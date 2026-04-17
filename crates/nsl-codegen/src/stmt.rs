@@ -3969,12 +3969,37 @@ impl Compiler<'_> {
                 // diagnostic) by CSHA.
                 if let Some(ref mode_str) = self.compile_options.csha_mode {
                     if mode_str != "off" && mode_str != "disable" && mode_str != "disabled" {
+                        // H.1: when `@flash_attention(head_dim=N)` is on a
+                        // method, `compile_flash_attention_kernels` has
+                        // already populated `flash_attention_context.config.head_dim`
+                        // with the user-specified N. Without threading that
+                        // value into CSHA's `LayerShape`, the planner's
+                        // `roofline_tile_config` sees `head_dim=64` (from
+                        // `run_on_wengert`'s default shape), every downstream
+                        // `FlashAttentionConfig` carries `head_dim=64`, and
+                        // the Tier C backward SMEM validator rejects the
+                        // fused backward ("713472 bytes > 101376 byte cap").
+                        // The dispatcher then silently falls back to per-op
+                        // adjoints and the toy pretrain smoke never emits
+                        // `nsl_flash_attention_csha_backward`.
+                        let csha_shape_override = self
+                            .kernels
+                            .flash_attention_context
+                            .as_ref()
+                            .map(|ctx| crate::wggo_cost::LayerShape {
+                                batch: 1,
+                                seq: 1024,
+                                d_model: 512,
+                                head_dim: ctx.config.head_dim as u64,
+                                n_kv_heads: 4,
+                                dtype_bytes: 2,
+                            });
                         if let Some(plan) = crate::csha::run_on_wengert(
                             extractor.wengert_list(),
                             &self.compile_options.target,
                             mode_str,
                             None, // weight-aware analysis hooked up via CompileOptions.weight_file in follow-up
-                            None, // shape override — defaults are fine for diagnostic
+                            csha_shape_override, // H.1: forward decorator head_dim to the planner
                             8,    // default head count; weight-informed path refines this
                             self.wggo_overrides.as_ref(),
                         ) {
@@ -5071,13 +5096,21 @@ impl Compiler<'_> {
             grads_list
         };
 
+        // H.2: mangling convention is `{module_prefix}__{fn_name}` where
+        // `module_prefix` is the dotted stdlib path with `.` -> `_`
+        // (single underscore per path separator). So `nsl.optim.sgd` ->
+        // `nsl_optim_sgd`, and the step fn becomes
+        // `nsl_optim_sgd__sgd_step`. Pre-H.2 this site emitted
+        // `nsl__optim__sgd__sgd_step` (double underscores between every
+        // path part) which did not match `stdlib_loader::module_prefix_for`
+        // output — `compile_entry` failed with "undefined function".
         let optimizer_fn_name = match optimizer_name.as_str() {
-            "sgd" => "nsl__optim__sgd__sgd_step",
-            "adam" => "nsl__optim__adam__adam_step",
-            "adamw" => "nsl__optim__adamw__adamw_step",
-            "lion" => "nsl__optim__lion__lion_step",
-            "muon" => "nsl__optim__muon__muon_step",
-            "soap" => "nsl__optim__soap__soap_step",
+            "sgd" => "nsl_optim_sgd__sgd_step",
+            "adam" => "nsl_optim_adam__adam_step",
+            "adamw" => "nsl_optim_adamw__adamw_step",
+            "lion" => "nsl_optim_lion__lion_step",
+            "muon" => "nsl_optim_muon__muon_step",
+            "soap" => "nsl_optim_soap__soap_step",
             _ => {
                 return Err(CodegenError::new(format!(
                     "unsupported optimizer '{}' in train block",
@@ -6636,13 +6669,16 @@ impl Compiler<'_> {
         }
 
         // ── 10. Optimizer step ──────────────────────────────────────────
+        // H.2: see comment in the non-pipelined emitter — `stdlib_loader`
+        // produces `nsl_optim_sgd__sgd_step` (single underscore between
+        // path parts), so this site must match that convention.
         let optimizer_fn_name = match optimizer_name.as_str() {
-            "sgd" => "nsl__optim__sgd__sgd_step",
-            "adam" => "nsl__optim__adam__adam_step",
-            "adamw" => "nsl__optim__adamw__adamw_step",
-            "lion" => "nsl__optim__lion__lion_step",
-            "muon" => "nsl__optim__muon__muon_step",
-            "soap" => "nsl__optim__soap__soap_step",
+            "sgd" => "nsl_optim_sgd__sgd_step",
+            "adam" => "nsl_optim_adam__adam_step",
+            "adamw" => "nsl_optim_adamw__adamw_step",
+            "lion" => "nsl_optim_lion__lion_step",
+            "muon" => "nsl_optim_muon__muon_step",
+            "soap" => "nsl_optim_soap__soap_step",
             _ => {
                 return Err(CodegenError::new(format!(
                     "unsupported optimizer '{}' in pipelined train block",

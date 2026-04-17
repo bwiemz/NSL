@@ -1436,4 +1436,94 @@ mod tests {
         assert!(cfg.csha_level >= 1 && cfg.csha_level <= 3);
         assert!(cfg.fused_rmsnorm);
     }
+
+    /// H.1 regression: when the CSHA planner is given `head_dim=32`
+    /// (the effective forwarding from `@flash_attention(head_dim=32)`),
+    /// the `FusionMark.config.head_dim` the dispatch map builds MUST
+    /// reflect that value — not the default 64. Pre-H.1 every
+    /// `FlashAttentionConfig` synthesized by `bridge()` carried
+    /// `head_dim=64` regardless of the shape threaded through
+    /// `csha::run`, because the call site in `stmt.rs` passed
+    /// `shape: None` into `run_on_wengert` and the fallback defaulted
+    /// to 64. Fixed in H.1 by deriving the shape override from
+    /// `flash_attention_context.config.head_dim`.
+    #[test]
+    fn h1_fusion_mark_config_head_dim_matches_planner_shape() {
+        let w = attn_wengert();
+        let input = CshaInput {
+            mode: CshaMode::Auto,
+            target: "H100",
+            wengert: &w,
+            weights: None,
+            shape: LayerShape {
+                batch: 1,
+                seq: 1024,
+                d_model: 512,
+                head_dim: 32,
+                n_kv_heads: 4,
+                dtype_bytes: 2,
+            },
+            n_heads: 8,
+            spec_cfg: SpecConfig::default(),
+            pattern_cfg: crate::csha_patterns::PatternConfig::default(),
+            wggo_overrides: None,
+        };
+        let plan = run(input);
+        // Mirror the `stmt.rs` reconstruction: head_dim comes from
+        // `plan.per_layer.first().tiles.head_dim`, which is derived
+        // from `shape.head_dim` in `roofline_tile_config`.
+        let shape_head_dim = plan
+            .per_layer
+            .first()
+            .map(|lp| lp.tiles.head_dim as i64)
+            .unwrap_or(64);
+        assert_eq!(
+            shape_head_dim, 32,
+            "H.1: plan.per_layer[0].tiles.head_dim must track input shape"
+        );
+        let bridge_result = bridge(&plan, shape_head_dim, &mut Vec::new());
+
+        // Every NormPrologue mark (one per Q/K/V chain) must carry
+        // the propagated head_dim in its FlashAttentionConfig.
+        let norm_marks: Vec<_> = bridge_result
+            .marks
+            .iter()
+            .filter(|m| m.role == MarkRole::NormPrologue)
+            .collect();
+        assert!(
+            !norm_marks.is_empty(),
+            "H.1: bridge must emit at least one NormPrologue mark"
+        );
+        for m in &norm_marks {
+            let cfg = m.config.as_ref().unwrap_or_else(|| {
+                panic!("H.1: NormPrologue mark {:?} has no config", m.layer)
+            });
+            assert_eq!(
+                cfg.head_dim, 32,
+                "H.1: FusionMark {:?}/{:?} config.head_dim = {} \
+                 (expected 32 propagated from shape)",
+                m.layer, m.role, cfg.head_dim
+            );
+        }
+
+        // The dispatch-map builder also re-derives config from the
+        // bridge result — make sure it reads the same head_dim.
+        let (_op_to_chain, chain_marks) =
+            collect_chain_dispatch_map_with_wengert(&plan, &bridge_result, Some(&w));
+        assert!(
+            !chain_marks.is_empty(),
+            "H.1: dispatch map must produce at least one chain mark"
+        );
+        for m in &chain_marks {
+            let cfg = m.config.as_ref().unwrap_or_else(|| {
+                panic!("H.1: chain mark {:?} has no config", m.layer)
+            });
+            assert_eq!(
+                cfg.head_dim, 32,
+                "H.1: chain FusionMark {:?}/{:?} config.head_dim = {} \
+                 (expected 32)",
+                m.layer, m.role, cfg.head_dim
+            );
+        }
+    }
 }
