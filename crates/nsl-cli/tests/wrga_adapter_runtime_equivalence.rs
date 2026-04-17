@@ -554,3 +554,85 @@ fn build_4_lora_rewrite_load_bearing_proof() {
         }
     }
 }
+
+// ─── Task D1: build_4_fused_real_launch — integration numerical gate ─
+//
+// Runs BUILD4_SRC_GPU with NSL_WRGA_FUSED_CUDA=1 forced on, asserts:
+//   1. Output is 16.0 ± 1e-4 elementwise (numerical correctness via
+//      real cudarc launch, NOT CPU fallback — the 1e-4 tolerance is
+//      the milestone's numerical gate from spec §5).
+//   2. [nsl-gpu-launch-count] ≥ 1 (proves the fused PTX actually
+//      executed on GPU; count=0 would mean numerical result was
+//      produced by CPU fallback even though NSL_WRGA_FUSED_CUDA=1
+//      was set).
+//
+// Complementary to build_4_fused_cuda_actually_fires (which only
+// asserts count ≥ 1 without checking numerics).  This test catches
+// semantic bugs in the rewritten kernel that passed ptxas validation
+// but silently compute the wrong thing.
+//
+// Known C4 precision concern: the final (x@A)@B MMA requires packed-f16
+// A-operand; C4 emits cvt.rn.f16x2.f32 between the two epilogue MMAs.
+// For BUILD4 shape (x=ones, A=ones, B=ones, rank=2) epi_interm=8.0
+// fits f16 exactly so no loss; larger test shapes may need >1e-4
+// tolerance — raise this flag here if the assertion fails.
+#[cfg(feature = "cuda")]
+#[test]
+fn build_4_fused_real_launch() {
+    let tmp = TempDir::new().unwrap();
+    let src_path = tmp.path().join("build4_real_launch.nsl");
+    fs::write(&src_path, BUILD4_SRC_GPU).unwrap();
+
+    let root = workspace_root();
+    let stdlib = root.join("stdlib");
+    let mut cmd = Command::cargo_bin("nsl").unwrap();
+    cmd.env("NSL_STDLIB_PATH", &stdlib)
+        .env("NSL_WRGA_FUSED_CUDA", "1")
+        .env("NSL_WRGA_GPU_LAUNCH_COUNTER", "1")
+        .arg("run")
+        .args(["--source-ad", "--target", "cuda_sm80"])
+        .arg(&src_path);
+    let output = cmd.output().expect("nsl run failed to spawn");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    assert!(
+        output.status.success(),
+        "nsl run failed.\nstdout:\n{stdout}\nstderr:\n{stderr}",
+    );
+
+    // Parse output tensor.
+    let tensor = parse_tensor_2d(&stdout);
+    assert_eq!(tensor.len(), 4, "expected 4 rows, got {tensor:?}");
+
+    // Assert 16.0 ± 1e-4 per element.
+    let mut max_diff: f32 = 0.0;
+    for row in &tensor {
+        assert_eq!(row.len(), 8, "expected 8 cols");
+        for v in row {
+            max_diff = max_diff.max((v - 16.0).abs());
+        }
+    }
+    assert!(
+        max_diff < 1e-4,
+        "build_4_fused_real_launch: max |y - 16.0| = {max_diff:.3e}, want < 1e-4.\n\
+         Diagnostic hints:\n\
+         - ~1e-3: f16 precision (cvt.rn.f16x2.f32 between epilogue MMAs)\n\
+         - exactly 16.0 diff (y=0): base matmul fired but adapter delta dropped\n\
+         - exactly 0: test never exercised the fused path\n\
+         stderr:\n{stderr}"
+    );
+
+    // Assert the REAL cudarc launch fired (not CPU fallback).
+    let gpu_count_line = stderr.lines().find(|l| l.contains("[nsl-gpu-launch-count]"));
+    let count: u64 = gpu_count_line
+        .and_then(|l| l.split_whitespace().next_back())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    assert!(
+        count >= 1,
+        "build_4_fused_real_launch: expected ≥1 real cudarc launch with \
+         NSL_WRGA_FUSED_CUDA=1, got {count}. Numerical output was correct \
+         but came from CPU fallback — the fused PTX path didn't fire. \
+         Check for fallback warnings in stderr above."
+    );
+}

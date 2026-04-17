@@ -608,7 +608,7 @@ pub(crate) mod inner {
                 CUresult::CUDA_SUCCESS,
                 "cuMemcpyDtoH_v2({} bytes) failed: {:?}",
                 size_bytes,
-                result
+                result,
             );
         }
     }

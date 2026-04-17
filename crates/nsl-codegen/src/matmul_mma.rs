@@ -65,14 +65,23 @@ pub fn emit_load_a_fragment_smem(
     ptx.push_str("    // Load A-fragment (m16xk16 row-major) from shared memory\n");
     for (reg_idx, k_base_pair) in [(0, 0usize), (1, 4), (2, 8), (3, 12)].iter() {
         let byte_col_offset = k_base_pair * 2;
+        // IMPORTANT: Use mul.lo.u32 + add.u32, NOT mad.lo.u32.
+        // mad.lo.u32 causes CUDA_ERROR_INVALID_PTX at runtime on ISA 7.0
+        // even though ptxas offline accepts it.  See M17 notes in MEMORY.md.
         ptx.push_str(&format!(
-            "    mad.lo.u32 %mma_addr, %mma_a_row, {}, {};  // row * stride + base\n",
-            row_stride_bytes, smem_base_expr
+            "    mul.lo.u32 %mma_addr, %mma_a_row, {};  // row * stride\n",
+            row_stride_bytes
         ));
         ptx.push_str(&format!(
-            "    add.u32 %mma_addr, %mma_addr, {};  // + k byte offset\n",
-            byte_col_offset
+            "    add.u32 %mma_addr, %mma_addr, {};  // + smem base\n",
+            smem_base_expr
         ));
+        if byte_col_offset > 0 {
+            ptx.push_str(&format!(
+                "    add.u32 %mma_addr, %mma_addr, {};  // + k byte offset\n",
+                byte_col_offset
+            ));
+        }
         ptx.push_str(&format!(
             "    ld.shared.b32 %{}, [%mma_addr];\n",
             frag_regs[*reg_idx]
@@ -91,14 +100,23 @@ pub fn emit_load_b_fragment_smem(
     ptx.push_str("    // Load B-fragment (k16xn8 col-major) from shared memory\n");
     for (reg_idx, k_base_pair) in [(0, 0usize), (1, 8)].iter() {
         let byte_col_offset = k_base_pair * 2;
+        // IMPORTANT: Use mul.lo.u32 + add.u32, NOT mad.lo.u32.
+        // mad.lo.u32 causes CUDA_ERROR_INVALID_PTX at runtime on ISA 7.0
+        // even though ptxas offline accepts it.  See M17 notes in MEMORY.md.
         ptx.push_str(&format!(
-            "    mad.lo.u32 %mma_addr, %mma_b_row, {}, {};  // row * stride + base\n",
-            row_stride_bytes, smem_base_expr
+            "    mul.lo.u32 %mma_addr, %mma_b_row, {};  // row * stride\n",
+            row_stride_bytes
         ));
         ptx.push_str(&format!(
-            "    add.u32 %mma_addr, %mma_addr, {};  // + k byte offset\n",
-            byte_col_offset
+            "    add.u32 %mma_addr, %mma_addr, {};  // + smem base\n",
+            smem_base_expr
         ));
+        if byte_col_offset > 0 {
+            ptx.push_str(&format!(
+                "    add.u32 %mma_addr, %mma_addr, {};  // + k byte offset\n",
+                byte_col_offset
+            ));
+        }
         ptx.push_str(&format!(
             "    ld.shared.b32 %{}, [%mma_addr];\n",
             frag_regs[*reg_idx]

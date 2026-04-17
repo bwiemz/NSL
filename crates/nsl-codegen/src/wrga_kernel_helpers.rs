@@ -21,7 +21,7 @@ pub struct LoraRegisterBudget {
     pub epi_final_count: u32,    // 4 (f32, (x@A)@B accumulator)
     pub main_a_frag_count: u32,  // 4 (b32, x fragment)
     pub main_b_frag_count: u32,  // 2 (b32, W fragment)
-    pub epi_a_frag_count: u32,   // 4 (b32, A fragment)
+    pub epi_a_frag_count: u32,   // 2 (b32, A-as-B-operand fragment — col-major B-fragment)
     pub epi_b_frag_count: u32,   // 2 (b32, B fragment)
     pub rd_scratch: u32,         // ~16 (u64)
     pub u32_scratch: u32,        // ~12
@@ -35,7 +35,7 @@ pub fn wrga_lora_register_budget(_cfg: &FusedLoraConfig) -> LoraRegisterBudget {
         epi_final_count: 4,
         main_a_frag_count: 4,
         main_b_frag_count: 2,
-        epi_a_frag_count: 4,
+        epi_a_frag_count: 2,
         epi_b_frag_count: 2,
         rd_scratch: 16,
         u32_scratch: 12,
@@ -75,6 +75,9 @@ pub fn emit_lora_register_pool(ptx: &mut String, b: &LoraRegisterBudget) {
 ///   %col_base = bid_y * 8
 ///   %m_real = min(m - row_base, 16)   // for tail-predication in store
 ///   %n_real = min(n - col_base, 8)    // for tail-predication in store
+///
+/// Compile-time version: m and n are baked in as immediate constants.
+/// Used only when the batch dimension is known at codegen time.
 pub fn emit_lora_output_tile_coords(ptx: &mut String, m: u32, n: u32) {
     ptx.push_str("    // WRGA output tile coords\n");
     ptx.push_str("    shl.b32 %row_base, %bid_x, 4;\n");
@@ -88,19 +91,43 @@ pub fn emit_lora_output_tile_coords(ptx: &mut String, m: u32, n: u32) {
     ptx.push_str("    min.u32 %n_real, %r1, 8;\n");
 }
 
+/// Dynamic version of `emit_lora_output_tile_coords` that reads m and n
+/// from the runtime kernel parameters `%m_param` and `%n_param` instead
+/// of baking in compile-time constants.  This is required because the
+/// prescan synthesizes the kernel with a placeholder m (to produce a
+/// single kernel binary), but the actual batch dimension is only known
+/// at launch time.
+///
+/// Callers must ensure `%m_param` and `%n_param` are loaded from `.param`
+/// slots before this is called.
+pub fn emit_lora_output_tile_coords_dynamic(ptx: &mut String) {
+    ptx.push_str("    // WRGA output tile coords (runtime m/n from kernel params)\n");
+    ptx.push_str("    shl.b32 %row_base, %bid_x, 4;\n");
+    ptx.push_str("    shl.b32 %col_base, %bid_y, 3;\n");
+    // m_real = min(m_param - row_base, 16)
+    ptx.push_str("    sub.u32 %r0, %m_param, %row_base;\n");
+    ptx.push_str("    min.u32 %m_real, %r0, 16;\n");
+    // n_real = min(n_param - col_base, 8)
+    ptx.push_str("    sub.u32 %r1, %n_param, %col_base;\n");
+    ptx.push_str("    min.u32 %n_real, %r1, 8;\n");
+}
+
 /// Emit the lane-derivation math that initializes `%mma_a_row` and
 /// `%mma_b_row` per the m16n8k16 lane layout spec.  Called ONCE in the
 /// prolog before any matmul_mma helper.
 ///
 /// For m16n8k16 with a single warp per tile:
 ///   A-fragment is 16×16 f16, distributed across 32 lanes.  Thread t's
-///   A-fragment row index is `t / 4` (8 threads share 4 consecutive
-///   K-elements within a row's 16 columns, 4 threads cover the 4
-///   consecutive K-positions a fragment holds).
+///   A-fragment row index is `t / 4` (0..7), which is the row within the
+///   16-row tile that this thread owns.
 ///
-///   B-fragment is 16×8 f16 col-major.  Thread t's B-fragment row is
-///   `(t % 8) * 4` — each of 8 threads per column covers 4 consecutive
-///   K rows.
+///   B-fragment is k=16 × n=8 f16 col-major.  Per PTX ISA §9.7.13.4,
+///   thread t owns k-rows {(t%4)*2, (t%4)*2+1} for b-reg[0] and
+///   {(t%4)*2+8, (t%4)*2+9} for b-reg[1], at column (t/4).
+///   So `mma_b_row = (t % 4) * 2` (k-row of first owned pair).
+///   The column byte offset `(t/4)*2` must be added to the SMEM base
+///   address BEFORE calling emit_load_b_fragment_smem; the caller is
+///   responsible for this — see emit_b_lane_smem_bases in wrga_fused_ptx.
 ///
 /// B.3 shipped pseudocode BECAUSE these registers were declared in the
 /// `.reg` pool but never initialized.  This helper is the fix.  Callers
@@ -108,10 +135,15 @@ pub fn emit_lora_output_tile_coords(ptx: &mut String, m: u32, n: u32) {
 /// MUST call `emit_matmul_mma_lane_init` before the first such helper.
 pub fn emit_matmul_mma_lane_init(ptx: &mut String) {
     ptx.push_str("    // matmul_mma lane-index init (m16n8k16 layout)\n");
-    // A-fragment row: tid / 4
+    // A-fragment row: tid / 4   (0..7)
     ptx.push_str("    shr.u32 %mma_a_row, %tid_x, 2;\n");
-    // B-fragment row: (tid % 8) * 4
-    ptx.push_str("    and.b32 %r2, %tid_x, 7;\n");
+    // B-fragment byte offset within col-major column: (tid % 4) * 4
+    //   = k-pair index * 2 f16s * 2 bytes/f16 = (tid%4)*4 bytes.
+    //   Column base offset (tid/4)*32 is baked into smem_base_[w|b]_lane_u32
+    //   by callers (see wrga_fused_ptx.rs).
+    //   This makes all ld.shared.b32 addresses 4-byte aligned because:
+    //     (tid/4)*32 is 32-byte aligned, (tid%4)*4 is 4-byte aligned.
+    ptx.push_str("    and.b32 %r2, %tid_x, 3;\n");
     ptx.push_str("    shl.b32 %mma_b_row, %r2, 2;\n");
 }
 
@@ -142,34 +174,63 @@ pub fn emit_lora_tile_bases(ptx: &mut String) {
 }
 
 /// Stage the x_tile slice for K-iteration `k_tile` from global (%rd_x)
-/// into SMEM (%x_tile_base).  Handles m-tail (rows >= m get zeroed) and
+/// into SMEM (%x_tile_base).  Handles m-tail (rows >= m_param get zeroed) and
 /// k-tail (k-positions >= k get zeroed).
 ///
-/// For simplicity (first rewrite), staging is serialized: if %tid_x == 0,
-/// thread 0 does all loads.  Cooperative staging is a follow-up perf pass.
+/// x global layout: [m, k] row-major, **f32** (dtype=1, the NSL GPU tensor dtype).
+/// SMEM stores packed f16x2 (required by m16n8k16 A-fragment).
+/// Each pair of f32 values is loaded, converted to f16, and packed into a b32.
+/// Thread 0 does all work.
 ///
-/// x global layout: [m, k] row-major, f16.  x[row, k_start + col].
-pub fn emit_lora_stage_x_tile(ptx: &mut String, k_tile: u32, m: u32, k: u32) {
-    ptx.push_str(&format!("    // Stage x_tile for K-tile {}\n", k_tile));
+/// NOTE: The m bound is taken from the **runtime** %m_param register (not the
+/// compile-time config.m prescan placeholder, which is always 1).  Each row
+/// emits a `setp.lt.u32 %p1, <row_const>, %m_param` before the global load to
+/// guard against reading beyond the actual batch dimension.  k-tail bounds are
+/// still compile-time constants since k is a fixed kernel dimension.
+pub fn emit_lora_stage_x_tile(ptx: &mut String, k_tile: u32, _m: u32, k: u32) {
+    ptx.push_str(&format!("    // Stage x_tile for K-tile {} (f32 global -> f16x2 SMEM, m-bound from %m_param)\n", k_tile));
     ptx.push_str("    setp.eq.u32 %p0, %tid_x, 0;\n");
     ptx.push_str(&format!("    @!%p0 bra lora_x_stage_done_{};\n", k_tile));
     let k_start = k_tile * 16;
     for row in 0..16u32 {
+        // Emit runtime m-predicate for this row: %p1 = (row < %m_param).
+        ptx.push_str(&format!("    setp.lt.u32 %p1, {}, %m_param;\n", row));
         for col_pair in 0..8u32 {
             let col = col_pair * 2;
             let smem_offset = row * 32 + col_pair * 4;
-            if row >= m || k_start + col >= k {
-                // OOB (m-tail or k-tail) — zero-fill SMEM slot.
+            // k-tail is a compile-time check (k is a fixed kernel dimension).
+            if k_start + col >= k {
+                // k-OOB: always zero, regardless of row.
                 ptx.push_str(&format!(
                     "    st.shared.b32 [%x_tile_base + {}], 0;\n",
                     smem_offset
                 ));
             } else {
-                let gl_offset = (row as u64) * (k as u64) * 2
-                    + (k_start as u64 + col as u64) * 2;
+                // f32 global layout: x[row, col] at byte (row * k + col) * 4.
+                let gl_off0 = (row as u64) * (k as u64) * 4
+                    + (k_start as u64 + col as u64) * 4;
+                let col1_valid = k_start + col + 1 < k;
+                let gl_off1 = gl_off0 + 4;
+                // Predicated load: row < m_param → load from global; else zero.
                 ptx.push_str(&format!(
-                    "    ld.global.b32 %r3, [%rd_x + {}];\n",
-                    gl_offset
+                    "    @%p1 ld.global.f32 %stg_f0, [%rd_x + {}];\n",
+                    gl_off0
+                ));
+                ptx.push_str("    @%p1 cvt.rn.f16.f32 %stg_h0, %stg_f0;\n");
+                ptx.push_str("    @!%p1 mov.b16 %stg_h0, 0;\n");
+                if col1_valid {
+                    ptx.push_str(&format!(
+                        "    @%p1 ld.global.f32 %stg_f1, [%rd_x + {}];\n",
+                        gl_off1
+                    ));
+                    ptx.push_str("    @%p1 cvt.rn.f16.f32 %stg_h1, %stg_f1;\n");
+                    ptx.push_str("    @!%p1 mov.b16 %stg_h1, 0;\n");
+                } else {
+                    ptx.push_str("    mov.b16 %stg_h1, 0;\n");
+                }
+                // Pack two f16s into b32 and store to SMEM.
+                ptx.push_str(&format!(
+                    "    mov.b32 %r3, {{%stg_h0, %stg_h1}};\n"
                 ));
                 ptx.push_str(&format!(
                     "    st.shared.b32 [%x_tile_base + {}], %r3;\n",
@@ -182,29 +243,41 @@ pub fn emit_lora_stage_x_tile(ptx: &mut String, k_tile: u32, m: u32, k: u32) {
 }
 
 /// Stage the w_tile slice for K-iteration `k_tile`.  Shape: 16×8 f16.
-/// W global layout: [k, n] row-major, f16.  W[k_start + row, col].
+/// W global layout: [k, n] row-major, **f32** (NSL GPU tensor dtype=1).
+///
+/// SMEM layout: col-major so that B-fragment ld.shared.b32 loads are 4-byte aligned.
+/// Element [k_row, col] in SMEM is at byte offset `col*32 + k_row*2`.
+/// Column stride = 32 bytes (16 f16 k-rows × 2 bytes/f16).
+///
+/// Each f32 is loaded from global, converted to f16, and stored individually
+/// to its col-major SMEM slot using b16 stores (always 2-byte aligned).
+/// Thread 0 does all work.
 pub fn emit_lora_stage_w_tile(ptx: &mut String, k_tile: u32, n: u32, k: u32) {
-    ptx.push_str(&format!("    // Stage w_tile for K-tile {}\n", k_tile));
+    ptx.push_str(&format!("    // Stage w_tile for K-tile {} (f32 global, col-major f16 SMEM)\n", k_tile));
     ptx.push_str("    setp.eq.u32 %p0, %tid_x, 0;\n");
     ptx.push_str(&format!("    @!%p0 bra lora_w_stage_done_{};\n", k_tile));
     let k_start = k_tile * 16;
-    for row in 0..16u32 {
-        for col_pair in 0..4u32 {
-            let col = col_pair * 2;
-            let smem_offset = row * 16 + col_pair * 4;
-            if k_start + row >= k || col >= n {
+    // Col-major SMEM: column c at bytes c*32 + k*2.
+    const COL_STRIDE: u32 = 32;
+    for col in 0..8u32 {
+        for k_row in 0..16u32 {
+            let smem_offset = col * COL_STRIDE + k_row * 2;
+            if k_start + k_row >= k || col >= n {
                 ptx.push_str(&format!(
-                    "    st.shared.b32 [%w_tile_base + {}], 0;\n",
+                    "    st.shared.b16 [%w_tile_base + {}], 0;\n",
                     smem_offset
                 ));
             } else {
-                let gl_offset = ((k_start + row) as u64) * (n as u64) * 2 + (col as u64) * 2;
+                // f32 global: W[k_start+k_row, col] at byte (k_start+k_row)*n*4 + col*4
+                let gl_offset =
+                    ((k_start + k_row) as u64) * (n as u64) * 4 + (col as u64) * 4;
                 ptx.push_str(&format!(
-                    "    ld.global.b32 %r3, [%rd_w + {}];\n",
+                    "    ld.global.f32 %stg_f0, [%rd_w + {}];\n",
                     gl_offset
                 ));
+                ptx.push_str("    cvt.rn.f16.f32 %stg_h0, %stg_f0;\n");
                 ptx.push_str(&format!(
-                    "    st.shared.b32 [%w_tile_base + {}], %r3;\n",
+                    "    st.shared.b16 [%w_tile_base + {}], %stg_h0;\n",
                     smem_offset
                 ));
             }
@@ -213,32 +286,41 @@ pub fn emit_lora_stage_w_tile(ptx: &mut String, k_tile: u32, n: u32, k: u32) {
     ptx.push_str(&format!("lora_w_stage_done_{}:\n", k_tile));
 }
 
-/// Stage the a_tile slice for K-iteration `k_tile`.  a_tile layout in
-/// SMEM: 16 rows × 16 cols (rank-padded to 16), f16.
-/// A global layout: [k, rank] row-major, f16.  A[k_start + row, col].
+/// Stage the a_tile slice for K-iteration `k_tile`.
+/// A global layout: [k, rank] row-major, **f32** (NSL GPU tensor dtype=1).
+///
+/// SMEM layout: col-major so that A-as-B-fragment loads are 4-byte aligned.
+/// The epilogue MMA uses a_tile as the B-operand (k=16 × n=rank_padded=8).
+/// Col-major layout: element [k_row, col] at byte offset `col*32 + k_row*2`.
+/// Column stride = 32 bytes (16 f16 k-rows × 2 bytes/f16).
+///
+/// Each f32 is loaded from global, converted to f16, and stored individually
+/// to its col-major SMEM slot using b16 stores.  Thread 0 does all work.
 pub fn emit_lora_stage_a_tile(ptx: &mut String, k_tile: u32, rank: u32, k: u32) {
-    ptx.push_str(&format!("    // Stage a_tile for K-tile {} (rank={})\n", k_tile, rank));
+    ptx.push_str(&format!("    // Stage a_tile for K-tile {} (rank={}, f32 global, col-major f16 SMEM)\n", k_tile, rank));
     ptx.push_str("    setp.eq.u32 %p0, %tid_x, 0;\n");
     ptx.push_str(&format!("    @!%p0 bra lora_a_stage_done_{};\n", k_tile));
     let k_start = k_tile * 16;
-    for row in 0..16u32 {
-        for col_pair in 0..8u32 {
-            let col = col_pair * 2;
-            let smem_offset = row * 32 + col_pair * 4;
-            if k_start + row >= k || col >= rank {
-                // OOB on k OR beyond rank — zero-fill (rank padding).
+    // Col-major: col c at bytes c*32 + k_row*2.
+    const COL_STRIDE: u32 = 32;
+    for col in 0..8u32 {
+        for k_row in 0..16u32 {
+            let smem_offset = col * COL_STRIDE + k_row * 2;
+            if k_start + k_row >= k || col >= rank {
                 ptx.push_str(&format!(
-                    "    st.shared.b32 [%a_tile_base + {}], 0;\n",
+                    "    st.shared.b16 [%a_tile_base + {}], 0;\n",
                     smem_offset
                 ));
             } else {
-                let gl_offset = ((k_start + row) as u64) * (rank as u64) * 2 + (col as u64) * 2;
+                // f32 global: A[k_start+k_row, col] at byte (k_start+k_row)*rank*4 + col*4
+                let gl_offset = ((k_start + k_row) as u64) * (rank as u64) * 4 + (col as u64) * 4;
                 ptx.push_str(&format!(
-                    "    ld.global.b32 %r3, [%rd_a + {}];\n",
+                    "    ld.global.f32 %stg_f0, [%rd_a + {}];\n",
                     gl_offset
                 ));
+                ptx.push_str("    cvt.rn.f16.f32 %stg_h0, %stg_f0;\n");
                 ptx.push_str(&format!(
-                    "    st.shared.b32 [%a_tile_base + {}], %r3;\n",
+                    "    st.shared.b16 [%a_tile_base + {}], %stg_h0;\n",
                     smem_offset
                 ));
             }
@@ -247,29 +329,38 @@ pub fn emit_lora_stage_a_tile(ptx: &mut String, k_tile: u32, rank: u32, k: u32) 
     ptx.push_str(&format!("lora_a_stage_done_{}:\n", k_tile));
 }
 
-/// Stage the b_tile ONCE post-loop.  Shape: 16×8 f16 (rank-padded rows).
-/// B global layout: [rank, n] row-major, f16.  B[row, col].
+/// Stage the b_tile ONCE post-loop.  Shape: 16×8 f16 (rank-padded rows = k-dim).
+/// B global layout: [rank, n] row-major, **f32** (NSL GPU tensor dtype=1).
+///
+/// SMEM layout: col-major so that B-fragment ld.shared.b32 loads are 4-byte aligned.
+/// Element [k_row, col] is at SMEM byte offset `col*32 + k_row*2`.
+/// Column stride = 32 bytes (16 f16 k-rows × 2 bytes/f16).
+///
+/// Each f32 is loaded from global, converted to f16, and stored individually
+/// to its col-major SMEM slot using b16 stores.  Thread 0 does all work.
 pub fn emit_lora_stage_b_tile(ptx: &mut String, rank: u32, n: u32) {
-    ptx.push_str("    // Stage b_tile (post-loop, once)\n");
+    ptx.push_str("    // Stage b_tile (post-loop, once, f32 global, col-major f16 SMEM)\n");
     ptx.push_str("    setp.eq.u32 %p0, %tid_x, 0;\n");
     ptx.push_str("    @!%p0 bra lora_b_stage_done;\n");
-    for row in 0..16u32 {
-        for col_pair in 0..4u32 {
-            let col = col_pair * 2;
-            let smem_offset = row * 16 + col_pair * 4;
-            if row >= rank || col >= n {
+    const COL_STRIDE: u32 = 32;
+    for col in 0..8u32 {
+        for k_row in 0..16u32 {
+            let smem_offset = col * COL_STRIDE + k_row * 2;
+            if k_row >= rank || col >= n {
                 ptx.push_str(&format!(
-                    "    st.shared.b32 [%b_tile_base + {}], 0;\n",
+                    "    st.shared.b16 [%b_tile_base + {}], 0;\n",
                     smem_offset
                 ));
             } else {
-                let gl_offset = (row as u64) * (n as u64) * 2 + (col as u64) * 2;
+                // f32 global: B[k_row, col] at byte k_row*n*4 + col*4
+                let gl_offset = (k_row as u64) * (n as u64) * 4 + (col as u64) * 4;
                 ptx.push_str(&format!(
-                    "    ld.global.b32 %r3, [%rd_b + {}];\n",
+                    "    ld.global.f32 %stg_f0, [%rd_b + {}];\n",
                     gl_offset
                 ));
+                ptx.push_str("    cvt.rn.f16.f32 %stg_h0, %stg_f0;\n");
                 ptx.push_str(&format!(
-                    "    st.shared.b32 [%b_tile_base + {}], %r3;\n",
+                    "    st.shared.b16 [%b_tile_base + {}], %stg_h0;\n",
                     smem_offset
                 ));
             }

@@ -73,3 +73,4 @@ fn lora_ptx_validates__16_8_8_16() {
     // rank == MMA k: exercises emit_smem_zero_pad_predicated no-op path.
     assert_lora_ptx_valid(lora_cfg(16, 8, 8, 16));
 }
+
