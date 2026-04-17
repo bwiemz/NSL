@@ -114,3 +114,166 @@ pub fn emit_matmul_mma_lane_init(ptx: &mut String) {
     ptx.push_str("    and.b32 %r2, %tid_x, 7;\n");
     ptx.push_str("    shl.b32 %mma_b_row, %r2, 2;\n");
 }
+
+// ─── C2: Tile-staging helpers ──────────────────────────────────────────────
+
+/// SMEM byte offsets within the shmem[1536] array for LoRA kernel:
+///   [   0,  512) — x_tile  (16×16 f16)
+///   [ 512,  768) — w_tile  (16×8  f16)
+///   [ 768, 1280) — a_tile  (16×16 f16, rank-padded)
+///   [1280, 1536) — b_tile  (16×8  f16, rank-padded)
+pub const LORA_X_TILE_OFFSET: u32 = 0;
+pub const LORA_W_TILE_OFFSET: u32 = 512;
+pub const LORA_A_TILE_OFFSET: u32 = 768;
+pub const LORA_B_TILE_OFFSET: u32 = 1280;
+
+/// Initialize the per-tile SMEM base registers from %shmem_base.
+/// Called ONCE in the prolog after `emit_shmem_base_cvta`.
+pub fn emit_lora_tile_bases(ptx: &mut String) {
+    ptx.push_str(&format!("    add.u64 %x_tile_base, %shmem_base, {};\n", LORA_X_TILE_OFFSET));
+    ptx.push_str(&format!("    add.u64 %w_tile_base, %shmem_base, {};\n", LORA_W_TILE_OFFSET));
+    ptx.push_str(&format!("    add.u64 %a_tile_base, %shmem_base, {};\n", LORA_A_TILE_OFFSET));
+    ptx.push_str(&format!("    add.u64 %b_tile_base, %shmem_base, {};\n", LORA_B_TILE_OFFSET));
+    // matmul_mma helpers look up %smem_base_x/w/a/b by name — alias.
+    ptx.push_str("    mov.u64 %smem_base_x, %x_tile_base;\n");
+    ptx.push_str("    mov.u64 %smem_base_w, %w_tile_base;\n");
+    ptx.push_str("    mov.u64 %smem_base_a, %a_tile_base;\n");
+    ptx.push_str("    mov.u64 %smem_base_b, %b_tile_base;\n");
+}
+
+/// Stage the x_tile slice for K-iteration `k_tile` from global (%rd_x)
+/// into SMEM (%x_tile_base).  Handles m-tail (rows >= m get zeroed) and
+/// k-tail (k-positions >= k get zeroed).
+///
+/// For simplicity (first rewrite), staging is serialized: if %tid_x == 0,
+/// thread 0 does all loads.  Cooperative staging is a follow-up perf pass.
+///
+/// x global layout: [m, k] row-major, f16.  x[row, k_start + col].
+pub fn emit_lora_stage_x_tile(ptx: &mut String, k_tile: u32, m: u32, k: u32) {
+    ptx.push_str(&format!("    // Stage x_tile for K-tile {}\n", k_tile));
+    ptx.push_str("    setp.eq.u32 %p0, %tid_x, 0;\n");
+    ptx.push_str(&format!("    @!%p0 bra lora_x_stage_done_{};\n", k_tile));
+    let k_start = k_tile * 16;
+    for row in 0..16u32 {
+        for col_pair in 0..8u32 {
+            let col = col_pair * 2;
+            let smem_offset = row * 32 + col_pair * 4;
+            if row >= m || k_start + col >= k {
+                // OOB (m-tail or k-tail) — zero-fill SMEM slot.
+                ptx.push_str(&format!(
+                    "    st.shared.b32 [%x_tile_base + {}], 0;\n",
+                    smem_offset
+                ));
+            } else {
+                let gl_offset = (row as u64) * (k as u64) * 2
+                    + (k_start as u64 + col as u64) * 2;
+                ptx.push_str(&format!(
+                    "    ld.global.b32 %r3, [%rd_x + {}];\n",
+                    gl_offset
+                ));
+                ptx.push_str(&format!(
+                    "    st.shared.b32 [%x_tile_base + {}], %r3;\n",
+                    smem_offset
+                ));
+            }
+        }
+    }
+    ptx.push_str(&format!("lora_x_stage_done_{}:\n", k_tile));
+}
+
+/// Stage the w_tile slice for K-iteration `k_tile`.  Shape: 16×8 f16.
+/// W global layout: [k, n] row-major, f16.  W[k_start + row, col].
+pub fn emit_lora_stage_w_tile(ptx: &mut String, k_tile: u32, n: u32, k: u32) {
+    ptx.push_str(&format!("    // Stage w_tile for K-tile {}\n", k_tile));
+    ptx.push_str("    setp.eq.u32 %p0, %tid_x, 0;\n");
+    ptx.push_str(&format!("    @!%p0 bra lora_w_stage_done_{};\n", k_tile));
+    let k_start = k_tile * 16;
+    for row in 0..16u32 {
+        for col_pair in 0..4u32 {
+            let col = col_pair * 2;
+            let smem_offset = row * 16 + col_pair * 4;
+            if k_start + row >= k || col >= n {
+                ptx.push_str(&format!(
+                    "    st.shared.b32 [%w_tile_base + {}], 0;\n",
+                    smem_offset
+                ));
+            } else {
+                let gl_offset = ((k_start + row) as u64) * (n as u64) * 2 + (col as u64) * 2;
+                ptx.push_str(&format!(
+                    "    ld.global.b32 %r3, [%rd_w + {}];\n",
+                    gl_offset
+                ));
+                ptx.push_str(&format!(
+                    "    st.shared.b32 [%w_tile_base + {}], %r3;\n",
+                    smem_offset
+                ));
+            }
+        }
+    }
+    ptx.push_str(&format!("lora_w_stage_done_{}:\n", k_tile));
+}
+
+/// Stage the a_tile slice for K-iteration `k_tile`.  a_tile layout in
+/// SMEM: 16 rows × 16 cols (rank-padded to 16), f16.
+/// A global layout: [k, rank] row-major, f16.  A[k_start + row, col].
+pub fn emit_lora_stage_a_tile(ptx: &mut String, k_tile: u32, rank: u32, k: u32) {
+    ptx.push_str(&format!("    // Stage a_tile for K-tile {} (rank={})\n", k_tile, rank));
+    ptx.push_str("    setp.eq.u32 %p0, %tid_x, 0;\n");
+    ptx.push_str(&format!("    @!%p0 bra lora_a_stage_done_{};\n", k_tile));
+    let k_start = k_tile * 16;
+    for row in 0..16u32 {
+        for col_pair in 0..8u32 {
+            let col = col_pair * 2;
+            let smem_offset = row * 32 + col_pair * 4;
+            if k_start + row >= k || col >= rank {
+                // OOB on k OR beyond rank — zero-fill (rank padding).
+                ptx.push_str(&format!(
+                    "    st.shared.b32 [%a_tile_base + {}], 0;\n",
+                    smem_offset
+                ));
+            } else {
+                let gl_offset = ((k_start + row) as u64) * (rank as u64) * 2 + (col as u64) * 2;
+                ptx.push_str(&format!(
+                    "    ld.global.b32 %r3, [%rd_a + {}];\n",
+                    gl_offset
+                ));
+                ptx.push_str(&format!(
+                    "    st.shared.b32 [%a_tile_base + {}], %r3;\n",
+                    smem_offset
+                ));
+            }
+        }
+    }
+    ptx.push_str(&format!("lora_a_stage_done_{}:\n", k_tile));
+}
+
+/// Stage the b_tile ONCE post-loop.  Shape: 16×8 f16 (rank-padded rows).
+/// B global layout: [rank, n] row-major, f16.  B[row, col].
+pub fn emit_lora_stage_b_tile(ptx: &mut String, rank: u32, n: u32) {
+    ptx.push_str("    // Stage b_tile (post-loop, once)\n");
+    ptx.push_str("    setp.eq.u32 %p0, %tid_x, 0;\n");
+    ptx.push_str("    @!%p0 bra lora_b_stage_done;\n");
+    for row in 0..16u32 {
+        for col_pair in 0..4u32 {
+            let col = col_pair * 2;
+            let smem_offset = row * 16 + col_pair * 4;
+            if row >= rank || col >= n {
+                ptx.push_str(&format!(
+                    "    st.shared.b32 [%b_tile_base + {}], 0;\n",
+                    smem_offset
+                ));
+            } else {
+                let gl_offset = (row as u64) * (n as u64) * 2 + (col as u64) * 2;
+                ptx.push_str(&format!(
+                    "    ld.global.b32 %r3, [%rd_b + {}];\n",
+                    gl_offset
+                ));
+                ptx.push_str(&format!(
+                    "    st.shared.b32 [%b_tile_base + {}], %r3;\n",
+                    smem_offset
+                ));
+            }
+        }
+    }
+    ptx.push_str("lora_b_stage_done:\n");
+}
