@@ -676,6 +676,55 @@ pub fn emit_gate_load_per_thread(ptx: &mut String) {
     ptx.push_str("    ld.global.f32 %gate1, [%rd_gate_addr + 4];\n");
 }
 
+/// Emit the GatedLoRA fold step: per-thread, per-column fold of the
+/// epilogue accumulator into `main_accum` with predicated OOB masking.
+///
+///   main_accum0 += %epi_final0 * %gate0 * %scale_reg   (col 0, row 0)
+///   main_accum2 += %epi_final2 * %gate0 * %scale_reg   (col 0, row 8)
+///   main_accum1 += %epi_final1 * %gate1 * %scale_reg   (col 1, row 0)
+///   main_accum3 += %epi_final3 * %gate1 * %scale_reg   (col 1, row 8)
+///
+/// Each add is predicated on `%p_col0` / `%p_col1` (computed from
+/// `%n_real`) so OOB output columns in partial tiles don't corrupt
+/// main_accum.  See spec §2 Fixture D bug-class and invariant #15.
+///
+/// Requires (caller must have declared / initialized before this call):
+///   %r5           — col_base_in_tile = (tid%4)*2 (from emit_matmul_mma_lane_init)
+///   %n_real       — real n for this output tile (from emit_lora_output_tile_coords_dynamic)
+///   %gate0, %gate1 — sigmoid(gate) values (from emit_gate_load_per_thread + emit_sigmoid_approx_fused)
+///   %scale_reg    — loaded from .param .f32 scale at prolog
+///   %epi_final0..3 — declared (4 f32 from the post-loop (x@A)@B MMA)
+///   %main_accum0..3 — declared (4 f32 main MMA accumulator)
+///   %r_col1       — declared .reg .u32
+///   %fold_tmp     — declared .reg .f32
+///   %p_col0, %p_col1 — declared .reg .pred
+///
+/// See invariants #13–#15 for per-thread / LastKIter / FoldResultMask
+/// correctness requirements.
+pub fn emit_gatedlora_fold(ptx: &mut String) {
+    ptx.push_str("    // GatedLoRA fold: main_accum += epi_final * sigmoid(gate) * scale\n");
+    ptx.push_str("    //   predicated on n_real bounds to skip OOB cols in partial tiles\n");
+    ptx.push_str("    setp.lt.u32  %p_col0, %r5, %n_real;\n");
+    ptx.push_str("    add.u32      %r_col1, %r5, 1;\n");
+    ptx.push_str("    setp.lt.u32  %p_col1, %r_col1, %n_real;\n");
+
+    // main_accum0 (col 0, row 0), main_accum2 (col 0, row 8) — gate0, p_col0
+    ptx.push_str("    mul.f32      %fold_tmp, %epi_final0, %gate0;\n");
+    ptx.push_str("    mul.f32      %fold_tmp, %fold_tmp, %scale_reg;\n");
+    ptx.push_str("    @%p_col0 add.f32 %main_accum0, %main_accum0, %fold_tmp;\n");
+    ptx.push_str("    mul.f32      %fold_tmp, %epi_final2, %gate0;\n");
+    ptx.push_str("    mul.f32      %fold_tmp, %fold_tmp, %scale_reg;\n");
+    ptx.push_str("    @%p_col0 add.f32 %main_accum2, %main_accum2, %fold_tmp;\n");
+
+    // main_accum1 (col 1, row 0), main_accum3 (col 1, row 8) — gate1, p_col1
+    ptx.push_str("    mul.f32      %fold_tmp, %epi_final1, %gate1;\n");
+    ptx.push_str("    mul.f32      %fold_tmp, %fold_tmp, %scale_reg;\n");
+    ptx.push_str("    @%p_col1 add.f32 %main_accum1, %main_accum1, %fold_tmp;\n");
+    ptx.push_str("    mul.f32      %fold_tmp, %epi_final3, %gate1;\n");
+    ptx.push_str("    mul.f32      %fold_tmp, %fold_tmp, %scale_reg;\n");
+    ptx.push_str("    @%p_col1 add.f32 %main_accum3, %main_accum3, %fold_tmp;\n");
+}
+
 #[cfg(test)]
 mod sigmoid_tests {
     use super::emit_sigmoid_approx_fused;
@@ -712,6 +761,59 @@ mod sigmoid_tests {
         assert!(ptx.contains("0f3F800000"), "missing +1.0 constant");
         assert!(ptx.contains("%in"), "missing input register reference");
         assert!(ptx.contains("%out"), "missing output register reference");
+    }
+
+    #[test]
+    fn emit_gatedlora_fold_masks_correctly_per_column() {
+        use super::emit_gatedlora_fold;
+        let mut ptx = String::new();
+        emit_gatedlora_fold(&mut ptx);
+
+        // Predicate setup: two setp.lt.u32 for the two-column fold.
+        assert_eq!(
+            ptx.matches("setp.lt.u32").count(), 2,
+            "expected 2 setp.lt.u32 for %p_col0 and %p_col1; got:\n{ptx}"
+        );
+
+        // 4 predicated adds, one per main_accum[0..3].
+        assert_eq!(
+            ptx.matches("@%p_col").count(), 4,
+            "expected 4 predicated adds (main_accum0..3); got:\n{ptx}"
+        );
+
+        // Column-parity wiring: main_accum0,2 gated by p_col0; main_accum1,3 gated by p_col1.
+        assert!(
+            ptx.contains("@%p_col0 add.f32 %main_accum0"),
+            "main_accum0 (col 0, row 0) must be gated by p_col0"
+        );
+        assert!(
+            ptx.contains("@%p_col0 add.f32 %main_accum2"),
+            "main_accum2 (col 0, row 8) must be gated by p_col0"
+        );
+        assert!(
+            ptx.contains("@%p_col1 add.f32 %main_accum1"),
+            "main_accum1 (col 1, row 0) must be gated by p_col1"
+        );
+        assert!(
+            ptx.contains("@%p_col1 add.f32 %main_accum3"),
+            "main_accum3 (col 1, row 8) must be gated by p_col1"
+        );
+
+        // Gate wiring: main_accum0/2 use %gate0; main_accum1/3 use %gate1.
+        assert!(
+            ptx.contains("mul.f32      %fold_tmp, %epi_final0, %gate0"),
+            "main_accum0 fold must multiply by %gate0"
+        );
+        assert!(
+            ptx.contains("mul.f32      %fold_tmp, %epi_final1, %gate1"),
+            "main_accum1 fold must multiply by %gate1"
+        );
+
+        // Scale multiplication present exactly 4 times (one per main_accum position).
+        assert_eq!(
+            ptx.matches("mul.f32      %fold_tmp, %fold_tmp, %scale_reg").count(), 4,
+            "expected 4 scale multiplications; got:\n{ptx}"
+        );
     }
 
     #[test]
