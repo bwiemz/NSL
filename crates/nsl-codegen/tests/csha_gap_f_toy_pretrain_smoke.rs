@@ -399,4 +399,41 @@ fn toy_pretrain_hd32_compile_emits_fused_backward_ffi() {
         "[gap-f] f16 zero-init FFI is absent — Gap I.3 A+F dtype \
          fix for gradient output allocation regressed."
     );
+
+    // ── Gap I step K: RMSNorm gamma gradient ───────────────────────
+    //
+    // The toy program declares `w_norm: Tensor = ones([32])` as a
+    // trainable RMSNorm gamma. Before Gap K, the source-AD gradient
+    // summary reported `3/4 trainable tensor params connected, 1
+    // cascade-skip` because the per-op RMSNorm backward was suppressed
+    // by the CSHA cascade (`AlreadyEmitted`) but the fused kernel
+    // doesn't emit dgamma — it emits `dx_norm` (the upstream gradient
+    // of the RMSNorm output). Gap K closes this gap by emitting a
+    // standalone `NormGammaBackward(extract[6], x_raw, eps, -1, gamma)`
+    // adjoint in the EmitFused arm. Its lowering expands to
+    // `mean_keepdim_last` → `nsl_tensor_mean_dim` FFI, which no other
+    // code path in the toy program touches (neither the forward nor
+    // the other adjoints go through `Mean { dim }` since RMSNorm's
+    // per-op backward is suppressed). So the reloc's presence is a
+    // load-bearing pin on the gamma path.
+    assert!(
+        called.contains("nsl_tensor_mean_dim"),
+        "[gap-k] expected `nsl_tensor_mean_dim` in relocation set — \
+         this FFI is the `mean_keepdim_last` lowering used by the \
+         `NormGammaBackward` adjoint that Gap K emits after the fused \
+         kernel's 7 extracts. Its absence means the dgamma emission \
+         did not fire and the RMSNorm gamma will have no gradient \
+         pathway (source-AD summary will report `3/4 trainable tensor \
+         params connected, 1 cascade-skip`). \
+         relocations={called:?}"
+    );
+
+    // `nsl_tensor_sqrt` is emitted by the same lowering (std = sqrt(var + eps)).
+    assert!(
+        called.contains("nsl_tensor_sqrt"),
+        "[gap-k] expected `nsl_tensor_sqrt` in relocation set — \
+         `NormGammaBackward`'s lowering computes std = sqrt(var + eps). \
+         Its absence is a secondary signal that Gap K's dgamma \
+         emission regressed."
+    );
 }

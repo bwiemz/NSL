@@ -67,6 +67,13 @@ pub struct CshaFusedBackwardEvent {
     /// chain to per-op AD even though the backward validator accepted
     /// it (e.g. head_dim > 32). Kept so tests can pin the scope gate.
     pub smoke_config: bool,
+    /// Gap I step K: `true` when this fused emission also emitted the
+    /// standalone `NormGammaBackward` adjoint (for `norm_weight_var`
+    /// gamma trainables). `false` when the chain had no trainable
+    /// gamma (`norm_weight_var = None`) or `x_raw_var` resolution
+    /// failed. Load-bearing so the toy-pretrain smoke test can pin
+    /// that the gamma gradient is actually wired.
+    pub dgamma_emitted: bool,
 }
 
 /// Generates the backward (adjoint) Wengert list from a forward (primal) list.
@@ -231,7 +238,11 @@ impl AdjointGenerator {
                                     block_q: cfg.block_q,
                                     block_kv: cfg.block_kv,
                                     smoke_config: is_smoke,
+                                    // Gap I step K: flipped below if the
+                                    // chain has a trainable gamma.
+                                    dgamma_emitted: false,
                                 });
+                                let this_event_idx = self.csha_fused_events.len() - 1;
 
                                 eprintln!(
                                     "[nsl] CSHA fused backward: emitting fused launch for \
@@ -368,6 +379,56 @@ impl AdjointGenerator {
                                     self.accumulate_adjoint(v.wk_var, extract_results[4]);
                                     self.accumulate_adjoint(v.wv_var, extract_results[5]);
                                     self.accumulate_adjoint(v.x_norm_var, extract_results[6]);
+
+                                    // Gap I step K: standalone RMSNorm
+                                    // gamma gradient. The fused kernel
+                                    // returns `dx_norm` (extract[6]) —
+                                    // the upstream gradient flowing into
+                                    // the RMSNorm's output — but NOT
+                                    // `dgamma`. The suppressed per-op
+                                    // backward for the RMSNorm op
+                                    // (`AlreadyEmitted`) would have
+                                    // emitted `NormGammaBackward` via
+                                    // `ad_rules.rs:~388`; we replicate
+                                    // that here with the same adjoint
+                                    // expression so gamma receives a
+                                    // real gradient instead of cascade-
+                                    // skipping out of the lowered grad
+                                    // var set.
+                                    //
+                                    // Option B from the Gap I design
+                                    // doc § K: reuse the existing per-op
+                                    // AD lowering rather than adding an
+                                    // 8th kernel output. Zero PTX
+                                    // changes; zero new primal ops.
+                                    if let (Some(gamma_var), Some(x_raw_var)) =
+                                        (v.norm_weight_var, v.x_raw_var)
+                                    {
+                                        let dgamma = self.lower_adjoint_expr(
+                                            AdjointExpr::NormGammaBackward(
+                                                extract_results[6],
+                                                x_raw_var,
+                                                v.rmsnorm_eps,
+                                                -1,
+                                                gamma_var,
+                                            ),
+                                        );
+                                        self.accumulate_adjoint(gamma_var, dgamma);
+                                        if let Some(ev) =
+                                            self.csha_fused_events.get_mut(this_event_idx)
+                                        {
+                                            ev.dgamma_emitted = true;
+                                        }
+                                        eprintln!(
+                                            "[nsl] CSHA fused backward: emitted dgamma \
+                                             (NormGammaBackward) for layer '{}' → \
+                                             gamma VarId {} (x_raw VarId {}, eps={:e})",
+                                            mark_layer,
+                                            gamma_var,
+                                            x_raw_var,
+                                            v.rmsnorm_eps,
+                                        );
+                                    }
                                 } else {
                                     // Legacy best-effort routing: treat `op`
                                     // as a matmul. Wrong for RoPE/norm, but
