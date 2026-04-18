@@ -667,7 +667,7 @@ pub fn emit_sigmoid_approx_fused(ptx: &mut String, input: &str, output: &str) {
 /// TODO(gate-dtype): the `shl.b32 %r_gate, %r_gate, 2` assumes f32 gate.
 /// If gate dtype ever narrows to f16, shift constant becomes 1.
 pub fn emit_gate_load_per_thread(ptx: &mut String) {
-    ptx.push_str("    // GatedLoRA: per-thread gate load — 2 cols per thread\n");
+    ptx.push_str("    // GatedLoRA: per-thread gate load - 2 cols per thread\n");
     ptx.push_str("    add.u32  %r_gate, %col_base, %r5;\n");
     ptx.push_str("    shl.b32  %r_gate, %r_gate, 2;   // * 4 bytes (f32)\n");
     ptx.push_str("    cvt.u64.u32 %rd_gate_addr, %r_gate;\n");

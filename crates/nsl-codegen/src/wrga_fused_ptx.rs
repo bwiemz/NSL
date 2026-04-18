@@ -212,6 +212,15 @@ fn emit_fused_adapter_kernel_body(
     // 3. SMEM decl + register pool + shmem base + thread/lane/warp init.
     emit_static_smem_decl(ptx, 1536);
     emit_lora_register_pool(ptx, &budget);
+    // GatedLoRA-specific register declarations (PerColumnSigmoid only)
+    if matches!(fold, FoldKind::PerColumnSigmoid { .. }) {
+        ptx.push_str("    .reg .f32 %gate0, %gate1;\n");
+        ptx.push_str("    .reg .f32 %sig_tmp;\n");
+        ptx.push_str("    .reg .f32 %fold_tmp;\n");
+        ptx.push_str("    .reg .u64 %rd_gate, %rd_gate_addr;\n");
+        ptx.push_str("    .reg .u32 %r_gate, %r_col1;\n");
+        ptx.push_str("    .reg .pred %p_col0, %p_col1;\n");
+    }
     // u32 tile-base shadow regs for SMEM addressing.
     ptx.push_str("    .reg .u32 %smem_base_x_u32, %smem_base_w_u32, %smem_base_a_u32, %smem_base_b_u32;\n");
     // f32 and b16 scratch for tile-staging f32→f16 conversion.
@@ -265,6 +274,9 @@ fn emit_fused_adapter_kernel_body(
     emit_ld_param_f32(ptx, "%scale_reg", "scale");
     emit_ld_param_u32(ptx, "%m_param", "m_rows");
     emit_ld_param_u32(ptx, "%n_param", "n_cols");
+    if matches!(fold, FoldKind::PerColumnSigmoid { .. }) {
+        emit_ld_param_u64(ptx, "%rd_gate", "gate_ptr");
+    }
 
     // 5. Output-tile coords + zero accumulators.
     // Use runtime m_param / n_param for predication — see the m_rows/n_cols
@@ -355,6 +367,23 @@ fn emit_fused_adapter_kernel_body(
         // epi_a_frag (from a_tile, col-major B-fragment, 2 b32 regs) as B-operand.
         emit_mma_instruction(ptx, &epi_interm, &main_a_frag, &epi_a_frag, &epi_interm);
 
+        // GatedLoRA: LastKIter scheduling — gate load + sigmoid at end of
+        // final main K-iteration, overlapping HBM load latency with the
+        // last main MMA.  See spec §2 and invariant #14.
+        if k_tile == k_iters - 1 {
+            if let FoldKind::PerColumnSigmoid {
+                gate_load_phase: GateLoadPhase::LastKIter, ..
+            } = fold {
+                // %r5 = col_base_in_tile = (tid%4)*2 — needed by emit_gate_load_per_thread.
+                // The store preamble also computes %r5 but runs after this point; emit here.
+                ptx.push_str("    and.b32 %r5, %tid_x, 3;\n");
+                ptx.push_str("    shl.b32 %r5, %r5, 1;\n");
+                crate::wrga_kernel_helpers::emit_gate_load_per_thread(ptx);
+                crate::wrga_kernel_helpers::emit_sigmoid_approx_fused(ptx, "%gate0", "%gate0");
+                crate::wrga_kernel_helpers::emit_sigmoid_approx_fused(ptx, "%gate1", "%gate1");
+            }
+        }
+
         ptx.push_str("    bar.sync 0;\n");
     }
 
@@ -405,19 +434,7 @@ fn emit_fused_adapter_kernel_body(
             }
         }
         FoldKind::PerColumnSigmoid { .. } => {
-            // GatedLoRA fold — implemented in Task 4.1.  For now, placeholder
-            // emits a bar.sync so the kernel body still parses if reached
-            // (though Task 3.1's stub synthesizer won't call us yet).
-            ptx.push_str("    // GatedLoRA fold placeholder; Task 4.1 replaces this\n");
-            ptx.push_str("    // with emit_gatedlora_fold() from wrga_kernel_helpers.rs\n");
-            for i in 0..4u32 {
-                ptx.push_str(&format!(
-                    "    mul.f32 %epi_final{i}, %epi_final{i}, %scale_reg;\n"
-                ));
-                ptx.push_str(&format!(
-                    "    add.f32 %main_accum{i}, %main_accum{i}, %epi_final{i};\n"
-                ));
-            }
+            crate::wrga_kernel_helpers::emit_gatedlora_fold(ptx);
         }
     }
 
@@ -624,25 +641,25 @@ pub fn synthesize_fused_gatedlora_ptx(config: &FusedGatedLoraConfig) -> String {
     );
     assert!(config.target_sm >= 80, "B.3 requires sm_80+");
 
-    // STUB: intentionally invalid PTX to establish red test state.
-    // Task 4.1 replaces this with emit_fused_adapter_kernel_body(..,
-    // FoldKind::PerColumnSigmoid { .. }).
-    //
-    // The stub emits a .entry with a deliberately invalid instruction
-    // (`this_is_not_a_real_ptx_opcode`) so ptxas rejects it.  An empty module
-    // (header + comment only) is valid PTX and would silently pass ptxas.
-    let sm = config.target_sm;
-    format!(
-        ".version 7.0\n\
-         .target sm_{sm}\n\
-         .address_size 64\n\
-         \n\
-         // STUB — Task 4.1 replaces this body\n\
-         .visible .entry gatedlora_stub ()\n\
-         {{\n\
-             this_is_not_a_real_ptx_opcode;\n\
-         }}\n"
-    )
+    let entry_name = format!(
+        "nsl_wrga_fused_gatedlora_m{}n{}k{}r{}",
+        config.m, config.n, config.k, config.rank,
+    );
+    let mut ptx = String::new();
+    emit_fused_adapter_kernel_body(
+        &mut ptx,
+        &entry_name,
+        config.m,
+        config.n,
+        config.k,
+        config.rank,
+        FoldKind::PerColumnSigmoid {
+            gate_ptr_param_name: "gate_ptr",
+            gate_load_phase: GateLoadPhase::LastKIter,
+            partial_tile_mask: PartialTileMask::FoldResultMask,
+        },
+    );
+    ptx
 }
 
 #[cfg(test)]
