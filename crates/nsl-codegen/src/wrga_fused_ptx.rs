@@ -35,6 +35,28 @@ pub struct FusedIa3Config {
     pub target_sm: u32,
 }
 
+/// Config for `synthesize_fused_gatedlora_ptx`.  Mirrors `FusedLoraConfig`
+/// field-for-field; the produced kernel emits the `PerColumnSigmoid` fold
+/// variant via the shared `emit_fused_adapter_kernel_body`.
+///
+/// Separate type so kernel-dedup and dispatch don't confuse GatedLoRA and
+/// LoRA kernel instances (different kernel_handle ⇒ different PTX registry
+/// entry).
+///
+/// scale is NOT a field — it flows at launch time via `.param .f32 scale`
+/// (B.3 dedup invariant; see spec Risk #5).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct FusedGatedLoraConfig {
+    pub site_id: String,
+    pub m: u32,         // batch
+    pub n: u32,         // d_out
+    pub k: u32,         // k_in (shared dim of x@W)
+    pub rank: u32,      // ≤ 16
+    pub target_sm: u32, // 80, 86, ...
+                        // scale is intentionally NOT a field — passed at launch time as
+                        // .param .f32.  See dedup notes in B.3 spec Risk #5.
+}
+
 /// Kernel cache key for dedup.  Sites with matching key share one PTX.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct LoraKernelKey {
@@ -580,6 +602,33 @@ pub fn synthesize_fused_ia3_ptx(config: &FusedIa3Config) -> String {
     ptx.push_str("}\n");
 
     ptx
+}
+
+/// Synthesize PTX for a fused GatedLoRA forward adapter kernel.
+///
+/// Computes `y[i,j] = (x @ W)[i,j] + sigmoid(gate[j]) * ((x @ A) @ B)[i,j] * scale`
+/// where `gate` is a per-output-column f32 vector.
+///
+/// Uses the shared `emit_fused_adapter_kernel_body` with
+/// `FoldKind::PerColumnSigmoid` to reuse LoRA's proven kernel body plus
+/// gate-load + sigmoid + per-column fold logic from `wrga_kernel_helpers`.
+///
+/// STUB — current body returns an invalid PTX header-only stub for
+/// Task 3.2's red-state test setup.  Task 4.1 replaces this with the real
+/// emission via `emit_fused_adapter_kernel_body(.., FoldKind::PerColumnSigmoid { .. })`.
+pub fn synthesize_fused_gatedlora_ptx(config: &FusedGatedLoraConfig) -> String {
+    assert!(
+        config.rank <= 16,
+        "B.3 rank ceiling: {} > 16; multi-pass epilogue is a follow-up milestone",
+        config.rank,
+    );
+    assert!(config.target_sm >= 80, "B.3 requires sm_80+");
+
+    // STUB: intentionally invalid PTX to establish red test state.
+    // Task 4.1 replaces this with emit_fused_adapter_kernel_body(..,
+    // FoldKind::PerColumnSigmoid { .. }).
+    let _ = config;
+    String::from(".version 7.0\n.target sm_80\n.address_size 64\n\n// STUB — Task 4.1 replaces this\n")
 }
 
 #[cfg(test)]
