@@ -111,6 +111,302 @@ pub enum PartialTileMask {
 
 const MMA_K_U32: u32 = 16; // m16n8k16
 
+/// Shared kernel body for fused adapter matmul kernels.
+///
+/// Emits the full kernel entry + body for either LoRA (FoldKind::Scalar)
+/// or GatedLoRA (FoldKind::PerColumnSigmoid).  Variation points:
+///   - Param block: PerColumnSigmoid adds `.param .u64 gate_ptr`
+///   - Fold step: Scalar uses %scale_reg uniform multiply; PerColumnSigmoid
+///     uses per-thread sigmoid(gate) multiply (implemented in Task 4.1;
+///     this task leaves the PerColumnSigmoid fold as a placeholder that
+///     emits the same Scalar math so unit tests compile and run plausibly).
+///
+/// All other phases (header, SMEM, register pool, indexing, param loads,
+/// output coords, accumulator init, main K-loop, post-loop (x@A)@B MMA,
+/// f32→packed-f16 conversion for final MMA A-operand, store, ret) are
+/// identical between the two FoldKind variants.
+#[allow(dead_code)]
+fn emit_fused_adapter_kernel_body(
+    ptx: &mut String,
+    entry_name: &str,
+    m: u32,
+    n: u32,
+    k: u32,
+    rank: u32,
+    fold: FoldKind,
+) {
+    use crate::kernel_skeleton::header::{emit_ptx_header, PtxVersion, TargetSm};
+    use crate::kernel_skeleton::indexing::emit_thread_lane_warp_register_init;
+    use crate::kernel_skeleton::params::{
+        emit_ld_param_f32, emit_ld_param_u32, emit_ld_param_u64, emit_param_block, Param, ParamTy,
+    };
+    use crate::kernel_skeleton::smem::{emit_shmem_base_cvta, emit_static_smem_decl};
+    use crate::matmul_mma::{
+        emit_load_a_fragment_smem, emit_load_b_fragment_smem, emit_mma_instruction,
+    };
+    use crate::wrga_kernel_helpers::{
+        emit_lora_output_tile_coords_dynamic, emit_lora_register_pool, emit_lora_stage_a_tile,
+        emit_lora_stage_b_tile, emit_lora_stage_w_tile, emit_lora_stage_x_tile,
+        emit_lora_store_output, emit_lora_tile_bases, emit_matmul_mma_lane_init,
+        emit_zero_accumulators, wrga_lora_register_budget,
+    };
+
+    // Build a FusedLoraConfig just for register budget computation.
+    // target_sm=80 matches the Sm80 header below; this function always targets sm_80+.
+    let budget_cfg = crate::wrga_fused_ptx::FusedLoraConfig {
+        site_id: String::new(),
+        m,
+        n,
+        k,
+        rank,
+        target_sm: 80,
+    };
+    let budget = wrga_lora_register_budget(&budget_cfg);
+
+    // 1. File header.
+    emit_ptx_header(ptx, PtxVersion::V7_0, TargetSm::Sm80);
+
+    // 2. Param block (opens entry + `{` body).
+    // Variation point A: PerColumnSigmoid appends gate_ptr.
+    let mut params = vec![
+        Param { ty: ParamTy::U64, name: "x_ptr" },
+        Param { ty: ParamTy::U64, name: "w_ptr" },
+        Param { ty: ParamTy::U64, name: "a_ptr" },
+        Param { ty: ParamTy::U64, name: "b_ptr" },
+        Param { ty: ParamTy::F32, name: "scale" },
+        Param { ty: ParamTy::U64, name: "y_ptr" },
+        // m_rows and n_cols are passed as runtime u32 parameters so the same
+        // kernel binary handles any batch size.  The compile-time m/n
+        // are only used for staging (k-iteration count, rank padding) and
+        // kernel naming; predication uses the runtime values.
+        Param { ty: ParamTy::U32, name: "m_rows" },
+        Param { ty: ParamTy::U32, name: "n_cols" },
+    ];
+    if matches!(fold, FoldKind::PerColumnSigmoid { .. }) {
+        params.push(Param { ty: ParamTy::U64, name: "gate_ptr" });
+    }
+    emit_param_block(ptx, entry_name, &params);
+
+    // 3. SMEM decl + register pool + shmem base + thread/lane/warp init.
+    emit_static_smem_decl(ptx, 1536);
+    emit_lora_register_pool(ptx, &budget);
+    // u32 tile-base shadow regs for SMEM addressing.
+    ptx.push_str("    .reg .u32 %smem_base_x_u32, %smem_base_w_u32, %smem_base_a_u32, %smem_base_b_u32;\n");
+    // f32 and b16 scratch for tile-staging f32→f16 conversion.
+    // NSL GPU tensors are f32 (dtype=1); the MMA kernel requires f16 operands in SMEM.
+    // Staging loads each f32 element, converts to f16 with cvt.rn.f16.f32, and packs
+    // two f16 values into a b32 for SMEM storage.
+    ptx.push_str("    .reg .f32 %stg_f0, %stg_f1;\n");
+    ptx.push_str("    .reg .b16 %stg_h0, %stg_h1;\n");
+    // Lane-adjusted B-fragment bases: smem_base_[w|b]_u32 + (tid/4)*2 bytes.
+    // Per m16n8k16 B-fragment layout, thread t addresses column (t/4) of the
+    // B tile; the column byte offset must be baked into the SMEM base so that
+    // emit_load_b_fragment_smem (which only walks k-rows) lands on the right
+    // column.  Without this, all threads address column 0, causing SMEM OOB
+    // for threads 4..31 (mma_b_row*(row_stride=16) would exceed tile bounds).
+    ptx.push_str("    .reg .u32 %smem_base_w_lane_u32, %smem_base_a_lane_u32, %smem_base_b_lane_u32;\n");
+    // packed f16x2 regs for converting epi_interm f32 -> f16x2 b32 before final MMA.
+    ptx.push_str("    .reg .b32 %epi_packed0, %epi_packed1, %epi_packed2, %epi_packed3;\n");
+    // runtime m/n for tile predication (avoids ILLEGAL_ADDRESS on tail rows/cols).
+    ptx.push_str("    .reg .u32 %m_param, %n_param;\n");
+    emit_shmem_base_cvta(ptx);
+    emit_thread_lane_warp_register_init(ptx);
+    emit_lora_tile_bases(ptx);
+    // Convert u64 tile bases to u32 shared addresses for matmul_mma helpers.
+    ptx.push_str("    cvt.u32.u64 %smem_base_x_u32, %x_tile_base;\n");
+    ptx.push_str("    cvt.u32.u64 %smem_base_w_u32, %w_tile_base;\n");
+    ptx.push_str("    cvt.u32.u64 %smem_base_a_u32, %a_tile_base;\n");
+    ptx.push_str("    cvt.u32.u64 %smem_base_b_u32, %b_tile_base;\n");
+    emit_matmul_mma_lane_init(ptx);
+    // Per-lane B-fragment column base offset in col-major SMEM layout.
+    // Col-major B-tile: column c starts at byte c*32 (= c * 16 k-rows * 2 bytes/f16).
+    // Thread t accesses column (t/4), so lane column base = (tid/4)*32.
+    // mma_b_row (computed in emit_matmul_mma_lane_init) = (tid%4)*4 (byte offset
+    // within the column for the k-pair).  Together:
+    //   b-frag-addr = smem_base_b_lane_u32 + mma_b_row * 1 + {0, 16}
+    //              = smem_base_b_u32 + (tid/4)*32 + (tid%4)*4 + {0, 16}
+    // All terms are multiples of 4, so ld.shared.b32 is always 4-byte aligned.
+    ptx.push_str("    // Per-lane B-frag column base: (tid/4)*32 bytes (col-major stride=32)\n");
+    ptx.push_str("    shr.u32 %r9, %tid_x, 2;\n");
+    ptx.push_str("    shl.b32 %r9, %r9, 5;\n");  // * 32 bytes (col stride in col-major)
+    ptx.push_str("    add.u32 %smem_base_w_lane_u32, %smem_base_w_u32, %r9;\n");
+    // a_tile is also col-major (used as B-operand in epilogue MMA: x @ a_tile).
+    ptx.push_str("    add.u32 %smem_base_a_lane_u32, %smem_base_a_u32, %r9;\n");
+    ptx.push_str("    add.u32 %smem_base_b_lane_u32, %smem_base_b_u32, %r9;\n");
+
+    // 4. Load params into named registers.
+    emit_ld_param_u64(ptx, "%rd_x", "x_ptr");
+    emit_ld_param_u64(ptx, "%rd_w", "w_ptr");
+    emit_ld_param_u64(ptx, "%rd_a", "a_ptr");
+    emit_ld_param_u64(ptx, "%rd_b", "b_ptr");
+    emit_ld_param_u64(ptx, "%rd_y", "y_ptr");
+    emit_ld_param_f32(ptx, "%scale_reg", "scale");
+    emit_ld_param_u32(ptx, "%m_param", "m_rows");
+    emit_ld_param_u32(ptx, "%n_param", "n_cols");
+
+    // 5. Output-tile coords + zero accumulators.
+    // Use runtime m_param / n_param for predication — see the m_rows/n_cols
+    // params added in step 2.  This fixes ILLEGAL_ADDRESS when the prescan
+    // config.m (used only for staging) differs from the actual runtime batch.
+    emit_lora_output_tile_coords_dynamic(ptx);
+    emit_zero_accumulators(ptx, "main_accum", 8);
+    emit_zero_accumulators(ptx, "epi_interm", 4);
+
+    // 6. Main K-loop with interleaved epilogue.
+    //
+    // NOTE: Each K-iteration stages x, w, and a into SMEM, then loads MMA
+    // fragments.  The epi_interm MMA reuses %main_a_frag (x tile fragment)
+    // as its A-operand — this is correct per spec §3 invariant (1): the
+    // m16n8k16 A-fragment encodes only the m×k tile, independent of B.
+    let k_iters = (k + MMA_K_U32 - 1) / MMA_K_U32;
+
+    // Fragment register names for matmul_mma load helpers (without % — helpers add it).
+    let main_a_frag_names: [String; 4] = [
+        "main_a_frag0".into(), "main_a_frag1".into(),
+        "main_a_frag2".into(), "main_a_frag3".into(),
+    ];
+    let main_b_frag_names: [String; 2] = [
+        "main_b_frag0".into(), "main_b_frag1".into(),
+    ];
+    // epi_a_frag is used as B-operand (a_tile is col-major, k=16 × rank columns).
+    // m16n8k16 B-fragment requires only 2 b32 registers per thread.
+    let epi_a_frag_names: [String; 2] = [
+        "epi_a_frag0".into(), "epi_a_frag1".into(),
+    ];
+    let epi_b_frag_names: [String; 2] = [
+        "epi_b_frag0".into(), "epi_b_frag1".into(),
+    ];
+
+    // MMA operand arrays (with % — emit_mma_instruction uses names as-is).
+    let main_a_frag: [String; 4] = [
+        "%main_a_frag0".into(), "%main_a_frag1".into(),
+        "%main_a_frag2".into(), "%main_a_frag3".into(),
+    ];
+    let main_b_frag: [String; 2] = [
+        "%main_b_frag0".into(), "%main_b_frag1".into(),
+    ];
+    let epi_a_frag: [String; 2] = [
+        "%epi_a_frag0".into(), "%epi_a_frag1".into(),
+    ];
+    let epi_b_frag: [String; 2] = [
+        "%epi_b_frag0".into(), "%epi_b_frag1".into(),
+    ];
+    let main_accum: [String; 4] = [
+        "%main_accum0".into(), "%main_accum1".into(),
+        "%main_accum2".into(), "%main_accum3".into(),
+    ];
+    let epi_interm: [String; 4] = [
+        "%epi_interm0".into(), "%epi_interm1".into(),
+        "%epi_interm2".into(), "%epi_interm3".into(),
+    ];
+    let epi_final: [String; 4] = [
+        "%epi_final0".into(), "%epi_final1".into(),
+        "%epi_final2".into(), "%epi_final3".into(),
+    ];
+
+    for k_tile in 0..k_iters {
+        ptx.push_str(&format!("    // ===== K-iteration {} =====\n", k_tile));
+
+        emit_lora_stage_x_tile(ptx, k_tile, m, k);
+        emit_lora_stage_w_tile(ptx, k_tile, n, k);
+        emit_lora_stage_a_tile(ptx, k_tile, rank, k);
+
+        ptx.push_str("    bar.sync 0;\n");
+
+        // Load A and B fragments from SMEM using u32 tile base addresses.
+        // k_tile offset within the tile is handled at stage time (fresh per-iter).
+        emit_load_a_fragment_smem(ptx, &main_a_frag_names, "%smem_base_x_u32", 32);
+        // row_stride_bytes=1: mma_b_row already holds the full byte offset within the
+        // col-major column (= (tid%4)*4).  The lane base (smem_base_w_lane_u32) adds
+        // the column base ((tid/4)*32).  k-pair register offset = {0, 16} bytes comes
+        // from emit_load_b_fragment_smem's byte_col_offset = k_base_pair*2 = {0, 16}.
+        emit_load_b_fragment_smem(ptx, &main_b_frag_names, "%smem_base_w_lane_u32", 1);
+        // a_tile is col-major (B-operand in epilogue MMA: x @ a_tile).
+        // Same col-major B-fragment addressing as w_tile above.
+        emit_load_b_fragment_smem(ptx, &epi_a_frag_names, "%smem_base_a_lane_u32", 1);
+
+        // Main MMA: main_accum += x_tile @ w_tile
+        emit_mma_instruction(ptx, &main_accum, &main_a_frag, &main_b_frag, &main_accum);
+
+        // Epilogue interleaved MMA: epi_interm += x_tile @ a_tile
+        // Reuses %main_a_frag (from x_tile, row-major) as A-operand; uses
+        // epi_a_frag (from a_tile, col-major B-fragment, 2 b32 regs) as B-operand.
+        emit_mma_instruction(ptx, &epi_interm, &main_a_frag, &epi_a_frag, &epi_interm);
+
+        ptx.push_str("    bar.sync 0;\n");
+    }
+
+    // 7. Post-loop: stage b once, compute (x@A) @ B.
+    emit_lora_stage_b_tile(ptx, rank, n);
+    ptx.push_str("    bar.sync 0;\n");
+    // Same col-major byte-offset addressing as main W-fragment load.
+    emit_load_b_fragment_smem(ptx, &epi_b_frag_names, "%smem_base_b_lane_u32", 1);
+
+    // 8. Convert epi_interm (f32) → packed f16x2 (b32) for final MMA A-operand.
+    //
+    // MMA requires A-operand registers to be .b32 (packed f16 pairs).  epi_interm
+    // holds f32 accumulators from the K-loop.  We convert per PTX invariant:
+    //   cvt.rn.f16x2.f32 %dst, %f32_hi, %f32_lo
+    // Packs: lower f16 = f32_lo, upper f16 = f32_hi.
+    // Per m16n8k16 A-fragment layout, each thread holds 8 f16 values packed into
+    // 4 b32 registers.  epi_interm[0..3] holds 4 f32 values → 2 packed b32.
+    // The upper 2 b32 (for the k=8..15 half) are zero-padded.
+    ptx.push_str("    // Pack epi_interm f32 -> f16x2 b32 for final MMA A-operand\n");
+    ptx.push_str("    cvt.rn.f16x2.f32 %epi_packed0, %epi_interm1, %epi_interm0;\n");
+    ptx.push_str("    cvt.rn.f16x2.f32 %epi_packed1, %epi_interm3, %epi_interm2;\n");
+    ptx.push_str("    mov.b32 %epi_packed2, 0;\n");
+    ptx.push_str("    mov.b32 %epi_packed3, 0;\n");
+    let epi_packed: [String; 4] = [
+        "%epi_packed0".into(), "%epi_packed1".into(),
+        "%epi_packed2".into(), "%epi_packed3".into(),
+    ];
+
+    // Zero-init epi_final and compute (x@A) @ B using packed A-fragments.
+    emit_zero_accumulators(ptx, "epi_final", 4);
+    emit_mma_instruction(ptx, &epi_final, &epi_packed, &epi_b_frag, &epi_final);
+
+    // 9. Scale epi_final, fold into main_accum.
+    // Variation point B: Scalar uses %scale_reg uniform multiply;
+    // PerColumnSigmoid placeholder emits the same Scalar math for now —
+    // Task 4.1 replaces it with emit_gatedlora_fold() after the gate-load
+    // helpers from Task Group 2 are in place.
+    match fold {
+        FoldKind::Scalar => {
+            // LoRA fold: main_accum += epi_final * scale  (uniform scalar from param)
+            for i in 0..4u32 {
+                ptx.push_str(&format!(
+                    "    mul.f32 %epi_final{i}, %epi_final{i}, %scale_reg;\n"
+                ));
+                ptx.push_str(&format!(
+                    "    add.f32 %main_accum{i}, %main_accum{i}, %epi_final{i};\n"
+                ));
+            }
+        }
+        FoldKind::PerColumnSigmoid { .. } => {
+            // GatedLoRA fold — implemented in Task 4.1.  For now, placeholder
+            // emits a bar.sync so the kernel body still parses if reached
+            // (though Task 3.1's stub synthesizer won't call us yet).
+            ptx.push_str("    // GatedLoRA fold placeholder; Task 4.1 replaces this\n");
+            ptx.push_str("    // with emit_gatedlora_fold() from wrga_kernel_helpers.rs\n");
+            for i in 0..4u32 {
+                ptx.push_str(&format!(
+                    "    mul.f32 %epi_final{i}, %epi_final{i}, %scale_reg;\n"
+                ));
+                ptx.push_str(&format!(
+                    "    add.f32 %main_accum{i}, %main_accum{i}, %epi_final{i};\n"
+                ));
+            }
+        }
+    }
+
+    // 10. Store to y with predication.
+    emit_lora_store_output(ptx, n);
+
+    // 11. Close the entry body.
+    ptx.push_str("    ret;\n");
+    ptx.push_str("}\n");
+}
+
 /// Synthesize the full PTX for an epilogue-fused LoRA matmul kernel.
 ///
 /// **Rank ceiling:** `config.rank <= 16` (single-pass epilogue).  Caller
