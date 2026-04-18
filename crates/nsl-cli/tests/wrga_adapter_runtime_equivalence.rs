@@ -935,3 +935,71 @@ print(y)
 fn gatedlora_fixture_c_negative_saturation() {
     run_gatedlora_fixture(GATEDLORA_FIXTURE_C_SRC, 8.0, 1e-4, "fixture_c");
 }
+
+/// Fixture D — mid-range sigmoid curve validation.
+/// alpha=2, rank=2, scale=1.0.  gate = full([8], 1.0f) exact f32.
+/// sigmoid(1.0) ≈ 0.7310586.  y[i,j] = 8 + 0.7310586 * 16 * 1.0 ≈ 19.697 per element.
+///
+/// Tolerance 1e-3 (vs 1e-4 on A/B/C): gate=1.0f exercises the actual
+/// ex2.approx + rcp.approx sigmoid curve shape between saturation points,
+/// not exact values.
+///
+/// Error propagation at rank=2 accumulator magnitudes:
+///   ex2.approx worst-case ULP:      ~2 ULP (~5e-8 at input -1.4427)
+///   rcp.approx worst-case ULP:      ~1 ULP (~6e-8 at input ≈1.368)
+///   Combined via 1/(1+e) derivative: ~9e-8 on sigmoid output
+///   Through fold at rank=2:          ~5e-6 per element
+///   Main-path MMA noise floor:       ~2e-4 (dominates)
+///   1e-3 tolerance:                  ~5x over main MMA, ~200x over sigmoid
+///
+/// Bug class this fixture catches: a sign-based-stub kernel emitting
+/// `select(x > 0, 1.0, select(x < 0, 0.0, 0.5))` passes every saturation
+/// fixture (A/B/C) but returns 0.5 here — wrong by |0.5 - 0.7310586| ≈ 0.2311
+/// on the sigmoid value.
+///
+///   Correct y:   (x@W = 8) + 0.7310586 · 16 · 1.0 ≈ 19.697
+///   Stub   y:   (x@W = 8) + 0.5       · 16 · 1.0 = 16.0
+///                                                   ^^^^
+///   The (x@W = 8) base contribution is identical in both paths and cancels.
+///   y-level error = |19.697 − 16.0| = 3.697, driven entirely by the
+///   adapter-path factor 16 · (0.7311 − 0.5) ≈ 3.697. This is ~3700× the
+///   1e-3 tolerance — fixture fails loudly.
+///
+/// This is the ONLY fixture in the B.3.1 matrix that discriminates
+/// "emitted rcp.approx(1 + ex2.approx(-x * log2e))" from "silently stubbed."
+const GATEDLORA_FIXTURE_D_SRC: &str = r#"from nsl.nn.losses import mse_loss
+
+model Toy:
+    w: Tensor = ones([8, 8])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x @ self.w
+
+@adapter(type=gatedlora, target=["Toy.w"], rank=2, alpha=2)
+let m = Toy()
+m.to(cuda)
+let x = ones([4, 8]).to(cuda)
+let y_target = zeros([4, 8]).to(cuda)
+train(model = m, epochs = 1):
+    optimizer: SGD(lr = 0.0)
+    step(batch):
+        let pred = m.forward(x)
+        let loss = mse_loss(pred, y_target)
+m.lora_A_Toy_w__gatedlora = ones([8, 2]).to(cuda)
+m.lora_B_Toy_w__gatedlora = ones([2, 8]).to(cuda)
+m.gate_Toy_w__gatedlora = full([8], 1.0).to(cuda)
+let y = m.forward(x)
+print(y)
+"#;
+
+fn sigmoid_f64(x: f64) -> f64 {
+    1.0 / (1.0 + (-x).exp())
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn gatedlora_fixture_d_mid_range_curve() {
+    // Expected computed from CPU reference: 8 + sigmoid(1.0) * 16.
+    let expected = 8.0_f32 + sigmoid_f64(1.0) as f32 * 16.0;
+    run_gatedlora_fixture(GATEDLORA_FIXTURE_D_SRC, expected, 1e-3, "fixture_d");
+}
