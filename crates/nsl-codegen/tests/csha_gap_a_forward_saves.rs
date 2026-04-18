@@ -360,3 +360,101 @@ train(model = m, epochs = 1):
          `nsl_flash_attention_csha` variant when with-saves is active"
     );
 }
+
+/// Gap I.3 save-lookup consistency: the layer key used by the forward
+/// save-allocation branch in `wengert_lower.rs::ScaledDotProductAttention`
+/// MUST match the key the backward lowerer uses in
+/// `Compiler.csha_forward_saves.get(layer)` (= `mark.layer`).
+///
+/// This regression pins the two to the SAME source: `mark.layer`, which
+/// is populated by `collect_chain_dispatch_map_with_wengert` from
+/// `chain.layer` (= `layer_key_with_fallback(weight_param)`).  Previous
+/// Gap A dispatch in `compile_flash_attention_call` used
+/// `extras_for_current_function` / `layer_at_index` — a different
+/// mechanism, which for single-layer toy models is exactly where the
+/// "no forward saves for layer 'm'" cascade surfaced.
+///
+/// Property under test: for a single-layer toy Wengert list with
+/// weight names like `"m.wq"` / `"m.wk"` / `"m.wv"`, the bridge's
+/// `extras_for_layer("m")` must resolve, AND at least one mark with
+/// `mark.layer == "m"` must exist in the chain-dispatch map.  Meeting
+/// both means the save-allocation site (keyed by `mark.layer`) and the
+/// backward-lookup site (same key) agree without any naming-convention
+/// gymnastics.
+#[test]
+fn gap_i3_save_layer_key_matches_backward_mark_layer() {
+    use nsl_codegen::csha_apply::collect_chain_dispatch_map;
+    use nsl_codegen::wengert::{PrimalOp, WengertList};
+
+    // Single-layer toy model — mimics the Gap F smoke's `let m = TinyAttn()`
+    // weight-naming convention (`m.wq`, etc.), where `layer_key_with_fallback`
+    // strips the last `.wq` / `.wk` / `.wv` and yields `"m"`.
+    let ops = vec![
+        op(0, 0, PrimalOp::Input("x".into()), vec![]),
+        op(1, 1, PrimalOp::RMSNorm { eps: 1e-5 }, vec![0]),
+        op(2, 2, PrimalOp::Param("m.wq".into()), vec![]),
+        op(3, 3, PrimalOp::Matmul, vec![1, 2]),
+        op(4, 4, PrimalOp::Param("m.wk".into()), vec![]),
+        op(5, 5, PrimalOp::Matmul, vec![1, 4]),
+        op(6, 6, PrimalOp::Param("m.wv".into()), vec![]),
+        op(7, 7, PrimalOp::Matmul, vec![1, 6]),
+    ];
+    let wengert = WengertList {
+        ops,
+        output: 7,
+        var_names: HashMap::new(),
+        var_types: HashMap::new(),
+    };
+
+    let plan = match run_on_wengert(&wengert, "H100", "auto", None, None, 8, None) {
+        Some(p) => p,
+        None => {
+            eprintln!("[gap-i3] csha::run_on_wengert returned None — skipping");
+            return;
+        }
+    };
+    let bridge_out = csha_bridge(&plan, 64, &mut Vec::new());
+    if bridge_out.extras.is_empty() {
+        eprintln!("[gap-i3] bridge produced no extras — skipping");
+        return;
+    }
+
+    // Forward-save-allocation path (wengert_lower.rs::ScaledDotProductAttention)
+    // resolves its layer key from `mark.layer` via
+    // `compiler.csha_backward_claims.op_to_chain`.
+    let (_op_to_chain, chain_marks) = collect_chain_dispatch_map(&plan, &bridge_out);
+    assert!(
+        !chain_marks.is_empty(),
+        "chain-dispatch map must populate at least one mark for a valid CSHA plan"
+    );
+
+    let save_key = chain_marks[0].layer.clone();
+
+    // Backward-lookup path (wengert_lower.rs::FusedCshaBackward) reads
+    // `compiler.csha_forward_saves.get(&layer)` where `layer == mark.layer`.
+    // Same source → the keys are by construction identical.  The test
+    // below pins that fact: every mark.layer MUST resolve in
+    // `bridge.extras_for_layer`, confirming the forward allocation site
+    // can also resolve the extras to check `save_activations_for_backward`.
+    for mark in &chain_marks {
+        assert!(
+            bridge_out.extras_for_layer(&mark.layer).is_some(),
+            "mark.layer '{}' must resolve in bridge.extras — if this \
+             fails, the forward save-allocation branch in wengert_lower.rs \
+             cannot check `save_activations_for_backward` and will silently \
+             skip the alloc, reproducing the Gap I.3 cascade.",
+            mark.layer,
+        );
+    }
+
+    // Load-bearing: for the `m.wq`-style naming this MUST be exactly "m"
+    // (the `layer_key_with_fallback` "last-dot" fallback).  If the plan's
+    // layer-key derivation changes, this test loudly flags that the save
+    // allocation needs to follow.
+    assert_eq!(
+        save_key, "m",
+        "single-layer toy with `m.wq` / `m.wk` / `m.wv` must produce \
+         layer key 'm' — got '{save_key}'. If this changes, the \
+         `let m = TinyAttn()` Gap F smoke will hit a cache-miss again."
+    );
+}

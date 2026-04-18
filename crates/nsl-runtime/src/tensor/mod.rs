@@ -1358,6 +1358,61 @@ pub extern "C" fn nsl_tensor_zeros_on(shape_list: i64, device: i64) -> i64 {
     }
 }
 
+/// Create a zero-filled f16 (dtype=2, 2 bytes/element) tensor on the
+/// requested device.
+///
+/// Used by the CSHA Tier C fused backward kernel's gradient-output
+/// allocations (dq/dk/dv/dwq/dwk/dwv) — the PTX writes these via
+/// `st.global.u16` at f16 element stride.  The classic `nsl_tensor_zeros_on`
+/// hard-codes f32 (4 bytes/element), which leaves the upper bytes of each
+/// element uninitialised and makes any subsequent f32 read interpret raw
+/// f16 bits as f32 → garbage.  `dx` stays on the f32 helper because the
+/// kernel writes it as f32; this helper exists specifically for the 6
+/// f16-typed gradient outputs.
+#[no_mangle]
+pub extern "C" fn nsl_tensor_zeros_f16_on(shape_list: i64, device: i64) -> i64 {
+    if device == 0 {
+        return crate::tensor::creation::tensor_from_shape_list_f16(shape_list, 0.0);
+    }
+    #[cfg(feature = "cuda")]
+    {
+        let list = NslList::from_ptr(shape_list);
+        let ndim = list.len;
+        let mut len: i64 = 1;
+        let shape = checked_alloc((ndim as usize) * std::mem::size_of::<i64>()) as *mut i64;
+        for i in 0..ndim as usize {
+            let dim = unsafe { *list.data.add(i) };
+            unsafe { *shape.add(i) = dim };
+            len *= dim;
+        }
+
+        // 2 bytes/element for f16.
+        let data_size = (len as usize) * 2;
+        let data = crate::cuda::inner::alloc_managed(data_size);
+        crate::cuda::inner::memset_d8(data, data_size);
+
+        let strides = NslTensor::compute_strides(shape, ndim);
+
+        let tensor = Box::new(NslTensor::new(
+            data,
+            shape,
+            strides,
+            ndim,
+            len,
+            device as u8,
+            DTYPE_FP16,
+            1,
+            0,
+        ));
+        NslTensor::publish(tensor)
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        let _ = shape_list;
+        panic!("CUDA support not compiled. Rebuild with --features cuda");
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn nsl_tensor_zeros_like(tensor_ptr: i64) -> i64 {
     let tensor = NslTensor::from_ptr(tensor_ptr);
@@ -3289,6 +3344,34 @@ mod tests {
         nsl_tensor_set_element(t, indices.as_ptr() as i64, 2, 42.0);
         let tensor = NslTensor::from_ptr(t);
         assert_eq!(unsafe { *tensor.data_f32().add(5) }, 42.0_f32);
+    }
+
+    /// Gap I.3 (A+F): `nsl_tensor_zeros_f16_on` must return a tensor whose
+    /// storage is actually f16 (dtype=2, element_size=2). Regression pin:
+    /// the Tier C fused backward writes dq/dk/dv/dwq/dwk/dwv via
+    /// `st.global.u16`; any f32-sized allocation would over-allocate by
+    /// 2× and leave half the bytes uninitialised.
+    #[test]
+    fn gap_i3_zeros_f16_on_cpu_reports_f16_dtype_and_elem_size() {
+        let shape = crate::list::nsl_list_new();
+        crate::list::nsl_list_push(shape, 4);
+        crate::list::nsl_list_push(shape, 8);
+        // device=0 → CPU path.  The CUDA path is gated by cfg(feature="cuda")
+        // and is exercised end-to-end by the CSHA integration tests.
+        let t = nsl_tensor_zeros_f16_on(shape, 0);
+        let tensor = NslTensor::from_ptr(t);
+        assert_eq!(tensor.dtype, DTYPE_FP16, "dtype must be DTYPE_FP16 (2)");
+        assert_eq!(tensor.element_size(), 2, "f16 element size must be 2 B");
+        assert_eq!(tensor.len, 32, "shape [4,8] → len=32");
+        assert_eq!(tensor.ndim, 2);
+        assert_eq!(unsafe { *tensor.shape }, 4);
+        assert_eq!(unsafe { *tensor.shape.add(1) }, 8);
+        // All-zero: reading each of the 32 u16 slots must give 0.
+        for i in 0..tensor.len as usize {
+            let bits = unsafe { *(tensor.data as *const u16).add(i) };
+            assert_eq!(bits, 0, "slot {} not zero-initialised", i);
+        }
+        nsl_tensor_free(t);
     }
 
     #[test]
