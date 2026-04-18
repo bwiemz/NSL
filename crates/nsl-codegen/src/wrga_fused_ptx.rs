@@ -57,6 +57,58 @@ impl FusedLoraConfig {
     }
 }
 
+/// Variation point for `emit_fused_adapter_kernel_body`'s fold step.
+/// LoRA uses `Scalar`; GatedLoRA uses `PerColumnSigmoid`.
+///
+/// Note: scale is NOT carried here — it's a `.param .f32 scale` loaded
+/// into `%scale_reg` at the kernel prolog, same for both adapter types.
+/// B.3 spec Risk #5: scale-as-param enables kernel dedup across sites
+/// with different alpha values.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum FoldKind {
+    /// LoRA: `main_accum += epi_final * %scale_reg`  (uniform scalar scale from param)
+    Scalar,
+    /// GatedLoRA: `main_accum += epi_final * sigmoid(gate[col]) * %scale_reg`  (per-column)
+    PerColumnSigmoid {
+        gate_ptr_param_name: &'static str,
+        gate_load_phase: GateLoadPhase,
+        partial_tile_mask: PartialTileMask,
+    },
+}
+
+/// Scheduling hint for when to emit gate-load + sigmoid computation in the
+/// PerColumnSigmoid fused body.
+///
+/// B.3.1 ships with `LastKIter` unconditionally; all shipped configs have
+/// `k_iters >= 1` for the epilogue path.  `PostLoop` is reserved for a
+/// potential future milestone that benchmarks load-phase alternatives.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum GateLoadPhase {
+    /// Emit gate load + sigmoid at the end of the final main K-iteration,
+    /// before its bar.sync.  Overlaps HBM load latency with the final MMA.
+    LastKIter,
+    /// Emit gate load + sigmoid after the main K-loop completes, before
+    /// the post-loop (x@A)@B MMA.  Has NO emission site in B.3.1; reserved.
+    PostLoop,
+}
+
+/// Partial-tile handling strategy for sub-MMA output tiles (n < 8).
+///
+/// B.3.1 ships `FoldResultMask` unconditionally; `SentinelGate` is reserved
+/// for a future variant that stages gate through SMEM with a sentinel value.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PartialTileMask {
+    /// Mask fold contribution with @%p_colN predicate; OOB gate reads
+    /// are harmless because the fold output is discarded.
+    FoldResultMask,
+    /// Pre-populate OOB gate SMEM slots with -20.0 such that sigmoid(-20) ≈ 0
+    /// naturally zeros the contribution.  Not emitted by B.3.1.
+    SentinelGate,
+}
+
 const MMA_K_U32: u32 = 16; // m16n8k16
 
 /// Synthesize the full PTX for an epilogue-fused LoRA matmul kernel.
