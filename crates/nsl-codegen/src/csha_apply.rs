@@ -455,7 +455,7 @@ pub fn collect_chain_dispatch_map(
     plan: &CshaPlan,
     bridge_result: &BridgeResult,
 ) -> (std::collections::HashMap<u32, usize>, Vec<FusionMark>) {
-    collect_chain_dispatch_map_with_wengert(plan, bridge_result, None)
+    collect_chain_dispatch_map_with_wengert(plan, bridge_result, None, None)
 }
 
 /// Gap D.1 internal: version that optionally accepts a Wengert list so
@@ -463,10 +463,20 @@ pub fn collect_chain_dispatch_map(
 /// RMSNorm-out) for correct gradient routing. Callers that already have
 /// the Wengert list should prefer this variant; the one-arg helper above
 /// stays for back-compat with existing tests.
+///
+/// Gap I.1: accepts an optional **training** `FlashAttentionConfig` that,
+/// when present, is attached to each emitted `FusionMark.config` in place
+/// of the pipeline/plan-level config. The training config is the one the
+/// fused-backward kernel is actually built from (`csha_training_config`
+/// on `FlashAttentionCompileContext` — no fusion flags, block_kv=32), so
+/// attaching it makes the backward SMEM validator see the same geometry
+/// the launch site will fire. Without this, the dispatcher validates
+/// against the inflated pipeline config and rejects at hd=32.
 pub fn collect_chain_dispatch_map_with_wengert(
     plan: &CshaPlan,
     bridge_result: &BridgeResult,
     wengert: Option<&crate::wengert::WengertList>,
+    training_config: Option<&FlashAttentionConfig>,
 ) -> (std::collections::HashMap<u32, usize>, Vec<FusionMark>) {
     let mut op_to_chain: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
     let mut chain_marks: Vec<FusionMark> = Vec::new();
@@ -591,6 +601,14 @@ pub fn collect_chain_dispatch_map_with_wengert(
                 _ => None,
             };
 
+            // Gap I.1: when the caller supplies a training config, stamp
+            // that onto the mark so the backward SMEM validator sees the
+            // clamped tile (block_kv=32, no fusion flags). The plan-level
+            // `config` carries the pipeline's fusion flags which inflate
+            // the backward layout past the 99 KB cap at hd=32.
+            let mark_config = training_config
+                .cloned()
+                .or_else(|| config.clone());
             chain_marks.push(FusionMark {
                 layer: layer.clone(),
                 // The grouped mark represents the whole layer; pick Q as
@@ -599,7 +617,7 @@ pub fn collect_chain_dispatch_map_with_wengert(
                 kind: Some(ProjKind::Q),
                 param_name: qc.weight_param.clone(),
                 role: MarkRole::NormPrologue,
-                config: config.clone(),
+                config: mark_config,
                 backward_emitted: std::cell::Cell::new(false),
                 chain_varids,
             });
@@ -632,12 +650,17 @@ pub fn collect_chain_dispatch_map_with_wengert(
                     })
                     .or_else(|| config.clone());
 
+                // Gap I.1: legacy per-chain path — prefer training
+                // config when available, same as the grouped path above.
+                let per_chain_mark_config = training_config
+                    .cloned()
+                    .or(per_kind_config);
                 chain_marks.push(FusionMark {
                     layer: layer.clone(),
                     kind: Some(chain.kind),
                     param_name: chain.weight_param.clone(),
                     role: MarkRole::NormPrologue,
-                    config: per_kind_config,
+                    config: per_chain_mark_config,
                     backward_emitted: std::cell::Cell::new(false),
                     chain_varids: None,
                 });

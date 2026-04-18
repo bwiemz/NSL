@@ -475,28 +475,19 @@ pub extern "C" fn nsl_model_get_weight(model_ptr: i64, name_ptr: i64, name_len: 
     model.weights.get(name).copied().unwrap_or(0)
 }
 
-/// Returns a pointer to the model's weight_ptrs array. The array contains
-/// `nsl_model_get_num_weights(model)` entries; each is an i64 that is a
-/// *mut NslTensor. The pointer is valid for the model's lifetime.
-#[no_mangle]
-pub extern "C" fn nsl_model_get_weight_ptrs(model_ptr: i64) -> i64 {
-    if model_ptr == 0 {
-        set_error("nsl_model_get_weight_ptrs: null model\0".to_string());
-        return 0;
-    }
-    let model = unsafe { &*(model_ptr as *const NslModel) };
-    model.weight_ptrs.as_ptr() as i64
-}
-
-/// Returns the number of weights in the model.
-#[no_mangle]
-pub extern "C" fn nsl_model_get_num_weights(model_ptr: i64) -> i64 {
-    if model_ptr == 0 {
-        set_error("nsl_model_get_num_weights: null model\0".to_string());
-        return 0;
-    }
-    let model = unsafe { &*(model_ptr as *const NslModel) };
-    model.weight_ptrs.len() as i64
+// NOTE (Gap I.1/I.2 worktree): the previously-present second pair of
+// `nsl_model_get_weight_ptrs` / `nsl_model_get_num_weights` definitions
+// has been removed. They were duplicate `#[no_mangle]` exports of the
+// functions defined at lines 446/457 above, left over from a conflict
+// between PR #45 (@export decorator) and PR #48 (m62 c-wrappers). The
+// duplicate block blocked `cargo build` on main at `b1c071f`. Removing
+// the second pair here is not part of the Gap I bundle — it is a
+// pre-existing compile fix needed to run this PR's tests. File a
+// separate cleanup PR if a hygiene pass for main is desired.
+#[allow(dead_code)]
+fn _gap_i_compile_note(model_ptr: i64) -> i64 {
+    let _ = model_ptr;
+    0
 }
 
 // ---------------------------------------------------------------------------

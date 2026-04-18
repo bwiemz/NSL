@@ -1067,11 +1067,15 @@ fn lower_single_op(
             // and this arm is unreachable in practice.  It exists as a ready-
             // made symbol Gap D can call without further plumbing work.
             //
-            // Contract expected by Gap D:
-            //   - inputs[0] is the "chain key" VarId.  Gap D decides what
+            // Contract expected by Gap D (revised by Gap I.2+M):
+            //   - inputs[0] is the launch op's Cranelift Value — a
+            //     placeholder zero tensor that exists purely as a
+            //     worklist-walk anchor for `eliminate_dead_gradients`.
+            //     The value itself is never dereferenced here.
+            //   - inputs[1] is the "chain key" VarId.  Gap D decides what
             //     VarId to use (typically the RMSNorm input or the SDPA
             //     output), but all seven extract ops in one chain MUST share
-            //     the same first-input VarId so they look up the same cache
+            //     the same second-input VarId so they look up the same cache
             //     entry.
             //   - Gap D populates the cache *before* emitting any extract
             //     op, by running the fused backward launch and stashing the
@@ -1088,7 +1092,10 @@ fn lower_single_op(
                     component
                 )));
             }
-            let key_val = inputs[0];
+            // Gap I.2+M: inputs[0] is the launch-result placeholder
+            // (ignored); inputs[1] is the chain cache key.
+            let _launch_result = inputs[0];
+            let key_val = inputs[1];
             let slot = compiler
                 .csha_fused_bwd_cache
                 .get(&key_val)

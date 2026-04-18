@@ -272,19 +272,32 @@ impl AdjointGenerator {
                                 let mut launch_inputs = vec![chain_key, do_var];
                                 launch_inputs.extend(op.inputs.iter().copied());
 
-                                let _launch_result = self.emit_op(
+                                let launch_result = self.emit_op(
                                     PrimalOp::FusedCshaBackward {
                                         layer: mark_layer.clone(),
                                     },
                                     launch_inputs,
                                 );
 
-                                // Emit 7 extract ops sharing the chain_key.
+                                // Gap I.2 + M: each extract op now lists the
+                                // launch op's result VarId as its FIRST input
+                                // so `eliminate_dead_gradients`' worklist walk
+                                // (which traverses `op.inputs` back from
+                                // `needed_vars`) reaches the launch op via any
+                                // live extract. Without this, the launch's
+                                // result is referenced by nothing and the pass
+                                // prunes it — leaving the extracts to fail
+                                // with "no cache entry".
+                                //
+                                // The launch's Cranelift Value (inputs[0] in
+                                // the lowerer) is a placeholder zero tensor
+                                // and is not actually consumed; inputs[1] is
+                                // the `chain_key` used to look up the cache.
                                 let mut extract_results: [VarId; 7] = [0u32; 7];
                                 for component in 0u8..=6u8 {
                                     let r = self.emit_op(
                                         PrimalOp::CshaFusedBackwardExtract { component },
-                                        vec![chain_key],
+                                        vec![launch_result, chain_key],
                                     );
                                     extract_results[component as usize] = r;
                                 }
@@ -2518,6 +2531,83 @@ mod tests {
         let ops = vec![make_op(0, 10, PrimalOp::Add, vec![0, 1])];
         let pruned = eliminate_dead_gradients(&ops, &HashSet::new());
         assert!(pruned.is_empty());
+    }
+
+    /// Gap I.2+M regression: a `FusedCshaBackward` launch op and its
+    /// seven `CshaFusedBackwardExtract` consumers form a coupled
+    /// multi-result primitive. The launch's result VarId is never read
+    /// directly (the extracts pull the real outputs from a side-channel
+    /// cache), so the dead-gradient worklist walk would normally prune
+    /// the launch.
+    ///
+    /// The Gap I.2+M fix lists the launch's result VarId as the FIRST
+    /// input of every extract op, giving the worklist walk a data-
+    /// dependency edge to reach back through. This test pins that
+    /// behavior: marking any ONE extract output as needed must keep the
+    /// launch op alive in the pruned output.
+    #[test]
+    fn gap_i2_launch_op_kept_alive_via_extract_dependency() {
+        // Layout:
+        //   op 0 → launch  (FusedCshaBackward, result = 100, inputs = [chain_key=1])
+        //   op 1 → extract(0)  (result = 200, inputs = [launch_result=100, chain_key=1])
+        //   op 2..7 → extract(1..6)  (results 201..206, same input shape)
+        //   op 8 → Mul(200, 999) → result = 300  (consumer of the dq extract)
+        //
+        // `needed = {300}` — we need the consumer's adjoint. Dead-grad
+        // elim must walk back: 300 → Mul → 200 → extract(0) → launch
+        // → chain_key. Without the I.2+M fix, the extract's inputs
+        // would be only [chain_key] and the launch would be pruned.
+        let mut ops = vec![
+            make_op(
+                0,
+                100,
+                PrimalOp::FusedCshaBackward {
+                    layer: "blocks.0".into(),
+                },
+                vec![1 /* chain_key */],
+            ),
+        ];
+        for c in 0u8..=6u8 {
+            ops.push(make_op(
+                (c as u32) + 1,
+                200 + c as VarId,
+                PrimalOp::CshaFusedBackwardExtract { component: c },
+                vec![100 /* launch_result */, 1 /* chain_key */],
+            ));
+        }
+        // A downstream consumer of the dq extract (component 0).
+        ops.push(make_op(8, 300, PrimalOp::Mul, vec![200, 999]));
+
+        let needed = HashSet::from([300_u32]);
+        let pruned = eliminate_dead_gradients(&ops, &needed);
+
+        // Launch op MUST survive — it's now reachable via extract(0)'s
+        // inputs[0].
+        let launch_kept = pruned.iter().any(|o| {
+            matches!(
+                &o.op,
+                PrimalOp::FusedCshaBackward { layer } if layer == "blocks.0"
+            )
+        });
+        assert!(
+            launch_kept,
+            "I.2+M regression: FusedCshaBackward launch op must survive \
+             dead-grad elimination when any extract's output is live; \
+             pruned ops = {:?}",
+            pruned.iter().map(|o| (o.result, &o.op)).collect::<Vec<_>>()
+        );
+
+        // The live extract (component 0) must also be kept.
+        let extract0_kept = pruned.iter().any(|o| {
+            matches!(
+                &o.op,
+                PrimalOp::CshaFusedBackwardExtract { component: 0 }
+            )
+        });
+        assert!(
+            extract0_kept,
+            "extract(0) feeds the consumer at var 300 and must survive"
+        );
     }
 
     #[test]

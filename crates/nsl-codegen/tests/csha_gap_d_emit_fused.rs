@@ -352,17 +352,168 @@ fn emit_fused_produces_launch_op_plus_seven_extracts() {
         extract_count
     );
 
-    // All seven extracts share the same chain_key VarId as their first
-    // input — the matmul_op's result (VarId 2).
+    // Gap I.2+M: each extract lists two inputs — [launch_result,
+    // chain_key]. All seven MUST declare the launch op's result as their
+    // FIRST input (so dead-grad elim keeps the launch alive via the
+    // worklist walk) and share the same SECOND input — the matmul_op's
+    // result VarId 2 (the chain key).
+    let launch_result = adjoint
+        .ops
+        .iter()
+        .find_map(|o| match &o.op {
+            PrimalOp::FusedCshaBackward { .. } => Some(o.result),
+            _ => None,
+        })
+        .expect("launch op should be present in adjoint list");
     for op in &adjoint.ops {
         if let PrimalOp::CshaFusedBackwardExtract { .. } = op.op {
             assert_eq!(
-                op.inputs.first().copied(),
-                Some(2),
-                "all 7 extract ops must share chain_key VarId = matmul_op.result"
+                op.inputs.len(),
+                2,
+                "extract ops must have 2 inputs ([launch_result, chain_key]); got {:?}",
+                op.inputs
+            );
+            assert_eq!(
+                op.inputs[0], launch_result,
+                "extract inputs[0] must be the FusedCshaBackward launch result"
+            );
+            assert_eq!(
+                op.inputs[1], 2,
+                "extract inputs[1] must be the chain_key = matmul_op.result"
             );
         }
     }
+}
+
+/// Gap I.2+M combined test: run `AdjointGenerator::generate` to produce
+/// a full adjoint list with a real `FusedCshaBackward` + 7 extracts,
+/// then invoke `eliminate_dead_gradients` with the param adjoints
+/// marked as needed, and assert the launch op is still present.
+///
+/// This stitches together the two passes the real compile does (source
+/// AD emits, dead-grad elim prunes) and pins that the launch op's
+/// survival is load-bearing through the combined pipeline.
+#[test]
+fn gap_i2_launch_op_survives_dead_grad_elim_in_generated_adjoint() {
+    use nsl_codegen::csha_apply::FusionMark;
+    use nsl_codegen::csha_boundary::ProjKind;
+    use nsl_codegen::flash_attention::{CshaExtras, FlashAttentionConfig, RopeStyle};
+    use nsl_codegen::source_ad::{
+        eliminate_dead_gradients, AdjointGenerator, CshaBackwardClaims,
+    };
+    use nsl_codegen::wengert::{PrimalOp, WengertList, WengertOp, WengertType};
+    use std::collections::{HashMap, HashSet};
+
+    // Same shape as the existing emit_fused test: Input + Param + Matmul,
+    // with the matmul claimed by CSHA.
+    let ops = vec![
+        WengertOp {
+            id: 0,
+            result: 0,
+            op: PrimalOp::Input("x".into()),
+            inputs: vec![],
+            saved_for_backward: false,
+            checkpointed: false,
+        },
+        WengertOp {
+            id: 1,
+            result: 1,
+            op: PrimalOp::Param("wq".into()),
+            inputs: vec![],
+            saved_for_backward: false,
+            checkpointed: false,
+        },
+        WengertOp {
+            id: 2,
+            result: 2,
+            op: PrimalOp::Matmul,
+            inputs: vec![0, 1],
+            saved_for_backward: false,
+            checkpointed: false,
+        },
+    ];
+    let mut var_types = HashMap::new();
+    var_types.insert(0, WengertType::Tensor);
+    var_types.insert(1, WengertType::Tensor);
+    var_types.insert(2, WengertType::Tensor);
+    let primal = WengertList {
+        ops,
+        output: 2,
+        var_names: HashMap::new(),
+        var_types,
+    };
+
+    // Clamped training-shaped config (I.1 semantic) so EmitFused accepts.
+    let cfg = FlashAttentionConfig {
+        block_q: 32,
+        block_kv: 32,
+        head_dim: 32,
+        causal: false,
+        paged: false,
+        rope_q: false,
+        rope_style: RopeStyle::HalfSplit,
+        gqa_group_size: 1,
+        tree_mask: false,
+        gpu_sm: 75,
+        csha: Some(CshaExtras {
+            level: 1,
+            fused_projections: false,
+            fused_output_proj: false,
+            save_activations_for_backward: true,
+            d_model: 32,
+            active_heads: 1,
+            rmsnorm_eps: 1e-5,
+            ..CshaExtras::default()
+        }),
+    };
+    let mark = FusionMark {
+        layer: "blocks.0".into(),
+        kind: Some(ProjKind::Q),
+        param_name: "wq".into(),
+        role: nsl_codegen::csha_apply::MarkRole::NormPrologue,
+        config: Some(cfg),
+        backward_emitted: std::cell::Cell::new(false),
+        chain_varids: None,
+    };
+    let mut op_to_chain: HashMap<u32, usize> = HashMap::new();
+    op_to_chain.insert(2, 0);
+    let claims = CshaBackwardClaims {
+        op_to_chain,
+        chain_marks: vec![mark],
+    };
+
+    let mut gen = AdjointGenerator::new(10);
+    gen.set_csha_claims(claims);
+    let adjoint = gen.generate(&primal);
+
+    // The Param's adjoint VarId is the "needed" var that param-gradient
+    // consumption would mark live. Look it up via the generator.
+    let param_adjoint = gen
+        .adjoint_of(1)
+        .expect("Param 'wq' must have an adjoint after CSHA EmitFused routing");
+
+    let needed: HashSet<u32> = [param_adjoint].into_iter().collect();
+    let pruned = eliminate_dead_gradients(&adjoint.ops, &needed);
+
+    // The launch op MUST be kept — without the Gap I.2+M fix, the walk
+    // from param_adjoint would never reach it (extracts would declare
+    // only [chain_key] as input, which is a primal VarId).
+    let launch_kept = pruned.iter().any(|o| {
+        matches!(
+            &o.op,
+            PrimalOp::FusedCshaBackward { layer } if layer == "blocks.0"
+        )
+    });
+    assert!(
+        launch_kept,
+        "Gap I.2+M regression: FusedCshaBackward must survive \
+         eliminate_dead_gradients on a realistically-generated adjoint \
+         list. Pruned ops: {:?}",
+        pruned
+            .iter()
+            .map(|o| (o.result, &o.op, &o.inputs))
+            .collect::<Vec<_>>()
+    );
 }
 
 // ── Gap D.1 — claim-site + adjoint-routing tests ───────────────────────────
@@ -460,7 +611,7 @@ fn gap_d1_sdpa_is_claim_primary_for_full_qkv_chain_group() {
 
     let br = bridge(&plan, 64, &mut Vec::new());
     let (op_to_chain, chain_marks) =
-        collect_chain_dispatch_map_with_wengert(&plan, &br, Some(&w));
+        collect_chain_dispatch_map_with_wengert(&plan, &br, Some(&w), None);
 
     // Gap D.1: one grouped mark for the whole layer (not three per-chain marks).
     assert_eq!(

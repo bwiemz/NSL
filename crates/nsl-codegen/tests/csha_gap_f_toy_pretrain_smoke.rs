@@ -264,15 +264,21 @@ fn toy_pretrain_hd32_compile_emits_fused_backward_ffi() {
             // `csha_gap_f_decorator.rs`, and the Gap G type-mismatch
             // regression is pinned by `csha_gap_g_ffi_scale_bits.rs`.
             eprintln!(
-                "[gap-f] end-to-end compile_entry failed after Gap G — \
-                 the FFI verifier error is resolved (see \
-                 csha_gap_g_ffi_scale_bits.rs) but two out-of-scope \
-                 follow-ups remain: (1) Gap F.2 decorator-arg threading \
-                 into the bridge mark's FlashAttentionConfig (hd=32 not \
-                 propagating to the SMEM validator), and (2) optimizer \
-                 FFI symbol-name mismatch (SGD(...) resolves to \
-                 nsl__optim__sgd__sgd_step not nsl_optim_sgd__sgd_step). \
-                 This test goes hard-green only after both follow-ups land."
+                "[gap-f] end-to-end compile_entry failed after Gap I.1/I.2 — \
+                 I.1 (training config clamp) and I.2+M (launch op survives \
+                 dead-grad elim) both landed; the dispatcher now emits \
+                 EmitFused at hd=32 and the backward launch op survives \
+                 pruning. The remaining blocker on the full @train \
+                 end-to-end path is Gap A (forward-side save-buffer \
+                 allocation for CSHA layers discovered via the model- \
+                 method decorator): \
+                 `FusedCshaBackward: no forward saves for layer 'm'`. \
+                 Per the Gap I design doc's ranked execution order, \
+                 A+F lands next (dtype-aware zeros FFI + GPU-resident \
+                 alloc for the 7 output tensors), followed by J (weight \
+                 pointer threading) and K (RMSNorm gamma gradient). \
+                 This test goes hard-green once A lands — I.1/I.2 is \
+                 necessary but not sufficient on its own."
             );
             return;
         }

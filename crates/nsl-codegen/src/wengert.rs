@@ -404,28 +404,43 @@ mod tests {
         }
     }
 
-    /// Gap C: seven distinct `CshaFusedBackwardExtract` ops, all sharing the
-    /// same first-input VarId (the "chain key"), lower into seven distinct
-    /// VarIds in a Wengert list.  This mirrors Gap D's usage pattern: one
-    /// fused-backward launch followed by seven extract ops sharing the
-    /// cache key.
+    /// Gap C (amended by Gap I.2+M): seven distinct
+    /// `CshaFusedBackwardExtract` ops, each declaring two inputs —
+    /// `[launch_result, chain_key]`. All seven share the same second-input
+    /// VarId (the cache key) so they look up the same cache entry, and all
+    /// seven list the launch op's result VarId as their first input so the
+    /// dead-gradient elimination worklist reaches the launch via any live
+    /// extract.
     #[test]
     fn test_csha_fused_backward_extract_seven_distinct_results() {
         let chain_key_var: VarId = 42;
-        let mut ops = vec![WengertOp {
-            id: 0,
-            result: chain_key_var,
-            op: PrimalOp::Input("chain_key".into()),
-            inputs: vec![],
-            saved_for_backward: false,
-            checkpointed: false,
-        }];
+        let launch_result_var: VarId = 99;
+        let mut ops = vec![
+            WengertOp {
+                id: 0,
+                result: chain_key_var,
+                op: PrimalOp::Input("chain_key".into()),
+                inputs: vec![],
+                saved_for_backward: false,
+                checkpointed: false,
+            },
+            WengertOp {
+                id: 1,
+                result: launch_result_var,
+                op: PrimalOp::FusedCshaBackward {
+                    layer: "blocks.0".into(),
+                },
+                inputs: vec![chain_key_var],
+                saved_for_backward: false,
+                checkpointed: false,
+            },
+        ];
         for c in 0u8..=6 {
             ops.push(WengertOp {
-                id: (c as u32) + 1,
+                id: (c as u32) + 2,
                 result: 100 + c as VarId,
                 op: PrimalOp::CshaFusedBackwardExtract { component: c },
-                inputs: vec![chain_key_var],
+                inputs: vec![launch_result_var, chain_key_var],
                 saved_for_backward: false,
                 checkpointed: false,
             });
@@ -449,8 +464,8 @@ mod tests {
             );
             assert_eq!(
                 producer.inputs,
-                vec![chain_key_var],
-                "all extracts share the same chain-key input"
+                vec![launch_result_var, chain_key_var],
+                "all extracts share [launch_result, chain_key]"
             );
         }
         assert_eq!(seen.len(), 7);
