@@ -41,6 +41,7 @@
 use crate::tensor::arithmetic::{
     nsl_tensor_add, nsl_tensor_matmul, nsl_tensor_mul, nsl_tensor_mul_scalar,
 };
+use crate::tensor::activation::nsl_tensor_sigmoid;
 use crate::tensor::fbip_flags::{RELINQUISH_A, RELINQUISH_B};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -507,4 +508,90 @@ pub extern "C" fn nsl_adapter_fused_ia3_matmul(
         }
     }
     cpu_fallback_fused_ia3(x, w, ia3_scale)
+}
+
+/// CPU-fallback GatedLoRA math:
+/// `y = x @ W + sigmoid(gate) * ((x @ A) @ B) * scale`.
+///
+/// # Step-0 invariant (LOAD-BEARING — mirrors wrga_adapter_rewrite.rs)
+///
+/// `gate` is initialized to zeros, so `sigmoid(0) == 0.5`.  The gate is
+/// HALF-OPEN at step 0.  Base-model equivalence depends on `lora_B = 0`.
+fn cpu_fallback_fused_gatedlora(
+    x: i64,
+    w: i64,
+    lora_a: i64,
+    lora_b: i64,
+    scale: f64,
+    gate: i64,
+) -> i64 {
+    // Base matmul: y_main = x @ W
+    let y_main = nsl_tensor_matmul(x, w, 0);
+    if y_main == 0 {
+        return 0;
+    }
+    // Adapter path: (x @ A) @ B
+    let x_a = nsl_tensor_matmul(x, lora_a, 0);
+    if x_a == 0 {
+        return y_main;
+    }
+    let x_ab = nsl_tensor_matmul(x_a, lora_b, RELINQUISH_A);
+    if x_ab == 0 {
+        return y_main;
+    }
+    // sigmoid(gate) * (x @ A @ B) * scale
+    let gate_sig = nsl_tensor_sigmoid(gate);
+    if gate_sig == 0 {
+        return y_main;
+    }
+    let gated = nsl_tensor_mul(gate_sig, x_ab, RELINQUISH_A | RELINQUISH_B);
+    if gated == 0 {
+        return y_main;
+    }
+    let scaled = nsl_tensor_mul_scalar(gated, scale, RELINQUISH_A);
+    if scaled == 0 {
+        return y_main;
+    }
+    nsl_tensor_add(y_main, scaled, RELINQUISH_A | RELINQUISH_B)
+}
+
+/// Fused GatedLoRA matmul:
+/// `y = x @ W + sigmoid(gate) * ((x @ A) @ B) * scale` in a single FFI call.
+///
+/// # Arguments
+///
+/// * `x`             — activation, shape `[..., k_in]`
+/// * `w`             — base weight, shape `[k_in, d_out]`
+/// * `lora_a`        — LoRA-A, shape `[k_in, rank]`
+/// * `lora_b`        — LoRA-B, shape `[rank, d_out]`
+/// * `scale`         — `alpha / rank`, passed as f64
+/// * `gate`          — gating scalar or vector; sigmoid applied element-wise
+/// * `kernel_handle` — index into the runtime fused-PTX registry (stub: 0).
+///                     Real PTX launch wired in Task 5.0.c.
+///
+/// # Task 5.0.a — stub status
+///
+/// CPU-fallback only.  Task 5.0.c registers the GatedLoRA PTX kernel
+/// and wires the real cudarc launch path.  The CPU fallback is
+/// numerically correct for the step-0 invariant and Fixture A at 1e-4.
+///
+/// # Safety
+/// All tensor pointers must be valid `*NslTensor` handles or `0`.
+#[no_mangle]
+pub extern "C" fn nsl_adapter_fused_gatedlora_matmul(
+    x: i64,
+    w: i64,
+    lora_a: i64,
+    lora_b: i64,
+    scale: f64,
+    gate: i64,
+    _kernel_handle: i64,
+) -> i64 {
+    if x == 0 || w == 0 || lora_a == 0 || lora_b == 0 || gate == 0 {
+        return 0;
+    }
+    record_fused_launch();
+    // Task 5.0.c: add real cudarc CUDA launch path here, mirroring
+    // nsl_adapter_fused_lora_matmul's try_cuda_launch_fused_lora branch.
+    cpu_fallback_fused_gatedlora(x, w, lora_a, lora_b, scale, gate)
 }

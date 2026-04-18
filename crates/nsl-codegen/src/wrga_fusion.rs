@@ -30,6 +30,10 @@ pub enum FusionTarget {
     /// Fuse the IA³ scaling vector into the host kernel's epilogue (RMSNorm,
     /// LayerNorm, or Softmax output).
     ActivationFusedIa3,
+    /// B.3.1: Fold the GatedLoRA contribution into the matmul epilogue:
+    /// `y = W₀x + sigmoid(gate) · α · B·(A·x)`.  Requires sm >= 80 so the
+    /// gate sigmoid can run in a warp-efficient epilogue thread-block.
+    EpilogueFusedGatedLora { rank: usize },
     /// The adapter cannot be fused: emit as a separate kernel.  This is always
     /// correct, just slower (extra HBM round-trip).
     StandaloneAdapter,
@@ -41,7 +45,9 @@ impl FusionTarget {
     pub fn is_fused(&self) -> bool {
         matches!(
             self,
-            FusionTarget::EpilogueFusedLora { .. } | FusionTarget::ActivationFusedIa3
+            FusionTarget::EpilogueFusedLora { .. }
+                | FusionTarget::ActivationFusedIa3
+                | FusionTarget::EpilogueFusedGatedLora { .. }
         )
     }
 }
@@ -176,6 +182,22 @@ fn decide(p: &AdapterPlacement, rank: usize) -> (FusionTarget, String, u64) {
             // fall back to a standalone adapter kernel.
             let site_kind = infer_site_kind(&p.name, p.arithmetic_intensity);
             if site_kind == SiteKind::Matmul {
+                // B.3.1: if the user decorated this as GatedLoRA, emit the
+                // dedicated EpilogueFusedGatedLora variant so the AST rewrite
+                // dispatch chooses the GatedLoRA fused path.
+                if matches!(
+                    p.decorator_kind,
+                    Some(crate::AdapterKind::GatedLora)
+                ) {
+                    return (
+                        FusionTarget::EpilogueFusedGatedLora { rank },
+                        format!(
+                            "GatedLoRA r={rank} folded into matmul epilogue: \
+                             sigmoid gate fused, zero extra memory round-trip"
+                        ),
+                        0,
+                    );
+                }
                 (
                     FusionTarget::EpilogueFusedLora { rank },
                     format!(
@@ -211,7 +233,12 @@ pub fn verify_fused_sites_have_no_intermediate(
     wengert: &crate::wengert::WengertList,
 ) {
     for decision in &plan.decisions {
-        if !matches!(decision.target, FusionTarget::EpilogueFusedLora { .. }) {
+        // B.3.1: also verify GatedLoRA fused sites have no intermediates.
+        if !matches!(
+            decision.target,
+            FusionTarget::EpilogueFusedLora { .. }
+                | FusionTarget::EpilogueFusedGatedLora { .. }
+        ) {
             continue;
         }
         for op in &wengert.ops {
@@ -227,8 +254,8 @@ pub fn verify_fused_sites_have_no_intermediate(
                     "[wrga B.3 Task 3 invariant] Fused site '{}' has an x @ A \
                      intermediate in the Wengert list ('{}').  The AST rewrite \
                      emitted the unfused triple for a site whose FusionDecision \
-                     is EpilogueFusedLora.  Check wrga_adapter_rewrite.rs's \
-                     conditional on site.fusion_decision.",
+                     is EpilogueFusedLora or EpilogueFusedGatedLora.  Check \
+                     wrga_adapter_rewrite.rs's conditional on site.fusion_decision.",
                     decision.site, op_name,
                 );
             }
