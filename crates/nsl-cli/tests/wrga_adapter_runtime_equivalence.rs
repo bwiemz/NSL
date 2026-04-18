@@ -894,3 +894,44 @@ print(y)
 fn gatedlora_fixture_b_positive_saturation() {
     run_gatedlora_fixture(GATEDLORA_FIXTURE_B_SRC, 24.0, 1e-4, "fixture_b");
 }
+
+/// Fixture C — negative saturation. alpha=2, rank=2, scale=1.0.
+/// gate = full([8], -30.0).  sigmoid(-30) ≈ 0.0 exactly (ex2.approx(+43)
+/// overflows in the denominator; 1/huge ≈ 0.0 in fp32).
+/// y[i,j] = 8 + 0.0 * 16 * 1.0 = 8.0 per element.
+///
+/// DIAGNOSTIC: the base-only value (8.0) specifically tests that
+/// the fold predicate path doesn't leak junk into main_accum when
+/// sigmoid(gate) ≈ 0.  A broken kernel that adds the adapter delta
+/// unconditionally (ignoring the sigmoid multiply) would produce y=24
+/// here instead of y=8.
+const GATEDLORA_FIXTURE_C_SRC: &str = r#"from nsl.nn.losses import mse_loss
+
+model Toy:
+    w: Tensor = ones([8, 8])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x @ self.w
+
+@adapter(type=gatedlora, target=["Toy.w"], rank=2, alpha=2)
+let m = Toy()
+m.to(cuda)
+let x = ones([4, 8]).to(cuda)
+let y_target = zeros([4, 8]).to(cuda)
+train(model = m, epochs = 1):
+    optimizer: SGD(lr = 0.0)
+    step(batch):
+        let pred = m.forward(x)
+        let loss = mse_loss(pred, y_target)
+m.lora_A_Toy_w__gatedlora = ones([8, 2]).to(cuda)
+m.lora_B_Toy_w__gatedlora = ones([2, 8]).to(cuda)
+m.gate_Toy_w__gatedlora = full([8], -30.0).to(cuda)
+let y = m.forward(x)
+print(y)
+"#;
+
+#[cfg(feature = "cuda")]
+#[test]
+fn gatedlora_fixture_c_negative_saturation() {
+    run_gatedlora_fixture(GATEDLORA_FIXTURE_C_SRC, 8.0, 1e-4, "fixture_c");
+}
