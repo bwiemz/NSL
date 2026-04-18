@@ -644,6 +644,38 @@ pub fn emit_sigmoid_approx_fused(ptx: &mut String, input: &str, output: &str) {
     ));
 }
 
+/// Emit a per-thread gate load for the GatedLoRA fused kernel.
+///
+/// Each thread owns exactly 2 output columns in the m16n8k16 D-fragment
+/// (cols `col_base_in_tile + 0` and `+1`, where `col_base_in_tile = (tid%4)*2`).
+/// This helper emits the address arithmetic + 2 `ld.global.f32` calls to
+/// load those 2 gate values into `%gate0` and `%gate1`.
+///
+/// Requires (caller must have declared / initialized before this call):
+///   %rd_gate      — loaded from .param .u64 gate_ptr at prolog
+///   %col_base     — output-tile column base (from emit_lora_output_tile_coords_dynamic)
+///   %r5           — col_base_in_tile = (tid%4)*2 (computed by emit_matmul_mma_lane_init OR
+///                    by the store preamble; caller must ensure a setter has run first)
+///   %r_gate       — declared .reg .u32
+///   %rd_gate_addr — declared .reg .u64
+///   %gate0, %gate1 — declared .reg .f32
+///
+/// Warp-broadcast alternative explicitly avoided: would 4× HBM gate
+/// traffic for no benefit since each thread consumes only 2 of 8 columns.
+/// See invariant #13 in project_wrga_fused_ptx_rewrite.md.
+///
+/// TODO(gate-dtype): the `shl.b32 %r_gate, %r_gate, 2` assumes f32 gate.
+/// If gate dtype ever narrows to f16, shift constant becomes 1.
+pub fn emit_gate_load_per_thread(ptx: &mut String) {
+    ptx.push_str("    // GatedLoRA: per-thread gate load — 2 cols per thread\n");
+    ptx.push_str("    add.u32  %r_gate, %col_base, %r5;\n");
+    ptx.push_str("    shl.b32  %r_gate, %r_gate, 2;   // * 4 bytes (f32)\n");
+    ptx.push_str("    cvt.u64.u32 %rd_gate_addr, %r_gate;\n");
+    ptx.push_str("    add.u64  %rd_gate_addr, %rd_gate, %rd_gate_addr;\n");
+    ptx.push_str("    ld.global.f32 %gate0, [%rd_gate_addr];\n");
+    ptx.push_str("    ld.global.f32 %gate1, [%rd_gate_addr + 4];\n");
+}
+
 #[cfg(test)]
 mod sigmoid_tests {
     use super::emit_sigmoid_approx_fused;
@@ -680,5 +712,37 @@ mod sigmoid_tests {
         assert!(ptx.contains("0f3F800000"), "missing +1.0 constant");
         assert!(ptx.contains("%in"), "missing input register reference");
         assert!(ptx.contains("%out"), "missing output register reference");
+    }
+
+    #[test]
+    fn emit_gate_load_per_thread_emits_two_f32_loads_with_correct_stride() {
+        use super::emit_gate_load_per_thread;
+        let mut ptx = String::new();
+        emit_gate_load_per_thread(&mut ptx);
+
+        // Exactly 2 ld.global.f32 — one per gate value.
+        assert_eq!(
+            ptx.matches("ld.global.f32").count(),
+            2,
+            "expected 2 per-thread gate loads; got:\n{ptx}"
+        );
+
+        // Byte-stride must be 4 (f32); catches gate-dtype regression.
+        assert!(
+            ptx.contains("shl.b32  %r_gate, %r_gate, 2"),
+            "gate offset must shift-left by 2 (f32 stride); got:\n{ptx}"
+        );
+
+        // Second load at offset +4 (second gate value).
+        assert!(
+            ptx.contains("ld.global.f32 %gate1, [%rd_gate_addr + 4]"),
+            "second gate load missing or wrong offset:\n{ptx}"
+        );
+
+        // Base pointer summation.
+        assert!(
+            ptx.contains("add.u64  %rd_gate_addr, %rd_gate, %rd_gate_addr"),
+            "gate address must sum base + offset:\n{ptx}"
+        );
     }
 }
