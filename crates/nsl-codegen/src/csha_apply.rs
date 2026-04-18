@@ -314,8 +314,24 @@ pub struct CshaChainVarIds {
     /// the backward PTX's `csha_norm_weight_ptr` slot receives the real
     /// gamma device pointer (instead of null). The Gap I.4 change only
     /// plumbs the pointer; the standalone `dgamma` accumulation is
-    /// deferred to Gap I.K (next PR).
+    /// emitted by Gap I step K (see `x_raw_var` / `rmsnorm_eps`).
     pub norm_weight_var: Option<u32>,
+    /// Gap I step K: primal VarId of the RMSNorm *input* (pre-norm `x`).
+    /// `norm_op.inputs[0]` in the Wengert list. Required to emit the
+    /// standalone `NormGammaBackward` adjoint after the fused launch —
+    /// the fused kernel returns `dx_norm` (extract component 6) as
+    /// upstream-gradient-of-RMSNorm-output, and dgamma = reduce(dx_norm
+    /// * x_hat) where x_hat recomputes from `x_raw`.
+    ///
+    /// `None` when `norm_weight_var` is `None` (no trainable gamma) or
+    /// when the RMSNorm op can't be resolved — in both cases the gamma
+    /// gradient path is skipped.
+    pub x_raw_var: Option<u32>,
+    /// Gap I step K: RMSNorm epsilon, captured from `PrimalOp::RMSNorm
+    /// { eps }` so the `NormGammaBackward` lowering can recompute
+    /// `1/sqrt(var + eps)` without re-consulting the primal op. Zero
+    /// when `x_raw_var` is `None` (the gamma path is skipped anyway).
+    pub rmsnorm_eps: f64,
 }
 
 /// Why CSHA is claiming a node.
@@ -607,6 +623,25 @@ pub fn collect_chain_dispatch_map_with_wengert(
                     })
                 });
 
+            // Gap I step K: to emit `NormGammaBackward` we need the
+            // RMSNorm input (pre-norm `x`) as a primal VarId plus the
+            // eps. Both come from the same `norm_op` entry that
+            // `x_norm_var` points at. Skip entirely when the RMSNorm
+            // has no trainable gamma — dgamma is pointless for
+            // constants.
+            let (x_raw_var, rmsnorm_eps): (Option<u32>, f64) = if norm_weight_var.is_some() {
+                let norm_entry = w.ops.get(norm_op as usize);
+                let x_input = norm_entry.and_then(|o| o.inputs.first().copied());
+                let eps = norm_entry.and_then(|o| match &o.op {
+                    crate::wengert::PrimalOp::RMSNorm { eps } => Some(*eps),
+                    crate::wengert::PrimalOp::LayerNorm { eps } => Some(*eps),
+                    _ => None,
+                });
+                (x_input, eps.unwrap_or(0.0))
+            } else {
+                (None, 0.0)
+            };
+
             let chain_varids = match (
                 q_out_var,
                 k_out_var,
@@ -636,6 +671,8 @@ pub fn collect_chain_dispatch_map_with_wengert(
                     x_norm_var: xn,
                     sdpa_out_var: so,
                     norm_weight_var,
+                    x_raw_var,
+                    rmsnorm_eps,
                 }),
                 _ => None,
             };

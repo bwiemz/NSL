@@ -747,6 +747,9 @@ fn gap_d1_adjoint_routing_populates_correct_varids() {
         // `csha_norm_weight_ptr` null-guard handles the `unwrap_or(0)`
         // that the launch emitter passes when this is `None`.
         norm_weight_var: None,
+        // Gap I step K: no gamma → no x_raw / eps for dgamma emission.
+        x_raw_var: None,
+        rmsnorm_eps: 0.0,
     };
     let mark = FusionMark {
         layer: "blocks.0".into(),
@@ -1092,6 +1095,10 @@ fn gap_i4_launch_inputs_thread_weight_and_norm_pointers() {
         x_norm_var: 2,
         sdpa_out_var: 11,
         norm_weight_var: Some(1),
+        // Gap I step K: RMSNorm op lives at VarId 2, its input
+        // (pre-norm x) is VarId 0, and eps matches the op above.
+        x_raw_var: Some(0),
+        rmsnorm_eps: 1e-5,
     };
     let mark = FusionMark {
         layer: "blocks.0".into(),
@@ -1227,6 +1234,9 @@ fn gap_i4_launch_inputs_pass_null_for_none_norm_weight() {
         x_norm_var: 1,
         sdpa_out_var: 10,
         norm_weight_var: None,
+        // Gap I step K: no gamma → no dgamma emission.
+        x_raw_var: None,
+        rmsnorm_eps: 0.0,
     };
     let mark = FusionMark {
         layer: "blocks.0".into(),
