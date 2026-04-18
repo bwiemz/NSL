@@ -743,6 +743,10 @@ fn gap_d1_adjoint_routing_populates_correct_varids() {
         wv_var: 8,
         x_norm_var: 1,
         sdpa_out_var: 10,
+        // Gap I.4: no gamma param in this structural test; kernel's
+        // `csha_norm_weight_ptr` null-guard handles the `unwrap_or(0)`
+        // that the launch emitter passes when this is `None`.
+        norm_weight_var: None,
     };
     let mark = FusionMark {
         layer: "blocks.0".into(),
@@ -828,5 +832,432 @@ fn gap_d1_adjoint_routing_populates_correct_varids() {
     assert_eq!(
         events[0].output_op_id, 10,
         "Gap D.1 claim primary is the SDPA op; event.output_op_id should be 10"
+    );
+}
+
+// ── Gap I.4 — weight-pointer threading through EmitFused ──────────────────
+
+/// Gap I.4 unit test (resolution): when the RMSNorm op's `inputs[1]` is
+/// a `Param(...)`, `collect_chain_dispatch_map_with_wengert` must
+/// populate `norm_weight_var` with that param's VarId. Without this,
+/// the `csha_norm_weight_ptr` slot in the launch stays null and the
+/// kernel can't accumulate dgamma (the stub for Gap I.K).
+#[test]
+fn gap_i4_norm_weight_var_populated_for_trainable_gamma() {
+    use nsl_codegen::csha::{self, CshaInput, CshaMode};
+    use nsl_codegen::csha_apply::{bridge, collect_chain_dispatch_map_with_wengert};
+    use nsl_codegen::csha_specialize::SpecConfig;
+    use nsl_codegen::wengert::{PrimalOp, WengertList, WengertOp};
+    use nsl_codegen::wggo_cost::LayerShape;
+    use std::collections::HashMap;
+
+    // Wengert with trainable gamma: RMSNorm(0, gamma_param_1) consumes
+    // a Param input as its second arg. Op layout:
+    //   0: Input(x)
+    //   1: Param("blocks.0.attn.norm_weight")  — gamma param
+    //   2: RMSNorm(0, 1)                        — RMSNorm with trainable gamma
+    //   3: Param(Wq), 4: Matmul(2,3), 5: RoPE(4)
+    //   6: Param(Wk), 7: Matmul(2,6), 8: RoPE(7)
+    //   9: Param(Wv), 10: Matmul(2,9)
+    //  11: SDPA(5, 8, 10)
+    let mk = |id, result, prim: PrimalOp, inputs| WengertOp {
+        id,
+        result,
+        op: prim,
+        inputs,
+        saved_for_backward: false,
+        checkpointed: false,
+    };
+    let w = WengertList {
+        ops: vec![
+            mk(0, 0, PrimalOp::Input("x".into()), vec![]),
+            mk(1, 1, PrimalOp::Param("blocks.0.attn.norm_weight".into()), vec![]),
+            mk(2, 2, PrimalOp::RMSNorm { eps: 1e-5 }, vec![0, 1]),
+            mk(3, 3, PrimalOp::Param("blocks.0.attn.wq".into()), vec![]),
+            mk(4, 4, PrimalOp::Matmul, vec![2, 3]),
+            mk(5, 5, PrimalOp::RoPE { dim: 64 }, vec![4]),
+            mk(6, 6, PrimalOp::Param("blocks.0.attn.wk".into()), vec![]),
+            mk(7, 7, PrimalOp::Matmul, vec![2, 6]),
+            mk(8, 8, PrimalOp::RoPE { dim: 64 }, vec![7]),
+            mk(9, 9, PrimalOp::Param("blocks.0.attn.wv".into()), vec![]),
+            mk(10, 10, PrimalOp::Matmul, vec![2, 9]),
+            mk(
+                11,
+                11,
+                PrimalOp::ScaledDotProductAttention { causal: false },
+                vec![5, 8, 10],
+            ),
+        ],
+        output: 11,
+        var_names: HashMap::new(),
+        var_types: HashMap::new(),
+    };
+
+    let plan = csha::run(CshaInput {
+        mode: CshaMode::Auto,
+        target: "H100",
+        wengert: &w,
+        weights: None,
+        shape: LayerShape {
+            batch: 1,
+            seq: 1024,
+            d_model: 512,
+            head_dim: 64,
+            n_kv_heads: 4,
+            dtype_bytes: 2,
+        },
+        n_heads: 8,
+        spec_cfg: SpecConfig::default(),
+        pattern_cfg: nsl_codegen::csha_patterns::PatternConfig::default(),
+        wggo_overrides: None,
+    });
+
+    let br = bridge(&plan, 64, &mut Vec::new());
+    let (_op_to_chain, chain_marks) =
+        collect_chain_dispatch_map_with_wengert(&plan, &br, Some(&w), None);
+    assert_eq!(chain_marks.len(), 1, "expected grouped mark");
+
+    let v = chain_marks[0]
+        .chain_varids
+        .as_ref()
+        .expect("grouped mark must carry chain_varids");
+    assert_eq!(
+        v.norm_weight_var,
+        Some(1),
+        "trainable gamma at VarId 1 must be resolved into norm_weight_var; \
+         got {:?}",
+        v.norm_weight_var
+    );
+}
+
+/// Gap I.4 unit test (no trainable gamma): when the RMSNorm op has no
+/// second input OR that input is NOT a `Param(...)` (e.g. a constant
+/// tensor), `norm_weight_var` must be `None`. The kernel's
+/// `csha_norm_weight_ptr` null-guard handles the resulting null slot
+/// in the launch.
+#[test]
+fn gap_i4_norm_weight_var_none_for_gammaless_rmsnorm() {
+    use nsl_codegen::csha::{self, CshaInput, CshaMode};
+    use nsl_codegen::csha_apply::{bridge, collect_chain_dispatch_map_with_wengert};
+    use nsl_codegen::csha_specialize::SpecConfig;
+    use nsl_codegen::wengert::{PrimalOp, WengertList, WengertOp};
+    use nsl_codegen::wggo_cost::LayerShape;
+    use std::collections::HashMap;
+
+    // RMSNorm(0) — single-input gamma-less variant (same layout as the
+    // Gap D.1 test above).
+    let mk = |id, result, prim: PrimalOp, inputs| WengertOp {
+        id,
+        result,
+        op: prim,
+        inputs,
+        saved_for_backward: false,
+        checkpointed: false,
+    };
+    let w = WengertList {
+        ops: vec![
+            mk(0, 0, PrimalOp::Input("x".into()), vec![]),
+            mk(1, 1, PrimalOp::RMSNorm { eps: 1e-5 }, vec![0]),
+            mk(2, 2, PrimalOp::Param("blocks.0.attn.wq".into()), vec![]),
+            mk(3, 3, PrimalOp::Matmul, vec![1, 2]),
+            mk(4, 4, PrimalOp::RoPE { dim: 64 }, vec![3]),
+            mk(5, 5, PrimalOp::Param("blocks.0.attn.wk".into()), vec![]),
+            mk(6, 6, PrimalOp::Matmul, vec![1, 5]),
+            mk(7, 7, PrimalOp::RoPE { dim: 64 }, vec![6]),
+            mk(8, 8, PrimalOp::Param("blocks.0.attn.wv".into()), vec![]),
+            mk(9, 9, PrimalOp::Matmul, vec![1, 8]),
+            mk(
+                10,
+                10,
+                PrimalOp::ScaledDotProductAttention { causal: false },
+                vec![4, 7, 9],
+            ),
+        ],
+        output: 10,
+        var_names: HashMap::new(),
+        var_types: HashMap::new(),
+    };
+
+    let plan = csha::run(CshaInput {
+        mode: CshaMode::Auto,
+        target: "H100",
+        wengert: &w,
+        weights: None,
+        shape: LayerShape {
+            batch: 1,
+            seq: 1024,
+            d_model: 512,
+            head_dim: 64,
+            n_kv_heads: 4,
+            dtype_bytes: 2,
+        },
+        n_heads: 8,
+        spec_cfg: SpecConfig::default(),
+        pattern_cfg: nsl_codegen::csha_patterns::PatternConfig::default(),
+        wggo_overrides: None,
+    });
+    let br = bridge(&plan, 64, &mut Vec::new());
+    let (_op_to_chain, chain_marks) =
+        collect_chain_dispatch_map_with_wengert(&plan, &br, Some(&w), None);
+    assert_eq!(chain_marks.len(), 1);
+    let v = chain_marks[0]
+        .chain_varids
+        .as_ref()
+        .expect("grouped mark must carry chain_varids");
+    assert!(
+        v.norm_weight_var.is_none(),
+        "gamma-less RMSNorm must leave norm_weight_var = None; got {:?}",
+        v.norm_weight_var
+    );
+}
+
+/// Gap I.4 integration: the `FusedCshaBackward` launch op emitted by
+/// `AdjointGenerator::generate` must carry 10 inputs (chain_key, dO,
+/// q, k, v, x_norm, wq, wk, wv, norm_weight) when `chain_varids` is
+/// populated. Pre-Gap-I.4 it carried only 5 (chain_key, dO, q, k, v)
+/// and the lowerer's null-default branches left wq/wk/wv/x/norm_weight
+/// at null, so the backward PTX skipped dwq/dwk/dwv accumulation.
+#[test]
+fn gap_i4_launch_inputs_thread_weight_and_norm_pointers() {
+    use nsl_codegen::csha_apply::{CshaChainVarIds, FusionMark};
+    use nsl_codegen::csha_boundary::ProjKind;
+    use nsl_codegen::flash_attention::{CshaExtras, FlashAttentionConfig, RopeStyle};
+    use nsl_codegen::source_ad::{AdjointGenerator, CshaBackwardClaims};
+    use nsl_codegen::wengert::{PrimalOp, WengertList, WengertOp};
+    use std::collections::HashMap;
+
+    let mk = |id, result, prim: PrimalOp, inputs| WengertOp {
+        id,
+        result,
+        op: prim,
+        inputs,
+        saved_for_backward: false,
+        checkpointed: false,
+    };
+    let primal = WengertList {
+        ops: vec![
+            mk(0, 0, PrimalOp::Input("x".into()), vec![]),
+            mk(1, 1, PrimalOp::Param("norm_w".into()), vec![]),
+            mk(2, 2, PrimalOp::RMSNorm { eps: 1e-5 }, vec![0, 1]),
+            mk(3, 3, PrimalOp::Param("wq".into()), vec![]),
+            mk(4, 4, PrimalOp::Matmul, vec![2, 3]),
+            mk(5, 5, PrimalOp::RoPE { dim: 64 }, vec![4]),
+            mk(6, 6, PrimalOp::Param("wk".into()), vec![]),
+            mk(7, 7, PrimalOp::Matmul, vec![2, 6]),
+            mk(8, 8, PrimalOp::RoPE { dim: 64 }, vec![7]),
+            mk(9, 9, PrimalOp::Param("wv".into()), vec![]),
+            mk(10, 10, PrimalOp::Matmul, vec![2, 9]),
+            mk(
+                11,
+                11,
+                PrimalOp::ScaledDotProductAttention { causal: false },
+                vec![5, 8, 10],
+            ),
+        ],
+        output: 11,
+        var_names: HashMap::new(),
+        var_types: HashMap::new(),
+    };
+
+    let cfg = FlashAttentionConfig {
+        block_q: 32,
+        block_kv: 32,
+        head_dim: 32,
+        causal: false,
+        paged: false,
+        rope_q: false,
+        rope_style: RopeStyle::HalfSplit,
+        gqa_group_size: 1,
+        tree_mask: false,
+        gpu_sm: 75,
+        csha: Some(CshaExtras {
+            level: 1,
+            fused_projections: true,
+            save_activations_for_backward: true,
+            d_model: 32,
+            active_heads: 1,
+            rmsnorm_eps: 1e-5,
+            ..CshaExtras::default()
+        }),
+    };
+
+    // Chain varids with a trainable gamma (norm_weight_var = Some(1)).
+    let varids = CshaChainVarIds {
+        q_out_var: 5,
+        k_out_var: 8,
+        v_out_var: 10,
+        wq_var: 3,
+        wk_var: 6,
+        wv_var: 9,
+        x_norm_var: 2,
+        sdpa_out_var: 11,
+        norm_weight_var: Some(1),
+    };
+    let mark = FusionMark {
+        layer: "blocks.0".into(),
+        kind: Some(ProjKind::Q),
+        param_name: "wq".into(),
+        role: nsl_codegen::csha_apply::MarkRole::NormPrologue,
+        config: Some(cfg),
+        backward_emitted: std::cell::Cell::new(false),
+        chain_varids: Some(varids),
+    };
+
+    let mut op_to_chain: HashMap<u32, usize> = HashMap::new();
+    op_to_chain.insert(11, 0); // SDPA primary
+    op_to_chain.insert(2, 0); // RMSNorm
+    op_to_chain.insert(4, 0); // Q matmul
+    op_to_chain.insert(5, 0); // Q RoPE
+    op_to_chain.insert(7, 0); // K matmul
+    op_to_chain.insert(8, 0); // K RoPE
+    op_to_chain.insert(10, 0); // V matmul
+
+    let claims = CshaBackwardClaims {
+        op_to_chain,
+        chain_marks: vec![mark],
+    };
+
+    let mut gen = AdjointGenerator::new(200);
+    gen.set_csha_claims(claims);
+    let adjoint = gen.generate(&primal);
+
+    let launch = adjoint
+        .ops
+        .iter()
+        .find(|o| matches!(&o.op, PrimalOp::FusedCshaBackward { .. }))
+        .expect("Gap I.4: fused launch op must be emitted");
+
+    // Shape check — pre-Gap-I.4 this was 5 entries. Post-Gap-I.4 it
+    // must be 10 (chain_key, dO, q, k, v, x, wq, wk, wv, norm_weight).
+    assert_eq!(
+        launch.inputs.len(),
+        10,
+        "Gap I.4: launch_inputs must carry 10 entries when chain_varids is \
+         populated (chain_key, dO, q, k, v, x, wq, wk, wv, norm_weight); \
+         got {} entries: {:?}",
+        launch.inputs.len(),
+        launch.inputs
+    );
+
+    // Index-by-index routing: the 5 new entries must be the primal
+    // VarIds from chain_varids (adjoints are applied at launch input 1
+    // only — the dO slot).
+    assert_eq!(launch.inputs[5], 2, "inputs[5] = x_norm_var (VarId 2)");
+    assert_eq!(launch.inputs[6], 3, "inputs[6] = wq_var (VarId 3)");
+    assert_eq!(launch.inputs[7], 6, "inputs[7] = wk_var (VarId 6)");
+    assert_eq!(launch.inputs[8], 9, "inputs[8] = wv_var (VarId 9)");
+    assert_eq!(
+        launch.inputs[9], 1,
+        "inputs[9] = norm_weight_var (VarId 1) since gamma is trainable"
+    );
+}
+
+/// Gap I.4 integration (null gamma): when `norm_weight_var` is `None`
+/// the launch emitter passes `0` (null-sentinel VarId) at inputs[9].
+/// The lowerer will iconst(0) that into a null pointer and the
+/// kernel's `csha_norm_weight_ptr` null-guard skips the dgamma path.
+#[test]
+fn gap_i4_launch_inputs_pass_null_for_none_norm_weight() {
+    use nsl_codegen::csha_apply::{CshaChainVarIds, FusionMark};
+    use nsl_codegen::csha_boundary::ProjKind;
+    use nsl_codegen::flash_attention::{CshaExtras, FlashAttentionConfig, RopeStyle};
+    use nsl_codegen::source_ad::{AdjointGenerator, CshaBackwardClaims};
+    use nsl_codegen::wengert::{PrimalOp, WengertList, WengertOp};
+    use std::collections::HashMap;
+
+    let mk = |id, result, prim: PrimalOp, inputs| WengertOp {
+        id,
+        result,
+        op: prim,
+        inputs,
+        saved_for_backward: false,
+        checkpointed: false,
+    };
+    let primal = WengertList {
+        ops: vec![
+            mk(0, 0, PrimalOp::Input("x".into()), vec![]),
+            mk(1, 1, PrimalOp::RMSNorm { eps: 1e-5 }, vec![0]),
+            mk(2, 2, PrimalOp::Param("wq".into()), vec![]),
+            mk(3, 3, PrimalOp::Matmul, vec![1, 2]),
+            mk(4, 4, PrimalOp::RoPE { dim: 64 }, vec![3]),
+            mk(5, 5, PrimalOp::Param("wk".into()), vec![]),
+            mk(6, 6, PrimalOp::Matmul, vec![1, 5]),
+            mk(7, 7, PrimalOp::RoPE { dim: 64 }, vec![6]),
+            mk(8, 8, PrimalOp::Param("wv".into()), vec![]),
+            mk(9, 9, PrimalOp::Matmul, vec![1, 8]),
+            mk(
+                10,
+                10,
+                PrimalOp::ScaledDotProductAttention { causal: false },
+                vec![4, 7, 9],
+            ),
+        ],
+        output: 10,
+        var_names: HashMap::new(),
+        var_types: HashMap::new(),
+    };
+    let cfg = FlashAttentionConfig {
+        block_q: 32,
+        block_kv: 32,
+        head_dim: 32,
+        causal: false,
+        paged: false,
+        rope_q: false,
+        rope_style: RopeStyle::HalfSplit,
+        gqa_group_size: 1,
+        tree_mask: false,
+        gpu_sm: 75,
+        csha: Some(CshaExtras {
+            level: 1,
+            fused_projections: true,
+            save_activations_for_backward: true,
+            d_model: 32,
+            active_heads: 1,
+            rmsnorm_eps: 1e-5,
+            ..CshaExtras::default()
+        }),
+    };
+    let varids = CshaChainVarIds {
+        q_out_var: 4,
+        k_out_var: 7,
+        v_out_var: 9,
+        wq_var: 2,
+        wk_var: 5,
+        wv_var: 8,
+        x_norm_var: 1,
+        sdpa_out_var: 10,
+        norm_weight_var: None,
+    };
+    let mark = FusionMark {
+        layer: "blocks.0".into(),
+        kind: Some(ProjKind::Q),
+        param_name: "wq".into(),
+        role: nsl_codegen::csha_apply::MarkRole::NormPrologue,
+        config: Some(cfg),
+        backward_emitted: std::cell::Cell::new(false),
+        chain_varids: Some(varids),
+    };
+    let mut op_to_chain: HashMap<u32, usize> = HashMap::new();
+    for id in [10u32, 1, 3, 4, 6, 7, 9] {
+        op_to_chain.insert(id, 0);
+    }
+    let claims = CshaBackwardClaims {
+        op_to_chain,
+        chain_marks: vec![mark],
+    };
+    let mut gen = AdjointGenerator::new(100);
+    gen.set_csha_claims(claims);
+    let adjoint = gen.generate(&primal);
+    let launch = adjoint
+        .ops
+        .iter()
+        .find(|o| matches!(&o.op, PrimalOp::FusedCshaBackward { .. }))
+        .expect("launch op must exist");
+    assert_eq!(launch.inputs.len(), 10, "Gap I.4 launch always carries 10 entries when chain_varids is Some");
+    assert_eq!(
+        launch.inputs[9], 0,
+        "Gap I.4: norm_weight_var=None → launch_inputs[9] must be the \
+         null-sentinel VarId (0); got {}",
+        launch.inputs[9]
     );
 }

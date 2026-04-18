@@ -304,6 +304,18 @@ pub struct CshaChainVarIds {
     /// Output of the SDPA op — this is the VarId whose y_bar we read as
     /// `dO` when `EmitFused` fires at the SDPA reverse-walk visit.
     pub sdpa_out_var: u32,
+    /// Gap I.4: Param VarId for the RMSNorm gamma weight, when the
+    /// chain's RMSNorm consumes a trainable gamma param. `None` when the
+    /// RMSNorm has no second input (bias-less / gamma-less variant) or
+    /// when the second input is a constant tensor (e.g. `ones([D])`)
+    /// rather than a `Param(...)` op.
+    ///
+    /// Threaded into the fused-backward launch at `launch_inputs[9]` so
+    /// the backward PTX's `csha_norm_weight_ptr` slot receives the real
+    /// gamma device pointer (instead of null). The Gap I.4 change only
+    /// plumbs the pointer; the standalone `dgamma` accumulation is
+    /// deferred to Gap I.K (next PR).
+    pub norm_weight_var: Option<u32>,
 }
 
 /// Why CSHA is claiming a node.
@@ -569,6 +581,32 @@ pub fn collect_chain_dispatch_map_with_wengert(
             let x_norm_var = w.ops.get(norm_op as usize).map(|o| o.result);
             let sdpa_out_var = w.ops.get(sdpa_op as usize).map(|o| o.result);
 
+            // Gap I.4: resolve the RMSNorm gamma's VarId when the chain's
+            // RMSNorm has a trainable second input. The Wengert op lives
+            // at `norm_op`; its `inputs[0]` is `x`, `inputs[1]` is the
+            // gamma input VarId (when present). We only populate
+            // `norm_weight_var` when that VarId was produced by a
+            // `Param(...)` op (i.e. a real trainable parameter). A
+            // constant gamma (e.g. `ones([D])`) leaves the slot as
+            // `None`, and the backward PTX's `csha_norm_weight_ptr` null
+            // guard will skip the gamma gradient path (which is still
+            // correct, since constants don't need gradients).
+            let norm_weight_var: Option<u32> = w
+                .ops
+                .get(norm_op as usize)
+                .and_then(|norm_op_entry| norm_op_entry.inputs.get(1).copied())
+                .and_then(|gamma_var| {
+                    w.ops.iter().find_map(|o| {
+                        if o.result == gamma_var
+                            && matches!(&o.op, crate::wengert::PrimalOp::Param(_))
+                        {
+                            Some(o.result)
+                        } else {
+                            None
+                        }
+                    })
+                });
+
             let chain_varids = match (
                 q_out_var,
                 k_out_var,
@@ -597,6 +635,7 @@ pub fn collect_chain_dispatch_map_with_wengert(
                     wv_var: wv_id,
                     x_norm_var: xn,
                     sdpa_out_var: so,
+                    norm_weight_var,
                 }),
                 _ => None,
             };

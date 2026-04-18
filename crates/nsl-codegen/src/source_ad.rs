@@ -265,12 +265,56 @@ impl AdjointGenerator {
                                     .unwrap_or(op.result);
                                 let do_var = self.get_or_create_adjoint(do_source_var);
 
-                                // Launch-op inputs: the lowerer only reads
-                                // inputs[0] (chain_key) and inputs[1]
-                                // (do_ptr) in the Gap D launch. Keep the
-                                // extra pass-throughs for forward compat.
+                                // Launch-op inputs (Gap I.4): the lowerer's
+                                // `FusedCshaBackward` arm indexes:
+                                //
+                                //   [0]  chain_key  — cache key; NOT a
+                                //                    real tensor read
+                                //   [1]  do_ptr    — dO adjoint
+                                //   [2]  q_ptr     — SDPA op.inputs[0]
+                                //   [3]  k_ptr     — SDPA op.inputs[1]
+                                //   [4]  v_ptr     — SDPA op.inputs[2]
+                                //   [5]  x_ptr     — RMSNorm output (x_norm)
+                                //   [6]  wq_ptr    — Q projection weight
+                                //   [7]  wk_ptr    — K projection weight
+                                //   [8]  wv_ptr    — V projection weight
+                                //   [9]  norm_w_ptr — RMSNorm gamma (or null)
+                                //
+                                // Pre-Gap-I.4 the launch only carried 5
+                                // entries (chain_key, dO, q, k, v). The
+                                // lowerer's null-default branches left
+                                // wq/wk/wv/x/norm_weight at null, and the
+                                // backward PTX's per-weight null-guard
+                                // (csha_hooks_backward.rs:348-350) then
+                                // skipped `V2_BWD_DPROJ_{WQ,WK,WV}_LOOP`,
+                                // returning zero-filled dwq/dwk/dwv. This
+                                // is Gap I step J's fix: push the 5 extra
+                                // VarIds when chain_varids is populated,
+                                // so the kernel receives real device
+                                // pointers and weight gradients are no
+                                // longer zero.
+                                //
+                                // When `chain_varids` is None (legacy
+                                // per-chain marks, structural tests, or
+                                // floating chains without SDPA), stick
+                                // to the 5-entry shape so the lowerer's
+                                // null-default path kicks in — those
+                                // code paths don't populate CSHA saves
+                                // and can't safely launch the backward
+                                // kernel anyway.
                                 let mut launch_inputs = vec![chain_key, do_var];
                                 launch_inputs.extend(op.inputs.iter().copied());
+                                if let Some(v) = chain_varids.as_ref() {
+                                    launch_inputs.push(v.x_norm_var); // [5]
+                                    launch_inputs.push(v.wq_var); // [6]
+                                    launch_inputs.push(v.wk_var); // [7]
+                                    launch_inputs.push(v.wv_var); // [8]
+                                    // Null (VarId 0) when the RMSNorm
+                                    // has no trainable gamma param. The
+                                    // backward PTX null-guards on
+                                    // `csha_norm_weight_ptr`.
+                                    launch_inputs.push(v.norm_weight_var.unwrap_or(0)); // [9]
+                                }
 
                                 let launch_result = self.emit_op(
                                     PrimalOp::FusedCshaBackward {
