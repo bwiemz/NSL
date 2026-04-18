@@ -46,6 +46,55 @@ pub(crate) fn tensor_from_shape_list(shape_list: i64, fill: f64) -> i64 {
     NslTensor::publish(tensor)
 }
 
+/// Helper: create a tensor from a shape list, zero-filled, in f16 storage
+/// (dtype=2, 2 bytes/element).
+///
+/// Used by the CSHA Tier C fused backward kernel's gradient-output
+/// allocations (dq/dk/dv/dwq/dwk/dwv), which the PTX writes via
+/// `st.global.u16`.  The matching f32 (`nsl_tensor_zeros*`) helper
+/// over-allocates for these by 2×, and the kernel's half-width stores
+/// leave the upper bytes uninitialised — a subsequent f32 read then
+/// interprets the raw f16 bits as f32 and produces garbage.  This
+/// helper gives the backward a correctly-sized f16 buffer.
+///
+/// `fill == 0.0` uses zero-init; any other fill value panics (no
+/// non-zero caller exists today, and implementing a correct f16
+/// conversion would pull in half-crate wiring we don't need).
+pub(crate) fn tensor_from_shape_list_f16(shape_list: i64, fill: f64) -> i64 {
+    assert_eq!(
+        fill, 0.0,
+        "tensor_from_shape_list_f16: only fill=0.0 is supported today"
+    );
+
+    let list = NslList::from_ptr(shape_list);
+    let ndim = list.len;
+
+    let shape = checked_alloc((ndim as usize) * std::mem::size_of::<i64>()) as *mut i64;
+    for i in 0..ndim as usize {
+        unsafe { *shape.add(i) = *list.data.add(i) };
+    }
+
+    let len = NslTensor::total_elements(shape, ndim);
+    // f16 = 2 bytes/element.
+    let data_size = (len as usize) * 2;
+    let data = checked_alloc_zeroed(data_size) as *mut u16;
+
+    let strides = NslTensor::compute_strides(shape, ndim);
+
+    let tensor = Box::new(NslTensor::new(
+        data as *mut c_void,
+        shape,
+        strides,
+        ndim,
+        len,
+        0,
+        super::DTYPE_FP16,
+        1,
+        0,
+    ));
+    NslTensor::publish(tensor)
+}
+
 /// Helper: create a tensor from a shape list, filling data with a given value (f64, dtype=0).
 /// Used for operations that explicitly require double precision.
 #[allow(dead_code)]

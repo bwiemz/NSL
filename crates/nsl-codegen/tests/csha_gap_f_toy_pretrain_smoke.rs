@@ -264,21 +264,28 @@ fn toy_pretrain_hd32_compile_emits_fused_backward_ffi() {
             // `csha_gap_f_decorator.rs`, and the Gap G type-mismatch
             // regression is pinned by `csha_gap_g_ffi_scale_bits.rs`.
             eprintln!(
-                "[gap-f] end-to-end compile_entry failed after Gap I.1/I.2 — \
-                 I.1 (training config clamp) and I.2+M (launch op survives \
-                 dead-grad elim) both landed; the dispatcher now emits \
-                 EmitFused at hd=32 and the backward launch op survives \
-                 pruning. The remaining blocker on the full @train \
-                 end-to-end path is Gap A (forward-side save-buffer \
-                 allocation for CSHA layers discovered via the model- \
-                 method decorator): \
-                 `FusedCshaBackward: no forward saves for layer 'm'`. \
-                 Per the Gap I design doc's ranked execution order, \
-                 A+F lands next (dtype-aware zeros FFI + GPU-resident \
-                 alloc for the 7 output tensors), followed by J (weight \
-                 pointer threading) and K (RMSNorm gamma gradient). \
-                 This test goes hard-green once A lands — I.1/I.2 is \
-                 necessary but not sufficient on its own."
+                "[gap-f] end-to-end compile_entry failed after Gap I.3 (A+F + \
+                 save-lookup): the save-buffer allocator, dtype-aware f16 \
+                 zeros FFI, direct-on-device gradient-output allocation, \
+                 and `nsl_flash_attention_csha_backward` runtime-symbol \
+                 registration all landed. The backward launch builds \
+                 successfully end-to-end on the @train path. \
+                 \
+                 Remaining blocker on the FULL compile_entry path is an \
+                 optimizer FFI symbol-name mismatch unrelated to CSHA: \
+                 source-level `SGD(lr=0.001)` resolves to \
+                 `nsl__optim__sgd__sgd_step` (stdlib_loader convention) \
+                 but the call site emits that name with no corresponding \
+                 runtime stub. This is the same gap the pre-A+F diagnostic \
+                 already documented, just surfacing later in the pipeline. \
+                 \
+                 Per the Gap I design doc's ranked execution order, the \
+                 next CSHA follow-ups are J (weight pointer threading — \
+                 wq/wk/wv currently null so dwq/dwk/dwv come back as zero) \
+                 and K (RMSNorm gamma gradient). Neither is load-bearing \
+                 for *this* test's structural reloc-presence check, since \
+                 the compile_entry step fails on the unrelated optimizer \
+                 issue before any relocation-level inspection can run."
             );
             return;
         }

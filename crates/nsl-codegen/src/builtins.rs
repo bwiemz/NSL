@@ -669,6 +669,17 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
         &[types::I64, types::I64],
         Some(types::I64),
     ),
+    // CSHA Gap I.3 (A+F): f16 (dtype=2, 2 bytes/element) zeros allocator.
+    // The Tier C backward kernel writes dq/dk/dv/dwq/dwk/dwv via
+    // `st.global.u16`; the f32 `_zeros_on` variant over-allocates by 2×
+    // and leaves every second byte uninitialised → host-side f32 reads
+    // then interpret raw f16 bits as f32 → garbage → weight corruption.
+    // `dx` stays on `_zeros_on` because the kernel writes it as f32.
+    (
+        "nsl_tensor_zeros_f16_on",
+        &[types::I64, types::I64],
+        Some(types::I64),
+    ),
     ("nsl_tensor_ones_like", &[types::I64], Some(types::I64)),
     // GPU runtime functions (M17)
     ("nsl_cuda_init", &[], Some(types::I64)),
@@ -1095,6 +1106,44 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
             types::I64, // x_raw
         ],
         None,
+    ),
+    // Gap D / Tier C: CSHA fused backward launch.  44 i64 args matching
+    // the wengert_lower.rs `PrimalOp::FusedCshaBackward` emission order:
+    //   36-arg forward-side prelude mirrored off `_with_saves`,
+    //   + 6 forward-saved activation pointers,
+    //   + dO input + 7 gradient outputs (dq, dk, dv, dwq, dwk, dwv, dx).
+    // First surfaced as "undefined function" in the Gap I.3 smoke once
+    // A+F let the backward launch actually fire.
+    (
+        "nsl_flash_attention_csha_backward",
+        &[
+            types::I64, types::I64, types::I64, // q, k, v
+            types::I64, types::I64,             // out, logsumexp
+            types::I64,                         // scale_bits
+            types::I64, types::I64, types::I64, types::I64, // batch, heads, seq_len, head_dim
+            types::I64, types::I64, types::I64, types::I64, // block_table, k_pool, v_pool, block_size
+            types::I64, types::I64,             // cos, sin
+            types::I64, types::I64,             // seq_ids, seq_lens
+            types::I64,                         // shmem_bytes
+            types::I64, types::I64,             // bwd_ptx_ptr, bwd_name_ptr
+            types::I64, types::I64,             // block_q, block_kv
+            types::I64,                         // causal
+            types::I64, types::I64,             // x_ptr, norm_weight_ptr
+            types::I64, types::I64, types::I64, // wq, wk, wv
+            types::I64,                         // wo (null)
+            types::I64,                         // rmsnorm_eps_bits
+            types::I64, types::I64,             // active_heads, d_model
+            // Saved activations (6):
+            types::I64, types::I64, types::I64, // q_proj, k_proj, v_proj
+            types::I64, types::I64,             // row_max, row_sum
+            types::I64,                         // x_raw
+            // Gradient outputs (dO + 7):
+            types::I64,                         // do_ptr
+            types::I64, types::I64, types::I64, // dq, dk, dv
+            types::I64, types::I64, types::I64, // dwq, dwk, dwv
+            types::I64,                         // dx
+        ],
+        Some(types::I64),
     ),
     // FlashAttention-2 backward (M27 backward pass)
     // Returns NslList [dQ, dK, dV]. When logsumexp_ptr == 0, auto-computes lse.

@@ -958,6 +958,109 @@ fn lower_single_op(
             let null_lse = builder.ins().iconst(cl_types::I64, 0);
             compiler.flash_attn_aux.insert(result, (result, null_lse));
 
+            // Gap I.3 — forward save-buffer allocation when CSHA fused
+            // backward will consume this SDPA op.
+            //
+            // Historical context: Gap A landed save-buffer allocation at
+            // `compile_flash_attention_call` — the codepath taken by the
+            // `@flash_attention` fast-path function compilation.  But
+            // when `@train` is active and the method body is INLINED
+            // into the Wengert primal extractor (source AD path), the
+            // SDPA call becomes a `PrimalOp::ScaledDotProductAttention`
+            // and its lowering runs here, NOT through
+            // `compile_flash_attention_call`.  Result: the Gap A save
+            // branch never fires for source-AD training, and Gap D's
+            // `FusedCshaBackward` lowerer failed with
+            // `"no forward saves for layer '<name>'"`.
+            //
+            // Fix: when this SDPA op is claimed by a CSHA backward chain
+            // (`compiler.csha_backward_claims.op_to_chain`), resolve the
+            // layer name from the claim's FusionMark and allocate the
+            // six save buffers right here.  The layer key comes straight
+            // from `mark.layer` — the same key the backward lowerer uses
+            // in `csha_forward_saves.get(layer)` — so the I.3 layer-key
+            // consistency issue disappears for free.
+            //
+            // Only fires when:
+            //   (a) `csha_backward_claims` is populated (CSHA active on
+            //       this op_to_chain entry), AND
+            //   (b) the resolved layer has `save_activations_for_backward`
+            //       on its CshaExtras (set by `compile_train_block` when
+            //       bridging under `@train`).
+            let save_dispatch = compiler
+                .csha_backward_claims
+                .as_ref()
+                .and_then(|claims| claims.op_to_chain.get(&op.id).copied()
+                    .and_then(|idx| claims.chain_marks.get(idx))
+                    .map(|m| m.layer.clone())
+                );
+            if let Some(layer) = save_dispatch {
+                let needs_saves = compiler
+                    .last_csha_bridge
+                    .as_ref()
+                    .and_then(|b| b.extras_for_layer(&layer))
+                    .map(|e| e.save_activations_for_backward)
+                    .unwrap_or(false);
+                if needs_saves {
+                    // Derive (batch, heads, seq, head_dim) from q tensor.
+                    // q shape is [batch, heads, seq, head_dim] — matches the
+                    // `compile_flash_attention_call` convention used by the
+                    // Gap A allocation helper.
+                    let dim0 = builder.ins().iconst(cl_types::I64, 0);
+                    let dim1 = builder.ins().iconst(cl_types::I64, 1);
+                    let dim2 = builder.ins().iconst(cl_types::I64, 2);
+                    let dim3 = builder.ins().iconst(cl_types::I64, 3);
+                    let b = call(compiler, builder, "nsl_tensor_shape_dim", &[q, dim0])?;
+                    let h = call(compiler, builder, "nsl_tensor_shape_dim", &[q, dim1])?;
+                    let s = call(compiler, builder, "nsl_tensor_shape_dim", &[q, dim2])?;
+                    let hd = call(compiler, builder, "nsl_tensor_shape_dim", &[q, dim3])?;
+
+                    // 6 × i64 = 48 bytes, aligned to 8.  Mirrors Gap A's
+                    // stack slot in `compile_flash_attention_call`.
+                    let saves_slot = builder.create_sized_stack_slot(
+                        cranelift_codegen::ir::StackSlotData::new(
+                            cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                            48,
+                            8,
+                        ),
+                    );
+                    let saves_ptr = builder.ins().stack_addr(cl_types::I64, saves_slot, 0);
+                    let _alloc_rc = call(
+                        compiler,
+                        builder,
+                        "nsl_csha_alloc_backward_activations_into",
+                        &[b, h, s, hd, saves_ptr],
+                    )?;
+                    let q_proj_v = builder.ins().stack_load(cl_types::I64, saves_slot, 0);
+                    let k_proj_v = builder.ins().stack_load(cl_types::I64, saves_slot, 8);
+                    let v_proj_v = builder.ins().stack_load(cl_types::I64, saves_slot, 16);
+                    let row_max_v = builder.ins().stack_load(cl_types::I64, saves_slot, 24);
+                    let row_sum_v = builder.ins().stack_load(cl_types::I64, saves_slot, 32);
+                    let x_raw_v = builder.ins().stack_load(cl_types::I64, saves_slot, 40);
+
+                    let (bwd_ptx_id, bwd_name_id) = compiler
+                        .kernels
+                        .flash_attention_context
+                        .as_ref()
+                        .map(|c| (c.csha_backward_ptx_data_id, c.csha_backward_name_data_id))
+                        .unwrap_or((None, None));
+
+                    compiler.csha_forward_saves.insert(
+                        layer,
+                        crate::csha_apply::CshaSavePointers {
+                            q_proj: q_proj_v,
+                            k_proj: k_proj_v,
+                            v_proj: v_proj_v,
+                            row_max: row_max_v,
+                            row_sum: row_sum_v,
+                            x_raw: x_raw_v,
+                            backward_ptx_data_id: bwd_ptx_id,
+                            backward_name_data_id: bwd_name_id,
+                        },
+                    );
+                }
+            }
+
             Ok(result)
         }
         PrimalOp::FlashAttentionBackwardExtract { causal, component } => {
@@ -1285,48 +1388,73 @@ fn lower_single_op(
             let norm_weight_ptr = if inputs.len() > 9 { inputs[9] } else { null };
             let do_ptr = if inputs.len() > 1 { inputs[1] } else { null };
 
-            // Allocate 7 output gradient tensors.
-            // dq/dk/dv: [batch, heads, seq_len, head_dim]
-            // dwq/dwk/dwv: [d_model, heads*head_dim]   (kv_dim = heads*head_dim)
-            // dx: [batch, seq_len, d_model]
+            // Allocate 7 output gradient tensors DIRECTLY on device with
+            // the right dtypes (Gap I.3 — A+F).
+            //
+            // Tier C backward writes:
+            //   - dq/dk/dv/dwq/dwk/dwv as f16 (st.global.u16 → 2 B/elem)
+            //   - dx as f32 (RMSNorm-input gradient stays f32)
+            //
+            // Pre-A+F we zero-allocated all seven via `nsl_tensor_zeros`
+            // (CPU, f32) then `nsl_tensor_to_device`.  That left the f16
+            // buffers at 2× their intended byte size with every second
+            // byte uninitialised; f32-interpreting reads on the host
+            // produced garbage which the optimiser then stirred into the
+            // next step's weights.  This block replaces that with a
+            // single direct-on-device alloc per tensor at the correct
+            // element size + dtype.
+            //
+            // Shapes:
+            //   dq/dk/dv:      [batch, heads, seq_len, head_dim]
+            //   dwq/dwk/dwv:   [d_model, heads*head_dim]    (kv_dim = heads*head_dim)
+            //   dx:            [batch, seq_len, d_model]
             let heads_hd = builder.ins().imul(heads, hd_val);
+            let cuda_device = builder.ins().iconst(cl_types::I64, 1);
 
-            let alloc_shape = |compiler: &mut Compiler,
-                               builder: &mut FunctionBuilder,
-                               dims: &[Value]|
+            let alloc_shape_on = |compiler: &mut Compiler,
+                                  builder: &mut FunctionBuilder,
+                                  ffi: &str,
+                                  dims: &[Value],
+                                  device: Value|
              -> Result<Value, CodegenError> {
                 let shape = call(compiler, builder, "nsl_list_new", &[])?;
                 for d in dims {
                     call(compiler, builder, "nsl_list_push", &[shape, *d])?;
                 }
-                call(compiler, builder, "nsl_tensor_zeros", &[shape])
+                call(compiler, builder, ffi, &[shape, device])
             };
 
-            let dq = alloc_shape(compiler, builder, &[batch, heads, seq_len, hd_val])?;
-            let dk = alloc_shape(compiler, builder, &[batch, heads, seq_len, hd_val])?;
-            let dv = alloc_shape(compiler, builder, &[batch, heads, seq_len, hd_val])?;
-            let dwq = alloc_shape(compiler, builder, &[d_model_val, heads_hd])?;
-            let dwk = alloc_shape(compiler, builder, &[d_model_val, heads_hd])?;
-            let dwv = alloc_shape(compiler, builder, &[d_model_val, heads_hd])?;
-            let dx = alloc_shape(compiler, builder, &[batch, seq_len, d_model_val])?;
+            // f16 outputs — the 6 kernel-side st.global.u16 sinks.
+            let dq_dev = alloc_shape_on(
+                compiler, builder, "nsl_tensor_zeros_f16_on",
+                &[batch, heads, seq_len, hd_val], cuda_device,
+            )?;
+            let dk_dev = alloc_shape_on(
+                compiler, builder, "nsl_tensor_zeros_f16_on",
+                &[batch, heads, seq_len, hd_val], cuda_device,
+            )?;
+            let dv_dev = alloc_shape_on(
+                compiler, builder, "nsl_tensor_zeros_f16_on",
+                &[batch, heads, seq_len, hd_val], cuda_device,
+            )?;
+            let dwq_dev = alloc_shape_on(
+                compiler, builder, "nsl_tensor_zeros_f16_on",
+                &[d_model_val, heads_hd], cuda_device,
+            )?;
+            let dwk_dev = alloc_shape_on(
+                compiler, builder, "nsl_tensor_zeros_f16_on",
+                &[d_model_val, heads_hd], cuda_device,
+            )?;
+            let dwv_dev = alloc_shape_on(
+                compiler, builder, "nsl_tensor_zeros_f16_on",
+                &[d_model_val, heads_hd], cuda_device,
+            )?;
 
-            // Move all seven outputs to device so the kernel can write to
-            // them via st.global.*.  (nsl_tensor_zeros is CPU; the kernel
-            // requires managed/device memory.)
-            let cuda_device = builder.ins().iconst(cl_types::I64, 1);
-            let to_dev = |compiler: &mut Compiler,
-                          builder: &mut FunctionBuilder,
-                          t: Value|
-             -> Result<Value, CodegenError> {
-                call(compiler, builder, "nsl_tensor_to_device", &[t, cuda_device])
-            };
-            let dq_dev = to_dev(compiler, builder, dq)?;
-            let dk_dev = to_dev(compiler, builder, dk)?;
-            let dv_dev = to_dev(compiler, builder, dv)?;
-            let dwq_dev = to_dev(compiler, builder, dwq)?;
-            let dwk_dev = to_dev(compiler, builder, dwk)?;
-            let dwv_dev = to_dev(compiler, builder, dwv)?;
-            let dx_dev = to_dev(compiler, builder, dx)?;
+            // dx stays on the f32 allocator — the kernel writes it as f32.
+            let dx_dev = alloc_shape_on(
+                compiler, builder, "nsl_tensor_zeros_on",
+                &[batch, seq_len, d_model_val], cuda_device,
+            )?;
 
             // Launch the 44-arg backward kernel.
             // Forward-side `active_heads` — take from the training config
