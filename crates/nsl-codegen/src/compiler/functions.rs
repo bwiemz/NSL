@@ -598,6 +598,20 @@ impl Compiler<'_> {
                                     }
                                 }
                             }
+                            // B.3.1 Task 5.1: GatedLoRA's synthesize_gatedlora_adapted
+                            // builds a `sigmoid(self.gate_<site>)` Call node and resolves
+                            // the callee by looking up `field_symbols["sigmoid"]`. Without
+                            // this insertion the fallback picks an arbitrary field symbol
+                            // (e.g. `w`) as the callee, emitting `w(gate_...)` which fails
+                            // at codegen with "undefined variable 'w'".
+                            //
+                            // We insert the symbol unconditionally for all models that have
+                            // adapter sites — it is a no-op if no GatedLoRA site is present
+                            // since non-GatedLoRA rewrites never consult `field_symbols["sigmoid"]`.
+                            if let Some(s) = self.interner.get("sigmoid") {
+                                ctx.field_symbols
+                                    .insert("sigmoid".to_string(), nsl_ast::Symbol(s));
+                            }
                             let out: Vec<nsl_ast::stmt::Stmt> = fn_def
                                 .body
                                 .stmts

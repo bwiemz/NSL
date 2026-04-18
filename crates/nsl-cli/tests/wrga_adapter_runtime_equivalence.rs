@@ -744,3 +744,117 @@ fn ia3_fixture_a_baseline() {
 fn ia3_fixture_b_gamma_scaling() {
     run_ia3_fixture(IA3_FIXTURE_B_SRC, 16.0, "ia3_b");
 }
+
+// ─── Task Group 5: GatedLoRA integration fixtures ──────────────────────────
+//
+// Fixture A — baseline (gate = 0 per column):
+//   x = ones([4,8]), W = ones([8,8]), A = ones([8,2]), B = ones([2,8])
+//   alpha = rank = 2, scale = alpha/rank = 1.0
+//   gate[j] = 0 for all j  ⟹  sigmoid(gate[j]) = 0.5
+//
+//   y[i,j] = (x@W)[i,j] + sigmoid(gate[j]) * ((x@A)@B)[i,j] * scale
+//          = 8            + 0.5              * 16              * 1.0
+//          = 16.0 per element.
+//
+// Proves the GatedLoRA fused kernel runs end-to-end: base matmul (8),
+// adapter delta (x@A@B = 16), sigmoid gate folded at the correct value (0.5),
+// and scale=1.0 applied.  Tolerance 1e-4.
+
+const GATEDLORA_FIXTURE_A_SRC: &str = r#"from nsl.nn.losses import mse_loss
+
+model Toy:
+    w: Tensor = ones([8, 8])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x @ self.w
+
+@adapter(type=gatedlora, target=["Toy.w"], rank=2, alpha=2)
+let m = Toy()
+m.to(cuda)
+let x = ones([4, 8]).to(cuda)
+let y_target = zeros([4, 8]).to(cuda)
+train(model = m, epochs = 1):
+    optimizer: SGD(lr = 0.0)
+    step(batch):
+        let pred = m.forward(x)
+        let loss = mse_loss(pred, y_target)
+m.lora_A_Toy_w__gatedlora = ones([8, 2]).to(cuda)
+m.lora_B_Toy_w__gatedlora = ones([2, 8]).to(cuda)
+m.gate_Toy_w__gatedlora = zeros([8]).to(cuda)
+let y = m.forward(x)
+print(y)
+"#;
+
+/// Shared helper for GatedLoRA integration fixtures (Tasks 5.1-5.4).
+///
+/// Runs `src` through `nsl run --source-ad --target cuda_sm80` with
+/// `NSL_WRGA_FUSED_CUDA=1` and `NSL_WRGA_GPU_LAUNCH_COUNTER=1`, then asserts:
+///   1. Process exits successfully.
+///   2. Every output element is within `tolerance` of `expected`.
+///   3. `[nsl-gpu-launch-count] >= 1` — the real cudarc PTX path fired, NOT
+///      the CPU fallback.
+#[cfg(feature = "cuda")]
+fn run_gatedlora_fixture(src: &str, expected: f32, tolerance: f32, fixture_name: &str) {
+    let tmp = TempDir::new().unwrap();
+    let src_path = tmp.path().join(format!("{}.nsl", fixture_name));
+    fs::write(&src_path, src).unwrap();
+    let root = workspace_root();
+    let stdlib = root.join("stdlib");
+    let mut cmd = Command::cargo_bin("nsl").unwrap();
+    cmd.env("NSL_STDLIB_PATH", &stdlib)
+        .env("NSL_WRGA_FUSED_CUDA", "1")
+        .env("NSL_WRGA_GPU_LAUNCH_COUNTER", "1")
+        .arg("run")
+        .args(["--source-ad", "--target", "cuda_sm80"])
+        .arg(&src_path);
+    let output = cmd.output().expect("nsl run failed to spawn");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    assert!(
+        output.status.success(),
+        "{fixture_name} nsl run failed.\nstdout:\n{stdout}\nstderr:\n{stderr}",
+    );
+
+    let tensor = parse_tensor_2d(&stdout);
+    assert_eq!(tensor.len(), 4, "{fixture_name}: expected 4 rows");
+
+    let mut max_diff: f32 = 0.0;
+    for row in &tensor {
+        assert_eq!(row.len(), 8, "{fixture_name}: expected 8 cols");
+        for v in row {
+            max_diff = max_diff.max((v - expected).abs());
+        }
+    }
+    assert!(
+        max_diff < tolerance,
+        "{fixture_name}: max |y - {expected}| = {max_diff:.3e}, want < {tolerance:.0e}.\n\
+         Diagnostic:\n\
+         - diff ~ 8.0 (y=8 or y=24): sigmoid gate not applied or applied twice\n\
+         - diff ~ 16.0 (y=0): adapter delta dropped entirely\n\
+         - diff ~ 0.5*16=8 (y~8): gate=0.5 correct but base matmul dropped\n\
+         - diff > 1e-3: precision concern (f16 cvt between epilogue MMAs)\n\
+         Tensor: {tensor:?}\nstderr:\n{stderr}",
+    );
+
+    // Assert fused PTX actually fired (not CPU fallback).
+    let gpu_count_line = stderr.lines().find(|l| l.contains("[nsl-gpu-launch-count]"));
+    let count: u64 = gpu_count_line
+        .and_then(|l| l.split_whitespace().next_back())
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    assert!(
+        count >= 1,
+        "{fixture_name}: expected >=1 fused CUDA launch, got {count}.\n\
+         0 means all fused FFI calls hit the CPU fallback — check:\n\
+         - GatedLoRA kernel registered in fused_adapter.rs kernel registry\n\
+         - wrga_adapter_rewrite.rs emits GatedLoRA fused Call (not unfused triple)\n\
+         - GPU tensor placement gates satisfied (all tensors on CUDA)\n\
+         stderr:\n{stderr}",
+    );
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+fn gatedlora_fixture_a_baseline() {
+    run_gatedlora_fixture(GATEDLORA_FIXTURE_A_SRC, 16.0, 1e-4, "gatedlora_fixture_a");
+}
