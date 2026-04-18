@@ -614,3 +614,71 @@ pub fn emit_ia3_gamma_multiply(ptx: &mut String) {
 pub fn emit_ia3_store_output(ptx: &mut String, n: u32) {
     emit_lora_store_output(ptx, n);
 }
+
+/// Emit a PTX fp32 sigmoid approximation using the hardware approx units.
+///
+/// Produces `output = 1 / (1 + exp(-input))` as 4 PTX instructions:
+///   mul.f32  %sig_tmp, <input>, 0fBFB8AA3B;   // * -log2(e) = -1.4426950408
+///   ex2.approx.f32 %sig_tmp, %sig_tmp;         // e^(-input)
+///   add.f32  %sig_tmp, %sig_tmp, 0f3F800000;   // + 1.0
+///   rcp.approx.f32 <output>, %sig_tmp;         // sigmoid(input)
+///
+/// Hex constants:
+///   0fBFB8AA3B = -log2(e) as f32 (sign=1, exp=0x7F, mantissa=0x38AA3B).
+///     DO NOT use 0f3FB8AA3B (= +log2(e), silently computes sigmoid(-input))
+///     DO NOT use 0f3FBE2FB9 (= +1.486, historical bad spec-draft value).
+///   0f3F800000 = 1.0 as f32.
+///
+/// Requires: the caller has declared `%sig_tmp` as `.reg .f32` in the
+/// kernel's register pool.  For GatedLoRA, this is declared in the
+/// `emit_fused_adapter_kernel_body`'s PerColumnSigmoid register block
+/// (added in Task 4.1).
+pub fn emit_sigmoid_approx_fused(ptx: &mut String, input: &str, output: &str) {
+    ptx.push_str(&format!(
+        "    mul.f32  %sig_tmp, {input}, 0fBFB8AA3B;   // * -log2(e)\n"
+    ));
+    ptx.push_str("    ex2.approx.f32 %sig_tmp, %sig_tmp;\n");
+    ptx.push_str("    add.f32  %sig_tmp, %sig_tmp, 0f3F800000;   // + 1.0\n");
+    ptx.push_str(&format!(
+        "    rcp.approx.f32 {output}, %sig_tmp;\n"
+    ));
+}
+
+#[cfg(test)]
+mod sigmoid_tests {
+    use super::emit_sigmoid_approx_fused;
+
+    #[test]
+    fn emit_sigmoid_approx_fused_has_correct_log2e_constant() {
+        let mut ptx = String::new();
+        emit_sigmoid_approx_fused(&mut ptx, "%in", "%out");
+
+        // Critical: the mul line must use the NEGATIVE log2(e) constant.
+        let mul_line = ptx.lines()
+            .find(|l| l.contains("mul.f32") && l.contains("%sig_tmp"))
+            .expect("expected mul.f32 %sig_tmp line in emission");
+        assert!(
+            mul_line.contains("0fBFB8AA3B"),
+            "mul line must use -log2(e) = 0fBFB8AA3B; got: {mul_line}"
+        );
+
+        // Belt-and-suspenders: reject the historical bad value.
+        assert!(
+            !ptx.contains("0f3FBE2FB9"),
+            "regression to spec-draft bad positive constant 0f3FBE2FB9:\n{ptx}"
+        );
+
+        // Also reject the sign-flipped case (would silently compute sigmoid(-x)).
+        assert!(
+            !ptx.contains("mul.f32  %sig_tmp, %in, 0f3FB8AA3B"),
+            "sign-flipped +log2(e) constant detected; would compute sigmoid(-input):\n{ptx}"
+        );
+
+        // Structural: exactly one ex2.approx and one rcp.approx.
+        assert_eq!(ptx.matches("ex2.approx.f32").count(), 1);
+        assert_eq!(ptx.matches("rcp.approx.f32").count(), 1);
+        assert!(ptx.contains("0f3F800000"), "missing +1.0 constant");
+        assert!(ptx.contains("%in"), "missing input register reference");
+        assert!(ptx.contains("%out"), "missing output register reference");
+    }
+}
