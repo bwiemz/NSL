@@ -1,0 +1,6 @@
+# Snapshot files compared byte-for-byte via include_str! / insta must
+# have deterministic line endings regardless of checkout platform.
+# Without this, Windows core.autocrlf=true normalizes LF to CRLF on
+# checkout and every snapshot assertion that compares against an
+# emitter using `ptx.push_str("...\n")` fails.
+*.snap text eol=lf
