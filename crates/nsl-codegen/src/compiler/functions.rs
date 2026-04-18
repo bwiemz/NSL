@@ -559,6 +559,17 @@ impl Compiler<'_> {
                                 .collect();
                             order.sort_by_key(|k| (k.m, k.n, k.k, k.rank, k.target_sm));
                             ctx.fused_kernel_order = order;
+                            // B.3.1 Task 5.0.c: build GatedLoRA kernel order
+                            // from the parallel map.  Handles for GatedLoRA
+                            // are assigned at lora_count + idx in this vec.
+                            let mut gl_order: Vec<crate::wrga_fused_ptx::LoraKernelKey> = self
+                                .fused_gatedlora_ptx_kernels
+                                .keys()
+                                .cloned()
+                                .collect();
+                            gl_order
+                                .sort_by_key(|k| (k.m, k.n, k.k, k.rank, k.target_sm));
+                            ctx.fused_gatedlora_kernel_order = gl_order;
                             // Find the `self` Symbol and populate field_symbols
                             // from the model's known fields for matcher support.
                             ctx.self_sym = fn_def

@@ -79,6 +79,22 @@ impl FusedLoraConfig {
     }
 }
 
+impl FusedGatedLoraConfig {
+    /// B.3.1 Task 5.0.c: reuse `LoraKernelKey` for the dedup key since
+    /// the shape fields are identical.  GatedLoRA entries live in the
+    /// separate `fused_gatedlora_ptx_kernels` map so there is no
+    /// collision with LoRA kernels that share the same shape.
+    pub fn kernel_key(&self) -> LoraKernelKey {
+        LoraKernelKey {
+            m: self.m,
+            n: self.n,
+            k: self.k,
+            rank: self.rank,
+            target_sm: self.target_sm,
+        }
+    }
+}
+
 /// Variation point for `emit_fused_adapter_kernel_body`'s fold step.
 /// LoRA uses `Scalar`; GatedLoRA uses `PerColumnSigmoid`.
 ///

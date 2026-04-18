@@ -72,6 +72,10 @@ pub struct RewriteContext<'a> {
     /// `(m, n, k, rank, target_sm)`.  Empty when the prescan didn't
     /// populate `Compiler::fused_ptx_kernels` (e.g. non-sm_80 target).
     pub fused_kernel_order: Vec<crate::wrga_fused_ptx::LoraKernelKey>,
+    /// B.3.1 Task 5.0.c: parallel ordering for GatedLoRA kernels.
+    /// GatedLoRA handles = `fused_kernel_order.len() + position_in_this_vec`.
+    /// Sorted by the same key tuple as `fused_kernel_order`.
+    pub fused_gatedlora_kernel_order: Vec<crate::wrga_fused_ptx::LoraKernelKey>,
 }
 
 impl<'a> RewriteContext<'a> {
@@ -84,6 +88,7 @@ impl<'a> RewriteContext<'a> {
             target_sm: None,
             synth_call_overrides: HashMap::new(),
             fused_kernel_order: Vec::new(),
+            fused_gatedlora_kernel_order: Vec::new(),
         }
     }
 }
@@ -533,10 +538,9 @@ pub fn synthesize_gatedlora_fused_call(
     let alpha = site.alpha.max(1) as f64;
     let scale = alpha / rank;
 
-    // kernel_handle: stubbed at 0 until Task 5.0.c registers the PTX kernel.
-    // Use the same LoraKernelKey lookup pattern as synthesize_lora_fused_call
-    // so that when Task 5.0.c adds GatedLoRA entries to fused_kernel_order the
-    // handle resolves automatically.
+    // B.3.1 Task 5.0.c: look up the GatedLoRA-specific kernel order.
+    // GatedLoRA handles are assigned as `lora_order.len() + idx_in_gatedlora_order`
+    // to avoid collisions with LoRA handles that share the same shape.
     let kernel_handle: i64 = {
         let target_sm = ctx.target_sm.unwrap_or(0);
         let rank_u32 = match &site.fusion_decision {
@@ -552,12 +556,12 @@ pub fn synthesize_gatedlora_fused_call(
             rank: rank_u32,
             target_sm,
         };
-        ctx.fused_kernel_order
+        let lora_offset = ctx.fused_kernel_order.len() as i64;
+        ctx.fused_gatedlora_kernel_order
             .iter()
             .position(|k| k == &key)
-            .map(|p| p as i64)
-            .unwrap_or(0) // stub: 0 until Task 5.0.c; LoRA uses -1 but spec
-                          // says 0 for GatedLoRA stub (Task 5.0.c will wire real handle)
+            .map(|p| lora_offset + p as i64)
+            .unwrap_or(-1)
     };
 
     let callee_id = NodeId::next();
