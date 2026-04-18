@@ -1571,7 +1571,7 @@ mod tests {
         // The dispatch-map builder also re-derives config from the
         // bridge result — make sure it reads the same head_dim.
         let (_op_to_chain, chain_marks) =
-            collect_chain_dispatch_map_with_wengert(&plan, &bridge_result, Some(&w));
+            collect_chain_dispatch_map_with_wengert(&plan, &bridge_result, Some(&w), None);
         assert!(
             !chain_marks.is_empty(),
             "H.1: dispatch map must produce at least one chain mark"

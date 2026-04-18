@@ -347,15 +347,12 @@ fn toy_pretrain_hd32_compile_emits_fused_backward_ffi() {
          mangled-name convention without updating this test."
     );
 
-    // Source AD fired — hallmark is `nsl_tensor_reduce_to_shape`
-    // (emitted by matmul/broadcast adjoints).
-    assert!(
-        called.contains("nsl_tensor_reduce_to_shape"),
-        "[gap-f] source AD did not fire — `nsl_tensor_reduce_to_shape` \
-         is absent.  Either `CompileOptions.source_ad=true` is no \
-         longer honoured for train blocks or `AdjointGenerator` \
-         failed silently."
-    );
+    // Source AD fired — the CSHA-fused source-AD path does NOT emit
+    // `nsl_tensor_reduce_to_shape` (the fused backward kernel handles
+    // reshape internally), so we detect source AD via the fused
+    // backward FFI reloc instead. If the fused path ever regresses to
+    // tape AD, the hard assertion on `nsl_flash_attention_csha_backward`
+    // below will fail first.
 
     // ── Gap F.1 + F.2 load-bearing assertions ──────────────────────
     //
@@ -375,39 +372,31 @@ fn toy_pretrain_hd32_compile_emits_fused_backward_ffi() {
     // of H's scope.  Keep this check as a skip-with-diagnostic so the
     // rest of the H-level relocation assertions above can still hard-
     // fail on regressions.
-    let found_backward = called.contains("nsl_flash_attention_csha_backward");
-    let found_alloc_into = called.contains("nsl_csha_alloc_backward_activations_into");
-    if !found_backward {
-        eprintln!(
-            "[gap-h] `nsl_flash_attention_csha_backward` is NOT referenced. \
-             H.1 + H.2 land correctly — `nsl_optim_sgd__sgd_step`, \
-             `nsl_set_training_mode`, and `nsl_tensor_reduce_to_shape` \
-             relocations are all present (observed above).  The fused \
-             backward FFI reloc requires two additional cascade fixes \
-             that emerge only after H.1 + H.2 unblock the AD path: \
-             (a) the Tier C backward SMEM validator rejects every \
-             Pipeline-level mark config (`316160 bytes > 101376 byte \
-             cap` at hd=32 because `fused_projections` + \
-             `fused_output_proj` inflate SMEM) — it needs either a \
-             mark → training-config alignment at the AD dispatch site \
-             or a validator pass that knows the launch uses the \
-             smaller training_config; (b) `eliminate_dead_gradients` \
-             prunes the `FusedCshaBackward` launch op when only a \
-             subset of its seven extract components are reachable \
-             from trainable-param gradients, breaking the \
-             cache-populate → cache-read ordering and tripping \
-             `CshaFusedBackwardExtract: no cache entry for key Value`. \
-             Both are Gap D/I follow-ups.  \
-             relocations={called:?}"
-        );
-        return;
-    }
+    // ── The load-bearing assertion: fused backward FFI is present ──
+    //
+    // Post H-replay + Gap I.1..I.4, the fused CSHA backward kernel is
+    // actually called from the emitted object. This reloc is the
+    // milestone the entire Gap I plan targeted.
     assert!(
-        found_alloc_into,
-        "[gap-f] `nsl_flash_attention_csha_backward` fired but the \
-         save-buffer allocator `nsl_csha_alloc_backward_activations_into` \
-         did not — the backward-PTX data address is reachable but the \
-         save tensor was never allocated.  Check Gap A's alloc \
-         lowering in compile_flash_attention_call."
+        called.contains("nsl_flash_attention_csha_backward"),
+        "[gap-f] THE milestone reloc `nsl_flash_attention_csha_backward` \
+         is absent. This regressed a working state — check that \
+         Gap H.1+H.2, Gap I.1+I.2+I.3+I.4 all remain in place. \
+         relocations={called:?}"
+    );
+    assert!(
+        called.contains("nsl_csha_alloc_backward_activations_into"),
+        "[gap-f] save-buffer allocator FFI is absent — Gap A + \
+         Gap I.3 SDPA-path save plumbing regressed."
+    );
+    assert!(
+        called.contains("nsl_csha_free_backward_activations_from"),
+        "[gap-f] save-buffer free FFI is absent — Gap A free-move \
+         in wengert_lower regressed."
+    );
+    assert!(
+        called.contains("nsl_tensor_zeros_f16_on"),
+        "[gap-f] f16 zero-init FFI is absent — Gap I.3 A+F dtype \
+         fix for gradient output allocation regressed."
     );
 }
