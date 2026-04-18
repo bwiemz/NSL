@@ -139,10 +139,11 @@ pub(crate) fn prescan_adapter_sites_from_decorators(compiler: &mut Compiler<'_>)
     let target_sm = compiler.target_sm().unwrap_or(80);
     if target_sm >= 80 {
         for site in &sites {
-            // B.3.1: also synthesize PTX for GatedLoRA fused sites.
+            // Only synthesize LoRA PTX here.  GatedLoRA PTX synthesis uses a
+            // separate synthesizer (synthesize_fused_gatedlora_ptx) and a
+            // separate kernel map; that wiring lands in Task 5.0.c.
             let rank = match site.fusion_decision.as_ref() {
                 Some(FusionTarget::EpilogueFusedLora { rank }) => rank,
-                Some(FusionTarget::EpilogueFusedGatedLora { rank }) => rank,
                 _ => continue,
             };
             if site.input_dim == 0 || site.output_dim == 0 {

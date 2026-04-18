@@ -555,6 +555,154 @@ fn cpu_fallback_fused_gatedlora(
     nsl_tensor_add(y_main, scaled, RELINQUISH_A | RELINQUISH_B)
 }
 
+/// Attempt a real cudarc-based launch for the GatedLoRA kernel identified by
+/// `handle`.  Returns `Some(out_ptr)` on success, `None` on any failure
+/// (missing PTX, non-GPU tensors, launch error, etc.) - the caller then
+/// falls back to the CPU-math path.  Emits a one-line stderr warning on
+/// fallback so test failures are debuggable.
+///
+/// PTX kernel signature (9 args):
+///   (x_ptr, w_ptr, a_ptr, b_ptr, scale.f32, y_ptr, m_rows.u32, n_cols.u32, gate_ptr)
+#[cfg(feature = "cuda")]
+fn try_cuda_launch_fused_gatedlora(
+    x: i64,
+    w: i64,
+    lora_a: i64,
+    lora_b: i64,
+    scale: f64,
+    gate: i64,
+    kernel_handle: i64,
+) -> Option<i64> {
+    use crate::cuda::inner;
+    use crate::tensor::NslTensor;
+    use std::ffi::c_void;
+
+    // 1. PTX must be registered for this handle.
+    let (ptx_cstr, name_cstr) = {
+        let reg = fused_ptx_registry().lock().ok()?;
+        let entry = reg.get(&kernel_handle)?;
+        (entry.ptx.clone(), entry.kernel_name.clone())
+    };
+
+    // 2. All inputs must be on GPU.  We do not perform dtype conversion here;
+    //    that is a synthesizer concern.
+    let xt = unsafe { &*(x as *const NslTensor) };
+    let wt = unsafe { &*(w as *const NslTensor) };
+    let at = unsafe { &*(lora_a as *const NslTensor) };
+    let bt = unsafe { &*(lora_b as *const NslTensor) };
+    let gat = unsafe { &*(gate as *const NslTensor) };
+    if xt.device == 0 || wt.device == 0 || at.device == 0 || bt.device == 0 || gat.device == 0 {
+        eprintln!(
+            "[nsl-wrga] NSL_WRGA_FUSED_CUDA=1 set but GatedLoRA inputs not on GPU - \
+             falling back to CPU math"
+        );
+        return None;
+    }
+
+    // 3. Derive shape-dependent grid/block from x=[m,k], w=[k,n].
+    if xt.ndim < 2 || wt.ndim < 2 {
+        return None;
+    }
+    let m = unsafe { *xt.shape.add(xt.ndim as usize - 2) } as i64;
+    let n = unsafe { *wt.shape.add(wt.ndim as usize - 1) } as i64;
+
+    // Allocate output on the same device, f32 (PTX stores back as f32).
+    let out_elems = (m * n) as usize;
+    let out_data = inner::try_alloc_managed(out_elems * 4)?;
+    let shape = NslTensor::copy_shape(xt.shape, 2);
+    unsafe {
+        *shape.add(0) = m;
+        *shape.add(1) = n;
+    }
+    let strides = NslTensor::compute_strides(shape, 2);
+    let out_box = Box::new(NslTensor::new(
+        out_data,
+        shape,
+        strides,
+        2,
+        (m * n) as i64,
+        xt.device,
+        1, // f32 output
+        1,
+        0,
+    ));
+    let out_ptr = Box::into_raw(out_box);
+
+    // 4. Marshal launch args.  PTX kernel signature (9 params):
+    //    (x_ptr, w_ptr, a_ptr, b_ptr, scale.f32, y_ptr, m_rows.u32, n_cols.u32, gate_ptr)
+    let mut x_data = xt.data as u64;
+    let mut w_data = wt.data as u64;
+    let mut a_data = at.data as u64;
+    let mut b_data = bt.data as u64;
+    let mut scale_f32: f32 = scale as f32;
+    let mut y_data = out_data as u64;
+    let mut m_rows_u32: u32 = m as u32;
+    let mut n_cols_u32: u32 = n as u32;
+    let mut gate_data = gat.data as u64;
+    let args: [*mut c_void; 9] = [
+        &mut x_data as *mut _ as *mut c_void,
+        &mut w_data as *mut _ as *mut c_void,
+        &mut a_data as *mut _ as *mut c_void,
+        &mut b_data as *mut _ as *mut c_void,
+        &mut scale_f32 as *mut _ as *mut c_void,
+        &mut y_data as *mut _ as *mut c_void,
+        &mut m_rows_u32 as *mut _ as *mut c_void,
+        &mut n_cols_u32 as *mut _ as *mut c_void,
+        &mut gate_data as *mut _ as *mut c_void,
+    ];
+
+    // 5. Grid/block.  The synthesizer emits m16n8k16 MMA tiles; one
+    //    warp (32 threads) per (BM=16, BN=8) output tile.
+    let grid = [(m + 15) / 16, (n + 7) / 8, 1];
+    let block = [32i64, 1, 1];
+    let res = inner::kernel_launch(
+        ptx_cstr.as_ptr(),
+        name_cstr.as_ptr(),
+        grid,
+        block,
+        &args,
+        0,
+    );
+    if res as u32 != 0 {
+        eprintln!(
+            "[nsl-wrga] fused GatedLoRA PTX launch failed ({:?}) - falling back to CPU math",
+            res
+        );
+        unsafe {
+            let _ = Box::from_raw(out_ptr);
+        }
+        inner::free_managed(out_data);
+        return None;
+    }
+    let sync_result = unsafe { cudarc::driver::sys::cuCtxSynchronize() };
+    if sync_result as u32 != 0 {
+        eprintln!(
+            "[nsl-wrga] fused GatedLoRA kernel caused GPU error ({:?}) - falling back to CPU math",
+            sync_result
+        );
+        unsafe {
+            let _ = Box::from_raw(out_ptr);
+        }
+        inner::free_managed(out_data);
+        return None;
+    }
+    record_fused_gpu_launch();
+    Some(out_ptr as i64)
+}
+
+#[cfg(not(feature = "cuda"))]
+fn try_cuda_launch_fused_gatedlora(
+    _x: i64,
+    _w: i64,
+    _lora_a: i64,
+    _lora_b: i64,
+    _scale: f64,
+    _gate: i64,
+    _kernel_handle: i64,
+) -> Option<i64> {
+    None
+}
+
 /// Fused GatedLoRA matmul:
 /// `y = x @ W + sigmoid(gate) * ((x @ A) @ B) * scale` in a single FFI call.
 ///
@@ -566,14 +714,20 @@ fn cpu_fallback_fused_gatedlora(
 /// * `lora_b`        — LoRA-B, shape `[rank, d_out]`
 /// * `scale`         — `alpha / rank`, passed as f64
 /// * `gate`          — gating scalar or vector; sigmoid applied element-wise
-/// * `kernel_handle` — index into the runtime fused-PTX registry (stub: 0).
-///                     Real PTX launch wired in Task 5.0.c.
+/// * `kernel_handle` — index into the runtime fused-PTX registry populated
+///                     by `nsl_wrga_register_fused_ptx`.  Negative or
+///                     unregistered handles skip the CUDA path.
 ///
-/// # Task 5.0.a — stub status
+/// # Dispatch rules
 ///
-/// CPU-fallback only.  Task 5.0.c registers the GatedLoRA PTX kernel
-/// and wires the real cudarc launch path.  The CPU fallback is
-/// numerically correct for the step-0 invariant and Fixture A at 1e-4.
+/// 1. `record_fused_launch()` fires exactly once per FFI call (Build 5 invariant).
+/// 2. If `NSL_WRGA_FUSED_CUDA=1` AND the handle is registered AND all
+///    inputs are on GPU, attempt the real cudarc PTX launch (Task 5.0.b).
+/// 3. On any failure (or when the env gate is off), fall through to the
+///    CPU-math path.  The CPU math is numerically correct for the step-0
+///    invariant and Fixture A at 1e-4.
+/// 4. Kernel registry still lacks GatedLoRA entries until Task 5.0.c wires
+///    PTX registration; Fixture A's GPU launch count stays at 0 until then.
 ///
 /// # Safety
 /// All tensor pointers must be valid `*NslTensor` handles or `0`.
@@ -585,13 +739,19 @@ pub extern "C" fn nsl_adapter_fused_gatedlora_matmul(
     lora_b: i64,
     scale: f64,
     gate: i64,
-    _kernel_handle: i64,
+    kernel_handle: i64,
 ) -> i64 {
     if x == 0 || w == 0 || lora_a == 0 || lora_b == 0 || gate == 0 {
         return 0;
     }
     record_fused_launch();
-    // Task 5.0.c: add real cudarc CUDA launch path here, mirroring
-    // nsl_adapter_fused_lora_matmul's try_cuda_launch_fused_lora branch.
+
+    if real_cuda_path_enabled() {
+        if let Some(out) =
+            try_cuda_launch_fused_gatedlora(x, w, lora_a, lora_b, scale, gate, kernel_handle)
+        {
+            return out;
+        }
+    }
     cpu_fallback_fused_gatedlora(x, w, lora_a, lora_b, scale, gate)
 }
