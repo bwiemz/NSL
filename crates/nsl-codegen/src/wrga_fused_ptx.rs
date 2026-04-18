@@ -627,8 +627,22 @@ pub fn synthesize_fused_gatedlora_ptx(config: &FusedGatedLoraConfig) -> String {
     // STUB: intentionally invalid PTX to establish red test state.
     // Task 4.1 replaces this with emit_fused_adapter_kernel_body(..,
     // FoldKind::PerColumnSigmoid { .. }).
-    let _ = config;
-    String::from(".version 7.0\n.target sm_80\n.address_size 64\n\n// STUB — Task 4.1 replaces this\n")
+    //
+    // The stub emits a .entry with a deliberately invalid instruction
+    // (`this_is_not_a_real_ptx_opcode`) so ptxas rejects it.  An empty module
+    // (header + comment only) is valid PTX and would silently pass ptxas.
+    let sm = config.target_sm;
+    format!(
+        ".version 7.0\n\
+         .target sm_{sm}\n\
+         .address_size 64\n\
+         \n\
+         // STUB — Task 4.1 replaces this body\n\
+         .visible .entry gatedlora_stub ()\n\
+         {{\n\
+             this_is_not_a_real_ptx_opcode;\n\
+         }}\n"
+    )
 }
 
 #[cfg(test)]
