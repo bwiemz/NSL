@@ -307,6 +307,125 @@ fn fallback_chain_records_no_fused_event() {
     assert!(!gen.csha_diagnostics().is_empty());
 }
 
+/// Gap I.1 regression: when the plan-level config carries fusion flags
+/// (`fused_projections=true`) that break the backward SMEM validator OR
+/// the `block_q == block_kv` fused-projections invariant, but a clamped
+/// training config is supplied, the dispatcher must see the **training**
+/// config and return `EmitFused` — not fall back via the plan config.
+///
+/// This pins the I.1 fix in `collect_chain_dispatch_map_with_wengert`:
+/// `FusionMark.config` is sourced from `training_config` when present.
+#[test]
+fn gap_i1_training_config_clamps_plan_fusion_flags() {
+    use nsl_codegen::ad_rules::{csha_dispatch_for_op, CshaDispatchDecision};
+    use nsl_codegen::flash_attention_v2::smem_layout::{
+        validate_scalar_v2_config, Direction,
+    };
+
+    // Plan-level config: fused_projections=true + block_q != block_kv →
+    // validator rejects ("fused_projections requires block_q == block_kv").
+    let plan_cfg = FlashAttentionConfig {
+        block_q: 32,
+        block_kv: 64, // mismatched vs block_q → forces validator rejection
+        head_dim: 32,
+        causal: false,
+        paged: false,
+        rope_q: false,
+        rope_style: RopeStyle::HalfSplit,
+        gqa_group_size: 1,
+        tree_mask: false,
+        gpu_sm: 75,
+        csha: Some(CshaExtras {
+            fused_projections: true,
+            fused_output_proj: true,
+            save_activations_for_backward: true,
+            d_model: 32,
+            ..CshaExtras::default()
+        }),
+    };
+    // Plan config MUST fail the validator — otherwise this test isn't
+    // actually exercising the clamp path.
+    assert!(
+        validate_scalar_v2_config(&plan_cfg, Direction::Backward).is_err(),
+        "plan config must be validator-rejecting for the test to be meaningful"
+    );
+
+    // Training config: clamped — no fusion flags, block_q==block_kv==32.
+    // This is what `compiler/kernel.rs:543-552` stamps onto
+    // `csha_training_config`, which is the config the real backward
+    // kernel is actually built from.
+    let train_cfg = FlashAttentionConfig {
+        block_q: 32,
+        block_kv: 32,
+        head_dim: 32,
+        causal: false,
+        paged: false,
+        rope_q: false,
+        rope_style: RopeStyle::HalfSplit,
+        gqa_group_size: 1,
+        tree_mask: false,
+        gpu_sm: 75,
+        csha: Some(CshaExtras {
+            level: 1,
+            fused_projections: false,
+            fused_output_proj: false,
+            save_activations_for_backward: true,
+            d_model: 32,
+            rmsnorm_eps: 1e-5,
+            ..CshaExtras::default()
+        }),
+    };
+    // Training config MUST pass the validator — otherwise even the
+    // clamp can't make the dispatcher hit `EmitFused`.
+    assert!(
+        validate_scalar_v2_config(&train_cfg, Direction::Backward).is_ok(),
+        "training config must pass the backward validator"
+    );
+
+    // Simulate what `collect_chain_dispatch_map_with_wengert` does when
+    // `training_config` is supplied: the mark carries the training
+    // config, not the plan config.
+    let clamped_mark = FusionMark {
+        layer: "blocks.0".into(),
+        kind: Some(ProjKind::Q),
+        param_name: "blocks.0.attn.wq".into(),
+        role: MarkRole::NormPrologue,
+        config: Some(train_cfg),
+        backward_emitted: std::cell::Cell::new(false),
+        chain_varids: None,
+    };
+    let plan_mark = FusionMark {
+        layer: "blocks.0".into(),
+        kind: Some(ProjKind::Q),
+        param_name: "blocks.0.attn.wq".into(),
+        role: MarkRole::NormPrologue,
+        config: Some(plan_cfg),
+        backward_emitted: std::cell::Cell::new(false),
+        chain_varids: None,
+    };
+
+    // With the plan config, the dispatcher MUST fall back.
+    match csha_dispatch_for_op(&plan_mark, 0) {
+        CshaDispatchDecision::Fallback { diagnostic } => {
+            assert!(
+                diagnostic.contains("CSHA fused backward rejected"),
+                "expected plan-config rejection, got: {diagnostic}"
+            );
+        }
+        other => panic!(
+            "plan config MUST be rejected by dispatcher; got {other:?}"
+        ),
+    }
+
+    // With the clamped training config, the dispatcher MUST emit fused.
+    match csha_dispatch_for_op(&clamped_mark, 0) {
+        CshaDispatchDecision::EmitFused => {}
+        other => panic!(
+            "I.1 regression — clamped training config MUST accept EmitFused; got {other:?}"
+        ),
+    }
+}
+
 /// Verify that the `collect_chain_dispatch_map` helper correctly
 /// maps boundary-chain op indices to chain-level marks.
 #[test]

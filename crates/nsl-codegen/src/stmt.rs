@@ -4045,11 +4045,23 @@ impl Compiler<'_> {
                             // which is the correct primary claim site for
                             // `EmitFused`.
                             if let Some(ref bridge) = self.last_csha_bridge {
+                                // Gap I.1: pass the TRAINING config (clamped, no
+                                // fusion flags) so the dispatcher's backward SMEM
+                                // validator sees the same geometry the real
+                                // launch will fire. Falls back to plan-level
+                                // config when `csha_training_config` is absent
+                                // (inference-only builds).
+                                let training_config = self
+                                    .kernels
+                                    .flash_attention_context
+                                    .as_ref()
+                                    .and_then(|c| c.csha_training_config.as_ref());
                                 let (op_to_chain, chain_marks) =
                                     crate::csha_apply::collect_chain_dispatch_map_with_wengert(
                                         &plan,
                                         bridge,
                                         Some(extractor.wengert_list()),
+                                        training_config,
                                     );
                                 if !chain_marks.is_empty() {
                                     self.csha_backward_claims =
