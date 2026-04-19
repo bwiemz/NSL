@@ -455,26 +455,46 @@ fn csha_gap_gpu_e2e_csha_fused_path() {
              rule that keeps SGD's `copy_data(param, ...)` dtype-compatible.\n\
              stderr:\n{stderr}"
         );
-        // Current known blocker (2026-04-16): once the backward kernel
-        // name mismatch is fixed (see compiler/kernel.rs — the fwd-name
-        // suffixed with `_bwd` did not match the PTX entry
-        // `flash_attn_backward_v2_...`), the kernel reaches launch and
-        // then segfaults on its first HBM load because the FA call site
-        // does NOT auto-transfer Q/K/V/x/dO from CPU→GPU. Graceful-skip
-        // on that signature until the device-placement fix lands.
+        // Known blocker (2026-04-16, updated): the launch-input shifting
+        // bug in `source_ad.rs::generate` has been fixed — the
+        // FusedCshaBackward op no longer receives `scale` at the
+        // `x_ptr` slot, so `csha_tensor_data_ptr`'s auto-promotion now
+        // produces a correctly shaped tensor for every positional arg
+        // (verified via per-arg shape dump in the FFI).  The kernel
+        // now receives well-formed device pointers for q/k/v/x/wq/wk/wv
+        // /norm_weight (all CPU tensors auto-promoted to GPU).
+        //
+        // What STILL fails: the backward kernel crashes with
+        // ILLEGAL_ADDRESS on launch because the forward CSHA kernel
+        // (`nsl_flash_attention_csha_with_saves`) is never called
+        // under `--source-ad` — `PrimalOp::ScaledDotProductAttention`
+        // lowers to primitive matmul/softmax/etc. in
+        // `wengert_lower.rs:878`, not to the fused forward FFI.  That
+        // leaves the six save buffers (q_proj/k_proj/v_proj/row_max/
+        // row_sum/x_raw) allocated-but-uninitialised, and the
+        // backward kernel's first HBM load on them trips the
+        // illegal-address trap.  Context poisoning then surfaces the
+        // panic at the NEXT cuMemcpyHtoD_v2 call — same stderr
+        // signature as before.
+        //
+        // Follow-up PR: either (a) have the AD emit a forward-fused
+        // CSHA launch alongside the backward (mirroring
+        // `compile_flash_attention_call`'s _with_saves path) so the
+        // save buffers get populated, or (b) teach the backward
+        // kernel to recompute post-projection Q/K/V from raw Q/K/V +
+        // projection weights when the save buffers are null.
         let device_placement_signature =
             stderr.contains("cuMemcpyHtoD_v2")
                 && stderr.contains("CUDA_ERROR_ILLEGAL_ADDRESS");
         if device_placement_signature {
             eprintln!(
-                "[csha-gpu-e2e-csha] SKIP — known blocker: @flash_attention \
-                 call site does not promote CPU Q/K/V/x/dO to device before \
-                 the fused backward launch. Kernel reaches launch (kernel-\
-                 name-mismatch fix in compiler/kernel.rs this PR) but then \
-                 ILLEGAL_ADDRESS on first HBM load. Follow-up: auto-transfer \
-                 FA inputs to GPU in \
-                 `expr/advanced.rs::compile_flash_attention_call` + mirror \
-                 in `wengert_lower.rs` FusedCshaBackward arm.\nstderr tail:\n{}",
+                "[csha-gpu-e2e-csha] SKIP — known blocker: launch-input \
+                 argument-shifting bug fixed (scale no longer passed as x_ptr) \
+                 but forward CSHA kernel not emitted under --source-ad, \
+                 so backward-kernel's save buffers (q_proj/k_proj/v_proj/\
+                 row_max/row_sum/x_raw) stay uninitialised and the \
+                 backward kernel ILLEGAL_ADDRESSes on first HBM load.\n\
+                 stderr tail:\n{}",
                 stderr.lines().rev().take(5).collect::<Vec<_>>().join("\n")
             );
             return;

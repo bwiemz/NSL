@@ -313,8 +313,29 @@ impl AdjointGenerator {
                                 // code paths don't populate CSHA saves
                                 // and can't safely launch the backward
                                 // kernel anyway.
+                                // Launch-op inputs contract (from the
+                                // doc block above): positions [2..5) carry
+                                // **only** q, k, v — the SDPA op's first
+                                // three tensor inputs. `op.inputs` can hold
+                                // more than 3 entries (scaled_dot_product_attention
+                                // has a 4th scalar `scale` VarId, and
+                                // optionally a 5th causal-flag VarId;
+                                // matmul chains have exactly 2). We clip
+                                // to 3 so the x_norm/wq/wk/wv/norm_w
+                                // pushes below land at the positions the
+                                // FusedCshaBackward lowerer reads
+                                // (inputs[5..10]). Passing SDPA's `scale`
+                                // scalar at inputs[5] would shift every
+                                // subsequent slot and make the lowerer
+                                // marshal a scalar as x_ptr, wq's
+                                // shape as norm_w_ptr, etc. — the exact
+                                // symptom seen in the device-placement
+                                // trace (a CU_MEMORYTYPE_DEVICE address
+                                // read from what should have been a
+                                // 4 KB f32 tensor but was interpreted as
+                                // a scale-bits i64 scalar handle).
                                 let mut launch_inputs = vec![chain_key, do_var];
-                                launch_inputs.extend(op.inputs.iter().copied());
+                                launch_inputs.extend(op.inputs.iter().copied().take(3));
                                 if let Some(v) = chain_varids.as_ref() {
                                     launch_inputs.push(v.x_norm_var); // [5]
                                     launch_inputs.push(v.wq_var); // [6]
