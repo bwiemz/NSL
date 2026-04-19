@@ -381,35 +381,45 @@ impl AdjointGenerator {
                                     self.accumulate_adjoint(v.x_norm_var, extract_results[6]);
 
                                     // Gap I step K: standalone RMSNorm
-                                    // gamma gradient. The fused kernel
-                                    // returns `dx_norm` (extract[6]) —
-                                    // the upstream gradient flowing into
-                                    // the RMSNorm's output — but NOT
-                                    // `dgamma`. The suppressed per-op
+                                    // gamma gradient. The suppressed per-op
                                     // backward for the RMSNorm op
                                     // (`AlreadyEmitted`) would have
-                                    // emitted `NormGammaBackward` via
+                                    // emitted the RMSNorm gamma adjoint via
                                     // `ad_rules.rs:~388`; we replicate
-                                    // that here with the same adjoint
-                                    // expression so gamma receives a
-                                    // real gradient instead of cascade-
-                                    // skipping out of the lowered grad
-                                    // var set.
+                                    // that here so gamma receives a real
+                                    // gradient instead of cascade-skipping
+                                    // out of the lowered grad var set.
                                     //
                                     // Option B from the Gap I design
                                     // doc § K: reuse the existing per-op
                                     // AD lowering rather than adding an
                                     // 8th kernel output. Zero PTX
                                     // changes; zero new primal ops.
+                                    //
+                                    // Formula: `dgamma = reduce(y_bar * x / rms)`
+                                    // matches `RmsNormGammaBackward`'s
+                                    // lowering.  Note `extract_results[6]`
+                                    // is the kernel's `dx_ptr` write, which
+                                    // is the closed-form `dx_raw` (gradient
+                                    // w.r.t. the pre-RMSNorm input), NOT
+                                    // `dy_norm`.  Using it directly as
+                                    // `y_bar` here is a known semantic
+                                    // mismatch tracked separately — the
+                                    // correct fix requires exposing the
+                                    // kernel's SMEM `dx_norm` intermediate
+                                    // (see `backward_dx_norm_offset`) as
+                                    // an 8th extract.  The per-op AD path
+                                    // in `ad_rules.rs` above is the
+                                    // authoritative numerically-correct
+                                    // path for all non-CSHA models.
                                     if let (Some(gamma_var), Some(x_raw_var)) =
                                         (v.norm_weight_var, v.x_raw_var)
                                     {
                                         let dgamma = self.lower_adjoint_expr(
-                                            AdjointExpr::NormGammaBackward(
+                                            AdjointExpr::RmsNormGammaBackward(
                                                 extract_results[6],
                                                 x_raw_var,
                                                 v.rmsnorm_eps,
-                                                -1,
                                                 gamma_var,
                                             ),
                                         );
@@ -791,7 +801,42 @@ impl AdjointGenerator {
                 self.emit_op(PrimalOp::Mul, vec![t2, rstd_bc])
             }
 
-            // --- Normalization gamma backward: grad * x_hat ---
+            // --- RMSNorm gamma backward: grad * (x / rms) ---
+            //
+            // RMSNorm's forward is `y = gamma * x / rms` where
+            // `rms = sqrt(mean(x^2) + eps)` over the LAST dim.  Unlike
+            // LayerNorm, RMSNorm does NOT subtract the per-row mean from x.
+            //
+            // Therefore dgamma[d] = sum_i (dy[i,d] * x[i,d] / rms[i]).
+            //
+            // Using `NormGammaBackward`'s `(x - mean(x)) / std` formulation
+            // here would yield dgamma = 0 whenever every row of x is constant
+            // (e.g. the all-ones smoke input), silently masking the real
+            // gradient.  That bug surfaced as "w_norm delta = 0" in the
+            // end-to-end CSHA GPU smoke on 2026-04-16.
+            AdjointExpr::RmsNormGammaBackward(y_bar, x, eps_val, weight) => {
+                // Recompute rms = sqrt(mean(x^2) + eps) over the last dim,
+                // keepdim so it broadcasts against x.
+                let x_sq = self.emit_op(PrimalOp::Mul, vec![x, x]);
+                let mean_sq = self.emit_op(
+                    PrimalOp::Passthrough("mean_keepdim_last".into()),
+                    vec![x_sq],
+                );
+                let eps = self.emit_constant(eps_val);
+                let ms_eps = self.emit_op(PrimalOp::Add, vec![mean_sq, eps]);
+                let rms = self.emit_op(PrimalOp::Sqrt, vec![ms_eps]);
+                // x_hat = x / rms (elementwise, with rms broadcasting along
+                // the last dim from shape [..., 1] to [..., D]).
+                let x_hat = self.emit_op(PrimalOp::Div, vec![x, rms]);
+                // dgamma = reduce_to_shape(y_bar * x_hat, weight).
+                let grad_x_hat = self.emit_op(PrimalOp::Mul, vec![y_bar, x_hat]);
+                self.emit_op(
+                    PrimalOp::Passthrough("reduce_to_shape".into()),
+                    vec![grad_x_hat, weight],
+                )
+            }
+
+            // --- LayerNorm / BatchNorm gamma backward: grad * x_hat ---
             // Recomputes x_hat = (x - mean) / std from input to get the correct
             // normalized values (NOT the output, which is gamma * x_hat + beta).
             AdjointExpr::NormGammaBackward(y_bar, x, eps_val, dim, weight) => {

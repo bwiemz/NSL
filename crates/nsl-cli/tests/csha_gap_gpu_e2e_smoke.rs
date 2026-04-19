@@ -325,46 +325,32 @@ fn csha_gap_gpu_e2e_weights_change_after_one_step() {
         );
     }
 
-    // The load-bearing assertion: at least ONE trainable param must
-    // have moved.  A zero across the board means either the optimizer
-    // step never ran, the gradients were all zero (e.g. `eliminate_
-    // dead_gradients` pruned the fused launch op), or the SGD write
-    // never landed in `m.<w>`'s device-backed storage.
-    let any_changed = deltas.iter().any(|(_, _, _, d)| d.abs() > 1e-6);
-    assert!(
-        any_changed,
-        "[csha-gpu-e2e] NO trainable parameter changed after one step. \
-         Every BEFORE/AFTER pair was identical (within 1e-6).  The \
-         compile-→-launch pipeline completed (rc=0), but the optimizer \
-         never wrote new values back.  Candidate causes: \
-         (a) `eliminate_dead_gradients` pruned `FusedCshaBackward`, \
-         (b) the fused backward silently produced all-zero gradients, \
-         (c) SGD dispatched but `copy_data` didn't land in the model \
-         slot, (d) the gradient tape wasn't linked to the param.  \
-         Run the kernel-level `t6_3_smoke_single_config` test to \
-         distinguish (a)/(b) from (c)/(d).\n\
-         Full per-param deltas above."
-    );
-
-    // Per-param diagnostic: log which params are on the "changed"
-    // side and which are stuck.  Do NOT assert all four must move —
-    // Gap I.5 is the dgamma fix and is known-wired at the reloc
-    // level, but its end-to-end behavior under mse_loss is itself a
-    // finding this test is here to surface.  A delta of exactly zero
-    // on `w_norm` is a documented diagnostic, not a hard fail: the
-    // test's primary contract is "≥1 param changed" (above).
+    // The load-bearing assertion: ALL FOUR trainable params must have
+    // moved.  A zero delta on any one means either the optimizer step
+    // never ran for that slot, the gradient was zero (e.g. a semantic
+    // mismatch in the adjoint lowering silently producing a zero grad),
+    // or the SGD write never landed in `m.<w>`'s device-backed storage.
+    //
+    // Tightened from "≥1 param changed" on 2026-04-16 as part of the
+    // `w_norm` dgamma runtime fix (PR #71): the original "any changed"
+    // was a fallback because Gap I.5's dgamma path was silently zero-ing
+    // under mse_loss + all-ones input — the LayerNorm formulation
+    // `(x - mean(x)) / std` was being applied to RMSNorm, which yields
+    // x_hat = 0 for any constant-valued row.  With the per-op AD now
+    // routed through `RmsNormGammaBackward` (pure `x / rms`, no mean
+    // subtraction), every trainable param receives a real gradient.
     let stuck: Vec<&String> = deltas
         .iter()
         .filter(|(_, _, _, d)| d.abs() <= 1e-6)
         .map(|(n, _, _, _)| n)
         .collect();
-    if !stuck.is_empty() {
-        eprintln!(
-            "[csha-gpu-e2e] diagnostic: {} trainable param(s) did not \
-             move under mse_loss: {stuck:?}.  If `w_norm` is among \
-             them, Gap I.5's dgamma pathway emits the reloc but may \
-             not be reaching the optimizer slot at runtime.",
-            stuck.len()
-        );
-    }
+    assert!(
+        stuck.is_empty(),
+        "[csha-gpu-e2e] trainable param(s) did not move after one step: \
+         {stuck:?}.  If `w_norm` is among them, the RMSNorm dgamma \
+         adjoint is wrong (LayerNorm formula applied to RMSNorm input). \
+         Expected ALL FOUR params (wq, wk, wv, w_norm) to receive a \
+         non-zero gradient and update under SGD(lr=0.001, mse_loss, \
+         ones input).  Full per-param deltas above."
+    );
 }

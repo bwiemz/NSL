@@ -126,9 +126,20 @@ pub enum AdjointExpr {
     /// BatchNorm backward: similar to LayerNorm but over batch dimension
     /// args: (grad, input, mean_unused, rstd_unused, eps)
     BatchNormBackward(VarId, VarId, VarId, VarId, f64),
-    /// Gamma gradient for normalization: grad * x_hat where x_hat = (x - mean) / std
-    /// args: (grad, input, eps, dim, weight) — recomputes x_hat from input, reduces to weight shape
+    /// Gamma gradient for LayerNorm / BatchNorm: grad * x_hat where
+    /// `x_hat = (x - mean) / std`.
+    /// args: (grad, input, eps, dim, weight) — recomputes x_hat from input, reduces to weight shape.
+    ///
+    /// NOT valid for RMSNorm (which does NOT mean-subtract); use
+    /// `RmsNormGammaBackward` instead.
     NormGammaBackward(VarId, VarId, f64, i64, VarId),
+    /// Gamma gradient for RMSNorm: `grad * x_hat` where
+    /// `x_hat = x / rms` and `rms = sqrt(mean(x^2) + eps)` over the last
+    /// dimension (keepdim).  Unlike `NormGammaBackward`, this does NOT
+    /// subtract the per-row mean from `x` before normalizing, which matches
+    /// RMSNorm's forward definition `y = gamma * x / rms`.
+    /// args: (grad, input, eps, weight)
+    RmsNormGammaBackward(VarId, VarId, f64, VarId),
 
     // Regularization
     /// Dropout backward: grad * mask / (1-p).  args: (grad, mask)
@@ -381,11 +392,14 @@ pub fn apply_ad_rule(op: &WengertOp, output_bar: VarId) -> Vec<InputAdjoint> {
                 input_var: input,
                 expr: AdjointExpr::LayerNormBackward(output_bar, input, op.result, op.result, *eps),
             }];
-            // weight gradient: grad * x_hat
+            // weight gradient: grad * (x / rms) — RMSNorm does NOT mean-subtract.
+            // Using `NormGammaBackward` here would compute x_hat = (x-mean)/std
+            // (the LayerNorm formulation) which yields dgamma=0 for any
+            // constant row (e.g. all-ones input), masking real gradients.
             if op.inputs.len() > 1 {
                 adjoints.push(InputAdjoint {
                     input_var: op.inputs[1],
-                    expr: AdjointExpr::NormGammaBackward(output_bar, input, *eps, -1, op.inputs[1]),
+                    expr: AdjointExpr::RmsNormGammaBackward(output_bar, input, *eps, op.inputs[1]),
                 });
             }
             adjoints
