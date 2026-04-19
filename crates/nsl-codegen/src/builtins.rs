@@ -1168,6 +1168,7 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
             types::I64, types::I64, types::I64, // dwq, dwk, dwv
             types::I64,                         // dx
             types::I64,                         // dx_norm (Gap I.5)
+            types::I64,                         // segment_ids_ptr (PCA Tier A Task 4B)
         ],
         Some(types::I64),
     ),

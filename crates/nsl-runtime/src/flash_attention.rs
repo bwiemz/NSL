@@ -916,6 +916,12 @@ pub extern "C" fn nsl_flash_attention_csha_backward(
     // CSHA dispatch path. f32, shape [batch, seq, d_model]. Null when
     // caller doesn't need it (e.g. inference warm-ups).
     dx_norm_ptr: i64,
+    // PCA Tier A Task 4B: segment_ids device pointer for packed-sequence training.
+    // Pass 0 on unpacked launches. The companion backward PTX kernel (Task 4A)
+    // declares this param in its prelude only when segment_masked=true; the
+    // segment_masked=false variant doesn't read this slot, so passing 0 is safe
+    // for all existing callers.
+    segment_ids_ptr: i64,
 ) -> i64 {
     #[cfg(feature = "cuda")]
     {
@@ -1001,8 +1007,12 @@ pub extern "C" fn nsl_flash_attention_csha_backward(
         let mut d_wv = csha_tensor_data_ptr(dwv_ptr);
         let mut d_x = csha_tensor_data_ptr(dx_ptr);
         let mut d_xn = csha_tensor_data_ptr(dx_norm_ptr);
+        // PCA Tier A Task 4B: segment_ids device pointer — raw pass-through
+        // (not an NslTensor handle). Null on unpacked launches; the
+        // segment_masked kernel variant reads it only when set.
+        let mut seg_ids = segment_ids_ptr as u64;
 
-        let args: [*mut c_void; 45] = [
+        let args: [*mut c_void; 46] = [
             &mut q as *mut _ as *mut c_void,
             &mut k as *mut _ as *mut c_void,
             &mut v as *mut _ as *mut c_void,
@@ -1049,6 +1059,8 @@ pub extern "C" fn nsl_flash_attention_csha_backward(
             &mut d_wv as *mut _ as *mut c_void,
             &mut d_x as *mut _ as *mut c_void,
             &mut d_xn as *mut _ as *mut c_void,
+            // PCA Tier A Task 4B: segment_ids trailing slot.
+            &mut seg_ids as *mut _ as *mut c_void,
         ];
 
         let rc = crate::cuda::inner::kernel_launch(
@@ -1113,6 +1125,7 @@ pub extern "C" fn nsl_flash_attention_csha_backward(
         let _ = (rmsnorm_eps_bits, active_heads, d_model);
         let _ = (q_proj_ptr, k_proj_ptr, v_proj_ptr, row_max_ptr, row_sum_ptr, x_raw_ptr);
         let _ = (do_ptr, dq_ptr, dk_ptr, dv_ptr, dwq_ptr, dwk_ptr, dwv_ptr, dx_ptr, dx_norm_ptr);
+        let _ = segment_ids_ptr;
         eprintln!("[nsl] CSHA backward requires CUDA.");
         -1
     }
