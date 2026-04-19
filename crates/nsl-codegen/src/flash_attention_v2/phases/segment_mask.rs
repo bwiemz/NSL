@@ -65,7 +65,7 @@ pub fn emit_segment_mask_predicate(
     residency:       SegmentResidency,
     mask_pred_inout: &str,
 ) {
-    ptx.push_str("    // PCA Tier A: extend %p0 with cross-segment disjunction (spec §5.1)\n");
+    ptx.push_str("    // PCA Tier A: extend %p0 with cross-segment disjunction (spec 5.1)\n");
     emit_segment_id_load(ptx, q_pos_reg, segment_ids_reg, residency, 'q');
     emit_segment_id_load(ptx, k_pos_reg, segment_ids_reg, residency, 'k');
     ptx.push_str("    setp.ne.u16    %p_seg_SEGMASK, %rs_q_SEGMASK, %rs_k_SEGMASK;\n");

@@ -2,7 +2,7 @@
 source: crates/nsl-codegen/tests/pca_segment_mask_snapshot.rs
 expression: "snapshot_with(SegmentResidency::Shared)"
 ---
-    // PCA Tier A: extend %p0 with cross-segment disjunction (spec §5.1)
+    // PCA Tier A: extend %p0 with cross-segment disjunction (spec 5.1)
     cvt.u32.u64    %r_q_SEGMASK, %rd35;            // q_global low-32
     shl.b32        %r_q_SEGMASK, %r_q_SEGMASK, 1;                 // q*sizeof(u16)
     add.u32        %r_q_SEGMASK, %seg_base, %r_q_SEGMASK;      // &seg[q]
