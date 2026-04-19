@@ -1,5 +1,7 @@
 # WRGA B.3.2 Option 3 -- source-AD Wengert handler for fused GatedLoRA forward
 
+> **INVALIDATED (2026-04-19, later in day):** §1 root-cause analysis was wrong. This spec's handler intervention is still correct but incomplete — the gap it missed is that `model_method_bodies` is populated from the *unrewritten* AST, so the fused FFI callee never appears in the code path source-AD walks. Superseded by [`2026-04-19-wrga-b32-option3-revised-design.md`](2026-04-19-wrga-b32-option3-revised-design.md), which adds phase 3e (rewrite method bodies post-prescan) on top of this spec's intervention. The superseding spec retains this spec's §2 AD-rule recipe and §4 tests verbatim. See WRGA paper Appendix B.5 for the institutional rule this cycle produced.
+
 **Design date:** 2026-04-19
 **Scope:** narrow wiring change; enables the B.3.2 trigger to be re-measured with the fused forward kernel actually firing under `--source-ad`.
 **Not in scope:** any fused backward kernel work; any broader source-AD refactor; any optimization of source-AD's backward allocator.
