@@ -1182,16 +1182,17 @@ fn lower_single_op(
             //     entry.
             //   - Gap D populates the cache *before* emitting any extract
             //     op, by running the fused backward launch and stashing the
-            //     seven output tensors into
-            //     `compiler.csha_fused_bwd_cache.insert(key_val, [t0..t6])`.
-            //   - `component` MUST be in 0..=6 (see variant doc-comment in
-            //     `wengert.rs` for the dq/dk/dv/dwq/dwk/dwv/dx mapping).
+            //     eight output tensors into
+            //     `compiler.csha_fused_bwd_cache.insert(key_val, [t0..t7])`.
+            //   - `component` MUST be in 0..=7 (see variant doc-comment in
+            //     `wengert.rs` for the dq/dk/dv/dwq/dwk/dwv/dx/dx_norm
+            //     mapping; component 7 is the Gap I.5 addition).
             //
             // Cache eviction is the last-component's responsibility, mirroring
             // the FlashAttention extract pattern (which evicts on component=2).
-            if *component > 6 {
+            if *component > 7 {
                 return Err(CodegenError::new(format!(
-                    "CshaFusedBackwardExtract: component {} out of range 0..=6",
+                    "CshaFusedBackwardExtract: component {} out of range 0..=7",
                     component
                 )));
             }
@@ -1214,10 +1215,12 @@ fn lower_single_op(
                 })?;
             let result = slot[*component as usize];
 
-            // Evict on the last component (component=6 → dx) so subsequent
-            // chains with a coincidentally-equal key_val don't reuse stale
-            // tensor pointers.  Mirrors FlashAttention's component==2 free.
-            if *component == 6 {
+            // Evict on the last component (component=7 → dx_norm) so
+            // subsequent chains with a coincidentally-equal key_val don't
+            // reuse stale tensor pointers. Mirrors FlashAttention's
+            // component==2 free. Bumped from 6 to 7 by the Gap I.5 Option-A
+            // fix when `dx_norm` became the 8th extract.
+            if *component == 7 {
                 compiler.csha_fused_bwd_cache.remove(&key_val);
             }
 
@@ -1456,6 +1459,16 @@ fn lower_single_op(
                 &[batch, seq_len, d_model_val], cuda_device,
             )?;
 
+            // Gap I.5 Option-A: 8th output `dx_norm`, gradient w.r.t. the
+            // RMSNorm OUTPUT (= `dy_norm`). f32, shape [batch, seq, d_model].
+            // Consumed by the AD-side `RmsNormGammaBackward` emission via
+            // `extract_results[7]` for correct dgamma under the fused CSHA
+            // dispatch path.
+            let dxn_dev = alloc_shape_on(
+                compiler, builder, "nsl_tensor_zeros_on",
+                &[batch, seq_len, d_model_val], cuda_device,
+            )?;
+
             // Launch the 44-arg backward kernel.
             // Forward-side `active_heads` — take from the training config
             // (stored on the FA context via Gap B).  When the ctx is gone,
@@ -1489,18 +1502,21 @@ fn lower_single_op(
                     saves.q_proj, saves.k_proj, saves.v_proj,
                     saves.row_max, saves.row_sum,
                     saves.x_raw,
-                    // Tier C backward-specific: dO input + 7 gradient outputs.
+                    // Tier C backward-specific: dO input + 8 gradient outputs.
+                    // 8th output (dxn_dev) added by Gap I.5 Option-A fix.
                     do_ptr,
                     dq_dev, dk_dev, dv_dev,
                     dwq_dev, dwk_dev, dwv_dev,
                     dx_dev,
+                    dxn_dev,
                 ],
             )?;
 
             // Populate Gap C cache so extract ops can read outputs.
+            // Slot 7 (dxn_dev) added by the Gap I.5 Option-A fix.
             compiler
                 .csha_fused_bwd_cache
-                .insert(key_val, [dq_dev, dk_dev, dv_dev, dwq_dev, dwk_dev, dwv_dev, dx_dev]);
+                .insert(key_val, [dq_dev, dk_dev, dv_dev, dwq_dev, dwk_dev, dwv_dev, dx_dev, dxn_dev]);
 
             // Gap A cleanup: now that the backward has consumed the save
             // pointers, free them.  (Moved here from the forward site in

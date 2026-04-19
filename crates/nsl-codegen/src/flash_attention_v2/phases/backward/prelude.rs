@@ -96,6 +96,13 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig) {
         (".param .u64", "dq_ptr"), (".param .u64", "dk_ptr"), (".param .u64", "dv_ptr"),
         (".param .u64", "dwq_ptr"), (".param .u64", "dwk_ptr"), (".param .u64", "dwv_ptr"),
         (".param .u64", "dx_ptr"),
+        // 8th gradient output (Option A of the Gap I.5 fix): `dx_norm_ptr`
+        // receives the SMEM `dx_norm` tile (gradient w.r.t. the RMSNorm
+        // OUTPUT — i.e. dy_norm). This is what `RmsNormGammaBackward`
+        // semantically needs as its `grad` input; previously the AD-side
+        // fed `dx_ptr` (which is dx_raw, post-dRMSNorm) and produced
+        // incorrect dgamma values when the CSHA dispatcher claim fired.
+        (".param .u64", "dx_norm_ptr"),
     ];
     for (i, (ty, pname)) in params.iter().enumerate() {
         let comma = if i + 1 < params.len() { "," } else { "" };
@@ -171,6 +178,11 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig) {
     ptx.push_str("    .reg .u64 %rd_bwd_row_max, %rd_bwd_row_sum;\n");
     ptx.push_str("    .reg .u64 %rd_bwd_do, %rd_bwd_dq, %rd_bwd_dk, %rd_bwd_dv;\n");
     ptx.push_str("    .reg .u64 %rd_bwd_dwq, %rd_bwd_dwk, %rd_bwd_dwv, %rd_bwd_dx;\n");
+    // Gap I.5 fix (Option A): HBM pointer for the 8th gradient output
+    // `dx_norm` (gradient w.r.t. the RMSNorm output). Loaded once in
+    // prelude so the dRMSNorm Phase 1 SMEM->HBM copy can reference it
+    // via a stable register name.
+    ptx.push_str("    .reg .u64 %rd_bwd_dxn;\n");
 
     // SMEM-base pointer + warp_row (shared with forward contract so
     // backward phase emitters can use the same addressing helpers).
@@ -220,6 +232,7 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig) {
     ptx.push_str("    ld.param.u64 %rd_bwd_dwk, [dwk_ptr];\n");
     ptx.push_str("    ld.param.u64 %rd_bwd_dwv, [dwv_ptr];\n");
     ptx.push_str("    ld.param.u64 %rd_bwd_dx,  [dx_ptr];\n");
+    ptx.push_str("    ld.param.u64 %rd_bwd_dxn, [dx_norm_ptr];\n");
 
     // Thread/block indices — identical to forward.
     emit_thread_lane_warp_register_init(ptx);

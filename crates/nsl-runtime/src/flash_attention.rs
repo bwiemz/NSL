@@ -688,6 +688,12 @@ pub extern "C" fn nsl_flash_attention_csha_backward(
     dq_ptr: i64, dk_ptr: i64, dv_ptr: i64,
     dwq_ptr: i64, dwk_ptr: i64, dwv_ptr: i64,
     dx_ptr: i64,
+    // Gap I.5 fix (Option A): 8th gradient output — dx_norm (gradient
+    // w.r.t. the RMSNorm output, i.e. dy_norm). Consumed by the AD-side
+    // `RmsNormGammaBackward` emission for correct dgamma under the fused
+    // CSHA dispatch path. f32, shape [batch, seq, d_model]. Null when
+    // caller doesn't need it (e.g. inference warm-ups).
+    dx_norm_ptr: i64,
 ) -> i64 {
     #[cfg(feature = "cuda")]
     {
@@ -747,8 +753,9 @@ pub extern "C" fn nsl_flash_attention_csha_backward(
         let mut d_wk = dwk_ptr as u64;
         let mut d_wv = dwv_ptr as u64;
         let mut d_x = dx_ptr as u64;
+        let mut d_xn = dx_norm_ptr as u64;
 
-        let args: [*mut c_void; 44] = [
+        let args: [*mut c_void; 45] = [
             &mut q as *mut _ as *mut c_void,
             &mut k as *mut _ as *mut c_void,
             &mut v as *mut _ as *mut c_void,
@@ -794,6 +801,7 @@ pub extern "C" fn nsl_flash_attention_csha_backward(
             &mut d_wk as *mut _ as *mut c_void,
             &mut d_wv as *mut _ as *mut c_void,
             &mut d_x as *mut _ as *mut c_void,
+            &mut d_xn as *mut _ as *mut c_void,
         ];
 
         crate::cuda::inner::kernel_launch(
@@ -815,7 +823,7 @@ pub extern "C" fn nsl_flash_attention_csha_backward(
         let _ = (x_ptr, norm_weight_ptr, wq_ptr, wk_ptr, wv_ptr, wo_ptr);
         let _ = (rmsnorm_eps_bits, active_heads, d_model);
         let _ = (q_proj_ptr, k_proj_ptr, v_proj_ptr, row_max_ptr, row_sum_ptr, x_raw_ptr);
-        let _ = (do_ptr, dq_ptr, dk_ptr, dv_ptr, dwq_ptr, dwk_ptr, dwv_ptr, dx_ptr);
+        let _ = (do_ptr, dq_ptr, dk_ptr, dv_ptr, dwq_ptr, dwk_ptr, dwv_ptr, dx_ptr, dx_norm_ptr);
         eprintln!("[nsl] CSHA backward requires CUDA.");
         -1
     }

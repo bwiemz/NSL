@@ -1,13 +1,16 @@
 //! Gap C (CSHA fused backward multi-result primitive) structural tests.
 //!
-//! Gap C adds a structural AD primitive so the forthcoming Gap D EmitFused
-//! path can represent the **seven** CSHA fused-backward outputs (dq, dk,
-//! dv, dwq, dwk, dwv, dx) inside a Wengert graph whose `WengertOp.result`
-//! is a single `VarId`.
+//! Gap C adds a structural AD primitive so the Gap D EmitFused path can
+//! represent the CSHA fused-backward outputs inside a Wengert graph whose
+//! `WengertOp.result` is a single `VarId`. Gap I.5 Option-A extended the
+//! output count from seven to **eight**: dq, dk, dv, dwq, dwk, dwv, dx,
+//! dx_norm — the 8th (`dx_norm`) is the gradient w.r.t. the RMSNorm
+//! OUTPUT, fed to the AD-side `RmsNormGammaBackward` for correct dgamma
+//! under the fused CSHA dispatcher claim path.
 //!
 //! The primitive mirrors `FlashAttentionBackwardExtract`: a single
-//! `PrimalOp::CshaFusedBackwardExtract { component }` variant with seven
-//! component values, plus a seven-slot cache on `Compiler` keyed by the
+//! `PrimalOp::CshaFusedBackwardExtract { component }` variant with eight
+//! component values, plus an eight-slot cache on `Compiler` keyed by the
 //! extract's first-input Cranelift `Value` ("chain key").
 //!
 //! These tests verify the primitive's shape — the Wengert-level variant
@@ -39,10 +42,10 @@ fn compiler_new_initialises_csha_fused_bwd_cache_empty() {
     );
 }
 
-/// The cache must round-trip a seven-slot entry under the chain-key
+/// The cache must round-trip an eight-slot entry under the chain-key
 /// `Value` that the extract ops will use as a lookup key.  This is the
-/// exact shape Gap D will write: one launch → seven output Values →
-/// one `insert(key, [v0..v6])`.
+/// exact shape Gap D now writes after the Gap I.5 Option-A fix: one
+/// launch → eight output Values → one `insert(key, [v0..v7])`.
 #[test]
 fn csha_fused_bwd_cache_roundtrips_seven_slot_entry() {
     let interner = Interner::new();
@@ -51,7 +54,7 @@ fn csha_fused_bwd_cache_roundtrips_seven_slot_entry() {
     let mut compiler = nsl_codegen::compiler::Compiler::new(&interner, &type_map, &opts)
         .expect("Compiler::new should succeed with default options");
     let key = Value::from_u32(100);
-    let slots: [Value; 7] = [
+    let slots: [Value; 8] = [
         Value::from_u32(200),
         Value::from_u32(201),
         Value::from_u32(202),
@@ -59,6 +62,7 @@ fn csha_fused_bwd_cache_roundtrips_seven_slot_entry() {
         Value::from_u32(204),
         Value::from_u32(205),
         Value::from_u32(206),
+        Value::from_u32(207),
     ];
     compiler.csha_fused_bwd_cache.insert(key, slots);
     let fetched = compiler
@@ -66,7 +70,7 @@ fn csha_fused_bwd_cache_roundtrips_seven_slot_entry() {
         .get(&key)
         .copied()
         .expect("insert/get round-trip");
-    // All seven slots preserved in order — lowerer's `component as usize`
+    // All eight slots preserved in order — lowerer's `component as usize`
     // indexes this array, so ordering matters.
     for (i, v) in slots.iter().enumerate() {
         assert_eq!(
@@ -76,13 +80,15 @@ fn csha_fused_bwd_cache_roundtrips_seven_slot_entry() {
     }
 }
 
-/// Gap D will emit seven `CshaFusedBackwardExtract` ops sharing one
-/// chain-key VarId.  Each op carries a distinct `component` in 0..=6.
-/// This test pins the mapping so Gap D can rely on it:
-///   0 = dq, 1 = dk, 2 = dv, 3 = dwq, 4 = dwk, 5 = dwv, 6 = dx.
+/// Gap D emits eight `CshaFusedBackwardExtract` ops sharing one chain-key
+/// VarId.  Each op carries a distinct `component` in 0..=7. This test
+/// pins the mapping so Gap D can rely on it:
+///   0 = dq, 1 = dk, 2 = dv, 3 = dwq, 4 = dwk, 5 = dwv, 6 = dx, 7 = dx_norm.
+/// Component 7 is the Gap I.5 Option-A addition (gradient w.r.t. the
+/// RMSNorm output, consumed by `RmsNormGammaBackward`).
 #[test]
 fn extract_op_component_range_matches_seven_outputs() {
-    for c in 0u8..=6 {
+    for c in 0u8..=7 {
         // Constructing succeeds; PartialEq distinguishes distinct components.
         let op = PrimalOp::CshaFusedBackwardExtract { component: c };
         let same = PrimalOp::CshaFusedBackwardExtract { component: c };
