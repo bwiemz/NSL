@@ -1995,7 +1995,12 @@ impl<'a> WengertExtractor<'a> {
                     // Scalar extraction (non-differentiable)
                     "int" | "float" => PrimalOp::Passthrough(func_name.clone()),
                     _ => {
-                        eprintln!("[source-ad] unsupported function: '{}'", func_name);
+                        eprintln!(
+                            "[source-ad] warning: unrecognized FFI callee '{}' in train block; \
+                             falling back to unfused AST evaluation. If you expected a fused kernel, \
+                             check that source-AD has a handler for this FFI.",
+                            func_name
+                        );
                         return None;
                     }
                 };
