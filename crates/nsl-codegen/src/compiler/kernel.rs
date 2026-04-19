@@ -981,6 +981,7 @@ impl Compiler<'_> {
                     gqa_group_size,
                     tree_mask: false,
                     gpu_sm: parse_gpu_sm_from_target(&self.compile_options.target),
+                    segment_masked: false,
                     csha: None,
                 };
 
@@ -1043,6 +1044,7 @@ impl Compiler<'_> {
                 gqa_group_size,
                 tree_mask: false,
                 gpu_sm: parse_gpu_sm_from_target(&self.compile_options.target),
+                segment_masked: false,
                 csha: None,
             };
 
@@ -1073,6 +1075,7 @@ impl Compiler<'_> {
                 head_dim: config.head_dim,
                 causal: config.causal,
                 gpu_sm: config.gpu_sm,
+                segment_masked: false,
             };
             let (bwd_p1, bwd_p2) =
                 crate::flash_attention::synthesize_flash_attention_backward_ptx(&bwd_config);
@@ -1123,6 +1126,7 @@ impl Compiler<'_> {
                 gqa_group_size,
                 tree_mask: false,
                 gpu_sm: parse_gpu_sm_from_target(&self.compile_options.target),
+                segment_masked: false,
                 csha: None,
             };
 
@@ -1198,6 +1202,7 @@ impl Compiler<'_> {
                 head_dim: config.head_dim,
                 causal: config.causal,
                 gpu_sm: config.gpu_sm,
+                segment_masked: false,
             };
             let (bwd_p1, bwd_p2) =
                 crate::flash_attention::synthesize_flash_attention_backward_ptx(&bwd_config);

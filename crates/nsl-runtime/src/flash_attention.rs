@@ -859,7 +859,10 @@ pub extern "C" fn nsl_flash_attention_csha_backward(
         let mut rmax = row_max_ptr as u64;
         let mut rsum = row_sum_ptr as u64;
         let mut xraw = x_raw_ptr as u64;
-        // Backward seed + 8 gradient outputs: NslTensor handles — resolve.
+        // Backward seed + 8 gradient outputs (dq/dk/dv/dwq/dwk/dwv/dx/dx_norm):
+        // NslTensor handles — resolve to device pointers via csha_tensor_data_ptr.
+        // PR #74 added dx_norm as the 8th extract so dgamma can be computed
+        // from the post-RMSNorm gradient directly.
         let mut d_o = csha_tensor_data_ptr(do_ptr);
         let mut d_q = csha_tensor_data_ptr(dq_ptr);
         let mut d_k = csha_tensor_data_ptr(dk_ptr);

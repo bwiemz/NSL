@@ -173,6 +173,7 @@ pub struct CsrLayout {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// A single weight tensor loaded from safetensors.
+#[derive(Debug, Clone)]
 pub struct WeightEntry {
     /// Parameter name as it appears in the safetensors file
     pub name: String,
@@ -372,6 +373,7 @@ impl WeightEntry {
 
 /// Index of all weight tensors loaded from a safetensors file at compile time.
 /// Each entry maps a parameter name to its raw tensor data and metadata.
+#[derive(Debug, Clone)]
 pub struct WeightMap {
     /// Parameter name -> WeightEntry
     entries: HashMap<String, WeightEntry>,

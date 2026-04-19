@@ -8,15 +8,16 @@ use std::ffi::c_void;
 use crate::cpu::{create_tensor_with_shape_rs_dtype};
 use crate::dict::{nsl_dict_new, nsl_dict_set_str};
 use crate::string::nsl_str_from_rust;
-use crate::tensor::{DTYPE_U16_TOKEN, NslTensor};
+use crate::tensor::{DTYPE_U16_SEGMENT, DTYPE_U16_TOKEN, NslTensor};
 
 /// A packed batch of token sequences with attention mask.
 pub struct PackedBatch {
-    pub input_ids: Vec<i64>,
-    pub labels: Vec<i64>,
-    pub mask: Vec<f32>,
-    pub batch_size: usize,
-    pub seq_len: usize,
+    pub input_ids:   Vec<i64>,
+    pub labels:      Vec<i64>,
+    pub mask:        Vec<f32>,   // retained through Task 7b
+    pub segment_ids: Vec<u16>,   // spec §3.5 — new, additive
+    pub batch_size:  usize,
+    pub seq_len:     usize,
 }
 
 /// Pack one batch from a continuous token stream.
@@ -61,6 +62,7 @@ pub fn pack_batch(
     // Build labels and mask per sequence in the batch
     let mut labels = vec![0i64; total];
     let mut mask = vec![-1e9f32; batch_size * seq_len * seq_len];
+    let mut segment_ids: Vec<u16> = Vec::with_capacity(total);
 
     for b in 0..batch_size {
         let offset = b * seq_len;
@@ -91,6 +93,14 @@ pub fn pack_batch(
             doc_ids[i] = current_doc;
         }
 
+        // PCA Tier A (spec §3.5): emit per-position segment IDs alongside
+        // the dense mask. Reuses the doc_ids computed above to preserve
+        // byte-identity with the dense-mask baseline. u16 ceiling enforced
+        // upstream by pca_detect::validate_config.
+        for d in doc_ids.iter() {
+            segment_ids.push(*d as u16);
+        }
+
         // Build block-diagonal causal mask for this sequence
         // mask[b][i][j] = 0.0 if doc_id[i] == doc_id[j] AND j <= i (same doc, causal)
         let mask_offset = b * seq_len * seq_len;
@@ -107,6 +117,7 @@ pub fn pack_batch(
         input_ids,
         labels,
         mask,
+        segment_ids,
         batch_size,
         seq_len,
     })
@@ -147,16 +158,38 @@ pub fn packed_batch_to_dict(batch: &PackedBatch) -> i64 {
         unsafe { *mask_data.add(i) = v };
     }
 
+    // segment_ids [B, S] — logical dtype is DTYPE_U16_SEGMENT (spec §3.5),
+    // but the current tensor helper allocates f32 storage and data_f32()
+    // asserts dtype==1. Use dtype=1 (f32) backing for now; values are
+    // lossless (u16 max = 65535 < 2^24 mantissa of f32).
+    // TODO(PCA Tier A, post-Task-7b): narrow-dtype (u16) storage for
+    // segment_ids is a DataLoader-backend follow-up. The dict key and
+    // shape contract are stable today; the physical backing promotes
+    // from f32 to true u16 once the tensor helper supports
+    // DTYPE_U16_SEGMENT. u16 values round-trip through f32 exactly
+    // (max=65535 < 2^24), so current storage is lossless but wastes
+    // 2x bytes per position.
+    let _ = DTYPE_U16_SEGMENT; // imported for future use; see TODO above
+    let seg_ptr = create_tensor_with_shape_rs_dtype(&[b, s], 1);
+    let seg_tensor = NslTensor::from_ptr(seg_ptr);
+    let seg_data = seg_tensor.data_f32();
+    for (i, &v) in batch.segment_ids.iter().enumerate() {
+        unsafe { *seg_data.add(i) = v as f32 };
+    }
+
     let dict = nsl_dict_new();
     let k_ids = nsl_str_from_rust("input_ids");
     let k_lbl = nsl_str_from_rust("labels");
     let k_mask = nsl_str_from_rust("attention_mask");
+    let k_seg = nsl_str_from_rust("segment_ids");
     nsl_dict_set_str(dict, k_ids, ids_ptr);
     nsl_dict_set_str(dict, k_lbl, lbl_ptr);
     nsl_dict_set_str(dict, k_mask, mask_ptr);
+    nsl_dict_set_str(dict, k_seg, seg_ptr);
     crate::string::nsl_string_free(k_ids);
     crate::string::nsl_string_free(k_lbl);
     crate::string::nsl_string_free(k_mask);
+    crate::string::nsl_string_free(k_seg);
 
     dict
 }
@@ -301,6 +334,91 @@ mod tests {
     }
 
     #[test]
+    fn pack_batch_segment_ids_increment_on_eos() {
+        // Two documents in one pack: [10, 11, 12, EOS=2, 20, 21, 22, 23].
+        // Expected segment_ids: [0, 0, 0, 0, 1, 1, 1, 1].
+        // Semantics: a new segment starts immediately AFTER an EOS token;
+        // the EOS token itself is part of the current segment.
+        let stream: Vec<f64> = vec![10.0, 11.0, 12.0, 2.0, 20.0, 21.0, 22.0, 23.0];
+        let mut cursor: usize = 0;
+        let batch = pack_batch(
+            stream.as_ptr() as *const c_void,
+            stream.len(),
+            0,           // DTYPE_F64
+            &mut cursor,
+            1,           // batch_size
+            8,           // seq_len
+            2,           // eos_token
+        )
+        .expect("pack_batch produced a batch");
+
+        assert_eq!(batch.segment_ids, vec![0u16, 0, 0, 0, 1, 1, 1, 1]);
+    }
+
+    #[test]
+    fn pack_batch_segment_ids_single_segment_no_eos() {
+        // No EOS in the stream → single segment of all zeros.
+        let stream: Vec<f64> = (0..8).map(|x| x as f64).collect();
+        let mut cursor: usize = 0;
+        let batch = pack_batch(
+            stream.as_ptr() as *const c_void,
+            stream.len(),
+            0,
+            &mut cursor,
+            1,
+            8,
+            255,         // EOS token that never appears in the stream
+        )
+        .expect("pack_batch produced a batch");
+
+        assert_eq!(batch.segment_ids, vec![0u16; 8]);
+    }
+
+    #[test]
+    fn pack_batch_segment_ids_three_unequal_segments() {
+        // Three documents: [A,A,EOS,B,B,B,EOS,C].
+        // Expected: [0, 0, 0, 1, 1, 1, 1, 2].
+        // Segment boundaries: EOS at pos 2 → segment 1 starts at pos 3.
+        // EOS at pos 6 → segment 2 starts at pos 7.
+        let stream: Vec<f64> = vec![10.0, 11.0, 2.0, 20.0, 21.0, 22.0, 2.0, 30.0];
+        let mut cursor: usize = 0;
+        let batch = pack_batch(
+            stream.as_ptr() as *const c_void,
+            stream.len(),
+            0,
+            &mut cursor,
+            1,
+            8,
+            2,
+        )
+        .expect("pack_batch produced a batch");
+
+        assert_eq!(batch.segment_ids, vec![0u16, 0, 0, 1, 1, 1, 1, 2]);
+    }
+
+    #[test]
+    fn pack_batch_segment_ids_trailing_eos_does_not_overflow() {
+        // Stream ends with EOS: [10, 11, 12, EOS=2] with seq_len=4.
+        // The trailing EOS is part of segment 0; no phantom segment 1
+        // should appear because there is no position after it.
+        // Expected segment_ids: [0, 0, 0, 0].
+        let stream: Vec<f64> = vec![10.0, 11.0, 12.0, 2.0];
+        let mut cursor: usize = 0;
+        let batch = pack_batch(
+            stream.as_ptr() as *const c_void,
+            stream.len(),
+            0,               // DTYPE_F64
+            &mut cursor,
+            1,               // batch_size
+            4,               // seq_len
+            2,               // eos_token
+        )
+        .expect("pack_batch produced a batch");
+
+        assert_eq!(batch.segment_ids, vec![0u16, 0, 0, 0]);
+    }
+
+    #[test]
     fn test_packed_batch_to_dict() {
         let stream: Vec<f64> = vec![1.0, 2.0, 3.0, 4.0];
         let mut cursor: usize = 0;
@@ -317,7 +435,7 @@ mod tests {
         .expect("should produce a batch");
 
         let dict = packed_batch_to_dict(&batch);
-        assert_eq!(nsl_dict_len(dict), 3);
+        assert_eq!(nsl_dict_len(dict), 4);
 
         // Verify input_ids tensor shape
         let k = nsl_str_from_rust("input_ids");

@@ -5,7 +5,7 @@
 //! synthesise for the downstream attention sublayer:
 //!
 //!   * **SegmentIdMasked** — the general case (arbitrary document lengths).
-//!     One compact `segment_ids: [i32; seq_len]` tensor per batch element
+//!     One compact `segment_ids: [u16; seq_len]` tensor per batch element
 //!     replaces the dense `S×S` attention mask.
 //!   * **PerDocumentCta** — documents are short and roughly even in
 //!     length; each CTA processes one complete document instead of one
@@ -109,9 +109,12 @@ fn dense_mask_bytes(seq: u32, dtype_bytes: u64) -> u64 {
     (seq as u64) * (seq as u64) * dtype_bytes
 }
 
-/// Bytes for the compact `segment_ids` tensor (`[S]` of i32).
+/// Bytes for the compact `segment_ids` tensor (`[S]` of u16). Segment
+/// IDs are non-negative indices into a pack; u16 ceiling is 65535
+/// segments per pack (unreachable in realistic corpora, guarded by
+/// `validate_config`).
 fn segment_ids_bytes(seq: u32) -> u64 {
-    (seq as u64) * 4
+    (seq as u64) * 2
 }
 
 /// Run the strategy selection.
@@ -169,6 +172,32 @@ pub fn detect(
             eliminated_mask_bytes_per_batch: mask_bytes,
         }
     }
+}
+
+/// Compile-time validation that a packing configuration will not
+/// exceed the u16 segment-count ceiling. Spec §4 invariant #3.
+pub fn validate_config(cfg: &DatasetPackingConfig) -> Result<(), String> {
+    if !cfg.enabled {
+        return Ok(());
+    }
+    let mean = cfg.mean_doc_length.unwrap_or(cfg.max_sequence_length.max(1));
+    if mean == 0 {
+        return Err(
+            "packing.mean_doc_length must be > 0 when packing enabled".to_string(),
+        );
+    }
+    // Worst-case segments per pack = max_sequence_length / min_doc_length.
+    // We approximate min_doc_length as mean/4 (conservative lower bound).
+    let min_doc = (mean / 4).max(1);
+    let worst_case_segments = cfg.max_sequence_length as u64 / min_doc as u64;
+    if worst_case_segments > u16::MAX as u64 {
+        return Err(format!(
+            "packing config may exceed u16 segment ceiling: \
+             max_sequence_length={}, min_doc_length≈{}, worst-case segments={} > {}",
+            cfg.max_sequence_length, min_doc, worst_case_segments, u16::MAX
+        ));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -254,8 +283,43 @@ mod tests {
         );
         // 2048 × 2048 × 2 bytes = 8 MB.
         assert_eq!(d.eliminated_mask_bytes_per_batch, 2048u64 * 2048 * 2);
-        // Segment IDs: 2048 × 4 bytes = 8 KB.
-        assert_eq!(d.segment_id_bytes_per_batch, 2048 * 4);
+        // Segment IDs: 2048 × 2 bytes = 4 KB (u16 per position).
+        assert_eq!(d.segment_id_bytes_per_batch, 2048 * 2);
+    }
+
+    #[test]
+    fn segment_ids_bytes_is_u16_sized() {
+        assert_eq!(segment_ids_bytes(2048), 4096);
+        assert_eq!(segment_ids_bytes(1024), 2048);
+    }
+
+    #[test]
+    fn validate_config_accepts_realistic_corpus() {
+        let cfg = DatasetPackingConfig {
+            enabled: true,
+            max_sequence_length: 2048,
+            mean_doc_length: Some(400),
+            doc_length_stddev: Some(100),
+            separator_token_id: Some(2),
+        };
+        assert!(validate_config(&cfg).is_ok());
+    }
+
+    #[test]
+    fn validate_config_rejects_u16_overflow_case() {
+        let cfg = DatasetPackingConfig {
+            enabled: true,
+            max_sequence_length: 65536,
+            mean_doc_length: Some(4),
+            doc_length_stddev: Some(1),
+            separator_token_id: Some(2),
+        };
+        assert!(validate_config(&cfg).is_err());
+    }
+
+    #[test]
+    fn validate_config_allows_disabled_packing() {
+        assert!(validate_config(&DatasetPackingConfig::default()).is_ok());
     }
 
     #[test]

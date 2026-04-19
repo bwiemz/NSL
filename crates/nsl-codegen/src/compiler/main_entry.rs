@@ -356,7 +356,7 @@ impl Compiler<'_> {
         &mut self,
         builder: &mut FunctionBuilder,
     ) -> Result<(), CodegenError> {
-        if self.fused_ptx_kernels.is_empty() {
+        if self.fused_ptx_kernels.is_empty() && self.fused_gatedlora_ptx_kernels.is_empty() {
             return Ok(());
         }
 
@@ -369,22 +369,47 @@ impl Compiler<'_> {
             .collect();
         order.sort_by_key(|(k, _)| (k.m, k.n, k.k, k.rank, k.target_sm));
 
+        // B.3.1 Task 5.0.c: GatedLoRA kernels get handles starting at
+        // lora_count so there is no overlap with LoRA handles.  Must match
+        // the offset baked into each GatedLoRA call site by
+        // `synthesize_gatedlora_fused_call`.
+        let lora_count = order.len();
+        let mut gl_order: Vec<(crate::wrga_fused_ptx::LoraKernelKey, String)> = self
+            .fused_gatedlora_ptx_kernels
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        gl_order.sort_by_key(|(k, _)| (k.m, k.n, k.k, k.rank, k.target_sm));
+
         let register_id = self.registry.runtime_fns["nsl_wrga_register_fused_ptx"].0;
         let register_ref = self
             .module
             .declare_func_in_func(register_id, builder.func);
 
-        for (handle, (key, ptx)) in order.into_iter().enumerate() {
+        /// Emit one `nsl_wrga_register_fused_ptx` call.
+        ///
+        /// `tag` is `"lora"` or `"gatedlora"` — used in the Cranelift data
+        /// symbol names so that LoRA and GatedLoRA symbols are distinct
+        /// (Cranelift rejects duplicate data-section symbol names).
+        fn emit_one_registration(
+            module: &mut cranelift_object::ObjectModule,
+            builder: &mut FunctionBuilder<'_>,
+            register_ref: cranelift_codegen::ir::FuncRef,
+            handle: usize,
+            key: &crate::wrga_fused_ptx::LoraKernelKey,
+            ptx: &str,
+            kernel_name: &str,
+            tag: &str,
+        ) -> Result<(), CodegenError> {
             // PTX bytes + null terminator (cudarc's load_ptx needs a C string).
             let mut ptx_bytes = ptx.as_bytes().to_vec();
             ptx_bytes.push(0);
             let ptx_len = (ptx_bytes.len() - 1) as i64; // length excludes NUL
             let ptx_label = format!(
-                "__nsl_wrga_fused_ptx_m{}n{}k{}r{}sm{}",
-                key.m, key.n, key.k, key.rank, key.target_sm
+                "__nsl_wrga_{}_ptx_m{}n{}k{}r{}sm{}",
+                tag, key.m, key.n, key.k, key.rank, key.target_sm
             );
-            let ptx_data_id = self
-                .module
+            let ptx_data_id = module
                 .declare_data(&ptx_label, cranelift_module::Linkage::Local, false, false)
                 .map_err(|e| {
                     CodegenError::new(format!(
@@ -393,7 +418,7 @@ impl Compiler<'_> {
                 })?;
             let mut ptx_desc = cranelift_module::DataDescription::new();
             ptx_desc.define(ptx_bytes.into_boxed_slice());
-            self.module
+            module
                 .define_data(ptx_data_id, &ptx_desc)
                 .map_err(|e| {
                     CodegenError::new(format!(
@@ -401,22 +426,14 @@ impl Compiler<'_> {
                     ))
                 })?;
 
-            // Kernel entry symbol name, null-terminated.  Must match the
-            // `.visible .entry` name emitted by `synthesize_fused_lora_ptx`:
-            //   nsl_wrga_fused_lora_m{m}n{n}k{k}r{rank}
-            let kernel_name = format!(
-                "nsl_wrga_fused_lora_m{}n{}k{}r{}",
-                key.m, key.n, key.k, key.rank
-            );
             let name_len = kernel_name.len() as i64;
             let mut name_bytes = kernel_name.as_bytes().to_vec();
             name_bytes.push(0);
             let name_label = format!(
-                "__nsl_wrga_fused_name_m{}n{}k{}r{}sm{}",
-                key.m, key.n, key.k, key.rank, key.target_sm
+                "__nsl_wrga_{}_name_m{}n{}k{}r{}sm{}",
+                tag, key.m, key.n, key.k, key.rank, key.target_sm
             );
-            let name_data_id = self
-                .module
+            let name_data_id = module
                 .declare_data(&name_label, cranelift_module::Linkage::Local, false, false)
                 .map_err(|e| {
                     CodegenError::new(format!(
@@ -425,7 +442,7 @@ impl Compiler<'_> {
                 })?;
             let mut name_desc = cranelift_module::DataDescription::new();
             name_desc.define(name_bytes.into_boxed_slice());
-            self.module
+            module
                 .define_data(name_data_id, &name_desc)
                 .map_err(|e| {
                     CodegenError::new(format!(
@@ -435,9 +452,9 @@ impl Compiler<'_> {
 
             // Emit the call: nsl_wrga_register_fused_ptx(handle, ptx_ptr,
             //   ptx_len, name_ptr, name_len)
-            let ptx_gv = self.module.declare_data_in_func(ptx_data_id, builder.func);
+            let ptx_gv = module.declare_data_in_func(ptx_data_id, builder.func);
             let ptx_ptr = builder.ins().symbol_value(cl_types::I64, ptx_gv);
-            let name_gv = self.module.declare_data_in_func(name_data_id, builder.func);
+            let name_gv = module.declare_data_in_func(name_data_id, builder.func);
             let name_ptr = builder.ins().symbol_value(cl_types::I64, name_gv);
             let handle_val = builder.ins().iconst(cl_types::I64, handle as i64);
             let ptx_len_val = builder.ins().iconst(cl_types::I64, ptx_len);
@@ -446,6 +463,46 @@ impl Compiler<'_> {
                 register_ref,
                 &[handle_val, ptx_ptr, ptx_len_val, name_ptr, name_len_val],
             );
+            Ok(())
+        }
+
+        // ── LoRA kernels (handles 0..lora_count) ─────────────────────────
+        for (handle, (key, ptx)) in order.into_iter().enumerate() {
+            // Kernel entry symbol name — must match `.visible .entry` in PTX.
+            let kernel_name = format!(
+                "nsl_wrga_fused_lora_m{}n{}k{}r{}",
+                key.m, key.n, key.k, key.rank
+            );
+            emit_one_registration(
+                &mut self.module,
+                builder,
+                register_ref,
+                handle,
+                &key,
+                &ptx,
+                &kernel_name,
+                "fused_lora",
+            )?;
+        }
+
+        // ── GatedLoRA kernels (handles lora_count..lora_count+gl_count) ──
+        for (gl_idx, (key, ptx)) in gl_order.into_iter().enumerate() {
+            // Kernel entry symbol name — must match `.visible .entry` in PTX
+            // emitted by `synthesize_fused_gatedlora_ptx`.
+            let kernel_name = format!(
+                "nsl_wrga_fused_gatedlora_m{}n{}k{}r{}",
+                key.m, key.n, key.k, key.rank
+            );
+            emit_one_registration(
+                &mut self.module,
+                builder,
+                register_ref,
+                lora_count + gl_idx,
+                &key,
+                &ptx,
+                &kernel_name,
+                "fused_gatedlora",
+            )?;
         }
 
         Ok(())

@@ -14,7 +14,7 @@ use crate::cpdt_comm::{build_schedule, CommSchedule};
 use crate::cpdt_expert::{ExpertConfig, ExpertPlan, MoeLayerShape};
 use crate::cpdt_joint::{solve as solve_joint, JointConfig, JointInput, JointPlan};
 use crate::cpdt_optim::{emit_plan, AdamWHyperparams, QuantizedOptimProgram};
-use crate::cpdt_precision::{plan_map, PrecisionConfig, PrecisionPlan};
+use crate::cpdt_tier_apply::{plan_map, PrecisionConfig, PrecisionPlan};
 use crate::cpdt_zero::{ClusterSpec, ModelSize, ZeroEvaluation};
 use crate::weight_aware::{WeightEntry, WeightMap};
 

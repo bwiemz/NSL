@@ -133,8 +133,7 @@ fn with_saves_ptx_contains_csha_save_labels() {
         rope_style: RopeStyle::HalfSplit,
         gqa_group_size: 1,
         tree_mask: false,
-        gpu_sm: 80,
-        csha: Some(CshaExtras {
+        gpu_sm: 80, segment_masked: false, csha: Some(CshaExtras {
             level: 1,
             fused_rmsnorm: false,
             fused_projections: false,

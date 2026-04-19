@@ -72,6 +72,10 @@ pub struct RewriteContext<'a> {
     /// `(m, n, k, rank, target_sm)`.  Empty when the prescan didn't
     /// populate `Compiler::fused_ptx_kernels` (e.g. non-sm_80 target).
     pub fused_kernel_order: Vec<crate::wrga_fused_ptx::LoraKernelKey>,
+    /// B.3.1 Task 5.0.c: parallel ordering for GatedLoRA kernels.
+    /// GatedLoRA handles = `fused_kernel_order.len() + position_in_this_vec`.
+    /// Sorted by the same key tuple as `fused_kernel_order`.
+    pub fused_gatedlora_kernel_order: Vec<crate::wrga_fused_ptx::LoraKernelKey>,
 }
 
 impl<'a> RewriteContext<'a> {
@@ -84,6 +88,7 @@ impl<'a> RewriteContext<'a> {
             target_sm: None,
             synth_call_overrides: HashMap::new(),
             fused_kernel_order: Vec::new(),
+            fused_gatedlora_kernel_order: Vec::new(),
         }
     }
 }
@@ -484,6 +489,118 @@ pub fn synthesize_ia3_unfused_mul(
     make_bin(BinOp::Mul, original, ma_scale, span)
 }
 
+/// B.3.1: synthesize a single `Call` to `nsl_adapter_fused_gatedlora_matmul`
+/// with args `[lhs, self.W, self.lora_A_<site>, self.lora_B_<site>,
+/// FloatLit(scale), self.gate_<site>, IntLit(kernel_handle)]`.
+///
+/// The callee Ident carries a sentinel Symbol; the real FFI name is stashed in
+/// `ctx.synth_call_overrides` keyed by the callee's NodeId (same pattern as
+/// `synthesize_lora_fused_call`).
+///
+/// `kernel_handle` is stubbed at 0 until Task 5.0.c registers the real PTX
+/// kernel and wires the handle through `ctx.fused_kernel_order`.
+pub fn synthesize_gatedlora_fused_call(
+    original: Expr,
+    lhs: &Expr,
+    site: &AdapterSite,
+    ctx: &mut RewriteContext<'_>,
+) -> Expr {
+    let span = original.span;
+    let sentinel = ctx
+        .field_symbols
+        .values()
+        .next()
+        .copied()
+        .expect("RewriteContext must have at least one field symbol");
+
+    // Recover `self.W` from the original `x @ self.W` matmul.
+    let self_w = match &original.kind {
+        ExprKind::BinaryOp { right, .. } => (**right).clone(),
+        _ => {
+            // Shouldn't happen — match_adapter_site guarantees a
+            // matmul-shaped original.  Fall back to unfused to be safe.
+            return synthesize_gatedlora_unfused(original, lhs, site, ctx);
+        }
+    };
+
+    let a_name = format!("lora_A_{}", site.site_id);
+    let b_name = format!("lora_B_{}", site.site_id);
+    let g_name = format!("gate_{}", site.site_id);
+
+    let self_a = make_self_expr(span);
+    let ma_a = make_synth_member_access(ctx, self_a, &a_name, span, sentinel);
+    let self_b = make_self_expr(span);
+    let ma_b = make_synth_member_access(ctx, self_b, &b_name, span, sentinel);
+    let self_g = make_self_expr(span);
+    let ma_g = make_synth_member_access(ctx, self_g, &g_name, span, sentinel);
+
+    let rank = site.rank.max(1) as f64;
+    let alpha = site.alpha.max(1) as f64;
+    let scale = alpha / rank;
+
+    // B.3.1 Task 5.0.c: look up the GatedLoRA-specific kernel order.
+    // GatedLoRA handles are assigned as `lora_order.len() + idx_in_gatedlora_order`
+    // to avoid collisions with LoRA handles that share the same shape.
+    let kernel_handle: i64 = {
+        let target_sm = ctx.target_sm.unwrap_or(0);
+        let rank_u32 = match &site.fusion_decision {
+            Some(crate::wrga_fusion::FusionTarget::EpilogueFusedGatedLora { rank }) => {
+                *rank as u32
+            }
+            _ => site.rank as u32,
+        };
+        let key = crate::wrga_fused_ptx::LoraKernelKey {
+            m: 1,
+            n: site.output_dim,
+            k: site.input_dim,
+            rank: rank_u32,
+            target_sm,
+        };
+        let lora_offset = ctx.fused_kernel_order.len() as i64;
+        ctx.fused_gatedlora_kernel_order
+            .iter()
+            .position(|k| k == &key)
+            .map(|p| lora_offset + p as i64)
+            .unwrap_or(-1)
+    };
+
+    let callee_id = NodeId::next();
+    ctx.synth_call_overrides
+        .insert(callee_id, "nsl_adapter_fused_gatedlora_matmul".to_string());
+    let callee = Expr {
+        kind: ExprKind::Ident(sentinel),
+        span,
+        id: callee_id,
+    };
+
+    let args = vec![
+        Arg { name: None, value: lhs.clone(), span },
+        Arg { name: None, value: self_w, span },
+        Arg { name: None, value: ma_a, span },
+        Arg { name: None, value: ma_b, span },
+        Arg { name: None, value: make_float(scale, span), span },
+        Arg { name: None, value: ma_g, span },
+        Arg {
+            name: None,
+            value: Expr {
+                kind: ExprKind::IntLiteral(kernel_handle),
+                span,
+                id: NodeId::next(),
+            },
+            span,
+        },
+    ];
+
+    Expr {
+        kind: ExprKind::Call {
+            callee: Box::new(callee),
+            args,
+        },
+        span,
+        id: NodeId::next(),
+    }
+}
+
 /// Synthesize
 /// `original + sigmoid(self.gate_<site>) * ((x @ self.lora_A_<site>) @ self.lora_B_<site>) * scale`.
 ///
@@ -495,7 +612,36 @@ pub fn synthesize_ia3_unfused_mul(
 /// contribution. If `lora_B`'s init is changed from zero, the equivalence
 /// invariant breaks silently. Task 5 Build 4 is the load-bearing runtime
 /// assertion that catches such regressions.
+///
+/// # Fused-dispatch (B.3.1)
+///
+/// When `site.fusion_decision == Some(EpilogueFusedGatedLora)` AND
+/// `ctx.target_sm >= 80`, emits a single `Call` to
+/// `nsl_adapter_fused_gatedlora_matmul(x, W, A, B, scale, gate, kernel_handle)`
+/// instead of the AST sigmoid+triple+scale expression.  The kernel
+/// handle is currently stubbed at 0; Task 5.0.c wires real registration.
 pub fn synthesize_gatedlora_adapted(
+    original: Expr,
+    lhs: &Expr,
+    site: &AdapterSite,
+    ctx: &mut RewriteContext<'_>,
+) -> Expr {
+    // Fused-dispatch branch (B.3.1): mirror synthesize_lora_adapted's pattern.
+    let is_fused = matches!(
+        site.fusion_decision,
+        Some(crate::wrga_fusion::FusionTarget::EpilogueFusedGatedLora { .. })
+    );
+    let sm_ok = ctx.target_sm.map(|sm| sm >= 80).unwrap_or(false);
+    if is_fused && sm_ok {
+        return synthesize_gatedlora_fused_call(original, lhs, site, ctx);
+    }
+    synthesize_gatedlora_unfused(original, lhs, site, ctx)
+}
+
+/// Unfused GatedLoRA body, preserved verbatim from B.3.
+/// Synthesize
+/// `original + sigmoid(self.gate_<site>) * ((x @ self.lora_A_<site>) @ self.lora_B_<site>) * scale`.
+pub fn synthesize_gatedlora_unfused(
     original: Expr,
     lhs: &Expr,
     site: &AdapterSite,
