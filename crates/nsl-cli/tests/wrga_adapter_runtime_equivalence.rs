@@ -1003,3 +1003,238 @@ fn gatedlora_fixture_d_mid_range_curve() {
     let expected = 8.0_f32 + sigmoid_f64(1.0) as f32 * 16.0;
     run_gatedlora_fixture(GATEDLORA_FIXTURE_D_SRC, expected, 1e-3, "fixture_d");
 }
+
+// ===== WRGA B.3.2 Option 3 (revised) phase 3e tests =====
+//
+// See `docs/superpowers/specs/2026-04-19-wrga-b32-option3-revised-design.md`
+// §5 for discipline. Phase 3e extracts the adapter rewrite setup from
+// `compile_user_functions` into `wrga_adapter_rewrite::rewrite_stmts_\
+// for_model` and re-applies it to `compiler.models.model_method_bodies`
+// immediately after prescan so source-AD's inline expansion walks the
+// fused AST.
+//
+// Test 1 (proxy, launch-counter): asserts the fused kernel fires under a
+//   train block, closing the regression "fused kernel never fires in
+//   train block" observed pre-phase-3e.
+// Test 2 (B.5 direct probe, 5/5 trainable params): `#[ignore]` at this
+//   commit — source-AD still has no handler for the fused FFI callee
+//   yet. Commit B (original option 3) removes the ignore.
+// Test 3 (anti-drift): asserts the two paths (Cranelift + source-AD)
+//   produce identical externally-visible behaviour.
+
+/// Test 1 — proxy-level launch-counter (B.5 necessary-but-not-sufficient).
+///
+/// Catches the regression where 3e's rewrite pass doesn't fire (empty
+/// `adapter_sites`, wrong insertion point, or the shared helper's
+/// extraction introduced a bug). Launch-counter alone is not sufficient
+/// (some other fusion-adjacent path could produce launches) — test 2
+/// below is the direct probe; it is currently ignored because source-AD
+/// has no handler yet for the fused FFI callee.
+#[cfg(feature = "cuda")]
+#[test]
+fn gatedlora_fused_fires_in_train_block() {
+    let src = r#"from nsl.nn.losses import mse_loss
+
+model Toy:
+    w: Tensor = zeros([8, 8])
+    fn forward(self, x: Tensor) -> Tensor:
+        return x @ self.w
+
+@adapter(type=gatedlora, target=["Toy.w"], rank=2, alpha=2)
+let m = Toy()
+m.to(cuda)
+let x = zeros([4, 8]).to(cuda)
+let y_target = zeros([4, 8]).to(cuda)
+train(model = m, epochs = 3):
+    optimizer: SGD(lr = 0.0)
+    step(batch):
+        let pred = m.forward(x)
+        let loss = mse_loss(pred, y_target)
+"#;
+
+    let tmp = TempDir::new().unwrap();
+    let src_path = tmp.path().join("fused_fires.nsl");
+    fs::write(&src_path, src).unwrap();
+    let root = workspace_root();
+    let stdlib = root.join("stdlib");
+
+    let out = Command::cargo_bin("nsl")
+        .unwrap()
+        .env("NSL_STDLIB_PATH", &stdlib)
+        .env("NSL_WRGA_FUSED_CUDA", "1")
+        .env("NSL_WRGA_GPU_LAUNCH_COUNTER", "1")
+        .arg("run")
+        .args(["--source-ad", "--target", "cuda_sm80"])
+        .arg(&src_path)
+        .output()
+        .expect("nsl run failed to spawn");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "nsl run failed:\n{stderr}");
+
+    let launch_line = stderr
+        .lines()
+        .find(|l| l.contains("[nsl-gpu-launch-count]"))
+        .expect("expected nsl-gpu-launch-count in stderr");
+    let count: u64 = launch_line
+        .split_whitespace()
+        .next_back()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    assert!(
+        count >= 3,
+        "expected >=3 fused CUDA launches (1 per train epoch, 3 epochs); got {count}.\n\
+         0 means the 3e rewrite didn't apply to model_method_bodies — regression.\nstderr:\n{stderr}",
+    );
+}
+
+/// Test 2 — B.5-compliant direct probe (5/5 trainable tensor params).
+///
+/// Source-AD must report 5/5 trainable tensor params connected (x, W, A,
+/// B, gate) when `@adapter(gatedlora)` is active in a train block. 5/5 is
+/// a signal only the specific code path can produce — it requires the
+/// Wengert extractor to have seen the fused FFI callee and decomposed its
+/// 5 inputs.
+///
+/// IGNORED in commit A (phase 3e): at this commit source-AD has no handler
+/// for `nsl_adapter_fused_gatedlora_matmul` yet, so it still falls back
+/// and reports 1/1 (or less, if the fallback path also fails). Commit B
+/// (original option 3) adds the extractor match arm + AD rule and removes
+/// this ignore.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "Commit B (original option 3) removes this ignore after adding the AD rule for FusedGatedLoraMatmul"]
+fn source_ad_sees_fused_ffi_in_train_block() {
+    let src = r#"from nsl.nn.losses import mse_loss
+
+model Toy:
+    w: Tensor = zeros([8, 8])
+    fn forward(self, x: Tensor) -> Tensor:
+        return x @ self.w
+
+@adapter(type=gatedlora, target=["Toy.w"], rank=2, alpha=2)
+let m = Toy()
+m.to(cuda)
+let x = zeros([4, 8]).to(cuda)
+let y_target = zeros([4, 8]).to(cuda)
+train(model = m, epochs = 1):
+    optimizer: SGD(lr = 0.0)
+    step(batch):
+        let pred = m.forward(x)
+        let loss = mse_loss(pred, y_target)
+"#;
+
+    let tmp = TempDir::new().unwrap();
+    let src_path = tmp.path().join("source_ad_sees.nsl");
+    fs::write(&src_path, src).unwrap();
+    let root = workspace_root();
+    let stdlib = root.join("stdlib");
+
+    let out = Command::cargo_bin("nsl")
+        .unwrap()
+        .env("NSL_STDLIB_PATH", &stdlib)
+        .env("NSL_WRGA_FUSED_CUDA", "1")
+        .arg("run")
+        .args(["--source-ad", "--target", "cuda_sm80"])
+        .arg(&src_path)
+        .output()
+        .expect("nsl run failed to spawn");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // Expected stderr line from source-AD summary:
+    //   "source AD gradient summary: 5/5 trainable tensor params connected"
+    assert!(
+        stderr.contains("5/5 trainable tensor params connected"),
+        "expected 5/5 trainable params (x, W, A, B, gate) to reach source-AD; got:\n{stderr}",
+    );
+}
+
+/// Test 3 — anti-drift structural check.
+///
+/// If `compile_user_functions` and `rewrite_model_method_bodies_with_\
+/// adapter_sites` use the same shared helper, both paths produce the
+/// same rewritten stmts for the same model/method input. This test runs
+/// the nsl binary on a program and asserts the externally-visible
+/// numerical output is identical whether or not `--source-ad` is in
+/// effect. If the two paths diverge (because the shared helper was
+/// accidentally forked between the two call sites), the outputs would
+/// differ.
+///
+/// Uses the fixture-A-style single-model GatedLoRA shape (same adapter
+/// seeding that drives Build 4 / fixture A to y = 8 + 16 = 24.0 — we
+/// only care that BOTH modes land on the same tensor value, not that it
+/// matches any specific reference).
+#[cfg(feature = "cuda")]
+#[test]
+fn cranelift_and_source_ad_see_same_rewritten_ast() {
+    // We only use the `let y = m.forward(x)` output outside the train
+    // block; both modes must produce the same answer. If the shared
+    // helper has drifted between the Cranelift and 3e call sites,
+    // `model_method_bodies` (source-AD) and `fn_def` (Cranelift) diverge
+    // and the two runs produce different tensors.
+    let src = r#"from nsl.nn.losses import mse_loss
+
+model Toy:
+    w: Tensor = ones([8, 8])
+    fn forward(self, x: Tensor) -> Tensor:
+        return x @ self.w
+
+@adapter(type=gatedlora, target=["Toy.w"], rank=2, alpha=2)
+let m = Toy()
+m.to(cuda)
+let x = ones([4, 8]).to(cuda)
+m.lora_A_Toy_w__gatedlora = ones([8, 2]).to(cuda)
+m.lora_B_Toy_w__gatedlora = ones([2, 8]).to(cuda)
+m.gate_Toy_w__gatedlora = full([8], 30.0).to(cuda)
+let y = m.forward(x)
+print(y)
+"#;
+
+    let tmp = TempDir::new().unwrap();
+    let src_path = tmp.path().join("same_ast.nsl");
+    fs::write(&src_path, src).unwrap();
+    let root = workspace_root();
+    let stdlib = root.join("stdlib");
+
+    let run = |with_source_ad: bool| -> String {
+        let mut cmd = Command::cargo_bin("nsl").unwrap();
+        cmd.env("NSL_STDLIB_PATH", &stdlib)
+            .env("NSL_WRGA_FUSED_CUDA", "1")
+            .arg("run")
+            .args(["--target", "cuda_sm80"]);
+        if with_source_ad {
+            cmd.arg("--source-ad");
+        }
+        cmd.arg(&src_path);
+        let out = cmd.output().expect("spawn");
+        assert!(
+            out.status.success(),
+            "nsl run failed (source_ad={with_source_ad}):\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).to_string()
+    };
+
+    let stdout_with = run(true);
+    let stdout_without = run(false);
+    // Extract the final tensor rows from each; compare the trailing
+    // contiguous block of `tensor(...)`-prefixed lines. This is robust
+    // to extra diagnostic lines appearing before `print(y)`.
+    let tensor_block = |s: &str| -> String {
+        s.lines()
+            .filter(|l| l.starts_with("tensor("))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let t_with = tensor_block(&stdout_with);
+    let t_without = tensor_block(&stdout_without);
+    assert!(
+        !t_with.is_empty() && !t_without.is_empty(),
+        "expected tensor output in both runs.\nwith: {stdout_with}\nwithout: {stdout_without}",
+    );
+    assert_eq!(
+        t_with, t_without,
+        "source-AD and non-source-AD paths produced different tensor output — \
+         indicates model_method_bodies and Cranelift-compiled body have drifted.",
+    );
+}

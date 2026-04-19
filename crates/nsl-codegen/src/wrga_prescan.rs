@@ -193,3 +193,71 @@ pub(crate) fn prescan_adapter_sites_from_decorators(compiler: &mut Compiler<'_>)
     compiler.last_wrga_plan = Some(plan.clone());
     compiler.adapter_prescan_plan = Some(plan);
 }
+
+/// WRGA B.3.2 Option 3 phase 3e: apply the adapter rewrite to
+/// `compiler.models.model_method_bodies` so source-AD's inline expansion
+/// sees the fused FFI call in the train block.
+///
+/// Parallel to `compile_user_functions`'s rewrite — both paths use the
+/// shared helper `wrga_adapter_rewrite::rewrite_stmts_for_model` to
+/// prevent drift. See
+/// `docs/superpowers/specs/2026-04-19-wrga-b32-option3-revised-design.md`
+/// §1 for the gap this closes: `model_method_bodies` is populated at
+/// `declaration.rs:490` with unrewritten `fn_def.clone()`, *before*
+/// `prescan_adapter_sites_from_decorators` runs. Without this pass the
+/// source-AD path walks stale AST and never sees the fused FFI callee.
+///
+/// Runs immediately after `prescan_adapter_sites_from_decorators` at each
+/// of the 4 entry points in `compiler/entry_points.rs`, and before the
+/// first consumer of `model_method_bodies` (which is source-AD inside
+/// `compile_main`).
+///
+/// No-op if `adapter_sites` is empty.
+pub(crate) fn rewrite_model_method_bodies_with_adapter_sites(
+    compiler: &mut crate::compiler::Compiler<'_>,
+) {
+    if compiler.adapter_sites.is_empty() {
+        return;
+    }
+    // Collect model names first to avoid mutable-borrow conflict with the
+    // helper's `&mut compiler` argument.
+    let model_names: Vec<String> = compiler
+        .models
+        .model_method_bodies
+        .keys()
+        .cloned()
+        .collect();
+    for model_name in model_names {
+        let method_names: Vec<String> = compiler
+            .models
+            .model_method_bodies
+            .get(&model_name)
+            .map(|m| m.keys().cloned().collect())
+            .unwrap_or_default();
+        for method_name in method_names {
+            // Take a clone of the fn_def for input; we only mutate
+            // `body.stmts` after the helper returns, so holding the clone
+            // for the helper call is safe.
+            let fn_def_opt = compiler
+                .models
+                .model_method_bodies
+                .get(&model_name)
+                .and_then(|m| m.get(&method_name))
+                .cloned();
+            let Some(fn_def) = fn_def_opt else {
+                continue;
+            };
+            let rewritten = crate::wrga_adapter_rewrite::rewrite_stmts_for_model(
+                compiler,
+                &model_name,
+                &fn_def,
+                &fn_def.body.stmts,
+            );
+            if let Some(map) = compiler.models.model_method_bodies.get_mut(&model_name) {
+                if let Some(body) = map.get_mut(&method_name) {
+                    body.body.stmts = rewritten;
+                }
+            }
+        }
+    }
+}

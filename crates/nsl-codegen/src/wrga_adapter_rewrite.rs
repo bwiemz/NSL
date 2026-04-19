@@ -93,6 +93,132 @@ impl<'a> RewriteContext<'a> {
     }
 }
 
+/// Apply the adapter rewrite to a sequence of statements for a given model.
+///
+/// Shared between `compile_user_functions` (Cranelift path, see
+/// `compiler/functions.rs`) and `wrga_prescan::rewrite_model_method_bodies_\
+/// with_adapter_sites` (source-AD path, which re-rewrites
+/// `compiler.models.model_method_bodies`). Using this single function
+/// prevents drift between the two paths — they must see the same rewritten
+/// AST or source-AD and Cranelift will diverge silently. See
+/// `docs/superpowers/specs/2026-04-19-wrga-b32-option3-revised-design.md`
+/// §4 for the rationale.
+///
+/// Preconditions: `compiler.adapter_sites` is populated (by
+/// `prescan_adapter_sites_from_decorators` or the train-block WRGA pass).
+/// The rewrite only fires when `adapter_sites` has at least one site with
+/// `target_model == model_name`; otherwise returns the input stmts cloned
+/// unchanged (cheap no-op).
+///
+/// Side effects: on a non-empty rewrite this inserts into
+/// `compiler.synth_member_names` and `compiler.synth_call_names` so
+/// downstream codegen can resolve the synthesized member accesses and call
+/// callees.
+pub fn rewrite_stmts_for_model(
+    compiler: &mut crate::compiler::Compiler<'_>,
+    model_name: &str,
+    fn_def: &nsl_ast::decl::FnDef,
+    stmts: &[Stmt],
+) -> Vec<Stmt> {
+    // B.2.1 Task 3: run the LoRA forward-pass AST rewrite over each
+    // statement before lowering. Only active when adapter sites target
+    // this model class.
+    let sites_for_model: Vec<&crate::wrga_adapter_inject::AdapterSite> = compiler
+        .adapter_sites
+        .iter()
+        .filter(|s| s.target_model == model_name)
+        .collect();
+    if sites_for_model.is_empty() {
+        return stmts.to_vec();
+    }
+
+    let mut ctx = RewriteContext::new(sites_for_model);
+    // B.3 Task 4: expose the compile target's sm version so the rewrite
+    // can choose between the fused single-FFI path and the B.2.1 unfused
+    // triple.
+    ctx.target_sm = compiler.target_sm();
+    // B.3 Task 5: deterministic ordering of fused PTX kernel keys, used
+    // by the rewrite to assign a stable per-site `kernel_handle`. Sort by
+    // the full key tuple.
+    let mut order: Vec<crate::wrga_fused_ptx::LoraKernelKey> =
+        compiler.fused_ptx_kernels.keys().cloned().collect();
+    order.sort_by_key(|k| (k.m, k.n, k.k, k.rank, k.target_sm));
+    ctx.fused_kernel_order = order;
+    // B.3.1 Task 5.0.c: build GatedLoRA kernel order from the parallel
+    // map. Handles for GatedLoRA are assigned at lora_count + idx in this
+    // vec.
+    let mut gl_order: Vec<crate::wrga_fused_ptx::LoraKernelKey> = compiler
+        .fused_gatedlora_ptx_kernels
+        .keys()
+        .cloned()
+        .collect();
+    gl_order.sort_by_key(|k| (k.m, k.n, k.k, k.rank, k.target_sm));
+    ctx.fused_gatedlora_kernel_order = gl_order;
+    // Find the `self` Symbol and populate field_symbols from the model's
+    // known fields for matcher support.
+    ctx.self_sym = fn_def
+        .params
+        .iter()
+        .find(|p| compiler.resolve_sym(p.name) == "self")
+        .map(|p| p.name);
+    if let Some(field_map) = compiler
+        .models
+        .model_field_types
+        .get(model_name)
+        .cloned()
+    {
+        for fname in field_map.keys() {
+            if let Some(s) = compiler.interner.get(fname) {
+                ctx.field_symbols
+                    .insert(fname.clone(), nsl_ast::Symbol(s));
+            }
+        }
+    }
+    // B.2.1 Task 5.5: also include Tensor-typed fields (whose shape
+    // strings live in the separate `model_tensor_field_shapes` map) so
+    // the rewrite matcher can recognise `self.w @ ...` for adapted tensor
+    // fields.
+    if let Some(field_map) = compiler
+        .models
+        .model_tensor_field_shapes
+        .get(model_name)
+        .cloned()
+    {
+        for fname in field_map.keys() {
+            if let Some(s) = compiler.interner.get(fname) {
+                ctx.field_symbols
+                    .insert(fname.clone(), nsl_ast::Symbol(s));
+            }
+        }
+    }
+    // B.3.1 Task 5.1: GatedLoRA's synthesize_gatedlora_adapted builds a
+    // `sigmoid(self.gate_<site>)` Call node and resolves the callee by
+    // looking up `field_symbols["sigmoid"]`. Without this insertion the
+    // fallback picks an arbitrary field symbol (e.g. `w`) as the callee,
+    // emitting `w(gate_...)` which fails at codegen with "undefined
+    // variable 'w'".
+    //
+    // We insert the symbol unconditionally for all models that have
+    // adapter sites — it is a no-op if no GatedLoRA site is present
+    // since non-GatedLoRA rewrites never consult `field_symbols["sigmoid"]`.
+    if let Some(s) = compiler.interner.get("sigmoid") {
+        ctx.field_symbols
+            .insert("sigmoid".to_string(), nsl_ast::Symbol(s));
+    }
+    let out: Vec<Stmt> = stmts
+        .iter()
+        .cloned()
+        .map(|s| rewrite_stmt(s, &mut ctx))
+        .collect();
+    // Commit synth overrides to the compiler so compile_member_access
+    // can resolve them.
+    compiler.synth_member_names.extend(ctx.synth_overrides);
+    // B.3 Task 4: commit fused-call callee overrides so expr_as_func_name
+    // can resolve them.
+    compiler.synth_call_names.extend(ctx.synth_call_overrides);
+    out
+}
+
 /// Is the given expression the `self` reference, given the optional
 /// known `self_sym` (from the method's `self` parameter)?
 fn is_self_expr(expr: &Expr, self_sym: Option<Symbol>) -> bool {
