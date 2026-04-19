@@ -1235,8 +1235,7 @@ mod tests {
             rope_style: RopeStyle::HalfSplit,
             gqa_group_size: 1,
             tree_mask: false,
-            gpu_sm: 75,
-            csha: Some(CshaExtras { fused_projections: true, d_model: 128, ..CshaExtras::default() }),
+            gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras { fused_projections: true, d_model: 128, ..CshaExtras::default() }),
         }
     }
 
@@ -1252,8 +1251,7 @@ mod tests {
             rope_style: RopeStyle::Adjacent,  // emit_rope_pair_sweep implements Adjacent (x[2i], x[2i+1])
             gqa_group_size: 1,
             tree_mask: false,
-            gpu_sm: 75,
-            csha: Some(CshaExtras { fused_projections: true, d_model: 128, ..CshaExtras::default() }),
+            gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras { fused_projections: true, d_model: 128, ..CshaExtras::default() }),
         }
     }
 
@@ -1428,8 +1426,7 @@ mod tests {
             rope_style: RopeStyle::HalfSplit,
             gqa_group_size: 1,
             tree_mask: false,
-            gpu_sm: 75,
-            csha: Some(CshaExtras {
+            gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras {
                 fused_projections: true,
                 fused_output_proj: true,
                 d_model: 128,
@@ -1587,8 +1584,7 @@ mod tests {
             rope_style: RopeStyle::HalfSplit,
             gqa_group_size: 1,
             tree_mask: false,
-            gpu_sm: 75,
-            csha: Some(CshaExtras {
+            gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras {
                 fused_projections: true,
                 save_activations_for_backward: true,
                 d_model: 128,
@@ -1625,8 +1621,7 @@ mod tests {
             rope_style: RopeStyle::HalfSplit,
             gqa_group_size: 1,
             tree_mask: false,
-            gpu_sm: 75,
-            csha: Some(CshaExtras {
+            gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras {
                 fused_projections: true,
                 save_activations_for_backward: false,
                 d_model: 128,

@@ -174,8 +174,7 @@ fn backward_prelude_ptxas_clean_sm75_sm90_sm120() {
         block_q: 32, block_kv: 32, head_dim: 32,
         causal: false, paged: false, rope_q: false,
         rope_style: RopeStyle::HalfSplit,
-        gqa_group_size: 1, tree_mask: false, gpu_sm: 75,
-        csha: Some(CshaExtras {
+        gqa_group_size: 1, tree_mask: false, gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras {
             fused_projections: true,
             save_activations_for_backward: true,
             d_model: 32,
@@ -214,8 +213,7 @@ fn backward_prelude_plus_q_load_ptxas_clean_sm75_sm90_sm120() {
         block_q: 32, block_kv: 32, head_dim: 32,
         causal: false, paged: false, rope_q: false,
         rope_style: RopeStyle::HalfSplit,
-        gqa_group_size: 1, tree_mask: false, gpu_sm: 75,
-        csha: Some(CshaExtras {
+        gqa_group_size: 1, tree_mask: false, gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras {
             fused_projections: true,
             save_activations_for_backward: true,
             d_model: 32,
@@ -255,8 +253,7 @@ fn backward_prelude_qload_ds_compute_ptxas_clean_sm75_sm90_sm120() {
             block_q: 32, block_kv: 32, head_dim: 32,
             causal, paged: false, rope_q: false,
             rope_style: RopeStyle::HalfSplit,
-            gqa_group_size: 1, tree_mask: false, gpu_sm: 75,
-            csha: Some(CshaExtras {
+            gqa_group_size: 1, tree_mask: false, gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras {
                 fused_projections: true,
                 save_activations_for_backward: true,
                 d_model: 32,
@@ -294,8 +291,7 @@ fn backward_prelude_qload_ds_dv_ptxas_clean_sm75_sm90_sm120() {
         block_q: 32, block_kv: 32, head_dim: 32,
         causal: false, paged: false, rope_q: false,
         rope_style: RopeStyle::HalfSplit,
-        gqa_group_size: 1, tree_mask: false, gpu_sm: 75,
-        csha: Some(CshaExtras {
+        gqa_group_size: 1, tree_mask: false, gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras {
             fused_projections: true,
             save_activations_for_backward: true,
             d_model: 32,
@@ -331,8 +327,7 @@ fn backward_through_dqdk_accum_ptxas_clean_sm75_sm90_sm120() {
         block_q: 32, block_kv: 32, head_dim: 32,
         causal: false, paged: false, rope_q: false,
         rope_style: RopeStyle::HalfSplit,
-        gqa_group_size: 1, tree_mask: false, gpu_sm: 75,
-        csha: Some(CshaExtras {
+        gqa_group_size: 1, tree_mask: false, gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras {
             fused_projections: true,
             save_activations_for_backward: true,
             d_model: 32,
@@ -369,8 +364,7 @@ fn backward_through_csha_hooks_ptxas_clean_sm75_sm90_sm120() {
         block_q: 32, block_kv: 32, head_dim: 32,
         causal: false, paged: false, rope_q: true,
         rope_style: RopeStyle::Adjacent,
-        gqa_group_size: 1, tree_mask: false, gpu_sm: 75,
-        csha: Some(CshaExtras {
+        gqa_group_size: 1, tree_mask: false, gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras {
             fused_projections: true,
             save_activations_for_backward: true,
             d_model: 32,
@@ -410,8 +404,7 @@ fn backward_full_pipeline_ptxas_clean_sm75_sm90_sm120() {
             block_q: 32, block_kv: 32, head_dim: 32,
             causal, paged: false, rope_q,
             rope_style: RopeStyle::Adjacent,
-            gqa_group_size: 1, tree_mask: false, gpu_sm: 75,
-            csha: Some(CshaExtras {
+            gqa_group_size: 1, tree_mask: false, gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras {
                 fused_projections: true,
                 save_activations_for_backward: true,
                 d_model: 32,
@@ -454,8 +447,7 @@ fn synthesize_backward_orchestrator_ptxas_clean_sm75_sm90_sm120() {
             block_q: 32, block_kv: 32, head_dim: 32,
             causal, paged: false, rope_q,
             rope_style: RopeStyle::Adjacent,
-            gqa_group_size: 1, tree_mask: false, gpu_sm: 75,
-            csha: Some(CshaExtras {
+            gqa_group_size: 1, tree_mask: false, gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras {
                 fused_projections: true,
                 save_activations_for_backward: true,
                 d_model: 32,

@@ -894,6 +894,7 @@ fn build_flash_config(
         gqa_group_size,
         tree_mask: false,
         gpu_sm: 80,
+        segment_masked: false,
         csha,
     }
 }

@@ -58,8 +58,7 @@ fn ok_config() -> FlashAttentionConfig {
         rope_style: RopeStyle::HalfSplit,
         gqa_group_size: 1,
         tree_mask: false,
-        gpu_sm: 75,
-        csha: Some(CshaExtras {
+        gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras {
             fused_projections: true,
             save_activations_for_backward: true,
             d_model: 32,
@@ -79,8 +78,7 @@ fn over_budget_config() -> FlashAttentionConfig {
         rope_style: RopeStyle::HalfSplit,
         gqa_group_size: 1,
         tree_mask: false,
-        gpu_sm: 75,
-        csha: Some(CshaExtras {
+        gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras {
             fused_projections: true,
             save_activations_for_backward: true,
             d_model: 64,
@@ -243,8 +241,7 @@ fn non_smoke_config_records_event_with_scope_gate() {
         block_q: 32, block_kv: 32, head_dim: 64,
         causal: false, paged: false, rope_q: false,
         rope_style: RopeStyle::HalfSplit,
-        gqa_group_size: 1, tree_mask: false, gpu_sm: 75,
-        csha: Some(CshaExtras {
+        gqa_group_size: 1, tree_mask: false, gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras {
             fused_projections: true,
             save_activations_for_backward: true,
             d_model: 64,
@@ -334,8 +331,7 @@ fn gap_i1_training_config_clamps_plan_fusion_flags() {
         rope_style: RopeStyle::HalfSplit,
         gqa_group_size: 1,
         tree_mask: false,
-        gpu_sm: 75,
-        csha: Some(CshaExtras {
+        gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras {
             fused_projections: true,
             fused_output_proj: true,
             save_activations_for_backward: true,
@@ -364,8 +360,7 @@ fn gap_i1_training_config_clamps_plan_fusion_flags() {
         rope_style: RopeStyle::HalfSplit,
         gqa_group_size: 1,
         tree_mask: false,
-        gpu_sm: 75,
-        csha: Some(CshaExtras {
+        gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras {
             level: 1,
             fused_projections: false,
             fused_output_proj: false,

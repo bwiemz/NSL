@@ -24,8 +24,7 @@ fn snapshot_flash_attention_basic() {
         rope_style: nsl_codegen::flash_attention::RopeStyle::HalfSplit,
         gqa_group_size: 1,
         tree_mask: false,
-        gpu_sm: 80,
-    csha: None,
+        gpu_sm: 80, segment_masked: false, csha: None,
     };
     let ptx = nsl_codegen::flash_attention::synthesize_flash_attention_ptx(&config);
     let ptx_str = String::from_utf8_lossy(&ptx[..ptx.len().saturating_sub(1)]); // strip null
@@ -44,8 +43,7 @@ fn snapshot_flash_attention_paged() {
         rope_style: nsl_codegen::flash_attention::RopeStyle::HalfSplit,
         gqa_group_size: 1,
         tree_mask: false,
-        gpu_sm: 80,
-    csha: None,
+        gpu_sm: 80, segment_masked: false, csha: None,
     };
     let ptx = nsl_codegen::flash_attention::synthesize_flash_attention_ptx(&config);
     let ptx_str = String::from_utf8_lossy(&ptx[..ptx.len().saturating_sub(1)]);
@@ -64,8 +62,7 @@ fn snapshot_flash_attention_rope_gqa() {
         rope_style: nsl_codegen::flash_attention::RopeStyle::HalfSplit,
         gqa_group_size: 4,
         tree_mask: false,
-        gpu_sm: 80,
-    csha: None,
+        gpu_sm: 80, segment_masked: false, csha: None,
     };
     let ptx = nsl_codegen::flash_attention::synthesize_flash_attention_ptx(&config);
     let ptx_str = String::from_utf8_lossy(&ptx[..ptx.len().saturating_sub(1)]);
@@ -84,8 +81,7 @@ fn snapshot_flash_attention_tree_mask() {
         rope_style: nsl_codegen::flash_attention::RopeStyle::HalfSplit,
         gqa_group_size: 1,
         tree_mask: true,
-        gpu_sm: 80,
-    csha: None,
+        gpu_sm: 80, segment_masked: false, csha: None,
     };
     let ptx = nsl_codegen::flash_attention::synthesize_flash_attention_ptx(&config);
     let ptx_str = String::from_utf8_lossy(&ptx[..ptx.len().saturating_sub(1)]);
@@ -108,8 +104,7 @@ fn flash_attention_ptx_has_logsumexp_param() {
         rope_style: nsl_codegen::flash_attention::RopeStyle::HalfSplit,
         gqa_group_size: 1,
         tree_mask: false,
-        gpu_sm: 80,
-    csha: None,
+        gpu_sm: 80, segment_masked: false, csha: None,
     };
     let ptx = nsl_codegen::flash_attention::synthesize_flash_attention_ptx(&config);
     let ptx_str = String::from_utf8_lossy(&ptx);
@@ -133,8 +128,7 @@ fn flash_attention_ptx_loads_logsumexp_base() {
         rope_style: nsl_codegen::flash_attention::RopeStyle::HalfSplit,
         gqa_group_size: 1,
         tree_mask: false,
-        gpu_sm: 80,
-    csha: None,
+        gpu_sm: 80, segment_masked: false, csha: None,
     };
     let ptx = nsl_codegen::flash_attention::synthesize_flash_attention_ptx(&config);
     let ptx_str = String::from_utf8_lossy(&ptx);
@@ -158,8 +152,7 @@ fn flash_attention_ptx_computes_logsumexp() {
         rope_style: nsl_codegen::flash_attention::RopeStyle::HalfSplit,
         gqa_group_size: 1,
         tree_mask: false,
-        gpu_sm: 80,
-    csha: None,
+        gpu_sm: 80, segment_masked: false, csha: None,
     };
     let ptx = nsl_codegen::flash_attention::synthesize_flash_attention_ptx(&config);
     let ptx_str = String::from_utf8_lossy(&ptx);
@@ -207,8 +200,7 @@ fn flash_attention_ptx_logsumexp_has_bounds_check() {
         rope_style: nsl_codegen::flash_attention::RopeStyle::HalfSplit,
         gqa_group_size: 1,
         tree_mask: false,
-        gpu_sm: 80,
-    csha: None,
+        gpu_sm: 80, segment_masked: false, csha: None,
     };
     let ptx = nsl_codegen::flash_attention::synthesize_flash_attention_ptx(&config);
     let ptx_str = String::from_utf8_lossy(&ptx);
@@ -232,8 +224,7 @@ fn flash_attention_ptx_logsumexp_register_declarations() {
         rope_style: nsl_codegen::flash_attention::RopeStyle::HalfSplit,
         gqa_group_size: 1,
         tree_mask: false,
-        gpu_sm: 80,
-    csha: None,
+        gpu_sm: 80, segment_masked: false, csha: None,
     };
     let ptx = nsl_codegen::flash_attention::synthesize_flash_attention_ptx(&config);
     let ptx_str = String::from_utf8_lossy(&ptx);

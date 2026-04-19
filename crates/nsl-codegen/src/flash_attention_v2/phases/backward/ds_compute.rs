@@ -210,6 +210,7 @@ mod tests {
             causal: false, paged: false, rope_q: false,
             rope_style: RopeStyle::HalfSplit,
             gqa_group_size: 1, tree_mask: false, gpu_sm: 75,
+            segment_masked: false,
             csha: Some(CshaExtras {
                 fused_projections: true,
                 save_activations_for_backward: true,

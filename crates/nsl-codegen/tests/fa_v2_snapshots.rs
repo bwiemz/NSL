@@ -10,7 +10,7 @@ fn csha_canonical() -> FlashAttentionConfig {
         block_q: 32, block_kv: 32, head_dim: 32,
         causal: true, paged: false, rope_q: false,
         rope_style: RopeStyle::HalfSplit, gqa_group_size: 1,
-        tree_mask: false, gpu_sm: 75, csha: None,
+        tree_mask: false, gpu_sm: 75, segment_masked: false, csha: None,
     }
 }
 
@@ -19,7 +19,7 @@ fn non_csha_canonical() -> FlashAttentionConfig {
         block_q: 64, block_kv: 64, head_dim: 128,
         causal: true, paged: false, rope_q: false,
         rope_style: RopeStyle::HalfSplit, gqa_group_size: 1,
-        tree_mask: false, gpu_sm: 75, csha: None,
+        tree_mask: false, gpu_sm: 75, segment_masked: false, csha: None,
     }
 }
 
@@ -148,8 +148,7 @@ fn csha_l2_rope_config() -> FlashAttentionConfig {
         block_q: 32, block_kv: 32, head_dim: 32,
         causal: true, paged: false, rope_q: true,
         rope_style: RopeStyle::Adjacent, gqa_group_size: 1,  // emit_rope_pair_sweep implements Adjacent
-        tree_mask: false, gpu_sm: 75,
-        csha: Some(CshaExtras::level2(1e-5, 32)),
+        tree_mask: false, gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras::level2(1e-5, 32)),
     }
 }
 

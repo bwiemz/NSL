@@ -171,8 +171,7 @@ fn run_fused_backward_config(
         block_q: block_q as i64, block_kv: block_kv as i64, head_dim: hd as i64,
         causal, paged: false, rope_q,
         rope_style: RopeStyle::Adjacent,
-        gqa_group_size: 1, tree_mask: false, gpu_sm: 75,
-        csha: Some(CshaExtras {
+        gqa_group_size: 1, tree_mask: false, gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras {
             level: 2,
             fused_rmsnorm: true,
             fused_projections: true,
@@ -530,8 +529,7 @@ fn t6_3_matrix_sweep_numerical() {
                     block_q: bq as i64, block_kv: bkv as i64, head_dim: hd as i64,
                     causal, paged: false, rope_q,
                     rope_style: RopeStyle::Adjacent,
-                    gqa_group_size: 1, tree_mask: false, gpu_sm: 75,
-                    csha: Some(CshaExtras {
+                    gqa_group_size: 1, tree_mask: false, gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras {
                         level: 2, fused_rmsnorm: true, fused_projections: true,
                         fused_output_proj: false,
                         save_activations_for_backward: true,
