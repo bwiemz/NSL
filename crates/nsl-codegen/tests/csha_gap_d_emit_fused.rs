@@ -1381,6 +1381,7 @@ fn gap_i_step_k_dgamma_accumulates_into_gamma_adjoint() {
         rope_style: RopeStyle::HalfSplit,
         gqa_group_size: 1,
         tree_mask: false,
+        segment_masked: false,
         gpu_sm: 75,
         csha: Some(CshaExtras {
             level: 1,
