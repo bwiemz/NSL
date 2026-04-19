@@ -428,15 +428,21 @@ pub struct Compiler<'a> {
     pub flash_attn_bwd_cache: HashMap<Value, Value>,
     /// Gap C (CSHA fused backward): seven-slot side-channel keyed by the
     /// Cranelift Value Gap D chooses as the "chain key" (see
-    /// `PrimalOp::CshaFusedBackwardExtract` in `wengert.rs`).  The seven
-    /// slots map to dq, dk, dv, dwq, dwk, dwv, dx — one Cranelift Value
-    /// each, produced by the fused CSHA backward launch that Gap D will
-    /// emit inside `AdjointGenerator::generate`'s EmitFused arm.
+    /// `PrimalOp::CshaFusedBackwardExtract` in `wengert.rs`).  The eight
+    /// slots map to dq, dk, dv, dwq, dwk, dwv, dx, dx_norm — one Cranelift
+    /// Value each, produced by the fused CSHA backward launch that Gap D
+    /// emits inside `AdjointGenerator::generate`'s EmitFused arm.
+    ///
+    /// Slot 7 (`dx_norm`) was added by the Gap I.5 Option-A fix so the
+    /// AD-side `RmsNormGammaBackward` receives the correct semantic input
+    /// (gradient w.r.t. the RMSNorm output). Previously slot 6 (`dx_raw`)
+    /// was fed to dgamma, producing numerically incorrect gradients when
+    /// the CSHA dispatcher claim fired on programs with trainable gamma.
     ///
     /// Gap C lands the storage so Gap D can populate it without further
     /// plumbing work.  The `wengert_lower.rs` extract arm reads from this
-    /// cache and evicts on the last component (dx / component=6).
-    pub csha_fused_bwd_cache: HashMap<Value, [Value; 7]>,
+    /// cache and evicts on the last component (dx_norm / component=7).
+    pub csha_fused_bwd_cache: HashMap<Value, [Value; 8]>,
 
     // ── WRGA side-channel (Milestone A) ─────────────────────────────
     /// WRGA decorator configs for this compile, forwarded from `CompileOptions`.

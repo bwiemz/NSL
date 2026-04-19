@@ -270,6 +270,12 @@ fn run_fused_backward_config(
     let dwk_dev = unsafe { nsl_test_cuda_alloc(dw_bytes) };
     let dwv_dev = unsafe { nsl_test_cuda_alloc(dw_bytes) };
     let dx_dev = unsafe { nsl_test_cuda_alloc(dx_bytes) };
+    // Gap I.5 Option A: 8th gradient output buffer (dx_norm — gradient
+    // w.r.t. the RMSNorm OUTPUT). f32, shape [batch, seq, d_model]; under
+    // the smoke scope this matches the existing `dx_bytes` sizing because
+    // `seq * d_model == h * seq * hd` (heads=1, d_model=hd).
+    let dxn_bytes = (batch * seq * dm * 4) as i64;
+    let dxn_dev = unsafe { nsl_test_cuda_alloc(dxn_bytes) };
 
     let saves = unsafe {
         nsl_csha_alloc_backward_activations(
@@ -280,6 +286,7 @@ fn run_fused_backward_config(
         q_dev, k_dev, v_dev, out_dev, lse_dev, x_dev, nw_dev,
         wq_dev, wk_dev, wv_dev, cos_dev, sin_dev,
         do_dev, dq_dev, dk_dev, dv_dev, dwq_dev, dwk_dev, dwv_dev, dx_dev,
+        dxn_dev,
     ];
 
     unsafe {
@@ -358,6 +365,7 @@ fn run_fused_backward_config(
             saves.x_raw,
             do_dev, dq_dev, dk_dev, dv_dev,
             dwq_dev, dwk_dev, dwv_dev, dx_dev,
+            dxn_dev,
         )
     };
     if rc_bwd != 0 {

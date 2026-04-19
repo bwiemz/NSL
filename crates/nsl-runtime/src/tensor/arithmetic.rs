@@ -83,7 +83,23 @@ pub extern "C" fn nsl_tensor_add(a: i64, b: i64, flags: u8) -> i64 {
         let tb = unsafe { &*(b as *const NslTensor) };
         if relinq_a && ta.shape_eq(tb) && ta.dtype == tb.dtype && tb.is_contiguous() {
             let len = ta.len as usize;
-            if ta.dtype == 1 {
+            if ta.dtype == crate::tensor::DTYPE_FP16 {
+                let da = ta.data as *mut u16;
+                let db = tb.data as *const u16;
+                for i in 0..len {
+                    let av = crate::tensor::f16_bits_to_f32(unsafe { *da.add(i) });
+                    let bv = crate::tensor::f16_bits_to_f32(unsafe { *db.add(i) });
+                    unsafe { *da.add(i) = crate::tensor::f32_to_f16_bits(av + bv) };
+                }
+            } else if ta.dtype == crate::tensor::DTYPE_BF16 {
+                let da = ta.data as *mut u16;
+                let db = tb.data as *const u16;
+                for i in 0..len {
+                    let av = crate::tensor::bf16_bits_to_f32(unsafe { *da.add(i) });
+                    let bv = crate::tensor::bf16_bits_to_f32(unsafe { *db.add(i) });
+                    unsafe { *da.add(i) = crate::tensor::f32_to_bf16_bits(av + bv) };
+                }
+            } else if ta.dtype == 1 {
                 let da = ta.data as *mut f32;
                 let db = tb.data as *const f32;
                 for i in 0..len { unsafe { *da.add(i) += *db.add(i) }; }
@@ -176,7 +192,23 @@ pub extern "C" fn nsl_tensor_sub(a: i64, b: i64, flags: u8) -> i64 {
         let tb = unsafe { &*(b as *const NslTensor) };
         if relinq_a && ta.shape_eq(tb) && ta.dtype == tb.dtype && tb.is_contiguous() {
             let len = ta.len as usize;
-            if ta.dtype == 1 {
+            if ta.dtype == crate::tensor::DTYPE_FP16 {
+                let da = ta.data as *mut u16;
+                let db = tb.data as *const u16;
+                for i in 0..len {
+                    let av = crate::tensor::f16_bits_to_f32(unsafe { *da.add(i) });
+                    let bv = crate::tensor::f16_bits_to_f32(unsafe { *db.add(i) });
+                    unsafe { *da.add(i) = crate::tensor::f32_to_f16_bits(av - bv) };
+                }
+            } else if ta.dtype == crate::tensor::DTYPE_BF16 {
+                let da = ta.data as *mut u16;
+                let db = tb.data as *const u16;
+                for i in 0..len {
+                    let av = crate::tensor::bf16_bits_to_f32(unsafe { *da.add(i) });
+                    let bv = crate::tensor::bf16_bits_to_f32(unsafe { *db.add(i) });
+                    unsafe { *da.add(i) = crate::tensor::f32_to_bf16_bits(av - bv) };
+                }
+            } else if ta.dtype == 1 {
                 let da = ta.data as *mut f32;
                 let db = tb.data as *const f32;
                 for i in 0..len { unsafe { *da.add(i) -= *db.add(i) }; }
@@ -254,7 +286,23 @@ pub extern "C" fn nsl_tensor_mul(a: i64, b: i64, flags: u8) -> i64 {
         let tb = unsafe { &*(b as *const NslTensor) };
         if relinq_a && ta.shape_eq(tb) && ta.dtype == tb.dtype && tb.is_contiguous() {
             let len = ta.len as usize;
-            if ta.dtype == 1 {
+            if ta.dtype == crate::tensor::DTYPE_FP16 {
+                let da = ta.data as *mut u16;
+                let db = tb.data as *const u16;
+                for i in 0..len {
+                    let av = crate::tensor::f16_bits_to_f32(unsafe { *da.add(i) });
+                    let bv = crate::tensor::f16_bits_to_f32(unsafe { *db.add(i) });
+                    unsafe { *da.add(i) = crate::tensor::f32_to_f16_bits(av * bv) };
+                }
+            } else if ta.dtype == crate::tensor::DTYPE_BF16 {
+                let da = ta.data as *mut u16;
+                let db = tb.data as *const u16;
+                for i in 0..len {
+                    let av = crate::tensor::bf16_bits_to_f32(unsafe { *da.add(i) });
+                    let bv = crate::tensor::bf16_bits_to_f32(unsafe { *db.add(i) });
+                    unsafe { *da.add(i) = crate::tensor::f32_to_bf16_bits(av * bv) };
+                }
+            } else if ta.dtype == 1 {
                 let da = ta.data as *mut f32;
                 let db = tb.data as *const f32;
                 for i in 0..len { unsafe { *da.add(i) *= *db.add(i) }; }
@@ -342,7 +390,23 @@ pub extern "C" fn nsl_tensor_div(a: i64, b: i64, flags: u8) -> i64 {
         let tb = unsafe { &*(b as *const NslTensor) };
         if relinq_a && ta.shape_eq(tb) && ta.dtype == tb.dtype && tb.is_contiguous() {
             let len = ta.len as usize;
-            if ta.dtype == 1 {
+            if ta.dtype == crate::tensor::DTYPE_FP16 {
+                let da = ta.data as *mut u16;
+                let db = tb.data as *const u16;
+                for i in 0..len {
+                    let av = crate::tensor::f16_bits_to_f32(unsafe { *da.add(i) });
+                    let bv = crate::tensor::f16_bits_to_f32(unsafe { *db.add(i) });
+                    unsafe { *da.add(i) = crate::tensor::f32_to_f16_bits(av / bv) };
+                }
+            } else if ta.dtype == crate::tensor::DTYPE_BF16 {
+                let da = ta.data as *mut u16;
+                let db = tb.data as *const u16;
+                for i in 0..len {
+                    let av = crate::tensor::bf16_bits_to_f32(unsafe { *da.add(i) });
+                    let bv = crate::tensor::bf16_bits_to_f32(unsafe { *db.add(i) });
+                    unsafe { *da.add(i) = crate::tensor::f32_to_bf16_bits(av / bv) };
+                }
+            } else if ta.dtype == 1 {
                 let da = ta.data as *mut f32;
                 let db = tb.data as *const f32;
                 for i in 0..len { unsafe { *da.add(i) /= *db.add(i) }; }
@@ -416,7 +480,19 @@ pub extern "C" fn nsl_tensor_neg(a_ptr: i64) -> i64 {
         let t = unsafe { &mut *(a_ptr as *mut NslTensor) };
         if t.can_mutate_inplace() {
             let len = t.len as usize;
-            if t.dtype == 1 {
+            if t.dtype == crate::tensor::DTYPE_FP16 {
+                let d = t.data as *mut u16;
+                for i in 0..len {
+                    let v = crate::tensor::f16_bits_to_f32(unsafe { *d.add(i) });
+                    unsafe { *d.add(i) = crate::tensor::f32_to_f16_bits(-v) };
+                }
+            } else if t.dtype == crate::tensor::DTYPE_BF16 {
+                let d = t.data as *mut u16;
+                for i in 0..len {
+                    let v = crate::tensor::bf16_bits_to_f32(unsafe { *d.add(i) });
+                    unsafe { *d.add(i) = crate::tensor::f32_to_bf16_bits(-v) };
+                }
+            } else if t.dtype == 1 {
                 let d = t.data as *mut f32;
                 for i in 0..len { unsafe { *d.add(i) = -(*d.add(i)) }; }
             } else {
@@ -436,7 +512,23 @@ pub extern "C" fn nsl_tensor_neg(a_ptr: i64) -> i64 {
     let shape = NslTensor::copy_shape(a.shape, ndim);
     let strides = NslTensor::compute_strides(shape, ndim);
 
-    let data: *mut c_void = if a.dtype == 1 {
+    let data: *mut c_void = if a.dtype == crate::tensor::DTYPE_FP16 {
+        let buf = checked_alloc((len as usize) * std::mem::size_of::<u16>()) as *mut u16;
+        let src = a.data as *const u16;
+        for i in 0..len as usize {
+            let v = crate::tensor::f16_bits_to_f32(unsafe { *src.add(i) });
+            unsafe { *buf.add(i) = crate::tensor::f32_to_f16_bits(-v) };
+        }
+        buf as *mut c_void
+    } else if a.dtype == crate::tensor::DTYPE_BF16 {
+        let buf = checked_alloc((len as usize) * std::mem::size_of::<u16>()) as *mut u16;
+        let src = a.data as *const u16;
+        for i in 0..len as usize {
+            let v = crate::tensor::bf16_bits_to_f32(unsafe { *src.add(i) });
+            unsafe { *buf.add(i) = crate::tensor::f32_to_bf16_bits(-v) };
+        }
+        buf as *mut c_void
+    } else if a.dtype == 1 {
         let buf = checked_alloc((len as usize) * std::mem::size_of::<f32>()) as *mut f32;
         for i in 0..len as usize {
             unsafe { *buf.add(i) = -(*a.data_f32().add(i)) };
@@ -506,7 +598,21 @@ pub extern "C" fn nsl_tensor_add_scalar(a_ptr: i64, s: f64, flags: u8) -> i64 {
         let t = unsafe { &mut *(a_ptr as *mut NslTensor) };
         if t.dtype != 4 && relinq_a {
             let len = t.len as usize;
-            if t.dtype == 1 {
+            if t.dtype == crate::tensor::DTYPE_FP16 {
+                let d = t.data as *mut u16;
+                let sf = s as f32;
+                for i in 0..len {
+                    let v = crate::tensor::f16_bits_to_f32(unsafe { *d.add(i) });
+                    unsafe { *d.add(i) = crate::tensor::f32_to_f16_bits(v + sf) };
+                }
+            } else if t.dtype == crate::tensor::DTYPE_BF16 {
+                let d = t.data as *mut u16;
+                let sf = s as f32;
+                for i in 0..len {
+                    let v = crate::tensor::bf16_bits_to_f32(unsafe { *d.add(i) });
+                    unsafe { *d.add(i) = crate::tensor::f32_to_bf16_bits(v + sf) };
+                }
+            } else if t.dtype == 1 {
                 let d = t.data as *mut f32;
                 let sf = s as f32;
                 for i in 0..len { unsafe { *d.add(i) += sf }; }
@@ -536,6 +642,24 @@ pub extern "C" fn nsl_tensor_add_scalar(a_ptr: i64, s: f64, flags: u8) -> i64 {
         let sf = s as f32;
         for i in 0..len as usize {
             unsafe { *buf.add(i) = (*src.add(i) as f32) + sf };
+        }
+        buf as *mut c_void
+    } else if a.dtype == crate::tensor::DTYPE_FP16 {
+        let buf = checked_alloc((len as usize) * std::mem::size_of::<u16>()) as *mut u16;
+        let src = a.data as *const u16;
+        let sf = s as f32;
+        for i in 0..len as usize {
+            let v = crate::tensor::f16_bits_to_f32(unsafe { *src.add(i) });
+            unsafe { *buf.add(i) = crate::tensor::f32_to_f16_bits(v + sf) };
+        }
+        buf as *mut c_void
+    } else if a.dtype == crate::tensor::DTYPE_BF16 {
+        let buf = checked_alloc((len as usize) * std::mem::size_of::<u16>()) as *mut u16;
+        let src = a.data as *const u16;
+        let sf = s as f32;
+        for i in 0..len as usize {
+            let v = crate::tensor::bf16_bits_to_f32(unsafe { *src.add(i) });
+            unsafe { *buf.add(i) = crate::tensor::f32_to_bf16_bits(v + sf) };
         }
         buf as *mut c_void
     } else if a.dtype == 1 {
@@ -600,7 +724,22 @@ pub extern "C" fn nsl_tensor_mul_scalar(a_ptr: i64, s: f64, flags: u8) -> i64 {
         let t = unsafe { &mut *(a_ptr as *mut NslTensor) };
         if relinq_a {
             let len = t.len as usize;
-            if t.dtype == 1 {
+            if t.dtype == crate::tensor::DTYPE_FP16 {
+                // f16 in-place scalar mul: widen to f32, multiply, narrow back.
+                let d = t.data as *mut u16;
+                let sf = s as f32;
+                for i in 0..len {
+                    let v = crate::tensor::f16_bits_to_f32(unsafe { *d.add(i) });
+                    unsafe { *d.add(i) = crate::tensor::f32_to_f16_bits(v * sf) };
+                }
+            } else if t.dtype == crate::tensor::DTYPE_BF16 {
+                let d = t.data as *mut u16;
+                let sf = s as f32;
+                for i in 0..len {
+                    let v = crate::tensor::bf16_bits_to_f32(unsafe { *d.add(i) });
+                    unsafe { *d.add(i) = crate::tensor::f32_to_bf16_bits(v * sf) };
+                }
+            } else if t.dtype == 1 {
                 let d = t.data as *mut f32;
                 let sf = s as f32;
                 for i in 0..len { unsafe { *d.add(i) *= sf }; }
@@ -621,7 +760,26 @@ pub extern "C" fn nsl_tensor_mul_scalar(a_ptr: i64, s: f64, flags: u8) -> i64 {
     let shape = NslTensor::copy_shape(a.shape, ndim);
     let strides = NslTensor::compute_strides(shape, ndim);
 
-    let data: *mut c_void = if a.dtype == 1 {
+    let data: *mut c_void = if a.dtype == crate::tensor::DTYPE_FP16 {
+        // f16 out-of-place scalar mul — same widen/narrow pattern as the in-place branch.
+        let buf = checked_alloc((len as usize) * std::mem::size_of::<u16>()) as *mut u16;
+        let sf = s as f32;
+        let src = a.data as *const u16;
+        for i in 0..len as usize {
+            let v = crate::tensor::f16_bits_to_f32(unsafe { *src.add(i) });
+            unsafe { *buf.add(i) = crate::tensor::f32_to_f16_bits(v * sf) };
+        }
+        buf as *mut c_void
+    } else if a.dtype == crate::tensor::DTYPE_BF16 {
+        let buf = checked_alloc((len as usize) * std::mem::size_of::<u16>()) as *mut u16;
+        let sf = s as f32;
+        let src = a.data as *const u16;
+        for i in 0..len as usize {
+            let v = crate::tensor::bf16_bits_to_f32(unsafe { *src.add(i) });
+            unsafe { *buf.add(i) = crate::tensor::f32_to_bf16_bits(v * sf) };
+        }
+        buf as *mut c_void
+    } else if a.dtype == 1 {
         let buf = checked_alloc((len as usize) * std::mem::size_of::<f32>()) as *mut f32;
         for i in 0..len as usize {
             unsafe { *buf.add(i) = *a.data_f32().add(i) * (s as f32) };

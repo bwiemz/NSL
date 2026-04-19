@@ -220,6 +220,72 @@ pub(crate) fn dtype_element_size(dtype: u16) -> usize {
     }
 }
 
+/// Convert IEEE 754 half-precision (f16) bits to f32.
+/// Dedicated bit-twiddling fallback so callers can read f16 tensors on
+/// hosts where the `half` crate isn't compiled in (e.g. `--features cuda`
+/// without `--features interop`). Handles subnormals, NaN, and ±Inf.
+#[inline]
+pub(crate) fn f16_bits_to_f32(bits: u16) -> f32 {
+    let sign = ((bits >> 15) as u32) << 31;
+    let exp = ((bits >> 10) & 0x1F) as u32;
+    let mant = (bits & 0x3FF) as u32;
+    if exp == 0 {
+        if mant == 0 {
+            return f32::from_bits(sign);
+        }
+        let mut e = 1u32;
+        let mut m = mant;
+        while (m & 0x400) == 0 {
+            m <<= 1;
+            e += 1;
+        }
+        let f_exp = (127 - 15 + 1 - e) << 23;
+        let f_mant = (m & 0x3FF) << 13;
+        f32::from_bits(sign | f_exp | f_mant)
+    } else if exp == 31 {
+        f32::from_bits(sign | 0x7F80_0000 | (mant << 13))
+    } else {
+        let f_exp = (exp + 127 - 15) << 23;
+        f32::from_bits(sign | f_exp | (mant << 13))
+    }
+}
+
+/// Convert f32 to IEEE 754 half-precision (f16) bits (round-to-nearest-even on truncation).
+/// Mirror of `f16_bits_to_f32`; saturates to ±Inf on overflow, flushes to zero on underflow.
+#[inline]
+pub(crate) fn f32_to_f16_bits(val: f32) -> u16 {
+    let bits = val.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let exp = ((bits >> 23) & 0xFF) as i32;
+    let mant = bits & 0x7F_FFFF;
+    if exp >= 143 {
+        return sign | 0x7C00;
+    }
+    if exp <= 102 {
+        return sign;
+    }
+    if exp <= 112 {
+        let shift = 113 - exp;
+        let m = (0x80_0000 | mant) >> (shift + 13);
+        return sign | m as u16;
+    }
+    let f16_exp = ((exp - 112) as u16) << 10;
+    let f16_mant = (mant >> 13) as u16;
+    sign | f16_exp | f16_mant
+}
+
+/// Convert bfloat16 bits to f32 — bf16 is just the top 16 bits of f32.
+#[inline]
+pub(crate) fn bf16_bits_to_f32(bits: u16) -> f32 {
+    f32::from_bits((bits as u32) << 16)
+}
+
+/// Convert f32 to bf16 bits (truncate lower 16 bits).
+#[inline]
+pub(crate) fn f32_to_bf16_bits(val: f32) -> u16 {
+    (val.to_bits() >> 16) as u16
+}
+
 /// Metadata for a user-defined custom datatype
 pub struct CustomDtypeInfo {
     pub id: u16,
@@ -379,6 +445,74 @@ impl NslTensor {
         self.data as *mut f32
     }
 
+    /// Raw pointer to the tensor's u16 storage (bits) for f16/bf16 tensors.
+    /// Callers must convert through `f16_bits_to_f32` / `bf16_bits_to_f32`
+    /// (or the `half` crate if available) before doing math.
+    #[allow(dead_code)]
+    #[inline]
+    pub(crate) fn data_f16_bits(&self) -> *mut u16 {
+        assert!(
+            self.dtype == DTYPE_FP16 || self.dtype == DTYPE_BF16,
+            "data_f16_bits() called on non-16-bit-float tensor (dtype={})",
+            self.dtype,
+        );
+        self.data as *mut u16
+    }
+
+    /// Decode the tensor's raw storage into an owned `Vec<f64>` regardless of dtype.
+    /// Handles f64, f32, f16, bf16, i32, and u16 token buffers. The returned vec
+    /// always has exactly `self.len` elements in row-major order. Intended for
+    /// callers (optimizers, CPU ops) that need to consume numeric values without
+    /// hard-asserting a specific storage dtype.
+    #[allow(dead_code)]
+    pub(crate) fn as_f64_owned(&self) -> Vec<f64> {
+        let len = self.len as usize;
+        let mut out = Vec::with_capacity(len);
+        match self.dtype {
+            DTYPE_F64 => {
+                let p = self.data as *const f64;
+                for i in 0..len {
+                    out.push(unsafe { *p.add(i) });
+                }
+            }
+            DTYPE_F32 => {
+                let p = self.data as *const f32;
+                for i in 0..len {
+                    out.push(unsafe { *p.add(i) as f64 });
+                }
+            }
+            DTYPE_FP16 => {
+                let p = self.data as *const u16;
+                for i in 0..len {
+                    out.push(f16_bits_to_f32(unsafe { *p.add(i) }) as f64);
+                }
+            }
+            DTYPE_BF16 => {
+                let p = self.data as *const u16;
+                for i in 0..len {
+                    out.push(bf16_bits_to_f32(unsafe { *p.add(i) }) as f64);
+                }
+            }
+            DTYPE_U16_TOKEN => {
+                let p = self.data as *const u16;
+                for i in 0..len {
+                    out.push(unsafe { *p.add(i) as f64 });
+                }
+            }
+            4 => {
+                let p = self.data as *const i32;
+                for i in 0..len {
+                    out.push(unsafe { *p.add(i) as f64 });
+                }
+            }
+            _ => panic!(
+                "as_f64_owned() unsupported for dtype {} (len={})",
+                self.dtype, self.len
+            ),
+        }
+        out
+    }
+
     #[allow(dead_code)]
     #[inline]
     pub(crate) fn data_i32(&self) -> *mut i32 {
@@ -391,6 +525,14 @@ impl NslTensor {
         match self.dtype {
             4 => unsafe { *(self.data as *const i32).add(offset) as f64 },
             DTYPE_U16_TOKEN => unsafe { *(self.data as *const u16).add(offset) as f64 },
+            DTYPE_FP16 => {
+                let bits = unsafe { *(self.data as *const u16).add(offset) };
+                f16_bits_to_f32(bits) as f64
+            }
+            DTYPE_BF16 => {
+                let bits = unsafe { *(self.data as *const u16).add(offset) };
+                bf16_bits_to_f32(bits) as f64
+            }
             1 => unsafe { *self.data_f32().add(offset) as f64 },
             0 => unsafe { *self.data_f64().add(offset) },
             _ => panic!("read_scalar_as_f64() unsupported for dtype {}", self.dtype),
@@ -433,6 +575,14 @@ impl NslTensor {
                     value,
                 );
                 unsafe { *(self.data as *mut u16).add(offset) = value as u16 };
+            }
+            DTYPE_FP16 => {
+                let bits = f32_to_f16_bits(value as f32);
+                unsafe { *(self.data as *mut u16).add(offset) = bits };
+            }
+            DTYPE_BF16 => {
+                let bits = f32_to_bf16_bits(value as f32);
+                unsafe { *(self.data as *mut u16).add(offset) = bits };
             }
             1 => unsafe { *self.data_f32().add(offset) = value as f32 },
             0 => unsafe { *self.data_f64().add(offset) = value },
