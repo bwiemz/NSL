@@ -3050,10 +3050,13 @@ pub struct FlashAttentionBackwardConfig {
     pub head_dim: i64,
     pub causal: bool,
     pub gpu_sm: u32,
-    /// PCA Tier A: when `true`, the emitter produces a segment-aware
-    /// attention kernel that masks `S[i, j]` by
-    /// `segment_ids[i] == segment_ids[j]` alongside the causal mask.
-    /// Mutually exclusive with `paged: true` (spec §3.2).
+    /// PCA Tier A: propagated from the upstream
+    /// `FlashAttentionConfig::segment_masked`. When `true`, the
+    /// backward kernel accepts a `segment_ids: *const u16` parameter
+    /// and masks `dS[i, j]` by `segment_ids[i] == segment_ids[j]`
+    /// alongside the causal mask (spec §3.4). No mutual-exclusion
+    /// check is needed here because backward configs are always
+    /// derived from a validated forward config.
     pub segment_masked: bool,
 }
 
@@ -7102,6 +7105,49 @@ mod tests {
             "prologue at offset {} must precede Q tile load at offset {}",
             prologue_idx,
             q_load_idx
+        );
+    }
+
+    // ── FlashAttentionConfig::validate() tests ────────────────────────
+
+    #[test]
+    fn flash_attention_config_validate_rejects_paged_segment_masked_combo() {
+        // Spec §3.2 invariant: segment_masked + paged are mutually
+        // exclusive.
+        let mut cfg = FlashAttentionConfig {
+            block_q: 64,
+            block_kv: 64,
+            head_dim: 64,
+            causal: true,
+            paged: true,
+            rope_q: false,
+            rope_style: RopeStyle::HalfSplit,
+            gqa_group_size: 1,
+            tree_mask: false,
+            gpu_sm: 80,
+            segment_masked: false,
+            csha: None,
+        };
+
+        // Case 1: paged=true alone is fine.
+        assert!(cfg.validate().is_ok(), "paged alone should validate");
+
+        // Case 2: segment_masked alone is fine.
+        cfg.paged = false;
+        cfg.segment_masked = true;
+        assert!(cfg.validate().is_ok(), "segment_masked alone should validate");
+
+        // Case 3: both set together must error.
+        cfg.paged = true;
+        let result = cfg.validate();
+        assert!(
+            result.is_err(),
+            "segment_masked=true AND paged=true must error per spec §3.2"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("mutually exclusive"),
+            "error message should mention mutual exclusion, got: {err}"
         );
     }
 }

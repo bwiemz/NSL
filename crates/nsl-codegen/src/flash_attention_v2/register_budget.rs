@@ -15,7 +15,8 @@ pub const SM75_REGISTER_CAP: u32 = 255;
 ///   Softmax state:           5 regs (row_max, row_sum, correction, old_max, new_max)
 ///   Loop counters/scratch:   ~10 regs
 ///   RoPE extras (if rope_q): 4 regs (q_a, q_b, cos, sin)
-///   PCA segment (if segment_masked): 3 GPR scratch regs (spec §6.4)
+///   PCA segment (if segment_masked): 3 GPR scratch regs + 1 pred
+///                                    reg (ptxas-tallied separately)
 pub fn count_registers(config: &FlashAttentionConfig) -> u32 {
     let q_row         = (config.head_dim / 32) as u32;
     let s_scratch     = 1;
