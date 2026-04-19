@@ -1,7 +1,8 @@
 //! CPDT — quantized optimizer step codegen.
 //!
 //! Emits the structured op-program for a per-layer fused optimizer step
-//! that honours the [`PrecisionPlan`] from `cpdt_precision`.  Mirrors
+//! that honours the [`PrecisionPlan`] from `cpdt_tier_apply` (formerly
+//! `cpdt_precision`, renamed by the Phase 1 weight-aware refactor). Mirrors
 //! FASE's approach (paper §4 composition): the optimizer is inlined
 //! into the backward pass as a sequence of [`QuantizedOptimOp`]s that
 //! the downstream PTX / Cranelift emitters consume.
@@ -12,7 +13,7 @@
 
 use serde::Serialize;
 
-use crate::cpdt_precision::{OptimPrecision, ParamPrecision};
+use crate::cpdt_tier_apply::{OptimPrecision, ParamPrecision};
 
 /// One instruction in the fused optimizer program.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -152,7 +153,7 @@ pub fn emit_step(precision: &ParamPrecision, hyper: &AdamWHyperparams) -> Quanti
 
 /// Emit per-parameter programs for a whole precision plan.
 pub fn emit_plan(
-    plan: &crate::cpdt_precision::PrecisionPlan,
+    plan: &crate::cpdt_tier_apply::PrecisionPlan,
     hyper: &AdamWHyperparams,
 ) -> Vec<QuantizedOptimProgram> {
     plan.params.iter().map(|p| emit_step(p, hyper)).collect()
@@ -165,7 +166,7 @@ pub fn emit_plan(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cpdt_precision::{OptimPrecision, ParamPrecision, SensitivityTier};
+    use crate::cpdt_tier_apply::{OptimPrecision, ParamPrecision, SensitivityTier};
 
     fn param(name: &str, m: OptimPrecision, v: OptimPrecision, stoch: bool) -> ParamPrecision {
         ParamPrecision {
@@ -236,7 +237,7 @@ mod tests {
 
     #[test]
     fn emit_plan_has_one_program_per_param() {
-        use crate::cpdt_precision::PrecisionPlan;
+        use crate::cpdt_tier_apply::PrecisionPlan;
         let plan = PrecisionPlan {
             params: vec![
                 param("a", OptimPrecision::Fp32, OptimPrecision::Fp32, false),

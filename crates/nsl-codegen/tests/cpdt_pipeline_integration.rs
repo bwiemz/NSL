@@ -28,7 +28,7 @@ use nsl_codegen::cpdt::{run as cpdt_run, CpdtInput, CpdtMode};
 use nsl_codegen::cpdt_expert::ExpertConfig;
 use nsl_codegen::cpdt_joint::JointConfig;
 use nsl_codegen::cpdt_optim::AdamWHyperparams;
-use nsl_codegen::cpdt_precision::PrecisionConfig;
+use nsl_codegen::cpdt_tier_apply::PrecisionConfig;
 use nsl_codegen::cpdt_zero::{ClusterSpec, ModelSize};
 use nsl_codegen::wggo_apply::{AppliedLayer, AppliedPlan};
 use nsl_codegen::wggo_dp::LayerDecision as CoarseDecision;

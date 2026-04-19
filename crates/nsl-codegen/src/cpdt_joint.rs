@@ -12,7 +12,7 @@
 use serde::Serialize;
 
 use crate::cpdt_expert::{plan as plan_experts, ExpertConfig, ExpertPlan, MoeLayerShape};
-use crate::cpdt_precision::PrecisionPlan;
+use crate::cpdt_tier_apply::PrecisionPlan;
 use crate::cpdt_zero::{search as search_zero, ClusterSpec, ModelSize, ZeroEvaluation};
 use crate::weight_aware::WeightEntry;
 
@@ -94,6 +94,14 @@ pub struct JointInput<'a> {
 
 /// Run the iterative solver.
 pub fn solve(input: JointInput) -> JointPlan {
+    // NOTE: If this function is modified to read per-parameter fields from
+    // input.precision (scores, tiers, layer-specific data), the CPDT calibration
+    // contract tightens — see cpdt_sensitivity.rs ANALYSIS_VERSION rule. Today,
+    // this function reads only aggregate fields (total_optim_bytes, etc.); the
+    // tier-assignment byte-identity regression gate is sufficient because
+    // aggregates are derived from tier labels. Reading per-parameter fields
+    // directly would require a stricter calibration contract that preserves
+    // per-parameter score magnitudes, not just tier labels.
     let mut iterations = Vec::new();
     let mut last_obj: Option<f64> = None;
     let mut converged = false;
@@ -181,7 +189,7 @@ pub fn solve(input: JointInput) -> JointPlan {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cpdt_precision::PrecisionPlan;
+    use crate::cpdt_tier_apply::PrecisionPlan;
 
     fn tiny_model() -> ModelSize {
         ModelSize {

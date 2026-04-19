@@ -78,6 +78,10 @@ pub struct CpdtConfig {
     pub cluster: CpdtClusterSpec,
     pub target_memory_fraction: f64,
     pub precision: PrecisionMode,
+    /// When `false`, CPDT skips the sensitivity scorer entirely and falls
+    /// back to heuristic-only tier assignment (equivalent to pre-weight-
+    /// aware behavior). Default: `true`. Exposed via `@cpdt(weight_aware=false)`.
+    pub weight_aware: bool,
     pub span: Span,
 }
 
@@ -111,6 +115,7 @@ pub fn validate_cpdt_decorator(
     let mut cluster = CpdtClusterSpec::default();
     let mut target_memory = 0.8;
     let mut precision = PrecisionMode::Auto;
+    let mut weight_aware = true;
 
     if let Some(ref args) = deco.args {
         for arg in args {
@@ -199,6 +204,15 @@ pub fn validate_cpdt_decorator(
                     // warned about but don't abort.
                     decode_cluster_arg(&arg.value.kind, resolve_sym, &mut cluster, diagnostics, arg.span);
                 }
+                "weight_aware" => match &arg.value.kind {
+                    ExprKind::BoolLiteral(b) => weight_aware = *b,
+                    _ => diagnostics.push(
+                        Diagnostic::error(
+                            "@cpdt: weight_aware must be a bool literal".to_string(),
+                        )
+                        .with_label(arg.span, "expected true or false"),
+                    ),
+                },
                 _ => diagnostics.push(
                     Diagnostic::error(format!("@cpdt: unknown argument '{aname}'"))
                         .with_label(arg.span, "unknown argument"),
@@ -212,6 +226,7 @@ pub fn validate_cpdt_decorator(
         cluster,
         target_memory_fraction: target_memory,
         precision,
+        weight_aware,
         span: deco.span,
     })
 }
