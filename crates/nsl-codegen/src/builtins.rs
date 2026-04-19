@@ -1056,6 +1056,8 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
             types::I64, // rmsnorm_eps_bits (f32 as i64)
             types::I64, // active_heads
             types::I64, // d_model
+            // PCA Tier A: segment_ids device pointer (0 = unpacked path)
+            types::I64, // segment_ids_ptr
         ],
         Some(types::I64),
     ),
@@ -1093,6 +1095,8 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
             types::I64, // row_max_ptr
             types::I64, // row_sum_ptr
             types::I64, // x_raw_ptr
+            // PCA Tier A: segment_ids device pointer (0 = unpacked path)
+            types::I64, // segment_ids_ptr
         ],
         Some(types::I64),
     ),
