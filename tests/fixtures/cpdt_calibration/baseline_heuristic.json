@@ -1,0 +1,487 @@
+[
+  {
+    "fixture": "calib_tiny",
+    "tiers": [
+      {
+        "name": "blocks.0.attn.wk.weight",
+        "tier": "high",
+        "score": 0.000015506474058982536
+      },
+      {
+        "name": "blocks.0.attn.wo.weight",
+        "tier": "high",
+        "score": 0.00001532977953313866
+      },
+      {
+        "name": "blocks.0.attn.wq.weight",
+        "tier": "high",
+        "score": 0.00001523910633789134
+      },
+      {
+        "name": "blocks.0.attn.wv.weight",
+        "tier": "high",
+        "score": 0.000015233954266336663
+      },
+      {
+        "name": "blocks.0.attn_norm.weight",
+        "tier": "high",
+        "score": 0.015625
+      },
+      {
+        "name": "blocks.0.ffn.w_down.weight",
+        "tier": "high",
+        "score": 1.9165995436754517e-6
+      },
+      {
+        "name": "blocks.0.ffn.w_gate.weight",
+        "tier": "high",
+        "score": 3.826769973022525e-6
+      },
+      {
+        "name": "blocks.0.ffn.w_up.weight",
+        "tier": "high",
+        "score": 3.825965239818366e-6
+      },
+      {
+        "name": "blocks.0.ffn_norm.weight",
+        "tier": "high",
+        "score": 0.015625
+      },
+      {
+        "name": "blocks.1.attn.wk.weight",
+        "tier": "high",
+        "score": 0.000015188850587856904
+      },
+      {
+        "name": "blocks.1.attn.wo.weight",
+        "tier": "high",
+        "score": 0.00001535861090271735
+      },
+      {
+        "name": "blocks.1.attn.wq.weight",
+        "tier": "high",
+        "score": 0.000015214576740149833
+      },
+      {
+        "name": "blocks.1.attn.wv.weight",
+        "tier": "high",
+        "score": 0.00001522376259092464
+      },
+      {
+        "name": "blocks.1.attn_norm.weight",
+        "tier": "high",
+        "score": 0.015625
+      },
+      {
+        "name": "blocks.1.ffn.w_down.weight",
+        "tier": "high",
+        "score": 1.896160880397853e-6
+      },
+      {
+        "name": "blocks.1.ffn.w_gate.weight",
+        "tier": "high",
+        "score": 3.825256427867009e-6
+      },
+      {
+        "name": "blocks.1.ffn.w_up.weight",
+        "tier": "high",
+        "score": 3.8105494393738626e-6
+      },
+      {
+        "name": "blocks.1.ffn_norm.weight",
+        "tier": "high",
+        "score": 0.015625
+      },
+      {
+        "name": "norm.weight",
+        "tier": "high",
+        "score": 0.01171875
+      },
+      {
+        "name": "output.weight",
+        "tier": "very_low",
+        "score": 5.7169275722577605e-6
+      },
+      {
+        "name": "tok_embeddings.weight",
+        "tier": "high",
+        "score": 5.739323837551717e-6
+      }
+    ]
+  },
+  {
+    "fixture": "calib_small",
+    "tiers": [
+      {
+        "name": "blocks.0.attn.wk.weight",
+        "tier": "high",
+        "score": 4.7673313037840634e-7
+      },
+      {
+        "name": "blocks.0.attn.wo.weight",
+        "tier": "high",
+        "score": 4.769182359591202e-7
+      },
+      {
+        "name": "blocks.0.attn.wq.weight",
+        "tier": "high",
+        "score": 4.7595258014538877e-7
+      },
+      {
+        "name": "blocks.0.attn.wv.weight",
+        "tier": "high",
+        "score": 4.7643637567213555e-7
+      },
+      {
+        "name": "blocks.0.attn_norm.weight",
+        "tier": "high",
+        "score": 0.00390625
+      },
+      {
+        "name": "blocks.0.ffn.w_down.weight",
+        "tier": "high",
+        "score": 7.27596662672418e-8
+      },
+      {
+        "name": "blocks.0.ffn.w_gate.weight",
+        "tier": "high",
+        "score": 1.3628081460026789e-7
+      },
+      {
+        "name": "blocks.0.ffn.w_up.weight",
+        "tier": "high",
+        "score": 1.363202045449627e-7
+      },
+      {
+        "name": "blocks.0.ffn_norm.weight",
+        "tier": "high",
+        "score": 0.00390625
+      },
+      {
+        "name": "blocks.1.attn.wk.weight",
+        "tier": "very_low",
+        "score": 3.09488611999137e-7
+      },
+      {
+        "name": "blocks.1.attn.wo.weight",
+        "tier": "very_low",
+        "score": 3.0983115526117157e-7
+      },
+      {
+        "name": "blocks.1.attn.wq.weight",
+        "tier": "very_low",
+        "score": 3.102997899619955e-7
+      },
+      {
+        "name": "blocks.1.attn.wv.weight",
+        "tier": "very_low",
+        "score": 3.1114668285290756e-7
+      },
+      {
+        "name": "blocks.1.attn_norm.weight",
+        "tier": "high",
+        "score": 0.0025390625
+      },
+      {
+        "name": "blocks.1.ffn.w_down.weight",
+        "tier": "very_low",
+        "score": 4.729531844659304e-8
+      },
+      {
+        "name": "blocks.1.ffn.w_gate.weight",
+        "tier": "very_low",
+        "score": 8.863502833007189e-8
+      },
+      {
+        "name": "blocks.1.ffn.w_up.weight",
+        "tier": "very_low",
+        "score": 8.857342633713867e-8
+      },
+      {
+        "name": "blocks.1.ffn_norm.weight",
+        "tier": "high",
+        "score": 0.0025390625
+      },
+      {
+        "name": "blocks.2.attn.wk.weight",
+        "tier": "very_low",
+        "score": 2.3801103426661687e-7
+      },
+      {
+        "name": "blocks.2.attn.wo.weight",
+        "tier": "very_low",
+        "score": 2.3827401714596796e-7
+      },
+      {
+        "name": "blocks.2.attn.wq.weight",
+        "tier": "very_low",
+        "score": 2.386028733212544e-7
+      },
+      {
+        "name": "blocks.2.attn.wv.weight",
+        "tier": "very_low",
+        "score": 2.3865798203003e-7
+      },
+      {
+        "name": "blocks.2.attn_norm.weight",
+        "tier": "high",
+        "score": 0.001953125
+      },
+      {
+        "name": "blocks.2.ffn.w_down.weight",
+        "tier": "very_low",
+        "score": 3.6414844941250436e-8
+      },
+      {
+        "name": "blocks.2.ffn.w_gate.weight",
+        "tier": "very_low",
+        "score": 6.8058643352313e-8
+      },
+      {
+        "name": "blocks.2.ffn.w_up.weight",
+        "tier": "very_low",
+        "score": 6.816491212845764e-8
+      },
+      {
+        "name": "blocks.2.ffn_norm.weight",
+        "tier": "high",
+        "score": 0.001953125
+      },
+      {
+        "name": "blocks.3.attn.wk.weight",
+        "tier": "very_low",
+        "score": 2.3865607053631207e-7
+      },
+      {
+        "name": "blocks.3.attn.wo.weight",
+        "tier": "very_low",
+        "score": 2.3856732437817774e-7
+      },
+      {
+        "name": "blocks.3.attn.wq.weight",
+        "tier": "very_low",
+        "score": 2.3818572182993694e-7
+      },
+      {
+        "name": "blocks.3.attn.wv.weight",
+        "tier": "very_low",
+        "score": 2.3830049650514118e-7
+      },
+      {
+        "name": "blocks.3.attn_norm.weight",
+        "tier": "high",
+        "score": 0.001953125
+      },
+      {
+        "name": "blocks.3.ffn.w_down.weight",
+        "tier": "very_low",
+        "score": 3.643914102254587e-8
+      },
+      {
+        "name": "blocks.3.ffn.w_gate.weight",
+        "tier": "very_low",
+        "score": 6.820089213207889e-8
+      },
+      {
+        "name": "blocks.3.ffn.w_up.weight",
+        "tier": "very_low",
+        "score": 6.81231430480195e-8
+      },
+      {
+        "name": "blocks.3.ffn_norm.weight",
+        "tier": "high",
+        "score": 0.001953125
+      },
+      {
+        "name": "blocks.4.attn.wk.weight",
+        "tier": "very_low",
+        "score": 2.3853491007484285e-7
+      },
+      {
+        "name": "blocks.4.attn.wo.weight",
+        "tier": "very_low",
+        "score": 2.3843966197765755e-7
+      },
+      {
+        "name": "blocks.4.attn.wq.weight",
+        "tier": "very_low",
+        "score": 2.388774113888542e-7
+      },
+      {
+        "name": "blocks.4.attn.wv.weight",
+        "tier": "very_low",
+        "score": 2.383242379614228e-7
+      },
+      {
+        "name": "blocks.4.attn_norm.weight",
+        "tier": "high",
+        "score": 0.001953125
+      },
+      {
+        "name": "blocks.4.ffn.w_down.weight",
+        "tier": "very_low",
+        "score": 3.6436671074007295e-8
+      },
+      {
+        "name": "blocks.4.ffn.w_gate.weight",
+        "tier": "very_low",
+        "score": 6.816496651220409e-8
+      },
+      {
+        "name": "blocks.4.ffn.w_up.weight",
+        "tier": "very_low",
+        "score": 6.809228112950866e-8
+      },
+      {
+        "name": "blocks.4.ffn_norm.weight",
+        "tier": "high",
+        "score": 0.001953125
+      },
+      {
+        "name": "blocks.5.attn.wk.weight",
+        "tier": "very_low",
+        "score": 2.3866943602022394e-7
+      },
+      {
+        "name": "blocks.5.attn.wo.weight",
+        "tier": "very_low",
+        "score": 2.385136895487358e-7
+      },
+      {
+        "name": "blocks.5.attn.wq.weight",
+        "tier": "very_low",
+        "score": 2.388972212925873e-7
+      },
+      {
+        "name": "blocks.5.attn.wv.weight",
+        "tier": "very_low",
+        "score": 2.3830714026207085e-7
+      },
+      {
+        "name": "blocks.5.attn_norm.weight",
+        "tier": "high",
+        "score": 0.001953125
+      },
+      {
+        "name": "blocks.5.ffn.w_down.weight",
+        "tier": "very_low",
+        "score": 3.638152249180997e-8
+      },
+      {
+        "name": "blocks.5.ffn.w_gate.weight",
+        "tier": "very_low",
+        "score": 6.805314330198263e-8
+      },
+      {
+        "name": "blocks.5.ffn.w_up.weight",
+        "tier": "very_low",
+        "score": 6.813829242937417e-8
+      },
+      {
+        "name": "blocks.5.ffn_norm.weight",
+        "tier": "high",
+        "score": 0.001953125
+      },
+      {
+        "name": "blocks.6.attn.wk.weight",
+        "tier": "very_low",
+        "score": 3.0992715017270087e-7
+      },
+      {
+        "name": "blocks.6.attn.wo.weight",
+        "tier": "very_low",
+        "score": 3.096373784848006e-7
+      },
+      {
+        "name": "blocks.6.attn.wq.weight",
+        "tier": "very_low",
+        "score": 3.103769549088209e-7
+      },
+      {
+        "name": "blocks.6.attn.wv.weight",
+        "tier": "very_low",
+        "score": 3.099298068924216e-7
+      },
+      {
+        "name": "blocks.6.attn_norm.weight",
+        "tier": "high",
+        "score": 0.0025390625
+      },
+      {
+        "name": "blocks.6.ffn.w_down.weight",
+        "tier": "very_low",
+        "score": 4.7331816410399815e-8
+      },
+      {
+        "name": "blocks.6.ffn.w_gate.weight",
+        "tier": "very_low",
+        "score": 8.851888766897887e-8
+      },
+      {
+        "name": "blocks.6.ffn.w_up.weight",
+        "tier": "very_low",
+        "score": 8.862391329263893e-8
+      },
+      {
+        "name": "blocks.6.ffn_norm.weight",
+        "tier": "high",
+        "score": 0.0025390625
+      },
+      {
+        "name": "blocks.7.attn.wk.weight",
+        "tier": "high",
+        "score": 4.7632072450650034e-7
+      },
+      {
+        "name": "blocks.7.attn.wo.weight",
+        "tier": "high",
+        "score": 4.7672687025533224e-7
+      },
+      {
+        "name": "blocks.7.attn.wq.weight",
+        "tier": "high",
+        "score": 4.772099968576038e-7
+      },
+      {
+        "name": "blocks.7.attn.wv.weight",
+        "tier": "high",
+        "score": 4.77850304772569e-7
+      },
+      {
+        "name": "blocks.7.attn_norm.weight",
+        "tier": "high",
+        "score": 0.00390625
+      },
+      {
+        "name": "blocks.7.ffn.w_down.weight",
+        "tier": "high",
+        "score": 7.278366997743334e-8
+      },
+      {
+        "name": "blocks.7.ffn.w_gate.weight",
+        "tier": "high",
+        "score": 1.3632517490458105e-7
+      },
+      {
+        "name": "blocks.7.ffn.w_up.weight",
+        "tier": "high",
+        "score": 1.3631572549929476e-7
+      },
+      {
+        "name": "blocks.7.ffn_norm.weight",
+        "tier": "high",
+        "score": 0.00390625
+      },
+      {
+        "name": "norm.weight",
+        "tier": "high",
+        "score": 0.0029296875
+      },
+      {
+        "name": "tok_embeddings.weight",
+        "tier": "high",
+        "score": 2.235542273453647e-8
+      }
+    ]
+  }
+]

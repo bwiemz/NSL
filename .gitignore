@@ -30,6 +30,8 @@ models/coder50m/data/tokenizer/
 # Model binaries (regenerated from training)
 *.onnx
 *.safetensors
+# Exception: committed CPDT calibration fixtures (deterministic, seed-anchored).
+!tests/fixtures/cpdt_calibration/*.safetensors
 
 # Log files (per-run, never versioned)
 *.log
