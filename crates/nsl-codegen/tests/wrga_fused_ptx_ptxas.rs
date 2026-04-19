@@ -224,3 +224,77 @@ fn gatedlora_ptx_validates__sub_mma_k_no_rank_pad_16_8_8_16() {
     // Sub-MMA K (k=8<16) + rank == MMA-k (no rank-pad path).
     assert_gatedlora_ptx_valid(gated_cfg(16, 8, 8, 16));
 }
+
+// -------- Llama-scale ptxas regression gate (2026-04-19) --------
+//
+// These configs exercise the scale regime that B.3.1's own test matrix
+// missed: realistic inference/training dims (n, k) in the 1k..4k range at
+// ranks 8..64. Pre-rewrite, every config here produced PTX that timed out
+// or overflowed ptxas (20 MB at k=4096). The runtime-K-loop keeps PTX at
+// ~106 KB regardless of k, so ptxas compiles all of them fast.
+//
+// Rule being enforced (WRGA paper Appendix B.3): any PTX emitter that targets
+// a scale regime in its spec must have ptxas-compile-validity tests at the
+// upper end of that regime, not just at shapes convenient for small-matrix
+// unit testing. The B.3.2 trigger referenced Llama-3-8B-style shapes; this
+// sweep is the test-coverage cash-out for that reference.
+
+fn assert_at_scale(m: u32, n: u32, k: u32, rank: u32, kind: &str) {
+    match kind {
+        "lora" => assert_lora_ptx_valid(lora_cfg(m, n, k, rank)),
+        "gatedlora" => assert_gatedlora_ptx_valid(gated_cfg(m, n, k, rank)),
+        "ia3" => {
+            let cfg = nsl_codegen::wrga_fused_ptx::FusedIa3Config {
+                site_id: format!("test_scale.m{}n{}k{}", m, n, k),
+                m,
+                n,
+                k,
+                target_sm: 80,
+            };
+            let ptx = nsl_codegen::wrga_fused_ptx::synthesize_fused_ia3_ptx(&cfg);
+            match validate_ptx(&ptx) {
+                Ok(()) => {}
+                Err(msg) if msg.contains("nvcc not available") => {
+                    eprintln!("[skip] IA³ scale config ({}, {}, {}) — {}", m, n, k, msg);
+                }
+                Err(msg) => panic!(
+                    "IA³ PTX rejected at scale ({}, {}, {}):\n{}",
+                    m, n, k, msg
+                ),
+            }
+        }
+        _ => unreachable!(),
+    }
+}
+
+#[test]
+fn scale__lora_m1_n1024_k1024_r16() {
+    assert_at_scale(1, 1024, 1024, 16, "lora");
+}
+
+#[test]
+fn scale__lora_m1_n4096_k4096_r16() {
+    // Llama-3-8B attention-out proxy, rank=16. Pre-rewrite: 20 MB PTX, ptxas timeout.
+    assert_at_scale(1, 4096, 4096, 16, "lora");
+}
+
+#[test]
+fn scale__gatedlora_m1_n4096_k4096_r16() {
+    // B.3.2 trigger's prescribed shape at rank 16.
+    assert_at_scale(1, 4096, 4096, 16, "gatedlora");
+}
+
+#[test]
+fn scale__gatedlora_m1_n2048_k2048_r8() {
+    assert_at_scale(1, 2048, 2048, 8, "gatedlora");
+}
+
+#[test]
+fn scale__gatedlora_m1_n1024_k1024_r16() {
+    assert_at_scale(1, 1024, 1024, 16, "gatedlora");
+}
+
+#[test]
+fn scale__ia3_m1_n4096_k4096() {
+    assert_at_scale(1, 4096, 4096, 0, "ia3");
+}
