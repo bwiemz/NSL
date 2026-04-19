@@ -43,6 +43,43 @@ fn contains_train_block_stmt(stmt: &Stmt) -> bool {
     }
 }
 
+/// Extract the trailing dim of a `Call{ones|zeros|...}([N])` /
+/// `Call{ones|...}([N, M])` shape literal so we can read the
+/// d_model from a model layer's `init` expression.
+///
+/// For `w_norm: Tensor = ones([32])` we want `32` (last dim).
+/// For `wq:     Tensor = ones([32, 32])` either dim works since it's a
+/// square projection (in_features=out_features=d_model). We take the
+/// FIRST dim (in_features) — that's the one that must equal d_model
+/// for `x @ wq` to typecheck.
+fn first_dim_from_init_expr(expr: &nsl_ast::expr::Expr) -> Option<i64> {
+    if let ExprKind::Call { args, .. } = &expr.kind {
+        let first_arg = args.first()?;
+        if let ExprKind::ListLiteral(elems) = &first_arg.value.kind {
+            if let Some(first) = elems.first() {
+                if let ExprKind::IntLiteral(v) = first.kind {
+                    return Some(v);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn last_dim_from_init_expr(expr: &nsl_ast::expr::Expr) -> Option<i64> {
+    if let ExprKind::Call { args, .. } = &expr.kind {
+        let first_arg = args.first()?;
+        if let ExprKind::ListLiteral(elems) = &first_arg.value.kind {
+            if let Some(last) = elems.last() {
+                if let ExprKind::IntLiteral(v) = last.kind {
+                    return Some(v);
+                }
+            }
+        }
+    }
+    None
+}
+
 impl Compiler<'_> {
     // ── Compile kernel definitions (PTX → .rodata, before functions) ──
 
@@ -500,6 +537,92 @@ impl Compiler<'_> {
         Ok(())
     }
 
+    /// Resolve the layer's `d_model` (= input feature dim of RMSNorm) by
+    /// scanning the top-level statement list for a `model` whose method
+    /// carries `@flash_attention`, then inspecting that model's peer
+    /// `LayerDecl`s.
+    ///
+    /// Resolution order:
+    ///   1. `w_norm` (RMSNorm gamma) — the literal first/last dim of its
+    ///      shape IS d_model.
+    ///   2. `wq` (or `q_proj`) — first dim of `[d_model, d_kv_heads]`.
+    ///   3. `wk`, `wv`, `q_proj`, `k_proj`, `v_proj` — same.
+    ///
+    /// Returns `None` when no model is found, when no peer LayerDecl has
+    /// a literal-init shape, or when the init expression isn't a simple
+    /// `ones([...])` / `zeros([...])` call.  Callers should keep the
+    /// previous `d_model: 0` placeholder in that case so non-CSHA paths
+    /// stay unchanged (they don't read d_model).
+    fn resolve_csha_d_model_from_stmts(&self, stmts: &[Stmt]) -> Option<u32> {
+        // Names we'll probe in priority order.
+        const NORM_NAMES: &[&str] = &["w_norm", "norm_weight", "gamma"];
+        const PROJ_NAMES: &[&str] = &["wq", "wk", "wv", "q_proj", "k_proj", "v_proj"];
+
+        for stmt in stmts {
+            let StmtKind::ModelDef(md) = &stmt.kind else {
+                continue;
+            };
+            // Only care about models that actually carry a
+            // `@flash_attention` method — otherwise this is an unrelated
+            // model (e.g. a quant target) and its layer dims are
+            // irrelevant to the CSHA training config.
+            let mut has_flash = false;
+            for member in &md.members {
+                if let ModelMember::Method(_, decos) = member {
+                    if decos.iter().any(|d| {
+                        d.name.len() == 1
+                            && self.interner.resolve(d.name[0].0).unwrap_or("")
+                                == "flash_attention"
+                    }) {
+                        has_flash = true;
+                        break;
+                    }
+                }
+            }
+            if !has_flash {
+                continue;
+            }
+
+            // Phase 1 — try `w_norm` (RMSNorm gamma) first. Both first
+            // and last dim equal d_model for a 1-D gamma; we use first.
+            for member in &md.members {
+                if let ModelMember::LayerDecl { name, init: Some(init), .. } = member {
+                    let nm = self.interner.resolve(name.0).unwrap_or("");
+                    if NORM_NAMES.contains(&nm) {
+                        if let Some(v) = first_dim_from_init_expr(init) {
+                            if v > 0 {
+                                return Some(v as u32);
+                            }
+                        }
+                    }
+                }
+            }
+            // Phase 2 — fall back to a Q/K/V projection.  Convention:
+            // `wq` is `[d_model, d_kv]` (input rows, output cols), so the
+            // FIRST dim is d_model.
+            for member in &md.members {
+                if let ModelMember::LayerDecl { name, init: Some(init), .. } = member {
+                    let nm = self.interner.resolve(name.0).unwrap_or("");
+                    if PROJ_NAMES.contains(&nm) {
+                        if let Some(v) = first_dim_from_init_expr(init) {
+                            if v > 0 {
+                                return Some(v as u32);
+                            }
+                            // Last-dim fallback in case the user wrote
+                            // `[d_kv, d_model]` (transposed convention).
+                        }
+                        if let Some(v) = last_dim_from_init_expr(init) {
+                            if v > 0 {
+                                return Some(v as u32);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
     /// Gap B: when the module contains a `@train` block AND a flash-attention
     /// context was established, synthesize two extra PTX strings and attach
     /// them to the context:
@@ -535,6 +658,17 @@ impl Compiler<'_> {
             None => return Ok(()),
         };
 
+        // Resolve `d_model` from the layer's RMSNorm gamma / Q/K/V
+        // projection shapes.  Without this the AD emitter allocates
+        // `dx_dev`/`dxn_dev` as `[batch, seq, 0]` and the first
+        // downstream elementwise op hard-faults with
+        //   `tensor shape mismatch in elementwise op (dim 3: 0 vs <hd>)`.
+        // Falling back to head_dim keeps the older single-head smokes
+        // (where d_model == head_dim) working when no recognisable
+        // `w_norm`/`wq`/etc. peer LayerDecl is present.
+        let resolved_d_model = self
+            .resolve_csha_d_model_from_stmts(stmts)
+            .unwrap_or(base_config.head_dim as u32);
         // Minimum-invasive CSHA preset: boundary level + saves. Level 0
         // is explicitly rejected by the kernel-name encoder, so we use
         // level=1 without turning on any fusion flags — the only bit
@@ -547,7 +681,7 @@ impl Compiler<'_> {
             fused_output_proj: false,
             active_heads: 0,
             rmsnorm_eps: 1e-5,
-            d_model: 0,
+            d_model: resolved_d_model,
             save_activations_for_backward: true,
         };
         // Tier C's backward emitter (ds_compute/dqdk_accum/dv_accum)

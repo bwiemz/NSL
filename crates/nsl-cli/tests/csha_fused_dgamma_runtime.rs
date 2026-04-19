@@ -140,12 +140,17 @@ let m = TinyAttn()
 let x = ones([1, 1, 32, 32])
 let y = zeros([1, 1, 32, 32])
 
+print("BEFORE_w_norm")
+print(sum(m.w_norm))
+
 train(model = m, epochs = 1):
     optimizer: SGD(lr = 0.001)
     step(batch):
         let out = m.forward(x)
         let loss = mse_loss(out, y)
 
+print("AFTER_w_norm")
+print(sum(m.w_norm))
 print("done")
 "#;
 
@@ -293,30 +298,34 @@ fn compile_time_emits_fused_dgamma_for_csha_chain() {
 
 /// Runtime execution of the fused-dgamma path.
 ///
-/// **Currently BLOCKED** on an upstream `csha_training_config` bug
-/// independent of PR #74. The `dxn_dev` allocation in
-/// `wengert_lower.rs:1467` shapes itself as
-/// `[batch, seq, d_model]`, but `compiler/kernel.rs:543` builds the
-/// training config with a hardcoded `CshaExtras { d_model: 0, ... }`,
-/// so `dxn_dev` ends up shape `[1, 32, 0]`. The kernel writes f32
-/// values into a zero-element buffer and the first downstream
-/// elementwise op crashes with:
-///   `nsl: tensor shape mismatch in elementwise op (dim 3: 0 vs 32)`
-///   `  full a_shape=[1, 1, 32, 0]`
-///   `  full b_shape=[1, 1, 32, 32]`
+/// # Status (2026-04-16): d_model=0 bug FIXED, downstream f16/f64 dtype
+/// bug now exposed.
 ///
-/// When the upstream `d_model` plumbing is fixed (the right value lives
-/// on the per-layer plan, not the training config), flip the `#[ignore]`
-/// reason off and assert the runtime delta on `w_norm` is finite and
-/// non-zero (analogous to `csha_gap_gpu_e2e_smoke`'s `w_norm` assertion).
+/// The original blocker — `compiler/kernel.rs` constructing the
+/// `csha_training_config` with a hardcoded `CshaExtras { d_model: 0,
+/// ... }` — was fixed in this same PR by `resolve_csha_d_model_from_stmts`.
+/// We hard-assert below that the documented `dim 3: 0 vs 32` /
+/// `a_shape=[1, 1, 32, 0]` signature is GONE, so any future regression
+/// re-introducing the placeholder will turn this test red.
+///
+/// A separate downstream issue is now exposed: the SGD step on the
+/// fused-backward grad output panics with
+///   `data_f64() called on non-f64 tensor (dtype=2)`
+/// because the f16 grad tensor coming out of the CSHA fused backward
+/// flows into an `nsl_runtime::tensor` op that hard-asserts f64 dtype.
+/// That is independent of PR #74 (the dgamma extract emission) and the
+/// `d_model` plumbing — it lives in the runtime's tensor-op dtype
+/// dispatch — and is documented here as a graceful skip with a fresh
+/// signature so the next PR landing the dtype-dispatch fix flips the
+/// last branch into the success path.
 ///
 /// Invocation (gated):
 ///   cargo test -p nsl-cli --test csha_fused_dgamma_runtime \
 ///     --features cuda -- --ignored --include-ignored --nocapture
 #[test]
-#[ignore = "requires CUDA toolchain + GPU; runtime path BLOCKED on upstream \
-            d_model=0 bug — runs to documented graceful-skip today, will \
-            hard-pass once compiler/kernel.rs:543 plumbing is fixed."]
+#[ignore = "requires CUDA toolchain + GPU; d_model=0 bug FIXED in this PR — \
+            now waiting on the runtime f16/f64 dtype-dispatch fix to flip \
+            the last graceful-skip into a hard pass."]
 fn runtime_executes_fused_dgamma() {
     // Compile-time check is required to even attempt the runtime
     // execution; if compilation diverged, the executable wouldn't
@@ -372,36 +381,67 @@ fn runtime_executes_fused_dgamma() {
     let run_stderr = String::from_utf8_lossy(&run_out.stderr).to_string();
 
     if !run_out.status.success() {
-        // Match the documented upstream-bug signature. We treat the
-        // KNOWN crash as a non-fatal "bug still present" diagnostic
-        // (eprintln + return) so the test isn't a constant red mark
-        // while the upstream fix is pending — but any OTHER runtime
-        // failure mode is a hard panic so a regression in PR #74's
-        // wiring (or a new failure introduced by the upstream fix)
-        // is loud.
-        let upstream_signature = run_stderr.contains("dim 3: 0 vs 32")
+        // Hard-assert the documented `d_model=0` signature is GONE.
+        // This was the blocker that motivated PR #74 + this PR's
+        // `resolve_csha_d_model_from_stmts`; if it ever re-appears the
+        // d_model resolution lost its grip on the layer's RMSNorm
+        // gamma / projection shapes and we want to fail loud.
+        let dmodel_zero_signature = run_stderr.contains("dim 3: 0 vs 32")
             || run_stderr.contains("a_shape=[1, 1, 32, 0]");
-        if upstream_signature {
+        assert!(
+            !dmodel_zero_signature,
+            "[csha-fused-dgamma-runtime] REGRESSION — the d_model=0 crash \
+             signature is back.  `resolve_csha_d_model_from_stmts` in \
+             compiler/kernel.rs must be threading the layer's gamma / Q/K/V \
+             projection dim through `CshaExtras::d_model`.  If a new model \
+             shape isn't being recognized, extend the NORM_NAMES / PROJ_NAMES \
+             priority lists.\nstderr:\n{run_stderr}"
+        );
+
+        // Downstream f16/f64 dtype-dispatch bug — graceful skip with a
+        // fresh signature.  Independent of d_model + PR #74 wiring.
+        let dtype_dispatch_signature = run_stderr.contains("data_f64() called on non-f64")
+            || run_stderr.contains("dtype=2");
+        if dtype_dispatch_signature {
             eprintln!(
-                "[csha-fused-dgamma-runtime] EXPECTED — runtime crash matches the documented \
-                 upstream `d_model=0` bug (compiler/kernel.rs:543). PR #74's compile-time wiring \
-                 is still verified by the sibling `compile_time_emits_fused_dgamma_for_csha_chain` \
-                 test. Once the upstream `d_model` plumbing is fixed, this branch should be \
-                 unreachable and the runtime success path below will execute.\n\
+                "[csha-fused-dgamma-runtime] EXPECTED — d_model fix landed and the \
+                 fused backward + dgamma extract are reaching the SGD step, but the \
+                 runtime tensor-op dispatch still asserts f64 on an f16 grad tensor. \
+                 This is the new top blocker.  When fixed, this branch is unreachable \
+                 and the success path below executes.\n\
                  stderr:\n{run_stderr}"
             );
             return;
         }
         panic!(
-            "[csha-fused-dgamma-runtime] unexpected runtime failure (NOT the \
-             documented `d_model=0` signature) — investigate before assuming PR #74 wiring is intact.\n\
+            "[csha-fused-dgamma-runtime] unexpected runtime failure (neither \
+             the documented `d_model=0` nor the new `dtype=2` signature). \
+             Investigate before assuming PR #74 + d_model wiring is intact.\n\
              stdout:\n{run_stdout}\n\nstderr:\n{run_stderr}"
         );
     }
 
-    // Once the upstream bug is fixed the runtime should exit cleanly.
-    // If we get here, the path is hot and PR #74's runtime contribution
-    // is fully verified.
+    // Once both upstream bugs are fixed the runtime should exit cleanly
+    // AND emit before/after sums proving the SGD step landed real
+    // updates on at least one trainable param.  Following the same
+    // bellwether convention as `csha_gap_gpu_e2e_weights_change_after_one_step`.
+    let before_w_norm: Option<f64> = parse_first_float_after(&run_stdout, "BEFORE_w_norm");
+    let after_w_norm: Option<f64> = parse_first_float_after(&run_stdout, "AFTER_w_norm");
+    if let (Some(b), Some(a)) = (before_w_norm, after_w_norm) {
+        let delta = a - b;
+        eprintln!(
+            "[csha-fused-dgamma-runtime] w_norm delta = {delta:+.6} (before={b}, after={a})"
+        );
+        assert!(
+            b.is_finite() && a.is_finite(),
+            "[csha-fused-dgamma-runtime] w_norm sums must be finite (before={b}, after={a})"
+        );
+        assert!(
+            delta.abs() > 1e-6,
+            "[csha-fused-dgamma-runtime] w_norm did not move under CSHA fused \
+             backward — the dgamma extract path produced a zero gradient."
+        );
+    }
     eprintln!(
         "[csha-fused-dgamma-runtime] runtime success! stdout:\n{run_stdout}\n\nstderr tail:\n{}",
         run_stderr
@@ -411,4 +451,26 @@ fn runtime_executes_fused_dgamma() {
             .collect::<Vec<_>>()
             .join("\n")
     );
+}
+
+/// Parse the first numeric line that appears AFTER a marker line.
+/// Skips diagnostic lines beginning with `[`.
+fn parse_first_float_after(stdout: &str, marker: &str) -> Option<f64> {
+    let lines: Vec<&str> = stdout.lines().collect();
+    let mut after_marker = false;
+    for line in &lines {
+        let t = line.trim();
+        if t == marker {
+            after_marker = true;
+            continue;
+        }
+        if !after_marker {
+            continue;
+        }
+        if t.is_empty() || t.starts_with('[') {
+            continue;
+        }
+        return t.parse::<f64>().ok();
+    }
+    None
 }

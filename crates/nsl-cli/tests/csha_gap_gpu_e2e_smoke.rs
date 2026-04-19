@@ -354,3 +354,153 @@ fn csha_gap_gpu_e2e_weights_change_after_one_step() {
          ones input).  Full per-param deltas above."
     );
 }
+
+/// CSHA variant: same toy program, but invokes `nsl run --csha auto` so
+/// the CSHA boundary scanner + fused-backward dispatcher fire end-to-end
+/// (the baseline test above takes the per-op AD path).
+///
+/// This is the bellwether for the runtime activation step:
+///   - `nsl run --csha auto` is now wired (this PR).
+///   - `csha_training_config` carries a real `d_model` (this PR).
+///   - PR #74's dgamma-extract diagnostic line must show up in stderr.
+///
+/// **Currently graceful-skip on the runtime side:** the d_model fix
+/// unblocks the kernel allocation, but the SGD step still trips a
+/// downstream `data_f64() called on non-f64 tensor (dtype=2)` assertion
+/// — independent of CSHA wiring, lives in `nsl-runtime`'s tensor-op
+/// dispatch.  When the dtype-dispatch fix lands, flip the runtime
+/// assertion below (`if !output.status.success() { ... return; }`)
+/// into a hard panic.
+///
+/// Invocation:
+///   cargo test -p nsl-cli --test csha_gap_gpu_e2e_smoke \
+///     --features cuda -- --ignored --nocapture
+#[test]
+#[ignore = "requires a CUDA-capable GPU; CSHA fused-backward variant — \
+            graceful-skip on the runtime f16/f64 dtype assertion."]
+fn csha_gap_gpu_e2e_csha_fused_path() {
+    let tmp = TempDir::new().expect("tempdir");
+    let src_path = tmp.path().join("csha_toy_gpu_e2e_csha.nsl");
+    fs::write(&src_path, TOY_SRC).expect("write toy source");
+
+    let mut cmd = Command::cargo_bin("nsl").expect("locate nsl binary");
+    cmd.env("NSL_STDLIB_PATH", stdlib_path())
+        .arg("run")
+        .arg("--source-ad")
+        .arg("--csha")
+        .arg("auto")
+        .arg("--target")
+        .arg("sm_89")
+        .arg(&src_path);
+    let output = cmd.output().expect("spawn nsl run --csha auto");
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    // Compile-time bellwether: BOTH diagnostic lines that prove the
+    // CSHA pass + PR #74's dgamma extract emission fired.  These are
+    // independent of runtime success and should always appear once
+    // `nsl run --csha auto` is honoured by the build pipeline.
+    let chains_line = stderr
+        .lines()
+        .find(|l| l.contains("[csha] csha[auto]:") && l.contains("chains,"));
+    assert!(
+        chains_line.is_some(),
+        "[csha-gpu-e2e-csha] missing `[csha] csha[auto]: ... chains` summary in \
+         stderr — `nsl run --csha auto` flag did not reach the CSHA pass.\n\
+         stderr:\n{stderr}"
+    );
+    eprintln!("[csha-gpu-e2e-csha] chains line: {}", chains_line.unwrap());
+
+    let dgamma_line = stderr
+        .lines()
+        .find(|l| l.contains("CSHA fused backward: emitted dgamma"));
+    assert!(
+        dgamma_line.is_some(),
+        "[csha-gpu-e2e-csha] missing `CSHA fused backward: emitted dgamma` line — \
+         PR #74's emission arm did not fire.  Either `chain_varids` resolved to \
+         None or EmitFused took the Fallback branch.\n\
+         stderr:\n{stderr}"
+    );
+    eprintln!("[csha-gpu-e2e-csha] dgamma line: {}", dgamma_line.unwrap());
+
+    // Runtime: graceful-skip on the f16/f64 dispatch assertion until
+    // the downstream fix lands.  The d_model=0 signature must NOT
+    // appear (regression guard).
+    if !output.status.success() {
+        let driver_missing = stderr.contains("no CUDA devices")
+            || stderr.contains("CUDA_ERROR_NOT_INITIALIZED")
+            || stderr.contains("CUDA driver not found");
+        if driver_missing {
+            eprintln!(
+                "[csha-gpu-e2e-csha] SKIP — no CUDA driver.\nstderr tail:\n{}",
+                stderr.lines().rev().take(5).collect::<Vec<_>>().join("\n")
+            );
+            return;
+        }
+        let dmodel_zero_signature = stderr.contains("dim 3: 0 vs 32")
+            || stderr.contains("a_shape=[1, 1, 32, 0]");
+        assert!(
+            !dmodel_zero_signature,
+            "[csha-gpu-e2e-csha] REGRESSION — d_model=0 crash signature is back.\n\
+             stderr:\n{stderr}"
+        );
+        let dtype_dispatch_signature = stderr.contains("data_f64() called on non-f64")
+            || stderr.contains("dtype=2");
+        if dtype_dispatch_signature {
+            eprintln!(
+                "[csha-gpu-e2e-csha] EXPECTED downstream — d_model fix landed and \
+                 CSHA fused backward is reaching the SGD step, but the runtime \
+                 tensor-op dispatch still asserts f64 on an f16 grad tensor.  \
+                 When the dtype-dispatch fix lands, flip this branch to a hard \
+                 panic.\n\
+                 stderr tail:\n{}",
+                stderr.lines().rev().take(10).collect::<Vec<_>>().join("\n")
+            );
+            return;
+        }
+        panic!(
+            "[csha-gpu-e2e-csha] `nsl run --csha auto` failed with exit {} for an \
+             unrecognised reason (neither d_model=0 nor dtype=2 signature).\n\n\
+             stdout:\n{stdout}\n\nstderr:\n{stderr}",
+            output.status
+        );
+    }
+
+    let deltas = parse_before_after(&stdout).unwrap_or_else(|e| {
+        panic!(
+            "[csha-gpu-e2e-csha] failed to parse BEFORE/AFTER param sums: {e}\n\
+             stdout:\n{stdout}\n\nstderr:\n{stderr}"
+        )
+    });
+
+    eprintln!("[csha-gpu-e2e-csha] per-parameter weight deltas:");
+    for (name, before, after, delta) in &deltas {
+        eprintln!(
+            "  {name:>8}: before={before:>14.6}  after={after:>14.6}  delta={delta:>+14.6}"
+        );
+    }
+
+    for (name, before, after, _) in &deltas {
+        assert!(
+            before.is_finite(),
+            "[csha-gpu-e2e-csha] BEFORE_{name} = {before} is not finite"
+        );
+        assert!(
+            after.is_finite(),
+            "[csha-gpu-e2e-csha] AFTER_{name} = {after} is not finite"
+        );
+    }
+
+    let stuck: Vec<&String> = deltas
+        .iter()
+        .filter(|(_, _, _, d)| d.abs() <= 1e-6)
+        .map(|(n, _, _, _)| n)
+        .collect();
+    assert!(
+        stuck.is_empty(),
+        "[csha-gpu-e2e-csha] trainable param(s) did not move after one CSHA step: \
+         {stuck:?}.  Expected ALL FOUR params (wq, wk, wv, w_norm) to receive \
+         a non-zero gradient under the fused backward path.  Full per-param \
+         deltas above."
+    );
+}

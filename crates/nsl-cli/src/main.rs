@@ -262,6 +262,16 @@ enum Cli {
         #[arg(long)]
         inspect: bool,
 
+        /// CSHA: attention-fusion mode ("auto", "boundary", "pipeline",
+        /// "block", or "off").  Passing `--csha` without a value enables
+        /// auto mode.  Mirrors `nsl build --csha`.
+        #[arg(long, value_name = "MODE", num_args = 0..=1, default_missing_value = "auto")]
+        csha: Option<String>,
+
+        /// CSHA: print the attention-fusion report to stderr
+        #[arg(long)]
+        csha_report: bool,
+
         /// Arguments to pass to the compiled program
         #[arg(last = true)]
         args: Vec<String>,
@@ -1331,7 +1341,21 @@ fn main_inner() {
             gpu_mem_report,
             monitor,
             inspect,
+            csha,
+            csha_report,
         } => {
+            // CSHA: validate the same way `nsl build --csha` does so an
+            // unrecognised mode fails fast rather than silently disabling
+            // the planner.
+            if let Some(ref m) = csha {
+                if nsl_codegen::csha::CshaMode::parse(m).is_none() {
+                    eprintln!(
+                        "error: --csha value '{}' is not one of auto|boundary|pipeline|block|off",
+                        m
+                    );
+                    process::exit(1);
+                }
+            }
             // Dev Tools Phase 4 Task 6: when --monitor is set, auto-detect
             // whether this program has a `train { }` block.  If so, enable
             // the health monitor and skip the Phase 1/2 kernel-timing path
@@ -1467,8 +1491,8 @@ fn main_inner() {
                 wggo_weights: None,
                 wggo_importance: nsl_codegen::WggoImportance::Auto,
                 wggo_prune_fraction: None,
-                csha_mode: None,
-                csha_report: false,
+                csha_mode: csha.clone(),
+                csha_report,
                 cpdt_mode: nsl_codegen::cpdt::CpdtMode::Off,
                 cpdt_cluster: None,
                 cpdt_report_requested: false,
