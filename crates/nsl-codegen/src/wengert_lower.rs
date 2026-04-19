@@ -252,6 +252,306 @@ fn promote_to_tensor(
     }
 }
 
+/// Option 3a — emit the fused CSHA forward FFI under a backward-dispatcher
+/// claim.
+///
+/// Called from `PrimalOp::ScaledDotProductAttention` when the op is in
+/// `compiler.csha_backward_claims.op_to_chain` AND the claim's layer has
+/// `save_activations_for_backward=true`.  This REPLACES the primitive
+/// decomposition (matmul → softmax → matmul) for the claimed op.
+///
+/// Responsibilities:
+///   1. Allocate the six backward-activation buffers via
+///      `nsl_csha_alloc_backward_activations_into` (matches the Gap A
+///      allocator used by `compile_flash_attention_call`).
+///   2. Resolve x_norm / norm_weight / Wq / Wk / Wv primal VarIds from
+///      the chain's `CshaChainVarIds` into Cranelift `Value`s via
+///      `var_map`.  Any VarId that can't be resolved stays null; the
+///      FFI's per-arg null-guard falls through to the classic path for
+///      that slot.
+///   3. Load PTX / name pointers from `.rodata` via
+///      `FlashAttentionCompileContext.csha_forward_with_saves_{ptx,name}_id`
+///      — falling back to the non-CSHA PTX when the module has no
+///      `@train` block.
+///   4. Emit the 36-arg `nsl_flash_attention_csha_with_saves` FFI
+///      call, returning the attention output tensor.
+///   5. Stash the six save-pointer Cranelift Values on
+///      `compiler.csha_forward_saves[layer]` so Gap D.1's
+///      `FusedCshaBackward` lowerer finds them when it runs later in
+///      the SAME function body.
+///
+/// The layer-key used here MUST match the key the backward lowerer
+/// reads — both resolve from `claim.chain_marks[idx].layer`, so they're
+/// structurally identical.
+fn emit_fused_forward_under_claim(
+    compiler: &mut Compiler,
+    builder: &mut FunctionBuilder,
+    op: &WengertOp,
+    inputs: &[Value],
+    var_map: &VarMap,
+    layer: &str,
+) -> Result<Value, CodegenError> {
+    // --- 1. Resolve the config (block_q/block_kv/head_dim/causal/
+    //        d_model/eps_bits/shmem_bytes) from the flash attention
+    //        context.  If the training config is absent this means the
+    //        module never set up CSHA training PTX — the claim itself
+    //        shouldn't have been issued, so we bail with a diagnostic
+    //        rather than silently falling back to decomposition. ---
+    let training_cfg = compiler
+        .kernels
+        .flash_attention_context
+        .as_ref()
+        .and_then(|c| c.csha_training_config.clone())
+        .ok_or_else(|| {
+            CodegenError::new(format!(
+                "[source-ad] CSHA fused forward claim fired for layer '{}' \
+                 but `csha_training_config` is absent — the module has no \
+                 `@train` block or CSHA training PTX synthesis was rejected. \
+                 This is a dispatcher bug, not a structural fallback case.",
+                layer
+            ))
+        })?;
+    let (block_q_i64, block_kv_i64, is_causal, d_model_i64, eps_bits_i64) = {
+        let dm = training_cfg.csha.as_ref().map(|c| c.d_model as i64).unwrap_or(0);
+        let eps = training_cfg
+            .csha
+            .as_ref()
+            .map(|c| c.rmsnorm_eps.to_bits() as i64)
+            .unwrap_or(1e-5_f32.to_bits() as i64);
+        (
+            training_cfg.block_q,
+            training_cfg.block_kv,
+            training_cfg.causal,
+            dm,
+            eps,
+        )
+    };
+    let shmem_bytes_i64 = {
+        let mut diags = Vec::<String>::new();
+        let bytes = crate::flash_attention_selector::shared_mem_bytes_selected_with_diag(
+            &training_cfg, &mut diags,
+        ) as i64;
+        for s in diags {
+            eprintln!("warning: {s}");
+        }
+        bytes
+    };
+    // active_heads from the bridge (same source as
+    // `compile_flash_attention_call`'s non-source-AD branch).
+    let active_heads_i64 = compiler
+        .last_csha_bridge
+        .as_ref()
+        .and_then(|b| b.extras_for_layer(layer))
+        .map(|e| e.active_heads as i64)
+        .unwrap_or(0);
+
+    // --- 2. SDPA inputs: [q, k, v, scale, ...].  The scale slot is an
+    //        f64 literal (NSL float literals lower to F64); the FFI
+    //        expects an i64 carrying the f32 bit pattern. ---
+    let q_val = inputs[0];
+    let k_val = inputs[1];
+    let v_val = inputs[2];
+    let scale_bits = if inputs.len() > 3 {
+        let scale_val = inputs[3];
+        let scale_ty = builder.func.dfg.value_type(scale_val);
+        if scale_ty == cl_types::F64 {
+            let scale_f32 = builder.ins().fdemote(cl_types::F32, scale_val);
+            let scale_bits_i32 = builder.ins().bitcast(
+                cl_types::I32,
+                cranelift_codegen::ir::MemFlags::new(),
+                scale_f32,
+            );
+            builder.ins().uextend(cl_types::I64, scale_bits_i32)
+        } else if scale_ty == cl_types::F32 {
+            let scale_bits_i32 = builder.ins().bitcast(
+                cl_types::I32,
+                cranelift_codegen::ir::MemFlags::new(),
+                scale_val,
+            );
+            builder.ins().uextend(cl_types::I64, scale_bits_i32)
+        } else {
+            // Already an integer Value — trust the caller.
+            scale_val
+        }
+    } else {
+        // Default scale = 1.0f32 bits.
+        let one_f32_bits = 1.0_f32.to_bits() as i64;
+        builder.ins().iconst(cl_types::I64, one_f32_bits)
+    };
+
+    // --- 3. Allocate out tensor (shape = q). ---
+    let out_val = call(compiler, builder, "nsl_tensor_zeros_like", &[q_val])?;
+
+    // Allocate logsumexp on GPU (mirrors compile_flash_attention_call).
+    let dim0 = builder.ins().iconst(cl_types::I64, 0);
+    let dim1 = builder.ins().iconst(cl_types::I64, 1);
+    let dim2 = builder.ins().iconst(cl_types::I64, 2);
+    let dim3 = builder.ins().iconst(cl_types::I64, 3);
+    let batch = call(compiler, builder, "nsl_tensor_shape_dim", &[q_val, dim0])?;
+    let heads = call(compiler, builder, "nsl_tensor_shape_dim", &[q_val, dim1])?;
+    let seq_len = call(compiler, builder, "nsl_tensor_shape_dim", &[q_val, dim2])?;
+    let head_dim = call(compiler, builder, "nsl_tensor_shape_dim", &[q_val, dim3])?;
+
+    let lse_shape = call(compiler, builder, "nsl_list_new", &[])?;
+    call(compiler, builder, "nsl_list_push", &[lse_shape, batch])?;
+    call(compiler, builder, "nsl_list_push", &[lse_shape, heads])?;
+    call(compiler, builder, "nsl_list_push", &[lse_shape, seq_len])?;
+    let lse_cpu = call(compiler, builder, "nsl_tensor_zeros", &[lse_shape])?;
+    let cuda_device = builder.ins().iconst(cl_types::I64, 1);
+    let lse_val = call(
+        compiler,
+        builder,
+        "nsl_tensor_to_device",
+        &[lse_cpu, cuda_device],
+    )?;
+
+    // --- 4. Allocate the six save buffers.  Same values populate
+    //        `csha_forward_saves[layer]` below. ---
+    let saves_slot = builder.create_sized_stack_slot(
+        cranelift_codegen::ir::StackSlotData::new(
+            cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+            48,
+            8,
+        ),
+    );
+    let saves_ptr = builder.ins().stack_addr(cl_types::I64, saves_slot, 0);
+    let _alloc_rc = call(
+        compiler,
+        builder,
+        "nsl_csha_alloc_backward_activations_into",
+        &[batch, heads, seq_len, head_dim, saves_ptr],
+    )?;
+    let q_proj_v = builder.ins().stack_load(cl_types::I64, saves_slot, 0);
+    let k_proj_v = builder.ins().stack_load(cl_types::I64, saves_slot, 8);
+    let v_proj_v = builder.ins().stack_load(cl_types::I64, saves_slot, 16);
+    let row_max_v = builder.ins().stack_load(cl_types::I64, saves_slot, 24);
+    let row_sum_v = builder.ins().stack_load(cl_types::I64, saves_slot, 32);
+    let x_raw_v = builder.ins().stack_load(cl_types::I64, saves_slot, 40);
+
+    // --- 5. Resolve chain-side VarIds via `var_map`. ---
+    let null = builder.ins().iconst(cl_types::I64, 0);
+    let (mut x_v, mut norm_w_v, mut wq_v, mut wk_v, mut wv_v) =
+        (null, null, null, null, null);
+    if let Some(claims) = compiler.csha_backward_claims.as_ref() {
+        if let Some(&chain_idx) = claims.op_to_chain.get(&op.id) {
+            if let Some(mark) = claims.chain_marks.get(chain_idx) {
+                if let Some(chain) = mark.chain_varids.as_ref() {
+                    if let Some(&v) = var_map.get(&chain.x_norm_var) {
+                        x_v = v;
+                    }
+                    if let Some(nw) = chain.norm_weight_var {
+                        if let Some(&v) = var_map.get(&nw) {
+                            norm_w_v = v;
+                        }
+                    }
+                    if let Some(&v) = var_map.get(&chain.wq_var) {
+                        wq_v = v;
+                    }
+                    if let Some(&v) = var_map.get(&chain.wk_var) {
+                        wk_v = v;
+                    }
+                    if let Some(&v) = var_map.get(&chain.wv_var) {
+                        wv_v = v;
+                    }
+                }
+            }
+        }
+    }
+    // Output projection not part of this chain at Level 0/1 fusion.
+    let wo_v = null;
+
+    // --- 6. Load PTX / name from rodata (prefer Gap B's with-saves PTX). ---
+    let (ptx_ptr, name_ptr) = {
+        let ctx = compiler.kernels.flash_attention_context.as_ref();
+        let with_saves_ptx_did = ctx.and_then(|c| c.csha_forward_with_saves_ptx_id);
+        let with_saves_name_did = ctx.and_then(|c| c.csha_forward_with_saves_name_id);
+        match (with_saves_ptx_did, with_saves_name_did) {
+            (Some(pid), Some(nid)) => {
+                let pgv = compiler.module.declare_data_in_func(pid, builder.func);
+                let ngv = compiler.module.declare_data_in_func(nid, builder.func);
+                (
+                    builder.ins().symbol_value(cl_types::I64, pgv),
+                    builder.ins().symbol_value(cl_types::I64, ngv),
+                )
+            }
+            _ => {
+                let pd = ctx.map(|c| c.ptx_data_id);
+                let nd = ctx.map(|c| c.name_data_id);
+                match (pd, nd) {
+                    (Some(pid), Some(nid)) => {
+                        let pgv = compiler.module.declare_data_in_func(pid, builder.func);
+                        let ngv = compiler.module.declare_data_in_func(nid, builder.func);
+                        (
+                            builder.ins().symbol_value(cl_types::I64, pgv),
+                            builder.ins().symbol_value(cl_types::I64, ngv),
+                        )
+                    }
+                    _ => (null, null),
+                }
+            }
+        }
+    };
+
+    let block_q_val = builder.ins().iconst(cl_types::I64, block_q_i64);
+    let block_kv_val = builder.ins().iconst(cl_types::I64, block_kv_i64);
+    let shmem_val = builder.ins().iconst(cl_types::I64, shmem_bytes_i64);
+    let causal_val = builder.ins().iconst(cl_types::I64, if is_causal { 1 } else { 0 });
+    let eps_bits_val = builder.ins().iconst(cl_types::I64, eps_bits_i64);
+    let active_heads_val = builder.ins().iconst(cl_types::I64, active_heads_i64);
+    let d_model_val = builder.ins().iconst(cl_types::I64, d_model_i64);
+
+    // --- 7. Emit the 36-arg fused-with-saves FFI call. ---
+    let _err = call(
+        compiler,
+        builder,
+        "nsl_flash_attention_csha_with_saves",
+        &[
+            q_val, k_val, v_val, out_val,
+            lse_val,
+            scale_bits,
+            batch, heads, seq_len, head_dim,
+            null, null, null, null, // paged
+            null, null,             // RoPE
+            null, null,             // seq_ids, seq_lens
+            shmem_val,
+            ptx_ptr, name_ptr,
+            block_q_val, block_kv_val,
+            causal_val,
+            x_v, norm_w_v,
+            wq_v, wk_v, wv_v, wo_v,
+            eps_bits_val,
+            active_heads_val,
+            d_model_val,
+            q_proj_v, k_proj_v, v_proj_v,
+            row_max_v, row_sum_v,
+            x_raw_v,
+        ],
+    )?;
+
+    // --- 8. Stash save-pointer Values for Gap D.1 backward lowerer. ---
+    let (bwd_ptx_id, bwd_name_id) = compiler
+        .kernels
+        .flash_attention_context
+        .as_ref()
+        .map(|c| (c.csha_backward_ptx_data_id, c.csha_backward_name_data_id))
+        .unwrap_or((None, None));
+    compiler.csha_forward_saves.insert(
+        layer.to_string(),
+        crate::csha_apply::CshaSavePointers {
+            q_proj: q_proj_v,
+            k_proj: k_proj_v,
+            v_proj: v_proj_v,
+            row_max: row_max_v,
+            row_sum: row_sum_v,
+            x_raw: x_raw_v,
+            backward_ptx_data_id: bwd_ptx_id,
+            backward_name_data_id: bwd_name_id,
+        },
+    );
+
+    Ok(out_val)
+}
+
 /// Lower one WengertOp to Cranelift IR.
 fn lower_single_op(
     compiler: &mut Compiler,
@@ -876,7 +1176,59 @@ fn lower_single_op(
 
         // === Attention (4 ops) ===
         PrimalOp::ScaledDotProductAttention { causal } => {
-            // Decompose into primitive ops: softmax((Q @ K.T) * scale [+ mask]) @ V
+            // Option 3a — CSHA fused-forward claim dispatch:
+            //
+            // When the CSHA backward dispatcher has claimed this SDPA
+            // op (it's in `compiler.csha_backward_claims.op_to_chain`)
+            // AND the resolved layer has `save_activations_for_backward`,
+            // emit the fused `nsl_flash_attention_csha_with_saves` FFI
+            // here instead of decomposing into primitive matmul/softmax.
+            //
+            // This is the symmetric extension of Gap D.1's backward-side
+            // dispatcher to the forward pass.  One forward code path
+            // under the claim, one set of save buffers, deterministic
+            // data flow into the fused backward — no drift between
+            // "what the fused kernel sees" and "what primitive ops
+            // would compute".
+            //
+            // No fallback path: if the fused FFI fails at runtime for
+            // a claimed chain, that's a bug to fix.  We never silently
+            // fall back to decomposition — that would reintroduce the
+            // dual-path drift class the user explicitly rejected.
+            let claim_layer = compiler
+                .csha_backward_claims
+                .as_ref()
+                .and_then(|claims| {
+                    claims
+                        .op_to_chain
+                        .get(&op.id)
+                        .copied()
+                        .and_then(|idx| claims.chain_marks.get(idx))
+                        .map(|m| m.layer.clone())
+                });
+            if let Some(layer) = claim_layer {
+                let needs_saves = compiler
+                    .last_csha_bridge
+                    .as_ref()
+                    .and_then(|b| b.extras_for_layer(&layer))
+                    .map(|e| e.save_activations_for_backward)
+                    .unwrap_or(false);
+                if needs_saves {
+                    let result = emit_fused_forward_under_claim(
+                        compiler, builder, op, &inputs, var_map, &layer,
+                    )?;
+                    // Mirror the side-channel registration the
+                    // decomposition did so non-CSHA consumers of
+                    // `flash_attn_aux` still work.  Backward consumes
+                    // saves directly; null lse is harmless here.
+                    let null_lse = builder.ins().iconst(cl_types::I64, 0);
+                    compiler.flash_attn_aux.insert(result, (result, null_lse));
+                    return Ok(result);
+                }
+            }
+
+            // Unclaimed path — decompose into primitive ops:
+            //   softmax((Q @ K.T) * scale [+ mask]) @ V
             // inputs: [q, k, v, scale, causal_flag]
             let q = inputs[0];
             let k = inputs[1];
@@ -958,108 +1310,18 @@ fn lower_single_op(
             let null_lse = builder.ins().iconst(cl_types::I64, 0);
             compiler.flash_attn_aux.insert(result, (result, null_lse));
 
-            // Gap I.3 — forward save-buffer allocation when CSHA fused
-            // backward will consume this SDPA op.
+            // NOTE: save-buffer allocation for claimed chains is handled
+            // above by option 3a's `emit_fused_forward_under_claim` —
+            // that path emits `nsl_flash_attention_csha_with_saves`
+            // (which both computes attention AND populates saves) AND
+            // registers the save pointers in `csha_forward_saves`.
             //
-            // Historical context: Gap A landed save-buffer allocation at
-            // `compile_flash_attention_call` — the codepath taken by the
-            // `@flash_attention` fast-path function compilation.  But
-            // when `@train` is active and the method body is INLINED
-            // into the Wengert primal extractor (source AD path), the
-            // SDPA call becomes a `PrimalOp::ScaledDotProductAttention`
-            // and its lowering runs here, NOT through
-            // `compile_flash_attention_call`.  Result: the Gap A save
-            // branch never fires for source-AD training, and Gap D's
-            // `FusedCshaBackward` lowerer failed with
-            // `"no forward saves for layer '<name>'"`.
-            //
-            // Fix: when this SDPA op is claimed by a CSHA backward chain
-            // (`compiler.csha_backward_claims.op_to_chain`), resolve the
-            // layer name from the claim's FusionMark and allocate the
-            // six save buffers right here.  The layer key comes straight
-            // from `mark.layer` — the same key the backward lowerer uses
-            // in `csha_forward_saves.get(layer)` — so the I.3 layer-key
-            // consistency issue disappears for free.
-            //
-            // Only fires when:
-            //   (a) `csha_backward_claims` is populated (CSHA active on
-            //       this op_to_chain entry), AND
-            //   (b) the resolved layer has `save_activations_for_backward`
-            //       on its CshaExtras (set by `compile_train_block` when
-            //       bridging under `@train`).
-            let save_dispatch = compiler
-                .csha_backward_claims
-                .as_ref()
-                .and_then(|claims| claims.op_to_chain.get(&op.id).copied()
-                    .and_then(|idx| claims.chain_marks.get(idx))
-                    .map(|m| m.layer.clone())
-                );
-            if let Some(layer) = save_dispatch {
-                let needs_saves = compiler
-                    .last_csha_bridge
-                    .as_ref()
-                    .and_then(|b| b.extras_for_layer(&layer))
-                    .map(|e| e.save_activations_for_backward)
-                    .unwrap_or(false);
-                if needs_saves {
-                    // Derive (batch, heads, seq, head_dim) from q tensor.
-                    // q shape is [batch, heads, seq, head_dim] — matches the
-                    // `compile_flash_attention_call` convention used by the
-                    // Gap A allocation helper.
-                    let dim0 = builder.ins().iconst(cl_types::I64, 0);
-                    let dim1 = builder.ins().iconst(cl_types::I64, 1);
-                    let dim2 = builder.ins().iconst(cl_types::I64, 2);
-                    let dim3 = builder.ins().iconst(cl_types::I64, 3);
-                    let b = call(compiler, builder, "nsl_tensor_shape_dim", &[q, dim0])?;
-                    let h = call(compiler, builder, "nsl_tensor_shape_dim", &[q, dim1])?;
-                    let s = call(compiler, builder, "nsl_tensor_shape_dim", &[q, dim2])?;
-                    let hd = call(compiler, builder, "nsl_tensor_shape_dim", &[q, dim3])?;
-
-                    // 6 × i64 = 48 bytes, aligned to 8.  Mirrors Gap A's
-                    // stack slot in `compile_flash_attention_call`.
-                    let saves_slot = builder.create_sized_stack_slot(
-                        cranelift_codegen::ir::StackSlotData::new(
-                            cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
-                            48,
-                            8,
-                        ),
-                    );
-                    let saves_ptr = builder.ins().stack_addr(cl_types::I64, saves_slot, 0);
-                    let _alloc_rc = call(
-                        compiler,
-                        builder,
-                        "nsl_csha_alloc_backward_activations_into",
-                        &[b, h, s, hd, saves_ptr],
-                    )?;
-                    let q_proj_v = builder.ins().stack_load(cl_types::I64, saves_slot, 0);
-                    let k_proj_v = builder.ins().stack_load(cl_types::I64, saves_slot, 8);
-                    let v_proj_v = builder.ins().stack_load(cl_types::I64, saves_slot, 16);
-                    let row_max_v = builder.ins().stack_load(cl_types::I64, saves_slot, 24);
-                    let row_sum_v = builder.ins().stack_load(cl_types::I64, saves_slot, 32);
-                    let x_raw_v = builder.ins().stack_load(cl_types::I64, saves_slot, 40);
-
-                    let (bwd_ptx_id, bwd_name_id) = compiler
-                        .kernels
-                        .flash_attention_context
-                        .as_ref()
-                        .map(|c| (c.csha_backward_ptx_data_id, c.csha_backward_name_data_id))
-                        .unwrap_or((None, None));
-
-                    compiler.csha_forward_saves.insert(
-                        layer,
-                        crate::csha_apply::CshaSavePointers {
-                            q_proj: q_proj_v,
-                            k_proj: k_proj_v,
-                            v_proj: v_proj_v,
-                            row_max: row_max_v,
-                            row_sum: row_sum_v,
-                            x_raw: x_raw_v,
-                            backward_ptx_data_id: bwd_ptx_id,
-                            backward_name_data_id: bwd_name_id,
-                        },
-                    );
-                }
-            }
+            // This arm (decomposition) only runs for UNCLAIMED SDPA
+            // ops — i.e. CSHA is off, or the dispatcher didn't claim
+            // this op.  Unclaimed ops by definition don't need save
+            // buffers (the backward consumer for them is the classic
+            // `FlashAttentionBackwardExtract` / `nsl_flash_attention_backward`
+            // path, not `FusedCshaBackward`).  So no save-alloc here.
 
             Ok(result)
         }
