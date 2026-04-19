@@ -1,7 +1,8 @@
 //! CPDT — quantized optimizer step codegen.
 //!
 //! Emits the structured op-program for a per-layer fused optimizer step
-//! that honours the [`PrecisionPlan`] from `cpdt_precision`.  Mirrors
+//! that honours the [`PrecisionPlan`] from `cpdt_tier_apply` (formerly
+//! `cpdt_precision`, renamed by the Phase 1 weight-aware refactor). Mirrors
 //! FASE's approach (paper §4 composition): the optimizer is inlined
 //! into the backward pass as a sequence of [`QuantizedOptimOp`]s that
 //! the downstream PTX / Cranelift emitters consume.
