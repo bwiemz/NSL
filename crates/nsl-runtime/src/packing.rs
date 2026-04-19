@@ -162,8 +162,13 @@ pub fn packed_batch_to_dict(batch: &PackedBatch) -> i64 {
     // but the current tensor helper allocates f32 storage and data_f32()
     // asserts dtype==1. Use dtype=1 (f32) backing for now; values are
     // lossless (u16 max = 65535 < 2^24 mantissa of f32).
-    // TODO(PCA Tier A Task N): switch to narrow-dtype storage once the
-    // tensor helper supports DTYPE_U16_SEGMENT natively.
+    // TODO(PCA Tier A, post-Task-7b): narrow-dtype (u16) storage for
+    // segment_ids is a DataLoader-backend follow-up. The dict key and
+    // shape contract are stable today; the physical backing promotes
+    // from f32 to true u16 once the tensor helper supports
+    // DTYPE_U16_SEGMENT. u16 values round-trip through f32 exactly
+    // (max=65535 < 2^24), so current storage is lossless but wastes
+    // 2x bytes per position.
     let _ = DTYPE_U16_SEGMENT; // imported for future use; see TODO above
     let seg_ptr = create_tensor_with_shape_rs_dtype(&[b, s], 1);
     let seg_tensor = NslTensor::from_ptr(seg_ptr);
@@ -389,6 +394,28 @@ mod tests {
         .expect("pack_batch produced a batch");
 
         assert_eq!(batch.segment_ids, vec![0u16, 0, 0, 1, 1, 1, 1, 2]);
+    }
+
+    #[test]
+    fn pack_batch_segment_ids_trailing_eos_does_not_overflow() {
+        // Stream ends with EOS: [10, 11, 12, EOS=2] with seq_len=4.
+        // The trailing EOS is part of segment 0; no phantom segment 1
+        // should appear because there is no position after it.
+        // Expected segment_ids: [0, 0, 0, 0].
+        let stream: Vec<f64> = vec![10.0, 11.0, 12.0, 2.0];
+        let mut cursor: usize = 0;
+        let batch = pack_batch(
+            stream.as_ptr() as *const c_void,
+            stream.len(),
+            0,               // DTYPE_F64
+            &mut cursor,
+            1,               // batch_size
+            4,               // seq_len
+            2,               // eos_token
+        )
+        .expect("pack_batch produced a batch");
+
+        assert_eq!(batch.segment_ids, vec![0u16, 0, 0, 0]);
     }
 
     #[test]
