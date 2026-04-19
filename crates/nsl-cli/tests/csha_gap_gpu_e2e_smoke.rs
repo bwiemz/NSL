@@ -455,45 +455,56 @@ fn csha_gap_gpu_e2e_csha_fused_path() {
              rule that keeps SGD's `copy_data(param, ...)` dtype-compatible.\n\
              stderr:\n{stderr}"
         );
-        // Known blocker (2026-04-16, updated): the launch-input shifting
-        // bug in `source_ad.rs::generate` has been fixed — the
-        // FusedCshaBackward op no longer receives `scale` at the
-        // `x_ptr` slot, so `csha_tensor_data_ptr`'s auto-promotion now
-        // produces a correctly shaped tensor for every positional arg
-        // (verified via per-arg shape dump in the FFI).  The kernel
-        // now receives well-formed device pointers for q/k/v/x/wq/wk/wv
-        // /norm_weight (all CPU tensors auto-promoted to GPU).
+        // Known blocker (2026-04-16, updated post-3a):
         //
-        // What STILL fails: the backward kernel crashes with
-        // ILLEGAL_ADDRESS on launch because the forward CSHA kernel
-        // (`nsl_flash_attention_csha_with_saves`) is never called
-        // under `--source-ad` — `PrimalOp::ScaledDotProductAttention`
-        // lowers to primitive matmul/softmax/etc. in
-        // `wengert_lower.rs:878`, not to the fused forward FFI.  That
-        // leaves the six save buffers (q_proj/k_proj/v_proj/row_max/
-        // row_sum/x_raw) allocated-but-uninitialised, and the
-        // backward kernel's first HBM load on them trips the
-        // illegal-address trap.  Context poisoning then surfaces the
-        // panic at the NEXT cuMemcpyHtoD_v2 call — same stderr
-        // signature as before.
+        // Option 3a has landed — `PrimalOp::ScaledDotProductAttention`
+        // under a CSHA dispatcher claim now lowers to the fused
+        // `nsl_flash_attention_csha_with_saves` FFI instead of
+        // decomposing into primitive matmul/softmax/matmul. The
+        // structural preconditions are all green:
+        //   - `csha-3a-diag` confirms the claim fires
+        //     (layer="m", needs_saves=true).
+        //   - `nsl_flash_attention_csha_with_saves` reloc is in the
+        //     emitted object (pinned by
+        //     `csha_fused_forward_under_source_ad::fused_forward_ffi_present_and_decomposed_softmax_absent`).
+        //   - `nsl_tensor_softmax` reloc is ABSENT → decomposition
+        //     did NOT fire.
+        //   - Save buffers are allocated by the forward and registered
+        //     under `csha_forward_saves[layer]` where Gap D.1's
+        //     backward lowerer reads them.
         //
-        // Follow-up PR: either (a) have the AD emit a forward-fused
-        // CSHA launch alongside the backward (mirroring
-        // `compile_flash_attention_call`'s _with_saves path) so the
-        // save buffers get populated, or (b) teach the backward
-        // kernel to recompute post-projection Q/K/V from raw Q/K/V +
-        // projection weights when the save buffers are null.
+        // What STILL fails at runtime (independent of the 3a forward
+        // claim): `cuMemcpyHtoD_v2(4096 bytes)` with
+        // CUDA_ERROR_ILLEGAL_ADDRESS. The 4096-byte size matches an
+        // f32 [32,32] tensor slice (likely the SGD writeback of one
+        // of the weight grads, or the CPU→GPU auto-promote of an
+        // input that was freed earlier in the step).
+        //
+        // This is a DIFFERENT bug from the pre-3a save-buffer-not-
+        // populated class — it's runtime lifetime / placement logic
+        // that 3a does not touch. Follow-up needs to:
+        //   (a) add a cudarc sync after the fused forward launch +
+        //       check rc, OR
+        //   (b) trace which HtoD site trips this assertion (the size
+        //       narrows it but the call site needs a diag ring buffer),
+        //       OR
+        //   (c) retry with `--gpu-mem-sync` env var equivalent.
+        //
+        // Keep the skip so the post-3a structural wins (documented
+        // above + in the dedicated test file) are observable and the
+        // runtime follow-up is a separate PR scope.
         let device_placement_signature =
             stderr.contains("cuMemcpyHtoD_v2")
                 && stderr.contains("CUDA_ERROR_ILLEGAL_ADDRESS");
         if device_placement_signature {
             eprintln!(
-                "[csha-gpu-e2e-csha] SKIP — known blocker: launch-input \
-                 argument-shifting bug fixed (scale no longer passed as x_ptr) \
-                 but forward CSHA kernel not emitted under --source-ad, \
-                 so backward-kernel's save buffers (q_proj/k_proj/v_proj/\
-                 row_max/row_sum/x_raw) stay uninitialised and the \
-                 backward kernel ILLEGAL_ADDRESSes on first HBM load.\n\
+                "[csha-gpu-e2e-csha] SKIP — post-3a blocker: fused forward \
+                 FFI IS emitted (pinned by csha_fused_forward_under_source_ad) \
+                 and save buffers ARE allocated, but runtime still hits \
+                 cuMemcpyHtoD_v2 ILLEGAL_ADDRESS during the training step. \
+                 This is an orthogonal CPU/GPU lifetime bug, not the save-\
+                 buffer-not-populated failure 3a fixed. Next follow-up: \
+                 trace the HtoD call site (4096 bytes = f32 [32,32] slice).\n\
                  stderr tail:\n{}",
                 stderr.lines().rev().take(5).collect::<Vec<_>>().join("\n")
             );
