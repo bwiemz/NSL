@@ -294,6 +294,23 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
         &[types::I64, types::I64, types::I64, types::I64],
         Some(types::I64),
     ),
+    // B.3.1 GatedLoRA args: (x_ptr, w_ptr, a_ptr, b_ptr, scale_f64, gate_ptr, kernel_handle_i64).
+    // Body is a stub returning the base matmul (x @ W) until Task 5.0.c registers the real
+    // fused PTX kernel.  The FFI declaration is needed here so compile_call resolves the
+    // callee symbol and falls through to compile_traced_call rather than compile_indirect_call.
+    (
+        "nsl_adapter_fused_gatedlora_matmul",
+        &[
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::F64,
+            types::I64,
+            types::I64,
+        ],
+        Some(types::I64),
+    ),
     // WRGA B.3 Task 5.6: fused-PTX runtime registry registration.
     // Args: (handle_i64, ptx_ptr_i64, ptx_len_i64, name_ptr_i64, name_len_i64).
     // Called from `main` preamble, one call per unique (m,n,k,rank,sm) key.

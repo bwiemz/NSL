@@ -614,3 +614,237 @@ pub fn emit_ia3_gamma_multiply(ptx: &mut String) {
 pub fn emit_ia3_store_output(ptx: &mut String, n: u32) {
     emit_lora_store_output(ptx, n);
 }
+
+/// Emit a PTX fp32 sigmoid approximation using the hardware approx units.
+///
+/// Produces `output = 1 / (1 + exp(-input))` as 4 PTX instructions:
+///   mul.f32  %sig_tmp, <input>, 0fBFB8AA3B;   // * -log2(e) = -1.4426950408
+///   ex2.approx.f32 %sig_tmp, %sig_tmp;         // e^(-input)
+///   add.f32  %sig_tmp, %sig_tmp, 0f3F800000;   // + 1.0
+///   rcp.approx.f32 <output>, %sig_tmp;         // sigmoid(input)
+///
+/// Hex constants:
+///   0fBFB8AA3B = -log2(e) as f32 (sign=1, exp=0x7F, mantissa=0x38AA3B).
+///     DO NOT use 0f3FB8AA3B (= +log2(e), silently computes sigmoid(-input))
+///     DO NOT use 0f3FBE2FB9 (= +1.486, historical bad spec-draft value).
+///   0f3F800000 = 1.0 as f32.
+///
+/// Requires: the caller has declared `%sig_tmp` as `.reg .f32` in the
+/// kernel's register pool.  For GatedLoRA, this is declared in the
+/// `emit_fused_adapter_kernel_body`'s PerColumnSigmoid register block
+/// (added in Task 4.1).
+pub fn emit_sigmoid_approx_fused(ptx: &mut String, input: &str, output: &str) {
+    ptx.push_str(&format!(
+        "    mul.f32  %sig_tmp, {input}, 0fBFB8AA3B;   // * -log2(e)\n"
+    ));
+    ptx.push_str("    ex2.approx.f32 %sig_tmp, %sig_tmp;\n");
+    ptx.push_str("    add.f32  %sig_tmp, %sig_tmp, 0f3F800000;   // + 1.0\n");
+    ptx.push_str(&format!(
+        "    rcp.approx.f32 {output}, %sig_tmp;\n"
+    ));
+}
+
+/// Emit a per-thread gate load for the GatedLoRA fused kernel.
+///
+/// Each thread owns exactly 2 output columns in the m16n8k16 D-fragment
+/// (cols `col_base_in_tile + 0` and `+1`, where `col_base_in_tile = (tid%4)*2`).
+/// This helper emits the address arithmetic + 2 `ld.global.f32` calls to
+/// load those 2 gate values into `%gate0` and `%gate1`.
+///
+/// Requires (caller must have declared / initialized before this call):
+///   %rd_gate      — loaded from .param .u64 gate_ptr at prolog
+///   %col_base     — output-tile column base (from emit_lora_output_tile_coords_dynamic)
+///   %r5           — col_base_in_tile = (tid%4)*2 (computed by emit_matmul_mma_lane_init OR
+///                    by the store preamble; caller must ensure a setter has run first)
+///   %r_gate       — declared .reg .u32
+///   %rd_gate_addr — declared .reg .u64
+///   %gate0, %gate1 — declared .reg .f32
+///
+/// Warp-broadcast alternative explicitly avoided: would 4× HBM gate
+/// traffic for no benefit since each thread consumes only 2 of 8 columns.
+/// See invariant #13 in project_wrga_fused_ptx_rewrite.md.
+///
+/// TODO(gate-dtype): the `shl.b32 %r_gate, %r_gate, 2` assumes f32 gate.
+/// If gate dtype ever narrows to f16, shift constant becomes 1.
+pub fn emit_gate_load_per_thread(ptx: &mut String) {
+    ptx.push_str("    // GatedLoRA: per-thread gate load - 2 cols per thread\n");
+    ptx.push_str("    add.u32  %r_gate, %col_base, %r5;\n");
+    ptx.push_str("    shl.b32  %r_gate, %r_gate, 2;   // * 4 bytes (f32)\n");
+    ptx.push_str("    cvt.u64.u32 %rd_gate_addr, %r_gate;\n");
+    ptx.push_str("    add.u64  %rd_gate_addr, %rd_gate, %rd_gate_addr;\n");
+    ptx.push_str("    ld.global.f32 %gate0, [%rd_gate_addr];\n");
+    ptx.push_str("    ld.global.f32 %gate1, [%rd_gate_addr + 4];\n");
+}
+
+/// Emit the GatedLoRA fold step: per-thread, per-column fold of the
+/// epilogue accumulator into `main_accum` with predicated OOB masking.
+///
+///   main_accum0 += %epi_final0 * %gate0 * %scale_reg   (col 0, row 0)
+///   main_accum2 += %epi_final2 * %gate0 * %scale_reg   (col 0, row 8)
+///   main_accum1 += %epi_final1 * %gate1 * %scale_reg   (col 1, row 0)
+///   main_accum3 += %epi_final3 * %gate1 * %scale_reg   (col 1, row 8)
+///
+/// Each add is predicated on `%p_col0` / `%p_col1` (computed from
+/// `%n_real`) so OOB output columns in partial tiles don't corrupt
+/// main_accum.  See spec §2 Fixture D bug-class and invariant #15.
+///
+/// Requires (caller must have declared / initialized before this call):
+///   %r5           — col_base_in_tile = (tid%4)*2 (from emit_matmul_mma_lane_init)
+///   %n_real       — real n for this output tile (from emit_lora_output_tile_coords_dynamic)
+///   %gate0, %gate1 — sigmoid(gate) values (from emit_gate_load_per_thread + emit_sigmoid_approx_fused)
+///   %scale_reg    — loaded from .param .f32 scale at prolog
+///   %epi_final0..3 — declared (4 f32 from the post-loop (x@A)@B MMA)
+///   %main_accum0..3 — declared (4 f32 main MMA accumulator)
+///   %r_col1       — declared .reg .u32
+///   %fold_tmp     — declared .reg .f32
+///   %p_col0, %p_col1 — declared .reg .pred
+///
+/// See invariants #13–#15 for per-thread / LastKIter / FoldResultMask
+/// correctness requirements.
+pub fn emit_gatedlora_fold(ptx: &mut String) {
+    ptx.push_str("    // GatedLoRA fold: main_accum += epi_final * sigmoid(gate) * scale\n");
+    ptx.push_str("    //   predicated on n_real bounds to skip OOB cols in partial tiles\n");
+    ptx.push_str("    setp.lt.u32  %p_col0, %r5, %n_real;\n");
+    ptx.push_str("    add.u32      %r_col1, %r5, 1;\n");
+    ptx.push_str("    setp.lt.u32  %p_col1, %r_col1, %n_real;\n");
+
+    // main_accum0 (col 0, row 0), main_accum2 (col 0, row 8) — gate0, p_col0
+    ptx.push_str("    mul.f32      %fold_tmp, %epi_final0, %gate0;\n");
+    ptx.push_str("    mul.f32      %fold_tmp, %fold_tmp, %scale_reg;\n");
+    ptx.push_str("    @%p_col0 add.f32 %main_accum0, %main_accum0, %fold_tmp;\n");
+    ptx.push_str("    mul.f32      %fold_tmp, %epi_final2, %gate0;\n");
+    ptx.push_str("    mul.f32      %fold_tmp, %fold_tmp, %scale_reg;\n");
+    ptx.push_str("    @%p_col0 add.f32 %main_accum2, %main_accum2, %fold_tmp;\n");
+
+    // main_accum1 (col 1, row 0), main_accum3 (col 1, row 8) — gate1, p_col1
+    ptx.push_str("    mul.f32      %fold_tmp, %epi_final1, %gate1;\n");
+    ptx.push_str("    mul.f32      %fold_tmp, %fold_tmp, %scale_reg;\n");
+    ptx.push_str("    @%p_col1 add.f32 %main_accum1, %main_accum1, %fold_tmp;\n");
+    ptx.push_str("    mul.f32      %fold_tmp, %epi_final3, %gate1;\n");
+    ptx.push_str("    mul.f32      %fold_tmp, %fold_tmp, %scale_reg;\n");
+    ptx.push_str("    @%p_col1 add.f32 %main_accum3, %main_accum3, %fold_tmp;\n");
+}
+
+#[cfg(test)]
+mod sigmoid_tests {
+    use super::emit_sigmoid_approx_fused;
+
+    #[test]
+    fn emit_sigmoid_approx_fused_has_correct_log2e_constant() {
+        let mut ptx = String::new();
+        emit_sigmoid_approx_fused(&mut ptx, "%in", "%out");
+
+        // Critical: the mul line must use the NEGATIVE log2(e) constant.
+        let mul_line = ptx.lines()
+            .find(|l| l.contains("mul.f32") && l.contains("%sig_tmp"))
+            .expect("expected mul.f32 %sig_tmp line in emission");
+        assert!(
+            mul_line.contains("0fBFB8AA3B"),
+            "mul line must use -log2(e) = 0fBFB8AA3B; got: {mul_line}"
+        );
+
+        // Belt-and-suspenders: reject the historical bad value.
+        assert!(
+            !ptx.contains("0f3FBE2FB9"),
+            "regression to spec-draft bad positive constant 0f3FBE2FB9:\n{ptx}"
+        );
+
+        // Also reject the sign-flipped case (would silently compute sigmoid(-x)).
+        assert!(
+            !ptx.contains("mul.f32  %sig_tmp, %in, 0f3FB8AA3B"),
+            "sign-flipped +log2(e) constant detected; would compute sigmoid(-input):\n{ptx}"
+        );
+
+        // Structural: exactly one ex2.approx and one rcp.approx.
+        assert_eq!(ptx.matches("ex2.approx.f32").count(), 1);
+        assert_eq!(ptx.matches("rcp.approx.f32").count(), 1);
+        assert!(ptx.contains("0f3F800000"), "missing +1.0 constant");
+        assert!(ptx.contains("%in"), "missing input register reference");
+        assert!(ptx.contains("%out"), "missing output register reference");
+    }
+
+    #[test]
+    fn emit_gatedlora_fold_masks_correctly_per_column() {
+        use super::emit_gatedlora_fold;
+        let mut ptx = String::new();
+        emit_gatedlora_fold(&mut ptx);
+
+        // Predicate setup: two setp.lt.u32 for the two-column fold.
+        assert_eq!(
+            ptx.matches("setp.lt.u32").count(), 2,
+            "expected 2 setp.lt.u32 for %p_col0 and %p_col1; got:\n{ptx}"
+        );
+
+        // 4 predicated adds, one per main_accum[0..3].
+        assert_eq!(
+            ptx.matches("@%p_col").count(), 4,
+            "expected 4 predicated adds (main_accum0..3); got:\n{ptx}"
+        );
+
+        // Column-parity wiring: main_accum0,2 gated by p_col0; main_accum1,3 gated by p_col1.
+        assert!(
+            ptx.contains("@%p_col0 add.f32 %main_accum0"),
+            "main_accum0 (col 0, row 0) must be gated by p_col0"
+        );
+        assert!(
+            ptx.contains("@%p_col0 add.f32 %main_accum2"),
+            "main_accum2 (col 0, row 8) must be gated by p_col0"
+        );
+        assert!(
+            ptx.contains("@%p_col1 add.f32 %main_accum1"),
+            "main_accum1 (col 1, row 0) must be gated by p_col1"
+        );
+        assert!(
+            ptx.contains("@%p_col1 add.f32 %main_accum3"),
+            "main_accum3 (col 1, row 8) must be gated by p_col1"
+        );
+
+        // Gate wiring: main_accum0/2 use %gate0; main_accum1/3 use %gate1.
+        assert!(
+            ptx.contains("mul.f32      %fold_tmp, %epi_final0, %gate0"),
+            "main_accum0 fold must multiply by %gate0"
+        );
+        assert!(
+            ptx.contains("mul.f32      %fold_tmp, %epi_final1, %gate1"),
+            "main_accum1 fold must multiply by %gate1"
+        );
+
+        // Scale multiplication present exactly 4 times (one per main_accum position).
+        assert_eq!(
+            ptx.matches("mul.f32      %fold_tmp, %fold_tmp, %scale_reg").count(), 4,
+            "expected 4 scale multiplications; got:\n{ptx}"
+        );
+    }
+
+    #[test]
+    fn emit_gate_load_per_thread_emits_two_f32_loads_with_correct_stride() {
+        use super::emit_gate_load_per_thread;
+        let mut ptx = String::new();
+        emit_gate_load_per_thread(&mut ptx);
+
+        // Exactly 2 ld.global.f32 — one per gate value.
+        assert_eq!(
+            ptx.matches("ld.global.f32").count(),
+            2,
+            "expected 2 per-thread gate loads; got:\n{ptx}"
+        );
+
+        // Byte-stride must be 4 (f32); catches gate-dtype regression.
+        assert!(
+            ptx.contains("shl.b32  %r_gate, %r_gate, 2"),
+            "gate offset must shift-left by 2 (f32 stride); got:\n{ptx}"
+        );
+
+        // Second load at offset +4 (second gate value).
+        assert!(
+            ptx.contains("ld.global.f32 %gate1, [%rd_gate_addr + 4]"),
+            "second gate load missing or wrong offset:\n{ptx}"
+        );
+
+        // Base pointer summation.
+        assert!(
+            ptx.contains("add.u64  %rd_gate_addr, %rd_gate, %rd_gate_addr"),
+            "gate address must sum base + offset:\n{ptx}"
+        );
+    }
+}

@@ -35,6 +35,28 @@ pub struct FusedIa3Config {
     pub target_sm: u32,
 }
 
+/// Config for `synthesize_fused_gatedlora_ptx`.  Mirrors `FusedLoraConfig`
+/// field-for-field; the produced kernel emits the `PerColumnSigmoid` fold
+/// variant via the shared `emit_fused_adapter_kernel_body`.
+///
+/// Separate type so kernel-dedup and dispatch don't confuse GatedLoRA and
+/// LoRA kernel instances (different kernel_handle ⇒ different PTX registry
+/// entry).
+///
+/// scale is NOT a field — it flows at launch time via `.param .f32 scale`
+/// (B.3 dedup invariant; see spec Risk #5).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct FusedGatedLoraConfig {
+    pub site_id: String,
+    pub m: u32,         // batch
+    pub n: u32,         // d_out
+    pub k: u32,         // k_in (shared dim of x@W)
+    pub rank: u32,      // ≤ 16
+    pub target_sm: u32, // 80, 86, ...
+                        // scale is intentionally NOT a field — passed at launch time as
+                        // .param .f32.  See dedup notes in B.3 spec Risk #5.
+}
+
 /// Kernel cache key for dedup.  Sites with matching key share one PTX.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct LoraKernelKey {
@@ -57,21 +79,100 @@ impl FusedLoraConfig {
     }
 }
 
+impl FusedGatedLoraConfig {
+    /// B.3.1 Task 5.0.c: reuse `LoraKernelKey` for the dedup key since
+    /// the shape fields are identical.  GatedLoRA entries live in the
+    /// separate `fused_gatedlora_ptx_kernels` map so there is no
+    /// collision with LoRA kernels that share the same shape.
+    pub fn kernel_key(&self) -> LoraKernelKey {
+        LoraKernelKey {
+            m: self.m,
+            n: self.n,
+            k: self.k,
+            rank: self.rank,
+            target_sm: self.target_sm,
+        }
+    }
+}
+
+/// Variation point for `emit_fused_adapter_kernel_body`'s fold step.
+/// LoRA uses `Scalar`; GatedLoRA uses `PerColumnSigmoid`.
+///
+/// Note: scale is NOT carried here — it's a `.param .f32 scale` loaded
+/// into `%scale_reg` at the kernel prolog, same for both adapter types.
+/// B.3 spec Risk #5: scale-as-param enables kernel dedup across sites
+/// with different alpha values.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum FoldKind {
+    /// LoRA: `main_accum += epi_final * %scale_reg`  (uniform scalar scale from param)
+    Scalar,
+    /// GatedLoRA: `main_accum += epi_final * sigmoid(gate[col]) * %scale_reg`  (per-column)
+    PerColumnSigmoid {
+        gate_ptr_param_name: &'static str,
+        gate_load_phase: GateLoadPhase,
+        partial_tile_mask: PartialTileMask,
+    },
+}
+
+/// Scheduling hint for when to emit gate-load + sigmoid computation in the
+/// PerColumnSigmoid fused body.
+///
+/// B.3.1 ships with `LastKIter` unconditionally; all shipped configs have
+/// `k_iters >= 1` for the epilogue path.  `PostLoop` is reserved for a
+/// potential future milestone that benchmarks load-phase alternatives.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum GateLoadPhase {
+    /// Emit gate load + sigmoid at the end of the final main K-iteration,
+    /// before its bar.sync.  Overlaps HBM load latency with the final MMA.
+    LastKIter,
+    /// Emit gate load + sigmoid after the main K-loop completes, before
+    /// the post-loop (x@A)@B MMA.  Has NO emission site in B.3.1; reserved.
+    PostLoop,
+}
+
+/// Partial-tile handling strategy for sub-MMA output tiles (n < 8).
+///
+/// B.3.1 ships `FoldResultMask` unconditionally; `SentinelGate` is reserved
+/// for a future variant that stages gate through SMEM with a sentinel value.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum PartialTileMask {
+    /// Mask fold contribution with @%p_colN predicate; OOB gate reads
+    /// are harmless because the fold output is discarded.
+    FoldResultMask,
+    /// Pre-populate OOB gate SMEM slots with -20.0 such that sigmoid(-20) ≈ 0
+    /// naturally zeros the contribution.  Not emitted by B.3.1.
+    SentinelGate,
+}
+
 const MMA_K_U32: u32 = 16; // m16n8k16
 
-/// Synthesize the full PTX for an epilogue-fused LoRA matmul kernel.
+/// Shared kernel body for fused adapter matmul kernels.
 ///
-/// **Rank ceiling:** `config.rank <= 16` (single-pass epilogue).  Caller
-/// must validate before invoking; this fn panics on violation (caller
-/// error — decorator inject pass enforces a proper compile error).
-pub fn synthesize_fused_lora_ptx(config: &FusedLoraConfig) -> String {
-    assert!(
-        config.rank <= 16,
-        "B.3 rank ceiling: {} > 16; multi-pass epilogue is a follow-up milestone",
-        config.rank,
-    );
-    assert!(config.target_sm >= 80, "B.3 requires sm_80+");
-
+/// Emits the full kernel entry + body for either LoRA (FoldKind::Scalar)
+/// or GatedLoRA (FoldKind::PerColumnSigmoid).  Variation points:
+///   - Param block: PerColumnSigmoid adds `.param .u64 gate_ptr`
+///   - Fold step: Scalar uses %scale_reg uniform multiply; PerColumnSigmoid
+///     uses per-thread sigmoid(gate) multiply (implemented in Task 4.1;
+///     this task leaves the PerColumnSigmoid fold as a placeholder that
+///     emits the same Scalar math so unit tests compile and run plausibly).
+///
+/// All other phases (header, SMEM, register pool, indexing, param loads,
+/// output coords, accumulator init, main K-loop, post-loop (x@A)@B MMA,
+/// f32→packed-f16 conversion for final MMA A-operand, store, ret) are
+/// identical between the two FoldKind variants.
+#[allow(dead_code)]
+fn emit_fused_adapter_kernel_body(
+    ptx: &mut String,
+    entry_name: &str,
+    m: u32,
+    n: u32,
+    k: u32,
+    rank: u32,
+    fold: FoldKind,
+) {
     use crate::kernel_skeleton::header::{emit_ptx_header, PtxVersion, TargetSm};
     use crate::kernel_skeleton::indexing::emit_thread_lane_warp_register_init;
     use crate::kernel_skeleton::params::{
@@ -88,18 +189,24 @@ pub fn synthesize_fused_lora_ptx(config: &FusedLoraConfig) -> String {
         emit_zero_accumulators, wrga_lora_register_budget,
     };
 
-    let mut ptx = String::new();
-    let budget = wrga_lora_register_budget(config);
+    // Build a FusedLoraConfig just for register budget computation.
+    // target_sm=80 matches the Sm80 header below; this function always targets sm_80+.
+    let budget_cfg = crate::wrga_fused_ptx::FusedLoraConfig {
+        site_id: String::new(),
+        m,
+        n,
+        k,
+        rank,
+        target_sm: 80,
+    };
+    let budget = wrga_lora_register_budget(&budget_cfg);
 
     // 1. File header.
-    emit_ptx_header(&mut ptx, PtxVersion::V7_0, TargetSm::Sm80);
+    emit_ptx_header(ptx, PtxVersion::V7_0, TargetSm::Sm80);
 
     // 2. Param block (opens entry + `{` body).
-    let entry_name = format!(
-        "nsl_wrga_fused_lora_m{}n{}k{}r{}",
-        config.m, config.n, config.k, config.rank,
-    );
-    let params = [
+    // Variation point A: PerColumnSigmoid appends gate_ptr.
+    let mut params = vec![
         Param { ty: ParamTy::U64, name: "x_ptr" },
         Param { ty: ParamTy::U64, name: "w_ptr" },
         Param { ty: ParamTy::U64, name: "a_ptr" },
@@ -107,17 +214,29 @@ pub fn synthesize_fused_lora_ptx(config: &FusedLoraConfig) -> String {
         Param { ty: ParamTy::F32, name: "scale" },
         Param { ty: ParamTy::U64, name: "y_ptr" },
         // m_rows and n_cols are passed as runtime u32 parameters so the same
-        // kernel binary handles any batch size.  The compile-time config.m/n
+        // kernel binary handles any batch size.  The compile-time m/n
         // are only used for staging (k-iteration count, rank padding) and
         // kernel naming; predication uses the runtime values.
         Param { ty: ParamTy::U32, name: "m_rows" },
         Param { ty: ParamTy::U32, name: "n_cols" },
     ];
-    emit_param_block(&mut ptx, &entry_name, &params);
+    if matches!(fold, FoldKind::PerColumnSigmoid { .. }) {
+        params.push(Param { ty: ParamTy::U64, name: "gate_ptr" });
+    }
+    emit_param_block(ptx, entry_name, &params);
 
     // 3. SMEM decl + register pool + shmem base + thread/lane/warp init.
-    emit_static_smem_decl(&mut ptx, 1536);
-    emit_lora_register_pool(&mut ptx, &budget);
+    emit_static_smem_decl(ptx, 1536);
+    emit_lora_register_pool(ptx, &budget);
+    // GatedLoRA-specific register declarations (PerColumnSigmoid only)
+    if matches!(fold, FoldKind::PerColumnSigmoid { .. }) {
+        ptx.push_str("    .reg .f32 %gate0, %gate1;\n");
+        ptx.push_str("    .reg .f32 %sig_tmp;\n");
+        ptx.push_str("    .reg .f32 %fold_tmp;\n");
+        ptx.push_str("    .reg .u64 %rd_gate, %rd_gate_addr;\n");
+        ptx.push_str("    .reg .u32 %r_gate, %r_col1;\n");
+        ptx.push_str("    .reg .pred %p_col0, %p_col1;\n");
+    }
     // u32 tile-base shadow regs for SMEM addressing.
     ptx.push_str("    .reg .u32 %smem_base_x_u32, %smem_base_w_u32, %smem_base_a_u32, %smem_base_b_u32;\n");
     // f32 and b16 scratch for tile-staging f32→f16 conversion.
@@ -137,15 +256,15 @@ pub fn synthesize_fused_lora_ptx(config: &FusedLoraConfig) -> String {
     ptx.push_str("    .reg .b32 %epi_packed0, %epi_packed1, %epi_packed2, %epi_packed3;\n");
     // runtime m/n for tile predication (avoids ILLEGAL_ADDRESS on tail rows/cols).
     ptx.push_str("    .reg .u32 %m_param, %n_param;\n");
-    emit_shmem_base_cvta(&mut ptx);
-    emit_thread_lane_warp_register_init(&mut ptx);
-    emit_lora_tile_bases(&mut ptx);
+    emit_shmem_base_cvta(ptx);
+    emit_thread_lane_warp_register_init(ptx);
+    emit_lora_tile_bases(ptx);
     // Convert u64 tile bases to u32 shared addresses for matmul_mma helpers.
     ptx.push_str("    cvt.u32.u64 %smem_base_x_u32, %x_tile_base;\n");
     ptx.push_str("    cvt.u32.u64 %smem_base_w_u32, %w_tile_base;\n");
     ptx.push_str("    cvt.u32.u64 %smem_base_a_u32, %a_tile_base;\n");
     ptx.push_str("    cvt.u32.u64 %smem_base_b_u32, %b_tile_base;\n");
-    emit_matmul_mma_lane_init(&mut ptx);
+    emit_matmul_mma_lane_init(ptx);
     // Per-lane B-fragment column base offset in col-major SMEM layout.
     // Col-major B-tile: column c starts at byte c*32 (= c * 16 k-rows * 2 bytes/f16).
     // Thread t accesses column (t/4), so lane column base = (tid/4)*32.
@@ -163,22 +282,25 @@ pub fn synthesize_fused_lora_ptx(config: &FusedLoraConfig) -> String {
     ptx.push_str("    add.u32 %smem_base_b_lane_u32, %smem_base_b_u32, %r9;\n");
 
     // 4. Load params into named registers.
-    emit_ld_param_u64(&mut ptx, "%rd_x", "x_ptr");
-    emit_ld_param_u64(&mut ptx, "%rd_w", "w_ptr");
-    emit_ld_param_u64(&mut ptx, "%rd_a", "a_ptr");
-    emit_ld_param_u64(&mut ptx, "%rd_b", "b_ptr");
-    emit_ld_param_u64(&mut ptx, "%rd_y", "y_ptr");
-    emit_ld_param_f32(&mut ptx, "%scale_reg", "scale");
-    emit_ld_param_u32(&mut ptx, "%m_param", "m_rows");
-    emit_ld_param_u32(&mut ptx, "%n_param", "n_cols");
+    emit_ld_param_u64(ptx, "%rd_x", "x_ptr");
+    emit_ld_param_u64(ptx, "%rd_w", "w_ptr");
+    emit_ld_param_u64(ptx, "%rd_a", "a_ptr");
+    emit_ld_param_u64(ptx, "%rd_b", "b_ptr");
+    emit_ld_param_u64(ptx, "%rd_y", "y_ptr");
+    emit_ld_param_f32(ptx, "%scale_reg", "scale");
+    emit_ld_param_u32(ptx, "%m_param", "m_rows");
+    emit_ld_param_u32(ptx, "%n_param", "n_cols");
+    if matches!(fold, FoldKind::PerColumnSigmoid { .. }) {
+        emit_ld_param_u64(ptx, "%rd_gate", "gate_ptr");
+    }
 
     // 5. Output-tile coords + zero accumulators.
     // Use runtime m_param / n_param for predication — see the m_rows/n_cols
     // params added in step 2.  This fixes ILLEGAL_ADDRESS when the prescan
     // config.m (used only for staging) differs from the actual runtime batch.
-    emit_lora_output_tile_coords_dynamic(&mut ptx);
-    emit_zero_accumulators(&mut ptx, "main_accum", 8);
-    emit_zero_accumulators(&mut ptx, "epi_interm", 4);
+    emit_lora_output_tile_coords_dynamic(ptx);
+    emit_zero_accumulators(ptx, "main_accum", 8);
+    emit_zero_accumulators(ptx, "epi_interm", 4);
 
     // 6. Main K-loop with interleaved epilogue.
     //
@@ -186,7 +308,7 @@ pub fn synthesize_fused_lora_ptx(config: &FusedLoraConfig) -> String {
     // fragments.  The epi_interm MMA reuses %main_a_frag (x tile fragment)
     // as its A-operand — this is correct per spec §3 invariant (1): the
     // m16n8k16 A-fragment encodes only the m×k tile, independent of B.
-    let k_iters = (config.k + MMA_K_U32 - 1) / MMA_K_U32;
+    let k_iters = (k + MMA_K_U32 - 1) / MMA_K_U32;
 
     // Fragment register names for matmul_mma load helpers (without % — helpers add it).
     let main_a_frag_names: [String; 4] = [
@@ -235,40 +357,57 @@ pub fn synthesize_fused_lora_ptx(config: &FusedLoraConfig) -> String {
     for k_tile in 0..k_iters {
         ptx.push_str(&format!("    // ===== K-iteration {} =====\n", k_tile));
 
-        emit_lora_stage_x_tile(&mut ptx, k_tile, config.m, config.k);
-        emit_lora_stage_w_tile(&mut ptx, k_tile, config.n, config.k);
-        emit_lora_stage_a_tile(&mut ptx, k_tile, config.rank, config.k);
+        emit_lora_stage_x_tile(ptx, k_tile, m, k);
+        emit_lora_stage_w_tile(ptx, k_tile, n, k);
+        emit_lora_stage_a_tile(ptx, k_tile, rank, k);
 
         ptx.push_str("    bar.sync 0;\n");
 
         // Load A and B fragments from SMEM using u32 tile base addresses.
         // k_tile offset within the tile is handled at stage time (fresh per-iter).
-        emit_load_a_fragment_smem(&mut ptx, &main_a_frag_names, "%smem_base_x_u32", 32);
+        emit_load_a_fragment_smem(ptx, &main_a_frag_names, "%smem_base_x_u32", 32);
         // row_stride_bytes=1: mma_b_row already holds the full byte offset within the
         // col-major column (= (tid%4)*4).  The lane base (smem_base_w_lane_u32) adds
         // the column base ((tid/4)*32).  k-pair register offset = {0, 16} bytes comes
         // from emit_load_b_fragment_smem's byte_col_offset = k_base_pair*2 = {0, 16}.
-        emit_load_b_fragment_smem(&mut ptx, &main_b_frag_names, "%smem_base_w_lane_u32", 1);
+        emit_load_b_fragment_smem(ptx, &main_b_frag_names, "%smem_base_w_lane_u32", 1);
         // a_tile is col-major (B-operand in epilogue MMA: x @ a_tile).
         // Same col-major B-fragment addressing as w_tile above.
-        emit_load_b_fragment_smem(&mut ptx, &epi_a_frag_names, "%smem_base_a_lane_u32", 1);
+        emit_load_b_fragment_smem(ptx, &epi_a_frag_names, "%smem_base_a_lane_u32", 1);
 
         // Main MMA: main_accum += x_tile @ w_tile
-        emit_mma_instruction(&mut ptx, &main_accum, &main_a_frag, &main_b_frag, &main_accum);
+        emit_mma_instruction(ptx, &main_accum, &main_a_frag, &main_b_frag, &main_accum);
 
         // Epilogue interleaved MMA: epi_interm += x_tile @ a_tile
         // Reuses %main_a_frag (from x_tile, row-major) as A-operand; uses
         // epi_a_frag (from a_tile, col-major B-fragment, 2 b32 regs) as B-operand.
-        emit_mma_instruction(&mut ptx, &epi_interm, &main_a_frag, &epi_a_frag, &epi_interm);
+        emit_mma_instruction(ptx, &epi_interm, &main_a_frag, &epi_a_frag, &epi_interm);
+
+        // GatedLoRA: LastKIter scheduling — gate load + sigmoid at end of
+        // final main K-iteration, overlapping HBM load latency with the
+        // last main MMA.  See spec §2 and invariant #14.
+        if k_tile == k_iters - 1 {
+            if let FoldKind::PerColumnSigmoid {
+                gate_load_phase: GateLoadPhase::LastKIter, ..
+            } = fold {
+                // %r5 = col_base_in_tile = (tid%4)*2 — needed by emit_gate_load_per_thread.
+                // The store preamble also computes %r5 but runs after this point; emit here.
+                ptx.push_str("    and.b32 %r5, %tid_x, 3;\n");
+                ptx.push_str("    shl.b32 %r5, %r5, 1;\n");
+                crate::wrga_kernel_helpers::emit_gate_load_per_thread(ptx);
+                crate::wrga_kernel_helpers::emit_sigmoid_approx_fused(ptx, "%gate0", "%gate0");
+                crate::wrga_kernel_helpers::emit_sigmoid_approx_fused(ptx, "%gate1", "%gate1");
+            }
+        }
 
         ptx.push_str("    bar.sync 0;\n");
     }
 
     // 7. Post-loop: stage b once, compute (x@A) @ B.
-    emit_lora_stage_b_tile(&mut ptx, config.rank, config.n);
+    emit_lora_stage_b_tile(ptx, rank, n);
     ptx.push_str("    bar.sync 0;\n");
     // Same col-major byte-offset addressing as main W-fragment load.
-    emit_load_b_fragment_smem(&mut ptx, &epi_b_frag_names, "%smem_base_b_lane_u32", 1);
+    emit_load_b_fragment_smem(ptx, &epi_b_frag_names, "%smem_base_b_lane_u32", 1);
 
     // 8. Convert epi_interm (f32) → packed f16x2 (b32) for final MMA A-operand.
     //
@@ -290,26 +429,66 @@ pub fn synthesize_fused_lora_ptx(config: &FusedLoraConfig) -> String {
     ];
 
     // Zero-init epi_final and compute (x@A) @ B using packed A-fragments.
-    emit_zero_accumulators(&mut ptx, "epi_final", 4);
-    emit_mma_instruction(&mut ptx, &epi_final, &epi_packed, &epi_b_frag, &epi_final);
+    emit_zero_accumulators(ptx, "epi_final", 4);
+    emit_mma_instruction(ptx, &epi_final, &epi_packed, &epi_b_frag, &epi_final);
 
     // 9. Scale epi_final, fold into main_accum.
-    for i in 0..4u32 {
-        ptx.push_str(&format!(
-            "    mul.f32 %epi_final{i}, %epi_final{i}, %scale_reg;\n"
-        ));
-        ptx.push_str(&format!(
-            "    add.f32 %main_accum{i}, %main_accum{i}, %epi_final{i};\n"
-        ));
+    // Variation point B: Scalar uses %scale_reg uniform multiply;
+    // PerColumnSigmoid placeholder emits the same Scalar math for now —
+    // Task 4.1 replaces it with emit_gatedlora_fold() after the gate-load
+    // helpers from Task Group 2 are in place.
+    match fold {
+        FoldKind::Scalar => {
+            // LoRA fold: main_accum += epi_final * scale  (uniform scalar from param)
+            for i in 0..4u32 {
+                ptx.push_str(&format!(
+                    "    mul.f32 %epi_final{i}, %epi_final{i}, %scale_reg;\n"
+                ));
+                ptx.push_str(&format!(
+                    "    add.f32 %main_accum{i}, %main_accum{i}, %epi_final{i};\n"
+                ));
+            }
+        }
+        FoldKind::PerColumnSigmoid { .. } => {
+            crate::wrga_kernel_helpers::emit_gatedlora_fold(ptx);
+        }
     }
 
     // 10. Store to y with predication.
-    emit_lora_store_output(&mut ptx, config.n);
+    emit_lora_store_output(ptx, n);
 
     // 11. Close the entry body.
     ptx.push_str("    ret;\n");
     ptx.push_str("}\n");
+}
 
+/// Synthesize the full PTX for an epilogue-fused LoRA matmul kernel.
+///
+/// **Rank ceiling:** `config.rank <= 16` (single-pass epilogue).  Caller
+/// must validate before invoking; this fn panics on violation (caller
+/// error — decorator inject pass enforces a proper compile error).
+pub fn synthesize_fused_lora_ptx(config: &FusedLoraConfig) -> String {
+    assert!(
+        config.rank <= 16,
+        "B.3 rank ceiling: {} > 16; multi-pass epilogue is a follow-up milestone",
+        config.rank,
+    );
+    assert!(config.target_sm >= 80, "B.3 requires sm_80+");
+
+    let entry_name = format!(
+        "nsl_wrga_fused_lora_m{}n{}k{}r{}",
+        config.m, config.n, config.k, config.rank,
+    );
+    let mut ptx = String::new();
+    emit_fused_adapter_kernel_body(
+        &mut ptx,
+        &entry_name,
+        config.m,
+        config.n,
+        config.k,
+        config.rank,
+        FoldKind::Scalar,
+    );
     ptx
 }
 
@@ -455,6 +634,47 @@ pub fn synthesize_fused_ia3_ptx(config: &FusedIa3Config) -> String {
     ptx.push_str("    ret;\n");
     ptx.push_str("}\n");
 
+    ptx
+}
+
+/// Synthesize PTX for a fused GatedLoRA forward adapter kernel.
+///
+/// Computes `y[i,j] = (x @ W)[i,j] + sigmoid(gate[j]) * ((x @ A) @ B)[i,j] * scale`
+/// where `gate` is a per-output-column f32 vector.
+///
+/// Uses the shared `emit_fused_adapter_kernel_body` with
+/// `FoldKind::PerColumnSigmoid` to reuse LoRA's proven kernel body plus
+/// gate-load + sigmoid + per-column fold logic from `wrga_kernel_helpers`.
+///
+/// STUB — current body returns an invalid PTX header-only stub for
+/// Task 3.2's red-state test setup.  Task 4.1 replaces this with the real
+/// emission via `emit_fused_adapter_kernel_body(.., FoldKind::PerColumnSigmoid { .. })`.
+pub fn synthesize_fused_gatedlora_ptx(config: &FusedGatedLoraConfig) -> String {
+    assert!(
+        config.rank <= 16,
+        "B.3 rank ceiling: {} > 16; multi-pass epilogue is a follow-up milestone",
+        config.rank,
+    );
+    assert!(config.target_sm >= 80, "B.3 requires sm_80+");
+
+    let entry_name = format!(
+        "nsl_wrga_fused_gatedlora_m{}n{}k{}r{}",
+        config.m, config.n, config.k, config.rank,
+    );
+    let mut ptx = String::new();
+    emit_fused_adapter_kernel_body(
+        &mut ptx,
+        &entry_name,
+        config.m,
+        config.n,
+        config.k,
+        config.rank,
+        FoldKind::PerColumnSigmoid {
+            gate_ptr_param_name: "gate_ptr",
+            gate_load_phase: GateLoadPhase::LastKIter,
+            partial_tile_mask: PartialTileMask::FoldResultMask,
+        },
+    );
     ptx
 }
 

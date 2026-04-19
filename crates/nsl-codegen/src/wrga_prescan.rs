@@ -27,7 +27,10 @@ use crate::cost_model::BoundClassification;
 use crate::wengert::{VarId, WengertList};
 use crate::wrga::WrgaPlan;
 use crate::wrga_adapter_inject;
-use crate::wrga_fused_ptx::{synthesize_fused_lora_ptx, FusedLoraConfig};
+use crate::wrga_fused_ptx::{
+    synthesize_fused_gatedlora_ptx, synthesize_fused_lora_ptx, FusedGatedLoraConfig,
+    FusedLoraConfig,
+};
 use crate::wrga_fusion::{build_fusion_plan, FusionPlan, FusionTarget};
 use crate::wrga_memory::MemoryPlan;
 use crate::wrga_prune::{PruneResult, PruneStats};
@@ -132,37 +135,57 @@ pub(crate) fn prescan_adapter_sites_from_decorators(compiler: &mut Compiler<'_>)
         }
     }
 
-    // PTX synthesis + dedup.  Only runs for EpilogueFusedLora sites
-    // whose site record has resolved dimensions (input_dim/output_dim
-    // non-zero).  Target sm is read from the compile target; defaults
-    // to 80 when absent (the PTX asserts sm >= 80 anyway).
+    // PTX synthesis + dedup.  Only runs for EpilogueFusedLora /
+    // EpilogueFusedGatedLora sites whose site record has resolved dimensions
+    // (input_dim/output_dim non-zero).  Target sm is read from the compile
+    // target; defaults to 80 when absent (the PTX asserts sm >= 80 anyway).
     let target_sm = compiler.target_sm().unwrap_or(80);
     if target_sm >= 80 {
         for site in &sites {
-            let Some(FusionTarget::EpilogueFusedLora { rank }) =
-                site.fusion_decision.as_ref()
-            else {
-                continue;
-            };
-            if site.input_dim == 0 || site.output_dim == 0 {
-                continue;
+            match site.fusion_decision.as_ref() {
+                Some(FusionTarget::EpilogueFusedLora { rank }) => {
+                    if site.input_dim == 0 || site.output_dim == 0 || *rank > 16 {
+                        continue;
+                    }
+                    let cfg = FusedLoraConfig {
+                        site_id: site.site_id.clone(),
+                        m: 1,
+                        n: site.output_dim,
+                        k: site.input_dim,
+                        rank: *rank as u32,
+                        target_sm,
+                    };
+                    let key = cfg.kernel_key();
+                    compiler
+                        .fused_ptx_kernels
+                        .entry(key)
+                        .or_insert_with(|| synthesize_fused_lora_ptx(&cfg));
+                }
+                Some(FusionTarget::EpilogueFusedGatedLora { rank }) => {
+                    // B.3.1 Task 5.0.c: synthesise GatedLoRA PTX and insert
+                    // into the separate `fused_gatedlora_ptx_kernels` map.
+                    // Kept separate from `fused_ptx_kernels` to avoid key
+                    // collision when LoRA and GatedLoRA share the same
+                    // (m, n, k, rank, target_sm) shape.
+                    if site.input_dim == 0 || site.output_dim == 0 || *rank > 16 {
+                        continue;
+                    }
+                    let cfg = FusedGatedLoraConfig {
+                        site_id: site.site_id.clone(),
+                        m: 1,
+                        n: site.output_dim,
+                        k: site.input_dim,
+                        rank: *rank as u32,
+                        target_sm,
+                    };
+                    let key = cfg.kernel_key();
+                    compiler
+                        .fused_gatedlora_ptx_kernels
+                        .entry(key)
+                        .or_insert_with(|| synthesize_fused_gatedlora_ptx(&cfg));
+                }
+                _ => continue,
             }
-            if *rank > 16 {
-                continue;
-            }
-            let cfg = FusedLoraConfig {
-                site_id: site.site_id.clone(),
-                m: 1,
-                n: site.output_dim,
-                k: site.input_dim,
-                rank: *rank as u32,
-                target_sm,
-            };
-            let key = cfg.kernel_key();
-            compiler
-                .fused_ptx_kernels
-                .entry(key)
-                .or_insert_with(|| synthesize_fused_lora_ptx(&cfg));
         }
     }
 

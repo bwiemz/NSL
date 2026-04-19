@@ -131,3 +131,96 @@ fn ia3_ptx_validates__32_16_64() {
     assert_ia3_ptx_valid(ia3_cfg(32, 16, 64));
 }
 
+// ─── GatedLoRA ptxas validation — Task 3.2 ─────────────────────
+
+use nsl_codegen::wrga_fused_ptx::{synthesize_fused_gatedlora_ptx, FusedGatedLoraConfig};
+
+fn gated_cfg(m: u32, n: u32, k: u32, rank: u32) -> FusedGatedLoraConfig {
+    FusedGatedLoraConfig {
+        site_id: format!("gated.m{m}n{n}k{k}r{rank}"),
+        m,
+        n,
+        k,
+        rank,
+        target_sm: 80,
+    }
+}
+
+fn assert_gatedlora_ptx_valid(cfg: FusedGatedLoraConfig) {
+    let m = cfg.m;
+    let n = cfg.n;
+    let k = cfg.k;
+    let rank = cfg.rank;
+    let ptx = synthesize_fused_gatedlora_ptx(&cfg);
+    match validate_ptx(&ptx) {
+        Ok(()) => {}
+        Err(msg) if msg.contains("nvcc not available") => {
+            eprintln!(
+                "[skip] GatedLoRA ptxas validation for ({m},{n},{k},r={rank}) — no validator: {msg}"
+            );
+        }
+        Err(msg) => panic!(
+            "GatedLoRA PTX rejected for config (m={m}, n={n}, k={k}, rank={rank}):\n{msg}\n\nEmitted PTX:\n{ptx}"
+        ),
+    }
+}
+
+// ── Reused LoRA shapes under FoldKind::PerColumnSigmoid (6) ──
+#[test]
+fn gatedlora_ptx_validates__16_8_16_16() {
+    assert_gatedlora_ptx_valid(gated_cfg(16, 8, 16, 16));
+}
+
+#[test]
+fn gatedlora_ptx_validates__16_8_32_4() {
+    assert_gatedlora_ptx_valid(gated_cfg(16, 8, 32, 4));
+}
+
+#[test]
+fn gatedlora_ptx_validates__1_8_8_2() {
+    assert_gatedlora_ptx_valid(gated_cfg(1, 8, 8, 2));
+}
+
+#[test]
+fn gatedlora_ptx_validates__4_8_8_2() {
+    assert_gatedlora_ptx_valid(gated_cfg(4, 8, 8, 2));
+}
+
+#[test]
+fn gatedlora_ptx_validates__32_16_64_8() {
+    assert_gatedlora_ptx_valid(gated_cfg(32, 16, 64, 8));
+}
+
+#[test]
+fn gatedlora_ptx_validates__16_8_8_16() {
+    assert_gatedlora_ptx_valid(gated_cfg(16, 8, 8, 16));
+}
+
+// ── GatedLoRA-distinctive configs (4) ──
+// Note: ptxas validation doesn't distinguish gate VALUES (runtime concern);
+// these tests validate that the emitted PTX structure is valid across
+// shape-and-feature combinations.  The (16, 13, 16, 4) config is the ONLY
+// one that exercises FoldResultMask's %p_col0/%p_col1 predicates at
+// runtime (partial-n tile: first tile full n=8, second tile n=5 partial).
+#[test]
+fn gatedlora_ptx_validates__uniform_gate_zero_16_8_16_16() {
+    assert_gatedlora_ptx_valid(gated_cfg(16, 8, 16, 16));
+}
+
+#[test]
+fn gatedlora_ptx_validates__alternating_saturation_16_8_16_16() {
+    assert_gatedlora_ptx_valid(gated_cfg(16, 8, 16, 16));
+}
+
+#[test]
+fn gatedlora_ptx_validates__partial_n_multi_tile_16_13_16_4() {
+    // n=13 → 2 tiles (tile 0 full n=8; tile 1 partial n=5).
+    // ONLY config that actually evaluates FoldResultMask predicates false at runtime.
+    assert_gatedlora_ptx_valid(gated_cfg(16, 13, 16, 4));
+}
+
+#[test]
+fn gatedlora_ptx_validates__sub_mma_k_no_rank_pad_16_8_8_16() {
+    // Sub-MMA K (k=8<16) + rank == MMA-k (no rank-pad path).
+    assert_gatedlora_ptx_valid(gated_cfg(16, 8, 8, 16));
+}

@@ -525,6 +525,15 @@ pub struct Compiler<'a> {
     /// CUDA launcher (Task 5) to pick the right kernel per call site.
     pub fused_ptx_kernels:
         std::collections::HashMap<crate::wrga_fused_ptx::LoraKernelKey, String>,
+    /// B.3.1 Task 5.0.c: deduplicated fused-GatedLoRA PTX kernel cache.
+    /// Parallel to `fused_ptx_kernels` but for GatedLoRA sites.  Kept
+    /// separate so the two adapter types can share the same
+    /// `(m, n, k, rank, target_sm)` shape without key collision.
+    /// Registration handles are assigned as `lora_count + gatedlora_idx`
+    /// (both sorted by the same key tuple), matching the offset
+    /// baked into each GatedLoRA call site's `kernel_handle` arg.
+    pub fused_gatedlora_ptx_kernels:
+        std::collections::HashMap<crate::wrga_fused_ptx::LoraKernelKey, String>,
     pub synth_call_names: std::collections::HashMap<nsl_ast::NodeId, String>,
 
     // ── Calibration retention pass (Task 4) ─────────────────────
@@ -697,6 +706,7 @@ impl<'a> Compiler<'a> {
             csha_backward_claims: None,
             csha_forward_saves: std::collections::HashMap::new(),
             fused_ptx_kernels: std::collections::HashMap::new(),
+            fused_gatedlora_ptx_kernels: std::collections::HashMap::new(),
             synth_call_names: std::collections::HashMap::new(),
             retention_arena_data_id: None,
             retention_offsets: std::collections::HashMap::new(),
