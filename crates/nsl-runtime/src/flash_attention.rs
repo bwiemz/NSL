@@ -263,6 +263,81 @@ pub extern "C" fn nsl_flash_attention(
     }
 }
 
+/// Resolve an NSL tensor-struct pointer (`NslTensor*` wrapped as `i64`) into
+/// the raw device data pointer expected by the CSHA PTX kernels.
+///
+/// Context: Cranelift-emitted call sites for the CSHA FFIs pass `q_val` /
+/// `k_val` / ... as `NslTensor*` (the opaque tensor handle). The CSHA
+/// kernels, however, declare their tensor parameters as `.param .u64` and
+/// do raw HBM address arithmetic on the loaded value. Passing the host
+/// `NslTensor*` straight through would make the kernel dereference the
+/// struct's first fields (`magic`, `data`, `shape`, ...) as if they were
+/// tensor elements, producing `CUDA_ERROR_ILLEGAL_ADDRESS` on the very
+/// first `ld.global` — exactly the bug PR #79 surfaced.
+///
+/// Dual-path contract:
+///   - **Production** (Cranelift-emitted code): always passes
+///     `NslTensor*`. We auto-promote CPU→GPU via `nsl_tensor_to_device`
+///     (idempotent) and read `.data` for the kernel.
+///   - **Test-only** (`nsl_test_cuda_alloc` call sites in
+///     `crates/nsl-codegen/tests/csha_cuda_launch_*.rs`): passes raw
+///     device pointers from `cuMemAlloc_v2`. We detect this via
+///     `cuPointerGetAttribute(MEMORY_TYPE)`: a CU_MEMORYTYPE_DEVICE
+///     result means the pointer is already in HBM and we pass it
+///     through unchanged.
+///
+/// Null passes through as `0` so the kernel's runtime null-guards still
+/// work.
+#[cfg(feature = "cuda")]
+#[inline]
+fn csha_tensor_data_ptr(tensor_ptr: i64) -> u64 {
+    if tensor_ptr == 0 {
+        return 0;
+    }
+
+    // Query the driver for the pointer's memory type. If it's already
+    // device memory (test path via `nsl_test_cuda_alloc`), the caller
+    // provided a raw device pointer and we pass it straight through.
+    // The query also handles managed memory cleanly — managed pointers
+    // have memory_type == HOST (or a cudaMemoryType mismatch) and we
+    // treat them as NslTensor* for safety.
+    //
+    // NOTE: we check `MEMORY_TYPE` not `DEVICE_POINTER` because the
+    // latter returns the same address for device allocations but also
+    // succeeds (returning the managed alias) for managed memory, which
+    // would false-positive on NslTensor* handles stored in managed
+    // memory. MEMORY_TYPE returns CU_MEMORYTYPE_DEVICE only for
+    // `cuMemAlloc`/`cuMemAllocPitch` results.
+    unsafe {
+        use cudarc::driver::sys::{
+            cuPointerGetAttribute, CUpointer_attribute, CUmemorytype, CUresult,
+        };
+        let mut mem_type: u32 = 0;
+        let rc = cuPointerGetAttribute(
+            &mut mem_type as *mut u32 as *mut std::ffi::c_void,
+            CUpointer_attribute::CU_POINTER_ATTRIBUTE_MEMORY_TYPE,
+            tensor_ptr as cudarc::driver::sys::CUdeviceptr,
+        );
+        if rc == CUresult::CUDA_SUCCESS
+            && mem_type == CUmemorytype::CU_MEMORYTYPE_DEVICE as u32
+        {
+            // Raw device pointer — test-only path. Pass through.
+            return tensor_ptr as u64;
+        }
+    }
+
+    // Host pointer (NslTensor* handle) — auto-promote CPU→GPU
+    // (idempotent for already-GPU tensors) then extract `.data`.
+    let t = NslTensor::from_ptr(tensor_ptr);
+    let gpu_ptr = if t.device == 0 {
+        crate::tensor::nsl_tensor_to_device(tensor_ptr, 1)
+    } else {
+        tensor_ptr
+    };
+    let gpu_t = NslTensor::from_ptr(gpu_ptr);
+    gpu_t.data as u64
+}
+
 /// CSHA Tier A.1: FlashAttention FFI variant that carries per-layer CSHA
 /// extras (paper §2). This entry point preserves the argument layout of
 /// `nsl_flash_attention` and *appends* nine CSHA-specific arguments:
@@ -344,10 +419,21 @@ pub extern "C" fn nsl_flash_attention_csha(
 
         // 21 base args — must exactly mirror the non-CSHA path so the
         // shared PTX body works identically on NULL CSHA extras.
-        let mut q = q_ptr as u64;
-        let mut k = k_ptr as u64;
-        let mut v = v_ptr as u64;
-        let mut out = out_ptr as u64;
+        //
+        // PR #79 bug fix: each tensor arg below is a host `NslTensor*`
+        // (Cranelift emits these as opaque tensor handles from
+        // `compile_flash_attention_call`). The CSHA PTX expects raw
+        // device (HBM) base pointers, so we resolve each handle via
+        // `csha_tensor_data_ptr` which (a) auto-promotes CPU tensors to
+        // GPU and (b) extracts `NslTensor.data` for the kernel.
+        // Non-tensor args (batch, heads, block_size, ...) pass through
+        // unchanged. Paged/ragged pointers (block_table, k_pool, ...)
+        // are always null at today's call sites so they pass through as
+        // `0`.
+        let mut q = csha_tensor_data_ptr(q_ptr);
+        let mut k = csha_tensor_data_ptr(k_ptr);
+        let mut v = csha_tensor_data_ptr(v_ptr);
+        let mut out = csha_tensor_data_ptr(out_ptr);
         let mut s = f32::from_bits(scale_bits as u32);
         let mut b = batch as u64;
         let mut h = heads as u64;
@@ -357,25 +443,25 @@ pub extern "C" fn nsl_flash_attention_csha(
         let mut kp = k_pool_ptr as u64;
         let mut vp = v_pool_ptr as u64;
         let mut bs = block_size as u64;
-        let mut cos = cos_ptr as u64;
-        let mut sin = sin_ptr as u64;
+        let mut cos = csha_tensor_data_ptr(cos_ptr);
+        let mut sin = csha_tensor_data_ptr(sin_ptr);
         let mut sids = seq_ids_ptr as u64;
         let mut slens = seq_lens_ptr as u64;
         let mut dfs_enter: u64 = 0;
         let mut dfs_exit: u64 = 0;
         let mut num_tree_nodes: u64 = 0;
-        let mut lse = logsumexp_ptr as u64;
+        let mut lse = csha_tensor_data_ptr(logsumexp_ptr);
 
         // 9 CSHA extras, matching the PTX param declarations in
         // `emit_flash_attention_entry`. eps is declared .f32; heads /
         // d_model are .u32. Widths matter — the launch wrapper reads
         // sizeof(param_type) bytes starting at each `*mut c_void`.
-        let mut x = x_ptr as u64;
-        let mut nw = norm_weight_ptr as u64;
-        let mut wq = wq_ptr as u64;
-        let mut wk = wk_ptr as u64;
-        let mut wv = wv_ptr as u64;
-        let mut wo = wo_ptr as u64;
+        let mut x = csha_tensor_data_ptr(x_ptr);
+        let mut nw = csha_tensor_data_ptr(norm_weight_ptr);
+        let mut wq = csha_tensor_data_ptr(wq_ptr);
+        let mut wk = csha_tensor_data_ptr(wk_ptr);
+        let mut wv = csha_tensor_data_ptr(wv_ptr);
+        let mut wo = csha_tensor_data_ptr(wo_ptr);
         let mut eps = f32::from_bits(rmsnorm_eps_bits as u32);
         let mut ah = active_heads as u32;
         let mut dm = d_model as u32;
@@ -539,10 +625,16 @@ pub extern "C" fn nsl_flash_attention_csha_with_saves(
         let block_y = 1i64;
         let block_z = 1i64;
 
-        let mut q = q_ptr as u64;
-        let mut k = k_ptr as u64;
-        let mut v = v_ptr as u64;
-        let mut out = out_ptr as u64;
+        // PR #79 bug fix: user-provided tensor args arrive as
+        // `NslTensor*` — resolve each via `csha_tensor_data_ptr` (auto-
+        // promotes CPU→GPU, extracts `.data`). The 6 activation-save
+        // pointers (q_proj_ptr, ..., x_raw_ptr) are ALREADY raw device
+        // pointers allocated by `nsl_csha_alloc_backward_activations_into`
+        // and pass through untouched.
+        let mut q = csha_tensor_data_ptr(q_ptr);
+        let mut k = csha_tensor_data_ptr(k_ptr);
+        let mut v = csha_tensor_data_ptr(v_ptr);
+        let mut out = csha_tensor_data_ptr(out_ptr);
         let mut s = f32::from_bits(scale_bits as u32);
         let mut b = batch as u64;
         let mut h = heads as u64;
@@ -552,23 +644,24 @@ pub extern "C" fn nsl_flash_attention_csha_with_saves(
         let mut kp = k_pool_ptr as u64;
         let mut vp = v_pool_ptr as u64;
         let mut bs = block_size as u64;
-        let mut cos = cos_ptr as u64;
-        let mut sin = sin_ptr as u64;
+        let mut cos = csha_tensor_data_ptr(cos_ptr);
+        let mut sin = csha_tensor_data_ptr(sin_ptr);
         let mut sids = seq_ids_ptr as u64;
         let mut slens = seq_lens_ptr as u64;
         let mut dfs_enter: u64 = 0;
         let mut dfs_exit: u64 = 0;
         let mut num_tree_nodes: u64 = 0;
-        let mut lse = logsumexp_ptr as u64;
-        let mut x = x_ptr as u64;
-        let mut nw = norm_weight_ptr as u64;
-        let mut wq = wq_ptr as u64;
-        let mut wk = wk_ptr as u64;
-        let mut wv = wv_ptr as u64;
-        let mut wo = wo_ptr as u64;
+        let mut lse = csha_tensor_data_ptr(logsumexp_ptr);
+        let mut x = csha_tensor_data_ptr(x_ptr);
+        let mut nw = csha_tensor_data_ptr(norm_weight_ptr);
+        let mut wq = csha_tensor_data_ptr(wq_ptr);
+        let mut wk = csha_tensor_data_ptr(wk_ptr);
+        let mut wv = csha_tensor_data_ptr(wv_ptr);
+        let mut wo = csha_tensor_data_ptr(wo_ptr);
         let mut eps = f32::from_bits(rmsnorm_eps_bits as u32);
         let mut ah = active_heads as u32;
         let mut dm = d_model as u32;
+        // Activation-save pointers: raw device buffers — pass through.
         let mut q_proj = q_proj_ptr as u64;
         let mut k_proj = k_proj_ptr as u64;
         let mut v_proj = v_proj_ptr as u64;
@@ -703,10 +796,30 @@ pub extern "C" fn nsl_flash_attention_csha_backward(
         let block_y = 1i64;
         let block_z = 1i64;
 
-        let mut q = q_ptr as u64;
-        let mut k = k_ptr as u64;
-        let mut v = v_ptr as u64;
-        let mut out = out_ptr as u64;
+        // PR #79 bug fix: user-provided tensor args arrive as
+        // `NslTensor*` — resolve each via `csha_tensor_data_ptr` (auto-
+        // promotes CPU→GPU, extracts `.data`).
+        //
+        // Passes through unchanged:
+        //   * Forward-saved activation pointers (q_proj_ptr, ...,
+        //     x_raw_ptr): raw device buffers from
+        //     `nsl_csha_alloc_backward_activations_into`.
+        //   * Paged/ragged pointers (block_table, k_pool, v_pool,
+        //     seq_ids, seq_lens): all null at today's callers.
+        //
+        // Resolved via `csha_tensor_data_ptr`:
+        //   * Primary forward inputs (q, k, v, out, logsumexp, cos,
+        //     sin, x, norm_weight, wq, wk, wv, wo).
+        //   * Backward seed `dO` plus the 7 gradient outputs
+        //     (dq, dk, dv, dwq, dwk, dwv, dx): these are allocated by
+        //     Cranelift via `nsl_tensor_zeros_f16_on` / `nsl_tensor_zeros_on`
+        //     (see `wengert_lower.rs::FusedCshaBackward`), which return
+        //     `NslTensor*` with device=1. The kernel needs the raw
+        //     device data pointer to write gradients into.
+        let mut q = csha_tensor_data_ptr(q_ptr);
+        let mut k = csha_tensor_data_ptr(k_ptr);
+        let mut v = csha_tensor_data_ptr(v_ptr);
+        let mut out = csha_tensor_data_ptr(out_ptr);
         let mut s = f32::from_bits(scale_bits as u32);
         let mut b = batch as u64;
         let mut h = heads as u64;
@@ -716,37 +829,39 @@ pub extern "C" fn nsl_flash_attention_csha_backward(
         let mut kp = k_pool_ptr as u64;
         let mut vp = v_pool_ptr as u64;
         let mut bs = block_size as u64;
-        let mut cos = cos_ptr as u64;
-        let mut sin = sin_ptr as u64;
+        let mut cos = csha_tensor_data_ptr(cos_ptr);
+        let mut sin = csha_tensor_data_ptr(sin_ptr);
         let mut sids = seq_ids_ptr as u64;
         let mut slens = seq_lens_ptr as u64;
         let mut dfs_enter: u64 = 0;
         let mut dfs_exit: u64 = 0;
         let mut num_tree_nodes: u64 = 0;
-        let mut lse = logsumexp_ptr as u64;
-        let mut x = x_ptr as u64;
-        let mut nw = norm_weight_ptr as u64;
-        let mut wq = wq_ptr as u64;
-        let mut wk = wk_ptr as u64;
-        let mut wv = wv_ptr as u64;
-        let mut wo = wo_ptr as u64;
+        let mut lse = csha_tensor_data_ptr(logsumexp_ptr);
+        let mut x = csha_tensor_data_ptr(x_ptr);
+        let mut nw = csha_tensor_data_ptr(norm_weight_ptr);
+        let mut wq = csha_tensor_data_ptr(wq_ptr);
+        let mut wk = csha_tensor_data_ptr(wk_ptr);
+        let mut wv = csha_tensor_data_ptr(wv_ptr);
+        let mut wo = csha_tensor_data_ptr(wo_ptr);
         let mut eps = f32::from_bits(rmsnorm_eps_bits as u32);
         let mut ah = active_heads as u32;
         let mut dm = d_model as u32;
+        // Forward-saved activations: raw device buffers, pass through.
         let mut qp = q_proj_ptr as u64;
         let mut kpj = k_proj_ptr as u64;
         let mut vpj = v_proj_ptr as u64;
         let mut rmax = row_max_ptr as u64;
         let mut rsum = row_sum_ptr as u64;
         let mut xraw = x_raw_ptr as u64;
-        let mut d_o = do_ptr as u64;
-        let mut d_q = dq_ptr as u64;
-        let mut d_k = dk_ptr as u64;
-        let mut d_v = dv_ptr as u64;
-        let mut d_wq = dwq_ptr as u64;
-        let mut d_wk = dwk_ptr as u64;
-        let mut d_wv = dwv_ptr as u64;
-        let mut d_x = dx_ptr as u64;
+        // Backward seed + 7 gradient outputs: NslTensor handles — resolve.
+        let mut d_o = csha_tensor_data_ptr(do_ptr);
+        let mut d_q = csha_tensor_data_ptr(dq_ptr);
+        let mut d_k = csha_tensor_data_ptr(dk_ptr);
+        let mut d_v = csha_tensor_data_ptr(dv_ptr);
+        let mut d_wq = csha_tensor_data_ptr(dwq_ptr);
+        let mut d_wk = csha_tensor_data_ptr(dwk_ptr);
+        let mut d_wv = csha_tensor_data_ptr(dwv_ptr);
+        let mut d_x = csha_tensor_data_ptr(dx_ptr);
 
         let args: [*mut c_void; 44] = [
             &mut q as *mut _ as *mut c_void,
