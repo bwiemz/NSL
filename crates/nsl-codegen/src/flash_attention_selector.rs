@@ -111,6 +111,7 @@ mod selector_tests {
             gqa_group_size: 1,
             tree_mask: false,
             gpu_sm,
+            segment_masked: false,
             csha: None,
         }
     }
@@ -129,6 +130,7 @@ mod selector_tests {
             gqa_group_size: 1,
             tree_mask: false,
             gpu_sm,
+            segment_masked: false,
             csha: Some(CshaExtras {
                 level: 2,
                 fused_rmsnorm: true,

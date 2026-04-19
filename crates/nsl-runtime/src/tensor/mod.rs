@@ -183,6 +183,7 @@ pub const DTYPE_INT8: u16 = 4;
 pub const DTYPE_FP8E4M3: u16 = 5;
 pub const DTYPE_FP8E5M2: u16 = 6;
 pub const DTYPE_U16_TOKEN: u16 = 7;
+pub const DTYPE_U16_SEGMENT: u16 = 8;
 
 // Custom dtype IDs start at 256
 pub const DTYPE_CUSTOM_START: u16 = 256;

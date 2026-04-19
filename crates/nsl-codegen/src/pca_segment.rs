@@ -1,7 +1,7 @@
 //! PCA — segment-ID-aware FlashAttention kernel plan.
 //!
 //! When the packing strategy is [`PcaStrategy::SegmentIdMasked`], PCA
-//! replaces the dense `S×S` attention mask with a compact `segment_ids: [S]`
+//! replaces the dense `S×S` attention mask with a compact `segment_ids: [u16; S]`
 //! tensor.  Inside the FA2 KV-tile loop, scores between query `q` and key
 //! `k` are masked iff `segment_ids[q] != segment_ids[k]`.
 //!
@@ -69,8 +69,8 @@ pub fn plan_kernel(
             causal_and_segment: false,
         };
     }
-    // Segment IDs are stored as i32 — 4 bytes per position.
-    let needed_bytes = seq_len.saturating_mul(4);
+    // Segment IDs are stored as u16 — 2 bytes per position.
+    let needed_bytes = seq_len.saturating_mul(2);
     let residency = if needed_bytes <= DEFAULT_SMEM_SEGMENT_BUDGET {
         SegmentResidency::Shared
     } else {
@@ -114,6 +114,7 @@ mod tests {
             gqa_group_size: 2,
             tree_mask: false,
             gpu_sm: 90,
+        segment_masked: false,
         csha: None,
         }
     }
@@ -145,9 +146,9 @@ mod tests {
 
     #[test]
     fn short_seq_uses_shared_residency() {
-        // 1024 × 4 = 4096 bytes — exactly fits the default SMEM budget.
+        // 2048 × 2 = 4096 bytes — exactly fits the default SMEM budget.
         let det = det_with_strategy();
-        let plan = plan_kernel(&det, fa_base(), 1024, true);
+        let plan = plan_kernel(&det, fa_base(), 2048, true);
         assert_eq!(plan.residency, SegmentResidency::Shared);
         assert_eq!(plan.smem_segment_bytes, 4096);
     }
@@ -155,7 +156,7 @@ mod tests {
     #[test]
     fn long_seq_streams_segment_ids() {
         let det = det_with_strategy();
-        // 4096 tokens × 4 bytes = 16 KB — exceeds budget.
+        // 4096 tokens × 2 bytes = 8 KB — exceeds budget.
         let plan = plan_kernel(&det, fa_base(), 4096, true);
         assert_eq!(plan.residency, SegmentResidency::Streamed);
         assert_eq!(plan.smem_segment_bytes, 0);

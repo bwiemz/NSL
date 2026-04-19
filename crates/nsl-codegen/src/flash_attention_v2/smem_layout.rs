@@ -417,6 +417,7 @@ mod tests {
             gqa_group_size: 1,
             tree_mask: false,
             gpu_sm: 75,
+            segment_masked: false,
             csha: None,
         }
     }
@@ -457,6 +458,7 @@ mod tests {
             gqa_group_size: 1,
             tree_mask: false,
             gpu_sm: 75,
+            segment_masked: false,
             csha: Some(CshaExtras {
                 fused_projections: true,
                 d_model,

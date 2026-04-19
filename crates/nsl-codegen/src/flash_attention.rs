@@ -152,12 +152,33 @@ pub struct FlashAttentionConfig {
     pub tree_mask: bool,
     /// Target GPU SM version for PTX target selection (default: 52).
     pub gpu_sm: u32,
+    /// PCA Tier A: when `true`, the emitter produces a segment-aware
+    /// attention kernel that masks `S[i, j]` by
+    /// `segment_ids[i] == segment_ids[j]` alongside the causal mask.
+    /// Mutually exclusive with `paged: true` (spec §3.2).
+    pub segment_masked: bool,
     /// CSHA (Compiler-Synthesized Holistic Attention) extensions.  `None`
     /// (the default) leaves the kernel functionally identical to classic
     /// FlashAttention-2.  `Some(..)` selects a CSHA-fused variant per
     /// `NSL-CSHA-Research.PDF`.
     #[doc(hidden)]
     pub csha: Option<CshaExtras>,
+}
+
+impl FlashAttentionConfig {
+    /// Spec §3.2 invariant: segment_masked + paged are mutually
+    /// exclusive; paged KV cache is inference-only, packed
+    /// pretraining doesn't use it.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.segment_masked && self.paged {
+            return Err(
+                "FlashAttentionConfig: segment_masked and paged are \
+                 mutually exclusive (spec §3.2)"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
 }
 
 /// CSHA kernel-level fusion extensions.
@@ -3029,6 +3050,19 @@ pub struct FlashAttentionBackwardConfig {
     pub head_dim: i64,
     pub causal: bool,
     pub gpu_sm: u32,
+    /// PCA Tier A: when `true`, the emitter produces a segment-aware
+    /// attention kernel that masks `S[i, j]` by
+    /// `segment_ids[i] == segment_ids[j]` alongside the causal mask.
+    /// Mutually exclusive with `paged: true` (spec §3.2).
+    pub segment_masked: bool,
+}
+
+impl FlashAttentionBackwardConfig {
+    /// Spec §3.2 invariant: segment_masked is propagated from the forward
+    /// config. Reserved for future backward emission gating (spec §3.2).
+    pub fn validate(&self) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// Kernel name for the Phase 1 D-correction vector kernel.
@@ -5937,6 +5971,7 @@ mod tests {
             gqa_group_size: 1,
             tree_mask: false,
             gpu_sm: 80,
+        segment_masked: false,
         csha: None,
         };
         assert_eq!(
@@ -5958,6 +5993,7 @@ mod tests {
             gqa_group_size: 4,
             tree_mask: false,
             gpu_sm: 80,
+        segment_masked: false,
         csha: None,
         };
         assert_eq!(
@@ -5979,6 +6015,7 @@ mod tests {
             gqa_group_size: 1,
             tree_mask: false,
             gpu_sm: 80,
+        segment_masked: false,
         csha: None,
         };
         // (64 + 64) * 128 * 2 = 32768 bytes (32 KB)
@@ -6000,6 +6037,7 @@ mod tests {
             gqa_group_size: 1,
             tree_mask: false,
             gpu_sm: 80,
+        segment_masked: false,
         csha: None,
         };
         assert_eq!(shared_mem_bytes(&config), 49152);
@@ -6019,6 +6057,7 @@ mod tests {
             gqa_group_size: 1,
             tree_mask: false,
             gpu_sm: 80,
+        segment_masked: false,
         csha: None,
         };
         let ptx = synthesize_flash_attention_ptx(&config);
@@ -6045,6 +6084,7 @@ mod tests {
             gqa_group_size: 1,
             tree_mask: false,
             gpu_sm: 80,
+        segment_masked: false,
         csha: None,
         };
         let ptx_no_causal = synthesize_flash_attention_ptx(&config);
@@ -6071,6 +6111,7 @@ mod tests {
             gqa_group_size: 1,
             tree_mask: false,
             gpu_sm: 80,
+        segment_masked: false,
         csha: None,
         };
         let ptx = synthesize_flash_attention_ptx(&config);
@@ -6093,6 +6134,7 @@ mod tests {
             gqa_group_size: 1,
             tree_mask: false,
             gpu_sm: 80,
+        segment_masked: false,
         csha: None,
         };
         let ptx = synthesize_flash_attention_ptx(&config);
@@ -6115,6 +6157,7 @@ mod tests {
             gqa_group_size: 4,
             tree_mask: false,
             gpu_sm: 80,
+        segment_masked: false,
         csha: None,
         };
         let ptx = synthesize_flash_attention_ptx(&config);
@@ -6152,6 +6195,7 @@ mod tests {
             gqa_group_size: 1,
             tree_mask: true,
             gpu_sm: 80,
+        segment_masked: false,
         csha: None,
         };
         let ptx = synthesize_flash_attention_ptx(&config);
@@ -6192,6 +6236,7 @@ mod tests {
             head_dim: 64,
             causal,
             gpu_sm: 80,
+            segment_masked: false,
         }
     }
 
@@ -6378,6 +6423,7 @@ mod tests {
             head_dim: 64,
             causal: false,
             gpu_sm: 80,
+            segment_masked: false,
         };
         assert!(use_mma_path(cfg.gpu_sm), "sm_80 should use MMA path");
         let (_, ptx2_bytes) = synthesize_flash_attention_backward_ptx(&cfg);
@@ -6440,6 +6486,7 @@ mod tests {
             head_dim: 64,
             causal: false,
             gpu_sm: 52,
+            segment_masked: false,
         };
         assert!(!use_mma_path(cfg.gpu_sm), "sm_52 should NOT use MMA path");
         let (_, ptx2_bytes) = synthesize_flash_attention_backward_ptx(&cfg);
@@ -6521,6 +6568,7 @@ mod tests {
             gqa_group_size: 1,
             tree_mask: false,
             gpu_sm: 80,
+            segment_masked: false,
             csha: Some(CshaExtras::level1(1e-5)),
         }
     }
@@ -6537,6 +6585,7 @@ mod tests {
             gqa_group_size: 1,
             tree_mask: false,
             gpu_sm: 80,
+            segment_masked: false,
             csha: None,
         }
     }
@@ -6618,6 +6667,7 @@ mod tests {
             gqa_group_size: 1,
             tree_mask: false,
             gpu_sm: 80,
+            segment_masked: false,
             csha: Some(CshaExtras::level2(1e-5, 512)),
         }
     }
