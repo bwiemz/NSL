@@ -6,7 +6,7 @@
 //!
 //! Ignored in Commit 3; unblocked in Commit 4.
 
-use std::path::Path;
+use std::path::PathBuf;
 
 use nsl_codegen::cpdt_sensitivity::{
     assign_tier, classify_layer_kind, gradient_magnitude_est, layer_of, position_criticality,
@@ -45,12 +45,11 @@ fn scale_entry_in_place(wm: &mut WeightMap, name: &str, factor: f64) {
 }
 
 #[test]
-#[ignore = "red: unblocked by Commit 4 (gradient_magnitude_est weights-reading path verification)"]
 fn adversarial_localized_tier_shift() {
-    let original = WeightMap::load(Path::new(
-        "tests/fixtures/cpdt_calibration/calib_small.safetensors",
-    ))
-    .expect("calib_small fixture missing");
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/cpdt_calibration/calib_small.safetensors");
+    let original = WeightMap::load(&path)
+        .unwrap_or_else(|e| panic!("calib_small fixture missing at {}: {e:?}", path.display()));
 
     // Precondition 1: target layer is not kind-overridden.
     let (_, _, target_kind) = score_layer(&original, TARGET_NAME);

@@ -7,7 +7,7 @@
 //! is verified to read weights in the Some-branch. (The Some-branch already
 //! exists today; Commit 4 is a green-flip, not a code-add.)
 
-use std::path::Path;
+use std::path::PathBuf;
 
 use nsl_codegen::cpdt_sensitivity::{
     assign_tier, classify_layer_kind, gradient_magnitude_est, layer_of, position_criticality,
@@ -28,9 +28,16 @@ struct FixtureSnapshot {
     tiers: Vec<TierEntry>,
 }
 
+/// Workspace root: CARGO_MANIFEST_DIR is crates/nsl-codegen; go up two.
+fn workspace_fixture_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tests/fixtures/cpdt_calibration")
+}
+
 fn load_expected() -> Vec<FixtureSnapshot> {
-    let path = Path::new("tests/fixtures/cpdt_calibration/expected_weights_present.json");
-    let json = std::fs::read_to_string(path).expect("expected_weights_present.json not found");
+    let path = workspace_fixture_dir().join("expected_weights_present.json");
+    let json = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("expected_weights_present.json not found at {}: {e}", path.display()));
     serde_json::from_str(&json).expect("expected_weights_present.json parse error")
 }
 
@@ -44,19 +51,16 @@ fn n_layers_for(fixture: &str) -> u32 {
 }
 
 #[test]
-#[ignore = "red: unblocked by Commit 4 (gradient_magnitude_est weights-reading path verification)"]
 fn weights_present_matches_expected_snapshot() {
     let expected = load_expected();
+    let fixture_dir = workspace_fixture_dir();
     for fs in &expected {
-        let path = format!(
-            "tests/fixtures/cpdt_calibration/{}.safetensors",
-            fs.fixture
-        );
-        let Ok(wm) = WeightMap::load(Path::new(&path)) else {
+        let path = fixture_dir.join(format!("{}.safetensors", fs.fixture));
+        let Ok(wm) = WeightMap::load(&path) else {
             if fs.fixture == "calib_medium" {
                 continue;
             }
-            panic!("fixture missing: {path}");
+            panic!("fixture missing: {}", path.display());
         };
         let n_layers = n_layers_for(&fs.fixture);
         for expected_entry in &fs.tiers {
