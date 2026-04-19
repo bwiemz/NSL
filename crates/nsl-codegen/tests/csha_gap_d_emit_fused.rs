@@ -1296,3 +1296,177 @@ fn gap_i4_launch_inputs_pass_null_for_none_norm_weight() {
         launch.inputs[9]
     );
 }
+
+// ── Gap I step K — standalone dgamma adjoint accumulation into gamma_var ──
+//
+// The fused CSHA backward kernel returns `dx_norm` (extract[7]) — the
+// gradient flowing into the RMSNorm *output*. Under the fused dispatch
+// path the per-op RMSNorm backward is suppressed (`AlreadyEmitted`),
+// so the `EmitFused` arm must explicitly emit the RMSNorm gamma gradient
+// and route it into `gamma_var`'s adjoint slot. Otherwise `w_norm` shows
+// `delta=0` after one SGD step (all three matmul weights move but gamma
+// stays stuck).
+//
+// This test builds a minimal claimed chain where the RMSNorm has a
+// trainable gamma Param as its second input, runs the full adjoint
+// generator, and verifies two load-bearing properties:
+//   1. `gen.adjoint_of(gamma_var)` returns Some(adjoint_VarId) — proving
+//      the `accumulate_adjoint(gamma_var, dgamma)` call fired.
+//   2. The fused event records `dgamma_emitted = true` — proving the
+//      code path at `source_ad.rs:~447` ran, not a silent continue.
+//
+// Regression guard: pre-Gap-I-step-K this test would fail because
+// `EmitFused` had no standalone dgamma emission; the RMSNorm op's
+// `AlreadyEmitted` cascade would leave gamma without any adjoint in
+// the generated list, and the SGD lookup via `gen.adjoint_of(gamma_var)`
+// would return `None`.
+#[test]
+fn gap_i_step_k_dgamma_accumulates_into_gamma_adjoint() {
+    use nsl_codegen::csha_apply::{CshaChainVarIds, FusionMark};
+    use nsl_codegen::csha_boundary::ProjKind;
+    use nsl_codegen::flash_attention::{CshaExtras, FlashAttentionConfig, RopeStyle};
+    use nsl_codegen::source_ad::{AdjointGenerator, CshaBackwardClaims};
+    use nsl_codegen::wengert::{PrimalOp, WengertList, WengertOp};
+    use std::collections::HashMap;
+
+    // Wengert layout with a trainable gamma RMSNorm + full Q/K/V chain + SDPA:
+    //   0: Input(x)                              — x_raw (pre-norm input)
+    //   1: Param(norm_weight)                    — gamma, trainable
+    //   2: RMSNorm(0, 1)                         — x_norm (RMSNorm output)
+    //   3: Param(wq)
+    //   4: Matmul(2, 3)                          — Q
+    //   5: RoPE(4)                               — Q_rope
+    //   6: Param(wk)
+    //   7: Matmul(2, 6)                          — K
+    //   8: RoPE(7)                               — K_rope
+    //   9: Param(wv)
+    //  10: Matmul(2, 9)                          — V
+    //  11: SDPA(5, 8, 10)
+    let mk = |id, result, prim: PrimalOp, inputs| WengertOp {
+        id,
+        result,
+        op: prim,
+        inputs,
+        saved_for_backward: false,
+        checkpointed: false,
+    };
+    let primal = WengertList {
+        ops: vec![
+            mk(0, 0, PrimalOp::Input("x".into()), vec![]),
+            mk(1, 1, PrimalOp::Param("norm_weight".into()), vec![]),
+            mk(2, 2, PrimalOp::RMSNorm { eps: 1e-5 }, vec![0, 1]),
+            mk(3, 3, PrimalOp::Param("wq".into()), vec![]),
+            mk(4, 4, PrimalOp::Matmul, vec![2, 3]),
+            mk(5, 5, PrimalOp::RoPE { dim: 32 }, vec![4]),
+            mk(6, 6, PrimalOp::Param("wk".into()), vec![]),
+            mk(7, 7, PrimalOp::Matmul, vec![2, 6]),
+            mk(8, 8, PrimalOp::RoPE { dim: 32 }, vec![7]),
+            mk(9, 9, PrimalOp::Param("wv".into()), vec![]),
+            mk(10, 10, PrimalOp::Matmul, vec![2, 9]),
+            mk(
+                11,
+                11,
+                PrimalOp::ScaledDotProductAttention { causal: false },
+                vec![5, 8, 10],
+            ),
+        ],
+        output: 11,
+        var_names: HashMap::new(),
+        var_types: HashMap::new(),
+    };
+
+    // Smoke config that passes the backward SMEM validator.
+    let cfg = FlashAttentionConfig {
+        block_q: 32,
+        block_kv: 32,
+        head_dim: 32,
+        causal: false,
+        paged: false,
+        rope_q: false,
+        rope_style: RopeStyle::HalfSplit,
+        gqa_group_size: 1,
+        tree_mask: false,
+        gpu_sm: 75,
+        csha: Some(CshaExtras {
+            level: 1,
+            fused_projections: true,
+            save_activations_for_backward: true,
+            d_model: 32,
+            active_heads: 1,
+            rmsnorm_eps: 1e-5,
+            ..CshaExtras::default()
+        }),
+    };
+
+    // Hand-built chain_varids mirroring what
+    // `collect_chain_dispatch_map_with_wengert` produces for a trainable
+    // gamma RMSNorm (Gap I.4 resolution + Gap I step K x_raw / eps).
+    let gamma_vid: u32 = 1;
+    let x_raw_vid: u32 = 0;
+    let varids = CshaChainVarIds {
+        q_out_var: 5,
+        k_out_var: 8,
+        v_out_var: 10,
+        wq_var: 3,
+        wk_var: 6,
+        wv_var: 9,
+        x_norm_var: 2,
+        sdpa_out_var: 11,
+        norm_weight_var: Some(gamma_vid),
+        x_raw_var: Some(x_raw_vid),
+        rmsnorm_eps: 1e-5,
+    };
+    let mark = FusionMark {
+        layer: "blocks.0".into(),
+        kind: Some(ProjKind::Q),
+        param_name: "wq".into(),
+        role: nsl_codegen::csha_apply::MarkRole::NormPrologue,
+        config: Some(cfg),
+        backward_emitted: std::cell::Cell::new(false),
+        chain_varids: Some(varids),
+    };
+
+    // Claim: SDPA primary, RMSNorm + Q/K/V ops secondary.
+    let mut op_to_chain: HashMap<u32, usize> = HashMap::new();
+    for id in [11u32, 2, 4, 5, 7, 8, 10] {
+        op_to_chain.insert(id, 0);
+    }
+    let claims = CshaBackwardClaims {
+        op_to_chain,
+        chain_marks: vec![mark],
+    };
+
+    let mut gen = AdjointGenerator::new(100);
+    gen.set_csha_claims(claims);
+    let _adjoint = gen.generate(&primal);
+
+    // Property 1: `adjoint_of(gamma_var)` must return Some. This is
+    // EXACTLY what SGD's param loop in `stmt.rs:~4603` looks up to find
+    // w_norm's gradient; if this returns None, w_norm never gets an
+    // update and the end-to-end smoke prints `w_norm: delta=0.000`.
+    let gamma_adj = gen.adjoint_of(gamma_vid);
+    assert!(
+        gamma_adj.is_some(),
+        "Gap I step K regression: `gen.adjoint_of({})` returned None \
+         under the fused CSHA dispatch path. That means \
+         `accumulate_adjoint(gamma_var, dgamma)` in \
+         `source_ad.rs:~447` did not fire — the standalone \
+         RmsNormGammaBackward emission was skipped.  `named_param_vars` \
+         map: {:?}",
+        gamma_vid,
+        gen.adjoint_vars_map().keys().collect::<Vec<_>>()
+    );
+
+    // Property 2: the event recorder should have flipped `dgamma_emitted`
+    // to `true`. This is the independent "we took the dgamma path"
+    // witness, separate from the adjoint map check above.
+    let events = gen.csha_fused_events();
+    assert_eq!(events.len(), 1, "one fused event expected");
+    assert!(
+        events[0].dgamma_emitted,
+        "Gap I step K regression: `csha_fused_events[0].dgamma_emitted` \
+         should be true when both `norm_weight_var` and `x_raw_var` are \
+         populated on the claim mark. Event: {:?}",
+        events[0]
+    );
+}
