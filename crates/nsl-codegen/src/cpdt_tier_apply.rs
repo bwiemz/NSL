@@ -217,14 +217,36 @@ pub fn plan_map_noweights(wm: &WeightMap, cfg: &PrecisionConfig) -> PrecisionPla
 ///
 /// Returns `(agree_layers, total_layers, agree_params, total_params)`. The two
 /// plans must have been produced from the same `WeightMap`; layer alignment
-/// goes by name, and any name present in one but not the other is counted as
-/// disagreement for the layers that are shared (mismatched layers are
-/// ignored — the caller should ensure plans share identities).
+/// goes by name, and any name present in one but not the other is skipped
+/// (mismatched layers are not counted). Zero-byte tensors are also skipped so
+/// they cannot artificially depress the parameter-weighted percentage.
+///
+/// **Precondition:** both `plan.params` and `plan_nw.params` must have unique
+/// names. Duplicates on either side silently corrupt the metric — the HashMap
+/// build collapses duplicates in `plan_nw`, and iteration over duplicates in
+/// `plan` double-counts against the same `plan_nw` record. A `debug_assert`
+/// catches the common regression paths.
 pub fn compute_tier_agreement(
     plan: &PrecisionPlan,
     plan_nw: &PrecisionPlan,
 ) -> (u64, u64, u64, u64) {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
+
+    debug_assert!(
+        {
+            let mut seen: HashSet<&str> = HashSet::with_capacity(plan.params.len());
+            plan.params.iter().all(|p| seen.insert(p.name.as_str()))
+        },
+        "compute_tier_agreement precondition: duplicate tensor name in `plan`"
+    );
+    debug_assert!(
+        {
+            let mut seen: HashSet<&str> = HashSet::with_capacity(plan_nw.params.len());
+            plan_nw.params.iter().all(|p| seen.insert(p.name.as_str()))
+        },
+        "compute_tier_agreement precondition: duplicate tensor name in `plan_nw`"
+    );
+
     let by_name_nw: HashMap<&str, &ParamPrecision> =
         plan_nw.params.iter().map(|p| (p.name.as_str(), p)).collect();
     let mut agree_layers: u64 = 0;
@@ -235,11 +257,17 @@ pub fn compute_tier_agreement(
         let Some(pnw) = by_name_nw.get(p.name.as_str()) else {
             continue;
         };
+        if p.param_bytes == 0 {
+            // Zero-byte tensors (e.g. shape-`[0]` biases) contribute nothing to
+            // optimizer memory; excluding them keeps the parameter-weighted
+            // percentage a true bytes-weighted measure.
+            continue;
+        }
         total_layers += 1;
-        total_params += p.param_bytes.max(1);
+        total_params += p.param_bytes;
         if p.tier == pnw.tier {
             agree_layers += 1;
-            agree_params += p.param_bytes.max(1);
+            agree_params += p.param_bytes;
         }
     }
     (agree_layers, total_layers, agree_params, total_params)

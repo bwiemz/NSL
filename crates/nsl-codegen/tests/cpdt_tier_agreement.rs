@@ -102,6 +102,55 @@ fn tier_agreement_ignores_unmatched_layers() {
 }
 
 #[test]
+fn tier_agreement_skips_zero_byte_tensors() {
+    // Construct two tiny plans where one shared tensor has param_bytes == 0;
+    // the zero-byte tensor must not contribute to the totals regardless of
+    // whether its tiers agree.
+    use nsl_codegen::cpdt_tier_apply::{OptimPrecision, ParamPrecision, PrecisionPlan};
+
+    let shared_nonzero = ParamPrecision {
+        name: "real.weight".to_string(),
+        layer: Some(0),
+        tier: Tier::High,
+        m_precision: OptimPrecision::Fp32,
+        v_precision: OptimPrecision::Fp32,
+        stochastic_rounding: false,
+        sensitivity_score: 1.0,
+        param_bytes: 1024,
+        optim_bytes: 8192,
+    };
+    let zero_byte = ParamPrecision {
+        name: "empty.bias".to_string(),
+        layer: Some(0),
+        tier: Tier::VeryLow,
+        m_precision: OptimPrecision::Int8,
+        v_precision: OptimPrecision::Int8,
+        stochastic_rounding: false,
+        sensitivity_score: 0.0,
+        param_bytes: 0,
+        optim_bytes: 0,
+    };
+    let plan = PrecisionPlan {
+        params: vec![shared_nonzero.clone(), zero_byte.clone()],
+        total_optim_bytes: 8192,
+        baseline_fp32_bytes: 8192,
+    };
+    // plan_nw disagrees on the zero-byte tensor; still shouldn't affect totals.
+    let mut zero_byte_disagree = zero_byte.clone();
+    zero_byte_disagree.tier = Tier::High;
+    let plan_nw = PrecisionPlan {
+        params: vec![shared_nonzero, zero_byte_disagree],
+        total_optim_bytes: 8192,
+        baseline_fp32_bytes: 8192,
+    };
+    let (agree_l, total_l, agree_p, total_p) = compute_tier_agreement(&plan, &plan_nw);
+    assert_eq!(total_l, 1, "zero-byte tensor must not be counted");
+    assert_eq!(agree_l, 1, "the real tensor agrees");
+    assert_eq!(total_p, 1024);
+    assert_eq!(agree_p, 1024);
+}
+
+#[test]
 fn plan_map_noweights_applies_embedding_stochastic_rounding_flag() {
     let wm = WeightMap::load(&fixture("calib_tiny")).unwrap();
     let cfg = PrecisionConfig {

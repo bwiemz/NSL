@@ -93,7 +93,14 @@ pub(crate) fn invoke_cpdt_if_enabled(
 
     let plan = cpdt_run(input);
 
-    if weights_present {
+    // Tier-agreement diagnostic requires a populated precision plan, which
+    // cpdt::run only builds under CpdtMode::Full. Under ZeroOnly the precision
+    // field is default-empty regardless of whether weights were supplied, so
+    // gating only on `weights_present` would emit a meaningless 100% / 0-of-0
+    // line. Tie the diagnostic to the mode that actually exercises the scorer.
+    let precision_plan_built = compiler.cpdt_mode == CpdtMode::Full;
+
+    if weights_present && precision_plan_built {
         if let Some(wm) = weight_map_ref {
             let plan_nw = plan_map_noweights(wm, &precision_cfg);
             let (agree_layers, total_layers, agree_params, total_params) =
