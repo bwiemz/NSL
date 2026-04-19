@@ -54,7 +54,7 @@ pub(crate) fn invoke_cpdt_if_enabled(
     use crate::cpdt::{CpdtInput, CpdtMode, run as cpdt_run};
     use crate::cpdt_expert::ExpertConfig;
     use crate::cpdt_joint::JointConfig;
-    use crate::cpdt_tier_apply::PrecisionConfig;
+    use crate::cpdt_tier_apply::{compute_tier_agreement, plan_map_noweights, PrecisionConfig};
     use crate::cpdt_zero::ModelSize;
     use crate::wggo_overrides::WggoOverrides;
 
@@ -69,12 +69,19 @@ pub(crate) fn invoke_cpdt_if_enabled(
     let model = ModelSize::from_applied_plan(applied_plan);
     let adamw = adamw_from_train_block(train_block, compiler.interner);
 
+    // Phase 1 weight-aware CPDT: the compiler holds a WeightMap loaded from
+    // the CLI's --weights flag. Thread it into the CpdtInput so plan_map
+    // runs on real weights.
+    let weight_map_ref = compiler.features.weight_map.as_ref();
+    let weights_present = weight_map_ref.is_some();
+    let precision_cfg = PrecisionConfig::default();
+
     let input = CpdtInput {
         mode: compiler.cpdt_mode,
         model,
         cluster,
-        weights: None,
-        precision_cfg: PrecisionConfig::default(),
+        weights: weight_map_ref,
+        precision_cfg: precision_cfg.clone(),
         adamw,
         moe_shape: None,
         moe_router: None,
@@ -85,6 +92,48 @@ pub(crate) fn invoke_cpdt_if_enabled(
     };
 
     let plan = cpdt_run(input);
+
+    if weights_present {
+        if let Some(wm) = weight_map_ref {
+            let plan_nw = plan_map_noweights(wm, &precision_cfg);
+            let (agree_layers, total_layers, agree_params, total_params) =
+                compute_tier_agreement(&plan.precision, &plan_nw);
+            let layer_pct = if total_layers == 0 {
+                100.0
+            } else {
+                100.0 * agree_layers as f64 / total_layers as f64
+            };
+            let param_pct = if total_params == 0 {
+                100.0
+            } else {
+                100.0 * agree_params as f64 / total_params as f64
+            };
+            eprintln!(
+                "[cpdt] weight-aware tier agreement: {:.2}% ({}/{} layers, \
+                 parameter-weighted {:.2}%)",
+                layer_pct, agree_layers, total_layers, param_pct,
+            );
+            if param_pct < 95.0 {
+                eprintln!(
+                    "warning: weight-aware tier agreement below 95% (parameter-weighted \
+                     {:.2}%). This may indicate that the calibration constants do not fit \
+                     this weight distribution well. Phase 2's spectral factor + sidecar \
+                     cache narrow this gap; see docs/superpowers/specs/\
+                     2026-04-18-cpdt-weight-aware-phase2-stub.md.",
+                    param_pct
+                );
+            }
+
+            if let Ok(val) = std::env::var("CPDT_CALIB_K") {
+                eprintln!(
+                    "warning: CPDT_CALIB_K={val} is set but ignored. Weights are present, \
+                     so the computed gradient_magnitude_est is authoritative. If CPDT_CALIB_K \
+                     is vestigial in your shell, you can unset it to silence this warning."
+                );
+            }
+        }
+    }
+
     // Publish to the CLI-owned output slot (if any) so `nsl build` can
     // render the plan after compile returns without threading it through
     // every entry-point's return tuple.

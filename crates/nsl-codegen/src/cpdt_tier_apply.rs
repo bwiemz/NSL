@@ -175,3 +175,72 @@ pub fn plan_map(wm: &WeightMap, cfg: &PrecisionConfig) -> PrecisionPlan {
         baseline_fp32_bytes: baseline_fp32,
     }
 }
+
+/// Score every tensor in `wm` using the no-weights path (gradient_magnitude_est
+/// replaced by `CALIB_K`). The outer caller passes the same `WeightMap` the
+/// weights-present pass used so layer identity and element counts match — this
+/// is what makes the two plans directly comparable in
+/// [`compute_tier_agreement`].
+pub fn plan_map_noweights(wm: &WeightMap, cfg: &PrecisionConfig) -> PrecisionPlan {
+    let scorer = SensitivityScorer::from_config(cfg);
+    let mut params = Vec::new();
+    let mut total_optim = 0u64;
+    let mut baseline_fp32 = 0u64;
+    for (name, entry) in wm.entries() {
+        let (tier, score, layer, kind) = scorer.score_optional(name, entry.num_elements, None);
+        let (m, v) = tier.precision();
+        let param_bytes = (entry.num_elements as u64) * (entry.dtype.byte_width() as u64);
+        let optim_bytes = (entry.num_elements as u64) * (m.bytes() as u64 + v.bytes() as u64);
+        let stochastic = cfg.embedding_stochastic_rounding && matches!(kind, LayerKind::Embedding);
+        params.push(ParamPrecision {
+            name: name.clone(),
+            layer,
+            tier,
+            m_precision: m,
+            v_precision: v,
+            stochastic_rounding: stochastic,
+            sensitivity_score: score,
+            param_bytes,
+            optim_bytes,
+        });
+        total_optim += optim_bytes;
+        baseline_fp32 += (entry.num_elements as u64) * 8;
+    }
+    PrecisionPlan {
+        params,
+        total_optim_bytes: total_optim,
+        baseline_fp32_bytes: baseline_fp32,
+    }
+}
+
+/// Tier-agreement between a weights-present `plan` and a no-weights `plan_nw`.
+///
+/// Returns `(agree_layers, total_layers, agree_params, total_params)`. The two
+/// plans must have been produced from the same `WeightMap`; layer alignment
+/// goes by name, and any name present in one but not the other is counted as
+/// disagreement for the layers that are shared (mismatched layers are
+/// ignored — the caller should ensure plans share identities).
+pub fn compute_tier_agreement(
+    plan: &PrecisionPlan,
+    plan_nw: &PrecisionPlan,
+) -> (u64, u64, u64, u64) {
+    use std::collections::HashMap;
+    let by_name_nw: HashMap<&str, &ParamPrecision> =
+        plan_nw.params.iter().map(|p| (p.name.as_str(), p)).collect();
+    let mut agree_layers: u64 = 0;
+    let mut total_layers: u64 = 0;
+    let mut agree_params: u64 = 0;
+    let mut total_params: u64 = 0;
+    for p in &plan.params {
+        let Some(pnw) = by_name_nw.get(p.name.as_str()) else {
+            continue;
+        };
+        total_layers += 1;
+        total_params += p.param_bytes.max(1);
+        if p.tier == pnw.tier {
+            agree_layers += 1;
+            agree_params += p.param_bytes.max(1);
+        }
+    }
+    (agree_layers, total_layers, agree_params, total_params)
+}
