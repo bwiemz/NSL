@@ -71,6 +71,15 @@ pub fn emit_lora_register_pool(ptx: &mut String, b: &LoraRegisterBudget) {
     // Output tile coords.
     ptx.push_str("    .reg .u32 %row_base, %col_base;\n");
     ptx.push_str("    .reg .u32 %m_real, %n_real;\n");
+    // Runtime K-loop registers (2026-04-19): the K-loop is now a PTX runtime
+    // loop rather than Rust-unrolled. The previous Rust-side unrolling produced
+    // 20 MB PTX at k=4096 which ptxas could not compile; invariant #19.
+    ptx.push_str("    .reg .u32 %k_iter, %k_index_base, %r_k_idx;\n");
+    ptx.push_str("    .reg .u64 %rd_k_iter;\n");
+    ptx.push_str("    .reg .u64 %rd_x_k_byte, %rd_w_k_byte, %rd_a_k_byte;\n");
+    ptx.push_str("    .reg .u64 %rd_x_iter, %rd_w_iter, %rd_a_iter;\n");
+    ptx.push_str("    .reg .pred %p_k_loop, %p_last_k;\n");
+    ptx.push_str("    .reg .pred %p_k_v0, %p_k_v1, %p_load0, %p_load1;\n");
 }
 
 /// Emit the WRGA output-tile coord computation:
@@ -190,59 +199,86 @@ pub fn emit_lora_tile_bases(ptx: &mut String) {
 /// emits a `setp.lt.u32 %p1, <row_const>, %m_param` before the global load to
 /// guard against reading beyond the actual batch dimension.  k-tail bounds are
 /// still compile-time constants since k is a fixed kernel dimension.
-pub fn emit_lora_stage_x_tile(ptx: &mut String, k_tile: u32, _m: u32, k: u32) {
-    ptx.push_str(&format!("    // Stage x_tile for K-tile {} (f32 global -> f16x2 SMEM, m-bound from %m_param)\n", k_tile));
+pub fn emit_lora_stage_x_tile(ptx: &mut String, _m: u32, k: u32) {
+    // Runtime K-iter version: k_start is derived from %k_iter at runtime.
+    // Preconditions set by emit_fused_adapter_kernel_body's loop prolog:
+    //   %rd_x_iter = %rd_x + (%k_iter * 64) — per-iter global base for x
+    //   %k_index_base = %k_iter * 16 (u32) — k-index at start of current iter
+    // The inner [16 rows x 8 col_pairs] unroll is retained (bounded, small).
+    // k-tail predicates are emitted only when k % 16 != 0; otherwise the
+    // runtime iter count k_iters * 16 == k exactly and no iter can overrun.
+    ptx.push_str("    // Stage x_tile for runtime K-iter (f32 global -> f16x2 SMEM)\n");
     ptx.push_str("    setp.eq.u32 %p0, %tid_x, 0;\n");
-    ptx.push_str(&format!("    @!%p0 bra lora_x_stage_done_{};\n", k_tile));
-    let k_start = k_tile * 16;
+    ptx.push_str("    @!%p0 bra lora_x_stage_done;\n");
+    let needs_k_tail = k % 16 != 0;
     for row in 0..16u32 {
-        // Emit runtime m-predicate for this row: %p1 = (row < %m_param).
+        // Per-row m-predicate: %p1 = (row < %m_param).
         ptx.push_str(&format!("    setp.lt.u32 %p1, {}, %m_param;\n", row));
         for col_pair in 0..8u32 {
             let col = col_pair * 2;
             let smem_offset = row * 32 + col_pair * 4;
-            // k-tail is a compile-time check (k is a fixed kernel dimension).
-            if k_start + col >= k {
-                // k-OOB: always zero, regardless of row.
+            // x is row-major [m, k], f32. Element at (row, k_start+col) lives at
+            // byte (row*k + k_start + col) * 4 = (row*k + col)*4 + (k_start)*4.
+            // %rd_x_iter already folds in k_start*4, so the remaining immediate
+            // offset is (row*k + col) * 4.
+            let row_byte_imm = (row as u64) * (k as u64) * 4 + (col as u64) * 4;
+            let row_byte_imm1 = row_byte_imm + 4;
+            if needs_k_tail {
+                // Need runtime k-bound predicate on each column.
                 ptx.push_str(&format!(
-                    "    st.shared.b32 [%x_tile_base + {}], 0;\n",
-                    smem_offset
+                    "    add.u32 %r_k_idx, %k_index_base, {};\n",
+                    col
                 ));
-            } else {
-                // f32 global layout: x[row, col] at byte (row * k + col) * 4.
-                let gl_off0 = (row as u64) * (k as u64) * 4
-                    + (k_start as u64 + col as u64) * 4;
-                let col1_valid = k_start + col + 1 < k;
-                let gl_off1 = gl_off0 + 4;
-                // Predicated load: row < m_param → load from global; else zero.
                 ptx.push_str(&format!(
-                    "    @%p1 ld.global.f32 %stg_f0, [%rd_x + {}];\n",
-                    gl_off0
+                    "    setp.lt.u32 %p_k_v0, %r_k_idx, {};\n",
+                    k
+                ));
+                ptx.push_str("    and.pred %p_load0, %p1, %p_k_v0;\n");
+                ptx.push_str(&format!(
+                    "    add.u32 %r_k_idx, %k_index_base, {};\n",
+                    col + 1
+                ));
+                ptx.push_str(&format!(
+                    "    setp.lt.u32 %p_k_v1, %r_k_idx, {};\n",
+                    k
+                ));
+                ptx.push_str("    and.pred %p_load1, %p1, %p_k_v1;\n");
+                ptx.push_str(&format!(
+                    "    @%p_load0 ld.global.f32 %stg_f0, [%rd_x_iter + {}];\n",
+                    row_byte_imm
+                ));
+                ptx.push_str("    @%p_load0 cvt.rn.f16.f32 %stg_h0, %stg_f0;\n");
+                ptx.push_str("    @!%p_load0 mov.b16 %stg_h0, 0;\n");
+                ptx.push_str(&format!(
+                    "    @%p_load1 ld.global.f32 %stg_f1, [%rd_x_iter + {}];\n",
+                    row_byte_imm1
+                ));
+                ptx.push_str("    @%p_load1 cvt.rn.f16.f32 %stg_h1, %stg_f1;\n");
+                ptx.push_str("    @!%p_load1 mov.b16 %stg_h1, 0;\n");
+            } else {
+                // k divisible by 16: bound checks elided (never fire at runtime).
+                ptx.push_str(&format!(
+                    "    @%p1 ld.global.f32 %stg_f0, [%rd_x_iter + {}];\n",
+                    row_byte_imm
                 ));
                 ptx.push_str("    @%p1 cvt.rn.f16.f32 %stg_h0, %stg_f0;\n");
                 ptx.push_str("    @!%p1 mov.b16 %stg_h0, 0;\n");
-                if col1_valid {
-                    ptx.push_str(&format!(
-                        "    @%p1 ld.global.f32 %stg_f1, [%rd_x + {}];\n",
-                        gl_off1
-                    ));
-                    ptx.push_str("    @%p1 cvt.rn.f16.f32 %stg_h1, %stg_f1;\n");
-                    ptx.push_str("    @!%p1 mov.b16 %stg_h1, 0;\n");
-                } else {
-                    ptx.push_str("    mov.b16 %stg_h1, 0;\n");
-                }
-                // Pack two f16s into b32 and store to SMEM.
                 ptx.push_str(&format!(
-                    "    mov.b32 %r3, {{%stg_h0, %stg_h1}};\n"
+                    "    @%p1 ld.global.f32 %stg_f1, [%rd_x_iter + {}];\n",
+                    row_byte_imm1
                 ));
-                ptx.push_str(&format!(
-                    "    st.shared.b32 [%x_tile_base + {}], %r3;\n",
-                    smem_offset
-                ));
+                ptx.push_str("    @%p1 cvt.rn.f16.f32 %stg_h1, %stg_f1;\n");
+                ptx.push_str("    @!%p1 mov.b16 %stg_h1, 0;\n");
             }
+            // Pack two f16s into b32 and store to SMEM.
+            ptx.push_str("    mov.b32 %r3, {%stg_h0, %stg_h1};\n");
+            ptx.push_str(&format!(
+                "    st.shared.b32 [%x_tile_base + {}], %r3;\n",
+                smem_offset
+            ));
         }
     }
-    ptx.push_str(&format!("lora_x_stage_done_{}:\n", k_tile));
+    ptx.push_str("lora_x_stage_done:\n");
 }
 
 /// Stage the w_tile slice for K-iteration `k_tile`.  Shape: 16×8 f16.
@@ -255,38 +291,61 @@ pub fn emit_lora_stage_x_tile(ptx: &mut String, k_tile: u32, _m: u32, k: u32) {
 /// Each f32 is loaded from global, converted to f16, and stored individually
 /// to its col-major SMEM slot using b16 stores (always 2-byte aligned).
 /// Thread 0 does all work.
-pub fn emit_lora_stage_w_tile(ptx: &mut String, k_tile: u32, n: u32, k: u32) {
-    ptx.push_str(&format!("    // Stage w_tile for K-tile {} (f32 global, col-major f16 SMEM)\n", k_tile));
+pub fn emit_lora_stage_w_tile(ptx: &mut String, n: u32, k: u32) {
+    // Runtime K-iter version. Precondition: %rd_w_iter = %rd_w + (%k_iter *
+    // (16 * n * 4)), set up in emit_fused_adapter_kernel_body's loop prolog.
+    // %k_index_base = %k_iter * 16 (u32).
+    ptx.push_str("    // Stage w_tile for runtime K-iter (f32 global, col-major f16 SMEM)\n");
     ptx.push_str("    setp.eq.u32 %p0, %tid_x, 0;\n");
-    ptx.push_str(&format!("    @!%p0 bra lora_w_stage_done_{};\n", k_tile));
-    let k_start = k_tile * 16;
+    ptx.push_str("    @!%p0 bra lora_w_stage_done;\n");
+    let needs_k_tail = k % 16 != 0;
     // Col-major SMEM: column c at bytes c*32 + k*2.
     const COL_STRIDE: u32 = 32;
     for col in 0..8u32 {
         for k_row in 0..16u32 {
             let smem_offset = col * COL_STRIDE + k_row * 2;
-            if k_start + k_row >= k || col >= n {
+            // col >= n is a compile-time check (n is fixed).
+            if col >= n {
                 ptx.push_str(&format!(
                     "    st.shared.b16 [%w_tile_base + {}], 0;\n",
                     smem_offset
                 ));
-            } else {
-                // f32 global: W[k_start+k_row, col] at byte (k_start+k_row)*n*4 + col*4
-                let gl_offset =
-                    ((k_start + k_row) as u64) * (n as u64) * 4 + (col as u64) * 4;
+                continue;
+            }
+            // f32 global: W[k_start+k_row, col] at byte (k_start+k_row)*n*4 + col*4.
+            // %rd_w_iter already folds in k_start*n*4; remaining immediate is
+            // k_row*n*4 + col*4.
+            let gl_offset_imm = (k_row as u64) * (n as u64) * 4 + (col as u64) * 4;
+            if needs_k_tail {
+                // Runtime k-bound: (k_index_base + k_row) < k.
                 ptx.push_str(&format!(
-                    "    ld.global.f32 %stg_f0, [%rd_w + {}];\n",
-                    gl_offset
+                    "    add.u32 %r_k_idx, %k_index_base, {};\n",
+                    k_row
+                ));
+                ptx.push_str(&format!(
+                    "    setp.lt.u32 %p_k_v0, %r_k_idx, {};\n",
+                    k
+                ));
+                ptx.push_str(&format!(
+                    "    @%p_k_v0 ld.global.f32 %stg_f0, [%rd_w_iter + {}];\n",
+                    gl_offset_imm
+                ));
+                ptx.push_str("    @%p_k_v0 cvt.rn.f16.f32 %stg_h0, %stg_f0;\n");
+                ptx.push_str("    @!%p_k_v0 mov.b16 %stg_h0, 0;\n");
+            } else {
+                ptx.push_str(&format!(
+                    "    ld.global.f32 %stg_f0, [%rd_w_iter + {}];\n",
+                    gl_offset_imm
                 ));
                 ptx.push_str("    cvt.rn.f16.f32 %stg_h0, %stg_f0;\n");
-                ptx.push_str(&format!(
-                    "    st.shared.b16 [%w_tile_base + {}], %stg_h0;\n",
-                    smem_offset
-                ));
             }
+            ptx.push_str(&format!(
+                "    st.shared.b16 [%w_tile_base + {}], %stg_h0;\n",
+                smem_offset
+            ));
         }
     }
-    ptx.push_str(&format!("lora_w_stage_done_{}:\n", k_tile));
+    ptx.push_str("lora_w_stage_done:\n");
 }
 
 /// Stage the a_tile slice for K-iteration `k_tile`.
@@ -299,37 +358,59 @@ pub fn emit_lora_stage_w_tile(ptx: &mut String, k_tile: u32, n: u32, k: u32) {
 ///
 /// Each f32 is loaded from global, converted to f16, and stored individually
 /// to its col-major SMEM slot using b16 stores.  Thread 0 does all work.
-pub fn emit_lora_stage_a_tile(ptx: &mut String, k_tile: u32, rank: u32, k: u32) {
-    ptx.push_str(&format!("    // Stage a_tile for K-tile {} (rank={}, f32 global, col-major f16 SMEM)\n", k_tile, rank));
+pub fn emit_lora_stage_a_tile(ptx: &mut String, rank: u32, k: u32) {
+    // Runtime K-iter version. Precondition: %rd_a_iter = %rd_a + (%k_iter *
+    // (16 * rank * 4)), set up in emit_fused_adapter_kernel_body's loop prolog.
+    // %k_index_base = %k_iter * 16 (u32).
+    ptx.push_str(&format!("    // Stage a_tile for runtime K-iter (rank={rank}, f32 global, col-major f16 SMEM)\n"));
     ptx.push_str("    setp.eq.u32 %p0, %tid_x, 0;\n");
-    ptx.push_str(&format!("    @!%p0 bra lora_a_stage_done_{};\n", k_tile));
-    let k_start = k_tile * 16;
+    ptx.push_str("    @!%p0 bra lora_a_stage_done;\n");
+    let needs_k_tail = k % 16 != 0;
     // Col-major: col c at bytes c*32 + k_row*2.
     const COL_STRIDE: u32 = 32;
     for col in 0..8u32 {
         for k_row in 0..16u32 {
             let smem_offset = col * COL_STRIDE + k_row * 2;
-            if k_start + k_row >= k || col >= rank {
+            if col >= rank {
                 ptx.push_str(&format!(
                     "    st.shared.b16 [%a_tile_base + {}], 0;\n",
                     smem_offset
                 ));
-            } else {
-                // f32 global: A[k_start+k_row, col] at byte (k_start+k_row)*rank*4 + col*4
-                let gl_offset = ((k_start + k_row) as u64) * (rank as u64) * 4 + (col as u64) * 4;
+                continue;
+            }
+            // f32 global: A[k_start+k_row, col] at byte
+            // (k_start+k_row)*rank*4 + col*4 = k_start*rank*4 + k_row*rank*4 + col*4.
+            // %rd_a_iter folds in k_start*rank*4; remaining imm is k_row*rank*4+col*4.
+            let gl_offset_imm = (k_row as u64) * (rank as u64) * 4 + (col as u64) * 4;
+            if needs_k_tail {
                 ptx.push_str(&format!(
-                    "    ld.global.f32 %stg_f0, [%rd_a + {}];\n",
-                    gl_offset
+                    "    add.u32 %r_k_idx, %k_index_base, {};\n",
+                    k_row
+                ));
+                ptx.push_str(&format!(
+                    "    setp.lt.u32 %p_k_v0, %r_k_idx, {};\n",
+                    k
+                ));
+                ptx.push_str(&format!(
+                    "    @%p_k_v0 ld.global.f32 %stg_f0, [%rd_a_iter + {}];\n",
+                    gl_offset_imm
+                ));
+                ptx.push_str("    @%p_k_v0 cvt.rn.f16.f32 %stg_h0, %stg_f0;\n");
+                ptx.push_str("    @!%p_k_v0 mov.b16 %stg_h0, 0;\n");
+            } else {
+                ptx.push_str(&format!(
+                    "    ld.global.f32 %stg_f0, [%rd_a_iter + {}];\n",
+                    gl_offset_imm
                 ));
                 ptx.push_str("    cvt.rn.f16.f32 %stg_h0, %stg_f0;\n");
-                ptx.push_str(&format!(
-                    "    st.shared.b16 [%a_tile_base + {}], %stg_h0;\n",
-                    smem_offset
-                ));
             }
+            ptx.push_str(&format!(
+                "    st.shared.b16 [%a_tile_base + {}], %stg_h0;\n",
+                smem_offset
+            ));
         }
     }
-    ptx.push_str(&format!("lora_a_stage_done_{}:\n", k_tile));
+    ptx.push_str("lora_a_stage_done:\n");
 }
 
 /// Stage the b_tile ONCE post-loop.  Shape: 16×8 f16 (rank-padded rows = k-dim).
@@ -510,6 +591,14 @@ pub fn emit_ia3_register_pool(ptx: &mut String, b: &Ia3RegisterBudget) {
     // Output tile coords.
     ptx.push_str("    .reg .u32 %row_base, %col_base;\n");
     ptx.push_str("    .reg .u32 %m_real, %n_real;\n");
+    // Runtime K-loop registers (see emit_lora_register_pool for rationale;
+    // IA³ uses the same set for its own runtime K-loop).
+    ptx.push_str("    .reg .u32 %k_iter, %k_index_base, %r_k_idx;\n");
+    ptx.push_str("    .reg .u64 %rd_k_iter;\n");
+    ptx.push_str("    .reg .u64 %rd_x_k_byte, %rd_w_k_byte, %rd_a_k_byte;\n");
+    ptx.push_str("    .reg .u64 %rd_x_iter, %rd_w_iter, %rd_a_iter;\n");
+    ptx.push_str("    .reg .pred %p_k_loop, %p_last_k;\n");
+    ptx.push_str("    .reg .pred %p_k_v0, %p_k_v1, %p_load0, %p_load1;\n");
 }
 
 /// SMEM byte offsets for the IA³ kernel.
@@ -634,13 +723,31 @@ pub fn emit_ia3_store_output(ptx: &mut String, n: u32) {
 /// `emit_fused_adapter_kernel_body`'s PerColumnSigmoid register block
 /// (added in Task 4.1).
 pub fn emit_sigmoid_approx_fused(ptx: &mut String, input: &str, output: &str) {
+    emit_sigmoid_approx_fused_maybe_guarded(ptx, input, output, None);
+}
+
+/// Predicate-guarded variant used by the runtime K-loop's LastKIter emission:
+/// each instruction is prefixed with `@<guard>` so the sigmoid math runs only
+/// on the last K iteration. Pass `None` to emit unguarded (identical to
+/// `emit_sigmoid_approx_fused`).
+pub fn emit_sigmoid_approx_fused_maybe_guarded(
+    ptx: &mut String,
+    input: &str,
+    output: &str,
+    guard: Option<&str>,
+) {
+    let g = guard.map(|p| format!("@{p} ")).unwrap_or_default();
     ptx.push_str(&format!(
-        "    mul.f32  %sig_tmp, {input}, 0fBFB8AA3B;   // * -log2(e)\n"
+        "    {g}mul.f32  %sig_tmp, {input}, 0fBFB8AA3B;   // * -log2(e)\n"
     ));
-    ptx.push_str("    ex2.approx.f32 %sig_tmp, %sig_tmp;\n");
-    ptx.push_str("    add.f32  %sig_tmp, %sig_tmp, 0f3F800000;   // + 1.0\n");
     ptx.push_str(&format!(
-        "    rcp.approx.f32 {output}, %sig_tmp;\n"
+        "    {g}ex2.approx.f32 %sig_tmp, %sig_tmp;\n"
+    ));
+    ptx.push_str(&format!(
+        "    {g}add.f32  %sig_tmp, %sig_tmp, 0f3F800000;   // + 1.0\n"
+    ));
+    ptx.push_str(&format!(
+        "    {g}rcp.approx.f32 {output}, %sig_tmp;\n"
     ));
 }
 
@@ -667,13 +774,30 @@ pub fn emit_sigmoid_approx_fused(ptx: &mut String, input: &str, output: &str) {
 /// TODO(gate-dtype): the `shl.b32 %r_gate, %r_gate, 2` assumes f32 gate.
 /// If gate dtype ever narrows to f16, shift constant becomes 1.
 pub fn emit_gate_load_per_thread(ptx: &mut String) {
+    emit_gate_load_per_thread_maybe_guarded(ptx, None);
+}
+
+/// Predicate-guarded variant used by the runtime K-loop's LastKIter emission.
+/// When `guard` is `Some(p)`, every non-comment instruction is prefixed with
+/// `@p` so the gate load only fires on the last K iteration. Pass `None` for
+/// the unguarded emission.
+pub fn emit_gate_load_per_thread_maybe_guarded(ptx: &mut String, guard: Option<&str>) {
+    let g = guard.map(|p| format!("@{p} ")).unwrap_or_default();
     ptx.push_str("    // GatedLoRA: per-thread gate load - 2 cols per thread\n");
-    ptx.push_str("    add.u32  %r_gate, %col_base, %r5;\n");
-    ptx.push_str("    shl.b32  %r_gate, %r_gate, 2;   // * 4 bytes (f32)\n");
-    ptx.push_str("    cvt.u64.u32 %rd_gate_addr, %r_gate;\n");
-    ptx.push_str("    add.u64  %rd_gate_addr, %rd_gate, %rd_gate_addr;\n");
-    ptx.push_str("    ld.global.f32 %gate0, [%rd_gate_addr];\n");
-    ptx.push_str("    ld.global.f32 %gate1, [%rd_gate_addr + 4];\n");
+    ptx.push_str(&format!("    {g}add.u32  %r_gate, %col_base, %r5;\n"));
+    ptx.push_str(&format!(
+        "    {g}shl.b32  %r_gate, %r_gate, 2;   // * 4 bytes (f32)\n"
+    ));
+    ptx.push_str(&format!("    {g}cvt.u64.u32 %rd_gate_addr, %r_gate;\n"));
+    ptx.push_str(&format!(
+        "    {g}add.u64  %rd_gate_addr, %rd_gate, %rd_gate_addr;\n"
+    ));
+    ptx.push_str(&format!(
+        "    {g}ld.global.f32 %gate0, [%rd_gate_addr];\n"
+    ));
+    ptx.push_str(&format!(
+        "    {g}ld.global.f32 %gate1, [%rd_gate_addr + 4];\n"
+    ));
 }
 
 /// Emit the GatedLoRA fold step: per-thread, per-column fold of the

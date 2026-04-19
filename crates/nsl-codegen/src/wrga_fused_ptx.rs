@@ -354,54 +354,94 @@ fn emit_fused_adapter_kernel_body(
         "%epi_final2".into(), "%epi_final3".into(),
     ];
 
-    for k_tile in 0..k_iters {
-        ptx.push_str(&format!("    // ===== K-iteration {} =====\n", k_tile));
+    // Runtime PTX K-loop (2026-04-19): the previous Rust-side `for k_tile in
+    // 0..k_iters` unroll produced PTX sized O(k), overflowing ptxas at k=4096
+    // (20 MB / 478k lines). This version emits a single body copy wrapped in
+    // `setp.lt + @pred bra` so PTX stays O(1) in k. See
+    // project_wrga_fused_ptx_rewrite.md invariant #19.
+    ptx.push_str("    // ==== Runtime PTX K-loop (k_iters = {} compile-time) ====\n");
+    ptx.push_str("    mov.u32 %k_iter, 0;\n");
+    ptx.push_str("k_loop_start:\n");
+    // Per-iter address bases: fold in k_start byte offset for each tile stream.
+    //   x : row-major [m, k], stride-k = 4 bytes (f32) → k_byte = k_iter * 64
+    //   w : row-major [k, n], stride-k = n*4 bytes → k_byte = k_iter * (16*n*4)
+    //   a : row-major [k, rank], stride-k = rank*4 → k_byte = k_iter * (16*rank*4)
+    ptx.push_str("    cvt.u64.u32 %rd_k_iter, %k_iter;\n");
+    ptx.push_str("    shl.b32 %k_index_base, %k_iter, 4;   // k_iter * 16 (k-index)\n");
+    ptx.push_str("    mul.lo.u64 %rd_x_k_byte, %rd_k_iter, 64;\n");
+    ptx.push_str("    add.u64 %rd_x_iter, %rd_x, %rd_x_k_byte;\n");
+    ptx.push_str(&format!(
+        "    mul.lo.u64 %rd_w_k_byte, %rd_k_iter, {};\n",
+        64u64 * n as u64
+    ));
+    ptx.push_str("    add.u64 %rd_w_iter, %rd_w, %rd_w_k_byte;\n");
+    ptx.push_str(&format!(
+        "    mul.lo.u64 %rd_a_k_byte, %rd_k_iter, {};\n",
+        64u64 * rank as u64
+    ));
+    ptx.push_str("    add.u64 %rd_a_iter, %rd_a, %rd_a_k_byte;\n");
 
-        emit_lora_stage_x_tile(ptx, k_tile, m, k);
-        emit_lora_stage_w_tile(ptx, k_tile, n, k);
-        emit_lora_stage_a_tile(ptx, k_tile, rank, k);
+    emit_lora_stage_x_tile(ptx, m, k);
+    emit_lora_stage_w_tile(ptx, n, k);
+    emit_lora_stage_a_tile(ptx, rank, k);
 
-        ptx.push_str("    bar.sync 0;\n");
+    ptx.push_str("    bar.sync 0;\n");
 
-        // Load A and B fragments from SMEM using u32 tile base addresses.
-        // k_tile offset within the tile is handled at stage time (fresh per-iter).
-        emit_load_a_fragment_smem(ptx, &main_a_frag_names, "%smem_base_x_u32", 32);
-        // row_stride_bytes=1: mma_b_row already holds the full byte offset within the
-        // col-major column (= (tid%4)*4).  The lane base (smem_base_w_lane_u32) adds
-        // the column base ((tid/4)*32).  k-pair register offset = {0, 16} bytes comes
-        // from emit_load_b_fragment_smem's byte_col_offset = k_base_pair*2 = {0, 16}.
-        emit_load_b_fragment_smem(ptx, &main_b_frag_names, "%smem_base_w_lane_u32", 1);
-        // a_tile is col-major (B-operand in epilogue MMA: x @ a_tile).
-        // Same col-major B-fragment addressing as w_tile above.
-        emit_load_b_fragment_smem(ptx, &epi_a_frag_names, "%smem_base_a_lane_u32", 1);
+    // Load A and B fragments from SMEM using u32 tile base addresses.
+    emit_load_a_fragment_smem(ptx, &main_a_frag_names, "%smem_base_x_u32", 32);
+    emit_load_b_fragment_smem(ptx, &main_b_frag_names, "%smem_base_w_lane_u32", 1);
+    emit_load_b_fragment_smem(ptx, &epi_a_frag_names, "%smem_base_a_lane_u32", 1);
 
-        // Main MMA: main_accum += x_tile @ w_tile
-        emit_mma_instruction(ptx, &main_accum, &main_a_frag, &main_b_frag, &main_accum);
+    // Main MMA: main_accum += x_tile @ w_tile
+    emit_mma_instruction(ptx, &main_accum, &main_a_frag, &main_b_frag, &main_accum);
+    // Epilogue interleaved MMA: epi_interm += x_tile @ a_tile
+    emit_mma_instruction(ptx, &epi_interm, &main_a_frag, &epi_a_frag, &epi_interm);
 
-        // Epilogue interleaved MMA: epi_interm += x_tile @ a_tile
-        // Reuses %main_a_frag (from x_tile, row-major) as A-operand; uses
-        // epi_a_frag (from a_tile, col-major B-fragment, 2 b32 regs) as B-operand.
-        emit_mma_instruction(ptx, &epi_interm, &main_a_frag, &epi_a_frag, &epi_interm);
-
-        // GatedLoRA: LastKIter scheduling — gate load + sigmoid at end of
-        // final main K-iteration, overlapping HBM load latency with the
-        // last main MMA.  See spec §2 and invariant #14.
-        if k_tile == k_iters - 1 {
-            if let FoldKind::PerColumnSigmoid {
-                gate_load_phase: GateLoadPhase::LastKIter, ..
-            } = fold {
-                // %r5 = col_base_in_tile = (tid%4)*2 — needed by emit_gate_load_per_thread.
-                // The store preamble also computes %r5 but runs after this point; emit here.
-                ptx.push_str("    and.b32 %r5, %tid_x, 3;\n");
-                ptx.push_str("    shl.b32 %r5, %r5, 1;\n");
-                crate::wrga_kernel_helpers::emit_gate_load_per_thread(ptx);
-                crate::wrga_kernel_helpers::emit_sigmoid_approx_fused(ptx, "%gate0", "%gate0");
-                crate::wrga_kernel_helpers::emit_sigmoid_approx_fused(ptx, "%gate1", "%gate1");
-            }
-        }
-
-        ptx.push_str("    bar.sync 0;\n");
+    // GatedLoRA: LastKIter scheduling — gate load + sigmoid at end of final
+    // K-iteration. In the runtime loop this becomes a predicate guard:
+    // %p_last_k = (%k_iter == k_iters - 1). Invariant #14 + #18 still apply.
+    if let FoldKind::PerColumnSigmoid {
+        gate_load_phase: GateLoadPhase::LastKIter,
+        ..
+    } = fold
+    {
+        ptx.push_str(&format!(
+            "    setp.eq.u32 %p_last_k, %k_iter, {};\n",
+            k_iters - 1
+        ));
+        // %r5 = col_base_in_tile = (tid%4)*2 — needed by emit_gate_load_per_thread.
+        // Computed unconditionally (cheap, and safe: the subsequent gate load
+        // + sigmoid math is predicate-guarded, so %r5 only matters on the
+        // last iter when those ops actually fire).
+        ptx.push_str("    and.b32 %r5, %tid_x, 3;\n");
+        ptx.push_str("    shl.b32 %r5, %r5, 1;\n");
+        crate::wrga_kernel_helpers::emit_gate_load_per_thread_maybe_guarded(
+            ptx,
+            Some("%p_last_k"),
+        );
+        crate::wrga_kernel_helpers::emit_sigmoid_approx_fused_maybe_guarded(
+            ptx,
+            "%gate0",
+            "%gate0",
+            Some("%p_last_k"),
+        );
+        crate::wrga_kernel_helpers::emit_sigmoid_approx_fused_maybe_guarded(
+            ptx,
+            "%gate1",
+            "%gate1",
+            Some("%p_last_k"),
+        );
     }
+
+    ptx.push_str("    bar.sync 0;\n");
+
+    // Loop tail: increment, compare, branch back if more iters remain.
+    ptx.push_str("    add.u32 %k_iter, %k_iter, 1;\n");
+    ptx.push_str(&format!(
+        "    setp.lt.u32 %p_k_loop, %k_iter, {};\n",
+        k_iters
+    ));
+    ptx.push_str("    @%p_k_loop bra k_loop_start;\n");
 
     // 7. Post-loop: stage b once, compute (x@A) @ B.
     emit_lora_stage_b_tile(ptx, rank, n);
@@ -608,22 +648,42 @@ pub fn synthesize_fused_ia3_ptx(config: &FusedIa3Config) -> String {
         "%main_accum2".into(), "%main_accum3".into(),
     ];
 
-    for k_tile in 0..k_iters {
-        ptx.push_str(&format!("    // ===== K-iteration {} =====\n", k_tile));
+    // Runtime PTX K-loop (2026-04-19) — see emit_fused_adapter_kernel_body
+    // for the full rationale + invariant #19. IA³ shares the same runtime
+    // K-loop structure but without adapter A/B staging or epilogue MMA.
+    let (n, k) = (config.n, config.k);
+    ptx.push_str("    // ==== Runtime PTX K-loop (IA³) ====\n");
+    ptx.push_str("    mov.u32 %k_iter, 0;\n");
+    ptx.push_str("k_loop_start:\n");
+    ptx.push_str("    cvt.u64.u32 %rd_k_iter, %k_iter;\n");
+    ptx.push_str("    shl.b32 %k_index_base, %k_iter, 4;\n");
+    ptx.push_str("    mul.lo.u64 %rd_x_k_byte, %rd_k_iter, 64;\n");
+    ptx.push_str("    add.u64 %rd_x_iter, %rd_x, %rd_x_k_byte;\n");
+    ptx.push_str(&format!(
+        "    mul.lo.u64 %rd_w_k_byte, %rd_k_iter, {};\n",
+        64u64 * n as u64
+    ));
+    ptx.push_str("    add.u64 %rd_w_iter, %rd_w, %rd_w_k_byte;\n");
 
-        emit_lora_stage_x_tile(&mut ptx, k_tile, config.m, config.k);
-        emit_lora_stage_w_tile(&mut ptx, k_tile, config.n, config.k);
+    emit_lora_stage_x_tile(&mut ptx, config.m, k);
+    emit_lora_stage_w_tile(&mut ptx, n, k);
 
-        ptx.push_str("    bar.sync 0;\n");
+    ptx.push_str("    bar.sync 0;\n");
 
-        emit_load_a_fragment_smem(&mut ptx, &main_a_frag_names, "%smem_base_x_u32", 32);
-        emit_load_b_fragment_smem(&mut ptx, &main_b_frag_names, "%smem_base_w_lane_u32", 1);
+    emit_load_a_fragment_smem(&mut ptx, &main_a_frag_names, "%smem_base_x_u32", 32);
+    emit_load_b_fragment_smem(&mut ptx, &main_b_frag_names, "%smem_base_w_lane_u32", 1);
 
-        // Main MMA: main_accum += x_tile @ w_tile
-        emit_mma_instruction(&mut ptx, &main_accum, &main_a_frag, &main_b_frag, &main_accum);
+    // Main MMA: main_accum += x_tile @ w_tile
+    emit_mma_instruction(&mut ptx, &main_accum, &main_a_frag, &main_b_frag, &main_accum);
 
-        ptx.push_str("    bar.sync 0;\n");
-    }
+    ptx.push_str("    bar.sync 0;\n");
+
+    ptx.push_str("    add.u32 %k_iter, %k_iter, 1;\n");
+    ptx.push_str(&format!(
+        "    setp.lt.u32 %p_k_loop, %k_iter, {};\n",
+        k_iters
+    ));
+    ptx.push_str("    @%p_k_loop bra k_loop_start;\n");
 
     // 7. IA³ epilogue: load γ, broadcast-multiply, store.
     emit_ia3_load_gamma(&mut ptx);
