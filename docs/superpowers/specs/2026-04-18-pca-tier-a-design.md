@@ -335,6 +335,115 @@ and.pred       %p_final, %p_eq, %p_c;       // fused mask
   in an earlier spec draft, caught by ptxas verification during spec
   prep — see §10 "Alternatives considered.")
 
+## 5.1 Spec-to-implementation amendment — mask-convention integration
+
+Added 2026-04-19 after `s_compute.rs` convention verification during
+Task 3 prep.
+
+The PTX listing in §5 was written assuming **allow-predicate convention**
+(predicate TRUE iff cell should be kept; caller emits
+`@%p_final st.shared.f32 ...` to gate the score store). The actual
+FA2 forward emitter at
+[`flash_attention_v2/phases/forward/s_compute.rs`](../../../crates/nsl-codegen/src/flash_attention_v2/phases/forward/s_compute.rs)
+uses **mask-predicate convention**: the existing causal block computes
+`setp.gt.u64 %p0, %rd_k, %rd_q` (TRUE iff cross-causal), then
+`@%p0 mov.f32 %f0, 0fFF800000` clobbers the score to `-inf` before the
+unconditional shmem store. No allow-gated store exists in the emitter.
+
+`emit_segment_mask_predicate` therefore emits **mask-convention PTX**
+to match the existing kernel idiom. The helper does not return a fresh
+predicate; instead, it **extends the caller's existing causal-mask
+predicate register** with a cross-segment disjunction. The integrated
+form at the call site:
+
+```ptx
+// Before helper (already in s_compute.rs):
+//   setp.gt.u64 %p0, %rd_k, %rd_q;   // TRUE iff k_global > q_row_global
+//
+// Helper emits (positions at u64 width — no u32 truncation in the
+// inputs because the existing kernel already carries q_global / k_global
+// as u64 tile-offset results):
+cvt.u32.u64    %r_sq, %rd_q;               // q_global low-32 for SMEM addr
+cvt.u32.u64    %r_sk, %rd_k;               // k_global low-32 for SMEM addr
+shl.b32        %r_sq, %r_sq, 1;            // q*2 bytes (sizeof(u16))
+shl.b32        %r_sk, %r_sk, 1;            // k*2 bytes
+add.u32        %r_sq, %seg_base, %r_sq;    // &seg[q]
+add.u32        %r_sk, %seg_base, %r_sk;    // &seg[k]
+ld.shared.u16  %rs_q, [%r_sq];
+ld.shared.u16  %rs_k, [%r_sk];
+setp.ne.u16    %p_seg, %rs_q, %rs_k;       // TRUE iff cross-segment
+or.pred        %p0, %p0, %p_seg;           // combined mask — TRUE iff mask cell
+//
+// After helper (unchanged from pre-PCA):
+//   @%p0 mov.f32 %f0, 0fFF800000;    // -inf for either cross-causal or cross-segment
+```
+
+The allow-convention form shown in §5 is **semantically equivalent** by
+De Morgan: `¬(segment_eq ∧ causal_le) = segment_ne ∨ causal_gt`.
+
+**Load-bearing contracts from §5 preserved under the amendment:**
+
+1. **u16 segment_ids dtype** — unchanged; `ld.shared.u16` still loads
+   u16 values.
+2. **Segment-equality + causal composition** — expressed as
+   segment-inequality OR causal-violation (mask form) rather than
+   segment-equality AND causal-validity (allow form). Same cells
+   masked; convention flipped.
+3. **Forward/backward byte-identity** — helper still exists as a
+   single shared function; forward `s_compute.rs` and backward
+   `ds_compute.rs` both call it with their respective `%p0` mask
+   registers and get the same extension emission. Caller-context-
+   independence test (§7.2) still verifies the claim.
+4. **ptxas-clean, zero-spill assembly** — re-measured and pinned in
+   §6.2.1 below.
+
+**Signature change from §3.3.** The `emit_segment_mask_predicate`
+helper no longer returns a fresh `PtxPredReg`. It takes an **in-out
+predicate register name** (the caller's existing mask-predicate, e.g.
+`%p0`) and emits PTX that extends it in place. The `causal` parameter
+is obsolete because the caller owns the causal check and passes its
+result via the in-out predicate; the helper composes via `or.pred`
+regardless. Updated signature:
+
+```rust
+pub fn emit_segment_mask_predicate(
+    ptx:             &mut String,
+    q_pos_reg:       &str,      // u64 q_row_global register (e.g. "%rd35")
+    k_pos_reg:       &str,      // u64 k_global register      (e.g. "%rd34")
+    segment_ids_reg: &str,      // u32 SMEM base pointer
+    residency:       SegmentResidency,
+    mask_pred_inout: &str,      // e.g. "%p0" — caller's existing
+                                //   mask predicate; helper OR-extends it
+);
+// No return value; the helper's effect is to extend `mask_pred_inout`
+// in place with the cross-segment disjunction.
+```
+
+The `PtxPredReg` type introduced in §3.3 is consequently unused at
+Tier A and is **not introduced** in Task 3. If a future tier needs
+allow-convention emission elsewhere, reintroduce `PtxPredReg` at that
+point; Tier A does not pre-build the abstraction.
+
+**Byte-identity invariant (§4 invariant #1 & #2) clarification.** The
+invariant applies to the *sequence of PTX instructions the helper
+emits between the first `cvt.u32.u64` and the final `or.pred`*. The
+exact text of `mask_pred_inout` (e.g. `%p0` vs `%p3`) is a caller
+argument; byte-identity is asserted on the emission modulo the
+argument substitution, verified by the caller-context-independence
+test which calls the helper with the same arguments and compares
+outputs.
+
+**Position-register width.** Positions flow at **u64** width from the
+enclosing kernel's tile-offset arithmetic. The helper internally
+truncates to u32 for SMEM address computation (SMEM is 32-bit
+addressable). No caller-side `cvt` prelude is needed.
+
+**Rejection of alternatives preserved.** The choice of option A
+(mask-convention helper) over option B (rewrite `s_compute.rs` to
+allow-convention) and option C (hybrid with caller-side `not.pred`)
+is documented at §10 "Alternatives considered" (entry added in the
+same amendment commit as this section).
+
 ## 6. ptxas verification artifacts
 
 The PTX in §5 was wrapped in a minimal test harness (`C:/tmp/pca_segment_mask_helper.ptx`)
@@ -381,6 +490,50 @@ production FA2 `s_compute`, both `%i` and `%j` are thread-indexed
 (derived from `threadIdx.x`, etc.), so both shifts emit as regular
 `SHF.L.U32`. Instruction count stays at 6; uniform vs regular datapath
 is an allocation detail.
+
+### 6.2.1 Re-measured SASS for mask-convention helper (supersedes §6.2 for Task 3 integration)
+
+The §5.1 amendment flipped the helper to mask-convention
+(`setp.ne.u16` then `or.pred` extending the caller's existing
+causal `%p0`). Harness re-assembled from
+[`C:/tmp/pca_segment_mask_helper_maskconv.ptx`](./2026-04-18-pca-tier-a-design.md)
+on sm_80:
+
+```text
+ptxas info : 0 bytes gmem
+ptxas info : Compiling entry function 'test_segment_mask_predicate_maskconv' for 'sm_80'
+ptxas info : Function properties for test_segment_mask_predicate_maskconv
+             0 bytes stack frame, 0 bytes spill stores, 0 bytes spill loads
+ptxas info : Used 8 registers, used 0 barriers, 4096 bytes smem, 376 bytes cmem[0]
+```
+
+**Zero spills, 8 total harness registers, 4096 B SMEM — parity with
+§6.1.**
+
+SASS on the mask-convention helper body:
+
+| # | SASS | Origin |
+|---|------|--------|
+| 1 | `USHF.L.U32 UR4, UR4, 0x1` or `SHF.L.U32 R, …, 0x1` | `cvt.u32.u64` + `shl.b32` (fold) — k position × 2 |
+| 2 | `IMAD.SHL.U32 R0, R4, 0x2, RZ` | same for q position × 2 (IMAD.SHL variant ptxas chose for this side) |
+| 3 | `LDS.U16 R3, [R0]` | `ld.shared.u16 %rs_q` — offset folded into LDS |
+| 4 | `LDS.U16 R2, [UR4]` | `ld.shared.u16 %rs_k` — offset folded |
+| 5 | `ISETP.NE.U32.AND P0, …` | `setp.ne.u16` (ptxas widens to u32 at the SASS layer; values are zero-extended u16 so the comparison result is identical) |
+| 6 | `ISETP.GT.U32.OR.EX P0, …, P0, P1` | `or.pred` collapsed into an extended-OR ISETP that re-runs the causal comparison and OR-folds with the segment predicate in one slot |
+
+**Measured total: 6 SASS instructions in the helper body.** Matches
+the original §6.2 count exactly despite the convention flip. The
+`or.pred` + existing-causal-setp combination is what ptxas folds into
+the `.OR.EX` extended-OR form, keeping the total instruction count
+flat.
+
+In the harness, `%rd_k` was a kernel parameter and flowed through
+the uniform datapath (`USHF.L.U32`). Production `s_compute` sees both
+positions as thread-indexed (from tile-offset arithmetic against
+`%q_start` / `%k_start`), so both shifts emit on the regular datapath
+(`SHF.L.U32` or `IMAD.SHL.U32`). Instruction count and register count
+are unchanged; uniform-vs-regular is an allocation detail ptxas
+selects based on the caller's register class.
 
 ### 6.3 Register pressure
 
@@ -640,6 +793,36 @@ WRGA B.3.1 / CSHA Tier A / WRGA hex-constant-verification precedents.
   during spec prep by the ptxas-verification-during-spec-prep
   discipline that this spec commits to. Fixed in §5's u32-throughout
   form.
+- **Allow-convention helper with `s_compute.rs` rewrite to match
+  (option B from the §5.1 amendment resolution).** Rewriting the
+  forward kernel's causal-mask block from its existing mask-predicate
+  idiom to an allow-predicate idiom to match §5's literal PTX form
+  was rejected 2026-04-19 in favour of the mask-convention helper
+  (option A, now pinned in §5.1). Reason: `s_compute.rs` is shared
+  with CSHA Tier A's RoPE-fused path (just stabilised 2026-04-15),
+  and a convention rewrite creates a regression surface in a
+  milestone (CSHA) whose tests aren't scoped to cover it. Specs
+  exist to reason about code; when the code and spec disagree on
+  an illustrative detail while agreeing on load-bearing contracts
+  (u16 dtype, forward/backward byte-identity, ptxas-clean
+  assembly), the spec amends. The alternative pattern — rewriting
+  stable modules to match illustrative spec detail — produces
+  "we rewrote a stable module to match an earlier reasoning
+  artifact" commits that readers of the git log can't understand
+  in isolation.
+- **Hybrid: allow-convention helper with caller-side `not.pred`
+  (option C from the §5.1 amendment resolution).** Serving the
+  literal §5 form by adding a `not.pred` at each call site creates
+  a convention boundary inside `s_compute.rs` — the helper speaks
+  allow-predicates while every other predicate in the kernel speaks
+  mask-predicates. Same failure pattern as Q4's rejected L2: the
+  helper's API diverges from its call sites' idiom, creating
+  maintenance friction at every integration point. Future tiers
+  (e.g. sliding-window, Tier A-prime position-reset) adding
+  additional predicates would have to pick a side or add another
+  conversion, producing a persistent convention split. Mask-
+  convention helper composes cleanly with any future mask-
+  convention predicate via `or.pred`.
 
 ## 11. Numerical claims verified
 
