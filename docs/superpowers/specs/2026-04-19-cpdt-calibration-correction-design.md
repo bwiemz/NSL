@@ -19,25 +19,25 @@ Phase 1 shipped with `T0=0.50, T1=0.10, T2=0.02, CALIB_K=0.0312`. On the committ
 
 The distribution is degenerate: every generic tensor scored below `T2 = 0.02` and landed `VeryLow`, making the 4-tier scheme operate as a 2-tier scheme. Both Phase 1 close-out gates (byte-identity on no-weights, <5% disagreement) passed trivially because both paths produced the same degenerate distribution.
 
-Pre-dispatch verification against `baseline_heuristic.json` measured the observed generic-score bands on calib_small:
+Pre-dispatch verification against `baseline_heuristic.json` + the regenerated `calib_medium.safetensors` measured the generic-score bands pooled across the fixtures:
 
-- `attn.w{q,k,v,o}`         2.38×10⁻⁷ to 3.11×10⁻⁷ (24 tensors)
-- `ffn.w_gate`, `ffn.w_up`  6.81×10⁻⁸ to 8.86×10⁻⁸ (12 tensors, numel = 917,504)
-- `ffn.w_down`              3.64×10⁻⁸ to 4.73×10⁻⁸ (6 tensors, numel = 917,504)
+- `attn.w{q,k,v,o}` — pooled min ~4×10⁻⁸ (calib_medium) to max ~3.1×10⁻⁷ (calib_small)
+- `ffn.w_gate/w_up` — pooled min ~1×10⁻⁸ (calib_medium) to max ~8.9×10⁻⁸ (calib_small)
+- `ffn.w_down` — pooled min ~5×10⁻⁹ (calib_medium) to max ~4.7×10⁻⁸ (calib_small)
 
 ### 1.1 Information-Bottleneck Finding
 
-Running the Commit 1 logic ahead of dispatch produced thresholds `T0=1.45×10⁻⁷, T1=5.68×10⁻⁸, T2=1.91×10⁻⁹` — and a structural problem: `ffn.w_gate`, `ffn.w_up`, and `ffn.w_down` all have `numel = d_model × d_ffn = 917,504` in a standard SwiGLU FFN. The weights-present scorer differentiates them (gate/up at 7.4×10⁻⁸ Medium; down at 4.0×10⁻⁸ Low) because Kaiming-normal RMS differs by `√(d_ffn / d_model) ≈ 1.87×`. The no-weights scorer `K × pos / numel` has no fan-in information and produces the same score for all three, so it cannot place them in different tiers regardless of K.
+Running the Commit 1 logic ahead of dispatch produced thresholds `T0=6.11×10⁻⁸, T1=2.23×10⁻⁸, T2=7.26×10⁻¹⁰` (from pooled-across-fixtures geomeans of adjacent band mins/maxes) — and a structural problem: `ffn.w_gate`, `ffn.w_up`, and `ffn.w_down` all have `numel = d_model × d_ffn` in a standard SwiGLU FFN. The weights-present scorer differentiates them (gate/up vs. down) because Kaiming-normal RMS differs by `√(d_ffn / d_model)` via fan-in. The no-weights scorer `K × pos / numel` has no fan-in information and produces the same score for all three, so it cannot place them in different tiers regardless of K.
 
-**Consequence:** no `CALIB_K` value achieves <5% parameter-weighted disagreement on calib_small. Numerical minimization (§3.2) finds 15.64% as the floor — the fraction of parameters living in `ffn.w_down`, which necessarily agrees with `ffn.w_gate/w_up` on the no-weights path but disagrees on the weights-present path.
+**Consequence:** corpus-wide parameter-weighted disagreement on `{calib_small, calib_medium}` has a genuine minimum at very low values (~2.5%) under a particular K, but that K produces alarming calib_small-only disagreement (~26.5%) because the SwiGLU numel-collision drives calib_small's per-fixture metric regardless of K. A more robust choice is the plateau of K values where *both* per-fixture disagreements stay under the monitoring threshold — §3.2 defines that procedure.
 
 ### 1.2 Response
 
 The honest response is neither to narrow the gate's domain (option C from the pre-dispatch discussion — creates a scoped-gate taxonomy) nor to merge shape classes into coarser bands (option A — commits Phase 1 to a classification Phase 2 must re-split). Instead:
 
 1. **Retune anyway** to the thresholds the weights-present path has information to support (§3.1).
-2. **Pick `CALIB_K` by numerical minimization** of parameter-weighted disagreement — accept the floor (§3.2).
-3. **Reframe invariant #7** from hard-gate to monitoring-gate with a Phase 2 promotion trigger (§5).
+2. **Pick `CALIB_K` by plateau-midpoint-under-per-fixture-constraint** rather than pure corpus-minimum — §3.2.
+3. **Reframe invariant #7** from hard-gate to monitoring-gate with a Phase 2 promotion trigger (§5). The reframing applies to committed-fixture parameter-weighted disagreement; the gate's measurement and domain are unchanged, only the institutional response to firing shifts.
 
 Phase 2's spectral factor is the intervention that gives the no-weights path access to a discriminator other than numel; when it ships and disagreement drops below 5%, invariant #7 returns to hard-gate status.
 
@@ -66,36 +66,92 @@ Compute `T0, T1, T2` from weights-present score bands on the calibration corpus:
 
 **Measured values (pre-dispatch):** `T0 = 1.4525e-7`, `T1 = 5.6755e-8`, `T2 = 1.9074e-9`. The binary will re-emit them during implementation; if the measurement drifts materially, the spec is re-reviewed before dispatch.
 
-### 3.2 CALIB_K computation by numerical minimization
+### 3.2 CALIB_K computation by plateau-midpoint-under-per-fixture-constraint
 
-Because the per-band-geomean approach produces `K = 5.07e-2` with 31.8% disagreement (pre-dispatch verified), §3.2 replaces it with direct minimization:
+Pre-dispatch verification showed that pure corpus-parameter-weighted minimization finds `K ≈ 0.046` with corpus disagreement 2.5% — but 26.5% on `calib_small` specifically (the SwiGLU numel-collision drives calib_small hard). A more robust choice satisfies a per-fixture constraint: both `calib_small` AND `calib_medium` disagreement must stay under the monitoring threshold (`MONITORING_T = 0.20`). The K values that satisfy this form a contiguous plateau in the log-grid; pick the plateau's log-midpoint.
 
-1. Score every generic tensor on the weights-present path; compute its weights-present tier under the new `T0/T1/T2`.
-2. For each candidate `K` on a log-spaced grid (4 decades, 400 points from `1e-6` to `1.0`), compute every tensor's no-weights score (`K × pos / numel`), its no-weights tier, and the parameter-weighted disagreement `Σ numel[disagreeing tensors] / Σ numel[all tensors]`.
-3. Pick `K` that minimizes disagreement. Break ties toward the log-midpoint of the minimizing range for robustness to measurement noise.
-4. Emit `K` alongside the thresholds.
+**Algorithm:**
 
-**Measured result (pre-dispatch):** the minimizer is `K = 0.0833` (log-midpoint of the analytic optimum range `[0.0521, 0.1331]` where `attn → High` AND `ffn_gate_up → Medium` on the no-weights path). Residual disagreement at this K is **15.64%**, entirely from `ffn.w_down` (5.5M params of 35.2M total). No K in the grid achieves lower disagreement.
+```text
+MONITORING_T = 0.20  # monitoring-gate threshold from §5
 
-**Diagnostic emission.** The binary additionally emits the per-band `(wp_tier, nw_tier)` pairs for middle-layer median tensors. A future reader of the calibration output can verify that the 15.64% is the gate_up/down-numel-collision scenario, not an unrelated source of divergence. This is the "disagreement source diagnostic" referenced in §5.
+for K in log_grid(10^-6 to 10^0, 600 points):
+    d_small[K]  = parameter_weighted_disagreement(calib_small,  K, T0, T1, T2)
+    d_medium[K] = parameter_weighted_disagreement(calib_medium, K, T0, T1, T2)
 
-**Structural-limitation guard.** If the minimum disagreement exceeds 35%, the binary exits non-zero. That threshold allows for moderate corpus variance (current measurement 15.64% + 20% slack for architectures with additional numel collisions) while still catching catastrophic drift. At 35%+, something other than the known gate_up/down collision is producing disagreement and the retune requires investigation before shipping.
+feasible_grid = {K : d_small[K] <= MONITORING_T AND d_medium[K] <= MONITORING_T}
 
-### 3.3 Post-retune distribution (calib_small, 74 tensors, 35.2M params)
+if feasible_grid is empty:
+    # Structural-limitation guard fires — no K satisfies both fixtures.
+    exit non-zero with best-found K and per-fixture disagreements;
+    investigation required before ship.
 
+plateau = longest_contiguous_run(feasible_grid)
+plateau_start, plateau_end = min(plateau), max(plateau)
+CALIB_K = sqrt(plateau_start * plateau_end)   # log-midpoint
+
+emit: CALIB_K, plateau_start, plateau_end,
+      d_small[CALIB_K], d_medium[CALIB_K], corpus_disagreement(CALIB_K),
+      per-band (wp_tier, nw_tier) diagnostic for middle-layer median tensors.
 ```
-Kind-overridden High     : 32 tensors (embeddings + norms + first-layer tensors + last-layer tensors)
-Formula-driven High (attn_qkvo) : 24 tensors       (middle layers 1–6 × 4 projections)
-Formula-driven Medium    : 12 tensors (ffn_gate+up) (middle layers 1–6 × 2 projections)
-Formula-driven Low       :  6 tensors (ffn_down)    (middle layers 1–6 × 1 projection)
-VeryLow                  :  0 tensors               (fallback for out-of-band generics)
+
+Log-midpoint rather than arithmetic midpoint because the K grid is log-spaced and the plateau boundaries are log-spaced; log-midpoint is the natural center in the grid's native measure.
+
+**Measured result (pre-dispatch):** feasible plateau is approximately `[0.057, 0.064]`, log-midpoint `K ≈ 0.060`. Per-fixture disagreement at K=0.060: calib_small 15.91%, calib_medium 2.51%. Corpus-wide 3.76%. (Precise K will come from the implementer's grid; these values are from an independent Python grid sweep. Expect ~2% variation due to grid quantization.)
+
+**Why plateau-midpoint beats pure corpus-minimum.** The corpus minimum at K=0.046 produces a 26.5% calib_small disagreement — still traceable to the numel-collision pattern per §5.4, but alarming when a reviewer sees it in isolation. The plateau-midpoint sacrifices ~1% corpus-wide disagreement (2.5% → 3.76%) to keep both per-fixture numbers comfortably under the monitoring threshold. The plateau itself is a robustness signal: a wide plateau means K isn't fragile to small measurement perturbations, so future corpus changes are less likely to destabilize the calibration.
+
+**Structural-limitation guard.** If `feasible_grid` is empty (no K satisfies both per-fixture constraints under `MONITORING_T = 0.20`), the binary exits non-zero with the best-found K, its per-fixture disagreements, and a diagnostic that both per-fixture numbers exceed the monitoring threshold. This signals that something beyond the known numel-collision pattern is at play and requires investigation.
+
+**Diagnostic emission.** Alongside the constants block, the binary emits:
+- plateau boundaries `[plateau_start, plateau_end]`
+- per-band (wp_tier, nw_tier) for middle-layer median tensors at the emitted K (lets reviewers verify disagreements trace to the numel-collision pattern)
+- per-fixture disagreement at emitted K
+- corpus-wide disagreement at emitted K (for reference; the gate reads per-fixture, not corpus)
+
+### 3.3 Post-retune distribution (measured under pooled thresholds + K=0.060)
+
+Pre-dispatch measurement pinned these per-fixture distributions under the plateau-midpoint `CALIB_K ≈ 0.060` and thresholds `T0 = 6.11e-8, T1 = 2.23e-8, T2 = 7.26e-10`.
+
+**calib_small (74 tensors, 34.6M params):**
+
+```text
+High     : 68 tensors (32 kind-overridden + 24 attn middle + 12 ffn_gate/up middle)
+Medium   :  6 tensors (ffn_down middle)
+Low      :  0 tensors
+VeryLow  :  0 tensors (documented fallback)
 ```
 
-**Arithmetic check** (verified against `cpdt_fixture_generate.rs`'s calib_small layout: tied embeddings, no biases, SwiGLU FFN, final RMSNorm):
+On calib_small alone, the pooled thresholds put `ffn.w_gate/w_up` above T0 (wp scores 6.8-8.9e-8 > T0 = 6.1e-8) — so both ffn_gate/up and attn land in High, and only ffn_down lands in Medium. The per-fixture distribution is effectively 2-tier. This is expected under pooled thresholds: calib_small's band boundaries are above T0 because T0 was computed from the pooled-across-fixtures band minimum (dominated by calib_medium's larger tensors).
+
+**calib_medium (179 tensors, 335.6M params):**
+
+```text
+High     :  53 tensors (kind-overridden + first/last + some near-extreme middle)
+Medium   :  56 tensors (middle attn + some near-extreme ffn)
+Low      :  42 tensors (middle ffn)
+VeryLow  :  28 tensors (pruned biases, unusual shapes — fallback fires here)
+```
+
+calib_medium is where the 4-tier spread materializes. VeryLow fires on calib_medium's heavily-quantized-looking generics (e.g. bias tensors under MixedHalf schedule that score near-zero), which is exactly the fallback case the tier's name describes.
+
+**Corpus-wide primary-tier coverage (§6 rule):**
+
+| Tier | calib_small | calib_medium | Populated? |
+|---|---|---|---|
+| High | 68 | 53 | ✓ |
+| Medium | 6 | 56 | ✓ |
+| Low | 0 | 42 | ✓ |
+| VeryLow (fallback) | 0 | 28 | N/A (exempt per §6) |
+
+All three primary tiers {H, M, L} populated across the corpus. §6's non-degeneracy rule satisfied.
+
+**Arithmetic check** (calib_small, verified against `cpdt_fixture_generate.rs`'s layout: tied embeddings, no biases, SwiGLU FFN, final RMSNorm):
 
 Total tensors: 1 `tok_embeddings.weight` + 8 layers × (4 attn + 2 norms + 3 ffn) + 1 `norm.weight` (final norm) + 0 output (tied) = 1 + 72 + 1 + 0 = **74 ✓** (matches §1.1).
 
 Kind-overridden = **32 = 9 + 9 + 12 + 1 + 1:**
+
 - 9 — all tensors in layer 0 (FirstOrLast kind): 4 attn + 2 norms + 3 ffn
 - 9 — all tensors in layer 7 (FirstOrLast kind): same
 - 12 — middle-layer norms (layers 1-6 × 2 norms): Norm kind
@@ -103,13 +159,14 @@ Kind-overridden = **32 = 9 + 9 + 12 + 1 + 1:**
 - 1 — final `norm.weight`: Norm kind
 
 Formula-driven generics = **42 = 24 + 12 + 6:**
-- 24 — middle layers 1-6 × 4 attn projections → High under the retuned thresholds
-- 12 — middle layers 1-6 × 2 ffn projections (gate, up) → Medium
-- 6 — middle layers 1-6 × 1 ffn projection (down) → Low
 
-Tier totals: High = 32 + 24 = 56; Medium = 12; Low = 6; VeryLow = 0. Grand total 56 + 12 + 6 + 0 = **74 ✓**.
+- 24 — middle layers 1-6 × 4 attn projections → High (wp ~2.4-3.1e-7, all > T0)
+- 12 — middle layers 1-6 × 2 ffn_gate/up projections → High (wp 6.8-8.9e-8, all > T0 = 6.1e-8)
+- 6 — middle layers 1-6 × 1 ffn_down projection → Medium (wp 3.6-4.7e-8, between T1 and T0)
 
-VeryLow stays in the enum as the fallback for out-of-band generics (heavily-pruned biases, unusual shapes); rare by design, which matches the tier's name.
+Tier totals on calib_small: High = 32 + 24 + 12 = 68; Medium = 6; Low = 0; VeryLow = 0. Grand total 68 + 6 + 0 + 0 = **74 ✓**.
+
+VeryLow stays in the enum as the fallback for out-of-band generics (heavily-pruned biases, unusual shapes); fires on calib_medium's MixedHalf-schedule zero-biases, which is exactly what the tier's name describes.
 
 ### 3.4 Invariant checklist
 
@@ -151,7 +208,7 @@ cargo run --features calibrate --bin cpdt_calibrate -- \
 Acceptance checks:
 
 1. Step 1 writes `target/cpdt_calibration/calib_medium.safetensors` and exits 0. The existing committed fixtures under `tests/fixtures/cpdt_calibration/` are untouched.
-2. Step 2 emits the `T0/T1/T2/CALIB_K` blocks + per-band diagnostic and exits 0. Cross-fixture ordering guard passes. Structural-limitation guard (35% ceiling) passes. The emitted values match §3.1 and §3.2's measured-value pinning within 1% (accounting for K-grid resolution).
+2. Step 2 emits the `T0/T1/T2/CALIB_K` blocks + plateau-boundary + per-band diagnostic and exits 0. Cross-fixture ordering guard passes. Structural-limitation guard (no feasible plateau) does NOT fire. The emitted `T0/T1/T2` match §3.1's measured values within 1%; emitted `CALIB_K` lies within plateau `[0.057, 0.064]` (log-midpoint ≈ 0.060) within ~2% grid-quantization tolerance.
 3. If Step 2 is run without Step 1 (i.e., `--medium-dir` points at a non-existent or empty directory), `cpdt_calibrate` exits non-zero with a clear "calib_medium required; run cpdt_fixture_generate --include-medium first" message rather than computing thresholds against an incomplete corpus.
 4. Scorer in-code constants and behavior unchanged; `baseline_heuristic.json` and `expected_weights_present.json` byte-identical before/after Commit 1.
 5. `cpdt_sensitivity_primitives` (22 tests), `cpdt_sensitivity_snapshot` (1), `cpdt_sensitivity_adversarial` (1), `cpdt_sensitivity_disagreement` (1), `cpdt_tier_agreement` (6) all pass unchanged.
@@ -172,23 +229,67 @@ Files:
 
 1. `ANALYSIS_VERSION == 2` (was 1).
 2. `cpdt_sensitivity_snapshot::weights_present_matches_expected_snapshot` passes against the regenerated `expected_weights_present.json`.
-3. `cpdt_sensitivity_disagreement::weighted_disagreement_below_threshold` (renamed from `..._below_5_percent`) passes under the new `CALIB_K` at the new **20%** monitoring-gate threshold, and additionally asserts that the disagreement source matches the gate_up/down-numel-collision pattern (see §5 and the diagnostic test body below).
-4. `cpdt_tier_agreement::tier_agreement_full_on_calib_small_by_construction` — **specific assertion updates:**
+3. `cpdt_sensitivity_disagreement::weighted_disagreement_below_threshold` (renamed from `..._below_5_percent`) passes on the committed-fixture corpus (calib_tiny + calib_small) at the new **20%** monitoring-gate threshold. Measured value at K=0.060 on calib_small is 15.91%; calib_tiny contributes 0% (all kind-overridden). Additionally asserts the disagreement source matches the numel-collision pattern via the diagnostic test in §5.4.
+4. `cpdt_tier_agreement::tier_agreement_full_on_calib_small_by_construction` — rewritten from binary-equality to **corpus-wide primary-tier non-degeneracy** plus per-fixture sanity:
+
    ```rust
-   let counts = tier_counts(&plan.params);
-   // High: kind-overridden (32) + formula-driven attn_qkvo (24) = 56 with slack
-   assert!(counts[Tier::High]    >= 50,
-           "High underpopulated; expected >=50, got {}", counts[Tier::High]);
-   // Medium: ffn_gate + ffn_up × 6 middle layers = 12 with slack
-   assert!(counts[Tier::Medium]  >= 8,
-           "Medium underpopulated; expected >=8, got {}", counts[Tier::Medium]);
-   // Low: ffn_down × 6 middle layers = 6 with slack
-   assert!(counts[Tier::Low]     >= 4,
-           "Low underpopulated; expected >=4, got {}", counts[Tier::Low]);
-   // VeryLow: documented fallback; 0 on calib_small by §3.3
-   assert_eq!(counts[Tier::VeryLow], 0,
-              "VeryLow unexpectedly populated on calib_small");
+   // Corpus-wide: union across all fixtures must populate {H, M, L}.
+   // calib_small alone is 2-tier (H + M) under pooled thresholds; calib_medium
+   // provides L. The canary asserts the UNION covers the primary set,
+   // matching §6's institutional rule.
+   let wm_small = WeightMap::load(&fixture("calib_small")).unwrap();
+   let plan_small = plan_map(&wm_small, &PrecisionConfig { n_layers: 8, ..Default::default() });
+   let counts_small = tier_counts_of(&plan_small);
+
+   // Per-fixture sanity on calib_small: at least one primary tier populated.
+   // (Catches the "all generics landed VeryLow" class of degeneracy — the
+   // original Phase 1 ship state.)
+   let small_primary_count =
+       counts_small.high + counts_small.medium + counts_small.low;
+   assert!(
+       small_primary_count > 0,
+       "calib_small has no primary-tier assignments (degenerate distribution)"
+   );
+
+   // Expected distribution under pooled thresholds at K=0.060:
+   //   High = 68 (32 kind-overridden + 24 attn + 12 ffn_gate_up)
+   //   Medium = 6 (ffn_down middle)
+   //   Low = 0 (populated on calib_medium instead)
+   //   VeryLow = 0 (documented fallback)
+   //
+   // Count-floors use slack so fixture perturbations (e.g. one extra layer)
+   // don't break the test.
+   assert!(counts_small.high   >= 60, "H underpopulated on calib_small: {}", counts_small.high);
+   assert!(counts_small.medium >= 4,  "M underpopulated on calib_small: {}", counts_small.medium);
+   assert_eq!(counts_small.very_low, 0,
+              "VeryLow unexpectedly populated on calib_small: {}", counts_small.very_low);
+
+   // Corpus-wide primary-tier non-degeneracy (§6 rule): needs calib_medium to
+   // verify Low is populated somewhere. calib_medium is regen-at-test-time;
+   // skip the Low-check if the regenerated fixture is absent. This makes the
+   // check opportunistic: CI with a calib_medium regen step catches the full
+   // rule; developer runs without regen see only the per-fixture sanity check.
+   if let Some(plan_medium) = try_load_plan_medium() {
+       let counts_medium = tier_counts_of(&plan_medium);
+       let union_populated = |tier_small: usize, tier_medium: usize| -> bool {
+           tier_small > 0 || tier_medium > 0
+       };
+       assert!(union_populated(counts_small.high, counts_medium.high),
+               "primary tier High not populated across corpus");
+       assert!(union_populated(counts_small.medium, counts_medium.medium),
+               "primary tier Medium not populated across corpus");
+       assert!(union_populated(counts_small.low, counts_medium.low),
+               "primary tier Low not populated across corpus; \
+                calib_small: {}, calib_medium: {}",
+               counts_small.low, counts_medium.low);
+   } else {
+       eprintln!("note: calib_medium not present at target/cpdt_calibration/; \
+                  corpus-wide primary-tier check skipped. To enable, run \
+                  cpdt_fixture_generate --include-medium --output-dir target/cpdt_calibration/");
+   }
    ```
+
+   `try_load_plan_medium` is a helper defined in the same test file: returns `Some(plan)` if `target/cpdt_calibration/calib_medium.safetensors` exists, else `None`.
 5. `cpdt_sensitivity_adversarial::adversarial_localized_tier_shift` still passes — the `M = CALIB_T0 / s_pre * 1.5` multiplier scales automatically with the new `T0`.
 6. All 22 `cpdt_sensitivity_primitives` boundary tests still pass (they use `CALIB_T0 ± 1e-6` patterns that are T-value-agnostic).
 7. All 6 `cpdt_tier_agreement` helper tests still pass; add a new test `disagreement_source_matches_numel_collision` (see §5).
@@ -228,12 +329,17 @@ Contrast with the failure modes §2 rejected:
 
 The 20% threshold is a **Phase 1 monitoring range**, not a "current measurement + epsilon" value. Two purposes:
 
-1. **Upper bound on known disagreement.** Current measurement is 15.64%; 20% is the fixed monitoring ceiling for Phase 1. The difference is headroom for modest corpus variance (fixture resize, addition of one more layer, etc.) without triggering re-investigation.
+1. **Upper bound on known disagreement.** Current measurement on committed fixtures (calib_small) is 15.91% at K=0.060; 20% is the fixed monitoring ceiling for Phase 1. The ~4-point headroom accommodates modest corpus variance (fixture resize, addition of one more layer, etc.) without triggering re-investigation.
 2. **Phase 2 urgency signal.** If disagreement on any committed fixture exceeds 20%, Phase 2 is promoted from "scheduled" to "priority" — something about the corpus or the scorer's behavior is worse than the known bottleneck.
+
+**Gate scope.** The gate reads committed-fixture parameter-weighted disagreement — the union of calib_tiny and calib_small tensors iterated by the existing test harness. calib_medium stays regen-at-test-time and is NOT in the gate by default (no test-infrastructure change needed). Two consequences:
+
+- The gate's sensitivity is highest on regressions affecting calib_small specifically. Since calib_small's 15.91% already approaches the 20% ceiling, most regressions will fire the gate.
+- Corpus-wide disagreement (measured across calib_small + calib_medium by the calibration binary at Commit 1 time) is reported as a diagnostic in the emission block but is not a gate — it's a sanity signal. At K=0.060 the corpus-wide measurement is ~3.76%.
 
 **Rule for future retunes in the Phase 1 era:** do NOT tighten the 20% ceiling to track a lower current measurement. If a future retune on a different corpus measures 10% disagreement, the ceiling stays at 20% until Phase 2 ships. The threshold represents "Phase 1's information-bottleneck monitoring range," not "current-measurement + slack." Tightening the threshold under corpus improvement would give the appearance of stricter discipline but actually creates a ratchet that fires on ordinary corpus variance.
 
-**Phase 2's close-out criterion** is where tightening happens: after spectral-factor integration, measured disagreement must drop below 5% on the full calibration corpus, and invariant #7 returns to the original <5% hard-gate. If Phase 2 can't reach <5%, Phase 2's first-commit precondition check (geometric mean ≈ 1.0 of the spectral factor) is probably failing and scope expands per the parent spec's §11.4.
+**Phase 2's close-out criterion** is where tightening happens: after spectral-factor integration, measured disagreement must drop below 5% on the committed-fixture gate, and invariant #7 returns to the original <5% hard-gate. If Phase 2 can't reach <5%, Phase 2's first-commit precondition check (geometric mean ≈ 1.0 of the spectral factor) is probably failing and scope expands per the parent spec's §11.4.
 
 ### 5.4 The diagnostic test
 
@@ -282,12 +388,15 @@ Location: **append** to `docs/superpowers/specs/2026-04-18-cpdt-weight-aware-pha
 Title: `## Phase 1 threshold retune — 2026-04-19 — scope-reduced with monitoring-gate reframing`
 
 Body captures:
+
 1. **Empirical observation.** The degenerate binary distribution (32 High + 42 VeryLow on calib_small) and how it slipped past Phase 1 close-out.
-2. **Pre-dispatch finding.** The gate_up/down numel-collision means no `CALIB_K` achieves <5% disagreement; 15.64% is the floor.
-3. **Response.** Retune the thresholds, minimize K numerically, reframe invariant #7 rather than weaken it.
-4. **Measured values.** T0, T1, T2, CALIB_K, disagreement rate.
-5. **Phase 2 connection.** Spectral factor is the intervention that returns invariant #7 to hard-gate; its close-out criterion is <5% disagreement.
-6. **Institutional rules** (§7 below).
+2. **Pre-dispatch finding.** The gate_up/down numel-collision makes per-fixture disagreement on calib_small unfixable by pure K-minimization; corpus-optimum K=0.046 gives 2.49% corpus-wide but 26.51% on calib_small alone.
+3. **Methodological shift.** The spec's original "minimize corpus disagreement" was replaced with "plateau-midpoint under per-fixture monitoring constraint." The plateau-midpoint approach (a) trades ~1% corpus-wide for both fixtures under 20%, (b) provides robustness to measurement noise through the plateau's width, and (c) produces consistent per-view signals. See §3.2.
+4. **Response.** Retune thresholds (§3.1), pick K by plateau-midpoint algorithm (§3.2), reframe invariant #7 as monitoring-gate on committed fixtures (§5).
+5. **Measured values.** T0 = 6.11e-8, T1 = 2.23e-8, T2 = 7.26e-10, CALIB_K ≈ 0.060 (from plateau [0.057, 0.064]); committed-fixture disagreement 15.91% on calib_small; corpus-wide disagreement 3.76%.
+6. **Phase 2 connection.** Spectral factor is the intervention that tightens per-fixture disagreement below 5% on committed fixtures; its close-out criterion is <5% on the committed-fixture gate, returning invariant #7 to hard-gate status.
+7. **Institutional rules** (§7 below): tier-distribution non-degeneracy + monitoring-gate reframing for architectural bottlenecks.
+8. **Pre-dispatch-verification lesson.** The spec's initial §3.3 was computed from calib_small-only data during pre-dispatch (calib_medium wasn't regenerable at spec-writing time). §3.1's pooling procedure was written for the full corpus. The two sections were written under different fixture-availability assumptions and the mismatch wasn't caught during spec self-review. Rule for future spec-writing: *pre-dispatch verification must run against the same fixture corpus the implementation will use. If part of the corpus isn't available at spec-writing time, distribution tables that depend on it are deferred to post-dispatch measurement (or the corpus is regenerated before spec writing).* This is adjacent to the WRGA B.3.1 "test at the scale you target" rule but distinct: that one is about the implementation's test coverage; this one is about the spec's verification coverage.
 
 ## 7. Institutional Discipline
 
