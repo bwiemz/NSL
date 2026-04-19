@@ -96,9 +96,28 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
     ptx.push_str("    mul.f32 %f_P, %f_P, %scale;\n");
 
     // Causal mask: if causal && lane > warp_row → S = -INF.
+    // When config.segment_masked, also mask if segment_ids[q_global] !=
+    // segment_ids[k_global]. The helper extends %p1 with a cross-segment
+    // OR (mask-convention, matching spec §5.1).
     if config.causal {
         ptx.push_str("    cvt.u32.u64 %r1, %warp_row;\n");
         ptx.push_str("    setp.gt.u32 %p1, %lane, %r1;\n");
+        if config.segment_masked {
+            // Synthesize u64 global positions for the helper.
+            // %warp_row is u64 (set by ds_compute line above), %q_start is u64.
+            // q_global = q_start + warp_row; k_global = k_start + lane
+            ptx.push_str("    add.u64 %rd_bw_q_global, %q_start, %warp_row;\n");
+            ptx.push_str("    cvt.u64.u32 %rd_bw_k_global, %lane;\n");
+            ptx.push_str("    add.u64 %rd_bw_k_global, %rd_bw_k_global, %k_start;\n");
+            crate::flash_attention_v2::phases::segment_mask::emit_segment_mask_predicate(
+                ptx,
+                "%rd_bw_q_global",
+                "%rd_bw_k_global",
+                "%seg_base",
+                crate::pca_segment::SegmentResidency::Shared,
+                "%p1",
+            );
+        }
         ptx.push_str("    mov.f32 %f2, 0fFF800000;    // -INF\n");
         ptx.push_str("    @%p1 mov.f32 %f_P, %f2;\n");
     }

@@ -47,7 +47,13 @@ pub fn backward_total_bytes(config: &FlashAttentionConfig) -> u32 {
 }
 
 fn backward_needs_dynamic_smem(config: &FlashAttentionConfig) -> bool {
-    backward_total_bytes(config) > SMEM_BUDGET_BYTES
+    // PCA Tier A: when segment_masked the prelude also emits seg_smem[4096]
+    // as a separate static SMEM array.  4096 bytes is enough to push some
+    // configs over the 48 KB static cap.  Force dynamic SMEM in that case
+    // so the main shmem[] uses the `extern .shared` form and ptxas sees
+    // only the 4096-byte seg_smem in the static budget.
+    let seg_overhead = if config.segment_masked { 4096 } else { 0 };
+    backward_total_bytes(config) + seg_overhead > SMEM_BUDGET_BYTES
 }
 
 /// Emit the backward prelude: header, entry, SMEM, registers, indices.
@@ -67,7 +73,7 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig) {
 
     let name = kernel_name(config);
     ptx.push_str(&format!(".visible .entry {} (\n", name));
-    let params = [
+    let mut params: Vec<(&str, &str)> = vec![
         // Forward-compatible block (35 args, identical to forward prelude
         // so tooling can treat the backward kernel as a drop-in CSHA
         // variant for name lookup / launch-list validation).
@@ -104,6 +110,12 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig) {
         // incorrect dgamma values when the CSHA dispatcher claim fired.
         (".param .u64", "dx_norm_ptr"),
     ];
+    // PCA Tier A: segment_ids pointer — trailing, only when segment_masked.
+    // Kept at the END so the 43-param layout stays byte-stable for
+    // segment_masked=false backward kernels.
+    if config.segment_masked {
+        params.push((".param .u64", "segment_ids_ptr"));
+    }
     for (i, (ty, pname)) in params.iter().enumerate() {
         let comma = if i + 1 < params.len() { "," } else { "" };
         ptx.push_str(&format!("    {} {}{}\n", ty, pname, comma));
@@ -189,6 +201,35 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig) {
     ptx.push_str("    .reg .u64 %q_smem_base, %k_smem_base, %v_smem_base;\n");
     ptx.push_str("    .reg .u64 %warp_row;\n");
 
+    // PCA Tier A backward: segment-mask helper scratch registers + SMEM buffer.
+    // Only emitted when segment_masked; segment_masked=false backward kernels
+    // remain byte-identical to pre-Task-4A. Mirrors forward prelude declarations
+    // (Task 3B), but with two additional backward-specific u64 scratch registers
+    // for synthesizing global q/k positions from within-tile indices.
+    if config.segment_masked {
+        // u64 pair: global segment_ids pointer + SMEM generic-space pointer.
+        ptx.push_str("    .reg .u64 %rd_seg_global, %rd_seg_smem;\n");
+        // u32 SMEM base address (after cvt from u64 generic-space ptr).
+        ptx.push_str("    .reg .u32 %seg_base;\n");
+        // Scratch registers used by segment_mask::emit_segment_mask_predicate.
+        ptx.push_str("    .reg .u32 %r_q_SEGMASK, %r_k_SEGMASK;\n");
+        ptx.push_str("    .reg .b16 %rs_q_SEGMASK, %rs_k_SEGMASK;\n");
+        ptx.push_str("    .reg .pred %p_seg_SEGMASK;\n");
+        // Cooperative-load scratch for the warp-0 prelude (seq_len <= 2048).
+        ptx.push_str("    .reg .u32 %r_pca_i, %r_pca_seq, %r_pca_off;\n");
+        ptx.push_str("    .reg .b16 %rs_pca;\n");
+        ptx.push_str("    .reg .pred %p_pca_load, %p_pca_done;\n");
+        // Backward-specific: scratch u64 for synthesizing q_global and k_global
+        // from within-tile indices for the helper call in ds_compute.
+        // %warp_row (u64) and %k_start (u64) are live at ds_compute call sites;
+        // these scratch registers receive q_start + warp_row and k_start + lane.
+        ptx.push_str("    .reg .u64 %rd_bw_q_global, %rd_bw_k_global;\n");
+        // 4096-byte SMEM buffer: holds up to 2048 u16 segment_ids entries.
+        // Kept separate from `shmem` so Q/K/V tile offset arithmetic is
+        // unaffected. Align 4 is safe for u16 loads.
+        ptx.push_str("    .shared .align 4 .b8 seg_smem[4096];\n");
+    }
+
     crate::kernel_skeleton::smem::emit_shmem_base_cvta(ptx);
     ptx.push_str("    mov.f32 %log2e, 0f3FB8AA3B;  // log2(e)\n");
 
@@ -245,6 +286,43 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig) {
     ptx.push_str("    cvt.u64.u32 %rd16, %bid_y;\n");
     ptx.push_str("    rem.u64 %head_idx,  %rd16, %rd5;\n");
     ptx.push_str("    div.u64 %batch_idx, %rd16, %rd5;\n");
+
+    // PCA Tier A: cooperative warp-0 global→shared load of segment_ids.
+    // Mirrors forward prelude's PCA_LOAD_LOOP / PCA_LOAD_DONE (Task 3B),
+    // with labels renamed BW_PCA_LOAD_* to avoid any risk of label
+    // collision (PTX labels are function-scoped so collision is technically
+    // impossible when forward+backward live in separate .entry blocks, but
+    // explicit prefixing is cheaper than reasoning about it).
+    if config.segment_masked {
+        ptx.push_str("\n    // --- PCA Tier A: load segment_ids from global to shared ---\n");
+        ptx.push_str("    ld.param.u64 %rd_seg_global, [segment_ids_ptr];\n");
+        ptx.push_str("    cvta.shared.u64 %rd_seg_smem, seg_smem;\n");
+        ptx.push_str("    cvt.u32.u64 %seg_base, %rd_seg_smem;\n");
+        ptx.push_str("    setp.lt.u32 %p_pca_load, %tid_x, 32;\n");
+        ptx.push_str("    @!%p_pca_load bra BW_PCA_LOAD_DONE;\n");
+        // seq_len is in %rd6 (u64); narrow to u32 for loop arithmetic.
+        ptx.push_str("    cvt.u32.u64 %r_pca_seq, %rd6;\n");
+        ptx.push_str("    mov.u32 %r_pca_i, %tid_x;\n");
+        ptx.push_str("BW_PCA_LOAD_LOOP:\n");
+        ptx.push_str("    setp.ge.u32 %p_pca_done, %r_pca_i, %r_pca_seq;\n");
+        ptx.push_str("    @%p_pca_done bra BW_PCA_LOAD_DONE;\n");
+        // Global address = rd_seg_global + i * 2  (u16 = 2 bytes)
+        ptx.push_str("    cvt.u64.u32 %rd_seg_smem, %r_pca_i;\n");
+        ptx.push_str("    shl.b64 %rd_seg_smem, %rd_seg_smem, 1;\n");
+        ptx.push_str("    add.u64 %rd_seg_smem, %rd_seg_smem, %rd_seg_global;\n");
+        ptx.push_str("    ld.global.u16 %rs_pca, [%rd_seg_smem];\n");
+        // Shared address = seg_base + i * 2
+        ptx.push_str("    shl.b32 %r_pca_off, %r_pca_i, 1;\n");
+        ptx.push_str("    add.u32 %r_pca_off, %r_pca_off, %seg_base;\n");
+        ptx.push_str("    st.shared.u16 [%r_pca_off], %rs_pca;\n");
+        // Advance by warp size (32) for next stride.
+        ptx.push_str("    add.u32 %r_pca_i, %r_pca_i, 32;\n");
+        ptx.push_str("    bra BW_PCA_LOAD_LOOP;\n");
+        ptx.push_str("BW_PCA_LOAD_DONE:\n");
+        // Fence: all threads (including warps 1+) see segment_ids before use.
+        ptx.push_str("    bar.sync 0;\n");
+        ptx.push_str("    // --- end PCA Tier A segment_ids load ---\n");
+    }
 }
 
 #[cfg(test)]
