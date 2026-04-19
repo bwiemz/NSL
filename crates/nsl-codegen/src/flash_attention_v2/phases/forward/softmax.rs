@@ -145,6 +145,18 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
         ptx.push_str("    mov.f32 %f_sdx_nmax, %new_max;  // J-A3 post-online-update max\n");
     }
     ptx.push_str("    sub.f32 %f0, %old_max, %new_max;\n");
+    // Defensive NaN guard: when old_max == new_max == -inf (i.e. every
+    // score seen so far has been a mask sentinel), %f0 is NaN. Downstream
+    // ex2(NaN) would produce NaN, poison %row_sum, and cascade into O_acc
+    // once the next tile has valid scores. Replace NaN with 0 so
+    // correction = exp(0) = 1 — row_sum is preserved across the fully-
+    // masked tile. The classic causal path never triggers this (every
+    // query has at least its diagonal key valid); PCA Tier A's segment
+    // mask can make a whole K-tile cross-segment, surfacing the corner
+    // case. This guard also defends any future masking pattern (tree
+    // masks, sliding windows, etc.) that could fully mask a tile.
+    ptx.push_str("    setp.nan.f32 %p0, %f0, %f0;\n");
+    ptx.push_str("    @%p0 mov.f32 %f0, 0f00000000;\n");
     ptx.push_str("    mul.f32 %f0, %f0, %log2e;\n");
     ptx.push_str("    ex2.approx.f32 %correction, %f0;          // exp(old-new), <=1\n");
     ptx.push_str("    mul.f32 %row_sum, %row_sum, %correction;\n");
@@ -178,6 +190,13 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
         ptx.push_str("    sub.f32 %f1, %f1, %new_max;\n");
         ptx.push_str("    mul.f32 %f1, %f1, %log2e;\n");
         ptx.push_str("    ex2.approx.f32 %f1, %f1;                  // P = exp(S-new_max)\n");
+        // Defensive NaN guard (spot 2): when S == new_max == -inf the
+        // sub produces NaN and ex2(NaN) = NaN. Force P = 0 so this cell
+        // contributes nothing to the partial sum or the later P*V. Uses
+        // %p1 (not %p0) because %p0 carries the in-range predicate for
+        // the writeback below.
+        ptx.push_str("    setp.nan.f32 %p1, %f1, %f1;\n");
+        ptx.push_str("    @%p1 mov.f32 %f1, 0f00000000;\n");
         // Zero P for out-of-range k so it does not pollute sum or later P*V.
         ptx.push_str("    @!%p0 mov.f32 %f1, 0f00000000;\n");
         // Writeback (in-range only, to avoid wild stores).

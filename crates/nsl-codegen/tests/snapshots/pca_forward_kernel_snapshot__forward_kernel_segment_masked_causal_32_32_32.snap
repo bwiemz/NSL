@@ -276,6 +276,8 @@ V2_LOOP_S_OVER_K_0:
     max.f32 %new_max, %row_max, %f0;
     mov.f32 %row_max, %new_max;
     sub.f32 %f0, %old_max, %new_max;
+    setp.nan.f32 %p0, %f0, %f0;
+    @%p0 mov.f32 %f0, 0f00000000;
     mul.f32 %f0, %f0, %log2e;
     ex2.approx.f32 %correction, %f0;          // exp(old-new), <=1
     mul.f32 %row_sum, %row_sum, %correction;
@@ -294,6 +296,8 @@ V2_LOOP_S_OVER_K_0:
     sub.f32 %f1, %f1, %new_max;
     mul.f32 %f1, %f1, %log2e;
     ex2.approx.f32 %f1, %f1;                  // P = exp(S-new_max)
+    setp.nan.f32 %p1, %f1, %f1;
+    @%p1 mov.f32 %f1, 0f00000000;
     @!%p0 mov.f32 %f1, 0f00000000;
     @%p0 st.shared.f32 [%smem_addr], %f1;     // in-place P writeback
     add.f32 %f2, %f2, %f1;
@@ -312,6 +316,8 @@ V2_LOOP_S_OVER_K_0:
     sub.f32 %f1, %f1, %new_max;
     mul.f32 %f1, %f1, %log2e;
     ex2.approx.f32 %f1, %f1;                  // P = exp(S-new_max)
+    setp.nan.f32 %p1, %f1, %f1;
+    @%p1 mov.f32 %f1, 0f00000000;
     @!%p0 mov.f32 %f1, 0f00000000;
     @%p0 st.shared.f32 [%smem_addr], %f1;     // in-place P writeback
     add.f32 %f2, %f2, %f1;
@@ -573,6 +579,8 @@ V2_LOOP_S_OVER_K_1:
     max.f32 %new_max, %row_max, %f0;
     mov.f32 %row_max, %new_max;
     sub.f32 %f0, %old_max, %new_max;
+    setp.nan.f32 %p0, %f0, %f0;
+    @%p0 mov.f32 %f0, 0f00000000;
     mul.f32 %f0, %f0, %log2e;
     ex2.approx.f32 %correction, %f0;          // exp(old-new), <=1
     mul.f32 %row_sum, %row_sum, %correction;
@@ -591,6 +599,8 @@ V2_LOOP_S_OVER_K_1:
     sub.f32 %f1, %f1, %new_max;
     mul.f32 %f1, %f1, %log2e;
     ex2.approx.f32 %f1, %f1;                  // P = exp(S-new_max)
+    setp.nan.f32 %p1, %f1, %f1;
+    @%p1 mov.f32 %f1, 0f00000000;
     @!%p0 mov.f32 %f1, 0f00000000;
     @%p0 st.shared.f32 [%smem_addr], %f1;     // in-place P writeback
     add.f32 %f2, %f2, %f1;
@@ -609,6 +619,8 @@ V2_LOOP_S_OVER_K_1:
     sub.f32 %f1, %f1, %new_max;
     mul.f32 %f1, %f1, %log2e;
     ex2.approx.f32 %f1, %f1;                  // P = exp(S-new_max)
+    setp.nan.f32 %p1, %f1, %f1;
+    @%p1 mov.f32 %f1, 0f00000000;
     @!%p0 mov.f32 %f1, 0f00000000;
     @%p0 st.shared.f32 [%smem_addr], %f1;     // in-place P writeback
     add.f32 %f2, %f2, %f1;
@@ -870,6 +882,8 @@ V2_LOOP_S_OVER_K_2:
     max.f32 %new_max, %row_max, %f0;
     mov.f32 %row_max, %new_max;
     sub.f32 %f0, %old_max, %new_max;
+    setp.nan.f32 %p0, %f0, %f0;
+    @%p0 mov.f32 %f0, 0f00000000;
     mul.f32 %f0, %f0, %log2e;
     ex2.approx.f32 %correction, %f0;          // exp(old-new), <=1
     mul.f32 %row_sum, %row_sum, %correction;
@@ -888,6 +902,8 @@ V2_LOOP_S_OVER_K_2:
     sub.f32 %f1, %f1, %new_max;
     mul.f32 %f1, %f1, %log2e;
     ex2.approx.f32 %f1, %f1;                  // P = exp(S-new_max)
+    setp.nan.f32 %p1, %f1, %f1;
+    @%p1 mov.f32 %f1, 0f00000000;
     @!%p0 mov.f32 %f1, 0f00000000;
     @%p0 st.shared.f32 [%smem_addr], %f1;     // in-place P writeback
     add.f32 %f2, %f2, %f1;
@@ -906,6 +922,8 @@ V2_LOOP_S_OVER_K_2:
     sub.f32 %f1, %f1, %new_max;
     mul.f32 %f1, %f1, %log2e;
     ex2.approx.f32 %f1, %f1;                  // P = exp(S-new_max)
+    setp.nan.f32 %p1, %f1, %f1;
+    @%p1 mov.f32 %f1, 0f00000000;
     @!%p0 mov.f32 %f1, 0f00000000;
     @%p0 st.shared.f32 [%smem_addr], %f1;     // in-place P writeback
     add.f32 %f2, %f2, %f1;
@@ -1167,6 +1185,8 @@ V2_LOOP_S_OVER_K_3:
     max.f32 %new_max, %row_max, %f0;
     mov.f32 %row_max, %new_max;
     sub.f32 %f0, %old_max, %new_max;
+    setp.nan.f32 %p0, %f0, %f0;
+    @%p0 mov.f32 %f0, 0f00000000;
     mul.f32 %f0, %f0, %log2e;
     ex2.approx.f32 %correction, %f0;          // exp(old-new), <=1
     mul.f32 %row_sum, %row_sum, %correction;
@@ -1185,6 +1205,8 @@ V2_LOOP_S_OVER_K_3:
     sub.f32 %f1, %f1, %new_max;
     mul.f32 %f1, %f1, %log2e;
     ex2.approx.f32 %f1, %f1;                  // P = exp(S-new_max)
+    setp.nan.f32 %p1, %f1, %f1;
+    @%p1 mov.f32 %f1, 0f00000000;
     @!%p0 mov.f32 %f1, 0f00000000;
     @%p0 st.shared.f32 [%smem_addr], %f1;     // in-place P writeback
     add.f32 %f2, %f2, %f1;
@@ -1203,6 +1225,8 @@ V2_LOOP_S_OVER_K_3:
     sub.f32 %f1, %f1, %new_max;
     mul.f32 %f1, %f1, %log2e;
     ex2.approx.f32 %f1, %f1;                  // P = exp(S-new_max)
+    setp.nan.f32 %p1, %f1, %f1;
+    @%p1 mov.f32 %f1, 0f00000000;
     @!%p0 mov.f32 %f1, 0f00000000;
     @%p0 st.shared.f32 [%smem_addr], %f1;     // in-place P writeback
     add.f32 %f2, %f2, %f1;
@@ -1464,6 +1488,8 @@ V2_LOOP_S_OVER_K_4:
     max.f32 %new_max, %row_max, %f0;
     mov.f32 %row_max, %new_max;
     sub.f32 %f0, %old_max, %new_max;
+    setp.nan.f32 %p0, %f0, %f0;
+    @%p0 mov.f32 %f0, 0f00000000;
     mul.f32 %f0, %f0, %log2e;
     ex2.approx.f32 %correction, %f0;          // exp(old-new), <=1
     mul.f32 %row_sum, %row_sum, %correction;
@@ -1482,6 +1508,8 @@ V2_LOOP_S_OVER_K_4:
     sub.f32 %f1, %f1, %new_max;
     mul.f32 %f1, %f1, %log2e;
     ex2.approx.f32 %f1, %f1;                  // P = exp(S-new_max)
+    setp.nan.f32 %p1, %f1, %f1;
+    @%p1 mov.f32 %f1, 0f00000000;
     @!%p0 mov.f32 %f1, 0f00000000;
     @%p0 st.shared.f32 [%smem_addr], %f1;     // in-place P writeback
     add.f32 %f2, %f2, %f1;
@@ -1500,6 +1528,8 @@ V2_LOOP_S_OVER_K_4:
     sub.f32 %f1, %f1, %new_max;
     mul.f32 %f1, %f1, %log2e;
     ex2.approx.f32 %f1, %f1;                  // P = exp(S-new_max)
+    setp.nan.f32 %p1, %f1, %f1;
+    @%p1 mov.f32 %f1, 0f00000000;
     @!%p0 mov.f32 %f1, 0f00000000;
     @%p0 st.shared.f32 [%smem_addr], %f1;     // in-place P writeback
     add.f32 %f2, %f2, %f1;
@@ -1761,6 +1791,8 @@ V2_LOOP_S_OVER_K_5:
     max.f32 %new_max, %row_max, %f0;
     mov.f32 %row_max, %new_max;
     sub.f32 %f0, %old_max, %new_max;
+    setp.nan.f32 %p0, %f0, %f0;
+    @%p0 mov.f32 %f0, 0f00000000;
     mul.f32 %f0, %f0, %log2e;
     ex2.approx.f32 %correction, %f0;          // exp(old-new), <=1
     mul.f32 %row_sum, %row_sum, %correction;
@@ -1779,6 +1811,8 @@ V2_LOOP_S_OVER_K_5:
     sub.f32 %f1, %f1, %new_max;
     mul.f32 %f1, %f1, %log2e;
     ex2.approx.f32 %f1, %f1;                  // P = exp(S-new_max)
+    setp.nan.f32 %p1, %f1, %f1;
+    @%p1 mov.f32 %f1, 0f00000000;
     @!%p0 mov.f32 %f1, 0f00000000;
     @%p0 st.shared.f32 [%smem_addr], %f1;     // in-place P writeback
     add.f32 %f2, %f2, %f1;
@@ -1797,6 +1831,8 @@ V2_LOOP_S_OVER_K_5:
     sub.f32 %f1, %f1, %new_max;
     mul.f32 %f1, %f1, %log2e;
     ex2.approx.f32 %f1, %f1;                  // P = exp(S-new_max)
+    setp.nan.f32 %p1, %f1, %f1;
+    @%p1 mov.f32 %f1, 0f00000000;
     @!%p0 mov.f32 %f1, 0f00000000;
     @%p0 st.shared.f32 [%smem_addr], %f1;     // in-place P writeback
     add.f32 %f2, %f2, %f1;
@@ -2058,6 +2094,8 @@ V2_LOOP_S_OVER_K_6:
     max.f32 %new_max, %row_max, %f0;
     mov.f32 %row_max, %new_max;
     sub.f32 %f0, %old_max, %new_max;
+    setp.nan.f32 %p0, %f0, %f0;
+    @%p0 mov.f32 %f0, 0f00000000;
     mul.f32 %f0, %f0, %log2e;
     ex2.approx.f32 %correction, %f0;          // exp(old-new), <=1
     mul.f32 %row_sum, %row_sum, %correction;
@@ -2076,6 +2114,8 @@ V2_LOOP_S_OVER_K_6:
     sub.f32 %f1, %f1, %new_max;
     mul.f32 %f1, %f1, %log2e;
     ex2.approx.f32 %f1, %f1;                  // P = exp(S-new_max)
+    setp.nan.f32 %p1, %f1, %f1;
+    @%p1 mov.f32 %f1, 0f00000000;
     @!%p0 mov.f32 %f1, 0f00000000;
     @%p0 st.shared.f32 [%smem_addr], %f1;     // in-place P writeback
     add.f32 %f2, %f2, %f1;
@@ -2094,6 +2134,8 @@ V2_LOOP_S_OVER_K_6:
     sub.f32 %f1, %f1, %new_max;
     mul.f32 %f1, %f1, %log2e;
     ex2.approx.f32 %f1, %f1;                  // P = exp(S-new_max)
+    setp.nan.f32 %p1, %f1, %f1;
+    @%p1 mov.f32 %f1, 0f00000000;
     @!%p0 mov.f32 %f1, 0f00000000;
     @%p0 st.shared.f32 [%smem_addr], %f1;     // in-place P writeback
     add.f32 %f2, %f2, %f1;
@@ -2355,6 +2397,8 @@ V2_LOOP_S_OVER_K_7:
     max.f32 %new_max, %row_max, %f0;
     mov.f32 %row_max, %new_max;
     sub.f32 %f0, %old_max, %new_max;
+    setp.nan.f32 %p0, %f0, %f0;
+    @%p0 mov.f32 %f0, 0f00000000;
     mul.f32 %f0, %f0, %log2e;
     ex2.approx.f32 %correction, %f0;          // exp(old-new), <=1
     mul.f32 %row_sum, %row_sum, %correction;
@@ -2373,6 +2417,8 @@ V2_LOOP_S_OVER_K_7:
     sub.f32 %f1, %f1, %new_max;
     mul.f32 %f1, %f1, %log2e;
     ex2.approx.f32 %f1, %f1;                  // P = exp(S-new_max)
+    setp.nan.f32 %p1, %f1, %f1;
+    @%p1 mov.f32 %f1, 0f00000000;
     @!%p0 mov.f32 %f1, 0f00000000;
     @%p0 st.shared.f32 [%smem_addr], %f1;     // in-place P writeback
     add.f32 %f2, %f2, %f1;
@@ -2391,6 +2437,8 @@ V2_LOOP_S_OVER_K_7:
     sub.f32 %f1, %f1, %new_max;
     mul.f32 %f1, %f1, %log2e;
     ex2.approx.f32 %f1, %f1;                  // P = exp(S-new_max)
+    setp.nan.f32 %p1, %f1, %f1;
+    @%p1 mov.f32 %f1, 0f00000000;
     @!%p0 mov.f32 %f1, 0f00000000;
     @%p0 st.shared.f32 [%smem_addr], %f1;     // in-place P writeback
     add.f32 %f2, %f2, %f1;
@@ -2652,6 +2700,8 @@ V2_LOOP_S_OVER_K_8:
     max.f32 %new_max, %row_max, %f0;
     mov.f32 %row_max, %new_max;
     sub.f32 %f0, %old_max, %new_max;
+    setp.nan.f32 %p0, %f0, %f0;
+    @%p0 mov.f32 %f0, 0f00000000;
     mul.f32 %f0, %f0, %log2e;
     ex2.approx.f32 %correction, %f0;          // exp(old-new), <=1
     mul.f32 %row_sum, %row_sum, %correction;
@@ -2670,6 +2720,8 @@ V2_LOOP_S_OVER_K_8:
     sub.f32 %f1, %f1, %new_max;
     mul.f32 %f1, %f1, %log2e;
     ex2.approx.f32 %f1, %f1;                  // P = exp(S-new_max)
+    setp.nan.f32 %p1, %f1, %f1;
+    @%p1 mov.f32 %f1, 0f00000000;
     @!%p0 mov.f32 %f1, 0f00000000;
     @%p0 st.shared.f32 [%smem_addr], %f1;     // in-place P writeback
     add.f32 %f2, %f2, %f1;
@@ -2688,6 +2740,8 @@ V2_LOOP_S_OVER_K_8:
     sub.f32 %f1, %f1, %new_max;
     mul.f32 %f1, %f1, %log2e;
     ex2.approx.f32 %f1, %f1;                  // P = exp(S-new_max)
+    setp.nan.f32 %p1, %f1, %f1;
+    @%p1 mov.f32 %f1, 0f00000000;
     @!%p0 mov.f32 %f1, 0f00000000;
     @%p0 st.shared.f32 [%smem_addr], %f1;     // in-place P writeback
     add.f32 %f2, %f2, %f1;
@@ -2949,6 +3003,8 @@ V2_LOOP_S_OVER_K_9:
     max.f32 %new_max, %row_max, %f0;
     mov.f32 %row_max, %new_max;
     sub.f32 %f0, %old_max, %new_max;
+    setp.nan.f32 %p0, %f0, %f0;
+    @%p0 mov.f32 %f0, 0f00000000;
     mul.f32 %f0, %f0, %log2e;
     ex2.approx.f32 %correction, %f0;          // exp(old-new), <=1
     mul.f32 %row_sum, %row_sum, %correction;
@@ -2967,6 +3023,8 @@ V2_LOOP_S_OVER_K_9:
     sub.f32 %f1, %f1, %new_max;
     mul.f32 %f1, %f1, %log2e;
     ex2.approx.f32 %f1, %f1;                  // P = exp(S-new_max)
+    setp.nan.f32 %p1, %f1, %f1;
+    @%p1 mov.f32 %f1, 0f00000000;
     @!%p0 mov.f32 %f1, 0f00000000;
     @%p0 st.shared.f32 [%smem_addr], %f1;     // in-place P writeback
     add.f32 %f2, %f2, %f1;
@@ -2985,6 +3043,8 @@ V2_LOOP_S_OVER_K_9:
     sub.f32 %f1, %f1, %new_max;
     mul.f32 %f1, %f1, %log2e;
     ex2.approx.f32 %f1, %f1;                  // P = exp(S-new_max)
+    setp.nan.f32 %p1, %f1, %f1;
+    @%p1 mov.f32 %f1, 0f00000000;
     @!%p0 mov.f32 %f1, 0f00000000;
     @%p0 st.shared.f32 [%smem_addr], %f1;     // in-place P writeback
     add.f32 %f2, %f2, %f1;
@@ -3246,6 +3306,8 @@ V2_LOOP_S_OVER_K_10:
     max.f32 %new_max, %row_max, %f0;
     mov.f32 %row_max, %new_max;
     sub.f32 %f0, %old_max, %new_max;
+    setp.nan.f32 %p0, %f0, %f0;
+    @%p0 mov.f32 %f0, 0f00000000;
     mul.f32 %f0, %f0, %log2e;
     ex2.approx.f32 %correction, %f0;          // exp(old-new), <=1
     mul.f32 %row_sum, %row_sum, %correction;
@@ -3264,6 +3326,8 @@ V2_LOOP_S_OVER_K_10:
     sub.f32 %f1, %f1, %new_max;
     mul.f32 %f1, %f1, %log2e;
     ex2.approx.f32 %f1, %f1;                  // P = exp(S-new_max)
+    setp.nan.f32 %p1, %f1, %f1;
+    @%p1 mov.f32 %f1, 0f00000000;
     @!%p0 mov.f32 %f1, 0f00000000;
     @%p0 st.shared.f32 [%smem_addr], %f1;     // in-place P writeback
     add.f32 %f2, %f2, %f1;
@@ -3282,6 +3346,8 @@ V2_LOOP_S_OVER_K_10:
     sub.f32 %f1, %f1, %new_max;
     mul.f32 %f1, %f1, %log2e;
     ex2.approx.f32 %f1, %f1;                  // P = exp(S-new_max)
+    setp.nan.f32 %p1, %f1, %f1;
+    @%p1 mov.f32 %f1, 0f00000000;
     @!%p0 mov.f32 %f1, 0f00000000;
     @%p0 st.shared.f32 [%smem_addr], %f1;     // in-place P writeback
     add.f32 %f2, %f2, %f1;
@@ -3543,6 +3609,8 @@ V2_LOOP_S_OVER_K_11:
     max.f32 %new_max, %row_max, %f0;
     mov.f32 %row_max, %new_max;
     sub.f32 %f0, %old_max, %new_max;
+    setp.nan.f32 %p0, %f0, %f0;
+    @%p0 mov.f32 %f0, 0f00000000;
     mul.f32 %f0, %f0, %log2e;
     ex2.approx.f32 %correction, %f0;          // exp(old-new), <=1
     mul.f32 %row_sum, %row_sum, %correction;
@@ -3561,6 +3629,8 @@ V2_LOOP_S_OVER_K_11:
     sub.f32 %f1, %f1, %new_max;
     mul.f32 %f1, %f1, %log2e;
     ex2.approx.f32 %f1, %f1;                  // P = exp(S-new_max)
+    setp.nan.f32 %p1, %f1, %f1;
+    @%p1 mov.f32 %f1, 0f00000000;
     @!%p0 mov.f32 %f1, 0f00000000;
     @%p0 st.shared.f32 [%smem_addr], %f1;     // in-place P writeback
     add.f32 %f2, %f2, %f1;
@@ -3579,6 +3649,8 @@ V2_LOOP_S_OVER_K_11:
     sub.f32 %f1, %f1, %new_max;
     mul.f32 %f1, %f1, %log2e;
     ex2.approx.f32 %f1, %f1;                  // P = exp(S-new_max)
+    setp.nan.f32 %p1, %f1, %f1;
+    @%p1 mov.f32 %f1, 0f00000000;
     @!%p0 mov.f32 %f1, 0f00000000;
     @%p0 st.shared.f32 [%smem_addr], %f1;     // in-place P writeback
     add.f32 %f2, %f2, %f1;
@@ -3840,6 +3912,8 @@ V2_LOOP_S_OVER_K_12:
     max.f32 %new_max, %row_max, %f0;
     mov.f32 %row_max, %new_max;
     sub.f32 %f0, %old_max, %new_max;
+    setp.nan.f32 %p0, %f0, %f0;
+    @%p0 mov.f32 %f0, 0f00000000;
     mul.f32 %f0, %f0, %log2e;
     ex2.approx.f32 %correction, %f0;          // exp(old-new), <=1
     mul.f32 %row_sum, %row_sum, %correction;
@@ -3858,6 +3932,8 @@ V2_LOOP_S_OVER_K_12:
     sub.f32 %f1, %f1, %new_max;
     mul.f32 %f1, %f1, %log2e;
     ex2.approx.f32 %f1, %f1;                  // P = exp(S-new_max)
+    setp.nan.f32 %p1, %f1, %f1;
+    @%p1 mov.f32 %f1, 0f00000000;
     @!%p0 mov.f32 %f1, 0f00000000;
     @%p0 st.shared.f32 [%smem_addr], %f1;     // in-place P writeback
     add.f32 %f2, %f2, %f1;
@@ -3876,6 +3952,8 @@ V2_LOOP_S_OVER_K_12:
     sub.f32 %f1, %f1, %new_max;
     mul.f32 %f1, %f1, %log2e;
     ex2.approx.f32 %f1, %f1;                  // P = exp(S-new_max)
+    setp.nan.f32 %p1, %f1, %f1;
+    @%p1 mov.f32 %f1, 0f00000000;
     @!%p0 mov.f32 %f1, 0f00000000;
     @%p0 st.shared.f32 [%smem_addr], %f1;     // in-place P writeback
     add.f32 %f2, %f2, %f1;
@@ -4137,6 +4215,8 @@ V2_LOOP_S_OVER_K_13:
     max.f32 %new_max, %row_max, %f0;
     mov.f32 %row_max, %new_max;
     sub.f32 %f0, %old_max, %new_max;
+    setp.nan.f32 %p0, %f0, %f0;
+    @%p0 mov.f32 %f0, 0f00000000;
     mul.f32 %f0, %f0, %log2e;
     ex2.approx.f32 %correction, %f0;          // exp(old-new), <=1
     mul.f32 %row_sum, %row_sum, %correction;
@@ -4155,6 +4235,8 @@ V2_LOOP_S_OVER_K_13:
     sub.f32 %f1, %f1, %new_max;
     mul.f32 %f1, %f1, %log2e;
     ex2.approx.f32 %f1, %f1;                  // P = exp(S-new_max)
+    setp.nan.f32 %p1, %f1, %f1;
+    @%p1 mov.f32 %f1, 0f00000000;
     @!%p0 mov.f32 %f1, 0f00000000;
     @%p0 st.shared.f32 [%smem_addr], %f1;     // in-place P writeback
     add.f32 %f2, %f2, %f1;
@@ -4173,6 +4255,8 @@ V2_LOOP_S_OVER_K_13:
     sub.f32 %f1, %f1, %new_max;
     mul.f32 %f1, %f1, %log2e;
     ex2.approx.f32 %f1, %f1;                  // P = exp(S-new_max)
+    setp.nan.f32 %p1, %f1, %f1;
+    @%p1 mov.f32 %f1, 0f00000000;
     @!%p0 mov.f32 %f1, 0f00000000;
     @%p0 st.shared.f32 [%smem_addr], %f1;     // in-place P writeback
     add.f32 %f2, %f2, %f1;
@@ -4434,6 +4518,8 @@ V2_LOOP_S_OVER_K_14:
     max.f32 %new_max, %row_max, %f0;
     mov.f32 %row_max, %new_max;
     sub.f32 %f0, %old_max, %new_max;
+    setp.nan.f32 %p0, %f0, %f0;
+    @%p0 mov.f32 %f0, 0f00000000;
     mul.f32 %f0, %f0, %log2e;
     ex2.approx.f32 %correction, %f0;          // exp(old-new), <=1
     mul.f32 %row_sum, %row_sum, %correction;
@@ -4452,6 +4538,8 @@ V2_LOOP_S_OVER_K_14:
     sub.f32 %f1, %f1, %new_max;
     mul.f32 %f1, %f1, %log2e;
     ex2.approx.f32 %f1, %f1;                  // P = exp(S-new_max)
+    setp.nan.f32 %p1, %f1, %f1;
+    @%p1 mov.f32 %f1, 0f00000000;
     @!%p0 mov.f32 %f1, 0f00000000;
     @%p0 st.shared.f32 [%smem_addr], %f1;     // in-place P writeback
     add.f32 %f2, %f2, %f1;
@@ -4470,6 +4558,8 @@ V2_LOOP_S_OVER_K_14:
     sub.f32 %f1, %f1, %new_max;
     mul.f32 %f1, %f1, %log2e;
     ex2.approx.f32 %f1, %f1;                  // P = exp(S-new_max)
+    setp.nan.f32 %p1, %f1, %f1;
+    @%p1 mov.f32 %f1, 0f00000000;
     @!%p0 mov.f32 %f1, 0f00000000;
     @%p0 st.shared.f32 [%smem_addr], %f1;     // in-place P writeback
     add.f32 %f2, %f2, %f1;
@@ -4731,6 +4821,8 @@ V2_LOOP_S_OVER_K_15:
     max.f32 %new_max, %row_max, %f0;
     mov.f32 %row_max, %new_max;
     sub.f32 %f0, %old_max, %new_max;
+    setp.nan.f32 %p0, %f0, %f0;
+    @%p0 mov.f32 %f0, 0f00000000;
     mul.f32 %f0, %f0, %log2e;
     ex2.approx.f32 %correction, %f0;          // exp(old-new), <=1
     mul.f32 %row_sum, %row_sum, %correction;
@@ -4749,6 +4841,8 @@ V2_LOOP_S_OVER_K_15:
     sub.f32 %f1, %f1, %new_max;
     mul.f32 %f1, %f1, %log2e;
     ex2.approx.f32 %f1, %f1;                  // P = exp(S-new_max)
+    setp.nan.f32 %p1, %f1, %f1;
+    @%p1 mov.f32 %f1, 0f00000000;
     @!%p0 mov.f32 %f1, 0f00000000;
     @%p0 st.shared.f32 [%smem_addr], %f1;     // in-place P writeback
     add.f32 %f2, %f2, %f1;
@@ -4767,6 +4861,8 @@ V2_LOOP_S_OVER_K_15:
     sub.f32 %f1, %f1, %new_max;
     mul.f32 %f1, %f1, %log2e;
     ex2.approx.f32 %f1, %f1;                  // P = exp(S-new_max)
+    setp.nan.f32 %p1, %f1, %f1;
+    @%p1 mov.f32 %f1, 0f00000000;
     @!%p0 mov.f32 %f1, 0f00000000;
     @%p0 st.shared.f32 [%smem_addr], %f1;     // in-place P writeback
     add.f32 %f2, %f2, %f1;

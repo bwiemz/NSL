@@ -43,6 +43,8 @@ expression: ptx
     max.f32 %new_max, %row_max, %f0;
     mov.f32 %row_max, %new_max;
     sub.f32 %f0, %old_max, %new_max;
+    setp.nan.f32 %p0, %f0, %f0;
+    @%p0 mov.f32 %f0, 0f00000000;
     mul.f32 %f0, %f0, %log2e;
     ex2.approx.f32 %correction, %f0;          // exp(old-new), <=1
     mul.f32 %row_sum, %row_sum, %correction;
@@ -61,6 +63,8 @@ expression: ptx
     sub.f32 %f1, %f1, %new_max;
     mul.f32 %f1, %f1, %log2e;
     ex2.approx.f32 %f1, %f1;                  // P = exp(S-new_max)
+    setp.nan.f32 %p1, %f1, %f1;
+    @%p1 mov.f32 %f1, 0f00000000;
     @!%p0 mov.f32 %f1, 0f00000000;
     @%p0 st.shared.f32 [%smem_addr], %f1;     // in-place P writeback
     add.f32 %f2, %f2, %f1;
@@ -79,6 +83,8 @@ expression: ptx
     sub.f32 %f1, %f1, %new_max;
     mul.f32 %f1, %f1, %log2e;
     ex2.approx.f32 %f1, %f1;                  // P = exp(S-new_max)
+    setp.nan.f32 %p1, %f1, %f1;
+    @%p1 mov.f32 %f1, 0f00000000;
     @!%p0 mov.f32 %f1, 0f00000000;
     @%p0 st.shared.f32 [%smem_addr], %f1;     // in-place P writeback
     add.f32 %f2, %f2, %f1;

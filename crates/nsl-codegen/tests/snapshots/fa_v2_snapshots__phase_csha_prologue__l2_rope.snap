@@ -6,6 +6,8 @@ expression: ptx
     ld.param.u64 %rd52, [csha_x_ptr];
     setp.eq.u64 %p0, %rd52, 0;
     @%p0 bra V2_CSHA_PROLOGUE_SKIP_0;
+    ld.param.u64 %rd58, [x_raw_ptr];
+    setp.eq.u64 %p1, %rd58, 0;
     mov.f32 %f0, 0f00000000;             // sumsq = 0
     // x slice 0: load, square, accumulate
     cvt.u64.u32 %rd53, %lane;
@@ -22,6 +24,9 @@ expression: ptx
     add.u64 %rd54, %rd52, %rd54;
     ld.global.f32 %f1, [%rd54];
     fma.rn.f32 %f0, %f1, %f1, %f0;            // sumsq += x*x
+    sub.u64 %rd59, %rd54, %rd52;        // byte_off = abs - x_base
+    add.u64 %rd59, %rd58, %rd59;        // x_raw addr
+    @!%p1 st.global.f32 [%rd59], %f1;   // x_raw save (null-gated)
     shfl.sync.bfly.b32 %shfl_tmp, %f0, 16, 31, 0xFFFFFFFF;
     add.f32 %f0, %f0, %shfl_tmp;
     shfl.sync.bfly.b32 %shfl_tmp, %f0, 8, 31, 0xFFFFFFFF;
