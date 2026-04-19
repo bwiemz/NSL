@@ -364,20 +364,19 @@ fn csha_gap_gpu_e2e_weights_change_after_one_step() {
 ///   - `csha_training_config` carries a real `d_model` (this PR).
 ///   - PR #74's dgamma-extract diagnostic line must show up in stderr.
 ///
-/// **Currently graceful-skip on the runtime side:** the d_model fix
-/// unblocks the kernel allocation, but the SGD step still trips a
-/// downstream `data_f64() called on non-f64 tensor (dtype=2)` assertion
-/// — independent of CSHA wiring, lives in `nsl-runtime`'s tensor-op
-/// dispatch.  When the dtype-dispatch fix lands, flip the runtime
-/// assertion below (`if !output.status.success() { ... return; }`)
-/// into a hard panic.
+/// **Runtime state (post-dtype-dispatch fix):** the d_model fix + the
+/// CPU tensor dispatch widening f16/bf16 to f32 now land SGD updates on
+/// `w_norm` + `wq`/`wk`/`wv` without panicking. The test hard-asserts
+/// BOTH the d_model=0 and the data_f64-on-non-f64 / copy_data dtype
+/// mismatch signatures are gone; any regression in either path turns
+/// this test red.
 ///
 /// Invocation:
 ///   cargo test -p nsl-cli --test csha_gap_gpu_e2e_smoke \
 ///     --features cuda -- --ignored --nocapture
 #[test]
-#[ignore = "requires a CUDA-capable GPU; CSHA fused-backward variant — \
-            graceful-skip on the runtime f16/f64 dtype assertion."]
+#[ignore = "requires a CUDA-capable GPU; runs the full CSHA fused-backward \
+            pipeline end-to-end including SGD writeback on f16 grads."]
 fn csha_gap_gpu_e2e_csha_fused_path() {
     let tmp = TempDir::new().expect("tempdir");
     let src_path = tmp.path().join("csha_toy_gpu_e2e_csha.nsl");
@@ -445,22 +444,20 @@ fn csha_gap_gpu_e2e_csha_fused_path() {
              stderr:\n{stderr}"
         );
         let dtype_dispatch_signature = stderr.contains("data_f64() called on non-f64")
-            || stderr.contains("dtype=2");
-        if dtype_dispatch_signature {
-            eprintln!(
-                "[csha-gpu-e2e-csha] EXPECTED downstream — d_model fix landed and \
-                 CSHA fused backward is reaching the SGD step, but the runtime \
-                 tensor-op dispatch still asserts f64 on an f16 grad tensor.  \
-                 When the dtype-dispatch fix lands, flip this branch to a hard \
-                 panic.\n\
-                 stderr tail:\n{}",
-                stderr.lines().rev().take(10).collect::<Vec<_>>().join("\n")
-            );
-            return;
-        }
+            || stderr.contains("nsl_tensor_copy_data: dtype mismatch");
+        assert!(
+            !dtype_dispatch_signature,
+            "[csha-gpu-e2e-csha] REGRESSION — f16/f64 dtype-dispatch crash \
+             signature is back.  The CPU tensor elementwise/scalar-mul paths \
+             in `crates/nsl-runtime/src/cpu.rs` + \
+             `crates/nsl-runtime/src/tensor/arithmetic.rs` must widen \
+             f16/bf16 inputs to f32 before computing and pick a promotion \
+             rule that keeps SGD's `copy_data(param, ...)` dtype-compatible.\n\
+             stderr:\n{stderr}"
+        );
         panic!(
             "[csha-gpu-e2e-csha] `nsl run --csha auto` failed with exit {} for an \
-             unrecognised reason (neither d_model=0 nor dtype=2 signature).\n\n\
+             unrecognised reason (neither d_model=0 nor dtype-dispatch signature).\n\n\
              stdout:\n{stdout}\n\nstderr:\n{stderr}",
             output.status
         );

@@ -4,14 +4,42 @@
 use std::ffi::c_void;
 
 use crate::memory::{checked_alloc, checked_alloc_zeroed};
-use crate::tensor::NslTensor;
+use crate::tensor::{
+    bf16_bits_to_f32, f16_bits_to_f32, f32_to_bf16_bits, f32_to_f16_bits, NslTensor, DTYPE_BF16,
+    DTYPE_FP16,
+};
 
 /// Elementwise binary op with NumPy-style broadcasting (f64 path).
 pub(crate) fn tensor_elementwise_op(a_ptr: i64, b_ptr: i64, op: fn(f64, f64) -> f64) -> i64 {
     let a = NslTensor::from_ptr(a_ptr);
     let b = NslTensor::from_ptr(b_ptr);
 
-    // Dispatch to f32 path if either tensor is f32
+    // Dtype dispatch — preserves prior behaviour for f64/f32 ops and adds
+    // f16/bf16 support:
+    //   * Both inputs are 16-bit floats → dedicated 16-bit path (output is 16-bit).
+    //   * Either input is f32           → f32 path (widens f64/f16/bf16 companions).
+    //                                     This matches the pre-existing
+    //                                     "f32 wins over f64" rule so SGD's
+    //                                     `f32_param - f64_velocity` still
+    //                                     lands in an f32 output tensor and
+    //                                     `copy_data(f32_param, result)` works.
+    //   * Otherwise                      → f64 path (widens f16/bf16 companions).
+    let a_is_16bit = a.dtype == DTYPE_FP16 || a.dtype == DTYPE_BF16;
+    let b_is_16bit = b.dtype == DTYPE_FP16 || b.dtype == DTYPE_BF16;
+    if a_is_16bit && b_is_16bit {
+        // Both inputs are 16-bit floats (possibly mixed f16/bf16) — stay in 16-bit.
+        // Prefer f16 over bf16 when the two differ so we don't lose the f16 mantissa.
+        let out_dtype = if a.dtype == DTYPE_FP16 || b.dtype == DTYPE_FP16 {
+            DTYPE_FP16
+        } else {
+            DTYPE_BF16
+        };
+        let op_f32 = move |x: f32, y: f32| op(x as f64, y as f64) as f32;
+        return tensor_elementwise_op_f16_impl(a_ptr, b_ptr, out_dtype, op_f32);
+    }
+
+    // Dispatch to f32 path if either tensor is f32 (possibly with f64 or
+    // 16-bit companions — `read_a`/`read_b` widens all non-f32 inputs to f32).
     if a.dtype == 1 || b.dtype == 1 {
         let op_f32 = {
             // We must convert the f64 op into an f32 op by wrapping
@@ -88,6 +116,28 @@ pub(crate) fn tensor_elementwise_op(a_ptr: i64, b_ptr: i64, op: fn(f64, f64) -> 
         }
     }
 
+    // Widen either input to f64. Handles f64/f32/f16/bf16/i32 — the f16 and
+    // bf16 reads flow through the same bit-twiddling helpers as the f16/f32
+    // dispatch paths. Needed so `f64_param op f16_grad` doesn't panic.
+    let read_a_f64 = |idx: usize| -> f64 {
+        match a.dtype {
+            0 => unsafe { *a.data_f64().add(idx) },
+            1 => unsafe { *a.data_f32().add(idx) as f64 },
+            DTYPE_FP16 => f16_bits_to_f32(unsafe { *(a.data as *const u16).add(idx) }) as f64,
+            DTYPE_BF16 => bf16_bits_to_f32(unsafe { *(a.data as *const u16).add(idx) }) as f64,
+            _ => unsafe { *a.data_f64().add(idx) },
+        }
+    };
+    let read_b_f64 = |idx: usize| -> f64 {
+        match b.dtype {
+            0 => unsafe { *b.data_f64().add(idx) },
+            1 => unsafe { *b.data_f32().add(idx) as f64 },
+            DTYPE_FP16 => f16_bits_to_f32(unsafe { *(b.data as *const u16).add(idx) }) as f64,
+            DTYPE_BF16 => bf16_bits_to_f32(unsafe { *(b.data as *const u16).add(idx) }) as f64,
+            _ => unsafe { *b.data_f64().add(idx) },
+        }
+    };
+
     // Iterate over output elements using multi-index
     for flat in 0..out_len as usize {
         let mut rem = flat;
@@ -111,7 +161,7 @@ pub(crate) fn tensor_elementwise_op(a_ptr: i64, b_ptr: i64, op: fn(f64, f64) -> 
             a_idx += coord * a_strides[d] as usize;
             b_idx += coord * b_strides[d] as usize;
         }
-        unsafe { *data.add(flat) = op(*a.data_f64().add(a_idx), *b.data_f64().add(b_idx)) };
+        unsafe { *data.add(flat) = op(read_a_f64(a_idx), read_b_f64(b_idx)) };
     }
 
     let result = Box::new(NslTensor::new(
@@ -200,19 +250,23 @@ pub(crate) fn tensor_elementwise_op_f32_impl(a_ptr: i64, b_ptr: i64, op: impl Fn
         }
     }
 
-    // Helper to read element as f32 regardless of source dtype
+    // Helper to read element as f32 regardless of source dtype.
+    // Widens f16/bf16 inputs so SGD-style `f32_param - lr*f16_grad` flows
+    // through the f32 output path without hitting the f64 assert.
     let read_a = |idx: usize| -> f32 {
-        if a.dtype == 1 {
-            unsafe { *a.data_f32().add(idx) }
-        } else {
-            unsafe { *a.data_f64().add(idx) as f32 }
+        match a.dtype {
+            1 => unsafe { *a.data_f32().add(idx) },
+            DTYPE_FP16 => f16_bits_to_f32(unsafe { *(a.data as *const u16).add(idx) }),
+            DTYPE_BF16 => bf16_bits_to_f32(unsafe { *(a.data as *const u16).add(idx) }),
+            _ => unsafe { *a.data_f64().add(idx) as f32 },
         }
     };
     let read_b = |idx: usize| -> f32 {
-        if b.dtype == 1 {
-            unsafe { *b.data_f32().add(idx) }
-        } else {
-            unsafe { *b.data_f64().add(idx) as f32 }
+        match b.dtype {
+            1 => unsafe { *b.data_f32().add(idx) },
+            DTYPE_FP16 => f16_bits_to_f32(unsafe { *(b.data as *const u16).add(idx) }),
+            DTYPE_BF16 => bf16_bits_to_f32(unsafe { *(b.data as *const u16).add(idx) }),
+            _ => unsafe { *b.data_f64().add(idx) as f32 },
         }
     };
 
@@ -254,6 +308,166 @@ pub(crate) fn tensor_elementwise_op_f32_impl(a_ptr: i64, b_ptr: i64, op: impl Fn
         0,
     ));
     crate::math::track_alloc((out_len as usize) * std::mem::size_of::<f32>());
+    Box::into_raw(result) as i64
+}
+
+/// Elementwise binary op with NumPy-style broadcasting (f16/bf16 path).
+///
+/// Math is performed in f32 (the storage dtype of one or both inputs may
+/// be f16 or bf16, which don't have native rust arithmetic). Inputs are
+/// widened with `f16_bits_to_f32` / `bf16_bits_to_f32` (or a direct cast
+/// for f32/f64 inputs), and the result is narrowed back to `out_dtype`
+/// via `f32_to_f16_bits` / `f32_to_bf16_bits`.
+///
+/// The output tensor is allocated with the narrowest input's dtype so
+/// downstream `copy_data` (which asserts dtype match) and SGD step logic
+/// doesn't have to insert extra casts. See the `tensor_elementwise_op`
+/// dispatcher above for the promotion rules.
+pub(crate) fn tensor_elementwise_op_f16_impl(
+    a_ptr: i64,
+    b_ptr: i64,
+    out_dtype: u16,
+    op: impl Fn(f32, f32) -> f32,
+) -> i64 {
+    let a = NslTensor::from_ptr(a_ptr);
+    let b = NslTensor::from_ptr(b_ptr);
+
+    let a_ndim = a.ndim as usize;
+    let b_ndim = b.ndim as usize;
+    let out_ndim = a_ndim.max(b_ndim);
+
+    let mut a_shape = vec![1i64; out_ndim];
+    let mut b_shape = vec![1i64; out_ndim];
+    for i in 0..a_ndim {
+        a_shape[out_ndim - a_ndim + i] = unsafe { *a.shape.add(i) };
+    }
+    for i in 0..b_ndim {
+        b_shape[out_ndim - b_ndim + i] = unsafe { *b.shape.add(i) };
+    }
+
+    let mut out_shape_vec = vec![0i64; out_ndim];
+    for i in 0..out_ndim {
+        let da = a_shape[i];
+        let db = b_shape[i];
+        if da == db {
+            out_shape_vec[i] = da;
+        } else if da == 1 {
+            out_shape_vec[i] = db;
+        } else if db == 1 {
+            out_shape_vec[i] = da;
+        } else {
+            eprintln!(
+                "nsl: tensor shape mismatch in elementwise op f16 (dim {}: {} vs {})\n  full a_shape={:?}\n  full b_shape={:?}",
+                i, da, db, a_shape, b_shape
+            );
+            std::process::abort();
+        }
+    }
+
+    let mut out_len: i64 = 1;
+    for &s in &out_shape_vec {
+        out_len *= s;
+    }
+
+    let shape = checked_alloc(out_ndim * std::mem::size_of::<i64>()) as *mut i64;
+    for (i, &s) in out_shape_vec.iter().enumerate().take(out_ndim) {
+        unsafe { *shape.add(i) = s };
+    }
+    let strides = NslTensor::compute_strides(shape, out_ndim as i64);
+    let data = checked_alloc((out_len as usize) * std::mem::size_of::<u16>()) as *mut u16;
+
+    let mut a_strides = vec![0i64; out_ndim];
+    let mut b_strides = vec![0i64; out_ndim];
+    {
+        let mut s = 1i64;
+        for i in (0..out_ndim).rev() {
+            if a_shape[i] > 1 {
+                a_strides[i] = s;
+            }
+            s *= a_shape[i];
+        }
+        s = 1;
+        for i in (0..out_ndim).rev() {
+            if b_shape[i] > 1 {
+                b_strides[i] = s;
+            }
+            s *= b_shape[i];
+        }
+    }
+
+    // Helper to read element as f32 regardless of source dtype.
+    // Accepts f16/bf16/f32/f64 inputs so elementwise `f16_grad op f32_param`
+    // and similar mixed-precision flows don't panic.
+    let read_a = |idx: usize| -> f32 {
+        match a.dtype {
+            DTYPE_FP16 => f16_bits_to_f32(unsafe { *(a.data as *const u16).add(idx) }),
+            DTYPE_BF16 => bf16_bits_to_f32(unsafe { *(a.data as *const u16).add(idx) }),
+            1 => unsafe { *a.data_f32().add(idx) },
+            0 => unsafe { *a.data_f64().add(idx) as f32 },
+            _ => panic!(
+                "tensor_elementwise_op_f16_impl: read_a unsupported dtype {}",
+                a.dtype
+            ),
+        }
+    };
+    let read_b = |idx: usize| -> f32 {
+        match b.dtype {
+            DTYPE_FP16 => f16_bits_to_f32(unsafe { *(b.data as *const u16).add(idx) }),
+            DTYPE_BF16 => bf16_bits_to_f32(unsafe { *(b.data as *const u16).add(idx) }),
+            1 => unsafe { *b.data_f32().add(idx) },
+            0 => unsafe { *b.data_f64().add(idx) as f32 },
+            _ => panic!(
+                "tensor_elementwise_op_f16_impl: read_b unsupported dtype {}",
+                b.dtype
+            ),
+        }
+    };
+
+    let narrow = |v: f32| -> u16 {
+        if out_dtype == DTYPE_FP16 {
+            f32_to_f16_bits(v)
+        } else {
+            f32_to_bf16_bits(v)
+        }
+    };
+
+    for flat in 0..out_len as usize {
+        let mut rem = flat;
+        let mut a_idx: usize = 0;
+        let mut b_idx: usize = 0;
+        for d in 0..out_ndim {
+            let coord = rem / {
+                let mut p = 1usize;
+                for &sv in out_shape_vec.iter().take(out_ndim).skip(d + 1) {
+                    p *= sv as usize;
+                }
+                p
+            };
+            rem %= {
+                let mut p = 1usize;
+                for &sv in out_shape_vec.iter().take(out_ndim).skip(d + 1) {
+                    p *= sv as usize;
+                }
+                p
+            };
+            a_idx += coord * a_strides[d] as usize;
+            b_idx += coord * b_strides[d] as usize;
+        }
+        unsafe { *data.add(flat) = narrow(op(read_a(a_idx), read_b(b_idx))) };
+    }
+
+    let result = Box::new(NslTensor::new(
+        data as *mut c_void,
+        shape,
+        strides,
+        out_ndim as i64,
+        out_len,
+        0,
+        out_dtype,
+        1,
+        0,
+    ));
+    crate::math::track_alloc((out_len as usize) * std::mem::size_of::<u16>());
     Box::into_raw(result) as i64
 }
 

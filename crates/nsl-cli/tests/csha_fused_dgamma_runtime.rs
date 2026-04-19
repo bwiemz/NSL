@@ -298,34 +298,24 @@ fn compile_time_emits_fused_dgamma_for_csha_chain() {
 
 /// Runtime execution of the fused-dgamma path.
 ///
-/// # Status (2026-04-16): d_model=0 bug FIXED, downstream f16/f64 dtype
-/// bug now exposed.
+/// # Status (2026-04-16): d_model=0 bug FIXED, f16/f64 dtype dispatch FIXED.
 ///
 /// The original blocker — `compiler/kernel.rs` constructing the
 /// `csha_training_config` with a hardcoded `CshaExtras { d_model: 0,
-/// ... }` — was fixed in this same PR by `resolve_csha_d_model_from_stmts`.
-/// We hard-assert below that the documented `dim 3: 0 vs 32` /
-/// `a_shape=[1, 1, 32, 0]` signature is GONE, so any future regression
-/// re-introducing the placeholder will turn this test red.
-///
-/// A separate downstream issue is now exposed: the SGD step on the
-/// fused-backward grad output panics with
-///   `data_f64() called on non-f64 tensor (dtype=2)`
-/// because the f16 grad tensor coming out of the CSHA fused backward
-/// flows into an `nsl_runtime::tensor` op that hard-asserts f64 dtype.
-/// That is independent of PR #74 (the dgamma extract emission) and the
-/// `d_model` plumbing — it lives in the runtime's tensor-op dtype
-/// dispatch — and is documented here as a graceful skip with a fresh
-/// signature so the next PR landing the dtype-dispatch fix flips the
-/// last branch into the success path.
+/// ... }` — was fixed in a prior PR by `resolve_csha_d_model_from_stmts`.
+/// The follow-up runtime blocker (`data_f64() called on non-f64 tensor
+/// (dtype=2)` during SGD on the f16 grad) was fixed in this PR by
+/// extending the CPU tensor-op dispatch in `cpu.rs` +
+/// `tensor/arithmetic.rs` to read f16/bf16 inputs via bit-twiddling
+/// helpers. We hard-assert both crash signatures are GONE below so any
+/// future regression in either path turns this test red.
 ///
 /// Invocation (gated):
 ///   cargo test -p nsl-cli --test csha_fused_dgamma_runtime \
 ///     --features cuda -- --ignored --include-ignored --nocapture
 #[test]
-#[ignore = "requires CUDA toolchain + GPU; d_model=0 bug FIXED in this PR — \
-            now waiting on the runtime f16/f64 dtype-dispatch fix to flip \
-            the last graceful-skip into a hard pass."]
+#[ignore = "requires CUDA toolchain + GPU; runs the full CSHA fused-backward \
+            pipeline end-to-end including SGD writeback on f16 grads."]
 fn runtime_executes_fused_dgamma() {
     // Compile-time check is required to even attempt the runtime
     // execution; if compilation diverged, the executable wouldn't
@@ -398,21 +388,22 @@ fn runtime_executes_fused_dgamma() {
              priority lists.\nstderr:\n{run_stderr}"
         );
 
-        // Downstream f16/f64 dtype-dispatch bug — graceful skip with a
-        // fresh signature.  Independent of d_model + PR #74 wiring.
+        // Hard-assert the downstream f16/f64 dtype-dispatch signature is GONE.
+        // Fixed in the same PR as this graceful-skip removal — the CPU tensor
+        // elementwise/scalar-mul paths now widen f16/bf16 inputs via
+        // `f16_bits_to_f32` before computing, so SGD's `param - lr*grad` on
+        // an f16 grad tensor no longer trips `data_f64() called on non-f64
+        // tensor`.  If the signature ever re-appears we want to fail loud.
         let dtype_dispatch_signature = run_stderr.contains("data_f64() called on non-f64")
-            || run_stderr.contains("dtype=2");
-        if dtype_dispatch_signature {
-            eprintln!(
-                "[csha-fused-dgamma-runtime] EXPECTED — d_model fix landed and the \
-                 fused backward + dgamma extract are reaching the SGD step, but the \
-                 runtime tensor-op dispatch still asserts f64 on an f16 grad tensor. \
-                 This is the new top blocker.  When fixed, this branch is unreachable \
-                 and the success path below executes.\n\
-                 stderr:\n{run_stderr}"
-            );
-            return;
-        }
+            || run_stderr.contains("nsl_tensor_copy_data: dtype mismatch");
+        assert!(
+            !dtype_dispatch_signature,
+            "[csha-fused-dgamma-runtime] REGRESSION — the f16/f64 dtype-dispatch \
+             crash signature is back.  The CPU tensor elementwise/scalar-mul \
+             paths in `crates/nsl-runtime/src/cpu.rs` + \
+             `crates/nsl-runtime/src/tensor/arithmetic.rs` must widen f16/bf16 \
+             inputs to f32 before computing.\nstderr:\n{run_stderr}"
+        );
         panic!(
             "[csha-fused-dgamma-runtime] unexpected runtime failure (neither \
              the documented `d_model=0` nor the new `dtype=2` signature). \
