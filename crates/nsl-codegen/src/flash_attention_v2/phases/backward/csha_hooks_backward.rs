@@ -612,6 +612,75 @@ pub fn emit_drmsnorm(ptx: &mut String, config: &FlashAttentionConfig, q_tile_ite
     }
     ptx.push_str("    bar.sync 0;  // dx_norm tile complete\n");
 
+    // ── Phase 1b: cooperative SMEM→HBM copy of the dx_norm tile. ──────────
+    //
+    // Gap I.5 fix (Option A): expose dx_norm as the 8th backward output so
+    // `RmsNormGammaBackward` on the AD side receives the correct semantic
+    // input (gradient w.r.t. the RMSNorm OUTPUT). The SMEM tile lives at
+    // `dxn_off` (shape [block_q, d_model] f32) and is already populated
+    // above — we just drain it to HBM at pointer `%rd_bwd_dxn`.
+    //
+    // HBM layout: [batch, seq, d_model] f32, row-major. This block's rows
+    // cover (batch_idx, q_start..q_start+block_q); under the smoke scope
+    // q_start=0 / batch_idx=0 so the block writes rows [0, block_q). For
+    // wider configs each (batch, q_start) block writes its own rows with
+    // no cross-block contention (heads=1 single-contributor assumption
+    // already documented for this hook).
+    //
+    // Null-guard on dxn_ptr: callers can pass 0 to skip this store if
+    // they don't need dx_norm.
+    let dxn_cells = block_q * d_model;
+    let dxn_cells_per_thread = dxn_cells.div_ceil(128).max(1);
+    ptx.push_str("    // dRMSNorm phase 1b: dx_norm SMEM->HBM (coop copy, f32)\n");
+    ptx.push_str(&format!(
+        "V2_BWD_DRMSNORM_DXN_STORE_{q_tile_iter}:\n"
+    ));
+    ptx.push_str("    setp.eq.u64 %p_c0, %rd_bwd_dxn, 0;\n");
+    ptx.push_str(&format!(
+        "    @%p_c0 bra V2_BWD_DRMSNORM_DXN_STORE_SKIP_{q_tile_iter};\n"
+    ));
+    // HBM base for this block:
+    //   ((batch_idx * seq_len + q_start) * d_model) * 4 bytes (f32).
+    // Note: dx_norm has shape [batch, seq, d_model] (no heads dim — it
+    // IS the RMSNorm-output gradient, which is per-sequence not per-head).
+    ptx.push_str("    mul.lo.u64 %rd_c0, %batch_idx, %rd6;  // batch_idx * seq_len\n");
+    ptx.push_str("    add.u64 %rd_c0, %rd_c0, %q_start;\n");
+    ptx.push_str(&format!(
+        "    mul.lo.u64 %rd_c0, %rd_c0, {};  // * d_model\n", d_model
+    ));
+    ptx.push_str("    shl.b64 %rd_c0, %rd_c0, 2;  // * 4 bytes (f32)\n");
+    ptx.push_str("    add.u64 %rd_c0, %rd_bwd_dxn, %rd_c0;  // HBM base for this block\n");
+    for k in 0..dxn_cells_per_thread {
+        let thread_cell = k * 128;
+        ptx.push_str("    cvt.u64.u32 %rd_c1, %tid_x;\n");
+        if thread_cell > 0 {
+            ptx.push_str(&format!(
+                "    add.u64 %rd_c1, %rd_c1, {};\n", thread_cell
+            ));
+        }
+        ptx.push_str(&format!(
+            "    setp.lt.u64 %p_c0, %rd_c1, {};\n", dxn_cells
+        ));
+        // SMEM f32 load from dx_norm tile
+        ptx.push_str("    shl.b64 %rd_c2, %rd_c1, 2;  // cell_idx * 4\n");
+        ptx.push_str(&format!(
+            "    add.u64 %rd_c2, %rd_c2, {};\n", dxn_off
+        ));
+        ptx.push_str("    add.u64 %rd_c2, %shmem_base, %rd_c2;\n");
+        ptx.push_str("    @%p_c0 ld.shared.f32 %f_dxn, [%rd_c2];\n");
+        // HBM f32 store
+        ptx.push_str("    shl.b64 %rd_c3, %rd_c1, 2;\n");
+        ptx.push_str("    add.u64 %rd_c3, %rd_c0, %rd_c3;\n");
+        ptx.push_str("    @%p_c0 st.global.f32 [%rd_c3], %f_dxn;\n");
+    }
+    // Note: only one lane per cell writes, so no barrier strictly needed
+    // between store and Phase 2 (Phase 2 only reads dx_norm from SMEM,
+    // not HBM). The existing bar.sync right before Phase 2 will cover
+    // any SMEM↔HBM interactions.
+    ptx.push_str(&format!(
+        "V2_BWD_DRMSNORM_DXN_STORE_SKIP_{q_tile_iter}:\n"
+    ));
+
     // ── Phase 2: per-row dx = g_d/rms - x*s_grad/(D*rms^3). ───────────────
     //
     // One thread per row (tid_x < block_q); compute s_grad serially
@@ -829,6 +898,82 @@ mod tests {
             ptx.matches("shfl.sync.bfly.b32").count() >= 5,
             "need ≥5 butterflies, got {}",
             ptx.matches("shfl.sync.bfly.b32").count()
+        );
+    }
+
+    /// Gap I.5 Option A: `emit_drmsnorm` MUST also drain the SMEM
+    /// `dx_norm` tile to HBM via `%rd_bwd_dxn` (the 8th gradient output).
+    /// This is the load-bearing kernel change for the Gap I.5 dgamma
+    /// semantic-correctness fix — the AD-side `RmsNormGammaBackward`
+    /// consumes this buffer via `extract_results[7]`.
+    ///
+    /// Assertions:
+    ///   - The new SMEM->HBM store label is emitted (both the ENTRY
+    ///     `V2_BWD_DRMSNORM_DXN_STORE_0:` and the null-guard SKIP label
+    ///     `V2_BWD_DRMSNORM_DXN_STORE_SKIP_0:`).
+    ///   - The kernel references `%rd_bwd_dxn` (the dxn_ptr register
+    ///     loaded by the prelude) so ptxas sees a real dependency on
+    ///     the new param.
+    ///   - At least one `st.global.f32` appears inside the dxn store
+    ///     phase (the HBM write of the f32 tile).
+    ///   - The store precedes Phase 2's `V2_BWD_DRMSNORM_PHASE2_DONE`
+    ///     label, confirming correct ordering (dx_norm drains BEFORE
+    ///     Phase 2 overwrites Phase-1-phase-2 scratch registers).
+    #[test]
+    fn backward_drmsnorm_stores_dx_norm_to_hbm_via_rd_bwd_dxn() {
+        let cfg = base_cfg_fused_backward(32, 32, 32, 4, 32);
+        let mut ptx = String::new();
+        emit_drmsnorm(&mut ptx, &cfg, 0);
+
+        assert!(
+            ptx.contains("V2_BWD_DRMSNORM_DXN_STORE_0:"),
+            "missing dx_norm SMEM->HBM store entry label; kernel-side Gap I.5 \
+             Option-A dx_norm export regressed. ptx=\n{}",
+            ptx
+        );
+        assert!(
+            ptx.contains("V2_BWD_DRMSNORM_DXN_STORE_SKIP_0:"),
+            "missing dx_norm null-guard SKIP label"
+        );
+        assert!(
+            ptx.contains("%rd_bwd_dxn"),
+            "dx_norm store must reference `%rd_bwd_dxn` so the prelude's \
+             dxn_ptr param load has a consumer; absence means the new HBM \
+             write wasn't wired."
+        );
+        let idx_dxn_store = ptx
+            .find("V2_BWD_DRMSNORM_DXN_STORE_0:")
+            .expect("dxn store label present");
+        let idx_phase2_done = ptx
+            .find("V2_BWD_DRMSNORM_PHASE2_DONE:")
+            .expect("phase 2 done label present");
+        assert!(
+            idx_dxn_store < idx_phase2_done,
+            "dx_norm HBM store must run BEFORE Phase 2 completes"
+        );
+    }
+
+    /// Gap I.5 Option A: the prelude's `dx_norm_ptr` param MUST be
+    /// declared AND consumed by an `ld.param.u64` into `%rd_bwd_dxn`.
+    /// Without the consumer, ptxas would complain that the param is
+    /// unreferenced (or the kernel would fail the full PTX-assemble
+    /// pass even though emit_drmsnorm uses the register).
+    #[test]
+    fn backward_prelude_declares_and_loads_dx_norm_ptr() {
+        use crate::flash_attention_v2::phases::backward::prelude::emit as emit_prelude;
+        let cfg = base_cfg_fused_backward(32, 32, 32, 4, 32);
+        let mut ptx = String::new();
+        emit_prelude(&mut ptx, &cfg);
+
+        assert!(
+            ptx.contains(".param .u64 dx_norm_ptr"),
+            "kernel param `dx_norm_ptr` missing from prelude — Gap I.5 \
+             Option-A 8th output regressed"
+        );
+        assert!(
+            ptx.contains("ld.param.u64 %rd_bwd_dxn, [dx_norm_ptr]"),
+            "prelude must load dx_norm_ptr into %rd_bwd_dxn so the \
+             downstream store in emit_drmsnorm has a live pointer"
         );
     }
 

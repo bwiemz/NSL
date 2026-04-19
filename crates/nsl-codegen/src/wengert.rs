@@ -176,23 +176,31 @@ pub enum PrimalOp {
         causal: bool,
         component: u8,
     },
-    /// Gap C: extract one component from the fused CSHA backward kernel.
+    /// Gap C (extended by Gap I.5 Option A): extract one component from the
+    /// fused CSHA backward kernel.
     ///
-    /// The CSHA fused backward produces **seven** output tensors — dq, dk, dv,
-    /// dwq, dwk, dwv, dx — and the AD graph represents every op with a single
-    /// `VarId` result.  To plumb seven results through the graph without
-    /// restructuring `WengertOp`, we mirror the `FlashAttentionBackwardExtract`
-    /// pattern: one dedicated extract op per component, all sharing a cache
-    /// keyed by the first input (the "chain key" VarId chosen by the caller).
+    /// The CSHA fused backward produces **eight** output tensors — dq, dk,
+    /// dv, dwq, dwk, dwv, dx, dx_norm — and the AD graph represents every
+    /// op with a single `VarId` result.  To plumb eight results through the
+    /// graph without restructuring `WengertOp`, we mirror the
+    /// `FlashAttentionBackwardExtract` pattern: one dedicated extract op per
+    /// component, all sharing a cache keyed by the first input (the "chain
+    /// key" VarId chosen by the caller).
     ///
     /// Component mapping:
-    ///   - 0 = dq  (gradient w.r.t. Q projection output)
-    ///   - 1 = dk  (gradient w.r.t. K projection output)
-    ///   - 2 = dv  (gradient w.r.t. V projection output)
-    ///   - 3 = dwq (gradient w.r.t. Wq weight)
-    ///   - 4 = dwk (gradient w.r.t. Wk weight)
-    ///   - 5 = dwv (gradient w.r.t. Wv weight)
-    ///   - 6 = dx  (gradient w.r.t. the layer input `x`)
+    ///   - 0 = dq      (gradient w.r.t. Q projection output)
+    ///   - 1 = dk      (gradient w.r.t. K projection output)
+    ///   - 2 = dv      (gradient w.r.t. V projection output)
+    ///   - 3 = dwq     (gradient w.r.t. Wq weight)
+    ///   - 4 = dwk     (gradient w.r.t. Wk weight)
+    ///   - 5 = dwv     (gradient w.r.t. Wv weight)
+    ///   - 6 = dx      (gradient w.r.t. the RAW layer input — post dRMSNorm)
+    ///   - 7 = dx_norm (gradient w.r.t. the RMSNorm OUTPUT — pre dRMSNorm)
+    ///
+    /// Component 7 was added by the Gap I.5 Option-A fix so the AD-side
+    /// `RmsNormGammaBackward` receives the correct semantic input
+    /// (`dy_norm`) — previously the CSHA dispatcher claim path fed
+    /// component 6 (dx_raw) which produced wrong dgamma values.
     ///
     /// Gap C lands the variant + the lowerer + the `Compiler`-level cache.
     /// Gap D constructs these ops inside the EmitFused arm of
@@ -374,17 +382,19 @@ mod tests {
         assert!(list.is_checkpointed(1));
     }
 
-    /// Gap C: `CshaFusedBackwardExtract` is a seven-slot extract primitive
-    /// (dq/dk/dv/dwq/dwk/dwv/dx).  Each component value MUST be distinct
-    /// and in the documented 0..=6 range so the lowerer's cache-lookup
-    /// (`compiler.csha_fused_bwd_cache[key][component]`) selects the right
-    /// output tensor.
+    /// Gap C (extended by Gap I.5 Option A): `CshaFusedBackwardExtract`
+    /// is now an **eight**-slot extract primitive
+    /// (dq/dk/dv/dwq/dwk/dwv/dx/dx_norm).  Each component value MUST be
+    /// distinct and in the documented 0..=7 range so the lowerer's
+    /// cache-lookup (`compiler.csha_fused_bwd_cache[key][component]`)
+    /// selects the right output tensor. Component 7 (dx_norm) is the
+    /// Gap I.5 addition for correct dgamma semantics.
     #[test]
     fn test_csha_fused_backward_extract_components_are_distinct() {
-        let components: Vec<PrimalOp> = (0u8..=6)
+        let components: Vec<PrimalOp> = (0u8..=7)
             .map(|c| PrimalOp::CshaFusedBackwardExtract { component: c })
             .collect();
-        assert_eq!(components.len(), 7, "CSHA fused backward has 7 outputs");
+        assert_eq!(components.len(), 8, "CSHA fused backward has 8 outputs (7+dx_norm)");
         // All seven variants are PartialEq-distinct.
         for (i, a) in components.iter().enumerate() {
             for (j, b) in components.iter().enumerate() {
@@ -404,11 +414,11 @@ mod tests {
         }
     }
 
-    /// Gap C (amended by Gap I.2+M): seven distinct
-    /// `CshaFusedBackwardExtract` ops, each declaring two inputs —
-    /// `[launch_result, chain_key]`. All seven share the same second-input
+    /// Gap C (amended by Gap I.2+M, extended by Gap I.5 Option A): eight
+    /// distinct `CshaFusedBackwardExtract` ops, each declaring two inputs —
+    /// `[launch_result, chain_key]`. All eight share the same second-input
     /// VarId (the cache key) so they look up the same cache entry, and all
-    /// seven list the launch op's result VarId as their first input so the
+    /// eight list the launch op's result VarId as their first input so the
     /// dead-gradient elimination worklist reaches the launch via any live
     /// extract.
     #[test]
@@ -435,7 +445,7 @@ mod tests {
                 checkpointed: false,
             },
         ];
-        for c in 0u8..=6 {
+        for c in 0u8..=7 {
             ops.push(WengertOp {
                 id: (c as u32) + 2,
                 result: 100 + c as VarId,
@@ -447,13 +457,13 @@ mod tests {
         }
         let list = WengertList {
             ops,
-            output: 106,
+            output: 107,
             var_names: HashMap::new(),
             var_types: HashMap::new(),
         };
-        // All seven extract ops are distinct VarIds.
+        // All eight extract ops are distinct VarIds.
         let mut seen = std::collections::HashSet::new();
-        for c in 0u8..=6 {
+        for c in 0u8..=7 {
             let vid = 100 + c as VarId;
             assert!(list.defines(vid), "extract {c} should define VarId {vid}");
             assert!(seen.insert(vid), "extract VarIds must be distinct");
@@ -468,7 +478,7 @@ mod tests {
                 "all extracts share [launch_result, chain_key]"
             );
         }
-        assert_eq!(seen.len(), 7);
+        assert_eq!(seen.len(), 8);
     }
 
     #[test]

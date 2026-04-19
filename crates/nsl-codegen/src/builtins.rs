@@ -1107,13 +1107,17 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
         ],
         None,
     ),
-    // Gap D / Tier C: CSHA fused backward launch.  44 i64 args matching
-    // the wengert_lower.rs `PrimalOp::FusedCshaBackward` emission order:
+    // Gap D / Tier C (extended by Gap I.5 Option A): CSHA fused backward
+    // launch. 45 i64 args matching the wengert_lower.rs
+    // `PrimalOp::FusedCshaBackward` emission order:
     //   36-arg forward-side prelude mirrored off `_with_saves`,
     //   + 6 forward-saved activation pointers,
-    //   + dO input + 7 gradient outputs (dq, dk, dv, dwq, dwk, dwv, dx).
+    //   + dO input + 8 gradient outputs
+    //     (dq, dk, dv, dwq, dwk, dwv, dx, dx_norm).
     // First surfaced as "undefined function" in the Gap I.3 smoke once
-    // A+F let the backward launch actually fire.
+    // A+F let the backward launch actually fire. Gap I.5 appended the
+    // 8th output (`dx_norm`) so the AD-side `RmsNormGammaBackward` gets
+    // the correct `dy_norm` input.
     (
         "nsl_flash_attention_csha_backward",
         &[
@@ -1137,11 +1141,12 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
             types::I64, types::I64, types::I64, // q_proj, k_proj, v_proj
             types::I64, types::I64,             // row_max, row_sum
             types::I64,                         // x_raw
-            // Gradient outputs (dO + 7):
+            // Gradient outputs (dO + 8):
             types::I64,                         // do_ptr
             types::I64, types::I64, types::I64, // dq, dk, dv
             types::I64, types::I64, types::I64, // dwq, dwk, dwv
             types::I64,                         // dx
+            types::I64,                         // dx_norm (Gap I.5)
         ],
         Some(types::I64),
     ),

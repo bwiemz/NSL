@@ -346,17 +346,18 @@ fn emit_fused_produces_launch_op_plus_seven_extracts() {
         .filter(|o| matches!(o.op, PrimalOp::CshaFusedBackwardExtract { .. }))
         .count();
     assert_eq!(
-        extract_count, 7,
-        "EmitFused must emit 7 CshaFusedBackwardExtract ops (one per \
-         dq/dk/dv/dwq/dwk/dwv/dx component); got {}",
+        extract_count, 8,
+        "EmitFused must emit 8 CshaFusedBackwardExtract ops (one per \
+         dq/dk/dv/dwq/dwk/dwv/dx/dx_norm component); got {}",
         extract_count
     );
 
     // Gap I.2+M: each extract lists two inputs — [launch_result,
-    // chain_key]. All seven MUST declare the launch op's result as their
-    // FIRST input (so dead-grad elim keeps the launch alive via the
-    // worklist walk) and share the same SECOND input — the matmul_op's
-    // result VarId 2 (the chain key).
+    // chain_key]. All eight (7 from Gap C + dx_norm from Gap I.5
+    // Option A) MUST declare the launch op's result as their FIRST
+    // input (so dead-grad elim keeps the launch alive via the worklist
+    // walk) and share the same SECOND input — the matmul_op's result
+    // VarId 2 (the chain key).
     let launch_result = adjoint
         .ops
         .iter()
@@ -382,6 +383,30 @@ fn emit_fused_produces_launch_op_plus_seven_extracts() {
                 "extract inputs[1] must be the chain_key = matmul_op.result"
             );
         }
+    }
+
+    // Gap I.5 Option A pin: every component value in 0..=7 must be
+    // emitted exactly once. Component 7 (`dx_norm`) is the load-bearing
+    // addition for correct dgamma semantics — if it regresses to 6
+    // components (or 7 without component=7), the AD-side
+    // RmsNormGammaBackward will receive dx_raw again (the original
+    // Gap I.5 bug).
+    let mut seen_components = std::collections::HashSet::<u8>::new();
+    for op in &adjoint.ops {
+        if let PrimalOp::CshaFusedBackwardExtract { component } = op.op {
+            assert!(
+                seen_components.insert(component),
+                "duplicate CshaFusedBackwardExtract component={component}"
+            );
+        }
+    }
+    for c in 0u8..=7 {
+        assert!(
+            seen_components.contains(&c),
+            "missing CshaFusedBackwardExtract component={c} — Gap I.5 \
+             Option-A expects the full 0..=7 range (component 7 is the \
+             dx_norm extract)"
+        );
     }
 }
 

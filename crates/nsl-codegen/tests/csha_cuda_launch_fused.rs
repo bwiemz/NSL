@@ -1001,11 +1001,16 @@ fn t4_csha_backward_ffi_smoke() {
     let dwk_dev = unsafe { nsl_test_cuda_alloc(dw_bytes) };
     let dwv_dev = unsafe { nsl_test_cuda_alloc(dw_bytes) };
     let dx_dev = unsafe { nsl_test_cuda_alloc(dx_bytes) };
+    // Gap I.5 Option A: 8th gradient output buffer (dx_norm — gradient
+    // w.r.t. the RMSNorm output). f32, [batch, seq, d_model].
+    let dxn_bytes = (batch * seq * d_model * 4) as i64;
+    let dxn_dev = unsafe { nsl_test_cuda_alloc(dxn_bytes) };
 
     let all_ptrs = [
         q_dev, k_dev, v_dev, out_dev, lse_dev, x_dev, nw_dev,
         wq_dev, wk_dev, wv_dev,
         do_dev, dq_dev, dk_dev, dv_dev, dwq_dev, dwk_dev, dwv_dev, dx_dev,
+        dxn_dev,
     ];
 
     let rc = unsafe {
@@ -1028,6 +1033,7 @@ fn t4_csha_backward_ffi_smoke() {
             saves.x_raw,
             do_dev, dq_dev, dk_dev, dv_dev,
             dwq_dev, dwk_dev, dwv_dev, dx_dev,
+            dxn_dev,
         )
     };
 

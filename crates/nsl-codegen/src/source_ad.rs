@@ -348,8 +348,8 @@ impl AdjointGenerator {
                                 // the lowerer) is a placeholder zero tensor
                                 // and is not actually consumed; inputs[1] is
                                 // the `chain_key` used to look up the cache.
-                                let mut extract_results: [VarId; 7] = [0u32; 7];
-                                for component in 0u8..=6u8 {
+                                let mut extract_results: [VarId; 8] = [0u32; 8];
+                                for component in 0u8..=7u8 {
                                     let r = self.emit_op(
                                         PrimalOp::CshaFusedBackwardExtract { component },
                                         vec![launch_result, chain_key],
@@ -357,28 +357,51 @@ impl AdjointGenerator {
                                     extract_results[component as usize] = r;
                                 }
 
-                                // Route the 7 outputs to the right VarIds.
+                                // Route the 8 outputs to the right VarIds.
                                 if let Some(v) = chain_varids {
-                                    // Gap D.1 primary routing: outputs land
-                                    // on the correct primal VarIds, so
-                                    // downstream accumulate_adjoint calls
-                                    // for the SUPPRESSED per-op backward
-                                    // (matmul/RMSNorm/RoPE) don't run and
-                                    // no double-accumulation occurs.
-                                    //   0 = dq → q_out_var (Q matmul or RoPE-Q output)
-                                    //   1 = dk → k_out_var
-                                    //   2 = dv → v_out_var
-                                    //   3 = dwq → wq_var
-                                    //   4 = dwk → wk_var
-                                    //   5 = dwv → wv_var
-                                    //   6 = dx  → x_norm_var
+                                    // Gap D.1 primary routing (extended by
+                                    // Gap I.5 Option A): outputs land on the
+                                    // correct primal VarIds, so downstream
+                                    // accumulate_adjoint calls for the
+                                    // SUPPRESSED per-op backward
+                                    // (matmul/RMSNorm/RoPE) don't run and no
+                                    // double-accumulation occurs.
+                                    //   0 = dq      → q_out_var (Q matmul or RoPE-Q output)
+                                    //   1 = dk      → k_out_var
+                                    //   2 = dv      → v_out_var
+                                    //   3 = dwq     → wq_var
+                                    //   4 = dwk     → wk_var
+                                    //   5 = dwv     → wv_var
+                                    //   6 = dx_raw  → x_raw_var (pre-RMSNorm input)
+                                    //   7 = dx_norm → x_norm_var (RMSNorm output — dy_norm)
+                                    //
+                                    // Pre-Gap-I.5 Option A the routing sent
+                                    // extract[6] (dx_raw) to `x_norm_var`,
+                                    // which was semantically wrong but
+                                    // benign (nothing downstream read it).
+                                    // Now extract[6] goes to `x_raw_var`
+                                    // (correct — it's the gradient w.r.t.
+                                    // the pre-RMSNorm input) and the new
+                                    // extract[7] (dx_norm) goes to
+                                    // `x_norm_var` (correct — it's the
+                                    // gradient w.r.t. the RMSNorm output).
                                     self.accumulate_adjoint(v.q_out_var, extract_results[0]);
                                     self.accumulate_adjoint(v.k_out_var, extract_results[1]);
                                     self.accumulate_adjoint(v.v_out_var, extract_results[2]);
                                     self.accumulate_adjoint(v.wq_var, extract_results[3]);
                                     self.accumulate_adjoint(v.wk_var, extract_results[4]);
                                     self.accumulate_adjoint(v.wv_var, extract_results[5]);
-                                    self.accumulate_adjoint(v.x_norm_var, extract_results[6]);
+                                    // Route dx_raw to x_raw_var when known;
+                                    // fall back to x_norm_var (legacy
+                                    // routing) when the chain didn't
+                                    // resolve x_raw_var. This keeps the
+                                    // Gap D.1 contract for chains without a
+                                    // trainable RMSNorm (no x_raw_var
+                                    // resolution is performed in that case).
+                                    let x_raw_target =
+                                        v.x_raw_var.unwrap_or(v.x_norm_var);
+                                    self.accumulate_adjoint(x_raw_target, extract_results[6]);
+                                    self.accumulate_adjoint(v.x_norm_var, extract_results[7]);
 
                                     // Gap I step K: standalone RMSNorm
                                     // gamma gradient. The suppressed per-op
@@ -398,26 +421,24 @@ impl AdjointGenerator {
                                     //
                                     // Formula: `dgamma = reduce(y_bar * x / rms)`
                                     // matches `RmsNormGammaBackward`'s
-                                    // lowering.  Note `extract_results[6]`
-                                    // is the kernel's `dx_ptr` write, which
-                                    // is the closed-form `dx_raw` (gradient
-                                    // w.r.t. the pre-RMSNorm input), NOT
-                                    // `dy_norm`.  Using it directly as
-                                    // `y_bar` here is a known semantic
-                                    // mismatch tracked separately — the
-                                    // correct fix requires exposing the
-                                    // kernel's SMEM `dx_norm` intermediate
-                                    // (see `backward_dx_norm_offset`) as
-                                    // an 8th extract.  The per-op AD path
-                                    // in `ad_rules.rs` above is the
-                                    // authoritative numerically-correct
-                                    // path for all non-CSHA models.
+                                    // lowering. Gap I.5 Option-A fix: now
+                                    // uses `extract_results[7]` (= dx_norm,
+                                    // the gradient w.r.t. the RMSNorm
+                                    // OUTPUT), which is exactly `dy_norm` —
+                                    // the semantically correct input for
+                                    // `RmsNormGammaBackward`'s `grad`
+                                    // argument. Previously extract[6]
+                                    // (dx_raw, post-dRMSNorm) was used,
+                                    // producing numerically incorrect
+                                    // dgamma values when the CSHA
+                                    // dispatcher claim fired on programs
+                                    // with trainable gamma.
                                     if let (Some(gamma_var), Some(x_raw_var)) =
                                         (v.norm_weight_var, v.x_raw_var)
                                     {
                                         let dgamma = self.lower_adjoint_expr(
                                             AdjointExpr::RmsNormGammaBackward(
-                                                extract_results[6],
+                                                extract_results[7],
                                                 x_raw_var,
                                                 v.rmsnorm_eps,
                                                 gamma_var,
