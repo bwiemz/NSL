@@ -91,7 +91,23 @@ Formula-driven Low       :  6 tensors (ffn_down)    (middle layers 1–6 × 1 pr
 VeryLow                  :  0 tensors               (fallback for out-of-band generics)
 ```
 
-**Arithmetic check:** middle layers 1-6 contribute 6×4 = 24 attn High + 6×2 = 12 ffn_gate_up Medium + 6×1 = 6 ffn_down Low = 42 formula-driven generics. Kind-overridden total is 32 (9 from layer 0 + 9 from layer 7 + 12 middle-layer norms + 2 embedding-family tensors). 42 + 32 = 74 ✓.
+**Arithmetic check** (verified against `cpdt_fixture_generate.rs`'s calib_small layout: tied embeddings, no biases, SwiGLU FFN, final RMSNorm):
+
+Total tensors: 1 `tok_embeddings.weight` + 8 layers × (4 attn + 2 norms + 3 ffn) + 1 `norm.weight` (final norm) + 0 output (tied) = 1 + 72 + 1 + 0 = **74 ✓** (matches §1.1).
+
+Kind-overridden = **32 = 9 + 9 + 12 + 1 + 1:**
+- 9 — all tensors in layer 0 (FirstOrLast kind): 4 attn + 2 norms + 3 ffn
+- 9 — all tensors in layer 7 (FirstOrLast kind): same
+- 12 — middle-layer norms (layers 1-6 × 2 norms): Norm kind
+- 1 — `tok_embeddings.weight`: Embedding kind
+- 1 — final `norm.weight`: Norm kind
+
+Formula-driven generics = **42 = 24 + 12 + 6:**
+- 24 — middle layers 1-6 × 4 attn projections → High under the retuned thresholds
+- 12 — middle layers 1-6 × 2 ffn projections (gate, up) → Medium
+- 6 — middle layers 1-6 × 1 ffn projection (down) → Low
+
+Tier totals: High = 32 + 24 = 56; Medium = 12; Low = 6; VeryLow = 0. Grand total 56 + 12 + 6 + 0 = **74 ✓**.
 
 VeryLow stays in the enum as the fallback for out-of-band generics (heavily-pruned biases, unusual shapes); rare by design, which matches the tier's name.
 
@@ -117,11 +133,30 @@ Files:
 - `crates/nsl-codegen/src/bin/cpdt_calibrate.rs` — add `--emit-calibration` mode with band-analysis, cross-fixture ordering guard, log-grid K-minimization, structural-limitation guard (35% ceiling), and diagnostic emission.
 - `crates/nsl-codegen/src/bin/cpdt_fixture_generate.rs` — add `--include-medium` flag that writes `calib_medium.safetensors` to a caller-specified path (not the committed fixture dir).
 
-**Acceptance:**
-1. `cargo run --features calibrate --bin cpdt_calibrate -- tests/fixtures/cpdt_calibration/ --emit-calibration` runs, emits `T0/T1/T2/CALIB_K` blocks + per-band diagnostic, exits 0.
-2. The emitted values match §3.1 and §3.2's measured-value pinning within 1% (accounting for grid resolution in K-sweep).
-3. Scorer in-code constants and behavior unchanged; `baseline_heuristic.json` and `expected_weights_present.json` byte-identical before/after.
-4. `cpdt_sensitivity_primitives` (22 tests), `cpdt_sensitivity_snapshot` (1), `cpdt_sensitivity_adversarial` (1), `cpdt_sensitivity_disagreement` (1), `cpdt_tier_agreement` (6) all pass unchanged.
+**Acceptance — explicit two-step command sequence:**
+
+```bash
+# Step 1 — regenerate calib_medium into target/ (not committed).
+cargo run --features calibrate --bin cpdt_fixture_generate -- \
+    --include-medium \
+    --output-dir target/cpdt_calibration/
+
+# Step 2 — compute thresholds + K against the committed corpus plus target/medium.
+cargo run --features calibrate --bin cpdt_calibrate -- \
+    tests/fixtures/cpdt_calibration/ \
+    --medium-dir target/cpdt_calibration/ \
+    --emit-calibration
+```
+
+Acceptance checks:
+
+1. Step 1 writes `target/cpdt_calibration/calib_medium.safetensors` and exits 0. The existing committed fixtures under `tests/fixtures/cpdt_calibration/` are untouched.
+2. Step 2 emits the `T0/T1/T2/CALIB_K` blocks + per-band diagnostic and exits 0. Cross-fixture ordering guard passes. Structural-limitation guard (35% ceiling) passes. The emitted values match §3.1 and §3.2's measured-value pinning within 1% (accounting for K-grid resolution).
+3. If Step 2 is run without Step 1 (i.e., `--medium-dir` points at a non-existent or empty directory), `cpdt_calibrate` exits non-zero with a clear "calib_medium required; run cpdt_fixture_generate --include-medium first" message rather than computing thresholds against an incomplete corpus.
+4. Scorer in-code constants and behavior unchanged; `baseline_heuristic.json` and `expected_weights_present.json` byte-identical before/after Commit 1.
+5. `cpdt_sensitivity_primitives` (22 tests), `cpdt_sensitivity_snapshot` (1), `cpdt_sensitivity_adversarial` (1), `cpdt_sensitivity_disagreement` (1), `cpdt_tier_agreement` (6) all pass unchanged.
+
+The two-step sequence keeps `cpdt_calibrate` focused on calibration — it does not invoke `cpdt_fixture_generate` internally. A future `Makefile` target or `cargo xtask calibrate` alias can chain both steps for CI ergonomics.
 
 ### 4.2 Commit 2 — `feat(cpdt): retune T0/T1/T2 + CALIB_K + bump ANALYSIS_VERSION`
 
@@ -191,22 +226,26 @@ Contrast with the failure modes §2 rejected:
 
 ### 5.3 Phase 2 promotion trigger
 
-The 20% threshold serves two purposes:
+The 20% threshold is a **Phase 1 monitoring range**, not a "current measurement + epsilon" value. Two purposes:
 
-1. **Upper bound on known disagreement.** Current measurement is 15.64%; the 4-point slack accommodates modest corpus variance without triggering re-investigation.
+1. **Upper bound on known disagreement.** Current measurement is 15.64%; 20% is the fixed monitoring ceiling for Phase 1. The difference is headroom for modest corpus variance (fixture resize, addition of one more layer, etc.) without triggering re-investigation.
 2. **Phase 2 urgency signal.** If disagreement on any committed fixture exceeds 20%, Phase 2 is promoted from "scheduled" to "priority" — something about the corpus or the scorer's behavior is worse than the known bottleneck.
 
-A Phase 2 close-out criterion: after spectral-factor integration, measured disagreement must drop below 5% on the full calibration corpus. If it doesn't, Phase 2's first commit's precondition check (geometric mean ≈ 1.0 of spectral factor) is probably failing, and Phase 2 scope expands per the parent spec's §11.4.
+**Rule for future retunes in the Phase 1 era:** do NOT tighten the 20% ceiling to track a lower current measurement. If a future retune on a different corpus measures 10% disagreement, the ceiling stays at 20% until Phase 2 ships. The threshold represents "Phase 1's information-bottleneck monitoring range," not "current-measurement + slack." Tightening the threshold under corpus improvement would give the appearance of stricter discipline but actually creates a ratchet that fires on ordinary corpus variance.
+
+**Phase 2's close-out criterion** is where tightening happens: after spectral-factor integration, measured disagreement must drop below 5% on the full calibration corpus, and invariant #7 returns to the original <5% hard-gate. If Phase 2 can't reach <5%, Phase 2's first-commit precondition check (geometric mean ≈ 1.0 of the spectral factor) is probably failing and scope expands per the parent spec's §11.4.
 
 ### 5.4 The diagnostic test
 
 ```rust
 #[test]
 fn disagreement_source_matches_numel_collision() {
-    // For every disagreeing tensor, there exists an agreeing tensor in the
-    // same fixture with the same numel but a different weights-present tier.
-    // This is the SwiGLU gate_up/down pattern; any disagreement that doesn't
-    // fit this pattern is an unexpected source and should fail the test.
+    // For every disagreeing tensor p (wp-tier != nw-tier), there must exist
+    // a numel-matched sibling q whose weights-present tier is exactly the
+    // tier the nw path put p into. That's the precise collision signature:
+    // the nw path collapsed p into q's tier because q and p produce identical
+    // nw scores (same K × pos / numel). Any disagreement without such a
+    // sibling is an unexpected source and should fail the test.
     let fixtures = [("calib_tiny", 2u32), ("calib_small", 8u32)];
     for (fix, n_layers) in fixtures {
         let wm = WeightMap::load(&fixture(fix)).unwrap();
@@ -218,17 +257,19 @@ fn disagreement_source_matches_numel_collision() {
         for p in &plan.params {
             let pnw = by_name_nw[p.name.as_str()];
             if p.tier == pnw.tier { continue; }
-            // Disagreement found — check the numel-collision pattern.
+            // Disagreement: p's wp-tier differs from p's nw-tier.
+            // Require a numel-matched sibling whose wp-tier IS p's nw-tier.
+            let p_numel = wm.get(&p.name).unwrap().num_elements;
             let has_collision_partner = plan.params.iter().any(|q| {
                 q.name != p.name
-                    && (wm.get(&q.name).unwrap().num_elements
-                        == wm.get(&p.name).unwrap().num_elements)
-                    && q.tier != p.tier
+                    && wm.get(&q.name).unwrap().num_elements == p_numel
+                    && q.tier == pnw.tier
             });
             assert!(has_collision_partner,
-                "disagreement on {} has no numel-collision partner — \
-                 unknown source of disagreement, investigate",
-                p.name);
+                "disagreement on {} (wp={:?}, nw={:?}) has no numel-matched \
+                 sibling with wp-tier == {:?} — unknown source of disagreement, \
+                 investigate",
+                p.name, p.tier, pnw.tier, pnw.tier);
         }
     }
 }
@@ -287,6 +328,7 @@ The invariant's computation and domain remain unchanged; only its institutional 
 | calib_tiny contributes no generic tensors (every tensor kind-overridden) | Certain (by design) | Documented in §3.1 step 4; band computation uses calib_small and calib_medium. |
 | calib_medium not regenerated before running calibration | Medium | `--include-medium` flag + the `--emit-calibration` mode refuse to compute thresholds without calib_medium, exit non-zero. |
 | Regenerated JSONs introduce CRLF noise on Windows | Low | `.gitattributes` + explicit text-format-json write; pattern from Phase 1. |
+| `K=0.0833` drifts on a corpus with different architecture mix (e.g., Mamba without attention/FFN split, or MoE with sparse experts) | Inherent to calibration-corpus-specific values | The retune is calibration-corpus-specific by design; corpus changes require re-running the retune. If §7.1's cross-fixture ordering guard fails on a new corpus, that is the signal to re-calibrate before shipping. |
 
 ## 9. Close-Out Criteria
 
