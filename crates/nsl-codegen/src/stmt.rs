@@ -54,7 +54,7 @@ pub(crate) fn invoke_cpdt_if_enabled(
     use crate::cpdt::{CpdtInput, CpdtMode, run as cpdt_run};
     use crate::cpdt_expert::ExpertConfig;
     use crate::cpdt_joint::JointConfig;
-    use crate::cpdt_precision::PrecisionConfig;
+    use crate::cpdt_tier_apply::PrecisionConfig;
     use crate::cpdt_zero::ModelSize;
     use crate::wggo_overrides::WggoOverrides;
 
