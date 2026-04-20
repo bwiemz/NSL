@@ -699,8 +699,39 @@ impl Compiler<'_> {
         // block_kv (the runtime dispatcher reads sequence length from
         // the tensor shape, not the PTX-baked block_kv).
         let backward_block_kv: i64 = 32;
+        // Backward block_q clamp (fix for 4KB-HtoD ILLEGAL_ADDRESS):
+        //
+        // The Tier C backward PTX is tiled for `block_q` Q rows per CTA
+        // and its phases (q_load, ds_compute, dv_accum, finalize's dq
+        // writeback, csha_hooks_backward's dxn writeback + dx Phase 2)
+        // address HBM buffers with indices up to `block_q * head_dim`
+        // / `block_q * d_model`. When `block_q > seq_len` (the common
+        // case for short toy programs — e2e smoke runs seq_len=32 with
+        // the default block_q=64 from the forward inference config),
+        // the backward HBM writes overflow the gradient output buffers
+        // (which are allocated as `[batch, seq, ...]`), tripping
+        // CUDA_ERROR_ILLEGAL_ADDRESS inside the kernel.
+        //
+        // Clamping to 32 matches the block_kv clamp above and the
+        // T3.3–T3.5 smoke scope; shorter sequences fit in a single CTA
+        // and longer sequences launch `ceil(seq_len/32)` CTAs per
+        // batch*head (via the runtime `grid_x = (seq_len + block_q -
+        // 1) / block_q` calculation in `nsl_flash_attention_csha_*`).
+        // The forward inference PTX still uses the user's
+        // (auto)tuned block_q; only the training / fused-backward PTX
+        // is tiled for 32 rows.
+        //
+        // NOTE: this does not fix bounds checking in the kernel — any
+        // config where the runtime seq_len is not a multiple of 32
+        // would still over-read/write the tail tile. For seq_len that
+        // IS a multiple of 32 (the e2e smoke's 32 qualifies), every
+        // warp covers exactly one valid row and the HBM indices land
+        // in-buffer. Full seq_len bounds-guards in the kernel phases
+        // are a follow-up (documented in the Tier C close-out memory).
+        let backward_block_q: i64 = 32;
         let training_config = crate::flash_attention::FlashAttentionConfig {
             csha: Some(csha_extras),
+            block_q: backward_block_q,
             block_kv: backward_block_kv,
             ..base_config
         };

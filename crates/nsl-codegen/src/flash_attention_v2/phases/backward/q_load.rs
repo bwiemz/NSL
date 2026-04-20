@@ -45,6 +45,22 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
     ));
     ptx.push_str("    cvt.u64.u32 %warp_row, %r0;\n");
 
+    // Seq-len bounds guard: skip HBM load when q_start + warp_row >= seq_len.
+    // Without this, configs where block_q > seq_len (e.g. block_q=64 with
+    // seq_len=32 in the e2e toy program) would read past the end of the
+    // q_proj buffer and fault with CUDA_ERROR_ILLEGAL_ADDRESS. The SMEM
+    // destination cells for these rows are already zeroed by the backward
+    // zero-init phase (which covers the full block_q tile), so skipping
+    // the load is safe — downstream phases only consume rows where the
+    // corresponding accumulator writes were gated by the same seq_len
+    // comparison at finalize time.
+    //   %rd6 = seq_len (from prelude).
+    ptx.push_str("    add.u64 %rd34, %q_start, %warp_row;  // q_row_global\n");
+    ptx.push_str("    setp.ge.u64 %p1, %rd34, %rd6;         // q_row_global >= seq_len?\n");
+    ptx.push_str(&format!(
+        "    @%p1 bra V2_BWD_Q_LOAD_SKIP_{q_tile_iter};\n"
+    ));
+
     // row_idx = batch_idx*(heads*seq) + head_idx*seq + (q_start + warp_row)
     //   %rd5 = heads, %rd6 = seq_len, %rd7 = head_dim (from prelude).
     ptx.push_str("    mul.lo.u64 %rd30, %batch_idx, %rd5;\n");
