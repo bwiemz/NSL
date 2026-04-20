@@ -5,7 +5,8 @@
 use std::path::PathBuf;
 
 use nsl_codegen::cpdt_tier_apply::{
-    compute_tier_agreement, plan_map, plan_map_noweights, PrecisionConfig, Tier,
+    compute_tier_agreement, plan_map, plan_map_noweights, ParamPrecision, PrecisionConfig,
+    PrecisionPlan, Tier,
 };
 use nsl_codegen::weight_aware::WeightMap;
 
@@ -57,24 +58,118 @@ fn tier_agreement_full_on_calib_tiny() {
 
 #[test]
 fn tier_agreement_full_on_calib_small_by_construction() {
-    // On calib_small, overridden tensors land High, generic tensors score
-    // < CALIB_T2 under both paths (CALIB_K/numel also under T2), so both
-    // paths agree on every tensor by construction of the placeholder
-    // constants. If calibration tuning changes this, the assertion here
-    // becomes a canary for the shift.
-    let wm = WeightMap::load(&fixture("calib_small")).unwrap();
-    let cfg = PrecisionConfig {
-        n_layers: 8,
-        ..Default::default()
-    };
-    let plan = plan_map(&wm, &cfg);
-    let plan_nw = plan_map_noweights(&wm, &cfg);
-    let (agree_l, total_l, _, _) = compute_tier_agreement(&plan, &plan_nw);
-    assert_eq!(
-        agree_l, total_l,
-        "calibration currently produces identical tier sets; \
-         recalibration will break this — update test when threshold tuning lands"
+    // Phase 1 retune (2026-04-19): the previous assertion
+    // (`agree_l == total_l`) held under the degenerate binary distribution.
+    // Under the retuned constants, calib_small is effectively 2-tier (H + M)
+    // because the pooled-across-fixtures thresholds are dominated by
+    // calib_medium's larger tensors; calib_small's ffn_gate_up scores land
+    // above T0 and all generic attn+ffn_gate_up go High, leaving ffn_down as
+    // the sole Medium population. The test now asserts corpus-wide primary-
+    // tier non-degeneracy (§6 rule) plus per-fixture sanity; see spec §4.2.
+    let wm_small = WeightMap::load(&fixture("calib_small")).unwrap();
+    let plan_small = plan_map(
+        &wm_small,
+        &PrecisionConfig { n_layers: 8, ..Default::default() },
     );
+    let counts_small = tier_counts_of(&plan_small);
+
+    // Per-fixture sanity on calib_small: at least one primary tier populated.
+    // Catches the "all generics landed VeryLow" degeneracy that Phase 1 shipped.
+    let small_primary_count =
+        counts_small.high + counts_small.medium + counts_small.low;
+    assert!(
+        small_primary_count > 0,
+        "calib_small has no primary-tier assignments (degenerate distribution)"
+    );
+
+    // Expected under pooled thresholds at K≈0.060 (per spec §3.3):
+    //   High = 68, Medium = 6, Low = 0, VeryLow = 0.
+    // Floors use slack so minor fixture perturbations don't break the test.
+    assert!(
+        counts_small.high >= 60,
+        "H underpopulated on calib_small: {}",
+        counts_small.high
+    );
+    assert!(
+        counts_small.medium >= 4,
+        "M underpopulated on calib_small: {}",
+        counts_small.medium
+    );
+    assert_eq!(
+        counts_small.very_low, 0,
+        "VeryLow unexpectedly populated on calib_small: {}",
+        counts_small.very_low
+    );
+
+    // Corpus-wide primary-tier non-degeneracy (§6 rule). calib_small alone
+    // doesn't populate Low; calib_medium does. calib_medium is regen-at-test-
+    // time — skip the corpus union check if the regenerated fixture is absent.
+    // CI runs that regenerate calib_medium first catch the full rule; local
+    // developer runs without regen see only the per-fixture sanity check.
+    if let Some(plan_medium) = try_load_plan_medium() {
+        let counts_medium = tier_counts_of(&plan_medium);
+        let union_populated = |s: usize, m: usize| -> bool { s > 0 || m > 0 };
+        assert!(
+            union_populated(counts_small.high, counts_medium.high),
+            "primary tier High not populated across corpus"
+        );
+        assert!(
+            union_populated(counts_small.medium, counts_medium.medium),
+            "primary tier Medium not populated across corpus"
+        );
+        assert!(
+            union_populated(counts_small.low, counts_medium.low),
+            "primary tier Low not populated across corpus; \
+             calib_small: {}, calib_medium: {}",
+            counts_small.low,
+            counts_medium.low
+        );
+    } else {
+        eprintln!(
+            "note: calib_medium not present at target/cpdt_calibration/; \
+             corpus-wide primary-tier check skipped. To enable, run \
+             cpdt_fixture_generate --include-medium \
+             --output-dir target/cpdt_calibration/"
+        );
+    }
+}
+
+#[derive(Default)]
+struct TierCounts {
+    high: usize,
+    medium: usize,
+    low: usize,
+    very_low: usize,
+}
+
+fn tier_counts_of(plan: &PrecisionPlan) -> TierCounts {
+    let mut c = TierCounts::default();
+    for p in &plan.params {
+        match p.tier {
+            Tier::High => c.high += 1,
+            Tier::Medium => c.medium += 1,
+            Tier::Low => c.low += 1,
+            Tier::VeryLow => c.very_low += 1,
+        }
+    }
+    c
+}
+
+/// Load calib_medium from the regen-at-test-time directory if present.
+/// Returns `None` if the file is absent so the canary test can skip the
+/// corpus-union check gracefully.
+fn try_load_plan_medium() -> Option<PrecisionPlan> {
+    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/cpdt_calibration/calib_medium.safetensors");
+    if !p.is_file() {
+        return None;
+    }
+    let wm = WeightMap::load(&p).ok()?;
+    let plan = plan_map(
+        &wm,
+        &PrecisionConfig { n_layers: 16, ..Default::default() },
+    );
+    Some(plan)
 }
 
 #[test]
@@ -106,7 +201,7 @@ fn tier_agreement_skips_zero_byte_tensors() {
     // Construct two tiny plans where one shared tensor has param_bytes == 0;
     // the zero-byte tensor must not contribute to the totals regardless of
     // whether its tiers agree.
-    use nsl_codegen::cpdt_tier_apply::{OptimPrecision, ParamPrecision, PrecisionPlan};
+    use nsl_codegen::cpdt_tier_apply::OptimPrecision;
 
     let shared_nonzero = ParamPrecision {
         name: "real.weight".to_string(),
@@ -169,4 +264,50 @@ fn plan_map_noweights_applies_embedding_stochastic_rounding_flag() {
         "embeddings should inherit stochastic rounding when the config enables it, \
          even on the no-weights path"
     );
+}
+
+#[test]
+fn disagreement_source_matches_numel_collision() {
+    // Spec §5.4: for every tensor p whose weights-present tier differs from
+    // its no-weights tier, there must exist a numel-matched sibling q whose
+    // weights-present tier is exactly the tier the nw path put p into. That's
+    // the precise collision signature (SwiGLU gate_up/down at d_model × d_ffn).
+    // Any disagreement without such a sibling is an unexpected source and
+    // should fail the test.
+    let fixtures = [("calib_tiny", 2u32), ("calib_small", 8u32)];
+    for (fix, n_layers) in fixtures {
+        let wm = WeightMap::load(&fixture(fix)).unwrap();
+        let cfg = PrecisionConfig {
+            n_layers,
+            ..Default::default()
+        };
+        let plan = plan_map(&wm, &cfg);
+        let plan_nw = plan_map_noweights(&wm, &cfg);
+        let by_name_nw: std::collections::HashMap<&str, &ParamPrecision> = plan_nw
+            .params
+            .iter()
+            .map(|p| (p.name.as_str(), p))
+            .collect();
+        for p in &plan.params {
+            let pnw = by_name_nw
+                .get(p.name.as_str())
+                .unwrap_or_else(|| panic!("{fix}: missing nw plan entry for {}", p.name));
+            if p.tier == pnw.tier {
+                continue;
+            }
+            let p_numel = wm.get(&p.name).unwrap().num_elements;
+            let has_collision_partner = plan.params.iter().any(|q| {
+                q.name != p.name
+                    && wm.get(&q.name).unwrap().num_elements == p_numel
+                    && q.tier == pnw.tier
+            });
+            assert!(
+                has_collision_partner,
+                "{fix}: disagreement on {} (wp={:?}, nw={:?}) has no \
+                 numel-matched sibling with wp-tier == {:?} — unknown source \
+                 of disagreement, investigate",
+                p.name, p.tier, pnw.tier, pnw.tier
+            );
+        }
+    }
 }

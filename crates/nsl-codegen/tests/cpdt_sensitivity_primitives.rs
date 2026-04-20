@@ -7,8 +7,12 @@ use nsl_codegen::cpdt_sensitivity::{
 use nsl_codegen::cpdt_tier_apply::Tier;
 
 #[test]
-fn analysis_version_pinned_to_one() {
-    assert_eq!(ANALYSIS_VERSION, 1);
+fn analysis_version_pinned_to_two_after_retune() {
+    // Phase 1 shipped with ANALYSIS_VERSION=1; the 2026-04-19 calibration
+    // retune bumped it to 2 per invariant #1 (any tier-boundary change
+    // requires a version bump). Future formula/factor/tier-boundary edits
+    // must bump again and update this pin.
+    assert_eq!(ANALYSIS_VERSION, 2);
 }
 
 // --- position_criticality ---
