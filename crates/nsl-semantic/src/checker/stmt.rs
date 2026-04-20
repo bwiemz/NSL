@@ -352,7 +352,10 @@ impl<'a> TypeChecker<'a> {
                         // CPDT: @cpdt decorator validation. Phase 1 requires
                         // exactly one @cpdt decorator per program; a second
                         // occurrence emits a diagnostic error referencing
-                        // both spans. See
+                        // both spans. Only the FIRST decorator runs through
+                        // validate_cpdt_decorator — running it on the
+                        // duplicate would produce noise alongside the
+                        // single-instance error. See
                         // docs/superpowers/specs/2026-04-20-cpdt-weight-aware-opt-out-design.md.
                         if dname == "cpdt" {
                             if let Some(prev_span) = self.cpdt_decorator_span {
@@ -365,15 +368,15 @@ impl<'a> TypeChecker<'a> {
                                 );
                             } else {
                                 self.cpdt_decorator_span = Some(deco.span);
+                                let resolve = |s: nsl_ast::Symbol| -> String {
+                                    self.interner.resolve(s.0).unwrap_or("").to_string()
+                                };
+                                crate::cpdt::validate_cpdt_decorator(
+                                    deco,
+                                    &resolve,
+                                    &mut self.diagnostics,
+                                );
                             }
-                            let resolve = |s: nsl_ast::Symbol| -> String {
-                                self.interner.resolve(s.0).unwrap_or("").to_string()
-                            };
-                            crate::cpdt::validate_cpdt_decorator(
-                                deco,
-                                &resolve,
-                                &mut self.diagnostics,
-                            );
                         }
 
                         // CEP: @cep_prune / @cep_search decorator validation
