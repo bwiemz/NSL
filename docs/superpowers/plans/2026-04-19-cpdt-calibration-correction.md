@@ -580,43 +580,49 @@ cargo run --features calibrate --bin cpdt_calibrate -- \
 
 Expected: prints "collected N records across fixtures" (N matches 21+74+calib_medium_count; calib_medium has 16 layers × 9 per-layer tensors + 1 embed + 1 output (untied) + 1 final norm + any biases per `MixedHalf` schedule = exercise says ~149, but exact count is not asserted here) and `thresholds: T0 = 1.4525e-7  T1 = 5.6755e-8  T2 = 1.9074e-9`. If the ordering guard fires, investigate before proceeding.
 
-### Task 1.6: K minimization + structural-limitation guard + diagnostic emission
+### Task 1.6: K via plateau-midpoint + structural-limitation guard + diagnostic emission
 
 **Files:**
 - Modify: `crates/nsl-codegen/src/bin/cpdt_calibrate.rs`
 
-- [ ] **Step 1: Add the K-minimization helper.**
+This task was redirected during pre-dispatch: the original pure-corpus-minimum K (0.046) produces 26.5% disagreement on calib_small specifically, driven by the SwiGLU numel-collision. The spec now specifies **plateau-midpoint-under-per-fixture-constraint**: pick the log-midpoint of the widest contiguous K-range where both calib_small and calib_medium stay under a 20% monitoring threshold. See spec §3.2.
+
+- [ ] **Step 1: Add per-fixture disagreement + plateau-midpoint helpers.**
 
 Add after `compute_thresholds`:
 
 ```rust
-/// Parameter-weighted disagreement at a given K under the emitted thresholds.
+/// Tier discriminator: u8 for equality comparison without depending on Tier's Hash.
+#[inline]
+fn tier_of_u8(score: f64, t0: f64, t1: f64, t2: f64) -> u8 {
+    if score > t0 { 3 }       // High
+    else if score > t1 { 2 }  // Medium
+    else if score > t2 { 1 }  // Low
+    else { 0 }                // VeryLow
+}
+
+/// Per-fixture parameter-weighted disagreement at a given K.
 /// Kind-overridden tensors agree trivially (both paths produce Tier::High);
-/// count them as "agree" to keep the metric comparable to
-/// `cpdt_sensitivity_disagreement`.
-fn disagreement_at(
+/// they contribute to `total` so the denominator matches the test harness,
+/// but are never counted as disagreeing.
+fn disagreement_per_fixture(
     records: &[TensorRecord],
+    fixture: &str,
     k: f64,
     t0: f64,
     t1: f64,
     t2: f64,
 ) -> f64 {
-    fn tier_of(score: f64, t0: f64, t1: f64, t2: f64) -> u8 {
-        // Encode as u8 for equality comparison without depending on Tier's Hash.
-        if score > t0 { 3 }       // High
-        else if score > t1 { 2 }  // Medium
-        else if score > t2 { 1 }  // Low
-        else { 0 }                // VeryLow
-    }
     let mut total: u64 = 0;
     let mut disagree: u64 = 0;
     for r in records {
+        if r.fixture != fixture { continue; }
         if r.numel == 0 { continue; }
         total += r.numel as u64;
         if r.overridden { continue; }
         let s_nw = k * r.pos / (r.numel.max(1) as f64);
-        let t_wp = tier_of(r.wp_score, t0, t1, t2);
-        let t_nw = tier_of(s_nw, t0, t1, t2);
+        let t_wp = tier_of_u8(r.wp_score, t0, t1, t2);
+        let t_nw = tier_of_u8(s_nw, t0, t1, t2);
         if t_wp != t_nw {
             disagree += r.numel as u64;
         }
@@ -624,65 +630,179 @@ fn disagreement_at(
     if total == 0 { 0.0 } else { disagree as f64 / total as f64 }
 }
 
-fn minimize_calib_k(
+/// Corpus-wide disagreement (pooled across all fixtures in `records`).
+fn disagreement_corpus(records: &[TensorRecord], k: f64, t0: f64, t1: f64, t2: f64) -> f64 {
+    let mut total: u64 = 0;
+    let mut disagree: u64 = 0;
+    for r in records {
+        if r.numel == 0 { continue; }
+        total += r.numel as u64;
+        if r.overridden { continue; }
+        let s_nw = k * r.pos / (r.numel.max(1) as f64);
+        let t_wp = tier_of_u8(r.wp_score, t0, t1, t2);
+        let t_nw = tier_of_u8(s_nw, t0, t1, t2);
+        if t_wp != t_nw {
+            disagree += r.numel as u64;
+        }
+    }
+    if total == 0 { 0.0 } else { disagree as f64 / total as f64 }
+}
+
+/// Plateau-midpoint-under-per-fixture-constraint selector.
+///
+/// Per spec §3.2: find the longest contiguous K-range (on a log-spaced grid)
+/// where *every* fixture's per-fixture disagreement is at or below
+/// `monitoring_threshold`. Return the log-midpoint of that range and its
+/// per-fixture disagreement values at the midpoint.
+///
+/// If no K satisfies the constraint for all fixtures, return
+/// `Err(diagnostic)` for the caller's structural-limitation guard to emit.
+fn select_calib_k_by_plateau(
     records: &[TensorRecord],
     t0: f64,
     t1: f64,
     t2: f64,
-) -> (f64, f64) {
-    // Log-spaced grid from 1e-6 to 1.0 (6 decades, 600 points → resolution ~2%).
-    let mut best_k = 0.0;
-    let mut best_d = f64::INFINITY;
-    let mut tied_ks: Vec<f64> = Vec::new();
-    for i in 0..600 {
-        let lnk = -6.0 * std::f64::consts::LN_10 + (i as f64 / 100.0) * std::f64::consts::LN_10;
-        let k = lnk.exp();
-        let d = disagreement_at(records, k, t0, t1, t2);
-        if d < best_d - 1e-12 {
-            best_d = d;
-            best_k = k;
-            tied_ks.clear();
-            tied_ks.push(k);
-        } else if (d - best_d).abs() < 1e-12 {
-            tied_ks.push(k);
+    monitoring_threshold: f64,
+) -> Result<PlateauResult, PlateauError> {
+    // Log-spaced grid: 10^-6 to 10^0 in 0.01-decade steps → 601 points,
+    // ~2.33% multiplicative step.
+    const N_POINTS: usize = 601;
+    let mut grid: Vec<f64> = Vec::with_capacity(N_POINTS);
+    for i in 0..N_POINTS {
+        let lnk = (-6.0 + (i as f64) / 100.0) * std::f64::consts::LN_10;
+        grid.push(lnk.exp());
+    }
+
+    // Per-point per-fixture disagreement.
+    let fixtures: std::collections::BTreeSet<String> =
+        records.iter().map(|r| r.fixture.clone()).collect();
+    let mut feasible: Vec<bool> = Vec::with_capacity(N_POINTS);
+    for &k in &grid {
+        let ok = fixtures.iter().all(|f| {
+            disagreement_per_fixture(records, f, k, t0, t1, t2) <= monitoring_threshold
+        });
+        feasible.push(ok);
+    }
+
+    // Longest contiguous run of true.
+    let mut best_lo: Option<usize> = None;
+    let mut best_hi: Option<usize> = None;
+    let mut cur_lo: Option<usize> = None;
+    for (i, &ok) in feasible.iter().enumerate() {
+        if ok {
+            if cur_lo.is_none() { cur_lo = Some(i); }
+            let lo = cur_lo.unwrap();
+            let run_len = i - lo + 1;
+            let best_len = match (best_lo, best_hi) {
+                (Some(l), Some(h)) => h - l + 1,
+                _ => 0,
+            };
+            if run_len > best_len {
+                best_lo = Some(lo);
+                best_hi = Some(i);
+            }
+        } else {
+            cur_lo = None;
         }
     }
-    // Break ties toward the log-midpoint of the plateau for robustness.
-    if tied_ks.len() > 1 {
-        let lo = tied_ks.iter().cloned().fold(f64::INFINITY, f64::min);
-        let hi = tied_ks.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-        best_k = (lo * hi).sqrt();
+
+    let (lo, hi) = match (best_lo, best_hi) {
+        (Some(l), Some(h)) => (l, h),
+        _ => {
+            // No feasible point — emit per-fixture best-found disagreements.
+            let best_k_per_fixture: Vec<(String, f64, f64)> = fixtures
+                .iter()
+                .map(|f| {
+                    let (bk, bd) = grid
+                        .iter()
+                        .map(|&k| (k, disagreement_per_fixture(records, f, k, t0, t1, t2)))
+                        .min_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+                        .unwrap();
+                    (f.clone(), bk, bd)
+                })
+                .collect();
+            return Err(PlateauError {
+                monitoring_threshold,
+                per_fixture_best: best_k_per_fixture,
+            });
+        }
+    };
+
+    let plateau_start = grid[lo];
+    let plateau_end = grid[hi];
+    let k_mid = (plateau_start * plateau_end).sqrt();
+    let mut per_fixture: Vec<(String, f64)> = Vec::new();
+    for f in &fixtures {
+        per_fixture.push((
+            f.clone(),
+            disagreement_per_fixture(records, f, k_mid, t0, t1, t2),
+        ));
     }
-    (best_k, best_d)
+    let corpus = disagreement_corpus(records, k_mid, t0, t1, t2);
+    Ok(PlateauResult {
+        k: k_mid,
+        plateau_start,
+        plateau_end,
+        per_fixture_disagreement: per_fixture,
+        corpus_disagreement: corpus,
+    })
+}
+
+struct PlateauResult {
+    k: f64,
+    plateau_start: f64,
+    plateau_end: f64,
+    per_fixture_disagreement: Vec<(String, f64)>,
+    corpus_disagreement: f64,
+}
+
+struct PlateauError {
+    monitoring_threshold: f64,
+    per_fixture_best: Vec<(String, f64, f64)>, // (fixture, best_k, best_disagreement)
 }
 ```
 
-- [ ] **Step 2: Extend `run_emit_calibration` with minimization + guard + diagnostic emission.**
+- [ ] **Step 2: Extend `run_emit_calibration` with plateau selection + guard + diagnostic emission.**
 
 Replace the `// K minimization ...` comment at the end of `run_emit_calibration` with:
 
 ```rust
-    let (k, disagreement) = minimize_calib_k(&records, t0, t1, t2);
-    eprintln!(
-        "minimization: CALIB_K = {k:.4e}  residual disagreement = {:.4}",
-        disagreement
-    );
+    const MONITORING_THRESHOLD: f64 = 0.20; // spec §5.3
 
-    // Structural-limitation guard — spec §3.2.
-    const STRUCTURAL_LIMIT: f64 = 0.35;
-    if disagreement > STRUCTURAL_LIMIT {
-        eprintln!(
-            "error: minimum disagreement {:.4} exceeds structural limit {:.2}. \
-             This indicates an unknown source of disagreement beyond the known \
-             numel-collision pattern. Investigate before shipping.",
-            disagreement, STRUCTURAL_LIMIT
-        );
-        std::process::exit(3);
+    let plateau = match select_calib_k_by_plateau(&records, t0, t1, t2, MONITORING_THRESHOLD) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!(
+                "error: no K satisfies per-fixture disagreement <= {:.2} across all fixtures.",
+                e.monitoring_threshold
+            );
+            eprintln!("best-found K per fixture:");
+            for (f, bk, bd) in &e.per_fixture_best {
+                eprintln!("  {f}: K={bk:.4e}  disagreement={:.4}", bd);
+            }
+            eprintln!(
+                "This indicates an unknown source of disagreement beyond the known \
+                 numel-collision pattern, or a corpus that needs re-calibration. \
+                 Investigate before shipping."
+            );
+            std::process::exit(3);
+        }
+    };
+
+    eprintln!(
+        "plateau: [{:.4e}, {:.4e}]  log-midpoint CALIB_K = {:.4e}",
+        plateau.plateau_start, plateau.plateau_end, plateau.k
+    );
+    for (f, d) in &plateau.per_fixture_disagreement {
+        eprintln!("  {f} disagreement at K: {:.4}", d);
     }
+    eprintln!("  corpus-wide disagreement at K: {:.4}", plateau.corpus_disagreement);
+
+    let k = plateau.k;
 
     // Per-band diagnostic: show representative middle-layer tensor tiers under
-    // the emitted (T0, T1, T2, K). Lets reviewers verify the 15.64% residual
-    // traces to the ffn_gate_up/down numel collision rather than unknown drift.
+    // the emitted (T0, T1, T2, K). Lets reviewers verify disagreements trace
+    // to the ffn_gate_up/down numel collision rather than unknown drift.
     println!();
     println!("=== Per-band diagnostic (middle-layer median tensors) ===");
     println!("| Band          | s_wp     | wp tier | s_nw     | nw tier | agree |");
@@ -736,43 +856,54 @@ Expected: clean build.
 cargo run --features calibrate --bin cpdt_calibrate -- \
     tests/fixtures/cpdt_calibration/ \
     --medium-dir target/cpdt_calibration/ \
-    --emit-calibration 2>&1 | tail -25
+    --emit-calibration 2>&1 | tail -30
 ```
 
-Expected output (exact numbers may vary by <1% due to grid quantization):
+Expected output (exact numbers may vary by ~2% due to grid quantization):
 
-```
+```text
 collected <N> records across fixtures
-thresholds: T0 = 1.4525e-7  T1 = 5.6755e-8  T2 = 1.9074e-9
-minimization: CALIB_K = 8.33e-2  residual disagreement = 0.1564
+thresholds: T0 = 6.1056e-8  T1 = 2.2324e-8  T2 = 7.2557e-10
+plateau: [~5.7e-2, ~6.4e-2]  log-midpoint CALIB_K = ~6.0e-2
+  calib_tiny disagreement at K: 0.0000
+  calib_small disagreement at K: ~0.1591
+  calib_medium disagreement at K: ~0.0251
+  corpus-wide disagreement at K: ~0.0376
 
 === Per-band diagnostic (middle-layer median tensors) ===
 | Band          | s_wp     | wp tier | s_nw     | nw tier | agree |
 | ------------- | -------- | ------- | -------- | ------- | ----- |
-| attn_qkvo     | 2.59e-07 | high    | 1.93e-07 | high    | yes |
-| ffn_gate_up   | 7.44e-08 | medium  | 5.53e-08 | low     | no  |
-| ffn_down      | 3.97e-08 | low     | 5.53e-08 | low     | yes |
+| attn_qkvo     | ~4.2e-08 | medium  | ~4.4e-08 | medium  | yes |
+| ffn_gate_up   | ~1.05e-08| low     | ~1.1e-08 | low     | yes |
+| ffn_down      | ~5.3e-09 | low     | ~1.1e-08 | low     | yes |
 
 pub const ANALYSIS_VERSION: u32 = 2;
-pub const CALIB_K:     f64 = 8.333333e-02;
-pub const CALIB_T0:    f64 = 1.452480e-07;
-pub const CALIB_T1:    f64 = 5.675521e-08;
-pub const CALIB_T2:    f64 = 1.907367e-09;
+pub const CALIB_K:     f64 = ~6.0e-02;
+pub const CALIB_T0:    f64 = 6.105600e-08;
+pub const CALIB_T1:    f64 = 2.232400e-08;
+pub const CALIB_T2:    f64 = 7.255700e-10;
 pub const CALIB_ALPHA: f64 = 0.3;
 ```
 
-- [ ] **Step 4: Verify spec pinning within 1%.**
+(The per-band diagnostic's middle-layer median scores come from calib_medium, which dominates the middle-layer tensor count. calib_medium's medians all agree between wp and nw paths at the plateau midpoint; calib_small's middle-layer scores would show the numel-collision disagreement but are not the median across the pooled set.)
 
-Spec §3.1/§3.2 pins: T0=1.4525e-7, T1=5.6755e-8, T2=1.9074e-9, K=8.33e-2, disagreement=15.64%.
+- [ ] **Step 4: Verify spec pinning within tolerance.**
+
+Spec §3.1/§3.2 pins: T0=6.1056e-8, T1=2.2324e-8, T2=7.2557e-10, plateau ≈ [0.057, 0.064], K ≈ 0.060.
 
 Verify:
-- T0 deviates from 1.4525e-7 by <1%: `|emitted - 1.4525e-7| / 1.4525e-7 < 0.01`.
-- T1 deviates from 5.6755e-8 by <1%.
-- T2 deviates from 1.9074e-9 by <1%.
-- K deviates from 8.33e-2 by <2% (grid resolution is ~2%).
-- Disagreement is 0.15-0.17 range (one-band-mismatch floor).
 
-If any constant deviates more, investigate before proceeding — spec values came from the same fixture set; divergence indicates a computation bug.
+- `T0` emitted within 1% of 6.1056e-8.
+- `T1` emitted within 1% of 2.2324e-8.
+- `T2` emitted within 1% of 7.2557e-10.
+- `plateau_start` within ~2% of 0.057.
+- `plateau_end` within ~2% of 0.064.
+- Emitted `K` within ~2% of 0.060 (log-midpoint, grid-dependent).
+- `calib_small` disagreement at K in range [0.15, 0.17].
+- `calib_medium` disagreement at K in range [0.02, 0.03].
+- `corpus-wide` disagreement at K below 0.05.
+
+If any constant deviates more, investigate before proceeding — spec values came from the same fixture set and the same algorithm; divergence indicates a computation bug.
 
 ### Task 1.7: Regression-test the default path + document the flag
 
@@ -1060,48 +1191,85 @@ use nsl_codegen::cpdt_tier_apply::{
 
 - [ ] **Step 2: Find the existing `tier_agreement_full_on_calib_small_by_construction` test.**
 
-Around line 62-82 in `cpdt_tier_agreement.rs`. Replace the whole function body with:
+Around line 62-82 in `cpdt_tier_agreement.rs`. Replace the whole function body with the new **corpus-wide primary-tier non-degeneracy + per-fixture sanity** form from spec §4.2:
 
 ```rust
 #[test]
 fn tier_agreement_full_on_calib_small_by_construction() {
     // Phase 1 retune (2026-04-19): the previous assertion
     // (`agree_l == total_l`) held under the degenerate binary distribution.
-    // Under the retuned constants, calib_small produces a non-degenerate
-    // 3-tier distribution on generic tensors (attn → High, ffn_gate_up →
-    // Medium, ffn_down → Low); the no-weights path cannot match on ffn_down
-    // because it shares numel with ffn_gate_up (spec §1.1). The test now
-    // asserts the expected tier *counts* directly — §4.2 of the retune spec.
-    let wm = WeightMap::load(&fixture("calib_small")).unwrap();
-    let cfg = PrecisionConfig {
-        n_layers: 8,
-        ..Default::default()
-    };
-    let plan = plan_map(&wm, &cfg);
-    let counts = tier_counts_of(&plan);
-    // High: 32 kind-overridden + 24 formula-driven attn QKVO = 56; floor 50.
-    assert!(
-        counts.high >= 50,
-        "High underpopulated on calib_small; expected >=50, got {}",
-        counts.high
+    // Under the retuned constants, calib_small is effectively 2-tier (H + M)
+    // because the pooled-across-fixtures thresholds are dominated by
+    // calib_medium's larger tensors; calib_small's ffn_gate_up scores land
+    // above T0 and all generic attn+ffn_gate_up go High, leaving ffn_down as
+    // the sole Medium population. The test now asserts corpus-wide primary-
+    // tier non-degeneracy (§6 rule) plus per-fixture sanity; see spec §4.2.
+    let wm_small = WeightMap::load(&fixture("calib_small")).unwrap();
+    let plan_small = plan_map(
+        &wm_small,
+        &PrecisionConfig { n_layers: 8, ..Default::default() },
     );
-    // Medium: 6 middle layers × 2 ffn_gate_up projections = 12; floor 8.
+    let counts_small = tier_counts_of(&plan_small);
+
+    // Per-fixture sanity on calib_small: at least one primary tier populated.
+    // Catches the "all generics landed VeryLow" degeneracy that Phase 1 shipped.
+    let small_primary_count =
+        counts_small.high + counts_small.medium + counts_small.low;
     assert!(
-        counts.medium >= 8,
-        "Medium underpopulated on calib_small; expected >=8, got {}",
-        counts.medium
+        small_primary_count > 0,
+        "calib_small has no primary-tier assignments (degenerate distribution)"
     );
-    // Low: 6 middle layers × 1 ffn_down projection = 6; floor 4.
+
+    // Expected under pooled thresholds at K≈0.060 (per spec §3.3):
+    //   High = 68, Medium = 6, Low = 0, VeryLow = 0.
+    // Floors use slack so minor fixture perturbations don't break the test.
     assert!(
-        counts.low >= 4,
-        "Low underpopulated on calib_small; expected >=4, got {}",
-        counts.low
+        counts_small.high >= 60,
+        "H underpopulated on calib_small: {}",
+        counts_small.high
     );
-    // VeryLow: documented fallback per spec §3.3; zero on calib_small.
+    assert!(
+        counts_small.medium >= 4,
+        "M underpopulated on calib_small: {}",
+        counts_small.medium
+    );
     assert_eq!(
-        counts.very_low, 0,
-        "VeryLow unexpectedly populated on calib_small"
+        counts_small.very_low, 0,
+        "VeryLow unexpectedly populated on calib_small: {}",
+        counts_small.very_low
     );
+
+    // Corpus-wide primary-tier non-degeneracy (§6 rule). calib_small alone
+    // doesn't populate Low; calib_medium does. calib_medium is regen-at-test-
+    // time — skip the corpus union check if the regenerated fixture is absent.
+    // CI runs that regenerate calib_medium first catch the full rule; local
+    // developer runs without regen see only the per-fixture sanity check.
+    if let Some(plan_medium) = try_load_plan_medium() {
+        let counts_medium = tier_counts_of(&plan_medium);
+        let union_populated = |s: usize, m: usize| -> bool { s > 0 || m > 0 };
+        assert!(
+            union_populated(counts_small.high, counts_medium.high),
+            "primary tier High not populated across corpus"
+        );
+        assert!(
+            union_populated(counts_small.medium, counts_medium.medium),
+            "primary tier Medium not populated across corpus"
+        );
+        assert!(
+            union_populated(counts_small.low, counts_medium.low),
+            "primary tier Low not populated across corpus; \
+             calib_small: {}, calib_medium: {}",
+            counts_small.low,
+            counts_medium.low
+        );
+    } else {
+        eprintln!(
+            "note: calib_medium not present at target/cpdt_calibration/; \
+             corpus-wide primary-tier check skipped. To enable, run \
+             cpdt_fixture_generate --include-medium \
+             --output-dir target/cpdt_calibration/"
+        );
+    }
 }
 
 #[derive(Default)]
@@ -1124,9 +1292,26 @@ fn tier_counts_of(plan: &PrecisionPlan) -> TierCounts {
     }
     c
 }
+
+/// Load calib_medium from the regen-at-test-time directory if present.
+/// Returns `None` if the file is absent so the canary test can skip the
+/// corpus-union check gracefully.
+fn try_load_plan_medium() -> Option<PrecisionPlan> {
+    let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/cpdt_calibration/calib_medium.safetensors");
+    if !p.is_file() {
+        return None;
+    }
+    let wm = WeightMap::load(&p).ok()?;
+    let plan = plan_map(
+        &wm,
+        &PrecisionConfig { n_layers: 16, ..Default::default() },
+    );
+    Some(plan)
+}
 ```
 
-The existing imports (`plan_map`, `PrecisionConfig`, `Tier`, `WeightMap`, the `fixture()` helper) are already in scope at the top of the file.
+The existing imports (`plan_map`, `PrecisionConfig`, `Tier`, `WeightMap`, the `fixture()` helper, `PathBuf`) are already in scope. After Step 1's import additions, `ParamPrecision` and `PrecisionPlan` are also in scope.
 
 - [ ] **Step 3: Build + run just this test.**
 
