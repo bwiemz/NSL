@@ -235,29 +235,60 @@ fn is_first_or_last_layer(layer: Option<u32>, n_layers: u32) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Validation pass against AppliedPlan (called by cpdt::run before scoring)
+// Validation pass against AppliedPlan (called from invoke_cpdt_if_enabled)
 //
-// Phase 1 Commit 1 ships a stub; Commit 5 fills in the body after confirming
-// the AppliedLayer weight-metadata surface.
+// Phase 1 ships layer-prefix validation only: catches "wrong checkpoint
+// entirely" at plan-time by asserting every hierarchical layer (blocks.N /
+// layers.N / h.N) has at least one matching tensor in the WeightMap.
+// Per-tensor shape/dtype validation is deferred to Phase 2 where the
+// spectral-factor wiring provides per-tensor metadata. Until then, the
+// MissingTensor / ShapeMismatch / DtypeMismatch variants are unused —
+// preserved in the enum so Phase 2 can activate them without schema drift.
+// Design: docs/superpowers/specs/2026-04-20-cpdt-validate-body-design.md
 // ---------------------------------------------------------------------------
 
 use crate::weight_aware::WeightMap;
 use crate::wggo_apply::AppliedPlan;
 
+/// Max number of unique tensor-name prefixes shown in the
+/// `LayersMissing` error's WeightMap summary. Keeps the error message
+/// diagnostic without dumping hundreds of tensor names on a large checkpoint.
+const PREFIX_SUMMARY_MAX: usize = 8;
+
 #[derive(Debug)]
 pub enum ValidationError {
+    /// Phase 2: a specific tensor declared by the model is absent from
+    /// the weight map. Unused in Phase 1.
     MissingTensor {
         tensor_name: String,
     },
+    /// Phase 2: a tensor's declared shape doesn't match the weight map.
+    /// Unused in Phase 1.
     ShapeMismatch {
         tensor_name: String,
         expected: Vec<usize>,
         actual: Vec<usize>,
     },
+    /// Phase 2: a tensor's declared dtype doesn't match the weight map.
+    /// Unused in Phase 1.
     DtypeMismatch {
         tensor_name: String,
         expected: String,
         actual: String,
+    },
+    /// Phase 1 (active): one or more AppliedPlan layers have no matching
+    /// tensors in the WeightMap. Aggregates every missing layer plus a
+    /// summary of the WeightMap's top-level tensor prefixes so the user
+    /// can diagnose format mismatches (HuggingFace vs NSL-native, etc.).
+    LayersMissing {
+        /// Layer names whose prefix-match returned zero tensors.
+        missing: Vec<String>,
+        /// Total number of hierarchical layers checked (i.e. non-"other").
+        total_layers_checked: usize,
+        /// Deduplicated, sorted, up-to-`PREFIX_SUMMARY_MAX` entries.
+        weight_map_prefix_summary: Vec<String>,
+        /// Total tensors in the WeightMap (for the error message's summary line).
+        weight_map_total_tensors: usize,
     },
 }
 
@@ -276,19 +307,125 @@ impl std::fmt::Display for ValidationError {
                 f,
                 "CPDT weight validation: tensor `{tensor_name}` dtype mismatch — expected {expected}, got {actual}",
             ),
+            Self::LayersMissing {
+                missing,
+                total_layers_checked,
+                weight_map_prefix_summary,
+                weight_map_total_tensors,
+            } => {
+                writeln!(
+                    f,
+                    "CPDT weight validation: weight map does not match model declaration."
+                )?;
+                writeln!(
+                    f,
+                    "  Missing layers ({} of {}): {}",
+                    missing.len(),
+                    total_layers_checked,
+                    missing.join(", "),
+                )?;
+                if weight_map_prefix_summary.is_empty() {
+                    write!(
+                        f,
+                        "  WeightMap contains {} tensors (no top-level prefixes to summarize).",
+                        weight_map_total_tensors,
+                    )
+                } else {
+                    write!(
+                        f,
+                        "  WeightMap contains {} tensors with top-level prefixes: {}",
+                        weight_map_total_tensors,
+                        weight_map_prefix_summary.join(", "),
+                    )
+                }
+            }
         }
     }
 }
 
 impl std::error::Error for ValidationError {}
 
-/// Cross-check the loaded WeightMap against WGGO's AppliedPlan. Phase 1
-/// Commit 1 ships a stub; the body is filled in during Commit 5 (Task 5.2)
-/// after confirming the exact `AppliedLayer` weight-metadata surface.
+/// Top-level prefix of a tensor name: substring up to the second dot.
+/// `transformer.h.0.attn.wq.weight` → `transformer.h`. `tok_embeddings.weight`
+/// → `tok_embeddings`. `no_dots` → `no_dots`. The second-dot rule gives
+/// enough signal to diagnose format mismatches (HuggingFace's `transformer.h`,
+/// `model.layers`, etc.) without listing every individual tensor.
+fn top_level_prefix(name: &str) -> &str {
+    let mut dot_count = 0;
+    for (i, c) in name.char_indices() {
+        if c == '.' {
+            dot_count += 1;
+            if dot_count == 2 {
+                return &name[..i];
+            }
+        }
+    }
+    name
+}
+
+/// Whether `layer_name` follows one of the hierarchical prefixes we can
+/// validate. Layer names outside this set (currently only `"other"` per
+/// `wggo_graph::layer_prefix`) are skipped.
+fn is_hierarchical_layer(layer_name: &str) -> bool {
+    layer_name.starts_with("blocks.")
+        || layer_name.starts_with("layers.")
+        || layer_name.starts_with("h.")
+}
+
+/// Cross-check the loaded WeightMap against WGGO's AppliedPlan.
+///
+/// For each hierarchical layer (`blocks.N` / `layers.N` / `h.N`) in
+/// `applied`, require at least one tensor in `wm` whose name starts with
+/// `layer_name + "."`. The `"other"` catch-all layer is skipped — its
+/// contents (embeddings, norms, LM head) are heterogeneous and per-tensor
+/// validation is Phase 2 work. If any hierarchical layer is unmatched, all
+/// missing layers are aggregated into a single `LayersMissing` error with
+/// a summary of the WeightMap's top-level tensor prefixes so the user can
+/// diagnose format mismatches.
+///
+/// Phase 1 scope; per-tensor shape/dtype validation deferred. See spec at
+/// `docs/superpowers/specs/2026-04-20-cpdt-validate-body-design.md`.
 pub fn validate(wm: &WeightMap, applied: &AppliedPlan) -> Result<(), ValidationError> {
-    // TODO(plan): cross-check against AppliedLayer.weight_name/shape/dtype.
-    // The exact AppliedLayer field names are read during Commit 5 Task 5.2
-    // when the validation is wired into cpdt::run.
-    let _ = (wm, applied);
-    Ok(())
+    let mut missing: Vec<String> = Vec::new();
+    let mut checked: usize = 0;
+
+    for layer in &applied.layers {
+        if !is_hierarchical_layer(&layer.layer_name) {
+            continue;
+        }
+        checked += 1;
+        let prefix = format!("{}.", layer.layer_name);
+        let has_match = wm.entries().any(|(name, _)| name.starts_with(&prefix));
+        if !has_match {
+            missing.push(layer.layer_name.clone());
+        }
+    }
+
+    if missing.is_empty() {
+        return Ok(());
+    }
+
+    // Aggregate the WeightMap's top-level prefixes for the diagnostic message.
+    use std::collections::BTreeSet;
+    let mut prefixes: BTreeSet<String> = BTreeSet::new();
+    let mut total_tensors = 0usize;
+    for (name, _) in wm.entries() {
+        total_tensors += 1;
+        prefixes.insert(top_level_prefix(name).to_string());
+    }
+    let mut summary: Vec<String> = prefixes.into_iter().take(PREFIX_SUMMARY_MAX).collect();
+    if total_tensors > 0 && summary.len() == PREFIX_SUMMARY_MAX {
+        // Note: we can't cheaply recount without re-iterating; the summary
+        // is capped at PREFIX_SUMMARY_MAX, and the total-tensors count is
+        // what the error message quotes. No explicit "truncated" marker —
+        // the disparity between summary.len() and total_tensors is the signal.
+        summary.push("...".to_string());
+    }
+
+    Err(ValidationError::LayersMissing {
+        missing,
+        total_layers_checked: checked,
+        weight_map_prefix_summary: summary,
+        weight_map_total_tensors: total_tensors,
+    })
 }
