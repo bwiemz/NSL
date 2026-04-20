@@ -65,6 +65,12 @@ pub struct TypeChecker<'a> {
     pub freeze_configs: Vec<crate::wrga::FreezeConfig>,
     /// WRGA: `@adapter(...)` configs captured during semantic analysis.
     pub adapter_configs: Vec<crate::wrga::AdapterConfig>,
+    /// Span of the first `@cpdt` decorator seen in this module. Phase 1
+    /// requires exactly one `@cpdt` decorator per program; a second
+    /// decorator emits a diagnostic error naming both spans. Phase 2 may
+    /// extend to per-decorator scope if multi-decorator programs become
+    /// useful — see docs/superpowers/specs/2026-04-20-cpdt-weight-aware-opt-out-design.md.
+    pub cpdt_decorator_span: Option<nsl_ast::Span>,
 }
 
 impl<'a> TypeChecker<'a> {
@@ -83,6 +89,7 @@ impl<'a> TypeChecker<'a> {
             wrga_configs: Vec::new(),
             freeze_configs: Vec::new(),
             adapter_configs: Vec::new(),
+            cpdt_decorator_span: None,
         }
     }
 

@@ -464,6 +464,18 @@ pub struct Compiler<'a> {
     pub cpdt_plan: Option<crate::cpdt::CpdtPlan>,
     /// Whether `--cpdt-report` was requested.
     pub cpdt_report_requested: bool,
+    /// Global default for CPDT's weight-aware path. Phase 1 requires exactly
+    /// one `@cpdt` decorator per program (enforced in nsl-semantic); this
+    /// field reflects that decorator's `weight_aware` argument, defaulting
+    /// to `true`. `@cpdt(weight_aware=false)` sets it to `false`, which
+    /// cascades through `invoke_cpdt_if_enabled` to suppress plan_map,
+    /// validate, tier-agreement diagnostic, and CPDT_CALIB_K warning.
+    ///
+    /// Phase 2 may extend this to per-decorator-site settings if multi-
+    /// decorator programs become supported. The single-writer semantics
+    /// remain correct as a default until then. Design:
+    /// docs/superpowers/specs/2026-04-20-cpdt-weight-aware-opt-out-design.md.
+    pub cpdt_weight_aware: bool,
 
     // ── Dev Tools Phase 2: kernel-profile pre-pass ─────────────────────
     pub prediction_map: HashMap<NodeId, crate::cost_model::OpCost>,
@@ -695,6 +707,7 @@ impl<'a> Compiler<'a> {
             cpdt_cluster: options.cpdt_cluster.clone(),
             cpdt_plan: None,
             cpdt_report_requested: options.cpdt_report_requested,
+            cpdt_weight_aware: true,
             prediction_map: HashMap::new(),
             manifest_builder: None,
             fusion_plan_for_profile: None,
