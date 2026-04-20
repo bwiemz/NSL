@@ -241,6 +241,36 @@ pub enum PrimalOp {
     RoPEInverse {
         dim: usize,
     },
+    /// WRGA B.3.2 Option 3 revised: fused GatedLoRA forward matmul.
+    ///
+    /// Single FFI call (`nsl_adapter_fused_gatedlora_matmul`) that computes
+    ///   y[B, N] = x[B, K] @ W[K, N] + sigmoid(gate[N]) ⊙ (x @ A @ B) * scale
+    /// in one CUDA kernel. Inputs (5): `[x, W, A, B, gate]`. `scale` is a
+    /// compile-time constant from the adapter decorator; `kernel_handle`
+    /// indexes the PTX kernel registry (-1 = CPU fallback).
+    ///
+    /// The forward is a recognized primal; the backward is emitted as
+    /// unfused primitive ops (no fused backward kernel) per spec §2.
+    FusedGatedLoraMatmul {
+        scale: f32,
+        kernel_handle: i64,
+    },
+    /// WRGA B.3 fused LoRA forward matmul.
+    ///
+    /// `y = x @ W + scale * (x @ A @ B)`. Inputs (4): `[x, W, A, B]`.
+    /// Forward lowers to `nsl_adapter_fused_lora_matmul`.
+    FusedLoraMatmul {
+        scale: f32,
+        kernel_handle: i64,
+    },
+    /// WRGA B.3 fused IA³ forward matmul.
+    ///
+    /// `y = (x @ W) * gamma` (gamma broadcasts over output dim).
+    /// Inputs (3): `[x, W, gamma]`. Forward lowers to
+    /// `nsl_adapter_fused_ia3_matmul`.
+    FusedIa3Matmul {
+        kernel_handle: i64,
+    },
     // Regularization
     Dropout {
         p: f64,
