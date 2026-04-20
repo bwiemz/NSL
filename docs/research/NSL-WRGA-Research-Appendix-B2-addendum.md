@@ -135,3 +135,21 @@ Option 3's re-spec (3e + original option 3) lands with two direct probes:
 - **Trainable-params connection-count assertion:** source-AD reports `5/5 trainable tensor params connected` (x, W, A, B, gate) rather than `1/5`. This signal can only reach 5 if source-AD's Wengert walk has seen the fused FFI call and extracted its 5 inputs -- exactly the code path 3e+option3 claims to enable. This is the B.5-compliant direct probe.
 
 The combination catches both the proxy-pass and the proxy-fail misclassification failure modes.
+
+### B.5 (clarification, 2026-04-19 later in day): the rule applies recursively
+
+Any verification step whose result is cited by a spec as an established fact is itself a code-path claim subject to B.5. "Task 0 verified the precondition" is not a shield against B.5 unless Task 0's own verification satisfied B.5 -- meaning it exercised the specific conditions the precondition depends on, not proxy conditions that happen to have overlapping behavior.
+
+Concrete failure observed: revised Option 3 spec §7 listed "No fix for adapter-field CPU placement (verified unnecessary by Task 0)" as a non-goal. Task 0 had probed gate placement via a **top-level inference call** (`let y = m.forward(x)` after the train block), not via an **in-train-block call** (`m.forward(x)` inside `train(step):`). These hit different code paths: inference mode lets the user manually reassign `m.gate_... = zeros(...).to(cuda)` between the train block and the probe; training mode has no such reassignment site because the adapter side-table is populated mid-train-block. Task 0's verification satisfied a claim about the inference path — it did not establish anything about the training path — but the spec's non-goal inherited the result as if it had. This is exactly the proxy-satisfies-the-wrong-claim failure the main B.5 rule targets, one meta-level up.
+
+The clarification: **the rule is recursive.** A spec's "verified elsewhere" citation carries the full B.5 obligation of the original verification. A proxy verification cannot confer spec-level confidence even when the spec explicitly cites it as "precondition verified."
+
+### Three-instances retrospective
+
+As of 2026-04-19 this is the third occurrence of the same failure mode in two days:
+
+1. **B.3.1's Llama-scale claim** verified via n≤64 ptxas tests.
+2. **Original Option 3's fused-handler claim** verified via top-level launch-counter.
+3. **Revised Option 3's precondition claim** (Task 0) verified via inference-path placement probe.
+
+The recurrence suggests the rule is being applied in retrospect (when a blocker surfaces the violation), not proactively during spec/verification prep. The rule is correct; the *timing* of its application is the gap. Whether this warrants codifying a separate discipline ("always ask B.5's three questions during verification prep, not after") is an open question — two more instances would confirm; one occurrence doesn't yet.
