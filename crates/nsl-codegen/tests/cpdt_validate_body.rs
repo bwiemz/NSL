@@ -184,6 +184,80 @@ fn empty_weightmap_red() {
 }
 
 #[test]
+fn exactly_eight_prefixes_does_not_emit_truncation_marker() {
+    // Regression for an early bug: the "..." truncation marker would fire
+    // whenever prefix count equaled PREFIX_SUMMARY_MAX (8) exactly, even
+    // when nothing was actually truncated. Build a WeightMap with exactly 8
+    // distinct top-level prefixes; assert the summary has 8 entries, no "...".
+    let names_owned: Vec<String> = (0..8)
+        .map(|i| format!("namespace{i}.tensor.weight"))
+        .collect();
+    let name_refs: Vec<&str> = names_owned.iter().map(|s| s.as_str()).collect();
+    let (wm, _tp) = wm_with_names(&name_refs);
+    let applied = plan_with_layers(&["blocks.0"]);
+    let err = validate(&wm, &applied).expect_err("should fail");
+    match err {
+        ValidationError::LayersMissing {
+            weight_map_prefix_summary,
+            ..
+        } => {
+            assert_eq!(
+                weight_map_prefix_summary.len(),
+                8,
+                "exactly-8-prefixes case: no truncation, no '...' marker; got {weight_map_prefix_summary:?}"
+            );
+            assert!(
+                !weight_map_prefix_summary.contains(&"...".to_string()),
+                "should not contain truncation marker when nothing was truncated"
+            );
+        }
+        other => panic!("expected LayersMissing, got {other:?}"),
+    }
+}
+
+#[test]
+fn nine_prefixes_emits_truncation_marker() {
+    // Dual of the previous test: 9 prefixes exceed the cap of 8, so the
+    // "..." marker should appear and the summary should total 9 entries
+    // (8 truncated + the "..." marker).
+    let names_owned: Vec<String> = (0..9)
+        .map(|i| format!("namespace{i}.tensor.weight"))
+        .collect();
+    let name_refs: Vec<&str> = names_owned.iter().map(|s| s.as_str()).collect();
+    let (wm, _tp) = wm_with_names(&name_refs);
+    let applied = plan_with_layers(&["blocks.0"]);
+    let err = validate(&wm, &applied).expect_err("should fail");
+    match err {
+        ValidationError::LayersMissing {
+            weight_map_prefix_summary,
+            ..
+        } => {
+            assert_eq!(
+                weight_map_prefix_summary.len(),
+                9,
+                "9 distinct prefixes: 8 summary + 1 '...' marker; got {weight_map_prefix_summary:?}"
+            );
+            assert_eq!(
+                weight_map_prefix_summary.last().map(|s| s.as_str()),
+                Some("..."),
+                "truncation marker should be the last entry"
+            );
+        }
+        other => panic!("expected LayersMissing, got {other:?}"),
+    }
+}
+
+#[test]
+fn empty_applied_plan_is_ok() {
+    // Documents intentional behavior: a plan with no layers produces no
+    // layers to check, so `validate` returns Ok. Guards against a future
+    // policy change that might want to error here.
+    let (wm, _tp) = wm_with_names(&["any.tensor.weight"]);
+    let applied = plan_with_layers(&[]);
+    assert!(validate(&wm, &applied).is_ok());
+}
+
+#[test]
 fn other_catchall_layer_is_skipped() {
     // The "other" catch-all (embeddings, norms, LM head) is heterogeneous;
     // Phase 1 skips it with no missing-layer error. Adds one more test beyond

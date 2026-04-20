@@ -413,12 +413,12 @@ pub fn validate(wm: &WeightMap, applied: &AppliedPlan) -> Result<(), ValidationE
         total_tensors += 1;
         prefixes.insert(top_level_prefix(name).to_string());
     }
+    let truncated = prefixes.len() > PREFIX_SUMMARY_MAX;
     let mut summary: Vec<String> = prefixes.into_iter().take(PREFIX_SUMMARY_MAX).collect();
-    if total_tensors > 0 && summary.len() == PREFIX_SUMMARY_MAX {
-        // Note: we can't cheaply recount without re-iterating; the summary
-        // is capped at PREFIX_SUMMARY_MAX, and the total-tensors count is
-        // what the error message quotes. No explicit "truncated" marker —
-        // the disparity between summary.len() and total_tensors is the signal.
+    if truncated {
+        // Signal that the list was cut off; the actual count is embedded in
+        // the prefix sort order, but "..." alerts the reader that there are
+        // more prefixes than shown.
         summary.push("...".to_string());
     }
 
