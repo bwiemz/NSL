@@ -555,6 +555,47 @@ fn csha_gap_gpu_e2e_csha_fused_path() {
     // structural wins (dispatch, FFI emission, save-buffer allocation,
     // kernel launch, writeback pointer flow) are observable and the
     // numerical follow-up is tracked separately.
+    //
+    // Diagnosed 2026-04-16 on `feat/csha-nan-diag` via the
+    // `NSL_CSHA_DUMP_GRADS=1` instrumentation landed alongside this
+    // comment in `crates/nsl-runtime/src/flash_attention.rs`.  The
+    // d2h readback of the 6 save buffers + 8 gradient outputs reveals:
+    //
+    //   [csha-dump-fwd-post] launch_rc=CUDA_ERROR_INVALID_PTX
+    //   [csha-dump-fwd-post]  q_proj nonzero_bits=0/1024
+    //   [csha-dump-fwd-post]  row_sum nonzero=0/32
+    //   [csha-dump]        dO nan_count=0   (all zero)
+    //   [csha-dump]        dq nan_count=1024
+    //
+    // Root cause (NOT the documented Phase 3 placeholder HBM-load):
+    // the CSHA `_with_saves` forward PTX synthesised by
+    // `maybe_synthesize_csha_training_ptx` is rejected by
+    // `cuModuleLoadData` because the save-emission path references
+    // `%q_smem_base` / `%k_smem_base` / `%v_smem_base` registers that
+    // are only declared + initialised in the `fused_projections=true`
+    // branch of `flash_attention_v2/phases/forward/prelude.rs:137` +
+    // `phases/forward/csha_hooks.rs:215`.  The training_config sets
+    // `save_activations_for_backward=true` but `fused_projections=false`,
+    // so the save sites emit `add.u64 %rd, %q_smem_base, ...` with no
+    // declaration → `ptxas` rejects with "Unknown symbol `%q_smem_base`"
+    // (24 instances, line 181+).  The forward launch silently fails
+    // (its return code is discarded at `compile_call_by_name`), save
+    // buffers + dO stay zero, backward divides by row_sum=0 and NaNs.
+    //
+    // Additionally (secondary, surfaces after the register fix): in
+    // the non-fused-projections branch of `flash_attention_v2/mod.rs`
+    // the save emission at line 210 runs BEFORE `q_load::emit`, so
+    // SMEM has not yet been populated with Q when the save tries to
+    // read it.  Fix needs both:
+    //   (a) declare + init `%q_smem_base/%k_smem_base/%v_smem_base`
+    //       whenever `save_activations_for_backward=true` (independent
+    //       of `fused_projections`);
+    //   (b) reorder save emission to run after Q/K/V are loaded into
+    //       SMEM (or save directly from HBM source pointers post-RoPE
+    //       bypassing the SMEM round-trip for the non-fused path).
+    //
+    // Both (a) and (b) are kernel-emission / spec-level work, out of
+    // scope for the diagnostic PR.  Keep the graceful-skip until fixed.
     let nan_afters: Vec<&String> = deltas
         .iter()
         .filter(|(_, _, after, _)| !after.is_finite())
@@ -562,12 +603,18 @@ fn csha_gap_gpu_e2e_csha_fused_path() {
         .collect();
     if !nan_afters.is_empty() {
         eprintln!(
-            "[csha-gpu-e2e-csha] SKIP — Tier C T6.3 numerical blocker: \
-             AFTER_{{{}}} = NaN.  ILLEGAL_ADDRESS is fixed (backward kernel \
-             runs + writes back); the remaining NaN is the known Phase 3 \
-             placeholder HBM-load issue (see \
-             `project_csha_tier_c_shipped.md`).  When Phase 3 is unblocked, \
-             flip this graceful-skip back to the hard-asserts below.",
+            "[csha-gpu-e2e-csha] SKIP — CSHA `_with_saves` forward PTX \
+             fails cuModuleLoadData with CUDA_ERROR_INVALID_PTX: the \
+             save-activations emission references `%q_smem_base` / \
+             `%k_smem_base` / `%v_smem_base` registers that are only \
+             declared under `fused_projections=true` (see \
+             `flash_attention_v2/phases/forward/prelude.rs:137`).  \
+             AFTER_{{{}}} = NaN because the silently-failed forward \
+             launch leaves the save buffers zero-initialised and the \
+             backward kernel then divides by row_sum=0.  Run with \
+             `NSL_CSHA_DUMP_GRADS=1` for the full d2h dump.  When the \
+             register declaration + save-emission reordering land, flip \
+             this graceful-skip back to the hard-asserts below.",
             nan_afters.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(",")
         );
         return;
