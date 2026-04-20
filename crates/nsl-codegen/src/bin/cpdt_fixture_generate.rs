@@ -62,7 +62,6 @@ fn calib_small() -> TransformerShape {
     }
 }
 
-#[allow(dead_code)]
 fn calib_medium() -> TransformerShape {
     TransformerShape {
         layers: 16,
@@ -76,19 +75,61 @@ fn calib_medium() -> TransformerShape {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    if args.len() < 2 {
-        eprintln!("usage: cpdt_fixture_generate <output_dir>");
-        std::process::exit(1);
+    let mut include_medium = false;
+    let mut output_dir: Option<String> = None;
+    let mut positional: Vec<String> = Vec::new();
+
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--include-medium" => {
+                include_medium = true;
+                i += 1;
+            }
+            "--output-dir" => {
+                i += 1;
+                if i >= args.len() {
+                    eprintln!("error: --output-dir requires a value");
+                    std::process::exit(2);
+                }
+                output_dir = Some(args[i].clone());
+                i += 1;
+            }
+            other => {
+                if other.starts_with("--") {
+                    eprintln!("error: unknown flag or missing space after flag name: {other}");
+                    std::process::exit(2);
+                }
+                positional.push(other.to_string());
+                i += 1;
+            }
+        }
     }
-    let out_dir = Path::new(&args[1]);
+
+    // Positional output_dir (back-compat) OR --output-dir (new form).
+    let out_dir_string = match (output_dir, positional.first()) {
+        (Some(d), _) => d,
+        (None, Some(d)) => d.clone(),
+        (None, None) => {
+            eprintln!(
+                "usage: cpdt_fixture_generate [--include-medium] [--output-dir DIR | DIR]"
+            );
+            std::process::exit(1);
+        }
+    };
+    let out_dir = Path::new(&out_dir_string);
     std::fs::create_dir_all(out_dir).unwrap();
 
     write_fixture(out_dir, "calib_tiny", calib_tiny(), DType::F32);
     write_fixture(out_dir, "calib_small", calib_small(), DType::F16);
 
-    eprintln!(
-        "calib_medium is regenerated at test-time into target/; not written by this binary."
-    );
+    if include_medium {
+        write_fixture(out_dir, "calib_medium", calib_medium(), DType::F16);
+    } else {
+        eprintln!(
+            "calib_medium is regenerated at test-time into target/; pass --include-medium to write here."
+        );
+    }
 }
 
 #[derive(Copy, Clone)]

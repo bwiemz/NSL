@@ -28,27 +28,37 @@ use crate::weight_aware::WeightEntry;
 // ANALYSIS_VERSION
 // ---------------------------------------------------------------------------
 
-pub const ANALYSIS_VERSION: u32 = 1;
+pub const ANALYSIS_VERSION: u32 = 2;
 
 // ---------------------------------------------------------------------------
-// Calibration constants
+// Calibration constants (Phase 1 retune — 2026-04-19)
 //
-// All constants are placeholders pending the Task 1.11 calibration run
-// that regenerates `tests/fixtures/cpdt_calibration/baseline_heuristic.json`
-// and emits the finalized values. Running `tools/cpdt_calibrate.rs`
-// (dev-only, gated behind `[features] calibrate = []`) reproduces them.
+// Emitted by `cpdt_calibrate --emit-calibration` on the pooled corpus
+// {calib_tiny, calib_small, calib_medium}. T0/T1/T2 are geomeans of adjacent
+// weights-present band mins/maxes; CALIB_K is the log-midpoint of the
+// longest K-range where both calib_small and calib_medium disagreement stay
+// <= 20% (the monitoring threshold). Residual per-fixture disagreement at
+// this K: calib_small 15.91%, calib_medium 2.51%, corpus-wide 3.76%.
+//
+// The SwiGLU numel-collision floors calib_small disagreement above 5%:
+// ffn.w_gate, ffn.w_up, ffn.w_down share numel = d_model * d_ffn, so the
+// no-weights formula K * pos / numel cannot separate them. Invariant #7 is
+// reframed to monitoring-gate at 20% per spec §5; Phase 2 spectral is the
+// intervention that returns it to <5% hard-gate.
+//
+// Retune design: docs/superpowers/specs/2026-04-19-cpdt-calibration-correction-design.md
 // ---------------------------------------------------------------------------
 
 /// Neutral value of `gradient_magnitude_est` when weights are absent.
-/// Calibrated so the no-weights path's tier assignments agree with the
-/// weights-present path within 5% parameter-weighted on the baseline corpus.
-pub const CALIB_K: f64 = 0.0312;
+/// Calibrated by plateau-midpoint selection in `cpdt_calibrate --emit-calibration`.
+pub const CALIB_K: f64 = 6.309573e-2;
 
-pub const CALIB_T0: f64 = 0.50; // High   ↔ Medium
-pub const CALIB_T1: f64 = 0.10; // Medium ↔ Low
-pub const CALIB_T2: f64 = 0.02; // Low    ↔ VeryLow
+pub const CALIB_T0: f64 = 6.105631e-8; // High   ↔ Medium
+pub const CALIB_T1: f64 = 2.232401e-8; // Medium ↔ Low
+pub const CALIB_T2: f64 = 7.255675e-10; // Low   ↔ VeryLow
 
-/// Position-criticality near-extreme boost (for `L ≥ 4`).
+/// Position-criticality near-extreme boost (for `L ≥ 4`). Unchanged from
+/// Phase 1 ship; the retune touches only the sensitivity-band constants.
 pub const CALIB_ALPHA: f64 = 0.3;
 
 // ---------------------------------------------------------------------------

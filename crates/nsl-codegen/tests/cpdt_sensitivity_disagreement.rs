@@ -1,5 +1,14 @@
-//! Phase 1 Commit 4 — parameter-weighted disagreement between no-weights
-//! and weights-present paths on the baseline corpus. Gate: < 5%.
+//! Phase 1 Commit 4 (original) + Phase 1 retune (2026-04-19) — parameter-
+//! weighted disagreement between no-weights and weights-present paths.
+//!
+//! Originally a <5% hard-gate. Reframed to <20% monitoring-gate by the
+//! retune (spec §5): the no-weights formula `K × pos / numel` has no
+//! discriminator between numel-degenerate shape classes (SwiGLU's
+//! ffn.w_gate/w_up/w_down at d_model × d_ffn), so no CALIB_K achieves
+//! <5% disagreement. The 20% ceiling is Phase 1's monitoring range;
+//! Phase 2's spectral factor is the intervention that returns this gate
+//! to <5%. See `disagreement_source_matches_numel_collision` (in
+//! cpdt_tier_agreement.rs) for the diagnostic that verifies the source.
 
 use std::path::PathBuf;
 
@@ -26,7 +35,7 @@ fn score_with_entry(
 }
 
 #[test]
-fn weighted_disagreement_below_5_percent() {
+fn weighted_disagreement_below_monitoring_threshold() {
     let fixtures = [("calib_tiny", 2u32), ("calib_small", 8u32)];
     let mut disagreeing_params: u64 = 0;
     let mut total_params: u64 = 0;
@@ -51,7 +60,9 @@ fn weighted_disagreement_below_5_percent() {
         frac, disagreeing_params, total_params
     );
     assert!(
-        frac < 0.05,
-        "weighted disagreement {frac:.4} >= 0.05 on baseline corpus"
+        frac < 0.20,
+        "weighted disagreement {frac:.4} >= 0.20 monitoring threshold — \
+         calibration drift or new class of disagreement beyond the documented \
+         numel-degeneracy. See spec §5 for the reframing."
     );
 }

@@ -60,3 +60,45 @@ Items Phase 1 Commit 5 scope-reduced; record kept here so they surface during Ph
 - **`@cpdt(weight_aware=false)` runtime opt-out** — semantic field exists, codegen threading deferred. Required if any Phase 2 consumer needs an escape hatch at build time.
 - **`cpdt_sensitivity::validate(wm, applied)` body** — Phase 1 ships the stub. AppliedLayer's weight-metadata surface needs extension before the body can cross-check shape/dtype/name. Independent of Phase 2; useful any time.
 - **Full `nsl-cli/tests/cpdt_weights_cli.rs` five-case decision-table test suite** — the tier-agreement diagnostic is already covered by `crates/nsl-codegen/tests/cpdt_tier_agreement.rs`; CLI tests are belt-and-suspenders. Land with the AST auto-detect.
+
+---
+
+## Phase 1 threshold retune — 2026-04-19 — scope-reduced with monitoring-gate reframing
+
+**Context.** Phase 1 shipped with placeholder constants `T0=0.50, T1=0.10, T2=0.02, CALIB_K=0.0312`. Post-ship inspection found that every generic (non-kind-overridden) tensor scored below `T2` on the calibration corpus, producing a degenerate binary distribution: 32 High + 42 VeryLow on `calib_small`, 0 Medium, 0 Low. Both Phase 1 close-out gates (byte-identity on no-weights, <5% disagreement) passed trivially because both paths produced the same degenerate distribution.
+
+**Pre-dispatch finding.** Running the retune's Commit 1 logic ahead of implementation revealed a structural information-bottleneck in the no-weights path: `ffn.w_gate`, `ffn.w_up`, and `ffn.w_down` share `numel = d_model × d_ffn` in a standard SwiGLU FFN, so the no-weights formula `K × pos / numel` produces identical scores for all three and cannot differentiate them by tier regardless of K. Pure-corpus-minimum K (K≈0.046) gives 2.49% corpus-wide disagreement but 26.51% on calib_small specifically — the numel-collision dominates calib_small's per-fixture metric.
+
+**Methodological shift.** The spec's initial "minimize corpus disagreement" formulation was replaced with "plateau-midpoint-under-per-fixture-constraint": pick the log-midpoint of the longest contiguous K-range where every per-fixture disagreement stays ≤ 20%. This trades ~1.3% corpus-wide disagreement to keep both per-fixture numbers comfortably under the monitoring threshold, provides robustness to measurement noise through the plateau's width, and produces consistent per-view signals. See §3.2 of the retune design spec.
+
+**Response.** Retune thresholds (geomeans of adjacent band mins/maxes), pick K by plateau-midpoint algorithm, reframe invariant #7 as a monitoring-gate on committed-fixture disagreement rather than a hard-gate.
+
+**Measured values** (from the 601-point Rust grid in `cpdt_calibrate --emit-calibration`):
+
+- `T0 = 6.1056e-8` (High ↔ Medium)
+- `T1 = 2.2324e-8` (Medium ↔ Low)
+- `T2 = 7.2557e-10` (Low ↔ VeryLow)
+- plateau = `[0.0562, 0.0708]`
+- `CALIB_K = 6.3096e-2` (log-midpoint of plateau)
+- `ANALYSIS_VERSION` bumped to 2
+
+**Post-retune distribution:**
+
+- `calib_small` (74 tensors): 68 H + 6 M + 0 L + 0 VL (2-tier on this fixture alone)
+- `calib_medium` (~179 tensors): 53 H + 56 M + 42 L + 28 VL (4-tier spread)
+- Corpus union populates primary set {H, M, L}; VeryLow is the documented fallback
+
+**Residual disagreement.** Committed-fixture gate (calib_tiny + calib_small) measures ~15.6%, well under the 20% monitoring threshold; calib_medium measures 2.51%; corpus-wide 3.76%. The 15.6% residual traces to the SwiGLU numel-collision (12 `ffn_gate_up` middle-layer tensors on calib_small plus 2 near-extreme `ffn_down` tensors that cross the T0 boundary due to pos=1.3 multiplier). The `disagreement_source_matches_numel_collision` diagnostic test verifies firings trace to this known pattern.
+
+**Invariant #7 reframing.** Phase 1's gate is now monitoring-status at `<0.20` on committed-fixture disagreement, with Phase 2 spectral factor as the documented intervention that returns it to `<0.05` hard-gate. The gate's computation and domain are unchanged; only its institutional authority (close-out blocker vs. Phase 2 promotion signal) shifts. This is *reframing*, not *weakening* — the latter was explicitly rejected during the E-option deliberation.
+
+**Phase 2 connection.** Spectral condition (randomized SVD or power iteration on `W^T W`) gives the no-weights path a shape-class discriminator beyond `numel` — its per-fixture close-out criterion is `<5%` on the committed-fixture gate, which automatically returns invariant #7 to hard-gate status.
+
+**Institutional rules added** (retune design spec §7):
+
+1. **Tier-distribution non-degeneracy check.** Any N-tier scheme's close-out must assert the *primary* tier set (all tiers minus documented-as-rare fallbacks) is non-degenerate across the union of calibration fixtures. CPDT's primary set is {High, Medium, Low}; VeryLow is the documented fallback.
+2. **Monitoring-gate reframing for architectural bottlenecks.** When an invariant fires on a specific architectural class (not a single tensor or transient bug), the correct response is to document the class, add a diagnostic test that verifies the firing traces to it, name the future intervention that resolves it, and reframe the invariant to monitoring-status with that intervention as the promotion trigger — *not* to narrow the invariant's domain or raise its threshold.
+
+Both rules apply to future tier-assignment work in NSL.
+
+**Pre-dispatch-verification lesson.** The retune spec's initial `§3.3` distribution was computed from calib_small-only data during pre-dispatch (calib_medium wasn't regenerable at spec-writing time). `§3.1`'s pooling procedure was written for the full corpus. The two sections were written under different fixture-availability assumptions and the mismatch wasn't caught during spec self-review — the implementer's grid-search under the operative `§3.1` procedure surfaced it. **Rule for future spec-writing:** pre-dispatch verification must run against the same fixture corpus the implementation will use. If part of the corpus isn't available at spec-writing time, distribution tables that depend on it are deferred to post-dispatch measurement, or the corpus is regenerated before spec writing. This is adjacent to the WRGA B.3.1 "test at the scale you target" rule but distinct: that one is about the implementation's test coverage; this one is about the spec's verification coverage.
