@@ -232,7 +232,7 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
                 ptx,
                 "%rd35",   // q_pos_reg (q_row_global, u64)
                 "%rd34",   // k_pos_reg  (k_global, u64)
-                "%seg_base", // SMEM base declared in prelude (u32)
+                "%seg_base", // SMEM base declared in prelude (u64 generic address)
                 crate::pca_segment::SegmentResidency::Shared,
                 "%p0",     // extend caller's mask predicate in place
             );

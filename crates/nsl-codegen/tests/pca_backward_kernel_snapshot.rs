@@ -82,3 +82,12 @@ fn backward_kernel_segment_masked_causal_32_32_32() {
 
     insta::assert_snapshot!(ptx);
 }
+
+#[test]
+fn write_ptx_to_file() {
+    let cfg = minimal_segment_masked_backward_config();
+    let ptx = synthesize_backward(&cfg).expect("synthesize_backward must succeed");
+    let path = std::env::temp_dir().join("bwd_full.ptx");
+    std::fs::write(&path, &ptx).expect("write failed");
+    println!("PTX written to {} ({} bytes)", path.display(), ptx.len());
+}

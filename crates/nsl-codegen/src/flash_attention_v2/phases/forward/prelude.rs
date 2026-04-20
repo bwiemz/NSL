@@ -3,7 +3,19 @@
 //! budget this phase allocates.
 
 use crate::flash_attention::FlashAttentionConfig;
-use crate::flash_attention_v2::smem_layout::{needs_dynamic_smem, total_bytes};
+use crate::flash_attention_v2::smem_layout::{needs_dynamic_smem, total_bytes, SMEM_BUDGET_BYTES};
+
+/// Forward SMEM-routing gate that also accounts for PCA Tier A's
+/// `seg_smem[4096]` static array (when `config.segment_masked`).  Without
+/// this, CSHA fused+saves + segment_masked configs can push the combined
+/// static SMEM past the 48 KB cap; ptxas accepts but launch fails with
+/// CUDA_ERROR_ILLEGAL_ADDRESS at sync time because the main shmem[] is
+/// silently over-allocated.  Mirrors `backward_needs_dynamic_smem`.
+fn fwd_needs_dynamic_smem(config: &FlashAttentionConfig) -> bool {
+    let seg_overhead = if config.segment_masked { 4096 } else { 0 };
+    total_bytes(config) + seg_overhead > SMEM_BUDGET_BYTES
+        || needs_dynamic_smem(config)
+}
 use crate::kernel_skeleton::indexing::emit_thread_lane_warp_register_decl;
 
 /// Emit the PTX file header up through the index-computation block.
@@ -33,7 +45,7 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig) {
     // inside a function body.  For configs that exceed the 48 KB static SMEM cap
     // the declaration moves here; the static `.shared .align 16 .b8 shmem[N]`
     // form (which CAN appear inside a function body) is used for smaller configs.
-    if needs_dynamic_smem(config) {
+    if fwd_needs_dynamic_smem(config) {
         use crate::kernel_skeleton::smem::emit_dynamic_smem_extern;
         emit_dynamic_smem_extern(ptx);
     }
@@ -86,7 +98,7 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig) {
     // Static shared memory declaration (inside function body).
     // Dynamic SMEM configs use `.extern .shared` at module scope (emitted above,
     // before the .visible .entry).  Static configs declare the array here.
-    if !needs_dynamic_smem(config) {
+    if !fwd_needs_dynamic_smem(config) {
         use crate::kernel_skeleton::smem::emit_static_smem_decl;
         emit_static_smem_decl(ptx, total_bytes(config) as usize);
     }
@@ -235,15 +247,20 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig) {
     // via total_bytes() is unaffected.
     if config.segment_masked {
         // u64 pair: global segment_ids pointer + SMEM generic-space pointer.
-        ptx.push_str("    .reg .u64 %rd_seg_global, %rd_seg_smem;\n");
-        // u32 SMEM base address (after cvt from u64 generic-space ptr).
-        ptx.push_str("    .reg .u32 %seg_base;\n");
+        // %seg_base is u64 (full generic address) to avoid the cvt.u32.u64
+        // truncation bug on Blackwell (sm_120+): at shared offset 0 the low 32
+        // bits of the generic address are NOT zero, so the u32 truncation gives
+        // a wrong shared-space address.  Use the full u64 generic address with
+        // ld/st.shared instead.
+        ptx.push_str("    .reg .u64 %rd_seg_global, %rd_seg_smem, %seg_base;\n");
         // Scratch registers used by segment_mask::emit_segment_mask_predicate.
-        ptx.push_str("    .reg .u32 %r_q_SEGMASK, %r_k_SEGMASK;\n");
+        // Now u64 (matching seg_base) to avoid mixing address widths.
+        ptx.push_str("    .reg .u64 %rd_q_SEGMASK, %rd_k_SEGMASK;\n");
         ptx.push_str("    .reg .b16 %rs_q_SEGMASK, %rs_k_SEGMASK;\n");
         ptx.push_str("    .reg .pred %p_seg_SEGMASK;\n");
         // Cooperative-load scratch for the warp-0 prelude (seq_len ≤ 2048).
-        ptx.push_str("    .reg .u32 %r_pca_i, %r_pca_seq, %r_pca_off;\n");
+        ptx.push_str("    .reg .u32 %r_pca_i, %r_pca_seq;\n");
+        ptx.push_str("    .reg .u64 %rd_pca_off;\n");
         ptx.push_str("    .reg .b16 %rs_pca;\n");
         ptx.push_str("    .reg .pred %p_pca_load, %p_pca_done;\n");
         // 4096-byte SMEM buffer: holds up to 2048 u16 segment_ids entries.
@@ -305,9 +322,11 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig) {
     if config.segment_masked {
         ptx.push_str("\n    // --- PCA Tier A: load segment_ids from global to shared ---\n");
         ptx.push_str("    ld.param.u64 %rd_seg_global, [segment_ids_ptr];\n");
-        // Get SMEM base address of seg_smem in generic space, then narrow to u32.
-        ptx.push_str("    cvta.shared.u64 %rd_seg_smem, seg_smem;\n");
-        ptx.push_str("    cvt.u32.u64 %seg_base, %rd_seg_smem;\n");
+        // Get SMEM generic-space address of seg_smem.  Keep as u64 — do NOT
+        // truncate to u32.  On Blackwell (sm_120+) the low 32 bits of the
+        // generic address are NOT the raw shared-space offset when the label
+        // sits at shared offset 0, so the old cvt.u32.u64 trick is incorrect.
+        ptx.push_str("    cvta.shared.u64 %seg_base, seg_smem;\n");
         // Only warp 0 participates in the load.
         ptx.push_str("    setp.lt.u32 %p_pca_load, %tid_x, 32;\n");
         ptx.push_str("    @!%p_pca_load bra PCA_LOAD_DONE;\n");
@@ -323,10 +342,11 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig) {
         ptx.push_str("    shl.b64 %rd_seg_smem, %rd_seg_smem, 1;\n");
         ptx.push_str("    add.u64 %rd_seg_smem, %rd_seg_smem, %rd_seg_global;\n");
         ptx.push_str("    ld.global.u16 %rs_pca, [%rd_seg_smem];\n");
-        // Shared address = seg_base + i * 2
-        ptx.push_str("    shl.b32 %r_pca_off, %r_pca_i, 1;\n");
-        ptx.push_str("    add.u32 %r_pca_off, %r_pca_off, %seg_base;\n");
-        ptx.push_str("    st.shared.u16 [%r_pca_off], %rs_pca;\n");
+        // Shared address = seg_base (u64 generic) + i * 2
+        ptx.push_str("    cvt.u64.u32 %rd_pca_off, %r_pca_i;\n");
+        ptx.push_str("    shl.b64 %rd_pca_off, %rd_pca_off, 1;\n");
+        ptx.push_str("    add.u64 %rd_pca_off, %rd_pca_off, %seg_base;\n");
+        ptx.push_str("    st.shared.u16 [%rd_pca_off], %rs_pca;\n");
         // Advance by warp size (32) for next stride.
         ptx.push_str("    add.u32 %r_pca_i, %r_pca_i, 32;\n");
         ptx.push_str("    bra PCA_LOAD_LOOP;\n");

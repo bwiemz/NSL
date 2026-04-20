@@ -93,12 +93,12 @@ expression: ptx
     .reg .u64 %rd_bwd_dwq, %rd_bwd_dwk, %rd_bwd_dwv, %rd_bwd_dx;
     .reg .u64 %q_smem_base, %k_smem_base, %v_smem_base;
     .reg .u64 %warp_row;
-    .reg .u64 %rd_seg_global, %rd_seg_smem;
-    .reg .u32 %seg_base;
-    .reg .u32 %r_q_SEGMASK, %r_k_SEGMASK;
+    .reg .u64 %rd_seg_global, %seg_base;
+    .reg .u64 %rd_q_SEGMASK, %rd_k_SEGMASK;
     .reg .b16 %rs_q_SEGMASK, %rs_k_SEGMASK;
     .reg .pred %p_seg_SEGMASK;
-    .reg .u32 %r_pca_i, %r_pca_seq, %r_pca_off;
+    .reg .u32 %r_pca_i, %r_pca_seq;
+    .reg .u64 %rd_pca_off;
     .reg .b16 %rs_pca;
     .reg .pred %p_pca_load, %p_pca_done;
     .reg .u64 %rd_bw_q_global, %rd_bw_k_global;
@@ -143,8 +143,7 @@ expression: ptx
 
     // --- PCA Tier A: load segment_ids from global to shared ---
     ld.param.u64 %rd_seg_global, [segment_ids_ptr];
-    cvta.shared.u64 %rd_seg_smem, seg_smem;
-    cvt.u32.u64 %seg_base, %rd_seg_smem;
+    cvta.shared.u64 %seg_base, seg_smem;
     setp.lt.u32 %p_pca_load, %tid_x, 32;
     @!%p_pca_load bra BW_PCA_LOAD_DONE;
     cvt.u32.u64 %r_pca_seq, %rd6;
@@ -152,13 +151,14 @@ expression: ptx
 BW_PCA_LOAD_LOOP:
     setp.ge.u32 %p_pca_done, %r_pca_i, %r_pca_seq;
     @%p_pca_done bra BW_PCA_LOAD_DONE;
-    cvt.u64.u32 %rd_seg_smem, %r_pca_i;
-    shl.b64 %rd_seg_smem, %rd_seg_smem, 1;
-    add.u64 %rd_seg_smem, %rd_seg_smem, %rd_seg_global;
-    ld.global.u16 %rs_pca, [%rd_seg_smem];
-    shl.b32 %r_pca_off, %r_pca_i, 1;
-    add.u32 %r_pca_off, %r_pca_off, %seg_base;
-    st.shared.u16 [%r_pca_off], %rs_pca;
+    cvt.u64.u32 %rd_pca_off, %r_pca_i;
+    shl.b64 %rd_pca_off, %rd_pca_off, 1;
+    add.u64 %rd_pca_off, %rd_pca_off, %rd_seg_global;
+    ld.global.u16 %rs_pca, [%rd_pca_off];
+    cvt.u64.u32 %rd_pca_off, %r_pca_i;
+    shl.b64 %rd_pca_off, %rd_pca_off, 1;
+    add.u64 %rd_pca_off, %rd_pca_off, %seg_base;
+    st.shared.u16 [%rd_pca_off], %rs_pca;
     add.u32 %r_pca_i, %r_pca_i, 32;
     bra BW_PCA_LOAD_LOOP;
 BW_PCA_LOAD_DONE:
@@ -885,14 +885,14 @@ V2_BWD_S_INNER_0:
     cvt.u64.u32 %rd_bw_k_global, %lane;
     add.u64 %rd_bw_k_global, %rd_bw_k_global, %k_start;
     // PCA Tier A: extend %p0 with cross-segment disjunction (spec 5.1)
-    cvt.u32.u64    %r_q_SEGMASK, %rd_bw_q_global;            // q_global low-32
-    shl.b32        %r_q_SEGMASK, %r_q_SEGMASK, 1;                 // q*sizeof(u16)
-    add.u32        %r_q_SEGMASK, %seg_base, %r_q_SEGMASK;      // &seg[q]
-    ld.shared.u16  %rs_q_SEGMASK, [%r_q_SEGMASK];
-    cvt.u32.u64    %r_k_SEGMASK, %rd_bw_k_global;            // k_global low-32
-    shl.b32        %r_k_SEGMASK, %r_k_SEGMASK, 1;                 // k*sizeof(u16)
-    add.u32        %r_k_SEGMASK, %seg_base, %r_k_SEGMASK;      // &seg[k]
-    ld.shared.u16  %rs_k_SEGMASK, [%r_k_SEGMASK];
+    and.b64        %rd_q_SEGMASK, %rd_bw_q_global, 0xFFFFFFFF; // q_global low-32 as u64
+    shl.b64        %rd_q_SEGMASK, %rd_q_SEGMASK, 1;                // q*sizeof(u16)
+    add.u64        %rd_q_SEGMASK, %seg_base, %rd_q_SEGMASK;     // &seg[q]
+    ld.shared.u16  %rs_q_SEGMASK, [%rd_q_SEGMASK];
+    and.b64        %rd_k_SEGMASK, %rd_bw_k_global, 0xFFFFFFFF; // k_global low-32 as u64
+    shl.b64        %rd_k_SEGMASK, %rd_k_SEGMASK, 1;                // k*sizeof(u16)
+    add.u64        %rd_k_SEGMASK, %seg_base, %rd_k_SEGMASK;     // &seg[k]
+    ld.shared.u16  %rs_k_SEGMASK, [%rd_k_SEGMASK];
     setp.ne.u16    %p_seg_SEGMASK, %rs_q_SEGMASK, %rs_k_SEGMASK;
     or.pred        %p1, %p1, %p_seg_SEGMASK;
     mov.f32 %f2, 0fFF800000;    // -INF
@@ -1238,14 +1238,14 @@ V2_BWD_S_INNER_1:
     cvt.u64.u32 %rd_bw_k_global, %lane;
     add.u64 %rd_bw_k_global, %rd_bw_k_global, %k_start;
     // PCA Tier A: extend %p0 with cross-segment disjunction (spec 5.1)
-    cvt.u32.u64    %r_q_SEGMASK, %rd_bw_q_global;            // q_global low-32
-    shl.b32        %r_q_SEGMASK, %r_q_SEGMASK, 1;                 // q*sizeof(u16)
-    add.u32        %r_q_SEGMASK, %seg_base, %r_q_SEGMASK;      // &seg[q]
-    ld.shared.u16  %rs_q_SEGMASK, [%r_q_SEGMASK];
-    cvt.u32.u64    %r_k_SEGMASK, %rd_bw_k_global;            // k_global low-32
-    shl.b32        %r_k_SEGMASK, %r_k_SEGMASK, 1;                 // k*sizeof(u16)
-    add.u32        %r_k_SEGMASK, %seg_base, %r_k_SEGMASK;      // &seg[k]
-    ld.shared.u16  %rs_k_SEGMASK, [%r_k_SEGMASK];
+    and.b64        %rd_q_SEGMASK, %rd_bw_q_global, 0xFFFFFFFF; // q_global low-32 as u64
+    shl.b64        %rd_q_SEGMASK, %rd_q_SEGMASK, 1;                // q*sizeof(u16)
+    add.u64        %rd_q_SEGMASK, %seg_base, %rd_q_SEGMASK;     // &seg[q]
+    ld.shared.u16  %rs_q_SEGMASK, [%rd_q_SEGMASK];
+    and.b64        %rd_k_SEGMASK, %rd_bw_k_global, 0xFFFFFFFF; // k_global low-32 as u64
+    shl.b64        %rd_k_SEGMASK, %rd_k_SEGMASK, 1;                // k*sizeof(u16)
+    add.u64        %rd_k_SEGMASK, %seg_base, %rd_k_SEGMASK;     // &seg[k]
+    ld.shared.u16  %rs_k_SEGMASK, [%rd_k_SEGMASK];
     setp.ne.u16    %p_seg_SEGMASK, %rs_q_SEGMASK, %rs_k_SEGMASK;
     or.pred        %p1, %p1, %p_seg_SEGMASK;
     mov.f32 %f2, 0fFF800000;    // -INF
@@ -1591,14 +1591,14 @@ V2_BWD_S_INNER_2:
     cvt.u64.u32 %rd_bw_k_global, %lane;
     add.u64 %rd_bw_k_global, %rd_bw_k_global, %k_start;
     // PCA Tier A: extend %p0 with cross-segment disjunction (spec 5.1)
-    cvt.u32.u64    %r_q_SEGMASK, %rd_bw_q_global;            // q_global low-32
-    shl.b32        %r_q_SEGMASK, %r_q_SEGMASK, 1;                 // q*sizeof(u16)
-    add.u32        %r_q_SEGMASK, %seg_base, %r_q_SEGMASK;      // &seg[q]
-    ld.shared.u16  %rs_q_SEGMASK, [%r_q_SEGMASK];
-    cvt.u32.u64    %r_k_SEGMASK, %rd_bw_k_global;            // k_global low-32
-    shl.b32        %r_k_SEGMASK, %r_k_SEGMASK, 1;                 // k*sizeof(u16)
-    add.u32        %r_k_SEGMASK, %seg_base, %r_k_SEGMASK;      // &seg[k]
-    ld.shared.u16  %rs_k_SEGMASK, [%r_k_SEGMASK];
+    and.b64        %rd_q_SEGMASK, %rd_bw_q_global, 0xFFFFFFFF; // q_global low-32 as u64
+    shl.b64        %rd_q_SEGMASK, %rd_q_SEGMASK, 1;                // q*sizeof(u16)
+    add.u64        %rd_q_SEGMASK, %seg_base, %rd_q_SEGMASK;     // &seg[q]
+    ld.shared.u16  %rs_q_SEGMASK, [%rd_q_SEGMASK];
+    and.b64        %rd_k_SEGMASK, %rd_bw_k_global, 0xFFFFFFFF; // k_global low-32 as u64
+    shl.b64        %rd_k_SEGMASK, %rd_k_SEGMASK, 1;                // k*sizeof(u16)
+    add.u64        %rd_k_SEGMASK, %seg_base, %rd_k_SEGMASK;     // &seg[k]
+    ld.shared.u16  %rs_k_SEGMASK, [%rd_k_SEGMASK];
     setp.ne.u16    %p_seg_SEGMASK, %rs_q_SEGMASK, %rs_k_SEGMASK;
     or.pred        %p1, %p1, %p_seg_SEGMASK;
     mov.f32 %f2, 0fFF800000;    // -INF
@@ -1944,14 +1944,14 @@ V2_BWD_S_INNER_3:
     cvt.u64.u32 %rd_bw_k_global, %lane;
     add.u64 %rd_bw_k_global, %rd_bw_k_global, %k_start;
     // PCA Tier A: extend %p0 with cross-segment disjunction (spec 5.1)
-    cvt.u32.u64    %r_q_SEGMASK, %rd_bw_q_global;            // q_global low-32
-    shl.b32        %r_q_SEGMASK, %r_q_SEGMASK, 1;                 // q*sizeof(u16)
-    add.u32        %r_q_SEGMASK, %seg_base, %r_q_SEGMASK;      // &seg[q]
-    ld.shared.u16  %rs_q_SEGMASK, [%r_q_SEGMASK];
-    cvt.u32.u64    %r_k_SEGMASK, %rd_bw_k_global;            // k_global low-32
-    shl.b32        %r_k_SEGMASK, %r_k_SEGMASK, 1;                 // k*sizeof(u16)
-    add.u32        %r_k_SEGMASK, %seg_base, %r_k_SEGMASK;      // &seg[k]
-    ld.shared.u16  %rs_k_SEGMASK, [%r_k_SEGMASK];
+    and.b64        %rd_q_SEGMASK, %rd_bw_q_global, 0xFFFFFFFF; // q_global low-32 as u64
+    shl.b64        %rd_q_SEGMASK, %rd_q_SEGMASK, 1;                // q*sizeof(u16)
+    add.u64        %rd_q_SEGMASK, %seg_base, %rd_q_SEGMASK;     // &seg[q]
+    ld.shared.u16  %rs_q_SEGMASK, [%rd_q_SEGMASK];
+    and.b64        %rd_k_SEGMASK, %rd_bw_k_global, 0xFFFFFFFF; // k_global low-32 as u64
+    shl.b64        %rd_k_SEGMASK, %rd_k_SEGMASK, 1;                // k*sizeof(u16)
+    add.u64        %rd_k_SEGMASK, %seg_base, %rd_k_SEGMASK;     // &seg[k]
+    ld.shared.u16  %rs_k_SEGMASK, [%rd_k_SEGMASK];
     setp.ne.u16    %p_seg_SEGMASK, %rs_q_SEGMASK, %rs_k_SEGMASK;
     or.pred        %p1, %p1, %p_seg_SEGMASK;
     mov.f32 %f2, 0fFF800000;    // -INF
@@ -2297,14 +2297,14 @@ V2_BWD_S_INNER_4:
     cvt.u64.u32 %rd_bw_k_global, %lane;
     add.u64 %rd_bw_k_global, %rd_bw_k_global, %k_start;
     // PCA Tier A: extend %p0 with cross-segment disjunction (spec 5.1)
-    cvt.u32.u64    %r_q_SEGMASK, %rd_bw_q_global;            // q_global low-32
-    shl.b32        %r_q_SEGMASK, %r_q_SEGMASK, 1;                 // q*sizeof(u16)
-    add.u32        %r_q_SEGMASK, %seg_base, %r_q_SEGMASK;      // &seg[q]
-    ld.shared.u16  %rs_q_SEGMASK, [%r_q_SEGMASK];
-    cvt.u32.u64    %r_k_SEGMASK, %rd_bw_k_global;            // k_global low-32
-    shl.b32        %r_k_SEGMASK, %r_k_SEGMASK, 1;                 // k*sizeof(u16)
-    add.u32        %r_k_SEGMASK, %seg_base, %r_k_SEGMASK;      // &seg[k]
-    ld.shared.u16  %rs_k_SEGMASK, [%r_k_SEGMASK];
+    and.b64        %rd_q_SEGMASK, %rd_bw_q_global, 0xFFFFFFFF; // q_global low-32 as u64
+    shl.b64        %rd_q_SEGMASK, %rd_q_SEGMASK, 1;                // q*sizeof(u16)
+    add.u64        %rd_q_SEGMASK, %seg_base, %rd_q_SEGMASK;     // &seg[q]
+    ld.shared.u16  %rs_q_SEGMASK, [%rd_q_SEGMASK];
+    and.b64        %rd_k_SEGMASK, %rd_bw_k_global, 0xFFFFFFFF; // k_global low-32 as u64
+    shl.b64        %rd_k_SEGMASK, %rd_k_SEGMASK, 1;                // k*sizeof(u16)
+    add.u64        %rd_k_SEGMASK, %seg_base, %rd_k_SEGMASK;     // &seg[k]
+    ld.shared.u16  %rs_k_SEGMASK, [%rd_k_SEGMASK];
     setp.ne.u16    %p_seg_SEGMASK, %rs_q_SEGMASK, %rs_k_SEGMASK;
     or.pred        %p1, %p1, %p_seg_SEGMASK;
     mov.f32 %f2, 0fFF800000;    // -INF
@@ -2650,14 +2650,14 @@ V2_BWD_S_INNER_5:
     cvt.u64.u32 %rd_bw_k_global, %lane;
     add.u64 %rd_bw_k_global, %rd_bw_k_global, %k_start;
     // PCA Tier A: extend %p0 with cross-segment disjunction (spec 5.1)
-    cvt.u32.u64    %r_q_SEGMASK, %rd_bw_q_global;            // q_global low-32
-    shl.b32        %r_q_SEGMASK, %r_q_SEGMASK, 1;                 // q*sizeof(u16)
-    add.u32        %r_q_SEGMASK, %seg_base, %r_q_SEGMASK;      // &seg[q]
-    ld.shared.u16  %rs_q_SEGMASK, [%r_q_SEGMASK];
-    cvt.u32.u64    %r_k_SEGMASK, %rd_bw_k_global;            // k_global low-32
-    shl.b32        %r_k_SEGMASK, %r_k_SEGMASK, 1;                 // k*sizeof(u16)
-    add.u32        %r_k_SEGMASK, %seg_base, %r_k_SEGMASK;      // &seg[k]
-    ld.shared.u16  %rs_k_SEGMASK, [%r_k_SEGMASK];
+    and.b64        %rd_q_SEGMASK, %rd_bw_q_global, 0xFFFFFFFF; // q_global low-32 as u64
+    shl.b64        %rd_q_SEGMASK, %rd_q_SEGMASK, 1;                // q*sizeof(u16)
+    add.u64        %rd_q_SEGMASK, %seg_base, %rd_q_SEGMASK;     // &seg[q]
+    ld.shared.u16  %rs_q_SEGMASK, [%rd_q_SEGMASK];
+    and.b64        %rd_k_SEGMASK, %rd_bw_k_global, 0xFFFFFFFF; // k_global low-32 as u64
+    shl.b64        %rd_k_SEGMASK, %rd_k_SEGMASK, 1;                // k*sizeof(u16)
+    add.u64        %rd_k_SEGMASK, %seg_base, %rd_k_SEGMASK;     // &seg[k]
+    ld.shared.u16  %rs_k_SEGMASK, [%rd_k_SEGMASK];
     setp.ne.u16    %p_seg_SEGMASK, %rs_q_SEGMASK, %rs_k_SEGMASK;
     or.pred        %p1, %p1, %p_seg_SEGMASK;
     mov.f32 %f2, 0fFF800000;    // -INF
@@ -3003,14 +3003,14 @@ V2_BWD_S_INNER_6:
     cvt.u64.u32 %rd_bw_k_global, %lane;
     add.u64 %rd_bw_k_global, %rd_bw_k_global, %k_start;
     // PCA Tier A: extend %p0 with cross-segment disjunction (spec 5.1)
-    cvt.u32.u64    %r_q_SEGMASK, %rd_bw_q_global;            // q_global low-32
-    shl.b32        %r_q_SEGMASK, %r_q_SEGMASK, 1;                 // q*sizeof(u16)
-    add.u32        %r_q_SEGMASK, %seg_base, %r_q_SEGMASK;      // &seg[q]
-    ld.shared.u16  %rs_q_SEGMASK, [%r_q_SEGMASK];
-    cvt.u32.u64    %r_k_SEGMASK, %rd_bw_k_global;            // k_global low-32
-    shl.b32        %r_k_SEGMASK, %r_k_SEGMASK, 1;                 // k*sizeof(u16)
-    add.u32        %r_k_SEGMASK, %seg_base, %r_k_SEGMASK;      // &seg[k]
-    ld.shared.u16  %rs_k_SEGMASK, [%r_k_SEGMASK];
+    and.b64        %rd_q_SEGMASK, %rd_bw_q_global, 0xFFFFFFFF; // q_global low-32 as u64
+    shl.b64        %rd_q_SEGMASK, %rd_q_SEGMASK, 1;                // q*sizeof(u16)
+    add.u64        %rd_q_SEGMASK, %seg_base, %rd_q_SEGMASK;     // &seg[q]
+    ld.shared.u16  %rs_q_SEGMASK, [%rd_q_SEGMASK];
+    and.b64        %rd_k_SEGMASK, %rd_bw_k_global, 0xFFFFFFFF; // k_global low-32 as u64
+    shl.b64        %rd_k_SEGMASK, %rd_k_SEGMASK, 1;                // k*sizeof(u16)
+    add.u64        %rd_k_SEGMASK, %seg_base, %rd_k_SEGMASK;     // &seg[k]
+    ld.shared.u16  %rs_k_SEGMASK, [%rd_k_SEGMASK];
     setp.ne.u16    %p_seg_SEGMASK, %rs_q_SEGMASK, %rs_k_SEGMASK;
     or.pred        %p1, %p1, %p_seg_SEGMASK;
     mov.f32 %f2, 0fFF800000;    // -INF
@@ -3356,14 +3356,14 @@ V2_BWD_S_INNER_7:
     cvt.u64.u32 %rd_bw_k_global, %lane;
     add.u64 %rd_bw_k_global, %rd_bw_k_global, %k_start;
     // PCA Tier A: extend %p0 with cross-segment disjunction (spec 5.1)
-    cvt.u32.u64    %r_q_SEGMASK, %rd_bw_q_global;            // q_global low-32
-    shl.b32        %r_q_SEGMASK, %r_q_SEGMASK, 1;                 // q*sizeof(u16)
-    add.u32        %r_q_SEGMASK, %seg_base, %r_q_SEGMASK;      // &seg[q]
-    ld.shared.u16  %rs_q_SEGMASK, [%r_q_SEGMASK];
-    cvt.u32.u64    %r_k_SEGMASK, %rd_bw_k_global;            // k_global low-32
-    shl.b32        %r_k_SEGMASK, %r_k_SEGMASK, 1;                 // k*sizeof(u16)
-    add.u32        %r_k_SEGMASK, %seg_base, %r_k_SEGMASK;      // &seg[k]
-    ld.shared.u16  %rs_k_SEGMASK, [%r_k_SEGMASK];
+    and.b64        %rd_q_SEGMASK, %rd_bw_q_global, 0xFFFFFFFF; // q_global low-32 as u64
+    shl.b64        %rd_q_SEGMASK, %rd_q_SEGMASK, 1;                // q*sizeof(u16)
+    add.u64        %rd_q_SEGMASK, %seg_base, %rd_q_SEGMASK;     // &seg[q]
+    ld.shared.u16  %rs_q_SEGMASK, [%rd_q_SEGMASK];
+    and.b64        %rd_k_SEGMASK, %rd_bw_k_global, 0xFFFFFFFF; // k_global low-32 as u64
+    shl.b64        %rd_k_SEGMASK, %rd_k_SEGMASK, 1;                // k*sizeof(u16)
+    add.u64        %rd_k_SEGMASK, %seg_base, %rd_k_SEGMASK;     // &seg[k]
+    ld.shared.u16  %rs_k_SEGMASK, [%rd_k_SEGMASK];
     setp.ne.u16    %p_seg_SEGMASK, %rs_q_SEGMASK, %rs_k_SEGMASK;
     or.pred        %p1, %p1, %p_seg_SEGMASK;
     mov.f32 %f2, 0fFF800000;    // -INF

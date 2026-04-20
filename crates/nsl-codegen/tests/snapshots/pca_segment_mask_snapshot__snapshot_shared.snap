@@ -3,13 +3,13 @@ source: crates/nsl-codegen/tests/pca_segment_mask_snapshot.rs
 expression: "snapshot_with(SegmentResidency::Shared)"
 ---
     // PCA Tier A: extend %p0 with cross-segment disjunction (spec 5.1)
-    cvt.u32.u64    %r_q_SEGMASK, %rd35;            // q_global low-32
-    shl.b32        %r_q_SEGMASK, %r_q_SEGMASK, 1;                 // q*sizeof(u16)
-    add.u32        %r_q_SEGMASK, %seg_base, %r_q_SEGMASK;      // &seg[q]
-    ld.shared.u16  %rs_q_SEGMASK, [%r_q_SEGMASK];
-    cvt.u32.u64    %r_k_SEGMASK, %rd34;            // k_global low-32
-    shl.b32        %r_k_SEGMASK, %r_k_SEGMASK, 1;                 // k*sizeof(u16)
-    add.u32        %r_k_SEGMASK, %seg_base, %r_k_SEGMASK;      // &seg[k]
-    ld.shared.u16  %rs_k_SEGMASK, [%r_k_SEGMASK];
+    and.b64        %rd_q_SEGMASK, %rd35, 0xFFFFFFFF; // q_global low-32 as u64
+    shl.b64        %rd_q_SEGMASK, %rd_q_SEGMASK, 1;                // q*sizeof(u16)
+    add.u64        %rd_q_SEGMASK, %seg_base, %rd_q_SEGMASK;     // &seg[q]
+    ld.shared.u16  %rs_q_SEGMASK, [%rd_q_SEGMASK];
+    and.b64        %rd_k_SEGMASK, %rd34, 0xFFFFFFFF; // k_global low-32 as u64
+    shl.b64        %rd_k_SEGMASK, %rd_k_SEGMASK, 1;                // k*sizeof(u16)
+    add.u64        %rd_k_SEGMASK, %seg_base, %rd_k_SEGMASK;     // &seg[k]
+    ld.shared.u16  %rs_k_SEGMASK, [%rd_k_SEGMASK];
     setp.ne.u16    %p_seg_SEGMASK, %rs_q_SEGMASK, %rs_k_SEGMASK;
     or.pred        %p0, %p0, %p_seg_SEGMASK;

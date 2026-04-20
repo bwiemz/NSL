@@ -43,8 +43,11 @@ use crate::pca_segment::SegmentResidency;
 ///   from tile-offset arithmetic.
 /// * `k_pos_reg` — name of the u64 register holding `k_global`
 ///   (e.g. `"%rd34"`).
-/// * `segment_ids_reg` — name of the u32 register holding the
-///   SMEM base address of `segment_ids` (e.g. `"%seg_base"`).
+/// * `segment_ids_reg` — name of the u64 register holding the
+///   SMEM generic-space base address of `segment_ids` (e.g. `"%seg_base"`).
+///   Must be the full 64-bit generic address from `cvta.shared.u64` — do NOT
+///   truncate to u32 (Blackwell sm_120 produces wrong values when the label is
+///   at shared offset 0).
 /// * `residency` — `Shared` uses `ld.shared.u16`; `Streamed` emits
 ///   a `trap` marker (out of scope for Tier A).
 /// * `mask_pred_inout` — name of the u1 predicate register that
@@ -52,7 +55,7 @@ use crate::pca_segment::SegmentResidency;
 ///   this helper OR-extends it in place.
 ///
 /// The emitted PTX allocates three internal scratch registers
-/// (`%r_sq_SEGMASK`, `%r_sk_SEGMASK`, `%p_seg_SEGMASK`) whose names
+/// (`%rd_q_SEGMASK`, `%rd_k_SEGMASK`, `%p_seg_SEGMASK`) whose names
 /// are fixed rather than monotonically seeded — multiple calls in
 /// the same kernel would collide.  Tier A never calls this helper
 /// more than once per kernel, so fixed names are fine; if a future
@@ -75,10 +78,13 @@ pub fn emit_segment_mask_predicate(
     ));
 }
 
-/// Private sub-helper: emit the u64 → u32 truncation, offset-by-2,
-/// add to SMEM base, and `ld.shared.u16`.  Produces the 4-instruction
-/// prelude per position.  Residency-aware: `Shared` = `ld.shared.u16`,
-/// `Streamed` = `trap;` (Tier A out of scope).
+/// Private sub-helper: compute a u64 SMEM address and `ld.shared.u16`.
+/// Uses full u64 arithmetic throughout to avoid the `cvt.u32.u64` truncation
+/// bug on Blackwell (sm_120) where `seg_smem` at shared offset 0 produces a
+/// generic address whose low 32 bits are non-zero (0x13E00 observed on
+/// RTX 5070 Ti), causing CUDA_ERROR_ILLEGAL_ADDRESS at runtime.
+///
+/// Residency-aware: `Shared` = `ld.shared.u16`, `Streamed` = `trap;` (Tier A out of scope).
 fn emit_segment_id_load(
     ptx:             &mut String,
     pos_reg:         &str,
@@ -86,21 +92,23 @@ fn emit_segment_id_load(
     residency:       SegmentResidency,
     tag:             char,
 ) {
-    let r_off = format!("%r_{tag}_SEGMASK");
+    let rd_off = format!("%rd_{tag}_SEGMASK");
     let rs = format!("%rs_{tag}_SEGMASK");
+    // Use u64 width throughout: avoid cvt.u32.u64 which truncates the Blackwell
+    // generic address incorrectly when the label is at shared offset 0.
     ptx.push_str(&format!(
-        "    cvt.u32.u64    {r_off}, {pos_reg};            // {tag}_global low-32\n"
+        "    and.b64        {rd_off}, {pos_reg}, 0xFFFFFFFF; // {tag}_global low-32 as u64\n"
     ));
     ptx.push_str(&format!(
-        "    shl.b32        {r_off}, {r_off}, 1;                 // {tag}*sizeof(u16)\n"
+        "    shl.b64        {rd_off}, {rd_off}, 1;                // {tag}*sizeof(u16)\n"
     ));
     match residency {
         SegmentResidency::Shared => {
             ptx.push_str(&format!(
-                "    add.u32        {r_off}, {segment_ids_reg}, {r_off};      // &seg[{tag}]\n"
+                "    add.u64        {rd_off}, {segment_ids_reg}, {rd_off};     // &seg[{tag}]\n"
             ));
             ptx.push_str(&format!(
-                "    ld.shared.u16  {rs}, [{r_off}];\n"
+                "    ld.shared.u16  {rs}, [{rd_off}];\n"
             ));
         }
         SegmentResidency::Streamed => {
