@@ -313,9 +313,17 @@ fn run_emit_calibration(fixture_dir: &Path, medium_dir: Option<&str>) {
         );
     }
 
-    // Emit the diff-ready Rust constants block.
+    // Emit the diff-ready Rust constants block. `--emit-calibration` is a
+    // retune operation, which always changes tier boundaries (T0/T1/T2) —
+    // invariant #1 requires bumping ANALYSIS_VERSION in the same commit.
+    // Emit the current-version-plus-one so the copy-paste produces a
+    // bump-compliant patch regardless of what version the source is on.
     println!();
-    println!("pub const ANALYSIS_VERSION: u32 = 2;");
+    println!(
+        "pub const ANALYSIS_VERSION: u32 = {}; // bumped from {} per invariant #1",
+        ANALYSIS_VERSION + 1,
+        ANALYSIS_VERSION,
+    );
     println!("pub const CALIB_K:     f64 = {k:.6e};");
     println!("pub const CALIB_T0:    f64 = {t0:.6e};");
     println!("pub const CALIB_T1:    f64 = {t1:.6e};");
