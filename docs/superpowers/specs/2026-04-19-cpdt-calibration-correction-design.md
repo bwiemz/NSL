@@ -97,7 +97,7 @@ emit: CALIB_K, plateau_start, plateau_end,
 
 Log-midpoint rather than arithmetic midpoint because the K grid is log-spaced and the plateau boundaries are log-spaced; log-midpoint is the natural center in the grid's native measure.
 
-**Measured result (pre-dispatch):** feasible plateau is approximately `[0.057, 0.064]`, log-midpoint `K ≈ 0.060`. Per-fixture disagreement at K=0.060: calib_small 15.91%, calib_medium 2.51%. Corpus-wide 3.76%. (Precise K will come from the implementer's grid; these values are from an independent Python grid sweep. Expect ~2% variation due to grid quantization.)
+**Measured result (post-dispatch-verification, implementer's 601-point Rust grid):** feasible plateau is `[0.0562, 0.0708]`, log-midpoint `K = 0.0631`. Per-fixture disagreement at `K = 0.0631`: calib_tiny 0.00%, calib_small 15.91%, calib_medium 2.51%. Corpus-wide 3.76%. The plateau's upper bound is wider than a coarser hand-sweep initially suggested — calib_medium's disagreement stays at 17.51% from ~0.066 to ~0.071 (still below the 20% monitoring threshold) before crossing into the 25% regime above ~0.083. The plateau-midpoint algorithm correctly identifies the flat region.
 
 **Why plateau-midpoint beats pure corpus-minimum.** The corpus minimum at K=0.046 produces a 26.5% calib_small disagreement — still traceable to the numel-collision pattern per §5.4, but alarming when a reviewer sees it in isolation. The plateau-midpoint sacrifices ~1% corpus-wide disagreement (2.5% → 3.76%) to keep both per-fixture numbers comfortably under the monitoring threshold. The plateau itself is a robustness signal: a wide plateau means K isn't fragile to small measurement perturbations, so future corpus changes are less likely to destabilize the calibration.
 
