@@ -36,7 +36,10 @@
 //! head_dim features and project using the first d_model features.
 //!
 //! Configs whose total_bytes exceed 99 KB are rejected by the validator.
-//! The asymmetric (block_q ≠ block_kv) constraint is a separate validator error.
+//! Asymmetric (block_q ≠ block_kv) configs are now supported by the fused
+//! emitter — the K/V pre-passes use `kv_iters = block_kv / 4` decoupled
+//! from the Q sweep's `iters = block_q / 4`.  See
+//! `crates/nsl-codegen/src/flash_attention_v2/mod.rs` Step 3 / Step 5.
 //!
 //! ## CPU reference
 //!
@@ -636,9 +639,10 @@ fn fused_csha_32x32x32_heads4_nocausal() {
 ///
 /// ## Constraint-blocked configs (reported, not failed)
 ///
-///   - (32,64,…) and (64,32,…) with fused_projections: block_q≠block_kv violates
-///     the K pre-pass invariant (writes exactly block_q K rows into the block_kv
-///     K tile). The validator rejects these.
+///   (None currently — asymmetric block_q ≠ block_kv configs are now
+///   supported by the fused emitter.  Historical constraint: "the K
+///   pre-pass writes exactly block_q K rows into the block_kv K tile"
+///   was fixed by decoupling K/V pre-passes with `kv_iters = block_kv/4`.)
 ///
 /// These are documented kernel constraints, not numerical failures.
 #[test]
@@ -664,10 +668,15 @@ fn csha_fused_matrix_sweep() {
         // without exceeding the RTX 5070 Ti's 99 KB cuFuncSetAttribute limit).
         (32, 32, 128, 4, false, false),
         (32, 32, 128, 4, true,  false),
-        // Asymmetric (block_q, block_kv) combos: block_q≠block_kv with fused_projections
-        // violates K pre-pass invariant → validator rejects.
+        // Asymmetric (block_q, block_kv) combos.  The K pre-pass now decouples
+        // its iteration count from block_q (uses `kv_iters = block_kv / 4`),
+        // so asymmetric configs are valid.  Two representative rows: one
+        // block_q < block_kv (wide-KV: long-context prefill shape), one
+        // block_q > block_kv (narrow-KV: short-sequence training shape).
         (32, 64, 32, 4, false, false),
+        (32, 64, 32, 4, true,  false),
         (64, 32, 32, 4, false, false),
+        (64, 32, 32, 4, true,  false),
     ];
 
     let mut failures  = Vec::new();

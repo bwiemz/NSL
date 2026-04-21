@@ -33,6 +33,11 @@ pub fn synthesize_flash_attention_ptx_v2(config: &FlashAttentionConfig) -> Vec<u
     // Outer q_tile_iter loop: iterates ceil(block_q / 4) times. Each
     // iteration processes 4 rows (one per warp).
     let iters = (config.block_q as u32).div_ceil(4);
+    // K/V pre-pass iteration count — decoupled from `iters` so the fused
+    // path supports asymmetric tiles (block_q != block_kv). Each K/V
+    // pre-pass iter writes 4 tile rows (one per warp); `kv_iters` rounds
+    // up to cover the full block_kv-row tile.
+    let kv_iters = (config.block_kv as u32).div_ceil(4);
     let slices = (config.head_dim as u32) / 32;
     let fused_proj = config.csha.as_ref().map_or(false, |c| c.fused_projections);
 
@@ -70,11 +75,13 @@ pub fn synthesize_flash_attention_ptx_v2(config: &FlashAttentionConfig) -> Vec<u
         emit_weight_tile_load(&mut ptx, config, "Wk", "csha_wk_ptr", base + wt_bytes, 0);
         emit_weight_tile_load(&mut ptx, config, "Wv", "csha_wv_ptr", base + 2 * wt_bytes, 0);
 
-        // ── Step 3: K pre-pass — all q_tile_iters write K rows to kv_offset.
-        //   Reads normalized x (written by RMSNorm pre-pass above).
+        // ── Step 3: K pre-pass — all kv_iters write K rows to kv_offset.
+        //   Reads normalized x (written by RMSNorm pre-pass above).  Uses
+        //   `kv_iters` (not `iters`) so asymmetric tiles (block_q !=
+        //   block_kv) populate exactly block_kv K rows.
         ptx.push_str("    // CSHA K pre-pass: populate full K SMEM tile\n");
-        for q_iter in 0..iters {
-            phases::csha_hooks::emit_k_prepass_sweep(&mut ptx, config, q_iter);
+        for kv_iter in 0..kv_iters {
+            phases::csha_hooks::emit_k_prepass_sweep(&mut ptx, config, kv_iter);
         }
         ptx.push_str("    bar.sync 0; // K tile complete; safe for all S-computes\n");
 
@@ -83,6 +90,32 @@ pub fn synthesize_flash_attention_ptx_v2(config: &FlashAttentionConfig) -> Vec<u
         //   S-compute reads K for QK^T.  Q rotation runs per-q_iter inside
         //   emit_rope_epilogue; K rotation runs once here for the whole tile.
         phases::csha_hooks::emit_rope_k_epilogue(&mut ptx, config);
+
+        // ── Step 3c: K save — post-RoPE K save runs here so asymmetric
+        //   tiles (block_q != block_kv) cover exactly block_kv K rows.
+        //   Iteration count is `kv_iters`, matching the K pre-pass.
+        //
+        //   Single-tile assumption inherited from the symmetric path: the
+        //   K save helper writes to HBM at `%q_start + warp_row` because
+        //   the K pre-pass reads x at `%q_start + warp_row` (see
+        //   `csha_hooks::emit_kv_prepass_reginit`), so the write address
+        //   is consistent with the data's sequence position.  The backward
+        //   `kv_load::emit_k` reads HBM without a `q_start` term, which
+        //   forces `q_start == 0` (single-tile workloads — all current
+        //   test harnesses and the prescribed Llama-3 proxy shape).
+        //   Multi-tile K-save addressing is a pre-existing gap orthogonal
+        //   to asymmetric tile support; tracked as a follow-up.
+        //
+        //   Gated on `save_activations_for_backward` at the orchestrator
+        //   level to avoid emitting N×"skip" comment lines when saves are
+        //   disabled (the shipped-binary common case).
+        if config.csha.as_ref().map_or(false, |c| c.save_activations_for_backward) {
+            for kv_iter in 0..kv_iters {
+                phases::csha_hooks::emit_save_activations_subset(
+                    &mut ptx, config, kv_iter, phases::csha_hooks::SaveSet::K,
+                );
+            }
+        }
 
         // ── Step 4: S-compute pass — Q sweep + RoPE + Q-load + S-compute + softmax.
         // RMSNorm already done above; do NOT call emit_prologue again here.
@@ -106,11 +139,13 @@ pub fn synthesize_flash_attention_ptx_v2(config: &FlashAttentionConfig) -> Vec<u
             // RoPE epilogue.
             phases::csha_hooks::emit_rope_epilogue(&mut ptx, config, q_iter);
 
-            // Tier C: save post-RoPE Q and K only here — V SMEM tile aliases
-            // K during the S-pass (same `kv_offset`) and is only populated
-            // with real V values after the V pre-pass, so V save is deferred.
+            // Tier C: save post-RoPE Q only here.  K was saved in Step 3c
+            // (after K RoPE, before the S-compute loop) to decouple from
+            // block_q — asymmetric-tile configs need kv_iters worth of K
+            // rows, not iters.  V SMEM tile aliases K during the S-pass
+            // and is saved after the V pre-pass below (Step 5).
             phases::csha_hooks::emit_save_activations_subset(
-                &mut ptx, config, q_iter, phases::csha_hooks::SaveSet::QK,
+                &mut ptx, config, q_iter, phases::csha_hooks::SaveSet::Q,
             );
 
             // Q load (q_smem → registers).
@@ -132,20 +167,23 @@ pub fn synthesize_flash_attention_ptx_v2(config: &FlashAttentionConfig) -> Vec<u
             phases::csha_hooks::emit_save_softmax_state(&mut ptx, config, q_iter);
         }
 
-        // V pre-pass: all q_tile_iters write V rows to kv_offset.
+        // V pre-pass: all kv_iters write V rows to kv_offset.
         // All S-computes are done; K at kv_offset is no longer needed.
+        // Uses `kv_iters` (not `iters`) so asymmetric tiles populate
+        // exactly block_kv V rows regardless of block_q.
         ptx.push_str("    bar.sync 0; // S-pass done; V pre-pass overwrites K SMEM\n");
         ptx.push_str("    // CSHA V pre-pass: populate full V SMEM tile\n");
-        for q_iter in 0..iters {
-            phases::csha_hooks::emit_v_prepass_sweep(&mut ptx, config, q_iter);
+        for kv_iter in 0..kv_iters {
+            phases::csha_hooks::emit_v_prepass_sweep(&mut ptx, config, kv_iter);
         }
         ptx.push_str("    bar.sync 0; // V tile complete; safe for all PV-accums\n");
 
         // Tier C: V save runs AFTER the V pre-pass so v_smem_base actually
-        // holds V projection (during S-pass it aliased K).
-        for q_iter in 0..iters {
+        // holds V projection (during S-pass it aliased K).  Iterates
+        // `kv_iters` to cover all block_kv V rows.
+        for kv_iter in 0..kv_iters {
             phases::csha_hooks::emit_save_activations_subset(
-                &mut ptx, config, q_iter, phases::csha_hooks::SaveSet::V,
+                &mut ptx, config, kv_iter, phases::csha_hooks::SaveSet::V,
             );
         }
 

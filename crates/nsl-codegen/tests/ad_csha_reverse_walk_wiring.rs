@@ -319,12 +319,18 @@ fn gap_i1_training_config_clamps_plan_fusion_flags() {
         validate_scalar_v2_config, Direction,
     };
 
-    // Plan-level config: fused_projections=true + block_q != block_kv →
-    // validator rejects ("fused_projections requires block_q == block_kv").
+    // Plan-level config: fused_projections + fused_output_proj at
+    // head_dim=128 + d_model=128 blows the SMEM budget (116 KB+ exceeds
+    // the 99 KB dynamic-SMEM cap on all supported archs) → validator
+    // rejects.  Previously this test used `block_q != block_kv` to
+    // force rejection; that asymmetry is now valid (see `flash_attention_v2/mod.rs`
+    // Step 3 kv_iters decoupling), so we use the SMEM-budget path
+    // instead — same test intent (plan-config validator-rejecting),
+    // different trigger.
     let plan_cfg = FlashAttentionConfig {
-        block_q: 32,
-        block_kv: 64, // mismatched vs block_q → forces validator rejection
-        head_dim: 32,
+        block_q: 64,
+        block_kv: 64,
+        head_dim: 128,
         causal: false,
         paged: false,
         rope_q: false,
@@ -335,7 +341,7 @@ fn gap_i1_training_config_clamps_plan_fusion_flags() {
             fused_projections: true,
             fused_output_proj: true,
             save_activations_for_backward: true,
-            d_model: 32,
+            d_model: 128,
             ..CshaExtras::default()
         }),
     };
