@@ -10,7 +10,7 @@ Annotated reading order for [`examples/`](../../examples/). Each entry tells you
 
 **What it teaches:** `let`/`const` bindings, typed variables, function definitions, control flow (`if`/`elif`/`else`), `for` loops, and `struct` declarations — the complete NSL syntax surface in one short file.
 
-**Key lines:** 3–4 (`let`/`const` declarations), 7–9 (function definition with typed params and return type), 14–20 (if/elif/else), 28–31 (struct definition).
+**Key lines:** 3–5 (`let`/`const` declarations), 7–9 (function definition with typed params and return type), 14–20 (if/elif/else), 22–25 (`for` loop over a list), 28–31 (struct definition).
 
 **Next:** `m11_model_basic.nsl` — once you can read basic NSL, learn the `model` keyword.
 
@@ -34,7 +34,7 @@ Annotated reading order for [`examples/`](../../examples/). Each entry tells you
 
 **What it teaches:** Using the `grad` keyword to compute gradients — the destructured `(loss, grads)` return, what the trailing expression inside the `grad` block means, and how the tape sees element-wise operations and reductions.
 
-**Key lines:** 6–7 (tensor setup with `ones`), 9–11 (`grad(w): ... y.sum()` — the complete gradient expression), 13–14 (printing loss and grads to confirm shapes).
+**Key lines:** 1–4 (inline derivation — forward / backward math in closed form), 6–7 (tensor setup with `ones`), 9–11 (`grad(w): ... y.sum()` — the complete gradient expression), 13–14 (printing loss and grads to confirm shapes).
 
 **Next:** `m14_adam_scheduler.nsl` — plug gradients into a full training loop.
 
@@ -46,7 +46,7 @@ Annotated reading order for [`examples/`](../../examples/). Each entry tells you
 
 **What it teaches:** The `train` block DSL — declaring an optimizer, attaching a learning-rate scheduler, writing a `step` callback that computes loss, and the `on_step` hook for logging.
 
-**Key lines:** 1 (`from nsl.nn.losses import mse_loss`), 3–8 (model with a `forward` method), 12–20 (`train(model=m, epochs=10):` — optimizer, scheduler, step, callbacks).
+**Key lines:** 3–8 (model with a `forward` method), 13–20 (`train(model=m, epochs=10):` — optimizer, scheduler, step, callbacks).
 
 **Next:** `gpt2.nsl` — a production-scale model that uses every feature above.
 
@@ -86,6 +86,8 @@ Reference examples for specific subsystems. Read the corresponding wiki page fir
 
 Read [Optimization-Passes § CSHA](Optimization-Passes.md#csha) first.
 
+**Start here:** read [`csha_toy_pretrain_hd32.nsl`](../../examples/csha_toy_pretrain_hd32.nsl) as reference material — it requires a GPU with sufficient shared memory to run.
+
 **What to look at:** The file documents the two compiler gaps it closes (DOC-GAP A: scanner now descends into `ModelMember::Method`; DOC-GAP B: `head_dim=N` is now a decorator parameter). The `model TinyAttn` block (lines 25–38) shows the minimal `@flash_attention(head_dim=32)` method pattern. Weight names `wq`/`wk`/`wv` are intentional — `ProjKind::from_param_name` depends on them for boundary scanning.
 
 [`examples/csha_toy_pretrain_hd32.nsl`](../../examples/csha_toy_pretrain_hd32.nsl)
@@ -96,11 +98,9 @@ Read [Optimization-Passes § CSHA](Optimization-Passes.md#csha) first.
 
 No dedicated `.nsl` example file exists for WRGA. The behavior is covered by the CLI integration tests:
 
-- **`crates/nsl-cli/tests/wrga_adapter_runtime_equivalence.rs`** — primary reference: verifies that fused LoRA/IA³/GatedLoRA adapter materialisation produces the same output as the unfused path. Start here.
-- **`crates/nsl-cli/tests/wrga_gatedlora_backward_trigger.rs`** — exercises the backward-trigger measurement (tests the 2.5× threshold condition that schedules the fused backward kernel).
-- **`crates/nsl-cli/tests/wrga_report_cli.rs`** — exercises `--wrga-report` CLI output.
-
-[`crates/nsl-cli/tests/wrga_adapter_runtime_equivalence.rs`](../../crates/nsl-cli/tests/wrga_adapter_runtime_equivalence.rs)
+- **[`wrga_adapter_runtime_equivalence.rs`](../../crates/nsl-cli/tests/wrga_adapter_runtime_equivalence.rs)** — primary reference: verifies that fused LoRA/IA³/GatedLoRA adapter materialisation produces the same output as the unfused path. Start here.
+- **[`wrga_gatedlora_backward_trigger.rs`](../../crates/nsl-cli/tests/wrga_gatedlora_backward_trigger.rs)** — exercises the backward-trigger measurement (tests the 2.5× threshold condition that schedules the fused backward kernel).
+- **[`wrga_report_cli.rs`](../../crates/nsl-cli/tests/wrga_report_cli.rs)** — exercises `--wrga-report` CLI output.
 
 ---
 
@@ -108,10 +108,8 @@ No dedicated `.nsl` example file exists for WRGA. The behavior is covered by the
 
 No dedicated `.nsl` example file exists for CPDT. The behavior is covered by the CLI integration tests:
 
-- **`crates/nsl-cli/tests/cpdt_weights_cli.rs`** — primary reference: exercises `load_safetensors(...)` auto-detect, the four-case decision table in `nsl build`, and the `validate(wm, applied)` layer-prefix validation.
-- **`crates/nsl-cli/tests/cpdt_cli.rs`** — covers the `@cpdt(weight_aware=false)` runtime opt-out and the one-`@cpdt`-per-program semantic enforcement.
-
-[`crates/nsl-cli/tests/cpdt_weights_cli.rs`](../../crates/nsl-cli/tests/cpdt_weights_cli.rs)
+- **[`cpdt_weights_cli.rs`](../../crates/nsl-cli/tests/cpdt_weights_cli.rs)** — primary reference: exercises `load_safetensors(...)` auto-detect, the four-case decision table in `nsl build`, and the `validate(wm, applied)` layer-prefix validation.
+- **[`cpdt_cli.rs`](../../crates/nsl-cli/tests/cpdt_cli.rs)** — covers the `@cpdt(weight_aware=false)` runtime opt-out and the one-`@cpdt`-per-program semantic enforcement.
 
 ---
 
