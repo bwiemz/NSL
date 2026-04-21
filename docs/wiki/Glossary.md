@@ -12,43 +12,43 @@ Every acronym, keyword, and decorator you will see in NSL code, specs, or PRs. O
 Build-time per-channel weight quantization that scales by observed activation magnitudes; produces INT4/INT8 weights with minimal perplexity loss. See [`spec/06-quantization.nsl.md`](../../spec/06-quantization.nsl.md); implementation in `crates/nsl-codegen/src/calibration/`.
 
 ### <a id="ccr"></a>CCR — Common-kernel Combination Rewriting
-IR pass that merges semantically identical kernel invocations (same op, same shape, same arguments) into a single dispatch before FASE and WGGO fire. See [CCR.pdf](../../CCR.pdf); fires as the first optimization pass in `compile_quant_block`.
+IR pass that merges semantically identical kernel invocations (same op, same shape, same arguments) into a single dispatch before FASE and WGGO fire. See [CCR.pdf](../research/CCR.pdf); fires as the first optimization pass in `compile_quant_block`.
 
 ### <a id="cep"></a>CEP — Compilation-Evaluated Pruning
 Compile-time head-pruning pass: the oracle, importance scorer, model rewriter, and greedy search are all applied before the binary is emitted — pruned heads generate no code at all. Implementation: `crates/nsl-codegen/src/cep.rs`; decisions surfaced via `nsl profile --explain-wggo`.
 
 ### <a id="cesh"></a>CESH — Compiler-Evaluated Speculative Hypothesis
-Research paper describing NSL's speculative decoding approach: hypothesis generation and verification are modeled as a single compiler-evaluated IR transformation. See [CESH.pdf](../../CESH.pdf).
+Research paper describing NSL's speculative decoding approach: hypothesis generation and verification are modeled as a single compiler-evaluated IR transformation. See [CESH.pdf](../research/CESH.pdf).
 
 ### <a id="cfa"></a>CFA — Compiler-Fused Attention (research)
-Research document covering the compiler's strategy for fusing multi-head attention with adjacent elementwise and normalization ops. See [NSL-CFA-Research.md.pdf](../../NSL-CFA-Research.md.pdf).
+Research document covering the compiler's strategy for fusing multi-head attention with adjacent elementwise and normalization ops. See [NSL-CFA-Research.md.pdf](../research/NSL-CFA-Research.md.pdf).
 
 ### <a id="cfie"></a>CFIE — Compiler-Fused Inference Engine
-NSL's inference-serving orchestration layer: KV plan, fused sampling, speculative decode, persistent KV cache, and grammar-constrained generation all compose into one codegen pass. See [CFIE.pdf](../../CFIE.pdf); implementation in `crates/nsl-codegen/src/cfie.rs`.
+NSL's inference-serving orchestration layer: KV plan, fused sampling, speculative decode, persistent KV cache, and grammar-constrained generation all compose into one codegen pass. See [CFIE.pdf](../research/CFIE.pdf); implementation in `crates/nsl-codegen/src/cfie.rs`.
 
 ### <a id="cftp"></a>CFTP — Compiler-Fused Training Pipeline
-Research framework covering NSL's full training pipeline as a compile-time transformation: batching, packing, gradient accumulation, and optimizer dispatch fused into a single low-level loop. See [CFTP.pdf](../../CFTP.pdf); PCA (§2) and FASE (§1) are the shipped sub-systems.
+Research framework covering NSL's full training pipeline as a compile-time transformation: batching, packing, gradient accumulation, and optimizer dispatch fused into a single low-level loop. See [CFTP.pdf](../research/CFTP.pdf); PCA (§2) and FASE (§1) are the shipped sub-systems.
 
 ### <a id="cgac"></a>CGAC — Compiler-Guided Activation Checkpointing
-Research document describing NSL's compile-time strategy for inserting `@checkpoint` recomputation points to trade compute for memory, guided by the memory planner's interference graph. See [CGAC.pdf](../../CGAC.pdf).
+Research document describing NSL's compile-time strategy for inserting `@checkpoint` recomputation points to trade compute for memory, guided by the memory planner's interference graph. See [CGAC.pdf](../research/CGAC.pdf).
 
 ### <a id="cidp"></a>CIDP — Compiler-Integrated Data Pipeline
-Research document covering NSL's data-loading and tokenization pipeline as a compiler-visible IR construct, enabling fusion with the training loop. See [NSL-CIDP-Research.md.pdf](../../NSL-CIDP-Research.md.pdf).
+Research document covering NSL's data-loading and tokenization pipeline as a compiler-visible IR construct, enabling fusion with the training loop. See [NSL-CIDP-Research.md.pdf](../research/NSL-CIDP-Research.md.pdf).
 
 ### <a id="ckvq"></a>CKVQ — Compiler-aware KV-cache Quantization
-Research paper on compile-time KV-cache quantization: the compiler annotates KV tensors with dtype/precision decisions at build time rather than selecting them at runtime. See [CKVQ.pdf](../../CKVQ.pdf).
+Research paper on compile-time KV-cache quantization: the compiler annotates KV tensors with dtype/precision decisions at build time rather than selecting them at runtime. See [CKVQ.pdf](../research/CKVQ.pdf).
 
 ### <a id="cpdt"></a>CPDT — Compile-time Parallelism & Distributed Training
-Pass that plans ZeRO-style tensor sharding, collective-comm scheduling, mixed precision, and expert placement across a `ClusterSpec` before binary emission. See [CPDT Research.pdf](<../../CPDT Research.pdf>); design specs in [`docs/superpowers/specs/`](../superpowers/specs/) (search `cpdt`); implementation in `crates/nsl-codegen/src/cpdt.rs`.
+Pass that plans ZeRO-style tensor sharding, collective-comm scheduling, mixed precision, and expert placement across a `ClusterSpec` before binary emission. See [CPDT Research.pdf](<../research/CPDT Research.pdf>); design specs in [`docs/superpowers/specs/`](../superpowers/specs/) (search `cpdt`); implementation in `crates/nsl-codegen/src/cpdt.rs`.
 
 ### <a id="cpkd"></a>CPKD — Compiler-Planned Knowledge Distillation
-Research document covering compile-time wiring of teacher and student models so the KL-divergence distillation loss and gradient flow are lowered as a single fused Wengert list. See [CPKD.pdf](../../CPKD.pdf).
+Research document covering compile-time wiring of teacher and student models so the KL-divergence distillation loss and gradient flow are lowered as a single fused Wengert list. See [CPKD.pdf](../research/CPKD.pdf).
 
 ### <a id="csha"></a>CSHA — Compiler-Synthesized Holistic Attention
-Compile-time pass that fuses RMSNorm + Q/K/V projection (via m16n8k16 MMA) + RoPE rotation + FlashAttention-2 into a single PTX kernel, eliminating intermediate HBM traffic. See [NSL-CSHA-Research.PDF](../../NSL-CSHA-Research.PDF); design specs in [`docs/superpowers/specs/`](../superpowers/specs/) (search `csha`); implementation in `crates/nsl-codegen/src/csha.rs`.
+Compile-time pass that fuses RMSNorm + Q/K/V projection (via m16n8k16 MMA) + RoPE rotation + FlashAttention-2 into a single PTX kernel, eliminating intermediate HBM traffic. See [NSL-CSHA-Research.PDF](../research/NSL-CSHA-Research.PDF); design specs in [`docs/superpowers/specs/`](../superpowers/specs/) (search `csha`); implementation in `crates/nsl-codegen/src/csha.rs`.
 
 ### <a id="css"></a>CSS — Compiler-Scheduled Sparsity
-Research document on compile-time sparsity scheduling: the compiler decides where to insert and exploit structured sparsity patterns (block-sparse, N:M) at build time. See [CSS.pdf](../../CSS.pdf).
+Research document on compile-time sparsity scheduling: the compiler decides where to insert and exploit structured sparsity patterns (block-sparse, N:M) at build time. See [CSS.pdf](../research/CSS.pdf).
 
 ### <a id="fase"></a>FASE — Fused Accumulation-Step Elimination
 Training optimization pass that defers gradient accumulation into a fused per-parameter loop (Deferred mode) or buffers it explicitly (FullBuffer mode), eliminating redundant optimizer-step dispatch. See [`docs/superpowers/specs/`](../superpowers/specs/) (search `fase`); implementation in `crates/nsl-codegen/src/fase.rs`.
@@ -57,10 +57,10 @@ Training optimization pass that defers gradient accumulation into a fused per-pa
 FlashAttention-2 kernel variant that packs multiple variable-length sequences into a single tile pass, using per-segment masking to preserve causal isolation. Defined in CFTP §2. See [`docs/superpowers/specs/2026-04-18-pca-tier-a-design.md`](../superpowers/specs/2026-04-18-pca-tier-a-design.md); implementation in `crates/nsl-codegen/src/pca_segment.rs`.
 
 ### <a id="wggo"></a>WGGO — Wengert Graph Global Optimization
-Multi-level ILP/DP pass that co-optimizes CEP head pruning, CSHA fusion level, WRGA adapter rank, and CPDT shard factor across all layers jointly, producing an `AppliedPlan` that downstream consumers consume. See [NSL-WGGO-Research.md.pdf](../../NSL-WGGO-Research.md.pdf); implementation in `crates/nsl-codegen/src/wggo.rs`.
+Multi-level ILP/DP pass that co-optimizes CEP head pruning, CSHA fusion level, WRGA adapter rank, and CPDT shard factor across all layers jointly, producing an `AppliedPlan` that downstream consumers consume. See [NSL-WGGO-Research.md.pdf](../research/NSL-WGGO-Research.md.pdf); implementation in `crates/nsl-codegen/src/wggo.rs`.
 
 ### <a id="wrga"></a>WRGA — Wengert-Pruned Roofline-Guided Adaptation
-Pass that decides per-layer LoRA/IA³/GatedLoRA adapter ranks by combining Wengert-graph pruning, roofline bandwidth analysis, and spectral rank scoring, then emits fused MMA PTX for the adapter forward (and optionally backward) pass. See [NSL-WRGA-Research.PDF](../../NSL-WRGA-Research.PDF); design specs in [`docs/superpowers/specs/`](../superpowers/specs/) (search `wrga`); implementation in `crates/nsl-codegen/src/wrga.rs`.
+Pass that decides per-layer LoRA/IA³/GatedLoRA adapter ranks by combining Wengert-graph pruning, roofline bandwidth analysis, and spectral rank scoring, then emits fused MMA PTX for the adapter forward (and optionally backward) pass. See [NSL-WRGA-Research.PDF](../research/NSL-WRGA-Research.PDF); design specs in [`docs/superpowers/specs/`](../superpowers/specs/) (search `wrga`); implementation in `crates/nsl-codegen/src/wrga.rs`.
 
 ---
 
@@ -73,7 +73,7 @@ NVIDIA's CUDA BLAS library. NSL does not link cuBLAS — it emits its own MMA-ba
 Rust crate (version 0.19) providing safe wrappers around the CUDA driver API. NSL uses it for device-memory allocation, PTX module loading, and kernel launch. See `Cargo.toml` feature flags `dynamic-linking` + `cuda-version-from-build-system`.
 
 ### <a id="fa"></a>FA / FA-2 — FlashAttention / FlashAttention-2
-Tiled online-softmax attention algorithm (Dao et al.) that keeps Q, K, V tiles in SRAM to avoid full HBM materialisation of the N×N attention matrix. NSL's FA-2 scalar v2 emitter lives in `crates/nsl-codegen/src/flash_attention_v2/`; activated via the `@flash_attention` decorator or the `@csha` decorator chain. See [NSL-CFA-Research.md.pdf](../../NSL-CFA-Research.md.pdf) for the NSL-specific fusion research.
+Tiled online-softmax attention algorithm (Dao et al.) that keeps Q, K, V tiles in SRAM to avoid full HBM materialisation of the N×N attention matrix. NSL's FA-2 scalar v2 emitter lives in `crates/nsl-codegen/src/flash_attention_v2/`; activated via the `@flash_attention` decorator or the `@csha` decorator chain. See [NSL-CFA-Research.md.pdf](../research/NSL-CFA-Research.md.pdf) for the NSL-specific fusion research.
 
 ### <a id="fp8"></a>FP8
 8-bit floating-point format (E4M3 or E5M2) supported on H100/Hopper and RTX 4090+. NSL uses FP8 for V tensors in CSHA Tier D (per-head mixed precision); E4M3 for Q/K (range-critical) and E5M2 for V (gradient-safe). See [`spec/06-quantization.nsl.md`](../../spec/06-quantization.nsl.md).
@@ -207,22 +207,22 @@ See [Roadmap](Roadmap.md) for the full phase → version → milestone mapping.
 
 | Acronym | PDF |
 |---------|-----|
-| CSHA    | [NSL-CSHA-Research.PDF](../../NSL-CSHA-Research.PDF) |
-| WRGA    | [NSL-WRGA-Research.PDF](../../NSL-WRGA-Research.PDF) |
-| WGGO    | [NSL-WGGO-Research.md.pdf](../../NSL-WGGO-Research.md.pdf) |
-| CPDT    | [CPDT Research.pdf](<../../CPDT Research.pdf>) |
-| CFTP    | [CFTP.pdf](../../CFTP.pdf) |
-| CPKD    | [CPKD.pdf](../../CPKD.pdf) |
-| CCR     | [CCR.pdf](../../CCR.pdf) |
-| CEP     | [CEP.pdf](../../CEP.pdf) |
-| CESH    | [CESH.pdf](../../CESH.pdf) |
-| CFIE    | [CFIE.pdf](../../CFIE.pdf) |
-| CGAC    | [CGAC.pdf](../../CGAC.pdf) |
-| CKVQ    | [CKVQ.pdf](../../CKVQ.pdf) |
-| CSS     | [CSS.pdf](../../CSS.pdf) |
-| CFA     | [NSL-CFA-Research.md.pdf](../../NSL-CFA-Research.md.pdf) |
-| CIDP    | [NSL-CIDP-Research.md.pdf](../../NSL-CIDP-Research.md.pdf) |
+| CSHA    | [NSL-CSHA-Research.PDF](../research/NSL-CSHA-Research.PDF) |
+| WRGA    | [NSL-WRGA-Research.PDF](../research/NSL-WRGA-Research.PDF) |
+| WGGO    | [NSL-WGGO-Research.md.pdf](../research/NSL-WGGO-Research.md.pdf) |
+| CPDT    | [CPDT Research.pdf](<../research/CPDT Research.pdf>) |
+| CFTP    | [CFTP.pdf](../research/CFTP.pdf) |
+| CPKD    | [CPKD.pdf](../research/CPKD.pdf) |
+| CCR     | [CCR.pdf](../research/CCR.pdf) |
+| CEP     | [CEP.pdf](../research/CEP.pdf) |
+| CESH    | [CESH.pdf](../research/CESH.pdf) |
+| CFIE    | [CFIE.pdf](../research/CFIE.pdf) |
+| CGAC    | [CGAC.pdf](../research/CGAC.pdf) |
+| CKVQ    | [CKVQ.pdf](../research/CKVQ.pdf) |
+| CSS     | [CSS.pdf](../research/CSS.pdf) |
+| CFA     | [NSL-CFA-Research.md.pdf](../research/NSL-CFA-Research.md.pdf) |
+| CIDP    | [NSL-CIDP-Research.md.pdf](../research/NSL-CIDP-Research.md.pdf) |
 
 ---
 
-*Last structurally verified against commit `d09d8061` on 2026-04-21. If the crate graph or pass order in this page no longer matches reality, open an issue tagged `docs-rot`.*
+*Last structurally verified against commit `9a1b512e` on 2026-04-21. If the crate graph or pass order in this page no longer matches reality, open an issue tagged `docs-rot`.*
