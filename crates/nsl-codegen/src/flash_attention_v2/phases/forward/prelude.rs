@@ -171,13 +171,16 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig) {
     // Used by emit_save_activations to write post-RoPE Q/K/V to HBM for the
     // fused source-AD backward kernel. `%f_diag` and `%r_save_qlo` are J-A2
     // diagnostic scratch regs used only when `NSL_CSHA_DUMP_SAVE_STATE` is set;
+    // `%f_sdx_fmax` / `%f_sdx_nmax` / `%f_sdx_fsum` are J-A3 softmax-internal
+    // capture regs written in softmax.rs at the three decisive points
+    // (post-butterfly-max, post-online-update, post-butterfly-sum). All are
     // declared unconditionally because ptxas prunes unused virtual regs.
     if config.csha.as_ref().map_or(false, |c| c.save_activations_for_backward) {
         ptx.push_str(
             "    .reg .u64 %rd_save_base, %rd_save_off, %rd_save_elem, %rd_save_smem, %rd_save_wrow, %rd_save_col, %rd_save_colb;\n",
         );
         ptx.push_str("    .reg .u32 %r_save_wrow, %r_save_qlo;\n");
-        ptx.push_str("    .reg .f32 %f_diag;\n");
+        ptx.push_str("    .reg .f32 %f_diag, %f_sdx_fmax, %f_sdx_nmax, %f_sdx_fsum;\n");
         ptx.push_str("    .reg .b16 %h_save_v;\n");
         ptx.push_str("    .reg .pred %p_save_null, %p_rowmax_null, %p_rowsum_null, %p_skip_rm, %p_skip_rs;\n");
     }
