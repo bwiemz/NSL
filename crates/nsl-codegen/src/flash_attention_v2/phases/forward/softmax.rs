@@ -204,20 +204,39 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
 
 /// J-A4 direct-HBM-store helper: emits PTX that (on lane 0 of each warp)
 /// stores the current `%f0` to `row_max_ptr[batch, head, q_start + warp_row]`.
-/// Bypasses all scratch-register allocation, so ptxas cannot coalesce the
-/// captured value with an aliasing f32 register whose later writes would
-/// clobber it. The store uses the same addressing math as
-/// `csha_hooks::emit_save_softmax_state` so the HBM layout matches the
-/// backward kernel's expectations (and so the diagnostic overwrites the
-/// real %row_max slot, where the downstream dump infrastructure already
-/// reads from).
-///
-/// `label` is emitted as a PTX comment for traceability. `q_tile_iter` is
-/// needed to compute `warp_row = warp_id + q_tile_iter * 4`.
+/// Thin wrapper over `emit_direct_hbm_store_of_reg` that hardcodes `%f0`
+/// as the source operand for backward-compatibility with existing call sites.
 fn emit_direct_hbm_store_of_f0(ptx: &mut String, q_tile_iter: u32, label: &str) {
+    emit_direct_hbm_store_of_reg(ptx, q_tile_iter, label, "%f0");
+}
+
+/// J-A4/J-A5 direct-HBM-store helper parameterized on the source f32 register.
+/// Bypasses all scratch-register allocation (via direct `st.global.f32`), so
+/// ptxas cannot coalesce the captured value with aliasing regs whose later
+/// writes clobber it. Uses the same addressing math as
+/// `csha_hooks::emit_save_softmax_state` so the HBM layout matches the
+/// backward kernel and the downstream dump infrastructure can read it back.
+///
+/// Preconditions (caller's responsibility):
+/// - `config.save_activations_for_backward` is true (so prelude has the
+///   required scratch-reg declarations: `%rd_save_*`, `%r_save_wrow`,
+///   `%p_save_null`, `%p_rowmax_null`, `%p_skip_rm`).
+/// - Caller has composed their diag mode into csha_hooks so the default
+///   row_max write suppresses (via `direct_*` starts-with check) to avoid
+///   the real save-path store overwriting this direct store.
+///
+/// `src_reg` is the PTX register name (including `%`) to store. `label` is
+/// emitted as a comment for traceability; `q_tile_iter` drives the warp_row
+/// offset calculation.
+pub(crate) fn emit_direct_hbm_store_of_reg(
+    ptx: &mut String,
+    q_tile_iter: u32,
+    label: &str,
+    src_reg: &str,
+) {
     ptx.push_str(&format!(
-        "    // J-A4 direct HBM store: {} (q_tile_iter={})\n",
-        label, q_tile_iter
+        "    // J-A4/A5 direct HBM store: {} (src={}, q_tile_iter={})\n",
+        label, src_reg, q_tile_iter
     ));
     // Lane-0 gate: only lane 0 stores to avoid 32-way races on the same address.
     ptx.push_str("    setp.ne.u32 %p_save_null, %lane, 0;\n");
@@ -239,7 +258,10 @@ fn emit_direct_hbm_store_of_f0(ptx: &mut String, q_tile_iter: u32, label: &str) 
     ptx.push_str("    add.u64 %rd_save_elem, %rd_save_base, %rd_save_off;\n");
     ptx.push_str("    setp.eq.u64 %p_rowmax_null, %rd_save_base, 0;\n");
     ptx.push_str("    or.pred %p_skip_rm, %p_rowmax_null, %p_save_null;\n");
-    ptx.push_str("    @!%p_skip_rm st.global.f32 [%rd_save_elem], %f0;\n");
+    ptx.push_str(&format!(
+        "    @!%p_skip_rm st.global.f32 [%rd_save_elem], {};\n",
+        src_reg
+    ));
 }
 
 #[cfg(test)]

@@ -370,8 +370,23 @@ fn emit_fused_forward_under_claim(
             );
             builder.ins().uextend(cl_types::I64, scale_bits_i32)
         } else {
-            // Already an integer Value — trust the caller.
-            scale_val
+            // Integer Value — typically an NslTensor handle (I64 pointer) for
+            // scale, since NSL expressions like `1.0 / sqrt(32.0)` often flow
+            // as rank-0 tensors through the Wengert list. Extract the scalar
+            // via `nsl_tensor_item` (returns f64), then f64->f32->bits as in
+            // the F64 branch. Prior code silently trusted `scale_val` as bits,
+            // which sent a POINTER to the kernel's `.param .f32 scale` slot
+            // and made %scale load from the lower 32 bits of that pointer —
+            // a tiny denormal near 1e-35 that silently multiplied Q*K^T to
+            // garbage downstream of the softmax butterfly.
+            let scale_f64 = call(compiler, builder, "nsl_tensor_item", &[scale_val])?;
+            let scale_f32 = builder.ins().fdemote(cl_types::F32, scale_f64);
+            let scale_bits_i32 = builder.ins().bitcast(
+                cl_types::I32,
+                cranelift_codegen::ir::MemFlags::new(),
+                scale_f32,
+            );
+            builder.ins().uextend(cl_types::I64, scale_bits_i32)
         }
     } else {
         // Default scale = 1.0f32 bits.

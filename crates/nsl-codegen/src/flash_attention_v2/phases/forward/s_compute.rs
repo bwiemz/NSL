@@ -18,6 +18,7 @@
 
 use crate::flash_attention::FlashAttentionConfig;
 use crate::flash_attention_v2::phases::q_load::Q_BASE;
+use crate::flash_attention_v2::phases::softmax::emit_direct_hbm_store_of_reg;
 use crate::flash_attention_v2::smem_layout::{kv_offset, sp_offset};
 
 pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
@@ -25,6 +26,25 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
     let slices   = head_dim / 32;
     let block_kv = config.block_kv as u32;
     let fused = config.csha.as_ref().map_or(false, |c| c.fused_projections);
+    let capture = config
+        .csha
+        .as_ref()
+        .map_or(false, |c| c.save_activations_for_backward);
+    // J-A5 s_compute-internal captures. Env-gated at codegen time.
+    //   - direct_q0        : lane-0 snapshot of %f{Q_BASE} before k loop
+    //                        (should be 32.0 for ones input; tells us if
+    //                        q_load populated Q registers correctly).
+    //   - direct_k00       : lane-0 snapshot of %f1 (= K[k=0, d=lane=0])
+    //                        after the SMEM load and cvt in slice-0 of the
+    //                        k=0 iteration; tells us if k_tile_load wrote
+    //                        the SMEM kv_offset region correctly.
+    //   - direct_qk_raw    : lane-0 snapshot of %f0 after the fma slices
+    //                        loop completes for k=0, before butterfly sum;
+    //                        the per-lane partial Q*K contribution. Lane 0
+    //                        for slice-0 of head_dim=32 is q[0]*k[0,0].
+    let diag_mode: String = std::env::var("NSL_CSHA_DUMP_SAVE_STATE")
+        .ok()
+        .unwrap_or_default();
     // SP slice base offset for this q_tile_iter (same logic as softmax.rs).
     let sp_iter_offset = if fused {
         sp_offset(config) + q_tile_iter * 4 * block_kv * 4
@@ -36,6 +56,32 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
         "    // Phase 2: S = Q*K^T (q_tile_iter = {})\n",
         q_tile_iter
     ));
+
+    // J-A5 direct_scale: snapshot %scale (the 1/sqrt(d_k) param loaded at
+    // kernel prelude) once per warp before the k loop. Ones-input expected
+    // value: 1/sqrt(32) ≈ 0.176777. If this reads back ~1e-34, the scale
+    // parameter isn't reaching the kernel correctly (or ld.param.f32 /
+    // the FFI is mis-threading the bits).
+    if capture && diag_mode == "direct_scale" {
+        emit_direct_hbm_store_of_reg(
+            ptx,
+            q_tile_iter,
+            "lane-0 %scale param",
+            "%scale",
+        );
+    }
+
+    // J-A5 direct_q0: snapshot lane-0's Q slice-0 register before the k
+    // loop. Stored to row_max HBM so the dump infrastructure can read it.
+    if capture && diag_mode == "direct_q0" {
+        let q0_reg = format!("%f{}", Q_BASE);
+        emit_direct_hbm_store_of_reg(
+            ptx,
+            q_tile_iter,
+            "lane-0 Q_BASE (Q slice 0)",
+            &q0_reg,
+        );
+    }
 
     // Loop over k in 0..block_kv.
     ptx.push_str("    mov.u32 %r1, 0;                           // k = 0\n");
@@ -69,9 +115,49 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
         ptx.push_str("    add.u64 %rd33, %rd33, %rd32;              // + K row base\n");
         ptx.push_str("    ld.shared.b16 %h0, [%rd33];\n");
         ptx.push_str("    cvt.f32.f16 %f1, %h0;                     // K[k, d]\n");
+        // J-A5 direct_k00 capture: fires only on slice 0 AND only when the
+        // k-loop iterator %r1 == 0. %f1 here is K[k=0, d=lane] in f32,
+        // just after cvt.f32.f16 from the SMEM b16 tile.
+        if i == 0 && capture && diag_mode == "direct_k00" {
+            ptx.push_str("    setp.ne.u32 %p0, %r1, 0;\n");
+            ptx.push_str(&format!(
+                "    @%p0 bra V2_DIAG_K00_SKIP_{};\n",
+                q_tile_iter
+            ));
+            emit_direct_hbm_store_of_reg(
+                ptx,
+                q_tile_iter,
+                "K[k=0, d=lane] from SMEM (lane-0 stores K[0,0])",
+                "%f1",
+            );
+            ptx.push_str(&format!("V2_DIAG_K00_SKIP_{}:\n", q_tile_iter));
+        }
         ptx.push_str(&format!(
             "    fma.rn.f32 %f0, %f{}, %f1, %f0;           // partial += Q*K\n",
             Q_BASE + i
+        ));
+    }
+
+    // J-A5 direct_qk_raw capture: after the per-slice fma accumulation,
+    // BEFORE butterfly sum. Fires only when k-loop iterator %r1 == 0.
+    // %f0 on lane 0 is q[0] * k[0, 0..slice-1] summed — the per-lane
+    // partial Q*K for lane 0, before the butterfly folds in other lanes'
+    // contributions. For head_dim=32 (slices=1), this equals q[0] * k[0,0].
+    if capture && diag_mode == "direct_qk_raw" {
+        ptx.push_str("    setp.ne.u32 %p0, %r1, 0;\n");
+        ptx.push_str(&format!(
+            "    @%p0 bra V2_DIAG_QK_RAW_SKIP_{};\n",
+            q_tile_iter
+        ));
+        emit_direct_hbm_store_of_reg(
+            ptx,
+            q_tile_iter,
+            "per-lane partial Q*K for k=0, pre-butterfly",
+            "%f0",
+        );
+        ptx.push_str(&format!(
+            "V2_DIAG_QK_RAW_SKIP_{}:\n",
+            q_tile_iter
         ));
     }
 
@@ -83,7 +169,45 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
         ));
         ptx.push_str("    add.f32 %f0, %f0, %shfl_tmp;\n");
     }
+    // J-A5 direct_post_bfly capture: post-butterfly, pre-scale. Lane-0 %f0
+    // should be the sum of 32 per-lane partials. For ones, 32 * 1024 = 32768.
+    if capture && diag_mode == "direct_post_bfly" {
+        ptx.push_str("    setp.ne.u32 %p0, %r1, 0;\n");
+        ptx.push_str(&format!(
+            "    @%p0 bra V2_DIAG_POST_BFLY_SKIP_{};\n",
+            q_tile_iter
+        ));
+        emit_direct_hbm_store_of_reg(
+            ptx,
+            q_tile_iter,
+            "lane-0 %f0 post-butterfly-sum for k=0 (pre-scale)",
+            "%f0",
+        );
+        ptx.push_str(&format!(
+            "V2_DIAG_POST_BFLY_SKIP_{}:\n",
+            q_tile_iter
+        ));
+    }
     ptx.push_str("    mul.f32 %f0, %f0, %scale;                 // S *= 1/sqrt(d_k)\n");
+    // J-A5 direct_post_scale capture: post-scale, pre-causal. Should be
+    // 32768 / sqrt(32) ≈ 5792.6 for ones input.
+    if capture && diag_mode == "direct_post_scale" {
+        ptx.push_str("    setp.ne.u32 %p0, %r1, 0;\n");
+        ptx.push_str(&format!(
+            "    @%p0 bra V2_DIAG_POST_SCALE_SKIP_{};\n",
+            q_tile_iter
+        ));
+        emit_direct_hbm_store_of_reg(
+            ptx,
+            q_tile_iter,
+            "lane-0 %f0 post-scale for k=0",
+            "%f0",
+        );
+        ptx.push_str(&format!(
+            "V2_DIAG_POST_SCALE_SKIP_{}:\n",
+            q_tile_iter
+        ));
+    }
 
     // Causal mask: if k_global > q_row_global, S = -inf.
     if config.causal {
@@ -98,6 +222,29 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
         ptx.push_str("    add.u64 %rd35, %q_start, %rd35;            // q_row_global\n");
         ptx.push_str("    setp.gt.u64 %p0, %rd34, %rd35;\n");
         ptx.push_str("    @%p0 mov.f32 %f0, 0fFF800000;             // -inf\n");
+    }
+
+    // J-A5 direct_s_store_pre capture: lane-0 %f0 immediately before the
+    // SMEM store. This is the value s_compute COMMITS to shmem_S[warp, k].
+    // Only fires for k=0. If this shows 5792.6 (scaled Q*K for ones input)
+    // but softmax's direct_s0 reads back 1e-30, something overwrites SMEM
+    // between s_compute's write and softmax's read.
+    if capture && diag_mode == "direct_s_store_pre" {
+        ptx.push_str("    setp.ne.u32 %p0, %r1, 0;\n");
+        ptx.push_str(&format!(
+            "    @%p0 bra V2_DIAG_S_STORE_PRE_SKIP_{};\n",
+            q_tile_iter
+        ));
+        emit_direct_hbm_store_of_reg(
+            ptx,
+            q_tile_iter,
+            "lane-0 %f0 pre-SMEM-store for k=0 (scaled post-causal S)",
+            "%f0",
+        );
+        ptx.push_str(&format!(
+            "V2_DIAG_S_STORE_PRE_SKIP_{}:\n",
+            q_tile_iter
+        ));
     }
 
     // Lane 0 stores full S to shmem_S[warp_id, k].
