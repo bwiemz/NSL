@@ -95,14 +95,14 @@ Full reference: [`spec/09-hardware-abstraction.nsl.md`](../../spec/09-hardware-a
 
 | Decorator | Purpose | Spec |
 |---|---|---|
-| [`@export`](Glossary.md#dec-export) | Mark function as C-ABI exported | `spec/11-interoperability.nsl.md` |
+| [`@export`](Glossary.md#dec-export) | Mark function as C-ABI exported | [`spec/11-interoperability.nsl.md`](../../spec/11-interoperability.nsl.md) |
 | [`@inspect`](Glossary.md#dec-inspect) | Dev-time shape/value inspection | [`Development-Setup`](Development-Setup.md#devtools) |
 | [`@flash_attention`](Glossary.md#dec-flash-attention) | Lower to FA-2 kernel | [`Optimization-Passes`](Optimization-Passes.md) |
-| [`@cpdt`](Glossary.md#dec-cpdt) | Weight-aware compilation | `spec/06-quantization.nsl.md` |
-| [`@no_grad`](Glossary.md#dec-no-grad) | Disable autodiff tape | `spec/03-automatic-differentiation.nsl.md` |
-| [`@checkpoint`](Glossary.md#dec-checkpoint) | Gradient checkpointing | `spec/03-automatic-differentiation.nsl.md` |
-| [`@fuse`](Glossary.md#dec-fuse) | Elementwise fusion hint | `spec/09-hardware-abstraction.nsl.md` |
-| [`@tie_weights`](Glossary.md#dec-tie-weights) | Share parameters across modules | `spec/04-model-definition.nsl.md` |
+| [`@cpdt`](Glossary.md#dec-cpdt) | Weight-aware compilation | [`spec/06-quantization.nsl.md`](../../spec/06-quantization.nsl.md) |
+| [`@no_grad`](Glossary.md#dec-no-grad) | Disable autodiff tape | [`spec/03-automatic-differentiation.nsl.md`](../../spec/03-automatic-differentiation.nsl.md) |
+| [`@checkpoint`](Glossary.md#dec-checkpoint) | Gradient checkpointing | [`spec/03-automatic-differentiation.nsl.md`](../../spec/03-automatic-differentiation.nsl.md) |
+| [`@fuse`](Glossary.md#dec-fuse) | Elementwise fusion hint | [`spec/09-hardware-abstraction.nsl.md`](../../spec/09-hardware-abstraction.nsl.md) |
+| [`@tie_weights`](Glossary.md#dec-tie-weights) | Share parameters across modules | [`spec/04-model-definition.nsl.md`](../../spec/04-model-definition.nsl.md) |
 | [`@shard`](Glossary.md#dec-shard) | Tensor parallelism | M30 milestone spec |
 | [`@autotune`](Glossary.md#dec-autotune) | Build-time kernel tuning | M26 milestone spec |
 
