@@ -75,6 +75,48 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
         ptx.push_str("    max.f32 %f0, %f0, %f1;\n");
     }
 
+    // J-A4 direct-HBM capture: `NSL_CSHA_DUMP_SAVE_STATE=direct_s0` stores
+    // lane 0's pre-butterfly `%f0` (= `S[warp_row, 0]` post-SMEM-load) to
+    // the row_max_ptr HBM buffer at the per-row offset. Bypasses all scratch
+    // registers so ptxas cannot coalesce. If the read-back looks sensible
+    // per warp, SMEM S is correct and the bug lives in the butterfly or
+    // later online-update path. If uniform garbage, s_compute or SMEM
+    // storage is the root cause.
+    let direct_mode: String = std::env::var("NSL_CSHA_DUMP_SAVE_STATE")
+        .ok()
+        .unwrap_or_default();
+    if capture && direct_mode == "direct_s0" {
+        emit_direct_hbm_store_of_f0(ptx, q_tile_iter, "S[warp_row, 0] pre-butterfly (lane 0)");
+    }
+    // J-A4 sanity check: under `direct_const` mode, store the literal f32
+    // 99.0 directly to row_max_ptr[warp_row]. If HBM reads back 99.0, the
+    // direct-store plumbing is correct and any garbage in other direct modes
+    // IS the register value at capture time (not a plumbing bug).
+    if capture && direct_mode == "direct_const" {
+        ptx.push_str(&format!(
+            "    // J-A4 direct const store: 99.0f to row_max[warp_row] (q_tile_iter={})\n",
+            q_tile_iter
+        ));
+        ptx.push_str("    mov.f32 %f_sdx_fmax, 0f42C60000;  // 99.0f\n");
+        ptx.push_str("    setp.ne.u32 %p_save_null, %lane, 0;\n");
+        ptx.push_str(&format!(
+            "    add.u32 %r_save_wrow, %warp_id, {}; // warp_row\n",
+            q_tile_iter * 4
+        ));
+        ptx.push_str("    cvt.u64.u32 %rd_save_wrow, %r_save_wrow;\n");
+        ptx.push_str("    mul.lo.u64 %rd_save_off, %batch_idx, %rd5;\n");
+        ptx.push_str("    add.u64 %rd_save_off, %rd_save_off, %head_idx;\n");
+        ptx.push_str("    mul.lo.u64 %rd_save_off, %rd_save_off, %rd6;\n");
+        ptx.push_str("    add.u64 %rd_save_off, %rd_save_off, %q_start;\n");
+        ptx.push_str("    add.u64 %rd_save_off, %rd_save_off, %rd_save_wrow;\n");
+        ptx.push_str("    shl.b64 %rd_save_off, %rd_save_off, 2;\n");
+        ptx.push_str("    ld.param.u64 %rd_save_base, [row_max_ptr];\n");
+        ptx.push_str("    add.u64 %rd_save_elem, %rd_save_base, %rd_save_off;\n");
+        ptx.push_str("    setp.eq.u64 %p_rowmax_null, %rd_save_base, 0;\n");
+        ptx.push_str("    or.pred %p_skip_rm, %p_rowmax_null, %p_save_null;\n");
+        ptx.push_str("    @!%p_skip_rm st.global.f32 [%rd_save_elem], %f_sdx_fmax;\n");
+    }
+    let _ = direct_mode.as_str();
     // Warp butterfly max.
     for offset in [16u32, 8, 4, 2, 1] {
         ptx.push_str(&format!(
@@ -86,6 +128,12 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
     // J-A3 capture: post-butterfly reduced max, before online update.
     if capture {
         ptx.push_str("    mov.f32 %f_sdx_fmax, %f0;  // J-A3 post-butterfly max\n");
+    }
+    // J-A4: mode `direct_fmax` stores lane-0's post-butterfly `%f0` directly
+    // to HBM. Same bypass argument as `direct_s0`, but captures the butterfly
+    // result rather than the pre-butterfly input.
+    if capture && direct_mode == "direct_fmax" {
+        emit_direct_hbm_store_of_f0(ptx, q_tile_iter, "%f0 post-butterfly reduced max");
     }
 
     // === Step 2: online update row_max, compute correction ===
@@ -152,6 +200,46 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
     ptx.push_str("    add.f32 %row_sum, %row_sum, %f2;\n");
 
     ptx.push_str("    bar.sync 0;  // FENCE: all warps done writing P in-place\n");
+}
+
+/// J-A4 direct-HBM-store helper: emits PTX that (on lane 0 of each warp)
+/// stores the current `%f0` to `row_max_ptr[batch, head, q_start + warp_row]`.
+/// Bypasses all scratch-register allocation, so ptxas cannot coalesce the
+/// captured value with an aliasing f32 register whose later writes would
+/// clobber it. The store uses the same addressing math as
+/// `csha_hooks::emit_save_softmax_state` so the HBM layout matches the
+/// backward kernel's expectations (and so the diagnostic overwrites the
+/// real %row_max slot, where the downstream dump infrastructure already
+/// reads from).
+///
+/// `label` is emitted as a PTX comment for traceability. `q_tile_iter` is
+/// needed to compute `warp_row = warp_id + q_tile_iter * 4`.
+fn emit_direct_hbm_store_of_f0(ptx: &mut String, q_tile_iter: u32, label: &str) {
+    ptx.push_str(&format!(
+        "    // J-A4 direct HBM store: {} (q_tile_iter={})\n",
+        label, q_tile_iter
+    ));
+    // Lane-0 gate: only lane 0 stores to avoid 32-way races on the same address.
+    ptx.push_str("    setp.ne.u32 %p_save_null, %lane, 0;\n");
+    // warp_row = warp_id + q_tile_iter * 4
+    ptx.push_str(&format!(
+        "    add.u32 %r_save_wrow, %warp_id, {}; // warp_row\n",
+        q_tile_iter * 4
+    ));
+    ptx.push_str("    cvt.u64.u32 %rd_save_wrow, %r_save_wrow;\n");
+    // row_idx = batch_idx*(heads*seq) + head_idx*seq + (q_start + warp_row)
+    ptx.push_str("    mul.lo.u64 %rd_save_off, %batch_idx, %rd5;\n");
+    ptx.push_str("    add.u64 %rd_save_off, %rd_save_off, %head_idx;\n");
+    ptx.push_str("    mul.lo.u64 %rd_save_off, %rd_save_off, %rd6;\n");
+    ptx.push_str("    add.u64 %rd_save_off, %rd_save_off, %q_start;\n");
+    ptx.push_str("    add.u64 %rd_save_off, %rd_save_off, %rd_save_wrow;\n");
+    ptx.push_str("    shl.b64 %rd_save_off, %rd_save_off, 2; // * 4 bytes (f32)\n");
+    // Store into row_max_ptr[row_idx].
+    ptx.push_str("    ld.param.u64 %rd_save_base, [row_max_ptr];\n");
+    ptx.push_str("    add.u64 %rd_save_elem, %rd_save_base, %rd_save_off;\n");
+    ptx.push_str("    setp.eq.u64 %p_rowmax_null, %rd_save_base, 0;\n");
+    ptx.push_str("    or.pred %p_skip_rm, %p_rowmax_null, %p_save_null;\n");
+    ptx.push_str("    @!%p_skip_rm st.global.f32 [%rd_save_elem], %f0;\n");
 }
 
 #[cfg(test)]
