@@ -240,6 +240,53 @@ pub fn compile(
     compile_returning_plan(ast, interner, type_map, dump_ir, options).map(|(b, _)| b)
 }
 
+/// Test-helper: runs the codegen pipeline through `compile_user_functions`
+/// (where model method bodies — and therefore retention splices — are
+/// emitted), skipping `compile_main` so tests with models that have
+/// non-trivial top-level constructors don't fail on unrelated setup issues.
+/// Returns the splice-emission count snapped off the compiler.  Downstream
+/// errors during body codegen are swallowed so the test can assert on the
+/// splice counter even when the fixture's pipe targets don't fully lower
+/// (e.g. pipe-as-function-call lookup failing — the splice already fired
+/// *before* the call is dispatched, so the counter is correct even if the
+/// later call step errors).
+#[doc(hidden)]
+pub fn compile_returning_splice_count_for_tests(
+    ast: &nsl_ast::Module,
+    interner: &Interner,
+    type_map: &TypeMap,
+    options: &crate::CompileOptions,
+) -> Result<u32, CodegenError> {
+    let mut compiler = Compiler::new(interner, type_map, options)?;
+
+    compiler.intern_string("")?;
+    compiler.collect_strings(&ast.stmts)?;
+    compiler.collect_enums(&ast.stmts)?;
+    compiler.collect_structs(&ast.stmts)?;
+    compiler.collect_models(&ast.stmts)?;
+    compiler.emit_retention_arena()?;
+    compiler.declare_runtime_functions()?;
+    compiler.declare_user_functions(&ast.stmts)?;
+    let vmap_results = compiler.apply_vmap_transforms(ast);
+    compiler.register_batched_functions(&vmap_results);
+    compiler.compile_datatype_defs(&ast.stmts)?;
+    compiler.compile_kernels(&ast.stmts)?;
+    compiler.compile_flash_attention_kernels(&ast.stmts)?;
+    crate::wrga_prescan::prescan_adapter_sites_from_decorators(&mut compiler);
+    crate::wrga_prescan::rewrite_model_method_bodies_with_adapter_sites(&mut compiler);
+    // Swallow the result intentionally.  The splice runs BEFORE
+    // `compile_call_by_name` inside `ExprKind::Pipe` lowering, so the counter
+    // is valid even if a later pipe target's function-call lookup fails — a
+    // common case in minimal test fixtures whose pipe RHS identifiers
+    // resolve to model fields rather than registered functions.  All earlier
+    // setup steps still propagate errors via `?` above, so a genuine
+    // infrastructure failure (Compiler::new, emit_retention_arena,
+    // declare_runtime_functions, etc.) is still surfaced as an Err.
+    let _ = compiler.compile_user_functions(&ast.stmts);
+
+    Ok(compiler.retention_splices_emitted)
+}
+
 /// Same as [`compile`] but also returns any `WrgaPlan` stashed on the compiler
 /// during `@train` block lowering (Milestone B.1 Task 2).
 ///
@@ -270,6 +317,13 @@ pub fn compile_returning_plan(
     compiler.collect_enums(&ast.stmts)?;
     compiler.collect_structs(&ast.stmts)?;
     compiler.collect_models(&ast.stmts)?;
+    // Task 4: declare the calibration retention arena BEFORE method-body
+    // codegen.  The pipe-site splice in `try_emit_retention_splice` early-
+    // returns when `retention_arena_data_id` is `None`, so emitting the
+    // arena later (after `compile_user_functions`) made every splice site
+    // silently no-op.  No-op when `calibration_retention` is `None`, so
+    // shipped binaries are unaffected.
+    compiler.emit_retention_arena()?;
     compiler.declare_runtime_functions()?;
     compiler.declare_user_functions(&ast.stmts)?;
     // M39b: Apply vmap AST transforms and register batched function variants
@@ -341,10 +395,6 @@ pub fn compile_returning_plan(
     if compiler.compile_options.wcet_enabled {
         compiler.run_wcet_analysis()?;
     }
-
-    // Task 4: Declare the calibration retention arena global (zeroinit .bss).
-    // No-op when calibration_retention is None, so shipped binaries are unaffected.
-    compiler.emit_retention_arena()?;
 
     // M52: Embed weight hash if weights were loaded
     compiler.embed_weight_hash()?;
@@ -437,6 +487,9 @@ fn compile_with_zk_info_best_effort_plan(
         compiler.collect_enums(&ast.stmts)?;
         compiler.collect_structs(&ast.stmts)?;
         compiler.collect_models(&ast.stmts)?;
+        // Task 4: declare the calibration retention arena BEFORE method-body
+        // codegen — see `compile_returning_plan` for the full rationale.
+        compiler.emit_retention_arena()?;
         compiler.declare_runtime_functions()?;
         compiler.declare_user_functions(&ast.stmts)?;
         let vmap_results = compiler.apply_vmap_transforms(ast);
@@ -467,9 +520,6 @@ fn compile_with_zk_info_best_effort_plan(
         if compiler.compile_options.wcet_enabled {
             compiler.run_wcet_analysis()?;
         }
-
-        // Task 4: Declare the calibration retention arena global (zeroinit .bss).
-        compiler.emit_retention_arena()?;
 
         // M52: Embed weight hash if weights were loaded
         compiler.embed_weight_hash()?;
@@ -603,6 +653,9 @@ fn compile_standalone_best_effort_plan(
         compiler.collect_enums(&ast.stmts)?;
         compiler.collect_structs(&ast.stmts)?;
         compiler.collect_models(&ast.stmts)?;
+        // Task 4: declare the calibration retention arena BEFORE method-body
+        // codegen — see `compile_returning_plan` for the full rationale.
+        compiler.emit_retention_arena()?;
         compiler.declare_runtime_functions()?;
         compiler.declare_user_functions(&ast.stmts)?;
         let vmap_results = compiler.apply_vmap_transforms(ast);
@@ -621,8 +674,6 @@ fn compile_standalone_best_effort_plan(
         if compiler.compile_options.wcet_enabled {
             compiler.run_wcet_analysis()?;
         }
-        // Task 4: Declare the calibration retention arena global (zeroinit .bss).
-        compiler.emit_retention_arena()?;
         // M62: Emit C-ABI wrapper bodies for @export functions before finalize.
         compiler.emit_export_wrappers()?;
         Ok(())
@@ -652,6 +703,12 @@ pub fn compile_test(
     compiler.collect_enums(&ast.stmts)?;
     compiler.collect_structs(&ast.stmts)?;
     compiler.collect_models(&ast.stmts)?;
+    // Task 4: declare the calibration retention arena BEFORE method-body
+    // codegen — parity with all other entry points.  `compile_test` compiles
+    // `@test` functions; a `@test` body that calls a model.forward with a
+    // pipe site would otherwise no-op the splice if the caller set
+    // `calibration_retention` on CompileOptions.
+    compiler.emit_retention_arena()?;
     compiler.declare_runtime_functions()?;
     compiler.declare_user_functions(&ast.stmts)?;
     // M39b: Apply vmap AST transforms and register batched function variants
@@ -800,6 +857,9 @@ pub fn compile_module_with_imports_best_effort_plan(
         compiler.collect_enums(&ast.stmts)?;
         compiler.collect_structs(&ast.stmts)?;
         compiler.collect_models(&ast.stmts)?;
+        // Task 4: declare the calibration retention arena BEFORE method-body
+        // codegen — see `compile_returning_plan` for the full rationale.
+        compiler.emit_retention_arena()?;
         compiler.declare_runtime_functions()?;
         compiler.declare_imported_functions(imported_fns)?;
         compiler.declare_user_functions_with_linkage(&ast.stmts, Linkage::Export)?;
@@ -815,8 +875,6 @@ pub fn compile_module_with_imports_best_effort_plan(
         compiler.compile_user_functions(&ast.stmts)?;
         compiler.compile_batched_functions(&vmap_results)?;
         compiler.compile_pending_lambdas()?;
-        // Task 4: Declare the calibration retention arena global (zeroinit .bss).
-        compiler.emit_retention_arena()?;
         // M62: Emit C-ABI wrapper bodies for @export functions before finalize.
         compiler.emit_export_wrappers()?;
         Ok(())
@@ -940,6 +998,9 @@ pub fn compile_entry_returning_plan(
             .entry(model_name)
             .or_insert(fields);
     }
+    // Task 4: declare the calibration retention arena BEFORE method-body
+    // codegen — see `compile_returning_plan` for the full rationale.
+    compiler.emit_retention_arena()?;
     compiler.declare_runtime_functions()?;
     compiler.declare_imported_functions(imported_fns)?;
     compiler.declare_user_functions_with_linkage(&ast.stmts, Linkage::Export)?;
@@ -962,8 +1023,6 @@ pub fn compile_entry_returning_plan(
     if compiler.compile_options.wcet_enabled {
         compiler.run_wcet_analysis()?;
     }
-    // Task 4: Declare the calibration retention arena global (zeroinit .bss).
-    compiler.emit_retention_arena()?;
     // M31: Print fusion report if enabled
     if compiler.fusion.report_enabled {
         crate::fusion_report::print_fusion_report(
