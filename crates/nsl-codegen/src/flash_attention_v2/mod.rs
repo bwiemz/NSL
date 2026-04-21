@@ -227,6 +227,19 @@ pub fn synthesize_flash_attention_ptx_v2(config: &FlashAttentionConfig) -> Vec<u
             emit_k_tile_load(&mut ptx, config, q_iter);
             phases::s_compute::emit(&mut ptx, config, q_iter);
             phases::softmax::emit(&mut ptx, config, q_iter);
+            // Tier C: persist row_max/row_sum to HBM IMMEDIATELY after
+            // softmax's online update, inside the KV loop. The prior
+            // placement (after the KV loop exit) allowed PV-accum to write
+            // back to physical f32 registers that ptxas had coalesced with
+            // `%row_max` / `%f_sdx_fmax` / `%f_sdx_nmax`, clobbering the
+            // captured softmax state before the save could fire (confirmed
+            // by J-A3 measurement: fsum was correct but fmax/newmax read
+            // `~±1e-30` uniform — same as default %row_max read-back). For
+            // multi-tile KV loops this fires per-tile, writing to the same
+            // HBM address each time; the final tile's values win, which IS
+            // the final committed softmax state — identical semantics to
+            // the previous post-loop placement for correctness.
+            phases::csha_hooks::emit_save_softmax_state(&mut ptx, config, q_iter);
             emit_v_tile_load(&mut ptx, config, q_iter);
             // Tier C: save V from v_smem (which aliases K after v_tile_load).
             // NOTE: under the non-fused path the save addressing uses
@@ -247,12 +260,6 @@ pub fn synthesize_flash_attention_ptx_v2(config: &FlashAttentionConfig) -> Vec<u
             ));
             ptx.push_str("    setp.lt.u64 %p0, %k_start, %k_max;\n");
             ptx.push_str(&format!("    @%p0 bra V2_LOOP_KV_START_{};\n", q_iter));
-
-            // Tier C: persist row_max/row_sum to HBM once the KV loop has
-            // processed all tiles and the registers hold their final values.
-            // The SMEM save portion of emit_save_softmax_state is gated on
-            // fused_projections and no-ops here; only the HBM save fires.
-            phases::csha_hooks::emit_save_softmax_state(&mut ptx, config, q_iter);
 
             phases::finalize::emit(&mut ptx, config, q_iter);
             phases::csha_hooks::emit_output_projection(&mut ptx, config, q_iter);

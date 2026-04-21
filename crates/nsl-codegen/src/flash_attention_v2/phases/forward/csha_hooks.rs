@@ -920,16 +920,28 @@ pub(crate) fn emit_save_softmax_state_with_diag(
             _ => ("", "%row_max"),
         };
 
+        // J-A4: under `direct_*` modes softmax.rs already wrote the row_max
+        // buffer directly from within softmax (bypassing scratch regs). Skip
+        // this save-site's row_max write to avoid overwriting the direct
+        // store with the stale-register value we're trying to sidestep.
+        let skip_rowmax_write = diag.starts_with("direct_");
+
         // row_max_ptr
-        ptx.push_str("    ld.param.u64 %rd_save_base, [row_max_ptr];\n");
-        ptx.push_str("    add.u64 %rd_save_elem, %rd_save_base, %rd_save_off;\n");
-        ptx.push_str("    setp.eq.u64 %p_rowmax_null, %rd_save_base, 0;\n");
-        ptx.push_str("    or.pred %p_skip_rm, %p_rowmax_null, %p_save_null;\n");
-        ptx.push_str(rm_setup);
-        ptx.push_str(&format!(
-            "    @!%p_skip_rm st.global.f32 [%rd_save_elem], {};  // row_max_ptr write\n",
-            rm_src
-        ));
+        if !skip_rowmax_write {
+            ptx.push_str("    ld.param.u64 %rd_save_base, [row_max_ptr];\n");
+            ptx.push_str("    add.u64 %rd_save_elem, %rd_save_base, %rd_save_off;\n");
+            ptx.push_str("    setp.eq.u64 %p_rowmax_null, %rd_save_base, 0;\n");
+            ptx.push_str("    or.pred %p_skip_rm, %p_rowmax_null, %p_save_null;\n");
+            ptx.push_str(rm_setup);
+            ptx.push_str(&format!(
+                "    @!%p_skip_rm st.global.f32 [%rd_save_elem], {};  // row_max_ptr write\n",
+                rm_src
+            ));
+        } else {
+            ptx.push_str(
+                "    // row_max write suppressed - direct_* mode wrote it from softmax\n",
+            );
+        }
         let _ = q_tile_iter;
 
         let (rs_setup, rs_src): (&str, &str) = match diag {
