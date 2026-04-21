@@ -193,6 +193,7 @@ examples/          Example programs and integration tests
 models/            Reference model implementations
 benchmarks/        Performance benchmarks
 docs/              Design documents, plans, and summaries
+  research/        Research PDFs and source collections
 ```
 
 ## Benchmarks
@@ -244,7 +245,11 @@ $ nsl run examples/m14_sgd_basic.nsl
 2.8855583667755127     # epoch 5
 ```
 
-All 1,558 tests pass across 7 crates.
+Validation commands live in `.github/workflows/ci.yml`. The current local snapshot for this checkout is:
+
+- `cargo build --workspace` ✅
+- `cargo test --workspace -- --skip e2e_` ❌ currently fails in `crates/nsl-cli/tests/cpdt_cli.rs::bare_cpdt_report_enables_full_mode`
+- `cargo test -p nsl-cli --test e2e -- --test-threads=1` ❌ currently reports widespread failures in this environment, including OpenSSL linker errors
 
 ### Recommended Training Config (RTX 5070 Ti, 16GB VRAM)
 
@@ -259,7 +264,9 @@ const PRETRAIN_GRAD_CLIP = 1.0
 ## Testing
 
 ```bash
-cargo test --workspace              # 1,558+ unit and integration tests
+cargo test --workspace              # Run the workspace unit and integration tests
+cargo test --workspace -- --skip e2e_  # Match the main CI unit-test step
+cargo test -p nsl-cli --test e2e -- --test-threads=1  # Run the CLI smoke/e2e suite
 cargo run -p nsl-cli -- run examples/m14_sgd_basic.nsl  # Training demo
 cargo run -p nsl-cli -- test tests/m15_test.nsl          # NSL test suite
 
@@ -272,6 +279,7 @@ cargo run -p nsl-cli --release -- run benchmarks/bench_roofline.nsl
 
 - **[SPECIFICATION.md](SPECIFICATION.md)** — Full feature reference, architecture, per-op roofline analysis
 - **[spec/](spec/)** — Formal language specification (13 chapters)
+- **[docs/research/](docs/research/)** — Research PDFs and source notes used to shape the roadmap
 - **[docs/summaries/](docs/summaries/)** — Condensed technical summaries for each subsystem
 - **[docs/plans/](docs/plans/)** — Roadmap and future milestone designs
 
@@ -283,7 +291,7 @@ NSL is structured as a standard Rust workspace. To get started:
 git clone https://github.com/bwiemz/NSL.git
 cd NSL
 cargo build                         # Build all crates
-cargo test --workspace              # Verify everything passes
+cargo test --workspace              # Run the full workspace test suite
 cargo run -p nsl-cli -- run examples/m14_sgd_basic.nsl  # Run a training example
 ```
 
