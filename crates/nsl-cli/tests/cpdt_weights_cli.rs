@@ -275,3 +275,53 @@ fn neither_present_cpdt_full_with_opt_out_succeeds() {
         .stderr(predicate::str::contains("1. Add --weights").not())
         .stderr(predicate::str::contains("3. Add `@cpdt(weight_aware=false)`").not());
 }
+
+/// Regression: the multi-file build path (triggered by any `from X import Y`)
+/// must load weights through `compile_entry_returning_plan` and stash the
+/// `WeightMap` on the compiler *before* codegen enters the user's train block.
+/// Historical bug (fixed by this test's worktree): the multi-file entry point
+/// had no weight-loading call, so CPDT Phase 1 silently no-opped on every
+/// real user program that used `from X import Y` — the `[nsl] loaded N
+/// weights` line never fired and the tier-assignment path fell back to the
+/// `no_weights` formula.
+///
+/// The `TEMPLATE` fixture always contains `from nsl.nn.losses import mse_loss`,
+/// so every CPDT test in this file already exercises the multi-file path.
+/// This test just adds the explicit `[nsl] loaded` stderr assertion that
+/// would have caught the regression.
+#[test]
+fn multi_file_path_loads_weights_before_codegen() {
+    let tmp = TempDir::new().unwrap();
+    let src_path = tmp.path().join("t.nsl");
+    let weights_path = tmp.path().join("weights.safetensors");
+    let out_path = tmp.path().join("t_out");
+    write_tiny_safetensors(&weights_path);
+    fs::write(&src_path, render_source("", "")).unwrap();
+
+    let mut cmd = Command::cargo_bin("nsl").unwrap();
+    cmd.env("NSL_STDLIB_PATH", stdlib_path());
+    cmd.arg("build")
+        .arg(&src_path)
+        .arg("--source-ad")
+        .arg("--emit-obj")
+        .arg("-o")
+        .arg(&out_path)
+        .arg("--wggo")
+        .arg("auto")
+        .arg("--cpdt-report")
+        .arg("--cpdt-num-gpus")
+        .arg("4")
+        .arg("--weights")
+        .arg(&weights_path);
+    // Stderr: weight-loading line proves the helper fired on the multi-file
+    // entry path.  Stdout: `=== CPDT Training Plan ===` proves the rendered
+    // plan was produced — which only happens when CPDT actually fired
+    // downstream of the weight load (the original bug manifested as the
+    // weight-loading line missing *and* the tier-agreement diagnostic
+    // silently falling back to the no-weights path).
+    cmd.assert()
+        .success()
+        .stderr(predicate::str::contains("[nsl] loaded 1 weights from"))
+        .stderr(predicate::str::contains("SHA-256:"))
+        .stdout(predicate::str::contains("=== CPDT Training Plan ==="));
+}

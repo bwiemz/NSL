@@ -144,6 +144,91 @@ fn write_manifest_if_needed(compiler: &mut Compiler<'_>, options: &crate::Compil
     }
 }
 
+/// M52 / CPDT follow-up: shared weight-loading path for every codegen entry
+/// point.  When `options.weight_file` is set, loads the safetensors file,
+/// runs sparsity analysis + dead-weight elimination + optional weight-analysis
+/// report + M52d scale computation, and stashes the resulting `WeightMap` +
+/// integrity hash on the compiler.  A missing/unreadable file is a hard error.
+/// A `None` weight path is a silent no-op — callers that intentionally skip
+/// weights (standalone export, library-module precompile) can simply not set
+/// `weight_file`.
+///
+/// Load-bearing for CPDT Phase 1: `stmt.rs::invoke_cpdt_if_enabled` reads
+/// `compiler.features.weight_map.as_ref()`, so the multi-file entry points
+/// `compile_module_with_imports_best_effort_plan` and
+/// `compile_entry_returning_plan` must call this helper before compiling any
+/// user-function body — otherwise CPDT silently no-ops on every real program
+/// that uses `from X import Y` or a `train(...)` block.
+fn load_and_register_weights_if_needed(
+    compiler: &mut Compiler<'_>,
+    options: &crate::CompileOptions,
+) -> Result<(), CodegenError> {
+    let Some(weight_path) = options.weight_file.as_ref() else {
+        return Ok(());
+    };
+
+    let mut wmap = crate::weight_aware::WeightMap::load(weight_path).map_err(|e| {
+        crate::error::CodegenError::new(format!("failed to load weights: {}", e))
+    })?;
+    let integrity = crate::weight_aware::WeightIntegrity::new(*wmap.hash());
+
+    // Sparsity analysis for sparse codegen / dead-weight elimination.
+    if options.weight_config.sparse_codegen || options.weight_config.dead_weight_elim {
+        let names: Vec<String> = wmap.names().map(|s| s.to_string()).collect();
+        for name in &names {
+            if let Some(entry) = wmap.get_mut(name) {
+                entry.analyze_sparsity(&options.weight_config);
+            }
+        }
+    }
+
+    // Dead-weight elimination.
+    if options.weight_config.dead_weight_elim {
+        let eliminator =
+            crate::weight_aware::DeadWeightEliminator::new(&options.weight_config);
+        let names: Vec<String> = wmap.names().map(|s| s.to_string()).collect();
+        for name in &names {
+            if let Some(entry) = wmap.get_mut(name) {
+                eliminator.eliminate(entry);
+            }
+        }
+    }
+
+    // Optional --weight-analysis report.
+    if options.weight_analysis {
+        crate::weight_aware::print_weight_analysis_report(&wmap, &options.weight_config);
+    }
+
+    // M52d: compile-time quantization scales for FP8/INT8 weights.
+    {
+        let names: Vec<String> = wmap.names().map(|s| s.to_string()).collect();
+        for name in &names {
+            if let Some(entry) = wmap.get(name) {
+                if let Some(scale) = entry.compute_scale() {
+                    compiler.memory.weight_scales.insert(name.clone(), scale);
+                }
+            }
+        }
+        if !compiler.memory.weight_scales.is_empty() {
+            eprintln!(
+                "[nsl] M52d: computed compile-time scales for {} quantized weights",
+                compiler.memory.weight_scales.len()
+            );
+        }
+    }
+
+    eprintln!(
+        "[nsl] loaded {} weights from {} (SHA-256: {})",
+        wmap.len(),
+        wmap.source_path(),
+        integrity.hash_hex
+    );
+
+    compiler.features.weight_integrity = Some(integrity);
+    compiler.features.weight_map = Some(wmap);
+    Ok(())
+}
+
 /// Main entry point (single-file, backward compatible).
 pub fn compile(
     ast: &nsl_ast::Module,
@@ -168,79 +253,8 @@ pub fn compile_returning_plan(
 ) -> Result<(Vec<u8>, Option<crate::wrga::WrgaPlan>), CodegenError> {
     let mut compiler = Compiler::new(interner, type_map, options)?;
 
-    // M52: Load weights if --weights was provided
-    if let Some(ref weight_path) = options.weight_file {
-        match crate::weight_aware::WeightMap::load(weight_path) {
-            Ok(mut wmap) => {
-                let integrity = crate::weight_aware::WeightIntegrity::new(*wmap.hash());
-
-                // Run sparsity analysis on all weight entries
-                if options.weight_config.sparse_codegen || options.weight_config.dead_weight_elim {
-                    let config = &options.weight_config;
-                    let names: Vec<String> = wmap.names().map(|s| s.to_string()).collect();
-                    for name in &names {
-                        if let Some(entry) = wmap.get_mut(name) {
-                            entry.analyze_sparsity(config);
-                        }
-                    }
-                }
-
-                // Run dead weight elimination
-                if options.weight_config.dead_weight_elim {
-                    let eliminator =
-                        crate::weight_aware::DeadWeightEliminator::new(&options.weight_config);
-                    let names: Vec<String> = wmap.names().map(|s| s.to_string()).collect();
-                    for name in &names {
-                        if let Some(entry) = wmap.get_mut(name) {
-                            eliminator.eliminate(entry);
-                        }
-                    }
-                }
-
-                // Weight analysis report (when --weight-analysis is set)
-                if options.weight_analysis {
-                    crate::weight_aware::print_weight_analysis_report(
-                        &wmap,
-                        &options.weight_config,
-                    );
-                }
-
-                // M52d: Compute and store quantization scales for FP8/INT8 weights
-                {
-                    let names: Vec<String> = wmap.names().map(|s| s.to_string()).collect();
-                    for name in &names {
-                        if let Some(entry) = wmap.get(name) {
-                            if let Some(scale) = entry.compute_scale() {
-                                compiler.memory.weight_scales.insert(name.clone(), scale);
-                            }
-                        }
-                    }
-                    if !compiler.memory.weight_scales.is_empty() {
-                        eprintln!(
-                            "[nsl] M52d: computed compile-time scales for {} quantized weights",
-                            compiler.memory.weight_scales.len()
-                        );
-                    }
-                }
-
-                eprintln!(
-                    "[nsl] loaded {} weights from {} (SHA-256: {})",
-                    wmap.len(),
-                    wmap.source_path(),
-                    integrity.hash_hex
-                );
-
-                compiler.features.weight_integrity = Some(integrity);
-                compiler.features.weight_map = Some(wmap);
-            }
-            Err(e) => {
-                return Err(crate::error::CodegenError::new(format!(
-                    "failed to load weights: {}",
-                    e
-                )));
-            }
-        }
-    }
+    // M52: load weights if --weights was provided.
+    load_and_register_weights_if_needed(&mut compiler, options)?;
 
     compiler.dump_ir = dump_ir;
 
@@ -415,43 +429,8 @@ fn compile_with_zk_info_best_effort_plan(
     // Run every pass up to (but not including) finalize so we can observe
     // `last_wrga_plan` even on an error path before consuming the compiler.
     let pre_finalize = (|| -> Result<(), CodegenError> {
-        // M52: Load weights if --weights was provided
-        if let Some(ref weight_path) = options.weight_file {
-            let mut wmap = crate::weight_aware::WeightMap::load(weight_path).map_err(|e| {
-                crate::error::CodegenError::new(format!("failed to load weights: {}", e))
-            })?;
-            let integrity = crate::weight_aware::WeightIntegrity::new(*wmap.hash());
-            if options.weight_config.sparse_codegen || options.weight_config.dead_weight_elim {
-                let config = &options.weight_config;
-                let names: Vec<String> = wmap.names().map(|s| s.to_string()).collect();
-                for name in &names {
-                    if let Some(entry) = wmap.get_mut(name) {
-                        entry.analyze_sparsity(config);
-                    }
-                }
-            }
-            if options.weight_config.dead_weight_elim {
-                let eliminator =
-                    crate::weight_aware::DeadWeightEliminator::new(&options.weight_config);
-                let names: Vec<String> = wmap.names().map(|s| s.to_string()).collect();
-                for name in &names {
-                    if let Some(entry) = wmap.get_mut(name) {
-                        eliminator.eliminate(entry);
-                    }
-                }
-            }
-            if options.weight_analysis {
-                crate::weight_aware::print_weight_analysis_report(&wmap, &options.weight_config);
-            }
-            eprintln!(
-                "[nsl] loaded {} weights from {} (SHA-256: {})",
-                wmap.len(),
-                wmap.source_path(),
-                integrity.hash_hex
-            );
-            compiler.features.weight_integrity = Some(integrity);
-            compiler.features.weight_map = Some(wmap);
-        }
+        // M52: load weights if --weights was provided.
+        load_and_register_weights_if_needed(&mut compiler, options)?;
 
         compiler.intern_string("")?;
         compiler.collect_strings(&ast.stmts)?;
@@ -907,6 +886,15 @@ pub fn compile_entry_returning_plan(
     let mut compiler = Compiler::new(interner, type_map, options)?;
     compiler.dump_ir = dump_ir;
 
+    // M52 / CPDT Phase 1: load weights if --weights was provided.  Load-bearing
+    // for the multi-file build path: without this call, `compile_main` sees
+    // `compiler.features.weight_map == None` and CPDT Phase 1 silently
+    // degrades to the no-weights tier-assignment path for every user program
+    // that has `from X import Y` or a `train(...)` block.  Equivalent single-
+    // file path runs through `compile_returning_plan` which calls the same
+    // helper.
+    load_and_register_weights_if_needed(&mut compiler, options)?;
+
     // Register imported structs/enums so the entry module can reference them
     for (name, layout) in imported_struct_layouts {
         compiler.types.struct_layouts.insert(name, layout);
@@ -983,6 +971,11 @@ pub fn compile_entry_returning_plan(
             &compiler.fusion.barriers,
         );
     }
+    // M52: embed weight hash if weights were loaded (parity with single-file
+    // `compile_returning_plan`).  Called before the `last_wrga_plan` clone so
+    // that if a future change makes `embed_weight_hash` stash anything into
+    // the plan, the returned plan reflects it — matches the single-file path.
+    compiler.embed_weight_hash()?;
     let plan = compiler.last_wrga_plan.clone();
     // M62: Emit C-ABI wrapper bodies for @export functions before finalize.
     compiler.emit_export_wrappers()?;
