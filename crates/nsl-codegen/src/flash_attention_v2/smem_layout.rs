@@ -189,17 +189,22 @@ pub fn validate_scalar_v2_config(
         )));
     }
 
-    // Fused-projection constraint: the K pre-pass writes exactly `block_q`
-    // K rows (4 warps × ceil(block_q/4) iters = block_q rows).  The K tile
-    // in SMEM holds `block_kv` rows.  block_q ≠ block_kv causes either an
-    // under-fill (garbage S-compute) or a SMEM out-of-bounds write.
+    // Fused-projection asymmetric-tile constraint: the K and V pre-passes
+    // are driven by `kv_iters = ceil(block_kv / 4)` separately from the Q
+    // sweep / S-compute / PV-accum loop (which uses `iters =
+    // ceil(block_q / 4)`).  Both block_q and block_kv are already
+    // constrained to multiples of 4 via `ALLOWED_BLOCK_Q`/`ALLOWED_BLOCK_KV`,
+    // which guarantees the warp-per-row contract (4 warps × N iters = 4N
+    // rows, exactly matches the tile size for both dimensions).  Asymmetric
+    // configs (`block_q != block_kv`) are therefore valid and no additional
+    // predicate is needed here.
     if config.csha.as_ref().map_or(false, |c| c.fused_projections)
-        && config.block_q != config.block_kv
+        && (config.block_kv % 4 != 0)
     {
         return Err(ConfigError(format!(
-            "fused_projections requires block_q == block_kv (got block_q={}, block_kv={}); \
-             the K pre-pass writes exactly block_q rows into the block_kv-row K tile",
-            config.block_q, config.block_kv
+            "fused_projections requires block_kv to be a multiple of 4 \
+             (warp-per-row contract); got block_kv={}",
+            config.block_kv
         )));
     }
 

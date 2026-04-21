@@ -642,7 +642,14 @@ pub fn emit_save_activations(ptx: &mut String, config: &FlashAttentionConfig, q_
 /// SMEM tiles are live and post-RoPE); `V` runs after the V pre-pass (V SMEM
 /// aliases K during the S-pass, so an early V save would store K's bytes).
 #[derive(Copy, Clone)]
-pub enum SaveSet { All, QK, V }
+/// Which post-RoPE activations `emit_save_activations_subset` writes to HBM.
+///
+/// The `Q` / `K` / `V` variants each save a single tile and are used by the
+/// asymmetric-tile fused path (`block_q != block_kv`) where Q, K, V all
+/// have independent row counts and are written from distinct orchestrator
+/// loops.  `QK` and `All` are retained for callers in the symmetric fused
+/// path and the non-fused path that save multiple tiles at a single site.
+pub enum SaveSet { All, QK, V, Q, K }
 
 pub fn emit_save_activations_subset(
     ptx: &mut String,
@@ -668,7 +675,13 @@ pub fn emit_save_activations_subset(
     ptx.push_str(&format!(
         "    // CSHA Tier C: save post-RoPE activations (q_tile_iter={}, slices/lane={}, set={:?})\n",
         q_tile_iter, slices_per_lane,
-        match set { SaveSet::All => "All", SaveSet::QK => "QK", SaveSet::V => "V" }
+        match set {
+            SaveSet::All => "All",
+            SaveSet::QK => "QK",
+            SaveSet::V => "V",
+            SaveSet::Q => "Q",
+            SaveSet::K => "K",
+        }
     ));
 
     // Non-fused path: initialise %q_smem_base / %k_smem_base / %v_smem_base.
@@ -705,6 +718,8 @@ pub fn emit_save_activations_subset(
     let entries: &[(&str, &str, &str)] = match set {
         SaveSet::All => &all,
         SaveSet::QK => &all[0..2],
+        SaveSet::Q  => &all[0..1],
+        SaveSet::K  => &all[1..2],
         SaveSet::V  => &all[2..3],
     };
     for &(label, ptr_name, smem_base) in entries {
