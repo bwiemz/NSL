@@ -1,6 +1,6 @@
 # NeuralScript (NSL) — Technical Specification
 
-Comprehensive feature reference, architecture details, and implementation status for NeuralScript v0.9.1.
+Comprehensive feature reference, architecture details, and implementation status for NeuralScript v0.9.0.
 
 For getting started, see [README.md](README.md).
 
@@ -20,6 +20,8 @@ NSL is a pure Rust+NSL stack with no C/C++/Python dependencies:
 | Standard Library | NSL (`stdlib/nsl/`) | Neural network layers, optimizers, losses |
 
 The compiler produces native executables via Cranelift JIT or AOT compilation. GPU code is emitted as PTX and launched via the CUDA driver API.
+
+Repository documentation and research artifacts are organized under `spec/`, `docs/summaries/`, `docs/plans/`, and `docs/research/`.
 
 ---
 
@@ -374,7 +376,7 @@ Per-op analysis targeting H100-SXM (FP32, batch=1, seq=1024):
 | FlashAttention correctness | Naive == SDPA output exactly | `scaled_dot_product_attention` intrinsic |
 | Serving infrastructure | 32 tests pass | PagedKV, CoW, scheduler, preemption |
 | Cost model formulas | 50/50 tests pass | All FLOP/bandwidth formulas validated |
-| Test suite | **1,420 tests, 0 failures** | Across 7 crates |
+| Test suite | See the README testing section for the current validation snapshot | The repo currently has known workspace and e2e test failures |
 
 ---
 
@@ -394,7 +396,7 @@ Milestone work from M9-M55 is present in the repo, with maturity ranging from pr
 | v1.2 | M65-M67 | Ternary 1.58-bit types, format-agnostic sparsity, neuromorphic |
 | v1.3 | M68-M71 | Refinement types (Z3 SMT), phase-split inference, unikernels, universal ZKML |
 
-See [docs/plans/](docs/plans/) for detailed designs.
+See [docs/plans/](docs/plans/) for detailed designs and [docs/research/](docs/research/) for the supporting research set.
 
 ---
 

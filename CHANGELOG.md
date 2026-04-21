@@ -4,6 +4,13 @@ All notable changes to NeuralScript will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased]
+
+### Changed
+- Moved the root-level research PDFs into `docs/research/` so research artifacts live with the rest of the repository's research material.
+- Refreshed `README.md` to reflect the current documentation layout and the current local validation snapshot instead of stale passing-test counts.
+- Refreshed `SPECIFICATION.md` to match the workspace version in `Cargo.toml` (`0.9.0`) and point readers at the current docs/research layout and validation status.
+
 ## [0.9.1] - 2026-03-26
 
 ### M41b: NVLink/RDMA/TCP KV Transfer Backends

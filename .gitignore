@@ -39,8 +39,7 @@ models/coder50m/data/tokenizer/
 # Python bytecode
 __pycache__/
 
-# Research PDFs (large binaries, external references)
-docs/research/*.pdf
+# Research PDFs are versioned under docs/research/
 
 # Claude Code / MCP plugin state
 .claude/
