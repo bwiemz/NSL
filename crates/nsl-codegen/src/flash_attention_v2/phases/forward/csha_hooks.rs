@@ -842,15 +842,32 @@ pub(crate) fn emit_save_softmax_state_with_diag(
     // (all 32 lanes share identical values post-butterfly-reduction).
     // Fires for both fused and non-fused paths when save_activations_for_backward=true.
     if save {
-        // J-A2 diagnostic: when `diag` is non-empty, replace the real
-        // `%row_max` / `%row_sum` source operands with known-provenance scalars
-        // so we can distinguish "wrong value computed by softmax" from
-        // "wrong address computed by save path". Modes:
+        // J-A2 + J-A3 diagnostic: when `diag` is non-empty, replace the real
+        // `%row_max` / `%row_sum` source operands with known-provenance
+        // scalars. J-A2 modes (save-site origin) distinguish "wrong value
+        // computed by softmax" from "wrong address in save path"; J-A3 modes
+        // (softmax-captured scratch regs populated in softmax.rs) distinguish
+        // "softmax computed wrong value" from "ptxas corrupted %row_max
+        // between softmax and save."
+        //
+        // J-A2 save-site modes:
         //   - "wrow"   → both slots store f32(warp_row). Expect [0..N-1].
         //   - "wid"    → row_max = f32(warp_id), row_sum = f32(lane). Verifies
-        //                the lane-0 gate and warp identity (lane row_sum must
-        //                read back 0.0 everywhere since only lane 0 stores).
+        //                the lane-0 gate and warp identity (row_sum reads 0.0
+        //                everywhere since only lane 0 stores).
         //   - "qstart" → row_max = f32(q_start.lo), row_sum = f32(warp_row).
+        //
+        // J-A3 softmax-internal modes (softmax.rs populates these regs):
+        //   - "fmax"   → both slots store %f_sdx_fmax (post-butterfly max,
+        //                BEFORE online update with %row_max). If fmax shows
+        //                the expected per-row max but default row_max reads
+        //                1e-30, ptxas is corrupting the reg between the
+        //                softmax update and the save.
+        //   - "newmax" → both slots store %f_sdx_nmax (post-online-update,
+        //                the value softmax commits to %row_max this tile).
+        //   - "fsum"   → both slots store %f_sdx_fsum (post-butterfly sum,
+        //                BEFORE online add to %row_sum).
+        //
         //   - anything else or empty → real %row_max / %row_sum.
         ptx.push_str(&format!(
             "    // Tier C: persist row_max/row_sum to HBM (q_tile_iter={})\n",
@@ -896,6 +913,10 @@ pub(crate) fn emit_save_softmax_state_with_diag(
                 "    cvt.u32.u64 %r_save_qlo, %q_start;\n    cvt.rn.f32.u32 %f_diag, %r_save_qlo;\n",
                 "%f_diag",
             ),
+            // J-A3: read from softmax-captured scratch regs (populated in softmax.rs).
+            "fmax"   => ("", "%f_sdx_fmax"),
+            "newmax" => ("", "%f_sdx_nmax"),
+            "fsum"   => ("", "%f_sdx_fsum"),
             _ => ("", "%row_max"),
         };
 
@@ -924,6 +945,11 @@ pub(crate) fn emit_save_softmax_state_with_diag(
                 "    cvt.rn.f32.u32 %f_diag, %r_save_wrow;\n",
                 "%f_diag",
             ),
+            // J-A3: both slots store the same softmax-captured scratch — makes
+            // it unambiguous when reading back which register we're inspecting.
+            "fmax"   => ("", "%f_sdx_fmax"),
+            "newmax" => ("", "%f_sdx_nmax"),
+            "fsum"   => ("", "%f_sdx_fsum"),
             _ => ("", "%row_sum"),
         };
 
@@ -1872,6 +1898,93 @@ mod tests {
         assert!(
             on.contains("J-A2 diagnostic: NSL_CSHA_DUMP_SAVE_STATE=wrow"),
             "on mode must emit diag annotation with mode name"
+        );
+    }
+
+    /// J-A3 fmax mode: both slots source from `%f_sdx_fmax` (populated by
+    /// softmax.rs post-butterfly-max). No cvt setup — direct mov-source.
+    #[test]
+    fn save_softmax_state_diag_fmax_sources_from_softmax_capture() {
+        let cfg = FlashAttentionConfig {
+            block_q: 32, block_kv: 32, head_dim: 32,
+            causal: false, paged: false, rope_q: false,
+            rope_style: RopeStyle::HalfSplit, gqa_group_size: 1,
+            tree_mask: false, gpu_sm: 75, segment_masked: false,
+            csha: Some(CshaExtras {
+                fused_projections: false,
+                save_activations_for_backward: true,
+                d_model: 128,
+                ..CshaExtras::default()
+            }),
+        };
+        let mut ptx = String::new();
+        emit_save_softmax_state_with_diag(&mut ptx, &cfg, 0, "fmax");
+        assert!(
+            ptx.contains("st.global.f32 [%rd_save_elem], %f_sdx_fmax;  // row_max_ptr write"),
+            "row_max slot must source from %f_sdx_fmax"
+        );
+        assert!(
+            ptx.contains("st.global.f32 [%rd_save_elem], %f_sdx_fmax;  // row_sum_ptr write"),
+            "row_sum slot must source from %f_sdx_fmax (both slots for unambiguous read-back)"
+        );
+        // No cvt setup for J-A3 modes — source regs are populated upstream.
+        assert!(
+            !ptx.contains("cvt.rn.f32.u32 %f_diag"),
+            "fmax mode must not re-cvt into %f_diag"
+        );
+    }
+
+    /// J-A3 newmax mode: both slots source from `%f_sdx_nmax`.
+    #[test]
+    fn save_softmax_state_diag_newmax_sources_from_online_update() {
+        let cfg = FlashAttentionConfig {
+            block_q: 32, block_kv: 32, head_dim: 32,
+            causal: false, paged: false, rope_q: false,
+            rope_style: RopeStyle::HalfSplit, gqa_group_size: 1,
+            tree_mask: false, gpu_sm: 75, segment_masked: false,
+            csha: Some(CshaExtras {
+                fused_projections: false,
+                save_activations_for_backward: true,
+                d_model: 128,
+                ..CshaExtras::default()
+            }),
+        };
+        let mut ptx = String::new();
+        emit_save_softmax_state_with_diag(&mut ptx, &cfg, 0, "newmax");
+        assert!(
+            ptx.contains("st.global.f32 [%rd_save_elem], %f_sdx_nmax;  // row_max_ptr write"),
+            "row_max slot must source from %f_sdx_nmax"
+        );
+        assert!(
+            ptx.contains("st.global.f32 [%rd_save_elem], %f_sdx_nmax;  // row_sum_ptr write"),
+            "row_sum slot must source from %f_sdx_nmax"
+        );
+    }
+
+    /// J-A3 fsum mode: both slots source from `%f_sdx_fsum`.
+    #[test]
+    fn save_softmax_state_diag_fsum_sources_from_butterfly_sum() {
+        let cfg = FlashAttentionConfig {
+            block_q: 32, block_kv: 32, head_dim: 32,
+            causal: false, paged: false, rope_q: false,
+            rope_style: RopeStyle::HalfSplit, gqa_group_size: 1,
+            tree_mask: false, gpu_sm: 75, segment_masked: false,
+            csha: Some(CshaExtras {
+                fused_projections: false,
+                save_activations_for_backward: true,
+                d_model: 128,
+                ..CshaExtras::default()
+            }),
+        };
+        let mut ptx = String::new();
+        emit_save_softmax_state_with_diag(&mut ptx, &cfg, 0, "fsum");
+        assert!(
+            ptx.contains("st.global.f32 [%rd_save_elem], %f_sdx_fsum;  // row_max_ptr write"),
+            "row_max slot must source from %f_sdx_fsum"
+        );
+        assert!(
+            ptx.contains("st.global.f32 [%rd_save_elem], %f_sdx_fsum;  // row_sum_ptr write"),
+            "row_sum slot must source from %f_sdx_fsum"
         );
     }
 
