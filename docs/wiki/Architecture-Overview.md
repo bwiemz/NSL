@@ -16,9 +16,9 @@
    │   nsl-lexer  │  tokens
    └──────┬───────┘
           ▼
-   ┌──────────────┐
-   │  nsl-parser  │  AST  (node types defined in nsl-ast)
-   └──────┬───────┘
+   ┌──────────────┐     ┌──────────────┐
+   │  nsl-parser  │────►│   nsl-ast    │  AST node types (shared contract)
+   └──────┬───────┘     └──────────────┘
           ▼
    ┌──────────────┐
    │ nsl-semantic │  shape/ownership/determinism checks
@@ -27,7 +27,7 @@
    ┌──────────────┐        ┌────────────────────────────────────┐
    │ nsl-codegen  │───────►│ Host path: Cranelift IR → native   │
    │              │        │                                    │
-   │              │──┐     │ Kernel path: Wengert list →        │
+   │              │──┐     │ ML math path: Wengert list →       │
    └──────────────┘  │     │ direct PTX (bypasses Cranelift)    │
                      │     └────────────────────────────────────┘
                      ▼
@@ -65,7 +65,7 @@ Dependency direction: `nsl-errors` and `nsl-runtime` are the true leaves (nothin
 
 ## GPU layer
 
-NSL binds to NVIDIA CUDA via [cudarc](https://github.com/coreylowman/cudarc) (0.19, dynamic linking). GPU kernels are lowered to **PTX directly, bypassing Cranelift**. This path is load-bearing — see [Compiler-Pipeline § Stage 4](Compiler-Pipeline.md#stage-4--codegen).
+NSL binds to NVIDIA CUDA via [cudarc](https://github.com/coreylowman/cudarc) (0.19, dynamic linking). GPU kernels are lowered to **PTX directly, bypassing Cranelift** — the emitter lives in [`crates/nsl-codegen/src/backend_ptx.rs`](../../crates/nsl-codegen/src/backend_ptx.rs). This path is load-bearing — see [Compiler-Pipeline § Stage 4](Compiler-Pipeline.md#stage-4--codegen).
 
 ## Subsystem deep-dives
 
