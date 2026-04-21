@@ -107,6 +107,20 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig) {
     // CSHA A.2.3 projection registers (only when fused_projections is set).
     // Named register pools: one accumulator, counter, scratch, and output
     // register per (label ∈ {Q,K,V}) × (slice ∈ 0..slices_per_lane).
+    //
+    // EXCEPTION: the three SMEM base registers `%q_smem_base`, `%k_smem_base`,
+    // `%v_smem_base` are ALSO required when `save_activations_for_backward=true`
+    // — the save-emission path in `emit_save_activations` (csha_hooks.rs) reads
+    // from these SMEM tiles to write post-RoPE Q/K/V to HBM for the backward
+    // kernel.  Without the wider gate, setting `save_activations_for_backward=true
+    // && fused_projections=false` emits `add.u64 %..., %q_smem_base, ...` with
+    // no preceding `.reg` declaration → ptxas rejects with `CUDA_ERROR_INVALID_PTX`.
+    // The wider declaration is cheap (three u64 registers) and only materialises
+    // when the CSHA branch actually needs SMEM-base plumbing.  See
+    // `phases/forward/csha_hooks.rs` for the mirrored init guard.
+    let needs_qkv_smem_base = config.csha.as_ref().map_or(false, |c| {
+        c.fused_projections || c.save_activations_for_backward
+    });
     if config.csha.as_ref().map_or(false, |c| c.fused_projections) {
         let slices_per_lane = ((config.head_dim as u32) / 32).max(1);
         for label in ["Q", "K", "V"] {
@@ -133,8 +147,9 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig) {
         ptx.push_str("    .reg .u64 %rd_wt, %rd_wt_idx, %rd_wt_off, %rd_wt_src, %rd_wt_dst;\n");
         ptx.push_str("    .reg .b16 %h_wt;\n");
         ptx.push_str("    .reg .pred %p_wt;\n");
-        // SMEM base registers for Q/K/V output tiles and x_norm input tile.
-        ptx.push_str("    .reg .u64 %q_smem_base, %k_smem_base, %v_smem_base;\n");
+        // x_norm_base / warp_row stay gated on fused_projections — only the
+        // projection-sweep path initialises them.  SMEM base registers move
+        // out below so they can be declared under the wider gate.
         ptx.push_str("    .reg .u64 %x_norm_base, %warp_row;\n");
         // SMEM tile pointer registers for weight matrices and inner-loop use.
         ptx.push_str("    .reg .u64 %q_tile, %k_tile, %v_tile;\n");
@@ -142,6 +157,14 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig) {
         // to skip the HBM load when the projection sweep already filled SMEM.
         ptx.push_str("    .reg .u64 %rd_wk_chk, %rd_wv_chk;\n");
         ptx.push_str("    .reg .pred %p_wk_fused, %p_wv_fused;\n");
+    }
+
+    // Q/K/V SMEM base registers — required whenever the fused projection
+    // sweep OR the Tier C save-activations path is live.  Declared under
+    // the wider gate so `save_activations_for_backward=true &&
+    // fused_projections=false` still sees valid register declarations.
+    if needs_qkv_smem_base {
+        ptx.push_str("    .reg .u64 %q_smem_base, %k_smem_base, %v_smem_base;\n");
     }
 
     // CSHA Tier C save_activations scratch registers (only when flag is set).

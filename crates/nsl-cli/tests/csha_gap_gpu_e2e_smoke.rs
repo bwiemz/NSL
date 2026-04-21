@@ -541,61 +541,46 @@ fn csha_gap_gpu_e2e_csha_fused_path() {
     }
 
     // The HtoD ILLEGAL_ADDRESS blocker (fixed by the backward block_q=32
-    // clamp in `maybe_synthesize_csha_training_ptx`) is now gone — the
-    // fused-backward kernel runs to completion and the optimizer step
-    // writes back to every param tensor. But the Tier C smoke T6.3 still
-    // shows a numerical gap (dq=1.4e4 vs 5e-3 target, per
-    // `project_csha_tier_c_shipped.md`) that comes from Phase 3's
-    // placeholder HBM-load pattern; under `mse_loss(ones, zeros)` the
-    // gradient magnitudes blow up and every AFTER-sum lands as NaN.
+    // clamp in `maybe_synthesize_csha_training_ptx`) is now gone.  The
+    // INVALID_PTX blocker (save-emission refs to %q_smem_base /
+    // %k_smem_base / %v_smem_base that were only declared under
+    // `fused_projections=true`) is ALSO gone, fixed by PR #93:
     //
-    // That's a distinct (pre-existing) Tier C numerical blocker, not the
-    // HtoD lifetime bug this test was pinned to detect. Recognise the
-    // NaN pattern and graceful-skip with a clear diagnostic so the
-    // structural wins (dispatch, FFI emission, save-buffer allocation,
-    // kernel launch, writeback pointer flow) are observable and the
-    // numerical follow-up is tracked separately.
+    //   - `prelude.rs:needs_qkv_smem_base`: widened the register
+    //     declaration gate to `fused_projections || save_activations_for_backward`.
+    //   - `csha_hooks.rs:emit_save_activations_subset`: added init of
+    //     `%q_smem_base / %k_smem_base / %v_smem_base` for the non-fused
+    //     branch (Q tile at q_offset(=0); K / V tiles alias kv_offset).
+    //   - `flash_attention_v2/mod.rs`: reordered save emission to fire
+    //     AFTER q_load::emit and after each of emit_k_tile_load /
+    //     emit_v_tile_load populate their SMEM slots (split QK save
+    //     before s_compute, V save after v_tile_load).
+    //   - `advanced.rs` + `wengert_lower.rs`: added runtime trap on
+    //     `nsl_flash_attention_csha_with_saves` rc != 0 so a failed
+    //     launch halts immediately instead of silently producing
+    //     zero-initialised save buffers.
     //
-    // Diagnosed 2026-04-16 on `feat/csha-nan-diag` via the
-    // `NSL_CSHA_DUMP_GRADS=1` instrumentation landed alongside this
-    // comment in `crates/nsl-runtime/src/flash_attention.rs`.  The
-    // d2h readback of the 6 save buffers + 8 gradient outputs reveals:
+    // With PR #93 applied, `NSL_CSHA_DUMP_GRADS=1` now shows:
     //
-    //   [csha-dump-fwd-post] launch_rc=CUDA_ERROR_INVALID_PTX
-    //   [csha-dump-fwd-post]  q_proj nonzero_bits=0/1024
-    //   [csha-dump-fwd-post]  row_sum nonzero=0/32
-    //   [csha-dump]        dO nan_count=0   (all zero)
-    //   [csha-dump]        dq nan_count=1024
+    //   [csha-dump-fwd-post] launch_rc=CUDA_SUCCESS
+    //   [csha-dump-fwd-post]  q_proj first8=[32, 32, ...] nonzero=1024/1024
+    //   [csha-dump-fwd-post]  v_proj first8=[32, 32, ...] nonzero=1024/1024
+    //   [csha-dump-fwd-post]  row_sum first8=[0, 0, ...]  nonzero=0/32   ← residual
+    //   [csha-dump]        dO nan_count=0
+    //   [csha-dump]        dq nan_count=1024  ← cascade from row_sum=0
     //
-    // Root cause (NOT the documented Phase 3 placeholder HBM-load):
-    // the CSHA `_with_saves` forward PTX synthesised by
-    // `maybe_synthesize_csha_training_ptx` is rejected by
-    // `cuModuleLoadData` because the save-emission path references
-    // `%q_smem_base` / `%k_smem_base` / `%v_smem_base` registers that
-    // are only declared + initialised in the `fused_projections=true`
-    // branch of `flash_attention_v2/phases/forward/prelude.rs:137` +
-    // `phases/forward/csha_hooks.rs:215`.  The training_config sets
-    // `save_activations_for_backward=true` but `fused_projections=false`,
-    // so the save sites emit `add.u64 %rd, %q_smem_base, ...` with no
-    // declaration → `ptxas` rejects with "Unknown symbol `%q_smem_base`"
-    // (24 instances, line 181+).  The forward launch silently fails
-    // (its return code is discarded at `compile_call_by_name`), save
-    // buffers + dO stay zero, backward divides by row_sum=0 and NaNs.
+    // Residual: row_max/row_sum save is gated on `fused_projections=true`
+    // inside `emit_save_softmax_state`, so the non-fused training-config
+    // forward never persists softmax state to HBM → backward divides by
+    // row_sum=0 → dq/dk/dv/dw NaN.  That gate is its own separate blocker
+    // (softmax-state save path) requiring either:
+    //   (i) widening the gate in `emit_save_softmax_state` and adding
+    //       a non-fused call-site, OR
+    //   (ii) recomputing row_max / row_sum inside the backward kernel
+    //        from saved Q/K (sacrificing forward-backward determinism).
     //
-    // Additionally (secondary, surfaces after the register fix): in
-    // the non-fused-projections branch of `flash_attention_v2/mod.rs`
-    // the save emission at line 210 runs BEFORE `q_load::emit`, so
-    // SMEM has not yet been populated with Q when the save tries to
-    // read it.  Fix needs both:
-    //   (a) declare + init `%q_smem_base/%k_smem_base/%v_smem_base`
-    //       whenever `save_activations_for_backward=true` (independent
-    //       of `fused_projections`);
-    //   (b) reorder save emission to run after Q/K/V are loaded into
-    //       SMEM (or save directly from HBM source pointers post-RoPE
-    //       bypassing the SMEM round-trip for the non-fused path).
-    //
-    // Both (a) and (b) are kernel-emission / spec-level work, out of
-    // scope for the diagnostic PR.  Keep the graceful-skip until fixed.
+    // That residual is out of scope for PR #93.  Keep the graceful-skip
+    // until the softmax-state save gate is widened.
     let nan_afters: Vec<&String> = deltas
         .iter()
         .filter(|(_, _, after, _)| !after.is_finite())
@@ -603,17 +588,13 @@ fn csha_gap_gpu_e2e_csha_fused_path() {
         .collect();
     if !nan_afters.is_empty() {
         eprintln!(
-            "[csha-gpu-e2e-csha] SKIP — CSHA `_with_saves` forward PTX \
-             fails cuModuleLoadData with CUDA_ERROR_INVALID_PTX: the \
-             save-activations emission references `%q_smem_base` / \
-             `%k_smem_base` / `%v_smem_base` registers that are only \
-             declared under `fused_projections=true` (see \
-             `flash_attention_v2/phases/forward/prelude.rs:137`).  \
-             AFTER_{{{}}} = NaN because the silently-failed forward \
-             launch leaves the save buffers zero-initialised and the \
-             backward kernel then divides by row_sum=0.  Run with \
-             `NSL_CSHA_DUMP_GRADS=1` for the full d2h dump.  When the \
-             register declaration + save-emission reordering land, flip \
+            "[csha-gpu-e2e-csha] SKIP — PR #93 fixed the INVALID_PTX blocker \
+             (launch_rc=CUDA_SUCCESS, q_proj/v_proj populated) but the residual \
+             softmax-state save gate in `emit_save_softmax_state` (only emits \
+             when `fused_projections=true`) leaves row_max/row_sum at zero in \
+             the non-fused training dispatch, so backward divides by row_sum=0 \
+             and AFTER_{{{}}} = NaN.  Run with `NSL_CSHA_DUMP_GRADS=1` for the \
+             full d2h dump.  When the softmax-state save gate is widened, flip \
              this graceful-skip back to the hard-asserts below.",
             nan_afters.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(",")
         );

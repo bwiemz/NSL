@@ -660,12 +660,39 @@ pub fn emit_save_activations_subset(
     }
     let head_dim = config.head_dim as u32;
     let slices_per_lane = (head_dim / 32).max(1);
+    let fused = config
+        .csha
+        .as_ref()
+        .map_or(false, |c| c.fused_projections);
 
     ptx.push_str(&format!(
         "    // CSHA Tier C: save post-RoPE activations (q_tile_iter={}, slices/lane={}, set={:?})\n",
         q_tile_iter, slices_per_lane,
         match set { SaveSet::All => "All", SaveSet::QK => "QK", SaveSet::V => "V" }
     ));
+
+    // Non-fused path: initialise %q_smem_base / %k_smem_base / %v_smem_base.
+    // In the fused-projections path these were already initialised by
+    // `emit_matmul_projection` (csha_hooks.rs:215).  In the non-fused path
+    // the Q tile lives at q_offset(=0) and the K/V tiles alias kv_offset
+    // (K is loaded by `emit_k_tile_load`, V by `emit_v_tile_load` — both
+    // write into the kv_offset slot).  Initialise here so the save sweep
+    // below can read from %q/k/v_smem_base without hitting an undeclared-
+    // register ptxas error.  Registers are guaranteed to be declared by
+    // the matching widened gate in `prelude.rs:needs_qkv_smem_base`.
+    if !fused {
+        let kv_off = crate::flash_attention_v2::smem_layout::kv_offset(config);
+        ptx.push_str("    // save_activations && !fused_projections: init SMEM base registers\n");
+        ptx.push_str("    mov.u64 %q_smem_base, %shmem_base;              // Q tile at q_offset(=0)\n");
+        ptx.push_str(&format!(
+            "    add.u64 %k_smem_base, %shmem_base, {}; // K tile at kv_offset\n",
+            kv_off
+        ));
+        ptx.push_str(&format!(
+            "    add.u64 %v_smem_base, %shmem_base, {}; // V tile at kv_offset (aliases K)\n",
+            kv_off
+        ));
+    }
 
     // Fence: ensure no attention-body reads of Q/K/V SMEM have commenced.
     ptx.push_str("    bar.sync 0;  // FENCE: save path must see final SMEM tiles\n");

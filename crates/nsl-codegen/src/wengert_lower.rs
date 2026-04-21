@@ -501,7 +501,13 @@ fn emit_fused_forward_under_claim(
     let d_model_val = builder.ins().iconst(cl_types::I64, d_model_i64);
 
     // --- 7. Emit the 36-arg fused-with-saves FFI call. ---
-    let _err = call(
+    // PR #93 edit 4: stop silently discarding the launch rc.  Runtime
+    // trap (TrapCode::unwrap_user(3)) fires when the FFI returns non-zero,
+    // preventing the silent zero-fill of save buffers that cascades into
+    // NaN gradients downstream.  The @train fused lowering path flows
+    // through this call — not the advanced.rs one — so the diagnostic
+    // must exist here too.
+    let launch_rc = call(
         compiler,
         builder,
         "nsl_flash_attention_csha_with_saves",
@@ -527,6 +533,21 @@ fn emit_fused_forward_under_claim(
             x_raw_v,
         ],
     )?;
+    {
+        use cranelift_codegen::ir::{condcodes::IntCC, TrapCode};
+        let ok_block   = builder.create_block();
+        let trap_block = builder.create_block();
+        let is_err = builder
+            .ins()
+            .icmp_imm(IntCC::NotEqual, launch_rc, 0);
+        builder.ins().brif(is_err, trap_block, &[], ok_block, &[]);
+        builder.switch_to_block(trap_block);
+        builder.seal_block(trap_block);
+        // TrapCode user(3) = CSHA forward launch rc != 0.
+        builder.ins().trap(TrapCode::unwrap_user(3));
+        builder.switch_to_block(ok_block);
+        builder.seal_block(ok_block);
+    }
 
     // --- 8. Stash save-pointer Values for Gap D.1 backward lowerer. ---
     let (bwd_ptx_id, bwd_name_id) = compiler
