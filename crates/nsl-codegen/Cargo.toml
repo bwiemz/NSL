@@ -26,7 +26,7 @@ sha2 = "0.10"
 safetensors = "0.4"
 half = { version = "2.4", features = ["std"] }
 base64 = "0.22"
-cudarc = { version = "0.19.4", default-features = false, features = ["driver", "cuda-version-from-build-system", "dynamic-linking"], optional = true }
+cudarc = { version = "0.19.4", default-features = false, features = ["driver", "cublas", "cuda-version-from-build-system", "dynamic-linking"], optional = true }
 rand = { version = "0.8", optional = true }
 
 [features]

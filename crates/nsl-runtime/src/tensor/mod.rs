@@ -3477,6 +3477,15 @@ pub fn test_read_tensor_f32(ptr: i64) -> Vec<f32> {
     (0..len).map(|i| unsafe { *buf.add(i) }).collect()
 }
 
+#[cfg(feature = "test-hooks")]
+pub fn test_read_tensor_f64(ptr: i64) -> Vec<f64> {
+    let t = unsafe { &*(ptr as *const NslTensor) };
+    assert_eq!(t.dtype, 0, "expected f64 tensor (dtype=0), got dtype={}", t.dtype);
+    let len = t.len as usize;
+    let buf = t.data as *const f64;
+    (0..len).map(|i| unsafe { *buf.add(i) }).collect()
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------

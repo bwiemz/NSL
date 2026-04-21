@@ -894,6 +894,105 @@ pub(crate) use inner::{cu_event_create, cu_event_record, cu_event_elapsed_time, 
 #[cfg(feature = "cuda")]
 pub use inner::{current_stream, cu_event_create_checked, cu_event_record_on_current_stream, cu_event_synchronize_raw, cu_event_elapsed_time_raw};
 
+// === cuBLAS handle + sgemm wrapper (spec 2026-04-21-matmul-cublas-swap-design) ===
+
+/// cuBLAS handle lifecycle + sgemm dispatch for `gpu_matmul_f32`.
+///
+/// Per spec §2.3: lazy-init a single `cublasHandle_t` per process via `OnceLock`,
+/// intentionally leak it at process exit (NO atexit destructor — cuBLAS destruction
+/// after the CUDA context has been torn down produces spurious driver errors).
+///
+/// Per spec §2.1: NSL tensors are row-major; cuBLAS is column-major. We wrap via
+/// the operand-swap idiom: `C_row = A_row @ B_row` is submitted as
+/// `C^T_col = B^T_col @ A^T_col` with `transa = transb = CUBLAS_OP_N`.
+#[cfg(feature = "cuda")]
+pub(crate) mod cublas_inner {
+    use cudarc::cublas::{result as cublas_result, sys as cublas_sys};
+    use std::sync::OnceLock;
+
+    /// Newtype wrapper so we can implement `Send`/`Sync` for the raw
+    /// `cublasHandle_t` pointer (opaque and thread-safe per cuBLAS docs
+    /// when serialized via NSL's existing single-context model).
+    #[derive(Copy, Clone)]
+    pub(crate) struct CublasHandle(pub cublas_sys::cublasHandle_t);
+
+    // SAFETY: cublasHandle_t is an opaque driver-managed pointer. NSL serializes
+    // access via single-threaded GPU dispatch today; the handle is thread-safe
+    // per the cuBLAS API for multi-thread use with external serialization.
+    unsafe impl Send for CublasHandle {}
+    unsafe impl Sync for CublasHandle {}
+
+    static CUBLAS_HANDLE: OnceLock<CublasHandle> = OnceLock::new();
+
+    /// Return a reference to the process-global cuBLAS handle, creating it on
+    /// first call. Panics on creation failure (catastrophic — no recovery).
+    pub(crate) fn cublas_handle() -> cublas_sys::cublasHandle_t {
+        CUBLAS_HANDLE
+            .get_or_init(|| {
+                // Ensure the CUDA primary context is current on this thread
+                // before calling any cuBLAS API (cuBLAS piggybacks the current
+                // context at handle creation).
+                super::inner::ensure_context();
+                let handle = cublas_result::create_handle()
+                    .expect("cublasCreate_v2 failed during lazy init");
+                // cuBLAS defaults to the NULL/default stream, which matches
+                // `inner::current_stream()`. No `cublasSetStream` call needed.
+                CublasHandle(handle)
+            })
+            .0
+    }
+
+    /// Single-matmul dispatch: C[M,N] = A[M,K] @ B[K,N], f32, row-major.
+    ///
+    /// Per §2.1's rectangular worked example:
+    ///   cublasSgemm_v2(handle, N, N, m=N, n=M, k=K,
+    ///                  alpha, B_ptr, lda=N,
+    ///                         A_ptr, ldb=K,
+    ///                  beta,  C_ptr, ldc=N)
+    ///
+    /// Returns `Ok(())` on success; translates cuBLAS status to a `CublasError`.
+    ///
+    /// # Safety
+    /// `a_dev`, `b_dev`, `c_dev` must be valid device f32 pointers of sizes
+    /// m*k, k*n, m*n respectively, with m, n, k > 0 and fitting in i32.
+    pub(crate) unsafe fn sgemm_row_major(
+        a_dev: *const f32,
+        b_dev: *const f32,
+        c_dev: *mut f32,
+        m: u64,
+        n: u64,
+        k: u64,
+    ) -> Result<(), cublas_result::CublasError> {
+        debug_assert!(m > 0 && n > 0 && k > 0, "sgemm requires m,n,k > 0");
+        debug_assert!(
+            m <= i32::MAX as u64 && n <= i32::MAX as u64 && k <= i32::MAX as u64,
+            "sgemm dims must fit in i32"
+        );
+        let handle = cublas_handle();
+        // Safe API takes alpha/beta by value via *const pointers. Under
+        // CUBLAS_POINTER_MODE_HOST (default) cuBLAS reads these synchronously
+        // before the FFI returns, but we pin them as locals here since
+        // cublas_result::sgemm reads them before returning — no async footgun
+        // with host-pointer mode.
+        let alpha: f32 = 1.0;
+        let beta: f32 = 0.0;
+        cublas_result::sgemm(
+            handle,
+            cublas_sys::cublasOperation_t::CUBLAS_OP_N,
+            cublas_sys::cublasOperation_t::CUBLAS_OP_N,
+            n as i32, // cublas m = N (cols of row-major C)
+            m as i32, // cublas n = M (rows of row-major C)
+            k as i32, // contraction dim
+            &alpha,
+            b_dev, n as i32, // A^cublas := B_row, lda = N
+            a_dev, k as i32, // B^cublas := A_row, ldb = K
+            &beta,
+            c_dev, n as i32, // C^cublas := C_row, ldc = N
+        )
+    }
+
+}
+
 // === GPU op helpers ===
 
 /// CPU fallback for a binary elementwise op when GPU allocation fails.
@@ -1428,35 +1527,81 @@ pub(crate) fn gpu_matmul_f32(a_ptr: i64, b_ptr: i64) -> i64 {
     let stride_c = c_mat_stride;
 
     if total_batch == 1 {
-        // Non-batched: use original 2D matmul kernel (simpler, no z-grid overhead)
-        let block = 16i64;
-        let grid_x = ((n as i64) + block - 1) / block;
-        let grid_y = ((m as i64) + block - 1) / block;
+        // Non-batched f32 matmul: dispatch to cuBLAS sgemm via the row-major
+        // operand-swap idiom (spec 2026-04-21 §2.1). Replaces the naive
+        // nsl_matmul_f32 PTX kernel (~1-2 TFLOPs/s on a 5070 Ti) with
+        // cuBLAS's architecture-specialized kernels (~25-30 TFLOPs/s peak).
+        //
+        // Profiler-event wrapping mirrors `inner::kernel_launch`: pop a
+        // (start, stop) event pair, record start before launch, record stop
+        // after launch, push a trace with a cuBLAS-pattern name so the §3
+        // presence assertion in matmul_cublas_equivalence.rs observes
+        // "sgemm" / "gemm_" substrings.
+        inner::ensure_context();
 
-        let mut a_data = a.data as u64;
-        let mut b_data = b.data as u64;
-        let mut c_data = out_data as u64;
-        let mut m_val = m;
-        let mut n_val = n;
-        let mut k_val = k;
+        let profiler_events = if crate::kernel_profiler::kernel_profiler_enabled() {
+            crate::kernel_profiler::kernel_profiler_pop_events()
+        } else {
+            None
+        };
 
-        let args = [
-            &mut a_data as *mut _ as *mut std::ffi::c_void,
-            &mut b_data as *mut _ as *mut std::ffi::c_void,
-            &mut c_data as *mut _ as *mut std::ffi::c_void,
-            &mut m_val as *mut _ as *mut std::ffi::c_void,
-            &mut n_val as *mut _ as *mut std::ffi::c_void,
-            &mut k_val as *mut _ as *mut std::ffi::c_void,
-        ];
+        if let Some((start, _, _)) = &profiler_events {
+            unsafe {
+                cudarc::driver::sys::cuEventRecord(
+                    *start as cudarc::driver::sys::CUevent,
+                    std::ptr::null_mut(),
+                );
+            }
+        }
 
-        let result = inner::kernel_launch(
-            kernels::MATMUL_F32_PTX.as_ptr(),
-            "nsl_matmul_f32\0".as_ptr(),
-            [grid_x, grid_y, 1],
-            [block, block, 1],
-            &args, 0,
-        );
-        assert_eq!(result as u32, 0, "GPU matmul kernel failed: {}", result as u32);
+        // SAFETY: a.data, b.data, out_data are valid device f32 pointers of
+        // sizes m*k, k*n, m*n respectively (verified by the shape derivation
+        // above + the caller contract of gpu_matmul_f32).
+        let res = unsafe {
+            cublas_inner::sgemm_row_major(
+                a.data as *const f32,
+                b.data as *const f32,
+                out_data as *mut f32,
+                m, n, k,
+            )
+        };
+        if let Err(e) = res {
+            eprintln!("[nsl-matmul] cuBLAS sgemm failed ({}x{}x{}): {:?}", m, n, k, e);
+            // Match existing failure convention: null pointer so callers can
+            // detect the failure (existing kernel path used assert_eq!; this
+            // is a safer non-panicking failure mode).
+            return 0;
+        }
+
+        // In sync mode, surface async errors the same way PTX kernels do.
+        if inner::sync_mode_enabled() {
+            let sync_result = unsafe { cudarc::driver::sys::cuCtxSynchronize() };
+            if sync_result != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+                panic!(
+                    "[nsl] CUDA async error after cuBLAS sgemm ({}x{}x{}): {:?}",
+                    m, n, k, sync_result
+                );
+            }
+        }
+
+        if let Some((_, stop, _)) = &profiler_events {
+            unsafe {
+                cudarc::driver::sys::cuEventRecord(
+                    *stop as cudarc::driver::sys::CUevent,
+                    std::ptr::null_mut(),
+                );
+            }
+            // Name picked to satisfy spec §3's `contains("sgemm") || contains("gemm_")`
+            // presence assertion. The exact arch-dispatched cuBLAS kernel name
+            // (e.g. `ampere_sgemm_128x64_nn`) is not visible from the public
+            // cuBLAS API, so we emit a synthetic marker that the profile parser
+            // can still match.
+            crate::kernel_profiler::kernel_profiler_push_trace(
+                "sgemm_cublas",
+                [1, 1, 1],
+                [1, 1, 1],
+            );
+        }
     } else {
         // Batched: single launch with blockIdx.z = batch dimension
         let block = 16i64;
