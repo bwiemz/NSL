@@ -384,6 +384,8 @@ fn csha_gap_gpu_e2e_csha_fused_path() {
 
     let mut cmd = Command::cargo_bin("nsl").expect("locate nsl binary");
     cmd.env("NSL_STDLIB_PATH", stdlib_path())
+        .env("NSL_CSHA_DUMP_GRADS",
+             std::env::var("NSL_CSHA_DUMP_GRADS").unwrap_or_default())
         .arg("run")
         .arg("--source-ad")
         .arg("--csha")

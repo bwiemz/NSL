@@ -779,45 +779,52 @@ pub fn emit_save_activations_subset(
 /// Each (warp_id, q_tile_iter) pair has its own 2×f32 slot to avoid races.
 /// Layout: `softmax_save_offset + (warp_id * iters + q_tile_iter) * 8` bytes.
 ///
-/// Only emitted when `fused_projections=true` (the S+PV split design).
+/// Runs when `fused_projections=true` (the S+PV split design) OR when
+/// `save_activations_for_backward=true` (Tier C training path). The SMEM
+/// save is only needed for the fused path's S+PV split; the HBM save is
+/// needed for the backward kernel regardless of fused_projections.
 pub fn emit_save_softmax_state(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
-    if !config.csha.as_ref().map_or(false, |c| c.fused_projections) {
-        return;
-    }
-    let save_base = crate::flash_attention_v2::smem_layout::softmax_save_offset(config);
-    let iters = (config.block_q as u32).div_ceil(4);
-    // Slot base for this (warp_id, q_tile_iter): save_base + (warp_id * iters + q_tile_iter) * 8.
-    // Computed at runtime using %warp_id.
-    // Static part: save_base + q_tile_iter * 8 + warp_id * iters * 8.
-
-    ptx.push_str(&format!(
-        "    // Save softmax state for q_tile_iter={} (warp-indexed)\n",
-        q_tile_iter
-    ));
-    // Compute warp offset: warp_id * iters * 8 (bytes).
-    ptx.push_str("    cvt.u64.u32 %rd_wt_off, %warp_id;\n");
-    ptx.push_str(&format!(
-        "    mul.lo.u64 %rd_wt_off, %rd_wt_off, {}; // warp_id * iters * 8\n",
-        iters * 8
-    ));
-    ptx.push_str(&format!(
-        "    add.u64 %rd_wt_dst, %shmem_base, {}; // save_base + q_tile_iter*8\n",
-        save_base + q_tile_iter * 8
-    ));
-    ptx.push_str("    add.u64 %rd_wt_dst, %rd_wt_dst, %rd_wt_off;\n");
-    // Save row_max and row_sum at consecutive 4-byte slots.
-    ptx.push_str("    st.shared.f32 [%rd_wt_dst], %row_max;\n");
-    ptx.push_str("    add.u64 %rd_wt_dst, %rd_wt_dst, 4;\n");
-    ptx.push_str("    st.shared.f32 [%rd_wt_dst], %row_sum;\n");
-
-    // Tier C: also persist row_max/row_sum to HBM so the backward kernel can
-    // recompute P = exp(S - row_max) / row_sum identically to forward.
-    // Layout: [batch, heads, seq] f32, row_major. Stored by lane 0 only
-    // (all 32 lanes share identical values post-butterfly-reduction).
+    let fused = config.csha.as_ref().map_or(false, |c| c.fused_projections);
     let save = config
         .csha
         .as_ref()
         .map_or(false, |c| c.save_activations_for_backward);
+    if !fused && !save {
+        return;
+    }
+    if fused {
+        let save_base = crate::flash_attention_v2::smem_layout::softmax_save_offset(config);
+        let iters = (config.block_q as u32).div_ceil(4);
+        // Slot base for this (warp_id, q_tile_iter): save_base + (warp_id * iters + q_tile_iter) * 8.
+        // Computed at runtime using %warp_id.
+        // Static part: save_base + q_tile_iter * 8 + warp_id * iters * 8.
+
+        ptx.push_str(&format!(
+            "    // Save softmax state for q_tile_iter={} (warp-indexed)\n",
+            q_tile_iter
+        ));
+        // Compute warp offset: warp_id * iters * 8 (bytes).
+        ptx.push_str("    cvt.u64.u32 %rd_wt_off, %warp_id;\n");
+        ptx.push_str(&format!(
+            "    mul.lo.u64 %rd_wt_off, %rd_wt_off, {}; // warp_id * iters * 8\n",
+            iters * 8
+        ));
+        ptx.push_str(&format!(
+            "    add.u64 %rd_wt_dst, %shmem_base, {}; // save_base + q_tile_iter*8\n",
+            save_base + q_tile_iter * 8
+        ));
+        ptx.push_str("    add.u64 %rd_wt_dst, %rd_wt_dst, %rd_wt_off;\n");
+        // Save row_max and row_sum at consecutive 4-byte slots.
+        ptx.push_str("    st.shared.f32 [%rd_wt_dst], %row_max;\n");
+        ptx.push_str("    add.u64 %rd_wt_dst, %rd_wt_dst, 4;\n");
+        ptx.push_str("    st.shared.f32 [%rd_wt_dst], %row_sum;\n");
+    }
+
+    // Tier C: persist row_max/row_sum to HBM so the backward kernel can
+    // recompute P = exp(S - row_max) / row_sum identically to forward.
+    // Layout: [batch, heads, seq] f32, row_major. Stored by lane 0 only
+    // (all 32 lanes share identical values post-butterfly-reduction).
+    // Fires for both fused and non-fused paths when save_activations_for_backward=true.
     if save {
         ptx.push_str(&format!(
             "    // Tier C: persist row_max/row_sum to HBM (q_tile_iter={})\n",
