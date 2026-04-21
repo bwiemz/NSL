@@ -76,6 +76,22 @@ pub(crate) fn invoke_cpdt_if_enabled(
     let weights_present = weight_map_ref.is_some();
     let precision_cfg = PrecisionConfig::default();
 
+    // Phase 1 weight-map validation: when weights + CpdtMode::Full, verify
+    // every hierarchical AppliedPlan layer has matching tensors in the
+    // WeightMap. Fails fast with an aggregated error naming all missing
+    // layers plus a WeightMap-prefix summary. Catches "wrong checkpoint
+    // entirely" at plan-time rather than letting CPDT produce corrupt tier
+    // assignments for downstream consumers. See
+    // docs/superpowers/specs/2026-04-20-cpdt-validate-body-design.md.
+    if let Some(wm) = weight_map_ref {
+        if compiler.cpdt_mode == CpdtMode::Full {
+            if let Err(e) = crate::cpdt_sensitivity::validate(wm, applied_plan) {
+                eprintln!("error: {}", e);
+                std::process::exit(1);
+            }
+        }
+    }
+
     let input = CpdtInput {
         mode: compiler.cpdt_mode,
         model,

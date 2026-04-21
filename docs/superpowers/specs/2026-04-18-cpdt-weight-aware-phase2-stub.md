@@ -58,7 +58,7 @@ Items Phase 1 Commit 5 scope-reduced; record kept here so they surface during Ph
 
 - **AST `load_safetensors(...)` auto-detect** in nsl-cli — pure ergonomics; not gated by Phase 2 measurement trigger; can land any time as a standalone pass.
 - **`@cpdt(weight_aware=false)` runtime opt-out** — semantic field exists, codegen threading deferred. Required if any Phase 2 consumer needs an escape hatch at build time.
-- **`cpdt_sensitivity::validate(wm, applied)` body** — Phase 1 ships the stub. AppliedLayer's weight-metadata surface needs extension before the body can cross-check shape/dtype/name. Independent of Phase 2; useful any time.
+- **`cpdt_sensitivity::validate(wm, applied)` body** — partially landed 2026-04-20 as layer-prefix validation. Design: `docs/superpowers/specs/2026-04-20-cpdt-validate-body-design.md`. Catches "wrong checkpoint entirely" (HuggingFace-format for NSL-native model) via per-layer prefix match on `blocks.N` / `layers.N` / `h.N`. **Per-tensor shape/dtype validation remains deferred to Phase 2** where the spectral-factor wiring produces the per-tensor metadata pipeline anyway. When Phase 2 lands, validate extends to cross-check `AppliedLayer`-declared tensor names against `WeightMap` entries, activating the currently-unused `MissingTensor` / `ShapeMismatch` / `DtypeMismatch` variants. Phase 1 layer-prefix runs first as the fast-path check; per-tensor validation runs only if layer-prefix passes.
 - **Full `nsl-cli/tests/cpdt_weights_cli.rs` five-case decision-table test suite** — the tier-agreement diagnostic is already covered by `crates/nsl-codegen/tests/cpdt_tier_agreement.rs`; CLI tests are belt-and-suspenders. Land with the AST auto-detect.
 
 ---
