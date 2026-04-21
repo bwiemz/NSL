@@ -29,21 +29,77 @@ NSL tensors are **row-major** (the naive kernel indexes A as `[row*K + k]`, B as
 
 **Pin option (a).** The wrapper computes `C = A @ B` in row-major by submitting the problem as `C^T = B^T @ A^T` in column-major, which cuBLAS naturally handles.
 
+**Worked example (square Llama-scale, A:[4096,4096] @ B:[4096,4096]):**
+
+```text
+cublasSgemm_v2(handle, CUBLAS_OP_N, CUBLAS_OP_N,
+               4096,        // m: rows of C^T (= cols of row-major C = N)
+               4096,        // n: cols of C^T (= rows of row-major C = M)
+               4096,        // k: contraction dim
+               &SGEMM_ALPHA,
+               B_ptr, 4096, // A^cublas := B^T (column-major), lda = N = 4096
+               A_ptr, 4096, // B^cublas := A^T (column-major), ldb = K = 4096
+               &SGEMM_BETA,
+               C_ptr, 4096); // C^cublas := C^T (column-major), ldc = N = 4096
+```
+
+**Worked example (rectangular, A:[M,K] @ B:[K,N], all row-major):**
+
+```text
+cublasSgemm_v2(handle, CUBLAS_OP_N, CUBLAS_OP_N,
+               N,           // m: rows of C^T = N
+               M,           // n: cols of C^T = M
+               K,           // k: contraction
+               &SGEMM_ALPHA,
+               B_ptr, N,    // B has N columns row-major => N rows column-major, lda = N
+               A_ptr, K,    // A has K columns row-major => K rows column-major, ldb = K
+               &SGEMM_BETA,
+               C_ptr, N);   // C has N columns row-major => N rows column-major, ldc = N
+```
+
+The leading-dimension argument for each operand equals "number of columns in row-major" (which becomes "number of rows in column-major"). For contiguous row-major tensors, that's just the tensor's last-dim extent. Non-contiguous strided tensors are out of scope; the wrapper asserts contiguity at entry and falls through to a clear error if not.
+
 ### 2.2 Alpha/beta scaling
 
 cuBLAS computes `C = alpha * op(A) * op(B) + beta * C`. Pass `alpha = 1.0`, `beta = 0.0` to match the naive kernel's `C = A @ B`.
 
-`alpha` and `beta` are `f32` pointers (cuBLAS expects `*const f32`). Per cuBLAS docs, the pointer mode defaults to `CUBLAS_POINTER_MODE_HOST`, so these are host pointers to f32 values. Allocate on the stack: `let alpha: f32 = 1.0; let beta: f32 = 0.0; cublasSgemm_v2(handle, ..., &alpha, ..., &beta, ...);`.
+`alpha` and `beta` are `f32` pointers (cuBLAS expects `*const f32`). Per cuBLAS docs, the pointer mode defaults to `CUBLAS_POINTER_MODE_HOST`. **Pin the constants as `'static` at module scope**, not stack-allocated locals:
+
+```rust
+static SGEMM_ALPHA: f32 = 1.0;
+static SGEMM_BETA: f32 = 0.0;
+// later:
+cublasSgemm_v2(handle, ..., &SGEMM_ALPHA, ..., &SGEMM_BETA, ...);
+```
+
+**Load-bearing:** cuBLAS with `CUBLAS_POINTER_MODE_HOST` reads `*alpha` and `*beta` at *kernel launch time*, not at the moment `cublasSgemm_v2` returns. Stack-allocated locals can go out of scope before the kernel executes (under any future concurrent use, or even today if the function returns before the launch completes on the stream). `'static` constants outlive every possible kernel launch by construction, eliminating the footgun at zero cost. NSL today runs matmuls synchronously on the default stream, so the footgun is latent — but it WILL bite the first time anyone adds concurrency, and `'static` prevents it forever.
 
 ### 2.3 Handle lifecycle
 
-`cublasHandle_t` is a stateful object that must be created once, reused across calls, and destroyed at program teardown. Three lifecycle patterns:
+`cublasHandle_t` is a stateful object that must be created once and reused across calls. Three lifecycle patterns:
 
 - **Per-call create/destroy:** simplest, but cublasCreate is ~ms-scale overhead. At 20 matmul calls per train iter, this dominates the speedup — bad.
 - **Per-CUDA-context singleton:** one handle per device. NSL currently has one CUDA context globally (via cudarc's driver feature). A lazy-initialized global `OnceLock<CublasHandle>` is sufficient.
 - **Per-stream singleton:** one handle per stream. NSL uses the default stream everywhere, so per-context and per-stream collapse to the same thing.
 
-**Pin per-CUDA-context singleton.** Lazy-initialized at first `gpu_matmul_f32` call, destroyed via an `atexit` hook (NSL already has atexit infrastructure — see `crates/nsl-runtime/src/args.rs` for the pattern used by kernel-profiler / launch-counter).
+**Pin per-CUDA-context singleton via `OnceLock<CublasHandle>`. Intentionally leak the handle at process exit; do NOT register an atexit destructor.**
+
+`atexit` callbacks fire during process teardown, at which point cudarc's CUDA context state is already being torn down. Calling `cublasDestroy` on a handle after its underlying CUDA context is gone produces spurious driver errors or crashes — the canonical "atexit ordering" hazard. The handle is a few KB; leaking one per process at exit is harmless. The OS reclaims the resource on process termination regardless. NSL has atexit infrastructure (kernel-profiler, launch-counter — see `crates/nsl-runtime/src/args.rs`) but those callbacks are specifically designed to be safe at teardown; cuBLAS handle destruction is not.
+
+The `OnceLock` pattern guarantees thread-safe lazy init and shared access without explicit destruction:
+
+```rust
+use std::sync::OnceLock;
+static CUBLAS_HANDLE: OnceLock<CublasHandle> = OnceLock::new();
+
+fn cublas_handle() -> &'static CublasHandle {
+    CUBLAS_HANDLE.get_or_init(|| {
+        // cudarc::cublas::CudaBlas::new(stream) or equivalent;
+        // panic on init failure (catastrophic — no recovery)
+        ...
+    })
+}
+```
 
 ### 2.4 Error translation
 
@@ -51,11 +107,23 @@ cuBLAS returns `cublasStatus_t`. On success: `CUBLAS_STATUS_SUCCESS`. On failure
 
 ## 3. Direct-probe test (B.5-compliant)
 
-The intervention's direct probe is shape-diverse numerical equivalence against the current naive kernel's output. Signals-that-only-the-claimed-path-can-produce:
+The intervention's direct probe is shape-diverse numerical equivalence + presence/absence assertions on the kernel-profile output. Signals that only the claimed path can produce:
 
 - Output tensor's `device` field is 1 (GPU), same as before.
-- Output tensor's element values match the naive kernel's output within 1e-5 relative tolerance (see §4 for tolerance rationale).
-- `nsl_matmul_f32` PTX kernel is NOT launched during the test run (launch-counter assertion: the old kernel's name no longer appears in `NSL_PROFILE_KERNELS=1` output).
+- Output tensor's element values match a CPU/naive reference within 1e-5 relative tolerance (see §4 for tolerance rationale).
+- **Presence:** a cuBLAS-pattern kernel name appears in the kernel-profile output. cuBLAS dispatches to architecture-specific kernels with names like `volta_sgemm_128x64_nn`, `ampere_sgemm_128x128_nn`, etc. The exact name varies by SM architecture, shape, and cuBLAS version, so the test pattern-matches on the substring `sgemm` or `gemm_` rather than pinning a specific name.
+- **Absence:** `nsl_matmul_f32` does NOT appear in the kernel-profile output for the same run.
+
+Both assertions are required. Presence-only would pass if cuBLAS kernels fire in *some* path (e.g., from a stdlib dep) while `nsl_matmul_f32` also fires for the workload under test. Absence-only would pass trivially if the profiler emits an empty event list (profiler broken, no GPU available, feature flag drift). Together they verify "the claimed path fires AND only the claimed path fires" per Appendix B.5.
+
+```rust
+let profile = parse_kernel_profile();
+let names: Vec<&str> = profile.events.iter().map(|e| e.kernel_name.as_str()).collect();
+let has_cublas = names.iter().any(|n| n.contains("sgemm") || n.contains("gemm_"));
+let has_naive  = names.iter().any(|n| *n == "nsl_matmul_f32");
+assert!(has_cublas, "expected cuBLAS sgemm kernel in profile; got: {:?}", names);
+assert!(!has_naive, "naive nsl_matmul_f32 still firing despite cuBLAS swap; got: {:?}", names);
+```
 
 Test matrix (new unit test file `crates/nsl-runtime/tests/matmul_cublas_equivalence.rs`, `#[cfg(feature = "cuda")]`):
 
@@ -65,9 +133,11 @@ Test matrix (new unit test file `crates/nsl-runtime/tests/matmul_cublas_equivale
 4. **Square Llama-scale:** (4096, 4096, 4096) — the shape that B.3.2's trigger measurement used.
 5. **Batched-in-row m=1:** (1, 4096, 4096) — exercises the "single-row matmul" edge case that B.3.1's fused FFI registers.
 
-For each: fill A and B with deterministic pseudo-random f32 values (seed the RNG once per shape; no shared state between shapes). Run matmul under both paths, compare element-wise at 1e-5 relative tolerance. Report per-shape max absolute and relative drift.
+For each: fill A and B with deterministic pseudo-random f32 values (seed the RNG once per shape; no shared state between shapes). Compare against a CPU reference (NSL's existing CPU `tiled_matmul_f32`, which has well-defined deterministic summation order). Run matmul through `gpu_matmul_f32`, compare element-wise at 1e-5 relative tolerance. Report per-shape max absolute and relative drift.
 
-The "PTX kernel NOT launched" assertion uses the kernel-profile JSON — parse it, assert `nsl_matmul_f32` does not appear in the event list. If it does, the swap didn't take effect for that shape (routing bug).
+**Edge case — m=1 may need looser tolerance.** cuBLAS dispatches different algorithms for low-m shapes (vector-matrix product specialization). The summation-order analysis in §4 (`log2(K) * ULP ≈ 1.5e-6`) bounds the drift for typical paths, but a vector-matrix kernel may have a different reduction structure and slightly different drift. **Verify during test execution that the m=1 shape stays within 1e-5; if it exceeds, relax to 1e-4 for that shape with a documented rationale in the test, NOT a blanket relaxation.** The relaxation rule mirrors §4's general policy: any tolerance change has a reason next to it.
+
+The presence/absence kernel-profile assertions from above run on every shape in the matrix. Routing bugs that affect only some shapes (e.g., "small shapes still hit the naive kernel") get caught per-shape rather than globally.
 
 ## 4. Tolerance rationale
 
@@ -99,10 +169,12 @@ Candidates to search (grep for tolerances near matmul usage):
 **Commit A — cuBLAS swap:**
 
 - Add `"cublas"` to cudarc features in `nsl-codegen/Cargo.toml` and `nsl-runtime/Cargo.toml`.
-- Add `gpu_matmul_f32_cublas` wrapper: cublasHandle lazy-init global, row-major-via-op-swap dispatch, alpha=1.0/beta=0.0, error translation.
-- Route `gpu_matmul_f32` to call the cuBLAS wrapper. Retain the naive PTX kernel's launch code behind an env var `NSL_MATMUL_FORCE_NAIVE=1` as a rollout safety net.
+- Add `gpu_matmul_f32_cublas` wrapper: cublasHandle lazy-init `OnceLock` global (no atexit destruction; intentionally leaks at process exit per §2.3), row-major-via-op-swap dispatch (per the worked example in §2.1), `'static SGEMM_ALPHA/BETA` constants (per §2.2), error translation to NSL's null-i64 failure pattern.
+- Route `gpu_matmul_f32` to call the cuBLAS wrapper. **Delete the naive PTX kernel and its launch code in the same commit.** No rollout safety net.
 - Add `crates/nsl-runtime/tests/matmul_cublas_equivalence.rs` per §3.
-- Enumerate any tolerance relaxations in existing tests.
+- Enumerate any tolerance relaxations in existing tests in the commit message.
+
+**No `NSL_MATMUL_FORCE_NAIVE=1` env var.** The earlier draft of this spec proposed retaining the naive kernel as a rollout safety net behind an env var. On reflection that's the wrong tradeoff: the safety net's value is "if cuBLAS misbehaves, fall back to slow but correct code" — but slow-but-correct silently masks the bug rather than surfacing it. The correct response to a cuBLAS regression is to fix the wrapper or revert the PR, not to silently route around the symptom. Plus: maintaining two code paths means they can drift over time (one gets a fix the other doesn't), which is the failure mode B.3.1's anti-drift discipline was created to prevent. Single path; trust the §3 direct-probe tests; revert if needed.
 
 **Commit B — re-run B.3.2 trigger against clean baseline + record verdict:**
 
@@ -120,27 +192,50 @@ Candidates to search (grep for tolerances near matmul usage):
 - No pure-PTX SMEM-tiled kernel (option A). cuBLAS dominates the investment curve for f32 GEMM.
 - No changes to `gpu_matmul_f64`, `gpu_sparse_matmul_csr_f32`, or other matmul variants. Scope is strictly `nsl_matmul_f32` → cublasSgemm.
 - No changes to the WRGA fused kernels. They already use tensor-core MMA via hand-written PTX.
-- No deletion of the naive PTX constant in this PR. Kept behind `NSL_MATMUL_FORCE_NAIVE=1` env var for rollout safety; removed in a follow-up after the swap has been live for at least one successful B.3.2-adjacent milestone.
+- The naive PTX constant IS deleted in the swap commit (per §5 reasoning). Single code path post-merge.
 
-## 7. Expected post-swap trigger ratio (analytical prediction)
+## 7. Pre-swap measurement state (corrected) and prediction caveats
 
-Current state: `nsl_matmul_f32` ~1.5 TFLOPs/s; backward iter 12,800 ms; forward iter (fused) 1792 ms; ratio 106x.
+**Source numbers from the post-Option-3 trigger bench (PR #93, recorded in `project_wrga_b32_measurement.md`):**
 
-Post-swap (cuBLAS on 5070 Ti, f32): expect ~25-30 TFLOPs/s peak at (4096, 4096, 4096). ~15-20x speedup on the naive kernel.
+| Metric | Per-iter value |
+|---|---|
+| fused-forward-in-training (the fused kernel inside `train(step):`) | 1792 ms |
+| fwd+bwd train iter (full forward + source-AD backward + loss) | 190,130 ms |
+| backward-only (= fwd+bwd minus fused-forward) | 188,338 ms |
+| Trigger ratio (fwd+bwd / fwd) | **106.1x** |
 
-Forward iter time shrinks to ~1792 ms - small-delta (fused kernel already uses tensor cores via B.3.1's m16n8k16 MMA; cuBLAS doesn't help the fused path directly). Small-delta estimate: forward stays ~1700-1800 ms/iter.
+The 106x figure is `190,130 / 1792`, where both numerator and denominator are measured in the same train-iteration context. This is the train-forward vs train-backward comparison the trigger spec required; not a B.5 violation. (The pre-Option-3 14.7x figure WAS a B.5 violation — fused-inference-forward vs all-unfused-train; that's been corrected by Option 3 shipping.)
 
-Backward iter time shrinks to ~12,800 / 15 ≈ 850 ms/iter (6 matmuls × ~70 ms each + elementwise + loss overhead).
+**Decomposition of 188,338 ms backward-only (per the kernel-name profile from 2026-04-20):**
 
-Expected post-swap ratio: **~850 / 1750 ≈ ~0.5x to ~2x.**
+- 6 `nsl_matmul_f32` calls per iter: `dW`, `dA`, `dB`, two `dx` contributions, plus a forward recompute in the AD rule.
+- 13 elementwise/reduction calls per iter: scale, sigmoid, broadcast, mul, sub, add, reduce.
+- 1 fused-GatedLoRA-forward call (in train iteration's forward portion, counted in the 1792 ms not the backward).
 
-Wait — that's wrong because forward is ~1700 ms but backward dropped below that. Let me redo: fused forward (1792 ms) is dominated by the fused kernel itself, which already uses tensor cores. Its time doesn't meaningfully change. Backward drops ~15x to ~850 ms. Ratio = 850 / 1792 ≈ 0.47x. Backward would be FASTER than forward — counterintuitive but follows from: backward's 6 matmuls (plus primitives) in optimized cuBLAS land ≈ 850 ms of total kernel compute, while forward's one fused kernel (thread-0-only staging, per B.3.1 perf gap) takes ~1800 ms.
+**The decomposition is by COUNT, not by TIME.** NSL's kernel profiler currently reports zero durations (event-creation-before-context bug, separate follow-up). We do NOT know how the 188 sec splits between matmul kernels, elementwise kernels, allocator overhead, memcpy, and source-AD tape machinery. This matters for the prediction.
 
-**If the post-swap ratio comes in < 1.0x, it means backward is actually faster than forward.** That inverts the trigger — B.3.2 fused backward wouldn't deliver further speedup; the forward kernel's thread-0-only staging is the next bottleneck (B.4 perf milestone).
+### Naive prediction (over-optimistic)
 
-The trigger decision-tree branches remain: > 2.5x → B.3.2; < 1.5x → deferred. An inverted ratio (< 1.0x) trivially lands in the "< 1.5x deferred" branch. **B.3.2 may stay deferred indefinitely once the matmul primitive is optimized.**
+If we assumed all 188 sec was matmul compute and cuBLAS gives a clean ~17x speedup (1.5 → ~25 TFLOPs/s on a 5070 Ti at this shape), backward would drop to 188 / 17 ≈ 11 sec/iter, ratio 11000 / 1792 ≈ 6.1x. Still well above 2.5x; B.3.2 fires.
 
-This is the measurement clarity option 2 was designed to produce. The analytical prediction doesn't bind the decision — the actual measurement does. But the prediction tells us what question the measurement is likely to answer, and the answer is plausibly "the real bottleneck has moved."
+### Realistic prediction (uncertain)
+
+If matmul is only PART of the 188 sec (allocator thrash on 13 elementwise intermediates each at 65536x4096x4 = 1 GB tensor allocations, memcpy, source-AD tape lookups), the cuBLAS speedup applies to that part only. Plausible regimes:
+
+- **Matmul-dominant:** matmul = 80% of 188 sec ≈ 150 sec. Post-swap: 150/17 + 38 ≈ 47 sec backward. Ratio 47000 / 1792 ≈ 26x. **B.3.2 fires hard.**
+- **Mixed:** matmul = 50% of 188 sec ≈ 94 sec. Post-swap: 94/17 + 94 ≈ 100 sec backward. Ratio 100000 / 1792 ≈ 56x. **B.3.2 fires.**
+- **Allocator-dominant:** matmul = 20% of 188 sec ≈ 38 sec. Post-swap: 38/17 + 150 ≈ 152 sec backward. Ratio 152000 / 1792 ≈ 85x. **B.3.2 fires, but kernel-fusion wins shrink because backward is allocator-bound.**
+
+In all three regimes the ratio stays well above 2.5x. **B.3.2 is likely to remain scheduled even post-swap.** What changes is the *attribution* of the speedup B.3.2 would deliver: in the allocator-dominant regime, fusing matmuls into one backward kernel only addresses the matmul portion, and the allocator-bound elementwise overhead remains. The headline B.3.2 speedup quote depends on which regime we're in.
+
+### Why the prediction can't be tightened analytically
+
+The 188 sec / 17 ≈ 11 sec naive prediction earlier in this spec (and in earlier conversation framings) implicitly assumed matmul was 100% of backward. That's the same class of category-error the Option 3 retrospective flagged: assuming a measurement covers a regime it doesn't. Without per-kernel timing, we can't bound the matmul-vs-other split tighter than 20%-80%.
+
+**Decision: don't tighten. Ship the swap, re-measure the trigger, apply the decision tree to the measured ratio.** The decision-tree branches (> 2.5x → B.3.2; [1.5, 2.5] → profile; < 1.5x → defer) all remain mechanical. The analytical prediction's value is "what range of ratios should we be prepared to see?" — the answer is roughly 6x-85x, all firing the trigger. If the measurement comes in below 6x, that's a new finding worth investigating.
+
+The fused forward kernel itself does NOT use `nsl_matmul_f32` (it's a hand-written m16n8k16 MMA per B.3.1). cuBLAS swap doesn't change its time. Post-swap forward iter stays ~1700-1800 ms — though if backward sees the predicted 80% reduction in matmul time, the fused-forward thread-0-only staging (B.4 perf gap, separate milestone) becomes the next scaling bottleneck. That's a separate decision tree, not this one.
 
 ## 8. Success criteria
 
@@ -148,4 +243,4 @@ This is the measurement clarity option 2 was designed to produce. The analytical
 - New `matmul_cublas_equivalence.rs`: all 5 shape categories pass at 1e-5 relative tolerance; no `nsl_matmul_f32` launch observed in profile output.
 - Tolerance relaxations in existing tests (if any) enumerated with reason in the commit message.
 - B.3.2 trigger re-measurement completes; post-swap ratio recorded in memory file; decision-tree branch applied.
-- `NSL_MATMUL_FORCE_NAIVE=1` env var still exercises the naive kernel path (rollout safety verified).
+- Naive `nsl_matmul_f32` PTX constant + launch code deleted from `cuda/kernels.rs` and `cuda/mod.rs`. Single matmul code path post-merge.
