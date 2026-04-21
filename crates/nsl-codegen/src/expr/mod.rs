@@ -516,6 +516,7 @@ impl Compiler<'_> {
             data_ptr,
             nbytes,
         );
+        self.retention_splices_emitted = self.retention_splices_emitted.saturating_add(1);
     }
 
     /// Map FFI function name to a trace op type ID.

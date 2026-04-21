@@ -30,7 +30,8 @@ use crate::error::CodegenError;
 pub use entry_points::{
     compile, compile_entry, compile_module, compile_module_with_imports,
     compile_module_with_imports_best_effort_plan, compile_module_with_imports_returning_plan,
-    compile_entry_returning_plan, compile_returning_plan, compile_standalone,
+    compile_entry_returning_plan, compile_returning_plan,
+    compile_returning_splice_count_for_tests, compile_standalone,
     compile_standalone_returning_plan, compile_test, compile_with_zk_info,
     compile_with_zk_info_returning_plan,
 };
@@ -561,6 +562,13 @@ pub struct Compiler<'a> {
     /// Per-projection byte offsets inside the retention arena.
     /// Populated at the same time as `retention_arena_data_id`.
     pub retention_offsets: std::collections::HashMap<String, u32>,
+    /// Count of retention splice sites that actually emitted memcpy IR.
+    /// Incremented by `try_emit_retention_splice` past its early-return gates.
+    /// Used by integration tests to assert the splice fired when the arena
+    /// was declared before `compile_user_functions` — the original bug had
+    /// `emit_retention_arena` running after method-body codegen, so the
+    /// splice skipped every site silently.
+    pub retention_splices_emitted: u32,
 
     // ── WGGO override side-channel (Task 3) ─────────────────────
     /// Per-layer WGGO decisions for consumer passes.  Populated in the
@@ -729,6 +737,7 @@ impl<'a> Compiler<'a> {
             synth_call_names: std::collections::HashMap::new(),
             retention_arena_data_id: None,
             retention_offsets: std::collections::HashMap::new(),
+            retention_splices_emitted: 0,
             wggo_overrides: None,
             weight_index_map: options.weight_index_map.clone(),
         })
