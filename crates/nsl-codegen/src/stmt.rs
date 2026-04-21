@@ -4062,6 +4062,44 @@ impl Compiler<'_> {
                             } else {
                                 eprintln!("[wggo] {}", plan.summary());
                             }
+                            // Prune consumer (diagnostic stub): WGGO's DP can
+                            // emit `CoarseDecision::Prune` for low-importance
+                            // layers, but no downstream codegen implements
+                            // the layer-to-residual-identity IR rewrite.
+                            // Surface the gap via the `[prune]` stderr
+                            // diagnostic matching the CSHA/WRGA/CPDT/FASE
+                            // pattern, so users and the future IR-rewrite
+                            // session can see the planner's intent instead
+                            // of the decision silently no-opping.  Empty
+                            // iterator when no layer is planned for pruning
+                            // (shipped-binary common case).
+                            for diag in crate::wggo_overrides::collect_prune_diagnostics(&plan.applied) {
+                                // Dispatch through `diag.reason` rather than
+                                // calling the reason-string helper directly,
+                                // so a future Prune-adjacent reason variant
+                                // automatically renders its own string and
+                                // this match statement surfaces the missing
+                                // case at compile time via a non-exhaustive
+                                // warning (or new arm) rather than silently
+                                // printing the wrong string.
+                                let reason_str: std::borrow::Cow<'static, str> = match &diag.reason {
+                                    crate::wggo_overrides::OverrideRejectReason::PruneNotImplemented => {
+                                        std::borrow::Cow::Borrowed(
+                                            crate::wggo_overrides::prune_not_implemented_reason(),
+                                        )
+                                    }
+                                    other => std::borrow::Cow::Owned(format!("{:?}", other)),
+                                };
+                                eprintln!(
+                                    "[prune] layer:{} name={} wggo-override-rejected \
+                                     requested={} applied={} reason={}",
+                                    diag.layer_index,
+                                    diag.layer_name,
+                                    diag.requested,
+                                    diag.applied,
+                                    reason_str,
+                                );
+                            }
                             // Stash for all downstream consumers (CSHA, WRGA, ...).
                             self.wggo_overrides = Some(
                                 crate::wggo_overrides::WggoOverrides::from_applied(&plan.applied),

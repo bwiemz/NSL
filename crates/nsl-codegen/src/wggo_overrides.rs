@@ -52,6 +52,16 @@ pub enum OverrideRejectReason {
     TwoPhaseClipConflict {
         grad_clip_threshold: f64,
     },
+    // Prune:
+    /// WGGO decided `CoarseDecision::Prune` for a layer whose weight
+    /// analysis score fell below `prune_floor`, but no downstream
+    /// codegen consumer implements the layer-to-residual-identity IR
+    /// rewrite required to honor the decision.  The layer still executes
+    /// at full cost; the `[prune] layer:N wggo-override-rejected` stderr
+    /// diagnostic surfaces the gap so users and future wiring work can
+    /// see the planner's intent.  Full IR rewrite is tracked as a
+    /// separate follow-up on top of this diagnostic stub.
+    PruneNotImplemented,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -145,6 +155,42 @@ fn map_csha_level(raw: u8) -> Option<FusionLevel> {
         3 => Some(FusionLevel::Level3),
         _ => None,
     }
+}
+
+/// Walk an `AppliedPlan` and collect one `OverrideDiagnostic` per layer
+/// whose coarse decision is `Prune`.  The downstream codegen consumer
+/// that would honor these decisions (layer-to-residual-identity IR
+/// rewrite) is not yet implemented; this helper makes the gap visible
+/// via the `[prune] layer:N wggo-override-rejected requested=prune
+/// applied=keepfull reason=ir_rewrite_not_implemented` stderr format
+/// that matches the existing CSHA/WRGA/CPDT/FASE diagnostic pattern.
+///
+/// Empty when no layer is planned for pruning (the shipped-binary
+/// common case) — caller can iterate and emit without extra gating.
+pub fn collect_prune_diagnostics(
+    applied: &crate::wggo_apply::AppliedPlan,
+) -> Vec<OverrideDiagnostic> {
+    use crate::wggo_dp::LayerDecision;
+    applied
+        .layers
+        .iter()
+        .filter(|l| matches!(l.coarse, LayerDecision::Prune))
+        .map(|l| OverrideDiagnostic {
+            layer_index: l.layer_index,
+            layer_name: l.layer_name.clone(),
+            reason: OverrideRejectReason::PruneNotImplemented,
+            requested: "prune".to_string(),
+            applied: "keepfull".to_string(),
+        })
+        .collect()
+}
+
+/// Stable reason-string for `OverrideRejectReason::PruneNotImplemented`,
+/// used by the `[prune]` stderr diagnostic emitter.  Factored out so
+/// tests can assert on the literal string without reaching into private
+/// rendering code in `stmt.rs`.
+pub fn prune_not_implemented_reason() -> &'static str {
+    "ir_rewrite_not_implemented"
 }
 
 #[cfg(test)]
@@ -252,6 +298,96 @@ mod tests {
         let _wrga_budget = OverrideRejectReason::BudgetExceededDowngraded {
             original_rank: 16, final_rank: 8,
         };
+    }
+
+    fn layer(name: &str, idx: u32, coarse: CoarseDecision) -> AppliedLayer {
+        AppliedLayer {
+            layer_index: idx,
+            layer_name: name.to_string(),
+            coarse,
+            pipeline_stage: 0,
+            shard_factor: 1,
+            active_heads: 4,
+            ffn_width: 2048,
+            csha_level: 0,
+            adapter_rank: 0,
+            optim_m_bits: 8,
+            optim_v_bits: 16,
+            fase_fused: true,
+            packing_mode: 0,
+            estimated_us: 10.0,
+            param_bytes: 0,
+            activation_bytes: 0,
+        }
+    }
+
+    #[test]
+    fn collect_prune_diagnostics_empty_when_no_layer_pruned() {
+        let plan = AppliedPlan {
+            layers: vec![
+                layer("blocks.0", 0, CoarseDecision::KeepFull),
+                layer("blocks.1", 1, CoarseDecision::Thin),
+            ],
+            total_us: 20.0,
+            peak_memory_bytes: 0,
+        };
+        assert!(collect_prune_diagnostics(&plan).is_empty());
+    }
+
+    #[test]
+    fn collect_prune_diagnostics_emits_one_per_pruned_layer() {
+        let plan = AppliedPlan {
+            layers: vec![
+                layer("blocks.0", 0, CoarseDecision::KeepFull),
+                layer("blocks.1", 1, CoarseDecision::Prune),
+                layer("blocks.2", 2, CoarseDecision::Thin),
+                layer("blocks.3", 3, CoarseDecision::Prune),
+            ],
+            total_us: 40.0,
+            peak_memory_bytes: 0,
+        };
+        let diags = collect_prune_diagnostics(&plan);
+        assert_eq!(diags.len(), 2);
+
+        // Order matches AppliedPlan.layers iteration order.
+        assert_eq!(diags[0].layer_index, 1);
+        assert_eq!(diags[0].layer_name, "blocks.1");
+        assert_eq!(diags[0].requested, "prune");
+        assert_eq!(diags[0].applied, "keepfull");
+        assert!(matches!(diags[0].reason, OverrideRejectReason::PruneNotImplemented));
+
+        assert_eq!(diags[1].layer_index, 3);
+        assert_eq!(diags[1].layer_name, "blocks.3");
+    }
+
+    #[test]
+    fn prune_not_implemented_reason_string_is_stable() {
+        // The reason string is part of the externally-observable stderr
+        // format `[prune] layer:N name=<N> wggo-override-rejected ...
+        // reason=<S>` which future tools (decision explainer, CI log
+        // scanners) may match against.  Pin the literal value here so
+        // drift is caught as a test failure rather than a quiet parser
+        // regression.
+        assert_eq!(prune_not_implemented_reason(), "ir_rewrite_not_implemented");
+    }
+
+    #[test]
+    fn prune_diagnostic_carries_layer_name_for_stderr_format() {
+        // The `[prune] layer:N name=<N>` stderr format depends on
+        // `OverrideDiagnostic.layer_name` being populated (not just
+        // `layer_index`).  Match the precedent the CSHA/WRGA/FASE/CPDT
+        // emitters set — they all carry both fields.  Guards the
+        // emitter at stmt.rs against regression if a future refactor
+        // drops `layer_name` from the diagnostic construction.
+        let plan = AppliedPlan {
+            layers: vec![layer("h.5", 5, CoarseDecision::Prune)],
+            total_us: 0.1,
+            peak_memory_bytes: 0,
+        };
+        let diags = collect_prune_diagnostics(&plan);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].layer_index, 5);
+        assert_eq!(diags[0].layer_name, "h.5");
     }
 
     fn overrides_with_layers(layers: &[(&str, u32)]) -> WggoOverrides {
