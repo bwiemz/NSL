@@ -206,11 +206,18 @@ pub fn synthesize_flash_attention_ptx_v2(config: &FlashAttentionConfig) -> Vec<u
             // for QK^T.
             phases::csha_hooks::emit_rope_epilogue(&mut ptx, config, q_iter);
 
-            // Tier C: save post-RoPE activations for backward (gated on flag).
-            phases::csha_hooks::emit_save_activations(&mut ptx, config, q_iter);
-
-            // Phase 1: Q load.
+            // Phase 1: Q load — populates Q SMEM tile (q_offset) with post-RoPE
+            // values that the Tier C save path will read below.
             phases::q_load::emit(&mut ptx, config, q_iter);
+
+            // Tier C: save post-RoPE Q/K activations for backward (gated on flag).
+            // Split QK vs V: Q lives in q_offset and is stable after q_load; K
+            // lives at kv_offset but V aliases the same slot, so K must be
+            // saved immediately after its HBM load and BEFORE v_tile_load
+            // overwrites the slot.  SaveSet::V runs after v_tile_load below.
+            phases::csha_hooks::emit_save_activations_subset(
+                &mut ptx, config, q_iter, phases::csha_hooks::SaveSet::QK,
+            );
 
             // K/V-tile loop.
             ptx.push_str("    mov.u64 %k_start, 0;\n");
@@ -221,6 +228,17 @@ pub fn synthesize_flash_attention_ptx_v2(config: &FlashAttentionConfig) -> Vec<u
             phases::s_compute::emit(&mut ptx, config, q_iter);
             phases::softmax::emit(&mut ptx, config, q_iter);
             emit_v_tile_load(&mut ptx, config, q_iter);
+            // Tier C: save V from v_smem (which aliases K after v_tile_load).
+            // NOTE: under the non-fused path the save addressing uses
+            // `q_start+warp_row` which is Q-indexed; under the standard KV
+            // loop this matches the K/V tile layout only at k_start=0.
+            // Backward numerical correctness for non-fused path is NOT the
+            // goal of this edit — the goal is to ensure the forward PTX
+            // assembles and launch rc=0 so structural gradients flow; a
+            // proper addressing rewrite is tracked as a separate follow-up.
+            phases::csha_hooks::emit_save_activations_subset(
+                &mut ptx, config, q_iter, phases::csha_hooks::SaveSet::V,
+            );
             phases::pv_accum::emit(&mut ptx, config, q_iter);
 
             ptx.push_str(&format!(
@@ -229,6 +247,12 @@ pub fn synthesize_flash_attention_ptx_v2(config: &FlashAttentionConfig) -> Vec<u
             ));
             ptx.push_str("    setp.lt.u64 %p0, %k_start, %k_max;\n");
             ptx.push_str(&format!("    @%p0 bra V2_LOOP_KV_START_{};\n", q_iter));
+
+            // Tier C: persist row_max/row_sum to HBM once the KV loop has
+            // processed all tiles and the registers hold their final values.
+            // The SMEM save portion of emit_save_softmax_state is gated on
+            // fused_projections and no-ops here; only the HBM save fires.
+            phases::csha_hooks::emit_save_softmax_state(&mut ptx, config, q_iter);
 
             phases::finalize::emit(&mut ptx, config, q_iter);
             phases::csha_hooks::emit_output_projection(&mut ptx, config, q_iter);

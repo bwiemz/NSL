@@ -566,3 +566,80 @@ fn csha_tier_c_save_activations_assembles_on_sm75_sm90_sm120() {
         failures.join("\n---\n")
     );
 }
+
+/// PR #93 regression: `save_activations_for_backward=true` with
+/// `fused_projections=false` (the training dispatch config) must also
+/// produce ptxas-clean PTX.  Pre-fix, the three `%q_smem_base` /
+/// `%k_smem_base` / `%v_smem_base` registers were declared only under the
+/// `fused_projections=true` branch of `prelude.rs`, so this config
+/// produced PTX that ptxas rejected with `Unknown symbol %q_smem_base`.
+///
+/// Fix:  widen the declaration gate to `fused_projections ||
+/// save_activations_for_backward` and initialise the registers inside
+/// `emit_save_activations_subset` when the non-fused branch is active.
+///
+/// Skipped gracefully when ptxas is not installed.
+#[test]
+fn csha_tier_c_save_nonfused_assembles_on_sm75_sm90_sm120() {
+    let Some(ptxas) = find_ptxas() else {
+        eprintln!(
+            "skipping Tier C save_nonfused ptxas test: ptxas not found in PATH"
+        );
+        return;
+    };
+    use nsl_codegen::flash_attention_v2::synthesize_flash_attention_ptx_v2;
+
+    let cfg = FlashAttentionConfig {
+        block_q: 32,
+        block_kv: 32,
+        head_dim: 32,
+        causal: false,
+        paged: false,
+        rope_q: true,
+        rope_style: RopeStyle::Adjacent,
+        gqa_group_size: 1,
+        tree_mask: false,
+        gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras {
+            // THE REGRESSION CONFIG: training dispatch sets this combo.
+            fused_projections: false,
+            save_activations_for_backward: true,
+            d_model: 128,
+            ..CshaExtras::default()
+        }),
+    };
+
+    let mut failures = Vec::new();
+    for sm in &["sm_75", "sm_90", "sm_120"] {
+        let mut c = cfg.clone();
+        c.gpu_sm = sm.trim_start_matches("sm_").parse().unwrap_or(75);
+        let ptx = synthesize_flash_attention_ptx_v2(&c);
+        let text_end = ptx.iter().position(|&b| b == 0).unwrap_or(ptx.len());
+        let dump = std::env::temp_dir().join(format!("tier_c_save_nonfused_{}.ptx", sm));
+        std::fs::write(&dump, &ptx[..text_end]).ok();
+        if let Err(stderr) = assemble_ptx(&ptxas, &ptx[..text_end], sm) {
+            let ptx_str = String::from_utf8_lossy(&ptx[..text_end]);
+            let lines: Vec<&str> = ptx_str.lines().collect();
+            let total = lines.len();
+            let tail_start = total.saturating_sub(60);
+            let tail: String = lines[tail_start..]
+                .iter()
+                .enumerate()
+                .map(|(i, l)| format!("  {:>4}: {}", tail_start + i + 1, l))
+                .collect::<Vec<_>>()
+                .join("\n");
+            failures.push(format!(
+                "Tier C save_nonfused PTX failed on {} (dump: {}):\n\
+                 --- ptxas ---\n{}\n--- PTX tail ---\n{}",
+                sm,
+                dump.display(),
+                stderr,
+                tail
+            ));
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "Tier C save_nonfused ptxas failures:\n\n{}",
+        failures.join("\n---\n")
+    );
+}

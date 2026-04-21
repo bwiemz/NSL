@@ -1657,7 +1657,14 @@ impl Compiler<'_> {
                 let save_shmem_val = builder
                     .ins()
                     .iconst(cl_types::I64, csha_training_shmem_bytes);
-                let _err = self.compile_call_by_name(
+                // PR #93 edit 4: stop silently discarding the launch rc.
+                // Previously bound to `_err` and dropped; now we emit a
+                // runtime `brif rc != 0 → trap` so an INVALID_PTX or
+                // ILLEGAL_ADDRESS launch halts the program immediately
+                // with a deterministic trap (`TrapCode::unwrap_user(3)`)
+                // instead of silently producing zero-initialised save
+                // buffers that then NaN the backward pass.
+                let launch_rc = self.compile_call_by_name(
                     builder,
                     "nsl_flash_attention_csha_with_saves",
                     &[
@@ -1683,6 +1690,21 @@ impl Compiler<'_> {
                         x_raw_v,
                     ],
                 )?;
+                {
+                    use cranelift_codegen::ir::{condcodes::IntCC, TrapCode};
+                    let ok_block   = builder.create_block();
+                    let trap_block = builder.create_block();
+                    let is_err = builder
+                        .ins()
+                        .icmp_imm(IntCC::NotEqual, launch_rc, 0);
+                    builder.ins().brif(is_err, trap_block, &[], ok_block, &[]);
+                    builder.switch_to_block(trap_block);
+                    builder.seal_block(trap_block);
+                    // TrapCode user(3) = CSHA forward launch rc != 0.
+                    builder.ins().trap(TrapCode::unwrap_user(3));
+                    builder.switch_to_block(ok_block);
+                    builder.seal_block(ok_block);
+                }
 
                 // Gap D: the scope-immediate free that was here in Gap A
                 // has MOVED.  Under @train the saves must survive until
