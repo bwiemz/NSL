@@ -91,3 +91,65 @@ B.3.1's close-out document (2026-04-18) claimed fused forward shipped end-to-end
 > **CORRECTION (2026-04-19):** Fused forward shipped for shape regime n <= 64. At spec-referenced shapes (n=4096 Llama-3-8B proxy), the emitter produced 20 MB PTX which ptxas could not compile, causing silent CPU fallback. Root cause: compile-time K-loop unrolling produced PTX with size O(k). Fixed 2026-04-19 by converting to a PTX runtime loop; post-fix PTX is ~106 KB regardless of k. See the B.3 addendum in this document.
 
 The correction is documented in the memory file for future retrospective cycles.
+
+---
+
+## B.5 -- Verify the specific code path, not a proxy
+
+**Discovered during WRGA B.3.2 Option 3 spec validation (2026-04-19); generalizes B.3's "test at the scale you target" rule from structural to procedural.**
+
+Any spec claiming that a specific code path fires under specific conditions must include a probe that directly verifies the claim. Proxy measurements (launch-counter increments, memory profile changes, throughput deltas) can be satisfied by code paths other than the one the spec claims, and a proxy's success doesn't establish that the claimed path fires.
+
+The probe must:
+
+1. Exercise the specific conditions the spec's claim depends on.
+2. Observe a signal that **only** the claimed path can produce.
+3. Fail if the proxy is satisfied through an unclaimed path.
+
+### Illustrative failures (both caught only after implementation began)
+
+- **B.3.1's Llama-scale claim** was verified via ptxas tests at n <= 64. Proxy passed because ptxas accepts small PTX even when the spec's target scale is structurally broken. The direct probe -- "feed the emitter a config at the spec-referenced shape (n=4096), confirm the resulting PTX ptxas-compiles" -- would have caught the 20 MB / 478k-line failure at CI time. Without it, the failure was only discovered during B.3.2 trigger measurement.
+
+- **B.3.2 Option 3's fused-handler claim** was verified by initial spec prep via a launch-counter increment in a top-level inference call (`let y = m.forward(x)` after the train block). Proxy passed because inference-time fusion is unrelated to the train-block path the spec claimed to fix. The direct probe -- "run `m.forward(x)` inside `train(...)` with `NSL_WRGA_GPU_LAUNCH_COUNTER=1`; assert `[nsl-gpu-launch-count] >= epochs`" -- would have shown `[nsl-gpu-launch-count] 0` and surfaced the structural gap (`model_method_bodies` populated from unrewritten AST) before any implementation work began.
+
+### Generalization
+
+The rule applies to any future spec where:
+
+- An intervention targets a specific execution context (train-block path, inference-only path, sm_80+ path, source-AD walk, compile_main, etc.).
+- The intervention claims to change behavior in that context.
+- The verification method has any ambiguity about which context satisfied the assertion.
+
+When in doubt, instrument the context with a signal that ONLY the claimed path can produce -- such as a param-count or adjoint-shape assertion whose value depends on the specific code path executing. Launch-counter increments are useful but insufficient if the same counter can be incremented by adjacent code paths.
+
+### Composition with B.3
+
+B.3 said: "test the scale you're targeting, not the scale your unit tests happen to hit." B.5 extends this from scale to code path: "verify the code path you're targeting, not a proxy satisfied by an adjacent path." Both rules target the same class of institutional failure -- specs that pass their tests for reasons unrelated to whether the intervention actually works in production.
+
+### Application to Option 3 re-spec (2026-04-19)
+
+Option 3's re-spec (3e + original option 3) lands with two direct probes:
+
+- **Launch-counter assertion under train block:** `NSL_WRGA_GPU_LAUNCH_COUNTER=1` + `train(epochs=3)` + `@adapter(type=gatedlora)` asserts `[nsl-gpu-launch-count] >= 3`. Proxy-level (necessary but not sufficient by B.5).
+
+- **Trainable-params connection-count assertion:** source-AD reports `5/5 trainable tensor params connected` (x, W, A, B, gate) rather than `1/5`. This signal can only reach 5 if source-AD's Wengert walk has seen the fused FFI call and extracted its 5 inputs -- exactly the code path 3e+option3 claims to enable. This is the B.5-compliant direct probe.
+
+The combination catches both the proxy-pass and the proxy-fail misclassification failure modes.
+
+### B.5 (clarification, 2026-04-19 later in day): the rule applies recursively
+
+Any verification step whose result is cited by a spec as an established fact is itself a code-path claim subject to B.5. "Task 0 verified the precondition" is not a shield against B.5 unless Task 0's own verification satisfied B.5 -- meaning it exercised the specific conditions the precondition depends on, not proxy conditions that happen to have overlapping behavior.
+
+Concrete failure observed: revised Option 3 spec §7 listed "No fix for adapter-field CPU placement (verified unnecessary by Task 0)" as a non-goal. Task 0 had probed gate placement via a **top-level inference call** (`let y = m.forward(x)` after the train block), not via an **in-train-block call** (`m.forward(x)` inside `train(step):`). These hit different code paths: inference mode lets the user manually reassign `m.gate_... = zeros(...).to(cuda)` between the train block and the probe; training mode has no such reassignment site because the adapter side-table is populated mid-train-block. Task 0's verification satisfied a claim about the inference path — it did not establish anything about the training path — but the spec's non-goal inherited the result as if it had. This is exactly the proxy-satisfies-the-wrong-claim failure the main B.5 rule targets, one meta-level up.
+
+The clarification: **the rule is recursive.** A spec's "verified elsewhere" citation carries the full B.5 obligation of the original verification. A proxy verification cannot confer spec-level confidence even when the spec explicitly cites it as "precondition verified."
+
+### Three-instances retrospective
+
+As of 2026-04-19 this is the third occurrence of the same failure mode in two days:
+
+1. **B.3.1's Llama-scale claim** verified via n≤64 ptxas tests.
+2. **Original Option 3's fused-handler claim** verified via top-level launch-counter.
+3. **Revised Option 3's precondition claim** (Task 0) verified via inference-path placement probe.
+
+The recurrence suggests the rule is being applied in retrospect (when a blocker surfaces the violation), not proactively during spec/verification prep. The rule is correct; the *timing* of its application is the gap. Whether this warrants codifying a separate discipline ("always ask B.5's three questions during verification prep, not after") is an open question — two more instances would confirm; one occurrence doesn't yet.

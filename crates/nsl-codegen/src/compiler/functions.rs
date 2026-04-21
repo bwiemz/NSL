@@ -532,112 +532,19 @@ impl Compiler<'_> {
                         // B.2.1 Task 3: run the LoRA forward-pass AST rewrite
                         // over each statement before lowering. Only active when
                         // adapter sites target this model class.
-                        let sites_for_model: Vec<&crate::wrga_adapter_inject::AdapterSite> = self
-                            .adapter_sites
-                            .iter()
-                            .filter(|s| s.target_model == model_name)
-                            .collect();
-                        let rewritten_stmts: Vec<nsl_ast::stmt::Stmt> = if sites_for_model.is_empty()
-                        {
-                            fn_def.body.stmts.clone()
-                        } else {
-                            let mut ctx =
-                                crate::wrga_adapter_rewrite::RewriteContext::new(sites_for_model);
-                            // B.3 Task 4: expose the compile target's sm
-                            // version so the rewrite can choose between the
-                            // fused single-FFI path and the B.2.1 unfused
-                            // triple.
-                            ctx.target_sm = self.target_sm();
-                            // B.3 Task 5: deterministic ordering of
-                            // fused PTX kernel keys, used by the rewrite
-                            // to assign a stable per-site `kernel_handle`.
-                            // Sort by the full key tuple.
-                            let mut order: Vec<crate::wrga_fused_ptx::LoraKernelKey> = self
-                                .fused_ptx_kernels
-                                .keys()
-                                .cloned()
-                                .collect();
-                            order.sort_by_key(|k| (k.m, k.n, k.k, k.rank, k.target_sm));
-                            ctx.fused_kernel_order = order;
-                            // B.3.1 Task 5.0.c: build GatedLoRA kernel order
-                            // from the parallel map.  Handles for GatedLoRA
-                            // are assigned at lora_count + idx in this vec.
-                            let mut gl_order: Vec<crate::wrga_fused_ptx::LoraKernelKey> = self
-                                .fused_gatedlora_ptx_kernels
-                                .keys()
-                                .cloned()
-                                .collect();
-                            gl_order
-                                .sort_by_key(|k| (k.m, k.n, k.k, k.rank, k.target_sm));
-                            ctx.fused_gatedlora_kernel_order = gl_order;
-                            // Find the `self` Symbol and populate field_symbols
-                            // from the model's known fields for matcher support.
-                            ctx.self_sym = fn_def
-                                .params
-                                .iter()
-                                .find(|p| self.resolve_sym(p.name) == "self")
-                                .map(|p| p.name);
-                            if let Some(field_map) =
-                                self.models.model_field_types.get(&model_name).cloned()
-                            {
-                                for fname in field_map.keys() {
-                                    if let Some(s) = self.interner.get(fname) {
-                                        ctx.field_symbols.insert(
-                                            fname.clone(),
-                                            nsl_ast::Symbol(s),
-                                        );
-                                    }
-                                }
-                            }
-                            // B.2.1 Task 5.5: also include Tensor-typed
-                            // fields (whose shape strings live in the
-                            // separate `model_tensor_field_shapes` map)
-                            // so the rewrite matcher can recognise
-                            // `self.w @ ...` for adapted tensor fields.
-                            if let Some(field_map) = self
-                                .models
-                                .model_tensor_field_shapes
-                                .get(&model_name)
-                                .cloned()
-                            {
-                                for fname in field_map.keys() {
-                                    if let Some(s) = self.interner.get(fname) {
-                                        ctx.field_symbols.insert(
-                                            fname.clone(),
-                                            nsl_ast::Symbol(s),
-                                        );
-                                    }
-                                }
-                            }
-                            // B.3.1 Task 5.1: GatedLoRA's synthesize_gatedlora_adapted
-                            // builds a `sigmoid(self.gate_<site>)` Call node and resolves
-                            // the callee by looking up `field_symbols["sigmoid"]`. Without
-                            // this insertion the fallback picks an arbitrary field symbol
-                            // (e.g. `w`) as the callee, emitting `w(gate_...)` which fails
-                            // at codegen with "undefined variable 'w'".
-                            //
-                            // We insert the symbol unconditionally for all models that have
-                            // adapter sites — it is a no-op if no GatedLoRA site is present
-                            // since non-GatedLoRA rewrites never consult `field_symbols["sigmoid"]`.
-                            if let Some(s) = self.interner.get("sigmoid") {
-                                ctx.field_symbols
-                                    .insert("sigmoid".to_string(), nsl_ast::Symbol(s));
-                            }
-                            let out: Vec<nsl_ast::stmt::Stmt> = fn_def
-                                .body
-                                .stmts
-                                .iter()
-                                .cloned()
-                                .map(|s| crate::wrga_adapter_rewrite::rewrite_stmt(s, &mut ctx))
-                                .collect();
-                            // Commit synth overrides to the compiler so
-                            // compile_member_access can resolve them.
-                            self.synth_member_names.extend(ctx.synth_overrides);
-                            // B.3 Task 4: commit fused-call callee overrides
-                            // so expr_as_func_name can resolve them.
-                            self.synth_call_names.extend(ctx.synth_call_overrides);
-                            out
-                        };
+                        //
+                        // WRGA B.3.2 Option 3 phase 3e: the rewrite setup lives
+                        // in `wrga_adapter_rewrite::rewrite_stmts_for_model`,
+                        // shared with `wrga_prescan::rewrite_model_method_bodies_\
+                        // with_adapter_sites` so the Cranelift-compiled body
+                        // and the source-AD-walked `model_method_bodies` copy
+                        // cannot drift.
+                        let rewritten_stmts = crate::wrga_adapter_rewrite::rewrite_stmts_for_model(
+                            self,
+                            &model_name,
+                            fn_def,
+                            &fn_def.body.stmts,
+                        );
 
                         // B.2.1 Task 5.5: stash model name so
                         // `compile_member_access` can resolve synthesized

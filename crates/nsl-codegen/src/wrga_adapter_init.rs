@@ -114,6 +114,7 @@ pub(crate) fn emit_adapter_init_sidetable(
             output_dim: out as i64,
             rank,
             strategies: placement.init_strategies.clone(),
+            target_field: target_field.to_string(),
         });
     }
 
@@ -131,14 +132,50 @@ pub(crate) fn emit_adapter_init_sidetable(
 
     // 4. Emit tensor creation per site+field, in order, and store into the
     //    table at consecutive 8-byte slots.
+    //
+    // Commit-C placement fix: newly-created adapter tensors are CPU-resident
+    // (nsl_tensor_zeros/ones/full/randn all allocate on the host). If the
+    // model was moved to GPU before entering this train block (via
+    // `m.to(cuda)`), the side-table tensors would otherwise stay on CPU, and
+    // the fused FFI at forward time would hit its device-check and fall back
+    // to CPU math. We reconcile by migrating each newly-created tensor onto
+    // the same device as the target weight field (loaded from the model
+    // struct at field.offset) using `nsl_tensor_to_device_like`.
     let mut idx: i64 = 0;
     for site in &emit_list {
+        // Resolve the target-field byte offset on the model struct so we can
+        // load its tensor pointer as the device reference.
+        let field_layout = layout
+            .fields
+            .iter()
+            .find(|f| f.name == site.target_field)
+            .ok_or_else(|| {
+                CodegenError::new(format!(
+                    "adapter init: target field '{}' not in struct layout for model '{}'",
+                    site.target_field, model_type_name,
+                ))
+            })?;
+        let ref_tensor_ptr = builder.ins().load(
+            cl_types::I64,
+            MemFlags::trusted(),
+            model_ptr,
+            cranelift_codegen::ir::immediates::Offset32::new(field_layout.offset as i32),
+        );
+
         for strat in &site.strategies {
             let tensor_ptr = emit_one_init(compiler, builder, site, strat)?;
+            // Migrate onto the target field's device. When devices already
+            // match (e.g., model still on CPU), this is a refcount-bump
+            // no-op in the runtime helper.
+            let placed_tensor = compiler.compile_call_by_name(
+                builder,
+                "nsl_tensor_to_device_like",
+                &[tensor_ptr, ref_tensor_ptr],
+            )?;
             let byte_off = (idx * 8) as i32;
             builder.ins().store(
                 MemFlags::trusted(),
-                tensor_ptr,
+                placed_tensor,
                 table_ptr,
                 byte_off,
             );
@@ -162,6 +199,11 @@ struct PlacementEmit {
     output_dim: i64,
     rank: i64,
     strategies: Vec<crate::wrga_adapter_inject::InitStrategy>,
+    /// Target weight field name on the model struct (e.g., "w" for
+    /// placement "Toy.w"). Used at emit time to look up the field's byte
+    /// offset from `StructLayout::fields` and load the field's tensor
+    /// pointer as the reference device for `nsl_tensor_to_device_like`.
+    target_field: String,
 }
 
 /// Emit one synthesized field's tensor creation FFI. Returns the owned

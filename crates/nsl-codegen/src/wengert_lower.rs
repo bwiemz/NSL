@@ -779,6 +779,44 @@ fn lower_single_op(
                 &[inputs[0], d0, d1],
             )
         }
+        // WRGA B.3.2 Option 3: fused GatedLoRA forward FFI call.
+        //
+        //   nsl_adapter_fused_gatedlora_matmul(x, W, A, B, scale: f64, gate, kh: i64) -> i64
+        PrimalOp::FusedGatedLoraMatmul { scale, kernel_handle } => {
+            let scale_v = builder.ins().f64const(*scale as f64);
+            let kh = builder.ins().iconst(cl_types::I64, *kernel_handle);
+            call(
+                compiler,
+                builder,
+                "nsl_adapter_fused_gatedlora_matmul",
+                &[inputs[0], inputs[1], inputs[2], inputs[3], scale_v, inputs[4], kh],
+            )
+        }
+        // WRGA B.3 fused LoRA forward FFI call.
+        //
+        //   nsl_adapter_fused_lora_matmul(x, W, A, B, scale: f64, kh: i64) -> i64
+        PrimalOp::FusedLoraMatmul { scale, kernel_handle } => {
+            let scale_v = builder.ins().f64const(*scale as f64);
+            let kh = builder.ins().iconst(cl_types::I64, *kernel_handle);
+            call(
+                compiler,
+                builder,
+                "nsl_adapter_fused_lora_matmul",
+                &[inputs[0], inputs[1], inputs[2], inputs[3], scale_v, kh],
+            )
+        }
+        // WRGA B.3 fused IA³ forward FFI call.
+        //
+        //   nsl_adapter_fused_ia3_matmul(x, W, gamma, kh: i64) -> i64
+        PrimalOp::FusedIa3Matmul { kernel_handle } => {
+            let kh = builder.ins().iconst(cl_types::I64, *kernel_handle);
+            call(
+                compiler,
+                builder,
+                "nsl_adapter_fused_ia3_matmul",
+                &[inputs[0], inputs[1], inputs[2], kh],
+            )
+        }
         PrimalOp::Reshape { .. } => {
             // Reshape in backward pass is typically a view op; clone preserves data.
             call(compiler, builder, "nsl_tensor_clone", &[inputs[0]])

@@ -3816,6 +3816,11 @@ impl Compiler<'_> {
             // Wire model method bodies and field types for inline expansion
             extractor.set_model_method_bodies(self.models.model_method_bodies.clone());
             extractor.set_model_field_types(self.models.model_field_types.clone());
+            // WRGA B.3.2 Option 3: plumb synth overrides so the extractor
+            // resolves sentinel-Ident callees/members emitted by the
+            // adapter rewrite (fused FFI name + adapter field names).
+            extractor.set_synth_call_names(self.synth_call_names.clone());
+            extractor.set_synth_member_names(self.synth_member_names.clone());
 
             // Register the model variable as a model instance so method calls get inlined
             extractor.register_model_instance(model_sym, &model_type_name);
@@ -4323,6 +4328,96 @@ impl Compiler<'_> {
                         plan_ref,
                     )?;
                 }
+
+                // WRGA B.3.2 Option 3: resolve any named adapter params
+                // that the pre-init pass above couldn't load (because the
+                // side-table pointer was still zero). The init just
+                // populated it, so MemberAccess loads on the synth adapter
+                // field names now return real tensor pointers — emit
+                // those loads here, after the init instructions in IR
+                // order, so they execute with a valid table pointer.
+                for (compound_name, vid) in extractor.named_param_var_ids() {
+                    if primal_vars.contains_key(vid) {
+                        continue;
+                    }
+                    let parts: Vec<&str> = compound_name.split('.').collect();
+                    if parts.len() < 2 {
+                        continue;
+                    }
+                    let last = parts[parts.len() - 1];
+                    if !crate::expr::access::is_synthesized_adapter_field_name(last) {
+                        continue;
+                    }
+                    let mut current_ptr = model_ptr;
+                    let mut current_type_name = model_type_name.clone();
+                    let mut current_layout = layout.clone();
+                    let mut ok = true;
+                    for part in &parts[1..parts.len() - 1] {
+                        if let Ok(array_idx) = part.parse::<usize>() {
+                            current_ptr = builder.ins().load(
+                                cl_types::I64,
+                                cranelift_codegen::ir::MemFlags::trusted(),
+                                current_ptr,
+                                (array_idx * 8) as i32,
+                            );
+                            continue;
+                        }
+                        if let Some(field) =
+                            current_layout.fields.iter().find(|f| &f.name == part)
+                        {
+                            let offset = field.offset as i32;
+                            let field_val = builder.ins().load(
+                                field.cl_type,
+                                cranelift_codegen::ir::MemFlags::trusted(),
+                                current_ptr,
+                                offset,
+                            );
+                            current_ptr = field_val;
+                            let field_type = self
+                                .models
+                                .model_field_types
+                                .get(&current_type_name)
+                                .and_then(|ft| ft.get(part.to_owned()))
+                                .cloned();
+                            if let Some(ft) = field_type {
+                                if let Some(inner_layout) = self.types.struct_layouts.get(&ft) {
+                                    current_layout = inner_layout.clone();
+                                    current_type_name = ft;
+                                } else {
+                                    ok = false;
+                                    break;
+                                }
+                            } else {
+                                ok = false;
+                                break;
+                            }
+                        } else {
+                            ok = false;
+                            break;
+                        }
+                    }
+                    if !ok {
+                        continue;
+                    }
+                    if let Some(slot_off) = current_layout.adapter_sidetable_offset {
+                        if let Some(index) = self.adapter_field_index(&current_type_name, last) {
+                            let table_ptr = builder.ins().load(
+                                cl_types::I64,
+                                cranelift_codegen::ir::MemFlags::trusted(),
+                                current_ptr,
+                                slot_off as i32,
+                            );
+                            let byte_off = (index * 8) as i32;
+                            let tensor_ptr = builder.ins().load(
+                                cl_types::I64,
+                                cranelift_codegen::ir::MemFlags::trusted(),
+                                table_ptr,
+                                byte_off,
+                            );
+                            primal_vars.insert(*vid, tensor_ptr);
+                        }
+                    }
+                }
                 let effective_primal: crate::wengert::WengertList = match &wrga_plan {
                     Some(plan) => plan.prune.pruned.clone(),
                     None => extractor.wengert_list().clone(),
@@ -4723,6 +4818,23 @@ impl Compiler<'_> {
                         continue;
                     };
                     grad_connected += 1;
+
+                    // WRGA B.3.2 Option 3: adapter-injected params (lora_A_*,
+                    // lora_B_*, ia3_scale_*, gate_*) are NOT in the runtime
+                    // param_list (the runtime list is built from
+                    // `enumerate_model_tensor_paths`, which excludes side-table
+                    // entries). Skip the align-with-runtime scan for them —
+                    // we count them as connected for the gradient-summary
+                    // diagnostic but don't emit the `nsl_assert` that would
+                    // always fire "missing param" for these paths.
+                    let leaf = param_name
+                        .rsplit('.')
+                        .next()
+                        .unwrap_or(param_name.as_str());
+                    if crate::expr::access::is_synthesized_adapter_field_name(leaf) {
+                        continue;
+                    }
+
                     let scan_i_var = state.new_variable();
                     let scan_match_count_var = state.new_variable();
                     builder.declare_var(scan_i_var, cl_types::I64);
@@ -6320,6 +6432,30 @@ impl Compiler<'_> {
                 paths.push(field_path);
             }
         }
+
+        // WRGA B.3.2 Option 3: include synthesized adapter-injected fields
+        // (lora_A_*, lora_B_*, ia3_scale_*, gate_*) in the ALL-paths
+        // enumeration. Source-AD reads this as `trainable_tensor_param_paths`
+        // so the gradient-summary diagnostic counts them (B.5 direct probe).
+        //
+        // Gated on `include_nontrainable` so `enumerate_model_tensor_paths`
+        // (used to build the runtime param_list) does NOT return these —
+        // runtime load via `load_nested_field` can't traverse the adapter
+        // side-table at that point in codegen.
+        if include_nontrainable {
+            for site in &self.adapter_sites {
+                if site.target_model != type_name {
+                    continue;
+                }
+                if site.input_dim == 0 || site.output_dim == 0 {
+                    continue;
+                }
+                for synth in &site.synthesized_fields {
+                    let synth_path = format!("{}.{}", prefix, synth);
+                    paths.push(synth_path);
+                }
+            }
+        }
     }
 
     /// Load a nested model field by traversing struct layouts along a compound name path.
@@ -7106,6 +7242,11 @@ impl Compiler<'_> {
         let mut extractor = crate::source_ad::WengertExtractor::new(self.interner);
         extractor.set_model_method_bodies(self.models.model_method_bodies.clone());
         extractor.set_model_field_types(self.models.model_field_types.clone());
+        // WRGA B.3.2 Option 3: plumb synth overrides so the extractor
+        // resolves sentinel-Ident callees/members emitted by the adapter
+        // rewrite.
+        extractor.set_synth_call_names(self.synth_call_names.clone());
+        extractor.set_synth_member_names(self.synth_member_names.clone());
         self.register_source_ad_model_instances(&mut extractor, state);
 
         for &sym in state.variables.keys() {

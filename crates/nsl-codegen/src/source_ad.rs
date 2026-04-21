@@ -532,6 +532,156 @@ impl AdjointGenerator {
             }
 
             let output_bar = self.get_or_create_adjoint(op.result);
+
+            // WRGA B.3 fused LoRA forward AD rule.
+            //
+            // Forward: y = x @ W + scale * (x @ A @ B).
+            // Given dy:
+            //   dy_sc = dy * scale
+            //   dx  += dy @ W.T + dy_sc @ B.T @ A.T
+            //   dW  += x.T @ dy
+            //   dA  += x.T @ dy_sc @ B.T
+            //   dB  += (x @ A).T @ dy_sc
+            if let PrimalOp::FusedLoraMatmul { scale, .. } = op.op {
+                let x = op.inputs[0];
+                let w = op.inputs[1];
+                let a = op.inputs[2];
+                let b_in = op.inputs[3];
+                let dy = output_bar;
+
+                let scale_c = self.emit_constant(scale as f64);
+                let dy_sc = self.emit_op(PrimalOp::Mul, vec![dy, scale_c]);
+                let xa = self.emit_op(PrimalOp::Matmul, vec![x, a]);
+
+                let x_t = self.emit_op(PrimalOp::Transpose { dim0: usize::MAX - 1, dim1: usize::MAX }, vec![x]);
+                let w_t = self.emit_op(PrimalOp::Transpose { dim0: usize::MAX - 1, dim1: usize::MAX }, vec![w]);
+                let a_t = self.emit_op(PrimalOp::Transpose { dim0: usize::MAX - 1, dim1: usize::MAX }, vec![a]);
+                let b_t = self.emit_op(PrimalOp::Transpose { dim0: usize::MAX - 1, dim1: usize::MAX }, vec![b_in]);
+                let xa_t = self.emit_op(PrimalOp::Transpose { dim0: usize::MAX - 1, dim1: usize::MAX }, vec![xa]);
+
+                let dw = self.emit_op(PrimalOp::Matmul, vec![x_t, dy]);
+                self.accumulate_adjoint(w, dw);
+
+                let xt_dysc = self.emit_op(PrimalOp::Matmul, vec![x_t, dy_sc]);
+                let da = self.emit_op(PrimalOp::Matmul, vec![xt_dysc, b_t]);
+                self.accumulate_adjoint(a, da);
+
+                let db = self.emit_op(PrimalOp::Matmul, vec![xa_t, dy_sc]);
+                self.accumulate_adjoint(b_in, db);
+
+                let dx_base = self.emit_op(PrimalOp::Matmul, vec![dy, w_t]);
+                let dy_sc_bt = self.emit_op(PrimalOp::Matmul, vec![dy_sc, b_t]);
+                let dx_ad = self.emit_op(PrimalOp::Matmul, vec![dy_sc_bt, a_t]);
+                let dx = self.emit_op(PrimalOp::Add, vec![dx_base, dx_ad]);
+                self.accumulate_adjoint(x, dx);
+                continue;
+            }
+
+            // WRGA B.3 fused IA³ forward AD rule.
+            //
+            // Forward: y[B, N] = (x[B, K] @ W[K, N]) * gamma[N] (broadcast).
+            // Given dy:
+            //   dxw = dy * gamma
+            //   dx  += dxw @ W.T
+            //   dW  += x.T @ dxw
+            //   dgamma += ReduceSum(dy * (x @ W), axis=0)
+            if let PrimalOp::FusedIa3Matmul { .. } = op.op {
+                let x = op.inputs[0];
+                let w = op.inputs[1];
+                let gamma = op.inputs[2];
+                let dy = output_bar;
+
+                let xw = self.emit_op(PrimalOp::Matmul, vec![x, w]);
+                let dxw = self.emit_op(PrimalOp::Mul, vec![dy, gamma]);
+
+                let x_t = self.emit_op(PrimalOp::Transpose { dim0: usize::MAX - 1, dim1: usize::MAX }, vec![x]);
+                let w_t = self.emit_op(PrimalOp::Transpose { dim0: usize::MAX - 1, dim1: usize::MAX }, vec![w]);
+
+                let dw = self.emit_op(PrimalOp::Matmul, vec![x_t, dxw]);
+                self.accumulate_adjoint(w, dw);
+
+                let dx = self.emit_op(PrimalOp::Matmul, vec![dxw, w_t]);
+                self.accumulate_adjoint(x, dx);
+
+                let dy_xw = self.emit_op(PrimalOp::Mul, vec![dy, xw]);
+                let dgamma = self.emit_op(PrimalOp::Sum { dim: Some(0) }, vec![dy_xw]);
+                self.accumulate_adjoint(gamma, dgamma);
+                continue;
+            }
+
+            // WRGA B.3.2 Option 3 revised: fused GatedLoRA forward AD rule.
+            //
+            // Forward:
+            //   y[B, N] = x[B, K] @ W[K, N]
+            //           + sigmoid(gate[N]) ⊙ (x @ A @ B)[B, N] * scale
+            //
+            // Given upstream adjoint dy[B, N]:
+            //   sig[N]          = Sigmoid(gate)
+            //   sig_prime[N]    = sig * (1 - sig)
+            //   xa[B, R]        = Matmul(x, A)
+            //   xab[B, N]       = Matmul(xa, B)
+            //   dy_sig[B, N]    = Mul(dy, sig)       (broadcast over batch)
+            //   dy_sig_sc[B, N] = Mul(dy_sig, scale) (scale factored once)
+            //
+            //   dx  += Matmul(dy, W.T)
+            //       +  Matmul(Matmul(dy_sig_sc, B.T), A.T)
+            //   dW  += Matmul(x.T, dy)
+            //   dA  += Matmul(Matmul(x.T, dy_sig_sc), B.T)
+            //   dB  += Matmul(xa.T, dy_sig_sc)
+            //   dgate += ReduceSum(dy * xab * sig_prime, axis=0) * scale
+            //
+            // Load-bearing:
+            //   - dy_sig is elementwise Mul with broadcast, NOT Matmul.
+            //   - dgate reduces over axis=0 (batch); shape drops [B,N] -> [N].
+            //   - scale is applied once (into dy_sig_sc) and reused.
+            if let PrimalOp::FusedGatedLoraMatmul { scale, .. } = op.op {
+                let x = op.inputs[0];
+                let w = op.inputs[1];
+                let a = op.inputs[2];
+                let b_in = op.inputs[3];
+                let gate = op.inputs[4];
+                let dy = output_bar;
+
+                let sig = self.emit_op(PrimalOp::Sigmoid, vec![gate]);
+                let one = self.emit_constant(1.0);
+                let one_minus_sig = self.emit_op(PrimalOp::Sub, vec![one, sig]);
+                let sig_prime = self.emit_op(PrimalOp::Mul, vec![sig, one_minus_sig]);
+                let xa = self.emit_op(PrimalOp::Matmul, vec![x, a]);
+                let xab = self.emit_op(PrimalOp::Matmul, vec![xa, b_in]);
+
+                let dy_sig = self.emit_op(PrimalOp::Mul, vec![dy, sig]);
+                let scale_c = self.emit_constant(scale as f64);
+                let dy_sig_sc = self.emit_op(PrimalOp::Mul, vec![dy_sig, scale_c]);
+
+                let x_t = self.emit_op(PrimalOp::Transpose { dim0: usize::MAX - 1, dim1: usize::MAX }, vec![x]);
+                let dw = self.emit_op(PrimalOp::Matmul, vec![x_t, dy]);
+                self.accumulate_adjoint(w, dw);
+
+                let b_t = self.emit_op(PrimalOp::Transpose { dim0: usize::MAX - 1, dim1: usize::MAX }, vec![b_in]);
+                let xt_dysigsc = self.emit_op(PrimalOp::Matmul, vec![x_t, dy_sig_sc]);
+                let da = self.emit_op(PrimalOp::Matmul, vec![xt_dysigsc, b_t]);
+                self.accumulate_adjoint(a, da);
+
+                let xa_t = self.emit_op(PrimalOp::Transpose { dim0: usize::MAX - 1, dim1: usize::MAX }, vec![xa]);
+                let db = self.emit_op(PrimalOp::Matmul, vec![xa_t, dy_sig_sc]);
+                self.accumulate_adjoint(b_in, db);
+
+                let w_t = self.emit_op(PrimalOp::Transpose { dim0: usize::MAX - 1, dim1: usize::MAX }, vec![w]);
+                let dx_base = self.emit_op(PrimalOp::Matmul, vec![dy, w_t]);
+                let dy_sig_sc_bt = self.emit_op(PrimalOp::Matmul, vec![dy_sig_sc, b_t]);
+                let a_t = self.emit_op(PrimalOp::Transpose { dim0: usize::MAX - 1, dim1: usize::MAX }, vec![a]);
+                let dx_adapter = self.emit_op(PrimalOp::Matmul, vec![dy_sig_sc_bt, a_t]);
+                let dx = self.emit_op(PrimalOp::Add, vec![dx_base, dx_adapter]);
+                self.accumulate_adjoint(x, dx);
+
+                let dy_xab = self.emit_op(PrimalOp::Mul, vec![dy, xab]);
+                let dy_xab_sp = self.emit_op(PrimalOp::Mul, vec![dy_xab, sig_prime]);
+                let reduced = self.emit_op(PrimalOp::Sum { dim: Some(0) }, vec![dy_xab_sp]);
+                let dgate = self.emit_op(PrimalOp::Mul, vec![reduced, scale_c]);
+                self.accumulate_adjoint(gate, dgate);
+                continue;
+            }
+
             let input_adjoints = apply_ad_rule(op, output_bar);
 
             for InputAdjoint { input_var, expr } in input_adjoints {
@@ -1290,6 +1440,16 @@ pub struct WengertExtractor<'a> {
     /// Named parameter VarIds with their compound names (e.g., "m.blocks.0.attn.w_q" -> VarId).
     /// Used for gradient collection since compound params don't have unique AST Symbols.
     named_param_vars: Vec<(String, VarId)>,
+    /// WRGA B.3.2 Option 3: the AST rewrite emits synthesized `Call`
+    /// nodes whose callee `Ident` carries a sentinel Symbol (e.g., `'w'`
+    /// — whatever field symbol the rewriter had on hand). The real FFI
+    /// callee name lives in this map, keyed by the Call callee's NodeId.
+    /// Parallel to `compiler.synth_call_names` in the Cranelift path.
+    synth_call_names: HashMap<nsl_ast::NodeId, String>,
+    /// WRGA B.3.2 Option 3: same pattern as `synth_call_names` but for
+    /// `MemberAccess` nodes (e.g. the synthesized `self.lora_A_<site>`
+    /// accesses whose member Symbol is a sentinel field symbol).
+    synth_member_names: HashMap<nsl_ast::NodeId, String>,
 }
 
 impl<'a> WengertExtractor<'a> {
@@ -1313,6 +1473,8 @@ impl<'a> WengertExtractor<'a> {
             symbol_name_overrides: HashMap::new(),
             model_instance_types: HashMap::new(),
             named_param_vars: Vec::new(),
+            synth_call_names: HashMap::new(),
+            synth_member_names: HashMap::new(),
         }
     }
 
@@ -1413,6 +1575,20 @@ impl<'a> WengertExtractor<'a> {
     /// Maps model_type -> field_name -> type_string (e.g., "[TransformerBlock;8]").
     pub fn set_model_field_types(&mut self, types: HashMap<String, HashMap<String, String>>) {
         self.model_field_types = types;
+    }
+
+    /// WRGA B.3.2 Option 3: install the compiler's synth_call_names map so
+    /// the Call extractor can resolve sentinel-Ident callees back to their
+    /// real FFI name (e.g. `nsl_adapter_fused_gatedlora_matmul`).
+    pub fn set_synth_call_names(&mut self, names: HashMap<nsl_ast::NodeId, String>) {
+        self.synth_call_names = names;
+    }
+
+    /// WRGA B.3.2 Option 3: install the compiler's synth_member_names map
+    /// so MemberAccess extraction resolves sentinel field symbols back to
+    /// their real names (e.g. `self.lora_A_<site>`).
+    pub fn set_synth_member_names(&mut self, names: HashMap<nsl_ast::NodeId, String>) {
+        self.synth_member_names = names;
     }
 
     /// Register a model instance: maps a variable symbol to a model type name
@@ -1537,8 +1713,15 @@ impl<'a> WengertExtractor<'a> {
 
             // Field access: self.w, m.w, block.attn → treat as a parameter reference
             ExprKind::MemberAccess { object, member } => {
-                // Early check: .shape and .ndim are always non-differentiable metadata
-                let member_name = self.interner.resolve(member.0).unwrap_or("?");
+                // WRGA B.3.2 Option 3: synthesized adapter accesses carry a
+                // sentinel member Symbol; the real field name lives in
+                // synth_member_names. Consult it FIRST so we recover e.g.
+                // `lora_A_<site>` instead of the sentinel 'w'.
+                let synth_name = self.synth_member_names.get(&expr.id).cloned();
+                let member_name_owned = synth_name.unwrap_or_else(|| {
+                    self.interner.resolve(member.0).unwrap_or("?").to_string()
+                });
+                let member_name = member_name_owned.as_str();
                 if member_name == "shape" || member_name == "ndim" {
                     if let Some(obj_var) = self.extract_expr(object) {
                         let result = self.alloc_var();
@@ -1576,7 +1759,8 @@ impl<'a> WengertExtractor<'a> {
                 // shape/ndim already handled by early check above
 
                 if let Some(prefix) = obj_prefix {
-                    let field_name = self.interner.resolve(member.0).unwrap_or("?").to_string();
+                    // Reuse the synth-aware member_name resolved above.
+                    let field_name = member_name_owned.clone();
                     let compound = format!("{}.{}", prefix, field_name);
 
                     // Check if we already have this compound name registered
@@ -1850,8 +2034,16 @@ impl<'a> WengertExtractor<'a> {
                     }
                 }
 
-                // Regular function call: extract function name
-                let func_name = if let ExprKind::Ident(sym) = &callee.kind {
+                // Regular function call: extract function name.
+                //
+                // WRGA B.3.2 Option 3: synth Calls emitted by the adapter
+                // rewrite use a sentinel Symbol for the callee Ident. The
+                // real FFI name lives in `synth_call_names` keyed by the
+                // callee's NodeId — consult it FIRST so the fused-FFI
+                // dispatch below can match.
+                let func_name = if let Some(synth) = self.synth_call_names.get(&callee.id) {
+                    synth.clone()
+                } else if let ExprKind::Ident(sym) = &callee.kind {
                     self.interner.resolve(sym.0).unwrap_or("").to_string()
                 } else if let ExprKind::MemberAccess { object, member } = &callee.kind {
                     let method = self.interner.resolve(member.0).unwrap_or("?");
@@ -2081,8 +2273,133 @@ impl<'a> WengertExtractor<'a> {
                     },
                     // Scalar extraction (non-differentiable)
                     "int" | "float" => PrimalOp::Passthrough(func_name.clone()),
+                    // WRGA B.3 fused LoRA forward FFI.
+                    //
+                    // Call shape: [x, W, A, B, FloatLit(scale), IntLit(kh)]
+                    // Forward: y = x @ W + scale * (x @ A @ B).
+                    "nsl_adapter_fused_lora_matmul" => {
+                        if args.len() != 6 {
+                            eprintln!(
+                                "[source-ad] nsl_adapter_fused_lora_matmul expected 6 args, got {}",
+                                args.len()
+                            );
+                            return None;
+                        }
+                        let scale = match &args[4].value.kind {
+                            ExprKind::FloatLiteral(v) => *v as f32,
+                            ExprKind::IntLiteral(v) => *v as f32,
+                            ExprKind::UnaryOp { op: AstUnaryOp::Neg, operand } => match &operand.kind {
+                                ExprKind::FloatLiteral(v) => -(*v) as f32,
+                                ExprKind::IntLiteral(v) => -(*v) as f32,
+                                _ => return None,
+                            },
+                            _ => return None,
+                        };
+                        let kernel_handle = match &args[5].value.kind {
+                            ExprKind::IntLiteral(v) => *v,
+                            ExprKind::UnaryOp { op: AstUnaryOp::Neg, operand } => match &operand.kind {
+                                ExprKind::IntLiteral(v) => -*v,
+                                _ => return None,
+                            },
+                            _ => return None,
+                        };
+                        let four_inputs = vec![
+                            input_vars[0], input_vars[1], input_vars[2], input_vars[3],
+                        ];
+                        self.push_op(WengertOp {
+                            id: self.list.ops.len() as u32,
+                            result,
+                            op: PrimalOp::FusedLoraMatmul { scale, kernel_handle },
+                            inputs: four_inputs,
+                            saved_for_backward: false,
+                            checkpointed: false,
+                        });
+                        return Some(result);
+                    }
+                    // WRGA B.3 fused IA³ forward FFI.
+                    //
+                    // Call shape: [x, W, gamma, IntLit(kh)]
+                    // Forward: y = (x @ W) * gamma (gamma broadcasts over out dim).
+                    "nsl_adapter_fused_ia3_matmul" => {
+                        if args.len() != 4 {
+                            eprintln!(
+                                "[source-ad] nsl_adapter_fused_ia3_matmul expected 4 args, got {}",
+                                args.len()
+                            );
+                            return None;
+                        }
+                        let kernel_handle = match &args[3].value.kind {
+                            ExprKind::IntLiteral(v) => *v,
+                            ExprKind::UnaryOp { op: AstUnaryOp::Neg, operand } => match &operand.kind {
+                                ExprKind::IntLiteral(v) => -*v,
+                                _ => return None,
+                            },
+                            _ => return None,
+                        };
+                        let three_inputs = vec![input_vars[0], input_vars[1], input_vars[2]];
+                        self.push_op(WengertOp {
+                            id: self.list.ops.len() as u32,
+                            result,
+                            op: PrimalOp::FusedIa3Matmul { kernel_handle },
+                            inputs: three_inputs,
+                            saved_for_backward: false,
+                            checkpointed: false,
+                        });
+                        return Some(result);
+                    }
+                    // WRGA B.3.2 Option 3: fused GatedLoRA forward FFI.
+                    //
+                    // Call shape (see wrga_adapter_rewrite::synthesize_gatedlora_fused_call):
+                    //   args = [x, W, A, B, FloatLit(scale), gate, IntLit(kh)]
+                    //
+                    // PrimalOp has 5 tensor inputs [x, W, A, B, gate];
+                    // scale + kernel_handle carried on the variant.
+                    "nsl_adapter_fused_gatedlora_matmul" => {
+                        if args.len() != 7 {
+                            eprintln!(
+                                "[source-ad] nsl_adapter_fused_gatedlora_matmul expected 7 args, got {}",
+                                args.len()
+                            );
+                            return None;
+                        }
+                        let scale = match &args[4].value.kind {
+                            ExprKind::FloatLiteral(v) => *v as f32,
+                            ExprKind::IntLiteral(v) => *v as f32,
+                            ExprKind::UnaryOp { op: AstUnaryOp::Neg, operand } => match &operand.kind {
+                                ExprKind::FloatLiteral(v) => -(*v) as f32,
+                                ExprKind::IntLiteral(v) => -(*v) as f32,
+                                _ => return None,
+                            },
+                            _ => return None,
+                        };
+                        let kernel_handle = match &args[6].value.kind {
+                            ExprKind::IntLiteral(v) => *v,
+                            ExprKind::UnaryOp { op: AstUnaryOp::Neg, operand } => match &operand.kind {
+                                ExprKind::IntLiteral(v) => -*v,
+                                _ => return None,
+                            },
+                            _ => return None,
+                        };
+                        let five_inputs = vec![
+                            input_vars[0], input_vars[1], input_vars[2], input_vars[3], input_vars[5],
+                        ];
+                        self.push_op(WengertOp {
+                            id: self.list.ops.len() as u32,
+                            result,
+                            op: PrimalOp::FusedGatedLoraMatmul { scale, kernel_handle },
+                            inputs: five_inputs,
+                            saved_for_backward: false,
+                            checkpointed: false,
+                        });
+                        return Some(result);
+                    }
                     _ => {
-                        eprintln!("[source-ad] unsupported function: '{}'", func_name);
+                        eprintln!(
+                            "[source-ad] warning: unrecognized FFI callee '{}' in train block; \
+                             falling back to unfused AST evaluation. If you expected a fused kernel, \
+                             check that source-AD has a handler for this FFI.",
+                            func_name
+                        );
                         return None;
                     }
                 };
