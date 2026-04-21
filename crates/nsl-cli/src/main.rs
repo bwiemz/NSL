@@ -1,3 +1,4 @@
+mod ast_scan;
 mod debug;
 mod formatter;
 mod loader;
