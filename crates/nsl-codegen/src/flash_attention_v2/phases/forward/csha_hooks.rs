@@ -784,6 +784,22 @@ pub fn emit_save_activations_subset(
 /// save is only needed for the fused path's S+PV split; the HBM save is
 /// needed for the backward kernel regardless of fused_projections.
 pub fn emit_save_softmax_state(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
+    let diag = std::env::var("NSL_CSHA_DUMP_SAVE_STATE")
+        .ok()
+        .unwrap_or_default();
+    emit_save_softmax_state_with_diag(ptx, config, q_tile_iter, &diag);
+}
+
+/// J-A2 diagnostic-aware emitter. Callers usually use the env-reading wrapper
+/// `emit_save_softmax_state`; tests call this directly to avoid mucking with
+/// process env. `diag` values: `""` (real %row_max/%row_sum), `"wrow"`,
+/// `"wid"`, or `"qstart"`.
+pub(crate) fn emit_save_softmax_state_with_diag(
+    ptx: &mut String,
+    config: &FlashAttentionConfig,
+    q_tile_iter: u32,
+    diag: &str,
+) {
     let fused = config.csha.as_ref().map_or(false, |c| c.fused_projections);
     let save = config
         .csha
@@ -826,12 +842,31 @@ pub fn emit_save_softmax_state(ptx: &mut String, config: &FlashAttentionConfig, 
     // (all 32 lanes share identical values post-butterfly-reduction).
     // Fires for both fused and non-fused paths when save_activations_for_backward=true.
     if save {
+        // J-A2 diagnostic: when `diag` is non-empty, replace the real
+        // `%row_max` / `%row_sum` source operands with known-provenance scalars
+        // so we can distinguish "wrong value computed by softmax" from
+        // "wrong address computed by save path". Modes:
+        //   - "wrow"   → both slots store f32(warp_row). Expect [0..N-1].
+        //   - "wid"    → row_max = f32(warp_id), row_sum = f32(lane). Verifies
+        //                the lane-0 gate and warp identity (lane row_sum must
+        //                read back 0.0 everywhere since only lane 0 stores).
+        //   - "qstart" → row_max = f32(q_start.lo), row_sum = f32(warp_row).
+        //   - anything else or empty → real %row_max / %row_sum.
         ptx.push_str(&format!(
             "    // Tier C: persist row_max/row_sum to HBM (q_tile_iter={})\n",
             q_tile_iter
         ));
-        // Lane-0 predicate.
-        ptx.push_str("    setp.eq.u32 %p_save_null, %lane, 0;\n");
+        if !diag.is_empty() {
+            ptx.push_str(&format!(
+                "    // J-A2 diagnostic: NSL_CSHA_DUMP_SAVE_STATE={}\n",
+                diag
+            ));
+        }
+        // `%p_save_null` is the "skip-this-lane" predicate — TRUE when this
+        // lane should NOT save. We want only lane 0 of each warp to write,
+        // so skip-predicate = (lane != 0). Composed with the null-ptr
+        // predicate via OR at each store site.
+        ptx.push_str("    setp.ne.u32 %p_save_null, %lane, 0;\n");
         // warp_row = warp_id + iter*4
         ptx.push_str(&format!(
             "    add.u32 %r_save_wrow, %warp_id, {}; // warp_row = warp_id + iter*4\n",
@@ -847,23 +882,60 @@ pub fn emit_save_softmax_state(ptx: &mut String, config: &FlashAttentionConfig, 
         // * 4 bytes (f32)
         ptx.push_str("    shl.b64 %rd_save_off, %rd_save_off, 2;\n");
 
+        // Pick diagnostic source operands per slot if `diag` is set.
+        let (rm_setup, rm_src): (&str, &str) = match diag {
+            "wrow" => (
+                "    cvt.rn.f32.u32 %f_diag, %r_save_wrow;\n",
+                "%f_diag",
+            ),
+            "wid" => (
+                "    cvt.rn.f32.u32 %f_diag, %warp_id;\n",
+                "%f_diag",
+            ),
+            "qstart" => (
+                "    cvt.u32.u64 %r_save_qlo, %q_start;\n    cvt.rn.f32.u32 %f_diag, %r_save_qlo;\n",
+                "%f_diag",
+            ),
+            _ => ("", "%row_max"),
+        };
+
         // row_max_ptr
         ptx.push_str("    ld.param.u64 %rd_save_base, [row_max_ptr];\n");
         ptx.push_str("    add.u64 %rd_save_elem, %rd_save_base, %rd_save_off;\n");
         ptx.push_str("    setp.eq.u64 %p_rowmax_null, %rd_save_base, 0;\n");
         ptx.push_str("    or.pred %p_skip_rm, %p_rowmax_null, %p_save_null;\n");
+        ptx.push_str(rm_setup);
         ptx.push_str(&format!(
-            "    @!%p_skip_rm st.global.f32 [%rd_save_elem], %row_max;  // row_max_ptr write\n"
+            "    @!%p_skip_rm st.global.f32 [%rd_save_elem], {};  // row_max_ptr write\n",
+            rm_src
         ));
         let _ = q_tile_iter;
+
+        let (rs_setup, rs_src): (&str, &str) = match diag {
+            "wrow" => (
+                "    cvt.rn.f32.u32 %f_diag, %r_save_wrow;\n",
+                "%f_diag",
+            ),
+            "wid" => (
+                "    cvt.rn.f32.u32 %f_diag, %lane;\n",
+                "%f_diag",
+            ),
+            "qstart" => (
+                "    cvt.rn.f32.u32 %f_diag, %r_save_wrow;\n",
+                "%f_diag",
+            ),
+            _ => ("", "%row_sum"),
+        };
 
         // row_sum_ptr
         ptx.push_str("    ld.param.u64 %rd_save_base, [row_sum_ptr];\n");
         ptx.push_str("    add.u64 %rd_save_elem, %rd_save_base, %rd_save_off;\n");
         ptx.push_str("    setp.eq.u64 %p_rowsum_null, %rd_save_base, 0;\n");
         ptx.push_str("    or.pred %p_skip_rs, %p_rowsum_null, %p_save_null;\n");
+        ptx.push_str(rs_setup);
         ptx.push_str(&format!(
-            "    @!%p_skip_rs st.global.f32 [%rd_save_elem], %row_sum;  // row_sum_ptr write\n"
+            "    @!%p_skip_rs st.global.f32 [%rd_save_elem], {};  // row_sum_ptr write\n",
+            rs_src
         ));
     }
 }
@@ -1640,6 +1712,166 @@ mod tests {
         assert!(
             ptx.contains("st.global.f32 [%rd_save_elem], %row_sum;"),
             "row_sum HBM store missing"
+        );
+    }
+
+    /// J-A2 lane-gate invariant: the HBM save must skip lanes 1..31 so that
+    /// only lane 0 writes. The predicate composition is "skip if (null_ptr OR
+    /// this_lane_should_skip)"; "this_lane_should_skip" = (lane != 0), so the
+    /// setp must be `setp.ne`, not `setp.eq`. Pre-Gap J this was `.eq` which
+    /// inverted the gate and caused 31-way races (benign because all lanes hold
+    /// identical post-butterfly values, but semantically wrong).
+    #[test]
+    fn save_softmax_state_lane_gate_uses_setp_ne() {
+        let cfg = FlashAttentionConfig {
+            block_q: 32, block_kv: 32, head_dim: 32,
+            causal: false, paged: false, rope_q: false,
+            rope_style: RopeStyle::HalfSplit, gqa_group_size: 1,
+            tree_mask: false, gpu_sm: 75, segment_masked: false,
+            csha: Some(CshaExtras {
+                fused_projections: false,
+                save_activations_for_backward: true,
+                d_model: 128,
+                ..CshaExtras::default()
+            }),
+        };
+        let mut ptx = String::new();
+        emit_save_softmax_state_with_diag(&mut ptx, &cfg, 0, "");
+        assert!(
+            ptx.contains("setp.ne.u32 %p_save_null, %lane, 0"),
+            "lane-0 skip predicate must be setp.ne (got: {ptx})"
+        );
+        assert!(
+            !ptx.contains("setp.eq.u32 %p_save_null, %lane, 0"),
+            "pre-Gap J setp.eq lane gate still present — inverted semantics"
+        );
+    }
+
+    /// J-A2 diag mode "wrow": both HBM slots store `f32(warp_row)` instead of
+    /// the real row_max/row_sum. Used to verify that the ADDRESSING math lays
+    /// out correctly (expected read-back: [0, 1, 2, ..., N-1]).
+    #[test]
+    fn save_softmax_state_diag_wrow_replaces_source_operand() {
+        let cfg = FlashAttentionConfig {
+            block_q: 32, block_kv: 32, head_dim: 32,
+            causal: false, paged: false, rope_q: false,
+            rope_style: RopeStyle::HalfSplit, gqa_group_size: 1,
+            tree_mask: false, gpu_sm: 75, segment_masked: false,
+            csha: Some(CshaExtras {
+                fused_projections: false,
+                save_activations_for_backward: true,
+                d_model: 128,
+                ..CshaExtras::default()
+            }),
+        };
+        let mut ptx = String::new();
+        emit_save_softmax_state_with_diag(&mut ptx, &cfg, 0, "wrow");
+        assert!(
+            ptx.contains("cvt.rn.f32.u32 %f_diag, %r_save_wrow"),
+            "wrow mode must convert %r_save_wrow to %f_diag"
+        );
+        assert!(
+            ptx.contains("st.global.f32 [%rd_save_elem], %f_diag;  // row_max_ptr write"),
+            "row_max HBM store must source from %f_diag under wrow mode"
+        );
+        assert!(
+            ptx.contains("st.global.f32 [%rd_save_elem], %f_diag;  // row_sum_ptr write"),
+            "row_sum HBM store must source from %f_diag under wrow mode"
+        );
+        // Real operands must NOT appear as store sources.
+        assert!(
+            !ptx.contains("st.global.f32 [%rd_save_elem], %row_max;"),
+            "diag mode must not store real %row_max"
+        );
+        assert!(
+            !ptx.contains("st.global.f32 [%rd_save_elem], %row_sum;"),
+            "diag mode must not store real %row_sum"
+        );
+    }
+
+    /// J-A2 diag mode "wid": row_max stores `f32(warp_id)`, row_sum stores
+    /// `f32(lane)`. With a correct lane-0 gate, row_sum must read back 0.0
+    /// everywhere (only lane 0 stores, lane == 0).
+    #[test]
+    fn save_softmax_state_diag_wid_splits_sources() {
+        let cfg = FlashAttentionConfig {
+            block_q: 32, block_kv: 32, head_dim: 32,
+            causal: false, paged: false, rope_q: false,
+            rope_style: RopeStyle::HalfSplit, gqa_group_size: 1,
+            tree_mask: false, gpu_sm: 75, segment_masked: false,
+            csha: Some(CshaExtras {
+                fused_projections: false,
+                save_activations_for_backward: true,
+                d_model: 128,
+                ..CshaExtras::default()
+            }),
+        };
+        let mut ptx = String::new();
+        emit_save_softmax_state_with_diag(&mut ptx, &cfg, 0, "wid");
+        assert!(
+            ptx.contains("cvt.rn.f32.u32 %f_diag, %warp_id"),
+            "wid mode row_max setup must convert %warp_id"
+        );
+        assert!(
+            ptx.contains("cvt.rn.f32.u32 %f_diag, %lane"),
+            "wid mode row_sum setup must convert %lane"
+        );
+    }
+
+    /// J-A2 diag mode "qstart": row_max stores `f32(q_start.lo)`, row_sum
+    /// stores `f32(warp_row)`. Verifies the carrier register %q_start.
+    #[test]
+    fn save_softmax_state_diag_qstart_dumps_carrier_reg() {
+        let cfg = FlashAttentionConfig {
+            block_q: 32, block_kv: 32, head_dim: 32,
+            causal: false, paged: false, rope_q: false,
+            rope_style: RopeStyle::HalfSplit, gqa_group_size: 1,
+            tree_mask: false, gpu_sm: 75, segment_masked: false,
+            csha: Some(CshaExtras {
+                fused_projections: false,
+                save_activations_for_backward: true,
+                d_model: 128,
+                ..CshaExtras::default()
+            }),
+        };
+        let mut ptx = String::new();
+        emit_save_softmax_state_with_diag(&mut ptx, &cfg, 0, "qstart");
+        assert!(
+            ptx.contains("cvt.u32.u64 %r_save_qlo, %q_start"),
+            "qstart mode must narrow %q_start to u32"
+        );
+        assert!(
+            ptx.contains("cvt.rn.f32.u32 %f_diag, %r_save_qlo"),
+            "qstart mode row_max setup must convert %r_save_qlo"
+        );
+    }
+
+    /// J-A2 diag annotation comment appears only when mode is non-empty.
+    #[test]
+    fn save_softmax_state_diag_annotation_gated() {
+        let cfg = FlashAttentionConfig {
+            block_q: 32, block_kv: 32, head_dim: 32,
+            causal: false, paged: false, rope_q: false,
+            rope_style: RopeStyle::HalfSplit, gqa_group_size: 1,
+            tree_mask: false, gpu_sm: 75, segment_masked: false,
+            csha: Some(CshaExtras {
+                fused_projections: false,
+                save_activations_for_backward: true,
+                d_model: 128,
+                ..CshaExtras::default()
+            }),
+        };
+        let mut off = String::new();
+        emit_save_softmax_state_with_diag(&mut off, &cfg, 0, "");
+        assert!(
+            !off.contains("J-A2 diagnostic"),
+            "off mode must not emit diag annotation"
+        );
+        let mut on = String::new();
+        emit_save_softmax_state_with_diag(&mut on, &cfg, 0, "wrow");
+        assert!(
+            on.contains("J-A2 diagnostic: NSL_CSHA_DUMP_SAVE_STATE=wrow"),
+            "on mode must emit diag annotation with mode name"
         );
     }
 

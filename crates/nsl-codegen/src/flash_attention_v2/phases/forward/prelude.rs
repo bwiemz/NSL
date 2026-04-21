@@ -169,12 +169,15 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig) {
 
     // CSHA Tier C save_activations scratch registers (only when flag is set).
     // Used by emit_save_activations to write post-RoPE Q/K/V to HBM for the
-    // fused source-AD backward kernel.
+    // fused source-AD backward kernel. `%f_diag` and `%r_save_qlo` are J-A2
+    // diagnostic scratch regs used only when `NSL_CSHA_DUMP_SAVE_STATE` is set;
+    // declared unconditionally because ptxas prunes unused virtual regs.
     if config.csha.as_ref().map_or(false, |c| c.save_activations_for_backward) {
         ptx.push_str(
             "    .reg .u64 %rd_save_base, %rd_save_off, %rd_save_elem, %rd_save_smem, %rd_save_wrow, %rd_save_col, %rd_save_colb;\n",
         );
-        ptx.push_str("    .reg .u32 %r_save_wrow;\n");
+        ptx.push_str("    .reg .u32 %r_save_wrow, %r_save_qlo;\n");
+        ptx.push_str("    .reg .f32 %f_diag;\n");
         ptx.push_str("    .reg .b16 %h_save_v;\n");
         ptx.push_str("    .reg .pred %p_save_null, %p_rowmax_null, %p_rowsum_null, %p_skip_rm, %p_skip_rs;\n");
     }
