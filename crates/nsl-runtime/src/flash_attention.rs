@@ -708,14 +708,123 @@ pub extern "C" fn nsl_flash_attention_csha_with_saves(
             &mut xraw as *mut _ as *mut c_void,
         ];
 
-        crate::cuda::inner::kernel_launch(
+        // NSL_CSHA_DUMP_GRADS=1 forward-side diag: read the PTX kernel name
+        // out of name_ptr (null-terminated C string) and print it so a
+        // mismatched PTX selection (inference PTX instead of the _with_saves
+        // variant) is visible. Also prints the save pointers so they can be
+        // confirmed non-null and distinct.
+        let dump_on = std::env::var_os("NSL_CSHA_DUMP_GRADS").map(|v| v != "0" && v != "").unwrap_or(false);
+        if dump_on {
+            let kname = unsafe {
+                let c = name_ptr as *const u8;
+                if c.is_null() { String::from("<null>") } else {
+                    let mut end = 0usize;
+                    while *c.add(end) != 0 && end < 256 { end += 1; }
+                    String::from_utf8_lossy(std::slice::from_raw_parts(c, end)).into_owned()
+                }
+            };
+            eprintln!(
+                "[csha-dump-fwd] with_saves kernel=\"{}\" q_proj=0x{:x} k_proj=0x{:x} v_proj=0x{:x} \
+                 row_max=0x{:x} row_sum=0x{:x} x_raw=0x{:x}",
+                kname, q_proj, k_proj, v_proj, rmax, rsum, xraw
+            );
+            // Dump the full PTX to a file for offline inspection — only once
+            // to avoid accumulating files.
+            unsafe {
+                let c = ptx_ptr as *const u8;
+                if !c.is_null() {
+                    let mut end = 0usize;
+                    while *c.add(end) != 0 && end < (1 << 20) { end += 1; }
+                    if end > 0 {
+                        let bytes = std::slice::from_raw_parts(c, end);
+                        let _ = std::fs::write(
+                            std::env::temp_dir().join("csha_with_saves.ptx"),
+                            bytes,
+                        );
+                        eprintln!(
+                            "[csha-dump-fwd] ptx written to {}/csha_with_saves.ptx ({} bytes)",
+                            std::env::temp_dir().display(), end
+                        );
+                    }
+                }
+            }
+        }
+
+        let fwd_rc = crate::cuda::inner::kernel_launch(
             ptx_ptr as *const u8,
             name_ptr as *const u8,
             [grid_x, grid_y, grid_z],
             [block_x, block_y, block_z],
             &args,
             shared_mem_bytes as u32,
-        ) as i64
+        );
+
+        // Immediately after the forward kernel, sync + read back q_proj and
+        // row_sum so we can tell whether the save-write path fired.  If the
+        // forward kernel didn't write these then something between forward
+        // PTX synthesis and launch lost the `save_activations_for_backward`
+        // flag OR the saves emit but to wrong addresses.
+        if dump_on {
+            unsafe { crate::cuda::inner::cu_ctx_synchronize(); }
+            eprintln!("[csha-dump-fwd-post] launch_rc={:?}", fwd_rc);
+            let qkv_elems = (batch * heads * seq_len * head_dim) as usize;
+            let stats_elems = (batch * heads * seq_len) as usize;
+            let x_elems = (batch * heads * seq_len * head_dim) as usize;
+            // q_proj (f16)
+            if q_proj != 0 {
+                let mut host: Vec<u16> = vec![0u16; qkv_elems];
+                unsafe {
+                    crate::cuda::inner::memcpy_dtoh(
+                        host.as_mut_ptr() as *mut std::ffi::c_void,
+                        q_proj as *const std::ffi::c_void,
+                        qkv_elems * 2,
+                    );
+                }
+                let nz = host.iter().filter(|&&b| b != 0).count();
+                let first8: Vec<f32> = host.iter().take(8)
+                    .map(|&b| crate::tensor::f16_bits_to_f32(b)).collect();
+                eprintln!(
+                    "[csha-dump-fwd-post]  q_proj first8={:?} nonzero_bits={}/{}",
+                    first8, nz, qkv_elems
+                );
+            }
+            // row_sum (f32)
+            if rsum != 0 {
+                let mut host: Vec<f32> = vec![0.0f32; stats_elems];
+                unsafe {
+                    crate::cuda::inner::memcpy_dtoh(
+                        host.as_mut_ptr() as *mut std::ffi::c_void,
+                        rsum as *const std::ffi::c_void,
+                        stats_elems * 4,
+                    );
+                }
+                let nz = host.iter().filter(|&&v| v != 0.0).count();
+                eprintln!(
+                    "[csha-dump-fwd-post]  row_sum first8={:?} nonzero={}/{}",
+                    host.iter().take(8).cloned().collect::<Vec<_>>(),
+                    nz, stats_elems
+                );
+            }
+            // x_raw (f32)
+            if xraw != 0 {
+                let mut host: Vec<f32> = vec![0.0f32; x_elems];
+                unsafe {
+                    crate::cuda::inner::memcpy_dtoh(
+                        host.as_mut_ptr() as *mut std::ffi::c_void,
+                        xraw as *const std::ffi::c_void,
+                        x_elems * 4,
+                    );
+                }
+                let nz = host.iter().filter(|&&v| v != 0.0).count();
+                eprintln!(
+                    "[csha-dump-fwd-post]  x_raw  first8={:?} nonzero={}/{}",
+                    host.iter().take(8).cloned().collect::<Vec<_>>(),
+                    nz, x_elems
+                );
+            }
+        }
+
+        fwd_rc as i64
     }
     #[cfg(not(feature = "cuda"))]
     {
@@ -922,14 +1031,56 @@ pub extern "C" fn nsl_flash_attention_csha_backward(
             &mut d_xn as *mut _ as *mut c_void,
         ];
 
-        crate::cuda::inner::kernel_launch(
+        let rc = crate::cuda::inner::kernel_launch(
             ptx_ptr as *const u8,
             name_ptr as *const u8,
             [grid_x, grid_y, grid_z],
             [block_x, block_y, block_z],
             &args,
             shared_mem_bytes as u32,
-        ) as i64
+        );
+
+        // NSL_CSHA_DUMP_GRADS=1 diagnostic — zero-cost when unset. Reads back
+        // the 6 forward-saved activations (q_proj, k_proj, v_proj, row_max,
+        // row_sum, x_raw) and all 8 gradient outputs (dq/dk/dv/dwq/dwk/dwv/
+        // dx/dx_norm) from device → host, prints the first 8 values, max|.|,
+        // element-sum, and NaN count for each.
+        //
+        // Consumes `qp, kpj, vpj, rmax, rsum, xraw` and `d_o, d_q, d_k, d_v,
+        // d_wq, d_wk, d_wv, d_x, d_xn` (already resolved to raw device
+        // pointers above). Shape info is derived from {batch, heads, seq_len,
+        // head_dim, d_model}. Synchronises the device first so any async
+        // kernel-launch failure or stale writeback is visible.
+        if std::env::var_os("NSL_CSHA_DUMP_GRADS").map(|v| v != "0" && v != "").unwrap_or(false) {
+            unsafe { crate::cuda::inner::cu_ctx_synchronize(); }
+            let kname = unsafe {
+                let c = name_ptr as *const u8;
+                if c.is_null() { String::from("<null>") } else {
+                    let mut end = 0usize;
+                    while *c.add(end) != 0 && end < 256 { end += 1; }
+                    String::from_utf8_lossy(std::slice::from_raw_parts(c, end)).into_owned()
+                }
+            };
+            eprintln!("[csha-dump-bwd] kernel=\"{}\"", kname);
+            eprintln!(
+                "[csha-dump-bwd] saves: q_proj=0x{:x} k_proj=0x{:x} v_proj=0x{:x} \
+                 row_max=0x{:x} row_sum=0x{:x} x_raw=0x{:x}",
+                qp, kpj, vpj, rmax, rsum, xraw
+            );
+            eprintln!(
+                "[csha-dump-bwd] grads: dO=0x{:x} dq=0x{:x} dk=0x{:x} dv=0x{:x} \
+                 dwq=0x{:x} dwk=0x{:x} dwv=0x{:x} dx=0x{:x} dx_norm=0x{:x}",
+                d_o, d_q, d_k, d_v, d_wq, d_wk, d_wv, d_x, d_xn
+            );
+            csha_dump_backward_buffers(
+                rc as i64,
+                batch, heads, seq_len, head_dim, d_model,
+                qp, kpj, vpj, rmax, rsum, xraw,
+                d_o, d_q, d_k, d_v, d_wq, d_wk, d_wv, d_x, d_xn,
+            );
+        }
+
+        rc as i64
     }
     #[cfg(not(feature = "cuda"))]
     {
@@ -945,6 +1096,118 @@ pub extern "C" fn nsl_flash_attention_csha_backward(
         eprintln!("[nsl] CSHA backward requires CUDA.");
         -1
     }
+}
+
+/// NSL_CSHA_DUMP_GRADS diagnostic: d2h-read the 6 save buffers and the 8
+/// gradient outputs, print first 8 values + max|.| + sum + NaN count.
+/// Zero-cost when disabled (callers gate on env var).
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn csha_dump_backward_buffers(
+    launch_rc: i64,
+    batch: i64, heads: i64, seq_len: i64, head_dim: i64, d_model: i64,
+    q_proj_dev: u64, k_proj_dev: u64, v_proj_dev: u64,
+    row_max_dev: u64, row_sum_dev: u64, x_raw_dev: u64,
+    d_o_dev: u64, d_q_dev: u64, d_k_dev: u64, d_v_dev: u64,
+    d_wq_dev: u64, d_wk_dev: u64, d_wv_dev: u64,
+    d_x_dev: u64, d_xn_dev: u64,
+) {
+    eprintln!(
+        "[csha-dump] launch_rc={} batch={} heads={} seq={} head_dim={} d_model={}",
+        launch_rc, batch, heads, seq_len, head_dim, d_model
+    );
+
+    // qkv-shaped: f16 [batch, heads, seq, head_dim]
+    let qkv_elems = (batch * heads * seq_len * head_dim) as usize;
+    // stats: f32 [batch, heads, seq]
+    let stats_elems = (batch * heads * seq_len) as usize;
+    // x_raw / dx / dx_norm: f32 [batch, seq, d_model] or [batch, heads, seq, head_dim]
+    // (x_raw is B*H*S*D = 1024; dx / dx_norm are B*S*M = 1024 here since M=H*D=32).
+    let x_elems = (batch * heads * seq_len * head_dim) as usize;
+    let dx_elems = (batch * seq_len * d_model) as usize;
+    // dwq/dwk/dwv: f16 [d_model, heads * head_dim]
+    let dw_elems = (d_model * heads * head_dim) as usize;
+
+    fn dump_f16(name: &str, dev_ptr: u64, n: usize) {
+        if dev_ptr == 0 || n == 0 {
+            eprintln!("[csha-dump] {:>9} = <null or empty> dev=0x{:x} n={}", name, dev_ptr, n);
+            return;
+        }
+        let mut host: Vec<u16> = vec![0u16; n];
+        unsafe {
+            crate::cuda::inner::memcpy_dtoh(
+                host.as_mut_ptr() as *mut std::ffi::c_void,
+                dev_ptr as *const std::ffi::c_void,
+                n * 2,
+            );
+        }
+        let mut nan_count: usize = 0;
+        let mut max_abs: f32 = 0.0;
+        let mut sum: f64 = 0.0;
+        for &bits in &host {
+            let v = crate::tensor::f16_bits_to_f32(bits);
+            if v.is_nan() { nan_count += 1; }
+            let a = v.abs();
+            if a.is_finite() && a > max_abs { max_abs = a; }
+            if v.is_finite() { sum += v as f64; }
+        }
+        let first8: Vec<f32> = host.iter().take(8).map(|&b| crate::tensor::f16_bits_to_f32(b)).collect();
+        eprintln!(
+            "[csha-dump] {:>9} [f16 n={}]: first8={:?} max|.|={:.6e} sum={:.6e} nan_count={}",
+            name, n, first8, max_abs, sum, nan_count
+        );
+    }
+
+    fn dump_f32(name: &str, dev_ptr: u64, n: usize) {
+        if dev_ptr == 0 || n == 0 {
+            eprintln!("[csha-dump] {:>9} = <null or empty> dev=0x{:x} n={}", name, dev_ptr, n);
+            return;
+        }
+        let mut host: Vec<f32> = vec![0.0f32; n];
+        unsafe {
+            crate::cuda::inner::memcpy_dtoh(
+                host.as_mut_ptr() as *mut std::ffi::c_void,
+                dev_ptr as *const std::ffi::c_void,
+                n * 4,
+            );
+        }
+        let mut nan_count: usize = 0;
+        let mut max_abs: f32 = 0.0;
+        let mut sum: f64 = 0.0;
+        for &v in &host {
+            if v.is_nan() { nan_count += 1; }
+            let a = v.abs();
+            if a.is_finite() && a > max_abs { max_abs = a; }
+            if v.is_finite() { sum += v as f64; }
+        }
+        let first8: Vec<f32> = host.iter().take(8).cloned().collect();
+        eprintln!(
+            "[csha-dump] {:>9} [f32 n={}]: first8={:?} max|.|={:.6e} sum={:.6e} nan_count={}",
+            name, n, first8, max_abs, sum, nan_count
+        );
+    }
+
+    // Save buffers (inputs to backward kernel — forward populated them).
+    dump_f16("q_proj",   q_proj_dev, qkv_elems);
+    dump_f16("k_proj",   k_proj_dev, qkv_elems);
+    dump_f16("v_proj",   v_proj_dev, qkv_elems);
+    dump_f32("row_max",  row_max_dev, stats_elems);
+    dump_f32("row_sum",  row_sum_dev, stats_elems);
+    dump_f32("x_raw",    x_raw_dev,   x_elems);
+
+    // Backward seed.
+    // dO is f16 (attention output gradient), shape [batch, heads, seq, head_dim].
+    dump_f16("dO",       d_o_dev,  qkv_elems);
+
+    // Gradient outputs.
+    dump_f16("dq",       d_q_dev,  qkv_elems);
+    dump_f16("dk",       d_k_dev,  qkv_elems);
+    dump_f16("dv",       d_v_dev,  qkv_elems);
+    dump_f16("dwq",      d_wq_dev, dw_elems);
+    dump_f16("dwk",      d_wk_dev, dw_elems);
+    dump_f16("dwv",      d_wv_dev, dw_elems);
+    dump_f32("dx",       d_x_dev,  dx_elems);
+    dump_f32("dx_norm",  d_xn_dev, dx_elems);
 }
 
 /// M42b: Quantized FlashAttention — KV-cache in INT8/FP8, Q in f16/f32.
