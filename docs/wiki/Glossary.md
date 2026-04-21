@@ -79,7 +79,7 @@ Tiled online-softmax attention algorithm (Dao et al.) that keeps Q, K, V tiles i
 8-bit floating-point format (E4M3 or E5M2) supported on H100/Hopper and RTX 4090+. NSL uses FP8 for V tensors in CSHA Tier D (per-head mixed precision); E4M3 for Q/K (range-critical) and E5M2 for V (gradient-safe). See [`spec/06-quantization.nsl.md`](../../spec/06-quantization.nsl.md).
 
 ### <a id="gqa"></a>GQA — Grouped-Query Attention
-Attention variant where multiple query heads share a single K/V head, reducing KV-cache memory. NSL's FA-2 emitter handles GQA via `source_ad.rs` expand-backward `ReduceToShape` for KV head gradients.
+Attention variant where multiple query heads share a single K/V head, reducing KV-cache memory. NSL's FA-2 emitter handles GQA via `source_ad.rs` expand-backward `ReduceToShape` for KV head gradients. See [Glossary#fa](#fa) and [`spec/02-tensor-type-system.nsl.md`](../../spec/02-tensor-type-system.nsl.md).
 
 ### <a id="gptq"></a>GPTQ — Generative Pre-Trained Quantization
 Post-training weight quantization algorithm (Frantar et al.) that uses second-order Hessian information to minimize quantization error layer by layer. Supported via `quant` block in NSL. See [`spec/06-quantization.nsl.md`](../../spec/06-quantization.nsl.md).
@@ -100,7 +100,7 @@ NVIDIA's virtual ISA for GPU kernels. NSL emits PTX text directly (no LLVM or nv
 Positional encoding scheme (Su et al.) that applies a complex rotation to Q and K vectors in-register, making attention scores relative-position-aware without adding learned parameters. NSL's FA-2 emitter has a `rope_q` flag; CSHA Tier A includes a fused RoPE epilogue PTX pass.
 
 ### <a id="tma"></a>TMA — Tensor Memory Accelerator (Hopper)
-Hopper-generation (sm_90) hardware unit that performs bulk async copies between global and shared memory using `cp.async.bulk.tensor` instructions. NSL's Hopper path in `flash_attention.rs` has TMA plumbing; the full wgmma-based Hopper kernel is not yet production-complete.
+Hopper-generation (sm_90) hardware unit that performs bulk async copies between global and shared memory using `cp.async.bulk.tensor` instructions. NSL's Hopper path in `flash_attention.rs` has TMA plumbing; the wgmma instruction family targets sm_90 and is distinct from sm_80 `mma.sync`.
 
 ### <a id="wcet"></a>WCET — Worst-Case Execution Time
 Compile-time upper bound on kernel execution time, required for hard real-time / robotics workloads (M53). NSL's `nsl check --wcet` pass in `crates/nsl-codegen/src/wcet.rs` models loop trip counts and memory latencies to produce a provable bound.
@@ -146,6 +146,9 @@ Block keyword for the declarative training DSL; generates an epoch loop with imp
 
 ## Decorators
 
+### <a id="dec-adapter"></a>`@adapter`
+Specifies adapter configuration (type, target layers, rank) for LoRA/IA³/GatedLoRA injection. Used alongside `@freeze` and `@wrga` to declare per-layer adapter parameters that will be optimized separately from frozen base weights. See [Glossary#wrga](#wrga).
+
 ### <a id="dec-autotune"></a>`@autotune`
 Triggers build-time tuning of tile sizes, warp counts, and SMEM allocation for a `kernel` block; stores the winning config in the binary's autotune table. See [`spec/09-hardware-abstraction.nsl.md`](../../spec/09-hardware-abstraction.nsl.md).
 
@@ -156,16 +159,16 @@ Marks a function as a hand-written backward pass that overrides the compiler's s
 Marks a function boundary where activations are recomputed on the backward pass instead of stored; reduces peak memory at the cost of one extra forward pass through the marked region. Full reference: [`spec/03-automatic-differentiation.nsl.md`](../../spec/03-automatic-differentiation.nsl.md).
 
 ### <a id="dec-cpdt"></a>`@cpdt`
-Attaches CPDT sharding and distributed-training configuration to a model; `@cpdt(weight_aware=false)` opts out of weight-aware calibration. Enforces one-`@cpdt`-per-program semantic. See [Glossary#cpdt](#cpdt); design spec `2026-04-18-cpdt-weight-aware-phase1-design.md`.
+Attaches CPDT sharding and distributed-training configuration to a model; `@cpdt(weight_aware=false)` opts out of weight-aware calibration. Enforces one-`@cpdt`-per-program semantic. See [Glossary#cpdt](#cpdt); design spec [`2026-04-18-cpdt-weight-aware-phase1-design.md`](../superpowers/specs/2026-04-18-cpdt-weight-aware-phase1-design.md).
 
 ### <a id="dec-csha"></a>`@csha`
 Enables CSHA fusion for a `@flash_attention`-decorated function; accepts `level`, `target`, and `disable` parameters. See [Glossary#csha](#csha).
 
 ### <a id="dec-export"></a>`@export`
-Marks a function for PyTorch FFI export (M62), generating a C-ABI wrapper and Python binding. Shipped PR #45 (2026-04-15). See [Adding-a-Language-Feature](Adding-a-Language-Feature.md) for end-to-end walkthrough; design spec `2026-04-15-m62-export-decorator-design.md`.
+Marks a function for PyTorch FFI export (M62), generating a C-ABI wrapper and Python binding. See [Adding-a-Language-Feature](Adding-a-Language-Feature.md) for the end-to-end walkthrough; design spec [`2026-04-15-m62-export-decorator-design.md`](../superpowers/specs/2026-04-15-m62-export-decorator-design.md).
 
 ### <a id="dec-flash-attention"></a>`@flash_attention`
-Signals to the compiler that the decorated function implements multi-head attention and should be lowered to the FA-2 PTX emitter; defaults to `causal=true`. See [Glossary#fa](#fa); feedback file `feedback_fa_decorator_causal_default.md` for the `row_sum=[1,2,...,N]` invariant.
+Signals to the compiler that the decorated function implements multi-head attention and should be lowered to the FA-2 PTX emitter; defaults to `causal=true`. See [Glossary#fa](#fa); note that with `causal=true` (the default), `row_sum = [1, 2, ..., N]` on the backward pass is correct behavior, not a bug.
 
 ### <a id="dec-freeze"></a>`@freeze`
 Marks model parameters as frozen during training; the compiler removes their VarIds from `backward_live` so no adjoint is emitted for them. Used in conjunction with WRGA adapter injection.
@@ -203,7 +206,7 @@ See [Roadmap](Roadmap.md) for the full phase → version → milestone mapping.
 
 ---
 
-## Primary references (PDFs in repo root)
+## Primary references (PDFs in docs/research/)
 
 | Acronym | PDF |
 |---------|-----|
