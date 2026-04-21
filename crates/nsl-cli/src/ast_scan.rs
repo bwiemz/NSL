@@ -485,23 +485,24 @@ train(model = m, epochs = 1):
 
     #[test]
     fn find_cpdt_weight_aware_false() {
-        let src = train_src_with_decorators("@cpdt(num_gpus=4, weight_aware=false)");
+        let src = train_src_with_decorators("@cpdt(weight_aware=false)");
         let (m, ip) = parse(&src);
         assert_eq!(find_ast_cpdt_weight_aware(&m, &ip), Some(false));
     }
 
     #[test]
     fn find_cpdt_weight_aware_true_when_present() {
-        let src = train_src_with_decorators("@cpdt(num_gpus=4, weight_aware=true)");
+        let src = train_src_with_decorators("@cpdt(weight_aware=true)");
         let (m, ip) = parse(&src);
         assert_eq!(find_ast_cpdt_weight_aware(&m, &ip), Some(true));
     }
 
     #[test]
     fn find_cpdt_weight_aware_none_when_kwarg_absent() {
-        // @cpdt(num_gpus=4) has no weight_aware kwarg; walker returns None
-        // and the CLI's decision table treats None as "default" (true).
-        let src = train_src_with_decorators("@cpdt(num_gpus=4)");
+        // @cpdt with no weight_aware kwarg; walker returns None. The CLI's
+        // decision table treats None as "default" (true), matching the
+        // semantic pass' CpdtConfig::weight_aware default.
+        let src = train_src_with_decorators("@cpdt(mode=full)");
         let (m, ip) = parse(&src);
         assert_eq!(find_ast_cpdt_weight_aware(&m, &ip), None);
     }
