@@ -264,7 +264,14 @@ fn neither_present_cpdt_full_with_opt_out_succeeds() {
         .arg("--cpdt-num-gpus")
         .arg("4");
     // Don't assert overall success/failure — just the decision-table slot.
+    // The third "3. Add `@cpdt(weight_aware=false)`" predicate is the
+    // critical one: it's a unique substring that only appears in the
+    // four-case error message, so its absence proves the decision table
+    // respected the opt-out. Even if "requires weights" were ever absent
+    // from a variant error message, the numbered option list would still
+    // catch a regression where the decorator parse broke.
     cmd.assert()
         .stderr(predicate::str::contains("requires weights").not())
-        .stderr(predicate::str::contains("1. Add --weights").not());
+        .stderr(predicate::str::contains("1. Add --weights").not())
+        .stderr(predicate::str::contains("3. Add `@cpdt(weight_aware=false)`").not());
 }

@@ -1149,6 +1149,12 @@ fn main_inner() {
                     (None, None) => {
                         let cpdt_enabled = cpdt_mode != nsl_codegen::cpdt::CpdtMode::Off;
                         let weight_aware = ast_weight_aware.unwrap_or(true);
+                        // The `!standalone` guard is load-bearing: a separate
+                        // "--standalone requires --weights" error fires later
+                        // (~line 1298). Without this guard, the four-case
+                        // message would fire first and replace the standalone-
+                        // specific error. If a future refactor moves the
+                        // standalone check earlier, this guard can be dropped.
                         if cpdt_enabled && weight_aware && !standalone {
                             eprintln!(
                                 "error: --cpdt {} requires weights. Resolve by ONE of:\n\
