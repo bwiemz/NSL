@@ -1,3 +1,4 @@
+mod ast_scan;
 mod debug;
 mod formatter;
 mod loader;
@@ -1118,6 +1119,59 @@ fn main_inner() {
                 None
             };
 
+            // Phase 1 CPDT: AST-scan for load_safetensors(...) + @cpdt(weight_aware=...).
+            // Resolve the effective weight file via the four-case decision table
+            // from the Phase 1 spec §2.1. Design:
+            // docs/superpowers/specs/2026-04-21-cpdt-ast-autodetect-design.md.
+            let resolved_weight_file: Option<PathBuf> = {
+                let ast_source = std::fs::read_to_string(&file).unwrap_or_default();
+                let mut ast_interner = Interner::new();
+                let ast_file_id = nsl_errors::FileId(0);
+                let (ast_tokens, _) =
+                    nsl_lexer::tokenize(&ast_source, ast_file_id, &mut ast_interner);
+                let ast_parse = nsl_parser::parse(&ast_tokens, &mut ast_interner);
+                let ast_weight_ref =
+                    ast_scan::find_ast_weight_ref(&ast_parse.module, &ast_interner);
+                let ast_weight_aware =
+                    ast_scan::find_ast_cpdt_weight_aware(&ast_parse.module, &ast_interner);
+
+                match (&weights, &ast_weight_ref) {
+                    (Some(flag_path), Some(ast_path)) => {
+                        eprintln!(
+                            "warning: --weights {} overrides AST-declared load_safetensors({:?}).",
+                            flag_path.display(),
+                            ast_path.display(),
+                        );
+                        Some(flag_path.clone())
+                    }
+                    (Some(flag_path), None) => Some(flag_path.clone()),
+                    (None, Some(ast_path)) => Some(ast_path.clone()),
+                    (None, None) => {
+                        let cpdt_enabled = cpdt_mode != nsl_codegen::cpdt::CpdtMode::Off;
+                        let weight_aware = ast_weight_aware.unwrap_or(true);
+                        // The `!standalone` guard is load-bearing: a separate
+                        // "--standalone requires --weights" error fires later
+                        // (~line 1298). Without this guard, the four-case
+                        // message would fire first and replace the standalone-
+                        // specific error. If a future refactor moves the
+                        // standalone check earlier, this guard can be dropped.
+                        if cpdt_enabled && weight_aware && !standalone {
+                            eprintln!(
+                                "error: --cpdt {} requires weights. Resolve by ONE of:\n\
+                                 \n\
+                                 1. Add --weights <path.safetensors> to this invocation.\n\
+                                 2. Add `let w = load_safetensors(\"<path>\")` to your NSL source.\n\
+                                 3. Add `@cpdt(weight_aware=false)` to opt out of the weight-aware path\n\
+                                    (produces a CPDT plan without weight-derived tier assignments).",
+                                cpdt_mode.as_str(),
+                            );
+                            process::exit(1);
+                        }
+                        None
+                    }
+                }
+            };
+
             let compile_opts = nsl_codegen::CompileOptions {
                 no_autotune,
                 autotune_fresh,
@@ -1134,8 +1188,9 @@ fn main_inner() {
                 nan_analysis,
                 deterministic: _deterministic,
                 // M52: When --standalone, weights are handled by standalone pipeline;
-                // otherwise pass through for weight-aware compilation
-                weight_file: if standalone { None } else { weights.clone() },
+                // otherwise pass through the four-case-resolved weight file from
+                // above (AST auto-detect + --weights flag decision table).
+                weight_file: if standalone { None } else { resolved_weight_file.clone() },
                 weight_config: nsl_codegen::weight_aware::WeightAwareConfig {
                     dead_weight_threshold,
                     sparse_threshold,
