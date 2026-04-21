@@ -73,6 +73,22 @@ pub(crate) fn invoke_cpdt_if_enabled(
     // the CLI's --weights flag. Thread it into the CpdtInput so plan_map
     // runs on real weights.
     let weight_map_ref = compiler.features.weight_map.as_ref();
+
+    // Phase 1 opt-out: `@cpdt(weight_aware=false)` suppresses the weight-aware
+    // path entirely. Shadowing `weight_map_ref` to `None` here propagates
+    // through every downstream guard:
+    //   * plan_map in cpdt::run receives None → returns PrecisionPlan::default().
+    //   * tier-agreement diagnostic + CPDT_CALIB_K warning gate on
+    //     `weights_present` (derived from weight_map_ref.is_some()) → skipped.
+    //   * validate (when PR #90 merges) gates on `if let Some(wm) = weight_map_ref`
+    //     → skipped.
+    // Design: docs/superpowers/specs/2026-04-20-cpdt-weight-aware-opt-out-design.md.
+    let weight_map_ref = if compiler.cpdt_weight_aware {
+        weight_map_ref
+    } else {
+        None
+    };
+
     let weights_present = weight_map_ref.is_some();
     let precision_cfg = PrecisionConfig::default();
 
@@ -1303,6 +1319,30 @@ impl Compiler<'_> {
             }
 
             StmtKind::Decorated { decorators, stmt } => {
+                // Module-scoped decorator configs that apply regardless of
+                // the inner stmt kind (i.e. not FnDef-specific). `@cpdt`
+                // wraps a TrainBlock but the `weight_aware` kwarg is global
+                // compiler state: nsl-semantic enforces exactly-one-@cpdt-
+                // per-program so the single-writer semantics are safe.
+                // See docs/superpowers/specs/2026-04-20-cpdt-weight-aware-opt-out-design.md.
+                for d in decorators {
+                    if d.name.len() == 1 && self.resolve_sym(d.name[0]) == "cpdt" {
+                        if let Some(args) = &d.args {
+                            for arg in args {
+                                if let Some(name_sym) = arg.name {
+                                    if self.resolve_sym(name_sym) == "weight_aware" {
+                                        if let nsl_ast::expr::ExprKind::BoolLiteral(b) =
+                                            arg.value.kind
+                                        {
+                                            self.cpdt_weight_aware = b;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // Check for @no_grad and @fuse on nested function definitions
                 if let StmtKind::FnDef(fn_def) = &stmt.kind {
                     for d in decorators {
