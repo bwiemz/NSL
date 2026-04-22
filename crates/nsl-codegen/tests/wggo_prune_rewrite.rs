@@ -486,3 +486,70 @@ fn whole_block_prune_refused() {
         result.refusals[0]
     );
 }
+
+// --------------------------------------------------------------------------
+// Test 6 (Task 16 — merge-gate smoke test): mixed plan with one supported
+//   sub-block prune (blocks.1.attn) AND one unsupported whole-block prune
+//   (blocks.0) must:
+//     (a) emit the WholeBlockUnsupported refusal for blocks.0
+//     (b) apply zero rewrites (dry-run-then-commit invariant — any refusal
+//         aborts the entire commit phase)
+//     (c) leave wengert.ops and wengert.output completely unchanged
+//
+// Spec §11 criterion #7. Validates the three-phase run() orchestration from
+// Task 11 under the realistic scenario of a partially-unsupported plan.
+// --------------------------------------------------------------------------
+
+#[test]
+fn mixed_plan_emits_all_refusals_in_one_pass_with_wengert_untouched() {
+    let mut wengert = mk_toy_wengert();
+    let baseline_op_count = wengert.ops.len();
+    let baseline_output = wengert.output;
+
+    // Mixed plan: blocks.1.attn is a valid sub-block prune; blocks.0 is a
+    // whole-block prune which is unsupported in v1 (LayerRole::Block).
+    let plan = AppliedPlan {
+        layers: vec![
+            mk_prune_layer(2, "blocks.1.attn"), // supported sub-block prune
+            mk_prune_layer(0, "blocks.0"),      // whole-block — should be refused
+        ],
+        total_us: 0.0,
+        peak_memory_bytes: 0,
+    };
+
+    let result = run(&mut wengert, &plan, &WeightMap::default());
+
+    // (a) WholeBlockUnsupported refusal must be present for blocks.0.
+    let has_whole_block_refusal = result.refusals.iter().any(|r| {
+        matches!(r, PruneRefusal::WholeBlockUnsupported { layer_name }
+            if layer_name == "blocks.0")
+    });
+    assert!(
+        has_whole_block_refusal,
+        "expected WholeBlockUnsupported for blocks.0; got refusals: {:?}",
+        result.refusals
+    );
+
+    // (b) Zero rewrites applied (dry-run-then-commit invariant).
+    assert_eq!(
+        result.rewrites.len(), 0,
+        "expected zero rewrites applied in a mixed-refusal plan (dry-run-then-commit); got {}",
+        result.rewrites.len()
+    );
+    assert_eq!(
+        result.ops_deleted, 0,
+        "expected ops_deleted=0 in a mixed-refusal plan; got {}",
+        result.ops_deleted
+    );
+
+    // (c) wengert unchanged — op count and output pointer both preserved.
+    assert_eq!(
+        wengert.ops.len(), baseline_op_count,
+        "wengert.ops should be untouched on refusal; count changed from {} to {}",
+        baseline_op_count, wengert.ops.len()
+    );
+    assert_eq!(
+        wengert.output, baseline_output,
+        "wengert.output should be untouched on refusal"
+    );
+}
