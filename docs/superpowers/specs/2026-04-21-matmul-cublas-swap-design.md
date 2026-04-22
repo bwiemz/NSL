@@ -1,5 +1,13 @@
 # Matmul Primitive: cuBLAS Swap for `nsl_matmul_f32`
 
+> **v3 UPDATE (2026-04-21 evening):** empirical post-swap measurement revealed cudarc's `CudaBlas::gemm` invokes `cublasSgemm_v2` under cuBLAS's default math mode, which on sm_80+ enables TF32 tensor cores. Observed throughput at (4096,4096,4096) is ~105 TFLOPs/s (above the 43 TFLOPs/s pure-f32 SIMT peak), and observed numerical drift is ~4.2e-4 at K=4096 (consistent with TF32 per-element ~1e-3 accuracy, NOT the 1.5e-6 summation-order bound §4 originally derived for strict f32).
+>
+> This section is a retrospective capture. §2 (alpha/beta), §3 (test presence/absence), §5 (commit structure), §8 (success criteria) carry over with the additions documented in new sections §9 (math-mode API) and §10 (split equivalence tests). §4's ULP analysis was correct for strict f32 but does not describe the implementation's runtime behavior under the default math mode — amended to describe both regimes.
+>
+> Two retrospective lessons (not yet codified as rules):
+> 1. Pre-dispatch verification should include "what cuBLAS math mode will actually run at runtime" when the intervention is a cuBLAS swap. v1/v2 of this spec assumed strict f32; the implementation landed in a different math mode and the spec didn't account for the possibility.
+> 2. **Layered bottleneck:** post-swap the B.3.2 trigger ratio dropped from 106.1x to 61.3x (fires, same decision-tree branch) but backward iter time INCREASED by ~28s despite ~400x matmul primitive speedup. The 188s backward was never matmul-dominated; the real bottleneck is allocator + source-AD tape overhead. B.3.2's expected speedup is correspondingly lower than originally framed. See memory file addendum.
+
 **Motivation:** WRGA B.3.2 trigger measurement (PR #93 aftermath) revealed the trigger's 106× ratio was inflated by an unoptimized matmul primitive. `nsl_matmul_f32` is a naive sm_52 scalar kernel achieving ~1-2 TFLOPs/s on a 5070 Ti (~15-20× below peak). Per `project_wrga_b32_measurement.md` 2026-04-20 addendum, B.3.2 is re-deferred until matmul-primitive optimization lands and the trigger is re-measured against a clean baseline.
 
 **Goal:** replace the naive kernel with a cuBLAS `cublasSgemm_v2` call via `cudarc::cublas`. Preserve strict f32 semantics (modulo summation-order drift). Smallest intervention that closes the primitive-optimization gap.
@@ -244,3 +252,98 @@ The fused forward kernel itself does NOT use `nsl_matmul_f32` (it's a hand-writt
 - Tolerance relaxations in existing tests (if any) enumerated with reason in the commit message.
 - B.3.2 trigger re-measurement completes; post-swap ratio recorded in memory file; decision-tree branch applied.
 - Naive `nsl_matmul_f32` PTX constant + launch code deleted from `cuda/kernels.rs` and `cuda/mod.rs`. Single matmul code path post-merge.
+
+## 9. Math-mode API (v3 addition — 2026-04-21 evening)
+
+The v1/v2 swap landed with cuBLAS's default math mode. On sm_80+ that's TF32 tensor cores — ~400x faster than the naive kernel but with ~1e-3 per-element numerical drift. For most ML workloads this is the correct default (matches PyTorch, JAX, TensorFlow); for numerical-analysis workloads it's a silent regression vs the pre-swap strict-f32 behavior. v3 adds an explicit opt-out API.
+
+### Three-level control (library / program / per-workload deferred)
+
+- **Library level (compile-time):** new Cargo feature `strict-matmul` in `crates/nsl-runtime/Cargo.toml`. When enabled, the default math mode at runtime is `CUBLAS_PEDANTIC_MATH` (strict f32, no TF32). When disabled (the Cargo default), the runtime defaults to `CUBLAS_DEFAULT_MATH` (TF32 on sm_80+).
+- **Program level (runtime):** env vars override the Cargo default.
+  - `NSL_MATMUL_PEDANTIC=1` forces pedantic regardless of Cargo feature.
+  - `NSL_MATMUL_TF32=1` forces TF32 regardless of Cargo feature.
+  - If both are set, `NSL_MATMUL_PEDANTIC=1` wins (safer default).
+- **Per-workload (future, Phase 2):** a `@pedantic_matmul` decorator is mentioned for forward-compat but NOT shipped in this PR. Out of scope.
+
+### Resolution logic
+
+```rust
+fn resolve_math_mode() -> CublasMathMode {
+    if std::env::var("NSL_MATMUL_PEDANTIC").ok().as_deref() == Some("1") {
+        return CublasMathMode::Pedantic;
+    }
+    if std::env::var("NSL_MATMUL_TF32").ok().as_deref() == Some("1") {
+        return CublasMathMode::Default;
+    }
+    if cfg!(feature = "strict-matmul") {
+        CublasMathMode::Pedantic
+    } else {
+        CublasMathMode::Default
+    }
+}
+```
+
+Called once at `OnceLock<CudaBlas>` init; result baked into the handle via `cublasSetMathMode`. Changing env vars mid-process does NOT change the mode — handle's mode is set at first-use.
+
+### Mode application
+
+cudarc doesn't expose `cublasSetMathMode` in its safe API, but the raw FFI is accessible via `cudarc::cublas::sys::cublasSetMathMode`. After `CudaBlas::new(stream)` returns, call the raw FFI on the handle field. ~10 LOC addition.
+
+### Discoverability
+
+The resolved mode is logged at `OnceLock` init time:
+
+```text
+[nsl-matmul] cuBLAS math mode: TF32 (default — set NSL_MATMUL_PEDANTIC=1 or build with --features strict-matmul for strict f32)
+```
+
+or:
+
+```text
+[nsl-matmul] cuBLAS math mode: pedantic (strict f32, ~5-10x slower than TF32 default)
+```
+
+One-time log per process, at handle init. No spam.
+
+## 10. Split equivalence tests (v3 addition)
+
+The `matmul_cublas_equivalence.rs` test from v2 ran against cuBLAS default (TF32) with a K-scaled envelope. v3 replaces it with two explicit tests.
+
+**Test A — `matmul_cublas_pedantic_equivalence`** (strict-f32 correctness gate):
+
+- Runs with `NSL_MATMUL_PEDANTIC=1` set (via `std::env::set_var` before subprocess spawn OR a test-harness flag that forces pedantic at init).
+- Uses the **1e-5 relative tolerance** from spec §4.
+- Shape matrix: 10 shapes from v2 §3.
+- Failure ⇒ wrapper bug (wrong lda/ldb/ldc, wrong operand order, missed `cublasSetMathMode`).
+
+**Test B — `matmul_cublas_tf32_default_sanity`** (TF32 default bound):
+
+- Runs with cuBLAS default math mode (no env var override).
+- Uses a **5e-3 relative tolerance** per NVIDIA TF32 specs (10-bit mantissa vs f32's 24-bit).
+- Shape matrix: same 10 shapes.
+- Failure ⇒ TF32-specific (mode-resolution bug, cudarc version incompatibility).
+
+Both tests assert the presence/absence kernel-profile invariant (cuBLAS `sgemm`/`gemm_` pattern appears; naive `nsl_matmul_f32` does not).
+
+**Test isolation note:** NSL's `gpu_matmul_f32` is called from a subprocess (`nsl run`). Env vars set via `std::env::set_var` in the test body propagate to the subprocess via `Command::env`. Ensure Test A explicitly sets `NSL_MATMUL_PEDANTIC=1` on the `Command` builder; Test B explicitly clears both env vars (using `Command::env_remove`) to inherit the Cargo-feature default.
+
+### CI recommendation
+
+- Primary CI build: default features (TF32 default). Test A sets `NSL_MATMUL_PEDANTIC=1`; Test B clears env vars. Both pass.
+- Secondary CI matrix entry: `--features strict-matmul`. Test A passes same way. Test B with cleared env vars now gets pedantic (the Cargo feature) — for Test B to exercise TF32 under this build, it must explicitly set `NSL_MATMUL_TF32=1`.
+
+Running both catches bugs where one resolution path works but the other doesn't.
+
+## 11. v3 commit structure
+
+- **Commit A (already landed at f704b259):** cuBLAS swap with default math mode. Deleted naive PTX. 10-shape equivalence test (K-scaled envelope).
+- **Commit B (v3 delta — pending):**
+  - Add `strict-matmul` Cargo feature to `nsl-runtime/Cargo.toml`.
+  - Add math-mode resolution + `cublasSetMathMode` call in `OnceLock` init.
+  - Add discoverability `eprintln!` at handle init.
+  - Replace K-scaled-envelope test with Test A (pedantic, 1e-5) + Test B (TF32, 5e-3).
+  - Doc update: CI matrix recommendation.
+- **Commit C (administrative — pending):** trigger re-measurement recorded (61.3x / 34.1x post-swap TF32) + backward-regression finding filed in memory file.
+
+Single PR containing A+B+C. Merge gate: both Test A and Test B green on default Cargo build.
