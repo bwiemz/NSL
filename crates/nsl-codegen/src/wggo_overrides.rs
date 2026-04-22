@@ -23,7 +23,7 @@ pub struct OverrideDiagnostic {
 }
 
 /// Why a consumer refused or adjusted a WGGO override.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub enum OverrideRejectReason {
     // CSHA:
     SmemBudgetExceeded { actual_kb: u32, limit_kb: u32 },

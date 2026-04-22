@@ -588,6 +588,121 @@ fn refusal_with_context(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Task 15: public diagnostic formatters
+// ---------------------------------------------------------------------------
+
+/// Map a refusal variant to its structured diagnostic code for Layer 4
+/// structural assertions. Spec §6.3.
+pub fn diagnostic_code(r: &PruneRefusal) -> crate::wggo_overrides::OverrideRejectReason {
+    use crate::wggo_overrides::OverrideRejectReason;
+    match r {
+        PruneRefusal::CrossLayerParam { .. } => OverrideRejectReason::PruneCrossLayerParam,
+        PruneRefusal::NoResidualAdd { .. } => OverrideRejectReason::PruneNoResidualAdd,
+        PruneRefusal::ParallelResidualBranches { .. } => OverrideRejectReason::PruneParallelResidualBranches,
+        PruneRefusal::AmbiguousPatternMatch { .. } => OverrideRejectReason::PruneAmbiguousPatternMatch,
+        PruneRefusal::EmptyClosure { .. } => OverrideRejectReason::PruneEmptyClosure,
+        PruneRefusal::WholeBlockUnsupported { .. } => OverrideRejectReason::PruneWholeBlockUnsupported,
+        PruneRefusal::ConflictingPruneDecisions { .. } => OverrideRejectReason::PruneConflictingDecisions,
+    }
+}
+
+/// Spec §6.1 success-path stderr line. Format:
+///   [prune] layer=N name=... role=... applied=true closure_size=K ops_deleted=K residual_add_op=ID
+/// Separator convention: key=value throughout (no colons).
+pub fn format_success_stderr(rewrite: &PruneRewrite, layer_index: u32, ops_deleted: usize) -> String {
+    format!(
+        "[prune] layer={} name={} role={:?} applied=true closure_size={} ops_deleted={} residual_add_op={}",
+        layer_index,
+        rewrite.layer_name,
+        rewrite.layer_role,
+        rewrite.closure_ops.len(),
+        ops_deleted,
+        rewrite.residual_add_op,
+    )
+}
+
+/// Spec §3 three-part refusal message. One format per variant.
+/// Format: three labeled sections (requested / expected / found) after a
+/// one-line header. Trailing newline so multiple refusals separate cleanly.
+pub fn format_refusal(r: &PruneRefusal) -> String {
+    match r {
+        PruneRefusal::CrossLayerParam {
+            layer_name, layer_role, param_name, param_var, external_consumer, external_op_kind,
+        } => format!(
+"prune: layer has cross-layer parameter sharing (not supported in v1).
+  requested:  prune {layer_name}  (role={layer_role:?})
+  expected:   all parameters matching `{layer_name}.*` consumed only within
+              the layer's computational closure
+  found:      parameter `{param_name}` (VarId {param_var}) is consumed by
+              op_id={external_consumer} ({external_op_kind}), which is
+              outside the closure for {layer_name}
+"
+        ),
+        PruneRefusal::NoResidualAdd { layer_name, layer_role, closure_size } => format!(
+"prune: layer is not residual-structured (no boundary Add found).
+  requested:  prune {layer_name}  (role={layer_role:?})
+  expected:   exactly one op in the closure matching Add(h_before, block_output)
+              with block_output in closure and block_output single-consumer
+  found:      closure has {closure_size} ops but zero ops match the residual
+              pattern; the layer appears to be non-residual (SSM / Mamba /
+              non-standard architecture)
+"
+        ),
+        PruneRefusal::ParallelResidualBranches { layer_name, layer_role, add_ops } => format!(
+"prune: layer has parallel residual branches (not supported in v1).
+  requested:  prune {layer_name}  (role={layer_role:?})
+  expected:   exactly one residual boundary Add
+  found:      {k} residual Adds detected at ops {add_ops:?}; each appears to
+              be a separate residual branch (distinct h_before values). Parallel
+              residual pruning requires branch-by-branch semantics not yet
+              specified.
+",
+            k = add_ops.len(),
+        ),
+        PruneRefusal::AmbiguousPatternMatch { layer_name, layer_role, h_before_var, candidate_adds } => format!(
+"prune: layer has multiple candidate residual boundaries (pattern-match ambiguous).
+  requested:  prune {layer_name}  (role={layer_role:?})
+  expected:   exactly one op matching the residual pattern
+  found:      {k} candidate Adds match the residual pattern against the same
+              h_before (VarId {h_before_var}): ops {candidate_adds:?}.
+              Boundary disambiguation requires architecture-specific rules not
+              yet specified.
+",
+            k = candidate_adds.len(),
+        ),
+        PruneRefusal::EmptyClosure { layer_name, layer_role, prefix } => format!(
+"prune: no parameters match the requested layer prefix.
+  requested:  prune {layer_name}  (role={layer_role:?})
+  expected:   at least one parameter VarId with var_name starting
+              with `{prefix}`
+  found:      zero matching parameters in the WeightMap. Check layer name /
+              index; the requested layer does not exist in the compiled model.
+"
+        ),
+        PruneRefusal::WholeBlockUnsupported { layer_name } => format!(
+"prune: whole-block pruning (LayerRole::Block) is not supported in v1.
+  requested:  prune {layer_name}  (role=Block)
+  supported:  prune {layer_name}.attn  (role=Attention)
+              prune {layer_name}.ffn   (role=Ffn)
+  workaround: emit two sub-block prune decisions for this layer; their combined
+              effect is semantically equivalent to whole-block prune in standard
+              pre-norm transformer architectures (NOT equivalent for post-norm,
+              parallel, or scaled-residual architectures).
+  planned:    whole-block prune tracked for v2 (chain-collapse transformation).
+"
+        ),
+        PruneRefusal::ConflictingPruneDecisions { decision_a, decision_b, reason } => format!(
+"prune: two prune decisions in the same plan conflict.
+  requested:  prune {decision_a} AND prune {decision_b} in the same plan
+  expected:   each rewrite's closure and VarId aliasing is disjoint from every
+              other rewrite's
+  found:      {reason}
+"
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

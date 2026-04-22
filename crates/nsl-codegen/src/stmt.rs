@@ -4299,21 +4299,33 @@ impl Compiler<'_> {
                         weight_map_ref,
                     );
                     if !wggo_prune_result.refusals.is_empty() {
-                        // Placeholder refusal emission — Task 15 upgrades this with
-                        // format_refusal + structured diagnostic_code attachment.
+                        // Spec §3 / §6: emit three-part refusal text per variant.
+                        // diagnostic_code() provides the structured OverrideRejectReason
+                        // for any future attach-reason API once diagnostic infrastructure
+                        // exposes it. For now, the stderr text + CodegenError is the
+                        // diagnostic contract.
                         for refusal in &wggo_prune_result.refusals {
-                            eprintln!("[prune] refusal (task3-stub): {refusal:?}");
+                            let text = crate::wggo_prune::format_refusal(refusal);
+                            eprintln!("{text}");
                         }
                         return Err(crate::error::CodegenError::new(
                             "wggo_prune: one or more prune decisions refused; see [prune] stderr lines",
                         ));
                     }
-                    // Success path: emit observable markers so Task 14 integration tests
-                    // can distinguish "rewrite applied" from "no rewrite".
-                    // Placeholder — Task 15 upgrades to spec §6.1 format:
-                    // [prune] layer=N name=... role=... applied=true closure_size=K ops_deleted=K residual_add_op=ID
+                    // Success path: spec §6.1 format per rewrite.
+                    // layer_index is looked up from applied_plan.layers by name match
+                    // so we report the index the planner assigned, not the Vec position.
                     for rewrite in &wggo_prune_result.rewrites {
-                        eprintln!("[prune] applied (task3-stub): layer={}", rewrite.layer_name);
+                        let layer_index = applied_plan.layers.iter()
+                            .find(|l| l.layer_name == rewrite.layer_name)
+                            .map(|l| l.layer_index)
+                            .unwrap_or(0);
+                        let line = crate::wggo_prune::format_success_stderr(
+                            rewrite,
+                            layer_index,
+                            wggo_prune_result.ops_deleted,
+                        );
+                        eprintln!("{line}");
                     }
                 }
                 // --- END NEW ---
