@@ -268,14 +268,16 @@ fn link_gcc_multi(
     }
 
     // macOS: inject platform version since Cranelift object files lack
-    // LC_BUILD_VERSION. 14.0 covers both `macos-14` (Sonoma) and
-    // `macos-latest` (Sequoia 15+) runners. An earlier 11.0 pin worked when
-    // the runtime was pure-Rust, but `native-tls` → `ring` object files
-    // target the runner's native SDK (15.5), and ld rejects linking objects
-    // with a higher minos than the pinned platform version (manifests as
-    // "Found illegal text-relocations" on arm64).
+    // LC_BUILD_VERSION. Pin to 15.0 because the `native-tls` landing
+    // brought in `ring`, whose object files on the runners target the
+    // native SDK (currently 15.5). ld rejects linking objects with a
+    // higher minos than the pinned platform version (manifests as
+    // "Found illegal text-relocations" on arm64, where text-relocs are
+    // banned under PIE and `-read_only_relocs,suppress` has no effect).
+    // Both `macos-14` (Sonoma) and `macos-latest` (Sequoia 15+) runners
+    // ship the macOS 15 SDK.
     if cfg!(target_os = "macos") {
-        cmd.args(["-Wl,-platform_version,macos,14.0,14.0"]);
+        cmd.args(["-Wl,-platform_version,macos,15.0,15.0"]);
         // `native-tls` uses the Security framework on macOS (via the
         // `security-framework` crate); the symbols end up in
         // `libnsl_runtime.a` but Cargo's link directives don't reach this
@@ -727,9 +729,9 @@ fn link_shared_gcc(
     }
 
     // macOS: inject platform version — see `link_gcc_multi` above for why
-    // the target is 14.0 rather than 11.0 after the native-tls landing.
+    // the target is 15.0 (matches `ring`'s SDK target on current runners).
     if cfg!(target_os = "macos") {
-        cmd.args(["-Wl,-platform_version,macos,14.0,14.0"]);
+        cmd.args(["-Wl,-platform_version,macos,15.0,15.0"]);
         // native-tls → security-framework (see `link_gcc_multi` comment).
         cmd.args([
             "-framework", "Security",

@@ -112,12 +112,21 @@ impl Drop for NslModel {
 // Thread-local error string
 // ---------------------------------------------------------------------------
 
+// `CString` (not `String`) so the pointer returned by `nsl_get_last_error`
+// is guaranteed null-terminated. With plain `String` the C-side read would
+// run past the last byte into whatever happened to be next on the heap,
+// yielding intermittent garbage like `"hello from wrapper[�JV"` on some
+// platforms' allocator layouts.
 thread_local! {
-    static LAST_ERROR: RefCell<Option<String>> = const { RefCell::new(None) };
+    static LAST_ERROR: RefCell<Option<std::ffi::CString>> = const { RefCell::new(None) };
 }
 
 fn set_error(msg: String) {
-    LAST_ERROR.with(|e| *e.borrow_mut() = Some(msg));
+    // `new` rejects interior nulls — strip them instead of panicking in the
+    // FFI surface.
+    let cleaned: String = msg.chars().filter(|c| *c != '\0').collect();
+    let cstr = std::ffi::CString::new(cleaned).expect("CString::new after \\0 strip");
+    LAST_ERROR.with(|e| *e.borrow_mut() = Some(cstr));
 }
 
 // ---------------------------------------------------------------------------
@@ -130,7 +139,7 @@ fn set_error(msg: String) {
 pub extern "C" fn nsl_get_last_error() -> i64 {
     LAST_ERROR.with(|e| {
         let borrow = e.borrow();
-        match borrow.as_deref() {
+        match borrow.as_ref() {
             Some(msg) => msg.as_ptr() as i64,
             None => c"".as_ptr() as i64,
         }

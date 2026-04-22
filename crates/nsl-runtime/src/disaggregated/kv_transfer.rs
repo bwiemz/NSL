@@ -2068,9 +2068,20 @@ mod tests {
 
     #[test]
     fn rdma_backend_falls_back_to_tcp() {
-        // Without NSL_RDMA_DEVICE set and no InfiniBand hardware,
-        // RdmaBackend should fall back to its internal TCP backend.
-        let (sender, receiver) = RdmaBackend::new_pair(0, 1);
+        // Force the "no RDMA" branch of `probe_rdma` deterministically:
+        // GitHub Actions Ubuntu runners expose `/sys/class/infiniband/` with
+        // virtual entries even without real hardware, so the auto-probe
+        // returns true and flips `rdma_available` to match. Setting
+        // `NSL_RDMA_DEVICE=""` trips the earlier explicit-override branch
+        // which returns `!device.is_empty()` → false.
+        //
+        // SAFETY: env vars are process-global but `probe_rdma` only reads
+        // NSL_RDMA_DEVICE here and in production (where the caller would
+        // never set it empty). No other test in this module depends on it.
+        unsafe {
+            std::env::set_var("NSL_RDMA_DEVICE", "");
+        }
+        let (sender, _receiver) = RdmaBackend::new_pair(0, 1);
         assert!(!sender.rdma_available, "RDMA should not be available in test env");
     }
 
