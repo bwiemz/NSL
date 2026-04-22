@@ -151,9 +151,15 @@ pub(crate) fn plan_rewrite(
 
     let layer_role = infer_role(&layer.layer_name);
 
-    // Spec §3.6 — Task 10 will land this refusal path; for Task 4 the
-    // positive case assumes non-Block roles. Leaving a TODO marker so Task 10
-    // can slot in without re-shaping the function.
+    // Spec §3.6: whole-block prune (LayerRole::Block) is not supported in v1.
+    // Refuse immediately — don't compute a closure or pattern-match, since
+    // the refusal semantic is role-based and the plan structure is
+    // independent of the Wengert state.
+    if matches!(layer_role, LayerRole::Block) {
+        return PlanResult::Refused(PruneRefusal::WholeBlockUnsupported {
+            layer_name: layer.layer_name.clone(),
+        });
+    }
 
     // (b) Find parameter VarIds matching `{layer_name}.` prefix.
     //     Spec §2.3 precondition #1 (non-empty parameters) lands in Task 8.
@@ -718,6 +724,35 @@ mod tests {
             }
             PlanResult::Ok(plan) => panic!("expected CrossLayerParam, got Ok({plan:?})"),
             PlanResult::Refused(other) => panic!("expected CrossLayerParam, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn whole_block_refusal_from_planner() {
+        // Layer with role=Block — the planner shouldn't emit this in v1's
+        // supported flow, but if something does, plan_rewrite refuses
+        // immediately per spec §3.6.
+        //
+        // `infer_role("blocks.7")` returns LayerRole::Block (no .attn/.ffn
+        // suffix; matches the `blocks.N` pattern).
+
+        let v_hb: VarId = 100;
+        let v_p:  VarId = 200;
+        let v_y:  VarId = 300;
+        let ops = vec![
+            op_unary(0, v_p, v_hb, PrimalOp::Relu),
+            op_add  (1, v_y, v_hb, v_p),
+        ];
+        let wengert = mk_wengert(ops, v_y, &[(v_hb, "h_before"), (v_p, "blocks.7.wq")]);
+        let layer = mk_prune_layer(7, "blocks.7");   // Block role — no .attn/.ffn suffix
+        let weight_map = WeightMap::default();
+
+        match plan_rewrite(&wengert, &layer, &weight_map) {
+            PlanResult::Refused(PruneRefusal::WholeBlockUnsupported { layer_name }) => {
+                assert_eq!(layer_name, "blocks.7");
+            }
+            PlanResult::Ok(plan) => panic!("expected WholeBlockUnsupported, got Ok({plan:?})"),
+            PlanResult::Refused(other) => panic!("expected WholeBlockUnsupported, got: {other:?}"),
         }
     }
 
