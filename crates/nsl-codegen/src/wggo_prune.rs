@@ -245,6 +245,11 @@ pub(crate) fn compute_closure(
 /// - Task 5: zero matches → NoResidualAdd
 /// - Task 6: multiple matches with distinct h_before → ParallelResidualBranches
 /// - Task 7: multiple matches with shared h_before → AmbiguousPatternMatch
+///
+/// Structural note for Tasks 6-7: the early `return Ok(...)` inside the loop
+/// must become a collect-all-then-classify pass. The positive-case test
+/// `closure_captures_transitive_compute_ops` only exercises the single-match
+/// path, so Task 6+ MUST re-verify it after changing control flow.
 fn find_residual_add(
     wengert: &WengertList,
     closure: &[OpId],
@@ -363,10 +368,10 @@ mod tests {
 
     #[test]
     fn closure_captures_transitive_compute_ops() {
-        // Wengert list modeling: h_after = h_before + (h_before * blocks.7.attn.wq)
-        //   op0: Mul v0 = v_hb * v_hb      → v0 is the "param producer" (v0 is named blocks.7.attn.wq)
-        //   op1: Mul v1 = v0 * v0          → block_output (reads layer-7 param)
-        //   op2: Add v_ha = v_hb + v1      → residual boundary
+        // Wengert list modeling: h_after = h_before + relu(relu(v_hb))
+        //   op0: Relu v0 = relu(v_hb)          — v0 is named blocks.7.attn.wq (param producer)
+        //   op1: Relu v1 = relu(v0)            — block_output (reads layer-7 param)
+        //   op2: Add  v_ha = v_hb + v1         — residual boundary
         //
         // Expected closure: {op0, op1}. The Add (op2) is the BOUNDARY, not the closure.
 
@@ -376,8 +381,8 @@ mod tests {
         let v_ha: VarId = 202;
 
         let ops = vec![
-            op_unary(0, v0, v_hb, PrimalOp::Mul),   // produces v0 (a layer-7 param VarId)
-            op_unary(1, v1, v0, PrimalOp::Mul),     // reads layer-7 param → block_output
+            op_unary(0, v0, v_hb, PrimalOp::Relu),  // produces v0 (a layer-7 param VarId)
+            op_unary(1, v1, v0, PrimalOp::Relu),    // reads layer-7 param → block_output
             op_add(2, v_ha, v_hb, v1),               // residual Add — the boundary
         ];
 
