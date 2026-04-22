@@ -4083,9 +4083,9 @@ impl Compiler<'_> {
                                 // warning (or new arm) rather than silently
                                 // printing the wrong string.
                                 let reason_str: std::borrow::Cow<'static, str> = match &diag.reason {
-                                    crate::wggo_overrides::OverrideRejectReason::PruneNotImplemented => {
+                                    crate::wggo_overrides::OverrideRejectReason::WholeBlockPruneNotImplemented => {
                                         std::borrow::Cow::Borrowed(
-                                            crate::wggo_overrides::prune_not_implemented_reason(),
+                                            crate::wggo_overrides::whole_block_prune_not_implemented_reason(),
                                         )
                                     }
                                     other => std::borrow::Cow::Owned(format!("{:?}", other)),
@@ -4285,6 +4285,51 @@ impl Compiler<'_> {
                         );
                     }
                 }
+                // --- NEW: spec §4 WGGO Prune, runs BEFORE wrga so WRGA sees reduced forward ---
+                // When WGGO produced a plan, run the prune IR rewriter. On any refusal the
+                // whole plan is rejected (spec §5.3 dry-run-then-commit contract) and
+                // compilation fails with a CodegenError. On success each rewritten layer
+                // gets a stderr marker that Task 15 will upgrade to format_refusal output.
+                if let Some(ref applied_plan) = wggo_applied {
+                    let empty_weight_map = crate::weight_aware::WeightMap::default();
+                    let weight_map_ref = self.features.weight_map.as_ref().unwrap_or(&empty_weight_map);
+                    let wggo_prune_result = crate::wggo_prune::run(
+                        extractor.wengert_list_mut(),
+                        applied_plan,
+                        weight_map_ref,
+                    );
+                    if !wggo_prune_result.refusals.is_empty() {
+                        // Spec §3 / §6: emit three-part refusal text per variant.
+                        // diagnostic_code() provides the structured OverrideRejectReason
+                        // for any future attach-reason API once diagnostic infrastructure
+                        // exposes it. For now, the stderr text + CodegenError is the
+                        // diagnostic contract.
+                        for refusal in &wggo_prune_result.refusals {
+                            let text = crate::wggo_prune::format_refusal(refusal);
+                            eprintln!("{text}");
+                        }
+                        return Err(crate::error::CodegenError::new(
+                            "wggo_prune: one or more prune decisions refused; see [prune] stderr lines",
+                        ));
+                    }
+                    // Success path: spec §6.1 format per rewrite.
+                    // layer_index is looked up from applied_plan.layers by name match
+                    // so we report the index the planner assigned, not the Vec position.
+                    for rewrite in &wggo_prune_result.rewrites {
+                        let layer_index = applied_plan.layers.iter()
+                            .find(|l| l.layer_name == rewrite.layer_name)
+                            .map(|l| l.layer_index)
+                            .unwrap_or(0);
+                        let line = crate::wggo_prune::format_success_stderr(
+                            rewrite,
+                            layer_index,
+                            rewrite.ops_deleted,  // per-rewrite, not aggregate
+                        );
+                        eprintln!("{line}");
+                    }
+                }
+                // --- END NEW ---
+
                 // Task 4: invoke WRGA driver (pruning / rank allocation /
                 // fusion) before primal lowering.  When WRGA is disabled or
                 // inputs are empty, this is a no-op and we use the raw

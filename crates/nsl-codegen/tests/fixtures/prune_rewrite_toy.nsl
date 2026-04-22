@@ -1,0 +1,49 @@
+# Minimal 4-block pre-norm transformer for WGGO Prune IR-rewrite testing.
+# Dimensions tiny to keep CI fast: d_model=32, d_ffn=64, 4 heads x head_dim=8.
+#
+# Parameter naming: array field `blocks: [TinyBlock; 4]` produces
+# `blocks.0.wq`, `blocks.1.wq`, etc. (dot-separated) — matching the
+# `blocks.N.attn` / `blocks.N.ffn` patterns that wggo_graph::infer_role
+# and the WGGO Prune consumer expect.
+
+from nsl.nn import rmsnorm, softmax
+
+model TinyBlock:
+    wq: Tensor = ones([32, 32])
+    wk: Tensor = ones([32, 32])
+    wv: Tensor = ones([32, 32])
+    wo: Tensor = ones([32, 32])
+    w_ffn_up:   Tensor = ones([32, 64])
+    w_ffn_down: Tensor = ones([64, 32])
+    norm_attn_g: Tensor = ones([32])
+    norm_ffn_g:  Tensor = ones([32])
+
+    fn attn(self, h: Tensor) -> Tensor:
+        let x = rmsnorm(h, self.norm_attn_g)
+        let q = x @ self.wq
+        let k = x @ self.wk
+        let v = x @ self.wv
+        let a = softmax(q @ k.T)
+        return (a @ v) @ self.wo
+
+    fn ffn(self, h: Tensor) -> Tensor:
+        let x = rmsnorm(h, self.norm_ffn_g)
+        let u = x @ self.w_ffn_up
+        return u @ self.w_ffn_down
+
+    fn forward(self, h: Tensor) -> Tensor:
+        let h1 = h + self.attn(h)
+        let h2 = h1 + self.ffn(h1)
+        return h2
+
+model TinyTransformer:
+    blocks: [TinyBlock; 4] = TinyBlock()
+
+    fn forward(self, h: Tensor) -> Tensor:
+        for block in self.blocks:
+            h = block.forward(h)
+        return h
+
+let m = TinyTransformer()
+let x = ones([1, 16, 32])
+let y = m.forward(x)
