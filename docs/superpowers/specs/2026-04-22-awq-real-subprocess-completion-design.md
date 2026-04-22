@@ -340,6 +340,8 @@ calibration: forward pass emitted but no observations declared.
 
 Compile-time refusal in `emit_and_link_calibration_binary`; `HarnessError::Infrastructure`.
 
+**Defensive invariant, not a user-facing refusal.** §5.4 differs in character from §5.1, §5.2, §5.3, and §5.5 — those four can all fire under realistic user workflows (bad batch shape from drifted fixtures, broken `.nsl` source lacking a forward, unlucky discovery mismatch, forgotten decorator). §5.4's trigger condition ("`needs_forward_pass() == true` ∧ `observe_plan().is_empty()`") is **unreachable under the current hook surface**: both functions derive from the same `requires()` query against the hook, so they cannot return inconsistent results unless a hook's internal implementation has drifted out of sync. This refusal is a regression guard protecting against subprocess runs that execute `model_forward` but silently discard its output — the failure mode the Task 6 revert exhibited (different root cause, same symptom). If this refusal ever fires in production, the bug is in a hook implementation, not in user NSL source.
+
 ### 5.5 Auto-discovery ran but produced zero projections with `@quantize model` present
 
 Trigger: AST contains a `@quantize model` decorator with AWQ config but pre-scan returns an empty DiscoveredProjection vec.
@@ -574,9 +576,9 @@ Implementation is expected to land in four commits plus the Task 6 re-land:
 
 - **Commit A — AST pre-scan (Bonus gap).** Extracts discovery into `pre_scan_awq_projections_from_ast`, wires it into every entry point before `emit_retention_arena`, adds the differential test (§6.3). Train-block `discover_awq_projections` becomes a no-op when `calibration_retention` is already set. All existing tests stay green.
 - **Commit B — Two-object split (Gap 3 scaffolding).** `emit_and_link_calibration_binary` is split into `emit_calibration_model_object` + `emit_calibration_scaffolding_object` + `link_calibration_binary`. Model object is stub-sized at this commit (no model_forward body yet; just the symbol); scaffolding still imports it. Link succeeds; tests still use the observation-free path and stay green. This commit isolates the object-split refactor. **Intentional intermediate state:** between Commit B and Commit C, a hand-run calibration subprocess produces empty sidecars because model_forward is a stub — the end-to-end pipeline does not work yet. Implementers smoke-testing Commit B should expect empty scales and not panic; the end-to-end path becomes live with Commit C's wrapper + loop-body edit. Commit D adds structured refusals on top; Commit E adds the proof via the analytical test.
-- **Commit C — `nsl_calib_model_forward` wrapper + `nsl_tensor_wrap_f32_desc` (Gap 2 + Gap 3 completion).** Implements the wrapper IR emission in `emit_calibration_model_object` and the runtime FFI. Loop-body edit in `emit_calibration_scaffolding_object` adds the `model_forward` call between `batch_at` and reduction. §6.1 unit test green. §6.2 link-step integration test green.
+- **Commit C — `nsl_calib_model_forward` wrapper (Gap 2 + Gap 3 completion).** Implements the wrapper IR emission in `emit_calibration_model_object` using M62's existing `nsl_desc_to_tensor` + `nsl_tensor_free` FFIs via `Linkage::Import` (construct `NslTensorDesc` on a Cranelift stack slot from the ArenaLayout-derived shape, call M62 FFIs to wrap + free). Loop-body edit in `emit_calibration_scaffolding_object` adds the `model_forward` call between `batch_at` and reduction. **No new runtime FFIs.** §6.1 unit test green. §6.2 link-step integration test green.
 - **Commit D — Refusal surface + diagnostics.** Implements §5.1–5.5 three-part errors. Each has a unit test asserting the exact stderr text + a structured diagnostic code.
-- **Commit E (merge gate) — Re-land Task 6 analytical test.** `reference_awq_scales` helper + `end_to_end_real_subprocess_matches_analytical_reference` re-added exactly as the revert removed them. Test passes bit-exact within 1e-6 tolerance. Task 7 stale-comment cleanup included here for hygiene.
+- **Commit E (merge gate) — Re-land Task 6 analytical test.** `reference_awq_scales` helper + `end_to_end_real_subprocess_matches_analytical_reference` re-added exactly as the revert removed them. Test matches the analytical reference within 5e-6 relative tolerance per the §6.4 ULP derivation (not bit-exact — the subprocess runs real f32 matmuls whose reduction order differs from the sequential-summation reference; 5e-6 is the accumulated ULP bound for a K=64 reduction). Task 7 stale-comment cleanup included here for hygiene.
 
 Informative only; implementer splits differently if needed. The only structural requirement: Commit C's §6.1 test cannot pass without Commit B's split landing first.
 
@@ -584,7 +586,7 @@ Informative only; implementer splits differently if needed. The only structural 
 
 ## 10. Success criteria (merge gate)
 
-1. **Commit E's `end_to_end_real_subprocess_matches_analytical_reference` passes within 1e-6 tolerance.** Without this the claim "subprocess produces honest scales" has no evidence. This criterion is the one the Task 6 revert cleared — restoring it closes the loop.
+1. **Commit E's `end_to_end_real_subprocess_matches_analytical_reference` passes within 5e-6 relative tolerance** (per §6.4's ULP derivation; tighter values risk reduction-order flakiness). Without this the claim "subprocess produces honest scales" has no evidence. This criterion is the one the Task 6 revert cleared — restoring it closes the loop.
 2. §6.1 Gap 2 unit test passes: `nsl_calib_model_forward` call appears in loop_body IR between `batch_at` and max-abs reduction.
 3. §6.2 Gap 3 link-step test passes on Linux + Windows.
 4. §6.3 differential test passes: AST pre-scan and in-compile discovery agree on every fixture.
