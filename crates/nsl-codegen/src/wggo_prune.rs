@@ -484,6 +484,58 @@ mod tests {
     }
 
     #[test]
+    fn ambiguous_pattern_match_refusal() {
+        // Two Adds that both pattern-match against the SAME h_before (v_hb).
+        // E.g., an architecture with both a pre-norm residual branch and a
+        // post-norm residual branch visible at the layer boundary. Both Adds
+        // match the residual pattern; we can't choose one without guessing.
+        //
+        //   op0: Relu v_p  = relu(v_hb)   — v_p is blocks.7.attn.wq (param producer)
+        //   op1: Relu v_b1 = relu(v_p)    — candidate block_output 1
+        //   op2: Relu v_b2 = relu(v_p)    — candidate block_output 2
+        //   op3: Add  v_y1 = v_hb + v_b1  — candidate residual Add 1
+        //   op4: Add  v_y2 = v_hb + v_b2  — candidate residual Add 2 (SAME h_before)
+        //
+        // Expected: AmbiguousPatternMatch with h_before_var = v_hb and
+        // candidate_adds containing {3, 4}.
+
+        let v_hb: VarId = 100;
+        let v_p:  VarId = 200;
+        let v_b1: VarId = 201;
+        let v_b2: VarId = 202;
+        let v_y1: VarId = 300;
+        let v_y2: VarId = 310;
+
+        let ops = vec![
+            op_unary(0, v_p,  v_hb, PrimalOp::Relu),
+            op_unary(1, v_b1, v_p,  PrimalOp::Relu),
+            op_unary(2, v_b2, v_p,  PrimalOp::Relu),
+            op_add  (3, v_y1, v_hb, v_b1),             // Add(h_before=v_hb, block_output=v_b1)
+            op_add  (4, v_y2, v_hb, v_b2),             // Add(h_before=v_hb, block_output=v_b2)
+        ];
+        let wengert = mk_wengert(
+            ops, v_y1,
+            &[(v_hb, "h_before"), (v_p, "blocks.7.attn.wq")],
+        );
+        let layer = mk_prune_layer(7, "blocks.7.attn");
+        let weight_map = WeightMap::default();
+
+        match plan_rewrite(&wengert, &layer, &weight_map) {
+            PlanResult::Refused(PruneRefusal::AmbiguousPatternMatch {
+                layer_name, h_before_var, candidate_adds, ..
+            }) => {
+                assert_eq!(layer_name, "blocks.7.attn");
+                assert_eq!(h_before_var, v_hb, "both Adds share the same h_before");
+                assert_eq!(candidate_adds.len(), 2, "expected 2 candidate Adds");
+                assert!(candidate_adds.contains(&3) && candidate_adds.contains(&4),
+                    "expected candidates {{3, 4}}; got {candidate_adds:?}");
+            }
+            PlanResult::Ok(plan) => panic!("expected AmbiguousPatternMatch, got Ok({plan:?})"),
+            PlanResult::Refused(other) => panic!("expected AmbiguousPatternMatch, got: {other:?}"),
+        }
+    }
+
+    #[test]
     fn no_residual_add_refusal() {
         // Closure: 3 Relu ops, NO Add anywhere. Non-residual architecture
         // (e.g., SSM/Mamba-style layer at the sub-block level).
