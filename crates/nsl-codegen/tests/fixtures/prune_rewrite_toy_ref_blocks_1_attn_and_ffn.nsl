@@ -1,0 +1,54 @@
+# Reference: blocks.1.attn AND blocks.1.ffn both pruned to identity.
+# After the WGGO Prune IR rewrite, both sub-blocks of blocks.1 are replaced
+# by identity skips: the entire block.1 becomes h → h (pass-through).
+# blocks.0, blocks.2, blocks.3 are unchanged.
+
+from nsl.nn import rmsnorm, softmax
+
+model TinyBlock:
+    wq: Tensor = ones([32, 32])
+    wk: Tensor = ones([32, 32])
+    wv: Tensor = ones([32, 32])
+    wo: Tensor = ones([32, 32])
+    w_ffn_up:   Tensor = ones([32, 64])
+    w_ffn_down: Tensor = ones([64, 32])
+    norm_attn_g: Tensor = ones([32])
+    norm_ffn_g:  Tensor = ones([32])
+
+    fn attn(self, h: Tensor) -> Tensor:
+        let x = rmsnorm(h, self.norm_attn_g)
+        let q = x @ self.wq
+        let k = x @ self.wk
+        let v = x @ self.wv
+        let a = softmax(q @ k.T)
+        return (a @ v) @ self.wo
+
+    fn ffn(self, h: Tensor) -> Tensor:
+        let x = rmsnorm(h, self.norm_ffn_g)
+        let u = x @ self.w_ffn_up
+        return u @ self.w_ffn_down
+
+    fn forward(self, h: Tensor) -> Tensor:
+        let h1 = h + self.attn(h)
+        let h2 = h1 + self.ffn(h1)
+        return h2
+
+    # Variant: both attn and ffn pruned → full block is identity
+    fn forward_both_pruned(self, h: Tensor) -> Tensor:
+        let h1 = h
+        let h2 = h1
+        return h2
+
+model TinyTransformer:
+    blocks: [TinyBlock; 4] = TinyBlock()
+
+    fn forward(self, h: Tensor) -> Tensor:
+        let h = self.blocks[0].forward(h)
+        let h = self.blocks[1].forward_both_pruned(h)
+        let h = self.blocks[2].forward(h)
+        let h = self.blocks[3].forward(h)
+        return h
+
+let m = TinyTransformer()
+let x = ones([1, 16, 32])
+let y = m.forward(x)
