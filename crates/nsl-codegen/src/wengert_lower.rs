@@ -394,10 +394,19 @@ fn emit_fused_forward_under_claim(
         builder.ins().iconst(cl_types::I64, one_f32_bits)
     };
 
-    // --- 3. Allocate out tensor (shape = q). ---
-    let out_val = call(compiler, builder, "nsl_tensor_zeros_like", &[q_val])?;
-
-    // Allocate logsumexp on GPU (mirrors compile_flash_attention_call).
+    // --- 3. Allocate out tensor on GPU with the shape of q. ---
+    //
+    // The CSHA fused kernel writes f32 output when
+    // `save_activations_for_backward=true` (the training path this function
+    // emits under — matched by a finalize.rs gate, see comment there).
+    // Allocating on GPU directly is REQUIRED for correctness under this
+    // path: pre-fix we called `nsl_tensor_zeros_like(q_val)` which
+    // inherited q's device (CPU when q came from a stdlib CPU matmul) and
+    // produced a CPU NslTensor*. The FFI's auto-promote path
+    // (`csha_tensor_data_ptr`) then allocated a FRESH GPU buffer for the
+    // kernel to write into, leaving the caller's CPU NslTensor.data
+    // unchanged (= zeros). Downstream MSE read the CPU zeros as the
+    // attention output, seeding the entire backward chain with zeros.
     let dim0 = builder.ins().iconst(cl_types::I64, 0);
     let dim1 = builder.ins().iconst(cl_types::I64, 1);
     let dim2 = builder.ins().iconst(cl_types::I64, 2);
@@ -406,6 +415,18 @@ fn emit_fused_forward_under_claim(
     let heads = call(compiler, builder, "nsl_tensor_shape_dim", &[q_val, dim1])?;
     let seq_len = call(compiler, builder, "nsl_tensor_shape_dim", &[q_val, dim2])?;
     let head_dim = call(compiler, builder, "nsl_tensor_shape_dim", &[q_val, dim3])?;
+
+    let cuda_device_for_out = builder.ins().iconst(cl_types::I64, 1);
+    let out_shape = call(compiler, builder, "nsl_list_new", &[])?;
+    call(compiler, builder, "nsl_list_push", &[out_shape, batch])?;
+    call(compiler, builder, "nsl_list_push", &[out_shape, heads])?;
+    call(compiler, builder, "nsl_list_push", &[out_shape, seq_len])?;
+    call(compiler, builder, "nsl_list_push", &[out_shape, head_dim])?;
+    let out_val = call(
+        compiler, builder, "nsl_tensor_zeros_on",
+        &[out_shape, cuda_device_for_out],
+    )?;
+    call(compiler, builder, "nsl_list_free", &[out_shape])?;
 
     let lse_shape = call(compiler, builder, "nsl_list_new", &[])?;
     call(compiler, builder, "nsl_list_push", &[lse_shape, batch])?;
