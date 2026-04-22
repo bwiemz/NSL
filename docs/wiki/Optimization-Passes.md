@@ -167,4 +167,4 @@ Promoted from internal engineering notes. Violations of any of these have caused
 
 ---
 
-*Last structurally verified against commit `e1f7c3c1` on 2026-04-21. If the crate graph or pass order in this page no longer matches reality, open an issue tagged `docs-rot`.*
+*Last structurally verified against commit `45f7f1b1` on 2026-04-21. If the crate graph or pass order in this page no longer matches reality, open an issue tagged `docs-rot`.*
