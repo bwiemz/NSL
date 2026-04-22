@@ -24,16 +24,16 @@
    │ nsl-semantic │  shape/ownership/determinism checks
    └──────┬───────┘
           ▼
-   ┌──────────────┐        ┌────────────────────────────────────┐
-   │ nsl-codegen  │───────►│ Host path: Cranelift IR → native   │
-   │              │        │                                    │
-   │              │──┐     │ ML math path: Wengert list →       │
-   └──────────────┘  │     │ direct PTX (bypasses Cranelift)    │
-                     │     └────────────────────────────────────┘
-                     ▼
-              ┌──────────────┐
-              │  nsl-runtime │  tensor ops, GPU, allocator
-              └──────────────┘
+   ┌──────────────┐                        ┌────────────────────────────────┐
+   │ nsl-codegen  │── Cranelift IR ──────► │ native binary                  │
+   │              │                        │  • machine code                │
+   │              │── PTX text bytes ────► │  • embedded PTX (data section) │
+   └──────┬───────┘                        └──────────────┬─────────────────┘
+          │                                               │ cuModuleLoadData
+          ▼                                               ▼
+    ┌──────────────┐                                ┌──────────────┐
+    │  nsl-runtime │  tensor ops, allocator         │  CUDA driver │  (at runtime)
+    └──────────────┘                                └──────────────┘
 
    ┌──────────────┐   ┌──────────────┐
    │  nsl-errors  │   │   nsl-cli    │  nsl run / build / profile / check
@@ -50,7 +50,7 @@
 | [`nsl-lexer`](../../crates/nsl-lexer/) | Tokenization, indentation handling; depends on `nsl-errors` |
 | [`nsl-parser`](../../crates/nsl-parser/) | Parsing, AST construction, error recovery; depends on `nsl-lexer`, `nsl-ast`, `nsl-errors` |
 | [`nsl-semantic`](../../crates/nsl-semantic/) | Type inference, shape checking, ownership analysis; depends on `nsl-ast`, `nsl-lexer`, `nsl-parser`, `nsl-errors` |
-| [`nsl-codegen`](../../crates/nsl-codegen/) | Cranelift IR + direct PTX emission, optimization passes; depends on all above plus `nsl-runtime` |
+| [`nsl-codegen`](../../crates/nsl-codegen/) | Cranelift IR emission for all functions; separate PTX synthesis pipeline for GPU kernels; optimization passes; depends on all above plus `nsl-runtime` |
 | [`nsl-cli`](../../crates/nsl-cli/) | `nsl run`, `nsl build`, `nsl profile`, `nsl check`; depends on all other crates |
 
 Dependency direction: `nsl-errors` and `nsl-runtime` are the true leaves (nothing they depend on is NSL-internal). Everything else builds upward. `nsl-cli` is the root and pulls in all seven other crates.
@@ -65,7 +65,7 @@ Dependency direction: `nsl-errors` and `nsl-runtime` are the true leaves (nothin
 
 ## GPU layer
 
-NSL binds to NVIDIA CUDA via [cudarc](https://github.com/coreylowman/cudarc) (0.19, dynamic linking). GPU kernels are lowered to **PTX directly, bypassing Cranelift** — the emitter lives in [`crates/nsl-codegen/src/backend_ptx.rs`](../../crates/nsl-codegen/src/backend_ptx.rs). This path is load-bearing — see [Compiler-Pipeline § Stage 4](Compiler-Pipeline.md#stage-4--codegen).
+NSL binds to NVIDIA CUDA via [cudarc](https://github.com/coreylowman/cudarc) (0.19, dynamic linking). Cranelift is the sole function-emission backend; **PTX is synthesized separately and embedded as Cranelift data sections**, then loaded at runtime via `cuModuleLoadData`. The portable PTX emitter lives in [`crates/nsl-codegen/src/backend_ptx.rs`](../../crates/nsl-codegen/src/backend_ptx.rs) (fed by [`kernel_lower.rs`](../../crates/nsl-codegen/src/kernel_lower.rs)); a legacy direct-AST-to-PTX path lives in [`kernel.rs`](../../crates/nsl-codegen/src/kernel.rs) for kernels outside the portable subset. See [Compiler-Pipeline § Stage 4](Compiler-Pipeline.md#stage-4--codegen) for the full picture.
 
 ## Subsystem deep-dives
 
