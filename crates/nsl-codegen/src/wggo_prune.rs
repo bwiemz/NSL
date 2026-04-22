@@ -164,6 +164,17 @@ pub(crate) fn plan_rewrite(
         .filter_map(|(v, name)| name.starts_with(&prefix).then_some(*v))
         .collect();
 
+    // Spec §2.3 precondition #1 / §3.5: if no VarIds match the layer prefix,
+    // the prune target doesn't exist (typo, off-by-one index, or layer not
+    // instantiated in the compiled model).
+    if parameter_var_ids.is_empty() {
+        return PlanResult::Refused(PruneRefusal::EmptyClosure {
+            layer_name: layer.layer_name.clone(),
+            layer_role,
+            prefix,
+        });
+    }
+
     // (c) Compute the data-flow closure.
     let closure_op_ids = compute_closure(wengert, &parameter_var_ids);
 
@@ -532,6 +543,36 @@ mod tests {
             }
             PlanResult::Ok(plan) => panic!("expected AmbiguousPatternMatch, got Ok({plan:?})"),
             PlanResult::Refused(other) => panic!("expected AmbiguousPatternMatch, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn empty_closure_refusal() {
+        // Wengert has parameters for blocks.0.* but user asks to prune blocks.99.attn.
+        // Prefix match returns zero VarIds → EmptyClosure refusal.
+
+        let v_hb: VarId = 100;
+        let v_p:  VarId = 200;
+        let v_y:  VarId = 300;
+
+        let ops = vec![
+            op_unary(0, v_p, v_hb, PrimalOp::Relu),
+            op_add  (1, v_y, v_hb, v_p),
+        ];
+        let wengert = mk_wengert(
+            ops, v_y,
+            &[(v_hb, "h_before"), (v_p, "blocks.0.attn.wq")],
+        );
+        let layer = mk_prune_layer(99, "blocks.99.attn");  // nonexistent layer
+        let weight_map = WeightMap::default();
+
+        match plan_rewrite(&wengert, &layer, &weight_map) {
+            PlanResult::Refused(PruneRefusal::EmptyClosure { layer_name, prefix, .. }) => {
+                assert_eq!(layer_name, "blocks.99.attn");
+                assert_eq!(prefix, "blocks.99.attn.");
+            }
+            PlanResult::Ok(plan) => panic!("expected EmptyClosure, got Ok({plan:?})"),
+            PlanResult::Refused(other) => panic!("expected EmptyClosure, got: {other:?}"),
         }
     }
 
