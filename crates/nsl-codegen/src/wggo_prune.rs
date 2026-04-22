@@ -195,6 +195,104 @@ pub(crate) fn plan_rewrite(
             }
         };
 
+    // Spec §2.3 precondition #2 / §3.1: detect leaks out of the closure.
+    //
+    // A "leak" is any closure op whose result escapes the closure without
+    // going through the residual Add. There are two forms:
+    //
+    //   (a) A non-closure op (other than the residual Add) reads a
+    //       closure op's result.
+    //   (b) wengert.output is a closure op's result AND is not the
+    //       residual Add's h_after_var.
+    //
+    // Prefer to cite layer-N parameter VarIds when the leaked value is one
+    // (matches the spec's "cross-layer parameter sharing" framing); fall
+    // back to the generic closure-op result otherwise.
+    {
+        let closure_set: BTreeSet<OpId> = closure_op_ids.iter().copied().collect();
+
+        // (a) Scan for external readers.
+        for closure_op_id in &closure_op_ids {
+            let closure_op = wengert.ops.iter().find(|o| o.id == *closure_op_id)
+                .expect("closure op id missing from wengert.ops");
+            let result_var = closure_op.result;
+
+            for other_op in &wengert.ops {
+                if closure_set.contains(&other_op.id) { continue; }
+                if other_op.id == residual_add_op_id { continue; }
+                if !other_op.inputs.contains(&result_var) { continue; }
+
+                // Leak detected. Choose citation VarId: prefer the param itself
+                // if the closure op's result is a layer-N param VarId.
+                let (param_name, param_var) = if parameter_var_ids.contains(&result_var) {
+                    (
+                        wengert.var_names.get(&result_var).cloned().unwrap_or_default(),
+                        result_var,
+                    )
+                } else {
+                    // Find a source param (input of this closure op that is in params).
+                    let sibling_param = closure_op.inputs.iter()
+                        .find(|v| parameter_var_ids.contains(v))
+                        .copied();
+                    match sibling_param {
+                        Some(p) => (
+                            wengert.var_names.get(&p).cloned().unwrap_or_default(),
+                            p,
+                        ),
+                        None => (
+                            wengert.var_names.get(&result_var).cloned()
+                                .unwrap_or_else(|| format!("v{result_var}")),
+                            result_var,
+                        ),
+                    }
+                };
+
+                return PlanResult::Refused(PruneRefusal::CrossLayerParam {
+                    layer_name: layer.layer_name.clone(),
+                    layer_role,
+                    param_name,
+                    param_var,
+                    external_consumer: other_op.id,
+                    external_op_kind: format!("{:?}", other_op.op),
+                });
+            }
+        }
+
+        // (b) wengert.output is a closure op's result (and not the residual
+        //     Add's result — which is `h_after_var`).
+        if wengert.output != h_after_var {
+            for closure_op_id in &closure_op_ids {
+                let closure_op = wengert.ops.iter().find(|o| o.id == *closure_op_id)
+                    .expect("closure op id missing from wengert.ops");
+                if closure_op.result == wengert.output {
+                    // Global escape leak.
+                    let sibling_param = closure_op.inputs.iter()
+                        .find(|v| parameter_var_ids.contains(v))
+                        .copied();
+                    let (param_name, param_var) = match sibling_param {
+                        Some(p) => (
+                            wengert.var_names.get(&p).cloned().unwrap_or_default(),
+                            p,
+                        ),
+                        None => (
+                            wengert.var_names.get(&wengert.output).cloned()
+                                .unwrap_or_else(|| format!("v{}", wengert.output)),
+                            wengert.output,
+                        ),
+                    };
+                    return PlanResult::Refused(PruneRefusal::CrossLayerParam {
+                        layer_name: layer.layer_name.clone(),
+                        layer_role,
+                        param_name,
+                        param_var,
+                        external_consumer: closure_op.id,
+                        external_op_kind: format!("{:?} (produces wengert.output)", closure_op.op),
+                    });
+                }
+            }
+        }
+    }
+
     PlanResult::Ok(PruneRewritePlan {
         layer_name: layer.layer_name.clone(),
         layer_role,
@@ -573,6 +671,53 @@ mod tests {
             }
             PlanResult::Ok(plan) => panic!("expected EmptyClosure, got Ok({plan:?})"),
             PlanResult::Refused(other) => panic!("expected EmptyClosure, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cross_layer_param_refusal() {
+        // Layer-7 parameter `v_p` (= blocks.7.attn.wq) is consumed inside the
+        // layer AND by an external Relu whose output escapes to wengert.output.
+        // Pruning the layer would delete the external Relu too, leaving
+        // wengert.output dangling — the compiler must refuse.
+        //
+        //   op0: Relu v_p   = relu(v_hb)    — param producer
+        //   op1: Relu v_b   = relu(v_p)     — in-layer consumer (block_output)
+        //   op2: Add  v_y   = v_hb + v_b    — residual Add (h_after = v_y)
+        //   op3: Relu v_ext = relu(v_p)     — external consumer; its output is wengert.output
+        //
+        // wengert.output = v_ext. Expected: CrossLayerParam refusal pointing at
+        // v_p + op3 (the external consumer).
+
+        let v_hb:  VarId = 100;
+        let v_p:   VarId = 200;  // blocks.7.attn.wq
+        let v_b:   VarId = 201;
+        let v_y:   VarId = 300;
+        let v_ext: VarId = 400;
+
+        let ops = vec![
+            op_unary(0, v_p,   v_hb, PrimalOp::Relu),
+            op_unary(1, v_b,   v_p,  PrimalOp::Relu),     // in-layer
+            op_add  (2, v_y,   v_hb, v_b),                // residual boundary
+            op_unary(3, v_ext, v_p,  PrimalOp::Relu),     // external consumer — CROSS-LAYER LEAK
+        ];
+        let wengert = mk_wengert(
+            ops, v_ext,
+            &[(v_hb, "h_before"), (v_p, "blocks.7.attn.wq")],
+        );
+        let layer = mk_prune_layer(7, "blocks.7.attn");
+        let weight_map = WeightMap::default();
+
+        match plan_rewrite(&wengert, &layer, &weight_map) {
+            PlanResult::Refused(PruneRefusal::CrossLayerParam {
+                layer_name, param_var, external_consumer, ..
+            }) => {
+                assert_eq!(layer_name, "blocks.7.attn");
+                assert_eq!(param_var, v_p, "expected blocks.7.attn.wq VarId");
+                assert_eq!(external_consumer, 3, "expected op3 as external consumer");
+            }
+            PlanResult::Ok(plan) => panic!("expected CrossLayerParam, got Ok({plan:?})"),
+            PlanResult::Refused(other) => panic!("expected CrossLayerParam, got: {other:?}"),
         }
     }
 
