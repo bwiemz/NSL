@@ -86,20 +86,125 @@ pub enum PruneRefusal {
 }
 
 /// Entry point. Dry-run-then-commit: validates all decisions first; applies
-/// mutations only if all pass. On refusal, `wengert` is unchanged.
+/// mutations only if all pass. On refusal, `wengert` is unchanged and
+/// `rewrites` is empty.
 ///
 /// See spec §5.3 for the three-phase contract.
 pub fn run(
-    _wengert: &mut WengertList,
-    _applied_plan: &AppliedPlan,
-    _weight_map: &WeightMap,
+    wengert: &mut WengertList,
+    applied_plan: &AppliedPlan,
+    weight_map: &WeightMap,
 ) -> PruneRewriteResult {
-    // Stub: Phase 1/2/3 land in Tasks 4–13.
+    use crate::wggo_dp::LayerDecision;
+
+    // Phase 1: validate each Prune decision without mutating wengert.
+    let mut plans: Vec<PruneRewritePlan> = Vec::new();
+    let mut refusals: Vec<PruneRefusal> = Vec::new();
+    for layer in &applied_plan.layers {
+        if !matches!(layer.coarse, LayerDecision::Prune) {
+            continue;
+        }
+        match plan_rewrite(wengert, layer, weight_map) {
+            PlanResult::Ok(plan) => plans.push(plan),
+            PlanResult::Refused(refusal) => refusals.push(refusal),
+        }
+    }
+
+    // Phase 1b: cross-plan conflict detection (spec §3.7). Two plans
+    // conflict if they claim overlapping OpIds (same ops would be deleted
+    // twice) OR target the same h_after_var (VarId aliasing undefined).
+    if refusals.is_empty() {
+        'outer: for i in 0..plans.len() {
+            for j in (i + 1)..plans.len() {
+                let a = &plans[i];
+                let b = &plans[j];
+                let a_ops: BTreeSet<OpId> = a.closure_op_ids.iter().copied().collect();
+                let b_ops: BTreeSet<OpId> = b.closure_op_ids.iter().copied().collect();
+                let overlap: Vec<OpId> = a_ops.intersection(&b_ops).copied().collect();
+                if !overlap.is_empty() {
+                    refusals.push(PruneRefusal::ConflictingPruneDecisions {
+                        decision_a: a.layer_name.clone(),
+                        decision_b: b.layer_name.clone(),
+                        reason: format!(
+                            "closures overlap on ops: {:?} (same ops would be deleted by both rewrites)",
+                            overlap
+                        ),
+                    });
+                    break 'outer;
+                }
+                if a.h_after_var == b.h_after_var {
+                    refusals.push(PruneRefusal::ConflictingPruneDecisions {
+                        decision_a: a.layer_name.clone(),
+                        decision_b: b.layer_name.clone(),
+                        reason: format!(
+                            "both rewrites target the same h_after VarId {:?}; aliasing is undefined",
+                            a.h_after_var
+                        ),
+                    });
+                    break 'outer;
+                }
+            }
+        }
+    }
+
+    // Phase 2: early-return on any refusal. Wengert stays untouched.
+    if !refusals.is_empty() {
+        return PruneRewriteResult {
+            rewrites: Vec::new(),
+            refusals,
+            pruned_forward_var_ids: BTreeSet::new(),
+            ops_deleted: 0,
+        };
+    }
+
+    // Phase 3: commit all plans. Captures pruned VarIds BEFORE the mutation
+    // so we can return them to the caller for WRGA / source-AD handoff.
+    let mut rewrites: Vec<PruneRewrite> = Vec::with_capacity(plans.len());
+    let mut pruned_forward_var_ids: BTreeSet<VarId> = BTreeSet::new();
+    let mut ops_deleted: usize = 0;
+    for plan in plans {
+        // Capture pruned VarIds BEFORE the mutation (apply_rewrite will
+        // delete ops and lose this info).
+        let mut removed_vars: Vec<VarId> = wengert.ops.iter()
+            .filter(|o| plan.closure_op_ids.contains(&o.id))
+            .map(|o| o.result)
+            .collect();
+        removed_vars.push(plan.h_after_var);
+        for v in removed_vars {
+            pruned_forward_var_ids.insert(v);
+        }
+
+        let rewrite = apply_rewrite(wengert, plan);
+        ops_deleted += rewrite.closure_ops.len() + 1; // +1 for the residual Add
+        rewrites.push(rewrite);
+    }
+
     PruneRewriteResult {
-        rewrites: Vec::new(),
+        rewrites,
         refusals: Vec::new(),
-        pruned_forward_var_ids: BTreeSet::new(),
-        ops_deleted: 0,
+        pruned_forward_var_ids,
+        ops_deleted,
+    }
+}
+
+/// Phase 3 mutation — STUB for Task 11. Task 12 replaces this body with
+/// actual op deletion + VarId repointing + Add removal.
+///
+/// Until Task 12 lands, this function builds a `PruneRewrite` record without
+/// touching `wengert`. The three-phase run() contract's behavior is visible
+/// (plans validated, refusals emitted, rewrites recorded), but the Wengert
+/// list is NOT actually mutated yet.
+fn apply_rewrite(
+    _wengert: &mut WengertList,
+    plan: PruneRewritePlan,
+) -> PruneRewrite {
+    PruneRewrite {
+        layer_name: plan.layer_name,
+        layer_role: plan.layer_role,
+        h_before_var: plan.h_before_var,
+        h_after_var: plan.h_after_var,
+        residual_add_op: plan.residual_add_op_id,
+        closure_ops: plan.closure_op_ids,
     }
 }
 
@@ -754,6 +859,86 @@ mod tests {
             PlanResult::Ok(plan) => panic!("expected WholeBlockUnsupported, got Ok({plan:?})"),
             PlanResult::Refused(other) => panic!("expected WholeBlockUnsupported, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn conflicting_decisions_refusal() {
+        // Two prune decisions whose closures would overlap on the same OpIds.
+        //
+        // Setup: one Wengert list with parameters for blocks.7.attn AND for
+        // blocks.7.attn.wq (a more specific prefix that matches the same
+        // param VarId). Both layers' closures will therefore overlap.
+        //
+        //   op0: Relu v_p  = relu(v_hb)    — v_p named "blocks.7.attn.wq"
+        //   op1: Relu v_b  = relu(v_p)
+        //   op2: Add  v_y  = v_hb + v_b    — residual
+        //
+        // Decision A: prune "blocks.7.attn"   → prefix "blocks.7.attn."    → matches v_p
+        // Decision B: prune "blocks.7.attn.wq" → prefix "blocks.7.attn.wq." → matches no vars (empty closure)
+        //
+        // Actually, construction (b) hits EmptyClosure first. We need DISTINCT
+        // prefixes that both successfully plan and share OpIds.
+        //
+        // Better setup: use two var names that share a common prefix:
+        //   v_p1  named "blocks.7.attn.wq"  — matches prefix "blocks.7.attn."
+        //   v_p2  named "blocks.7.attn.wk"  — matches prefix "blocks.7.attn."
+        // Decision A: prune "blocks.7.attn"   → matches v_p1 AND v_p2
+        // Decision B: prune "blocks.7.attn"   → same prefix (same layer twice in plan)
+        //
+        // Actually the SAME prefix twice is the clearest conflict — two plan
+        // entries both trying to delete the same ops.
+
+        let v_hb: VarId = 100;
+        let v_p:  VarId = 200;   // blocks.7.attn.wq
+        let v_b:  VarId = 201;
+        let v_y:  VarId = 300;
+
+        let ops = vec![
+            op_unary(0, v_p, v_hb, PrimalOp::Relu),
+            op_unary(1, v_b, v_p,  PrimalOp::Relu),
+            op_add  (2, v_y, v_hb, v_b),
+        ];
+        let mut wengert = mk_wengert(
+            ops,
+            v_y,
+            &[(v_hb, "h_before"), (v_p, "blocks.7.attn.wq")],
+        );
+
+        // Plan with two prune decisions whose closures overlap (same layer name
+        // — they'd both claim the same closure ops).
+        let plan = AppliedPlan {
+            layers: vec![
+                mk_prune_layer(7, "blocks.7.attn"),
+                mk_prune_layer(70, "blocks.7.attn"),
+            ],
+            total_us: 0.0,
+            peak_memory_bytes: 0,
+        };
+
+        let result = run(&mut wengert, &plan, &WeightMap::default());
+
+        // Expect at least one ConflictingPruneDecisions refusal.
+        let found_conflict = result.refusals.iter()
+            .any(|r| matches!(r, PruneRefusal::ConflictingPruneDecisions { .. }));
+        assert!(
+            found_conflict,
+            "expected a ConflictingPruneDecisions refusal; got refusals: {:?}",
+            result.refusals,
+        );
+
+        // Dry-run invariant (spec §5.3 Phase 2): on refusal, wengert is unchanged.
+        assert_eq!(
+            wengert.ops.len(), 3,
+            "wengert should be untouched on refusal (spec §5.3 Phase 2); still has {} ops",
+            wengert.ops.len(),
+        );
+
+        // And result.rewrites must be empty per the dry-run contract.
+        assert_eq!(
+            result.rewrites.len(), 0,
+            "expected empty rewrites on refusal; got {}",
+            result.rewrites.len(),
+        );
     }
 
     #[test]
