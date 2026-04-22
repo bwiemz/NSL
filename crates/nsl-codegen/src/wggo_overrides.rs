@@ -177,14 +177,16 @@ pub fn collect_prune_diagnostics(
     applied
         .layers
         .iter()
-        // Spec §3.6 + Task 2: sub-block prune decisions (name ends in `.attn` or
-        // `.ffn`) are handled by `wggo_prune::run()` and are NOT surfaced here.
-        // This function now diagnoses ONLY whole-block prune (LayerRole::Block),
-        // which remains unimplemented in v1.
+        // Spec §3.6 + Task 2: this function now surfaces only whole-block prune
+        // decisions. Sub-block prune decisions (Attention / Ffn) flow through
+        // `wggo_prune::run()`. Role classification is delegated to
+        // `wggo_graph::infer_role` so all consumers use the same authority.
         .filter(|l| {
             matches!(l.coarse, LayerDecision::Prune)
-                && !l.layer_name.ends_with(".attn")
-                && !l.layer_name.ends_with(".ffn")
+                && matches!(
+                    crate::wggo_graph::infer_role(&l.layer_name),
+                    crate::wggo_graph::LayerRole::Block
+                )
         })
         .map(|l| OverrideDiagnostic {
             layer_index: l.layer_index,
@@ -373,7 +375,27 @@ mod tests {
     }
 
     #[test]
-    fn prune_not_implemented_reason_string_is_stable() {
+    fn collect_prune_diagnostics_excludes_sub_block_layers() {
+        // Spec §3.6 + Task 2: sub-block prune decisions (Attention / Ffn role)
+        // are routed through wggo_prune::run() and must NOT be surfaced here.
+        // Only whole-block prune (LayerRole::Block) appears in this diagnostic.
+        let plan = AppliedPlan {
+            layers: vec![
+                layer("blocks.3.attn", 0, CoarseDecision::Prune),
+                layer("blocks.3.ffn",  1, CoarseDecision::Prune),
+                layer("blocks.3",      2, CoarseDecision::Prune),
+            ],
+            total_us: 30.0,
+            peak_memory_bytes: 0,
+        };
+        let diags = collect_prune_diagnostics(&plan);
+        // Only the whole-block layer (blocks.3) should appear.
+        assert_eq!(diags.len(), 1, "expected 1 diagnostic for whole-block only; got {}", diags.len());
+        assert_eq!(diags[0].layer_name, "blocks.3");
+    }
+
+    #[test]
+    fn whole_block_prune_not_implemented_reason_string_is_stable() {
         // The reason string is part of the externally-observable stderr
         // format `[prune] layer:N name=<N> wggo-override-rejected ...
         // reason=<S>` which future tools (decision explainer, CI log
