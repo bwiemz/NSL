@@ -1172,18 +1172,16 @@ impl AdjointGenerator {
                 vec![y_bar, pred, target],
             ),
 
-            // --- L1 backward for reduction='sum': d/d(pred) = sign(pred - target) * grad_output ---
-            // For reduction='mean', the user's NSL code divides by N before loss,
-            // which propagates 1/N through grad_output automatically.
-            AdjointExpr::L1Backward(y_bar, pred, target) => {
-                let diff = self.emit_op(PrimalOp::Sub, vec![pred, target]);
-                let zero = self.emit_constant(0.0);
-                let pos_cond = self.emit_op(PrimalOp::Condition(CompareKind::Gt), vec![diff, zero]);
-                let one = self.emit_constant(1.0);
-                let neg_one = self.emit_constant(-1.0);
-                let sign = self.emit_op(PrimalOp::Select, vec![pos_cond, one, neg_one]);
-                self.emit_op(PrimalOp::Mul, vec![y_bar, sign])
-            }
+            // --- L1 backward: d/d(pred_i) = grad_output * sign(pred_i - target_i) / N ---
+            // Same intercept pattern as MSE: the forward `PrimalOp::L1Loss` lowers to
+            // `mean(|pred - target|)` (global mean over N=numel(pred), scalar out), so
+            // backward must apply the /N factor or gradients come out N× too large.
+            // Delegated to `nsl_l1_backward` so N can be read at runtime from the
+            // pred tensor header without plumbing shape info through the Wengert list.
+            AdjointExpr::L1Backward(y_bar, pred, target) => self.emit_op(
+                PrimalOp::Passthrough("l1_backward".into()),
+                vec![y_bar, pred, target],
+            ),
 
             // --- Attention backward: per-component extraction from fused kernel ---
             // Each component (dQ=0, dK=1, dV=2) is extracted via a dedicated op
