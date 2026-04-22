@@ -24,6 +24,7 @@ use crate::wggo_graph::LayerRole;
 /// Outcome of `run()`. Either `rewrites` is populated and `refusals` is empty
 /// (all prune decisions applied), or `refusals` is populated and `rewrites`
 /// is empty (any refusal → nothing applied; `wengert` is unchanged).
+#[derive(Debug)]
 pub struct PruneRewriteResult {
     pub rewrites: Vec<PruneRewrite>,
     pub refusals: Vec<PruneRefusal>,
@@ -32,6 +33,7 @@ pub struct PruneRewriteResult {
 }
 
 /// Record of one layer successfully pruned.
+#[derive(Debug)]
 pub struct PruneRewrite {
     pub layer_name: String,
     pub layer_role: LayerRole,
@@ -42,6 +44,7 @@ pub struct PruneRewrite {
 }
 
 /// A refusal. One variant per precondition failure enumerated in spec §3.
+#[derive(Debug)]
 pub enum PruneRefusal {
     CrossLayerParam {
         layer_name: String,
