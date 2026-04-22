@@ -7,7 +7,7 @@ use nsl_codegen::wggo_overrides::OverrideRejectReason;
 #[test]
 fn prune_refusal_variants_exist() {
     // Each variant should construct (unit-style, no fields — we'll use
-    // these as discriminants for the structural test assertions Task 14
+    // these as discriminants for the structural test assertions Task 15
     // wires up).
     let _ = OverrideRejectReason::PruneCrossLayerParam;
     let _ = OverrideRejectReason::PruneNoResidualAdd;

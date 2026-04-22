@@ -4302,10 +4302,7 @@ impl Compiler<'_> {
                         // Placeholder refusal emission — Task 15 upgrades this with
                         // format_refusal + structured diagnostic_code attachment.
                         for refusal in &wggo_prune_result.refusals {
-                            eprintln!(
-                                "[prune] refusal (task3-stub): {:?}",
-                                std::mem::discriminant(refusal)
-                            );
+                            eprintln!("[prune] refusal (task3-stub): {refusal:?}");
                         }
                         return Err(crate::error::CodegenError::new(
                             "wggo_prune: one or more prune decisions refused; see [prune] stderr lines",
@@ -4313,6 +4310,8 @@ impl Compiler<'_> {
                     }
                     // Success path: emit observable markers so Task 14 integration tests
                     // can distinguish "rewrite applied" from "no rewrite".
+                    // Placeholder — Task 15 upgrades to spec §6.1 format:
+                    // [prune] layer=N name=... role=... applied=true closure_size=K ops_deleted=K residual_add_op=ID
                     for rewrite in &wggo_prune_result.rewrites {
                         eprintln!("[prune] applied (task3-stub): layer={}", rewrite.layer_name);
                     }
