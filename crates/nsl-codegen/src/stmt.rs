@@ -4323,7 +4323,7 @@ impl Compiler<'_> {
                         let line = crate::wggo_prune::format_success_stderr(
                             rewrite,
                             layer_index,
-                            wggo_prune_result.ops_deleted,
+                            rewrite.ops_deleted,  // per-rewrite, not aggregate
                         );
                         eprintln!("{line}");
                     }

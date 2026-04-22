@@ -41,6 +41,10 @@ pub struct PruneRewrite {
     pub h_after_var: VarId,
     pub residual_add_op: OpId,
     pub closure_ops: Vec<OpId>,
+    /// Ops removed from wengert by this rewrite (closure_ops.len() + 1 for
+    /// the residual Add). Tracked per-rewrite to enable spec §6.1 stderr
+    /// emission without ambiguity on multi-rewrite plans.
+    pub ops_deleted: usize,
 }
 
 /// A refusal. One variant per precondition failure enumerated in spec §3.
@@ -175,7 +179,7 @@ pub fn run(
         }
 
         let rewrite = apply_rewrite(wengert, plan);
-        ops_deleted += rewrite.closure_ops.len() + 1; // +1 for the residual Add
+        ops_deleted += rewrite.ops_deleted;
         rewrites.push(rewrite);
     }
 
@@ -229,6 +233,7 @@ fn apply_rewrite(
     wengert.var_names.retain(|v, _| surviving_var_ids.contains(v) || *v == wengert.output);
     wengert.var_types.retain(|v, _| surviving_var_ids.contains(v) || *v == wengert.output);
 
+    let ops_deleted = plan.closure_op_ids.len() + 1; // +1 for the residual Add
     PruneRewrite {
         layer_name: plan.layer_name,
         layer_role: plan.layer_role,
@@ -236,6 +241,7 @@ fn apply_rewrite(
         h_after_var: plan.h_after_var,
         residual_add_op: plan.residual_add_op_id,
         closure_ops: plan.closure_op_ids,
+        ops_deleted,
     }
 }
 

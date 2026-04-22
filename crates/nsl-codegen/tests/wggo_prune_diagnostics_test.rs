@@ -123,6 +123,7 @@ fn success_stderr_format_matches_spec() {
         h_after_var: 202,
         residual_add_op: 42,
         closure_ops: vec![10, 11, 12, 13],
+        ops_deleted: 5,  // 4 closure ops + 1 residual Add
     };
     let line = format_success_stderr(&rewrite, /*layer_index=*/ 7, /*ops_deleted=*/ 5);
     assert!(line.contains("layer=7"));
@@ -134,4 +135,39 @@ fn success_stderr_format_matches_spec() {
     assert!(line.contains("residual_add_op=42"));
     // Separator convention: key=value, no colons.
     assert!(!line.contains(":"), "format should use = not : ; got {line}");
+}
+
+#[test]
+fn multi_rewrite_stderr_reports_per_rewrite_ops_deleted_not_aggregate() {
+    // Regression: stmt.rs previously passed wggo_prune_result.ops_deleted
+    // (aggregate) to format_success_stderr for each rewrite, so multi-prune
+    // plans reported identical (combined) op counts on every line.
+    //
+    // This test verifies per-rewrite ops_deleted is the source of truth.
+    let rewrite_a = PruneRewrite {
+        layer_name: "blocks.1.attn".into(),
+        layer_role: LayerRole::Attention,
+        h_before_var: 100,
+        h_after_var: 110,
+        residual_add_op: 9,
+        closure_ops: vec![1, 2, 3],
+        ops_deleted: 4,  // 3 + 1
+    };
+    let rewrite_b = PruneRewrite {
+        layer_name: "blocks.2.ffn".into(),
+        layer_role: LayerRole::Ffn,
+        h_before_var: 200,
+        h_after_var: 220,
+        residual_add_op: 19,
+        closure_ops: vec![11, 12, 13, 14, 15],
+        ops_deleted: 6,  // 5 + 1
+    };
+    let line_a = format_success_stderr(&rewrite_a, 1, rewrite_a.ops_deleted);
+    let line_b = format_success_stderr(&rewrite_b, 2, rewrite_b.ops_deleted);
+    assert!(line_a.contains("ops_deleted=4"), "line_a expected ops_deleted=4; got: {line_a}");
+    assert!(line_b.contains("ops_deleted=6"), "line_b expected ops_deleted=6; got: {line_b}");
+    // If a caller accidentally passes the aggregate (10) to both, both lines
+    // would contain ops_deleted=10 — catch that.
+    assert!(!line_a.contains("ops_deleted=10"));
+    assert!(!line_b.contains("ops_deleted=10"));
 }
