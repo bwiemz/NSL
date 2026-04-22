@@ -62,17 +62,17 @@ The memory planner runs **after** `compile_user_functions` and **before** `compi
 
 The optimization passes that operate on the `WengertList` run inside `compile_train_block` (invoked from `compile_main`). The order, as read from [`crates/nsl-codegen/src/stmt.rs`](../../crates/nsl-codegen/src/stmt.rs), is:
 
-1. **Source AD extraction** — `WengertExtractor::extract_stmts` builds the `WengertList`.
-2. **Calibration** — optional; runs the calibration harness and populates `calibration_sidecar` if `--calibration-data` is set. Feeds gradient-importance scores to WGGO.
-3. **WGGO** — `wggo::run_on_wengert_with_weights`; consumes the `WengertList` and emits a `WggoPlan` + `AppliedPlan`. Stashes `WggoOverrides` for all downstream passes.
-4. **CSHA** — `csha::run_on_wengert`; consumes the `WengertList` + `WggoOverrides`; emits a `CshaPlan` and bridges it into kernel-site annotations (`last_csha_bridge`).
-5. **WRGA** — `invoke_wrga_if_enabled`; consumes the `WengertList`; runs dead-gradient elimination (`wrga_prune`), rank allocation (`wrga_roofline`), memory planning (`wrga_memory`), and fusion decisions (`wrga_fusion`).
-6. **CPDT** — `invoke_cpdt_if_enabled`; consumes the `AppliedPlan` from WGGO. **CPDT is a no-op unless WGGO produced a plan first.**
-7. **Source-AD adjoint generation + lowering** — `AdjointGenerator` rewrites the pruned `WengertList` into an adjoint program; `wengert_lower` lowers it to Cranelift IR.
-8. **FASE** — runs per-layer inside `compile_train_block` when `accumulation > 1`. Produces a `FasePlan` that rewrites how gradients accumulate and how the optimizer step fires.
+1. **FASE planning** — `fase::plan` / `fase::plan_with_overrides` is called **first**, before source AD, using `wggo_overrides` stashed by a prior WGGO run (or `None` on a fresh compile). Produces a `FasePlan` describing accumulation mode, update rule, and two-phase clip structure. FASE codegen (applying the plan) fires later in the same function.
+2. **Source AD extraction** — `WengertExtractor::extract_stmts` builds the `WengertList`.
+3. **Calibration** — optional; runs the calibration harness and populates `calibration_sidecar` if `--calibration-data` is set. Feeds gradient-importance scores to WGGO.
+4. **WGGO** — `wggo::run_on_wengert_with_weights`; consumes the `WengertList` and emits a `WggoPlan` + `AppliedPlan`. Stashes `WggoOverrides` for all downstream passes (and for the NEXT compile's FASE planning).
+5. **CSHA** — `csha::run_on_wengert`; consumes the `WengertList` + `WggoOverrides`; emits a `CshaPlan` and bridges it into kernel-site annotations (`last_csha_bridge`).
+6. **WRGA** — `invoke_wrga_if_enabled`; consumes the `WengertList`; runs dead-gradient elimination (`wrga_prune`), rank allocation (`wrga_roofline`), memory planning (`wrga_memory`), and fusion decisions (`wrga_fusion`).
+7. **CPDT** — `invoke_cpdt_if_enabled`; consumes the `AppliedPlan` from WGGO. **CPDT is a no-op unless WGGO produced a plan first.**
+8. **Source-AD adjoint generation + lowering** — `AdjointGenerator` rewrites the pruned `WengertList` into an adjoint program; `wengert_lower` lowers it to Cranelift IR.
 9. **Memory planner (M36)** — runs after all user-function bodies are compiled, before `compile_main`. See above.
 
-**Pass ordering is load-bearing.** CSHA receives WGGO's `AppliedPlan` (via `WggoOverrides`) so per-layer fusion-level decisions from WGGO are honoured — or rejected with a diagnostic — by CSHA. CPDT hard-depends on WGGO: if `--wggo` is absent, `cpdt_plan` remains `None`. FASE must run inside the train-block loop (after CSHA and WRGA have committed their kernel plans) because it rewrites the per-step accumulation buffer layout that CSHA and WRGA may have already annotated.
+**Pass ordering is load-bearing.** FASE planning reads `wggo_overrides` from the compiler state, which is set by a prior WGGO run — on a fresh first-pass compile, FASE falls back to `fase::plan` (no overrides). CSHA receives WGGO's `AppliedPlan` (via `WggoOverrides`) so per-layer fusion-level decisions from WGGO are honoured — or rejected with a diagnostic — by CSHA. CPDT hard-depends on WGGO: if `--wggo` is absent, `cpdt_plan` remains `None`. The memory planner (M36) must run after `compile_user_functions` and before `compile_main`; reversing this order means the slab-initialization call is emitted before the plan is computed.
 
 ## Per-pass descriptions
 
@@ -90,7 +90,7 @@ Design specs: [`docs/superpowers/specs/2026-04-14-fase-deferred-codegen-integrat
 
 Given a `train` block configuration (optimizer, gradient accumulation count, clipping setting), `fase::plan` produces a `FasePlan` that the backward-codegen stage consumes. The plan describes: (1) whether to rewrite the backward at all (active only when `accumulation > 1`); (2) whether to run in **Deferred** mode (first-moment accumulation) or **Full** mode (standard gradient buffer, used when the optimizer does not match FASE invariants, e.g. Lion); (3) the mathematical update rule for the chosen optimizer, already specialised to the accumulation count; (4) the two-phase structure when `grad_clip` is enabled. The driver is pure — no state, no I/O — and produces the same output given the same inputs. PTX emission for the fused backward is handled by `fase_optimizer.rs` and `fase_memory.rs`.
 
-Fires: **train-block backward only**, when `accumulation > 1`. Forward-only compilation and inference are unaffected.
+Fires: **train-block only** (both planning and codegen run inside `compile_train_block`). The plan is a no-op (`FaseMode::Full` with N=1 scale) when `accumulation == 1`. Forward-only compilation and inference are unaffected.
 
 ---
 
