@@ -2,7 +2,7 @@
 
 # Development Setup
 
-Get a working NSL build in under 30 minutes. For PR process (fork, branch, commit format, review), see [`CONTRIBUTING.md`](../../CONTRIBUTING.md).
+Get a working NSL build. First `--release` build takes 10–30 minutes depending on hardware; incremental builds are under a minute. For PR process (fork, branch, commit format, review), see [`CONTRIBUTING.md`](../../CONTRIBUTING.md).
 
 ## Prerequisites
 
@@ -53,7 +53,7 @@ The following subcommands are verified from `crates/nsl-cli/src/main.rs`:
 - **`nsl run main.nsl`** — compiles the source to a temp binary in the system temp directory (`%TEMP%` on Windows / `$TMPDIR` on Unix) and executes it immediately. Does **not** JIT PTX at launch; the full frontend+codegen pipeline runs first, then the resulting native binary is spawned.
   - `--profile-memory` — writes `memory_profile.json` on exit
   - `--profile-kernels` — writes `kernel_profile.json` on exit
-  - `--profile` — enables all profilers and merges output into `profile.json`
+  - `--profile` — enables all profilers and merges output into `profile.json` (or `<stem>.nsl-profile.json` when `--monitor` is also active)
   - `--monitor` — activates the health monitor for train programs (auto-detects `train` block)
   - `--inspect` — activates `@inspect` decorator hooks; dumps tensor stats to `.nsl-inspect/`
   - `--cuda-sync` — forces synchronous CUDA launches (better error attribution, slower)
@@ -79,7 +79,7 @@ The following subcommands are verified from `crates/nsl-cli/src/main.rs`:
 - **`nsl export main.nsl`** — export a model to ONNX or checkpoint to safetensors
 - **`nsl convert`** — convert between checkpoint formats (`.nslm` ↔ `.safetensors`)
 - **`nsl init <name>`** — scaffold a new NSL project
-- **`nsl zk`** — M55 ZK inference circuit operations (`stats`, `prove`, `verify`)
+- **`nsl zk <subcommand>`** — M55 ZK inference circuit operations. Canonical forms: `nsl zk stats`, `nsl zk prove`, `nsl zk verify`. (Top-level `nsl stats`/`nsl prove`/`nsl verify` also exist as aliases — prefer the `zk` prefix for clarity.)
 - **`nsl tokenize`** — train a BPE tokenizer from source files
 
 ## IDE
@@ -115,7 +115,7 @@ nsl run main.nsl --profile
 # Writes profile.json (merged memory + kernel trace)
 ```
 
-Load `profile.json` in [`chrome://tracing/`](chrome://tracing/) or [Perfetto UI](https://ui.perfetto.dev/). Shows per-op timing, GPU kernel launches, and memory allocations as recorded by the runtime.
+Load `profile.json` in [`chrome://tracing/`](chrome://tracing/) or [Perfetto UI](https://ui.perfetto.dev/). Shows GPU kernel launches (when CUDA is active), memory allocation/free events, and any explicit trace spans as recorded by the runtime.
 
 ### `nsl run --monitor` — train-loop health monitor
 
@@ -126,6 +126,8 @@ When `--monitor` is passed for a program with a `train` block, the CLI auto-dete
 Source: [`crates/nsl-codegen/src/profiling/memory_timeline.rs`](../../crates/nsl-codegen/src/profiling/memory_timeline.rs).
 
 Renders an ASCII staircase showing how HBM slabs are packed across training steps. **The target is 0 MB/step allocation growth.** A flat plateau means aliasing is correct; a rising slope means the slab plan missed an opportunity and the allocator is leaking.
+
+This visualizes the static slab plan from the compiler, not runtime allocation. To detect runtime leaks, set `NSL_MEMSTATS=1` or `NSL_PROFILE_MEMORY=1` and inspect actual allocator behavior.
 
 ```bash
 # Activate via nsl profile --memory
@@ -183,8 +185,8 @@ The following `NSL_*` variables are read by the compiler or runtime at process s
 | `NSL_DEBUG_SOURCE_AD_OWNED` | `nsl-codegen` | Log source-AD ownership checks |
 | `NSL_AUTOTUNE_VERBOSE` | `nsl-codegen` | Print autotune candidate timing as it runs |
 | `NSL_AUTOTUNE_FALLBACK` | `nsl-codegen` | Force autotune to fall back to the default kernel |
-| `NSL_PROFILE_MEMORY` | `nsl-runtime` | Runtime memory profiler; writes `memory_profile.json` |
-| `NSL_PROFILE_KERNELS` | `nsl-runtime` | Runtime kernel profiler; writes `kernel_profile.json` |
+| `NSL_PROFILE_MEMORY` | `nsl-runtime` | Runtime memory profiler; writes `memory_profile.json` (or merges into `profile.json` if `--profile` flag is used) |
+| `NSL_PROFILE_KERNELS` | `nsl-runtime` | Runtime kernel profiler; writes `kernel_profile.json` (or merges into `profile.json` if `--profile` flag is used) |
 | `NSL_GPU_MEM_REPORT` | `nsl-runtime` | Print GPU memory report on program exit |
 | `NSL_GPU_MEM_LIMIT` | `nsl-runtime` | Cap the caching allocator's GPU memory budget (bytes) |
 | `NSL_MEMSTATS` | `nsl-runtime` | Print caching-allocator statistics on exit |
