@@ -49,9 +49,25 @@ fn backward_kernel_segment_masked_causal_32_32_32() {
         ptx.contains("segment_ids_ptr"),
         "param block must declare segment_ids_ptr"
     );
+    // Post-Blackwell-fix: seg_smem is embedded at the TAIL of the extern
+    // shmem[] allocation (the launcher passes `backward_total_bytes + 4096`
+    // as shared_mem_bytes; the last 4096 bytes hold segment_ids).  A
+    // separate `.shared .align 4 .b8 seg_smem[4096]` declaration
+    // alongside `.extern .shared shmem[]` compiled cleanly on ptxas but
+    // fired CUDA_ERROR_ILLEGAL_ADDRESS at runtime on sm_120 (RTX 5070
+    // Ti).  The structural evidence that the 4096-byte region is
+    // reserved is the `%seg_base = %shmem_base + bwd_total` setup,
+    // which only appears when segment_masked is active.  The comment
+    // tail `seg_smem starts here` is also pinned so a future refactor
+    // that silently drops the setup is caught by test failure.
     assert!(
-        ptx.contains("seg_smem[4096]"),
-        "must declare 4096-byte seg_smem buffer"
+        ptx.contains("%seg_base"),
+        "backward must set up %seg_base (tail-of-shmem seg_smem region)"
+    );
+    assert!(
+        ptx.contains("seg_smem starts here"),
+        "backward %seg_base setup must be annotated so the seg_smem \
+         tail-embedding convention is self-documenting in emitted PTX"
     );
     assert!(
         ptx.contains("BW_PCA_LOAD_LOOP"),
