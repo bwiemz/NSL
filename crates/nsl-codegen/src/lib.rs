@@ -114,6 +114,7 @@ pub mod wggo_weight_analysis;
 pub mod wggo_weight_analysis_cache;
 pub mod wggo_weight_analysis_nslweights;
 pub mod wggo_overrides;
+pub mod wggo_prune;
 pub use wggo_overrides::{
     OverrideDiagnostic, OverrideRejectReason, PerLayerOverride, WggoOverrides,
 };
