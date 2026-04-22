@@ -18,7 +18,7 @@ base64 = "0.22"
 once_cell = "1"
 memmap2 = "0.9"
 rand = "0.8"
-cudarc = { version = "0.19.4", default-features = false, features = ["driver", "cuda-version-from-build-system", "dynamic-linking"], optional = true }
+cudarc = { version = "0.19.4", default-features = false, features = ["driver", "cublas", "cuda-version-from-build-system", "dynamic-linking"], optional = true }
 safetensors = { version = "0.4" }
 hf-hub = { version = "0.3", optional = true }
 prost = { version = "0.13", optional = true }
@@ -33,3 +33,10 @@ default = []
 cuda = ["dep:cudarc"]
 interop = ["dep:hf-hub", "dep:prost", "dep:half", "dep:regex-lite"]
 test-hooks = []
+# Force cuBLAS to use `CUBLAS_PEDANTIC_MATH` (strict f32) as the default math
+# mode instead of `CUBLAS_DEFAULT_MATH` (which enables TF32 tensor cores on
+# sm_80+). Per spec 2026-04-21-matmul-cublas-swap-design §9 this is the
+# compile-time opt-out for workloads that require strict f32 summation bounds.
+# Runtime env vars `NSL_MATMUL_PEDANTIC=1` / `NSL_MATMUL_TF32=1` take
+# precedence over this Cargo feature.
+strict-matmul = []

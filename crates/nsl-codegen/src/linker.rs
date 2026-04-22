@@ -266,15 +266,18 @@ fn link_gcc_multi(
     }
 
     // Link CUDA driver library if available (Linux: lib64/, Windows: lib/x64/)
+    // Also link cuBLAS (added 2026-04-21 for the nsl_matmul_f32 cublasSgemm swap).
     if let Ok(cuda_path) = std::env::var("CUDA_PATH") {
         let cuda_lib = PathBuf::from(&cuda_path).join("lib64");
         let cuda_lib_win = PathBuf::from(&cuda_path).join("lib").join("x64");
         if cuda_lib.is_dir() {
             cmd.arg(format!("-L{}", cuda_lib.display()));
             cmd.arg("-lcuda");
+            cmd.arg("-lcublas");
         } else if cuda_lib_win.is_dir() {
             cmd.arg(format!("-L{}", cuda_lib_win.display()));
             cmd.arg("-lcuda");
+            cmd.arg("-lcublas");
         }
     }
 
@@ -334,12 +337,15 @@ fn link_msvc_multi(
         "/GUARD:NO",
     ]);
 
-    // Link CUDA driver library if available (needed when runtime has cuda feature)
+    // Link CUDA driver + cuBLAS libraries if available (needed when runtime
+    // has cuda feature).  cublas.lib added 2026-04-21 for the nsl_matmul_f32
+    // cublasSgemm swap.
     if let Ok(cuda_path) = std::env::var("CUDA_PATH") {
         let cuda_lib = PathBuf::from(&cuda_path).join("lib").join("x64");
         if cuda_lib.is_dir() {
             cmd.arg(format!("/LIBPATH:{}", cuda_lib.display()));
             cmd.arg("cuda.lib");
+            cmd.arg("cublas.lib");
         }
     }
 
@@ -701,16 +707,19 @@ fn link_shared_gcc(
         cmd.args(["-Wl,-platform_version,macos,11.0,11.0"]);
     }
 
-    // Link CUDA driver library if available (Linux: lib64/, Windows: lib/x64/)
+    // Link CUDA driver + cuBLAS libraries if available (Linux: lib64/, Windows: lib/x64/).
+    // cublas added 2026-04-21 for the nsl_matmul_f32 cublasSgemm swap.
     if let Ok(cuda_path) = std::env::var("CUDA_PATH") {
         let cuda_lib = PathBuf::from(&cuda_path).join("lib64");
         let cuda_lib_win = PathBuf::from(&cuda_path).join("lib").join("x64");
         if cuda_lib.is_dir() {
             cmd.arg(format!("-L{}", cuda_lib.display()));
             cmd.arg("-lcuda");
+            cmd.arg("-lcublas");
         } else if cuda_lib_win.is_dir() {
             cmd.arg(format!("-L{}", cuda_lib_win.display()));
             cmd.arg("-lcuda");
+            cmd.arg("-lcublas");
         }
     }
 
@@ -804,12 +813,14 @@ fn link_shared_msvc(
         "/NODEFAULTLIB:LIBCMT",
     ]);
 
-    // Link CUDA driver library if available
+    // Link CUDA driver + cuBLAS libraries if available.  cublas.lib added
+    // 2026-04-21 for the nsl_matmul_f32 cublasSgemm swap.
     if let Ok(cuda_path) = std::env::var("CUDA_PATH") {
         let cuda_lib = PathBuf::from(&cuda_path).join("lib").join("x64");
         if cuda_lib.is_dir() {
             cmd.arg(format!("/LIBPATH:{}", cuda_lib.display()));
             cmd.arg("cuda.lib");
+            cmd.arg("cublas.lib");
         }
     }
 
