@@ -12,7 +12,7 @@ Every acronym, keyword, and decorator you will see in NSL code, specs, or PRs. O
 Build-time per-channel weight quantization that scales by observed activation magnitudes; produces INT4/INT8 weights with minimal perplexity loss. See [`spec/06-quantization.nsl.md`](../../spec/06-quantization.nsl.md); implementation in `crates/nsl-codegen/src/calibration/`.
 
 ### <a id="ccr"></a>CCR — Common-kernel Combination Rewriting
-IR pass that merges semantically identical kernel invocations (same op, same shape, same arguments) into a single dispatch before FASE and WGGO fire. See [CCR.pdf](../research/CCR.pdf); fires as the first optimization pass in `compile_quant_block`.
+Planned future pass — no implementation yet. See [`CCR.pdf`](../research/CCR.pdf) for the research concept.
 
 ### <a id="cep"></a>CEP — Compilation-Evaluated Pruning
 Compile-time head-pruning pass: the oracle, importance scorer, model rewriter, and greedy search are all applied before the binary is emitted — pruned heads generate no code at all. Implementation: `crates/nsl-codegen/src/cep.rs`; decisions surfaced via `nsl profile --explain-wggo`.

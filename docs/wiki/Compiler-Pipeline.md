@@ -75,7 +75,7 @@ The resulting PTX text is embedded as a Cranelift data section inside the compil
 
 For M54 (unikernel) targets, [`unikernel.rs`](../../crates/nsl-codegen/src/unikernel.rs) drives an alternate emission path that skips the host runtime linkage.
 
-Between AST and codegen, a sequence of IR rewrite passes runs: CCR → FASE → WGGO → subsystem-specific (CSHA, WRGA). These are described in [Optimization-Passes](Optimization-Passes.md).
+Between AST and codegen, a sequence of IR rewrite passes runs: FASE (planning) → source AD → WGGO → subsystem-specific (CSHA, WRGA, CPDT). These are described in [Optimization-Passes](Optimization-Passes.md).
 
 Start reading: [`lib.rs:750`](../../crates/nsl-codegen/src/lib.rs#L750) — `pub fn compile_with_options(source: &str, opts: &CompileOptions) -> Result<Vec<u8>, CodegenError>` is the top-level entry point that runs all semantic-to-binary work.
 
