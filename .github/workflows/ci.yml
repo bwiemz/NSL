@@ -22,6 +22,17 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      # `rust-toolchain.toml` pins 1.95.0, which rustup auto-installs on
+      # first cargo invocation. `dtolnay/rust-toolchain@stable` installs
+      # clippy for `stable`, but the pinned 1.95.0 toolchain ships without
+      # clippy on Windows — so add it explicitly for the pinned toolchain
+      # too. (Linux/macOS happen to pick up clippy from the stable install
+      # via toolchain hash collision, but Windows-msvc does not.)
+      - name: Install clippy for pinned toolchain
+        run: rustup component add clippy --toolchain 1.95.0
 
       - name: Cache cargo
         uses: actions/cache@v4
