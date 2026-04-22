@@ -49,4 +49,4 @@ Then pick a milestone from [Roadmap](Roadmap.md) or an open issue.
 
 ---
 
-*Last structurally verified against commit `bc8d4ec9` on 2026-04-21. If the crate graph or pass order in this page no longer matches reality, open an issue tagged `docs-rot`.*
+*Last structurally verified against commit `9a1b512e` on 2026-04-21. If the crate graph or pass order in this page no longer matches reality, open an issue tagged `docs-rot`.*
