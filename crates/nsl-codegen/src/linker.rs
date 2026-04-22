@@ -258,11 +258,26 @@ fn link_gcc_multi(
         cmd.arg("-lm");
         cmd.arg("-lpthread");
         cmd.arg("-ldl");
+        // nsl-runtime (with `interop`) pulls in `hf-hub` → `native-tls` →
+        // `openssl-sys`. Cargo threads the resulting `-lssl -lcrypto` link
+        // args into its own test binaries, but `nsl build`'s standalone
+        // linker invocation does not see them — so NSL-built binaries fail
+        // to resolve `SSL_CTX_ctrl` etc. unless we add them here.
+        cmd.arg("-lssl");
+        cmd.arg("-lcrypto");
     }
 
     // macOS: inject platform version since Cranelift object files lack LC_BUILD_VERSION
     if cfg!(target_os = "macos") {
         cmd.args(["-Wl,-platform_version,macos,11.0,11.0"]);
+        // `native-tls` uses the Security framework on macOS (via the
+        // `security-framework` crate); the symbols end up in
+        // `libnsl_runtime.a` but Cargo's link directives don't reach this
+        // standalone link step, so we add them explicitly.
+        cmd.args([
+            "-framework", "Security",
+            "-framework", "CoreFoundation",
+        ]);
     }
 
     // Link CUDA driver library if available (Linux: lib64/, Windows: lib/x64/)
@@ -696,6 +711,9 @@ fn link_shared_gcc(
         cmd.arg("-lm");
         cmd.arg("-lpthread");
         cmd.arg("-ldl");
+        // native-tls → openssl-sys (see `link_gcc_multi` comment).
+        cmd.arg("-lssl");
+        cmd.arg("-lcrypto");
         // Set SONAME so the dynamic linker can identify the library
         if let Some(filename) = output_path.file_name() {
             cmd.arg(format!("-Wl,-soname,{}", filename.to_string_lossy()));
@@ -705,6 +723,11 @@ fn link_shared_gcc(
     // macOS: inject platform version since Cranelift object files lack LC_BUILD_VERSION
     if cfg!(target_os = "macos") {
         cmd.args(["-Wl,-platform_version,macos,11.0,11.0"]);
+        // native-tls → security-framework (see `link_gcc_multi` comment).
+        cmd.args([
+            "-framework", "Security",
+            "-framework", "CoreFoundation",
+        ]);
     }
 
     // Link CUDA driver + cuBLAS libraries if available (Linux: lib64/, Windows: lib/x64/).
