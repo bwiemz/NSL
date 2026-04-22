@@ -1,4 +1,16 @@
 use nsl_runtime::inspect::ffi::{nsl_inspect_record_stats, nsl_inspect_set_dir};
+use std::sync::{Mutex, MutexGuard, OnceLock};
+
+// `nsl_inspect_set_dir` mutates a process-global path; tests running in
+// parallel race on it (one test's record_stats lands in another test's
+// temp dir and the path-exists assertion fails). Serialize the tests that
+// touch the global so the suite is safe under `cargo test` without needing
+// `--test-threads=1`.
+fn serial_lock() -> MutexGuard<'static, ()> {
+    static SERIAL_GUARD: OnceLock<Mutex<()>> = OnceLock::new();
+    let m = SERIAL_GUARD.get_or_init(|| Mutex::new(()));
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 fn set_tmp_dir() -> tempfile::TempDir {
     let tmp = tempfile::tempdir().unwrap();
@@ -12,6 +24,7 @@ fn set_tmp_dir() -> tempfile::TempDir {
 
 #[test]
 fn record_stats_writes_expected_file_layout() {
+    let _g = serial_lock();
     let dir = set_tmp_dir();
     let stats: [f64; 6] = [1.5, 0.3, -2.0, 4.5, 0.0, 0.0];
     let name = "h0";
@@ -27,6 +40,7 @@ fn record_stats_writes_expected_file_layout() {
 
 #[test]
 fn record_stats_null_pointer_returns_error() {
+    let _g = serial_lock();
     let _dir = set_tmp_dir();
     let rc = unsafe { nsl_inspect_record_stats(std::ptr::null(), 1, std::ptr::null(), 0) };
     assert_ne!(rc, 0);
@@ -34,6 +48,7 @@ fn record_stats_null_pointer_returns_error() {
 
 #[test]
 fn record_stats_creates_dir_if_missing() {
+    let _g = serial_lock();
     let outer = tempfile::tempdir().unwrap();
     let nested = outer.path().join("a").join("b");
     let pstr = nested.to_str().unwrap();
