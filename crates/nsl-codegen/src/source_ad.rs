@@ -227,7 +227,7 @@ impl AdjointGenerator {
                             let is_smoke = cfg.head_dim == 32
                                 && cfg.block_q == 32
                                 && cfg.block_kv == 32
-                                && cfg.csha.as_ref().map_or(false, |c| c.d_model == 32);
+                                && cfg.csha.as_ref().is_some_and(|c| c.d_model == 32);
 
                             // One event per chain.
                             if fused_event_emitted.insert(chain_idx) {

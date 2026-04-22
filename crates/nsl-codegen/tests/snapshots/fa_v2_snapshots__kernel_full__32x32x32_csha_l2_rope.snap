@@ -1,5 +1,6 @@
 ---
 source: crates/nsl-codegen/tests/fa_v2_snapshots.rs
+assertion_line: 247
 expression: s
 ---
 .version 8.7
@@ -74,11 +75,11 @@ expression: s
     .reg .u64 %rd_wt, %rd_wt_idx, %rd_wt_off, %rd_wt_src, %rd_wt_dst;
     .reg .b16 %h_wt;
     .reg .pred %p_wt;
-    .reg .u64 %q_smem_base, %k_smem_base, %v_smem_base;
     .reg .u64 %x_norm_base, %warp_row;
     .reg .u64 %q_tile, %k_tile, %v_tile;
     .reg .u64 %rd_wk_chk, %rd_wv_chk;
     .reg .pred %p_wk_fused, %p_wv_fused;
+    .reg .u64 %q_smem_base, %k_smem_base, %v_smem_base;
     .reg .u64 %rd_wo_ptr;
     .reg .pred %p_wo_null, %p_x_null;
     .reg .u64 %rd_rope_cos, %rd_rope_sin, %rd_rope_addr;
@@ -3838,11 +3839,11 @@ V2_LOOP_PV_OVER_K_0:
     mul.lo.u64 %rd48, %rd48, %rd6;            // * seq_len
     add.u64 %rd48, %rd48, %rd47;              // + q_row_global
     mul.lo.u64 %rd48, %rd48, %rd7;            // * head_dim
-    shl.b64 %rd48, %rd48, 1;                  // * 2 bytes f16
+    shl.b64 %rd48, %rd48, 1;                  // * 2 bytes f16 (inference)
     add.u64 %rd48, %rd3, %rd48;               // out_base_global
-    cvt.rn.f16.f32 %h0, %f48;
     cvt.u64.u32 %rd49, %lane;
-    shl.b64 %rd49, %rd49, 1;                  // * 2 bytes
+    cvt.rn.f16.f32 %h0, %f48;
+    shl.b64 %rd49, %rd49, 1;                  // * 2 bytes f16
     add.u64 %rd49, %rd48, %rd49;              // out_base + d*2
     st.global.b16 [%rd49], %h0;
     // LSE store (lane 0 only, null-guarded)
@@ -3860,7 +3861,7 @@ V2_LOOP_PV_OVER_K_0:
     shl.b64 %rd50, %rd50, 2;
     add.u64 %rd50, %logsumexp_base, %rd50;
     @%p1 st.global.f32 [%rd50], %lse;
-    // CSHA A5: Wo output projection stub (spec R2 — separate kernel path)
+    // CSHA A5: Wo output projection stub (spec R2 -- separate kernel path)
     // d_model=32, q_tile_iter=0
     ld.param.u64 %rd_wo_ptr, [csha_wo_ptr];
     setp.eq.u64 %p_wo_null, %rd_wo_ptr, 0;
@@ -3952,11 +3953,11 @@ V2_LOOP_PV_OVER_K_1:
     mul.lo.u64 %rd48, %rd48, %rd6;            // * seq_len
     add.u64 %rd48, %rd48, %rd47;              // + q_row_global
     mul.lo.u64 %rd48, %rd48, %rd7;            // * head_dim
-    shl.b64 %rd48, %rd48, 1;                  // * 2 bytes f16
+    shl.b64 %rd48, %rd48, 1;                  // * 2 bytes f16 (inference)
     add.u64 %rd48, %rd3, %rd48;               // out_base_global
-    cvt.rn.f16.f32 %h0, %f48;
     cvt.u64.u32 %rd49, %lane;
-    shl.b64 %rd49, %rd49, 1;                  // * 2 bytes
+    cvt.rn.f16.f32 %h0, %f48;
+    shl.b64 %rd49, %rd49, 1;                  // * 2 bytes f16
     add.u64 %rd49, %rd48, %rd49;              // out_base + d*2
     st.global.b16 [%rd49], %h0;
     // LSE store (lane 0 only, null-guarded)
@@ -3974,7 +3975,7 @@ V2_LOOP_PV_OVER_K_1:
     shl.b64 %rd50, %rd50, 2;
     add.u64 %rd50, %logsumexp_base, %rd50;
     @%p1 st.global.f32 [%rd50], %lse;
-    // CSHA A5: Wo output projection stub (spec R2 — separate kernel path)
+    // CSHA A5: Wo output projection stub (spec R2 -- separate kernel path)
     // d_model=32, q_tile_iter=1
     ld.param.u64 %rd_wo_ptr, [csha_wo_ptr];
     setp.eq.u64 %p_wo_null, %rd_wo_ptr, 0;
@@ -4066,11 +4067,11 @@ V2_LOOP_PV_OVER_K_2:
     mul.lo.u64 %rd48, %rd48, %rd6;            // * seq_len
     add.u64 %rd48, %rd48, %rd47;              // + q_row_global
     mul.lo.u64 %rd48, %rd48, %rd7;            // * head_dim
-    shl.b64 %rd48, %rd48, 1;                  // * 2 bytes f16
+    shl.b64 %rd48, %rd48, 1;                  // * 2 bytes f16 (inference)
     add.u64 %rd48, %rd3, %rd48;               // out_base_global
-    cvt.rn.f16.f32 %h0, %f48;
     cvt.u64.u32 %rd49, %lane;
-    shl.b64 %rd49, %rd49, 1;                  // * 2 bytes
+    cvt.rn.f16.f32 %h0, %f48;
+    shl.b64 %rd49, %rd49, 1;                  // * 2 bytes f16
     add.u64 %rd49, %rd48, %rd49;              // out_base + d*2
     st.global.b16 [%rd49], %h0;
     // LSE store (lane 0 only, null-guarded)
@@ -4088,7 +4089,7 @@ V2_LOOP_PV_OVER_K_2:
     shl.b64 %rd50, %rd50, 2;
     add.u64 %rd50, %logsumexp_base, %rd50;
     @%p1 st.global.f32 [%rd50], %lse;
-    // CSHA A5: Wo output projection stub (spec R2 — separate kernel path)
+    // CSHA A5: Wo output projection stub (spec R2 -- separate kernel path)
     // d_model=32, q_tile_iter=2
     ld.param.u64 %rd_wo_ptr, [csha_wo_ptr];
     setp.eq.u64 %p_wo_null, %rd_wo_ptr, 0;
@@ -4180,11 +4181,11 @@ V2_LOOP_PV_OVER_K_3:
     mul.lo.u64 %rd48, %rd48, %rd6;            // * seq_len
     add.u64 %rd48, %rd48, %rd47;              // + q_row_global
     mul.lo.u64 %rd48, %rd48, %rd7;            // * head_dim
-    shl.b64 %rd48, %rd48, 1;                  // * 2 bytes f16
+    shl.b64 %rd48, %rd48, 1;                  // * 2 bytes f16 (inference)
     add.u64 %rd48, %rd3, %rd48;               // out_base_global
-    cvt.rn.f16.f32 %h0, %f48;
     cvt.u64.u32 %rd49, %lane;
-    shl.b64 %rd49, %rd49, 1;                  // * 2 bytes
+    cvt.rn.f16.f32 %h0, %f48;
+    shl.b64 %rd49, %rd49, 1;                  // * 2 bytes f16
     add.u64 %rd49, %rd48, %rd49;              // out_base + d*2
     st.global.b16 [%rd49], %h0;
     // LSE store (lane 0 only, null-guarded)
@@ -4202,7 +4203,7 @@ V2_LOOP_PV_OVER_K_3:
     shl.b64 %rd50, %rd50, 2;
     add.u64 %rd50, %logsumexp_base, %rd50;
     @%p1 st.global.f32 [%rd50], %lse;
-    // CSHA A5: Wo output projection stub (spec R2 — separate kernel path)
+    // CSHA A5: Wo output projection stub (spec R2 -- separate kernel path)
     // d_model=32, q_tile_iter=3
     ld.param.u64 %rd_wo_ptr, [csha_wo_ptr];
     setp.eq.u64 %p_wo_null, %rd_wo_ptr, 0;
@@ -4294,11 +4295,11 @@ V2_LOOP_PV_OVER_K_4:
     mul.lo.u64 %rd48, %rd48, %rd6;            // * seq_len
     add.u64 %rd48, %rd48, %rd47;              // + q_row_global
     mul.lo.u64 %rd48, %rd48, %rd7;            // * head_dim
-    shl.b64 %rd48, %rd48, 1;                  // * 2 bytes f16
+    shl.b64 %rd48, %rd48, 1;                  // * 2 bytes f16 (inference)
     add.u64 %rd48, %rd3, %rd48;               // out_base_global
-    cvt.rn.f16.f32 %h0, %f48;
     cvt.u64.u32 %rd49, %lane;
-    shl.b64 %rd49, %rd49, 1;                  // * 2 bytes
+    cvt.rn.f16.f32 %h0, %f48;
+    shl.b64 %rd49, %rd49, 1;                  // * 2 bytes f16
     add.u64 %rd49, %rd48, %rd49;              // out_base + d*2
     st.global.b16 [%rd49], %h0;
     // LSE store (lane 0 only, null-guarded)
@@ -4316,7 +4317,7 @@ V2_LOOP_PV_OVER_K_4:
     shl.b64 %rd50, %rd50, 2;
     add.u64 %rd50, %logsumexp_base, %rd50;
     @%p1 st.global.f32 [%rd50], %lse;
-    // CSHA A5: Wo output projection stub (spec R2 — separate kernel path)
+    // CSHA A5: Wo output projection stub (spec R2 -- separate kernel path)
     // d_model=32, q_tile_iter=4
     ld.param.u64 %rd_wo_ptr, [csha_wo_ptr];
     setp.eq.u64 %p_wo_null, %rd_wo_ptr, 0;
@@ -4408,11 +4409,11 @@ V2_LOOP_PV_OVER_K_5:
     mul.lo.u64 %rd48, %rd48, %rd6;            // * seq_len
     add.u64 %rd48, %rd48, %rd47;              // + q_row_global
     mul.lo.u64 %rd48, %rd48, %rd7;            // * head_dim
-    shl.b64 %rd48, %rd48, 1;                  // * 2 bytes f16
+    shl.b64 %rd48, %rd48, 1;                  // * 2 bytes f16 (inference)
     add.u64 %rd48, %rd3, %rd48;               // out_base_global
-    cvt.rn.f16.f32 %h0, %f48;
     cvt.u64.u32 %rd49, %lane;
-    shl.b64 %rd49, %rd49, 1;                  // * 2 bytes
+    cvt.rn.f16.f32 %h0, %f48;
+    shl.b64 %rd49, %rd49, 1;                  // * 2 bytes f16
     add.u64 %rd49, %rd48, %rd49;              // out_base + d*2
     st.global.b16 [%rd49], %h0;
     // LSE store (lane 0 only, null-guarded)
@@ -4430,7 +4431,7 @@ V2_LOOP_PV_OVER_K_5:
     shl.b64 %rd50, %rd50, 2;
     add.u64 %rd50, %logsumexp_base, %rd50;
     @%p1 st.global.f32 [%rd50], %lse;
-    // CSHA A5: Wo output projection stub (spec R2 — separate kernel path)
+    // CSHA A5: Wo output projection stub (spec R2 -- separate kernel path)
     // d_model=32, q_tile_iter=5
     ld.param.u64 %rd_wo_ptr, [csha_wo_ptr];
     setp.eq.u64 %p_wo_null, %rd_wo_ptr, 0;
@@ -4522,11 +4523,11 @@ V2_LOOP_PV_OVER_K_6:
     mul.lo.u64 %rd48, %rd48, %rd6;            // * seq_len
     add.u64 %rd48, %rd48, %rd47;              // + q_row_global
     mul.lo.u64 %rd48, %rd48, %rd7;            // * head_dim
-    shl.b64 %rd48, %rd48, 1;                  // * 2 bytes f16
+    shl.b64 %rd48, %rd48, 1;                  // * 2 bytes f16 (inference)
     add.u64 %rd48, %rd3, %rd48;               // out_base_global
-    cvt.rn.f16.f32 %h0, %f48;
     cvt.u64.u32 %rd49, %lane;
-    shl.b64 %rd49, %rd49, 1;                  // * 2 bytes
+    cvt.rn.f16.f32 %h0, %f48;
+    shl.b64 %rd49, %rd49, 1;                  // * 2 bytes f16
     add.u64 %rd49, %rd48, %rd49;              // out_base + d*2
     st.global.b16 [%rd49], %h0;
     // LSE store (lane 0 only, null-guarded)
@@ -4544,7 +4545,7 @@ V2_LOOP_PV_OVER_K_6:
     shl.b64 %rd50, %rd50, 2;
     add.u64 %rd50, %logsumexp_base, %rd50;
     @%p1 st.global.f32 [%rd50], %lse;
-    // CSHA A5: Wo output projection stub (spec R2 — separate kernel path)
+    // CSHA A5: Wo output projection stub (spec R2 -- separate kernel path)
     // d_model=32, q_tile_iter=6
     ld.param.u64 %rd_wo_ptr, [csha_wo_ptr];
     setp.eq.u64 %p_wo_null, %rd_wo_ptr, 0;
@@ -4636,11 +4637,11 @@ V2_LOOP_PV_OVER_K_7:
     mul.lo.u64 %rd48, %rd48, %rd6;            // * seq_len
     add.u64 %rd48, %rd48, %rd47;              // + q_row_global
     mul.lo.u64 %rd48, %rd48, %rd7;            // * head_dim
-    shl.b64 %rd48, %rd48, 1;                  // * 2 bytes f16
+    shl.b64 %rd48, %rd48, 1;                  // * 2 bytes f16 (inference)
     add.u64 %rd48, %rd3, %rd48;               // out_base_global
-    cvt.rn.f16.f32 %h0, %f48;
     cvt.u64.u32 %rd49, %lane;
-    shl.b64 %rd49, %rd49, 1;                  // * 2 bytes
+    cvt.rn.f16.f32 %h0, %f48;
+    shl.b64 %rd49, %rd49, 1;                  // * 2 bytes f16
     add.u64 %rd49, %rd48, %rd49;              // out_base + d*2
     st.global.b16 [%rd49], %h0;
     // LSE store (lane 0 only, null-guarded)
@@ -4658,7 +4659,7 @@ V2_LOOP_PV_OVER_K_7:
     shl.b64 %rd50, %rd50, 2;
     add.u64 %rd50, %logsumexp_base, %rd50;
     @%p1 st.global.f32 [%rd50], %lse;
-    // CSHA A5: Wo output projection stub (spec R2 — separate kernel path)
+    // CSHA A5: Wo output projection stub (spec R2 -- separate kernel path)
     // d_model=32, q_tile_iter=7
     ld.param.u64 %rd_wo_ptr, [csha_wo_ptr];
     setp.eq.u64 %p_wo_null, %rd_wo_ptr, 0;

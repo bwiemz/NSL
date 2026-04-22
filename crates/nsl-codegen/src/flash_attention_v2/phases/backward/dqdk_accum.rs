@@ -34,7 +34,7 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
     let block_q = config.block_q as u32;
     let block_kv = config.block_kv as u32;
     assert!(
-        head_dim % 4 == 0,
+        head_dim.is_multiple_of(4),
         "dqdk_accum warp-d partition requires head_dim % 4 == 0 (got {head_dim})"
     );
     let d_per_warp = head_dim / 4;

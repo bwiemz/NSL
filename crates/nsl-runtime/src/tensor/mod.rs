@@ -754,7 +754,7 @@ impl NslTensor {
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     (tensor.data as *const u8).add(src_offset * elem_size),
-                    (new_data as *mut u8).add(flat * elem_size),
+                    new_data.add(flat * elem_size),
                     elem_size,
                 );
             }
@@ -1217,7 +1217,7 @@ pub extern "C" fn nsl_tensor_free(tensor_ptr: i64) {
 pub extern "C" fn nsl_tensor_free_if_valid(ptr: i64) {
     if ptr == 0 { return; }
     if (ptr as u64) < 0x10000 { return; }
-    if (ptr as usize) % 8 != 0 { return; }
+    if !(ptr as usize).is_multiple_of(8) { return; }
     let magic = unsafe { *(ptr as *const u32) };
     if magic == TENSOR_MAGIC {
         nsl_tensor_free(ptr);
@@ -1250,7 +1250,7 @@ pub extern "C" fn nsl_tensor_clone_if_valid(ptr: i64) -> i64 {
     if (ptr as u64) < 0x10000 {
         return ptr;
     }
-    if (ptr as usize) % 8 != 0 {
+    if !(ptr as usize).is_multiple_of(8) {
         return ptr;
     }
     let magic = unsafe { *(ptr as *const u32) };
@@ -3109,7 +3109,7 @@ fn collect_params_recursive(base: usize, num_slots: usize, result: i64, depth: u
             let mut found_tensor = false;
             // Quick probe: check if first field is a tensor
             let first_val = unsafe { *probe_ptr };
-            if first_val != 0 && (first_val as u64) >= 0x10000 && (first_val as usize) % 8 == 0 {
+            if first_val != 0 && (first_val as u64) >= 0x10000 && (first_val as usize).is_multiple_of(8) {
                 let inner = first_val as *const NslTensor;
                 if unsafe { (*inner).magic } == TENSOR_MAGIC {
                     found_tensor = true;

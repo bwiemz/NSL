@@ -418,7 +418,7 @@ impl Compiler<'_> {
                         Register::M => m_ptr,
                         Register::V => v_ptr,
                         other => return Err(crate::error::CodegenError::new(
-                            &format!("ScalarMulByBc src must be M or V, got {:?}", other)
+                            format!("ScalarMulByBc src must be M or V, got {:?}", other)
                         )),
                     };
 
@@ -445,7 +445,7 @@ impl Compiler<'_> {
                             v_hat_ptr = Some(out);
                         }
                         other => return Err(crate::error::CodegenError::new(
-                            &format!("ScalarMulByBc dst must be MHat or VHat, got {:?}", other)
+                            format!("ScalarMulByBc dst must be MHat or VHat, got {:?}", other)
                         )),
                     }
                 }

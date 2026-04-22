@@ -379,6 +379,9 @@ fn a4_v2_rope_q_fused_projections_assembles_on_sm75_sm90_sm120() {
     };
     use nsl_codegen::flash_attention_v2::synthesize_flash_attention_ptx_v2;
 
+    // `emit_rope_k_epilogue` currently implements `RopeStyle::Adjacent` only
+    // — HalfSplit support is a follow-up. Pinning Adjacent here keeps the
+    // ptxas-surface test stable against the supported code path.
     let cfg = FlashAttentionConfig {
         block_q: 32,
         block_kv: 32,
@@ -386,7 +389,7 @@ fn a4_v2_rope_q_fused_projections_assembles_on_sm75_sm90_sm120() {
         causal: false,
         paged: false,
         rope_q: true,
-        rope_style: RopeStyle::HalfSplit,
+        rope_style: RopeStyle::Adjacent,
         gqa_group_size: 1,
         tree_mask: false,
         gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras {
@@ -446,6 +449,8 @@ fn a5_v2_fused_output_assembles_on_sm75_sm90_sm120() {
     };
     use nsl_codegen::flash_attention_v2::synthesize_flash_attention_ptx_v2;
 
+    // RopeStyle::Adjacent: same rationale as the A4 test above — the rope_k
+    // epilogue currently only implements Adjacent.
     let cfg = FlashAttentionConfig {
         block_q: 32,
         block_kv: 32,
@@ -453,7 +458,7 @@ fn a5_v2_fused_output_assembles_on_sm75_sm90_sm120() {
         causal: false,
         paged: false,
         rope_q: true,
-        rope_style: RopeStyle::HalfSplit,
+        rope_style: RopeStyle::Adjacent,
         gqa_group_size: 1,
         tree_mask: false,
         gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras {

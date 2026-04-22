@@ -145,7 +145,7 @@ pub fn decide_causal_mask(seq_len: u64, block_kv: u64, enabled: bool) -> CausalM
     }
     if seq_len <= block_kv {
         CausalMaskStrategy::SingleTileStatic
-    } else if seq_len % block_kv == 0 {
+    } else if seq_len.is_multiple_of(block_kv) {
         CausalMaskStrategy::TileAlignedBitmask
     } else {
         CausalMaskStrategy::Dynamic
@@ -161,7 +161,7 @@ pub fn decide_causal_mask(seq_len: u64, block_kv: u64, enabled: bool) -> CausalM
 pub fn decide_gqa(n_heads: u32, n_kv_heads: u32) -> GqaStrategy {
     if n_heads == n_kv_heads || n_kv_heads == 0 {
         GqaStrategy::None
-    } else if n_heads % n_kv_heads == 0 {
+    } else if n_heads.is_multiple_of(n_kv_heads) {
         GqaStrategy::ZeroCopyStride {
             group_size: n_heads / n_kv_heads,
         }

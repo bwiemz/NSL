@@ -9,7 +9,6 @@
 //! 2. The splice point in `expr/mod.rs`: to compute the per-projection offset
 //!    before emitting the `emit_splice_memcpy` call.
 
-use crate::calibration::observation::ProjectionRef;
 use crate::calibration::retention::ArenaLayout;
 use crate::calibration::discovery::DiscoveredProjection;
 
@@ -45,6 +44,7 @@ pub fn build_arena_layout(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::calibration::observation::ProjectionRef;
 
     #[test]
     fn two_projection_arena_sized_on_activations() {

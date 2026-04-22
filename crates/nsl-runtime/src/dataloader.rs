@@ -318,6 +318,7 @@ fn read_flat_value(data: *const c_void, dtype: u16, index: usize) -> i64 {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_simple_batch(
     data: *const c_void,
     data_len: usize,
@@ -331,7 +332,7 @@ fn build_simple_batch(
     has_labels: bool,
 ) -> i64 {
     let total = batch_size * seq_len;
-    let available = if offset < data_len { data_len - offset } else { 0 };
+    let available = data_len.saturating_sub(offset);
     if available == 0 {
         return 0;
     }
@@ -348,7 +349,7 @@ fn build_simple_batch(
     // Padded positions get -100 (ignore_index) so they don't contribute to loss.
     let mut labels_vec = vec![-100i64; total];
     if has_labels {
-        let label_available = if offset < labels_len { labels_len - offset } else { 0 };
+        let label_available = labels_len.saturating_sub(offset);
         let label_read = label_available.min(total);
         for i in 0..label_read {
             labels_vec[i] = read_flat_value(labels, labels_dtype, offset + i);

@@ -115,11 +115,17 @@ fn smem_total_matches_sum_of_regions() {
 }
 
 #[test]
-fn smem_total_under_48kb_for_all_supported() {
+fn smem_total_under_dynamic_budget_for_all_supported() {
+    // The validator now accepts configs up to the 99KB dynamic-SMEM budget
+    // (`SMEM_DYNAMIC_BUDGET_BYTES`) — configs above 48KB use
+    // `cuFuncSetAttribute(MAX_DYNAMIC_SHARED_SIZE_BYTES)` to opt into the
+    // extended pool available on sm_80+. This test just mirrors that cap:
+    // every config `validate_scalar_v2_config` lets through must fit.
+    const DYNAMIC_BUDGET: u32 = 99 * 1024;
     for c in supported_matrix() {
-        assert!(total_bytes(&c) <= 48 * 1024,
-            "SMEM overflow for {:?}: {} bytes",
-            (c.block_q, c.block_kv, c.head_dim), total_bytes(&c));
+        assert!(total_bytes(&c) <= DYNAMIC_BUDGET,
+            "SMEM overflow for {:?}: {} bytes (> {} byte dynamic budget)",
+            (c.block_q, c.block_kv, c.head_dim), total_bytes(&c), DYNAMIC_BUDGET);
     }
 }
 

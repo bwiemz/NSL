@@ -39,7 +39,7 @@ pub fn synthesize_flash_attention_ptx_v2(config: &FlashAttentionConfig) -> Vec<u
     // up to cover the full block_kv-row tile.
     let kv_iters = (config.block_kv as u32).div_ceil(4);
     let slices = (config.head_dim as u32) / 32;
-    let fused_proj = config.csha.as_ref().map_or(false, |c| c.fused_projections);
+    let fused_proj = config.csha.as_ref().is_some_and(|c| c.fused_projections);
 
     // ── CSHA K/V fused-projection pre-passes ──────────────────────────────
     //
@@ -109,7 +109,7 @@ pub fn synthesize_flash_attention_ptx_v2(config: &FlashAttentionConfig) -> Vec<u
         //   Gated on `save_activations_for_backward` at the orchestrator
         //   level to avoid emitting N×"skip" comment lines when saves are
         //   disabled (the shipped-binary common case).
-        if config.csha.as_ref().map_or(false, |c| c.save_activations_for_backward) {
+        if config.csha.as_ref().is_some_and(|c| c.save_activations_for_backward) {
             for kv_iter in 0..kv_iters {
                 phases::csha_hooks::emit_save_activations_subset(
                     &mut ptx, config, kv_iter, phases::csha_hooks::SaveSet::K,
@@ -326,7 +326,7 @@ pub fn synthesize_flash_attention_ptx_v2(config: &FlashAttentionConfig) -> Vec<u
 /// pre-projected K/V via classic k_ptr) the load runs normally.
 fn emit_k_tile_load(ptx: &mut String, config: &FlashAttentionConfig, q_iter: u32) {
     let total_k_elems = (config.block_kv as u32) * (config.head_dim as u32);
-    let fused_k = config.csha.as_ref().map_or(false, |c| c.fused_projections);
+    let fused_k = config.csha.as_ref().is_some_and(|c| c.fused_projections);
 
     ptx.push_str("    // K tile load: 128 threads cooperatively load block_kv*head_dim elems\n");
 
@@ -383,7 +383,7 @@ fn emit_k_tile_load(ptx: &mut String, config: &FlashAttentionConfig, q_iter: u32
 /// HBM load to avoid overwriting the fused result.
 fn emit_v_tile_load(ptx: &mut String, config: &FlashAttentionConfig, q_iter: u32) {
     let total_v_elems = (config.block_kv as u32) * (config.head_dim as u32);
-    let fused_v = config.csha.as_ref().map_or(false, |c| c.fused_projections);
+    let fused_v = config.csha.as_ref().is_some_and(|c| c.fused_projections);
 
     ptx.push_str("    // V tile load: cooperative, reuses K region\n");
 

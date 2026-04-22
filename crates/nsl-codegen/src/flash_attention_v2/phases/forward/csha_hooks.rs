@@ -300,7 +300,7 @@ pub fn emit_matmul_projection(ptx: &mut String, config: &FlashAttentionConfig, q
 /// was null at kernel entry, this is a no-op (the classic `emit_v_tile_load`
 /// path handled V from HBM).
 pub fn emit_v_projection_in_kv_loop(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
-    let fused = config.csha.as_ref().map_or(false, |c| c.fused_projections);
+    let fused = config.csha.as_ref().is_some_and(|c| c.fused_projections);
     if !fused {
         ptx.push_str("    // CSHA V projection (deferred): fused_projections=false, no-op\n");
         return;
@@ -373,9 +373,7 @@ fn emit_warp_per_row_sweep(
             label, slice
         ));
         ptx.push_str("    shl.b64 %rd_wt_off, %rd_wt_off, 2;    // in_dim * 4 bytes (f32)\n");
-        ptx.push_str(&format!(
-            "    add.u64 %rd_wt_src, %x_norm_base, %rd_wt_off;\n"
-        ));
+        ptx.push_str("    add.u64 %rd_wt_src, %x_norm_base, %rd_wt_off;\n");
         // Use f32 register directly — skip the f16 intermediate.
         ptx.push_str(&format!(
             "    ld.global.f32 %f_x_{}_{}, [%rd_wt_src];\n",
@@ -552,7 +550,7 @@ fn emit_kv_prepass_reginit(ptx: &mut String, config: &FlashAttentionConfig, q_ti
 /// Emit the K projection sweep for the K pre-pass (before any S-compute).
 /// Writes K rows for this q_tile_iter's warps into SMEM at kv_offset.
 pub fn emit_k_prepass_sweep(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
-    if !config.csha.as_ref().map_or(false, |c| c.fused_projections) {
+    if !config.csha.as_ref().is_some_and(|c| c.fused_projections) {
         return;
     }
     ptx.push_str(&format!(
@@ -574,7 +572,7 @@ pub fn emit_k_prepass_sweep(ptx: &mut String, config: &FlashAttentionConfig, q_t
 /// Writes Q rows for this q_tile_iter into q_smem (q_offset).
 /// Assumes x has been normalized by the prologue and weight tiles are in SMEM.
 pub fn emit_q_projection_only(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
-    if !config.csha.as_ref().map_or(false, |c| c.fused_projections) {
+    if !config.csha.as_ref().is_some_and(|c| c.fused_projections) {
         return;
     }
     ptx.push_str(&format!(
@@ -595,7 +593,7 @@ pub fn emit_q_projection_only(ptx: &mut String, config: &FlashAttentionConfig, q
 /// Emit the V projection sweep for the V pre-pass (after all S-computes).
 /// Writes V rows for this q_tile_iter's warps into SMEM at kv_offset.
 pub fn emit_v_prepass_sweep(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
-    if !config.csha.as_ref().map_or(false, |c| c.fused_projections) {
+    if !config.csha.as_ref().is_some_and(|c| c.fused_projections) {
         return;
     }
     ptx.push_str(&format!(
@@ -660,7 +658,7 @@ pub fn emit_save_activations_subset(
     let save = config
         .csha
         .as_ref()
-        .map_or(false, |c| c.save_activations_for_backward);
+        .is_some_and(|c| c.save_activations_for_backward);
     if !save {
         ptx.push_str("    // CSHA Tier C save_activations: save_activations=false, no emission\n");
         return;
@@ -670,7 +668,7 @@ pub fn emit_save_activations_subset(
     let fused = config
         .csha
         .as_ref()
-        .map_or(false, |c| c.fused_projections);
+        .is_some_and(|c| c.fused_projections);
 
     ptx.push_str(&format!(
         "    // CSHA Tier C: save post-RoPE activations (q_tile_iter={}, slices/lane={}, set={:?})\n",
@@ -815,11 +813,11 @@ pub(crate) fn emit_save_softmax_state_with_diag(
     q_tile_iter: u32,
     diag: &str,
 ) {
-    let fused = config.csha.as_ref().map_or(false, |c| c.fused_projections);
+    let fused = config.csha.as_ref().is_some_and(|c| c.fused_projections);
     let save = config
         .csha
         .as_ref()
-        .map_or(false, |c| c.save_activations_for_backward);
+        .is_some_and(|c| c.save_activations_for_backward);
     if !fused && !save {
         return;
     }
@@ -998,7 +996,7 @@ pub(crate) fn emit_save_softmax_state_with_diag(
 /// Symmetric to `emit_save_softmax_state`.  Called at the start of the PV-accum
 /// pass for each q_tile_iter.
 pub fn emit_restore_softmax_state(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
-    if !config.csha.as_ref().map_or(false, |c| c.fused_projections) {
+    if !config.csha.as_ref().is_some_and(|c| c.fused_projections) {
         return;
     }
     let save_base = crate::flash_attention_v2::smem_layout::softmax_save_offset(config);
@@ -1042,7 +1040,7 @@ pub fn emit_restore_softmax_state(ptx: &mut String, config: &FlashAttentionConfi
 /// When `fused_output_proj=false` (or `csha=None`) the function is a
 /// complete no-op (emits a comment only).
 pub fn emit_output_projection(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
-    let fused_output = config.csha.as_ref().map_or(false, |c| c.fused_output_proj);
+    let fused_output = config.csha.as_ref().is_some_and(|c| c.fused_output_proj);
     if !fused_output {
         ptx.push_str("    // CSHA A5: fused_output=false, no emission\n");
         return;
@@ -1050,9 +1048,8 @@ pub fn emit_output_projection(ptx: &mut String, config: &FlashAttentionConfig, q
 
     let d_model = config.csha.as_ref().map_or(0, |c| c.d_model);
 
-    ptx.push_str(&format!(
-        "    // CSHA A5: Wo output projection stub (spec R2 — separate kernel path)\n"
-    ));
+    // Keep PTX comments ASCII-only — ptxas rejects UTF-8 bytes like em-dash.
+    ptx.push_str("    // CSHA A5: Wo output projection stub (spec R2 -- separate kernel path)\n");
     ptx.push_str(&format!(
         "    // d_model={d_model}, q_tile_iter={q_tile_iter}\n"
     ));
@@ -1185,7 +1182,7 @@ pub fn emit_rope_k_epilogue(ptx: &mut String, config: &FlashAttentionConfig) {
         ptx.push_str("    // CSHA RoPE K epilogue: rope_q=false or no CSHA, skip\n");
         return;
     }
-    if !config.csha.as_ref().map_or(false, |c| c.fused_projections) {
+    if !config.csha.as_ref().is_some_and(|c| c.fused_projections) {
         ptx.push_str("    // CSHA RoPE K epilogue: fused_projections=false, skip\n");
         return;
     }

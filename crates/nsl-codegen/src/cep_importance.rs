@@ -111,9 +111,9 @@ pub fn head_frobenius(entry: &WeightEntry, head: u32, n_heads: u32) -> f64 {
     let rows = entry.shape[0];
     let cols = entry.shape[1];
     // Heads partition either the row or the column axis — try row first.
-    let (per_head_rows, on_rows) = if rows % n_heads as usize == 0 {
+    let (per_head_rows, on_rows) = if rows.is_multiple_of(n_heads as usize) {
         (rows / n_heads as usize, true)
-    } else if cols % n_heads as usize == 0 {
+    } else if cols.is_multiple_of(n_heads as usize) {
         (cols / n_heads as usize, false)
     } else {
         return 0.0;

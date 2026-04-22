@@ -265,6 +265,11 @@ pub(crate) struct PruneRewritePlan {
     pub(crate) residual_add_op_id: OpId,     // rewritten then deleted
     pub(crate) h_before_var: VarId,
     pub(crate) h_after_var: VarId,
+    // Populated by Phase 1's residual-add resolver; Phase 3 currently
+    // deletes by op-id, but downstream callers (diagnostic rendering,
+    // cross-layer parameter leak detection) read this set — keep it even
+    // though the Phase 3 mutator itself doesn't consume it directly.
+    #[allow(dead_code)]
     pub(crate) parameter_var_ids: std::collections::BTreeSet<VarId>,
 }
 

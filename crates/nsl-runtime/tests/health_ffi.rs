@@ -1,14 +1,26 @@
 //! FFI hook tests for the health monitor.
 //!
-//! NOTE: These tests share a single global `Mutex<HealthCollector>` (see
-//! `health::ffi::COLLECTOR`). They MUST be run with `--test-threads=1` to
-//! avoid cross-test races on the shared collector state.
+//! These tests share a single global `Mutex<HealthCollector>` (see
+//! `health::ffi::COLLECTOR`). Parallel execution races on the collector
+//! state — each test records data and then flushes, and a concurrent test
+//! can overwrite the record-to-flush sequence under that lock. The
+//! `SERIAL_GUARD` below pins one test at a time so the suite is safe under
+//! `cargo test` without needing `--test-threads=1` on the CLI.
 
 use nsl_runtime::health::ffi::{
     nsl_health_flush_snapshot, nsl_health_get_grad_norm_total, nsl_health_get_loss_ema,
     nsl_health_get_loss_ema_slope, nsl_health_get_nan_inf_count_window,
     nsl_health_record_grad_norm, nsl_health_record_loss, nsl_health_record_weight_norm,
 };
+use std::sync::{Mutex, MutexGuard, OnceLock};
+
+fn serial_lock() -> MutexGuard<'static, ()> {
+    static SERIAL_GUARD: OnceLock<Mutex<()>> = OnceLock::new();
+    let m = SERIAL_GUARD.get_or_init(|| Mutex::new(()));
+    // Poisoned-mutex recovery: a prior test's panic shouldn't cascade into
+    // every subsequent test aborting on `unwrap()`.
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 fn flush_to_string() -> String {
     let tmp = tempfile::NamedTempFile::new().unwrap();
@@ -21,6 +33,7 @@ fn flush_to_string() -> String {
 
 #[test]
 fn record_loss_then_flush_writes_json_with_step_and_loss() {
+    let _g = serial_lock();
     nsl_health_record_loss(2.5, 7);
     let json = flush_to_string();
     let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -30,6 +43,7 @@ fn record_loss_then_flush_writes_json_with_step_and_loss() {
 
 #[test]
 fn record_grad_norm_emits_layer_entry() {
+    let _g = serial_lock();
     let path = "m.transformer.h.4.attn.wq";
     let bytes = path.as_bytes();
     unsafe {
@@ -42,12 +56,14 @@ fn record_grad_norm_emits_layer_entry() {
 
 #[test]
 fn flush_to_null_path_returns_zero() {
+    let _g = serial_lock();
     let rc = unsafe { nsl_health_flush_snapshot(std::ptr::null(), 0) };
     assert_eq!(rc, 0);
 }
 
 #[test]
 fn flush_invalid_utf8_returns_2() {
+    let _g = serial_lock();
     let bytes = [0xFFu8, 0xFE, 0xFD];
     let rc = unsafe { nsl_health_flush_snapshot(bytes.as_ptr(), bytes.len()) };
     assert_eq!(rc, 2);
@@ -65,6 +81,7 @@ fn tensor_l2_norm_symbol_exists() {
 
 #[test]
 fn weight_norm_is_init_then_update_round_trips() {
+    let _g = serial_lock();
     let path = "m.l0.w";
     let b = path.as_bytes();
     unsafe {
@@ -79,6 +96,7 @@ fn weight_norm_is_init_then_update_round_trips() {
 
 #[test]
 fn getters_return_finite_values_after_recording() {
+    let _g = serial_lock();
     nsl_health_record_loss(2.0, 1);
     nsl_health_record_loss(2.5, 2);
     let ema = nsl_health_get_loss_ema();

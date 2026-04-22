@@ -183,7 +183,7 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
     }
 
     // DX — hook-managed (emit_drmsnorm phase 2 writes f32 directly).
-    ptx.push_str(&format!("    // -- DX store via [dx_ptr] (hook-managed; null-only guard) --\n"));
+    ptx.push_str("    // -- DX store via [dx_ptr] (hook-managed; null-only guard) --\n");
     ptx.push_str("    setp.eq.u64 %p0, %rd_bwd_dx, 0;\n");
     ptx.push_str(&format!(
         "    @%p0 bra V2_BWD_STORE_DX_SKIP_{q_tile_iter};\n"

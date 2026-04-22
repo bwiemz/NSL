@@ -764,7 +764,7 @@ pub fn format_memory_report(allocs: &[TensorAlloc], plan: &SlabPlan) -> String {
 
     // Top consumers (sorted by size)
     let mut sorted: Vec<&TensorAlloc> = allocs.iter().filter(|a| a.is_plannable()).collect();
-    sorted.sort_by(|a, b| b.size_bytes.cmp(&a.size_bytes));
+    sorted.sort_by_key(|a| std::cmp::Reverse(a.size_bytes));
 
     if !sorted.is_empty() {
         report.push_str("\n  Top consumers:\n");

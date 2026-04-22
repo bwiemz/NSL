@@ -29,7 +29,7 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
     let head_dim = config.head_dim as u32;
     let slices   = head_dim / 32;
     let block_kv = config.block_kv as u32;
-    let fused = config.csha.as_ref().map_or(false, |c| c.fused_projections);
+    let fused = config.csha.as_ref().is_some_and(|c| c.fused_projections);
     // SP slice base offset for this q_tile_iter (same logic as softmax.rs).
     let sp_iter_offset = if fused {
         sp_offset(config) + q_tile_iter * 4 * block_kv * 4

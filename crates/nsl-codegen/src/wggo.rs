@@ -505,7 +505,7 @@ pub fn run_on_wengert_with_weights(
     // Check the sidecar cache first — a hit lets us skip the
     // checkpoint load entirely.
     let cached_report = weights_path
-        .and_then(|p| crate::wggo_weight_analysis_cache::try_load(p));
+        .and_then(crate::wggo_weight_analysis_cache::try_load);
 
     // Load the weights file up front so its lifetime covers the call.
     // Skip the load when the cache hit already carries the scores.

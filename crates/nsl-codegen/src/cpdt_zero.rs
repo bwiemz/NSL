@@ -264,7 +264,7 @@ pub fn evaluate_config(
 /// required.
 fn generate_candidates(cluster: &ClusterSpec) -> Vec<ZeroConfig> {
     let n = cluster.num_gpus.max(1);
-    let divisors: Vec<u32> = (1..=n).filter(|d| n % d == 0).collect();
+    let divisors: Vec<u32> = (1..=n).filter(|d| n.is_multiple_of(*d)).collect();
     let mut out = Vec::new();
     for &s_p in &divisors {
         for &s_g in &divisors {

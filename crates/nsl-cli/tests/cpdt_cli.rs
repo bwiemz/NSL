@@ -13,12 +13,16 @@
 //! source that WGGO can plan over, so we reuse the same inline fixture the
 //! WRGA report CLI tests use, which has a one-layer Linear model + SGD train
 //! block — enough for WGGO to produce an `AppliedPlan` and for CPDT to turn
-//! that into a `CpdtPlan`.
+//! that into a `CpdtPlan`. Since the weight-aware gate (PR #88/#90/#91) now
+//! requires weights for `--cpdt full`, (1) also writes a tiny safetensors
+//! fixture and passes it via `--weights`.
 
 use assert_cmd::prelude::*;
 use predicates::prelude::*;
+use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use tempfile::TempDir;
 
@@ -34,6 +38,20 @@ fn workspace_root() -> PathBuf {
 
 fn stdlib_path() -> PathBuf {
     workspace_root().join("stdlib")
+}
+
+/// Write a minimal valid safetensors file containing one f32 tensor named
+/// `blocks.0.attn.wq.weight`. Mirrors the helper in `cpdt_weights_cli.rs`.
+fn write_tiny_safetensors(path: &Path) {
+    use safetensors::tensor::{serialize, TensorView};
+    use safetensors::Dtype;
+    let bytes: Vec<u8> = 1.0f32.to_le_bytes().to_vec();
+    let mut views: HashMap<String, TensorView<'_>> = HashMap::new();
+    let view = TensorView::new(Dtype::F32, vec![1], bytes.as_slice()).unwrap();
+    views.insert("blocks.0.attn.wq.weight".to_string(), view);
+    let bytes = serialize(&views, &None).unwrap();
+    let mut f = fs::File::create(path).unwrap();
+    f.write_all(&bytes).unwrap();
 }
 
 /// Minimal `@train`-bearing fixture. Mirrors the SRC used by
@@ -61,8 +79,10 @@ train(model = m, epochs = 1):
 fn bare_cpdt_report_enables_full_mode() {
     let tmp = TempDir::new().unwrap();
     let src_path = tmp.path().join("t.nsl");
+    let weights_path = tmp.path().join("weights.safetensors");
     let out_path = tmp.path().join("t_out");
     fs::write(&src_path, SRC).unwrap();
+    write_tiny_safetensors(&weights_path);
 
     let mut cmd = Command::cargo_bin("nsl").unwrap();
     cmd.env("NSL_STDLIB_PATH", stdlib_path());
@@ -78,7 +98,12 @@ fn bare_cpdt_report_enables_full_mode() {
         .arg("auto")
         .arg("--cpdt-report")
         .arg("--cpdt-num-gpus")
-        .arg("4");
+        .arg("4")
+        // Weight-aware gate (PR #88/#90/#91) requires weights for full mode;
+        // supply a minimal safetensors so the decision table lets the build
+        // proceed and CPDT can produce its report.
+        .arg("--weights")
+        .arg(&weights_path);
     cmd.assert()
         .success()
         .stdout(predicate::str::contains("=== CPDT Training Plan ==="))

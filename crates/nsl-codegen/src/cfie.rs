@@ -225,7 +225,7 @@ pub fn run(input: CfieInput) -> CfiePlan {
     // Kernel-launch accounting.
     let baseline = 500u32; // paper §1's "~500-1000 launches/token" figure
     let saved_persistent = (persistent.baseline_launches_per_layer
-        .saturating_sub(persistent.persistent_launches_per_layer)) as u32
+        .saturating_sub(persistent.persistent_launches_per_layer))
         * input.persistent_model.n_layers;
     // Sampling + residual layers: one fused kernel versus six.
     let saved_sampling = if sampling.is_fused() { 5 } else { 0 };

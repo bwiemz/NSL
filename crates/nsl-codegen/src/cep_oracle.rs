@@ -135,7 +135,7 @@ impl ModelSpec {
             if *kv == 0 || self.n_heads[i] == 0 {
                 return Err(format!("layer {i}: n_heads and n_kv_heads must be > 0"));
             }
-            if self.n_heads[i] % *kv != 0 {
+            if !self.n_heads[i].is_multiple_of(*kv) {
                 return Err(format!(
                     "layer {i}: n_heads ({}) must be a multiple of n_kv_heads ({})",
                     self.n_heads[i], kv

@@ -8,8 +8,6 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::{c_void, CStr};
 use std::os::raw::c_char;
-#[cfg(feature = "interop")]
-use std::sync::atomic::Ordering;
 
 use crate::dlpack::DLManagedTensor;
 use crate::tensor::NslTensor;

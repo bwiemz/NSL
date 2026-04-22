@@ -126,7 +126,7 @@ pub extern "C" fn nsl_kv_dequantize_gpu(
     }
 
     let qs = KvQuantScheme::from_i64(scheme);
-    let n_val = n as u64;
+    let _n_val = n as u64;
 
     #[cfg(feature = "cuda")]
     {

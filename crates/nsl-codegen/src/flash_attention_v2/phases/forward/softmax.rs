@@ -12,7 +12,7 @@ use crate::flash_attention_v2::smem_layout::sp_offset;
 
 pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
     let block_kv = config.block_kv as u32;
-    let fused = config.csha.as_ref().map_or(false, |c| c.fused_projections);
+    let fused = config.csha.as_ref().is_some_and(|c| c.fused_projections);
     // J-A3 softmax-internal capture: when save_activations is on, snapshot
     // the three decisive softmax-state registers to dedicated scratch regs
     // (`%f_sdx_fmax` post-butterfly-max, `%f_sdx_nmax` post-online-update,
@@ -24,7 +24,7 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
     let capture = config
         .csha
         .as_ref()
-        .map_or(false, |c| c.save_activations_for_backward);
+        .is_some_and(|c| c.save_activations_for_backward);
     // SP slice base offset for this q_tile_iter.  In the fused split-loop
     // design, all S-passes run before all PV-accums, so each q_tile_iter's P
     // values must live in a distinct SP slice.  In the standard interleaved
@@ -39,7 +39,7 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
     };
     // block_kv is always a multiple of 32 in the supported matrix (16, 32, 64, 128).
     // For block_kv=16 we have a partial chunk; the predicated load handles it.
-    let chunks = (block_kv + 31) / 32;
+    let chunks = block_kv.div_ceil(32);
 
     ptx.push_str("    // Phase 3: online softmax + P writeback\n");
 

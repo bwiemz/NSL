@@ -245,7 +245,7 @@ pub fn percentile_threshold(scores: &[f64], prune_fraction: f64) -> f64 {
     if scores.is_empty() {
         return 0.0;
     }
-    let mut sorted: Vec<f64> = scores.iter().copied().collect();
+    let mut sorted: Vec<f64> = scores.to_vec();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let drop_count = (sorted.len() as f64 * prune_fraction).floor() as usize;
     sorted.iter().skip(drop_count).sum()

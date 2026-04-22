@@ -3707,7 +3707,7 @@ fn emit_bwd_main_q_tile_loop_scalar(ptx: &mut String, config: &FlashAttentionBac
         l_shmem_offset
     ));
     emit_smem_load(ptx, "f32", "%f_l_val", "%rd27"); // L[mi] (logsumexp)
-    ptx.push_str("\n");
+    ptx.push('\n');
 
     // global_i = q_start + mi
     ptx.push_str("    add.u64 %rd31, %rd25, %rd11;  // global_i = q_start + tid\n\n");
@@ -4342,7 +4342,7 @@ fn emit_bwd_main_q_tile_loop_mma(ptx: &mut String, config: &FlashAttentionBackwa
         l_shmem_offset
     ));
     emit_smem_load(ptx, "f32", "%f_l_val", "%rd27"); // L[mi]
-    ptx.push_str("\n");
+    ptx.push('\n');
 
     // global_i = q_start + mi
     ptx.push_str("    add.u64 %rd31, %rd25, %rd11;  // global_i = q_start + tid\n\n");
@@ -4597,7 +4597,7 @@ fn emit_bwd_main_q_tile_loop_mma(ptx: &mut String, config: &FlashAttentionBackwa
         d_shmem_offset
     ));
     emit_smem_load(ptx, "f32", "%f_d_val", "%rd27");
-    ptx.push_str("\n");
+    ptx.push('\n');
 
     ptx.push_str("    mov.u64 %rd32, 0;  // nj = 0\n");
     ptx.push_str("BWD_MAIN_MMA_DS_NJ:\n");
@@ -6830,20 +6830,30 @@ mod tests {
 
     #[test]
     fn a23_projection_tile_sweep_uses_register_based_smem_addresses() {
-        // Per-iteration A and B fragment loads must use register
-        // expressions (%ts_a_base / %ts_b_base) rather than compile-
-        // time literals, so the MMA primitive addresses the correct
-        // tile on each iteration.
+        // Per-iteration A and B fragment loads must address the per-tile
+        // base register (%ts_a_base / %ts_b_base), not a compile-time
+        // literal, so the MMA primitive walks the correct tile each
+        // iteration. The load is emitted as `mul.lo.u32` + `add.u32`
+        // rather than `mad.lo.u32` because the fused multiply-add form is
+        // rejected by CUDA at runtime on PTX ISA 7.0 (see MEMORY.md).
         let ptx = String::from_utf8(synthesize_flash_attention_ptx(&csha_l2_config())).unwrap();
         // A stride = head_dim * 2 = 128 * 2 = 256 bytes.
         assert!(
-            ptx.contains("%mma_a_row, 256, %ts_a_base"),
-            "A-fragment load must resolve against the tile-base register"
+            ptx.contains("mul.lo.u32 %mma_addr, %mma_a_row, 256;"),
+            "A-fragment load must multiply row by the tile stride"
+        );
+        assert!(
+            ptx.contains("add.u32 %mma_addr, %mma_addr, %ts_a_base;"),
+            "A-fragment load must add the tile-base register"
         );
         // B stride = d_model.min(256) * 2 = 256 * 2 = 512 bytes.
         assert!(
-            ptx.contains("%mma_b_row, 512, %ts_b_base"),
-            "B-fragment load must resolve against the tile-base register"
+            ptx.contains("mul.lo.u32 %mma_addr, %mma_b_row, 512;"),
+            "B-fragment load must multiply row by the tile stride"
+        );
+        assert!(
+            ptx.contains("add.u32 %mma_addr, %mma_addr, %ts_b_base;"),
+            "B-fragment load must add the tile-base register"
         );
     }
 

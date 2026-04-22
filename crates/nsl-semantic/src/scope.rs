@@ -78,6 +78,11 @@ impl ScopeMap {
 
     /// Declare a symbol in the given scope. Returns Err with the existing
     /// SymbolInfo if the name is already declared in THIS scope (not parent).
+    // The Err payload is >128 bytes (SymbolInfo carries a full Type), but
+    // callers only inspect `.is_err()` and the re-declare path is the cold
+    // one — boxing here would force every call site through a heap alloc on
+    // the hot success path in exchange for no observable win.
+    #[allow(clippy::result_large_err)]
     pub fn declare(
         &mut self,
         scope: ScopeId,

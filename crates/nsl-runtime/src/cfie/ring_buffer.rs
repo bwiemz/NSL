@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// Per-request metadata the host enqueues.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
+#[derive(Default)]
 pub struct RequestSlot {
     /// Opaque sequence identifier returned to the host as the request
     /// progresses.
@@ -33,18 +34,6 @@ pub struct RequestSlot {
     pub sampling_packed: u32,
 }
 
-impl Default for RequestSlot {
-    fn default() -> Self {
-        Self {
-            sequence_id: 0,
-            prompt_ptr: 0,
-            prompt_len: 0,
-            max_new_tokens: 0,
-            grammar_start_state: 0,
-            sampling_packed: 0,
-        }
-    }
-}
 
 /// Fixed-capacity ring buffer.  `CAPACITY` must be a power of two.
 pub struct RingBuffer {

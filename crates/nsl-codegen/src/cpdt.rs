@@ -193,7 +193,7 @@ pub fn run(input: CpdtInput) -> CpdtPlan {
     let world_size_u32 = input.cluster.num_gpus;
 
     let zero: Option<ZeroEvaluation> = match input.wggo_recommended_shard {
-        Some(rec) if world_size_u32 % rec != 0 => {
+        Some(rec) if !world_size_u32.is_multiple_of(rec) => {
             // Gate 1: world-size divisibility.
             override_diagnostics.push(crate::wggo_overrides::OverrideDiagnostic {
                 layer_index: 0,

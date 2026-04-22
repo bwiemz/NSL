@@ -112,9 +112,7 @@ fn emit_segment_id_load(
             ));
         }
         SegmentResidency::Streamed => {
-            ptx.push_str(&format!(
-                "    // SegmentResidency::Streamed is out of scope for PCA Tier A\n"
-            ));
+            ptx.push_str("    // SegmentResidency::Streamed is out of scope for PCA Tier A\n");
             ptx.push_str(&format!(
                 "    trap;                                        // planner mis-routed {tag}\n"
             ));

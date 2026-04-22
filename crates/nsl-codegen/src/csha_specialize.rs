@@ -252,7 +252,7 @@ fn per_head_frobenius(w: &WeightEntry, n_heads: u32) -> Option<Vec<(f64, f64)>> 
     }
     let rows = w.shape[0];
     let cols = w.shape[1];
-    if n_heads as usize == 0 || cols % n_heads as usize != 0 {
+    if n_heads as usize == 0 || !cols.is_multiple_of(n_heads as usize) {
         return None;
     }
     let head_width = cols / n_heads as usize;

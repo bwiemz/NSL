@@ -164,7 +164,7 @@ pub fn build_manifest_from_report(
 
 pub fn write_manifest(path: &std::path::Path, m: &Manifest) -> std::io::Result<()> {
     let s = serde_json::to_string_pretty(m)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
     std::fs::write(path, s)
 }
 

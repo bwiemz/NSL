@@ -613,7 +613,7 @@ fn enumerate_head_configs(c: &LayerIlpConstraints) -> Vec<Vec<bool>> {
         return vec![Vec::new()];
     }
     let group = c.gqa_group.max(1) as usize;
-    if h % group != 0 {
+    if !h.is_multiple_of(group) {
         // Degenerate — fall back to all-kept.
         return vec![vec![true; h]];
     }

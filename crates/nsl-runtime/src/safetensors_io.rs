@@ -1,7 +1,6 @@
 // M18b: Safetensors read/write FFI
 
 use std::ffi::c_void;
-use std::sync::atomic::AtomicI64;
 
 use crate::dict::{nsl_dict_keys, nsl_dict_new, nsl_dict_set_str};
 use crate::list::NslList;

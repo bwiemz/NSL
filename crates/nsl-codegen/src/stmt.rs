@@ -4767,7 +4767,7 @@ impl Compiler<'_> {
                             }
                         }
                         let mut counts: Vec<_> = counts.into_iter().collect();
-                        counts.sort_by(|a, b| b.1.cmp(&a.1));
+                        counts.sort_by_key(|a| std::cmp::Reverse(a.1));
                         eprintln!("[nsl] source-ad owned {} ops:", label);
                         for (name, count) in counts {
                             eprintln!("  {} -> {}", name, count);
@@ -4796,7 +4796,7 @@ impl Compiler<'_> {
                         }
                     }
                     let mut final_grad_counts: Vec<_> = final_grad_counts.into_iter().collect();
-                    final_grad_counts.sort_by(|a, b| b.1.cmp(&a.1));
+                    final_grad_counts.sort_by_key(|a| std::cmp::Reverse(a.1));
                     eprintln!("[nsl] source-ad final grad ops:");
                     for (name, count) in final_grad_counts {
                         eprintln!("  {} -> {}", name, count);

@@ -1,5 +1,6 @@
 ---
 source: crates/nsl-codegen/tests/fa_v2_snapshots.rs
+assertion_line: 123
 expression: ptx
 ---
     // Phase 6: finalize + output store (q_tile_iter = 0)
@@ -16,29 +17,29 @@ expression: ptx
     mul.lo.u64 %rd48, %rd48, %rd6;            // * seq_len
     add.u64 %rd48, %rd48, %rd47;              // + q_row_global
     mul.lo.u64 %rd48, %rd48, %rd7;            // * head_dim
-    shl.b64 %rd48, %rd48, 1;                  // * 2 bytes f16
+    shl.b64 %rd48, %rd48, 1;                  // * 2 bytes f16 (inference)
     add.u64 %rd48, %rd3, %rd48;               // out_base_global
-    cvt.rn.f16.f32 %h0, %f48;
     cvt.u64.u32 %rd49, %lane;
-    shl.b64 %rd49, %rd49, 1;                  // * 2 bytes
+    cvt.rn.f16.f32 %h0, %f48;
+    shl.b64 %rd49, %rd49, 1;                  // * 2 bytes f16
     add.u64 %rd49, %rd48, %rd49;              // out_base + d*2
     st.global.b16 [%rd49], %h0;
-    cvt.rn.f16.f32 %h0, %f49;
     cvt.u64.u32 %rd49, %lane;
     add.u64 %rd49, %rd49, 32;
-    shl.b64 %rd49, %rd49, 1;                  // * 2 bytes
+    cvt.rn.f16.f32 %h0, %f49;
+    shl.b64 %rd49, %rd49, 1;                  // * 2 bytes f16
     add.u64 %rd49, %rd48, %rd49;              // out_base + d*2
     st.global.b16 [%rd49], %h0;
-    cvt.rn.f16.f32 %h0, %f50;
     cvt.u64.u32 %rd49, %lane;
     add.u64 %rd49, %rd49, 64;
-    shl.b64 %rd49, %rd49, 1;                  // * 2 bytes
+    cvt.rn.f16.f32 %h0, %f50;
+    shl.b64 %rd49, %rd49, 1;                  // * 2 bytes f16
     add.u64 %rd49, %rd48, %rd49;              // out_base + d*2
     st.global.b16 [%rd49], %h0;
-    cvt.rn.f16.f32 %h0, %f51;
     cvt.u64.u32 %rd49, %lane;
     add.u64 %rd49, %rd49, 96;
-    shl.b64 %rd49, %rd49, 1;                  // * 2 bytes
+    cvt.rn.f16.f32 %h0, %f51;
+    shl.b64 %rd49, %rd49, 1;                  // * 2 bytes f16
     add.u64 %rd49, %rd48, %rd49;              // out_base + d*2
     st.global.b16 [%rd49], %h0;
     // LSE store (lane 0 only, null-guarded)

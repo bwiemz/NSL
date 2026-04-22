@@ -149,14 +149,14 @@ fn l1_smem_bytes(model: &PersistentModel) -> u32 {
     // Level 1: one norm scratchpad + one tile of Q/K/V.
     let norm = 4 * 1024;
     let tile = 64 * model.head_dim * model.dtype_bytes;
-    (norm + tile) as u32
+    (norm + tile)
 }
 
 fn l2_smem_bytes(model: &PersistentModel) -> u32 {
     // Level 2: producer + consumer tiles + partial weight tile.
     let tile = 64 * model.head_dim * model.dtype_bytes;
     let weight_slice = model.head_dim * model.d_model * model.dtype_bytes;
-    (2 * tile + weight_slice) as u32
+    (2 * tile + weight_slice)
 }
 
 fn l3_smem_bytes(model: &PersistentModel) -> u32 {
@@ -170,7 +170,7 @@ fn l3_smem_bytes(model: &PersistentModel) -> u32 {
     let ffn_chunk_cols = (model.d_ff / 8).max(64);
     let ffn_scratch = 64 * ffn_chunk_cols * model.dtype_bytes;
     let residual = 16 * 1024;
-    (4 * tile + ffn_scratch + residual) as u32
+    (4 * tile + ffn_scratch + residual)
 }
 
 fn scheduler_smem_bytes(max_active: u32) -> u32 {

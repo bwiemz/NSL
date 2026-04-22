@@ -134,7 +134,7 @@ impl LayerCostLut {
                         if !e.feasible {
                             continue;
                         }
-                        if best.map_or(true, |(_, _, _, _, b)| e.total_us() < b.total_us()) {
+                        if best.is_none_or(|(_, _, _, _, b)| e.total_us() < b.total_us()) {
                             best = Some((h, f, c, r, e));
                         }
                     }

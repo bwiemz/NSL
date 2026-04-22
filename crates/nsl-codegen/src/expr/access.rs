@@ -93,8 +93,8 @@ impl Compiler<'_> {
         // AST rewrite pass have no type-map entry (fresh NodeId). Fall
         // back to the current model context so the Type::Model branch
         // below fires and the side-table route-through happens.
-        if matches!(obj_type, Type::Unknown) {
-            if matches!(object.kind, ExprKind::SelfRef) {
+        if matches!(obj_type, Type::Unknown)
+            && matches!(object.kind, ExprKind::SelfRef) {
                 if let Some(ref model_name) = self.current_method_model_name {
                     if let Some(sym) = self.interner.get(model_name) {
                         obj_type = Type::Model {
@@ -107,7 +107,6 @@ impl Compiler<'_> {
                     }
                 }
             }
-        }
 
         if let Type::Struct { name, .. } = &obj_type {
             let struct_name = self.resolve_sym(*name).to_string();

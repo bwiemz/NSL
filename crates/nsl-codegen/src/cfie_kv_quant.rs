@@ -121,8 +121,8 @@ fn position_factor(layer: u32, n_layers: u32) -> f64 {
     // U-shape with steeper endpoints — first and last layers must
     // survive at FP16.  Normalised to [0, 1] with peaks at 1.0.
     let t = layer as f64 / (n_layers - 1) as f64;
-    let d = (2.0 * t - 1.0).abs();
-    d
+    
+    (2.0 * t - 1.0).abs()
 }
 
 fn spectral_energy_proxy(entry: &WeightEntry) -> f64 {

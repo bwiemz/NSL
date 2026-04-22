@@ -392,7 +392,7 @@ fn make_f32_tensor(data: &[f32], shape: &[i64]) -> i64 {
         unsafe { *shape_ptr.add(i) = s };
     }
     let strides = NslTensor::compute_strides(shape_ptr, ndim);
-    let data_size = total * std::mem::size_of::<f32>();
+    let data_size = std::mem::size_of_val(data);
     let data_ptr = crate::memory::checked_alloc(data_size) as *mut f32;
     unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), data_ptr, total) };
     let t = Box::new(NslTensor::new(

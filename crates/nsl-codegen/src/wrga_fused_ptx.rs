@@ -308,7 +308,7 @@ fn emit_fused_adapter_kernel_body(
     // fragments.  The epi_interm MMA reuses %main_a_frag (x tile fragment)
     // as its A-operand — this is correct per spec §3 invariant (1): the
     // m16n8k16 A-fragment encodes only the m×k tile, independent of B.
-    let k_iters = (k + MMA_K_U32 - 1) / MMA_K_U32;
+    let k_iters = k.div_ceil(MMA_K_U32);
 
     // Fragment register names for matmul_mma load helpers (without % — helpers add it).
     let main_a_frag_names: [String; 4] = [
@@ -627,7 +627,7 @@ pub fn synthesize_fused_ia3_ptx(config: &FusedIa3Config) -> String {
     emit_zero_accumulators(&mut ptx, "main_accum", 8);
 
     // 6. Main K-loop.
-    let k_iters = (config.k + MMA_K_U32 - 1) / MMA_K_U32;
+    let k_iters = config.k.div_ceil(MMA_K_U32);
 
     let main_a_frag_names: [String; 4] = [
         "main_a_frag0".into(), "main_a_frag1".into(),

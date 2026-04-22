@@ -392,9 +392,7 @@ pub fn emit_dproj(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: 
             // Loop over s in 0..block_q (unrolled)
             for s in 0..block_q {
                 // x_norm addr: x_off + (s*d_model + p)*4
-                ptx.push_str(&format!(
-                    "    mul.lo.u64 %rd_c3, %rd_c1, 4;  // p*4\n"
-                ));
+                ptx.push_str("    mul.lo.u64 %rd_c3, %rd_c1, 4;  // p*4\n");
                 ptx.push_str(&format!(
                     "    add.u64 %rd_c3, %rd_c3, {};\n", s * d_model * 4 + x_off
                 ));

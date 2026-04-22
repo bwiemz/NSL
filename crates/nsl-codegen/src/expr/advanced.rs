@@ -424,8 +424,8 @@ impl Compiler<'_> {
         seen: &mut std::collections::HashSet<nsl_ast::Symbol>,
     ) {
         match &expr.kind {
-            ExprKind::Ident(sym) => {
-                if !param_syms.contains(sym) && !seen.contains(sym) {
+            ExprKind::Ident(sym)
+                if !param_syms.contains(sym) && !seen.contains(sym) => {
                     if let Some((_var, cl_type)) = state.variables.get(sym) {
                         // It's an outer-scope variable -- it's a capture
                         seen.insert(*sym);
@@ -433,7 +433,6 @@ impl Compiler<'_> {
                     }
                     // If not in state.variables, it's a global/builtin -- not a capture
                 }
-            }
             ExprKind::BinaryOp { left, right, .. } | ExprKind::Pipe { left, right } => {
                 self.collect_free_vars(left, param_syms, state, out, seen);
                 self.collect_free_vars(right, param_syms, state, out, seen);

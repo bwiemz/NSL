@@ -358,6 +358,7 @@ pub extern "C" fn nsl_tape_resume() {
 
 /// Call a function pointer with a variable number of i64 arguments (up to 8).
 /// Used by gradient checkpointing to re-execute the forward function during backward.
+#[allow(dead_code)]
 pub(crate) fn call_with_args(fn_ptr: usize, args: &[i64]) -> i64 {
     debug_assert_eq!(std::mem::size_of::<usize>(), 8, "gradient checkpointing requires 64-bit target");
     type Fn0 = extern "C" fn() -> i64;

@@ -210,7 +210,7 @@ pub fn emit_lora_stage_x_tile(ptx: &mut String, _m: u32, k: u32) {
     ptx.push_str("    // Stage x_tile for runtime K-iter (f32 global -> f16x2 SMEM)\n");
     ptx.push_str("    setp.eq.u32 %p0, %tid_x, 0;\n");
     ptx.push_str("    @!%p0 bra lora_x_stage_done;\n");
-    let needs_k_tail = k % 16 != 0;
+    let needs_k_tail = !k.is_multiple_of(16);
     for row in 0..16u32 {
         // Per-row m-predicate: %p1 = (row < %m_param).
         ptx.push_str(&format!("    setp.lt.u32 %p1, {}, %m_param;\n", row));
@@ -298,7 +298,7 @@ pub fn emit_lora_stage_w_tile(ptx: &mut String, n: u32, k: u32) {
     ptx.push_str("    // Stage w_tile for runtime K-iter (f32 global, col-major f16 SMEM)\n");
     ptx.push_str("    setp.eq.u32 %p0, %tid_x, 0;\n");
     ptx.push_str("    @!%p0 bra lora_w_stage_done;\n");
-    let needs_k_tail = k % 16 != 0;
+    let needs_k_tail = !k.is_multiple_of(16);
     // Col-major SMEM: column c at bytes c*32 + k*2.
     const COL_STRIDE: u32 = 32;
     for col in 0..8u32 {
@@ -365,7 +365,7 @@ pub fn emit_lora_stage_a_tile(ptx: &mut String, rank: u32, k: u32) {
     ptx.push_str(&format!("    // Stage a_tile for runtime K-iter (rank={rank}, f32 global, col-major f16 SMEM)\n"));
     ptx.push_str("    setp.eq.u32 %p0, %tid_x, 0;\n");
     ptx.push_str("    @!%p0 bra lora_a_stage_done;\n");
-    let needs_k_tail = k % 16 != 0;
+    let needs_k_tail = !k.is_multiple_of(16);
     // Col-major: col c at bytes c*32 + k_row*2.
     const COL_STRIDE: u32 = 32;
     for col in 0..8u32 {

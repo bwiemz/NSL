@@ -156,7 +156,7 @@ impl Compiler<'_> {
                 ptx_data_id,
                 name_data_id,
                 call_expr.id,
-                call_expr.span.clone(),
+                call_expr.span,
             );
         }
 
@@ -2385,10 +2385,15 @@ impl Compiler<'_> {
                 }
             }
             let span_json = crate::profiling::instrument::SourceSpanJson::from_span(
-                span.clone(),
+                span,
                 &self.source_file_name,
                 &self.source_text,
             );
+            // Split the is_some / as_mut so the earlier immutable uses of
+            // `self` don't collide with the mutable borrow — the `expect`
+            // form matches that control-flow shape more clearly than an
+            // `if let Some(...)` refactor here.
+            #[allow(clippy::unnecessary_unwrap)]
             let mb = self
                 .manifest_builder
                 .as_mut()

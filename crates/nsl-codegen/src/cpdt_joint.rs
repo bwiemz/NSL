@@ -163,7 +163,7 @@ pub fn solve(input: JointInput) -> JointPlan {
         // Track best iteration.
         if best
             .as_ref()
-            .map_or(true, |b| iter.objective.composite() < b.objective.composite())
+            .is_none_or(|b| iter.objective.composite() < b.objective.composite())
         {
             best = Some(iter.clone());
         }

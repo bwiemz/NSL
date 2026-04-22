@@ -2008,7 +2008,7 @@ pub extern "C" fn nsl_flash_attention_backward(
             // f64 -> f32
             if is_gpu {
                 // GPU f64 tensors: transfer as f64, then convert
-                let mut f64_buf = vec![0.0f64; len];
+                let f64_buf = vec![0.0f64; len];
                 #[cfg(feature = "cuda")]
                 {
                     crate::cuda::inner::memcpy_dtoh(

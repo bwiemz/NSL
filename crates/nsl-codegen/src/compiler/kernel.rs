@@ -11,10 +11,18 @@ use crate::error::CodegenError;
 
 /// Parse the numeric SM version from a target string like `"sm_90"` → `90`.
 ///
+/// Accepts the generic `"cuda"` alias (used as `CompileOptions::default()`)
+/// and maps it to sm_80 (Ampere, the earliest SM that has every feature
+/// the current PTX emitters need). Concrete targets like `sm_75` always
+/// take precedence when the user passes one explicitly.
+///
 /// Panics with a clear message on an unrecognised format so that a
 /// misconfigured compile target is caught at compile time rather than
 /// silently routing to the wrong PTX path.
 pub(crate) fn parse_gpu_sm_from_target(target: &str) -> u32 {
+    if target == "cuda" {
+        return 80;
+    }
     target
         .strip_prefix("sm_")
         .and_then(|n| n.parse().ok())

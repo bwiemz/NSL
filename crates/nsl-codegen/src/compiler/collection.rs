@@ -441,7 +441,7 @@ impl Compiler<'_> {
                                             self.models
                                                 .model_tensor_field_shapes
                                                 .entry(name.clone())
-                                                .or_insert_with(HashMap::new)
+                                                .or_default()
                                                 .insert(field_name.clone(), type_str);
                                         }
                                     }

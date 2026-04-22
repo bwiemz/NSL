@@ -197,7 +197,6 @@ impl<'a> CalibCtx<'a> {
                     }
                 }
             }
-            return;
         }
     }
 }
@@ -292,7 +291,7 @@ pub(crate) fn emit_running_max_abs_f32(
     fb.append_block_param(header, cl_types::I32);
 
     let zero_i32 = fb.ins().iconst(cl_types::I32, 0);
-    fb.ins().jump(header, &[zero_i32.into()]);
+    fb.ins().jump(header, &[zero_i32]);
 
     // header: if i < len goto body(i) else goto exit
     fb.switch_to_block(header);
@@ -315,7 +314,7 @@ pub(crate) fn emit_running_max_abs_f32(
     fb.ins().store(MemFlags::new(), new_val, buf_addr, 0);
     let one = fb.ins().iconst(cl_types::I32, 1);
     let i_next = fb.ins().iadd(i_cur, one);
-    fb.ins().jump(header, &[i_next.into()]);
+    fb.ins().jump(header, &[i_next]);
 
     fb.seal_block(header);
     fb.switch_to_block(exit);

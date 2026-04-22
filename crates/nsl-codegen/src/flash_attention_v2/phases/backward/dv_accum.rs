@@ -37,7 +37,7 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
     let block_q = config.block_q as u32;
     let block_kv = config.block_kv as u32;
     assert!(
-        head_dim % 4 == 0,
+        head_dim.is_multiple_of(4),
         "dv_accum warp-d partition requires head_dim % 4 == 0 (got {head_dim})"
     );
     let d_per_warp = head_dim / 4;
@@ -120,9 +120,7 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
 
     for k in 0..d_per_warp {
         // dV SMEM addr = %rd34 + %rd35 + k*4
-        ptx.push_str(&format!(
-            "    add.u64 %rd37, %rd34, %rd35;\n"
-        ));
+        ptx.push_str("    add.u64 %rd37, %rd34, %rd35;\n");
         if k > 0 {
             ptx.push_str(&format!("    add.u64 %rd37, %rd37, {};\n", k * 4));
         }

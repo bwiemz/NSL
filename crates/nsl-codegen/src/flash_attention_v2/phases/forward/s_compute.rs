@@ -25,11 +25,11 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
     let head_dim = config.head_dim as u32;
     let slices   = head_dim / 32;
     let block_kv = config.block_kv as u32;
-    let fused = config.csha.as_ref().map_or(false, |c| c.fused_projections);
+    let fused = config.csha.as_ref().is_some_and(|c| c.fused_projections);
     let capture = config
         .csha
         .as_ref()
-        .map_or(false, |c| c.save_activations_for_backward);
+        .is_some_and(|c| c.save_activations_for_backward);
     // J-A5 s_compute-internal captures. Env-gated at codegen time.
     //   - direct_q0        : lane-0 snapshot of %f{Q_BASE} before k loop
     //                        (should be 32.0 for ones input; tells us if

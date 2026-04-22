@@ -1,7 +1,9 @@
 //! Register accounting for the v2 scalar emitter. Used at compile time
 //! to catch configs that would exceed sm_75's 255-register cap.
 
-use crate::flash_attention::{FlashAttentionConfig, RopeStyle};
+use crate::flash_attention::FlashAttentionConfig;
+#[cfg(test)]
+use crate::flash_attention::RopeStyle;
 
 /// Maximum registers per thread on sm_75 (the oldest SM v2 targets).
 pub const SM75_REGISTER_CAP: u32 = 255;

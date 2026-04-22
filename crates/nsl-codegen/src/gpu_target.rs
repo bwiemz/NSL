@@ -34,11 +34,7 @@ impl GpuTarget {
             rest
         } else if let Some(rest) = lower.strip_prefix("sm_") {
             rest
-        } else if let Some(rest) = lower.strip_prefix("sm") {
-            rest
-        } else {
-            return None;
-        };
+        } else { lower.strip_prefix("sm")? };
         // Trim any trailing non-digit (e.g. `sm_80a`).
         let digits: String = tail.chars().take_while(|c| c.is_ascii_digit()).collect();
         digits.parse().ok()

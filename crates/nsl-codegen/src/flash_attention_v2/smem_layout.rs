@@ -198,7 +198,7 @@ pub fn validate_scalar_v2_config(
     // rows, exactly matches the tile size for both dimensions).  Asymmetric
     // configs (`block_q != block_kv`) are therefore valid and no additional
     // predicate is needed here.
-    if config.csha.as_ref().map_or(false, |c| c.fused_projections)
+    if config.csha.as_ref().is_some_and(|c| c.fused_projections)
         && (config.block_kv % 4 != 0)
     {
         return Err(ConfigError(format!(
@@ -279,7 +279,7 @@ pub fn sp_bytes(config: &FlashAttentionConfig) -> u32 {
     let warps     = 4u32;
     let block_kv  = config.block_kv as u32;
     let base      = warps * block_kv * 4;
-    if config.csha.as_ref().map_or(false, |c| c.fused_projections) {
+    if config.csha.as_ref().is_some_and(|c| c.fused_projections) {
         let iters = (config.block_q as u32).div_ceil(4);
         iters * base
     } else {
@@ -301,7 +301,7 @@ pub fn total_bytes(config: &FlashAttentionConfig) -> u32 {
 /// Wq weight tile bytes when `csha.fused_projections` is set: `d_model × head_dim × 2` (f16).
 /// Returns 0 when `fused_projections` is false or `d_model == 0`.
 pub fn wq_tile_bytes(config: &FlashAttentionConfig) -> u32 {
-    if config.csha.as_ref().map_or(false, |c| c.fused_projections) {
+    if config.csha.as_ref().is_some_and(|c| c.fused_projections) {
         let d_model = config.csha.as_ref().map_or(0, |c| c.d_model);
         2 * d_model * (config.head_dim as u32)
     } else {
@@ -322,7 +322,7 @@ pub fn wv_tile_bytes(config: &FlashAttentionConfig) -> u32 {
 /// Wo output projection tile bytes when `csha.fused_output_proj` is set:
 /// `head_dim * d_model * 2` (f16). Returns 0 when not enabled or `d_model == 0`.
 pub fn wo_tile_bytes(config: &FlashAttentionConfig) -> u32 {
-    if config.csha.as_ref().map_or(false, |c| c.fused_output_proj) {
+    if config.csha.as_ref().is_some_and(|c| c.fused_output_proj) {
         let d_model = config.csha.as_ref().map_or(0, |c| c.d_model);
         2 * (config.head_dim as u32) * d_model
     } else {
@@ -333,7 +333,7 @@ pub fn wo_tile_bytes(config: &FlashAttentionConfig) -> u32 {
 /// Residual input tile bytes when `csha.fused_output_proj` is set:
 /// `block_q * d_model * 2` (f16). Returns 0 when not enabled or `d_model == 0`.
 pub fn x_residual_bytes(config: &FlashAttentionConfig) -> u32 {
-    if config.csha.as_ref().map_or(false, |c| c.fused_output_proj) {
+    if config.csha.as_ref().is_some_and(|c| c.fused_output_proj) {
         let d_model = config.csha.as_ref().map_or(0, |c| c.d_model);
         2 * (config.block_q as u32) * d_model
     } else {
@@ -350,7 +350,7 @@ pub fn x_residual_bytes(config: &FlashAttentionConfig) -> u32 {
 /// Layout: 4 warps × iters × 2 f32 × 4 bytes
 /// Slot for (warp, iter): byte offset = warp*iters*8 + iter*8
 pub fn softmax_save_bytes(config: &FlashAttentionConfig) -> u32 {
-    if config.csha.as_ref().map_or(false, |c| c.fused_projections) {
+    if config.csha.as_ref().is_some_and(|c| c.fused_projections) {
         let iters = (config.block_q as u32).div_ceil(4);
         4 * iters * 2 * 4  // 4 warps × iters × (row_max, row_sum) × sizeof(f32)
     } else {

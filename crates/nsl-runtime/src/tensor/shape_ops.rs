@@ -384,7 +384,7 @@ pub extern "C" fn nsl_tensor_select(tensor_ptr: i64, dim: i64, index: i64) -> i6
             remaining %= out_stride_vec[oa] as usize;
             in_offset += i * in_strides[ia] as usize;
         }
-        unsafe { copy_preserved_dtype_element(&tensor, in_offset, data, flat) };
+        unsafe { copy_preserved_dtype_element(tensor, in_offset, data, flat) };
     }
 
     let out = Box::new(NslTensor::new(
@@ -508,7 +508,7 @@ pub extern "C" fn nsl_tensor_stack(list_ptr: i64, dim: i64) -> i64 {
                 let oa = if ia < insert_pos { ia } else { ia + 1 };
                 out_offset += iv * out_stride_vec[oa] as usize;
             }
-            unsafe { copy_preserved_dtype_element(&t, flat, data, out_offset) };
+            unsafe { copy_preserved_dtype_element(t, flat, data, out_offset) };
         }
     }
 
@@ -763,7 +763,7 @@ pub extern "C" fn nsl_tensor_slice(tensor_ptr: i64, dim: i64, start: i64, end: i
                 in_offset += idx * in_strides[axis] as usize;
             }
         }
-        unsafe { copy_preserved_dtype_element(&tensor, in_offset, data, flat) };
+        unsafe { copy_preserved_dtype_element(tensor, in_offset, data, flat) };
     }
 
     let input_shape: Vec<i64> = (0..ndim)
@@ -896,7 +896,7 @@ pub extern "C" fn nsl_tensor_cat(tensor_list: i64, dim: i64) -> i64 {
                     out_offset += idx * o_strides[axis] as usize;
                 }
             }
-            unsafe { copy_preserved_dtype_element(&t, flat, data, out_offset) };
+            unsafe { copy_preserved_dtype_element(t, flat, data, out_offset) };
         }
         cat_offset += sz as usize;
     }
@@ -1104,7 +1104,7 @@ pub extern "C" fn nsl_tensor_contiguous(tensor_ptr: i64) -> i64 {
             let src_stride = unsafe { *t.strides.add(d) } as usize;
             src_offset += coord * src_stride;
         }
-        unsafe { copy_preserved_dtype_element(&t, src_offset, data, flat) };
+        unsafe { copy_preserved_dtype_element(t, src_offset, data, flat) };
     }
     let result = Box::new(NslTensor::new(
         data,

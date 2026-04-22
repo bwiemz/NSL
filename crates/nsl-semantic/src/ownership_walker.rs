@@ -361,10 +361,8 @@ fn register_pattern_bindings_with_type(
 ) {
     let is_tensor = elem_ty.as_ref().map(|ty| ty.is_tensor()).unwrap_or(false);
     match &pattern.kind {
-        PatternKind::Ident(sym) => {
-            if is_tensor {
-                checker.register_binding(*sym, pattern.span, false);
-            }
+        PatternKind::Ident(sym) if is_tensor => {
+            checker.register_binding(*sym, pattern.span, false);
         }
         PatternKind::Tuple(pats) | PatternKind::List(pats) => {
             // For tuple destructuring in for-loops (e.g., `for (i, t) in enumerate(list):`),

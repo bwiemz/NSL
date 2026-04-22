@@ -22,7 +22,7 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
     let save = config
         .csha
         .as_ref()
-        .map_or(false, |c| c.save_activations_for_backward);
+        .is_some_and(|c| c.save_activations_for_backward);
 
     ptx.push_str(&format!(
         "    // Phase 6: finalize + output store (q_tile_iter = {})\n",

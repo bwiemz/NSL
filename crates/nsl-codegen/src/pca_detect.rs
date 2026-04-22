@@ -16,6 +16,7 @@ use serde::Serialize;
 
 /// Parsed packing configuration from a `dataset` block.
 #[derive(Debug, Clone, Serialize)]
+#[derive(Default)]
 pub struct DatasetPackingConfig {
     /// Whether the dataset has `packing = true`.
     pub enabled: bool,
@@ -31,17 +32,6 @@ pub struct DatasetPackingConfig {
     pub separator_token_id: Option<i64>,
 }
 
-impl Default for DatasetPackingConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            max_sequence_length: 0,
-            mean_doc_length: None,
-            doc_length_stddev: None,
-            separator_token_id: None,
-        }
-    }
-}
 
 /// PCA strategy the compiler should apply to the attention sublayer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]

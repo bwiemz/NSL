@@ -184,9 +184,11 @@ impl Default for CodegenFlags {
 
 /// Controls how `self` and `self.<field>` are lowered inside model methods.
 #[derive(Debug, Clone)]
+#[derive(Default)]
 pub enum SelfResolution {
     /// Normal model method: `self` is bound to block_params[0] (struct pointer)
     /// and field accesses go through `struct_layouts`. Existing behavior.
+    #[default]
     StructPointer,
     /// @export model method: `self` is phantom. `self.<field>` lowers to
     /// `load(weight_ptrs + field_index*8)` where `weight_ptrs_var` holds the
@@ -196,11 +198,6 @@ pub enum SelfResolution {
     },
 }
 
-impl Default for SelfResolution {
-    fn default() -> Self {
-        SelfResolution::StructPointer
-    }
-}
 
 /// Per-function compilation state (variables, loops).
 pub struct FuncState {

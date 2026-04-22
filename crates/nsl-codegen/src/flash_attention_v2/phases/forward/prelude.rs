@@ -139,10 +139,10 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig) {
     // The wider declaration is cheap (three u64 registers) and only materialises
     // when the CSHA branch actually needs SMEM-base plumbing.  See
     // `phases/forward/csha_hooks.rs` for the mirrored init guard.
-    let needs_qkv_smem_base = config.csha.as_ref().map_or(false, |c| {
+    let needs_qkv_smem_base = config.csha.as_ref().is_some_and(|c| {
         c.fused_projections || c.save_activations_for_backward
     });
-    if config.csha.as_ref().map_or(false, |c| c.fused_projections) {
+    if config.csha.as_ref().is_some_and(|c| c.fused_projections) {
         let slices_per_lane = ((config.head_dim as u32) / 32).max(1);
         for label in ["Q", "K", "V"] {
             for slice in 0..slices_per_lane {
@@ -196,7 +196,7 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig) {
     // capture regs written in softmax.rs at the three decisive points
     // (post-butterfly-max, post-online-update, post-butterfly-sum). All are
     // declared unconditionally because ptxas prunes unused virtual regs.
-    if config.csha.as_ref().map_or(false, |c| c.save_activations_for_backward) {
+    if config.csha.as_ref().is_some_and(|c| c.save_activations_for_backward) {
         ptx.push_str(
             "    .reg .u64 %rd_save_base, %rd_save_off, %rd_save_elem, %rd_save_smem, %rd_save_wrow, %rd_save_col, %rd_save_colb;\n",
         );
@@ -209,7 +209,7 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig) {
     // CSHA A5 Wo output projection stub registers (only when fused_output_proj is set).
     // Actual Wo @ O computation is delegated to a separate follow-up kernel (spec R2);
     // these registers are used only for the null-check dispatch stub.
-    if config.csha.as_ref().map_or(false, |c| c.fused_output_proj) {
+    if config.csha.as_ref().is_some_and(|c| c.fused_output_proj) {
         ptx.push_str("    .reg .u64 %rd_wo_ptr;\n");
         ptx.push_str("    .reg .pred %p_wo_null, %p_x_null;\n");
     }

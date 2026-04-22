@@ -251,7 +251,7 @@ fn convert_to_f32(param: &str, dtype: &str, bytes: &[u8]) -> Result<Vec<f32>, Ns
         param: param.to_string(),
         dtype: dtype.to_string(),
     })?;
-    if bytes.len() % dsize != 0 {
+    if !bytes.len().is_multiple_of(dsize) {
         return Err(NslWeightsError::DtypeSizeMismatch {
             param: param.to_string(),
             dtype: dtype.to_string(),

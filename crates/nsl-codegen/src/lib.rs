@@ -1,3 +1,29 @@
+// Clippy style-lint churn new in 1.95+ that's not worth per-site fixes here:
+// - doc_overindented_list_items / doc_lazy_continuation / unused_parens: doc
+//   formatting pedantry that fires on preexisting ASCII diagrams.
+// - manual_checked_ops: explicit `if divisor == 0 { fallback }` is clearer
+//   than `.checked_div(...).unwrap_or(...)` at the call sites in question.
+// - needless_range_loop: indexed loops where the index threads into multiple
+//   parallel buffers in lock-step.
+// - too_many_arguments: numerical-kernel / codegen-emit signatures have many
+//   parameters by nature (block_q, block_kv, head_dim, rope flags, ...) and
+//   refactoring into structs is churn with no callsite win.
+// - sort_by_key_reverse / unstable_sort: cosmetic; ordering is fine either way.
+// - has_len_but_not_is_empty: `len()` is the semantic we want; empty state is
+//   represented via separate invariants, not "len == 0".
+// - field_reassign_with_default / type_complexity: style, not correctness.
+#![allow(
+    unused_parens,
+    clippy::doc_overindented_list_items,
+    clippy::doc_lazy_continuation,
+    clippy::manual_checked_ops,
+    clippy::needless_range_loop,
+    clippy::too_many_arguments,
+    clippy::field_reassign_with_default,
+    clippy::type_complexity,
+    clippy::len_without_is_empty
+)]
+
 pub mod autotune;
 pub mod builtins;
 pub mod c_header;
