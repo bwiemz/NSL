@@ -1161,15 +1161,16 @@ impl AdjointGenerator {
                 vec![y_bar, logits, targets],
             ),
 
-            // --- MSE backward for reduction='sum': d/d(pred) = 2*(pred - target) * grad_output ---
-            // For reduction='mean', the user's NSL code divides by N before loss,
-            // which propagates 1/N through grad_output automatically.
-            AdjointExpr::MSEBackward(y_bar, pred, target) => {
-                let diff = self.emit_op(PrimalOp::Sub, vec![pred, target]);
-                let two = self.emit_constant(2.0);
-                let scaled_diff = self.emit_op(PrimalOp::Mul, vec![two, diff]);
-                self.emit_op(PrimalOp::Mul, vec![y_bar, scaled_diff])
-            }
+            // --- MSE backward: d/d(pred_i) = grad_output * 2 * (pred_i - target_i) / N ---
+            // Forward `PrimalOp::MSELoss` lowers to a global `mean((pred-target)^2)`
+            // (scalar over all N=numel(pred)), so the /N factor must be applied here
+            // or the gradient is N× too large (was causing dO inflation in CSHA e2e).
+            // Delegated to `nsl_mse_backward` so `N` can be read at runtime from the
+            // pred tensor header without plumbing shape info through the Wengert list.
+            AdjointExpr::MSEBackward(y_bar, pred, target) => self.emit_op(
+                PrimalOp::Passthrough("mse_backward".into()),
+                vec![y_bar, pred, target],
+            ),
 
             // --- L1 backward for reduction='sum': d/d(pred) = sign(pred - target) * grad_output ---
             // For reduction='mean', the user's NSL code divides by N before loss,

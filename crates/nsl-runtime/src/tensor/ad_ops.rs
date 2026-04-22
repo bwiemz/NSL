@@ -712,6 +712,58 @@ pub extern "C" fn nsl_cross_entropy_backward(
 }
 
 // ---------------------------------------------------------------------------
+// 5d. nsl_mse_backward — MSE gradient: grad_output * 2 * (pred - target) / N
+// ---------------------------------------------------------------------------
+
+/// Compute the MSE loss backward gradient w.r.t. `pred`.
+///
+/// Forward:  `loss = mean((pred - target)^2)`   (scalar over all N = numel(pred))
+/// Backward: `d(loss)/d(pred_i) = (2/N) * (pred_i - target_i) * grad_output`
+///
+/// `grad_output` is the upstream adjoint of `loss`. Because MSE's output is a
+/// scalar, `grad_output` is always a 0-dim / 1-element tensor — we fold its
+/// value directly into the `mul_scalar` factor to sidestep
+/// `gpu_elementwise_binary`, which is element-count-matched and would
+/// silently misfire on a scalar × n-dim multiply.
+#[no_mangle]
+pub extern "C" fn nsl_mse_backward(
+    grad_output_ptr: i64,
+    pred_ptr: i64,
+    target_ptr: i64,
+) -> i64 {
+    let pred = NslTensor::from_ptr(pred_ptr);
+    if pred.len <= 0 {
+        return super::nsl_tensor_clone(pred_ptr);
+    }
+    let grad_out_cpu = if NslTensor::from_ptr(grad_output_ptr).device > 0 {
+        nsl_tensor_to_device(grad_output_ptr, 0)
+    } else {
+        grad_output_ptr
+    };
+    let go = NslTensor::from_ptr(grad_out_cpu);
+    let go_scalar = if go.len == 1 {
+        match go.dtype {
+            1 => (unsafe { *go.data_f32() }) as f64,
+            _ => unsafe { *go.data_f64() },
+        }
+    } else {
+        // Non-scalar grad_output is not expected for a scalar MSE loss; log
+        // and fall back to 1.0 rather than corrupting the gradient silently.
+        eprintln!(
+            "nsl: nsl_mse_backward expected a scalar grad_output, got len={}; defaulting multiplier to 1.0",
+            go.len
+        );
+        1.0
+    };
+    if grad_out_cpu != grad_output_ptr {
+        nsl_tensor_free(grad_out_cpu);
+    }
+    let factor = (2.0_f64 * go_scalar) / pred.len as f64;
+    let diff = super::arithmetic::nsl_tensor_sub(pred_ptr, target_ptr, 0);
+    super::arithmetic::nsl_tensor_mul_scalar(diff, factor, super::fbip_flags::RELINQUISH_A)
+}
+
+// ---------------------------------------------------------------------------
 // 6. nsl_tensor_logsoftmax — numerically-stable log-softmax along `dim`
 // ---------------------------------------------------------------------------
 
@@ -1449,6 +1501,44 @@ mod tests {
         nsl_tensor_free(logits_gpu);
         nsl_tensor_free(grad_gpu);
         nsl_tensor_free(grad_cpu);
+    }
+
+    // MSE backward: d/d(pred_i) = grad_output * 2 * (pred_i - target_i) / N
+    // where N = numel(pred). Regression guard for the /N factor that was
+    // previously missing and inflated dO by a factor of N (e.g., 1024× for
+    // [1,1,32,32] inputs in the CSHA e2e path).
+    #[test]
+    fn test_mse_backward_divides_by_n_cpu() {
+        let pred = make_1d_f32(&[1.0, 2.0, 3.0, 4.0]);
+        let target = make_1d_f32(&[0.0, 0.0, 0.0, 0.0]);
+        let grad_out = nsl_tensor_scalar(1.0, 1);
+        let grad = nsl_mse_backward(grad_out, pred, target);
+        let vals = read_1d_f32(grad);
+        // N=4, so expected = 2*(p-t)/4 = (p-t)/2.
+        let expected = [0.5_f32, 1.0, 1.5, 2.0];
+        for (i, (&v, &e)) in vals.iter().zip(expected.iter()).enumerate() {
+            assert!((v - e).abs() < 1e-6, "idx {i}: got {v}, expected {e}");
+        }
+        nsl_tensor_free(pred);
+        nsl_tensor_free(target);
+        nsl_tensor_free(grad_out);
+        nsl_tensor_free(grad);
+    }
+
+    #[test]
+    fn test_mse_backward_scales_with_grad_output() {
+        let pred = make_1d_f32(&[10.0, 20.0]);
+        let target = make_1d_f32(&[5.0, 15.0]);
+        let grad_out = nsl_tensor_scalar(3.0, 1);
+        let grad = nsl_mse_backward(grad_out, pred, target);
+        let vals = read_1d_f32(grad);
+        // N=2, expected = 3 * 2 * (p-t) / 2 = 3 * (p-t) = [15, 15].
+        assert!((vals[0] - 15.0).abs() < 1e-6, "vals[0]={}", vals[0]);
+        assert!((vals[1] - 15.0).abs() < 1e-6, "vals[1]={}", vals[1]);
+        nsl_tensor_free(pred);
+        nsl_tensor_free(target);
+        nsl_tensor_free(grad_out);
+        nsl_tensor_free(grad);
     }
 }
 
