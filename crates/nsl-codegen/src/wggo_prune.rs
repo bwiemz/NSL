@@ -407,4 +407,44 @@ mod tests {
             PlanResult::Refused(r) => panic!("expected Ok, got Refused({r:?})"),
         }
     }
+
+    #[test]
+    fn no_residual_add_refusal() {
+        // Closure: 3 Relu ops, NO Add anywhere. Non-residual architecture
+        // (e.g., SSM/Mamba-style layer at the sub-block level).
+        //
+        //   op0: Relu v0 = relu(v_hb)   — v0 is named blocks.7.attn.wq (param producer)
+        //   op1: Relu v1 = relu(v0)
+        //   op2: Relu v2 = relu(v1)
+        //
+        // Expected refusal: NoResidualAdd with closure_size = 3.
+
+        let v_hb: VarId = 100;
+        let v0:   VarId = 200;
+        let v1:   VarId = 201;
+        let v2:   VarId = 202;
+
+        let ops = vec![
+            op_unary(0, v0, v_hb, PrimalOp::Relu),
+            op_unary(1, v1, v0,   PrimalOp::Relu),
+            op_unary(2, v2, v1,   PrimalOp::Relu),
+        ];
+        let wengert = mk_wengert(
+            ops,
+            v2,
+            &[(v_hb, "h_before"), (v0, "blocks.7.attn.wq")],
+        );
+        let layer = mk_prune_layer(7, "blocks.7.attn");
+        let weight_map = WeightMap::default();
+
+        match plan_rewrite(&wengert, &layer, &weight_map) {
+            PlanResult::Refused(PruneRefusal::NoResidualAdd { layer_name, closure_size, .. }) => {
+                assert_eq!(layer_name, "blocks.7.attn");
+                assert_eq!(closure_size, 3,
+                    "all 3 Relu ops are in the closure (no Add to terminate at); got {closure_size}");
+            }
+            PlanResult::Ok(plan) => panic!("expected NoResidualAdd refusal, got Ok({plan:?})"),
+            PlanResult::Refused(other) => panic!("expected NoResidualAdd refusal, got other variant: {other:?}"),
+        }
+    }
 }
