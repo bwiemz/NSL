@@ -141,4 +141,4 @@ See [Adding-a-Language-Feature](Adding-a-Language-Feature.md) for the end-to-end
 
 ---
 
-*Last structurally verified against commit `669f250a` on 2026-04-21. If the crate graph or pass order in this page no longer matches reality, open an issue tagged `docs-rot`.*
+*Last structurally verified against commit `9a1b512e` on 2026-04-21. If the crate graph or pass order in this page no longer matches reality, open an issue tagged `docs-rot`.*
