@@ -35,7 +35,7 @@ mod tests {
 
     #[test]
     fn my_pass_preserves_shapes() {
-        let input = /* hand-built */;
+        let input = todo!("construct a hand-built input");
         let output = my_pass(input);
         assert_eq!(output.shape(), input.shape());
     }
@@ -63,13 +63,13 @@ First run creates `.snap.new`. Review with `cargo insta review` and accept.
 
 **When an existing snapshot changes in a PR**, review the diff deliberately — a snapshot change usually means either (a) your change is correct and the snapshot needs accepting, or (b) you regressed something subtle.
 
-## Differential tests — CPU vs GPU
+## Differential tests — fused vs unfused
 
-Verify numerical equivalence between CPU f64 and GPU f32 paths (within appropriate tolerance — FP16 / FP8 paths need looser tolerance).
+Verifies numerical equivalence between fused and unfused code paths — runs the same `.nsl` script twice via the CLI (once with default fusion, once with `--disable-fusion`) and asserts max-abs-diff within tolerance. Catches precision regressions introduced by fusion passes.
 
-Representative example: [`crates/nsl-cli/tests/differential.rs`](../../crates/nsl-cli/tests/differential.rs) — compiles the same `.nsl` script twice via the CLI (once baseline, once with an optimization flag), captures stdout from both runs, and asserts max-abs-diff is within tolerance. The test gracefully skips if either run fails to compile (e.g. on a machine without CUDA).
+Representative example: [`crates/nsl-cli/tests/differential.rs`](../../crates/nsl-cli/tests/differential.rs) — runs the same `.nsl` script twice via the CLI with and without `--disable-fusion`, captures stdout from both runs, and asserts max-abs-diff is within tolerance. The test gracefully skips if either run fails to compile (detected via `nsl_run()` returning `None`).
 
-Typical tolerance: 5e-3 / 2e-2 / 4e-2 tiers, scaling with `O(sqrt(d) * ε_f16)`. The tighter 5e-3 bound applies to standard f32 paths; 2e-2 to FP16 attention outputs; 4e-2 to accumulations across large head-dim (128+).
+Typical tolerance: tight bounds like `1e-5` or `1e-6` (relative error on f64 stdout, both runs use same dtype and device — no CPU-vs-GPU comparison happens here).
 
 ### Adding one
 
@@ -87,6 +87,14 @@ Run only when a CUDA device is present. The codebase uses two complementary mech
 2. **`#[cfg(feature = "cuda")]`** — used on a subset of tests (primarily in `nsl-codegen`) that require the `cuda` Cargo feature to be compiled at all.
 
 Representative example: [`crates/nsl-codegen/tests/csha_cuda_launch_fused.rs`](../../crates/nsl-codegen/tests/csha_cuda_launch_fused.rs) — GPU-resident CSHA launch tests are decorated with `#[ignore]` and begin with `if !cuda_available() { return; }`. The `cuda_available()` helper calls `nsl_cuda_init()` and returns `false` if the CUDA driver is absent or if `NSL_SKIP_CUDA_TESTS` is set in the environment.
+
+When comparing GPU kernel outputs against a reference implementation, use tiered tolerance based on the data path:
+
+- **5e-3** — standard f32 attention outputs
+- **2e-2** — FP16 attention outputs
+- **4e-2** — accumulations across large head-dim (128+)
+
+These scale with `O(sqrt(d) * ε_f16)` where `d` is the accumulation dimension and `ε_f16` is the FP16 unit roundoff.
 
 ### Running
 
@@ -127,7 +135,7 @@ The `tests/` directory contains the full range of integration fixtures: GPU broa
 
 - **New language feature** → unit + snapshot (AST, IR) + at least one e2e example
 - **New IR pass** → unit (hand-built input) + snapshot (capture pass output) + differential (if it touches math)
-- **New kernel** → unit + differential + GPU-gated smoke
+- **New kernel** → unit + snapshot (PTX) + differential + GPU-gated smoke
 - **Bug fix** → regression test reproducing the bug before the fix
 
 See [Adding-a-Language-Feature](Adding-a-Language-Feature.md) for the end-to-end workflow including where tests fit.
