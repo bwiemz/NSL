@@ -2123,6 +2123,16 @@ fn lower_single_op(
                         &[inputs[0], inputs[1], inputs[2]],
                     )
                 }
+                "mse_backward" => {
+                    // inputs = [grad_output, pred, target]
+                    // Emits grad_output * 2 * (pred - target) / numel(pred).
+                    call(
+                        compiler,
+                        builder,
+                        "nsl_mse_backward",
+                        &[inputs[0], inputs[1], inputs[2]],
+                    )
+                }
                 "zeros" | "ones" | "full" | "randn" | "zeros_like" | "ones_like" => {
                     let rt_name = format!("nsl_tensor_{}", name);
                     call(compiler, builder, &rt_name, &inputs)
