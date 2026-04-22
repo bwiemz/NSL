@@ -61,13 +61,7 @@ Prefix: `feat`, `fix`, `docs`, `test`, `refactor`, `perf`
 
 ## Architecture
 
-- `crates/nsl-lexer/` — Tokenizer
-- `crates/nsl-parser/` — Parser (AST generation)
-- `crates/nsl-ast/` — AST types
-- `crates/nsl-semantic/` — Type checking, ownership, determinism
-- `crates/nsl-codegen/` — Cranelift IR generation, kernel compilation
-- `crates/nsl-runtime/` — Runtime library (tensor ops, serving, GPU)
-- `crates/nsl-cli/` — CLI entry point (`nsl run`, `nsl build`, etc.)
+For architectural documentation (crate graph, compiler pipeline, runtime internals, optimization passes, how to add a language feature), see [`docs/wiki/Architecture-Overview.md`](docs/wiki/Architecture-Overview.md).
 
 ## Questions?
 

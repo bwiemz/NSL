@@ -49,6 +49,8 @@ cd myproject
 nsl run main.nsl
 ```
 
+**Contributing?** See [`docs/wiki/`](docs/wiki/) for architecture, roadmap, and how to extend the compiler.
+
 ## Tutorial: Build a Transformer from Scratch
 
 ### 1. Define a Model
