@@ -120,34 +120,39 @@ The object layout on disk after `harness_entry`:
 
 ### 4.3 The `nsl_calib_model_forward` ABI wrapper
 
-`model_forward` in NSL compiled form takes an `NslTensor*` (internal ABI). For calibration, the inputs come as raw `f32*` buffers from `nsl_calibration_batch_at`. The wrapper bridges the two:
+`model_forward` in NSL compiled form takes an `NslTensor*` (internal ABI). For calibration, the inputs come as raw `f32*` buffers from `nsl_calibration_batch_at`. The wrapper bridges the two. It is emitted as Cranelift IR inside `calib_model.o`; no new runtime FFI is required.
 
 ```rust
-// emitted as part of calib_model.o
-#[repr(C)]
+// signature of the wrapper as Rust-equivalent pseudocode
 #[no_mangle]
 pub extern "C" fn nsl_calib_model_forward(
     batch_f32_ptr: *const f32,
     batch_elem_count: u64,
 ) {
-    // 1. Build an NslTensor wrapping batch_f32_ptr (shape derived from
-    //    ArenaLayout — batch × seq × channels).
-    // 2. Call model_forward(tensor). Retention splice inside populates
+    // 1. Build an NslTensorDesc on the stack with the ArenaLayout's
+    //    declared shape (batch × seq × channels).
+    // 2. Call nsl_desc_to_tensor(&desc) — the existing M62 FFI — which
+    //    constructs an NslTensor aliasing the batch buffer.
+    // 3. Call model_forward(tensor_handle). Retention splice populates
     //    __nsl_calib_retention_arena.
-    // 3. Discard the return value (calibration doesn't use model output).
+    // 4. Free the tensor wrapper via nsl_tensor_free (borrows the data;
+    //    the f32 buffer itself is owned by nsl_calibration_batch_at).
+    // 5. Return (void; calibration discards the forward output).
 }
 ```
 
+**Reuses M62's `nsl_desc_to_tensor`** (`crates/nsl-runtime/src/c_api.rs:597`). M62's existing C-ABI wrapper FFI for `@export` functions already takes `NslTensorDesc*` and returns `*mut NslTensor` with borrow-don't-copy semantics — exactly what calibration needs. Rather than add a parallel `nsl_tensor_wrap_f32_desc` with a different signature shape (raw pointer + length + separate shape array + ndim), this spec reuses M62's existing convention: construct an `NslTensorDesc` on the Cranelift-emitted stack, fill its fields from the ArenaLayout-derived shape + the batch buffer pointer, then call the existing FFI. Zero new runtime FFIs required; perfect consistency with the M62 family.
+
 In Cranelift IR (emitted, not source), the wrapper:
 
-1. Imports `model_forward` (the user-compiled forward) and `nsl_tensor_wrap_f32_desc` (new runtime FFI) as `Linkage::Import`.
-2. Calls `nsl_tensor_wrap_f32_desc(batch_f32_ptr, batch_elem_count, shape_array_ptr, ndim)` — this returns an NSL-internal tensor handle without copying the data.
-3. Calls `model_forward(tensor_handle)`, discards the result.
-4. Returns void.
+1. Imports `model_forward` (the user-compiled forward), `nsl_desc_to_tensor` (M62 FFI, Linkage::Import), and `nsl_tensor_free` (M62 FFI, Linkage::Import).
+2. Allocates an `NslTensorDesc`-sized stack slot; stores `batch_f32_ptr` into the `data` field; stores ArenaLayout-derived shape pointer + `ndim` into the respective fields; stores dtype=f32 flag.
+3. Calls `nsl_desc_to_tensor(desc_ptr)` → receives an `*mut NslTensor` handle.
+4. Calls `model_forward(tensor_handle)`, discards the return value.
+5. Calls `nsl_tensor_free(tensor_handle)` — the wrapper struct is freed but not the aliased data buffer (borrow semantics; buffer ownership stays with `nsl_calibration_batch_at`).
+6. Returns void.
 
-The wrapper is ~30 lines of Cranelift IR inside `calib_model.o`. `batch_elem_count` is checked against the ArenaLayout's declared shape; mismatch is a structured error (§5.1).
-
-**New runtime FFI `nsl_tensor_wrap_f32_desc`:** implementation in `crates/nsl-runtime/src/awq.rs` (adjacent to the existing `nsl_awq_write_sidecar`). Borrows the f32 buffer by pointer, constructs an `NslTensor` on the CPU heap that aliases the borrow, returns the handle. Caller responsible for calling `nsl_tensor_free` after the model_forward call (wrapper does this).
+The wrapper is ~40 lines of Cranelift IR inside `calib_model.o`. `batch_elem_count` is checked against the ArenaLayout's declared shape product; mismatch is a structured error (§5.1).
 
 ### 4.4 Bonus — AST pre-scan extraction
 
@@ -191,7 +196,23 @@ compiler.emit_retention_arena()?;
 
 **Interaction with existing `discover_awq_projections` at `stmt.rs:3950`.** Keep it. The in-train-block call is still the authoritative discovery for runtime-only paths (e.g., tests that don't exercise entry-point dispatch). It becomes a no-op in auto-discovery builds because `calibration_retention` is already populated by the AST pre-scan.
 
-**Idempotence precondition.** `pre_scan_awq_projections_from_ast` and the train-block `discover_awq_projections` must agree byte-for-byte on the DiscoveredProjection set for the same AST. If they diverge, we have a subtle split-brain bug where the retention arena is sized for one set but the max-abs reduction is wired for the other. A differential test (§6.2) is the mitigation.
+**DiscoveredProjection stability contract (load-bearing for the differential test).** `DiscoveredProjection` in `crates/nsl-codegen/src/calibration/discovery.rs:46-52` has exactly two fields:
+
+```rust
+pub struct DiscoveredProjection {
+    pub projection: ProjectionRef,  // qualified path, e.g. "TinyMLP.up_proj"
+    pub weight_shape: [u32; 2],     // [out_features, in_features]
+}
+```
+
+Both fields are **pure-AST-derivable**:
+
+- `projection` is a qualified name synthesised from the model's name (from `ModelDef`) concatenated with a field name (from the model body's tensor field declarations).
+- `weight_shape` comes from parsing the literal tensor-type annotation text (`Tensor<[128, 64], f32>`), which lives in the AST at parse time. The existing `discover_awq_projections_from_state` derives it from a `tensor_shapes: HashMap<String, String>` map of stringified annotations — that map's entries are verbatim AST text, requiring no name resolution or type-checking to extract.
+
+Therefore Option (a) — pure-AST — applies: `pre_scan_awq_projections_from_ast` and the train-block `discover_awq_projections_from_state` arrive at **byte-for-byte identical** `DiscoveredProjection` vectors for the same AST. No masked-field comparator is needed; the differential test (§6.3) uses plain `assert_eq!`. If a future refactor adds a lowered-state-dependent field to `DiscoveredProjection` (e.g., `resolved_weight_var: VarId`), the differential test breaks and forces a design decision at review time: either make the new field pure-AST-derivable, or split the struct into a pre-scan-facing subset and an enriched superset. The spec pins the current pure-AST invariant; any future erosion of it requires a spec update, not a test-side comparator workaround.
+
+**Runtime divergence handling.** If the two paths somehow diverge at runtime despite the differential test passing on every fixture (e.g., a user's NSL source hits an AST shape no fixture exercised and exposes a discovery path bug), the refusal in §5.3 fires at compile time with a three-part error. Hard error, not silent split-brain arena.
 
 ### 4.5 Loop-body edit
 
@@ -321,18 +342,22 @@ Compile-time refusal in `emit_and_link_calibration_binary`; `HarnessError::Infra
 
 ### 5.5 Auto-discovery ran but produced zero projections with `@quantize model` present
 
-Trigger: AST contains a `@quantize model` decorator with AWQ config but pre-scan returns an empty DiscoveredProjection vec. Likely a discovery bug.
+Trigger: AST contains a `@quantize model` decorator with AWQ config but pre-scan returns an empty DiscoveredProjection vec.
 
 ```text
 calibration: @quantize model declared but no AWQ projections discovered.
   requested:  auto-discover AWQ projections from {source_file}
   expected:   @quantize model + AWQ config ⇒ at least one DiscoveredProjection
+              (if the model has no projections to quantize, the decorator
+               should be removed)
   found:      decorator present at {span}; zero projections emitted.
-              Either the model's nn.Linear layers are not yet lowered at
-              pre-scan time, or projection enumeration is broken.
+              Action: either remove the @quantize model decorator, or add
+              the Linear/tensor projections the decorator is meant to target.
 ```
 
-Compile-time warning (not error) because a user might legitimately guard the decorator behind a config flag with no Linear layers inside; the empty discovery then is correct. A warning still catches the more common bug.
+**Hard-fail, not warning.** An earlier draft of this spec framed §5.5 as a compile-time warning on the rationale "a user might legitimately guard the decorator behind a config flag with no Linear layers inside." That reasoning was rejected during review: the warning-and-proceed pattern is exactly the "fallback to weaker transformations with different semantics" case the spec's §11 principle #1 rejects. Compilation succeeding with no quantization when the user wrote `@quantize model` is not semantically equivalent to the quantized binary the user asked for — it's a silent semantic downgrade that would train users to ignore calibration stderr output. Symmetric hard-failure with §5.1–5.4 gives the user an actionable diagnostic at compile time; they remove the decorator or add the layers they intended. No "legitimately guarded decorator" NSL syntax exists today (there is no `@quantize model if <flag>`), so no legitimate scenario justifies the relaxation.
+
+Variant: `HarnessError::Infrastructure` with structured diagnostic code `AwqDecoratorNoProjections`. Compilation fails; no subprocess is spawned.
 
 ---
 
@@ -374,7 +399,7 @@ Build a minimal NSL fixture with a single `@quantize model` + one Linear layer. 
 - The final binary exports `main` and does NOT export `model_forward` (internal to the model object).
 - On platforms supporting it, `nm` / `dumpbin` shows `nsl_calib_model_forward` resolved (not undefined).
 
-The platform-portability concerns from the 2026-04-14 spec §5.4 (`objdump | grep -i cuda`) apply identically; gate the nm-style assertion with the same platform guard.
+**Platform guard is literally `#[cfg(any(target_os = "linux", target_os = "macos"))]`.** The 2026-04-14 spec §5.4 used the same predicate informally ("skip on Windows or use platform-conditional test"); this spec pins it explicitly so the test file is self-contained and future spec edits don't cascade through indirection. The nm-style symbol-resolution assertion and the no-CUDA-linkage `objdump`/`ldd` assertion share this single predicate — one `#[cfg]` attribute guards both. Windows exercises the link step itself (via the test's subprocess call to `link_multi`); only the post-link symbol-inspection assertions are gated off Windows because `dumpbin` availability is not guaranteed in CI environments.
 
 ### 6.3 Bonus — AST pre-scan differential test
 
@@ -399,9 +424,19 @@ One test per fixture. Catches the §5.3 divergence case at build time rather tha
 
 File: `crates/nsl-codegen/tests/awq_full_pipeline.rs`.
 
-Re-land the `end_to_end_real_subprocess_matches_analytical_reference` test that commit `7e035855` reverted. Shape is unchanged from `e36634a6`:
+Re-land the `end_to_end_real_subprocess_matches_analytical_reference` test that commit `7e035855` reverted. Shape is unchanged from `e36634a6` (the original commit), including its **5e-6** tolerance with the original ULP-derivation rationale restored as a source comment:
 
 ```rust
+/// Tolerance: 5e-6 — f32 matmul over 64-length reductions accumulates
+/// ~4 ULPs of round-off vs. a pairwise accumulator; the subprocess
+/// runs the same fabs/fmax loop as the analytical reference, so the
+/// dominant source of drift is model_forward's matmul reordering, not
+/// the reduction. Fixture dimensions:
+///   up_proj:   [128, 64] — K=64 reduction in the forward matmul
+///   down_proj: [64, 128] — K=128 reduction, tighter but still below 5e-6
+///   batch:     [8, 4, 64] = 32 rows × 64 channels of calibration data
+/// Tighter (e.g. 1e-6) risks flakiness from reduction-order drift;
+/// looser would mask real subprocess-pipeline bugs.
 #[test]
 fn end_to_end_real_subprocess_matches_analytical_reference() {
     let sidecar = compile_and_calibrate(
@@ -417,14 +452,16 @@ fn end_to_end_real_subprocess_matches_analytical_reference() {
     let up_actual   = awq_scales(&sidecar, "TinyMLP.up_proj");
     let down_actual = awq_scales(&sidecar, "TinyMLP.down_proj");
 
-    assert_close(&up_actual,   &up_ref,   1e-6, "up_proj scales diverge from reference");
-    assert_close(&down_actual, &down_ref, 1e-6, "down_proj scales diverge from reference");
+    // 5e-6 tolerance: f32 matmul over length-64 inner products accumulates
+    // ~4 ULPs of round-off vs. the analytical reference's sequential summation.
+    assert_close(&up_actual,   &up_ref,   5e-6, "up_proj");
+    assert_close(&down_actual, &down_ref, 5e-6, "down_proj");
 }
 ```
 
 **This test is the merge gate. Without it, the claim "subprocess produces honest scales" has no evidence.**
 
-The `reference_awq_scales` analytical helper from the 2026-04-14 spec §5.2 is re-added alongside. The `1e-6` tolerance accounts for f32 rounding in matmul order-of-operations — identical to the original.
+The `reference_awq_scales` analytical helper from the 2026-04-14 spec §5.2 is re-added alongside. The tolerance matches the reverted commit exactly (5e-6, not 1e-6); the earlier draft of this spec mis-cited 1e-6 by mistake — the reverted code's landed value was 5e-6 with the rationale inlined above.
 
 If the test is unreachable at re-land time (e.g., because CI lacks the linker Cranelift needs on that platform), the test is gated behind a feature flag equivalent to the existing `#[cfg(feature = "real-subprocess-test")]` pattern with explicit `"ignored"` semantics — NOT deleted. Deletion without equivalent coverage would recreate the exact bug class the Task 6 revert introduced.
 
@@ -479,7 +516,7 @@ harness_entry:
 
 1. **AST pre-scan runs before `emit_retention_arena`** in every entry point. Without this, auto-discovery builds hit the Bonus gap silently.
 2. **`model_forward` call emission comes after `nsl_calibration_batch_at` and before the max-abs reduction** in `loop_body`. Without this, Gap 2 reappears.
-3. **`calib_model.o` linked first** (or at least listed before `scaffolding.o`) in `link_multi`'s argument vector if the platform's linker cares about object order. On Linux/macOS (GNU ld / lld) order is flexible for exports; on MSVC link.exe order can matter. Spec picks `&[scaffolding.o, calib_model.o]` as canonical; if link fails due to order, the implementation plan handles the reversal.
+3. **Canonical link-argument order is `&[scaffolding.o, calib_model.o]`.** Both GNU ld/lld and MSVC link.exe read all `.o` files up front and resolve cross-object references in a single symbol-table pass — order sensitivity for `.o` arguments is only a concern in weak-symbol override scenarios (LTO, `/ALTERNATENAME`), none of which this spec uses. `.lib`/`.a` scanning (which IS order-sensitive on MSVC single-pass `/DEFAULTLIB:` resolution) is handled by `linker::link_multi`'s existing runtime-staticlib append, unchanged by this work. The canonical order is pinned here so the implementation doesn't need a trial-and-error reversal fallback; if the link step fails at implementation time, the failure is loud (`link.exe` emits an `LNK2019` unresolved external) and the root cause gets investigated rather than papered over by flipping argument order. Removing the "handles the reversal" fallback from an earlier draft enforces the spec's overall refusal discipline (see §11 principle #1).
 4. **ArenaLayout computed once, reused by both object emissions.** If they disagree, arena offsets don't match between the splice's writes and the reduction's reads — silent garbage. Enforced by constructing ArenaLayout in `harness_entry` and passing it by shared reference.
 
 ---
@@ -520,20 +557,9 @@ pub(crate) fn link_calibration_binary(
 ) -> Result<(), HarnessError>;
 ```
 
-### 8.2 New runtime FFI
+### 8.2 No new runtime FFIs
 
-```rust
-// crates/nsl-runtime/src/awq.rs
-#[no_mangle]
-pub extern "C" fn nsl_tensor_wrap_f32_desc(
-    data_ptr: *const f32,
-    elem_count: u64,
-    shape_ptr: *const u64,
-    ndim: u32,
-) -> *mut NslTensor;
-```
-
-Implementation mirrors the existing `nsl_desc_to_tensor` from the M62 C-wrapper work — same borrow-don't-copy semantics. Returns a heap-allocated `NslTensor` that aliases the input buffer. Caller calls `nsl_tensor_free` when done.
+The wrapper (§4.3) reuses the existing M62 FFIs `nsl_desc_to_tensor` and `nsl_tensor_free` (both in `crates/nsl-runtime/src/c_api.rs`) via `Linkage::Import` from within `calib_model.o`. An earlier draft of this spec proposed a new `nsl_tensor_wrap_f32_desc(data_ptr, elem_count, shape_ptr, ndim)` FFI; that design was rejected during review for unnecessarily duplicating M62's `NslTensorDesc`-based calling convention. Zero new runtime FFIs reduces the runtime's ABI surface and guarantees behavioural consistency with the M62 `@export` wrapper family (same tensor-wrapping semantics, same free semantics, same lifetime rules).
 
 ### 8.3 Renamed / deprecated symbols
 
@@ -547,7 +573,7 @@ Implementation mirrors the existing `nsl_desc_to_tensor` from the M62 C-wrapper 
 Implementation is expected to land in four commits plus the Task 6 re-land:
 
 - **Commit A — AST pre-scan (Bonus gap).** Extracts discovery into `pre_scan_awq_projections_from_ast`, wires it into every entry point before `emit_retention_arena`, adds the differential test (§6.3). Train-block `discover_awq_projections` becomes a no-op when `calibration_retention` is already set. All existing tests stay green.
-- **Commit B — Two-object split (Gap 3 scaffolding).** `emit_and_link_calibration_binary` is split into `emit_calibration_model_object` + `emit_calibration_scaffolding_object` + `link_calibration_binary`. Model object is stub-sized at this commit (no model_forward body yet; just the symbol); scaffolding still imports it. Link succeeds; tests still use the observation-free path and stay green. This commit isolates the object-split refactor.
+- **Commit B — Two-object split (Gap 3 scaffolding).** `emit_and_link_calibration_binary` is split into `emit_calibration_model_object` + `emit_calibration_scaffolding_object` + `link_calibration_binary`. Model object is stub-sized at this commit (no model_forward body yet; just the symbol); scaffolding still imports it. Link succeeds; tests still use the observation-free path and stay green. This commit isolates the object-split refactor. **Intentional intermediate state:** between Commit B and Commit C, a hand-run calibration subprocess produces empty sidecars because model_forward is a stub — the end-to-end pipeline does not work yet. Implementers smoke-testing Commit B should expect empty scales and not panic; the end-to-end path becomes live with Commit C's wrapper + loop-body edit. Commit D adds structured refusals on top; Commit E adds the proof via the analytical test.
 - **Commit C — `nsl_calib_model_forward` wrapper + `nsl_tensor_wrap_f32_desc` (Gap 2 + Gap 3 completion).** Implements the wrapper IR emission in `emit_calibration_model_object` and the runtime FFI. Loop-body edit in `emit_calibration_scaffolding_object` adds the `model_forward` call between `batch_at` and reduction. §6.1 unit test green. §6.2 link-step integration test green.
 - **Commit D — Refusal surface + diagnostics.** Implements §5.1–5.5 three-part errors. Each has a unit test asserting the exact stderr text + a structured diagnostic code.
 - **Commit E (merge gate) — Re-land Task 6 analytical test.** `reference_awq_scales` helper + `end_to_end_real_subprocess_matches_analytical_reference` re-added exactly as the revert removed them. Test passes bit-exact within 1e-6 tolerance. Task 7 stale-comment cleanup included here for hygiene.
@@ -594,5 +620,7 @@ Inherits from three prior institutional rules:
 ## 13. Relationship to other in-flight work
 
 - **WGGO Prune v1 IR rewrite** (separate branch `feat/wggo-prune-ir-rewrite`). Independent; no shared code, no shared ordering constraints. Both specs share the "transformation-precondition-refusal" discipline and cite each other as adjacent instances of the rule.
-- **WGGO Phase 2 gradient scoring** (depends on this spec). Once calibration produces real scales, `wggo_head_gradients` in the sidecar starts returning populated data; `CalibratedGradientScorer` switches from silent MagnitudeFallback to real gradient-based scoring. Memory file `project_wggo_phase2.md` tracks this dependency.
-- **M62 C wrappers** (shipped via PR #48). The `nsl_tensor_wrap_f32_desc` FFI in §8.2 is the calibration-side analogue of M62's `nsl_desc_to_tensor`. Same borrow-don't-copy semantics; same runtime module. No merge conflicts expected.
+- **WGGO Phase 2 gradient scoring** (depends on this spec). Once calibration produces real scales, `wggo_head_gradients` in the sidecar starts returning populated data; `CalibratedGradientScorer` switches from silent MagnitudeFallback to real gradient-based scoring. Memory file `project_wggo_phase2.md` tracks this dependency. **Implicit behavioural shift.** The scorer's switch is automatic — no WGGO Phase 2 code changes when this spec ships. Two consequences worth surfacing before Commit E lands:
+  - Any existing WGGO Phase 2 test that asserted MagnitudeFallback output will need review after this spec's merge gate clears. Not a blocker for this spec, but a follow-up sweep task on `feat/wggo-phase2`'s test suite.
+  - A smoke test that compiles the same fixture twice — once under MagnitudeFallback (e.g., by stubbing the sidecar load), once under this spec's real scorer — and asserts the scorer output is both (i) different between the two and (ii) plausible under gradient-based importance rules, would catch unintended interactions. Not added to this spec's §6 test plan because the assertion lives in WGGO Phase 2's surface, not calibration's; tracked here as a downstream follow-up.
+- **M62 C wrappers** (shipped via PR #48). This spec reuses M62's existing `nsl_desc_to_tensor` + `nsl_tensor_free` FFIs directly inside the calibration wrapper (see §4.3); no parallel FFI family is introduced. The runtime ABI surface stays unchanged. No merge conflicts expected.
