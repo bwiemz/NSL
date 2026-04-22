@@ -36,7 +36,13 @@ expression: ptx
     .param .u64 csha_wo_ptr,
     .param .f32 csha_eps,
     .param .u32 csha_active_heads,
-    .param .u32 csha_d_model
+    .param .u32 csha_d_model,
+    .param .u64 q_proj_ptr,
+    .param .u64 k_proj_ptr,
+    .param .u64 v_proj_ptr,
+    .param .u64 row_max_ptr,
+    .param .u64 row_sum_ptr,
+    .param .u64 x_raw_ptr
 )
 {
     .shared .align 16 .b8 shmem[33792];

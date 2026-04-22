@@ -210,6 +210,8 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
     }
 
     // Causal mask: if k_global > q_row_global, S = -inf.
+    // When both config.causal and config.segment_masked are true, also
+    // mask if segment_ids[q_row_global] != segment_ids[k_global] (spec §5.1).
     if config.causal {
         ptx.push_str("    // causal: if k_global > q_row_global -> S = -inf\n");
         ptx.push_str("    cvt.u64.u32 %rd34, %r1;                   // k\n");
@@ -221,6 +223,20 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
         ptx.push_str("    cvt.u64.u32 %rd35, %r3;\n");
         ptx.push_str("    add.u64 %rd35, %q_start, %rd35;            // q_row_global\n");
         ptx.push_str("    setp.gt.u64 %p0, %rd34, %rd35;\n");
+        // PCA Tier A: extend %p0 with cross-segment disjunction (spec §5.1).
+        // Guard: only when BOTH causal (so %p0 is already set) AND segment_masked.
+        // If !causal && segment_masked, %p0 is uninitialized; we skip rather than
+        // extend a garbage predicate (spec §3.2 rejects that config in practice).
+        if config.segment_masked {
+            crate::flash_attention_v2::phases::segment_mask::emit_segment_mask_predicate(
+                ptx,
+                "%rd35",   // q_pos_reg (q_row_global, u64)
+                "%rd34",   // k_pos_reg  (k_global, u64)
+                "%seg_base", // SMEM base declared in prelude (u64 generic address)
+                crate::pca_segment::SegmentResidency::Shared,
+                "%p0",     // extend caller's mask predicate in place
+            );
+        }
         ptx.push_str("    @%p0 mov.f32 %f0, 0fFF800000;             // -inf\n");
     }
 

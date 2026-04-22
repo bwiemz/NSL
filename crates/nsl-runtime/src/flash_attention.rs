@@ -395,6 +395,12 @@ pub extern "C" fn nsl_flash_attention_csha(
     rmsnorm_eps_bits: i64,
     active_heads: i64,
     d_model: i64,
+    // PCA Tier A: segment_ids device pointer for packed-sequence training.
+    // Pass 0 on unpacked launches. The companion PTX kernel declares this
+    // param in its prelude only when its FlashAttentionConfig has
+    // segment_masked=true, in which case the pointer must be non-null and
+    // reference a [B, S] u16 tensor in global memory.
+    segment_ids_ptr: i64,
 ) -> i64 {
     #[cfg(feature = "cuda")]
     {
@@ -473,8 +479,10 @@ pub extern "C" fn nsl_flash_attention_csha(
         let mut rmax: u64 = 0;
         let mut rsum: u64 = 0;
         let mut xraw: u64 = 0;
+        // PCA Tier A: segment_ids slot (trailing — matches prelude params Vec order).
+        let mut seg_ids = segment_ids_ptr as u64;
 
-        let args: [*mut c_void; 36] = [
+        let args: [*mut c_void; 37] = [
             &mut q as *mut _ as *mut c_void,
             &mut k as *mut _ as *mut c_void,
             &mut v as *mut _ as *mut c_void,
@@ -513,6 +521,8 @@ pub extern "C" fn nsl_flash_attention_csha(
             &mut rmax as *mut _ as *mut c_void,
             &mut rsum as *mut _ as *mut c_void,
             &mut xraw as *mut _ as *mut c_void,
+            // PCA Tier A: segment_ids slot (trailing — matches prelude params Vec order)
+            &mut seg_ids as *mut _ as *mut c_void,
         ];
 
         let result = crate::cuda::inner::kernel_launch(
@@ -557,7 +567,7 @@ pub extern "C" fn nsl_flash_attention_csha(
         let _ = (cos_ptr, sin_ptr, seq_ids_ptr, seq_lens_ptr);
         let _ = (shared_mem_bytes, ptx_ptr, name_ptr, block_q, _block_kv, causal);
         let _ = (x_ptr, norm_weight_ptr, wq_ptr, wk_ptr, wv_ptr, wo_ptr);
-        let _ = (rmsnorm_eps_bits, active_heads, d_model);
+        let _ = (rmsnorm_eps_bits, active_heads, d_model, segment_ids_ptr);
         eprintln!("[nsl] CSHA FlashAttention requires CUDA; non-CUDA build cannot launch.");
         -1
     }
@@ -610,6 +620,12 @@ pub extern "C" fn nsl_flash_attention_csha_with_saves(
     // RMSNorm overwrites csha_x_ptr in place, so the backward dRMSNorm
     // can read pre-norm x). Null = skip the save.
     x_raw_ptr: i64,
+    // PCA Tier A: segment_ids device pointer for packed-sequence training.
+    // Pass 0 on unpacked launches. The companion PTX kernel declares this
+    // param in its prelude only when its FlashAttentionConfig has
+    // segment_masked=true, in which case the pointer must be non-null and
+    // reference a [B, S] u16 tensor in global memory.
+    segment_ids_ptr: i64,
 ) -> i64 {
     #[cfg(feature = "cuda")]
     {
@@ -668,8 +684,10 @@ pub extern "C" fn nsl_flash_attention_csha_with_saves(
         let mut rmax = row_max_ptr as u64;
         let mut rsum = row_sum_ptr as u64;
         let mut xraw = x_raw_ptr as u64;
+        // PCA Tier A: segment_ids slot (trailing — matches prelude params Vec order).
+        let mut seg_ids = segment_ids_ptr as u64;
 
-        let args: [*mut c_void; 36] = [
+        let args: [*mut c_void; 37] = [
             &mut q as *mut _ as *mut c_void,
             &mut k as *mut _ as *mut c_void,
             &mut v as *mut _ as *mut c_void,
@@ -706,6 +724,8 @@ pub extern "C" fn nsl_flash_attention_csha_with_saves(
             &mut rmax as *mut _ as *mut c_void,
             &mut rsum as *mut _ as *mut c_void,
             &mut xraw as *mut _ as *mut c_void,
+            // PCA Tier A: segment_ids slot (trailing — matches prelude params Vec order)
+            &mut seg_ids as *mut _ as *mut c_void,
         ];
 
         // NSL_CSHA_DUMP_GRADS=1 forward-side diag: read the PTX kernel name
@@ -835,7 +855,7 @@ pub extern "C" fn nsl_flash_attention_csha_with_saves(
         let _ = (shared_mem_bytes, ptx_ptr, name_ptr, block_q, _block_kv, causal);
         let _ = (x_ptr, norm_weight_ptr, wq_ptr, wk_ptr, wv_ptr, wo_ptr);
         let _ = (rmsnorm_eps_bits, active_heads, d_model);
-        let _ = (q_proj_ptr, k_proj_ptr, v_proj_ptr, row_max_ptr, row_sum_ptr, x_raw_ptr);
+        let _ = (q_proj_ptr, k_proj_ptr, v_proj_ptr, row_max_ptr, row_sum_ptr, x_raw_ptr, segment_ids_ptr);
         eprintln!("[nsl] CSHA FlashAttention w/ saves requires CUDA.");
         -1
     }
@@ -896,6 +916,12 @@ pub extern "C" fn nsl_flash_attention_csha_backward(
     // CSHA dispatch path. f32, shape [batch, seq, d_model]. Null when
     // caller doesn't need it (e.g. inference warm-ups).
     dx_norm_ptr: i64,
+    // PCA Tier A Task 4B: segment_ids device pointer for packed-sequence training.
+    // Pass 0 on unpacked launches. The companion backward PTX kernel (Task 4A)
+    // declares this param in its prelude only when segment_masked=true; the
+    // segment_masked=false variant doesn't read this slot, so passing 0 is safe
+    // for all existing callers.
+    segment_ids_ptr: i64,
 ) -> i64 {
     #[cfg(feature = "cuda")]
     {
@@ -981,8 +1007,12 @@ pub extern "C" fn nsl_flash_attention_csha_backward(
         let mut d_wv = csha_tensor_data_ptr(dwv_ptr);
         let mut d_x = csha_tensor_data_ptr(dx_ptr);
         let mut d_xn = csha_tensor_data_ptr(dx_norm_ptr);
+        // PCA Tier A Task 4B: segment_ids device pointer — raw pass-through
+        // (not an NslTensor handle). Null on unpacked launches; the
+        // segment_masked kernel variant reads it only when set.
+        let mut seg_ids = segment_ids_ptr as u64;
 
-        let args: [*mut c_void; 45] = [
+        let args: [*mut c_void; 46] = [
             &mut q as *mut _ as *mut c_void,
             &mut k as *mut _ as *mut c_void,
             &mut v as *mut _ as *mut c_void,
@@ -1029,6 +1059,8 @@ pub extern "C" fn nsl_flash_attention_csha_backward(
             &mut d_wv as *mut _ as *mut c_void,
             &mut d_x as *mut _ as *mut c_void,
             &mut d_xn as *mut _ as *mut c_void,
+            // PCA Tier A Task 4B: segment_ids trailing slot.
+            &mut seg_ids as *mut _ as *mut c_void,
         ];
 
         let rc = crate::cuda::inner::kernel_launch(
@@ -1093,6 +1125,7 @@ pub extern "C" fn nsl_flash_attention_csha_backward(
         let _ = (rmsnorm_eps_bits, active_heads, d_model);
         let _ = (q_proj_ptr, k_proj_ptr, v_proj_ptr, row_max_ptr, row_sum_ptr, x_raw_ptr);
         let _ = (do_ptr, dq_ptr, dk_ptr, dv_ptr, dwq_ptr, dwk_ptr, dwv_ptr, dx_ptr, dx_norm_ptr);
+        let _ = segment_ids_ptr;
         eprintln!("[nsl] CSHA backward requires CUDA.");
         -1
     }
@@ -3080,6 +3113,8 @@ mod tests {
             0, 0, 0, 0, 0, 0,
             1e-5f32.to_bits() as i64,
             0, 0,
+            // PCA Tier A: segment_ids_ptr (0 = unpacked path).
+            0,
         );
         assert_eq!(r, -1, "non-CUDA build must return -1 for the CSHA FFI");
     }
@@ -3127,15 +3162,16 @@ mod tests {
         assert_eq!(a4_effective_heads(8, 8), 8);
     }
 
-    /// Smoke test: the CSHA FFI symbol resolves and the 30-parameter
+    /// Smoke test: the CSHA FFI symbol resolves and the 34-parameter
     /// signature is wired correctly through the `extern "C"` ABI.
     /// This catches A.2.5 signature regressions (e.g. an accidentally
     /// dropped extras arg) at link time — the forwarder version would
     /// have silently ignored wrong-count calls.
+    /// Updated in PCA Tier A Task 3C: one trailing segment_ids_ptr added.
     #[test]
     #[cfg(not(feature = "cuda"))]
     fn a25_csha_ffi_signature_has_thirty_params() {
-        // Type-check: compiler enforces the full 30-arg signature.
+        // Type-check: compiler enforces the full 34-arg signature.
         let _: extern "C" fn(
             i64, i64, i64, i64, i64, i64,
             i64, i64, i64, i64,
@@ -3146,6 +3182,8 @@ mod tests {
             // extras
             i64, i64, i64, i64, i64, i64,
             i64, i64, i64,
+            // PCA Tier A: segment_ids_ptr
+            i64,
         ) -> i64 = nsl_flash_attention_csha;
     }
 }

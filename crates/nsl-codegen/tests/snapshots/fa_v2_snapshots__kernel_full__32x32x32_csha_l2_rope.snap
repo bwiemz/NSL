@@ -36,7 +36,13 @@ expression: s
     .param .u64 csha_wo_ptr,
     .param .f32 csha_eps,
     .param .u32 csha_active_heads,
-    .param .u32 csha_d_model
+    .param .u32 csha_d_model,
+    .param .u64 q_proj_ptr,
+    .param .u64 k_proj_ptr,
+    .param .u64 v_proj_ptr,
+    .param .u64 row_max_ptr,
+    .param .u64 row_sum_ptr,
+    .param .u64 x_raw_ptr
 )
 {
     .shared .align 16 .b8 shmem[18688];
@@ -121,6 +127,8 @@ V2_CSHA_ACTIVE_HEADS_SKIP:
     ld.param.u64 %rd52, [csha_x_ptr];
     setp.eq.u64 %p0, %rd52, 0;
     @%p0 bra V2_CSHA_PROLOGUE_SKIP_0;
+    ld.param.u64 %rd58, [x_raw_ptr];
+    setp.eq.u64 %p1, %rd58, 0;
     mov.f32 %f0, 0f00000000;             // sumsq = 0
     // x slice 0: load, square, accumulate
     cvt.u64.u32 %rd53, %lane;
@@ -137,6 +145,9 @@ V2_CSHA_ACTIVE_HEADS_SKIP:
     add.u64 %rd54, %rd52, %rd54;
     ld.global.f32 %f1, [%rd54];
     fma.rn.f32 %f0, %f1, %f1, %f0;            // sumsq += x*x
+    sub.u64 %rd59, %rd54, %rd52;        // byte_off = abs - x_base
+    add.u64 %rd59, %rd58, %rd59;        // x_raw addr
+    @!%p1 st.global.f32 [%rd59], %f1;   // x_raw save (null-gated)
     shfl.sync.bfly.b32 %shfl_tmp, %f0, 16, 31, 0xFFFFFFFF;
     add.f32 %f0, %f0, %shfl_tmp;
     shfl.sync.bfly.b32 %shfl_tmp, %f0, 8, 31, 0xFFFFFFFF;
@@ -180,6 +191,8 @@ V2_CSHA_PROLOGUE_SKIP_0:
     ld.param.u64 %rd52, [csha_x_ptr];
     setp.eq.u64 %p0, %rd52, 0;
     @%p0 bra V2_CSHA_PROLOGUE_SKIP_1;
+    ld.param.u64 %rd58, [x_raw_ptr];
+    setp.eq.u64 %p1, %rd58, 0;
     mov.f32 %f0, 0f00000000;             // sumsq = 0
     // x slice 0: load, square, accumulate
     cvt.u64.u32 %rd53, %lane;
@@ -196,6 +209,9 @@ V2_CSHA_PROLOGUE_SKIP_0:
     add.u64 %rd54, %rd52, %rd54;
     ld.global.f32 %f1, [%rd54];
     fma.rn.f32 %f0, %f1, %f1, %f0;            // sumsq += x*x
+    sub.u64 %rd59, %rd54, %rd52;        // byte_off = abs - x_base
+    add.u64 %rd59, %rd58, %rd59;        // x_raw addr
+    @!%p1 st.global.f32 [%rd59], %f1;   // x_raw save (null-gated)
     shfl.sync.bfly.b32 %shfl_tmp, %f0, 16, 31, 0xFFFFFFFF;
     add.f32 %f0, %f0, %shfl_tmp;
     shfl.sync.bfly.b32 %shfl_tmp, %f0, 8, 31, 0xFFFFFFFF;
@@ -239,6 +255,8 @@ V2_CSHA_PROLOGUE_SKIP_1:
     ld.param.u64 %rd52, [csha_x_ptr];
     setp.eq.u64 %p0, %rd52, 0;
     @%p0 bra V2_CSHA_PROLOGUE_SKIP_2;
+    ld.param.u64 %rd58, [x_raw_ptr];
+    setp.eq.u64 %p1, %rd58, 0;
     mov.f32 %f0, 0f00000000;             // sumsq = 0
     // x slice 0: load, square, accumulate
     cvt.u64.u32 %rd53, %lane;
@@ -255,6 +273,9 @@ V2_CSHA_PROLOGUE_SKIP_1:
     add.u64 %rd54, %rd52, %rd54;
     ld.global.f32 %f1, [%rd54];
     fma.rn.f32 %f0, %f1, %f1, %f0;            // sumsq += x*x
+    sub.u64 %rd59, %rd54, %rd52;        // byte_off = abs - x_base
+    add.u64 %rd59, %rd58, %rd59;        // x_raw addr
+    @!%p1 st.global.f32 [%rd59], %f1;   // x_raw save (null-gated)
     shfl.sync.bfly.b32 %shfl_tmp, %f0, 16, 31, 0xFFFFFFFF;
     add.f32 %f0, %f0, %shfl_tmp;
     shfl.sync.bfly.b32 %shfl_tmp, %f0, 8, 31, 0xFFFFFFFF;
@@ -298,6 +319,8 @@ V2_CSHA_PROLOGUE_SKIP_2:
     ld.param.u64 %rd52, [csha_x_ptr];
     setp.eq.u64 %p0, %rd52, 0;
     @%p0 bra V2_CSHA_PROLOGUE_SKIP_3;
+    ld.param.u64 %rd58, [x_raw_ptr];
+    setp.eq.u64 %p1, %rd58, 0;
     mov.f32 %f0, 0f00000000;             // sumsq = 0
     // x slice 0: load, square, accumulate
     cvt.u64.u32 %rd53, %lane;
@@ -314,6 +337,9 @@ V2_CSHA_PROLOGUE_SKIP_2:
     add.u64 %rd54, %rd52, %rd54;
     ld.global.f32 %f1, [%rd54];
     fma.rn.f32 %f0, %f1, %f1, %f0;            // sumsq += x*x
+    sub.u64 %rd59, %rd54, %rd52;        // byte_off = abs - x_base
+    add.u64 %rd59, %rd58, %rd59;        // x_raw addr
+    @!%p1 st.global.f32 [%rd59], %f1;   // x_raw save (null-gated)
     shfl.sync.bfly.b32 %shfl_tmp, %f0, 16, 31, 0xFFFFFFFF;
     add.f32 %f0, %f0, %shfl_tmp;
     shfl.sync.bfly.b32 %shfl_tmp, %f0, 8, 31, 0xFFFFFFFF;
@@ -357,6 +383,8 @@ V2_CSHA_PROLOGUE_SKIP_3:
     ld.param.u64 %rd52, [csha_x_ptr];
     setp.eq.u64 %p0, %rd52, 0;
     @%p0 bra V2_CSHA_PROLOGUE_SKIP_4;
+    ld.param.u64 %rd58, [x_raw_ptr];
+    setp.eq.u64 %p1, %rd58, 0;
     mov.f32 %f0, 0f00000000;             // sumsq = 0
     // x slice 0: load, square, accumulate
     cvt.u64.u32 %rd53, %lane;
@@ -373,6 +401,9 @@ V2_CSHA_PROLOGUE_SKIP_3:
     add.u64 %rd54, %rd52, %rd54;
     ld.global.f32 %f1, [%rd54];
     fma.rn.f32 %f0, %f1, %f1, %f0;            // sumsq += x*x
+    sub.u64 %rd59, %rd54, %rd52;        // byte_off = abs - x_base
+    add.u64 %rd59, %rd58, %rd59;        // x_raw addr
+    @!%p1 st.global.f32 [%rd59], %f1;   // x_raw save (null-gated)
     shfl.sync.bfly.b32 %shfl_tmp, %f0, 16, 31, 0xFFFFFFFF;
     add.f32 %f0, %f0, %shfl_tmp;
     shfl.sync.bfly.b32 %shfl_tmp, %f0, 8, 31, 0xFFFFFFFF;
@@ -416,6 +447,8 @@ V2_CSHA_PROLOGUE_SKIP_4:
     ld.param.u64 %rd52, [csha_x_ptr];
     setp.eq.u64 %p0, %rd52, 0;
     @%p0 bra V2_CSHA_PROLOGUE_SKIP_5;
+    ld.param.u64 %rd58, [x_raw_ptr];
+    setp.eq.u64 %p1, %rd58, 0;
     mov.f32 %f0, 0f00000000;             // sumsq = 0
     // x slice 0: load, square, accumulate
     cvt.u64.u32 %rd53, %lane;
@@ -432,6 +465,9 @@ V2_CSHA_PROLOGUE_SKIP_4:
     add.u64 %rd54, %rd52, %rd54;
     ld.global.f32 %f1, [%rd54];
     fma.rn.f32 %f0, %f1, %f1, %f0;            // sumsq += x*x
+    sub.u64 %rd59, %rd54, %rd52;        // byte_off = abs - x_base
+    add.u64 %rd59, %rd58, %rd59;        // x_raw addr
+    @!%p1 st.global.f32 [%rd59], %f1;   // x_raw save (null-gated)
     shfl.sync.bfly.b32 %shfl_tmp, %f0, 16, 31, 0xFFFFFFFF;
     add.f32 %f0, %f0, %shfl_tmp;
     shfl.sync.bfly.b32 %shfl_tmp, %f0, 8, 31, 0xFFFFFFFF;
@@ -475,6 +511,8 @@ V2_CSHA_PROLOGUE_SKIP_5:
     ld.param.u64 %rd52, [csha_x_ptr];
     setp.eq.u64 %p0, %rd52, 0;
     @%p0 bra V2_CSHA_PROLOGUE_SKIP_6;
+    ld.param.u64 %rd58, [x_raw_ptr];
+    setp.eq.u64 %p1, %rd58, 0;
     mov.f32 %f0, 0f00000000;             // sumsq = 0
     // x slice 0: load, square, accumulate
     cvt.u64.u32 %rd53, %lane;
@@ -491,6 +529,9 @@ V2_CSHA_PROLOGUE_SKIP_5:
     add.u64 %rd54, %rd52, %rd54;
     ld.global.f32 %f1, [%rd54];
     fma.rn.f32 %f0, %f1, %f1, %f0;            // sumsq += x*x
+    sub.u64 %rd59, %rd54, %rd52;        // byte_off = abs - x_base
+    add.u64 %rd59, %rd58, %rd59;        // x_raw addr
+    @!%p1 st.global.f32 [%rd59], %f1;   // x_raw save (null-gated)
     shfl.sync.bfly.b32 %shfl_tmp, %f0, 16, 31, 0xFFFFFFFF;
     add.f32 %f0, %f0, %shfl_tmp;
     shfl.sync.bfly.b32 %shfl_tmp, %f0, 8, 31, 0xFFFFFFFF;
@@ -534,6 +575,8 @@ V2_CSHA_PROLOGUE_SKIP_6:
     ld.param.u64 %rd52, [csha_x_ptr];
     setp.eq.u64 %p0, %rd52, 0;
     @%p0 bra V2_CSHA_PROLOGUE_SKIP_7;
+    ld.param.u64 %rd58, [x_raw_ptr];
+    setp.eq.u64 %p1, %rd58, 0;
     mov.f32 %f0, 0f00000000;             // sumsq = 0
     // x slice 0: load, square, accumulate
     cvt.u64.u32 %rd53, %lane;
@@ -550,6 +593,9 @@ V2_CSHA_PROLOGUE_SKIP_6:
     add.u64 %rd54, %rd52, %rd54;
     ld.global.f32 %f1, [%rd54];
     fma.rn.f32 %f0, %f1, %f1, %f0;            // sumsq += x*x
+    sub.u64 %rd59, %rd54, %rd52;        // byte_off = abs - x_base
+    add.u64 %rd59, %rd58, %rd59;        // x_raw addr
+    @!%p1 st.global.f32 [%rd59], %f1;   // x_raw save (null-gated)
     shfl.sync.bfly.b32 %shfl_tmp, %f0, 16, 31, 0xFFFFFFFF;
     add.f32 %f0, %f0, %shfl_tmp;
     shfl.sync.bfly.b32 %shfl_tmp, %f0, 8, 31, 0xFFFFFFFF;
@@ -1027,6 +1073,62 @@ V2_CSHA_PROJ_K_INDIM_0_7:
     st.shared.b16 [%rd_wt_dst], %h_out_K_0;
 V2_K_PREPASS_SKIP_7:
     bar.sync 0; // K tile complete; safe for all S-computes
+    // CSHA RoPE K rotation (fused path): block_kv=32, head_dim=32, pairs_per_lane=4
+    ld.param.u64 %rd_rope_cos, [cos_ptr];
+    ld.param.u64 %rd_rope_sin, [sin_ptr];
+    setp.eq.u64 %p_rope_cos_null, %rd_rope_cos, 0;
+    setp.eq.u64 %p_rope_sin_null, %rd_rope_sin, 0;
+    or.pred %p_rope_skip, %p_rope_cos_null, %p_rope_sin_null;
+    @%p_rope_skip bra V2_CSHA_ROPE_K_FUSED_SKIP;
+    // A.2.4 RoPE K sweep: block_q=32, half_dim=16, pairs_per_lane=4
+    cvt.u32.u32 %r_rope_tid, %tid_x;
+    mov.u32 %r_rope_pair_idx, %r_rope_tid;
+V2_CSHA_ROPE_K_LOOP_0:
+    setp.ge.u32 %p_rope_done, %r_rope_pair_idx, 512;
+    @%p_rope_done bra V2_CSHA_ROPE_K_END_0;
+    div.u32 %r_rope_row,      %r_rope_pair_idx, 16;
+    rem.u32 %r_rope_dim_pair, %r_rope_pair_idx, 16;
+    mul.lo.u32 %r_rope_cs_off, %r_rope_row, 16;
+    add.u32 %r_rope_cs_off, %r_rope_cs_off, %r_rope_dim_pair;
+    cvt.u64.u32 %rd_rope_cs_idx, %r_rope_cs_off;
+    shl.b64 %rd_rope_cs_idx, %rd_rope_cs_idx, 1;  // *2 for f16
+    add.u64 %rd_rope_addr, %rd_rope_cos, %rd_rope_cs_idx;
+    ld.global.b16 %h_rope_pair, [%rd_rope_addr];
+    cvt.f32.f16 %f_rope_cos, %h_rope_pair;
+    add.u64 %rd_rope_addr, %rd_rope_sin, %rd_rope_cs_idx;
+    ld.global.b16 %h_rope_pair, [%rd_rope_addr];
+    cvt.f32.f16 %f_rope_sin, %h_rope_pair;
+    mul.lo.u32 %r_rope_smem_row_off, %r_rope_row, 64;
+    shl.b32 %r_rope_x0_col, %r_rope_dim_pair, 2;  // 4*dim_pair
+    add.u32 %r_rope_x0_off, %r_rope_smem_row_off, %r_rope_x0_col;
+    add.u32 %r_rope_x1_off, %r_rope_x0_off, 2;    // +2 bytes
+    cvt.u64.u32 %rd_rope_x0_off, %r_rope_x0_off;
+    cvt.u64.u32 %rd_rope_x1_off, %r_rope_x1_off;
+    add.u64 %rd_rope_addr, %k_smem_base, %rd_rope_x0_off;
+    ld.shared.b16 %h_rope_pair, [%rd_rope_addr];
+    cvt.f32.f16 %f_rope_x0, %h_rope_pair;
+    add.u64 %rd_rope_addr, %k_smem_base, %rd_rope_x1_off;
+    ld.shared.b16 %h_rope_pair, [%rd_rope_addr];
+    cvt.f32.f16 %f_rope_x1, %h_rope_pair;
+    mov.f32 %f_rope_y0, 0f00000000;
+    fma.rn.f32 %f_rope_y0, %f_rope_x0, %f_rope_cos, %f_rope_y0;
+    neg.f32 %f_rope_neg_x1, %f_rope_x1;
+    fma.rn.f32 %f_rope_y0, %f_rope_neg_x1, %f_rope_sin, %f_rope_y0;
+    mov.f32 %f_rope_y1, 0f00000000;
+    fma.rn.f32 %f_rope_y1, %f_rope_x0, %f_rope_sin, %f_rope_y1;
+    fma.rn.f32 %f_rope_y1, %f_rope_x1, %f_rope_cos, %f_rope_y1;
+    cvt.rn.f16.f32 %h_rope_y0, %f_rope_y0;
+    cvt.rn.f16.f32 %h_rope_y1, %f_rope_y1;
+    add.u64 %rd_rope_addr, %k_smem_base, %rd_rope_x0_off;
+    st.shared.b16 [%rd_rope_addr], %h_rope_y0;
+    add.u64 %rd_rope_addr, %k_smem_base, %rd_rope_x1_off;
+    st.shared.b16 [%rd_rope_addr], %h_rope_y1;
+    add.u32 %r_rope_pair_idx, %r_rope_pair_idx, 128;
+    bra V2_CSHA_ROPE_K_LOOP_0;
+V2_CSHA_ROPE_K_END_0:
+    bar.sync 0;  // FENCE: RoPE tile writes complete
+V2_CSHA_ROPE_K_FUSED_SKIP:
+    bar.sync 0;  // FENCE: K RoPE rotation writes visible to all threads
     // CSHA S-compute pass
     // ====== q_tile_iter = 0 / 8 (S-pass) ======
     mov.f32 %row_max, 0fFF800000;
@@ -1137,6 +1239,7 @@ V2_CSHA_ROPE_Q_END_0:
     bar.sync 0;  // FENCE: RoPE tile writes complete
 V2_CSHA_ROPE_SKIP_0:
     bar.sync 0;  // FENCE: RoPE rotation writes visible to all threads
+    // CSHA Tier C save_activations: save_activations=false, no emission
     // Phase 1: Q load, q_tile_iter = 0
     add.u32 %r0, %warp_id, 0;            // q_row_local = warp_id + q_tile_iter*4
     cvt.u64.u32 %rd20, %r0;                 // q_row_local as u64
@@ -1258,6 +1361,8 @@ V2_LOOP_S_OVER_K_0:
     max.f32 %new_max, %row_max, %f0;
     mov.f32 %row_max, %new_max;
     sub.f32 %f0, %old_max, %new_max;
+    setp.nan.f32 %p0, %f0, %f0;
+    @%p0 mov.f32 %f0, 0f00000000;
     mul.f32 %f0, %f0, %log2e;
     ex2.approx.f32 %correction, %f0;          // exp(old-new), <=1
     mul.f32 %row_sum, %row_sum, %correction;
@@ -1276,6 +1381,8 @@ V2_LOOP_S_OVER_K_0:
     sub.f32 %f1, %f1, %new_max;
     mul.f32 %f1, %f1, %log2e;
     ex2.approx.f32 %f1, %f1;                  // P = exp(S-new_max)
+    setp.nan.f32 %p1, %f1, %f1;
+    @%p1 mov.f32 %f1, 0f00000000;
     @!%p0 mov.f32 %f1, 0f00000000;
     @%p0 st.shared.f32 [%smem_addr], %f1;     // in-place P writeback
     add.f32 %f2, %f2, %f1;
@@ -1411,6 +1518,7 @@ V2_CSHA_ROPE_Q_END_1:
     bar.sync 0;  // FENCE: RoPE tile writes complete
 V2_CSHA_ROPE_SKIP_1:
     bar.sync 0;  // FENCE: RoPE rotation writes visible to all threads
+    // CSHA Tier C save_activations: save_activations=false, no emission
     // Phase 1: Q load, q_tile_iter = 1
     add.u32 %r0, %warp_id, 4;            // q_row_local = warp_id + q_tile_iter*4
     cvt.u64.u32 %rd20, %r0;                 // q_row_local as u64
@@ -1532,6 +1640,8 @@ V2_LOOP_S_OVER_K_1:
     max.f32 %new_max, %row_max, %f0;
     mov.f32 %row_max, %new_max;
     sub.f32 %f0, %old_max, %new_max;
+    setp.nan.f32 %p0, %f0, %f0;
+    @%p0 mov.f32 %f0, 0f00000000;
     mul.f32 %f0, %f0, %log2e;
     ex2.approx.f32 %correction, %f0;          // exp(old-new), <=1
     mul.f32 %row_sum, %row_sum, %correction;
@@ -1550,6 +1660,8 @@ V2_LOOP_S_OVER_K_1:
     sub.f32 %f1, %f1, %new_max;
     mul.f32 %f1, %f1, %log2e;
     ex2.approx.f32 %f1, %f1;                  // P = exp(S-new_max)
+    setp.nan.f32 %p1, %f1, %f1;
+    @%p1 mov.f32 %f1, 0f00000000;
     @!%p0 mov.f32 %f1, 0f00000000;
     @%p0 st.shared.f32 [%smem_addr], %f1;     // in-place P writeback
     add.f32 %f2, %f2, %f1;
@@ -1685,6 +1797,7 @@ V2_CSHA_ROPE_Q_END_2:
     bar.sync 0;  // FENCE: RoPE tile writes complete
 V2_CSHA_ROPE_SKIP_2:
     bar.sync 0;  // FENCE: RoPE rotation writes visible to all threads
+    // CSHA Tier C save_activations: save_activations=false, no emission
     // Phase 1: Q load, q_tile_iter = 2
     add.u32 %r0, %warp_id, 8;            // q_row_local = warp_id + q_tile_iter*4
     cvt.u64.u32 %rd20, %r0;                 // q_row_local as u64
@@ -1806,6 +1919,8 @@ V2_LOOP_S_OVER_K_2:
     max.f32 %new_max, %row_max, %f0;
     mov.f32 %row_max, %new_max;
     sub.f32 %f0, %old_max, %new_max;
+    setp.nan.f32 %p0, %f0, %f0;
+    @%p0 mov.f32 %f0, 0f00000000;
     mul.f32 %f0, %f0, %log2e;
     ex2.approx.f32 %correction, %f0;          // exp(old-new), <=1
     mul.f32 %row_sum, %row_sum, %correction;
@@ -1824,6 +1939,8 @@ V2_LOOP_S_OVER_K_2:
     sub.f32 %f1, %f1, %new_max;
     mul.f32 %f1, %f1, %log2e;
     ex2.approx.f32 %f1, %f1;                  // P = exp(S-new_max)
+    setp.nan.f32 %p1, %f1, %f1;
+    @%p1 mov.f32 %f1, 0f00000000;
     @!%p0 mov.f32 %f1, 0f00000000;
     @%p0 st.shared.f32 [%smem_addr], %f1;     // in-place P writeback
     add.f32 %f2, %f2, %f1;
@@ -1959,6 +2076,7 @@ V2_CSHA_ROPE_Q_END_3:
     bar.sync 0;  // FENCE: RoPE tile writes complete
 V2_CSHA_ROPE_SKIP_3:
     bar.sync 0;  // FENCE: RoPE rotation writes visible to all threads
+    // CSHA Tier C save_activations: save_activations=false, no emission
     // Phase 1: Q load, q_tile_iter = 3
     add.u32 %r0, %warp_id, 12;            // q_row_local = warp_id + q_tile_iter*4
     cvt.u64.u32 %rd20, %r0;                 // q_row_local as u64
@@ -2080,6 +2198,8 @@ V2_LOOP_S_OVER_K_3:
     max.f32 %new_max, %row_max, %f0;
     mov.f32 %row_max, %new_max;
     sub.f32 %f0, %old_max, %new_max;
+    setp.nan.f32 %p0, %f0, %f0;
+    @%p0 mov.f32 %f0, 0f00000000;
     mul.f32 %f0, %f0, %log2e;
     ex2.approx.f32 %correction, %f0;          // exp(old-new), <=1
     mul.f32 %row_sum, %row_sum, %correction;
@@ -2098,6 +2218,8 @@ V2_LOOP_S_OVER_K_3:
     sub.f32 %f1, %f1, %new_max;
     mul.f32 %f1, %f1, %log2e;
     ex2.approx.f32 %f1, %f1;                  // P = exp(S-new_max)
+    setp.nan.f32 %p1, %f1, %f1;
+    @%p1 mov.f32 %f1, 0f00000000;
     @!%p0 mov.f32 %f1, 0f00000000;
     @%p0 st.shared.f32 [%smem_addr], %f1;     // in-place P writeback
     add.f32 %f2, %f2, %f1;
@@ -2233,6 +2355,7 @@ V2_CSHA_ROPE_Q_END_4:
     bar.sync 0;  // FENCE: RoPE tile writes complete
 V2_CSHA_ROPE_SKIP_4:
     bar.sync 0;  // FENCE: RoPE rotation writes visible to all threads
+    // CSHA Tier C save_activations: save_activations=false, no emission
     // Phase 1: Q load, q_tile_iter = 4
     add.u32 %r0, %warp_id, 16;            // q_row_local = warp_id + q_tile_iter*4
     cvt.u64.u32 %rd20, %r0;                 // q_row_local as u64
@@ -2354,6 +2477,8 @@ V2_LOOP_S_OVER_K_4:
     max.f32 %new_max, %row_max, %f0;
     mov.f32 %row_max, %new_max;
     sub.f32 %f0, %old_max, %new_max;
+    setp.nan.f32 %p0, %f0, %f0;
+    @%p0 mov.f32 %f0, 0f00000000;
     mul.f32 %f0, %f0, %log2e;
     ex2.approx.f32 %correction, %f0;          // exp(old-new), <=1
     mul.f32 %row_sum, %row_sum, %correction;
@@ -2372,6 +2497,8 @@ V2_LOOP_S_OVER_K_4:
     sub.f32 %f1, %f1, %new_max;
     mul.f32 %f1, %f1, %log2e;
     ex2.approx.f32 %f1, %f1;                  // P = exp(S-new_max)
+    setp.nan.f32 %p1, %f1, %f1;
+    @%p1 mov.f32 %f1, 0f00000000;
     @!%p0 mov.f32 %f1, 0f00000000;
     @%p0 st.shared.f32 [%smem_addr], %f1;     // in-place P writeback
     add.f32 %f2, %f2, %f1;
@@ -2507,6 +2634,7 @@ V2_CSHA_ROPE_Q_END_5:
     bar.sync 0;  // FENCE: RoPE tile writes complete
 V2_CSHA_ROPE_SKIP_5:
     bar.sync 0;  // FENCE: RoPE rotation writes visible to all threads
+    // CSHA Tier C save_activations: save_activations=false, no emission
     // Phase 1: Q load, q_tile_iter = 5
     add.u32 %r0, %warp_id, 20;            // q_row_local = warp_id + q_tile_iter*4
     cvt.u64.u32 %rd20, %r0;                 // q_row_local as u64
@@ -2628,6 +2756,8 @@ V2_LOOP_S_OVER_K_5:
     max.f32 %new_max, %row_max, %f0;
     mov.f32 %row_max, %new_max;
     sub.f32 %f0, %old_max, %new_max;
+    setp.nan.f32 %p0, %f0, %f0;
+    @%p0 mov.f32 %f0, 0f00000000;
     mul.f32 %f0, %f0, %log2e;
     ex2.approx.f32 %correction, %f0;          // exp(old-new), <=1
     mul.f32 %row_sum, %row_sum, %correction;
@@ -2646,6 +2776,8 @@ V2_LOOP_S_OVER_K_5:
     sub.f32 %f1, %f1, %new_max;
     mul.f32 %f1, %f1, %log2e;
     ex2.approx.f32 %f1, %f1;                  // P = exp(S-new_max)
+    setp.nan.f32 %p1, %f1, %f1;
+    @%p1 mov.f32 %f1, 0f00000000;
     @!%p0 mov.f32 %f1, 0f00000000;
     @%p0 st.shared.f32 [%smem_addr], %f1;     // in-place P writeback
     add.f32 %f2, %f2, %f1;
@@ -2781,6 +2913,7 @@ V2_CSHA_ROPE_Q_END_6:
     bar.sync 0;  // FENCE: RoPE tile writes complete
 V2_CSHA_ROPE_SKIP_6:
     bar.sync 0;  // FENCE: RoPE rotation writes visible to all threads
+    // CSHA Tier C save_activations: save_activations=false, no emission
     // Phase 1: Q load, q_tile_iter = 6
     add.u32 %r0, %warp_id, 24;            // q_row_local = warp_id + q_tile_iter*4
     cvt.u64.u32 %rd20, %r0;                 // q_row_local as u64
@@ -2902,6 +3035,8 @@ V2_LOOP_S_OVER_K_6:
     max.f32 %new_max, %row_max, %f0;
     mov.f32 %row_max, %new_max;
     sub.f32 %f0, %old_max, %new_max;
+    setp.nan.f32 %p0, %f0, %f0;
+    @%p0 mov.f32 %f0, 0f00000000;
     mul.f32 %f0, %f0, %log2e;
     ex2.approx.f32 %correction, %f0;          // exp(old-new), <=1
     mul.f32 %row_sum, %row_sum, %correction;
@@ -2920,6 +3055,8 @@ V2_LOOP_S_OVER_K_6:
     sub.f32 %f1, %f1, %new_max;
     mul.f32 %f1, %f1, %log2e;
     ex2.approx.f32 %f1, %f1;                  // P = exp(S-new_max)
+    setp.nan.f32 %p1, %f1, %f1;
+    @%p1 mov.f32 %f1, 0f00000000;
     @!%p0 mov.f32 %f1, 0f00000000;
     @%p0 st.shared.f32 [%smem_addr], %f1;     // in-place P writeback
     add.f32 %f2, %f2, %f1;
@@ -3055,6 +3192,7 @@ V2_CSHA_ROPE_Q_END_7:
     bar.sync 0;  // FENCE: RoPE tile writes complete
 V2_CSHA_ROPE_SKIP_7:
     bar.sync 0;  // FENCE: RoPE rotation writes visible to all threads
+    // CSHA Tier C save_activations: save_activations=false, no emission
     // Phase 1: Q load, q_tile_iter = 7
     add.u32 %r0, %warp_id, 28;            // q_row_local = warp_id + q_tile_iter*4
     cvt.u64.u32 %rd20, %r0;                 // q_row_local as u64
@@ -3176,6 +3314,8 @@ V2_LOOP_S_OVER_K_7:
     max.f32 %new_max, %row_max, %f0;
     mov.f32 %row_max, %new_max;
     sub.f32 %f0, %old_max, %new_max;
+    setp.nan.f32 %p0, %f0, %f0;
+    @%p0 mov.f32 %f0, 0f00000000;
     mul.f32 %f0, %f0, %log2e;
     ex2.approx.f32 %correction, %f0;          // exp(old-new), <=1
     mul.f32 %row_sum, %row_sum, %correction;
@@ -3194,6 +3334,8 @@ V2_LOOP_S_OVER_K_7:
     sub.f32 %f1, %f1, %new_max;
     mul.f32 %f1, %f1, %log2e;
     ex2.approx.f32 %f1, %f1;                  // P = exp(S-new_max)
+    setp.nan.f32 %p1, %f1, %f1;
+    @%p1 mov.f32 %f1, 0f00000000;
     @!%p0 mov.f32 %f1, 0f00000000;
     @%p0 st.shared.f32 [%smem_addr], %f1;     // in-place P writeback
     add.f32 %f2, %f2, %f1;
@@ -3607,6 +3749,14 @@ V2_CSHA_PROJ_V_INDIM_0_7:
     st.shared.b16 [%rd_wt_dst], %h_out_V_0;
 V2_V_PREPASS_SKIP_7:
     bar.sync 0; // V tile complete; safe for all PV-accums
+    // CSHA Tier C save_activations: save_activations=false, no emission
+    // CSHA Tier C save_activations: save_activations=false, no emission
+    // CSHA Tier C save_activations: save_activations=false, no emission
+    // CSHA Tier C save_activations: save_activations=false, no emission
+    // CSHA Tier C save_activations: save_activations=false, no emission
+    // CSHA Tier C save_activations: save_activations=false, no emission
+    // CSHA Tier C save_activations: save_activations=false, no emission
+    // CSHA Tier C save_activations: save_activations=false, no emission
     // CSHA PV-accum pass
     // ====== q_tile_iter = 0 / 8 (PV-pass) ======
     mov.f32 %f48, 0f00000000;

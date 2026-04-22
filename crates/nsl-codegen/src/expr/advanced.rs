@@ -1688,6 +1688,10 @@ impl Compiler<'_> {
                         q_proj_v, k_proj_v, v_proj_v,
                         row_max_v, row_sum_v,
                         x_raw_v,
+                        // PCA Tier A: segment_ids_ptr — 0 for unpacked paths.
+                        // Task 5 will route real segment_ids device pointers
+                        // through the compiler's PCA detection pass.
+                        null,
                     ],
                 )?;
                 {
@@ -1761,6 +1765,10 @@ impl Compiler<'_> {
                         eps_bits,
                         active_heads_val,
                         d_model_val,
+                        // PCA Tier A: segment_ids_ptr — 0 for unpacked paths.
+                        // Task 5 will route real segment_ids device pointers
+                        // through the compiler's PCA detection pass.
+                        null,
                     ],
                 )?;
             }

@@ -1845,6 +1845,10 @@ fn lower_single_op(
                     dwq_dev, dwk_dev, dwv_dev,
                     dx_dev,
                     dxn_dev,
+                    // PCA Tier A Task 4B: segment_ids_ptr trailing slot.
+                    // Unpacked backward launches pass 0; segment_masked=true
+                    // kernels will receive a real pointer once Task 5 wires it.
+                    null,
                 ],
             )?;
 
