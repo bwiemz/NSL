@@ -538,6 +538,21 @@ pub fn synthesize_backward(config: &FlashAttentionConfig) -> Result<String, Stri
     // Phase 0: header, .visible .entry, SMEM, register pool, indices.
     phases::backward::prelude::emit(&mut ptx, config);
 
+    // CSHA A.4: head pruning guard — mirror forward. Runs ONCE before
+    // any backward phase so blocks whose head_idx >= csha_active_heads
+    // early-`ret` and skip the entire backward pass. Reuses forward's
+    // emitter: the guard's scratch (%r10/%r11/%p0) and %head_idx are
+    // declared by the backward prelude's register pool, and
+    // `csha_active_heads` is in the backward param list. The guard's
+    // label `V2_CSHA_ACTIVE_HEADS_SKIP` is function-scoped in PTX so
+    // the forward copy cannot collide with the backward copy.
+    //
+    // Placement: must come AFTER the PCA `bar.sync 0` at the end of
+    // `backward::prelude::emit` (segment_masked path) so the warp-0
+    // cooperative segment_ids load completes for all 128 threads of
+    // the block before any thread takes the early-`ret` branch.
+    phases::csha_hooks::emit_active_heads_guard(&mut ptx, config);
+
     // Phase 1: load saved post-RoPE Q/K/V from HBM into their SMEM
     // tiles. Fired once; subsequent q_tile_iter iterations read from
     // these tiles. K and V are loaded via kv_load so ds_compute can
@@ -718,7 +733,10 @@ mod backward_orchestrator_tests {
         let idx_drope = ptx.find("V2_BWD_DROPE_Q_LOOP_0:").expect("dRoPE label missing");
         let idx_dproj = ptx.find("V2_BWD_DPROJ_WQ_LOOP_0:").expect("dproj label missing");
         let idx_drmsnorm = ptx.find("V2_BWD_DRMSNORM_0:").expect("dRMSNorm label missing");
-        let idx_final = ptx.find("ret;").expect("ret missing");
+        // Use rfind so we match the trailing `ret;` that closes the
+        // kernel body, not the guarded `@%p0 ret;` inside the A.4
+        // dead-head guard that sits between prelude and q_load.
+        let idx_final = ptx.rfind("ret;").expect("ret missing");
 
         assert!(idx_prelude < idx_qload, "prelude before q_load");
         assert!(idx_qload < idx_ds, "q_load before ds");
@@ -747,6 +765,74 @@ mod backward_orchestrator_tests {
         let ptx = synthesize_backward(&cfg).expect("synth backward");
         assert!(ptx.ends_with('\0'),
             "cuModuleLoadData requires NUL terminator");
+    }
+
+    #[test]
+    fn synthesize_backward_emits_active_heads_guard_when_csha_is_some() {
+        // With csha=Some, backward must emit the A.4 active_heads guard
+        // so dead-head blocks early-`ret` and skip the entire backward
+        // pass (same contract as forward, closing the Tier C follow-up
+        // for dead-head elimination on backward).
+        let cfg = base_cfg_fused_backward(32, 32, 32, 4, 32);
+        let ptx = synthesize_backward(&cfg).expect("synth backward");
+
+        assert!(
+            ptx.contains("CSHA A.4: active_heads guard"),
+            "backward must emit A.4 guard annotation when csha=Some"
+        );
+        assert!(
+            ptx.contains("ld.param.u32 %r10, [csha_active_heads];"),
+            "backward A.4 guard must load csha_active_heads param"
+        );
+        assert!(
+            ptx.contains("V2_CSHA_ACTIVE_HEADS_SKIP:"),
+            "backward A.4 guard must emit the skip-label"
+        );
+
+        // The guard must run BEFORE any backward phase (q_load / ds /
+        // dv / dq / finalize). Placing it after the prelude's
+        // bar.sync but before q_load is what ensures dead-head blocks
+        // pay only the prelude setup and then `ret`.
+        let idx_guard = ptx
+            .find("CSHA A.4: active_heads guard")
+            .expect("guard annotation missing");
+        let idx_qload = ptx
+            .find("V2_BWD_Q_LOAD_0:")
+            .expect("q_load label missing");
+        assert!(
+            idx_guard < idx_qload,
+            "A.4 guard must precede q_load so dead-head blocks skip all backward work"
+        );
+    }
+
+    #[test]
+    fn synthesize_backward_emits_no_guard_when_csha_is_none() {
+        // With csha=None the A.4 guard must no-op (emit only the
+        // `csha=None, no emission` annotation) so non-CSHA backward
+        // kernels are byte-identical to pre-guard emission modulo the
+        // single comment line.
+        let cfg = FlashAttentionConfig {
+            block_q: 32, block_kv: 32, head_dim: 32,
+            causal: false, paged: false, rope_q: false,
+            rope_style: RopeStyle::Adjacent,
+            gqa_group_size: 1, tree_mask: false, gpu_sm: 75,
+            segment_masked: false,
+            csha: None,
+        };
+        let ptx = synthesize_backward(&cfg).expect("synth backward");
+
+        assert!(
+            ptx.contains("CSHA A.4 active_heads guard: csha=None, no emission"),
+            "csha=None backward must emit the no-emission annotation"
+        );
+        assert!(
+            !ptx.contains("ld.param.u32 %r10, [csha_active_heads];"),
+            "csha=None backward must NOT load csha_active_heads"
+        );
+        assert!(
+            !ptx.contains("V2_CSHA_ACTIVE_HEADS_SKIP:"),
+            "csha=None backward must NOT emit the skip-label"
+        );
     }
 
     #[test]

@@ -166,6 +166,14 @@ BW_PCA_LOAD_LOOP:
 BW_PCA_LOAD_DONE:
     bar.sync 0;
     // --- end PCA Tier A segment_ids load ---
+    // CSHA A.4: active_heads guard
+    ld.param.u32 %r10, [csha_active_heads];
+    setp.eq.u32 %p0, %r10, 0;
+    @%p0 bra V2_CSHA_ACTIVE_HEADS_SKIP;
+    cvt.u32.u64 %r11, %head_idx;
+    setp.ge.u32 %p0, %r11, %r10;
+    @%p0 ret;
+V2_CSHA_ACTIVE_HEADS_SKIP:
     // Tier C backward Q-load (q_tile_iter=0, slices/lane=1)
 V2_BWD_Q_LOAD_0:
     mov.u64 %q_smem_base, %shmem_base;
