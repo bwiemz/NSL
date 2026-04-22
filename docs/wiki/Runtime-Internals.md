@@ -91,7 +91,7 @@ Binds to CUDA via [cudarc](https://github.com/coreylowman/cudarc) `0.19.4` with 
 
 ### Initialization and context management
 
-`ensure_context()` (line 67) must be called before any CUDA driver API call. It locks the global `CudaState` and calls `cuCtxSetCurrent(guard.context)`. Because CUDA contexts are **thread-local state in the driver**, failing to call this on a new thread produces "invalid context" errors deep in cudarc with no useful stack trace.
+`ensure_context()` (line 67) must be called before any CUDA driver API call. It is a free function in [`crates/nsl-runtime/src/cuda/mod.rs`](../../crates/nsl-runtime/src/cuda/mod.rs) — no arguments, acquires the global `CudaState` mutex internally. Call it as `crate::cuda::ensure_context()` at the top of any new CUDA call site. It locks `CudaState` and invokes `cuCtxSetCurrent(guard.context)`. Because CUDA contexts are **thread-local state in the driver**, failing to call this on a new thread produces "invalid context" errors deep in cudarc with no useful stack trace.
 
 ### CUDA 13.x workarounds
 
@@ -137,7 +137,12 @@ When an op is recorded, `assign_ids` converts each operand pointer into a `tape_
 - **If backward needs shape info**, store it in the `TapeOp` struct as a `Vec<i64>` (e.g., `input_shape` in `SumReduce`). Do not reconstruct from the `a` pointer.
 - **If backward needs tensor data**, add a `saved_a` field with a refcount bump at record time, as `Mul`, `Div`, `MatMul`, `Exp`, `Log`, and `FlashAttention` do.
 
-The canonical failure mode: a backward implementation calls `ones_like(*a)` to generate a gradient seed, but `a` is a tape ID (or a freed raw pointer) — the dereference causes non-deterministic NaN or shape corruption. The `ones_from_shape(input_shape, dtype)` helper was introduced specifically to avoid this pattern.
+Two distinct failure modes can result from misusing these fields:
+
+- **Tape ID dereferenced as a pointer** → the "address" is a small integer (e.g. `3`). On modern OSes the low page is unmapped, so the dereference produces an **immediate SIGSEGV / access violation**. If `loss.backward()` dies with a segfault pointing into a backward implementation, the canonical cause is a bare `*a` where `a` is a tape ID.
+- **Stale freed pointer dereferenced as live tensor data** → the pointer was valid at `tape_start` time but its backing storage was freed and possibly reallocated. The read succeeds, but the bytes are whatever the allocator reused for — the backward pass silently produces **non-deterministic NaN or garbage gradients**, detectable as divergence between runs on the same seed.
+
+The canonical anti-pattern: a backward implementation calls `ones_like(*a)` to generate a gradient seed. The `ones_from_shape(input_shape, dtype)` helper was introduced specifically to avoid both failure modes — it takes shape and dtype directly from the `TapeOp` record, never touching `a` as a pointer.
 
 ### Tape scoping
 
