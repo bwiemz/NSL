@@ -131,8 +131,8 @@ pub(crate) struct PruneRewritePlan {
 #[derive(Debug)]
 enum PartialRefusal {
     NoResidualAdd,
-    // Task 6 will add ParallelResidualBranches { add_ops: Vec<OpId> }
-    // Task 7 will add AmbiguousPatternMatch { h_before: VarId, candidate_adds: Vec<OpId> }
+    ParallelResidualBranches { add_ops: Vec<OpId> },
+    AmbiguousPatternMatch { h_before: VarId, candidate_adds: Vec<OpId> },
 }
 
 // --- Phase 1 validator (positive case only — refusals land in Tasks 5-11) ---
@@ -239,17 +239,16 @@ pub(crate) fn compute_closure(
     closure
 }
 
-/// Positive-case pattern-match: find THE residual Add.
+/// Pattern-match residual Add candidates in the non-closure region.
 ///
-/// Task 4 handles the single-match case. Tasks 5-7 extend:
-/// - Task 5: zero matches → NoResidualAdd
-/// - Task 6: multiple matches with distinct h_before → ParallelResidualBranches
-/// - Task 7: multiple matches with shared h_before → AmbiguousPatternMatch
-///
-/// Structural note for Tasks 6-7: the early `return Ok(...)` inside the loop
-/// must become a collect-all-then-classify pass. The positive-case test
-/// `closure_captures_transitive_compute_ops` only exercises the single-match
-/// path, so Task 6+ MUST re-verify it after changing control flow.
+/// Spec §1.3 / §3.2 / §3.3 / §3.4. Returns:
+/// - `Ok((add_op, h_before, h_after))` when exactly one candidate matches
+///   the residual pattern Add(h_before, block_output).
+/// - `Err(PartialRefusal::NoResidualAdd)` when zero candidates match.
+/// - `Err(PartialRefusal::ParallelResidualBranches)` when ≥2 candidates
+///   have DISTINCT h_before values (parallel residual paths).
+/// - `Err(PartialRefusal::AmbiguousPatternMatch)` when ≥2 candidates share
+///   the SAME h_before (architecturally ambiguous boundary; Task 7 covers).
 fn find_residual_add(
     wengert: &WengertList,
     closure: &[OpId],
@@ -271,7 +270,9 @@ fn find_residual_add(
         t
     };
 
-    // Find the first Add(tainted, untainted) outside the closure.
+    // Collect ALL candidate residual Adds (outside closure; inputs.len() == 2;
+    // exactly one input tainted).
+    let mut candidates: Vec<(OpId, VarId, VarId)> = Vec::new(); // (add_op_id, h_before_var, h_after_var)
     for op in &wengert.ops {
         if closure_set.contains(&op.id) { continue; }
         if !matches!(op.op, PrimalOp::Add) { continue; }
@@ -281,17 +282,35 @@ fn find_residual_add(
         let b = op.inputs[1];
         let a_tainted = tainted.contains(&a);
         let b_tainted = tainted.contains(&b);
+
         if a_tainted != b_tainted {
             let h_before = if a_tainted { b } else { a };
-            return Ok((op.id, h_before, op.result));
+            candidates.push((op.id, h_before, op.result));
         }
     }
 
-    Err(PartialRefusal::NoResidualAdd)
+    match candidates.len() {
+        0 => Err(PartialRefusal::NoResidualAdd),
+        1 => Ok(candidates[0]),
+        _ => {
+            // Multiple candidates: distinguish shared-h_before (ambiguous) from
+            // distinct-h_before (parallel branches).
+            let first_h_before = candidates[0].1;
+            if candidates.iter().all(|(_, h, _)| *h == first_h_before) {
+                Err(PartialRefusal::AmbiguousPatternMatch {
+                    h_before: first_h_before,
+                    candidate_adds: candidates.iter().map(|(op, _, _)| *op).collect(),
+                })
+            } else {
+                Err(PartialRefusal::ParallelResidualBranches {
+                    add_ops: candidates.iter().map(|(op, _, _)| *op).collect(),
+                })
+            }
+        }
+    }
 }
 
-/// Wrap a partial refusal in the caller's context. Task 5-7 extend with
-/// more variants.
+/// Wrap a partial refusal in the caller's context.
 fn refusal_with_context(
     partial: PartialRefusal,
     layer: &crate::wggo_apply::AppliedLayer,
@@ -303,6 +322,17 @@ fn refusal_with_context(
             layer_name: layer.layer_name.clone(),
             layer_role,
             closure_size,
+        },
+        PartialRefusal::ParallelResidualBranches { add_ops } => PruneRefusal::ParallelResidualBranches {
+            layer_name: layer.layer_name.clone(),
+            layer_role,
+            add_ops,
+        },
+        PartialRefusal::AmbiguousPatternMatch { h_before, candidate_adds } => PruneRefusal::AmbiguousPatternMatch {
+            layer_name: layer.layer_name.clone(),
+            layer_role,
+            h_before_var: h_before,
+            candidate_adds,
         },
     }
 }
@@ -405,6 +435,51 @@ mod tests {
                 assert_eq!(plan.h_after_var, v_ha);
             }
             PlanResult::Refused(r) => panic!("expected Ok, got Refused({r:?})"),
+        }
+    }
+
+    #[test]
+    fn parallel_residuals_refusal() {
+        // Two parallel residual paths sharing a common layer-N param:
+        //   y1 = h_before_1 + (something reading param)
+        //   y2 = h_before_2 + (something reading param)
+        //
+        // Both Adds match the residual pattern; their `h_before` inputs are
+        // DISTINCT (different pre-block streams). Parallel-residual architectures
+        // (e.g., Parallel Transformers) aren't supported in v1.
+
+        let v_hb1: VarId = 100;
+        let v_hb2: VarId = 110;
+        let v_p:   VarId = 200;   // shared layer-N param
+        let v_b1:  VarId = 201;
+        let v_b2:  VarId = 211;
+        let v_y1:  VarId = 300;
+        let v_y2:  VarId = 310;
+
+        let ops = vec![
+            op_unary(0, v_p,  v_hb1, PrimalOp::Relu),   // param producer
+            op_unary(1, v_b1, v_p,   PrimalOp::Relu),    // block_output branch 1
+            op_add  (2, v_y1, v_hb1, v_b1),              // residual branch 1: Add(h_before_1, block_output_1)
+            op_unary(3, v_b2, v_p,   PrimalOp::Relu),    // block_output branch 2 (reads same param)
+            op_add  (4, v_y2, v_hb2, v_b2),              // residual branch 2: Add(h_before_2, block_output_2) — DISTINCT h_before
+        ];
+
+        let wengert = mk_wengert(
+            ops, v_y1,
+            &[(v_hb1, "h_before_1"), (v_hb2, "h_before_2"), (v_p, "blocks.7.attn.wq")],
+        );
+        let layer = mk_prune_layer(7, "blocks.7.attn");
+        let weight_map = WeightMap::default();
+
+        match plan_rewrite(&wengert, &layer, &weight_map) {
+            PlanResult::Refused(PruneRefusal::ParallelResidualBranches { layer_name, add_ops, .. }) => {
+                assert_eq!(layer_name, "blocks.7.attn");
+                assert_eq!(add_ops.len(), 2, "expected 2 parallel-branch Adds, got {}", add_ops.len());
+                assert!(add_ops.contains(&2) && add_ops.contains(&4),
+                    "expected parallel Adds at ops 2 and 4; got {add_ops:?}");
+            }
+            PlanResult::Ok(plan) => panic!("expected ParallelResidualBranches, got Ok({plan:?})"),
+            PlanResult::Refused(other) => panic!("expected ParallelResidualBranches, got: {other:?}"),
         }
     }
 
