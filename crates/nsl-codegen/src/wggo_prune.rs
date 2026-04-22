@@ -187,17 +187,48 @@ pub fn run(
     }
 }
 
-/// Phase 3 mutation — STUB for Task 11. Task 12 replaces this body with
-/// actual op deletion + VarId repointing + Add removal.
+/// Phase 3 mutation. Deletes closure ops, repoints consumers of h_after to
+/// h_before, then deletes the residual Add. Also cleans up stale var_names
+/// / var_types entries and repoints wengert.output when h_after was it.
 ///
-/// Until Task 12 lands, this function builds a `PruneRewrite` record without
-/// touching `wengert`. The three-phase run() contract's behavior is visible
-/// (plans validated, refusals emitted, rewrites recorded), but the Wengert
-/// list is NOT actually mutated yet.
+/// Spec §1.1 / §2.2 three-category treatment:
+///   - closure ops → DELETED
+///   - residual Add → REWRITTEN (consumers repointed) then DELETED
+///   - h_before → UNTOUCHED (belongs to the prior stream)
 fn apply_rewrite(
-    _wengert: &mut WengertList,
+    wengert: &mut WengertList,
     plan: PruneRewritePlan,
 ) -> PruneRewrite {
+    use std::collections::BTreeSet;
+
+    // Collect the set of OpIds to delete: every closure op + the residual Add.
+    let mut to_delete: BTreeSet<OpId> = plan.closure_op_ids.iter().copied().collect();
+    to_delete.insert(plan.residual_add_op_id);
+
+    // Repoint every surviving op's inputs from h_after_var → h_before_var.
+    for op in wengert.ops.iter_mut() {
+        if to_delete.contains(&op.id) { continue; }
+        for input in op.inputs.iter_mut() {
+            if *input == plan.h_after_var {
+                *input = plan.h_before_var;
+            }
+        }
+    }
+    // Repoint wengert.output too, if it pointed at h_after.
+    if wengert.output == plan.h_after_var {
+        wengert.output = plan.h_before_var;
+    }
+
+    // Delete closure ops + residual Add from wengert.ops.
+    wengert.ops.retain(|op| !to_delete.contains(&op.id));
+
+    // Prune stale var_names / var_types for VarIds that no surviving op produces.
+    // (h_before_var survives because it's produced by an upstream op outside the
+    // closure OR is an initial input — either way, keep its entry.)
+    let surviving_var_ids: BTreeSet<VarId> = wengert.ops.iter().map(|o| o.result).collect();
+    wengert.var_names.retain(|v, _| surviving_var_ids.contains(v) || *v == wengert.output);
+    wengert.var_types.retain(|v, _| surviving_var_ids.contains(v) || *v == wengert.output);
+
     PruneRewrite {
         layer_name: plan.layer_name,
         layer_role: plan.layer_role,
@@ -939,6 +970,110 @@ mod tests {
             "expected empty rewrites on refusal; got {}",
             result.rewrites.len(),
         );
+    }
+
+    #[test]
+    fn apply_rewrite_deletes_closure_and_aliases_h_after() {
+        // Wengert:
+        //   op0: Relu v0   = relu(v_hb)       (param producer for blocks.7.attn.wq)
+        //   op1: Relu v1   = relu(v0)         (block_output)
+        //   op2: Add  v_ha = v_hb + v1        (residual Add at the boundary)
+        //   op3: Relu v_out = relu(v_ha)      (downstream consumer of h_after)
+        //
+        // wengert.output = v_out.
+        //
+        // After prune of blocks.7.attn:
+        //   - op0, op1, op2 are deleted
+        //   - op3's input v_ha is repointed to v_hb
+        //   - wengert.output stays v_out (op3 survives)
+
+        let v_hb:  VarId = 100;
+        let v0:    VarId = 200;
+        let v1:    VarId = 201;
+        let v_ha:  VarId = 202;
+        let v_out: VarId = 300;
+
+        let ops = vec![
+            op_unary(0, v0,    v_hb, PrimalOp::Relu),
+            op_unary(1, v1,    v0,   PrimalOp::Relu),
+            op_add  (2, v_ha,  v_hb, v1),
+            op_unary(3, v_out, v_ha, PrimalOp::Relu),
+        ];
+        let mut wengert = mk_wengert(
+            ops,
+            v_out,
+            &[(v_hb, "h_before"), (v0, "blocks.7.attn.wq"), (v_ha, "h_after")],
+        );
+        let plan = AppliedPlan {
+            layers: vec![mk_prune_layer(7, "blocks.7.attn")],
+            total_us: 0.0,
+            peak_memory_bytes: 0,
+        };
+
+        let result = run(&mut wengert, &plan, &WeightMap::default());
+
+        assert!(
+            result.refusals.is_empty(),
+            "expected no refusals; got: {:?}",
+            result.refusals,
+        );
+        assert_eq!(result.rewrites.len(), 1);
+        assert_eq!(result.ops_deleted, 3, "closure=2 (op0+op1) + residual Add (op2) = 3");
+
+        // Exactly one op survives: op3 (the downstream consumer).
+        assert_eq!(wengert.ops.len(), 1, "expected only op3 to survive; got {}", wengert.ops.len());
+        let surviving = &wengert.ops[0];
+        assert_eq!(surviving.id, 3);
+        assert_eq!(
+            surviving.inputs, vec![v_hb],
+            "downstream consumer must be aliased from v_ha to v_hb"
+        );
+
+        // wengert.output still points at v_out (op3's result).
+        assert_eq!(wengert.output, v_out);
+
+        // pruned_forward_var_ids should include v0, v1, v_ha (everything removed).
+        assert!(result.pruned_forward_var_ids.contains(&v0));
+        assert!(result.pruned_forward_var_ids.contains(&v1));
+        assert!(result.pruned_forward_var_ids.contains(&v_ha));
+    }
+
+    #[test]
+    fn apply_rewrite_repoints_wengert_output_when_h_after_is_output() {
+        // Edge case: wengert.output is the residual Add's result directly.
+        // After prune, wengert.output must be repointed to v_hb.
+        //
+        //   op0: Relu v0   = relu(v_hb)
+        //   op1: Add  v_ha = v_hb + v0    (residual)
+        //
+        // wengert.output = v_ha. After prune of blocks.7.attn:
+        //   - op0, op1 deleted
+        //   - wengert.output repointed to v_hb
+
+        let v_hb: VarId = 100;
+        let v0:   VarId = 200;
+        let v_ha: VarId = 201;
+
+        let ops = vec![
+            op_unary(0, v0,   v_hb, PrimalOp::Relu),
+            op_add  (1, v_ha, v_hb, v0),
+        ];
+        let mut wengert = mk_wengert(
+            ops,
+            v_ha,
+            &[(v_hb, "h_before"), (v0, "blocks.7.attn.wq")],
+        );
+        let plan = AppliedPlan {
+            layers: vec![mk_prune_layer(7, "blocks.7.attn")],
+            total_us: 0.0,
+            peak_memory_bytes: 0,
+        };
+
+        let result = run(&mut wengert, &plan, &WeightMap::default());
+
+        assert!(result.refusals.is_empty(), "expected no refusals");
+        assert_eq!(wengert.ops.len(), 0, "all ops deleted");
+        assert_eq!(wengert.output, v_hb, "wengert.output repointed from v_ha to v_hb");
     }
 
     #[test]
