@@ -33,3 +33,10 @@ default = []
 cuda = ["dep:cudarc"]
 interop = ["dep:hf-hub", "dep:prost", "dep:half", "dep:regex-lite"]
 test-hooks = []
+# Force cuBLAS to use `CUBLAS_PEDANTIC_MATH` (strict f32) as the default math
+# mode instead of `CUBLAS_DEFAULT_MATH` (which enables TF32 tensor cores on
+# sm_80+). Per spec 2026-04-21-matmul-cublas-swap-design §9 this is the
+# compile-time opt-out for workloads that require strict f32 summation bounds.
+# Runtime env vars `NSL_MATMUL_PEDANTIC=1` / `NSL_MATMUL_TF32=1` take
+# precedence over this Cargo feature.
+strict-matmul = []

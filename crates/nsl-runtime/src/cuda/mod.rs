@@ -924,8 +924,44 @@ pub(crate) mod cublas_inner {
 
     static CUBLAS_HANDLE: OnceLock<CublasHandle> = OnceLock::new();
 
+    /// cuBLAS math-mode selection (spec §9). Resolved ONCE at `OnceLock`
+    /// init time and baked into the handle via `cublasSetMathMode`.
+    /// Runtime env-var changes after the first matmul call do NOT retune
+    /// the handle; a restart is required to switch modes.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum CublasMathMode {
+        /// `CUBLAS_DEFAULT_MATH` — TF32 tensor cores on sm_80+.
+        Default,
+        /// `CUBLAS_PEDANTIC_MATH` — strict f32 throughout, no TF32.
+        Pedantic,
+    }
+
+    /// Resolve the math mode via env-var > Cargo-feature precedence (spec §9).
+    ///
+    /// - `NSL_MATMUL_PEDANTIC=1` forces pedantic (beats everything).
+    /// - `NSL_MATMUL_TF32=1` forces TF32 default.
+    /// - Falling through to `cfg!(feature = "strict-matmul")` => pedantic
+    ///   if the feature is on, else TF32 default.
+    pub(crate) fn resolve_math_mode() -> CublasMathMode {
+        if std::env::var("NSL_MATMUL_PEDANTIC").ok().as_deref() == Some("1") {
+            return CublasMathMode::Pedantic;
+        }
+        if std::env::var("NSL_MATMUL_TF32").ok().as_deref() == Some("1") {
+            return CublasMathMode::Default;
+        }
+        if cfg!(feature = "strict-matmul") {
+            CublasMathMode::Pedantic
+        } else {
+            CublasMathMode::Default
+        }
+    }
+
     /// Return a reference to the process-global cuBLAS handle, creating it on
     /// first call. Panics on creation failure (catastrophic — no recovery).
+    ///
+    /// Applies the resolved math mode (spec §9) via raw `cublasSetMathMode`
+    /// FFI since cudarc does not expose it through its safe API.  Logs the
+    /// active mode once at init for discoverability (spec §9).
     pub(crate) fn cublas_handle() -> cublas_sys::cublasHandle_t {
         CUBLAS_HANDLE
             .get_or_init(|| {
@@ -937,6 +973,36 @@ pub(crate) mod cublas_inner {
                     .expect("cublasCreate_v2 failed during lazy init");
                 // cuBLAS defaults to the NULL/default stream, which matches
                 // `inner::current_stream()`. No `cublasSetStream` call needed.
+
+                // Apply the resolved math mode via raw FFI.  `cublasSetMathMode`
+                // is exported by `cudarc::cublas::sys` but not wrapped by the
+                // safe API surface — raw call is the canonical path.
+                let mode = resolve_math_mode();
+                let raw_mode = match mode {
+                    CublasMathMode::Default => cublas_sys::cublasMath_t::CUBLAS_DEFAULT_MATH,
+                    CublasMathMode::Pedantic => cublas_sys::cublasMath_t::CUBLAS_PEDANTIC_MATH,
+                };
+                // SAFETY: `handle` was just returned by `create_handle` and is a
+                // valid `cublasHandle_t`; `raw_mode` is a valid enum variant.
+                let status = unsafe { cublas_sys::cublasSetMathMode(handle, raw_mode) };
+                if status != cublas_sys::cublasStatus_t::CUBLAS_STATUS_SUCCESS {
+                    eprintln!(
+                        "[nsl-matmul] cublasSetMathMode({raw_mode:?}) failed: {status:?} \
+                         (handle left in cuBLAS default math mode)"
+                    );
+                }
+
+                match mode {
+                    CublasMathMode::Default => eprintln!(
+                        "[nsl-matmul] cuBLAS math mode: TF32 (default — set NSL_MATMUL_PEDANTIC=1 \
+                         or build with --features strict-matmul for strict f32)"
+                    ),
+                    CublasMathMode::Pedantic => eprintln!(
+                        "[nsl-matmul] cuBLAS math mode: pedantic (strict f32, ~5-10x slower than \
+                         TF32 default)"
+                    ),
+                }
+
                 CublasHandle(handle)
             })
             .0
