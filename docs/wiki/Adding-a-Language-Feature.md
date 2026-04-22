@@ -70,7 +70,7 @@ No parser changes for the same reason as AST. The existing decorator-parse path 
 File: [`crates/nsl-semantic/src/export.rs`](../../crates/nsl-semantic/src/export.rs) (new file)
 File: [`crates/nsl-semantic/src/lib.rs`](../../crates/nsl-semantic/src/lib.rs) (wiring)
 
-Commit `ea737fb0` introduced `validate_exports`, a pure-additive pass that appends diagnostics without modifying other analysis state.
+Commit `ea737fb0` introduced `validate_exports`, which validates `@export` decorators and also builds a `WeightIndexMap` side-table that maps each `self.<field>` expression to its declaration-order tensor-weight index (consumed by M62 codegen).
 
 **New file `export.rs` — entry point:**
 
@@ -78,14 +78,16 @@ Commit `ea737fb0` introduced `validate_exports`, a pure-additive pass that appen
 /// Run `@export` validation over the top-level statements of a module.
 ///
 /// Returns diagnostics that should be appended to the rest of the
-/// analysis diagnostics.  Pure-additive: does not read or modify
-/// other analysis state.
-pub fn validate_exports(module: &Module, interner: &Interner) -> Vec<Diagnostic> {
+/// analysis diagnostics, plus a `WeightIndexMap` side-table mapping each
+/// resolved `self.<field>` expression to its tensor-weight index.
+pub fn validate_exports(module: &Module, interner: &Interner) -> (Vec<Diagnostic>, WeightIndexMap) {
     let mut diagnostics = Vec::new();
+    let mut weight_index_map = WeightIndexMap::new();
     for stmt in &module.stmts {
         validate_stmt(stmt, interner, &mut diagnostics);
+        validate_model_method_exports(stmt, interner, &mut diagnostics, &mut weight_index_map);
     }
-    diagnostics
+    (diagnostics, weight_index_map)
 }
 
 fn validate_stmt(stmt: &Stmt, interner: &Interner, diagnostics: &mut Vec<Diagnostic>) {
@@ -121,73 +123,130 @@ fn validate_stmt(stmt: &Stmt, interner: &Interner, diagnostics: &mut Vec<Diagnos
 
 ```rust
 +    // M62: Run `@export` decorator validation.  Pure-additive — appends
-+    // diagnostics without touching other analysis state.
-+    diagnostics.extend(crate::export::validate_exports(module, interner));
++    // diagnostics without touching other analysis state.  Also returns the
++    // weight-index side-table for codegen consumption.
++    let (export_diags, weight_index_map) = crate::export::validate_exports(module, interner);
++    diagnostics.extend(export_diags);
 ```
 
-Semantic validation enforces nine rules: the decorator must be on a `fn` (not a `model`, closure, or anything else); no positional args; only `name` kwarg; `name` must be a non-empty string literal; no duplicate `@export` on the same function; all param types must be C-ABI-compatible tensors or scalars; return type must not use generic type params. Errors here block codegen — the codegen branch assumes all `@export` signatures are already validated.
+Semantic validation enforces nine rules: the decorator must be on a `fn` (not a `model`, closure, or anything else); no positional args; only `name` kwarg; `name` must be a non-empty string literal; no duplicate `@export` on the same function; all param types must be C-ABI-compatible tensors or scalars; return type must not use generic type params. Errors here block codegen — the codegen branch assumes all `@export` signatures are already validated. The function also populates `WeightIndexMap` by walking model-method bodies and recording every `self.<field>` expression's declaration-order index, which codegen uses to lower `self.W` to `load(weight_ptrs + index * 8)`.
 
 ### 6. Codegen — linkage override
 
 File: [`crates/nsl-codegen/src/compiler/declaration.rs`](../../crates/nsl-codegen/src/compiler/declaration.rs)
 
-Commit `5e15c9b6` — the linkage override. The change is surgical: a pure helper `extract_export_decorator` parses the decorator list, then the main declare loop checks its result before calling `declare_function`.
+Commit `5e15c9b6` — the linkage override. The change is surgical: a pure helper `extract_export_decorator` parses the decorator list, then the main declare loop checks its result. Crucially, `@export` functions require **two** Cranelift declarations — an internal implementation function (`Linkage::Local`, NSL-internal ABI) and a C-ABI wrapper (`Linkage::Export`). Non-`@export` functions go through the original single-declaration path.
+
+**Part 1 — decorator check and two-declaration branch (`declaration.rs`):**
 
 ```rust
-+            // M62: @export override — if decorated, use Export linkage and an
-+            // unmangled (or user-named) symbol so C consumers see a clean ABI.
-+            let (is_export, override_name) = match decorators {
-+                Some(decos) => extract_export_decorator(decos, self.interner),
-+                None => (false, None),
-+            };
-+            let effective_linkage = if is_export {
-+                Linkage::Export
-+            } else {
-+                linkage
-+            };
-+            let symbol_name = if is_export {
-+                override_name.unwrap_or_else(|| raw_name.clone())
-+            } else {
-+                cranelift_name.clone()
-+            };
-+
-             let func_id = self
-                 .module
--                .declare_function(&cranelift_name, linkage, &sig)
-+                .declare_function(&symbol_name, effective_linkage, &sig)
+            // M62: @export override — if decorated, use Export linkage and an
+            // unmangled (or user-named) symbol so C consumers see a clean ABI.
+            let (is_export, override_name) = match decorators {
+                Some(decos) => extract_export_decorator(decos, self.interner),
+                None => (false, None),
+            };
+            if is_export {
+                // 1. Internal implementation: mangled name + Linkage::Local + NSL-internal ABI.
+                let impl_symbol = format!("__nsl_export_impl_{}", raw_name);
+                let impl_func_id = self
+                    .module
+                    .declare_function(&impl_symbol, Linkage::Local, &sig)
+                    .map_err(|e| {
+                        CodegenError::new(format!("failed to declare impl fn '{raw_name}': {e}"))
+                    })?;
+                self.registry
+                    .functions
+                    .insert(raw_name.clone(), (impl_func_id, sig.clone()));
+
+                // 2. C-ABI wrapper: exported name + Linkage::Export + C-ABI signature.
+                let wrapper_symbol = override_name
+                    .unwrap_or_else(|| raw_name.clone());
+                let info = crate::c_header::ExportInfo::from_fn_def(
+                    fn_def,
+                    &raw_name,
+                    &wrapper_symbol,
+                    self.interner,
+                );
+                let call_conv = self.module.target_config().default_call_conv;
+                let wrapper_sig =
+                    crate::c_wrapper::build_c_abi_wrapper_signature(&info, call_conv);
+                let wrapper_func_id = self
+                    .module
+                    .declare_function(&wrapper_symbol, Linkage::Export, &wrapper_sig)
+                    .map_err(|e| {
+                        CodegenError::new(format!(
+                            "failed to declare wrapper fn '{wrapper_symbol}': {e}"
+                        ))
+                    })?;
+
+                // 3. Track for wrapper-body emission + header emission.
+                self.features
+                    .export_wrappers
+                    .push(crate::c_wrapper::ExportWrapper {
+                        impl_func_id,
+                        impl_sig: sig,
+                        wrapper_func_id,
+                        raw_name: raw_name.clone(),
+                        export_info: info.clone(),
+                        is_model_method: false,
+                    });
+                self.features.export_functions.push(info);
+            } else {
+                let func_id = self
+                    .module
+                    .declare_function(&cranelift_name, linkage, &sig)
+                    .map_err(|e| {
+                        CodegenError::new(format!("failed to declare fn '{raw_name}': {e}"))
+                    })?;
+                self.registry
+                    .functions
+                    .insert(raw_name.clone(), (func_id, sig));
+            }
 ```
 
-The `extract_export_decorator` helper is a pure function (no `&mut self`) so it can be unit-tested independently of a full `Compiler`:
+The impl function (`__nsl_export_impl_<name>`) is what the NSL compiler emits the body into; the wrapper function is a thin C-ABI trampoline whose body is generated separately. Non-decorated functions are byte-identical to pre-PR output — the `else` branch is the original path.
+
+**Part 2 — `extract_export_decorator` helper (`declaration.rs`):**
+
+The `extract_export_decorator` helper is a pure function (no `&mut self`) so it can be unit-tested independently of a full `Compiler`. Note the real body uses accumulate-then-return (`let mut is_export = false`), not early-return on first match:
 
 ```rust
 fn extract_export_decorator(
     decorators: &[nsl_ast::decl::Decorator],
     interner: &nsl_lexer::Interner,
 ) -> (bool, Option<String>) {
+    let mut is_export = false;
+    let mut override_name: Option<String> = None;
+
     for d in decorators {
-        if d.name.len() != 1 { continue; }
+        if d.name.len() != 1 {
+            continue;
+        }
         let dname = interner.resolve(d.name[0].0).unwrap_or("");
-        if dname != "export" { continue; }
-        // found — extract optional name="..." kwarg
+        if dname != "export" {
+            continue;
+        }
+        is_export = true;
         if let Some(ref args) = d.args {
             for arg in args {
                 if let Some(name_sym) = arg.name {
                     let arg_name = interner.resolve(name_sym.0).unwrap_or("");
                     if arg_name == "name" {
-                        if let ExprKind::StringLiteral(s) = &arg.value.kind {
-                            return (true, Some(s.clone()));
+                        if let nsl_ast::expr::ExprKind::StringLiteral(s) = &arg.value.kind {
+                            override_name = Some(s.clone());
                         }
                     }
                 }
             }
         }
-        return (true, None);
     }
-    (false, None)
+
+    (is_export, override_name)
 }
 ```
 
-Non-decorated functions are byte-identical to pre-PR output — the two branches collapse.
+Note the import path: `nsl_ast::expr::ExprKind::StringLiteral` (not a local `ExprKind` re-export).
 
 ### 7. Codegen — type model and header emission
 
@@ -307,6 +366,10 @@ def test_shared_lib_has_add_symbol(shared_lib):
     sym = getattr(lib, "add", None)
     assert sym is not None, f"'add' symbol not found in {shared_lib}"
 ```
+
+If you change header emission, the `c_header_snapshot.rs` test will produce a `.snap.new` file on the next run — review it with `cargo insta review` and accept if the change is intentional.
+
+**For any new codegen-affecting feature:** add at minimum a snapshot test (pins the output), at least one E2E fixture (exercises the full compile path), and unit tests for any isolated helper functions you introduced. Add Python e2e tests if the feature affects the FFI surface.
 
 ## PR structure
 
