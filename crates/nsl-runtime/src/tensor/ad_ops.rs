@@ -764,6 +764,142 @@ pub extern "C" fn nsl_mse_backward(
 }
 
 // ---------------------------------------------------------------------------
+// 5e. nsl_l1_backward — L1 gradient: grad_output * sign(pred - target) / N
+// ---------------------------------------------------------------------------
+
+/// Compute the L1 loss backward gradient w.r.t. `pred`.
+///
+/// Forward:  `loss = mean(|pred - target|)`   (scalar over all N = numel(pred))
+/// Backward: `d(loss)/d(pred_i) = (1/N) * sign(pred_i - target_i) * grad_output`
+///
+/// Mirrors `nsl_mse_backward`'s scalar-folding discipline: `grad_output` is the
+/// upstream adjoint of the scalar loss, so we read its one element and bake it
+/// into a per-element factor rather than risking the non-broadcasting GPU
+/// `gpu_elementwise_binary` path with a 0-dim × n-dim multiply.
+///
+/// The computation runs on CPU then publishes back to the input device, same
+/// pattern as `nsl_cross_entropy_backward`.
+#[no_mangle]
+pub extern "C" fn nsl_l1_backward(
+    grad_output_ptr: i64,
+    pred_ptr: i64,
+    target_ptr: i64,
+) -> i64 {
+    let pred_hdr = NslTensor::from_ptr(pred_ptr);
+    if pred_hdr.len <= 0 {
+        return super::nsl_tensor_clone(pred_ptr);
+    }
+    let out_device = pred_hdr.device;
+    let n = pred_hdr.len as usize;
+    let dtype = pred_hdr.dtype;
+
+    // Pull grad_output to CPU to read its scalar value.
+    let grad_out_cpu = if NslTensor::from_ptr(grad_output_ptr).device > 0 {
+        nsl_tensor_to_device(grad_output_ptr, 0)
+    } else {
+        grad_output_ptr
+    };
+    let go_tensor = NslTensor::from_ptr(grad_out_cpu);
+    let go_scalar = if go_tensor.len == 1 {
+        match go_tensor.dtype {
+            1 => (unsafe { *go_tensor.data_f32() }) as f64,
+            _ => unsafe { *go_tensor.data_f64() },
+        }
+    } else {
+        eprintln!(
+            "nsl: nsl_l1_backward expected a scalar grad_output, got len={}; defaulting multiplier to 1.0",
+            go_tensor.len
+        );
+        1.0
+    };
+    if grad_out_cpu != grad_output_ptr {
+        nsl_tensor_free(grad_out_cpu);
+    }
+    let factor = go_scalar / n as f64;
+
+    // Pull pred/target to CPU for the sign comparison.
+    let pred_c = nsl_tensor_contiguous(pred_ptr);
+    let target_c = nsl_tensor_contiguous(target_ptr);
+    let (pred_cpu, pred_needs_free) = if NslTensor::from_ptr(pred_c).device > 0 {
+        (nsl_tensor_to_device(pred_c, 0), true)
+    } else {
+        (pred_c, false)
+    };
+    let (target_cpu, target_needs_free) = if NslTensor::from_ptr(target_c).device > 0 {
+        (nsl_tensor_to_device(target_c, 0), true)
+    } else {
+        (target_c, false)
+    };
+    let pred = NslTensor::from_ptr(pred_cpu);
+    let target = NslTensor::from_ptr(target_cpu);
+
+    let elem_size = if dtype == 1 {
+        std::mem::size_of::<f32>()
+    } else {
+        std::mem::size_of::<f64>()
+    };
+    let out_data = checked_alloc(n * elem_size);
+
+    if dtype == 1 {
+        let p = pred.data_f32();
+        let t = target.data_f32();
+        let d = out_data as *mut f32;
+        let f = factor as f32;
+        for i in 0..n {
+            let diff = unsafe { *p.add(i) - *t.add(i) };
+            let s = if diff > 0.0 {
+                1.0_f32
+            } else if diff < 0.0 {
+                -1.0_f32
+            } else {
+                0.0_f32
+            };
+            unsafe { *d.add(i) = s * f };
+        }
+    } else {
+        let p = pred.data_f64();
+        let t = target.data_f64();
+        let d = out_data as *mut f64;
+        for i in 0..n {
+            let diff = unsafe { *p.add(i) - *t.add(i) };
+            let s = if diff > 0.0 {
+                1.0_f64
+            } else if diff < 0.0 {
+                -1.0_f64
+            } else {
+                0.0_f64
+            };
+            unsafe { *d.add(i) = s * factor };
+        }
+    }
+
+    let ndim = pred.ndim;
+    let shape_ptr = NslTensor::copy_shape(pred.shape, ndim);
+    let strides_ptr = NslTensor::compute_strides(shape_ptr, ndim);
+    let result = Box::new(NslTensor::new(
+        out_data as *mut c_void,
+        shape_ptr,
+        strides_ptr,
+        ndim,
+        n as i64,
+        0,
+        dtype,
+        1,
+        0,
+    ));
+
+    if pred_needs_free {
+        nsl_tensor_free(pred_cpu);
+    }
+    if target_needs_free {
+        nsl_tensor_free(target_cpu);
+    }
+    nsl_tensor_free(pred_c);
+    nsl_tensor_free(target_c);
+    publish_cpu_result_to_device(result, out_device, "ad_l1_backward")
+}
+
+// ---------------------------------------------------------------------------
 // 6. nsl_tensor_logsoftmax — numerically-stable log-softmax along `dim`
 // ---------------------------------------------------------------------------
 
@@ -1535,6 +1671,43 @@ mod tests {
         // N=2, expected = 3 * 2 * (p-t) / 2 = 3 * (p-t) = [15, 15].
         assert!((vals[0] - 15.0).abs() < 1e-6, "vals[0]={}", vals[0]);
         assert!((vals[1] - 15.0).abs() < 1e-6, "vals[1]={}", vals[1]);
+        nsl_tensor_free(pred);
+        nsl_tensor_free(target);
+        nsl_tensor_free(grad_out);
+        nsl_tensor_free(grad);
+    }
+
+    // L1 backward: d/d(pred_i) = grad_output * sign(pred_i - target_i) / N
+    // Regression guard for the /N factor (same pattern as MSE). Also covers
+    // the three sign branches: positive, negative, and zero.
+    #[test]
+    fn test_l1_backward_divides_by_n_and_signs_correctly_cpu() {
+        let pred = make_1d_f32(&[2.0, -1.0, 5.0, 5.0]);
+        let target = make_1d_f32(&[0.0, 3.0, 5.0, 9.0]);
+        let grad_out = nsl_tensor_scalar(1.0, 1);
+        let grad = nsl_l1_backward(grad_out, pred, target);
+        let vals = read_1d_f32(grad);
+        // N=4. diff=[2, -4, 0, -4] → sign=[1, -1, 0, -1] → /4 = [0.25, -0.25, 0, -0.25].
+        let expected = [0.25_f32, -0.25, 0.0, -0.25];
+        for (i, (&v, &e)) in vals.iter().zip(expected.iter()).enumerate() {
+            assert!((v - e).abs() < 1e-6, "idx {i}: got {v}, expected {e}");
+        }
+        nsl_tensor_free(pred);
+        nsl_tensor_free(target);
+        nsl_tensor_free(grad_out);
+        nsl_tensor_free(grad);
+    }
+
+    #[test]
+    fn test_l1_backward_scales_with_grad_output() {
+        let pred = make_1d_f32(&[10.0, 20.0]);
+        let target = make_1d_f32(&[5.0, 25.0]);
+        let grad_out = nsl_tensor_scalar(4.0, 1);
+        let grad = nsl_l1_backward(grad_out, pred, target);
+        let vals = read_1d_f32(grad);
+        // N=2. diff=[5,-5] → sign=[1,-1] → 4 * sign / 2 = [2, -2].
+        assert!((vals[0] - 2.0).abs() < 1e-6, "vals[0]={}", vals[0]);
+        assert!((vals[1] - (-2.0)).abs() < 1e-6, "vals[1]={}", vals[1]);
         nsl_tensor_free(pred);
         nsl_tensor_free(target);
         nsl_tensor_free(grad_out);
