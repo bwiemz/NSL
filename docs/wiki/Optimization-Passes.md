@@ -140,7 +140,7 @@ Fires: **train-block, when `@adapter` decorators are present and `--wrga` is set
 
 Source: [`crates/nsl-codegen/src/cpdt.rs`](../../crates/nsl-codegen/src/cpdt.rs) (driver), plus sub-modules: [`cpdt_zero.rs`](../../crates/nsl-codegen/src/cpdt_zero.rs) (ZeRO planning), [`cpdt_comm.rs`](../../crates/nsl-codegen/src/cpdt_comm.rs) (comm scheduling), [`cpdt_tier_apply.rs`](../../crates/nsl-codegen/src/cpdt_tier_apply.rs) (precision selection), [`cpdt_optim.rs`](../../crates/nsl-codegen/src/cpdt_optim.rs) (quantized optimizer codegen), [`cpdt_expert.rs`](../../crates/nsl-codegen/src/cpdt_expert.rs) (expert placement), [`cpdt_joint.rs`](../../crates/nsl-codegen/src/cpdt_joint.rs) (joint ZeRO + precision + expert solver; core driver of `CpdtMode::Full`). Note: [`cpdt_sensitivity.rs`](../../crates/nsl-codegen/src/cpdt_sensitivity.rs) is an internal scoring helper used inside `cpdt_tier_apply`, not a top-level pass.
 
-Research paper: [`docs/research/CPDT Research.pdf`](../../docs/research/CPDT%20Research.pdf).
+Research paper: [`docs/research/CPDT Research.pdf`](<../../docs/research/CPDT Research.pdf>).
 
 Design specs: [`docs/superpowers/specs/2026-04-15-cpdt-pipeline-integration-design.md`](../../docs/superpowers/specs/2026-04-15-cpdt-pipeline-integration-design.md), [`2026-04-18-cpdt-weight-aware-phase1-design.md`](../../docs/superpowers/specs/2026-04-18-cpdt-weight-aware-phase1-design.md).
 

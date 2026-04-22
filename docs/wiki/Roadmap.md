@@ -186,7 +186,7 @@ Cross-node trace correlation; per-rank NaN/divergence detection; cluster-level C
 
 ## Currently in flight
 
-Cross-verified against `git log` as of commit `bc8d4ec9` (2026-04-21):
+Cross-verified against `git log` as of commit `9a1b512e` (2026-04-21):
 
 - **M52 CPDT Phase 2** -- weight-aware spectral factor; fires when committed-fixture disagreement exceeds 20% (currently 15.6%); measurement-triggered, not yet scheduled. Design: `docs/superpowers/specs/2026-04-18-cpdt-weight-aware-phase2-stub.md`.
 - **M62 PyTorch FFI -- per-function C wrappers** -- `@export` decorator and grad-context bridge shipped; per-function C wrappers and Python E2E tests remain. Design: `docs/superpowers/specs/2026-04-15-m62-c-wrappers-design.md`.
@@ -229,4 +229,4 @@ What is load-bearing and won't move:
 
 ---
 
-*Last structurally verified against commit `bc8d4ec9` on 2026-04-21.*
+*Last structurally verified against commit `9a1b512e` on 2026-04-21.*
