@@ -53,6 +53,9 @@ pub enum OverrideRejectReason {
         grad_clip_threshold: f64,
     },
     // Prune:
+    /// Whole-block prune (LayerRole::Block) — not yet implemented; see spec §3.6.
+    /// Sub-block prune is handled by wggo_prune.rs.
+    ///
     /// WGGO decided `CoarseDecision::Prune` for a layer whose weight
     /// analysis score fell below `prune_floor`, but no downstream
     /// codegen consumer implements the layer-to-residual-identity IR
@@ -61,7 +64,7 @@ pub enum OverrideRejectReason {
     /// diagnostic surfaces the gap so users and future wiring work can
     /// see the planner's intent.  Full IR rewrite is tracked as a
     /// separate follow-up on top of this diagnostic stub.
-    PruneNotImplemented,
+    WholeBlockPruneNotImplemented,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -174,22 +177,31 @@ pub fn collect_prune_diagnostics(
     applied
         .layers
         .iter()
-        .filter(|l| matches!(l.coarse, LayerDecision::Prune))
+        // Spec §3.6 + Task 2: sub-block prune decisions (name ends in `.attn` or
+        // `.ffn`) are handled by `wggo_prune::run()` and are NOT surfaced here.
+        // This function now diagnoses ONLY whole-block prune (LayerRole::Block),
+        // which remains unimplemented in v1.
+        .filter(|l| {
+            matches!(l.coarse, LayerDecision::Prune)
+                && !l.layer_name.ends_with(".attn")
+                && !l.layer_name.ends_with(".ffn")
+        })
         .map(|l| OverrideDiagnostic {
             layer_index: l.layer_index,
             layer_name: l.layer_name.clone(),
-            reason: OverrideRejectReason::PruneNotImplemented,
+            reason: OverrideRejectReason::WholeBlockPruneNotImplemented,
             requested: "prune".to_string(),
             applied: "keepfull".to_string(),
         })
         .collect()
 }
 
-/// Stable reason-string for `OverrideRejectReason::PruneNotImplemented`,
+/// Stable reason-string for `OverrideRejectReason::WholeBlockPruneNotImplemented`,
 /// used by the `[prune]` stderr diagnostic emitter.  Factored out so
 /// tests can assert on the literal string without reaching into private
 /// rendering code in `stmt.rs`.
-pub fn prune_not_implemented_reason() -> &'static str {
+pub fn whole_block_prune_not_implemented_reason() -> &'static str {
+    // Stable string preserved from PR #102; see spec §5.5.
     "ir_rewrite_not_implemented"
 }
 
@@ -354,7 +366,7 @@ mod tests {
         assert_eq!(diags[0].layer_name, "blocks.1");
         assert_eq!(diags[0].requested, "prune");
         assert_eq!(diags[0].applied, "keepfull");
-        assert!(matches!(diags[0].reason, OverrideRejectReason::PruneNotImplemented));
+        assert!(matches!(diags[0].reason, OverrideRejectReason::WholeBlockPruneNotImplemented));
 
         assert_eq!(diags[1].layer_index, 3);
         assert_eq!(diags[1].layer_name, "blocks.3");
@@ -368,7 +380,7 @@ mod tests {
         // scanners) may match against.  Pin the literal value here so
         // drift is caught as a test failure rather than a quiet parser
         // regression.
-        assert_eq!(prune_not_implemented_reason(), "ir_rewrite_not_implemented");
+        assert_eq!(whole_block_prune_not_implemented_reason(), "ir_rewrite_not_implemented");
     }
 
     #[test]

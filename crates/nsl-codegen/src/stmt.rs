@@ -4083,9 +4083,9 @@ impl Compiler<'_> {
                                 // warning (or new arm) rather than silently
                                 // printing the wrong string.
                                 let reason_str: std::borrow::Cow<'static, str> = match &diag.reason {
-                                    crate::wggo_overrides::OverrideRejectReason::PruneNotImplemented => {
+                                    crate::wggo_overrides::OverrideRejectReason::WholeBlockPruneNotImplemented => {
                                         std::borrow::Cow::Borrowed(
-                                            crate::wggo_overrides::prune_not_implemented_reason(),
+                                            crate::wggo_overrides::whole_block_prune_not_implemented_reason(),
                                         )
                                     }
                                     other => std::borrow::Cow::Owned(format!("{:?}", other)),
