@@ -68,7 +68,20 @@ fn classify_exit(code: Option<i32>) -> SubprocessOutcome {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
     use std::time::Duration;
+
+    // Linux fork/exec races on ETXTBUSY when a sibling test's open write
+    // descriptor is inherited by the fork() before exec() runs its script.
+    // macOS has been reliable, Windows is a .cmd dispatch, but Ubuntu
+    // runners fail intermittently when exit_0/exit_1/exit_2/timeout all
+    // spawn children in parallel. Serializing the spawn-sensitive block
+    // keeps scripts unique AND ordered relative to each other.
+    fn serial_lock() -> MutexGuard<'static, ()> {
+        static SERIAL_GUARD: OnceLock<Mutex<()>> = OnceLock::new();
+        let m = SERIAL_GUARD.get_or_init(|| Mutex::new(()));
+        m.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     fn echo_binary_that_exits(code: i32) -> PathBuf {
         let mut p = std::env::temp_dir();
@@ -91,6 +104,7 @@ mod tests {
 
     #[test]
     fn exit_0_maps_to_clean() {
+        let _g = serial_lock();
         let b = echo_binary_that_exits(0);
         let r = run_subprocess(&b, &[], Duration::from_secs(5));
         let _ = std::fs::remove_file(&b);
@@ -99,6 +113,7 @@ mod tests {
 
     #[test]
     fn exit_1_maps_to_degenerate() {
+        let _g = serial_lock();
         let b = echo_binary_that_exits(1);
         let r = run_subprocess(&b, &[], Duration::from_secs(5));
         let _ = std::fs::remove_file(&b);
@@ -107,6 +122,7 @@ mod tests {
 
     #[test]
     fn exit_2_maps_to_infrastructure() {
+        let _g = serial_lock();
         let b = echo_binary_that_exits(2);
         let r = run_subprocess(&b, &[], Duration::from_secs(5));
         let _ = std::fs::remove_file(&b);
@@ -115,6 +131,7 @@ mod tests {
 
     #[test]
     fn timeout_maps_to_infrastructure() {
+        let _g = serial_lock();
         let mut p = std::env::temp_dir();
         p.push(format!("nsl-calib-sleep.{}", std::process::id()));
         #[cfg(windows)]
