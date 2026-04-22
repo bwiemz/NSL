@@ -2959,6 +2959,13 @@ impl<'a> WengertExtractor<'a> {
         &self.list
     }
 
+    /// Mutably access the extracted WengertList.
+    /// Used by `wggo_prune::run()` to perform in-place IR rewrites before
+    /// downstream passes (WRGA, source-AD adjoint generation) consume the list.
+    pub fn wengert_list_mut(&mut self) -> &mut WengertList {
+        &mut self.list
+    }
+
     /// Set the output VarId of the extracted WengertList.
     /// This is needed when the step body uses `let loss = ...` (VarDecl) rather
     /// than `return loss`, since VarDecl extraction does not set list.output.

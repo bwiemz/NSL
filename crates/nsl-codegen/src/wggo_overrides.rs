@@ -65,6 +65,24 @@ pub enum OverrideRejectReason {
     /// see the planner's intent.  Full IR rewrite is tracked as a
     /// separate follow-up on top of this diagnostic stub.
     WholeBlockPruneNotImplemented,
+    /// Prune refusal — spec §3.1. Cross-layer parameter consumption.
+    PruneCrossLayerParam,
+    /// Prune refusal — spec §3.2. Layer lacks a residual `Add`.
+    PruneNoResidualAdd,
+    /// Prune refusal — spec §3.3. Parallel residual branches detected.
+    PruneParallelResidualBranches,
+    /// Prune refusal — spec §3.4. Multiple Adds match the residual pattern ambiguously.
+    PruneAmbiguousPatternMatch,
+    /// Prune refusal — spec §3.5. No parameters match the requested layer prefix.
+    PruneEmptyClosure,
+    /// Prune refusal — spec §3.6. Whole-block prune (LayerRole::Block) unsupported in v1.
+    /// Distinct from `WholeBlockPruneNotImplemented`: this variant is emitted by
+    /// `wggo_prune::run()` via the new sub-block flow; `WholeBlockPruneNotImplemented`
+    /// is emitted by the legacy `collect_prune_diagnostics` path. Both coexist
+    /// during v1; v2 will consolidate.
+    PruneWholeBlockUnsupported,
+    /// Prune refusal — spec §3.7. Two prune decisions in the same plan conflict.
+    PruneConflictingDecisions,
 }
 
 #[derive(Debug, Clone, Serialize)]

@@ -4285,6 +4285,40 @@ impl Compiler<'_> {
                         );
                     }
                 }
+                // --- NEW: spec §4 WGGO Prune, runs BEFORE wrga so WRGA sees reduced forward ---
+                // When WGGO produced a plan, run the prune IR rewriter. On any refusal the
+                // whole plan is rejected (spec §5.3 dry-run-then-commit contract) and
+                // compilation fails with a CodegenError. On success each rewritten layer
+                // gets a stderr marker that Task 15 will upgrade to format_refusal output.
+                if let Some(ref applied_plan) = wggo_applied {
+                    let empty_weight_map = crate::weight_aware::WeightMap::default();
+                    let weight_map_ref = self.features.weight_map.as_ref().unwrap_or(&empty_weight_map);
+                    let wggo_prune_result = crate::wggo_prune::run(
+                        extractor.wengert_list_mut(),
+                        applied_plan,
+                        weight_map_ref,
+                    );
+                    if !wggo_prune_result.refusals.is_empty() {
+                        // Placeholder refusal emission — Task 15 upgrades this with
+                        // format_refusal + structured diagnostic_code attachment.
+                        for refusal in &wggo_prune_result.refusals {
+                            eprintln!(
+                                "[prune] refusal (task3-stub): {:?}",
+                                std::mem::discriminant(refusal)
+                            );
+                        }
+                        return Err(crate::error::CodegenError::new(
+                            "wggo_prune: one or more prune decisions refused; see [prune] stderr lines",
+                        ));
+                    }
+                    // Success path: emit observable markers so Task 14 integration tests
+                    // can distinguish "rewrite applied" from "no rewrite".
+                    for rewrite in &wggo_prune_result.rewrites {
+                        eprintln!("[prune] applied (task3-stub): layer={}", rewrite.layer_name);
+                    }
+                }
+                // --- END NEW ---
+
                 // Task 4: invoke WRGA driver (pruning / rank allocation /
                 // fusion) before primal lowering.  When WRGA is disabled or
                 // inputs are empty, this is a no-op and we use the raw

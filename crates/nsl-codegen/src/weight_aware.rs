@@ -518,6 +518,21 @@ impl WeightMap {
     }
 }
 
+impl Default for WeightMap {
+    /// Constructs an empty `WeightMap` (no tensors loaded).
+    /// Used as a sentinel when no weights file was provided at compile time —
+    /// e.g., `wggo_prune::run()` requires `&WeightMap` but the caller may not
+    /// have weights available (inference-only builds, unit tests).
+    fn default() -> Self {
+        WeightMap {
+            entries: HashMap::new(),
+            file_hash: [0u8; 32],
+            source_path: String::new(),
+            total_bytes: 0,
+        }
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Constant Folding
 // ─────────────────────────────────────────────────────────────────────────────
