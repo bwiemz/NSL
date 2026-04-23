@@ -834,6 +834,9 @@ pub extern "C" fn nsl_sparse_matmul(
 ) -> i64 {
     #[cfg(feature = "cuda")]
     {
+        let row_ptrs_ptr = _row_ptrs_ptr;
+        let col_indices_ptr = _col_indices_ptr;
+        let nrows = _nrows;
         let b = NslTensor::from_ptr(b_ptr);
         if b.device > 0 {
             let last_dim = if b.ndim >= 2 {
