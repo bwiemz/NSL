@@ -20,7 +20,149 @@
 //!      at backward_ds_offset for dqdk_accum to consume.
 
 use crate::flash_attention::FlashAttentionConfig;
-use crate::flash_attention_v2::smem_layout::{backward_ds_offset, backward_p_offset};
+use crate::flash_attention_v2::smem_layout::{
+    backward_ds_offset, backward_p_offset, backward_rms_strip_offset,
+};
+
+pub fn emit_rowsum_prepass(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
+    assert_eq!(config.block_kv, 32);
+    let head_dim = config.head_dim as u32;
+    let row_stride_bytes = head_dim * 2;
+    let corr_off = backward_rms_strip_offset(config);
+
+    ptx.push_str(&format!(
+        "    // Tier C backward rowsum prepass (q_tile_iter={q_tile_iter})\n"
+    ));
+    ptx.push_str(&format!(
+        "    add.u32 %r0, %warp_id, {}; // warp_row\n",
+        q_tile_iter * 4
+    ));
+    ptx.push_str("    cvt.u64.u32 %warp_row, %r0;\n");
+    ptx.push_str("    add.u64 %rd39, %q_start, %warp_row;\n");
+    ptx.push_str("    setp.ge.u64 %p0, %rd39, %rd6;\n");
+    ptx.push_str(&format!(
+        "    @%p0 bra V2_BWD_ROWPRE_ZERO_{q_tile_iter};\n"
+    ));
+    ptx.push_str("    mul.lo.u64 %rd30, %batch_idx, %rd5;\n");
+    ptx.push_str("    add.u64 %rd30, %rd30, %head_idx;\n");
+    ptx.push_str("    mul.lo.u64 %rd30, %rd30, %rd6;\n");
+    ptx.push_str("    add.u64 %rd30, %rd30, %q_start;\n");
+    ptx.push_str("    add.u64 %rd30, %rd30, %warp_row;\n");
+    ptx.push_str("    shl.b64 %rd30, %rd30, 2;\n");
+    ptx.push_str("    add.u64 %rd31, %rd_bwd_row_max, %rd30;\n");
+    ptx.push_str("    ld.global.f32 %row_max, [%rd31];\n");
+    ptx.push_str("    add.u64 %rd31, %rd_bwd_row_sum, %rd30;\n");
+    ptx.push_str("    ld.global.f32 %row_sum, [%rd31];\n");
+    ptx.push_str(&format!("    bra V2_BWD_ROWPRE_DONE_{q_tile_iter};\n"));
+    ptx.push_str(&format!("V2_BWD_ROWPRE_ZERO_{q_tile_iter}:\n"));
+    ptx.push_str("    mov.f32 %row_max, 0f7F800000;\n");
+    ptx.push_str("    mov.f32 %row_sum, 0f3F800000;\n");
+    ptx.push_str(&format!("V2_BWD_ROWPRE_DONE_{q_tile_iter}:\n"));
+
+    ptx.push_str("    mov.f32 %f_rowsum_dP_P, 0f00000000;\n");
+    ptx.push_str("    mov.f32 %f_P, 0f00000000;\n");
+    ptx.push_str(&format!(
+        "    mul.lo.u64 %rd40, %warp_row, {row_stride_bytes};\n"
+    ));
+    ptx.push_str("    add.u64 %rd40, %q_smem_base, %rd40;\n");
+    ptx.push_str("    cvt.u64.u32 %rd41, %lane;\n");
+    ptx.push_str(&format!(
+        "    mul.lo.u64 %rd41, %rd41, {row_stride_bytes};\n"
+    ));
+    ptx.push_str("    add.u64 %rd41, %k_smem_base, %rd41;\n");
+    ptx.push_str("    mov.u32 %r0, 0;\n");
+    ptx.push_str(&format!("V2_BWD_ROWPRE_S_INNER_{q_tile_iter}:\n"));
+    ptx.push_str("    cvt.u64.u32 %rd42, %r0;\n");
+    ptx.push_str("    shl.b64 %rd42, %rd42, 1;\n");
+    ptx.push_str("    add.u64 %rd43, %rd40, %rd42;\n");
+    ptx.push_str("    ld.shared.b16 %h0, [%rd43];\n");
+    ptx.push_str("    cvt.f32.f16 %f0, %h0;\n");
+    ptx.push_str("    add.u64 %rd43, %rd41, %rd42;\n");
+    ptx.push_str("    ld.shared.b16 %h0, [%rd43];\n");
+    ptx.push_str("    cvt.f32.f16 %f1, %h0;\n");
+    ptx.push_str("    fma.rn.f32 %f_P, %f0, %f1, %f_P;\n");
+    ptx.push_str("    add.u32 %r0, %r0, 1;\n");
+    ptx.push_str(&format!("    setp.lt.u32 %p0, %r0, {head_dim};\n"));
+    ptx.push_str(&format!("    @%p0 bra V2_BWD_ROWPRE_S_INNER_{q_tile_iter};\n"));
+    ptx.push_str("    mul.f32 %f_P, %f_P, %scale;\n");
+    ptx.push_str("    cvt.u64.u32 %rd42, %lane;\n");
+    ptx.push_str("    add.u64 %rd42, %rd42, %k_start;\n");
+    ptx.push_str("    setp.ge.u64 %p1, %rd42, %rd6;\n");
+    if config.causal {
+        ptx.push_str("    setp.gt.u64 %p0, %rd42, %rd39;\n");
+        ptx.push_str("    or.pred %p1, %p1, %p0;\n");
+        if config.segment_masked {
+            ptx.push_str("    add.u64 %rd_bw_q_global, %q_start, %warp_row;\n");
+            ptx.push_str("    cvt.u64.u32 %rd_bw_k_global, %lane;\n");
+            ptx.push_str("    add.u64 %rd_bw_k_global, %rd_bw_k_global, %k_start;\n");
+            crate::flash_attention_v2::phases::segment_mask::emit_segment_mask_predicate(
+                ptx,
+                "%rd_bw_q_global",
+                "%rd_bw_k_global",
+                "%seg_base",
+                crate::pca_segment::SegmentResidency::Shared,
+                "%p1",
+            );
+        }
+        ptx.push_str("    mov.f32 %f2, 0fFF800000;\n");
+        ptx.push_str("    @%p1 mov.f32 %f_P, %f2;\n");
+    }
+    ptx.push_str("    sub.f32 %f_P, %f_P, %row_max;\n");
+    ptx.push_str("    mul.f32 %f_P, %f_P, %log2e;\n");
+    ptx.push_str("    ex2.approx.f32 %f_P, %f_P;\n");
+    ptx.push_str("    div.approx.f32 %f_P, %f_P, %row_sum;\n");
+
+    ptx.push_str("    setp.ge.u64 %p0, %rd39, %rd6;\n");
+    ptx.push_str(&format!("    @%p0 bra V2_BWD_ROWPRE_DP_ZERO_{q_tile_iter};\n"));
+    ptx.push_str("    mov.f32 %f_dP, 0f00000000;\n");
+    ptx.push_str("    mul.lo.u64 %rd46, %batch_idx, %rd5;\n");
+    ptx.push_str("    add.u64 %rd46, %rd46, %head_idx;\n");
+    ptx.push_str("    mul.lo.u64 %rd46, %rd46, %rd6;\n");
+    ptx.push_str("    add.u64 %rd46, %rd46, %q_start;\n");
+    ptx.push_str("    add.u64 %rd46, %rd46, %warp_row;\n");
+    ptx.push_str("    mul.lo.u64 %rd46, %rd46, %rd7;\n");
+    ptx.push_str("    shl.b64 %rd46, %rd46, 1;\n");
+    ptx.push_str("    add.u64 %rd46, %rd_bwd_do, %rd46;\n");
+    ptx.push_str("    cvt.u64.u32 %rd47, %lane;\n");
+    ptx.push_str(&format!(
+        "    mul.lo.u64 %rd47, %rd47, {row_stride_bytes};\n"
+    ));
+    ptx.push_str("    add.u64 %rd47, %v_smem_base, %rd47;\n");
+    ptx.push_str("    mov.u32 %r0, 0;\n");
+    ptx.push_str(&format!("V2_BWD_ROWPRE_DP_INNER_{q_tile_iter}:\n"));
+    ptx.push_str("    cvt.u64.u32 %rd42, %r0;\n");
+    ptx.push_str("    shl.b64 %rd42, %rd42, 1;\n");
+    ptx.push_str("    add.u64 %rd43, %rd46, %rd42;\n");
+    ptx.push_str("    ld.global.b16 %h0, [%rd43];\n");
+    ptx.push_str("    cvt.f32.f16 %f0, %h0;\n");
+    ptx.push_str("    add.u64 %rd43, %rd47, %rd42;\n");
+    ptx.push_str("    ld.shared.b16 %h0, [%rd43];\n");
+    ptx.push_str("    cvt.f32.f16 %f1, %h0;\n");
+    ptx.push_str("    fma.rn.f32 %f_dP, %f0, %f1, %f_dP;\n");
+    ptx.push_str("    add.u32 %r0, %r0, 1;\n");
+    ptx.push_str(&format!("    setp.lt.u32 %p0, %r0, {head_dim};\n"));
+    ptx.push_str(&format!("    @%p0 bra V2_BWD_ROWPRE_DP_INNER_{q_tile_iter};\n"));
+    ptx.push_str("    fma.rn.f32 %f_rowsum_dP_P, %f_dP, %f_P, %f_rowsum_dP_P;\n");
+    for offset in [16u32, 8, 4, 2, 1] {
+        ptx.push_str(&format!(
+            "    shfl.sync.bfly.b32 %f0, %f_rowsum_dP_P, {offset}, 31, 0xFFFFFFFF;\n"
+        ));
+        ptx.push_str("    add.f32 %f_rowsum_dP_P, %f_rowsum_dP_P, %f0;\n");
+    }
+    ptx.push_str(&format!("    bra V2_BWD_ROWPRE_DP_DONE_{q_tile_iter};\n"));
+    ptx.push_str(&format!("V2_BWD_ROWPRE_DP_ZERO_{q_tile_iter}:\n"));
+    ptx.push_str("    mov.f32 %f_rowsum_dP_P, 0f00000000;\n");
+    ptx.push_str(&format!("V2_BWD_ROWPRE_DP_DONE_{q_tile_iter}:\n"));
+
+    ptx.push_str("    setp.eq.u32 %p0, %lane, 0;\n");
+    ptx.push_str("    shl.b64 %rd44, %warp_row, 2;\n");
+    ptx.push_str(&format!("    add.u64 %rd44, %rd44, {corr_off};\n"));
+    ptx.push_str("    add.u64 %rd44, %shmem_base, %rd44;\n");
+    ptx.push_str("    @%p0 ld.shared.f32 %f0, [%rd44];\n");
+    ptx.push_str("    @%p0 add.f32 %f0, %f0, %f_rowsum_dP_P;\n");
+    ptx.push_str("    @%p0 st.shared.f32 [%rd44], %f0;\n");
+    ptx.push_str("    bar.sync 0;  // correction strip updated\n");
+}
 
 pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
     assert_eq!(
@@ -44,6 +186,11 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
         q_tile_iter * 4
     ));
     ptx.push_str("    cvt.u64.u32 %warp_row, %r0;\n");
+    ptx.push_str("    add.u64 %rd39, %q_start, %warp_row;\n");
+    ptx.push_str("    setp.ge.u64 %p0, %rd39, %rd6;\n");
+    ptx.push_str(&format!(
+        "    @%p0 bra V2_BWD_ROW_STATS_ZERO_{q_tile_iter};\n"
+    ));
     ptx.push_str("    mul.lo.u64 %rd30, %batch_idx, %rd5;\n");
     ptx.push_str("    add.u64 %rd30, %rd30, %head_idx;\n");
     ptx.push_str("    mul.lo.u64 %rd30, %rd30, %rd6;\n");
@@ -54,8 +201,11 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
     ptx.push_str("    ld.global.f32 %row_max, [%rd31];\n");
     ptx.push_str("    add.u64 %rd31, %rd_bwd_row_sum, %rd30;\n");
     ptx.push_str("    ld.global.f32 %row_sum, [%rd31];\n");
-
-    ptx.push_str("    mov.f32 %f_rowsum_dP_P, 0f00000000;\n");
+    ptx.push_str(&format!("    bra V2_BWD_ROW_STATS_DONE_{q_tile_iter};\n"));
+    ptx.push_str(&format!("V2_BWD_ROW_STATS_ZERO_{q_tile_iter}:\n"));
+    ptx.push_str("    mov.f32 %row_max, 0f7F800000;\n");
+    ptx.push_str("    mov.f32 %row_sum, 0f3F800000;\n");
+    ptx.push_str(&format!("V2_BWD_ROW_STATS_DONE_{q_tile_iter}:\n"));
 
     // ── Pass 1: compute S[row, lane], P[row, lane], dP[row, lane] ─────────
     ptx.push_str(&format!("V2_BWD_DP_LOOP_{q_tile_iter}:\n"));
@@ -95,13 +245,18 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
     // S *= scale  (= 1/sqrt(head_dim))
     ptx.push_str("    mul.f32 %f_P, %f_P, %scale;\n");
 
-    // Causal mask: if causal && lane > warp_row → S = -INF.
-    // When config.segment_masked, also mask if segment_ids[q_global] !=
-    // segment_ids[k_global]. The helper extends %p1 with a cross-segment
-    // OR (mask-convention, matching spec §5.1).
+    // Mask invalid KV columns first: k_global >= seq_len must behave like
+    // a masked score regardless of causal / segment settings.
+    ptx.push_str("    cvt.u64.u32 %rd42, %lane;\n");
+    ptx.push_str("    add.u64 %rd42, %rd42, %k_start;\n");
+    ptx.push_str("    setp.ge.u64 %p1, %rd42, %rd6;\n");
+
+    // Causal mask: if lane > warp_row → S = -INF. When config.segment_masked,
+    // also mask if segment_ids[q_global] != segment_ids[k_global]. The helper
+    // extends %p1 with a cross-segment OR (mask-convention, matching spec §5.1).
     if config.causal {
-        ptx.push_str("    cvt.u32.u64 %r1, %warp_row;\n");
-        ptx.push_str("    setp.gt.u32 %p1, %lane, %r1;\n");
+        ptx.push_str("    setp.gt.u64 %p0, %rd42, %rd39;\n");
+        ptx.push_str("    or.pred %p1, %p1, %p0;\n");
         if config.segment_masked {
             // Synthesize u64 global positions for the helper.
             // %warp_row is u64 (set by ds_compute line above), %q_start is u64.
@@ -143,6 +298,10 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
     ptx.push_str("    st.shared.f32 [%rd44], %f_P;\n");
 
     // ── dP[row, lane] = dO[row, :] · V[lane, :] ────────────────────────────
+    ptx.push_str("    setp.ge.u64 %p0, %rd39, %rd6;\n");
+    ptx.push_str(&format!(
+        "    @%p0 bra V2_BWD_DP_ZERO_{q_tile_iter};\n"
+    ));
     ptx.push_str("    mov.f32 %f_dP, 0f00000000;\n");
     // dO[warp_row, d] base in HBM:
     //   row_idx_bytes (computed into %rd46) =
@@ -179,16 +338,17 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
     ptx.push_str(&format!("    setp.lt.u32 %p0, %r0, {head_dim};\n"));
     ptx.push_str(&format!("    @%p0 bra V2_BWD_DP_INNER_{q_tile_iter};\n"));
 
-    // rowsum_dP_P += dP * P  (lane-local partial)
-    ptx.push_str("    fma.rn.f32 %f_rowsum_dP_P, %f_dP, %f_P, %f_rowsum_dP_P;\n");
+    ptx.push_str(&format!("    bra V2_BWD_DP_DONE_{q_tile_iter};\n"));
+    ptx.push_str(&format!("V2_BWD_DP_ZERO_{q_tile_iter}:\n"));
+    ptx.push_str("    mov.f32 %f_dP, 0f00000000;\n");
+    ptx.push_str(&format!("V2_BWD_DP_DONE_{q_tile_iter}:\n"));
 
-    // ── 5-step warp butterfly reduction of rowsum_dP_P ─────────────────────
-    for offset in [16u32, 8, 4, 2, 1] {
-        ptx.push_str(&format!(
-            "    shfl.sync.bfly.b32 %f0, %f_rowsum_dP_P, {offset}, 31, 0xFFFFFFFF;\n"
-        ));
-        ptx.push_str("    add.f32 %f_rowsum_dP_P, %f_rowsum_dP_P, %f0;\n");
-    }
+    ptx.push_str("    shl.b64 %rd45, %warp_row, 2;\n");
+    ptx.push_str(&format!(
+        "    add.u64 %rd45, %rd45, {};\n", backward_rms_strip_offset(config)
+    ));
+    ptx.push_str("    add.u64 %rd45, %shmem_base, %rd45;\n");
+    ptx.push_str("    ld.shared.f32 %f_rowsum_dP_P, [%rd45];\n");
 
     // Ensure P stores are visible to dv_accum (and to anyone reading P later).
     ptx.push_str("    bar.sync 0;  // P tile visible to dv_accum\n");
@@ -253,16 +413,29 @@ mod tests {
         assert!(ptx.contains("div.approx.f32"));
         assert!(ptx.contains("V2_BWD_DP_LOOP_0:"));
         assert!(ptx.contains("V2_BWD_DS_0:"));
-        assert!(
-            ptx.matches("shfl.sync.bfly.b32").count() >= 5,
-            "5-step butterfly reduction for dS rowsum"
-        );
+        // Rowsum butterfly reduction lives in `emit_rowsum_prepass` now
+        // (pre-KV-loop correction strip); `emit` reads the correction
+        // from the SMEM strip rather than re-reducing.
         assert!(ptx.contains("%f_dS"));
+        assert!(ptx.contains("%f_rowsum_dP_P"),
+            "dS must consume the pre-reduced correction strip");
         // Real SMEM addressing (not placeholder constants):
         assert!(ptx.contains("ld.shared.b16 %h0"),
             "must read Q/K/V from SMEM");
         assert!(ptx.contains("%rd_bwd_do"),
             "dP must read dO from HBM (not placeholder)");
+    }
+
+    #[test]
+    #[allow(non_snake_case)]
+    fn backward_rowsum_prepass_applies_butterfly_reduction() {
+        let cfg = base_cfg_fused_backward(32, 32, 32, 4, 32);
+        let mut ptx = String::new();
+        emit_rowsum_prepass(&mut ptx, &cfg, 0);
+        assert!(
+            ptx.matches("shfl.sync.bfly.b32").count() >= 5,
+            "5-step butterfly reduction for correction strip"
+        );
     }
 
     #[test]

@@ -65,6 +65,12 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
     ptx.push_str(&format!(
         "    add.u32 %r2, %r1, {iter_row_base};  // row_global\n"
     ));
+    ptx.push_str("    cvt.u64.u32 %rd39, %r2;\n");
+    ptx.push_str("    add.u64 %rd39, %rd39, %q_start;\n");
+    ptx.push_str("    setp.ge.u64 %p0, %rd39, %rd6;\n");
+    ptx.push_str(&format!(
+        "    @%p0 bra V2_BWD_DV_SKIP_ROW_{q_tile_iter};\n"
+    ));
 
     // Load P[row_global, lane] from SMEM.
     ptx.push_str("    cvt.u64.u32 %rd30, %r2;\n");
@@ -142,6 +148,14 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
         "    setp.lt.u32 %p0, %r1, {iter_row_count};\n"
     ));
     ptx.push_str(&format!("    @%p0 bra V2_BWD_DV_INNER_{q_tile_iter};\n"));
+    ptx.push_str(&format!("    bra V2_BWD_DV_DONE_ROW_{q_tile_iter};\n"));
+    ptx.push_str(&format!("V2_BWD_DV_SKIP_ROW_{q_tile_iter}:\n"));
+    ptx.push_str("    add.u32 %r1, %r1, 1;\n");
+    ptx.push_str(&format!(
+        "    setp.lt.u32 %p0, %r1, {iter_row_count};\n"
+    ));
+    ptx.push_str(&format!("    @%p0 bra V2_BWD_DV_INNER_{q_tile_iter};\n"));
+    ptx.push_str(&format!("V2_BWD_DV_DONE_ROW_{q_tile_iter}:\n"));
 
     ptx.push_str("    bar.sync 0;  // dV updates visible across warps\n");
 }
