@@ -250,7 +250,7 @@ fn extract_agent_list(decorator: &Decorator, interner: &Interner) -> Vec<Symbol>
         let is_agents = arg
             .name
             .and_then(|s| interner.resolve(s.0))
-            .map_or(false, |n| n == "agents");
+            == Some("agents");
         if !is_agents {
             continue;
         }
@@ -267,6 +267,10 @@ fn extract_agent_list(decorator: &Decorator, interner: &Interner) -> Vec<Symbol>
     Vec::new()
 }
 
+// `diags` is threaded through for Tasks 8-11, which will emit diagnostics
+// inside the walker (cross-agent access, mutation, device, fan-out rules).
+// Task 6 does not yet write to it, hence the suppression.
+#[allow(clippy::only_used_in_recursion)]
 fn walk_block_for_edges(
     block: &Block,
     registry: &AgentRegistry,
@@ -291,6 +295,13 @@ fn walk_block_for_edges(
                     push_call_edges(&call, pipeline_params, source_by_binding, edges, expr.span);
                 }
             }
+            // NOTE: source_by_binding is shared across branches (then/elif/else).
+            // In v1, conditional-branch binding scope is not modeled; for branching
+            // pipelines, binding sources from any branch are visible to statements
+            // that follow the if. Acceptable because v1 pipelines are expected to be
+            // linear (test: extracts_linear_pipeline_apg_from_method_calls).
+            // TODO(future): per-branch SSA or join-node modeling for sound data-flow
+            // in conditional pipelines.
             StmtKind::If { then_block, elif_clauses, else_block, .. } => {
                 walk_block_for_edges(
                     then_block, registry, interner, pipeline_params, source_by_binding, edges, diags,
@@ -306,6 +317,11 @@ fn walk_block_for_edges(
                     );
                 }
             }
+            // TODO(v2): For/While/WhileLet loop bodies are not walked; agent method
+            // calls inside loops produce zero APG edges in v1. v1 pipelines are
+            // expected to be linear (no loops over agent calls). If a user writes
+            // agent calls inside a loop, the scheduler (Task 14) will not see them —
+            // a future task should either walk these bodies or emit a diagnostic.
             _ => {}
         }
     }
@@ -338,7 +354,12 @@ fn as_agent_method_call(
         return None;
     };
     let name = interner.resolve(receiver_sym.0)?;
-    // Convert variable name (lowercase) to title-case for registry lookup.
+    // v1 heuristic: convert the receiver variable name (lowercase) to title-case
+    // and look up the registered agent by that name. This mirrors the NSL
+    // convention that `agent Drafter:` is bound at the pipeline site as
+    // `drafter`. Tasks 8–10 use the same heuristic via the same lookup shape.
+    // TODO(task 12): replace heuristic with type-checker-resolved binding→agent
+    // type map when semantic-phase integration lands.
     let title = {
         let mut chars = name.chars();
         match chars.next() {
