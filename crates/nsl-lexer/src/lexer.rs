@@ -552,3 +552,20 @@ impl<'a> Lexer<'a> {
         self.tokens.push(Token { kind, span });
     }
 }
+
+#[cfg(test)]
+mod tests {
+
+    #[test]
+    fn lexer_recognises_agent_keyword() {
+        let mut interner = crate::Interner::new();
+        let (tokens, diags) = crate::tokenize(
+            "agent Drafter:\n    pass\n",
+            nsl_errors::FileId(0),
+            &mut interner,
+        );
+        assert!(diags.is_empty(), "unexpected diagnostics: {:?}", diags);
+        assert_eq!(tokens[0].kind, crate::TokenKind::Agent,
+            "first token should be Agent, was {:?}", tokens[0].kind);
+    }
+}

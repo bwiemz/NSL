@@ -50,6 +50,7 @@ pub enum TokenKind {
 
     // === Keywords: ML blocks ===
     Model,
+    Agent,
     Train,
     Grad,
     Quant,
@@ -191,6 +192,7 @@ impl std::fmt::Display for TokenKind {
             TokenKind::Match => write!(f, "match"),
             TokenKind::Case => write!(f, "case"),
             TokenKind::Model => write!(f, "model"),
+            TokenKind::Agent => write!(f, "agent"),
             TokenKind::Train => write!(f, "train"),
             TokenKind::Grad => write!(f, "grad"),
             TokenKind::Quant => write!(f, "quant"),

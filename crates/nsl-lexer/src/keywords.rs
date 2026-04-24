@@ -28,6 +28,7 @@ pub fn lookup_keyword(s: &str) -> Option<TokenKind> {
 
         // ML blocks
         "model" => Some(TokenKind::Model),
+        "agent" => Some(TokenKind::Agent),
         "train" => Some(TokenKind::Train),
         "grad" => Some(TokenKind::Grad),
         "quant" => Some(TokenKind::Quant),
