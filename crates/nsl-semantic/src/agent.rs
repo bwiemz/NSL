@@ -77,7 +77,7 @@ impl AgentRegistry {
                 name_str: interner.resolve(name.0).unwrap_or("?").to_string(),
                 is_shared: decorators.iter().any(|d| {
                     d.name.len() == 1
-                        && interner.resolve(d.name[0].0).map_or(false, |s| s == "shared")
+                        && interner.resolve(d.name[0].0) == Some("shared")
                 }),
                 span: *span,
             }),
@@ -90,7 +90,7 @@ impl AgentRegistry {
                 name_str: interner.resolve(fn_def.name.0).unwrap_or("?").to_string(),
                 has_auto_device_transfer: decorators.iter().any(|d| {
                     d.name.len() == 1
-                        && interner.resolve(d.name[0].0).map_or(false, |s| s == "auto_device_transfer")
+                        && interner.resolve(d.name[0].0) == Some("auto_device_transfer")
                 }),
                 param_names: fn_def.params.iter().map(|p| p.name).collect(),
                 span: fn_def.span,
