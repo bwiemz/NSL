@@ -532,7 +532,7 @@ fn parse_import_items(p: &mut Parser) -> Vec<ImportItem> {
     items
 }
 
-fn parse_type_params(p: &mut Parser) -> Vec<TypeParam> {
+pub fn parse_type_params(p: &mut Parser) -> Vec<TypeParam> {
     p.advance(); // consume <
     let mut params = Vec::new();
 
