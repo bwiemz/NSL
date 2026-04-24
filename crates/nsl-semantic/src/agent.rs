@@ -3,7 +3,7 @@
 //!
 //! Spec: docs/superpowers/specs/2026-04-23-m56-multi-agent-v1-design.md
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use nsl_ast::agent::{AgentDef, AgentMember};
 use nsl_ast::decl::{Decorator, FnDef};
 use nsl_ast::expr::{Expr, ExprKind};
@@ -418,9 +418,101 @@ fn push_call_edges(
 }
 
 // ---------------------------------------------------------------------------
-// Flag-gate check
+// Cycle detection — E0603
 // ---------------------------------------------------------------------------
 
+/// Spec §6.3. DFS-based cycle detection over agent-to-agent edges.
+///
+/// An agent-to-agent edge exists iff an `ApgEdge::BindingToAgent` has a known
+/// `source_agent` — i.e., data produced by one agent is consumed by another.
+/// `PipelineInputToAgent` edges never contribute because they have no source
+/// agent.
+pub fn detect_cycles(
+    apg: &ActionPortGraph,
+    interner: &Interner,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let mut adj: HashMap<Symbol, HashSet<Symbol>> = HashMap::new();
+    for edge in &apg.edges {
+        if let ApgEdge::BindingToAgent { source_agent: Some(src), target_agent: dst, .. } = edge {
+            adj.entry(*src).or_default().insert(*dst);
+        }
+    }
+
+    let mut visited = HashSet::new();
+    let mut in_stack: Vec<Symbol> = Vec::new();
+    let mut cycle_path: Option<Vec<Symbol>> = None;
+
+    for &start in &apg.agents {
+        if visited.contains(&start) {
+            continue;
+        }
+        if dfs_cycle(start, &adj, &mut visited, &mut in_stack, &mut cycle_path) {
+            break;
+        }
+    }
+
+    if let Some(path) = cycle_path {
+        let names: Vec<String> = path
+            .iter()
+            .map(|s| interner.resolve(s.0).unwrap_or("?").to_string())
+            .collect();
+        diagnostics.push(
+            Diagnostic::error(format!(
+                "E0603: circular port topology rejected — APG contains a cycle\n\
+                 \n\
+                 requested: acyclic APG\n\
+                 expected:  no cycle in port-to-port edges\n\
+                 found:     cycle {}\n\
+                 \n\
+                 fix: restructure the pipeline so ownership flows in one direction, \
+                 or use @shared for data that must flow bidirectionally.",
+                names.join(" -> ")
+            ))
+            .with_label(apg.decorator_span, "in this @pipeline_agent"),
+        );
+    }
+}
+
+fn dfs_cycle(
+    node: Symbol,
+    adj: &HashMap<Symbol, HashSet<Symbol>>,
+    visited: &mut HashSet<Symbol>,
+    in_stack: &mut Vec<Symbol>,
+    cycle_path: &mut Option<Vec<Symbol>>,
+) -> bool {
+    if in_stack.contains(&node) {
+        // Extract the cycle: from first occurrence of `node` through end of
+        // in_stack, plus `node` repeated to close the visible cycle.
+        let start_idx = in_stack.iter().position(|n| *n == node).unwrap();
+        let mut path = in_stack[start_idx..].to_vec();
+        path.push(node);
+        *cycle_path = Some(path);
+        return true;
+    }
+    if visited.contains(&node) {
+        return false;
+    }
+    visited.insert(node);
+    in_stack.push(node);
+
+    if let Some(neighbors) = adj.get(&node) {
+        // Collect into a sorted vec for deterministic output order.
+        let mut sorted: Vec<Symbol> = neighbors.iter().copied().collect();
+        sorted.sort_by_key(|s| s.0);
+        for next in sorted {
+            if dfs_cycle(next, adj, visited, in_stack, cycle_path) {
+                return true;
+            }
+        }
+    }
+    in_stack.pop();
+    false
+}
+
+// ---------------------------------------------------------------------------
+// Flag-gate check
+// ---------------------------------------------------------------------------
 
 /// Emit E0610 if agent declarations are present and `--linear-types` is off.
 /// Spec §7 (flag gating) + §6.7 (error format).
@@ -546,5 +638,60 @@ fn pipeline(prompt: Tensor) -> Tensor:\n    let draft = drafter.draft(prompt)\n 
             "expected 2 edges: prompt→drafter.in_prompt, draft→reviewer.in_draft; got {:?}",
             apg.edges
         );
+    }
+
+    #[test]
+    fn cycle_detection_flags_bidirectional_send() {
+        // A calls B; then calls A again - produces an A→B→A cycle.
+        let src = "\
+agent A:\n    fn a_fn(self, x: Tensor) -> Tensor:\n        return x\n\
+agent B:\n    fn b_fn(self, y: Tensor) -> Tensor:\n        return y\n\
+@pipeline_agent(agents=[A, B])\n\
+fn loop_pipe(x: Tensor) -> Tensor:\n    let y = a.a_fn(x)\n    let z = b.b_fn(y)\n    return a.a_fn(z)\n";
+        let mut interner = nsl_lexer::Interner::new();
+        let (tokens, lex_diags) = nsl_lexer::tokenize(src, nsl_errors::FileId(0), &mut interner);
+        assert!(lex_diags.is_empty(), "lex diagnostics: {:?}", lex_diags);
+        let parse_result = nsl_parser::parse(&tokens, &mut interner);
+        assert!(parse_result.diagnostics.is_empty(), "parse diagnostics: {:?}", parse_result.diagnostics);
+
+        let mut registry = AgentRegistry::new();
+        registry.register_module(&parse_result.module, &interner);
+
+        let mut apgs = Vec::new();
+        let mut diags = Vec::new();
+        extract_apgs(&parse_result.module, &registry, &interner, &mut apgs, &mut diags);
+        assert_eq!(apgs.len(), 1);
+        for apg in &apgs {
+            detect_cycles(apg, &interner, &mut diags);
+        }
+        assert!(diags.iter().any(|d| d.message.contains("E0603")),
+            "expected E0603 cycle error, got: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn no_cycle_flagged_for_linear_pipeline() {
+        // Reuse the linear-pipeline fixture from Task 6; assert 0 E0603 diagnostics.
+        let src = "\
+agent Drafter:\n    fn draft(self, prompt: Tensor) -> Tensor:\n        return prompt\n\
+agent Reviewer:\n    fn review(self, draft: Tensor) -> Tensor:\n        return draft\n\
+@pipeline_agent(agents=[Drafter, Reviewer])\n\
+fn pipeline(prompt: Tensor) -> Tensor:\n    let draft = drafter.draft(prompt)\n    return reviewer.review(draft)\n";
+        let mut interner = nsl_lexer::Interner::new();
+        let (tokens, _) = nsl_lexer::tokenize(src, nsl_errors::FileId(0), &mut interner);
+        let parse_result = nsl_parser::parse(&tokens, &mut interner);
+
+        let mut registry = AgentRegistry::new();
+        registry.register_module(&parse_result.module, &interner);
+
+        let mut apgs = Vec::new();
+        let mut diags = Vec::new();
+        extract_apgs(&parse_result.module, &registry, &interner, &mut apgs, &mut diags);
+        for apg in &apgs {
+            detect_cycles(apg, &interner, &mut diags);
+        }
+        assert!(!diags.iter().any(|d| d.message.contains("E0603")),
+            "linear pipeline should not produce E0603, got: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>());
     }
 }
