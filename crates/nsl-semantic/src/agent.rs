@@ -10,7 +10,7 @@ use nsl_errors::{Diagnostic, Span};
 ///
 /// `agent_decl_spans`: spans of all `agent Foo:` declarations found in the
 /// module; typically produced during initial AST walk in
-/// `crates/nsl-semantic/src/checker/decl.rs`.
+/// `crates/nsl-semantic/src/checker/mod.rs::collect_top_level_decls`.
 pub fn check_linear_types_flag(
     agent_decl_spans: &[Span],
     linear_types_enabled: bool,
@@ -30,10 +30,11 @@ pub fn check_linear_types_flag(
              expected:  the linear ownership checker (--linear-types) active\n\
              found:     --linear-types not passed to the compiler\n\
              \n\
-             fix: add --linear-types to `nsl check` or `nsl build`. `nsl run`\n\
-                  does not currently expose --linear-types; for run, use \
-                  `nsl build` followed by direct execution of the produced \
-                  binary. (Tracked: Task 20 of this plan closes that gap.)",
+             fix: add --linear-types to `nsl check` or `nsl build`.\n\
+             \n\
+             `nsl run` does not currently expose --linear-types;\n\
+             for run, use `nsl build` and execute the produced binary.\n\
+             (Tracked: Task 20 of this plan closes that gap.)",
         )
         .with_label(first_span, "agent declared here"),
     );
