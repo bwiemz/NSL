@@ -109,10 +109,17 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig) {
         // fed `dx_ptr` (which is dx_raw, post-dRMSNorm) and produced
         // incorrect dgamma values when the CSHA dispatcher claim fired.
         (".param .u64", "dx_norm_ptr"),
+        // Option A dK/dV f32 scratch pointers (saturation fix). Each
+        // q-block launch does serialized f32 ld/add/st RMW into these
+        // scratch buffers; a final host-side conversion kernel writes
+        // f32 scratch → f16 dk_ptr / dv_ptr so accumulation never
+        // saturates at f16 max (65504) like the prior f16-HBM design.
+        (".param .u64", "dk_scratch_ptr"),
+        (".param .u64", "dv_scratch_ptr"),
     ];
     // PCA Tier A: segment_ids pointer — trailing, only when segment_masked.
-    // Kept at the END so the 43-param layout stays byte-stable for
-    // segment_masked=false backward kernels.
+    // Kept at the END so the rest of the param layout stays byte-stable
+    // for segment_masked=false backward kernels.
     if config.segment_masked {
         params.push((".param .u64", "segment_ids_ptr"));
     }
@@ -142,7 +149,7 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig) {
     ptx.push_str("    .reg .u32 %r<16>;\n");
     ptx.push_str("    .reg .f32 %scale, %log2e;\n");
     ptx.push_str("    .reg .f32 %row_max, %row_sum;\n");
-    ptx.push_str("    .reg .u64 %q_start, %head_idx, %batch_idx, %k_start, %k_max;\n");
+    ptx.push_str("    .reg .u64 %q_start, %q_launch_base, %head_idx, %batch_idx, %k_start, %k_max;\n");
     ptx.push_str("    .reg .u64 %shmem_base, %smem_addr;\n");
 
     // Tier C backward-specific registers. Per-slice f32 accumulators for
@@ -198,6 +205,13 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig) {
     // prelude so the dRMSNorm Phase 1 SMEM->HBM copy can reference it
     // via a stable register name.
     ptx.push_str("    .reg .u64 %rd_bwd_dxn;\n");
+    // Option A dK/dV f32 scratch pointers. Finalize emits
+    // `ld.global.f32 / add.f32 / st.global.f32` RMW into these
+    // scratch buffers; a host-side conversion kernel writes
+    // f32 scratch → f16 dk_ptr / dv_ptr once all q-block launches
+    // complete. Avoids the f16-HBM saturation-to-inf that broke the
+    // prior cvt.rn.f16.f32 ld-add-st design.
+    ptx.push_str("    .reg .u64 %rd_bwd_dk_scratch, %rd_bwd_dv_scratch;\n");
 
     // SMEM-base pointer + warp_row (shared with forward contract so
     // backward phase emitters can use the same addressing helpers).
@@ -288,6 +302,9 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig) {
     ptx.push_str("    ld.param.u64 %rd_bwd_dwv, [dwv_ptr];\n");
     ptx.push_str("    ld.param.u64 %rd_bwd_dx,  [dx_ptr];\n");
     ptx.push_str("    ld.param.u64 %rd_bwd_dxn, [dx_norm_ptr];\n");
+    ptx.push_str("    ld.param.u64 %rd_bwd_dk_scratch, [dk_scratch_ptr];\n");
+    ptx.push_str("    ld.param.u64 %rd_bwd_dv_scratch, [dv_scratch_ptr];\n");
+    ptx.push_str("    ld.param.u64 %q_launch_base, [seq_lens_ptr];\n");
 
     // Thread/block indices — identical to forward.
     emit_thread_lane_warp_register_init(ptx);
@@ -297,9 +314,16 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig) {
         "    mul.lo.u64 %q_start, %q_start, {};\n",
         config.block_q
     ));
+    ptx.push_str("    add.u64 %q_start, %q_start, %q_launch_base;\n");
     ptx.push_str("    cvt.u64.u32 %rd16, %bid_y;\n");
     ptx.push_str("    rem.u64 %head_idx,  %rd16, %rd5;\n");
     ptx.push_str("    div.u64 %batch_idx, %rd16, %rd5;\n");
+    // Backward loads only the first KV tile into SMEM today, so the live
+    // tile origin is k_start=0. Segment-masked ds_compute synthesizes
+    // k_global = k_start + lane; leaving k_start uninitialized turns the
+    // helper's seg_smem address into garbage and can fault on ld.shared.
+    ptx.push_str("    mov.u64 %k_start, 0;\n");
+    ptx.push_str("    mov.u64 %k_max, %rd6;\n");
 
     // PCA Tier A: cooperative warp-0 global→shared load of segment_ids.
     // Mirrors forward prelude's PCA_LOAD_LOOP / PCA_LOAD_DONE (Task 3B),

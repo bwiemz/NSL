@@ -553,10 +553,9 @@ pub fn synthesize_backward(config: &FlashAttentionConfig) -> Result<String, Stri
     // the block before any thread takes the early-`ret` branch.
     phases::csha_hooks::emit_active_heads_guard(&mut ptx, config);
 
-    // Phase 1: load saved post-RoPE Q/K/V from HBM into their SMEM
-    // tiles. Fired once; subsequent q_tile_iter iterations read from
-    // these tiles. K and V are loaded via kv_load so ds_compute can
-    // recompute S = Q @ K^T and dP = dO · V^T with real addressing.
+    // Phase 1: load saved post-RoPE Q from HBM into its SMEM tile.
+    // K and V are reloaded inside the outer KV-tile loop so `%k_start`
+    // advances across the full sequence instead of freezing on tile 0.
     //
     // Q load must cover ALL block_q rows — each q_tile_iter loads 4 rows
     // (one per warp), so we iterate all q_tile_iters to fill the full
@@ -566,29 +565,75 @@ pub fn synthesize_backward(config: &FlashAttentionConfig) -> Result<String, Stri
     for qi in 0..q_load_iters {
         phases::backward::q_load::emit(&mut ptx, config, qi);
     }
-    phases::backward::kv_load::emit_k(&mut ptx, config);
-    phases::backward::kv_load::emit_v(&mut ptx, config);
 
     // Phase 2: per q_tile_iter KV loop. One iter per 4-row warp group
     // (matches the forward orchestrator's tile cadence).
     let iters = (config.block_q as u32).div_ceil(4);
     let slices_per_lane = ((config.head_dim as u32) / 32).max(1);
 
-    // Cooperatively zero the dV and dK SMEM tiles ONCE before the KV
-    // loop. Both tiles are block_kv × head_dim × 4 bytes f32; 128
-    // threads per block cooperatively zero
-    // `block_kv*head_dim*2 / 128` floats each.
+    // Cooperatively zero the dQ SMEM tile ONCE before the KV loop. dQ
+    // accumulates across all KV tiles for this q-block, so its backing
+    // tile must persist for the whole outer k_start sweep.
     let dv_off = smem_layout::backward_dv_offset(config);
     let dk_off = smem_layout::backward_dk_offset(config);
     let dq_off = smem_layout::backward_dq_offset(config);
+    let corr_off = smem_layout::backward_rms_strip_offset(config);
     let dk_dv_cells = (config.block_kv * config.head_dim) as u32;
     let dq_cells = (config.block_q * config.head_dim) as u32;
+    let corr_cells = config.block_q as u32;
     let cells_per_thread = dk_dv_cells.div_ceil(128);
     let dq_cells_per_thread = dq_cells.div_ceil(128);
+    let corr_cells_per_thread = corr_cells.div_ceil(128);
+    // Zero-init the dQ SMEM tile. The row-correction strip is written
+    // unconditionally by `emit_d_correction` below (overwrite, not RMW),
+    // so it does NOT need pre-zeroing.
+    let _ = (corr_off, corr_cells, corr_cells_per_thread);
+    ptx.push_str(&format!(
+        "    // BWD zero-init DQ SMEM tile ({dq_cells} cells, \
+         {dq_cells_per_thread}/thread)\n"
+    ));
+    for k in 0..dq_cells_per_thread {
+        let thread_cell = k * 128;
+        ptx.push_str("    cvt.u64.u32 %rd_zero_idx, %tid_x;\n");
+        if thread_cell > 0 {
+            ptx.push_str(&format!(
+                "    add.u64 %rd_zero_idx, %rd_zero_idx, {};\n",
+                thread_cell
+            ));
+        }
+        ptx.push_str(&format!(
+            "    setp.lt.u64 %p_zero, %rd_zero_idx, {};\n", dq_cells
+        ));
+        ptx.push_str("    shl.b64 %rd_zero_idx, %rd_zero_idx, 2;\n");
+        ptx.push_str(&format!(
+            "    add.u64 %rd_zero_idx, %rd_zero_idx, {dq_off};\n"
+        ));
+        ptx.push_str("    add.u64 %rd_zero_idx, %shmem_base, %rd_zero_idx;\n");
+        ptx.push_str("    mov.f32 %f_zero_val, 0f00000000;\n");
+        ptx.push_str("    @%p_zero st.shared.f32 [%rd_zero_idx], %f_zero_val;\n");
+    }
+    ptx.push_str("    bar.sync 0;  // dQ tile zeroed\n");
+
+    // One-shot D-correction phase: D[i] = dO[i] . O[i] for each row.
+    // Replaces the previous ROWPRE KV loop + cross-tile strip RMW.
+    // Mathematically equivalent to sum_c P[i,c]*dP[i,c] but computed in
+    // a single row-wise pass — matches the CPU reference's `d_corr`
+    // formulation and avoids the accumulation bug that made the old
+    // strip ~62× too large on the sq128 fixture.
+    ptx.push_str("    // --- one-shot D correction strip (dO . O) ---\n");
+    for q_iter in 0..iters {
+        phases::backward::ds_compute::emit_d_correction(&mut ptx, config, q_iter);
+    }
+    ptx.push_str("    bar.sync 0;  // D correction strip complete\n");
+
+    ptx.push_str("    mov.u64 %k_start, 0;\n");
+    ptx.push_str("    mov.u64 %k_max, %rd6;\n");
+    ptx.push_str("V2_BWD_LOOP_KV:\n");
+    phases::backward::kv_load::emit_k_suffixed(&mut ptx, config, "MAIN");
+    phases::backward::kv_load::emit_v_suffixed(&mut ptx, config, "MAIN");
     for (tag, off, total, per_thread) in [
         ("DV", dv_off, dk_dv_cells, cells_per_thread),
         ("DK", dk_off, dk_dv_cells, cells_per_thread),
-        ("DQ", dq_off, dq_cells, dq_cells_per_thread),
     ] {
         ptx.push_str(&format!(
             "    // BWD zero-init {tag} SMEM tile ({total} cells, \
@@ -596,7 +641,6 @@ pub fn synthesize_backward(config: &FlashAttentionConfig) -> Result<String, Stri
         ));
         for k in 0..per_thread {
             let thread_cell = k * 128;
-            // cell_idx = tid + k*128; byte_off = off + cell_idx*4
             ptx.push_str("    cvt.u64.u32 %rd_zero_idx, %tid_x;\n");
             if thread_cell > 0 {
                 ptx.push_str(&format!(
@@ -604,7 +648,6 @@ pub fn synthesize_backward(config: &FlashAttentionConfig) -> Result<String, Stri
                     thread_cell
                 ));
             }
-            // Guard (only stores in-range cells): cell_idx < total
             ptx.push_str(&format!(
                 "    setp.lt.u64 %p_zero, %rd_zero_idx, {};\n", total
             ));
@@ -617,27 +660,52 @@ pub fn synthesize_backward(config: &FlashAttentionConfig) -> Result<String, Stri
             ptx.push_str("    @%p_zero st.shared.f32 [%rd_zero_idx], %f_zero_val;\n");
         }
     }
-    ptx.push_str("    bar.sync 0;  // dV + dK + dQ tiles zeroed\n");
+    ptx.push_str("    bar.sync 0;  // dV + dK tiles zeroed for this KV tile\n");
 
     for q_iter in 0..iters {
         ptx.push_str(&format!(
             "    // ====== BWD q_tile_iter = {q_iter} / {iters} ======\n"
         ));
-        // %f_dq_{slice} register-held accumulator reset per iter.
-        // (dV/dK now use SMEM tiles zeroed above, so no per-iter reset.)
-        for slice in 0..slices_per_lane {
-            ptx.push_str(&format!("    mov.f32 %f_dq_{slice}, 0f00000000;\n"));
+        let hd = config.head_dim as u32;
+        let row_stride = hd * 4; // f32
+        let slices = slices_per_lane;
+        ptx.push_str(&format!(
+            "    // BWD reload dQ SMEM tile -> %f_dq (q_tile_iter={q_iter})\n"
+        ));
+        ptx.push_str(&format!(
+            "    add.u32 %r0, %warp_id, {};\n", q_iter * 4
+        ));
+        ptx.push_str("    cvt.u64.u32 %rd_dqs_row, %r0;\n");
+        ptx.push_str(&format!(
+            "    mul.lo.u64 %rd_dqs_row, %rd_dqs_row, {row_stride};\n"
+        ));
+        ptx.push_str(&format!(
+            "    add.u64 %rd_dqs_row, %rd_dqs_row, {dq_off};\n"
+        ));
+        ptx.push_str("    add.u64 %rd_dqs_row, %shmem_base, %rd_dqs_row;\n");
+        for slice in 0..slices {
+            ptx.push_str("    cvt.u64.u32 %rd_dqs_col, %lane;\n");
+            if slices > 1 {
+                ptx.push_str(&format!(
+                    "    mul.lo.u64 %rd_dqs_col, %rd_dqs_col, {slices};\n"
+                ));
+            }
+            if slice > 0 {
+                ptx.push_str(&format!(
+                    "    add.u64 %rd_dqs_col, %rd_dqs_col, {slice};\n"
+                ));
+            }
+            ptx.push_str("    shl.b64 %rd_dqs_col, %rd_dqs_col, 2;\n");
+            ptx.push_str("    add.u64 %rd_dqs_addr, %rd_dqs_row, %rd_dqs_col;\n");
+            ptx.push_str(&format!(
+                "    ld.shared.f32 %f_dq_{slice}, [%rd_dqs_addr];\n"
+            ));
         }
+
         phases::backward::ds_compute::emit(&mut ptx, config, q_iter);
         phases::backward::dv_accum::emit(&mut ptx, config, q_iter);
         phases::backward::dqdk_accum::emit(&mut ptx, config, q_iter);
 
-        // Flush %f_dq_{slice} registers into the dQ SMEM tile so the
-        // per-iter register values survive across iters. Warp owns row
-        // (warp_row = warp_id + q_iter*4), lane owns d-slice cols.
-        let hd = config.head_dim as u32;
-        let row_stride = hd * 4; // f32
-        let slices = slices_per_lane;
         ptx.push_str(&format!(
             "    // BWD flush %f_dq -> dQ SMEM tile (q_tile_iter={q_iter})\n"
         ));
@@ -653,7 +721,6 @@ pub fn synthesize_backward(config: &FlashAttentionConfig) -> Result<String, Stri
         ));
         ptx.push_str("    add.u64 %rd_dqs_row, %shmem_base, %rd_dqs_row;\n");
         for slice in 0..slices {
-            // col = lane * slices + slice; byte off = col * 4
             ptx.push_str("    cvt.u64.u32 %rd_dqs_col, %lane;\n");
             if slices > 1 {
                 ptx.push_str(&format!(
@@ -674,7 +741,11 @@ pub fn synthesize_backward(config: &FlashAttentionConfig) -> Result<String, Stri
             ));
         }
     }
-    ptx.push_str("    bar.sync 0;  // dQ SMEM tile complete\n");
+    phases::backward::finalize::emit_store_kv_only(&mut ptx, config, 0);
+    ptx.push_str(&format!("    add.u64 %k_start, %k_start, {};\n", config.block_kv));
+    ptx.push_str("    setp.lt.u64 %p0, %k_start, %k_max;\n");
+    ptx.push_str("    @%p0 bra V2_BWD_LOOP_KV;\n");
+    ptx.push_str("    bar.sync 0;  // dQ SMEM tile complete across all KV tiles\n");
 
     // Phase 3: CSHA hooks (x_norm recompute, inverse RoPE, dW{q,k,v},
     // dRMSNorm). Each writes directly to HBM except the dRoPE rotation
@@ -687,7 +758,7 @@ pub fn synthesize_backward(config: &FlashAttentionConfig) -> Result<String, Stri
     // phases::backward::csha_hooks_backward::emit_drmsnorm(&mut ptx, config, 0);
 
     // Phase 4: cooperative global stores of the 7 gradients + final fence.
-    phases::backward::finalize::emit(&mut ptx, config, 0);
+    phases::backward::finalize::emit_store_dq_only(&mut ptx, config, 0);
 
     ptx.push_str("    ret;\n");
     ptx.push_str("}\n");
@@ -839,13 +910,14 @@ mod backward_orchestrator_tests {
     fn synthesize_backward_emits_accumulator_resets() {
         let cfg = base_cfg_fused_backward(32, 32, 32, 4, 32);
         let ptx = synthesize_backward(&cfg).expect("synth backward");
-        // dQ is register-held — orchestrator zero-inits %f_dq_{slice}
-        // per q_tile_iter (cross-iter accumulation not needed; dQ has
-        // unique per-thread cell ownership).
-        assert!(ptx.contains("mov.f32 %f_dq_0, 0f00000000"));
-        // dK and dV migrated to SMEM tiles (backward_dk_offset /
-        // backward_dv_offset). Orchestrator cooperatively zeros the
-        // tiles ONCE before the KV loop rather than per-iter resets.
+        // WIP q-block serialization architecture: dQ, dK, dV all migrated
+        // to SMEM tiles zeroed cooperatively before their respective loops.
+        // dQ is zeroed ONCE before the KV loop (cumulates across KV iters
+        // via register-SMEM cycle inside each q_tile_iter). dK/dV are
+        // zeroed at the TOP of each KV iter since they flush to f32
+        // scratch (Option A) after every iter.
+        assert!(ptx.contains("BWD zero-init DQ SMEM tile"),
+            "orchestrator must zero dQ SMEM tile");
         assert!(ptx.contains("BWD zero-init DK SMEM tile"),
             "orchestrator must zero dK SMEM tile");
         assert!(ptx.contains("BWD zero-init DV SMEM tile"),
