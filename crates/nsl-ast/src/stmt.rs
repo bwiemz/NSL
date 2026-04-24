@@ -36,6 +36,9 @@ pub enum StmtKind {
     /// model definitions
     ModelDef(ModelDef),
 
+    /// agent definitions
+    AgentDef(crate::agent::AgentDef),
+
     /// struct definitions
     StructDef(StructDef),
 
