@@ -584,51 +584,47 @@ pub fn synthesize_backward(config: &FlashAttentionConfig) -> Result<String, Stri
     let cells_per_thread = dk_dv_cells.div_ceil(128);
     let dq_cells_per_thread = dq_cells.div_ceil(128);
     let corr_cells_per_thread = corr_cells.div_ceil(128);
-    for (tag, off, total, per_thread) in [
-        ("DQ", dq_off, dq_cells, dq_cells_per_thread),
-        ("ROWCORR", corr_off, corr_cells, corr_cells_per_thread),
-    ] {
-        ptx.push_str(&format!(
-            "    // BWD zero-init {tag} SMEM tile ({total} cells, \
-             {per_thread}/thread)\n"
-        ));
-        for k in 0..per_thread {
-            let thread_cell = k * 128;
-            // cell_idx = tid + k*128; byte_off = off + cell_idx*4
-            ptx.push_str("    cvt.u64.u32 %rd_zero_idx, %tid_x;\n");
-            if thread_cell > 0 {
-                ptx.push_str(&format!(
-                    "    add.u64 %rd_zero_idx, %rd_zero_idx, {};\n",
-                    thread_cell
-                ));
-            }
-            // Guard (only stores in-range cells): cell_idx < total
+    // Zero-init the dQ SMEM tile. The row-correction strip is written
+    // unconditionally by `emit_d_correction` below (overwrite, not RMW),
+    // so it does NOT need pre-zeroing.
+    let _ = (corr_off, corr_cells, corr_cells_per_thread);
+    ptx.push_str(&format!(
+        "    // BWD zero-init DQ SMEM tile ({dq_cells} cells, \
+         {dq_cells_per_thread}/thread)\n"
+    ));
+    for k in 0..dq_cells_per_thread {
+        let thread_cell = k * 128;
+        ptx.push_str("    cvt.u64.u32 %rd_zero_idx, %tid_x;\n");
+        if thread_cell > 0 {
             ptx.push_str(&format!(
-                "    setp.lt.u64 %p_zero, %rd_zero_idx, {};\n", total
+                "    add.u64 %rd_zero_idx, %rd_zero_idx, {};\n",
+                thread_cell
             ));
-            ptx.push_str("    shl.b64 %rd_zero_idx, %rd_zero_idx, 2;\n");
-            ptx.push_str(&format!(
-                "    add.u64 %rd_zero_idx, %rd_zero_idx, {off};\n"
-            ));
-            ptx.push_str("    add.u64 %rd_zero_idx, %shmem_base, %rd_zero_idx;\n");
-            ptx.push_str("    mov.f32 %f_zero_val, 0f00000000;\n");
-            ptx.push_str("    @%p_zero st.shared.f32 [%rd_zero_idx], %f_zero_val;\n");
         }
+        ptx.push_str(&format!(
+            "    setp.lt.u64 %p_zero, %rd_zero_idx, {};\n", dq_cells
+        ));
+        ptx.push_str("    shl.b64 %rd_zero_idx, %rd_zero_idx, 2;\n");
+        ptx.push_str(&format!(
+            "    add.u64 %rd_zero_idx, %rd_zero_idx, {dq_off};\n"
+        ));
+        ptx.push_str("    add.u64 %rd_zero_idx, %shmem_base, %rd_zero_idx;\n");
+        ptx.push_str("    mov.f32 %f_zero_val, 0f00000000;\n");
+        ptx.push_str("    @%p_zero st.shared.f32 [%rd_zero_idx], %f_zero_val;\n");
     }
-    ptx.push_str("    bar.sync 0;  // dQ tile + row correction strip zeroed\n");
+    ptx.push_str("    bar.sync 0;  // dQ tile zeroed\n");
 
-    ptx.push_str("    mov.u64 %k_start, 0;\n");
-    ptx.push_str("    mov.u64 %k_max, %rd6;\n");
-    ptx.push_str("V2_BWD_LOOP_KV_ROWPRE:\n");
-    phases::backward::kv_load::emit_k_suffixed(&mut ptx, config, "ROWPRE");
-    phases::backward::kv_load::emit_v_suffixed(&mut ptx, config, "ROWPRE");
+    // One-shot D-correction phase: D[i] = dO[i] . O[i] for each row.
+    // Replaces the previous ROWPRE KV loop + cross-tile strip RMW.
+    // Mathematically equivalent to sum_c P[i,c]*dP[i,c] but computed in
+    // a single row-wise pass — matches the CPU reference's `d_corr`
+    // formulation and avoids the accumulation bug that made the old
+    // strip ~62× too large on the sq128 fixture.
+    ptx.push_str("    // --- one-shot D correction strip (dO . O) ---\n");
     for q_iter in 0..iters {
-        phases::backward::ds_compute::emit_rowsum_prepass(&mut ptx, config, q_iter);
+        phases::backward::ds_compute::emit_d_correction(&mut ptx, config, q_iter);
     }
-    ptx.push_str(&format!("    add.u64 %k_start, %k_start, {};\n", config.block_kv));
-    ptx.push_str("    setp.lt.u64 %p0, %k_start, %k_max;\n");
-    ptx.push_str("    @%p0 bra V2_BWD_LOOP_KV_ROWPRE;\n");
-    ptx.push_str("    bar.sync 0;  // full-row correction strip complete\n");
+    ptx.push_str("    bar.sync 0;  // D correction strip complete\n");
 
     ptx.push_str("    mov.u64 %k_start, 0;\n");
     ptx.push_str("    mov.u64 %k_max, %rd6;\n");
