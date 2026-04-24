@@ -961,6 +961,10 @@ impl<'a> TypeChecker<'a> {
                 });
             }
             StmtKind::ServeBlock(serve) => self.check_serve_block(serve),
+            // M56: Agent body checking is deferred to Tasks 5–12.
+            // For now we simply accept the declaration; E0610 is already
+            // emitted during collect_top_level_decls.
+            StmtKind::AgentDef(_) => {}
         }
     }
 }

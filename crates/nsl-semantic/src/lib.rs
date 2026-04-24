@@ -1,3 +1,4 @@
+pub mod agent;
 pub mod builtins;
 pub mod cep;
 pub mod cfie;
@@ -99,6 +100,8 @@ pub fn analyze_with_imports(
     // Phase 2: Run the type checker with import context
     let mut checker = TypeChecker::new(interner, &mut scopes);
     checker.set_import_types(import_types);
+    // M56: thread the flag so E0610 can fire during collect_top_level_decls.
+    checker.linear_types_enabled = linear_types;
     checker.check_module(module);
 
     // M51: Effect analysis is now integrated into TypeChecker — propagation

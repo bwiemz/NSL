@@ -594,7 +594,9 @@ impl Compiler<'_> {
             | StmtKind::TokenizerDef(_)
             | StmtKind::DatasetDef(_)
             | StmtKind::DatatypeDef(_)
-            | StmtKind::ServeBlock(_) => {}
+            | StmtKind::ServeBlock(_)
+            // M56: agent codegen deferred; no free-var analysis needed yet.
+            | StmtKind::AgentDef(_) => {}
             StmtKind::Decorated { stmt, .. } => {
                 self.collect_free_vars_in_stmt(stmt, param_syms, state, out, seen);
             }
