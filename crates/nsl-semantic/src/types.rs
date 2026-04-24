@@ -178,6 +178,26 @@ pub enum Type {
     /// Immutable borrow: &T — read-only access, cannot be consumed or mutated.
     /// The inner type is the borrowed type (e.g., &Tensor<[N], f32> -> Borrow(Tensor{...})).
     Borrow(Box<Type>),
+
+    /// M56: Agent type — like Model with isolated mutable state and
+    /// per-port linear-move communication.
+    Agent {
+        name: nsl_ast::Symbol,
+        fields: Vec<(nsl_ast::Symbol, Type, AgentFieldOwnership)>,
+        methods: Vec<(nsl_ast::Symbol, Type)>,
+    },
+}
+
+/// M56: Ownership classification for agent fields.
+/// Controls how the linear-move ownership checker treats cross-agent access.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AgentFieldOwnership {
+    /// Field is exclusively owned by the agent; no other agent can access.
+    Exclusive,
+    /// Field is @shared — readable by all agents (refcount-bumped across sends).
+    SharedReadOnly,
+    /// Scalar/copy type (int, float, bool) — no ownership concerns.
+    Copy,
 }
 
 impl Type {
