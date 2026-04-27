@@ -174,6 +174,8 @@ pub struct NslTensor {
     pub(crate) tape_id: i64,
 }
 
+pub const NSL_TENSOR_DATA_OFFSET: usize = std::mem::offset_of!(NslTensor, data);
+
 // Built-in dtype IDs (match existing u8 values)
 pub const DTYPE_F64: u16 = 0;
 pub const DTYPE_F32: u16 = 1;

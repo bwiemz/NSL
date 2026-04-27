@@ -397,7 +397,16 @@ impl Compiler<'_> {
                 }
             }
 
-            if let StmtKind::ModelDef(md) = &stmt.kind {
+            let model_def = match &stmt.kind {
+                StmtKind::ModelDef(md) => Some(md),
+                StmtKind::Decorated { stmt: inner, .. } => match &inner.kind {
+                    StmtKind::ModelDef(md) => Some(md),
+                    _ => None,
+                },
+                _ => None,
+            };
+
+            if let Some(md) = model_def {
                 let name = self.resolve_sym(md.name).to_string();
                 let mut fields = Vec::new();
                 let mut offset = 0usize;

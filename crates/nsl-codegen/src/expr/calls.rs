@@ -12,6 +12,24 @@ use crate::context::FuncState;
 use crate::error::CodegenError;
 use crate::types::{is_float_type, is_int_type, nsl_type_to_cl, pointer_type};
 
+fn tensor_unary_runtime_alias(func_name: &str, arity: usize) -> Option<&'static str> {
+    if arity != 1 {
+        return None;
+    }
+    match func_name {
+        "relu" => Some("nsl_tensor_relu"),
+        "sigmoid" => Some("nsl_tensor_sigmoid"),
+        "tanh" => Some("nsl_tensor_tanh"),
+        "exp" => Some("nsl_tensor_exp"),
+        "log" => Some("nsl_tensor_log"),
+        "sqrt" => Some("nsl_tensor_sqrt"),
+        "abs" => Some("nsl_tensor_abs"),
+        "gelu" => Some("nsl_tensor_gelu"),
+        "silu" => Some("nsl_tensor_silu"),
+        _ => None,
+    }
+}
+
 fn static_dim_value(dim: &nsl_semantic::types::Dim) -> Option<i64> {
     match dim {
         nsl_semantic::types::Dim::Concrete(value) => Some(*value),
@@ -2056,6 +2074,12 @@ impl Compiler<'_> {
             e.clone()
         } else if let Some(e) = self.registry.runtime_fns.get(effective_name) {
             e.clone()
+        } else if let Some(alias) = tensor_unary_runtime_alias(effective_name, arg_vals.len()) {
+            self.registry
+                .runtime_fns
+                .get(alias)
+                .cloned()
+                .ok_or_else(|| CodegenError::new(format!("undefined function '{effective_name}'")))?
         } else {
             return Err(CodegenError::new(format!(
                 "undefined function '{effective_name}'"

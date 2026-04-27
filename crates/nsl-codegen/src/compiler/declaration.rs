@@ -16,6 +16,17 @@ use super::{mangle_name, Compiler};
 use crate::error::CodegenError;
 use crate::types::pointer_type;
 
+fn model_def_from_stmt(stmt: &Stmt) -> Option<&nsl_ast::decl::ModelDef> {
+    match &stmt.kind {
+        StmtKind::ModelDef(md) => Some(md),
+        StmtKind::Decorated { stmt: inner, .. } => match &inner.kind {
+            StmtKind::ModelDef(md) => Some(md),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 impl Compiler<'_> {
     // ── Pass 1: Declare functions ───────────────────────────────────
 
@@ -206,13 +217,8 @@ impl Compiler<'_> {
         // Collect model names so we skip them in the struct constructor loop
         let model_name_set: std::collections::HashSet<String> = stmts
             .iter()
-            .filter_map(|s| {
-                if let StmtKind::ModelDef(md) = &s.kind {
-                    Some(self.resolve_sym(md.name).to_string())
-                } else {
-                    None
-                }
-            })
+            .filter_map(|s| model_def_from_stmt(s))
+            .map(|md| self.resolve_sym(md.name).to_string())
             .collect();
 
         let struct_names: Vec<String> = self
@@ -244,13 +250,7 @@ impl Compiler<'_> {
         // Declare model constructors and methods
         let model_defs: Vec<_> = stmts
             .iter()
-            .filter_map(|s| {
-                if let StmtKind::ModelDef(md) = &s.kind {
-                    Some(md.clone())
-                } else {
-                    None
-                }
-            })
+            .filter_map(|s| model_def_from_stmt(s).cloned())
             .collect();
 
         for md in &model_defs {
@@ -586,7 +586,7 @@ impl Compiler<'_> {
         let mut result = Vec::new();
 
         for stmt in stmts {
-            if let StmtKind::ModelDef(md) = &stmt.kind {
+            if let Some(md) = model_def_from_stmt(stmt) {
                 let model_name = self.resolve_sym(md.name).to_string();
 
                 // Constructor signature: (params...) -> ptr

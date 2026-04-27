@@ -8,8 +8,8 @@
 //!   2. Reads `argv[1]` = data_path, `argv[2]` = sidecar_path,
 //!      `argv[3]` = weights_path (NUL-terminated C-strings from the OS).
 //!   3. Loads calibration batches via `nsl_calibration_load`.
-//!   4. Loads model weights via `nsl_model_load` (nsl-runtime).
-//!   5. Loops over batches calling `model_forward`; each call populates
+//!   4. Creates a runtime model from `argv[3]` and retrieves its weight-pointer array.
+//!   5. Loops over batches calling `nsl_calib_model_forward`; each call populates
 //!      the retention arena (spliced in by Task 4).
 //!   6. For AWQ-style hooks with an `observe_plan`, emits a plan-driven
 //!      2D max-abs loop per projection that reads the retention arena and
@@ -35,6 +35,7 @@
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -48,6 +49,7 @@ use cranelift_codegen::Context;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_module::{DataDescription, DataId, Linkage, Module};
 use cranelift_object::{ObjectBuilder, ObjectModule};
+use object::{Object, ObjectSymbol};
 
 use crate::calibration::ctx::CalibCtx;
 use crate::calibration::hooks::{CalibrationResult, FinalizePlanEntry, ObservePlanEntry};
@@ -91,8 +93,23 @@ pub fn real_subprocess_entry(
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default();
 
+    let forward_batch_seq = if needs_forward {
+        Some(
+            nsl_runtime::calibration_data::peek_batch_seq(&cfg.calibration_data).map_err(|e| {
+                HarnessError::Infrastructure {
+                    reason: format!("peek_batch_seq: {e}"),
+                }
+            })?,
+        )
+    } else {
+        None
+    };
+
     // Build the arena layout and collect observe/finalize plans from hooks.
-    let arena_layout = build_arena_layout(&cfg.projections, 8, 4);
+    let (arena_batch, arena_seq) = forward_batch_seq
+        .map(|(_, seq)| (1, seq))
+        .unwrap_or((8, 4));
+    let arena_layout = build_arena_layout(&cfg.projections, arena_batch, arena_seq);
     let observe_plan: Vec<ObservePlanEntry> = registry
         .iter()
         .flat_map(|h| h.observe_plan(&arena_layout))
@@ -103,13 +120,54 @@ pub fn real_subprocess_entry(
         .collect();
 
     // Emit and link the calibration binary.
-    let binary_path = emit_and_link_calibration_binary(
-        &tmp,
-        &sidecar_json_for_binary,
-        needs_forward,
-        &observe_plan,
-        &finalize_plan,
-    )?;
+    let binary_path = if needs_forward {
+        let compile_bundle = cfg
+            .compile_bundle
+            .clone()
+            .ok_or_else(|| HarnessError::Infrastructure {
+                reason: "real_subprocess_entry requires compile_bundle for forward-pass calibration"
+                    .into(),
+            })?;
+        let (_count, seq) = forward_batch_seq.expect("forward path computed batch/seq above");
+        let mut model_opts = crate::CompileOptions::default();
+        model_opts.calibration_batch_seq = Some((1, seq));
+        model_opts.calibration_retention = Some(cfg.projections.clone());
+        model_opts.calibration_compile_bundle = Some(compile_bundle.clone());
+
+        let model_obj = tmp.join("calib_model.o");
+        emit_calibration_model_object(
+            &compile_bundle.ast,
+            &model_opts,
+            &arena_layout,
+            &model_obj,
+        )?;
+
+        let scaffolding_obj = tmp.join("scaffolding.o");
+        emit_calibration_scaffolding_object(
+            &observe_plan,
+            &finalize_plan,
+            &arena_layout,
+            &sidecar_json_for_binary,
+            true,
+            &scaffolding_obj,
+        )?;
+
+        let binary_path = tmp.join(if cfg!(windows) {
+            "calibration.exe"
+        } else {
+            "calibration"
+        });
+        link_calibration_binary(&scaffolding_obj, &model_obj, &binary_path)?;
+        binary_path
+    } else {
+        emit_and_link_calibration_binary(
+            &tmp,
+            &sidecar_json_for_binary,
+            false,
+            &observe_plan,
+            &finalize_plan,
+        )?
+    };
 
     // Spawn the subprocess passing paths as CLI args.
     let data_path_str = cfg.calibration_data.to_string_lossy().into_owned();
@@ -132,6 +190,16 @@ pub fn real_subprocess_entry(
             });
         }
         SubprocessOutcome::Infrastructure(reason) => {
+            let reason = if reason.contains("status 3") {
+                match fs::read_to_string(&sidecar_path) {
+                    Ok(detail) if !detail.trim().is_empty() => {
+                        format!("{reason}\n{}", detail.trim())
+                    }
+                    _ => reason,
+                }
+            } else {
+                reason
+            };
             return Err(HarnessError::Infrastructure { reason });
         }
     }
@@ -305,6 +373,1284 @@ fn emit_2d_max_abs_loop(
 ///   running_ptr: *const f32 = 8 bytes
 ///   Total                   = 32 bytes
 const AWQ_DESC_BYTES: u32 = 32;
+
+fn new_calibration_object_module(
+    name: &str,
+) -> Result<(ObjectModule, cranelift_codegen::isa::CallConv), HarnessError> {
+    let flag_builder = cranelift_codegen::settings::builder();
+    let isa = cranelift_native::builder()
+        .map_err(|e| HarnessError::Infrastructure {
+            reason: format!("cranelift native builder: {e}"),
+        })?
+        .finish(cranelift_codegen::settings::Flags::new(flag_builder))
+        .map_err(|e| HarnessError::Infrastructure {
+            reason: format!("cranelift ISA: {e}"),
+        })?;
+
+    let call_conv = {
+        let detected = isa.default_call_conv();
+        #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+        {
+            if detected != cranelift_codegen::isa::CallConv::WindowsFastcall {
+                cranelift_codegen::isa::CallConv::WindowsFastcall
+            } else {
+                detected
+            }
+        }
+        #[cfg(not(all(target_os = "windows", target_arch = "x86_64")))]
+        {
+            detected
+        }
+    };
+
+    let builder = ObjectBuilder::new(
+        isa,
+        name,
+        cranelift_module::default_libcall_names(),
+    )
+    .map_err(|e| HarnessError::Infrastructure {
+        reason: format!("object builder: {e}"),
+    })?;
+
+    Ok((ObjectModule::new(builder), call_conv))
+}
+
+fn write_object_module(module: ObjectModule, out_path: &Path) -> Result<(), HarnessError> {
+    let product = module.finish();
+    let obj_bytes = product.emit().map_err(|e| HarnessError::Infrastructure {
+        reason: format!("emit object: {e}"),
+    })?;
+    fs::write(out_path, &obj_bytes).map_err(|e| HarnessError::Infrastructure {
+        reason: format!("writing {}: {e}", out_path.display()),
+    })
+}
+
+fn map_codegen_error<T>(
+    context: &str,
+    result: Result<T, crate::error::CodegenError>,
+) -> Result<T, HarnessError> {
+    result.map_err(|e| HarnessError::Infrastructure {
+        reason: format!("{context}: {}", e.message),
+    })
+}
+
+fn awq_model_def_from_ast<'a>(
+    ast: &'a nsl_ast::Module,
+    interner: &nsl_lexer::Interner,
+    model_name: &str,
+) -> Option<&'a nsl_ast::decl::ModelDef> {
+    ast.stmts.iter().find_map(|stmt| {
+        let md = match &stmt.kind {
+            nsl_ast::stmt::StmtKind::ModelDef(md) => md,
+            nsl_ast::stmt::StmtKind::Decorated { stmt: inner, .. } => match &inner.kind {
+                nsl_ast::stmt::StmtKind::ModelDef(md) => md,
+                _ => return None,
+            },
+            _ => return None,
+        };
+        (interner.resolve(md.name.0) == Some(model_name)).then_some(md)
+    })
+}
+
+fn awq_tensor_field_names(
+    model_def: &nsl_ast::decl::ModelDef,
+    interner: &nsl_lexer::Interner,
+) -> Vec<String> {
+    model_def
+        .members
+        .iter()
+        .filter_map(|member| match member {
+            nsl_ast::decl::ModelMember::LayerDecl { name, type_ann, .. } => {
+                match &type_ann.kind {
+                    nsl_ast::types::TypeExprKind::Named(sym)
+                        if interner.resolve(sym.0) == Some("Tensor") =>
+                    {
+                        interner.resolve(name.0).map(str::to_string)
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn declare_i64_rodata(
+    module: &mut ObjectModule,
+    symbol: &str,
+    values: &[i64],
+) -> Result<DataId, HarnessError> {
+    let mut bytes = Vec::with_capacity(values.len() * std::mem::size_of::<i64>());
+    for value in values {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    let data_id = module
+        .declare_data(symbol, Linkage::Local, false, false)
+        .map_err(|e| HarnessError::Infrastructure {
+            reason: format!("declare {symbol}: {e}"),
+        })?;
+    let mut desc = DataDescription::new();
+    desc.define(bytes.into_boxed_slice());
+    module
+        .define_data(data_id, &desc)
+        .map_err(|e| HarnessError::Infrastructure {
+            reason: format!("define {symbol}: {e}"),
+        })?;
+    Ok(data_id)
+}
+
+fn declare_cstr_rodata(
+    module: &mut ObjectModule,
+    symbol: &str,
+    value: &str,
+) -> Result<DataId, HarnessError> {
+    if value.as_bytes().contains(&0) {
+        return Err(HarnessError::Infrastructure {
+            reason: format!("declare {symbol}: embedded NUL byte in C string literal"),
+        });
+    }
+    let data_id = module
+        .declare_data(symbol, Linkage::Local, false, false)
+        .map_err(|e| HarnessError::Infrastructure {
+            reason: format!("declare {symbol}: {e}"),
+        })?;
+    let mut bytes = value.as_bytes().to_vec();
+    bytes.push(0);
+    let mut desc = DataDescription::new();
+    desc.define(bytes.into_boxed_slice());
+    module
+        .define_data(data_id, &desc)
+        .map_err(|e| HarnessError::Infrastructure {
+            reason: format!("define {symbol}: {e}"),
+        })?;
+    Ok(data_id)
+}
+
+fn emit_model_forward_bridge(
+    compiler: &mut crate::compiler::Compiler<'_>,
+    model_name: &str,
+    model_def: &nsl_ast::decl::ModelDef,
+    transpose_fields: &HashSet<String>,
+) -> Result<cranelift_module::FuncId, HarnessError> {
+    let mut model_get_weight_sig = compiler.module.make_signature();
+    model_get_weight_sig.call_conv = compiler.call_conv;
+    model_get_weight_sig.params.push(AbiParam::new(cl_types::I64));
+    model_get_weight_sig.params.push(AbiParam::new(cl_types::I64));
+    model_get_weight_sig.params.push(AbiParam::new(cl_types::I64));
+    model_get_weight_sig.returns.push(AbiParam::new(cl_types::I64));
+    let model_get_weight_id = compiler
+        .module
+        .declare_function(
+            "nsl_model_get_weight",
+            Linkage::Import,
+            &model_get_weight_sig,
+        )
+        .map_err(|e| HarnessError::Infrastructure {
+            reason: format!("declare nsl_model_get_weight: {e}"),
+        })?;
+
+    let mut tensor_transpose_sig = compiler.module.make_signature();
+    tensor_transpose_sig.call_conv = compiler.call_conv;
+    tensor_transpose_sig.params.push(AbiParam::new(cl_types::I64));
+    tensor_transpose_sig.params.push(AbiParam::new(cl_types::I64));
+    tensor_transpose_sig.params.push(AbiParam::new(cl_types::I64));
+    tensor_transpose_sig.returns.push(AbiParam::new(cl_types::I64));
+    let tensor_transpose_id = compiler
+        .module
+        .declare_function("nsl_tensor_transpose", Linkage::Import, &tensor_transpose_sig)
+        .map_err(|e| HarnessError::Infrastructure {
+            reason: format!("declare nsl_tensor_transpose: {e}"),
+        })?;
+
+    let mut sig = compiler.module.make_signature();
+    sig.call_conv = compiler.call_conv;
+    sig.params.push(AbiParam::new(cl_types::I64));
+    sig.params.push(AbiParam::new(cl_types::I64));
+    sig.params.push(AbiParam::new(cl_types::I64));
+    let func_id = compiler
+        .module
+        .declare_function("model_forward", Linkage::Export, &sig)
+        .map_err(|e| HarnessError::Infrastructure {
+            reason: format!("declare model_forward: {e}"),
+        })?;
+
+    let mut ctx = Context::for_function(Function::with_name_signature(
+        UserFuncName::user(0, compiler.next_func_index()),
+        sig,
+    ));
+    let mut fn_builder_ctx = FunctionBuilderContext::new();
+    {
+        let mut b = FunctionBuilder::new(&mut ctx.func, &mut fn_builder_ctx);
+        let entry = b.create_block();
+        b.append_block_params_for_function_params(entry);
+        b.switch_to_block(entry);
+        b.seal_block(entry);
+
+        let model_ptr = b.block_params(entry)[0];
+        let _num_weights = b.block_params(entry)[1];
+        let input_tensor = b.block_params(entry)[2];
+
+        let layout = compiler
+            .types
+            .struct_layouts
+            .get(model_name)
+            .cloned()
+            .ok_or_else(|| HarnessError::Infrastructure {
+                reason: format!("missing struct layout for model '{model_name}'"),
+            })?;
+
+        let model_slot = b.create_sized_stack_slot(StackSlotData::new(
+            StackSlotKind::ExplicitSlot,
+            layout.total_size.max(8) as u32,
+            3,
+        ));
+        let model_addr = b.ins().stack_addr(cl_types::I64, model_slot, 0);
+
+        for field in &layout.fields {
+            let zero = if field.cl_type == cl_types::F64 {
+                b.ins().f64const(0.0)
+            } else if field.cl_type == cl_types::F32 {
+                b.ins().f32const(0.0)
+            } else {
+                b.ins().iconst(field.cl_type, 0)
+            };
+            b.ins()
+                .store(MemFlags::trusted(), zero, model_addr, field.offset as i32);
+        }
+        if let Some(slot_off) = layout.adapter_sidetable_offset {
+            let zero = b.ins().iconst(cl_types::I64, 0);
+            b.ins()
+                .store(MemFlags::trusted(), zero, model_addr, slot_off as i32);
+        }
+
+        let tensor_fields = awq_tensor_field_names(model_def, compiler.interner);
+        let model_get_weight_ref = compiler
+            .module
+            .declare_func_in_func(model_get_weight_id, b.func);
+        let tensor_transpose_ref = compiler
+            .module
+            .declare_func_in_func(tensor_transpose_id, b.func);
+        let zero_i64 = b.ins().iconst(cl_types::I64, 0);
+        let one_i64 = b.ins().iconst(cl_types::I64, 1);
+        let mut transposed_tensors = Vec::new();
+        for field_name in &tensor_fields {
+            let Some(field) = layout.fields.iter().find(|field| field.name == *field_name) else {
+                continue;
+            };
+            let qualified_name = format!("{model_name}.{field_name}");
+            let symbol = format!(
+                "__nsl_calib_weight_name_{}_{}",
+                model_name,
+                field_name
+            );
+            let name_data = declare_cstr_rodata(&mut compiler.module, &symbol, &qualified_name)?;
+            let name_ref = compiler.module.declare_data_in_func(name_data, b.func);
+            let name_ptr = b.ins().symbol_value(cl_types::I64, name_ref);
+            let name_len = b.ins().iconst(cl_types::I64, qualified_name.len() as i64);
+            let tensor_call = b.ins().call(model_get_weight_ref, &[model_ptr, name_ptr, name_len]);
+            let mut tensor_ptr = b.inst_results(tensor_call)[0];
+            let should_transpose = transpose_fields.contains(field_name)
+                || compiler
+                    .models
+                    .model_tensor_field_shapes
+                    .get(model_name)
+                    .is_some_and(|fields| fields.contains_key(field_name));
+            if should_transpose {
+                let transpose_call = b.ins().call(tensor_transpose_ref, &[tensor_ptr, zero_i64, one_i64]);
+                tensor_ptr = b.inst_results(transpose_call)[0];
+                transposed_tensors.push(tensor_ptr);
+            }
+            b.ins().store(
+                MemFlags::trusted(),
+                tensor_ptr,
+                model_addr,
+                field.offset as i32,
+            );
+        }
+
+        let method_mangled = compiler
+            .models
+            .model_methods
+            .get(model_name)
+            .and_then(|methods| methods.get("forward"))
+            .cloned()
+            .ok_or_else(|| HarnessError::Infrastructure {
+                reason: format!("model '{model_name}' has no forward method"),
+            })?;
+        let (forward_id, forward_sig) = compiler
+            .registry
+            .functions
+            .get(&method_mangled)
+            .cloned()
+            .ok_or_else(|| HarnessError::Infrastructure {
+                reason: format!("forward impl '{method_mangled}' not registered"),
+            })?;
+        if forward_sig.params.len() != 2 {
+            return Err(HarnessError::Infrastructure {
+                reason: format!(
+                    "model '{model_name}' forward must take exactly one non-self argument"
+                ),
+            });
+        }
+        let forward_ref = compiler.module.declare_func_in_func(forward_id, b.func);
+        let forward_call = b.ins().call(forward_ref, &[model_addr, input_tensor]);
+
+        if !forward_sig.returns.is_empty() {
+            let output_tensor = b.inst_results(forward_call)[0];
+            let tensor_free_id = compiler.registry.runtime_fns["nsl_tensor_free"].0;
+            let tensor_free_ref = compiler.module.declare_func_in_func(tensor_free_id, b.func);
+            b.ins().call(tensor_free_ref, &[output_tensor]);
+            for tensor_ptr in transposed_tensors {
+                b.ins().call(tensor_free_ref, &[tensor_ptr]);
+            }
+        } else {
+            let tensor_free_id = compiler.registry.runtime_fns["nsl_tensor_free"].0;
+            let tensor_free_ref = compiler.module.declare_func_in_func(tensor_free_id, b.func);
+            for tensor_ptr in transposed_tensors {
+                b.ins().call(tensor_free_ref, &[tensor_ptr]);
+            }
+        }
+
+        b.ins().return_(&[]);
+        b.finalize();
+    }
+
+    compiler
+        .module
+        .define_function(func_id, &mut ctx)
+        .map_err(|e| HarnessError::Infrastructure {
+            reason: format!("define model_forward: {e}"),
+        })?;
+    Ok(func_id)
+}
+
+fn emit_calibration_forward_wrapper(
+    compiler: &mut crate::compiler::Compiler<'_>,
+    model_forward_id: cranelift_module::FuncId,
+    batch: u32,
+    seq: u32,
+    channels: i64,
+) -> Result<(), HarnessError> {
+    let (shape_vals, input_ndim) = if batch == 1 {
+        (vec![seq as i64, channels], 2_i32)
+    } else {
+        (vec![batch as i64, seq as i64, channels], 3_i32)
+    };
+    let shape_data = declare_i64_rodata(
+        &mut compiler.module,
+        "__nsl_calib_input_shape",
+        &shape_vals,
+    )?;
+
+    let mut desc_to_tensor_sig = compiler.module.make_signature();
+    desc_to_tensor_sig.call_conv = compiler.call_conv;
+    desc_to_tensor_sig.params.push(AbiParam::new(cl_types::I64));
+    desc_to_tensor_sig.returns.push(AbiParam::new(cl_types::I64));
+    let desc_to_tensor_id = compiler
+        .module
+        .declare_function("nsl_desc_to_tensor", Linkage::Import, &desc_to_tensor_sig)
+        .map_err(|e| HarnessError::Infrastructure {
+            reason: format!("declare nsl_desc_to_tensor: {e}"),
+        })?;
+
+    let mut wrapper_sig = compiler.module.make_signature();
+    wrapper_sig.call_conv = compiler.call_conv;
+    wrapper_sig.params.push(AbiParam::new(cl_types::I64));
+    wrapper_sig.params.push(AbiParam::new(cl_types::I64));
+    wrapper_sig.params.push(AbiParam::new(cl_types::I64));
+    wrapper_sig.params.push(AbiParam::new(cl_types::I64));
+    let wrapper_id = compiler
+        .module
+        .declare_function("nsl_calib_model_forward", Linkage::Export, &wrapper_sig)
+        .map_err(|e| HarnessError::Infrastructure {
+            reason: format!("declare nsl_calib_model_forward: {e}"),
+        })?;
+
+    let mut ctx = Context::for_function(Function::with_name_signature(
+        UserFuncName::user(0, compiler.next_func_index()),
+        wrapper_sig,
+    ));
+    let mut fn_builder_ctx = FunctionBuilderContext::new();
+    {
+        let mut b = FunctionBuilder::new(&mut ctx.func, &mut fn_builder_ctx);
+        let entry = b.create_block();
+        b.append_block_params_for_function_params(entry);
+        b.switch_to_block(entry);
+        b.seal_block(entry);
+
+        let weight_ptrs = b.block_params(entry)[0];
+        let num_weights = b.block_params(entry)[1];
+        let batch_ptr = b.block_params(entry)[2];
+        let _batch_elem_count = b.block_params(entry)[3];
+
+        let desc_slot = b.create_sized_stack_slot(StackSlotData::new(
+            StackSlotKind::ExplicitSlot,
+            40,
+            3,
+        ));
+        let desc_addr = b.ins().stack_addr(cl_types::I64, desc_slot, 0);
+        let zero_i64 = b.ins().iconst(cl_types::I64, 0);
+        let zero_i32 = b.ins().iconst(cl_types::I32, 0);
+        let ndim_i32 = b.ins().iconst(cl_types::I32, input_ndim as i64);
+
+        let shape_ref = compiler.module.declare_data_in_func(shape_data, b.func);
+        let shape_ptr = b.ins().symbol_value(cl_types::I64, shape_ref);
+
+        b.ins().store(MemFlags::trusted(), batch_ptr, desc_addr, 0);
+        b.ins().store(MemFlags::trusted(), shape_ptr, desc_addr, 8);
+        b.ins().store(MemFlags::trusted(), zero_i64, desc_addr, 16);
+        b.ins().store(MemFlags::trusted(), ndim_i32, desc_addr, 24);
+        b.ins().store(MemFlags::trusted(), zero_i32, desc_addr, 28);
+        b.ins().store(MemFlags::trusted(), zero_i32, desc_addr, 32);
+        b.ins().store(MemFlags::trusted(), zero_i32, desc_addr, 36);
+
+        let desc_to_tensor_ref = compiler.module.declare_func_in_func(desc_to_tensor_id, b.func);
+        let desc_call = b.ins().call(desc_to_tensor_ref, &[desc_addr]);
+        let input_tensor = b.inst_results(desc_call)[0];
+
+        let model_forward_ref = compiler.module.declare_func_in_func(model_forward_id, b.func);
+        b.ins()
+            .call(model_forward_ref, &[weight_ptrs, num_weights, input_tensor]);
+
+        let tensor_free_id = compiler.registry.runtime_fns["nsl_tensor_free"].0;
+        let tensor_free_ref = compiler.module.declare_func_in_func(tensor_free_id, b.func);
+        b.ins().call(tensor_free_ref, &[input_tensor]);
+        b.ins().return_(&[]);
+        b.finalize();
+    }
+
+    compiler
+        .module
+        .define_function(wrapper_id, &mut ctx)
+        .map_err(|e| HarnessError::Infrastructure {
+            reason: format!("define nsl_calib_model_forward: {e}"),
+        })?;
+    Ok(())
+}
+
+pub fn emit_calibration_model_object(
+    ast: &nsl_ast::Module,
+    opts: &crate::CompileOptions,
+    _arena_layout: &crate::calibration::ArenaLayout,
+    out_path: &Path,
+) -> Result<(), HarnessError> {
+    let bundle = opts
+        .calibration_compile_bundle
+        .as_ref()
+        .ok_or_else(|| HarnessError::Infrastructure {
+            reason: "emit_calibration_model_object requires calibration_compile_bundle"
+                .into(),
+        })?;
+
+    let mut compile_opts = opts.clone();
+    if compile_opts.calibration_retention.is_none() {
+        let discovered =
+            crate::calibration::pre_scan_awq_projections_from_ast(ast, &bundle.interner);
+        if !discovered.is_empty() {
+            compile_opts.calibration_retention = Some(discovered);
+        }
+    }
+    let projections = compile_opts
+        .calibration_retention
+        .clone()
+        .ok_or_else(|| HarnessError::Infrastructure {
+            reason: "emit_calibration_model_object requires AWQ projections".into(),
+        })?;
+    let first_projection = projections.first().ok_or_else(|| HarnessError::Infrastructure {
+        reason: "emit_calibration_model_object requires a non-empty projection list".into(),
+    })?;
+    let channels = first_projection.weight_shape[1] as i64;
+    let (batch, seq) = compile_opts.calibration_batch_seq.unwrap_or((8, 4));
+    let model_name = first_projection
+        .projection
+        .0
+        .split('.')
+        .next()
+        .ok_or_else(|| HarnessError::Infrastructure {
+            reason: "invalid projection path in calibration retention".into(),
+        })?
+        .to_string();
+    let transpose_fields: HashSet<String> = projections
+        .iter()
+        .filter_map(|projection| {
+            projection
+                .projection
+                .0
+                .strip_prefix(&(model_name.clone() + "."))
+                .map(str::to_string)
+        })
+        .collect();
+    let model_def = awq_model_def_from_ast(ast, &bundle.interner, &model_name).ok_or_else(|| {
+        HarnessError::Infrastructure {
+            reason: format!("cannot find AWQ model '{model_name}' in AST"),
+        }
+    })?;
+    let model_only_stmts: Vec<nsl_ast::stmt::Stmt> = bundle
+        .ast
+        .stmts
+        .iter()
+        .filter(|stmt| match &stmt.kind {
+            nsl_ast::stmt::StmtKind::ModelDef(md) => {
+                bundle.interner.resolve(md.name.0) == Some(model_name.as_str())
+            }
+            nsl_ast::stmt::StmtKind::Decorated { stmt: inner, .. } => match &inner.kind {
+                nsl_ast::stmt::StmtKind::ModelDef(md) => {
+                    bundle.interner.resolve(md.name.0) == Some(model_name.as_str())
+                }
+                _ => false,
+            },
+            _ => false,
+        })
+        .cloned()
+        .collect();
+
+    let (module, call_conv) = new_calibration_object_module("nsl_calibration_model")?;
+    let mut compiler = map_codegen_error(
+        "Compiler::new(calibration model object)",
+        crate::compiler::Compiler::new(&bundle.interner, &bundle.type_map, &compile_opts),
+    )?;
+    compiler.module = module;
+    compiler.call_conv = call_conv;
+
+    map_codegen_error("intern empty string", compiler.intern_string(""))?;
+    map_codegen_error("collect strings", compiler.collect_strings(&bundle.ast.stmts))?;
+    map_codegen_error("collect enums", compiler.collect_enums(&bundle.ast.stmts))?;
+    map_codegen_error("collect structs", compiler.collect_structs(&bundle.ast.stmts))?;
+    map_codegen_error("collect models", compiler.collect_models(&bundle.ast.stmts))?;
+    map_codegen_error("emit retention arena", compiler.emit_retention_arena())?;
+    map_codegen_error("declare runtime functions", compiler.declare_runtime_functions())?;
+    map_codegen_error(
+        "declare user functions",
+        compiler.declare_user_functions(&model_only_stmts),
+    )?;
+    let vmap_results = compiler.apply_vmap_transforms(&bundle.ast);
+    compiler.register_batched_functions(&vmap_results);
+    map_codegen_error(
+        "compile datatype defs",
+        compiler.compile_datatype_defs(&bundle.ast.stmts),
+    )?;
+    map_codegen_error("compile kernels", compiler.compile_kernels(&bundle.ast.stmts))?;
+    map_codegen_error(
+        "compile flash-attention kernels",
+        compiler.compile_flash_attention_kernels(&bundle.ast.stmts),
+    )?;
+    crate::wrga_prescan::prescan_adapter_sites_from_decorators(&mut compiler);
+    crate::wrga_prescan::rewrite_model_method_bodies_with_adapter_sites(&mut compiler);
+    map_codegen_error(
+        "compile user functions",
+        compiler.compile_user_functions(&model_only_stmts),
+    )?;
+    map_codegen_error(
+        "compile batched functions",
+        compiler.compile_batched_functions(&vmap_results),
+    )?;
+    map_codegen_error(
+        "compile pending lambdas",
+        compiler.compile_pending_lambdas(),
+    )?;
+
+    let model_forward_id = emit_model_forward_bridge(
+        &mut compiler,
+        &model_name,
+        model_def,
+        &transpose_fields,
+    )?;
+    emit_calibration_forward_wrapper(&mut compiler, model_forward_id, batch, seq, channels)?;
+
+    let obj_bytes = map_codegen_error("finalize calib_model.o", compiler.finalize())?;
+    fs::write(out_path, &obj_bytes).map_err(|e| HarnessError::Infrastructure {
+        reason: format!("writing {}: {e}", out_path.display()),
+    })
+}
+
+pub fn emit_calibration_scaffolding_object(
+    observe_plan: &[ObservePlanEntry],
+    finalize_plan: &[FinalizePlanEntry],
+    arena_layout: &crate::calibration::ArenaLayout,
+    sidecar_json: &[u8],
+    needs_forward_pass: bool,
+    out_path: &Path,
+) -> Result<(), HarnessError> {
+    if needs_forward_pass && observe_plan.is_empty() {
+        return Err(HarnessError::Infrastructure {
+            reason: "calibration: forward pass emitted but no observations declared.\n\
+ requested:  run calibration subprocess with forward pass\n\
+ expected:   observe_plan is non-empty when a model_forward call is emitted\n\
+ found:      observe_plan is empty but needs_forward_pass() returned true.\n\
+             Did a hook's requires() change without updating observe_plan()?"
+                .into(),
+        });
+    }
+
+    if !needs_forward_pass && sidecar_json.contains(&0u8) {
+        return Err(HarnessError::Infrastructure {
+            reason: "sidecar JSON contains embedded NUL byte".into(),
+        });
+    }
+
+    let (mut module, call_conv) = new_calibration_object_module("nsl_calibration")?;
+    let ptr_ty = cl_types::I64;
+
+    let mut json_bytes: Vec<u8> = sidecar_json.to_vec();
+    json_bytes.push(0);
+    let json_data = module
+        .declare_data("__nsl_calibration_sidecar_json", Linkage::Local, false, false)
+        .map_err(|e| HarnessError::Infrastructure {
+            reason: format!("declare sidecar-json data: {e}"),
+        })?;
+    let mut json_desc = DataDescription::new();
+    json_desc.define(json_bytes.into_boxed_slice());
+    module
+        .define_data(json_data, &json_desc)
+        .map_err(|e| HarnessError::Infrastructure {
+            reason: format!("define sidecar-json data: {e}"),
+        })?;
+
+    let batch_shape_mismatch_data = if needs_forward_pass {
+        let first_entry = arena_layout
+            .entries
+            .first()
+            .ok_or_else(|| HarnessError::Infrastructure {
+                reason: "calibration: forward pass emitted but arena layout is empty".into(),
+            })?;
+        let expected_bytes = first_entry.2 as u64;
+        let expected_elems = expected_bytes / 4;
+        Some(declare_cstr_rodata(
+            &mut module,
+            "__nsl_calibration_batch_shape_mismatch",
+            &format!(
+                "calibration: batch shape mismatch at subprocess model-forward call.\n\
+ requested:  run calibration forward on a batch matching the emitted arena layout\n\
+ expected:   flattened batch payload == {expected_elems} f32 elements ({expected_bytes} bytes)\n\
+ found:      nsl_calibration_batch_at returned a batch payload whose size did not match the emitted arena layout.\n\
+ Action:     regenerate calibration metadata from the same model/data pair, or fix the projection shape metadata passed into calibration."
+            ),
+        )?)
+    } else {
+        None
+    };
+
+    let mut running_data_ids: HashMap<String, DataId> = HashMap::new();
+    for entry in finalize_plan {
+        let mut data = DataDescription::new();
+        data.define_zeroinit((entry.channels * 4) as usize);
+        let id = module
+            .declare_data(&entry.running_symbol, Linkage::Export, true, false)
+            .map_err(|e| HarnessError::Infrastructure {
+                reason: format!("declare running buf '{}': {e}", entry.running_symbol),
+            })?;
+        module
+            .define_data(id, &data)
+            .map_err(|e| HarnessError::Infrastructure {
+                reason: format!("define running buf '{}': {e}", entry.running_symbol),
+            })?;
+        running_data_ids.insert(entry.running_symbol.clone(), id);
+    }
+
+    let arena_data_id: Option<DataId> = if !observe_plan.is_empty() {
+        let id = module
+            .declare_data("__nsl_calib_retention_arena", Linkage::Import, false, false)
+            .map_err(|e| HarnessError::Infrastructure {
+                reason: format!("declare retention arena import: {e}"),
+            })?;
+        Some(id)
+    } else {
+        None
+    };
+
+    let mut path_data_ids: HashMap<String, DataId> = HashMap::new();
+    for entry in finalize_plan {
+        let sym = format!(
+            "__nsl_awq_pathstr.{}",
+            entry.projection.0.replace(['.', '-'], "_")
+        );
+        let mut data = DataDescription::new();
+        data.define(entry.projection.0.as_bytes().to_vec().into_boxed_slice());
+        let id = module
+            .declare_data(&sym, Linkage::Local, false, false)
+            .map_err(|e| HarnessError::Infrastructure {
+                reason: format!("declare path string '{}': {e}", sym),
+            })?;
+        module
+            .define_data(id, &data)
+            .map_err(|e| HarnessError::Infrastructure {
+                reason: format!("define path string '{}': {e}", sym),
+            })?;
+        path_data_ids.insert(entry.projection.0.clone(), id);
+    }
+
+    let mut strlen_sig = module.make_signature();
+    strlen_sig.call_conv = call_conv;
+    strlen_sig.params.push(AbiParam::new(cl_types::I64));
+    strlen_sig.returns.push(AbiParam::new(cl_types::I64));
+    let strlen_id = module
+        .declare_function("strlen", Linkage::Import, &strlen_sig)
+        .map_err(|e| HarnessError::Infrastructure {
+            reason: format!("declare strlen: {e}"),
+        })?;
+
+    let mut write_file_sig = module.make_signature();
+    write_file_sig.call_conv = call_conv;
+    write_file_sig.params.push(AbiParam::new(cl_types::I64));
+    write_file_sig.params.push(AbiParam::new(cl_types::I64));
+    let write_file_id = module
+        .declare_function("nsl_write_file", Linkage::Import, &write_file_sig)
+        .map_err(|e| HarnessError::Infrastructure {
+            reason: format!("declare nsl_write_file: {e}"),
+        })?;
+
+    let mut calib_load_sig = module.make_signature();
+    calib_load_sig.call_conv = call_conv;
+    calib_load_sig.params.push(AbiParam::new(cl_types::I64));
+    calib_load_sig.params.push(AbiParam::new(cl_types::I64));
+    calib_load_sig.returns.push(AbiParam::new(cl_types::I64));
+    let calib_load_id = module
+        .declare_function("nsl_calibration_load", Linkage::Import, &calib_load_sig)
+        .map_err(|e| HarnessError::Infrastructure {
+            reason: format!("declare nsl_calibration_load: {e}"),
+        })?;
+
+    let mut calib_count_sig = module.make_signature();
+    calib_count_sig.call_conv = call_conv;
+    calib_count_sig.params.push(AbiParam::new(cl_types::I64));
+    calib_count_sig.returns.push(AbiParam::new(cl_types::I64));
+    let calib_count_id = module
+        .declare_function("nsl_calibration_count", Linkage::Import, &calib_count_sig)
+        .map_err(|e| HarnessError::Infrastructure {
+            reason: format!("declare nsl_calibration_count: {e}"),
+        })?;
+
+    let mut calib_batch_sig = module.make_signature();
+    calib_batch_sig.call_conv = call_conv;
+    calib_batch_sig.params.push(AbiParam::new(cl_types::I64));
+    calib_batch_sig.params.push(AbiParam::new(cl_types::I64));
+    calib_batch_sig.params.push(AbiParam::new(cl_types::I64));
+    calib_batch_sig.params.push(AbiParam::new(cl_types::I64));
+    let calib_batch_id = module
+        .declare_function("nsl_calibration_batch_at", Linkage::Import, &calib_batch_sig)
+        .map_err(|e| HarnessError::Infrastructure {
+            reason: format!("declare nsl_calibration_batch_at: {e}"),
+        })?;
+
+    let mut calib_free_sig = module.make_signature();
+    calib_free_sig.call_conv = call_conv;
+    calib_free_sig.params.push(AbiParam::new(cl_types::I64));
+    let _calib_free_id = module
+        .declare_function("nsl_calibration_free", Linkage::Import, &calib_free_sig)
+        .map_err(|e| HarnessError::Infrastructure {
+            reason: format!("declare nsl_calibration_free: {e}"),
+        })?;
+
+    let mut write_sidecar_sig = module.make_signature();
+    write_sidecar_sig.call_conv = call_conv;
+    write_sidecar_sig.params.push(AbiParam::new(ptr_ty));
+    write_sidecar_sig.params.push(AbiParam::new(ptr_ty));
+    write_sidecar_sig.params.push(AbiParam::new(ptr_ty));
+    write_sidecar_sig.params.push(AbiParam::new(ptr_ty));
+    write_sidecar_sig.returns.push(AbiParam::new(cl_types::I32));
+    let write_sidecar_id = module
+        .declare_function("nsl_awq_write_sidecar", Linkage::Import, &write_sidecar_sig)
+        .map_err(|e| HarnessError::Infrastructure {
+            reason: format!("declare nsl_awq_write_sidecar: {e}"),
+        })?;
+
+    let mut model_create_sig = module.make_signature();
+    model_create_sig.call_conv = call_conv;
+    model_create_sig.params.push(AbiParam::new(ptr_ty));
+    model_create_sig.returns.push(AbiParam::new(ptr_ty));
+    let model_create_id = module
+        .declare_function("nsl_model_create", Linkage::Import, &model_create_sig)
+        .map_err(|e| HarnessError::Infrastructure {
+            reason: format!("declare nsl_model_create: {e}"),
+        })?;
+
+    let mut model_destroy_sig = module.make_signature();
+    model_destroy_sig.call_conv = call_conv;
+    model_destroy_sig.params.push(AbiParam::new(ptr_ty));
+    model_destroy_sig.returns.push(AbiParam::new(cl_types::I64));
+    let model_destroy_id = module
+        .declare_function("nsl_model_destroy", Linkage::Import, &model_destroy_sig)
+        .map_err(|e| HarnessError::Infrastructure {
+            reason: format!("declare nsl_model_destroy: {e}"),
+        })?;
+
+    let mut model_num_weights_sig = module.make_signature();
+    model_num_weights_sig.call_conv = call_conv;
+    model_num_weights_sig.params.push(AbiParam::new(ptr_ty));
+    model_num_weights_sig.returns.push(AbiParam::new(cl_types::I64));
+    let model_num_weights_id = module
+        .declare_function(
+            "nsl_model_get_num_weights",
+            Linkage::Import,
+            &model_num_weights_sig,
+        )
+        .map_err(|e| HarnessError::Infrastructure {
+            reason: format!("declare nsl_model_get_num_weights: {e}"),
+        })?;
+
+    let mut model_weight_ptrs_sig = module.make_signature();
+    model_weight_ptrs_sig.call_conv = call_conv;
+    model_weight_ptrs_sig.params.push(AbiParam::new(ptr_ty));
+    model_weight_ptrs_sig.returns.push(AbiParam::new(ptr_ty));
+    let model_weight_ptrs_id = module
+        .declare_function(
+            "nsl_model_get_weight_ptrs",
+            Linkage::Import,
+            &model_weight_ptrs_sig,
+        )
+        .map_err(|e| HarnessError::Infrastructure {
+            reason: format!("declare nsl_model_get_weight_ptrs: {e}"),
+        })?;
+
+    let mut calib_model_forward_sig = module.make_signature();
+    calib_model_forward_sig.call_conv = call_conv;
+    calib_model_forward_sig.params.push(AbiParam::new(ptr_ty));
+    calib_model_forward_sig.params.push(AbiParam::new(cl_types::I64));
+    calib_model_forward_sig.params.push(AbiParam::new(ptr_ty));
+    calib_model_forward_sig.params.push(AbiParam::new(cl_types::I64));
+    let calib_model_forward_id = module
+        .declare_function(
+            "nsl_calib_model_forward",
+            Linkage::Import,
+            &calib_model_forward_sig,
+        )
+        .map_err(|e| HarnessError::Infrastructure {
+            reason: format!("declare nsl_calib_model_forward: {e}"),
+        })?;
+
+    let mut main_sig = module.make_signature();
+    main_sig.call_conv = call_conv;
+    main_sig.params.push(AbiParam::new(cl_types::I32));
+    main_sig.params.push(AbiParam::new(cl_types::I64));
+    main_sig.returns.push(AbiParam::new(cl_types::I32));
+    let main_id = module
+        .declare_function("main", Linkage::Export, &main_sig)
+        .map_err(|e| HarnessError::Infrastructure {
+            reason: format!("declare main: {e}"),
+        })?;
+
+    let mut ctx = Context::for_function(Function::with_name_signature(
+        UserFuncName::user(0, 0),
+        main_sig,
+    ));
+    let mut fn_builder_ctx = FunctionBuilderContext::new();
+
+    {
+        let mut b = FunctionBuilder::new(&mut ctx.func, &mut fn_builder_ctx);
+
+        let entry = b.create_block();
+        let argc_err = b.create_block();
+        let no_forward_write = b.create_block();
+        let load_data = b.create_block();
+        let data_null = b.create_block();
+        let load_model = b.create_block();
+        let model_create_entry = b.create_block();
+        let batch_preflight = b.create_block();
+        let batch_shape_err = b.create_block();
+        let model_ready = b.create_block();
+        let model_null = b.create_block();
+        let loop_header = b.create_block();
+        let loop_body = b.create_block();
+        let loop_exit = b.create_block();
+        let finalize = b.create_block();
+        let write_ok = b.create_block();
+        let write_err = b.create_block();
+
+        b.append_block_params_for_function_params(entry);
+        b.append_block_param(load_model, cl_types::I64);
+        b.append_block_param(load_model, cl_types::I64);
+        b.append_block_param(model_ready, cl_types::I64);
+        b.append_block_param(model_ready, cl_types::I64);
+        b.append_block_param(model_ready, cl_types::I64);
+        b.append_block_param(loop_header, cl_types::I64);
+        b.append_block_param(loop_header, cl_types::I64);
+        b.append_block_param(loop_header, cl_types::I64);
+        b.append_block_param(loop_exit, cl_types::I64);
+        b.append_block_param(loop_exit, cl_types::I64);
+        b.append_block_param(finalize, cl_types::I64);
+        b.append_block_param(finalize, cl_types::I64);
+
+        b.switch_to_block(entry);
+        b.seal_block(entry);
+
+        let argc = b.block_params(entry)[0];
+        let argv = b.block_params(entry)[1];
+        let four = b.ins().iconst(cl_types::I32, 4);
+        let argc_ok = b.ins().icmp(IntCC::SignedGreaterThanOrEqual, argc, four);
+        b.ins().brif(argc_ok, load_data, &[], argc_err, &[]);
+
+        b.switch_to_block(argc_err);
+        b.seal_block(argc_err);
+        let two = b.ins().iconst(cl_types::I32, 2);
+        b.ins().return_(&[two]);
+
+        b.switch_to_block(load_data);
+        b.seal_block(load_data);
+
+        let argv1_addr = b.ins().load(cl_types::I64, MemFlags::new(), argv, 8);
+        let argv2_addr = b.ins().load(cl_types::I64, MemFlags::new(), argv, 16);
+
+        if !needs_forward_pass {
+            let json_gv = module.declare_data_in_func(json_data, b.func);
+            let json_ptr = b.ins().symbol_value(cl_types::I64, json_gv);
+            let write_ref = module.declare_func_in_func(write_file_id, b.func);
+            b.ins().call(write_ref, &[argv2_addr, json_ptr]);
+            b.ins().jump(no_forward_write, &[]);
+
+            b.switch_to_block(no_forward_write);
+            b.seal_block(no_forward_write);
+            let zero = b.ins().iconst(cl_types::I32, 0);
+            b.ins().return_(&[zero]);
+        } else {
+            let model_ptr_slot = b.create_sized_stack_slot(StackSlotData::new(
+                StackSlotKind::ExplicitSlot,
+                8,
+                0,
+            ));
+            let weight_ptrs_slot = b.create_sized_stack_slot(StackSlotData::new(
+                StackSlotKind::ExplicitSlot,
+                8,
+                0,
+            ));
+            let num_weights_slot = b.create_sized_stack_slot(StackSlotData::new(
+                StackSlotKind::ExplicitSlot,
+                8,
+                0,
+            ));
+            let model_ptr_addr = b.ins().stack_addr(cl_types::I64, model_ptr_slot, 0);
+            let weight_ptrs_addr = b.ins().stack_addr(cl_types::I64, weight_ptrs_slot, 0);
+            let num_weights_addr = b.ins().stack_addr(cl_types::I64, num_weights_slot, 0);
+
+            let strlen_ref = module.declare_func_in_func(strlen_id, b.func);
+            let path_len_call = b.ins().call(strlen_ref, &[argv1_addr]);
+            let data_path_len = b.inst_results(path_len_call)[0];
+
+            let calib_load_ref = module.declare_func_in_func(calib_load_id, b.func);
+            let load_call = b.ins().call(calib_load_ref, &[argv1_addr, data_path_len]);
+            let batches_ptr = b.inst_results(load_call)[0];
+            let zero_i64 = b.ins().iconst(cl_types::I64, 0);
+            let batches_ok = b.ins().icmp(IntCC::NotEqual, batches_ptr, zero_i64);
+            b.ins().brif(
+                batches_ok,
+                load_model,
+                &[batches_ptr, argv2_addr],
+                data_null,
+                &[],
+            );
+
+            b.switch_to_block(data_null);
+            b.seal_block(data_null);
+            let four_ret = b.ins().iconst(cl_types::I32, 4);
+            b.ins().return_(&[four_ret]);
+
+            b.switch_to_block(load_model);
+            b.seal_block(load_model);
+            let lm_batches = b.block_params(load_model)[0];
+            let lm_sidecar_ptr = b.block_params(load_model)[1];
+
+            let calib_count_ref = module.declare_func_in_func(calib_count_id, b.func);
+            let count_call = b.ins().call(calib_count_ref, &[lm_batches]);
+            let count = b.inst_results(count_call)[0];
+            let has_batches = b.ins().icmp(IntCC::NotEqual, count, zero_i64);
+            b.ins().brif(has_batches, batch_preflight, &[], model_create_entry, &[]);
+
+            b.switch_to_block(batch_preflight);
+            b.seal_block(batch_preflight);
+            let out_ptr_slot = b.create_sized_stack_slot(StackSlotData::new(
+                StackSlotKind::ExplicitSlot,
+                8,
+                0,
+            ));
+            let out_len_slot = b.create_sized_stack_slot(StackSlotData::new(
+                StackSlotKind::ExplicitSlot,
+                8,
+                0,
+            ));
+            let out_ptr_addr = b.ins().stack_addr(cl_types::I64, out_ptr_slot, 0);
+            let out_len_addr = b.ins().stack_addr(cl_types::I64, out_len_slot, 0);
+            let calib_batch_ref = module.declare_func_in_func(calib_batch_id, b.func);
+            b.ins().call(calib_batch_ref, &[lm_batches, zero_i64, out_ptr_addr, out_len_addr]);
+
+            let batch_len = b.ins().load(cl_types::I64, MemFlags::new(), out_len_addr, 0);
+                let actual_batch_elems = b.ins().ushr_imm(batch_len, 2);
+                let expected_batch_elems = b.ins().iconst(
+                cl_types::I64,
+                arena_layout
+                    .entries
+                    .first()
+                    .map(|(_, _, nbytes)| (*nbytes / 4) as i64)
+                    .unwrap_or(0),
+            );
+                let batch_ok = b.ins().icmp(IntCC::Equal, actual_batch_elems, expected_batch_elems);
+            b.ins().brif(batch_ok, model_create_entry, &[], batch_shape_err, &[]);
+
+            b.switch_to_block(batch_shape_err);
+            b.seal_block(batch_shape_err);
+            let mismatch_ref = module.declare_data_in_func(
+                batch_shape_mismatch_data.expect("forward path defines batch-shape mismatch data"),
+                b.func,
+            );
+            let mismatch_ptr = b.ins().symbol_value(ptr_ty, mismatch_ref);
+            let write_ref = module.declare_func_in_func(write_file_id, b.func);
+            b.ins().call(write_ref, &[lm_sidecar_ptr, mismatch_ptr]);
+            let calib_free_ref = module.declare_func_in_func(_calib_free_id, b.func);
+            b.ins().call(calib_free_ref, &[lm_batches]);
+            let three = b.ins().iconst(cl_types::I32, 3);
+            b.ins().return_(&[three]);
+
+            b.switch_to_block(model_create_entry);
+            b.seal_block(model_create_entry);
+            let argv3_addr = b.ins().load(cl_types::I64, MemFlags::new(), argv, 24);
+
+            let model_create_ref = module.declare_func_in_func(model_create_id, b.func);
+            let model_create_call = b.ins().call(model_create_ref, &[argv3_addr]);
+            let model_ptr = b.inst_results(model_create_call)[0];
+            let model_ok = b.ins().icmp(IntCC::NotEqual, model_ptr, zero_i64);
+            b.ins().brif(
+                model_ok,
+                model_ready,
+                &[lm_batches, lm_sidecar_ptr, model_ptr],
+                model_null,
+                &[],
+            );
+
+            b.switch_to_block(model_null);
+            b.seal_block(model_null);
+            let four_ret = b.ins().iconst(cl_types::I32, 4);
+            b.ins().return_(&[four_ret]);
+
+            b.switch_to_block(model_ready);
+            b.seal_block(model_ready);
+            let mr_batches = b.block_params(model_ready)[0];
+            let mr_sidecar_ptr = b.block_params(model_ready)[1];
+            let mr_model_ptr = b.block_params(model_ready)[2];
+
+            let model_num_weights_ref = module.declare_func_in_func(model_num_weights_id, b.func);
+            let num_weights_call = b.ins().call(model_num_weights_ref, &[mr_model_ptr]);
+            let num_weights = b.inst_results(num_weights_call)[0];
+
+            let model_weight_ptrs_ref =
+                module.declare_func_in_func(model_weight_ptrs_id, b.func);
+            let weight_ptrs_call = b.ins().call(model_weight_ptrs_ref, &[mr_model_ptr]);
+            let weight_ptrs = b.inst_results(weight_ptrs_call)[0];
+
+            b.ins().store(MemFlags::new(), mr_model_ptr, model_ptr_addr, 0);
+            b.ins().store(MemFlags::new(), weight_ptrs, weight_ptrs_addr, 0);
+            b.ins().store(MemFlags::new(), num_weights, num_weights_addr, 0);
+            b.ins().jump(loop_header, &[mr_batches, mr_sidecar_ptr, zero_i64]);
+
+            b.switch_to_block(loop_header);
+            let lh_batches = b.block_params(loop_header)[0];
+            let lh_sidecar_ptr = b.block_params(loop_header)[1];
+            let i_cur = b.block_params(loop_header)[2];
+
+            let calib_count_ref = module.declare_func_in_func(calib_count_id, b.func);
+            let count_call = b.ins().call(calib_count_ref, &[lh_batches]);
+            let count = b.inst_results(count_call)[0];
+            let loop_cond = b.ins().icmp(IntCC::UnsignedLessThan, i_cur, count);
+            b.ins().brif(loop_cond, loop_body, &[], loop_exit, &[lh_batches, lh_sidecar_ptr]);
+
+            b.switch_to_block(loop_body);
+            b.seal_block(loop_body);
+
+            let out_ptr_slot = b.create_sized_stack_slot(StackSlotData::new(
+                StackSlotKind::ExplicitSlot,
+                8,
+                0,
+            ));
+            let out_len_slot = b.create_sized_stack_slot(StackSlotData::new(
+                StackSlotKind::ExplicitSlot,
+                8,
+                0,
+            ));
+            let out_ptr_addr = b.ins().stack_addr(cl_types::I64, out_ptr_slot, 0);
+            let out_len_addr = b.ins().stack_addr(cl_types::I64, out_len_slot, 0);
+
+            let calib_batch_ref = module.declare_func_in_func(calib_batch_id, b.func);
+            b.ins().call(calib_batch_ref, &[lh_batches, i_cur, out_ptr_addr, out_len_addr]);
+
+            let batch_ptr = b.ins().load(cl_types::I64, MemFlags::new(), out_ptr_addr, 0);
+            let batch_len = b.ins().load(cl_types::I64, MemFlags::new(), out_len_addr, 0);
+                let model_ptr = b.ins().load(cl_types::I64, MemFlags::new(), model_ptr_addr, 0);
+            let num_weights = b.ins().load(cl_types::I64, MemFlags::new(), num_weights_addr, 0);
+            let calib_model_forward_ref =
+                module.declare_func_in_func(calib_model_forward_id, b.func);
+            b.ins().call(
+                calib_model_forward_ref,
+                    &[model_ptr, num_weights, batch_ptr, batch_len],
+            );
+
+            for entry in observe_plan {
+                let arena_id = arena_data_id.expect("arena_data_id is Some when observe_plan is non-empty");
+                let arena_gv = module.declare_data_in_func(arena_id, b.func);
+                let arena_base = b.ins().symbol_value(ptr_ty, arena_gv);
+                let run_id = running_data_ids[&entry.running_symbol];
+                let run_gv = module.declare_data_in_func(run_id, b.func);
+                let running_base = b.ins().symbol_value(ptr_ty, run_gv);
+                emit_2d_max_abs_loop(
+                    &mut b,
+                    arena_base,
+                    entry.src_offset,
+                    entry.rows,
+                    entry.channels,
+                    running_base,
+                );
+            }
+
+            let one_i64 = b.ins().iconst(cl_types::I64, 1);
+            let i_next = b.ins().iadd(i_cur, one_i64);
+            b.ins().jump(loop_header, &[lh_batches, lh_sidecar_ptr, i_next]);
+
+            b.seal_block(loop_header);
+
+            b.switch_to_block(loop_exit);
+            b.seal_block(loop_exit);
+            let le_batches = b.block_params(loop_exit)[0];
+            let le_sidecar_ptr = b.block_params(loop_exit)[1];
+            b.ins().jump(finalize, &[le_batches, le_sidecar_ptr]);
+
+            b.switch_to_block(finalize);
+            b.seal_block(finalize);
+            let fin_batches = b.block_params(finalize)[0];
+            let fin_sidecar_ptr = b.block_params(finalize)[1];
+            let model_destroy_ref = module.declare_func_in_func(model_destroy_id, b.func);
+            let calib_free_ref = module.declare_func_in_func(_calib_free_id, b.func);
+
+            if finalize_plan.is_empty() {
+                let json_gv = module.declare_data_in_func(json_data, b.func);
+                let json_ptr = b.ins().symbol_value(cl_types::I64, json_gv);
+                let write_ref = module.declare_func_in_func(write_file_id, b.func);
+                b.ins().call(write_ref, &[fin_sidecar_ptr, json_ptr]);
+                let model_ptr = b.ins().load(cl_types::I64, MemFlags::new(), model_ptr_addr, 0);
+                b.ins().call(model_destroy_ref, &[model_ptr]);
+                b.ins().call(calib_free_ref, &[fin_batches]);
+                let zero = b.ins().iconst(cl_types::I32, 0);
+                b.ins().return_(&[zero]);
+            } else {
+                let total_desc_bytes = (finalize_plan.len() as u32) * AWQ_DESC_BYTES;
+                let stack_slot = b.create_sized_stack_slot(StackSlotData::new(
+                    StackSlotKind::ExplicitSlot,
+                    total_desc_bytes,
+                    8,
+                ));
+                let descs_base = b.ins().stack_addr(ptr_ty, stack_slot, 0);
+
+                for (index, fp) in finalize_plan.iter().enumerate() {
+                    let off = (index as i32) * (AWQ_DESC_BYTES as i32);
+                    let path_id = path_data_ids[&fp.projection.0];
+                    let path_gv = module.declare_data_in_func(path_id, b.func);
+                    let path_ptr_v = b.ins().symbol_value(ptr_ty, path_gv);
+                    b.ins().stack_store(path_ptr_v, stack_slot, off);
+
+                    let path_len_v = b.ins().iconst(ptr_ty, fp.projection.0.len() as i64);
+                    b.ins().stack_store(path_len_v, stack_slot, off + 8);
+
+                    let channels_v = b.ins().iconst(cl_types::I32, fp.channels as i64);
+                    b.ins().stack_store(channels_v, stack_slot, off + 16);
+
+                    let pad_v = b.ins().iconst(cl_types::I32, 0);
+                    b.ins().stack_store(pad_v, stack_slot, off + 20);
+
+                    let run_id = running_data_ids[&fp.running_symbol];
+                    let run_gv = module.declare_data_in_func(run_id, b.func);
+                    let run_ptr_v = b.ins().symbol_value(ptr_ty, run_gv);
+                    b.ins().stack_store(run_ptr_v, stack_slot, off + 24);
+                }
+
+                let strlen_ref2 = module.declare_func_in_func(strlen_id, b.func);
+                let sc_len_call = b.ins().call(strlen_ref2, &[fin_sidecar_ptr]);
+                let sidecar_path_len = b.inst_results(sc_len_call)[0];
+
+                let desc_count = b.ins().iconst(ptr_ty, finalize_plan.len() as i64);
+                let write_sidecar_ref = module.declare_func_in_func(write_sidecar_id, b.func);
+                let ws_call = b.ins().call(
+                    write_sidecar_ref,
+                    &[fin_sidecar_ptr, sidecar_path_len, descs_base, desc_count],
+                );
+                let rc = b.inst_results(ws_call)[0];
+                let model_ptr = b.ins().load(cl_types::I64, MemFlags::new(), model_ptr_addr, 0);
+                b.ins().call(model_destroy_ref, &[model_ptr]);
+                b.ins().call(calib_free_ref, &[fin_batches]);
+
+                let zero_i32 = b.ins().iconst(cl_types::I32, 0);
+                let is_zero = b.ins().icmp(IntCC::Equal, rc, zero_i32);
+                b.ins().brif(is_zero, write_ok, &[], write_err, &[]);
+
+                b.switch_to_block(write_err);
+                b.seal_block(write_err);
+                b.ins().return_(&[rc]);
+
+                b.switch_to_block(write_ok);
+                b.seal_block(write_ok);
+                let zero = b.ins().iconst(cl_types::I32, 0);
+                b.ins().return_(&[zero]);
+            }
+        }
+
+        b.finalize();
+    }
+
+    module
+        .define_function(main_id, &mut ctx)
+        .map_err(|e| HarnessError::Infrastructure {
+            reason: format!("define main: {e}"),
+        })?;
+
+    write_object_module(module, out_path)
+}
+
+pub fn link_calibration_binary(
+    scaffolding_obj: &Path,
+    calib_model_obj: &Path,
+    out_binary: &Path,
+) -> Result<(), HarnessError> {
+    let obj_bytes = std::fs::read(calib_model_obj).map_err(|e| HarnessError::Infrastructure {
+        reason: format!(
+            "link_calibration_binary: read {}: {e}",
+            calib_model_obj.display()
+        ),
+    })?;
+    let obj = object::File::parse(&*obj_bytes).map_err(|e| HarnessError::Infrastructure {
+        reason: format!(
+            "link_calibration_binary: parse {}: {e}",
+            calib_model_obj.display()
+        ),
+    })?;
+    if !obj
+        .symbols()
+        .any(|symbol| symbol.name() == Ok("nsl_calib_model_forward") && !symbol.is_undefined())
+    {
+        return Err(HarnessError::Infrastructure {
+            reason: format!(
+                "calibration: model-forward wrapper missing from calib_model.o.\n\
+ requested:  link scaffolding.o <- calib_model.o with nsl_calib_model_forward resolved\n\
+ expected:   calib_model.o exports nsl_calib_model_forward (the f32-buffer wrapper around model_forward)\n\
+ found:      {} does not export nsl_calib_model_forward",
+                calib_model_obj.display()
+            ),
+        });
+    }
+
+    crate::linker::link_multi(
+        &[scaffolding_obj.to_path_buf(), calib_model_obj.to_path_buf()],
+        out_binary,
+    )
+    .map_err(|e| {
+        let err_str = format!("link_calibration_binary: {e}");
+        if err_str.contains("nsl_calib_model_forward") {
+            HarnessError::Infrastructure {
+                reason: format!(
+                    "calibration: model-forward wrapper missing from calib_model.o.\n\
+ requested:  link scaffolding.o <- calib_model.o with nsl_calib_model_forward resolved\n\
+ expected:   calib_model.o exports nsl_calib_model_forward (the f32-buffer wrapper around model_forward)\n\
+ found:      {err_str}"
+                ),
+            }
+        } else {
+            HarnessError::Infrastructure { reason: err_str }
+        }
+    })
+}
 
 /// Emit a Cranelift object + link a calibration binary whose `main()`:
 ///
@@ -890,5 +2236,211 @@ struct TmpCleanup(PathBuf);
 impl Drop for TmpCleanup {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use object::{Object, ObjectSymbol};
+    use nsl_errors::{FileId, Level};
+    use nsl_lexer::{tokenize, Interner};
+
+    fn repo_root() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+    }
+
+    fn fixture(name: &str) -> PathBuf {
+        repo_root().join("tests").join("fixtures").join(name)
+    }
+
+    fn parse_awq_fixture() -> (nsl_ast::Module, Interner) {
+        let source = std::fs::read_to_string(fixture("awq_calibration_mlp.nsl"))
+            .expect("fixture readable");
+        let mut interner = Interner::new();
+        let (tokens, lex_diags) = tokenize(&source, FileId(0), &mut interner);
+        assert!(
+            lex_diags.iter().all(|diag| !matches!(diag.level, Level::Error)),
+            "fixture must lex cleanly: {lex_diags:?}"
+        );
+
+        let parsed = nsl_parser::parse(&tokens, &mut interner);
+        assert!(
+            parsed
+                .diagnostics
+                .iter()
+                .all(|diag| !matches!(diag.level, Level::Error)),
+            "fixture must parse cleanly: {:?}",
+            parsed.diagnostics
+        );
+
+        (parsed.module, interner)
+    }
+
+    fn awq_fixture_compile_options(
+        ast: &nsl_ast::Module,
+        interner: &Interner,
+    ) -> crate::CompileOptions {
+        let mut analysis_interner = interner.clone();
+        let analysis = nsl_semantic::analyze(ast, &mut analysis_interner);
+        let mut opts = crate::CompileOptions::default();
+        opts.calibration_batch_seq = Some((8, 4));
+        opts.calibration_compile_bundle = Some(std::sync::Arc::new(
+            crate::calibration::CalibrationCompileBundle {
+                ast: ast.clone(),
+                interner: analysis_interner,
+                type_map: analysis.type_map.clone(),
+            },
+        ));
+        opts.weight_index_map = analysis.weight_index_map.clone();
+        opts
+    }
+
+    #[test]
+    fn emit_calibration_model_object_exports_wrapper_symbol() {
+        let (ast, interner) = parse_awq_fixture();
+        let projections = crate::calibration::pre_scan_awq_projections_from_ast(&ast, &interner);
+        let arena_layout = build_arena_layout(&projections, 8, 4);
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let out_path = tmp.path().join("calib_model.o");
+        let opts = awq_fixture_compile_options(&ast, &interner);
+
+        emit_calibration_model_object(
+            &ast,
+            &opts,
+            &arena_layout,
+            &out_path,
+        )
+        .expect("emit succeeds");
+
+        assert!(out_path.exists(), "calib_model.o must be written");
+        let obj_bytes = std::fs::read(&out_path).expect("object readable");
+        let obj = object::File::parse(&*obj_bytes).expect("object::File::parse");
+
+        assert!(
+            obj.symbols()
+                .any(|symbol| symbol.name() == Ok("nsl_calib_model_forward")),
+            "calib_model.o must export nsl_calib_model_forward"
+        );
+    }
+
+    #[test]
+    fn calib_model_object_contains_model_forward_body() {
+        let (ast, interner) = parse_awq_fixture();
+        let projections = crate::calibration::pre_scan_awq_projections_from_ast(&ast, &interner);
+        let arena_layout = build_arena_layout(&projections, 8, 4);
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let out_path = tmp.path().join("calib_model.o");
+        let opts = awq_fixture_compile_options(&ast, &interner);
+
+        emit_calibration_model_object(&ast, &opts, &arena_layout, &out_path)
+            .expect("emit succeeds");
+
+        let obj_bytes = std::fs::read(&out_path).expect("object readable");
+        let obj = object::File::parse(&*obj_bytes).expect("object::File::parse");
+
+        assert!(
+            obj.symbols().any(|symbol| symbol.name() == Ok("model_forward")),
+            "calib_model.o must export model_forward"
+        );
+    }
+
+    #[test]
+    fn emit_calibration_scaffolding_imports_calib_model_forward() {
+        let observe_plan = vec![ObservePlanEntry {
+            projection: crate::calibration::ProjectionRef("TinyMLP.up_proj".into()),
+            src_offset: 0,
+            rows: 32,
+            channels: 64,
+            running_symbol: "__nsl_awq_running_up_proj".into(),
+        }];
+        let finalize_plan = vec![FinalizePlanEntry {
+            projection: crate::calibration::ProjectionRef("TinyMLP.up_proj".into()),
+            running_symbol: "__nsl_awq_running_up_proj".into(),
+            channels: 64,
+        }];
+        let arena_layout = build_arena_layout(
+            &[crate::calibration::DiscoveredProjection {
+                projection: crate::calibration::ProjectionRef("TinyMLP.up_proj".into()),
+                weight_shape: [128, 64],
+            }],
+            8,
+            4,
+        );
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let out_path = tmp.path().join("scaffolding.o");
+
+        emit_calibration_scaffolding_object(
+            &observe_plan,
+            &finalize_plan,
+            &arena_layout,
+            b"{}",
+            true,
+            &out_path,
+        )
+        .expect("emit succeeds");
+
+        let obj_bytes = std::fs::read(&out_path).expect("object readable");
+        let obj = object::File::parse(&*obj_bytes).expect("object::File::parse");
+
+        let imports: Vec<String> = obj
+            .symbols()
+            .filter(|symbol| symbol.is_undefined())
+            .filter_map(|symbol| symbol.name().ok().map(str::to_string))
+            .collect();
+        assert!(
+            imports.iter().any(|symbol| symbol == "nsl_calib_model_forward"),
+            "scaffolding.o must import nsl_calib_model_forward"
+        );
+        assert!(
+            imports.iter().any(|symbol| symbol == "nsl_calibration_load"),
+            "scaffolding.o must import nsl_calibration_load"
+        );
+        assert!(
+            imports.iter().any(|symbol| symbol == "nsl_calibration_batch_at"),
+            "scaffolding.o must import nsl_calibration_batch_at"
+        );
+        assert!(
+            imports.iter().any(|symbol| symbol == "nsl_awq_write_sidecar"),
+            "scaffolding.o must import nsl_awq_write_sidecar"
+        );
+
+        assert!(
+            obj.symbols().any(|symbol| symbol.name() == Ok("main") && !symbol.is_undefined()),
+            "scaffolding.o must export main"
+        );
+    }
+
+    #[test]
+    fn empty_observe_plan_with_forward_pass_refuses() {
+        let arena_layout = build_arena_layout(
+            &[crate::calibration::DiscoveredProjection {
+                projection: crate::calibration::ProjectionRef("TinyMLP.up_proj".into()),
+                weight_shape: [128, 64],
+            }],
+            8,
+            4,
+        );
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let out_path = tmp.path().join("scaffolding.o");
+
+        let err = emit_calibration_scaffolding_object(
+            &[],
+            &[],
+            &arena_layout,
+            b"{}",
+            true,
+            &out_path,
+        )
+        .expect_err("must refuse defensively");
+
+        let err_str = format!("{err}");
+        assert!(err_str.contains("calibration: forward pass emitted but no observations declared"));
+        assert!(err_str.contains("requested:"));
+        assert!(err_str.contains("expected:"));
+        assert!(err_str.contains("found:"));
     }
 }
