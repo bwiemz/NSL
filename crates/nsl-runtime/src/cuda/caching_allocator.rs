@@ -646,6 +646,23 @@ impl<D: DriverAlloc> CachingAllocator<D> {
         self.allocated_blocks.contains_key(&(ptr as usize))
     }
 
+    /// Return per-pool reserved-byte breakdown.
+    /// Format: (persistent_bytes, persistent_segs, transient_bytes, transient_segs).
+    /// Used by `nsl_debug_gpu_mem` to diagnose the ELTLS leak.
+    pub(crate) fn pool_breakdown(&self) -> (usize, usize, usize, usize) {
+        let mut p_bytes = 0usize;
+        let mut p_segs = 0usize;
+        let mut t_bytes = 0usize;
+        let mut t_segs = 0usize;
+        for seg in &self.segments {
+            match seg.pool {
+                AllocPool::Persistent => { p_bytes += seg.total_size; p_segs += 1; }
+                AllocPool::Transient  => { t_bytes += seg.total_size; t_segs += 1; }
+            }
+        }
+        (p_bytes, p_segs, t_bytes, t_segs)
+    }
+
     /// Return a summary of all currently allocated blocks grouped by context.
     /// Format: Vec<(context, count, total_bytes)> sorted by total_bytes descending.
     pub fn allocated_block_summary(&self) -> Vec<(String, usize, usize)> {

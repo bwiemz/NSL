@@ -4402,6 +4402,11 @@ pub extern "C" fn nsl_gpu_set_transient_pool() {
 /// to prevent the caching allocator from holding stale segments.
 #[no_mangle]
 pub extern "C" fn nsl_gpu_drain_cache() {
+    // Probe gate (2026-04-23): NSL_SKIP_GPU_DRAIN=1 bypasses this workaround
+    // so we can observe whether ELTLS frees intermediates at last use.
+    if std::env::var("NSL_SKIP_GPU_DRAIN").ok().as_deref() == Some("1") {
+        return;
+    }
     #[cfg(feature = "cuda")]
     {
         crate::cuda::inner::ensure_context();
@@ -4434,7 +4439,8 @@ pub(crate) fn debug_track_gpu_free(bytes: usize) {
 /// Debug: print GPU allocated block summary grouped by context.
 #[no_mangle]
 pub extern "C" fn nsl_debug_gpu_alloc_summary(step: i64) {
-    if step > 2 { return; } // only first 3 steps
+    let all = std::env::var("NSL_DEBUG_MEM_ALL").ok().as_deref() == Some("1");
+    if !all && step > 2 { return; } // default: only first 3 steps
     #[cfg(feature = "cuda")]
     {
         let alloc = crate::cuda::caching_allocator::CACHING_ALLOCATOR.lock().unwrap();
@@ -4453,7 +4459,8 @@ pub extern "C" fn nsl_debug_gpu_alloc_summary(step: i64) {
 /// Debug: print GPU memory usage + caching allocator stats.
 #[no_mangle]
 pub extern "C" fn nsl_debug_gpu_mem(step: i64) {
-    if step > 5 { return; }
+    let all = std::env::var("NSL_DEBUG_MEM_ALL").ok().as_deref() == Some("1");
+    if !all && step > 5 { return; }
     #[cfg(feature = "cuda")]
     {
         unsafe {
@@ -4464,12 +4471,21 @@ pub extern "C" fn nsl_debug_gpu_mem(step: i64) {
             let used_mb = (total - free) / (1024 * 1024);
             let alloc = crate::cuda::caching_allocator::CACHING_ALLOCATOR.lock().unwrap();
             let stats = alloc.stats();
+            let mb = |b: usize| b / (1024 * 1024);
             eprintln!(
-                "[gpu-mem] step={} driver={}MB alloc={}MB reserved={}MB allocs={} frees={}",
+                "[gpu-mem] step={} driver={}MB alloc={}MB reserved={}MB live_blocks={} drv_allocs={} drv_frees={}",
                 step, used_mb,
-                stats.allocated_bytes / (1024 * 1024),
-                stats.reserved_bytes / (1024 * 1024),
-                stats.num_allocs, stats.num_driver_frees,
+                mb(stats.allocated_bytes),
+                mb(stats.reserved_bytes),
+                stats.num_allocs, stats.num_driver_allocs, stats.num_driver_frees,
+            );
+            let (p_b, p_s, t_b, t_s) = alloc.pool_breakdown();
+            eprintln!(
+                "[gpu-mem]    persistent={}MB ({} segs)  transient={}MB ({} segs)  free_blocks={} hits={} misses={} splits={} coalesces={}",
+                mb(p_b), p_s, mb(t_b), t_s,
+                stats.num_free_blocks,
+                stats.num_cache_hits, stats.num_cache_misses,
+                stats.num_splits, stats.num_coalesces,
             );
         }
     }
