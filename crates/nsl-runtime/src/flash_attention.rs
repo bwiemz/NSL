@@ -1126,6 +1126,31 @@ pub extern "C" fn nsl_flash_attention_csha_backward(
             }
         }
 
+        if rc == cudarc::driver::sys::CUresult::CUDA_SUCCESS
+            && std::env::var_os("NSL_CSHA_DUMP_GRADS").map(|v| v != "0" && v != "").unwrap_or(false)
+        {
+            let dump_first_nonfinite_scratch = |name: &str, ptr: *mut c_void| {
+                if ptr.is_null() || qkv_elems == 0 {
+                    return;
+                }
+                let mut host = vec![0f32; qkv_elems];
+                crate::cuda::inner::memcpy_dtoh(host.as_mut_ptr() as *mut c_void, ptr, scratch_bytes);
+                if let Some((idx, value)) = host.iter().copied().enumerate().find(|(_, x)| !x.is_finite()) {
+                    eprintln!(
+                        "[csha-dump-bwd-scratch] first non-finite {name}[{idx}]={value:?}"
+                    );
+                } else {
+                    let first = host.iter().take(4).copied().collect::<Vec<_>>();
+                    eprintln!(
+                        "[csha-dump-bwd-scratch] {name} first4={first:?} max_abs={:.6e}",
+                        host.iter().copied().map(f32::abs).fold(0.0f32, f32::max)
+                    );
+                }
+            };
+            dump_first_nonfinite_scratch("dk_scratch", dk_scratch_raw);
+            dump_first_nonfinite_scratch("dv_scratch", dv_scratch_raw);
+        }
+
         // Convert f32 scratch → f16 output for dK and dV.
         if rc == cudarc::driver::sys::CUresult::CUDA_SUCCESS {
             if !dk_scratch_raw.is_null() && d_k != 0 {
