@@ -197,6 +197,17 @@ pub fn run_harness_simulated(
                 cfg.calibration_data.display()
             ),
         })?;
+    // v2 follow-up (spec §12): bind cache against the calibration AST so
+    // a `.nsl` source edit invalidates the sidecar even when checkpoint
+    // bytes and calibration data are unchanged. Empty for paths without
+    // a compile bundle (non-forward hooks, identity-hook smoke tests) —
+    // those run the simpler pre-baked-JSON path that has no model object
+    // to bind against.
+    let model_ast_hash = cfg
+        .compile_bundle
+        .as_ref()
+        .map(|bundle| crate::calibration::cache::hash_compile_bundle_ast(&bundle.ast))
+        .unwrap_or_default();
     let cache_key = crate::calibration::cache::CacheKey {
         checkpoint_hashes: ckpt_hashes.clone(),
         calibration_data_hash: calibration_data_hash.clone(),
@@ -204,6 +215,7 @@ pub fn run_harness_simulated(
         samples: cfg.samples,
         batch_size: cfg.batch_size,
         projections: cfg.projections.clone(),
+        model_ast_hash,
     };
     let cache_key_digest = cache_key.digest();
 
