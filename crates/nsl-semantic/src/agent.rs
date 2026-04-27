@@ -549,6 +549,180 @@ pub fn check_linear_types_flag(
     );
 }
 
+// ---------------------------------------------------------------------------
+// E0601 — cross-agent exclusive field access (M56 spec §1.1, §6.1)
+// ---------------------------------------------------------------------------
+
+/// M56 spec §1.1, §6.1. Walk every agent's method bodies; emit E0601 when
+/// a method reads `<other_agent>.<field>` and the field is not `@shared`.
+///
+/// v1 heuristic: receiver-name → agent-type mapping is title-cased
+/// (`drafter` → `Drafter`). See the same TODO(task 12) note on
+/// `as_agent_method_call` — Task 12 will replace this with the
+/// type-checker-resolved binding type map.
+pub fn check_cross_agent_field_access(
+    module: &nsl_ast::Module,
+    registry: &AgentRegistry,
+    interner: &Interner,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    for (_, agent) in registry.iter() {
+        for method in &agent.methods {
+            if let Some(fn_def) = find_agent_method_fn_def(module, agent.def_symbol, method.name) {
+                walk_block_for_cross_field_access(
+                    &fn_def.body, agent.def_symbol, registry, interner, diagnostics,
+                );
+            }
+        }
+    }
+}
+
+fn find_agent_method_fn_def(
+    module: &nsl_ast::Module,
+    agent_sym: Symbol,
+    method_sym: Symbol,
+) -> Option<&nsl_ast::decl::FnDef> {
+    for stmt in &module.stmts {
+        // AgentDef stmts may be wrapped in StmtKind::Decorated for any agent
+        // that carries decorators on its declaration; find the inner.
+        let agent_def = match &stmt.kind {
+            StmtKind::AgentDef(def) => def,
+            StmtKind::Decorated { stmt: inner, .. } => match &inner.kind {
+                StmtKind::AgentDef(def) => def,
+                _ => continue,
+            },
+            _ => continue,
+        };
+        if agent_def.name != agent_sym {
+            continue;
+        }
+        for member in &agent_def.members {
+            if let AgentMember::Method(fn_def, _) = member {
+                if fn_def.name == method_sym {
+                    return Some(fn_def);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn walk_block_for_cross_field_access(
+    block: &Block,
+    current_agent: Symbol,
+    registry: &AgentRegistry,
+    interner: &Interner,
+    diags: &mut Vec<Diagnostic>,
+) {
+    for stmt in &block.stmts {
+        match &stmt.kind {
+            StmtKind::VarDecl { value: Some(val), .. } => {
+                walk_expr_for_cross_field(val, current_agent, registry, interner, diags);
+            }
+            StmtKind::Return(Some(expr)) => {
+                walk_expr_for_cross_field(expr, current_agent, registry, interner, diags);
+            }
+            StmtKind::Expr(expr) => {
+                walk_expr_for_cross_field(expr, current_agent, registry, interner, diags);
+            }
+            StmtKind::If { condition, then_block, elif_clauses, else_block } => {
+                walk_expr_for_cross_field(condition, current_agent, registry, interner, diags);
+                walk_block_for_cross_field_access(then_block, current_agent, registry, interner, diags);
+                for (cond, b) in elif_clauses {
+                    walk_expr_for_cross_field(cond, current_agent, registry, interner, diags);
+                    walk_block_for_cross_field_access(b, current_agent, registry, interner, diags);
+                }
+                if let Some(e) = else_block {
+                    walk_block_for_cross_field_access(e, current_agent, registry, interner, diags);
+                }
+            }
+            // TODO(v2): For/While/WhileLet bodies not walked in v1; same
+            // rationale as walk_block_for_edges (linear-pipeline-only scope).
+            _ => {}
+        }
+    }
+}
+
+fn walk_expr_for_cross_field(
+    expr: &Expr,
+    current_agent: Symbol,
+    registry: &AgentRegistry,
+    interner: &Interner,
+    diags: &mut Vec<Diagnostic>,
+) {
+    match &expr.kind {
+        ExprKind::MemberAccess { object, member } => {
+            // First recurse into the receiver — it may itself be a nested
+            // expression we need to walk (e.g. `(foo()).bar.baz`).
+            walk_expr_for_cross_field(object, current_agent, registry, interner, diags);
+            if let ExprKind::Ident(obj_sym) = &object.kind {
+                let Some(obj_name) = interner.resolve(obj_sym.0) else { return };
+                // Skip `self` — same-agent access is always allowed.
+                if obj_name == "self" {
+                    return;
+                }
+                // v1 heuristic: title-case the receiver name to find the
+                // agent type. See TODO(task 12) on as_agent_method_call.
+                let title = uppercase_first(obj_name);
+                let Some(other_agent) = registry.get_by_name(&title) else { return };
+                if other_agent.def_symbol == current_agent {
+                    return;
+                }
+                let Some(field_name) = interner.resolve(member.0) else { return };
+                let is_shared = other_agent
+                    .fields
+                    .iter()
+                    .find(|f| f.name_str == field_name)
+                    .map(|f| f.is_shared)
+                    .unwrap_or(false);
+                if !is_shared {
+                    let current_name = interner.resolve(current_agent.0).unwrap_or("?");
+                    diags.push(
+                        Diagnostic::error(format!(
+                            "E0601: agent '{}' cannot access exclusive field '{}' of agent '{}'\n\
+                             \n\
+                             requested: cross-agent field read\n\
+                             expected:  field marked @shared, or self-access inside the\n\
+                                        owning agent\n\
+                             found:     {} accessing {}.{} (Exclusive)\n\
+                             \n\
+                             fix: use method-call syntax to move/borrow via a port,\n\
+                                  or annotate the field as @shared for read-only access.",
+                            current_name, field_name, title,
+                            current_name, title, field_name,
+                        ))
+                        .with_label(expr.span, "exclusive field — owned by another agent"),
+                    );
+                }
+            }
+        }
+        ExprKind::Call { callee, args } => {
+            walk_expr_for_cross_field(callee, current_agent, registry, interner, diags);
+            for arg in args {
+                walk_expr_for_cross_field(&arg.value, current_agent, registry, interner, diags);
+            }
+        }
+        ExprKind::ListLiteral(items) => {
+            for item in items {
+                walk_expr_for_cross_field(item, current_agent, registry, interner, diags);
+            }
+        }
+        // Other ExprKind variants: recurse into sub-expressions where the AST
+        // exposes them. For Task 8 v1 scope, the above cover all paths the
+        // tests exercise. Add more arms if Task 21's E2E examples surface
+        // unhandled cases.
+        _ => {}
+    }
+}
+
+fn uppercase_first(s: &str) -> String {
+    let mut c = s.chars();
+    match c.next() {
+        Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+        None => String::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -693,5 +867,50 @@ fn pipeline(prompt: Tensor) -> Tensor:\n    let draft = drafter.draft(prompt)\n 
         assert!(!diags.iter().any(|d| d.message.contains("E0603")),
             "linear pipeline should not produce E0603, got: {:?}",
             diags.iter().map(|d| &d.message).collect::<Vec<_>>());
+    }
+
+    // -------------------------------------------------------------------------
+    // Task 8: E0601 cross-agent exclusive field access
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn cross_agent_exclusive_field_access_errors() {
+        // Reviewer.review receives `drafter: Drafter` and reads `drafter.kv_cache`.
+        // Title-casing "drafter" -> "Drafter" matches the registered agent.
+        // Drafter.draft reads `self.kv_cache` (same-agent, exempt).
+        let src = "\
+agent Drafter:\n    kv_cache: Tensor = empty()\n    fn draft(self) -> Tensor:\n        return self.kv_cache\n\
+agent Reviewer:\n    fn review(self, drafter: Drafter) -> Tensor:\n        return drafter.kv_cache\n";
+        let mut interner = nsl_lexer::Interner::new();
+        let (tokens, _) = nsl_lexer::tokenize(src, nsl_errors::FileId(0), &mut interner);
+        let parse_result = nsl_parser::parse(&tokens, &mut interner);
+        assert!(parse_result.diagnostics.is_empty(), "parse: {:?}", parse_result.diagnostics);
+
+        let mut registry = AgentRegistry::new();
+        registry.register_module(&parse_result.module, &interner);
+        let mut diags = Vec::new();
+        check_cross_agent_field_access(&parse_result.module, &registry, &interner, &mut diags);
+
+        assert!(diags.iter().any(|d| d.message.contains("E0601")),
+            "expected E0601, got: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
+        // Self-access (Drafter.draft reading self.kv_cache) MUST NOT produce E0601.
+        let e0601_count = diags.iter().filter(|d| d.message.contains("E0601")).count();
+        assert_eq!(e0601_count, 1, "exactly one E0601 expected (Reviewer.review's drafter.kv_cache); got {}", e0601_count);
+    }
+
+    #[test]
+    fn cross_agent_shared_field_access_allowed() {
+        let src = "\
+agent Drafter:\n    @shared\n    cache: Tensor = empty()\n    fn draft(self) -> Tensor:\n        return self.cache\n\
+agent Reviewer:\n    fn review(self, drafter: Drafter) -> Tensor:\n        return drafter.cache\n";
+        let mut interner = nsl_lexer::Interner::new();
+        let (tokens, _) = nsl_lexer::tokenize(src, nsl_errors::FileId(0), &mut interner);
+        let parse_result = nsl_parser::parse(&tokens, &mut interner);
+        let mut registry = AgentRegistry::new();
+        registry.register_module(&parse_result.module, &interner);
+        let mut diags = Vec::new();
+        check_cross_agent_field_access(&parse_result.module, &registry, &interner, &mut diags);
+        assert!(!diags.iter().any(|d| d.message.contains("E0601")),
+            "expected no E0601 for @shared field, got: {:?}", diags);
     }
 }
