@@ -360,13 +360,7 @@ fn as_agent_method_call(
     // `drafter`. Tasks 8–10 use the same heuristic via the same lookup shape.
     // TODO(task 12): replace heuristic with type-checker-resolved binding→agent
     // type map when semantic-phase integration lands.
-    let title = {
-        let mut chars = name.chars();
-        match chars.next() {
-            Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
-            None => String::new(),
-        }
-    };
+    let title = uppercase_first(name);
     let agent = registry.get_by_name(&title)?;
     let method_str = interner.resolve(member.0)?;
     let method_info = agent.methods.iter().find(|m| m.name_str == method_str)?;
@@ -657,10 +651,10 @@ fn walk_expr_for_cross_field(
             walk_expr_for_cross_field(object, current_agent, registry, interner, diags);
             if let ExprKind::Ident(obj_sym) = &object.kind {
                 let Some(obj_name) = interner.resolve(obj_sym.0) else { return };
-                // Skip `self` — same-agent access is always allowed.
-                if obj_name == "self" {
-                    return;
-                }
+                // Note: `self.field` is ExprKind::SelfRef, not Ident, so it does not
+                // reach this branch. Same-agent access via a parameter typed as the
+                // same agent (e.g. `drafter` inside Drafter's own method) is caught
+                // structurally by the `def_symbol == current_agent` guard below.
                 // v1 heuristic: title-case the receiver name to find the
                 // agent type. See TODO(task 12) on as_agent_method_call.
                 let title = uppercase_first(obj_name);
@@ -707,14 +701,36 @@ fn walk_expr_for_cross_field(
                 walk_expr_for_cross_field(item, current_agent, registry, interner, diags);
             }
         }
-        // Other ExprKind variants: recurse into sub-expressions where the AST
-        // exposes them. For Task 8 v1 scope, the above cover all paths the
-        // tests exercise. Add more arms if Task 21's E2E examples surface
-        // unhandled cases.
+        ExprKind::BinaryOp { left, right, .. } => {
+            walk_expr_for_cross_field(left, current_agent, registry, interner, diags);
+            walk_expr_for_cross_field(right, current_agent, registry, interner, diags);
+        }
+        ExprKind::UnaryOp { operand, .. } => {
+            walk_expr_for_cross_field(operand, current_agent, registry, interner, diags);
+        }
+        ExprKind::Pipe { left, right } => {
+            walk_expr_for_cross_field(left, current_agent, registry, interner, diags);
+            walk_expr_for_cross_field(right, current_agent, registry, interner, diags);
+        }
+        ExprKind::TupleLiteral(items) => {
+            for item in items {
+                walk_expr_for_cross_field(item, current_agent, registry, interner, diags);
+            }
+        }
+        ExprKind::Paren(inner) => {
+            walk_expr_for_cross_field(inner, current_agent, registry, interner, diags);
+        }
+        // TODO(task 21 / v2): walker still misses `IfExpr` (inline ternary),
+        // `Subscript`, `Await`, `Lambda`, `BlockExpr`, `DictLiteral`, `FString`,
+        // `MatchExpr`, and `ListComp` — agent field accesses inside any of those
+        // produce false negatives today. Loop bodies (For/While) are also
+        // unhandled at the statement level.
         _ => {}
     }
 }
 
+/// v1 heuristic: title-case a receiver variable name to find the registered agent type.
+/// TODO(task 12): replace with the type-checker-resolved binding→agent type map.
 fn uppercase_first(s: &str) -> String {
     let mut c = s.chars();
     match c.next() {
@@ -912,5 +928,25 @@ agent Reviewer:\n    fn review(self, drafter: Drafter) -> Tensor:\n        retur
         check_cross_agent_field_access(&parse_result.module, &registry, &interner, &mut diags);
         assert!(!diags.iter().any(|d| d.message.contains("E0601")),
             "expected no E0601 for @shared field, got: {:?}", diags);
+    }
+
+    #[test]
+    fn cross_agent_field_access_in_binary_op_errors() {
+        let src = "\
+agent Drafter:\n    score: f32 = 0.0\n    fn draft(self) -> f32:\n        return self.score\n\
+agent Reviewer:\n    fn review(self, drafter: Drafter) -> bool:\n        return drafter.score > 0.5\n";
+        let mut interner = nsl_lexer::Interner::new();
+        let (tokens, _) = nsl_lexer::tokenize(src, nsl_errors::FileId(0), &mut interner);
+        let parse_result = nsl_parser::parse(&tokens, &mut interner);
+        assert!(parse_result.diagnostics.is_empty(), "parse: {:?}", parse_result.diagnostics);
+
+        let mut registry = AgentRegistry::new();
+        registry.register_module(&parse_result.module, &interner);
+        let mut diags = Vec::new();
+        check_cross_agent_field_access(&parse_result.module, &registry, &interner, &mut diags);
+
+        assert!(diags.iter().any(|d| d.message.contains("E0601")),
+            "expected E0601 for drafter.score inside a BinaryOp, got: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>());
     }
 }
