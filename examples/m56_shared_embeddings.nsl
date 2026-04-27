@@ -1,0 +1,14 @@
+# M56 v2-pending example: @shared embedding table read by multiple agents.
+# The semantic check (Task 8) recognizes @shared and exempts it from E0601,
+# so cross-agent reads of @shared fields do NOT fire E0601.
+# Full runtime/codegen for shared tensors is v2-pending.
+
+agent Encoder:
+    @shared
+    embeddings: i32 = 0
+    fn encode(self) -> i32:
+        return self.embeddings
+
+agent Decoder:
+    fn decode(self, encoder: Encoder) -> i32:
+        return encoder.embeddings

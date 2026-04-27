@@ -1,0 +1,18 @@
+# M56 v1 negative example: circular agent topology.
+# A calls B; B output feeds back to A — produces an A->B->A cycle.
+# Must produce E0603 (circular port topology rejected).
+# Task 7 owns this check (detect_cycles on the APG).
+
+agent A:
+    fn a_fn(self, x: i32) -> i32:
+        return x
+
+agent B:
+    fn b_fn(self, y: i32) -> i32:
+        return y
+
+@pipeline_agent(agents=[A, B])
+fn loop_pipe(x: i32) -> i32:
+    let y = a.a_fn(x)
+    let z = b.b_fn(y)
+    return a.a_fn(z)

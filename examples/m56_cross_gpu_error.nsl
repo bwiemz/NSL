@@ -1,0 +1,17 @@
+# M56 v1 negative example: cross-GPU port connection.
+# Agent A is on cuda(0), Agent B is on cuda(1) — must produce E0607.
+# Task 10 owns this check (check_device_compatibility).
+# M30 will eventually support cross-GPU transfers; v1 rejects them.
+
+agent A:
+    fn produce(self, x: Tensor<[1], f32, cuda(0)>) -> Tensor<[1], f32, cuda(0)>:
+        return x
+
+agent B:
+    fn consume(self, y: Tensor<[1], f32, cuda(1)>) -> Tensor<[1], f32, cuda(1)>:
+        return y
+
+@pipeline_agent(agents=[A, B])
+fn pipe(x: Tensor<[1], f32, cuda(0)>) -> Tensor<[1], f32, cuda(1)>:
+    let r = a.produce(x)
+    return b.consume(r)
