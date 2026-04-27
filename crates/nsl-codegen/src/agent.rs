@@ -325,7 +325,8 @@ impl Compiler<'_> {
                             .iter()
                             .find(|p| self.resolve_sym(p.name) == "self")
                             .map(|p| p.name)
-                            .unwrap_or_else(|| fn_def.params[0].name);
+                            .or_else(|| fn_def.params.first().map(|p| p.name))
+                            .expect("agent method missing both explicit 'self' param and any params at all");
                         let self_var = state.new_variable();
                         builder.declare_var(self_var, pointer_type());
                         builder.def_var(self_var, state_ptr_val);
