@@ -739,6 +739,110 @@ fn uppercase_first(s: &str) -> String {
     }
 }
 
+// ---------------------------------------------------------------------------
+// E0602 — cross-agent Mutation effect rejected (M56 spec §1.1, §6.2)
+// ---------------------------------------------------------------------------
+
+/// M56 spec §1.1, §6.2 — cross-agent Mutation effect rejected.
+/// Walk every agent's method bodies; when an `Assign` statement's target
+/// is `<other_agent_var>.<field>`, emit E0602.
+///
+/// Composes with M51's Mutation effect by specializing the cross-agent case
+/// — the broader Mutation effect is reported by EffectChecker for fields
+/// the agent owns; this pass identifies the specific cross-boundary
+/// violation so users see the "agent boundary" framing rather than a
+/// generic Mutation diagnostic.
+pub fn check_cross_agent_mutation(
+    module: &nsl_ast::Module,
+    registry: &AgentRegistry,
+    interner: &Interner,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    for (_, agent) in registry.iter() {
+        for method in &agent.methods {
+            if let Some(fn_def) = find_agent_method_fn_def(module, agent.def_symbol, method.name) {
+                walk_block_for_cross_mutation(
+                    &fn_def.body, agent.def_symbol, registry, interner, diagnostics,
+                );
+            }
+        }
+    }
+}
+
+fn walk_block_for_cross_mutation(
+    block: &Block,
+    current_agent: Symbol,
+    registry: &AgentRegistry,
+    interner: &Interner,
+    diags: &mut Vec<Diagnostic>,
+) {
+    for stmt in &block.stmts {
+        match &stmt.kind {
+            // Direct and compound assignments: `target = value`, `target += value`, etc.
+            // `StmtKind::Assign` carries { target, op, value }; the cross-agent rule
+            // applies to all forms (both `a.x = 42` and `a.x += 1`), since the check
+            // is only on `target`. The `..` covers `op` and `value`.
+            StmtKind::Assign { target, .. } => {
+                check_target_for_cross_agent(target, current_agent, registry, interner, diags);
+            }
+            StmtKind::If { then_block, elif_clauses, else_block, .. } => {
+                walk_block_for_cross_mutation(then_block, current_agent, registry, interner, diags);
+                for (_, b) in elif_clauses {
+                    walk_block_for_cross_mutation(b, current_agent, registry, interner, diags);
+                }
+                if let Some(e) = else_block {
+                    walk_block_for_cross_mutation(e, current_agent, registry, interner, diags);
+                }
+            }
+            // TODO(v2): For/While/WhileLet bodies; same v1 scope rationale
+            // as Task 6 walk_block_for_edges.
+            _ => {}
+        }
+    }
+}
+
+fn check_target_for_cross_agent(
+    target: &Expr,
+    current_agent: Symbol,
+    registry: &AgentRegistry,
+    interner: &Interner,
+    diags: &mut Vec<Diagnostic>,
+) {
+    // TODO(v2): nested member access `a.b.c = ...` is not caught here.
+    // The target shape for that case is:
+    //   MemberAccess { object: MemberAccess { object: Ident(a), member: b }, member: c }
+    // The current code only checks the immediate `object` for `Ident`, so
+    // `a.b.c = ...` is a false negative. Tasks 17+ may need to revisit.
+    let ExprKind::MemberAccess { object, member } = &target.kind else { return };
+    let ExprKind::Ident(obj_sym) = &object.kind else { return };
+    let Some(obj_name) = interner.resolve(obj_sym.0) else { return };
+    // `self.x` is structurally excluded: `self` is parsed as `ExprKind::SelfRef`,
+    // not `ExprKind::Ident`, so it never reaches this branch.
+    // v1 heuristic: title-case the receiver variable name to find the agent type.
+    // TODO(task 12): replace with the type-checker-resolved binding→agent type map.
+    let title = uppercase_first(obj_name);
+    let Some(other_agent) = registry.get_by_name(&title) else { return };
+    if other_agent.def_symbol == current_agent { return; }
+    let Some(field_name) = interner.resolve(member.0) else { return };
+    let current_name = interner.resolve(current_agent.0).unwrap_or("?");
+    diags.push(
+        Diagnostic::error(format!(
+            "E0602: cross-agent Mutation effect rejected\n\
+             \n\
+             requested: cross-agent effect\n\
+             expected:  Communication only\n\
+             found:     Mutation on {}.{} from within {}\n\
+             \n\
+             fix: cross-agent state can only flow via port-typed method calls\n\
+                  in @pipeline_agent functions. To update another agent's\n\
+                  state, send a struct or tensor through that agent's input\n\
+                  port and let the agent mutate its own state internally.",
+            title, field_name, current_name,
+        ))
+        .with_label(target.span, "Mutation crosses agent boundary"),
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -948,5 +1052,45 @@ agent Reviewer:\n    fn review(self, drafter: Drafter) -> bool:\n        return 
         assert!(diags.iter().any(|d| d.message.contains("E0601")),
             "expected E0601 for drafter.score inside a BinaryOp, got: {:?}",
             diags.iter().map(|d| &d.message).collect::<Vec<_>>());
+    }
+
+    // -------------------------------------------------------------------------
+    // Task 9: E0602 cross-agent mutation rule
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn cross_agent_mutation_rejected_via_effects() {
+        let src = "\
+agent A:\n    x: i32 = 0\n    fn a_self(self) -> i32:\n        return self.x\n\
+agent B:\n    fn touch_a(self, a: A):\n        a.x = 42\n";
+        let mut interner = nsl_lexer::Interner::new();
+        let (tokens, _) = nsl_lexer::tokenize(src, nsl_errors::FileId(0), &mut interner);
+        let parse_result = nsl_parser::parse(&tokens, &mut interner);
+        assert!(parse_result.diagnostics.is_empty(), "parse: {:?}", parse_result.diagnostics);
+
+        let mut registry = AgentRegistry::new();
+        registry.register_module(&parse_result.module, &interner);
+        let mut diags = Vec::new();
+        check_cross_agent_mutation(&parse_result.module, &registry, &interner, &mut diags);
+
+        assert!(diags.iter().any(|d| d.message.contains("E0602")),
+            "expected E0602, got: {:?}", diags.iter().map(|d| &d.message).collect::<Vec<_>>());
+        let count = diags.iter().filter(|d| d.message.contains("E0602")).count();
+        assert_eq!(count, 1, "expected exactly one E0602 (B.touch_a's a.x = 42); got {}", count);
+    }
+
+    #[test]
+    fn self_mutation_not_rejected() {
+        let src = "\
+agent C:\n    counter: i32 = 0\n    fn bump(self):\n        self.counter = self.counter + 1\n";
+        let mut interner = nsl_lexer::Interner::new();
+        let (tokens, _) = nsl_lexer::tokenize(src, nsl_errors::FileId(0), &mut interner);
+        let parse_result = nsl_parser::parse(&tokens, &mut interner);
+        let mut registry = AgentRegistry::new();
+        registry.register_module(&parse_result.module, &interner);
+        let mut diags = Vec::new();
+        check_cross_agent_mutation(&parse_result.module, &registry, &interner, &mut diags);
+        assert!(!diags.iter().any(|d| d.message.contains("E0602")),
+            "self.counter = ... should not produce E0602, got: {:?}", diags);
     }
 }
