@@ -60,10 +60,13 @@ impl PipelineContext {
     }
 }
 
-/// A lease handle returned by `acquire`. Linear resource: created by
-/// `acquire`, consumed by `release` (or by drop, which still tombstones
-/// the slot if no release was called explicitly — but tests should always
-/// call `release` to exercise the reset path).
+/// A lease handle returned by `acquire`. Linear resource: must be
+/// consumed by `release` or `release_by_index`. v1 has no `Drop` impl —
+/// if a `Lease` is dropped without calling release, the pool slot leaks
+/// (remains permanently in the leased state and cannot be reacquired).
+/// Callers are responsible for ensuring every acquired lease reaches a
+/// release call. v2 may add a `Drop` impl that tombstones the slot, but
+/// v1's contract is explicit-release-only.
 pub struct Lease {
     index: usize,
 }
