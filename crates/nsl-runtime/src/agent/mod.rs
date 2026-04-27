@@ -2,6 +2,7 @@
 //!
 //! Spec: docs/superpowers/specs/2026-04-23-m56-multi-agent-v1-design.md §3.
 
+pub mod ffi;
 pub mod mailbox;
 pub mod pool;
 pub mod scheduler;
