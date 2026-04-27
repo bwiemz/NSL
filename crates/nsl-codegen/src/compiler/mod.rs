@@ -152,6 +152,13 @@ pub struct ModelMetadata {
     /// Key: (model_name, method_name). Consumed by Task 6 when compiling
     /// the impl body so it can reference the declared FuncId.
     pub export_method_impls: std::collections::HashMap<(String, String), (cranelift_module::FuncId, cranelift_codegen::ir::Signature)>,
+    /// M56 Task 18: maps lowercase agent binding symbol (e.g. `drafter`) to
+    /// the title-case agent type name (e.g. `"Drafter"`) for variables
+    /// synthesised at `@pipeline_agent` fn entry.  Consulted by the
+    /// Unknown-type dispatch path in `calls.rs` to route `drafter.draft(...)`
+    /// to `__nsl_agent_Drafter_draft` without full type-checker support.
+    /// Spec §5.2, Option A (direct dispatch, no scheduler call).
+    pub agent_var_types: HashMap<Symbol, String>,
 }
 
 impl ModelMetadata {
@@ -165,6 +172,7 @@ impl ModelMetadata {
             model_method_bodies: HashMap::new(),
             model_tensor_field_shapes: HashMap::new(),
             export_method_impls: std::collections::HashMap::new(),
+            agent_var_types: HashMap::new(),
         }
     }
 }

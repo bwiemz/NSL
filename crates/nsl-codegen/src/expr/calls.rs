@@ -104,8 +104,11 @@ impl Compiler<'_> {
                 }
                 return self.compile_call_by_name(builder, &mangled, &arg_vals);
             }
-            // Fallback for model array loop variables (type is Unknown but var was bound from model array)
-            if matches!(obj_type, Type::Unknown) {
+            // Fallback for model array loop variables (type is Unknown but var was bound from model array).
+            // M56 Task 18: also handles `Type::Error` (semantic pass assigns Error to undefined
+            // bindings like `drafter` in @pipeline_agent fn bodies where type checking doesn't
+            // know about the synthesised agent vars — they are wired at codegen time).
+            if matches!(obj_type, Type::Unknown | Type::Error) {
                 if let ExprKind::Ident(obj_sym) = &object.kind {
                     if let Some(model_name) = self.models.model_var_types.get(obj_sym).cloned() {
                         return self.compile_model_method_call(
@@ -117,11 +120,26 @@ impl Compiler<'_> {
                             args,
                         );
                     }
+                    // M56 Task 18 (spec §5.2, Option A): agent-var synthesised at
+                    // @pipeline_agent fn entry — dispatch to __nsl_agent_{Name}_{method}.
+                    if let Some(agent_name) = self.models.agent_var_types.get(obj_sym).cloned() {
+                        let mangled = format!("__nsl_agent_{}_{}", agent_name, member_name);
+                        let self_val = self.compile_expr(builder, state, object)?;
+                        let mut arg_vals = vec![self_val];
+                        for arg in args {
+                            arg_vals.push(self.compile_expr(builder, state, &arg.value)?);
+                        }
+                        return self.compile_call_by_name(builder, &mangled, &arg_vals);
+                    }
                 }
-                eprintln!(
-                    "[nsl-codegen] warning: method '.{member_name}()' called on Unknown-typed object \
-                     — defaulting to tensor dispatch. This may indicate a type inference gap."
-                );
+                // Only warn for Unknown — Error is expected for @pipeline_agent bodies
+                // where type inference doesn't cover synthesised agent vars.
+                if matches!(obj_type, Type::Unknown) {
+                    eprintln!(
+                        "[nsl-codegen] warning: method '.{member_name}()' called on Unknown-typed \
+                         object — defaulting to tensor dispatch. This may indicate a type inference gap."
+                    );
+                }
                 return self.compile_tensor_method_call(builder, state, object, &member_name, args);
             }
         }
