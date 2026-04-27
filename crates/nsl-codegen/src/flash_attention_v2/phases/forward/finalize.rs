@@ -13,17 +13,6 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
     let head_dim = config.head_dim as u32;
     let slices = head_dim / 32;
 
-    // Training paths set `save_activations_for_backward=true` and expect
-    // an f32 `out` tensor so MSE/L1 loss forwards can read it without a
-    // mid-graph dtype dance. Inference kernels keep f16 output for memory
-    // bandwidth. The wengert_lower fused-forward-under-claim site
-    // (wengert_lower.rs:398+) allocates `out` as GPU f32 when save=true,
-    // matching this emission.
-    let save = config
-        .csha
-        .as_ref()
-        .is_some_and(|c| c.save_activations_for_backward);
-
     ptx.push_str(&format!(
         "    // Phase 6: finalize + output store (q_tile_iter = {})\n",
         q_tile_iter
@@ -55,11 +44,7 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
     ptx.push_str("    mul.lo.u64 %rd48, %rd48, %rd6;            // * seq_len\n");
     ptx.push_str("    add.u64 %rd48, %rd48, %rd47;              // + q_row_global\n");
     ptx.push_str("    mul.lo.u64 %rd48, %rd48, %rd7;            // * head_dim\n");
-    if save {
-        ptx.push_str("    shl.b64 %rd48, %rd48, 2;                  // * 4 bytes f32 (training)\n");
-    } else {
-        ptx.push_str("    shl.b64 %rd48, %rd48, 1;                  // * 2 bytes f16 (inference)\n");
-    }
+    ptx.push_str("    shl.b64 %rd48, %rd48, 1;                  // * 2 bytes f16 output\n");
     ptx.push_str("    add.u64 %rd48, %rd3, %rd48;               // out_base_global\n");
 
     // Each lane writes head_dim/32 output values (f32 under save=true, f16 otherwise).
@@ -68,22 +53,13 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
         if i > 0 {
             ptx.push_str(&format!("    add.u64 %rd49, %rd49, {};\n", i * 32));
         }
-        if save {
-            ptx.push_str("    shl.b64 %rd49, %rd49, 2;                  // * 4 bytes f32\n");
-            ptx.push_str("    add.u64 %rd49, %rd48, %rd49;              // out_base + d*4\n");
-            ptx.push_str(&format!(
-                "    st.global.f32 [%rd49], %f{};\n",
-                O_BASE + i
-            ));
-        } else {
-            ptx.push_str(&format!(
-                "    cvt.rn.f16.f32 %h0, %f{};\n",
-                O_BASE + i
-            ));
-            ptx.push_str("    shl.b64 %rd49, %rd49, 1;                  // * 2 bytes f16\n");
-            ptx.push_str("    add.u64 %rd49, %rd48, %rd49;              // out_base + d*2\n");
-            ptx.push_str("    st.global.b16 [%rd49], %h0;\n");
-        }
+        ptx.push_str(&format!(
+            "    cvt.rn.f16.f32 %h0, %f{};\n",
+            O_BASE + i
+        ));
+        ptx.push_str("    shl.b64 %rd49, %rd49, 1;                  // * 2 bytes f16\n");
+        ptx.push_str("    add.u64 %rd49, %rd48, %rd49;              // out_base + d*2\n");
+        ptx.push_str("    st.global.b16 [%rd49], %h0;\n");
     }
 
     // LSE: lane 0 of each warp writes logsumexp[batch, head, q_row_global].

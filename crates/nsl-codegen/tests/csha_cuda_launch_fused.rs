@@ -510,6 +510,7 @@ fn run_fused_config_dmodel(
             norm_eps.to_bits() as i64,
             active_heads_i,
             d_model as i64,
+            0i64,
         )
     };
 
@@ -757,11 +758,12 @@ fn csha_fused_matrix_sweep() {
 fn run_with_saves(
     block_q: u32, block_kv: u32, head_dim: u32, heads: u32,
     causal: bool, rope_q: bool,
+    seq_override: Option<usize>,
     saves: Option<CshaBackwardActivations>,
 ) -> Result<(Vec<u16>, Vec<f32>), String> {
     let batch = 1usize;
     let heads_u = heads as usize;
-    let seq = (block_q as usize).max(block_kv as usize);
+    let seq = seq_override.unwrap_or((block_q as usize).max(block_kv as usize));
     let hd = head_dim as usize;
     let dm = hd;
     let norm_eps = 1e-5f32;
@@ -853,6 +855,7 @@ fn run_with_saves(
             0, norm_eps.to_bits() as i64,
             heads as i64, dm as i64,
             qp, kp, vp, rmx, rsm, xr,
+            0,
         )
     };
     if rc != 0 {
@@ -888,7 +891,7 @@ fn t1_forward_output_invariant_under_save_activations_flag() {
     let seq = block_q.max(block_kv) as i64;
 
     let (out_no_save, lse_no_save) =
-        run_with_saves(block_q, block_kv, head_dim, heads, false, false, None)
+        run_with_saves(block_q, block_kv, head_dim, heads, false, false, None, None)
             .expect("launch (save=None) failed");
 
     let saves = unsafe {
@@ -897,7 +900,7 @@ fn t1_forward_output_invariant_under_save_activations_flag() {
     assert_ne!(saves.q_proj, 0, "activation alloc failed");
 
     let (out_save, lse_save) = run_with_saves(
-        block_q, block_kv, head_dim, heads, false, false, Some(saves),
+        block_q, block_kv, head_dim, heads, false, false, None, Some(saves),
     )
     .expect("launch (save=Some) failed");
 
@@ -912,6 +915,84 @@ fn t1_forward_output_invariant_under_save_activations_flag() {
         .zip(&lse_save)
         .all(|(&a, &b)| a.to_bits() == b.to_bits());
     assert!(lse_bits_eq, "T1.4 invariant broken: LSE diverged");
+}
+
+/// Multi-tile variant of T1.4. The save-enabled fused path must preserve
+/// forward O/LSE when seq_len spans multiple KV tiles, not just the single-tile
+/// smoke configuration above.
+#[test]
+#[ignore]
+fn t1_forward_output_invariant_under_save_activations_flag_multitile() {
+    if !cuda_available() {
+        eprintln!("[T1.4-multitile] skipping — no CUDA");
+        return;
+    }
+    let (block_q, block_kv, head_dim, heads) = (32u32, 32, 32, 4);
+    let seq = 128usize;
+
+    let (out_no_save, lse_no_save) =
+        run_with_saves(block_q, block_kv, head_dim, heads, false, false, Some(seq), None)
+            .expect("launch (save=None) failed");
+
+    let saves = unsafe {
+        nsl_csha_alloc_backward_activations(1, heads as i64, seq as i64, head_dim as i64)
+    };
+    assert_ne!(saves.q_proj, 0, "activation alloc failed");
+
+    let (out_save, lse_save) = run_with_saves(
+        block_q, block_kv, head_dim, heads, false, false, Some(seq), Some(saves),
+    )
+    .expect("launch (save=Some) failed");
+
+    unsafe { nsl_csha_free_backward_activations(saves); }
+
+    assert_eq!(
+        out_no_save, out_save,
+        "T1.4 multitile invariant broken: forward O diverged between save-null and save-active"
+    );
+    let lse_bits_eq = lse_no_save
+        .iter()
+        .zip(&lse_save)
+        .all(|(&a, &b)| a.to_bits() == b.to_bits());
+    assert!(lse_bits_eq, "T1.4 multitile invariant broken: LSE diverged");
+}
+
+#[test]
+#[ignore]
+fn t1_forward_output_invariant_under_save_activations_flag_multitile_causal() {
+    if !cuda_available() {
+        eprintln!("[T1.4-multitile-causal] skipping — no CUDA");
+        return;
+    }
+    let (block_q, block_kv, head_dim, heads) = (32u32, 32, 32, 1);
+    let seq = 128usize;
+
+    let (out_no_save, lse_no_save) = run_with_saves(
+        block_q, block_kv, head_dim, heads, true, false, Some(seq), None,
+    )
+    .expect("launch (save=None) failed");
+
+    let saves = unsafe {
+        nsl_csha_alloc_backward_activations(1, heads as i64, seq as i64, head_dim as i64)
+    };
+    assert_ne!(saves.q_proj, 0, "activation alloc failed");
+
+    let (out_save, lse_save) = run_with_saves(
+        block_q, block_kv, head_dim, heads, true, false, Some(seq), Some(saves),
+    )
+    .expect("launch (save=Some) failed");
+
+    unsafe { nsl_csha_free_backward_activations(saves); }
+
+    assert_eq!(
+        out_no_save, out_save,
+        "T1.4 multitile causal invariant broken: forward O diverged between save-null and save-active"
+    );
+    let lse_bits_eq = lse_no_save
+        .iter()
+        .zip(&lse_save)
+        .all(|(&a, &b)| a.to_bits() == b.to_bits());
+    assert!(lse_bits_eq, "T1.4 multitile causal invariant broken: LSE diverged");
 }
 
 // --------------------------------------------------------------------------
@@ -1039,6 +1120,7 @@ fn t4_csha_backward_ffi_smoke() {
             do_dev, dq_dev, dk_dev, dv_dev,
             dwq_dev, dwk_dev, dwv_dev, dx_dev,
             dxn_dev,
+            0,
         )
     };
 
