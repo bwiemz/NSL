@@ -753,18 +753,28 @@ fn emit_calibration_forward_wrapper(
             reason: format!("declare nsl_desc_to_tensor: {e}"),
         })?;
 
+    // v2 follow-up (spec §5.1): wrapper returns i32 status so the
+    // caller can detect per-batch shape mismatch mid-loop, not just the
+    // first-batch preflight in `batch_preflight`. 0 = ok, 3 = mismatch
+    // (matches the subprocess exit code for §5.1).
     let mut wrapper_sig = compiler.module.make_signature();
     wrapper_sig.call_conv = compiler.call_conv;
     wrapper_sig.params.push(AbiParam::new(cl_types::I64));
     wrapper_sig.params.push(AbiParam::new(cl_types::I64));
     wrapper_sig.params.push(AbiParam::new(cl_types::I64));
     wrapper_sig.params.push(AbiParam::new(cl_types::I64));
+    wrapper_sig.returns.push(AbiParam::new(cl_types::I32));
     let wrapper_id = compiler
         .module
         .declare_function("nsl_calib_model_forward", Linkage::Export, &wrapper_sig)
         .map_err(|e| HarnessError::Infrastructure {
             reason: format!("declare nsl_calib_model_forward: {e}"),
         })?;
+
+    // Compile-time element count derived from the same shape array we
+    // wrote into the rodata; both descriptor and check share one source
+    // of truth, so a future shape change can't desync them.
+    let expected_elem_count: i64 = shape_vals.iter().product();
 
     let mut ctx = Context::for_function(Function::with_name_signature(
         UserFuncName::user(0, compiler.next_func_index()),
@@ -781,7 +791,26 @@ fn emit_calibration_forward_wrapper(
         let weight_ptrs = b.block_params(entry)[0];
         let num_weights = b.block_params(entry)[1];
         let batch_ptr = b.block_params(entry)[2];
-        let _batch_elem_count = b.block_params(entry)[3];
+        let batch_elem_count = b.block_params(entry)[3];
+
+        // Per-batch shape check: refuse with status 3 if the runtime
+        // batch element count differs from the compile-time expected.
+        // Defends against `nsl_calibration_batch_at` returning a
+        // variable-size view on a heterogeneous calibration dataset —
+        // the scaffolding's `batch_preflight` only validates batch 0.
+        let shape_ok = b.create_block();
+        let shape_mismatch = b.create_block();
+        let expected_v = b.ins().iconst(cl_types::I64, expected_elem_count);
+        let shape_eq = b.ins().icmp(IntCC::Equal, batch_elem_count, expected_v);
+        b.ins().brif(shape_eq, shape_ok, &[], shape_mismatch, &[]);
+
+        b.switch_to_block(shape_mismatch);
+        b.seal_block(shape_mismatch);
+        let three = b.ins().iconst(cl_types::I32, 3);
+        b.ins().return_(&[three]);
+
+        b.switch_to_block(shape_ok);
+        b.seal_block(shape_ok);
 
         let desc_slot = b.create_sized_stack_slot(StackSlotData::new(
             StackSlotKind::ExplicitSlot,
@@ -815,7 +844,7 @@ fn emit_calibration_forward_wrapper(
         let tensor_free_id = compiler.registry.runtime_fns["nsl_tensor_free"].0;
         let tensor_free_ref = compiler.module.declare_func_in_func(tensor_free_id, b.func);
         b.ins().call(tensor_free_ref, &[input_tensor]);
-        b.ins().return_(&[]);
+        b.ins().return_(&[zero_i32]);
         b.finalize();
     }
 
@@ -1202,12 +1231,16 @@ pub fn emit_calibration_scaffolding_object(
             reason: format!("declare nsl_model_get_weight_ptrs: {e}"),
         })?;
 
+    // v2 follow-up (spec §5.1): wrapper returns i32 status (0=ok, 3=batch
+    // shape mismatch). Scaffolding must declare the same signature or the
+    // ABI desyncs at link time (return-register vs caller-clobber).
     let mut calib_model_forward_sig = module.make_signature();
     calib_model_forward_sig.call_conv = call_conv;
     calib_model_forward_sig.params.push(AbiParam::new(ptr_ty));
     calib_model_forward_sig.params.push(AbiParam::new(cl_types::I64));
     calib_model_forward_sig.params.push(AbiParam::new(ptr_ty));
     calib_model_forward_sig.params.push(AbiParam::new(cl_types::I64));
+    calib_model_forward_sig.returns.push(AbiParam::new(cl_types::I32));
     let calib_model_forward_id = module
         .declare_function(
             "nsl_calib_model_forward",
@@ -1471,14 +1504,55 @@ pub fn emit_calibration_scaffolding_object(
 
             let batch_ptr = b.ins().load(cl_types::I64, MemFlags::new(), out_ptr_addr, 0);
             let batch_len = b.ins().load(cl_types::I64, MemFlags::new(), out_len_addr, 0);
-                let model_ptr = b.ins().load(cl_types::I64, MemFlags::new(), model_ptr_addr, 0);
+            let batch_elems = b.ins().ushr_imm(batch_len, 2);
+            let model_ptr = b.ins().load(cl_types::I64, MemFlags::new(), model_ptr_addr, 0);
             let num_weights = b.ins().load(cl_types::I64, MemFlags::new(), num_weights_addr, 0);
             let calib_model_forward_ref =
                 module.declare_func_in_func(calib_model_forward_id, b.func);
-            b.ins().call(
+            // Spec §4.3: 4th arg is element count, not byte length.
+            // `nsl_calibration_batch_at` returns out_len in bytes, so we
+            // shift right by 2 (f32 = 4 bytes). Pre-v2 the wrapper ignored
+            // this argument so the bytes-vs-elements mismatch was latent.
+            let fwd_call = b.ins().call(
                 calib_model_forward_ref,
-                    &[model_ptr, num_weights, batch_ptr, batch_len],
+                &[model_ptr, num_weights, batch_ptr, batch_elems],
             );
+            let fwd_status = b.inst_results(fwd_call)[0];
+
+            // v2 follow-up (spec §5.1): wrapper returns 3 on per-batch
+            // shape mismatch. The scaffolding's `batch_preflight` only
+            // validates batch 0; this catches drift mid-loop. Reuse the
+            // same `batch_shape_mismatch_data` payload + exit code as
+            // the preflight path so the surfaced reason is identical.
+            let observe_continue = b.create_block();
+            let batch_mismatch_mid_loop = b.create_block();
+            let zero_status = b.ins().iconst(cl_types::I32, 0);
+            let status_ok = b.ins().icmp(IntCC::Equal, fwd_status, zero_status);
+            b.ins().brif(
+                status_ok,
+                observe_continue,
+                &[],
+                batch_mismatch_mid_loop,
+                &[],
+            );
+
+            b.switch_to_block(batch_mismatch_mid_loop);
+            b.seal_block(batch_mismatch_mid_loop);
+            let mid_mismatch_ref = module.declare_data_in_func(
+                batch_shape_mismatch_data
+                    .expect("forward path defines batch-shape mismatch data"),
+                b.func,
+            );
+            let mid_mismatch_ptr = b.ins().symbol_value(ptr_ty, mid_mismatch_ref);
+            let mid_write_ref = module.declare_func_in_func(write_file_id, b.func);
+            b.ins().call(mid_write_ref, &[lh_sidecar_ptr, mid_mismatch_ptr]);
+            let mid_free_ref = module.declare_func_in_func(_calib_free_id, b.func);
+            b.ins().call(mid_free_ref, &[lh_batches]);
+            let mid_three = b.ins().iconst(cl_types::I32, 3);
+            b.ins().return_(&[mid_three]);
+
+            b.switch_to_block(observe_continue);
+            b.seal_block(observe_continue);
 
             for entry in observe_plan {
                 let arena_id = arena_data_id.expect("arena_data_id is Some when observe_plan is non-empty");

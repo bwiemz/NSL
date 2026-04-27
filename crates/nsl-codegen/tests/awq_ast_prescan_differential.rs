@@ -141,7 +141,11 @@ fn collect_in_compile_discovery(
         discovered.append(&mut per_model);
     }
 
-    discovered.sort_by(|left, right| left.projection.0.cmp(&right.projection.0));
+    // Spec §4.4 stability contract: both paths return pipe-chain order
+    // (per the `pre_scan_preserves_forward_projection_order` lib test).
+    // Earlier this helper sorted alphabetically, which made the assert_eq
+    // flake whenever the pipe order disagreed with alphabetical — exactly
+    // the case for the TinyMLP fixture (`up_proj |> ... |> down_proj`).
     discovered
 }
 
