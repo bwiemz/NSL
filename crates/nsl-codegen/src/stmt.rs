@@ -1292,7 +1292,11 @@ impl Compiler<'_> {
             | StmtKind::Import(_)
             | StmtKind::FromImport(_)
             | StmtKind::DatasetDef(_)
-            | StmtKind::TokenizerDef(_) => {}
+            | StmtKind::TokenizerDef(_)
+            // M56 Task 17: agent declarations are compiled by the dedicated
+            // collect_agents / declare_agent_methods / compile_agent_methods
+            // passes in entry_points.rs — not inline in stmt compilation.
+            | StmtKind::AgentDef(_) => {}
 
             StmtKind::DatatypeDef(_) => {
                 // M23: custom datatype codegen — implemented in Task 9

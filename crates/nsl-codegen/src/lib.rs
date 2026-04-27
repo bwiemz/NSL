@@ -24,6 +24,7 @@
     clippy::len_without_is_empty
 )]
 
+pub mod agent;
 pub mod autotune;
 pub mod builtins;
 pub mod c_header;
@@ -730,12 +731,16 @@ pub fn compile_and_calibrate(
         compiler.collect_enums(&parsed.module.stmts)?;
         compiler.collect_structs(&parsed.module.stmts)?;
         compiler.collect_models(&parsed.module.stmts)?;
+        // M56 Task 17: compute agent struct layouts.
+        compiler.collect_agents(&parsed.module.stmts)?;
         compiler.declare_runtime_functions()?;
         compiler.declare_imported_functions(&imported_fns)?;
         compiler.declare_user_functions_with_linkage(
             &parsed.module.stmts,
             cranelift_module::Linkage::Export,
         )?;
+        // M56 Task 17: declare agent method FuncIds.
+        compiler.declare_agent_methods(&parsed.module.stmts, cranelift_module::Linkage::Export)?;
         let vmap_results = compiler.apply_vmap_transforms(&parsed.module);
         compiler.register_batched_functions(&vmap_results);
         compiler.compile_datatype_defs(&parsed.module.stmts)?;
@@ -743,6 +748,8 @@ pub fn compile_and_calibrate(
         compiler.compile_flash_attention_kernels(&parsed.module.stmts)?;
         crate::wrga_prescan::prescan_adapter_sites_from_decorators(&mut compiler);
         compiler.compile_user_functions(&parsed.module.stmts)?;
+        // M56 Task 17: compile agent method bodies.
+        compiler.compile_agent_methods(&parsed.module.stmts)?;
         compiler.compile_batched_functions(&vmap_results)?;
         // compile_main triggers compile_train_block which fires the calibration
         // harness (AWQ discovery + run_harness_production) as a side-effect,

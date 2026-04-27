@@ -264,9 +264,13 @@ pub fn compile_returning_splice_count_for_tests(
     compiler.collect_enums(&ast.stmts)?;
     compiler.collect_structs(&ast.stmts)?;
     compiler.collect_models(&ast.stmts)?;
+    // M56 Task 17: compute agent struct layouts (after models, same pass ordering).
+    compiler.collect_agents(&ast.stmts)?;
     compiler.emit_retention_arena()?;
     compiler.declare_runtime_functions()?;
     compiler.declare_user_functions(&ast.stmts)?;
+    // M56 Task 17: declare agent method FuncIds (Linkage::Local mirrors non-export modules).
+    compiler.declare_agent_methods(&ast.stmts, cranelift_module::Linkage::Local)?;
     let vmap_results = compiler.apply_vmap_transforms(ast);
     compiler.register_batched_functions(&vmap_results);
     compiler.compile_datatype_defs(&ast.stmts)?;
@@ -283,6 +287,8 @@ pub fn compile_returning_splice_count_for_tests(
     // infrastructure failure (Compiler::new, emit_retention_arena,
     // declare_runtime_functions, etc.) is still surfaced as an Err.
     let _ = compiler.compile_user_functions(&ast.stmts);
+    // M56 Task 17: compile agent method bodies.
+    let _ = compiler.compile_agent_methods(&ast.stmts);
 
     Ok(compiler.retention_splices_emitted)
 }
@@ -317,6 +323,8 @@ pub fn compile_returning_plan(
     compiler.collect_enums(&ast.stmts)?;
     compiler.collect_structs(&ast.stmts)?;
     compiler.collect_models(&ast.stmts)?;
+    // M56 Task 17: compute agent struct layouts.
+    compiler.collect_agents(&ast.stmts)?;
     // Task 4: declare the calibration retention arena BEFORE method-body
     // codegen.  The pipe-site splice in `try_emit_retention_splice` early-
     // returns when `retention_arena_data_id` is `None`, so emitting the
@@ -326,6 +334,8 @@ pub fn compile_returning_plan(
     compiler.emit_retention_arena()?;
     compiler.declare_runtime_functions()?;
     compiler.declare_user_functions(&ast.stmts)?;
+    // M56 Task 17: declare agent method FuncIds.
+    compiler.declare_agent_methods(&ast.stmts, cranelift_module::Linkage::Local)?;
     // M39b: Apply vmap AST transforms and register batched function variants
     let vmap_results = compiler.apply_vmap_transforms(ast);
     compiler.register_batched_functions(&vmap_results);
@@ -344,6 +354,8 @@ pub fn compile_returning_plan(
     // blocks. Mirrors the rewrite inside `compile_user_functions`.
     crate::wrga_prescan::rewrite_model_method_bodies_with_adapter_sites(&mut compiler);
     compiler.compile_user_functions(&ast.stmts)?;
+    // M56 Task 17: compile agent method bodies.
+    compiler.compile_agent_methods(&ast.stmts)?;
     // M39c: Compile batched function bodies (after user functions, before main)
     compiler.compile_batched_functions(&vmap_results)?;
     // M36: Memory planner — compile-time slab allocation for GPU tensors.
@@ -487,11 +499,15 @@ fn compile_with_zk_info_best_effort_plan(
         compiler.collect_enums(&ast.stmts)?;
         compiler.collect_structs(&ast.stmts)?;
         compiler.collect_models(&ast.stmts)?;
+        // M56 Task 17: compute agent struct layouts.
+        compiler.collect_agents(&ast.stmts)?;
         // Task 4: declare the calibration retention arena BEFORE method-body
         // codegen — see `compile_returning_plan` for the full rationale.
         compiler.emit_retention_arena()?;
         compiler.declare_runtime_functions()?;
         compiler.declare_user_functions(&ast.stmts)?;
+        // M56 Task 17: declare agent method FuncIds.
+        compiler.declare_agent_methods(&ast.stmts, cranelift_module::Linkage::Local)?;
         let vmap_results = compiler.apply_vmap_transforms(ast);
         compiler.register_batched_functions(&vmap_results);
         compiler.compile_datatype_defs(&ast.stmts)?;
@@ -502,6 +518,8 @@ fn compile_with_zk_info_best_effort_plan(
         // so source-AD's inline expansion sees the fused FFI call.
         crate::wrga_prescan::rewrite_model_method_bodies_with_adapter_sites(&mut compiler);
         compiler.compile_user_functions(&ast.stmts)?;
+        // M56 Task 17: compile agent method bodies.
+        compiler.compile_agent_methods(&ast.stmts)?;
         compiler.compile_batched_functions(&vmap_results)?;
         compiler.compile_main(&ast.stmts)?;
         compiler.compile_pending_lambdas()?;
@@ -653,11 +671,15 @@ fn compile_standalone_best_effort_plan(
         compiler.collect_enums(&ast.stmts)?;
         compiler.collect_structs(&ast.stmts)?;
         compiler.collect_models(&ast.stmts)?;
+        // M56 Task 17: compute agent struct layouts.
+        compiler.collect_agents(&ast.stmts)?;
         // Task 4: declare the calibration retention arena BEFORE method-body
         // codegen — see `compile_returning_plan` for the full rationale.
         compiler.emit_retention_arena()?;
         compiler.declare_runtime_functions()?;
         compiler.declare_user_functions(&ast.stmts)?;
+        // M56 Task 17: declare agent method FuncIds.
+        compiler.declare_agent_methods(&ast.stmts, cranelift_module::Linkage::Local)?;
         let vmap_results = compiler.apply_vmap_transforms(ast);
         compiler.register_batched_functions(&vmap_results);
         compiler.compile_datatype_defs(&ast.stmts)?;
@@ -668,6 +690,8 @@ fn compile_standalone_best_effort_plan(
         // so source-AD's inline expansion sees the fused FFI call.
         crate::wrga_prescan::rewrite_model_method_bodies_with_adapter_sites(&mut compiler);
         compiler.compile_user_functions(&ast.stmts)?;
+        // M56 Task 17: compile agent method bodies.
+        compiler.compile_agent_methods(&ast.stmts)?;
         compiler.compile_batched_functions(&vmap_results)?;
         compiler.compile_standalone_main(&ast.stmts)?;
         compiler.compile_pending_lambdas()?;
@@ -703,6 +727,8 @@ pub fn compile_test(
     compiler.collect_enums(&ast.stmts)?;
     compiler.collect_structs(&ast.stmts)?;
     compiler.collect_models(&ast.stmts)?;
+    // M56 Task 17: compute agent struct layouts.
+    compiler.collect_agents(&ast.stmts)?;
     // Task 4: declare the calibration retention arena BEFORE method-body
     // codegen — parity with all other entry points.  `compile_test` compiles
     // `@test` functions; a `@test` body that calls a model.forward with a
@@ -711,6 +737,8 @@ pub fn compile_test(
     compiler.emit_retention_arena()?;
     compiler.declare_runtime_functions()?;
     compiler.declare_user_functions(&ast.stmts)?;
+    // M56 Task 17: declare agent method FuncIds.
+    compiler.declare_agent_methods(&ast.stmts, cranelift_module::Linkage::Local)?;
     // M39b: Apply vmap AST transforms and register batched function variants
     let vmap_results = compiler.apply_vmap_transforms(ast);
     compiler.register_batched_functions(&vmap_results);
@@ -718,6 +746,8 @@ pub fn compile_test(
     compiler.compile_kernels(&ast.stmts)?;
     compiler.compile_flash_attention_kernels(&ast.stmts)?;
     compiler.compile_user_functions(&ast.stmts)?;
+    // M56 Task 17: compile agent method bodies.
+    compiler.compile_agent_methods(&ast.stmts)?;
     // M39c: Compile batched function bodies
     compiler.compile_batched_functions(&vmap_results)?;
     compiler.compile_pending_lambdas()?;
@@ -857,12 +887,16 @@ pub fn compile_module_with_imports_best_effort_plan(
         compiler.collect_enums(&ast.stmts)?;
         compiler.collect_structs(&ast.stmts)?;
         compiler.collect_models(&ast.stmts)?;
+        // M56 Task 17: compute agent struct layouts.
+        compiler.collect_agents(&ast.stmts)?;
         // Task 4: declare the calibration retention arena BEFORE method-body
         // codegen — see `compile_returning_plan` for the full rationale.
         compiler.emit_retention_arena()?;
         compiler.declare_runtime_functions()?;
         compiler.declare_imported_functions(imported_fns)?;
         compiler.declare_user_functions_with_linkage(&ast.stmts, Linkage::Export)?;
+        // M56 Task 17: declare agent method FuncIds (Export linkage mirrors module compile).
+        compiler.declare_agent_methods(&ast.stmts, Linkage::Export)?;
         let vmap_results = compiler.apply_vmap_transforms(ast);
         compiler.register_batched_functions(&vmap_results);
         compiler.compile_datatype_defs(&ast.stmts)?;
@@ -873,6 +907,8 @@ pub fn compile_module_with_imports_best_effort_plan(
         // so source-AD's inline expansion sees the fused FFI call.
         crate::wrga_prescan::rewrite_model_method_bodies_with_adapter_sites(&mut compiler);
         compiler.compile_user_functions(&ast.stmts)?;
+        // M56 Task 17: compile agent method bodies.
+        compiler.compile_agent_methods(&ast.stmts)?;
         compiler.compile_batched_functions(&vmap_results)?;
         compiler.compile_pending_lambdas()?;
         // M62: Emit C-ABI wrapper bodies for @export functions before finalize.
@@ -979,6 +1015,8 @@ pub fn compile_entry_returning_plan(
     compiler.collect_enums(&ast.stmts)?;
     compiler.collect_structs(&ast.stmts)?;
     compiler.collect_models(&ast.stmts)?;
+    // M56 Task 17: compute agent struct layouts.
+    compiler.collect_agents(&ast.stmts)?;
 
     // Merge imported model method bodies and field types from dependency modules.
     // This enables source AD to inline method calls on imported model types
@@ -1004,6 +1042,8 @@ pub fn compile_entry_returning_plan(
     compiler.declare_runtime_functions()?;
     compiler.declare_imported_functions(imported_fns)?;
     compiler.declare_user_functions_with_linkage(&ast.stmts, Linkage::Export)?;
+    // M56 Task 17: declare agent method FuncIds (Export linkage for entry compile).
+    compiler.declare_agent_methods(&ast.stmts, Linkage::Export)?;
     // M39b: Apply vmap AST transforms and register batched function variants
     let vmap_results = compiler.apply_vmap_transforms(ast);
     compiler.register_batched_functions(&vmap_results);
@@ -1015,6 +1055,8 @@ pub fn compile_entry_returning_plan(
     // so source-AD's inline expansion sees the fused FFI call.
     crate::wrga_prescan::rewrite_model_method_bodies_with_adapter_sites(&mut compiler);
     compiler.compile_user_functions(&ast.stmts)?;
+    // M56 Task 17: compile agent method bodies.
+    compiler.compile_agent_methods(&ast.stmts)?;
     // M39c: Compile batched function bodies
     compiler.compile_batched_functions(&vmap_results)?;
     compiler.compile_main(&ast.stmts)?;

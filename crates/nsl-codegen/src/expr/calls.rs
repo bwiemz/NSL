@@ -92,6 +92,18 @@ impl Compiler<'_> {
                     args,
                 );
             }
+            // M56 Task 17: agent method calls — `agent_var.method(args)`.
+            // Spec §4.1: mangling is `__nsl_agent_{AgentName}_{MethodName}`.
+            if let Type::Agent { name, .. } = &obj_type {
+                let agent_name = self.resolve_sym(*name).to_string();
+                let mangled = format!("__nsl_agent_{}_{}", agent_name, member_name);
+                let self_val = self.compile_expr(builder, state, object)?;
+                let mut arg_vals = vec![self_val];
+                for arg in args {
+                    arg_vals.push(self.compile_expr(builder, state, &arg.value)?);
+                }
+                return self.compile_call_by_name(builder, &mangled, &arg_vals);
+            }
             // Fallback for model array loop variables (type is Unknown but var was bound from model array)
             if matches!(obj_type, Type::Unknown) {
                 if let ExprKind::Ident(obj_sym) = &object.kind {

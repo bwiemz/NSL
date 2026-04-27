@@ -231,6 +231,31 @@ impl Compiler<'_> {
             }
         }
 
+        // M56 Task 17: agent field access — `self.field` inside agent methods.
+        // Spec §4.1: agent state structs are in `struct_layouts` under the agent
+        // name; field offsets are computed by `collect_agents` in agent.rs.
+        // The access path is intentionally simpler than model access: no
+        // adapter sidetable, no weight-map integration (agents are not trained).
+        if let nsl_semantic::types::Type::Agent { name, .. } = &obj_type {
+            let agent_name = self.resolve_sym(*name).to_string();
+            if let Some(layout) = self.types.struct_layouts.get(&agent_name).cloned() {
+                for field in &layout.fields {
+                    if field.name == member_name {
+                        let val = builder.ins().load(
+                            field.cl_type,
+                            MemFlags::trusted(),
+                            obj_val,
+                            field.offset as i32,
+                        );
+                        return Ok(val);
+                    }
+                }
+                return Err(CodegenError::new(format!(
+                    "agent '{agent_name}' has no field '{member_name}'"
+                )));
+            }
+        }
+
         // Tensor property access
         if obj_type.is_tensor() {
             return match member_name.as_str() {
