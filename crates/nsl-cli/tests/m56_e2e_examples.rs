@@ -46,12 +46,20 @@ fn m56_basic_two_agents_compiles_clean() {
     );
 }
 
-/// @auto_device_transfer opt-in — E0608 must NOT fire.
+/// @auto_device_transfer opt-in — E0608 must NOT fire, no other M56 errors either.
 #[test]
 fn m56_device_transfer_opt_in_compiles_clean() {
     let out = run_check("m56_device_transfer_opt_in");
     let stderr = String::from_utf8_lossy(&out.stderr);
-    // E0608 must NOT fire — the @auto_device_transfer annotation suppresses it.
+    // No M56 agent-memory error codes should fire (E0601–E0609 + E0610).
+    assert!(
+        !stderr.contains("E060") && !stderr.contains("E0610"),
+        "expected clean check; stderr:\n{}",
+        stderr
+    );
+    // Specifically: E0608 must NOT fire — @auto_device_transfer suppresses it.
+    // (The above assertion already covers this, but the explicit message aids
+    // diagnosis if E0608 reappears after a Task 10 regression.)
     assert!(
         !stderr.contains("E0608"),
         "@auto_device_transfer should suppress E0608; stderr:\n{}",
@@ -111,8 +119,13 @@ fn m56_serve_pool_parses_clean_v2_pending() {
     // Best-effort: the file should at least not crash nsl check.
     // With the serve block commented out, no fatal parse errors are expected.
     // Any remaining errors from other type-system passes are acceptable per
-    // v2-pending status; we only assert the process didn't panic.
-    let _ = (out.status, stderr.as_ref());
+    // v2-pending status. Assert at minimum that the process did not panic
+    // (exit code 101 = Rust panic/unwrap in the nsl binary).
+    assert!(
+        out.status.code() != Some(101),
+        "nsl check panicked on m56_serve_pool (exit 101); stderr:\n{}",
+        stderr
+    );
 }
 
 /// @shared embedding table — v2-pending runtime, but semantic check (Task 8)
