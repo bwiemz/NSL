@@ -40,7 +40,7 @@ use nsl_ast::agent::{AgentDef, AgentMember};
 use nsl_ast::decl::Decorator;
 use nsl_ast::expr::ExprKind;
 use nsl_ast::stmt::{Stmt, StmtKind};
-use nsl_ast::types::TypeExprKind;
+use nsl_ast::types::{DeviceExpr, TypeExprKind};
 use nsl_ast::Symbol;
 
 use crate::compiler::Compiler;
@@ -167,12 +167,58 @@ impl Compiler<'_> {
             self.types.struct_layouts.insert(
                 name.clone(),
                 StructLayout {
-                    name,
+                    name: name.clone(),
                     fields,
                     total_size,
                     adapter_sidetable_offset: None,
                 },
             );
+
+            // M56 Task 19: scan @auto_device_transfer methods to populate
+            // `agent_auto_device_params` so calls.rs can insert transfers.
+            for member in &agent.members {
+                if let AgentMember::Method(fn_def, decorators) = member {
+                    let has_adt = decorators.iter().any(|d| {
+                        d.name.len() == 1
+                            && self.resolve_sym(d.name[0]) == "auto_device_transfer"
+                    });
+                    if !has_adt {
+                        continue;
+                    }
+                    let method_name = self.resolve_sym(fn_def.name).to_string();
+                    let mut device_transfers: Vec<(usize, i64)> = Vec::new();
+                    let mut call_arg_idx = 0usize;
+                    for param in &fn_def.params {
+                        let pname = self.resolve_sym(param.name).to_string();
+                        if pname == "self" {
+                            continue;
+                        }
+                        if let Some(ref type_ann) = param.type_ann {
+                            if let TypeExprKind::Tensor {
+                                device: Some(dev), ..
+                            } = &type_ann.kind
+                            {
+                                let target_device: i64 = match dev {
+                                    DeviceExpr::Cpu => 0,
+                                    DeviceExpr::Cuda(_) => 1,
+                                    // Metal/ROCm/NPU not yet modelled in Task 19 v1.
+                                    _ => {
+                                        call_arg_idx += 1;
+                                        continue;
+                                    }
+                                };
+                                device_transfers.push((call_arg_idx, target_device));
+                            }
+                        }
+                        call_arg_idx += 1;
+                    }
+                    if !device_transfers.is_empty() {
+                        self.models
+                            .agent_auto_device_params
+                            .insert((name.clone(), method_name), device_transfers);
+                    }
+                }
+            }
         }
         Ok(())
     }
