@@ -569,6 +569,10 @@ pub struct CompileOptions {
     /// calling any codegen entry point.  Empty map = no @export methods (safe
     /// default, nothing to look up).
     pub weight_index_map: HashMap<nsl_ast::NodeId, usize>,
+    /// Owned AST/interner/type-map bundle used by the calibration subprocess
+    /// path to emit a dedicated model object.
+    pub calibration_compile_bundle:
+        Option<std::sync::Arc<crate::calibration::CalibrationCompileBundle>>,
 }
 
 impl Default for CompileOptions {
@@ -641,6 +645,7 @@ impl Default for CompileOptions {
             calibration_retention: None,
             calibration_batch_seq: None,
             weight_index_map: HashMap::new(),
+            calibration_compile_bundle: None,
         }
     }
 }
@@ -671,8 +676,8 @@ pub fn compile_and_calibrate(
         CodegenError::new(format!("reading source {}: {e}", source_path.display()))
     })?;
 
-    // Step 1: peek at the calibration data to get (batch, seq).
-    let (batch, seq) = nsl_runtime::calibration_data::peek_batch_seq(data_path)
+    // Step 1: peek at the calibration data to get (_count, seq).
+    let (_count, seq) = nsl_runtime::calibration_data::peek_batch_seq(data_path)
         .map_err(|e| CodegenError::new(format!("reading calibration data header: {e}")))?;
 
     // Step 2: lex, parse, and semantically analyse.
@@ -706,8 +711,15 @@ pub fn compile_and_calibrate(
     let mut opts = CompileOptions::default();
     opts.calibration_data = Some(data_path.to_path_buf());
     opts.weight_file = Some(weights_path.to_path_buf());
-    opts.calibration_batch_seq = Some((batch, seq));
+    opts.calibration_batch_seq = Some((1, seq));
     opts.calibration_mode = Some("required".to_string());
+    opts.calibration_compile_bundle = Some(std::sync::Arc::new(
+        crate::calibration::CalibrationCompileBundle {
+            ast: parsed.module.clone(),
+            interner: interner.clone(),
+            type_map: analysis.type_map.clone(),
+        },
+    ));
 
     // Step 4: Run stdlib imports for any train block references.
     let imported_fns = crate::stdlib_loader::build_imported_fns_for_entry(
@@ -723,6 +735,7 @@ pub fn compile_and_calibrate(
     // sidecar written into the Compiler's internal copy cannot be recovered
     // via the public API.  Driving Compiler directly avoids this limitation.)
     let mut compiler = crate::compiler::Compiler::new(&interner, &analysis.type_map, &opts)?;
+    compiler.compile_options.calibration_compile_bundle = opts.calibration_compile_bundle.clone();
 
     let pre_finalize = (|| -> Result<(), CodegenError> {
         compiler.intern_string("")?;

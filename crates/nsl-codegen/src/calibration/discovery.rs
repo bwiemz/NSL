@@ -6,9 +6,10 @@
 //! sorted `Vec<DiscoveredProjection>`.
 
 use crate::calibration::observation::ProjectionRef;
-use nsl_ast::decl::ModelMember;
+use nsl_ast::decl::{Decorator, ModelDef, ModelMember};
 use nsl_ast::expr::ExprKind;
-use nsl_ast::stmt::Block;
+use nsl_ast::stmt::{Block, StmtKind};
+use nsl_ast::types::{TypeExpr, TypeExprKind};
 use nsl_lexer::Interner;
 
 // ── error type ────────────────────────────────────────────────────────────────
@@ -21,6 +22,11 @@ pub enum DiscoveryError {
     /// A pipe target or call callee that looks like a layer reference is not
     /// a static model parameter (not in `model_field_types`).
     NonStaticWeight { path: String },
+    /// The AST pre-scan and in-compiler discovery paths disagreed.
+    Divergence {
+        pre_scan_names: Vec<String>,
+        in_compile_names: Vec<String>,
+    },
 }
 
 impl std::fmt::Display for DiscoveryError {
@@ -32,6 +38,15 @@ impl std::fmt::Display for DiscoveryError {
             Self::NonStaticWeight { path } => write!(
                 f,
                 "Projection '{path}' uses a non-parameter weight; AWQ requires static weights"
+            ),
+            Self::Divergence {
+                pre_scan_names,
+                in_compile_names,
+            } => write!(
+                f,
+                "calibration: discovery divergence.\n pre-scan:    {}\n in-compile:  {}",
+                pre_scan_names.join(", "),
+                in_compile_names.join(", ")
             ),
         }
     }
@@ -48,6 +63,11 @@ pub struct DiscoveredProjection {
     pub projection: ProjectionRef,
     /// Weight shape `[out_features, in_features]`.
     pub weight_shape: [u32; 2],
+}
+
+fn dedup_preserving_first_seen(projections: &mut Vec<DiscoveredProjection>) {
+    let mut seen = std::collections::HashSet::new();
+    projections.retain(|projection| seen.insert(projection.projection.0.clone()));
 }
 
 // ── glob matching ─────────────────────────────────────────────────────────────
@@ -86,6 +106,53 @@ fn parse_tensor_shape_string(s: &str) -> [u32; 2] {
     let out_f = parts[0].trim().parse::<u32>().unwrap_or(0);
     let in_f = parts[1].trim().parse::<u32>().unwrap_or(0);
     [out_f, in_f]
+}
+
+fn parse_tensor_shape_from_type_expr(ty: &TypeExpr) -> Option<[u32; 2]> {
+    let TypeExprKind::Tensor { shape, .. } = &ty.kind else {
+        return None;
+    };
+    if shape.len() < 2 {
+        return None;
+    }
+    let out_features = match shape.first() {
+        Some(nsl_ast::types::DimExpr::Concrete(n)) if *n >= 0 => *n as u32,
+        _ => return None,
+    };
+    let in_features = match shape.get(1) {
+        Some(nsl_ast::types::DimExpr::Concrete(n)) if *n >= 0 => *n as u32,
+        _ => return None,
+    };
+    Some([out_features, in_features])
+}
+
+fn extract_shape_from_tensor_init(expr: &nsl_ast::expr::Expr, interner: &Interner) -> Option<[u32; 2]> {
+    let ExprKind::Call { callee, args } = &expr.kind else {
+        return None;
+    };
+    let ExprKind::Ident(sym) = &callee.kind else {
+        return None;
+    };
+    let fname = interner.resolve(sym.0).unwrap_or("");
+    if !matches!(fname, "zeros" | "ones" | "randn" | "rand" | "full" | "arange") {
+        return None;
+    }
+    let first = args.first()?;
+    let ExprKind::ListLiteral(items) = &first.value.kind else {
+        return None;
+    };
+    if items.len() < 2 {
+        return None;
+    }
+    let out_features = match &items[0].kind {
+        ExprKind::IntLiteral(n) if *n >= 0 => *n as u32,
+        _ => return None,
+    };
+    let in_features = match &items[1].kind {
+        ExprKind::IntLiteral(n) if *n >= 0 => *n as u32,
+        _ => return None,
+    };
+    Some([out_features, in_features])
 }
 
 // ── built-in filter ───────────────────────────────────────────────────────────
@@ -201,6 +268,160 @@ fn collect_rhs_expr(expr: &nsl_ast::expr::Expr, interner: &Interner, out: &mut V
     }
 }
 
+fn model_has_awq_quantize_decorator(decorators: &[Decorator], interner: &Interner) -> bool {
+    decorators.iter().any(|decorator| {
+        if decorator.name.len() != 1 || interner.resolve(decorator.name[0].0).unwrap_or("") != "quantize" {
+            return false;
+        }
+        let mut dtype = "awq4";
+        if let Some(args) = &decorator.args {
+            for arg in args {
+                let Some(name_sym) = arg.name else {
+                    continue;
+                };
+                if interner.resolve(name_sym.0).unwrap_or("") != "dtype" {
+                    continue;
+                }
+                if let ExprKind::StringLiteral(s) = &arg.value.kind {
+                    dtype = s.as_str();
+                }
+            }
+        }
+        dtype == "awq4"
+    })
+}
+
+fn collect_model_layer_metadata(
+    model_def: &ModelDef,
+    interner: &Interner,
+) -> (
+    std::collections::HashMap<String, String>,
+    std::collections::HashMap<String, String>,
+) {
+    let mut field_types = std::collections::HashMap::new();
+    let mut tensor_shapes = std::collections::HashMap::new();
+
+    for member in &model_def.members {
+        let ModelMember::LayerDecl {
+            name,
+            type_ann,
+            init,
+            ..
+        } = member else {
+            continue;
+        };
+
+        let field_name = interner.resolve(name.0).unwrap_or("").to_string();
+        if field_name.is_empty() {
+            continue;
+        }
+
+        let type_name = match &type_ann.kind {
+            TypeExprKind::Named(sym) => interner.resolve(sym.0).unwrap_or("").to_string(),
+            TypeExprKind::Tensor { .. } => "Tensor".to_string(),
+            _ => String::new(),
+        };
+        if !type_name.is_empty() {
+            field_types.insert(field_name.clone(), type_name);
+        }
+
+        let shape = parse_tensor_shape_from_type_expr(type_ann)
+            .or_else(|| init.as_ref().and_then(|expr| extract_shape_from_tensor_init(expr, interner)));
+        if let Some([out_features, in_features]) = shape {
+            tensor_shapes.insert(
+                field_name,
+                format!("Tensor<[{}, {}], f32>", out_features, in_features),
+            );
+        }
+    }
+
+    (field_types, tensor_shapes)
+}
+
+/// Discover AWQ projections directly from the parsed AST before any compiler
+/// state exists.
+pub fn pre_scan_awq_projections_from_ast(
+    ast: &nsl_ast::Module,
+    interner: &Interner,
+) -> Vec<DiscoveredProjection> {
+    let mut all_projections = Vec::new();
+
+    for stmt in &ast.stmts {
+        let StmtKind::Decorated { decorators, stmt: inner } = &stmt.kind else {
+            continue;
+        };
+        let StmtKind::ModelDef(model_def) = &inner.kind else {
+            continue;
+        };
+        if !model_has_awq_quantize_decorator(decorators, interner) {
+            continue;
+        }
+
+        let model_name = interner.resolve(model_def.name.0).unwrap_or("").to_string();
+        if model_name.is_empty() {
+            continue;
+        }
+
+        let forward_body = find_forward_body(model_def, interner);
+        let (field_types, tensor_shapes) = collect_model_layer_metadata(model_def, interner);
+
+        if let Ok(mut discovered) = discover_awq_projections_from_state(
+            &model_name,
+            forward_body,
+            &field_types,
+            &tensor_shapes,
+            &[],
+            interner,
+        ) {
+            all_projections.append(&mut discovered);
+        }
+    }
+
+    dedup_preserving_first_seen(&mut all_projections);
+    all_projections
+}
+
+pub fn first_awq_quantized_model_name(
+    ast: &nsl_ast::Module,
+    interner: &Interner,
+) -> Option<String> {
+    ast.stmts.iter().find_map(|stmt| {
+        let StmtKind::Decorated { decorators, stmt: inner } = &stmt.kind else {
+            return None;
+        };
+        let StmtKind::ModelDef(model_def) = &inner.kind else {
+            return None;
+        };
+        if !model_has_awq_quantize_decorator(decorators, interner) {
+            return None;
+        }
+        let model_name = interner.resolve(model_def.name.0).unwrap_or("").to_string();
+        if model_name.is_empty() {
+            None
+        } else {
+            Some(model_name)
+        }
+    })
+}
+
+pub fn ast_has_awq_quantize_decorator(ast: &nsl_ast::Module, interner: &Interner) -> bool {
+    first_awq_quantized_model_name(ast, interner).is_some()
+}
+
+pub fn check_discovery_agreement(
+    pre_scan: &[DiscoveredProjection],
+    in_compile: &[DiscoveredProjection],
+) -> Result<(), DiscoveryError> {
+    if pre_scan == in_compile {
+        return Ok(());
+    }
+
+    Err(DiscoveryError::Divergence {
+        pre_scan_names: pre_scan.iter().map(|p| p.projection.0.clone()).collect(),
+        in_compile_names: in_compile.iter().map(|p| p.projection.0.clone()).collect(),
+    })
+}
+
 // ── public API ────────────────────────────────────────────────────────────────
 
 /// Walk `model_def`'s `forward` method body, collecting linear-projection sites,
@@ -269,7 +490,9 @@ pub fn discover_awq_projections(
         if is_builtin_fn(&field_name) {
             continue; // skip activation functions
         }
-        if !model_field_types.contains_key(&field_name) {
+        if !model_field_types.contains_key(&field_name)
+            && !tensor_shapes.contains_key(&field_name)
+        {
             let qualified = format!("{}.{}", model_name, field_name);
             return Err(DiscoveryError::NonStaticWeight { path: qualified });
         }
@@ -310,8 +533,7 @@ pub fn discover_awq_projections(
         });
     }
 
-    // 9. Sort for determinism.
-    matched.sort_by(|a, b| a.projection.0.cmp(&b.projection.0));
+    dedup_preserving_first_seen(&mut matched);
 
     Ok(matched)
 }
@@ -363,7 +585,9 @@ pub fn discover_awq_projections_from_state(
         if is_builtin_fn(&field_name) {
             continue;
         }
-        if !model_field_types.contains_key(&field_name) {
+        if !model_field_types.contains_key(&field_name)
+            && !tensor_shapes.contains_key(&field_name)
+        {
             let qualified = format!("{}.{}", model_name, field_name);
             return Err(DiscoveryError::NonStaticWeight { path: qualified });
         }
@@ -403,7 +627,7 @@ pub fn discover_awq_projections_from_state(
         });
     }
 
-    matched.sort_by(|a, b| a.projection.0.cmp(&b.projection.0));
+    dedup_preserving_first_seen(&mut matched);
 
     Ok(matched)
 }
@@ -419,6 +643,111 @@ mod tests {
     use nsl_ast::stmt::{Block, Stmt, StmtKind};
     use nsl_ast::{NodeId, Span};
     use nsl_lexer::Interner;
+
+    fn repo_fixture(name: &str) -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("tests")
+            .join("fixtures")
+            .join(name)
+    }
+
+    fn parse_module(source: &str) -> (nsl_ast::Module, Interner) {
+        let mut interner = Interner::new();
+        let (tokens, lex_diags) =
+            nsl_lexer::tokenize(source, nsl_errors::FileId(0), &mut interner);
+        assert!(
+            lex_diags
+                .iter()
+                .all(|d| !matches!(d.level, nsl_errors::Level::Error)),
+            "fixture must lex cleanly: {lex_diags:?}"
+        );
+        let parsed = nsl_parser::parse(&tokens, &mut interner);
+        assert!(
+            parsed
+                .diagnostics
+                .iter()
+                .all(|d| !matches!(d.level, nsl_errors::Level::Error)),
+            "fixture must parse cleanly: {:?}",
+            parsed.diagnostics
+        );
+        (parsed.module, interner)
+    }
+
+    #[test]
+    fn pre_scan_finds_both_projections_in_tinymlp_fixture() {
+        let source = std::fs::read_to_string(repo_fixture("awq_calibration_mlp.nsl"))
+            .expect("fixture readable");
+        let (ast, interner) = parse_module(&source);
+        let discovered = pre_scan_awq_projections_from_ast(&ast, &interner);
+
+        assert_eq!(discovered.len(), 2, "TinyMLP has up_proj + down_proj");
+        assert!(discovered.iter().any(|d| d.projection.0 == "TinyMLP.up_proj"));
+        assert!(discovered.iter().any(|d| d.projection.0 == "TinyMLP.down_proj"));
+
+        let up = discovered
+            .iter()
+            .find(|d| d.projection.0 == "TinyMLP.up_proj")
+            .expect("up projection present");
+        assert_eq!(up.weight_shape, [128, 64]);
+
+        let down = discovered
+            .iter()
+            .find(|d| d.projection.0 == "TinyMLP.down_proj")
+            .expect("down projection present");
+        assert_eq!(down.weight_shape, [64, 128]);
+    }
+
+    #[test]
+    fn pre_scan_returns_empty_when_no_quantize_decorator() {
+        let source = "fn main():\n    return 0\n";
+        let (ast, interner) = parse_module(source);
+        let discovered = pre_scan_awq_projections_from_ast(&ast, &interner);
+        assert!(discovered.is_empty());
+    }
+
+    #[test]
+    fn pre_scan_preserves_forward_projection_order() {
+        let source = std::fs::read_to_string(repo_fixture("awq_calibration_mlp.nsl"))
+            .expect("fixture readable");
+        let (ast, interner) = parse_module(&source);
+        let discovered = pre_scan_awq_projections_from_ast(&ast, &interner);
+        let names: Vec<_> = discovered.iter().map(|d| d.projection.0.as_str()).collect();
+
+        assert_eq!(
+            names,
+            vec!["TinyMLP.up_proj", "TinyMLP.down_proj"],
+            "discovery order should follow the forward pipe, not alphabetical sorting"
+        );
+    }
+
+    #[test]
+    fn check_discovery_agreement_reports_divergence() {
+        let pre_scan = vec![
+            DiscoveredProjection {
+                projection: ProjectionRef("TinyMLP.up_proj".into()),
+                weight_shape: [128, 64],
+            },
+            DiscoveredProjection {
+                projection: ProjectionRef("TinyMLP.down_proj".into()),
+                weight_shape: [64, 128],
+            },
+        ];
+        let in_compile = vec![DiscoveredProjection {
+            projection: ProjectionRef("TinyMLP.up_proj".into()),
+            weight_shape: [128, 64],
+        }];
+
+        let err = check_discovery_agreement(&pre_scan, &in_compile)
+            .expect_err("mismatched discovery sets must refuse");
+        let msg = err.to_string();
+
+        assert!(msg.contains("calibration: discovery divergence"));
+        assert!(msg.contains("pre-scan:"));
+        assert!(msg.contains("in-compile:"));
+        assert!(msg.contains("TinyMLP.down_proj"));
+    }
 
     // ── fixture helpers ───────────────────────────────────────────────────
 

@@ -859,12 +859,31 @@ pub extern "C" fn nsl_awq_write_sidecar(
         by_projection.insert(name, values);
     }
 
+    let mut blob = Vec::new();
+    blob.extend_from_slice(&AWQ_SIDECAR_VERSION.to_le_bytes());
+    blob.extend_from_slice(&(by_projection.len() as u32).to_le_bytes());
+    for (name, scales) in &by_projection {
+        let name_bytes = name.as_bytes();
+        blob.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
+        blob.extend_from_slice(name_bytes);
+        blob.extend_from_slice(&(scales.len() as u32).to_le_bytes());
+        for scale in scales {
+            blob.extend_from_slice(&scale.to_le_bytes());
+        }
+    }
+
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    let awq_blob_b64 = STANDARD.encode(blob);
+
     let json = serde_json::json!({
         "version": 2,
+        "checkpoint_sha256": "",
+        "calibration_data_sha256": "",
+        "hook_set_sha256": "",
+        "cache_key_digest": "",
+        "num_samples_used": 0,
         "hooks": {
-            "awq_activation_scales": {
-                "by_projection": by_projection,
-            },
+            "awq_activation_scales": awq_blob_b64,
         },
     });
 
@@ -916,11 +935,9 @@ mod write_sidecar_tests {
         );
         assert_eq!(rc, 0);
 
-        let raw = std::fs::read(tmp.path()).unwrap();
-        let v: serde_json::Value = serde_json::from_slice(&raw).unwrap();
-        let scales = &v["hooks"]["awq_activation_scales"];
-        assert_eq!(scales["by_projection"]["TinyMLP.up_proj"].as_array().unwrap().len(), 64);
-        assert_eq!(scales["by_projection"]["TinyMLP.down_proj"].as_array().unwrap().len(), 128);
+        let scales = AwqScales::from_sidecar_json_path(tmp.path()).unwrap();
+        assert_eq!(scales.by_projection["TinyMLP.up_proj"].len(), 64);
+        assert_eq!(scales.by_projection["TinyMLP.down_proj"].len(), 128);
     }
 
     #[test]
