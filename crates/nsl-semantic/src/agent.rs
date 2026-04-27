@@ -829,15 +829,15 @@ fn transfer_size_note(ann: &nsl_ast::types::TypeExpr, interner: &Interner) -> St
                 interner.resolve(sym.0).unwrap_or("?").to_string()
             }
             nsl_ast::types::DimExpr::Named { name, value } => {
-                all_concrete = false;
                 let n = interner.resolve(name.0).unwrap_or("?");
                 match value {
                     nsl_ast::types::DimValue::Int(v) => {
                         elements *= v;
-                        all_concrete = true; // revert flag for this dim
                         format!("{}={}", n, v)
                     }
                     nsl_ast::types::DimValue::String(s) => {
+                        // Named dim with a string label (e.g. heads="H") is symbolic.
+                        all_concrete = false;
                         format!("{}=\"{}\"", n, s)
                     }
                 }
@@ -896,15 +896,6 @@ fn find_pipeline_fn_def(module: &Module, pipeline_fn_sym: Symbol) -> Option<&FnD
         }
     }
     None
-}
-
-/// Find the `FnDef` for a specific agent method by agent and method symbols.
-fn find_agent_method_fn_def_for_device(
-    module: &Module,
-    agent_sym: Symbol,
-    method_sym: Symbol,
-) -> Option<&FnDef> {
-    find_agent_method_fn_def(module, agent_sym, method_sym)
 }
 
 /// M56 spec §1.6, §6.4, §6.5 — device compatibility check on APG edges.
@@ -972,7 +963,7 @@ pub fn check_device_compatibility(
                 ..
             } => {
                 // Source device: from the source agent method's return type.
-                let src_device = find_agent_method_fn_def_for_device(
+                let src_device = find_agent_method_fn_def(
                     module,
                     *src_agent,
                     *src_method,
@@ -1020,7 +1011,7 @@ fn check_edge_devices(
     diagnostics: &mut Vec<Diagnostic>,
 ) {
     // Look up target parameter type annotation.
-    let target_fn = match find_agent_method_fn_def_for_device(module, target_agent, target_method) {
+    let target_fn = match find_agent_method_fn_def(module, target_agent, target_method) {
         Some(fd) => fd,
         None => return,
     };
