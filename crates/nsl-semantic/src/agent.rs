@@ -534,11 +534,7 @@ pub fn check_linear_types_flag(
              expected:  the linear ownership checker (--linear-types) active\n\
              found:     --linear-types not passed to the compiler\n\
              \n\
-             fix: add --linear-types to `nsl check` or `nsl build`.\n\
-             \n\
-             `nsl run` does not currently expose --linear-types;\n\
-             for run, use `nsl build` and execute the produced binary.\n\
-             (Tracked: Task 20 of this plan closes that gap.)",
+             fix: add --linear-types to `nsl check`, `nsl build`, or `nsl run`.",
         )
         .with_label(first_span, "agent declared here"),
     );
