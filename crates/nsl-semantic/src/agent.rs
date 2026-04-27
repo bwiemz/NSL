@@ -1218,6 +1218,83 @@ fn check_target_for_cross_agent(
     );
 }
 
+/// M56 spec §1.4, §6.6 — fan-out of linear content rejected.
+///
+/// Counts how many `BindingToAgent` edges in the APG reference each binding
+/// symbol. For any binding used more than once, emit E0609 with
+/// intent-distinguishing fix guidance: (a) for sharing the same content,
+/// (b) for routing different fields to different consumers.
+///
+/// v1 simplification: treats every binding as linear. When @shared
+/// ownership tracking is integrated (Tasks 17+ / Task 12 type-checker
+/// integration), this check should consult per-binding ownership and
+/// suppress E0609 for @shared bindings.
+///
+/// TODO(task 12): consult type-checker @shared annotation per binding before
+/// emitting E0609; @shared bindings must be allowed to fan-out.
+pub fn check_fan_out(
+    apg: &ActionPortGraph,
+    interner: &Interner,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    use std::collections::HashMap;
+
+    // (target_agent, target_method, span) for each use of a binding.
+    type ConsumerEntry = (Symbol, Symbol, nsl_errors::Span);
+
+    // Map binding symbol → list of consumer entries.
+    let mut uses: HashMap<Symbol, Vec<ConsumerEntry>> = HashMap::new();
+    for edge in &apg.edges {
+        if let ApgEdge::BindingToAgent { binding, target_agent, target_method, span, .. } = edge {
+            uses.entry(*binding).or_default().push((*target_agent, *target_method, *span));
+        }
+    }
+
+    // Sort the bindings deterministically so test output / diagnostic order
+    // is stable across runs (HashMap iteration is non-deterministic).
+    let mut multi_use: Vec<(Symbol, Vec<ConsumerEntry>)> =
+        uses.into_iter().filter(|(_, v)| v.len() > 1).collect();
+    multi_use.sort_by_key(|(s, _)| s.0);
+
+    for (binding, consumers) in multi_use {
+        let binding_name = interner.resolve(binding.0).unwrap_or("?").to_string();
+        // Build a comma-separated consumer list for the `found:` line.
+        let consumer_strs: Vec<String> = consumers.iter().map(|(a, m, _)| {
+            let aname = interner.resolve(a.0).unwrap_or("?");
+            let mname = interner.resolve(m.0).unwrap_or("?");
+            format!("{}.{}", aname.to_lowercase(), mname)
+        }).collect();
+        let consumer_list = consumer_strs.join(" and ");
+
+        // Use the FIRST consumer's span as the primary label location.
+        let primary_span = consumers[0].2;
+
+        diagnostics.push(
+            Diagnostic::error(format!(
+                "E0609: cannot fan out linear content — use after move\n\
+                 \n\
+                 requested: two or more downstream consumers of a linear binding\n\
+                 expected:  exactly one consumer per linear binding, OR @shared\n\
+                            on the fanned-out content\n\
+                 found:     `{}` consumed by {}\n\
+                 \n\
+                 fix: choose based on intent:\n\
+                      (a) both consumers need the *same* data → make the struct's\n\
+                          tensor fields @shared, or explicitly clone:\n\
+                          `logger.log({}.clone())`.\n\
+                      (b) consumers need *different parts* of the struct →\n\
+                          destructure at the binding:\n\
+                          `let (tokens, meta) = drafter.draft(prompt);`\n\
+                          then route each field to its one consumer\n\
+                          (destructure-and-forward, per Section 1.4 — this is\n\
+                          NOT fan-out).",
+                binding_name, consumer_list, binding_name,
+            ))
+            .with_label(primary_span, "fan-out occurs here")
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1572,5 +1649,74 @@ fn pipe(text: str) -> Tensor<[1, 8], f32, cuda>:\n    let t = tok.tokenize(text)
             || d.message.to_lowercase().contains("inserted device transfer")),
             "expected a transfer-insertion note; got: {:?}",
             diags.iter().map(|d| &d.message).collect::<Vec<_>>());
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 11 — E0609 fan-out detection
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn fan_out_of_linear_struct_refused_with_intent_guidance() {
+        let src = "\
+agent Drafter:\n    fn draft(self, p: Tensor) -> Tensor:\n        return p\n\
+agent Reviewer:\n    fn review(self, d: Tensor) -> Tensor:\n        return d\n\
+agent Logger:\n    fn log(self, d: Tensor) -> Tensor:\n        return d\n\
+@pipeline_agent(agents=[Drafter, Reviewer, Logger])\n\
+fn p(prompt: Tensor) -> Tensor:\n    let draft = drafter.draft(prompt)\n    let _ = reviewer.review(draft)\n    return logger.log(draft)\n";
+        let mut interner = nsl_lexer::Interner::new();
+        let (tokens, _) = nsl_lexer::tokenize(src, nsl_errors::FileId(0), &mut interner);
+        let parse_result = nsl_parser::parse(&tokens, &mut interner);
+        assert!(parse_result.diagnostics.is_empty(), "parse: {:?}", parse_result.diagnostics);
+
+        let mut registry = AgentRegistry::new();
+        registry.register_module(&parse_result.module, &interner);
+
+        let mut apgs = Vec::new();
+        let mut diags = Vec::new();
+        extract_apgs(&parse_result.module, &registry, &interner, &mut apgs, &mut diags);
+
+        let mut e0609_diags = Vec::new();
+        for apg in &apgs {
+            check_fan_out(apg, &interner, &mut e0609_diags);
+        }
+
+        let e0609 = e0609_diags.iter().find(|d| d.message.contains("E0609"))
+            .expect("expected E0609 fan-out error");
+
+        // The error message must distinguish the two intent cases:
+        assert!(e0609.message.contains("(a)") && e0609.message.contains("(b)"),
+            "E0609 should enumerate fix options (a) and (b); got: {}",
+            e0609.message);
+        assert!(e0609.message.contains("@shared") || e0609.message.contains("clone"),
+            "(a) fix should mention @shared or clone; got: {}", e0609.message);
+        assert!(e0609.message.contains("destructure") || e0609.message.contains("destructur"),
+            "(b) fix should mention destructure; got: {}", e0609.message);
+    }
+
+    #[test]
+    fn no_fan_out_for_single_use_binding() {
+        let src = "\
+agent Drafter:\n    fn draft(self, p: Tensor) -> Tensor:\n        return p\n\
+agent Reviewer:\n    fn review(self, d: Tensor) -> Tensor:\n        return d\n\
+@pipeline_agent(agents=[Drafter, Reviewer])\n\
+fn p(prompt: Tensor) -> Tensor:\n    let draft = drafter.draft(prompt)\n    return reviewer.review(draft)\n";
+        let mut interner = nsl_lexer::Interner::new();
+        let (tokens, _) = nsl_lexer::tokenize(src, nsl_errors::FileId(0), &mut interner);
+        let parse_result = nsl_parser::parse(&tokens, &mut interner);
+        let mut registry = AgentRegistry::new();
+        registry.register_module(&parse_result.module, &interner);
+
+        let mut apgs = Vec::new();
+        let mut diags = Vec::new();
+        extract_apgs(&parse_result.module, &registry, &interner, &mut apgs, &mut diags);
+
+        let mut e0609_diags = Vec::new();
+        for apg in &apgs {
+            check_fan_out(apg, &interner, &mut e0609_diags);
+        }
+
+        assert!(!e0609_diags.iter().any(|d| d.message.contains("E0609")),
+            "single-use binding should not produce E0609; got: {:?}",
+            e0609_diags.iter().map(|d| &d.message).collect::<Vec<_>>());
     }
 }
