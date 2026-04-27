@@ -65,7 +65,7 @@ fn m56_device_transfer_opt_in_compiles_clean() {
         "@auto_device_transfer should suppress E0608; stderr:\n{}",
         stderr
     );
-    // Note: v1 may emit a warning-level device-transfer note — that is acceptable.
+    // Note: v1 may emit an info-level device-transfer note — that is acceptable.
     // We don't assert its presence here; Task 10's unit tests cover the note emission.
 }
 
@@ -126,6 +126,18 @@ fn m56_serve_pool_parses_clean_v2_pending() {
         "nsl check panicked on m56_serve_pool (exit 101); stderr:\n{}",
         stderr
     );
+}
+
+/// Three-agent speculative decoding pipeline — spec §1.4 motivating example.
+/// Must compile clean with no M56 error codes.
+#[test]
+fn m56_speculative_decoding_compiles_clean() {
+    let out = run_check("m56_speculative_decoding");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // Three-agent linear pipeline — no E060x codes should fire.
+    assert!(!stderr.contains("E060") && !stderr.contains("E0610"),
+        "expected clean check for speculative decoding pipeline; stderr:\n{}",
+        stderr);
 }
 
 /// @shared embedding table — v2-pending runtime, but semantic check (Task 8)

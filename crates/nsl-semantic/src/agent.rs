@@ -901,8 +901,8 @@ fn find_pipeline_fn_def(module: &Module, pipeline_fn_sym: Symbol) -> Option<&FnD
 /// - E0607 (cross-GPU) when both sides are CUDA with different IDs (M30 deferred).
 /// - E0608 (cross-device, no opt-in) when devices differ and the target
 ///   method lacks `@auto_device_transfer`.
-/// - A WARNING-level diagnostic (no `note` severity exists) with computed
-///   transfer size when the target method opts in via `@auto_device_transfer`.
+/// - An INFO-level diagnostic (note severity, via `Diagnostic::info()`) with
+///   computed transfer size when the target method opts in via `@auto_device_transfer`.
 ///
 /// v1 source: device is read directly from the AST's parameter type annotations
 /// (`TypeExpr` walking). If the device is unspecified syntactically, the check
@@ -1074,7 +1074,7 @@ fn check_edge_devices(
     if has_auto_transfer {
         let size_note = transfer_size_note(target_ann, interner);
         diagnostics.push(
-            Diagnostic::warning(format!(
+            Diagnostic::info(format!(
                 "note: inserted device transfer at call site `{}.{}(...)`\n\
                  source device: {}  destination device: {}\n\
                  size: {}\n\
@@ -1612,7 +1612,7 @@ fn pipe(text: str) -> Tensor<[1, 8], f32, cuda>:\n    let t = tok.tokenize(text)
     }
 
     /// Auto-transfer note: same fixture but Mdl.forward is @auto_device_transfer.
-    /// Should emit a warning-level note about inserted transfer, NOT E0608.
+    /// Should emit an info-level note about inserted transfer, NOT E0608.
     #[test]
     fn cpu_to_gpu_auto_transfer_inserts_diagnostic() {
         let src = "\
@@ -1640,7 +1640,7 @@ fn pipe(text: str) -> Tensor<[1, 8], f32, cuda>:\n    let t = tok.tokenize(text)
         assert!(!diags.iter().any(|d| d.message.contains("E0608")),
             "@auto_device_transfer should suppress E0608; got: {:?}",
             diags.iter().map(|d| &d.message).collect::<Vec<_>>());
-        // A warning-level note about device transfer should appear.
+        // An info-level note about device transfer should appear.
         assert!(diags.iter().any(|d| d.message.to_lowercase().contains("device transfer")
             || d.message.to_lowercase().contains("inserted device transfer")),
             "expected a transfer-insertion note; got: {:?}",
