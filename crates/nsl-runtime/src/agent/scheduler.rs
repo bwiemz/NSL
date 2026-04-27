@@ -23,9 +23,11 @@ type MailboxKey = (AgentId, String);
 /// One mailbox per `(agent_id, port_name)` pair.
 pub type MailboxMap = HashMap<MailboxKey, PortMailbox>;
 
-/// Borrowed view passed to each agent's fire closure. Provides safe
-/// `read_in` / `write_out` operations that route through the scheduler's
-/// mailbox map. The closure does NOT see other agents' mailboxes.
+/// Borrowed view passed to each agent's fire closure. The closure should
+/// read/write only its own ports via `read_in`/`write_out`; the raw
+/// `mailboxes` field is exposed because v2 extension points (e.g., the
+/// reactor scheduler's lock-free dispatch) may need direct access. v1
+/// closures are author-trusted not to reach into other agents' mailboxes.
 pub struct AgentPorts<'a> {
     pub mailboxes: &'a mut MailboxMap,
     pub agent_id: AgentId,
@@ -107,6 +109,8 @@ impl ReactorScheduler {
         }
 
         // Propagate outputs along connections.
+        // v2-revisit: per-step clone of connections avoids a double-borrow of `self`;
+        // acceptable for v1 small pipeline graphs (<20 agents).
         let connections = self.connections.clone();
         for (src, dst) in connections {
             // Move the slot from src to dst, preserving the stamped time.
