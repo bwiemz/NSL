@@ -760,6 +760,7 @@ fn run_with_saves(
     causal: bool, rope_q: bool,
     seq_override: Option<usize>,
     saves: Option<CshaBackwardActivations>,
+    segment_ids: Option<&[u16]>,
 ) -> Result<(Vec<u16>, Vec<f32>), String> {
     let batch = 1usize;
     let heads_u = heads as usize;
@@ -768,12 +769,16 @@ fn run_with_saves(
     let dm = hd;
     let norm_eps = 1e-5f32;
     let scale = 1.0f32 / (hd as f32).sqrt();
+    let segment_masked = segment_ids.is_some();
+    if let Some(ids) = segment_ids {
+        assert_eq!(ids.len(), seq, "segment_ids must be of length seq");
+    }
 
     let config = FlashAttentionConfig {
         block_q: block_q as i64, block_kv: block_kv as i64, head_dim: hd as i64,
         causal, paged: false, rope_q,
         rope_style: RopeStyle::HalfSplit,
-        gqa_group_size: 1, tree_mask: false, gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras {
+        gqa_group_size: 1, tree_mask: false, gpu_sm: 75, segment_masked, csha: Some(CshaExtras {
             level: 2,
             fused_rmsnorm: true,
             fused_projections: true,
@@ -819,7 +824,18 @@ fn run_with_saves(
     let wk_dev = unsafe { nsl_test_cuda_alloc(w_bytes) };
     let wv_dev = unsafe { nsl_test_cuda_alloc(w_bytes) };
     let nw_dev = unsafe { nsl_test_cuda_alloc(nw_bytes) };
-    let all_ptrs = [q_dev, k_dev, v_dev, out_dev, lse_dev, x_dev, wq_dev, wk_dev, wv_dev, nw_dev];
+    let seg_ids_dev: i64 = if let Some(ids) = segment_ids {
+        let seg_bytes = (ids.len() * std::mem::size_of::<u16>()) as i64;
+        let ptr = unsafe { nsl_test_cuda_alloc(seg_bytes) };
+        unsafe { nsl_test_cuda_h2d(ptr, ids.as_ptr() as i64, seg_bytes); }
+        ptr
+    } else {
+        0i64
+    };
+    // seg_ids_dev is included in all_ptrs only when non-zero — free_all skips
+    // zeros via its own check, but allocating 11 elements unconditionally
+    // keeps the array shape stable.
+    let all_ptrs = [q_dev, k_dev, v_dev, out_dev, lse_dev, x_dev, wq_dev, wk_dev, wv_dev, nw_dev, seg_ids_dev];
 
     unsafe {
         nsl_test_cuda_h2d(x_dev,  x.as_ptr()  as i64, x_bytes);
@@ -855,7 +871,7 @@ fn run_with_saves(
             0, norm_eps.to_bits() as i64,
             heads as i64, dm as i64,
             qp, kp, vp, rmx, rsm, xr,
-            0,
+            seg_ids_dev,
         )
     };
     if rc != 0 {
@@ -891,7 +907,7 @@ fn t1_forward_output_invariant_under_save_activations_flag() {
     let seq = block_q.max(block_kv) as i64;
 
     let (out_no_save, lse_no_save) =
-        run_with_saves(block_q, block_kv, head_dim, heads, false, false, None, None)
+        run_with_saves(block_q, block_kv, head_dim, heads, false, false, None, None, None)
             .expect("launch (save=None) failed");
 
     let saves = unsafe {
@@ -900,7 +916,7 @@ fn t1_forward_output_invariant_under_save_activations_flag() {
     assert_ne!(saves.q_proj, 0, "activation alloc failed");
 
     let (out_save, lse_save) = run_with_saves(
-        block_q, block_kv, head_dim, heads, false, false, None, Some(saves),
+        block_q, block_kv, head_dim, heads, false, false, None, Some(saves), None,
     )
     .expect("launch (save=Some) failed");
 
@@ -931,7 +947,7 @@ fn t1_forward_output_invariant_under_save_activations_flag_multitile() {
     let seq = 128usize;
 
     let (out_no_save, lse_no_save) =
-        run_with_saves(block_q, block_kv, head_dim, heads, false, false, Some(seq), None)
+        run_with_saves(block_q, block_kv, head_dim, heads, false, false, Some(seq), None, None)
             .expect("launch (save=None) failed");
 
     let saves = unsafe {
@@ -940,7 +956,7 @@ fn t1_forward_output_invariant_under_save_activations_flag_multitile() {
     assert_ne!(saves.q_proj, 0, "activation alloc failed");
 
     let (out_save, lse_save) = run_with_saves(
-        block_q, block_kv, head_dim, heads, false, false, Some(seq), Some(saves),
+        block_q, block_kv, head_dim, heads, false, false, Some(seq), Some(saves), None,
     )
     .expect("launch (save=Some) failed");
 
@@ -968,7 +984,7 @@ fn t1_forward_output_invariant_under_save_activations_flag_multitile_causal() {
     let seq = 128usize;
 
     let (out_no_save, lse_no_save) = run_with_saves(
-        block_q, block_kv, head_dim, heads, true, false, Some(seq), None,
+        block_q, block_kv, head_dim, heads, true, false, Some(seq), None, None,
     )
     .expect("launch (save=None) failed");
 
@@ -978,7 +994,7 @@ fn t1_forward_output_invariant_under_save_activations_flag_multitile_causal() {
     assert_ne!(saves.q_proj, 0, "activation alloc failed");
 
     let (out_save, lse_save) = run_with_saves(
-        block_q, block_kv, head_dim, heads, true, false, Some(seq), Some(saves),
+        block_q, block_kv, head_dim, heads, true, false, Some(seq), Some(saves), None,
     )
     .expect("launch (save=Some) failed");
 
@@ -993,6 +1009,106 @@ fn t1_forward_output_invariant_under_save_activations_flag_multitile_causal() {
         .zip(&lse_save)
         .all(|(&a, &b)| a.to_bits() == b.to_bits());
     assert!(lse_bits_eq, "T1.4 multitile causal invariant broken: LSE diverged");
+}
+
+/// T1.4-multitile-segmented (PCA caveat closure): the save-enabled fused
+/// path must preserve forward O/LSE under `segment_masked=true` for multi-tile
+/// configs. Combined with `pca_tier_a_forward_correctness::tier_a_forward_*`
+/// (which validates the no-saves path against a CPU/unpacked-padded reference
+/// for the same fixtures), bit-equality here transitively closes the
+/// "save-enabled forward × multitile × segmented" correctness gap that
+/// `claude_pca_backward_handoff.md` flagged as out of scope.
+///
+/// Two-equal-segments fixture: seq=128 = [seg0]×64 + [seg1]×64.
+#[test]
+#[ignore]
+fn t1_forward_output_invariant_under_save_activations_flag_multitile_segmented_two_equal() {
+    if !cuda_available() {
+        eprintln!("[T1.4-multitile-segmented-2eq] skipping — no CUDA");
+        return;
+    }
+    let (block_q, block_kv, head_dim, heads) = (32u32, 32, 32, 4);
+    let seq = 128usize;
+    let mut seg_ids = vec![0u16; seq];
+    for s in seg_ids.iter_mut().take(seq).skip(64) { *s = 1; }
+
+    let (out_no_save, lse_no_save) = run_with_saves(
+        block_q, block_kv, head_dim, heads, false, false, Some(seq), None, Some(&seg_ids),
+    )
+    .expect("launch (save=None, segmented) failed");
+
+    let saves = unsafe {
+        nsl_csha_alloc_backward_activations(1, heads as i64, seq as i64, head_dim as i64)
+    };
+    assert_ne!(saves.q_proj, 0, "activation alloc failed");
+
+    let (out_save, lse_save) = run_with_saves(
+        block_q, block_kv, head_dim, heads, false, false, Some(seq), Some(saves), Some(&seg_ids),
+    )
+    .expect("launch (save=Some, segmented) failed");
+
+    unsafe { nsl_csha_free_backward_activations(saves); }
+
+    assert_eq!(
+        out_no_save, out_save,
+        "T1.4 multitile segmented (2-equal) invariant broken: forward O diverged between save-null and save-active"
+    );
+    let lse_bits_eq = lse_no_save
+        .iter()
+        .zip(&lse_save)
+        .all(|(&a, &b)| a.to_bits() == b.to_bits());
+    assert!(
+        lse_bits_eq,
+        "T1.4 multitile segmented (2-equal) invariant broken: LSE diverged"
+    );
+}
+
+/// Three-unequal-segments fixture: seq=128 = 38 + 64 + 26 (matches
+/// `pca_tier_a_forward_correctness::tier_a_forward_unequal_segments_matches_unpacked_reference`
+/// and `pca_tier_a_backward_correctness` Fixture 3 packing).
+#[test]
+#[ignore]
+fn t1_forward_output_invariant_under_save_activations_flag_multitile_segmented_three_unequal() {
+    if !cuda_available() {
+        eprintln!("[T1.4-multitile-segmented-3uneq] skipping — no CUDA");
+        return;
+    }
+    let (block_q, block_kv, head_dim, heads) = (32u32, 32, 32, 4);
+    let seq = 128usize;
+    let mut seg_ids = vec![0u16; seq];
+    for (i, s) in seg_ids.iter_mut().enumerate() {
+        *s = if i < 38 { 0 } else if i < 38 + 64 { 1 } else { 2 };
+    }
+
+    let (out_no_save, lse_no_save) = run_with_saves(
+        block_q, block_kv, head_dim, heads, false, false, Some(seq), None, Some(&seg_ids),
+    )
+    .expect("launch (save=None, segmented) failed");
+
+    let saves = unsafe {
+        nsl_csha_alloc_backward_activations(1, heads as i64, seq as i64, head_dim as i64)
+    };
+    assert_ne!(saves.q_proj, 0, "activation alloc failed");
+
+    let (out_save, lse_save) = run_with_saves(
+        block_q, block_kv, head_dim, heads, false, false, Some(seq), Some(saves), Some(&seg_ids),
+    )
+    .expect("launch (save=Some, segmented) failed");
+
+    unsafe { nsl_csha_free_backward_activations(saves); }
+
+    assert_eq!(
+        out_no_save, out_save,
+        "T1.4 multitile segmented (3-unequal) invariant broken: forward O diverged between save-null and save-active"
+    );
+    let lse_bits_eq = lse_no_save
+        .iter()
+        .zip(&lse_save)
+        .all(|(&a, &b)| a.to_bits() == b.to_bits());
+    assert!(
+        lse_bits_eq,
+        "T1.4 multitile segmented (3-unequal) invariant broken: LSE diverged"
+    );
 }
 
 // --------------------------------------------------------------------------
