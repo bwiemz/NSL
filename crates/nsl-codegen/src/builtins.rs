@@ -2065,6 +2065,15 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_unikernel_gpu_init", &[types::I64], Some(types::I64)),
     ("nsl_unikernel_gpu_ready", &[], Some(types::I64)),
     ("nsl_unikernel_gpu_device_id", &[], Some(types::I64)),
+    // --- M56 v1 agent runtime FFI (Task 16). Signatures from spec §3.4. ---
+    // All raw pointers are I64 per the workspace convention; time: u64 is also I64.
+    ("nsl_agent_pool_new", &[types::I64, types::I64], Some(types::I64)),
+    ("nsl_agent_pool_destroy", &[types::I64], None),
+    ("nsl_agent_pool_acquire", &[types::I64, types::I64], Some(types::I64)),
+    ("nsl_agent_pool_release", &[types::I64, types::I64], None),
+    ("nsl_agent_scheduler_step", &[types::I64], Some(types::I32)),
+    ("nsl_agent_mailbox_write", &[types::I64, types::I64, types::I64], Some(types::I32)),
+    ("nsl_agent_mailbox_read", &[types::I64], Some(types::I64)),
 ];
 
 /// Declare all runtime functions as imports in the module.

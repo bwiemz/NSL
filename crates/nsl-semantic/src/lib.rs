@@ -1,3 +1,4 @@
+pub mod agent;
 pub mod builtins;
 pub mod cep;
 pub mod cfie;
@@ -99,6 +100,8 @@ pub fn analyze_with_imports(
     // Phase 2: Run the type checker with import context
     let mut checker = TypeChecker::new(interner, &mut scopes);
     checker.set_import_types(import_types);
+    // M56: thread the flag so E0610 can fire during collect_top_level_decls.
+    checker.linear_types_enabled = linear_types;
     checker.check_module(module);
 
     // M51: Effect analysis is now integrated into TypeChecker — propagation
@@ -126,6 +129,53 @@ pub fn analyze_with_imports(
         );
         diagnostics.extend(ownership_diags);
         ownership_info = info;
+    }
+
+    // M56 Task 12: agent analysis pipeline.
+    // Order: registry → APG extraction → cycle detection → device compat
+    // → cross-agent access → cross-agent mutation → fan-out.
+    //
+    // The E0610 flag gate already ran inside TypeChecker::check_module above;
+    // we do NOT re-run it here. We still run the rest of the pipeline
+    // unconditionally so the user sees ALL agent-related errors in one
+    // compile pass, not just the flag-gate complaint.
+    {
+        let mut agent_registry = crate::agent::AgentRegistry::new();
+        agent_registry.register_module(module, interner);
+
+        let mut apgs = Vec::new();
+        crate::agent::extract_apgs(
+            module,
+            &agent_registry,
+            interner,
+            &mut apgs,
+            &mut diagnostics,
+        );
+
+        for apg in &apgs {
+            crate::agent::detect_cycles(apg, interner, &mut diagnostics);
+            crate::agent::check_device_compatibility(
+                apg,
+                module,
+                &agent_registry,
+                interner,
+                &mut diagnostics,
+            );
+            crate::agent::check_fan_out(apg, interner, &mut diagnostics);
+        }
+
+        crate::agent::check_cross_agent_field_access(
+            module,
+            &agent_registry,
+            interner,
+            &mut diagnostics,
+        );
+        crate::agent::check_cross_agent_mutation(
+            module,
+            &agent_registry,
+            interner,
+            &mut diagnostics,
+        );
     }
 
     AnalysisResult {

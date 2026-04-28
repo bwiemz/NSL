@@ -1,0 +1,13 @@
+# M56 v1 negative example: cross-agent exclusive field access.
+# Reviewer reads Drafter.kv_cache directly — must produce E0601.
+# Task 8 owns this check (check_cross_agent_field_access).
+# Self-access (Drafter.draft reading self.kv_cache) is exempt from E0601.
+
+agent Drafter:
+    kv_cache: i64 = 0
+    fn draft(self) -> i64:
+        return self.kv_cache
+
+agent Reviewer:
+    fn review(self, drafter: Drafter) -> i64:
+        return drafter.kv_cache

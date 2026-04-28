@@ -110,8 +110,23 @@ impl Compiler<'_> {
                     args,
                 );
             }
-            // Fallback for model array loop variables (type is Unknown but var was bound from model array)
-            if matches!(obj_type, Type::Unknown) {
+            // M56 Task 17: agent method calls — `agent_var.method(args)`.
+            // Spec §4.1: mangling is `__nsl_agent_{AgentName}_{MethodName}`.
+            if let Type::Agent { name, .. } = &obj_type {
+                let agent_name = self.resolve_sym(*name).to_string();
+                let mangled = format!("__nsl_agent_{}_{}", agent_name, member_name);
+                let self_val = self.compile_expr(builder, state, object)?;
+                let mut arg_vals = vec![self_val];
+                for arg in args {
+                    arg_vals.push(self.compile_expr(builder, state, &arg.value)?);
+                }
+                return self.compile_call_by_name(builder, &mangled, &arg_vals);
+            }
+            // Fallback for model array loop variables (type is Unknown but var was bound from model array).
+            // M56 Task 18: also handles `Type::Error` (semantic pass assigns Error to undefined
+            // bindings like `drafter` in @pipeline_agent fn bodies where type checking doesn't
+            // know about the synthesised agent vars — they are wired at codegen time).
+            if matches!(obj_type, Type::Unknown | Type::Error) {
                 if let ExprKind::Ident(obj_sym) = &object.kind {
                     if let Some(model_name) = self.models.model_var_types.get(obj_sym).cloned() {
                         return self.compile_model_method_call(
@@ -123,11 +138,60 @@ impl Compiler<'_> {
                             args,
                         );
                     }
+                    // M56 Task 18 (spec §5.2, Option A): agent-var synthesised at
+                    // @pipeline_agent fn entry — dispatch to __nsl_agent_{Name}_{method}.
+                    if let Some(agent_name) = self.models.agent_var_types.get(obj_sym).cloned() {
+                        let mangled = format!("__nsl_agent_{}_{}", agent_name, member_name);
+                        let self_val = self.compile_expr(builder, state, object)?;
+                        // M56 Task 19: compile user args and apply @auto_device_transfer
+                        // transfers where the target method annotates tensor params with
+                        // an explicit device.  `nsl_tensor_to_device` is a no-op when the
+                        // tensor is already on the correct device, so the transfer is safe
+                        // to insert unconditionally without a static source-device check.
+                        let device_transfers = self
+                            .models
+                            .agent_auto_device_params
+                            .get(&(agent_name.clone(), member_name.clone()))
+                            .cloned()
+                            .unwrap_or_default();
+                        let mut arg_vals = vec![self_val];
+                        for (call_arg_idx, arg) in args.iter().enumerate() {
+                            let compiled = self.compile_expr(builder, state, &arg.value)?;
+                            // Check whether this argument position has a device-transfer
+                            // requirement AND the compiled value is a tensor pointer (I64).
+                            // The transfer is only safe when the value is pointer-sized;
+                            // non-pointer values (e.g. i32 scalars) are passed unchanged.
+                            // `nsl_tensor_to_device` is a no-op when already on the target
+                            // device, so insertion is safe-by-default for I64 tensor values.
+                            let compiled_ty = builder.func.dfg.value_type(compiled);
+                            if compiled_ty == cl_types::I64 {
+                                if let Some(&(_, target_device)) =
+                                    device_transfers.iter().find(|(idx, _)| *idx == call_arg_idx)
+                                {
+                                    let device_val =
+                                        builder.ins().iconst(cl_types::I64, target_device);
+                                    let transferred = self.compile_call_by_name(
+                                        builder,
+                                        "nsl_tensor_to_device",
+                                        &[compiled, device_val],
+                                    )?;
+                                    arg_vals.push(transferred);
+                                    continue;
+                                }
+                            }
+                            arg_vals.push(compiled);
+                        }
+                        return self.compile_call_by_name(builder, &mangled, &arg_vals);
+                    }
                 }
-                eprintln!(
-                    "[nsl-codegen] warning: method '.{member_name}()' called on Unknown-typed object \
-                     — defaulting to tensor dispatch. This may indicate a type inference gap."
-                );
+                // Only warn for Unknown — Error is expected for @pipeline_agent bodies
+                // where type inference doesn't cover synthesised agent vars.
+                if matches!(obj_type, Type::Unknown) {
+                    eprintln!(
+                        "[nsl-codegen] warning: method '.{member_name}()' called on Unknown-typed \
+                         object — defaulting to tensor dispatch. This may indicate a type inference gap."
+                    );
+                }
                 return self.compile_tensor_method_call(builder, state, object, &member_name, args);
             }
         }

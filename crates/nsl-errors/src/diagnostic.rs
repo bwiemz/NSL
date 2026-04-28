@@ -47,6 +47,15 @@ impl Diagnostic {
         }
     }
 
+    pub fn info(message: impl Into<String>) -> Self {
+        Self {
+            level: Level::Info,
+            message: message.into(),
+            labels: Vec::new(),
+            notes: Vec::new(),
+        }
+    }
+
     pub fn with_label(mut self, span: Span, message: impl Into<String>) -> Self {
         self.labels.push(Label {
             span,

@@ -1,0 +1,22 @@
+# M56 v1 example: speculative decoding pipeline (3 agents, branching).
+# This is the motivating use case from spec §1.4 — Drafter generates
+# candidate tokens, Reviewer scores them, Editor refines accepted drafts.
+# Compile with `nsl check --linear-types examples/m56_speculative_decoding.nsl`.
+
+agent Drafter:
+    fn draft(self, prompt: i32) -> i32:
+        return prompt
+
+agent Reviewer:
+    fn review(self, draft: i32) -> i32:
+        return draft
+
+agent Editor:
+    fn edit(self, review: i32) -> i32:
+        return review
+
+@pipeline_agent(agents=[Drafter, Reviewer, Editor])
+fn speculative_review(prompt: i32) -> i32:
+    let draft = drafter.draft(prompt)
+    let review = reviewer.review(draft)
+    return editor.edit(review)

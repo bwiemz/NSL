@@ -145,5 +145,8 @@ pub mod unikernel;
 pub mod dlpack;
 pub mod c_api;
 
+// M56: Agent runtime — mailboxes, scheduler, pool, FFI.
+pub mod agent;
+
 #[cfg(test)]
 mod fuzz;

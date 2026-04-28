@@ -26,6 +26,26 @@ impl Compiler<'_> {
     // ── Pass 2: Compile function bodies ─────────────────────────────
 
     pub fn compile_user_functions(&mut self, stmts: &[Stmt]) -> Result<(), CodegenError> {
+        // M56 Task 18 (spec §5.2, Option A): collect @pipeline_agent fns separately so
+        // they get the pipeline-specific lowering instead of the generic compile_fn_def.
+        let pipeline_fn_names: std::collections::HashSet<String> = stmts
+            .iter()
+            .filter_map(|s| {
+                if let StmtKind::Decorated { decorators, stmt } = &s.kind {
+                    if let StmtKind::FnDef(fn_def) = &stmt.kind {
+                        let is_pipeline = decorators.iter().any(|d| {
+                            d.name.len() == 1
+                                && self.resolve_sym(d.name[0]) == "pipeline_agent"
+                        });
+                        if is_pipeline {
+                            return Some(self.resolve_sym(fn_def.name).to_string());
+                        }
+                    }
+                }
+                None
+            })
+            .collect();
+
         let fn_defs: Vec<_> = stmts
             .iter()
             .filter_map(|s| match &s.kind {
@@ -42,7 +62,13 @@ impl Compiler<'_> {
             .collect();
 
         for fn_def in &fn_defs {
-            self.compile_fn_def(fn_def)?;
+            let fn_name = self.resolve_sym(fn_def.name).to_string();
+            if pipeline_fn_names.contains(&fn_name) {
+                // Route @pipeline_agent fns through the pipeline lowering (Task 18).
+                self.compile_pipeline_agent_fn(stmts, fn_def)?;
+            } else {
+                self.compile_fn_def(fn_def)?;
+            }
         }
 
         #[allow(clippy::type_complexity)]

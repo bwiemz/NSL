@@ -56,7 +56,8 @@ pub fn nsl_type_to_cl(ty: &Type) -> types::Type {
         | Type::TypeVar(_)
         | Type::Module { .. }
         | Type::NoneType
-        | Type::FixedModelArray { .. } => types::I64,
+        | Type::FixedModelArray { .. }
+        | Type::Agent { .. } => types::I64, /* M56 Task 5 stub; handled by agent pass */
     }
 }
 

@@ -152,6 +152,29 @@ pub struct ModelMetadata {
     /// Key: (model_name, method_name). Consumed by Task 6 when compiling
     /// the impl body so it can reference the declared FuncId.
     pub export_method_impls: std::collections::HashMap<(String, String), (cranelift_module::FuncId, cranelift_codegen::ir::Signature)>,
+    /// M56 Task 18: maps lowercase agent binding symbol (e.g. `drafter`) to
+    /// the title-case agent type name (e.g. `"Drafter"`) for variables
+    /// synthesised at `@pipeline_agent` fn entry.  Consulted by the
+    /// Unknown-type dispatch path in `calls.rs` to route `drafter.draft(...)`
+    /// to `__nsl_agent_Drafter_draft` without full type-checker support.
+    /// Spec §5.2, Option A (direct dispatch, no scheduler call).
+    pub agent_var_types: HashMap<Symbol, String>,
+    /// M56 Task 19: maps `(agent_name, method_name)` to a vec of
+    /// `(call_arg_index, target_device_i64)` pairs for parameters that require
+    /// an automatic device transfer when `@auto_device_transfer` is present.
+    ///
+    /// `call_arg_index` is the 0-based index into the *user-visible* argument
+    /// list (i.e. excluding the implicit `state_ptr` first param), matching the
+    /// order in which args are compiled in the dispatch path in `calls.rs`.
+    ///
+    /// `target_device_i64`: 0 = CPU, 1 = CUDA (matches NslTensor.device field).
+    ///
+    /// Populated by `collect_agents` for every `@auto_device_transfer` method
+    /// whose non-self params carry explicit `Tensor<..., cpu|cuda>` type
+    /// annotations.  The runtime `nsl_tensor_to_device` is a no-op when the
+    /// tensor is already on the target device, so it is safe to insert
+    /// unconditionally without a static source-device check.
+    pub agent_auto_device_params: HashMap<(String, String), Vec<(usize, i64)>>,
 }
 
 impl ModelMetadata {
@@ -165,6 +188,8 @@ impl ModelMetadata {
             model_method_bodies: HashMap::new(),
             model_tensor_field_shapes: HashMap::new(),
             export_method_impls: std::collections::HashMap::new(),
+            agent_var_types: HashMap::new(),
+            agent_auto_device_params: HashMap::new(),
         }
     }
 }

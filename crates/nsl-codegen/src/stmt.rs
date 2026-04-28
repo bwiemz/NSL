@@ -923,7 +923,21 @@ impl Compiler<'_> {
                         };
 
                         let cl_type = if let Some(expr) = value {
-                            nsl_type_to_cl(&self.node_type(expr.id).clone())
+                            let nsl_ty = self.node_type(expr.id).clone();
+                            // M56 Task 18: when the semantic pass returns Error/Unknown
+                            // (e.g. for vars in @pipeline_agent bodies where agent
+                            // bindings are synthesised at codegen time), fall back to
+                            // the actual Cranelift type of the compiled Value so that
+                            // variable declaration never mismatches the init_val type.
+                            if matches!(
+                                nsl_ty,
+                                nsl_semantic::types::Type::Unknown
+                                    | nsl_semantic::types::Type::Error
+                            ) {
+                                builder.func.dfg.value_type(init_val)
+                            } else {
+                                nsl_type_to_cl(&nsl_ty)
+                            }
                         } else {
                             cl_types::I64
                         };
@@ -1292,7 +1306,11 @@ impl Compiler<'_> {
             | StmtKind::Import(_)
             | StmtKind::FromImport(_)
             | StmtKind::DatasetDef(_)
-            | StmtKind::TokenizerDef(_) => {}
+            | StmtKind::TokenizerDef(_)
+            // M56 Task 17: agent declarations are compiled by the dedicated
+            // collect_agents / declare_agent_methods / compile_agent_methods
+            // passes in entry_points.rs — not inline in stmt compilation.
+            | StmtKind::AgentDef(_) => {}
 
             StmtKind::DatatypeDef(_) => {
                 // M23: custom datatype codegen — implemented in Task 9

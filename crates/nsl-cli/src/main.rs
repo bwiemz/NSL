@@ -273,6 +273,11 @@ enum Cli {
         #[arg(long)]
         csha_report: bool,
 
+        /// M38a/M56: Enable linear types ownership checking. Required for
+        /// agent declarations (M56). Closes Task 20 of the M56 plan.
+        #[arg(long)]
+        linear_types: bool,
+
         /// Arguments to pass to the compiled program
         #[arg(last = true)]
         args: Vec<String>,
@@ -1406,6 +1411,7 @@ fn main_inner() {
             inspect,
             csha,
             csha_report,
+            linear_types,
         } => {
             // CSHA: validate the same way `nsl build --csha` does so an
             // unrecognised mode fails fast rather than silently disabling
@@ -1518,7 +1524,7 @@ fn main_inner() {
                 zk_field: "m31".to_string(),
                 zk_solidity: false,
                 zk_weights_path: None,
-                linear_types_enabled: false, // run command doesn't expose --linear-types
+                linear_types_enabled: linear_types, // Task 20: nsl run now exposes --linear-types
                 ownership_info: std::collections::HashMap::new(),
                 zero_stage: zero_stage.map(|s| s as u8),
                 debug_training,
@@ -1925,6 +1931,13 @@ fn main_inner() {
 }
 
 fn frontend(file: &PathBuf) -> (Interner, nsl_parser::ParseResult, nsl_semantic::AnalysisResult) {
+    frontend_with_flags(file, false)
+}
+
+fn frontend_with_flags(
+    file: &PathBuf,
+    linear_types: bool,
+) -> (Interner, nsl_parser::ParseResult, nsl_semantic::AnalysisResult) {
     let source = match std::fs::read_to_string(file) {
         Ok(s) => s,
         Err(e) => {
@@ -1952,8 +1965,13 @@ fn frontend(file: &PathBuf) -> (Interner, nsl_parser::ParseResult, nsl_semantic:
         source_map.emit_diagnostic(diag);
     }
 
-    // Semantic analysis
-    let analysis = nsl_semantic::analyze(&parse_result.module, &mut interner);
+    // Semantic analysis — thread linear_types so E0610 fires correctly.
+    let analysis = nsl_semantic::analyze_with_imports(
+        &parse_result.module,
+        &mut interner,
+        &std::collections::HashMap::new(),
+        linear_types,
+    );
 
     for diag in &analysis.diagnostics {
         source_map.emit_diagnostic(diag);
@@ -2239,7 +2257,7 @@ fn run_build_shared_single(
     options: &nsl_codegen::CompileOptions,
     wrga_report: Option<&std::path::Path>,
 ) {
-    let (interner, parse_result, analysis) = frontend(file);
+    let (interner, parse_result, analysis) = frontend_with_flags(file, options.linear_types_enabled);
 
     // Task 3 (B.1): forward WRGA decorator configs so they take effect on the
     // shared-library build path, and fail fast if --wrga-report is combined
@@ -2623,7 +2641,7 @@ fn run_build_zk(
     options: &nsl_codegen::CompileOptions,
     wrga_report: Option<&std::path::Path>,
 ) {
-    let (interner, parse_result, analysis) = frontend(file);
+    let (interner, parse_result, analysis) = frontend_with_flags(file, options.linear_types_enabled);
 
     // Task 3 (B.1): forward WRGA decorator configs so `@freeze`/`@adapter`/`@wrga`
     // take effect in codegen on the ZK build path.
@@ -2850,7 +2868,7 @@ fn run_build_standalone(
 
     // 4. Run frontend (lex, parse, semantic analysis)
     let file_pb = file.to_path_buf();
-    let (interner, parse_result, analysis) = frontend(&file_pb);
+    let (interner, parse_result, analysis) = frontend_with_flags(&file_pb, options.linear_types_enabled);
 
     // Task 3 (B.1): forward WRGA decorator configs so `@freeze`/`@adapter`/`@wrga`
     // take effect in codegen on the standalone build path.
@@ -2986,7 +3004,7 @@ fn run_build_single(
     options: &nsl_codegen::CompileOptions,
     wrga_report: Option<&std::path::Path>,
 ) {
-    let (interner, parse_result, analysis) = frontend(file);
+    let (interner, parse_result, analysis) = frontend_with_flags(file, options.linear_types_enabled);
 
     // Task 3 (B.1): fail fast if --wrga-report is used without --source-ad
     // when decorators are present — the old silent-notice behaviour was

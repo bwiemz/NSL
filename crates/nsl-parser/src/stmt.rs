@@ -19,6 +19,7 @@ pub fn parse_stmt(p: &mut Parser) -> Stmt {
         TokenKind::Let | TokenKind::Const => parse_var_decl(p),
         TokenKind::Fn | TokenKind::Async => crate::decl::parse_fn_def_stmt(p),
         TokenKind::Model => crate::decl::parse_model_def_stmt(p),
+        TokenKind::Agent => crate::agent::parse_agent_def_stmt(p),
         TokenKind::Struct => crate::decl::parse_struct_def_stmt(p),
         TokenKind::Enum => crate::decl::parse_enum_def_stmt(p),
         TokenKind::Trait => crate::decl::parse_trait_def_stmt(p),

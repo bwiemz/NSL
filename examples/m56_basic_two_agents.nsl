@@ -1,0 +1,16 @@
+# M56 v1 example: minimal two-agent linear pipeline.
+# Compile with: nsl check --linear-types examples/m56_basic_two_agents.nsl
+# Task 18 owns the @pipeline_agent codegen; Task 4 enables the agent keyword.
+
+agent Drafter:
+    fn draft(self, prompt: i32) -> i32:
+        return prompt
+
+agent Reviewer:
+    fn review(self, draft: i32) -> i32:
+        return draft
+
+@pipeline_agent(agents=[Drafter, Reviewer])
+fn pipeline(prompt: i32) -> i32:
+    let draft = drafter.draft(prompt)
+    return reviewer.review(draft)

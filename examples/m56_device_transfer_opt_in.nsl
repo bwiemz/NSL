@@ -1,0 +1,18 @@
+# M56 v1 example: @auto_device_transfer at port boundaries.
+# Tokenizer outputs a scalar token ID; Model expects a CUDA tensor and opts in.
+# Task 19 codegen inserts the runtime nsl_tensor_to_device transfer.
+# Task 10 semantic check suppresses E0608 when @auto_device_transfer is present.
+
+agent Tokenizer:
+    fn tokenize(self, text: i64) -> i64:
+        return text
+
+agent Model:
+    @auto_device_transfer
+    fn forward(self, tokens: Tensor<[1, 8], f32, cuda>) -> Tensor<[1, 8], f32, cuda>:
+        return tokens
+
+@pipeline_agent(agents=[Tokenizer, Model])
+fn pipeline(text: i64) -> Tensor<[1, 8], f32, cuda>:
+    let t = tokenizer.tokenize(text)
+    return model.forward(t)

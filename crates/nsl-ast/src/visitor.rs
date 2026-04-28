@@ -116,6 +116,30 @@ pub fn walk_stmt(v: &mut impl Visitor, stmt: &Stmt) {
                 }
             }
         }
+        StmtKind::AgentDef(a) => {
+            for param in &a.params {
+                if let Some(default) = &param.default {
+                    v.visit_expr(default);
+                }
+            }
+            for member in &a.members {
+                match member {
+                    crate::agent::AgentMember::Method(f, _decos) => {
+                        for param in &f.params {
+                            if let Some(default) = &param.default {
+                                v.visit_expr(default);
+                            }
+                        }
+                        v.visit_block(&f.body);
+                    }
+                    crate::agent::AgentMember::FieldDecl { init, .. } => {
+                        if let Some(init) = init {
+                            v.visit_expr(init);
+                        }
+                    }
+                }
+            }
+        }
         StmtKind::If {
             condition,
             then_block,
