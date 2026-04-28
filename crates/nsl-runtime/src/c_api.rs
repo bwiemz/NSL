@@ -129,6 +129,12 @@ fn set_error(msg: String) {
     LAST_ERROR.with(|e| *e.borrow_mut() = Some(cstr));
 }
 
+fn capi_trace(msg: impl AsRef<str>) {
+    if std::env::var_os("NSL_CAPI_TRACE").is_some() {
+        eprintln!("[nsl-capi] {}", msg.as_ref());
+    }
+}
+
 // ---------------------------------------------------------------------------
 // FFI: Error handling
 // ---------------------------------------------------------------------------
@@ -198,6 +204,7 @@ pub extern "C" fn nsl_model_create(weights_path_ptr: i64) -> i64 {
             return 0;
         }
     };
+    capi_trace(format!("model_create path={path_str}"));
 
     // Try to load weights from safetensors file
     let (weights, weight_ptrs) = match load_safetensors_weights(path_str) {
@@ -207,6 +214,7 @@ pub extern "C" fn nsl_model_create(weights_path_ptr: i64) -> i64 {
             return 0;
         }
     };
+    capi_trace(format!("model_create loaded_weights={}", weight_ptrs.len()));
 
     let model = Box::new(NslModel {
         version: 2,
@@ -249,6 +257,7 @@ pub extern "C" fn nsl_model_set_forward(model_ptr: i64, fn_ptr: i64) -> i64 {
     // Wrap the raw function pointer in a ForwardFn closure
     type RawForwardFn = extern "C" fn(i64, i64, i64, i64) -> i64;
     let raw_fn: RawForwardFn = unsafe { std::mem::transmute(fn_ptr as *const ()) };
+    capi_trace("model_set_forward registered");
 
     model.forward_fn = Some(Box::new(move |weights: &[i64], inputs: &[i64]| {
         let result = raw_fn(
@@ -290,6 +299,12 @@ pub extern "C" fn nsl_model_forward(
         return -1;
     }
     let model = unsafe { &*(model_ptr as *const NslModel) };
+    capi_trace(format!(
+        "model_forward start num_inputs={} num_outputs={} weights={}",
+        num_inputs,
+        num_outputs,
+        model.weight_ptrs.len()
+    ));
 
     // Check forward function is registered
     let forward_fn = match &model.forward_fn {
@@ -306,11 +321,20 @@ pub extern "C" fn nsl_model_forward(
         let descs = unsafe {
             std::slice::from_raw_parts(inputs_ptr as *const NslTensorDesc, num_inputs as usize)
         };
-        for desc in descs {
+        for (idx, desc) in descs.iter().enumerate() {
+            capi_trace(format!(
+                "model_forward import input={} ndim={} dtype={} shape_ptr={:?} strides_ptr={:?}",
+                idx,
+                desc.ndim,
+                desc.dtype,
+                desc.shape,
+                desc.strides
+            ));
             let tensor_ptr = desc_to_nsl_tensor(desc);
             input_ptrs.push(tensor_ptr);
         }
     }
+    capi_trace(format!("model_forward imported_inputs={}", input_ptrs.len()));
 
     // If grad recording is enabled, start the tape over the weight parameters
     // so that the backward pass can replay it.
@@ -325,7 +349,9 @@ pub extern "C" fn nsl_model_forward(
     }
 
     // Call forward function
+    capi_trace("model_forward invoke_forward");
     let output_tensor_ptrs = forward_fn(&model.weight_ptrs, &input_ptrs);
+    capi_trace(format!("model_forward outputs={}", output_tensor_ptrs.len()));
 
     // Save forward outputs for the backward pass (before writing to output descs,
     // since nsl_tensor_to_desc only borrows the pointer — the tensor stays alive).
@@ -479,7 +505,9 @@ pub extern "C" fn nsl_model_get_weight(model_ptr: i64, name_ptr: i64, name_len: 
         let slice = std::slice::from_raw_parts(name_ptr as *const u8, name_len as usize);
         std::str::from_utf8_unchecked(slice)
     };
-    model.weights.get(name).copied().unwrap_or(0)
+    let weight = model.weights.get(name).copied().unwrap_or(0);
+    capi_trace(format!("model_get_weight name={name} found={}", weight != 0));
+    weight
 }
 
 // NOTE (Gap I.1/I.2 worktree): the previously-present second pair of
@@ -518,6 +546,7 @@ fn load_safetensors_weights(path: &str) -> Result<(HashMap<String, i64>, Vec<i64
         let ndim = shape.len();
         let len: i64 = shape.iter().product::<i64>().max(1);
         let raw_data = view.data();
+        capi_trace(format!("load_weight name={name} shape={shape:?}"));
 
         // Convert to f32 (the standard NSL runtime format for loaded weights)
         let f32_data = convert_weight_to_f32(view.dtype(), raw_data, len as usize);
@@ -558,28 +587,38 @@ fn load_safetensors_weights(path: &str) -> Result<(HashMap<String, i64>, Vec<i64
 #[cfg(feature = "interop")]
 fn convert_weight_to_f32(dtype: safetensors::Dtype, data: &[u8], len: usize) -> Vec<f32> {
     match dtype {
-        safetensors::Dtype::F32 => {
-            let src = data.as_ptr() as *const f32;
-            (0..len).map(|i| unsafe { *src.add(i) }).collect()
-        }
-        safetensors::Dtype::F64 => {
-            let src = data.as_ptr() as *const f64;
-            (0..len).map(|i| unsafe { *src.add(i) as f32 }).collect()
-        }
-        safetensors::Dtype::F16 => {
-            let src = data.as_ptr() as *const u16;
-            (0..len).map(|i| {
-                let bits = unsafe { *src.add(i) };
-                half::f16::from_bits(bits).to_f32()
-            }).collect()
-        }
-        safetensors::Dtype::BF16 => {
-            let src = data.as_ptr() as *const u16;
-            (0..len).map(|i| {
-                let bits = unsafe { *src.add(i) };
-                half::bf16::from_bits(bits).to_f32()
-            }).collect()
-        }
+        safetensors::Dtype::F32 => data
+            .chunks_exact(std::mem::size_of::<f32>())
+            .take(len)
+            .map(|chunk| {
+                let bytes: [u8; 4] = chunk.try_into().expect("f32 chunks are 4 bytes");
+                f32::from_le_bytes(bytes)
+            })
+            .collect(),
+        safetensors::Dtype::F64 => data
+            .chunks_exact(std::mem::size_of::<f64>())
+            .take(len)
+            .map(|chunk| {
+                let bytes: [u8; 8] = chunk.try_into().expect("f64 chunks are 8 bytes");
+                f64::from_le_bytes(bytes) as f32
+            })
+            .collect(),
+        safetensors::Dtype::F16 => data
+            .chunks_exact(std::mem::size_of::<u16>())
+            .take(len)
+            .map(|chunk| {
+                let bytes: [u8; 2] = chunk.try_into().expect("f16 chunks are 2 bytes");
+                half::f16::from_bits(u16::from_le_bytes(bytes)).to_f32()
+            })
+            .collect(),
+        safetensors::Dtype::BF16 => data
+            .chunks_exact(std::mem::size_of::<u16>())
+            .take(len)
+            .map(|chunk| {
+                let bytes: [u8; 2] = chunk.try_into().expect("bf16 chunks are 2 bytes");
+                half::bf16::from_bits(u16::from_le_bytes(bytes)).to_f32()
+            })
+            .collect(),
         _ => vec![0.0_f32; len], // unsupported dtype → zeros
     }
 }
@@ -629,18 +668,33 @@ fn desc_to_nsl_tensor(desc: &NslTensorDesc) -> i64 {
     let nsl_dtype = capi_dtype_to_nsl(desc.dtype);
 
     let shape_ptr = checked_alloc(ndim * std::mem::size_of::<i64>()) as *mut i64;
-    unsafe { std::ptr::copy_nonoverlapping(desc.shape, shape_ptr, ndim); }
+    for i in 0..ndim {
+        unsafe {
+            *shape_ptr.add(i) = std::ptr::read_unaligned(desc.shape.add(i));
+        }
+    }
 
     let strides = if desc.strides.is_null() {
         NslTensor::compute_strides(shape_ptr, desc.ndim as i64)
     } else {
         let s = checked_alloc(ndim * std::mem::size_of::<i64>()) as *mut i64;
-        unsafe { std::ptr::copy_nonoverlapping(desc.strides, s, ndim); }
+        for i in 0..ndim {
+            unsafe {
+                *s.add(i) = std::ptr::read_unaligned(desc.strides.add(i));
+            }
+        }
         s
     };
 
     let len = NslTensor::total_elements(shape_ptr, desc.ndim as i64);
     let device = if desc.device_type > 0 { desc.device_id as u8 + 1 } else { 0 };
+    capi_trace(format!(
+        "desc_to_tensor ndim={} len={} device={} dtype={}",
+        desc.ndim,
+        len,
+        device,
+        nsl_dtype
+    ));
 
     let tensor = Box::new(NslTensor::new(
         desc.data,

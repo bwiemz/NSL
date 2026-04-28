@@ -24,6 +24,7 @@ fn emit_one(
     ptx: &mut String,
     config: &FlashAttentionConfig,
     tag: &str,
+    label_suffix: &str,
     ptr_reg: &str,
     smem_base: &str,
 ) {
@@ -37,10 +38,10 @@ fn emit_one(
         "    // Tier C backward {tag}-load (block_kv={block_kv}, \
          slices/lane={slices_per_lane}, rows/warp={rows_per_warp})\n"
     ));
-    ptx.push_str(&format!("V2_BWD_{tag}_LOAD:\n"));
+    ptx.push_str(&format!("V2_BWD_{tag}_LOAD_{label_suffix}:\n"));
     // Null-guard.
     ptx.push_str(&format!("    setp.eq.u64 %p0, {ptr_reg}, 0;\n"));
-    ptx.push_str(&format!("    @%p0 bra V2_BWD_{tag}_LOAD_SKIP;\n"));
+    ptx.push_str(&format!("    @%p0 bra V2_BWD_{tag}_LOAD_SKIP_{label_suffix};\n"));
 
     for r in 0..rows_per_warp {
         // kv_row = warp_id + r*4
@@ -48,12 +49,14 @@ fn emit_one(
             "    add.u32 %r0, %warp_id, {}; // kv_row\n",
             r * 4
         ));
-        // row_idx (global HBM) = batch_idx*(heads*seq) + head_idx*seq + kv_row
         ptx.push_str("    cvt.u64.u32 %rd30, %r0;\n");
+        ptx.push_str("    add.u64 %rd35, %rd30, %k_start;\n");
+        ptx.push_str("    setp.ge.u64 %p1, %rd35, %rd6;\n");
+        // row_idx (global HBM) = batch_idx*(heads*seq) + head_idx*seq + kv_row
         ptx.push_str("    mul.lo.u64 %rd31, %batch_idx, %rd5;\n");
         ptx.push_str("    add.u64 %rd31, %rd31, %head_idx;\n");
         ptx.push_str("    mul.lo.u64 %rd31, %rd31, %rd6;\n");
-        ptx.push_str("    add.u64 %rd31, %rd31, %rd30;\n");
+        ptx.push_str("    add.u64 %rd31, %rd31, %rd35;\n");
         // * head_dim * 2 bytes (f16)
         ptx.push_str("    mul.lo.u64 %rd31, %rd31, %rd7;\n");
         ptx.push_str("    shl.b64 %rd31, %rd31, 1;\n");
@@ -73,7 +76,8 @@ fn emit_one(
             // HBM addr = ptr_base + row_byte_off + col*2
             ptx.push_str("    add.u64 %rd33, %rd31, %rd32;\n");
             ptx.push_str(&format!("    add.u64 %rd33, {ptr_reg}, %rd33;\n"));
-            ptx.push_str("    ld.global.b16 %h0, [%rd33];\n");
+            ptx.push_str("    @%p1 mov.b16 %h0, 0;\n");
+            ptx.push_str("    @!%p1 ld.global.b16 %h0, [%rd33];\n");
             // SMEM addr = smem_base + kv_row*(head_dim*2) + col*2
             ptx.push_str(&format!(
                 "    mul.lo.u64 %rd34, %rd30, {};\n",
@@ -85,18 +89,26 @@ fn emit_one(
         }
     }
 
-    ptx.push_str(&format!("V2_BWD_{tag}_LOAD_SKIP:\n"));
+    ptx.push_str(&format!("V2_BWD_{tag}_LOAD_SKIP_{label_suffix}:\n"));
     ptx.push_str("    bar.sync 0;  // tile visible to all threads\n");
 }
 
 /// Load saved K_proj from HBM into the K SMEM tile.
+pub fn emit_k_suffixed(ptx: &mut String, config: &FlashAttentionConfig, label_suffix: &str) {
+    emit_one(ptx, config, "K", label_suffix, "%rd_bwd_k_proj", "%k_smem_base");
+}
+
 pub fn emit_k(ptx: &mut String, config: &FlashAttentionConfig) {
-    emit_one(ptx, config, "K", "%rd_bwd_k_proj", "%k_smem_base");
+    emit_k_suffixed(ptx, config, "0");
 }
 
 /// Load saved V_proj from HBM into the V SMEM tile.
+pub fn emit_v_suffixed(ptx: &mut String, config: &FlashAttentionConfig, label_suffix: &str) {
+    emit_one(ptx, config, "V", label_suffix, "%rd_bwd_v_proj", "%v_smem_base");
+}
+
 pub fn emit_v(ptx: &mut String, config: &FlashAttentionConfig) {
-    emit_one(ptx, config, "V", "%rd_bwd_v_proj", "%v_smem_base");
+    emit_v_suffixed(ptx, config, "0");
 }
 
 #[cfg(test)]
@@ -128,8 +140,8 @@ mod tests {
         assert!(ptx.contains("%rd_bwd_k_proj"));
         assert!(ptx.contains("ld.global.b16"));
         assert!(ptx.contains("st.shared.b16"));
-        assert!(ptx.contains("V2_BWD_K_LOAD:"));
-        assert!(ptx.contains("V2_BWD_K_LOAD_SKIP:"));
+        assert!(ptx.contains("V2_BWD_K_LOAD_0:"));
+        assert!(ptx.contains("V2_BWD_K_LOAD_SKIP_0:"));
         assert!(!ptx.contains("cos_ptr"),
             "backward k_load must use saved post-RoPE K");
     }
@@ -142,6 +154,6 @@ mod tests {
         assert!(ptx.contains("%rd_bwd_v_proj"));
         assert!(ptx.contains("ld.global.b16"));
         assert!(ptx.contains("st.shared.b16"));
-        assert!(ptx.contains("V2_BWD_V_LOAD:"));
+        assert!(ptx.contains("V2_BWD_V_LOAD_0:"));
     }
 }

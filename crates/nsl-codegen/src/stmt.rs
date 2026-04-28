@@ -3965,24 +3965,28 @@ impl Compiler<'_> {
                 // running it first is a safe one-way reorder.
                 if let Some(ref data_path) = self.compile_options.calibration_data {
                     let mut registry = crate::calibration::registry::HookRegistry::new();
-                    if let Some(awq_projections) = self.discover_awq_projections() {
-                        if !awq_projections.is_empty() {
-                            // Extract just the ProjectionRef for the hook; the full
-                            // DiscoveredProjection (with weight_shape) lives in
-                            // compile_options.calibration_retention for codegen.
-                            let proj_refs: Vec<crate::calibration::ProjectionRef> = awq_projections
-                                .iter()
-                                .map(|dp| dp.projection.clone())
-                                .collect();
-                            registry.register(Box::new(
-                                crate::calibration::awq_hook::AwqCalibrationHook::new(
-                                    proj_refs,
-                                ),
-                            ));
-                            // Store the full DiscoveredProjection vec so the retention
-                            // pass can use weight_shape for arena-layout sizing.
-                            self.compile_options.calibration_retention = Some(awq_projections);
-                        }
+                    let awq_projections = self.discover_awq_projections().unwrap_or_default();
+                    if let Some(pre_scan) = self.compile_options.calibration_retention.as_ref() {
+                        crate::calibration::discovery::check_discovery_agreement(
+                            pre_scan,
+                            &awq_projections,
+                        )
+                        .map_err(|err| CodegenError::new(err.to_string()))?;
+                    }
+                    if !awq_projections.is_empty() {
+                        // Extract just the ProjectionRef for the hook; the full
+                        // DiscoveredProjection (with weight_shape) lives in
+                        // compile_options.calibration_retention for codegen.
+                        let proj_refs: Vec<crate::calibration::ProjectionRef> = awq_projections
+                            .iter()
+                            .map(|dp| dp.projection.clone())
+                            .collect();
+                        registry.register(Box::new(
+                            crate::calibration::awq_hook::AwqCalibrationHook::new(proj_refs),
+                        ));
+                        // Store the full DiscoveredProjection vec so the retention
+                        // pass can use weight_shape for arena-layout sizing.
+                        self.compile_options.calibration_retention = Some(awq_projections);
                     }
                     if registry.is_empty() {
                         eprintln!(
@@ -4018,6 +4022,10 @@ impl Compiler<'_> {
                                 .calibration_retention
                                 .clone()
                                 .unwrap_or_default(),
+                            compile_bundle: self
+                                .compile_options
+                                .calibration_compile_bundle
+                                .clone(),
                         };
                         match crate::calibration::run_harness_production(&registry, &cfg) {
                             Ok(out) => {

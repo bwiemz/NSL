@@ -32,6 +32,13 @@ pub struct CacheKey {
     /// `out_features` under the same name both invalidate the cache.
     /// Order-insensitive: `digest` sorts by path internally.
     pub projections: Vec<DiscoveredProjection>,
+    /// SHA-256 of a stable serialization of the calibration AST,
+    /// binding the cache against `calib_model.o`'s source-of-truth so a
+    /// `.nsl` edit invalidates the sidecar even when checkpoint bytes
+    /// and calibration data are unchanged (spec §12 v2 follow-up).
+    /// Empty string for paths that have no compile bundle (non-forward
+    /// hooks, identity-hook smoke tests).
+    pub model_ast_hash: String,
 }
 
 impl CacheKey {
@@ -65,8 +72,29 @@ impl CacheKey {
             h.update(p.weight_shape[0].to_le_bytes());
             h.update(p.weight_shape[1].to_le_bytes());
         }
+        // model_ast_hash — empty string is the "no compile bundle"
+        // sentinel; length-prefixed framing keeps it order-and-position
+        // unambiguous against the other length-prefixed fields above.
+        h.update((self.model_ast_hash.len() as u64).to_le_bytes());
+        h.update(self.model_ast_hash.as_bytes());
         hex(&h.finalize())
     }
+}
+
+/// SHA-256 of the calibration AST's `Debug` representation. Used by
+/// `run_harness_simulated` to bind the sidecar cache against the
+/// compiled-model source so a `.nsl` edit invalidates the cache.
+///
+/// `Debug` is deterministic across re-parses of the same source under a
+/// fixed Rust toolchain (the AST is purely data; spans are stable bytes
+/// from the file). The choice favors over-invalidation — e.g., a
+/// whitespace change that shifts spans bumps the hash and forces a
+/// recompile — over the alternative under-invalidation risk of trying
+/// to cherry-pick "semantically meaningful" fields and missing one.
+pub fn hash_compile_bundle_ast(ast: &nsl_ast::Module) -> String {
+    let mut h = Sha256::new();
+    h.update(format!("{ast:?}").as_bytes());
+    hex(&h.finalize())
 }
 
 /// Sidecar path for a given checkpoint (next to it, with
@@ -151,6 +179,7 @@ mod projection_key_tests {
             samples: 128,
             batch_size: 4,
             projections: vec![proj("model.up_proj", 128, 64)],
+            model_ast_hash: String::new(),
         }
     }
 
@@ -160,6 +189,35 @@ mod projection_key_tests {
         let mut b = a.clone();
         b.projections = vec![proj("model.up_proj", 128, 96)]; // in_f changed
         assert_ne!(a.digest(), b.digest());
+    }
+
+    #[test]
+    fn model_ast_hash_change_changes_digest() {
+        // Spec §12 v2 follow-up: source edit must invalidate the cache.
+        // The driver hashes the calibration AST before the cache lookup
+        // and threads it through `model_ast_hash`; flipping the value
+        // here mimics a recompile after the user edited their .nsl source.
+        let a = base_key();
+        let mut b = a.clone();
+        b.model_ast_hash = "ast-hash-after-edit".into();
+        assert_ne!(
+            a.digest(),
+            b.digest(),
+            "digest must change when the source AST hash changes"
+        );
+    }
+
+    #[test]
+    fn empty_model_ast_hash_matches_unset() {
+        // Backward-compat: pre-v2 callers (and the non-forward path that
+        // has no compile bundle) pass an empty string. That must still
+        // produce a stable digest, distinct from any non-empty value.
+        let a = base_key();
+        let b = CacheKey {
+            model_ast_hash: String::new(),
+            ..a.clone()
+        };
+        assert_eq!(a.digest(), b.digest());
     }
 
     #[test]
@@ -240,6 +298,7 @@ mod tests {
             samples: 128,
             batch_size: 4,
             projections: vec![],
+            model_ast_hash: String::new(),
         };
         let k2 = CacheKey {
             checkpoint_hashes: vec!["b".into(), "a".into()],
@@ -248,6 +307,7 @@ mod tests {
             samples: 128,
             batch_size: 4,
             projections: vec![],
+            model_ast_hash: String::new(),
         };
         assert_eq!(k1.digest(), k2.digest());
     }
@@ -261,6 +321,7 @@ mod tests {
             samples: 128,
             batch_size: 4,
             projections: vec![],
+            model_ast_hash: String::new(),
         };
         let changed = CacheKey {
             samples: 129,
@@ -329,6 +390,7 @@ mod tests {
             samples: 1,
             batch_size: 1,
             projections: vec![],
+            model_ast_hash: String::new(),
         };
         let split = CacheKey {
             checkpoint_hashes: vec!["c".into()],
@@ -337,6 +399,7 @@ mod tests {
             samples: 1,
             batch_size: 1,
             projections: vec![],
+            model_ast_hash: String::new(),
         };
         assert_ne!(combined.digest(), split.digest());
     }
@@ -353,6 +416,7 @@ mod tests {
             samples: 1,
             batch_size: 1,
             projections: vec![],
+            model_ast_hash: String::new(),
         };
         let b = CacheKey {
             checkpoint_hashes: vec!["a".into()],
@@ -361,6 +425,7 @@ mod tests {
             samples: 1,
             batch_size: 1,
             projections: vec![],
+            model_ast_hash: String::new(),
         };
         assert_ne!(a.digest(), b.digest());
     }

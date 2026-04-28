@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use cranelift_codegen::ir::Signature;
 use cranelift_module::Linkage;
@@ -104,6 +105,21 @@ fn run_profile_pre_pass(
             }
         }
     }
+}
+
+fn install_calibration_compile_bundle(
+    compiler: &mut Compiler<'_>,
+    ast: &nsl_ast::Module,
+    interner: &Interner,
+    type_map: &TypeMap,
+) {
+    compiler.compile_options.calibration_compile_bundle = Some(Arc::new(
+        crate::calibration::CalibrationCompileBundle {
+            ast: ast.clone(),
+            interner: interner.clone(),
+            type_map: type_map.clone(),
+        },
+    ));
 }
 
 /// Dev Tools Phase 2, Task 6: drain `Compiler.manifest_builder` (if set) and
@@ -229,6 +245,36 @@ fn load_and_register_weights_if_needed(
     Ok(())
 }
 
+fn populate_calibration_retention_from_ast_if_unset(
+    compiler: &mut Compiler<'_>,
+    ast: &nsl_ast::Module,
+    interner: &Interner,
+) -> Result<(), CodegenError> {
+    if compiler.compile_options.calibration_retention.is_some() {
+        return Ok(());
+    }
+
+    let discovered = crate::calibration::pre_scan_awq_projections_from_ast(ast, interner);
+    if !discovered.is_empty() {
+        compiler.compile_options.calibration_retention = Some(discovered);
+        return Ok(());
+    }
+
+    if crate::calibration::discovery::ast_has_awq_quantize_decorator(ast, interner) {
+        let model_name = crate::calibration::discovery::first_awq_quantized_model_name(ast, interner)
+            .unwrap_or_else(|| "<unknown>".into());
+        return Err(CodegenError::new(format!(
+            "calibration: @quantize model declared but no AWQ projections discovered.\n\
+ requested:  auto-discover AWQ projections for model '{model_name}'\n\
+ expected:   @quantize(dtype=\"awq4\") model -> at least one DiscoveredProjection\n\
+ found:      model '{model_name}' is AWQ-quantized but discovery returned zero projections.\n\
+ Action:     either remove the @quantize decorator, or add the Linear/tensor projections the decorator is meant to target."
+        )));
+    }
+
+    Ok(())
+}
+
 /// Main entry point (single-file, backward compatible).
 pub fn compile(
     ast: &nsl_ast::Module,
@@ -258,6 +304,7 @@ pub fn compile_returning_splice_count_for_tests(
     options: &crate::CompileOptions,
 ) -> Result<u32, CodegenError> {
     let mut compiler = Compiler::new(interner, type_map, options)?;
+    install_calibration_compile_bundle(&mut compiler, ast, interner, type_map);
 
     compiler.intern_string("")?;
     compiler.collect_strings(&ast.stmts)?;
@@ -266,6 +313,7 @@ pub fn compile_returning_splice_count_for_tests(
     compiler.collect_models(&ast.stmts)?;
     // M56 Task 17: compute agent struct layouts (after models, same pass ordering).
     compiler.collect_agents(&ast.stmts)?;
+    populate_calibration_retention_from_ast_if_unset(&mut compiler, ast, interner)?;
     compiler.emit_retention_arena()?;
     compiler.declare_runtime_functions()?;
     compiler.declare_user_functions(&ast.stmts)?;
@@ -305,6 +353,7 @@ pub fn compile_returning_plan(
     options: &crate::CompileOptions,
 ) -> Result<(Vec<u8>, Option<crate::wrga::WrgaPlan>), CodegenError> {
     let mut compiler = Compiler::new(interner, type_map, options)?;
+    install_calibration_compile_bundle(&mut compiler, ast, interner, type_map);
 
     // M52: load weights if --weights was provided.
     load_and_register_weights_if_needed(&mut compiler, options)?;
@@ -325,6 +374,7 @@ pub fn compile_returning_plan(
     compiler.collect_models(&ast.stmts)?;
     // M56 Task 17: compute agent struct layouts.
     compiler.collect_agents(&ast.stmts)?;
+    populate_calibration_retention_from_ast_if_unset(&mut compiler, ast, interner)?;
     // Task 4: declare the calibration retention arena BEFORE method-body
     // codegen.  The pipe-site splice in `try_emit_retention_splice` early-
     // returns when `retention_arena_data_id` is `None`, so emitting the
@@ -485,6 +535,7 @@ fn compile_with_zk_info_best_effort_plan(
         Ok(c) => c,
         Err(e) => return (Err(e), HashMap::new(), Vec::new(), None),
     };
+    install_calibration_compile_bundle(&mut compiler, ast, interner, type_map);
 
     compiler.dump_ir = dump_ir;
 
@@ -501,6 +552,7 @@ fn compile_with_zk_info_best_effort_plan(
         compiler.collect_models(&ast.stmts)?;
         // M56 Task 17: compute agent struct layouts.
         compiler.collect_agents(&ast.stmts)?;
+        populate_calibration_retention_from_ast_if_unset(&mut compiler, ast, interner)?;
         // Task 4: declare the calibration retention arena BEFORE method-body
         // codegen — see `compile_returning_plan` for the full rationale.
         compiler.emit_retention_arena()?;
@@ -663,6 +715,7 @@ fn compile_standalone_best_effort_plan(
         Ok(c) => c,
         Err(e) => return (Err(e), None),
     };
+    install_calibration_compile_bundle(&mut compiler, ast, interner, type_map);
     compiler.dump_ir = dump_ir;
     compiler.standalone_config = Some(config);
     let pre_finalize = (|| -> Result<(), CodegenError> {
@@ -673,6 +726,7 @@ fn compile_standalone_best_effort_plan(
         compiler.collect_models(&ast.stmts)?;
         // M56 Task 17: compute agent struct layouts.
         compiler.collect_agents(&ast.stmts)?;
+        populate_calibration_retention_from_ast_if_unset(&mut compiler, ast, interner)?;
         // Task 4: declare the calibration retention arena BEFORE method-body
         // codegen — see `compile_returning_plan` for the full rationale.
         compiler.emit_retention_arena()?;
@@ -721,6 +775,7 @@ pub fn compile_test(
     options: &crate::CompileOptions,
 ) -> Result<(Vec<u8>, Vec<String>), CodegenError> {
     let mut compiler = Compiler::new(interner, type_map, options)?;
+    install_calibration_compile_bundle(&mut compiler, ast, interner, type_map);
     compiler.dump_ir = dump_ir;
     compiler.intern_string("")?;
     compiler.collect_strings(&ast.stmts)?;
@@ -729,6 +784,7 @@ pub fn compile_test(
     compiler.collect_models(&ast.stmts)?;
     // M56 Task 17: compute agent struct layouts.
     compiler.collect_agents(&ast.stmts)?;
+    populate_calibration_retention_from_ast_if_unset(&mut compiler, ast, interner)?;
     // Task 4: declare the calibration retention arena BEFORE method-body
     // codegen — parity with all other entry points.  `compile_test` compiles
     // `@test` functions; a `@test` body that calls a model.forward with a
@@ -863,6 +919,7 @@ pub fn compile_module_with_imports_best_effort_plan(
         Ok(c) => c,
         Err(e) => return (Err(e), None),
     };
+    install_calibration_compile_bundle(&mut compiler, ast, interner, type_map);
     compiler.dump_ir = dump_ir;
     compiler.module_prefix = module_prefix.to_string();
     for (name, layout) in imported_struct_layouts {
@@ -889,6 +946,7 @@ pub fn compile_module_with_imports_best_effort_plan(
         compiler.collect_models(&ast.stmts)?;
         // M56 Task 17: compute agent struct layouts.
         compiler.collect_agents(&ast.stmts)?;
+        populate_calibration_retention_from_ast_if_unset(&mut compiler, ast, interner)?;
         // Task 4: declare the calibration retention arena BEFORE method-body
         // codegen — see `compile_returning_plan` for the full rationale.
         compiler.emit_retention_arena()?;
@@ -978,6 +1036,7 @@ pub fn compile_entry_returning_plan(
     options: &crate::CompileOptions,
 ) -> Result<(Vec<u8>, Option<crate::wrga::WrgaPlan>), CodegenError> {
     let mut compiler = Compiler::new(interner, type_map, options)?;
+    install_calibration_compile_bundle(&mut compiler, ast, interner, type_map);
     compiler.dump_ir = dump_ir;
 
     // M52 / CPDT Phase 1: load weights if --weights was provided.  Load-bearing
@@ -1036,6 +1095,7 @@ pub fn compile_entry_returning_plan(
             .entry(model_name)
             .or_insert(fields);
     }
+    populate_calibration_retention_from_ast_if_unset(&mut compiler, ast, interner)?;
     // Task 4: declare the calibration retention arena BEFORE method-body
     // codegen — see `compile_returning_plan` for the full rationale.
     compiler.emit_retention_arena()?;

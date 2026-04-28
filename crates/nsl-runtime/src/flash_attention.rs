@@ -930,7 +930,8 @@ pub extern "C" fn nsl_flash_attention_csha_backward(
         } else {
             heads
         };
-        let grid_x = (seq_len + block_q - 1) / block_q;
+        let q_blocks = (seq_len + block_q - 1) / block_q;
+        let grid_x = 1i64;
         let grid_y = batch * effective_heads;
         let grid_z = 1i64;
         let block_x = 128i64;
@@ -1012,7 +1013,33 @@ pub extern "C" fn nsl_flash_attention_csha_backward(
         // segment_masked kernel variant reads it only when set.
         let mut seg_ids = segment_ids_ptr as u64;
 
-        let args: [*mut c_void; 46] = [
+        // Option A f32 scratch for dK/dV: accumulate in f32 to avoid the
+        // f16-HBM saturation-to-inf that plagued the naive ld-add-store
+        // finalize. Scratch is zeroed, each q-block kernel does serialized
+        // ld.f32/add.f32/st.f32 RMW (deterministic — no atomics), and a
+        // final conversion kernel writes f32 scratch → f16 dK/dV outputs.
+        let qkv_elems = (batch * heads * seq_len * head_dim) as usize;
+        let scratch_bytes = qkv_elems * 4; // f32
+        let dk_scratch_raw = if d_k != 0 {
+            crate::cuda::inner::alloc_device(scratch_bytes)
+        } else {
+            std::ptr::null_mut()
+        };
+        let dv_scratch_raw = if d_v != 0 {
+            crate::cuda::inner::alloc_device(scratch_bytes)
+        } else {
+            std::ptr::null_mut()
+        };
+        if !dk_scratch_raw.is_null() {
+            crate::cuda::inner::memset_d8(dk_scratch_raw, scratch_bytes);
+        }
+        if !dv_scratch_raw.is_null() {
+            crate::cuda::inner::memset_d8(dv_scratch_raw, scratch_bytes);
+        }
+        let mut dk_scratch = dk_scratch_raw as u64;
+        let mut dv_scratch = dv_scratch_raw as u64;
+
+        let args: [*mut c_void; 48] = [
             &mut q as *mut _ as *mut c_void,
             &mut k as *mut _ as *mut c_void,
             &mut v as *mut _ as *mut c_void,
@@ -1059,18 +1086,99 @@ pub extern "C" fn nsl_flash_attention_csha_backward(
             &mut d_wv as *mut _ as *mut c_void,
             &mut d_x as *mut _ as *mut c_void,
             &mut d_xn as *mut _ as *mut c_void,
+            // Option A: f32 scratch for dK/dV accumulation.
+            &mut dk_scratch as *mut _ as *mut c_void,
+            &mut dv_scratch as *mut _ as *mut c_void,
             // PCA Tier A Task 4B: segment_ids trailing slot.
             &mut seg_ids as *mut _ as *mut c_void,
         ];
 
-        let rc = crate::cuda::inner::kernel_launch(
-            ptx_ptr as *const u8,
-            name_ptr as *const u8,
-            [grid_x, grid_y, grid_z],
-            [block_x, block_y, block_z],
-            &args,
-            shared_mem_bytes as u32,
-        );
+        // The backward kernel is launched one q-block at a time with the
+        // q-block base carried in the otherwise-unused seq_lens_ptr slot.
+        // Each launch does serialized f32 RMW on dk_scratch / dv_scratch,
+        // so the final scratch values accumulate correctly across all
+        // q-blocks without atomics. dQ is written per-launch to disjoint
+        // slices so `d_q` still needs a zero init before the first launch.
+        if d_q != 0 {
+            crate::cuda::inner::memset_d8(d_q as *mut c_void, qkv_elems * 2);
+        }
+
+        let mut rc = cudarc::driver::sys::CUresult::CUDA_SUCCESS;
+        for q_block in 0..q_blocks {
+            // Thread the q-block base into seq_lens_ptr slot via `slens`.
+            // Raw-ptr use: `args[16]` holds `&mut slens`, and CUDA's
+            // `cuLaunchKernel` reads the pointee at call time, so each
+            // iteration's assignment is picked up by the next launch.
+            // `black_box` prevents the optimizer from eliding the write
+            // because dataflow analysis can't see the read-through-ptr.
+            slens = (q_block * block_q) as u64;
+            let _ = std::hint::black_box(&slens);
+            rc = crate::cuda::inner::kernel_launch(
+                ptx_ptr as *const u8,
+                name_ptr as *const u8,
+                [grid_x, grid_y, grid_z],
+                [block_x, block_y, block_z],
+                &args,
+                shared_mem_bytes as u32,
+            );
+            if rc != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+                break;
+            }
+        }
+
+        if rc == cudarc::driver::sys::CUresult::CUDA_SUCCESS
+            && std::env::var_os("NSL_CSHA_DUMP_GRADS").map(|v| v != "0" && v != "").unwrap_or(false)
+        {
+            let dump_first_nonfinite_scratch = |name: &str, ptr: *mut c_void| {
+                if ptr.is_null() || qkv_elems == 0 {
+                    return;
+                }
+                let mut host = vec![0f32; qkv_elems];
+                crate::cuda::inner::memcpy_dtoh(host.as_mut_ptr() as *mut c_void, ptr, scratch_bytes);
+                if let Some((idx, value)) = host.iter().copied().enumerate().find(|(_, x)| !x.is_finite()) {
+                    eprintln!(
+                        "[csha-dump-bwd-scratch] first non-finite {name}[{idx}]={value:?}"
+                    );
+                } else {
+                    let first = host.iter().take(4).copied().collect::<Vec<_>>();
+                    eprintln!(
+                        "[csha-dump-bwd-scratch] {name} first4={first:?} max_abs={:.6e}",
+                        host.iter().copied().map(f32::abs).fold(0.0f32, f32::max)
+                    );
+                }
+            };
+            dump_first_nonfinite_scratch("dk_scratch", dk_scratch_raw);
+            dump_first_nonfinite_scratch("dv_scratch", dv_scratch_raw);
+        }
+
+        // Convert f32 scratch → f16 output for dK and dV.
+        if rc == cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+            if !dk_scratch_raw.is_null() && d_k != 0 {
+                let c_rc = csha_bwd_convert_f32_to_f16(
+                    dk_scratch_raw, d_k as *mut c_void, qkv_elems,
+                );
+                if c_rc != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+                    rc = c_rc;
+                }
+            }
+            if rc == cudarc::driver::sys::CUresult::CUDA_SUCCESS
+                && !dv_scratch_raw.is_null() && d_v != 0
+            {
+                let c_rc = csha_bwd_convert_f32_to_f16(
+                    dv_scratch_raw, d_v as *mut c_void, qkv_elems,
+                );
+                if c_rc != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+                    rc = c_rc;
+                }
+            }
+        }
+
+        if !dk_scratch_raw.is_null() {
+            crate::cuda::inner::free_device(dk_scratch_raw);
+        }
+        if !dv_scratch_raw.is_null() {
+            crate::cuda::inner::free_device(dv_scratch_raw);
+        }
 
         // NSL_CSHA_DUMP_GRADS=1 diagnostic — zero-cost when unset. Reads back
         // the 6 forward-saved activations (q_proj, k_proj, v_proj, row_max,
@@ -1129,6 +1237,94 @@ pub extern "C" fn nsl_flash_attention_csha_backward(
         eprintln!("[nsl] CSHA backward requires CUDA.");
         -1
     }
+}
+
+/// f32 scratch → f16 output conversion kernel used by the CSHA backward
+/// (Option A of the dK/dV saturation fix). Cached once per process via
+/// `kernel_launch`'s content-hashed module cache.
+///
+/// Kernel body: one thread per element, bounds-checked against `n_elems`.
+/// `src` is f32, `dst` is f16; conversion is `cvt.rn.f16.f32` (round to
+/// nearest even). Overflow still saturates to ±inf — acceptable here
+/// because the f32 scratch was accumulated deterministically and any
+/// |x| > 65504 is a legitimate gradient value the downstream f16 store
+/// can't represent regardless of accumulation strategy.
+#[cfg(feature = "cuda")]
+const CSHA_BWD_F32_TO_F16_PTX: &str = concat!(
+    ".version 8.7\n",
+    ".target sm_75\n",
+    ".address_size 64\n",
+    ".visible .entry nsl_csha_bwd_f32_to_f16(\n",
+    "    .param .u64 src_ptr,\n",
+    "    .param .u64 dst_ptr,\n",
+    "    .param .u64 n_elems\n",
+    ")\n",
+    "{\n",
+    // User registers intentionally avoid %tid / %ntid / %ctaid names
+    // — those are PTX built-in special registers and redefining them
+    // as user regs triggers a ptxas parse failure (tid.x dot-syntax
+    // clash).
+    "    .reg .u32 %th, %bd, %bi, %gid, %tmp;\n",
+    "    .reg .u64 %idx, %n, %src, %dst, %addr_src, %addr_dst;\n",
+    "    .reg .f32 %f;\n",
+    "    .reg .b16 %h;\n",
+    "    .reg .pred %p;\n",
+    "    mov.u32 %th, %tid.x;\n",
+    "    mov.u32 %bd, %ntid.x;\n",
+    "    mov.u32 %bi, %ctaid.x;\n",
+    "    mul.lo.u32 %tmp, %bi, %bd;\n",
+    "    add.u32 %gid, %tmp, %th;\n",
+    "    cvt.u64.u32 %idx, %gid;\n",
+    "    ld.param.u64 %src, [src_ptr];\n",
+    "    ld.param.u64 %dst, [dst_ptr];\n",
+    "    ld.param.u64 %n, [n_elems];\n",
+    "    setp.ge.u64 %p, %idx, %n;\n",
+    "    @%p bra F32F16_END;\n",
+    "    shl.b64 %addr_src, %idx, 2;\n",
+    "    add.u64 %addr_src, %src, %addr_src;\n",
+    "    shl.b64 %addr_dst, %idx, 1;\n",
+    "    add.u64 %addr_dst, %dst, %addr_dst;\n",
+    "    ld.global.f32 %f, [%addr_src];\n",
+    "    cvt.rn.f16.f32 %h, %f;\n",
+    "    st.global.b16 [%addr_dst], %h;\n",
+    "F32F16_END:\n",
+    "    ret;\n",
+    "}\n",
+    "\0",
+);
+
+#[cfg(feature = "cuda")]
+const CSHA_BWD_F32_TO_F16_NAME: &str = "nsl_csha_bwd_f32_to_f16\0";
+
+/// Launch the f32→f16 conversion kernel. `n_elems` is the element count
+/// (src is f32*4 bytes, dst is f16*2 bytes).
+#[cfg(feature = "cuda")]
+fn csha_bwd_convert_f32_to_f16(
+    src: *mut c_void,
+    dst: *mut c_void,
+    n_elems: usize,
+) -> cudarc::driver::sys::CUresult {
+    if n_elems == 0 {
+        return cudarc::driver::sys::CUresult::CUDA_SUCCESS;
+    }
+    let mut src_ptr = src as u64;
+    let mut dst_ptr = dst as u64;
+    let mut n = n_elems as u64;
+    let args: [*mut c_void; 3] = [
+        &mut src_ptr as *mut _ as *mut c_void,
+        &mut dst_ptr as *mut _ as *mut c_void,
+        &mut n as *mut _ as *mut c_void,
+    ];
+    let block: i64 = 128;
+    let grid: i64 = ((n_elems as i64) + block - 1) / block;
+    crate::cuda::inner::kernel_launch(
+        CSHA_BWD_F32_TO_F16_PTX.as_ptr(),
+        CSHA_BWD_F32_TO_F16_NAME.as_ptr(),
+        [grid, 1, 1],
+        [block, 1, 1],
+        &args,
+        0,
+    )
 }
 
 /// NSL_CSHA_DUMP_GRADS diagnostic: d2h-read the 6 save buffers and the 8
@@ -2008,7 +2204,8 @@ pub extern "C" fn nsl_flash_attention_backward(
             // f64 -> f32
             if is_gpu {
                 // GPU f64 tensors: transfer as f64, then convert
-                let f64_buf = vec![0.0f64; len];
+                #[allow(unused_mut)] // `mut` needed only under `cuda` feature
+                let mut f64_buf = vec![0.0f64; len];
                 #[cfg(feature = "cuda")]
                 {
                     crate::cuda::inner::memcpy_dtoh(

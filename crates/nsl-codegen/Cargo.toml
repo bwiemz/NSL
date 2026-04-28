@@ -18,7 +18,7 @@ cranelift-module.workspace = true
 cranelift-object.workspace = true
 cranelift-native.workspace = true
 target-lexicon.workspace = true
-nsl-runtime = { path = "../nsl-runtime" }
+nsl-runtime = { path = "../nsl-runtime", features = ["interop"] }
 nsl-parser.workspace = true
 serde.workspace = true
 serde_json = "1"
@@ -26,6 +26,7 @@ sha2 = "0.10"
 safetensors = "0.4"
 half = { version = "2.4", features = ["std"] }
 base64 = "0.22"
+object = "0.36"
 cudarc = { version = "0.19.4", default-features = false, features = ["driver", "cublas", "cuda-version-from-build-system", "dynamic-linking"], optional = true }
 rand = { version = "0.8", optional = true }
 
@@ -41,7 +42,6 @@ string-interner.workspace = true
 insta = { version = "1.40", features = ["yaml"] }
 tempfile = "3"
 libloading = "0.8"
-object = "0.36"
 assert_cmd = "2"
 
 [[bin]]

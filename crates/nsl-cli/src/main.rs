@@ -1260,6 +1260,9 @@ fn main_inner() {
                 // M62 Task 6: weight_index_map is populated from analysis in
                 // run_build_single/run_build_multi (where analysis is in scope).
                 weight_index_map: std::collections::HashMap::new(),
+                // PR #127 (AWQ v2) added this field; CLI build site populates
+                // it via the calibration plumbing further down, not here.
+                calibration_compile_bundle: None,
             };
 
             // Validate WGGO mode string early so users get a clear error
@@ -1575,6 +1578,9 @@ fn main_inner() {
                 // M62 Task 6: weight_index_map is populated from analysis in
                 // run_build_single (where analysis is in scope).
                 weight_index_map: std::collections::HashMap::new(),
+                // PR #127 (AWQ v2) added this field; CLI run site doesn't
+                // perform calibration so the bundle is unset.
+                calibration_compile_bundle: None,
             };
             // M41: Disaggregated inference — spawn router + prefill + decode workers.
             // Each runs the same compiled binary with NSL_ROLE and NSL_LOCAL_RANK env vars.

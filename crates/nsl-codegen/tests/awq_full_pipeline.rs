@@ -6,25 +6,29 @@
 //!   activation observation (emit_observe_batch with real f32 data)
 //!   → sidecar assembly → final compile with scales (compile_with_options).
 //!
-//! Blocker A (compile_and_calibrate sidecar recovery) and Blocker B
-//! (emit_observe_batch real IR) are both addressed:
-//!   * Blocker A: compile_and_calibrate now constructs Compiler directly
-//!     and reads back compile_options.calibration_sidecar.
-//!   * Blocker B: real_subprocess_entry calls
-//!     build_sidecar_from_forward_observation which loads calibration data
-//!     and drives emit_observe_batch per batch with real f32 values.
+//! Architecture (post-2026-04-22 completion work):
+//!   * Two-object compile: scaffolding.o (calibration_main) + calib_model.o
+//!     (model_forward + nsl_calib_model_forward wrapper + retention arena)
+//!     linked via link_calibration_binary. See spec/plan pair at
+//!     docs/superpowers/specs/2026-04-22-awq-real-subprocess-completion-design.md.
+//!   * loop_body calls nsl_calib_model_forward between nsl_calibration_batch_at
+//!     and the plan-driven max-abs reduction, populating the retention arena
+//!     via the model_forward splice. Empty-arena regression (the Task 6 revert
+//!     signal) is impossible by construction.
 //!
 //! These tests drive the public calibration API (no internal Compiler
 //! exposure) so they exercise the same surface a real AWQ pipeline uses.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use nsl_codegen::calibration::{
     CalibCtx, CalibrationHook, CalibrationResult,
     awq_hook::AwqCalibrationHook,
     discovery::DiscoveredProjection,
+    binary_codegen::real_subprocess_entry,
     observation::ProjectionRef,
+    HarnessConfig, HarnessMode, HookRegistry,
     retention::{ArenaLayout, RetentionTable, TensorShape},
     retention_pass::build_arena_layout,
     sidecar::{Sidecar, SIDECAR_VERSION},
@@ -67,6 +71,155 @@ fn build_awq_sidecar(projections: &[(&str, Vec<f32>)]) -> Sidecar {
         num_samples_used: 1,
         hooks,
         wggo_head_gradients: None,
+    }
+}
+
+fn awq_fixture_compile_bundle(
+) -> (
+    Vec<DiscoveredProjection>,
+    std::sync::Arc<nsl_codegen::calibration::CalibrationCompileBundle>,
+) {
+    let source = std::fs::read_to_string(fixture("awq_calibration_mlp.nsl"))
+        .expect("awq fixture readable");
+    let mut interner = nsl_lexer::Interner::new();
+    let (tokens, lex_diags) = nsl_lexer::tokenize(&source, nsl_errors::FileId(0), &mut interner);
+    assert!(
+        lex_diags
+            .iter()
+            .all(|diag| !matches!(diag.level, nsl_errors::Level::Error)),
+        "fixture must lex cleanly: {lex_diags:?}"
+    );
+
+    let parsed = nsl_parser::parse(&tokens, &mut interner);
+    assert!(
+        parsed
+            .diagnostics
+            .iter()
+            .all(|diag| !matches!(diag.level, nsl_errors::Level::Error)),
+        "fixture must parse cleanly: {:?}",
+        parsed.diagnostics
+    );
+
+    let projections = nsl_codegen::calibration::pre_scan_awq_projections_from_ast(
+        &parsed.module,
+        &interner,
+    );
+    let mut analysis_interner = interner.clone();
+    let analysis = nsl_semantic::analyze(&parsed.module, &mut analysis_interner);
+    assert!(
+        analysis
+            .diagnostics
+            .iter()
+            .all(|diag| !matches!(diag.level, nsl_errors::Level::Error)),
+        "fixture must pass semantic analysis: {:?}",
+        analysis.diagnostics
+    );
+
+    let bundle = std::sync::Arc::new(nsl_codegen::calibration::CalibrationCompileBundle {
+        ast: parsed.module,
+        interner: analysis_interner,
+        type_map: analysis.type_map.clone(),
+    });
+
+    (projections, bundle)
+}
+
+fn read_safetensors_flat(path: &Path, tensor_name: &str) -> Vec<f32> {
+    let bytes = std::fs::read(path)
+        .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
+    let tensors = safetensors::SafeTensors::deserialize(&bytes)
+        .unwrap_or_else(|e| panic!("deserializing {}: {e}", path.display()));
+    let tensor = tensors
+        .tensor(tensor_name)
+        .unwrap_or_else(|e| panic!("missing tensor {tensor_name} in {}: {e}", path.display()));
+    assert_eq!(
+        tensor.dtype(),
+        safetensors::Dtype::F32,
+        "{tensor_name} in {} must be f32",
+        path.display()
+    );
+    tensor
+        .data()
+        .chunks_exact(4)
+        .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+        .collect()
+}
+
+fn reference_awq_scales(calib: &[f32], up_w: &[f32]) -> (Vec<f32>, Vec<f32>) {
+    const CALIB_COUNT: usize = 8;
+    const CALIB_SEQ: usize = 4;
+    const CALIB_HIDDEN: usize = 64;
+    const UP_OUT: usize = 128;
+
+    assert_eq!(
+        calib.len(),
+        CALIB_COUNT * CALIB_SEQ * CALIB_HIDDEN,
+        "calibration fixture shape must stay [8, 4, 64]"
+    );
+    assert_eq!(
+        up_w.len(),
+        UP_OUT * CALIB_HIDDEN,
+        "TinyMLP.up_proj weight fixture shape must stay [128, 64]"
+    );
+
+    let rows = CALIB_COUNT * CALIB_SEQ;
+    let mut up_ref = vec![0.0f32; CALIB_HIDDEN];
+    let mut down_ref = vec![0.0f32; UP_OUT];
+
+    for row_idx in 0..rows {
+        let row = &calib[row_idx * CALIB_HIDDEN..(row_idx + 1) * CALIB_HIDDEN];
+        for channel in 0..CALIB_HIDDEN {
+            up_ref[channel] = up_ref[channel].max(row[channel].abs());
+        }
+
+        for out_channel in 0..UP_OUT {
+            let weights = &up_w[out_channel * CALIB_HIDDEN..(out_channel + 1) * CALIB_HIDDEN];
+            let mut acc = 0.0f32;
+            for feature in 0..CALIB_HIDDEN {
+                acc += row[feature] * weights[feature];
+            }
+            let relu = acc.max(0.0);
+            down_ref[out_channel] = down_ref[out_channel].max(relu.abs());
+        }
+    }
+
+    (up_ref, down_ref)
+}
+
+fn awq_scales(sidecar: &Sidecar, projection: &str) -> Vec<f32> {
+    let blob = sidecar
+        .hooks
+        .get("awq_activation_scales")
+        .expect("awq_activation_scales hook blob missing from sidecar");
+    let parsed = nsl_runtime::awq::AwqScales::from_blob(blob)
+        .expect("AWQ sidecar blob must parse");
+    parsed
+        .by_projection
+        .get(projection)
+        .unwrap_or_else(|| panic!("projection {projection} missing from AWQ sidecar"))
+        .clone()
+}
+
+fn assert_close(actual: &[f32], expected: &[f32], rtol: f32, label: &str) {
+    assert_eq!(
+        actual.len(),
+        expected.len(),
+        "{label}: vector length mismatch (actual {} expected {})",
+        actual.len(),
+        expected.len()
+    );
+
+    for (index, (&actual_value, &expected_value)) in actual.iter().zip(expected.iter()).enumerate() {
+        let scale = actual_value
+            .abs()
+            .max(expected_value.abs())
+            .max(1.0);
+        let diff = (actual_value - expected_value).abs();
+        assert!(
+            diff <= rtol * scale,
+            "{label}[{index}] diff {diff} exceeds tol {} (actual {actual_value}, expected {expected_value})",
+            rtol * scale
+        );
     }
 }
 
@@ -455,4 +608,49 @@ fn compile_with_options_smoke_test() {
     let opts = nsl_codegen::CompileOptions::default();
     nsl_codegen::compile_with_options(src, &opts)
         .expect("simple source must compile with default options");
+}
+
+/// Tolerance: 5e-6 — f32 matmul over 64-length reductions accumulates
+/// ~4 ULPs of round-off vs. a pairwise accumulator; the subprocess
+/// runs the same fabs/fmax loop as the analytical reference, so the
+/// dominant source of drift is model_forward's matmul reordering, not
+/// the reduction. Fixture dimensions:
+///   up_proj:   [128, 64]  — K=64 reduction in the forward matmul
+///   down_proj: [64, 128]  — K=128 reduction, tighter but still < 5e-6
+///   batch:     [8, 4, 64] = 32 rows × 64 channels of calibration data
+/// Tighter (e.g. 1e-6) risks flakiness from reduction-order drift;
+/// looser would mask real subprocess-pipeline bugs.
+#[test]
+fn end_to_end_real_subprocess_matches_analytical_reference() {
+    let data_path = fixture("awq_calib_data.safetensors");
+    let weights_path = fixture("awq_calib_weights.safetensors");
+    let (projections, compile_bundle) = awq_fixture_compile_bundle();
+
+    let mut registry = HookRegistry::new();
+    registry.register(Box::new(AwqCalibrationHook::from_discovered(&projections)));
+
+    let cfg = HarnessConfig {
+        checkpoints: vec![weights_path.clone()],
+        calibration_data: data_path.clone(),
+        samples: 8,
+        batch_size: 1,
+        timeout_secs: 30,
+        mode: HarnessMode::Required,
+        projections,
+        compile_bundle: Some(compile_bundle),
+    };
+
+    let sidecar = real_subprocess_entry(&cfg, &registry)
+        .expect("real subprocess pipeline runs end-to-end")
+        .sidecar;
+
+    let calib = read_safetensors_flat(&data_path, "calibration");
+    let up_w = read_safetensors_flat(&weights_path, "TinyMLP.up_proj");
+    let (up_ref, down_ref) = reference_awq_scales(&calib, &up_w);
+
+    let up_actual = awq_scales(&sidecar, "TinyMLP.up_proj");
+    let down_actual = awq_scales(&sidecar, "TinyMLP.down_proj");
+
+    assert_close(&up_actual, &up_ref, 5e-6, "up_proj");
+    assert_close(&down_actual, &down_ref, 5e-6, "down_proj");
 }

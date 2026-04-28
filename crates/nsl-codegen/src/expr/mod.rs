@@ -141,6 +141,11 @@ impl Compiler<'_> {
                     ExprKind::Ident(_) => {
                         let func_name = self.expr_as_func_name(right);
                         if let Some(name) = func_name {
+                            if let Some(result) =
+                                self.try_compile_model_tensor_pipe(builder, state, &name, left_val)?
+                            {
+                                return Ok(result);
+                            }
                             // Task 4: emit retention splice BEFORE the matmul call.
                             // No-op when calibration_retention is None.
                             self.try_emit_retention_splice(builder, &name, left_val);
@@ -232,6 +237,76 @@ impl Compiler<'_> {
             ExprKind::Ident(sym) => Some(self.resolve_sym(*sym).to_string()),
             _ => None,
         }
+    }
+
+    fn try_compile_model_tensor_pipe(
+        &mut self,
+        builder: &mut FunctionBuilder,
+        state: &mut FuncState,
+        field_name: &str,
+        input_val: Value,
+    ) -> Result<Option<Value>, CodegenError> {
+        let Some(model_name) = self.current_method_model_name.clone() else {
+            return Ok(None);
+        };
+        let is_tensor_field = self
+            .models
+            .model_tensor_field_shapes
+            .get(&model_name)
+            .is_some_and(|fields| fields.contains_key(field_name));
+        if !is_tensor_field {
+            return Ok(None);
+        }
+
+        let self_var = state
+            .variables
+            .iter()
+            .find_map(|(sym, (var, _ty))| (self.resolve_sym(*sym) == "self").then_some(*var))
+            .ok_or_else(|| CodegenError::new("model tensor pipe missing self binding"))?;
+        let field_offset = self
+            .types
+            .struct_layouts
+            .get(&model_name)
+            .and_then(|layout| {
+                layout
+                    .fields
+                    .iter()
+                    .find(|field| field.name == field_name)
+                    .map(|field| field.offset)
+            })
+            .ok_or_else(|| {
+                CodegenError::new(format!(
+                    "model '{}' has no tensor field '{}'",
+                    model_name, field_name
+                ))
+            })?;
+
+        let self_ptr = builder.use_var(self_var);
+        let field_val = builder.ins().load(
+            cl_types::I64,
+            MemFlags::trusted(),
+            self_ptr,
+            field_offset as i32,
+        );
+
+        if let Some(ref weight_map) = self.features.weight_map {
+            let candidates = [format!("{}.{}", model_name, field_name), field_name.to_string()];
+            for key in &candidates {
+                if weight_map.get(key).is_some() {
+                    state.weight_values.insert(field_val, key.clone());
+                    state.weights_by_name.insert(key.clone(), field_val);
+                    break;
+                }
+            }
+        }
+        if state.weight_values.contains_key(&field_val) {
+            self.set_ownership(builder, state, field_val, Ownership::BorrowedWeight);
+        }
+
+        self.try_emit_retention_splice(builder, field_name, input_val);
+        let flags_zero = builder.ins().iconst(cl_types::I8, 0);
+        self.compile_traced_call(builder, "nsl_tensor_matmul", &[input_val, field_val, flags_zero])
+            .map(Some)
     }
 
     // ── M38b: Ownership-aware helpers ──────────────────────────────
@@ -489,11 +564,8 @@ impl Compiler<'_> {
         let arena_gv = self.module.declare_data_in_func(arena_data_id, builder.func);
         let arena_ptr = builder.ins().symbol_value(cl_types::I64, arena_gv);
 
-        // Determine the data pointer inside the NslTensor struct.
-        // NslTensor layout: [magic: u32 (4 bytes)] [data: *mut c_void (8 bytes)] ...
-        // So the `data` field is at byte offset 4.
-        // We load an 8-byte pointer from (input_val + 4).
-        const DATA_FIELD_OFFSET: i32 = 4;
+        // Determine the data pointer inside the repr(C) NslTensor layout.
+        const DATA_FIELD_OFFSET: i32 = nsl_runtime::tensor::NSL_TENSOR_DATA_OFFSET as i32;
         let data_ptr = builder.ins().load(
             cl_types::I64,
             MemFlags::new(),

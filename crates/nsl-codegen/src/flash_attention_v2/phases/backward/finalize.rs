@@ -14,11 +14,136 @@
 
 use crate::flash_attention::FlashAttentionConfig;
 
+pub fn emit_store_dq_only(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
+    let head_dim = config.head_dim as u32;
+    let block_q = config.block_q as u32;
+    let dq_smem_off = crate::flash_attention_v2::smem_layout::backward_dq_offset(config);
+    let dq_cells = block_q * head_dim;
+    let dq_cells_per_thread = dq_cells.div_ceil(128);
+
+    ptx.push_str(&format!(
+        "    // Tier C backward finalize -- DQ global store only (q_tile_iter={q_tile_iter})\n"
+    ));
+    ptx.push_str("    // -- DQ store via [dq_ptr] (coop SMEM->HBM, full tile) --\n");
+    ptx.push_str("    setp.eq.u64 %p0, %rd_bwd_dq, 0;\n");
+    ptx.push_str(&format!(
+        "    @%p0 bra V2_BWD_STORE_DQ_SKIP_{q_tile_iter};\n"
+    ));
+    ptx.push_str("    mul.lo.u64 %rd_dq_base, %batch_idx, %rd5;\n");
+    ptx.push_str("    add.u64 %rd_dq_base, %rd_dq_base, %head_idx;\n");
+    ptx.push_str("    mul.lo.u64 %rd_dq_base, %rd_dq_base, %rd6;\n");
+    ptx.push_str("    add.u64 %rd_dq_base, %rd_dq_base, %q_start;\n");
+    ptx.push_str("    mul.lo.u64 %rd_dq_base, %rd_dq_base, %rd7;\n");
+    ptx.push_str("    shl.b64 %rd_dq_base, %rd_dq_base, 1;  // * 2 bytes (f16)\n");
+    ptx.push_str("    add.u64 %rd_dq_base, %rd_bwd_dq, %rd_dq_base;\n");
+    for k in 0..dq_cells_per_thread {
+        let thread_cell = k * 128;
+        ptx.push_str("    cvt.u64.u32 %rd_dq_idx, %tid_x;\n");
+        if thread_cell > 0 {
+            ptx.push_str(&format!(
+                "    add.u64 %rd_dq_idx, %rd_dq_idx, {};\n", thread_cell
+            ));
+        }
+        ptx.push_str(&format!(
+            "    setp.lt.u64 %p_dq_g, %rd_dq_idx, {};\n", dq_cells
+        ));
+        ptx.push_str("    div.u64 %rd42, %rd_dq_idx, %rd7;\n");
+        ptx.push_str("    add.u64 %rd43, %rd42, %q_start;\n");
+        ptx.push_str("    setp.lt.u64 %p0, %rd43, %rd6;\n");
+        ptx.push_str("    and.pred %p_dq_g, %p_dq_g, %p0;\n");
+        ptx.push_str("    shl.b64 %rd_dq_smem, %rd_dq_idx, 2;\n");
+        ptx.push_str(&format!(
+            "    add.u64 %rd_dq_smem, %rd_dq_smem, {dq_smem_off};\n"
+        ));
+        ptx.push_str("    add.u64 %rd_dq_smem, %shmem_base, %rd_dq_smem;\n");
+        ptx.push_str("    @%p_dq_g ld.shared.f32 %f_dq_tmp, [%rd_dq_smem];\n");
+        ptx.push_str("    shl.b64 %rd_dq_hbm, %rd_dq_idx, 1;\n");
+        ptx.push_str("    add.u64 %rd_dq_hbm, %rd_dq_base, %rd_dq_hbm;\n");
+        ptx.push_str("    @%p_dq_g cvt.rn.f16.f32 %h0, %f_dq_tmp;\n");
+        ptx.push_str("    @%p_dq_g st.global.b16 [%rd_dq_hbm], %h0;\n");
+    }
+    ptx.push_str(&format!("V2_BWD_STORE_DQ_SKIP_{q_tile_iter}:\n"));
+}
+
+pub fn emit_store_kv_only(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
+    let head_dim = config.head_dim as u32;
+    let total_cells = (config.block_kv as u32) * head_dim;
+    let cells_per_thread = total_cells.div_ceil(128);
+    let dk_smem_off = crate::flash_attention_v2::smem_layout::backward_dk_offset(config);
+    let dv_smem_off = crate::flash_attention_v2::smem_layout::backward_dv_offset(config);
+
+    ptx.push_str(&format!(
+        "    // Tier C backward finalize -- DK/DV f32-scratch accumulate (q_tile_iter={q_tile_iter})\n"
+    ));
+    // Option A: write dK / dV to f32 scratch pointers instead of the
+    // f16 dk/dv output tensors. Each q-block launch's kernel does
+    // `ld.global.f32 / add.f32 / st.global.f32` RMW into scratch; a
+    // host-side conversion kernel writes scratch → f16 after all
+    // q-blocks complete. Avoids the f16 saturation-to-inf path.
+    //
+    // HBM byte-stride is * 4 (f32), not * 2 (f16) — index math below
+    // uses `shl.b64 ..., 2` to align with the scratch f32 layout.
+    for (label, ptr_reg, ptr_name, smem_off) in [
+        ("DK", "%rd_bwd_dk_scratch", "dk_scratch_ptr", dk_smem_off),
+        ("DV", "%rd_bwd_dv_scratch", "dv_scratch_ptr", dv_smem_off),
+    ] {
+        ptx.push_str(&format!(
+            "    // -- {label} f32-scratch RMW via [{ptr_name}] (coop SMEM->HBM) --\n"
+        ));
+        ptx.push_str(&format!("    setp.eq.u64 %p0, {ptr_reg}, 0;\n"));
+        ptx.push_str(&format!(
+            "    @%p0 bra V2_BWD_STORE_{label}_SKIP_{q_tile_iter};\n"
+        ));
+        ptx.push_str("    mul.lo.u64 %rd_dk_base, %batch_idx, %rd5;\n");
+        ptx.push_str("    add.u64 %rd_dk_base, %rd_dk_base, %head_idx;\n");
+        ptx.push_str("    mul.lo.u64 %rd_dk_base, %rd_dk_base, %rd6;\n");
+        ptx.push_str("    add.u64 %rd_dk_base, %rd_dk_base, %k_start;\n");
+        ptx.push_str("    mul.lo.u64 %rd_dk_base, %rd_dk_base, %rd7;\n");
+        // f32 scratch: 4 bytes per element, so byte stride = elem * 4.
+        ptx.push_str("    shl.b64 %rd_dk_base, %rd_dk_base, 2;\n");
+        ptx.push_str(&format!(
+            "    add.u64 %rd_dk_base, {ptr_reg}, %rd_dk_base;\n"
+        ));
+        for k in 0..cells_per_thread {
+            let thread_cell = k * 128;
+            ptx.push_str("    cvt.u64.u32 %rd_dk_idx, %tid_x;\n");
+            if thread_cell > 0 {
+                ptx.push_str(&format!(
+                    "    add.u64 %rd_dk_idx, %rd_dk_idx, {};\n", thread_cell
+                ));
+            }
+            ptx.push_str(&format!(
+                "    setp.lt.u64 %p_dk, %rd_dk_idx, {};\n", total_cells
+            ));
+            ptx.push_str("    div.u64 %rd42, %rd_dk_idx, %rd7;\n");
+            ptx.push_str("    add.u64 %rd43, %rd42, %k_start;\n");
+            ptx.push_str("    setp.lt.u64 %p0, %rd43, %rd6;\n");
+            ptx.push_str("    and.pred %p_dk, %p_dk, %p0;\n");
+            // SMEM f32 load (local contribution for this q-block).
+            ptx.push_str("    shl.b64 %rd_dk_smem, %rd_dk_idx, 2;\n");
+            ptx.push_str(&format!(
+                "    add.u64 %rd_dk_smem, %rd_dk_smem, {smem_off};\n"
+            ));
+            ptx.push_str("    add.u64 %rd_dk_smem, %shmem_base, %rd_dk_smem;\n");
+            ptx.push_str("    @%p_dk ld.shared.f32 %f_dk_tmp, [%rd_dk_smem];\n");
+            // HBM f32 scratch RMW: load, add, store — all in f32.
+            ptx.push_str("    shl.b64 %rd_dk_hbm, %rd_dk_idx, 2;\n");
+            ptx.push_str("    add.u64 %rd_dk_hbm, %rd_dk_base, %rd_dk_hbm;\n");
+            ptx.push_str("    @%p_dk ld.global.f32 %f0, [%rd_dk_hbm];\n");
+            ptx.push_str("    @%p_dk add.f32 %f_dk_tmp, %f_dk_tmp, %f0;\n");
+            ptx.push_str("    @%p_dk st.global.f32 [%rd_dk_hbm], %f_dk_tmp;\n");
+        }
+        ptx.push_str(&format!(
+            "V2_BWD_STORE_{label}_SKIP_{q_tile_iter}:\n"
+        ));
+    }
+    ptx.push_str("    bar.sync 0;\n");
+}
+
 /// Emit the cooperative global stores for all 7 gradient tensors.
 pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
     let head_dim = config.head_dim as u32;
     let _slices_per_lane = (head_dim / 32).max(1);
-    let block_q = config.block_q as u32;
 
     ptx.push_str(&format!(
         "    // Tier C backward finalize -- global stores of all 7 gradients (q_tile_iter={q_tile_iter})\n"
@@ -42,118 +167,8 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
     ptx.push_str("    mul.lo.u64 %rd30, %rd30, %rd7;\n");
     ptx.push_str("    shl.b64 %rd30, %rd30, 1;  // * 2 bytes (f16)\n");
 
-    // ── f16 store: dQ (cooperative SMEM→HBM, full block_q×head_dim tile).
-    //
-    // The dQ SMEM tile at backward_dq_offset is populated by the
-    // orchestrator's per-iter flush of %f_dq_{slice} registers. Finalize
-    // is invoked exactly once (q_tile_iter=0), so it must drain the
-    // WHOLE tile here — not just the rows owned by one iter. Mirrors the
-    // dK/dV cooperative copy pattern below.
-    let dq_smem_off = crate::flash_attention_v2::smem_layout::backward_dq_offset(config);
-    let dq_cells = block_q * head_dim;
-    let dq_cells_per_thread = dq_cells.div_ceil(128);
-    ptx.push_str("    // -- DQ store via [dq_ptr] (coop SMEM->HBM, full tile) --\n");
-    ptx.push_str("    setp.eq.u64 %p0, %rd_bwd_dq, 0;\n");
-    ptx.push_str(&format!(
-        "    @%p0 bra V2_BWD_STORE_DQ_SKIP_{q_tile_iter};\n"
-    ));
-    // HBM base for this block's Q segment:
-    //   ((batch_idx*heads + head_idx) * seq + q_start) * head_dim * 2
-    ptx.push_str("    mul.lo.u64 %rd_dq_base, %batch_idx, %rd5;\n");
-    ptx.push_str("    add.u64 %rd_dq_base, %rd_dq_base, %head_idx;\n");
-    ptx.push_str("    mul.lo.u64 %rd_dq_base, %rd_dq_base, %rd6;\n");
-    ptx.push_str("    add.u64 %rd_dq_base, %rd_dq_base, %q_start;\n");
-    ptx.push_str("    mul.lo.u64 %rd_dq_base, %rd_dq_base, %rd7;\n");
-    ptx.push_str("    shl.b64 %rd_dq_base, %rd_dq_base, 1;  // * 2 bytes (f16)\n");
-    ptx.push_str("    add.u64 %rd_dq_base, %rd_bwd_dq, %rd_dq_base;\n");
-    for k in 0..dq_cells_per_thread {
-        let thread_cell = k * 128;
-        ptx.push_str("    cvt.u64.u32 %rd_dq_idx, %tid_x;\n");
-        if thread_cell > 0 {
-            ptx.push_str(&format!(
-                "    add.u64 %rd_dq_idx, %rd_dq_idx, {};\n", thread_cell
-            ));
-        }
-        ptx.push_str(&format!(
-            "    setp.lt.u64 %p_dq_g, %rd_dq_idx, {};\n", dq_cells
-        ));
-        // SMEM f32 load
-        ptx.push_str("    shl.b64 %rd_dq_smem, %rd_dq_idx, 2;\n");
-        ptx.push_str(&format!(
-            "    add.u64 %rd_dq_smem, %rd_dq_smem, {dq_smem_off};\n"
-        ));
-        ptx.push_str("    add.u64 %rd_dq_smem, %shmem_base, %rd_dq_smem;\n");
-        ptx.push_str("    @%p_dq_g ld.shared.f32 %f_dq_tmp, [%rd_dq_smem];\n");
-        // HBM f16 store
-        ptx.push_str("    shl.b64 %rd_dq_hbm, %rd_dq_idx, 1;\n");
-        ptx.push_str("    add.u64 %rd_dq_hbm, %rd_dq_base, %rd_dq_hbm;\n");
-        ptx.push_str("    @%p_dq_g cvt.rn.f16.f32 %h0, %f_dq_tmp;\n");
-        ptx.push_str("    @%p_dq_g st.global.b16 [%rd_dq_hbm], %h0;\n");
-    }
-    ptx.push_str(&format!("V2_BWD_STORE_DQ_SKIP_{q_tile_iter}:\n"));
-
-    // dK / dV: cooperative SMEM → HBM copy. Both tiles are
-    //   [block_kv, head_dim] f32, row-major, living at backward_dk_offset
-    //   and backward_dv_offset. We convert to f16 and store with layout
-    //   [batch, heads, seq, head_dim] — SMEM row `r` maps to HBM kv_row
-    //   `r` (= this block's KV segment starts at row index 0 for the
-    //   single-KV-block configs this first cut supports).
-    //
-    // Coverage: block_kv * head_dim cells total. 128 threads cooperatively
-    // copy cells_per_thread = ceil(total / 128) each.
-    let total_cells = (config.block_kv as u32) * head_dim;
-    let cells_per_thread = total_cells.div_ceil(128);
-    let dk_smem_off = crate::flash_attention_v2::smem_layout::backward_dk_offset(config);
-    let dv_smem_off = crate::flash_attention_v2::smem_layout::backward_dv_offset(config);
-    for (label, ptr_reg, ptr_name, smem_off) in [
-        ("DK", "%rd_bwd_dk", "dk_ptr", dk_smem_off),
-        ("DV", "%rd_bwd_dv", "dv_ptr", dv_smem_off),
-    ] {
-        ptx.push_str(&format!(
-            "    // -- {label} store via [{ptr_name}] (coop SMEM->HBM) --\n"
-        ));
-        ptx.push_str(&format!("    setp.eq.u64 %p0, {ptr_reg}, 0;\n"));
-        ptx.push_str(&format!(
-            "    @%p0 bra V2_BWD_STORE_{label}_SKIP_{q_tile_iter};\n"
-        ));
-        // HBM base for this block's KV segment:
-        //   ((batch_idx*heads + head_idx)*seq + 0) * head_dim * 2
-        ptx.push_str("    mul.lo.u64 %rd_dk_base, %batch_idx, %rd5;\n");
-        ptx.push_str("    add.u64 %rd_dk_base, %rd_dk_base, %head_idx;\n");
-        ptx.push_str("    mul.lo.u64 %rd_dk_base, %rd_dk_base, %rd6;\n");
-        ptx.push_str("    mul.lo.u64 %rd_dk_base, %rd_dk_base, %rd7;\n");
-        ptx.push_str("    shl.b64 %rd_dk_base, %rd_dk_base, 1;\n");
-        ptx.push_str(&format!(
-            "    add.u64 %rd_dk_base, {ptr_reg}, %rd_dk_base;\n"
-        ));
-        for k in 0..cells_per_thread {
-            let thread_cell = k * 128;
-            ptx.push_str("    cvt.u64.u32 %rd_dk_idx, %tid_x;\n");
-            if thread_cell > 0 {
-                ptx.push_str(&format!(
-                    "    add.u64 %rd_dk_idx, %rd_dk_idx, {};\n", thread_cell
-                ));
-            }
-            ptx.push_str(&format!(
-                "    setp.lt.u64 %p_dk, %rd_dk_idx, {};\n", total_cells
-            ));
-            // SMEM f32 load
-            ptx.push_str("    shl.b64 %rd_dk_smem, %rd_dk_idx, 2;\n");
-            ptx.push_str(&format!(
-                "    add.u64 %rd_dk_smem, %rd_dk_smem, {smem_off};\n"
-            ));
-            ptx.push_str("    add.u64 %rd_dk_smem, %shmem_base, %rd_dk_smem;\n");
-            ptx.push_str("    @%p_dk ld.shared.f32 %f_dk_tmp, [%rd_dk_smem];\n");
-            // HBM f16 store
-            ptx.push_str("    shl.b64 %rd_dk_hbm, %rd_dk_idx, 1;\n");
-            ptx.push_str("    add.u64 %rd_dk_hbm, %rd_dk_base, %rd_dk_hbm;\n");
-            ptx.push_str("    @%p_dk cvt.rn.f16.f32 %h0, %f_dk_tmp;\n");
-            ptx.push_str("    @%p_dk st.global.b16 [%rd_dk_hbm], %h0;\n");
-        }
-        ptx.push_str(&format!(
-            "V2_BWD_STORE_{label}_SKIP_{q_tile_iter}:\n"
-        ));
-    }
+    emit_store_dq_only(ptx, config, q_tile_iter);
+    emit_store_kv_only(ptx, config, q_tile_iter);
 
     // ── dwq / dwk / dwv / dx: hook-managed. emit_dproj + emit_drmsnorm
     // phase 2 have already written the full tensors to HBM. Finalize
@@ -227,9 +242,17 @@ mod tests {
         let mut ptx = String::new();
         emit(&mut ptx, &cfg, 0);
 
+        // dq still stores f16 directly to dq_ptr (no scratch path for dQ —
+        // each q-block writes a disjoint slice so f16 overwrite is safe).
         assert!(ptx.contains("dq_ptr") && ptx.contains("st.global.b16"));
-        assert!(ptx.contains("dk_ptr"));
-        assert!(ptx.contains("dv_ptr"));
+        // dK / dV now RMW into f32 scratch (Option A saturation fix).
+        // `dk_scratch_ptr` / `dv_scratch_ptr` and `st.global.f32` are the
+        // current kv-store signals; `dk_ptr` / `dv_ptr` live only in the
+        // param block now.
+        assert!(ptx.contains("dk_scratch_ptr"));
+        assert!(ptx.contains("dv_scratch_ptr"));
+        assert!(ptx.contains("st.global.f32"),
+            "dK/dV must RMW into f32 scratch (not f16)");
         assert!(ptx.contains("dwq_ptr"));
         assert!(ptx.contains("dwk_ptr"));
         assert!(ptx.contains("dwv_ptr"));
@@ -239,14 +262,17 @@ mod tests {
 
     #[test]
     fn backward_finalize_dx_is_f32_others_are_f16() {
-        // After Phase 3 hook refactor (feat/csha-tier-c-diag), finalize
-        // no longer emits the dx f32 store — that moved into
-        // `emit_drmsnorm` phase 2. Finalize retains the dK/dV f16 copy.
+        // After the Option A saturation fix, dK/dV accumulate in f32 scratch
+        // (see `emit_store_kv_only`). Finalize emits `st.global.b16` only for
+        // dQ now; dK/dV use `st.global.f32` into scratch, and a host-side
+        // conversion kernel writes f16 dK/dV outputs after all q-blocks.
         let cfg = base_cfg_fused_backward(32, 32, 32, 4, 32);
         let mut ptx = String::new();
         emit(&mut ptx, &cfg, 0);
         assert!(ptx.contains("st.global.b16"),
-            "tensor gradients (dK/dV) still store as f16 in finalize");
+            "dQ is still written as f16 in finalize");
+        assert!(ptx.contains("st.global.f32"),
+            "dK/dV accumulate in f32 scratch (saturation fix)");
     }
 
     #[test]

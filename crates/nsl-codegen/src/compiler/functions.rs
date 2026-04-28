@@ -11,6 +11,17 @@ use crate::context::FuncState;
 use crate::error::CodegenError;
 use crate::types::pointer_type;
 
+fn model_def_from_stmt(stmt: &Stmt) -> Option<&nsl_ast::decl::ModelDef> {
+    match &stmt.kind {
+        StmtKind::ModelDef(md) => Some(md),
+        StmtKind::Decorated { stmt: inner, .. } => match &inner.kind {
+            StmtKind::ModelDef(md) => Some(md),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 impl Compiler<'_> {
     // ── Pass 2: Compile function bodies ─────────────────────────────
 
@@ -86,13 +97,7 @@ impl Compiler<'_> {
         // Compile model constructors and methods
         let model_defs: Vec<_> = stmts
             .iter()
-            .filter_map(|s| {
-                if let StmtKind::ModelDef(md) = &s.kind {
-                    Some(md.clone())
-                } else {
-                    None
-                }
-            })
+            .filter_map(|s| model_def_from_stmt(s).cloned())
             .collect();
         for md in &model_defs {
             self.compile_model_constructor(md)?;
@@ -462,13 +467,7 @@ impl Compiler<'_> {
     fn compile_model_methods(&mut self, stmts: &[Stmt]) -> Result<(), CodegenError> {
         let model_defs: Vec<_> = stmts
             .iter()
-            .filter_map(|s| {
-                if let StmtKind::ModelDef(md) = &s.kind {
-                    Some(md.clone())
-                } else {
-                    None
-                }
-            })
+            .filter_map(|s| model_def_from_stmt(s).cloned())
             .collect();
 
         for md in &model_defs {

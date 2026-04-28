@@ -20,10 +20,14 @@ pub mod subprocess;
 
 pub use ctx::{BufferHandle, CalibCtx};
 pub use discovery::{
-    discover_awq_projections, discover_awq_projections_from_state, DiscoveredProjection,
-    DiscoveryError,
+    discover_awq_projections, discover_awq_projections_from_state,
+    pre_scan_awq_projections_from_ast, DiscoveredProjection, DiscoveryError,
 };
 pub use hooks::{CalibrationHook, CalibrationResult, FinalizePlanEntry, ObservePlanEntry};
+pub use binary_codegen::{
+    emit_calibration_model_object, emit_calibration_scaffolding_object,
+    link_calibration_binary,
+};
 pub use wggo_gradient_hook::{discover_loss_anchor, LayerGradTarget, WggoAnchorError, WggoGradientHook};
 pub use identity_hook::IdentityHook;
 pub use observation::{LayerRef, ObservationPlan, ObservationSet, ParamRef, ProjectionRef};
@@ -32,9 +36,26 @@ pub use retention::{ArenaLayout, RetentionTable, TensorShape};
 pub use retention_pass::build_arena_layout;
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use crate::calibration::sidecar::{Sidecar, SIDECAR_VERSION};
 use sha2::{Digest, Sha256};
+
+#[derive(Clone)]
+pub struct CalibrationCompileBundle {
+    pub ast: nsl_ast::Module,
+    pub interner: nsl_lexer::Interner,
+    pub type_map: nsl_semantic::checker::TypeMap,
+}
+
+impl std::fmt::Debug for CalibrationCompileBundle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CalibrationCompileBundle")
+            .field("stmts", &self.ast.stmts.len())
+            .field("type_entries", &self.type_map.len())
+            .finish()
+    }
+}
 
 /// Error surfaced by the harness driver.
 #[derive(Debug)]
@@ -135,6 +156,9 @@ pub struct HarnessConfig {
     /// Per-projection `(path, weight_shape)` used to extend the cache-key
     /// digest.  Empty when no AWQ projections are present.
     pub projections: Vec<crate::calibration::discovery::DiscoveredProjection>,
+    /// Owned compile context used by the real subprocess path to emit the
+    /// calibration model object from the user's program.
+    pub compile_bundle: Option<Arc<CalibrationCompileBundle>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -173,6 +197,17 @@ pub fn run_harness_simulated(
                 cfg.calibration_data.display()
             ),
         })?;
+    // v2 follow-up (spec §12): bind cache against the calibration AST so
+    // a `.nsl` source edit invalidates the sidecar even when checkpoint
+    // bytes and calibration data are unchanged. Empty for paths without
+    // a compile bundle (non-forward hooks, identity-hook smoke tests) —
+    // those run the simpler pre-baked-JSON path that has no model object
+    // to bind against.
+    let model_ast_hash = cfg
+        .compile_bundle
+        .as_ref()
+        .map(|bundle| crate::calibration::cache::hash_compile_bundle_ast(&bundle.ast))
+        .unwrap_or_default();
     let cache_key = crate::calibration::cache::CacheKey {
         checkpoint_hashes: ckpt_hashes.clone(),
         calibration_data_hash: calibration_data_hash.clone(),
@@ -180,6 +215,7 @@ pub fn run_harness_simulated(
         samples: cfg.samples,
         batch_size: cfg.batch_size,
         projections: cfg.projections.clone(),
+        model_ast_hash,
     };
     let cache_key_digest = cache_key.digest();
 
@@ -372,6 +408,7 @@ mod driver_tests {
             timeout_secs: 5,
             mode: HarnessMode::Required,
             projections: vec![],
+            compile_bundle: None,
         };
 
         let r1 = run_harness_simulated(&registry, &cfg, simulated_ok_subprocess)
@@ -411,6 +448,7 @@ mod driver_tests {
             timeout_secs: 1,
             mode: HarnessMode::Required,
             projections: vec![],
+            compile_bundle: None,
         };
         match run_harness_simulated(&registry, &cfg, simulated_infra_error) {
             Err(HarnessError::Infrastructure { reason }) => {
@@ -438,6 +476,7 @@ mod driver_tests {
             timeout_secs: 1,
             mode: HarnessMode::BestEffort,
             projections: vec![],
+            compile_bundle: None,
         };
         let r = run_harness_simulated(&registry, &cfg, simulated_infra_error)
             .expect("best-effort should not error");
@@ -466,6 +505,7 @@ mod driver_tests {
             timeout_secs: 1,
             mode: HarnessMode::BestEffort,
             projections: vec![],
+            compile_bundle: None,
         };
         let err = run_harness_simulated(&registry, &cfg, simulated_ok_subprocess).unwrap_err();
         match err {
@@ -496,6 +536,7 @@ mod driver_tests {
             timeout_secs: 5,
             mode: HarnessMode::Required,
             projections: vec![],
+            compile_bundle: None,
         };
         let r1 = run_harness_simulated(&registry, &cfg, simulated_ok_subprocess).unwrap();
         assert_eq!(r1.outcome_repr, "clean");

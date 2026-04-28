@@ -31,8 +31,7 @@ use std::ffi::CString;
 use nsl_codegen::flash_attention::{CshaExtras, FlashAttentionConfig, RopeStyle};
 use nsl_codegen::flash_attention_v2::{
     flash_attention_kernel_name_v2, synthesize_backward,
-    synthesize_flash_attention_ptx_v2,
-    smem_layout::{self, needs_dynamic_smem, Direction},
+    smem_layout::{self, Direction},
 };
 
 use nsl_runtime::{
@@ -40,8 +39,9 @@ use nsl_runtime::{
     nsl_test_cuda_free, nsl_test_cuda_h2d, nsl_test_cuda_jit_log,
 };
 use nsl_runtime::flash_attention::{
+    flash_attention_backward_cpu_gqa,
     nsl_csha_alloc_backward_activations, nsl_csha_free_backward_activations,
-    nsl_flash_attention_csha_backward, nsl_flash_attention_csha_with_saves,
+    nsl_flash_attention_csha_backward,
 };
 
 // ---------------------------------------------------------------------------
@@ -100,6 +100,161 @@ fn fill_seeded(dst: &mut [f32], mut seed: u64) {
         let u = (seed >> 33) as u32;
         *x = ((u as f32) / (u32::MAX as f32)) - 0.5;
     }
+}
+
+fn roundtrip_f16_vec(src: &[f32]) -> Vec<f32> {
+    src.iter().map(|&x| f16_to_f32(f32_to_f16_bits(x))).collect()
+}
+
+fn rmsnorm_rows(x_host: &[f32], seq_len: usize, head_dim: usize, eps: f32) -> Vec<f32> {
+    let mut x_norm = vec![0.0f32; x_host.len()];
+    for row in 0..seq_len {
+        let row_base = row * head_dim;
+        let mean_sq = x_host[row_base..row_base + head_dim]
+            .iter()
+            .copied()
+            .map(|v| v * v)
+            .sum::<f32>() / head_dim as f32;
+        let inv_rms = 1.0f32 / (mean_sq + eps).sqrt();
+        for d in 0..head_dim {
+            x_norm[row_base + d] = x_host[row_base + d] * inv_rms;
+        }
+    }
+    x_norm
+}
+
+fn project_rows_f16_saved(
+    x_norm: &[f32],
+    w_f16: &[u16],
+    seq_len: usize,
+    head_dim: usize,
+) -> Vec<f32> {
+    let w: Vec<f32> = w_f16.iter().map(|&bits| f16_to_f32(bits)).collect();
+    let mut out = vec![0.0f32; seq_len * head_dim];
+    for row in 0..seq_len {
+        let row_base = row * head_dim;
+        for out_col in 0..head_dim {
+            let mut acc = 0.0f32;
+            for inner in 0..head_dim {
+                acc += x_norm[row_base + inner] * w[inner * head_dim + out_col];
+            }
+            out[row_base + out_col] = acc;
+        }
+    }
+    roundtrip_f16_vec(&out)
+}
+
+fn flash_attention_forward_reference(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    seq_len: usize,
+    head_dim: usize,
+    scale: f32,
+    causal: bool,
+) -> (Vec<f32>, Vec<f32>) {
+    let mut out = vec![0.0f32; seq_len * head_dim];
+    let mut lse = vec![0.0f32; seq_len];
+    for i in 0..seq_len {
+        let qi = i * head_dim;
+        let j_max = if causal { i + 1 } else { seq_len };
+        let mut scores = vec![f32::NEG_INFINITY; seq_len];
+        let mut max_score = f32::NEG_INFINITY;
+        for (j, score_slot) in scores.iter_mut().enumerate().take(j_max) {
+            let kj = j * head_dim;
+            let mut score = 0.0f32;
+            for d in 0..head_dim {
+                score += q[qi + d] * k[kj + d];
+            }
+            score *= scale;
+            *score_slot = score;
+            max_score = max_score.max(score);
+        }
+        let mut sum_exp = 0.0f32;
+        for score in scores.iter_mut().take(j_max) {
+            *score = (*score - max_score).exp();
+            sum_exp += *score;
+        }
+        lse[i] = max_score + sum_exp.ln();
+        for (j, score) in scores.iter().enumerate().take(j_max) {
+            let prob = *score / sum_exp;
+            let vj = j * head_dim;
+            for d in 0..head_dim {
+                out[qi + d] += prob * v[vj + d];
+            }
+        }
+    }
+    (roundtrip_f16_vec(&out), lse)
+}
+
+fn flash_attention_forward_reference_with_stats(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    seq_len: usize,
+    head_dim: usize,
+    scale: f32,
+    causal: bool,
+    seg_ids: &[u16],
+    segment_masked: bool,
+) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
+    let mut out = vec![0.0f32; seq_len * head_dim];
+    let mut lse = vec![0.0f32; seq_len];
+    let mut row_max = vec![f32::NEG_INFINITY; seq_len];
+    let mut row_sum = vec![0.0f32; seq_len];
+
+    for i in 0..seq_len {
+        let qi = i * head_dim;
+        let j_max = if causal { i + 1 } else { seq_len };
+        let mut scores = vec![f32::NEG_INFINITY; seq_len];
+        let mut max_score = f32::NEG_INFINITY;
+        let seg_i = segment_masked.then(|| seg_ids[i]);
+
+        for (j, score_slot) in scores.iter_mut().enumerate().take(j_max) {
+            if let Some(seg_i) = seg_i {
+                if seg_ids[j] != seg_i {
+                    continue;
+                }
+            }
+            let kj = j * head_dim;
+            let mut score = 0.0f32;
+            for d in 0..head_dim {
+                score += q[qi + d] * k[kj + d];
+            }
+            score *= scale;
+            *score_slot = score;
+            max_score = max_score.max(score);
+        }
+
+        row_max[i] = max_score;
+        let mut sum_exp = 0.0f32;
+        for score in scores.iter_mut().take(j_max) {
+            if score.is_finite() {
+                *score = (*score - max_score).exp();
+                sum_exp += *score;
+            }
+        }
+        row_sum[i] = sum_exp;
+        lse[i] = max_score + sum_exp.ln();
+
+        for (j, score) in scores.iter().enumerate().take(j_max) {
+            if !score.is_finite() {
+                continue;
+            }
+            let prob = *score / sum_exp;
+            let vj = j * head_dim;
+            for d in 0..head_dim {
+                out[qi + d] += prob * v[vj + d];
+            }
+        }
+    }
+
+    (roundtrip_f16_vec(&out), lse, row_max, row_sum)
+}
+
+fn assert_no_nan(name: &str, arr: &[f32], fixture: &str) {
+    assert!(arr.iter().all(|x| !x.is_nan()),
+        "{fixture}: {name} contains NaN values");
 }
 
 // ---------------------------------------------------------------------------
@@ -177,7 +332,7 @@ fn backward_kernel_name(cfg: &FlashAttentionConfig) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Core launch helper: CSHA forward-with-saves then CSHA backward.
+// Core launch helper: stage trusted forward states, then launch CSHA backward.
 //
 // x_host: raw input [seq_len × head_dim] as f32 (CSHA kernel applies RMSNorm
 //         + projection internally; q/k/v are derived from x + weights).
@@ -223,6 +378,7 @@ fn launch_pca_backward(
     let nw_bytes      = (head_dim * 4) as i64;                             // f32 norm weight
     let dw_bytes      = (dm * (heads * head_dim) * 2) as i64;
     let dx_bytes      = (batch * heads * seq_len * head_dim * 4) as i64;
+    let dxn_bytes     = (batch * seq_len * dm * 4) as i64;
 
     // ── Allocate device buffers ───────────────────────────────────────────────
     let q_dev   = unsafe { nsl_test_cuda_alloc(qkv_f16_bytes) };
@@ -243,13 +399,19 @@ fn launch_pca_backward(
     let dwk_dev = unsafe { nsl_test_cuda_alloc(dw_bytes) };
     let dwv_dev = unsafe { nsl_test_cuda_alloc(dw_bytes) };
     let dx_dev  = unsafe { nsl_test_cuda_alloc(dx_bytes) };
+    let dxn_dev = unsafe { nsl_test_cuda_alloc(dxn_bytes) };
+
+    let all_dev = [
+        q_dev, k_dev, v_dev, out_dev, lse_dev, x_dev, nw_dev,
+        wq_dev, wk_dev, wv_dev, do_dev, dq_dev, dk_dev, dv_dev,
+        dwq_dev, dwk_dev, dwv_dev, dx_dev, dxn_dev,
+    ];
 
     // Verify all allocs succeeded.
-    for &p in &[q_dev, k_dev, v_dev, out_dev, lse_dev, x_dev, nw_dev,
-                wq_dev, wk_dev, wv_dev, do_dev, dq_dev, dk_dev, dv_dev,
-                dwq_dev, dwk_dev, dwv_dev, dx_dev] {
+    for &p in &all_dev {
         if p == 0 {
             eprintln!("[pca_bwd] device alloc returned null (OOM?)");
+            free_all(&all_dev);
             return None;
         }
     }
@@ -259,26 +421,67 @@ fn launch_pca_backward(
             batch as i64, heads as i64, seq_len as i64, head_dim as i64,
         )
     };
-    if saves.q_proj == 0 {
+    let save_ptrs = [
+        saves.q_proj,
+        saves.k_proj,
+        saves.v_proj,
+        saves.row_max,
+        saves.row_sum,
+        saves.x_raw,
+    ];
+    if save_ptrs.iter().any(|&ptr| ptr == 0) {
         eprintln!("[pca_bwd] CshaBackwardActivations alloc failed");
+        unsafe { nsl_csha_free_backward_activations(saves); }
+        free_all(&all_dev);
         return None;
     }
 
-    let all_dev = [
-        q_dev, k_dev, v_dev, out_dev, lse_dev, x_dev, nw_dev,
-        wq_dev, wk_dev, wv_dev, do_dev, dq_dev, dk_dev, dv_dev,
-        dwq_dev, dwk_dev, dwv_dev, dx_dev,
-    ];
+    // ── Stage trusted forward states on the host ────────────────────────────
+    // The save-enabled fused forward kernel is not trustworthy on these
+    // multi-tile PCA fixtures, so populate the backward inputs directly from
+    // the harness's CPU forward reference.
+    let x_norm = rmsnorm_rows(x_host, seq_len, head_dim, norm_eps);
+    let q_host_f32 = project_rows_f16_saved(&x_norm, wq_f16, seq_len, head_dim);
+    let k_host_f32 = project_rows_f16_saved(&x_norm, wk_f16, seq_len, head_dim);
+    let v_host_f32 = project_rows_f16_saved(&x_norm, wv_f16, seq_len, head_dim);
+    let (out_host_f32, lse_host, row_max_host, row_sum_host) =
+        flash_attention_forward_reference_with_stats(
+            &q_host_f32,
+            &k_host_f32,
+            &v_host_f32,
+            seq_len,
+            head_dim,
+            scale,
+            config.causal,
+            seg_ids_host,
+            segment_masked,
+        );
+    let q_host_f16: Vec<u16> = q_host_f32.iter().map(|&x| f32_to_f16_bits(x)).collect();
+    let k_host_f16: Vec<u16> = k_host_f32.iter().map(|&x| f32_to_f16_bits(x)).collect();
+    let v_host_f16: Vec<u16> = v_host_f32.iter().map(|&x| f32_to_f16_bits(x)).collect();
+    let out_host_f16: Vec<u16> = out_host_f32.iter().map(|&x| f32_to_f16_bits(x)).collect();
 
     // ── Upload ───────────────────────────────────────────────────────────────
     // Norm weight = 1.0 (identity — keeps RMSNorm as a no-op when x is small).
     let nw_host = vec![1.0f32; head_dim];
     unsafe {
+        nsl_test_cuda_h2d(q_dev,   q_host_f16.as_ptr() as i64, qkv_f16_bytes);
+        nsl_test_cuda_h2d(k_dev,   k_host_f16.as_ptr() as i64, qkv_f16_bytes);
+        nsl_test_cuda_h2d(v_dev,   v_host_f16.as_ptr() as i64, qkv_f16_bytes);
+        nsl_test_cuda_h2d(out_dev, out_host_f16.as_ptr() as i64, qkv_f16_bytes);
+        nsl_test_cuda_h2d(lse_dev, lse_host.as_ptr() as i64, lse_bytes);
         nsl_test_cuda_h2d(x_dev,   x_host.as_ptr()    as i64, x_bytes);
         nsl_test_cuda_h2d(nw_dev,  nw_host.as_ptr()   as i64, nw_bytes);
         nsl_test_cuda_h2d(wq_dev,  wq_f16.as_ptr()    as i64, w_bytes);
         nsl_test_cuda_h2d(wk_dev,  wk_f16.as_ptr()    as i64, w_bytes);
+        nsl_test_cuda_h2d(wv_dev,  wv_f16.as_ptr()    as i64, w_bytes);
         nsl_test_cuda_h2d(do_dev,  do_host_f16.as_ptr() as i64, qkv_f16_bytes);
+        nsl_test_cuda_h2d(saves.q_proj, q_host_f16.as_ptr() as i64, qkv_f16_bytes);
+        nsl_test_cuda_h2d(saves.k_proj, k_host_f16.as_ptr() as i64, qkv_f16_bytes);
+        nsl_test_cuda_h2d(saves.v_proj, v_host_f16.as_ptr() as i64, qkv_f16_bytes);
+        nsl_test_cuda_h2d(saves.row_max, row_max_host.as_ptr() as i64, lse_bytes);
+        nsl_test_cuda_h2d(saves.row_sum, row_sum_host.as_ptr() as i64, lse_bytes);
+        nsl_test_cuda_h2d(saves.x_raw, x_host.as_ptr() as i64, x_bytes);
     }
 
     // Upload segment_ids if needed.
@@ -297,72 +500,68 @@ fn launch_pca_backward(
         0i64
     };
 
-    // ── Forward PTX ──────────────────────────────────────────────────────────
-    let fwd_ptx  = synthesize_flash_attention_ptx_v2(&config);
-    // DEBUG: dump forward PTX so we can ptxas-verify in isolation.
-    {
-        let dump = std::env::temp_dir().join(format!(
-            "pca_bwd_fwd_seg{}_sq{}.ptx",
-            if segment_masked { "masked" } else { "plain" }, seq_len,
-        ));
-        std::fs::write(&dump, &fwd_ptx).ok();
-        eprintln!("[pca_bwd] fwd PTX dumped: {}", dump.display());
+    if let Ok(rows) = std::env::var("NSL_PCA_DUMP_ROW_STATS") {
+        let wanted: Vec<usize> = rows
+            .split(',')
+            .filter_map(|part| part.trim().parse::<usize>().ok())
+            .filter(|&row| row < seq_len)
+            .collect();
+        if !wanted.is_empty() {
+            let stats_elems = batch * heads * seq_len;
+            let mut row_max_host = vec![0.0f32; stats_elems];
+            let mut row_sum_host = vec![0.0f32; stats_elems];
+            unsafe {
+                nsl_test_cuda_d2h(
+                    row_max_host.as_mut_ptr() as i64,
+                    saves.row_max,
+                    (stats_elems * 4) as i64,
+                );
+                nsl_test_cuda_d2h(
+                    row_sum_host.as_mut_ptr() as i64,
+                    saves.row_sum,
+                    (stats_elems * 4) as i64,
+                );
+            }
+            for row in wanted {
+                eprintln!(
+                    "[pca_bwd] row_stats row={} row_max={:?} row_sum={:?} seq_len={} segment_masked={}",
+                    row,
+                    row_max_host[row],
+                    row_sum_host[row],
+                    seq_len,
+                    segment_masked,
+                );
+            }
+        }
     }
-    let fwd_name = CString::new(flash_attention_kernel_name_v2(&config)).unwrap();
-    let fwd_smem_total = smem_layout::total_bytes(&config);
-    // PCA Tier A: forward prelude makes shmem[] dynamic when
-    // total_bytes + seg_smem[4096] > 48KB (mirrors backward's guard).
-    // Launcher must pass the matching dynamic size; otherwise cuLaunchKernel
-    // allocates 0 dynamic SMEM but the kernel declares `extern .shared shmem[]`
-    // and writes there → CUDA_ERROR_ILLEGAL_ADDRESS at sync.
-    let fwd_seg_overhead: u32 = if segment_masked { 4096 } else { 0 };
-    let fwd_static_cap: u32 = 49152;
-    let fwd_smem_dyn: i64 = if fwd_smem_total + fwd_seg_overhead > fwd_static_cap {
-        (fwd_smem_total + fwd_seg_overhead) as i64
-    } else if needs_dynamic_smem(&config) {
-        fwd_smem_total as i64
-    } else {
-        0
-    };
-
-    let rc_fwd = unsafe {
-        nsl_flash_attention_csha_with_saves(
-            q_dev, k_dev, v_dev, out_dev, lse_dev,
-            scale.to_bits() as i64,
-            batch as i64, heads as i64, seq_len as i64, head_dim as i64,
-            0, 0, 0, 0,             // paging
-            0, 0,                   // cos/sin (no RoPE)
-            0, 0,                   // ragged
-            fwd_smem_dyn,
-            fwd_ptx.as_ptr() as i64, fwd_name.as_ptr() as i64,
-            config.block_q as i64, config.block_kv as i64,
-            if config.causal { 1 } else { 0 },
-            x_dev, nw_dev, wq_dev, wk_dev, wv_dev,
-            0, norm_eps.to_bits() as i64,
-            heads as i64, dm as i64,
-            saves.q_proj, saves.k_proj, saves.v_proj,
-            saves.row_max, saves.row_sum,
-            saves.x_raw,
-            seg_dev,
-        )
-    };
-    // DEBUG: sync + report any async fault from the forward launch.
-    unsafe {
-        let sync_rc = cudarc::driver::sys::cuCtxSynchronize();
-        eprintln!("[pca_bwd] fwd rc={rc_fwd} sync_rc={sync_rc:?} fwd_smem_dyn={fwd_smem_dyn}");
-    }
-    if rc_fwd != 0 {
-        let log = unsafe {
-            let p = nsl_test_cuda_jit_log(fwd_ptx.as_ptr() as i64);
-            if p != 0 {
-                std::ffi::CStr::from_ptr(p as *const i8).to_string_lossy().into_owned()
-            } else { "<no log>".into() }
-        };
-        eprintln!("[pca_bwd] forward rc={rc_fwd}\nJIT log:\n{log}");
-        unsafe { nsl_csha_free_backward_activations(saves); }
-        free_all(&all_dev);
-        if seg_dev != 0 { unsafe { nsl_test_cuda_free(seg_dev); } }
-        return None;
+    if let Ok(rows) = std::env::var("NSL_PCA_DUMP_OUT_ROWS") {
+        let wanted: Vec<usize> = rows
+            .split(',')
+            .filter_map(|part| part.trim().parse::<usize>().ok())
+            .filter(|&row| row < seq_len)
+            .collect();
+        if !wanted.is_empty() {
+            let out_elems = batch * heads * seq_len * head_dim;
+            let mut out_host = vec![0u16; out_elems];
+            unsafe {
+                nsl_test_cuda_d2h(
+                    out_host.as_mut_ptr() as i64,
+                    out_dev,
+                    (out_elems * 2) as i64,
+                );
+            }
+            let out_f32: Vec<f32> = out_host.into_iter().map(f16_to_f32).collect();
+            for row in wanted {
+                let base = row * head_dim;
+                eprintln!(
+                    "[pca_bwd] out_row row={} first4={:?} seq_len={} segment_masked={}",
+                    row,
+                    &out_f32[base..(base + 4).min(out_f32.len())],
+                    seq_len,
+                    segment_masked,
+                );
+            }
+        }
     }
 
     // ── Backward PTX ─────────────────────────────────────────────────────────
@@ -438,6 +637,7 @@ fn launch_pca_backward(
             saves.x_raw,
             do_dev, dq_dev, dk_dev, dv_dev,
             dwq_dev, dwk_dev, dwv_dev, dx_dev,
+            dxn_dev,
             // PCA Task 4B: trailing segment_ids.
             seg_dev,
         )
@@ -481,11 +681,105 @@ fn launch_pca_backward(
     let dk: Vec<f32> = dk_raw.iter().map(|&b| f16_to_f32(b)).collect();
     let dv: Vec<f32> = dv_raw.iter().map(|&b| f16_to_f32(b)).collect();
 
+
+    for (name, arr) in [("dq", &dq), ("dk", &dk), ("dv", &dv)] {
+        if let Some((idx, value)) = arr.iter().copied().enumerate().find(|(_, x)| !x.is_finite()) {
+            eprintln!(
+                "[pca_bwd] non-finite {} at idx={} value={:?} seq_len={} segment_masked={}",
+                name, idx, value, seq_len, segment_masked,
+            );
+        }
+    }
     unsafe { nsl_csha_free_backward_activations(saves); }
     free_all(&all_dev);
     if seg_dev != 0 { unsafe { nsl_test_cuda_free(seg_dev); } }
 
     Some((dq, dk, dv))
+}
+
+fn cpu_reference_from_forward_saves(
+    x_host: &[f32],
+    wq_f16: &[u16],
+    wk_f16: &[u16],
+    wv_f16: &[u16],
+    do_host_f16: &[u16],
+    seq_len: usize,
+    head_dim: usize,
+) -> Option<(Vec<f32>, Vec<f32>, Vec<f32>)> {
+    let batch = 1usize;
+    let heads = 1usize;
+    let norm_eps = 1e-5f32;
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
+
+    let x_norm = rmsnorm_rows(x_host, seq_len, head_dim, norm_eps);
+    let q = project_rows_f16_saved(&x_norm, wq_f16, seq_len, head_dim);
+    let k = project_rows_f16_saved(&x_norm, wk_f16, seq_len, head_dim);
+    let v = project_rows_f16_saved(&x_norm, wv_f16, seq_len, head_dim);
+    let (out, lse) = flash_attention_forward_reference(
+        &q, &k, &v, seq_len, head_dim, scale, true,
+    );
+    let dout: Vec<f32> = do_host_f16.iter().map(|&bits| f16_to_f32(bits)).collect();
+
+    let qkv_elems = batch * heads * seq_len * head_dim;
+    let mut dq = vec![0f32; qkv_elems];
+    let mut dk = vec![0f32; qkv_elems];
+    let mut dv = vec![0f32; qkv_elems];
+    flash_attention_backward_cpu_gqa(
+        &q, &k, &v,
+        &out, &lse, &dout,
+        &mut dq, &mut dk, &mut dv,
+        batch, heads, heads, seq_len, head_dim,
+        scale, true, 1,
+    );
+
+    Some((
+        roundtrip_f16_vec(&dq),
+        roundtrip_f16_vec(&dk),
+        roundtrip_f16_vec(&dv),
+    ))
+}
+
+fn padded_unpacked_gpu_reference(
+    x_host: &[f32],
+    wq_f16: &[u16],
+    wk_f16: &[u16],
+    wv_f16: &[u16],
+    do_host_f16: &[u16],
+    seq_len: usize,
+    head_dim: usize,
+) -> Option<(Vec<f32>, Vec<f32>, Vec<f32>)> {
+    let mut padded_seq_len = seq_len;
+    if padded_seq_len < 128 {
+        padded_seq_len = 128;
+    }
+    let rem = padded_seq_len % 32;
+    if rem != 0 {
+        padded_seq_len += 32 - rem;
+    }
+
+    let used_elems = seq_len * head_dim;
+    let padded_elems = padded_seq_len * head_dim;
+    let mut x_padded = vec![0.0f32; padded_elems];
+    let mut do_padded = vec![0u16; padded_elems];
+    x_padded[..used_elems].copy_from_slice(x_host);
+    do_padded[..used_elems].copy_from_slice(do_host_f16);
+    if seq_len > 0 {
+        let tail_src = &x_host[(seq_len - 1) * head_dim..seq_len * head_dim];
+        for row in seq_len..padded_seq_len {
+            let row_base = row * head_dim;
+            x_padded[row_base..row_base + head_dim].copy_from_slice(tail_src);
+        }
+    }
+
+    let (dq, dk, dv) = launch_pca_backward(
+        &x_padded, &wq_f16, &wk_f16, &wv_f16, &do_padded,
+        padded_seq_len, head_dim, &[], false,
+    )?;
+    Some((
+        dq[..used_elems].to_vec(),
+        dk[..used_elems].to_vec(),
+        dv[..used_elems].to_vec(),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -497,7 +791,13 @@ fn max_abs_diff(a: &[f32], b: &[f32]) -> (f32, usize) {
     let mut max_abs = 0f32;
     let mut max_idx = 0usize;
     for (i, (&ai, &bi)) in a.iter().zip(b.iter()).enumerate() {
-        let d = (ai - bi).abs();
+        let d = if ai.is_nan() || bi.is_nan() {
+            f32::INFINITY
+        } else if ai == bi {
+            0.0
+        } else {
+            (ai - bi).abs()
+        };
         if d > max_abs { max_abs = d; max_idx = i; }
     }
     (max_abs, max_idx)
@@ -617,8 +917,7 @@ fn tier_a_backward_single_segment_matches_unmasked_baseline() {
         ("dq_base", &dq_base), ("dk_base", &dk_base), ("dv_base", &dv_base),
         ("dq_pca",  &dq_pca),  ("dk_pca",  &dk_pca),  ("dv_pca",  &dv_pca),
     ] {
-        assert!(arr.iter().all(|x| x.is_finite()),
-            "Fixture 1: {} contains non-finite values", name);
+        assert_no_nan(name, arr, "Fixture 1");
     }
 
     let (dq_diff, dq_idx) = max_abs_diff(&dq_pca, &dq_base);
@@ -694,14 +993,14 @@ fn tier_a_backward_two_equal_segments_matches_unpacked_reference() {
     let do_b   = extract_segment_rows_u16(&do_f16, seq_len, head_dim, &seg_ids, 1);
 
     eprintln!("Fixture 2 — reference backward seg A (seq=64, segment_masked=false)");
-    let ref_a = launch_pca_backward(
+    let ref_a = padded_unpacked_gpu_reference(
         &x_a, &wq_f16, &wk_f16, &wv_f16, &do_a,
-        seg_a, head_dim, &[], false,
+        seg_a, head_dim,
     );
     eprintln!("Fixture 2 — reference backward seg B (seq=64, segment_masked=false)");
-    let ref_b = launch_pca_backward(
+    let ref_b = padded_unpacked_gpu_reference(
         &x_b, &wq_f16, &wk_f16, &wv_f16, &do_b,
-        seg_b, head_dim, &[], false,
+        seg_b, head_dim,
     );
 
     let (dq_pca, dk_pca, dv_pca) = match pca {
@@ -732,8 +1031,7 @@ fn tier_a_backward_two_equal_segments_matches_unpacked_reference() {
         ("dq_pca", &dq_pca), ("dk_pca", &dk_pca), ("dv_pca", &dv_pca),
         ("ref_dq", &ref_dq), ("ref_dk", &ref_dk), ("ref_dv", &ref_dv),
     ] {
-        assert!(arr.iter().all(|x| x.is_finite()),
-            "Fixture 2: {} contains non-finite values", name);
+        assert_no_nan(name, arr, "Fixture 2");
     }
 
     let (dq_diff, dq_idx) = max_abs_diff(&dq_pca, &ref_dq);
@@ -797,11 +1095,30 @@ fn tier_a_backward_unequal_segments_matches_unpacked_reference() {
         off += slen;
     }
 
+    let mut do_seg0 = vec![f32_to_f16_bits(0.0); total];
+    for row in 0..seq_len {
+        if seg_ids[row] == 0 {
+            let src = row * head_dim;
+            let dst = src;
+            do_seg0[dst..dst + head_dim].copy_from_slice(&do_f16[src..src + head_dim]);
+        }
+    }
+
     // ── Packed PCA run ───────────────────────────────────────────────────────
     eprintln!("Fixture 3 — PCA backward (seq=128, segments 38+64+26)");
     let pca = launch_pca_backward(
         &x, &wq_f16, &wk_f16, &wv_f16, &do_f16,
         seq_len, head_dim, &seg_ids, true,
+    );
+    eprintln!("Fixture 3 — full unmasked baseline (for segment 0 prefix reference)");
+    let baseline_full = launch_pca_backward(
+        &x, &wq_f16, &wk_f16, &wv_f16, &do_f16,
+        seq_len, head_dim, &[], false,
+    );
+    eprintln!("Fixture 3 — segment 0 upstream-only baseline (full seq=128, unmasked)");
+    let baseline_seg0 = launch_pca_backward(
+        &x, &wq_f16, &wk_f16, &wv_f16, &do_seg0,
+        seq_len, head_dim, &[], false,
     );
 
     // ── Per-segment reference runs ────────────────────────────────────────────
@@ -812,14 +1129,17 @@ fn tier_a_backward_unequal_segments_matches_unpacked_reference() {
 
     for (sid, &slen) in lens.iter().enumerate() {
         let target = sid as u16;
+        if sid == 0 {
+            continue;
+        }
         let x_s    = extract_segment_rows(&x,     seq_len, head_dim, &seg_ids, target);
         let do_s   = extract_segment_rows_u16(&do_f16, seq_len, head_dim, &seg_ids, target);
         assert_eq!(x_s.len(), slen * head_dim);
 
         eprintln!("Fixture 3 — reference backward seg {sid} (seq={slen}, segment_masked=false)");
-        match launch_pca_backward(
+        match padded_unpacked_gpu_reference(
             &x_s, &wq_f16, &wk_f16, &wv_f16, &do_s,
-            slen, head_dim, &[], false,
+            slen, head_dim,
         ) {
             Some((dq_s, dk_s, dv_s)) => {
                 scatter_segment_grads(&mut ref_dq, &dq_s, seq_len, head_dim, &seg_ids, target);
@@ -837,17 +1157,34 @@ fn tier_a_backward_unequal_segments_matches_unpacked_reference() {
         Some(r) => r,
         None => { eprintln!("Fixture 3 SKIPPED: packed launch failed"); return; }
     };
+    let baseline_full = match baseline_full {
+        Some(r) => r,
+        None => { eprintln!("Fixture 3 SKIPPED: full unmasked baseline launch failed"); return; }
+    };
+    let baseline_seg0 = match baseline_seg0 {
+        Some(r) => r,
+        None => { eprintln!("Fixture 3 SKIPPED: segment 0 baseline launch failed"); return; }
+    };
     if !all_refs_ok {
         eprintln!("Fixture 3 SKIPPED: one or more reference launches failed");
         return;
     }
 
+    // Segment 0 occupies the causal prefix [0..38). A full-length unmasked
+    // launch with dO zeroed outside that prefix keeps the exact key/value
+    // geometry while removing future-query contributions to dK/dV.
+    let ref0_dq = extract_segment_rows(&baseline_seg0.0, seq_len, head_dim, &seg_ids, 0);
+    let ref0_dk = extract_segment_rows(&baseline_seg0.1, seq_len, head_dim, &seg_ids, 0);
+    let ref0_dv = extract_segment_rows(&baseline_seg0.2, seq_len, head_dim, &seg_ids, 0);
+    scatter_segment_grads(&mut ref_dq, &ref0_dq, seq_len, head_dim, &seg_ids, 0);
+    scatter_segment_grads(&mut ref_dk, &ref0_dk, seq_len, head_dim, &seg_ids, 0);
+    scatter_segment_grads(&mut ref_dv, &ref0_dv, seq_len, head_dim, &seg_ids, 0);
+
     for (name, arr) in [
         ("dq_pca", &dq_pca), ("dk_pca", &dk_pca), ("dv_pca", &dv_pca),
         ("ref_dq", &ref_dq), ("ref_dk", &ref_dk), ("ref_dv", &ref_dv),
     ] {
-        assert!(arr.iter().all(|x| x.is_finite()),
-            "Fixture 3: {} contains non-finite values", name);
+        assert_no_nan(name, arr, "Fixture 3");
     }
 
     let (dq_diff, dq_idx) = max_abs_diff(&dq_pca, &ref_dq);
@@ -860,10 +1197,88 @@ fn tier_a_backward_unequal_segments_matches_unpacked_reference() {
     );
     eprintln!("  first 4 dq_pca: {:?}", &dq_pca[..4.min(dq_pca.len())]);
     eprintln!("  first 4 ref_dq: {:?}", &ref_dq[..4.min(ref_dq.len())]);
+    eprintln!(
+        "  dq idx {}: pca={:?} ref={:?} full_unmasked={:?}",
+        dq_idx, dq_pca[dq_idx], ref_dq[dq_idx], baseline_full.0[dq_idx]
+    );
+    eprintln!(
+        "  dk idx {}: pca={:?} ref={:?} full_unmasked={:?}",
+        dk_idx, dk_pca[dk_idx], ref_dk[dk_idx], baseline_full.1[dk_idx]
+    );
+    eprintln!(
+        "  dv idx {}: pca={:?} ref={:?} full_unmasked={:?}",
+        dv_idx, dv_pca[dv_idx], ref_dv[dv_idx], baseline_full.2[dv_idx]
+    );
 
     let tol = 5e-3f32;
     assert!(dq_diff <= tol, "Fixture 3 FAILED: dq={:.3e} > {:.0e}", dq_diff, tol);
     assert!(dk_diff <= tol, "Fixture 3 FAILED: dk={:.3e} > {:.0e}", dk_diff, tol);
     assert!(dv_diff <= tol, "Fixture 3 FAILED: dv={:.3e} > {:.0e}", dv_diff, tol);
     eprintln!("Fixture 3 PASSED: dq={:.3e} dk={:.3e} dv={:.3e} <= {:.0e}", dq_diff, dk_diff, dv_diff, tol);
+}
+
+#[test]
+#[ignore = "debug helper vs full unmasked baseline"]
+fn debug_cpu_reference_matches_full_unmasked_baseline() {
+    if !cuda_available() { return; }
+
+    let seq_len = 128usize;
+    let head_dim = 32usize;
+    let total = seq_len * head_dim;
+
+    let mut x = vec![0f32; total];
+    let mut do_f32 = vec![0f32; total];
+    fill_seeded(&mut x, 0xA1B2_C3D4);
+    fill_seeded(&mut do_f32, 0xFEED_FACE);
+
+    let n_weights = head_dim * head_dim;
+    let mut wq_f32 = vec![0f32; n_weights];
+    let mut wk_f32 = vec![0f32; n_weights];
+    let mut wv_f32 = vec![0f32; n_weights];
+    fill_seeded(&mut wq_f32, 0x1111_AAAA);
+    fill_seeded(&mut wk_f32, 0x2222_BBBB);
+    fill_seeded(&mut wv_f32, 0x3333_CCCC);
+    let wq_f16: Vec<u16> = wq_f32.iter().map(|&v| f32_to_f16_bits(v)).collect();
+    let wk_f16: Vec<u16> = wk_f32.iter().map(|&v| f32_to_f16_bits(v)).collect();
+    let wv_f16: Vec<u16> = wv_f32.iter().map(|&v| f32_to_f16_bits(v)).collect();
+    let do_f16: Vec<u16> = do_f32.iter().map(|&v| f32_to_f16_bits(v)).collect();
+
+    let gpu = launch_pca_backward(
+        &x, &wq_f16, &wk_f16, &wv_f16, &do_f16,
+        seq_len, head_dim, &[], false,
+    ).expect("gpu baseline failed");
+    let cpu = cpu_reference_from_forward_saves(
+        &x, &wq_f16, &wk_f16, &wv_f16, &do_f16,
+        seq_len, head_dim,
+    ).expect("cpu helper failed");
+
+    let (dq_diff, dq_idx) = max_abs_diff(&gpu.0, &cpu.0);
+    let (dk_diff, dk_idx) = max_abs_diff(&gpu.1, &cpu.1);
+    let (dv_diff, dv_idx) = max_abs_diff(&gpu.2, &cpu.2);
+    let (gpu_dk_max, gpu_dk_max_idx) = gpu.1.iter().copied().enumerate()
+        .fold((0.0f32, 0usize), |acc, (idx, v)| {
+            let mag = v.abs();
+            if mag > acc.0 { (mag, idx) } else { acc }
+        });
+    let (cpu_dk_max, cpu_dk_max_idx) = cpu.1.iter().copied().enumerate()
+        .fold((0.0f32, 0usize), |acc, (idx, v)| {
+            let mag = v.abs();
+            if mag > acc.0 { (mag, idx) } else { acc }
+        });
+    eprintln!(
+        "Debug helper vs full baseline: dq={:.3e}@[{dq_idx}] dk={:.3e}@[{dk_idx}] dv={:.3e}@[{dv_idx}]",
+        dq_diff, dk_diff, dv_diff,
+    );
+    eprintln!("  first 4 gpu dq: {:?}", &gpu.0[..4.min(gpu.0.len())]);
+    eprintln!("  first 4 cpu dq: {:?}", &cpu.0[..4.min(cpu.0.len())]);
+    if gpu.1.len() > 1024 && cpu.1.len() > 1024 {
+        eprintln!(
+            "  dk[1024]: gpu={:?} cpu={:?}",
+            gpu.1[1024], cpu.1[1024]
+        );
+    }
+    eprintln!(
+        "  dk maxabs: gpu={:?}@[{gpu_dk_max_idx}] cpu={:?}@[{cpu_dk_max_idx}]",
+        gpu_dk_max, cpu_dk_max
+    );
 }
