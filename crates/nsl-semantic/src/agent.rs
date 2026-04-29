@@ -439,13 +439,14 @@ pub fn detect_cycles(
 
     let mut visited = HashSet::new();
     let mut in_stack: Vec<Symbol> = Vec::new();
+    let mut in_stack_set: HashSet<Symbol> = HashSet::new();
     let mut cycle_path: Option<Vec<Symbol>> = None;
 
     for &start in &apg.agents {
         if visited.contains(&start) {
             continue;
         }
-        if dfs_cycle(start, &adj, &mut visited, &mut in_stack, &mut cycle_path) {
+        if dfs_cycle(start, &adj, &mut visited, &mut in_stack, &mut in_stack_set, &mut cycle_path) {
             break;
         }
     }
@@ -472,14 +473,26 @@ pub fn detect_cycles(
     }
 }
 
+/// DFS-based back-edge detection for cycle reporting.
+///
+/// # Dual-structure invariant
+///
+/// `in_stack` (Vec) preserves insertion order for cycle-path reconstruction —
+/// when a back-edge is found the slice `in_stack[start_idx..]` gives the exact
+/// cycle sequence for the diagnostic message.
+///
+/// `in_stack_set` (HashSet) mirrors `in_stack`'s membership for O(1) back-edge
+/// queries — the contains check on a Vec is O(N) and becomes hot on deep graphs.
+/// Both structures must be kept in sync: push to both, pop from both.
 fn dfs_cycle(
     node: Symbol,
     adj: &HashMap<Symbol, HashSet<Symbol>>,
     visited: &mut HashSet<Symbol>,
     in_stack: &mut Vec<Symbol>,
+    in_stack_set: &mut HashSet<Symbol>,
     cycle_path: &mut Option<Vec<Symbol>>,
 ) -> bool {
-    if in_stack.contains(&node) {
+    if in_stack_set.contains(&node) {
         // Extract the cycle: from first occurrence of `node` through end of
         // in_stack, plus `node` repeated to close the visible cycle.
         let start_idx = in_stack.iter().position(|n| *n == node).unwrap();
@@ -493,18 +506,20 @@ fn dfs_cycle(
     }
     visited.insert(node);
     in_stack.push(node);
+    in_stack_set.insert(node);
 
     if let Some(neighbors) = adj.get(&node) {
         // Collect into a sorted vec for deterministic output order.
         let mut sorted: Vec<Symbol> = neighbors.iter().copied().collect();
         sorted.sort_by_key(|s| s.0);
         for next in sorted {
-            if dfs_cycle(next, adj, visited, in_stack, cycle_path) {
+            if dfs_cycle(next, adj, visited, in_stack, in_stack_set, cycle_path) {
                 return true;
             }
         }
     }
     in_stack.pop();
+    in_stack_set.remove(&node);
     false
 }
 
@@ -1431,6 +1446,71 @@ fn loop_pipe(x: Tensor) -> Tensor:\n    let y = a.a_fn(x)\n    let z = b.b_fn(y)
         assert!(diags.iter().any(|d| d.message.contains("E0603")),
             "expected E0603 cycle error, got: {:?}",
             diags.iter().map(|d| &d.message).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn cycle_detection_flags_self_cycle() {
+        // A's output feeds back into A's own method input — produces an A→A self-cycle.
+        // Uses a single method called twice: a.a_fn(x) → y, then a.a_fn(y) → z.
+        // The second call's arg `y` came from agent A, so source_by_binding maps
+        // y → (A, a_fn), producing BindingToAgent { source_agent: Some(A), target_agent: A }.
+        // dfs_cycle: visits A, pushes A to in_stack_set, recurses into neighbor A,
+        // finds A in in_stack_set → cycle detected.
+        let src = "\
+agent A:\n    fn a_fn(self, x: Tensor) -> Tensor:\n        return x\n\
+@pipeline_agent(agents=[A])\n\
+fn self_loop(x: Tensor) -> Tensor:\n    let y = a.a_fn(x)\n    let z = a.a_fn(y)\n    return z\n";
+        let mut interner = nsl_lexer::Interner::new();
+        let (tokens, _) = nsl_lexer::tokenize(src, nsl_errors::FileId(0), &mut interner);
+        let parse_result = nsl_parser::parse(&tokens, &mut interner);
+        assert!(parse_result.diagnostics.is_empty(), "parse: {:?}", parse_result.diagnostics);
+
+        let mut registry = AgentRegistry::new();
+        registry.register_module(&parse_result.module, &interner);
+
+        let mut apgs = Vec::new();
+        let mut diags = Vec::new();
+        extract_apgs(&parse_result.module, &registry, &interner, &mut apgs, &mut diags);
+        for apg in &apgs {
+            detect_cycles(apg, &interner, &mut diags);
+        }
+
+        // A → A self-cycle: BindingToAgent edges where source_agent == target_agent.
+        assert!(diags.iter().any(|d| d.message.contains("E0603")),
+            "expected E0603 for self-cycle (A→A); got: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn cycle_detection_flags_three_agent_cycle() {
+        // A→B→C→A: transitive cycle through three nodes.
+        let src = "\
+agent A:\n    fn a_fn(self, x: Tensor) -> Tensor:\n        return x\n\
+agent B:\n    fn b_fn(self, y: Tensor) -> Tensor:\n        return y\n\
+agent C:\n    fn c_fn(self, z: Tensor) -> Tensor:\n        return z\n\
+@pipeline_agent(agents=[A, B, C])\n\
+fn three_cycle(x: Tensor) -> Tensor:\n    let y = a.a_fn(x)\n    let z = b.b_fn(y)\n    let w = c.c_fn(z)\n    return a.a_fn(w)\n";
+        let mut interner = nsl_lexer::Interner::new();
+        let (tokens, _) = nsl_lexer::tokenize(src, nsl_errors::FileId(0), &mut interner);
+        let parse_result = nsl_parser::parse(&tokens, &mut interner);
+        assert!(parse_result.diagnostics.is_empty(), "parse: {:?}", parse_result.diagnostics);
+
+        let mut registry = AgentRegistry::new();
+        registry.register_module(&parse_result.module, &interner);
+
+        let mut apgs = Vec::new();
+        let mut diags = Vec::new();
+        extract_apgs(&parse_result.module, &registry, &interner, &mut apgs, &mut diags);
+        for apg in &apgs {
+            detect_cycles(apg, &interner, &mut diags);
+        }
+
+        // The cycle path should mention all three agents — verify by reading the message.
+        let e0603 = diags.iter().find(|d| d.message.contains("E0603"))
+            .expect("expected E0603 for 3-agent cycle");
+        let msg = &e0603.message;
+        assert!(msg.contains("A") && msg.contains("B") && msg.contains("C"),
+            "3-agent cycle path should mention all three agents (A, B, C); got: {}", msg);
     }
 
     #[test]

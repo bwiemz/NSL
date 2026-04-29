@@ -641,22 +641,22 @@ impl Compiler<'_> {
             );
         }
 
-        self.module
-            .define_function(func_id, &mut ctx)
-            .map_err(|e| {
-                CodegenError::new(format!(
-                    "failed to define @pipeline_agent fn '{fn_name}': {e}"
-                ))
-            })?;
-
-        // Clean up agent_var_types entries added for this pipeline fn so they
-        // don't leak into subsequent pipeline fn compilations with different
-        // agent bindings.
+        // `agent_var_types` entries must be removed regardless of whether
+        // `define_function` succeeds — entries are pipeline-fn-scoped, not
+        // module-scoped. Cleaning up before propagating the error prevents stale
+        // entries from leaking into subsequent pipeline fn compilations that use
+        // different agent bindings.
+        let define_result = self.module.define_function(func_id, &mut ctx).map_err(|e| {
+            CodegenError::new(format!(
+                "failed to define @pipeline_agent fn '{fn_name}': {e}"
+            ))
+        });
         for (_, lowercase, _) in &agent_info {
             if let Some(sym) = self.interner.get(lowercase.as_str()).map(Symbol) {
                 self.models.agent_var_types.remove(&sym);
             }
         }
+        define_result?;
 
         Ok(())
     }
