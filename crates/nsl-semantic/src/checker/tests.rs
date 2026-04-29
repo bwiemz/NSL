@@ -915,3 +915,106 @@ model AttentionBlock:
         diags
     );
 }
+
+#[test]
+fn wggo_target_on_layer_decl_errors() {
+    // Covers the `ModelMember::LayerDecl` arm in `checker/model.rs`:
+    // `@wggo_target` on a layer/field declaration (not a method) must emit
+    // the "@wggo_target can only be applied to fn declarations" diagnostic.
+    //
+    // Field-decl form mirrors `examples/m30_shard_validation.nsl` —
+    // `name: Type = init` with the decorator on the preceding line — which
+    // is the syntax the parser actually accepts inside a `model:` body.
+    let src = r#"
+model AttentionBlock:
+    @wggo_target
+    weight: Tensor<[4, 4], f32> = zeros([4, 4])
+
+    fn forward(self, x: Tensor<[4], f32>) -> Tensor<[4], f32>:
+        return x
+"#;
+    let diags = check_source(src);
+    let placement_errs: Vec<_> = diags
+        .iter()
+        .filter(|d| {
+            d.message
+                .contains("@wggo_target can only be applied to fn declarations")
+        })
+        .collect();
+    assert!(
+        !placement_errs.is_empty(),
+        "@wggo_target on a layer declaration should emit the fn-only diagnostic; got: {:?}",
+        diags
+    );
+}
+
+#[test]
+fn wggo_target_on_top_level_non_fn_errors() {
+    // Covers the top-level `_ =>` arm in `StmtKind::Decorated` in
+    // `checker/stmt.rs`: `@wggo_target` decorating any non-`fn` top-level
+    // statement (here, a `model` decl) must emit the
+    // "@wggo_target can only be applied to fn declarations" diagnostic.
+    let src = r#"
+@wggo_target
+model AttentionBlock:
+    fn forward(self, x: Tensor<[4], f32>) -> Tensor<[4], f32>:
+        return x
+"#;
+    let diags = check_source(src);
+    let placement_errs: Vec<_> = diags
+        .iter()
+        .filter(|d| {
+            d.message
+                .contains("@wggo_target can only be applied to fn declarations")
+        })
+        .collect();
+    assert!(
+        !placement_errs.is_empty(),
+        "@wggo_target on a top-level non-fn statement should emit the fn-only diagnostic; got: {:?}",
+        diags
+    );
+}
+
+#[test]
+fn wggo_target_on_both_methods_fires_only_for_wrong_one() {
+    // Edge case: a model with BOTH `@wggo_target fn forward` (clean) AND
+    // `@wggo_target fn cached_forward` (wrong-name) verifies that the
+    // iteration in `checker/model.rs` continues past the first match and
+    // emits exactly one placement diagnostic — for `cached_forward` only.
+    //
+    // The exact-count assertion guards against regressions where the loop
+    // either short-circuits on the happy method or double-reports.
+    let src = r#"
+model AttentionBlock:
+    let q_proj: Tensor<[4, 4], f32>
+
+    @wggo_target
+    fn forward(self, x: Tensor<[4], f32>) -> Tensor<[4], f32>:
+        return x
+
+    @wggo_target
+    fn cached_forward(self, x: Tensor<[4], f32>) -> Tensor<[4], f32>:
+        return x
+"#;
+    let diags = check_source(src);
+    let placement_errs: Vec<_> = diags
+        .iter()
+        .filter(|d| {
+            d.message
+                .contains("@wggo_target must be on the model's 'forward' method")
+        })
+        .collect();
+    assert_eq!(
+        placement_errs.len(),
+        1,
+        "expected exactly one placement diagnostic (for `cached_forward`); got {} from diags: {:?}",
+        placement_errs.len(),
+        diags
+    );
+    // Sanity: the single firing must be the cached_forward one, not forward.
+    assert!(
+        placement_errs[0].message.contains("'cached_forward'"),
+        "the single placement diagnostic must name 'cached_forward'; got: {:?}",
+        placement_errs[0]
+    );
+}
