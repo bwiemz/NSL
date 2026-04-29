@@ -68,6 +68,41 @@ pub struct DiscoveredProjection {
     pub weight_shape: [u32; 2],
 }
 
+/// A single WGGO Phase 2 target — one per instance of a
+/// `@wggo_target`-decorated model.
+///
+/// Produced by [`pre_scan_wggo_targets_from_ast`] (Task 6 of the WGGO
+/// Phase 2 backward-pass calibration plan). Each record carries the
+/// qualified instance path, the resolved `head_dim`, and the four
+/// projection refs + shapes drawn from the model's
+/// `@wggo_target(w_q=self.<…>, w_k=self.<…>, w_v=self.<…>,
+/// w_o=self.<…>, head_dim=self.<…>)` decorator on `forward`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WggoGradTarget {
+    /// Qualified path of the instance, e.g. `"gpt.blocks.0.attn"`.
+    /// For Phase 2 Task 6 this is the variable name from the `let`
+    /// binding at the instantiation site (e.g.
+    /// `let attn = Attention(...)` → `"attn"`).
+    pub layer_key: String,
+    /// Model class name, e.g. `"Attention"`.
+    pub class_name: String,
+    /// Resolved at pre-scan from the model's `head_dim` field
+    /// initializer via the AST evaluator (e.g.
+    /// `head_dim: int = dim // num_heads` with `dim=4096, num_heads=32`
+    /// → `128`).
+    pub head_dim: u32,
+    pub w_q: ProjectionRef,
+    pub w_k: ProjectionRef,
+    pub w_v: ProjectionRef,
+    pub w_o: ProjectionRef,
+    /// Resolved from `W_*`'s tensor field initializer via the AST
+    /// evaluator. `[out_features, in_features]`.
+    pub w_q_shape: [u32; 2],
+    pub w_k_shape: [u32; 2],
+    pub w_v_shape: [u32; 2],
+    pub w_o_shape: [u32; 2],
+}
+
 fn dedup_preserving_first_seen(projections: &mut Vec<DiscoveredProjection>) {
     let mut seen = std::collections::HashSet::new();
     projections.retain(|projection| seen.insert(projection.projection.0.clone()));
@@ -409,6 +444,332 @@ pub fn first_awq_quantized_model_name(
 
 pub fn ast_has_awq_quantize_decorator(ast: &nsl_ast::Module, interner: &Interner) -> bool {
     first_awq_quantized_model_name(ast, interner).is_some()
+}
+
+// ── WGGO Phase 2 pre-scan ─────────────────────────────────────────────────────
+
+/// Returns `true` when `model_def` carries an `@wggo_target` decorator on
+/// its `forward` method.
+fn model_has_wggo_target_decorator(model_def: &ModelDef, interner: &Interner) -> bool {
+    for member in &model_def.members {
+        let ModelMember::Method(fn_def, decorators) = member else {
+            continue;
+        };
+        if interner.resolve(fn_def.name.0).unwrap_or("") != "forward" {
+            continue;
+        }
+        for deco in decorators {
+            if deco.name.len() == 1
+                && interner.resolve(deco.name[0].0).unwrap_or("") == "wggo_target"
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Holds the field names referenced by a `@wggo_target` decorator (each
+/// arg's value is a `self.<field>` reference; we record only the field
+/// name string).
+struct WggoTargetFieldNames {
+    w_q: String,
+    w_k: String,
+    w_v: String,
+    w_o: String,
+    head_dim: String,
+}
+
+/// Extract the five `self.<field>` references from a model's
+/// `@wggo_target` decorator on `forward`. Returns `None` if any of the
+/// five required fields is missing or shaped unexpectedly. Phase 1
+/// (Tasks 2-3) is the canonical place that *errors* on these problems —
+/// pre-scan is best-effort and silently skips.
+fn extract_wggo_target_field_names(
+    model_def: &ModelDef,
+    interner: &Interner,
+) -> Option<WggoTargetFieldNames> {
+    for member in &model_def.members {
+        let ModelMember::Method(fn_def, decorators) = member else {
+            continue;
+        };
+        if interner.resolve(fn_def.name.0).unwrap_or("") != "forward" {
+            continue;
+        }
+        for deco in decorators {
+            if deco.name.len() != 1
+                || interner.resolve(deco.name[0].0).unwrap_or("") != "wggo_target"
+            {
+                continue;
+            }
+            let args = deco.args.as_ref()?;
+            let mut w_q = None;
+            let mut w_k = None;
+            let mut w_v = None;
+            let mut w_o = None;
+            let mut head_dim = None;
+            for arg in args {
+                let Some(arg_name_sym) = arg.name else {
+                    continue;
+                };
+                let arg_name = interner.resolve(arg_name_sym.0).unwrap_or("");
+                let ExprKind::MemberAccess { object, member } = &arg.value.kind else {
+                    continue;
+                };
+                if !matches!(object.kind, ExprKind::SelfRef) {
+                    continue;
+                }
+                let field = interner.resolve(member.0).unwrap_or("").to_string();
+                if field.is_empty() {
+                    continue;
+                }
+                match arg_name {
+                    "w_q" => w_q = Some(field),
+                    "w_k" => w_k = Some(field),
+                    "w_v" => w_v = Some(field),
+                    "w_o" => w_o = Some(field),
+                    "head_dim" => head_dim = Some(field),
+                    _ => {}
+                }
+            }
+            return Some(WggoTargetFieldNames {
+                w_q: w_q?,
+                w_k: w_k?,
+                w_v: w_v?,
+                w_o: w_o?,
+                head_dim: head_dim?,
+            });
+        }
+    }
+    None
+}
+
+/// Build `field_name → init_expr` for every `LayerDecl` member that has
+/// an initializer. Used by the WGGO pre-scan to look up `W_*`/`head_dim`
+/// initializers by the field names extracted from `@wggo_target`.
+fn collect_layer_init_exprs<'a>(
+    model_def: &'a ModelDef,
+    interner: &Interner,
+) -> std::collections::HashMap<String, &'a nsl_ast::expr::Expr> {
+    let mut out = std::collections::HashMap::new();
+    for member in &model_def.members {
+        let ModelMember::LayerDecl {
+            name, init: Some(init), ..
+        } = member
+        else {
+            continue;
+        };
+        let fname = interner.resolve(name.0).unwrap_or("");
+        if fname.is_empty() {
+            continue;
+        }
+        out.insert(fname.to_string(), init);
+    }
+    out
+}
+
+/// Try to build a `WggoGradTarget` from a `let <var_name> = <init_expr>`
+/// statement. Returns `None` (silent skip) on any of:
+///
+/// * `init_expr` isn't a direct call `ClassName(args...)`.
+/// * `ClassName` isn't in `decorated`.
+/// * Constructor-arg evaluation (`bind_constructor_args`) fails.
+/// * The decorator's required field references are incomplete.
+/// * Any field's initializer fails to evaluate to the expected shape
+///   (`Int` for `head_dim`; 2-element `IntList` for each `W_*`).
+///
+/// This best-effort behaviour mirrors the AWQ pre-scan: errors surface
+/// later in semantic check / Task 11 refusal, not here.
+fn try_build_wggo_target(
+    var_name: &str,
+    init_expr: &nsl_ast::expr::Expr,
+    decorated: &std::collections::HashMap<nsl_ast::Symbol, &ModelDef>,
+    interner: &Interner,
+) -> Option<WggoGradTarget> {
+    use crate::calibration::ast_evaluator::{bind_constructor_args, evaluate_expr, EvalValue};
+
+    let ExprKind::Call { callee, args } = &init_expr.kind else {
+        return None;
+    };
+    let ExprKind::Ident(class_sym) = &callee.kind else {
+        return None;
+    };
+    let model_def = decorated.get(class_sym)?;
+
+    // Bind constructor args (best-effort).
+    let scope = bind_constructor_args(&model_def.params, args, interner).ok()?;
+
+    let fields = extract_wggo_target_field_names(model_def, interner)?;
+    let inits = collect_layer_init_exprs(model_def, interner);
+
+    let head_dim_init = inits.get(fields.head_dim.as_str())?;
+    let head_dim_val = match evaluate_expr(head_dim_init, &scope, interner).ok()? {
+        EvalValue::Int(n) if n >= 0 && n <= u32::MAX as i64 => n as u32,
+        _ => return None,
+    };
+
+    let resolve_shape = |field: &str| -> Option<[u32; 2]> {
+        let init = inits.get(field)?;
+        let EvalValue::IntList(dims) = evaluate_expr(init, &scope, interner).ok()? else {
+            return None;
+        };
+        if dims.len() != 2 {
+            return None;
+        }
+        if dims[0] < 0 || dims[1] < 0 {
+            return None;
+        }
+        if dims[0] > u32::MAX as i64 || dims[1] > u32::MAX as i64 {
+            return None;
+        }
+        Some([dims[0] as u32, dims[1] as u32])
+    };
+
+    let w_q_shape = resolve_shape(&fields.w_q)?;
+    let w_k_shape = resolve_shape(&fields.w_k)?;
+    let w_v_shape = resolve_shape(&fields.w_v)?;
+    let w_o_shape = resolve_shape(&fields.w_o)?;
+
+    let class_name = interner.resolve(model_def.name.0).unwrap_or("").to_string();
+
+    Some(WggoGradTarget {
+        layer_key: var_name.to_string(),
+        class_name,
+        head_dim: head_dim_val,
+        w_q: ProjectionRef(format!("{var_name}.{}", fields.w_q)),
+        w_k: ProjectionRef(format!("{var_name}.{}", fields.w_k)),
+        w_v: ProjectionRef(format!("{var_name}.{}", fields.w_v)),
+        w_o: ProjectionRef(format!("{var_name}.{}", fields.w_o)),
+        w_q_shape,
+        w_k_shape,
+        w_v_shape,
+        w_o_shape,
+    })
+}
+
+/// Recursively walk `stmts` for `let <name> = <ClassName>(...)` bindings
+/// where `<ClassName>` is a `@wggo_target`-decorated model. Descends
+/// into block-shaped statements (`FnDef.body`, top-level `If`/`For`/
+/// `While`/`WhileLet`/`Match` arms, plain `Block`s, and `Decorated`
+/// inner stmts).
+fn walk_for_wggo_instantiations(
+    stmts: &[nsl_ast::stmt::Stmt],
+    decorated: &std::collections::HashMap<nsl_ast::Symbol, &ModelDef>,
+    interner: &Interner,
+    targets: &mut Vec<WggoGradTarget>,
+) {
+    use nsl_ast::pattern::PatternKind;
+    use nsl_ast::stmt::StmtKind as SK;
+
+    for stmt in stmts {
+        match &stmt.kind {
+            SK::VarDecl {
+                pattern,
+                value: Some(init),
+                ..
+            } => {
+                if let PatternKind::Ident(name_sym) = &pattern.kind {
+                    let var_name = interner.resolve(name_sym.0).unwrap_or("").to_string();
+                    if !var_name.is_empty() {
+                        if let Some(t) =
+                            try_build_wggo_target(&var_name, init, decorated, interner)
+                        {
+                            targets.push(t);
+                        }
+                    }
+                }
+            }
+            SK::FnDef(fn_def) => {
+                walk_for_wggo_instantiations(&fn_def.body.stmts, decorated, interner, targets);
+            }
+            SK::If {
+                then_block,
+                elif_clauses,
+                else_block,
+                ..
+            } => {
+                walk_for_wggo_instantiations(&then_block.stmts, decorated, interner, targets);
+                for (_, blk) in elif_clauses {
+                    walk_for_wggo_instantiations(&blk.stmts, decorated, interner, targets);
+                }
+                if let Some(blk) = else_block {
+                    walk_for_wggo_instantiations(&blk.stmts, decorated, interner, targets);
+                }
+            }
+            SK::For { body, .. } | SK::While { body, .. } | SK::WhileLet { body, .. } => {
+                walk_for_wggo_instantiations(&body.stmts, decorated, interner, targets);
+            }
+            SK::Match { arms, .. } => {
+                for arm in arms {
+                    walk_for_wggo_instantiations(&arm.body.stmts, decorated, interner, targets);
+                }
+            }
+            SK::Decorated { stmt: inner, .. } => {
+                walk_for_wggo_instantiations(
+                    std::slice::from_ref(inner.as_ref()),
+                    decorated,
+                    interner,
+                    targets,
+                );
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Pre-scan the AST for WGGO Phase 2 backward-pass targets — one
+/// `WggoGradTarget` per *instantiation site* of any `@wggo_target`-
+/// decorated model.
+///
+/// Behaviour:
+///
+/// * No `@wggo_target` decorators in the AST → empty `Vec`.
+/// * Decorator present but no instantiation reachable → empty `Vec`
+///   (the §5.5 refusal in Task 11 is the place that errors here, not
+///   pre-scan).
+/// * Constructor-arg or field-shape evaluation failure for a single
+///   instantiation → silent skip of that instantiation. Other
+///   instantiations may still succeed.
+/// * Initializer that isn't a direct call to a decorated class → skip
+///   (e.g. `let attn = SomeOther()`).
+///
+/// This best-effort approach mirrors
+/// [`pre_scan_awq_projections_from_ast`]: pre-scan runs early, and the
+/// authoritative validation lives in semantic check (Phase 1 Tasks 1-4)
+/// and Task 11 refusal.
+pub fn pre_scan_wggo_targets_from_ast(
+    ast: &nsl_ast::Module,
+    interner: &Interner,
+) -> Vec<WggoGradTarget> {
+    use std::collections::HashMap;
+
+    // 1. Collect every `@wggo_target`-decorated model (top-level, with
+    //    or without an outer `@decorator` envelope around the model).
+    let mut decorated: HashMap<nsl_ast::Symbol, &ModelDef> = HashMap::new();
+    for stmt in &ast.stmts {
+        let model_def_opt = match &stmt.kind {
+            StmtKind::ModelDef(m) => Some(m),
+            StmtKind::Decorated { stmt: inner, .. } => match &inner.kind {
+                StmtKind::ModelDef(m) => Some(m),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(model_def) = model_def_opt {
+            if model_has_wggo_target_decorator(model_def, interner) {
+                decorated.insert(model_def.name, model_def);
+            }
+        }
+    }
+
+    if decorated.is_empty() {
+        return Vec::new();
+    }
+
+    // 2. Walk for instantiations and build targets.
+    let mut targets = Vec::new();
+    walk_for_wggo_instantiations(&ast.stmts, &decorated, interner, &mut targets);
+    targets
 }
 
 pub fn check_discovery_agreement(
@@ -1008,5 +1369,113 @@ mod tests {
         assert_eq!(parse_tensor_shape_string("Tensor<[128, 64], f32>"), [128, 64]);
         assert_eq!(parse_tensor_shape_string(""), [0, 0]);
         assert_eq!(parse_tensor_shape_string("Tensor<[99], f32>"), [0, 0]);
+    }
+
+    // ── WGGO Phase 2 Task 6: pre_scan_wggo_targets_from_ast ───────────────
+
+    #[test]
+    fn pre_scan_wggo_finds_attention_target_with_resolved_shapes() {
+        let source = r#"
+model Attention(dim: int, num_heads: int):
+    head_dim: int = dim // num_heads
+    q_proj: Tensor = randn([dim, dim])
+    k_proj: Tensor = randn([dim, dim])
+    v_proj: Tensor = randn([dim, dim])
+    o_proj: Tensor = randn([dim, dim])
+
+    @wggo_target(w_q=self.q_proj, w_k=self.k_proj, w_v=self.v_proj, w_o=self.o_proj, head_dim=self.head_dim)
+    fn forward(self, x: Tensor) -> Tensor:
+        return x
+
+fn main():
+    let m = Attention(dim=4096, num_heads=32)
+    let x = randn([1, 4096])
+    let y = m.forward(x)
+"#;
+        let (ast, interner) = parse_module(source);
+        let targets = pre_scan_wggo_targets_from_ast(&ast, &interner);
+        assert_eq!(targets.len(), 1, "one Attention instantiation → one target");
+        let t = &targets[0];
+        assert_eq!(t.layer_key, "m");
+        assert_eq!(t.class_name, "Attention");
+        assert_eq!(t.head_dim, 128);
+        assert_eq!(t.w_q_shape, [4096, 4096]);
+        assert_eq!(t.w_k_shape, [4096, 4096]);
+        assert_eq!(t.w_v_shape, [4096, 4096]);
+        assert_eq!(t.w_o_shape, [4096, 4096]);
+        assert_eq!(t.w_q.0, "m.q_proj");
+        assert_eq!(t.w_k.0, "m.k_proj");
+        assert_eq!(t.w_v.0, "m.v_proj");
+        assert_eq!(t.w_o.0, "m.o_proj");
+    }
+
+    #[test]
+    fn pre_scan_wggo_returns_empty_without_decorator() {
+        let source = "fn main():\n    let x = 0\n";
+        let (ast, interner) = parse_module(source);
+        assert!(pre_scan_wggo_targets_from_ast(&ast, &interner).is_empty());
+    }
+
+    #[test]
+    fn pre_scan_wggo_returns_empty_when_decorated_class_not_instantiated() {
+        let source = r#"
+model Attention(dim: int):
+    head_dim: int = dim
+    q_proj: Tensor = zeros([4, 4])
+    k_proj: Tensor = zeros([4, 4])
+    v_proj: Tensor = zeros([4, 4])
+    o_proj: Tensor = zeros([4, 4])
+
+    @wggo_target(w_q=self.q_proj, w_k=self.k_proj, w_v=self.v_proj, w_o=self.o_proj, head_dim=self.head_dim)
+    fn forward(self, x: Tensor) -> Tensor:
+        return x
+
+model OtherModel:
+    weight: Tensor = zeros([4, 4])
+    fn forward(self, x: Tensor) -> Tensor:
+        return x
+
+fn main():
+    let m = OtherModel()
+    let x = zeros([4])
+    let y = m.forward(x)
+"#;
+        let (ast, interner) = parse_module(source);
+        let targets = pre_scan_wggo_targets_from_ast(&ast, &interner);
+        assert!(
+            targets.is_empty(),
+            "decorated class not instantiated → empty (Task 11 refusal handles this)"
+        );
+    }
+
+    #[test]
+    fn pre_scan_wggo_handles_multiple_instantiations_in_source_order() {
+        let source = r#"
+model Attention(dim: int, num_heads: int):
+    head_dim: int = dim // num_heads
+    q_proj: Tensor = zeros([dim, dim])
+    k_proj: Tensor = zeros([dim, dim])
+    v_proj: Tensor = zeros([dim, dim])
+    o_proj: Tensor = zeros([dim, dim])
+
+    @wggo_target(w_q=self.q_proj, w_k=self.k_proj, w_v=self.v_proj, w_o=self.o_proj, head_dim=self.head_dim)
+    fn forward(self, x: Tensor) -> Tensor:
+        return x
+
+fn main():
+    let small = Attention(dim=64, num_heads=4)
+    let large = Attention(dim=4096, num_heads=32)
+    let x = zeros([1, 64])
+    let y = small.forward(x)
+"#;
+        let (ast, interner) = parse_module(source);
+        let targets = pre_scan_wggo_targets_from_ast(&ast, &interner);
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets[0].layer_key, "small");
+        assert_eq!(targets[0].head_dim, 16);
+        assert_eq!(targets[0].w_q_shape, [64, 64]);
+        assert_eq!(targets[1].layer_key, "large");
+        assert_eq!(targets[1].head_dim, 128);
+        assert_eq!(targets[1].w_q_shape, [4096, 4096]);
     }
 }
