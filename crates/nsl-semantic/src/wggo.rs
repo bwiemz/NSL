@@ -108,6 +108,57 @@ pub fn validate_wggo_decorator(
 }
 
 // ---------------------------------------------------------------------------
+// WGGO Phase 2 Task 2: `@wggo_target` required-arguments validation
+// ---------------------------------------------------------------------------
+
+/// The five named arguments `@wggo_target` requires.
+///
+/// Order matters for the diagnostic message: it's the canonical ordering
+/// the user-facing error lists, and the order of `WGGO_TARGET_REQUIRED_ARGS`
+/// is the source of truth for that header.
+pub const WGGO_TARGET_REQUIRED_ARGS: &[&str] = &["w_q", "w_k", "w_v", "w_o", "head_dim"];
+
+/// Validate that a `@wggo_target` decorator provides all five required
+/// named arguments (`w_q`, `w_k`, `w_v`, `w_o`, `head_dim`).
+///
+/// This task ONLY checks that the names appear as arguments. It does NOT
+/// validate that the values are `self.<field>` references (Task 3) or that
+/// those fields exist on the model with appropriate types (Task 4).
+///
+/// Called from both:
+///   * `crates/nsl-semantic/src/checker/model.rs` — `ModelMember::Method`
+///   * `crates/nsl-semantic/src/checker/stmt.rs` — top-level `StmtKind::FnDef`
+///
+/// Both call sites guard on the placement check from Task 1 first; this
+/// function assumes placement has already been validated.
+pub fn validate_wggo_target_required_args(
+    deco: &Decorator,
+    resolve_sym: &dyn Fn(Symbol) -> String,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let provided: std::collections::HashSet<String> = match deco.args {
+        Some(ref args) => args
+            .iter()
+            .filter_map(|a| a.name.map(resolve_sym))
+            .collect(),
+        None => std::collections::HashSet::new(),
+    };
+    let missing: Vec<&str> = WGGO_TARGET_REQUIRED_ARGS
+        .iter()
+        .filter(|a| !provided.contains(**a))
+        .copied()
+        .collect();
+    if !missing.is_empty() {
+        diagnostics.push(
+            Diagnostic::error(format!(
+                "@wggo_target requires arguments: w_q, w_k, w_v, w_o, head_dim; missing: {missing:?}"
+            ))
+            .with_label(deco.span, "missing required arguments"),
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -122,5 +173,15 @@ mod tests {
         }
         assert_eq!(WggoMode::parse("auto"), Some(WggoMode::Full));
         assert!(WggoMode::parse("nonsense").is_none());
+    }
+
+    #[test]
+    fn wggo_target_required_args_is_canonical_five() {
+        // Guard against accidental reordering or additions: the diagnostic
+        // message header lists these in a fixed order.
+        assert_eq!(
+            WGGO_TARGET_REQUIRED_ARGS,
+            &["w_q", "w_k", "w_v", "w_o", "head_dim"]
+        );
     }
 }

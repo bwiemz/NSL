@@ -606,6 +606,18 @@ impl<'a> TypeChecker<'a> {
                                             .with_label(deco.span, "invalid @wggo_target target"),
                                         );
                                     }
+                                    // WGGO Phase 2 Task 2: required-args check.
+                                    // Even when placement is wrong (non-`forward`)
+                                    // we still report missing args so users see
+                                    // all issues in one pass.
+                                    let resolve = |s: nsl_ast::Symbol| -> String {
+                                        self.interner.resolve(s.0).unwrap_or("").to_string()
+                                    };
+                                    crate::wggo::validate_wggo_target_required_args(
+                                        deco,
+                                        &resolve,
+                                        &mut self.diagnostics,
+                                    );
                                 }
                                 _ => {
                                     self.diagnostics.push(
