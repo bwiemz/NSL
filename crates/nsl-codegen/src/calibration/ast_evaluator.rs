@@ -25,7 +25,7 @@ use std::collections::HashMap;
 
 use nsl_ast::decl::Param;
 use nsl_ast::expr::{Arg, Expr, ExprKind};
-use nsl_ast::operator::BinOp;
+use nsl_ast::operator::{BinOp, UnaryOp};
 use nsl_ast::{Span, Symbol};
 use nsl_lexer::Interner;
 
@@ -63,6 +63,12 @@ pub enum EvalError {
     },
     /// Right operand of `Div`, `FloorDiv`, or `Mod` was zero.
     DivByZero { span: Span },
+    /// Integer arithmetic overflow during evaluation. `op` is a static
+    /// label naming the offending operation (e.g. `"addition"`,
+    /// `"negation"`) so a three-part diagnostic can render
+    /// `requested`/`expected`/`found` consistently with the other
+    /// `EvalError` variants.
+    Overflow { span: Span, op: &'static str },
 }
 
 impl std::fmt::Display for EvalError {
@@ -78,6 +84,9 @@ impl std::fmt::Display for EvalError {
                 write!(f, "type mismatch in calibration pre-scan: expected {expected}, got {got}")
             }
             Self::DivByZero { .. } => write!(f, "division by zero in calibration pre-scan"),
+            Self::Overflow { op, .. } => {
+                write!(f, "calibration pre-scan: integer overflow during {op}")
+            }
         }
     }
 }
@@ -105,24 +114,47 @@ pub fn evaluate_expr(
         ExprKind::BinaryOp { left, op, right } => {
             let l = expect_int(evaluate_expr(left, scope, interner)?, left.span)?;
             let r = expect_int(evaluate_expr(right, scope, interner)?, right.span)?;
+            // `checked_*` everywhere: in debug builds raw `+/-/*` panics
+            // on overflow (kills the compiler with no diagnostic span);
+            // in release builds it wraps silently (produces wrong shape
+            // values that propagate into far-away codegen errors). Both
+            // are wrong for a user-controlled AST.
             let result = match op {
-                BinOp::Add => l + r,
-                BinOp::Sub => l - r,
-                BinOp::Mul => l * r,
+                BinOp::Add => l.checked_add(r).ok_or(EvalError::Overflow {
+                    span: expr.span,
+                    op: "addition",
+                })?,
+                BinOp::Sub => l.checked_sub(r).ok_or(EvalError::Overflow {
+                    span: expr.span,
+                    op: "subtraction",
+                })?,
+                BinOp::Mul => l.checked_mul(r).ok_or(EvalError::Overflow {
+                    span: expr.span,
+                    op: "multiplication",
+                })?,
                 BinOp::Div | BinOp::FloorDiv => {
                     if r == 0 {
                         return Err(EvalError::DivByZero { span: expr.span });
                     }
-                    // Integer floor-division. `Div` and `FloorDiv` are
+                    // `i64::checked_div` returns `None` only on the
+                    // single overflow case `i64::MIN / -1`; the
+                    // explicit `r == 0` check above still covers
+                    // standard div-by-zero. `Div` and `FloorDiv` are
                     // equivalent here because the evaluator's value
                     // domain is i64 (no float results).
-                    l / r
+                    l.checked_div(r).ok_or(EvalError::Overflow {
+                        span: expr.span,
+                        op: "division",
+                    })?
                 }
                 BinOp::Mod => {
                     if r == 0 {
                         return Err(EvalError::DivByZero { span: expr.span });
                     }
-                    l % r
+                    l.checked_rem(r).ok_or(EvalError::Overflow {
+                        span: expr.span,
+                        op: "modulo",
+                    })?
                 }
                 _ => {
                     return Err(EvalError::UnsupportedExpr {
@@ -133,6 +165,33 @@ pub fn evaluate_expr(
             };
             Ok(EvalValue::Int(result))
         }
+
+        ExprKind::UnaryOp { op, operand } => {
+            // `-1` parses as `UnaryOp { Neg, IntLiteral(1) }`, NOT as
+            // `IntLiteral(-1)`. Without this arm, every negative literal
+            // (`pad_id: int = -1`, `[batch, -1]`) refuses with
+            // `UnsupportedExpr`. `Not` falls through to the catch-all.
+            let v = evaluate_expr(operand, scope, interner)?;
+            match (op, v) {
+                (UnaryOp::Neg, EvalValue::Int(n)) => {
+                    n.checked_neg().map(EvalValue::Int).ok_or(EvalError::Overflow {
+                        span: expr.span,
+                        op: "negation",
+                    })
+                }
+                (UnaryOp::Neg, EvalValue::IntList(_)) => Err(EvalError::TypeMismatch {
+                    expected: "int",
+                    got: "list",
+                    span: operand.span,
+                }),
+                _ => Err(EvalError::UnsupportedExpr {
+                    kind_summary: "non-arithmetic unary op",
+                    span: expr.span,
+                }),
+            }
+        }
+
+        ExprKind::Paren(inner) => evaluate_expr(inner, scope, interner),
 
         ExprKind::ListLiteral(items) => {
             let mut out = Vec::with_capacity(items.len());
@@ -367,6 +426,17 @@ mod tests {
 
     fn list_lit(items: Vec<Expr>) -> Expr {
         make_expr(ExprKind::ListLiteral(items))
+    }
+
+    fn unary_neg(operand: Expr) -> Expr {
+        make_expr(ExprKind::UnaryOp {
+            op: UnaryOp::Neg,
+            operand: Box::new(operand),
+        })
+    }
+
+    fn paren(inner: Expr) -> Expr {
+        make_expr(ExprKind::Paren(Box::new(inner)))
     }
 
     // ── evaluate_expr coverage ────────────────────────────────────────
@@ -694,6 +764,125 @@ mod tests {
                 assert_eq!(got, "list");
             }
             other => panic!("expected TypeMismatch, got {other:?}"),
+        }
+    }
+
+    // ── overflow / Paren / UnaryOp coverage (Tasks I-1, I-2, I-3) ─────
+
+    #[test]
+    fn arithmetic_overflow_errors() {
+        // i64::MAX + 1 must surface as `Overflow`, NOT panic (debug) or
+        // wrap silently (release).
+        let interner = Interner::new();
+        let scope = Scope::new();
+        let expr = bin(BinOp::Add, int_lit(i64::MAX), int_lit(1));
+        match evaluate_expr(&expr, &scope, &interner) {
+            Err(EvalError::Overflow { op, .. }) => assert_eq!(op, "addition"),
+            other => panic!("expected Overflow, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn multiplication_overflow_errors() {
+        let interner = Interner::new();
+        let scope = Scope::new();
+        let expr = bin(BinOp::Mul, int_lit(i64::MAX), int_lit(2));
+        match evaluate_expr(&expr, &scope, &interner) {
+            Err(EvalError::Overflow { op, .. }) => assert_eq!(op, "multiplication"),
+            other => panic!("expected Overflow for multiplication, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn negation_overflow_errors() {
+        // i64::MIN.checked_neg() is None — only overflow case for neg.
+        let interner = Interner::new();
+        let scope = Scope::new();
+        let expr = unary_neg(int_lit(i64::MIN));
+        assert!(matches!(
+            evaluate_expr(&expr, &scope, &interner),
+            Err(EvalError::Overflow { op: "negation", .. })
+        ));
+    }
+
+    #[test]
+    fn paren_unwraps_inner_expr() {
+        // `(3 + 4)` must evaluate identically to `3 + 4`.
+        let interner = Interner::new();
+        let scope = Scope::new();
+        let expr = paren(bin(BinOp::Add, int_lit(3), int_lit(4)));
+        assert_eq!(
+            evaluate_expr(&expr, &scope, &interner).unwrap(),
+            EvalValue::Int(7)
+        );
+    }
+
+    #[test]
+    fn paren_around_list_preserves_list() {
+        // `([1, 2, 3])` should yield the IntList unchanged.
+        let interner = Interner::new();
+        let scope = Scope::new();
+        let expr = paren(list_lit(vec![int_lit(1), int_lit(2), int_lit(3)]));
+        assert_eq!(
+            evaluate_expr(&expr, &scope, &interner).unwrap(),
+            EvalValue::IntList(vec![1, 2, 3])
+        );
+    }
+
+    #[test]
+    fn unary_neg_negates_int() {
+        // `-5` parses as UnaryOp{Neg, IntLiteral(5)} — must yield -5.
+        let interner = Interner::new();
+        let scope = Scope::new();
+        let expr = unary_neg(int_lit(5));
+        assert_eq!(
+            evaluate_expr(&expr, &scope, &interner).unwrap(),
+            EvalValue::Int(-5)
+        );
+    }
+
+    #[test]
+    fn unary_neg_in_list_evaluates() {
+        // `[batch, -1]` is a common reshape pattern — UnaryOp::Neg
+        // inside a list literal must evaluate to -1, not refuse.
+        let interner = Interner::new();
+        let scope = Scope::new();
+        let expr = list_lit(vec![int_lit(2), unary_neg(int_lit(1))]);
+        assert_eq!(
+            evaluate_expr(&expr, &scope, &interner).unwrap(),
+            EvalValue::IntList(vec![2, -1])
+        );
+    }
+
+    #[test]
+    fn unary_neg_on_list_errors() {
+        // Negating a list value is a TypeMismatch, not silent dropping.
+        let mut interner = Interner::new();
+        let v = intern(&mut interner, "v");
+        let mut scope = Scope::new();
+        scope.insert(v, EvalValue::IntList(vec![1, 2]));
+        let expr = unary_neg(ident(v));
+        assert!(matches!(
+            evaluate_expr(&expr, &scope, &interner),
+            Err(EvalError::TypeMismatch { expected: "int", got: "list", .. })
+        ));
+    }
+
+    #[test]
+    fn unary_not_unsupported() {
+        // `not x` falls through to UnsupportedExpr — the calibration
+        // pre-scan never sees boolean expressions.
+        let interner = Interner::new();
+        let scope = Scope::new();
+        let expr = make_expr(ExprKind::UnaryOp {
+            op: UnaryOp::Not,
+            operand: Box::new(int_lit(0)),
+        });
+        match evaluate_expr(&expr, &scope, &interner) {
+            Err(EvalError::UnsupportedExpr { kind_summary, .. }) => {
+                assert!(kind_summary.contains("non-arithmetic unary op"));
+            }
+            other => panic!("expected UnsupportedExpr for UnaryOp::Not, got {other:?}"),
         }
     }
 
