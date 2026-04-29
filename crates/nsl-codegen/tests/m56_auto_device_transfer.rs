@@ -153,6 +153,45 @@ fn pipe2(text: i32) -> i32:\n    return plain.process(text)\n";
         obj_str.contains("__nsl_agent_Plain_process"),
         "compiled object must contain '__nsl_agent_Plain_process'"
     );
+
+    // Negative transfer assertion: verify that Task 19's dispatch gate does NOT
+    // arm for Plain.process.
+    //
+    // NOTE: `!obj_str.contains("nsl_tensor_to_device")` is not viable:
+    // `nsl_tensor_to_device` is registered as a global builtin in builtins.rs
+    // and therefore always appears in any compiled module's external symbol table
+    // regardless of whether any call site actually uses it.  Object-level
+    // occurrence-count comparison also fails: the symbol appears the same number
+    // of times whether or not a call is inserted (call-site relocations use a
+    // symbol-table index, not a repeated string).
+    //
+    // Coverage via the semantic registry (proxy for codegen's gate):
+    // `collect_agents` populates `agent_auto_device_params` only for methods
+    // where `has_auto_device_transfer == true` in the semantic registry.  We
+    // verify here that Plain.process has no such annotation, which guarantees
+    // that `agent_auto_device_params` will be empty for ("Plain", "process") and
+    // the Task 19 dispatch branch will be skipped.
+    {
+        let mut interner2 = nsl_lexer::Interner::new();
+        let (tokens2, _) = nsl_lexer::tokenize(src, nsl_errors::FileId(0), &mut interner2);
+        let parsed2 = nsl_parser::parse(&tokens2, &mut interner2);
+        let mut registry = nsl_semantic::agent::AgentRegistry::new();
+        registry.register_module(&parsed2.module, &interner2);
+        let plain_agent = registry
+            .get_by_name("Plain")
+            .expect("Plain agent must be registered in semantic registry");
+        let process_method = plain_agent
+            .methods
+            .iter()
+            .find(|m| m.name_str == "process")
+            .expect("Plain.process must be present in semantic registry");
+        assert!(
+            !process_method.has_auto_device_transfer,
+            "Plain.process must not have @auto_device_transfer — a spurious \
+             annotation would arm the Task 19 dispatch gate and cause \
+             nsl_tensor_to_device to be inserted at every call site"
+        );
+    }
 }
 
 // ── Test 4: @auto_device_transfer with cpu target param ──────────────────────

@@ -480,7 +480,7 @@ fn declare_i64_rodata(
     symbol: &str,
     values: &[i64],
 ) -> Result<DataId, HarnessError> {
-    let mut bytes = Vec::with_capacity(values.len() * std::mem::size_of::<i64>());
+    let mut bytes = Vec::with_capacity(std::mem::size_of_val(values));
     for value in values {
         bytes.extend_from_slice(&value.to_le_bytes());
     }

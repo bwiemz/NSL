@@ -254,7 +254,8 @@ impl<'a> Parser<'a> {
                 | TokenKind::Import
                 | TokenKind::From
                 | TokenKind::Train
-                | TokenKind::Grad => {
+                | TokenKind::Grad
+                | TokenKind::Agent => {
                     return;
                 }
                 _ => {
