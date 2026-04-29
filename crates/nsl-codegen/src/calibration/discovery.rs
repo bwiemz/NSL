@@ -3,7 +3,10 @@
 //! Walks a model's `forward` method body, collects every site where a model
 //! layer field is piped or called (i.e. a linear projection), filters by a
 //! `*`-per-segment glob derived from the quantisation block, and returns a
-//! sorted `Vec<DiscoveredProjection>`.
+//! `Vec<DiscoveredProjection>` in **forward-pipe order** (first occurrence
+//! per field name). Pipe order is canonical: the AST pre-scan and the
+//! in-compile path both produce it, and `check_discovery_agreement` requires
+//! the two to match.
 
 use crate::calibration::observation::ProjectionRef;
 use nsl_ast::decl::{Decorator, ModelDef, ModelMember};
@@ -425,7 +428,8 @@ pub fn check_discovery_agreement(
 // ── public API ────────────────────────────────────────────────────────────────
 
 /// Walk `model_def`'s `forward` method body, collecting linear-projection sites,
-/// and return a sorted `Vec<DiscoveredProjection>`.
+/// and return a `Vec<DiscoveredProjection>` in forward-pipe order
+/// (first occurrence per field name).
 ///
 /// # Parameters
 ///
@@ -885,7 +889,11 @@ mod tests {
     // ── test cases ─────────────────────────────────────────────────────────
 
     #[test]
-    fn single_glob_resolves_to_both_projections_sorted() {
+    fn single_glob_resolves_to_both_projections_in_pipe_order() {
+        // Canonical order is forward-pipe order, NOT alphabetical. The pre-scan
+        // path walks the AST in the same order; check_discovery_agreement
+        // requires the in-compile path to produce an identical sequence. See
+        // pre_scan_preserves_forward_projection_order for the matching anchor.
         let (model_def, quant_block, interner, field_types, tensor_shapes) =
             mlp_fixture_two_linears();
         let result = discover_awq_projections(
@@ -897,11 +905,11 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result.len(), 2);
-        // Alphabetical: down_proj < up_proj
-        assert_eq!(result[0].projection.0, "TinyMLP.down_proj");
-        assert_eq!(result[1].projection.0, "TinyMLP.up_proj");
-        assert_eq!(result[0].weight_shape, [128, 64]);
-        assert_eq!(result[1].weight_shape, [64, 128]);
+        // Pipe order in the fixture: up_proj first, then down_proj.
+        assert_eq!(result[0].projection.0, "TinyMLP.up_proj");
+        assert_eq!(result[1].projection.0, "TinyMLP.down_proj");
+        assert_eq!(result[0].weight_shape, [64, 128]);
+        assert_eq!(result[1].weight_shape, [128, 64]);
     }
 
     #[test]
@@ -940,10 +948,16 @@ mod tests {
 
     #[test]
     fn non_static_weight_errors_for_unknown_field() {
-        let (model_def, quant_block, interner, mut field_types, tensor_shapes) =
+        let (model_def, quant_block, interner, mut field_types, mut tensor_shapes) =
             mlp_fixture_two_linears();
-        // Remove down_proj from the field map; it still appears in the pipe chain.
+        // Remove down_proj from BOTH maps so it appears in the pipe chain but
+        // resolves to no static weight. The discovery validator accepts a
+        // field present in *either* `model_field_types` (named layer types like
+        // `Linear`) or `tensor_shapes` (raw `Tensor<…>` parameters); both
+        // qualify as static weights for AWQ. The error fires only when both
+        // are absent.
         field_types.remove("down_proj");
+        tensor_shapes.remove("down_proj");
         let err = discover_awq_projections(
             &model_def,
             &quant_block,
