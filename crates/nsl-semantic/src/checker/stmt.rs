@@ -626,6 +626,22 @@ impl<'a> TypeChecker<'a> {
                                         &resolve,
                                         &mut self.diagnostics,
                                     );
+                                    // WGGO Phase 2 Task 4 is deliberately
+                                    // SKIPPED here. Field-existence and
+                                    // field-type validation requires the
+                                    // enclosing `ModelDef`'s `LayerDecl`
+                                    // member list to resolve field types,
+                                    // which is not available at the
+                                    // top-level `fn` site. Task 1's
+                                    // placement check already errors on
+                                    // any non-`forward` standalone fn,
+                                    // and a standalone `forward` fn has
+                                    // no `self` model context anyway, so
+                                    // any `self.<field>` arg here is
+                                    // unresolvable by construction. See
+                                    // the model-method call site in
+                                    // `checker/model.rs` for the actual
+                                    // Task 4 call.
                                 }
                                 _ => {
                                     self.diagnostics.push(

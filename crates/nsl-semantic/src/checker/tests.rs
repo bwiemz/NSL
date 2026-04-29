@@ -1375,3 +1375,151 @@ model Attention:
         msg
     );
 }
+
+// -------------------------------------------------------------------------
+// WGGO Phase 2 Task 4: @wggo_target field-existence + field-type validation
+//
+// Each `@wggo_target` argument that passes Tasks 1-3 (placement,
+// required-args, self.<field>) must reference a field that:
+//   - exists in the enclosing model's `LayerDecl` member list, AND
+//   - has the right type (Tensor for w_q/w_k/w_v/w_o; int for head_dim)
+//
+// Diagnostic shapes:
+//   @wggo_target field reference 'self.<F>' not found in model '<M>'
+//   @wggo_target argument '<ARG>' must reference a Tensor field; got <KIND>
+//   @wggo_target argument 'head_dim' must reference an int field; got <KIND>
+// -------------------------------------------------------------------------
+
+#[test]
+fn wggo_target_unknown_field_errors() {
+    // `self.unknown_field` is referenced but no such field exists on
+    // model `Attention`. The diagnostic must name both the missing field
+    // and the model.
+    let src = r#"
+model Attention:
+    q_proj: Tensor<[4, 4], f32> = zeros([4, 4])
+    head_dim: Tensor<[4, 4], f32> = zeros([4, 4])
+
+    @wggo_target(w_q=self.unknown_field, w_k=self.q_proj, w_v=self.q_proj, w_o=self.q_proj, head_dim=self.head_dim)
+    fn forward(self, x: Tensor<[4], f32>) -> Tensor<[4], f32>:
+        return x
+"#;
+    let diags = check_source(src);
+    assert!(
+        diags.iter().any(|d| {
+            d.message
+                .contains("'self.unknown_field' not found in model 'Attention'")
+        }),
+        "expected unknown-field diagnostic naming `self.unknown_field` and `Attention`; got: {:?}",
+        diags
+    );
+}
+
+#[test]
+fn wggo_target_w_q_points_at_int_field_errors() {
+    // `head_dim` is an `int` field. Pointing `w_q` (which must be Tensor)
+    // at it should emit the wrong-field-type diagnostic with `got int`.
+    let src = r#"
+model Attention:
+    head_dim: int = 4
+
+    @wggo_target(w_q=self.head_dim, w_k=self.head_dim, w_v=self.head_dim, w_o=self.head_dim, head_dim=self.head_dim)
+    fn forward(self, x: Tensor<[4], f32>) -> Tensor<[4], f32>:
+        return x
+"#;
+    let diags = check_source(src);
+    assert!(
+        diags.iter().any(|d| {
+            d.message
+                .contains("argument 'w_q' must reference a Tensor field; got int")
+        }),
+        "expected `w_q must reference a Tensor field; got int`; got: {:?}",
+        diags
+    );
+}
+
+#[test]
+fn wggo_target_head_dim_points_at_tensor_field_errors() {
+    // `q_proj` is a Tensor field. Using it as `head_dim` (which must be
+    // int) should emit the wrong-field-type diagnostic with `got Tensor`.
+    let src = r#"
+model Attention:
+    q_proj: Tensor<[4, 4], f32> = zeros([4, 4])
+
+    @wggo_target(w_q=self.q_proj, w_k=self.q_proj, w_v=self.q_proj, w_o=self.q_proj, head_dim=self.q_proj)
+    fn forward(self, x: Tensor<[4], f32>) -> Tensor<[4], f32>:
+        return x
+"#;
+    let diags = check_source(src);
+    assert!(
+        diags.iter().any(|d| {
+            d.message
+                .contains("argument 'head_dim' must reference an int field; got Tensor")
+        }),
+        "expected `head_dim must reference an int field; got Tensor`; got: {:?}",
+        diags
+    );
+}
+
+#[test]
+fn wggo_target_correctly_typed_fields_no_field_type_error() {
+    // Happy path: all four projection args reference Tensor fields and
+    // head_dim references an int field. None of the Task 4 diagnostics
+    // should fire.
+    let src = r#"
+model Attention:
+    q_proj: Tensor<[4, 4], f32> = zeros([4, 4])
+    k_proj: Tensor<[4, 4], f32> = zeros([4, 4])
+    v_proj: Tensor<[4, 4], f32> = zeros([4, 4])
+    o_proj: Tensor<[4, 4], f32> = zeros([4, 4])
+    head_dim: int = 4
+
+    @wggo_target(w_q=self.q_proj, w_k=self.k_proj, w_v=self.v_proj, w_o=self.o_proj, head_dim=self.head_dim)
+    fn forward(self, x: Tensor<[4], f32>) -> Tensor<[4], f32>:
+        return x
+"#;
+    let diags = check_source(src);
+    assert!(
+        !diags.iter().any(|d| d.message.contains("not found in model")),
+        "happy path must not emit `not found in model` diagnostics; got: {:?}",
+        diags
+    );
+    assert!(
+        !diags.iter().any(|d| d.message.contains("must reference a Tensor field")
+            || d.message.contains("must reference an int field")),
+        "happy path must not emit field-type diagnostics; got: {:?}",
+        diags
+    );
+}
+
+#[test]
+fn wggo_target_multiple_wrong_fields_all_diagnose() {
+    // Two errors: `w_q` points at an int field and `head_dim` points at a
+    // Tensor field. Both diagnostics must fire — no short-circuit.
+    let src = r#"
+model Attention:
+    q_proj: Tensor<[4, 4], f32> = zeros([4, 4])
+    head_dim_int: int = 4
+
+    @wggo_target(w_q=self.head_dim_int, w_k=self.q_proj, w_v=self.q_proj, w_o=self.q_proj, head_dim=self.q_proj)
+    fn forward(self, x: Tensor<[4], f32>) -> Tensor<[4], f32>:
+        return x
+"#;
+    let diags = check_source(src);
+    assert!(
+        diags.iter().any(|d| {
+            d.message
+                .contains("argument 'w_q' must reference a Tensor field; got int")
+        }),
+        "expected w_q-int diagnostic; got: {:?}",
+        diags
+    );
+    assert!(
+        diags.iter().any(|d| {
+            d.message
+                .contains("argument 'head_dim' must reference an int field; got Tensor")
+        }),
+        "expected head_dim-Tensor diagnostic; got: {:?}",
+        diags
+    );
+}

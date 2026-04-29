@@ -401,6 +401,18 @@ impl<'a> TypeChecker<'a> {
                                 &resolve,
                                 &mut self.diagnostics,
                             );
+                            // WGGO Phase 2 Task 4: each `self.<field>`
+                            // arg must reference an existing field of
+                            // the enclosing model with the right type
+                            // (Tensor for w_q/w_k/w_v/w_o; int for
+                            // head_dim). Args that didn't pass Task 3
+                            // are silently skipped inside the helper.
+                            crate::wggo::validate_wggo_target_field_types(
+                                deco,
+                                model_def,
+                                &resolve,
+                                &mut self.diagnostics,
+                            );
                         }
                     }
                 }
