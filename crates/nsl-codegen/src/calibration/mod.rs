@@ -1,6 +1,7 @@
 //! Compile-time calibration harness — see
 //! `docs/superpowers/specs/2026-04-13-calibration-harness-design.md`.
 
+pub mod ast_evaluator;
 pub mod awq_hook;
 pub mod discovery;
 pub mod wggo_gradient_hook;
