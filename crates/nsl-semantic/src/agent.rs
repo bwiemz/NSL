@@ -359,8 +359,11 @@ fn as_agent_method_call(
     // and look up the registered agent by that name. This mirrors the NSL
     // convention that `agent Drafter:` is bound at the pipeline site as
     // `drafter`. Tasks 8–10 use the same heuristic via the same lookup shape.
-    // TODO(task 12): replace heuristic with type-checker-resolved binding→agent
-    // type map when semantic-phase integration lands.
+    // TODO(post-v1): replace this v1 heuristic with the type-checker-resolved
+    // binding→agent type map. Task 12 (semantic integration) shipped
+    // intentionally retaining the heuristic; replacement requires extending
+    // the type checker to resolve receiver→agent-type when the binding is not
+    // declared (e.g., synthesized in @pipeline_agent bodies).
     let title = uppercase_first(name);
     let agent = registry.get_by_name(&title)?;
     let method_str = interner.resolve(member.0)?;
@@ -436,13 +439,14 @@ pub fn detect_cycles(
 
     let mut visited = HashSet::new();
     let mut in_stack: Vec<Symbol> = Vec::new();
+    let mut in_stack_set: HashSet<Symbol> = HashSet::new();
     let mut cycle_path: Option<Vec<Symbol>> = None;
 
     for &start in &apg.agents {
         if visited.contains(&start) {
             continue;
         }
-        if dfs_cycle(start, &adj, &mut visited, &mut in_stack, &mut cycle_path) {
+        if dfs_cycle(start, &adj, &mut visited, &mut in_stack, &mut in_stack_set, &mut cycle_path) {
             break;
         }
     }
@@ -469,14 +473,26 @@ pub fn detect_cycles(
     }
 }
 
+/// DFS-based back-edge detection for cycle reporting.
+///
+/// # Dual-structure invariant
+///
+/// `in_stack` (Vec) preserves insertion order for cycle-path reconstruction —
+/// when a back-edge is found the slice `in_stack[start_idx..]` gives the exact
+/// cycle sequence for the diagnostic message.
+///
+/// `in_stack_set` (HashSet) mirrors `in_stack`'s membership for O(1) back-edge
+/// queries — the contains check on a Vec is O(N) and becomes hot on deep graphs.
+/// Both structures must be kept in sync: push to both, pop from both.
 fn dfs_cycle(
     node: Symbol,
     adj: &HashMap<Symbol, HashSet<Symbol>>,
     visited: &mut HashSet<Symbol>,
     in_stack: &mut Vec<Symbol>,
+    in_stack_set: &mut HashSet<Symbol>,
     cycle_path: &mut Option<Vec<Symbol>>,
 ) -> bool {
-    if in_stack.contains(&node) {
+    if in_stack_set.contains(&node) {
         // Extract the cycle: from first occurrence of `node` through end of
         // in_stack, plus `node` repeated to close the visible cycle.
         let start_idx = in_stack.iter().position(|n| *n == node).unwrap();
@@ -490,18 +506,20 @@ fn dfs_cycle(
     }
     visited.insert(node);
     in_stack.push(node);
+    in_stack_set.insert(node);
 
     if let Some(neighbors) = adj.get(&node) {
         // Collect into a sorted vec for deterministic output order.
         let mut sorted: Vec<Symbol> = neighbors.iter().copied().collect();
         sorted.sort_by_key(|s| s.0);
         for next in sorted {
-            if dfs_cycle(next, adj, visited, in_stack, cycle_path) {
+            if dfs_cycle(next, adj, visited, in_stack, in_stack_set, cycle_path) {
                 return true;
             }
         }
     }
     in_stack.pop();
+    in_stack_set.remove(&node);
     false
 }
 
@@ -548,8 +566,8 @@ pub fn check_linear_types_flag(
 /// a method reads `<other_agent>.<field>` and the field is not `@shared`.
 ///
 /// v1 heuristic: receiver-name → agent-type mapping is title-cased
-/// (`drafter` → `Drafter`). See the same TODO(task 12) note on
-/// `as_agent_method_call` — Task 12 will replace this with the
+/// (`drafter` → `Drafter`). See the same TODO(post-v1) note on
+/// `as_agent_method_call` — a post-v1 task will replace this with the
 /// type-checker-resolved binding type map.
 pub fn check_cross_agent_field_access(
     module: &nsl_ast::Module,
@@ -653,7 +671,7 @@ fn walk_expr_for_cross_field(
                 // same agent (e.g. `drafter` inside Drafter's own method) is caught
                 // structurally by the `def_symbol == current_agent` guard below.
                 // v1 heuristic: title-case the receiver name to find the
-                // agent type. See TODO(task 12) on as_agent_method_call.
+                // agent type. See TODO(post-v1) on as_agent_method_call.
                 let title = uppercase_first(obj_name);
                 let Some(other_agent) = registry.get_by_name(&title) else { return };
                 if other_agent.def_symbol == current_agent {
@@ -727,7 +745,11 @@ fn walk_expr_for_cross_field(
 }
 
 /// v1 heuristic: title-case a receiver variable name to find the registered agent type.
-/// TODO(task 12): replace with the type-checker-resolved binding→agent type map.
+/// TODO(post-v1): replace this v1 heuristic with the type-checker-resolved
+/// binding→agent type map. Task 12 (semantic integration) shipped
+/// intentionally retaining the heuristic; replacement requires extending the
+/// type checker to resolve receiver→agent-type when the binding is not
+/// declared (e.g., synthesized in @pipeline_agent bodies).
 fn uppercase_first(s: &str) -> String {
     let mut c = s.chars();
     match c.next() {
@@ -742,8 +764,10 @@ fn uppercase_first(s: &str) -> String {
 
 /// Simplified device representation used for comparison during device checking.
 /// Distinct from `crate::types::Device` (which is the post-type-check form).
-/// v1 sources device info from AST `DeviceExpr`; TODO(task 12): replace with
-/// the type-checker-resolved `types::Device` from the full type map.
+/// v1 sources device info from AST `DeviceExpr`; TODO(post-v1): replace with
+/// the type-checker-resolved `types::Device` from the full type map. Task 12
+/// (semantic integration) shipped intentionally retaining AST scraping;
+/// replacement depends on the type checker exposing a resolved device map.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SrcDevice {
     Cpu,
@@ -793,7 +817,10 @@ fn src_device_from_device_expr(dev: &DeviceExpr) -> SrcDevice {
 /// Try to extract the device from a type annotation `TypeExprKind`.
 /// Returns `None` if the type is not a `Tensor` or carries no device clause.
 ///
-/// TODO(task 12): replace AST scraping with the type-checker-resolved type map.
+/// TODO(post-v1): replace AST scraping with the type-checker-resolved type map.
+/// Task 12 (semantic integration) shipped intentionally retaining the AST
+/// scraping path; replacement requires the type checker to expose a resolved
+/// type map for pipeline parameter bindings.
 fn device_from_type_ann(ann: &nsl_ast::types::TypeExpr) -> Option<SrcDevice> {
     match &ann.kind {
         TypeExprKind::Tensor { device, .. } => {
@@ -906,8 +933,11 @@ fn find_pipeline_fn_def(module: &Module, pipeline_fn_sym: Symbol) -> Option<&FnD
 ///
 /// v1 source: device is read directly from the AST's parameter type annotations
 /// (`TypeExpr` walking). If the device is unspecified syntactically, the check
-/// is skipped conservatively. TODO(task 12): replace AST scraping with the
-/// type-checker-resolved type map when full semantic integration lands.
+/// is skipped conservatively. TODO(post-v1): replace AST scraping with the
+/// type-checker-resolved type map. Task 12 (semantic integration) shipped
+/// intentionally retaining the conservative AST scraping; replacement
+/// requires the type checker to expose a resolved device map for pipeline
+/// parameter bindings.
 pub fn check_device_compatibility(
     apg: &ActionPortGraph,
     module: &Module,
@@ -1190,7 +1220,11 @@ fn check_target_for_cross_agent(
     // `self.x` is structurally excluded: `self` is parsed as `ExprKind::SelfRef`,
     // not `ExprKind::Ident`, so it never reaches this branch.
     // v1 heuristic: title-case the receiver variable name to find the agent type.
-    // TODO(task 12): replace with the type-checker-resolved binding→agent type map.
+    // TODO(post-v1): replace this v1 heuristic with the type-checker-resolved
+    // binding→agent type map. Task 12 (semantic integration) shipped
+    // intentionally retaining the heuristic; replacement requires extending
+    // the type checker to resolve receiver→agent-type when the binding is not
+    // declared (e.g., synthesized in @pipeline_agent bodies).
     let title = uppercase_first(obj_name);
     let Some(other_agent) = registry.get_by_name(&title) else { return };
     if other_agent.def_symbol == current_agent { return; }
@@ -1226,8 +1260,11 @@ fn check_target_for_cross_agent(
 /// integration), this check should consult per-binding ownership and
 /// suppress E0609 for @shared bindings.
 ///
-/// TODO(task 12): consult type-checker @shared annotation per binding before
+/// TODO(post-v1): consult type-checker @shared annotation per binding before
 /// emitting E0609; @shared bindings must be allowed to fan-out.
+/// Task 12 (semantic integration) shipped intentionally retaining the
+/// conservative v1 behavior (all bindings treated as linear); replacement
+/// requires the type checker to expose per-binding @shared ownership flags.
 pub fn check_fan_out(
     apg: &ActionPortGraph,
     interner: &Interner,
@@ -1409,6 +1446,71 @@ fn loop_pipe(x: Tensor) -> Tensor:\n    let y = a.a_fn(x)\n    let z = b.b_fn(y)
         assert!(diags.iter().any(|d| d.message.contains("E0603")),
             "expected E0603 cycle error, got: {:?}",
             diags.iter().map(|d| &d.message).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn cycle_detection_flags_self_cycle() {
+        // A's output feeds back into A's own method input — produces an A→A self-cycle.
+        // Uses a single method called twice: a.a_fn(x) → y, then a.a_fn(y) → z.
+        // The second call's arg `y` came from agent A, so source_by_binding maps
+        // y → (A, a_fn), producing BindingToAgent { source_agent: Some(A), target_agent: A }.
+        // dfs_cycle: visits A, pushes A to in_stack_set, recurses into neighbor A,
+        // finds A in in_stack_set → cycle detected.
+        let src = "\
+agent A:\n    fn a_fn(self, x: Tensor) -> Tensor:\n        return x\n\
+@pipeline_agent(agents=[A])\n\
+fn self_loop(x: Tensor) -> Tensor:\n    let y = a.a_fn(x)\n    let z = a.a_fn(y)\n    return z\n";
+        let mut interner = nsl_lexer::Interner::new();
+        let (tokens, _) = nsl_lexer::tokenize(src, nsl_errors::FileId(0), &mut interner);
+        let parse_result = nsl_parser::parse(&tokens, &mut interner);
+        assert!(parse_result.diagnostics.is_empty(), "parse: {:?}", parse_result.diagnostics);
+
+        let mut registry = AgentRegistry::new();
+        registry.register_module(&parse_result.module, &interner);
+
+        let mut apgs = Vec::new();
+        let mut diags = Vec::new();
+        extract_apgs(&parse_result.module, &registry, &interner, &mut apgs, &mut diags);
+        for apg in &apgs {
+            detect_cycles(apg, &interner, &mut diags);
+        }
+
+        // A → A self-cycle: BindingToAgent edges where source_agent == target_agent.
+        assert!(diags.iter().any(|d| d.message.contains("E0603")),
+            "expected E0603 for self-cycle (A→A); got: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn cycle_detection_flags_three_agent_cycle() {
+        // A→B→C→A: transitive cycle through three nodes.
+        let src = "\
+agent A:\n    fn a_fn(self, x: Tensor) -> Tensor:\n        return x\n\
+agent B:\n    fn b_fn(self, y: Tensor) -> Tensor:\n        return y\n\
+agent C:\n    fn c_fn(self, z: Tensor) -> Tensor:\n        return z\n\
+@pipeline_agent(agents=[A, B, C])\n\
+fn three_cycle(x: Tensor) -> Tensor:\n    let y = a.a_fn(x)\n    let z = b.b_fn(y)\n    let w = c.c_fn(z)\n    return a.a_fn(w)\n";
+        let mut interner = nsl_lexer::Interner::new();
+        let (tokens, _) = nsl_lexer::tokenize(src, nsl_errors::FileId(0), &mut interner);
+        let parse_result = nsl_parser::parse(&tokens, &mut interner);
+        assert!(parse_result.diagnostics.is_empty(), "parse: {:?}", parse_result.diagnostics);
+
+        let mut registry = AgentRegistry::new();
+        registry.register_module(&parse_result.module, &interner);
+
+        let mut apgs = Vec::new();
+        let mut diags = Vec::new();
+        extract_apgs(&parse_result.module, &registry, &interner, &mut apgs, &mut diags);
+        for apg in &apgs {
+            detect_cycles(apg, &interner, &mut diags);
+        }
+
+        // The cycle path should mention all three agents — verify by reading the message.
+        let e0603 = diags.iter().find(|d| d.message.contains("E0603"))
+            .expect("expected E0603 for 3-agent cycle");
+        let msg = &e0603.message;
+        assert!(msg.contains("A") && msg.contains("B") && msg.contains("C"),
+            "3-agent cycle path should mention all three agents (A, B, C); got: {}", msg);
     }
 
     #[test]
@@ -1644,6 +1746,12 @@ fn pipe(text: str) -> Tensor<[1, 8], f32, cuda>:\n    let t = tok.tokenize(text)
         assert!(diags.iter().any(|d| d.message.to_lowercase().contains("device transfer")
             || d.message.to_lowercase().contains("inserted device transfer")),
             "expected a transfer-insertion note; got: {:?}",
+            diags.iter().map(|d| &d.message).collect::<Vec<_>>());
+        // The diagnostic must include the computed transfer size.
+        // Tensor<[1, 8], f32, cuda>: 1 × 8 × 4 B = 32 B.
+        // transfer_size_note formats this as "32 B (shape [1, 8], dtype f32)".
+        assert!(diags.iter().any(|d| d.message.contains("32 B")),
+            "expected size '32 B' in transfer note; got: {:?}",
             diags.iter().map(|d| &d.message).collect::<Vec<_>>());
     }
 

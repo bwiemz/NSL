@@ -4404,18 +4404,17 @@ pub extern "C" fn nsl_gpu_set_transient_pool() {
 pub extern "C" fn nsl_gpu_drain_cache() {
     // Probe gate (2026-04-23): NSL_SKIP_GPU_DRAIN=1 bypasses this workaround
     // so we can observe whether ELTLS frees intermediates at last use.
-    if std::env::var("NSL_SKIP_GPU_DRAIN").ok().as_deref() == Some("1") {
-        return;
-    }
-    #[cfg(feature = "cuda")]
-    {
-        crate::cuda::inner::ensure_context();
-        // Sync first to ensure all async GPU ops complete so freed blocks are actually available
-        unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
-        let mut alloc = crate::cuda::caching_allocator::CACHING_ALLOCATOR.lock().unwrap();
-        let freed = alloc.drain_all();
-        if freed > 0 {
-            eprintln!("[gpu-drain] released {}MB to driver", freed / (1024 * 1024));
+    if std::env::var("NSL_SKIP_GPU_DRAIN").ok().as_deref() != Some("1") {
+        #[cfg(feature = "cuda")]
+        {
+            crate::cuda::inner::ensure_context();
+            // Sync first to ensure all async GPU ops complete so freed blocks are actually available
+            unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+            let mut alloc = crate::cuda::caching_allocator::CACHING_ALLOCATOR.lock().unwrap();
+            let freed = alloc.drain_all();
+            if freed > 0 {
+                eprintln!("[gpu-drain] released {}MB to driver", freed / (1024 * 1024));
+            }
         }
     }
 }

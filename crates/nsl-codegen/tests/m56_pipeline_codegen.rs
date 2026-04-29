@@ -42,6 +42,17 @@ fn compile_src(src: &str) -> Result<Vec<u8>, String> {
 
 // ── Test 1: two-agent pipeline compiles with both method symbols in the object ─
 
+/// Regression test for Task 18 pre-existing-bug fixes:
+/// (a) `Type::Error` dispatch — unresolved `drafter`/`reviewer` bindings
+///     are typed `Type::Error` by the semantic pass; the agent-dispatch
+///     path in `expr/calls.rs` must handle them (extends the `Unknown` arm
+///     to `Unknown | Error`).
+/// (b) `VarDecl` type fallback — agent methods returning `i32`/`f32`
+///     produce a Cranelift value whose type doesn't match the default
+///     `I64` from `nsl_type_to_cl(Type::Error)`. The fix in `stmt.rs`
+///     uses `builder.func.dfg.value_type(init_val)` when the semantic
+///     type is `Error`/`Unknown`, preventing a verifier panic.
+///
 /// Verify that a two-agent `@pipeline_agent` function compiles without errors
 /// and that the compiled object contains:
 /// - The pipeline fn symbol (`pipeline`).
