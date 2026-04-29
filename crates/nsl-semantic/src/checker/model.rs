@@ -332,12 +332,56 @@ impl<'a> TypeChecker<'a> {
                                     &mut self.diagnostics,
                                 );
                             }
+                            // WGGO Phase 2 Task 1: `@wggo_target` is only
+                            // valid on the model's `forward` method, never
+                            // on a layer declaration.
+                            if dname == "wggo_target" {
+                                self.diagnostics.push(
+                                    Diagnostic::error(
+                                        "@wggo_target can only be applied to fn declarations"
+                                            .to_string(),
+                                    )
+                                    .with_label(deco.span, "invalid @wggo_target target"),
+                                );
+                            }
                         }
                     }
                 }
-                ModelMember::Method(fn_def, _decos) => {
+                ModelMember::Method(fn_def, decos) => {
                     let method_ty = self.build_fn_type(fn_def);
                     methods.push((fn_def.name, method_ty));
+
+                    // WGGO Phase 2 Task 1: `@wggo_target` placement validation.
+                    // The decorator is only valid on the model's `forward`
+                    // method — the AWQ-calibration backward pass needs to
+                    // observe the canonical forward computation. Mirrors the
+                    // existing `@flash_attention` per-target validation in
+                    // `checker/stmt.rs` for top-level fn declarations.
+                    for deco in decos {
+                        if deco.name.len() != 1 {
+                            continue;
+                        }
+                        let dname = self
+                            .interner
+                            .resolve(deco.name[0].0)
+                            .unwrap_or("")
+                            .to_string();
+                        if dname == "wggo_target" {
+                            let fn_name = self
+                                .interner
+                                .resolve(fn_def.name.0)
+                                .unwrap_or("?")
+                                .to_string();
+                            if fn_name != "forward" {
+                                self.diagnostics.push(
+                                    Diagnostic::error(format!(
+                                        "@wggo_target must be on the model's 'forward' method; found on '{fn_name}'"
+                                    ))
+                                    .with_label(deco.span, "invalid @wggo_target target"),
+                                );
+                            }
+                        }
+                    }
                 }
             }
         }

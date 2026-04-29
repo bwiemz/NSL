@@ -855,3 +855,63 @@ let x: int = 42
         res.diagnostics
     );
 }
+
+// -----------------------------------------------------------------------
+// @wggo_target placement validation tests (WGGO Phase 2 Task 1)
+// -----------------------------------------------------------------------
+
+#[test]
+fn wggo_target_on_non_forward_method_errors() {
+    // @wggo_target must be on the model's `forward` method. Placing it on
+    // any other method (e.g. `cached_forward`) must emit a diagnostic
+    // containing the exact phrase "@wggo_target must be on the model's
+    // 'forward' method" so users can immediately locate the misplacement.
+    //
+    // The fixture intentionally uses a no-arg `@wggo_target` decorator to
+    // isolate the placement rule (Task 1) from later argument-validation
+    // tasks. Subsequent tasks (2/3/4) cover arg presence, types, etc.
+    let src = r#"
+model AttentionBlock:
+    let weight: Tensor<[4, 4], f32>
+
+    @wggo_target
+    fn cached_forward(self, x: Tensor<[4], f32>) -> Tensor<[4], f32>:
+        return x
+"#;
+    let diags = check_source(src);
+    let placement_errs: Vec<_> = diags
+        .iter()
+        .filter(|d| {
+            d.message
+                .contains("@wggo_target must be on the model's 'forward' method")
+        })
+        .collect();
+    assert!(
+        !placement_errs.is_empty(),
+        "@wggo_target on a non-`forward` method should emit the placement diagnostic; got: {:?}",
+        diags
+    );
+}
+
+#[test]
+fn wggo_target_on_forward_method_is_clean() {
+    // The happy path: @wggo_target on `forward` should NOT emit the
+    // placement diagnostic. (Other validation rules — arg presence, types,
+    // etc. — may still fire but are out of scope for Task 1.)
+    let src = r#"
+model AttentionBlock:
+    let weight: Tensor<[4, 4], f32>
+
+    @wggo_target
+    fn forward(self, x: Tensor<[4], f32>) -> Tensor<[4], f32>:
+        return x
+"#;
+    let diags = check_source(src);
+    assert!(
+        !diags.iter().any(|d| d
+            .message
+            .contains("@wggo_target must be on the model's 'forward' method")),
+        "@wggo_target on `forward` should not emit the placement diagnostic; got: {:?}",
+        diags
+    );
+}

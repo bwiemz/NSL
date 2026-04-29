@@ -584,6 +584,40 @@ impl<'a> TypeChecker<'a> {
                             }
                         }
 
+                        // WGGO Phase 2 Task 1: `@wggo_target` placement.
+                        // At the top level the decorator is invalid on any
+                        // non-`fn` form (let-bindings, model defs, etc.).
+                        // The forward-method-name rule is enforced inside
+                        // `checker/model.rs` where the method's name is in
+                        // scope; mirroring the @flash_attention pattern.
+                        if dname == "wggo_target" {
+                            match &stmt.kind {
+                                StmtKind::FnDef(fn_def) => {
+                                    let fn_name = self
+                                        .interner
+                                        .resolve(fn_def.name.0)
+                                        .unwrap_or("?")
+                                        .to_string();
+                                    if fn_name != "forward" {
+                                        self.diagnostics.push(
+                                            Diagnostic::error(format!(
+                                                "@wggo_target must be on the model's 'forward' method; found on '{fn_name}'"
+                                            ))
+                                            .with_label(deco.span, "invalid @wggo_target target"),
+                                        );
+                                    }
+                                }
+                                _ => {
+                                    self.diagnostics.push(
+                                        Diagnostic::error(
+                                            "@wggo_target can only be applied to fn declarations",
+                                        )
+                                        .with_label(deco.span, "invalid @wggo_target target"),
+                                    );
+                                }
+                            }
+                        }
+
                         if dname == "rope" {
                             // @rope requires @flash_attention on the same function
                             let has_flash = decorators.iter().any(|d| {
