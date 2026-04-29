@@ -159,6 +159,107 @@ pub fn validate_wggo_target_required_args(
 }
 
 // ---------------------------------------------------------------------------
+// WGGO Phase 2 Task 3: `@wggo_target` argument-expression validation
+// ---------------------------------------------------------------------------
+
+/// Returns `Some(field_symbol)` if `expr` is a `self.<field>` member-access.
+/// Otherwise returns `None`.
+///
+/// In the NSL AST, `self` is parsed as `ExprKind::SelfRef` (a distinct
+/// variant), and `self.foo` is `MemberAccess { object: SelfRef, member: foo }`.
+fn is_self_field_expr(expr: &nsl_ast::expr::Expr) -> Option<Symbol> {
+    let ExprKind::MemberAccess { object, member } = &expr.kind else {
+        return None;
+    };
+    if matches!(object.kind, ExprKind::SelfRef) {
+        Some(*member)
+    } else {
+        None
+    }
+}
+
+/// Returns a short, human-readable summary of an expression's kind for use
+/// in the `must be a self.<field> reference; got <KIND>` diagnostic.
+///
+/// The returned strings are stable, lowercase, no trailing punctuation, and
+/// chosen to read naturally after the word "got" in the diagnostic.
+fn describe_expr_kind(expr: &nsl_ast::expr::Expr) -> &'static str {
+    match &expr.kind {
+        ExprKind::IntLiteral(_) => "int literal",
+        ExprKind::FloatLiteral(_) => "float literal",
+        ExprKind::StringLiteral(_) => "string literal",
+        ExprKind::FString(_) => "f-string literal",
+        ExprKind::BoolLiteral(_) => "bool literal",
+        ExprKind::NoneLiteral => "None literal",
+        ExprKind::ListLiteral(_) => "list literal",
+        ExprKind::TupleLiteral(_) => "tuple literal",
+        ExprKind::DictLiteral(_) => "dict literal",
+        ExprKind::Ident(_) => "bare identifier",
+        // `SelfRef` and `MemberAccess` covering non-self cases — the
+        // self-field case is filtered out before we call this helper.
+        ExprKind::SelfRef => "bare self",
+        ExprKind::MemberAccess { .. } => "non-self member access",
+        ExprKind::BinaryOp { .. } => "binary op",
+        ExprKind::UnaryOp { .. } => "unary op",
+        ExprKind::Pipe { .. } => "pipe expression",
+        ExprKind::Subscript { .. } => "subscript expression",
+        ExprKind::Call { .. } => "function call",
+        ExprKind::Lambda { .. } => "lambda",
+        ExprKind::BlockExpr(_) => "block expression",
+        ExprKind::ListComp { .. } => "list comprehension",
+        ExprKind::IfExpr { .. } => "if expression",
+        ExprKind::MatchExpr { .. } => "match expression",
+        ExprKind::Range { .. } => "range expression",
+        ExprKind::Paren(_) => "parenthesized expression",
+        ExprKind::Await(_) => "await expression",
+        ExprKind::Error => "invalid expression",
+    }
+}
+
+/// Validate that each `@wggo_target` argument whose name is in
+/// `WGGO_TARGET_REQUIRED_ARGS` (`w_q`, `w_k`, `w_v`, `w_o`, `head_dim`) is
+/// a `self.<field>` member-access expression.
+///
+/// This task does NOT verify that the field actually exists on the
+/// enclosing model or that the field's type matches expectations — those
+/// checks live in Task 4.
+///
+/// Args with names NOT in the required-args set are skipped here and
+/// flagged elsewhere (Task 2 handles missing names; unknown extra names
+/// are out of scope for both Tasks 2 and 3).
+///
+/// Args with no `name` (positional) are silently skipped — Task 2 will
+/// have already reported them as missing required arguments since their
+/// canonical name slot is empty.
+///
+/// Called from both:
+///   * `crates/nsl-semantic/src/checker/model.rs` — `ModelMember::Method`
+///   * `crates/nsl-semantic/src/checker/stmt.rs` — top-level `StmtKind::FnDef`
+pub fn validate_wggo_target_self_field_args(
+    deco: &Decorator,
+    resolve_sym: &dyn Fn(Symbol) -> String,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let Some(ref args) = deco.args else { return };
+    for arg in args {
+        let Some(arg_name_sym) = arg.name else { continue };
+        let arg_name = resolve_sym(arg_name_sym);
+        if !WGGO_TARGET_REQUIRED_ARGS.contains(&arg_name.as_str()) {
+            continue;
+        }
+        if is_self_field_expr(&arg.value).is_none() {
+            let summary = describe_expr_kind(&arg.value);
+            diagnostics.push(
+                Diagnostic::error(format!(
+                    "@wggo_target argument '{arg_name}' must be a self.<field> reference; got {summary}"
+                ))
+                .with_label(arg.value.span, "expected self.<field>"),
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

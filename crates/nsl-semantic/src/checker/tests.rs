@@ -1195,3 +1195,183 @@ model Attention:
         );
     }
 }
+
+// -----------------------------------------------------------------------
+// WGGO Phase 2 Task 3: @wggo_target argument-expression validation
+//
+// Each of the five required arguments (w_q, w_k, w_v, w_o, head_dim) must
+// be a `self.<field>` reference. Any other expression shape (literal,
+// bare identifier, complex expression, etc.) emits a diagnostic of the
+// form:
+//   @wggo_target argument 'NAME' must be a self.<field> reference; got KIND
+// -----------------------------------------------------------------------
+
+#[test]
+fn wggo_target_bare_ident_arg_errors() {
+    // `w_q=q_proj` (bare identifier — missing `self.` prefix) must emit
+    // the self.<field> diagnostic for w_q.
+    let src = r#"
+model Attention:
+    q_proj: Tensor<[4, 4], f32> = zeros([4, 4])
+    k_proj: Tensor<[4, 4], f32> = zeros([4, 4])
+    v_proj: Tensor<[4, 4], f32> = zeros([4, 4])
+    o_proj: Tensor<[4, 4], f32> = zeros([4, 4])
+    head_dim: Tensor<[4, 4], f32> = zeros([4, 4])
+
+    @wggo_target(w_q=q_proj, w_k=self.k_proj, w_v=self.v_proj, w_o=self.o_proj, head_dim=self.head_dim)
+    fn forward(self, x: Tensor<[4], f32>) -> Tensor<[4], f32>:
+        return x
+"#;
+    let diags = check_source(src);
+    assert!(
+        diags.iter().any(|d| {
+            d.message
+                .contains("argument 'w_q' must be a self.<field> reference")
+        }),
+        "bare-ident `w_q=q_proj` must emit the self.<field> diagnostic for w_q; got: {:?}",
+        diags
+    );
+}
+
+#[test]
+fn wggo_target_int_literal_head_dim_errors() {
+    // `head_dim=32` (integer literal) must emit the self.<field>
+    // diagnostic for head_dim.
+    let src = r#"
+model Attention:
+    q_proj: Tensor<[4, 4], f32> = zeros([4, 4])
+
+    @wggo_target(w_q=self.q_proj, w_k=self.q_proj, w_v=self.q_proj, w_o=self.q_proj, head_dim=32)
+    fn forward(self, x: Tensor<[4], f32>) -> Tensor<[4], f32>:
+        return x
+"#;
+    let diags = check_source(src);
+    assert!(
+        diags.iter().any(|d| {
+            d.message
+                .contains("argument 'head_dim' must be a self.<field> reference")
+        }),
+        "int-literal `head_dim=32` must emit the self.<field> diagnostic for head_dim; got: {:?}",
+        diags
+    );
+}
+
+#[test]
+fn wggo_target_all_self_field_args_no_self_field_error() {
+    // Happy path: all five args are `self.<field>` — the self.<field>
+    // diagnostic must NOT fire. (Other diagnostics from later tasks may
+    // fire, but not THIS specific error.)
+    let src = r#"
+model Attention:
+    q_proj: Tensor<[4, 4], f32> = zeros([4, 4])
+    k_proj: Tensor<[4, 4], f32> = zeros([4, 4])
+    v_proj: Tensor<[4, 4], f32> = zeros([4, 4])
+    o_proj: Tensor<[4, 4], f32> = zeros([4, 4])
+    head_dim: Tensor<[4, 4], f32> = zeros([4, 4])
+
+    @wggo_target(w_q=self.q_proj, w_k=self.k_proj, w_v=self.v_proj, w_o=self.o_proj, head_dim=self.head_dim)
+    fn forward(self, x: Tensor<[4], f32>) -> Tensor<[4], f32>:
+        return x
+"#;
+    let diags = check_source(src);
+    assert!(
+        !diags
+            .iter()
+            .any(|d| d.message.contains("must be a self.<field> reference")),
+        "all-`self.<field>` args must not emit the self.<field> diagnostic; got: {:?}",
+        diags
+    );
+}
+
+#[test]
+fn wggo_target_multiple_wrong_args_all_diagnose() {
+    // Two wrong args (`w_q=q_proj` bare-ident and `head_dim=32` literal)
+    // must both produce diagnostics — validation does not stop at the
+    // first wrong arg.
+    let src = r#"
+model Attention:
+    q_proj: Tensor<[4, 4], f32> = zeros([4, 4])
+    k_proj: Tensor<[4, 4], f32> = zeros([4, 4])
+    v_proj: Tensor<[4, 4], f32> = zeros([4, 4])
+    o_proj: Tensor<[4, 4], f32> = zeros([4, 4])
+
+    @wggo_target(w_q=q_proj, w_k=self.k_proj, w_v=self.v_proj, w_o=self.o_proj, head_dim=32)
+    fn forward(self, x: Tensor<[4], f32>) -> Tensor<[4], f32>:
+        return x
+"#;
+    let diags = check_source(src);
+    assert!(
+        diags.iter().any(|d| {
+            d.message
+                .contains("argument 'w_q' must be a self.<field> reference")
+        }),
+        "expected w_q self.<field> diagnostic; got: {:?}",
+        diags
+    );
+    assert!(
+        diags.iter().any(|d| {
+            d.message
+                .contains("argument 'head_dim' must be a self.<field> reference")
+        }),
+        "expected head_dim self.<field> diagnostic; got: {:?}",
+        diags
+    );
+}
+
+#[test]
+fn wggo_target_bare_ident_summary_mentions_kind() {
+    // The diagnostic message should include the expression-kind summary
+    // after `got `. For a bare identifier this is "bare identifier".
+    let src = r#"
+model Attention:
+    q_proj: Tensor<[4, 4], f32> = zeros([4, 4])
+    k_proj: Tensor<[4, 4], f32> = zeros([4, 4])
+    v_proj: Tensor<[4, 4], f32> = zeros([4, 4])
+    o_proj: Tensor<[4, 4], f32> = zeros([4, 4])
+    head_dim: Tensor<[4, 4], f32> = zeros([4, 4])
+
+    @wggo_target(w_q=q_proj, w_k=self.k_proj, w_v=self.v_proj, w_o=self.o_proj, head_dim=self.head_dim)
+    fn forward(self, x: Tensor<[4], f32>) -> Tensor<[4], f32>:
+        return x
+"#;
+    let diags = check_source(src);
+    let msg = diags
+        .iter()
+        .find(|d| {
+            d.message
+                .contains("argument 'w_q' must be a self.<field> reference")
+        })
+        .map(|d| d.message.clone())
+        .unwrap_or_default();
+    assert!(
+        msg.contains("got bare identifier"),
+        "diagnostic should mention the kind summary `got bare identifier`; got: {}",
+        msg
+    );
+}
+
+#[test]
+fn wggo_target_int_literal_summary_mentions_kind() {
+    let src = r#"
+model Attention:
+    q_proj: Tensor<[4, 4], f32> = zeros([4, 4])
+
+    @wggo_target(w_q=self.q_proj, w_k=self.q_proj, w_v=self.q_proj, w_o=self.q_proj, head_dim=32)
+    fn forward(self, x: Tensor<[4], f32>) -> Tensor<[4], f32>:
+        return x
+"#;
+    let diags = check_source(src);
+    let msg = diags
+        .iter()
+        .find(|d| {
+            d.message
+                .contains("argument 'head_dim' must be a self.<field> reference")
+        })
+        .map(|d| d.message.clone())
+        .unwrap_or_default();
+    assert!(
+        msg.contains("got int literal"),
+        "diagnostic should mention the kind summary `got int literal`; got: {}",
+        msg
+    );
+}

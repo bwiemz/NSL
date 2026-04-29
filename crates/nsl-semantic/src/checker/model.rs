@@ -394,6 +394,13 @@ impl<'a> TypeChecker<'a> {
                                 &resolve,
                                 &mut self.diagnostics,
                             );
+                            // WGGO Phase 2 Task 3: each required arg's
+                            // value must be a `self.<field>` reference.
+                            crate::wggo::validate_wggo_target_self_field_args(
+                                deco,
+                                &resolve,
+                                &mut self.diagnostics,
+                            );
                         }
                     }
                 }
