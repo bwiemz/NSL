@@ -83,6 +83,11 @@ impl ArenaLayout {
 }
 
 /// Per-projection layout in `__nsl_calib_grad_arena`. Spec §4.3.
+///
+/// **Overflow contract:** entries' `byte_size` and `total_bytes` use `saturating_*`
+/// arithmetic on `u32`. Pathological shapes that overflow will silently alias —
+/// debug builds `debug_assert!` to surface this, but release builds saturate.
+/// In practice, no production WGGO target approaches `u32::MAX` (4 GiB per matrix).
 #[derive(Debug, Clone, PartialEq)]
 pub struct GradArenaLayout {
     /// (projection, byte_offset, byte_size). One entry per registered
@@ -105,6 +110,12 @@ pub fn build_grad_arena_layout(
             (&target.w_o, &target.w_o_shape),
         ] {
             let byte_size = shape[0].saturating_mul(shape[1]).saturating_mul(4); // f32 = 4 bytes
+            debug_assert!(
+                byte_size < u32::MAX,
+                "GradArenaLayout: byte_size for projection {:?} ({}x{}x4) saturated to u32::MAX — \
+                 a real 4 GiB tensor would alias subsequent entries; spec §4.3 assumes this never happens.",
+                proj.0, shape[0], shape[1]
+            );
             entries.push((proj.clone(), offset, byte_size));
             offset = offset.saturating_add(byte_size);
         }
@@ -243,6 +254,16 @@ mod grad_arena_tests {
         let layout = build_grad_arena_layout(&targets);
         assert_eq!(layout.entries.len(), 12); // 3 layers × 4 projections
         assert_eq!(layout.total_bytes, 12 * 128 * 128 * 4);
+
+        // Verify the q,k,v,o order within layer 0
+        assert_eq!(layout.entries[0].0 .0, "gpt.blocks.0.attn.q_proj");
+        assert_eq!(layout.entries[1].0 .0, "gpt.blocks.0.attn.k_proj");
+        assert_eq!(layout.entries[2].0 .0, "gpt.blocks.0.attn.v_proj");
+        assert_eq!(layout.entries[3].0 .0, "gpt.blocks.0.attn.o_proj");
+
+        // First entry of layer 1 (after layer 0's 4 q/k/v/o entries)
+        assert_eq!(layout.entries[4].0 .0, "gpt.blocks.1.attn.q_proj");
+        assert_eq!(layout.entries[4].1, 4 * 128 * 128 * 4);
     }
 }
 
