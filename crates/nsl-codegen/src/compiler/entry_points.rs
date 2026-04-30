@@ -245,24 +245,52 @@ fn load_and_register_weights_if_needed(
     Ok(())
 }
 
+/// Run both AWQ and WGGO pre-scan discovery passes against the AST and
+/// populate `opts` fields that are still `None`.  This is the test-facing
+/// seam: all compiler entry points delegate to
+/// [`populate_calibration_retention_from_ast_if_unset`] which calls this
+/// helper internally.
+///
+/// Idempotent: if a field is already `Some`, it is left unchanged.
+pub(crate) fn run_pre_scan_phase(
+    ast: &nsl_ast::Module,
+    interner: &Interner,
+    mut opts: crate::CompileOptions,
+) -> crate::CompileOptions {
+    if opts.calibration_retention.is_none() {
+        let discovered_awq = crate::calibration::pre_scan_awq_projections_from_ast(ast, interner);
+        if !discovered_awq.is_empty() {
+            opts.calibration_retention = Some(discovered_awq);
+        }
+    }
+    if opts.calibration_grad_retention.is_none() {
+        let discovered_wggo =
+            crate::calibration::discovery::pre_scan_wggo_targets_from_ast(ast, interner);
+        if !discovered_wggo.is_empty() {
+            opts.calibration_grad_retention = Some(discovered_wggo);
+        }
+    }
+    opts
+}
+
 fn populate_calibration_retention_from_ast_if_unset(
     compiler: &mut Compiler<'_>,
     ast: &nsl_ast::Module,
     interner: &Interner,
 ) -> Result<(), CodegenError> {
-    if compiler.compile_options.calibration_retention.is_some() {
-        return Ok(());
-    }
+    // Delegate to the shared helper for pure-discovery work.
+    let updated = run_pre_scan_phase(ast, interner, compiler.compile_options.clone());
+    compiler.compile_options.calibration_retention = updated.calibration_retention;
+    compiler.compile_options.calibration_grad_retention = updated.calibration_grad_retention;
 
-    let discovered = crate::calibration::pre_scan_awq_projections_from_ast(ast, interner);
-    if !discovered.is_empty() {
-        compiler.compile_options.calibration_retention = Some(discovered);
-        return Ok(());
-    }
-
-    if crate::calibration::discovery::ast_has_awq_quantize_decorator(ast, interner) {
-        let model_name = crate::calibration::discovery::first_awq_quantized_model_name(ast, interner)
-            .unwrap_or_else(|| "<unknown>".into());
+    // AWQ-specific error: if an @quantize decorator is present but discovery
+    // returned nothing, that is a user error we must surface.
+    if compiler.compile_options.calibration_retention.is_none()
+        && crate::calibration::discovery::ast_has_awq_quantize_decorator(ast, interner)
+    {
+        let model_name =
+            crate::calibration::discovery::first_awq_quantized_model_name(ast, interner)
+                .unwrap_or_else(|| "<unknown>".into());
         return Err(CodegenError::new(format!(
             "calibration: @quantize model declared but no AWQ projections discovered.\n\
  requested:  auto-discover AWQ projections for model '{model_name}'\n\
@@ -1144,4 +1172,65 @@ pub fn compile_entry_returning_plan(
     write_manifest_if_needed(&mut compiler, options);
     let bytes = compiler.finalize()?;
     Ok((bytes, plan))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nsl_lexer::Interner;
+
+    fn parse_module(source: &str) -> (nsl_ast::Module, Interner) {
+        let mut interner = Interner::new();
+        let (tokens, lex_diags) =
+            nsl_lexer::tokenize(source, nsl_errors::FileId(0), &mut interner);
+        assert!(
+            lex_diags
+                .iter()
+                .all(|d| !matches!(d.level, nsl_errors::Level::Error)),
+            "fixture must lex cleanly: {lex_diags:?}"
+        );
+        let parsed = nsl_parser::parse(&tokens, &mut interner);
+        assert!(
+            parsed
+                .diagnostics
+                .iter()
+                .all(|d| !matches!(d.level, nsl_errors::Level::Error)),
+            "fixture must parse cleanly: {:?}",
+            parsed.diagnostics
+        );
+        (parsed.module, interner)
+    }
+
+    #[test]
+    fn entry_point_populates_calibration_grad_retention_from_ast() {
+        let source = include_str!("../../../../tests/fixtures/wggo_attention_mlp.nsl");
+        let opts = crate::CompileOptions::default();
+        let (ast, interner) = parse_module(source);
+        let resolved_opts = run_pre_scan_phase(&ast, &interner, opts);
+        let targets = resolved_opts
+            .calibration_grad_retention
+            .expect("@wggo_target decorators should populate calibration_grad_retention");
+        assert!(
+            !targets.is_empty(),
+            "@wggo_target decorators should populate the field"
+        );
+        assert_eq!(targets[0].class_name, "TinyAttn");
+        assert_eq!(targets[0].layer_key, "m");
+    }
+
+    #[test]
+    fn run_pre_scan_phase_does_not_overwrite_existing_grad_retention() {
+        let source = include_str!("../../../../tests/fixtures/wggo_attention_mlp.nsl");
+        let (ast, interner) = parse_module(source);
+        // Pre-populate with a sentinel empty vec to verify idempotency.
+        let mut opts = crate::CompileOptions::default();
+        opts.calibration_grad_retention = Some(Vec::new());
+        let resolved_opts = run_pre_scan_phase(&ast, &interner, opts);
+        // Must remain the caller-supplied empty vec, not the discovered targets.
+        assert_eq!(
+            resolved_opts.calibration_grad_retention,
+            Some(Vec::new()),
+            "run_pre_scan_phase must not overwrite a pre-populated field"
+        );
+    }
 }

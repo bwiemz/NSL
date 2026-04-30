@@ -574,6 +574,11 @@ pub struct CompileOptions {
     /// path to emit a dedicated model object.
     pub calibration_compile_bundle:
         Option<std::sync::Arc<crate::calibration::CalibrationCompileBundle>>,
+    /// When `Some`, codegen emits `model_backward` IR with grad-retention
+    /// splices for the listed attention layers. `None` = forward-only AWQ
+    /// or no calibration. Spec §4.8.
+    pub calibration_grad_retention:
+        Option<Vec<crate::calibration::discovery::WggoGradTarget>>,
 }
 
 impl Default for CompileOptions {
@@ -647,6 +652,7 @@ impl Default for CompileOptions {
             calibration_batch_seq: None,
             weight_index_map: HashMap::new(),
             calibration_compile_bundle: None,
+            calibration_grad_retention: None,
         }
     }
 }
@@ -839,5 +845,11 @@ mod calib_options_tests {
     fn compile_options_default_has_no_calibration_retention() {
         let opts = CompileOptions::default();
         assert!(opts.calibration_retention.is_none());
+    }
+
+    #[test]
+    fn compile_options_default_has_no_calibration_grad_retention() {
+        let opts = CompileOptions::default();
+        assert!(opts.calibration_grad_retention.is_none());
     }
 }
