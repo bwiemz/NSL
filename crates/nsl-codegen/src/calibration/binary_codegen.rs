@@ -952,6 +952,29 @@ pub fn emit_calibration_model_object(
         "emit grad retention arena",
         compiler.emit_grad_retention_arena(),
     )?;
+
+    // §5.3: defensive check — backward emission with empty grad observations is a bug.
+    // `calibration_grad_retention.is_some()` signals that the caller requested a backward
+    // pass; `grad_arena_layout` must be populated by `emit_grad_retention_arena` above.
+    // If it isn't, the targets list was present but yielded zero bytes (corrupt shape
+    // metadata or a hook that updated `requires()` without updating its targets list).
+    if compile_opts.calibration_grad_retention.is_some()
+        && compiler.grad_arena_layout.is_none()
+    {
+        return Err(HarnessError::Infrastructure {
+            reason: "calibration: backward pass emitted but no grad observations declared.\n\
+  requested:  run calibration subprocess with backward pass\n\
+  expected:   __nsl_calib_grad_arena has at least one entry when a\n\
+              model_backward call is emitted\n\
+  found:      grad_arena_layout is empty but calibration_grad_retention\n\
+              was set. Did a hook's requires() change without\n\
+              updating its targets() list?\n\
+  fix:        verify hook.requires() and pre_scan_wggo_targets_from_ast\n\
+              produce consistent target sets."
+                .into(),
+        });
+    }
+
     map_codegen_error("declare runtime functions", compiler.declare_runtime_functions())?;
     map_codegen_error(
         "declare user functions",

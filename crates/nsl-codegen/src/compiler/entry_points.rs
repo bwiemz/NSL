@@ -273,6 +273,80 @@ pub(crate) fn run_pre_scan_phase(
     opts
 }
 
+/// §5.4-§5.6 refusal checks for grad-mode WGGO.
+///
+/// Only fires when `opts.wggo_importance == WggoImportance::Grad`.  In `Auto`
+/// or `Magnitude` modes the user never asked for gradient scoring, so there is
+/// nothing to refuse.
+///
+/// Must be called **after** `run_pre_scan_phase` has already populated
+/// `calibration_grad_retention` (or left it `None` when no reachable target
+/// was found) so the checks below see the post-discovery state.
+fn enforce_grad_mode_refusals(
+    ast: &nsl_ast::Module,
+    interner: &Interner,
+    opts: &crate::CompileOptions,
+) -> Result<(), CodegenError> {
+    use crate::WggoImportance;
+
+    if opts.wggo_importance != WggoImportance::Grad {
+        return Ok(());
+    }
+
+    let decorators_in_ast =
+        crate::calibration::discovery::ast_has_wggo_target_decorators(ast, interner);
+    let resolved_targets = opts.calibration_grad_retention.as_deref().unwrap_or(&[]);
+    let calibration_data_present = opts.calibration_data.is_some();
+
+    // §5.4: grad mode requested but the source has no @wggo_target decorators at all.
+    if !decorators_in_ast {
+        return Err(CodegenError::new(
+            "calibration: --wggo-importance=grad set but no @wggo_target decorators in source.\n\
+  requested: gradient-importance scoring on the compiled model\n\
+  expected:  ≥1 @wggo_target decorator on a model's `forward` method\n\
+  found:     zero @wggo_target decorators in the AST\n\
+  fix:       either add @wggo_target(...) to your attention block's\n\
+             `forward` method, or use --wggo-importance=magnitude."
+                .to_string(),
+        ));
+    }
+
+    // §5.5: decorators present in source but none is reachable from the entry point.
+    if resolved_targets.is_empty() {
+        let decorated = crate::calibration::discovery::list_decorated_class_names(ast, interner);
+        let entry_fn = crate::calibration::discovery::entry_point_fn_name(ast, interner)
+            .unwrap_or_else(|| "(unknown)".to_string());
+        let n = decorated.len();
+        return Err(CodegenError::new(format!(
+            "calibration: --wggo-importance=grad set but no decorated model is reachable.\n\
+  requested: gradient-importance scoring on the compiled model\n\
+  expected:  ≥1 @wggo_target-decorated model reachable from the entry point\n\
+  found:     {n} decorator(s) in AST; 0 reachable\n\
+             decorated classes: {decorated:?}\n\
+             entry function:    {entry_fn}\n\
+  fix:       either compile a model that uses one of the decorated classes,\n\
+             or move the decorator to the class your entry point uses."
+        )));
+    }
+
+    // §5.6: decorators present and model reachable, but no calibration data provided.
+    if !calibration_data_present {
+        let n = resolved_targets.len();
+        return Err(CodegenError::new(format!(
+            "calibration: --wggo-importance=grad requires calibration data, but none was provided.\n\
+  requested: gradient-importance scoring with @wggo_target-decorated attention\n\
+  expected:  a calibration data file via `quant awq {{ calibration_data = \"...\" }}`\n\
+  found:     {n} @wggo_target target(s) discovered, model instantiated, but\n\
+             no calibration data was provided.\n\
+  fix:       add a `quant awq {{ calibration_data = \"path/to/data.safetensors\" }}`\n\
+             block. If you don't have calibration data,\n\
+             use --wggo-importance=magnitude."
+        )));
+    }
+
+    Ok(())
+}
+
 fn populate_calibration_retention_from_ast_if_unset(
     compiler: &mut Compiler<'_>,
     ast: &nsl_ast::Module,
@@ -299,6 +373,9 @@ fn populate_calibration_retention_from_ast_if_unset(
  Action:     either remove the @quantize decorator, or add the Linear/tensor projections the decorator is meant to target."
         )));
     }
+
+    // §5.4-§5.6: grad-mode WGGO refusals.
+    enforce_grad_mode_refusals(ast, interner, &compiler.compile_options)?;
 
     Ok(())
 }

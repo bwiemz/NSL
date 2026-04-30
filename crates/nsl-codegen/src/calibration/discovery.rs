@@ -967,6 +967,89 @@ pub fn pre_scan_wggo_targets_from_ast(
     targets
 }
 
+// ── Task 11 refusal helpers ───────────────────────────────────────────────────
+
+/// Returns `true` when the AST contains at least one model with a
+/// `@wggo_target` decorator on its `forward` method. Used by the §5.4
+/// refusal in `entry_points.rs` to distinguish "no decorators at all"
+/// from "decorators present but no reachable instantiation" (§5.5).
+pub fn ast_has_wggo_target_decorators(ast: &nsl_ast::Module, interner: &Interner) -> bool {
+    for stmt in &ast.stmts {
+        let model_def_opt = match &stmt.kind {
+            StmtKind::ModelDef(m) => Some(m),
+            StmtKind::Decorated { stmt: inner, .. } => match &inner.kind {
+                StmtKind::ModelDef(m) => Some(m),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(model_def) = model_def_opt {
+            if model_has_wggo_target_decorator(model_def, interner) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Returns the names of all model classes decorated with `@wggo_target`.
+/// Diagnostics-only: used by the §5.5 refusal to report which classes
+/// were decorated but none was reachable from the entry point.
+pub fn list_decorated_class_names(ast: &nsl_ast::Module, interner: &Interner) -> Vec<String> {
+    let mut out = Vec::new();
+    for stmt in &ast.stmts {
+        let model_def_opt = match &stmt.kind {
+            StmtKind::ModelDef(m) => Some(m),
+            StmtKind::Decorated { stmt: inner, .. } => match &inner.kind {
+                StmtKind::ModelDef(m) => Some(m),
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some(model_def) = model_def_opt {
+            if model_has_wggo_target_decorator(model_def, interner) {
+                let name = interner.resolve(model_def.name.0).unwrap_or("").to_string();
+                if !name.is_empty() {
+                    out.push(name);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Returns the name of the first top-level function that looks like an
+/// entry point (named `"main"`) as a hint for the §5.5 diagnostic.
+/// Returns `None` when the AST has no `fn main()`.
+pub fn entry_point_fn_name(ast: &nsl_ast::Module, interner: &Interner) -> Option<String> {
+    for stmt in &ast.stmts {
+        let fn_def = match &stmt.kind {
+            StmtKind::FnDef(f) => f,
+            StmtKind::Decorated { stmt: inner, .. } => match &inner.kind {
+                StmtKind::FnDef(f) => f,
+                _ => continue,
+            },
+            _ => continue,
+        };
+        let name = interner.resolve(fn_def.name.0).unwrap_or("");
+        if name == "main" {
+            return Some(name.to_string());
+        }
+    }
+    // Fall back to the first non-model, non-import top-level function.
+    for stmt in &ast.stmts {
+        let fn_def = match &stmt.kind {
+            StmtKind::FnDef(f) => f,
+            _ => continue,
+        };
+        let name = interner.resolve(fn_def.name.0).unwrap_or("").to_string();
+        if !name.is_empty() {
+            return Some(name);
+        }
+    }
+    None
+}
+
 pub fn check_discovery_agreement(
     pre_scan: &[DiscoveredProjection],
     in_compile: &[DiscoveredProjection],
