@@ -50,7 +50,10 @@ pub struct CalibCtx<'a> {
     /// Verifies that the layout HashMap is built once (outside the per-target loop).
     layout_map_build_count: u32,
     /// Task 22: running buffers for WGGO f64 accumulators (test-only, keyed by symbol).
-    /// In production these are BSS globals read back via the calibration binary output.
+    /// In production this map is always empty — the real read path for BSS accumulators
+    /// comes from the calibration subprocess binary's output (wired by Task 23's
+    /// sidecar-field-flip). Tests use `set_running_buffer_f64` to inject fake values
+    /// so that `emit_finalize` can be exercised without a live subprocess.
     running_buffers_f64: BTreeMap<String, Vec<f64>>,
     /// Task 22: number of calibration batches processed (test-only).
     batches_processed: u32,
@@ -306,6 +309,11 @@ impl<'a> CalibCtx<'a> {
     /// Store a named f64 running buffer (used by tests to simulate the BSS
     /// accumulator state that the calibration binary would write during the
     /// backward pass).
+    ///
+    /// **Test-only.** Production code never calls this — in production the
+    /// `running_buffers_f64` map stays empty and Task 23's BSS readback
+    /// populates the per-head scores via a different code path.
+    #[cfg(test)]
     pub fn set_running_buffer_f64(&mut self, symbol: &str, values: &[f64]) {
         self.running_buffers_f64.insert(symbol.to_string(), values.to_vec());
     }
@@ -313,19 +321,47 @@ impl<'a> CalibCtx<'a> {
     /// Read back a named f64 running buffer and cast each element to f32.
     ///
     /// Returns up to `n_heads` values.  If the stored buffer is shorter than
-    /// `n_heads` the result is zero-padded.  If no buffer was set for the
-    /// symbol an all-zeros Vec of length `n_heads` is returned.
+    /// `n_heads` the result is zero-padded.
+    ///
+    /// **Production note:** in production the `running_buffers_f64` map is
+    /// always empty (it is only populated by the test-only
+    /// `set_running_buffer_f64` setter).  Task 23 must replace this call site
+    /// with the real BSS readback from the calibration subprocess output
+    /// before this hook is reachable in production.  Until then, calling this
+    /// method outside tests on an empty map will trigger a `debug_assert`
+    /// in debug/test builds — making the gap visible before it silently
+    /// produces all-zero scores.
     pub fn read_running_buffer_f64_as_f32(&self, symbol: &str, n_heads: usize) -> Vec<f32> {
-        let src = self.running_buffers_f64.get(symbol).cloned().unwrap_or_default();
-        let mut out = vec![0.0f32; n_heads];
-        for (i, v) in src.iter().take(n_heads).enumerate() {
-            out[i] = *v as f32;
+        match self.running_buffers_f64.get(symbol) {
+            Some(src) => {
+                let mut out = vec![0.0f32; n_heads];
+                for (i, v) in src.iter().take(n_heads).enumerate() {
+                    out[i] = *v as f32;
+                }
+                out
+            }
+            None => {
+                // In test mode `set_running_buffer_f64` populates this map.
+                // In production (calibration subprocess path) the BSS readback
+                // is wired by Task 23's sidecar-field-flip work.  If this fires
+                // in a production build it means Task 23 is incomplete and the
+                // WGGO scores will silently be all-zero (all heads ranked equal).
+                debug_assert!(
+                    cfg!(test),
+                    "CalibCtx::read_running_buffer_f64_as_f32 called outside tests \
+                     with empty buffer for symbol '{symbol}'. Task 23 must wire \
+                     the production BSS readback before this is reachable in production."
+                );
+                vec![0.0_f32; n_heads]
+            }
         }
-        out
     }
 
     /// Record the number of calibration batches processed (test-only; in
     /// production this comes from the calibration binary's counter global).
+    ///
+    /// **Test-only.** Production code never calls this.
+    #[cfg(test)]
     pub fn set_batches_processed(&mut self, n: u32) {
         self.batches_processed = n;
     }

@@ -25,6 +25,34 @@ fn running_symbol_for(layer_key: &str) -> String {
     format!("__nsl_wggo_grad.{}", layer_key.replace('.', "_"))
 }
 
+// ── Payload sanitization ──────────────────────────────────────────────────────
+
+/// Replace any non-finite `per_head_score` values (NaN / ±Inf) with `0.0`
+/// before JSON serialization.
+///
+/// `serde_json` rejects `f32::NAN` / `f32::INFINITY` because JSON has no
+/// representation for them.  A non-finite score means the importance signal
+/// is undefined for that head; treating it as `0.0` effectively removes the
+/// head from the importance ranking rather than aborting calibration.
+fn sanitize_payload(payload: &WggoHeadGradients) -> WggoHeadGradients {
+    let mut out = WggoHeadGradients { by_layer: std::collections::BTreeMap::new() };
+    for (k, v) in &payload.by_layer {
+        let sanitized_scores: Vec<f32> = v
+            .per_head_score
+            .iter()
+            .map(|s| if s.is_finite() { *s } else { 0.0 })
+            .collect();
+        out.by_layer.insert(
+            k.clone(),
+            PerLayerGradient {
+                per_head_score: sanitized_scores,
+                batches_observed: v.batches_observed,
+            },
+        );
+    }
+    out
+}
+
 // ── Hook ──────────────────────────────────────────────────────────────────────
 
 #[derive(Debug)]
@@ -177,7 +205,16 @@ impl CalibrationHook for WggoGradientHook {
                 (target.w_o_shape[0] / target.head_dim).max(1) as usize
             };
             let symbol = running_symbol_for(&target.layer_key);
-            let per_head_score = ctx.read_running_buffer_f64_as_f32(&symbol, n_o_heads);
+            // Sanitize non-finite values (NaN / ±Inf) before inserting.
+            // serde_json serializes f32::NAN as `null`, which cannot be
+            // deserialized back as f32 — sanitize eagerly so the JSON round-trip
+            // is always clean.  A non-finite score means importance is undefined;
+            // 0.0 removes the head from ranking rather than crashing calibration.
+            let per_head_score: Vec<f32> = ctx
+                .read_running_buffer_f64_as_f32(&symbol, n_o_heads)
+                .into_iter()
+                .map(|s| if s.is_finite() { s } else { 0.0 })
+                .collect();
             by_layer.insert(
                 target.layer_key.clone(),
                 PerLayerGradient {
@@ -187,8 +224,16 @@ impl CalibrationHook for WggoGradientHook {
             );
         }
         let payload = WggoHeadGradients { by_layer };
-        let bytes = serde_json::to_vec(&payload)
-            .expect("serialize WggoHeadGradients: BTreeMap<String, _> is always JSON-serializable");
+        let bytes = serde_json::to_vec(&payload).unwrap_or_else(|_e| {
+            // f32 NaN/Inf is not representable in JSON.  Sanitize non-finite
+            // values to 0.0 (undefined importance → treated as unimportant)
+            // and retry.  A non-finite score cannot rank heads, so 0.0 is the
+            // safest fallback — it effectively removes those heads from the
+            // importance ranking rather than crashing calibration entirely.
+            let sanitized = sanitize_payload(&payload);
+            serde_json::to_vec(&sanitized)
+                .expect("serialize WggoHeadGradients after NaN/Inf sanitization (per_head_score: f32)")
+        });
         CalibrationResult::Ok(bytes)
     }
 
@@ -479,6 +524,30 @@ mod tests {
         let l1 = payload.by_layer.get("layers.1").expect("layers.1 missing from payload");
         assert_eq!(l1.per_head_score, vec![5.0f32, 6.0, 7.0, 8.0]);
         assert_eq!(l1.batches_observed, 10);
+    }
+
+    /// Regression: NaN and ±Inf in per_head_score must not crash emit_finalize.
+    /// Non-finite values are sanitized to 0.0 before JSON serialization.
+    #[test]
+    fn emit_finalize_handles_nan_inf_in_per_head_score() {
+        use crate::calibration::sidecar::WggoHeadGradients;
+
+        let targets = vec![fixture_target("layers.nan", 64, [256, 256])];
+        let hook = WggoGradientHook::new(targets);
+        let mut ctx = crate::calibration::ctx::CalibCtx::stub_for_tests();
+        ctx.set_running_buffer_f64("__nsl_wggo_grad.layers_nan", &[
+            f64::NAN, f64::INFINITY, 1.0, f64::NEG_INFINITY,
+        ]);
+        ctx.set_batches_processed(5);
+
+        let result = hook.emit_finalize(&mut ctx);
+        let CalibrationResult::Ok(bytes) = result else { panic!("expected Ok, got {result:?}") };
+        let payload: WggoHeadGradients = serde_json::from_slice(&bytes)
+            .expect("emit_finalize bytes must be valid WggoHeadGradients JSON after sanitization");
+        let layer = payload.by_layer.get("layers.nan").expect("layers.nan missing from payload");
+        // NaN and ±Inf are sanitized to 0.0; finite values pass through unchanged.
+        assert_eq!(layer.per_head_score, vec![0.0f32, 0.0, 1.0, 0.0]);
+        assert_eq!(layer.batches_observed, 5);
     }
 
     /// Empty targets → empty by_layer map, still a valid non-empty JSON object.
