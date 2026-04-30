@@ -55,7 +55,7 @@ use crate::calibration::ctx::CalibCtx;
 use crate::calibration::hooks::{CalibrationResult, FinalizePlanEntry, ObservePlanEntry};
 use crate::calibration::registry::HookRegistry;
 use crate::calibration::retention_pass::build_arena_layout;
-use crate::calibration::sidecar::{Sidecar, SIDECAR_VERSION};
+use crate::calibration::sidecar::{Sidecar, WggoHeadGradients, SIDECAR_VERSION};
 use crate::calibration::subprocess::{run_subprocess, SubprocessOutcome};
 use crate::calibration::{HarnessConfig, HarnessError, HarnessOutput};
 
@@ -274,8 +274,10 @@ fn build_sidecar_from_stub(
         hook_set_sha256: String::new(),
         cache_key_digest: String::new(),
         num_samples_used: cfg.samples,
+        wggo_head_gradients: hooks_out
+            .get("wggo_head_gradients")
+            .and_then(|bytes| serde_json::from_slice::<WggoHeadGradients>(bytes).ok()),
         hooks: hooks_out,
-        wggo_head_gradients: None,
     })
 }
 
