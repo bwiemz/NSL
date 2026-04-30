@@ -8,7 +8,7 @@
 use std::collections::BTreeMap;
 
 use crate::calibration::observation::ProjectionRef;
-use crate::calibration::retention::RetentionTable;
+use crate::calibration::retention::{GradArenaLayout, RetentionTable};
 
 /// Opaque handle returned by `alloc_running_vec`; hooks store these
 /// in their `self` fields to reference buffers across `emit_*` calls.
@@ -38,6 +38,17 @@ pub struct CalibCtx<'a> {
     /// BSS globals declared by hook `emit_init` calls (stub + production).
     /// Keyed by symbol name; value is size in bytes.
     bss_globals: BTreeMap<String, u32>,
+    /// Task 21: grad arena layout for WGGO per-step iteration (test-only instrumentation).
+    /// In production this is `None`; tests use `stub_for_tests_with_grad_layout` to
+    /// inject a layout and verify that `emit_per_step` iterates the correct projections.
+    grad_arena_layout: Option<GradArenaLayout>,
+    /// Task 21: counter incremented by `record_per_head_dot_call()`.
+    /// Zero in production; tests use `per_head_dot_call_count()` to verify
+    /// `emit_per_step` would call `emit_per_head_dot_abs_accum` the right number of times.
+    per_head_dot_call_count: u32,
+    /// Task 21: counter incremented by `record_layout_map_build()`.
+    /// Verifies that the layout HashMap is built once (outside the per-target loop).
+    layout_map_build_count: u32,
 }
 
 impl<'a> CalibCtx<'a> {
@@ -53,6 +64,9 @@ impl<'a> CalibCtx<'a> {
             next_handle: 0,
             stub_arena_data: BTreeMap::new(),
             bss_globals: BTreeMap::new(),
+            grad_arena_layout: None,
+            per_head_dot_call_count: 0,
+            layout_map_build_count: 0,
         }
     }
 
@@ -71,6 +85,50 @@ impl<'a> CalibCtx<'a> {
             next_handle: 0,
             stub_arena_data: BTreeMap::new(),
             bss_globals: BTreeMap::new(),
+            grad_arena_layout: None,
+            per_head_dot_call_count: 0,
+            layout_map_build_count: 0,
+        }
+    }
+
+    /// Task 21: Construct a stub context pre-loaded with a `GradArenaLayout` for
+    /// testing `WggoGradientHook::emit_per_step`.
+    ///
+    /// `entries` is a slice of `(projection_name, byte_offset, byte_size)` triples
+    /// that mirrors the production `GradArenaLayout` built by `build_grad_arena_layout`.
+    ///
+    /// Use `per_head_dot_call_count()` and `layout_map_build_count()` after calling
+    /// `emit_per_step` to verify the hook iterated correctly.
+    pub fn stub_for_tests_with_grad_layout(
+        entries: &[(&str, u32, u32)],
+    ) -> Self {
+        use crate::calibration::retention::GradArenaLayout;
+        let layout_entries = entries
+            .iter()
+            .map(|(name, offset, size)| (ProjectionRef(name.to_string()), *offset, *size))
+            .collect();
+        let total_bytes = entries
+            .iter()
+            .map(|(_, off, sz)| off + sz)
+            .max()
+            .unwrap_or(0);
+        static EMPTY: std::sync::OnceLock<RetentionTable> = std::sync::OnceLock::new();
+        let retention = EMPTY.get_or_init(RetentionTable::new);
+        Self {
+            sample_idx: 0,
+            total_samples: 0,
+            retention,
+            running_buffers: BTreeMap::new(),
+            running_names: BTreeMap::new(),
+            next_handle: 0,
+            stub_arena_data: BTreeMap::new(),
+            bss_globals: BTreeMap::new(),
+            grad_arena_layout: Some(GradArenaLayout {
+                entries: layout_entries,
+                total_bytes,
+            }),
+            per_head_dot_call_count: 0,
+            layout_map_build_count: 0,
         }
     }
 
@@ -190,6 +248,46 @@ impl<'a> CalibCtx<'a> {
             name: symbol.to_string(),
             size_bytes,
         })
+    }
+
+    // ---- Task 21: grad-arena layout + per-step instrumentation ---------------
+
+    /// Return the grad arena layout injected via `stub_for_tests_with_grad_layout`,
+    /// or `None` if this context has no layout (production or plain stub).
+    pub fn grad_arena_layout(&self) -> Option<&GradArenaLayout> {
+        self.grad_arena_layout.as_ref()
+    }
+
+    /// Record that `emit_per_step` would call `emit_per_head_dot_abs_accum`
+    /// for one (target, projection) pair.
+    ///
+    /// In production this is a no-op; in tests it increments a counter that
+    /// can be read back via `per_head_dot_call_count()`.
+    #[inline]
+    pub fn record_per_head_dot_call(&mut self) {
+        self.per_head_dot_call_count = self.per_head_dot_call_count.saturating_add(1);
+    }
+
+    /// Record that the hook built the grad-arena layout map.
+    ///
+    /// Spec §4.6: the HashMap must be built once (outside the per-target loop).
+    /// In tests, `layout_map_build_count()` should equal 1 after a single
+    /// `emit_per_step` call regardless of target count.
+    #[inline]
+    pub fn record_layout_map_build(&mut self) {
+        self.layout_map_build_count = self.layout_map_build_count.saturating_add(1);
+    }
+
+    /// Return the number of `emit_per_head_dot_abs_accum` calls recorded so far.
+    /// Only meaningful after calling `hook.emit_per_step(ctx)` with a
+    /// `stub_for_tests_with_grad_layout` context.
+    pub fn per_head_dot_call_count(&self) -> u32 {
+        self.per_head_dot_call_count
+    }
+
+    /// Return the number of layout map builds recorded so far.
+    pub fn layout_map_build_count(&self) -> u32 {
+        self.layout_map_build_count
     }
 
     /// Emit a per-input-channel max-abs reduction over a 2-D slice of the

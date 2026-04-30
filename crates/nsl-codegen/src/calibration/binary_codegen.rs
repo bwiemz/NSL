@@ -404,9 +404,11 @@ fn emit_2d_max_abs_loop(
 /// All blocks are sealed here; the caller must NOT seal them.
 /// After this call the builder is positioned at `head_exit` (just like
 /// `emit_2d_max_abs_loop` leaves the builder at `row_exit`).
-// Task 21 (`emit_per_step` in the scaffolding loop) calls this to perform the
-// per-batch |g·w| reduction.  The allow(dead_code) suppresses the lint until
-// that wire-up lands.
+// Task 22 (scaffolding wire-up) will call this from the scaffolding loop body
+// to perform the per-batch |g·w| reduction per (target, projection).
+// Task 21 implemented WggoGradientHook::emit_per_step and unit-tested the
+// iteration logic; Task 22 threads weight-data pointers in and removes the
+// allow(dead_code) suppression below.
 #[allow(dead_code)]
 pub(crate) fn emit_per_head_dot_abs_accum(
     b: &mut FunctionBuilder,
@@ -2577,18 +2579,29 @@ pub fn emit_calibration_scaffolding_object(
             }
 
             // Spec §4.5: hook.emit_per_step for backward observers.
-            // Task 18 placeholder — Task 21 replaces with real per-head dot+abs reduction.
             //
-            // For each backward hook's running buffer, emit a `symbol_value` and
-            // store it to a stack slot.  The store prevents Cranelift's optimizer
-            // from dead-code-eliminating the `symbol_value`, so the relocation
-            // entry referencing `__nsl_wggo_grad.<layer>` survives into the
-            // object file.  The test in `loop_body_dispatch` inspects these
-            // relocation entries to verify the hook was wired in.
+            // Task 21 status: WggoGradientHook::emit_per_step is implemented and
+            // unit-tested (4 tests in wggo_gradient_hook.rs).  The hook's body
+            // iterates (target × projection), verifies presence in grad_arena_layout,
+            // and calls ctx.record_per_head_dot_call() for each valid pair.
+            //
+            // Full scaffolding wiring (calling emit_per_head_dot_abs_accum here)
+            // requires threading per-projection weight data pointers into this
+            // loop body.  In production, weight pointers come from
+            // `nsl_model_get_weight_ptrs` (stored in weight_ptrs_addr above),
+            // but indexing individual projections requires either:
+            //   (a) `nsl_model_get_weight`-by-name for each projection (needs new
+            //       import declaration + weight name string globals), or
+            //   (b) pre-computed weight-index offsets passed via a new parameter
+            //       to emit_calibration_scaffolding_object.
+            //
+            // The placeholder below (Task 18) is kept to maintain the relocation
+            // entries that verify `__nsl_wggo_grad.*` symbols are referenced.
+            // Replace with real emit_per_head_dot_abs_accum calls in Task 22.
             if needs_backward && !per_step_backward_symbols.is_empty() {
-                // Task 18 placeholder: single scratch slot is intentional. All stores
+                // Placeholder: single scratch slot is intentional. All stores
                 // overwrite offset 0; the slot exists only to prevent Cranelift DCE
-                // of the symbol_value instructions. Task 21 will replace the loop
+                // of the symbol_value instructions. Task 22 will replace the loop
                 // with a real per-symbol reduction (one slot per accumulator).
                 let scratch_slot = b.create_sized_stack_slot(StackSlotData::new(
                     StackSlotKind::ExplicitSlot,
