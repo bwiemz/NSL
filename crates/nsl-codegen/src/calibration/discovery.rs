@@ -164,6 +164,32 @@ fn parse_tensor_shape_from_type_expr(ty: &TypeExpr) -> Option<[u32; 2]> {
     Some([out_features, in_features])
 }
 
+/// Try to resolve a 2-D weight shape from a field initializer expression using
+/// the AST evaluator against the provided constructor-arg scope. Returns `None`
+/// if the result is not a 2-element `IntList`, if any dimension is negative, or
+/// if any dimension exceeds `u32::MAX`.
+fn resolve_field_shape_via_evaluator(
+    init_expr: &nsl_ast::expr::Expr,
+    scope: &crate::calibration::ast_evaluator::Scope,
+    interner: &Interner,
+) -> Option<[u32; 2]> {
+    use crate::calibration::ast_evaluator::{evaluate_expr, EvalValue};
+    let EvalValue::IntList(dims) = evaluate_expr(init_expr, scope, interner).ok()? else {
+        return None;
+    };
+    if dims.len() != 2 {
+        return None;
+    }
+    // Defensive: reject negative or too-large dims (spec hygiene).
+    if dims[0] < 0 || dims[1] < 0 {
+        return None;
+    }
+    if dims[0] > u32::MAX as i64 || dims[1] > u32::MAX as i64 {
+        return None;
+    }
+    Some([dims[0] as u32, dims[1] as u32])
+}
+
 fn extract_shape_from_tensor_init(expr: &nsl_ast::expr::Expr, interner: &Interner) -> Option<[u32; 2]> {
     let ExprKind::Call { callee, args } = &expr.kind else {
         return None;
@@ -332,6 +358,12 @@ fn model_has_awq_quantize_decorator(decorators: &[Decorator], interner: &Interne
 fn collect_model_layer_metadata(
     model_def: &ModelDef,
     interner: &Interner,
+    // Optional constructor-arg scope built from the model's instantiation site.
+    // When Some, the evaluator path is tried first for each field initializer,
+    // enabling resolution of param-dependent shapes like `zeros([hidden, in_features])`.
+    // Falls through to the literal-only path when None or when the evaluator
+    // returns None (back-compat guaranteed).
+    scope: Option<&crate::calibration::ast_evaluator::Scope>,
 ) -> (
     std::collections::HashMap<String, String>,
     std::collections::HashMap<String, String>,
@@ -364,7 +396,18 @@ fn collect_model_layer_metadata(
         }
 
         let shape = parse_tensor_shape_from_type_expr(type_ann)
-            .or_else(|| init.as_ref().and_then(|expr| extract_shape_from_tensor_init(expr, interner)));
+            .or_else(|| {
+                let init_expr = init.as_ref()?;
+                // Try evaluator-backed resolution first when a scope is available
+                // (handles `zeros([param, param])` patterns).
+                if let Some(s) = scope {
+                    if let Some(shape) = resolve_field_shape_via_evaluator(init_expr, s, interner) {
+                        return Some(shape);
+                    }
+                }
+                // Fall through to literal-only path (back-compat for plain literals).
+                extract_shape_from_tensor_init(init_expr, interner)
+            });
         if let Some([out_features, in_features]) = shape {
             tensor_shapes.insert(
                 field_name,
@@ -376,12 +419,92 @@ fn collect_model_layer_metadata(
     (field_types, tensor_shapes)
 }
 
+/// Walk `stmts` recursively for the first `let <var> = <class_name>(...)` call
+/// where `class_name` matches `model_sym`, and return the call's `args` slice.
+/// Policy: pick the first instantiation in source order; if multiple exist,
+/// subsequent ones are ignored (users can override by changing source order).
+/// Returns `None` when no matching instantiation is reachable (e.g. test-only
+/// fixtures or externally-loaded models) — callers fall through to the
+/// literal-only path in that case.
+fn find_first_instantiation_args(
+    stmts: &[nsl_ast::stmt::Stmt],
+    model_sym: nsl_ast::Symbol,
+) -> Option<&[nsl_ast::expr::Arg]> {
+    for stmt in stmts {
+        match &stmt.kind {
+            StmtKind::VarDecl { value: Some(init), .. } => {
+                if let ExprKind::Call { callee, args } = &init.kind {
+                    if let ExprKind::Ident(sym) = &callee.kind {
+                        if *sym == model_sym {
+                            return Some(args.as_slice());
+                        }
+                    }
+                }
+            }
+            StmtKind::FnDef(fn_def) => {
+                if let Some(result) =
+                    find_first_instantiation_args(&fn_def.body.stmts, model_sym)
+                {
+                    return Some(result);
+                }
+            }
+            StmtKind::If {
+                then_block,
+                elif_clauses,
+                else_block,
+                ..
+            } => {
+                if let Some(r) =
+                    find_first_instantiation_args(&then_block.stmts, model_sym)
+                {
+                    return Some(r);
+                }
+                for (_, blk) in elif_clauses {
+                    if let Some(r) =
+                        find_first_instantiation_args(&blk.stmts, model_sym)
+                    {
+                        return Some(r);
+                    }
+                }
+                if let Some(blk) = else_block {
+                    if let Some(r) =
+                        find_first_instantiation_args(&blk.stmts, model_sym)
+                    {
+                        return Some(r);
+                    }
+                }
+            }
+            StmtKind::For { body, .. }
+            | StmtKind::While { body, .. }
+            | StmtKind::WhileLet { body, .. } => {
+                if let Some(r) =
+                    find_first_instantiation_args(&body.stmts, model_sym)
+                {
+                    return Some(r);
+                }
+            }
+            StmtKind::Decorated { stmt: inner, .. } => {
+                if let Some(r) = find_first_instantiation_args(
+                    std::slice::from_ref(inner.as_ref()),
+                    model_sym,
+                ) {
+                    return Some(r);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 /// Discover AWQ projections directly from the parsed AST before any compiler
 /// state exists.
 pub fn pre_scan_awq_projections_from_ast(
     ast: &nsl_ast::Module,
     interner: &Interner,
 ) -> Vec<DiscoveredProjection> {
+    use crate::calibration::ast_evaluator::bind_constructor_args;
+
     let mut all_projections = Vec::new();
 
     for stmt in &ast.stmts {
@@ -400,8 +523,18 @@ pub fn pre_scan_awq_projections_from_ast(
             continue;
         }
 
+        // Try to build a constructor-arg scope from the first instantiation site.
+        // When no instantiation exists in the AST (test-only fixtures, externally-
+        // loaded models), fall through to the literal-only path with no scope.
+        let scope_opt: Option<crate::calibration::ast_evaluator::Scope> =
+            find_first_instantiation_args(&ast.stmts, model_def.name)
+                .and_then(|args| {
+                    bind_constructor_args(&model_def.params, args, interner).ok()
+                });
+
         let forward_body = find_forward_body(model_def, interner);
-        let (field_types, tensor_shapes) = collect_model_layer_metadata(model_def, interner);
+        let (field_types, tensor_shapes) =
+            collect_model_layer_metadata(model_def, interner, scope_opt.as_ref());
 
         if let Ok(mut discovered) = discover_awq_projections_from_state(
             &model_name,
@@ -1583,6 +1716,20 @@ fn main():
             layer_keys.contains(&"inner_attn"),
             "missing train.step body instantiation: {layer_keys:?}"
         );
+    }
+
+    #[test]
+    fn pre_scan_awq_resolves_parameterized_shapes() {
+        let source = std::fs::read_to_string(
+            repo_fixture("awq_calibration_parameterized.nsl")
+        ).unwrap();
+        let (ast, interner) = parse_module(&source);
+        let discovered = pre_scan_awq_projections_from_ast(&ast, &interner);
+        assert_eq!(discovered.len(), 2);
+        // up_proj from `zeros([hidden, in_features])` with hidden=128, in_features=64
+        assert_eq!(discovered[0].weight_shape, [128, 64]);
+        // down_proj from `zeros([in_features, hidden])` with in_features=64, hidden=128
+        assert_eq!(discovered[1].weight_shape, [64, 128]);
     }
 
     /// `grad(targets): ...` blocks have a `body: Block` that may contain user

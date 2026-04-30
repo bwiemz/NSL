@@ -1,0 +1,16 @@
+# Regression fixture proving AWQ pre-scan handles constructor-param shapes
+# (closes the gap surfaced in spec §4.7).
+from nsl.nn.losses import mse_loss
+
+@quantize(dtype="awq4")
+model TinyMLP(in_features: int, hidden: int):
+    up_proj: Tensor = zeros([hidden, in_features])
+    down_proj: Tensor = zeros([in_features, hidden])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x |> up_proj |> relu |> down_proj
+
+fn main():
+    let m = TinyMLP(in_features=64, hidden=128)
+    let x = zeros([1, 64])
+    let y = m.forward(x)
