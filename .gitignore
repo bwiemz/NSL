@@ -32,6 +32,9 @@ models/coder50m/data/tokenizer/
 *.safetensors
 # Exception: committed CPDT calibration fixtures (deterministic, seed-anchored).
 !tests/fixtures/cpdt_calibration/*.safetensors
+# Exception: committed WGGO merge-gate fixtures (deterministic, seed-anchored).
+!tests/fixtures/wggo_calib_data.safetensors
+!tests/fixtures/wggo_calib_weights.safetensors
 
 # Log files (per-run, never versioned)
 *.log
