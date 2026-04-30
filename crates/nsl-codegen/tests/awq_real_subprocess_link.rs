@@ -103,6 +103,7 @@ fn two_object_link_produces_binary_with_resolved_wrapper_symbol() {
         &arena_layout,
         b"{}",
         true,
+        false, // needs_backward = false for AWQ-only test
         &scaffolding_obj,
     )
     .expect("emit scaffolding.o");
@@ -153,6 +154,7 @@ fn missing_wrapper_symbol_at_link_emits_three_part_error() {
         &arena_layout,
         b"{}",
         true,
+        false, // needs_backward = false; tests forward-path link failure
         &scaffolding_obj,
     )
     .expect("emit scaffolding.o");

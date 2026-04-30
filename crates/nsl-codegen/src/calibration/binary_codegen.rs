@@ -69,6 +69,10 @@ pub fn real_subprocess_entry(
     let sidecar_path = tmp.join("sidecar.json");
 
     let needs_forward = registry.iter().any(|h| h.requires().needs_forward_pass());
+    let needs_backward = {
+        let sets: Vec<_> = registry.iter().map(|h| h.requires()).collect();
+        crate::calibration::observation::ObservationPlan::union_of(&sets).needs_backward()
+    };
 
     // For non-forward hooks: compute sidecar in-process so we can embed the
     // JSON in the binary.
@@ -149,6 +153,7 @@ pub fn real_subprocess_entry(
             &arena_layout,
             &sidecar_json_for_binary,
             true,
+            needs_backward,
             &scaffolding_obj,
         )?;
 
@@ -1782,6 +1787,7 @@ pub fn emit_calibration_scaffolding_object(
     arena_layout: &crate::calibration::ArenaLayout,
     sidecar_json: &[u8],
     needs_forward_pass: bool,
+    needs_backward: bool,
     out_path: &Path,
 ) -> Result<(), HarnessError> {
     if needs_forward_pass && observe_plan.is_empty() {
@@ -2025,15 +2031,44 @@ pub fn emit_calibration_scaffolding_object(
     calib_model_forward_sig.params.push(AbiParam::new(ptr_ty));
     calib_model_forward_sig.params.push(AbiParam::new(cl_types::I64));
     calib_model_forward_sig.returns.push(AbiParam::new(cl_types::I32));
-    let calib_model_forward_id = module
-        .declare_function(
-            "nsl_calib_model_forward",
-            Linkage::Import,
-            &calib_model_forward_sig,
+    let calib_model_forward_id = if !needs_backward {
+        Some(
+            module
+                .declare_function(
+                    "nsl_calib_model_forward",
+                    Linkage::Import,
+                    &calib_model_forward_sig,
+                )
+                .map_err(|e| HarnessError::Infrastructure {
+                    reason: format!("declare nsl_calib_model_forward: {e}"),
+                })?,
         )
-        .map_err(|e| HarnessError::Infrastructure {
-            reason: format!("declare nsl_calib_model_forward: {e}"),
-        })?;
+    } else {
+        None
+    };
+
+    // Task 17 (spec §4.5): when needs_backward, the scaffolding calls
+    // nsl_calib_model_backward INSTEAD of nsl_calib_model_forward.
+    // The backward wrapper internally runs forward then backward, so calling
+    // forward separately would be redundant.  Same 4-param ABI as forward.
+    let calib_model_backward_id = if needs_backward {
+        let mut sig = module.make_signature();
+        sig.call_conv = call_conv;
+        sig.params.push(AbiParam::new(ptr_ty));
+        sig.params.push(AbiParam::new(cl_types::I64));
+        sig.params.push(AbiParam::new(ptr_ty));
+        sig.params.push(AbiParam::new(cl_types::I64));
+        sig.returns.push(AbiParam::new(cl_types::I32));
+        Some(
+            module
+                .declare_function("nsl_calib_model_backward", Linkage::Import, &sig)
+                .map_err(|e| HarnessError::Infrastructure {
+                    reason: format!("declare nsl_calib_model_backward: {e}"),
+                })?,
+        )
+    } else {
+        None
+    };
 
     let mut main_sig = module.make_signature();
     main_sig.call_conv = call_conv;
@@ -2291,17 +2326,37 @@ pub fn emit_calibration_scaffolding_object(
             let batch_elems = b.ins().ushr_imm(batch_len, 2);
             let model_ptr = b.ins().load(cl_types::I64, MemFlags::new(), model_ptr_addr, 0);
             let num_weights = b.ins().load(cl_types::I64, MemFlags::new(), num_weights_addr, 0);
-            let calib_model_forward_ref =
-                module.declare_func_in_func(calib_model_forward_id, b.func);
+
+            // Task 17 (spec §4.5): dispatch to backward wrapper when needs_backward,
+            // otherwise call forward.  The backward wrapper internally runs forward
+            // then backward — calling forward separately when backward is needed would
+            // be redundant and incorrect.  Both share the same 4-param ABI:
+            //   (model_ptr, num_weights, batch_ptr, batch_elems) -> i32
             // Spec §4.3: 4th arg is element count, not byte length.
             // `nsl_calibration_batch_at` returns out_len in bytes, so we
             // shift right by 2 (f32 = 4 bytes). Pre-v2 the wrapper ignored
             // this argument so the bytes-vs-elements mismatch was latent.
-            let fwd_call = b.ins().call(
-                calib_model_forward_ref,
-                &[model_ptr, num_weights, batch_ptr, batch_elems],
-            );
-            let fwd_status = b.inst_results(fwd_call)[0];
+            let call_status = if needs_backward {
+                let bwd_ref = module.declare_func_in_func(
+                    calib_model_backward_id.expect("calib_model_backward_id is Some when needs_backward"),
+                    b.func,
+                );
+                let bwd_call = b.ins().call(
+                    bwd_ref,
+                    &[model_ptr, num_weights, batch_ptr, batch_elems],
+                );
+                b.inst_results(bwd_call)[0]
+            } else {
+                let fwd_ref = module.declare_func_in_func(
+                    calib_model_forward_id.expect("calib_model_forward_id is Some when !needs_backward"),
+                    b.func,
+                );
+                let fwd_call = b.ins().call(
+                    fwd_ref,
+                    &[model_ptr, num_weights, batch_ptr, batch_elems],
+                );
+                b.inst_results(fwd_call)[0]
+            };
 
             // v2 follow-up (spec §5.1): wrapper returns 3 on per-batch
             // shape mismatch. The scaffolding's `batch_preflight` only
@@ -2311,7 +2366,7 @@ pub fn emit_calibration_scaffolding_object(
             let observe_continue = b.create_block();
             let batch_mismatch_mid_loop = b.create_block();
             let zero_status = b.ins().iconst(cl_types::I32, 0);
-            let status_ok = b.ins().icmp(IntCC::Equal, fwd_status, zero_status);
+            let status_ok = b.ins().icmp(IntCC::Equal, call_status, zero_status);
             b.ins().brif(
                 status_ok,
                 observe_continue,
@@ -3237,6 +3292,7 @@ mod tests {
             &arena_layout,
             b"{}",
             true,
+            false, // needs_backward = false for this AWQ-only test
             &out_path,
         )
         .expect("emit succeeds");
@@ -3291,6 +3347,7 @@ mod tests {
             &arena_layout,
             b"{}",
             true,
+            false, // needs_backward = false
             &out_path,
         )
         .expect_err("must refuse defensively");
@@ -3679,6 +3736,136 @@ mod backward_wrapper {
             err_msg.contains("forward has no return type")
                 || err_msg.contains("--wggo-importance=magnitude"),
             "error message must mention the void-forward constraint; got: {err_msg}"
+        );
+    }
+}
+
+/// Task 17 (spec §4.5): verify that the scaffolding loop body dispatches to
+/// `nsl_calib_model_backward` when `needs_backward = true`, and to
+/// `nsl_calib_model_forward` when `needs_backward = false`.
+///
+/// Test strategy: relocation-symbol inspection on the emitted `.o` file.
+/// When `needs_backward = true`:
+///   - scaffolding.o must import (undefined reference to) `nsl_calib_model_backward`
+///   - scaffolding.o must NOT import `nsl_calib_model_forward`
+/// When `needs_backward = false`:
+///   - scaffolding.o must import `nsl_calib_model_forward`
+///   - scaffolding.o must NOT import `nsl_calib_model_backward`
+///
+/// This ensures the codegen branches to ONE OR THE OTHER at compile time,
+/// not both, which is the spec §4.5 requirement.
+#[cfg(test)]
+mod loop_body_dispatch {
+    use object::{Object, ObjectSymbol};
+
+    use crate::calibration::hooks::{FinalizePlanEntry, ObservePlanEntry};
+    use crate::calibration::observation::ProjectionRef;
+    use crate::calibration::retention_pass::build_arena_layout;
+
+    use super::emit_calibration_scaffolding_object;
+
+    /// Build a minimal observe/finalize plan and arena layout for dispatch tests.
+    fn fixture_plans() -> (
+        Vec<ObservePlanEntry>,
+        Vec<FinalizePlanEntry>,
+        crate::calibration::ArenaLayout,
+    ) {
+        let observe_plan = vec![ObservePlanEntry {
+            projection: ProjectionRef("TinyMLP.up_proj".into()),
+            src_offset: 0,
+            rows: 32,
+            channels: 64,
+            running_symbol: "__nsl_awq_running_up_proj".into(),
+        }];
+        let finalize_plan = vec![FinalizePlanEntry {
+            projection: ProjectionRef("TinyMLP.up_proj".into()),
+            running_symbol: "__nsl_awq_running_up_proj".into(),
+            channels: 64,
+        }];
+        let arena_layout = build_arena_layout(
+            &[crate::calibration::DiscoveredProjection {
+                projection: ProjectionRef("TinyMLP.up_proj".into()),
+                weight_shape: [128, 64],
+            }],
+            8,
+            4,
+        );
+        (observe_plan, finalize_plan, arena_layout)
+    }
+
+    #[test]
+    fn loop_body_calls_model_backward_when_backward_needed() {
+        let (observe_plan, finalize_plan, arena_layout) = fixture_plans();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let out_path = tmp.path().join("scaffolding_bwd.o");
+
+        emit_calibration_scaffolding_object(
+            &observe_plan,
+            &finalize_plan,
+            &arena_layout,
+            b"{}",
+            true,
+            true, // needs_backward = true
+            &out_path,
+        )
+        .expect("emit succeeds with needs_backward=true");
+
+        let obj_bytes = std::fs::read(&out_path).expect("object readable");
+        let obj = object::File::parse(&*obj_bytes).expect("object::File::parse");
+
+        let imports: Vec<String> = obj
+            .symbols()
+            .filter(|s| s.is_undefined())
+            .filter_map(|s| s.name().ok().map(str::to_string))
+            .collect();
+
+        assert!(
+            imports.iter().any(|s| s == "nsl_calib_model_backward"),
+            "scaffolding.o must import nsl_calib_model_backward when needs_backward=true; \
+             imports: {imports:?}"
+        );
+        assert!(
+            !imports.iter().any(|s| s == "nsl_calib_model_forward"),
+            "scaffolding.o must NOT import nsl_calib_model_forward when needs_backward=true \
+             (backward subsumes forward); imports: {imports:?}"
+        );
+    }
+
+    #[test]
+    fn loop_body_calls_only_forward_when_backward_not_needed() {
+        let (observe_plan, finalize_plan, arena_layout) = fixture_plans();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let out_path = tmp.path().join("scaffolding_fwd.o");
+
+        emit_calibration_scaffolding_object(
+            &observe_plan,
+            &finalize_plan,
+            &arena_layout,
+            b"{}",
+            true,
+            false, // needs_backward = false
+            &out_path,
+        )
+        .expect("emit succeeds with needs_backward=false");
+
+        let obj_bytes = std::fs::read(&out_path).expect("object readable");
+        let obj = object::File::parse(&*obj_bytes).expect("object::File::parse");
+
+        let imports: Vec<String> = obj
+            .symbols()
+            .filter(|s| s.is_undefined())
+            .filter_map(|s| s.name().ok().map(str::to_string))
+            .collect();
+
+        assert!(
+            imports.iter().any(|s| s == "nsl_calib_model_forward"),
+            "scaffolding.o must import nsl_calib_model_forward when needs_backward=false; \
+             imports: {imports:?}"
+        );
+        assert!(
+            !imports.iter().any(|s| s == "nsl_calib_model_backward"),
+            "scaffolding.o must NOT import nsl_calib_model_backward when needs_backward=false; \
+             imports: {imports:?}"
         );
     }
 }
