@@ -1,11 +1,12 @@
-//! WGGO Phase 2: calibration hook that will retain per-head |g·w| reductions
+//! WGGO Phase 2: calibration hook that retains per-head |g·w| reductions
 //! during the compile-time backward pass.
 //!
-//! In this milestone the hook is structural only — the subprocess backward
-//! pass remains blocked on the AWQ retention debug. `observe_plan` and
-//! `finalize_plan` return shaped entries so the rest of the pipeline
-//! (running buffer declaration, sidecar JSON layout) is exercised, but
-//! running buffers stay zero until the backward pass fires for real.
+//! The hook owns three IR-emission methods:
+//! - `emit_init` declares one f64 .bss running buffer per registered layer.
+//! - `emit_per_step` runs after each batch's backward call, accumulating
+//!   `Σ |dW · W|` per head (with MQA/GQA replication per spec §4.6).
+//! - `emit_finalize` reads back the running buffers and serialises them
+//!   into the sidecar's `wggo_head_gradients` field.
 
 use crate::calibration::{
     ArenaLayout, CalibCtx, CalibrationHook, CalibrationResult, FinalizePlanEntry,
@@ -13,6 +14,7 @@ use crate::calibration::{
 };
 use crate::calibration::observation::{ObservationSet, ProjectionRef};
 use crate::calibration::discovery::WggoGradTarget;
+use crate::calibration::sidecar::{PerLayerGradient, WggoHeadGradients};
 
 // ── Symbol naming ─────────────────────────────────────────────────────────────
 
@@ -162,11 +164,32 @@ impl CalibrationHook for WggoGradientHook {
         }
     }
 
-    fn emit_finalize(&self, _ctx: &mut CalibCtx) -> CalibrationResult {
-        // Stub — returns an empty payload so the harness driver records a
-        // key for this hook but with no data.  Tests can assert on this
-        // until the real reduction lands.
-        CalibrationResult::Ok(vec![])
+    fn emit_finalize(&self, ctx: &mut CalibCtx) -> CalibrationResult {
+        let batches_observed = ctx.batches_processed();
+        let mut by_layer = std::collections::BTreeMap::new();
+        for target in &self.targets {
+            // n_o_heads = d_model / head_dim where d_model = w_o_shape[0].
+            // Belt-and-suspenders: guard head_dim == 0 in case a registry
+            // path bypasses pre-scan validation.
+            let n_o_heads = if target.head_dim == 0 {
+                1
+            } else {
+                (target.w_o_shape[0] / target.head_dim).max(1) as usize
+            };
+            let symbol = running_symbol_for(&target.layer_key);
+            let per_head_score = ctx.read_running_buffer_f64_as_f32(&symbol, n_o_heads);
+            by_layer.insert(
+                target.layer_key.clone(),
+                PerLayerGradient {
+                    per_head_score,
+                    batches_observed,
+                },
+            );
+        }
+        let payload = WggoHeadGradients { by_layer };
+        let bytes = serde_json::to_vec(&payload)
+            .expect("serialize WggoHeadGradients: BTreeMap<String, _> is always JSON-serializable");
+        CalibrationResult::Ok(bytes)
     }
 
     // ── Arena-layout plan methods ─────────────────────────────────────────
@@ -421,14 +444,56 @@ mod tests {
         }
     }
 
+    /// Task 22: emit_finalize must serialise per-layer running buffers into a
+    /// `WggoHeadGradients` JSON payload.  This test replaces the old
+    /// `emit_finalize_stub_returns_empty_ok` test that asserted on the stub
+    /// behaviour (empty Vec).
     #[test]
-    fn emit_finalize_stub_returns_empty_ok() {
+    fn emit_finalize_returns_populated_per_layer_payload() {
+        use crate::calibration::sidecar::WggoHeadGradients;
+
+        let targets = vec![
+            fixture_target("layers.0", 64, [256, 256]),
+            fixture_target("layers.1", 64, [256, 256]),
+        ];
+        let hook = WggoGradientHook::new(targets);
+        let mut ctx = crate::calibration::ctx::CalibCtx::stub_for_tests();
+        // Simulate accumulator state: 4 heads each (256/64 = 4).
+        ctx.set_running_buffer_f64("__nsl_wggo_grad.layers_0", &[1.0, 2.0, 3.0, 4.0]);
+        ctx.set_running_buffer_f64("__nsl_wggo_grad.layers_1", &[5.0, 6.0, 7.0, 8.0]);
+        ctx.set_batches_processed(10);
+
+        let result = hook.emit_finalize(&mut ctx);
+        let CalibrationResult::Ok(bytes) = result else {
+            panic!("expected CalibrationResult::Ok, got {result:?}")
+        };
+        assert!(!bytes.is_empty(), "stub-era empty payload regression: emit_finalize must return non-empty bytes");
+
+        let payload: WggoHeadGradients = serde_json::from_slice(&bytes)
+            .expect("emit_finalize bytes must be valid WggoHeadGradients JSON");
+
+        let l0 = payload.by_layer.get("layers.0").expect("layers.0 missing from payload");
+        assert_eq!(l0.per_head_score, vec![1.0f32, 2.0, 3.0, 4.0]);
+        assert_eq!(l0.batches_observed, 10);
+
+        let l1 = payload.by_layer.get("layers.1").expect("layers.1 missing from payload");
+        assert_eq!(l1.per_head_score, vec![5.0f32, 6.0, 7.0, 8.0]);
+        assert_eq!(l1.batches_observed, 10);
+    }
+
+    /// Empty targets → empty by_layer map, still a valid non-empty JSON object.
+    #[test]
+    fn emit_finalize_empty_targets_returns_empty_map() {
+        use crate::calibration::sidecar::WggoHeadGradients;
+
         let hook = WggoGradientHook::new(vec![]);
         let mut ctx = crate::calibration::ctx::CalibCtx::stub_for_tests();
-        match hook.emit_finalize(&mut ctx) {
-            CalibrationResult::Ok(b) => assert!(b.is_empty()),
-            other => panic!("expected Ok(empty), got {other:?}"),
-        }
+        let CalibrationResult::Ok(bytes) = hook.emit_finalize(&mut ctx) else {
+            panic!("expected Ok")
+        };
+        assert!(!bytes.is_empty(), "JSON serialisation of empty map must not be empty bytes");
+        let payload: WggoHeadGradients = serde_json::from_slice(&bytes).unwrap();
+        assert!(payload.by_layer.is_empty());
     }
 
     #[test]

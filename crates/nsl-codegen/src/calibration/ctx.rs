@@ -49,6 +49,11 @@ pub struct CalibCtx<'a> {
     /// Task 21: counter incremented by `record_layout_map_build()`.
     /// Verifies that the layout HashMap is built once (outside the per-target loop).
     layout_map_build_count: u32,
+    /// Task 22: running buffers for WGGO f64 accumulators (test-only, keyed by symbol).
+    /// In production these are BSS globals read back via the calibration binary output.
+    running_buffers_f64: BTreeMap<String, Vec<f64>>,
+    /// Task 22: number of calibration batches processed (test-only).
+    batches_processed: u32,
 }
 
 impl<'a> CalibCtx<'a> {
@@ -67,6 +72,8 @@ impl<'a> CalibCtx<'a> {
             grad_arena_layout: None,
             per_head_dot_call_count: 0,
             layout_map_build_count: 0,
+            running_buffers_f64: BTreeMap::new(),
+            batches_processed: 0,
         }
     }
 
@@ -88,6 +95,8 @@ impl<'a> CalibCtx<'a> {
             grad_arena_layout: None,
             per_head_dot_call_count: 0,
             layout_map_build_count: 0,
+            running_buffers_f64: BTreeMap::new(),
+            batches_processed: 0,
         }
     }
 
@@ -129,6 +138,8 @@ impl<'a> CalibCtx<'a> {
             }),
             per_head_dot_call_count: 0,
             layout_map_build_count: 0,
+            running_buffers_f64: BTreeMap::new(),
+            batches_processed: 0,
         }
     }
 
@@ -288,6 +299,40 @@ impl<'a> CalibCtx<'a> {
     /// Return the number of layout map builds recorded so far.
     pub fn layout_map_build_count(&self) -> u32 {
         self.layout_map_build_count
+    }
+
+    // ---- Task 22: f64 running-buffer accessors (test-only + production readback) --
+
+    /// Store a named f64 running buffer (used by tests to simulate the BSS
+    /// accumulator state that the calibration binary would write during the
+    /// backward pass).
+    pub fn set_running_buffer_f64(&mut self, symbol: &str, values: &[f64]) {
+        self.running_buffers_f64.insert(symbol.to_string(), values.to_vec());
+    }
+
+    /// Read back a named f64 running buffer and cast each element to f32.
+    ///
+    /// Returns up to `n_heads` values.  If the stored buffer is shorter than
+    /// `n_heads` the result is zero-padded.  If no buffer was set for the
+    /// symbol an all-zeros Vec of length `n_heads` is returned.
+    pub fn read_running_buffer_f64_as_f32(&self, symbol: &str, n_heads: usize) -> Vec<f32> {
+        let src = self.running_buffers_f64.get(symbol).cloned().unwrap_or_default();
+        let mut out = vec![0.0f32; n_heads];
+        for (i, v) in src.iter().take(n_heads).enumerate() {
+            out[i] = *v as f32;
+        }
+        out
+    }
+
+    /// Record the number of calibration batches processed (test-only; in
+    /// production this comes from the calibration binary's counter global).
+    pub fn set_batches_processed(&mut self, n: u32) {
+        self.batches_processed = n;
+    }
+
+    /// Return the number of calibration batches processed.
+    pub fn batches_processed(&self) -> u32 {
+        self.batches_processed
     }
 
     /// Emit a per-input-channel max-abs reduction over a 2-D slice of the
