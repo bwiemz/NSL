@@ -921,14 +921,13 @@ fn emit_model_backward_bridge(
 /// Tasks 15-16 will insert the L2-loss synthesis and source-AD splice.
 fn emit_calibration_backward_wrapper(
     compiler: &mut crate::compiler::Compiler<'_>,
-    #[allow(unused_variables)] // task 15-16 use these
-    model_forward_id: cranelift_module::FuncId,
-    #[allow(unused_variables)] // task 15-16 use these
-    model_backward_id: cranelift_module::FuncId,
+    // Tasks 15-16 use these
+    _model_forward_id: cranelift_module::FuncId,
+    _model_backward_id: cranelift_module::FuncId,
     batch: u32,
     seq: u32,
     channels: i64,
-) -> Result<cranelift_module::FuncId, HarnessError> {
+) -> Result<(), HarnessError> {
     let pointer_ty = compiler.module.target_config().pointer_type();
 
     let (shape_vals, _input_ndim) = if batch == 1 {
@@ -998,7 +997,7 @@ fn emit_calibration_backward_wrapper(
         .map_err(|e| HarnessError::Infrastructure {
             reason: format!("define nsl_calib_model_backward: {e}"),
         })?;
-    Ok(func_id)
+    Ok(())
 }
 
 pub fn emit_calibration_model_object(
