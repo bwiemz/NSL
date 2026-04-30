@@ -400,12 +400,25 @@ fn run_weight_analysis(
     // informed score and substitute it for the magnitude baseline.
     if let Some(sc) = scorer {
         for (layer, imp) in graph.layers.iter().zip(report.per_layer.iter_mut()) {
+            let has_real_gradient_for_layer = sc.has_gradient_data_for_layer(&layer.name);
             let from_scorer = sc.score_layer(&layer.name, layer_shape);
             let (new_scores, source) = match from_scorer {
-                Some(hi) => (
-                    hi.per_head.iter().map(|&v| v as f64).collect::<Vec<f64>>(),
-                    "gradient (calibrated)",
-                ),
+                Some(hi) => {
+                    // Truth-in-logging: a CalibratedGradientScorer may return
+                    // Some(...) via its internal magnitude fallback when the
+                    // sidecar lacks an entry for this layer.  Only claim
+                    // "gradient (calibrated)" when the scorer confirmed it has
+                    // real sidecar-derived data for the layer.
+                    let label = if has_real_gradient_for_layer {
+                        "gradient (calibrated)"
+                    } else {
+                        "magnitude (fallback within CalibratedGradientScorer)"
+                    };
+                    (
+                        hi.per_head.iter().map(|&v| v as f64).collect::<Vec<f64>>(),
+                        label,
+                    )
+                }
                 None => (
                     score_layer_magnitude(&layer.name, layer_shape, provider)
                         .per_head

@@ -252,6 +252,10 @@ fn load_and_register_weights_if_needed(
 /// helper internally.
 ///
 /// Idempotent: if a field is already `Some`, it is left unchanged.
+///
+/// §5.7: when `opts.wggo_importance == WggoImportance::Auto` and any of the
+/// §5.4/§5.5/§5.6 conditions are met, an informational note is emitted to
+/// stderr and `opts.wggo_importance` is demoted to `WggoImportance::Magnitude`.
 pub(crate) fn run_pre_scan_phase(
     ast: &nsl_ast::Module,
     interner: &Interner,
@@ -270,7 +274,72 @@ pub(crate) fn run_pre_scan_phase(
             opts.calibration_grad_retention = Some(discovered_wggo);
         }
     }
+
+    // §5.7: --wggo-importance=auto soft-fallback to magnitude.
+    // When auto mode encounters any of the §5.4/§5.5/§5.6 conditions, emit
+    // an informational note and demote the mode to magnitude.
+    apply_auto_mode_fallback_note(ast, interner, &mut opts);
+
     opts
+}
+
+/// §5.7 soft-fallback for `WggoImportance::Auto`.
+///
+/// If `opts.wggo_importance == Auto` and any of the §5.4/§5.5/§5.6
+/// conditions are met, this function:
+///   1. Emits a single informational note to stderr.
+///   2. Demotes `opts.wggo_importance` to `WggoImportance::Magnitude`.
+///
+/// This is the parallel to [`enforce_grad_mode_refusals`] — same three
+/// conditions, but soft (note + demotion) rather than hard (error).
+///
+/// Must be called **after** `calibration_grad_retention` has been populated
+/// by discovery (see [`run_pre_scan_phase`]).
+fn apply_auto_mode_fallback_note(
+    ast: &nsl_ast::Module,
+    interner: &Interner,
+    opts: &mut crate::CompileOptions,
+) {
+    use crate::WggoImportance;
+
+    if opts.wggo_importance != WggoImportance::Auto {
+        return;
+    }
+
+    let calibration_data_present = opts.calibration_data.is_some();
+    let decorators_in_ast =
+        crate::calibration::discovery::ast_has_wggo_target_decorators(ast, interner);
+    let resolved_targets = opts.calibration_grad_retention.as_deref().unwrap_or(&[]);
+
+    // §5.4: no @wggo_target decorators in source.
+    // §5.5: decorators present but none reachable from entry point.
+    // §5.6: decorators reachable but no calibration data provided.
+    let trigger_reason: Option<String> = if !decorators_in_ast {
+        Some("no @wggo_target decorators in source".to_string())
+    } else if resolved_targets.is_empty() {
+        let decorated =
+            crate::calibration::discovery::list_decorated_class_names(ast, interner);
+        let entry = crate::calibration::discovery::entry_point_fn_name(ast, interner)
+            .unwrap_or_else(|| "(unknown)".to_string());
+        Some(format!(
+            "decorated classes {decorated:?} not reachable from entry `{entry}`"
+        ))
+    } else if !calibration_data_present {
+        Some("decorators present but no calibration data provided".to_string())
+    } else {
+        None
+    };
+
+    if let Some(reason) = trigger_reason {
+        eprintln!(
+            "note: --wggo-importance=auto fell back to magnitude scoring.\n  \
+             reason: {reason}\n  \
+             effect: WGGO ILP runs against magnitude (||W||₂)-based importance scores.\n  \
+             to silence: add @wggo_target + calibration data, OR set\n             \
+             --wggo-importance=magnitude to opt out of grad scoring entirely."
+        );
+        opts.wggo_importance = WggoImportance::Magnitude;
+    }
 }
 
 /// §5.4-§5.6 refusal checks for grad-mode WGGO.
@@ -1323,5 +1392,64 @@ mod tests {
             Some(Vec::new()),
             "run_pre_scan_phase must not overwrite a pre-populated field"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // §5.7 auto-mode soft-fallback tests
+    // -----------------------------------------------------------------------
+
+    /// §5.4 condition: no @wggo_target decorators → Auto demotes to Magnitude.
+    #[test]
+    fn auto_mode_demotes_to_magnitude_when_no_decorators_in_ast() {
+        // Plain model with no @wggo_target decorators.
+        let source =
+            "model NoAttn:\n    weight: Tensor = zeros([4, 4])\n\nfn main():\n    let m = NoAttn()\n";
+        let mut opts = crate::CompileOptions::default();
+        opts.wggo_importance = crate::WggoImportance::Auto;
+        // No calibration_data, no decorators.
+        let (ast, interner) = parse_module(source);
+        let resolved = run_pre_scan_phase(&ast, &interner, opts);
+        assert_eq!(
+            resolved.wggo_importance,
+            crate::WggoImportance::Magnitude,
+            "§5.7: Auto must demote to Magnitude when no @wggo_target decorators are present"
+        );
+    }
+
+    /// §5.6 condition: decorators present + model reachable, but no calibration data
+    /// → Auto demotes to Magnitude.
+    #[test]
+    fn auto_mode_demotes_to_magnitude_when_no_calibration_data() {
+        // Fixture has @wggo_target + a main() that instantiates the decorated model.
+        let source = include_str!("../../../../tests/fixtures/wggo_attention_mlp.nsl");
+        let mut opts = crate::CompileOptions::default();
+        opts.wggo_importance = crate::WggoImportance::Auto;
+        // calibration_data is None (default) — §5.6 fires.
+        let (ast, interner) = parse_module(source);
+        let resolved = run_pre_scan_phase(&ast, &interner, opts);
+        assert_eq!(
+            resolved.wggo_importance,
+            crate::WggoImportance::Magnitude,
+            "§5.7: Auto must demote to Magnitude when calibration data is absent"
+        );
+    }
+
+    /// When wggo_importance is NOT Auto the fallback note must not fire
+    /// (Grad and Magnitude modes are unaffected).
+    #[test]
+    fn non_auto_modes_are_not_demoted_by_fallback_note() {
+        let source =
+            "model NoAttn:\n    weight: Tensor = zeros([4, 4])\n\nfn main():\n    let m = NoAttn()\n";
+        let (ast, interner) = parse_module(source);
+
+        for importance in [crate::WggoImportance::Grad, crate::WggoImportance::Magnitude] {
+            let mut opts = crate::CompileOptions::default();
+            opts.wggo_importance = importance;
+            let resolved = run_pre_scan_phase(&ast, &interner, opts);
+            assert_eq!(
+                resolved.wggo_importance, importance,
+                "§5.7 fallback must not alter non-Auto mode {importance:?}"
+            );
+        }
     }
 }

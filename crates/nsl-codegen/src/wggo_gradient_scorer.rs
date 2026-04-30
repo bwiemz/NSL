@@ -24,8 +24,21 @@ use crate::wggo_weight_analysis::{score_layer_magnitude, WeightProvider};
 /// `MagnitudeFallbackScorer` always returns `Some(...)`.
 /// `CalibratedGradientScorer` returns `Some(...)` from sidecar data when
 /// present, or delegates to its inner `MagnitudeFallbackScorer` otherwise.
+///
+/// `has_gradient_data_for_layer` returns `true` only when the scorer has
+/// *real* gradient data (from a calibration sidecar) for the given key.
+/// This is used for truth-in-logging: a `CalibratedGradientScorer` that
+/// fell back to magnitude for a missing layer returns `false`, preventing
+/// the log from falsely labelling it `gradient (calibrated)`.
 pub trait GradientScorer: std::fmt::Debug + Send + Sync {
     fn score_layer(&self, layer_key: &str, layer_shape: &LayerShape) -> Option<HeadImportance>;
+
+    /// Returns `true` when this scorer has real sidecar-derived gradient data
+    /// for `layer_key` (as opposed to deriving a score from magnitude).
+    /// The default implementation returns `false` (magnitude/null scorers).
+    fn has_gradient_data_for_layer(&self, _layer_key: &str) -> bool {
+        false
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -106,6 +119,13 @@ impl GradientScorer for CalibratedGradientScorer {
         } else {
             self.fallback.score_layer(key, shape)
         }
+    }
+
+    /// Returns `true` only when the sidecar actually contains gradient data
+    /// for this layer key — i.e., the score came from calibration, not from
+    /// the magnitude fallback.
+    fn has_gradient_data_for_layer(&self, layer_key: &str) -> bool {
+        self.sidecar_scores.contains_key(layer_key)
     }
 }
 
