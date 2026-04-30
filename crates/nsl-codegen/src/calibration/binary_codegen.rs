@@ -947,6 +947,11 @@ pub fn emit_calibration_model_object(
     map_codegen_error("collect structs", compiler.collect_structs(&bundle.ast.stmts))?;
     map_codegen_error("collect models", compiler.collect_models(&bundle.ast.stmts))?;
     map_codegen_error("emit retention arena", compiler.emit_retention_arena())?;
+    // Task 10: backward (WGGO grad) sibling arena — spec §7.2 ordering invariant #2.
+    map_codegen_error(
+        "emit grad retention arena",
+        compiler.emit_grad_retention_arena(),
+    )?;
     map_codegen_error("declare runtime functions", compiler.declare_runtime_functions())?;
     map_codegen_error(
         "declare user functions",
