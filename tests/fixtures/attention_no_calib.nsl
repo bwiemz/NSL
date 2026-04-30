@@ -1,0 +1,20 @@
+# §5.6 fixture: @wggo_target decorator present, model IS reachable from main(),
+# but NO calibration data is supplied.  auto-mode pre-scan finds the decorator
+# AND resolves the target (passes §5.4 and §5.5) but §5.6 trigger fires
+# because calibration_data is None → demotes wggo_importance to Magnitude.
+
+model Attention(dim: int):
+    head_dim: int = dim
+    q_proj: Tensor = zeros([dim, dim])
+    k_proj: Tensor = zeros([dim, dim])
+    v_proj: Tensor = zeros([dim, dim])
+    o_proj: Tensor = zeros([dim, dim])
+
+    @wggo_target(w_q=self.q_proj, w_k=self.k_proj, w_v=self.v_proj, w_o=self.o_proj, head_dim=self.head_dim)
+    fn forward(self, x: Tensor) -> Tensor:
+        return x
+
+fn main():
+    let m = Attention(dim=16)
+    let x = zeros([1, 16])
+    let y = m.forward(x)

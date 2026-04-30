@@ -647,7 +647,14 @@ fn lower_single_op(
             );
             return Ok(builder.ins().iconst(cl_types::I64, 0));
         }
-        PrimalOp::Constant(val) => {
+        PrimalOp::Constant(constant_val) => {
+            // If this VarId is already present in var_map (i.e., the caller pre-seeded
+            // it with a real upstream gradient value — e.g., `dy_handle` from the L2
+            // backward wrapper seeded via `loss_seed_var_id`, spec §4.2), use that
+            // value as-is and skip materialising the hardcoded constant.
+            if let Some(&val) = var_map.get(&op.result) {
+                return Ok(val);
+            }
             let ty = var_types
                 .get(&op.result)
                 .copied()
@@ -655,15 +662,15 @@ fn lower_single_op(
             match ty {
                 WengertType::Scalar => {
                     // Raw f64 constant — used as scalar value (e.g., index 0.0 for subscript)
-                    return Ok(builder.ins().f64const(*val));
+                    return Ok(builder.ins().f64const(*constant_val));
                 }
                 WengertType::Integer => {
                     // Raw i64 constant — used as integer (e.g., dimension size)
-                    return Ok(builder.ins().iconst(cl_types::I64, *val as i64));
+                    return Ok(builder.ins().iconst(cl_types::I64, *constant_val as i64));
                 }
                 WengertType::Tensor | WengertType::List => {
                     // Scalar tensor for use in tensor ops (default)
-                    let v = builder.ins().f64const(*val);
+                    let v = builder.ins().f64const(*constant_val);
                     let dt = builder.ins().iconst(cl_types::I64, 1); // f32 default
                     return call(compiler, builder, "nsl_tensor_scalar", &[v, dt]);
                 }

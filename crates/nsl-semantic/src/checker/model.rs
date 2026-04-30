@@ -332,12 +332,89 @@ impl<'a> TypeChecker<'a> {
                                     &mut self.diagnostics,
                                 );
                             }
+                            // WGGO Phase 2 Task 1: `@wggo_target` is only
+                            // valid on the model's `forward` method, never
+                            // on a layer declaration.
+                            if dname == "wggo_target" {
+                                self.diagnostics.push(
+                                    Diagnostic::error(
+                                        "@wggo_target can only be applied to fn declarations"
+                                            .to_string(),
+                                    )
+                                    .with_label(deco.span, "invalid @wggo_target target"),
+                                );
+                            }
                         }
                     }
                 }
-                ModelMember::Method(fn_def, _decos) => {
+                ModelMember::Method(fn_def, decos) => {
                     let method_ty = self.build_fn_type(fn_def);
                     methods.push((fn_def.name, method_ty));
+
+                    // WGGO Phase 2 Task 1: `@wggo_target` placement validation.
+                    // The decorator is only valid on the model's `forward`
+                    // method — the AWQ-calibration backward pass needs to
+                    // observe the canonical forward computation. Mirrors the
+                    // existing `@flash_attention` per-target validation in
+                    // `checker/stmt.rs` for top-level fn declarations.
+                    for deco in decos {
+                        if deco.name.len() != 1 {
+                            continue;
+                        }
+                        let dname = self
+                            .interner
+                            .resolve(deco.name[0].0)
+                            .unwrap_or("")
+                            .to_string();
+                        if dname == "wggo_target" {
+                            let fn_name = self
+                                .interner
+                                .resolve(fn_def.name.0)
+                                .unwrap_or("?")
+                                .to_string();
+                            if fn_name != "forward" {
+                                self.diagnostics.push(
+                                    Diagnostic::error(format!(
+                                        "@wggo_target must be on the model's 'forward' method; found on '{fn_name}'"
+                                    ))
+                                    .with_label(deco.span, "invalid @wggo_target target"),
+                                );
+                            }
+                            // WGGO Phase 2 Task 2: required-args check.
+                            // Even when placement is wrong (non-`forward`)
+                            // we still report the missing-args error so
+                            // users see all the issues in one pass rather
+                            // than fixing the name and re-running to
+                            // discover the args were missing too.
+                            let resolve = |s: nsl_ast::Symbol| -> String {
+                                self.interner.resolve(s.0).unwrap_or("").to_string()
+                            };
+                            crate::wggo::validate_wggo_target_required_args(
+                                deco,
+                                &resolve,
+                                &mut self.diagnostics,
+                            );
+                            // WGGO Phase 2 Task 3: each required arg's
+                            // value must be a `self.<field>` reference.
+                            crate::wggo::validate_wggo_target_self_field_args(
+                                deco,
+                                &resolve,
+                                &mut self.diagnostics,
+                            );
+                            // WGGO Phase 2 Task 4: each `self.<field>`
+                            // arg must reference an existing field of
+                            // the enclosing model with the right type
+                            // (Tensor for w_q/w_k/w_v/w_o; int for
+                            // head_dim). Args that didn't pass Task 3
+                            // are silently skipped inside the helper.
+                            crate::wggo::validate_wggo_target_field_types(
+                                deco,
+                                model_def,
+                                &resolve,
+                                &mut self.diagnostics,
+                            );
+                        }
+                    }
                 }
             }
         }

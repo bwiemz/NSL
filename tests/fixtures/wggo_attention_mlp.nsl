@@ -1,0 +1,15 @@
+# Phase 4 placeholder; Phase 11 Task 26 replaces with full attention+MLP coverage.
+
+model TinyAttn(dim: int, heads: int):
+    q_proj: Tensor = zeros([dim, dim])
+    k_proj: Tensor = zeros([dim, dim])
+    v_proj: Tensor = zeros([dim, dim])
+    o_proj: Tensor = zeros([dim, dim])
+    head_dim: int = dim // heads
+
+    @wggo_target(w_q=self.q_proj, w_k=self.k_proj, w_v=self.v_proj, w_o=self.o_proj, head_dim=self.head_dim)
+    fn forward(self, x: Tensor) -> Tensor:
+        return x
+
+fn main():
+    let m = TinyAttn(dim=64, heads=4)

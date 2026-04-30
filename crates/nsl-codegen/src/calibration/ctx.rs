@@ -8,12 +8,20 @@
 use std::collections::BTreeMap;
 
 use crate::calibration::observation::ProjectionRef;
-use crate::calibration::retention::RetentionTable;
+use crate::calibration::retention::{GradArenaLayout, RetentionTable};
 
 /// Opaque handle returned by `alloc_running_vec`; hooks store these
 /// in their `self` fields to reference buffers across `emit_*` calls.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct BufferHandle(u32);
+
+/// Descriptor for a BSS global declared by a hook's `emit_init`.
+/// Returned by [`CalibCtx::lookup_bss_global`] in test/stub mode.
+#[derive(Debug, Clone)]
+pub struct BssGlobalEntry {
+    pub name: String,
+    pub size_bytes: u32,
+}
 
 #[derive(Debug)]
 pub struct CalibCtx<'a> {
@@ -27,6 +35,28 @@ pub struct CalibCtx<'a> {
     /// Populated by `stub_set_arena_buffer`; consumed by
     /// `emit_per_channel_max_abs_update` in stub mode.
     stub_arena_data: BTreeMap<String, Vec<f32>>,
+    /// BSS globals declared by hook `emit_init` calls (stub + production).
+    /// Keyed by symbol name; value is size in bytes.
+    bss_globals: BTreeMap<String, u32>,
+    /// Task 21: grad arena layout for WGGO per-step iteration (test-only instrumentation).
+    /// In production this is `None`; tests use `stub_for_tests_with_grad_layout` to
+    /// inject a layout and verify that `emit_per_step` iterates the correct projections.
+    grad_arena_layout: Option<GradArenaLayout>,
+    /// Task 21: counter incremented by `record_per_head_dot_call()`.
+    /// Zero in production; tests use `per_head_dot_call_count()` to verify
+    /// `emit_per_step` would call `emit_per_head_dot_abs_accum` the right number of times.
+    per_head_dot_call_count: u32,
+    /// Task 21: counter incremented by `record_layout_map_build()`.
+    /// Verifies that the layout HashMap is built once (outside the per-target loop).
+    layout_map_build_count: u32,
+    /// Task 22: running buffers for WGGO f64 accumulators (test-only, keyed by symbol).
+    /// In production this map is always empty — the real read path for BSS accumulators
+    /// comes from the calibration subprocess binary's output (wired by Task 23's
+    /// sidecar-field-flip). Tests use `set_running_buffer_f64` to inject fake values
+    /// so that `emit_finalize` can be exercised without a live subprocess.
+    running_buffers_f64: BTreeMap<String, Vec<f64>>,
+    /// Task 22: number of calibration batches processed (test-only).
+    batches_processed: u32,
 }
 
 impl<'a> CalibCtx<'a> {
@@ -41,6 +71,12 @@ impl<'a> CalibCtx<'a> {
             running_names: BTreeMap::new(),
             next_handle: 0,
             stub_arena_data: BTreeMap::new(),
+            bss_globals: BTreeMap::new(),
+            grad_arena_layout: None,
+            per_head_dot_call_count: 0,
+            layout_map_build_count: 0,
+            running_buffers_f64: BTreeMap::new(),
+            batches_processed: 0,
         }
     }
 
@@ -58,6 +94,55 @@ impl<'a> CalibCtx<'a> {
             running_names: BTreeMap::new(),
             next_handle: 0,
             stub_arena_data: BTreeMap::new(),
+            bss_globals: BTreeMap::new(),
+            grad_arena_layout: None,
+            per_head_dot_call_count: 0,
+            layout_map_build_count: 0,
+            running_buffers_f64: BTreeMap::new(),
+            batches_processed: 0,
+        }
+    }
+
+    /// Task 21: Construct a stub context pre-loaded with a `GradArenaLayout` for
+    /// testing `WggoGradientHook::emit_per_step`.
+    ///
+    /// `entries` is a slice of `(projection_name, byte_offset, byte_size)` triples
+    /// that mirrors the production `GradArenaLayout` built by `build_grad_arena_layout`.
+    ///
+    /// Use `per_head_dot_call_count()` and `layout_map_build_count()` after calling
+    /// `emit_per_step` to verify the hook iterated correctly.
+    pub fn stub_for_tests_with_grad_layout(
+        entries: &[(&str, u32, u32)],
+    ) -> Self {
+        use crate::calibration::retention::GradArenaLayout;
+        let layout_entries = entries
+            .iter()
+            .map(|(name, offset, size)| (ProjectionRef(name.to_string()), *offset, *size))
+            .collect();
+        let total_bytes = entries
+            .iter()
+            .map(|(_, off, sz)| off + sz)
+            .max()
+            .unwrap_or(0);
+        static EMPTY: std::sync::OnceLock<RetentionTable> = std::sync::OnceLock::new();
+        let retention = EMPTY.get_or_init(RetentionTable::new);
+        Self {
+            sample_idx: 0,
+            total_samples: 0,
+            retention,
+            running_buffers: BTreeMap::new(),
+            running_names: BTreeMap::new(),
+            next_handle: 0,
+            stub_arena_data: BTreeMap::new(),
+            bss_globals: BTreeMap::new(),
+            grad_arena_layout: Some(GradArenaLayout {
+                entries: layout_entries,
+                total_bytes,
+            }),
+            per_head_dot_call_count: 0,
+            layout_map_build_count: 0,
+            running_buffers_f64: BTreeMap::new(),
+            batches_processed: 0,
         }
     }
 
@@ -140,6 +225,150 @@ impl<'a> CalibCtx<'a> {
             None => return Vec::new(),
         };
         self.running_buffers.get(&h).cloned().unwrap_or_default()
+    }
+
+    // ---- BSS-global declaration (emit_init path) ----------------------------
+
+    /// Records a BSS global declaration for the calibration codegen pipeline.
+    ///
+    /// Used by both `WggoGradientHook::emit_init` (production) and tests
+    /// (`stub_for_tests` + `lookup_bss_global` to verify what was declared).
+    ///
+    /// On the real Cranelift IR path (Task 12+) this will emit a
+    /// zero-initialised data section of the requested size.  In stub / test
+    /// mode it records the declaration into an in-memory map so tests can
+    /// verify correct size via [`lookup_bss_global`].
+    ///
+    /// **Caller contract:** each `(CalibCtx, symbol)` pair must be declared at
+    /// most once.  Hooks that may run their `emit_init` more than once per
+    /// `CalibCtx` (e.g., a registry that re-binds an existing context) must
+    /// guard their own state.  Mirrors the `alloc_running_vec` precedent.
+    ///
+    /// # Panics
+    /// Panics if `symbol` was already declared in this `CalibCtx`.
+    pub fn declare_bss_global(&mut self, symbol: &str, size_bytes: u32) {
+        if self.bss_globals.contains_key(symbol) {
+            panic!("duplicate BSS global declaration: {symbol}");
+        }
+        self.bss_globals.insert(symbol.to_string(), size_bytes);
+    }
+
+    /// Test helper: look up a BSS global by symbol name.
+    ///
+    /// Returns `Some(BssGlobalEntry)` when the symbol was previously declared
+    /// via [`declare_bss_global`], or `None` if it was never declared.
+    pub fn lookup_bss_global(&self, symbol: &str) -> Option<BssGlobalEntry> {
+        self.bss_globals.get(symbol).map(|&size_bytes| BssGlobalEntry {
+            name: symbol.to_string(),
+            size_bytes,
+        })
+    }
+
+    // ---- Task 21: grad-arena layout + per-step instrumentation ---------------
+
+    /// Return the grad arena layout injected via `stub_for_tests_with_grad_layout`,
+    /// or `None` if this context has no layout (production or plain stub).
+    pub fn grad_arena_layout(&self) -> Option<&GradArenaLayout> {
+        self.grad_arena_layout.as_ref()
+    }
+
+    /// Record that `emit_per_step` would call `emit_per_head_dot_abs_accum`
+    /// for one (target, projection) pair.
+    ///
+    /// In production this is a no-op; in tests it increments a counter that
+    /// can be read back via `per_head_dot_call_count()`.
+    #[inline]
+    pub fn record_per_head_dot_call(&mut self) {
+        self.per_head_dot_call_count = self.per_head_dot_call_count.saturating_add(1);
+    }
+
+    /// Record that the hook built the grad-arena layout map.
+    ///
+    /// Spec §4.6: the HashMap must be built once (outside the per-target loop).
+    /// In tests, `layout_map_build_count()` should equal 1 after a single
+    /// `emit_per_step` call regardless of target count.
+    #[inline]
+    pub fn record_layout_map_build(&mut self) {
+        self.layout_map_build_count = self.layout_map_build_count.saturating_add(1);
+    }
+
+    /// Return the number of `emit_per_head_dot_abs_accum` calls recorded so far.
+    /// Only meaningful after calling `hook.emit_per_step(ctx)` with a
+    /// `stub_for_tests_with_grad_layout` context.
+    pub fn per_head_dot_call_count(&self) -> u32 {
+        self.per_head_dot_call_count
+    }
+
+    /// Return the number of layout map builds recorded so far.
+    pub fn layout_map_build_count(&self) -> u32 {
+        self.layout_map_build_count
+    }
+
+    // ---- Task 22: f64 running-buffer accessors (test-only + production readback) --
+
+    /// Store a named f64 running buffer (used by tests to simulate the BSS
+    /// accumulator state that the calibration binary would write during the
+    /// backward pass).
+    ///
+    /// **Test-only.** Production code never calls this — in production the
+    /// `running_buffers_f64` map stays empty and Task 23's BSS readback
+    /// populates the per-head scores via a different code path.
+    #[cfg(test)]
+    pub fn set_running_buffer_f64(&mut self, symbol: &str, values: &[f64]) {
+        self.running_buffers_f64.insert(symbol.to_string(), values.to_vec());
+    }
+
+    /// Read back a named f64 running buffer and cast each element to f32.
+    ///
+    /// Returns up to `n_heads` values.  If the stored buffer is shorter than
+    /// `n_heads` the result is zero-padded.
+    ///
+    /// **Production note:** in production the `running_buffers_f64` map is
+    /// always empty (it is only populated by the test-only
+    /// `set_running_buffer_f64` setter).  Task 23 must replace this call site
+    /// with the real BSS readback from the calibration subprocess output
+    /// before this hook is reachable in production.  Until then, calling this
+    /// method outside tests on an empty map will trigger a `debug_assert`
+    /// in debug/test builds — making the gap visible before it silently
+    /// produces all-zero scores.
+    pub fn read_running_buffer_f64_as_f32(&self, symbol: &str, n_heads: usize) -> Vec<f32> {
+        match self.running_buffers_f64.get(symbol) {
+            Some(src) => {
+                let mut out = vec![0.0f32; n_heads];
+                for (i, v) in src.iter().take(n_heads).enumerate() {
+                    out[i] = *v as f32;
+                }
+                out
+            }
+            None => {
+                // In test mode `set_running_buffer_f64` populates this map.
+                // In production (calibration subprocess path) the BSS readback
+                // is wired by Task 23's sidecar-field-flip work.  If this fires
+                // in a production build it means Task 23 is incomplete and the
+                // WGGO scores will silently be all-zero (all heads ranked equal).
+                debug_assert!(
+                    cfg!(test),
+                    "CalibCtx::read_running_buffer_f64_as_f32 called outside tests \
+                     with empty buffer for symbol '{symbol}'. Task 23 must wire \
+                     the production BSS readback before this is reachable in production."
+                );
+                vec![0.0_f32; n_heads]
+            }
+        }
+    }
+
+    /// Record the number of calibration batches processed (test-only; in
+    /// production this comes from the calibration binary's counter global).
+    ///
+    /// **Test-only.** Production code never calls this.
+    #[cfg(test)]
+    pub fn set_batches_processed(&mut self, n: u32) {
+        self.batches_processed = n;
+    }
+
+    /// Return the number of calibration batches processed.
+    pub fn batches_processed(&self) -> u32 {
+        self.batches_processed
     }
 
     /// Emit a per-input-channel max-abs reduction over a 2-D slice of the

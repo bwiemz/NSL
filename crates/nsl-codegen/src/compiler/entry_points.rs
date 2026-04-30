@@ -245,24 +245,195 @@ fn load_and_register_weights_if_needed(
     Ok(())
 }
 
+/// Run both AWQ and WGGO pre-scan discovery passes against the AST and
+/// populate `opts` fields that are still `None`.  This is the test-facing
+/// seam: all compiler entry points delegate to
+/// [`populate_calibration_retention_from_ast_if_unset`] which calls this
+/// helper internally.
+///
+/// Idempotent: if a field is already `Some`, it is left unchanged.
+///
+/// §5.7: when `opts.wggo_importance == WggoImportance::Auto` and any of the
+/// §5.4/§5.5/§5.6 conditions are met, an informational note is emitted to
+/// stderr and `opts.wggo_importance` is demoted to `WggoImportance::Magnitude`.
+pub(crate) fn run_pre_scan_phase(
+    ast: &nsl_ast::Module,
+    interner: &Interner,
+    mut opts: crate::CompileOptions,
+) -> crate::CompileOptions {
+    if opts.calibration_retention.is_none() {
+        let discovered_awq = crate::calibration::pre_scan_awq_projections_from_ast(ast, interner);
+        if !discovered_awq.is_empty() {
+            opts.calibration_retention = Some(discovered_awq);
+        }
+    }
+    if opts.calibration_grad_retention.is_none() {
+        let discovered_wggo =
+            crate::calibration::discovery::pre_scan_wggo_targets_from_ast(ast, interner);
+        if !discovered_wggo.is_empty() {
+            opts.calibration_grad_retention = Some(discovered_wggo);
+        }
+    }
+
+    // §5.7: --wggo-importance=auto soft-fallback to magnitude.
+    // When auto mode encounters any of the §5.4/§5.5/§5.6 conditions, emit
+    // an informational note and demote the mode to magnitude.
+    apply_auto_mode_fallback_note(ast, interner, &mut opts);
+
+    opts
+}
+
+/// §5.7 soft-fallback for `WggoImportance::Auto`.
+///
+/// If `opts.wggo_importance == Auto` and any of the §5.4/§5.5/§5.6
+/// conditions are met, this function:
+///   1. Emits a single informational note to stderr.
+///   2. Demotes `opts.wggo_importance` to `WggoImportance::Magnitude`.
+///
+/// This is the parallel to [`enforce_grad_mode_refusals`] — same three
+/// conditions, but soft (note + demotion) rather than hard (error).
+///
+/// Must be called **after** `calibration_grad_retention` has been populated
+/// by discovery (see [`run_pre_scan_phase`]).
+fn apply_auto_mode_fallback_note(
+    ast: &nsl_ast::Module,
+    interner: &Interner,
+    opts: &mut crate::CompileOptions,
+) {
+    use crate::WggoImportance;
+
+    if opts.wggo_importance != WggoImportance::Auto {
+        return;
+    }
+
+    let calibration_data_present = opts.calibration_data.is_some();
+    let decorators_in_ast =
+        crate::calibration::discovery::ast_has_wggo_target_decorators(ast, interner);
+    let resolved_targets = opts.calibration_grad_retention.as_deref().unwrap_or(&[]);
+
+    // §5.4: no @wggo_target decorators in source.
+    // §5.5: decorators present but none reachable from entry point.
+    // §5.6: decorators reachable but no calibration data provided.
+    let trigger_reason: Option<String> = if !decorators_in_ast {
+        Some("no @wggo_target decorators in source".to_string())
+    } else if resolved_targets.is_empty() {
+        let decorated =
+            crate::calibration::discovery::list_decorated_class_names(ast, interner);
+        let entry = crate::calibration::discovery::entry_point_fn_name(ast, interner)
+            .unwrap_or_else(|| "(unknown)".to_string());
+        Some(format!(
+            "decorated classes {decorated:?} not reachable from entry `{entry}`"
+        ))
+    } else if !calibration_data_present {
+        Some("decorators present but no calibration data provided".to_string())
+    } else {
+        None
+    };
+
+    if let Some(reason) = trigger_reason {
+        eprintln!(
+            "note: --wggo-importance=auto fell back to magnitude scoring.\n  \
+             reason: {reason}\n  \
+             effect: WGGO ILP runs against magnitude (||W||₂)-based importance scores.\n  \
+             to silence: add @wggo_target + calibration data, OR set\n             \
+             --wggo-importance=magnitude to opt out of grad scoring entirely."
+        );
+        opts.wggo_importance = WggoImportance::Magnitude;
+    }
+}
+
+/// §5.4-§5.6 refusal checks for grad-mode WGGO.
+///
+/// Only fires when `opts.wggo_importance == WggoImportance::Grad`.  In `Auto`
+/// or `Magnitude` modes the user never asked for gradient scoring, so there is
+/// nothing to refuse.
+///
+/// Must be called **after** `run_pre_scan_phase` has already populated
+/// `calibration_grad_retention` (or left it `None` when no reachable target
+/// was found) so the checks below see the post-discovery state.
+fn enforce_grad_mode_refusals(
+    ast: &nsl_ast::Module,
+    interner: &Interner,
+    opts: &crate::CompileOptions,
+) -> Result<(), CodegenError> {
+    use crate::WggoImportance;
+
+    if opts.wggo_importance != WggoImportance::Grad {
+        return Ok(());
+    }
+
+    let decorators_in_ast =
+        crate::calibration::discovery::ast_has_wggo_target_decorators(ast, interner);
+    let resolved_targets = opts.calibration_grad_retention.as_deref().unwrap_or(&[]);
+    let calibration_data_present = opts.calibration_data.is_some();
+
+    // §5.4: grad mode requested but the source has no @wggo_target decorators at all.
+    if !decorators_in_ast {
+        return Err(CodegenError::new(
+            "calibration: --wggo-importance=grad set but no @wggo_target decorators in source.\n\
+  requested: gradient-importance scoring on the compiled model\n\
+  expected:  ≥1 @wggo_target decorator on a model's `forward` method\n\
+  found:     zero @wggo_target decorators in the AST\n\
+  fix:       either add @wggo_target(...) to your attention block's\n\
+             `forward` method, or use --wggo-importance=magnitude."
+                .to_string(),
+        ));
+    }
+
+    // §5.5: decorators present in source but none is reachable from the entry point.
+    if resolved_targets.is_empty() {
+        let decorated = crate::calibration::discovery::list_decorated_class_names(ast, interner);
+        let entry_fn = crate::calibration::discovery::entry_point_fn_name(ast, interner)
+            .unwrap_or_else(|| "(unknown)".to_string());
+        let n = decorated.len();
+        return Err(CodegenError::new(format!(
+            "calibration: --wggo-importance=grad set but no decorated model is reachable.\n\
+  requested: gradient-importance scoring on the compiled model\n\
+  expected:  ≥1 @wggo_target-decorated model reachable from the entry point\n\
+  found:     {n} decorator(s) in AST; 0 reachable\n\
+             decorated classes: {decorated:?}\n\
+             entry function:    {entry_fn}\n\
+  fix:       either compile a model that uses one of the decorated classes,\n\
+             or move the decorator to the class your entry point uses."
+        )));
+    }
+
+    // §5.6: decorators present and model reachable, but no calibration data provided.
+    if !calibration_data_present {
+        let n = resolved_targets.len();
+        return Err(CodegenError::new(format!(
+            "calibration: --wggo-importance=grad requires calibration data, but none was provided.\n\
+  requested: gradient-importance scoring with @wggo_target-decorated attention\n\
+  expected:  a calibration data file via `quant awq {{ calibration_data = \"...\" }}`\n\
+  found:     {n} @wggo_target target(s) discovered, model instantiated, but\n\
+             no calibration data was provided.\n\
+  fix:       add a `quant awq {{ calibration_data = \"path/to/data.safetensors\" }}`\n\
+             block. If you don't have calibration data,\n\
+             use --wggo-importance=magnitude."
+        )));
+    }
+
+    Ok(())
+}
+
 fn populate_calibration_retention_from_ast_if_unset(
     compiler: &mut Compiler<'_>,
     ast: &nsl_ast::Module,
     interner: &Interner,
 ) -> Result<(), CodegenError> {
-    if compiler.compile_options.calibration_retention.is_some() {
-        return Ok(());
-    }
+    // Delegate to the shared helper for pure-discovery work.
+    let updated = run_pre_scan_phase(ast, interner, compiler.compile_options.clone());
+    compiler.compile_options.calibration_retention = updated.calibration_retention;
+    compiler.compile_options.calibration_grad_retention = updated.calibration_grad_retention;
 
-    let discovered = crate::calibration::pre_scan_awq_projections_from_ast(ast, interner);
-    if !discovered.is_empty() {
-        compiler.compile_options.calibration_retention = Some(discovered);
-        return Ok(());
-    }
-
-    if crate::calibration::discovery::ast_has_awq_quantize_decorator(ast, interner) {
-        let model_name = crate::calibration::discovery::first_awq_quantized_model_name(ast, interner)
-            .unwrap_or_else(|| "<unknown>".into());
+    // AWQ-specific error: if an @quantize decorator is present but discovery
+    // returned nothing, that is a user error we must surface.
+    if compiler.compile_options.calibration_retention.is_none()
+        && crate::calibration::discovery::ast_has_awq_quantize_decorator(ast, interner)
+    {
+        let model_name =
+            crate::calibration::discovery::first_awq_quantized_model_name(ast, interner)
+                .unwrap_or_else(|| "<unknown>".into());
         return Err(CodegenError::new(format!(
             "calibration: @quantize model declared but no AWQ projections discovered.\n\
  requested:  auto-discover AWQ projections for model '{model_name}'\n\
@@ -271,6 +442,9 @@ fn populate_calibration_retention_from_ast_if_unset(
  Action:     either remove the @quantize decorator, or add the Linear/tensor projections the decorator is meant to target."
         )));
     }
+
+    // §5.4-§5.6: grad-mode WGGO refusals.
+    enforce_grad_mode_refusals(ast, interner, &compiler.compile_options)?;
 
     Ok(())
 }
@@ -315,6 +489,8 @@ pub fn compile_returning_splice_count_for_tests(
     compiler.collect_agents(&ast.stmts)?;
     populate_calibration_retention_from_ast_if_unset(&mut compiler, ast, interner)?;
     compiler.emit_retention_arena()?;
+    // Task 10: backward (WGGO grad) sibling arena — spec §7.2 ordering invariant #2.
+    compiler.emit_grad_retention_arena()?;
     compiler.declare_runtime_functions()?;
     compiler.declare_user_functions(&ast.stmts)?;
     // M56 Task 17: declare agent method FuncIds (Linkage::Local mirrors non-export modules).
@@ -382,6 +558,8 @@ pub fn compile_returning_plan(
     // silently no-op.  No-op when `calibration_retention` is `None`, so
     // shipped binaries are unaffected.
     compiler.emit_retention_arena()?;
+    // Task 10: backward (WGGO grad) sibling arena — spec §7.2 ordering invariant #2.
+    compiler.emit_grad_retention_arena()?;
     compiler.declare_runtime_functions()?;
     compiler.declare_user_functions(&ast.stmts)?;
     // M56 Task 17: declare agent method FuncIds.
@@ -556,6 +734,8 @@ fn compile_with_zk_info_best_effort_plan(
         // Task 4: declare the calibration retention arena BEFORE method-body
         // codegen — see `compile_returning_plan` for the full rationale.
         compiler.emit_retention_arena()?;
+        // Task 10: backward (WGGO grad) sibling arena — spec §7.2 ordering invariant #2.
+        compiler.emit_grad_retention_arena()?;
         compiler.declare_runtime_functions()?;
         compiler.declare_user_functions(&ast.stmts)?;
         // M56 Task 17: declare agent method FuncIds.
@@ -730,6 +910,8 @@ fn compile_standalone_best_effort_plan(
         // Task 4: declare the calibration retention arena BEFORE method-body
         // codegen — see `compile_returning_plan` for the full rationale.
         compiler.emit_retention_arena()?;
+        // Task 10: backward (WGGO grad) sibling arena — spec §7.2 ordering invariant #2.
+        compiler.emit_grad_retention_arena()?;
         compiler.declare_runtime_functions()?;
         compiler.declare_user_functions(&ast.stmts)?;
         // M56 Task 17: declare agent method FuncIds.
@@ -791,6 +973,8 @@ pub fn compile_test(
     // pipe site would otherwise no-op the splice if the caller set
     // `calibration_retention` on CompileOptions.
     compiler.emit_retention_arena()?;
+    // Task 10: backward (WGGO grad) sibling arena — spec §7.2 ordering invariant #2.
+    compiler.emit_grad_retention_arena()?;
     compiler.declare_runtime_functions()?;
     compiler.declare_user_functions(&ast.stmts)?;
     // M56 Task 17: declare agent method FuncIds.
@@ -950,6 +1134,8 @@ pub fn compile_module_with_imports_best_effort_plan(
         // Task 4: declare the calibration retention arena BEFORE method-body
         // codegen — see `compile_returning_plan` for the full rationale.
         compiler.emit_retention_arena()?;
+        // Task 10: backward (WGGO grad) sibling arena — spec §7.2 ordering invariant #2.
+        compiler.emit_grad_retention_arena()?;
         compiler.declare_runtime_functions()?;
         compiler.declare_imported_functions(imported_fns)?;
         compiler.declare_user_functions_with_linkage(&ast.stmts, Linkage::Export)?;
@@ -1099,6 +1285,8 @@ pub fn compile_entry_returning_plan(
     // Task 4: declare the calibration retention arena BEFORE method-body
     // codegen — see `compile_returning_plan` for the full rationale.
     compiler.emit_retention_arena()?;
+    // Task 10: backward (WGGO grad) sibling arena — spec §7.2 ordering invariant #2.
+    compiler.emit_grad_retention_arena()?;
     compiler.declare_runtime_functions()?;
     compiler.declare_imported_functions(imported_fns)?;
     compiler.declare_user_functions_with_linkage(&ast.stmts, Linkage::Export)?;
@@ -1144,4 +1332,124 @@ pub fn compile_entry_returning_plan(
     write_manifest_if_needed(&mut compiler, options);
     let bytes = compiler.finalize()?;
     Ok((bytes, plan))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nsl_lexer::Interner;
+
+    fn parse_module(source: &str) -> (nsl_ast::Module, Interner) {
+        let mut interner = Interner::new();
+        let (tokens, lex_diags) =
+            nsl_lexer::tokenize(source, nsl_errors::FileId(0), &mut interner);
+        assert!(
+            lex_diags
+                .iter()
+                .all(|d| !matches!(d.level, nsl_errors::Level::Error)),
+            "fixture must lex cleanly: {lex_diags:?}"
+        );
+        let parsed = nsl_parser::parse(&tokens, &mut interner);
+        assert!(
+            parsed
+                .diagnostics
+                .iter()
+                .all(|d| !matches!(d.level, nsl_errors::Level::Error)),
+            "fixture must parse cleanly: {:?}",
+            parsed.diagnostics
+        );
+        (parsed.module, interner)
+    }
+
+    #[test]
+    fn entry_point_populates_calibration_grad_retention_from_ast() {
+        let source = include_str!("../../../../tests/fixtures/wggo_attention_mlp.nsl");
+        let opts = crate::CompileOptions::default();
+        let (ast, interner) = parse_module(source);
+        let resolved_opts = run_pre_scan_phase(&ast, &interner, opts);
+        let targets = resolved_opts
+            .calibration_grad_retention
+            .expect("@wggo_target decorators should populate calibration_grad_retention");
+        assert!(
+            !targets.is_empty(),
+            "@wggo_target decorators should populate the field"
+        );
+        assert_eq!(targets[0].class_name, "TinyAttn");
+        assert_eq!(targets[0].layer_key, "m");
+    }
+
+    #[test]
+    fn run_pre_scan_phase_does_not_overwrite_existing_grad_retention() {
+        let source = include_str!("../../../../tests/fixtures/wggo_attention_mlp.nsl");
+        let (ast, interner) = parse_module(source);
+        // Pre-populate with a sentinel empty vec to verify idempotency.
+        let mut opts = crate::CompileOptions::default();
+        opts.calibration_grad_retention = Some(Vec::new());
+        let resolved_opts = run_pre_scan_phase(&ast, &interner, opts);
+        // Must remain the caller-supplied empty vec, not the discovered targets.
+        assert_eq!(
+            resolved_opts.calibration_grad_retention,
+            Some(Vec::new()),
+            "run_pre_scan_phase must not overwrite a pre-populated field"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // §5.7 auto-mode soft-fallback tests
+    // -----------------------------------------------------------------------
+
+    /// §5.4 condition: no @wggo_target decorators → Auto demotes to Magnitude.
+    #[test]
+    fn auto_mode_demotes_to_magnitude_when_no_decorators_in_ast() {
+        // Plain model with no @wggo_target decorators.
+        let source =
+            "model NoAttn:\n    weight: Tensor = zeros([4, 4])\n\nfn main():\n    let m = NoAttn()\n";
+        let mut opts = crate::CompileOptions::default();
+        opts.wggo_importance = crate::WggoImportance::Auto;
+        // No calibration_data, no decorators.
+        let (ast, interner) = parse_module(source);
+        let resolved = run_pre_scan_phase(&ast, &interner, opts);
+        assert_eq!(
+            resolved.wggo_importance,
+            crate::WggoImportance::Magnitude,
+            "§5.7: Auto must demote to Magnitude when no @wggo_target decorators are present"
+        );
+    }
+
+    /// §5.6 condition: decorators present + model reachable, but no calibration data
+    /// → Auto demotes to Magnitude.
+    #[test]
+    fn auto_mode_demotes_to_magnitude_when_no_calibration_data() {
+        // Fixture has @wggo_target + a main() that instantiates the decorated model.
+        let source = include_str!("../../../../tests/fixtures/wggo_attention_mlp.nsl");
+        let mut opts = crate::CompileOptions::default();
+        opts.wggo_importance = crate::WggoImportance::Auto;
+        // calibration_data is None (default) — §5.6 fires.
+        let (ast, interner) = parse_module(source);
+        let resolved = run_pre_scan_phase(&ast, &interner, opts);
+        assert_eq!(
+            resolved.wggo_importance,
+            crate::WggoImportance::Magnitude,
+            "§5.7: Auto must demote to Magnitude when calibration data is absent"
+        );
+    }
+
+    /// When wggo_importance is NOT Auto the fallback note must not fire
+    /// (Grad and Magnitude modes are unaffected).
+    #[test]
+    fn non_auto_modes_are_not_demoted_by_fallback_note() {
+        let source =
+            "model NoAttn:\n    weight: Tensor = zeros([4, 4])\n\nfn main():\n    let m = NoAttn()\n";
+        let (ast, interner) = parse_module(source);
+
+        for importance in [crate::WggoImportance::Grad, crate::WggoImportance::Magnitude] {
+            let mut opts = crate::CompileOptions::default();
+            opts.wggo_importance = importance;
+            let resolved = run_pre_scan_phase(&ast, &interner, opts);
+            assert_eq!(
+                resolved.wggo_importance, importance,
+                "§5.7 fallback must not alter non-Auto mode {importance:?}"
+            );
+        }
+    }
 }

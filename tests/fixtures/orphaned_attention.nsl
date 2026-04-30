@@ -1,0 +1,24 @@
+# §5.5 fixture: @wggo_target decorator on Attention, but main() instantiates a
+# different model.  Pre-scan must find the decorator yet end up with empty
+# `calibration_grad_retention` because the decorated class is never
+# instantiated reachably from main.
+
+model Attention(dim: int):
+    q_proj: Tensor = zeros([dim, dim])
+    k_proj: Tensor = zeros([dim, dim])
+    v_proj: Tensor = zeros([dim, dim])
+    o_proj: Tensor = zeros([dim, dim])
+    head_dim: int = dim // 8
+
+    @wggo_target(w_q=self.q_proj, w_k=self.k_proj, w_v=self.v_proj, w_o=self.o_proj, head_dim=self.head_dim)
+    fn forward(self, x: Tensor) -> Tensor:
+        return x
+
+model OtherModel(dim: int):
+    weight: Tensor = zeros([dim, dim])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x
+
+fn main():
+    let m = OtherModel(dim=4)

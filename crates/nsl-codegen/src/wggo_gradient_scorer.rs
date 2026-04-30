@@ -24,8 +24,21 @@ use crate::wggo_weight_analysis::{score_layer_magnitude, WeightProvider};
 /// `MagnitudeFallbackScorer` always returns `Some(...)`.
 /// `CalibratedGradientScorer` returns `Some(...)` from sidecar data when
 /// present, or delegates to its inner `MagnitudeFallbackScorer` otherwise.
+///
+/// `has_gradient_data_for_layer` returns `true` only when the scorer has
+/// *real* gradient data (from a calibration sidecar) for the given key.
+/// This is used for truth-in-logging: a `CalibratedGradientScorer` that
+/// fell back to magnitude for a missing layer returns `false`, preventing
+/// the log from falsely labelling it `gradient (calibrated)`.
 pub trait GradientScorer: std::fmt::Debug + Send + Sync {
     fn score_layer(&self, layer_key: &str, layer_shape: &LayerShape) -> Option<HeadImportance>;
+
+    /// Returns `true` when this scorer has real sidecar-derived gradient data
+    /// for `layer_key` (as opposed to deriving a score from magnitude).
+    /// The default implementation returns `false` (magnitude/null scorers).
+    fn has_gradient_data_for_layer(&self, _layer_key: &str) -> bool {
+        false
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -106,6 +119,13 @@ impl GradientScorer for CalibratedGradientScorer {
         } else {
             self.fallback.score_layer(key, shape)
         }
+    }
+
+    /// Returns `true` only when the sidecar actually contains gradient data
+    /// for this layer key — i.e., the score came from calibration, not from
+    /// the magnitude fallback.
+    fn has_gradient_data_for_layer(&self, layer_key: &str) -> bool {
+        self.sidecar_scores.contains_key(layer_key)
     }
 }
 
@@ -334,5 +354,108 @@ mod tests {
         .unwrap();
         let hit = s.score_layer("x", &fixture_shape()).unwrap();
         assert_eq!(hit.per_head, vec![1.0]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 30: CalibratedGradientScorer reads populated wggo_head_gradients
+    // -----------------------------------------------------------------------
+
+    fn sidecar_with_wggo_grads(layers: &[(&str, Vec<f32>)]) -> Sidecar {
+        let mut by_layer = BTreeMap::new();
+        for (name, scores) in layers {
+            by_layer.insert(
+                name.to_string(),
+                PerLayerGradient {
+                    per_head_score: scores.clone(),
+                    batches_observed: 10,
+                },
+            );
+        }
+        Sidecar {
+            version: crate::calibration::sidecar::SIDECAR_VERSION,
+            checkpoint_sha256: String::new(),
+            calibration_data_sha256: String::new(),
+            hook_set_sha256: String::new(),
+            cache_key_digest: String::new(),
+            num_samples_used: 10,
+            hooks: BTreeMap::new(),
+            wggo_head_gradients: Some(WggoHeadGradients { by_layer }),
+        }
+    }
+
+    #[test]
+    fn calibrated_scorer_uses_real_grads_when_present() {
+        // Task 30: build_scorer must extract wggo_head_gradients → CalibratedGradientScorer
+        // returns the exact per-head scores, not magnitude-derived values.
+        let sidecar = sidecar_with_wggo_grads(&[
+            ("layers.0", vec![1.0, 2.0, 3.0, 4.0]),
+            ("layers.1", vec![10.0, 20.0, 30.0, 40.0]),
+        ]);
+        let s = build_scorer(
+            &opts(WggoImportance::Grad, Some(sidecar)),
+            Arc::new(NullWeightProvider),
+        )
+        .unwrap();
+
+        // Layers present in wggo_head_gradients must return their exact calibrated scores.
+        let scores_0 = s.score_layer("layers.0", &fixture_shape()).unwrap();
+        assert_eq!(
+            scores_0.per_head,
+            vec![1.0, 2.0, 3.0, 4.0],
+            "layers.0 should return calibrated gradient scores, not magnitude"
+        );
+
+        let scores_1 = s.score_layer("layers.1", &fixture_shape()).unwrap();
+        assert_eq!(
+            scores_1.per_head,
+            vec![10.0, 20.0, 30.0, 40.0],
+            "layers.1 should return calibrated gradient scores, not magnitude"
+        );
+
+        // has_gradient_data_for_layer must reflect the sidecar entries.
+        assert!(
+            s.has_gradient_data_for_layer("layers.0"),
+            "layers.0 is in sidecar — has_gradient_data_for_layer must return true"
+        );
+        assert!(
+            s.has_gradient_data_for_layer("layers.1"),
+            "layers.1 is in sidecar — has_gradient_data_for_layer must return true"
+        );
+
+        // Per-layer fallback: a layer not present in wggo_head_gradients falls
+        // through to MagnitudeFallbackScorer, which always returns Some with
+        // NullWeightProvider → uniform scores.
+        let scores_unknown = s.score_layer("layers.99", &fixture_shape());
+        assert!(
+            scores_unknown.is_some(),
+            "fallback must produce magnitude scores for layers absent from sidecar"
+        );
+        assert!(
+            !s.has_gradient_data_for_layer("layers.99"),
+            "layers.99 is not in sidecar — has_gradient_data_for_layer must return false"
+        );
+    }
+
+    #[test]
+    fn calibrated_scorer_wggo_grads_none_falls_back_to_magnitude_for_all() {
+        // When wggo_head_gradients is Some but empty (e.g. calibration ran but
+        // produced no data), ALL layers must fall through to magnitude.
+        let sidecar = sidecar_with_wggo_grads(&[]);
+        let s = build_scorer(
+            &opts(WggoImportance::Auto, Some(sidecar)),
+            Arc::new(NullWeightProvider),
+        )
+        .unwrap();
+        // No entry → falls back to magnitude → uniform with NullWeightProvider.
+        let scores = s.score_layer("layers.0", &fixture_shape()).unwrap();
+        assert!(
+            scores.per_head.iter().all(|&v| (v - scores.per_head[0]).abs() < 1e-6),
+            "empty sidecar should yield uniform magnitude fallback, got {:?}",
+            scores.per_head
+        );
+        assert!(
+            !s.has_gradient_data_for_layer("layers.0"),
+            "empty sidecar: has_gradient_data_for_layer must return false"
+        );
     }
 }

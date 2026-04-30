@@ -855,3 +855,671 @@ let x: int = 42
         res.diagnostics
     );
 }
+
+// -----------------------------------------------------------------------
+// @wggo_target placement validation tests (WGGO Phase 2 Task 1)
+// -----------------------------------------------------------------------
+
+#[test]
+fn wggo_target_on_non_forward_method_errors() {
+    // @wggo_target must be on the model's `forward` method. Placing it on
+    // any other method (e.g. `cached_forward`) must emit a diagnostic
+    // containing the exact phrase "@wggo_target must be on the model's
+    // 'forward' method" so users can immediately locate the misplacement.
+    //
+    // The fixture intentionally uses a no-arg `@wggo_target` decorator to
+    // isolate the placement rule (Task 1) from later argument-validation
+    // tasks. Subsequent tasks (2/3/4) cover arg presence, types, etc.
+    let src = r#"
+model AttentionBlock:
+    let weight: Tensor<[4, 4], f32>
+
+    @wggo_target
+    fn cached_forward(self, x: Tensor<[4], f32>) -> Tensor<[4], f32>:
+        return x
+"#;
+    let diags = check_source(src);
+    let placement_errs: Vec<_> = diags
+        .iter()
+        .filter(|d| {
+            d.message
+                .contains("@wggo_target must be on the model's 'forward' method")
+        })
+        .collect();
+    assert!(
+        !placement_errs.is_empty(),
+        "@wggo_target on a non-`forward` method should emit the placement diagnostic; got: {:?}",
+        diags
+    );
+}
+
+#[test]
+fn wggo_target_on_forward_method_is_clean() {
+    // The happy path: @wggo_target on `forward` should NOT emit the
+    // placement diagnostic. (Other validation rules — arg presence, types,
+    // etc. — may still fire but are out of scope for Task 1.)
+    let src = r#"
+model AttentionBlock:
+    let weight: Tensor<[4, 4], f32>
+
+    @wggo_target
+    fn forward(self, x: Tensor<[4], f32>) -> Tensor<[4], f32>:
+        return x
+"#;
+    let diags = check_source(src);
+    assert!(
+        !diags.iter().any(|d| d
+            .message
+            .contains("@wggo_target must be on the model's 'forward' method")),
+        "@wggo_target on `forward` should not emit the placement diagnostic; got: {:?}",
+        diags
+    );
+}
+
+#[test]
+fn wggo_target_on_layer_decl_errors() {
+    // Covers the `ModelMember::LayerDecl` arm in `checker/model.rs`:
+    // `@wggo_target` on a layer/field declaration (not a method) must emit
+    // the "@wggo_target can only be applied to fn declarations" diagnostic.
+    //
+    // Field-decl form mirrors `examples/m30_shard_validation.nsl` —
+    // `name: Type = init` with the decorator on the preceding line — which
+    // is the syntax the parser actually accepts inside a `model:` body.
+    let src = r#"
+model AttentionBlock:
+    @wggo_target
+    weight: Tensor<[4, 4], f32> = zeros([4, 4])
+
+    fn forward(self, x: Tensor<[4], f32>) -> Tensor<[4], f32>:
+        return x
+"#;
+    let diags = check_source(src);
+    let placement_errs: Vec<_> = diags
+        .iter()
+        .filter(|d| {
+            d.message
+                .contains("@wggo_target can only be applied to fn declarations")
+        })
+        .collect();
+    assert!(
+        !placement_errs.is_empty(),
+        "@wggo_target on a layer declaration should emit the fn-only diagnostic; got: {:?}",
+        diags
+    );
+}
+
+#[test]
+fn wggo_target_on_top_level_non_fn_errors() {
+    // Covers the top-level `_ =>` arm in `StmtKind::Decorated` in
+    // `checker/stmt.rs`: `@wggo_target` decorating any non-`fn` top-level
+    // statement (here, a `model` decl) must emit the
+    // "@wggo_target can only be applied to fn declarations" diagnostic.
+    let src = r#"
+@wggo_target
+model AttentionBlock:
+    fn forward(self, x: Tensor<[4], f32>) -> Tensor<[4], f32>:
+        return x
+"#;
+    let diags = check_source(src);
+    let placement_errs: Vec<_> = diags
+        .iter()
+        .filter(|d| {
+            d.message
+                .contains("@wggo_target can only be applied to fn declarations")
+        })
+        .collect();
+    assert!(
+        !placement_errs.is_empty(),
+        "@wggo_target on a top-level non-fn statement should emit the fn-only diagnostic; got: {:?}",
+        diags
+    );
+}
+
+#[test]
+fn wggo_target_on_both_methods_fires_only_for_wrong_one() {
+    // Edge case: a model with BOTH `@wggo_target fn forward` (clean) AND
+    // `@wggo_target fn cached_forward` (wrong-name) verifies that the
+    // iteration in `checker/model.rs` continues past the first match and
+    // emits exactly one placement diagnostic — for `cached_forward` only.
+    //
+    // The exact-count assertion guards against regressions where the loop
+    // either short-circuits on the happy method or double-reports.
+    let src = r#"
+model AttentionBlock:
+    let q_proj: Tensor<[4, 4], f32>
+
+    @wggo_target
+    fn forward(self, x: Tensor<[4], f32>) -> Tensor<[4], f32>:
+        return x
+
+    @wggo_target
+    fn cached_forward(self, x: Tensor<[4], f32>) -> Tensor<[4], f32>:
+        return x
+"#;
+    let diags = check_source(src);
+    let placement_errs: Vec<_> = diags
+        .iter()
+        .filter(|d| {
+            d.message
+                .contains("@wggo_target must be on the model's 'forward' method")
+        })
+        .collect();
+    assert_eq!(
+        placement_errs.len(),
+        1,
+        "expected exactly one placement diagnostic (for `cached_forward`); got {} from diags: {:?}",
+        placement_errs.len(),
+        diags
+    );
+    // Sanity: the single firing must be the cached_forward one, not forward.
+    assert!(
+        placement_errs[0].message.contains("'cached_forward'"),
+        "the single placement diagnostic must name 'cached_forward'; got: {:?}",
+        placement_errs[0]
+    );
+}
+
+// -----------------------------------------------------------------------
+// WGGO Phase 2 Task 2: @wggo_target required-arguments validation
+// -----------------------------------------------------------------------
+// The @wggo_target decorator requires exactly five named arguments:
+//   w_q, w_k, w_v, w_o, head_dim
+// Missing any is a semantic-check error. These tests exercise the
+// `ModelMember::Method` arm in `checker/model.rs` (the canonical case)
+// since the standalone-fn arm in `checker/stmt.rs` always emits the
+// placement diagnostic for the non-`forward` case but otherwise mirrors
+// the same validate path.
+
+#[test]
+fn wggo_target_missing_head_dim_errors() {
+    // Four of the five required args are present; `head_dim` is missing.
+    // The diagnostic message must mention both the required-args header
+    // and `head_dim` in the missing list so users know exactly what's
+    // missing.
+    let src = r#"
+model Attention:
+    q_proj: Tensor<[4, 4], f32> = zeros([4, 4])
+    k_proj: Tensor<[4, 4], f32> = zeros([4, 4])
+    v_proj: Tensor<[4, 4], f32> = zeros([4, 4])
+    o_proj: Tensor<[4, 4], f32> = zeros([4, 4])
+
+    @wggo_target(w_q=self.q_proj, w_k=self.k_proj, w_v=self.v_proj, w_o=self.o_proj)
+    fn forward(self, x: Tensor<[4], f32>) -> Tensor<[4], f32>:
+        return x
+"#;
+    let diags = check_source(src);
+    let arg_errs: Vec<_> = diags
+        .iter()
+        .filter(|d| {
+            d.message.contains("@wggo_target requires arguments")
+                && d.message.contains("head_dim")
+        })
+        .collect();
+    assert!(
+        !arg_errs.is_empty(),
+        "@wggo_target with missing head_dim should emit the required-args diagnostic mentioning head_dim; got: {:?}",
+        diags
+    );
+}
+
+#[test]
+fn wggo_target_missing_w_k_errors() {
+    // Four of the five required args are present; `w_k` is missing.
+    // Uses Tensor fields (matching Task 1's fixture form) for `q_proj`
+    // and `head_dim` so the parser is happy. The exact field-type or
+    // self.x reference shape isn't validated yet (Tasks 3/4); only the
+    // arg *name* presence matters here.
+    let src = r#"
+model Attention:
+    q_proj: Tensor<[4, 4], f32> = zeros([4, 4])
+    head_dim: Tensor<[4, 4], f32> = zeros([4, 4])
+
+    @wggo_target(w_q=self.q_proj, w_v=self.q_proj, w_o=self.q_proj, head_dim=self.head_dim)
+    fn forward(self, x: Tensor<[4], f32>) -> Tensor<[4], f32>:
+        return x
+"#;
+    let diags = check_source(src);
+    let arg_errs: Vec<_> = diags
+        .iter()
+        .filter(|d| d.message.contains("missing:") && d.message.contains("w_k"))
+        .collect();
+    assert!(
+        !arg_errs.is_empty(),
+        "@wggo_target with missing w_k should emit a diagnostic containing `missing:` and `w_k`; got: {:?}",
+        diags
+    );
+}
+
+#[test]
+fn wggo_target_all_five_args_present_is_clean() {
+    // Happy path: all five required args present. The required-args
+    // diagnostic must NOT fire. Other validation rules (Tasks 3/4) may
+    // still fire but are out of scope for Task 2.
+    let src = r#"
+model Attention:
+    q_proj: Tensor<[4, 4], f32> = zeros([4, 4])
+    k_proj: Tensor<[4, 4], f32> = zeros([4, 4])
+    v_proj: Tensor<[4, 4], f32> = zeros([4, 4])
+    o_proj: Tensor<[4, 4], f32> = zeros([4, 4])
+    head_dim: Tensor<[4, 4], f32> = zeros([4, 4])
+
+    @wggo_target(w_q=self.q_proj, w_k=self.k_proj, w_v=self.v_proj, w_o=self.o_proj, head_dim=self.head_dim)
+    fn forward(self, x: Tensor<[4], f32>) -> Tensor<[4], f32>:
+        return x
+"#;
+    let diags = check_source(src);
+    assert!(
+        !diags
+            .iter()
+            .any(|d| d.message.contains("@wggo_target requires arguments")),
+        "@wggo_target with all five args present should not emit the required-args diagnostic; got: {:?}",
+        diags
+    );
+}
+
+#[test]
+fn wggo_target_missing_multiple_args_lists_all() {
+    // Only `w_q` provided; the diagnostic must list all four missing
+    // names so users see them in one shot rather than chasing one error
+    // at a time.
+    let src = r#"
+model Attention:
+    q_proj: Tensor<[4, 4], f32> = zeros([4, 4])
+
+    @wggo_target(w_q=self.q_proj)
+    fn forward(self, x: Tensor<[4], f32>) -> Tensor<[4], f32>:
+        return x
+"#;
+    let diags = check_source(src);
+    let arg_errs: Vec<_> = diags
+        .iter()
+        .filter(|d| d.message.contains("@wggo_target requires arguments"))
+        .collect();
+    assert_eq!(
+        arg_errs.len(),
+        1,
+        "expected exactly one required-args diagnostic; got: {:?}",
+        diags
+    );
+    let msg = &arg_errs[0].message;
+    for missing in ["w_k", "w_v", "w_o", "head_dim"] {
+        assert!(
+            msg.contains(missing),
+            "required-args diagnostic must list missing arg '{}'; got: {}",
+            missing,
+            msg
+        );
+    }
+    // `w_q` was provided so it must NOT appear in the missing list.
+    // Look for the exact `"w_q"` quoted form (the message header
+    // mentions w_q in the required-args list, but not in the missing
+    // vector debug print).
+    let after_missing = msg.split("missing:").nth(1).unwrap_or("");
+    assert!(
+        !after_missing.contains("\"w_q\""),
+        "the missing list must not contain w_q (it was provided); got: {}",
+        msg
+    );
+}
+
+#[test]
+fn wggo_target_no_args_lists_all_five_missing() {
+    // No-arg `@wggo_target` (the Task 1 fixture form): all five required
+    // args are missing. The diagnostic must list all five.
+    let src = r#"
+model Attention:
+    q_proj: Tensor<[4, 4], f32> = zeros([4, 4])
+
+    @wggo_target
+    fn forward(self, x: Tensor<[4], f32>) -> Tensor<[4], f32>:
+        return x
+"#;
+    let diags = check_source(src);
+    let arg_errs: Vec<_> = diags
+        .iter()
+        .filter(|d| d.message.contains("@wggo_target requires arguments"))
+        .collect();
+    assert_eq!(
+        arg_errs.len(),
+        1,
+        "expected exactly one required-args diagnostic; got: {:?}",
+        diags
+    );
+    let msg = &arg_errs[0].message;
+    for missing in ["w_q", "w_k", "w_v", "w_o", "head_dim"] {
+        assert!(
+            msg.contains(missing),
+            "required-args diagnostic must list missing arg '{}'; got: {}",
+            missing,
+            msg
+        );
+    }
+}
+
+// -----------------------------------------------------------------------
+// WGGO Phase 2 Task 3: @wggo_target argument-expression validation
+//
+// Each of the five required arguments (w_q, w_k, w_v, w_o, head_dim) must
+// be a `self.<field>` reference. Any other expression shape (literal,
+// bare identifier, complex expression, etc.) emits a diagnostic of the
+// form:
+//   @wggo_target argument 'NAME' must be a self.<field> reference; got KIND
+// -----------------------------------------------------------------------
+
+#[test]
+fn wggo_target_bare_ident_arg_errors() {
+    // `w_q=q_proj` (bare identifier — missing `self.` prefix) must emit
+    // the self.<field> diagnostic for w_q.
+    let src = r#"
+model Attention:
+    q_proj: Tensor<[4, 4], f32> = zeros([4, 4])
+    k_proj: Tensor<[4, 4], f32> = zeros([4, 4])
+    v_proj: Tensor<[4, 4], f32> = zeros([4, 4])
+    o_proj: Tensor<[4, 4], f32> = zeros([4, 4])
+    head_dim: Tensor<[4, 4], f32> = zeros([4, 4])
+
+    @wggo_target(w_q=q_proj, w_k=self.k_proj, w_v=self.v_proj, w_o=self.o_proj, head_dim=self.head_dim)
+    fn forward(self, x: Tensor<[4], f32>) -> Tensor<[4], f32>:
+        return x
+"#;
+    let diags = check_source(src);
+    assert!(
+        diags.iter().any(|d| {
+            d.message
+                .contains("argument 'w_q' must be a self.<field> reference")
+        }),
+        "bare-ident `w_q=q_proj` must emit the self.<field> diagnostic for w_q; got: {:?}",
+        diags
+    );
+}
+
+#[test]
+fn wggo_target_int_literal_head_dim_errors() {
+    // `head_dim=32` (integer literal) must emit the self.<field>
+    // diagnostic for head_dim.
+    let src = r#"
+model Attention:
+    q_proj: Tensor<[4, 4], f32> = zeros([4, 4])
+
+    @wggo_target(w_q=self.q_proj, w_k=self.q_proj, w_v=self.q_proj, w_o=self.q_proj, head_dim=32)
+    fn forward(self, x: Tensor<[4], f32>) -> Tensor<[4], f32>:
+        return x
+"#;
+    let diags = check_source(src);
+    assert!(
+        diags.iter().any(|d| {
+            d.message
+                .contains("argument 'head_dim' must be a self.<field> reference")
+        }),
+        "int-literal `head_dim=32` must emit the self.<field> diagnostic for head_dim; got: {:?}",
+        diags
+    );
+}
+
+#[test]
+fn wggo_target_all_self_field_args_no_self_field_error() {
+    // Happy path: all five args are `self.<field>` — the self.<field>
+    // diagnostic must NOT fire. (Other diagnostics from later tasks may
+    // fire, but not THIS specific error.)
+    let src = r#"
+model Attention:
+    q_proj: Tensor<[4, 4], f32> = zeros([4, 4])
+    k_proj: Tensor<[4, 4], f32> = zeros([4, 4])
+    v_proj: Tensor<[4, 4], f32> = zeros([4, 4])
+    o_proj: Tensor<[4, 4], f32> = zeros([4, 4])
+    head_dim: Tensor<[4, 4], f32> = zeros([4, 4])
+
+    @wggo_target(w_q=self.q_proj, w_k=self.k_proj, w_v=self.v_proj, w_o=self.o_proj, head_dim=self.head_dim)
+    fn forward(self, x: Tensor<[4], f32>) -> Tensor<[4], f32>:
+        return x
+"#;
+    let diags = check_source(src);
+    assert!(
+        !diags
+            .iter()
+            .any(|d| d.message.contains("must be a self.<field> reference")),
+        "all-`self.<field>` args must not emit the self.<field> diagnostic; got: {:?}",
+        diags
+    );
+}
+
+#[test]
+fn wggo_target_multiple_wrong_args_all_diagnose() {
+    // Two wrong args (`w_q=q_proj` bare-ident and `head_dim=32` literal)
+    // must both produce diagnostics — validation does not stop at the
+    // first wrong arg.
+    let src = r#"
+model Attention:
+    q_proj: Tensor<[4, 4], f32> = zeros([4, 4])
+    k_proj: Tensor<[4, 4], f32> = zeros([4, 4])
+    v_proj: Tensor<[4, 4], f32> = zeros([4, 4])
+    o_proj: Tensor<[4, 4], f32> = zeros([4, 4])
+
+    @wggo_target(w_q=q_proj, w_k=self.k_proj, w_v=self.v_proj, w_o=self.o_proj, head_dim=32)
+    fn forward(self, x: Tensor<[4], f32>) -> Tensor<[4], f32>:
+        return x
+"#;
+    let diags = check_source(src);
+    assert!(
+        diags.iter().any(|d| {
+            d.message
+                .contains("argument 'w_q' must be a self.<field> reference")
+        }),
+        "expected w_q self.<field> diagnostic; got: {:?}",
+        diags
+    );
+    assert!(
+        diags.iter().any(|d| {
+            d.message
+                .contains("argument 'head_dim' must be a self.<field> reference")
+        }),
+        "expected head_dim self.<field> diagnostic; got: {:?}",
+        diags
+    );
+}
+
+#[test]
+fn wggo_target_bare_ident_summary_mentions_kind() {
+    // The diagnostic message should include the expression-kind summary
+    // after `got `. For a bare identifier this is "bare identifier".
+    let src = r#"
+model Attention:
+    q_proj: Tensor<[4, 4], f32> = zeros([4, 4])
+    k_proj: Tensor<[4, 4], f32> = zeros([4, 4])
+    v_proj: Tensor<[4, 4], f32> = zeros([4, 4])
+    o_proj: Tensor<[4, 4], f32> = zeros([4, 4])
+    head_dim: Tensor<[4, 4], f32> = zeros([4, 4])
+
+    @wggo_target(w_q=q_proj, w_k=self.k_proj, w_v=self.v_proj, w_o=self.o_proj, head_dim=self.head_dim)
+    fn forward(self, x: Tensor<[4], f32>) -> Tensor<[4], f32>:
+        return x
+"#;
+    let diags = check_source(src);
+    let msg = diags
+        .iter()
+        .find(|d| {
+            d.message
+                .contains("argument 'w_q' must be a self.<field> reference")
+        })
+        .map(|d| d.message.clone())
+        .unwrap_or_default();
+    assert!(
+        msg.contains("got bare identifier"),
+        "diagnostic should mention the kind summary `got bare identifier`; got: {}",
+        msg
+    );
+}
+
+#[test]
+fn wggo_target_int_literal_summary_mentions_kind() {
+    let src = r#"
+model Attention:
+    q_proj: Tensor<[4, 4], f32> = zeros([4, 4])
+
+    @wggo_target(w_q=self.q_proj, w_k=self.q_proj, w_v=self.q_proj, w_o=self.q_proj, head_dim=32)
+    fn forward(self, x: Tensor<[4], f32>) -> Tensor<[4], f32>:
+        return x
+"#;
+    let diags = check_source(src);
+    let msg = diags
+        .iter()
+        .find(|d| {
+            d.message
+                .contains("argument 'head_dim' must be a self.<field> reference")
+        })
+        .map(|d| d.message.clone())
+        .unwrap_or_default();
+    assert!(
+        msg.contains("got int literal"),
+        "diagnostic should mention the kind summary `got int literal`; got: {}",
+        msg
+    );
+}
+
+// -------------------------------------------------------------------------
+// WGGO Phase 2 Task 4: @wggo_target field-existence + field-type validation
+//
+// Each `@wggo_target` argument that passes Tasks 1-3 (placement,
+// required-args, self.<field>) must reference a field that:
+//   - exists in the enclosing model's `LayerDecl` member list, AND
+//   - has the right type (Tensor for w_q/w_k/w_v/w_o; int for head_dim)
+//
+// Diagnostic shapes:
+//   @wggo_target field reference 'self.<F>' not found in model '<M>'
+//   @wggo_target argument '<ARG>' must reference a Tensor field; got <KIND>
+//   @wggo_target argument 'head_dim' must reference an int field; got <KIND>
+// -------------------------------------------------------------------------
+
+#[test]
+fn wggo_target_unknown_field_errors() {
+    // `self.unknown_field` is referenced but no such field exists on
+    // model `Attention`. The diagnostic must name both the missing field
+    // and the model.
+    let src = r#"
+model Attention:
+    q_proj: Tensor<[4, 4], f32> = zeros([4, 4])
+    head_dim: Tensor<[4, 4], f32> = zeros([4, 4])
+
+    @wggo_target(w_q=self.unknown_field, w_k=self.q_proj, w_v=self.q_proj, w_o=self.q_proj, head_dim=self.head_dim)
+    fn forward(self, x: Tensor<[4], f32>) -> Tensor<[4], f32>:
+        return x
+"#;
+    let diags = check_source(src);
+    assert!(
+        diags.iter().any(|d| {
+            d.message
+                .contains("'self.unknown_field' not found in model 'Attention'")
+        }),
+        "expected unknown-field diagnostic naming `self.unknown_field` and `Attention`; got: {:?}",
+        diags
+    );
+}
+
+#[test]
+fn wggo_target_w_q_points_at_int_field_errors() {
+    // `head_dim` is an `int` field. Pointing `w_q` (which must be Tensor)
+    // at it should emit the wrong-field-type diagnostic with `got int`.
+    let src = r#"
+model Attention:
+    head_dim: int = 4
+
+    @wggo_target(w_q=self.head_dim, w_k=self.head_dim, w_v=self.head_dim, w_o=self.head_dim, head_dim=self.head_dim)
+    fn forward(self, x: Tensor<[4], f32>) -> Tensor<[4], f32>:
+        return x
+"#;
+    let diags = check_source(src);
+    assert!(
+        diags.iter().any(|d| {
+            d.message
+                .contains("argument 'w_q' must reference a Tensor field; got int")
+        }),
+        "expected `w_q must reference a Tensor field; got int`; got: {:?}",
+        diags
+    );
+}
+
+#[test]
+fn wggo_target_head_dim_points_at_tensor_field_errors() {
+    // `q_proj` is a Tensor field. Using it as `head_dim` (which must be
+    // int) should emit the wrong-field-type diagnostic with `got Tensor`.
+    let src = r#"
+model Attention:
+    q_proj: Tensor<[4, 4], f32> = zeros([4, 4])
+
+    @wggo_target(w_q=self.q_proj, w_k=self.q_proj, w_v=self.q_proj, w_o=self.q_proj, head_dim=self.q_proj)
+    fn forward(self, x: Tensor<[4], f32>) -> Tensor<[4], f32>:
+        return x
+"#;
+    let diags = check_source(src);
+    assert!(
+        diags.iter().any(|d| {
+            d.message
+                .contains("argument 'head_dim' must reference an int field; got Tensor")
+        }),
+        "expected `head_dim must reference an int field; got Tensor`; got: {:?}",
+        diags
+    );
+}
+
+#[test]
+fn wggo_target_correctly_typed_fields_no_field_type_error() {
+    // Happy path: all four projection args reference Tensor fields and
+    // head_dim references an int field. None of the Task 4 diagnostics
+    // should fire.
+    let src = r#"
+model Attention:
+    q_proj: Tensor<[4, 4], f32> = zeros([4, 4])
+    k_proj: Tensor<[4, 4], f32> = zeros([4, 4])
+    v_proj: Tensor<[4, 4], f32> = zeros([4, 4])
+    o_proj: Tensor<[4, 4], f32> = zeros([4, 4])
+    head_dim: int = 4
+
+    @wggo_target(w_q=self.q_proj, w_k=self.k_proj, w_v=self.v_proj, w_o=self.o_proj, head_dim=self.head_dim)
+    fn forward(self, x: Tensor<[4], f32>) -> Tensor<[4], f32>:
+        return x
+"#;
+    let diags = check_source(src);
+    assert!(
+        !diags.iter().any(|d| d.message.contains("not found in model")),
+        "happy path must not emit `not found in model` diagnostics; got: {:?}",
+        diags
+    );
+    assert!(
+        !diags.iter().any(|d| d.message.contains("must reference a Tensor field")
+            || d.message.contains("must reference an int field")),
+        "happy path must not emit field-type diagnostics; got: {:?}",
+        diags
+    );
+}
+
+#[test]
+fn wggo_target_multiple_wrong_fields_all_diagnose() {
+    // Two errors: `w_q` points at an int field and `head_dim` points at a
+    // Tensor field. Both diagnostics must fire — no short-circuit.
+    let src = r#"
+model Attention:
+    q_proj: Tensor<[4, 4], f32> = zeros([4, 4])
+    head_dim_int: int = 4
+
+    @wggo_target(w_q=self.head_dim_int, w_k=self.q_proj, w_v=self.q_proj, w_o=self.q_proj, head_dim=self.q_proj)
+    fn forward(self, x: Tensor<[4], f32>) -> Tensor<[4], f32>:
+        return x
+"#;
+    let diags = check_source(src);
+    assert!(
+        diags.iter().any(|d| {
+            d.message
+                .contains("argument 'w_q' must reference a Tensor field; got int")
+        }),
+        "expected w_q-int diagnostic; got: {:?}",
+        diags
+    );
+    assert!(
+        diags.iter().any(|d| {
+            d.message
+                .contains("argument 'head_dim' must reference an int field; got Tensor")
+        }),
+        "expected head_dim-Tensor diagnostic; got: {:?}",
+        diags
+    );
+}

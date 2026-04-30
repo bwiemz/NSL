@@ -584,7 +584,7 @@ impl Compiler<'_> {
         crate::calibration::retention::emit_splice_memcpy(
             builder,
             arena_ptr,
-            offset as u64,
+            offset,
             data_ptr,
             nbytes,
         );

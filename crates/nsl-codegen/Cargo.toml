@@ -53,3 +53,7 @@ required-features = ["calibrate"]
 name = "cpdt_fixture_generate"
 path = "src/bin/cpdt_fixture_generate.rs"
 required-features = ["calibrate"]
+
+[[bin]]
+name = "build_wggo_fixtures"
+path = "src/bin/build_wggo_fixtures.rs"

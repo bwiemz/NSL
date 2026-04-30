@@ -352,6 +352,31 @@ pub fn debug_clear_allocator_slot_channels() {
     debug_channels::ALLOC_SLOTS_POST_HINT.with(|c| c.set(None));
 }
 
+/// §5.7 test helper: parse `source`, run only the pre-scan phase (AWQ + WGGO
+/// discovery + auto-mode fallback note), and return the resolved
+/// `CompileOptions`.
+///
+/// Panics on lex/parse errors so callers can use it in tests with clean
+/// `expect`-style assertions on the returned opts.  Does **not** run codegen.
+#[doc(hidden)]
+pub fn debug_resolve_pre_scan_opts(source: &str, opts: CompileOptions) -> CompileOptions {
+    use nsl_errors::{FileId, Level};
+    let mut interner = nsl_lexer::Interner::new();
+    let (tokens, lex_diags) = nsl_lexer::tokenize(source, FileId(0), &mut interner);
+    assert!(
+        !lex_diags.iter().any(|d| matches!(d.level, Level::Error)),
+        "lex errors in test fixture: {:?}",
+        lex_diags.iter().map(|d| d.message.clone()).collect::<Vec<_>>()
+    );
+    let parsed = nsl_parser::parse(&tokens, &mut interner);
+    assert!(
+        !parsed.diagnostics.iter().any(|d| matches!(d.level, Level::Error)),
+        "parse errors in test fixture: {:?}",
+        parsed.diagnostics.iter().map(|d| d.message.clone()).collect::<Vec<_>>()
+    );
+    compiler::run_pre_scan_phase(&parsed.module, &interner, opts)
+}
+
 pub use error::CodegenError;
 pub use standalone::create_weight_object;
 pub use wrga_fusion::{FusionDecision, FusionPlan, FusionTarget};
@@ -574,6 +599,11 @@ pub struct CompileOptions {
     /// path to emit a dedicated model object.
     pub calibration_compile_bundle:
         Option<std::sync::Arc<crate::calibration::CalibrationCompileBundle>>,
+    /// When `Some`, codegen emits `model_backward` IR with grad-retention
+    /// splices for the listed attention layers. `None` = forward-only AWQ
+    /// or no calibration. Spec §4.8.
+    pub calibration_grad_retention:
+        Option<Vec<crate::calibration::discovery::WggoGradTarget>>,
 }
 
 impl Default for CompileOptions {
@@ -647,6 +677,7 @@ impl Default for CompileOptions {
             calibration_batch_seq: None,
             weight_index_map: HashMap::new(),
             calibration_compile_bundle: None,
+            calibration_grad_retention: None,
         }
     }
 }
@@ -770,6 +801,8 @@ pub fn compile_and_calibrate(
         compiler.compile_main(&parsed.module.stmts)?;
         compiler.compile_pending_lambdas()?;
         compiler.emit_retention_arena()?;
+        // Task 10: backward (WGGO grad) sibling arena — spec §7.2 ordering invariant #2.
+        compiler.emit_grad_retention_arena()?;
         Ok(())
     })();
 
@@ -839,5 +872,11 @@ mod calib_options_tests {
     fn compile_options_default_has_no_calibration_retention() {
         let opts = CompileOptions::default();
         assert!(opts.calibration_retention.is_none());
+    }
+
+    #[test]
+    fn compile_options_default_has_no_calibration_grad_retention() {
+        let opts = CompileOptions::default();
+        assert!(opts.calibration_grad_retention.is_none());
     }
 }

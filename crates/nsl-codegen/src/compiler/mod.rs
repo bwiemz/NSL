@@ -36,6 +36,10 @@ pub use entry_points::{
     compile_with_zk_info_returning_plan,
 };
 
+// §5.7 debug helper seam: exposed so lib.rs can forward it as a public
+// `#[doc(hidden)]` fn without re-implementing the pre-scan pipeline.
+pub(crate) use entry_points::run_pre_scan_phase;
+
 /// Compile-time context for FlashAttention PTX dispatch.
 /// Populated by `compile_flash_attention_kernels()` when a `@flash_attention`-decorated
 /// function is found, consumed by `compile_flash_attention_call()` in expr.rs.
@@ -595,6 +599,14 @@ pub struct Compiler<'a> {
     /// splice skipped every site silently.
     pub retention_splices_emitted: u32,
 
+    // ── WGGO grad-retention arena (Task 10) ─────────────────────
+    /// Layout of the `__nsl_calib_grad_arena` .bss global.
+    /// `None` when `calibration_grad_retention` is not set.
+    /// Populated immediately after `emit_grad_retention_arena` runs.
+    /// Spec §4.3 + §7.2 ordering invariant #2 (backward sibling of the
+    /// forward arena, declared immediately after it in every entry point).
+    pub grad_arena_layout: Option<crate::calibration::retention::GradArenaLayout>,
+
     // ── WGGO override side-channel (Task 3) ─────────────────────
     /// Per-layer WGGO decisions for consumer passes.  Populated in the
     /// diagnostics section of `compile_quant_block` when `--wggo` is on;
@@ -763,6 +775,7 @@ impl<'a> Compiler<'a> {
             retention_arena_data_id: None,
             retention_offsets: std::collections::HashMap::new(),
             retention_splices_emitted: 0,
+            grad_arena_layout: None,
             wggo_overrides: None,
             weight_index_map: options.weight_index_map.clone(),
         })
@@ -1194,6 +1207,46 @@ impl<'a> Compiler<'a> {
 
         self.retention_arena_data_id = Some(data_id);
         self.retention_offsets = offsets;
+        Ok(())
+    }
+
+    /// Task 10: Declare and define the `__nsl_calib_grad_arena` zeroinit
+    /// `.bss` global when `calibration_grad_retention` is active.  Mirrors
+    /// `emit_retention_arena` for the backward (WGGO grad) sibling arena.
+    /// Spec §4.3.  Must run immediately after `emit_retention_arena` in every
+    /// entry point (spec §7.2 ordering invariant #2).
+    pub fn emit_grad_retention_arena(&mut self) -> Result<(), CodegenError> {
+        let targets = match self.compile_options.calibration_grad_retention.clone() {
+            Some(t) if !t.is_empty() => t,
+            _ => return Ok(()),
+        };
+
+        let layout = crate::calibration::retention::build_grad_arena_layout(&targets);
+        if layout.total_bytes == 0 {
+            return Ok(());
+        }
+
+        let data_id = self
+            .module
+            .declare_data(
+                "__nsl_calib_grad_arena",
+                cranelift_module::Linkage::Export,
+                true,  // writable
+                false, // not TLS
+            )
+            .map_err(|e| {
+                CodegenError::new(format!(
+                    "failed to declare grad retention arena data: {e}"
+                ))
+            })?;
+
+        let mut desc = DataDescription::new();
+        desc.define_zeroinit(layout.total_bytes as usize);
+        self.module
+            .define_data(data_id, &desc)
+            .map_err(|e| CodegenError::new(format!("failed to define grad retention arena: {e}")))?;
+
+        self.grad_arena_layout = Some(layout);
         Ok(())
     }
 

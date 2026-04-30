@@ -1,0 +1,31 @@
+# Merge-gate fixture for WGGO Phase 2 Tasks 27+28 — AWQ + WGGO coexistence.
+# Identical to wggo_attention_mlp_real.nsl in structure; this copy exists so
+# Task 28 can load it by a distinct name and document the §6.4 "both flags live
+# on the same model" scenario explicitly.
+#
+# The @quantize(dtype="awq4") decorator on AttentionMLP2 activates AWQ
+# calibration while @wggo_target on forward activates gradient scoring.
+from nsl.nn.losses import mse_loss
+
+@quantize(dtype="awq4")
+model AttentionMLP2(dim: int, num_heads: int):
+    head_dim: int = dim // num_heads
+    q_proj: Tensor = zeros([dim, dim])
+    k_proj: Tensor = zeros([dim, dim])
+    v_proj: Tensor = zeros([dim, dim])
+    o_proj: Tensor = zeros([dim, dim])
+
+    @wggo_target(w_q=self.q_proj, w_k=self.k_proj, w_v=self.v_proj, w_o=self.o_proj, head_dim=self.head_dim)
+    fn forward(self, x: Tensor) -> Tensor:
+        let q = x @ self.q_proj
+        let k = x @ self.k_proj
+        let v = x @ self.v_proj
+        let scores = q @ k.transpose(1, 2)
+        let attn = softmax(scores, 2)
+        let out = attn @ v
+        return out @ self.o_proj
+
+fn main():
+    let m = AttentionMLP2(dim=32, num_heads=4)
+    let x = zeros([8, 4, 32])
+    let y = m.forward(x)

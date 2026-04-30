@@ -1253,6 +1253,19 @@ impl AdjointGenerator {
     pub fn adjoint_of(&self, primal_var: VarId) -> Option<VarId> {
         self.adjoint_vars.get(&primal_var).copied()
     }
+
+    /// Return the VarId of the loss seed (the adjoint of `primal.output`).
+    ///
+    /// This is the VarId that `generate()` assigns `PrimalOp::Constant(1.0)` to.
+    /// Callers that hold an upstream loss gradient (e.g. `dy_handle` from the
+    /// L2 backward wrapper — spec §4.2) can pre-populate this VarId in their
+    /// `primal_vars` map before calling `compile_wengert_ops`, so the lowerer's
+    /// pre-mapped-constant check skips the hardcoded 1.0 and uses the real gradient.
+    ///
+    /// Returns `None` if `generate()` has not yet been called.
+    pub fn loss_seed_var_id(&self, primal_output: VarId) -> Option<VarId> {
+        self.adjoint_vars.get(&primal_output).copied()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1600,6 +1613,17 @@ impl<'a> WengertExtractor<'a> {
             .insert(name, model_type.to_string());
     }
 
+    /// Set the current self-context string directly.
+    ///
+    /// Required when extracting a model method body directly (i.e., not via
+    /// method inlining from an outer training loop).  Call this with the name
+    /// of the `self` parameter (typically `"self"`) after calling
+    /// `register_model_instance`, so that `ExprKind::SelfRef` and
+    /// `ExprKind::Pipe` with bare field-name RHS can be resolved correctly.
+    pub fn set_self_context(&mut self, ctx: Option<String>) {
+        self.self_context = ctx;
+    }
+
     /// Get named parameter VarIds with their compound names.
     /// Returns (compound_name, VarId) pairs for gradient collection.
     pub fn named_param_var_ids(&self) -> &[(String, VarId)] {
@@ -1833,6 +1857,97 @@ impl<'a> WengertExtractor<'a> {
                     result,
                     op: primal_op,
                     inputs: vec![l, r],
+                    saved_for_backward: false,
+                    checkpointed: false,
+                });
+                Some(result)
+            }
+
+            // Pipe operator: `x |> f`
+            //
+            // Semantics depend on `f`:
+            //   • `x |> tensor_field`  (bare Ident that resolves to a model Tensor param)
+            //     → equivalent to `x @ tensor_field`, i.e. Matmul.
+            //   • `x |> func`          (bare Ident that resolves to an input/local var)
+            //     → Matmul(x, func_var).
+            //   • Anything else        → extract RHS as a full expression, Matmul(x, rhs).
+            //
+            // The special case for bare model-field identifiers handles forward
+            // bodies of the form `x |> q_proj |> k_proj |> …` where `q_proj` etc.
+            // are model fields, not function names.  We resolve them via
+            // `self_context` + `context_to_model_type` just as `ExprKind::MemberAccess`
+            // with `SelfRef` would.
+            ExprKind::Pipe { left, right } => {
+                let left_var = self.extract_expr(left)?;
+
+                // Try to resolve the RHS.  For a bare Ident we first attempt the
+                // model-field path (registers a Param op if needed), then fall back
+                // to symbol_to_var lookup.
+                let right_var = if let ExprKind::Ident(sym) = &right.kind {
+                    // Fast path: already registered.
+                    if let Some(&v) = self.symbol_to_var.get(sym) {
+                        v
+                    } else {
+                        // Try model-field path: look up "<self_context>.<ident_name>".
+                        let ident_name = self.interner.resolve(sym.0).unwrap_or("?").to_string();
+                        let resolved = if let Some(ctx) = self.self_context.clone() {
+                            if self.context_to_model_type.contains_key(&ctx) {
+                                let compound = format!("{}.{}", ctx, ident_name);
+                                // Check if already present in var_names (idempotent).
+                                let existing = self
+                                    .list
+                                    .var_names
+                                    .iter()
+                                    .find_map(|(&vid, n)| if n == &compound { Some(vid) } else { None });
+                                if let Some(vid) = existing {
+                                    Some(vid)
+                                } else {
+                                    // Register as a Param leaf.
+                                    let var = self.alloc_var();
+                                    self.symbol_to_var.insert(*sym, var);
+                                    self.list.var_names.insert(var, compound.clone());
+                                    self.param_symbols.insert(*sym);
+                                    self.named_param_vars.push((compound.clone(), var));
+                                    self.push_op(WengertOp {
+                                        id: self.list.ops.len() as u32,
+                                        result: var,
+                                        op: PrimalOp::Param(compound),
+                                        inputs: vec![],
+                                        saved_for_backward: false,
+                                        checkpointed: false,
+                                    });
+                                    Some(var)
+                                }
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+                        // If the model-field path failed (e.g., `relu` is a free
+                        // function, not a model field), fall through to extracting
+                        // the RHS as a normal expression.  Without this, `x |> relu
+                        // |> q_proj` would return None here and collapse the whole
+                        // pipe chain to a stub.
+                        if let Some(vid) = resolved {
+                            vid
+                        } else {
+                            self.extract_expr(right)?
+                        }
+                    }
+                } else {
+                    // Non-Ident RHS (e.g. a function call or nested pipe):
+                    // extract it normally.
+                    self.extract_expr(right)?
+                };
+
+                // Emit Matmul(left, right) — `x |> w` ≡ `x @ w`.
+                let result = self.alloc_var();
+                self.push_op(WengertOp {
+                    id: self.list.ops.len() as u32,
+                    result,
+                    op: PrimalOp::Matmul,
+                    inputs: vec![left_var, right_var],
                     saved_for_backward: false,
                     checkpointed: false,
                 });

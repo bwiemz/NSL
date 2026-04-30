@@ -1,0 +1,14 @@
+# §5.4 fixture: plain MLP with NO @wggo_target decorators.
+# auto-mode pre-scan finds zero decorated classes → §5.4 trigger fires
+# and demotes wggo_importance from Auto to Magnitude.
+
+model NoAttn:
+    weight: Tensor = zeros([16, 16])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x @ self.weight
+
+fn main():
+    let m = NoAttn()
+    let x = zeros([1, 16])
+    let y = m.forward(x)

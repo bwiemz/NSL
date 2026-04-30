@@ -74,6 +74,7 @@ fn awq_plans() -> (Vec<ObservePlanEntry>, Vec<FinalizePlanEntry>) {
             projection,
             running_symbol: "__nsl_awq_running_up_proj".into(),
             channels: 64,
+            bytes_per_element: 4, // AWQ f32 max-abs running buffer
         }],
     )
 }
@@ -103,6 +104,8 @@ fn two_object_link_produces_binary_with_resolved_wrapper_symbol() {
         &arena_layout,
         b"{}",
         true,
+        false, // needs_backward = false for AWQ-only test
+        &[],   // no per-step backward symbols for AWQ-only
         &scaffolding_obj,
     )
     .expect("emit scaffolding.o");
@@ -112,7 +115,7 @@ fn two_object_link_produces_binary_with_resolved_wrapper_symbol() {
     } else {
         "calibration"
     });
-    link_calibration_binary(&scaffolding_obj, &model_obj, &binary)
+    link_calibration_binary(&scaffolding_obj, &model_obj, &binary, false)
         .expect("link two-object calibration binary");
 
     assert!(binary.exists(), "linked calibration binary must exist");
@@ -153,6 +156,8 @@ fn missing_wrapper_symbol_at_link_emits_three_part_error() {
         &arena_layout,
         b"{}",
         true,
+        false, // needs_backward = false; tests forward-path link failure
+        &[],   // no per-step backward symbols
         &scaffolding_obj,
     )
     .expect("emit scaffolding.o");
@@ -162,7 +167,7 @@ fn missing_wrapper_symbol_at_link_emits_three_part_error() {
     } else {
         "calibration"
     });
-    let err = link_calibration_binary(&scaffolding_obj, &scaffolding_obj, &binary)
+    let err = link_calibration_binary(&scaffolding_obj, &scaffolding_obj, &binary, false)
         .expect_err("link should fail without calib_model.o wrapper export");
 
     let err_str = format!("{err}");
