@@ -19,7 +19,7 @@ pub mod retention_pass;
 pub mod sidecar;
 pub mod subprocess;
 
-pub use ctx::{BufferHandle, CalibCtx};
+pub use ctx::{BssGlobalEntry, BufferHandle, CalibCtx};
 pub use discovery::{
     discover_awq_projections, discover_awq_projections_from_state,
     pre_scan_awq_projections_from_ast, DiscoveredProjection, DiscoveryError,
@@ -29,7 +29,7 @@ pub use binary_codegen::{
     emit_calibration_model_object, emit_calibration_scaffolding_object,
     link_calibration_binary,
 };
-pub use wggo_gradient_hook::{discover_loss_anchor, LayerGradTarget, WggoAnchorError, WggoGradientHook};
+pub use wggo_gradient_hook::{discover_loss_anchor, WggoAnchorError, WggoGradientHook};
 pub use identity_hook::IdentityHook;
 pub use observation::{LayerRef, ObservationPlan, ObservationSet, ParamRef, ProjectionRef};
 pub use registry::HookRegistry;

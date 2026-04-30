@@ -12,21 +12,7 @@ use crate::calibration::{
     ObservePlanEntry,
 };
 use crate::calibration::observation::{ObservationSet, ProjectionRef};
-use crate::wggo_cost::LayerShape;
-
-/// Per-layer targets the hook observes. Each layer contributes four
-/// projections (`W_q`, `W_k`, `W_v`, `W_o`) to the retention arena; the
-/// per-head scalar for each is accumulated into a single per-layer running
-/// buffer of size `n_heads`.
-#[derive(Debug, Clone)]
-pub struct LayerGradTarget {
-    pub layer_key: String,
-    pub layer_shape: LayerShape,
-    pub w_q: ProjectionRef,
-    pub w_k: ProjectionRef,
-    pub w_v: ProjectionRef,
-    pub w_o: ProjectionRef,
-}
+use crate::calibration::discovery::WggoGradTarget;
 
 // ── Discovery error ───────────────────────────────────────────────────────────
 
@@ -92,16 +78,16 @@ fn running_symbol_for(layer_key: &str) -> String {
 
 #[derive(Debug)]
 pub struct WggoGradientHook {
-    targets: Vec<LayerGradTarget>,
+    targets: Vec<WggoGradTarget>,
     loss_anchor: ProjectionRef,
 }
 
 impl WggoGradientHook {
-    pub fn new(targets: Vec<LayerGradTarget>, loss_anchor: ProjectionRef) -> Self {
+    pub fn new(targets: Vec<WggoGradTarget>, loss_anchor: ProjectionRef) -> Self {
         Self { targets, loss_anchor }
     }
 
-    pub fn targets(&self) -> &[LayerGradTarget] {
+    pub fn targets(&self) -> &[WggoGradTarget] {
         &self.targets
     }
 
@@ -126,9 +112,16 @@ impl CalibrationHook for WggoGradientHook {
         ObservationSet::BackwardGradients(layers)
     }
 
-    fn emit_init(&self, _ctx: &mut CalibCtx) {
-        // Stub — real reduction IR lands in the follow-up plan when the AWQ
-        // subprocess retention debug resolves.  Running buffers stay zero.
+    fn emit_init(&self, ctx: &mut CalibCtx) {
+        for target in &self.targets {
+            // n_o_heads = d_model / head_dim where d_model = w_o_shape[0]
+            // (output dim of the o_proj). Floor to 1 to guard against
+            // degenerate fixtures where head_dim > d_model.
+            let n_o_heads = (target.w_o_shape[0] / target.head_dim).max(1);
+            let symbol = running_symbol_for(&target.layer_key);
+            // Each head gets one f64 accumulator — 8 bytes per spec §4.6.
+            ctx.declare_bss_global(&symbol, n_o_heads * 8);
+        }
     }
 
     fn emit_per_step(&self, _ctx: &mut CalibCtx) {
@@ -147,8 +140,9 @@ impl CalibrationHook for WggoGradientHook {
     fn observe_plan(&self, arena: &ArenaLayout) -> Vec<ObservePlanEntry> {
         let mut out = Vec::new();
         for t in &self.targets {
-            // n_heads = d_model / head_dim; floor to 1 to avoid div-by-zero.
-            let num_heads = (t.layer_shape.d_model / t.layer_shape.head_dim).max(1) as u32;
+            // n_heads = d_model / head_dim (w_o_shape[0] is d_model);
+            // floor to 1 to avoid div-by-zero.
+            let num_heads = (t.w_o_shape[0] / t.head_dim).max(1);
             for proj in [&t.w_q, &t.w_k, &t.w_v, &t.w_o] {
                 if let Some((_, offset, nbytes)) =
                     arena.entries.iter().find(|(p, _, _)| p == proj)
@@ -181,8 +175,7 @@ impl CalibrationHook for WggoGradientHook {
         self.targets
             .iter()
             .map(|t| {
-                let num_heads =
-                    (t.layer_shape.d_model / t.layer_shape.head_dim).max(1) as u32;
+                let num_heads = (t.w_o_shape[0] / t.head_dim).max(1);
                 FinalizePlanEntry {
                     projection: ProjectionRef(format!("{}.__wggo_grad", t.layer_key)),
                     running_symbol: running_symbol_for(&t.layer_key),
@@ -199,21 +192,38 @@ impl CalibrationHook for WggoGradientHook {
 mod tests {
     use super::*;
     use crate::calibration::retention::ArenaLayout;
-    use crate::wggo_cost::LayerShape;
+    use crate::calibration::discovery::WggoGradTarget;
 
     fn proj(name: &str) -> ProjectionRef {
         ProjectionRef(name.to_string())
     }
 
-    fn fixture_target(layer_key: &str) -> LayerGradTarget {
-        LayerGradTarget {
+    /// Build a `WggoGradTarget` fixture.
+    ///
+    /// `head_dim` and `w_o_shape` are explicit so that tests can control
+    /// the head-count calculation independently.  The other three
+    /// projection shapes default to the same value as `w_o_shape` — fine
+    /// for observe/finalize plan tests that only care about `w_o_shape`.
+    fn fixture_target(layer_key: &str, head_dim: u32, w_o_shape: [u32; 2]) -> WggoGradTarget {
+        WggoGradTarget {
             layer_key: layer_key.to_string(),
-            layer_shape: LayerShape::default_for_test_4heads(),
+            class_name: "Attention".to_string(),
+            head_dim,
             w_q: proj(&format!("{layer_key}.w_q")),
             w_k: proj(&format!("{layer_key}.w_k")),
             w_v: proj(&format!("{layer_key}.w_v")),
             w_o: proj(&format!("{layer_key}.w_o")),
+            w_q_shape: w_o_shape,
+            w_k_shape: w_o_shape,
+            w_v_shape: w_o_shape,
+            w_o_shape,
         }
+    }
+
+    /// Convenience wrapper matching the old zero-argument style:
+    /// 4 heads, d_model=256, head_dim=64 (same as `LayerShape::default_for_test_4heads`).
+    fn fixture_target_4heads(layer_key: &str) -> WggoGradTarget {
+        fixture_target(layer_key, 64, [256, 256])
     }
 
     // ── discover_loss_anchor ──────────────────────────────────────────────
@@ -280,7 +290,7 @@ mod tests {
 
     #[test]
     fn observe_plan_matches_per_layer_targets() {
-        let t = fixture_target("model.layers.0");
+        let t = fixture_target_4heads("model.layers.0");
         // 4 heads × 4 bytes × 1 row = 16 bytes per projection
         let entries = vec![
             (t.w_q.clone(), 0u32, 16u32),
@@ -310,7 +320,7 @@ mod tests {
 
     #[test]
     fn observe_plan_skips_projections_missing_from_arena() {
-        let t = fixture_target("model.layers.0");
+        let t = fixture_target_4heads("model.layers.0");
         // Only w_q in arena; w_k, w_v, w_o absent.
         let entries = vec![(t.w_q.clone(), 0u32, 16u32)];
         let arena = ArenaLayout { entries };
@@ -322,7 +332,7 @@ mod tests {
 
     #[test]
     fn observe_plan_empty_arena_produces_no_entries() {
-        let t = fixture_target("model.layers.0");
+        let t = fixture_target_4heads("model.layers.0");
         let arena = ArenaLayout { entries: vec![] };
         let hook = WggoGradientHook::new(vec![t], proj("model.lm_head"));
         assert!(hook.observe_plan(&arena).is_empty());
@@ -330,8 +340,8 @@ mod tests {
 
     #[test]
     fn observe_plan_multiple_layers() {
-        let t0 = fixture_target("model.layers.0");
-        let t1 = fixture_target("model.layers.1");
+        let t0 = fixture_target_4heads("model.layers.0");
+        let t1 = fixture_target_4heads("model.layers.1");
         let entries = vec![
             (t0.w_q.clone(), 0u32, 16u32),
             (t1.w_q.clone(), 16u32, 16u32),
@@ -351,8 +361,8 @@ mod tests {
     fn finalize_plan_one_entry_per_layer() {
         let hook = WggoGradientHook::new(
             vec![
-                fixture_target("model.layers.0"),
-                fixture_target("model.layers.1"),
+                fixture_target_4heads("model.layers.0"),
+                fixture_target_4heads("model.layers.1"),
             ],
             proj("model.lm_head"),
         );
@@ -384,8 +394,8 @@ mod tests {
     fn requires_returns_backward_gradients_for_all_layers() {
         let hook = WggoGradientHook::new(
             vec![
-                fixture_target("model.layers.0"),
-                fixture_target("model.layers.1"),
+                fixture_target_4heads("model.layers.0"),
+                fixture_target_4heads("model.layers.1"),
             ],
             proj("model.lm_head"),
         );
@@ -412,7 +422,7 @@ mod tests {
     #[test]
     fn hook_is_object_safe_via_box() {
         let hook: Box<dyn CalibrationHook> = Box::new(WggoGradientHook::new(
-            vec![fixture_target("model.layers.0")],
+            vec![fixture_target_4heads("model.layers.0")],
             proj("model.lm_head"),
         ));
         assert_eq!(hook.id(), "wggo_head_gradients");
@@ -422,10 +432,29 @@ mod tests {
     fn running_symbol_sanitises_dots() {
         // Indirectly test through finalize_plan.
         let hook = WggoGradientHook::new(
-            vec![fixture_target("a.b.c")],
+            vec![fixture_target_4heads("a.b.c")],
             proj("model.lm_head"),
         );
         let plan = hook.finalize_plan();
         assert_eq!(plan[0].running_symbol, "__nsl_wggo_grad.a_b_c");
+    }
+
+    // ── emit_init ────────────────────────────────────────────────────────
+
+    #[test]
+    fn emit_init_declares_per_layer_running_buffers_as_bss_globals() {
+        let targets = vec![
+            fixture_target("model.layers.0", /*head_dim=*/ 128, /*w_o_shape=*/ [4096, 4096]),
+            fixture_target("model.layers.1", 128, [4096, 4096]),
+        ];
+        let hook = WggoGradientHook::new(targets, proj("model.lm_head"));
+        let mut ctx = crate::calibration::ctx::CalibCtx::stub_for_tests();
+        hook.emit_init(&mut ctx);
+
+        // n_o_heads = 4096 / 128 = 32; buffer = 32 × 8 bytes = 256 bytes per layer
+        let g0 = ctx.lookup_bss_global("__nsl_wggo_grad.model_layers_0").unwrap();
+        assert_eq!(g0.size_bytes, 256);
+        let g1 = ctx.lookup_bss_global("__nsl_wggo_grad.model_layers_1").unwrap();
+        assert_eq!(g1.size_bytes, 256);
     }
 }

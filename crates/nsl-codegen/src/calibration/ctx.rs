@@ -15,6 +15,14 @@ use crate::calibration::retention::RetentionTable;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct BufferHandle(u32);
 
+/// Descriptor for a BSS global declared by a hook's `emit_init`.
+/// Returned by [`CalibCtx::lookup_bss_global`] in test/stub mode.
+#[derive(Debug, Clone)]
+pub struct BssGlobalEntry {
+    pub name: String,
+    pub size_bytes: u32,
+}
+
 #[derive(Debug)]
 pub struct CalibCtx<'a> {
     pub sample_idx: u32,
@@ -27,6 +35,9 @@ pub struct CalibCtx<'a> {
     /// Populated by `stub_set_arena_buffer`; consumed by
     /// `emit_per_channel_max_abs_update` in stub mode.
     stub_arena_data: BTreeMap<String, Vec<f32>>,
+    /// BSS globals declared by hook `emit_init` calls (stub + production).
+    /// Keyed by symbol name; value is size in bytes.
+    bss_globals: BTreeMap<String, u32>,
 }
 
 impl<'a> CalibCtx<'a> {
@@ -41,6 +52,7 @@ impl<'a> CalibCtx<'a> {
             running_names: BTreeMap::new(),
             next_handle: 0,
             stub_arena_data: BTreeMap::new(),
+            bss_globals: BTreeMap::new(),
         }
     }
 
@@ -58,6 +70,7 @@ impl<'a> CalibCtx<'a> {
             running_names: BTreeMap::new(),
             next_handle: 0,
             stub_arena_data: BTreeMap::new(),
+            bss_globals: BTreeMap::new(),
         }
     }
 
@@ -140,6 +153,34 @@ impl<'a> CalibCtx<'a> {
             None => return Vec::new(),
         };
         self.running_buffers.get(&h).cloned().unwrap_or_default()
+    }
+
+    // ---- BSS-global declaration (emit_init path) ----------------------------
+
+    /// Declare a BSS global with the given `symbol` name and `size_bytes`.
+    ///
+    /// On the real Cranelift IR path (Task 12+) this will emit a
+    /// zero-initialised data section of the requested size.  In stub / test
+    /// mode it records the declaration into an in-memory map so tests can
+    /// verify correct size via [`lookup_bss_global`].
+    ///
+    /// Panics if the same symbol is declared twice (hook-author bug).
+    pub fn declare_bss_global(&mut self, symbol: &str, size_bytes: u32) {
+        if self.bss_globals.contains_key(symbol) {
+            panic!("duplicate BSS global declaration: {symbol}");
+        }
+        self.bss_globals.insert(symbol.to_string(), size_bytes);
+    }
+
+    /// Test helper: look up a BSS global by symbol name.
+    ///
+    /// Returns `Some(BssGlobalEntry)` when the symbol was previously declared
+    /// via [`declare_bss_global`], or `None` if it was never declared.
+    pub fn lookup_bss_global(&self, symbol: &str) -> Option<BssGlobalEntry> {
+        self.bss_globals.get(symbol).map(|&size_bytes| BssGlobalEntry {
+            name: symbol.to_string(),
+            size_bytes,
+        })
     }
 
     /// Emit a per-input-channel max-abs reduction over a 2-D slice of the
