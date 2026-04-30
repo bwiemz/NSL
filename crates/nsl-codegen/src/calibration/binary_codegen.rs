@@ -866,26 +866,46 @@ fn emit_calibration_forward_wrapper(
     Ok(())
 }
 
-/// Declare the compiled model's backward function as a `Linkage::Local`
-/// symbol in the calibration model object.
+/// Emit the `model_backward` bridge: source-AD splice into
+/// `__nsl_calib_grad_arena` via the `on_param_grad` callback.
 ///
-/// Task 14: emits a stub body that just returns so the object finalizer is
-/// happy.  Tasks 15-16 will replace the stub with real source-AD body.
-/// The signature matches the bridge expected by `emit_calibration_backward_wrapper`:
+/// Spec §4.2 last paragraph + projection-identity invariant.
 ///
-///   model_backward(input_handle: i64, dy_handle: i64) -> void
+/// Signature (Task 16):
+///   model_backward(weight_ptrs: i64, num_weights: i64,
+///                  input_handle: i64, dy_handle: i64) -> void
 ///
-/// (NslTensor* is lowered to i64 throughout this codebase.)
+/// Body:
+///  1. Load weight tensors from weight_ptrs (same pattern as model_forward).
+///  2. Extract the model's forward WengertList via WengertExtractor.
+///  3. Build primal_vars: map x VarId → input_handle, weight VarIds → loaded tensors.
+///  4. Lower the primal forward to obtain full intermediate values.
+///  5. Generate the adjoint WengertList from the primal.
+///  6. Lower the adjoint with on_param_grad callback: for each WGGO target weight
+///     gradient, copy to __nsl_calib_grad_arena at the correct byte offset.
+///  7. Free loaded weight views and return.
+///
+/// Forward-equivalence note: the primal forward re-runs as source-AD ops
+/// (FFI calls), independent of the compiled NSL forward.  The retention arena
+/// writes (Task 4's splice) happen in model_forward, NOT here — this function
+/// only writes to the GRAD arena.  This is intentional: spec §7.2 requires the
+/// two arenas to be written by separate paths.
 fn emit_model_backward_bridge(
     compiler: &mut crate::compiler::Compiler<'_>,
+    model_def: &nsl_ast::decl::ModelDef,
+    model_name: &str,
     _arena_layout: &crate::calibration::ArenaLayout,
-    _grad_arena_layout: &crate::calibration::retention::GradArenaLayout,
+    grad_arena_layout: &crate::calibration::retention::GradArenaLayout,
 ) -> Result<cranelift_module::FuncId, HarnessError> {
-    let pointer_ty = compiler.module.target_config().pointer_type();
+    // ── Signature ────────────────────────────────────────────────────────────
+    // Task 16 expands from the Task-14/15 2-param stub to 4 params so the
+    // bridge can load weights for source-AD (same pattern as model_forward).
     let mut sig = compiler.module.make_signature();
     sig.call_conv = compiler.call_conv;
-    sig.params.push(AbiParam::new(pointer_ty)); // input_handle (NslTensor* as i64)
-    sig.params.push(AbiParam::new(pointer_ty)); // dy_handle    (NslTensor* as i64)
+    sig.params.push(AbiParam::new(cl_types::I64)); // weight_ptrs
+    sig.params.push(AbiParam::new(cl_types::I64)); // num_weights
+    sig.params.push(AbiParam::new(cl_types::I64)); // input_handle (NslTensor* as i64)
+    sig.params.push(AbiParam::new(cl_types::I64)); // dy_handle    (NslTensor* as i64)
 
     let func_id = compiler
         .module
@@ -894,27 +914,414 @@ fn emit_model_backward_bridge(
             reason: format!("declare model_backward: {e}"),
         })?;
 
-    // Task 14: emit a trivial stub so the ObjectModule finalizer accepts the
-    // declaration.  Tasks 15-16 will replace the stub body with real source-AD.
+    // ── Pre-compute grad-arena layout map: projection path → (offset, bytes) ──
+    // Keyed by the bare field name (e.g. "up_proj") for fast lookup.
+    // GradArenaLayout entries carry ProjectionRef with form "<ModelName>.<field>".
+    let prefix = format!("{model_name}.");
+    let field_to_arena: HashMap<String, (u32, u32)> = grad_arena_layout
+        .entries
+        .iter()
+        .filter_map(|(proj_ref, offset, nbytes)| {
+            proj_ref
+                .0
+                .strip_prefix(&prefix)
+                .map(|field| (field.to_string(), (*offset, *nbytes)))
+        })
+        .collect();
+
+    // Early exit: if no grad arena entries match this model's fields, emit a
+    // trivial stub to avoid confusing the Wengert extraction path below.
+    // This mirrors the Task-14 stub and is correct when the WGGO targets list
+    // references a different model name than the one being compiled.
+    if field_to_arena.is_empty() {
+        let mut ctx = Context::for_function(Function::with_name_signature(
+            UserFuncName::user(0, compiler.next_func_index()),
+            sig,
+        ));
+        let mut fn_builder_ctx = FunctionBuilderContext::new();
+        {
+            let mut b = FunctionBuilder::new(&mut ctx.func, &mut fn_builder_ctx);
+            let entry = b.create_block();
+            b.append_block_params_for_function_params(entry);
+            b.switch_to_block(entry);
+            b.seal_block(entry);
+            b.ins().return_(&[]);
+            b.finalize();
+        }
+        compiler
+            .module
+            .define_function(func_id, &mut ctx)
+            .map_err(|e| HarnessError::Infrastructure {
+                reason: format!("define model_backward (empty-layout stub): {e}"),
+            })?;
+        return Ok(func_id);
+    }
+
+    // ── Declare helper FFIs ───────────────────────────────────────────────────
+    // nsl_model_get_weight: (model_ptr: i64, name_ptr: i64, name_len: i64) -> i64
+    let mut model_get_weight_sig = compiler.module.make_signature();
+    model_get_weight_sig.call_conv = compiler.call_conv;
+    model_get_weight_sig.params.push(AbiParam::new(cl_types::I64));
+    model_get_weight_sig.params.push(AbiParam::new(cl_types::I64));
+    model_get_weight_sig.params.push(AbiParam::new(cl_types::I64));
+    model_get_weight_sig.returns.push(AbiParam::new(cl_types::I64));
+    let model_get_weight_id = compiler
+        .module
+        .declare_function(
+            "nsl_model_get_weight",
+            Linkage::Import,
+            &model_get_weight_sig,
+        )
+        .map_err(|e| HarnessError::Infrastructure {
+            reason: format!("declare nsl_model_get_weight (backward bridge): {e}"),
+        })?;
+
+    // nsl_tensor_free: (tensor: i64) -> void
+    let tensor_free_id = compiler.registry.runtime_fns["nsl_tensor_free"].0;
+
+    // __nsl_calib_grad_arena: declared as Local by emit_grad_retention_arena.
+    // Reference it from this function via Import — the linker resolves within
+    // the same object (both Local and Export are resolved before relocation).
+    let grad_arena_data_id = compiler
+        .module
+        .declare_data("__nsl_calib_grad_arena", Linkage::Import, true, false)
+        .map_err(|e| HarnessError::Infrastructure {
+            reason: format!("declare __nsl_calib_grad_arena import (backward bridge): {e}"),
+        })?;
+
+    // ── Extract the model's forward WengertList ───────────────────────────────
+    // Collect tensor field names (same logic as awq_tensor_field_names).
+    let tensor_fields: Vec<String> = model_def
+        .members
+        .iter()
+        .filter_map(|member| match member {
+            nsl_ast::decl::ModelMember::LayerDecl { name, type_ann, .. } => {
+                match &type_ann.kind {
+                    nsl_ast::types::TypeExprKind::Named(sym)
+                        if compiler.interner.resolve(sym.0) == Some("Tensor") =>
+                    {
+                        compiler.interner.resolve(name.0).map(str::to_string)
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        })
+        .collect();
+
+    // Find the forward method body.  collect_models() / declare_user_functions()
+    // have already run before this function is called, so model_method_bodies is
+    // populated.  If "forward" is missing, emit the trivial stub.
+    let forward_fn_def = compiler
+        .models
+        .model_method_bodies
+        .get(model_name)
+        .and_then(|m| m.get("forward"))
+        .cloned();
+
+    let forward_fn_def = match forward_fn_def {
+        Some(fd) => fd,
+        None => {
+            // No forward method known — emit trivial stub.
+            let mut ctx = Context::for_function(Function::with_name_signature(
+                UserFuncName::user(0, compiler.next_func_index()),
+                sig,
+            ));
+            let mut fn_builder_ctx = FunctionBuilderContext::new();
+            {
+                let mut b = FunctionBuilder::new(&mut ctx.func, &mut fn_builder_ctx);
+                let entry = b.create_block();
+                b.append_block_params_for_function_params(entry);
+                b.switch_to_block(entry);
+                b.seal_block(entry);
+                b.ins().return_(&[]);
+                b.finalize();
+            }
+            compiler
+                .module
+                .define_function(func_id, &mut ctx)
+                .map_err(|e| HarnessError::Infrastructure {
+                    reason: format!("define model_backward (no-forward stub): {e}"),
+                })?;
+            return Ok(func_id);
+        }
+    };
+
+    // Run WengertExtractor on the forward body.
+    // We set self_context = "self" so SelfRef + field → "self.<field>".
+    // The model instance is registered with a synthetic Symbol whose name is "self".
+    let mut extractor = crate::source_ad::WengertExtractor::new(compiler.interner);
+    extractor.set_model_method_bodies(compiler.models.model_method_bodies.clone());
+    extractor.set_model_field_types(compiler.models.model_field_types.clone());
+
+    // Register the model's `self` symbol as the model instance.
+    // forward_fn_def.params[0] is the `self` parameter whose Symbol maps
+    // to the context name "self" in the WengertExtractor.  If the method has
+    // no params (malformed model — rejected by the front-end), the extraction
+    // will fail and we fall through to the stub path below.
+    let self_sym = forward_fn_def.params.first().map(|p| p.name);
+    let self_param_name: Option<String> = self_sym.and_then(|sym| {
+        compiler.interner.resolve(sym.0).map(str::to_string)
+    });
+    if let Some(sym) = self_sym {
+        extractor.register_model_instance(sym, model_name);
+    }
+    // Set self_context so that ExprKind::SelfRef and pipe-with-bare-field-ident
+    // arms in extract_expr can resolve "self.<field>" correctly when the extractor
+    // runs directly on the method body (not via method inlining from an outer loop).
+    extractor.set_self_context(self_param_name);
+
+    // Register the input parameter (second param of forward, e.g. `x`).
+    let input_sym_opt = forward_fn_def.params.get(1).map(|p| p.name);
+    if let Some(input_sym) = input_sym_opt {
+        extractor.register_input(input_sym);
+    }
+
+    let extraction_ok = extractor.extract_stmts(&forward_fn_def.body.stmts);
+
+    if !extraction_ok || extractor.wengert_list().ops.is_empty() {
+        // Extraction failed — emit trivial stub, log warning.
+        eprintln!(
+            "[nsl] model_backward: WengertExtractor failed for '{model_name}' — emitting stub"
+        );
+        let mut ctx = Context::for_function(Function::with_name_signature(
+            UserFuncName::user(0, compiler.next_func_index()),
+            sig,
+        ));
+        let mut fn_builder_ctx = FunctionBuilderContext::new();
+        {
+            let mut b = FunctionBuilder::new(&mut ctx.func, &mut fn_builder_ctx);
+            let entry = b.create_block();
+            b.append_block_params_for_function_params(entry);
+            b.switch_to_block(entry);
+            b.seal_block(entry);
+            b.ins().return_(&[]);
+            b.finalize();
+        }
+        compiler
+            .module
+            .define_function(func_id, &mut ctx)
+            .map_err(|e| HarnessError::Infrastructure {
+                reason: format!("define model_backward (extraction-failed stub): {e}"),
+            })?;
+        return Ok(func_id);
+    }
+
+    // Build adjoint-variable → grad_arena entry map.
+    // named_param_var_ids() yields ("self.<field>", VarId).
+    // We map "self.<field>" → "<model_name>.<field>" to match grad_arena keys.
+    let self_prefix = "self.";
+    let mut param_adj_set = std::collections::HashSet::<crate::wengert::VarId>::new();
+    // Maps adjoint VarId → (byte_offset, byte_size) in grad_arena.
+    let mut adj_to_arena: std::collections::HashMap<crate::wengert::VarId, (u32, u32)> =
+        std::collections::HashMap::new();
+
+    let start_var = extractor.next_var_id();
+    let mut gen = crate::source_ad::AdjointGenerator::new(start_var);
+    // Generate adjoint before we need adjoint_of() — it consumes the primal list.
+    let adjoint = gen.generate(extractor.wengert_list());
+
+    for (compound_name, primal_vid) in extractor.named_param_var_ids() {
+        // Strip "self." prefix to get bare field name.
+        let field_name = match compound_name.strip_prefix(self_prefix) {
+            Some(f) => f,
+            None => continue,
+        };
+        let Some(&(offset, nbytes)) = field_to_arena.get(field_name) else {
+            continue;
+        };
+        let Some(adj_vid) = gen.adjoint_of(*primal_vid) else {
+            continue;
+        };
+        param_adj_set.insert(adj_vid);
+        adj_to_arena.insert(adj_vid, (offset, nbytes));
+    }
+
+    // ── Emit IR ──────────────────────────────────────────────────────────────
     let mut ctx = Context::for_function(Function::with_name_signature(
         UserFuncName::user(0, compiler.next_func_index()),
         sig,
     ));
     let mut fn_builder_ctx = FunctionBuilderContext::new();
-    {
+    let result = (|| {
         let mut b = FunctionBuilder::new(&mut ctx.func, &mut fn_builder_ctx);
         let entry = b.create_block();
         b.append_block_params_for_function_params(entry);
         b.switch_to_block(entry);
         b.seal_block(entry);
+
+        let weight_ptrs   = b.block_params(entry)[0];
+        let _num_weights  = b.block_params(entry)[1];
+        let input_handle  = b.block_params(entry)[2];
+        let _dy_handle    = b.block_params(entry)[3];
+
+        // ── Step 1: load weight tensors from weight_ptrs ──────────────────
+        // Mirrors emit_model_forward_bridge: call nsl_model_get_weight per field.
+        // We build a map: field_name → Cranelift Value (the loaded tensor handle).
+        let model_get_weight_ref = compiler
+            .module
+            .declare_func_in_func(model_get_weight_id, b.func);
+        let tensor_free_ref = compiler
+            .module
+            .declare_func_in_func(tensor_free_id, b.func);
+
+        let mut field_values: HashMap<String, cranelift_codegen::ir::Value> = HashMap::new();
+        let mut loaded_weight_vals: Vec<cranelift_codegen::ir::Value> = Vec::new();
+        for field_name in &tensor_fields {
+            let qualified_name = format!("{model_name}.{field_name}");
+            let symbol = format!(
+                "__nsl_calib_bwd_weight_name_{}_{}",
+                model_name, field_name
+            );
+            let name_data = declare_cstr_rodata(&mut compiler.module, &symbol, &qualified_name)?;
+            let name_ref = compiler.module.declare_data_in_func(name_data, b.func);
+            let name_ptr = b.ins().symbol_value(cl_types::I64, name_ref);
+            let name_len = b.ins().iconst(cl_types::I64, qualified_name.len() as i64);
+            let call_inst = b.ins().call(model_get_weight_ref, &[weight_ptrs, name_ptr, name_len]);
+            let tensor_val = b.inst_results(call_inst)[0];
+            field_values.insert(field_name.clone(), tensor_val);
+            loaded_weight_vals.push(tensor_val);
+        }
+
+        // ── Step 2: build primal_vars for source-AD lowering ──────────────
+        // Map:
+        //   input symbol VarId → input_handle (from block param)
+        //   each weight symbol VarId → the loaded tensor value
+        let mut primal_vars = crate::wengert_lower::VarMap::new();
+
+        // Map input symbol.
+        if let Some(input_sym) = input_sym_opt {
+            if let Some(&vid) = extractor.symbol_var_map().get(&input_sym) {
+                primal_vars.insert(vid, input_handle);
+            }
+        }
+        // Map weight params via named_param_var_ids.
+        for (compound_name, primal_vid) in extractor.named_param_var_ids() {
+            let field_name = match compound_name.strip_prefix(self_prefix) {
+                Some(f) => f,
+                None => continue,
+            };
+            if let Some(&tensor_val) = field_values.get(field_name) {
+                primal_vars.insert(*primal_vid, tensor_val);
+            }
+        }
+        // Also seed Input ops by name in the Wengert list.
+        // Resolve the input symbol name once for the name-match path.
+        let input_sym_name = input_sym_opt
+            .and_then(|sym| compiler.interner.resolve(sym.0))
+            .unwrap_or("x");
+        for op in &extractor.wengert_list().ops {
+            if let crate::wengert::PrimalOp::Input(name) = &op.op {
+                if primal_vars.contains_key(&op.result) {
+                    continue;
+                }
+                if name == input_sym_name {
+                    primal_vars.insert(op.result, input_handle);
+                }
+            }
+        }
+
+        // ── Step 3: lower primal forward ──────────────────────────────────
+        let mut func_state = crate::context::FuncState::default();
+        let full_lowered = map_codegen_error(
+            "model_backward: lower primal forward",
+            crate::wengert_lower::compile_wengert_ops(
+                compiler,
+                &mut b,
+                &mut func_state,
+                extractor.wengert_list(),
+                &primal_vars,
+                None,
+            ),
+        )?;
+        let full_vars = full_lowered.var_map.clone();
+
+        // ── Step 4: prepare grad-arena global value reference ────────────
+        // The GV is declared once per function so the module can link it.
+        // The actual `symbol_value` instruction is emitted INSIDE the
+        // on_param_grad callback — one per weight gradient — so that each
+        // splice produces an independent relocation targeting
+        // `__nsl_calib_grad_arena` in the object's text section.
+        // Spec §4.2 / test-spec §wggo_grad_arena_splice: "one relocation
+        // per distinct W_* that the on_param_grad callback writes to."
+        let grad_arena_gv = compiler.module.declare_data_in_func(grad_arena_data_id, b.func);
+
+        // ── Step 5: lower adjoint backward with on_param_grad callback ────
+        // The callback: for each fired gradient VarId, load the raw data
+        // pointer from the NslTensor (offset 8 = data field), compute
+        // dst = arena_base + byte_offset, and emit a byte-copy loop.
+        // Then free the gradient tensor.
+        let arena_map = &adj_to_arena;
+        let mut grad_cb = |c: &mut crate::compiler::Compiler<'_>,
+                           var_id: crate::wengert::VarId,
+                           grad_val: cranelift_codegen::ir::Value,
+                           fb: &mut FunctionBuilder|
+         -> Result<(), crate::error::CodegenError> {
+            let Some(&(offset, nbytes)) = arena_map.get(&var_id) else {
+                // Not in our target set — free and skip.
+                c.compile_call_by_name(fb, "nsl_tensor_free", &[grad_val])?;
+                return Ok(());
+            };
+            // Emit symbol_value here (not once outside the callback) so that
+            // each splice generates an independent relocation targeting
+            // __nsl_calib_grad_arena.  This satisfies the §4.2 invariant
+            // that the linker can observe one arena reference per W_*.
+            let arena_base = fb.ins().symbol_value(cl_types::I64, grad_arena_gv);
+            // Get raw data pointer from the NslTensor struct.
+            // NslTensor.data is at offset NSL_TENSOR_DATA_OFFSET (= 8 bytes after magic).
+            const DATA_OFF: i32 =
+                nsl_runtime::tensor::NSL_TENSOR_DATA_OFFSET as i32;
+            let src_ptr = fb.ins().load(
+                cl_types::I64,
+                MemFlags::new(),
+                grad_val,
+                DATA_OFF,
+            );
+            // Emit inline byte-copy loop to grad arena slot.
+            crate::calibration::retention::emit_splice_memcpy(
+                fb,
+                arena_base,
+                offset as u64,
+                src_ptr,
+                nbytes as u64,
+            );
+            // Free the gradient tensor (callback owns it).
+            c.compile_call_by_name(fb, "nsl_tensor_free", &[grad_val])?;
+            Ok(())
+        };
+
+        let mut adj_func_state = crate::context::FuncState::default();
+        map_codegen_error(
+            "model_backward: lower adjoint backward",
+            crate::wengert_lower::compile_wengert_ops(
+                compiler,
+                &mut b,
+                &mut adj_func_state,
+                &adjoint,
+                &full_vars,
+                Some((&param_adj_set, &mut grad_cb)),
+            ),
+        )?;
+
+        // ── Step 6: free loaded weight views ──────────────────────────────
+        // The weights loaded via nsl_model_get_weight are borrowed views;
+        // release them now.  (Matching the forward bridge pattern.)
+        for weight_val in loaded_weight_vals {
+            b.ins().call(tensor_free_ref, &[weight_val]);
+        }
+
         b.ins().return_(&[]);
         b.finalize();
-    }
+        Ok::<(), HarnessError>(())
+    })();
+
+    result?;
+
     compiler
         .module
         .define_function(func_id, &mut ctx)
         .map_err(|e| HarnessError::Infrastructure {
-            reason: format!("define model_backward stub: {e}"),
+            reason: format!("define model_backward: {e}"),
         })?;
     Ok(func_id)
 }
@@ -1090,10 +1497,12 @@ fn emit_calibration_backward_wrapper(
         let dy_call = b.ins().call(mul_scalar_ref, &[y_handle, two_f64, flags_zero]);
         let dy_handle = b.inst_results(dy_call)[0];
 
-        // ── Step 4: call model_backward(input_handle, dy_handle). ──
+        // ── Step 4: call model_backward(weight_ptrs, num_weights, input_handle, dy_handle). ──
+        // Task 16: backward bridge now takes weight_ptrs and num_weights so it can
+        // load weight tensors for source-AD primal forward re-run.
         let model_backward_ref =
             compiler.module.declare_func_in_func(model_backward_id, b.func);
-        b.ins().call(model_backward_ref, &[input_handle, dy_handle]);
+        b.ins().call(model_backward_ref, &[weight_ptrs, num_weights, input_handle, dy_handle]);
 
         // ── Step 5: free intermediates and return 0 (success). ──
         let tensor_free_ref =
@@ -1320,6 +1729,8 @@ pub fn emit_calibration_model_object(
             .expect("grad_arena_layout must be set when calibration_grad_retention is Some");
         let model_backward_id = emit_model_backward_bridge(
             &mut compiler,
+            model_def,
+            &model_name,
             _arena_layout,
             &grad_arena_layout_clone,
         )?;
