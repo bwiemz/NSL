@@ -36,6 +36,10 @@ pub use entry_points::{
     compile_with_zk_info_returning_plan,
 };
 
+// §5.7 debug helper seam: exposed so lib.rs can forward it as a public
+// `#[doc(hidden)]` fn without re-implementing the pre-scan pipeline.
+pub(crate) use entry_points::run_pre_scan_phase;
+
 /// Compile-time context for FlashAttention PTX dispatch.
 /// Populated by `compile_flash_attention_kernels()` when a `@flash_attention`-decorated
 /// function is found, consumed by `compile_flash_attention_call()` in expr.rs.
