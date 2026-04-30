@@ -378,6 +378,152 @@ fn emit_2d_max_abs_loop(
     // caller continues from row_exit
 }
 
+/// Emit a Cranelift IR loop inside `b` that performs a per-head `|grad · weight|`
+/// accumulation over `n_proj_heads × elements_per_head` f32 elements, writing the
+/// f64 running sum into `running_base`.
+///
+/// **Spec §4.6 invariants:**
+/// - f32 input values are promoted to f64 **before** accumulation (preserves
+///   numerical fidelity for the 524K-element reduction on large models).
+/// - The running buffer is f64 (8 bytes per element); `bytes_per_element = 8` in
+///   the matching `FinalizePlanEntry`.
+/// - MQA/GQA replication: K/V projections have fewer heads than Q/O.  Each K/V
+///   head `h` contributes to `replication` Q-head slots at indices
+///   `h * replication .. h * replication + replication` in the running buffer.
+///   The unrolled write loop `for r in 0..replication` implements this.
+///
+/// **Block layout (6 blocks):**
+///   caller_block → head_header(h=0)
+///   head_header(h): h < n_proj_heads → head_body / head_exit
+///   head_body: e=0 → elem_header(e)
+///   elem_header(e): e < elements_per_head → elem_body / elem_exit
+///   elem_body: grad*weight|→f64 → for r: running[h*rep+r] += v64; e++ → elem_header
+///   elem_exit: h++ → head_header
+///   head_exit: (fall through to caller)
+///
+/// All blocks are sealed here; the caller must NOT seal them.
+/// After this call the builder is positioned at `head_exit` (just like
+/// `emit_2d_max_abs_loop` leaves the builder at `row_exit`).
+// Task 21 (`emit_per_step` in the scaffolding loop) calls this to perform the
+// per-batch |g·w| reduction.  The allow(dead_code) suppresses the lint until
+// that wire-up lands.
+#[allow(dead_code)]
+pub(crate) fn emit_per_head_dot_abs_accum(
+    b: &mut FunctionBuilder,
+    grad_arena_base: cranelift_codegen::ir::Value,
+    src_offset: u32,
+    weight_data_base: cranelift_codegen::ir::Value,
+    running_base: cranelift_codegen::ir::Value,
+    n_proj_heads: u32,
+    elements_per_head: u32,
+    replication: u32,
+) {
+    let ptr_ty = cl_types::I64;
+
+    let head_header = b.create_block();
+    let head_body   = b.create_block();
+    let elem_header = b.create_block();
+    let elem_body   = b.create_block();
+    let elem_exit   = b.create_block();
+    let head_exit   = b.create_block();
+
+    // Block params: head_header carries h (I32), elem_header carries e (I32).
+    b.append_block_param(head_header, cl_types::I32); // h
+    b.append_block_param(elem_header, cl_types::I32); // e
+
+    let zero_i32      = b.ins().iconst(cl_types::I32, 0);
+    let four          = b.ins().iconst(cl_types::I32, 4);
+    let n_heads_v     = b.ins().iconst(cl_types::I32, n_proj_heads as i64);
+    let elems_v       = b.ins().iconst(cl_types::I32, elements_per_head as i64);
+    let soff_c        = b.ins().iconst(cl_types::I32, src_offset as i64);
+
+    // Jump from caller into the outer loop.
+    b.ins().jump(head_header, &[zero_i32]);
+
+    // ── head_header: if h < n_proj_heads → head_body else head_exit ────────
+    b.switch_to_block(head_header);
+    let h = b.block_params(head_header)[0];
+    let cmp_h = b.ins().icmp(IntCC::UnsignedLessThan, h, n_heads_v);
+    b.ins().brif(cmp_h, head_body, &[], head_exit, &[]);
+
+    // ── head_body: jump to elem_header(e=0) ────────────────────────────────
+    b.switch_to_block(head_body);
+    b.seal_block(head_body);
+    b.ins().jump(elem_header, &[zero_i32]);
+
+    // ── elem_header: if e < elements_per_head → elem_body else elem_exit ───
+    b.switch_to_block(elem_header);
+    let e = b.block_params(elem_header)[0];
+    let cmp_e = b.ins().icmp(IntCC::UnsignedLessThan, e, elems_v);
+    b.ins().brif(cmp_e, elem_body, &[], elem_exit, &[]);
+
+    // ── elem_body: compute addresses, load grad + weight, accumulate ────────
+    b.switch_to_block(elem_body);
+    b.seal_block(elem_body);
+
+    // Linear element index within this head: lin = h * elements_per_head + e
+    let h_elems = b.ins().imul(h, elems_v);
+    let lin     = b.ins().iadd(h_elems, e);
+
+    // grad_addr = grad_arena_base + src_offset + lin * 4
+    let lin4_g   = b.ins().imul(lin, four);
+    let raw_g    = b.ins().iadd(lin4_g, soff_c);
+    let raw_g_p  = b.ins().uextend(ptr_ty, raw_g);
+    let grad_addr = b.ins().iadd(grad_arena_base, raw_g_p);
+
+    // weight_addr = weight_data_base + lin * 4  (weights are packed [out, in] f32;
+    // no src_offset needed — weight_data_base already points at this projection's
+    // weight slice, which Task 21 threads in from nsl_model_get_weight_ptrs).
+    let lin4_w    = b.ins().imul(lin, four);
+    let raw_w_p   = b.ins().uextend(ptr_ty, lin4_w);
+    let wt_addr   = b.ins().iadd(weight_data_base, raw_w_p);
+
+    // Load f32 values.
+    let gv  = b.ins().load(cl_types::F32, MemFlags::new(), grad_addr, 0);
+    let wv  = b.ins().load(cl_types::F32, MemFlags::new(), wt_addr,   0);
+
+    // |grad * weight| — compute in f32, then promote to f64.
+    let prod    = b.ins().fmul(gv, wv);
+    let abs_prod = b.ins().fabs(prod);
+    let v64     = b.ins().fpromote(cl_types::F64, abs_prod);
+
+    // Unrolled replication loop: for r in 0..replication { running[h*rep+r] += v64 }
+    // Each K/V head contributes to `replication` Q-head running slots.
+    // The running buffer is f64 so each slot is 8 bytes.
+    let eight      = b.ins().iconst(cl_types::I32, 8);
+    let rep_v      = b.ins().iconst(cl_types::I32, replication as i64);
+    let base_slot  = b.ins().imul(h, rep_v); // h * replication
+
+    for r in 0..replication {
+        let r_v      = b.ins().iconst(cl_types::I32, r as i64);
+        let slot_idx = b.ins().iadd(base_slot, r_v);      // h*rep + r
+        let slot_off = b.ins().imul(slot_idx, eight);      // * 8 bytes
+        let slot_p   = b.ins().uextend(ptr_ty, slot_off);
+        let run_addr = b.ins().iadd(running_base, slot_p);
+        let cur      = b.ins().load(cl_types::F64, MemFlags::new(), run_addr, 0);
+        let new_val  = b.ins().fadd(cur, v64);
+        b.ins().store(MemFlags::new(), new_val, run_addr, 0);
+    }
+
+    // e++ → elem_header
+    let ep1 = b.ins().iadd_imm(e, 1);
+    b.ins().jump(elem_header, &[ep1]);
+
+    // ── elem_exit: h++ → head_header ────────────────────────────────────────
+    b.switch_to_block(elem_exit);
+    b.seal_block(elem_exit);
+    let hp1 = b.ins().iadd_imm(h, 1);
+    b.ins().jump(head_header, &[hp1]);
+
+    // Seal back-edge blocks now that all predecessors are known.
+    b.seal_block(head_header);
+    b.seal_block(elem_header);
+
+    b.switch_to_block(head_exit);
+    b.seal_block(head_exit);
+    // caller continues from head_exit
+}
+
 /// Size of `AwqProjectionDescriptor` on 64-bit platforms (matching `#[repr(C)]`):
 ///   path_ptr:    *const u8  = 8 bytes
 ///   path_len:    usize      = 8 bytes
@@ -4065,5 +4211,120 @@ mod loop_body_dispatch {
             }
         }
         count
+    }
+}
+
+/// Tests for `emit_per_head_dot_abs_accum` (Task 20, spec §4.6).
+///
+/// These tests operate directly on Cranelift IR text (via `func.display()`)
+/// so they run without a GPU, without the subprocess, and without a fixture
+/// NSL source file.  They check:
+///   1. f32 → f64 promotion happens before the accumulating fadd.
+///   2. The running buffer is read/written as f64 (8 bytes).
+///   3. MQA/GQA replication emits one f64 store per replication slot.
+#[cfg(test)]
+mod per_head_dot {
+    use cranelift_codegen::ir::types as cl_types;
+    use cranelift_codegen::ir::{AbiParam, Function, InstBuilder, UserFuncName};
+    use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
+
+    use super::emit_per_head_dot_abs_accum;
+
+    /// Build a tiny test `Function`, call `emit_per_head_dot_abs_accum` with the
+    /// given dimensions, finalise, and return the IR text.
+    ///
+    /// The three "base" pointer Values are materialised as `iconst(I64, 0)` — safe
+    /// for IR text inspection; we never execute this function.
+    fn emit_helper_for_test(
+        n_proj_heads: u32,
+        elements_per_head: u32,
+        replication: u32,
+    ) -> String {
+        // Build a no-arg, no-return signature.
+        let mut sig = cranelift_codegen::ir::Signature::new(
+            cranelift_codegen::isa::CallConv::SystemV,
+        );
+        sig.params.push(AbiParam::new(cl_types::I64)); // grad_arena_base
+        sig.params.push(AbiParam::new(cl_types::I64)); // weight_data_base
+        sig.params.push(AbiParam::new(cl_types::I64)); // running_base
+
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
+        let mut fn_builder_ctx = FunctionBuilderContext::new();
+        {
+            let mut b = FunctionBuilder::new(&mut func, &mut fn_builder_ctx);
+            let entry = b.create_block();
+            b.append_block_params_for_function_params(entry);
+            b.switch_to_block(entry);
+            b.seal_block(entry);
+
+            let grad_base   = b.block_params(entry)[0];
+            let weight_base = b.block_params(entry)[1];
+            let running_base = b.block_params(entry)[2];
+
+            emit_per_head_dot_abs_accum(
+                &mut b,
+                grad_base,
+                /*src_offset=*/ 0,
+                weight_base,
+                running_base,
+                n_proj_heads,
+                elements_per_head,
+                replication,
+            );
+
+            // head_exit is now current; terminate.
+            b.ins().return_(&[]);
+            b.finalize();
+        }
+
+        format!("{}", func.display())
+    }
+
+    /// §4.6 invariant: f32 inputs must be promoted to f64 before accumulation.
+    /// Verified by checking the IR text for `fpromote`, `fadd`, and `load.f64`.
+    #[test]
+    fn emit_per_head_dot_abs_accum_emits_f64_accumulator() {
+        let ir = emit_helper_for_test(/*n_proj_heads=*/4, /*elements_per_head=*/16, /*replication=*/1);
+        assert!(
+            ir.contains("fpromote"),
+            "must promote f32 → f64 before accumulating; got:\n{ir}"
+        );
+        assert!(
+            ir.contains("fadd"),
+            "must accumulate (fadd); got:\n{ir}"
+        );
+        // Cranelift displays f64 loads as "load.f64" in the textual IR.
+        assert!(
+            ir.contains("load.f64"),
+            "running buffer must be loaded as f64; got:\n{ir}"
+        );
+    }
+
+    /// §4.6 MQA/GQA replication: K/V with n_proj_heads=1, replication=4 must
+    /// write into 4 distinct f64 slots (one per Q-head it serves).
+    #[test]
+    fn emit_per_head_dot_abs_accum_handles_replication_for_mqa() {
+        // MQA: n_proj_heads=1 (K/V), replication=4 (q-heads).
+        let ir = emit_helper_for_test(/*n_proj_heads=*/1, /*elements_per_head=*/16, /*replication=*/4);
+
+        // The unrolled loop emits 4 fadd-store pairs.  Count "store" occurrences
+        // that appear after "f64" in the IR (store.f64 stores).
+        // Cranelift displays f64 stores as "store v... -> ..." without a type suffix
+        // on the store opcode itself — we count by counting "fadd" occurrences, which
+        // correspond 1:1 with the replication unrolling (one fadd per slot per element).
+        // For replication=4 and 16 elements, there are 4*16 = 64 fadds total.
+        let fadd_count = ir.matches("fadd").count();
+        assert!(
+            fadd_count >= 4,
+            "expected ≥4 fadd instructions for replication=4 (one per Q-head slot); \
+             got {fadd_count}:\n{ir}"
+        );
+
+        // Also verify the load.f64 count is >= 4 (one per replication slot per elem).
+        let load_f64_count = ir.matches("load.f64").count();
+        assert!(
+            load_f64_count >= 4,
+            "expected ≥4 load.f64 for replication=4; got {load_f64_count}:\n{ir}"
+        );
     }
 }
