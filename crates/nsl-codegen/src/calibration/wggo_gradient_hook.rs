@@ -150,6 +150,9 @@ impl CalibrationHook for WggoGradientHook {
                     projection: ProjectionRef(format!("{}.__wggo_grad", t.layer_key)),
                     running_symbol: running_symbol_for(&t.layer_key),
                     channels: num_heads,
+                    // WGGO per-head gradient accumulator uses f64 (spec §4.6):
+                    // 8 bytes per head, distinct from AWQ's f32 max-abs (4 bytes).
+                    bytes_per_element: 8,
                 }
             })
             .collect()
@@ -283,6 +286,20 @@ mod tests {
         assert_eq!(plan[1].channels, 4);
         assert_eq!(plan[1].running_symbol, "__nsl_wggo_grad.model_layers_1");
         assert_eq!(plan[1].projection.0, "model.layers.1.__wggo_grad");
+    }
+
+    /// Spec §4.6: WGGO running buffers use f64 accumulators — each entry must
+    /// declare bytes_per_element=8 so the Cranelift BSS allocation is the
+    /// correct size (channels * 8, not channels * 4).
+    #[test]
+    fn finalize_plan_uses_f64_bytes_per_element() {
+        let hook = WggoGradientHook::new(vec![fixture_target_4heads("model.layers.0")]);
+        let plan = hook.finalize_plan();
+        assert_eq!(plan.len(), 1);
+        assert_eq!(
+            plan[0].bytes_per_element, 8,
+            "WGGO finalize_plan must use bytes_per_element=8 (f64) per spec §4.6"
+        );
     }
 
     #[test]

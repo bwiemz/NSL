@@ -19,6 +19,10 @@ pub struct FinalizePlanEntry {
     pub projection: ProjectionRef,
     pub running_symbol: String,
     pub channels: u32,
+    /// Number of bytes per accumulator element.  AWQ uses 4 (f32 max-abs
+    /// reduction, spec §4.3); WGGO uses 8 (f64 per-head accumulator,
+    /// spec §4.6).  Total BSS size = `channels * bytes_per_element`.
+    pub bytes_per_element: u8,
 }
 
 /// Outcome of a hook's `emit_finalize` call.

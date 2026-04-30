@@ -1866,10 +1866,13 @@ pub fn emit_calibration_scaffolding_object(
         None
     };
 
+    // AWQ entries use bytes_per_element=4 (f32 max-abs running buffer, spec §4.3).
+    // WGGO entries use bytes_per_element=8 (f64 per-head accumulator, spec §4.6).
+    // Do NOT collapse these to a single constant — the sizes differ by design.
     let mut running_data_ids: HashMap<String, DataId> = HashMap::new();
     for entry in finalize_plan {
         let mut data = DataDescription::new();
-        data.define_zeroinit((entry.channels * 4) as usize);
+        data.define_zeroinit((entry.channels * (entry.bytes_per_element as u32)) as usize);
         let id = module
             .declare_data(&entry.running_symbol, Linkage::Export, true, false)
             .map_err(|e| HarnessError::Infrastructure {
@@ -2437,6 +2440,10 @@ pub fn emit_calibration_scaffolding_object(
             // object file.  The test in `loop_body_dispatch` inspects these
             // relocation entries to verify the hook was wired in.
             if needs_backward && !per_step_backward_symbols.is_empty() {
+                // Task 18 placeholder: single scratch slot is intentional. All stores
+                // overwrite offset 0; the slot exists only to prevent Cranelift DCE
+                // of the symbol_value instructions. Task 21 will replace the loop
+                // with a real per-symbol reduction (one slot per accumulator).
                 let scratch_slot = b.create_sized_stack_slot(StackSlotData::new(
                     StackSlotKind::ExplicitSlot,
                     8,
@@ -2699,10 +2706,13 @@ fn emit_and_link_calibration_binary(
 
     // ── Step 2: Declare per-projection running buffers as zeroinit .data globals ──
     // These are the targets of the 2D max-abs reduction loop.
+    // AWQ entries use bytes_per_element=4 (f32 max-abs running buffer, spec §4.3).
+    // WGGO entries use bytes_per_element=8 (f64 per-head accumulator, spec §4.6).
+    // Do NOT collapse these to a single constant — the sizes differ by design.
     let mut running_data_ids: HashMap<String, DataId> = HashMap::new();
     for entry in finalize_plan {
         let mut data = DataDescription::new();
-        data.define_zeroinit((entry.channels * 4) as usize);
+        data.define_zeroinit((entry.channels * (entry.bytes_per_element as u32)) as usize);
         let id = module
             .declare_data(
                 &entry.running_symbol,
@@ -3320,6 +3330,7 @@ mod tests {
             projection: crate::calibration::ProjectionRef("TinyMLP.up_proj".into()),
             running_symbol: "__nsl_awq_running_up_proj".into(),
             channels: 64,
+            bytes_per_element: 4, // AWQ f32 max-abs running buffer
         }];
         let arena_layout = build_arena_layout(
             &[crate::calibration::DiscoveredProjection {
@@ -3829,6 +3840,7 @@ mod loop_body_dispatch {
             projection: ProjectionRef("TinyMLP.up_proj".into()),
             running_symbol: "__nsl_awq_running_up_proj".into(),
             channels: 64,
+            bytes_per_element: 4, // AWQ f32 max-abs running buffer
         }];
         let arena_layout = build_arena_layout(
             &[crate::calibration::DiscoveredProjection {
@@ -3926,10 +3938,13 @@ mod loop_body_dispatch {
     /// Test strategy: relocation-symbol inspection on the emitted `.o` file.
     /// The placeholder `symbol_value` + `stack_store` in the loop body creates
     /// at least one relocation entry per symbol so the linker sees a reference.
+    ///
+    /// Two WGGO symbols are passed to verify the loop iterates correctly —
+    /// the assertion is tightened to `>= 2` to catch any single-iteration bug.
     #[test]
     fn loop_body_invokes_emit_per_step_for_backward_hooks_after_backward_call() {
-        // Build a finalize_plan that includes a WGGO running buffer alongside
-        // the AWQ running buffer so both are in running_data_ids.
+        // Build a finalize_plan that includes TWO WGGO running buffers alongside
+        // the AWQ running buffer so all three are in running_data_ids.
         let observe_plan = vec![ObservePlanEntry {
             projection: ProjectionRef("TinyMLP.up_proj".into()),
             src_offset: 0,
@@ -3942,12 +3957,21 @@ mod loop_body_dispatch {
                 projection: ProjectionRef("TinyMLP.up_proj".into()),
                 running_symbol: "__nsl_awq_running_up_proj".into(),
                 channels: 64,
+                bytes_per_element: 4, // AWQ f32 max-abs running buffer
             },
-            // WGGO running buffer — this is what emit_per_step references.
+            // WGGO running buffers — these are what emit_per_step references.
+            // Uses bytes_per_element=8 (f64 per-head accumulator, spec §4.6).
             FinalizePlanEntry {
                 projection: ProjectionRef("TinyMLP.__wggo_grad".into()),
                 running_symbol: "__nsl_wggo_grad.TinyMLP".into(),
                 channels: 4,
+                bytes_per_element: 8, // WGGO f64 per-head accumulator
+            },
+            FinalizePlanEntry {
+                projection: ProjectionRef("TinyMLP2.__wggo_grad".into()),
+                running_symbol: "__nsl_wggo_grad.TinyMLP2".into(),
+                channels: 4,
+                bytes_per_element: 8, // WGGO f64 per-head accumulator
             },
         ];
         let arena_layout = build_arena_layout(
@@ -3958,7 +3982,11 @@ mod loop_body_dispatch {
             8,
             4,
         );
-        let per_step_backward_symbols = vec!["__nsl_wggo_grad.TinyMLP".to_string()];
+        // Two distinct WGGO symbols — verifies the loop iterates over all of them.
+        let per_step_backward_symbols = vec![
+            "__nsl_wggo_grad.TinyMLP".to_string(),
+            "__nsl_wggo_grad.TinyMLP2".to_string(),
+        ];
         let tmp = tempfile::tempdir().expect("tempdir");
         let out_path = tmp.path().join("scaffolding_wggo.o");
 
@@ -3972,15 +4000,16 @@ mod loop_body_dispatch {
             &per_step_backward_symbols,
             &out_path,
         )
-        .expect("emit succeeds with WGGO per-step symbols");
+        .expect("emit succeeds with two WGGO per-step symbols");
 
         let obj_bytes = std::fs::read(&out_path).expect("object readable");
         let obj = object::File::parse(&*obj_bytes).expect("object::File::parse");
 
         let count = count_wggo_grad_refs(&obj);
         assert!(
-            count >= 1,
-            "expected ≥1 __nsl_wggo_grad.* relocation reference in scaffolding.o; got {count}"
+            count >= 2,
+            "expected ≥2 __nsl_wggo_grad.* relocation references in scaffolding.o \
+             (one per symbol in per_step_backward_symbols); got {count}"
         );
     }
 

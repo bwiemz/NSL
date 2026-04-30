@@ -140,6 +140,8 @@ impl CalibrationHook for AwqCalibrationHook {
                 projection: proj.clone(),
                 running_symbol: running_symbol_for(proj),
                 channels,
+                // AWQ max-abs reduction accumulates f32 values (spec §4.3).
+                bytes_per_element: 4,
             })
             .collect();
         entries.sort_by(|a, b| a.projection.0.cmp(&b.projection.0));

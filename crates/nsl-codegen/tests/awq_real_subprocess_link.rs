@@ -74,6 +74,7 @@ fn awq_plans() -> (Vec<ObservePlanEntry>, Vec<FinalizePlanEntry>) {
             projection,
             running_symbol: "__nsl_awq_running_up_proj".into(),
             channels: 64,
+            bytes_per_element: 4, // AWQ f32 max-abs running buffer
         }],
     )
 }
