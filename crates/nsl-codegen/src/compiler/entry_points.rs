@@ -343,6 +343,8 @@ pub fn compile_returning_splice_count_for_tests(
     compiler.collect_agents(&ast.stmts)?;
     populate_calibration_retention_from_ast_if_unset(&mut compiler, ast, interner)?;
     compiler.emit_retention_arena()?;
+    // Task 10: backward (WGGO grad) sibling arena — spec §7.2 ordering invariant #2.
+    compiler.emit_grad_retention_arena()?;
     compiler.declare_runtime_functions()?;
     compiler.declare_user_functions(&ast.stmts)?;
     // M56 Task 17: declare agent method FuncIds (Linkage::Local mirrors non-export modules).
@@ -410,6 +412,8 @@ pub fn compile_returning_plan(
     // silently no-op.  No-op when `calibration_retention` is `None`, so
     // shipped binaries are unaffected.
     compiler.emit_retention_arena()?;
+    // Task 10: backward (WGGO grad) sibling arena — spec §7.2 ordering invariant #2.
+    compiler.emit_grad_retention_arena()?;
     compiler.declare_runtime_functions()?;
     compiler.declare_user_functions(&ast.stmts)?;
     // M56 Task 17: declare agent method FuncIds.
@@ -584,6 +588,8 @@ fn compile_with_zk_info_best_effort_plan(
         // Task 4: declare the calibration retention arena BEFORE method-body
         // codegen — see `compile_returning_plan` for the full rationale.
         compiler.emit_retention_arena()?;
+        // Task 10: backward (WGGO grad) sibling arena — spec §7.2 ordering invariant #2.
+        compiler.emit_grad_retention_arena()?;
         compiler.declare_runtime_functions()?;
         compiler.declare_user_functions(&ast.stmts)?;
         // M56 Task 17: declare agent method FuncIds.
@@ -758,6 +764,8 @@ fn compile_standalone_best_effort_plan(
         // Task 4: declare the calibration retention arena BEFORE method-body
         // codegen — see `compile_returning_plan` for the full rationale.
         compiler.emit_retention_arena()?;
+        // Task 10: backward (WGGO grad) sibling arena — spec §7.2 ordering invariant #2.
+        compiler.emit_grad_retention_arena()?;
         compiler.declare_runtime_functions()?;
         compiler.declare_user_functions(&ast.stmts)?;
         // M56 Task 17: declare agent method FuncIds.
@@ -819,6 +827,8 @@ pub fn compile_test(
     // pipe site would otherwise no-op the splice if the caller set
     // `calibration_retention` on CompileOptions.
     compiler.emit_retention_arena()?;
+    // Task 10: backward (WGGO grad) sibling arena — spec §7.2 ordering invariant #2.
+    compiler.emit_grad_retention_arena()?;
     compiler.declare_runtime_functions()?;
     compiler.declare_user_functions(&ast.stmts)?;
     // M56 Task 17: declare agent method FuncIds.
@@ -978,6 +988,8 @@ pub fn compile_module_with_imports_best_effort_plan(
         // Task 4: declare the calibration retention arena BEFORE method-body
         // codegen — see `compile_returning_plan` for the full rationale.
         compiler.emit_retention_arena()?;
+        // Task 10: backward (WGGO grad) sibling arena — spec §7.2 ordering invariant #2.
+        compiler.emit_grad_retention_arena()?;
         compiler.declare_runtime_functions()?;
         compiler.declare_imported_functions(imported_fns)?;
         compiler.declare_user_functions_with_linkage(&ast.stmts, Linkage::Export)?;
@@ -1127,6 +1139,8 @@ pub fn compile_entry_returning_plan(
     // Task 4: declare the calibration retention arena BEFORE method-body
     // codegen — see `compile_returning_plan` for the full rationale.
     compiler.emit_retention_arena()?;
+    // Task 10: backward (WGGO grad) sibling arena — spec §7.2 ordering invariant #2.
+    compiler.emit_grad_retention_arena()?;
     compiler.declare_runtime_functions()?;
     compiler.declare_imported_functions(imported_fns)?;
     compiler.declare_user_functions_with_linkage(&ast.stmts, Linkage::Export)?;

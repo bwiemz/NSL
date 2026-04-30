@@ -2518,3 +2518,118 @@ mod tests {
         assert!(err_str.contains("found:"));
     }
 }
+
+#[cfg(test)]
+mod grad_arena_emission {
+    use super::*;
+    use object::{Object, ObjectSection, ObjectSymbol};
+    use nsl_lexer::Interner;
+
+    use crate::calibration::discovery::WggoGradTarget;
+    use crate::calibration::observation::ProjectionRef;
+    use crate::calibration::retention::build_grad_arena_layout;
+
+    /// Build two-layer fixture: two attention layers with 64x64 weight matrices.
+    fn sample_two_attention_layers() -> Vec<WggoGradTarget> {
+        (0..2)
+            .map(|i| WggoGradTarget {
+                layer_key: format!("gpt.blocks.{i}.attn"),
+                class_name: "Attention".into(),
+                head_dim: 64,
+                w_q: ProjectionRef(format!("gpt.blocks.{i}.attn.q_proj")),
+                w_k: ProjectionRef(format!("gpt.blocks.{i}.attn.k_proj")),
+                w_v: ProjectionRef(format!("gpt.blocks.{i}.attn.v_proj")),
+                w_o: ProjectionRef(format!("gpt.blocks.{i}.attn.o_proj")),
+                w_q_shape: [64, 64],
+                w_k_shape: [64, 64],
+                w_v_shape: [64, 64],
+                w_o_shape: [64, 64],
+            })
+            .collect()
+    }
+
+    #[test]
+    fn emit_grad_retention_arena_declares_bss_global_with_total_bytes() {
+        let targets = sample_two_attention_layers();
+        let layout = build_grad_arena_layout(&targets);
+        // 2 layers × 4 projections × (64 × 64 × 4 bytes) = 8 × 16384 = 131072
+        let expected_total = 2 * 4 * 64 * 64 * 4u32;
+        assert_eq!(layout.total_bytes, expected_total, "fixture sanity");
+
+        // Build a minimal Compiler with calibration_grad_retention set.
+        let interner = Interner::new();
+        let type_map = nsl_semantic::checker::TypeMap::default();
+        let mut opts = crate::CompileOptions::default();
+        opts.calibration_grad_retention = Some(targets);
+
+        let mut compiler =
+            crate::compiler::Compiler::new(&interner, &type_map, &opts)
+                .expect("Compiler::new");
+
+        // Should succeed and populate grad_arena_layout.
+        compiler
+            .emit_grad_retention_arena()
+            .expect("emit_grad_retention_arena must succeed");
+
+        assert!(
+            compiler.grad_arena_layout.is_some(),
+            "grad_arena_layout must be populated after emit"
+        );
+        assert_eq!(
+            compiler.grad_arena_layout.as_ref().unwrap().total_bytes,
+            expected_total,
+            "stored layout total_bytes must match"
+        );
+
+        // Finalize and verify the symbol appears in the emitted object with
+        // the expected size and Export linkage.
+        let obj_bytes = compiler.finalize().expect("finalize");
+        let obj = object::File::parse(&*obj_bytes).expect("object::File::parse");
+
+        // Find the __nsl_calib_grad_arena symbol.
+        let sym = obj
+            .symbols()
+            .find(|s| s.name() == Ok("__nsl_calib_grad_arena"))
+            .expect("__nsl_calib_grad_arena must be exported");
+
+        assert!(
+            !sym.is_undefined(),
+            "__nsl_calib_grad_arena must be defined (not just imported)"
+        );
+
+        // On ELF the symbol size field reflects the BSS region directly.
+        // On COFF (Windows) symbol sizes are stored in the containing section,
+        // not in the symbol table entry, so sym.size() returns 0 for BSS.
+        // We check the section's size instead, which is format-agnostic.
+        let section_idx = sym.section_index()
+            .expect("__nsl_calib_grad_arena must belong to a section");
+        let section = obj.section_by_index(section_idx)
+            .expect("section must be readable");
+        assert_eq!(
+            section.size(),
+            expected_total as u64,
+            "__nsl_calib_grad_arena section size must equal layout.total_bytes \
+             (ELF: symbol carries it; COFF: section carries it)"
+        );
+    }
+
+    #[test]
+    fn emit_grad_retention_arena_no_ops_when_option_is_none() {
+        let interner = Interner::new();
+        let type_map = nsl_semantic::checker::TypeMap::default();
+        let opts = crate::CompileOptions::default(); // calibration_grad_retention is None
+
+        let mut compiler =
+            crate::compiler::Compiler::new(&interner, &type_map, &opts)
+                .expect("Compiler::new");
+
+        compiler
+            .emit_grad_retention_arena()
+            .expect("no-op must not error");
+
+        assert!(
+            compiler.grad_arena_layout.is_none(),
+            "grad_arena_layout must remain None when option is not set"
+        );
+    }
+}

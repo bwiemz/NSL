@@ -776,6 +776,8 @@ pub fn compile_and_calibrate(
         compiler.compile_main(&parsed.module.stmts)?;
         compiler.compile_pending_lambdas()?;
         compiler.emit_retention_arena()?;
+        // Task 10: backward (WGGO grad) sibling arena — spec §7.2 ordering invariant #2.
+        compiler.emit_grad_retention_arena()?;
         Ok(())
     })();
 
