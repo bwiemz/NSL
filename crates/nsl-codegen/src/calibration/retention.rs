@@ -82,6 +82,36 @@ impl ArenaLayout {
     }
 }
 
+/// Per-projection layout in `__nsl_calib_grad_arena`. Spec §4.3.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GradArenaLayout {
+    /// (projection, byte_offset, byte_size). One entry per registered
+    /// target's W_q/W_k/W_v/W_o, in target × (q,k,v,o) order.
+    pub entries: Vec<(ProjectionRef, u32, u32)>,
+    /// Total .bss size; `__nsl_calib_grad_arena` is declared at this size.
+    pub total_bytes: u32,
+}
+
+pub fn build_grad_arena_layout(
+    targets: &[crate::calibration::discovery::WggoGradTarget],
+) -> GradArenaLayout {
+    let mut entries = Vec::with_capacity(targets.len() * 4);
+    let mut offset: u32 = 0;
+    for target in targets {
+        for (proj, shape) in [
+            (&target.w_q, &target.w_q_shape),
+            (&target.w_k, &target.w_k_shape),
+            (&target.w_v, &target.w_v_shape),
+            (&target.w_o, &target.w_o_shape),
+        ] {
+            let byte_size = shape[0].saturating_mul(shape[1]).saturating_mul(4); // f32 = 4 bytes
+            entries.push((proj.clone(), offset, byte_size));
+            offset = offset.saturating_add(byte_size);
+        }
+    }
+    GradArenaLayout { entries, total_bytes: offset }
+}
+
 /// Shape of the tensor feeding into a projection.  `[batch, seq,
 /// in_channels]` for the common transformer case.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -159,6 +189,61 @@ impl RetentionTable {
 
     pub fn len(&self) -> usize { self.entries.len() }
     pub fn is_empty(&self) -> bool { self.entries.is_empty() }
+}
+
+#[cfg(test)]
+mod grad_arena_tests {
+    use super::*;
+    use crate::calibration::discovery::WggoGradTarget;
+    use crate::calibration::observation::ProjectionRef;
+
+    #[test]
+    fn build_grad_arena_layout_assigns_per_projection_offsets() {
+        let targets = vec![WggoGradTarget {
+            layer_key: "gpt.blocks.0.attn".into(),
+            class_name: "Attention".into(),
+            head_dim: 128,
+            w_q: ProjectionRef("gpt.blocks.0.attn.q_proj".into()),
+            w_k: ProjectionRef("gpt.blocks.0.attn.k_proj".into()),
+            w_v: ProjectionRef("gpt.blocks.0.attn.v_proj".into()),
+            w_o: ProjectionRef("gpt.blocks.0.attn.o_proj".into()),
+            w_q_shape: [4096, 4096],
+            w_k_shape: [4096, 4096],
+            w_v_shape: [4096, 4096],
+            w_o_shape: [4096, 4096],
+        }];
+        let layout = build_grad_arena_layout(&targets);
+        // 4 projections × (4096 × 4096 × 4 bytes) = 4 × 64 MiB = 256 MiB
+        assert_eq!(layout.entries.len(), 4);
+        assert_eq!(layout.entries[0].0.0, "gpt.blocks.0.attn.q_proj");
+        assert_eq!(layout.entries[0].1, 0); // first offset is zero
+        assert_eq!(layout.entries[0].2, 4096 * 4096 * 4);
+        // Subsequent offsets are the cumulative sum
+        assert_eq!(layout.entries[1].1, 4096 * 4096 * 4);
+        assert_eq!(layout.total_bytes, 4 * 4096 * 4096 * 4);
+    }
+
+    #[test]
+    fn build_grad_arena_layout_handles_multiple_layers() {
+        let targets: Vec<_> = (0..3)
+            .map(|i| WggoGradTarget {
+                layer_key: format!("gpt.blocks.{i}.attn"),
+                class_name: "Attention".into(),
+                head_dim: 64,
+                w_q: ProjectionRef(format!("gpt.blocks.{i}.attn.q_proj")),
+                w_k: ProjectionRef(format!("gpt.blocks.{i}.attn.k_proj")),
+                w_v: ProjectionRef(format!("gpt.blocks.{i}.attn.v_proj")),
+                w_o: ProjectionRef(format!("gpt.blocks.{i}.attn.o_proj")),
+                w_q_shape: [128, 128],
+                w_k_shape: [128, 128],
+                w_v_shape: [128, 128],
+                w_o_shape: [128, 128],
+            })
+            .collect();
+        let layout = build_grad_arena_layout(&targets);
+        assert_eq!(layout.entries.len(), 12); // 3 layers × 4 projections
+        assert_eq!(layout.total_bytes, 12 * 128 * 128 * 4);
+    }
 }
 
 #[cfg(test)]
