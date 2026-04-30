@@ -1,0 +1,14 @@
+from nsl.nn.losses import mse_loss
+
+@quantize(dtype="awq4")
+model TinyMLPVoid:
+    up_proj: Tensor = zeros([128, 64])
+    down_proj: Tensor = zeros([64, 128])
+
+    fn forward(self, x: Tensor):
+        let _ = x |> up_proj |> relu |> down_proj
+
+fn main():
+    let m = TinyMLPVoid()
+    let x = zeros([1, 64])
+    m.forward(x)

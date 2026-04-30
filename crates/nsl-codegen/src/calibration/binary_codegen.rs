@@ -1039,7 +1039,8 @@ fn emit_calibration_backward_wrapper(
         //   offset  8: shape_ptr (i64)
         //   offset 16: strides_ptr (i64, 0 = row-major default)
         //   offset 24: ndim (i32)
-        //   offset 28: dtype (i32, 0 = f64, 1 = f32)  — calibration batches are f32
+        //   offset 28: dtype (i32) — C API convention: 0=f32, 1=f64 (opposite of NSL internal!)
+        //                            calibration batches are f32, so dtype=0 here.
         //   offset 32: device (i32, 0 = CPU)
         //   offset 36: pad (i32)
         let desc_slot = b.create_sized_stack_slot(StackSlotData::new(
@@ -1051,8 +1052,11 @@ fn emit_calibration_backward_wrapper(
         let zero_i64 = b.ins().iconst(cl_types::I64, 0);
         let zero_i32 = b.ins().iconst(cl_types::I32, 0);
         let ndim_i32 = b.ins().iconst(cl_types::I32, input_ndim as i64);
-        // dtype=1 (f32) to match the raw f32 calibration batch data.
-        let dtype_f32 = b.ins().iconst(cl_types::I32, 1);
+        // dtype=0 (C API f32) — mirrors the forward wrapper (binary_codegen.rs offset 28).
+        // NslTensorDesc.dtype follows the C API convention where 0=f32, NOT the NSL
+        // internal convention (where 0=f64). nsl_desc_to_tensor calls capi_dtype_to_nsl
+        // which maps 0 → NSL 1 (f32). Calibration batches are always raw f32.
+        let dtype_f32 = b.ins().iconst(cl_types::I32, 0);
 
         let shape_ref = compiler.module.declare_data_in_func(shape_data, b.func);
         let shape_ptr = b.ins().symbol_value(cl_types::I64, shape_ref);
@@ -1170,6 +1174,36 @@ pub fn emit_calibration_model_object(
             reason: format!("cannot find AWQ model '{model_name}' in AST"),
         }
     })?;
+
+    // Spec safety: backward wrapper synthesises L2 loss from forward's output (dy = 2y).
+    // A void-returning forward has no tensor to differentiate against — passing a null
+    // y_handle into nsl_tensor_mul_scalar is silent UB / segfault at runtime.
+    //
+    // Check the AST return annotation here, before any Cranelift IR is emitted, so we
+    // get an actionable error rather than a Cranelift verifier panic inside
+    // compile_user_functions (which cannot lower a void model method to a returning IR).
+    if compile_opts.calibration_grad_retention.is_some() {
+        let forward_has_return = model_def.members.iter().any(|m| {
+            if let nsl_ast::decl::ModelMember::Method(fn_def, _) = m {
+                if bundle.interner.resolve(fn_def.name.0) == Some("forward") {
+                    return fn_def.return_type.is_some();
+                }
+            }
+            false
+        });
+        if !forward_has_return {
+            return Err(HarnessError::Infrastructure {
+                reason: format!(
+                    "calibration: --wggo-importance=grad requires a model whose `forward` returns a tensor.\n\
+  requested: gradient-importance scoring with synthetic L2 loss\n\
+  expected:  model.forward returns a Tensor for L2 = sum(y\u{00B2})\n\
+  found:     model '{model_name}' forward has no return type\n\
+  fix:       return the activations from forward, or use --wggo-importance=magnitude."
+                ),
+            });
+        }
+    }
+
     let model_only_stmts: Vec<nsl_ast::stmt::Stmt> = bundle
         .ast
         .stmts
@@ -3159,6 +3193,55 @@ mod backward_wrapper {
         assert!(
             has_mul_scalar,
             "calib_model.o must reference nsl_tensor_mul_scalar"
+        );
+    }
+
+    /// Regression test for Issue 1: a void-returning `forward` with
+    /// `calibration_grad_retention` set must be refused at compile time, not
+    /// silently produce a null y_handle that crashes `nsl_tensor_mul_scalar`.
+    ///
+    /// The backward wrapper synthesises `dy = 2·y` from the forward output;
+    /// this is undefined when `y` is null (void-returning forward).
+    #[test]
+    fn void_forward_with_grad_retention_is_refused() {
+        let source = std::fs::read_to_string(fixture("awq_calibration_mlp_void_forward.nsl"))
+            .expect("void-forward fixture readable");
+        let mut interner = Interner::new();
+        let (tokens, lex_diags) = tokenize(&source, FileId(0), &mut interner);
+        assert!(
+            lex_diags.iter().all(|d| !matches!(d.level, Level::Error)),
+            "fixture must lex cleanly: {lex_diags:?}"
+        );
+        let parsed = nsl_parser::parse(&tokens, &mut interner);
+        assert!(
+            parsed.diagnostics.iter().all(|d| !matches!(d.level, Level::Error)),
+            "fixture must parse cleanly: {:?}",
+            parsed.diagnostics
+        );
+        let ast = parsed.module;
+
+        let projections = crate::calibration::pre_scan_awq_projections_from_ast(&ast, &interner);
+        let arena_layout = build_arena_layout(&projections, 8, 4);
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let out_path = tmp.path().join("calib_model_void.o");
+
+        let opts = compile_options_with_backward(&ast, &interner);
+
+        let result = emit_calibration_model_object(&ast, &opts, &arena_layout, &out_path);
+
+        assert!(
+            result.is_err(),
+            "emit_calibration_model_object must refuse a void-returning forward \
+             when calibration_grad_retention is set; got: {result:?}"
+        );
+        let err_msg = match result.unwrap_err() {
+            HarnessError::Infrastructure { reason } => reason,
+            other => panic!("expected Infrastructure error, got {other:?}"),
+        };
+        assert!(
+            err_msg.contains("forward has no return type")
+                || err_msg.contains("--wggo-importance=magnitude"),
+            "error message must mention the void-forward constraint; got: {err_msg}"
         );
     }
 }
