@@ -14,57 +14,6 @@ use crate::calibration::{
 use crate::calibration::observation::{ObservationSet, ProjectionRef};
 use crate::calibration::discovery::WggoGradTarget;
 
-// ── Discovery error ───────────────────────────────────────────────────────────
-
-#[derive(Debug)]
-pub enum WggoAnchorError {
-    /// No LM-head candidate found; add `@wggo_loss_anchor` to the model
-    /// output projection.
-    NoCandidate,
-    /// Multiple candidates found; disambiguate with `@wggo_loss_anchor`.
-    AmbiguousCandidates(Vec<String>),
-}
-
-impl std::fmt::Display for WggoAnchorError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::NoCandidate => write!(
-                f,
-                "no LM-head candidate found; add @wggo_loss_anchor to the model output projection"
-            ),
-            Self::AmbiguousCandidates(v) => write!(
-                f,
-                "multiple LM-head candidates: {:?}; disambiguate with @wggo_loss_anchor",
-                v
-            ),
-        }
-    }
-}
-
-impl std::error::Error for WggoAnchorError {}
-
-// ── Discovery function ────────────────────────────────────────────────────────
-
-/// Auto-discovers the LM-head loss anchor among the model's projections by
-/// matching path suffixes. Exactly one match must exist.
-pub fn discover_loss_anchor(
-    projections: &[ProjectionRef],
-) -> Result<ProjectionRef, WggoAnchorError> {
-    const SUFFIXES: &[&str] = &[".lm_head", ".output", ".output_proj", ".final_linear"];
-    let hits: Vec<ProjectionRef> = projections
-        .iter()
-        .filter(|p| SUFFIXES.iter().any(|s| p.0.ends_with(s)))
-        .cloned()
-        .collect();
-    match hits.len() {
-        0 => Err(WggoAnchorError::NoCandidate),
-        1 => Ok(hits.into_iter().next().unwrap()),
-        _ => Err(WggoAnchorError::AmbiguousCandidates(
-            hits.into_iter().map(|p| p.0).collect(),
-        )),
-    }
-}
-
 // ── Symbol naming ─────────────────────────────────────────────────────────────
 
 fn running_symbol_for(layer_key: &str) -> String {
@@ -79,20 +28,21 @@ fn running_symbol_for(layer_key: &str) -> String {
 #[derive(Debug)]
 pub struct WggoGradientHook {
     targets: Vec<WggoGradTarget>,
-    loss_anchor: ProjectionRef,
 }
 
 impl WggoGradientHook {
-    pub fn new(targets: Vec<WggoGradTarget>, loss_anchor: ProjectionRef) -> Self {
-        Self { targets, loss_anchor }
+    /// Construct a hook from pre-scanned WGGO targets.
+    ///
+    /// **No `loss_anchor` argument:** the synthetic L2 loss is computed
+    /// over `model_forward`'s return value (spec §4.4), so the hook does
+    /// not need to know the LM head's projection ref. The previous
+    /// `loss_anchor` parameter has been removed.
+    pub fn new(targets: Vec<WggoGradTarget>) -> Self {
+        Self { targets }
     }
 
     pub fn targets(&self) -> &[WggoGradTarget] {
         &self.targets
-    }
-
-    pub fn loss_anchor(&self) -> &ProjectionRef {
-        &self.loss_anchor
     }
 }
 
@@ -246,66 +196,6 @@ mod tests {
         fixture_target(layer_key, 64, [256, 256])
     }
 
-    // ── discover_loss_anchor ──────────────────────────────────────────────
-
-    #[test]
-    fn discover_single_lm_head_match() {
-        let ps = vec![
-            proj("model.embed"),
-            proj("model.lm_head"),
-            proj("model.layers.0.up_proj"),
-        ];
-        let anchor = discover_loss_anchor(&ps).unwrap();
-        assert_eq!(anchor.0, "model.lm_head");
-    }
-
-    #[test]
-    fn discover_output_suffix_matches() {
-        let ps = vec![proj("model.output")];
-        let anchor = discover_loss_anchor(&ps).unwrap();
-        assert_eq!(anchor.0, "model.output");
-    }
-
-    #[test]
-    fn discover_output_proj_suffix_matches() {
-        let ps = vec![proj("model.output_proj")];
-        let anchor = discover_loss_anchor(&ps).unwrap();
-        assert_eq!(anchor.0, "model.output_proj");
-    }
-
-    #[test]
-    fn discover_final_linear_suffix_matches() {
-        let ps = vec![proj("model.final_linear")];
-        let anchor = discover_loss_anchor(&ps).unwrap();
-        assert_eq!(anchor.0, "model.final_linear");
-    }
-
-    #[test]
-    fn discover_zero_matches_errors() {
-        let ps = vec![proj("model.foo")];
-        assert!(matches!(
-            discover_loss_anchor(&ps),
-            Err(WggoAnchorError::NoCandidate)
-        ));
-    }
-
-    #[test]
-    fn discover_multiple_matches_errors() {
-        let ps = vec![proj("a.lm_head"), proj("b.output_proj")];
-        assert!(matches!(
-            discover_loss_anchor(&ps),
-            Err(WggoAnchorError::AmbiguousCandidates(_))
-        ));
-    }
-
-    #[test]
-    fn discover_empty_list_errors() {
-        assert!(matches!(
-            discover_loss_anchor(&[]),
-            Err(WggoAnchorError::NoCandidate)
-        ));
-    }
-
     // ── observe_plan ─────────────────────────────────────────────────────
 
     #[test]
@@ -319,7 +209,7 @@ mod tests {
             (t.w_o.clone(), 48u32, 16u32),
         ];
         let arena = ArenaLayout { entries };
-        let hook = WggoGradientHook::new(vec![t], proj("model.lm_head"));
+        let hook = WggoGradientHook::new(vec![t]);
         let plan = hook.observe_plan(&arena);
         assert_eq!(plan.len(), 4, "all four projections should produce entries");
         for e in &plan {
@@ -344,7 +234,7 @@ mod tests {
         // Only w_q in arena; w_k, w_v, w_o absent.
         let entries = vec![(t.w_q.clone(), 0u32, 16u32)];
         let arena = ArenaLayout { entries };
-        let hook = WggoGradientHook::new(vec![t], proj("model.lm_head"));
+        let hook = WggoGradientHook::new(vec![t]);
         let plan = hook.observe_plan(&arena);
         assert_eq!(plan.len(), 1);
         assert_eq!(plan[0].projection, proj("model.layers.0.w_q"));
@@ -354,7 +244,7 @@ mod tests {
     fn observe_plan_empty_arena_produces_no_entries() {
         let t = fixture_target_4heads("model.layers.0");
         let arena = ArenaLayout { entries: vec![] };
-        let hook = WggoGradientHook::new(vec![t], proj("model.lm_head"));
+        let hook = WggoGradientHook::new(vec![t]);
         assert!(hook.observe_plan(&arena).is_empty());
     }
 
@@ -367,7 +257,7 @@ mod tests {
             (t1.w_q.clone(), 16u32, 16u32),
         ];
         let arena = ArenaLayout { entries };
-        let hook = WggoGradientHook::new(vec![t0, t1], proj("model.lm_head"));
+        let hook = WggoGradientHook::new(vec![t0, t1]);
         let plan = hook.observe_plan(&arena);
         // One projection per layer (only w_q present in arena for each).
         assert_eq!(plan.len(), 2);
@@ -384,7 +274,6 @@ mod tests {
                 fixture_target_4heads("model.layers.0"),
                 fixture_target_4heads("model.layers.1"),
             ],
-            proj("model.lm_head"),
         );
         let plan = hook.finalize_plan();
         assert_eq!(plan.len(), 2);
@@ -398,7 +287,7 @@ mod tests {
 
     #[test]
     fn finalize_plan_empty_targets() {
-        let hook = WggoGradientHook::new(vec![], proj("model.lm_head"));
+        let hook = WggoGradientHook::new(vec![]);
         assert!(hook.finalize_plan().is_empty());
     }
 
@@ -406,7 +295,7 @@ mod tests {
 
     #[test]
     fn hook_id_is_stable() {
-        let hook = WggoGradientHook::new(vec![], proj("model.lm_head"));
+        let hook = WggoGradientHook::new(vec![]);
         assert_eq!(hook.id(), "wggo_head_gradients");
     }
 
@@ -417,7 +306,6 @@ mod tests {
                 fixture_target_4heads("model.layers.0"),
                 fixture_target_4heads("model.layers.1"),
             ],
-            proj("model.lm_head"),
         );
         match hook.requires() {
             ObservationSet::BackwardGradients(refs) => {
@@ -431,7 +319,7 @@ mod tests {
 
     #[test]
     fn emit_finalize_stub_returns_empty_ok() {
-        let hook = WggoGradientHook::new(vec![], proj("model.lm_head"));
+        let hook = WggoGradientHook::new(vec![]);
         let mut ctx = crate::calibration::ctx::CalibCtx::stub_for_tests();
         match hook.emit_finalize(&mut ctx) {
             CalibrationResult::Ok(b) => assert!(b.is_empty()),
@@ -443,7 +331,6 @@ mod tests {
     fn hook_is_object_safe_via_box() {
         let hook: Box<dyn CalibrationHook> = Box::new(WggoGradientHook::new(
             vec![fixture_target_4heads("model.layers.0")],
-            proj("model.lm_head"),
         ));
         assert_eq!(hook.id(), "wggo_head_gradients");
     }
@@ -453,7 +340,6 @@ mod tests {
         // Indirectly test through finalize_plan.
         let hook = WggoGradientHook::new(
             vec![fixture_target_4heads("a.b.c")],
-            proj("model.lm_head"),
         );
         let plan = hook.finalize_plan();
         assert_eq!(plan[0].running_symbol, "__nsl_wggo_grad.a_b_c");
@@ -466,7 +352,7 @@ mod tests {
     #[test]
     fn head_dim_zero_does_not_panic_in_emit_init() {
         let t = fixture_target("model.layers.0", /*head_dim=*/ 0, /*w_o_shape=*/ [256, 256]);
-        let hook = WggoGradientHook::new(vec![t], proj("model.lm_head"));
+        let hook = WggoGradientHook::new(vec![t]);
         let mut ctx = crate::calibration::ctx::CalibCtx::stub_for_tests();
         // Must not panic; should emit a 1-head buffer (8 bytes).
         hook.emit_init(&mut ctx);
@@ -479,7 +365,7 @@ mod tests {
         let t = fixture_target("model.layers.0", 0, [256, 256]);
         let entries = vec![(t.w_q.clone(), 0u32, 16u32)];
         let arena = ArenaLayout { entries };
-        let hook = WggoGradientHook::new(vec![t], proj("model.lm_head"));
+        let hook = WggoGradientHook::new(vec![t]);
         // Must not panic; num_heads falls back to 1.
         let plan = hook.observe_plan(&arena);
         assert_eq!(plan.len(), 1);
@@ -489,7 +375,7 @@ mod tests {
     #[test]
     fn head_dim_zero_does_not_panic_in_finalize_plan() {
         let t = fixture_target("model.layers.0", 0, [256, 256]);
-        let hook = WggoGradientHook::new(vec![t], proj("model.lm_head"));
+        let hook = WggoGradientHook::new(vec![t]);
         // Must not panic; channels falls back to 1.
         let plan = hook.finalize_plan();
         assert_eq!(plan.len(), 1);
@@ -504,7 +390,7 @@ mod tests {
             fixture_target("model.layers.0", /*head_dim=*/ 128, /*w_o_shape=*/ [4096, 4096]),
             fixture_target("model.layers.1", 128, [4096, 4096]),
         ];
-        let hook = WggoGradientHook::new(targets, proj("model.lm_head"));
+        let hook = WggoGradientHook::new(targets);
         let mut ctx = crate::calibration::ctx::CalibCtx::stub_for_tests();
         hook.emit_init(&mut ctx);
 
