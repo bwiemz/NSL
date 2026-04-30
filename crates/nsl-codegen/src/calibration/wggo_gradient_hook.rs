@@ -117,7 +117,14 @@ impl CalibrationHook for WggoGradientHook {
             // n_o_heads = d_model / head_dim where d_model = w_o_shape[0]
             // (output dim of the o_proj). Floor to 1 to guard against
             // degenerate fixtures where head_dim > d_model.
-            let n_o_heads = (target.w_o_shape[0] / target.head_dim).max(1);
+            //
+            // Belt-and-suspenders: pre-scan rejects head_dim == 0 (discovery.rs),
+            // but guard the division here too in case a registry path bypasses pre-scan.
+            let n_o_heads = if target.head_dim == 0 {
+                1
+            } else {
+                (target.w_o_shape[0] / target.head_dim).max(1)
+            };
             let symbol = running_symbol_for(&target.layer_key);
             // Each head gets one f64 accumulator — 8 bytes per spec §4.6.
             ctx.declare_bss_global(&symbol, n_o_heads * 8);
@@ -142,7 +149,14 @@ impl CalibrationHook for WggoGradientHook {
         for t in &self.targets {
             // n_heads = d_model / head_dim (w_o_shape[0] is d_model);
             // floor to 1 to avoid div-by-zero.
-            let num_heads = (t.w_o_shape[0] / t.head_dim).max(1);
+            //
+            // Belt-and-suspenders: pre-scan rejects head_dim == 0 (discovery.rs),
+            // but guard the division here too in case a registry path bypasses pre-scan.
+            let num_heads = if t.head_dim == 0 {
+                1
+            } else {
+                (t.w_o_shape[0] / t.head_dim).max(1)
+            };
             for proj in [&t.w_q, &t.w_k, &t.w_v, &t.w_o] {
                 if let Some((_, offset, nbytes)) =
                     arena.entries.iter().find(|(p, _, _)| p == proj)
@@ -175,7 +189,13 @@ impl CalibrationHook for WggoGradientHook {
         self.targets
             .iter()
             .map(|t| {
-                let num_heads = (t.w_o_shape[0] / t.head_dim).max(1);
+                // Belt-and-suspenders: pre-scan rejects head_dim == 0 (discovery.rs),
+                // but guard the division here too in case a registry path bypasses pre-scan.
+                let num_heads = if t.head_dim == 0 {
+                    1
+                } else {
+                    (t.w_o_shape[0] / t.head_dim).max(1)
+                };
                 FinalizePlanEntry {
                     projection: ProjectionRef(format!("{}.__wggo_grad", t.layer_key)),
                     running_symbol: running_symbol_for(&t.layer_key),
@@ -437,6 +457,43 @@ mod tests {
         );
         let plan = hook.finalize_plan();
         assert_eq!(plan[0].running_symbol, "__nsl_wggo_grad.a_b_c");
+    }
+
+    // ── head_dim=0 defensive guard ────────────────────────────────────
+
+    /// Regression: pre-scan rejects head_dim=0 (discovery.rs), but a registry
+    /// path could bypass it.  All three division sites must not panic.
+    #[test]
+    fn head_dim_zero_does_not_panic_in_emit_init() {
+        let t = fixture_target("model.layers.0", /*head_dim=*/ 0, /*w_o_shape=*/ [256, 256]);
+        let hook = WggoGradientHook::new(vec![t], proj("model.lm_head"));
+        let mut ctx = crate::calibration::ctx::CalibCtx::stub_for_tests();
+        // Must not panic; should emit a 1-head buffer (8 bytes).
+        hook.emit_init(&mut ctx);
+        let g = ctx.lookup_bss_global("__nsl_wggo_grad.model_layers_0").unwrap();
+        assert_eq!(g.size_bytes, 8, "head_dim=0 → 1 head → 8 bytes");
+    }
+
+    #[test]
+    fn head_dim_zero_does_not_panic_in_observe_plan() {
+        let t = fixture_target("model.layers.0", 0, [256, 256]);
+        let entries = vec![(t.w_q.clone(), 0u32, 16u32)];
+        let arena = ArenaLayout { entries };
+        let hook = WggoGradientHook::new(vec![t], proj("model.lm_head"));
+        // Must not panic; num_heads falls back to 1.
+        let plan = hook.observe_plan(&arena);
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].channels, 1);
+    }
+
+    #[test]
+    fn head_dim_zero_does_not_panic_in_finalize_plan() {
+        let t = fixture_target("model.layers.0", 0, [256, 256]);
+        let hook = WggoGradientHook::new(vec![t], proj("model.lm_head"));
+        // Must not panic; channels falls back to 1.
+        let plan = hook.finalize_plan();
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].channels, 1);
     }
 
     // ── emit_init ────────────────────────────────────────────────────────

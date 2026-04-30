@@ -157,14 +157,23 @@ impl<'a> CalibCtx<'a> {
 
     // ---- BSS-global declaration (emit_init path) ----------------------------
 
-    /// Declare a BSS global with the given `symbol` name and `size_bytes`.
+    /// Records a BSS global declaration for the calibration codegen pipeline.
+    ///
+    /// Used by both `WggoGradientHook::emit_init` (production) and tests
+    /// (`stub_for_tests` + `lookup_bss_global` to verify what was declared).
     ///
     /// On the real Cranelift IR path (Task 12+) this will emit a
     /// zero-initialised data section of the requested size.  In stub / test
     /// mode it records the declaration into an in-memory map so tests can
     /// verify correct size via [`lookup_bss_global`].
     ///
-    /// Panics if the same symbol is declared twice (hook-author bug).
+    /// **Caller contract:** each `(CalibCtx, symbol)` pair must be declared at
+    /// most once.  Hooks that may run their `emit_init` more than once per
+    /// `CalibCtx` (e.g., a registry that re-binds an existing context) must
+    /// guard their own state.  Mirrors the `alloc_running_vec` precedent.
+    ///
+    /// # Panics
+    /// Panics if `symbol` was already declared in this `CalibCtx`.
     pub fn declare_bss_global(&mut self, symbol: &str, size_bytes: u32) {
         if self.bss_globals.contains_key(symbol) {
             panic!("duplicate BSS global declaration: {symbol}");

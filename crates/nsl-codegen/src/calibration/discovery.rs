@@ -737,7 +737,8 @@ fn try_build_wggo_target(
 
     let head_dim_init = inits.get(fields.head_dim.as_str())?;
     let head_dim_val = match evaluate_expr(head_dim_init, &scope, interner).ok()? {
-        EvalValue::Int(n) if n >= 0 && n <= u32::MAX as i64 => n as u32,
+        // head_dim == 0 is degenerate; skip silently — emit-time refusals would be worse than a no-op.
+        EvalValue::Int(n) if n >= 1 && n <= u32::MAX as i64 => n as u32,
         _ => return None,
     };
 
@@ -1818,6 +1819,36 @@ fn main():
     /// `grad(targets): ...` blocks have a `body: Block` that may contain user
     /// instantiations. The walker must descend into it (regression for
     /// code-review I1 of commit 795cbabc).
+    /// Regression: head_dim == 0 is degenerate and must be silently skipped by
+    /// pre-scan.  If it were accepted, the three integer-division sites in
+    /// `WggoGradientHook` would panic on `x / 0` before the `.max(1)` guard
+    /// could run.
+    #[test]
+    fn pre_scan_wggo_rejects_head_dim_zero() {
+        // head_dim field is literally 0; this must produce zero targets, not panic.
+        let source = r#"
+model Attention(dim: int):
+    head_dim: int = 0
+    q_proj: Tensor = zeros([dim, dim])
+    k_proj: Tensor = zeros([dim, dim])
+    v_proj: Tensor = zeros([dim, dim])
+    o_proj: Tensor = zeros([dim, dim])
+
+    @wggo_target(w_q=self.q_proj, w_k=self.k_proj, w_v=self.v_proj, w_o=self.o_proj, head_dim=self.head_dim)
+    fn forward(self, x: Tensor) -> Tensor:
+        return x
+
+fn main():
+    let m = Attention(dim=64)
+"#;
+        let (ast, interner) = parse_module(source);
+        let targets = pre_scan_wggo_targets_from_ast(&ast, &interner);
+        assert!(
+            targets.is_empty(),
+            "head_dim=0 must be silently rejected by pre-scan, got {targets:?}"
+        );
+    }
+
     #[test]
     fn pre_scan_wggo_finds_target_inside_grad_block() {
         let source = r#"
