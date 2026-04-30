@@ -650,14 +650,17 @@ fn try_build_wggo_target(
 /// Recursively walk `stmts` for `let <name> = <ClassName>(...)` bindings
 /// where `<ClassName>` is a `@wggo_target`-decorated model. Descends
 /// into block-shaped statements (`FnDef.body`, top-level `If`/`For`/
-/// `While`/`WhileLet`/`Match` arms, plain `Block`s, and `Decorated`
-/// inner stmts).
+/// `While`/`WhileLet`/`Match` arms, plain `Block`s, `Decorated` inner
+/// stmts, and the training DSL: `TrainBlock` section bodies +
+/// `GradBlock` body — the latter two matter because real user code
+/// puts model instantiations inside `train(...)` and `grad(...)`).
 fn walk_for_wggo_instantiations(
     stmts: &[nsl_ast::stmt::Stmt],
     decorated: &std::collections::HashMap<nsl_ast::Symbol, &ModelDef>,
     interner: &Interner,
     targets: &mut Vec<WggoGradTarget>,
 ) {
+    use nsl_ast::block::TrainSection;
     use nsl_ast::pattern::PatternKind;
     use nsl_ast::stmt::StmtKind as SK;
 
@@ -712,6 +715,65 @@ fn walk_for_wggo_instantiations(
                     targets,
                 );
             }
+            // Training DSL: `train(model = m, epochs = N): ...`. Each
+            // section may carry user statements (Step/Eval bodies, raw
+            // `Stmt`, `Data` stmt list, `Callbacks` with method bodies).
+            // Variants that hold a single `Expr` (Optimizer, Scheduler,
+            // Distribute) cannot bind a model instantiation `let` and
+            // are skipped.
+            SK::TrainBlock(train) => {
+                for section in &train.sections {
+                    match section {
+                        TrainSection::Step { body, .. }
+                        | TrainSection::Eval { body, .. } => {
+                            walk_for_wggo_instantiations(
+                                &body.stmts,
+                                decorated,
+                                interner,
+                                targets,
+                            );
+                        }
+                        TrainSection::Data(stmts) => {
+                            walk_for_wggo_instantiations(stmts, decorated, interner, targets);
+                        }
+                        TrainSection::Stmt(inner) => {
+                            walk_for_wggo_instantiations(
+                                std::slice::from_ref(inner.as_ref()),
+                                decorated,
+                                interner,
+                                targets,
+                            );
+                        }
+                        TrainSection::Callbacks(callbacks) => {
+                            for cb in callbacks {
+                                walk_for_wggo_instantiations(
+                                    &cb.body.stmts,
+                                    decorated,
+                                    interner,
+                                    targets,
+                                );
+                            }
+                        }
+                        TrainSection::Optimizer(_)
+                        | TrainSection::Scheduler(_)
+                        | TrainSection::Distribute(_) => {
+                            // Pure expressions; cannot contain `let` instantiations.
+                        }
+                    }
+                }
+            }
+            // `grad(targets): body` — the body is a `Block` of user
+            // statements, which is exactly where instantiations live in
+            // gradient-eval contexts.
+            SK::GradBlock(grad) => {
+                walk_for_wggo_instantiations(&grad.body.stmts, decorated, interner, targets);
+            }
+            // Remaining variants are leaves for instantiation-discovery
+            // purposes (Break/Continue/Return/Yield/Assign/Expr/Import/
+            // FromImport, type/struct/enum/trait/agent defs, KernelDef/
+            // TokenizerDef/DatasetDef/DatatypeDef/QuantBlock/ServeBlock).
+            // None can contain a `let x = Class(...)` that binds in the
+            // enclosing scope.
             _ => {}
         }
     }
@@ -1477,5 +1539,83 @@ fn main():
         assert_eq!(targets[1].layer_key, "large");
         assert_eq!(targets[1].head_dim, 128);
         assert_eq!(targets[1].w_q_shape, [4096, 4096]);
+    }
+
+    /// Real user code instantiates models inside `train` blocks because that's
+    /// where the training DSL lives. The walker must descend into TrainBlock
+    /// section bodies (regression for code-review I1 of commit 795cbabc).
+    #[test]
+    fn pre_scan_wggo_finds_target_inside_train_block() {
+        let source = r#"
+model Attention(dim: int, num_heads: int):
+    head_dim: int = dim // num_heads
+    q_proj: Tensor = zeros([dim, dim])
+    k_proj: Tensor = zeros([dim, dim])
+    v_proj: Tensor = zeros([dim, dim])
+    o_proj: Tensor = zeros([dim, dim])
+
+    @wggo_target(w_q=self.q_proj, w_k=self.k_proj, w_v=self.v_proj, w_o=self.o_proj, head_dim=self.head_dim)
+    fn forward(self, x: Tensor) -> Tensor:
+        return x
+
+fn main():
+    let m = Attention(dim=64, num_heads=4)
+    train(model = m, epochs = 1):
+        optimizer: SGD(lr = 0.01)
+        step(batch):
+            let inner_attn = Attention(dim=128, num_heads=8)
+            let pred = m.forward(zeros([1, 64]))
+"#;
+        let (ast, interner) = parse_module(source);
+        let targets = pre_scan_wggo_targets_from_ast(&ast, &interner);
+        // Both `m` (in fn main scope) AND `inner_attn` (inside train.step.body) must be found.
+        assert_eq!(
+            targets.len(),
+            2,
+            "walker must descend into TrainBlock.sections[].body — got {targets:?}",
+        );
+        let layer_keys: Vec<&str> = targets.iter().map(|t| t.layer_key.as_str()).collect();
+        assert!(
+            layer_keys.contains(&"m"),
+            "missing top-level instantiation: {layer_keys:?}"
+        );
+        assert!(
+            layer_keys.contains(&"inner_attn"),
+            "missing train.step body instantiation: {layer_keys:?}"
+        );
+    }
+
+    /// `grad(targets): ...` blocks have a `body: Block` that may contain user
+    /// instantiations. The walker must descend into it (regression for
+    /// code-review I1 of commit 795cbabc).
+    #[test]
+    fn pre_scan_wggo_finds_target_inside_grad_block() {
+        let source = r#"
+model Attention(dim: int, num_heads: int):
+    head_dim: int = dim // num_heads
+    q_proj: Tensor = zeros([dim, dim])
+    k_proj: Tensor = zeros([dim, dim])
+    v_proj: Tensor = zeros([dim, dim])
+    o_proj: Tensor = zeros([dim, dim])
+
+    @wggo_target(w_q=self.q_proj, w_k=self.k_proj, w_v=self.v_proj, w_o=self.o_proj, head_dim=self.head_dim)
+    fn forward(self, x: Tensor) -> Tensor:
+        return x
+
+fn main():
+    let w = ones([4])
+    let (loss, grads) = grad(w):
+        let m = Attention(dim=64, num_heads=4)
+        let y = m.forward(zeros([1, 64]))
+        y.sum()
+"#;
+        let (ast, interner) = parse_module(source);
+        let targets = pre_scan_wggo_targets_from_ast(&ast, &interner);
+        assert_eq!(
+            targets.len(),
+            1,
+            "walker must descend into GradBlock.body — got {targets:?}",
+        );
+        assert_eq!(targets[0].layer_key, "m");
     }
 }
