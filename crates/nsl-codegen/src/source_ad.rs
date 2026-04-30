@@ -1253,6 +1253,19 @@ impl AdjointGenerator {
     pub fn adjoint_of(&self, primal_var: VarId) -> Option<VarId> {
         self.adjoint_vars.get(&primal_var).copied()
     }
+
+    /// Return the VarId of the loss seed (the adjoint of `primal.output`).
+    ///
+    /// This is the VarId that `generate()` assigns `PrimalOp::Constant(1.0)` to.
+    /// Callers that hold an upstream loss gradient (e.g. `dy_handle` from the
+    /// L2 backward wrapper — spec §4.2) can pre-populate this VarId in their
+    /// `primal_vars` map before calling `compile_wengert_ops`, so the lowerer's
+    /// pre-mapped-constant check skips the hardcoded 1.0 and uses the real gradient.
+    ///
+    /// Returns `None` if `generate()` has not yet been called.
+    pub fn loss_seed_var_id(&self, primal_output: VarId) -> Option<VarId> {
+        self.adjoint_vars.get(&primal_output).copied()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1911,7 +1924,16 @@ impl<'a> WengertExtractor<'a> {
                         } else {
                             None
                         };
-                        resolved?
+                        // If the model-field path failed (e.g., `relu` is a free
+                        // function, not a model field), fall through to extracting
+                        // the RHS as a normal expression.  Without this, `x |> relu
+                        // |> q_proj` would return None here and collapse the whole
+                        // pipe chain to a stub.
+                        if let Some(vid) = resolved {
+                            vid
+                        } else {
+                            self.extract_expr(right)?
+                        }
                     }
                 } else {
                     // Non-Ident RHS (e.g. a function call or nested pipe):

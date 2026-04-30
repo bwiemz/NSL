@@ -25,7 +25,7 @@ use crate::calibration::observation::ProjectionRef;
 pub fn emit_splice_memcpy(
     fb: &mut FunctionBuilder,
     arena_ptr: Value,
-    offset: u64,
+    offset: u32,
     src_ptr: Value,
     nbytes: u64,
 ) {

@@ -894,6 +894,7 @@ fn emit_model_backward_bridge(
     compiler: &mut crate::compiler::Compiler<'_>,
     model_def: &nsl_ast::decl::ModelDef,
     model_name: &str,
+    // reserved for Task 17+: cross-arena consistency checks (forward retention vs backward retention symmetry)
     _arena_layout: &crate::calibration::ArenaLayout,
     grad_arena_layout: &crate::calibration::retention::GradArenaLayout,
 ) -> Result<cranelift_module::FuncId, HarnessError> {
@@ -1119,7 +1120,14 @@ fn emit_model_backward_bridge(
     let start_var = extractor.next_var_id();
     let mut gen = crate::source_ad::AdjointGenerator::new(start_var);
     // Generate adjoint before we need adjoint_of() — it consumes the primal list.
+    // Capture the primal output VarId first so we can retrieve loss_seed_var_id
+    // after generate() maps primal.output → loss_bar.
+    let primal_output_var = extractor.wengert_list().output;
     let adjoint = gen.generate(extractor.wengert_list());
+    // Spec §4.2: retrieve the loss seed VarId so the adjoint lowering can be
+    // given the real upstream gradient (dy_handle = dL/dy = 2·y from the L2
+    // wrapper) instead of the default Constant(1.0).
+    let loss_seed_vid = gen.loss_seed_var_id(primal_output_var);
 
     for (compound_name, primal_vid) in extractor.named_param_var_ids() {
         // Strip "self." prefix to get bare field name.
@@ -1153,7 +1161,11 @@ fn emit_model_backward_bridge(
         let weight_ptrs   = b.block_params(entry)[0];
         let _num_weights  = b.block_params(entry)[1];
         let input_handle  = b.block_params(entry)[2];
-        let _dy_handle    = b.block_params(entry)[3];
+        // dy_handle: the upstream loss gradient dL/dy = 2·y computed by the
+        // L2 wrapper (spec §4.2).  Must be used to seed the adjoint's loss_bar
+        // VarId so weight gradients are scaled correctly; ignoring it would
+        // silently corrupt per-head scoring magnitudes used by WGGO pruning.
+        let dy_handle     = b.block_params(entry)[3];
 
         // ── Step 1: load weight tensors from weight_ptrs ──────────────────
         // Mirrors emit_model_forward_bridge: call nsl_model_get_weight per field.
@@ -1234,7 +1246,21 @@ fn emit_model_backward_bridge(
                 None,
             ),
         )?;
-        let full_vars = full_lowered.var_map.clone();
+        let mut full_vars = full_lowered.var_map.clone();
+
+        // ── Spec §4.2: seed adjoint with upstream dy_handle ──────────────
+        // `loss_seed_vid` is the VarId that `AdjointGenerator::generate` assigned
+        // `PrimalOp::Constant(1.0)` to (the default "loss seed = 1").
+        // By inserting `dy_handle` for that VarId before calling
+        // `compile_wengert_ops` on the adjoint, the lowerer's pre-mapped-constant
+        // check (wengert_lower.rs: `if var_map.contains_key(&op.result)`) will
+        // short-circuit the Constant(1.0) materialisation and use the real
+        // upstream gradient `dL/dy = 2·y` instead.  Without this, weight
+        // gradients are off by the 2·y factor, corrupting per-head scoring
+        // magnitudes and potentially the relative head ordering used by WGGO pruning.
+        if let Some(seed_vid) = loss_seed_vid {
+            full_vars.insert(seed_vid, dy_handle);
+        }
 
         // ── Step 4: prepare grad-arena global value reference ────────────
         // The GV is declared once per function so the module can link it.
@@ -1281,7 +1307,7 @@ fn emit_model_backward_bridge(
             crate::calibration::retention::emit_splice_memcpy(
                 fb,
                 arena_base,
-                offset as u64,
+                offset,
                 src_ptr,
                 nbytes as u64,
             );
