@@ -28,16 +28,15 @@ fn grad_mode_opts_no_data() -> CompileOptions {
     opts
 }
 
-/// Build a `CompileOptions` with `wggo_importance = Grad` and a dummy
-/// `calibration_data` path.  The path does not need to exist for the refusal
-/// tests — the §5.6 check only tests `is_some()`, not that the file is
-/// readable.  Used for §5.6 (all preconditions met except data).
-fn grad_mode_opts_with_dummy_data() -> CompileOptions {
+/// Build a `CompileOptions` with `wggo_importance = Grad`, reachable decorated
+/// model, but no `calibration_data`.  Used for §5.6 (all upstream preconditions
+/// met but calibration data is None, triggering the refusal).
+fn grad_mode_opts_no_data_reachable_model() -> CompileOptions {
     let mut opts = CompileOptions::default();
     opts.wggo_importance = WggoImportance::Grad;
-    // Set a dummy path — the §5.6 check fires *before* any disk I/O.
-    // We need a source that passes pre-scan (has decorators + reachable model)
-    // but has no calibration data, so the §5.6 path fires.
+    // calibration_data remains None — the §5.6 check fires because the source
+    // has decorators + reachable model (passes §5.4 and §5.5 preconditions)
+    // but calibration_data is missing.
     opts
 }
 
@@ -91,7 +90,7 @@ fn refuse_grad_mode_with_unreachable_decorators() {
 fn refuse_grad_mode_with_no_calibration_data() {
     let source = include_str!("../../../tests/fixtures/wggo_attention_mlp.nsl");
     // opts has wggo_importance=Grad but calibration_data=None.
-    let opts = grad_mode_opts_with_dummy_data();
+    let opts = grad_mode_opts_no_data_reachable_model();
     // calibration_data is still None here — that is the trigger for §5.6.
     assert!(
         opts.calibration_data.is_none(),

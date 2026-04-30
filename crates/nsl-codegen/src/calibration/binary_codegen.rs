@@ -958,6 +958,9 @@ pub fn emit_calibration_model_object(
     // pass; `grad_arena_layout` must be populated by `emit_grad_retention_arena` above.
     // If it isn't, the targets list was present but yielded zero bytes (corrupt shape
     // metadata or a hook that updated `requires()` without updating its targets list).
+    // This fires when callers bypass the pre-scan refusal gate (`enforce_grad_mode_refusals`
+    // in entry_points.rs) and pre-populate `calibration_grad_retention` themselves;
+    // normal flows produce more actionable messages via the §5.4–§5.6 refusals above.
     if compile_opts.calibration_grad_retention.is_some()
         && compiler.grad_arena_layout.is_none()
     {
