@@ -4305,26 +4305,30 @@ mod per_head_dot {
     #[test]
     fn emit_per_head_dot_abs_accum_handles_replication_for_mqa() {
         // MQA: n_proj_heads=1 (K/V), replication=4 (q-heads).
-        let ir = emit_helper_for_test(/*n_proj_heads=*/1, /*elements_per_head=*/16, /*replication=*/4);
+        let n_proj_heads = 1;
+        let elements_per_head = 16;
+        let replication = 4;
+        let ir = emit_helper_for_test(/*n_proj_heads=*/n_proj_heads, /*elements_per_head=*/elements_per_head, /*replication=*/replication);
 
-        // The unrolled loop emits 4 fadd-store pairs.  Count "store" occurrences
-        // that appear after "f64" in the IR (store.f64 stores).
-        // Cranelift displays f64 stores as "store v... -> ..." without a type suffix
-        // on the store opcode itself — we count by counting "fadd" occurrences, which
-        // correspond 1:1 with the replication unrolling (one fadd per slot per element).
-        // For replication=4 and 16 elements, there are 4*16 = 64 fadds total.
+        // The replication loop is unrolled at codegen time; element and head loops remain.
+        // Textual IR shows one dynamic trace per loop iteration, with `replication` unrolled
+        // fadd-store pairs per element iteration. With replication=4, each element iteration
+        // contributes 4 fadds. The full execution (1 head × 16 elements × 4 replication) = 64 fadds total,
+        // but the static IR text shows ≥replication fadds.
+        let expected_fadds = replication as usize;
         let fadd_count = ir.matches("fadd").count();
         assert!(
-            fadd_count >= 4,
-            "expected ≥4 fadd instructions for replication=4 (one per Q-head slot); \
+            fadd_count >= expected_fadds,
+            "expected ≥{expected_fadds} fadd instructions (one per replication slot) for replication={replication}; \
              got {fadd_count}:\n{ir}"
         );
 
-        // Also verify the load.f64 count is >= 4 (one per replication slot per elem).
+        // Also verify the load.f64 count is >= replication (one per replication slot per element iteration).
+        let expected_loads = replication as usize;
         let load_f64_count = ir.matches("load.f64").count();
         assert!(
-            load_f64_count >= 4,
-            "expected ≥4 load.f64 for replication=4; got {load_f64_count}:\n{ir}"
+            load_f64_count >= expected_loads,
+            "expected ≥{expected_loads} load.f64 (one per replication slot) for replication={replication}; got {load_f64_count}:\n{ir}"
         );
     }
 }
