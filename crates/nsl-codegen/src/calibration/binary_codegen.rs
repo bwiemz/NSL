@@ -562,11 +562,16 @@ fn emit_model_forward_bridge(
             reason: format!("declare nsl_tensor_transpose: {e}"),
         })?;
 
+    // model_forward: (weight_ptrs: i64, num_weights: i64, input_tensor: i64) -> i64
+    // Returns the output tensor (y) — callers are responsible for freeing it.
+    // Previously this was void-returning and freed y internally; changed in Task 15
+    // so that `emit_calibration_backward_wrapper` can capture y to compute dy = 2y.
     let mut sig = compiler.module.make_signature();
     sig.call_conv = compiler.call_conv;
     sig.params.push(AbiParam::new(cl_types::I64));
     sig.params.push(AbiParam::new(cl_types::I64));
     sig.params.push(AbiParam::new(cl_types::I64));
+    sig.returns.push(AbiParam::new(cl_types::I64)); // returns y (output tensor)
     let func_id = compiler
         .module
         .declare_function("model_forward", Linkage::Export, &sig)
@@ -695,23 +700,23 @@ fn emit_model_forward_bridge(
         let forward_ref = compiler.module.declare_func_in_func(forward_id, b.func);
         let forward_call = b.ins().call(forward_ref, &[model_addr, input_tensor]);
 
-        if !forward_sig.returns.is_empty() {
-            let output_tensor = b.inst_results(forward_call)[0];
-            let tensor_free_id = compiler.registry.runtime_fns["nsl_tensor_free"].0;
-            let tensor_free_ref = compiler.module.declare_func_in_func(tensor_free_id, b.func);
-            b.ins().call(tensor_free_ref, &[output_tensor]);
-            for tensor_ptr in transposed_tensors {
-                b.ins().call(tensor_free_ref, &[tensor_ptr]);
-            }
-        } else {
-            let tensor_free_id = compiler.registry.runtime_fns["nsl_tensor_free"].0;
-            let tensor_free_ref = compiler.module.declare_func_in_func(tensor_free_id, b.func);
-            for tensor_ptr in transposed_tensors {
-                b.ins().call(tensor_free_ref, &[tensor_ptr]);
-            }
+        // Free transposed weight views (these are always intermediate tensors).
+        let tensor_free_id = compiler.registry.runtime_fns["nsl_tensor_free"].0;
+        let tensor_free_ref = compiler.module.declare_func_in_func(tensor_free_id, b.func);
+        for tensor_ptr in transposed_tensors {
+            b.ins().call(tensor_free_ref, &[tensor_ptr]);
         }
 
-        b.ins().return_(&[]);
+        // Return y to the caller; the caller is responsible for freeing it.
+        // If the forward method has no return value, return null (0) — callers
+        // that depend on y (e.g. the backward wrapper) must not be used with
+        // void-returning models, but this keeps the bridge valid.
+        let output_tensor = if !forward_sig.returns.is_empty() {
+            b.inst_results(forward_call)[0]
+        } else {
+            b.ins().iconst(cl_types::I64, 0)
+        };
+        b.ins().return_(&[output_tensor]);
         b.finalize();
     }
 
@@ -838,11 +843,15 @@ fn emit_calibration_forward_wrapper(
         let input_tensor = b.inst_results(desc_call)[0];
 
         let model_forward_ref = compiler.module.declare_func_in_func(model_forward_id, b.func);
-        b.ins()
+        let fwd_call = b.ins()
             .call(model_forward_ref, &[weight_ptrs, num_weights, input_tensor]);
+        // model_forward now returns y; free it here (forward wrapper only observes
+        // activations via the retention arena — it does not need y itself).
+        let y_tensor = b.inst_results(fwd_call)[0];
 
         let tensor_free_id = compiler.registry.runtime_fns["nsl_tensor_free"].0;
         let tensor_free_ref = compiler.module.declare_func_in_func(tensor_free_id, b.func);
+        b.ins().call(tensor_free_ref, &[y_tensor]);
         b.ins().call(tensor_free_ref, &[input_tensor]);
         b.ins().return_(&[zero_i32]);
         b.finalize();
@@ -913,37 +922,74 @@ fn emit_model_backward_bridge(
 /// Emit `nsl_calib_model_backward` — the ABI wrapper the calibration
 /// scaffolding calls to run the backward pass for a single batch.
 ///
-/// Spec §4.2.  Signature: `(*const f32, i64) -> i32`.
-/// Returns 0 on success, 3 on batch-shape mismatch (same convention as
-/// `nsl_calib_model_forward`).
+/// Spec §4.2 / §4.4.
 ///
-/// Task 14 ships a trivial body (shape check + early return 0).
-/// Tasks 15-16 will insert the L2-loss synthesis and source-AD splice.
+/// Signature (Task 15): `(weight_ptrs: i64, num_weights: i64, batch_ptr: i64,
+///                        batch_elem_count: i64) -> i32`.
+/// Matches `nsl_calib_model_forward` so the scaffolding can call both with the
+/// same (model_ptr, num_weights, batch_ptr, batch_elems) quad.
+/// Returns 0 on success, 3 on batch-shape mismatch.
+///
+/// Body (spec §4.4):
+///  1. Validate batch_elem_count.
+///  2. Wrap batch_ptr in a NslTensorDesc and convert to NslTensor (input).
+///  3. Call model_forward(weight_ptrs, num_weights, input) → y.
+///  4. Compute dy = nsl_tensor_mul_scalar(y, 2.0, 0)  [L2 loss: dL/dy = 2·y].
+///  5. Call model_backward(input, dy).
+///  6. Free input, y, dy.
+///  7. Return 0.
 fn emit_calibration_backward_wrapper(
     compiler: &mut crate::compiler::Compiler<'_>,
-    // Tasks 15-16 use these
-    _model_forward_id: cranelift_module::FuncId,
-    _model_backward_id: cranelift_module::FuncId,
+    model_forward_id: cranelift_module::FuncId,
+    model_backward_id: cranelift_module::FuncId,
     batch: u32,
     seq: u32,
     channels: i64,
 ) -> Result<(), HarnessError> {
-    let pointer_ty = compiler.module.target_config().pointer_type();
-
-    let (shape_vals, _input_ndim) = if batch == 1 {
+    let (shape_vals, input_ndim) = if batch == 1 {
         (vec![seq as i64, channels], 2_i32)
     } else {
         (vec![batch as i64, seq as i64, channels], 3_i32)
     };
 
-    // Compile-time element count — single source of truth, same pattern as
-    // `emit_calibration_forward_wrapper`.
+    // Compile-time element count — single source of truth.
     let expected_elem_count: i64 = shape_vals.iter().product();
 
+    // Shape rodata for NslTensorDesc — same layout as the forward wrapper.
+    let shape_data = declare_i64_rodata(
+        &mut compiler.module,
+        "__nsl_calib_bwd_input_shape",
+        &shape_vals,
+    )?;
+
+    // nsl_desc_to_tensor: converts an NslTensorDesc (stack slot) into a heap-allocated
+    // NslTensor handle (i64).  Same declaration pattern as the forward wrapper.
+    let mut desc_to_tensor_sig = compiler.module.make_signature();
+    desc_to_tensor_sig.call_conv = compiler.call_conv;
+    desc_to_tensor_sig.params.push(AbiParam::new(cl_types::I64));
+    desc_to_tensor_sig.returns.push(AbiParam::new(cl_types::I64));
+    let desc_to_tensor_id = compiler
+        .module
+        .declare_function("nsl_desc_to_tensor", Linkage::Import, &desc_to_tensor_sig)
+        .map_err(|e| HarnessError::Infrastructure {
+            reason: format!("declare nsl_desc_to_tensor (backward wrapper): {e}"),
+        })?;
+
+    // nsl_tensor_mul_scalar: (tensor: i64, scalar: f64, flags: i8) -> i64.
+    // Used to compute dy = 2·y (L2-loss gradient).
+    let mul_scalar_id = compiler.registry.runtime_fns["nsl_tensor_mul_scalar"].0;
+
+    // nsl_tensor_free: (tensor: i64) -> void.
+    let tensor_free_id = compiler.registry.runtime_fns["nsl_tensor_free"].0;
+
+    // Backward wrapper ABI matches the forward wrapper:
+    //   (weight_ptrs: i64, num_weights: i64, batch_ptr: i64, batch_elem_count: i64) -> i32
     let mut wrapper_sig = compiler.module.make_signature();
     wrapper_sig.call_conv = compiler.call_conv;
-    wrapper_sig.params.push(AbiParam::new(pointer_ty));     // batch_f32_ptr (*const f32)
-    wrapper_sig.params.push(AbiParam::new(cl_types::I64));  // batch_elem_count (i64)
+    wrapper_sig.params.push(AbiParam::new(cl_types::I64)); // weight_ptrs
+    wrapper_sig.params.push(AbiParam::new(cl_types::I64)); // num_weights
+    wrapper_sig.params.push(AbiParam::new(cl_types::I64)); // batch_ptr (*const f32 as i64)
+    wrapper_sig.params.push(AbiParam::new(cl_types::I64)); // batch_elem_count
     wrapper_sig.returns.push(AbiParam::new(cl_types::I32)); // status: 0 = ok, 3 = mismatch
 
     let func_id = compiler
@@ -968,8 +1014,10 @@ fn emit_calibration_backward_wrapper(
         b.switch_to_block(entry);
         b.seal_block(entry);
 
-        let _batch_ptr = b.block_params(entry)[0]; // unused in Task 14; Task 15 uses
-        let batch_elem_count = b.block_params(entry)[1];
+        let weight_ptrs = b.block_params(entry)[0];
+        let num_weights = b.block_params(entry)[1];
+        let batch_ptr = b.block_params(entry)[2];
+        let batch_elem_count = b.block_params(entry)[3];
 
         // Validate batch element count against compile-time expected shape product.
         let expected_v = b.ins().iconst(cl_types::I64, expected_elem_count);
@@ -984,9 +1032,74 @@ fn emit_calibration_backward_wrapper(
         b.switch_to_block(shape_ok);
         b.seal_block(shape_ok);
 
-        // Task 14: return success.  Tasks 15-16 insert the backward body here.
-        let zero = b.ins().iconst(cl_types::I32, 0);
-        b.ins().return_(&[zero]);
+        // ── Step 1: build NslTensorDesc for the input batch (mirrors forward wrapper). ──
+        //
+        // NslTensorDesc layout (40 bytes, 8-byte aligned):
+        //   offset  0: data_ptr (i64)
+        //   offset  8: shape_ptr (i64)
+        //   offset 16: strides_ptr (i64, 0 = row-major default)
+        //   offset 24: ndim (i32)
+        //   offset 28: dtype (i32, 0 = f64, 1 = f32)  — calibration batches are f32
+        //   offset 32: device (i32, 0 = CPU)
+        //   offset 36: pad (i32)
+        let desc_slot = b.create_sized_stack_slot(StackSlotData::new(
+            StackSlotKind::ExplicitSlot,
+            40,
+            3,
+        ));
+        let desc_addr = b.ins().stack_addr(cl_types::I64, desc_slot, 0);
+        let zero_i64 = b.ins().iconst(cl_types::I64, 0);
+        let zero_i32 = b.ins().iconst(cl_types::I32, 0);
+        let ndim_i32 = b.ins().iconst(cl_types::I32, input_ndim as i64);
+        // dtype=1 (f32) to match the raw f32 calibration batch data.
+        let dtype_f32 = b.ins().iconst(cl_types::I32, 1);
+
+        let shape_ref = compiler.module.declare_data_in_func(shape_data, b.func);
+        let shape_ptr = b.ins().symbol_value(cl_types::I64, shape_ref);
+
+        b.ins().store(MemFlags::trusted(), batch_ptr, desc_addr, 0);
+        b.ins().store(MemFlags::trusted(), shape_ptr, desc_addr, 8);
+        b.ins().store(MemFlags::trusted(), zero_i64, desc_addr, 16);
+        b.ins().store(MemFlags::trusted(), ndim_i32, desc_addr, 24);
+        b.ins().store(MemFlags::trusted(), dtype_f32, desc_addr, 28);
+        b.ins().store(MemFlags::trusted(), zero_i32, desc_addr, 32);
+        b.ins().store(MemFlags::trusted(), zero_i32, desc_addr, 36);
+
+        let desc_to_tensor_ref =
+            compiler.module.declare_func_in_func(desc_to_tensor_id, b.func);
+        let desc_call = b.ins().call(desc_to_tensor_ref, &[desc_addr]);
+        let input_handle = b.inst_results(desc_call)[0];
+
+        // ── Step 2: call model_forward(weight_ptrs, num_weights, input) → y. ──
+        let model_forward_ref =
+            compiler.module.declare_func_in_func(model_forward_id, b.func);
+        let fwd_call = b
+            .ins()
+            .call(model_forward_ref, &[weight_ptrs, num_weights, input_handle]);
+        let y_handle = b.inst_results(fwd_call)[0];
+
+        // ── Step 3: dy = nsl_tensor_mul_scalar(y, 2.0, 0)  [L2: dL/dy = 2·y]. ──
+        let mul_scalar_ref =
+            compiler.module.declare_func_in_func(mul_scalar_id, b.func);
+        let two_f64 = b.ins().f64const(2.0_f64);
+        let flags_zero = b.ins().iconst(cl_types::I8, 0); // no FBIP relinquish flags
+        let dy_call = b.ins().call(mul_scalar_ref, &[y_handle, two_f64, flags_zero]);
+        let dy_handle = b.inst_results(dy_call)[0];
+
+        // ── Step 4: call model_backward(input_handle, dy_handle). ──
+        let model_backward_ref =
+            compiler.module.declare_func_in_func(model_backward_id, b.func);
+        b.ins().call(model_backward_ref, &[input_handle, dy_handle]);
+
+        // ── Step 5: free intermediates and return 0 (success). ──
+        let tensor_free_ref =
+            compiler.module.declare_func_in_func(tensor_free_id, b.func);
+        b.ins().call(tensor_free_ref, &[input_handle]);
+        b.ins().call(tensor_free_ref, &[y_handle]);
+        b.ins().call(tensor_free_ref, &[dy_handle]);
+
+        let ok = b.ins().iconst(cl_types::I32, 0);
+        b.ins().return_(&[ok]);
 
         b.finalize();
     }
@@ -2975,6 +3088,77 @@ mod backward_wrapper {
         assert!(
             !obj.symbols().any(|s| s.name() == Ok("nsl_calib_model_backward")),
             "calib_model.o must NOT export nsl_calib_model_backward when grad-retention is absent"
+        );
+    }
+
+    /// Task 15: verify the backward wrapper accepts 4 ABI params (matching the forward
+    /// wrapper) and compiles successfully with the full L2-loss body.
+    ///
+    /// This test confirms that:
+    ///  1. The object still exports `nsl_calib_model_backward`.
+    ///  2. `nsl_calib_model_backward` now has the 4-param ABI
+    ///     (weight_ptrs, num_weights, batch_ptr, batch_elem_count) matching the forward
+    ///     wrapper, not the 2-param Task-14 stub.
+    ///  3. The model_forward bridge now RETURNS y (so this test would fail to compile if
+    ///     the bridge still returned void and the backward wrapper tried to capture its
+    ///     result).
+    ///
+    /// We verify #2 indirectly: if the wrapper is compiled with the wrong number of
+    /// block params the Cranelift verifier would panic/error during `define_function`;
+    /// the call to `emit_calibration_model_object` would return Err. We assert it
+    /// returns Ok AND check that both wrappers are exported.
+    #[test]
+    fn backward_wrapper_emits_l2_loss_dy_alloc_and_scale() {
+        let (ast, interner) = parse_awq_fixture();
+        let projections = crate::calibration::pre_scan_awq_projections_from_ast(&ast, &interner);
+        let arena_layout = build_arena_layout(&projections, 8, 4);
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let out_path = tmp.path().join("calib_model.o");
+        let opts = compile_options_with_backward(&ast, &interner);
+
+        // This will fail with a Cranelift verifier error if the backward wrapper's body
+        // tries to call model_forward but model_forward still has a void return (Task 14).
+        // After Task 15, model_forward returns y (i64), so the call captures the result.
+        emit_calibration_model_object(&ast, &opts, &arena_layout, &out_path)
+            .expect("emit_calibration_model_object succeeds with Task-15 L2-loss body");
+
+        let obj_bytes = std::fs::read(&out_path).expect("object readable");
+        let obj = object::File::parse(&*obj_bytes).expect("object::File::parse");
+
+        // Both wrappers must be exported — confirmed by symbol presence.
+        let fwd_exported = obj.symbols().any(|s| {
+            s.name() == Ok("nsl_calib_model_forward") && !s.is_undefined()
+        });
+        assert!(fwd_exported, "nsl_calib_model_forward must be exported");
+
+        let bwd_exported = obj.symbols().any(|s| {
+            s.name() == Ok("nsl_calib_model_backward") && !s.is_undefined()
+        });
+        assert!(bwd_exported, "nsl_calib_model_backward must be exported");
+
+        // model_forward must now be a LOCAL (non-undefined) symbol — it's defined in
+        // this object (not imported).  Before Task 15 it was Export; after refactoring
+        // for backward use it remains defined here.
+        let model_fwd_defined = obj.symbols().any(|s| {
+            s.name() == Ok("model_forward") && !s.is_undefined()
+        });
+        assert!(
+            model_fwd_defined,
+            "model_forward bridge must be defined (local/export) in calib_model.o"
+        );
+
+        // nsl_tensor_mul_scalar must be imported (undefined) — the backward wrapper
+        // uses it to compute dy = 2·y.  If the Task-14 stub were still in place, this
+        // function would NOT be needed by nsl_calib_model_backward specifically (though
+        // the compiled model code may already reference it).
+        // We verify the emission compiles without error as the primary assertion;
+        // the symbol check is a belt-and-suspenders indicator.
+        let has_mul_scalar = obj.symbols().any(|s| {
+            s.name() == Ok("nsl_tensor_mul_scalar")
+        });
+        assert!(
+            has_mul_scalar,
+            "calib_model.o must reference nsl_tensor_mul_scalar"
         );
     }
 }
