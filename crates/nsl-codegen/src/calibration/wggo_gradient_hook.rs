@@ -300,6 +300,16 @@ mod tests {
     }
 
     #[test]
+    fn requires_backward_returns_true_for_wggo_hook() {
+        let hook = WggoGradientHook::new(vec![fixture_target_4heads("model.layers.0")]);
+        assert!(
+            hook.requires_backward(),
+            "WggoGradientHook must return true for requires_backward() \
+             (it declares BackwardGradients)"
+        );
+    }
+
+    #[test]
     fn requires_returns_backward_gradients_for_all_layers() {
         let hook = WggoGradientHook::new(
             vec![

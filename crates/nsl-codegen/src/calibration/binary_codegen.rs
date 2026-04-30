@@ -122,6 +122,13 @@ pub fn real_subprocess_entry(
         .iter()
         .flat_map(|h| h.finalize_plan())
         .collect();
+    // Spec §4.5: collect running-buffer symbols from hooks that require backward.
+    // Passed into the scaffolding so the loop body emits per-step symbol references.
+    let per_step_backward_symbols: Vec<String> = registry
+        .iter()
+        .filter(|h| h.requires_backward())
+        .flat_map(|h| h.finalize_plan().into_iter().map(|fp| fp.running_symbol))
+        .collect();
 
     // Emit and link the calibration binary.
     let binary_path = if needs_forward {
@@ -154,6 +161,7 @@ pub fn real_subprocess_entry(
             &sidecar_json_for_binary,
             true,
             needs_backward,
+            &per_step_backward_symbols,
             &scaffolding_obj,
         )?;
 
@@ -1781,6 +1789,14 @@ pub fn emit_calibration_model_object(
     })
 }
 
+/// Emit the calibration scaffolding object (`main` + loop body).
+///
+/// `per_step_backward_symbols`: running-buffer symbol names that backward hooks
+/// need referenced per step (spec §4.5).  Each symbol must already be declared
+/// as an Export global via `finalize_plan` — the scaffolding reuses the
+/// `running_data_ids` entry.  The placeholder `symbol_value` + `stack_store`
+/// keeps the relocation alive so the linker sees a reference even before Task 21
+/// replaces this stub with real per-head dot+abs reduction IR.
 pub fn emit_calibration_scaffolding_object(
     observe_plan: &[ObservePlanEntry],
     finalize_plan: &[FinalizePlanEntry],
@@ -1788,6 +1804,7 @@ pub fn emit_calibration_scaffolding_object(
     sidecar_json: &[u8],
     needs_forward_pass: bool,
     needs_backward: bool,
+    per_step_backward_symbols: &[String],
     out_path: &Path,
 ) -> Result<(), HarnessError> {
     if needs_forward_pass && observe_plan.is_empty() {
@@ -2408,6 +2425,35 @@ pub fn emit_calibration_scaffolding_object(
                     entry.channels,
                     running_base,
                 );
+            }
+
+            // Spec §4.5: hook.emit_per_step for backward observers.
+            // Task 18 placeholder — Task 21 replaces with real per-head dot+abs reduction.
+            //
+            // For each backward hook's running buffer, emit a `symbol_value` and
+            // store it to a stack slot.  The store prevents Cranelift's optimizer
+            // from dead-code-eliminating the `symbol_value`, so the relocation
+            // entry referencing `__nsl_wggo_grad.<layer>` survives into the
+            // object file.  The test in `loop_body_dispatch` inspects these
+            // relocation entries to verify the hook was wired in.
+            if needs_backward && !per_step_backward_symbols.is_empty() {
+                let scratch_slot = b.create_sized_stack_slot(StackSlotData::new(
+                    StackSlotKind::ExplicitSlot,
+                    8,
+                    0,
+                ));
+                for sym in per_step_backward_symbols {
+                    let run_id = running_data_ids
+                        .get(sym.as_str())
+                        .unwrap_or_else(|| panic!(
+                            "per_step_backward_symbols entry '{sym}' not found in \
+                             running_data_ids — ensure it appears in finalize_plan"
+                        ));
+                    let run_gv = module.declare_data_in_func(*run_id, b.func);
+                    let run_ptr = b.ins().symbol_value(ptr_ty, run_gv);
+                    // Stack-store the pointer value to prevent DCE.
+                    b.ins().stack_store(run_ptr, scratch_slot, 0);
+                }
             }
 
             let one_i64 = b.ins().iconst(cl_types::I64, 1);
@@ -3293,6 +3339,7 @@ mod tests {
             b"{}",
             true,
             false, // needs_backward = false for this AWQ-only test
+            &[],   // no per-step backward symbols for AWQ-only
             &out_path,
         )
         .expect("emit succeeds");
@@ -3348,6 +3395,7 @@ mod tests {
             b"{}",
             true,
             false, // needs_backward = false
+            &[],   // no per-step backward symbols
             &out_path,
         )
         .expect_err("must refuse defensively");
@@ -3806,6 +3854,7 @@ mod loop_body_dispatch {
             b"{}",
             true,
             true, // needs_backward = true
+            &[],  // no wggo per-step symbols for this forward-dispatch test
             &out_path,
         )
         .expect("emit succeeds with needs_backward=true");
@@ -3844,6 +3893,7 @@ mod loop_body_dispatch {
             b"{}",
             true,
             false, // needs_backward = false
+            &[],   // no wggo per-step symbols for this forward-only test
             &out_path,
         )
         .expect("emit succeeds with needs_backward=false");
@@ -3867,5 +3917,95 @@ mod loop_body_dispatch {
             "scaffolding.o must NOT import nsl_calib_model_backward when needs_backward=false; \
              imports: {imports:?}"
         );
+    }
+
+    /// Task 18 (spec §4.5): verify that the scaffolding loop body emits
+    /// relocation entries referencing `__nsl_wggo_grad.*` symbols when
+    /// `per_step_backward_symbols` is populated and `needs_backward = true`.
+    ///
+    /// Test strategy: relocation-symbol inspection on the emitted `.o` file.
+    /// The placeholder `symbol_value` + `stack_store` in the loop body creates
+    /// at least one relocation entry per symbol so the linker sees a reference.
+    #[test]
+    fn loop_body_invokes_emit_per_step_for_backward_hooks_after_backward_call() {
+        // Build a finalize_plan that includes a WGGO running buffer alongside
+        // the AWQ running buffer so both are in running_data_ids.
+        let observe_plan = vec![ObservePlanEntry {
+            projection: ProjectionRef("TinyMLP.up_proj".into()),
+            src_offset: 0,
+            rows: 32,
+            channels: 64,
+            running_symbol: "__nsl_awq_running_up_proj".into(),
+        }];
+        let finalize_plan = vec![
+            FinalizePlanEntry {
+                projection: ProjectionRef("TinyMLP.up_proj".into()),
+                running_symbol: "__nsl_awq_running_up_proj".into(),
+                channels: 64,
+            },
+            // WGGO running buffer — this is what emit_per_step references.
+            FinalizePlanEntry {
+                projection: ProjectionRef("TinyMLP.__wggo_grad".into()),
+                running_symbol: "__nsl_wggo_grad.TinyMLP".into(),
+                channels: 4,
+            },
+        ];
+        let arena_layout = build_arena_layout(
+            &[crate::calibration::DiscoveredProjection {
+                projection: ProjectionRef("TinyMLP.up_proj".into()),
+                weight_shape: [128, 64],
+            }],
+            8,
+            4,
+        );
+        let per_step_backward_symbols = vec!["__nsl_wggo_grad.TinyMLP".to_string()];
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let out_path = tmp.path().join("scaffolding_wggo.o");
+
+        emit_calibration_scaffolding_object(
+            &observe_plan,
+            &finalize_plan,
+            &arena_layout,
+            b"{}",
+            true,
+            true, // needs_backward = true
+            &per_step_backward_symbols,
+            &out_path,
+        )
+        .expect("emit succeeds with WGGO per-step symbols");
+
+        let obj_bytes = std::fs::read(&out_path).expect("object readable");
+        let obj = object::File::parse(&*obj_bytes).expect("object::File::parse");
+
+        let count = count_wggo_grad_refs(&obj);
+        assert!(
+            count >= 1,
+            "expected ≥1 __nsl_wggo_grad.* relocation reference in scaffolding.o; got {count}"
+        );
+    }
+
+    /// Count relocations in the .text section that target a `__nsl_wggo_grad.*` symbol.
+    fn count_wggo_grad_refs(obj: &object::File) -> usize {
+        use object::{ObjectSection, ObjectSymbol, RelocationTarget};
+        let mut count = 0;
+        for sec in obj.sections() {
+            if sec.kind() != object::SectionKind::Text {
+                continue;
+            }
+            for (_offset, reloc) in sec.relocations() {
+                if let RelocationTarget::Symbol(sym_idx) = reloc.target() {
+                    if let Ok(sym) = obj.symbol_by_index(sym_idx) {
+                        if sym
+                            .name()
+                            .map(|n| n.starts_with("__nsl_wggo_grad."))
+                            .unwrap_or(false)
+                        {
+                            count += 1;
+                        }
+                    }
+                }
+            }
+        }
+        count
     }
 }

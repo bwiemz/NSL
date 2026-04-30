@@ -43,6 +43,15 @@ pub trait CalibrationHook: Send + Sync {
     fn emit_per_step(&self, ctx: &mut CalibCtx);
     fn emit_finalize(&self, ctx: &mut CalibCtx) -> CalibrationResult;
 
+    /// Returns `true` when this hook needs backward gradients.
+    ///
+    /// Default impl matches on `requires()`'s `ObservationSet` variant:
+    /// returns `true` iff the hook declared `BackwardGradients`.
+    /// Forward-only hooks (AWQ, IdentityHook) return `false` automatically.
+    fn requires_backward(&self) -> bool {
+        matches!(self.requires(), ObservationSet::BackwardGradients(_))
+    }
+
     /// Called once per calibration batch, after model_forward has populated
     /// the retention arena.  Default impl is a no-op for hooks that don't
     /// observe per-batch activations (e.g. IdentityHook).
@@ -85,6 +94,15 @@ mod tests {
             CalibrationResult::Ok(b) => assert_eq!(b, vec![0x42]),
             other => panic!("expected Ok, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn requires_backward_default_false_for_empty_hook() {
+        let h = DummyHook;
+        assert!(
+            !h.requires_backward(),
+            "DummyHook (ObservationSet::Empty) must not require backward"
+        );
     }
 
     #[test]
