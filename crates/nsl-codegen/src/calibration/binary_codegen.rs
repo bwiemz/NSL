@@ -170,7 +170,7 @@ pub fn real_subprocess_entry(
         } else {
             "calibration"
         });
-        link_calibration_binary(&scaffolding_obj, &model_obj, &binary_path)?;
+        link_calibration_binary(&scaffolding_obj, &model_obj, &binary_path, needs_backward)?;
         binary_path
     } else {
         emit_and_link_calibration_binary(
@@ -2569,6 +2569,7 @@ pub fn link_calibration_binary(
     scaffolding_obj: &Path,
     calib_model_obj: &Path,
     out_binary: &Path,
+    needs_backward: bool,
 ) -> Result<(), HarnessError> {
     let obj_bytes = std::fs::read(calib_model_obj).map_err(|e| HarnessError::Infrastructure {
         reason: format!(
@@ -2596,6 +2597,24 @@ pub fn link_calibration_binary(
             ),
         });
     }
+    if needs_backward
+        && !obj
+            .symbols()
+            .any(|symbol| symbol.name() == Ok("nsl_calib_model_backward") && !symbol.is_undefined())
+    {
+        return Err(HarnessError::Infrastructure {
+            reason: format!(
+                "calibration: model-backward wrapper missing from calib_model.o.\n\
+ requested:  link scaffolding.o <- calib_model.o with nsl_calib_model_backward resolved\n\
+ expected:   calib_model.o exports nsl_calib_model_backward (the f32-buffer\n\
+             wrapper around model_forward + L2 loss + model_backward)\n\
+ found:      {} does not export `nsl_calib_model_backward`. Either the\n\
+             NSL source lacks a model_forward function, or the\n\
+             calibration-scoped compile pass skipped backward emission.",
+                calib_model_obj.display()
+            ),
+        });
+    }
 
     crate::linker::link_multi(
         &[scaffolding_obj.to_path_buf(), calib_model_obj.to_path_buf()],
@@ -2603,7 +2622,17 @@ pub fn link_calibration_binary(
     )
     .map_err(|e| {
         let err_str = format!("link_calibration_binary: {e}");
-        if err_str.contains("nsl_calib_model_forward") {
+        if err_str.contains("nsl_calib_model_backward") {
+            HarnessError::Infrastructure {
+                reason: format!(
+                    "calibration: model-backward wrapper missing from calib_model.o.\n\
+ requested:  link scaffolding.o <- calib_model.o with nsl_calib_model_backward resolved\n\
+ expected:   calib_model.o exports nsl_calib_model_backward (the f32-buffer\n\
+             wrapper around model_forward + L2 loss + model_backward)\n\
+ found:      {err_str}"
+                ),
+            }
+        } else if err_str.contains("nsl_calib_model_forward") {
             HarnessError::Infrastructure {
                 reason: format!(
                     "calibration: model-forward wrapper missing from calib_model.o.\n\

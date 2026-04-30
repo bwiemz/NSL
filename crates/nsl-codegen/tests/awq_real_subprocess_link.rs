@@ -115,7 +115,7 @@ fn two_object_link_produces_binary_with_resolved_wrapper_symbol() {
     } else {
         "calibration"
     });
-    link_calibration_binary(&scaffolding_obj, &model_obj, &binary)
+    link_calibration_binary(&scaffolding_obj, &model_obj, &binary, false)
         .expect("link two-object calibration binary");
 
     assert!(binary.exists(), "linked calibration binary must exist");
@@ -167,7 +167,7 @@ fn missing_wrapper_symbol_at_link_emits_three_part_error() {
     } else {
         "calibration"
     });
-    let err = link_calibration_binary(&scaffolding_obj, &scaffolding_obj, &binary)
+    let err = link_calibration_binary(&scaffolding_obj, &scaffolding_obj, &binary, false)
         .expect_err("link should fail without calib_model.o wrapper export");
 
     let err_str = format!("{err}");
