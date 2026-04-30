@@ -857,6 +857,150 @@ fn emit_calibration_forward_wrapper(
     Ok(())
 }
 
+/// Declare the compiled model's backward function as a `Linkage::Local`
+/// symbol in the calibration model object.
+///
+/// Task 14: emits a stub body that just returns so the object finalizer is
+/// happy.  Tasks 15-16 will replace the stub with real source-AD body.
+/// The signature matches the bridge expected by `emit_calibration_backward_wrapper`:
+///
+///   model_backward(input_handle: i64, dy_handle: i64) -> void
+///
+/// (NslTensor* is lowered to i64 throughout this codebase.)
+fn emit_model_backward_bridge(
+    compiler: &mut crate::compiler::Compiler<'_>,
+    _arena_layout: &crate::calibration::ArenaLayout,
+    _grad_arena_layout: &crate::calibration::retention::GradArenaLayout,
+) -> Result<cranelift_module::FuncId, HarnessError> {
+    let pointer_ty = compiler.module.target_config().pointer_type();
+    let mut sig = compiler.module.make_signature();
+    sig.call_conv = compiler.call_conv;
+    sig.params.push(AbiParam::new(pointer_ty)); // input_handle (NslTensor* as i64)
+    sig.params.push(AbiParam::new(pointer_ty)); // dy_handle    (NslTensor* as i64)
+
+    let func_id = compiler
+        .module
+        .declare_function("model_backward", Linkage::Local, &sig)
+        .map_err(|e| HarnessError::Infrastructure {
+            reason: format!("declare model_backward: {e}"),
+        })?;
+
+    // Task 14: emit a trivial stub so the ObjectModule finalizer accepts the
+    // declaration.  Tasks 15-16 will replace the stub body with real source-AD.
+    let mut ctx = Context::for_function(Function::with_name_signature(
+        UserFuncName::user(0, compiler.next_func_index()),
+        sig,
+    ));
+    let mut fn_builder_ctx = FunctionBuilderContext::new();
+    {
+        let mut b = FunctionBuilder::new(&mut ctx.func, &mut fn_builder_ctx);
+        let entry = b.create_block();
+        b.append_block_params_for_function_params(entry);
+        b.switch_to_block(entry);
+        b.seal_block(entry);
+        b.ins().return_(&[]);
+        b.finalize();
+    }
+    compiler
+        .module
+        .define_function(func_id, &mut ctx)
+        .map_err(|e| HarnessError::Infrastructure {
+            reason: format!("define model_backward stub: {e}"),
+        })?;
+    Ok(func_id)
+}
+
+/// Emit `nsl_calib_model_backward` — the ABI wrapper the calibration
+/// scaffolding calls to run the backward pass for a single batch.
+///
+/// Spec §4.2.  Signature: `(*const f32, i64) -> i32`.
+/// Returns 0 on success, 3 on batch-shape mismatch (same convention as
+/// `nsl_calib_model_forward`).
+///
+/// Task 14 ships a trivial body (shape check + early return 0).
+/// Tasks 15-16 will insert the L2-loss synthesis and source-AD splice.
+fn emit_calibration_backward_wrapper(
+    compiler: &mut crate::compiler::Compiler<'_>,
+    #[allow(unused_variables)] // task 15-16 use these
+    model_forward_id: cranelift_module::FuncId,
+    #[allow(unused_variables)] // task 15-16 use these
+    model_backward_id: cranelift_module::FuncId,
+    batch: u32,
+    seq: u32,
+    channels: i64,
+) -> Result<cranelift_module::FuncId, HarnessError> {
+    let pointer_ty = compiler.module.target_config().pointer_type();
+
+    let (shape_vals, _input_ndim) = if batch == 1 {
+        (vec![seq as i64, channels], 2_i32)
+    } else {
+        (vec![batch as i64, seq as i64, channels], 3_i32)
+    };
+
+    // Compile-time element count — single source of truth, same pattern as
+    // `emit_calibration_forward_wrapper`.
+    let expected_elem_count: i64 = shape_vals.iter().product();
+
+    let mut wrapper_sig = compiler.module.make_signature();
+    wrapper_sig.call_conv = compiler.call_conv;
+    wrapper_sig.params.push(AbiParam::new(pointer_ty));     // batch_f32_ptr (*const f32)
+    wrapper_sig.params.push(AbiParam::new(cl_types::I64));  // batch_elem_count (i64)
+    wrapper_sig.returns.push(AbiParam::new(cl_types::I32)); // status: 0 = ok, 3 = mismatch
+
+    let func_id = compiler
+        .module
+        .declare_function("nsl_calib_model_backward", Linkage::Export, &wrapper_sig)
+        .map_err(|e| HarnessError::Infrastructure {
+            reason: format!("declare nsl_calib_model_backward: {e}"),
+        })?;
+
+    let mut ctx = Context::for_function(Function::with_name_signature(
+        UserFuncName::user(0, compiler.next_func_index()),
+        wrapper_sig,
+    ));
+    let mut fn_builder_ctx = FunctionBuilderContext::new();
+    {
+        let mut b = FunctionBuilder::new(&mut ctx.func, &mut fn_builder_ctx);
+        let entry = b.create_block();
+        b.append_block_params_for_function_params(entry);
+        let shape_ok = b.create_block();
+        let shape_mismatch = b.create_block();
+
+        b.switch_to_block(entry);
+        b.seal_block(entry);
+
+        let _batch_ptr = b.block_params(entry)[0]; // unused in Task 14; Task 15 uses
+        let batch_elem_count = b.block_params(entry)[1];
+
+        // Validate batch element count against compile-time expected shape product.
+        let expected_v = b.ins().iconst(cl_types::I64, expected_elem_count);
+        let shape_eq = b.ins().icmp(IntCC::Equal, batch_elem_count, expected_v);
+        b.ins().brif(shape_eq, shape_ok, &[], shape_mismatch, &[]);
+
+        b.switch_to_block(shape_mismatch);
+        b.seal_block(shape_mismatch);
+        let three = b.ins().iconst(cl_types::I32, 3);
+        b.ins().return_(&[three]);
+
+        b.switch_to_block(shape_ok);
+        b.seal_block(shape_ok);
+
+        // Task 14: return success.  Tasks 15-16 insert the backward body here.
+        let zero = b.ins().iconst(cl_types::I32, 0);
+        b.ins().return_(&[zero]);
+
+        b.finalize();
+    }
+
+    compiler
+        .module
+        .define_function(func_id, &mut ctx)
+        .map_err(|e| HarnessError::Infrastructure {
+            reason: format!("define nsl_calib_model_backward: {e}"),
+        })?;
+    Ok(func_id)
+}
+
 pub fn emit_calibration_model_object(
     ast: &nsl_ast::Module,
     opts: &crate::CompileOptions,
@@ -1016,6 +1160,32 @@ pub fn emit_calibration_model_object(
         &transpose_fields,
     )?;
     emit_calibration_forward_wrapper(&mut compiler, model_forward_id, batch, seq, channels)?;
+
+    // Spec §4.2: when grad retention is requested, also emit the backward path.
+    if compile_opts.calibration_grad_retention.is_some() {
+        // Clone the layout before the mutable borrow of compiler so there is no
+        // simultaneous &/&mut conflict.  The layout is small (a Vec of tuples).
+        // Safe to unwrap: the `calibration_grad_retention.is_some()` guard above
+        // plus the defensive check at the start of this function guarantees
+        // `grad_arena_layout` is populated when we reach this point.
+        let grad_arena_layout_clone = compiler
+            .grad_arena_layout
+            .clone()
+            .expect("grad_arena_layout must be set when calibration_grad_retention is Some");
+        let model_backward_id = emit_model_backward_bridge(
+            &mut compiler,
+            _arena_layout,
+            &grad_arena_layout_clone,
+        )?;
+        emit_calibration_backward_wrapper(
+            &mut compiler,
+            model_forward_id,
+            model_backward_id,
+            batch,
+            seq,
+            channels,
+        )?;
+    }
 
     let obj_bytes = map_codegen_error("finalize calib_model.o", compiler.finalize())?;
     fs::write(out_path, &obj_bytes).map_err(|e| HarnessError::Infrastructure {
@@ -2552,7 +2722,6 @@ mod tests {
 
 #[cfg(test)]
 mod grad_arena_emission {
-    use super::*;
     use object::{Object, ObjectSection, ObjectSymbol};
     use nsl_lexer::Interner;
 
@@ -2661,6 +2830,152 @@ mod grad_arena_emission {
         assert!(
             compiler.grad_arena_layout.is_none(),
             "grad_arena_layout must remain None when option is not set"
+        );
+    }
+}
+
+#[cfg(test)]
+mod backward_wrapper {
+    use super::*;
+    use object::{Object, ObjectSymbol};
+    use nsl_errors::{FileId, Level};
+    use nsl_lexer::{tokenize, Interner};
+
+    use crate::calibration::discovery::WggoGradTarget;
+    use crate::calibration::observation::ProjectionRef;
+    use crate::calibration::retention_pass::build_arena_layout;
+
+    fn repo_root() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+    }
+
+    fn fixture(name: &str) -> PathBuf {
+        repo_root().join("tests").join("fixtures").join(name)
+    }
+
+    /// Parse the AWQ MLP fixture — same model used by existing calib model tests.
+    fn parse_awq_fixture() -> (nsl_ast::Module, Interner) {
+        let source = std::fs::read_to_string(fixture("awq_calibration_mlp.nsl"))
+            .expect("fixture readable");
+        let mut interner = Interner::new();
+        let (tokens, lex_diags) = tokenize(&source, FileId(0), &mut interner);
+        assert!(
+            lex_diags.iter().all(|d| !matches!(d.level, Level::Error)),
+            "fixture must lex cleanly: {lex_diags:?}"
+        );
+        let parsed = nsl_parser::parse(&tokens, &mut interner);
+        assert!(
+            parsed.diagnostics.iter().all(|d| !matches!(d.level, Level::Error)),
+            "fixture must parse cleanly: {:?}",
+            parsed.diagnostics
+        );
+        (parsed.module, interner)
+    }
+
+    /// Build `CompileOptions` with both AWQ calibration bundle *and*
+    /// `calibration_grad_retention` set to a minimal single-layer WGGO target
+    /// whose projection names match the TinyMLP fixture.
+    ///
+    /// The WGGO target uses the same 128×64 weight shape as `TinyMLP.up_proj`
+    /// so that `build_grad_arena_layout` produces a non-zero BSS section,
+    /// which is required for the backward guard in `emit_calibration_model_object`
+    /// to pass.
+    fn compile_options_with_backward(
+        ast: &nsl_ast::Module,
+        interner: &Interner,
+    ) -> crate::CompileOptions {
+        let mut analysis_interner = interner.clone();
+        let analysis = nsl_semantic::analyze(ast, &mut analysis_interner);
+        let mut opts = crate::CompileOptions::default();
+        opts.calibration_batch_seq = Some((8, 4));
+        opts.calibration_compile_bundle = Some(std::sync::Arc::new(
+            crate::calibration::CalibrationCompileBundle {
+                ast: ast.clone(),
+                interner: analysis_interner,
+                type_map: analysis.type_map.clone(),
+            },
+        ));
+        opts.weight_index_map = analysis.weight_index_map.clone();
+
+        // One WGGO target that mirrors TinyMLP's weight shapes (128×64).
+        let targets = vec![WggoGradTarget {
+            layer_key: "TinyMLP".into(),
+            class_name: "TinyMLP".into(),
+            head_dim: 64,
+            w_q: ProjectionRef("TinyMLP.up_proj".into()),
+            w_k: ProjectionRef("TinyMLP.up_proj".into()),
+            w_v: ProjectionRef("TinyMLP.up_proj".into()),
+            w_o: ProjectionRef("TinyMLP.down_proj".into()),
+            w_q_shape: [128, 64],
+            w_k_shape: [128, 64],
+            w_v_shape: [128, 64],
+            w_o_shape: [64, 128],
+        }];
+        opts.calibration_grad_retention = Some(targets);
+        opts
+    }
+
+    #[test]
+    fn calib_model_object_exports_nsl_calib_model_backward() {
+        let (ast, interner) = parse_awq_fixture();
+        let projections = crate::calibration::pre_scan_awq_projections_from_ast(&ast, &interner);
+        let arena_layout = build_arena_layout(&projections, 8, 4);
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let out_path = tmp.path().join("calib_model.o");
+        let opts = compile_options_with_backward(&ast, &interner);
+
+        emit_calibration_model_object(&ast, &opts, &arena_layout, &out_path)
+            .expect("emit succeeds with grad_retention set");
+
+        let obj_bytes = std::fs::read(&out_path).expect("object readable");
+        let obj = object::File::parse(&*obj_bytes).expect("object::File::parse");
+
+        assert!(
+            obj.symbols().any(|s| {
+                s.name() == Ok("nsl_calib_model_backward") && !s.is_undefined()
+            }),
+            "calib_model.o must export nsl_calib_model_backward when grad-retention is set"
+        );
+    }
+
+    #[test]
+    fn calib_model_object_no_backward_when_grad_retention_absent() {
+        let (ast, interner) = parse_awq_fixture();
+        let projections = crate::calibration::pre_scan_awq_projections_from_ast(&ast, &interner);
+        let arena_layout = build_arena_layout(&projections, 8, 4);
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let out_path = tmp.path().join("calib_model.o");
+
+        // opts WITHOUT calibration_grad_retention.
+        let opts = {
+            let mut analysis_interner = interner.clone();
+            let analysis = nsl_semantic::analyze(&ast, &mut analysis_interner);
+            let mut o = crate::CompileOptions::default();
+            o.calibration_batch_seq = Some((8, 4));
+            o.calibration_compile_bundle = Some(std::sync::Arc::new(
+                crate::calibration::CalibrationCompileBundle {
+                    ast: ast.clone(),
+                    interner: analysis_interner,
+                    type_map: analysis.type_map.clone(),
+                },
+            ));
+            o.weight_index_map = analysis.weight_index_map.clone();
+            o
+        };
+        // Confirm no grad retention.
+        assert!(opts.calibration_grad_retention.is_none());
+
+        emit_calibration_model_object(&ast, &opts, &arena_layout, &out_path)
+            .expect("emit succeeds without grad_retention");
+
+        let obj_bytes = std::fs::read(&out_path).expect("object readable");
+        let obj = object::File::parse(&*obj_bytes).expect("object::File::parse");
+
+        assert!(
+            !obj.symbols().any(|s| s.name() == Ok("nsl_calib_model_backward")),
+            "calib_model.o must NOT export nsl_calib_model_backward when grad-retention is absent"
         );
     }
 }
