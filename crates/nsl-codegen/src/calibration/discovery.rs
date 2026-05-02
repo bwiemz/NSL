@@ -1879,4 +1879,112 @@ fn main():
         );
         assert_eq!(targets[0].layer_key, "m");
     }
+
+    // ── Task 6 fast-follows: walker edge-case contracts ────────────────
+
+    /// Default constructor args propagate end-to-end through pre-scan: a
+    /// `model Attention(dim: int = 4096, num_heads: int = 32)` instantiated
+    /// with no args should resolve via `bind_constructor_args`'s default
+    /// path (already unit-tested at the function level), and pre-scan
+    /// should produce a target whose shapes reflect the defaults.
+    ///
+    /// This locks in the end-to-end contract — without it, a regression
+    /// in the walker → bind_constructor_args path could silently swallow
+    /// default-arg models.
+    #[test]
+    fn pre_scan_wggo_resolves_default_constructor_args() {
+        let source = r#"
+model Attention(dim: int = 4096, num_heads: int = 32):
+    head_dim: int = dim // num_heads
+    q_proj: Tensor = randn([dim, dim])
+    k_proj: Tensor = randn([dim, dim])
+    v_proj: Tensor = randn([dim, dim])
+    o_proj: Tensor = randn([dim, dim])
+
+    @wggo_target(w_q=self.q_proj, w_k=self.k_proj, w_v=self.v_proj, w_o=self.o_proj, head_dim=self.head_dim)
+    fn forward(self, x: Tensor) -> Tensor:
+        return x
+
+fn main():
+    let m = Attention()
+    let x = randn([1, 4096])
+    let y = m.forward(x)
+"#;
+        let (ast, interner) = parse_module(source);
+        let targets = pre_scan_wggo_targets_from_ast(&ast, &interner);
+        assert_eq!(
+            targets.len(),
+            1,
+            "Attention() with default args must produce one target; got {targets:?}",
+        );
+        let t = &targets[0];
+        assert_eq!(t.layer_key, "m");
+        assert_eq!(t.head_dim, 128, "default 4096 // 32 = 128");
+        assert_eq!(t.w_q_shape, [4096, 4096], "default dim=4096 propagates to projections");
+    }
+
+    /// Walker contract: a non-`Call` initializer (here a parenthesized
+    /// `Call`, parsed as `ExprKind::Paren(Call(...))`) is silently
+    /// skipped because `try_build_wggo_target` matches only direct
+    /// `ExprKind::Call`. Documents the intentional silent-skip; if the
+    /// walker is ever generalized to unwrap `Paren`, update the
+    /// expectation here.
+    #[test]
+    fn pre_scan_wggo_silently_skips_parenthesized_init() {
+        let source = r#"
+model Attention(dim: int, num_heads: int):
+    head_dim: int = dim // num_heads
+    q_proj: Tensor = zeros([dim, dim])
+    k_proj: Tensor = zeros([dim, dim])
+    v_proj: Tensor = zeros([dim, dim])
+    o_proj: Tensor = zeros([dim, dim])
+
+    @wggo_target(w_q=self.q_proj, w_k=self.k_proj, w_v=self.v_proj, w_o=self.o_proj, head_dim=self.head_dim)
+    fn forward(self, x: Tensor) -> Tensor:
+        return x
+
+fn main():
+    let m = (Attention(dim=64, num_heads=4))
+    let y = m.forward(zeros([1, 64]))
+"#;
+        let (ast, interner) = parse_module(source);
+        let targets = pre_scan_wggo_targets_from_ast(&ast, &interner);
+        assert!(
+            targets.is_empty(),
+            "parenthesized init is not a direct Call → silently skipped (current contract); got {targets:?}",
+        );
+    }
+
+    /// Walker contract: a `Call` whose callee is itself a member-access
+    /// (e.g. `pkg.Attention(...)`) is silently skipped because
+    /// `try_build_wggo_target` requires `ExprKind::Ident` for the
+    /// callee. Documents the intentional silent-skip — qualified paths
+    /// would need explicit symbol resolution before they can be
+    /// matched against the `decorated` map.
+    #[test]
+    fn pre_scan_wggo_silently_skips_qualified_path_callee() {
+        let source = r#"
+model Attention(dim: int, num_heads: int):
+    head_dim: int = dim // num_heads
+    q_proj: Tensor = zeros([dim, dim])
+    k_proj: Tensor = zeros([dim, dim])
+    v_proj: Tensor = zeros([dim, dim])
+    o_proj: Tensor = zeros([dim, dim])
+
+    @wggo_target(w_q=self.q_proj, w_k=self.k_proj, w_v=self.v_proj, w_o=self.o_proj, head_dim=self.head_dim)
+    fn forward(self, x: Tensor) -> Tensor:
+        return x
+
+fn main():
+    let pkg = some_factory()
+    let m = pkg.Attention(dim=64, num_heads=4)
+    let y = m.forward(zeros([1, 64]))
+"#;
+        let (ast, interner) = parse_module(source);
+        let targets = pre_scan_wggo_targets_from_ast(&ast, &interner);
+        assert!(
+            targets.is_empty(),
+            "member-access callee `pkg.Attention(...)` is not an Ident callee → silently skipped (current contract); got {targets:?}",
+        );
+    }
 }
