@@ -1,6 +1,5 @@
 ---
 source: crates/nsl-codegen/tests/pca_forward_kernel_snapshot.rs
-assertion_line: 35
 expression: ptx
 ---
 .version 8.7
@@ -398,7 +397,7 @@ V2_LOOP_PV_OVER_K_0:
     mul.lo.u64 %rd48, %rd48, %rd6;            // * seq_len
     add.u64 %rd48, %rd48, %rd47;              // + q_row_global
     mul.lo.u64 %rd48, %rd48, %rd7;            // * head_dim
-    shl.b64 %rd48, %rd48, 1;                  // * 2 bytes f16 (inference)
+    shl.b64 %rd48, %rd48, 1;                  // * 2 bytes f16 output
     add.u64 %rd48, %rd3, %rd48;               // out_base_global
     cvt.u64.u32 %rd49, %lane;
     cvt.rn.f16.f32 %h0, %f48;
@@ -702,7 +701,7 @@ V2_LOOP_PV_OVER_K_1:
     mul.lo.u64 %rd48, %rd48, %rd6;            // * seq_len
     add.u64 %rd48, %rd48, %rd47;              // + q_row_global
     mul.lo.u64 %rd48, %rd48, %rd7;            // * head_dim
-    shl.b64 %rd48, %rd48, 1;                  // * 2 bytes f16 (inference)
+    shl.b64 %rd48, %rd48, 1;                  // * 2 bytes f16 output
     add.u64 %rd48, %rd3, %rd48;               // out_base_global
     cvt.u64.u32 %rd49, %lane;
     cvt.rn.f16.f32 %h0, %f48;
@@ -1006,7 +1005,7 @@ V2_LOOP_PV_OVER_K_2:
     mul.lo.u64 %rd48, %rd48, %rd6;            // * seq_len
     add.u64 %rd48, %rd48, %rd47;              // + q_row_global
     mul.lo.u64 %rd48, %rd48, %rd7;            // * head_dim
-    shl.b64 %rd48, %rd48, 1;                  // * 2 bytes f16 (inference)
+    shl.b64 %rd48, %rd48, 1;                  // * 2 bytes f16 output
     add.u64 %rd48, %rd3, %rd48;               // out_base_global
     cvt.u64.u32 %rd49, %lane;
     cvt.rn.f16.f32 %h0, %f48;
@@ -1310,7 +1309,7 @@ V2_LOOP_PV_OVER_K_3:
     mul.lo.u64 %rd48, %rd48, %rd6;            // * seq_len
     add.u64 %rd48, %rd48, %rd47;              // + q_row_global
     mul.lo.u64 %rd48, %rd48, %rd7;            // * head_dim
-    shl.b64 %rd48, %rd48, 1;                  // * 2 bytes f16 (inference)
+    shl.b64 %rd48, %rd48, 1;                  // * 2 bytes f16 output
     add.u64 %rd48, %rd3, %rd48;               // out_base_global
     cvt.u64.u32 %rd49, %lane;
     cvt.rn.f16.f32 %h0, %f48;
@@ -1614,7 +1613,7 @@ V2_LOOP_PV_OVER_K_4:
     mul.lo.u64 %rd48, %rd48, %rd6;            // * seq_len
     add.u64 %rd48, %rd48, %rd47;              // + q_row_global
     mul.lo.u64 %rd48, %rd48, %rd7;            // * head_dim
-    shl.b64 %rd48, %rd48, 1;                  // * 2 bytes f16 (inference)
+    shl.b64 %rd48, %rd48, 1;                  // * 2 bytes f16 output
     add.u64 %rd48, %rd3, %rd48;               // out_base_global
     cvt.u64.u32 %rd49, %lane;
     cvt.rn.f16.f32 %h0, %f48;
@@ -1918,7 +1917,7 @@ V2_LOOP_PV_OVER_K_5:
     mul.lo.u64 %rd48, %rd48, %rd6;            // * seq_len
     add.u64 %rd48, %rd48, %rd47;              // + q_row_global
     mul.lo.u64 %rd48, %rd48, %rd7;            // * head_dim
-    shl.b64 %rd48, %rd48, 1;                  // * 2 bytes f16 (inference)
+    shl.b64 %rd48, %rd48, 1;                  // * 2 bytes f16 output
     add.u64 %rd48, %rd3, %rd48;               // out_base_global
     cvt.u64.u32 %rd49, %lane;
     cvt.rn.f16.f32 %h0, %f48;
@@ -2222,7 +2221,7 @@ V2_LOOP_PV_OVER_K_6:
     mul.lo.u64 %rd48, %rd48, %rd6;            // * seq_len
     add.u64 %rd48, %rd48, %rd47;              // + q_row_global
     mul.lo.u64 %rd48, %rd48, %rd7;            // * head_dim
-    shl.b64 %rd48, %rd48, 1;                  // * 2 bytes f16 (inference)
+    shl.b64 %rd48, %rd48, 1;                  // * 2 bytes f16 output
     add.u64 %rd48, %rd3, %rd48;               // out_base_global
     cvt.u64.u32 %rd49, %lane;
     cvt.rn.f16.f32 %h0, %f48;
@@ -2526,7 +2525,7 @@ V2_LOOP_PV_OVER_K_7:
     mul.lo.u64 %rd48, %rd48, %rd6;            // * seq_len
     add.u64 %rd48, %rd48, %rd47;              // + q_row_global
     mul.lo.u64 %rd48, %rd48, %rd7;            // * head_dim
-    shl.b64 %rd48, %rd48, 1;                  // * 2 bytes f16 (inference)
+    shl.b64 %rd48, %rd48, 1;                  // * 2 bytes f16 output
     add.u64 %rd48, %rd3, %rd48;               // out_base_global
     cvt.u64.u32 %rd49, %lane;
     cvt.rn.f16.f32 %h0, %f48;
@@ -2830,7 +2829,7 @@ V2_LOOP_PV_OVER_K_8:
     mul.lo.u64 %rd48, %rd48, %rd6;            // * seq_len
     add.u64 %rd48, %rd48, %rd47;              // + q_row_global
     mul.lo.u64 %rd48, %rd48, %rd7;            // * head_dim
-    shl.b64 %rd48, %rd48, 1;                  // * 2 bytes f16 (inference)
+    shl.b64 %rd48, %rd48, 1;                  // * 2 bytes f16 output
     add.u64 %rd48, %rd3, %rd48;               // out_base_global
     cvt.u64.u32 %rd49, %lane;
     cvt.rn.f16.f32 %h0, %f48;
@@ -3134,7 +3133,7 @@ V2_LOOP_PV_OVER_K_9:
     mul.lo.u64 %rd48, %rd48, %rd6;            // * seq_len
     add.u64 %rd48, %rd48, %rd47;              // + q_row_global
     mul.lo.u64 %rd48, %rd48, %rd7;            // * head_dim
-    shl.b64 %rd48, %rd48, 1;                  // * 2 bytes f16 (inference)
+    shl.b64 %rd48, %rd48, 1;                  // * 2 bytes f16 output
     add.u64 %rd48, %rd3, %rd48;               // out_base_global
     cvt.u64.u32 %rd49, %lane;
     cvt.rn.f16.f32 %h0, %f48;
@@ -3438,7 +3437,7 @@ V2_LOOP_PV_OVER_K_10:
     mul.lo.u64 %rd48, %rd48, %rd6;            // * seq_len
     add.u64 %rd48, %rd48, %rd47;              // + q_row_global
     mul.lo.u64 %rd48, %rd48, %rd7;            // * head_dim
-    shl.b64 %rd48, %rd48, 1;                  // * 2 bytes f16 (inference)
+    shl.b64 %rd48, %rd48, 1;                  // * 2 bytes f16 output
     add.u64 %rd48, %rd3, %rd48;               // out_base_global
     cvt.u64.u32 %rd49, %lane;
     cvt.rn.f16.f32 %h0, %f48;
@@ -3742,7 +3741,7 @@ V2_LOOP_PV_OVER_K_11:
     mul.lo.u64 %rd48, %rd48, %rd6;            // * seq_len
     add.u64 %rd48, %rd48, %rd47;              // + q_row_global
     mul.lo.u64 %rd48, %rd48, %rd7;            // * head_dim
-    shl.b64 %rd48, %rd48, 1;                  // * 2 bytes f16 (inference)
+    shl.b64 %rd48, %rd48, 1;                  // * 2 bytes f16 output
     add.u64 %rd48, %rd3, %rd48;               // out_base_global
     cvt.u64.u32 %rd49, %lane;
     cvt.rn.f16.f32 %h0, %f48;
@@ -4046,7 +4045,7 @@ V2_LOOP_PV_OVER_K_12:
     mul.lo.u64 %rd48, %rd48, %rd6;            // * seq_len
     add.u64 %rd48, %rd48, %rd47;              // + q_row_global
     mul.lo.u64 %rd48, %rd48, %rd7;            // * head_dim
-    shl.b64 %rd48, %rd48, 1;                  // * 2 bytes f16 (inference)
+    shl.b64 %rd48, %rd48, 1;                  // * 2 bytes f16 output
     add.u64 %rd48, %rd3, %rd48;               // out_base_global
     cvt.u64.u32 %rd49, %lane;
     cvt.rn.f16.f32 %h0, %f48;
@@ -4350,7 +4349,7 @@ V2_LOOP_PV_OVER_K_13:
     mul.lo.u64 %rd48, %rd48, %rd6;            // * seq_len
     add.u64 %rd48, %rd48, %rd47;              // + q_row_global
     mul.lo.u64 %rd48, %rd48, %rd7;            // * head_dim
-    shl.b64 %rd48, %rd48, 1;                  // * 2 bytes f16 (inference)
+    shl.b64 %rd48, %rd48, 1;                  // * 2 bytes f16 output
     add.u64 %rd48, %rd3, %rd48;               // out_base_global
     cvt.u64.u32 %rd49, %lane;
     cvt.rn.f16.f32 %h0, %f48;
@@ -4654,7 +4653,7 @@ V2_LOOP_PV_OVER_K_14:
     mul.lo.u64 %rd48, %rd48, %rd6;            // * seq_len
     add.u64 %rd48, %rd48, %rd47;              // + q_row_global
     mul.lo.u64 %rd48, %rd48, %rd7;            // * head_dim
-    shl.b64 %rd48, %rd48, 1;                  // * 2 bytes f16 (inference)
+    shl.b64 %rd48, %rd48, 1;                  // * 2 bytes f16 output
     add.u64 %rd48, %rd3, %rd48;               // out_base_global
     cvt.u64.u32 %rd49, %lane;
     cvt.rn.f16.f32 %h0, %f48;
@@ -4958,7 +4957,7 @@ V2_LOOP_PV_OVER_K_15:
     mul.lo.u64 %rd48, %rd48, %rd6;            // * seq_len
     add.u64 %rd48, %rd48, %rd47;              // + q_row_global
     mul.lo.u64 %rd48, %rd48, %rd7;            // * head_dim
-    shl.b64 %rd48, %rd48, 1;                  // * 2 bytes f16 (inference)
+    shl.b64 %rd48, %rd48, 1;                  // * 2 bytes f16 output
     add.u64 %rd48, %rd3, %rd48;               // out_base_global
     cvt.u64.u32 %rd49, %lane;
     cvt.rn.f16.f32 %h0, %f48;
