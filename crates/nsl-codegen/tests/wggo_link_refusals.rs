@@ -108,6 +108,10 @@ fn backward_compile_options(
         w_k_shape: [128, 64],
         w_v_shape: [128, 64],
         w_o_shape: [64, 128],
+        w_q_index: 0,
+        w_k_index: 0,
+        w_v_index: 0,
+        w_o_index: 1,
     }];
     opts.calibration_grad_retention = Some(targets);
     opts
@@ -192,6 +196,8 @@ fn link_fails_when_backward_wrapper_missing() {
         true,
         true, // needs_backward = true — the scaffolding will call nsl_calib_model_backward
         &[],
+        &[],  // no wggo targets for this link-refusal test
+        None, // no grad_arena_layout
         &scaffolding_obj,
     )
     .expect("emit backward scaffolding.o");
@@ -255,6 +261,8 @@ fn link_succeeds_when_backward_not_needed_and_wrapper_absent() {
         true,
         false, // needs_backward = false — AWQ-only path
         &[],
+        &[],  // no wggo targets for this forward-only test
+        None, // no grad_arena_layout
         &scaffolding_obj,
     )
     .expect("emit forward scaffolding.o");
@@ -361,6 +369,10 @@ fn wggo_gradient_hook_registered_when_grad_retention_is_some() {
         w_k_shape: [32, 32],
         w_v_shape: [32, 32],
         w_o_shape: [32, 32],
+        w_q_index: 0,
+        w_k_index: 1,
+        w_v_index: 2,
+        w_o_index: 3,
     }];
 
     // Mirror the conditional registration logic from stmt.rs.

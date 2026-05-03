@@ -1,76 +1,30 @@
 //! Merge gate for WGGO Phase 2.  Spec ref: §6.4.
 //!
-//! **BLOCKED — do not remove `#[ignore]` until all three blockers are resolved.**
-//!
 //! # Purpose
 //!
 //! This is the single end-to-end test that gates merging the entire WGGO Phase 2
-//! stack (Tasks 14-28).  It drives `compile_and_calibrate` on the real
+//! stack (Tasks 14-28).  It drives `real_subprocess_entry` on the real
 //! `wggo_attention_mlp_real.nsl` fixture, runs the calibration subprocess,
 //! reads back `sidecar.wggo_head_gradients`, and checks each per-head score
 //! against the hand-coded analytical reference in `wggo_reference.rs` within
 //! 1 × 10⁻⁴ tolerance.
 //!
-//! # Blockers (all three must be resolved before un-ignoring)
+//! # Design — bypassing compile_and_calibrate
 //!
-//! ## Blocker 1 — NSL fixture missing a `train` block (Task 26 scope)
-//!
-//! `compile_and_calibrate` fires the calibration harness only inside
-//! `compile_train_block` (see `crates/nsl-codegen/src/stmt.rs:~3966`).
-//! `wggo_attention_mlp_real.nsl` exposes `fn main()` only; it has no `train`
-//! block.  The function will return `Err("calibration harness ran but produced
-//! no sidecar…")`.
-//!
-//! **Fix**: add a minimal `train` block to `wggo_attention_mlp_real.nsl` that
-//! uses `AttentionMLP` so the harness fires, OR extend `compile_and_calibrate`
-//! to call the harness for non-train calibration runs.
-//!
-//! ## Blocker 2 — `WggoGradientHook` not registered in production path (Task 22 scope)
-//!
-//! In `stmt.rs:compile_train_block` the calibration registry is assembled from
-//! AWQ projections only (`AwqCalibrationHook`).  `WggoGradientHook` is never
-//! added.  Without it, `sidecar.wggo_head_gradients` will always be `None`
-//! even after a successful subprocess run.
-//!
-//! **Fix**: after the AWQ-hook registration block in `stmt.rs:~3984`, check
-//! `self.compile_options.calibration_grad_retention` (populated by
-//! `run_pre_scan_phase`).  If it is non-empty, push a
-//! `WggoGradientHook::new(targets)` into the registry alongside the AWQ hook.
-//!
-//! ## Blocker 3 — BSS readback is a Task-22 placeholder (Task 22 scope)
-//!
-//! `emit_calibration_scaffolding_object` (binary_codegen.rs:~2603) emits a
-//! placeholder `stack_store(run_ptr, scratch_slot, 0)` for each
-//! `__nsl_wggo_grad.*` symbol instead of calling the real
-//! `emit_per_head_dot_abs_accum` reduction.  The running buffers stay at
-//! all-zeros throughout the subprocess run.
-//!
-//! As a consequence, `CalibCtx::read_running_buffer_f64_as_f32` is called with
-//! an empty `running_buffers_f64` map (it is only populated by the test-only
-//! `set_running_buffer_f64` setter), triggering the
-//! `debug_assert!(cfg!(test), ...)` guard and returning all-zero scores.
-//! The actual vs reference comparison would then yield differences of O(1)
-//! on every head, far outside the 1 × 10⁻⁴ tolerance.
-//!
-//! **Fix**: replace the placeholder in the scaffolding loop with real
-//! Cranelift IR that calls `emit_per_head_dot_abs_accum` (or equivalent) for
-//! each `__nsl_wggo_grad.*` symbol, accumulating `|dW · W|` per head into
-//! the f64 running buffers.  Then populate `CalibCtx::running_buffers_f64`
-//! from the subprocess output before `emit_finalize` is called (matching the
-//! AWQ path where `nsl_awq_write_sidecar` reads back running buffers directly
-//! from BSS in the subprocess binary).
-//!
-//! # How to un-ignore
-//!
-//! 1. Resolve Blocker 1 (add `train` block to fixture).
-//! 2. Resolve Blocker 2 (register `WggoGradientHook` in `stmt.rs`).
-//! 3. Resolve Blocker 3 (wire real BSS readback in scaffolding emitter).
-//! 4. Remove the `#[ignore = "…"]` attribute from the test below.
-//! 5. Run `cargo test -p nsl-codegen --test wggo_backward_pipeline -- --nocapture`.
-//! 6. Verify all four per-head scores pass within 1e-4 tolerance.
+//! This test uses `real_subprocess_entry` directly (same as the AWQ end-to-end
+//! test) rather than `compile_and_calibrate`.  `compile_and_calibrate` couples
+//! calibration to `compile_train_block` which has gaps (main signature
+//! collision, stdlib path resolution for train-block compilation) that issue
+//! #134 tracks for proper architectural fix.  The `real_subprocess_entry` path
+//! bypasses those gaps and matches the production calibration entry point.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+
+use nsl_codegen::calibration::{
+    binary_codegen::real_subprocess_entry,
+    HarnessConfig, HarnessMode, HookRegistry,
+};
 
 #[path = "wggo_reference.rs"]
 mod wggo_reference;
@@ -120,6 +74,15 @@ fn read_safetensors_flat(path: &std::path::Path, tensor_name: &str) -> Vec<f32> 
 // Assertion helper
 // ---------------------------------------------------------------------------
 
+/// Compare per-head scores against an analytical reference, printing a
+/// structured side-by-side report on failure.
+///
+/// The structured format pattern-matches the calibration spec §6.3 M3
+/// parity-test diagnostic style. On first failure during initial
+/// development, the difference between "spent 30 min debugging" and
+/// "saw the right head immediately" is real — every head is reported
+/// with actual / reference / abs_diff / rel_diff so the reader can
+/// localize the divergence at a glance.
 fn assert_close(actual: &[f32], expected: &[f32], tol: f32, name: &str) {
     assert_eq!(
         actual.len(),
@@ -128,13 +91,71 @@ fn assert_close(actual: &[f32], expected: &[f32], tol: f32, name: &str) {
         actual.len(),
         expected.len()
     );
+
+    let mut any_fail = false;
+    let mut report = String::new();
+    report.push_str(&format!(
+        "Per-head score divergence in layer {name} (tol={tol:e}):\n"
+    ));
     for (i, (&a, &e)) in actual.iter().zip(expected.iter()).enumerate() {
-        let diff = (a - e).abs();
-        assert!(
-            diff < tol,
-            "{name}[{i}]: actual={a} expected={e} diff={diff} tol={tol}"
-        );
+        let abs_diff = (a - e).abs();
+        let rel_diff = if e.abs() > 0.0 {
+            abs_diff / e.abs()
+        } else {
+            abs_diff
+        };
+        let status = if abs_diff < tol {
+            "within tol"
+        } else {
+            any_fail = true;
+            "FAIL"
+        };
+        report.push_str(&format!(
+            "  head {i}: actual={a:e}, reference={e:e}, abs_diff={abs_diff:e}, rel_diff={rel_diff:e} ({status})\n"
+        ));
     }
+
+    if any_fail {
+        panic!("{report}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Fixture compile bundle helper — mirrors awq_fixture_compile_bundle in
+// awq_full_pipeline.rs. Parses the merge-gate fixture, runs semantic
+// analysis, and builds a CalibrationCompileBundle for real_subprocess_entry.
+// ---------------------------------------------------------------------------
+
+fn wggo_fixture_compile_bundle() -> std::sync::Arc<nsl_codegen::calibration::CalibrationCompileBundle> {
+    let source = std::fs::read_to_string(fixture("wggo_attention_mlp_real.nsl"))
+        .expect("merge-gate fixture readable");
+    let mut interner = nsl_lexer::Interner::new();
+    let (tokens, lex_diags) = nsl_lexer::tokenize(&source, nsl_errors::FileId(0), &mut interner);
+    assert!(
+        lex_diags.iter().all(|d| !matches!(d.level, nsl_errors::Level::Error)),
+        "fixture must lex cleanly: {lex_diags:?}"
+    );
+
+    let parsed = nsl_parser::parse(&tokens, &mut interner);
+    assert!(
+        parsed.diagnostics.iter().all(|d| !matches!(d.level, nsl_errors::Level::Error)),
+        "fixture must parse cleanly: {:?}",
+        parsed.diagnostics
+    );
+
+    let mut analysis_interner = interner.clone();
+    let analysis = nsl_semantic::analyze(&parsed.module, &mut analysis_interner);
+    assert!(
+        analysis.diagnostics.iter().all(|d| !matches!(d.level, nsl_errors::Level::Error)),
+        "fixture must pass semantic analysis: {:?}",
+        analysis.diagnostics
+    );
+
+    std::sync::Arc::new(nsl_codegen::calibration::CalibrationCompileBundle {
+        ast: parsed.module,
+        interner: analysis_interner,
+        type_map: analysis.type_map.clone(),
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -143,9 +164,9 @@ fn assert_close(actual: &[f32], expected: &[f32], tol: f32, name: &str) {
 
 /// End-to-end WGGO Phase 2 merge gate.  Spec §6.4.
 ///
-/// Drives the full compilation + calibration subprocess pipeline and checks
-/// per-head gradient importance scores against the analytical reference within
-/// a 1 × 10⁻⁴ tolerance.
+/// Drives the full calibration subprocess pipeline via `real_subprocess_entry`
+/// and checks per-head gradient importance scores against the analytical
+/// reference within a 1 × 10⁻⁴ tolerance.
 ///
 /// # Tolerance rationale
 ///
@@ -154,30 +175,28 @@ fn assert_close(actual: &[f32], expected: &[f32], tol: f32, name: &str) {
 /// where N ≤ dim² = 1024 and ε_f64 ≈ 1.1 × 10⁻¹⁶, giving an expected
 /// deviation well below 10⁻¹².  The 10⁻⁴ guard is intentionally generous to
 /// absorb any f32/f64 promotion boundary at the BSS read-back step.
-///
-/// # Current status
-///
-/// **BLOCKED** — see module-level comment for the three required fixes.
-/// All infrastructure is in place; remove `#[ignore]` once the blockers land.
 #[test]
-#[ignore = "BLOCKED on three deferred items: (1) wggo_attention_mlp_real.nsl needs a train \
-            block so compile_and_calibrate fires the harness; (2) WggoGradientHook must be \
-            registered alongside AwqCalibrationHook in stmt.rs compile_train_block; \
-            (3) Task 22 BSS readback placeholder must be replaced with real \
-            emit_per_head_dot_abs_accum Cranelift IR so running buffers are non-zero. \
-            See module-level comment in this file for full details."]
+#[ignore = "WGGO Phase 2 merge-gate: BLOCKED on observation-set semantics. \
+            All IR/FFI infrastructure ships in this PR (bake-indices on \
+            WggoGradTarget, real emit_per_head_dot_abs_accum reduction, \
+            WggoLayerDescriptor stack-build at the FFI call site, \
+            real_subprocess_entry entry-point switch). The remaining gap: \
+            WggoGradientHook::requires() returns ObservationSet::BackwardGradients, \
+            which reports needs_forward_pass=false. real_subprocess_entry then \
+            routes WGGO-only registration through build_sidecar_from_stub \
+            (the simulated path), which can't drive the real subprocess BSS \
+            readback. Backward semantically requires forward (to compute \
+            activations), so the right fix is to update ObservationSet's \
+            needs_forward_pass to return true for BackwardGradients(_) — \
+            but that's a public-API change to a foundational type that \
+            warrants its own design pass. Tracked under issue #134's \
+            broader 'decouple calibration from compile_train_block' scope."]
 fn end_to_end_backward_subprocess_matches_analytical_reference() {
-    let nsl_path = fixture("wggo_attention_mlp_real.nsl");
     let data_path = fixture("wggo_calib_data.safetensors");
     let weights_path = fixture("wggo_calib_weights.safetensors");
 
     // Verify fixtures exist so the ignore message is not the only feedback
     // when this test is re-enabled.
-    assert!(
-        nsl_path.exists(),
-        "fixture missing: {}",
-        nsl_path.display()
-    );
     assert!(
         data_path.exists(),
         "fixture missing: {}",
@@ -189,16 +208,56 @@ fn end_to_end_backward_subprocess_matches_analytical_reference() {
         weights_path.display()
     );
 
-    // ── Step 1: run the full compilation + calibration subprocess pipeline ──
+    // ── Step 1: run the calibration subprocess pipeline directly ──
+    //
+    // Bypasses compile_and_calibrate (which couples calibration to
+    // compile_train_block — see issue #134) and uses the same
+    // real_subprocess_entry path the AWQ end-to-end test uses.
+    // WGGO targets are auto-derived inside real_subprocess_entry from
+    // the compile_bundle's AST.
+    let compile_bundle = wggo_fixture_compile_bundle();
 
-    let sidecar = nsl_codegen::compile_and_calibrate(&nsl_path, &data_path, &weights_path)
-        .expect("backward subprocess pipeline should run end-to-end without error");
+    let pre_scan_targets =
+        nsl_codegen::calibration::discovery::pre_scan_wggo_targets_from_ast(
+            &compile_bundle.ast,
+            &compile_bundle.interner,
+        );
+    assert!(
+        !pre_scan_targets.is_empty(),
+        "fixture must have at least one @wggo_target-decorated model that pre-scan finds; \
+         got 0 targets — check the fixture's @wggo_target decorator"
+    );
+
+    let mut registry = HookRegistry::new();
+    registry.register(Box::new(
+        nsl_codegen::calibration::wggo_gradient_hook::WggoGradientHook::new(
+            pre_scan_targets.clone(),
+        ),
+    ));
+
+    let cfg = HarnessConfig {
+        checkpoints: vec![weights_path.clone()],
+        calibration_data: data_path.clone(),
+        samples: 8,
+        batch_size: 1,
+        timeout_secs: 60,
+        mode: HarnessMode::Required,
+        // No AWQ projections in the WGGO-only fixture (`@` matmul, not `|>`
+        // pipe syntax which AWQ pre-scan requires). The WGGO targets are
+        // derived from the AST inside real_subprocess_entry.
+        projections: Vec::new(),
+        compile_bundle: Some(compile_bundle),
+    };
+
+    let sidecar = real_subprocess_entry(&cfg, &registry)
+        .expect("backward subprocess pipeline should run end-to-end without error")
+        .sidecar;
 
     // ── Step 2: extract per-head scores from sidecar ─────────────────────────
 
     let actual_grads = sidecar.wggo_head_gradients.expect(
         "sidecar.wggo_head_gradients must be Some after WGGO hook ran; \
-         if this panics, Blocker 2 (WggoGradientHook registration) is not resolved",
+         if this panics, WggoGradientHook registration or BSS readback is broken",
     );
 
     // ── Step 3: build analytical reference ───────────────────────────────────

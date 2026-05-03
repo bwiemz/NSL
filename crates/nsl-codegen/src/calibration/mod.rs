@@ -611,6 +611,10 @@ mod wggo_routing_tests {
                 w_k_shape: [256, 256],
                 w_v_shape: [256, 256],
                 w_o_shape: [256, 256],
+                w_q_index: 0,
+                w_k_index: 1,
+                w_v_index: 2,
+                w_o_index: 3,
             },
             WggoGradTarget {
                 layer_key: "model.layers.1".into(),
@@ -624,6 +628,10 @@ mod wggo_routing_tests {
                 w_k_shape: [256, 256],
                 w_v_shape: [256, 256],
                 w_o_shape: [256, 256],
+                w_q_index: 0,
+                w_k_index: 1,
+                w_v_index: 2,
+                w_o_index: 3,
             },
         ]
     }

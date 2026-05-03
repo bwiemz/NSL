@@ -76,6 +76,10 @@ fn opts_with_backward(
         w_k_shape: [16, 16],
         w_v_shape: [16, 16],
         w_o_shape: [16, 16],
+        w_q_index: 0,
+        w_k_index: 1,
+        w_v_index: 2,
+        w_o_index: 3,
     }];
     opts.calibration_grad_retention = Some(targets);
     opts

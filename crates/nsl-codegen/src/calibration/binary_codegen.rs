@@ -140,10 +140,38 @@ pub fn real_subprocess_entry(
                     .into(),
             })?;
         let (_count, seq) = forward_batch_seq.expect("forward path computed batch/seq above");
+
+        // Pre-scan WGGO targets from the compile bundle AST. Used both to
+        // drive the model object's backward-IR emission (calibration_grad_retention
+        // on model_opts below) and to populate the scaffolding emitter's
+        // per-head reduction calls + WGGO descriptor stack-build.
+        let scaffolding_wggo_targets: Vec<crate::calibration::discovery::WggoGradTarget> =
+            if needs_backward {
+                crate::calibration::discovery::pre_scan_wggo_targets_from_ast(
+                    &compile_bundle.ast,
+                    &compile_bundle.interner,
+                )
+            } else {
+                Vec::new()
+            };
+        let scaffolding_grad_arena_layout: Option<crate::calibration::retention::GradArenaLayout> =
+            if !scaffolding_wggo_targets.is_empty() {
+                Some(crate::calibration::retention::build_grad_arena_layout(
+                    &scaffolding_wggo_targets,
+                ))
+            } else {
+                None
+            };
+
         let mut model_opts = crate::CompileOptions::default();
         model_opts.calibration_batch_seq = Some((1, seq));
         model_opts.calibration_retention = Some(cfg.projections.clone());
         model_opts.calibration_compile_bundle = Some(compile_bundle.clone());
+        // Drive the model object's backward-IR emission. emit_calibration_model_object
+        // runs emit_grad_retention_arena and the source-AD splice when this is Some.
+        if !scaffolding_wggo_targets.is_empty() {
+            model_opts.calibration_grad_retention = Some(scaffolding_wggo_targets.clone());
+        }
 
         let model_obj = tmp.join("calib_model.o");
         emit_calibration_model_object(
@@ -154,6 +182,7 @@ pub fn real_subprocess_entry(
         )?;
 
         let scaffolding_obj = tmp.join("scaffolding.o");
+
         emit_calibration_scaffolding_object(
             &observe_plan,
             &finalize_plan,
@@ -162,6 +191,8 @@ pub fn real_subprocess_entry(
             true,
             needs_backward,
             &per_step_backward_symbols,
+            &scaffolding_wggo_targets,
+            scaffolding_grad_arena_layout.as_ref(),
             &scaffolding_obj,
         )?;
 
@@ -1947,6 +1978,25 @@ pub fn emit_calibration_model_object(
 /// `running_data_ids` entry.  The placeholder `symbol_value` + `stack_store`
 /// keeps the relocation alive so the linker sees a reference even before Task 21
 /// replaces this stub with real per-head dot+abs reduction IR.
+
+/// Compute the per-output-head count for a WGGO target.
+///
+/// `n_o_heads = max(1, w_o_shape[0] / head_dim)` with a `head_dim == 0`
+/// guard. Used in two places: the per-step reduction loop (for the
+/// replication factor `n_o_heads / n_proj_heads`) and the WGGO
+/// descriptor stack-build (for the `running_buffer_len` field).
+///
+/// The two sites must agree because the descriptor advertises the
+/// running-buffer length the runtime FFI reads, and the reduction
+/// emits stores up to that length.
+fn wggo_n_o_heads(target: &crate::calibration::discovery::WggoGradTarget) -> u32 {
+    if target.head_dim == 0 {
+        1
+    } else {
+        (target.w_o_shape[0] / target.head_dim).max(1)
+    }
+}
+
 pub fn emit_calibration_scaffolding_object(
     observe_plan: &[ObservePlanEntry],
     finalize_plan: &[FinalizePlanEntry],
@@ -1955,6 +2005,8 @@ pub fn emit_calibration_scaffolding_object(
     needs_forward_pass: bool,
     needs_backward: bool,
     per_step_backward_symbols: &[String],
+    wggo_targets: &[crate::calibration::discovery::WggoGradTarget],
+    grad_arena_layout: Option<&crate::calibration::retention::GradArenaLayout>,
     out_path: &Path,
 ) -> Result<(), HarnessError> {
     if needs_forward_pass && observe_plan.is_empty() {
@@ -2046,6 +2098,33 @@ pub fn emit_calibration_scaffolding_object(
     } else {
         None
     };
+
+    // Task 3.5: import the grad-arena from the calib_model object when
+    // backward pass is needed and wggo_targets are present.
+    let grad_arena_data_id: Option<DataId> = if needs_backward && !wggo_targets.is_empty() {
+        Some(
+            module
+                .declare_data("__nsl_calib_grad_arena", Linkage::Import, true, false)
+                .map_err(|e| HarnessError::Infrastructure {
+                    reason: format!("declare __nsl_calib_grad_arena import (scaffolding): {e}"),
+                })?,
+        )
+    } else {
+        None
+    };
+
+    // Task 3.6: declare a NUL-terminated C-string rodata for each WGGO
+    // target's layer_key.  Referenced from the descriptor stack-build at the
+    // write_sidecar call site.
+    let mut wggo_layer_key_data_ids: HashMap<String, DataId> = HashMap::new();
+    for target in wggo_targets {
+        let sym = format!(
+            "__nsl_wggo_layer_key.{}",
+            target.layer_key.replace('.', "_")
+        );
+        let key_id = declare_cstr_rodata(&mut module, &sym, &target.layer_key)?;
+        wggo_layer_key_data_ids.insert(target.layer_key.clone(), key_id);
+    }
 
     let mut path_data_ids: HashMap<String, DataId> = HashMap::new();
     for entry in finalize_plan {
@@ -2582,47 +2661,144 @@ pub fn emit_calibration_scaffolding_object(
                 );
             }
 
-            // Spec §4.5: hook.emit_per_step for backward observers.
+            // Task 3.5 (spec §4.5 + §4.6): real per-head |g·w| reduction IR.
             //
-            // Task 21 status: WggoGradientHook::emit_per_step is implemented and
-            // unit-tested (4 tests in wggo_gradient_hook.rs).  The hook's body
-            // iterates (target × projection), verifies presence in grad_arena_layout,
-            // and calls ctx.record_per_head_dot_call() for each valid pair.
+            // For each WGGO target × projection pair that is registered in the
+            // grad arena layout, emit `emit_per_head_dot_abs_accum` calls that
+            // accumulate |grad * weight| per output-head into the f64 running
+            // buffer.  This replaces the Task-18 DCE-prevention placeholder.
             //
-            // Full scaffolding wiring (calling emit_per_head_dot_abs_accum here)
-            // requires threading per-projection weight data pointers into this
-            // loop body.  In production, weight pointers come from
-            // `nsl_model_get_weight_ptrs` (stored in weight_ptrs_addr above),
-            // but indexing individual projections requires either:
-            //   (a) `nsl_model_get_weight`-by-name for each projection (needs new
-            //       import declaration + weight name string globals), or
-            //   (b) pre-computed weight-index offsets passed via a new parameter
-            //       to emit_calibration_scaffolding_object.
-            //
-            // The placeholder below (Task 18) is kept to maintain the relocation
-            // entries that verify `__nsl_wggo_grad.*` symbols are referenced.
-            // Replace with real emit_per_head_dot_abs_accum calls in Task 22.
+            // When `wggo_targets` is empty (AWQ-only run) the block is skipped
+            // entirely — the `needs_backward && !per_step_backward_symbols.is_empty()`
+            // guard is retained to keep the AWQ relocation path unchanged for tests
+            // that pass non-empty `per_step_backward_symbols` without wggo_targets.
             if needs_backward && !per_step_backward_symbols.is_empty() {
-                // Placeholder: single scratch slot is intentional. All stores
-                // overwrite offset 0; the slot exists only to prevent Cranelift DCE
-                // of the symbol_value instructions. Task 22 will replace the loop
-                // with a real per-symbol reduction (one slot per accumulator).
-                let scratch_slot = b.create_sized_stack_slot(StackSlotData::new(
-                    StackSlotKind::ExplicitSlot,
-                    8,
-                    0,
-                ));
-                for sym in per_step_backward_symbols {
-                    let run_id = running_data_ids
-                        .get(sym.as_str())
-                        .unwrap_or_else(|| panic!(
-                            "per_step_backward_symbols entry '{sym}' not found in \
-                             running_data_ids — ensure it appears in finalize_plan"
-                        ));
-                    let run_gv = module.declare_data_in_func(*run_id, b.func);
-                    let run_ptr = b.ins().symbol_value(ptr_ty, run_gv);
-                    // Stack-store the pointer value to prevent DCE.
-                    b.ins().stack_store(run_ptr, scratch_slot, 0);
+                if wggo_targets.is_empty() {
+                    // Backward pass requested (e.g. for a future hook), but no WGGO
+                    // targets registered.  Maintain relocation entries for backward
+                    // symbol references as the old placeholder did so linker smoke
+                    // tests (Task 18) continue to pass.
+                    let scratch_slot = b.create_sized_stack_slot(StackSlotData::new(
+                        StackSlotKind::ExplicitSlot,
+                        8,
+                        0,
+                    ));
+                    for sym in per_step_backward_symbols {
+                        let run_id = running_data_ids
+                            .get(sym.as_str())
+                            .unwrap_or_else(|| panic!(
+                                "per_step_backward_symbols entry '{sym}' not found in \
+                                 running_data_ids — ensure it appears in finalize_plan"
+                            ));
+                        let run_gv = module.declare_data_in_func(*run_id, b.func);
+                        let run_ptr = b.ins().symbol_value(ptr_ty, run_gv);
+                        b.ins().stack_store(run_ptr, scratch_slot, 0);
+                    }
+                } else {
+                    // Real per-head reduction loop.
+                    let grad_arena_id = grad_arena_data_id.expect(
+                        "grad_arena_data_id must be Some when needs_backward \
+                         and wggo_targets is non-empty (spec §5.3 invariant)",
+                    );
+                    let grad_layout = grad_arena_layout.expect(
+                        "grad_arena_layout must be Some when needs_backward \
+                         and wggo_targets is non-empty (spec §5.3 invariant)",
+                    );
+
+                    // Build a full-path → (offset, byte_size) map once, outside
+                    // the per-target loop.  Keys are the full ProjectionRef strings
+                    // (e.g. "gpt.blocks.0.attn.q_proj") because GradArenaLayout
+                    // entries carry the full path, matching target.w_q.0 etc.
+                    let layout_map: HashMap<String, (u32, u32)> = grad_layout
+                        .entries
+                        .iter()
+                        .map(|(p, off, sz)| (p.0.clone(), (*off, *sz)))
+                        .collect();
+
+                    let grad_gv = module.declare_data_in_func(grad_arena_id, b.func);
+                    let grad_arena_base = b.ins().symbol_value(ptr_ty, grad_gv);
+
+                    // weight_ptrs_addr is a stack slot holding the *const *const f32
+                    // array returned by nsl_model_get_weight_ptrs (stored at line ~2462).
+                    // Load the array base pointer once; individual projection pointers are
+                    // loaded at proj_index * PTR_SIZE inside the per-target loop.
+                    let weights_base = b.ins().load(
+                        ptr_ty,
+                        cranelift_codegen::ir::MemFlags::new(),
+                        weight_ptrs_addr,
+                        0,
+                    );
+
+                    const PTR_SIZE: i64 = 8;
+
+                    for target in wggo_targets.iter() {
+                        let n_o_heads = wggo_n_o_heads(target);
+
+                        let running_sym = format!(
+                            "__nsl_wggo_grad.{}",
+                            target.layer_key.replace('.', "_")
+                        );
+                        // Pre-scan/finalize-plan disagreement: skip rather than emitting a
+                        // corrupt accumulation. The descriptor stack-build below treats this
+                        // case as a hard error because a missing pointer there would write
+                        // null into the sidecar; here we only lose one batch's contribution.
+                        let run_id = match running_data_ids.get(&running_sym) {
+                            Some(id) => *id,
+                            None => continue,
+                        };
+                        let run_gv = module.declare_data_in_func(run_id, b.func);
+                        let running_base = b.ins().symbol_value(ptr_ty, run_gv);
+
+                        let proj_specs: [(&str, u32, [u32; 2]); 4] = [
+                            (target.w_q.0.as_str(), target.w_q_index, target.w_q_shape),
+                            (target.w_k.0.as_str(), target.w_k_index, target.w_k_shape),
+                            (target.w_v.0.as_str(), target.w_v_index, target.w_v_shape),
+                            (target.w_o.0.as_str(), target.w_o_index, target.w_o_shape),
+                        ];
+
+                        for (proj_path, proj_index, proj_shape) in proj_specs.iter() {
+                            let n_proj_heads = if target.head_dim == 0 {
+                                1
+                            } else {
+                                (proj_shape[0] / target.head_dim).max(1)
+                            };
+
+                            let (byte_offset, byte_size) =
+                                match layout_map.get(*proj_path) {
+                                    Some(&v) => v,
+                                    None => continue, // projection not in grad arena; skip
+                                };
+
+                            let total_f32 = byte_size / 4;
+                            if n_proj_heads == 0 || total_f32 % n_proj_heads != 0 {
+                                continue;
+                            }
+                            let elements_per_head = total_f32 / n_proj_heads;
+                            let replication = (n_o_heads / n_proj_heads).max(1);
+
+                            // Load weight_ptr = weights_base[proj_index * PTR_SIZE]
+                            let weight_offset = (*proj_index as i64) * PTR_SIZE;
+                            let weight_ptr_addr =
+                                b.ins().iadd_imm(weights_base, weight_offset);
+                            let weight_ptr = b.ins().load(
+                                ptr_ty,
+                                cranelift_codegen::ir::MemFlags::new(),
+                                weight_ptr_addr,
+                                0,
+                            );
+
+                            emit_per_head_dot_abs_accum(
+                                &mut b,
+                                grad_arena_base,
+                                byte_offset,
+                                weight_ptr,
+                                running_base,
+                                n_proj_heads,
+                                elements_per_head,
+                                replication,
+                            );
+                        }
+                    }
                 }
             }
 
@@ -2691,12 +2867,105 @@ pub fn emit_calibration_scaffolding_object(
                 let sidecar_path_len = b.inst_results(sc_len_call)[0];
 
                 let desc_count = b.ins().iconst(ptr_ty, finalize_plan.len() as i64);
-                let zero_ptr = b.ins().iconst(ptr_ty, 0);
-                let zero_count = b.ins().iconst(ptr_ty, 0);
+
+                // Task 3.6: build the WGGO descriptor array on the stack.
+                // `WggoLayerDescriptor` is 48 bytes, 8-byte aligned (spec §6.2).
+                // When no WGGO targets are registered, pass null+0 (AWQ-only path).
+                const WGGO_DESC_BYTES: u32 = 48;
+
+                // Compute batches_observed once for the WGGO descriptor fill.
+                // Re-use the calib_count function to get the total batch count
+                // from the batches handle in the finalize block.
+                let fin_batches_count_v: cranelift_codegen::ir::Value;
+                let (wggo_descs_base, wggo_count_v) = if wggo_targets.is_empty() {
+                    fin_batches_count_v = b.ins().iconst(ptr_ty, 0); // unused; silence binding
+                    let null_ptr = b.ins().iconst(ptr_ty, 0);
+                    let zero_wggo = b.ins().iconst(ptr_ty, 0);
+                    (null_ptr, zero_wggo)
+                } else {
+                    // Get batches_observed count.
+                    let calib_count_ref3 =
+                        module.declare_func_in_func(calib_count_id, b.func);
+                    let count_call3 = b.ins().call(calib_count_ref3, &[fin_batches]);
+                    fin_batches_count_v = b.inst_results(count_call3)[0];
+                    // Truncate i64 count to i32 for the descriptor field.
+                    let batches_i32 = b.ins().ireduce(cl_types::I32, fin_batches_count_v);
+
+                    let total_wggo_bytes =
+                        (wggo_targets.len() as u32) * WGGO_DESC_BYTES;
+                    let wggo_slot = b.create_sized_stack_slot(StackSlotData::new(
+                        StackSlotKind::ExplicitSlot,
+                        total_wggo_bytes,
+                        8,
+                    ));
+                    let base_v = b.ins().stack_addr(ptr_ty, wggo_slot, 0);
+
+                    for (i, target) in wggo_targets.iter().enumerate() {
+                        let off = (i as i32) * (WGGO_DESC_BYTES as i32);
+
+                        // version: u32 at offset 0. v1 sentinel; future descriptor versions
+                        // extend additively, with the runtime checking `version == 1` and
+                        // rejecting unknown values via UnknownVersion (error code 5). See
+                        // spec §6.2-6.3.
+                        let version_v = b.ins().iconst(cl_types::I32, 1);
+                        b.ins().stack_store(version_v, wggo_slot, off);
+                        // _pad0: u32 at offset 4 — zero-initialised by stack slot
+
+                        // layer_key_ptr: *const u8 at offset 8
+                        let key_id = wggo_layer_key_data_ids[&target.layer_key];
+                        let key_gv = module.declare_data_in_func(key_id, b.func);
+                        let key_ptr = b.ins().symbol_value(ptr_ty, key_gv);
+                        b.ins().stack_store(key_ptr, wggo_slot, off + 8);
+
+                        // layer_key_len: usize at offset 16
+                        let key_len_v =
+                            b.ins().iconst(ptr_ty, target.layer_key.len() as i64);
+                        b.ins().stack_store(key_len_v, wggo_slot, off + 16);
+
+                        // running_buffer_len: u32 at offset 24 (number of f64 slots = n_o_heads)
+                        let n_o_heads = wggo_n_o_heads(target);
+                        let n_heads_v =
+                            b.ins().iconst(cl_types::I32, n_o_heads as i64);
+                        b.ins().stack_store(n_heads_v, wggo_slot, off + 24);
+                        // _pad1: u32 at offset 28 — zero-initialised
+
+                        // running_ptr: *const f64 at offset 32 (BSS running buffer)
+                        let running_sym = format!(
+                            "__nsl_wggo_grad.{}",
+                            target.layer_key.replace('.', "_")
+                        );
+                        // A missing running_ptr here would write null into the descriptor —
+                        // hard fail to prevent silent data corruption. The per-step block above
+                        // can `continue` because a skipped batch is observable; a null pointer
+                        // in the sidecar would silently corrupt the analytical comparison.
+                        let run_id = match running_data_ids.get(&running_sym) {
+                            Some(id) => *id,
+                            None => panic!(
+                                "running_data_ids missing entry for WGGO target '{}' \
+                                 (running symbol '{}') — finalize_plan and wggo_targets disagree",
+                                target.layer_key, running_sym
+                            ),
+                        };
+                        let run_gv = module.declare_data_in_func(run_id, b.func);
+                        let run_ptr_v = b.ins().symbol_value(ptr_ty, run_gv);
+                        b.ins().stack_store(run_ptr_v, wggo_slot, off + 32);
+
+                        // batches_observed: u32 at offset 40
+                        b.ins().stack_store(batches_i32, wggo_slot, off + 40);
+                        // _pad2: u32 at offset 44 — zero-initialised
+                    }
+
+                    let wggo_count =
+                        b.ins().iconst(ptr_ty, wggo_targets.len() as i64);
+                    (base_v, wggo_count)
+                };
+                // Suppress unused-variable warning in the wggo_targets.is_empty() branch.
+                let _ = fin_batches_count_v;
+
                 let write_sidecar_ref = module.declare_func_in_func(write_sidecar_id, b.func);
                 let ws_call = b.ins().call(
                     write_sidecar_ref,
-                    &[fin_sidecar_ptr, sidecar_path_len, descs_base, desc_count, zero_ptr, zero_count],
+                    &[fin_sidecar_ptr, sidecar_path_len, descs_base, desc_count, wggo_descs_base, wggo_count_v],
                 );
                 let rc = b.inst_results(ws_call)[0];
                 let model_ptr = b.ins().load(cl_types::I64, MemFlags::new(), model_ptr_addr, 0);
@@ -3554,6 +3823,8 @@ mod tests {
             true,
             false, // needs_backward = false for this AWQ-only test
             &[],   // no per-step backward symbols for AWQ-only
+            &[],   // no wggo targets for this AWQ-only test
+            None,  // no grad_arena_layout for AWQ-only test
             &out_path,
         )
         .expect("emit succeeds");
@@ -3610,6 +3881,8 @@ mod tests {
             true,
             false, // needs_backward = false
             &[],   // no per-step backward symbols
+            &[],   // no wggo targets
+            None,  // no grad_arena_layout
             &out_path,
         )
         .expect_err("must refuse defensively");
@@ -3646,6 +3919,10 @@ mod grad_arena_emission {
                 w_k_shape: [64, 64],
                 w_v_shape: [64, 64],
                 w_o_shape: [64, 64],
+                w_q_index: 0,
+                w_k_index: 1,
+                w_v_index: 2,
+                w_o_index: 3,
             })
             .collect()
     }
@@ -3814,6 +4091,10 @@ mod backward_wrapper {
             w_k_shape: [128, 64],
             w_v_shape: [128, 64],
             w_o_shape: [64, 128],
+            w_q_index: 0,
+            w_k_index: 0,
+            w_v_index: 0,
+            w_o_index: 1,
         }];
         opts.calibration_grad_retention = Some(targets);
         opts
@@ -4068,8 +4349,10 @@ mod loop_body_dispatch {
             &arena_layout,
             b"{}",
             true,
-            true, // needs_backward = true
-            &[],  // no wggo per-step symbols for this forward-dispatch test
+            true,  // needs_backward = true
+            &[],   // no wggo per-step symbols for this forward-dispatch test
+            &[],   // no wggo targets for this dispatch test
+            None,  // no grad_arena_layout
             &out_path,
         )
         .expect("emit succeeds with needs_backward=true");
@@ -4109,6 +4392,8 @@ mod loop_body_dispatch {
             true,
             false, // needs_backward = false
             &[],   // no wggo per-step symbols for this forward-only test
+            &[],   // no wggo targets for this forward-only test
+            None,  // no grad_arena_layout
             &out_path,
         )
         .expect("emit succeeds with needs_backward=false");
@@ -4199,8 +4484,10 @@ mod loop_body_dispatch {
             &arena_layout,
             b"{}",
             true,
-            true, // needs_backward = true
+            true,  // needs_backward = true
             &per_step_backward_symbols,
+            &[],   // no wggo targets — exercises the placeholder relocation path
+            None,  // no grad_arena_layout
             &out_path,
         )
         .expect("emit succeeds with two WGGO per-step symbols");

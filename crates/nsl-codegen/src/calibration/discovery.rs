@@ -101,6 +101,19 @@ pub struct WggoGradTarget {
     pub w_k_shape: [u32; 2],
     pub w_v_shape: [u32; 2],
     pub w_o_shape: [u32; 2],
+    /// Declaration-order indices into the model's tensor-weight list.
+    /// Computed by pre-scan via the same walk as
+    /// `nsl-semantic::export::validate_model_method_exports`:
+    /// iterate `ModelDef.members`, count tensor-typed `LayerDecl`s,
+    /// match by field name to each projection.
+    ///
+    /// Indices feed `weights_base + index * PTR_SIZE` in the
+    /// scaffolding emitter to load the runtime weight pointer for
+    /// each projection. See spec §5.7.
+    pub w_q_index: u32,
+    pub w_k_index: u32,
+    pub w_v_index: u32,
+    pub w_o_index: u32,
 }
 
 fn dedup_preserving_first_seen(projections: &mut Vec<DiscoveredProjection>) {
@@ -701,6 +714,61 @@ fn collect_layer_init_exprs<'a>(
     out
 }
 
+/// Returns `true` if `type_ann` is a tensor-like type (`Tensor`, `Param`,
+/// or `Buffer`). Mirrors the predicate in
+/// `nsl-semantic::export::is_tensor_type` so that both the pre-scan and
+/// the semantic validator agree on which `LayerDecl` fields are counted as
+/// tensor weights when assigning declaration-order indices.
+///
+/// Pre-scan operates on the raw AST before the type-checker runs. A bare
+/// `Tensor` annotation (without angle brackets, e.g. `q_proj: Tensor = ...`)
+/// is parsed as `TypeExprKind::Named("Tensor")`. A parameterized form
+/// (`Tensor<[dim, dim], f32>`) is parsed as `TypeExprKind::Tensor { .. }`.
+/// Both forms must be treated as tensor-typed; the `Named` case is resolved
+/// by `resolve_tensor_field_index` which passes the resolved name string.
+fn is_tensor_type_ann(type_ann: &nsl_ast::types::TypeExpr, interner: &Interner) -> bool {
+    match &type_ann.kind {
+        nsl_ast::types::TypeExprKind::Tensor { .. }
+        | nsl_ast::types::TypeExprKind::Param { .. }
+        | nsl_ast::types::TypeExprKind::Buffer { .. } => true,
+        // Bare names: `Tensor`, `Param`, `Buffer` parse as Named(sym) before
+        // the type-checker upgrades them to the parameterized forms.
+        nsl_ast::types::TypeExprKind::Named(sym) => matches!(
+            interner.resolve(sym.0),
+            Some("Tensor") | Some("Param") | Some("Buffer")
+        ),
+        _ => false,
+    }
+}
+
+/// Compute the declaration-order index of `field_name` in the model's
+/// tensor-weight list. Returns `None` if the field doesn't exist or
+/// isn't tensor-typed.
+///
+/// Mirrors `nsl-semantic::export::validate_model_method_exports`'s
+/// tensor-weight enumeration (declaration-order, tensor-typed
+/// `LayerDecl`s only). The two must agree because both produce
+/// indices into the same runtime weight-pointer array.
+fn resolve_tensor_field_index(
+    model_def: &ModelDef,
+    field_name: &str,
+    interner: &Interner,
+) -> Option<u32> {
+    let mut idx: u32 = 0;
+    for member in &model_def.members {
+        if let nsl_ast::decl::ModelMember::LayerDecl { name, type_ann, .. } = member {
+            if !is_tensor_type_ann(type_ann, interner) {
+                continue;
+            }
+            if interner.resolve(name.0) == Some(field_name) {
+                return Some(idx);
+            }
+            idx = idx.checked_add(1)?;
+        }
+    }
+    None
+}
+
 /// Try to build a `WggoGradTarget` from a `let <var_name> = <init_expr>`
 /// statement. Returns `None` (silent skip) on any of:
 ///
@@ -764,6 +832,16 @@ fn try_build_wggo_target(
     let w_v_shape = resolve_shape(&fields.w_v)?;
     let w_o_shape = resolve_shape(&fields.w_o)?;
 
+    // Resolve declaration-order indices for each projection's field name.
+    // If any projection's field can't be resolved (e.g., typo, non-tensor
+    // field), silently skip the target — the existing best-effort contract.
+    // Semantic check Task 4 from PR #132 catches the typo case at semantic
+    // time with a "field not found" diagnostic, so pre-scan never sees that.
+    let w_q_index = resolve_tensor_field_index(model_def, &fields.w_q, interner)?;
+    let w_k_index = resolve_tensor_field_index(model_def, &fields.w_k, interner)?;
+    let w_v_index = resolve_tensor_field_index(model_def, &fields.w_v, interner)?;
+    let w_o_index = resolve_tensor_field_index(model_def, &fields.w_o, interner)?;
+
     let class_name = interner.resolve(model_def.name.0).unwrap_or("").to_string();
 
     Some(WggoGradTarget {
@@ -778,6 +856,10 @@ fn try_build_wggo_target(
         w_k_shape,
         w_v_shape,
         w_o_shape,
+        w_q_index,
+        w_k_index,
+        w_v_index,
+        w_o_index,
     })
 }
 
@@ -1986,5 +2068,36 @@ fn main():
             targets.is_empty(),
             "member-access callee `pkg.Attention(...)` is not an Ident callee → silently skipped (current contract); got {targets:?}",
         );
+    }
+
+    #[test]
+    fn pre_scan_wggo_resolves_weight_indices_in_declaration_order() {
+        // Attention model with q_proj, k_proj, v_proj, o_proj as the
+        // ONLY tensor fields, in that declaration order. Indices must
+        // be 0, 1, 2, 3 respectively. head_dim is int and not counted.
+        let source = r#"
+model Attention(dim: int, num_heads: int):
+    head_dim: int = dim // num_heads
+    q_proj: Tensor = zeros([dim, dim])
+    k_proj: Tensor = zeros([dim, dim])
+    v_proj: Tensor = zeros([dim, dim])
+    o_proj: Tensor = zeros([dim, dim])
+
+    @wggo_target(w_q=self.q_proj, w_k=self.k_proj, w_v=self.v_proj, w_o=self.o_proj, head_dim=self.head_dim)
+    fn forward(self, x: Tensor) -> Tensor:
+        return x
+
+fn main():
+    let m = Attention(dim=64, num_heads=4)
+    let y = m.forward(zeros([1, 64]))
+"#;
+        let (ast, interner) = parse_module(source);
+        let targets = pre_scan_wggo_targets_from_ast(&ast, &interner);
+        assert_eq!(targets.len(), 1);
+        let t = &targets[0];
+        assert_eq!(t.w_q_index, 0, "q_proj is the first tensor field → index 0");
+        assert_eq!(t.w_k_index, 1, "k_proj is the second tensor field → index 1");
+        assert_eq!(t.w_v_index, 2, "v_proj is the third tensor field → index 2");
+        assert_eq!(t.w_o_index, 3, "o_proj is the fourth tensor field → index 3");
     }
 }
