@@ -222,6 +222,10 @@ mod grad_arena_tests {
             w_k_shape: [4096, 4096],
             w_v_shape: [4096, 4096],
             w_o_shape: [4096, 4096],
+            w_q_index: 0,
+            w_k_index: 1,
+            w_v_index: 2,
+            w_o_index: 3,
         }];
         let layout = build_grad_arena_layout(&targets);
         // 4 projections × (4096 × 4096 × 4 bytes) = 4 × 64 MiB = 256 MiB
@@ -249,6 +253,10 @@ mod grad_arena_tests {
                 w_k_shape: [128, 128],
                 w_v_shape: [128, 128],
                 w_o_shape: [128, 128],
+                w_q_index: 0,
+                w_k_index: 1,
+                w_v_index: 2,
+                w_o_index: 3,
             })
             .collect();
         let layout = build_grad_arena_layout(&targets);

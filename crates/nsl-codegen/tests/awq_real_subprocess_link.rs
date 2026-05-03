@@ -106,6 +106,8 @@ fn two_object_link_produces_binary_with_resolved_wrapper_symbol() {
         true,
         false, // needs_backward = false for AWQ-only test
         &[],   // no per-step backward symbols for AWQ-only
+        &[],   // no wggo targets for AWQ-only test
+        None,  // no grad_arena_layout
         &scaffolding_obj,
     )
     .expect("emit scaffolding.o");
@@ -158,6 +160,8 @@ fn missing_wrapper_symbol_at_link_emits_three_part_error() {
         true,
         false, // needs_backward = false; tests forward-path link failure
         &[],   // no per-step backward symbols
+        &[],   // no wggo targets for this link-test
+        None,  // no grad_arena_layout
         &scaffolding_obj,
     )
     .expect("emit scaffolding.o");

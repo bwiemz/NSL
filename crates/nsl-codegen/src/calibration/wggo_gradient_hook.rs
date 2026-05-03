@@ -335,6 +335,10 @@ mod tests {
             w_k_shape: w_o_shape,
             w_v_shape: w_o_shape,
             w_o_shape,
+            w_q_index: 0,
+            w_k_index: 1,
+            w_v_index: 2,
+            w_o_index: 3,
         }
     }
 

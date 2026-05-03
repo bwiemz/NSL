@@ -3,17 +3,26 @@
 # the forward pass. Small dimensions (dim=32, num_heads=4, head_dim=8) for fast
 # tests. Calibration data: [8, 4, 32] f32 in wggo_calib_data.safetensors.
 #
-# Choice: option B — the Task 9 placeholder (wggo_attention_mlp.nsl / TinyAttn)
-# is preserved unchanged; this file is the full merge-gate fixture.
+# The merge-gate test (`wggo_backward_pipeline.rs`) bypasses
+# `compile_and_calibrate` and calls `real_subprocess_entry` directly,
+# mirroring the AWQ end-to-end test's pattern. This avoids
+# `compile_and_calibrate`'s reduced-pipeline gaps (main signature
+# collision, stdlib path resolution for train-block compilation) which
+# issue #134 tracks for proper architectural fix.
+#
+# As a result this fixture has NO train block — the harness fires from
+# `real_subprocess_entry` based on the registered hooks, not from
+# `compile_train_block`. The `@wggo_target` decorator on the forward
+# method is the only declaration needed.
 from nsl.nn.losses import mse_loss
 
 @quantize(dtype="awq4")
 model AttentionMLP(dim: int, num_heads: int):
     head_dim: int = dim // num_heads
-    q_proj: Tensor = zeros([dim, dim])
-    k_proj: Tensor = zeros([dim, dim])
-    v_proj: Tensor = zeros([dim, dim])
-    o_proj: Tensor = zeros([dim, dim])
+    q_proj: Tensor<[dim, dim], f32> = zeros([dim, dim])
+    k_proj: Tensor<[dim, dim], f32> = zeros([dim, dim])
+    v_proj: Tensor<[dim, dim], f32> = zeros([dim, dim])
+    o_proj: Tensor<[dim, dim], f32> = zeros([dim, dim])
 
     @wggo_target(w_q=self.q_proj, w_k=self.k_proj, w_v=self.v_proj, w_o=self.o_proj, head_dim=self.head_dim)
     fn forward(self, x: Tensor) -> Tensor:
@@ -28,12 +37,4 @@ model AttentionMLP(dim: int, num_heads: int):
 fn main():
     let m = AttentionMLP(dim=32, num_heads=4)
     let x = zeros([8, 4, 32])
-    # SCAFFOLDING: this train block exists ONLY because compile_and_calibrate
-    # currently fires from compile_train_block. The merge-gate test does NOT
-    # verify training behavior — it verifies WGGO Phase 2 backward-pass math
-    # via the calibration harness. Once issue #134 (decouple calibration from
-    # train-block) lands, this block is removable.
-    train(model = m, epochs = 1):
-        optimizer: SGD(lr = 0.01)
-        step(batch):
-            let pred = m.forward(batch)
+    let y = m.forward(x)
