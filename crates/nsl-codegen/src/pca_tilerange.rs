@@ -196,6 +196,31 @@ mod tests {
         assert!(!should_emit_tier_b(&cfg, 1_048_576, SegmentResidency::Shared));
     }
 
+    /// Boundary-pair test that anchors directly on `TIER_B_RANGE_TABLE_BUDGET_BYTES`.
+    /// If the const drifts, at least one assertion fails immediately —
+    /// neither `should_emit_tier_b_inside_envelope` (4 K seq → 512 B, ¹⁄₁₆-budget)
+    /// nor `should_skip_tier_b_when_table_exceeds_budget` (1 M seq → 128 KB, 16×-budget)
+    /// catches drift to 4 KB or 16 KB.
+    #[test]
+    fn at_range_table_budget_boundary_decides_correctly() {
+        // compute_range_table_bytes(16384, 16, 16) = 2 * (1024 + 1024) * 2 = 8192.
+        assert_eq!(compute_range_table_bytes(16_384, 16, 16), 8192);
+        // compute_range_table_bytes(16384, 8, 8)   = 2 * (2048 + 2048) * 2 = 16384.
+        assert_eq!(compute_range_table_bytes(16_384, 8, 8), 16_384);
+
+        // Exactly at budget → fits (`<=` semantics in should_emit_tier_b).
+        let mut cfg_at = fa_base_for_test();
+        cfg_at.block_q = 16;
+        cfg_at.block_kv = 16;
+        assert!(should_emit_tier_b(&cfg_at, 16_384, SegmentResidency::Shared));
+
+        // Just past budget → falls back.
+        let mut cfg_over = fa_base_for_test();
+        cfg_over.block_q = 8;
+        cfg_over.block_kv = 8;
+        assert!(!should_emit_tier_b(&cfg_over, 16_384, SegmentResidency::Shared));
+    }
+
     #[test]
     fn skeleton_emitters_emit_marker_comments() {
         let mut s = String::new();
