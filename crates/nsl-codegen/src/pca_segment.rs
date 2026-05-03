@@ -54,8 +54,8 @@ impl SegmentKernelPlan {
 /// `Shared` residency for seq_len ≤ 16 K with u16 segment IDs,
 /// covering the §4.4 fixture matrix. Combined with Q/K/V tiles
 /// + softmax stats + Tier B's range table, total per-CTA SMEM
-/// remains ≤ 60 KB at the worst-case fixture (`long_seq_5doc`,
-/// 16 K seq, `block_q = block_kv = 64`).
+/// is ≈ 58.5 KB at the worst-case fixture (`long_seq_5doc`,
+/// 16 K seq, `block_q = block_kv = 64`); see spec §3.4.2.
 pub const DEFAULT_SMEM_SEGMENT_BUDGET: u64 = 32768;
 
 /// Build the kernel plan.  `seq_len` and `dtype_bytes` come from the
@@ -166,6 +166,24 @@ mod tests {
         let plan = plan_kernel(&det, fa_base(), 32768, true);
         assert_eq!(plan.residency, SegmentResidency::Streamed);
         assert_eq!(plan.smem_segment_bytes, 0);
+    }
+
+    /// Boundary-pair test: directly probes `DEFAULT_SMEM_SEGMENT_BUDGET`'s
+    /// value. If the const drifts (e.g. someone bumps it to 16 KB or 64 KB),
+    /// at least one of these two assertions will fail — which neither
+    /// `short_seq_uses_shared_residency` (8 KB, ¼-budget) nor
+    /// `long_seq_streams_segment_ids` (64 KB, 2×-budget) catches.
+    #[test]
+    fn at_budget_boundary_seq_lens_pick_correct_residency() {
+        let det = det_with_strategy();
+        // seq_len = 16 384 → 32 KB — exactly equal to the budget; fits Shared.
+        let plan_at = plan_kernel(&det, fa_base(), 16_384, true);
+        assert_eq!(plan_at.residency, SegmentResidency::Shared);
+        assert_eq!(plan_at.smem_segment_bytes, 32_768);
+        // seq_len = 16 385 → 32 770 B — one element past the budget; Streamed.
+        let plan_over = plan_kernel(&det, fa_base(), 16_385, true);
+        assert_eq!(plan_over.residency, SegmentResidency::Streamed);
+        assert_eq!(plan_over.smem_segment_bytes, 0);
     }
 
     #[test]
