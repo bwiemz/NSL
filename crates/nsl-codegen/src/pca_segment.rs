@@ -47,10 +47,16 @@ impl SegmentKernelPlan {
     }
 }
 
-/// Budget for segment IDs in SMEM per CTA (bytes).  Kept deliberately
-/// conservative — real kernels reserve more SMEM for Q/K/V tiles + softmax
-/// stats, so we only use a small fixed slice here.
-pub const DEFAULT_SMEM_SEGMENT_BUDGET: u64 = 4096;
+/// Per-CTA SMEM budget for segment_ids in `Shared` residency.
+///
+/// Set to 32 KB (was 4 KB) as PCA Tier B prerequisite per spec
+/// `2026-05-02-pca-tier-b-tile-skip-design.md` §3.4.1: enables
+/// `Shared` residency for seq_len ≤ 16 K with u16 segment IDs,
+/// covering the §4.4 fixture matrix. Combined with Q/K/V tiles
+/// + softmax stats + Tier B's range table, total per-CTA SMEM
+/// remains ≤ 60 KB at the worst-case fixture (`long_seq_5doc`,
+/// 16 K seq, `block_q = block_kv = 64`).
+pub const DEFAULT_SMEM_SEGMENT_BUDGET: u64 = 32768;
 
 /// Build the kernel plan.  `seq_len` and `dtype_bytes` come from the
 /// enclosing sublayer shape.
@@ -146,18 +152,18 @@ mod tests {
 
     #[test]
     fn short_seq_uses_shared_residency() {
-        // 2048 × 2 = 4096 bytes — exactly fits the default SMEM budget.
+        // 4096 × 2 = 8192 bytes — fits the new 32 KB SMEM budget.
         let det = det_with_strategy();
-        let plan = plan_kernel(&det, fa_base(), 2048, true);
+        let plan = plan_kernel(&det, fa_base(), 4096, true);
         assert_eq!(plan.residency, SegmentResidency::Shared);
-        assert_eq!(plan.smem_segment_bytes, 4096);
+        assert_eq!(plan.smem_segment_bytes, 8192);
     }
 
     #[test]
     fn long_seq_streams_segment_ids() {
         let det = det_with_strategy();
-        // 4096 tokens × 2 bytes = 8 KB — exceeds budget.
-        let plan = plan_kernel(&det, fa_base(), 4096, true);
+        // 32 K tokens × 2 bytes = 64 KB — exceeds the 32 KB Tier B budget.
+        let plan = plan_kernel(&det, fa_base(), 32768, true);
         assert_eq!(plan.residency, SegmentResidency::Streamed);
         assert_eq!(plan.smem_segment_bytes, 0);
     }
