@@ -28,4 +28,12 @@ model AttentionMLP(dim: int, num_heads: int):
 fn main():
     let m = AttentionMLP(dim=32, num_heads=4)
     let x = zeros([8, 4, 32])
-    let y = m.forward(x)
+    # SCAFFOLDING: this train block exists ONLY because compile_and_calibrate
+    # currently fires from compile_train_block. The merge-gate test does NOT
+    # verify training behavior — it verifies WGGO Phase 2 backward-pass math
+    # via the calibration harness. Once issue #134 (decouple calibration from
+    # train-block) lands, this block is removable.
+    train(model = m, epochs = 1):
+        optimizer: SGD(lr = 0.01)
+        step(batch):
+            let pred = m.forward(batch)

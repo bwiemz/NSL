@@ -3988,6 +3988,19 @@ impl Compiler<'_> {
                         // pass can use weight_shape for arena-layout sizing.
                         self.compile_options.calibration_retention = Some(awq_projections);
                     }
+                    // WGGO Phase 2 (PR 1b): register WggoGradientHook when
+                    // pre-scan produced backward-pass targets. Gated on
+                    // calibration_grad_retention.is_some() (which entry_points::
+                    // run_pre_scan_phase populates only when @wggo_target
+                    // decorators reach an instantiated model) and !targets.is_empty()
+                    // (defends against the degenerate Some(vec![]) state).
+                    if let Some(targets) = self.compile_options.calibration_grad_retention.as_ref() {
+                        if !targets.is_empty() {
+                            registry.register(Box::new(
+                                crate::calibration::wggo_gradient_hook::WggoGradientHook::new(targets.clone()),
+                            ));
+                        }
+                    }
                     if registry.is_empty() {
                         eprintln!(
                             "warning: --calibration-data {} supplied but no calibration hooks registered (no consumers yet — this is a no-op in MVP)",

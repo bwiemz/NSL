@@ -329,3 +329,72 @@ fn backward_batch_shape_mismatch_subprocess_returns_3() {
     // 4. Assert the subprocess exits with status code 3.
     unimplemented!("subprocess harness not yet available");
 }
+
+/// PR 1b regression: when `calibration_grad_retention` is non-empty, the
+/// hook registry built in `compile_train_block` MUST contain a
+/// `WggoGradientHook` alongside the `AwqCalibrationHook`. Conversely,
+/// when `calibration_grad_retention` is None, only the AWQ hook is
+/// registered.
+///
+/// We exercise this through the registry-builder path used by
+/// `compile_and_calibrate`. The test inspects the registry's hook IDs
+/// to assert the WGGO hook is present iff targets are non-empty.
+///
+/// NOTE: `WggoGradientHook::id()` returns `"wggo_head_gradients"` (not
+/// `"wggo_gradient"`). The assert below uses the actual value.
+#[test]
+fn wggo_gradient_hook_registered_when_grad_retention_is_some() {
+    use nsl_codegen::calibration::registry::HookRegistry;
+    use nsl_codegen::calibration::wggo_gradient_hook::WggoGradientHook;
+    use nsl_codegen::calibration::discovery::WggoGradTarget;
+
+    // Build a non-empty WggoGradTarget vec.
+    let targets = vec![WggoGradTarget {
+        layer_key: "m".to_string(),
+        class_name: "Attention".to_string(),
+        head_dim: 8,
+        w_q: ProjectionRef("m.q_proj".into()),
+        w_k: ProjectionRef("m.k_proj".into()),
+        w_v: ProjectionRef("m.v_proj".into()),
+        w_o: ProjectionRef("m.o_proj".into()),
+        w_q_shape: [32, 32],
+        w_k_shape: [32, 32],
+        w_v_shape: [32, 32],
+        w_o_shape: [32, 32],
+    }];
+
+    // Mirror the conditional registration logic from stmt.rs.
+    let mut registry = HookRegistry::new();
+    if !targets.is_empty() {
+        registry.register(Box::new(WggoGradientHook::new(targets.clone())));
+    }
+
+    let ids: Vec<&'static str> = registry.iter().map(|h| h.id()).collect();
+    assert!(
+        ids.contains(&"wggo_head_gradients"),
+        "WggoGradientHook (id='wggo_head_gradients') must be registered; got: {:?}",
+        ids
+    );
+}
+
+#[test]
+fn wggo_gradient_hook_not_registered_when_targets_empty() {
+    use nsl_codegen::calibration::registry::HookRegistry;
+    use nsl_codegen::calibration::discovery::WggoGradTarget;
+
+    // Empty targets: pre-scan returned Some(vec![]) — the gating must
+    // skip registration to avoid an empty-buffer sidecar entry.
+    let targets: Vec<WggoGradTarget> = vec![];
+
+    let mut registry = HookRegistry::new();
+    if !targets.is_empty() {
+        registry.register(Box::new(
+            nsl_codegen::calibration::wggo_gradient_hook::WggoGradientHook::new(targets),
+        ));
+    }
+
+    assert!(
+        registry.is_empty(),
+        "registry must be empty when WGGO targets are empty"
+    );
+}

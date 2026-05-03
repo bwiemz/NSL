@@ -140,8 +140,13 @@ pub fn evaluate_expr(
                     // single overflow case `i64::MIN / -1`; the
                     // explicit `r == 0` check above still covers
                     // standard div-by-zero. `Div` and `FloorDiv` are
-                    // equivalent here because the evaluator's value
-                    // domain is i64 (no float results).
+                    // equivalent here because this evaluator only
+                    // operates on i64 — there is no float domain.
+                    // NSL `/` over floats parses to the same `BinOp::Div`
+                    // but a float operand would have been rejected as
+                    // `UnsupportedExpr` in `evaluate_expr`'s float arm
+                    // before reaching here, so we can safely treat
+                    // `Div` and `FloorDiv` as integer-floor division.
                     l.checked_div(r).ok_or(EvalError::Overflow {
                         span: expr.span,
                         op: "division",
@@ -790,6 +795,47 @@ mod tests {
         match evaluate_expr(&expr, &scope, &interner) {
             Err(EvalError::Overflow { op, .. }) => assert_eq!(op, "multiplication"),
             other => panic!("expected Overflow for multiplication, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn subtraction_overflow_errors() {
+        // i64::MIN - 1 must surface as `Overflow`.  Mirrors the
+        // addition test — `Sub` and `Add` go through different
+        // `checked_*` arms.
+        let interner = Interner::new();
+        let scope = Scope::new();
+        let expr = bin(BinOp::Sub, int_lit(i64::MIN), int_lit(1));
+        match evaluate_expr(&expr, &scope, &interner) {
+            Err(EvalError::Overflow { op, .. }) => assert_eq!(op, "subtraction"),
+            other => panic!("expected Overflow for subtraction, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn division_overflow_errors() {
+        // The single `i64::checked_div` overflow case: `i64::MIN / -1`
+        // (the result would be `i64::MAX + 1`, which doesn't fit).
+        // Must surface as `Overflow`, NOT `DivByZero` (`r != 0` here).
+        let interner = Interner::new();
+        let scope = Scope::new();
+        let expr = bin(BinOp::Div, int_lit(i64::MIN), int_lit(-1));
+        match evaluate_expr(&expr, &scope, &interner) {
+            Err(EvalError::Overflow { op, .. }) => assert_eq!(op, "division"),
+            other => panic!("expected Overflow for division, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn floor_division_overflow_errors() {
+        // Same overflow case as `Div` since the evaluator collapses
+        // `Div` and `FloorDiv` to integer-floor `checked_div`.
+        let interner = Interner::new();
+        let scope = Scope::new();
+        let expr = bin(BinOp::FloorDiv, int_lit(i64::MIN), int_lit(-1));
+        match evaluate_expr(&expr, &scope, &interner) {
+            Err(EvalError::Overflow { op, .. }) => assert_eq!(op, "division"),
+            other => panic!("expected Overflow for floor division, got {other:?}"),
         }
     }
 

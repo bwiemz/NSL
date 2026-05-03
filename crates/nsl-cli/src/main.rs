@@ -1263,9 +1263,9 @@ fn main_inner() {
                 // PR #127 (AWQ v2) added this field; CLI build site populates
                 // it via the calibration plumbing further down, not here.
                 calibration_compile_bundle: None,
-                // AWQ §4.8: grad-retention spec. `nsl build` does not perform
-                // calibration here; the calibration subprocess gets its own
-                // CompileOptions further down. Default to None.
+                // PR #132 (WGGO Phase 2) added this field; codegen populates
+                // it from AST pre-scan inside `run_pre_scan_phase`, so the
+                // CLI initializes to None and lets entry_points.rs do it.
                 calibration_grad_retention: None,
             };
 
@@ -1585,8 +1585,8 @@ fn main_inner() {
                 // PR #127 (AWQ v2) added this field; CLI run site doesn't
                 // perform calibration so the bundle is unset.
                 calibration_compile_bundle: None,
-                // AWQ §4.8: grad-retention spec. `nsl run` does not perform
-                // calibration; default to None.
+                // PR #132 (WGGO Phase 2) added this field; the run site
+                // doesn't drive calibration, so this stays None.
                 calibration_grad_retention: None,
             };
             // M41: Disaggregated inference — spawn router + prefill + decode workers.
