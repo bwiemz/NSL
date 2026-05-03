@@ -54,6 +54,8 @@ expression: ptx
     .param .u64 dwv_ptr,
     .param .u64 dx_ptr,
     .param .u64 dx_norm_ptr,
+    .param .u64 dk_scratch_ptr,
+    .param .u64 dv_scratch_ptr,
     .param .u64 segment_ids_ptr
 )
 {
@@ -65,7 +67,7 @@ expression: ptx
     .reg .u32 %r<16>;
     .reg .f32 %scale, %log2e;
     .reg .f32 %row_max, %row_sum;
-    .reg .u64 %q_start, %head_idx, %batch_idx, %k_start, %k_max;
+    .reg .u64 %q_start, %q_launch_base, %head_idx, %batch_idx, %k_start, %k_max;
     .reg .u64 %shmem_base, %smem_addr;
     .reg .f32 %f_dq_0, %f_dk_0, %f_dv_0;
     .reg .f32 %f_q_0, %f_k_0, %f_v_0;
@@ -93,6 +95,7 @@ expression: ptx
     .reg .u64 %rd_bwd_do, %rd_bwd_dq, %rd_bwd_dk, %rd_bwd_dv;
     .reg .u64 %rd_bwd_dwq, %rd_bwd_dwk, %rd_bwd_dwv, %rd_bwd_dx;
     .reg .u64 %rd_bwd_dxn;
+    .reg .u64 %rd_bwd_dk_scratch, %rd_bwd_dv_scratch;
     .reg .u64 %q_smem_base, %k_smem_base, %v_smem_base;
     .reg .u64 %warp_row;
     .reg .u64 %rd_seg_global, %seg_base;
@@ -132,6 +135,9 @@ expression: ptx
     ld.param.u64 %rd_bwd_dwv, [dwv_ptr];
     ld.param.u64 %rd_bwd_dx,  [dx_ptr];
     ld.param.u64 %rd_bwd_dxn, [dx_norm_ptr];
+    ld.param.u64 %rd_bwd_dk_scratch, [dk_scratch_ptr];
+    ld.param.u64 %rd_bwd_dv_scratch, [dv_scratch_ptr];
+    ld.param.u64 %q_launch_base, [seq_lens_ptr];
     mov.u32 %tid_x, %tid.x;
     shr.u32 %warp_id, %tid_x, 5;
     and.b32 %lane, %tid_x, 31;
@@ -139,9 +145,12 @@ expression: ptx
     mov.u32 %bid_y, %ctaid.y;
     cvt.u64.u32 %q_start, %bid_x;
     mul.lo.u64 %q_start, %q_start, 32;
+    add.u64 %q_start, %q_start, %q_launch_base;
     cvt.u64.u32 %rd16, %bid_y;
     rem.u64 %head_idx,  %rd16, %rd5;
     div.u64 %batch_idx, %rd16, %rd5;
+    mov.u64 %k_start, 0;
+    mov.u64 %k_max, %rd6;
 
     // --- PCA Tier A: load segment_ids from global to shared ---
     ld.param.u64 %rd_seg_global, [segment_ids_ptr];
@@ -398,289 +407,791 @@ V2_BWD_Q_LOAD_7:
     st.shared.b16 [%rd33], %h0;
 V2_BWD_Q_LOAD_SKIP_7:
     bar.sync 0;  // Q tile visible to all threads
+    // BWD zero-init DQ SMEM tile (1024 cells, 8/thread)
+    cvt.u64.u32 %rd_zero_idx, %tid_x;
+    setp.lt.u64 %p_zero, %rd_zero_idx, 1024;
+    shl.b64 %rd_zero_idx, %rd_zero_idx, 2;
+    add.u64 %rd_zero_idx, %rd_zero_idx, 22784;
+    add.u64 %rd_zero_idx, %shmem_base, %rd_zero_idx;
+    mov.f32 %f_zero_val, 0f00000000;
+    @%p_zero st.shared.f32 [%rd_zero_idx], %f_zero_val;
+    cvt.u64.u32 %rd_zero_idx, %tid_x;
+    add.u64 %rd_zero_idx, %rd_zero_idx, 128;
+    setp.lt.u64 %p_zero, %rd_zero_idx, 1024;
+    shl.b64 %rd_zero_idx, %rd_zero_idx, 2;
+    add.u64 %rd_zero_idx, %rd_zero_idx, 22784;
+    add.u64 %rd_zero_idx, %shmem_base, %rd_zero_idx;
+    mov.f32 %f_zero_val, 0f00000000;
+    @%p_zero st.shared.f32 [%rd_zero_idx], %f_zero_val;
+    cvt.u64.u32 %rd_zero_idx, %tid_x;
+    add.u64 %rd_zero_idx, %rd_zero_idx, 256;
+    setp.lt.u64 %p_zero, %rd_zero_idx, 1024;
+    shl.b64 %rd_zero_idx, %rd_zero_idx, 2;
+    add.u64 %rd_zero_idx, %rd_zero_idx, 22784;
+    add.u64 %rd_zero_idx, %shmem_base, %rd_zero_idx;
+    mov.f32 %f_zero_val, 0f00000000;
+    @%p_zero st.shared.f32 [%rd_zero_idx], %f_zero_val;
+    cvt.u64.u32 %rd_zero_idx, %tid_x;
+    add.u64 %rd_zero_idx, %rd_zero_idx, 384;
+    setp.lt.u64 %p_zero, %rd_zero_idx, 1024;
+    shl.b64 %rd_zero_idx, %rd_zero_idx, 2;
+    add.u64 %rd_zero_idx, %rd_zero_idx, 22784;
+    add.u64 %rd_zero_idx, %shmem_base, %rd_zero_idx;
+    mov.f32 %f_zero_val, 0f00000000;
+    @%p_zero st.shared.f32 [%rd_zero_idx], %f_zero_val;
+    cvt.u64.u32 %rd_zero_idx, %tid_x;
+    add.u64 %rd_zero_idx, %rd_zero_idx, 512;
+    setp.lt.u64 %p_zero, %rd_zero_idx, 1024;
+    shl.b64 %rd_zero_idx, %rd_zero_idx, 2;
+    add.u64 %rd_zero_idx, %rd_zero_idx, 22784;
+    add.u64 %rd_zero_idx, %shmem_base, %rd_zero_idx;
+    mov.f32 %f_zero_val, 0f00000000;
+    @%p_zero st.shared.f32 [%rd_zero_idx], %f_zero_val;
+    cvt.u64.u32 %rd_zero_idx, %tid_x;
+    add.u64 %rd_zero_idx, %rd_zero_idx, 640;
+    setp.lt.u64 %p_zero, %rd_zero_idx, 1024;
+    shl.b64 %rd_zero_idx, %rd_zero_idx, 2;
+    add.u64 %rd_zero_idx, %rd_zero_idx, 22784;
+    add.u64 %rd_zero_idx, %shmem_base, %rd_zero_idx;
+    mov.f32 %f_zero_val, 0f00000000;
+    @%p_zero st.shared.f32 [%rd_zero_idx], %f_zero_val;
+    cvt.u64.u32 %rd_zero_idx, %tid_x;
+    add.u64 %rd_zero_idx, %rd_zero_idx, 768;
+    setp.lt.u64 %p_zero, %rd_zero_idx, 1024;
+    shl.b64 %rd_zero_idx, %rd_zero_idx, 2;
+    add.u64 %rd_zero_idx, %rd_zero_idx, 22784;
+    add.u64 %rd_zero_idx, %shmem_base, %rd_zero_idx;
+    mov.f32 %f_zero_val, 0f00000000;
+    @%p_zero st.shared.f32 [%rd_zero_idx], %f_zero_val;
+    cvt.u64.u32 %rd_zero_idx, %tid_x;
+    add.u64 %rd_zero_idx, %rd_zero_idx, 896;
+    setp.lt.u64 %p_zero, %rd_zero_idx, 1024;
+    shl.b64 %rd_zero_idx, %rd_zero_idx, 2;
+    add.u64 %rd_zero_idx, %rd_zero_idx, 22784;
+    add.u64 %rd_zero_idx, %shmem_base, %rd_zero_idx;
+    mov.f32 %f_zero_val, 0f00000000;
+    @%p_zero st.shared.f32 [%rd_zero_idx], %f_zero_val;
+    bar.sync 0;  // dQ tile zeroed
+    // --- one-shot D correction strip (dO . O) ---
+    // Tier C backward D correction: D[i] = dO[i] . O[i] (q_tile_iter=0, d_per_lane=1)
+    add.u32 %r0, %warp_id, 0; // warp_row
+    cvt.u64.u32 %warp_row, %r0;
+    add.u64 %rd39, %q_start, %warp_row;
+    setp.ge.u64 %p0, %rd39, %rd6;
+    @%p0 bra V2_BWD_D_ZERO_0;
+    mul.lo.u64 %rd30, %batch_idx, %rd5;
+    add.u64 %rd30, %rd30, %head_idx;
+    mul.lo.u64 %rd30, %rd30, %rd6;
+    add.u64 %rd30, %rd30, %rd39;
+    mul.lo.u64 %rd30, %rd30, %rd7;
+    shl.b64 %rd30, %rd30, 1;  // * 2 bytes (f16)
+    add.u64 %rd31, %rd_bwd_do, %rd30;  // &dO[row, 0]
+    add.u64 %rd32, %rd3, %rd30;         // &O[row, 0]
+    mov.f32 %f_rowsum_dP_P, 0f00000000;
+    cvt.u64.u32 %rd33, %lane;
+    shl.b64 %rd33, %rd33, 1;  // d * 2 bytes
+    add.u64 %rd34, %rd31, %rd33;
+    ld.global.b16 %h0, [%rd34];
+    cvt.f32.f16 %f0, %h0;
+    add.u64 %rd34, %rd32, %rd33;
+    ld.global.b16 %h0, [%rd34];
+    cvt.f32.f16 %f1, %h0;
+    fma.rn.f32 %f_rowsum_dP_P, %f0, %f1, %f_rowsum_dP_P;
+    shfl.sync.bfly.b32 %f0, %f_rowsum_dP_P, 16, 31, 0xFFFFFFFF;
+    add.f32 %f_rowsum_dP_P, %f_rowsum_dP_P, %f0;
+    shfl.sync.bfly.b32 %f0, %f_rowsum_dP_P, 8, 31, 0xFFFFFFFF;
+    add.f32 %f_rowsum_dP_P, %f_rowsum_dP_P, %f0;
+    shfl.sync.bfly.b32 %f0, %f_rowsum_dP_P, 4, 31, 0xFFFFFFFF;
+    add.f32 %f_rowsum_dP_P, %f_rowsum_dP_P, %f0;
+    shfl.sync.bfly.b32 %f0, %f_rowsum_dP_P, 2, 31, 0xFFFFFFFF;
+    add.f32 %f_rowsum_dP_P, %f_rowsum_dP_P, %f0;
+    shfl.sync.bfly.b32 %f0, %f_rowsum_dP_P, 1, 31, 0xFFFFFFFF;
+    add.f32 %f_rowsum_dP_P, %f_rowsum_dP_P, %f0;
+    setp.eq.u32 %p0, %lane, 0;
+    shl.b64 %rd35, %warp_row, 2;
+    add.u64 %rd35, %rd35, 45312;
+    add.u64 %rd35, %shmem_base, %rd35;
+    @%p0 st.shared.f32 [%rd35], %f_rowsum_dP_P;
+    bra V2_BWD_D_DONE_0;
+V2_BWD_D_ZERO_0:
+    setp.eq.u32 %p0, %lane, 0;
+    shl.b64 %rd35, %warp_row, 2;
+    add.u64 %rd35, %rd35, 45312;
+    add.u64 %rd35, %shmem_base, %rd35;
+    mov.f32 %f_rowsum_dP_P, 0f00000000;
+    @%p0 st.shared.f32 [%rd35], %f_rowsum_dP_P;
+V2_BWD_D_DONE_0:
+    // Tier C backward D correction: D[i] = dO[i] . O[i] (q_tile_iter=1, d_per_lane=1)
+    add.u32 %r0, %warp_id, 4; // warp_row
+    cvt.u64.u32 %warp_row, %r0;
+    add.u64 %rd39, %q_start, %warp_row;
+    setp.ge.u64 %p0, %rd39, %rd6;
+    @%p0 bra V2_BWD_D_ZERO_1;
+    mul.lo.u64 %rd30, %batch_idx, %rd5;
+    add.u64 %rd30, %rd30, %head_idx;
+    mul.lo.u64 %rd30, %rd30, %rd6;
+    add.u64 %rd30, %rd30, %rd39;
+    mul.lo.u64 %rd30, %rd30, %rd7;
+    shl.b64 %rd30, %rd30, 1;  // * 2 bytes (f16)
+    add.u64 %rd31, %rd_bwd_do, %rd30;  // &dO[row, 0]
+    add.u64 %rd32, %rd3, %rd30;         // &O[row, 0]
+    mov.f32 %f_rowsum_dP_P, 0f00000000;
+    cvt.u64.u32 %rd33, %lane;
+    shl.b64 %rd33, %rd33, 1;  // d * 2 bytes
+    add.u64 %rd34, %rd31, %rd33;
+    ld.global.b16 %h0, [%rd34];
+    cvt.f32.f16 %f0, %h0;
+    add.u64 %rd34, %rd32, %rd33;
+    ld.global.b16 %h0, [%rd34];
+    cvt.f32.f16 %f1, %h0;
+    fma.rn.f32 %f_rowsum_dP_P, %f0, %f1, %f_rowsum_dP_P;
+    shfl.sync.bfly.b32 %f0, %f_rowsum_dP_P, 16, 31, 0xFFFFFFFF;
+    add.f32 %f_rowsum_dP_P, %f_rowsum_dP_P, %f0;
+    shfl.sync.bfly.b32 %f0, %f_rowsum_dP_P, 8, 31, 0xFFFFFFFF;
+    add.f32 %f_rowsum_dP_P, %f_rowsum_dP_P, %f0;
+    shfl.sync.bfly.b32 %f0, %f_rowsum_dP_P, 4, 31, 0xFFFFFFFF;
+    add.f32 %f_rowsum_dP_P, %f_rowsum_dP_P, %f0;
+    shfl.sync.bfly.b32 %f0, %f_rowsum_dP_P, 2, 31, 0xFFFFFFFF;
+    add.f32 %f_rowsum_dP_P, %f_rowsum_dP_P, %f0;
+    shfl.sync.bfly.b32 %f0, %f_rowsum_dP_P, 1, 31, 0xFFFFFFFF;
+    add.f32 %f_rowsum_dP_P, %f_rowsum_dP_P, %f0;
+    setp.eq.u32 %p0, %lane, 0;
+    shl.b64 %rd35, %warp_row, 2;
+    add.u64 %rd35, %rd35, 45312;
+    add.u64 %rd35, %shmem_base, %rd35;
+    @%p0 st.shared.f32 [%rd35], %f_rowsum_dP_P;
+    bra V2_BWD_D_DONE_1;
+V2_BWD_D_ZERO_1:
+    setp.eq.u32 %p0, %lane, 0;
+    shl.b64 %rd35, %warp_row, 2;
+    add.u64 %rd35, %rd35, 45312;
+    add.u64 %rd35, %shmem_base, %rd35;
+    mov.f32 %f_rowsum_dP_P, 0f00000000;
+    @%p0 st.shared.f32 [%rd35], %f_rowsum_dP_P;
+V2_BWD_D_DONE_1:
+    // Tier C backward D correction: D[i] = dO[i] . O[i] (q_tile_iter=2, d_per_lane=1)
+    add.u32 %r0, %warp_id, 8; // warp_row
+    cvt.u64.u32 %warp_row, %r0;
+    add.u64 %rd39, %q_start, %warp_row;
+    setp.ge.u64 %p0, %rd39, %rd6;
+    @%p0 bra V2_BWD_D_ZERO_2;
+    mul.lo.u64 %rd30, %batch_idx, %rd5;
+    add.u64 %rd30, %rd30, %head_idx;
+    mul.lo.u64 %rd30, %rd30, %rd6;
+    add.u64 %rd30, %rd30, %rd39;
+    mul.lo.u64 %rd30, %rd30, %rd7;
+    shl.b64 %rd30, %rd30, 1;  // * 2 bytes (f16)
+    add.u64 %rd31, %rd_bwd_do, %rd30;  // &dO[row, 0]
+    add.u64 %rd32, %rd3, %rd30;         // &O[row, 0]
+    mov.f32 %f_rowsum_dP_P, 0f00000000;
+    cvt.u64.u32 %rd33, %lane;
+    shl.b64 %rd33, %rd33, 1;  // d * 2 bytes
+    add.u64 %rd34, %rd31, %rd33;
+    ld.global.b16 %h0, [%rd34];
+    cvt.f32.f16 %f0, %h0;
+    add.u64 %rd34, %rd32, %rd33;
+    ld.global.b16 %h0, [%rd34];
+    cvt.f32.f16 %f1, %h0;
+    fma.rn.f32 %f_rowsum_dP_P, %f0, %f1, %f_rowsum_dP_P;
+    shfl.sync.bfly.b32 %f0, %f_rowsum_dP_P, 16, 31, 0xFFFFFFFF;
+    add.f32 %f_rowsum_dP_P, %f_rowsum_dP_P, %f0;
+    shfl.sync.bfly.b32 %f0, %f_rowsum_dP_P, 8, 31, 0xFFFFFFFF;
+    add.f32 %f_rowsum_dP_P, %f_rowsum_dP_P, %f0;
+    shfl.sync.bfly.b32 %f0, %f_rowsum_dP_P, 4, 31, 0xFFFFFFFF;
+    add.f32 %f_rowsum_dP_P, %f_rowsum_dP_P, %f0;
+    shfl.sync.bfly.b32 %f0, %f_rowsum_dP_P, 2, 31, 0xFFFFFFFF;
+    add.f32 %f_rowsum_dP_P, %f_rowsum_dP_P, %f0;
+    shfl.sync.bfly.b32 %f0, %f_rowsum_dP_P, 1, 31, 0xFFFFFFFF;
+    add.f32 %f_rowsum_dP_P, %f_rowsum_dP_P, %f0;
+    setp.eq.u32 %p0, %lane, 0;
+    shl.b64 %rd35, %warp_row, 2;
+    add.u64 %rd35, %rd35, 45312;
+    add.u64 %rd35, %shmem_base, %rd35;
+    @%p0 st.shared.f32 [%rd35], %f_rowsum_dP_P;
+    bra V2_BWD_D_DONE_2;
+V2_BWD_D_ZERO_2:
+    setp.eq.u32 %p0, %lane, 0;
+    shl.b64 %rd35, %warp_row, 2;
+    add.u64 %rd35, %rd35, 45312;
+    add.u64 %rd35, %shmem_base, %rd35;
+    mov.f32 %f_rowsum_dP_P, 0f00000000;
+    @%p0 st.shared.f32 [%rd35], %f_rowsum_dP_P;
+V2_BWD_D_DONE_2:
+    // Tier C backward D correction: D[i] = dO[i] . O[i] (q_tile_iter=3, d_per_lane=1)
+    add.u32 %r0, %warp_id, 12; // warp_row
+    cvt.u64.u32 %warp_row, %r0;
+    add.u64 %rd39, %q_start, %warp_row;
+    setp.ge.u64 %p0, %rd39, %rd6;
+    @%p0 bra V2_BWD_D_ZERO_3;
+    mul.lo.u64 %rd30, %batch_idx, %rd5;
+    add.u64 %rd30, %rd30, %head_idx;
+    mul.lo.u64 %rd30, %rd30, %rd6;
+    add.u64 %rd30, %rd30, %rd39;
+    mul.lo.u64 %rd30, %rd30, %rd7;
+    shl.b64 %rd30, %rd30, 1;  // * 2 bytes (f16)
+    add.u64 %rd31, %rd_bwd_do, %rd30;  // &dO[row, 0]
+    add.u64 %rd32, %rd3, %rd30;         // &O[row, 0]
+    mov.f32 %f_rowsum_dP_P, 0f00000000;
+    cvt.u64.u32 %rd33, %lane;
+    shl.b64 %rd33, %rd33, 1;  // d * 2 bytes
+    add.u64 %rd34, %rd31, %rd33;
+    ld.global.b16 %h0, [%rd34];
+    cvt.f32.f16 %f0, %h0;
+    add.u64 %rd34, %rd32, %rd33;
+    ld.global.b16 %h0, [%rd34];
+    cvt.f32.f16 %f1, %h0;
+    fma.rn.f32 %f_rowsum_dP_P, %f0, %f1, %f_rowsum_dP_P;
+    shfl.sync.bfly.b32 %f0, %f_rowsum_dP_P, 16, 31, 0xFFFFFFFF;
+    add.f32 %f_rowsum_dP_P, %f_rowsum_dP_P, %f0;
+    shfl.sync.bfly.b32 %f0, %f_rowsum_dP_P, 8, 31, 0xFFFFFFFF;
+    add.f32 %f_rowsum_dP_P, %f_rowsum_dP_P, %f0;
+    shfl.sync.bfly.b32 %f0, %f_rowsum_dP_P, 4, 31, 0xFFFFFFFF;
+    add.f32 %f_rowsum_dP_P, %f_rowsum_dP_P, %f0;
+    shfl.sync.bfly.b32 %f0, %f_rowsum_dP_P, 2, 31, 0xFFFFFFFF;
+    add.f32 %f_rowsum_dP_P, %f_rowsum_dP_P, %f0;
+    shfl.sync.bfly.b32 %f0, %f_rowsum_dP_P, 1, 31, 0xFFFFFFFF;
+    add.f32 %f_rowsum_dP_P, %f_rowsum_dP_P, %f0;
+    setp.eq.u32 %p0, %lane, 0;
+    shl.b64 %rd35, %warp_row, 2;
+    add.u64 %rd35, %rd35, 45312;
+    add.u64 %rd35, %shmem_base, %rd35;
+    @%p0 st.shared.f32 [%rd35], %f_rowsum_dP_P;
+    bra V2_BWD_D_DONE_3;
+V2_BWD_D_ZERO_3:
+    setp.eq.u32 %p0, %lane, 0;
+    shl.b64 %rd35, %warp_row, 2;
+    add.u64 %rd35, %rd35, 45312;
+    add.u64 %rd35, %shmem_base, %rd35;
+    mov.f32 %f_rowsum_dP_P, 0f00000000;
+    @%p0 st.shared.f32 [%rd35], %f_rowsum_dP_P;
+V2_BWD_D_DONE_3:
+    // Tier C backward D correction: D[i] = dO[i] . O[i] (q_tile_iter=4, d_per_lane=1)
+    add.u32 %r0, %warp_id, 16; // warp_row
+    cvt.u64.u32 %warp_row, %r0;
+    add.u64 %rd39, %q_start, %warp_row;
+    setp.ge.u64 %p0, %rd39, %rd6;
+    @%p0 bra V2_BWD_D_ZERO_4;
+    mul.lo.u64 %rd30, %batch_idx, %rd5;
+    add.u64 %rd30, %rd30, %head_idx;
+    mul.lo.u64 %rd30, %rd30, %rd6;
+    add.u64 %rd30, %rd30, %rd39;
+    mul.lo.u64 %rd30, %rd30, %rd7;
+    shl.b64 %rd30, %rd30, 1;  // * 2 bytes (f16)
+    add.u64 %rd31, %rd_bwd_do, %rd30;  // &dO[row, 0]
+    add.u64 %rd32, %rd3, %rd30;         // &O[row, 0]
+    mov.f32 %f_rowsum_dP_P, 0f00000000;
+    cvt.u64.u32 %rd33, %lane;
+    shl.b64 %rd33, %rd33, 1;  // d * 2 bytes
+    add.u64 %rd34, %rd31, %rd33;
+    ld.global.b16 %h0, [%rd34];
+    cvt.f32.f16 %f0, %h0;
+    add.u64 %rd34, %rd32, %rd33;
+    ld.global.b16 %h0, [%rd34];
+    cvt.f32.f16 %f1, %h0;
+    fma.rn.f32 %f_rowsum_dP_P, %f0, %f1, %f_rowsum_dP_P;
+    shfl.sync.bfly.b32 %f0, %f_rowsum_dP_P, 16, 31, 0xFFFFFFFF;
+    add.f32 %f_rowsum_dP_P, %f_rowsum_dP_P, %f0;
+    shfl.sync.bfly.b32 %f0, %f_rowsum_dP_P, 8, 31, 0xFFFFFFFF;
+    add.f32 %f_rowsum_dP_P, %f_rowsum_dP_P, %f0;
+    shfl.sync.bfly.b32 %f0, %f_rowsum_dP_P, 4, 31, 0xFFFFFFFF;
+    add.f32 %f_rowsum_dP_P, %f_rowsum_dP_P, %f0;
+    shfl.sync.bfly.b32 %f0, %f_rowsum_dP_P, 2, 31, 0xFFFFFFFF;
+    add.f32 %f_rowsum_dP_P, %f_rowsum_dP_P, %f0;
+    shfl.sync.bfly.b32 %f0, %f_rowsum_dP_P, 1, 31, 0xFFFFFFFF;
+    add.f32 %f_rowsum_dP_P, %f_rowsum_dP_P, %f0;
+    setp.eq.u32 %p0, %lane, 0;
+    shl.b64 %rd35, %warp_row, 2;
+    add.u64 %rd35, %rd35, 45312;
+    add.u64 %rd35, %shmem_base, %rd35;
+    @%p0 st.shared.f32 [%rd35], %f_rowsum_dP_P;
+    bra V2_BWD_D_DONE_4;
+V2_BWD_D_ZERO_4:
+    setp.eq.u32 %p0, %lane, 0;
+    shl.b64 %rd35, %warp_row, 2;
+    add.u64 %rd35, %rd35, 45312;
+    add.u64 %rd35, %shmem_base, %rd35;
+    mov.f32 %f_rowsum_dP_P, 0f00000000;
+    @%p0 st.shared.f32 [%rd35], %f_rowsum_dP_P;
+V2_BWD_D_DONE_4:
+    // Tier C backward D correction: D[i] = dO[i] . O[i] (q_tile_iter=5, d_per_lane=1)
+    add.u32 %r0, %warp_id, 20; // warp_row
+    cvt.u64.u32 %warp_row, %r0;
+    add.u64 %rd39, %q_start, %warp_row;
+    setp.ge.u64 %p0, %rd39, %rd6;
+    @%p0 bra V2_BWD_D_ZERO_5;
+    mul.lo.u64 %rd30, %batch_idx, %rd5;
+    add.u64 %rd30, %rd30, %head_idx;
+    mul.lo.u64 %rd30, %rd30, %rd6;
+    add.u64 %rd30, %rd30, %rd39;
+    mul.lo.u64 %rd30, %rd30, %rd7;
+    shl.b64 %rd30, %rd30, 1;  // * 2 bytes (f16)
+    add.u64 %rd31, %rd_bwd_do, %rd30;  // &dO[row, 0]
+    add.u64 %rd32, %rd3, %rd30;         // &O[row, 0]
+    mov.f32 %f_rowsum_dP_P, 0f00000000;
+    cvt.u64.u32 %rd33, %lane;
+    shl.b64 %rd33, %rd33, 1;  // d * 2 bytes
+    add.u64 %rd34, %rd31, %rd33;
+    ld.global.b16 %h0, [%rd34];
+    cvt.f32.f16 %f0, %h0;
+    add.u64 %rd34, %rd32, %rd33;
+    ld.global.b16 %h0, [%rd34];
+    cvt.f32.f16 %f1, %h0;
+    fma.rn.f32 %f_rowsum_dP_P, %f0, %f1, %f_rowsum_dP_P;
+    shfl.sync.bfly.b32 %f0, %f_rowsum_dP_P, 16, 31, 0xFFFFFFFF;
+    add.f32 %f_rowsum_dP_P, %f_rowsum_dP_P, %f0;
+    shfl.sync.bfly.b32 %f0, %f_rowsum_dP_P, 8, 31, 0xFFFFFFFF;
+    add.f32 %f_rowsum_dP_P, %f_rowsum_dP_P, %f0;
+    shfl.sync.bfly.b32 %f0, %f_rowsum_dP_P, 4, 31, 0xFFFFFFFF;
+    add.f32 %f_rowsum_dP_P, %f_rowsum_dP_P, %f0;
+    shfl.sync.bfly.b32 %f0, %f_rowsum_dP_P, 2, 31, 0xFFFFFFFF;
+    add.f32 %f_rowsum_dP_P, %f_rowsum_dP_P, %f0;
+    shfl.sync.bfly.b32 %f0, %f_rowsum_dP_P, 1, 31, 0xFFFFFFFF;
+    add.f32 %f_rowsum_dP_P, %f_rowsum_dP_P, %f0;
+    setp.eq.u32 %p0, %lane, 0;
+    shl.b64 %rd35, %warp_row, 2;
+    add.u64 %rd35, %rd35, 45312;
+    add.u64 %rd35, %shmem_base, %rd35;
+    @%p0 st.shared.f32 [%rd35], %f_rowsum_dP_P;
+    bra V2_BWD_D_DONE_5;
+V2_BWD_D_ZERO_5:
+    setp.eq.u32 %p0, %lane, 0;
+    shl.b64 %rd35, %warp_row, 2;
+    add.u64 %rd35, %rd35, 45312;
+    add.u64 %rd35, %shmem_base, %rd35;
+    mov.f32 %f_rowsum_dP_P, 0f00000000;
+    @%p0 st.shared.f32 [%rd35], %f_rowsum_dP_P;
+V2_BWD_D_DONE_5:
+    // Tier C backward D correction: D[i] = dO[i] . O[i] (q_tile_iter=6, d_per_lane=1)
+    add.u32 %r0, %warp_id, 24; // warp_row
+    cvt.u64.u32 %warp_row, %r0;
+    add.u64 %rd39, %q_start, %warp_row;
+    setp.ge.u64 %p0, %rd39, %rd6;
+    @%p0 bra V2_BWD_D_ZERO_6;
+    mul.lo.u64 %rd30, %batch_idx, %rd5;
+    add.u64 %rd30, %rd30, %head_idx;
+    mul.lo.u64 %rd30, %rd30, %rd6;
+    add.u64 %rd30, %rd30, %rd39;
+    mul.lo.u64 %rd30, %rd30, %rd7;
+    shl.b64 %rd30, %rd30, 1;  // * 2 bytes (f16)
+    add.u64 %rd31, %rd_bwd_do, %rd30;  // &dO[row, 0]
+    add.u64 %rd32, %rd3, %rd30;         // &O[row, 0]
+    mov.f32 %f_rowsum_dP_P, 0f00000000;
+    cvt.u64.u32 %rd33, %lane;
+    shl.b64 %rd33, %rd33, 1;  // d * 2 bytes
+    add.u64 %rd34, %rd31, %rd33;
+    ld.global.b16 %h0, [%rd34];
+    cvt.f32.f16 %f0, %h0;
+    add.u64 %rd34, %rd32, %rd33;
+    ld.global.b16 %h0, [%rd34];
+    cvt.f32.f16 %f1, %h0;
+    fma.rn.f32 %f_rowsum_dP_P, %f0, %f1, %f_rowsum_dP_P;
+    shfl.sync.bfly.b32 %f0, %f_rowsum_dP_P, 16, 31, 0xFFFFFFFF;
+    add.f32 %f_rowsum_dP_P, %f_rowsum_dP_P, %f0;
+    shfl.sync.bfly.b32 %f0, %f_rowsum_dP_P, 8, 31, 0xFFFFFFFF;
+    add.f32 %f_rowsum_dP_P, %f_rowsum_dP_P, %f0;
+    shfl.sync.bfly.b32 %f0, %f_rowsum_dP_P, 4, 31, 0xFFFFFFFF;
+    add.f32 %f_rowsum_dP_P, %f_rowsum_dP_P, %f0;
+    shfl.sync.bfly.b32 %f0, %f_rowsum_dP_P, 2, 31, 0xFFFFFFFF;
+    add.f32 %f_rowsum_dP_P, %f_rowsum_dP_P, %f0;
+    shfl.sync.bfly.b32 %f0, %f_rowsum_dP_P, 1, 31, 0xFFFFFFFF;
+    add.f32 %f_rowsum_dP_P, %f_rowsum_dP_P, %f0;
+    setp.eq.u32 %p0, %lane, 0;
+    shl.b64 %rd35, %warp_row, 2;
+    add.u64 %rd35, %rd35, 45312;
+    add.u64 %rd35, %shmem_base, %rd35;
+    @%p0 st.shared.f32 [%rd35], %f_rowsum_dP_P;
+    bra V2_BWD_D_DONE_6;
+V2_BWD_D_ZERO_6:
+    setp.eq.u32 %p0, %lane, 0;
+    shl.b64 %rd35, %warp_row, 2;
+    add.u64 %rd35, %rd35, 45312;
+    add.u64 %rd35, %shmem_base, %rd35;
+    mov.f32 %f_rowsum_dP_P, 0f00000000;
+    @%p0 st.shared.f32 [%rd35], %f_rowsum_dP_P;
+V2_BWD_D_DONE_6:
+    // Tier C backward D correction: D[i] = dO[i] . O[i] (q_tile_iter=7, d_per_lane=1)
+    add.u32 %r0, %warp_id, 28; // warp_row
+    cvt.u64.u32 %warp_row, %r0;
+    add.u64 %rd39, %q_start, %warp_row;
+    setp.ge.u64 %p0, %rd39, %rd6;
+    @%p0 bra V2_BWD_D_ZERO_7;
+    mul.lo.u64 %rd30, %batch_idx, %rd5;
+    add.u64 %rd30, %rd30, %head_idx;
+    mul.lo.u64 %rd30, %rd30, %rd6;
+    add.u64 %rd30, %rd30, %rd39;
+    mul.lo.u64 %rd30, %rd30, %rd7;
+    shl.b64 %rd30, %rd30, 1;  // * 2 bytes (f16)
+    add.u64 %rd31, %rd_bwd_do, %rd30;  // &dO[row, 0]
+    add.u64 %rd32, %rd3, %rd30;         // &O[row, 0]
+    mov.f32 %f_rowsum_dP_P, 0f00000000;
+    cvt.u64.u32 %rd33, %lane;
+    shl.b64 %rd33, %rd33, 1;  // d * 2 bytes
+    add.u64 %rd34, %rd31, %rd33;
+    ld.global.b16 %h0, [%rd34];
+    cvt.f32.f16 %f0, %h0;
+    add.u64 %rd34, %rd32, %rd33;
+    ld.global.b16 %h0, [%rd34];
+    cvt.f32.f16 %f1, %h0;
+    fma.rn.f32 %f_rowsum_dP_P, %f0, %f1, %f_rowsum_dP_P;
+    shfl.sync.bfly.b32 %f0, %f_rowsum_dP_P, 16, 31, 0xFFFFFFFF;
+    add.f32 %f_rowsum_dP_P, %f_rowsum_dP_P, %f0;
+    shfl.sync.bfly.b32 %f0, %f_rowsum_dP_P, 8, 31, 0xFFFFFFFF;
+    add.f32 %f_rowsum_dP_P, %f_rowsum_dP_P, %f0;
+    shfl.sync.bfly.b32 %f0, %f_rowsum_dP_P, 4, 31, 0xFFFFFFFF;
+    add.f32 %f_rowsum_dP_P, %f_rowsum_dP_P, %f0;
+    shfl.sync.bfly.b32 %f0, %f_rowsum_dP_P, 2, 31, 0xFFFFFFFF;
+    add.f32 %f_rowsum_dP_P, %f_rowsum_dP_P, %f0;
+    shfl.sync.bfly.b32 %f0, %f_rowsum_dP_P, 1, 31, 0xFFFFFFFF;
+    add.f32 %f_rowsum_dP_P, %f_rowsum_dP_P, %f0;
+    setp.eq.u32 %p0, %lane, 0;
+    shl.b64 %rd35, %warp_row, 2;
+    add.u64 %rd35, %rd35, 45312;
+    add.u64 %rd35, %shmem_base, %rd35;
+    @%p0 st.shared.f32 [%rd35], %f_rowsum_dP_P;
+    bra V2_BWD_D_DONE_7;
+V2_BWD_D_ZERO_7:
+    setp.eq.u32 %p0, %lane, 0;
+    shl.b64 %rd35, %warp_row, 2;
+    add.u64 %rd35, %rd35, 45312;
+    add.u64 %rd35, %shmem_base, %rd35;
+    mov.f32 %f_rowsum_dP_P, 0f00000000;
+    @%p0 st.shared.f32 [%rd35], %f_rowsum_dP_P;
+V2_BWD_D_DONE_7:
+    bar.sync 0;  // D correction strip complete
+    mov.u64 %k_start, 0;
+    mov.u64 %k_max, %rd6;
+V2_BWD_LOOP_KV:
     // Tier C backward K-load (block_kv=32, slices/lane=1, rows/warp=8)
-V2_BWD_K_LOAD:
+V2_BWD_K_LOAD_MAIN:
     setp.eq.u64 %p0, %rd_bwd_k_proj, 0;
-    @%p0 bra V2_BWD_K_LOAD_SKIP;
+    @%p0 bra V2_BWD_K_LOAD_SKIP_MAIN;
     add.u32 %r0, %warp_id, 0; // kv_row
     cvt.u64.u32 %rd30, %r0;
+    add.u64 %rd35, %rd30, %k_start;
+    setp.ge.u64 %p1, %rd35, %rd6;
     mul.lo.u64 %rd31, %batch_idx, %rd5;
     add.u64 %rd31, %rd31, %head_idx;
     mul.lo.u64 %rd31, %rd31, %rd6;
-    add.u64 %rd31, %rd31, %rd30;
+    add.u64 %rd31, %rd31, %rd35;
     mul.lo.u64 %rd31, %rd31, %rd7;
     shl.b64 %rd31, %rd31, 1;
     cvt.u64.u32 %rd32, %lane;
     shl.b64 %rd32, %rd32, 1;  // col * 2
     add.u64 %rd33, %rd31, %rd32;
     add.u64 %rd33, %rd_bwd_k_proj, %rd33;
-    ld.global.b16 %h0, [%rd33];
+    @%p1 mov.b16 %h0, 0;
+    @!%p1 ld.global.b16 %h0, [%rd33];
     mul.lo.u64 %rd34, %rd30, 64;
     add.u64 %rd34, %rd34, %rd32;
     add.u64 %rd34, %k_smem_base, %rd34;
     st.shared.b16 [%rd34], %h0;
     add.u32 %r0, %warp_id, 4; // kv_row
     cvt.u64.u32 %rd30, %r0;
+    add.u64 %rd35, %rd30, %k_start;
+    setp.ge.u64 %p1, %rd35, %rd6;
     mul.lo.u64 %rd31, %batch_idx, %rd5;
     add.u64 %rd31, %rd31, %head_idx;
     mul.lo.u64 %rd31, %rd31, %rd6;
-    add.u64 %rd31, %rd31, %rd30;
+    add.u64 %rd31, %rd31, %rd35;
     mul.lo.u64 %rd31, %rd31, %rd7;
     shl.b64 %rd31, %rd31, 1;
     cvt.u64.u32 %rd32, %lane;
     shl.b64 %rd32, %rd32, 1;  // col * 2
     add.u64 %rd33, %rd31, %rd32;
     add.u64 %rd33, %rd_bwd_k_proj, %rd33;
-    ld.global.b16 %h0, [%rd33];
+    @%p1 mov.b16 %h0, 0;
+    @!%p1 ld.global.b16 %h0, [%rd33];
     mul.lo.u64 %rd34, %rd30, 64;
     add.u64 %rd34, %rd34, %rd32;
     add.u64 %rd34, %k_smem_base, %rd34;
     st.shared.b16 [%rd34], %h0;
     add.u32 %r0, %warp_id, 8; // kv_row
     cvt.u64.u32 %rd30, %r0;
+    add.u64 %rd35, %rd30, %k_start;
+    setp.ge.u64 %p1, %rd35, %rd6;
     mul.lo.u64 %rd31, %batch_idx, %rd5;
     add.u64 %rd31, %rd31, %head_idx;
     mul.lo.u64 %rd31, %rd31, %rd6;
-    add.u64 %rd31, %rd31, %rd30;
+    add.u64 %rd31, %rd31, %rd35;
     mul.lo.u64 %rd31, %rd31, %rd7;
     shl.b64 %rd31, %rd31, 1;
     cvt.u64.u32 %rd32, %lane;
     shl.b64 %rd32, %rd32, 1;  // col * 2
     add.u64 %rd33, %rd31, %rd32;
     add.u64 %rd33, %rd_bwd_k_proj, %rd33;
-    ld.global.b16 %h0, [%rd33];
+    @%p1 mov.b16 %h0, 0;
+    @!%p1 ld.global.b16 %h0, [%rd33];
     mul.lo.u64 %rd34, %rd30, 64;
     add.u64 %rd34, %rd34, %rd32;
     add.u64 %rd34, %k_smem_base, %rd34;
     st.shared.b16 [%rd34], %h0;
     add.u32 %r0, %warp_id, 12; // kv_row
     cvt.u64.u32 %rd30, %r0;
+    add.u64 %rd35, %rd30, %k_start;
+    setp.ge.u64 %p1, %rd35, %rd6;
     mul.lo.u64 %rd31, %batch_idx, %rd5;
     add.u64 %rd31, %rd31, %head_idx;
     mul.lo.u64 %rd31, %rd31, %rd6;
-    add.u64 %rd31, %rd31, %rd30;
+    add.u64 %rd31, %rd31, %rd35;
     mul.lo.u64 %rd31, %rd31, %rd7;
     shl.b64 %rd31, %rd31, 1;
     cvt.u64.u32 %rd32, %lane;
     shl.b64 %rd32, %rd32, 1;  // col * 2
     add.u64 %rd33, %rd31, %rd32;
     add.u64 %rd33, %rd_bwd_k_proj, %rd33;
-    ld.global.b16 %h0, [%rd33];
+    @%p1 mov.b16 %h0, 0;
+    @!%p1 ld.global.b16 %h0, [%rd33];
     mul.lo.u64 %rd34, %rd30, 64;
     add.u64 %rd34, %rd34, %rd32;
     add.u64 %rd34, %k_smem_base, %rd34;
     st.shared.b16 [%rd34], %h0;
     add.u32 %r0, %warp_id, 16; // kv_row
     cvt.u64.u32 %rd30, %r0;
+    add.u64 %rd35, %rd30, %k_start;
+    setp.ge.u64 %p1, %rd35, %rd6;
     mul.lo.u64 %rd31, %batch_idx, %rd5;
     add.u64 %rd31, %rd31, %head_idx;
     mul.lo.u64 %rd31, %rd31, %rd6;
-    add.u64 %rd31, %rd31, %rd30;
+    add.u64 %rd31, %rd31, %rd35;
     mul.lo.u64 %rd31, %rd31, %rd7;
     shl.b64 %rd31, %rd31, 1;
     cvt.u64.u32 %rd32, %lane;
     shl.b64 %rd32, %rd32, 1;  // col * 2
     add.u64 %rd33, %rd31, %rd32;
     add.u64 %rd33, %rd_bwd_k_proj, %rd33;
-    ld.global.b16 %h0, [%rd33];
+    @%p1 mov.b16 %h0, 0;
+    @!%p1 ld.global.b16 %h0, [%rd33];
     mul.lo.u64 %rd34, %rd30, 64;
     add.u64 %rd34, %rd34, %rd32;
     add.u64 %rd34, %k_smem_base, %rd34;
     st.shared.b16 [%rd34], %h0;
     add.u32 %r0, %warp_id, 20; // kv_row
     cvt.u64.u32 %rd30, %r0;
+    add.u64 %rd35, %rd30, %k_start;
+    setp.ge.u64 %p1, %rd35, %rd6;
     mul.lo.u64 %rd31, %batch_idx, %rd5;
     add.u64 %rd31, %rd31, %head_idx;
     mul.lo.u64 %rd31, %rd31, %rd6;
-    add.u64 %rd31, %rd31, %rd30;
+    add.u64 %rd31, %rd31, %rd35;
     mul.lo.u64 %rd31, %rd31, %rd7;
     shl.b64 %rd31, %rd31, 1;
     cvt.u64.u32 %rd32, %lane;
     shl.b64 %rd32, %rd32, 1;  // col * 2
     add.u64 %rd33, %rd31, %rd32;
     add.u64 %rd33, %rd_bwd_k_proj, %rd33;
-    ld.global.b16 %h0, [%rd33];
+    @%p1 mov.b16 %h0, 0;
+    @!%p1 ld.global.b16 %h0, [%rd33];
     mul.lo.u64 %rd34, %rd30, 64;
     add.u64 %rd34, %rd34, %rd32;
     add.u64 %rd34, %k_smem_base, %rd34;
     st.shared.b16 [%rd34], %h0;
     add.u32 %r0, %warp_id, 24; // kv_row
     cvt.u64.u32 %rd30, %r0;
+    add.u64 %rd35, %rd30, %k_start;
+    setp.ge.u64 %p1, %rd35, %rd6;
     mul.lo.u64 %rd31, %batch_idx, %rd5;
     add.u64 %rd31, %rd31, %head_idx;
     mul.lo.u64 %rd31, %rd31, %rd6;
-    add.u64 %rd31, %rd31, %rd30;
+    add.u64 %rd31, %rd31, %rd35;
     mul.lo.u64 %rd31, %rd31, %rd7;
     shl.b64 %rd31, %rd31, 1;
     cvt.u64.u32 %rd32, %lane;
     shl.b64 %rd32, %rd32, 1;  // col * 2
     add.u64 %rd33, %rd31, %rd32;
     add.u64 %rd33, %rd_bwd_k_proj, %rd33;
-    ld.global.b16 %h0, [%rd33];
+    @%p1 mov.b16 %h0, 0;
+    @!%p1 ld.global.b16 %h0, [%rd33];
     mul.lo.u64 %rd34, %rd30, 64;
     add.u64 %rd34, %rd34, %rd32;
     add.u64 %rd34, %k_smem_base, %rd34;
     st.shared.b16 [%rd34], %h0;
     add.u32 %r0, %warp_id, 28; // kv_row
     cvt.u64.u32 %rd30, %r0;
+    add.u64 %rd35, %rd30, %k_start;
+    setp.ge.u64 %p1, %rd35, %rd6;
     mul.lo.u64 %rd31, %batch_idx, %rd5;
     add.u64 %rd31, %rd31, %head_idx;
     mul.lo.u64 %rd31, %rd31, %rd6;
-    add.u64 %rd31, %rd31, %rd30;
+    add.u64 %rd31, %rd31, %rd35;
     mul.lo.u64 %rd31, %rd31, %rd7;
     shl.b64 %rd31, %rd31, 1;
     cvt.u64.u32 %rd32, %lane;
     shl.b64 %rd32, %rd32, 1;  // col * 2
     add.u64 %rd33, %rd31, %rd32;
     add.u64 %rd33, %rd_bwd_k_proj, %rd33;
-    ld.global.b16 %h0, [%rd33];
+    @%p1 mov.b16 %h0, 0;
+    @!%p1 ld.global.b16 %h0, [%rd33];
     mul.lo.u64 %rd34, %rd30, 64;
     add.u64 %rd34, %rd34, %rd32;
     add.u64 %rd34, %k_smem_base, %rd34;
     st.shared.b16 [%rd34], %h0;
-V2_BWD_K_LOAD_SKIP:
+V2_BWD_K_LOAD_SKIP_MAIN:
     bar.sync 0;  // tile visible to all threads
     // Tier C backward V-load (block_kv=32, slices/lane=1, rows/warp=8)
-V2_BWD_V_LOAD:
+V2_BWD_V_LOAD_MAIN:
     setp.eq.u64 %p0, %rd_bwd_v_proj, 0;
-    @%p0 bra V2_BWD_V_LOAD_SKIP;
+    @%p0 bra V2_BWD_V_LOAD_SKIP_MAIN;
     add.u32 %r0, %warp_id, 0; // kv_row
     cvt.u64.u32 %rd30, %r0;
+    add.u64 %rd35, %rd30, %k_start;
+    setp.ge.u64 %p1, %rd35, %rd6;
     mul.lo.u64 %rd31, %batch_idx, %rd5;
     add.u64 %rd31, %rd31, %head_idx;
     mul.lo.u64 %rd31, %rd31, %rd6;
-    add.u64 %rd31, %rd31, %rd30;
+    add.u64 %rd31, %rd31, %rd35;
     mul.lo.u64 %rd31, %rd31, %rd7;
     shl.b64 %rd31, %rd31, 1;
     cvt.u64.u32 %rd32, %lane;
     shl.b64 %rd32, %rd32, 1;  // col * 2
     add.u64 %rd33, %rd31, %rd32;
     add.u64 %rd33, %rd_bwd_v_proj, %rd33;
-    ld.global.b16 %h0, [%rd33];
+    @%p1 mov.b16 %h0, 0;
+    @!%p1 ld.global.b16 %h0, [%rd33];
     mul.lo.u64 %rd34, %rd30, 64;
     add.u64 %rd34, %rd34, %rd32;
     add.u64 %rd34, %v_smem_base, %rd34;
     st.shared.b16 [%rd34], %h0;
     add.u32 %r0, %warp_id, 4; // kv_row
     cvt.u64.u32 %rd30, %r0;
+    add.u64 %rd35, %rd30, %k_start;
+    setp.ge.u64 %p1, %rd35, %rd6;
     mul.lo.u64 %rd31, %batch_idx, %rd5;
     add.u64 %rd31, %rd31, %head_idx;
     mul.lo.u64 %rd31, %rd31, %rd6;
-    add.u64 %rd31, %rd31, %rd30;
+    add.u64 %rd31, %rd31, %rd35;
     mul.lo.u64 %rd31, %rd31, %rd7;
     shl.b64 %rd31, %rd31, 1;
     cvt.u64.u32 %rd32, %lane;
     shl.b64 %rd32, %rd32, 1;  // col * 2
     add.u64 %rd33, %rd31, %rd32;
     add.u64 %rd33, %rd_bwd_v_proj, %rd33;
-    ld.global.b16 %h0, [%rd33];
+    @%p1 mov.b16 %h0, 0;
+    @!%p1 ld.global.b16 %h0, [%rd33];
     mul.lo.u64 %rd34, %rd30, 64;
     add.u64 %rd34, %rd34, %rd32;
     add.u64 %rd34, %v_smem_base, %rd34;
     st.shared.b16 [%rd34], %h0;
     add.u32 %r0, %warp_id, 8; // kv_row
     cvt.u64.u32 %rd30, %r0;
+    add.u64 %rd35, %rd30, %k_start;
+    setp.ge.u64 %p1, %rd35, %rd6;
     mul.lo.u64 %rd31, %batch_idx, %rd5;
     add.u64 %rd31, %rd31, %head_idx;
     mul.lo.u64 %rd31, %rd31, %rd6;
-    add.u64 %rd31, %rd31, %rd30;
+    add.u64 %rd31, %rd31, %rd35;
     mul.lo.u64 %rd31, %rd31, %rd7;
     shl.b64 %rd31, %rd31, 1;
     cvt.u64.u32 %rd32, %lane;
     shl.b64 %rd32, %rd32, 1;  // col * 2
     add.u64 %rd33, %rd31, %rd32;
     add.u64 %rd33, %rd_bwd_v_proj, %rd33;
-    ld.global.b16 %h0, [%rd33];
+    @%p1 mov.b16 %h0, 0;
+    @!%p1 ld.global.b16 %h0, [%rd33];
     mul.lo.u64 %rd34, %rd30, 64;
     add.u64 %rd34, %rd34, %rd32;
     add.u64 %rd34, %v_smem_base, %rd34;
     st.shared.b16 [%rd34], %h0;
     add.u32 %r0, %warp_id, 12; // kv_row
     cvt.u64.u32 %rd30, %r0;
+    add.u64 %rd35, %rd30, %k_start;
+    setp.ge.u64 %p1, %rd35, %rd6;
     mul.lo.u64 %rd31, %batch_idx, %rd5;
     add.u64 %rd31, %rd31, %head_idx;
     mul.lo.u64 %rd31, %rd31, %rd6;
-    add.u64 %rd31, %rd31, %rd30;
+    add.u64 %rd31, %rd31, %rd35;
     mul.lo.u64 %rd31, %rd31, %rd7;
     shl.b64 %rd31, %rd31, 1;
     cvt.u64.u32 %rd32, %lane;
     shl.b64 %rd32, %rd32, 1;  // col * 2
     add.u64 %rd33, %rd31, %rd32;
     add.u64 %rd33, %rd_bwd_v_proj, %rd33;
-    ld.global.b16 %h0, [%rd33];
+    @%p1 mov.b16 %h0, 0;
+    @!%p1 ld.global.b16 %h0, [%rd33];
     mul.lo.u64 %rd34, %rd30, 64;
     add.u64 %rd34, %rd34, %rd32;
     add.u64 %rd34, %v_smem_base, %rd34;
     st.shared.b16 [%rd34], %h0;
     add.u32 %r0, %warp_id, 16; // kv_row
     cvt.u64.u32 %rd30, %r0;
+    add.u64 %rd35, %rd30, %k_start;
+    setp.ge.u64 %p1, %rd35, %rd6;
     mul.lo.u64 %rd31, %batch_idx, %rd5;
     add.u64 %rd31, %rd31, %head_idx;
     mul.lo.u64 %rd31, %rd31, %rd6;
-    add.u64 %rd31, %rd31, %rd30;
+    add.u64 %rd31, %rd31, %rd35;
     mul.lo.u64 %rd31, %rd31, %rd7;
     shl.b64 %rd31, %rd31, 1;
     cvt.u64.u32 %rd32, %lane;
     shl.b64 %rd32, %rd32, 1;  // col * 2
     add.u64 %rd33, %rd31, %rd32;
     add.u64 %rd33, %rd_bwd_v_proj, %rd33;
-    ld.global.b16 %h0, [%rd33];
+    @%p1 mov.b16 %h0, 0;
+    @!%p1 ld.global.b16 %h0, [%rd33];
     mul.lo.u64 %rd34, %rd30, 64;
     add.u64 %rd34, %rd34, %rd32;
     add.u64 %rd34, %v_smem_base, %rd34;
     st.shared.b16 [%rd34], %h0;
     add.u32 %r0, %warp_id, 20; // kv_row
     cvt.u64.u32 %rd30, %r0;
+    add.u64 %rd35, %rd30, %k_start;
+    setp.ge.u64 %p1, %rd35, %rd6;
     mul.lo.u64 %rd31, %batch_idx, %rd5;
     add.u64 %rd31, %rd31, %head_idx;
     mul.lo.u64 %rd31, %rd31, %rd6;
-    add.u64 %rd31, %rd31, %rd30;
+    add.u64 %rd31, %rd31, %rd35;
     mul.lo.u64 %rd31, %rd31, %rd7;
     shl.b64 %rd31, %rd31, 1;
     cvt.u64.u32 %rd32, %lane;
     shl.b64 %rd32, %rd32, 1;  // col * 2
     add.u64 %rd33, %rd31, %rd32;
     add.u64 %rd33, %rd_bwd_v_proj, %rd33;
-    ld.global.b16 %h0, [%rd33];
+    @%p1 mov.b16 %h0, 0;
+    @!%p1 ld.global.b16 %h0, [%rd33];
     mul.lo.u64 %rd34, %rd30, 64;
     add.u64 %rd34, %rd34, %rd32;
     add.u64 %rd34, %v_smem_base, %rd34;
     st.shared.b16 [%rd34], %h0;
     add.u32 %r0, %warp_id, 24; // kv_row
     cvt.u64.u32 %rd30, %r0;
+    add.u64 %rd35, %rd30, %k_start;
+    setp.ge.u64 %p1, %rd35, %rd6;
     mul.lo.u64 %rd31, %batch_idx, %rd5;
     add.u64 %rd31, %rd31, %head_idx;
     mul.lo.u64 %rd31, %rd31, %rd6;
-    add.u64 %rd31, %rd31, %rd30;
+    add.u64 %rd31, %rd31, %rd35;
     mul.lo.u64 %rd31, %rd31, %rd7;
     shl.b64 %rd31, %rd31, 1;
     cvt.u64.u32 %rd32, %lane;
     shl.b64 %rd32, %rd32, 1;  // col * 2
     add.u64 %rd33, %rd31, %rd32;
     add.u64 %rd33, %rd_bwd_v_proj, %rd33;
-    ld.global.b16 %h0, [%rd33];
+    @%p1 mov.b16 %h0, 0;
+    @!%p1 ld.global.b16 %h0, [%rd33];
     mul.lo.u64 %rd34, %rd30, 64;
     add.u64 %rd34, %rd34, %rd32;
     add.u64 %rd34, %v_smem_base, %rd34;
     st.shared.b16 [%rd34], %h0;
     add.u32 %r0, %warp_id, 28; // kv_row
     cvt.u64.u32 %rd30, %r0;
+    add.u64 %rd35, %rd30, %k_start;
+    setp.ge.u64 %p1, %rd35, %rd6;
     mul.lo.u64 %rd31, %batch_idx, %rd5;
     add.u64 %rd31, %rd31, %head_idx;
     mul.lo.u64 %rd31, %rd31, %rd6;
-    add.u64 %rd31, %rd31, %rd30;
+    add.u64 %rd31, %rd31, %rd35;
     mul.lo.u64 %rd31, %rd31, %rd7;
     shl.b64 %rd31, %rd31, 1;
     cvt.u64.u32 %rd32, %lane;
     shl.b64 %rd32, %rd32, 1;  // col * 2
     add.u64 %rd33, %rd31, %rd32;
     add.u64 %rd33, %rd_bwd_v_proj, %rd33;
-    ld.global.b16 %h0, [%rd33];
+    @%p1 mov.b16 %h0, 0;
+    @!%p1 ld.global.b16 %h0, [%rd33];
     mul.lo.u64 %rd34, %rd30, 64;
     add.u64 %rd34, %rd34, %rd32;
     add.u64 %rd34, %v_smem_base, %rd34;
     st.shared.b16 [%rd34], %h0;
-V2_BWD_V_LOAD_SKIP:
+V2_BWD_V_LOAD_SKIP_MAIN:
     bar.sync 0;  // tile visible to all threads
     // BWD zero-init DV SMEM tile (1024 cells, 8/thread)
     cvt.u64.u32 %rd_zero_idx, %tid_x;
@@ -810,76 +1321,24 @@ V2_BWD_V_LOAD_SKIP:
     add.u64 %rd_zero_idx, %shmem_base, %rd_zero_idx;
     mov.f32 %f_zero_val, 0f00000000;
     @%p_zero st.shared.f32 [%rd_zero_idx], %f_zero_val;
-    // BWD zero-init DQ SMEM tile (1024 cells, 8/thread)
-    cvt.u64.u32 %rd_zero_idx, %tid_x;
-    setp.lt.u64 %p_zero, %rd_zero_idx, 1024;
-    shl.b64 %rd_zero_idx, %rd_zero_idx, 2;
-    add.u64 %rd_zero_idx, %rd_zero_idx, 22784;
-    add.u64 %rd_zero_idx, %shmem_base, %rd_zero_idx;
-    mov.f32 %f_zero_val, 0f00000000;
-    @%p_zero st.shared.f32 [%rd_zero_idx], %f_zero_val;
-    cvt.u64.u32 %rd_zero_idx, %tid_x;
-    add.u64 %rd_zero_idx, %rd_zero_idx, 128;
-    setp.lt.u64 %p_zero, %rd_zero_idx, 1024;
-    shl.b64 %rd_zero_idx, %rd_zero_idx, 2;
-    add.u64 %rd_zero_idx, %rd_zero_idx, 22784;
-    add.u64 %rd_zero_idx, %shmem_base, %rd_zero_idx;
-    mov.f32 %f_zero_val, 0f00000000;
-    @%p_zero st.shared.f32 [%rd_zero_idx], %f_zero_val;
-    cvt.u64.u32 %rd_zero_idx, %tid_x;
-    add.u64 %rd_zero_idx, %rd_zero_idx, 256;
-    setp.lt.u64 %p_zero, %rd_zero_idx, 1024;
-    shl.b64 %rd_zero_idx, %rd_zero_idx, 2;
-    add.u64 %rd_zero_idx, %rd_zero_idx, 22784;
-    add.u64 %rd_zero_idx, %shmem_base, %rd_zero_idx;
-    mov.f32 %f_zero_val, 0f00000000;
-    @%p_zero st.shared.f32 [%rd_zero_idx], %f_zero_val;
-    cvt.u64.u32 %rd_zero_idx, %tid_x;
-    add.u64 %rd_zero_idx, %rd_zero_idx, 384;
-    setp.lt.u64 %p_zero, %rd_zero_idx, 1024;
-    shl.b64 %rd_zero_idx, %rd_zero_idx, 2;
-    add.u64 %rd_zero_idx, %rd_zero_idx, 22784;
-    add.u64 %rd_zero_idx, %shmem_base, %rd_zero_idx;
-    mov.f32 %f_zero_val, 0f00000000;
-    @%p_zero st.shared.f32 [%rd_zero_idx], %f_zero_val;
-    cvt.u64.u32 %rd_zero_idx, %tid_x;
-    add.u64 %rd_zero_idx, %rd_zero_idx, 512;
-    setp.lt.u64 %p_zero, %rd_zero_idx, 1024;
-    shl.b64 %rd_zero_idx, %rd_zero_idx, 2;
-    add.u64 %rd_zero_idx, %rd_zero_idx, 22784;
-    add.u64 %rd_zero_idx, %shmem_base, %rd_zero_idx;
-    mov.f32 %f_zero_val, 0f00000000;
-    @%p_zero st.shared.f32 [%rd_zero_idx], %f_zero_val;
-    cvt.u64.u32 %rd_zero_idx, %tid_x;
-    add.u64 %rd_zero_idx, %rd_zero_idx, 640;
-    setp.lt.u64 %p_zero, %rd_zero_idx, 1024;
-    shl.b64 %rd_zero_idx, %rd_zero_idx, 2;
-    add.u64 %rd_zero_idx, %rd_zero_idx, 22784;
-    add.u64 %rd_zero_idx, %shmem_base, %rd_zero_idx;
-    mov.f32 %f_zero_val, 0f00000000;
-    @%p_zero st.shared.f32 [%rd_zero_idx], %f_zero_val;
-    cvt.u64.u32 %rd_zero_idx, %tid_x;
-    add.u64 %rd_zero_idx, %rd_zero_idx, 768;
-    setp.lt.u64 %p_zero, %rd_zero_idx, 1024;
-    shl.b64 %rd_zero_idx, %rd_zero_idx, 2;
-    add.u64 %rd_zero_idx, %rd_zero_idx, 22784;
-    add.u64 %rd_zero_idx, %shmem_base, %rd_zero_idx;
-    mov.f32 %f_zero_val, 0f00000000;
-    @%p_zero st.shared.f32 [%rd_zero_idx], %f_zero_val;
-    cvt.u64.u32 %rd_zero_idx, %tid_x;
-    add.u64 %rd_zero_idx, %rd_zero_idx, 896;
-    setp.lt.u64 %p_zero, %rd_zero_idx, 1024;
-    shl.b64 %rd_zero_idx, %rd_zero_idx, 2;
-    add.u64 %rd_zero_idx, %rd_zero_idx, 22784;
-    add.u64 %rd_zero_idx, %shmem_base, %rd_zero_idx;
-    mov.f32 %f_zero_val, 0f00000000;
-    @%p_zero st.shared.f32 [%rd_zero_idx], %f_zero_val;
-    bar.sync 0;  // dV + dK + dQ tiles zeroed
+    bar.sync 0;  // dV + dK tiles zeroed for this KV tile
     // ====== BWD q_tile_iter = 0 / 8 ======
-    mov.f32 %f_dq_0, 0f00000000;
+    // BWD reload dQ SMEM tile -> %f_dq (q_tile_iter=0)
+    add.u32 %r0, %warp_id, 0;
+    cvt.u64.u32 %rd_dqs_row, %r0;
+    mul.lo.u64 %rd_dqs_row, %rd_dqs_row, 128;
+    add.u64 %rd_dqs_row, %rd_dqs_row, 22784;
+    add.u64 %rd_dqs_row, %shmem_base, %rd_dqs_row;
+    cvt.u64.u32 %rd_dqs_col, %lane;
+    shl.b64 %rd_dqs_col, %rd_dqs_col, 2;
+    add.u64 %rd_dqs_addr, %rd_dqs_row, %rd_dqs_col;
+    ld.shared.f32 %f_dq_0, [%rd_dqs_addr];
     // Tier C backward dS compute (q_tile_iter=0)
     add.u32 %r0, %warp_id, 0; // warp_row
     cvt.u64.u32 %warp_row, %r0;
+    add.u64 %rd39, %q_start, %warp_row;
+    setp.ge.u64 %p0, %rd39, %rd6;
+    @%p0 bra V2_BWD_ROW_STATS_ZERO_0;
     mul.lo.u64 %rd30, %batch_idx, %rd5;
     add.u64 %rd30, %rd30, %head_idx;
     mul.lo.u64 %rd30, %rd30, %rd6;
@@ -890,7 +1349,11 @@ V2_BWD_V_LOAD_SKIP:
     ld.global.f32 %row_max, [%rd31];
     add.u64 %rd31, %rd_bwd_row_sum, %rd30;
     ld.global.f32 %row_sum, [%rd31];
-    mov.f32 %f_rowsum_dP_P, 0f00000000;
+    bra V2_BWD_ROW_STATS_DONE_0;
+V2_BWD_ROW_STATS_ZERO_0:
+    mov.f32 %row_max, 0f7F800000;
+    mov.f32 %row_sum, 0f3F800000;
+V2_BWD_ROW_STATS_DONE_0:
 V2_BWD_DP_LOOP_0:
     mov.f32 %f_P, 0f00000000;  // S accumulator
     mul.lo.u64 %rd40, %warp_row, 64; // q row byte off
@@ -913,8 +1376,11 @@ V2_BWD_S_INNER_0:
     setp.lt.u32 %p0, %r0, 32;
     @%p0 bra V2_BWD_S_INNER_0;
     mul.f32 %f_P, %f_P, %scale;
-    cvt.u32.u64 %r1, %warp_row;
-    setp.gt.u32 %p1, %lane, %r1;
+    cvt.u64.u32 %rd42, %lane;
+    add.u64 %rd42, %rd42, %k_start;
+    setp.ge.u64 %p1, %rd42, %rd6;
+    setp.gt.u64 %p0, %rd42, %rd39;
+    or.pred %p1, %p1, %p0;
     add.u64 %rd_bw_q_global, %q_start, %warp_row;
     cvt.u64.u32 %rd_bw_k_global, %lane;
     add.u64 %rd_bw_k_global, %rd_bw_k_global, %k_start;
@@ -942,6 +1408,8 @@ V2_BWD_S_INNER_0:
     add.u64 %rd44, %rd44, 14592;  // + backward_p_offset
     add.u64 %rd44, %shmem_base, %rd44;
     st.shared.f32 [%rd44], %f_P;
+    setp.ge.u64 %p0, %rd39, %rd6;
+    @%p0 bra V2_BWD_DP_ZERO_0;
     mov.f32 %f_dP, 0f00000000;
     mul.lo.u64 %rd46, %batch_idx, %rd5;
     add.u64 %rd46, %rd46, %head_idx;
@@ -968,17 +1436,14 @@ V2_BWD_DP_INNER_0:
     add.u32 %r0, %r0, 1;
     setp.lt.u32 %p0, %r0, 32;
     @%p0 bra V2_BWD_DP_INNER_0;
-    fma.rn.f32 %f_rowsum_dP_P, %f_dP, %f_P, %f_rowsum_dP_P;
-    shfl.sync.bfly.b32 %f0, %f_rowsum_dP_P, 16, 31, 0xFFFFFFFF;
-    add.f32 %f_rowsum_dP_P, %f_rowsum_dP_P, %f0;
-    shfl.sync.bfly.b32 %f0, %f_rowsum_dP_P, 8, 31, 0xFFFFFFFF;
-    add.f32 %f_rowsum_dP_P, %f_rowsum_dP_P, %f0;
-    shfl.sync.bfly.b32 %f0, %f_rowsum_dP_P, 4, 31, 0xFFFFFFFF;
-    add.f32 %f_rowsum_dP_P, %f_rowsum_dP_P, %f0;
-    shfl.sync.bfly.b32 %f0, %f_rowsum_dP_P, 2, 31, 0xFFFFFFFF;
-    add.f32 %f_rowsum_dP_P, %f_rowsum_dP_P, %f0;
-    shfl.sync.bfly.b32 %f0, %f_rowsum_dP_P, 1, 31, 0xFFFFFFFF;
-    add.f32 %f_rowsum_dP_P, %f_rowsum_dP_P, %f0;
+    bra V2_BWD_DP_DONE_0;
+V2_BWD_DP_ZERO_0:
+    mov.f32 %f_dP, 0f00000000;
+V2_BWD_DP_DONE_0:
+    shl.b64 %rd45, %warp_row, 2;
+    add.u64 %rd45, %rd45, 45312;
+    add.u64 %rd45, %shmem_base, %rd45;
+    ld.shared.f32 %f_rowsum_dP_P, [%rd45];
     bar.sync 0;  // P tile visible to dv_accum
 V2_BWD_DS_0:
     sub.f32 %f0, %f_dP, %f_rowsum_dP_P;
@@ -996,6 +1461,10 @@ V2_BWD_DV_ACCUM_0:
     mov.u32 %r1, 0;   // Q-row counter (0..4)
 V2_BWD_DV_INNER_0:
     add.u32 %r2, %r1, 0;  // row_global
+    cvt.u64.u32 %rd39, %r2;
+    add.u64 %rd39, %rd39, %q_start;
+    setp.ge.u64 %p0, %rd39, %rd6;
+    @%p0 bra V2_BWD_DV_SKIP_ROW_0;
     cvt.u64.u32 %rd30, %r2;
     mul.lo.u64 %rd30, %rd30, 32;
     cvt.u64.u32 %rd31, %lane;
@@ -1094,6 +1563,12 @@ V2_BWD_DV_INNER_0:
     add.u32 %r1, %r1, 1;
     setp.lt.u32 %p0, %r1, 4;
     @%p0 bra V2_BWD_DV_INNER_0;
+    bra V2_BWD_DV_DONE_ROW_0;
+V2_BWD_DV_SKIP_ROW_0:
+    add.u32 %r1, %r1, 1;
+    setp.lt.u32 %p0, %r1, 4;
+    @%p0 bra V2_BWD_DV_INNER_0;
+V2_BWD_DV_DONE_ROW_0:
     bar.sync 0;  // dV updates visible across warps
     // Tier C backward dQ+dK accumulation (q_tile_iter=0)
 V2_BWD_DQ_ACCUM_0:
@@ -1229,10 +1704,22 @@ V2_BWD_DK_INNER_0:
     add.u64 %rd_dqs_addr, %rd_dqs_row, %rd_dqs_col;
     st.shared.f32 [%rd_dqs_addr], %f_dq_0;
     // ====== BWD q_tile_iter = 1 / 8 ======
-    mov.f32 %f_dq_0, 0f00000000;
+    // BWD reload dQ SMEM tile -> %f_dq (q_tile_iter=1)
+    add.u32 %r0, %warp_id, 4;
+    cvt.u64.u32 %rd_dqs_row, %r0;
+    mul.lo.u64 %rd_dqs_row, %rd_dqs_row, 128;
+    add.u64 %rd_dqs_row, %rd_dqs_row, 22784;
+    add.u64 %rd_dqs_row, %shmem_base, %rd_dqs_row;
+    cvt.u64.u32 %rd_dqs_col, %lane;
+    shl.b64 %rd_dqs_col, %rd_dqs_col, 2;
+    add.u64 %rd_dqs_addr, %rd_dqs_row, %rd_dqs_col;
+    ld.shared.f32 %f_dq_0, [%rd_dqs_addr];
     // Tier C backward dS compute (q_tile_iter=1)
     add.u32 %r0, %warp_id, 4; // warp_row
     cvt.u64.u32 %warp_row, %r0;
+    add.u64 %rd39, %q_start, %warp_row;
+    setp.ge.u64 %p0, %rd39, %rd6;
+    @%p0 bra V2_BWD_ROW_STATS_ZERO_1;
     mul.lo.u64 %rd30, %batch_idx, %rd5;
     add.u64 %rd30, %rd30, %head_idx;
     mul.lo.u64 %rd30, %rd30, %rd6;
@@ -1243,7 +1730,11 @@ V2_BWD_DK_INNER_0:
     ld.global.f32 %row_max, [%rd31];
     add.u64 %rd31, %rd_bwd_row_sum, %rd30;
     ld.global.f32 %row_sum, [%rd31];
-    mov.f32 %f_rowsum_dP_P, 0f00000000;
+    bra V2_BWD_ROW_STATS_DONE_1;
+V2_BWD_ROW_STATS_ZERO_1:
+    mov.f32 %row_max, 0f7F800000;
+    mov.f32 %row_sum, 0f3F800000;
+V2_BWD_ROW_STATS_DONE_1:
 V2_BWD_DP_LOOP_1:
     mov.f32 %f_P, 0f00000000;  // S accumulator
     mul.lo.u64 %rd40, %warp_row, 64; // q row byte off
@@ -1266,8 +1757,11 @@ V2_BWD_S_INNER_1:
     setp.lt.u32 %p0, %r0, 32;
     @%p0 bra V2_BWD_S_INNER_1;
     mul.f32 %f_P, %f_P, %scale;
-    cvt.u32.u64 %r1, %warp_row;
-    setp.gt.u32 %p1, %lane, %r1;
+    cvt.u64.u32 %rd42, %lane;
+    add.u64 %rd42, %rd42, %k_start;
+    setp.ge.u64 %p1, %rd42, %rd6;
+    setp.gt.u64 %p0, %rd42, %rd39;
+    or.pred %p1, %p1, %p0;
     add.u64 %rd_bw_q_global, %q_start, %warp_row;
     cvt.u64.u32 %rd_bw_k_global, %lane;
     add.u64 %rd_bw_k_global, %rd_bw_k_global, %k_start;
@@ -1295,6 +1789,8 @@ V2_BWD_S_INNER_1:
     add.u64 %rd44, %rd44, 14592;  // + backward_p_offset
     add.u64 %rd44, %shmem_base, %rd44;
     st.shared.f32 [%rd44], %f_P;
+    setp.ge.u64 %p0, %rd39, %rd6;
+    @%p0 bra V2_BWD_DP_ZERO_1;
     mov.f32 %f_dP, 0f00000000;
     mul.lo.u64 %rd46, %batch_idx, %rd5;
     add.u64 %rd46, %rd46, %head_idx;
@@ -1321,17 +1817,14 @@ V2_BWD_DP_INNER_1:
     add.u32 %r0, %r0, 1;
     setp.lt.u32 %p0, %r0, 32;
     @%p0 bra V2_BWD_DP_INNER_1;
-    fma.rn.f32 %f_rowsum_dP_P, %f_dP, %f_P, %f_rowsum_dP_P;
-    shfl.sync.bfly.b32 %f0, %f_rowsum_dP_P, 16, 31, 0xFFFFFFFF;
-    add.f32 %f_rowsum_dP_P, %f_rowsum_dP_P, %f0;
-    shfl.sync.bfly.b32 %f0, %f_rowsum_dP_P, 8, 31, 0xFFFFFFFF;
-    add.f32 %f_rowsum_dP_P, %f_rowsum_dP_P, %f0;
-    shfl.sync.bfly.b32 %f0, %f_rowsum_dP_P, 4, 31, 0xFFFFFFFF;
-    add.f32 %f_rowsum_dP_P, %f_rowsum_dP_P, %f0;
-    shfl.sync.bfly.b32 %f0, %f_rowsum_dP_P, 2, 31, 0xFFFFFFFF;
-    add.f32 %f_rowsum_dP_P, %f_rowsum_dP_P, %f0;
-    shfl.sync.bfly.b32 %f0, %f_rowsum_dP_P, 1, 31, 0xFFFFFFFF;
-    add.f32 %f_rowsum_dP_P, %f_rowsum_dP_P, %f0;
+    bra V2_BWD_DP_DONE_1;
+V2_BWD_DP_ZERO_1:
+    mov.f32 %f_dP, 0f00000000;
+V2_BWD_DP_DONE_1:
+    shl.b64 %rd45, %warp_row, 2;
+    add.u64 %rd45, %rd45, 45312;
+    add.u64 %rd45, %shmem_base, %rd45;
+    ld.shared.f32 %f_rowsum_dP_P, [%rd45];
     bar.sync 0;  // P tile visible to dv_accum
 V2_BWD_DS_1:
     sub.f32 %f0, %f_dP, %f_rowsum_dP_P;
@@ -1349,6 +1842,10 @@ V2_BWD_DV_ACCUM_1:
     mov.u32 %r1, 0;   // Q-row counter (0..4)
 V2_BWD_DV_INNER_1:
     add.u32 %r2, %r1, 4;  // row_global
+    cvt.u64.u32 %rd39, %r2;
+    add.u64 %rd39, %rd39, %q_start;
+    setp.ge.u64 %p0, %rd39, %rd6;
+    @%p0 bra V2_BWD_DV_SKIP_ROW_1;
     cvt.u64.u32 %rd30, %r2;
     mul.lo.u64 %rd30, %rd30, 32;
     cvt.u64.u32 %rd31, %lane;
@@ -1447,6 +1944,12 @@ V2_BWD_DV_INNER_1:
     add.u32 %r1, %r1, 1;
     setp.lt.u32 %p0, %r1, 4;
     @%p0 bra V2_BWD_DV_INNER_1;
+    bra V2_BWD_DV_DONE_ROW_1;
+V2_BWD_DV_SKIP_ROW_1:
+    add.u32 %r1, %r1, 1;
+    setp.lt.u32 %p0, %r1, 4;
+    @%p0 bra V2_BWD_DV_INNER_1;
+V2_BWD_DV_DONE_ROW_1:
     bar.sync 0;  // dV updates visible across warps
     // Tier C backward dQ+dK accumulation (q_tile_iter=1)
 V2_BWD_DQ_ACCUM_1:
@@ -1582,10 +2085,22 @@ V2_BWD_DK_INNER_1:
     add.u64 %rd_dqs_addr, %rd_dqs_row, %rd_dqs_col;
     st.shared.f32 [%rd_dqs_addr], %f_dq_0;
     // ====== BWD q_tile_iter = 2 / 8 ======
-    mov.f32 %f_dq_0, 0f00000000;
+    // BWD reload dQ SMEM tile -> %f_dq (q_tile_iter=2)
+    add.u32 %r0, %warp_id, 8;
+    cvt.u64.u32 %rd_dqs_row, %r0;
+    mul.lo.u64 %rd_dqs_row, %rd_dqs_row, 128;
+    add.u64 %rd_dqs_row, %rd_dqs_row, 22784;
+    add.u64 %rd_dqs_row, %shmem_base, %rd_dqs_row;
+    cvt.u64.u32 %rd_dqs_col, %lane;
+    shl.b64 %rd_dqs_col, %rd_dqs_col, 2;
+    add.u64 %rd_dqs_addr, %rd_dqs_row, %rd_dqs_col;
+    ld.shared.f32 %f_dq_0, [%rd_dqs_addr];
     // Tier C backward dS compute (q_tile_iter=2)
     add.u32 %r0, %warp_id, 8; // warp_row
     cvt.u64.u32 %warp_row, %r0;
+    add.u64 %rd39, %q_start, %warp_row;
+    setp.ge.u64 %p0, %rd39, %rd6;
+    @%p0 bra V2_BWD_ROW_STATS_ZERO_2;
     mul.lo.u64 %rd30, %batch_idx, %rd5;
     add.u64 %rd30, %rd30, %head_idx;
     mul.lo.u64 %rd30, %rd30, %rd6;
@@ -1596,7 +2111,11 @@ V2_BWD_DK_INNER_1:
     ld.global.f32 %row_max, [%rd31];
     add.u64 %rd31, %rd_bwd_row_sum, %rd30;
     ld.global.f32 %row_sum, [%rd31];
-    mov.f32 %f_rowsum_dP_P, 0f00000000;
+    bra V2_BWD_ROW_STATS_DONE_2;
+V2_BWD_ROW_STATS_ZERO_2:
+    mov.f32 %row_max, 0f7F800000;
+    mov.f32 %row_sum, 0f3F800000;
+V2_BWD_ROW_STATS_DONE_2:
 V2_BWD_DP_LOOP_2:
     mov.f32 %f_P, 0f00000000;  // S accumulator
     mul.lo.u64 %rd40, %warp_row, 64; // q row byte off
@@ -1619,8 +2138,11 @@ V2_BWD_S_INNER_2:
     setp.lt.u32 %p0, %r0, 32;
     @%p0 bra V2_BWD_S_INNER_2;
     mul.f32 %f_P, %f_P, %scale;
-    cvt.u32.u64 %r1, %warp_row;
-    setp.gt.u32 %p1, %lane, %r1;
+    cvt.u64.u32 %rd42, %lane;
+    add.u64 %rd42, %rd42, %k_start;
+    setp.ge.u64 %p1, %rd42, %rd6;
+    setp.gt.u64 %p0, %rd42, %rd39;
+    or.pred %p1, %p1, %p0;
     add.u64 %rd_bw_q_global, %q_start, %warp_row;
     cvt.u64.u32 %rd_bw_k_global, %lane;
     add.u64 %rd_bw_k_global, %rd_bw_k_global, %k_start;
@@ -1648,6 +2170,8 @@ V2_BWD_S_INNER_2:
     add.u64 %rd44, %rd44, 14592;  // + backward_p_offset
     add.u64 %rd44, %shmem_base, %rd44;
     st.shared.f32 [%rd44], %f_P;
+    setp.ge.u64 %p0, %rd39, %rd6;
+    @%p0 bra V2_BWD_DP_ZERO_2;
     mov.f32 %f_dP, 0f00000000;
     mul.lo.u64 %rd46, %batch_idx, %rd5;
     add.u64 %rd46, %rd46, %head_idx;
@@ -1674,17 +2198,14 @@ V2_BWD_DP_INNER_2:
     add.u32 %r0, %r0, 1;
     setp.lt.u32 %p0, %r0, 32;
     @%p0 bra V2_BWD_DP_INNER_2;
-    fma.rn.f32 %f_rowsum_dP_P, %f_dP, %f_P, %f_rowsum_dP_P;
-    shfl.sync.bfly.b32 %f0, %f_rowsum_dP_P, 16, 31, 0xFFFFFFFF;
-    add.f32 %f_rowsum_dP_P, %f_rowsum_dP_P, %f0;
-    shfl.sync.bfly.b32 %f0, %f_rowsum_dP_P, 8, 31, 0xFFFFFFFF;
-    add.f32 %f_rowsum_dP_P, %f_rowsum_dP_P, %f0;
-    shfl.sync.bfly.b32 %f0, %f_rowsum_dP_P, 4, 31, 0xFFFFFFFF;
-    add.f32 %f_rowsum_dP_P, %f_rowsum_dP_P, %f0;
-    shfl.sync.bfly.b32 %f0, %f_rowsum_dP_P, 2, 31, 0xFFFFFFFF;
-    add.f32 %f_rowsum_dP_P, %f_rowsum_dP_P, %f0;
-    shfl.sync.bfly.b32 %f0, %f_rowsum_dP_P, 1, 31, 0xFFFFFFFF;
-    add.f32 %f_rowsum_dP_P, %f_rowsum_dP_P, %f0;
+    bra V2_BWD_DP_DONE_2;
+V2_BWD_DP_ZERO_2:
+    mov.f32 %f_dP, 0f00000000;
+V2_BWD_DP_DONE_2:
+    shl.b64 %rd45, %warp_row, 2;
+    add.u64 %rd45, %rd45, 45312;
+    add.u64 %rd45, %shmem_base, %rd45;
+    ld.shared.f32 %f_rowsum_dP_P, [%rd45];
     bar.sync 0;  // P tile visible to dv_accum
 V2_BWD_DS_2:
     sub.f32 %f0, %f_dP, %f_rowsum_dP_P;
@@ -1702,6 +2223,10 @@ V2_BWD_DV_ACCUM_2:
     mov.u32 %r1, 0;   // Q-row counter (0..4)
 V2_BWD_DV_INNER_2:
     add.u32 %r2, %r1, 8;  // row_global
+    cvt.u64.u32 %rd39, %r2;
+    add.u64 %rd39, %rd39, %q_start;
+    setp.ge.u64 %p0, %rd39, %rd6;
+    @%p0 bra V2_BWD_DV_SKIP_ROW_2;
     cvt.u64.u32 %rd30, %r2;
     mul.lo.u64 %rd30, %rd30, 32;
     cvt.u64.u32 %rd31, %lane;
@@ -1800,6 +2325,12 @@ V2_BWD_DV_INNER_2:
     add.u32 %r1, %r1, 1;
     setp.lt.u32 %p0, %r1, 4;
     @%p0 bra V2_BWD_DV_INNER_2;
+    bra V2_BWD_DV_DONE_ROW_2;
+V2_BWD_DV_SKIP_ROW_2:
+    add.u32 %r1, %r1, 1;
+    setp.lt.u32 %p0, %r1, 4;
+    @%p0 bra V2_BWD_DV_INNER_2;
+V2_BWD_DV_DONE_ROW_2:
     bar.sync 0;  // dV updates visible across warps
     // Tier C backward dQ+dK accumulation (q_tile_iter=2)
 V2_BWD_DQ_ACCUM_2:
@@ -1935,10 +2466,22 @@ V2_BWD_DK_INNER_2:
     add.u64 %rd_dqs_addr, %rd_dqs_row, %rd_dqs_col;
     st.shared.f32 [%rd_dqs_addr], %f_dq_0;
     // ====== BWD q_tile_iter = 3 / 8 ======
-    mov.f32 %f_dq_0, 0f00000000;
+    // BWD reload dQ SMEM tile -> %f_dq (q_tile_iter=3)
+    add.u32 %r0, %warp_id, 12;
+    cvt.u64.u32 %rd_dqs_row, %r0;
+    mul.lo.u64 %rd_dqs_row, %rd_dqs_row, 128;
+    add.u64 %rd_dqs_row, %rd_dqs_row, 22784;
+    add.u64 %rd_dqs_row, %shmem_base, %rd_dqs_row;
+    cvt.u64.u32 %rd_dqs_col, %lane;
+    shl.b64 %rd_dqs_col, %rd_dqs_col, 2;
+    add.u64 %rd_dqs_addr, %rd_dqs_row, %rd_dqs_col;
+    ld.shared.f32 %f_dq_0, [%rd_dqs_addr];
     // Tier C backward dS compute (q_tile_iter=3)
     add.u32 %r0, %warp_id, 12; // warp_row
     cvt.u64.u32 %warp_row, %r0;
+    add.u64 %rd39, %q_start, %warp_row;
+    setp.ge.u64 %p0, %rd39, %rd6;
+    @%p0 bra V2_BWD_ROW_STATS_ZERO_3;
     mul.lo.u64 %rd30, %batch_idx, %rd5;
     add.u64 %rd30, %rd30, %head_idx;
     mul.lo.u64 %rd30, %rd30, %rd6;
@@ -1949,7 +2492,11 @@ V2_BWD_DK_INNER_2:
     ld.global.f32 %row_max, [%rd31];
     add.u64 %rd31, %rd_bwd_row_sum, %rd30;
     ld.global.f32 %row_sum, [%rd31];
-    mov.f32 %f_rowsum_dP_P, 0f00000000;
+    bra V2_BWD_ROW_STATS_DONE_3;
+V2_BWD_ROW_STATS_ZERO_3:
+    mov.f32 %row_max, 0f7F800000;
+    mov.f32 %row_sum, 0f3F800000;
+V2_BWD_ROW_STATS_DONE_3:
 V2_BWD_DP_LOOP_3:
     mov.f32 %f_P, 0f00000000;  // S accumulator
     mul.lo.u64 %rd40, %warp_row, 64; // q row byte off
@@ -1972,8 +2519,11 @@ V2_BWD_S_INNER_3:
     setp.lt.u32 %p0, %r0, 32;
     @%p0 bra V2_BWD_S_INNER_3;
     mul.f32 %f_P, %f_P, %scale;
-    cvt.u32.u64 %r1, %warp_row;
-    setp.gt.u32 %p1, %lane, %r1;
+    cvt.u64.u32 %rd42, %lane;
+    add.u64 %rd42, %rd42, %k_start;
+    setp.ge.u64 %p1, %rd42, %rd6;
+    setp.gt.u64 %p0, %rd42, %rd39;
+    or.pred %p1, %p1, %p0;
     add.u64 %rd_bw_q_global, %q_start, %warp_row;
     cvt.u64.u32 %rd_bw_k_global, %lane;
     add.u64 %rd_bw_k_global, %rd_bw_k_global, %k_start;
@@ -2001,6 +2551,8 @@ V2_BWD_S_INNER_3:
     add.u64 %rd44, %rd44, 14592;  // + backward_p_offset
     add.u64 %rd44, %shmem_base, %rd44;
     st.shared.f32 [%rd44], %f_P;
+    setp.ge.u64 %p0, %rd39, %rd6;
+    @%p0 bra V2_BWD_DP_ZERO_3;
     mov.f32 %f_dP, 0f00000000;
     mul.lo.u64 %rd46, %batch_idx, %rd5;
     add.u64 %rd46, %rd46, %head_idx;
@@ -2027,17 +2579,14 @@ V2_BWD_DP_INNER_3:
     add.u32 %r0, %r0, 1;
     setp.lt.u32 %p0, %r0, 32;
     @%p0 bra V2_BWD_DP_INNER_3;
-    fma.rn.f32 %f_rowsum_dP_P, %f_dP, %f_P, %f_rowsum_dP_P;
-    shfl.sync.bfly.b32 %f0, %f_rowsum_dP_P, 16, 31, 0xFFFFFFFF;
-    add.f32 %f_rowsum_dP_P, %f_rowsum_dP_P, %f0;
-    shfl.sync.bfly.b32 %f0, %f_rowsum_dP_P, 8, 31, 0xFFFFFFFF;
-    add.f32 %f_rowsum_dP_P, %f_rowsum_dP_P, %f0;
-    shfl.sync.bfly.b32 %f0, %f_rowsum_dP_P, 4, 31, 0xFFFFFFFF;
-    add.f32 %f_rowsum_dP_P, %f_rowsum_dP_P, %f0;
-    shfl.sync.bfly.b32 %f0, %f_rowsum_dP_P, 2, 31, 0xFFFFFFFF;
-    add.f32 %f_rowsum_dP_P, %f_rowsum_dP_P, %f0;
-    shfl.sync.bfly.b32 %f0, %f_rowsum_dP_P, 1, 31, 0xFFFFFFFF;
-    add.f32 %f_rowsum_dP_P, %f_rowsum_dP_P, %f0;
+    bra V2_BWD_DP_DONE_3;
+V2_BWD_DP_ZERO_3:
+    mov.f32 %f_dP, 0f00000000;
+V2_BWD_DP_DONE_3:
+    shl.b64 %rd45, %warp_row, 2;
+    add.u64 %rd45, %rd45, 45312;
+    add.u64 %rd45, %shmem_base, %rd45;
+    ld.shared.f32 %f_rowsum_dP_P, [%rd45];
     bar.sync 0;  // P tile visible to dv_accum
 V2_BWD_DS_3:
     sub.f32 %f0, %f_dP, %f_rowsum_dP_P;
@@ -2055,6 +2604,10 @@ V2_BWD_DV_ACCUM_3:
     mov.u32 %r1, 0;   // Q-row counter (0..4)
 V2_BWD_DV_INNER_3:
     add.u32 %r2, %r1, 12;  // row_global
+    cvt.u64.u32 %rd39, %r2;
+    add.u64 %rd39, %rd39, %q_start;
+    setp.ge.u64 %p0, %rd39, %rd6;
+    @%p0 bra V2_BWD_DV_SKIP_ROW_3;
     cvt.u64.u32 %rd30, %r2;
     mul.lo.u64 %rd30, %rd30, 32;
     cvt.u64.u32 %rd31, %lane;
@@ -2153,6 +2706,12 @@ V2_BWD_DV_INNER_3:
     add.u32 %r1, %r1, 1;
     setp.lt.u32 %p0, %r1, 4;
     @%p0 bra V2_BWD_DV_INNER_3;
+    bra V2_BWD_DV_DONE_ROW_3;
+V2_BWD_DV_SKIP_ROW_3:
+    add.u32 %r1, %r1, 1;
+    setp.lt.u32 %p0, %r1, 4;
+    @%p0 bra V2_BWD_DV_INNER_3;
+V2_BWD_DV_DONE_ROW_3:
     bar.sync 0;  // dV updates visible across warps
     // Tier C backward dQ+dK accumulation (q_tile_iter=3)
 V2_BWD_DQ_ACCUM_3:
@@ -2288,10 +2847,22 @@ V2_BWD_DK_INNER_3:
     add.u64 %rd_dqs_addr, %rd_dqs_row, %rd_dqs_col;
     st.shared.f32 [%rd_dqs_addr], %f_dq_0;
     // ====== BWD q_tile_iter = 4 / 8 ======
-    mov.f32 %f_dq_0, 0f00000000;
+    // BWD reload dQ SMEM tile -> %f_dq (q_tile_iter=4)
+    add.u32 %r0, %warp_id, 16;
+    cvt.u64.u32 %rd_dqs_row, %r0;
+    mul.lo.u64 %rd_dqs_row, %rd_dqs_row, 128;
+    add.u64 %rd_dqs_row, %rd_dqs_row, 22784;
+    add.u64 %rd_dqs_row, %shmem_base, %rd_dqs_row;
+    cvt.u64.u32 %rd_dqs_col, %lane;
+    shl.b64 %rd_dqs_col, %rd_dqs_col, 2;
+    add.u64 %rd_dqs_addr, %rd_dqs_row, %rd_dqs_col;
+    ld.shared.f32 %f_dq_0, [%rd_dqs_addr];
     // Tier C backward dS compute (q_tile_iter=4)
     add.u32 %r0, %warp_id, 16; // warp_row
     cvt.u64.u32 %warp_row, %r0;
+    add.u64 %rd39, %q_start, %warp_row;
+    setp.ge.u64 %p0, %rd39, %rd6;
+    @%p0 bra V2_BWD_ROW_STATS_ZERO_4;
     mul.lo.u64 %rd30, %batch_idx, %rd5;
     add.u64 %rd30, %rd30, %head_idx;
     mul.lo.u64 %rd30, %rd30, %rd6;
@@ -2302,7 +2873,11 @@ V2_BWD_DK_INNER_3:
     ld.global.f32 %row_max, [%rd31];
     add.u64 %rd31, %rd_bwd_row_sum, %rd30;
     ld.global.f32 %row_sum, [%rd31];
-    mov.f32 %f_rowsum_dP_P, 0f00000000;
+    bra V2_BWD_ROW_STATS_DONE_4;
+V2_BWD_ROW_STATS_ZERO_4:
+    mov.f32 %row_max, 0f7F800000;
+    mov.f32 %row_sum, 0f3F800000;
+V2_BWD_ROW_STATS_DONE_4:
 V2_BWD_DP_LOOP_4:
     mov.f32 %f_P, 0f00000000;  // S accumulator
     mul.lo.u64 %rd40, %warp_row, 64; // q row byte off
@@ -2325,8 +2900,11 @@ V2_BWD_S_INNER_4:
     setp.lt.u32 %p0, %r0, 32;
     @%p0 bra V2_BWD_S_INNER_4;
     mul.f32 %f_P, %f_P, %scale;
-    cvt.u32.u64 %r1, %warp_row;
-    setp.gt.u32 %p1, %lane, %r1;
+    cvt.u64.u32 %rd42, %lane;
+    add.u64 %rd42, %rd42, %k_start;
+    setp.ge.u64 %p1, %rd42, %rd6;
+    setp.gt.u64 %p0, %rd42, %rd39;
+    or.pred %p1, %p1, %p0;
     add.u64 %rd_bw_q_global, %q_start, %warp_row;
     cvt.u64.u32 %rd_bw_k_global, %lane;
     add.u64 %rd_bw_k_global, %rd_bw_k_global, %k_start;
@@ -2354,6 +2932,8 @@ V2_BWD_S_INNER_4:
     add.u64 %rd44, %rd44, 14592;  // + backward_p_offset
     add.u64 %rd44, %shmem_base, %rd44;
     st.shared.f32 [%rd44], %f_P;
+    setp.ge.u64 %p0, %rd39, %rd6;
+    @%p0 bra V2_BWD_DP_ZERO_4;
     mov.f32 %f_dP, 0f00000000;
     mul.lo.u64 %rd46, %batch_idx, %rd5;
     add.u64 %rd46, %rd46, %head_idx;
@@ -2380,17 +2960,14 @@ V2_BWD_DP_INNER_4:
     add.u32 %r0, %r0, 1;
     setp.lt.u32 %p0, %r0, 32;
     @%p0 bra V2_BWD_DP_INNER_4;
-    fma.rn.f32 %f_rowsum_dP_P, %f_dP, %f_P, %f_rowsum_dP_P;
-    shfl.sync.bfly.b32 %f0, %f_rowsum_dP_P, 16, 31, 0xFFFFFFFF;
-    add.f32 %f_rowsum_dP_P, %f_rowsum_dP_P, %f0;
-    shfl.sync.bfly.b32 %f0, %f_rowsum_dP_P, 8, 31, 0xFFFFFFFF;
-    add.f32 %f_rowsum_dP_P, %f_rowsum_dP_P, %f0;
-    shfl.sync.bfly.b32 %f0, %f_rowsum_dP_P, 4, 31, 0xFFFFFFFF;
-    add.f32 %f_rowsum_dP_P, %f_rowsum_dP_P, %f0;
-    shfl.sync.bfly.b32 %f0, %f_rowsum_dP_P, 2, 31, 0xFFFFFFFF;
-    add.f32 %f_rowsum_dP_P, %f_rowsum_dP_P, %f0;
-    shfl.sync.bfly.b32 %f0, %f_rowsum_dP_P, 1, 31, 0xFFFFFFFF;
-    add.f32 %f_rowsum_dP_P, %f_rowsum_dP_P, %f0;
+    bra V2_BWD_DP_DONE_4;
+V2_BWD_DP_ZERO_4:
+    mov.f32 %f_dP, 0f00000000;
+V2_BWD_DP_DONE_4:
+    shl.b64 %rd45, %warp_row, 2;
+    add.u64 %rd45, %rd45, 45312;
+    add.u64 %rd45, %shmem_base, %rd45;
+    ld.shared.f32 %f_rowsum_dP_P, [%rd45];
     bar.sync 0;  // P tile visible to dv_accum
 V2_BWD_DS_4:
     sub.f32 %f0, %f_dP, %f_rowsum_dP_P;
@@ -2408,6 +2985,10 @@ V2_BWD_DV_ACCUM_4:
     mov.u32 %r1, 0;   // Q-row counter (0..4)
 V2_BWD_DV_INNER_4:
     add.u32 %r2, %r1, 16;  // row_global
+    cvt.u64.u32 %rd39, %r2;
+    add.u64 %rd39, %rd39, %q_start;
+    setp.ge.u64 %p0, %rd39, %rd6;
+    @%p0 bra V2_BWD_DV_SKIP_ROW_4;
     cvt.u64.u32 %rd30, %r2;
     mul.lo.u64 %rd30, %rd30, 32;
     cvt.u64.u32 %rd31, %lane;
@@ -2506,6 +3087,12 @@ V2_BWD_DV_INNER_4:
     add.u32 %r1, %r1, 1;
     setp.lt.u32 %p0, %r1, 4;
     @%p0 bra V2_BWD_DV_INNER_4;
+    bra V2_BWD_DV_DONE_ROW_4;
+V2_BWD_DV_SKIP_ROW_4:
+    add.u32 %r1, %r1, 1;
+    setp.lt.u32 %p0, %r1, 4;
+    @%p0 bra V2_BWD_DV_INNER_4;
+V2_BWD_DV_DONE_ROW_4:
     bar.sync 0;  // dV updates visible across warps
     // Tier C backward dQ+dK accumulation (q_tile_iter=4)
 V2_BWD_DQ_ACCUM_4:
@@ -2641,10 +3228,22 @@ V2_BWD_DK_INNER_4:
     add.u64 %rd_dqs_addr, %rd_dqs_row, %rd_dqs_col;
     st.shared.f32 [%rd_dqs_addr], %f_dq_0;
     // ====== BWD q_tile_iter = 5 / 8 ======
-    mov.f32 %f_dq_0, 0f00000000;
+    // BWD reload dQ SMEM tile -> %f_dq (q_tile_iter=5)
+    add.u32 %r0, %warp_id, 20;
+    cvt.u64.u32 %rd_dqs_row, %r0;
+    mul.lo.u64 %rd_dqs_row, %rd_dqs_row, 128;
+    add.u64 %rd_dqs_row, %rd_dqs_row, 22784;
+    add.u64 %rd_dqs_row, %shmem_base, %rd_dqs_row;
+    cvt.u64.u32 %rd_dqs_col, %lane;
+    shl.b64 %rd_dqs_col, %rd_dqs_col, 2;
+    add.u64 %rd_dqs_addr, %rd_dqs_row, %rd_dqs_col;
+    ld.shared.f32 %f_dq_0, [%rd_dqs_addr];
     // Tier C backward dS compute (q_tile_iter=5)
     add.u32 %r0, %warp_id, 20; // warp_row
     cvt.u64.u32 %warp_row, %r0;
+    add.u64 %rd39, %q_start, %warp_row;
+    setp.ge.u64 %p0, %rd39, %rd6;
+    @%p0 bra V2_BWD_ROW_STATS_ZERO_5;
     mul.lo.u64 %rd30, %batch_idx, %rd5;
     add.u64 %rd30, %rd30, %head_idx;
     mul.lo.u64 %rd30, %rd30, %rd6;
@@ -2655,7 +3254,11 @@ V2_BWD_DK_INNER_4:
     ld.global.f32 %row_max, [%rd31];
     add.u64 %rd31, %rd_bwd_row_sum, %rd30;
     ld.global.f32 %row_sum, [%rd31];
-    mov.f32 %f_rowsum_dP_P, 0f00000000;
+    bra V2_BWD_ROW_STATS_DONE_5;
+V2_BWD_ROW_STATS_ZERO_5:
+    mov.f32 %row_max, 0f7F800000;
+    mov.f32 %row_sum, 0f3F800000;
+V2_BWD_ROW_STATS_DONE_5:
 V2_BWD_DP_LOOP_5:
     mov.f32 %f_P, 0f00000000;  // S accumulator
     mul.lo.u64 %rd40, %warp_row, 64; // q row byte off
@@ -2678,8 +3281,11 @@ V2_BWD_S_INNER_5:
     setp.lt.u32 %p0, %r0, 32;
     @%p0 bra V2_BWD_S_INNER_5;
     mul.f32 %f_P, %f_P, %scale;
-    cvt.u32.u64 %r1, %warp_row;
-    setp.gt.u32 %p1, %lane, %r1;
+    cvt.u64.u32 %rd42, %lane;
+    add.u64 %rd42, %rd42, %k_start;
+    setp.ge.u64 %p1, %rd42, %rd6;
+    setp.gt.u64 %p0, %rd42, %rd39;
+    or.pred %p1, %p1, %p0;
     add.u64 %rd_bw_q_global, %q_start, %warp_row;
     cvt.u64.u32 %rd_bw_k_global, %lane;
     add.u64 %rd_bw_k_global, %rd_bw_k_global, %k_start;
@@ -2707,6 +3313,8 @@ V2_BWD_S_INNER_5:
     add.u64 %rd44, %rd44, 14592;  // + backward_p_offset
     add.u64 %rd44, %shmem_base, %rd44;
     st.shared.f32 [%rd44], %f_P;
+    setp.ge.u64 %p0, %rd39, %rd6;
+    @%p0 bra V2_BWD_DP_ZERO_5;
     mov.f32 %f_dP, 0f00000000;
     mul.lo.u64 %rd46, %batch_idx, %rd5;
     add.u64 %rd46, %rd46, %head_idx;
@@ -2733,17 +3341,14 @@ V2_BWD_DP_INNER_5:
     add.u32 %r0, %r0, 1;
     setp.lt.u32 %p0, %r0, 32;
     @%p0 bra V2_BWD_DP_INNER_5;
-    fma.rn.f32 %f_rowsum_dP_P, %f_dP, %f_P, %f_rowsum_dP_P;
-    shfl.sync.bfly.b32 %f0, %f_rowsum_dP_P, 16, 31, 0xFFFFFFFF;
-    add.f32 %f_rowsum_dP_P, %f_rowsum_dP_P, %f0;
-    shfl.sync.bfly.b32 %f0, %f_rowsum_dP_P, 8, 31, 0xFFFFFFFF;
-    add.f32 %f_rowsum_dP_P, %f_rowsum_dP_P, %f0;
-    shfl.sync.bfly.b32 %f0, %f_rowsum_dP_P, 4, 31, 0xFFFFFFFF;
-    add.f32 %f_rowsum_dP_P, %f_rowsum_dP_P, %f0;
-    shfl.sync.bfly.b32 %f0, %f_rowsum_dP_P, 2, 31, 0xFFFFFFFF;
-    add.f32 %f_rowsum_dP_P, %f_rowsum_dP_P, %f0;
-    shfl.sync.bfly.b32 %f0, %f_rowsum_dP_P, 1, 31, 0xFFFFFFFF;
-    add.f32 %f_rowsum_dP_P, %f_rowsum_dP_P, %f0;
+    bra V2_BWD_DP_DONE_5;
+V2_BWD_DP_ZERO_5:
+    mov.f32 %f_dP, 0f00000000;
+V2_BWD_DP_DONE_5:
+    shl.b64 %rd45, %warp_row, 2;
+    add.u64 %rd45, %rd45, 45312;
+    add.u64 %rd45, %shmem_base, %rd45;
+    ld.shared.f32 %f_rowsum_dP_P, [%rd45];
     bar.sync 0;  // P tile visible to dv_accum
 V2_BWD_DS_5:
     sub.f32 %f0, %f_dP, %f_rowsum_dP_P;
@@ -2761,6 +3366,10 @@ V2_BWD_DV_ACCUM_5:
     mov.u32 %r1, 0;   // Q-row counter (0..4)
 V2_BWD_DV_INNER_5:
     add.u32 %r2, %r1, 20;  // row_global
+    cvt.u64.u32 %rd39, %r2;
+    add.u64 %rd39, %rd39, %q_start;
+    setp.ge.u64 %p0, %rd39, %rd6;
+    @%p0 bra V2_BWD_DV_SKIP_ROW_5;
     cvt.u64.u32 %rd30, %r2;
     mul.lo.u64 %rd30, %rd30, 32;
     cvt.u64.u32 %rd31, %lane;
@@ -2859,6 +3468,12 @@ V2_BWD_DV_INNER_5:
     add.u32 %r1, %r1, 1;
     setp.lt.u32 %p0, %r1, 4;
     @%p0 bra V2_BWD_DV_INNER_5;
+    bra V2_BWD_DV_DONE_ROW_5;
+V2_BWD_DV_SKIP_ROW_5:
+    add.u32 %r1, %r1, 1;
+    setp.lt.u32 %p0, %r1, 4;
+    @%p0 bra V2_BWD_DV_INNER_5;
+V2_BWD_DV_DONE_ROW_5:
     bar.sync 0;  // dV updates visible across warps
     // Tier C backward dQ+dK accumulation (q_tile_iter=5)
 V2_BWD_DQ_ACCUM_5:
@@ -2994,10 +3609,22 @@ V2_BWD_DK_INNER_5:
     add.u64 %rd_dqs_addr, %rd_dqs_row, %rd_dqs_col;
     st.shared.f32 [%rd_dqs_addr], %f_dq_0;
     // ====== BWD q_tile_iter = 6 / 8 ======
-    mov.f32 %f_dq_0, 0f00000000;
+    // BWD reload dQ SMEM tile -> %f_dq (q_tile_iter=6)
+    add.u32 %r0, %warp_id, 24;
+    cvt.u64.u32 %rd_dqs_row, %r0;
+    mul.lo.u64 %rd_dqs_row, %rd_dqs_row, 128;
+    add.u64 %rd_dqs_row, %rd_dqs_row, 22784;
+    add.u64 %rd_dqs_row, %shmem_base, %rd_dqs_row;
+    cvt.u64.u32 %rd_dqs_col, %lane;
+    shl.b64 %rd_dqs_col, %rd_dqs_col, 2;
+    add.u64 %rd_dqs_addr, %rd_dqs_row, %rd_dqs_col;
+    ld.shared.f32 %f_dq_0, [%rd_dqs_addr];
     // Tier C backward dS compute (q_tile_iter=6)
     add.u32 %r0, %warp_id, 24; // warp_row
     cvt.u64.u32 %warp_row, %r0;
+    add.u64 %rd39, %q_start, %warp_row;
+    setp.ge.u64 %p0, %rd39, %rd6;
+    @%p0 bra V2_BWD_ROW_STATS_ZERO_6;
     mul.lo.u64 %rd30, %batch_idx, %rd5;
     add.u64 %rd30, %rd30, %head_idx;
     mul.lo.u64 %rd30, %rd30, %rd6;
@@ -3008,7 +3635,11 @@ V2_BWD_DK_INNER_5:
     ld.global.f32 %row_max, [%rd31];
     add.u64 %rd31, %rd_bwd_row_sum, %rd30;
     ld.global.f32 %row_sum, [%rd31];
-    mov.f32 %f_rowsum_dP_P, 0f00000000;
+    bra V2_BWD_ROW_STATS_DONE_6;
+V2_BWD_ROW_STATS_ZERO_6:
+    mov.f32 %row_max, 0f7F800000;
+    mov.f32 %row_sum, 0f3F800000;
+V2_BWD_ROW_STATS_DONE_6:
 V2_BWD_DP_LOOP_6:
     mov.f32 %f_P, 0f00000000;  // S accumulator
     mul.lo.u64 %rd40, %warp_row, 64; // q row byte off
@@ -3031,8 +3662,11 @@ V2_BWD_S_INNER_6:
     setp.lt.u32 %p0, %r0, 32;
     @%p0 bra V2_BWD_S_INNER_6;
     mul.f32 %f_P, %f_P, %scale;
-    cvt.u32.u64 %r1, %warp_row;
-    setp.gt.u32 %p1, %lane, %r1;
+    cvt.u64.u32 %rd42, %lane;
+    add.u64 %rd42, %rd42, %k_start;
+    setp.ge.u64 %p1, %rd42, %rd6;
+    setp.gt.u64 %p0, %rd42, %rd39;
+    or.pred %p1, %p1, %p0;
     add.u64 %rd_bw_q_global, %q_start, %warp_row;
     cvt.u64.u32 %rd_bw_k_global, %lane;
     add.u64 %rd_bw_k_global, %rd_bw_k_global, %k_start;
@@ -3060,6 +3694,8 @@ V2_BWD_S_INNER_6:
     add.u64 %rd44, %rd44, 14592;  // + backward_p_offset
     add.u64 %rd44, %shmem_base, %rd44;
     st.shared.f32 [%rd44], %f_P;
+    setp.ge.u64 %p0, %rd39, %rd6;
+    @%p0 bra V2_BWD_DP_ZERO_6;
     mov.f32 %f_dP, 0f00000000;
     mul.lo.u64 %rd46, %batch_idx, %rd5;
     add.u64 %rd46, %rd46, %head_idx;
@@ -3086,17 +3722,14 @@ V2_BWD_DP_INNER_6:
     add.u32 %r0, %r0, 1;
     setp.lt.u32 %p0, %r0, 32;
     @%p0 bra V2_BWD_DP_INNER_6;
-    fma.rn.f32 %f_rowsum_dP_P, %f_dP, %f_P, %f_rowsum_dP_P;
-    shfl.sync.bfly.b32 %f0, %f_rowsum_dP_P, 16, 31, 0xFFFFFFFF;
-    add.f32 %f_rowsum_dP_P, %f_rowsum_dP_P, %f0;
-    shfl.sync.bfly.b32 %f0, %f_rowsum_dP_P, 8, 31, 0xFFFFFFFF;
-    add.f32 %f_rowsum_dP_P, %f_rowsum_dP_P, %f0;
-    shfl.sync.bfly.b32 %f0, %f_rowsum_dP_P, 4, 31, 0xFFFFFFFF;
-    add.f32 %f_rowsum_dP_P, %f_rowsum_dP_P, %f0;
-    shfl.sync.bfly.b32 %f0, %f_rowsum_dP_P, 2, 31, 0xFFFFFFFF;
-    add.f32 %f_rowsum_dP_P, %f_rowsum_dP_P, %f0;
-    shfl.sync.bfly.b32 %f0, %f_rowsum_dP_P, 1, 31, 0xFFFFFFFF;
-    add.f32 %f_rowsum_dP_P, %f_rowsum_dP_P, %f0;
+    bra V2_BWD_DP_DONE_6;
+V2_BWD_DP_ZERO_6:
+    mov.f32 %f_dP, 0f00000000;
+V2_BWD_DP_DONE_6:
+    shl.b64 %rd45, %warp_row, 2;
+    add.u64 %rd45, %rd45, 45312;
+    add.u64 %rd45, %shmem_base, %rd45;
+    ld.shared.f32 %f_rowsum_dP_P, [%rd45];
     bar.sync 0;  // P tile visible to dv_accum
 V2_BWD_DS_6:
     sub.f32 %f0, %f_dP, %f_rowsum_dP_P;
@@ -3114,6 +3747,10 @@ V2_BWD_DV_ACCUM_6:
     mov.u32 %r1, 0;   // Q-row counter (0..4)
 V2_BWD_DV_INNER_6:
     add.u32 %r2, %r1, 24;  // row_global
+    cvt.u64.u32 %rd39, %r2;
+    add.u64 %rd39, %rd39, %q_start;
+    setp.ge.u64 %p0, %rd39, %rd6;
+    @%p0 bra V2_BWD_DV_SKIP_ROW_6;
     cvt.u64.u32 %rd30, %r2;
     mul.lo.u64 %rd30, %rd30, 32;
     cvt.u64.u32 %rd31, %lane;
@@ -3212,6 +3849,12 @@ V2_BWD_DV_INNER_6:
     add.u32 %r1, %r1, 1;
     setp.lt.u32 %p0, %r1, 4;
     @%p0 bra V2_BWD_DV_INNER_6;
+    bra V2_BWD_DV_DONE_ROW_6;
+V2_BWD_DV_SKIP_ROW_6:
+    add.u32 %r1, %r1, 1;
+    setp.lt.u32 %p0, %r1, 4;
+    @%p0 bra V2_BWD_DV_INNER_6;
+V2_BWD_DV_DONE_ROW_6:
     bar.sync 0;  // dV updates visible across warps
     // Tier C backward dQ+dK accumulation (q_tile_iter=6)
 V2_BWD_DQ_ACCUM_6:
@@ -3347,10 +3990,22 @@ V2_BWD_DK_INNER_6:
     add.u64 %rd_dqs_addr, %rd_dqs_row, %rd_dqs_col;
     st.shared.f32 [%rd_dqs_addr], %f_dq_0;
     // ====== BWD q_tile_iter = 7 / 8 ======
-    mov.f32 %f_dq_0, 0f00000000;
+    // BWD reload dQ SMEM tile -> %f_dq (q_tile_iter=7)
+    add.u32 %r0, %warp_id, 28;
+    cvt.u64.u32 %rd_dqs_row, %r0;
+    mul.lo.u64 %rd_dqs_row, %rd_dqs_row, 128;
+    add.u64 %rd_dqs_row, %rd_dqs_row, 22784;
+    add.u64 %rd_dqs_row, %shmem_base, %rd_dqs_row;
+    cvt.u64.u32 %rd_dqs_col, %lane;
+    shl.b64 %rd_dqs_col, %rd_dqs_col, 2;
+    add.u64 %rd_dqs_addr, %rd_dqs_row, %rd_dqs_col;
+    ld.shared.f32 %f_dq_0, [%rd_dqs_addr];
     // Tier C backward dS compute (q_tile_iter=7)
     add.u32 %r0, %warp_id, 28; // warp_row
     cvt.u64.u32 %warp_row, %r0;
+    add.u64 %rd39, %q_start, %warp_row;
+    setp.ge.u64 %p0, %rd39, %rd6;
+    @%p0 bra V2_BWD_ROW_STATS_ZERO_7;
     mul.lo.u64 %rd30, %batch_idx, %rd5;
     add.u64 %rd30, %rd30, %head_idx;
     mul.lo.u64 %rd30, %rd30, %rd6;
@@ -3361,7 +4016,11 @@ V2_BWD_DK_INNER_6:
     ld.global.f32 %row_max, [%rd31];
     add.u64 %rd31, %rd_bwd_row_sum, %rd30;
     ld.global.f32 %row_sum, [%rd31];
-    mov.f32 %f_rowsum_dP_P, 0f00000000;
+    bra V2_BWD_ROW_STATS_DONE_7;
+V2_BWD_ROW_STATS_ZERO_7:
+    mov.f32 %row_max, 0f7F800000;
+    mov.f32 %row_sum, 0f3F800000;
+V2_BWD_ROW_STATS_DONE_7:
 V2_BWD_DP_LOOP_7:
     mov.f32 %f_P, 0f00000000;  // S accumulator
     mul.lo.u64 %rd40, %warp_row, 64; // q row byte off
@@ -3384,8 +4043,11 @@ V2_BWD_S_INNER_7:
     setp.lt.u32 %p0, %r0, 32;
     @%p0 bra V2_BWD_S_INNER_7;
     mul.f32 %f_P, %f_P, %scale;
-    cvt.u32.u64 %r1, %warp_row;
-    setp.gt.u32 %p1, %lane, %r1;
+    cvt.u64.u32 %rd42, %lane;
+    add.u64 %rd42, %rd42, %k_start;
+    setp.ge.u64 %p1, %rd42, %rd6;
+    setp.gt.u64 %p0, %rd42, %rd39;
+    or.pred %p1, %p1, %p0;
     add.u64 %rd_bw_q_global, %q_start, %warp_row;
     cvt.u64.u32 %rd_bw_k_global, %lane;
     add.u64 %rd_bw_k_global, %rd_bw_k_global, %k_start;
@@ -3413,6 +4075,8 @@ V2_BWD_S_INNER_7:
     add.u64 %rd44, %rd44, 14592;  // + backward_p_offset
     add.u64 %rd44, %shmem_base, %rd44;
     st.shared.f32 [%rd44], %f_P;
+    setp.ge.u64 %p0, %rd39, %rd6;
+    @%p0 bra V2_BWD_DP_ZERO_7;
     mov.f32 %f_dP, 0f00000000;
     mul.lo.u64 %rd46, %batch_idx, %rd5;
     add.u64 %rd46, %rd46, %head_idx;
@@ -3439,17 +4103,14 @@ V2_BWD_DP_INNER_7:
     add.u32 %r0, %r0, 1;
     setp.lt.u32 %p0, %r0, 32;
     @%p0 bra V2_BWD_DP_INNER_7;
-    fma.rn.f32 %f_rowsum_dP_P, %f_dP, %f_P, %f_rowsum_dP_P;
-    shfl.sync.bfly.b32 %f0, %f_rowsum_dP_P, 16, 31, 0xFFFFFFFF;
-    add.f32 %f_rowsum_dP_P, %f_rowsum_dP_P, %f0;
-    shfl.sync.bfly.b32 %f0, %f_rowsum_dP_P, 8, 31, 0xFFFFFFFF;
-    add.f32 %f_rowsum_dP_P, %f_rowsum_dP_P, %f0;
-    shfl.sync.bfly.b32 %f0, %f_rowsum_dP_P, 4, 31, 0xFFFFFFFF;
-    add.f32 %f_rowsum_dP_P, %f_rowsum_dP_P, %f0;
-    shfl.sync.bfly.b32 %f0, %f_rowsum_dP_P, 2, 31, 0xFFFFFFFF;
-    add.f32 %f_rowsum_dP_P, %f_rowsum_dP_P, %f0;
-    shfl.sync.bfly.b32 %f0, %f_rowsum_dP_P, 1, 31, 0xFFFFFFFF;
-    add.f32 %f_rowsum_dP_P, %f_rowsum_dP_P, %f0;
+    bra V2_BWD_DP_DONE_7;
+V2_BWD_DP_ZERO_7:
+    mov.f32 %f_dP, 0f00000000;
+V2_BWD_DP_DONE_7:
+    shl.b64 %rd45, %warp_row, 2;
+    add.u64 %rd45, %rd45, 45312;
+    add.u64 %rd45, %shmem_base, %rd45;
+    ld.shared.f32 %f_rowsum_dP_P, [%rd45];
     bar.sync 0;  // P tile visible to dv_accum
 V2_BWD_DS_7:
     sub.f32 %f0, %f_dP, %f_rowsum_dP_P;
@@ -3467,6 +4128,10 @@ V2_BWD_DV_ACCUM_7:
     mov.u32 %r1, 0;   // Q-row counter (0..4)
 V2_BWD_DV_INNER_7:
     add.u32 %r2, %r1, 28;  // row_global
+    cvt.u64.u32 %rd39, %r2;
+    add.u64 %rd39, %rd39, %q_start;
+    setp.ge.u64 %p0, %rd39, %rd6;
+    @%p0 bra V2_BWD_DV_SKIP_ROW_7;
     cvt.u64.u32 %rd30, %r2;
     mul.lo.u64 %rd30, %rd30, 32;
     cvt.u64.u32 %rd31, %lane;
@@ -3565,6 +4230,12 @@ V2_BWD_DV_INNER_7:
     add.u32 %r1, %r1, 1;
     setp.lt.u32 %p0, %r1, 4;
     @%p0 bra V2_BWD_DV_INNER_7;
+    bra V2_BWD_DV_DONE_ROW_7;
+V2_BWD_DV_SKIP_ROW_7:
+    add.u32 %r1, %r1, 1;
+    setp.lt.u32 %p0, %r1, 4;
+    @%p0 bra V2_BWD_DV_INNER_7;
+V2_BWD_DV_DONE_ROW_7:
     bar.sync 0;  // dV updates visible across warps
     // Tier C backward dQ+dK accumulation (q_tile_iter=7)
 V2_BWD_DQ_ACCUM_7:
@@ -3699,7 +4370,288 @@ V2_BWD_DK_INNER_7:
     shl.b64 %rd_dqs_col, %rd_dqs_col, 2;
     add.u64 %rd_dqs_addr, %rd_dqs_row, %rd_dqs_col;
     st.shared.f32 [%rd_dqs_addr], %f_dq_0;
-    bar.sync 0;  // dQ SMEM tile complete
+    // Tier C backward finalize -- DK/DV f32-scratch accumulate (q_tile_iter=0)
+    // -- DK f32-scratch RMW via [dk_scratch_ptr] (coop SMEM->HBM) --
+    setp.eq.u64 %p0, %rd_bwd_dk_scratch, 0;
+    @%p0 bra V2_BWD_STORE_DK_SKIP_0;
+    mul.lo.u64 %rd_dk_base, %batch_idx, %rd5;
+    add.u64 %rd_dk_base, %rd_dk_base, %head_idx;
+    mul.lo.u64 %rd_dk_base, %rd_dk_base, %rd6;
+    add.u64 %rd_dk_base, %rd_dk_base, %k_start;
+    mul.lo.u64 %rd_dk_base, %rd_dk_base, %rd7;
+    shl.b64 %rd_dk_base, %rd_dk_base, 2;
+    add.u64 %rd_dk_base, %rd_bwd_dk_scratch, %rd_dk_base;
+    cvt.u64.u32 %rd_dk_idx, %tid_x;
+    setp.lt.u64 %p_dk, %rd_dk_idx, 1024;
+    div.u64 %rd42, %rd_dk_idx, %rd7;
+    add.u64 %rd43, %rd42, %k_start;
+    setp.lt.u64 %p0, %rd43, %rd6;
+    and.pred %p_dk, %p_dk, %p0;
+    shl.b64 %rd_dk_smem, %rd_dk_idx, 2;
+    add.u64 %rd_dk_smem, %rd_dk_smem, 30976;
+    add.u64 %rd_dk_smem, %shmem_base, %rd_dk_smem;
+    @%p_dk ld.shared.f32 %f_dk_tmp, [%rd_dk_smem];
+    shl.b64 %rd_dk_hbm, %rd_dk_idx, 2;
+    add.u64 %rd_dk_hbm, %rd_dk_base, %rd_dk_hbm;
+    @%p_dk ld.global.f32 %f0, [%rd_dk_hbm];
+    @%p_dk add.f32 %f_dk_tmp, %f_dk_tmp, %f0;
+    @%p_dk st.global.f32 [%rd_dk_hbm], %f_dk_tmp;
+    cvt.u64.u32 %rd_dk_idx, %tid_x;
+    add.u64 %rd_dk_idx, %rd_dk_idx, 128;
+    setp.lt.u64 %p_dk, %rd_dk_idx, 1024;
+    div.u64 %rd42, %rd_dk_idx, %rd7;
+    add.u64 %rd43, %rd42, %k_start;
+    setp.lt.u64 %p0, %rd43, %rd6;
+    and.pred %p_dk, %p_dk, %p0;
+    shl.b64 %rd_dk_smem, %rd_dk_idx, 2;
+    add.u64 %rd_dk_smem, %rd_dk_smem, 30976;
+    add.u64 %rd_dk_smem, %shmem_base, %rd_dk_smem;
+    @%p_dk ld.shared.f32 %f_dk_tmp, [%rd_dk_smem];
+    shl.b64 %rd_dk_hbm, %rd_dk_idx, 2;
+    add.u64 %rd_dk_hbm, %rd_dk_base, %rd_dk_hbm;
+    @%p_dk ld.global.f32 %f0, [%rd_dk_hbm];
+    @%p_dk add.f32 %f_dk_tmp, %f_dk_tmp, %f0;
+    @%p_dk st.global.f32 [%rd_dk_hbm], %f_dk_tmp;
+    cvt.u64.u32 %rd_dk_idx, %tid_x;
+    add.u64 %rd_dk_idx, %rd_dk_idx, 256;
+    setp.lt.u64 %p_dk, %rd_dk_idx, 1024;
+    div.u64 %rd42, %rd_dk_idx, %rd7;
+    add.u64 %rd43, %rd42, %k_start;
+    setp.lt.u64 %p0, %rd43, %rd6;
+    and.pred %p_dk, %p_dk, %p0;
+    shl.b64 %rd_dk_smem, %rd_dk_idx, 2;
+    add.u64 %rd_dk_smem, %rd_dk_smem, 30976;
+    add.u64 %rd_dk_smem, %shmem_base, %rd_dk_smem;
+    @%p_dk ld.shared.f32 %f_dk_tmp, [%rd_dk_smem];
+    shl.b64 %rd_dk_hbm, %rd_dk_idx, 2;
+    add.u64 %rd_dk_hbm, %rd_dk_base, %rd_dk_hbm;
+    @%p_dk ld.global.f32 %f0, [%rd_dk_hbm];
+    @%p_dk add.f32 %f_dk_tmp, %f_dk_tmp, %f0;
+    @%p_dk st.global.f32 [%rd_dk_hbm], %f_dk_tmp;
+    cvt.u64.u32 %rd_dk_idx, %tid_x;
+    add.u64 %rd_dk_idx, %rd_dk_idx, 384;
+    setp.lt.u64 %p_dk, %rd_dk_idx, 1024;
+    div.u64 %rd42, %rd_dk_idx, %rd7;
+    add.u64 %rd43, %rd42, %k_start;
+    setp.lt.u64 %p0, %rd43, %rd6;
+    and.pred %p_dk, %p_dk, %p0;
+    shl.b64 %rd_dk_smem, %rd_dk_idx, 2;
+    add.u64 %rd_dk_smem, %rd_dk_smem, 30976;
+    add.u64 %rd_dk_smem, %shmem_base, %rd_dk_smem;
+    @%p_dk ld.shared.f32 %f_dk_tmp, [%rd_dk_smem];
+    shl.b64 %rd_dk_hbm, %rd_dk_idx, 2;
+    add.u64 %rd_dk_hbm, %rd_dk_base, %rd_dk_hbm;
+    @%p_dk ld.global.f32 %f0, [%rd_dk_hbm];
+    @%p_dk add.f32 %f_dk_tmp, %f_dk_tmp, %f0;
+    @%p_dk st.global.f32 [%rd_dk_hbm], %f_dk_tmp;
+    cvt.u64.u32 %rd_dk_idx, %tid_x;
+    add.u64 %rd_dk_idx, %rd_dk_idx, 512;
+    setp.lt.u64 %p_dk, %rd_dk_idx, 1024;
+    div.u64 %rd42, %rd_dk_idx, %rd7;
+    add.u64 %rd43, %rd42, %k_start;
+    setp.lt.u64 %p0, %rd43, %rd6;
+    and.pred %p_dk, %p_dk, %p0;
+    shl.b64 %rd_dk_smem, %rd_dk_idx, 2;
+    add.u64 %rd_dk_smem, %rd_dk_smem, 30976;
+    add.u64 %rd_dk_smem, %shmem_base, %rd_dk_smem;
+    @%p_dk ld.shared.f32 %f_dk_tmp, [%rd_dk_smem];
+    shl.b64 %rd_dk_hbm, %rd_dk_idx, 2;
+    add.u64 %rd_dk_hbm, %rd_dk_base, %rd_dk_hbm;
+    @%p_dk ld.global.f32 %f0, [%rd_dk_hbm];
+    @%p_dk add.f32 %f_dk_tmp, %f_dk_tmp, %f0;
+    @%p_dk st.global.f32 [%rd_dk_hbm], %f_dk_tmp;
+    cvt.u64.u32 %rd_dk_idx, %tid_x;
+    add.u64 %rd_dk_idx, %rd_dk_idx, 640;
+    setp.lt.u64 %p_dk, %rd_dk_idx, 1024;
+    div.u64 %rd42, %rd_dk_idx, %rd7;
+    add.u64 %rd43, %rd42, %k_start;
+    setp.lt.u64 %p0, %rd43, %rd6;
+    and.pred %p_dk, %p_dk, %p0;
+    shl.b64 %rd_dk_smem, %rd_dk_idx, 2;
+    add.u64 %rd_dk_smem, %rd_dk_smem, 30976;
+    add.u64 %rd_dk_smem, %shmem_base, %rd_dk_smem;
+    @%p_dk ld.shared.f32 %f_dk_tmp, [%rd_dk_smem];
+    shl.b64 %rd_dk_hbm, %rd_dk_idx, 2;
+    add.u64 %rd_dk_hbm, %rd_dk_base, %rd_dk_hbm;
+    @%p_dk ld.global.f32 %f0, [%rd_dk_hbm];
+    @%p_dk add.f32 %f_dk_tmp, %f_dk_tmp, %f0;
+    @%p_dk st.global.f32 [%rd_dk_hbm], %f_dk_tmp;
+    cvt.u64.u32 %rd_dk_idx, %tid_x;
+    add.u64 %rd_dk_idx, %rd_dk_idx, 768;
+    setp.lt.u64 %p_dk, %rd_dk_idx, 1024;
+    div.u64 %rd42, %rd_dk_idx, %rd7;
+    add.u64 %rd43, %rd42, %k_start;
+    setp.lt.u64 %p0, %rd43, %rd6;
+    and.pred %p_dk, %p_dk, %p0;
+    shl.b64 %rd_dk_smem, %rd_dk_idx, 2;
+    add.u64 %rd_dk_smem, %rd_dk_smem, 30976;
+    add.u64 %rd_dk_smem, %shmem_base, %rd_dk_smem;
+    @%p_dk ld.shared.f32 %f_dk_tmp, [%rd_dk_smem];
+    shl.b64 %rd_dk_hbm, %rd_dk_idx, 2;
+    add.u64 %rd_dk_hbm, %rd_dk_base, %rd_dk_hbm;
+    @%p_dk ld.global.f32 %f0, [%rd_dk_hbm];
+    @%p_dk add.f32 %f_dk_tmp, %f_dk_tmp, %f0;
+    @%p_dk st.global.f32 [%rd_dk_hbm], %f_dk_tmp;
+    cvt.u64.u32 %rd_dk_idx, %tid_x;
+    add.u64 %rd_dk_idx, %rd_dk_idx, 896;
+    setp.lt.u64 %p_dk, %rd_dk_idx, 1024;
+    div.u64 %rd42, %rd_dk_idx, %rd7;
+    add.u64 %rd43, %rd42, %k_start;
+    setp.lt.u64 %p0, %rd43, %rd6;
+    and.pred %p_dk, %p_dk, %p0;
+    shl.b64 %rd_dk_smem, %rd_dk_idx, 2;
+    add.u64 %rd_dk_smem, %rd_dk_smem, 30976;
+    add.u64 %rd_dk_smem, %shmem_base, %rd_dk_smem;
+    @%p_dk ld.shared.f32 %f_dk_tmp, [%rd_dk_smem];
+    shl.b64 %rd_dk_hbm, %rd_dk_idx, 2;
+    add.u64 %rd_dk_hbm, %rd_dk_base, %rd_dk_hbm;
+    @%p_dk ld.global.f32 %f0, [%rd_dk_hbm];
+    @%p_dk add.f32 %f_dk_tmp, %f_dk_tmp, %f0;
+    @%p_dk st.global.f32 [%rd_dk_hbm], %f_dk_tmp;
+V2_BWD_STORE_DK_SKIP_0:
+    // -- DV f32-scratch RMW via [dv_scratch_ptr] (coop SMEM->HBM) --
+    setp.eq.u64 %p0, %rd_bwd_dv_scratch, 0;
+    @%p0 bra V2_BWD_STORE_DV_SKIP_0;
+    mul.lo.u64 %rd_dk_base, %batch_idx, %rd5;
+    add.u64 %rd_dk_base, %rd_dk_base, %head_idx;
+    mul.lo.u64 %rd_dk_base, %rd_dk_base, %rd6;
+    add.u64 %rd_dk_base, %rd_dk_base, %k_start;
+    mul.lo.u64 %rd_dk_base, %rd_dk_base, %rd7;
+    shl.b64 %rd_dk_base, %rd_dk_base, 2;
+    add.u64 %rd_dk_base, %rd_bwd_dv_scratch, %rd_dk_base;
+    cvt.u64.u32 %rd_dk_idx, %tid_x;
+    setp.lt.u64 %p_dk, %rd_dk_idx, 1024;
+    div.u64 %rd42, %rd_dk_idx, %rd7;
+    add.u64 %rd43, %rd42, %k_start;
+    setp.lt.u64 %p0, %rd43, %rd6;
+    and.pred %p_dk, %p_dk, %p0;
+    shl.b64 %rd_dk_smem, %rd_dk_idx, 2;
+    add.u64 %rd_dk_smem, %rd_dk_smem, 26880;
+    add.u64 %rd_dk_smem, %shmem_base, %rd_dk_smem;
+    @%p_dk ld.shared.f32 %f_dk_tmp, [%rd_dk_smem];
+    shl.b64 %rd_dk_hbm, %rd_dk_idx, 2;
+    add.u64 %rd_dk_hbm, %rd_dk_base, %rd_dk_hbm;
+    @%p_dk ld.global.f32 %f0, [%rd_dk_hbm];
+    @%p_dk add.f32 %f_dk_tmp, %f_dk_tmp, %f0;
+    @%p_dk st.global.f32 [%rd_dk_hbm], %f_dk_tmp;
+    cvt.u64.u32 %rd_dk_idx, %tid_x;
+    add.u64 %rd_dk_idx, %rd_dk_idx, 128;
+    setp.lt.u64 %p_dk, %rd_dk_idx, 1024;
+    div.u64 %rd42, %rd_dk_idx, %rd7;
+    add.u64 %rd43, %rd42, %k_start;
+    setp.lt.u64 %p0, %rd43, %rd6;
+    and.pred %p_dk, %p_dk, %p0;
+    shl.b64 %rd_dk_smem, %rd_dk_idx, 2;
+    add.u64 %rd_dk_smem, %rd_dk_smem, 26880;
+    add.u64 %rd_dk_smem, %shmem_base, %rd_dk_smem;
+    @%p_dk ld.shared.f32 %f_dk_tmp, [%rd_dk_smem];
+    shl.b64 %rd_dk_hbm, %rd_dk_idx, 2;
+    add.u64 %rd_dk_hbm, %rd_dk_base, %rd_dk_hbm;
+    @%p_dk ld.global.f32 %f0, [%rd_dk_hbm];
+    @%p_dk add.f32 %f_dk_tmp, %f_dk_tmp, %f0;
+    @%p_dk st.global.f32 [%rd_dk_hbm], %f_dk_tmp;
+    cvt.u64.u32 %rd_dk_idx, %tid_x;
+    add.u64 %rd_dk_idx, %rd_dk_idx, 256;
+    setp.lt.u64 %p_dk, %rd_dk_idx, 1024;
+    div.u64 %rd42, %rd_dk_idx, %rd7;
+    add.u64 %rd43, %rd42, %k_start;
+    setp.lt.u64 %p0, %rd43, %rd6;
+    and.pred %p_dk, %p_dk, %p0;
+    shl.b64 %rd_dk_smem, %rd_dk_idx, 2;
+    add.u64 %rd_dk_smem, %rd_dk_smem, 26880;
+    add.u64 %rd_dk_smem, %shmem_base, %rd_dk_smem;
+    @%p_dk ld.shared.f32 %f_dk_tmp, [%rd_dk_smem];
+    shl.b64 %rd_dk_hbm, %rd_dk_idx, 2;
+    add.u64 %rd_dk_hbm, %rd_dk_base, %rd_dk_hbm;
+    @%p_dk ld.global.f32 %f0, [%rd_dk_hbm];
+    @%p_dk add.f32 %f_dk_tmp, %f_dk_tmp, %f0;
+    @%p_dk st.global.f32 [%rd_dk_hbm], %f_dk_tmp;
+    cvt.u64.u32 %rd_dk_idx, %tid_x;
+    add.u64 %rd_dk_idx, %rd_dk_idx, 384;
+    setp.lt.u64 %p_dk, %rd_dk_idx, 1024;
+    div.u64 %rd42, %rd_dk_idx, %rd7;
+    add.u64 %rd43, %rd42, %k_start;
+    setp.lt.u64 %p0, %rd43, %rd6;
+    and.pred %p_dk, %p_dk, %p0;
+    shl.b64 %rd_dk_smem, %rd_dk_idx, 2;
+    add.u64 %rd_dk_smem, %rd_dk_smem, 26880;
+    add.u64 %rd_dk_smem, %shmem_base, %rd_dk_smem;
+    @%p_dk ld.shared.f32 %f_dk_tmp, [%rd_dk_smem];
+    shl.b64 %rd_dk_hbm, %rd_dk_idx, 2;
+    add.u64 %rd_dk_hbm, %rd_dk_base, %rd_dk_hbm;
+    @%p_dk ld.global.f32 %f0, [%rd_dk_hbm];
+    @%p_dk add.f32 %f_dk_tmp, %f_dk_tmp, %f0;
+    @%p_dk st.global.f32 [%rd_dk_hbm], %f_dk_tmp;
+    cvt.u64.u32 %rd_dk_idx, %tid_x;
+    add.u64 %rd_dk_idx, %rd_dk_idx, 512;
+    setp.lt.u64 %p_dk, %rd_dk_idx, 1024;
+    div.u64 %rd42, %rd_dk_idx, %rd7;
+    add.u64 %rd43, %rd42, %k_start;
+    setp.lt.u64 %p0, %rd43, %rd6;
+    and.pred %p_dk, %p_dk, %p0;
+    shl.b64 %rd_dk_smem, %rd_dk_idx, 2;
+    add.u64 %rd_dk_smem, %rd_dk_smem, 26880;
+    add.u64 %rd_dk_smem, %shmem_base, %rd_dk_smem;
+    @%p_dk ld.shared.f32 %f_dk_tmp, [%rd_dk_smem];
+    shl.b64 %rd_dk_hbm, %rd_dk_idx, 2;
+    add.u64 %rd_dk_hbm, %rd_dk_base, %rd_dk_hbm;
+    @%p_dk ld.global.f32 %f0, [%rd_dk_hbm];
+    @%p_dk add.f32 %f_dk_tmp, %f_dk_tmp, %f0;
+    @%p_dk st.global.f32 [%rd_dk_hbm], %f_dk_tmp;
+    cvt.u64.u32 %rd_dk_idx, %tid_x;
+    add.u64 %rd_dk_idx, %rd_dk_idx, 640;
+    setp.lt.u64 %p_dk, %rd_dk_idx, 1024;
+    div.u64 %rd42, %rd_dk_idx, %rd7;
+    add.u64 %rd43, %rd42, %k_start;
+    setp.lt.u64 %p0, %rd43, %rd6;
+    and.pred %p_dk, %p_dk, %p0;
+    shl.b64 %rd_dk_smem, %rd_dk_idx, 2;
+    add.u64 %rd_dk_smem, %rd_dk_smem, 26880;
+    add.u64 %rd_dk_smem, %shmem_base, %rd_dk_smem;
+    @%p_dk ld.shared.f32 %f_dk_tmp, [%rd_dk_smem];
+    shl.b64 %rd_dk_hbm, %rd_dk_idx, 2;
+    add.u64 %rd_dk_hbm, %rd_dk_base, %rd_dk_hbm;
+    @%p_dk ld.global.f32 %f0, [%rd_dk_hbm];
+    @%p_dk add.f32 %f_dk_tmp, %f_dk_tmp, %f0;
+    @%p_dk st.global.f32 [%rd_dk_hbm], %f_dk_tmp;
+    cvt.u64.u32 %rd_dk_idx, %tid_x;
+    add.u64 %rd_dk_idx, %rd_dk_idx, 768;
+    setp.lt.u64 %p_dk, %rd_dk_idx, 1024;
+    div.u64 %rd42, %rd_dk_idx, %rd7;
+    add.u64 %rd43, %rd42, %k_start;
+    setp.lt.u64 %p0, %rd43, %rd6;
+    and.pred %p_dk, %p_dk, %p0;
+    shl.b64 %rd_dk_smem, %rd_dk_idx, 2;
+    add.u64 %rd_dk_smem, %rd_dk_smem, 26880;
+    add.u64 %rd_dk_smem, %shmem_base, %rd_dk_smem;
+    @%p_dk ld.shared.f32 %f_dk_tmp, [%rd_dk_smem];
+    shl.b64 %rd_dk_hbm, %rd_dk_idx, 2;
+    add.u64 %rd_dk_hbm, %rd_dk_base, %rd_dk_hbm;
+    @%p_dk ld.global.f32 %f0, [%rd_dk_hbm];
+    @%p_dk add.f32 %f_dk_tmp, %f_dk_tmp, %f0;
+    @%p_dk st.global.f32 [%rd_dk_hbm], %f_dk_tmp;
+    cvt.u64.u32 %rd_dk_idx, %tid_x;
+    add.u64 %rd_dk_idx, %rd_dk_idx, 896;
+    setp.lt.u64 %p_dk, %rd_dk_idx, 1024;
+    div.u64 %rd42, %rd_dk_idx, %rd7;
+    add.u64 %rd43, %rd42, %k_start;
+    setp.lt.u64 %p0, %rd43, %rd6;
+    and.pred %p_dk, %p_dk, %p0;
+    shl.b64 %rd_dk_smem, %rd_dk_idx, 2;
+    add.u64 %rd_dk_smem, %rd_dk_smem, 26880;
+    add.u64 %rd_dk_smem, %shmem_base, %rd_dk_smem;
+    @%p_dk ld.shared.f32 %f_dk_tmp, [%rd_dk_smem];
+    shl.b64 %rd_dk_hbm, %rd_dk_idx, 2;
+    add.u64 %rd_dk_hbm, %rd_dk_base, %rd_dk_hbm;
+    @%p_dk ld.global.f32 %f0, [%rd_dk_hbm];
+    @%p_dk add.f32 %f_dk_tmp, %f_dk_tmp, %f0;
+    @%p_dk st.global.f32 [%rd_dk_hbm], %f_dk_tmp;
+V2_BWD_STORE_DV_SKIP_0:
+    bar.sync 0;
+    add.u64 %k_start, %k_start, 32;
+    setp.lt.u64 %p0, %k_start, %k_max;
+    @%p0 bra V2_BWD_LOOP_KV;
+    bar.sync 0;  // dQ SMEM tile complete across all KV tiles
     // Tier C x_norm + rms recompute (one thread per row).
 V2_BWD_XNORM_RECOMPUTE:
     setp.lt.u32 %p_c0, %tid_x, 32;
@@ -18154,17 +19106,7 @@ V2_BWD_DRMSNORM_PHASE2_DONE:
     add.f32 %f_gd, %f_gd, %f_nw;
     shfl.sync.bfly.b32 %f_nw, %f_gd, 1, 31, 0xFFFFFFFF;
     add.f32 %f_gd, %f_gd, %f_nw;
-    // Tier C backward finalize -- global stores of all 7 gradients (q_tile_iter=0)
-V2_BWD_FINALIZE_0:
-    add.u32 %r0, %warp_id, 0;
-    cvt.u64.u32 %warp_row, %r0;
-    mul.lo.u64 %rd30, %batch_idx, %rd5;
-    add.u64 %rd30, %rd30, %head_idx;
-    mul.lo.u64 %rd30, %rd30, %rd6;
-    add.u64 %rd30, %rd30, %q_start;
-    add.u64 %rd30, %rd30, %warp_row;
-    mul.lo.u64 %rd30, %rd30, %rd7;
-    shl.b64 %rd30, %rd30, 1;  // * 2 bytes (f16)
+    // Tier C backward finalize -- DQ global store only (q_tile_iter=0)
     // -- DQ store via [dq_ptr] (coop SMEM->HBM, full tile) --
     setp.eq.u64 %p0, %rd_bwd_dq, 0;
     @%p0 bra V2_BWD_STORE_DQ_SKIP_0;
@@ -18177,6 +19119,10 @@ V2_BWD_FINALIZE_0:
     add.u64 %rd_dq_base, %rd_bwd_dq, %rd_dq_base;
     cvt.u64.u32 %rd_dq_idx, %tid_x;
     setp.lt.u64 %p_dq_g, %rd_dq_idx, 1024;
+    div.u64 %rd42, %rd_dq_idx, %rd7;
+    add.u64 %rd43, %rd42, %q_start;
+    setp.lt.u64 %p0, %rd43, %rd6;
+    and.pred %p_dq_g, %p_dq_g, %p0;
     shl.b64 %rd_dq_smem, %rd_dq_idx, 2;
     add.u64 %rd_dq_smem, %rd_dq_smem, 22784;
     add.u64 %rd_dq_smem, %shmem_base, %rd_dq_smem;
@@ -18188,6 +19134,10 @@ V2_BWD_FINALIZE_0:
     cvt.u64.u32 %rd_dq_idx, %tid_x;
     add.u64 %rd_dq_idx, %rd_dq_idx, 128;
     setp.lt.u64 %p_dq_g, %rd_dq_idx, 1024;
+    div.u64 %rd42, %rd_dq_idx, %rd7;
+    add.u64 %rd43, %rd42, %q_start;
+    setp.lt.u64 %p0, %rd43, %rd6;
+    and.pred %p_dq_g, %p_dq_g, %p0;
     shl.b64 %rd_dq_smem, %rd_dq_idx, 2;
     add.u64 %rd_dq_smem, %rd_dq_smem, 22784;
     add.u64 %rd_dq_smem, %shmem_base, %rd_dq_smem;
@@ -18199,6 +19149,10 @@ V2_BWD_FINALIZE_0:
     cvt.u64.u32 %rd_dq_idx, %tid_x;
     add.u64 %rd_dq_idx, %rd_dq_idx, 256;
     setp.lt.u64 %p_dq_g, %rd_dq_idx, 1024;
+    div.u64 %rd42, %rd_dq_idx, %rd7;
+    add.u64 %rd43, %rd42, %q_start;
+    setp.lt.u64 %p0, %rd43, %rd6;
+    and.pred %p_dq_g, %p_dq_g, %p0;
     shl.b64 %rd_dq_smem, %rd_dq_idx, 2;
     add.u64 %rd_dq_smem, %rd_dq_smem, 22784;
     add.u64 %rd_dq_smem, %shmem_base, %rd_dq_smem;
@@ -18210,6 +19164,10 @@ V2_BWD_FINALIZE_0:
     cvt.u64.u32 %rd_dq_idx, %tid_x;
     add.u64 %rd_dq_idx, %rd_dq_idx, 384;
     setp.lt.u64 %p_dq_g, %rd_dq_idx, 1024;
+    div.u64 %rd42, %rd_dq_idx, %rd7;
+    add.u64 %rd43, %rd42, %q_start;
+    setp.lt.u64 %p0, %rd43, %rd6;
+    and.pred %p_dq_g, %p_dq_g, %p0;
     shl.b64 %rd_dq_smem, %rd_dq_idx, 2;
     add.u64 %rd_dq_smem, %rd_dq_smem, 22784;
     add.u64 %rd_dq_smem, %shmem_base, %rd_dq_smem;
@@ -18221,6 +19179,10 @@ V2_BWD_FINALIZE_0:
     cvt.u64.u32 %rd_dq_idx, %tid_x;
     add.u64 %rd_dq_idx, %rd_dq_idx, 512;
     setp.lt.u64 %p_dq_g, %rd_dq_idx, 1024;
+    div.u64 %rd42, %rd_dq_idx, %rd7;
+    add.u64 %rd43, %rd42, %q_start;
+    setp.lt.u64 %p0, %rd43, %rd6;
+    and.pred %p_dq_g, %p_dq_g, %p0;
     shl.b64 %rd_dq_smem, %rd_dq_idx, 2;
     add.u64 %rd_dq_smem, %rd_dq_smem, 22784;
     add.u64 %rd_dq_smem, %shmem_base, %rd_dq_smem;
@@ -18232,6 +19194,10 @@ V2_BWD_FINALIZE_0:
     cvt.u64.u32 %rd_dq_idx, %tid_x;
     add.u64 %rd_dq_idx, %rd_dq_idx, 640;
     setp.lt.u64 %p_dq_g, %rd_dq_idx, 1024;
+    div.u64 %rd42, %rd_dq_idx, %rd7;
+    add.u64 %rd43, %rd42, %q_start;
+    setp.lt.u64 %p0, %rd43, %rd6;
+    and.pred %p_dq_g, %p_dq_g, %p0;
     shl.b64 %rd_dq_smem, %rd_dq_idx, 2;
     add.u64 %rd_dq_smem, %rd_dq_smem, 22784;
     add.u64 %rd_dq_smem, %shmem_base, %rd_dq_smem;
@@ -18243,6 +19209,10 @@ V2_BWD_FINALIZE_0:
     cvt.u64.u32 %rd_dq_idx, %tid_x;
     add.u64 %rd_dq_idx, %rd_dq_idx, 768;
     setp.lt.u64 %p_dq_g, %rd_dq_idx, 1024;
+    div.u64 %rd42, %rd_dq_idx, %rd7;
+    add.u64 %rd43, %rd42, %q_start;
+    setp.lt.u64 %p0, %rd43, %rd6;
+    and.pred %p_dq_g, %p_dq_g, %p0;
     shl.b64 %rd_dq_smem, %rd_dq_idx, 2;
     add.u64 %rd_dq_smem, %rd_dq_smem, 22784;
     add.u64 %rd_dq_smem, %shmem_base, %rd_dq_smem;
@@ -18254,6 +19224,10 @@ V2_BWD_FINALIZE_0:
     cvt.u64.u32 %rd_dq_idx, %tid_x;
     add.u64 %rd_dq_idx, %rd_dq_idx, 896;
     setp.lt.u64 %p_dq_g, %rd_dq_idx, 1024;
+    div.u64 %rd42, %rd_dq_idx, %rd7;
+    add.u64 %rd43, %rd42, %q_start;
+    setp.lt.u64 %p0, %rd43, %rd6;
+    and.pred %p_dq_g, %p_dq_g, %p0;
     shl.b64 %rd_dq_smem, %rd_dq_idx, 2;
     add.u64 %rd_dq_smem, %rd_dq_smem, 22784;
     add.u64 %rd_dq_smem, %shmem_base, %rd_dq_smem;
@@ -18263,217 +19237,6 @@ V2_BWD_FINALIZE_0:
     @%p_dq_g cvt.rn.f16.f32 %h0, %f_dq_tmp;
     @%p_dq_g st.global.b16 [%rd_dq_hbm], %h0;
 V2_BWD_STORE_DQ_SKIP_0:
-    // -- DK store via [dk_ptr] (coop SMEM->HBM) --
-    setp.eq.u64 %p0, %rd_bwd_dk, 0;
-    @%p0 bra V2_BWD_STORE_DK_SKIP_0;
-    mul.lo.u64 %rd_dk_base, %batch_idx, %rd5;
-    add.u64 %rd_dk_base, %rd_dk_base, %head_idx;
-    mul.lo.u64 %rd_dk_base, %rd_dk_base, %rd6;
-    mul.lo.u64 %rd_dk_base, %rd_dk_base, %rd7;
-    shl.b64 %rd_dk_base, %rd_dk_base, 1;
-    add.u64 %rd_dk_base, %rd_bwd_dk, %rd_dk_base;
-    cvt.u64.u32 %rd_dk_idx, %tid_x;
-    setp.lt.u64 %p_dk, %rd_dk_idx, 1024;
-    shl.b64 %rd_dk_smem, %rd_dk_idx, 2;
-    add.u64 %rd_dk_smem, %rd_dk_smem, 30976;
-    add.u64 %rd_dk_smem, %shmem_base, %rd_dk_smem;
-    @%p_dk ld.shared.f32 %f_dk_tmp, [%rd_dk_smem];
-    shl.b64 %rd_dk_hbm, %rd_dk_idx, 1;
-    add.u64 %rd_dk_hbm, %rd_dk_base, %rd_dk_hbm;
-    @%p_dk cvt.rn.f16.f32 %h0, %f_dk_tmp;
-    @%p_dk st.global.b16 [%rd_dk_hbm], %h0;
-    cvt.u64.u32 %rd_dk_idx, %tid_x;
-    add.u64 %rd_dk_idx, %rd_dk_idx, 128;
-    setp.lt.u64 %p_dk, %rd_dk_idx, 1024;
-    shl.b64 %rd_dk_smem, %rd_dk_idx, 2;
-    add.u64 %rd_dk_smem, %rd_dk_smem, 30976;
-    add.u64 %rd_dk_smem, %shmem_base, %rd_dk_smem;
-    @%p_dk ld.shared.f32 %f_dk_tmp, [%rd_dk_smem];
-    shl.b64 %rd_dk_hbm, %rd_dk_idx, 1;
-    add.u64 %rd_dk_hbm, %rd_dk_base, %rd_dk_hbm;
-    @%p_dk cvt.rn.f16.f32 %h0, %f_dk_tmp;
-    @%p_dk st.global.b16 [%rd_dk_hbm], %h0;
-    cvt.u64.u32 %rd_dk_idx, %tid_x;
-    add.u64 %rd_dk_idx, %rd_dk_idx, 256;
-    setp.lt.u64 %p_dk, %rd_dk_idx, 1024;
-    shl.b64 %rd_dk_smem, %rd_dk_idx, 2;
-    add.u64 %rd_dk_smem, %rd_dk_smem, 30976;
-    add.u64 %rd_dk_smem, %shmem_base, %rd_dk_smem;
-    @%p_dk ld.shared.f32 %f_dk_tmp, [%rd_dk_smem];
-    shl.b64 %rd_dk_hbm, %rd_dk_idx, 1;
-    add.u64 %rd_dk_hbm, %rd_dk_base, %rd_dk_hbm;
-    @%p_dk cvt.rn.f16.f32 %h0, %f_dk_tmp;
-    @%p_dk st.global.b16 [%rd_dk_hbm], %h0;
-    cvt.u64.u32 %rd_dk_idx, %tid_x;
-    add.u64 %rd_dk_idx, %rd_dk_idx, 384;
-    setp.lt.u64 %p_dk, %rd_dk_idx, 1024;
-    shl.b64 %rd_dk_smem, %rd_dk_idx, 2;
-    add.u64 %rd_dk_smem, %rd_dk_smem, 30976;
-    add.u64 %rd_dk_smem, %shmem_base, %rd_dk_smem;
-    @%p_dk ld.shared.f32 %f_dk_tmp, [%rd_dk_smem];
-    shl.b64 %rd_dk_hbm, %rd_dk_idx, 1;
-    add.u64 %rd_dk_hbm, %rd_dk_base, %rd_dk_hbm;
-    @%p_dk cvt.rn.f16.f32 %h0, %f_dk_tmp;
-    @%p_dk st.global.b16 [%rd_dk_hbm], %h0;
-    cvt.u64.u32 %rd_dk_idx, %tid_x;
-    add.u64 %rd_dk_idx, %rd_dk_idx, 512;
-    setp.lt.u64 %p_dk, %rd_dk_idx, 1024;
-    shl.b64 %rd_dk_smem, %rd_dk_idx, 2;
-    add.u64 %rd_dk_smem, %rd_dk_smem, 30976;
-    add.u64 %rd_dk_smem, %shmem_base, %rd_dk_smem;
-    @%p_dk ld.shared.f32 %f_dk_tmp, [%rd_dk_smem];
-    shl.b64 %rd_dk_hbm, %rd_dk_idx, 1;
-    add.u64 %rd_dk_hbm, %rd_dk_base, %rd_dk_hbm;
-    @%p_dk cvt.rn.f16.f32 %h0, %f_dk_tmp;
-    @%p_dk st.global.b16 [%rd_dk_hbm], %h0;
-    cvt.u64.u32 %rd_dk_idx, %tid_x;
-    add.u64 %rd_dk_idx, %rd_dk_idx, 640;
-    setp.lt.u64 %p_dk, %rd_dk_idx, 1024;
-    shl.b64 %rd_dk_smem, %rd_dk_idx, 2;
-    add.u64 %rd_dk_smem, %rd_dk_smem, 30976;
-    add.u64 %rd_dk_smem, %shmem_base, %rd_dk_smem;
-    @%p_dk ld.shared.f32 %f_dk_tmp, [%rd_dk_smem];
-    shl.b64 %rd_dk_hbm, %rd_dk_idx, 1;
-    add.u64 %rd_dk_hbm, %rd_dk_base, %rd_dk_hbm;
-    @%p_dk cvt.rn.f16.f32 %h0, %f_dk_tmp;
-    @%p_dk st.global.b16 [%rd_dk_hbm], %h0;
-    cvt.u64.u32 %rd_dk_idx, %tid_x;
-    add.u64 %rd_dk_idx, %rd_dk_idx, 768;
-    setp.lt.u64 %p_dk, %rd_dk_idx, 1024;
-    shl.b64 %rd_dk_smem, %rd_dk_idx, 2;
-    add.u64 %rd_dk_smem, %rd_dk_smem, 30976;
-    add.u64 %rd_dk_smem, %shmem_base, %rd_dk_smem;
-    @%p_dk ld.shared.f32 %f_dk_tmp, [%rd_dk_smem];
-    shl.b64 %rd_dk_hbm, %rd_dk_idx, 1;
-    add.u64 %rd_dk_hbm, %rd_dk_base, %rd_dk_hbm;
-    @%p_dk cvt.rn.f16.f32 %h0, %f_dk_tmp;
-    @%p_dk st.global.b16 [%rd_dk_hbm], %h0;
-    cvt.u64.u32 %rd_dk_idx, %tid_x;
-    add.u64 %rd_dk_idx, %rd_dk_idx, 896;
-    setp.lt.u64 %p_dk, %rd_dk_idx, 1024;
-    shl.b64 %rd_dk_smem, %rd_dk_idx, 2;
-    add.u64 %rd_dk_smem, %rd_dk_smem, 30976;
-    add.u64 %rd_dk_smem, %shmem_base, %rd_dk_smem;
-    @%p_dk ld.shared.f32 %f_dk_tmp, [%rd_dk_smem];
-    shl.b64 %rd_dk_hbm, %rd_dk_idx, 1;
-    add.u64 %rd_dk_hbm, %rd_dk_base, %rd_dk_hbm;
-    @%p_dk cvt.rn.f16.f32 %h0, %f_dk_tmp;
-    @%p_dk st.global.b16 [%rd_dk_hbm], %h0;
-V2_BWD_STORE_DK_SKIP_0:
-    // -- DV store via [dv_ptr] (coop SMEM->HBM) --
-    setp.eq.u64 %p0, %rd_bwd_dv, 0;
-    @%p0 bra V2_BWD_STORE_DV_SKIP_0;
-    mul.lo.u64 %rd_dk_base, %batch_idx, %rd5;
-    add.u64 %rd_dk_base, %rd_dk_base, %head_idx;
-    mul.lo.u64 %rd_dk_base, %rd_dk_base, %rd6;
-    mul.lo.u64 %rd_dk_base, %rd_dk_base, %rd7;
-    shl.b64 %rd_dk_base, %rd_dk_base, 1;
-    add.u64 %rd_dk_base, %rd_bwd_dv, %rd_dk_base;
-    cvt.u64.u32 %rd_dk_idx, %tid_x;
-    setp.lt.u64 %p_dk, %rd_dk_idx, 1024;
-    shl.b64 %rd_dk_smem, %rd_dk_idx, 2;
-    add.u64 %rd_dk_smem, %rd_dk_smem, 26880;
-    add.u64 %rd_dk_smem, %shmem_base, %rd_dk_smem;
-    @%p_dk ld.shared.f32 %f_dk_tmp, [%rd_dk_smem];
-    shl.b64 %rd_dk_hbm, %rd_dk_idx, 1;
-    add.u64 %rd_dk_hbm, %rd_dk_base, %rd_dk_hbm;
-    @%p_dk cvt.rn.f16.f32 %h0, %f_dk_tmp;
-    @%p_dk st.global.b16 [%rd_dk_hbm], %h0;
-    cvt.u64.u32 %rd_dk_idx, %tid_x;
-    add.u64 %rd_dk_idx, %rd_dk_idx, 128;
-    setp.lt.u64 %p_dk, %rd_dk_idx, 1024;
-    shl.b64 %rd_dk_smem, %rd_dk_idx, 2;
-    add.u64 %rd_dk_smem, %rd_dk_smem, 26880;
-    add.u64 %rd_dk_smem, %shmem_base, %rd_dk_smem;
-    @%p_dk ld.shared.f32 %f_dk_tmp, [%rd_dk_smem];
-    shl.b64 %rd_dk_hbm, %rd_dk_idx, 1;
-    add.u64 %rd_dk_hbm, %rd_dk_base, %rd_dk_hbm;
-    @%p_dk cvt.rn.f16.f32 %h0, %f_dk_tmp;
-    @%p_dk st.global.b16 [%rd_dk_hbm], %h0;
-    cvt.u64.u32 %rd_dk_idx, %tid_x;
-    add.u64 %rd_dk_idx, %rd_dk_idx, 256;
-    setp.lt.u64 %p_dk, %rd_dk_idx, 1024;
-    shl.b64 %rd_dk_smem, %rd_dk_idx, 2;
-    add.u64 %rd_dk_smem, %rd_dk_smem, 26880;
-    add.u64 %rd_dk_smem, %shmem_base, %rd_dk_smem;
-    @%p_dk ld.shared.f32 %f_dk_tmp, [%rd_dk_smem];
-    shl.b64 %rd_dk_hbm, %rd_dk_idx, 1;
-    add.u64 %rd_dk_hbm, %rd_dk_base, %rd_dk_hbm;
-    @%p_dk cvt.rn.f16.f32 %h0, %f_dk_tmp;
-    @%p_dk st.global.b16 [%rd_dk_hbm], %h0;
-    cvt.u64.u32 %rd_dk_idx, %tid_x;
-    add.u64 %rd_dk_idx, %rd_dk_idx, 384;
-    setp.lt.u64 %p_dk, %rd_dk_idx, 1024;
-    shl.b64 %rd_dk_smem, %rd_dk_idx, 2;
-    add.u64 %rd_dk_smem, %rd_dk_smem, 26880;
-    add.u64 %rd_dk_smem, %shmem_base, %rd_dk_smem;
-    @%p_dk ld.shared.f32 %f_dk_tmp, [%rd_dk_smem];
-    shl.b64 %rd_dk_hbm, %rd_dk_idx, 1;
-    add.u64 %rd_dk_hbm, %rd_dk_base, %rd_dk_hbm;
-    @%p_dk cvt.rn.f16.f32 %h0, %f_dk_tmp;
-    @%p_dk st.global.b16 [%rd_dk_hbm], %h0;
-    cvt.u64.u32 %rd_dk_idx, %tid_x;
-    add.u64 %rd_dk_idx, %rd_dk_idx, 512;
-    setp.lt.u64 %p_dk, %rd_dk_idx, 1024;
-    shl.b64 %rd_dk_smem, %rd_dk_idx, 2;
-    add.u64 %rd_dk_smem, %rd_dk_smem, 26880;
-    add.u64 %rd_dk_smem, %shmem_base, %rd_dk_smem;
-    @%p_dk ld.shared.f32 %f_dk_tmp, [%rd_dk_smem];
-    shl.b64 %rd_dk_hbm, %rd_dk_idx, 1;
-    add.u64 %rd_dk_hbm, %rd_dk_base, %rd_dk_hbm;
-    @%p_dk cvt.rn.f16.f32 %h0, %f_dk_tmp;
-    @%p_dk st.global.b16 [%rd_dk_hbm], %h0;
-    cvt.u64.u32 %rd_dk_idx, %tid_x;
-    add.u64 %rd_dk_idx, %rd_dk_idx, 640;
-    setp.lt.u64 %p_dk, %rd_dk_idx, 1024;
-    shl.b64 %rd_dk_smem, %rd_dk_idx, 2;
-    add.u64 %rd_dk_smem, %rd_dk_smem, 26880;
-    add.u64 %rd_dk_smem, %shmem_base, %rd_dk_smem;
-    @%p_dk ld.shared.f32 %f_dk_tmp, [%rd_dk_smem];
-    shl.b64 %rd_dk_hbm, %rd_dk_idx, 1;
-    add.u64 %rd_dk_hbm, %rd_dk_base, %rd_dk_hbm;
-    @%p_dk cvt.rn.f16.f32 %h0, %f_dk_tmp;
-    @%p_dk st.global.b16 [%rd_dk_hbm], %h0;
-    cvt.u64.u32 %rd_dk_idx, %tid_x;
-    add.u64 %rd_dk_idx, %rd_dk_idx, 768;
-    setp.lt.u64 %p_dk, %rd_dk_idx, 1024;
-    shl.b64 %rd_dk_smem, %rd_dk_idx, 2;
-    add.u64 %rd_dk_smem, %rd_dk_smem, 26880;
-    add.u64 %rd_dk_smem, %shmem_base, %rd_dk_smem;
-    @%p_dk ld.shared.f32 %f_dk_tmp, [%rd_dk_smem];
-    shl.b64 %rd_dk_hbm, %rd_dk_idx, 1;
-    add.u64 %rd_dk_hbm, %rd_dk_base, %rd_dk_hbm;
-    @%p_dk cvt.rn.f16.f32 %h0, %f_dk_tmp;
-    @%p_dk st.global.b16 [%rd_dk_hbm], %h0;
-    cvt.u64.u32 %rd_dk_idx, %tid_x;
-    add.u64 %rd_dk_idx, %rd_dk_idx, 896;
-    setp.lt.u64 %p_dk, %rd_dk_idx, 1024;
-    shl.b64 %rd_dk_smem, %rd_dk_idx, 2;
-    add.u64 %rd_dk_smem, %rd_dk_smem, 26880;
-    add.u64 %rd_dk_smem, %shmem_base, %rd_dk_smem;
-    @%p_dk ld.shared.f32 %f_dk_tmp, [%rd_dk_smem];
-    shl.b64 %rd_dk_hbm, %rd_dk_idx, 1;
-    add.u64 %rd_dk_hbm, %rd_dk_base, %rd_dk_hbm;
-    @%p_dk cvt.rn.f16.f32 %h0, %f_dk_tmp;
-    @%p_dk st.global.b16 [%rd_dk_hbm], %h0;
-V2_BWD_STORE_DV_SKIP_0:
-    // -- DWQ store via [dwq_ptr] (hook-managed; null-only guard) --
-    setp.eq.u64 %p0, %rd_bwd_dwq, 0;
-    @%p0 bra V2_BWD_STORE_DWQ_SKIP_0;
-V2_BWD_STORE_DWQ_SKIP_0:
-    // -- DWK store via [dwk_ptr] (hook-managed; null-only guard) --
-    setp.eq.u64 %p0, %rd_bwd_dwk, 0;
-    @%p0 bra V2_BWD_STORE_DWK_SKIP_0;
-V2_BWD_STORE_DWK_SKIP_0:
-    // -- DWV store via [dwv_ptr] (hook-managed; null-only guard) --
-    setp.eq.u64 %p0, %rd_bwd_dwv, 0;
-    @%p0 bra V2_BWD_STORE_DWV_SKIP_0;
-V2_BWD_STORE_DWV_SKIP_0:
-    // -- DX store via [dx_ptr] (hook-managed; null-only guard) --
-    setp.eq.u64 %p0, %rd_bwd_dx, 0;
-    @%p0 bra V2_BWD_STORE_DX_SKIP_0;
-V2_BWD_STORE_DX_SKIP_0:
-    bar.sync 0;
     ret;
 }
  

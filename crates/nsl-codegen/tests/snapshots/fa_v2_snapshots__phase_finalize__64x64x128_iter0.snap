@@ -1,6 +1,5 @@
 ---
 source: crates/nsl-codegen/tests/fa_v2_snapshots.rs
-assertion_line: 123
 expression: ptx
 ---
     // Phase 6: finalize + output store (q_tile_iter = 0)
@@ -17,7 +16,7 @@ expression: ptx
     mul.lo.u64 %rd48, %rd48, %rd6;            // * seq_len
     add.u64 %rd48, %rd48, %rd47;              // + q_row_global
     mul.lo.u64 %rd48, %rd48, %rd7;            // * head_dim
-    shl.b64 %rd48, %rd48, 1;                  // * 2 bytes f16 (inference)
+    shl.b64 %rd48, %rd48, 1;                  // * 2 bytes f16 output
     add.u64 %rd48, %rd3, %rd48;               // out_base_global
     cvt.u64.u32 %rd49, %lane;
     cvt.rn.f16.f32 %h0, %f48;

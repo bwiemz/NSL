@@ -107,6 +107,7 @@ pub mod ownership_expr;
 pub mod pca_detect;
 pub mod pca_rope;
 pub mod pca_segment;
+pub mod pca_tilerange;
 pub mod pca_tileskip;
 pub mod training_report;
 pub mod pipeline;
