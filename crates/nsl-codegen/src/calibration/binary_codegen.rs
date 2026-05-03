@@ -2132,15 +2132,17 @@ pub fn emit_calibration_scaffolding_object(
 
     let mut write_sidecar_sig = module.make_signature();
     write_sidecar_sig.call_conv = call_conv;
-    write_sidecar_sig.params.push(AbiParam::new(ptr_ty));
-    write_sidecar_sig.params.push(AbiParam::new(ptr_ty));
-    write_sidecar_sig.params.push(AbiParam::new(ptr_ty));
-    write_sidecar_sig.params.push(AbiParam::new(ptr_ty));
+    write_sidecar_sig.params.push(AbiParam::new(ptr_ty)); // path_ptr
+    write_sidecar_sig.params.push(AbiParam::new(ptr_ty)); // path_len
+    write_sidecar_sig.params.push(AbiParam::new(ptr_ty)); // awq_descs_ptr
+    write_sidecar_sig.params.push(AbiParam::new(ptr_ty)); // awq_count
+    write_sidecar_sig.params.push(AbiParam::new(ptr_ty)); // wggo_descs_ptr
+    write_sidecar_sig.params.push(AbiParam::new(ptr_ty)); // wggo_count
     write_sidecar_sig.returns.push(AbiParam::new(cl_types::I32));
     let write_sidecar_id = module
-        .declare_function("nsl_awq_write_sidecar", Linkage::Import, &write_sidecar_sig)
+        .declare_function("nsl_calib_write_sidecar", Linkage::Import, &write_sidecar_sig)
         .map_err(|e| HarnessError::Infrastructure {
-            reason: format!("declare nsl_awq_write_sidecar: {e}"),
+            reason: format!("declare nsl_calib_write_sidecar: {e}"),
         })?;
 
     let mut model_create_sig = module.make_signature();
@@ -2689,10 +2691,12 @@ pub fn emit_calibration_scaffolding_object(
                 let sidecar_path_len = b.inst_results(sc_len_call)[0];
 
                 let desc_count = b.ins().iconst(ptr_ty, finalize_plan.len() as i64);
+                let zero_ptr = b.ins().iconst(ptr_ty, 0);
+                let zero_count = b.ins().iconst(ptr_ty, 0);
                 let write_sidecar_ref = module.declare_func_in_func(write_sidecar_id, b.func);
                 let ws_call = b.ins().call(
                     write_sidecar_ref,
-                    &[fin_sidecar_ptr, sidecar_path_len, descs_base, desc_count],
+                    &[fin_sidecar_ptr, sidecar_path_len, descs_base, desc_count, zero_ptr, zero_count],
                 );
                 let rc = b.inst_results(ws_call)[0];
                 let model_ptr = b.ins().load(cl_types::I64, MemFlags::new(), model_ptr_addr, 0);
@@ -3035,18 +3039,20 @@ fn emit_and_link_calibration_binary(
             reason: format!("declare nsl_calibration_free: {e}"),
         })?;
 
-    // nsl_awq_write_sidecar(path_ptr, path_len, desc_ptr, desc_len) -> i32
+    // nsl_calib_write_sidecar(path_ptr, path_len, awq_descs_ptr, awq_count, wggo_descs_ptr, wggo_count) -> i32
     let mut write_sidecar_sig = module.make_signature();
     write_sidecar_sig.call_conv = call_conv;
-    write_sidecar_sig.params.push(AbiParam::new(ptr_ty)); // sidecar_path_ptr
-    write_sidecar_sig.params.push(AbiParam::new(ptr_ty)); // sidecar_path_len
-    write_sidecar_sig.params.push(AbiParam::new(ptr_ty)); // desc_ptr
-    write_sidecar_sig.params.push(AbiParam::new(ptr_ty)); // desc_len
+    write_sidecar_sig.params.push(AbiParam::new(ptr_ty)); // path_ptr
+    write_sidecar_sig.params.push(AbiParam::new(ptr_ty)); // path_len
+    write_sidecar_sig.params.push(AbiParam::new(ptr_ty)); // awq_descs_ptr
+    write_sidecar_sig.params.push(AbiParam::new(ptr_ty)); // awq_count
+    write_sidecar_sig.params.push(AbiParam::new(ptr_ty)); // wggo_descs_ptr
+    write_sidecar_sig.params.push(AbiParam::new(ptr_ty)); // wggo_count
     write_sidecar_sig.returns.push(AbiParam::new(cl_types::I32));
     let write_sidecar_id = module
-        .declare_function("nsl_awq_write_sidecar", Linkage::Import, &write_sidecar_sig)
+        .declare_function("nsl_calib_write_sidecar", Linkage::Import, &write_sidecar_sig)
         .map_err(|e| HarnessError::Infrastructure {
-            reason: format!("declare nsl_awq_write_sidecar: {e}"),
+            reason: format!("declare nsl_calib_write_sidecar: {e}"),
         })?;
 
     // ── Declare main() ──────────────────────────────────────────────
@@ -3316,12 +3322,14 @@ fn emit_and_link_calibration_binary(
                 let sc_len_call = b.ins().call(strlen_ref2, &[fin_sidecar_ptr]);
                 let sidecar_path_len = b.inst_results(sc_len_call)[0];
 
-                // Call nsl_awq_write_sidecar(path_ptr, path_len, descs_ptr, descs_len).
+                // Call nsl_calib_write_sidecar(path_ptr, path_len, awq_descs_ptr, awq_count, wggo_descs_ptr, wggo_count).
                 let desc_count = b.ins().iconst(ptr_ty, finalize_plan.len() as i64);
+                let zero_ptr = b.ins().iconst(ptr_ty, 0);
+                let zero_count = b.ins().iconst(ptr_ty, 0);
                 let write_sidecar_ref = module.declare_func_in_func(write_sidecar_id, b.func);
                 let ws_call = b.ins().call(
                     write_sidecar_ref,
-                    &[fin_sidecar_ptr, sidecar_path_len, descs_base, desc_count],
+                    &[fin_sidecar_ptr, sidecar_path_len, descs_base, desc_count, zero_ptr, zero_count],
                 );
                 let rc = b.inst_results(ws_call)[0];
 
@@ -3566,8 +3574,8 @@ mod tests {
             "scaffolding.o must import nsl_calibration_batch_at"
         );
         assert!(
-            imports.iter().any(|symbol| symbol == "nsl_awq_write_sidecar"),
-            "scaffolding.o must import nsl_awq_write_sidecar"
+            imports.iter().any(|symbol| symbol == "nsl_calib_write_sidecar"),
+            "scaffolding.o must import nsl_calib_write_sidecar"
         );
 
         assert!(
