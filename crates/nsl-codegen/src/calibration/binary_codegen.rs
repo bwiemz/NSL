@@ -2194,20 +2194,27 @@ pub fn emit_calibration_scaffolding_object(
     // v2 follow-up (spec §5.1): wrapper returns i32 status (0=ok, 3=batch
     // shape mismatch). Scaffolding must declare the same signature or the
     // ABI desyncs at link time (return-register vs caller-clobber).
-    let mut calib_model_forward_sig = module.make_signature();
-    calib_model_forward_sig.call_conv = call_conv;
-    calib_model_forward_sig.params.push(AbiParam::new(ptr_ty));
-    calib_model_forward_sig.params.push(AbiParam::new(cl_types::I64));
-    calib_model_forward_sig.params.push(AbiParam::new(ptr_ty));
-    calib_model_forward_sig.params.push(AbiParam::new(cl_types::I64));
-    calib_model_forward_sig.returns.push(AbiParam::new(cl_types::I32));
+    //
+    // Task 17 (spec §4.5): the forward and backward wrappers share the
+    // exact same 4-param ABI — the backward wrapper internally runs
+    // forward then backward, so the scaffolding can call either with one
+    // call site shape. Build the signature once and reuse it for both
+    // declarations to keep them ABI-locked.
+    let mut calib_wrapper_sig = module.make_signature();
+    calib_wrapper_sig.call_conv = call_conv;
+    calib_wrapper_sig.params.push(AbiParam::new(ptr_ty));
+    calib_wrapper_sig.params.push(AbiParam::new(cl_types::I64));
+    calib_wrapper_sig.params.push(AbiParam::new(ptr_ty));
+    calib_wrapper_sig.params.push(AbiParam::new(cl_types::I64));
+    calib_wrapper_sig.returns.push(AbiParam::new(cl_types::I32));
+
     let calib_model_forward_id = if !needs_backward {
         Some(
             module
                 .declare_function(
                     "nsl_calib_model_forward",
                     Linkage::Import,
-                    &calib_model_forward_sig,
+                    &calib_wrapper_sig,
                 )
                 .map_err(|e| HarnessError::Infrastructure {
                     reason: format!("declare nsl_calib_model_forward: {e}"),
@@ -2217,21 +2224,14 @@ pub fn emit_calibration_scaffolding_object(
         None
     };
 
-    // Task 17 (spec §4.5): when needs_backward, the scaffolding calls
-    // nsl_calib_model_backward INSTEAD of nsl_calib_model_forward.
-    // The backward wrapper internally runs forward then backward, so calling
-    // forward separately would be redundant.  Same 4-param ABI as forward.
     let calib_model_backward_id = if needs_backward {
-        let mut sig = module.make_signature();
-        sig.call_conv = call_conv;
-        sig.params.push(AbiParam::new(ptr_ty));
-        sig.params.push(AbiParam::new(cl_types::I64));
-        sig.params.push(AbiParam::new(ptr_ty));
-        sig.params.push(AbiParam::new(cl_types::I64));
-        sig.returns.push(AbiParam::new(cl_types::I32));
         Some(
             module
-                .declare_function("nsl_calib_model_backward", Linkage::Import, &sig)
+                .declare_function(
+                    "nsl_calib_model_backward",
+                    Linkage::Import,
+                    &calib_wrapper_sig,
+                )
                 .map_err(|e| HarnessError::Infrastructure {
                     reason: format!("declare nsl_calib_model_backward: {e}"),
                 })?,
@@ -2783,7 +2783,12 @@ pub fn link_calibration_binary(
     )
     .map_err(|e| {
         let err_str = format!("link_calibration_binary: {e}");
-        if err_str.contains("nsl_calib_model_backward") {
+        // Task 19: only attribute a "backward wrapper missing" error when
+        // backward was actually requested. Otherwise an unrelated linker
+        // diagnostic that happens to mention the symbol name (e.g. as part
+        // of a multi-symbol error list) would produce a misleading
+        // "backward wrapper missing" message for a forward-only run.
+        if needs_backward && err_str.contains("nsl_calib_model_backward") {
             HarnessError::Infrastructure {
                 reason: format!(
                     "calibration: model-backward wrapper missing from calib_model.o.\n\

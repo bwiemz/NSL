@@ -162,8 +162,13 @@ pub fn validate_wggo_target_required_args(
 // WGGO Phase 2 Task 3: `@wggo_target` argument-expression validation
 // ---------------------------------------------------------------------------
 
-/// Returns `Some(field_symbol)` if `expr` is a `self.<field>` member-access.
-/// Otherwise returns `None`.
+/// Returns the field-name `Symbol` if `expr` is a `self.<field>`
+/// member-access; otherwise returns `None`.
+///
+/// The returned `Symbol` is the interned identifier of the `<field>`
+/// portion (e.g. for `self.q_proj`, returns `Some(<symbol of "q_proj">)`).
+/// Resolve it back to a string with `Interner::resolve(sym.0)` if you need
+/// the field name for diagnostics or field-type lookup.
 ///
 /// In the NSL AST, `self` is parsed as `ExprKind::SelfRef` (a distinct
 /// variant), and `self.foo` is `MemberAccess { object: SelfRef, member: foo }`.
@@ -373,6 +378,13 @@ pub fn validate_wggo_target_field_types(
         let summary = type_expr_summary(field_type, resolve_sym);
         // Per spec: head_dim must be an int; the four projections must be
         // Tensor. The article ("a"/"an") is chosen per the expected type.
+        //
+        // `expected` matches the literal output of `type_expr_summary` —
+        // for `head_dim` that is the string "int" (the NSL builtin). NSL
+        // does not currently expose other integer scalar types like
+        // `i32`/`i64`/etc. as field annotations, so this exact-string
+        // comparison is sufficient. If NSL ever adds them, extend
+        // `type_expr_summary` and broaden the match here.
         let (expected, article) = if arg_name == "head_dim" {
             ("int", "an")
         } else {

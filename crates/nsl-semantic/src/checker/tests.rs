@@ -1523,3 +1523,111 @@ model Attention:
         diags
     );
 }
+
+// -------------------------------------------------------------------------
+// Fast-follow coverage gaps from PR #132 review
+// -------------------------------------------------------------------------
+
+/// Task 2 M4: a top-level standalone `fn forward` decorated with
+/// `@wggo_target(<missing args>)` exercises the `checker/stmt.rs` arm
+/// directly (not the `checker/model.rs` arm). The placement check
+/// passes because the function name IS `forward`, so the required-args
+/// validator must still run and emit the missing-args diagnostic.
+///
+/// This complements `wggo_target_on_top_level_non_fn_errors` (which
+/// only exercises the `_ =>` non-fn arm) and the model-method tests
+/// (which exercise `model.rs`).
+#[test]
+fn wggo_target_top_level_forward_runs_required_args_validation() {
+    let src = r#"
+@wggo_target(w_q=self.q_proj)
+fn forward(self, x: Tensor<[4], f32>) -> Tensor<[4], f32>:
+    return x
+"#;
+    let diags = check_source(src);
+    let arg_errs: Vec<_> = diags
+        .iter()
+        .filter(|d| d.message.contains("@wggo_target requires arguments"))
+        .collect();
+    assert_eq!(
+        arg_errs.len(),
+        1,
+        "stmt.rs arm must run required-args validation on top-level `fn forward` with @wggo_target; got: {:?}",
+        diags
+    );
+    let msg = &arg_errs[0].message;
+    for missing in ["w_k", "w_v", "w_o", "head_dim"] {
+        assert!(
+            msg.contains(missing),
+            "missing-args diagnostic must list '{}'; got: {}",
+            missing,
+            msg
+        );
+    }
+}
+
+/// Task 3 fast-follow: `@wggo_target` arguments whose names are NOT in
+/// `WGGO_TARGET_REQUIRED_ARGS` (e.g. an extra `foo=...`) must be
+/// silently skipped by the self-field validator. They are neither
+/// required (Task 2) nor in scope for the self.<field> rule (Task 3).
+///
+/// Concretely: passing `foo=42` (an int-literal that would otherwise
+/// trigger the "must be a self.<field> reference" diagnostic if it were
+/// in scope) MUST NOT emit that diagnostic for `foo`.
+#[test]
+fn wggo_target_unknown_arg_name_is_silently_skipped_by_self_field_check() {
+    let src = r#"
+model Attention:
+    q_proj: Tensor<[4, 4], f32> = zeros([4, 4])
+    k_proj: Tensor<[4, 4], f32> = zeros([4, 4])
+    v_proj: Tensor<[4, 4], f32> = zeros([4, 4])
+    o_proj: Tensor<[4, 4], f32> = zeros([4, 4])
+    head_dim: Tensor<[4, 4], f32> = zeros([4, 4])
+
+    @wggo_target(w_q=self.q_proj, w_k=self.k_proj, w_v=self.v_proj, w_o=self.o_proj, head_dim=self.head_dim, foo=42)
+    fn forward(self, x: Tensor<[4], f32>) -> Tensor<[4], f32>:
+        return x
+"#;
+    let diags = check_source(src);
+    assert!(
+        !diags.iter().any(|d| {
+            d.message
+                .contains("argument 'foo' must be a self.<field> reference")
+        }),
+        "extra arg 'foo' must NOT trigger the self.<field> diagnostic; got: {:?}",
+        diags
+    );
+}
+
+/// Task 4 fast-follow: a `self.<field>` arg that resolves to a method on
+/// the model (not a `LayerDecl`) must report `not found in model` —
+/// methods are absent from the field-type map by design. This locks in
+/// the contract that fields and methods live in disjoint namespaces for
+/// `@wggo_target`.
+#[test]
+fn wggo_target_method_arg_falls_through_to_unknown_field() {
+    let src = r#"
+model Attention:
+    q_proj: Tensor<[4, 4], f32> = zeros([4, 4])
+    k_proj: Tensor<[4, 4], f32> = zeros([4, 4])
+    v_proj: Tensor<[4, 4], f32> = zeros([4, 4])
+    o_proj: Tensor<[4, 4], f32> = zeros([4, 4])
+    head_dim: Tensor<[4, 4], f32> = zeros([4, 4])
+
+    fn helper(self) -> int:
+        return 4
+
+    @wggo_target(w_q=self.helper, w_k=self.k_proj, w_v=self.v_proj, w_o=self.o_proj, head_dim=self.head_dim)
+    fn forward(self, x: Tensor<[4], f32>) -> Tensor<[4], f32>:
+        return x
+"#;
+    let diags = check_source(src);
+    assert!(
+        diags.iter().any(|d| {
+            d.message
+                .contains("'self.helper' not found in model 'Attention'")
+        }),
+        "method-typed self.<method> arg must surface as `not found in model` (methods are not in the field-type map); got: {:?}",
+        diags
+    );
+}
