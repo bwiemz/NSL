@@ -521,6 +521,11 @@ use std::path::Path;
 
 const AWQ_SIDECAR_KEY: &str = "awq_activation_scales";
 const AWQ_SIDECAR_VERSION: u32 = 1;
+/// JSON schema version for the combined calibration sidecar (AWQ +
+/// WGGO). Bumped when the JSON top-level shape changes incompatibly.
+/// Distinct from `AWQ_SIDECAR_VERSION` which versions the AWQ
+/// activation-scales binary blob inside `hooks.awq_activation_scales`.
+const CALIB_SIDECAR_JSON_VERSION: u32 = 2;
 
 #[derive(Debug, Clone)]
 pub struct AwqScales {
@@ -817,84 +822,264 @@ pub struct AwqProjectionDescriptor {
     pub running_ptr:  *const f32,
 }
 
-/// Write an AWQ activation-scales sidecar JSON file.
+/// Per-layer WGGO Phase 2 gradient-importance descriptor.
+///
+/// Field layout is `#[repr(C)]` and pinned by spec §6.2 of the WGGO
+/// Phase 2 merge-gate completion design. Future additions extend
+/// additively after `batches_observed`; the receiver checks
+/// `version == 1` and rejects unknown versions with code 5
+/// (`UnknownVersion`).
+///
+/// `running_buffer_len` is the f64 element count at `running_ptr`;
+/// equal to n_output_heads per the calibration spec's
+/// per-output-head reduction shape, but the FFI itself is neutral
+/// on attention semantics — it just reads f64s.
+#[repr(C)]
+pub struct WggoLayerDescriptor {
+    pub version: u32,
+    pub _pad0: u32,
+    pub layer_key_ptr: *const u8,
+    pub layer_key_len: usize,
+    pub running_buffer_len: u32,
+    pub _pad1: u32,
+    pub running_ptr: *const f64,
+    pub batches_observed: u32,
+    pub _pad2: u32,
+}
+
+/// Write a combined calibration sidecar JSON file with AWQ + WGGO data.
+///
+/// Atomicity: builds the full JSON in memory, writes to `<path>.tmp`,
+/// fsyncs, and renames to `<path>`. A subprocess crash mid-write
+/// leaves a stale `.tmp` file but never a corrupted sidecar. See
+/// `write_atomic` for the same-filesystem requirement.
 ///
 /// Return codes:
 ///   0 = success
 ///   1 = sidecar_path is null or not valid UTF-8
-///   2 = a projection name is not valid UTF-8, or JSON serialization failed
-///   3 = disk write failed
+///   2 = a name string is not valid UTF-8, or JSON serialization failed
+///   3 = disk write or rename failed
+///   4 = EmptyCalibration (both AWQ and WGGO descriptor counts are zero)
+///   5 = UnknownVersion (a WggoLayerDescriptor.version != 1)
 #[no_mangle]
-pub extern "C" fn nsl_awq_write_sidecar(
+pub extern "C" fn nsl_calib_write_sidecar(
     sidecar_path_ptr: *const u8,
     sidecar_path_len: usize,
-    projections_ptr:  *const AwqProjectionDescriptor,
-    projections_len:  usize,
+    awq_descriptors_ptr: *const AwqProjectionDescriptor,
+    awq_count: usize,
+    wggo_descriptors_ptr: *const WggoLayerDescriptor,
+    wggo_count: usize,
 ) -> i32 {
-    if sidecar_path_ptr.is_null() { return 1; }
-    let path_bytes = unsafe {
-        std::slice::from_raw_parts(sidecar_path_ptr, sidecar_path_len)
-    };
+    if sidecar_path_ptr.is_null() {
+        return 1;
+    }
+    // SAFETY: caller guarantees that `sidecar_path_ptr` is valid for reads of
+    // `sidecar_path_len` bytes, properly aligned, and non-aliased for the
+    // lifetime of this call. The C-ABI contract documented on
+    // `nsl_calib_write_sidecar`'s docstring places this responsibility on the
+    // caller (the calibration subprocess scaffolding emitter).
+    let path_bytes = unsafe { std::slice::from_raw_parts(sidecar_path_ptr, sidecar_path_len) };
     let path_str = match std::str::from_utf8(path_bytes) {
         Ok(s) => s,
         Err(_) => return 1,
     };
 
-    let descs: &[AwqProjectionDescriptor] = if projections_len == 0 {
+    if awq_count == 0 && wggo_count == 0 {
+        return 4; // EmptyCalibration
+    }
+
+    // ── AWQ descriptors → activation-scales blob ────────────────────────
+    let awq_descs: &[AwqProjectionDescriptor] = if awq_count == 0 {
         &[]
     } else {
-        unsafe { std::slice::from_raw_parts(projections_ptr, projections_len) }
+        // SAFETY: caller guarantees that `awq_descriptors_ptr` is valid for reads
+        // of `awq_count` elements of `AwqProjectionDescriptor`, properly aligned,
+        // and non-aliased for the lifetime of this call. The C-ABI contract
+        // documented on `nsl_calib_write_sidecar`'s docstring places this
+        // responsibility on the caller (the calibration subprocess scaffolding
+        // emitter).
+        unsafe { std::slice::from_raw_parts(awq_descriptors_ptr, awq_count) }
     };
 
-    let mut by_projection = std::collections::BTreeMap::<String, Vec<f32>>::new();
-    for d in descs {
+    let mut awq_by_projection = std::collections::BTreeMap::<String, Vec<f32>>::new();
+    for d in awq_descs {
+        // SAFETY: caller guarantees that `d.path_ptr` is valid for reads of
+        // `d.path_len` bytes, properly aligned, and non-aliased for the lifetime
+        // of this call. The C-ABI contract on `nsl_calib_write_sidecar` places
+        // this responsibility on the caller.
         let name_bytes = unsafe { std::slice::from_raw_parts(d.path_ptr, d.path_len) };
         let name = match std::str::from_utf8(name_bytes) {
             Ok(s) => s.to_string(),
             Err(_) => return 2,
         };
+        // SAFETY: caller guarantees that `d.running_ptr` is valid for reads of
+        // `d.channels` f32 elements, properly aligned, and non-aliased for the
+        // lifetime of this call. The C-ABI contract on `nsl_calib_write_sidecar`
+        // places this responsibility on the caller.
         let values = unsafe {
             std::slice::from_raw_parts(d.running_ptr, d.channels as usize).to_vec()
         };
-        by_projection.insert(name, values);
+        awq_by_projection.insert(name, values);
     }
 
-    let mut blob = Vec::new();
-    blob.extend_from_slice(&AWQ_SIDECAR_VERSION.to_le_bytes());
-    blob.extend_from_slice(&(by_projection.len() as u32).to_le_bytes());
-    for (name, scales) in &by_projection {
-        let name_bytes = name.as_bytes();
-        blob.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
-        blob.extend_from_slice(name_bytes);
-        blob.extend_from_slice(&(scales.len() as u32).to_le_bytes());
-        for scale in scales {
-            blob.extend_from_slice(&scale.to_le_bytes());
+    let mut awq_blob_b64: Option<String> = None;
+    if !awq_by_projection.is_empty() {
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&AWQ_SIDECAR_VERSION.to_le_bytes());
+        blob.extend_from_slice(&(awq_by_projection.len() as u32).to_le_bytes());
+        for (name, scales) in &awq_by_projection {
+            let name_bytes = name.as_bytes();
+            blob.extend_from_slice(&(name_bytes.len() as u32).to_le_bytes());
+            blob.extend_from_slice(name_bytes);
+            blob.extend_from_slice(&(scales.len() as u32).to_le_bytes());
+            for scale in scales {
+                blob.extend_from_slice(&scale.to_le_bytes());
+            }
         }
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        awq_blob_b64 = Some(STANDARD.encode(blob));
     }
 
-    use base64::{engine::general_purpose::STANDARD, Engine};
-    let awq_blob_b64 = STANDARD.encode(blob);
+    // ── WGGO descriptors → wggo_head_gradients map ──────────────────────
+    let wggo_descs: &[WggoLayerDescriptor] = if wggo_count == 0 {
+        &[]
+    } else {
+        if wggo_descriptors_ptr.is_null() {
+            // Defensive: count > 0 with null pointer is a caller bug. Treat
+            // as a path-error (1) since "valid pointer" is part of the FFI
+            // contract and the closest existing error code.
+            return 1;
+        }
+        // SAFETY: caller guarantees that `wggo_descriptors_ptr` is valid for
+        // reads of `wggo_count` elements of `WggoLayerDescriptor`, properly
+        // aligned, and non-aliased for the lifetime of this call. The C-ABI
+        // contract documented on `nsl_calib_write_sidecar`'s docstring places
+        // this responsibility on the caller (the calibration subprocess
+        // scaffolding emitter). The null check above ensures the pointer is
+        // non-null before this call.
+        unsafe { std::slice::from_raw_parts(wggo_descriptors_ptr, wggo_count) }
+    };
 
-    let json = serde_json::json!({
-        "version": 2,
-        "checkpoint_sha256": "",
-        "calibration_data_sha256": "",
-        "hook_set_sha256": "",
-        "cache_key_digest": "",
-        "num_samples_used": 0,
-        "hooks": {
-            "awq_activation_scales": awq_blob_b64,
-        },
-    });
+    let mut wggo_by_layer = std::collections::BTreeMap::<String, serde_json::Value>::new();
+    for d in wggo_descs {
+        if d.version != 1 {
+            return 5; // UnknownVersion
+        }
+        // SAFETY: caller guarantees that `d.layer_key_ptr` is valid for reads
+        // of `d.layer_key_len` bytes, properly aligned, and non-aliased for the
+        // lifetime of this call. The C-ABI contract on `nsl_calib_write_sidecar`
+        // places this responsibility on the caller.
+        let key_bytes = unsafe { std::slice::from_raw_parts(d.layer_key_ptr, d.layer_key_len) };
+        let layer_key = match std::str::from_utf8(key_bytes) {
+            Ok(s) => s.to_string(),
+            Err(_) => return 2,
+        };
+        // SAFETY: caller guarantees that `d.running_ptr` is valid for reads of
+        // `d.running_buffer_len` f64 elements, properly aligned, and non-aliased
+        // for the lifetime of this call. The C-ABI contract on
+        // `nsl_calib_write_sidecar` places this responsibility on the caller.
+        let f64s = unsafe {
+            std::slice::from_raw_parts(d.running_ptr, d.running_buffer_len as usize)
+        };
+        // Convert f64 → f32 at the boundary; sanitize NaN/Inf to 0.0.
+        let per_head_score: Vec<f32> = f64s
+            .iter()
+            .map(|v| {
+                let f = *v as f32;
+                if f.is_finite() { f } else { 0.0 }
+            })
+            .collect();
 
-    let bytes = match serde_json::to_vec(&json) {
+        wggo_by_layer.insert(
+            layer_key,
+            serde_json::json!({
+                "per_head_score": per_head_score,
+                "batches_observed": d.batches_observed,
+            }),
+        );
+    }
+
+    // ── Compose the JSON ────────────────────────────────────────────────
+    let mut hooks_obj = serde_json::Map::new();
+    if let Some(b64) = awq_blob_b64 {
+        hooks_obj.insert("awq_activation_scales".to_string(), serde_json::Value::String(b64));
+    }
+
+    let mut top = serde_json::Map::new();
+    top.insert("version".into(), serde_json::json!(CALIB_SIDECAR_JSON_VERSION));
+    top.insert("checkpoint_sha256".into(), serde_json::json!(""));
+    top.insert("calibration_data_sha256".into(), serde_json::json!(""));
+    top.insert("hook_set_sha256".into(), serde_json::json!(""));
+    top.insert("cache_key_digest".into(), serde_json::json!(""));
+    top.insert("num_samples_used".into(), serde_json::json!(0));
+    if !hooks_obj.is_empty() {
+        top.insert("hooks".into(), serde_json::Value::Object(hooks_obj));
+    }
+    if !wggo_by_layer.is_empty() {
+        top.insert(
+            "wggo_head_gradients".into(),
+            serde_json::json!({ "by_layer": wggo_by_layer }),
+        );
+    }
+
+    let bytes = match serde_json::to_vec(&serde_json::Value::Object(top)) {
         Ok(b) => b,
         Err(_) => return 2,
     };
-    match std::fs::write(path_str, bytes) {
+
+    match write_atomic(&bytes, std::path::Path::new(path_str)) {
         Ok(_) => 0,
         Err(_) => 3,
     }
+}
+
+/// Deprecated thin shim retained for the rename transition. Forwards to
+/// `nsl_calib_write_sidecar` with empty WGGO arrays. Scheduled for
+/// deletion in milestone N+1; deletion gated by workspace-wide grep
+/// confirming no callers remain.
+#[no_mangle]
+#[deprecated(note = "use nsl_calib_write_sidecar")]
+pub extern "C" fn nsl_awq_write_sidecar(
+    sidecar_path_ptr: *const u8,
+    sidecar_path_len: usize,
+    projections_ptr: *const AwqProjectionDescriptor,
+    projections_len: usize,
+) -> i32 {
+    nsl_calib_write_sidecar(
+        sidecar_path_ptr,
+        sidecar_path_len,
+        projections_ptr,
+        projections_len,
+        std::ptr::null(),
+        0,
+    )
+}
+
+// ---------------------------------------------------------------------------
+// Atomic file write — write-temp-then-rename + fsync.
+// Spec §6.4 of WGGO Phase 2 merge-gate completion design.
+// ---------------------------------------------------------------------------
+
+/// Write `bytes` to `final_path` atomically using a sibling temp file
+/// and `rename`. The temp file is `final_path.with_extension("tmp")` —
+/// a sibling, not under `/tmp` — to ensure same-filesystem rename.
+///
+/// On crash between `File::create` and `rename`, the live sidecar at
+/// `final_path` is unchanged; the temp file is left behind for cleanup
+/// but never reaches the live path partially-written.
+///
+/// `sync_all()` is mandatory: without it the rename can complete
+/// while the data is still in kernel page cache, producing a
+/// rename'd-but-empty file on power loss between `rename` and flush.
+fn write_atomic(bytes: &[u8], final_path: &std::path::Path) -> std::io::Result<()> {
+    use std::io::Write;
+    let tmp_path = final_path.with_extension("tmp");
+    {
+        let mut tmp_file = std::fs::File::create(&tmp_path)?;
+        tmp_file.write_all(bytes)?;
+        tmp_file.sync_all()?;
+    }
+    std::fs::rename(&tmp_path, final_path)
 }
 
 #[cfg(test)]
@@ -903,6 +1088,7 @@ mod write_sidecar_tests {
     use tempfile::NamedTempFile;
 
     #[test]
+    #[allow(deprecated)] // Exercises the shim during rename transition.
     fn writes_sidecar_with_two_projections() {
         let tmp = NamedTempFile::new().unwrap();
         let path_str = tmp.path().to_string_lossy().to_string();
@@ -941,6 +1127,7 @@ mod write_sidecar_tests {
     }
 
     #[test]
+    #[allow(deprecated)] // Exercises the shim during rename transition.
     fn returns_1_on_invalid_utf8_path() {
         let bad: [u8; 4] = [0xff, 0xfe, 0xfd, 0xfc];
         let rc = nsl_awq_write_sidecar(
@@ -948,5 +1135,204 @@ mod write_sidecar_tests {
             std::ptr::null(), 0,
         );
         assert_eq!(rc, 1);
+    }
+
+    #[test]
+    fn nsl_calib_write_sidecar_awq_only_succeeds() {
+        let tmp = NamedTempFile::new().unwrap();
+        let path_str = tmp.path().to_string_lossy().to_string();
+
+        let up_path = "TinyMLP.up_proj";
+        let up_buf: Vec<f32> = (0..64).map(|i| i as f32).collect();
+        let descs = vec![AwqProjectionDescriptor {
+            path_ptr: up_path.as_ptr(),
+            path_len: up_path.len(),
+            channels: 64,
+            _pad: 0,
+            running_ptr: up_buf.as_ptr(),
+        }];
+
+        let rc = nsl_calib_write_sidecar(
+            path_str.as_ptr(), path_str.len(),
+            descs.as_ptr(), descs.len(),
+            std::ptr::null(), 0,  // empty WGGO array
+        );
+        assert_eq!(rc, 0);
+
+        let scales = AwqScales::from_sidecar_json_path(tmp.path()).unwrap();
+        assert_eq!(scales.by_projection["TinyMLP.up_proj"].len(), 64);
+    }
+
+    #[test]
+    fn nsl_calib_write_sidecar_wggo_only_succeeds() {
+        let tmp = NamedTempFile::new().unwrap();
+        let path_str = tmp.path().to_string_lossy().to_string();
+
+        let layer_key = "AttentionMLP";
+        let run_buf: Vec<f64> = vec![0.001, 0.002, 0.003, 0.004];
+        let wggo_descs = vec![WggoLayerDescriptor {
+            version: 1,
+            _pad0: 0,
+            layer_key_ptr: layer_key.as_ptr(),
+            layer_key_len: layer_key.len(),
+            running_buffer_len: 4,
+            _pad1: 0,
+            running_ptr: run_buf.as_ptr(),
+            batches_observed: 8,
+            _pad2: 0,
+        }];
+
+        let rc = nsl_calib_write_sidecar(
+            path_str.as_ptr(), path_str.len(),
+            std::ptr::null(), 0,
+            wggo_descs.as_ptr(), wggo_descs.len(),
+        );
+        assert_eq!(rc, 0);
+
+        let raw = std::fs::read_to_string(tmp.path()).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let by_layer = &json["wggo_head_gradients"]["by_layer"];
+        let scores = by_layer["AttentionMLP"]["per_head_score"].as_array().unwrap();
+        assert_eq!(scores.len(), 4);
+        let s0 = scores[0].as_f64().unwrap();
+        assert!((s0 - 0.001).abs() < 1e-6, "score[0] = {s0}");
+        let batches = by_layer["AttentionMLP"]["batches_observed"].as_u64().unwrap();
+        assert_eq!(batches, 8);
+    }
+
+    #[test]
+    fn nsl_calib_write_sidecar_mixed_writes_both_keys() {
+        let tmp = NamedTempFile::new().unwrap();
+        let path_str = tmp.path().to_string_lossy().to_string();
+
+        // AWQ side
+        let awq_path = "AttentionMLP.q_proj";
+        let awq_buf: Vec<f32> = (0..32).map(|i| i as f32).collect();
+        let awq_descs = vec![AwqProjectionDescriptor {
+            path_ptr: awq_path.as_ptr(),
+            path_len: awq_path.len(),
+            channels: 32,
+            _pad: 0,
+            running_ptr: awq_buf.as_ptr(),
+        }];
+
+        // WGGO side
+        let layer_key = "AttentionMLP";
+        let run_buf: Vec<f64> = vec![0.1, 0.2, 0.3, 0.4];
+        let wggo_descs = vec![WggoLayerDescriptor {
+            version: 1,
+            _pad0: 0,
+            layer_key_ptr: layer_key.as_ptr(),
+            layer_key_len: layer_key.len(),
+            running_buffer_len: 4,
+            _pad1: 0,
+            running_ptr: run_buf.as_ptr(),
+            batches_observed: 16,
+            _pad2: 0,
+        }];
+
+        let rc = nsl_calib_write_sidecar(
+            path_str.as_ptr(), path_str.len(),
+            awq_descs.as_ptr(), awq_descs.len(),
+            wggo_descs.as_ptr(), wggo_descs.len(),
+        );
+        assert_eq!(rc, 0);
+
+        let raw = std::fs::read_to_string(tmp.path()).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert!(
+            json["hooks"]["awq_activation_scales"].is_string(),
+            "AWQ blob missing in mixed write: {raw}"
+        );
+        assert!(
+            json["wggo_head_gradients"]["by_layer"]["AttentionMLP"].is_object(),
+            "WGGO entry missing in mixed write: {raw}"
+        );
+    }
+
+    #[test]
+    fn nsl_calib_write_sidecar_empty_returns_4() {
+        let tmp = NamedTempFile::new().unwrap();
+        let path_str = tmp.path().to_string_lossy().to_string();
+
+        let rc = nsl_calib_write_sidecar(
+            path_str.as_ptr(), path_str.len(),
+            std::ptr::null(), 0,
+            std::ptr::null(), 0,
+        );
+        assert_eq!(rc, 4, "both-empty descriptor counts must return EmptyCalibration (4)");
+
+        // The sidecar file must NOT be written.
+        let metadata = std::fs::metadata(tmp.path()).unwrap();
+        assert_eq!(metadata.len(), 0, "EmptyCalibration must not write any bytes");
+    }
+
+    #[test]
+    fn nsl_calib_write_sidecar_unknown_version_returns_5() {
+        let tmp = NamedTempFile::new().unwrap();
+        let path_str = tmp.path().to_string_lossy().to_string();
+
+        let layer_key = "X";
+        let run_buf: Vec<f64> = vec![0.0];
+        let wggo_descs = vec![WggoLayerDescriptor {
+            version: 99, // unknown
+            _pad0: 0,
+            layer_key_ptr: layer_key.as_ptr(),
+            layer_key_len: layer_key.len(),
+            running_buffer_len: 1,
+            _pad1: 0,
+            running_ptr: run_buf.as_ptr(),
+            batches_observed: 1,
+            _pad2: 0,
+        }];
+
+        let rc = nsl_calib_write_sidecar(
+            path_str.as_ptr(), path_str.len(),
+            std::ptr::null(), 0,
+            wggo_descs.as_ptr(), wggo_descs.len(),
+        );
+        assert_eq!(rc, 5, "unknown WggoLayerDescriptor.version must return UnknownVersion (5)");
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn nsl_calib_write_sidecar_atomic_under_simulated_partial_state() {
+        // We can't actually crash the process mid-write, but we can verify
+        // the property: after a successful write, the live path matches the
+        // intended bytes exactly, and the .tmp sibling is gone. This locks
+        // in the write-temp-then-rename contract from spec §6.4.
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let final_path = tmp_dir.path().join("sidecar.json");
+
+        let awq_path = "X.proj";
+        let awq_buf: Vec<f32> = vec![1.0, 2.0];
+        let awq_descs = vec![AwqProjectionDescriptor {
+            path_ptr: awq_path.as_ptr(),
+            path_len: awq_path.len(),
+            channels: 2,
+            _pad: 0,
+            running_ptr: awq_buf.as_ptr(),
+        }];
+
+        let final_path_str = final_path.to_string_lossy().to_string();
+        let rc = nsl_calib_write_sidecar(
+            final_path_str.as_ptr(), final_path_str.len(),
+            awq_descs.as_ptr(), awq_descs.len(),
+            std::ptr::null(), 0,
+        );
+        assert_eq!(rc, 0);
+
+        // Live file exists and parses.
+        assert!(final_path.exists(), "final sidecar must exist after rc=0");
+        let raw = std::fs::read_to_string(&final_path).unwrap();
+        let _json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+
+        // Tmp sibling MUST NOT remain after a successful write.
+        let tmp_sibling = final_path.with_extension("tmp");
+        assert!(
+            !tmp_sibling.exists(),
+            "tmp sibling at {} must be renamed away on success",
+            tmp_sibling.display()
+        );
     }
 }
