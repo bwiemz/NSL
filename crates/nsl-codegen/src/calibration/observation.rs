@@ -103,16 +103,32 @@ impl ObservationPlan {
 
 impl ObservationSet {
     /// Returns `true` if any variant inside this set requires the
-    /// forward pass to produce observable intermediate tensors
-    /// (i.e. `ForwardActivations` or `LinearInputActivations` with
-    /// at least one target).  Used by the calibration driver to
-    /// decide whether the real subprocess codegen path (which emits
-    /// model-forward IR) is required vs. the in-process stub.
+    /// forward pass to produce observable intermediate tensors.
+    ///
+    /// Three variants need forward:
+    /// - `ForwardActivations` (with at least one target) — observes
+    ///   intermediate activations directly.
+    /// - `LinearInputActivations` (with at least one target) — observes
+    ///   the input to a linear layer.
+    /// - `BackwardGradients` — backward propagation requires the forward
+    ///   pass to have populated activation tensors that the backward
+    ///   computation reads. There is no way to compute gradients without
+    ///   running forward first; treating `BackwardGradients` as
+    ///   forward-free was a latent bug that routed WGGO-only calibration
+    ///   through `build_sidecar_from_stub` (the simulated host-side path)
+    ///   instead of the real subprocess. See PR #139's `#[ignore]`
+    ///   message on the WGGO merge-gate test for the failure mode.
+    ///
+    /// `Empty` and `Weights(_)` do not need forward (weights are static).
+    ///
+    /// Used by the calibration driver to decide whether the real
+    /// subprocess codegen path (which emits model-forward IR) is required
+    /// vs. the in-process stub.
     pub fn needs_forward_pass(&self) -> bool {
         match self {
-            ObservationSet::Empty
-            | ObservationSet::BackwardGradients(_)
-            | ObservationSet::Weights(_) => false,
+            ObservationSet::Empty | ObservationSet::Weights(_) => false,
+            // Backward semantically requires forward (activations).
+            ObservationSet::BackwardGradients(_) => true,
             ObservationSet::ForwardActivations(v) => !v.is_empty(),
             ObservationSet::LinearInputActivations(v) => !v.is_empty(),
             ObservationSet::Union(children) => children.iter().any(Self::needs_forward_pass),
@@ -203,7 +219,9 @@ mod tests {
     #[test]
     fn needs_forward_pass_detects_every_variant_correctly() {
         assert!(!ObservationSet::Empty.needs_forward_pass());
-        assert!(!ObservationSet::BackwardGradients(vec![LayerRef::new("x")]).needs_forward_pass());
+        // Backward semantically requires forward (activations) — the
+        // backward pass reads forward-populated tensors.
+        assert!(ObservationSet::BackwardGradients(vec![LayerRef::new("x")]).needs_forward_pass());
         assert!(!ObservationSet::Weights(vec![ParamRef::new("w")]).needs_forward_pass());
         assert!(!ObservationSet::ForwardActivations(vec![]).needs_forward_pass());
         assert!(ObservationSet::ForwardActivations(vec![LayerRef::new("l")]).needs_forward_pass());
@@ -214,9 +232,16 @@ mod tests {
             ObservationSet::Weights(vec![ParamRef::new("w")]),
             ObservationSet::LinearInputActivations(vec![ProjectionRef::new("p")]),
         ]).needs_forward_pass());
-        assert!(!ObservationSet::Union(vec![
+        // Union with BackwardGradients: now true (was false before the
+        // semantics fix — backward needs forward to compute activations).
+        assert!(ObservationSet::Union(vec![
             ObservationSet::Empty,
             ObservationSet::BackwardGradients(vec![LayerRef::new("x")]),
+        ]).needs_forward_pass());
+        // Union of weight-only + empty is still false (no forward dependency).
+        assert!(!ObservationSet::Union(vec![
+            ObservationSet::Empty,
+            ObservationSet::Weights(vec![ParamRef::new("w")]),
         ]).needs_forward_pass());
     }
 
