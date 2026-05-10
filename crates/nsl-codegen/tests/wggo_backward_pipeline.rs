@@ -176,28 +176,31 @@ fn wggo_fixture_compile_bundle() -> std::sync::Arc<nsl_codegen::calibration::Cal
 /// deviation well below 10⁻¹².  The 10⁻⁴ guard is intentionally generous to
 /// absorb any f32/f64 promotion boundary at the BSS read-back step.
 #[test]
-#[ignore = "WGGO Phase 2 merge-gate: BLOCKED on emit_calibration_model_object's \
-            AWQ-only projection-list assumption. \
+#[ignore = "Blocked on #134 (decouple calibration from compile_train_block + remove \
+            AWQ-only assumptions across calibration entry points). \
             \
-            Earlier blockers shipped: bake-indices on WggoGradTarget, real \
+            Resolution comes via #134's broader reshape, NOT as a standalone \
+            micro-PR — the AWQ-first ossification is multi-site (observation-set, \
+            compile_train_block-vs-real_subprocess_entry drift, hop 6) and patching \
+            each manifestation in isolation produces churn without architectural \
+            cleanup. \
+            \
+            Specific remaining blocker (hop 6): emit_calibration_model_object \
+            (binary_codegen.rs:1771-1779) requires a non-empty calibration_retention \
+            list (AWQ projections) because it reads channels / model_name / \
+            transpose_fields from the first projection. WGGO-only flows have empty \
+            calibration_retention but populated calibration_grad_retention; the \
+            function rejects on the empty list before reaching the WGGO codegen \
+            path. WGGO targets carry equivalent metadata (class_name, w_*_shape) \
+            so the convergence in #134 will read from calibration_grad_retention \
+            when calibration_retention is empty. \
+            \
+            Earlier blockers already shipped: bake-indices on WggoGradTarget, real \
             emit_per_head_dot_abs_accum reduction, WggoLayerDescriptor stack-build \
             at the FFI call site, real_subprocess_entry entry-point switch (PR #139); \
             ObservationSet::BackwardGradients(_) → needs_forward_pass=true so \
-            WGGO-only registration routes through the real subprocess path \
-            instead of build_sidecar_from_stub. \
-            \
-            Remaining gap: emit_calibration_model_object (binary_codegen.rs:1771-1779) \
-            requires a non-empty calibration_retention list (AWQ projections) \
-            because it reads channels / model_name / transpose_fields from the \
-            first projection. WGGO-only flows have empty calibration_retention \
-            but populated calibration_grad_retention; the function rejects on \
-            the empty list before reaching the WGGO codegen path. The WGGO \
-            targets carry the same metadata (class_name, w_*_shape) so the fix \
-            is a fallback path that reads from calibration_grad_retention when \
-            calibration_retention is empty. Tracked under issue #134's broader \
-            'decouple calibration from compile_train_block' scope, which is \
-            the natural place to converge the AWQ-only assumptions in the \
-            calibration entry points."]
+            WGGO-only registration routes through the real subprocess path instead \
+            of build_sidecar_from_stub (PR #140). See #134 for scope rationale."]
 fn end_to_end_backward_subprocess_matches_analytical_reference() {
     let data_path = fixture("wggo_calib_data.safetensors");
     let weights_path = fixture("wggo_calib_weights.safetensors");
