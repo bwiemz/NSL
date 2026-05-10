@@ -6,15 +6,17 @@
 # byte-identical across runs. Exits 0 on success, 1 on any divergence.
 #
 # Used at commit 1a of #134 to verify the AWQ sidecar is deterministic
-# before commit 1b captures it as an insta baseline. Spec §6.1 forbids
-# papering over non-determinism with a hash digest — fix the source.
+# (against end_to_end_real_subprocess_matches_analytical_reference)
+# before commit 1b captures it as an insta baseline (snapshot_awq_sidecar_baseline).
+# After 1b, this script verifies the baseline test itself remains deterministic.
+# Spec §6.1 forbids papering over non-determinism with a hash digest — fix the source.
 
 set -euo pipefail
 
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
-TEST_NAME="end_to_end_real_subprocess_matches_analytical_reference"
+TEST_NAME="snapshot_awq_sidecar_baseline"
 
 echo "verify-awq-determinism: capturing 10 sequential SIDECAR_DUMP runs of $TEST_NAME"
 for i in $(seq 1 10); do

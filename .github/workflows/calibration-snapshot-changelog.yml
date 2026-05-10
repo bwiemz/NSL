@@ -1,0 +1,45 @@
+name: Calibration snapshot CHANGELOG enforcement
+
+on:
+  pull_request:
+    paths:
+      - 'crates/nsl-codegen/tests/snapshots/awq_*.snap'
+
+jobs:
+  enforce-changelog:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify CHANGELOG-CALIBRATION.md has entry for this PR
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: |
+          set -euo pipefail
+          # Find awq_*.snap files changed in this PR.
+          CHANGED_SNAPSHOTS=$(git diff --name-only "origin/${BASE_REF}...HEAD" \
+            -- 'crates/nsl-codegen/tests/snapshots/awq_*.snap' || true)
+          if [ -z "$CHANGED_SNAPSHOTS" ]; then
+            echo "No AWQ snapshot files changed; skipping CHANGELOG check."
+            exit 0
+          fi
+          echo "Changed AWQ snapshots:"
+          echo "$CHANGED_SNAPSHOTS"
+          echo ""
+          # Verify CHANGELOG-CALIBRATION.md was modified in this PR.
+          if ! git diff --name-only "origin/${BASE_REF}...HEAD" | grep -q '^CHANGELOG-CALIBRATION\.md$'; then
+            echo "FAIL: PR modifies AWQ snapshot file(s) but does not update CHANGELOG-CALIBRATION.md."
+            echo "Per #134 §6.3, any snapshot-touching PR must add a corresponding entry."
+            echo "See CHANGELOG-CALIBRATION.md for the entry format."
+            exit 1
+          fi
+          # Verify the CHANGELOG entry references this PR number.
+          if ! grep -q "PR #${PR_NUMBER}" CHANGELOG-CALIBRATION.md; then
+            echo "FAIL: CHANGELOG-CALIBRATION.md was modified but does not reference PR #${PR_NUMBER}."
+            echo "Add an entry of the form: '## YYYY-MM-DD — PR #${PR_NUMBER} — <title>'"
+            exit 1
+          fi
+          echo "PASS: CHANGELOG-CALIBRATION.md has entry referencing PR #${PR_NUMBER}."
