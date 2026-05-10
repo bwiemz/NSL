@@ -644,6 +644,17 @@ fn end_to_end_real_subprocess_matches_analytical_reference() {
         .expect("real subprocess pipeline runs end-to-end")
         .sidecar;
 
+    // #134 §6.1 determinism verification: when SIDECAR_DUMP=1, print the
+    // canonical sidecar JSON between sentinel lines so
+    // scripts/verify-awq-determinism.sh can extract and compare across runs.
+    if std::env::var("SIDECAR_DUMP").is_ok() {
+        let canonical = serde_json::to_string_pretty(&sidecar)
+            .expect("Sidecar serializes to JSON");
+        eprintln!("SIDECAR_JSON_START");
+        eprintln!("{canonical}");
+        eprintln!("SIDECAR_JSON_END");
+    }
+
     let calib = read_safetensors_flat(&data_path, "calibration");
     let up_w = read_safetensors_flat(&weights_path, "TinyMLP.up_proj");
     let (up_ref, down_ref) = reference_awq_scales(&calib, &up_w);
