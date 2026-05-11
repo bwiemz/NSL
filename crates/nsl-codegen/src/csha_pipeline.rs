@@ -564,4 +564,105 @@ mod tests {
         let b = smem_budget_bytes(gpu);
         assert!(b <= 228 * 1024);
     }
+
+    // ----------------------------------------------------------------------
+    // B1.1 coverage: configurations newly admitted by the corrected formula
+    // ----------------------------------------------------------------------
+    //
+    // The B1.1 corrections (see V3 findings doc) shrink
+    // `pipeline_smem_bytes` for typical shapes via two competing effects:
+    //   * `+24576` from doubled K/V tiles + chunk staging (worst-case
+    //     inflation)
+    //   * `-bq*hd*4 - 2*hd*min(dm,256)` from O_acc zeroed + w_tile replaced
+    //     (worst-case savings)
+    //
+    // The net effect is a NEGATIVE delta for the common "hd=256" regime
+    // (e.g. -110_592 bytes at balanced tiles, -78_848 at compute-bound),
+    // which moves configurations that were over the 228 KB H100 cap into
+    // the admitted set.  Each test below picks a representative such
+    // config from the §3.4 supported matrix and asserts the planner now
+    // admits it at Pipeline level.
+
+    fn h100() -> &'static GpuSpec {
+        find_gpu("H100").unwrap_or_else(default_gpu)
+    }
+
+    fn shape_with(d_model: u64, head_dim: u64) -> LayerShape {
+        LayerShape {
+            batch: 1,
+            seq: 1024,
+            d_model,
+            head_dim,
+            n_kv_heads: 8,
+            dtype_bytes: 2,
+        }
+    }
+
+    #[test]
+    fn newly_unblocked_balanced_dm512_hd256_admits_pipeline() {
+        // roofline: ai = 512/2 = 256, balanced regime → (bq=64, bkv=64).
+        // Pre-B1.1:  74240 ... no wait — at hd=256 not hd=64:
+        //   pre  = 32768 + 32768 + 32768 + 65536 + 512 + 131072 = 295424  (over 228 KB)
+        //   post = 32768 + 131072 + 0 + 512 + 20480              = 184832  (fits)
+        let gpu = h100();
+        let plan = plan_layer(
+            "newly_unblocked_balanced_dm512_hd256",
+            shape_with(512, 256),
+            gpu,
+            FusionLevel::Pipeline,
+        );
+        assert_eq!(
+            plan.level,
+            FusionLevel::Pipeline,
+            "balanced (64,64) at hd=256 must admit Pipeline post-B1.1; got level={:?} reason={:?}",
+            plan.level,
+            plan.downgrade_reason
+        );
+        assert!(plan.downgrade_reason.is_none());
+    }
+
+    #[test]
+    fn newly_unblocked_balanced_dm1024_hd256_admits_pipeline() {
+        // roofline: ai = 1024/2 = 512, still balanced → (bq=64, bkv=64).
+        // Pre-B1.1: 295424 (same as dm=512 case — min(dm,256) caps the
+        //                   pre-correction w_tile term)
+        // Post-B1.1: 184832 (chunk staging does not depend on dm)
+        let gpu = h100();
+        let plan = plan_layer(
+            "newly_unblocked_balanced_dm1024_hd256",
+            shape_with(1024, 256),
+            gpu,
+            FusionLevel::Pipeline,
+        );
+        assert_eq!(
+            plan.level,
+            FusionLevel::Pipeline,
+            "balanced (64,64) at hd=256 dm=1024 must admit Pipeline post-B1.1; got level={:?} reason={:?}",
+            plan.level,
+            plan.downgrade_reason
+        );
+        assert!(plan.downgrade_reason.is_none());
+    }
+
+    #[test]
+    fn newly_unblocked_compute_bound_dm2048_hd256_admits_pipeline() {
+        // roofline: ai = 2048/2 = 1024, compute-bound → (bq=32, bkv=64).
+        //   pre  = 16384 + 32768 + 32768 + 32768 + 256 + 131072 = 246016  (over 228 KB)
+        //   post = 16384 + 131072 + 0 + 256 + 19456              = 167168  (fits)
+        let gpu = h100();
+        let plan = plan_layer(
+            "newly_unblocked_compute_dm2048_hd256",
+            shape_with(2048, 256),
+            gpu,
+            FusionLevel::Pipeline,
+        );
+        assert_eq!(
+            plan.level,
+            FusionLevel::Pipeline,
+            "compute-bound (32,64) at hd=256 dm=2048 must admit Pipeline post-B1.1; got level={:?} reason={:?}",
+            plan.level,
+            plan.downgrade_reason
+        );
+        assert!(plan.downgrade_reason.is_none());
+    }
 }
