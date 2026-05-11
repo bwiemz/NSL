@@ -104,6 +104,12 @@ impl<'a> TypeResolver<'a> {
             "int64" => Type::Int64,
             "int4" => Type::Int4,
             "uint8" => Type::Uint8,
+            // M35.1 BitNet ternary dtypes (spec §1.1).
+            // Mirror the bf16 pattern: dtype names are identifiers resolved here,
+            // not lexer keywords. `ternary` is packed (2 bits/trit); `ternary_unpacked`
+            // is unpacked (one trit per i8 slot).
+            "ternary" => Type::TernaryPacked,
+            "ternary_unpacked" => Type::TernaryUnpacked,
             // Unparameterized tensor family: bare `Tensor`, `Param`, `Buffer`
             "Tensor" => Type::Tensor {
                 shape: Shape::unknown(),
@@ -379,6 +385,11 @@ impl<'a> TypeResolver<'a> {
             "int4" => DType::Int4,
             "uint8" => DType::Uint8,
             "bool" => DType::Bool,
+            // M35.1 BitNet ternary dtypes (spec §1.1 + §2).
+            // `ternary` is the packed at-rest format used inside `Tensor<..., ternary>`;
+            // `ternary_unpacked` is the compute-time format produced by `nsl.quant.ternary.unpack`.
+            "ternary" => DType::TernaryPacked,
+            "ternary_unpacked" => DType::TernaryUnpacked,
             _ => DType::Unknown,
         }
     }
