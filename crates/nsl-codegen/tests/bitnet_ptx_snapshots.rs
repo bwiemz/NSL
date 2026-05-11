@@ -5,7 +5,7 @@
 //! at unit-test scale (not only via end-to-end logit match).
 
 use nsl_codegen::bitnet::config::BitNetKernelConfig;
-use nsl_codegen::bitnet::phases::packed_load;
+use nsl_codegen::bitnet::phases::{absmean_quant, packed_load};
 use nsl_codegen::kernel_ir::KirType;
 
 fn default_config() -> BitNetKernelConfig {
@@ -27,4 +27,12 @@ fn packed_load_basic_snapshot() {
     let mut ptx = String::new();
     packed_load::emit(&mut ptx, &config);
     insta::assert_snapshot!("bitnet_ptx__packed_load_basic", ptx);
+}
+
+#[test]
+fn absmean_quant_basic_snapshot() {
+    let config = default_config();
+    let mut ptx = String::new();
+    absmean_quant::emit(&mut ptx, &config);
+    insta::assert_snapshot!("bitnet_ptx__absmean_quant_basic", ptx);
 }

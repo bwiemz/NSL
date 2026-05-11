@@ -1,0 +1,82 @@
+---
+source: crates/nsl-codegen/tests/bitnet_ptx_snapshots.rs
+assertion_line: 37
+expression: ptx
+---
+// === BitNet absmax_quant (hidden_dim=1024) ===
+// Per-thread: track max(|x[r, k]|) over assigned lane stride.
+mov.f32 %f_max, 0f00000000;
+mov.u32 %r_k, %tid.x;
+ABSMAX_LOOP:
+setp.ge.u32 %p_amdone, %r_k, %r_hidden_dim;
+@%p_amdone bra ABSMAX_END;
+mul.lo.u32 %r_off, %r_row_id, %r_hidden_dim;
+add.u32 %r_off, %r_off, %r_k;
+shl.b32 %r_off, %r_off, 1;
+cvt.u64.u32 %rd_off, %r_off;
+add.s64 %rd_addr, %rd_act_in, %rd_off;
+ld.global.b16 %h_x, [%rd_addr];
+cvt.f32.f16 %f_x, %h_x;
+abs.f32 %f_absx, %f_x;
+max.f32 %f_max, %f_max, %f_absx;
+add.u32 %r_k, %r_k, 32;
+bra ABSMAX_LOOP;
+ABSMAX_END:
+// Warp-shuffle butterfly reduction (parallel, not serialized).
+shfl.sync.bfly.b32 %f_partial, %f_max, 16, 0x1f, 0xffffffff;
+max.f32 %f_max, %f_max, %f_partial;
+shfl.sync.bfly.b32 %f_partial, %f_max, 8, 0x1f, 0xffffffff;
+max.f32 %f_max, %f_max, %f_partial;
+shfl.sync.bfly.b32 %f_partial, %f_max, 4, 0x1f, 0xffffffff;
+max.f32 %f_max, %f_max, %f_partial;
+shfl.sync.bfly.b32 %f_partial, %f_max, 2, 0x1f, 0xffffffff;
+max.f32 %f_max, %f_max, %f_partial;
+shfl.sync.bfly.b32 %f_partial, %f_max, 1, 0x1f, 0xffffffff;
+max.f32 %f_max, %f_max, %f_partial;
+// %f_max now holds row-wide absmax across all lanes.
+mov.f32 %f_scale, %f_max;
+// Zero-magnitude row guard: scale == 0 -> write all zeros to SMEM, scale = 0.
+setp.eq.f32 %p_zero, %f_scale, 0f00000000;
+@%p_zero bra ABSMAX_ZERO_ROW;
+// Per-thread quantize: q = round(clip(x * 127.0 / scale, -127, 127)).
+mov.f32 %f_inv_scale, 0f42FE0000;
+div.rn.f32 %f_inv_scale, %f_inv_scale, %f_scale;
+mov.u32 %r_k, %tid.x;
+QUANT_LOOP:
+setp.ge.u32 %p_qdone, %r_k, %r_hidden_dim;
+@%p_qdone bra QUANT_END;
+mul.lo.u32 %r_qoff, %r_row_id, %r_hidden_dim;
+add.u32 %r_qoff, %r_qoff, %r_k;
+shl.b32 %r_qoff_bytes, %r_qoff, 1;
+cvt.u64.u32 %rd_qoff, %r_qoff_bytes;
+add.s64 %rd_qload, %rd_act_in, %rd_qoff;
+ld.global.b16 %h_xq, [%rd_qload];
+cvt.f32.f16 %f_xq, %h_xq;
+mul.f32 %f_scaled, %f_xq, %f_inv_scale;
+max.f32 %f_clip, %f_scaled, 0fC2FE0000;
+min.f32 %f_clip, %f_clip, 0f42FE0000;
+cvt.rni.s32.f32 %r_qi, %f_clip;
+cvt.s8.s32 %rs_qi8, %r_qi;
+cvt.u64.u32 %rd_smemoff, %r_qoff;
+add.s64 %rd_qsmem_addr, %rd_qact_smem, %rd_smemoff;
+st.shared.s8 [%rd_qsmem_addr], %rs_qi8;
+add.u32 %r_k, %r_k, 32;
+bra QUANT_LOOP;
+QUANT_END:
+bra ABSMAX_DONE;
+ABSMAX_ZERO_ROW:
+// Zero-magnitude row: write zeros to all quantized slots.
+mov.u32 %r_k, %tid.x;
+ZERO_LOOP:
+setp.ge.u32 %p_zdone, %r_k, %r_hidden_dim;
+@%p_zdone bra ABSMAX_DONE;
+mul.lo.u32 %r_zoff, %r_row_id, %r_hidden_dim;
+add.u32 %r_zoff, %r_zoff, %r_k;
+cvt.u64.u32 %rd_zoff, %r_zoff;
+add.s64 %rd_zsmem, %rd_qact_smem, %rd_zoff;
+st.shared.s8 [%rd_zsmem], 0;
+add.u32 %r_k, %r_k, 32;
+bra ZERO_LOOP;
+ABSMAX_DONE:
+bar.sync 0;
+// === end BitNet absmax_quant ===
