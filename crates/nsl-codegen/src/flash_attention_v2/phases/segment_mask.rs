@@ -24,10 +24,11 @@
 //!
 //! # Residency
 //!
-//! Tier A exercises only `SegmentResidency::Shared` at seq ≤ 2048
-//! on the 4096 B SMEM budget. The `Streamed` branch emits a `trap`
-//! marker so mis-planned residency surfaces at runtime rather than
-//! silently producing wrong gradients.
+//! Tier A exercises only `SegmentResidency::Shared` up to the ceiling
+//! defined by `pca_segment::DEFAULT_SMEM_SEGMENT_BUDGET` (the FA
+//! prelude's `seg_smem` allocation is sized to the same budget). The
+//! `Streamed` branch emits a `trap` marker so mis-planned residency
+//! surfaces at runtime rather than silently producing wrong gradients.
 
 use crate::pca_segment::SegmentResidency;
 

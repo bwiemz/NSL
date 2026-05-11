@@ -29,6 +29,7 @@
 use std::ffi::CString;
 
 use nsl_codegen::flash_attention::{CshaExtras, FlashAttentionConfig, RopeStyle};
+use nsl_codegen::pca_segment::DEFAULT_SMEM_SEGMENT_BUDGET;
 use nsl_codegen::flash_attention_v2::{
     flash_attention_kernel_name_v2, synthesize_backward,
     smem_layout::{self, Direction},
@@ -589,22 +590,24 @@ fn launch_pca_backward(
     let bwd_name = CString::new(backward_kernel_name(&config)).unwrap();
 
     // The backward kernel uses dynamic SMEM when the combined backward
-    // footprint + PCA seg_smem (4096 bytes) exceeds the 48 KB static cap.
+    // footprint + PCA seg_smem (DEFAULT_SMEM_SEGMENT_BUDGET bytes) exceeds
+    // the 48 KB static cap.
     //
-    // `seg_smem[4096]` is a SEPARATE static .shared array in PTX.
-    // `shmem[]` is the main dynamic region (`extern .shared`).
-    // cuLaunchKernel.sharedMemBytes = the dynamic portion only (bwd_total).
-    // cuFuncSetAttribute(MAX_DYNAMIC_SHARED_SIZE_BYTES) must be set to
-    // at least (bwd_total + seg_overhead) so the driver accepts the full
-    // total SMEM per block.
+    // seg_smem is embedded at the TAIL of the extern shmem[] region (the
+    // backward prelude's Blackwell workaround), so the launcher must size
+    // the dynamic allocation to bwd_total + seg_overhead. Budget sourced
+    // from pca_segment::DEFAULT_SMEM_SEGMENT_BUDGET so this stays in sync
+    // with the backward emitter's seg_overhead calculation.
     //
     // kernel_launch only calls cuFuncSetAttribute when shared_mem_bytes > 48KB.
     // We pass (bwd_total + seg_overhead) to force the cuFuncSetAttribute call
     // when the total exceeds 48KB, even if bwd_total alone is under 48KB.
-    // The kernel only reads bwd_total bytes of dynamic SMEM, so any value >=
-    // bwd_total satisfies the `sharedMemBytes` contract.
     let bwd_total = smem_layout::total_bytes(&config) + smem_layout::backward_extra_bytes(&config);
-    let seg_overhead: u32 = if segment_masked { 4096 } else { 0 };
+    let seg_overhead: u32 = if segment_masked {
+        DEFAULT_SMEM_SEGMENT_BUDGET as u32
+    } else {
+        0
+    };
     let smem_static_cap: u32 = 49152; // 48 KB hard limit for static SMEM
     let bwd_smem_dyn: i64 = if bwd_total + seg_overhead > smem_static_cap {
         // Pass bwd_total + seg_overhead so kernel_launch triggers cuFuncSetAttribute.

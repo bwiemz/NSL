@@ -26,6 +26,7 @@ use crate::flash_attention_v2::smem_layout::{
 use crate::kernel_skeleton::indexing::{
     emit_thread_lane_warp_register_decl, emit_thread_lane_warp_register_init,
 };
+use crate::pca_segment::DEFAULT_SMEM_SEGMENT_BUDGET;
 
 /// Stable kernel-name prefix for backward variants.
 pub fn kernel_name(config: &FlashAttentionConfig) -> String {
@@ -47,12 +48,19 @@ pub fn backward_total_bytes(config: &FlashAttentionConfig) -> u32 {
 }
 
 fn backward_needs_dynamic_smem(config: &FlashAttentionConfig) -> bool {
-    // PCA Tier A: when segment_masked the prelude also emits seg_smem[4096]
-    // as a separate static SMEM array.  4096 bytes is enough to push some
-    // configs over the 48 KB static cap.  Force dynamic SMEM in that case
-    // so the main shmem[] uses the `extern .shared` form and ptxas sees
-    // only the 4096-byte seg_smem in the static budget.
-    let seg_overhead = if config.segment_masked { 4096 } else { 0 };
+    // PCA Tier A: when segment_masked the prelude reserves
+    // DEFAULT_SMEM_SEGMENT_BUDGET bytes for the embedded seg_smem region
+    // at the tail of shmem (Blackwell fix; see register-decl comment
+    // below).  Force dynamic SMEM whenever the combined footprint exceeds
+    // the 48 KB static cap so the main shmem[] uses the `extern .shared`
+    // form.  Budget sourced from pca_segment::DEFAULT_SMEM_SEGMENT_BUDGET
+    // so the FA emitter's allocation tracks the planner's residency
+    // ceiling.
+    let seg_overhead = if config.segment_masked {
+        DEFAULT_SMEM_SEGMENT_BUDGET as u32
+    } else {
+        0
+    };
     backward_total_bytes(config) + seg_overhead > SMEM_BUDGET_BYTES
 }
 
@@ -131,9 +139,14 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig) {
 
     if !dyn_smem {
         use crate::kernel_skeleton::smem::emit_static_smem_decl;
-        // PCA Tier A: when segment_masked, reserve an extra 4096 bytes at the
-        // tail of shmem for the embedded seg_smem (see register-decl comment).
-        let seg_overhead: u32 = if config.segment_masked { 4096 } else { 0 };
+        // PCA Tier A: when segment_masked, reserve DEFAULT_SMEM_SEGMENT_BUDGET
+        // bytes at the tail of shmem for the embedded seg_smem (see
+        // register-decl comment).
+        let seg_overhead: u32 = if config.segment_masked {
+            DEFAULT_SMEM_SEGMENT_BUDGET as u32
+        } else {
+            0
+        };
         emit_static_smem_decl(ptx, (backward_total_bytes(config) + seg_overhead) as usize);
     }
 
@@ -236,7 +249,11 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig) {
         ptx.push_str("    .reg .u64 %rd_q_SEGMASK, %rd_k_SEGMASK;\n");
         ptx.push_str("    .reg .b16 %rs_q_SEGMASK, %rs_k_SEGMASK;\n");
         ptx.push_str("    .reg .pred %p_seg_SEGMASK;\n");
-        // Cooperative-load scratch for the warp-0 prelude (seq_len <= 2048).
+        // Cooperative-load scratch for the warp-0 prelude. The load loop
+        // iterates over the runtime seq_len; the embedded seg_smem region
+        // (sized to DEFAULT_SMEM_SEGMENT_BUDGET) caps the supported seq_len
+        // at DEFAULT_SMEM_SEGMENT_BUDGET / 2 entries — the same ceiling
+        // pca_segment::plan_kernel uses to pick Shared.
         ptx.push_str("    .reg .u32 %r_pca_i, %r_pca_seq;\n");
         ptx.push_str("    .reg .u64 %rd_pca_off;\n");
         ptx.push_str("    .reg .b16 %rs_pca;\n");
@@ -247,15 +264,16 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig) {
         // these scratch registers receive q_start + warp_row and k_start + lane.
         ptx.push_str("    .reg .u64 %rd_bw_q_global, %rd_bw_k_global;\n");
         // PCA Tier A — seg_smem location: embedded at the TAIL of the extern
-        // shmem[] region (`shared_mem_bytes` in cuLaunchKernel includes an
-        // extra 4096 bytes past backward_total_bytes so the last 4096 bytes
-        // hold segment_ids). Rationale: a separate `.shared .align 4 .b8
-        // seg_smem[4096]` alongside `.extern .shared shmem[]` compiles
-        // cleanly on ptxas but fires CUDA_ERROR_ILLEGAL_ADDRESS on Blackwell
-        // (sm_120, RTX 5070 Ti) at runtime when both coexist — the mixed
-        // static+extern layout exposes a driver / hardware addressing issue.
-        // Embedding seg_smem inside the single extern shmem allocation
-        // sidesteps the mix. No separate `.shared` decl is emitted.
+        // shmem[] region (`shared_mem_bytes` in cuLaunchKernel includes
+        // DEFAULT_SMEM_SEGMENT_BUDGET extra bytes past backward_total_bytes,
+        // and those tail bytes hold segment_ids). Rationale: a separate
+        // `.shared .align 4 .b8 seg_smem[N]` alongside `.extern .shared
+        // shmem[]` compiles cleanly on ptxas but fires
+        // CUDA_ERROR_ILLEGAL_ADDRESS on Blackwell (sm_120, RTX 5070 Ti) at
+        // runtime when both coexist — the mixed static+extern layout
+        // exposes a driver / hardware addressing issue. Embedding seg_smem
+        // inside the single extern shmem allocation sidesteps the mix. No
+        // separate `.shared` decl is emitted.
     }
 
     crate::kernel_skeleton::smem::emit_shmem_base_cvta(ptx);
@@ -337,8 +355,9 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig) {
         // seg_base = shmem_base + backward_total_bytes — embed seg_smem at
         // the tail of the extern shmem region (see prelude register-decl
         // comment for the Blackwell illegal-address rationale). The launcher
-        // passes shared_mem_bytes = backward_total_bytes + 4096, so the last
-        // 4096 bytes past bwd_total are reserved for segment_ids.
+        // passes shared_mem_bytes = backward_total_bytes +
+        // DEFAULT_SMEM_SEGMENT_BUDGET, so the trailing budget bytes past
+        // bwd_total are reserved for segment_ids.
         ptx.push_str(&format!(
             "    add.u64 %seg_base, %shmem_base, {};  // bwd_total - seg_smem starts here\n",
             backward_total_bytes(config)
