@@ -40,6 +40,11 @@ pub fn emit(ptx: &mut String, config: &BitNetKernelConfig) {
     ptx.push_str("// cp.async ping-pong (depth=2, no role split).\n");
     ptx.push_str("cp.async.ca.shared.global [%rd2], [%rd_weight_addr], 4;\n");
     ptx.push_str("cp.async.commit_group;\n");
+    // Drain ALL inflight cp.async groups before consuming SMEM. Without this,
+    // ld.shared.b32 below can race the async copy unit and read stale/partial bytes.
+    // Phase 1 uses wait_group 0 (drain all); future depth-2 ping-pong tuning
+    // can switch to wait_group 1 to overlap stage N+1 with stage N.
+    ptx.push_str("cp.async.wait_group 0;\n");
 
     // After the load lands in SMEM, threads cooperatively unpack.
     // Each thread unpacks 4 trits → 4 i8 register slots.

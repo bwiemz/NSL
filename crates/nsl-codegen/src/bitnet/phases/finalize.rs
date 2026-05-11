@@ -7,6 +7,13 @@
 //! configured output dtype (F16 or BF16), and stores to HBM.
 //!
 //! Deferred to Phase 1.5: RMSNorm fold across layer boundaries.
+//!
+//! **TODO (M35.1 Linux follow-on):** the emitted epilogue currently
+//! omits the per-tensor weight_scale factor. See `loader.rs::LoadedTernaryWeight`
+//! for full context. Un-ignoring `bitnet_logit_match` requires injecting
+//! the weight_scale into this phase (either as a kernel param or burned as
+//! a compile-time immediate) and multiplying the FP32 accumulator before
+//! the FP16/BF16 cast.
 
 use crate::bitnet::config::BitNetKernelConfig;
 use crate::kernel_ir::KirType;

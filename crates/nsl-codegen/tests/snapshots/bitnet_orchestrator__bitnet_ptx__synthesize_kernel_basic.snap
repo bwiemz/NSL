@@ -1,6 +1,5 @@
 ---
 source: crates/nsl-codegen/tests/bitnet_orchestrator.rs
-assertion_line: 29
 expression: ptx
 ---
 .version 7.0
@@ -22,6 +21,7 @@ add.s64 %rd_weight_addr, %rd_weight_global, %rd_byte_off_64;
 // cp.async ping-pong (depth=2, no role split).
 cp.async.ca.shared.global [%rd2], [%rd_weight_addr], 4;
 cp.async.commit_group;
+cp.async.wait_group 0;
 // Unpack 4 trits per byte using bit-field extract (single SASS at sm_80+).
 // HIGH-BITS-FIRST: trit[0] at bits [7:6]; trit[3] at bits [1:0].
 ld.shared.b32 %r_packed_word, [%rd2];
