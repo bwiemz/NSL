@@ -6278,6 +6278,12 @@ impl Compiler<'_> {
         // Phase 5 Task 7: clear train-scope @inspect context on exit.
         self.inspect_train_step_var = None;
 
+        // Gap I.B: drop stale CSHA per-function cache entries so a
+        // subsequent train/grad block in the same module gets a clean
+        // slate (Cranelift `Value` IDs reset per function and would
+        // otherwise alias against leftover keys).
+        self.clear_csha_per_function_caches();
+
         Ok(())
     }
 
@@ -7199,6 +7205,12 @@ impl Compiler<'_> {
         // Phase 5 Task 7: clear train-scope @inspect context on exit.
         self.inspect_train_step_var = None;
 
+        // Gap I.B: drop stale CSHA per-function cache entries so a
+        // subsequent train/grad block in the same module gets a clean
+        // slate (Cranelift `Value` IDs reset per function and would
+        // otherwise alias against leftover keys).
+        self.clear_csha_per_function_caches();
+
         Ok(())
     }
 
@@ -7248,6 +7260,12 @@ impl Compiler<'_> {
                 }
             }
         }
+
+        // Gap I.B: drop stale CSHA per-function cache entries so a
+        // subsequent train/grad block in the same module gets a clean
+        // slate (Cranelift `Value` IDs reset per function and would
+        // otherwise alias against leftover keys).
+        self.clear_csha_per_function_caches();
 
         Ok(())
     }
