@@ -1138,17 +1138,38 @@ fn emit_model_backward_bridge(
         })?;
 
     // ── Pre-compute grad-arena layout map: projection path → (offset, bytes) ──
-    // Keyed by the bare field name (e.g. "up_proj") for fast lookup.
-    // GradArenaLayout entries carry ProjectionRef with form "<ModelName>.<field>".
-    let prefix = format!("{model_name}.");
+    // Keyed by the bare field name (e.g. "q_proj") for fast lookup against the
+    // adjoint generator's `named_param_var_ids`, which yield names like
+    // `self.q_proj` that are stripped to `q_proj` below.
+    //
+    // GradArenaLayout entries are built by `build_grad_arena_layout`, which
+    // keys them by the raw `WggoGradTarget.w_q/w_k/w_v/w_o` paths. Pre-scan
+    // forms those paths as `"<instance_var>.<field>"` (e.g. "m.q_proj") — the
+    // var name, NOT the model's class name. The earlier `strip_prefix(&format!("{model_name}."))`
+    // (using the class name "AttentionMLP") therefore matched nothing and left
+    // `field_to_arena` empty, which made this bridge silently emit the no-op
+    // trivial stub below — backward never wrote a byte into __nsl_calib_grad_arena
+    // and the scaffolding's per-step accumulator read all-zero gradients
+    // (#147 hop 13's "actual=0 vs reference=~5-7×10⁷" symptom).
+    //
+    // Take the bare field name by splitting on the LAST '.' instead — this is
+    // robust to all three forms used elsewhere in the calibration pipeline:
+    //   - `"m.q_proj"`              → var-name pre-scan (`build_grad_arena_layout`)
+    //   - `"AttentionMLP.q_proj"`   → class-name rewrite (`grad_target_to_projection_meta`)
+    //   - `"gpt.blocks.0.attn.q_proj"` → nested-model class path
+    // For each entry the suffix after the final '.' is the projection field
+    // name; everything before it is the instance/path prefix we don't care
+    // about (the field name is the only key the adjoint walker uses).
     let field_to_arena: HashMap<String, (u32, u32)> = grad_arena_layout
         .entries
         .iter()
-        .filter_map(|(proj_ref, offset, nbytes)| {
-            proj_ref
+        .map(|(proj_ref, offset, nbytes)| {
+            let field = proj_ref
                 .0
-                .strip_prefix(&prefix)
-                .map(|field| (field.to_string(), (*offset, *nbytes)))
+                .rsplit_once('.')
+                .map(|(_, suffix)| suffix.to_string())
+                .unwrap_or_else(|| proj_ref.0.clone());
+            (field, (*offset, *nbytes))
         })
         .collect();
 
@@ -2259,6 +2280,68 @@ pub fn emit_calibration_scaffolding_object(
         wggo_layer_key_data_ids.insert(target.layer_key.clone(), key_id);
     }
 
+    // #147 hop 13: declare a NUL-terminated C-string rodata holding the
+    // **safetensors-qualified** name of each WGGO projection (Q/K/V/O).
+    // The scaffolding's per-step accumulator uses these to look up the
+    // weight tensor via `nsl_model_get_weight(model_ptr, name_ptr, name_len)`
+    // — the same lookup the model_forward bridge already uses — because the
+    // runtime weight_ptrs Vec is keyed by *safetensors load order* (HashMap
+    // iteration over the file's metadata), NOT by AST declaration order.
+    // Reading `weights_base[proj_index]` therefore returned the wrong
+    // NslTensor for every projection. Name lookup is robust to load order
+    // and matches whatever name the safetensors file uses.
+    //
+    // We also build the projection name as `<class_name>.<field>` (the
+    // safetensors convention) by splitting `target.w_q.0` on the first dot
+    // — pre-scan emits paths like `"m.q_proj"` (var name), but the weight
+    // tensor in the file is named `"AttentionMLP.q_proj"` (class name).
+    let mut wggo_proj_name_data_ids: HashMap<(String, String), DataId> = HashMap::new();
+    if needs_backward && !wggo_targets.is_empty() {
+        for target in wggo_targets {
+            for (proj_path, _proj_index, _proj_shape) in [
+                (target.w_q.0.as_str(), target.w_q_index, target.w_q_shape),
+                (target.w_k.0.as_str(), target.w_k_index, target.w_k_shape),
+                (target.w_v.0.as_str(), target.w_v_index, target.w_v_shape),
+                (target.w_o.0.as_str(), target.w_o_index, target.w_o_shape),
+            ] {
+                let field = proj_path
+                    .split_once('.')
+                    .map(|(_, after)| after)
+                    .unwrap_or(proj_path);
+                let qualified = format!("{}.{}", target.class_name, field);
+                let sym = format!(
+                    "__nsl_wggo_projname.{}",
+                    qualified.replace('.', "_")
+                );
+                let key_id = declare_cstr_rodata(&mut module, &sym, &qualified)?;
+                wggo_proj_name_data_ids
+                    .insert((proj_path.to_string(), qualified), key_id);
+            }
+        }
+    }
+
+    // Import `nsl_model_get_weight` so the per-step accumulator can look up
+    // weight tensors by name instead of relying on the (mismatched) Vec
+    // index. Signature: (model_ptr: i64, name_ptr: i64, name_len: i64) -> i64.
+    let nsl_model_get_weight_id: Option<cranelift_module::FuncId> =
+        if needs_backward && !wggo_targets.is_empty() {
+            let mut sig = module.make_signature();
+            sig.call_conv = call_conv;
+            sig.params.push(AbiParam::new(cl_types::I64));
+            sig.params.push(AbiParam::new(cl_types::I64));
+            sig.params.push(AbiParam::new(cl_types::I64));
+            sig.returns.push(AbiParam::new(cl_types::I64));
+            Some(
+                module
+                    .declare_function("nsl_model_get_weight", Linkage::Import, &sig)
+                    .map_err(|e| HarnessError::Infrastructure {
+                        reason: format!("declare nsl_model_get_weight (scaffolding): {e}"),
+                    })?,
+            )
+        } else {
+            None
+        };
+
     let mut path_data_ids: HashMap<String, DataId> = HashMap::new();
     for entry in finalize_plan {
         let sym = format!(
@@ -2881,16 +2964,14 @@ pub fn emit_calibration_scaffolding_object(
 
                     // weight_ptrs_addr is a stack slot holding the *const *const f32
                     // array returned by nsl_model_get_weight_ptrs (stored at line ~2462).
-                    // Load the array base pointer once; individual projection pointers are
-                    // loaded at proj_index * PTR_SIZE inside the per-target loop.
-                    let weights_base = b.ins().load(
-                        ptr_ty,
-                        cranelift_codegen::ir::MemFlags::new(),
-                        weight_ptrs_addr,
-                        0,
-                    );
-
-                    const PTR_SIZE: i64 = 8;
+                    // The per-step accumulator below looks weights up by name
+                    // via `nsl_model_get_weight(model_ptr, name_ptr, name_len)`
+                    // instead of indexing `weight_ptrs[proj_index]`. See the
+                    // hop-13 comment inside the per-target loop for why
+                    // index-based access was wrong. `weight_ptrs_addr` and the
+                    // `weights_base` load are kept above for the (future) AWQ
+                    // descriptor path; they're intentionally unused here.
+                    let _ = weight_ptrs_addr;
 
                     for target in wggo_targets.iter() {
                         let n_o_heads = wggo_n_o_heads(target);
@@ -2937,27 +3018,99 @@ pub fn emit_calibration_scaffolding_object(
                             let elements_per_head = total_f32 / n_proj_heads;
                             let replication = (n_o_heads / n_proj_heads).max(1);
 
-                            // Load weight_ptr = weights_base[proj_index * PTR_SIZE]
-                            let weight_offset = (*proj_index as i64) * PTR_SIZE;
-                            let weight_ptr_addr =
-                                b.ins().iadd_imm(weights_base, weight_offset);
-                            let weight_ptr = b.ins().load(
+                            // #147 hop 13: look up the weight tensor BY NAME via
+                            // `nsl_model_get_weight(model_ptr, name_ptr, name_len)`
+                            // — NOT by `weights_base[proj_index]`.
+                            //
+                            // The runtime's `weight_ptrs: Vec<i64>` is populated
+                            // by `load_safetensors_weights`, which iterates the
+                            // safetensors file's metadata in storage order (which
+                            // is the HashMap-iteration order at fixture-build
+                            // time, e.g. `[k_proj, o_proj, q_proj, v_proj]` for
+                            // the WGGO merge-gate fixture). But pre-scan assigns
+                            // `proj_index` from AST declaration order
+                            // (`q=0, k=1, v=2, o=3`). Reading
+                            // `weights_base[proj_index]` therefore returned the
+                            // wrong NslTensor for every projection — the
+                            // gradient for `q_proj` got multiplied by `k_proj`'s
+                            // weights, and so on. That was the residual hop 13
+                            // numerical error left over after the backward
+                            // bridge field-name fix above ("actual = ~50% of
+                            // reference, with run-to-run variation").
+                            //
+                            // The forward bridge already uses the same lookup
+                            // (see `emit_model_forward_bridge`); reusing it here
+                            // keeps the WGGO accumulator on the same code path
+                            // as the model body.
+                            let model_ptr =
+                                b.ins().load(ptr_ty, cranelift_codegen::ir::MemFlags::new(), model_ptr_addr, 0);
+                            let field = proj_path
+                                .split_once('.')
+                                .map(|(_, after)| after)
+                                .unwrap_or(*proj_path);
+                            let qualified =
+                                format!("{}.{}", target.class_name, field);
+                            let name_data_id = wggo_proj_name_data_ids
+                                .get(&(proj_path.to_string(), qualified.clone()))
+                                .copied()
+                                .expect(
+                                    "wggo_proj_name_data_ids missing entry for \
+                                     (proj_path, qualified) pair built above — \
+                                     declaration loop must enumerate the same \
+                                     (target, projection) tuples as the codegen \
+                                     loop",
+                                );
+                            let name_gv =
+                                module.declare_data_in_func(name_data_id, b.func);
+                            let name_ptr = b.ins().symbol_value(ptr_ty, name_gv);
+                            let name_len =
+                                b.ins().iconst(ptr_ty, qualified.len() as i64);
+                            let get_weight_ref = module.declare_func_in_func(
+                                nsl_model_get_weight_id.expect(
+                                    "nsl_model_get_weight_id is Some when \
+                                     needs_backward && !wggo_targets.is_empty()",
+                                ),
+                                b.func,
+                            );
+                            let weight_call = b.ins().call(
+                                get_weight_ref,
+                                &[model_ptr, name_ptr, name_len],
+                            );
+                            let weight_handle = b.inst_results(weight_call)[0];
+
+                            // Dereference the NslTensor's `data` field to obtain
+                            // the raw f32 buffer pointer. The accumulator kernel
+                            // treats `weight_data_base` as a flat `*const f32`
+                            // and indexes as `load(base + lin * 4)` — without
+                            // the deref, it would read offset 0 of the NslTensor
+                            // struct (the `magic` field, `0x4E534C54`) and
+                            // every subsequent load would walk through internal
+                            // struct fields. Mirrors the backward bridge's
+                            // `on_param_grad` splice at line ~1505.
+                            const NSL_TENSOR_DATA_OFFSET_I32: i32 =
+                                nsl_runtime::tensor::NSL_TENSOR_DATA_OFFSET as i32;
+                            let weight_data_ptr = b.ins().load(
                                 ptr_ty,
                                 cranelift_codegen::ir::MemFlags::new(),
-                                weight_ptr_addr,
-                                0,
+                                weight_handle,
+                                NSL_TENSOR_DATA_OFFSET_I32,
                             );
 
                             emit_per_head_dot_abs_accum(
                                 &mut b,
                                 grad_arena_base,
                                 byte_offset,
-                                weight_ptr,
+                                weight_data_ptr,
                                 running_base,
                                 n_proj_heads,
                                 elements_per_head,
                                 replication,
                             );
+                            // `proj_index` is no longer used now that we look
+                            // weights up by name. Bind it to `_` to suppress
+                            // the unused-variable warning without churning the
+                            // surrounding tuple destructuring.
+                            let _ = proj_index;
                         }
                     }
                 }

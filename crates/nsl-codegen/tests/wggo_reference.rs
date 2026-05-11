@@ -88,9 +88,29 @@ fn per_head_score(d_w: &[f64], w: &[f64], dim: usize, head_dim: usize) -> Vec<f3
 /// Returns a map from layer name to per-head gradient importance scores.
 /// Key `"AttentionMLP"` maps to a `Vec<f32>` of length `num_heads`.
 ///
-/// `calib` is the calibration input of shape `[batch * seq, dim]` (flattened).
+/// `calib` is the calibration input of shape `[count, seq, dim]` (flattened
+/// to length `count * seq * dim`). Each of the `count` samples is processed
+/// independently — the model's `forward(x: Tensor<[B, S, D]>)` performs
+/// **batched** attention with `softmax` over `seq` (not over `count * seq`),
+/// so the per-head |dW · W| score aggregates `count` independent backward
+/// passes and matches what the calibration subprocess produces by feeding
+/// the model one batch at a time.
+///
 /// `weights` must contain keys: `"AttentionMLP.q_proj"`, `"AttentionMLP.k_proj"`,
 /// `"AttentionMLP.v_proj"`, `"AttentionMLP.o_proj"` each of size `dim * dim`.
+///
+/// # Historical note (#147 hop 13)
+///
+/// An earlier version of this reference treated `calib` as `[batch * seq, dim]`
+/// — one big flattened sample with `softmax` over `count * seq = 32` keys.
+/// That was inconsistent with both the merge-gate fixture's declared input
+/// shape (`let x = zeros([8, 4, 32])`) and the calibration subprocess's
+/// per-sample feeding. Once the subprocess actually wrote correct values into
+/// the BSS running buffer (hop 13 fixes in `binary_codegen.rs`), the actual
+/// scores came out ≈60% of the old reference's flattened result — exactly the
+/// constant-factor structural mismatch you'd expect from `softmax(K=32)` vs
+/// `softmax(K=4)`. The reference now mirrors the subprocess: `count` separate
+/// `[seq, dim]` forward/backward passes, gradients summed.
 pub fn reference_wggo_head_scores(
     calib: &[f32],
     weights: &HashMap<&str, Vec<f32>>,
@@ -98,10 +118,24 @@ pub fn reference_wggo_head_scores(
     num_heads: usize,
 ) -> HashMap<String, Vec<f32>> {
     let head_dim = dim / num_heads;
-    let n_rows = calib.len() / dim; // batch × seq flattened
+    let total_rows = calib.len() / dim;
+
+    // The merge-gate fixture stores calibration data as `[count, seq, dim]`
+    // and the subprocess feeds the model `count` batches of `[1, seq, dim]`.
+    // For the test we hard-code the fixture's seq=4 — the only consumer is
+    // the merge-gate test (dim=32, count*seq=32) which always uses seq=4.
+    // `analytical_reference_produces_four_head_scores` below pins this.
+    let seq = 4;
+    assert!(
+        total_rows.is_multiple_of(seq),
+        "calib row count {} must be a multiple of seq={}",
+        total_rows,
+        seq
+    );
+    let count = total_rows / seq;
 
     // Promote everything to f64 for accumulator parity with IR.
-    let x: Vec<f64> = calib.iter().map(|&v| v as f64).collect();
+    let x_full: Vec<f64> = calib.iter().map(|&v| v as f64).collect();
     let w_q: Vec<f64> = weights["AttentionMLP.q_proj"]
         .iter()
         .map(|&v| v as f64)
@@ -119,71 +153,89 @@ pub fn reference_wggo_head_scores(
         .map(|&v| v as f64)
         .collect();
 
-    // Forward pass: y = softmax(X Wq (X Wk)^T) (X Wv) Wo
-    let q = matmul_f64(&x, n_rows, dim, &w_q, dim, dim);
-    let k = matmul_f64(&x, n_rows, dim, &w_k, dim, dim);
-    let v = matmul_f64(&x, n_rows, dim, &w_v, dim, dim);
-    let k_t = transpose_f64(&k, n_rows, dim);
-    let scores = matmul_f64(&q, n_rows, dim, &k_t, dim, n_rows);
-    let mut attn = scores.clone();
-    softmax_rowwise_f64(&mut attn, n_rows, n_rows);
-    let out = matmul_f64(&attn, n_rows, n_rows, &v, n_rows, dim);
-    let y = matmul_f64(&out, n_rows, dim, &w_o, dim, dim);
+    // Accumulate per-head scores across all `count` samples. We accumulate
+    // SCORES (`Σ_elem |dW · W|` per head, per batch) — NOT raw gradients —
+    // because the subprocess's `emit_per_head_dot_abs_accum` takes the
+    // element-wise absolute value before the per-head sum, so the running
+    // buffer holds `Σ_batch Σ_elem |dW_batch[i] · W[i]|`. Accumulating raw
+    // gradients first and then taking `per_head_score` would give the
+    // different `Σ_elem |Σ_batch dW_batch[i] · W[i]|` quantity, since
+    // `|a+b| ≠ |a|+|b|` in general.
+    let mut q_score_acc = vec![0.0_f64; num_heads];
+    let mut k_score_acc = vec![0.0_f64; num_heads];
+    let mut v_score_acc = vec![0.0_f64; num_heads];
+    let mut o_score_acc = vec![0.0_f64; num_heads];
 
-    // Loss = sum(y²); dy = 2y
-    let dy: Vec<f64> = y.iter().map(|v| 2.0 * v).collect();
+    for batch_idx in 0..count {
+        let x = &x_full[batch_idx * seq * dim..(batch_idx + 1) * seq * dim];
 
-    // Backward pass
-    // dW_o = out.T @ dy
-    let out_t = transpose_f64(&out, n_rows, dim);
-    let d_w_o = matmul_f64(&out_t, dim, n_rows, &dy, n_rows, dim);
-    // d_out = dy @ W_o.T
-    let w_o_t = transpose_f64(&w_o, dim, dim);
-    let d_out = matmul_f64(&dy, n_rows, dim, &w_o_t, dim, dim);
-    // dV = attn.T @ d_out
-    let attn_t = transpose_f64(&attn, n_rows, n_rows);
-    let d_v_act = matmul_f64(&attn_t, n_rows, n_rows, &d_out, n_rows, dim);
-    // d_attn = d_out @ V.T
-    let v_t = transpose_f64(&v, n_rows, dim);
-    let d_attn = matmul_f64(&d_out, n_rows, dim, &v_t, dim, n_rows);
+        // Forward pass on this batch (seq rows, dim cols).
+        let q = matmul_f64(x, seq, dim, &w_q, dim, dim);
+        let k = matmul_f64(x, seq, dim, &w_k, dim, dim);
+        let v = matmul_f64(x, seq, dim, &w_v, dim, dim);
+        let k_t = transpose_f64(&k, seq, dim);
+        let scores = matmul_f64(&q, seq, dim, &k_t, dim, seq);
+        let mut attn = scores.clone();
+        softmax_rowwise_f64(&mut attn, seq, seq);
+        let out = matmul_f64(&attn, seq, seq, &v, seq, dim);
+        let y = matmul_f64(&out, seq, dim, &w_o, dim, dim);
 
-    // Softmax-Jacobian-vector-product:
-    //   d_scores[i,j] = attn[i,j] * (d_attn[i,j] - sum_k(attn[i,k] * d_attn[i,k]))
-    let mut d_scores = vec![0.0; n_rows * n_rows];
-    for r in 0..n_rows {
-        let attn_row = &attn[r * n_rows..(r + 1) * n_rows];
-        let d_attn_row = &d_attn[r * n_rows..(r + 1) * n_rows];
-        let dot: f64 = attn_row
-            .iter()
-            .zip(d_attn_row.iter())
-            .map(|(a, d)| a * d)
-            .sum();
-        for j in 0..n_rows {
-            d_scores[r * n_rows + j] = attn_row[j] * (d_attn_row[j] - dot);
+        // Loss = sum(y²); dy = 2y
+        let dy: Vec<f64> = y.iter().map(|v| 2.0 * v).collect();
+
+        // Backward pass — same chain rule as before, but on per-batch shapes.
+        let out_t = transpose_f64(&out, seq, dim);
+        let d_w_o = matmul_f64(&out_t, dim, seq, &dy, seq, dim);
+        let w_o_t = transpose_f64(&w_o, dim, dim);
+        let d_out = matmul_f64(&dy, seq, dim, &w_o_t, dim, dim);
+        let attn_t = transpose_f64(&attn, seq, seq);
+        let d_v_act = matmul_f64(&attn_t, seq, seq, &d_out, seq, dim);
+        let v_t = transpose_f64(&v, seq, dim);
+        let d_attn = matmul_f64(&d_out, seq, dim, &v_t, dim, seq);
+
+        let mut d_scores = vec![0.0; seq * seq];
+        for r in 0..seq {
+            let attn_row = &attn[r * seq..(r + 1) * seq];
+            let d_attn_row = &d_attn[r * seq..(r + 1) * seq];
+            let dot: f64 = attn_row
+                .iter()
+                .zip(d_attn_row.iter())
+                .map(|(a, d)| a * d)
+                .sum();
+            for j in 0..seq {
+                d_scores[r * seq + j] = attn_row[j] * (d_attn_row[j] - dot);
+            }
+        }
+
+        let d_q_act = matmul_f64(&d_scores, seq, seq, &k, seq, dim);
+        let d_scores_t = transpose_f64(&d_scores, seq, seq);
+        let d_k_act = matmul_f64(&d_scores_t, seq, seq, &q, seq, dim);
+
+        let x_t = transpose_f64(x, seq, dim);
+        let d_w_q = matmul_f64(&x_t, dim, seq, &d_q_act, seq, dim);
+        let d_w_k = matmul_f64(&x_t, dim, seq, &d_k_act, seq, dim);
+        let d_w_v = matmul_f64(&x_t, dim, seq, &d_v_act, seq, dim);
+
+        // Per-batch per-head score: `Σ_elem |dW · W|` per head row range.
+        // Matches the subprocess's per-batch reduction inside
+        // `emit_per_head_dot_abs_accum`.
+        let q_scores_batch = per_head_score(&d_w_q, &w_q, dim, head_dim);
+        let k_scores_batch = per_head_score(&d_w_k, &w_k, dim, head_dim);
+        let v_scores_batch = per_head_score(&d_w_v, &w_v, dim, head_dim);
+        let o_scores_batch = per_head_score(&d_w_o, &w_o, dim, head_dim);
+        for h in 0..num_heads {
+            q_score_acc[h] += q_scores_batch[h] as f64;
+            k_score_acc[h] += k_scores_batch[h] as f64;
+            v_score_acc[h] += v_scores_batch[h] as f64;
+            o_score_acc[h] += o_scores_batch[h] as f64;
         }
     }
 
-    // dQ = d_scores @ K
-    let d_q_act = matmul_f64(&d_scores, n_rows, n_rows, &k, n_rows, dim);
-    // dK = d_scores.T @ Q
-    let d_scores_t = transpose_f64(&d_scores, n_rows, n_rows);
-    let d_k_act = matmul_f64(&d_scores_t, n_rows, n_rows, &q, n_rows, dim);
-
-    // dW_q = x.T @ dQ;  dW_k = x.T @ dK;  dW_v = x.T @ dV
-    let x_t = transpose_f64(&x, n_rows, dim);
-    let d_w_q = matmul_f64(&x_t, dim, n_rows, &d_q_act, n_rows, dim);
-    let d_w_k = matmul_f64(&x_t, dim, n_rows, &d_k_act, n_rows, dim);
-    let d_w_v = matmul_f64(&x_t, dim, n_rows, &d_v_act, n_rows, dim);
-
-    // Per-head reduction: aggregate per-projection per-head into a single score vec.
-    // For symmetric MHA, n_q_heads == n_kv_heads == n_o_heads, so simple sum works.
-    let q_scores = per_head_score(&d_w_q, &w_q, dim, head_dim);
-    let k_scores = per_head_score(&d_w_k, &w_k, dim, head_dim);
-    let v_scores = per_head_score(&d_w_v, &w_v, dim, head_dim);
-    let o_scores = per_head_score(&d_w_o, &w_o, dim, head_dim);
+    // For symmetric MHA, n_q_heads == n_kv_heads == n_o_heads, so simple
+    // cross-projection sum gives the layer's per-head score.
     let mut combined = vec![0.0_f32; num_heads];
     for h in 0..num_heads {
-        combined[h] = q_scores[h] + k_scores[h] + v_scores[h] + o_scores[h];
+        combined[h] = (q_score_acc[h] + k_score_acc[h] + v_score_acc[h] + o_score_acc[h]) as f32;
     }
 
     let mut out = HashMap::new();
