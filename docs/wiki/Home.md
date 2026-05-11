@@ -36,9 +36,12 @@ Then pick a milestone from [Roadmap](Roadmap.md) or an open issue.
 
 - **M52 CPDT Phase 2** — weight-aware spectral factor measurement-triggered at >20% committed-fixture disagreement ([Roadmap](Roadmap.md))
 - **M62 PyTorch FFI** — per-function C wrappers and Python E2E tests remain ([`m62-c-wrappers-design.md`](../superpowers/specs/2026-04-15-m62-c-wrappers-design.md))
-- **AWQ retention subprocess gaps** — model library linking + model_forward calls ([`docs/plans/`](../plans/))
-- **WGGO Phase 2 gradient scoring** — backward-pass execution blocked on AWQ retention fix ([Roadmap](Roadmap.md))
 - **WRGA B.3.2 fused backward** — scope analysis in progress; speedup estimate 1.2–1.5x ([`2026-04-18-wrga-b32-fused-backward-STUB.md`](../plans/2026-04-18-wrga-b32-fused-backward-STUB.md))
+
+## Recently landed
+
+- **AWQ retention subprocess** — shipped end-to-end. `real_subprocess_entry` is the canonical calibration path; AWQ analytical reference and snapshot tests both green (PRs #134, #145, #146, #148, #149).
+- **WGGO Phase 2 gradient scoring** — shipped end-to-end. Merge-gate test (`wggo_backward_pipeline::end_to_end_backward_subprocess_matches_analytical_reference`) passes against the analytical reference; `CalibratedGradientScorer` reads real per-head gradients from the calibration sidecar (PRs #132, #136–#141, #144, #146, #148, #149).
 
 ## If you get stuck
 

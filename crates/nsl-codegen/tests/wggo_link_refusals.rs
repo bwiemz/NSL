@@ -322,20 +322,51 @@ fn backward_wrapper_exported_with_shape_validation() {
     );
 }
 
-/// §5.1 (subprocess-level): deferred until a real calibration subprocess
-/// invocation harness (model weights + calibration data) is available.
-/// The runtime shape-mismatch path (status 3) is proven correct by the
-/// Task-14 unit tests in binary_codegen.rs::backward_wrapper.
+/// §5.1 (subprocess-level): defensive test for the runtime status-3 path
+/// (per-batch shape mismatch returned by `nsl_calib_model_{forward,backward}`).
+///
+/// The calibration subprocess harness IS now available — PRs #144/#146/#148/#149
+/// closed the hop chain that previously blocked it, and
+/// `wggo_backward_pipeline::end_to_end_backward_subprocess_matches_analytical_reference`
+/// proves the end-to-end path works. What's still missing is a way to trigger
+/// the status-3 branch from outside the wrapper: `real_subprocess_entry` uses
+/// the SAME calibration data file for both compile-time shape derivation
+/// (`peek_batch_seq`) and runtime feeding, so the wrapper's
+/// `batch_elem_count == expected_elem_count` check is unsatisfiable-by-fault
+/// — they always agree by construction. Reaching the mismatch path needs
+/// either (a) a heterogeneous calibration data loader that returns
+/// varying-size batches (none exists today; `load_bin` rejects mismatched
+/// payloads at load time) or (b) plumbing to invoke the linked calibration
+/// binary with a data file distinct from the one used for compile-time
+/// metadata. Neither is on a current roadmap.
+///
+/// Coverage today: the IR-level Task-14 unit tests in
+/// `binary_codegen::backward_wrapper` directly assert the wrapper emits the
+/// `icmp + brif` to the status-3 return on shape mismatch, which is
+/// equivalent at the binary level.
 #[test]
-#[ignore = "§5.1 subprocess harness not yet available; runtime status-3 path \
-            validated by Task-14 unit tests in binary_codegen::backward_wrapper"]
+#[ignore = "§5.1 (defensive): subprocess status-3 path is validated at the IR \
+            level by binary_codegen::backward_wrapper unit tests. Triggering \
+            it end-to-end requires either heterogeneous calibration data \
+            (no loader supports this) or a refactor of real_subprocess_entry \
+            to accept distinct compile-vs-runtime data paths. Tracked as \
+            future infrastructure work — not a WGGO Phase 2 blocker."]
 fn backward_batch_shape_mismatch_subprocess_returns_3() {
     // When this test is un-ignored, the harness should:
     // 1. Build a real calib_model.o + scaffolding.o with backward enabled.
     // 2. Link and execute the resulting binary.
     // 3. Pass calibration data whose batch_elem_count != batch*seq*channels.
     // 4. Assert the subprocess exits with status code 3.
-    unimplemented!("subprocess harness not yet available");
+    //
+    // Blocking detail: step 3 needs a data path with per-batch size different
+    // from what `peek_batch_seq` reported during compile. The simplest
+    // delivery is an optional `runtime_data_override: Option<PathBuf>` on
+    // `HarnessConfig` (test-only) plus a paired fixture file with mismatched
+    // shape — see the issue tracker for design discussion.
+    unimplemented!(
+        "see #[ignore] message: subprocess status-3 trigger needs \
+         heterogeneous-data loader or compile/runtime path split"
+    );
 }
 
 /// PR 1b regression: when `calibration_grad_retention` is non-empty, the
