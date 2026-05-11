@@ -646,7 +646,23 @@ fn awq_model_def_from_ast<'a>(
     })
 }
 
-fn awq_tensor_field_names(
+/// Collect the declaration-order names of every tensor-typed `LayerDecl` field
+/// on `model_def`.
+///
+/// Used by both the forward-bridge (which looks up runtime weight tensors by
+/// name and stores them at compile-time struct offsets) and the
+/// backward-bridge (which walks the same fields to build the
+/// `primal_vars` map for source-AD).
+///
+/// Matches the four type-annotation forms the parser produces for tensor
+/// weights so models that declare projections either as bare `Tensor` (AWQ
+/// fixture style) or as explicitly-parameterised `Tensor<[shape], dtype>` /
+/// `Param<[shape], dtype>` / `Buffer<[shape], dtype>` (WGGO fixture style)
+/// are both wired up. Previously this only matched the bare-`Named` form,
+/// which silently dropped every weight on WGGO-style models and produced
+/// null tensor pointers at the first `self.<proj>` matmul inside the
+/// compiled forward (#147 hop 8).
+fn model_tensor_field_names(
     model_def: &nsl_ast::decl::ModelDef,
     interner: &nsl_lexer::Interner,
 ) -> Vec<String> {
@@ -655,13 +671,20 @@ fn awq_tensor_field_names(
         .iter()
         .filter_map(|member| match member {
             nsl_ast::decl::ModelMember::LayerDecl { name, type_ann, .. } => {
-                match &type_ann.kind {
-                    nsl_ast::types::TypeExprKind::Named(sym)
-                        if interner.resolve(sym.0) == Some("Tensor") =>
-                    {
-                        interner.resolve(name.0).map(str::to_string)
-                    }
-                    _ => None,
+                let is_tensor = match &type_ann.kind {
+                    nsl_ast::types::TypeExprKind::Named(sym) => matches!(
+                        interner.resolve(sym.0),
+                        Some("Tensor") | Some("Param") | Some("Buffer")
+                    ),
+                    nsl_ast::types::TypeExprKind::Tensor { .. }
+                    | nsl_ast::types::TypeExprKind::Param { .. }
+                    | nsl_ast::types::TypeExprKind::Buffer { .. } => true,
+                    _ => false,
+                };
+                if is_tensor {
+                    interner.resolve(name.0).map(str::to_string)
+                } else {
+                    None
                 }
             }
             _ => None,
@@ -822,7 +845,7 @@ fn emit_model_forward_bridge(
                 .store(MemFlags::trusted(), zero, model_addr, slot_off as i32);
         }
 
-        let tensor_fields = awq_tensor_field_names(model_def, compiler.interner);
+        let tensor_fields = model_tensor_field_names(model_def, compiler.interner);
         let model_get_weight_ref = compiler
             .module
             .declare_func_in_func(model_get_weight_id, b.func);
@@ -930,11 +953,16 @@ fn emit_calibration_forward_wrapper(
     seq: u32,
     channels: i64,
 ) -> Result<(), HarnessError> {
-    let (shape_vals, input_ndim) = if batch == 1 {
-        (vec![seq as i64, channels], 2_i32)
-    } else {
-        (vec![batch as i64, seq as i64, channels], 3_i32)
-    };
+    // #147 hop 9: always feed the model a rank-3 input `[batch, seq, channels]`,
+    // even when `batch == 1`. The calibration data loader (`peek_batch_seq`)
+    // already errors unless the source tensor is rank-3, so the per-batch
+    // slice's natural rank is 3. Models that perform `.transpose(b, s)` or
+    // any other ndim-aware operation (e.g. multi-head attention) fail if the
+    // wrapper silently drops the batch axis to a rank-2 `[seq, channels]`
+    // shape. Element-wise / pipe-style models (AWQ TinyMLP) accept either
+    // rank since they only rely on the last-dim semantics.
+    let shape_vals: Vec<i64> = vec![batch as i64, seq as i64, channels];
+    let input_ndim: i32 = 3;
     let shape_data = declare_i64_rodata(
         &mut compiler.module,
         "__nsl_calib_input_shape",
@@ -1185,24 +1213,12 @@ fn emit_model_backward_bridge(
         })?;
 
     // ── Extract the model's forward WengertList ───────────────────────────────
-    // Collect tensor field names (same logic as awq_tensor_field_names).
-    let tensor_fields: Vec<String> = model_def
-        .members
-        .iter()
-        .filter_map(|member| match member {
-            nsl_ast::decl::ModelMember::LayerDecl { name, type_ann, .. } => {
-                match &type_ann.kind {
-                    nsl_ast::types::TypeExprKind::Named(sym)
-                        if compiler.interner.resolve(sym.0) == Some("Tensor") =>
-                    {
-                        compiler.interner.resolve(name.0).map(str::to_string)
-                    }
-                    _ => None,
-                }
-            }
-            _ => None,
-        })
-        .collect();
+    // Reuse the same tensor-field detection the forward bridge uses so the
+    // two paths cannot drift; #147 fixed a bug where this site silently
+    // skipped WGGO-style `Tensor<[...]>` fields, breaking source-AD weight
+    // resolution.
+    let tensor_fields: Vec<String> =
+        model_tensor_field_names(model_def, compiler.interner);
 
     // Find the forward method body.  collect_models() / declare_user_functions()
     // have already run before this function is called, so model_method_bodies is
@@ -1573,11 +1589,11 @@ fn emit_calibration_backward_wrapper(
     seq: u32,
     channels: i64,
 ) -> Result<(), HarnessError> {
-    let (shape_vals, input_ndim) = if batch == 1 {
-        (vec![seq as i64, channels], 2_i32)
-    } else {
-        (vec![batch as i64, seq as i64, channels], 3_i32)
-    };
+    // #147 hop 9: always rank-3 input — mirror the forward wrapper.
+    // Dropping the batch dim when batch==1 breaks any model whose forward
+    // uses ndim-aware ops (e.g. transpose(b, s) inside attention).
+    let shape_vals: Vec<i64> = vec![batch as i64, seq as i64, channels];
+    let input_ndim: i32 = 3;
 
     // Compile-time element count — single source of truth.
     let expected_elem_count: i64 = shape_vals.iter().product();
@@ -2177,10 +2193,21 @@ pub fn emit_calibration_scaffolding_object(
     // AWQ entries use bytes_per_element=4 (f32 max-abs running buffer, spec §4.3).
     // WGGO entries use bytes_per_element=8 (f64 per-head accumulator, spec §4.6).
     // Do NOT collapse these to a single constant — the sizes differ by design.
+    //
+    // #147 hop 11: declare each running buffer with explicit alignment equal
+    // to `bytes_per_element`. Cranelift's default BSS alignment is 1 byte,
+    // which the linker honors literally — without `set_align` the WGGO f64
+    // buffer can land on an odd address, and the runtime's
+    // `slice::from_raw_parts(running_ptr as *const f64, …)` violates the
+    // f64-alignment precondition and panics inside `nsl_calib_write_sidecar`
+    // (awq.rs:982). AWQ f32 buffers had the same latent issue; the AWQ
+    // unpacking just happened to land on aligned addresses with the previous
+    // single-buffer layouts.
     let mut running_data_ids: HashMap<String, DataId> = HashMap::new();
     for entry in finalize_plan {
         let mut data = DataDescription::new();
         data.define_zeroinit((entry.channels * (entry.bytes_per_element as u32)) as usize);
+        data.set_align(entry.bytes_per_element as u64);
         let id = module
             .declare_data(&entry.running_symbol, Linkage::Export, true, false)
             .map_err(|e| HarnessError::Infrastructure {
@@ -2966,15 +2993,37 @@ pub fn emit_calibration_scaffolding_object(
                 let zero = b.ins().iconst(cl_types::I32, 0);
                 b.ins().return_(&[zero]);
             } else {
-                let total_desc_bytes = (finalize_plan.len() as u32) * AWQ_DESC_BYTES;
+                // #147 hop 10: the AWQ descriptor array must contain ONLY
+                // AWQ-flavored entries (f32 max-abs running buffers). WGGO
+                // entries carry f64 per-head accumulators (bytes_per_element=8,
+                // spec §4.6) and are surfaced through `WggoLayerDescriptor`s
+                // in the WGGO array built below — packing them as AWQ would
+                // misinterpret f64 data as f32 *and* violate `*const f32`
+                // alignment requirements (the BSS symbol's natural alignment
+                // is 1 byte unless explicitly raised).
+                //
+                // Split finalize_plan up-front so the AWQ pack loop, the
+                // descriptor stack-size, and the desc_count argument all agree
+                // on what's an AWQ entry.
+                let awq_finalize_entries: Vec<&FinalizePlanEntry> = finalize_plan
+                    .iter()
+                    .filter(|fp| fp.bytes_per_element == 4)
+                    .collect();
+                let awq_desc_bytes =
+                    (awq_finalize_entries.len() as u32) * AWQ_DESC_BYTES;
+                // Cranelift requires every stack slot to be at least 1 byte;
+                // when there are no AWQ entries we still need a non-zero slot
+                // so the `stack_addr` instruction is valid. The base pointer
+                // is paired with `desc_count = 0`, so the runtime never reads
+                // from it (see awq_count == 0 branch in nsl_calib_write_sidecar).
                 let stack_slot = b.create_sized_stack_slot(StackSlotData::new(
                     StackSlotKind::ExplicitSlot,
-                    total_desc_bytes,
+                    awq_desc_bytes.max(AWQ_DESC_BYTES),
                     8,
                 ));
                 let descs_base = b.ins().stack_addr(ptr_ty, stack_slot, 0);
 
-                for (index, fp) in finalize_plan.iter().enumerate() {
+                for (index, fp) in awq_finalize_entries.iter().enumerate() {
                     let off = (index as i32) * (AWQ_DESC_BYTES as i32);
                     let path_id = path_data_ids[&fp.projection.0];
                     let path_gv = module.declare_data_in_func(path_id, b.func);
@@ -3000,7 +3049,8 @@ pub fn emit_calibration_scaffolding_object(
                 let sc_len_call = b.ins().call(strlen_ref2, &[fin_sidecar_ptr]);
                 let sidecar_path_len = b.inst_results(sc_len_call)[0];
 
-                let desc_count = b.ins().iconst(ptr_ty, finalize_plan.len() as i64);
+                let desc_count =
+                    b.ins().iconst(ptr_ty, awq_finalize_entries.len() as i64);
 
                 // Task 3.6: build the WGGO descriptor array on the stack.
                 // `WggoLayerDescriptor` is 48 bytes, 8-byte aligned (spec §6.2).
@@ -4106,6 +4156,76 @@ mod tests {
         assert!(
             imports.iter().any(|s| s == "nsl_calib_model_backward"),
             "WGGO-only scaffolding must import nsl_calib_model_backward; imports: {imports:?}"
+        );
+    }
+
+    /// Issue #147 (hop 8): the forward bridge needs to wire up every tensor
+    /// field whether it was declared as bare `Tensor` (AWQ fixture style) or
+    /// with explicit shape/dtype generics like `Tensor<[dim, dim], f32>`
+    /// (WGGO fixture style). Previously the bridge only matched
+    /// `TypeExprKind::Named("Tensor")`, silently dropping every weight on a
+    /// WGGO-style model — the compiled forward then read null tensor
+    /// pointers from the stack-allocated model struct and crashed inside
+    /// `nsl_tensor_matmul`'s `reconcile_device` (#147 root cause).
+    ///
+    /// This test runs `model_tensor_field_names` against both AWQ-style and
+    /// WGGO-style fixtures and asserts both forms produce the right set of
+    /// names. Regression bait: shrinking the matcher to either form alone
+    /// would fail this test.
+    #[test]
+    fn model_tensor_field_names_matches_both_bare_and_generic_tensor_forms() {
+        let interner = parse_awq_fixture().1;
+        // We can't easily build a ModelDef without parsing, so reuse the
+        // existing fixtures: awq_calibration_mlp.nsl uses bare `Tensor`,
+        // wggo_attention_mlp_real.nsl uses `Tensor<[...]>`. Both wrap the
+        // ModelDef in `Decorated { decorators: [@quantize(...)], stmt: ... }`,
+        // so unwrap that layer when searching.
+        fn find_model_def(stmts: &[nsl_ast::stmt::Stmt]) -> Option<nsl_ast::decl::ModelDef> {
+            for s in stmts {
+                match &s.kind {
+                    nsl_ast::stmt::StmtKind::ModelDef(md) => return Some(md.clone()),
+                    nsl_ast::stmt::StmtKind::Decorated { stmt, .. } => {
+                        if let nsl_ast::stmt::StmtKind::ModelDef(md) = &stmt.kind {
+                            return Some(md.clone());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            None
+        }
+
+        let awq = {
+            let (ast, _) = parse_awq_fixture();
+            find_model_def(&ast.stmts).expect("awq fixture has a ModelDef")
+        };
+        let awq_fields = model_tensor_field_names(&awq, &interner);
+        assert!(
+            awq_fields.iter().any(|f| f == "up_proj") && awq_fields.iter().any(|f| f == "down_proj"),
+            "AWQ fixture's bare-`Tensor` projections must be detected: got {awq_fields:?}"
+        );
+
+        // WGGO-style fixture: `Tensor<[dim, dim], f32>` typed projections.
+        let wggo_source = std::fs::read_to_string(fixture("wggo_attention_mlp_real.nsl"))
+            .expect("wggo fixture readable");
+        let mut wggo_interner = Interner::new();
+        let (wggo_tokens, _) = tokenize(&wggo_source, FileId(0), &mut wggo_interner);
+        let wggo_parsed = nsl_parser::parse(&wggo_tokens, &mut wggo_interner);
+        let wggo = find_model_def(&wggo_parsed.module.stmts)
+            .expect("wggo fixture has a ModelDef");
+        let wggo_fields = model_tensor_field_names(&wggo, &wggo_interner);
+        for name in &["q_proj", "k_proj", "v_proj", "o_proj"] {
+            assert!(
+                wggo_fields.iter().any(|f| f == *name),
+                "WGGO fixture's `Tensor<[...]>`-typed projection `{name}` must be detected; \
+                 got {wggo_fields:?} — if this fails, the forward bridge will silently drop \
+                 weights and the compiled model_forward will see null tensor pointers"
+            );
+        }
+        // `head_dim: int` must NOT be detected as a tensor field.
+        assert!(
+            !wggo_fields.iter().any(|f| f == "head_dim"),
+            "non-tensor field `head_dim` must not be in the tensor-field list: {wggo_fields:?}"
         );
     }
 }
