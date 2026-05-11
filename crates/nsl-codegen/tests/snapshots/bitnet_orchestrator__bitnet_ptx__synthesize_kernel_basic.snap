@@ -1,0 +1,165 @@
+---
+source: crates/nsl-codegen/tests/bitnet_orchestrator.rs
+expression: ptx
+---
+.version 7.0
+.target sm_80
+.address_size 64
+// BitNet kernel: nsl_bitnet_b158_gemm_m64_n128_k128_f16
+.visible .entry nsl_bitnet_b158_gemm_m64_n128_k128_f16 (
+  .param .u64 act_in,
+  .param .u64 weights_packed,
+  .param .u64 y_out
+) {
+// --- Body skeleton (Phase 1; runtime register definitions added in Task 10) ---
+// === BitNet packed_load (block_k=128, block_n=128) ===
+// Compute byte offset = trit_offset >> 2 (4 trits per byte).
+shr.b32 %r_byte_offset, %r1, 2;
+cvta.to.global.u64 %rd_weight_global, %rd1;
+cvt.u64.u32 %rd_byte_off_64, %r_byte_offset;
+add.s64 %rd_weight_addr, %rd_weight_global, %rd_byte_off_64;
+// cp.async ping-pong (depth=2, no role split).
+cp.async.ca.shared.global [%rd2], [%rd_weight_addr], 4;
+cp.async.commit_group;
+cp.async.wait_group 0;
+// Unpack 4 trits per byte using bit-field extract (single SASS at sm_80+).
+// HIGH-BITS-FIRST: trit[0] at bits [7:6]; trit[3] at bits [1:0].
+ld.shared.b32 %r_packed_word, [%rd2];
+bfe.u32 %r_trit0, %r_packed_word, 6, 2;
+bfe.u32 %r_trit1, %r_packed_word, 4, 2;
+bfe.u32 %r_trit2, %r_packed_word, 2, 2;
+bfe.u32 %r_trit3, %r_packed_word, 0, 2;
+// Decode: trit_value = bits - 1 (00 -> -1, 01 -> 0, 10 -> +1).
+sub.s32 %r_t0_val, %r_trit0, 1;
+sub.s32 %r_t1_val, %r_trit1, 1;
+sub.s32 %r_t2_val, %r_trit2, 1;
+sub.s32 %r_t3_val, %r_trit3, 1;
+// === end BitNet packed_load ===
+// === BitNet fused quantized_ternary_gemm ===
+// Phase 1/2: absmax activation quantization prologue.
+// === BitNet absmax_quant (hidden_dim=1024) ===
+// Per-thread: track max(|x[r, k]|) over assigned lane stride.
+mov.f32 %f_max, 0f00000000;
+mov.u32 %r_k, %tid.x;
+ABSMAX_LOOP:
+setp.ge.u32 %p_amdone, %r_k, %r_hidden_dim;
+@%p_amdone bra ABSMAX_END;
+mul.lo.u32 %r_off, %r_row_id, %r_hidden_dim;
+add.u32 %r_off, %r_off, %r_k;
+shl.b32 %r_off, %r_off, 1;
+cvt.u64.u32 %rd_off, %r_off;
+add.s64 %rd_addr, %rd_act_in, %rd_off;
+ld.global.b16 %h_x, [%rd_addr];
+cvt.f32.f16 %f_x, %h_x;
+abs.f32 %f_absx, %f_x;
+max.f32 %f_max, %f_max, %f_absx;
+add.u32 %r_k, %r_k, 32;
+bra ABSMAX_LOOP;
+ABSMAX_END:
+// Warp-shuffle butterfly reduction (parallel, not serialized).
+shfl.sync.bfly.b32 %f_partial, %f_max, 16, 0x1f, 0xffffffff;
+max.f32 %f_max, %f_max, %f_partial;
+shfl.sync.bfly.b32 %f_partial, %f_max, 8, 0x1f, 0xffffffff;
+max.f32 %f_max, %f_max, %f_partial;
+shfl.sync.bfly.b32 %f_partial, %f_max, 4, 0x1f, 0xffffffff;
+max.f32 %f_max, %f_max, %f_partial;
+shfl.sync.bfly.b32 %f_partial, %f_max, 2, 0x1f, 0xffffffff;
+max.f32 %f_max, %f_max, %f_partial;
+shfl.sync.bfly.b32 %f_partial, %f_max, 1, 0x1f, 0xffffffff;
+max.f32 %f_max, %f_max, %f_partial;
+// %f_max now holds row-wide absmax across all lanes.
+mov.f32 %f_scale, %f_max;
+// Zero-magnitude row guard: scale == 0 -> write all zeros to SMEM, scale = 0.
+setp.eq.f32 %p_zero, %f_scale, 0f00000000;
+@%p_zero bra ABSMAX_ZERO_ROW;
+// Per-thread quantize: q = round(clip(x * 127.0 / scale, -127, 127)).
+mov.f32 %f_inv_scale, 0f42FE0000;
+div.rn.f32 %f_inv_scale, %f_inv_scale, %f_scale;
+mov.u32 %r_k, %tid.x;
+QUANT_LOOP:
+setp.ge.u32 %p_qdone, %r_k, %r_hidden_dim;
+@%p_qdone bra QUANT_END;
+mul.lo.u32 %r_qoff, %r_row_id, %r_hidden_dim;
+add.u32 %r_qoff, %r_qoff, %r_k;
+shl.b32 %r_qoff_bytes, %r_qoff, 1;
+cvt.u64.u32 %rd_qoff, %r_qoff_bytes;
+add.s64 %rd_qload, %rd_act_in, %rd_qoff;
+ld.global.b16 %h_xq, [%rd_qload];
+cvt.f32.f16 %f_xq, %h_xq;
+mul.f32 %f_scaled, %f_xq, %f_inv_scale;
+max.f32 %f_clip, %f_scaled, 0fC2FE0000;
+min.f32 %f_clip, %f_clip, 0f42FE0000;
+cvt.rni.s32.f32 %r_qi, %f_clip;
+cvt.s8.s32 %rs_qi8, %r_qi;
+cvt.u64.u32 %rd_smemoff, %r_qoff;
+add.s64 %rd_qsmem_addr, %rd_qact_smem, %rd_smemoff;
+st.shared.s8 [%rd_qsmem_addr], %rs_qi8;
+add.u32 %r_k, %r_k, 32;
+bra QUANT_LOOP;
+QUANT_END:
+bra ABSMAX_DONE;
+ABSMAX_ZERO_ROW:
+// Zero-magnitude row: write zeros to all quantized slots.
+mov.u32 %r_k, %tid.x;
+ZERO_LOOP:
+setp.ge.u32 %p_zdone, %r_k, %r_hidden_dim;
+@%p_zdone bra ABSMAX_DONE;
+mul.lo.u32 %r_zoff, %r_row_id, %r_hidden_dim;
+add.u32 %r_zoff, %r_zoff, %r_k;
+cvt.u64.u32 %rd_zoff, %r_zoff;
+add.s64 %rd_zsmem, %rd_qact_smem, %rd_zoff;
+st.shared.s8 [%rd_zsmem], 0;
+add.u32 %r_k, %r_k, 32;
+bra ZERO_LOOP;
+ABSMAX_DONE:
+bar.sync 0;
+// === end BitNet absmax_quant ===
+// Phase 2/2: ternary GEMM body (consumes quantized activations + scale).
+// === BitNet ternary_gemm (hidden_dim=1024) ===
+// Init i32 accumulator for this thread's (row, col) output.
+mov.s32 %r_acc, 0;
+// Inner loop: acc += q_act[row, k] * w_ternary[k, col] over k.
+mov.u32 %r_k, 0;
+GEMM_LOOP:
+setp.ge.u32 %p_gdone, %r_k, %r_hidden_dim;
+@%p_gdone bra GEMM_END;
+// Load q_act[row, k] = qact_smem[row * hidden_dim + k].
+mul.lo.u32 %r_qoff, %r_row_id, %r_hidden_dim;
+add.u32 %r_qoff, %r_qoff, %r_k;
+cvt.u64.u32 %rd_qoff, %r_qoff;
+add.s64 %rd_qaddr, %rd_qact_smem, %rd_qoff;
+ld.shared.s8 %rs_qact, [%rd_qaddr];
+cvt.s32.s8 %r_qact_i32, %rs_qact;
+// Load w_ternary[k, col] = w_smem[k * out_dim + col].
+mul.lo.u32 %r_woff, %r_k, %r_out_dim;
+add.u32 %r_woff, %r_woff, %r_col_id;
+cvt.u64.u32 %rd_woff, %r_woff;
+add.s64 %rd_waddr, %rd_w_smem, %rd_woff;
+ld.shared.s8 %rs_w, [%rd_waddr];
+cvt.s32.s8 %r_w_i32, %rs_w;
+// acc += qact * w  (mul.lo.s32 + add.s32 to avoid mad.lo.s32 risk).
+mul.lo.s32 %r_prod, %r_qact_i32, %r_w_i32;
+add.s32 %r_acc, %r_acc, %r_prod;
+add.u32 %r_k, %r_k, 1;
+bra GEMM_LOOP;
+GEMM_END:
+// Dequant: y = (scale / 127.0) * acc.
+cvt.rn.f32.s32 %f_acc, %r_acc;
+mov.f32 %f_127, 0f42FE0000;
+div.rn.f32 %f_inv127_scale, %f_scale, %f_127;
+mul.f32 %f_y_out, %f_inv127_scale, %f_acc;
+// === end BitNet ternary_gemm ===
+// === end BitNet fused quantized_ternary_gemm ===
+// === BitNet finalize ===
+// Cast FP32 -> F16/BF16 and store to HBM.
+cvt.rn.f16.f32 %h_y, %f_y_out;
+mul.lo.u32 %r_yoff, %r_row_id, %r_out_dim;
+add.u32 %r_yoff, %r_yoff, %r_col_id;
+shl.b32 %r_yoff, %r_yoff, 1;
+cvt.u64.u32 %rd_yoff, %r_yoff;
+cvta.to.global.u64 %rd_y_global, %rd_y_out;
+add.s64 %rd_y_addr, %rd_y_global, %rd_yoff;
+st.global.b16 [%rd_y_addr], %h_y;
+// === end BitNet finalize ===
+ret;
+}

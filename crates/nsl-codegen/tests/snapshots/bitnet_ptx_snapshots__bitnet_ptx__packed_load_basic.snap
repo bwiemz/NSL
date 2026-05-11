@@ -1,0 +1,27 @@
+---
+source: crates/nsl-codegen/tests/bitnet_ptx_snapshots.rs
+expression: ptx
+---
+// === BitNet packed_load (block_k=128, block_n=128) ===
+// Compute byte offset = trit_offset >> 2 (4 trits per byte).
+shr.b32 %r_byte_offset, %r1, 2;
+cvta.to.global.u64 %rd_weight_global, %rd1;
+cvt.u64.u32 %rd_byte_off_64, %r_byte_offset;
+add.s64 %rd_weight_addr, %rd_weight_global, %rd_byte_off_64;
+// cp.async ping-pong (depth=2, no role split).
+cp.async.ca.shared.global [%rd2], [%rd_weight_addr], 4;
+cp.async.commit_group;
+cp.async.wait_group 0;
+// Unpack 4 trits per byte using bit-field extract (single SASS at sm_80+).
+// HIGH-BITS-FIRST: trit[0] at bits [7:6]; trit[3] at bits [1:0].
+ld.shared.b32 %r_packed_word, [%rd2];
+bfe.u32 %r_trit0, %r_packed_word, 6, 2;
+bfe.u32 %r_trit1, %r_packed_word, 4, 2;
+bfe.u32 %r_trit2, %r_packed_word, 2, 2;
+bfe.u32 %r_trit3, %r_packed_word, 0, 2;
+// Decode: trit_value = bits - 1 (00 -> -1, 01 -> 0, 10 -> +1).
+sub.s32 %r_t0_val, %r_trit0, 1;
+sub.s32 %r_t1_val, %r_trit1, 1;
+sub.s32 %r_t2_val, %r_trit2, 1;
+sub.s32 %r_t3_val, %r_trit3, 1;
+// === end BitNet packed_load ===

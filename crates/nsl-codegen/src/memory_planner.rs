@@ -845,6 +845,8 @@ fn dtype_byte_size(dtype: &nsl_semantic::types::DType) -> u64 {
         DType::Int8 | DType::Uint8 | DType::Bool => 1,
         DType::Fp8E4m3 | DType::Fp8E5m2 => 1,
         DType::Int4 => 1,                       // rounded up
+        // M35.1 BitNet: ternary storage atom is 1 byte (packed 2-bit×4 trits; unpacked i8).
+        DType::TernaryPacked | DType::TernaryUnpacked => 1,
         DType::Custom(_) | DType::Unknown => 4, // default to f32 size for unknown dtypes
     }
 }
