@@ -174,25 +174,22 @@ fn wggo_fixture_compile_bundle() -> std::sync::Arc<nsl_codegen::calibration::Cal
 /// deviation well below 10⁻¹².  The 10⁻⁴ guard is intentionally generous to
 /// absorb any f32/f64 promotion boundary at the BSS read-back step.
 #[test]
-#[ignore = "Blocked on #144 (WGGO hop 7: WggoGradientHook produces empty \
-            observe_plan despite needs_forward_pass=true). \
+#[ignore = "Hop 7 (WGGO validator + arena-empty handling) is fixed by #144 — \
+            the scaffolding now builds and the calibration binary runs. \
             \
-            #134 (decouple calibration from compile_train_block) has \
-            landed and delivered: hop 6 generalization of \
-            emit_calibration_model_object, wrapper-level firing of \
-            real_subprocess_entry from compile_and_calibrate, deletion \
-            of Path 1's calibration block in compile_train_block, AWQ \
-            sidecar regression discipline (snapshot + CHANGELOG + CI). \
+            Newly surfaced blocker (hop 8): the calibration subprocess crashes \
+            during the model's forward pass with a null-pointer dereference in \
+            nsl_tensor_matmul (one of the matmul operands is null). The same \
+            crash signature is reproducible in the AWQ merge-gate \
+            (awq_full_pipeline::end_to_end_real_subprocess_matches_analytical_reference), \
+            confirming this is a pre-existing runtime bug in the calibration \
+            forward-pass FFI path (weight pointer indexing or input tensor \
+            descriptor wiring), not WGGO-specific. \
             \
-            Remaining blocker (hop 7): the validator at binary_codegen.rs \
-            rejects 'observe_plan is empty but needs_forward_pass() \
-            returned true' for the WGGO-only flow. WggoGradientHook's \
-            requires() returns BackwardGradients(_) (needs_forward_pass=true \
-            per PR #140) but observe_plan() returns empty. Either the \
-            hook should emit ObservePlanEntry records for its BSS \
-            gradient reads, or the validator needs an exemption for \
-            backward-only hooks. See #144 for the resolution scope and \
-            tracking."]
+            Track separately as a follow-up to #144 — out of scope for the hop \
+            7 validator fix. When the runtime bug is resolved, drop the \
+            #[ignore] and the merge-gate test should pass against the \
+            analytical reference within 1×10⁻⁴ tolerance."]
 fn end_to_end_backward_subprocess_matches_analytical_reference() {
     let data_path = fixture("wggo_calib_data.safetensors");
     let weights_path = fixture("wggo_calib_weights.safetensors");
