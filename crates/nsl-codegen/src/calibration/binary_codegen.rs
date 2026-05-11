@@ -1746,6 +1746,55 @@ fn emit_calibration_backward_wrapper(
     Ok(())
 }
 
+/// Adapt a WGGO Phase 2 `WggoGradTarget` to a `DiscoveredProjection` so
+/// `emit_calibration_model_object` can read `channels` / `model_name` /
+/// `transpose_fields` from a uniform projection list regardless of
+/// whether the source was AWQ (`@quantize(dtype="awq4")`) or WGGO
+/// (`@wggo_target(...)`).
+///
+/// Spec §5.2: the adapter emits **one** `DiscoveredProjection` per target,
+/// using **`w_o_shape`** for the `weight_shape` field. Rationale:
+/// `emit_calibration_model_object` reads `channels = first_projection.
+/// weight_shape[1]` (the **input** dimension, `in_features` per
+/// `DiscoveredProjection.weight_shape = [out_features, in_features]`);
+/// `w_o_shape[1]` is the corresponding input dimension for attention's
+/// output projection. Picking `w_o_shape`
+/// is load-bearing for "AWQ byte-identical by inspection" — a different
+/// choice could shift the channels value on mixed AWQ + WGGO fixtures and
+/// trigger a snapshot regression diagnosed as a symptom (wrong channels)
+/// rather than the cause (wrong shape selection).
+///
+/// If a future caller needs per-W_* granularity, this adapter can be
+/// extended to emit four entries per target — but v1's hop 6 fix needs
+/// only one entry per layer to satisfy the existing reads.
+fn grad_target_to_projection_meta(
+    target: &crate::calibration::discovery::WggoGradTarget,
+) -> crate::calibration::discovery::DiscoveredProjection {
+    // target.w_o is structured as "<instance_var>.<field_path>" — e.g.,
+    // "m.o_proj" for a top-level instance, or "gpt.blocks.0.attn.o_proj"
+    // for nested models. emit_calibration_model_object derives
+    // `model_name` via projection.0.split('.').next(), which on raw
+    // target.w_o yields the instance-var name (e.g., "m") — but
+    // awq_model_def_from_ast looks up the AST by class name (e.g.,
+    // "AttentionMLP"). Construct the projection path with target.class_name
+    // as the first segment + the field-path portion of w_o, so model_name
+    // derives to the class name (matching AWQ's "ClassName.field"
+    // projection-path convention) and transpose_fields strips correctly.
+    let field_path = target
+        .w_o
+        .0
+        .split_once('.')
+        .map(|(_, after)| after)
+        .unwrap_or("w_o");
+    crate::calibration::discovery::DiscoveredProjection {
+        projection: crate::calibration::ProjectionRef(format!(
+            "{}.{}",
+            target.class_name, field_path
+        )),
+        weight_shape: target.w_o_shape,
+    }
+}
+
 pub fn emit_calibration_model_object(
     ast: &nsl_ast::Module,
     opts: &crate::CompileOptions,
@@ -1761,6 +1810,16 @@ pub fn emit_calibration_model_object(
         })?;
 
     let mut compile_opts = opts.clone();
+
+    // #134 §5.2 hop 6 generalization: emit_calibration_model_object reads
+    // from the union calibration_retention ∪ calibration_grad_retention.
+    // AWQ flow: calibration_retention is non-empty (or AWQ pre-scan
+    // discovers it from the AST), so the first arm matches and the function
+    // reads exactly what it read before — byte-identical by inspection.
+    // WGGO-only flow: calibration_retention is None or empty but
+    // calibration_grad_retention is populated; the second arm synthesizes
+    // projections from WGGO targets using grad_target_to_projection_meta
+    // (one entry per target, using w_o_shape per spec §5.2).
     if compile_opts.calibration_retention.is_none() {
         let discovered =
             crate::calibration::pre_scan_awq_projections_from_ast(ast, &bundle.interner);
@@ -1768,15 +1827,27 @@ pub fn emit_calibration_model_object(
             compile_opts.calibration_retention = Some(discovered);
         }
     }
-    let projections = compile_opts
-        .calibration_retention
-        .clone()
-        .ok_or_else(|| HarnessError::Infrastructure {
-            reason: "emit_calibration_model_object requires AWQ projections".into(),
-        })?;
-    let first_projection = projections.first().ok_or_else(|| HarnessError::Infrastructure {
-        reason: "emit_calibration_model_object requires a non-empty projection list".into(),
-    })?;
+
+    let projections: Vec<crate::calibration::discovery::DiscoveredProjection> = match (
+        compile_opts.calibration_retention.as_ref(),
+        compile_opts.calibration_grad_retention.as_ref(),
+    ) {
+        (Some(retn), _) if !retn.is_empty() => retn.clone(),
+        (_, Some(grads)) if !grads.is_empty() => {
+            grads.iter().map(grad_target_to_projection_meta).collect()
+        }
+        _ => {
+            return Err(HarnessError::Infrastructure {
+                reason: "emit_calibration_model_object requires either AWQ \
+                         projections (calibration_retention) or WGGO targets \
+                         (calibration_grad_retention)"
+                    .into(),
+            });
+        }
+    };
+    let first_projection = projections.first().expect(
+        "projections vec built from non-empty match arms — first() cannot fail",
+    );
     let channels = first_projection.weight_shape[1] as i64;
     let (batch, seq) = compile_opts.calibration_batch_seq.unwrap_or((8, 4));
     let model_name = first_projection
