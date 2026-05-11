@@ -509,6 +509,24 @@ pub fn shared_mem_bytes_v2(config: &FlashAttentionConfig) -> u32 {
     smem_layout::total_bytes(config)
 }
 
+/// Dynamic SMEM byte count to pass to `cuLaunchKernel` for the v2 Tier C
+/// **backward** kernel. Covers the backward shmem region
+/// (`backward_total_bytes` = forward total + dQ/dK/dV/P/dS/v_in tiles +
+/// CSHA dRMSNorm strips) plus PCA Tier A's embedded `seg_smem` tail when
+/// `config.segment_masked`. The forward shmem helper above does not
+/// suffice — backward needs `backward_extra_bytes` on top of the forward
+/// layout, and the seg_smem region lives in the same extern shmem
+/// allocation per the Blackwell static+extern fix
+/// (see `phases/backward/prelude.rs::backward_needs_dynamic_smem`).
+pub fn shared_mem_bytes_v2_backward(config: &FlashAttentionConfig) -> u32 {
+    let seg_overhead = if config.segment_masked {
+        crate::pca_segment::DEFAULT_SMEM_SEGMENT_BUDGET as u32
+    } else {
+        0
+    };
+    phases::backward::prelude::backward_total_bytes(config) + seg_overhead
+}
+
 /// Tier C backward orchestrator — emits the full backward PTX kernel by
 /// wiring every Phase 3 emitter in the correct execution order.
 ///
@@ -922,5 +940,38 @@ mod backward_orchestrator_tests {
             "orchestrator must zero dK SMEM tile");
         assert!(ptx.contains("BWD zero-init DV SMEM tile"),
             "orchestrator must zero dV SMEM tile");
+    }
+
+    /// `shared_mem_bytes_v2_backward` must be strictly larger than the
+    /// forward `shared_mem_bytes_v2` for any non-trivial backward config —
+    /// `backward_extra_bytes` (P, dS, dQ/dK/dV, V_in, dRMSNorm strips) is
+    /// always non-zero. A regression that returns the forward total here
+    /// silently short-allocates dynamic SMEM at every backward launch.
+    #[test]
+    fn backward_shmem_strictly_exceeds_forward_shmem() {
+        let cfg = base_cfg_fused_backward(32, 32, 32, 4, 32);
+        let fwd = shared_mem_bytes_v2(&cfg);
+        let bwd = shared_mem_bytes_v2_backward(&cfg);
+        assert!(
+            bwd > fwd,
+            "backward shmem ({bwd}) must exceed forward shmem ({fwd}) by backward_extra_bytes"
+        );
+    }
+
+    /// When `segment_masked`, the backward shmem must also include the
+    /// embedded `seg_smem` tail (sized to `DEFAULT_SMEM_SEGMENT_BUDGET`)
+    /// so the launcher's dynamic allocation covers both `backward_total`
+    /// and the trailing segment_ids region.
+    #[test]
+    fn backward_shmem_includes_segment_budget_when_masked() {
+        let base = base_cfg_fused_backward(32, 32, 32, 4, 32);
+        let masked = FlashAttentionConfig { segment_masked: true, ..base.clone() };
+        let unmasked = shared_mem_bytes_v2_backward(&base);
+        let with_seg = shared_mem_bytes_v2_backward(&masked);
+        assert_eq!(
+            with_seg - unmasked,
+            crate::pca_segment::DEFAULT_SMEM_SEGMENT_BUDGET as u32,
+            "segment_masked must add exactly DEFAULT_SMEM_SEGMENT_BUDGET bytes"
+        );
     }
 }
