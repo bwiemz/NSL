@@ -4,15 +4,25 @@
 
 use crate::flash_attention::FlashAttentionConfig;
 use crate::flash_attention_v2::smem_layout::{needs_dynamic_smem, total_bytes, SMEM_BUDGET_BYTES};
+use crate::pca_segment::DEFAULT_SMEM_SEGMENT_BUDGET;
 
 /// Forward SMEM-routing gate that also accounts for PCA Tier A's
-/// `seg_smem[4096]` static array (when `config.segment_masked`).  Without
+/// `seg_smem` static array (when `config.segment_masked`).  Without
 /// this, CSHA fused+saves + segment_masked configs can push the combined
 /// static SMEM past the 48 KB cap; ptxas accepts but launch fails with
 /// CUDA_ERROR_ILLEGAL_ADDRESS at sync time because the main shmem[] is
 /// silently over-allocated.  Mirrors `backward_needs_dynamic_smem`.
+///
+/// `seg_smem` is sized to `pca_segment::DEFAULT_SMEM_SEGMENT_BUDGET`
+/// (the upper bound used by `pca_segment::plan_kernel` when deciding
+/// `SegmentResidency::Shared`); the FA emitter's allocation must match
+/// the planner so cooperative loads never write past the buffer.
 fn fwd_needs_dynamic_smem(config: &FlashAttentionConfig) -> bool {
-    let seg_overhead = if config.segment_masked { 4096 } else { 0 };
+    let seg_overhead = if config.segment_masked {
+        DEFAULT_SMEM_SEGMENT_BUDGET as u32
+    } else {
+        0
+    };
     total_bytes(config) + seg_overhead > SMEM_BUDGET_BYTES
         || needs_dynamic_smem(config)
 }
@@ -258,16 +268,23 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig) {
         ptx.push_str("    .reg .u64 %rd_q_SEGMASK, %rd_k_SEGMASK;\n");
         ptx.push_str("    .reg .b16 %rs_q_SEGMASK, %rs_k_SEGMASK;\n");
         ptx.push_str("    .reg .pred %p_seg_SEGMASK;\n");
-        // Cooperative-load scratch for the warp-0 prelude (seq_len ≤ 2048).
+        // Cooperative-load scratch for the warp-0 prelude. The load loop
+        // iterates over the runtime seq_len; the SMEM buffer below caps
+        // the supported seq_len at DEFAULT_SMEM_SEGMENT_BUDGET / 2 entries
+        // (the same ceiling pca_segment::plan_kernel uses to pick Shared).
         ptx.push_str("    .reg .u32 %r_pca_i, %r_pca_seq;\n");
         ptx.push_str("    .reg .u64 %rd_pca_off;\n");
         ptx.push_str("    .reg .b16 %rs_pca;\n");
         ptx.push_str("    .reg .pred %p_pca_load, %p_pca_done;\n");
-        // 4096-byte SMEM buffer: holds up to 2048 u16 segment_ids entries.
-        // Kept separate from `shmem` so Q/K/V tile offset arithmetic is
-        // unaffected. Align 4 is safe for u16 loads (offsets are 2-byte aligned
-        // from a 4-byte-aligned base).
-        ptx.push_str("    .shared .align 4 .b8 seg_smem[4096];\n");
+        // SMEM buffer sized to pca_segment::DEFAULT_SMEM_SEGMENT_BUDGET so
+        // it matches the ceiling pca_segment::plan_kernel uses to pick
+        // SegmentResidency::Shared. Kept separate from `shmem` so Q/K/V
+        // tile offset arithmetic is unaffected. Align 4 is safe for u16
+        // loads (offsets are 2-byte aligned from a 4-byte-aligned base).
+        ptx.push_str(&format!(
+            "    .shared .align 4 .b8 seg_smem[{}];\n",
+            DEFAULT_SMEM_SEGMENT_BUDGET
+        ));
     }
 
     crate::kernel_skeleton::smem::emit_shmem_base_cvta(ptx);
