@@ -100,3 +100,66 @@ fn extract_op_component_range_matches_seven_outputs() {
         }
     }
 }
+
+/// Gap I.B: `clear_csha_per_function_caches` empties both
+/// `csha_fused_bwd_cache` and `csha_forward_saves` so a subsequent
+/// train/grad block in the same module starts with no aliased entries.
+///
+/// Cranelift `Value` IDs restart at 0 for every new function — if a prior
+/// function left `Value::from_u32(42) → [v0..v7]` behind, a later
+/// function's first cache lookup against its own `Value::from_u32(42)`
+/// would return ghost outputs that don't belong to it.  The helper makes
+/// the post-function state byte-equivalent to a fresh `Compiler::new()`
+/// for these two fields.
+#[test]
+fn clear_csha_per_function_caches_empties_both_maps() {
+    use nsl_codegen::csha_apply::CshaSavePointers;
+
+    let interner = Interner::new();
+    let type_map: TypeMap = HashMap::new();
+    let opts = CompileOptions::default();
+    let mut compiler = nsl_codegen::compiler::Compiler::new(&interner, &type_map, &opts)
+        .expect("Compiler::new should succeed with default options");
+
+    // Populate `csha_fused_bwd_cache` the way `FusedCshaBackward` does.
+    let key = Value::from_u32(42);
+    let slots: [Value; 8] = [
+        Value::from_u32(300), Value::from_u32(301), Value::from_u32(302),
+        Value::from_u32(303), Value::from_u32(304), Value::from_u32(305),
+        Value::from_u32(306), Value::from_u32(307),
+    ];
+    compiler.csha_fused_bwd_cache.insert(key, slots);
+
+    // Populate `csha_forward_saves` the way the FA call site does.
+    compiler.csha_forward_saves.insert(
+        "TinyAttn".to_string(),
+        CshaSavePointers {
+            q_proj: Value::from_u32(400),
+            k_proj: Value::from_u32(401),
+            v_proj: Value::from_u32(402),
+            row_max: Value::from_u32(403),
+            row_sum: Value::from_u32(404),
+            x_raw:   Value::from_u32(405),
+            backward_ptx_data_id: None,
+            backward_name_data_id: None,
+        },
+    );
+
+    assert!(!compiler.csha_fused_bwd_cache.is_empty(), "precondition");
+    assert!(!compiler.csha_forward_saves.is_empty(), "precondition");
+
+    compiler.clear_csha_per_function_caches();
+
+    assert!(
+        compiler.csha_fused_bwd_cache.is_empty(),
+        "csha_fused_bwd_cache must be empty after clear_csha_per_function_caches; \
+         otherwise a later function's `Value::from_u32(N)` lookup could alias \
+         against this function's stale entry"
+    );
+    assert!(
+        compiler.csha_forward_saves.is_empty(),
+        "csha_forward_saves must be empty after clear_csha_per_function_caches; \
+         otherwise a later function's backward emission could read save pointers \
+         that point into the previous function's stack frame"
+    );
+}

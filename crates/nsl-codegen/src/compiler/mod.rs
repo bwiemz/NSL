@@ -805,6 +805,38 @@ impl<'a> Compiler<'a> {
         self.csha_claimed_ops.contains(&op_idx)
     }
 
+    /// Gap I.B: clear CSHA per-function caches at function-compile
+    /// boundaries.
+    ///
+    /// `csha_fused_bwd_cache` is keyed by `cranelift_codegen::ir::Value`,
+    /// whose IDs restart at 0 for every new Cranelift function (each
+    /// `FunctionBuilderContext::new()` resets the local Value namespace).
+    /// `csha_forward_saves` is keyed by layer name; it isn't subject to
+    /// Value collisions but a partially-compiled function (e.g. one where
+    /// `FusedCshaBackward` got dead-grad-eliminated before the
+    /// `nsl_csha_free_backward_activations_from` cleanup ran) can leave
+    /// the entry behind.
+    ///
+    /// Today the train-block forward+backward compile inside ONE Cranelift
+    /// function and the lowerer `.remove()`s entries on consumption, so the
+    /// common path is safe. This helper is defensive: it makes the system
+    /// correct under future scenarios where:
+    ///   - A second `grad` block in the same module compiles into a
+    ///     separate Cranelift function.
+    ///   - Forward and backward are split across distinct functions.
+    ///   - Dead-grad elimination drops a `FusedCshaBackward` or
+    ///     `CshaFusedBackwardExtract` op before it can `.remove()` its
+    ///     cache entry.
+    ///
+    /// Callers: end of `compile_train_block`, `compile_train_block_pipelined`,
+    /// and `compile_grad_block`. Public so the `csha_gap_c_multiresult_primitive`
+    /// integration test can directly assert the post-clear invariant; the
+    /// underlying fields are already `pub`.
+    pub fn clear_csha_per_function_caches(&mut self) {
+        self.csha_fused_bwd_cache.clear();
+        self.csha_forward_saves.clear();
+    }
+
     /// Dev Tools Phase 2: resolve the constituent `NodeId`s folded into the
     /// kernel rooted at `root`.  For non-fused kernels (or when no
     /// `FusionPlan` is recorded for profiling), returns `vec![root]`.
