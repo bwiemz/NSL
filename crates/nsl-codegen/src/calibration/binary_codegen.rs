@@ -2080,13 +2080,30 @@ pub fn emit_calibration_scaffolding_object(
     grad_arena_layout: Option<&crate::calibration::retention::GradArenaLayout>,
     out_path: &Path,
 ) -> Result<(), HarnessError> {
-    if needs_forward_pass && observe_plan.is_empty() {
+    // A forward pass needs a destination for what it computes. Two valid sinks
+    // exist (spec §4.3, §4.6):
+    //
+    //   - `observe_plan` non-empty   → AWQ-style: hooks read in-process from
+    //                                  `__nsl_calib_retention_arena` after
+    //                                  each forward call.
+    //   - `wggo_targets` non-empty   → WGGO-style: backward writes into
+    //     + `needs_backward`           `__nsl_calib_grad_arena`, and the
+    //                                  scaffolding's per-step block reduces
+    //                                  gradients into per-head BSS buffers.
+    //
+    // Reject only when both sinks are empty — that means the hook reports
+    // `needs_forward_pass()` but produced no destination, which would emit a
+    // forward call whose results vanish.
+    let has_backward_data_path = needs_backward && !wggo_targets.is_empty();
+    if needs_forward_pass && observe_plan.is_empty() && !has_backward_data_path {
         return Err(HarnessError::Infrastructure {
             reason: "calibration: forward pass emitted but no observations declared.\n\
  requested:  run calibration subprocess with forward pass\n\
- expected:   observe_plan is non-empty when a model_forward call is emitted\n\
- found:      observe_plan is empty but needs_forward_pass() returned true.\n\
-             Did a hook's requires() change without updating observe_plan()?"
+ expected:   observe_plan is non-empty, or backward hooks declared wggo_targets\n\
+ found:      observe_plan is empty AND no backward data path \
+             (needs_backward && wggo_targets non-empty).\n\
+             Did a hook's requires() change without updating observe_plan() \
+             or registering wggo_targets?"
                 .into(),
         });
     }
@@ -2115,25 +2132,43 @@ pub fn emit_calibration_scaffolding_object(
             reason: format!("define sidecar-json data: {e}"),
         })?;
 
+    // The forward-pass scaffolding always emits at least the mid-loop branch
+    // that handles a non-zero wrapper status (the wrapper checks each batch
+    // against the model's compile-time `__nsl_calib_input_shape` and returns
+    // 3 on mismatch — see emit_calib_model_forward_bridge). The scaffolding's
+    // first-batch preflight additionally rejects up front when the arena
+    // layout is available. When the arena is empty (WGGO-only flow with no
+    // AWQ projections), the preflight is skipped and the wrapper's per-batch
+    // check is the sole source of truth, but the mid-loop error payload must
+    // still exist so the scaffolding can surface a clear sidecar message.
     let batch_shape_mismatch_data = if needs_forward_pass {
-        let first_entry = arena_layout
-            .entries
-            .first()
-            .ok_or_else(|| HarnessError::Infrastructure {
-                reason: "calibration: forward pass emitted but arena layout is empty".into(),
-            })?;
-        let expected_bytes = first_entry.2 as u64;
-        let expected_elems = expected_bytes / 4;
-        Some(declare_cstr_rodata(
-            &mut module,
-            "__nsl_calibration_batch_shape_mismatch",
-            &format!(
-                "calibration: batch shape mismatch at subprocess model-forward call.\n\
+        let detail = match arena_layout.entries.first() {
+            Some(first_entry) => {
+                let expected_bytes = first_entry.2 as u64;
+                let expected_elems = expected_bytes / 4;
+                format!(
+                    "calibration: batch shape mismatch at subprocess model-forward call.\n\
  requested:  run calibration forward on a batch matching the emitted arena layout\n\
  expected:   flattened batch payload == {expected_elems} f32 elements ({expected_bytes} bytes)\n\
  found:      nsl_calibration_batch_at returned a batch payload whose size did not match the emitted arena layout.\n\
  Action:     regenerate calibration metadata from the same model/data pair, or fix the projection shape metadata passed into calibration."
-            ),
+                )
+            }
+            None => {
+                // WGGO-only flow: arena layout is empty (no AWQ projections),
+                // so the message references the model's input shape instead.
+                "calibration: batch shape mismatch at subprocess model-forward call.\n\
+ requested:  run calibration forward on a batch matching the model's compile-time input shape\n\
+ expected:   flattened batch payload element count == model's declared input element count\n\
+ found:      nsl_calib_model_forward / nsl_calib_model_backward rejected a batch whose flattened size did not match the model's input shape.\n\
+ Action:     regenerate calibration data to match the model's input dimensions."
+                    .to_string()
+            }
+        };
+        Some(declare_cstr_rodata(
+            &mut module,
+            "__nsl_calibration_batch_shape_mismatch",
+            &detail,
         )?)
     } else {
         None
@@ -2530,47 +2565,75 @@ pub fn emit_calibration_scaffolding_object(
 
             b.switch_to_block(batch_preflight);
             b.seal_block(batch_preflight);
-            let out_ptr_slot = b.create_sized_stack_slot(StackSlotData::new(
-                StackSlotKind::ExplicitSlot,
-                8,
-                0,
-            ));
-            let out_len_slot = b.create_sized_stack_slot(StackSlotData::new(
-                StackSlotKind::ExplicitSlot,
-                8,
-                0,
-            ));
-            let out_ptr_addr = b.ins().stack_addr(cl_types::I64, out_ptr_slot, 0);
-            let out_len_addr = b.ins().stack_addr(cl_types::I64, out_len_slot, 0);
-            let calib_batch_ref = module.declare_func_in_func(calib_batch_id, b.func);
-            b.ins().call(calib_batch_ref, &[lm_batches, zero_i64, out_ptr_addr, out_len_addr]);
+            if let Some(first_entry) = arena_layout.entries.first() {
+                // AWQ-style preflight: validate the first batch against the
+                // arena-derived element count up front so we fail before
+                // creating the model.
+                let out_ptr_slot = b.create_sized_stack_slot(StackSlotData::new(
+                    StackSlotKind::ExplicitSlot,
+                    8,
+                    0,
+                ));
+                let out_len_slot = b.create_sized_stack_slot(StackSlotData::new(
+                    StackSlotKind::ExplicitSlot,
+                    8,
+                    0,
+                ));
+                let out_ptr_addr = b.ins().stack_addr(cl_types::I64, out_ptr_slot, 0);
+                let out_len_addr = b.ins().stack_addr(cl_types::I64, out_len_slot, 0);
+                let calib_batch_ref = module.declare_func_in_func(calib_batch_id, b.func);
+                b.ins().call(calib_batch_ref, &[lm_batches, zero_i64, out_ptr_addr, out_len_addr]);
 
-            let batch_len = b.ins().load(cl_types::I64, MemFlags::new(), out_len_addr, 0);
+                let batch_len = b.ins().load(cl_types::I64, MemFlags::new(), out_len_addr, 0);
                 let actual_batch_elems = b.ins().ushr_imm(batch_len, 2);
-                let expected_batch_elems = b.ins().iconst(
-                cl_types::I64,
-                arena_layout
-                    .entries
-                    .first()
-                    .map(|(_, _, nbytes)| (*nbytes / 4) as i64)
-                    .unwrap_or(0),
-            );
-                let batch_ok = b.ins().icmp(IntCC::Equal, actual_batch_elems, expected_batch_elems);
-            b.ins().brif(batch_ok, model_create_entry, &[], batch_shape_err, &[]);
+                let expected_batch_elems =
+                    b.ins().iconst(cl_types::I64, (first_entry.2 / 4) as i64);
+                let batch_ok =
+                    b.ins().icmp(IntCC::Equal, actual_batch_elems, expected_batch_elems);
+                b.ins().brif(batch_ok, model_create_entry, &[], batch_shape_err, &[]);
 
-            b.switch_to_block(batch_shape_err);
-            b.seal_block(batch_shape_err);
-            let mismatch_ref = module.declare_data_in_func(
-                batch_shape_mismatch_data.expect("forward path defines batch-shape mismatch data"),
-                b.func,
-            );
-            let mismatch_ptr = b.ins().symbol_value(ptr_ty, mismatch_ref);
-            let write_ref = module.declare_func_in_func(write_file_id, b.func);
-            b.ins().call(write_ref, &[lm_sidecar_ptr, mismatch_ptr]);
-            let calib_free_ref = module.declare_func_in_func(_calib_free_id, b.func);
-            b.ins().call(calib_free_ref, &[lm_batches]);
-            let three = b.ins().iconst(cl_types::I32, 3);
-            b.ins().return_(&[three]);
+                b.switch_to_block(batch_shape_err);
+                b.seal_block(batch_shape_err);
+                let mismatch_ref = module.declare_data_in_func(
+                    batch_shape_mismatch_data
+                        .expect("forward path defines batch-shape mismatch data"),
+                    b.func,
+                );
+                let mismatch_ptr = b.ins().symbol_value(ptr_ty, mismatch_ref);
+                let write_ref = module.declare_func_in_func(write_file_id, b.func);
+                b.ins().call(write_ref, &[lm_sidecar_ptr, mismatch_ptr]);
+                let calib_free_ref = module.declare_func_in_func(_calib_free_id, b.func);
+                b.ins().call(calib_free_ref, &[lm_batches]);
+                let three = b.ins().iconst(cl_types::I32, 3);
+                b.ins().return_(&[three]);
+            } else {
+                // WGGO-only flow: no AWQ arena entries, so there is no
+                // arena-derived expected batch shape to check against. Skip
+                // the preflight and rely on the wrapper's per-batch shape
+                // check (returns status 3 on mismatch, caught by the
+                // mid-loop branch below).
+                b.ins().jump(model_create_entry, &[]);
+
+                // `batch_shape_err` is unreachable on this path, but Cranelift
+                // requires every created block to be terminated. Emit a
+                // trivial body that reuses the mid-loop mismatch payload so
+                // any future caller can wire the preflight back in without
+                // re-introducing a relocation hole.
+                b.switch_to_block(batch_shape_err);
+                b.seal_block(batch_shape_err);
+                let mismatch_ref = module.declare_data_in_func(
+                    batch_shape_mismatch_data
+                        .expect("forward path defines batch-shape mismatch data"),
+                    b.func,
+                );
+                let mismatch_ptr = b.ins().symbol_value(ptr_ty, mismatch_ref);
+                let write_ref = module.declare_func_in_func(write_file_id, b.func);
+                b.ins().call(write_ref, &[lm_sidecar_ptr, mismatch_ptr]);
+                let calib_free_ref = module.declare_func_in_func(_calib_free_id, b.func);
+                b.ins().call(calib_free_ref, &[lm_batches]);
+                let three = b.ins().iconst(cl_types::I32, 3);
+                b.ins().return_(&[three]);
+            }
 
             b.switch_to_block(model_create_entry);
             b.seal_block(model_create_entry);
@@ -3963,6 +4026,87 @@ mod tests {
         assert!(err_str.contains("requested:"));
         assert!(err_str.contains("expected:"));
         assert!(err_str.contains("found:"));
+    }
+
+    /// Issue #144 (hop 7): WGGO-only flow has an empty `observe_plan`
+    /// (it reads gradients via `__nsl_calib_grad_arena` / BSS, not via the
+    /// AWQ in-process retention arena) yet still needs the forward pass —
+    /// `requires()` returns `BackwardGradients(_)` whose `needs_forward_pass()`
+    /// is true (PR #140). The validator must permit this case when a backward
+    /// data path exists (`needs_backward && wggo_targets non-empty`) — that
+    /// is the WGGO data sink.
+    #[test]
+    fn empty_observe_plan_with_backward_wggo_path_is_accepted() {
+        use crate::calibration::discovery::WggoGradTarget;
+        use crate::calibration::observation::ProjectionRef;
+        use crate::calibration::retention::build_grad_arena_layout;
+
+        let target = WggoGradTarget {
+            layer_key: "model.layers.0".into(),
+            class_name: "Attention".into(),
+            head_dim: 64,
+            w_q: ProjectionRef("model.layers.0.w_q".into()),
+            w_k: ProjectionRef("model.layers.0.w_k".into()),
+            w_v: ProjectionRef("model.layers.0.w_v".into()),
+            w_o: ProjectionRef("model.layers.0.w_o".into()),
+            w_q_shape: [256, 256],
+            w_k_shape: [256, 256],
+            w_v_shape: [256, 256],
+            w_o_shape: [256, 256],
+            w_q_index: 0,
+            w_k_index: 1,
+            w_v_index: 2,
+            w_o_index: 3,
+        };
+        let wggo_targets = vec![target.clone()];
+        let grad_arena_layout = build_grad_arena_layout(&wggo_targets);
+
+        // Empty arena_layout (no AWQ projections) — the WGGO-only flow.
+        let arena_layout = crate::calibration::ArenaLayout { entries: vec![] };
+
+        // WGGO's finalize_plan emits one entry per layer (per-layer running
+        // buffer for f64 accumulators, spec §4.6).
+        let finalize_plan = vec![FinalizePlanEntry {
+            projection: ProjectionRef("model.layers.0.__wggo_grad".into()),
+            running_symbol: "__nsl_wggo_grad.model_layers_0".into(),
+            channels: 4,
+            bytes_per_element: 8,
+        }];
+        let per_step_backward_symbols =
+            vec!["__nsl_wggo_grad.model_layers_0".to_string()];
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let out_path = tmp.path().join("scaffolding_wggo_only.o");
+
+        emit_calibration_scaffolding_object(
+            &[], // empty observe_plan — WGGO reads grad arena, not retention arena
+            &finalize_plan,
+            &arena_layout, // empty — no AWQ projections in WGGO-only flow
+            b"{}",
+            true, // needs_forward_pass: BackwardGradients implies forward
+            true, // needs_backward: yes
+            &per_step_backward_symbols,
+            &wggo_targets,
+            Some(&grad_arena_layout),
+            &out_path,
+        )
+        .expect(
+            "WGGO-only flow with empty observe_plan must succeed when \
+             wggo_targets is non-empty (issue #144 hop 7 exemption)",
+        );
+
+        // The object must still import the backward wrapper symbol.
+        let obj_bytes = std::fs::read(&out_path).expect("object readable");
+        let obj = object::File::parse(&*obj_bytes).expect("object::File::parse");
+        let imports: Vec<String> = obj
+            .symbols()
+            .filter(|s| s.is_undefined())
+            .filter_map(|s| s.name().ok().map(str::to_string))
+            .collect();
+        assert!(
+            imports.iter().any(|s| s == "nsl_calib_model_backward"),
+            "WGGO-only scaffolding must import nsl_calib_model_backward; imports: {imports:?}"
+        );
     }
 }
 
