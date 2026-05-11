@@ -45,6 +45,7 @@ pub mod backend_amdgpu;
 pub mod backend_metal;
 pub mod backend_ptx;
 pub mod backend_wgsl;
+pub mod bitnet;
 pub mod cep;
 pub mod cep_importance;
 pub mod cep_oracle;

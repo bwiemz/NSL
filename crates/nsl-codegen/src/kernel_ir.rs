@@ -58,6 +58,14 @@ pub enum KirType {
     Bool,
     Ptr(Box<KirType>, AddressSpace),
     Vec(Box<KirType>, u32),
+    // BitNet M35.1: packed ternary representation (4 trits per byte, 2 bits per trit).
+    // At-rest format in HBM; unpacked into `TernaryUnpacked` for compute.
+    // Layout per docs/superpowers/specs/2026-05-11-m35-1-bitnet-ternary-design.md §2.1
+    // (high-bits-first ordering verified against bitnet.cpp).
+    Tq2Packed,
+    // BitNet M35.1: one trit per i8 (or register slot). Compute-time format.
+    // Conversions to/from Tq2Packed are explicit ops via `bitnet::pack`/`unpack`.
+    TernaryUnpacked,
 }
 
 impl KirType {
@@ -70,6 +78,8 @@ impl KirType {
             KirType::F16 | KirType::Bf16 => 2,
             KirType::Ptr(_, _) => 8,
             KirType::Vec(inner, n) => inner.size_bytes() * *n as usize,
+            KirType::Tq2Packed => 1,
+            KirType::TernaryUnpacked => 1,
         }
     }
 
@@ -82,6 +92,8 @@ impl KirType {
             KirType::F64 => "%fd",
             KirType::F16 | KirType::Bf16 => "%h",
             KirType::Vec(_, _) => "%v",
+            KirType::Tq2Packed => "%r",
+            KirType::TernaryUnpacked => "%r",
         }
     }
 
@@ -99,6 +111,8 @@ impl KirType {
             KirType::Bool => "pred",
             KirType::Ptr(_, _) => "u64",
             KirType::Vec(_, _) => "b32",
+            KirType::Tq2Packed => "b8",
+            KirType::TernaryUnpacked => "s8",
         }
     }
 }
