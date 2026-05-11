@@ -5,7 +5,9 @@
 //! at unit-test scale (not only via end-to-end logit match).
 
 use nsl_codegen::bitnet::config::BitNetKernelConfig;
-use nsl_codegen::bitnet::phases::{absmean_quant, packed_load, quantized_ternary_gemm, ternary_gemm};
+use nsl_codegen::bitnet::phases::{
+    absmean_quant, finalize, packed_load, quantized_ternary_gemm, ternary_gemm,
+};
 use nsl_codegen::kernel_ir::KirType;
 
 fn default_config() -> BitNetKernelConfig {
@@ -18,6 +20,8 @@ fn default_config() -> BitNetKernelConfig {
         hidden_dim: 1024,
         out_dim: 1024,
         fused_rmsnorm: false,
+        fused_bias_add: false,
+        fused_residual_add: false,
     }
 }
 
@@ -51,4 +55,22 @@ fn quantized_ternary_gemm_basic_snapshot() {
     let mut ptx = String::new();
     quantized_ternary_gemm::emit(&mut ptx, &config);
     insta::assert_snapshot!("bitnet_ptx__quantized_ternary_gemm_basic", ptx);
+}
+
+#[test]
+fn finalize_basic_snapshot() {
+    let config = default_config();
+    let mut ptx = String::new();
+    finalize::emit(&mut ptx, &config);
+    insta::assert_snapshot!("bitnet_ptx__finalize_basic", ptx);
+}
+
+#[test]
+fn finalize_with_bias_and_residual_snapshot() {
+    let mut config = default_config();
+    config.fused_bias_add = true;
+    config.fused_residual_add = true;
+    let mut ptx = String::new();
+    finalize::emit(&mut ptx, &config);
+    insta::assert_snapshot!("bitnet_ptx__finalize_bias_residual", ptx);
 }

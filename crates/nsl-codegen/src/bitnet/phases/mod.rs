@@ -24,3 +24,7 @@ pub mod ternary_gemm;
 // path that external callers (CSHA-fused mode, future M35.x) should compose
 // against per IR-001.
 pub mod quantized_ternary_gemm;
+
+// Public: finalize epilogue (FP32 -> F16/BF16 cast, optional bias/residual
+// add, HBM write). Composed by `synthesize_kernel` after the fused GEMM.
+pub mod finalize;

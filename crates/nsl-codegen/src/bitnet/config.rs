@@ -23,14 +23,22 @@ pub struct BitNetKernelConfig {
     /// Enable RMSNorm fold in the prologue (CSHA-style fusion).
     /// Phase 1 default: false (deferred per spec §4.4).
     pub fused_rmsnorm: bool,
+    /// Enable bias add in the finalize epilogue.
+    /// Phase 1 default: false.
+    pub fused_bias_add: bool,
+    /// Enable residual add in the finalize epilogue.
+    /// Phase 1 default: false.
+    pub fused_residual_add: bool,
 }
 
 impl BitNetKernelConfig {
     /// Returns the BitNet kernel symbol name encoding all config knobs.
     /// Used for PTX kernel naming + dispatch table lookup.
+    ///
+    /// Suffix order is deterministic: `_rmsfold` then `_bias` then `_res`.
     pub fn kernel_name(&self) -> String {
         format!(
-            "nsl_bitnet_b158_gemm_m{}_n{}_k{}_{}{}",
+            "nsl_bitnet_b158_gemm_m{}_n{}_k{}_{}{}{}{}",
             self.block_m,
             self.block_n,
             self.block_k,
@@ -43,6 +51,8 @@ impl BitNetKernelConfig {
                 ),
             },
             if self.fused_rmsnorm { "_rmsfold" } else { "" },
+            if self.fused_bias_add { "_bias" } else { "" },
+            if self.fused_residual_add { "_res" } else { "" },
         )
     }
 }

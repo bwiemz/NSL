@@ -20,6 +20,8 @@ fn packed_load_emits_bfe_for_unpack() {
         hidden_dim: 1024,
         out_dim: 1024,
         fused_rmsnorm: false,
+        fused_bias_add: false,
+        fused_residual_add: false,
     };
     let mut ptx = String::new();
     packed_load::emit(&mut ptx, &config);
