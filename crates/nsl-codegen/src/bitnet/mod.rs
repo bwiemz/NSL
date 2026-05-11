@@ -21,6 +21,7 @@
 //! See `phases/README.md` for the Phase 2 (M35.2) planned additions.
 
 pub mod config;
+pub mod pack;
 pub mod phases;
 
 pub use config::BitNetKernelConfig;
