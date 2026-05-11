@@ -3,4 +3,4 @@ source: crates/nsl-codegen/tests/csha_pipeline_cost_model_snapshot.rs
 assertion_line: 46
 expression: bytes.to_string()
 ---
-2097152
+3145728

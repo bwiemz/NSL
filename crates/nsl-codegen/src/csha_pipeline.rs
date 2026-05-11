@@ -132,28 +132,68 @@ pub fn smem_budget_bytes(gpu: &GpuSpec) -> u64 {
 /// SMEM bytes required by a Level-2 pipelined attention kernel at the
 /// given shape / tile config.
 ///
-/// Layout (paper §2.2):
-///   * Q tile (ping):  `block_q  * head_dim * 2`
-///   * K tile (ping):  `block_kv * head_dim * 2`
-///   * V tile (ping):  `block_kv * head_dim * 2`
-///   * O accumulator:  `block_q  * head_dim * 4` (fp32)
-///   * Stats:          `block_q  * 2 * 4`        (logsumexp + max)
-///   * Producer side buffers a single tile of each projection weight
-///     (we charge the worst case: `head_dim * d_model * 2`).
+/// Layout (Tier B.1 design spec §3.4 + V3 cost-model audit findings,
+/// `docs/superpowers/specs/2026-05-11-tier-b1-v3-cost-model-audit.md`):
+///   * Q tile          : `block_q  * head_dim * dtype`
+///   * K/V ping-pong   : `2 * (block_kv * head_dim * dtype)` per stream
+///                       (4 slabs total — Tier B.1 depth=2 over K and V)
+///   * O accumulator   : 0  (register-resident; was a phantom over-count)
+///   * Stats           : `block_q * 2 * 4`        (logsumexp + max, f32)
+///   * Chunk staging   : two W chunk slots (Wk + Wv) + two x chunk slots
+///                       (x_q + x_kv) — sized at the **minimum** chunk
+///                       (16) so the planner admits any config that any
+///                       valid chunk selection would accept.
+///
+/// **V3 audit corrections (2026-05-11) over the original formula:**
+///
+/// | Term            | Pre-correction         | Post-correction              | Why                                                                                  |
+/// |-----------------|------------------------|------------------------------|--------------------------------------------------------------------------------------|
+/// | `o_acc`         | `block_q*head_dim*4`   | **0**                        | Phantom term — Tier A already keeps O_acc in registers (V3 case alpha, retroactive). |
+/// | K tile          | `block_kv*head_dim*dt` | **2 × that**                 | Tier B.1 ping-pongs K (depth=2).                                                     |
+/// | V tile          | `block_kv*head_dim*dt` | **2 × that**                 | Tier B.1 ping-pongs V (depth=2).                                                     |
+/// | `w_tile` (one)  | `head_dim*min(dm,256)*2` | **chunk staging w/ chunk=16** | Single weight tile replaced by Wk/Wv + x_q/x_kv staging; min chunk=16 = most permissive admission. |
+///
+/// The retained `o_acc: u64 = 0` location is intentional per spec §7.2's
+/// "set to zero, not delete" discipline so a future Tier B.2 reintroducing
+/// SMEM O_acc has the location preserved.
+///
+/// Canonical example (small_shape, bq=bkv=64, hd=64, dtype=2, dm=512):
+///   q_tile        = 64*64*2  = 8192
+///   kv_tiles      = 2*(64*64*2 + 64*64*2) = 32768
+///   o_acc         = 0  (was 16384 phantom)
+///   stats         = 64*2*4   = 512
+///   chunk_staging = 2*(16*64*2) + (64+64)*16*2 = 4096 + 4096 = 8192
+///   Total         = 8192 + 32768 + 0 + 512 + 8192 = **49664**
+///
+/// (Pre-correction baseline was 74240; delta = -24576.)
 pub fn pipeline_smem_bytes(shape: LayerShape, tiles: TileConfig) -> u64 {
     let dtype = shape.dtype_bytes;
     let block_q = tiles.block_q as u64;
     let block_kv = tiles.block_kv as u64;
     let head_dim = tiles.head_dim as u64;
-    let d_model = shape.d_model;
+    let _d_model = shape.d_model; // retained: B1.2 chunk selector reads dm
 
     let q_tile = block_q * head_dim * dtype;
     let k_tile = block_kv * head_dim * dtype;
     let v_tile = block_kv * head_dim * dtype;
-    let o_acc = block_q * head_dim * 4;
+    // Tier B.1 ping-pong (depth=2) over both K and V — 4 slabs total.
+    let kv_tiles = 2 * (k_tile + v_tile);
+    // V3 case alpha: O_acc is register-resident (pv_accum.rs:23-26,
+    // finalize.rs:62, smem_layout::total_bytes line 307-312 has no O
+    // region). Zeroed, not deleted, so B.2 has the location preserved.
+    let o_acc: u64 = 0;
     let stats = block_q * 2 * 4;
-    let w_tile = head_dim * d_model.min(256) * dtype;
-    q_tile + k_tile + v_tile + o_acc + stats + w_tile
+    // Chunk staging budget per spec §3.4: at any instant the kernel holds
+    // two W chunk slots (Wk_chunk + Wv_chunk) plus two x chunk slots
+    // (x_q_chunk + x_kv_chunk). The planner uses the MINIMUM chunk (16)
+    // so it admits configs that any valid chunk selection would accept;
+    // the actual chunk is selected at emission time by B1.2's
+    // `chunk_config::select`, which descends {128, 64, 32, 16}.
+    const MIN_CHUNK: u64 = 16;
+    let chunk_staging =
+        2 * (MIN_CHUNK * head_dim * dtype)       // Wk + Wv chunk slots
+        + (block_q + block_kv) * MIN_CHUNK * dtype; // x_q + x_kv chunk slots
+    q_tile + kv_tiles + o_acc + stats + chunk_staging
 }
 
 /// SMEM for Level-3 block fusion — pipeline cost plus the FFN staging
@@ -247,12 +287,20 @@ pub fn fused_hbm_bytes(shape: LayerShape, level: FusionLevel) -> u64 {
             (baseline_hbm_bytes(shape) as f64 * 0.58) as u64
         }
         FusionLevel::Pipeline => {
-            // Paper §2.2: only x read + output write remain.
-            2 * bsd // read x + write out
+            // V3 audit (spec §7.1) correction: L2 reads x + writes attn_out,
+            // but the downstream Wo kernel must re-read attn_out from HBM
+            // (L2 does NOT fuse the output projection — that's L3 only).
+            // The original `2 * bsd` over-counted L2's savings by omitting
+            // the Wo re-read.
+            let x_in = bsd;
+            let attn_out_write = bsd;
+            let downstream_wo_in = bsd; // downstream Wo kernel re-reads attn_out
+            x_in + attn_out_write + downstream_wo_in // = 3 * bsd
         }
         FusionLevel::Block => {
-            // Paper §2.3: same as pipeline for a single block (block
-            // fusion eliminates intra-block HBM, not inter-block).
+            // L3 fuses Wo into the persistent kernel, eliminating the
+            // attn_out → Wo HBM round-trip. So 2*bsd is correct here: read
+            // x + write final output. (No Wo re-read — Wo is in-kernel.)
             2 * bsd
         }
     }

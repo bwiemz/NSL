@@ -1166,18 +1166,28 @@ mod override_tests {
             "no override diagnostics when no WggoOverrides supplied"
         );
 
-        // Snapshot: H100 in Auto/full mode with d_model=512/hd=64 picks Pipeline
-        // (Level 2).  Block (Level 3) needs 232 KB but the SMEM cap is 228 KB,
-        // so the planner downgrades to Pipeline automatically.
+        // Snapshot: H100 in Auto/full mode with d_model=512/hd=64 picks Block
+        // (Level 3) after the B1.1 cost-model correction.
+        //
+        // Pre-B1.1 baseline:    Pipeline (Block was 232 KB, over the 228 KB cap)
+        // Post-B1.1 baseline:   Block    (Block now fits at ~209 KB)
+        //
+        // B1.1 corrected three load-bearing bugs in `pipeline_smem_bytes` —
+        // phantom O_acc, single-buffered K/V, and oversized w_tile — which
+        // collectively shrink the Pipeline-level SMEM cost. `block_smem_bytes`
+        // computes off that reduced base, so the post-correction Level-3
+        // estimate is ~209 KB, inside the 228 KB cap.
+        //
+        // See docs/superpowers/specs/2026-05-11-tier-b1-v3-cost-model-audit.md.
         //
         // This value is pinned as the internal-planner baseline; if the planner
         // logic changes and produces a different level in the future, this test
         // will catch the regression — by design.
         assert_eq!(
             plan.per_layer[0].level,
-            PipelineLevel::Pipeline,
-            "internal planner baseline (H100, Auto, d512/hd64): expected Level2/Pipeline \
-             (Block needs 232 KB, cap is 228 KB)"
+            PipelineLevel::Block,
+            "internal planner baseline (H100, Auto, d512/hd64) after B1.1: \
+             expected Level3/Block (~209 KB fits in 228 KB cap)"
         );
     }
 
