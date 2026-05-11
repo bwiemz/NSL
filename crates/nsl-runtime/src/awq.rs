@@ -1012,9 +1012,11 @@ pub extern "C" fn nsl_calib_write_sidecar(
     top.insert("hook_set_sha256".into(), serde_json::json!(""));
     top.insert("cache_key_digest".into(), serde_json::json!(""));
     top.insert("num_samples_used".into(), serde_json::json!(0));
-    if !hooks_obj.is_empty() {
-        top.insert("hooks".into(), serde_json::Value::Object(hooks_obj));
-    }
+    // #147 hop 12: always emit `hooks`, possibly as an empty object. The
+    // host-side `Sidecar` struct treats `hooks` as a required (no `default`)
+    // field, so omitting it for the WGGO-only flow (where `hooks_obj` is
+    // empty) trips the JSON deserializer with "missing field `hooks`".
+    top.insert("hooks".into(), serde_json::Value::Object(hooks_obj));
     if !wggo_by_layer.is_empty() {
         top.insert(
             "wggo_head_gradients".into(),

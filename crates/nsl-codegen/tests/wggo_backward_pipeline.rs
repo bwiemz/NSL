@@ -174,22 +174,23 @@ fn wggo_fixture_compile_bundle() -> std::sync::Arc<nsl_codegen::calibration::Cal
 /// deviation well below 10⁻¹².  The 10⁻⁴ guard is intentionally generous to
 /// absorb any f32/f64 promotion boundary at the BSS read-back step.
 #[test]
-#[ignore = "Hop 7 (WGGO validator + arena-empty handling) is fixed by #144 — \
-            the scaffolding now builds and the calibration binary runs. \
+#[ignore = "Hops 7-12 are fixed (PRs #144 + #147) — the calibration \
+            subprocess now runs end-to-end and produces a valid sidecar. \
             \
-            Newly surfaced blocker (hop 8): the calibration subprocess crashes \
-            during the model's forward pass with a null-pointer dereference in \
-            nsl_tensor_matmul (one of the matmul operands is null). The same \
-            crash signature is reproducible in the AWQ merge-gate \
-            (awq_full_pipeline::end_to_end_real_subprocess_matches_analytical_reference), \
-            confirming this is a pre-existing runtime bug in the calibration \
-            forward-pass FFI path (weight pointer indexing or input tensor \
-            descriptor wiring), not WGGO-specific. \
+            Newly surfaced blocker (hop 13, numerical): the WGGO per-head \
+            running buffer reads back as all-zeros after calibration, even \
+            though backward writes gradients into __nsl_calib_grad_arena. \
+            Expected per-head scores are ~5-7×10^7 (see reference panic \
+            output); observed are 0.0 across all four heads. Root cause is \
+            in the gradient-arena → BSS accumulator IR pipeline \
+            (`emit_per_head_dot_abs_accum` invocation chain inside the \
+            scaffolding's per-step block), not in the validator or wrapper \
+            ABI. Tractable but separate from #147's six-hop runtime fix. \
             \
-            Track separately as a follow-up to #144 — out of scope for the hop \
-            7 validator fix. When the runtime bug is resolved, drop the \
-            #[ignore] and the merge-gate test should pass against the \
-            analytical reference within 1×10⁻⁴ tolerance."]
+            Track as a follow-up: investigate `emit_per_head_dot_abs_accum` \
+            in binary_codegen.rs vs the grad_arena_base / running_base \
+            relocations, and verify the per-batch IR actually fires \
+            (instrument the running buffer reads between batches)."]
 fn end_to_end_backward_subprocess_matches_analytical_reference() {
     let data_path = fixture("wggo_calib_data.safetensors");
     let weights_path = fixture("wggo_calib_weights.safetensors");
@@ -280,28 +281,38 @@ fn end_to_end_backward_subprocess_matches_analytical_reference() {
 
     // ── Step 4: compare per-head scores within tolerance ─────────────────────
 
-    // The fixture has one layer key "AttentionMLP" — the model class name used
-    // as the layer_key in the @wggo_target decorator (see fixture: @wggo_target
-    // on AttentionMLP.forward with no explicit layer_key → defaults to class name).
-    let layer_key = "AttentionMLP";
+    // Layer keys: pre-scan disambiguates multiple instances of the same class
+    // by using the LET-binding variable name, not the class name (see
+    // `discovery.rs::pre_scan_wggo_targets_from_ast` and its unit tests at
+    // `targets[0].layer_key == "small"` / `"large"` for two same-class
+    // instances).  The merge-gate fixture binds `let m = AttentionMLP(...)`,
+    // so the sidecar layer key is "m".  The analytical reference (built in
+    // `wggo_reference.rs`) deliberately keys by class name "AttentionMLP" —
+    // a stable identifier callers actually care about — and the test bridges
+    // the two: read sidecar by var name, look up reference by class name.
+    let sidecar_layer_key = "m";
+    let reference_layer_key = "AttentionMLP";
 
     let ref_scores = reference
-        .get(layer_key)
-        .unwrap_or_else(|| panic!("reference missing layer '{layer_key}'"));
+        .get(reference_layer_key)
+        .unwrap_or_else(|| panic!("reference missing layer '{reference_layer_key}'"));
 
-    let actual_layer = actual_grads.by_layer.get(layer_key).unwrap_or_else(|| {
-        panic!(
-            "sidecar.wggo_head_gradients.by_layer missing layer '{layer_key}'; \
-             available layers: {:?}",
-            actual_grads.by_layer.keys().collect::<Vec<_>>()
-        )
-    });
+    let actual_layer = actual_grads
+        .by_layer
+        .get(sidecar_layer_key)
+        .unwrap_or_else(|| {
+            panic!(
+                "sidecar.wggo_head_gradients.by_layer missing layer '{sidecar_layer_key}'; \
+                 available layers: {:?}",
+                actual_grads.by_layer.keys().collect::<Vec<_>>()
+            )
+        });
 
     assert_close(
         &actual_layer.per_head_score,
         ref_scores,
         1e-4,
-        layer_key,
+        sidecar_layer_key,
     );
 
     // Sanity: exactly 4 heads (dim=32, head_dim=8).
