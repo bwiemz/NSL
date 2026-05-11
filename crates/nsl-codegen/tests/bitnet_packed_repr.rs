@@ -77,3 +77,26 @@ fn pack_unpack_roundtrip_all_valid_inputs() {
         }
     }
 }
+
+#[test]
+fn pack_trit_slice_roundtrip_multi_byte() {
+    use nsl_codegen::bitnet::pack::{pack_trit_slice, unpack_byte_slice};
+    // 12 trits = 3 bytes, covers chunk boundaries.
+    let input: Vec<i8> = vec![-1, 0, 1, 1, -1, -1, 0, 0, 1, -1, 1, 0];
+    let packed = pack_trit_slice(&input);
+    assert_eq!(packed.len(), 3, "12 trits should pack to 3 bytes");
+    let unpacked = unpack_byte_slice(&packed);
+    assert_eq!(
+        unpacked, input,
+        "pack_trit_slice + unpack_byte_slice round-trip failed"
+    );
+}
+
+#[test]
+#[should_panic(expected = "trit count must be multiple of 4")]
+fn pack_trit_slice_non_multiple_panics() {
+    use nsl_codegen::bitnet::pack::pack_trit_slice;
+    // 5 trits is not a multiple of 4 — must panic with the spec'd assertion.
+    let input: Vec<i8> = vec![-1, 0, 1, 1, -1];
+    let _ = pack_trit_slice(&input);
+}
