@@ -5,7 +5,7 @@
 //! at unit-test scale (not only via end-to-end logit match).
 
 use nsl_codegen::bitnet::config::BitNetKernelConfig;
-use nsl_codegen::bitnet::phases::{absmean_quant, packed_load};
+use nsl_codegen::bitnet::phases::{absmean_quant, packed_load, quantized_ternary_gemm, ternary_gemm};
 use nsl_codegen::kernel_ir::KirType;
 
 fn default_config() -> BitNetKernelConfig {
@@ -35,4 +35,20 @@ fn absmean_quant_basic_snapshot() {
     let mut ptx = String::new();
     absmean_quant::emit(&mut ptx, &config);
     insta::assert_snapshot!("bitnet_ptx__absmean_quant_basic", ptx);
+}
+
+#[test]
+fn ternary_gemm_basic_snapshot() {
+    let config = default_config();
+    let mut ptx = String::new();
+    ternary_gemm::emit(&mut ptx, &config);
+    insta::assert_snapshot!("bitnet_ptx__ternary_gemm_basic", ptx);
+}
+
+#[test]
+fn quantized_ternary_gemm_basic_snapshot() {
+    let config = default_config();
+    let mut ptx = String::new();
+    quantized_ternary_gemm::emit(&mut ptx, &config);
+    insta::assert_snapshot!("bitnet_ptx__quantized_ternary_gemm_basic", ptx);
 }

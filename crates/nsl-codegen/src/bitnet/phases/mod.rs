@@ -14,3 +14,13 @@ pub mod packed_load;
 // This mirrors the visibility/discipline pattern already used by
 // `packed_load` above.
 pub mod absmean_quant;
+
+// Internal: pub only for test introspection (same rationale as absmean_quant).
+// IR-001 is documentation-enforced for this emitter; external callers should
+// use quantized_ternary_gemm (the fused public path).
+pub mod ternary_gemm;
+
+// Public: the fused absmax + ternary GEMM emitter. The only ternary-GEMM
+// path that external callers (CSHA-fused mode, future M35.x) should compose
+// against per IR-001.
+pub mod quantized_ternary_gemm;
