@@ -34,10 +34,13 @@ impl BitNetKernelConfig {
             self.block_m,
             self.block_n,
             self.block_k,
-            match self.activation_dtype {
+            match &self.activation_dtype {
                 KirType::F16 => "f16",
                 KirType::Bf16 => "bf16",
-                _ => "unknown",
+                other => panic!(
+                    "BitNetKernelConfig: activation_dtype must be F16 or Bf16, got {:?}",
+                    other
+                ),
             },
             if self.fused_rmsnorm { "_rmsfold" } else { "" },
         )

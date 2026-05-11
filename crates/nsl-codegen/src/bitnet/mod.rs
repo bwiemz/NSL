@@ -34,11 +34,9 @@ pub use config::BitNetKernelConfig;
 ///
 /// Phase 1: returns a stub PTX module. Real emitter wiring lands in Task 7.
 pub fn synthesize_kernel(config: &BitNetKernelConfig) -> Vec<u8> {
-    let mut ptx = String::new();
-    ptx.push_str(&format!(
-        "// BitNet kernel stub for config: {}\n",
+    todo!(
+        "BitNet kernel synthesis lands in M35.1 Task 7 (orchestrator wiring). \
+         Requested kernel: {}",
         config.kernel_name()
-    ));
-    // Phase 1 commits 4-7 populate the body. This stub is the Task 1 deliverable.
-    ptx.into_bytes()
+    )
 }
