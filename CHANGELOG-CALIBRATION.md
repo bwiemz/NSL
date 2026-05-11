@@ -15,8 +15,7 @@ CI enforces the pairing (`.github/workflows/calibration-snapshot-changelog.yml`)
 
 ---
 
-## 2026-05-06 — PR #TBD — Initial AWQ sidecar baseline
-<!-- PR #TBD is intentional for the snapshot-introducing PR; amended to the real PR number after opening. -->
+## 2026-05-06 — PR #145 — Initial AWQ sidecar baseline
 
 **Snapshot files:** `crates/nsl-codegen/tests/snapshots/awq_full_pipeline__awq_sidecar_baseline.snap`
 
