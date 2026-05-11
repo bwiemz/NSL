@@ -18,7 +18,7 @@ bfe.u32 %r_trit0, %r_packed_word, 6, 2;
 bfe.u32 %r_trit1, %r_packed_word, 4, 2;
 bfe.u32 %r_trit2, %r_packed_word, 2, 2;
 bfe.u32 %r_trit3, %r_packed_word, 0, 2;
-// Decode: trit_value = bits - 1 (00→-1, 01→0, 10→+1).
+// Decode: trit_value = bits - 1 (00 -> -1, 01 -> 0, 10 -> +1).
 sub.s32 %r_t0_val, %r_trit0, 1;
 sub.s32 %r_t1_val, %r_trit1, 1;
 sub.s32 %r_t2_val, %r_trit2, 1;

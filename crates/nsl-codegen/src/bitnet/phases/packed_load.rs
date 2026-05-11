@@ -56,7 +56,7 @@ pub fn emit(ptx: &mut String, config: &BitNetKernelConfig) {
     // Decode 2-bit → trit value: 00 → -1, 01 → 0, 10 → +1.
     // Subtract 1 from the 2-bit value (00 → -1, 01 → 0, 10 → 1).
     // 0b11 is rejected upstream by the loader (try_unpack_byte).
-    ptx.push_str("// Decode: trit_value = bits - 1 (00→-1, 01→0, 10→+1).\n");
+    ptx.push_str("// Decode: trit_value = bits - 1 (00 -> -1, 01 -> 0, 10 -> +1).\n");
     ptx.push_str("sub.s32 %r_t0_val, %r_trit0, 1;\n");
     ptx.push_str("sub.s32 %r_t1_val, %r_trit1, 1;\n");
     ptx.push_str("sub.s32 %r_t2_val, %r_trit2, 1;\n");
