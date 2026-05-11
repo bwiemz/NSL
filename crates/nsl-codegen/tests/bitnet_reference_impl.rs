@@ -44,7 +44,11 @@
 /// Spec §4.2 CORRECTED: BitNet b1.58 uses per-row absmax (NOT absmean)
 /// for activations.
 pub fn absmax_scale_row(row: &[f32]) -> f32 {
-    row.iter().map(|x| x.abs()).fold(0.0_f32, f32::max)
+    debug_assert!(
+        row.iter().all(|x| x.is_finite()),
+        "absmax_scale_row: row contains NaN/Inf"
+    );
+    row.iter().map(|x| x.abs()).fold(0.0_f32, |acc, v| acc.max(v))
 }
 
 /// Quantize one row to int8 using its absmax scale.
@@ -147,10 +151,15 @@ pub fn lcg_next(state: &mut u64) -> u64 {
 
 /// Generate the f10_large_hidden fixture inputs deterministically.
 ///
-/// Returns 128 unit-variance-ish normal-distributed activations (one row)
-/// and a 128×4 ternary weight matrix. Box-Muller-lite for the normals; the
-/// LCG seed `42` makes this byte-identical across platforms and Rust
-/// versions.
+/// Uses a fixed LCG (seed=42) for cross-platform reproducibility, combined
+/// with **Box-Muller basic form**: each output normal consumes two LCG draws,
+/// and only the cosine branch is used (the sine companion `z1` is discarded).
+/// This is mathematically correct but consumes 2× the LCG output of an
+/// optimal implementation that emits both branches per pair. Documented
+/// here so cross-implementation verification expects the same LCG-consumption
+/// pattern.
+///
+/// Returns (activations: 128 floats, weights: 128×4 ternary matrix).
 pub fn make_f10_inputs() -> (Vec<f32>, Vec<Vec<i8>>) {
     let mut state: u64 = 42;
     let acts: Vec<f32> = (0..128)
