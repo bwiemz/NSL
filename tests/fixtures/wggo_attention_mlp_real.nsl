@@ -3,17 +3,18 @@
 # the forward pass. Small dimensions (dim=32, num_heads=4, head_dim=8) for fast
 # tests. Calibration data: [8, 4, 32] f32 in wggo_calib_data.safetensors.
 #
-# The merge-gate test (`wggo_backward_pipeline.rs`) bypasses
-# `compile_and_calibrate` and calls `real_subprocess_entry` directly,
-# mirroring the AWQ end-to-end test's pattern. This avoids
-# `compile_and_calibrate`'s reduced-pipeline gaps (main signature
-# collision, stdlib path resolution for train-block compilation) which
-# issue #134 tracks for proper architectural fix.
+# The merge-gate test (`wggo_backward_pipeline.rs`) calls
+# `real_subprocess_entry` directly — under #134's (c-i) convergence,
+# this is the canonical calibration entry point that
+# `compile_and_calibrate` itself invokes (pre-`compile_main`, see
+# lib.rs's compile_and_calibrate wrapper). The test exercises the
+# same path that production calibration takes.
 #
-# As a result this fixture has NO train block — the harness fires from
-# `real_subprocess_entry` based on the registered hooks, not from
-# `compile_train_block`. The `@wggo_target` decorator on the forward
-# method is the only declaration needed.
+# As a result this fixture has no `train` block — calibration fires
+# from `real_subprocess_entry` based on registered hooks, not from
+# `compile_train_block` (whose calibration block was deleted in #134).
+# The `@wggo_target` decorator on the forward method is the only
+# declaration needed.
 from nsl.nn.losses import mse_loss
 
 @quantize(dtype="awq4")
