@@ -3956,108 +3956,6 @@ impl Compiler<'_> {
                 };
                 extractor.set_output(loss_var_id);
 
-                // Calibration harness MUST run before WGGO: WGGO Phase 2's
-                // gradient-scoring path reads `compile_options.calibration_sidecar`
-                // via `build_scorer`. If WGGO ran first, the sidecar would
-                // still be `None` and Phase 2 would silently fall back to
-                // magnitude scoring even when `--calibration-data` was
-                // supplied. Calibration does not depend on WGGO output, so
-                // running it first is a safe one-way reorder.
-                if let Some(ref data_path) = self.compile_options.calibration_data {
-                    let mut registry = crate::calibration::registry::HookRegistry::new();
-                    let awq_projections = self.discover_awq_projections().unwrap_or_default();
-                    if let Some(pre_scan) = self.compile_options.calibration_retention.as_ref() {
-                        crate::calibration::discovery::check_discovery_agreement(
-                            pre_scan,
-                            &awq_projections,
-                        )
-                        .map_err(|err| CodegenError::new(err.to_string()))?;
-                    }
-                    if !awq_projections.is_empty() {
-                        // Extract just the ProjectionRef for the hook; the full
-                        // DiscoveredProjection (with weight_shape) lives in
-                        // compile_options.calibration_retention for codegen.
-                        let proj_refs: Vec<crate::calibration::ProjectionRef> = awq_projections
-                            .iter()
-                            .map(|dp| dp.projection.clone())
-                            .collect();
-                        registry.register(Box::new(
-                            crate::calibration::awq_hook::AwqCalibrationHook::new(proj_refs),
-                        ));
-                        // Store the full DiscoveredProjection vec so the retention
-                        // pass can use weight_shape for arena-layout sizing.
-                        self.compile_options.calibration_retention = Some(awq_projections);
-                    }
-                    // WGGO Phase 2 (PR 1b): register WggoGradientHook when
-                    // pre-scan produced backward-pass targets. Gated on
-                    // calibration_grad_retention.is_some() (which entry_points::
-                    // run_pre_scan_phase populates only when @wggo_target
-                    // decorators reach an instantiated model) and !targets.is_empty()
-                    // (defends against the degenerate Some(vec![]) state).
-                    if let Some(targets) = self.compile_options.calibration_grad_retention.as_ref() {
-                        if !targets.is_empty() {
-                            registry.register(Box::new(
-                                crate::calibration::wggo_gradient_hook::WggoGradientHook::new(targets.clone()),
-                            ));
-                        }
-                    }
-                    if registry.is_empty() {
-                        eprintln!(
-                            "warning: --calibration-data {} supplied but no calibration hooks registered (no consumers yet — this is a no-op in MVP)",
-                            data_path.display()
-                        );
-                    } else {
-                        let mode = match self
-                            .compile_options
-                            .calibration_mode
-                            .as_deref()
-                            .unwrap_or("required")
-                        {
-                            "best-effort" => crate::calibration::HarnessMode::BestEffort,
-                            _ => crate::calibration::HarnessMode::Required,
-                        };
-                        let cfg = crate::calibration::HarnessConfig {
-                            checkpoints: self
-                                .compile_options
-                                .weight_file
-                                .as_ref()
-                                .map(|p| vec![p.clone()])
-                                .unwrap_or_default(),
-                            calibration_data: data_path.clone(),
-                            samples: self.compile_options.calibration_samples,
-                            batch_size: self.compile_options.calibration_batch_size,
-                            timeout_secs: self.compile_options.calibration_timeout_secs,
-                            mode,
-                            // Wire per-projection (path, weight_shape) into the
-                            // cache key so renames and shape changes invalidate it.
-                            projections: self
-                                .compile_options
-                                .calibration_retention
-                                .clone()
-                                .unwrap_or_default(),
-                            compile_bundle: self
-                                .compile_options
-                                .calibration_compile_bundle
-                                .clone(),
-                        };
-                        match crate::calibration::run_harness_production(&registry, &cfg) {
-                            Ok(out) => {
-                                eprintln!(
-                                    "[calibration] {} ({} hooks)",
-                                    out.outcome_repr,
-                                    out.sidecar.hooks.len()
-                                );
-                                self.compile_options.calibration_sidecar = Some(out.sidecar);
-                            }
-                            Err(e) => {
-                                return Err(crate::error::CodegenError::new(format!(
-                                    "calibration failed: {e}"
-                                )));
-                            }
-                        }
-                    }
-                }
-
                 // WGGO: run the global optimization planner if enabled.  The
                 // planner is pure data-in/data-out and does not mutate the
                 // Wengert list — it produces a report describing the
@@ -4083,8 +3981,10 @@ impl Compiler<'_> {
                         // when weights_path is None, producing uniform scores).
                         // compile_options is forwarded so build_scorer can wire the
                         // GradientScorer appropriate for --wggo-importance + --calibration-data.
-                        // The calibration pass above populated calibration_sidecar if
-                        // --calibration-data was supplied and hooks were registered.
+                        // calibration_sidecar is populated by compile_and_calibrate's wrapper-
+                        // level firing BEFORE compile_main runs, ensuring it's available here
+                        // when build_scorer reads it (see #134 (c-i) and lib.rs's compile_and_
+                        // calibrate wrapper).
                         let weights_path = self.compile_options.wggo_weights.as_deref();
                         let plan = crate::wggo::run_on_wengert_with_weights(
                             extractor.wengert_list(),
@@ -7935,7 +7835,7 @@ impl Compiler<'_> {
     /// deduplicated `Vec<ProjectionRef>`.  Discovery errors (e.g. empty match)
     /// are logged to stderr and treated as `None` so the harness falls back to
     /// its no-op path rather than crashing the compile.
-    fn discover_awq_projections(
+    pub(crate) fn discover_awq_projections(
         &self,
     ) -> Option<Vec<crate::calibration::DiscoveredProjection>> {
         use crate::calibration::discover_awq_projections_from_state;

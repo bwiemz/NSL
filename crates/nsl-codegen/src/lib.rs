@@ -691,15 +691,21 @@ impl Default for CompileOptions {
 /// 2. Sets up `CompileOptions` with `calibration_data`, `weight_file`,
 ///    `calibration_batch_seq`, and `calibration_mode = "required"`.
 /// 3. Lexes, parses, and semantically analyses the source.
-/// 4. Constructs a `Compiler` directly and runs all passes, which triggers
-///    `discover_awq_projections` and `run_harness_production` as side effects
-///    inside `compile_train_block` (the calibration harness fires when a
-///    `train` block is compiled and `calibration_data` is set).
+/// 4. Constructs a `Compiler` directly, runs all pre-`compile_main` passes
+///    (string/enum/struct/model collection, function declaration, kernel
+///    compilation, user-function compilation), then fires the calibration
+///    harness at the wrapper level by invoking `real_subprocess_entry`
+///    directly — the same canonical path used by AWQ + WGGO end-to-end tests.
+///    After the harness completes, `compile_main` runs with
+///    `calibration_sidecar` already populated.
 /// 5. Reads back `compiler.compile_options.calibration_sidecar` and returns it.
 ///
-/// The NSL source must contain a `train` block for the calibration harness
-/// to fire; models decorated with `@quantize(dtype="awq4")` and using `|>`
-/// pipe syntax in `forward` will have their projections discovered automatically.
+/// The NSL source no longer needs a `train` block for calibration to fire.
+/// Calibration fires whenever `calibration_data.is_some()`, driven by the
+/// wrapper-level block (see `#134 (c-i)`).  Models decorated with
+/// `@quantize(dtype="awq4")` will have their AWQ projections discovered via
+/// `discover_awq_projections`; WGGO gradient targets are wired via
+/// `WggoGradientHook` when `calibration_grad_retention` is populated.
 pub fn compile_and_calibrate(
     source_path: &std::path::Path,
     data_path: &std::path::Path,
@@ -796,9 +802,106 @@ pub fn compile_and_calibrate(
         // M56 Task 17: compile agent method bodies.
         compiler.compile_agent_methods(&parsed.module.stmts)?;
         compiler.compile_batched_functions(&vmap_results)?;
-        // compile_main triggers compile_train_block which fires the calibration
-        // harness (AWQ discovery + run_harness_production) as a side-effect,
-        // populating compiler.compile_options.calibration_sidecar.
+        // #134 (c-i) wrapper-level firing — spec §4.1 + §8.1 commit 3.
+        // Previously: compile_train_block fired the calibration harness as a
+        // side-effect inside compile_main, coupling calibration to the
+        // presence of a `train` block.
+        // Now: calibration fires here, at the wrapper level, regardless of
+        // whether the source contains a `train` block. Path 1 (compile_train_
+        // block's calibration block at stmt.rs:3960-4046) is deleted in this
+        // same commit. real_subprocess_entry is invoked directly — same
+        // canonical path that AWQ + WGGO end-to-end tests already use.
+        //
+        // ORDERING INVARIANT (preserved from the deleted stmt.rs block):
+        // Calibration must fire BEFORE compile_main because compile_main
+        // triggers compile_train_block's WGGO pass, which reads
+        // compile_options.calibration_sidecar via build_scorer. Firing after
+        // compile_main would leave the sidecar None at WGGO's read site,
+        // silently degrading wggo_importance=Auto to magnitude scoring and
+        // breaking wggo_importance=Grad outright. Spec §4.1's "after
+        // compile_main returns" wording was over-specified — the architectural
+        // goal "calibration runs around the compiled code" (§4.3) is equally
+        // satisfied by firing before compile_main, with the WGGO ordering
+        // invariant preserved.
+        if let Some(data_path) = compiler.compile_options.calibration_data.clone() {
+            let mut registry = crate::calibration::registry::HookRegistry::new();
+            let awq_projections = compiler.discover_awq_projections().unwrap_or_default();
+            if let Some(pre_scan) = compiler.compile_options.calibration_retention.as_ref() {
+                crate::calibration::discovery::check_discovery_agreement(
+                    pre_scan,
+                    &awq_projections,
+                )
+                .map_err(|err| CodegenError::new(err.to_string()))?;
+            }
+            if !awq_projections.is_empty() {
+                let proj_refs: Vec<crate::calibration::ProjectionRef> = awq_projections
+                    .iter()
+                    .map(|dp| dp.projection.clone())
+                    .collect();
+                registry.register(Box::new(
+                    crate::calibration::awq_hook::AwqCalibrationHook::new(proj_refs),
+                ));
+                compiler.compile_options.calibration_retention = Some(awq_projections);
+            }
+            if let Some(targets) = compiler.compile_options.calibration_grad_retention.as_ref() {
+                if !targets.is_empty() {
+                    registry.register(Box::new(
+                        crate::calibration::wggo_gradient_hook::WggoGradientHook::new(
+                            targets.clone(),
+                        ),
+                    ));
+                }
+            }
+            if registry.is_empty() {
+                eprintln!(
+                    "warning: --calibration-data {} supplied but no calibration hooks \
+                     registered (no consumers yet — this is a no-op in MVP)",
+                    data_path.display()
+                );
+            } else {
+                let mode = match compiler
+                    .compile_options
+                    .calibration_mode
+                    .as_deref()
+                    .unwrap_or("required")
+                {
+                    "best-effort" => crate::calibration::HarnessMode::BestEffort,
+                    _ => crate::calibration::HarnessMode::Required,
+                };
+                let cfg = crate::calibration::HarnessConfig {
+                    checkpoints: compiler
+                        .compile_options
+                        .weight_file
+                        .as_ref()
+                        .map(|p| vec![p.clone()])
+                        .unwrap_or_default(),
+                    calibration_data: data_path.clone(),
+                    samples: compiler.compile_options.calibration_samples,
+                    batch_size: compiler.compile_options.calibration_batch_size,
+                    timeout_secs: compiler.compile_options.calibration_timeout_secs,
+                    mode,
+                    projections: compiler
+                        .compile_options
+                        .calibration_retention
+                        .clone()
+                        .unwrap_or_default(),
+                    compile_bundle: compiler.compile_options.calibration_compile_bundle.clone(),
+                };
+                match crate::calibration::binary_codegen::real_subprocess_entry(&cfg, &registry) {
+                    Ok(out) => {
+                        eprintln!(
+                            "[calibration] {} ({} hooks)",
+                            out.outcome_repr,
+                            out.sidecar.hooks.len()
+                        );
+                        compiler.compile_options.calibration_sidecar = Some(out.sidecar);
+                    }
+                    Err(err) => {
+                        return Err(CodegenError::new(format!("calibration: {err}")));
+                    }
+                }
+            }
+        }
         compiler.compile_main(&parsed.module.stmts)?;
         compiler.compile_pending_lambdas()?;
         compiler.emit_retention_arena()?;
@@ -818,8 +921,9 @@ pub fn compile_and_calibrate(
     sidecar.ok_or_else(|| {
         CodegenError::new(
             "compile_and_calibrate: calibration harness ran but produced no sidecar. \
-             Ensure the NSL source contains a train block and at least one \
-             @quantize(dtype=\"awq4\")-decorated model with |>-pipe forward method."
+             Ensure at least one @quantize(dtype=\"awq4\")-decorated model is present \
+             (for AWQ projections) and/or @wggo_target decorators (for WGGO gradients), \
+             and that the registered hook set is non-empty."
                 .to_string(),
         )
     })
