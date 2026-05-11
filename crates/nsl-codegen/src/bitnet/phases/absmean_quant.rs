@@ -7,9 +7,14 @@
 //!
 //! **Internal phase emitter** — do NOT call from outside `bitnet/`. Use
 //! `quantized_ternary_gemm::emit` (the fused public path) instead. This
-//! visibility is `pub(crate)` rather than `pub(super)` only to enable
-//! structural snapshot tests; future Rust visibility refinements (e.g., a
-//! `__test_only` feature gate) can tighten this if external misuse appears.
+//! visibility is `pub` (rather than the originally-intended `pub(super)`)
+//! only to enable structural snapshot tests from integration tests in
+//! `tests/`, which compile as separate crates and cannot reach
+//! `pub(super)`/`pub(crate)` items. IR-001 ("only fused
+//! `quantized_ternary_gemm` is publicly callable") is therefore
+//! documentation-enforced here, not API-shape-enforced; future Rust
+//! visibility refinements (e.g., a `__test_only` feature gate) can
+//! tighten this if external misuse appears.
 //!
 //! Performs per-row reduction over `hidden_dim` elements via warp-shuffle
 //! butterfly reduction (parallel), then per-element quantize:

@@ -10,17 +10,27 @@ Spec: `docs/superpowers/specs/2026-05-11-m35-1-bitnet-ternary-design.md` §3 + �
 - `quantized_ternary_gemm.rs` — fused activation-quant prologue + ternary GEMM body.
 - `finalize.rs` — dequant + bias/residual add + HBM write.
 
-### Subsystem-internal emitters (`pub(super)`)
+### Subsystem-internal emitters
 
-- `absmean_quant.rs` — per-row activation quantization to int8. Callable
-  from unit tests but external callers should use `quantized_ternary_gemm`.
-  (File name historically references "absmean"; actual BitNet b1.58 uses
-  per-row **absmax** for activations — weights use absmean. The file name
-  is retained for spec traceability; the implementation uses absmax.)
-- `ternary_gemm.rs` — bare ternary GEMM body. **Never publicly exposed** —
-  has the "activations must be quantized first" precondition that's
-  impossible to violate when fused with the activation-quant prologue.
-  Discipline pattern: IR-001 (API-shape-enforced invariants).
+- `absmean_quant.rs` — per-row activation quantization to int8. Visibility
+  is `pub` (not `pub(super)` as originally intended) only because
+  integration tests in `tests/` compile as separate crates and cannot
+  reach `pub(super)`/`pub(crate)` items; structural snapshot tests need
+  introspection. IR-001 ("only fused `quantized_ternary_gemm` is publicly
+  callable") is therefore documentation-enforced here, not
+  API-shape-enforced. External callers of `nsl-codegen` should still use
+  `quantized_ternary_gemm`. (File name historically references "absmean";
+  actual BitNet b1.58 uses per-row **absmax** for activations — weights
+  use absmean. The file name is retained for spec traceability; the
+  implementation uses absmax.)
+- `ternary_gemm.rs` — bare ternary GEMM body. Will be `pub` for the same
+  test-introspection reason. **Never composed into a non-fused public
+  emitter** — has the "activations must be quantized first" precondition
+  that's impossible to violate when fused with the activation-quant
+  prologue. Discipline pattern: IR-001 (documentation-enforced for
+  internal emitters; API-shape-enforced at the subsystem boundary —
+  `bitnet::synthesize_kernel` and `bitnet::__public_phases::*` only
+  expose the fused composition).
 
 ## Phase 2 (M35.2) — additive (NOT created in Phase 1)
 
