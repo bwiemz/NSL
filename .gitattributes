@@ -4,6 +4,7 @@
 # checkout and every snapshot assertion that compares against an
 # emitter using `ptx.push_str("...\n")` fails.
 *.snap text eol=lf
+*.sh text eol=lf
 
 # Committed CPDT calibration fixtures are binary safetensors; mark as such
 # so git skips text-diff heuristics and CRLF normalization.

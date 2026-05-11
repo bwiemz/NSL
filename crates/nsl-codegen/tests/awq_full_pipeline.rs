@@ -644,6 +644,17 @@ fn end_to_end_real_subprocess_matches_analytical_reference() {
         .expect("real subprocess pipeline runs end-to-end")
         .sidecar;
 
+    // #134 §6.1 determinism verification: when SIDECAR_DUMP=1, print the
+    // canonical sidecar JSON between sentinel lines so
+    // scripts/verify-awq-determinism.sh can extract and compare across runs.
+    if std::env::var("SIDECAR_DUMP").is_ok() {
+        let canonical = serde_json::to_string_pretty(&sidecar)
+            .expect("Sidecar serializes to JSON");
+        eprintln!("SIDECAR_JSON_START");
+        eprintln!("{canonical}");
+        eprintln!("SIDECAR_JSON_END");
+    }
+
     let calib = read_safetensors_flat(&data_path, "calibration");
     let up_w = read_safetensors_flat(&weights_path, "TinyMLP.up_proj");
     let (up_ref, down_ref) = reference_awq_scales(&calib, &up_w);
@@ -653,4 +664,57 @@ fn end_to_end_real_subprocess_matches_analytical_reference() {
 
     assert_close(&up_actual, &up_ref, 5e-6, "up_proj");
     assert_close(&down_actual, &down_ref, 5e-6, "down_proj");
+}
+
+/// #134 §6.2 — AWQ sidecar bit-identical regression test.
+///
+/// Captures the full Sidecar JSON as an `insta` snapshot. Under #134's
+/// (c-i) convergence shape, this snapshot is **zero-by-construction**: the
+/// wrapper-level firing change does not affect `compile_main`'s output and
+/// fires calibration against the same fixture in the same order. Any drift
+/// after commit 1b indicates an implementation bug in commits 2-5, not a
+/// (c-i) design problem.
+///
+/// Legitimate future changes (new hooks, format upgrades) must update both
+/// this snapshot AND `CHANGELOG-CALIBRATION.md` — CI enforces the pairing.
+#[test]
+fn snapshot_awq_sidecar_baseline() {
+    let data_path = fixture("awq_calib_data.safetensors");
+    let weights_path = fixture("awq_calib_weights.safetensors");
+    let (projections, compile_bundle) = awq_fixture_compile_bundle();
+
+    let mut registry = HookRegistry::new();
+    registry.register(Box::new(AwqCalibrationHook::from_discovered(&projections)));
+
+    let cfg = HarnessConfig {
+        checkpoints: vec![weights_path.clone()],
+        calibration_data: data_path.clone(),
+        samples: 8,
+        batch_size: 1,
+        timeout_secs: 30,
+        mode: HarnessMode::Required,
+        projections,
+        compile_bundle: Some(compile_bundle),
+    };
+
+    let sidecar = real_subprocess_entry(&cfg, &registry)
+        .expect("real subprocess pipeline runs end-to-end")
+        .sidecar;
+
+    // Serialize to a canonical pretty-printed JSON. serde_json sorts BTreeMap
+    // keys by construction; Sidecar.hooks is BTreeMap<String, Vec<u8>>. Float
+    // fields use default serde_json formatting (deterministic per Rust toolchain).
+    let canonical = serde_json::to_string_pretty(&sidecar)
+        .expect("Sidecar serializes to JSON");
+
+    // #134 §6.1 determinism verification: when SIDECAR_DUMP=1, print the
+    // canonical sidecar JSON between sentinel lines so
+    // scripts/verify-awq-determinism.sh can extract and compare across runs.
+    if std::env::var("SIDECAR_DUMP").is_ok() {
+        eprintln!("SIDECAR_JSON_START");
+        eprintln!("{canonical}");
+        eprintln!("SIDECAR_JSON_END");
+    }
+
+    insta::assert_snapshot!("awq_sidecar_baseline", canonical);
 }

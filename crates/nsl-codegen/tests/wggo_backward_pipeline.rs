@@ -9,14 +9,12 @@
 //! against the hand-coded analytical reference in `wggo_reference.rs` within
 //! 1 × 10⁻⁴ tolerance.
 //!
-//! # Design — bypassing compile_and_calibrate
+//! # Design — direct `real_subprocess_entry` call
 //!
-//! This test uses `real_subprocess_entry` directly (same as the AWQ end-to-end
-//! test) rather than `compile_and_calibrate`.  `compile_and_calibrate` couples
-//! calibration to `compile_train_block` which has gaps (main signature
-//! collision, stdlib path resolution for train-block compilation) that issue
-//! #134 tracks for proper architectural fix.  The `real_subprocess_entry` path
-//! bypasses those gaps and matches the production calibration entry point.
+//! This test calls `real_subprocess_entry` directly — under #134's (c-i)
+//! convergence, this is the canonical calibration entry point that
+//! `compile_and_calibrate` itself invokes (pre-`compile_main`). The test
+//! exercises the same path production calibration takes.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -176,31 +174,25 @@ fn wggo_fixture_compile_bundle() -> std::sync::Arc<nsl_codegen::calibration::Cal
 /// deviation well below 10⁻¹².  The 10⁻⁴ guard is intentionally generous to
 /// absorb any f32/f64 promotion boundary at the BSS read-back step.
 #[test]
-#[ignore = "Blocked on #134 (decouple calibration from compile_train_block + remove \
-            AWQ-only assumptions across calibration entry points). \
+#[ignore = "Blocked on #144 (WGGO hop 7: WggoGradientHook produces empty \
+            observe_plan despite needs_forward_pass=true). \
             \
-            Resolution comes via #134's broader reshape, NOT as a standalone \
-            micro-PR — the AWQ-first ossification is multi-site (observation-set, \
-            compile_train_block-vs-real_subprocess_entry drift, hop 6) and patching \
-            each manifestation in isolation produces churn without architectural \
-            cleanup. \
+            #134 (decouple calibration from compile_train_block) has \
+            landed and delivered: hop 6 generalization of \
+            emit_calibration_model_object, wrapper-level firing of \
+            real_subprocess_entry from compile_and_calibrate, deletion \
+            of Path 1's calibration block in compile_train_block, AWQ \
+            sidecar regression discipline (snapshot + CHANGELOG + CI). \
             \
-            Specific remaining blocker (hop 6): emit_calibration_model_object \
-            (binary_codegen.rs:1771-1779) requires a non-empty calibration_retention \
-            list (AWQ projections) because it reads channels / model_name / \
-            transpose_fields from the first projection. WGGO-only flows have empty \
-            calibration_retention but populated calibration_grad_retention; the \
-            function rejects on the empty list before reaching the WGGO codegen \
-            path. WGGO targets carry equivalent metadata (class_name, w_*_shape) \
-            so the convergence in #134 will read from calibration_grad_retention \
-            when calibration_retention is empty. \
-            \
-            Earlier blockers already shipped: bake-indices on WggoGradTarget, real \
-            emit_per_head_dot_abs_accum reduction, WggoLayerDescriptor stack-build \
-            at the FFI call site, real_subprocess_entry entry-point switch (PR #139); \
-            ObservationSet::BackwardGradients(_) → needs_forward_pass=true so \
-            WGGO-only registration routes through the real subprocess path instead \
-            of build_sidecar_from_stub (PR #140). See #134 for scope rationale."]
+            Remaining blocker (hop 7): the validator at binary_codegen.rs \
+            rejects 'observe_plan is empty but needs_forward_pass() \
+            returned true' for the WGGO-only flow. WggoGradientHook's \
+            requires() returns BackwardGradients(_) (needs_forward_pass=true \
+            per PR #140) but observe_plan() returns empty. Either the \
+            hook should emit ObservePlanEntry records for its BSS \
+            gradient reads, or the validator needs an exemption for \
+            backward-only hooks. See #144 for the resolution scope and \
+            tracking."]
 fn end_to_end_backward_subprocess_matches_analytical_reference() {
     let data_path = fixture("wggo_calib_data.safetensors");
     let weights_path = fixture("wggo_calib_weights.safetensors");
@@ -220,9 +212,9 @@ fn end_to_end_backward_subprocess_matches_analytical_reference() {
 
     // ── Step 1: run the calibration subprocess pipeline directly ──
     //
-    // Bypasses compile_and_calibrate (which couples calibration to
-    // compile_train_block — see issue #134) and uses the same
-    // real_subprocess_entry path the AWQ end-to-end test uses.
+    // Calls real_subprocess_entry directly — the canonical calibration
+    // entry point under #134's (c-i) convergence (compile_and_calibrate
+    // itself invokes this same function pre-compile_main).
     // WGGO targets are auto-derived inside real_subprocess_entry from
     // the compile_bundle's AST.
     let compile_bundle = wggo_fixture_compile_bundle();
