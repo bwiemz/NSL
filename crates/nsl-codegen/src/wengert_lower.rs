@@ -1660,12 +1660,18 @@ fn lower_single_op(
             let (block_q, block_kv, head_dim, is_causal, d_model, eps_bits, shmem_bytes) =
                 match training_cfg {
                     Some(cfg) => {
-                        let mut d = Vec::<String>::new();
+                        // Backward kernel sizes shmem differently than forward:
+                        // it needs `backward_total_bytes` (forward total +
+                        // backward_extra dQ/dK/dV/P/dS/v_in/dRMSNorm tiles)
+                        // plus PCA Tier A's embedded seg_smem tail when
+                        // `segment_masked`. `shared_mem_bytes_v2` returns only
+                        // the forward total — passing that to the backward
+                        // launch short-allocates dynamic SMEM whenever the
+                        // backward config needs the extern .shared path,
+                        // corrupting gradients at runtime.
                         let bytes =
-                            crate::flash_attention_selector::shared_mem_bytes_selected_with_diag(
-                                &cfg, &mut d,
-                            ) as i64;
-                        for s in d { eprintln!("warning: {s}"); }
+                            crate::flash_attention_v2::shared_mem_bytes_v2_backward(&cfg)
+                                as i64;
                         let dm = cfg.csha.as_ref().map(|c| c.d_model as i64).unwrap_or(0);
                         let eps = cfg
                             .csha
