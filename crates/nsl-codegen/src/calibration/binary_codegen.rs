@@ -2078,15 +2078,6 @@ pub fn emit_calibration_model_object(
     })
 }
 
-/// Emit the calibration scaffolding object (`main` + loop body).
-///
-/// `per_step_backward_symbols`: running-buffer symbol names that backward hooks
-/// need referenced per step (spec §4.5).  Each symbol must already be declared
-/// as an Export global via `finalize_plan` — the scaffolding reuses the
-/// `running_data_ids` entry.  The placeholder `symbol_value` + `stack_store`
-/// keeps the relocation alive so the linker sees a reference even before Task 21
-/// replaces this stub with real per-head dot+abs reduction IR.
-
 /// Compute the per-output-head count for a WGGO target.
 ///
 /// `n_o_heads = max(1, w_o_shape[0] / head_dim)` with a `head_dim == 0`
@@ -2105,6 +2096,14 @@ fn wggo_n_o_heads(target: &crate::calibration::discovery::WggoGradTarget) -> u32
     }
 }
 
+/// Emit the calibration scaffolding object (`main` + loop body).
+///
+/// `per_step_backward_symbols`: running-buffer symbol names that backward hooks
+/// need referenced per step (spec §4.5).  Each symbol must already be declared
+/// as an Export global via `finalize_plan` — the scaffolding reuses the
+/// `running_data_ids` entry.  The placeholder `symbol_value` + `stack_store`
+/// keeps the relocation alive so the linker sees a reference even before Task 21
+/// replaces this stub with real per-head dot+abs reduction IR.
 pub fn emit_calibration_scaffolding_object(
     observe_plan: &[ObservePlanEntry],
     finalize_plan: &[FinalizePlanEntry],
