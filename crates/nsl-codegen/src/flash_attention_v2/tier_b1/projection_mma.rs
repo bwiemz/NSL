@@ -67,8 +67,37 @@ fn tiles_per_warp(config: &FlashAttentionConfig) -> u32 {
 ///   5. Land the `V2_TIER_B1_Q_PROJ_SKIP:` label.
 ///
 /// `chunk` is the d_model_chunk size selected by `chunk_config::select`
-/// (one of {128, 64, 32, FLOOR}). Caller guarantees `d_model % chunk == 0`
-/// for admitted configs (V3 supported-matrix CSV property).
+/// (one of {128, 64, 32, FLOOR}).
+///
+/// # B1.3 deferrals (FOUR classes of placeholder for B1.4 to replace)
+///
+/// B1.3 ships structural FSM scaffolding. The kernel ptxas-validates on
+/// sm_80 + sm_120, but **will NOT compute correct numerics if launched**
+/// — there are four independent layers of placeholder work, each of
+/// which B1.4 must replace before the kernel is numerically meaningful:
+///
+/// 1. **A/B fragment loads use a uniform SMEM address.** Every lane reads
+///    from `[%tb1_q_smem_w]` and `[%tb1_q_smem_x]` with no per-(warp, lane,
+///    K-step) offset. Real CUTLASS-style per-thread fragment loads should
+///    replace this via `matmul_mma::emit_load_a_fragment_smem` and
+///    `emit_load_b_fragment_smem` (those helpers already exist).
+/// 2. **Warp-ownership predicate (`t % 8 == warp_id`) is NOT emitted.**
+///    All 8 warps currently execute every MMA in the inner loop. B1.4 must
+///    gate each MMA on a `setp` + `@%pred` against `%warp_id`, or the
+///    accumulators end up 8× the intended sum.
+/// 3. **cp.async stages 16 bytes per chunk, not the chunk's full
+///    `chunk * hd * 2` bytes.** 16 bytes is the only legal cp.async width
+///    in PTX ISA 7.0; staging a full chunk requires a per-thread loop with
+///    per-thread destination offsets. B1.4 must add that loop.
+/// 4. **`d_model % chunk == 0` is a precondition with no upstream guard.**
+///    `chunk_config::select` doesn't enforce divisibility today. A
+///    debug_assert is added at the top of this function as a tripwire;
+///    long-term either the assert moves into `chunk_config::select` as a
+///    rejection criterion, OR the chunk loop emits a tail-iteration
+///    handler for the remainder.
+///
+/// Caller guarantees `d_model % chunk == 0` for admitted configs (V3
+/// supported-matrix CSV property; debug_assert enforces it at this layer).
 pub fn emit_q_projection(ptx: &mut String, config: &FlashAttentionConfig, chunk: u32) {
     let csha = match &config.csha {
         Some(c) => c,
@@ -82,6 +111,19 @@ pub fn emit_q_projection(ptx: &mut String, config: &FlashAttentionConfig, chunk:
         ptx.push_str("    // Tier B.1 Q projection: d_model=0 or chunk=0, no emission\n");
         return;
     }
+    // B1.3 deferral #4 tripwire: chunk_config::select does not currently
+    // reject non-divisible (d_model, chunk) pairs. If a non-divisible pair
+    // reaches this emitter (e.g., user-overridden chunk param, or future
+    // model_config with non-power-of-2 d_model), the integer division
+    // below silently truncates and the kernel under-computes Q. B1.4
+    // should either (a) add divisibility check to chunk_config::select
+    // as a rejection criterion, OR (b) emit a tail-iteration handler.
+    debug_assert!(
+        d_model % chunk == 0,
+        "Tier B.1 Q projection: d_model ({}) must be divisible by chunk ({}); chunk_config::select missing divisibility check (see B1.4 deferral #4)",
+        d_model,
+        chunk
+    );
     let n_chunks = d_model / chunk;
     let hd = config.head_dim as u32;
     let bq = config.block_q as u32;
@@ -166,11 +208,14 @@ pub fn emit_q_projection(ptx: &mut String, config: &FlashAttentionConfig, chunk:
             chunk_idx * chunk,
             (chunk_idx + 1) * chunk
         ));
-        // Symbolic cp.async issuance — real address computation + per-thread
-        // chunking lands in B1.4 alongside the ping-pong pipeline emitter.
-        // The instruction itself is real PTX that ptxas accepts at sm_80+:
-        // we stage one 16-byte burst from HBM at the offset we computed.
-        // (Sized-16 is the only legal width for cp.async in PTX ISA 7.0.)
+        // B1.4 TODO (deferral #3): this is a single 16-byte burst per
+        // CTA-wide issuance, NOT a chunk-completing per-thread loop. A
+        // full chunk = chunk*hd*2 bytes (e.g. 8192 bytes for canonical
+        // 128*32*2). To stage that, B1.4 must wrap this cp.async in a
+        // per-thread loop with per-thread destination offsets — likely
+        // via the cp.async ping-pong helper to be added in pipeline.rs.
+        // (Sized-16 is the only legal width for cp.async in PTX ISA 7.0,
+        // so the issuance shape is correct; what's missing is the count.)
         ptx.push_str(&format!(
             "    cp.async.cg.shared.global [%tb1_q_smem_w], [%tb1_q_wq_ptr + {}], 16;\n",
             chunk_idx * chunk * hd * 2
@@ -217,13 +262,20 @@ pub fn emit_q_projection(ptx: &mut String, config: &FlashAttentionConfig, chunk:
                 "    .reg .b32 %tb1_q_b_{}_{}_0, %tb1_q_b_{}_{}_1;\n",
                 chunk_idx, t, chunk_idx, t
             ));
-            // Symbolic A-fragment load: real address arithmetic lands in B1.4.
+            // B1.4 TODO (deferral #1): replace with matmul_mma::
+            // emit_load_a_fragment_smem(...) — that helper already does the
+            // CUTLASS-style per-(warp, lane, K-step) row*stride+base+offset
+            // arithmetic. Current uniform `[%tb1_q_smem_x]` load is correct
+            // PTX syntax (ptxas accepts) but every lane reads the same 4
+            // bytes; numerics will only become correct after the swap.
             for i in 0..4 {
                 ptx.push_str(&format!(
                     "    ld.shared.b32 %tb1_q_a_{}_{}_{}, [%tb1_q_smem_x];\n",
                     chunk_idx, t, i
                 ));
             }
+            // B1.4 TODO (deferral #1): replace with matmul_mma::
+            // emit_load_b_fragment_smem(...) for per-lane B-fragment addressing.
             for i in 0..2 {
                 ptx.push_str(&format!(
                     "    ld.shared.b32 %tb1_q_b_{}_{}_{}, [%tb1_q_smem_w];\n",
@@ -247,8 +299,13 @@ pub fn emit_q_projection(ptx: &mut String, config: &FlashAttentionConfig, chunk:
                 format!("%tb1_q_b_{}_{}_1", chunk_idx, t),
             ];
             let c_regs = d_regs.clone();
+            // B1.4 TODO (deferral #2): gate this MMA on the warp-ownership
+            // predicate (`setp.eq.u32 %wo_pred, %warp_id, (t %% 8); @%wo_pred mma.sync ...`).
+            // Currently every one of the 8 warps executes every MMA tile; the
+            // accumulator end-state is therefore 8x the intended sum. ptxas
+            // accepts the instruction; the gate is what makes the numerics right.
             ptx.push_str(&format!(
-                "    // MMA tile t={} (warp owns t %% 8 == warp_id)\n",
+                "    // MMA tile t={} -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)\n",
                 t
             ));
             emit_mma_instruction(ptx, &d_regs, &a_regs, &b_regs, &c_regs);
