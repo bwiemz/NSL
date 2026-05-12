@@ -49,7 +49,7 @@ jobs:
         run: cargo test -p nsl-codegen --test bitnet_logit_match --no-run
 
       - name: Run always-on sanity checks
-        run: cargo test -p nsl-codegen --test bitnet_logit_match --nocapture
+        run: cargo test -p nsl-codegen --test bitnet_logit_match -- --nocapture
 
       # The reference-logits binary (tests/fixtures/bitnet_b158_3b_reference_logits.bin)
       # is deferred to the Linux follow-on (parallel to AWQ PR #134 pattern).
