@@ -11,13 +11,16 @@ pub mod packed_load;
 // publicly callable for activation-quant + ternary GEMM") is enforced at
 // the documentation level: the module docstring of `absmean_quant.rs`
 // directs external callers to `quantized_ternary_gemm::emit` instead.
-// This mirrors the visibility/discipline pattern already used by
-// `packed_load` above.
+// `#[doc(hidden)]` also keeps this off the rustdoc front page so external
+// crate users don't see it as a public API surface.
+#[doc(hidden)]
 pub mod absmean_quant;
 
 // Internal: pub only for test introspection (same rationale as absmean_quant).
 // IR-001 is documentation-enforced for this emitter; external callers should
-// use quantized_ternary_gemm (the fused public path).
+// use quantized_ternary_gemm (the fused public path). `#[doc(hidden)]` hides
+// it from rustdoc to reduce the risk of mistaken external composition.
+#[doc(hidden)]
 pub mod ternary_gemm;
 
 // Public: the fused absmax + ternary GEMM emitter. The only ternary-GEMM
