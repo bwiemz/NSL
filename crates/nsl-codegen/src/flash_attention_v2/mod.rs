@@ -20,6 +20,37 @@ use phases::pv_accum::O_BASE;
 /// v2 entry point. Returns a byte vector ending with a single trailing
 /// newline followed by a NUL terminator so `cuModuleLoadData` accepts it.
 pub fn synthesize_flash_attention_ptx_v2(config: &FlashAttentionConfig) -> Vec<u8> {
+    // Tier B.1 dispatch (CSHA Level 2 pipelined kernel).  Eligible when
+    // `csha.level >= 2` AND the target GPU supports MMA tensor cores
+    // (sm_80+ — required for the Hopper/Blackwell cp.async + MMA path).
+    //
+    // `chunk_config::select` gates the dispatch.  On failure (no chunk
+    // fits SMEM, register pressure, etc.) it returns a `DowngradeReason`
+    // and we fall through to the Tier A v2 path below.
+    //
+    // Note: under normal operation the upstream planner
+    // (`csha_pipeline::plan_layer`) has already determined L2 fits per
+    // the cost model in spec section 7, so `chunk_config::select` should
+    // succeed.  This fall-through is a safety net for the case where
+    // the cost model and the actual emission budget disagree — it
+    // represents a cost-model bug in `csha_pipeline.rs` to be fixed
+    // there, NOT the primary downgrade path.  The primary downgrade
+    // path is the planner deciding L2 doesn't fit and dispatching with
+    // `csha.level < 2`.
+    let want_tier_b1 = config.csha.as_ref().is_some_and(|c| c.level >= 2)
+        && config.gpu_sm >= 80;
+    if want_tier_b1 {
+        match tier_b1::chunk_config::select(config) {
+            Ok(chunk) => return tier_b1::synthesize(config, chunk),
+            Err(_reason) => {
+                // chunk_config::select failed despite planner having
+                // admitted L2.  Fall through to Tier A v2 path.  The
+                // snapshot regression test on the emitted PTX will catch
+                // any inadvertent fall-through in CI-monitored variants.
+            }
+        }
+    }
+
     smem_layout::validate_scalar_v2_config(config, smem_layout::Direction::Forward)
         .expect("v2 emitter called with unsupported config -- selector must gate this");
 
