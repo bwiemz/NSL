@@ -42,8 +42,11 @@ fn tier_b1_eligible_falls_through_to_classic_at_b1_2_stage() {
     // `chunk_config::select` is a B1.2 stub that always returns Err, so
     // the dispatch falls through to the Tier A path.  The emitted PTX
     // should therefore NOT contain "Tier B.1 stub" (which the
-    // `tier_b1::synthesize` placeholder emits).  At B1.3 once
-    // `chunk_config::select` succeeds, this assertion will flip.
+    // `tier_b1::synthesize` placeholder emits).
+    // FLIP-POINT B1.3: once `chunk_config::select` succeeds, the
+    // assertion below must change from `!s.contains(...)` to
+    // `s.contains(...)` — the eligible config will then route into
+    // `tier_b1::synthesize` and the placeholder marker WILL appear.
     assert!(
         !s.contains("Tier B.1 stub"),
         "B1.2 stub chunk_config::select should always fall through; got: {}",
@@ -63,6 +66,8 @@ fn level_1_config_does_not_route_to_tier_b1() {
     });
     let ptx = synthesize_flash_attention_ptx_v2(&config);
     let s = String::from_utf8_lossy(&ptx);
+    // FLIP-POINT B1.3: this assertion stays the same — level=1 will
+    // never route to tier_b1 regardless of `chunk_config::select`'s state.
     assert!(
         !s.contains("Tier B.1 stub"),
         "csha.level=1 must NOT route to tier_b1; got: {}",
@@ -79,6 +84,8 @@ fn old_sm_does_not_route_to_tier_b1() {
     config.gpu_sm = 75;
     let ptx = synthesize_flash_attention_ptx_v2(&config);
     let s = String::from_utf8_lossy(&ptx);
+    // FLIP-POINT B1.3: this assertion stays the same — sm<80 will
+    // never route to tier_b1 regardless of `chunk_config::select`'s state.
     assert!(
         !s.contains("Tier B.1 stub"),
         "gpu_sm=75 must NOT route to tier_b1; got: {}",
