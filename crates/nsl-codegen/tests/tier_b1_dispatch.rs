@@ -2,18 +2,21 @@
 //! routes to `tier_b1::synthesize` when `csha.level >= 2` AND `gpu_sm >= 80`,
 //! and falls through to Tier A otherwise.
 //!
-//! At B1.2 stage, `chunk_config::select` is a stub that always returns Err,
-//! so even level=2+sm=120 configs fall through to Tier A.  The B1.3 milestone
-//! lands the real chunk selector, at which point this test's "routes to
-//! tier_b1 stub" assertion will need updating to "tier_b1::synthesize is
-//! called with the selected chunk."  See test comments.
+//! At B1.3 stage, `chunk_config::select` performs a real descending search
+//! over `{128, 64, 32, FLOOR}`, gated on SMEM (spec §3.4) and register
+//! budget (spec §5.4). Eligible level=2 + sm>=80 configs whose tile shape
+//! fits the 99 KB SMEM budget now route into `tier_b1::synthesize`, which
+//! at this stage emits a placeholder ("Tier B.1 stub") marker. B1.4+ lands
+//! the real PTX emission.
 
 use nsl_codegen::flash_attention::{CshaExtras, FlashAttentionConfig, RopeStyle};
 use nsl_codegen::flash_attention_v2::synthesize_flash_attention_ptx_v2;
 
 /// Construct a Tier B.1 eligible config: `csha.level = 2` (Pipeline),
-/// `gpu_sm = 120` (Blackwell), small tile sizes so the Tier A fall-through
-/// fits the 99 KB dynamic SMEM cap.
+/// `gpu_sm = 120` (Blackwell), small tile sizes so the SMEM budget is
+/// satisfied at multiple chunk candidates. `d_model = 2048` is the
+/// smallest dm in the V3 supported-matrix CSV; selectors require a
+/// non-zero d_model to size chunk staging.
 fn tier_b1_eligible_config() -> FlashAttentionConfig {
     FlashAttentionConfig {
         block_q: 32,
@@ -29,27 +32,29 @@ fn tier_b1_eligible_config() -> FlashAttentionConfig {
         segment_masked: false,
         csha: Some(CshaExtras {
             level: 2,
+            d_model: 2048,
             ..CshaExtras::default()
         }),
     }
 }
 
 #[test]
-fn tier_b1_eligible_falls_through_to_classic_at_b1_2_stage() {
+fn tier_b1_eligible_routes_to_synthesize_stub() {
     let config = tier_b1_eligible_config();
     let ptx = synthesize_flash_attention_ptx_v2(&config);
     let s = String::from_utf8_lossy(&ptx);
-    // `chunk_config::select` is a B1.2 stub that always returns Err, so
-    // the dispatch falls through to the Tier A path.  The emitted PTX
-    // should therefore NOT contain "Tier B.1 stub" (which the
-    // `tier_b1::synthesize` placeholder emits).
-    // FLIP-POINT B1.3: once `chunk_config::select` succeeds, the
-    // assertion below must change from `!s.contains(...)` to
-    // `s.contains(...)` — the eligible config will then route into
-    // `tier_b1::synthesize` and the placeholder marker WILL appear.
+    // B1.3 landed the real `chunk_config::select` (SMEM + register-budget
+    // gates per spec §3.4 + §5.4). For this small 32x32x32 config it
+    // succeeds, so dispatch routes into `tier_b1::synthesize`, which at
+    // B1.3 emits the "Tier B.1 stub" placeholder marker. B1.4+ replaces
+    // that placeholder with real PTX emission.
+    // FLIP-POINT B1.4: when real emission lands the marker string will
+    // change — update this assertion to match the new emitter output
+    // (likely a kernel name like ".visible .entry flash_attn_tier_b1_*"
+    // or a sentinel block header).
     assert!(
-        !s.contains("Tier B.1 stub"),
-        "B1.2 stub chunk_config::select should always fall through; got: {}",
+        s.contains("Tier B.1 stub"),
+        "B1.3 chunk_config::select should now succeed and route to tier_b1::synthesize stub; got: {}",
         &s[..s.len().min(200)]
     );
 }
