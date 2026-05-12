@@ -15,12 +15,15 @@
 //   diagrams and continuation lines.
 // - `needless_range_loop`: indexed loops with `i` are intentional where the
 //   index itself feeds into other buffers in lock-step.
-// NOTE: `clippy::manual_checked_ops` (1.95+) — the explicit `if divisor == 0`
-//   guards are clearer than `.checked_div(...).unwrap_or(...)`. Re-add to the
-//   allow list below when the toolchain is pinned to 1.95+.
+// - `manual_checked_ops` (clippy 1.95+): explicit `if divisor == 0` guards
+//   are clearer than `.checked_div(...).unwrap_or(...)` at these call sites.
+//   `unknown_lints` is listed first so that compilers older than 1.95 don't
+//   error on the unrecognised lint name under `-D warnings`.
 #![allow(
+    unknown_lints,
     clippy::not_unsafe_ptr_arg_deref,
     clippy::missing_safety_doc,
+    clippy::manual_checked_ops,
     clippy::doc_overindented_list_items,
     clippy::doc_lazy_continuation,
     clippy::needless_range_loop
