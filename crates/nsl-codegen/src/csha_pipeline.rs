@@ -23,6 +23,23 @@ use crate::csha_boundary::BoundaryScan;
 use crate::gpu_specs::GpuSpec;
 use crate::wggo_cost::LayerShape;
 
+/// Smallest chunk value the Tier B.1 emitter's `chunk_config::select` may
+/// return — load-bearing for the planner / emitter contract.
+///
+/// `chunk_config::select` performs a descending search over `{128, 64, 32,
+/// 16}` and is REQUIRED to treat this constant as its floor: returning a
+/// smaller value would invalidate the planner's admission decision in
+/// `pipeline_smem_bytes`, which sizes chunk staging against this floor so
+/// any admitted config has SOME valid chunk choice. Conversely, the
+/// emitter MUST NOT silently downgrade below this floor or the planner
+/// over-admits.
+///
+/// If you change this value you MUST also update `chunk_config::select`'s
+/// descending search to match, and re-run the cost-model snapshot tests
+/// (`csha_pipeline_cost_model.rs::snapshot_*`) which freeze admission
+/// behavior across the V3 supported matrix.
+pub const CHUNK_PLANNER_FLOOR: u64 = 16;
+
 /// Selected CSHA fusion level for one layer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum FusionLevel {
@@ -171,28 +188,28 @@ pub fn pipeline_smem_bytes(shape: LayerShape, tiles: TileConfig) -> u64 {
     let block_q = tiles.block_q as u64;
     let block_kv = tiles.block_kv as u64;
     let head_dim = tiles.head_dim as u64;
-    let _d_model = shape.d_model; // retained: B1.2 chunk selector reads dm
+    let _ = shape.d_model; // dm is unused here; chunk selector lives in tier_b1::chunk_config.
 
     let q_tile = block_q * head_dim * dtype;
     let k_tile = block_kv * head_dim * dtype;
     let v_tile = block_kv * head_dim * dtype;
     // Tier B.1 ping-pong (depth=2) over both K and V — 4 slabs total.
     let kv_tiles = 2 * (k_tile + v_tile);
-    // V3 case alpha: O_acc is register-resident (pv_accum.rs:23-26,
-    // finalize.rs:62, smem_layout::total_bytes line 307-312 has no O
-    // region). Zeroed, not deleted, so B.2 has the location preserved.
+    // V3 case alpha: O_acc is register-resident (see `pv_accum::*`,
+    // `finalize::*`, `smem_layout::total_bytes` — no O region). Zeroed,
+    // not deleted, so B.2 has the location preserved.
     let o_acc: u64 = 0;
     let stats = block_q * 2 * 4;
     // Chunk staging budget per spec §3.4: at any instant the kernel holds
     // two W chunk slots (Wk_chunk + Wv_chunk) plus two x chunk slots
-    // (x_q_chunk + x_kv_chunk). The planner uses the MINIMUM chunk (16)
-    // so it admits configs that any valid chunk selection would accept;
-    // the actual chunk is selected at emission time by B1.2's
-    // `chunk_config::select`, which descends {128, 64, 32, 16}.
-    const MIN_CHUNK: u64 = 16;
+    // (x_q_chunk + x_kv_chunk). The planner uses the MINIMUM chunk
+    // (`CHUNK_PLANNER_FLOOR`) so it admits configs that any valid chunk
+    // selection would accept; the actual chunk is selected at emission
+    // time by `tier_b1::chunk_config::select`, which descends
+    // {128, 64, 32, 16} and must treat `CHUNK_PLANNER_FLOOR` as its floor.
     let chunk_staging =
-        2 * (MIN_CHUNK * head_dim * dtype)       // Wk + Wv chunk slots
-        + (block_q + block_kv) * MIN_CHUNK * dtype; // x_q + x_kv chunk slots
+        2 * (CHUNK_PLANNER_FLOOR * head_dim * dtype)       // Wk + Wv chunk slots
+        + (block_q + block_kv) * CHUNK_PLANNER_FLOOR * dtype; // x_q + x_kv chunk slots
     q_tile + kv_tiles + o_acc + stats + chunk_staging
 }
 
