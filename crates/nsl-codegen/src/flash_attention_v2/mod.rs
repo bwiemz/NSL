@@ -12,6 +12,7 @@
 pub mod smem_layout;
 pub mod register_budget;
 pub mod phases;
+pub mod tier_b1;
 
 use crate::flash_attention::FlashAttentionConfig;
 use phases::pv_accum::O_BASE;
