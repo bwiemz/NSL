@@ -71,7 +71,7 @@ pub fn try_unpack_byte(byte: u8) -> Result<[i8; 4], String> {
 /// Trit count must be a multiple of 4 (caller pads with zeros if needed).
 pub fn pack_trit_slice(trits: &[i8]) -> Vec<u8> {
     assert!(
-        trits.len() % 4 == 0,
+        trits.len().is_multiple_of(4),
         "trit count must be multiple of 4, got {}",
         trits.len()
     );

@@ -10,18 +10,17 @@
 //   pointers; the safety invariants are documented module-by-module in the
 //   compiler/runtime contract, not per-function. Marking each entry point
 //   `unsafe` would require touching every Cranelift call site.
-// - `manual_checked_ops`: the explicit `if divisor == 0` guards are clearer
-//   than `.checked_div(...).unwrap_or(...)` at these call sites and were
-//   written to match the original semantics exactly.
 // - `doc_overindented_list_items` / `doc_lazy_continuation`: pedantic doc
 //   formatting lints new in clippy 1.95 that fire on preexisting ASCII
 //   diagrams and continuation lines.
 // - `needless_range_loop`: indexed loops with `i` are intentional where the
 //   index itself feeds into other buffers in lock-step.
+// NOTE: `clippy::manual_checked_ops` (1.95+) — the explicit `if divisor == 0`
+//   guards are clearer than `.checked_div(...).unwrap_or(...)`. Re-add to the
+//   allow list below when the toolchain is pinned to 1.95+.
 #![allow(
     clippy::not_unsafe_ptr_arg_deref,
     clippy::missing_safety_doc,
-    clippy::manual_checked_ops,
     clippy::doc_overindented_list_items,
     clippy::doc_lazy_continuation,
     clippy::needless_range_loop

@@ -1,8 +1,9 @@
 // Clippy style-lint churn new in 1.95+ that's not worth per-site fixes here:
 // - doc_overindented_list_items / doc_lazy_continuation / unused_parens: doc
 //   formatting pedantry that fires on preexisting ASCII diagrams.
-// - manual_checked_ops: explicit `if divisor == 0 { fallback }` is clearer
-//   than `.checked_div(...).unwrap_or(...)` at the call sites in question.
+// NOTE: `clippy::manual_checked_ops` (1.95+) — explicit `if divisor == 0`
+//   guards are clearer than `.checked_div(...).unwrap_or(...)`. Re-add to the
+//   allow list when the toolchain is pinned to 1.95+.
 // - needless_range_loop: indexed loops where the index threads into multiple
 //   parallel buffers in lock-step.
 // - too_many_arguments: numerical-kernel / codegen-emit signatures have many
@@ -16,7 +17,6 @@
     unused_parens,
     clippy::doc_overindented_list_items,
     clippy::doc_lazy_continuation,
-    clippy::manual_checked_ops,
     clippy::needless_range_loop,
     clippy::too_many_arguments,
     clippy::field_reassign_with_default,
