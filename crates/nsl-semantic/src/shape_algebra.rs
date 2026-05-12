@@ -110,12 +110,12 @@ impl ShapeAlgebraSolver {
             DimExpr::Div(a, b) => {
                 let va = self.evaluate(a)?;
                 let vb = self.evaluate(b)?;
-                if vb == 0 { None } else { Some(va / vb) }
+                va.checked_div(vb)
             }
             DimExpr::Mod(a, b) => {
                 let va = self.evaluate(a)?;
                 let vb = self.evaluate(b)?;
-                if vb == 0 { None } else { Some(va % vb) }
+                va.checked_rem(vb)
             }
         }
     }

@@ -7,9 +7,11 @@
 //! pre-quantizes to packed ternary at load time using the b1.58 BitLinear
 //! per-tensor absmean math:
 //!
-//!     weight_scale = mean(|w|)
-//!     w_ternary    = round(clip(w / weight_scale, -1, +1))
-//!     packed       = pack_trit_slice(w_ternary)  (Task 2)
+//! ```text
+//! weight_scale = mean(|w|)
+//! w_ternary    = round(clip(w / weight_scale, -1, +1))
+//! packed       = pack_trit_slice(w_ternary)  (Task 2)
+//! ```
 //!
 //! Per spec §1.3 escalation criteria, future inference must hit ≥80% of
 //! the paper's claimed speedup; this pre-quantize-at-load step is a
@@ -118,7 +120,7 @@ fn quantize_fp16_to_ternary(
     let bytes = view.data();
     // Convert FP16 → FP32 once.
     let numel = bytes.len() / 2;
-    if numel % 4 != 0 {
+    if !numel.is_multiple_of(4) {
         return Err(LoaderError::AlignmentError {
             name: name.to_string(),
             numel,
