@@ -19,15 +19,29 @@ const REG_HEADROOM: u32 = 15;
 /// fragment layout). Returns Ok(regs_estimate) if under the cap minus
 /// headroom; Err(SpillRisk) otherwise.
 ///
-/// Budget terms (warp's share, expressed per-thread = warp_share / 32):
+/// **INVARIANT (load-bearing for `chunk_config::select` short-circuit):**
+/// this function MUST remain chunk-independent. `select` short-circuits
+/// the descending search with `break` on register failure under the
+/// assumption that all chunks produce the same register estimate. If a
+/// future revision introduces chunk-dependent register pressure (e.g.,
+/// chunk affects how many MMA accumulators are co-live), the `break` at
+/// `chunk_config.rs::select` becomes wrong — REMOVE it there before
+/// introducing chunk dependence here.
+///
+/// Budget terms (per-thread, with 8 warps × 32 threads = 256 threads/CTA):
 ///   * Q resident accumulators       : (bq/16) * (hd/8) / 8 * 4 (f32)
-///   * K projection in-flight chunk  : 16 (f32, one chunk's worth)
-///   * V projection in-flight chunk  : 16 (f32)
+///   * K projection in-flight chunk  : 4 (f32; one m16n8k16 accumulator
+///                                       fragment = 4 f32 lanes per thread)
+///   * V projection in-flight chunk  : 4 (f32; same shape as K)
 ///   * QK^T S fragments              : (bq/16) * (bkv/8) / 8 * 4 (f32)
 ///   * P_f16 packed (post-softmax)   : 8 (b32 holding 16 f16 lanes)
 ///   * O_acc (lives across kv_iters) : (bq/16) * (hd/8) / 8 * 4 (f32)
 ///   * Row stats + correction        : ~16 (f32 + scratch)
 ///   * Addressing + predicates       : ~32 (mixed)
+///
+/// At the canonical (bq=64, bkv=64, hd=128) the formula yields 144
+/// regs/thread; at (64,64,64) it yields 112. Both fit comfortably under
+/// the 255-15=240 cap with headroom.
 ///
 /// The formula is integer-only (no floor/ceil); MMA tile counts
 /// (bq/16, bkv/8, hd/8) are assumed integral — the caller (validator
@@ -86,20 +100,23 @@ mod tests {
 
     #[test]
     fn canonical_64_64_64_fits_budget() {
-        // Per spec §5.4: typical canonical config should fit comfortably
-        // under 255/thread. Expected ~168 regs.
+        // Hand-derive: q_resident=16, k=4, v=4, s=16, p=8, o=16,
+        // row_stats=16, addressing=32 -> total = 112 regs/thread.
+        // Cap-with-headroom = 255 - 15 = 240; comfortable margin.
         let cfg = make_config(64, 64, 64);
         let regs = analyze(&cfg).expect("canonical config should fit");
-        assert!(regs < 200, "got {} regs, expected ~168 per spec", regs);
+        assert_eq!(regs, 112, "formula drift in canonical (64,64,64) budget");
     }
 
     #[test]
     fn canonical_64_64_128_fits_budget() {
-        // Same shape but hd=128. Spec §5.4 says ~168 at this config too
-        // (the formula scales with bq*hd/8, but normalized per-thread the
-        // dominant term is constant).
+        // Hand-derive: q_resident=32, k=4, v=4, s=16, p=8, o=32,
+        // row_stats=16, addressing=32 -> total = 144 regs/thread.
+        // hd=128 doubles q_resident and o_acc vs hd=64 (both terms
+        // scale with hd/8); other terms unchanged. Still under cap.
         let cfg = make_config(64, 64, 128);
         let regs = analyze(&cfg).expect("canonical hd=128 should fit");
+        assert_eq!(regs, 144, "formula drift in canonical (64,64,128) budget");
         assert!(regs < REG_CAP_PER_THREAD - REG_HEADROOM);
     }
 
