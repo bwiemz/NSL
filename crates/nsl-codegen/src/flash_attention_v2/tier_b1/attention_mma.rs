@@ -105,16 +105,20 @@ pub fn emit_phase_b_attention(
 /// **B1.6 TODO (deferral #2):** warp-ownership predicate not yet emitted.
 /// All 8 warps execute every MMA; gate each on `setp.eq.u32` + `@%pred`.
 ///
-/// **B1.6 TODO (deferral #5 -- Phase-B-specific):** S-fragment dtype.
-/// QK^T output should be f32 accumulator (4 lanes per thread), then
-/// scaled by `1/sqrt(head_dim)` before softmax. Scaling is a scalar
-/// `mul.f32` per lane; ship it as part of the QK^T tail (not yet emitted
-/// in the scaffold -- B1.6 must add the scaling line per spec section 4.2).
+/// **B1.6 deferral #5 RESOLVED:** the QK^T tail applies the
+/// `1/sqrt(head_dim)` scaling via per-lane `mul.f32` immediately after
+/// the MMA loop — semantically equivalent to applying the scale to the
+/// softmax input. The scale constant is computed at codegen time from
+/// `config.head_dim` and emitted as the IEEE-754 f32 hex literal.
 fn emit_qkt_mma(ptx: &mut String, config: &FlashAttentionConfig, slot: u32) {
     let tpw = tiles_per_warp_qkt(config);
+    let hd = config.head_dim as u32;
+    // Codegen-time computation: 1 / sqrt(head_dim) as f32 IEEE-754 bits.
+    // Spec section 4.2: scale QK^T output by 1/sqrt(d_k) before softmax.
+    let scale_bits = (1.0_f32 / (hd as f32).sqrt()).to_bits();
     ptx.push_str(&format!(
-        "    // QK^T MMA: bq={} bkv={} tpw_qkt={} slot={}\n",
-        config.block_q, config.block_kv, tpw, slot
+        "    // QK^T MMA: bq={} bkv={} tpw_qkt={} slot={} (scale=1/sqrt({})=0f{:08X})\n",
+        config.block_q, config.block_kv, tpw, slot, hd, scale_bits
     ));
     // %tb1_phase_b_smem_q/k and %s_acc_<t>_<lane> are declared + zero-init'd
     // by register_budget::declare_registers at orchestrator scope (B1.6
@@ -168,6 +172,25 @@ fn emit_qkt_mma(ptx: &mut String, config: &FlashAttentionConfig, slot: u32) {
             t
         ));
         emit_mma_instruction(ptx, &d_regs, &a_regs, &b_regs, &c_regs);
+    }
+
+    // B1.6 deferral #5 resolution: scale S accumulators by 1/sqrt(head_dim).
+    // Per spec section 4.2 the scale belongs between QK^T and softmax. We
+    // apply it to the f32 S accumulators here so the downstream softmax
+    // input is already pre-scaled. Mathematically equivalent to scaling
+    // inside exp(); architecturally simpler because the constant is known
+    // at codegen time and the loop already has the accumulator regs hot.
+    ptx.push_str(&format!(
+        "    // Apply 1/sqrt(head_dim={}) scale to S accumulators (deferral #5)\n",
+        hd
+    ));
+    for t in 0..tpw {
+        for lane in 0..4 {
+            ptx.push_str(&format!(
+                "    mul.f32 %s_acc_{}_{}, %s_acc_{}_{}, 0f{:08X};\n",
+                t, lane, t, lane, scale_bits
+            ));
+        }
     }
 }
 
@@ -366,6 +389,32 @@ mod tests {
         assert!(
             prelude_ptx.contains(".reg .f32 %o_acc_0_0"),
             "register_budget::declare_registers must emit the %o_acc declaration"
+        );
+    }
+
+    #[test]
+    fn phase_b_qkt_scale_count_equals_tpw_times_four() {
+        // B1.6 deferral #5: 1/sqrt(head_dim) scale per S-accumulator lane
+        // emitted after the MMA loop. Count must equal tpw_qkt * 4 lanes.
+        let cfg = make_config(32, 32, 32, 2048);
+        let mut ptx = String::new();
+        emit_phase_b_attention(&mut ptx, &cfg, 0, 0);
+        let tpw = tiles_per_warp_qkt(&cfg);
+        let scale_count = ptx.matches("mul.f32 %s_acc_").count();
+        assert_eq!(
+            scale_count,
+            (tpw * 4) as usize,
+            "expected {} QK^T scale ops ({} tile(s) * 4 lanes); got {}",
+            tpw * 4,
+            tpw,
+            scale_count
+        );
+        // The scale literal must be a non-zero f32. For hd=32, 1/sqrt(32) bits.
+        let expected_scale = (1.0_f32 / 32.0_f32.sqrt()).to_bits();
+        assert!(
+            ptx.contains(&format!("0f{:08X}", expected_scale)),
+            "QK^T tail must embed the IEEE-754 hex for 1/sqrt(32) = 0f{:08X}",
+            expected_scale
         );
     }
 

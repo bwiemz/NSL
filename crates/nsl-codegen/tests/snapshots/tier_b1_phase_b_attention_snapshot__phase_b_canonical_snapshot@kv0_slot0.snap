@@ -3,7 +3,7 @@ source: crates/nsl-codegen/tests/tier_b1_phase_b_attention_snapshot.rs
 expression: ptx
 ---
     // === Phase B: attention compute on slot[0] (kv_iter=0) ===
-    // QK^T MMA: bq=32 bkv=32 tpw_qkt=1 slot=0
+    // QK^T MMA: bq=32 bkv=32 tpw_qkt=1 slot=0 (scale=1/sqrt(32)=0f3E3504F3)
     .reg .b32 %tb1_qkt_a_0_0, %tb1_qkt_a_0_1, %tb1_qkt_a_0_2, %tb1_qkt_a_0_3;
     .reg .b32 %tb1_qkt_b_0_0, %tb1_qkt_b_0_1;
     ld.shared.b32 %tb1_qkt_a_0_0, [%tb1_phase_b_smem_q];
@@ -18,6 +18,11 @@ expression: ptx
         {%tb1_qkt_a_0_0, %tb1_qkt_a_0_1, %tb1_qkt_a_0_2, %tb1_qkt_a_0_3},
         {%tb1_qkt_b_0_0, %tb1_qkt_b_0_1},
         {%s_acc_0_0, %s_acc_0_1, %s_acc_0_2, %s_acc_0_3};
+    // Apply 1/sqrt(head_dim=32) scale to S accumulators (deferral #5)
+    mul.f32 %s_acc_0_0, %s_acc_0_0, 0f3E3504F3;
+    mul.f32 %s_acc_0_1, %s_acc_0_1, 0f3E3504F3;
+    mul.f32 %s_acc_0_2, %s_acc_0_2, 0f3E3504F3;
+    mul.f32 %s_acc_0_3, %s_acc_0_3, 0f3E3504F3;
     // Online softmax: bq=32 tpw_qkt=1 kv_iter=0
     // softmax tile t=0 -- placeholder bfly + exp (B1.6 deferral #6)
     shfl.sync.bfly.b32 %s_acc_0_0, %s_acc_0_0, 4, 0x1f, 0xffffffff;
