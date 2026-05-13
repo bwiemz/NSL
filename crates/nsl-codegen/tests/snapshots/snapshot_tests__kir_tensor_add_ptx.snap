@@ -1,5 +1,6 @@
 ---
 source: crates/nsl-codegen/tests/snapshot_tests.rs
+assertion_line: 308
 expression: ptx_str
 ---
 .version 7.0
@@ -7,10 +8,10 @@ expression: ptx_str
 .address_size 64
 
 .visible .entry nsl_tensor_add(.param .u64 param_a, .param .u64 param_b, .param .u64 param_out, .param .u32 param_len) {
-    .reg .u32 %r<16>;
-    .reg .u64 %rd<16>;
-    .reg .f32 %f<16>;
-    .reg .pred %p<16>;
+    .reg .u32 %r<1006>;
+    .reg .u64 %rd<1006>;
+    .reg .f32 %f<1006>;
+    .reg .pred %p<1006>;
 
     ld.param.u64 %rd0, [param_a];
     ld.param.u64 %rd1, [param_b];
