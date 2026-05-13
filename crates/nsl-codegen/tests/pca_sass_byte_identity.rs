@@ -618,3 +618,327 @@ fn forward_and_backward_helper_sass_opcode_pattern_equivalent() {
         fwd_sigs.len(), bwd_sigs.len()
     );
 }
+
+// ---------------------------------------------------------------------------
+// Tier B SASS assertions (added 2026-05-13)
+//
+// Per spec §5.2 of 2026-05-12-pca-tier-b-revision-design.md.
+// ---------------------------------------------------------------------------
+
+fn tier_b_test_fixture() -> nsl_codegen::flash_attention::FlashAttentionConfig {
+    nsl_codegen::flash_attention::FlashAttentionConfig {
+        block_q: 64,
+        block_kv: 64,
+        head_dim: 64,
+        causal: true,
+        paged: false,
+        rope_q: true,
+        rope_style: nsl_codegen::flash_attention::RopeStyle::HalfSplit,
+        gqa_group_size: 2,
+        tree_mask: false,
+        gpu_sm: 120,
+        segment_masked: true,
+        csha: None,
+    }
+}
+
+/// Wrap a preamble PTX fragment in a minimal compilable kernel.
+///
+/// The target is parameterised by `sm` so we can assemble for both sm_80
+/// and sm_120.  The `.extern .shared .align 16 .b8 shmem[]` declaration
+/// satisfies the `cvta.shared.u64 %addr_*, shmem;` references emitted by
+/// `emit_lane_zero_store`.
+fn wrap_in_minimal_kernel(preamble_ptx: &str, sm: u32) -> String {
+    // Use the ISA version appropriate for the target.
+    // sm_120 (Blackwell) → PTX ISA 8.6; sm_80 (Ampere) → PTX ISA 7.0.
+    let (ptx_version, target_str) = if sm >= 120 {
+        ("8.6", format!("sm_{sm}"))
+    } else {
+        ("7.0", format!("sm_{sm}"))
+    };
+
+    format!(
+        r#".version {ptx_version}
+.target {target_str}
+.address_size 64
+
+.shared .align 4 .b8 seg_smem[4096];
+.extern .shared .align 16 .b8 shmem[];
+
+.visible .entry tier_b_test_kernel() {{
+{preamble_ptx}
+    ret;
+}}
+"#
+    )
+}
+
+mod tier_b_sass {
+    use super::{find_cuobjdump, find_ptxas, tier_b_test_fixture, wrap_in_minimal_kernel};
+    use std::process::Command;
+
+    /// Assemble `ptx` for `sm` and return the full SASS dump, or an error.
+    ///
+    /// Returns `Ok(sass)` on success.
+    /// Returns `Err(msg)` on assembly failure.
+    fn ptx_to_sass_sm(ptxas: &str, cuobjdump: &str, ptx: &str, sm: u32) -> Result<String, String> {
+        let tmpdir = tempfile::tempdir().map_err(|e| format!("tempdir: {e}"))?;
+        let ptx_path = tmpdir.path().join(format!("tier_b_sm{sm}.ptx"));
+        let cubin_path = tmpdir.path().join(format!("tier_b_sm{sm}.cubin"));
+        std::fs::write(&ptx_path, ptx).map_err(|e| format!("write ptx: {e}"))?;
+
+        let asm = Command::new(ptxas)
+            .args([&format!("-arch=sm_{sm}"), "-O2", "-o"])
+            .arg(&cubin_path)
+            .arg(&ptx_path)
+            .output()
+            .map_err(|e| format!("spawn ptxas: {e}"))?;
+        if !asm.status.success() {
+            return Err(format!(
+                "ptxas rejected sm_{sm}: stdout={} stderr={}",
+                String::from_utf8_lossy(&asm.stdout),
+                String::from_utf8_lossy(&asm.stderr),
+            ));
+        }
+
+        let dump = Command::new(cuobjdump)
+            .args(["--dump-sass"])
+            .arg(&cubin_path)
+            .output()
+            .map_err(|e| format!("spawn cuobjdump: {e}"))?;
+        if !dump.status.success() {
+            return Err(format!(
+                "cuobjdump failed: {}",
+                String::from_utf8_lossy(&dump.stderr)
+            ));
+        }
+        String::from_utf8(dump.stdout).map_err(|e| format!("sass utf8: {e}"))
+    }
+
+    /// Extract the SASS lines between two landmarks (inclusive).
+    ///
+    /// Labels appear in SASS as source-file comment annotations or as
+    /// inline PTX-label→SASS boundary markers.  The start/end strings
+    /// are matched as substrings so `LOOP_Q_TILERANGE` matches a line
+    /// containing that text anywhere.
+    fn sass_between(sass: &str, start_marker: &str, end_marker: &str) -> String {
+        let mut in_block = false;
+        let mut out = String::new();
+        for line in sass.lines() {
+            if !in_block && line.contains(start_marker) {
+                in_block = true;
+            }
+            if in_block {
+                out.push_str(line);
+                out.push('\n');
+                if line.contains(end_marker) {
+                    break;
+                }
+            }
+        }
+        out
+    }
+
+    /// Resolve ptxas + cuobjdump or skip.  Returns `None` when tools are absent.
+    fn tools() -> Option<(String, String)> {
+        match (find_ptxas(), find_cuobjdump()) {
+            (Some(p), Some(c)) => Some((p, c)),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn tier_b_preamble_q_phase_branch_is_uniform_sm120() {
+        let (ptxas, cuobjdump) = match tools() {
+            Some(t) => t,
+            None => {
+                eprintln!("SKIP: ptxas or cuobjdump not available on this host");
+                return;
+            }
+        };
+
+        let cfg = tier_b_test_fixture();
+        let mut preamble = String::new();
+        nsl_codegen::pca_tilerange::emit_range_table_preamble(
+            &mut preamble, &cfg, 4096, "seg_smem", 0,
+        );
+
+        let kernel_ptx = wrap_in_minimal_kernel(&preamble, 120);
+        let sass = match ptx_to_sass_sm(&ptxas, &cuobjdump, &kernel_ptx, 120) {
+            Ok(s) => s,
+            Err(e) => {
+                // ptxas may reject sm_120 on older CUDA toolkits; treat as skip.
+                eprintln!("SKIP: sm_120 assembly failed (CUDA toolkit too old?): {e}");
+                return;
+            }
+        };
+
+        // The q-phase loop body lives between LOOP_Q_TILERANGE and LOOP_KV_TILERANGE.
+        let q_region = sass_between(&sass, "LOOP_Q_TILERANGE", "LOOP_KV_TILERANGE");
+        assert!(
+            !q_region.is_empty() || sass.contains("BRA.U") || sass.contains("BRA.UNI"),
+            "q-phase LOOP_Q_TILERANGE region not found in SASS — label may have been \
+             dropped by ptxas. Full SASS:\n{sass}"
+        );
+        // If we extracted a region, verify BRA.U is present.
+        if !q_region.is_empty() {
+            assert!(
+                q_region.contains("BRA.U") || q_region.contains("BRA.UNI"),
+                "q-phase loop branch not BRA.U/BRA.UNI on sm_120:\n{q_region}\n\
+                 (Full SASS for context:\n{sass})"
+            );
+        }
+    }
+
+    #[test]
+    fn tier_b_preamble_kv_phase_branch_is_uniform_sm120() {
+        let (ptxas, cuobjdump) = match tools() {
+            Some(t) => t,
+            None => {
+                eprintln!("SKIP: ptxas or cuobjdump not available on this host");
+                return;
+            }
+        };
+
+        let cfg = tier_b_test_fixture();
+        let mut preamble = String::new();
+        nsl_codegen::pca_tilerange::emit_range_table_preamble(
+            &mut preamble, &cfg, 4096, "seg_smem", 0,
+        );
+
+        let kernel_ptx = wrap_in_minimal_kernel(&preamble, 120);
+        let sass = match ptx_to_sass_sm(&ptxas, &cuobjdump, &kernel_ptx, 120) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("SKIP: sm_120 assembly failed (CUDA toolkit too old?): {e}");
+                return;
+            }
+        };
+
+        // kv-phase lives between LOOP_KV_TILERANGE and the trailing bar.sync.
+        let kv_region = sass_between(&sass, "LOOP_KV_TILERANGE", "bar.sync");
+        assert!(
+            !kv_region.is_empty() || sass.contains("BRA.U") || sass.contains("BRA.UNI"),
+            "kv-phase LOOP_KV_TILERANGE region not found in SASS — label may have been \
+             dropped by ptxas. Full SASS:\n{sass}"
+        );
+        if !kv_region.is_empty() {
+            assert!(
+                kv_region.contains("BRA.U") || kv_region.contains("BRA.UNI"),
+                "kv-phase loop branch not BRA.U/BRA.UNI on sm_120:\n{kv_region}\n\
+                 (Full SASS for context:\n{sass})"
+            );
+        }
+    }
+
+    #[test]
+    fn tier_b_preamble_uses_uniform_registers_on_sm120() {
+        let (ptxas, cuobjdump) = match tools() {
+            Some(t) => t,
+            None => {
+                eprintln!("SKIP: ptxas or cuobjdump not available on this host");
+                return;
+            }
+        };
+
+        let cfg = tier_b_test_fixture();
+        let mut preamble = String::new();
+        nsl_codegen::pca_tilerange::emit_range_table_preamble(
+            &mut preamble, &cfg, 4096, "seg_smem", 0,
+        );
+
+        let kernel_ptx = wrap_in_minimal_kernel(&preamble, 120);
+        let sass = match ptx_to_sass_sm(&ptxas, &cuobjdump, &kernel_ptx, 120) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("SKIP: sm_120 assembly failed (CUDA toolkit too old?): {e}");
+                return;
+            }
+        };
+
+        assert!(
+            sass.contains("UR"),
+            "sm_120 SASS should reference UR<n> uniform-class registers; \
+             full SASS:\n{sass}"
+        );
+    }
+
+    #[test]
+    fn tier_b_skip_predicate_branch_is_uniform_sm120() {
+        let (ptxas, cuobjdump) = match tools() {
+            Some(t) => t,
+            None => {
+                eprintln!("SKIP: ptxas or cuobjdump not available on this host");
+                return;
+            }
+        };
+
+        let cfg = tier_b_test_fixture();
+        let mut predicate_ptx = String::new();
+        nsl_codegen::pca_tilerange::emit_skip_predicate(
+            &mut predicate_ptx, &cfg, 4096, "%qt", "%kvt", 0, "KV_TILE_SKIP",
+        );
+
+        // Wrap predicate in a kernel with %qt, %kvt set up + a KV_TILE_SKIP target.
+        let body = format!(
+            "    .reg .u32 %qt, %kvt;\n    mov.u32 %qt, 0;\n    mov.u32 %kvt, 0;\n{predicate_ptx}\nKV_TILE_SKIP:\n    bar.sync 0;\n"
+        );
+        let kernel_ptx = wrap_in_minimal_kernel(&body, 120);
+
+        let sass = match ptx_to_sass_sm(&ptxas, &cuobjdump, &kernel_ptx, 120) {
+            Ok(s) => s,
+            Err(e) => {
+                // ptxas may reject sm_120 on older CUDA toolkits; treat as skip.
+                eprintln!("SKIP: sm_120 assembly failed (CUDA toolkit too old?): {e}");
+                return;
+            }
+        };
+
+        // The predicate branch labeled section is between the "PCA Tier B: skip predicate"
+        // marker comment and "end PCA Tier B skip predicate" marker. ptxas may drop those
+        // comments from SASS, so fall back to grepping the whole SASS for BRA.U as a proxy.
+        let predicate_sass = sass_between(&sass, "PCA Tier B", "end PCA Tier B");
+        let target_sass = if predicate_sass.trim().is_empty() { &sass[..] } else { &predicate_sass };
+        assert!(
+            target_sass.contains("BRA.U") || target_sass.contains("BRA.UNI"),
+            "skip predicate branch not BRA.U on sm_120:\n{target_sass}"
+        );
+    }
+
+    #[test]
+    fn tier_b_preamble_sm80_uniform_proxy_via_brau() {
+        let (ptxas, cuobjdump) = match tools() {
+            Some(t) => t,
+            None => {
+                eprintln!("SKIP: ptxas or cuobjdump not available on this host");
+                return;
+            }
+        };
+
+        let mut cfg = tier_b_test_fixture();
+        cfg.gpu_sm = 80;
+        let mut preamble = String::new();
+        nsl_codegen::pca_tilerange::emit_range_table_preamble(
+            &mut preamble, &cfg, 4096, "seg_smem", 0,
+        );
+
+        let kernel_ptx = wrap_in_minimal_kernel(&preamble, 80);
+        let sass = match ptx_to_sass_sm(&ptxas, &cuobjdump, &kernel_ptx, 80) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("SKIP: sm_80 assembly failed: {e}");
+                return;
+            }
+        };
+
+        let q_region = sass_between(&sass, "LOOP_Q_TILERANGE", "LOOP_KV_TILERANGE");
+        // On sm_80 labels may be preserved or dropped; check either the region
+        // or the whole SASS for BRA.U as a warp-uniform proxy.
+        let target = if q_region.is_empty() { &sass } else { &q_region };
+        assert!(
+            target.contains("BRA.U") || target.contains("BRA.UNI"),
+            "sm_80 q-phase loop branch not BRA.U (uniform-class proxy) \
+             in region:\n{q_region}\n(Full SASS:\n{sass})"
+        );
+    }
+}

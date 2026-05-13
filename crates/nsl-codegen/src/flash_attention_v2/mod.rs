@@ -14,18 +14,40 @@ pub mod register_budget;
 pub mod phases;
 
 use crate::flash_attention::FlashAttentionConfig;
+use crate::pca_segment::SegmentResidency;
 use phases::pv_accum::O_BASE;
 
 /// v2 entry point. Returns a byte vector ending with a single trailing
 /// newline followed by a NUL terminator so `cuModuleLoadData` accepts it.
+///
+/// Calls `synthesize_flash_attention_ptx_v2_with_tier_b(config, None)` —
+/// output is byte-identical to all pre-Tier-B baselines (spec §3.4.6).
 pub fn synthesize_flash_attention_ptx_v2(config: &FlashAttentionConfig) -> Vec<u8> {
+    synthesize_flash_attention_ptx_v2_with_tier_b(config, None)
+}
+
+/// v2 entry point with optional PCA Tier B support.
+///
+/// When `tier_b` is `None` this produces byte-identical output to
+/// `synthesize_flash_attention_ptx_v2` (no-op guarantee, spec §3.4.6).
+/// When `tier_b` is `Some((seq_len, residency))` and `should_emit_tier_b`
+/// returns true, the emitted PTX includes:
+///   1. Range-table preamble in the forward prelude (after Tier A bar.sync 0).
+///   2. Per-KV-tile skip predicate via `s_compute::emit(... tier_b)`.
+///   3. `KV_TILE_SKIP_TB_{q_iter}:` labels at the bottom of each KV tile loop.
+pub fn synthesize_flash_attention_ptx_v2_with_tier_b(
+    config: &FlashAttentionConfig,
+    tier_b: Option<(u32, SegmentResidency)>,
+) -> Vec<u8> {
     smem_layout::validate_scalar_v2_config(config, smem_layout::Direction::Forward)
         .expect("v2 emitter called with unsupported config -- selector must gate this");
 
     let mut ptx = String::new();
 
     // Phase 0: file header, param block, register decls, indices.
-    phases::prelude::emit(&mut ptx, config);
+    // tier_b forwarded so the Tier B range-table preamble (if admitted) is
+    // emitted after the Tier A segment_ids load + bar.sync 0.
+    phases::prelude::emit(&mut ptx, config, tier_b);
 
     // CSHA A.4: head pruning guard (runs ONCE, before any q_tile work).
     phases::csha_hooks::emit_active_heads_guard(&mut ptx, config);
@@ -156,8 +178,14 @@ pub fn synthesize_flash_attention_ptx_v2(config: &FlashAttentionConfig) -> Vec<u
             ptx.push_str("    mov.u64 %k_max, %rd6;\n");
             ptx.push_str(&format!("V2_LOOP_KV_S_{}:\n", q_iter));
             emit_k_tile_load(&mut ptx, config, q_iter);
-            phases::s_compute::emit(&mut ptx, config, q_iter);
+            phases::s_compute::emit(&mut ptx, config, q_iter, tier_b);
             phases::softmax::emit(&mut ptx, config, q_iter);
+            // PCA Tier B: KV_TILE_SKIP_TB_{q_iter} label is emitted here ONLY
+            // when tier_b.is_some() — preserves byte-identical output for non-Tier-B
+            // kernels (spec §3.4.6 no-op guarantee).
+            if tier_b.is_some() {
+                ptx.push_str(&format!("KV_TILE_SKIP_TB_{}:\n", q_iter));
+            }
             ptx.push_str(&format!("    add.u64 %k_start, %k_start, {};\n", config.block_kv));
             ptx.push_str("    setp.lt.u64 %p0, %k_start, %k_max;\n");
             ptx.push_str(&format!("    @%p0 bra V2_LOOP_KV_S_{};\n", q_iter));
@@ -263,7 +291,7 @@ pub fn synthesize_flash_attention_ptx_v2(config: &FlashAttentionConfig) -> Vec<u
             ptx.push_str(&format!("V2_LOOP_KV_START_{}:\n", q_iter));
 
             emit_k_tile_load(&mut ptx, config, q_iter);
-            phases::s_compute::emit(&mut ptx, config, q_iter);
+            phases::s_compute::emit(&mut ptx, config, q_iter, tier_b);
             phases::softmax::emit(&mut ptx, config, q_iter);
             // Tier C: persist row_max/row_sum to HBM IMMEDIATELY after
             // softmax's online update, inside the KV loop. The prior
@@ -292,6 +320,12 @@ pub fn synthesize_flash_attention_ptx_v2(config: &FlashAttentionConfig) -> Vec<u
             );
             phases::pv_accum::emit(&mut ptx, config, q_iter);
 
+            // PCA Tier B: KV_TILE_SKIP_TB_{q_iter} label emitted ONLY when
+            // tier_b.is_some() — preserves byte-identical output for non-Tier-B
+            // kernels (spec §3.4.6 no-op guarantee).
+            if tier_b.is_some() {
+                ptx.push_str(&format!("KV_TILE_SKIP_TB_{}:\n", q_iter));
+            }
             ptx.push_str(&format!(
                 "    add.u64 %k_start, %k_start, {};\n",
                 config.block_kv
@@ -525,6 +559,39 @@ pub fn shared_mem_bytes_v2_backward(config: &FlashAttentionConfig) -> u32 {
         0
     };
     phases::backward::prelude::backward_total_bytes(config) + seg_overhead
+}
+
+/// SMEM byte count for a v2 forward kernel including Tier B contribution.
+///
+/// Called from launch sites that have access to `seq_len` and the Tier A
+/// residency decision. No-op guarantee: when Tier B is not emitted, returns
+/// exactly `shared_mem_bytes_v2(config)` — pre-Tier-B SMEM layout preserved
+/// byte-identically for non-Tier-B configs (spec §3.4.6).
+pub fn shared_mem_bytes_v2_with_seqlen(
+    config: &FlashAttentionConfig,
+    seq_len: u32,
+    residency: crate::pca_segment::SegmentResidency,
+) -> u32 {
+    let tier_b_bytes = if crate::pca_tilerange::should_emit_tier_b(config, seq_len as u64, residency) {
+        crate::pca_tilerange::tier_b_range_table_bytes(config, seq_len)
+    } else {
+        0
+    };
+    shared_mem_bytes_v2(config) + tier_b_bytes
+}
+
+/// Backward equivalent of `shared_mem_bytes_v2_with_seqlen`.
+pub fn shared_mem_bytes_v2_backward_with_seqlen(
+    config: &FlashAttentionConfig,
+    seq_len: u32,
+    residency: crate::pca_segment::SegmentResidency,
+) -> u32 {
+    let tier_b_bytes = if crate::pca_tilerange::should_emit_tier_b(config, seq_len as u64, residency) {
+        crate::pca_tilerange::tier_b_range_table_bytes(config, seq_len)
+    } else {
+        0
+    };
+    shared_mem_bytes_v2_backward(config) + tier_b_bytes
 }
 
 /// Tier C backward orchestrator — emits the full backward PTX kernel by

@@ -4,7 +4,7 @@
 
 use crate::flash_attention::FlashAttentionConfig;
 use crate::flash_attention_v2::smem_layout::{needs_dynamic_smem, total_bytes, SMEM_BUDGET_BYTES};
-use crate::pca_segment::DEFAULT_SMEM_SEGMENT_BUDGET;
+use crate::pca_segment::{DEFAULT_SMEM_SEGMENT_BUDGET, SegmentResidency};
 
 /// Forward SMEM-routing gate that also accounts for PCA Tier A's
 /// `seg_smem` static array (when `config.segment_masked`).  Without
@@ -45,7 +45,11 @@ use crate::kernel_skeleton::indexing::emit_thread_lane_warp_register_decl;
 /// %logsumexp_base; %scale holds the softmax scale. Shared-memory base
 /// pointer lives in %shmem_base after a `cvta.shared.u64` from the
 /// `shmem` byte array declared here.
-pub fn emit(ptx: &mut String, config: &FlashAttentionConfig) {
+/// `tier_b` — when `Some((seq_len, residency))`, emits the PCA Tier B
+/// range-table preamble after the Tier A segment_ids SMEM load + bar.sync.
+/// When `None` (all existing callers), the output is byte-identical to the
+/// pre-Tier-B baseline (spec §3.4.6 no-op guarantee).
+pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, tier_b: Option<(u32, SegmentResidency)>) {
     // File header.
     use crate::kernel_skeleton::header::{emit_ptx_header, PtxVersion, TargetSm};
     emit_ptx_header(ptx, PtxVersion::V8_7, TargetSm::Sm75);
@@ -371,5 +375,22 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig) {
         // Fence: all threads (including warps 1+) see segment_ids before use.
         ptx.push_str("    bar.sync 0;\n");
         ptx.push_str("    // --- end PCA Tier A segment_ids load ---\n");
+
+        // PCA Tier B range-table preamble (only when admitted).
+        // Runs after bar.sync 0 so segment_ids SMEM values are visible to all threads.
+        // The preamble builds per-tile min/max tables used by emit_skip_predicate.
+        if let Some((seq_len, residency)) = tier_b {
+            if crate::pca_tilerange::should_emit_tier_b(config, seq_len as u64, residency) {
+                let range_table_base =
+                    crate::flash_attention_v2::smem_layout::tier_b_range_table_offset(config);
+                crate::pca_tilerange::emit_range_table_preamble(
+                    ptx,
+                    config,
+                    seq_len,
+                    "seg_smem",
+                    range_table_base,
+                );
+            }
+        }
     }
 }

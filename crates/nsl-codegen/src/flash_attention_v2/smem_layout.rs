@@ -300,6 +300,29 @@ pub fn sp_bytes(config: &FlashAttentionConfig) -> u32 {
     }
 }
 
+/// PCA Tier B range table — single tail offset into extern shmem.
+///
+/// Returns `align_up(backward_total_bytes + seg_overhead, 2)` so the
+/// returned offset is 2-byte aligned for u16 slot loads. Alignment is
+/// owned here per IR-004; `pca_tilerange::range_table_addrs` assumes
+/// the base is ready-to-use.
+pub fn tier_b_range_table_offset(config: &crate::flash_attention::FlashAttentionConfig) -> u32 {
+    let seg_overhead = if config.segment_masked {
+        crate::pca_segment::DEFAULT_SMEM_SEGMENT_BUDGET as u32
+    } else {
+        0
+    };
+    let base = crate::flash_attention_v2::phases::backward::prelude::backward_total_bytes(config)
+        + seg_overhead;
+    align_up_u32(base, 2)
+}
+
+#[inline]
+fn align_up_u32(x: u32, align: u32) -> u32 {
+    debug_assert!(align.is_power_of_two());
+    (x + align - 1) & !(align - 1)
+}
+
 /// Total SMEM bytes: Q tile + KV tile + S/P rows (4 warps × block_kv × 4 bytes, f32).
 /// When `csha.fused_projections`, also includes Wq/Wk/Wv weight tile slots and
 /// a softmax-state save area for the K/V pre-pass split design.

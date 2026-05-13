@@ -99,6 +99,26 @@ fn backward_kernel_segment_masked_causal_32_32_32() {
     insta::assert_snapshot!(ptx);
 }
 
+// ── Tier B.2 deferred: backward unchanged regression (Task 8) ─────────────
+//
+// When Tier B would be admitted on forward (segment_masked, Shared residency,
+// seq_len fits 8 KB budget), the backward kernel must NOT contain any Tier B
+// preamble text — backward Tier B is Tier B.2 (deferred).
+
+#[test]
+fn backward_kernel_segment_masked_tier_b_baseline_unchanged_causal_32_32_32() {
+    let cfg = minimal_segment_masked_backward_config();
+    let ptx = synthesize_backward(&cfg).expect("synthesize_backward must succeed");
+    assert!(
+        !ptx.contains("PCA Tier B: range-table preamble"),
+        "backward kernel must not contain Tier B preamble (Tier B.2 deferred)"
+    );
+    assert!(
+        !ptx.contains("KV_TILE_SKIP_TB_"),
+        "backward kernel must not contain KV_TILE_SKIP_TB labels (Tier B.2 deferred)"
+    );
+}
+
 #[test]
 fn write_ptx_to_file() {
     let cfg = minimal_segment_masked_backward_config();
