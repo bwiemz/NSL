@@ -236,10 +236,17 @@ fn emit_qkt_mma(ptx: &mut String, config: &FlashAttentionConfig, slot: u32) {
 /// `shfl.sync.bfly.b32`. Output: P fragments packed f16 in
 /// `%p_packed_<t>` registers (one b32 per tile, holding 2 f16 lanes).
 ///
-/// **B1.6 TODO (deferral #6 -- Phase-B-specific):** the bfly reduction
-/// tree is currently a single placeholder `shfl.sync.bfly.b32` per row.
-/// Real implementation is 3-step log2(8)=3 reductions for the lane group
-/// holding one row's S values (spec section 5.3 lane->fragment map).
+/// **B1.6 deferral #6 PARTIAL:** the row-max bfly reduction tree is real
+/// (2 steps, mask=1 then mask=2 across the 4-lane row group per spec
+/// §5.5 lane mapping). For each tile, each lane folds its 2 cols held
+/// for `row_lo` into a local max, then bfly-reduces across the 4-lane
+/// group sharing that row. Same for `row_lo + 8`. After the tree, every
+/// lane in a row group has the per-row max.
+///
+/// **Still deferred** (full softmax pipeline): subtract row_max, exp
+/// (PTX `ex2.approx.f32` after `mul.f32` by `log2(e)`), row_sum
+/// reduction (same 2-step bfly), divide. P-packed emission stays a
+/// `mov` placeholder until that pipeline lands.
 ///
 /// **B1.6 TODO (deferral #7):** running max + sum across kv_iters needs
 /// state in `%m_acc_<row>` and `%l_acc_<row>` registers declared at
@@ -251,23 +258,56 @@ fn emit_online_softmax(ptx: &mut String, config: &FlashAttentionConfig, kv_iter:
         "    // Online softmax: bq={} tpw_qkt={} kv_iter={}\n",
         config.block_q, tpw, kv_iter
     ));
-    // Placeholder bfly reduction per tile. Real impl is per spec 5.3.
     for t in 0..tpw {
         ptx.push_str(&format!(
-            "    // softmax tile t={} -- placeholder bfly + exp (B1.6 deferral #6)\n",
+            "    // === softmax tile t={} : row-max bfly tree (deferral #6 partial) ===\n",
             t
         ));
-        // B1.6 TODO (deferral #6): replace with 3-step bfly tree (log2(8)=3
-        // reductions) operating on the lane group holding one row's S values.
+        // Per-tile scratch for the row-max reduction.
         ptx.push_str(&format!(
-            "    shfl.sync.bfly.b32 %s_acc_{}_0, %s_acc_{}_0, 4, 0x1f, 0xffffffff;\n",
-            t, t
+            "    .reg .f32 %s_max_{}_lo, %s_max_{}_hi, %s_shfl_{}_tmp;\n",
+            t, t, t
         ));
-        // Pack to b32 holding two f16 lanes (placeholder).
-        // B1.6 TODO (deferral #7): replace with real exp(S - row_max) + row_sum
-        // correction using running %m_acc and %l_acc state from prologue scope.
-        // %p_packed_<t> is hoisted to register_budget::declare_registers (B1.6
-        // deferral #4 resolution); we just write into it.
+        // Intra-thread max across the 2 cols this lane holds for row_lo
+        // (frag indices 0,1) and row_lo+8 (frag indices 2,3).
+        ptx.push_str(&format!(
+            "    max.f32 %s_max_{}_lo, %s_acc_{}_0, %s_acc_{}_1;\n",
+            t, t, t
+        ));
+        ptx.push_str(&format!(
+            "    max.f32 %s_max_{}_hi, %s_acc_{}_2, %s_acc_{}_3;\n",
+            t, t, t
+        ));
+        // Row-max bfly tree across the 4-lane row group. Per spec §5.5
+        // lanes (4k, 4k+1, 4k+2, 4k+3) share the same row_lo; pairing
+        // via bfly mask=1 then mask=2 reduces those 4 lanes to a common
+        // max. Same pattern applies independently to row_lo+8.
+        for (mask, comment) in [(1u32, "lane k <-> k^1"), (2u32, "lane k <-> k^2")].iter() {
+            ptx.push_str(&format!(
+                "    shfl.sync.bfly.b32 %s_shfl_{}_tmp, %s_max_{}_lo, {}, 0x1f, 0xffffffff; // {}\n",
+                t, t, mask, comment
+            ));
+            ptx.push_str(&format!(
+                "    max.f32 %s_max_{}_lo, %s_max_{}_lo, %s_shfl_{}_tmp;\n",
+                t, t, t
+            ));
+            ptx.push_str(&format!(
+                "    shfl.sync.bfly.b32 %s_shfl_{}_tmp, %s_max_{}_hi, {}, 0x1f, 0xffffffff; // {}\n",
+                t, t, mask, comment
+            ));
+            ptx.push_str(&format!(
+                "    max.f32 %s_max_{}_hi, %s_max_{}_hi, %s_shfl_{}_tmp;\n",
+                t, t, t
+            ));
+        }
+        // B1.6 TODO (full pipeline): subtract row_max, ex2.approx.f32,
+        // row_sum reduction (same bfly pattern as above), divide. Then
+        // %p_packed_<t> gets the real f16-packed P values. For now the
+        // mov-placeholder keeps the snapshot structure stable.
+        ptx.push_str(&format!(
+            "    // B1.6 TODO: subtract %s_max, exp, sum-reduce, divide -> %p_packed_{}\n",
+            t
+        ));
         ptx.push_str(&format!(
             "    mov.b32 %p_packed_{}, %s_acc_{}_0;\n",
             t, t
