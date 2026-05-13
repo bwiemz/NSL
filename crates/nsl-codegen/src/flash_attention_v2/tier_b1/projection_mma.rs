@@ -178,6 +178,13 @@ pub fn emit_q_projection(ptx: &mut String, config: &FlashAttentionConfig, chunk:
     // u32 sister registers for matmul_mma::emit_load_*_fragment_smem
     // (B1.6 deferral #1) — the helpers use 32-bit SMEM addressing.
     ptx.push_str("    .reg .u32 %tb1_q_smem_w_u32, %tb1_q_smem_x_u32;\n");
+    // Per-thread cp.async byte offset (B1.6 deferral #3): each of the 256
+    // threads stages its own 16-byte slot in the chunk.
+    ptx.push_str("    .reg .u32 %tb1_q_cp_tid_off;\n");
+    ptx.push_str("    .reg .u32 %tb1_q_cp_smem_addr, %tb1_q_cp_hbm_off;\n");
+    ptx.push_str("    .reg .u64 %tb1_q_cp_hbm_addr;\n");
+    ptx.push_str("    mov.u32 %tb1_q_cp_tid_off, %tid.x;\n");
+    ptx.push_str("    shl.b32 %tb1_q_cp_tid_off, %tb1_q_cp_tid_off, 4; // tid * 16 (B1.6 deferral #3)\n");
     ptx.push_str("    .reg .u64 %tb1_q_scatter_addr;\n");
     ptx.push_str("    .reg .b16 %tb1_q_h0, %tb1_q_h1;\n");
 
@@ -230,17 +237,29 @@ pub fn emit_q_projection(ptx: &mut String, config: &FlashAttentionConfig, chunk:
             chunk_idx * chunk,
             (chunk_idx + 1) * chunk
         ));
-        // B1.4 TODO (deferral #3): this is a single 16-byte burst per
-        // CTA-wide issuance, NOT a chunk-completing per-thread loop. A
-        // full chunk = chunk*hd*2 bytes (e.g. 8192 bytes for canonical
-        // 128*32*2). To stage that, B1.4 must wrap this cp.async in a
-        // per-thread loop with per-thread destination offsets — likely
-        // via the cp.async ping-pong helper to be added in pipeline.rs.
-        // (Sized-16 is the only legal width for cp.async in PTX ISA 7.0,
-        // so the issuance shape is correct; what's missing is the count.)
+        // B1.6 deferral #3 partial: per-thread cp.async — each of the 256
+        // threads stages its own 16-byte slot. Total = 256*16 = 4096 bytes
+        // per call. For chunks > 4096 bytes (e.g. canonical chunk*hd*2 =
+        // 8192) a second per-thread cp.async would be needed; deferred
+        // until the larger-chunk configs are exercised.
         ptx.push_str(&format!(
-            "    cp.async.cg.shared.global [%tb1_q_smem_w], [%tb1_q_wq_ptr + {}], 16;\n",
+            "    add.u32 %tb1_q_cp_smem_addr, %tb1_q_smem_w_u32, %tb1_q_cp_tid_off;\n"
+        ));
+        ptx.push_str(&format!(
+            "    cvt.u32.u64 %tb1_q_cp_hbm_off, %tb1_q_wq_ptr;\n"
+        ));
+        ptx.push_str(&format!(
+            "    add.u32 %tb1_q_cp_hbm_off, %tb1_q_cp_hbm_off, {};\n",
             chunk_idx * chunk * hd * 2
+        ));
+        ptx.push_str(&format!(
+            "    add.u32 %tb1_q_cp_hbm_off, %tb1_q_cp_hbm_off, %tb1_q_cp_tid_off;\n"
+        ));
+        ptx.push_str(&format!(
+            "    cvt.u64.u32 %tb1_q_cp_hbm_addr, %tb1_q_cp_hbm_off;\n"
+        ));
+        ptx.push_str(&format!(
+            "    cp.async.cg.shared.global [%tb1_q_cp_smem_addr], [%tb1_q_cp_hbm_addr], 16;\n"
         ));
 
         // cp.async stage x_q chunk: bytes = bq * chunk * 2 (f16 after f32->f16
@@ -254,8 +273,23 @@ pub fn emit_q_projection(ptx: &mut String, config: &FlashAttentionConfig, chunk:
             chunk_idx
         ));
         ptx.push_str(&format!(
-            "    cp.async.cg.shared.global [%tb1_q_smem_x], [%tb1_q_x_ptr + {}], 16;\n",
+            "    add.u32 %tb1_q_cp_smem_addr, %tb1_q_smem_x_u32, %tb1_q_cp_tid_off;\n"
+        ));
+        ptx.push_str(&format!(
+            "    cvt.u32.u64 %tb1_q_cp_hbm_off, %tb1_q_x_ptr;\n"
+        ));
+        ptx.push_str(&format!(
+            "    add.u32 %tb1_q_cp_hbm_off, %tb1_q_cp_hbm_off, {};\n",
             chunk_idx * chunk * 4
+        ));
+        ptx.push_str(&format!(
+            "    add.u32 %tb1_q_cp_hbm_off, %tb1_q_cp_hbm_off, %tb1_q_cp_tid_off;\n"
+        ));
+        ptx.push_str(&format!(
+            "    cvt.u64.u32 %tb1_q_cp_hbm_addr, %tb1_q_cp_hbm_off;\n"
+        ));
+        ptx.push_str(&format!(
+            "    cp.async.cg.shared.global [%tb1_q_cp_smem_addr], [%tb1_q_cp_hbm_addr], 16;\n"
         ));
 
         // Commit + wait + barrier: synchronous chunk for B1.3 (B1.4
