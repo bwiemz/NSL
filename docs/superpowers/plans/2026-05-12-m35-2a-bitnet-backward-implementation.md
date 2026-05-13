@@ -55,7 +55,7 @@ Every file with its target stage and one-sentence responsibility.
 | `crates/nsl-codegen/tests/fixtures/bitnet_backward_supported_matrix.csv` | New | D.2 | `(forward_tile, backward_tile)` combinations supported |
 | `crates/nsl-codegen/tests/bitnet_backward_chunk_config.rs` | New | D.2 | Unit tests for `select()` + supported-matrix |
 | `crates/nsl-codegen/tests/bitnet_ternary_gemm_backward.rs` | New | D.3 | PTX snapshot + fixture bit-equivalence for ternary_gemm_backward |
-| `crates/nsl-codegen/tests/bitnet_absmax_quant_backward.rs` | New | D.4 | PTX snapshot + clipped-STE correctness on saturation fixtures |
+| `crates/nsl-codegen/tests/bitnet_absmax_quant_backward.rs` | New | D.4 | PTX snapshot + vanilla-STE anti-regression (no clip-mask emission) |
 | `crates/nsl-codegen/tests/bitnet_orchestrator_train.rs` | New | D.5 | Wrapper structural test (parallel-stream dispatch, save buffer allocation) |
 | `tests/fixtures/bitnet_backward_single_step/` | New | D.6 | Tier 2 fixture: initial weights, target, expected gradient directions |
 | `crates/nsl-codegen/tests/bitnet_backward_single_step.rs` | New | D.6 | Tier 2 sign-matching test + Tier 2.0 byte-identical preflight |
@@ -189,6 +189,8 @@ gh pr create --base main --title "docs(m35.2a): V-P1-D-prep — pin Linux access
 - Create: `docs/superpowers/specs/2026-05-12-m35-2-ste-baseline-findings.md`
 
 **Spec reference:** §2.6 V-M35.2a-STE. "Verify the b1.58 reference STE choice. Search Microsoft training code → HuggingFace official examples → community reproductions for STE-variant consensus."
+
+**STATUS (as of PR #163, 2026-05-12): COMPLETED — DISCREPANCY found.** V-M35.2a-STE surveyed 3 community b1.58 reproductions (`1bitLLM`, `kyegomez/BitNet`, `AlarioAI/bitnet`) and found unanimous use of **vanilla STE** (identity passthrough via the `x + (quant(x) - x).detach()` trick), NOT clipped STE as the original spec §4.1 assumed. Spec amendment landed in PR #164 (off main): §4 rewritten to commit to vanilla STE; clipped STE deferred to Phase 2.1. The procedural steps A.2.1–A.2.6 below are preserved as historical context — read for the verification methodology, but the actual outcome (DISCREPANCY) has already been folded into spec §4 and Task D.4 of this plan. The procedure's "If PASSED..." branches are unreachable; the "If DISCREPANCY..." branch is what happened.
 
 - [ ] **Step A.2.1: Search for Microsoft's BitNet training code**
 
@@ -698,9 +700,9 @@ Create `crates/nsl-codegen/src/bitnet/phases/ternary_gemm_backward.rs`:
 Create `crates/nsl-codegen/src/bitnet/phases/absmax_quant_backward.rs`:
 
 ```rust
-//! BitNet absmax activation quant backward — INTERNAL phase emitter (clipped STE).
+//! BitNet absmax activation quant backward — INTERNAL phase emitter (vanilla STE per V-M35.2a-STE).
 //!
-//! Spec: docs/superpowers/specs/2026-05-12-m35-2a-bitnet-backward-design.md §4
+//! Spec: docs/superpowers/specs/2026-05-12-m35-2a-bitnet-backward-design.md §4 (amended PR #164)
 //! TODO(M35.2a impl gated on V-P1-D): real emit() lands in Stage D.4.
 ```
 
@@ -1605,21 +1607,21 @@ EOF
 )"
 ```
 
-### Task D.4 / Commit 4 — `absmax_quant_backward.rs` (clipped STE)
+### Task D.4 / Commit 4 — `absmax_quant_backward.rs` (vanilla STE per V-M35.2a-STE)
 
 **Files:**
 - Modify: `crates/nsl-codegen/src/bitnet/phases/absmax_quant_backward.rs` (replace stub with real `emit()`)
 - Create: `crates/nsl-codegen/tests/bitnet_absmax_quant_backward.rs`
 - Create (auto-generated): snapshot file
 
-**Spec reference:** §4.
+**Spec reference:** §4 (amended for vanilla STE per V-M35.2a-STE findings PR #163).
 
-- [ ] **Step D.4.1: Write the snapshot + clipped-STE test (TDD)**
+- [ ] **Step D.4.1: Write the snapshot + vanilla-STE anti-regression test (TDD)**
 
 Create `crates/nsl-codegen/tests/bitnet_absmax_quant_backward.rs`:
 
 ```rust
-//! Tests for absmax_quant_backward (clipped STE) PTX emission.
+//! Tests for absmax_quant_backward (vanilla STE per V-M35.2a-STE) PTX emission.
 
 use nsl_codegen::bitnet::config::BitNetKernelConfig;
 use nsl_codegen::bitnet::phases::absmax_quant_backward;
@@ -1645,17 +1647,16 @@ fn absmax_quant_backward_basic_snapshot() {
 }
 
 #[test]
-fn absmax_quant_backward_emits_clip_check() {
+fn absmax_quant_backward_is_vanilla_identity_pass_through() {
     let config = default_config();
     let mut ptx = String::new();
     absmax_quant_backward::emit(&mut ptx, &config);
-    // Clipped STE checks |x_int8| == 127 to detect saturation.
-    // Implementation: load x_int8, compute abs, compare with 127.
-    assert!(ptx.contains("ld.global.s8"), "must load x_int8 to detect saturation");
-    assert!(ptx.contains("127") || ptx.contains("0x7F") || ptx.contains("0x7f"),
-            "must compare x_int8 against 127 (saturation boundary)");
-    assert!(ptx.contains("selp.f32") || ptx.contains("@%p"),
-            "must conditionally zero dX_final on saturation");
+    // Vanilla STE per V-M35.2a-STE: no clip-mask, no x_int8 load, no conditional.
+    assert!(!ptx.contains("ld.global.s8"),
+            "vanilla STE must NOT load x_int8 (no clip detection); kernel is identity copy");
+    assert!(!ptx.contains("selp.f32"),
+            "vanilla STE must NOT use conditional move; kernel is unconditional identity copy");
+    // Phase 2.1 would re-introduce these if clipped STE is revived.
 }
 
 #[test]
@@ -1681,62 +1682,51 @@ Expected: compilation FAIL (`absmax_quant_backward::emit` doesn't exist).
 Replace `crates/nsl-codegen/src/bitnet/phases/absmax_quant_backward.rs` with:
 
 ```rust
-//! BitNet absmax activation quant backward — INTERNAL phase emitter (clipped STE).
+//! BitNet absmax activation quant backward — INTERNAL phase emitter (vanilla STE).
 //!
 //! Spec: docs/superpowers/specs/2026-05-12-m35-2a-bitnet-backward-design.md §4.
-//!
-//! Computes dX_final = (|x_int8| != 127) ? dX_pre_STE : 0 per-element.
-//! Clipped STE per b1.58 reference (V-M35.2a-STE verified).
+//! Vanilla STE per V-M35.2a-STE findings (PR #163). The kernel is preserved as
+//! a discrete phase (not collapsed into ternary_gemm_backward) to keep
+//! Q1's two-chained-kernel architecture and forward-compat for Phase 2.1
+//! clipped-STE revival.
 
 use crate::bitnet::config::BitNetKernelConfig;
 
-/// Emit absmax_quant_backward PTX (clipped STE applied to dX_pre_STE).
+/// Emit absmax_quant_backward PTX (vanilla STE: identity copy of dX_pre_STE → dX_final).
 ///
 /// Calling convention (per spec §3.6):
 /// - %rd_dx_pre_ste: pointer to dX_pre_STE (FP32, [batch, hidden_dim]).
-/// - %rd_x_int8: pointer to saved x_int8 (i8, [batch, hidden_dim]).
 /// - %rd_dx_final: pointer to output dX_final (FP32, [batch, hidden_dim]).
+///   (x_int8 is saved for backward's dW computation in ternary_gemm_backward but
+///    is NOT consumed by absmax_quant_backward under vanilla STE.)
 pub fn emit(ptx: &mut String, config: &BitNetKernelConfig) {
     let hidden_dim = config.hidden_dim;
 
     ptx.push_str(&format!(
-        "// === BitNet absmax_quant_backward (hidden_dim={hidden_dim}, clipped STE) ===\n"
+        "// === BitNet absmax_quant_backward (hidden_dim={hidden_dim}, vanilla STE) ===\n"
     ));
+    ptx.push_str("// Vanilla STE per V-M35.2a-STE findings; identity copy.\n");
+    ptx.push_str("// Phase 2.1 may revive clipped STE here if M35.2c training shows divergence.\n");
 
-    // Per-thread loop: each thread handles one element.
+    // Per-thread loop: each thread copies one element.
     ptx.push_str("mov.u32 %r_k, %tid.x;\n");
     ptx.push_str("STE_LOOP:\n");
     ptx.push_str("setp.ge.u32 %p_ste_done, %r_k, %r_hidden_dim;\n");
     ptx.push_str("@%p_ste_done bra STE_END;\n");
 
-    // Compute element address offset.
     ptx.push_str("mul.lo.u32 %r_off, %r_row_id, %r_hidden_dim;\n");
     ptx.push_str("add.u32 %r_off, %r_off, %r_k;\n");
-
-    // Load x_int8[row, k] for saturation detection.
-    ptx.push_str("cvt.u64.u32 %rd_x_off, %r_off;\n");
-    ptx.push_str("add.s64 %rd_x_addr, %rd_x_int8, %rd_x_off;\n");
-    ptx.push_str("ld.global.s8 %rs_x_int8, [%rd_x_addr];\n");
-    ptx.push_str("cvt.s32.s8 %r_x_i32, %rs_x_int8;\n");
-
-    // abs(x_int8): negate if negative, identity otherwise.
-    ptx.push_str("abs.s32 %r_x_abs, %r_x_i32;\n");
-
-    // Saturated if abs(x_int8) == 127.
-    ptx.push_str("setp.eq.s32 %p_saturated, %r_x_abs, 127;\n");
+    ptx.push_str("shl.b32 %r_off, %r_off, 2;\n"); // FP32 = 4 bytes
+    ptx.push_str("cvt.u64.u32 %rd_off, %r_off;\n");
 
     // Load dX_pre_STE[row, k].
-    ptx.push_str("shl.b32 %r_dx_off, %r_off, 2;\n"); // FP32 = 4 bytes
-    ptx.push_str("cvt.u64.u32 %rd_dx_off, %r_dx_off;\n");
-    ptx.push_str("add.s64 %rd_dx_pre_addr, %rd_dx_pre_ste, %rd_dx_off;\n");
+    ptx.push_str("add.s64 %rd_dx_pre_addr, %rd_dx_pre_ste, %rd_off;\n");
     ptx.push_str("ld.global.f32 %f_dx_pre, [%rd_dx_pre_addr];\n");
 
-    // dX_final = saturated ? 0.0 : dX_pre_STE (clipped STE).
-    ptx.push_str("selp.f32 %f_dx_final, 0f00000000, %f_dx_pre, %p_saturated;\n");
-
+    // Vanilla STE: dX_final = dX_pre_STE (no clip, no conditional).
     // Store dX_final[row, k].
-    ptx.push_str("add.s64 %rd_dx_final_addr, %rd_dx_final, %rd_dx_off;\n");
-    ptx.push_str("st.global.f32 [%rd_dx_final_addr], %f_dx_final;\n");
+    ptx.push_str("add.s64 %rd_dx_final_addr, %rd_dx_final, %rd_off;\n");
+    ptx.push_str("st.global.f32 [%rd_dx_final_addr], %f_dx_pre;\n");
 
     ptx.push_str("add.u32 %r_k, %r_k, 32;\n"); // warp stride
     ptx.push_str("bra STE_LOOP;\n");
@@ -1755,7 +1745,7 @@ cargo insta accept --package nsl-codegen
 cargo test -p nsl-codegen --test bitnet_absmax_quant_backward 2>&1 | tail -10  # 3 passed
 ```
 
-Expected: snapshot test passes after acceptance; clip-check test passes; ASCII test passes.
+Expected: snapshot test passes after acceptance; vanilla-STE anti-regression test passes (no `ld.global.s8`, no `selp.f32`); ASCII test passes.
 
 - [ ] **Step D.4.5: Commit**
 
@@ -1764,23 +1754,27 @@ git add crates/nsl-codegen/src/bitnet/phases/absmax_quant_backward.rs \
         crates/nsl-codegen/tests/bitnet_absmax_quant_backward.rs \
         crates/nsl-codegen/tests/snapshots/bitnet_absmax_quant_backward__bitnet_ptx__absmax_quant_backward_basic.snap
 git commit -m "$(cat <<'EOF'
-feat(m35.2a): absmax_quant_backward PTX emitter (clipped STE)
+feat(m35.2a): absmax_quant_backward PTX emitter (vanilla STE per V-M35.2a-STE)
 
-Stage D commit 4 of M35.2a's implementation plan (spec §4).
+Stage D commit 4 of M35.2a's implementation plan (spec §4 amended PR #164).
 
-Emits PTX for the activation backward (clipped STE):
-- dX_final = (|x_int8| != 127) ? dX_pre_STE : 0 per element.
-- Saturation detection: load x_int8, compute abs, compare with 127.
-- selp.f32 emits the conditional zero.
+Emits PTX for the activation backward (vanilla STE / identity copy):
+- dX_final = dX_pre_STE per element (no clip, no conditional).
 - Per-thread strided loop over hidden_dim with warp-stride 32.
 
-Clipped STE matches the b1.58 reference's behavior per V-M35.2a-STE
-findings doc (linked in spec §2.6). Vanilla STE rejected per spec §4.2
-calibrated rationale (15-30% training divergence at 1-2 bit per Hubara
-et al. 2017).
+Vanilla STE matches the b1.58 reference's behavior per V-M35.2a-STE
+findings doc (PR #163; spec §2.6 / §4.4). The kernel is preserved as
+a discrete phase (not collapsed into ternary_gemm_backward) to maintain
+Q1's two-chained-kernel architecture and forward-compat for Phase 2.1
+clipped-STE revival.
 
-Tests assert: snapshot stability, presence of clip check (ld.global.s8,
-127, selp.f32 or @%p), ASCII-only PTX literals.
+Phase 2.1 may revive clipped STE here if M35.2c training-loss
+equivalence shows >=10% gradient instability vs FP16 baseline (per
+spec §10.3 deferral).
+
+Tests assert: snapshot stability, anti-regression (no ld.global.s8,
+no selp.f32 — Phase 2.1 would re-introduce these), ASCII-only PTX
+literals.
 
 Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
 EOF
@@ -2173,9 +2167,16 @@ Create `tests/fixtures/bitnet_backward_reference.py`:
 """
 PyTorch reference for M35.2a backward kernel validation.
 
-Spec: docs/superpowers/specs/2026-05-12-m35-2a-bitnet-backward-design.md §5.2.
+Spec: docs/superpowers/specs/2026-05-12-m35-2a-bitnet-backward-design.md §5.2
+(amended for vanilla STE per V-M35.2a-STE findings PR #163).
 
 Uses torch.autograd.Function with explicit forward/backward methods (idiom α).
+Backward uses vanilla STE (identity passthrough), matching the b1.58
+reference's detach-trick convention. The kernel under test
+(absmax_quant_backward) is an identity copy; bf06_saturated_input +
+bf07_partial_saturation serve as anti-regression tests for accidental
+clip-mask emission (Phase 2.1 may revive clipped STE).
+
 Generates 10 backward fixtures: 5 inherited from M35.1 forward + 5 backward-specific.
 
 Run with: `python tests/fixtures/bitnet_backward_reference.py`
@@ -2195,9 +2196,9 @@ class BitLinearSTE(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_output):
         x_int8, x_scale, w_ternary = ctx.saved_tensors
-        clip_mask = (x_int8.abs() != 127).float()
+        # Vanilla STE per V-M35.2a-STE: identity passthrough.
         grad_x_pre_ste = (grad_output @ w_ternary.t().float()) * (x_scale / 127.0)
-        grad_x = grad_x_pre_ste * clip_mask
+        grad_x = grad_x_pre_ste  # No clip mask
         grad_w = x_int8.t().float() @ grad_output
         return grad_x, grad_w, None
 
@@ -2436,9 +2437,16 @@ Items that may be revisited as Phase 2.1 optimizations if profiling justifies:
 - **Epilogue-fused `ternary_gemm_backward_with_ste`** — if dX_pre_STE HBM round-trip
   is a measurable bottleneck (>5% of training-step time at production scale).
   Cost: ~200 LOC + new public emitter. Trade-off: harder reference-impl debugging.
+- **Clipped STE revival** — if M35.2c training-loss equivalence shows >=10% gradient
+  instability vs FP16 baseline (mechanism predicted by Hubara et al. 2017 but not
+  observed in community b1.58 reproductions per V-M35.2a-STE findings). Cost: ~10
+  PTX lines re-introducing the clip-mask conditional in `absmax_quant_backward::emit`
+  + saved-state contract for x_int8 propagation (x_int8 is already saved for
+  `ternary_gemm_backward::dW`; Phase 2.1 adds the second consumer).
 - **Config-driven STE variant** — if production training shows the STE choice matters
-  and clipped STE is unnecessarily conservative for specific configurations.
-  Cost: V-P1-A exception expansion + emitter switch logic.
+  and a per-layer or per-config switch becomes necessary (e.g., one layer benefits
+  from clipped STE while others use vanilla). Cost: V-P1-A exception expansion +
+  emitter switch logic.
 - **Bf16 backward path optimization** — current backward supports bf16 via the
   same code path as F16; a separate Phase 2.1 may optimize bf16-specific backward
   if production workloads warrant.
