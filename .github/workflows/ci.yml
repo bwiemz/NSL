@@ -23,16 +23,15 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
+          # Pin to the same version as rust-toolchain.toml so that clippy is
+          # installed for the exact toolchain the workspace uses. The prior
+          # approach (install stable, then `rustup component add clippy
+          # --toolchain 1.95.0`) fails on macOS runners when the component
+          # manifest doesn't expose a standalone clippy binary for 1.95.0 on
+          # that host triple. Using the `toolchain` input lets dtolnay/rust-
+          # toolchain resolve and install clippy correctly on all platforms.
+          toolchain: 1.95.0
           components: clippy
-
-      # `rust-toolchain.toml` pins 1.95.0, which rustup auto-installs on
-      # first cargo invocation. `dtolnay/rust-toolchain@stable` installs
-      # clippy for `stable`, but the pinned 1.95.0 toolchain ships without
-      # clippy on Windows — so add it explicitly for the pinned toolchain
-      # too. (Linux/macOS happen to pick up clippy from the stable install
-      # via toolchain hash collision, but Windows-msvc does not.)
-      - name: Install clippy for pinned toolchain
-        run: rustup component add clippy --toolchain 1.95.0
 
       - name: Cache cargo
         uses: actions/cache@v4
@@ -90,10 +89,8 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
+          toolchain: 1.95.0
           components: clippy
-
-      - name: Install clippy for pinned toolchain
-        run: rustup component add clippy --toolchain 1.95.0
 
       - name: Cache cargo
         uses: actions/cache@v4
