@@ -37,8 +37,12 @@ struct ProbeRow {
 }
 
 fn build_probe_ptx(static_bytes: u32, sm: u32) -> String {
+    // PTX ISA version must define the target family. sm_120
+    // (Blackwell) was introduced in PTX 8.7 (CUDA 12.8) — the
+    // driver-bundled JIT rejects sm_120 with anything older. 8.7
+    // is backward compatible with sm_80, so we use it unconditionally.
     format!(
-        r#".version 7.0
+        r#".version 8.7
 .target sm_{sm}
 .address_size 64
 
@@ -50,8 +54,11 @@ fn build_probe_ptx(static_bytes: u32, sm: u32) -> String {
     .param .u32 probe_kernel_param_1
 ) {{
     .reg .u64 %out_ptr;
-    .reg .u32 %tid, %n;
-    .reg .u32 %seg_addr, %shmem_addr;
+    // NOTE: avoid the name %tid for a user register; ptxas parses
+    // `%tid.x` as our user %tid followed by a video selector `.x`
+    // and rejects it. Use %t for our local copy.
+    .reg .u32 %t, %n;
+    .reg .u32 %seg_addr;
     .reg .u64 %wide_seg_addr, %wide_shmem_addr;
     .reg .u64 %slot0_ptr, %slot1_ptr;
     .reg .u16 %byte_aa, %byte_bb, %read_a, %read_b;
@@ -59,32 +66,32 @@ fn build_probe_ptx(static_bytes: u32, sm: u32) -> String {
 
     ld.param.u64 %out_ptr, [probe_kernel_param_0];
     ld.param.u32 %n,       [probe_kernel_param_1];
-    mov.u32 %tid, %tid.x;
+    mov.u32 %t, %tid.x;
 
-    setp.ge.u32 %p_oob, %tid, %n;
+    setp.ge.u32 %p_oob, %t, %n;
     @%p_oob bra END;
 
     // Static-shared write at byte offset tid
     mov.u16 %byte_aa, 0xAA;
     cvta.shared.u64 %wide_seg_addr, seg_smem;
-    cvt.u64.u32 %slot0_ptr, %tid;
+    cvt.u64.u32 %slot0_ptr, %t;
     add.u64 %wide_seg_addr, %wide_seg_addr, %slot0_ptr;
-    st.shared.u8 [%wide_seg_addr], %byte_aa;
+    st.u8 [%wide_seg_addr], %byte_aa;
 
     // Dynamic-shared write at byte offset tid
     mov.u16 %byte_bb, 0xBB;
     cvta.shared.u64 %wide_shmem_addr, shmem;
     add.u64 %wide_shmem_addr, %wide_shmem_addr, %slot0_ptr;
-    st.shared.u8 [%wide_shmem_addr], %byte_bb;
+    st.u8 [%wide_shmem_addr], %byte_bb;
 
     bar.sync 0;
 
-    // Read back
-    ld.shared.u8 %read_a, [%wide_seg_addr];
-    ld.shared.u8 %read_b, [%wide_shmem_addr];
+    // Read back via the generic addresses we already produced.
+    ld.u8 %read_a, [%wide_seg_addr];
+    ld.u8 %read_b, [%wide_shmem_addr];
 
     // Write to out[2*tid], out[2*tid+1]
-    mul.lo.u32 %seg_addr, %tid, 2;
+    mul.lo.u32 %seg_addr, %t, 2;
     cvt.u64.u32 %slot0_ptr, %seg_addr;
     add.u64 %slot0_ptr, %out_ptr, %slot0_ptr;
     add.u64 %slot1_ptr, %slot0_ptr, 1;
@@ -159,26 +166,58 @@ fn run_probe_config(static_bytes: u32, dynamic_bytes: u32, sm: u32) -> ProbeRow 
             }
         };
 
+        // Use cuModuleLoadDataEx with CU_JIT_ERROR_LOG_BUFFER so any
+        // JIT failure message is captured instead of being collapsed
+        // to the generic "a PTX JIT compilation failed" string.
         let mut module: sys::CUmodule = std::ptr::null_mut();
-        let mod_rc = sys::cuModuleLoadData(
+        let mut err_log = vec![0u8; 8192];
+        let info_log = vec![0u8; 4096];
+        let mut options: [sys::CUjit_option; 4] = [
+            sys::CUjit_option_enum::CU_JIT_ERROR_LOG_BUFFER,
+            sys::CUjit_option_enum::CU_JIT_ERROR_LOG_BUFFER_SIZE_BYTES,
+            sys::CUjit_option_enum::CU_JIT_INFO_LOG_BUFFER,
+            sys::CUjit_option_enum::CU_JIT_INFO_LOG_BUFFER_SIZE_BYTES,
+        ];
+        let mut option_values: [*mut c_void; 4] = [
+            err_log.as_mut_ptr() as *mut c_void,
+            err_log.len() as *mut c_void,
+            info_log.as_ptr() as *mut c_void,
+            info_log.len() as *mut c_void,
+        ];
+        let mod_rc = sys::cuModuleLoadDataEx(
             &mut module,
             ptx_c.as_ptr() as *const c_void,
+            options.len() as u32,
+            options.as_mut_ptr(),
+            option_values.as_mut_ptr(),
         );
         if mod_rc != sys::CUresult::CUDA_SUCCESS {
+            let log_nul = err_log
+                .iter()
+                .position(|&b| b == 0)
+                .unwrap_or(err_log.len());
+            let log_str = String::from_utf8_lossy(&err_log[..log_nul])
+                .trim()
+                .to_string();
             let mut err_name: *const std::os::raw::c_char = std::ptr::null();
             sys::cuGetErrorString(mod_rc, &mut err_name);
-            let msg = if !err_name.is_null() {
+            let driver_msg = if !err_name.is_null() {
                 std::ffi::CStr::from_ptr(err_name)
                     .to_string_lossy()
                     .to_string()
             } else {
-                format!("cuModuleLoadData failed with rc={:?}", mod_rc)
+                format!("cuModuleLoadDataEx rc={:?}", mod_rc)
+            };
+            let combined = if log_str.is_empty() {
+                driver_msg
+            } else {
+                format!("{driver_msg} | log: {log_str}")
             };
             return ProbeRow {
                 static_bytes,
                 dynamic_bytes,
                 sm,
-                outcome: ProbeOutcome::LaunchError(msg),
+                outcome: ProbeOutcome::LaunchError(combined),
             };
         }
 
@@ -220,6 +259,37 @@ fn run_probe_config(static_bytes: u32, dynamic_bytes: u32, sm: u32) -> ProbeRow 
                 dynamic_bytes,
                 sm,
                 outcome: ProbeOutcome::LaunchError("cuMemsetD8_v2 failed".to_string()),
+            };
+        }
+
+        // Opt in to dynamic shared > 48 KB. Both Ampere and Blackwell
+        // require the kernel to request the larger budget explicitly;
+        // without this the driver rejects launches with "invalid
+        // argument" once shared_mem_bytes crosses 49152.
+        const CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES: sys::CUfunction_attribute =
+            sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES;
+        let attr_rc = sys::cuFuncSetAttribute(
+            func,
+            CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES,
+            dynamic_bytes as i32,
+        );
+        if attr_rc != sys::CUresult::CUDA_SUCCESS {
+            let mut err_name: *const std::os::raw::c_char = std::ptr::null();
+            sys::cuGetErrorString(attr_rc, &mut err_name);
+            let msg = if !err_name.is_null() {
+                std::ffi::CStr::from_ptr(err_name)
+                    .to_string_lossy()
+                    .to_string()
+            } else {
+                format!("cuFuncSetAttribute failed with rc={:?}", attr_rc)
+            };
+            let _ = sys::cuMemFree_v2(out_buf);
+            let _ = sys::cuModuleUnload(module);
+            return ProbeRow {
+                static_bytes,
+                dynamic_bytes,
+                sm,
+                outcome: ProbeOutcome::LaunchError(format!("cuFuncSetAttribute: {}", msg)),
             };
         }
 
