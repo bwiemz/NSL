@@ -54,7 +54,7 @@ fn build_probe_ptx(static_bytes: u32, sm: u32) -> String {
     .reg .u32 %seg_addr, %shmem_addr;
     .reg .u64 %wide_seg_addr, %wide_shmem_addr;
     .reg .u64 %slot0_ptr, %slot1_ptr;
-    .reg .u8 %byte_aa, %byte_bb, %read_a, %read_b;
+    .reg .u16 %byte_aa, %byte_bb, %read_a, %read_b;
     .reg .pred %p_oob;
 
     ld.param.u64 %out_ptr, [probe_kernel_param_0];
@@ -65,14 +65,14 @@ fn build_probe_ptx(static_bytes: u32, sm: u32) -> String {
     @%p_oob bra END;
 
     // Static-shared write at byte offset tid
-    mov.u8 %byte_aa, 0xAA;
+    mov.u16 %byte_aa, 0xAA;
     cvta.shared.u64 %wide_seg_addr, seg_smem;
     cvt.u64.u32 %slot0_ptr, %tid;
     add.u64 %wide_seg_addr, %wide_seg_addr, %slot0_ptr;
     st.shared.u8 [%wide_seg_addr], %byte_aa;
 
     // Dynamic-shared write at byte offset tid
-    mov.u8 %byte_bb, 0xBB;
+    mov.u16 %byte_bb, 0xBB;
     cvta.shared.u64 %wide_shmem_addr, shmem;
     add.u64 %wide_shmem_addr, %wide_shmem_addr, %slot0_ptr;
     st.shared.u8 [%wide_shmem_addr], %byte_bb;
@@ -221,9 +221,11 @@ fn run_probe_config(static_bytes: u32, dynamic_bytes: u32, sm: u32) -> ProbeRow 
         }
 
         // Prepare kernel arguments.
+        let mut out_ptr_arg: u64 = out_buf;
+        let mut n_threads_arg: u32 = num_threads;
         let mut args: [*mut c_void; 2] = [
-            &mut (out_buf as u64) as *mut u64 as *mut c_void,
-            &mut (num_threads as u32) as *mut u32 as *mut c_void,
+            &mut out_ptr_arg as *mut u64 as *mut c_void,
+            &mut n_threads_arg as *mut u32 as *mut c_void,
         ];
 
         // Launch kernel.
