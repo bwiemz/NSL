@@ -62,10 +62,19 @@ fn tiles_per_warp_pv(config: &FlashAttentionConfig) -> u32 {
 /// 3. Softmax row-reductions are placeholder lane-collective shfl ops
 ///    rather than real bfly trees (B1.6 implement spec section 5.3's
 ///    intra-warp reduction pattern).
-/// 4. O_acc register lifetime across kv_iters is asserted-only here;
-///    B1.6 + Task 5.3 orchestrator must ensure the orchestrator declares
-///    `%o_acc_<t>_<lane>` registers at outer-prologue scope so they
-///    persist across the main-loop iteration calling this function.
+/// 4. **All `.reg` declarations inside this file's sub-helpers will collide
+///    if `emit_phase_b_attention` is called more than once on the same PTX
+///    string.** ptxas rejects duplicate `.reg` declarations. The set
+///    includes `%tb1_phase_b_smem_q/k/v`, `%s_acc_<t>_<lane>`,
+///    `%p_packed_<t>`, `%o_acc_<t>_<lane>`, and all `%tb1_qkt_a/b` /
+///    `%tb1_pv_a/b` fragment regs. Until B1.6 hoists these, the Task 5.3
+///    orchestrator MUST call this helper exactly once (single-iteration
+///    scaffold). The multi-`kv_iter` loop the plan template draws is
+///    deferred to B1.6 alongside the register-hoist refactor.
+///
+///    Additionally, O_acc semantically must persist across kv_iters per
+///    spec section 3.1 (register-resident O_acc); the same hoist that
+///    fixes the collision also satisfies the lifetime requirement.
 pub fn emit_phase_b_attention(
     ptx: &mut String,
     config: &FlashAttentionConfig,
@@ -88,6 +97,10 @@ pub fn emit_phase_b_attention(
 /// **B1.6 TODO (deferral #1):** fragment loads use uniform SMEM address;
 /// swap to `matmul_mma::emit_load_a_fragment_smem` (Q) +
 /// `emit_load_b_fragment_smem` (K^T) for real per-thread addressing.
+/// Also requires importing `smem_layout::tier_b1_q_offset` and
+/// `tier_b1_k_offset_{ping,pong}` to compute the per-tile base address
+/// — the placeholder currently uses `mov.u64 ..., 0` which would yield
+/// reads from offset 0 even after the fragment-load swap.
 ///
 /// **B1.6 TODO (deferral #2):** warp-ownership predicate not yet emitted.
 /// All 8 warps execute every MMA; gate each on `setp.eq.u32` + `@%pred`.
@@ -224,7 +237,10 @@ fn emit_online_softmax(ptx: &mut String, config: &FlashAttentionConfig, kv_iter:
 /// kv_iters per spec section 3.1 (register-resident O_acc).
 ///
 /// **B1.6 TODO (deferral #1):** B-fragment load from V SMEM uses uniform
-/// address; swap to `matmul_mma::emit_load_b_fragment_smem`.
+/// address; swap to `matmul_mma::emit_load_b_fragment_smem`. Also
+/// requires `smem_layout::tier_b1_v_offset_{ping,pong}` to compute the
+/// per-tile base address — the placeholder uses `mov.u64 ..., 0` so the
+/// fragment-load swap alone leaves the kernel reading from offset 0.
 ///
 /// **B1.6 TODO (deferral #2):** warp-ownership predicate not yet emitted.
 /// All 8 warps execute every MMA; gate each on `setp.eq.u32` + `@%pred`.
