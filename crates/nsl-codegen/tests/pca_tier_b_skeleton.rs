@@ -14,7 +14,7 @@ fn public_api_signatures_compile() {
     // this file stops compiling.
     let _: fn(u64, u64, u64) -> u64 = compute_range_table_bytes;
     let _: u64 = TIER_B_RANGE_TABLE_BUDGET_BYTES;
-    let _: fn(&mut String, &FlashAttentionConfig, u64, &str) = emit_range_table_preamble;
+    let _: fn(&mut String, &FlashAttentionConfig, u32, &str, u32) = emit_range_table_preamble;
     let _: fn(&mut String, &str, &str, &str) = emit_skip_predicate;
     let _: fn(&mut String, &FlashAttentionConfig, &str, &str, &str, &str) =
         emit_skip_decision_writeback;
