@@ -1,0 +1,6 @@
+---
+source: crates/nsl-codegen/tests/tier_b1_pipeline_helpers_snapshot.rs
+expression: ptx
+---
+    // Phase A: chunk-loop body lives in projection_mma; this helper just synchronizes.
+    bar.sync 0;

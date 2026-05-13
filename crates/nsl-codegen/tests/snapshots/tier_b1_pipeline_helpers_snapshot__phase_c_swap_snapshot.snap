@@ -1,0 +1,17 @@
+---
+source: crates/nsl-codegen/tests/tier_b1_pipeline_helpers_snapshot.rs
+expression: ptx
+---
+    // Phase C: prefetch kv_iter=2 into the slot we just consumed
+    // (conditional on kv_iter + 2 < N_kv; emitted as runtime predicate)
+    setp.lt.u32 %p_prefetch, %r_kv_iter_next, %r_n_kv;
+    @%p_prefetch bra V2_TIER_B1_PHASE_C_DO_PREFETCH;
+    bra V2_TIER_B1_PHASE_C_AFTER_PREFETCH;
+V2_TIER_B1_PHASE_C_DO_PREFETCH:
+    // cp.async issue for slot[curr] (which becomes slot[next] after swap)
+    cp.async.commit_group;
+V2_TIER_B1_PHASE_C_AFTER_PREFETCH:
+    cp.async.wait_group 1;
+    bar.sync 0;
+    // slot swap: toggle slot[curr] in addressing arithmetic
+    xor.b32 %r_slot_curr, %r_slot_curr, 1;
