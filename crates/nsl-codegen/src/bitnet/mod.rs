@@ -12,10 +12,12 @@
 //! - `reference.rs`: CPU reference impl (`#[cfg(test)]`-gated). Added in Task 3.
 //! - `phases/`:
 //!   - `packed_load.rs` — PUBLIC; HBM→SMEM load + on-the-fly unpack.
-//!   - `absmean_quant.rs` — `pub(super)`; activation quant prologue (BitNet b1.58
-//!     uses absmax per-row for activations; file name is historical).
-//!   - `ternary_gemm.rs` — `pub(super)`; GEMM body (input invariant: activations
-//!     must be quantized; enforced by visibility per IR-001).
+//!   - `absmean_quant.rs` — `pub` + `#[doc(hidden)]`; activation quant prologue.
+//!     BitNet b1.58 uses absmax per-row for activations; file name is historical.
+//!     IR-001 invariant is documentation-enforced (not visibility-enforced) since
+//!     integration tests in `tests/` are separate crates and cannot see `pub(super)`.
+//!   - `ternary_gemm.rs` — `pub` + `#[doc(hidden)]`; GEMM body (input invariant:
+//!     activations must be quantized; documentation-enforced per IR-001).
 //!   - `quantized_ternary_gemm.rs` — PUBLIC; fused activation-quant + ternary GEMM.
 //!   - `finalize.rs` — PUBLIC; dequant + epilogue.
 //!
@@ -25,6 +27,11 @@ pub mod config;
 pub mod loader;
 pub mod pack;
 pub mod phases;
+
+// M35.2a training-mode wrapper — gated on V-P1-D pass per BLOCKED_ON_V_P1_D.md.
+// Real implementation lands in M35.2a implementation Stage D.5.
+#[doc(hidden)]
+pub mod orchestrator_train;
 
 pub use config::BitNetKernelConfig;
 

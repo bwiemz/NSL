@@ -60,3 +60,25 @@ step.
 **Anti-pattern this prevents.** Ongoing C++ build dependencies in CI;
 tests that silently drift when upstream pushes updates; "test failed
 because external service changed" failure modes.
+
+---
+
+## IR-003: Separate design-proceeding work from measurement-dependent implementation
+
+**Rule.** Work that can proceed on the platform/state available now should be separated from work that depends on unmeasured criteria. Design proceeds on the platform-independent surface; measurement-dependent implementation waits for the gate.
+
+**Pattern.** Identify the load-bearing measurement (e.g., perplexity gate, hardware-behavior probe, V-P1-D-style escalation criteria). Identify what can be designed without it (architectural decisions, API shape, fixture sets, reference implementations). Ship the design as a permanent artifact; gate the implementation on the measurement.
+
+**Origin.** Introduced in
+`docs/superpowers/specs/2026-05-12-m35-2a-bitnet-backward-design.md` §9.2.
+
+**Examples.**
+
+- **AWQ #142 → #134:** design PR landed before #134 measured calibration-PPL outcomes. Design PR was self-contained; implementation cited design PR by SHA; design remained a permanent artifact regardless of measurement outcome.
+- **M35.2a (origin spec):** ships design-only with `BLOCKED_ON_V_P1_D.md` + CI enforcement. Implementation waits for V-P1-D pass.
+- **CSHA Tier B.1 V1/V2/V3:** verified load-bearing assumptions before kernel implementation began. Caught three substantive spec drifts pre-implementation.
+- **V-M35.2a-STE (PR #163):** pre-implementation verification of the M35.2a STE choice. Surveyed community b1.58 sources and found DISCREPANCY (vanilla STE, not clipped). Caught the assumption error before any backward-kernel code was written.
+
+**Discipline pattern: structural enforcement, not convention.** IR-003 is not satisfied by intent alone — it requires CI checks, BLOCKED_ON files, or other tooling that prevents implementation-creep into design-only PRs. Convention-only enforcement degrades with team turnover.
+
+**Anti-pattern this prevents.** Implementation work accumulates while waiting for measurement, then re-litigates design decisions when measurement results arrive. The institutional cost is wasted implementation effort if measurement fails; the institutional value is design-as-permanent-artifact if measurement succeeds OR fails.

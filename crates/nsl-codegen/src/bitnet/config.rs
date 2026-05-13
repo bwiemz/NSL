@@ -29,6 +29,17 @@ pub struct BitNetKernelConfig {
     /// Enable residual add in the finalize epilogue.
     /// Phase 1 default: false.
     pub fused_residual_add: bool,
+    /// Output rows per CTA tile in backward kernels.
+    /// Independent of forward `block_m`; backward typically uses smaller tiles
+    /// because dW accumulator (FP32, block_k_bwd × block_n_bwd × 4 bytes) competes
+    /// with X/W SMEM regions. See M35.2a spec §3.3 + §9.1 (V-P1-A exception #1).
+    pub block_m_backward: u32,
+    /// Output cols per CTA tile in backward kernels.
+    /// Independent of forward `block_n`. See M35.2a spec §3.3.
+    pub block_n_backward: u32,
+    /// Reduction dim per inner tile step in backward kernels.
+    /// Independent of forward `block_k`. See M35.2a spec §3.3.
+    pub block_k_backward: u32,
 }
 
 impl BitNetKernelConfig {
@@ -53,6 +64,26 @@ impl BitNetKernelConfig {
             if self.fused_rmsnorm { "_rmsfold" } else { "" },
             if self.fused_bias_add { "_bias" } else { "" },
             if self.fused_residual_add { "_res" } else { "" },
+        )
+    }
+
+    /// Returns the backward kernel symbol name encoding backward-specific tile knobs.
+    /// Used for PTX kernel naming + dispatch table lookup by M35.2a backward emitters
+    /// (Stage D of the M35.2a implementation plan).
+    pub fn backward_kernel_name(&self) -> String {
+        format!(
+            "nsl_bitnet_b158_ternary_gemm_backward_m{}_n{}_k{}_{}",
+            self.block_m_backward,
+            self.block_n_backward,
+            self.block_k_backward,
+            match &self.activation_dtype {
+                KirType::F16 => "f16",
+                KirType::Bf16 => "bf16",
+                other => panic!(
+                    "BitNetKernelConfig::backward_kernel_name: activation_dtype must be F16 or Bf16, got {:?}",
+                    other
+                ),
+            },
         )
     }
 }
