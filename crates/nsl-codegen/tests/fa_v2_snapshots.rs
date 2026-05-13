@@ -26,14 +26,14 @@ fn non_csha_canonical() -> FlashAttentionConfig {
 #[test]
 fn phase_prelude__32x32x32_snapshot() {
     let mut ptx = String::new();
-    prelude::emit(&mut ptx, &csha_canonical());
+    prelude::emit(&mut ptx, &csha_canonical(), None);
     insta::assert_snapshot!("phase_prelude__32x32x32", ptx);
 }
 
 #[test]
 fn phase_prelude__64x64x128_snapshot() {
     let mut ptx = String::new();
-    prelude::emit(&mut ptx, &non_csha_canonical());
+    prelude::emit(&mut ptx, &non_csha_canonical(), None);
     insta::assert_snapshot!("phase_prelude__64x64x128", ptx);
 }
 
