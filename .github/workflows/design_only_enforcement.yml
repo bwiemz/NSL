@@ -1,0 +1,65 @@
+name: M35.2 design-only enforcement
+
+on:
+  pull_request:
+    paths:
+      - 'crates/nsl-codegen/src/bitnet/phases/**'
+      - 'crates/nsl-codegen/src/bitnet/orchestrator_train.rs'
+      - 'BLOCKED_ON_V_P1_D.md'
+      - '.github/workflows/design_only_enforcement.yml'
+
+jobs:
+  reject-impl-while-blocked:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check BLOCKED_ON_V_P1_D.md exists
+        id: blocked
+        run: |
+          if [[ -f BLOCKED_ON_V_P1_D.md ]]; then
+            echo "blocked=true" >> "$GITHUB_OUTPUT"
+            echo "Gate file present; design-only enforcement is active."
+          else
+            echo "blocked=false" >> "$GITHUB_OUTPUT"
+            echo "Gate file absent; V-P1-D has passed and implementation is permitted."
+          fi
+
+      - name: Reject non-stub backward emitter content
+        if: steps.blocked.outputs.blocked == 'true'
+        run: |
+          set -e
+          fail=0
+          # Glob-find pattern matches BLOCKED_ON_V_P1_D.md's documented contract:
+          # *backward*.rs / *shadow*.rs under bitnet/phases/ + orchestrator_train.rs.
+          # Future Stage D sub-specs may add files like ternary_gemm_backward_chunked.rs;
+          # the find pattern captures them automatically without workflow edits.
+          backward_files=$(find crates/nsl-codegen/src/bitnet/phases \
+                              \( -name '*backward*.rs' -o -name '*shadow*.rs' \) 2>/dev/null || true)
+          for f in $backward_files crates/nsl-codegen/src/bitnet/orchestrator_train.rs; do
+            if [[ -f "$f" ]]; then
+              # Count non-comment, non-blank lines.
+              # Comments include lines starting with //, //!, or whitespace+//
+              lines=$(grep -v -E '^\s*(//|$)' "$f" | wc -l | tr -d ' ')
+              if [[ "$lines" -gt 5 ]]; then
+                echo "FAIL: $f has $lines non-comment non-blank lines while BLOCKED_ON_V_P1_D.md exists at repo root."
+                echo "      The design-only gate (M35.2a spec §9.3) forbids non-stub implementation in this file until V-P1-D passes."
+                echo "      To unblock: land the V-P1-D measurement PR (which records the result in BLOCKED_ON_V_P1_D.md), then the M35.2a implementation PR's commit 1 deletes the gate file."
+                fail=1
+              else
+                echo "OK: $f has $lines non-comment non-blank lines (<=5; stub-only)."
+              fi
+            else
+              echo "OK: $f does not exist (acceptable; this file lands in Stage B.5 of the M35.2a plan as a stub)."
+            fi
+          done
+          if [[ "$fail" -eq 1 ]]; then
+            exit 1
+          fi
+          echo "PASS: all backward emitter files are stub-only while V-P1-D is unmeasured."
+
+      - name: Confirm gate-removal is allowed (when blocked=false)
+        if: steps.blocked.outputs.blocked == 'false'
+        run: |
+          echo "BLOCKED_ON_V_P1_D.md absent — V-P1-D has been measured PASS or the gate has been retired."
+          echo "Design-only enforcement is no longer active for this PR."

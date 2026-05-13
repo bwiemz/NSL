@@ -268,16 +268,24 @@ fn link_gcc_multi(
     }
 
     // macOS: inject platform version since Cranelift object files lack
-    // LC_BUILD_VERSION. Pin to 15.0 because the `native-tls` landing
-    // brought in `ring`, whose object files on the runners target the
-    // native SDK (currently 15.5). ld rejects linking objects with a
-    // higher minos than the pinned platform version (manifests as
-    // "Found illegal text-relocations" on arm64, where text-relocs are
-    // banned under PIE and `-read_only_relocs,suppress` has no effect).
-    // Both `macos-14` (Sonoma) and `macos-latest` (Sequoia 15+) runners
-    // ship the macOS 15 SDK.
+    // LC_BUILD_VERSION. Without this flag, ld on arm64 treats unversioned
+    // objects as old-style (potentially bearing text-relocations) and rejects
+    // them under PIE ("Found illegal text-relocations"; -read_only_relocs,suppress
+    // has no effect on modern macOS). The platform_version must be >= the SDK
+    // version that ring/native-tls objects were compiled against (the runner's
+    // native Xcode SDK), which has changed across runner image refreshes
+    // (11.0 → 14.0 → 15.0 in prior fixes). We now detect the SDK version
+    // dynamically via `xcrun --show-sdk-version` so no manual bump is needed
+    // when Apple ships a new SDK on the CI runners.
     if cfg!(target_os = "macos") {
-        cmd.args(["-Wl,-platform_version,macos,15.0,15.0"]);
+        let sdk_ver = std::process::Command::new("xcrun")
+            .args(["--show-sdk-version"])
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|| "15.5".to_string());
+        cmd.args([format!("-Wl,-platform_version,macos,{sdk_ver},{sdk_ver}")]);
         // `native-tls` uses the Security framework on macOS (via the
         // `security-framework` crate); the symbols end up in
         // `libnsl_runtime.a` but Cargo's link directives don't reach this
@@ -728,10 +736,18 @@ fn link_shared_gcc(
         }
     }
 
-    // macOS: inject platform version — see `link_gcc_multi` above for why
-    // the target is 15.0 (matches `ring`'s SDK target on current runners).
+    // macOS: inject platform version — see `link_gcc_multi` above for why.
+    // SDK version is detected dynamically so runner image refreshes don't
+    // require manual bumps to this file.
     if cfg!(target_os = "macos") {
-        cmd.args(["-Wl,-platform_version,macos,15.0,15.0"]);
+        let sdk_ver = std::process::Command::new("xcrun")
+            .args(["--show-sdk-version"])
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|| "15.5".to_string());
+        cmd.args([format!("-Wl,-platform_version,macos,{sdk_ver},{sdk_ver}")]);
         // native-tls → security-framework (see `link_gcc_multi` comment).
         cmd.args([
             "-framework", "Security",

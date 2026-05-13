@@ -66,8 +66,27 @@ pub fn lower_kir_to_ptx(ir: &KernelIR) -> Vec<u8> {
         .flat_map(extract_var_ids)
         .max()
         .unwrap_or(0);
+    // GlobalId emits synthetic u32 temps at dst+1000 and dst+1001 to avoid
+    // collision with normal VarIds (see emit_op GlobalId arm). Those indices
+    // are not returned by extract_var_ids, so they are invisible to the
+    // max_var scan above. Without an explicit floor the .reg .u32 %r<N>
+    // declaration is too small and ptxas rejects the output.
+    let global_id_reg_floor: u32 = ir
+        .blocks
+        .iter()
+        .flat_map(|b| b.ops.iter())
+        .filter_map(|op| {
+            if let KirOp::GlobalId(d, _) = op {
+                Some(d + 1002) // highest temp index is d+1001; need count d+1002
+            } else {
+                None
+            }
+        })
+        .max()
+        .unwrap_or(0);
     // Ensure we have enough registers for all variables
     let total_vars = std::cmp::max(max_var + 1, ir.params.len() as u32 + count_body_vars(ir));
+    let total_vars = std::cmp::max(total_vars, global_id_reg_floor);
     // Declare enough registers of each type
     let r_count = std::cmp::max(*reg_counts.get("%r").unwrap_or(&0), total_vars);
     let rd_count = std::cmp::max(*reg_counts.get("%rd").unwrap_or(&0), total_vars);
@@ -707,5 +726,41 @@ mod tests {
         let ptx = String::from_utf8_lossy(&ptx_bytes[..ptx_bytes.len() - 1]);
 
         assert!(ptx.contains("bar.sync 0;"));
+    }
+
+    /// GlobalId emits synthetic u32 temporaries at dst+1000 and dst+1001
+    /// (to avoid collision with normal VarIds).  These indices are NOT
+    /// returned by `extract_var_ids`, so without an explicit fix the
+    /// `.reg .u32 %r<N>` declaration is too small and ptxas rejects the PTX
+    /// with an "undeclared register" error at `cuModuleLoadData` time.
+    #[test]
+    fn test_ptx_global_id_register_count_covers_synthetic_temps() {
+        let mut b = KirBuilder::new("test_global_id_regs");
+        let entry = b.new_block();
+        b.set_block(entry);
+        // First new_var() → VarId 0; synthetic temps land at %r1000 and %r1001.
+        let tid = b.new_var();
+        b.emit(KirOp::GlobalId(tid, 0));
+        b.terminate(KirTerminator::Return);
+        let ir = b.finalize();
+
+        let ptx_bytes = lower_kir_to_ptx(&ir);
+        let ptx = String::from_utf8_lossy(&ptx_bytes[..ptx_bytes.len() - 1]);
+
+        let decl_count: u32 = ptx
+            .lines()
+            .find(|l| l.trim_start().starts_with(".reg .u32 %r<"))
+            .and_then(|l| {
+                let after = l.trim_start().strip_prefix(".reg .u32 %r<")?;
+                after.split('>').next()?.trim().parse().ok()
+            })
+            .expect(".reg .u32 %r<N> declaration must be present");
+
+        assert!(
+            decl_count >= 1002,
+            "GlobalId(dst=0) uses synthetic temps %r1000 and %r1001; \
+             .reg .u32 %r<N> must declare N >= 1002, got {}",
+            decl_count
+        );
     }
 }
