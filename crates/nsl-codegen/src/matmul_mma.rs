@@ -38,7 +38,39 @@ pub fn emit_mma_instruction(
     b_regs: &[String; 2],
     c_regs: &[String; 4],
 ) {
-    ptx.push_str("    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32\n");
+    emit_mma_instruction_impl(ptx, d_regs, a_regs, b_regs, c_regs, None);
+}
+
+/// Predicated variant — emits `@%<pred> mma.sync...` prefix so callers
+/// can gate the instruction on a runtime predicate (e.g., warp-ownership
+/// for CSHA Tier B.1). `pred` is the predicate-register name WITHOUT the
+/// leading `%` (the emitter adds it).
+pub fn emit_mma_instruction_predicated(
+    ptx: &mut String,
+    d_regs: &[String; 4],
+    a_regs: &[String; 4],
+    b_regs: &[String; 2],
+    c_regs: &[String; 4],
+    pred: &str,
+) {
+    emit_mma_instruction_impl(ptx, d_regs, a_regs, b_regs, c_regs, Some(pred));
+}
+
+fn emit_mma_instruction_impl(
+    ptx: &mut String,
+    d_regs: &[String; 4],
+    a_regs: &[String; 4],
+    b_regs: &[String; 2],
+    c_regs: &[String; 4],
+    pred: Option<&str>,
+) {
+    match pred {
+        Some(p) => ptx.push_str(&format!(
+            "    @%{} mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32\n",
+            p
+        )),
+        None => ptx.push_str("    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32\n"),
+    }
     ptx.push_str(&format!(
         "        {{{}, {}, {}, {}}},\n",
         d_regs[0], d_regs[1], d_regs[2], d_regs[3]

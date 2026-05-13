@@ -46,7 +46,7 @@ use crate::flash_attention_v2::smem_layout::{
     tier_b1_k_offset_ping, tier_b1_k_offset_pong, tier_b1_q_offset, tier_b1_v_offset_ping,
     tier_b1_v_offset_pong, tier_b1_w_chunk_offset,
 };
-use crate::matmul_mma::emit_mma_instruction;
+use crate::matmul_mma::emit_mma_instruction_predicated;
 
 /// Number of (m16, n8) MMA tiles each of the 8 warps owns for the Q
 /// projection output (bq × hd). Always at least 1 — small configs
@@ -313,16 +313,13 @@ pub fn emit_q_projection(ptx: &mut String, config: &FlashAttentionConfig, chunk:
                 format!("%tb1_q_b_{}_{}_1", chunk_idx, t),
             ];
             let c_regs = d_regs.clone();
-            // B1.4 TODO (deferral #2): gate this MMA on the warp-ownership
-            // predicate (`setp.eq.u32 %wo_pred, %warp_id, (t %% 8); @%wo_pred mma.sync ...`).
-            // Currently every one of the 8 warps executes every MMA tile; the
-            // accumulator end-state is therefore 8x the intended sum. ptxas
-            // accepts the instruction; the gate is what makes the numerics right.
+            // B1.6 deferral #2 resolution: warp-ownership gate. Only the
+            // warp owning output tile `t` writes the MMA.
             ptx.push_str(&format!(
-                "    // MMA tile t={} -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)\n",
-                t
+                "    setp.eq.u32 %wo_pred, %warp_id, {}; // Q-proj tile t={} ownership\n",
+                t % 8, t
             ));
-            emit_mma_instruction(ptx, &d_regs, &a_regs, &b_regs, &c_regs);
+            emit_mma_instruction_predicated(ptx, &d_regs, &a_regs, &b_regs, &c_regs, "wo_pred");
         }
     }
 
@@ -692,18 +689,12 @@ pub fn emit_kv_projection_chunk_loop(
                 format!("%tb1_kv_bk_{}_{}_1", chunk_idx, t),
             ];
             let k_c_regs = k_d_regs.clone();
-            // B1.6 TODO (deferral #2): gate this MMA on the warp-ownership
-            // predicate (`setp.eq.u32 %wo_pred, %warp_id, (t %% 8);
-            // @%wo_pred mma.sync ...`). Currently every one of the 8 warps
-            // executes every MMA tile; the accumulator end-state is therefore
-            // 8x the intended sum. ptxas accepts the instruction; the gate is
-            // what makes the numerics right. See matching marker in
-            // emit_q_projection (B1.4 deferral #2).
+            // B1.6 deferral #2 resolution: warp-ownership gate (K MMA).
             ptx.push_str(&format!(
-                "    // K MMA tile t={} -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.6)\n",
-                t
+                "    setp.eq.u32 %wo_pred, %warp_id, {}; // K-proj tile t={} ownership\n",
+                t % 8, t
             ));
-            emit_mma_instruction(ptx, &k_d_regs, &a_regs, &bk_regs, &k_c_regs);
+            emit_mma_instruction_predicated(ptx, &k_d_regs, &a_regs, &bk_regs, &k_c_regs, "wo_pred");
 
             // --- MMA (b): V accumulation ---
             let v_d_regs = [
@@ -717,13 +708,9 @@ pub fn emit_kv_projection_chunk_loop(
                 format!("%tb1_kv_bv_{}_{}_1", chunk_idx, t),
             ];
             let v_c_regs = v_d_regs.clone();
-            // B1.6 TODO (deferral #2): same warp-ownership gate needed for V MMA.
-            // See matching marker above and in emit_q_projection (B1.4 deferral #2).
-            ptx.push_str(&format!(
-                "    // V MMA tile t={} -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.6)\n",
-                t
-            ));
-            emit_mma_instruction(ptx, &v_d_regs, &a_regs, &bv_regs, &v_c_regs);
+            // B1.6 deferral #2 resolution: warp-ownership gate (V MMA).
+            // Same predicate value as K — both MMAs share the t % 8 ownership.
+            emit_mma_instruction_predicated(ptx, &v_d_regs, &a_regs, &bv_regs, &v_c_regs, "wo_pred");
         }
     }
 

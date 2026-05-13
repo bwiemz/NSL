@@ -17,7 +17,7 @@
 //! for the specific B1.6 swap targets.
 
 use crate::flash_attention::FlashAttentionConfig;
-use crate::matmul_mma::emit_mma_instruction;
+use crate::matmul_mma::emit_mma_instruction_predicated;
 
 /// Number of (m16, n8) MMA tiles each of the 8 warps owns for the QK^T
 /// output (bq x bkv). Always at least 1.
@@ -163,15 +163,14 @@ fn emit_qkt_mma(ptx: &mut String, config: &FlashAttentionConfig, slot: u32) {
             format!("%tb1_qkt_b_{}_1", t),
         ];
         let c_regs = d_regs.clone();
-        // B1.6 TODO (deferral #2): gate this MMA on the warp-ownership
-        // predicate (setp.eq.u32 %wo_pred, %warp_id, (t %% 8); @%wo_pred mma.sync ...).
-        // Currently every one of the 8 warps executes every MMA tile; the
-        // accumulator end-state is therefore 8x the intended sum.
+        // B1.6 deferral #2 resolution: warp-ownership gate. Only the warp
+        // owning tile `t` executes its MMA; the predicate `%wo_pred` is
+        // set per-tile and the MMA is prefixed with `@%wo_pred`.
         ptx.push_str(&format!(
-            "    // QK^T MMA tile t={} -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.6)\n",
-            t
+            "    setp.eq.u32 %wo_pred, %warp_id, {}; // QK^T tile t={} ownership\n",
+            t % 8, t
         ));
-        emit_mma_instruction(ptx, &d_regs, &a_regs, &b_regs, &c_regs);
+        emit_mma_instruction_predicated(ptx, &d_regs, &a_regs, &b_regs, &c_regs, "wo_pred");
     }
 
     // B1.6 deferral #5 resolution: scale S accumulators by 1/sqrt(head_dim).
@@ -308,15 +307,12 @@ fn emit_pv_mma(ptx: &mut String, config: &FlashAttentionConfig, slot: u32) {
             format!("%tb1_pv_b_{}_1", t),
         ];
         let c_regs = d_regs.clone();
-        // B1.6 TODO (deferral #2): gate this MMA on the warp-ownership
-        // predicate (setp.eq.u32 %wo_pred, %warp_id, (t %% 8); @%wo_pred mma.sync ...).
-        // Currently every one of the 8 warps executes every MMA tile; the
-        // accumulator end-state is therefore 8x the intended sum.
+        // B1.6 deferral #2 resolution: warp-ownership gate on PV MMA.
         ptx.push_str(&format!(
-            "    // PV MMA tile t={} -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.6)\n",
-            t
+            "    setp.eq.u32 %wo_pred, %warp_id, {}; // PV tile t={} ownership\n",
+            t % 8, t
         ));
-        emit_mma_instruction(ptx, &d_regs, &a_regs, &b_regs, &c_regs);
+        emit_mma_instruction_predicated(ptx, &d_regs, &a_regs, &b_regs, &c_regs, "wo_pred");
     }
 }
 

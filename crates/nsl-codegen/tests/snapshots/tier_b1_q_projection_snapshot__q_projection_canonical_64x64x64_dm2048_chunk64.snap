@@ -34,8 +34,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_0_0_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_0_0_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_0_0_1, [%tb1_q_smem_w];
-    // MMA tile t=0 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 0; // Q-proj tile t=0 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_0_0, %q_acc_0_1, %q_acc_0_2, %q_acc_0_3},
         {%tb1_q_a_0_0_0, %tb1_q_a_0_0_1, %tb1_q_a_0_0_2, %tb1_q_a_0_0_3},
         {%tb1_q_b_0_0_0, %tb1_q_b_0_0_1},
@@ -48,8 +48,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_0_1_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_0_1_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_0_1_1, [%tb1_q_smem_w];
-    // MMA tile t=1 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 1; // Q-proj tile t=1 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_1_0, %q_acc_1_1, %q_acc_1_2, %q_acc_1_3},
         {%tb1_q_a_0_1_0, %tb1_q_a_0_1_1, %tb1_q_a_0_1_2, %tb1_q_a_0_1_3},
         {%tb1_q_b_0_1_0, %tb1_q_b_0_1_1},
@@ -62,8 +62,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_0_2_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_0_2_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_0_2_1, [%tb1_q_smem_w];
-    // MMA tile t=2 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 2; // Q-proj tile t=2 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_2_0, %q_acc_2_1, %q_acc_2_2, %q_acc_2_3},
         {%tb1_q_a_0_2_0, %tb1_q_a_0_2_1, %tb1_q_a_0_2_2, %tb1_q_a_0_2_3},
         {%tb1_q_b_0_2_0, %tb1_q_b_0_2_1},
@@ -76,8 +76,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_0_3_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_0_3_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_0_3_1, [%tb1_q_smem_w];
-    // MMA tile t=3 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 3; // Q-proj tile t=3 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_3_0, %q_acc_3_1, %q_acc_3_2, %q_acc_3_3},
         {%tb1_q_a_0_3_0, %tb1_q_a_0_3_1, %tb1_q_a_0_3_2, %tb1_q_a_0_3_3},
         {%tb1_q_b_0_3_0, %tb1_q_b_0_3_1},
@@ -98,8 +98,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_1_0_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_1_0_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_1_0_1, [%tb1_q_smem_w];
-    // MMA tile t=0 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 0; // Q-proj tile t=0 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_0_0, %q_acc_0_1, %q_acc_0_2, %q_acc_0_3},
         {%tb1_q_a_1_0_0, %tb1_q_a_1_0_1, %tb1_q_a_1_0_2, %tb1_q_a_1_0_3},
         {%tb1_q_b_1_0_0, %tb1_q_b_1_0_1},
@@ -112,8 +112,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_1_1_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_1_1_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_1_1_1, [%tb1_q_smem_w];
-    // MMA tile t=1 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 1; // Q-proj tile t=1 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_1_0, %q_acc_1_1, %q_acc_1_2, %q_acc_1_3},
         {%tb1_q_a_1_1_0, %tb1_q_a_1_1_1, %tb1_q_a_1_1_2, %tb1_q_a_1_1_3},
         {%tb1_q_b_1_1_0, %tb1_q_b_1_1_1},
@@ -126,8 +126,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_1_2_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_1_2_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_1_2_1, [%tb1_q_smem_w];
-    // MMA tile t=2 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 2; // Q-proj tile t=2 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_2_0, %q_acc_2_1, %q_acc_2_2, %q_acc_2_3},
         {%tb1_q_a_1_2_0, %tb1_q_a_1_2_1, %tb1_q_a_1_2_2, %tb1_q_a_1_2_3},
         {%tb1_q_b_1_2_0, %tb1_q_b_1_2_1},
@@ -140,8 +140,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_1_3_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_1_3_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_1_3_1, [%tb1_q_smem_w];
-    // MMA tile t=3 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 3; // Q-proj tile t=3 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_3_0, %q_acc_3_1, %q_acc_3_2, %q_acc_3_3},
         {%tb1_q_a_1_3_0, %tb1_q_a_1_3_1, %tb1_q_a_1_3_2, %tb1_q_a_1_3_3},
         {%tb1_q_b_1_3_0, %tb1_q_b_1_3_1},
@@ -162,8 +162,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_2_0_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_2_0_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_2_0_1, [%tb1_q_smem_w];
-    // MMA tile t=0 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 0; // Q-proj tile t=0 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_0_0, %q_acc_0_1, %q_acc_0_2, %q_acc_0_3},
         {%tb1_q_a_2_0_0, %tb1_q_a_2_0_1, %tb1_q_a_2_0_2, %tb1_q_a_2_0_3},
         {%tb1_q_b_2_0_0, %tb1_q_b_2_0_1},
@@ -176,8 +176,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_2_1_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_2_1_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_2_1_1, [%tb1_q_smem_w];
-    // MMA tile t=1 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 1; // Q-proj tile t=1 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_1_0, %q_acc_1_1, %q_acc_1_2, %q_acc_1_3},
         {%tb1_q_a_2_1_0, %tb1_q_a_2_1_1, %tb1_q_a_2_1_2, %tb1_q_a_2_1_3},
         {%tb1_q_b_2_1_0, %tb1_q_b_2_1_1},
@@ -190,8 +190,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_2_2_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_2_2_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_2_2_1, [%tb1_q_smem_w];
-    // MMA tile t=2 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 2; // Q-proj tile t=2 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_2_0, %q_acc_2_1, %q_acc_2_2, %q_acc_2_3},
         {%tb1_q_a_2_2_0, %tb1_q_a_2_2_1, %tb1_q_a_2_2_2, %tb1_q_a_2_2_3},
         {%tb1_q_b_2_2_0, %tb1_q_b_2_2_1},
@@ -204,8 +204,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_2_3_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_2_3_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_2_3_1, [%tb1_q_smem_w];
-    // MMA tile t=3 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 3; // Q-proj tile t=3 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_3_0, %q_acc_3_1, %q_acc_3_2, %q_acc_3_3},
         {%tb1_q_a_2_3_0, %tb1_q_a_2_3_1, %tb1_q_a_2_3_2, %tb1_q_a_2_3_3},
         {%tb1_q_b_2_3_0, %tb1_q_b_2_3_1},
@@ -226,8 +226,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_3_0_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_3_0_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_3_0_1, [%tb1_q_smem_w];
-    // MMA tile t=0 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 0; // Q-proj tile t=0 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_0_0, %q_acc_0_1, %q_acc_0_2, %q_acc_0_3},
         {%tb1_q_a_3_0_0, %tb1_q_a_3_0_1, %tb1_q_a_3_0_2, %tb1_q_a_3_0_3},
         {%tb1_q_b_3_0_0, %tb1_q_b_3_0_1},
@@ -240,8 +240,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_3_1_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_3_1_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_3_1_1, [%tb1_q_smem_w];
-    // MMA tile t=1 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 1; // Q-proj tile t=1 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_1_0, %q_acc_1_1, %q_acc_1_2, %q_acc_1_3},
         {%tb1_q_a_3_1_0, %tb1_q_a_3_1_1, %tb1_q_a_3_1_2, %tb1_q_a_3_1_3},
         {%tb1_q_b_3_1_0, %tb1_q_b_3_1_1},
@@ -254,8 +254,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_3_2_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_3_2_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_3_2_1, [%tb1_q_smem_w];
-    // MMA tile t=2 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 2; // Q-proj tile t=2 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_2_0, %q_acc_2_1, %q_acc_2_2, %q_acc_2_3},
         {%tb1_q_a_3_2_0, %tb1_q_a_3_2_1, %tb1_q_a_3_2_2, %tb1_q_a_3_2_3},
         {%tb1_q_b_3_2_0, %tb1_q_b_3_2_1},
@@ -268,8 +268,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_3_3_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_3_3_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_3_3_1, [%tb1_q_smem_w];
-    // MMA tile t=3 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 3; // Q-proj tile t=3 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_3_0, %q_acc_3_1, %q_acc_3_2, %q_acc_3_3},
         {%tb1_q_a_3_3_0, %tb1_q_a_3_3_1, %tb1_q_a_3_3_2, %tb1_q_a_3_3_3},
         {%tb1_q_b_3_3_0, %tb1_q_b_3_3_1},
@@ -290,8 +290,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_4_0_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_4_0_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_4_0_1, [%tb1_q_smem_w];
-    // MMA tile t=0 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 0; // Q-proj tile t=0 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_0_0, %q_acc_0_1, %q_acc_0_2, %q_acc_0_3},
         {%tb1_q_a_4_0_0, %tb1_q_a_4_0_1, %tb1_q_a_4_0_2, %tb1_q_a_4_0_3},
         {%tb1_q_b_4_0_0, %tb1_q_b_4_0_1},
@@ -304,8 +304,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_4_1_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_4_1_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_4_1_1, [%tb1_q_smem_w];
-    // MMA tile t=1 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 1; // Q-proj tile t=1 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_1_0, %q_acc_1_1, %q_acc_1_2, %q_acc_1_3},
         {%tb1_q_a_4_1_0, %tb1_q_a_4_1_1, %tb1_q_a_4_1_2, %tb1_q_a_4_1_3},
         {%tb1_q_b_4_1_0, %tb1_q_b_4_1_1},
@@ -318,8 +318,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_4_2_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_4_2_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_4_2_1, [%tb1_q_smem_w];
-    // MMA tile t=2 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 2; // Q-proj tile t=2 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_2_0, %q_acc_2_1, %q_acc_2_2, %q_acc_2_3},
         {%tb1_q_a_4_2_0, %tb1_q_a_4_2_1, %tb1_q_a_4_2_2, %tb1_q_a_4_2_3},
         {%tb1_q_b_4_2_0, %tb1_q_b_4_2_1},
@@ -332,8 +332,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_4_3_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_4_3_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_4_3_1, [%tb1_q_smem_w];
-    // MMA tile t=3 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 3; // Q-proj tile t=3 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_3_0, %q_acc_3_1, %q_acc_3_2, %q_acc_3_3},
         {%tb1_q_a_4_3_0, %tb1_q_a_4_3_1, %tb1_q_a_4_3_2, %tb1_q_a_4_3_3},
         {%tb1_q_b_4_3_0, %tb1_q_b_4_3_1},
@@ -354,8 +354,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_5_0_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_5_0_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_5_0_1, [%tb1_q_smem_w];
-    // MMA tile t=0 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 0; // Q-proj tile t=0 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_0_0, %q_acc_0_1, %q_acc_0_2, %q_acc_0_3},
         {%tb1_q_a_5_0_0, %tb1_q_a_5_0_1, %tb1_q_a_5_0_2, %tb1_q_a_5_0_3},
         {%tb1_q_b_5_0_0, %tb1_q_b_5_0_1},
@@ -368,8 +368,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_5_1_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_5_1_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_5_1_1, [%tb1_q_smem_w];
-    // MMA tile t=1 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 1; // Q-proj tile t=1 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_1_0, %q_acc_1_1, %q_acc_1_2, %q_acc_1_3},
         {%tb1_q_a_5_1_0, %tb1_q_a_5_1_1, %tb1_q_a_5_1_2, %tb1_q_a_5_1_3},
         {%tb1_q_b_5_1_0, %tb1_q_b_5_1_1},
@@ -382,8 +382,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_5_2_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_5_2_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_5_2_1, [%tb1_q_smem_w];
-    // MMA tile t=2 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 2; // Q-proj tile t=2 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_2_0, %q_acc_2_1, %q_acc_2_2, %q_acc_2_3},
         {%tb1_q_a_5_2_0, %tb1_q_a_5_2_1, %tb1_q_a_5_2_2, %tb1_q_a_5_2_3},
         {%tb1_q_b_5_2_0, %tb1_q_b_5_2_1},
@@ -396,8 +396,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_5_3_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_5_3_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_5_3_1, [%tb1_q_smem_w];
-    // MMA tile t=3 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 3; // Q-proj tile t=3 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_3_0, %q_acc_3_1, %q_acc_3_2, %q_acc_3_3},
         {%tb1_q_a_5_3_0, %tb1_q_a_5_3_1, %tb1_q_a_5_3_2, %tb1_q_a_5_3_3},
         {%tb1_q_b_5_3_0, %tb1_q_b_5_3_1},
@@ -418,8 +418,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_6_0_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_6_0_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_6_0_1, [%tb1_q_smem_w];
-    // MMA tile t=0 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 0; // Q-proj tile t=0 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_0_0, %q_acc_0_1, %q_acc_0_2, %q_acc_0_3},
         {%tb1_q_a_6_0_0, %tb1_q_a_6_0_1, %tb1_q_a_6_0_2, %tb1_q_a_6_0_3},
         {%tb1_q_b_6_0_0, %tb1_q_b_6_0_1},
@@ -432,8 +432,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_6_1_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_6_1_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_6_1_1, [%tb1_q_smem_w];
-    // MMA tile t=1 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 1; // Q-proj tile t=1 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_1_0, %q_acc_1_1, %q_acc_1_2, %q_acc_1_3},
         {%tb1_q_a_6_1_0, %tb1_q_a_6_1_1, %tb1_q_a_6_1_2, %tb1_q_a_6_1_3},
         {%tb1_q_b_6_1_0, %tb1_q_b_6_1_1},
@@ -446,8 +446,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_6_2_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_6_2_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_6_2_1, [%tb1_q_smem_w];
-    // MMA tile t=2 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 2; // Q-proj tile t=2 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_2_0, %q_acc_2_1, %q_acc_2_2, %q_acc_2_3},
         {%tb1_q_a_6_2_0, %tb1_q_a_6_2_1, %tb1_q_a_6_2_2, %tb1_q_a_6_2_3},
         {%tb1_q_b_6_2_0, %tb1_q_b_6_2_1},
@@ -460,8 +460,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_6_3_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_6_3_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_6_3_1, [%tb1_q_smem_w];
-    // MMA tile t=3 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 3; // Q-proj tile t=3 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_3_0, %q_acc_3_1, %q_acc_3_2, %q_acc_3_3},
         {%tb1_q_a_6_3_0, %tb1_q_a_6_3_1, %tb1_q_a_6_3_2, %tb1_q_a_6_3_3},
         {%tb1_q_b_6_3_0, %tb1_q_b_6_3_1},
@@ -482,8 +482,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_7_0_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_7_0_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_7_0_1, [%tb1_q_smem_w];
-    // MMA tile t=0 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 0; // Q-proj tile t=0 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_0_0, %q_acc_0_1, %q_acc_0_2, %q_acc_0_3},
         {%tb1_q_a_7_0_0, %tb1_q_a_7_0_1, %tb1_q_a_7_0_2, %tb1_q_a_7_0_3},
         {%tb1_q_b_7_0_0, %tb1_q_b_7_0_1},
@@ -496,8 +496,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_7_1_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_7_1_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_7_1_1, [%tb1_q_smem_w];
-    // MMA tile t=1 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 1; // Q-proj tile t=1 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_1_0, %q_acc_1_1, %q_acc_1_2, %q_acc_1_3},
         {%tb1_q_a_7_1_0, %tb1_q_a_7_1_1, %tb1_q_a_7_1_2, %tb1_q_a_7_1_3},
         {%tb1_q_b_7_1_0, %tb1_q_b_7_1_1},
@@ -510,8 +510,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_7_2_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_7_2_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_7_2_1, [%tb1_q_smem_w];
-    // MMA tile t=2 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 2; // Q-proj tile t=2 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_2_0, %q_acc_2_1, %q_acc_2_2, %q_acc_2_3},
         {%tb1_q_a_7_2_0, %tb1_q_a_7_2_1, %tb1_q_a_7_2_2, %tb1_q_a_7_2_3},
         {%tb1_q_b_7_2_0, %tb1_q_b_7_2_1},
@@ -524,8 +524,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_7_3_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_7_3_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_7_3_1, [%tb1_q_smem_w];
-    // MMA tile t=3 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 3; // Q-proj tile t=3 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_3_0, %q_acc_3_1, %q_acc_3_2, %q_acc_3_3},
         {%tb1_q_a_7_3_0, %tb1_q_a_7_3_1, %tb1_q_a_7_3_2, %tb1_q_a_7_3_3},
         {%tb1_q_b_7_3_0, %tb1_q_b_7_3_1},
@@ -546,8 +546,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_8_0_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_8_0_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_8_0_1, [%tb1_q_smem_w];
-    // MMA tile t=0 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 0; // Q-proj tile t=0 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_0_0, %q_acc_0_1, %q_acc_0_2, %q_acc_0_3},
         {%tb1_q_a_8_0_0, %tb1_q_a_8_0_1, %tb1_q_a_8_0_2, %tb1_q_a_8_0_3},
         {%tb1_q_b_8_0_0, %tb1_q_b_8_0_1},
@@ -560,8 +560,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_8_1_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_8_1_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_8_1_1, [%tb1_q_smem_w];
-    // MMA tile t=1 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 1; // Q-proj tile t=1 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_1_0, %q_acc_1_1, %q_acc_1_2, %q_acc_1_3},
         {%tb1_q_a_8_1_0, %tb1_q_a_8_1_1, %tb1_q_a_8_1_2, %tb1_q_a_8_1_3},
         {%tb1_q_b_8_1_0, %tb1_q_b_8_1_1},
@@ -574,8 +574,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_8_2_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_8_2_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_8_2_1, [%tb1_q_smem_w];
-    // MMA tile t=2 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 2; // Q-proj tile t=2 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_2_0, %q_acc_2_1, %q_acc_2_2, %q_acc_2_3},
         {%tb1_q_a_8_2_0, %tb1_q_a_8_2_1, %tb1_q_a_8_2_2, %tb1_q_a_8_2_3},
         {%tb1_q_b_8_2_0, %tb1_q_b_8_2_1},
@@ -588,8 +588,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_8_3_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_8_3_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_8_3_1, [%tb1_q_smem_w];
-    // MMA tile t=3 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 3; // Q-proj tile t=3 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_3_0, %q_acc_3_1, %q_acc_3_2, %q_acc_3_3},
         {%tb1_q_a_8_3_0, %tb1_q_a_8_3_1, %tb1_q_a_8_3_2, %tb1_q_a_8_3_3},
         {%tb1_q_b_8_3_0, %tb1_q_b_8_3_1},
@@ -610,8 +610,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_9_0_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_9_0_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_9_0_1, [%tb1_q_smem_w];
-    // MMA tile t=0 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 0; // Q-proj tile t=0 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_0_0, %q_acc_0_1, %q_acc_0_2, %q_acc_0_3},
         {%tb1_q_a_9_0_0, %tb1_q_a_9_0_1, %tb1_q_a_9_0_2, %tb1_q_a_9_0_3},
         {%tb1_q_b_9_0_0, %tb1_q_b_9_0_1},
@@ -624,8 +624,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_9_1_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_9_1_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_9_1_1, [%tb1_q_smem_w];
-    // MMA tile t=1 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 1; // Q-proj tile t=1 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_1_0, %q_acc_1_1, %q_acc_1_2, %q_acc_1_3},
         {%tb1_q_a_9_1_0, %tb1_q_a_9_1_1, %tb1_q_a_9_1_2, %tb1_q_a_9_1_3},
         {%tb1_q_b_9_1_0, %tb1_q_b_9_1_1},
@@ -638,8 +638,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_9_2_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_9_2_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_9_2_1, [%tb1_q_smem_w];
-    // MMA tile t=2 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 2; // Q-proj tile t=2 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_2_0, %q_acc_2_1, %q_acc_2_2, %q_acc_2_3},
         {%tb1_q_a_9_2_0, %tb1_q_a_9_2_1, %tb1_q_a_9_2_2, %tb1_q_a_9_2_3},
         {%tb1_q_b_9_2_0, %tb1_q_b_9_2_1},
@@ -652,8 +652,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_9_3_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_9_3_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_9_3_1, [%tb1_q_smem_w];
-    // MMA tile t=3 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 3; // Q-proj tile t=3 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_3_0, %q_acc_3_1, %q_acc_3_2, %q_acc_3_3},
         {%tb1_q_a_9_3_0, %tb1_q_a_9_3_1, %tb1_q_a_9_3_2, %tb1_q_a_9_3_3},
         {%tb1_q_b_9_3_0, %tb1_q_b_9_3_1},
@@ -674,8 +674,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_10_0_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_10_0_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_10_0_1, [%tb1_q_smem_w];
-    // MMA tile t=0 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 0; // Q-proj tile t=0 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_0_0, %q_acc_0_1, %q_acc_0_2, %q_acc_0_3},
         {%tb1_q_a_10_0_0, %tb1_q_a_10_0_1, %tb1_q_a_10_0_2, %tb1_q_a_10_0_3},
         {%tb1_q_b_10_0_0, %tb1_q_b_10_0_1},
@@ -688,8 +688,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_10_1_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_10_1_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_10_1_1, [%tb1_q_smem_w];
-    // MMA tile t=1 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 1; // Q-proj tile t=1 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_1_0, %q_acc_1_1, %q_acc_1_2, %q_acc_1_3},
         {%tb1_q_a_10_1_0, %tb1_q_a_10_1_1, %tb1_q_a_10_1_2, %tb1_q_a_10_1_3},
         {%tb1_q_b_10_1_0, %tb1_q_b_10_1_1},
@@ -702,8 +702,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_10_2_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_10_2_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_10_2_1, [%tb1_q_smem_w];
-    // MMA tile t=2 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 2; // Q-proj tile t=2 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_2_0, %q_acc_2_1, %q_acc_2_2, %q_acc_2_3},
         {%tb1_q_a_10_2_0, %tb1_q_a_10_2_1, %tb1_q_a_10_2_2, %tb1_q_a_10_2_3},
         {%tb1_q_b_10_2_0, %tb1_q_b_10_2_1},
@@ -716,8 +716,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_10_3_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_10_3_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_10_3_1, [%tb1_q_smem_w];
-    // MMA tile t=3 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 3; // Q-proj tile t=3 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_3_0, %q_acc_3_1, %q_acc_3_2, %q_acc_3_3},
         {%tb1_q_a_10_3_0, %tb1_q_a_10_3_1, %tb1_q_a_10_3_2, %tb1_q_a_10_3_3},
         {%tb1_q_b_10_3_0, %tb1_q_b_10_3_1},
@@ -738,8 +738,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_11_0_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_11_0_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_11_0_1, [%tb1_q_smem_w];
-    // MMA tile t=0 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 0; // Q-proj tile t=0 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_0_0, %q_acc_0_1, %q_acc_0_2, %q_acc_0_3},
         {%tb1_q_a_11_0_0, %tb1_q_a_11_0_1, %tb1_q_a_11_0_2, %tb1_q_a_11_0_3},
         {%tb1_q_b_11_0_0, %tb1_q_b_11_0_1},
@@ -752,8 +752,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_11_1_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_11_1_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_11_1_1, [%tb1_q_smem_w];
-    // MMA tile t=1 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 1; // Q-proj tile t=1 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_1_0, %q_acc_1_1, %q_acc_1_2, %q_acc_1_3},
         {%tb1_q_a_11_1_0, %tb1_q_a_11_1_1, %tb1_q_a_11_1_2, %tb1_q_a_11_1_3},
         {%tb1_q_b_11_1_0, %tb1_q_b_11_1_1},
@@ -766,8 +766,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_11_2_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_11_2_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_11_2_1, [%tb1_q_smem_w];
-    // MMA tile t=2 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 2; // Q-proj tile t=2 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_2_0, %q_acc_2_1, %q_acc_2_2, %q_acc_2_3},
         {%tb1_q_a_11_2_0, %tb1_q_a_11_2_1, %tb1_q_a_11_2_2, %tb1_q_a_11_2_3},
         {%tb1_q_b_11_2_0, %tb1_q_b_11_2_1},
@@ -780,8 +780,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_11_3_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_11_3_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_11_3_1, [%tb1_q_smem_w];
-    // MMA tile t=3 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 3; // Q-proj tile t=3 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_3_0, %q_acc_3_1, %q_acc_3_2, %q_acc_3_3},
         {%tb1_q_a_11_3_0, %tb1_q_a_11_3_1, %tb1_q_a_11_3_2, %tb1_q_a_11_3_3},
         {%tb1_q_b_11_3_0, %tb1_q_b_11_3_1},
@@ -802,8 +802,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_12_0_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_12_0_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_12_0_1, [%tb1_q_smem_w];
-    // MMA tile t=0 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 0; // Q-proj tile t=0 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_0_0, %q_acc_0_1, %q_acc_0_2, %q_acc_0_3},
         {%tb1_q_a_12_0_0, %tb1_q_a_12_0_1, %tb1_q_a_12_0_2, %tb1_q_a_12_0_3},
         {%tb1_q_b_12_0_0, %tb1_q_b_12_0_1},
@@ -816,8 +816,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_12_1_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_12_1_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_12_1_1, [%tb1_q_smem_w];
-    // MMA tile t=1 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 1; // Q-proj tile t=1 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_1_0, %q_acc_1_1, %q_acc_1_2, %q_acc_1_3},
         {%tb1_q_a_12_1_0, %tb1_q_a_12_1_1, %tb1_q_a_12_1_2, %tb1_q_a_12_1_3},
         {%tb1_q_b_12_1_0, %tb1_q_b_12_1_1},
@@ -830,8 +830,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_12_2_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_12_2_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_12_2_1, [%tb1_q_smem_w];
-    // MMA tile t=2 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 2; // Q-proj tile t=2 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_2_0, %q_acc_2_1, %q_acc_2_2, %q_acc_2_3},
         {%tb1_q_a_12_2_0, %tb1_q_a_12_2_1, %tb1_q_a_12_2_2, %tb1_q_a_12_2_3},
         {%tb1_q_b_12_2_0, %tb1_q_b_12_2_1},
@@ -844,8 +844,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_12_3_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_12_3_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_12_3_1, [%tb1_q_smem_w];
-    // MMA tile t=3 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 3; // Q-proj tile t=3 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_3_0, %q_acc_3_1, %q_acc_3_2, %q_acc_3_3},
         {%tb1_q_a_12_3_0, %tb1_q_a_12_3_1, %tb1_q_a_12_3_2, %tb1_q_a_12_3_3},
         {%tb1_q_b_12_3_0, %tb1_q_b_12_3_1},
@@ -866,8 +866,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_13_0_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_13_0_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_13_0_1, [%tb1_q_smem_w];
-    // MMA tile t=0 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 0; // Q-proj tile t=0 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_0_0, %q_acc_0_1, %q_acc_0_2, %q_acc_0_3},
         {%tb1_q_a_13_0_0, %tb1_q_a_13_0_1, %tb1_q_a_13_0_2, %tb1_q_a_13_0_3},
         {%tb1_q_b_13_0_0, %tb1_q_b_13_0_1},
@@ -880,8 +880,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_13_1_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_13_1_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_13_1_1, [%tb1_q_smem_w];
-    // MMA tile t=1 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 1; // Q-proj tile t=1 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_1_0, %q_acc_1_1, %q_acc_1_2, %q_acc_1_3},
         {%tb1_q_a_13_1_0, %tb1_q_a_13_1_1, %tb1_q_a_13_1_2, %tb1_q_a_13_1_3},
         {%tb1_q_b_13_1_0, %tb1_q_b_13_1_1},
@@ -894,8 +894,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_13_2_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_13_2_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_13_2_1, [%tb1_q_smem_w];
-    // MMA tile t=2 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 2; // Q-proj tile t=2 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_2_0, %q_acc_2_1, %q_acc_2_2, %q_acc_2_3},
         {%tb1_q_a_13_2_0, %tb1_q_a_13_2_1, %tb1_q_a_13_2_2, %tb1_q_a_13_2_3},
         {%tb1_q_b_13_2_0, %tb1_q_b_13_2_1},
@@ -908,8 +908,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_13_3_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_13_3_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_13_3_1, [%tb1_q_smem_w];
-    // MMA tile t=3 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 3; // Q-proj tile t=3 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_3_0, %q_acc_3_1, %q_acc_3_2, %q_acc_3_3},
         {%tb1_q_a_13_3_0, %tb1_q_a_13_3_1, %tb1_q_a_13_3_2, %tb1_q_a_13_3_3},
         {%tb1_q_b_13_3_0, %tb1_q_b_13_3_1},
@@ -930,8 +930,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_14_0_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_14_0_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_14_0_1, [%tb1_q_smem_w];
-    // MMA tile t=0 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 0; // Q-proj tile t=0 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_0_0, %q_acc_0_1, %q_acc_0_2, %q_acc_0_3},
         {%tb1_q_a_14_0_0, %tb1_q_a_14_0_1, %tb1_q_a_14_0_2, %tb1_q_a_14_0_3},
         {%tb1_q_b_14_0_0, %tb1_q_b_14_0_1},
@@ -944,8 +944,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_14_1_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_14_1_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_14_1_1, [%tb1_q_smem_w];
-    // MMA tile t=1 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 1; // Q-proj tile t=1 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_1_0, %q_acc_1_1, %q_acc_1_2, %q_acc_1_3},
         {%tb1_q_a_14_1_0, %tb1_q_a_14_1_1, %tb1_q_a_14_1_2, %tb1_q_a_14_1_3},
         {%tb1_q_b_14_1_0, %tb1_q_b_14_1_1},
@@ -958,8 +958,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_14_2_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_14_2_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_14_2_1, [%tb1_q_smem_w];
-    // MMA tile t=2 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 2; // Q-proj tile t=2 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_2_0, %q_acc_2_1, %q_acc_2_2, %q_acc_2_3},
         {%tb1_q_a_14_2_0, %tb1_q_a_14_2_1, %tb1_q_a_14_2_2, %tb1_q_a_14_2_3},
         {%tb1_q_b_14_2_0, %tb1_q_b_14_2_1},
@@ -972,8 +972,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_14_3_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_14_3_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_14_3_1, [%tb1_q_smem_w];
-    // MMA tile t=3 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 3; // Q-proj tile t=3 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_3_0, %q_acc_3_1, %q_acc_3_2, %q_acc_3_3},
         {%tb1_q_a_14_3_0, %tb1_q_a_14_3_1, %tb1_q_a_14_3_2, %tb1_q_a_14_3_3},
         {%tb1_q_b_14_3_0, %tb1_q_b_14_3_1},
@@ -994,8 +994,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_15_0_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_15_0_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_15_0_1, [%tb1_q_smem_w];
-    // MMA tile t=0 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 0; // Q-proj tile t=0 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_0_0, %q_acc_0_1, %q_acc_0_2, %q_acc_0_3},
         {%tb1_q_a_15_0_0, %tb1_q_a_15_0_1, %tb1_q_a_15_0_2, %tb1_q_a_15_0_3},
         {%tb1_q_b_15_0_0, %tb1_q_b_15_0_1},
@@ -1008,8 +1008,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_15_1_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_15_1_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_15_1_1, [%tb1_q_smem_w];
-    // MMA tile t=1 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 1; // Q-proj tile t=1 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_1_0, %q_acc_1_1, %q_acc_1_2, %q_acc_1_3},
         {%tb1_q_a_15_1_0, %tb1_q_a_15_1_1, %tb1_q_a_15_1_2, %tb1_q_a_15_1_3},
         {%tb1_q_b_15_1_0, %tb1_q_b_15_1_1},
@@ -1022,8 +1022,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_15_2_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_15_2_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_15_2_1, [%tb1_q_smem_w];
-    // MMA tile t=2 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 2; // Q-proj tile t=2 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_2_0, %q_acc_2_1, %q_acc_2_2, %q_acc_2_3},
         {%tb1_q_a_15_2_0, %tb1_q_a_15_2_1, %tb1_q_a_15_2_2, %tb1_q_a_15_2_3},
         {%tb1_q_b_15_2_0, %tb1_q_b_15_2_1},
@@ -1036,8 +1036,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_15_3_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_15_3_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_15_3_1, [%tb1_q_smem_w];
-    // MMA tile t=3 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 3; // Q-proj tile t=3 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_3_0, %q_acc_3_1, %q_acc_3_2, %q_acc_3_3},
         {%tb1_q_a_15_3_0, %tb1_q_a_15_3_1, %tb1_q_a_15_3_2, %tb1_q_a_15_3_3},
         {%tb1_q_b_15_3_0, %tb1_q_b_15_3_1},
@@ -1058,8 +1058,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_16_0_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_16_0_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_16_0_1, [%tb1_q_smem_w];
-    // MMA tile t=0 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 0; // Q-proj tile t=0 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_0_0, %q_acc_0_1, %q_acc_0_2, %q_acc_0_3},
         {%tb1_q_a_16_0_0, %tb1_q_a_16_0_1, %tb1_q_a_16_0_2, %tb1_q_a_16_0_3},
         {%tb1_q_b_16_0_0, %tb1_q_b_16_0_1},
@@ -1072,8 +1072,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_16_1_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_16_1_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_16_1_1, [%tb1_q_smem_w];
-    // MMA tile t=1 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 1; // Q-proj tile t=1 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_1_0, %q_acc_1_1, %q_acc_1_2, %q_acc_1_3},
         {%tb1_q_a_16_1_0, %tb1_q_a_16_1_1, %tb1_q_a_16_1_2, %tb1_q_a_16_1_3},
         {%tb1_q_b_16_1_0, %tb1_q_b_16_1_1},
@@ -1086,8 +1086,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_16_2_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_16_2_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_16_2_1, [%tb1_q_smem_w];
-    // MMA tile t=2 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 2; // Q-proj tile t=2 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_2_0, %q_acc_2_1, %q_acc_2_2, %q_acc_2_3},
         {%tb1_q_a_16_2_0, %tb1_q_a_16_2_1, %tb1_q_a_16_2_2, %tb1_q_a_16_2_3},
         {%tb1_q_b_16_2_0, %tb1_q_b_16_2_1},
@@ -1100,8 +1100,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_16_3_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_16_3_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_16_3_1, [%tb1_q_smem_w];
-    // MMA tile t=3 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 3; // Q-proj tile t=3 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_3_0, %q_acc_3_1, %q_acc_3_2, %q_acc_3_3},
         {%tb1_q_a_16_3_0, %tb1_q_a_16_3_1, %tb1_q_a_16_3_2, %tb1_q_a_16_3_3},
         {%tb1_q_b_16_3_0, %tb1_q_b_16_3_1},
@@ -1122,8 +1122,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_17_0_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_17_0_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_17_0_1, [%tb1_q_smem_w];
-    // MMA tile t=0 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 0; // Q-proj tile t=0 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_0_0, %q_acc_0_1, %q_acc_0_2, %q_acc_0_3},
         {%tb1_q_a_17_0_0, %tb1_q_a_17_0_1, %tb1_q_a_17_0_2, %tb1_q_a_17_0_3},
         {%tb1_q_b_17_0_0, %tb1_q_b_17_0_1},
@@ -1136,8 +1136,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_17_1_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_17_1_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_17_1_1, [%tb1_q_smem_w];
-    // MMA tile t=1 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 1; // Q-proj tile t=1 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_1_0, %q_acc_1_1, %q_acc_1_2, %q_acc_1_3},
         {%tb1_q_a_17_1_0, %tb1_q_a_17_1_1, %tb1_q_a_17_1_2, %tb1_q_a_17_1_3},
         {%tb1_q_b_17_1_0, %tb1_q_b_17_1_1},
@@ -1150,8 +1150,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_17_2_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_17_2_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_17_2_1, [%tb1_q_smem_w];
-    // MMA tile t=2 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 2; // Q-proj tile t=2 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_2_0, %q_acc_2_1, %q_acc_2_2, %q_acc_2_3},
         {%tb1_q_a_17_2_0, %tb1_q_a_17_2_1, %tb1_q_a_17_2_2, %tb1_q_a_17_2_3},
         {%tb1_q_b_17_2_0, %tb1_q_b_17_2_1},
@@ -1164,8 +1164,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_17_3_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_17_3_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_17_3_1, [%tb1_q_smem_w];
-    // MMA tile t=3 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 3; // Q-proj tile t=3 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_3_0, %q_acc_3_1, %q_acc_3_2, %q_acc_3_3},
         {%tb1_q_a_17_3_0, %tb1_q_a_17_3_1, %tb1_q_a_17_3_2, %tb1_q_a_17_3_3},
         {%tb1_q_b_17_3_0, %tb1_q_b_17_3_1},
@@ -1186,8 +1186,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_18_0_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_18_0_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_18_0_1, [%tb1_q_smem_w];
-    // MMA tile t=0 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 0; // Q-proj tile t=0 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_0_0, %q_acc_0_1, %q_acc_0_2, %q_acc_0_3},
         {%tb1_q_a_18_0_0, %tb1_q_a_18_0_1, %tb1_q_a_18_0_2, %tb1_q_a_18_0_3},
         {%tb1_q_b_18_0_0, %tb1_q_b_18_0_1},
@@ -1200,8 +1200,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_18_1_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_18_1_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_18_1_1, [%tb1_q_smem_w];
-    // MMA tile t=1 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 1; // Q-proj tile t=1 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_1_0, %q_acc_1_1, %q_acc_1_2, %q_acc_1_3},
         {%tb1_q_a_18_1_0, %tb1_q_a_18_1_1, %tb1_q_a_18_1_2, %tb1_q_a_18_1_3},
         {%tb1_q_b_18_1_0, %tb1_q_b_18_1_1},
@@ -1214,8 +1214,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_18_2_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_18_2_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_18_2_1, [%tb1_q_smem_w];
-    // MMA tile t=2 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 2; // Q-proj tile t=2 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_2_0, %q_acc_2_1, %q_acc_2_2, %q_acc_2_3},
         {%tb1_q_a_18_2_0, %tb1_q_a_18_2_1, %tb1_q_a_18_2_2, %tb1_q_a_18_2_3},
         {%tb1_q_b_18_2_0, %tb1_q_b_18_2_1},
@@ -1228,8 +1228,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_18_3_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_18_3_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_18_3_1, [%tb1_q_smem_w];
-    // MMA tile t=3 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 3; // Q-proj tile t=3 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_3_0, %q_acc_3_1, %q_acc_3_2, %q_acc_3_3},
         {%tb1_q_a_18_3_0, %tb1_q_a_18_3_1, %tb1_q_a_18_3_2, %tb1_q_a_18_3_3},
         {%tb1_q_b_18_3_0, %tb1_q_b_18_3_1},
@@ -1250,8 +1250,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_19_0_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_19_0_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_19_0_1, [%tb1_q_smem_w];
-    // MMA tile t=0 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 0; // Q-proj tile t=0 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_0_0, %q_acc_0_1, %q_acc_0_2, %q_acc_0_3},
         {%tb1_q_a_19_0_0, %tb1_q_a_19_0_1, %tb1_q_a_19_0_2, %tb1_q_a_19_0_3},
         {%tb1_q_b_19_0_0, %tb1_q_b_19_0_1},
@@ -1264,8 +1264,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_19_1_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_19_1_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_19_1_1, [%tb1_q_smem_w];
-    // MMA tile t=1 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 1; // Q-proj tile t=1 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_1_0, %q_acc_1_1, %q_acc_1_2, %q_acc_1_3},
         {%tb1_q_a_19_1_0, %tb1_q_a_19_1_1, %tb1_q_a_19_1_2, %tb1_q_a_19_1_3},
         {%tb1_q_b_19_1_0, %tb1_q_b_19_1_1},
@@ -1278,8 +1278,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_19_2_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_19_2_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_19_2_1, [%tb1_q_smem_w];
-    // MMA tile t=2 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 2; // Q-proj tile t=2 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_2_0, %q_acc_2_1, %q_acc_2_2, %q_acc_2_3},
         {%tb1_q_a_19_2_0, %tb1_q_a_19_2_1, %tb1_q_a_19_2_2, %tb1_q_a_19_2_3},
         {%tb1_q_b_19_2_0, %tb1_q_b_19_2_1},
@@ -1292,8 +1292,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_19_3_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_19_3_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_19_3_1, [%tb1_q_smem_w];
-    // MMA tile t=3 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 3; // Q-proj tile t=3 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_3_0, %q_acc_3_1, %q_acc_3_2, %q_acc_3_3},
         {%tb1_q_a_19_3_0, %tb1_q_a_19_3_1, %tb1_q_a_19_3_2, %tb1_q_a_19_3_3},
         {%tb1_q_b_19_3_0, %tb1_q_b_19_3_1},
@@ -1314,8 +1314,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_20_0_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_20_0_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_20_0_1, [%tb1_q_smem_w];
-    // MMA tile t=0 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 0; // Q-proj tile t=0 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_0_0, %q_acc_0_1, %q_acc_0_2, %q_acc_0_3},
         {%tb1_q_a_20_0_0, %tb1_q_a_20_0_1, %tb1_q_a_20_0_2, %tb1_q_a_20_0_3},
         {%tb1_q_b_20_0_0, %tb1_q_b_20_0_1},
@@ -1328,8 +1328,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_20_1_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_20_1_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_20_1_1, [%tb1_q_smem_w];
-    // MMA tile t=1 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 1; // Q-proj tile t=1 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_1_0, %q_acc_1_1, %q_acc_1_2, %q_acc_1_3},
         {%tb1_q_a_20_1_0, %tb1_q_a_20_1_1, %tb1_q_a_20_1_2, %tb1_q_a_20_1_3},
         {%tb1_q_b_20_1_0, %tb1_q_b_20_1_1},
@@ -1342,8 +1342,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_20_2_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_20_2_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_20_2_1, [%tb1_q_smem_w];
-    // MMA tile t=2 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 2; // Q-proj tile t=2 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_2_0, %q_acc_2_1, %q_acc_2_2, %q_acc_2_3},
         {%tb1_q_a_20_2_0, %tb1_q_a_20_2_1, %tb1_q_a_20_2_2, %tb1_q_a_20_2_3},
         {%tb1_q_b_20_2_0, %tb1_q_b_20_2_1},
@@ -1356,8 +1356,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_20_3_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_20_3_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_20_3_1, [%tb1_q_smem_w];
-    // MMA tile t=3 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 3; // Q-proj tile t=3 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_3_0, %q_acc_3_1, %q_acc_3_2, %q_acc_3_3},
         {%tb1_q_a_20_3_0, %tb1_q_a_20_3_1, %tb1_q_a_20_3_2, %tb1_q_a_20_3_3},
         {%tb1_q_b_20_3_0, %tb1_q_b_20_3_1},
@@ -1378,8 +1378,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_21_0_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_21_0_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_21_0_1, [%tb1_q_smem_w];
-    // MMA tile t=0 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 0; // Q-proj tile t=0 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_0_0, %q_acc_0_1, %q_acc_0_2, %q_acc_0_3},
         {%tb1_q_a_21_0_0, %tb1_q_a_21_0_1, %tb1_q_a_21_0_2, %tb1_q_a_21_0_3},
         {%tb1_q_b_21_0_0, %tb1_q_b_21_0_1},
@@ -1392,8 +1392,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_21_1_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_21_1_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_21_1_1, [%tb1_q_smem_w];
-    // MMA tile t=1 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 1; // Q-proj tile t=1 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_1_0, %q_acc_1_1, %q_acc_1_2, %q_acc_1_3},
         {%tb1_q_a_21_1_0, %tb1_q_a_21_1_1, %tb1_q_a_21_1_2, %tb1_q_a_21_1_3},
         {%tb1_q_b_21_1_0, %tb1_q_b_21_1_1},
@@ -1406,8 +1406,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_21_2_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_21_2_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_21_2_1, [%tb1_q_smem_w];
-    // MMA tile t=2 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 2; // Q-proj tile t=2 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_2_0, %q_acc_2_1, %q_acc_2_2, %q_acc_2_3},
         {%tb1_q_a_21_2_0, %tb1_q_a_21_2_1, %tb1_q_a_21_2_2, %tb1_q_a_21_2_3},
         {%tb1_q_b_21_2_0, %tb1_q_b_21_2_1},
@@ -1420,8 +1420,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_21_3_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_21_3_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_21_3_1, [%tb1_q_smem_w];
-    // MMA tile t=3 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 3; // Q-proj tile t=3 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_3_0, %q_acc_3_1, %q_acc_3_2, %q_acc_3_3},
         {%tb1_q_a_21_3_0, %tb1_q_a_21_3_1, %tb1_q_a_21_3_2, %tb1_q_a_21_3_3},
         {%tb1_q_b_21_3_0, %tb1_q_b_21_3_1},
@@ -1442,8 +1442,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_22_0_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_22_0_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_22_0_1, [%tb1_q_smem_w];
-    // MMA tile t=0 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 0; // Q-proj tile t=0 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_0_0, %q_acc_0_1, %q_acc_0_2, %q_acc_0_3},
         {%tb1_q_a_22_0_0, %tb1_q_a_22_0_1, %tb1_q_a_22_0_2, %tb1_q_a_22_0_3},
         {%tb1_q_b_22_0_0, %tb1_q_b_22_0_1},
@@ -1456,8 +1456,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_22_1_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_22_1_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_22_1_1, [%tb1_q_smem_w];
-    // MMA tile t=1 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 1; // Q-proj tile t=1 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_1_0, %q_acc_1_1, %q_acc_1_2, %q_acc_1_3},
         {%tb1_q_a_22_1_0, %tb1_q_a_22_1_1, %tb1_q_a_22_1_2, %tb1_q_a_22_1_3},
         {%tb1_q_b_22_1_0, %tb1_q_b_22_1_1},
@@ -1470,8 +1470,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_22_2_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_22_2_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_22_2_1, [%tb1_q_smem_w];
-    // MMA tile t=2 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 2; // Q-proj tile t=2 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_2_0, %q_acc_2_1, %q_acc_2_2, %q_acc_2_3},
         {%tb1_q_a_22_2_0, %tb1_q_a_22_2_1, %tb1_q_a_22_2_2, %tb1_q_a_22_2_3},
         {%tb1_q_b_22_2_0, %tb1_q_b_22_2_1},
@@ -1484,8 +1484,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_22_3_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_22_3_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_22_3_1, [%tb1_q_smem_w];
-    // MMA tile t=3 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 3; // Q-proj tile t=3 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_3_0, %q_acc_3_1, %q_acc_3_2, %q_acc_3_3},
         {%tb1_q_a_22_3_0, %tb1_q_a_22_3_1, %tb1_q_a_22_3_2, %tb1_q_a_22_3_3},
         {%tb1_q_b_22_3_0, %tb1_q_b_22_3_1},
@@ -1506,8 +1506,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_23_0_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_23_0_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_23_0_1, [%tb1_q_smem_w];
-    // MMA tile t=0 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 0; // Q-proj tile t=0 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_0_0, %q_acc_0_1, %q_acc_0_2, %q_acc_0_3},
         {%tb1_q_a_23_0_0, %tb1_q_a_23_0_1, %tb1_q_a_23_0_2, %tb1_q_a_23_0_3},
         {%tb1_q_b_23_0_0, %tb1_q_b_23_0_1},
@@ -1520,8 +1520,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_23_1_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_23_1_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_23_1_1, [%tb1_q_smem_w];
-    // MMA tile t=1 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 1; // Q-proj tile t=1 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_1_0, %q_acc_1_1, %q_acc_1_2, %q_acc_1_3},
         {%tb1_q_a_23_1_0, %tb1_q_a_23_1_1, %tb1_q_a_23_1_2, %tb1_q_a_23_1_3},
         {%tb1_q_b_23_1_0, %tb1_q_b_23_1_1},
@@ -1534,8 +1534,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_23_2_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_23_2_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_23_2_1, [%tb1_q_smem_w];
-    // MMA tile t=2 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 2; // Q-proj tile t=2 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_2_0, %q_acc_2_1, %q_acc_2_2, %q_acc_2_3},
         {%tb1_q_a_23_2_0, %tb1_q_a_23_2_1, %tb1_q_a_23_2_2, %tb1_q_a_23_2_3},
         {%tb1_q_b_23_2_0, %tb1_q_b_23_2_1},
@@ -1548,8 +1548,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_23_3_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_23_3_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_23_3_1, [%tb1_q_smem_w];
-    // MMA tile t=3 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 3; // Q-proj tile t=3 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_3_0, %q_acc_3_1, %q_acc_3_2, %q_acc_3_3},
         {%tb1_q_a_23_3_0, %tb1_q_a_23_3_1, %tb1_q_a_23_3_2, %tb1_q_a_23_3_3},
         {%tb1_q_b_23_3_0, %tb1_q_b_23_3_1},
@@ -1570,8 +1570,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_24_0_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_24_0_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_24_0_1, [%tb1_q_smem_w];
-    // MMA tile t=0 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 0; // Q-proj tile t=0 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_0_0, %q_acc_0_1, %q_acc_0_2, %q_acc_0_3},
         {%tb1_q_a_24_0_0, %tb1_q_a_24_0_1, %tb1_q_a_24_0_2, %tb1_q_a_24_0_3},
         {%tb1_q_b_24_0_0, %tb1_q_b_24_0_1},
@@ -1584,8 +1584,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_24_1_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_24_1_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_24_1_1, [%tb1_q_smem_w];
-    // MMA tile t=1 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 1; // Q-proj tile t=1 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_1_0, %q_acc_1_1, %q_acc_1_2, %q_acc_1_3},
         {%tb1_q_a_24_1_0, %tb1_q_a_24_1_1, %tb1_q_a_24_1_2, %tb1_q_a_24_1_3},
         {%tb1_q_b_24_1_0, %tb1_q_b_24_1_1},
@@ -1598,8 +1598,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_24_2_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_24_2_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_24_2_1, [%tb1_q_smem_w];
-    // MMA tile t=2 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 2; // Q-proj tile t=2 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_2_0, %q_acc_2_1, %q_acc_2_2, %q_acc_2_3},
         {%tb1_q_a_24_2_0, %tb1_q_a_24_2_1, %tb1_q_a_24_2_2, %tb1_q_a_24_2_3},
         {%tb1_q_b_24_2_0, %tb1_q_b_24_2_1},
@@ -1612,8 +1612,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_24_3_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_24_3_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_24_3_1, [%tb1_q_smem_w];
-    // MMA tile t=3 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 3; // Q-proj tile t=3 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_3_0, %q_acc_3_1, %q_acc_3_2, %q_acc_3_3},
         {%tb1_q_a_24_3_0, %tb1_q_a_24_3_1, %tb1_q_a_24_3_2, %tb1_q_a_24_3_3},
         {%tb1_q_b_24_3_0, %tb1_q_b_24_3_1},
@@ -1634,8 +1634,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_25_0_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_25_0_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_25_0_1, [%tb1_q_smem_w];
-    // MMA tile t=0 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 0; // Q-proj tile t=0 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_0_0, %q_acc_0_1, %q_acc_0_2, %q_acc_0_3},
         {%tb1_q_a_25_0_0, %tb1_q_a_25_0_1, %tb1_q_a_25_0_2, %tb1_q_a_25_0_3},
         {%tb1_q_b_25_0_0, %tb1_q_b_25_0_1},
@@ -1648,8 +1648,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_25_1_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_25_1_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_25_1_1, [%tb1_q_smem_w];
-    // MMA tile t=1 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 1; // Q-proj tile t=1 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_1_0, %q_acc_1_1, %q_acc_1_2, %q_acc_1_3},
         {%tb1_q_a_25_1_0, %tb1_q_a_25_1_1, %tb1_q_a_25_1_2, %tb1_q_a_25_1_3},
         {%tb1_q_b_25_1_0, %tb1_q_b_25_1_1},
@@ -1662,8 +1662,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_25_2_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_25_2_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_25_2_1, [%tb1_q_smem_w];
-    // MMA tile t=2 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 2; // Q-proj tile t=2 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_2_0, %q_acc_2_1, %q_acc_2_2, %q_acc_2_3},
         {%tb1_q_a_25_2_0, %tb1_q_a_25_2_1, %tb1_q_a_25_2_2, %tb1_q_a_25_2_3},
         {%tb1_q_b_25_2_0, %tb1_q_b_25_2_1},
@@ -1676,8 +1676,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_25_3_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_25_3_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_25_3_1, [%tb1_q_smem_w];
-    // MMA tile t=3 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 3; // Q-proj tile t=3 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_3_0, %q_acc_3_1, %q_acc_3_2, %q_acc_3_3},
         {%tb1_q_a_25_3_0, %tb1_q_a_25_3_1, %tb1_q_a_25_3_2, %tb1_q_a_25_3_3},
         {%tb1_q_b_25_3_0, %tb1_q_b_25_3_1},
@@ -1698,8 +1698,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_26_0_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_26_0_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_26_0_1, [%tb1_q_smem_w];
-    // MMA tile t=0 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 0; // Q-proj tile t=0 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_0_0, %q_acc_0_1, %q_acc_0_2, %q_acc_0_3},
         {%tb1_q_a_26_0_0, %tb1_q_a_26_0_1, %tb1_q_a_26_0_2, %tb1_q_a_26_0_3},
         {%tb1_q_b_26_0_0, %tb1_q_b_26_0_1},
@@ -1712,8 +1712,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_26_1_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_26_1_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_26_1_1, [%tb1_q_smem_w];
-    // MMA tile t=1 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 1; // Q-proj tile t=1 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_1_0, %q_acc_1_1, %q_acc_1_2, %q_acc_1_3},
         {%tb1_q_a_26_1_0, %tb1_q_a_26_1_1, %tb1_q_a_26_1_2, %tb1_q_a_26_1_3},
         {%tb1_q_b_26_1_0, %tb1_q_b_26_1_1},
@@ -1726,8 +1726,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_26_2_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_26_2_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_26_2_1, [%tb1_q_smem_w];
-    // MMA tile t=2 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 2; // Q-proj tile t=2 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_2_0, %q_acc_2_1, %q_acc_2_2, %q_acc_2_3},
         {%tb1_q_a_26_2_0, %tb1_q_a_26_2_1, %tb1_q_a_26_2_2, %tb1_q_a_26_2_3},
         {%tb1_q_b_26_2_0, %tb1_q_b_26_2_1},
@@ -1740,8 +1740,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_26_3_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_26_3_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_26_3_1, [%tb1_q_smem_w];
-    // MMA tile t=3 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 3; // Q-proj tile t=3 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_3_0, %q_acc_3_1, %q_acc_3_2, %q_acc_3_3},
         {%tb1_q_a_26_3_0, %tb1_q_a_26_3_1, %tb1_q_a_26_3_2, %tb1_q_a_26_3_3},
         {%tb1_q_b_26_3_0, %tb1_q_b_26_3_1},
@@ -1762,8 +1762,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_27_0_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_27_0_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_27_0_1, [%tb1_q_smem_w];
-    // MMA tile t=0 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 0; // Q-proj tile t=0 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_0_0, %q_acc_0_1, %q_acc_0_2, %q_acc_0_3},
         {%tb1_q_a_27_0_0, %tb1_q_a_27_0_1, %tb1_q_a_27_0_2, %tb1_q_a_27_0_3},
         {%tb1_q_b_27_0_0, %tb1_q_b_27_0_1},
@@ -1776,8 +1776,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_27_1_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_27_1_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_27_1_1, [%tb1_q_smem_w];
-    // MMA tile t=1 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 1; // Q-proj tile t=1 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_1_0, %q_acc_1_1, %q_acc_1_2, %q_acc_1_3},
         {%tb1_q_a_27_1_0, %tb1_q_a_27_1_1, %tb1_q_a_27_1_2, %tb1_q_a_27_1_3},
         {%tb1_q_b_27_1_0, %tb1_q_b_27_1_1},
@@ -1790,8 +1790,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_27_2_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_27_2_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_27_2_1, [%tb1_q_smem_w];
-    // MMA tile t=2 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 2; // Q-proj tile t=2 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_2_0, %q_acc_2_1, %q_acc_2_2, %q_acc_2_3},
         {%tb1_q_a_27_2_0, %tb1_q_a_27_2_1, %tb1_q_a_27_2_2, %tb1_q_a_27_2_3},
         {%tb1_q_b_27_2_0, %tb1_q_b_27_2_1},
@@ -1804,8 +1804,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_27_3_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_27_3_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_27_3_1, [%tb1_q_smem_w];
-    // MMA tile t=3 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 3; // Q-proj tile t=3 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_3_0, %q_acc_3_1, %q_acc_3_2, %q_acc_3_3},
         {%tb1_q_a_27_3_0, %tb1_q_a_27_3_1, %tb1_q_a_27_3_2, %tb1_q_a_27_3_3},
         {%tb1_q_b_27_3_0, %tb1_q_b_27_3_1},
@@ -1826,8 +1826,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_28_0_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_28_0_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_28_0_1, [%tb1_q_smem_w];
-    // MMA tile t=0 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 0; // Q-proj tile t=0 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_0_0, %q_acc_0_1, %q_acc_0_2, %q_acc_0_3},
         {%tb1_q_a_28_0_0, %tb1_q_a_28_0_1, %tb1_q_a_28_0_2, %tb1_q_a_28_0_3},
         {%tb1_q_b_28_0_0, %tb1_q_b_28_0_1},
@@ -1840,8 +1840,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_28_1_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_28_1_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_28_1_1, [%tb1_q_smem_w];
-    // MMA tile t=1 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 1; // Q-proj tile t=1 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_1_0, %q_acc_1_1, %q_acc_1_2, %q_acc_1_3},
         {%tb1_q_a_28_1_0, %tb1_q_a_28_1_1, %tb1_q_a_28_1_2, %tb1_q_a_28_1_3},
         {%tb1_q_b_28_1_0, %tb1_q_b_28_1_1},
@@ -1854,8 +1854,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_28_2_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_28_2_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_28_2_1, [%tb1_q_smem_w];
-    // MMA tile t=2 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 2; // Q-proj tile t=2 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_2_0, %q_acc_2_1, %q_acc_2_2, %q_acc_2_3},
         {%tb1_q_a_28_2_0, %tb1_q_a_28_2_1, %tb1_q_a_28_2_2, %tb1_q_a_28_2_3},
         {%tb1_q_b_28_2_0, %tb1_q_b_28_2_1},
@@ -1868,8 +1868,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_28_3_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_28_3_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_28_3_1, [%tb1_q_smem_w];
-    // MMA tile t=3 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 3; // Q-proj tile t=3 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_3_0, %q_acc_3_1, %q_acc_3_2, %q_acc_3_3},
         {%tb1_q_a_28_3_0, %tb1_q_a_28_3_1, %tb1_q_a_28_3_2, %tb1_q_a_28_3_3},
         {%tb1_q_b_28_3_0, %tb1_q_b_28_3_1},
@@ -1890,8 +1890,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_29_0_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_29_0_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_29_0_1, [%tb1_q_smem_w];
-    // MMA tile t=0 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 0; // Q-proj tile t=0 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_0_0, %q_acc_0_1, %q_acc_0_2, %q_acc_0_3},
         {%tb1_q_a_29_0_0, %tb1_q_a_29_0_1, %tb1_q_a_29_0_2, %tb1_q_a_29_0_3},
         {%tb1_q_b_29_0_0, %tb1_q_b_29_0_1},
@@ -1904,8 +1904,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_29_1_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_29_1_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_29_1_1, [%tb1_q_smem_w];
-    // MMA tile t=1 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 1; // Q-proj tile t=1 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_1_0, %q_acc_1_1, %q_acc_1_2, %q_acc_1_3},
         {%tb1_q_a_29_1_0, %tb1_q_a_29_1_1, %tb1_q_a_29_1_2, %tb1_q_a_29_1_3},
         {%tb1_q_b_29_1_0, %tb1_q_b_29_1_1},
@@ -1918,8 +1918,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_29_2_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_29_2_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_29_2_1, [%tb1_q_smem_w];
-    // MMA tile t=2 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 2; // Q-proj tile t=2 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_2_0, %q_acc_2_1, %q_acc_2_2, %q_acc_2_3},
         {%tb1_q_a_29_2_0, %tb1_q_a_29_2_1, %tb1_q_a_29_2_2, %tb1_q_a_29_2_3},
         {%tb1_q_b_29_2_0, %tb1_q_b_29_2_1},
@@ -1932,8 +1932,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_29_3_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_29_3_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_29_3_1, [%tb1_q_smem_w];
-    // MMA tile t=3 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 3; // Q-proj tile t=3 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_3_0, %q_acc_3_1, %q_acc_3_2, %q_acc_3_3},
         {%tb1_q_a_29_3_0, %tb1_q_a_29_3_1, %tb1_q_a_29_3_2, %tb1_q_a_29_3_3},
         {%tb1_q_b_29_3_0, %tb1_q_b_29_3_1},
@@ -1954,8 +1954,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_30_0_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_30_0_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_30_0_1, [%tb1_q_smem_w];
-    // MMA tile t=0 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 0; // Q-proj tile t=0 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_0_0, %q_acc_0_1, %q_acc_0_2, %q_acc_0_3},
         {%tb1_q_a_30_0_0, %tb1_q_a_30_0_1, %tb1_q_a_30_0_2, %tb1_q_a_30_0_3},
         {%tb1_q_b_30_0_0, %tb1_q_b_30_0_1},
@@ -1968,8 +1968,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_30_1_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_30_1_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_30_1_1, [%tb1_q_smem_w];
-    // MMA tile t=1 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 1; // Q-proj tile t=1 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_1_0, %q_acc_1_1, %q_acc_1_2, %q_acc_1_3},
         {%tb1_q_a_30_1_0, %tb1_q_a_30_1_1, %tb1_q_a_30_1_2, %tb1_q_a_30_1_3},
         {%tb1_q_b_30_1_0, %tb1_q_b_30_1_1},
@@ -1982,8 +1982,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_30_2_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_30_2_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_30_2_1, [%tb1_q_smem_w];
-    // MMA tile t=2 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 2; // Q-proj tile t=2 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_2_0, %q_acc_2_1, %q_acc_2_2, %q_acc_2_3},
         {%tb1_q_a_30_2_0, %tb1_q_a_30_2_1, %tb1_q_a_30_2_2, %tb1_q_a_30_2_3},
         {%tb1_q_b_30_2_0, %tb1_q_b_30_2_1},
@@ -1996,8 +1996,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_30_3_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_30_3_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_30_3_1, [%tb1_q_smem_w];
-    // MMA tile t=3 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 3; // Q-proj tile t=3 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_3_0, %q_acc_3_1, %q_acc_3_2, %q_acc_3_3},
         {%tb1_q_a_30_3_0, %tb1_q_a_30_3_1, %tb1_q_a_30_3_2, %tb1_q_a_30_3_3},
         {%tb1_q_b_30_3_0, %tb1_q_b_30_3_1},
@@ -2018,8 +2018,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_31_0_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_31_0_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_31_0_1, [%tb1_q_smem_w];
-    // MMA tile t=0 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 0; // Q-proj tile t=0 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_0_0, %q_acc_0_1, %q_acc_0_2, %q_acc_0_3},
         {%tb1_q_a_31_0_0, %tb1_q_a_31_0_1, %tb1_q_a_31_0_2, %tb1_q_a_31_0_3},
         {%tb1_q_b_31_0_0, %tb1_q_b_31_0_1},
@@ -2032,8 +2032,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_31_1_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_31_1_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_31_1_1, [%tb1_q_smem_w];
-    // MMA tile t=1 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 1; // Q-proj tile t=1 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_1_0, %q_acc_1_1, %q_acc_1_2, %q_acc_1_3},
         {%tb1_q_a_31_1_0, %tb1_q_a_31_1_1, %tb1_q_a_31_1_2, %tb1_q_a_31_1_3},
         {%tb1_q_b_31_1_0, %tb1_q_b_31_1_1},
@@ -2046,8 +2046,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_31_2_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_31_2_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_31_2_1, [%tb1_q_smem_w];
-    // MMA tile t=2 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 2; // Q-proj tile t=2 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_2_0, %q_acc_2_1, %q_acc_2_2, %q_acc_2_3},
         {%tb1_q_a_31_2_0, %tb1_q_a_31_2_1, %tb1_q_a_31_2_2, %tb1_q_a_31_2_3},
         {%tb1_q_b_31_2_0, %tb1_q_b_31_2_1},
@@ -2060,8 +2060,8 @@ expression: ptx
     ld.shared.b32 %tb1_q_a_31_3_3, [%tb1_q_smem_x];
     ld.shared.b32 %tb1_q_b_31_3_0, [%tb1_q_smem_w];
     ld.shared.b32 %tb1_q_b_31_3_1, [%tb1_q_smem_w];
-    // MMA tile t=3 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.4)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 3; // Q-proj tile t=3 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_3_0, %q_acc_3_1, %q_acc_3_2, %q_acc_3_3},
         {%tb1_q_a_31_3_0, %tb1_q_a_31_3_1, %tb1_q_a_31_3_2, %tb1_q_a_31_3_3},
         {%tb1_q_b_31_3_0, %tb1_q_b_31_3_1},

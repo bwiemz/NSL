@@ -82,6 +82,13 @@ pub fn declare_registers(ptx: &mut String, config: &FlashAttentionConfig) {
     ptx.push_str("    mov.u64 %tb1_phase_b_smem_k, 0;\n");
     ptx.push_str("    mov.u64 %tb1_phase_b_smem_v, 0;\n");
 
+    // Warp-ownership gating (B1.6 deferral #2). `%warp_id` is already
+    // declared + populated by `phases::forward::prelude::emit` (it's a
+    // Tier A primitive); we just add the per-tile predicate register.
+    // Each per-tile MMA gates on `%warp_id == (t % 8)`.
+    ptx.push_str("    // Warp-ownership gating predicate (B1.6 deferral #2)\n");
+    ptx.push_str("    .reg .pred %wo_pred;\n");
+
     ptx.push_str("    // === Zero-init all f32 accumulators ===\n");
     for t in 0..tpw_q {
         for lane in 0..4 {

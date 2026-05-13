@@ -12,8 +12,8 @@ expression: ptx
     ld.shared.b32 %tb1_qkt_a_0_3, [%tb1_phase_b_smem_q];
     ld.shared.b32 %tb1_qkt_b_0_0, [%tb1_phase_b_smem_k];
     ld.shared.b32 %tb1_qkt_b_0_1, [%tb1_phase_b_smem_k];
-    // QK^T MMA tile t=0 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.6)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 0; // QK^T tile t=0 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%s_acc_0_0, %s_acc_0_1, %s_acc_0_2, %s_acc_0_3},
         {%tb1_qkt_a_0_0, %tb1_qkt_a_0_1, %tb1_qkt_a_0_2, %tb1_qkt_a_0_3},
         {%tb1_qkt_b_0_0, %tb1_qkt_b_0_1},
@@ -36,8 +36,8 @@ expression: ptx
     mov.b32 %tb1_pv_a_0_3, %p_packed_0;
     ld.shared.b32 %tb1_pv_b_0_0, [%tb1_phase_b_smem_v];
     ld.shared.b32 %tb1_pv_b_0_1, [%tb1_phase_b_smem_v];
-    // PV MMA tile t=0 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.6)
-    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    setp.eq.u32 %wo_pred, %warp_id, 0; // PV tile t=0 ownership
+    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%o_acc_0_0, %o_acc_0_1, %o_acc_0_2, %o_acc_0_3},
         {%tb1_pv_a_0_0, %tb1_pv_a_0_1, %tb1_pv_a_0_2, %tb1_pv_a_0_3},
         {%tb1_pv_b_0_0, %tb1_pv_b_0_1},
