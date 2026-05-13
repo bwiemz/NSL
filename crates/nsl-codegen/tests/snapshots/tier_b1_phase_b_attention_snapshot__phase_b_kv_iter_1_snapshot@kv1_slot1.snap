@@ -1,0 +1,61 @@
+---
+source: crates/nsl-codegen/tests/tier_b1_phase_b_attention_snapshot.rs
+expression: ptx
+---
+    // === Phase B: attention compute on slot[1] (kv_iter=1) ===
+    // QK^T MMA: bq=32 bkv=32 tpw_qkt=1 slot=1
+    .reg .u64 %tb1_phase_b_smem_q, %tb1_phase_b_smem_k;
+    mov.u64 %tb1_phase_b_smem_q, 0; // placeholder (B1.6 deferral #1)
+    mov.u64 %tb1_phase_b_smem_k, 0; // placeholder (B1.6 deferral #1)
+    .reg .f32 %s_acc_0_0;
+    .reg .f32 %s_acc_0_1;
+    .reg .f32 %s_acc_0_2;
+    .reg .f32 %s_acc_0_3;
+    mov.f32 %s_acc_0_0, 0f00000000;
+    mov.f32 %s_acc_0_1, 0f00000000;
+    mov.f32 %s_acc_0_2, 0f00000000;
+    mov.f32 %s_acc_0_3, 0f00000000;
+    .reg .b32 %tb1_qkt_a_0_0, %tb1_qkt_a_0_1, %tb1_qkt_a_0_2, %tb1_qkt_a_0_3;
+    .reg .b32 %tb1_qkt_b_0_0, %tb1_qkt_b_0_1;
+    ld.shared.b32 %tb1_qkt_a_0_0, [%tb1_phase_b_smem_q];
+    ld.shared.b32 %tb1_qkt_a_0_1, [%tb1_phase_b_smem_q];
+    ld.shared.b32 %tb1_qkt_a_0_2, [%tb1_phase_b_smem_q];
+    ld.shared.b32 %tb1_qkt_a_0_3, [%tb1_phase_b_smem_q];
+    ld.shared.b32 %tb1_qkt_b_0_0, [%tb1_phase_b_smem_k];
+    ld.shared.b32 %tb1_qkt_b_0_1, [%tb1_phase_b_smem_k];
+    // QK^T MMA tile t=0 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.6)
+    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+        {%s_acc_0_0, %s_acc_0_1, %s_acc_0_2, %s_acc_0_3},
+        {%tb1_qkt_a_0_0, %tb1_qkt_a_0_1, %tb1_qkt_a_0_2, %tb1_qkt_a_0_3},
+        {%tb1_qkt_b_0_0, %tb1_qkt_b_0_1},
+        {%s_acc_0_0, %s_acc_0_1, %s_acc_0_2, %s_acc_0_3};
+    // Online softmax: bq=32 tpw_qkt=1 kv_iter=1
+    // softmax tile t=0 -- placeholder bfly + exp (B1.6 deferral #6)
+    shfl.sync.bfly.b32 %s_acc_0_0, %s_acc_0_0, 4, 0x1f, 0xffffffff;
+    .reg .b32 %p_packed_0;
+    mov.b32 %p_packed_0, %s_acc_0_0;
+    // PV MMA: bq=32 hd=32 tpw_pv=1 slot=1
+    .reg .u64 %tb1_phase_b_smem_v;
+    mov.u64 %tb1_phase_b_smem_v, 0; // placeholder (B1.6 deferral #1)
+    .reg .f32 %o_acc_0_0;
+    mov.f32 %o_acc_0_0, 0f00000000;
+    .reg .f32 %o_acc_0_1;
+    mov.f32 %o_acc_0_1, 0f00000000;
+    .reg .f32 %o_acc_0_2;
+    mov.f32 %o_acc_0_2, 0f00000000;
+    .reg .f32 %o_acc_0_3;
+    mov.f32 %o_acc_0_3, 0f00000000;
+    .reg .b32 %tb1_pv_a_0_0, %tb1_pv_a_0_1, %tb1_pv_a_0_2, %tb1_pv_a_0_3;
+    .reg .b32 %tb1_pv_b_0_0, %tb1_pv_b_0_1;
+    mov.b32 %tb1_pv_a_0_0, %p_packed_0;
+    mov.b32 %tb1_pv_a_0_1, %p_packed_0;
+    mov.b32 %tb1_pv_a_0_2, %p_packed_0;
+    mov.b32 %tb1_pv_a_0_3, %p_packed_0;
+    ld.shared.b32 %tb1_pv_b_0_0, [%tb1_phase_b_smem_v];
+    ld.shared.b32 %tb1_pv_b_0_1, [%tb1_phase_b_smem_v];
+    // PV MMA tile t=0 -- intended ownership: t %% 8 == warp_id (gate NOT yet emitted; B1.6)
+    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+        {%o_acc_0_0, %o_acc_0_1, %o_acc_0_2, %o_acc_0_3},
+        {%tb1_pv_a_0_0, %tb1_pv_a_0_1, %tb1_pv_a_0_2, %tb1_pv_a_0_3},
+        {%tb1_pv_b_0_0, %tb1_pv_b_0_1},
+        {%o_acc_0_0, %o_acc_0_1, %o_acc_0_2, %o_acc_0_3};
