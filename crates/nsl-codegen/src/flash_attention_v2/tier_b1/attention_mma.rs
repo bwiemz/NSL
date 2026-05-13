@@ -18,8 +18,8 @@
 
 use crate::flash_attention::FlashAttentionConfig;
 use crate::flash_attention_v2::smem_layout::{
-    tier_b1_k_offset_ping, tier_b1_k_offset_pong, tier_b1_q_offset, tier_b1_v_offset_ping,
-    tier_b1_v_offset_pong,
+    tier_b1_k_offset_ping, tier_b1_k_offset_pong, tier_b1_p_offset, tier_b1_q_offset,
+    tier_b1_v_offset_ping, tier_b1_v_offset_pong,
 };
 use crate::matmul_mma::{
     emit_load_a_fragment_smem, emit_load_b_fragment_smem, emit_mma_instruction_predicated,
@@ -93,7 +93,106 @@ pub fn emit_phase_b_attention(
     ));
     emit_qkt_mma(ptx, config, slot);
     emit_online_softmax(ptx, config, kv_iter);
+    emit_scatter_p_to_smem(ptx, config);
     emit_pv_mma(ptx, config, slot);
+}
+
+/// Scatter the D-fragment-shaped softmax output `%s_acc_<t>_<i>` to SMEM
+/// at `tier_b1_p_offset` so the PV MMA can load it as an A-fragment via
+/// `matmul_mma::emit_load_a_fragment_smem`. Per spec section 3.5 the
+/// PV A-fragment k=16 span crosses two consecutive QK^T n-tiles, which
+/// can't be sourced from a single D-fragment in-register — the SMEM
+/// round-trip is the standard FA-2 bridge.
+///
+/// Issues a `bar.sync 0` at the end to ensure cross-warp visibility of
+/// the scattered P data before the PV MMA reads from `P_smem`.
+///
+/// Each tile is warp-gated on `%warp_id == (t % 8)` to match the QK^T
+/// MMA's warp ownership pattern — only the owning warp's `%s_acc_*`
+/// registers hold meaningful post-softmax values, and only that warp
+/// writes its tile's slice of P_smem.
+fn emit_scatter_p_to_smem(ptx: &mut String, config: &FlashAttentionConfig) {
+    let tpw = tiles_per_warp_qkt(config);
+    let bkv = config.block_kv as u32;
+    let n_tiles_kv = (bkv / 8).max(1);
+    let p_off = tier_b1_p_offset(config);
+
+    ptx.push_str("    // === P scatter to SMEM (PV A-fragment bridge) ===\n");
+    ptx.push_str("    .reg .u32 %sp_laneid, %sp_lo_row, %sp_lo_col_base;\n");
+    ptx.push_str("    .reg .u32 %sp_row_off, %sp_col_off, %sp_lane_off;\n");
+    ptx.push_str("    .reg .u32 %sp_addr_u32, %sp_addr_i;\n");
+    ptx.push_str("    .reg .u64 %sp_addr_u64;\n");
+    ptx.push_str("    .reg .b16 %sp_h;\n");
+    ptx.push_str("    .reg .pred %sp_warp_pred;\n");
+
+    // Per-lane addressing setup (constant across all tiles for a lane).
+    ptx.push_str("    mov.u32 %sp_laneid, %tid.x;\n");
+    ptx.push_str("    and.b32 %sp_laneid, %sp_laneid, 31;\n");
+    ptx.push_str("    shr.u32 %sp_lo_row, %sp_laneid, 2;       // l/4 = D-fragment lo-row\n");
+    ptx.push_str("    and.b32 %sp_lo_col_base, %sp_laneid, 3;  // l%4\n");
+    ptx.push_str("    shl.b32 %sp_lo_col_base, %sp_lo_col_base, 1; // (l%4)*2 = col base\n");
+    ptx.push_str(&format!(
+        "    mul.lo.u32 %sp_row_off, %sp_lo_row, {};  // row * block_kv * 2 bytes\n",
+        bkv * 2
+    ));
+    ptx.push_str("    shl.b32 %sp_col_off, %sp_lo_col_base, 1;     // col * 2 bytes (f16)\n");
+    ptx.push_str("    add.u32 %sp_lane_off, %sp_row_off, %sp_col_off;\n");
+
+    for t in 0..tpw {
+        let m_tile = t / n_tiles_kv;
+        let n_tile = t % n_tiles_kv;
+        let tile_off_bytes = p_off + m_tile * 16 * bkv * 2 + n_tile * 8 * 2;
+
+        ptx.push_str(&format!(
+            "    // P scatter tile t={} (m_tile={}, n_tile={}, warp owner = {})\n",
+            t,
+            m_tile,
+            n_tile,
+            t % 8
+        ));
+        ptx.push_str(&format!(
+            "    setp.eq.u32 %sp_warp_pred, %warp_id, {};\n",
+            t % 8
+        ));
+        ptx.push_str(&format!(
+            "    add.u64 %sp_addr_u64, %shmem_base, {};\n",
+            tile_off_bytes
+        ));
+        ptx.push_str("    cvt.u32.u64 %sp_addr_u32, %sp_addr_u64;\n");
+        ptx.push_str("    add.u32 %sp_addr_u32, %sp_addr_u32, %sp_lane_off;\n");
+
+        // 4 D-fragment positions per lane:
+        //   i=0: row=lo_row,   col=lo_col_base   → +0
+        //   i=1: row=lo_row,   col=lo_col_base+1 → +2 bytes
+        //   i=2: row=lo_row+8, col=lo_col_base   → +8*bkv*2 bytes
+        //   i=3: row=lo_row+8, col=lo_col_base+1 → +8*bkv*2 + 2 bytes
+        for i in 0..4u32 {
+            let off_bytes: u32 = match i {
+                0 => 0,
+                1 => 2,
+                2 => 8 * bkv * 2,
+                3 => 8 * bkv * 2 + 2,
+                _ => unreachable!(),
+            };
+            if off_bytes > 0 {
+                ptx.push_str(&format!(
+                    "    add.u32 %sp_addr_i, %sp_addr_u32, {};\n",
+                    off_bytes
+                ));
+            } else {
+                ptx.push_str("    mov.u32 %sp_addr_i, %sp_addr_u32;\n");
+            }
+            ptx.push_str(&format!(
+                "    cvt.rn.f16.f32 %sp_h, %s_acc_{}_{};\n",
+                t, i
+            ));
+            ptx.push_str("    @%sp_warp_pred st.shared.b16 [%sp_addr_i], %sp_h;\n");
+        }
+    }
+
+    // CTA-wide sync: ensure all warps see all scattered P values before
+    // any warp reads P_smem in the PV MMA.
+    ptx.push_str("    bar.sync 0;\n");
 }
 
 /// QK^T: m16n8k16 MMA against Q (SMEM, tier_b1_q_offset) and K (SMEM,
@@ -417,6 +516,8 @@ fn emit_online_softmax(ptx: &mut String, config: &FlashAttentionConfig, kv_iter:
 fn emit_pv_mma(ptx: &mut String, config: &FlashAttentionConfig, slot: u32) {
     let tpw = tiles_per_warp_pv(config);
     let hd = config.head_dim as u32;
+    let bkv = config.block_kv as u32;
+    let n_tiles_d_pv = (hd / 8).max(1);
     ptx.push_str(&format!(
         "    // PV MMA: bq={} hd={} tpw_pv={} slot={}\n",
         config.block_q, config.head_dim, tpw, slot
@@ -437,6 +538,17 @@ fn emit_pv_mma(ptx: &mut String, config: &FlashAttentionConfig, slot: u32) {
     ptx.push_str("    .reg .u32 %tb1_phase_b_smem_v_u32;\n");
     ptx.push_str("    cvt.u32.u64 %tb1_phase_b_smem_v_u32, %tb1_phase_b_smem_v;\n");
 
+    // P_smem base for A-fragment loads (set once; per-tile offset added
+    // inside the loop). Bridges softmax's D-fragment output to the PV
+    // A-fragment via `tier_b1_p_offset` (see emit_scatter_p_to_smem).
+    let p_off = tier_b1_p_offset(config);
+    ptx.push_str(&format!(
+        "    add.u64 %tb1_phase_b_smem_q, %shmem_base, {}; // P_smem base (reusing q-slot u64 reg)\n",
+        p_off
+    ));
+    ptx.push_str("    .reg .u32 %tb1_phase_b_smem_p_u32, %tb1_phase_b_smem_p_tile_u32;\n");
+    ptx.push_str("    cvt.u32.u64 %tb1_phase_b_smem_p_u32, %tb1_phase_b_smem_q;\n");
+
     for t in 0..tpw {
         ptx.push_str(&format!(
             "    .reg .b32 %tb1_pv_a_{}_0, %tb1_pv_a_{}_1, %tb1_pv_a_{}_2, %tb1_pv_a_{}_3;\n",
@@ -446,18 +558,45 @@ fn emit_pv_mma(ptx: &mut String, config: &FlashAttentionConfig, slot: u32) {
             "    .reg .b32 %tb1_pv_b_{}_0, %tb1_pv_b_{}_1;\n",
             t, t
         ));
-        // P-packed is in %p_packed_<t>, reuse as the A-fragment lane 0.
-        // (Placeholder: real A-fragment for PV has 4 lanes per thread.
-        // Real mapping requires the m16n8k16 register-A-fragment layout
-        // which differs from the SMEM-A-fragment helper signature; deferred
-        // to a B1.6 follow-on commit.)
+
+        // PV A-fragment via SMEM round-trip. PV tile t has output position
+        // (m_tile_pv = t / (hd/8), n_tile_pv = t % (hd/8)) where m-dim
+        // covers q-rows and n-dim covers head_dim cols. The A-fragment
+        // K-dim spans 16 cols of P starting at k_iter*16 (k_iter = 0 in
+        // the current single-K-iter scaffold).
+        //
+        // A-fragment base = P_smem + m_tile_pv*16*block_kv*2 + 0*2 bytes
+        // (k_iter=0). emit_load_a_fragment_smem then adds `%mma_a_row *
+        // (block_kv * 2)` for the per-lane row offset.
+        let m_tile_pv = t / n_tiles_d_pv;
+        let p_tile_byte_off = m_tile_pv * 16 * bkv * 2;
         ptx.push_str(&format!(
-            "    mov.b32 %tb1_pv_a_{}_0, %p_packed_{};\n",
-            t, t
+            "    // PV A-frag tile t={}: m_tile_pv={} → P_smem +{} bytes\n",
+            t, m_tile_pv, p_tile_byte_off
         ));
-        ptx.push_str(&format!("    mov.b32 %tb1_pv_a_{}_1, %p_packed_{};\n", t, t));
-        ptx.push_str(&format!("    mov.b32 %tb1_pv_a_{}_2, %p_packed_{};\n", t, t));
-        ptx.push_str(&format!("    mov.b32 %tb1_pv_a_{}_3, %p_packed_{};\n", t, t));
+        if p_tile_byte_off > 0 {
+            ptx.push_str(&format!(
+                "    add.u32 %tb1_phase_b_smem_p_tile_u32, %tb1_phase_b_smem_p_u32, {};\n",
+                p_tile_byte_off
+            ));
+        } else {
+            ptx.push_str(
+                "    mov.u32 %tb1_phase_b_smem_p_tile_u32, %tb1_phase_b_smem_p_u32;\n",
+            );
+        }
+        let a_fragment_regs = [
+            format!("tb1_pv_a_{}_0", t),
+            format!("tb1_pv_a_{}_1", t),
+            format!("tb1_pv_a_{}_2", t),
+            format!("tb1_pv_a_{}_3", t),
+        ];
+        emit_load_a_fragment_smem(
+            ptx,
+            &a_fragment_regs,
+            "%tb1_phase_b_smem_p_tile_u32",
+            (bkv * 2) as usize,
+        );
+
         // B1.6 deferral #1 (PV B-fragment): real per-lane V load.
         // V is bkv rows x hd cols; B-fragment col-major stride is hd*2.
         let b_fragment_regs = [

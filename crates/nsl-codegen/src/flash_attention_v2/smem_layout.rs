@@ -450,13 +450,30 @@ pub fn tier_b1_v_offset_pong(config: &FlashAttentionConfig) -> u32 {
     tier_b1_v_offset_ping(config) + bkv * hd * 2
 }
 
-/// W chunk staging region offset. Lives immediately after V pong. Size
-/// is chunk-dependent and sized at emission time (B1.3+) from the
-/// chunk selected by `tier_b1::chunk_config::select`.
-pub fn tier_b1_w_chunk_offset(config: &FlashAttentionConfig) -> u32 {
+/// P scratch region offset. f16 row-major `[block_q, block_kv]`. Lives
+/// immediately after V pong. Used for the SMEM round-trip that bridges
+/// softmax D-fragment-shaped output into the PV MMA's A-fragment input
+/// (B1.6 deferral resolution — required for numerical correctness since
+/// the PV A-fragment k=16 span crosses two consecutive QK^T n-tiles
+/// which can't be sourced from a single D-fragment in-register).
+pub fn tier_b1_p_offset(config: &FlashAttentionConfig) -> u32 {
     let bkv = config.block_kv as u32;
     let hd = config.head_dim as u32;
     tier_b1_v_offset_pong(config) + bkv * hd * 2
+}
+
+/// Size of the P scratch region in bytes (block_q × block_kv f16).
+pub fn tier_b1_p_scratch_bytes(config: &FlashAttentionConfig) -> u32 {
+    let bq = config.block_q as u32;
+    let bkv = config.block_kv as u32;
+    bq * bkv * 2
+}
+
+/// W chunk staging region offset. Lives immediately after P scratch. Size
+/// is chunk-dependent and sized at emission time (B1.3+) from the
+/// chunk selected by `tier_b1::chunk_config::select`.
+pub fn tier_b1_w_chunk_offset(config: &FlashAttentionConfig) -> u32 {
+    tier_b1_p_offset(config) + tier_b1_p_scratch_bytes(config)
 }
 
 /// Validate config against Tier B.1's SMEM budget (per spec section 3.4).
@@ -475,10 +492,11 @@ pub fn validate_tier_b1_config(
     // 4 KV slabs total: K_ping + K_pong + V_ping + V_pong, each
     // `bkv * hd * 2` bytes (f16).
     let kv_ping_pong = 2 * (bkv * hd * 2) + 2 * (bkv * hd * 2);
-    // SP scratch reduced per spec section 3.5 option 1 (S/P scratch
-    // elimination sketched; final form determined at B1.5).
-    let sp_scratch = 0u32;
-    let fixed_bytes = q_tile + kv_ping_pong + sp_scratch;
+    // P scratch: SMEM round-trip for softmax(QK^T) D-fragment → PV
+    // A-fragment bridge (B1.6 deferral resolution). Size = block_q
+    // × block_kv f16.
+    let p_scratch = tier_b1_p_scratch_bytes(config);
+    let fixed_bytes = q_tile + kv_ping_pong + p_scratch;
 
     let chunk_staging = chunk * hd * 2 * 2          // Wk + Wv chunk slots
                       + (bq + bkv) * chunk * 2;     // x_q + x_kv chunk slots
@@ -741,8 +759,16 @@ mod tests {
             "k_offset_pong must precede v_offset_ping");
         assert!(tier_b1_v_offset_ping(&config) < tier_b1_v_offset_pong(&config),
             "v_offset_ping must precede v_offset_pong");
-        assert!(tier_b1_v_offset_pong(&config) < tier_b1_w_chunk_offset(&config),
-            "v_offset_pong must precede w_chunk_offset");
+        assert!(tier_b1_v_offset_pong(&config) < tier_b1_p_offset(&config),
+            "v_offset_pong must precede p_offset");
+        assert!(tier_b1_p_offset(&config) < tier_b1_w_chunk_offset(&config),
+            "p_offset must precede w_chunk_offset");
+        // P scratch is block_q × block_kv f16.
+        assert_eq!(
+            tier_b1_w_chunk_offset(&config) - tier_b1_p_offset(&config),
+            tier_b1_p_scratch_bytes(&config),
+            "p_scratch region between p_offset and w_chunk_offset must equal block_q × block_kv × 2"
+        );
     }
 
     #[test]

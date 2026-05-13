@@ -21,8 +21,8 @@ expression: ptx
     ld.param.u64 %tb1_q_wq_ptr, [csha_wq_ptr];
     setp.eq.u64 %tb1_q_wqnull, %tb1_q_wq_ptr, 0;
     @%tb1_q_wqnull bra V2_TIER_B1_Q_PROJ_SKIP;
-    add.u64 %tb1_q_smem_w, %shmem_base, 40960; // Wq chunk slot (w_chunk_off)
-    add.u64 %tb1_q_smem_x, %shmem_base, 57344; // x_q chunk slot
+    add.u64 %tb1_q_smem_w, %shmem_base, 49152; // Wq chunk slot (w_chunk_off)
+    add.u64 %tb1_q_smem_x, %shmem_base, 65536; // x_q chunk slot
     add.u64 %tb1_q_smem_q, %shmem_base, 0; // Q output tile (tier_b1_q_offset)
     cvt.u32.u64 %tb1_q_smem_w_u32, %tb1_q_smem_w;
     cvt.u32.u64 %tb1_q_smem_x_u32, %tb1_q_smem_x;

@@ -27,9 +27,9 @@ expression: ptx
     ld.param.u64 %tb1_kv_wv_ptr, [csha_wv_ptr];
     setp.eq.u64 %tb1_kv_wvnull, %tb1_kv_wv_ptr, 0;
     @%tb1_kv_wvnull bra V2_TIER_B1_KV_PROJ_SKIP_1;
-    add.u64 %tb1_kv_smem_wk, %shmem_base, 10240; // Wk chunk slot (w_chunk_off slot 0)
-    add.u64 %tb1_kv_smem_wv, %shmem_base, 18432; // Wv chunk slot (w_chunk_off slot 1)
-    add.u64 %tb1_kv_smem_x, %shmem_base, 34816; // x_kv chunk slot (will be narrowed to u32 below)
+    add.u64 %tb1_kv_smem_wk, %shmem_base, 12288; // Wk chunk slot (w_chunk_off slot 0)
+    add.u64 %tb1_kv_smem_wv, %shmem_base, 20480; // Wv chunk slot (w_chunk_off slot 1)
+    add.u64 %tb1_kv_smem_x, %shmem_base, 36864; // x_kv chunk slot (will be narrowed to u32 below)
     cvt.u32.u64 %tb1_kv_smem_wk_u32, %tb1_kv_smem_wk;
     cvt.u32.u64 %tb1_kv_smem_wv_u32, %tb1_kv_smem_wv;
     cvt.u32.u64 %tb1_kv_smem_x_u32, %tb1_kv_smem_x;
