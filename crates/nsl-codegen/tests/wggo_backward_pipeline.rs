@@ -184,7 +184,6 @@ fn wggo_fixture_compile_bundle() -> std::sync::Arc<nsl_codegen::calibration::Cal
 /// across runs without masking real semantic divergence (a structural bug
 /// would produce ≥ 10× larger gaps, as seen during #147 hop 13 development).
 #[test]
-#[cfg_attr(target_os = "macos", ignore = "Cranelift objects have text relocations rejected by the macOS ARM64 PIE linker; tracked separately")]
 fn end_to_end_backward_subprocess_matches_analytical_reference() {
     let data_path = fixture("wggo_calib_data.safetensors");
     let weights_path = fixture("wggo_calib_weights.safetensors");
