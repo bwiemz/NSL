@@ -55,6 +55,21 @@ pub struct LaunchResult {
 ///
 /// Does not panic in release. The skeleton's `todo!()` body panics; this
 /// is replaced in B1.5-2 with the real implementation.
+///
+/// # Safety
+///
+/// Caller must guarantee:
+///
+/// * `func` is a valid `CUfunction` loaded into the current CUDA primary
+///   context. The current thread has that context active (cf.
+///   `nsl-runtime`'s `ensure_context`).
+/// * `args` is a kernel-argument-pointer array shaped per the kernel's
+///   parameter list; each entry points to live, correctly-sized argument
+///   storage for the duration of this call.
+/// * `skip_decisions_buf`, if `Some`, names a live device allocation of
+///   at least the stated byte length and remains live until this call
+///   returns.
+/// * `iterations > 0` (debug-checked).
 pub unsafe fn time_kernel_launches(
     _func: sys::CUfunction,
     _args: &mut [*mut c_void],
