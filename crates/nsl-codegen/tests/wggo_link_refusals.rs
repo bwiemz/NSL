@@ -240,7 +240,6 @@ fn link_fails_when_backward_wrapper_missing() {
 /// the backward symbol must link successfully — the §5.2 guard must NOT fire
 /// for forward-only (AWQ-only) calibration runs.
 #[test]
-#[cfg_attr(target_os = "macos", ignore = "Cranelift objects have text relocations rejected by the macOS ARM64 PIE linker; tracked separately")]
 fn link_succeeds_when_backward_not_needed_and_wrapper_absent() {
     let (ast, interner) = parse_awq_fixture();
     let projections = pre_scan_awq_projections_from_ast(&ast, &interner);

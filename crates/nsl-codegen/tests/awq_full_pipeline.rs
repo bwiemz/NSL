@@ -621,7 +621,6 @@ fn compile_with_options_smoke_test() {
 /// Tighter (e.g. 1e-6) risks flakiness from reduction-order drift;
 /// looser would mask real subprocess-pipeline bugs.
 #[test]
-#[cfg_attr(target_os = "macos", ignore = "Cranelift objects have text relocations rejected by the macOS ARM64 PIE linker; tracked separately")]
 fn end_to_end_real_subprocess_matches_analytical_reference() {
     let data_path = fixture("awq_calib_data.safetensors");
     let weights_path = fixture("awq_calib_weights.safetensors");
@@ -679,7 +678,6 @@ fn end_to_end_real_subprocess_matches_analytical_reference() {
 /// Legitimate future changes (new hooks, format upgrades) must update both
 /// this snapshot AND `CHANGELOG-CALIBRATION.md` — CI enforces the pairing.
 #[test]
-#[cfg_attr(target_os = "macos", ignore = "Cranelift objects have text relocations rejected by the macOS ARM64 PIE linker; tracked separately")]
 fn snapshot_awq_sidecar_baseline() {
     let data_path = fixture("awq_calib_data.safetensors");
     let weights_path = fixture("awq_calib_weights.safetensors");

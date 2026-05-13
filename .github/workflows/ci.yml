@@ -14,21 +14,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: ubuntu-latest
-          - os: windows-latest
-          # macOS ARM64 PIE enforcement rejects Cranelift-generated objects with
-          # absolute relocations in .text sections.  The affected tests are all
-          # #[cfg_attr(target_os = "macos", ignore)]'d, but other macOS-specific
-          # failures (clippy, build order, SDK quirks) remain under investigation.
-          # Mark macOS as optional so these known-flaky platforms do not block
-          # PR merges while the root cause is tracked down.
-          - os: macos-14
-            optional: true
-          - os: macos-latest
-            optional: true
+        os: [ubuntu-latest, windows-latest, macos-14, macos-latest]
     runs-on: ${{ matrix.os }}
-    continue-on-error: ${{ matrix.optional == true }}
 
     steps:
       - uses: actions/checkout@v4
@@ -64,13 +51,7 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace -- -D warnings
 
-      - name: E2E smoke tests (Linux/Windows)
-        if: runner.os != 'macOS'
-        run: cargo test -p nsl-cli --test e2e -- --test-threads=1
-
-      - name: E2E smoke tests (macOS, non-blocking)
-        if: runner.os == 'macOS'
-        continue-on-error: true
+      - name: E2E smoke tests
         run: cargo test -p nsl-cli --test e2e -- --test-threads=1
 
   # WGGO Phase 2 merge-gate preview — runs the `#[ignore]`'d
