@@ -158,11 +158,9 @@ pub fn synthesize_flash_attention_ptx_v2(config: &FlashAttentionConfig) -> Vec<u
             emit_k_tile_load(&mut ptx, config, q_iter);
             phases::s_compute::emit(&mut ptx, config, q_iter, None);
             phases::softmax::emit(&mut ptx, config, q_iter);
-            // PCA Tier B skip target (CSHA S-pass): branches here when
-            // (q,kv) ranges are disjoint.  Note: in the CSHA fused path
-            // PV-accum is a separate loop and is NOT skipped by this branch;
-            // full CSHA Tier B skipping is deferred to Task 8.
-            ptx.push_str(&format!("KV_TILE_SKIP_TB_{}:\n", q_iter));
+            // PCA Tier B skip target deferred to Task 8 (end-to-end wiring);
+            // emitting it unconditionally here would violate spec §3.4.6
+            // no-op guarantee (non-Tier-B kernel snapshots must be byte-identical).
             ptx.push_str(&format!("    add.u64 %k_start, %k_start, {};\n", config.block_kv));
             ptx.push_str("    setp.lt.u64 %p0, %k_start, %k_max;\n");
             ptx.push_str(&format!("    @%p0 bra V2_LOOP_KV_S_{};\n", q_iter));
@@ -297,9 +295,9 @@ pub fn synthesize_flash_attention_ptx_v2(config: &FlashAttentionConfig) -> Vec<u
             );
             phases::pv_accum::emit(&mut ptx, config, q_iter);
 
-            // PCA Tier B skip target: tiles whose (q,kv) ranges were disjoint
-            // branch here, bypassing K-load + QK^T + softmax + PV-accum.
-            ptx.push_str(&format!("KV_TILE_SKIP_TB_{}:\n", q_iter));
+            // PCA Tier B skip target deferred to Task 8 (end-to-end wiring);
+            // emitting it unconditionally here would violate spec §3.4.6
+            // no-op guarantee for non-Tier-B kernel snapshots.
             ptx.push_str(&format!(
                 "    add.u64 %k_start, %k_start, {};\n",
                 config.block_kv
