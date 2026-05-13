@@ -58,3 +58,8 @@ required-features = ["calibrate"]
 [[bin]]
 name = "build_wggo_fixtures"
 path = "src/bin/build_wggo_fixtures.rs"
+
+[[bin]]
+name = "bench"
+path = "src/bin/bench.rs"
+required-features = ["cuda", "debug_kernel_instrumentation"]
