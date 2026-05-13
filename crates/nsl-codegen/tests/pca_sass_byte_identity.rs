@@ -864,6 +864,48 @@ mod tier_b_sass {
     }
 
     #[test]
+    fn tier_b_skip_predicate_branch_is_uniform_sm120() {
+        let (ptxas, cuobjdump) = match tools() {
+            Some(t) => t,
+            None => {
+                eprintln!("SKIP: ptxas or cuobjdump not available on this host");
+                return;
+            }
+        };
+
+        let cfg = tier_b_test_fixture();
+        let mut predicate_ptx = String::new();
+        nsl_codegen::pca_tilerange::emit_skip_predicate(
+            &mut predicate_ptx, &cfg, 4096, "%qt", "%kvt", 0, "KV_TILE_SKIP",
+        );
+
+        // Wrap predicate in a kernel with %qt, %kvt set up + a KV_TILE_SKIP target.
+        let body = format!(
+            "    .reg .u32 %qt, %kvt;\n    mov.u32 %qt, 0;\n    mov.u32 %kvt, 0;\n{predicate_ptx}\nKV_TILE_SKIP:\n    bar.sync 0;\n"
+        );
+        let kernel_ptx = wrap_in_minimal_kernel(&body, 120);
+
+        let sass = match ptx_to_sass_sm(&ptxas, &cuobjdump, &kernel_ptx, 120) {
+            Ok(s) => s,
+            Err(e) => {
+                // ptxas may reject sm_120 on older CUDA toolkits; treat as skip.
+                eprintln!("SKIP: sm_120 assembly failed (CUDA toolkit too old?): {e}");
+                return;
+            }
+        };
+
+        // The predicate branch labeled section is between the "PCA Tier B: skip predicate"
+        // marker comment and "end PCA Tier B skip predicate" marker. ptxas may drop those
+        // comments from SASS, so fall back to grepping the whole SASS for BRA.U as a proxy.
+        let predicate_sass = sass_between(&sass, "PCA Tier B", "end PCA Tier B");
+        let target_sass = if predicate_sass.trim().is_empty() { &sass[..] } else { &predicate_sass };
+        assert!(
+            target_sass.contains("BRA.U") || target_sass.contains("BRA.UNI"),
+            "skip predicate branch not BRA.U on sm_120:\n{target_sass}"
+        );
+    }
+
+    #[test]
     fn tier_b_preamble_sm80_uniform_proxy_via_brau() {
         let (ptxas, cuobjdump) = match tools() {
             Some(t) => t,
