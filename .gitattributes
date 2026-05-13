@@ -6,6 +6,15 @@
 *.snap text eol=lf
 *.sh text eol=lf
 
+# M35.2a design-only enforcement workflow counts non-comment non-blank lines
+# in stub files via `grep -v -E '^\s*(//|$)' | wc -l`. On Windows checkouts
+# with core.autocrlf=true, CRLF can sneak into .rs files and `\r`-only
+# blank lines fail to match `^\s*$`, inflating the line count and risking
+# false-positive CI fails. Pin .rs + .yml to LF to prevent this.
+*.rs text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+
 # Committed CPDT calibration fixtures are binary safetensors; mark as such
 # so git skips text-diff heuristics and CRLF normalization.
 tests/fixtures/cpdt_calibration/*.safetensors binary

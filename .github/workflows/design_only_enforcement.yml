@@ -30,10 +30,13 @@ jobs:
         run: |
           set -e
           fail=0
-          for f in crates/nsl-codegen/src/bitnet/phases/ternary_gemm_backward.rs \
-                   crates/nsl-codegen/src/bitnet/phases/absmax_quant_backward.rs \
-                   crates/nsl-codegen/src/bitnet/phases/quantize_shadow.rs \
-                   crates/nsl-codegen/src/bitnet/orchestrator_train.rs; do
+          # Glob-find pattern matches BLOCKED_ON_V_P1_D.md's documented contract:
+          # *backward*.rs / *shadow*.rs under bitnet/phases/ + orchestrator_train.rs.
+          # Future Stage D sub-specs may add files like ternary_gemm_backward_chunked.rs;
+          # the find pattern captures them automatically without workflow edits.
+          backward_files=$(find crates/nsl-codegen/src/bitnet/phases \
+                              \( -name '*backward*.rs' -o -name '*shadow*.rs' \) 2>/dev/null || true)
+          for f in $backward_files crates/nsl-codegen/src/bitnet/orchestrator_train.rs; do
             if [[ -f "$f" ]]; then
               # Count non-comment, non-blank lines.
               # Comments include lines starting with //, //!, or whitespace+//
