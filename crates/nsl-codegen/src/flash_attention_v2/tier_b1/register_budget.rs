@@ -89,6 +89,25 @@ pub fn declare_registers(ptx: &mut String, config: &FlashAttentionConfig) {
     ptx.push_str("    // Warp-ownership gating predicate (B1.6 deferral #2)\n");
     ptx.push_str("    .reg .pred %wo_pred;\n");
 
+    // MMA fragment-load temps (B1.6 deferral #1 resolution). The helpers
+    // `matmul_mma::emit_load_{a,b}_fragment_smem` write into
+    // %mma_a_row / %mma_b_row / %mma_addr; we precompute the per-lane
+    // %mma_a_row from %tid.x using the m16n8k16 lane-to-row mapping per
+    // spec section 5.5 (row = (laneid % 4) * 2 + laneid / 16; B row
+    // matches A row for the k-dim).
+    ptx.push_str("    // MMA fragment-load temps (B1.6 deferral #1)\n");
+    ptx.push_str("    .reg .f16 %mma_h0, %mma_h1;          // f32->f16 temps\n");
+    ptx.push_str("    .reg .u32 %mma_a_row, %mma_b_row;    // fragment row indices\n");
+    ptx.push_str("    .reg .u32 %mma_addr;                  // SMEM address scratch\n");
+    ptx.push_str("    .reg .u32 %mma_laneid;                // laneid = tid.x % 32\n");
+    ptx.push_str("    mov.u32 %mma_laneid, %tid.x;\n");
+    ptx.push_str("    and.b32 %mma_laneid, %mma_laneid, 31;\n");
+    ptx.push_str("    and.b32 %mma_a_row, %mma_laneid, 3;   // laneid % 4\n");
+    ptx.push_str("    shl.b32 %mma_a_row, %mma_a_row, 1;    // * 2\n");
+    ptx.push_str("    shr.u32 %mma_addr, %mma_laneid, 4;    // laneid / 16 (scratch)\n");
+    ptx.push_str("    add.u32 %mma_a_row, %mma_a_row, %mma_addr; // row = (laneid%4)*2 + laneid/16\n");
+    ptx.push_str("    mov.u32 %mma_b_row, %mma_a_row;       // B row matches A row for k-dim\n");
+
     ptx.push_str("    // === Zero-init all f32 accumulators ===\n");
     for t in 0..tpw_q {
         for lane in 0..4 {

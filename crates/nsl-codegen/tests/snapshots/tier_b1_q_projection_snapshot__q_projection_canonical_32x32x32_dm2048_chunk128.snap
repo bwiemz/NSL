@@ -6,6 +6,7 @@ expression: ptx
     .reg .u64 %tb1_q_x_ptr, %tb1_q_wq_ptr;
     .reg .pred %tb1_q_xnull, %tb1_q_wqnull;
     .reg .u64 %tb1_q_smem_w, %tb1_q_smem_x, %tb1_q_smem_q;
+    .reg .u32 %tb1_q_smem_w_u32, %tb1_q_smem_x_u32;
     .reg .u64 %tb1_q_scatter_addr;
     .reg .b16 %tb1_q_h0, %tb1_q_h1;
     // Null-guard csha_x_ptr; on null, skip Q projection (Tier A path).
@@ -18,6 +19,8 @@ expression: ptx
     add.u64 %tb1_q_smem_w, %shmem_base, 10240; // Wq chunk slot (w_chunk_off)
     add.u64 %tb1_q_smem_x, %shmem_base, 26624; // x_q chunk slot
     add.u64 %tb1_q_smem_q, %shmem_base, 0; // Q output tile (tier_b1_q_offset)
+    cvt.u32.u64 %tb1_q_smem_w_u32, %tb1_q_smem_w;
+    cvt.u32.u64 %tb1_q_smem_x_u32, %tb1_q_smem_x;
     // -- Q-proj chunk 1/16 (d_model offset 0 .. 128) --
     // cp.async Wq[0:128] -> SMEM[w_chunk_off]
     cp.async.cg.shared.global [%tb1_q_smem_w], [%tb1_q_wq_ptr + 0], 16;
@@ -28,12 +31,30 @@ expression: ptx
     bar.sync 0;
     .reg .b32 %tb1_q_a_0_0_0, %tb1_q_a_0_0_1, %tb1_q_a_0_0_2, %tb1_q_a_0_0_3;
     .reg .b32 %tb1_q_b_0_0_0, %tb1_q_b_0_0_1;
-    ld.shared.b32 %tb1_q_a_0_0_0, [%tb1_q_smem_x];
-    ld.shared.b32 %tb1_q_a_0_0_1, [%tb1_q_smem_x];
-    ld.shared.b32 %tb1_q_a_0_0_2, [%tb1_q_smem_x];
-    ld.shared.b32 %tb1_q_a_0_0_3, [%tb1_q_smem_x];
-    ld.shared.b32 %tb1_q_b_0_0_0, [%tb1_q_smem_w];
-    ld.shared.b32 %tb1_q_b_0_0_1, [%tb1_q_smem_w];
+    // Load A-fragment (m16xk16 row-major) from shared memory
+    mul.lo.u32 %mma_addr, %mma_a_row, 256;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_q_smem_x_u32;  // + smem base
+    ld.shared.b32 %tb1_q_a_0_0_0, [%mma_addr];
+    mul.lo.u32 %mma_addr, %mma_a_row, 256;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_q_smem_x_u32;  // + smem base
+    add.u32 %mma_addr, %mma_addr, 8;  // + k byte offset
+    ld.shared.b32 %tb1_q_a_0_0_1, [%mma_addr];
+    mul.lo.u32 %mma_addr, %mma_a_row, 256;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_q_smem_x_u32;  // + smem base
+    add.u32 %mma_addr, %mma_addr, 16;  // + k byte offset
+    ld.shared.b32 %tb1_q_a_0_0_2, [%mma_addr];
+    mul.lo.u32 %mma_addr, %mma_a_row, 256;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_q_smem_x_u32;  // + smem base
+    add.u32 %mma_addr, %mma_addr, 24;  // + k byte offset
+    ld.shared.b32 %tb1_q_a_0_0_3, [%mma_addr];
+    // Load B-fragment (k16xn8 col-major) from shared memory
+    mul.lo.u32 %mma_addr, %mma_b_row, 64;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_q_smem_w_u32;  // + smem base
+    ld.shared.b32 %tb1_q_b_0_0_0, [%mma_addr];
+    mul.lo.u32 %mma_addr, %mma_b_row, 64;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_q_smem_w_u32;  // + smem base
+    add.u32 %mma_addr, %mma_addr, 16;  // + k byte offset
+    ld.shared.b32 %tb1_q_b_0_0_1, [%mma_addr];
     setp.eq.u32 %wo_pred, %warp_id, 0; // Q-proj tile t=0 ownership
     @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_0_0, %q_acc_0_1, %q_acc_0_2, %q_acc_0_3},
@@ -50,12 +71,30 @@ expression: ptx
     bar.sync 0;
     .reg .b32 %tb1_q_a_1_0_0, %tb1_q_a_1_0_1, %tb1_q_a_1_0_2, %tb1_q_a_1_0_3;
     .reg .b32 %tb1_q_b_1_0_0, %tb1_q_b_1_0_1;
-    ld.shared.b32 %tb1_q_a_1_0_0, [%tb1_q_smem_x];
-    ld.shared.b32 %tb1_q_a_1_0_1, [%tb1_q_smem_x];
-    ld.shared.b32 %tb1_q_a_1_0_2, [%tb1_q_smem_x];
-    ld.shared.b32 %tb1_q_a_1_0_3, [%tb1_q_smem_x];
-    ld.shared.b32 %tb1_q_b_1_0_0, [%tb1_q_smem_w];
-    ld.shared.b32 %tb1_q_b_1_0_1, [%tb1_q_smem_w];
+    // Load A-fragment (m16xk16 row-major) from shared memory
+    mul.lo.u32 %mma_addr, %mma_a_row, 256;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_q_smem_x_u32;  // + smem base
+    ld.shared.b32 %tb1_q_a_1_0_0, [%mma_addr];
+    mul.lo.u32 %mma_addr, %mma_a_row, 256;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_q_smem_x_u32;  // + smem base
+    add.u32 %mma_addr, %mma_addr, 8;  // + k byte offset
+    ld.shared.b32 %tb1_q_a_1_0_1, [%mma_addr];
+    mul.lo.u32 %mma_addr, %mma_a_row, 256;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_q_smem_x_u32;  // + smem base
+    add.u32 %mma_addr, %mma_addr, 16;  // + k byte offset
+    ld.shared.b32 %tb1_q_a_1_0_2, [%mma_addr];
+    mul.lo.u32 %mma_addr, %mma_a_row, 256;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_q_smem_x_u32;  // + smem base
+    add.u32 %mma_addr, %mma_addr, 24;  // + k byte offset
+    ld.shared.b32 %tb1_q_a_1_0_3, [%mma_addr];
+    // Load B-fragment (k16xn8 col-major) from shared memory
+    mul.lo.u32 %mma_addr, %mma_b_row, 64;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_q_smem_w_u32;  // + smem base
+    ld.shared.b32 %tb1_q_b_1_0_0, [%mma_addr];
+    mul.lo.u32 %mma_addr, %mma_b_row, 64;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_q_smem_w_u32;  // + smem base
+    add.u32 %mma_addr, %mma_addr, 16;  // + k byte offset
+    ld.shared.b32 %tb1_q_b_1_0_1, [%mma_addr];
     setp.eq.u32 %wo_pred, %warp_id, 0; // Q-proj tile t=0 ownership
     @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_0_0, %q_acc_0_1, %q_acc_0_2, %q_acc_0_3},
@@ -72,12 +111,30 @@ expression: ptx
     bar.sync 0;
     .reg .b32 %tb1_q_a_2_0_0, %tb1_q_a_2_0_1, %tb1_q_a_2_0_2, %tb1_q_a_2_0_3;
     .reg .b32 %tb1_q_b_2_0_0, %tb1_q_b_2_0_1;
-    ld.shared.b32 %tb1_q_a_2_0_0, [%tb1_q_smem_x];
-    ld.shared.b32 %tb1_q_a_2_0_1, [%tb1_q_smem_x];
-    ld.shared.b32 %tb1_q_a_2_0_2, [%tb1_q_smem_x];
-    ld.shared.b32 %tb1_q_a_2_0_3, [%tb1_q_smem_x];
-    ld.shared.b32 %tb1_q_b_2_0_0, [%tb1_q_smem_w];
-    ld.shared.b32 %tb1_q_b_2_0_1, [%tb1_q_smem_w];
+    // Load A-fragment (m16xk16 row-major) from shared memory
+    mul.lo.u32 %mma_addr, %mma_a_row, 256;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_q_smem_x_u32;  // + smem base
+    ld.shared.b32 %tb1_q_a_2_0_0, [%mma_addr];
+    mul.lo.u32 %mma_addr, %mma_a_row, 256;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_q_smem_x_u32;  // + smem base
+    add.u32 %mma_addr, %mma_addr, 8;  // + k byte offset
+    ld.shared.b32 %tb1_q_a_2_0_1, [%mma_addr];
+    mul.lo.u32 %mma_addr, %mma_a_row, 256;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_q_smem_x_u32;  // + smem base
+    add.u32 %mma_addr, %mma_addr, 16;  // + k byte offset
+    ld.shared.b32 %tb1_q_a_2_0_2, [%mma_addr];
+    mul.lo.u32 %mma_addr, %mma_a_row, 256;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_q_smem_x_u32;  // + smem base
+    add.u32 %mma_addr, %mma_addr, 24;  // + k byte offset
+    ld.shared.b32 %tb1_q_a_2_0_3, [%mma_addr];
+    // Load B-fragment (k16xn8 col-major) from shared memory
+    mul.lo.u32 %mma_addr, %mma_b_row, 64;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_q_smem_w_u32;  // + smem base
+    ld.shared.b32 %tb1_q_b_2_0_0, [%mma_addr];
+    mul.lo.u32 %mma_addr, %mma_b_row, 64;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_q_smem_w_u32;  // + smem base
+    add.u32 %mma_addr, %mma_addr, 16;  // + k byte offset
+    ld.shared.b32 %tb1_q_b_2_0_1, [%mma_addr];
     setp.eq.u32 %wo_pred, %warp_id, 0; // Q-proj tile t=0 ownership
     @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_0_0, %q_acc_0_1, %q_acc_0_2, %q_acc_0_3},
@@ -94,12 +151,30 @@ expression: ptx
     bar.sync 0;
     .reg .b32 %tb1_q_a_3_0_0, %tb1_q_a_3_0_1, %tb1_q_a_3_0_2, %tb1_q_a_3_0_3;
     .reg .b32 %tb1_q_b_3_0_0, %tb1_q_b_3_0_1;
-    ld.shared.b32 %tb1_q_a_3_0_0, [%tb1_q_smem_x];
-    ld.shared.b32 %tb1_q_a_3_0_1, [%tb1_q_smem_x];
-    ld.shared.b32 %tb1_q_a_3_0_2, [%tb1_q_smem_x];
-    ld.shared.b32 %tb1_q_a_3_0_3, [%tb1_q_smem_x];
-    ld.shared.b32 %tb1_q_b_3_0_0, [%tb1_q_smem_w];
-    ld.shared.b32 %tb1_q_b_3_0_1, [%tb1_q_smem_w];
+    // Load A-fragment (m16xk16 row-major) from shared memory
+    mul.lo.u32 %mma_addr, %mma_a_row, 256;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_q_smem_x_u32;  // + smem base
+    ld.shared.b32 %tb1_q_a_3_0_0, [%mma_addr];
+    mul.lo.u32 %mma_addr, %mma_a_row, 256;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_q_smem_x_u32;  // + smem base
+    add.u32 %mma_addr, %mma_addr, 8;  // + k byte offset
+    ld.shared.b32 %tb1_q_a_3_0_1, [%mma_addr];
+    mul.lo.u32 %mma_addr, %mma_a_row, 256;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_q_smem_x_u32;  // + smem base
+    add.u32 %mma_addr, %mma_addr, 16;  // + k byte offset
+    ld.shared.b32 %tb1_q_a_3_0_2, [%mma_addr];
+    mul.lo.u32 %mma_addr, %mma_a_row, 256;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_q_smem_x_u32;  // + smem base
+    add.u32 %mma_addr, %mma_addr, 24;  // + k byte offset
+    ld.shared.b32 %tb1_q_a_3_0_3, [%mma_addr];
+    // Load B-fragment (k16xn8 col-major) from shared memory
+    mul.lo.u32 %mma_addr, %mma_b_row, 64;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_q_smem_w_u32;  // + smem base
+    ld.shared.b32 %tb1_q_b_3_0_0, [%mma_addr];
+    mul.lo.u32 %mma_addr, %mma_b_row, 64;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_q_smem_w_u32;  // + smem base
+    add.u32 %mma_addr, %mma_addr, 16;  // + k byte offset
+    ld.shared.b32 %tb1_q_b_3_0_1, [%mma_addr];
     setp.eq.u32 %wo_pred, %warp_id, 0; // Q-proj tile t=0 ownership
     @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_0_0, %q_acc_0_1, %q_acc_0_2, %q_acc_0_3},
@@ -116,12 +191,30 @@ expression: ptx
     bar.sync 0;
     .reg .b32 %tb1_q_a_4_0_0, %tb1_q_a_4_0_1, %tb1_q_a_4_0_2, %tb1_q_a_4_0_3;
     .reg .b32 %tb1_q_b_4_0_0, %tb1_q_b_4_0_1;
-    ld.shared.b32 %tb1_q_a_4_0_0, [%tb1_q_smem_x];
-    ld.shared.b32 %tb1_q_a_4_0_1, [%tb1_q_smem_x];
-    ld.shared.b32 %tb1_q_a_4_0_2, [%tb1_q_smem_x];
-    ld.shared.b32 %tb1_q_a_4_0_3, [%tb1_q_smem_x];
-    ld.shared.b32 %tb1_q_b_4_0_0, [%tb1_q_smem_w];
-    ld.shared.b32 %tb1_q_b_4_0_1, [%tb1_q_smem_w];
+    // Load A-fragment (m16xk16 row-major) from shared memory
+    mul.lo.u32 %mma_addr, %mma_a_row, 256;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_q_smem_x_u32;  // + smem base
+    ld.shared.b32 %tb1_q_a_4_0_0, [%mma_addr];
+    mul.lo.u32 %mma_addr, %mma_a_row, 256;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_q_smem_x_u32;  // + smem base
+    add.u32 %mma_addr, %mma_addr, 8;  // + k byte offset
+    ld.shared.b32 %tb1_q_a_4_0_1, [%mma_addr];
+    mul.lo.u32 %mma_addr, %mma_a_row, 256;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_q_smem_x_u32;  // + smem base
+    add.u32 %mma_addr, %mma_addr, 16;  // + k byte offset
+    ld.shared.b32 %tb1_q_a_4_0_2, [%mma_addr];
+    mul.lo.u32 %mma_addr, %mma_a_row, 256;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_q_smem_x_u32;  // + smem base
+    add.u32 %mma_addr, %mma_addr, 24;  // + k byte offset
+    ld.shared.b32 %tb1_q_a_4_0_3, [%mma_addr];
+    // Load B-fragment (k16xn8 col-major) from shared memory
+    mul.lo.u32 %mma_addr, %mma_b_row, 64;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_q_smem_w_u32;  // + smem base
+    ld.shared.b32 %tb1_q_b_4_0_0, [%mma_addr];
+    mul.lo.u32 %mma_addr, %mma_b_row, 64;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_q_smem_w_u32;  // + smem base
+    add.u32 %mma_addr, %mma_addr, 16;  // + k byte offset
+    ld.shared.b32 %tb1_q_b_4_0_1, [%mma_addr];
     setp.eq.u32 %wo_pred, %warp_id, 0; // Q-proj tile t=0 ownership
     @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_0_0, %q_acc_0_1, %q_acc_0_2, %q_acc_0_3},
@@ -138,12 +231,30 @@ expression: ptx
     bar.sync 0;
     .reg .b32 %tb1_q_a_5_0_0, %tb1_q_a_5_0_1, %tb1_q_a_5_0_2, %tb1_q_a_5_0_3;
     .reg .b32 %tb1_q_b_5_0_0, %tb1_q_b_5_0_1;
-    ld.shared.b32 %tb1_q_a_5_0_0, [%tb1_q_smem_x];
-    ld.shared.b32 %tb1_q_a_5_0_1, [%tb1_q_smem_x];
-    ld.shared.b32 %tb1_q_a_5_0_2, [%tb1_q_smem_x];
-    ld.shared.b32 %tb1_q_a_5_0_3, [%tb1_q_smem_x];
-    ld.shared.b32 %tb1_q_b_5_0_0, [%tb1_q_smem_w];
-    ld.shared.b32 %tb1_q_b_5_0_1, [%tb1_q_smem_w];
+    // Load A-fragment (m16xk16 row-major) from shared memory
+    mul.lo.u32 %mma_addr, %mma_a_row, 256;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_q_smem_x_u32;  // + smem base
+    ld.shared.b32 %tb1_q_a_5_0_0, [%mma_addr];
+    mul.lo.u32 %mma_addr, %mma_a_row, 256;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_q_smem_x_u32;  // + smem base
+    add.u32 %mma_addr, %mma_addr, 8;  // + k byte offset
+    ld.shared.b32 %tb1_q_a_5_0_1, [%mma_addr];
+    mul.lo.u32 %mma_addr, %mma_a_row, 256;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_q_smem_x_u32;  // + smem base
+    add.u32 %mma_addr, %mma_addr, 16;  // + k byte offset
+    ld.shared.b32 %tb1_q_a_5_0_2, [%mma_addr];
+    mul.lo.u32 %mma_addr, %mma_a_row, 256;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_q_smem_x_u32;  // + smem base
+    add.u32 %mma_addr, %mma_addr, 24;  // + k byte offset
+    ld.shared.b32 %tb1_q_a_5_0_3, [%mma_addr];
+    // Load B-fragment (k16xn8 col-major) from shared memory
+    mul.lo.u32 %mma_addr, %mma_b_row, 64;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_q_smem_w_u32;  // + smem base
+    ld.shared.b32 %tb1_q_b_5_0_0, [%mma_addr];
+    mul.lo.u32 %mma_addr, %mma_b_row, 64;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_q_smem_w_u32;  // + smem base
+    add.u32 %mma_addr, %mma_addr, 16;  // + k byte offset
+    ld.shared.b32 %tb1_q_b_5_0_1, [%mma_addr];
     setp.eq.u32 %wo_pred, %warp_id, 0; // Q-proj tile t=0 ownership
     @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_0_0, %q_acc_0_1, %q_acc_0_2, %q_acc_0_3},
@@ -160,12 +271,30 @@ expression: ptx
     bar.sync 0;
     .reg .b32 %tb1_q_a_6_0_0, %tb1_q_a_6_0_1, %tb1_q_a_6_0_2, %tb1_q_a_6_0_3;
     .reg .b32 %tb1_q_b_6_0_0, %tb1_q_b_6_0_1;
-    ld.shared.b32 %tb1_q_a_6_0_0, [%tb1_q_smem_x];
-    ld.shared.b32 %tb1_q_a_6_0_1, [%tb1_q_smem_x];
-    ld.shared.b32 %tb1_q_a_6_0_2, [%tb1_q_smem_x];
-    ld.shared.b32 %tb1_q_a_6_0_3, [%tb1_q_smem_x];
-    ld.shared.b32 %tb1_q_b_6_0_0, [%tb1_q_smem_w];
-    ld.shared.b32 %tb1_q_b_6_0_1, [%tb1_q_smem_w];
+    // Load A-fragment (m16xk16 row-major) from shared memory
+    mul.lo.u32 %mma_addr, %mma_a_row, 256;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_q_smem_x_u32;  // + smem base
+    ld.shared.b32 %tb1_q_a_6_0_0, [%mma_addr];
+    mul.lo.u32 %mma_addr, %mma_a_row, 256;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_q_smem_x_u32;  // + smem base
+    add.u32 %mma_addr, %mma_addr, 8;  // + k byte offset
+    ld.shared.b32 %tb1_q_a_6_0_1, [%mma_addr];
+    mul.lo.u32 %mma_addr, %mma_a_row, 256;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_q_smem_x_u32;  // + smem base
+    add.u32 %mma_addr, %mma_addr, 16;  // + k byte offset
+    ld.shared.b32 %tb1_q_a_6_0_2, [%mma_addr];
+    mul.lo.u32 %mma_addr, %mma_a_row, 256;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_q_smem_x_u32;  // + smem base
+    add.u32 %mma_addr, %mma_addr, 24;  // + k byte offset
+    ld.shared.b32 %tb1_q_a_6_0_3, [%mma_addr];
+    // Load B-fragment (k16xn8 col-major) from shared memory
+    mul.lo.u32 %mma_addr, %mma_b_row, 64;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_q_smem_w_u32;  // + smem base
+    ld.shared.b32 %tb1_q_b_6_0_0, [%mma_addr];
+    mul.lo.u32 %mma_addr, %mma_b_row, 64;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_q_smem_w_u32;  // + smem base
+    add.u32 %mma_addr, %mma_addr, 16;  // + k byte offset
+    ld.shared.b32 %tb1_q_b_6_0_1, [%mma_addr];
     setp.eq.u32 %wo_pred, %warp_id, 0; // Q-proj tile t=0 ownership
     @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_0_0, %q_acc_0_1, %q_acc_0_2, %q_acc_0_3},
@@ -182,12 +311,30 @@ expression: ptx
     bar.sync 0;
     .reg .b32 %tb1_q_a_7_0_0, %tb1_q_a_7_0_1, %tb1_q_a_7_0_2, %tb1_q_a_7_0_3;
     .reg .b32 %tb1_q_b_7_0_0, %tb1_q_b_7_0_1;
-    ld.shared.b32 %tb1_q_a_7_0_0, [%tb1_q_smem_x];
-    ld.shared.b32 %tb1_q_a_7_0_1, [%tb1_q_smem_x];
-    ld.shared.b32 %tb1_q_a_7_0_2, [%tb1_q_smem_x];
-    ld.shared.b32 %tb1_q_a_7_0_3, [%tb1_q_smem_x];
-    ld.shared.b32 %tb1_q_b_7_0_0, [%tb1_q_smem_w];
-    ld.shared.b32 %tb1_q_b_7_0_1, [%tb1_q_smem_w];
+    // Load A-fragment (m16xk16 row-major) from shared memory
+    mul.lo.u32 %mma_addr, %mma_a_row, 256;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_q_smem_x_u32;  // + smem base
+    ld.shared.b32 %tb1_q_a_7_0_0, [%mma_addr];
+    mul.lo.u32 %mma_addr, %mma_a_row, 256;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_q_smem_x_u32;  // + smem base
+    add.u32 %mma_addr, %mma_addr, 8;  // + k byte offset
+    ld.shared.b32 %tb1_q_a_7_0_1, [%mma_addr];
+    mul.lo.u32 %mma_addr, %mma_a_row, 256;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_q_smem_x_u32;  // + smem base
+    add.u32 %mma_addr, %mma_addr, 16;  // + k byte offset
+    ld.shared.b32 %tb1_q_a_7_0_2, [%mma_addr];
+    mul.lo.u32 %mma_addr, %mma_a_row, 256;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_q_smem_x_u32;  // + smem base
+    add.u32 %mma_addr, %mma_addr, 24;  // + k byte offset
+    ld.shared.b32 %tb1_q_a_7_0_3, [%mma_addr];
+    // Load B-fragment (k16xn8 col-major) from shared memory
+    mul.lo.u32 %mma_addr, %mma_b_row, 64;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_q_smem_w_u32;  // + smem base
+    ld.shared.b32 %tb1_q_b_7_0_0, [%mma_addr];
+    mul.lo.u32 %mma_addr, %mma_b_row, 64;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_q_smem_w_u32;  // + smem base
+    add.u32 %mma_addr, %mma_addr, 16;  // + k byte offset
+    ld.shared.b32 %tb1_q_b_7_0_1, [%mma_addr];
     setp.eq.u32 %wo_pred, %warp_id, 0; // Q-proj tile t=0 ownership
     @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_0_0, %q_acc_0_1, %q_acc_0_2, %q_acc_0_3},
@@ -204,12 +351,30 @@ expression: ptx
     bar.sync 0;
     .reg .b32 %tb1_q_a_8_0_0, %tb1_q_a_8_0_1, %tb1_q_a_8_0_2, %tb1_q_a_8_0_3;
     .reg .b32 %tb1_q_b_8_0_0, %tb1_q_b_8_0_1;
-    ld.shared.b32 %tb1_q_a_8_0_0, [%tb1_q_smem_x];
-    ld.shared.b32 %tb1_q_a_8_0_1, [%tb1_q_smem_x];
-    ld.shared.b32 %tb1_q_a_8_0_2, [%tb1_q_smem_x];
-    ld.shared.b32 %tb1_q_a_8_0_3, [%tb1_q_smem_x];
-    ld.shared.b32 %tb1_q_b_8_0_0, [%tb1_q_smem_w];
-    ld.shared.b32 %tb1_q_b_8_0_1, [%tb1_q_smem_w];
+    // Load A-fragment (m16xk16 row-major) from shared memory
+    mul.lo.u32 %mma_addr, %mma_a_row, 256;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_q_smem_x_u32;  // + smem base
+    ld.shared.b32 %tb1_q_a_8_0_0, [%mma_addr];
+    mul.lo.u32 %mma_addr, %mma_a_row, 256;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_q_smem_x_u32;  // + smem base
+    add.u32 %mma_addr, %mma_addr, 8;  // + k byte offset
+    ld.shared.b32 %tb1_q_a_8_0_1, [%mma_addr];
+    mul.lo.u32 %mma_addr, %mma_a_row, 256;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_q_smem_x_u32;  // + smem base
+    add.u32 %mma_addr, %mma_addr, 16;  // + k byte offset
+    ld.shared.b32 %tb1_q_a_8_0_2, [%mma_addr];
+    mul.lo.u32 %mma_addr, %mma_a_row, 256;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_q_smem_x_u32;  // + smem base
+    add.u32 %mma_addr, %mma_addr, 24;  // + k byte offset
+    ld.shared.b32 %tb1_q_a_8_0_3, [%mma_addr];
+    // Load B-fragment (k16xn8 col-major) from shared memory
+    mul.lo.u32 %mma_addr, %mma_b_row, 64;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_q_smem_w_u32;  // + smem base
+    ld.shared.b32 %tb1_q_b_8_0_0, [%mma_addr];
+    mul.lo.u32 %mma_addr, %mma_b_row, 64;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_q_smem_w_u32;  // + smem base
+    add.u32 %mma_addr, %mma_addr, 16;  // + k byte offset
+    ld.shared.b32 %tb1_q_b_8_0_1, [%mma_addr];
     setp.eq.u32 %wo_pred, %warp_id, 0; // Q-proj tile t=0 ownership
     @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_0_0, %q_acc_0_1, %q_acc_0_2, %q_acc_0_3},
@@ -226,12 +391,30 @@ expression: ptx
     bar.sync 0;
     .reg .b32 %tb1_q_a_9_0_0, %tb1_q_a_9_0_1, %tb1_q_a_9_0_2, %tb1_q_a_9_0_3;
     .reg .b32 %tb1_q_b_9_0_0, %tb1_q_b_9_0_1;
-    ld.shared.b32 %tb1_q_a_9_0_0, [%tb1_q_smem_x];
-    ld.shared.b32 %tb1_q_a_9_0_1, [%tb1_q_smem_x];
-    ld.shared.b32 %tb1_q_a_9_0_2, [%tb1_q_smem_x];
-    ld.shared.b32 %tb1_q_a_9_0_3, [%tb1_q_smem_x];
-    ld.shared.b32 %tb1_q_b_9_0_0, [%tb1_q_smem_w];
-    ld.shared.b32 %tb1_q_b_9_0_1, [%tb1_q_smem_w];
+    // Load A-fragment (m16xk16 row-major) from shared memory
+    mul.lo.u32 %mma_addr, %mma_a_row, 256;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_q_smem_x_u32;  // + smem base
+    ld.shared.b32 %tb1_q_a_9_0_0, [%mma_addr];
+    mul.lo.u32 %mma_addr, %mma_a_row, 256;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_q_smem_x_u32;  // + smem base
+    add.u32 %mma_addr, %mma_addr, 8;  // + k byte offset
+    ld.shared.b32 %tb1_q_a_9_0_1, [%mma_addr];
+    mul.lo.u32 %mma_addr, %mma_a_row, 256;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_q_smem_x_u32;  // + smem base
+    add.u32 %mma_addr, %mma_addr, 16;  // + k byte offset
+    ld.shared.b32 %tb1_q_a_9_0_2, [%mma_addr];
+    mul.lo.u32 %mma_addr, %mma_a_row, 256;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_q_smem_x_u32;  // + smem base
+    add.u32 %mma_addr, %mma_addr, 24;  // + k byte offset
+    ld.shared.b32 %tb1_q_a_9_0_3, [%mma_addr];
+    // Load B-fragment (k16xn8 col-major) from shared memory
+    mul.lo.u32 %mma_addr, %mma_b_row, 64;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_q_smem_w_u32;  // + smem base
+    ld.shared.b32 %tb1_q_b_9_0_0, [%mma_addr];
+    mul.lo.u32 %mma_addr, %mma_b_row, 64;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_q_smem_w_u32;  // + smem base
+    add.u32 %mma_addr, %mma_addr, 16;  // + k byte offset
+    ld.shared.b32 %tb1_q_b_9_0_1, [%mma_addr];
     setp.eq.u32 %wo_pred, %warp_id, 0; // Q-proj tile t=0 ownership
     @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_0_0, %q_acc_0_1, %q_acc_0_2, %q_acc_0_3},
@@ -248,12 +431,30 @@ expression: ptx
     bar.sync 0;
     .reg .b32 %tb1_q_a_10_0_0, %tb1_q_a_10_0_1, %tb1_q_a_10_0_2, %tb1_q_a_10_0_3;
     .reg .b32 %tb1_q_b_10_0_0, %tb1_q_b_10_0_1;
-    ld.shared.b32 %tb1_q_a_10_0_0, [%tb1_q_smem_x];
-    ld.shared.b32 %tb1_q_a_10_0_1, [%tb1_q_smem_x];
-    ld.shared.b32 %tb1_q_a_10_0_2, [%tb1_q_smem_x];
-    ld.shared.b32 %tb1_q_a_10_0_3, [%tb1_q_smem_x];
-    ld.shared.b32 %tb1_q_b_10_0_0, [%tb1_q_smem_w];
-    ld.shared.b32 %tb1_q_b_10_0_1, [%tb1_q_smem_w];
+    // Load A-fragment (m16xk16 row-major) from shared memory
+    mul.lo.u32 %mma_addr, %mma_a_row, 256;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_q_smem_x_u32;  // + smem base
+    ld.shared.b32 %tb1_q_a_10_0_0, [%mma_addr];
+    mul.lo.u32 %mma_addr, %mma_a_row, 256;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_q_smem_x_u32;  // + smem base
+    add.u32 %mma_addr, %mma_addr, 8;  // + k byte offset
+    ld.shared.b32 %tb1_q_a_10_0_1, [%mma_addr];
+    mul.lo.u32 %mma_addr, %mma_a_row, 256;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_q_smem_x_u32;  // + smem base
+    add.u32 %mma_addr, %mma_addr, 16;  // + k byte offset
+    ld.shared.b32 %tb1_q_a_10_0_2, [%mma_addr];
+    mul.lo.u32 %mma_addr, %mma_a_row, 256;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_q_smem_x_u32;  // + smem base
+    add.u32 %mma_addr, %mma_addr, 24;  // + k byte offset
+    ld.shared.b32 %tb1_q_a_10_0_3, [%mma_addr];
+    // Load B-fragment (k16xn8 col-major) from shared memory
+    mul.lo.u32 %mma_addr, %mma_b_row, 64;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_q_smem_w_u32;  // + smem base
+    ld.shared.b32 %tb1_q_b_10_0_0, [%mma_addr];
+    mul.lo.u32 %mma_addr, %mma_b_row, 64;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_q_smem_w_u32;  // + smem base
+    add.u32 %mma_addr, %mma_addr, 16;  // + k byte offset
+    ld.shared.b32 %tb1_q_b_10_0_1, [%mma_addr];
     setp.eq.u32 %wo_pred, %warp_id, 0; // Q-proj tile t=0 ownership
     @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_0_0, %q_acc_0_1, %q_acc_0_2, %q_acc_0_3},
@@ -270,12 +471,30 @@ expression: ptx
     bar.sync 0;
     .reg .b32 %tb1_q_a_11_0_0, %tb1_q_a_11_0_1, %tb1_q_a_11_0_2, %tb1_q_a_11_0_3;
     .reg .b32 %tb1_q_b_11_0_0, %tb1_q_b_11_0_1;
-    ld.shared.b32 %tb1_q_a_11_0_0, [%tb1_q_smem_x];
-    ld.shared.b32 %tb1_q_a_11_0_1, [%tb1_q_smem_x];
-    ld.shared.b32 %tb1_q_a_11_0_2, [%tb1_q_smem_x];
-    ld.shared.b32 %tb1_q_a_11_0_3, [%tb1_q_smem_x];
-    ld.shared.b32 %tb1_q_b_11_0_0, [%tb1_q_smem_w];
-    ld.shared.b32 %tb1_q_b_11_0_1, [%tb1_q_smem_w];
+    // Load A-fragment (m16xk16 row-major) from shared memory
+    mul.lo.u32 %mma_addr, %mma_a_row, 256;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_q_smem_x_u32;  // + smem base
+    ld.shared.b32 %tb1_q_a_11_0_0, [%mma_addr];
+    mul.lo.u32 %mma_addr, %mma_a_row, 256;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_q_smem_x_u32;  // + smem base
+    add.u32 %mma_addr, %mma_addr, 8;  // + k byte offset
+    ld.shared.b32 %tb1_q_a_11_0_1, [%mma_addr];
+    mul.lo.u32 %mma_addr, %mma_a_row, 256;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_q_smem_x_u32;  // + smem base
+    add.u32 %mma_addr, %mma_addr, 16;  // + k byte offset
+    ld.shared.b32 %tb1_q_a_11_0_2, [%mma_addr];
+    mul.lo.u32 %mma_addr, %mma_a_row, 256;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_q_smem_x_u32;  // + smem base
+    add.u32 %mma_addr, %mma_addr, 24;  // + k byte offset
+    ld.shared.b32 %tb1_q_a_11_0_3, [%mma_addr];
+    // Load B-fragment (k16xn8 col-major) from shared memory
+    mul.lo.u32 %mma_addr, %mma_b_row, 64;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_q_smem_w_u32;  // + smem base
+    ld.shared.b32 %tb1_q_b_11_0_0, [%mma_addr];
+    mul.lo.u32 %mma_addr, %mma_b_row, 64;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_q_smem_w_u32;  // + smem base
+    add.u32 %mma_addr, %mma_addr, 16;  // + k byte offset
+    ld.shared.b32 %tb1_q_b_11_0_1, [%mma_addr];
     setp.eq.u32 %wo_pred, %warp_id, 0; // Q-proj tile t=0 ownership
     @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_0_0, %q_acc_0_1, %q_acc_0_2, %q_acc_0_3},
@@ -292,12 +511,30 @@ expression: ptx
     bar.sync 0;
     .reg .b32 %tb1_q_a_12_0_0, %tb1_q_a_12_0_1, %tb1_q_a_12_0_2, %tb1_q_a_12_0_3;
     .reg .b32 %tb1_q_b_12_0_0, %tb1_q_b_12_0_1;
-    ld.shared.b32 %tb1_q_a_12_0_0, [%tb1_q_smem_x];
-    ld.shared.b32 %tb1_q_a_12_0_1, [%tb1_q_smem_x];
-    ld.shared.b32 %tb1_q_a_12_0_2, [%tb1_q_smem_x];
-    ld.shared.b32 %tb1_q_a_12_0_3, [%tb1_q_smem_x];
-    ld.shared.b32 %tb1_q_b_12_0_0, [%tb1_q_smem_w];
-    ld.shared.b32 %tb1_q_b_12_0_1, [%tb1_q_smem_w];
+    // Load A-fragment (m16xk16 row-major) from shared memory
+    mul.lo.u32 %mma_addr, %mma_a_row, 256;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_q_smem_x_u32;  // + smem base
+    ld.shared.b32 %tb1_q_a_12_0_0, [%mma_addr];
+    mul.lo.u32 %mma_addr, %mma_a_row, 256;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_q_smem_x_u32;  // + smem base
+    add.u32 %mma_addr, %mma_addr, 8;  // + k byte offset
+    ld.shared.b32 %tb1_q_a_12_0_1, [%mma_addr];
+    mul.lo.u32 %mma_addr, %mma_a_row, 256;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_q_smem_x_u32;  // + smem base
+    add.u32 %mma_addr, %mma_addr, 16;  // + k byte offset
+    ld.shared.b32 %tb1_q_a_12_0_2, [%mma_addr];
+    mul.lo.u32 %mma_addr, %mma_a_row, 256;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_q_smem_x_u32;  // + smem base
+    add.u32 %mma_addr, %mma_addr, 24;  // + k byte offset
+    ld.shared.b32 %tb1_q_a_12_0_3, [%mma_addr];
+    // Load B-fragment (k16xn8 col-major) from shared memory
+    mul.lo.u32 %mma_addr, %mma_b_row, 64;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_q_smem_w_u32;  // + smem base
+    ld.shared.b32 %tb1_q_b_12_0_0, [%mma_addr];
+    mul.lo.u32 %mma_addr, %mma_b_row, 64;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_q_smem_w_u32;  // + smem base
+    add.u32 %mma_addr, %mma_addr, 16;  // + k byte offset
+    ld.shared.b32 %tb1_q_b_12_0_1, [%mma_addr];
     setp.eq.u32 %wo_pred, %warp_id, 0; // Q-proj tile t=0 ownership
     @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_0_0, %q_acc_0_1, %q_acc_0_2, %q_acc_0_3},
@@ -314,12 +551,30 @@ expression: ptx
     bar.sync 0;
     .reg .b32 %tb1_q_a_13_0_0, %tb1_q_a_13_0_1, %tb1_q_a_13_0_2, %tb1_q_a_13_0_3;
     .reg .b32 %tb1_q_b_13_0_0, %tb1_q_b_13_0_1;
-    ld.shared.b32 %tb1_q_a_13_0_0, [%tb1_q_smem_x];
-    ld.shared.b32 %tb1_q_a_13_0_1, [%tb1_q_smem_x];
-    ld.shared.b32 %tb1_q_a_13_0_2, [%tb1_q_smem_x];
-    ld.shared.b32 %tb1_q_a_13_0_3, [%tb1_q_smem_x];
-    ld.shared.b32 %tb1_q_b_13_0_0, [%tb1_q_smem_w];
-    ld.shared.b32 %tb1_q_b_13_0_1, [%tb1_q_smem_w];
+    // Load A-fragment (m16xk16 row-major) from shared memory
+    mul.lo.u32 %mma_addr, %mma_a_row, 256;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_q_smem_x_u32;  // + smem base
+    ld.shared.b32 %tb1_q_a_13_0_0, [%mma_addr];
+    mul.lo.u32 %mma_addr, %mma_a_row, 256;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_q_smem_x_u32;  // + smem base
+    add.u32 %mma_addr, %mma_addr, 8;  // + k byte offset
+    ld.shared.b32 %tb1_q_a_13_0_1, [%mma_addr];
+    mul.lo.u32 %mma_addr, %mma_a_row, 256;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_q_smem_x_u32;  // + smem base
+    add.u32 %mma_addr, %mma_addr, 16;  // + k byte offset
+    ld.shared.b32 %tb1_q_a_13_0_2, [%mma_addr];
+    mul.lo.u32 %mma_addr, %mma_a_row, 256;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_q_smem_x_u32;  // + smem base
+    add.u32 %mma_addr, %mma_addr, 24;  // + k byte offset
+    ld.shared.b32 %tb1_q_a_13_0_3, [%mma_addr];
+    // Load B-fragment (k16xn8 col-major) from shared memory
+    mul.lo.u32 %mma_addr, %mma_b_row, 64;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_q_smem_w_u32;  // + smem base
+    ld.shared.b32 %tb1_q_b_13_0_0, [%mma_addr];
+    mul.lo.u32 %mma_addr, %mma_b_row, 64;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_q_smem_w_u32;  // + smem base
+    add.u32 %mma_addr, %mma_addr, 16;  // + k byte offset
+    ld.shared.b32 %tb1_q_b_13_0_1, [%mma_addr];
     setp.eq.u32 %wo_pred, %warp_id, 0; // Q-proj tile t=0 ownership
     @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_0_0, %q_acc_0_1, %q_acc_0_2, %q_acc_0_3},
@@ -336,12 +591,30 @@ expression: ptx
     bar.sync 0;
     .reg .b32 %tb1_q_a_14_0_0, %tb1_q_a_14_0_1, %tb1_q_a_14_0_2, %tb1_q_a_14_0_3;
     .reg .b32 %tb1_q_b_14_0_0, %tb1_q_b_14_0_1;
-    ld.shared.b32 %tb1_q_a_14_0_0, [%tb1_q_smem_x];
-    ld.shared.b32 %tb1_q_a_14_0_1, [%tb1_q_smem_x];
-    ld.shared.b32 %tb1_q_a_14_0_2, [%tb1_q_smem_x];
-    ld.shared.b32 %tb1_q_a_14_0_3, [%tb1_q_smem_x];
-    ld.shared.b32 %tb1_q_b_14_0_0, [%tb1_q_smem_w];
-    ld.shared.b32 %tb1_q_b_14_0_1, [%tb1_q_smem_w];
+    // Load A-fragment (m16xk16 row-major) from shared memory
+    mul.lo.u32 %mma_addr, %mma_a_row, 256;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_q_smem_x_u32;  // + smem base
+    ld.shared.b32 %tb1_q_a_14_0_0, [%mma_addr];
+    mul.lo.u32 %mma_addr, %mma_a_row, 256;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_q_smem_x_u32;  // + smem base
+    add.u32 %mma_addr, %mma_addr, 8;  // + k byte offset
+    ld.shared.b32 %tb1_q_a_14_0_1, [%mma_addr];
+    mul.lo.u32 %mma_addr, %mma_a_row, 256;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_q_smem_x_u32;  // + smem base
+    add.u32 %mma_addr, %mma_addr, 16;  // + k byte offset
+    ld.shared.b32 %tb1_q_a_14_0_2, [%mma_addr];
+    mul.lo.u32 %mma_addr, %mma_a_row, 256;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_q_smem_x_u32;  // + smem base
+    add.u32 %mma_addr, %mma_addr, 24;  // + k byte offset
+    ld.shared.b32 %tb1_q_a_14_0_3, [%mma_addr];
+    // Load B-fragment (k16xn8 col-major) from shared memory
+    mul.lo.u32 %mma_addr, %mma_b_row, 64;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_q_smem_w_u32;  // + smem base
+    ld.shared.b32 %tb1_q_b_14_0_0, [%mma_addr];
+    mul.lo.u32 %mma_addr, %mma_b_row, 64;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_q_smem_w_u32;  // + smem base
+    add.u32 %mma_addr, %mma_addr, 16;  // + k byte offset
+    ld.shared.b32 %tb1_q_b_14_0_1, [%mma_addr];
     setp.eq.u32 %wo_pred, %warp_id, 0; // Q-proj tile t=0 ownership
     @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_0_0, %q_acc_0_1, %q_acc_0_2, %q_acc_0_3},
@@ -358,12 +631,30 @@ expression: ptx
     bar.sync 0;
     .reg .b32 %tb1_q_a_15_0_0, %tb1_q_a_15_0_1, %tb1_q_a_15_0_2, %tb1_q_a_15_0_3;
     .reg .b32 %tb1_q_b_15_0_0, %tb1_q_b_15_0_1;
-    ld.shared.b32 %tb1_q_a_15_0_0, [%tb1_q_smem_x];
-    ld.shared.b32 %tb1_q_a_15_0_1, [%tb1_q_smem_x];
-    ld.shared.b32 %tb1_q_a_15_0_2, [%tb1_q_smem_x];
-    ld.shared.b32 %tb1_q_a_15_0_3, [%tb1_q_smem_x];
-    ld.shared.b32 %tb1_q_b_15_0_0, [%tb1_q_smem_w];
-    ld.shared.b32 %tb1_q_b_15_0_1, [%tb1_q_smem_w];
+    // Load A-fragment (m16xk16 row-major) from shared memory
+    mul.lo.u32 %mma_addr, %mma_a_row, 256;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_q_smem_x_u32;  // + smem base
+    ld.shared.b32 %tb1_q_a_15_0_0, [%mma_addr];
+    mul.lo.u32 %mma_addr, %mma_a_row, 256;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_q_smem_x_u32;  // + smem base
+    add.u32 %mma_addr, %mma_addr, 8;  // + k byte offset
+    ld.shared.b32 %tb1_q_a_15_0_1, [%mma_addr];
+    mul.lo.u32 %mma_addr, %mma_a_row, 256;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_q_smem_x_u32;  // + smem base
+    add.u32 %mma_addr, %mma_addr, 16;  // + k byte offset
+    ld.shared.b32 %tb1_q_a_15_0_2, [%mma_addr];
+    mul.lo.u32 %mma_addr, %mma_a_row, 256;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_q_smem_x_u32;  // + smem base
+    add.u32 %mma_addr, %mma_addr, 24;  // + k byte offset
+    ld.shared.b32 %tb1_q_a_15_0_3, [%mma_addr];
+    // Load B-fragment (k16xn8 col-major) from shared memory
+    mul.lo.u32 %mma_addr, %mma_b_row, 64;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_q_smem_w_u32;  // + smem base
+    ld.shared.b32 %tb1_q_b_15_0_0, [%mma_addr];
+    mul.lo.u32 %mma_addr, %mma_b_row, 64;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_q_smem_w_u32;  // + smem base
+    add.u32 %mma_addr, %mma_addr, 16;  // + k byte offset
+    ld.shared.b32 %tb1_q_b_15_0_1, [%mma_addr];
     setp.eq.u32 %wo_pred, %warp_id, 0; // Q-proj tile t=0 ownership
     @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%q_acc_0_0, %q_acc_0_1, %q_acc_0_2, %q_acc_0_3},

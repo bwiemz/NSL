@@ -46,7 +46,7 @@ use crate::flash_attention_v2::smem_layout::{
     tier_b1_k_offset_ping, tier_b1_k_offset_pong, tier_b1_q_offset, tier_b1_v_offset_ping,
     tier_b1_v_offset_pong, tier_b1_w_chunk_offset,
 };
-use crate::matmul_mma::emit_mma_instruction_predicated;
+use crate::matmul_mma::{emit_load_a_fragment_smem, emit_load_b_fragment_smem, emit_mma_instruction_predicated};
 
 /// Number of (m16, n8) MMA tiles each of the 8 warps owns for the Q
 /// projection output (bq × hd). Always at least 1 — small configs
@@ -173,6 +173,9 @@ pub fn emit_q_projection(ptx: &mut String, config: &FlashAttentionConfig, chunk:
     ptx.push_str("    .reg .u64 %tb1_q_x_ptr, %tb1_q_wq_ptr;\n");
     ptx.push_str("    .reg .pred %tb1_q_xnull, %tb1_q_wqnull;\n");
     ptx.push_str("    .reg .u64 %tb1_q_smem_w, %tb1_q_smem_x, %tb1_q_smem_q;\n");
+    // u32 sister registers for matmul_mma::emit_load_*_fragment_smem
+    // (B1.6 deferral #1) — the helpers use 32-bit SMEM addressing.
+    ptx.push_str("    .reg .u32 %tb1_q_smem_w_u32, %tb1_q_smem_x_u32;\n");
     ptx.push_str("    .reg .u64 %tb1_q_scatter_addr;\n");
     ptx.push_str("    .reg .b16 %tb1_q_h0, %tb1_q_h1;\n");
 
@@ -198,6 +201,9 @@ pub fn emit_q_projection(ptx: &mut String, config: &FlashAttentionConfig, chunk:
         "    add.u64 %tb1_q_smem_q, %shmem_base, {}; // Q output tile (tier_b1_q_offset)\n",
         q_out_off
     ));
+    // Narrow SMEM bases to u32 for the matmul_mma fragment-load helpers.
+    ptx.push_str("    cvt.u32.u64 %tb1_q_smem_w_u32, %tb1_q_smem_w;\n");
+    ptx.push_str("    cvt.u32.u64 %tb1_q_smem_x_u32, %tb1_q_smem_x;\n");
 
     // ----- 3. Outer chunk loop -----
     // For B1.3 we unroll the chunk loop so the snapshot diff captures the
@@ -263,11 +269,9 @@ pub fn emit_q_projection(ptx: &mut String, config: &FlashAttentionConfig, chunk:
         for t in 0..tpw {
             // Per spec §5.3 lane→fragment mapping: lanes within a warp
             // collectively own one m16n8k16 fragment per tile.
-            // emit_mma_instruction emits the PTX instruction; the actual
-            // ld.shared.b32 fragment-loads land in B1.4 once the cp.async
-            // pipeline knows the per-thread tile-offset arithmetic. For
-            // B1.3 we use sentinel A/B fragment register names — they're
-            // declared inline so ptxas can verify the instruction shape.
+            // B1.6 deferral #1 resolution: A/B-fragment loads now use the
+            // matmul_mma helpers which compute per-(warp, lane) addresses
+            // from %mma_a_row / %mma_b_row (set up by declare_registers).
             ptx.push_str(&format!(
                 "    .reg .b32 %tb1_q_a_{}_{}_0, %tb1_q_a_{}_{}_1, %tb1_q_a_{}_{}_2, %tb1_q_a_{}_{}_3;\n",
                 chunk_idx, t, chunk_idx, t, chunk_idx, t, chunk_idx, t
@@ -276,26 +280,32 @@ pub fn emit_q_projection(ptx: &mut String, config: &FlashAttentionConfig, chunk:
                 "    .reg .b32 %tb1_q_b_{}_{}_0, %tb1_q_b_{}_{}_1;\n",
                 chunk_idx, t, chunk_idx, t
             ));
-            // B1.4 TODO (deferral #1): replace with matmul_mma::
-            // emit_load_a_fragment_smem(...) — that helper already does the
-            // CUTLASS-style per-(warp, lane, K-step) row*stride+base+offset
-            // arithmetic. Current uniform `[%tb1_q_smem_x]` load is correct
-            // PTX syntax (ptxas accepts) but every lane reads the same 4
-            // bytes; numerics will only become correct after the swap.
-            for i in 0..4 {
-                ptx.push_str(&format!(
-                    "    ld.shared.b32 %tb1_q_a_{}_{}_{}, [%tb1_q_smem_x];\n",
-                    chunk_idx, t, i
-                ));
-            }
-            // B1.4 TODO (deferral #1): replace with matmul_mma::
-            // emit_load_b_fragment_smem(...) for per-lane B-fragment addressing.
-            for i in 0..2 {
-                ptx.push_str(&format!(
-                    "    ld.shared.b32 %tb1_q_b_{}_{}_{}, [%tb1_q_smem_w];\n",
-                    chunk_idx, t, i
-                ));
-            }
+            // A-fragment: x_q rows from SMEM at %tb1_q_smem_x. Row stride is
+            // chunk * 2 bytes (the x_q chunk slab is bq rows x chunk cols, f16).
+            let a_fragment_regs = [
+                format!("tb1_q_a_{}_{}_0", chunk_idx, t),
+                format!("tb1_q_a_{}_{}_1", chunk_idx, t),
+                format!("tb1_q_a_{}_{}_2", chunk_idx, t),
+                format!("tb1_q_a_{}_{}_3", chunk_idx, t),
+            ];
+            emit_load_a_fragment_smem(
+                ptx,
+                &a_fragment_regs,
+                "%tb1_q_smem_x_u32",
+                (chunk * 2) as usize,
+            );
+            // B-fragment: Wq cols from SMEM at %tb1_q_smem_w. Row stride is
+            // hd * 2 bytes (Wq chunk slab is chunk rows x hd cols, f16).
+            let b_fragment_regs = [
+                format!("tb1_q_b_{}_{}_0", chunk_idx, t),
+                format!("tb1_q_b_{}_{}_1", chunk_idx, t),
+            ];
+            emit_load_b_fragment_smem(
+                ptx,
+                &b_fragment_regs,
+                "%tb1_q_smem_w_u32",
+                (hd * 2) as usize,
+            );
             let d_regs = [
                 format!("%q_acc_{}_0", t),
                 format!("%q_acc_{}_1", t),
