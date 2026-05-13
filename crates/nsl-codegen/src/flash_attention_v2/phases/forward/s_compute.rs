@@ -89,7 +89,11 @@ pub fn emit(
             let range_table_base =
                 crate::flash_attention_v2::smem_layout::tier_b_range_table_offset(config);
             let skip_label = format!("KV_TILE_SKIP_TB_{q_tile_iter}");
-            // Derive kv-tile ordinal: %r_kvt_ord_TB = k_start >> log2(block_kv)
+            // Wrap in a PTX lexical scope so the kvt-ordinal registers
+            // are local to this q_tile_iter (s_compute::emit is called
+            // once per q_iter; without the scope, ptxas would reject
+            // duplicate %rd_kvt_ord_TB / %r_kvt_ord_TB declarations).
+            ptx.push_str("    { // PCA Tier B per-q_iter scope\n");
             ptx.push_str("    // PCA Tier B: derive kv-tile ordinal from %k_start\n");
             ptx.push_str("    .reg .u64 %rd_kvt_ord_TB;\n");
             ptx.push_str("    .reg .u32 %r_kvt_ord_TB;\n");
@@ -106,6 +110,7 @@ pub fn emit(
                 range_table_base,
                 &skip_label,
             );
+            ptx.push_str("    } // end PCA Tier B per-q_iter scope\n");
         }
     }
 

@@ -3,6 +3,7 @@ source: crates/nsl-codegen/tests/pca_tier_b_predicate_isolation.rs
 expression: ptx
 ---
     // ----- PCA Tier B: skip predicate (spec sec 3.2) -----
+    {
     .reg .u16  %qmin_TB, %qmax_TB, %kvmin_TB, %kvmax_TB;
     .reg .pred %p_lt_TB, %p_gt_TB, %p_skip_TB;
     .reg .u32  %tile_byte_TB;
@@ -28,4 +29,5 @@ expression: ptx
     setp.gt.u16 %p_gt_TB, %qmin_TB, %kvmax_TB;
     or.pred %p_skip_TB, %p_lt_TB, %p_gt_TB;
     @%p_skip_TB bra KV_TILE_SKIP;
+    }
     // ----- end PCA Tier B skip predicate -----

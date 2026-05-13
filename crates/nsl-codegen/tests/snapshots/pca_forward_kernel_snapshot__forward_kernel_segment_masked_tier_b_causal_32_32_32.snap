@@ -118,8 +118,9 @@ PCA_LOAD_DONE:
     // ----- PCA Tier B: range-table preamble (spec sec 3.1, v2) -----
     // num_q_tiles=64, num_kv_tiles=64, base=0x19500
     .reg .u32  %r_tile_q_TILERANGE,  %r_tile_kv_TILERANGE;
-    .reg .u16  %rs_min_TILERANGE,   %rs_max_TILERANGE;
-    .reg .u16  %rs_peer_min_TILERANGE, %rs_peer_max_TILERANGE;
+    .reg .b32  %rs_min_TILERANGE,   %rs_max_TILERANGE;
+    .reg .b32  %rs_peer_min_TILERANGE, %rs_peer_max_TILERANGE;
+    .reg .u16  %rs_tmp_u16_TILERANGE;
     .reg .u32  %lane_id_TILERANGE;
     .reg .pred %p_done_TILERANGE,   %p_lane_zero_TILERANGE;
     .reg .u64  %addr_min_TILERANGE, %addr_max_TILERANGE;
@@ -137,33 +138,35 @@ LOOP_Q_TILERANGE:
     shl.b32 %seg_byte_off_TILERANGE, %seg_byte_off_TILERANGE, 1;
     cvt.u64.u32 %wide_tile_off_TILERANGE, %seg_byte_off_TILERANGE;
     add.u64 %wide_tile_off_TILERANGE, %seg_smem_TILERANGE, %wide_tile_off_TILERANGE;
-    ld.shared.u16 %rs_min_TILERANGE, [%wide_tile_off_TILERANGE];
-    mov.u16 %rs_max_TILERANGE, %rs_min_TILERANGE;
+    ld.shared.u16 %rs_tmp_u16_TILERANGE, [%wide_tile_off_TILERANGE];
+    cvt.u32.u16 %rs_min_TILERANGE, %rs_tmp_u16_TILERANGE;
+    mov.b32 %rs_max_TILERANGE, %rs_min_TILERANGE;
     // fold lane + 32 into lane-local min/max
     add.u64 %wide_tile_off_TILERANGE, %wide_tile_off_TILERANGE, 64;
-    ld.shared.u16 %rs_peer_min_TILERANGE, [%wide_tile_off_TILERANGE];
-    min.u16 %rs_min_TILERANGE, %rs_min_TILERANGE, %rs_peer_min_TILERANGE;
-    max.u16 %rs_max_TILERANGE, %rs_max_TILERANGE, %rs_peer_min_TILERANGE;
+    ld.shared.u16 %rs_tmp_u16_TILERANGE, [%wide_tile_off_TILERANGE];
+    cvt.u32.u16 %rs_peer_min_TILERANGE, %rs_tmp_u16_TILERANGE;
+    min.u32 %rs_min_TILERANGE, %rs_min_TILERANGE, %rs_peer_min_TILERANGE;
+    max.u32 %rs_max_TILERANGE, %rs_max_TILERANGE, %rs_peer_min_TILERANGE;
     shfl.sync.bfly.b32 %rs_peer_min_TILERANGE, %rs_min_TILERANGE, 16, 0x1F, 0xFFFFFFFF;
     shfl.sync.bfly.b32 %rs_peer_max_TILERANGE, %rs_max_TILERANGE, 16, 0x1F, 0xFFFFFFFF;
-    min.u16 %rs_min_TILERANGE, %rs_min_TILERANGE, %rs_peer_min_TILERANGE;
-    max.u16 %rs_max_TILERANGE, %rs_max_TILERANGE, %rs_peer_max_TILERANGE;
+    min.u32 %rs_min_TILERANGE, %rs_min_TILERANGE, %rs_peer_min_TILERANGE;
+    max.u32 %rs_max_TILERANGE, %rs_max_TILERANGE, %rs_peer_max_TILERANGE;
     shfl.sync.bfly.b32 %rs_peer_min_TILERANGE, %rs_min_TILERANGE, 8, 0x1F, 0xFFFFFFFF;
     shfl.sync.bfly.b32 %rs_peer_max_TILERANGE, %rs_max_TILERANGE, 8, 0x1F, 0xFFFFFFFF;
-    min.u16 %rs_min_TILERANGE, %rs_min_TILERANGE, %rs_peer_min_TILERANGE;
-    max.u16 %rs_max_TILERANGE, %rs_max_TILERANGE, %rs_peer_max_TILERANGE;
+    min.u32 %rs_min_TILERANGE, %rs_min_TILERANGE, %rs_peer_min_TILERANGE;
+    max.u32 %rs_max_TILERANGE, %rs_max_TILERANGE, %rs_peer_max_TILERANGE;
     shfl.sync.bfly.b32 %rs_peer_min_TILERANGE, %rs_min_TILERANGE, 4, 0x1F, 0xFFFFFFFF;
     shfl.sync.bfly.b32 %rs_peer_max_TILERANGE, %rs_max_TILERANGE, 4, 0x1F, 0xFFFFFFFF;
-    min.u16 %rs_min_TILERANGE, %rs_min_TILERANGE, %rs_peer_min_TILERANGE;
-    max.u16 %rs_max_TILERANGE, %rs_max_TILERANGE, %rs_peer_max_TILERANGE;
+    min.u32 %rs_min_TILERANGE, %rs_min_TILERANGE, %rs_peer_min_TILERANGE;
+    max.u32 %rs_max_TILERANGE, %rs_max_TILERANGE, %rs_peer_max_TILERANGE;
     shfl.sync.bfly.b32 %rs_peer_min_TILERANGE, %rs_min_TILERANGE, 2, 0x1F, 0xFFFFFFFF;
     shfl.sync.bfly.b32 %rs_peer_max_TILERANGE, %rs_max_TILERANGE, 2, 0x1F, 0xFFFFFFFF;
-    min.u16 %rs_min_TILERANGE, %rs_min_TILERANGE, %rs_peer_min_TILERANGE;
-    max.u16 %rs_max_TILERANGE, %rs_max_TILERANGE, %rs_peer_max_TILERANGE;
+    min.u32 %rs_min_TILERANGE, %rs_min_TILERANGE, %rs_peer_min_TILERANGE;
+    max.u32 %rs_max_TILERANGE, %rs_max_TILERANGE, %rs_peer_max_TILERANGE;
     shfl.sync.bfly.b32 %rs_peer_min_TILERANGE, %rs_min_TILERANGE, 1, 0x1F, 0xFFFFFFFF;
     shfl.sync.bfly.b32 %rs_peer_max_TILERANGE, %rs_max_TILERANGE, 1, 0x1F, 0xFFFFFFFF;
-    min.u16 %rs_min_TILERANGE, %rs_min_TILERANGE, %rs_peer_min_TILERANGE;
-    max.u16 %rs_max_TILERANGE, %rs_max_TILERANGE, %rs_peer_max_TILERANGE;
+    min.u32 %rs_min_TILERANGE, %rs_min_TILERANGE, %rs_peer_min_TILERANGE;
+    max.u32 %rs_max_TILERANGE, %rs_max_TILERANGE, %rs_peer_max_TILERANGE;
     shl.b32 %seg_byte_off_TILERANGE, %r_tile_q_TILERANGE, 1;
     cvt.u64.u32 %wide_tile_off_TILERANGE, %seg_byte_off_TILERANGE;
     cvta.shared.u64 %addr_min_TILERANGE, shmem;
@@ -173,8 +176,10 @@ LOOP_Q_TILERANGE:
     add.u64 %addr_max_TILERANGE, %addr_max_TILERANGE, 103808;
     add.u64 %addr_max_TILERANGE, %addr_max_TILERANGE, %wide_tile_off_TILERANGE;
     setp.eq.u32 %p_lane_zero_TILERANGE, %lane_id_TILERANGE, 0;
-    @%p_lane_zero_TILERANGE st.shared.u16 [%addr_min_TILERANGE], %rs_min_TILERANGE;
-    @%p_lane_zero_TILERANGE st.shared.u16 [%addr_max_TILERANGE], %rs_max_TILERANGE;
+    @%p_lane_zero_TILERANGE cvt.u16.u32 %rs_tmp_u16_TILERANGE, %rs_min_TILERANGE;
+    @%p_lane_zero_TILERANGE st.shared.u16 [%addr_min_TILERANGE], %rs_tmp_u16_TILERANGE;
+    @%p_lane_zero_TILERANGE cvt.u16.u32 %rs_tmp_u16_TILERANGE, %rs_max_TILERANGE;
+    @%p_lane_zero_TILERANGE st.shared.u16 [%addr_max_TILERANGE], %rs_tmp_u16_TILERANGE;
     add.u32 %r_tile_q_TILERANGE, %r_tile_q_TILERANGE, 1;
     setp.lt.u32 %p_done_TILERANGE, %r_tile_q_TILERANGE, 64;
     @%p_done_TILERANGE bra LOOP_Q_TILERANGE;
@@ -187,33 +192,35 @@ LOOP_KV_TILERANGE:
     shl.b32 %seg_byte_off_TILERANGE, %seg_byte_off_TILERANGE, 1;
     cvt.u64.u32 %wide_tile_off_TILERANGE, %seg_byte_off_TILERANGE;
     add.u64 %wide_tile_off_TILERANGE, %seg_smem_TILERANGE, %wide_tile_off_TILERANGE;
-    ld.shared.u16 %rs_min_TILERANGE, [%wide_tile_off_TILERANGE];
-    mov.u16 %rs_max_TILERANGE, %rs_min_TILERANGE;
+    ld.shared.u16 %rs_tmp_u16_TILERANGE, [%wide_tile_off_TILERANGE];
+    cvt.u32.u16 %rs_min_TILERANGE, %rs_tmp_u16_TILERANGE;
+    mov.b32 %rs_max_TILERANGE, %rs_min_TILERANGE;
     // fold lane + 32 into lane-local min/max
     add.u64 %wide_tile_off_TILERANGE, %wide_tile_off_TILERANGE, 64;
-    ld.shared.u16 %rs_peer_min_TILERANGE, [%wide_tile_off_TILERANGE];
-    min.u16 %rs_min_TILERANGE, %rs_min_TILERANGE, %rs_peer_min_TILERANGE;
-    max.u16 %rs_max_TILERANGE, %rs_max_TILERANGE, %rs_peer_min_TILERANGE;
+    ld.shared.u16 %rs_tmp_u16_TILERANGE, [%wide_tile_off_TILERANGE];
+    cvt.u32.u16 %rs_peer_min_TILERANGE, %rs_tmp_u16_TILERANGE;
+    min.u32 %rs_min_TILERANGE, %rs_min_TILERANGE, %rs_peer_min_TILERANGE;
+    max.u32 %rs_max_TILERANGE, %rs_max_TILERANGE, %rs_peer_min_TILERANGE;
     shfl.sync.bfly.b32 %rs_peer_min_TILERANGE, %rs_min_TILERANGE, 16, 0x1F, 0xFFFFFFFF;
     shfl.sync.bfly.b32 %rs_peer_max_TILERANGE, %rs_max_TILERANGE, 16, 0x1F, 0xFFFFFFFF;
-    min.u16 %rs_min_TILERANGE, %rs_min_TILERANGE, %rs_peer_min_TILERANGE;
-    max.u16 %rs_max_TILERANGE, %rs_max_TILERANGE, %rs_peer_max_TILERANGE;
+    min.u32 %rs_min_TILERANGE, %rs_min_TILERANGE, %rs_peer_min_TILERANGE;
+    max.u32 %rs_max_TILERANGE, %rs_max_TILERANGE, %rs_peer_max_TILERANGE;
     shfl.sync.bfly.b32 %rs_peer_min_TILERANGE, %rs_min_TILERANGE, 8, 0x1F, 0xFFFFFFFF;
     shfl.sync.bfly.b32 %rs_peer_max_TILERANGE, %rs_max_TILERANGE, 8, 0x1F, 0xFFFFFFFF;
-    min.u16 %rs_min_TILERANGE, %rs_min_TILERANGE, %rs_peer_min_TILERANGE;
-    max.u16 %rs_max_TILERANGE, %rs_max_TILERANGE, %rs_peer_max_TILERANGE;
+    min.u32 %rs_min_TILERANGE, %rs_min_TILERANGE, %rs_peer_min_TILERANGE;
+    max.u32 %rs_max_TILERANGE, %rs_max_TILERANGE, %rs_peer_max_TILERANGE;
     shfl.sync.bfly.b32 %rs_peer_min_TILERANGE, %rs_min_TILERANGE, 4, 0x1F, 0xFFFFFFFF;
     shfl.sync.bfly.b32 %rs_peer_max_TILERANGE, %rs_max_TILERANGE, 4, 0x1F, 0xFFFFFFFF;
-    min.u16 %rs_min_TILERANGE, %rs_min_TILERANGE, %rs_peer_min_TILERANGE;
-    max.u16 %rs_max_TILERANGE, %rs_max_TILERANGE, %rs_peer_max_TILERANGE;
+    min.u32 %rs_min_TILERANGE, %rs_min_TILERANGE, %rs_peer_min_TILERANGE;
+    max.u32 %rs_max_TILERANGE, %rs_max_TILERANGE, %rs_peer_max_TILERANGE;
     shfl.sync.bfly.b32 %rs_peer_min_TILERANGE, %rs_min_TILERANGE, 2, 0x1F, 0xFFFFFFFF;
     shfl.sync.bfly.b32 %rs_peer_max_TILERANGE, %rs_max_TILERANGE, 2, 0x1F, 0xFFFFFFFF;
-    min.u16 %rs_min_TILERANGE, %rs_min_TILERANGE, %rs_peer_min_TILERANGE;
-    max.u16 %rs_max_TILERANGE, %rs_max_TILERANGE, %rs_peer_max_TILERANGE;
+    min.u32 %rs_min_TILERANGE, %rs_min_TILERANGE, %rs_peer_min_TILERANGE;
+    max.u32 %rs_max_TILERANGE, %rs_max_TILERANGE, %rs_peer_max_TILERANGE;
     shfl.sync.bfly.b32 %rs_peer_min_TILERANGE, %rs_min_TILERANGE, 1, 0x1F, 0xFFFFFFFF;
     shfl.sync.bfly.b32 %rs_peer_max_TILERANGE, %rs_max_TILERANGE, 1, 0x1F, 0xFFFFFFFF;
-    min.u16 %rs_min_TILERANGE, %rs_min_TILERANGE, %rs_peer_min_TILERANGE;
-    max.u16 %rs_max_TILERANGE, %rs_max_TILERANGE, %rs_peer_max_TILERANGE;
+    min.u32 %rs_min_TILERANGE, %rs_min_TILERANGE, %rs_peer_min_TILERANGE;
+    max.u32 %rs_max_TILERANGE, %rs_max_TILERANGE, %rs_peer_max_TILERANGE;
     shl.b32 %seg_byte_off_TILERANGE, %r_tile_kv_TILERANGE, 1;
     cvt.u64.u32 %wide_tile_off_TILERANGE, %seg_byte_off_TILERANGE;
     cvta.shared.u64 %addr_min_TILERANGE, shmem;
@@ -223,8 +230,10 @@ LOOP_KV_TILERANGE:
     add.u64 %addr_max_TILERANGE, %addr_max_TILERANGE, 104064;
     add.u64 %addr_max_TILERANGE, %addr_max_TILERANGE, %wide_tile_off_TILERANGE;
     setp.eq.u32 %p_lane_zero_TILERANGE, %lane_id_TILERANGE, 0;
-    @%p_lane_zero_TILERANGE st.shared.u16 [%addr_min_TILERANGE], %rs_min_TILERANGE;
-    @%p_lane_zero_TILERANGE st.shared.u16 [%addr_max_TILERANGE], %rs_max_TILERANGE;
+    @%p_lane_zero_TILERANGE cvt.u16.u32 %rs_tmp_u16_TILERANGE, %rs_min_TILERANGE;
+    @%p_lane_zero_TILERANGE st.shared.u16 [%addr_min_TILERANGE], %rs_tmp_u16_TILERANGE;
+    @%p_lane_zero_TILERANGE cvt.u16.u32 %rs_tmp_u16_TILERANGE, %rs_max_TILERANGE;
+    @%p_lane_zero_TILERANGE st.shared.u16 [%addr_max_TILERANGE], %rs_tmp_u16_TILERANGE;
     add.u32 %r_tile_kv_TILERANGE, %r_tile_kv_TILERANGE, 1;
     setp.lt.u32 %p_done_TILERANGE, %r_tile_kv_TILERANGE, 64;
     @%p_done_TILERANGE bra LOOP_KV_TILERANGE;
@@ -293,12 +302,14 @@ V2_LOOP_K_LOAD_0:
     @%p0 bra V2_LOOP_K_LOAD_0;
     bar.sync 0;  // FENCE: K tile in shmem
     // Phase 2: S = Q*K^T (q_tile_iter = 0)
+    { // PCA Tier B per-q_iter scope
     // PCA Tier B: derive kv-tile ordinal from %k_start
     .reg .u64 %rd_kvt_ord_TB;
     .reg .u32 %r_kvt_ord_TB;
     shr.b64 %rd_kvt_ord_TB, %k_start, 6;
     cvt.u32.u64 %r_kvt_ord_TB, %rd_kvt_ord_TB;
     // ----- PCA Tier B: skip predicate (spec sec 3.2) -----
+    {
     .reg .u16  %qmin_TB, %qmax_TB, %kvmin_TB, %kvmax_TB;
     .reg .pred %p_lt_TB, %p_gt_TB, %p_skip_TB;
     .reg .u32  %tile_byte_TB;
@@ -324,7 +335,9 @@ V2_LOOP_K_LOAD_0:
     setp.gt.u16 %p_gt_TB, %qmin_TB, %kvmax_TB;
     or.pred %p_skip_TB, %p_lt_TB, %p_gt_TB;
     @%p_skip_TB bra KV_TILE_SKIP_TB_0;
+    }
     // ----- end PCA Tier B skip predicate -----
+    } // end PCA Tier B per-q_iter scope
     mov.u32 %r1, 0;                           // k = 0
     mov.u32 %r2, 64;                           // block_kv
 V2_LOOP_S_OVER_K_0:
@@ -630,12 +643,14 @@ V2_LOOP_K_LOAD_1:
     @%p0 bra V2_LOOP_K_LOAD_1;
     bar.sync 0;  // FENCE: K tile in shmem
     // Phase 2: S = Q*K^T (q_tile_iter = 1)
+    { // PCA Tier B per-q_iter scope
     // PCA Tier B: derive kv-tile ordinal from %k_start
     .reg .u64 %rd_kvt_ord_TB;
     .reg .u32 %r_kvt_ord_TB;
     shr.b64 %rd_kvt_ord_TB, %k_start, 6;
     cvt.u32.u64 %r_kvt_ord_TB, %rd_kvt_ord_TB;
     // ----- PCA Tier B: skip predicate (spec sec 3.2) -----
+    {
     .reg .u16  %qmin_TB, %qmax_TB, %kvmin_TB, %kvmax_TB;
     .reg .pred %p_lt_TB, %p_gt_TB, %p_skip_TB;
     .reg .u32  %tile_byte_TB;
@@ -661,7 +676,9 @@ V2_LOOP_K_LOAD_1:
     setp.gt.u16 %p_gt_TB, %qmin_TB, %kvmax_TB;
     or.pred %p_skip_TB, %p_lt_TB, %p_gt_TB;
     @%p_skip_TB bra KV_TILE_SKIP_TB_1;
+    }
     // ----- end PCA Tier B skip predicate -----
+    } // end PCA Tier B per-q_iter scope
     mov.u32 %r1, 0;                           // k = 0
     mov.u32 %r2, 64;                           // block_kv
 V2_LOOP_S_OVER_K_1:
@@ -967,12 +984,14 @@ V2_LOOP_K_LOAD_2:
     @%p0 bra V2_LOOP_K_LOAD_2;
     bar.sync 0;  // FENCE: K tile in shmem
     // Phase 2: S = Q*K^T (q_tile_iter = 2)
+    { // PCA Tier B per-q_iter scope
     // PCA Tier B: derive kv-tile ordinal from %k_start
     .reg .u64 %rd_kvt_ord_TB;
     .reg .u32 %r_kvt_ord_TB;
     shr.b64 %rd_kvt_ord_TB, %k_start, 6;
     cvt.u32.u64 %r_kvt_ord_TB, %rd_kvt_ord_TB;
     // ----- PCA Tier B: skip predicate (spec sec 3.2) -----
+    {
     .reg .u16  %qmin_TB, %qmax_TB, %kvmin_TB, %kvmax_TB;
     .reg .pred %p_lt_TB, %p_gt_TB, %p_skip_TB;
     .reg .u32  %tile_byte_TB;
@@ -998,7 +1017,9 @@ V2_LOOP_K_LOAD_2:
     setp.gt.u16 %p_gt_TB, %qmin_TB, %kvmax_TB;
     or.pred %p_skip_TB, %p_lt_TB, %p_gt_TB;
     @%p_skip_TB bra KV_TILE_SKIP_TB_2;
+    }
     // ----- end PCA Tier B skip predicate -----
+    } // end PCA Tier B per-q_iter scope
     mov.u32 %r1, 0;                           // k = 0
     mov.u32 %r2, 64;                           // block_kv
 V2_LOOP_S_OVER_K_2:
@@ -1304,12 +1325,14 @@ V2_LOOP_K_LOAD_3:
     @%p0 bra V2_LOOP_K_LOAD_3;
     bar.sync 0;  // FENCE: K tile in shmem
     // Phase 2: S = Q*K^T (q_tile_iter = 3)
+    { // PCA Tier B per-q_iter scope
     // PCA Tier B: derive kv-tile ordinal from %k_start
     .reg .u64 %rd_kvt_ord_TB;
     .reg .u32 %r_kvt_ord_TB;
     shr.b64 %rd_kvt_ord_TB, %k_start, 6;
     cvt.u32.u64 %r_kvt_ord_TB, %rd_kvt_ord_TB;
     // ----- PCA Tier B: skip predicate (spec sec 3.2) -----
+    {
     .reg .u16  %qmin_TB, %qmax_TB, %kvmin_TB, %kvmax_TB;
     .reg .pred %p_lt_TB, %p_gt_TB, %p_skip_TB;
     .reg .u32  %tile_byte_TB;
@@ -1335,7 +1358,9 @@ V2_LOOP_K_LOAD_3:
     setp.gt.u16 %p_gt_TB, %qmin_TB, %kvmax_TB;
     or.pred %p_skip_TB, %p_lt_TB, %p_gt_TB;
     @%p_skip_TB bra KV_TILE_SKIP_TB_3;
+    }
     // ----- end PCA Tier B skip predicate -----
+    } // end PCA Tier B per-q_iter scope
     mov.u32 %r1, 0;                           // k = 0
     mov.u32 %r2, 64;                           // block_kv
 V2_LOOP_S_OVER_K_3:
@@ -1641,12 +1666,14 @@ V2_LOOP_K_LOAD_4:
     @%p0 bra V2_LOOP_K_LOAD_4;
     bar.sync 0;  // FENCE: K tile in shmem
     // Phase 2: S = Q*K^T (q_tile_iter = 4)
+    { // PCA Tier B per-q_iter scope
     // PCA Tier B: derive kv-tile ordinal from %k_start
     .reg .u64 %rd_kvt_ord_TB;
     .reg .u32 %r_kvt_ord_TB;
     shr.b64 %rd_kvt_ord_TB, %k_start, 6;
     cvt.u32.u64 %r_kvt_ord_TB, %rd_kvt_ord_TB;
     // ----- PCA Tier B: skip predicate (spec sec 3.2) -----
+    {
     .reg .u16  %qmin_TB, %qmax_TB, %kvmin_TB, %kvmax_TB;
     .reg .pred %p_lt_TB, %p_gt_TB, %p_skip_TB;
     .reg .u32  %tile_byte_TB;
@@ -1672,7 +1699,9 @@ V2_LOOP_K_LOAD_4:
     setp.gt.u16 %p_gt_TB, %qmin_TB, %kvmax_TB;
     or.pred %p_skip_TB, %p_lt_TB, %p_gt_TB;
     @%p_skip_TB bra KV_TILE_SKIP_TB_4;
+    }
     // ----- end PCA Tier B skip predicate -----
+    } // end PCA Tier B per-q_iter scope
     mov.u32 %r1, 0;                           // k = 0
     mov.u32 %r2, 64;                           // block_kv
 V2_LOOP_S_OVER_K_4:
@@ -1978,12 +2007,14 @@ V2_LOOP_K_LOAD_5:
     @%p0 bra V2_LOOP_K_LOAD_5;
     bar.sync 0;  // FENCE: K tile in shmem
     // Phase 2: S = Q*K^T (q_tile_iter = 5)
+    { // PCA Tier B per-q_iter scope
     // PCA Tier B: derive kv-tile ordinal from %k_start
     .reg .u64 %rd_kvt_ord_TB;
     .reg .u32 %r_kvt_ord_TB;
     shr.b64 %rd_kvt_ord_TB, %k_start, 6;
     cvt.u32.u64 %r_kvt_ord_TB, %rd_kvt_ord_TB;
     // ----- PCA Tier B: skip predicate (spec sec 3.2) -----
+    {
     .reg .u16  %qmin_TB, %qmax_TB, %kvmin_TB, %kvmax_TB;
     .reg .pred %p_lt_TB, %p_gt_TB, %p_skip_TB;
     .reg .u32  %tile_byte_TB;
@@ -2009,7 +2040,9 @@ V2_LOOP_K_LOAD_5:
     setp.gt.u16 %p_gt_TB, %qmin_TB, %kvmax_TB;
     or.pred %p_skip_TB, %p_lt_TB, %p_gt_TB;
     @%p_skip_TB bra KV_TILE_SKIP_TB_5;
+    }
     // ----- end PCA Tier B skip predicate -----
+    } // end PCA Tier B per-q_iter scope
     mov.u32 %r1, 0;                           // k = 0
     mov.u32 %r2, 64;                           // block_kv
 V2_LOOP_S_OVER_K_5:
@@ -2315,12 +2348,14 @@ V2_LOOP_K_LOAD_6:
     @%p0 bra V2_LOOP_K_LOAD_6;
     bar.sync 0;  // FENCE: K tile in shmem
     // Phase 2: S = Q*K^T (q_tile_iter = 6)
+    { // PCA Tier B per-q_iter scope
     // PCA Tier B: derive kv-tile ordinal from %k_start
     .reg .u64 %rd_kvt_ord_TB;
     .reg .u32 %r_kvt_ord_TB;
     shr.b64 %rd_kvt_ord_TB, %k_start, 6;
     cvt.u32.u64 %r_kvt_ord_TB, %rd_kvt_ord_TB;
     // ----- PCA Tier B: skip predicate (spec sec 3.2) -----
+    {
     .reg .u16  %qmin_TB, %qmax_TB, %kvmin_TB, %kvmax_TB;
     .reg .pred %p_lt_TB, %p_gt_TB, %p_skip_TB;
     .reg .u32  %tile_byte_TB;
@@ -2346,7 +2381,9 @@ V2_LOOP_K_LOAD_6:
     setp.gt.u16 %p_gt_TB, %qmin_TB, %kvmax_TB;
     or.pred %p_skip_TB, %p_lt_TB, %p_gt_TB;
     @%p_skip_TB bra KV_TILE_SKIP_TB_6;
+    }
     // ----- end PCA Tier B skip predicate -----
+    } // end PCA Tier B per-q_iter scope
     mov.u32 %r1, 0;                           // k = 0
     mov.u32 %r2, 64;                           // block_kv
 V2_LOOP_S_OVER_K_6:
@@ -2652,12 +2689,14 @@ V2_LOOP_K_LOAD_7:
     @%p0 bra V2_LOOP_K_LOAD_7;
     bar.sync 0;  // FENCE: K tile in shmem
     // Phase 2: S = Q*K^T (q_tile_iter = 7)
+    { // PCA Tier B per-q_iter scope
     // PCA Tier B: derive kv-tile ordinal from %k_start
     .reg .u64 %rd_kvt_ord_TB;
     .reg .u32 %r_kvt_ord_TB;
     shr.b64 %rd_kvt_ord_TB, %k_start, 6;
     cvt.u32.u64 %r_kvt_ord_TB, %rd_kvt_ord_TB;
     // ----- PCA Tier B: skip predicate (spec sec 3.2) -----
+    {
     .reg .u16  %qmin_TB, %qmax_TB, %kvmin_TB, %kvmax_TB;
     .reg .pred %p_lt_TB, %p_gt_TB, %p_skip_TB;
     .reg .u32  %tile_byte_TB;
@@ -2683,7 +2722,9 @@ V2_LOOP_K_LOAD_7:
     setp.gt.u16 %p_gt_TB, %qmin_TB, %kvmax_TB;
     or.pred %p_skip_TB, %p_lt_TB, %p_gt_TB;
     @%p_skip_TB bra KV_TILE_SKIP_TB_7;
+    }
     // ----- end PCA Tier B skip predicate -----
+    } // end PCA Tier B per-q_iter scope
     mov.u32 %r1, 0;                           // k = 0
     mov.u32 %r2, 64;                           // block_kv
 V2_LOOP_S_OVER_K_7:
@@ -2989,12 +3030,14 @@ V2_LOOP_K_LOAD_8:
     @%p0 bra V2_LOOP_K_LOAD_8;
     bar.sync 0;  // FENCE: K tile in shmem
     // Phase 2: S = Q*K^T (q_tile_iter = 8)
+    { // PCA Tier B per-q_iter scope
     // PCA Tier B: derive kv-tile ordinal from %k_start
     .reg .u64 %rd_kvt_ord_TB;
     .reg .u32 %r_kvt_ord_TB;
     shr.b64 %rd_kvt_ord_TB, %k_start, 6;
     cvt.u32.u64 %r_kvt_ord_TB, %rd_kvt_ord_TB;
     // ----- PCA Tier B: skip predicate (spec sec 3.2) -----
+    {
     .reg .u16  %qmin_TB, %qmax_TB, %kvmin_TB, %kvmax_TB;
     .reg .pred %p_lt_TB, %p_gt_TB, %p_skip_TB;
     .reg .u32  %tile_byte_TB;
@@ -3020,7 +3063,9 @@ V2_LOOP_K_LOAD_8:
     setp.gt.u16 %p_gt_TB, %qmin_TB, %kvmax_TB;
     or.pred %p_skip_TB, %p_lt_TB, %p_gt_TB;
     @%p_skip_TB bra KV_TILE_SKIP_TB_8;
+    }
     // ----- end PCA Tier B skip predicate -----
+    } // end PCA Tier B per-q_iter scope
     mov.u32 %r1, 0;                           // k = 0
     mov.u32 %r2, 64;                           // block_kv
 V2_LOOP_S_OVER_K_8:
@@ -3326,12 +3371,14 @@ V2_LOOP_K_LOAD_9:
     @%p0 bra V2_LOOP_K_LOAD_9;
     bar.sync 0;  // FENCE: K tile in shmem
     // Phase 2: S = Q*K^T (q_tile_iter = 9)
+    { // PCA Tier B per-q_iter scope
     // PCA Tier B: derive kv-tile ordinal from %k_start
     .reg .u64 %rd_kvt_ord_TB;
     .reg .u32 %r_kvt_ord_TB;
     shr.b64 %rd_kvt_ord_TB, %k_start, 6;
     cvt.u32.u64 %r_kvt_ord_TB, %rd_kvt_ord_TB;
     // ----- PCA Tier B: skip predicate (spec sec 3.2) -----
+    {
     .reg .u16  %qmin_TB, %qmax_TB, %kvmin_TB, %kvmax_TB;
     .reg .pred %p_lt_TB, %p_gt_TB, %p_skip_TB;
     .reg .u32  %tile_byte_TB;
@@ -3357,7 +3404,9 @@ V2_LOOP_K_LOAD_9:
     setp.gt.u16 %p_gt_TB, %qmin_TB, %kvmax_TB;
     or.pred %p_skip_TB, %p_lt_TB, %p_gt_TB;
     @%p_skip_TB bra KV_TILE_SKIP_TB_9;
+    }
     // ----- end PCA Tier B skip predicate -----
+    } // end PCA Tier B per-q_iter scope
     mov.u32 %r1, 0;                           // k = 0
     mov.u32 %r2, 64;                           // block_kv
 V2_LOOP_S_OVER_K_9:
@@ -3663,12 +3712,14 @@ V2_LOOP_K_LOAD_10:
     @%p0 bra V2_LOOP_K_LOAD_10;
     bar.sync 0;  // FENCE: K tile in shmem
     // Phase 2: S = Q*K^T (q_tile_iter = 10)
+    { // PCA Tier B per-q_iter scope
     // PCA Tier B: derive kv-tile ordinal from %k_start
     .reg .u64 %rd_kvt_ord_TB;
     .reg .u32 %r_kvt_ord_TB;
     shr.b64 %rd_kvt_ord_TB, %k_start, 6;
     cvt.u32.u64 %r_kvt_ord_TB, %rd_kvt_ord_TB;
     // ----- PCA Tier B: skip predicate (spec sec 3.2) -----
+    {
     .reg .u16  %qmin_TB, %qmax_TB, %kvmin_TB, %kvmax_TB;
     .reg .pred %p_lt_TB, %p_gt_TB, %p_skip_TB;
     .reg .u32  %tile_byte_TB;
@@ -3694,7 +3745,9 @@ V2_LOOP_K_LOAD_10:
     setp.gt.u16 %p_gt_TB, %qmin_TB, %kvmax_TB;
     or.pred %p_skip_TB, %p_lt_TB, %p_gt_TB;
     @%p_skip_TB bra KV_TILE_SKIP_TB_10;
+    }
     // ----- end PCA Tier B skip predicate -----
+    } // end PCA Tier B per-q_iter scope
     mov.u32 %r1, 0;                           // k = 0
     mov.u32 %r2, 64;                           // block_kv
 V2_LOOP_S_OVER_K_10:
@@ -4000,12 +4053,14 @@ V2_LOOP_K_LOAD_11:
     @%p0 bra V2_LOOP_K_LOAD_11;
     bar.sync 0;  // FENCE: K tile in shmem
     // Phase 2: S = Q*K^T (q_tile_iter = 11)
+    { // PCA Tier B per-q_iter scope
     // PCA Tier B: derive kv-tile ordinal from %k_start
     .reg .u64 %rd_kvt_ord_TB;
     .reg .u32 %r_kvt_ord_TB;
     shr.b64 %rd_kvt_ord_TB, %k_start, 6;
     cvt.u32.u64 %r_kvt_ord_TB, %rd_kvt_ord_TB;
     // ----- PCA Tier B: skip predicate (spec sec 3.2) -----
+    {
     .reg .u16  %qmin_TB, %qmax_TB, %kvmin_TB, %kvmax_TB;
     .reg .pred %p_lt_TB, %p_gt_TB, %p_skip_TB;
     .reg .u32  %tile_byte_TB;
@@ -4031,7 +4086,9 @@ V2_LOOP_K_LOAD_11:
     setp.gt.u16 %p_gt_TB, %qmin_TB, %kvmax_TB;
     or.pred %p_skip_TB, %p_lt_TB, %p_gt_TB;
     @%p_skip_TB bra KV_TILE_SKIP_TB_11;
+    }
     // ----- end PCA Tier B skip predicate -----
+    } // end PCA Tier B per-q_iter scope
     mov.u32 %r1, 0;                           // k = 0
     mov.u32 %r2, 64;                           // block_kv
 V2_LOOP_S_OVER_K_11:
@@ -4337,12 +4394,14 @@ V2_LOOP_K_LOAD_12:
     @%p0 bra V2_LOOP_K_LOAD_12;
     bar.sync 0;  // FENCE: K tile in shmem
     // Phase 2: S = Q*K^T (q_tile_iter = 12)
+    { // PCA Tier B per-q_iter scope
     // PCA Tier B: derive kv-tile ordinal from %k_start
     .reg .u64 %rd_kvt_ord_TB;
     .reg .u32 %r_kvt_ord_TB;
     shr.b64 %rd_kvt_ord_TB, %k_start, 6;
     cvt.u32.u64 %r_kvt_ord_TB, %rd_kvt_ord_TB;
     // ----- PCA Tier B: skip predicate (spec sec 3.2) -----
+    {
     .reg .u16  %qmin_TB, %qmax_TB, %kvmin_TB, %kvmax_TB;
     .reg .pred %p_lt_TB, %p_gt_TB, %p_skip_TB;
     .reg .u32  %tile_byte_TB;
@@ -4368,7 +4427,9 @@ V2_LOOP_K_LOAD_12:
     setp.gt.u16 %p_gt_TB, %qmin_TB, %kvmax_TB;
     or.pred %p_skip_TB, %p_lt_TB, %p_gt_TB;
     @%p_skip_TB bra KV_TILE_SKIP_TB_12;
+    }
     // ----- end PCA Tier B skip predicate -----
+    } // end PCA Tier B per-q_iter scope
     mov.u32 %r1, 0;                           // k = 0
     mov.u32 %r2, 64;                           // block_kv
 V2_LOOP_S_OVER_K_12:
@@ -4674,12 +4735,14 @@ V2_LOOP_K_LOAD_13:
     @%p0 bra V2_LOOP_K_LOAD_13;
     bar.sync 0;  // FENCE: K tile in shmem
     // Phase 2: S = Q*K^T (q_tile_iter = 13)
+    { // PCA Tier B per-q_iter scope
     // PCA Tier B: derive kv-tile ordinal from %k_start
     .reg .u64 %rd_kvt_ord_TB;
     .reg .u32 %r_kvt_ord_TB;
     shr.b64 %rd_kvt_ord_TB, %k_start, 6;
     cvt.u32.u64 %r_kvt_ord_TB, %rd_kvt_ord_TB;
     // ----- PCA Tier B: skip predicate (spec sec 3.2) -----
+    {
     .reg .u16  %qmin_TB, %qmax_TB, %kvmin_TB, %kvmax_TB;
     .reg .pred %p_lt_TB, %p_gt_TB, %p_skip_TB;
     .reg .u32  %tile_byte_TB;
@@ -4705,7 +4768,9 @@ V2_LOOP_K_LOAD_13:
     setp.gt.u16 %p_gt_TB, %qmin_TB, %kvmax_TB;
     or.pred %p_skip_TB, %p_lt_TB, %p_gt_TB;
     @%p_skip_TB bra KV_TILE_SKIP_TB_13;
+    }
     // ----- end PCA Tier B skip predicate -----
+    } // end PCA Tier B per-q_iter scope
     mov.u32 %r1, 0;                           // k = 0
     mov.u32 %r2, 64;                           // block_kv
 V2_LOOP_S_OVER_K_13:
@@ -5011,12 +5076,14 @@ V2_LOOP_K_LOAD_14:
     @%p0 bra V2_LOOP_K_LOAD_14;
     bar.sync 0;  // FENCE: K tile in shmem
     // Phase 2: S = Q*K^T (q_tile_iter = 14)
+    { // PCA Tier B per-q_iter scope
     // PCA Tier B: derive kv-tile ordinal from %k_start
     .reg .u64 %rd_kvt_ord_TB;
     .reg .u32 %r_kvt_ord_TB;
     shr.b64 %rd_kvt_ord_TB, %k_start, 6;
     cvt.u32.u64 %r_kvt_ord_TB, %rd_kvt_ord_TB;
     // ----- PCA Tier B: skip predicate (spec sec 3.2) -----
+    {
     .reg .u16  %qmin_TB, %qmax_TB, %kvmin_TB, %kvmax_TB;
     .reg .pred %p_lt_TB, %p_gt_TB, %p_skip_TB;
     .reg .u32  %tile_byte_TB;
@@ -5042,7 +5109,9 @@ V2_LOOP_K_LOAD_14:
     setp.gt.u16 %p_gt_TB, %qmin_TB, %kvmax_TB;
     or.pred %p_skip_TB, %p_lt_TB, %p_gt_TB;
     @%p_skip_TB bra KV_TILE_SKIP_TB_14;
+    }
     // ----- end PCA Tier B skip predicate -----
+    } // end PCA Tier B per-q_iter scope
     mov.u32 %r1, 0;                           // k = 0
     mov.u32 %r2, 64;                           // block_kv
 V2_LOOP_S_OVER_K_14:
@@ -5348,12 +5417,14 @@ V2_LOOP_K_LOAD_15:
     @%p0 bra V2_LOOP_K_LOAD_15;
     bar.sync 0;  // FENCE: K tile in shmem
     // Phase 2: S = Q*K^T (q_tile_iter = 15)
+    { // PCA Tier B per-q_iter scope
     // PCA Tier B: derive kv-tile ordinal from %k_start
     .reg .u64 %rd_kvt_ord_TB;
     .reg .u32 %r_kvt_ord_TB;
     shr.b64 %rd_kvt_ord_TB, %k_start, 6;
     cvt.u32.u64 %r_kvt_ord_TB, %rd_kvt_ord_TB;
     // ----- PCA Tier B: skip predicate (spec sec 3.2) -----
+    {
     .reg .u16  %qmin_TB, %qmax_TB, %kvmin_TB, %kvmax_TB;
     .reg .pred %p_lt_TB, %p_gt_TB, %p_skip_TB;
     .reg .u32  %tile_byte_TB;
@@ -5379,7 +5450,9 @@ V2_LOOP_K_LOAD_15:
     setp.gt.u16 %p_gt_TB, %qmin_TB, %kvmax_TB;
     or.pred %p_skip_TB, %p_lt_TB, %p_gt_TB;
     @%p_skip_TB bra KV_TILE_SKIP_TB_15;
+    }
     // ----- end PCA Tier B skip predicate -----
+    } // end PCA Tier B per-q_iter scope
     mov.u32 %r1, 0;                           // k = 0
     mov.u32 %r2, 64;                           // block_kv
 V2_LOOP_S_OVER_K_15:

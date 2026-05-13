@@ -143,10 +143,15 @@ pub fn emit_range_table_preamble(
     ));
 
     // Register declarations (declared once at the preamble; reused
-    // across q-phase and kv-phase iterations).
+    // across q-phase and kv-phase iterations). Data registers are .b32
+    // because shfl.sync.bfly.b32 requires .b32 operands; u16 values
+    // ride in the low 16 bits (zero-extended on load via cvt.u32.u16,
+    // narrowed on store via cvt.u16.u32). min/max are computed as .u32
+    // which gives the same result as .u16 since high bits are 0.
     ptx.push_str("    .reg .u32  %r_tile_q_TILERANGE,  %r_tile_kv_TILERANGE;\n");
-    ptx.push_str("    .reg .u16  %rs_min_TILERANGE,   %rs_max_TILERANGE;\n");
-    ptx.push_str("    .reg .u16  %rs_peer_min_TILERANGE, %rs_peer_max_TILERANGE;\n");
+    ptx.push_str("    .reg .b32  %rs_min_TILERANGE,   %rs_max_TILERANGE;\n");
+    ptx.push_str("    .reg .b32  %rs_peer_min_TILERANGE, %rs_peer_max_TILERANGE;\n");
+    ptx.push_str("    .reg .u16  %rs_tmp_u16_TILERANGE;\n");
     ptx.push_str("    .reg .u32  %lane_id_TILERANGE;\n");
     ptx.push_str("    .reg .pred %p_done_TILERANGE,   %p_lane_zero_TILERANGE;\n");
     ptx.push_str("    .reg .u64  %addr_min_TILERANGE, %addr_max_TILERANGE;\n");
@@ -232,12 +237,16 @@ fn emit_inner_reduction(
     ptx.push_str(
         "    add.u64 %wide_tile_off_TILERANGE, %seg_smem_TILERANGE, %wide_tile_off_TILERANGE;\n",
     );
-    // Lane-local initial: load one u16 from SMEM.
+    // Lane-local initial: load one u16 from SMEM, widen to b32 so shfl
+    // and min/max work in 32-bit (high bits stay zero).
     ptx.push_str(
-        "    ld.shared.u16 %rs_min_TILERANGE, [%wide_tile_off_TILERANGE];\n",
+        "    ld.shared.u16 %rs_tmp_u16_TILERANGE, [%wide_tile_off_TILERANGE];\n",
     );
     ptx.push_str(
-        "    mov.u16 %rs_max_TILERANGE, %rs_min_TILERANGE;\n",
+        "    cvt.u32.u16 %rs_min_TILERANGE, %rs_tmp_u16_TILERANGE;\n",
+    );
+    ptx.push_str(
+        "    mov.b32 %rs_max_TILERANGE, %rs_min_TILERANGE;\n",
     );
 
     // If block_size > warp_size, fold the second half (lane + 32, lane + 64, ...).
@@ -253,18 +262,23 @@ fn emit_inner_reduction(
             extra_offset * 2 /* byte stride */
         ));
         ptx.push_str(
-            "    ld.shared.u16 %rs_peer_min_TILERANGE, [%wide_tile_off_TILERANGE];\n",
+            "    ld.shared.u16 %rs_tmp_u16_TILERANGE, [%wide_tile_off_TILERANGE];\n",
         );
         ptx.push_str(
-            "    min.u16 %rs_min_TILERANGE, %rs_min_TILERANGE, %rs_peer_min_TILERANGE;\n",
+            "    cvt.u32.u16 %rs_peer_min_TILERANGE, %rs_tmp_u16_TILERANGE;\n",
         );
         ptx.push_str(
-            "    max.u16 %rs_max_TILERANGE, %rs_max_TILERANGE, %rs_peer_min_TILERANGE;\n",
+            "    min.u32 %rs_min_TILERANGE, %rs_min_TILERANGE, %rs_peer_min_TILERANGE;\n",
+        );
+        ptx.push_str(
+            "    max.u32 %rs_max_TILERANGE, %rs_max_TILERANGE, %rs_peer_min_TILERANGE;\n",
         );
         extra_offset += warp_size;
     }
 
-    // 5-step butterfly reduction (offsets 16, 8, 4, 2, 1).
+    // 5-step butterfly reduction (offsets 16, 8, 4, 2, 1). Operates on
+    // .b32 registers per PTX shfl.sync.bfly.b32 requirement; min/max
+    // computed as .u32 (high bits are zero so equivalent to u16 cmp).
     for offset in [16u32, 8, 4, 2, 1] {
         ptx.push_str(&format!(
             "    shfl.sync.bfly.b32 %rs_peer_min_TILERANGE, %rs_min_TILERANGE, {offset}, 0x1F, 0xFFFFFFFF;\n"
@@ -273,10 +287,10 @@ fn emit_inner_reduction(
             "    shfl.sync.bfly.b32 %rs_peer_max_TILERANGE, %rs_max_TILERANGE, {offset}, 0x1F, 0xFFFFFFFF;\n"
         ));
         ptx.push_str(
-            "    min.u16 %rs_min_TILERANGE, %rs_min_TILERANGE, %rs_peer_min_TILERANGE;\n",
+            "    min.u32 %rs_min_TILERANGE, %rs_min_TILERANGE, %rs_peer_min_TILERANGE;\n",
         );
         ptx.push_str(
-            "    max.u16 %rs_max_TILERANGE, %rs_max_TILERANGE, %rs_peer_max_TILERANGE;\n",
+            "    max.u32 %rs_max_TILERANGE, %rs_max_TILERANGE, %rs_peer_max_TILERANGE;\n",
         );
     }
 }
@@ -322,11 +336,18 @@ fn emit_lane_zero_store(
         "    setp.eq.u32 %p_lane_zero_TILERANGE, %lane_id_TILERANGE, 0;\n",
     );
     // Predicated stores (NOT divergent branch -- see spec sec 4.3).
+    // Narrow b32 to u16 for the store (st.shared.u16 requires .u16 source).
     ptx.push_str(
-        "    @%p_lane_zero_TILERANGE st.shared.u16 [%addr_min_TILERANGE], %rs_min_TILERANGE;\n",
+        "    @%p_lane_zero_TILERANGE cvt.u16.u32 %rs_tmp_u16_TILERANGE, %rs_min_TILERANGE;\n",
     );
     ptx.push_str(
-        "    @%p_lane_zero_TILERANGE st.shared.u16 [%addr_max_TILERANGE], %rs_max_TILERANGE;\n",
+        "    @%p_lane_zero_TILERANGE st.shared.u16 [%addr_min_TILERANGE], %rs_tmp_u16_TILERANGE;\n",
+    );
+    ptx.push_str(
+        "    @%p_lane_zero_TILERANGE cvt.u16.u32 %rs_tmp_u16_TILERANGE, %rs_max_TILERANGE;\n",
+    );
+    ptx.push_str(
+        "    @%p_lane_zero_TILERANGE st.shared.u16 [%addr_max_TILERANGE], %rs_tmp_u16_TILERANGE;\n",
     );
 }
 
@@ -358,6 +379,10 @@ pub fn emit_skip_predicate(
     let addrs = range_table_addrs(range_table_base, num_q, num_kv);
 
     ptx.push_str("    // ----- PCA Tier B: skip predicate (spec sec 3.2) -----\n");
+    // Wrap in a PTX lexical scope so register decls are local to this
+    // call site (predicate fires once per (q_iter, kv_iter) pair; without
+    // the scope, repeat calls would re-declare and ptxas would reject).
+    ptx.push_str("    {\n");
     ptx.push_str("    .reg .u16  %qmin_TB, %qmax_TB, %kvmin_TB, %kvmax_TB;\n");
     ptx.push_str("    .reg .pred %p_lt_TB, %p_gt_TB, %p_skip_TB;\n");
     ptx.push_str("    .reg .u32  %tile_byte_TB;\n");
@@ -397,6 +422,7 @@ pub fn emit_skip_predicate(
     ptx.push_str("    setp.gt.u16 %p_gt_TB, %qmin_TB, %kvmax_TB;\n");
     ptx.push_str("    or.pred %p_skip_TB, %p_lt_TB, %p_gt_TB;\n");
     ptx.push_str(&format!("    @%p_skip_TB bra {on_skip_label};\n"));
+    ptx.push_str("    }\n");
     ptx.push_str("    // ----- end PCA Tier B skip predicate -----\n");
 }
 
