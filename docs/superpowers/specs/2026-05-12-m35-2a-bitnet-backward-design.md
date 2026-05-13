@@ -101,6 +101,15 @@ V-P1-D is the *first* Linux-required step; M35.2 implementation requires Linux f
 
 **Acceptance:** a one-paragraph note in `docs/superpowers/specs/2026-05-12-m35-2a-bitnet-backward-design.md` (this file) recording the access mechanism + cost + estimated reliability. Updated before V-P1-D measurement begins.
 
+**Linux access mechanism (chosen 2026-05-12, per Task A.1 of the M35.2a plan):**
+
+- **Mechanism:** WSL2 (Windows Subsystem for Linux 2) on the existing Windows 11 development machine, using CUDA passthrough to the RTX 5070 Ti (sm_120). Same physical hardware as the primary Windows MSVC environment; bitnet.cpp builds + GPU measurements run inside WSL2 via standard `cmake + nvcc` (`/usr/local/cuda` from WSL2's CUDA toolkit) rather than via separate Linux infrastructure.
+- **Setup time before first V-P1-D measurement:** ~1-2 hours one-time (install Ubuntu 22.04 WSL2 distro + WSL2 CUDA toolkit + clone microsoft/BitNet + cmake build). The ~13 GB HF model download is a one-time ~30 min cost on a typical home connection and is cached at `~/.cache/nsl-tests/bitnet_b158_3b/` per spec §6.2 (the cache directory lives in WSL2's filesystem; the Linux-only bash script `scripts/fetch_bitnet_b158_3b.sh` runs natively in WSL2).
+- **Ongoing reliability:** Stable for the duration of M35.2 (~3-6 months). Same machine as primary development; no rental expiry, no remote contributor coordination. Subject only to occasional Windows update events that may briefly affect WSL2 (rare; recoverable in <30 min). WSL2's CUDA support has been mature since Windows 11 21H2; the user's Windows 11 Home 10.0.26200 build supports it cleanly.
+- **Estimated cost across M35.2 (a+b+c):** Effectively zero (machine + electricity already incurred). Compared to a cloud-rental alternative (~$200/week reserved A100; ~$2,400 over 12 weeks), WSL2 saves ~$2K and eliminates rental-coordination overhead.
+- **WSL2-specific caveats:** WSL2 compute-bound perf is typically 95-99% of native Linux; HBM-bound workloads (BitNet is HBM-bound for ternary unpack) may show slightly larger deltas vs native, generally still within 5%. V-P1-D's ≥80% speedup criterion is measured *against WSL2's own FP16 baseline* (same harness, same WSL2 environment), not against a hypothetical native-Linux baseline — apples-to-apples within the chosen platform. If a future workload requires sub-5% match against native Linux, fall back to cloud GPU rental for that specific measurement.
+- **Fallback if WSL2 becomes unavailable:** Cloud GPU rental (RunPod A100, ~$1/hour) used as one-time V-P1-D measurement venue. Plan would shift M35.2b/c ongoing development to a rented instance for the duration; cost ~$2K total. Fallback never needed unless WSL2 CUDA support breaks via an unrelated Windows event.
+
 ### 2.6 V-M35.2a-STE — confirm clipped STE matches b1.58 training reference (gates STE implementation)
 
 **Task:** verify the b1.58 reference STE choice. Q2's clipped-STE-with-clip-threshold-`|x_int8| == 127` decision rests on "matches the de-facto b1.58 reference behavior." STE lives in training code, not inference code; bitnet.cpp may not have backward. Verification procedure:
