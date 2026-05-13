@@ -112,6 +112,9 @@ fn run_probe_config(static_bytes: u32, dynamic_bytes: u32, sm: u32) -> ProbeRow 
         let mut ctx: sys::CUcontext = std::ptr::null_mut();
         let query_rc = sys::cuCtxGetCurrent(&mut ctx);
         if query_rc != sys::CUresult::CUDA_SUCCESS || ctx.is_null() {
+            // cuInit is idempotent; required before cuDeviceGet on a cold
+            // test binary where no other code has driven the driver yet.
+            let _ = sys::cuInit(0);
             // Try to create one on device 0.
             let mut dev: sys::CUdevice = 0;
             let dev_rc = sys::cuDeviceGet(&mut dev, 0);
