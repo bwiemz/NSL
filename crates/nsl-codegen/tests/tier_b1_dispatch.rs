@@ -2,12 +2,14 @@
 //! routes to `tier_b1::synthesize` when `csha.level >= 2` AND `gpu_sm >= 80`,
 //! and falls through to Tier A otherwise.
 //!
-//! At B1.3 stage, `chunk_config::select` performs a real descending search
-//! over `{128, 64, 32, FLOOR}`, gated on SMEM (spec §3.4) and register
-//! budget (spec §5.4). Eligible level=2 + sm>=80 configs whose tile shape
-//! fits the 99 KB SMEM budget now route into `tier_b1::synthesize`, which
-//! at this stage emits a placeholder ("Tier B.1 stub") marker. B1.4+ lands
-//! the real PTX emission.
+//! At B1.5 Task 5.3 stage, `chunk_config::select` performs a real descending
+//! search over `{128, 64, 32, FLOOR}`, gated on SMEM (spec section 3.4) and
+//! register budget (spec section 5.4). Eligible level=2 + sm>=80 configs whose
+//! tile shape fits the 99 KB SMEM budget route into `tier_b1::synthesize`,
+//! which now emits the full single-iteration scaffold (prelude + active_heads +
+//! RMSNorm + Q projection + cp.async prologue kicks + Phase A/B/C + finalize)
+//! and the "Tier B.1 single-iter scaffold complete" sentinel comment. B1.6
+//! lands the multi-iter loop alongside the register-hoist refactor.
 
 use nsl_codegen::flash_attention::{CshaExtras, FlashAttentionConfig, RopeStyle};
 use nsl_codegen::flash_attention_v2::synthesize_flash_attention_ptx_v2;
@@ -43,18 +45,16 @@ fn tier_b1_eligible_routes_to_synthesize_stub() {
     let config = tier_b1_eligible_config();
     let ptx = synthesize_flash_attention_ptx_v2(&config);
     let s = String::from_utf8_lossy(&ptx);
-    // B1.3 landed the real `chunk_config::select` (SMEM + register-budget
-    // gates per spec §3.4 + §5.4). For this small 32x32x32 config it
-    // succeeds, so dispatch routes into `tier_b1::synthesize`, which at
-    // B1.3 emits the "Tier B.1 stub" placeholder marker. B1.4+ replaces
-    // that placeholder with real PTX emission.
-    // FLIP-POINT B1.4: when real emission lands the marker string will
-    // change — update this assertion to match the new emitter output
-    // (likely a kernel name like ".visible .entry flash_attn_tier_b1_*"
-    // or a sentinel block header).
+    // B1.5 Task 5.3 replaced the "Tier B.1 stub" placeholder with the full
+    // single-iteration scaffold (prelude + active_heads + RMSNorm + Q proj +
+    // cp.async prologue + Phase A/B/C + finalize). The sentinel comment at the
+    // tail of synthesize() is the load-bearing marker for this test.
+    // FLIP-POINT B1.6: when the multi-iter loop lands (with the register-hoist
+    // refactor in attention_mma.rs Phase-B deferral #4), update this assertion
+    // to match the new sentinel or the loop-control label.
     assert!(
-        s.contains("Tier B.1 stub"),
-        "B1.3 chunk_config::select should now succeed and route to tier_b1::synthesize stub; got: {}",
+        s.contains("Tier B.1 single-iter scaffold complete"),
+        "B1.5 Task 5.3 ships the single-iter scaffold marker; B1.6 will replace this with the multi-iter form. Got: {}",
         &s[..s.len().min(200)]
     );
 }
@@ -71,10 +71,10 @@ fn level_1_config_does_not_route_to_tier_b1() {
     });
     let ptx = synthesize_flash_attention_ptx_v2(&config);
     let s = String::from_utf8_lossy(&ptx);
-    // FLIP-POINT B1.3: this assertion stays the same — level=1 will
-    // never route to tier_b1 regardless of `chunk_config::select`'s state.
+    // This assertion stays the same — level=1 will never route to tier_b1
+    // regardless of milestone. Checked against the B1.5 scaffold sentinel.
     assert!(
-        !s.contains("Tier B.1 stub"),
+        !s.contains("Tier B.1 single-iter scaffold complete"),
         "csha.level=1 must NOT route to tier_b1; got: {}",
         &s[..s.len().min(200)]
     );
@@ -89,10 +89,10 @@ fn old_sm_does_not_route_to_tier_b1() {
     config.gpu_sm = 75;
     let ptx = synthesize_flash_attention_ptx_v2(&config);
     let s = String::from_utf8_lossy(&ptx);
-    // FLIP-POINT B1.3: this assertion stays the same — sm<80 will
-    // never route to tier_b1 regardless of `chunk_config::select`'s state.
+    // This assertion stays the same — sm<80 will never route to tier_b1
+    // regardless of milestone. Checked against the B1.5 scaffold sentinel.
     assert!(
-        !s.contains("Tier B.1 stub"),
+        !s.contains("Tier B.1 single-iter scaffold complete"),
         "gpu_sm=75 must NOT route to tier_b1; got: {}",
         &s[..s.len().min(200)]
     );
