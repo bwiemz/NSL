@@ -20,8 +20,20 @@ use crate::flash_attention::FlashAttentionConfig;
 use crate::flash_attention_v2::phases::q_load::Q_BASE;
 use crate::flash_attention_v2::phases::softmax::emit_direct_hbm_store_of_reg;
 use crate::flash_attention_v2::smem_layout::{kv_offset, sp_offset};
+use crate::pca_segment::SegmentResidency;
 
-pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
+/// Emit the S = Q·Kᵀ computation for one kv-tile.
+///
+/// `tier_b` — when `Some((seq_len, residency))`, emits the PCA Tier B
+/// skip predicate at the top of the tile body (before QK^T) if the
+/// range-table budget check passes.  `None` disables Tier B emission
+/// (used by the existing `synthesize_flash_attention_ptx_v2` path).
+pub fn emit(
+    ptx: &mut String,
+    config: &FlashAttentionConfig,
+    q_tile_iter: u32,
+    tier_b: Option<(u32, SegmentResidency)>,
+) {
     let head_dim = config.head_dim as u32;
     let slices   = head_dim / 32;
     let block_kv = config.block_kv as u32;
@@ -56,6 +68,46 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
         "    // Phase 2: S = Q*K^T (q_tile_iter = {})\n",
         q_tile_iter
     ));
+
+    // PCA Tier B: tile-level skip predicate — fires once per kv-tile BEFORE
+    // the QK^T inner loop.  When ranges are disjoint the entire tile is
+    // skipped (including softmax + PV accumulation) by branching to
+    // KV_TILE_SKIP_TB_{q_tile_iter}, which is placed in the orchestrator
+    // (mod.rs) just before the k_start increment.
+    //
+    // Implementation notes:
+    //   - %k_start (u64) is the absolute token position of the kv-tile
+    //     start, set by the orchestrator BEFORE emit() is called.  We derive
+    //     the kv-tile ordinal with a right-shift by log2(block_kv) (block_kv
+    //     is always a power of 2 in the supported tile matrix).
+    //   - The q-tile ordinal is the compile-time constant `q_tile_iter`,
+    //     emitted as a PTX immediate literal — ptxas accepts an immediate
+    //     as the `a` operand of `shl.b32`.
+    if let Some((seq_len, residency)) = tier_b {
+        if crate::pca_tilerange::should_emit_tier_b(config, seq_len as u64, residency) {
+            let log2_bkv = (block_kv as u32).trailing_zeros();
+            let range_table_base =
+                crate::flash_attention_v2::smem_layout::tier_b_range_table_offset(config);
+            let skip_label = format!("KV_TILE_SKIP_TB_{q_tile_iter}");
+            // Derive kv-tile ordinal: %r_kvt_ord_TB = k_start >> log2(block_kv)
+            ptx.push_str("    // PCA Tier B: derive kv-tile ordinal from %k_start\n");
+            ptx.push_str("    .reg .u64 %rd_kvt_ord_TB;\n");
+            ptx.push_str("    .reg .u32 %r_kvt_ord_TB;\n");
+            ptx.push_str(&format!(
+                "    shr.b64 %rd_kvt_ord_TB, %k_start, {log2_bkv};\n"
+            ));
+            ptx.push_str("    cvt.u32.u64 %r_kvt_ord_TB, %rd_kvt_ord_TB;\n");
+            crate::pca_tilerange::emit_skip_predicate(
+                ptx,
+                config,
+                seq_len,
+                &q_tile_iter.to_string(), // qt is compile-time; emit as immediate
+                "%r_kvt_ord_TB",
+                range_table_base,
+                &skip_label,
+            );
+        }
+    }
 
     // J-A5 direct_scale: snapshot %scale (the 1/sqrt(d_k) param loaded at
     // kernel prelude) once per warp before the k loop. Ones-input expected

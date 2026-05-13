@@ -333,17 +333,71 @@ fn emit_lane_zero_store(
 /// Emit PTX that branches to `on_skip_label` if the `(qt, kvt)` tile
 /// pair has strictly disjoint segment ranges.
 ///
-/// Compiles to one comparison + one warp-uniform branch (`BRA.U`).
+/// Loads `qtile_seg_min[qt]`, `qtile_seg_max[qt]`, `kvtile_seg_min[kvt]`,
+/// `kvtile_seg_max[kvt]` from the range table in SMEM, then checks:
+///   disjoint = (qmax < kvmin) || (qmin > kvmax)
 ///
-/// **Stub in skeleton — real emission in Task 4.**
+/// When disjoint, branches to `on_skip_label` (warp-uniform → BRA.U).
+/// All scratch registers carry the `_TB` suffix to avoid collisions.
+///
+/// `qt_reg` and `kvt_reg` are u32 PTX operands (register names or
+/// immediates) holding the current q-tile / kv-tile ordinal.
+/// `range_table_base` is the SMEM byte offset from
+/// `smem_layout::tier_b_range_table_offset`.
 pub fn emit_skip_predicate(
     ptx: &mut String,
-    qt_reg: &str,
-    kvt_reg: &str,
-    on_skip_label: &str,
+    config: &crate::flash_attention::FlashAttentionConfig,
+    seq_len: u32,
+    qt_reg: &str,            // PTX register holding the current q-tile index
+    kvt_reg: &str,           // PTX register holding the current kv-tile index
+    range_table_base: u32,   // from smem_layout::tier_b_range_table_offset
+    on_skip_label: &str,     // PTX label to branch to when ranges disjoint
 ) {
-    let _ = (qt_reg, kvt_reg, on_skip_label);
-    ptx.push_str("    // PCA Tier B: skip predicate (Task 4 stub)\n");
+    let num_q  = crate::pca_tile_config::num_tiles(seq_len, config.block_q  as u32);
+    let num_kv = crate::pca_tile_config::num_tiles(seq_len, config.block_kv as u32);
+    let addrs = range_table_addrs(range_table_base, num_q, num_kv);
+
+    ptx.push_str("    // ----- PCA Tier B: skip predicate (spec sec 3.2) -----\n");
+    ptx.push_str("    .reg .u16  %qmin_TB, %qmax_TB, %kvmin_TB, %kvmax_TB;\n");
+    ptx.push_str("    .reg .pred %p_lt_TB, %p_gt_TB, %p_skip_TB;\n");
+    ptx.push_str("    .reg .u32  %tile_byte_TB;\n");
+    ptx.push_str("    .reg .u64  %addr_TB;\n");
+    ptx.push_str("\n");
+
+    // qmin[qt], qmax[qt]
+    ptx.push_str(&format!("    shl.b32 %tile_byte_TB, {qt_reg}, 1;\n"));
+    ptx.push_str("    cvt.u64.u32 %addr_TB, %tile_byte_TB;\n");
+    ptx.push_str(&format!(
+        "    cvta.shared.u64 %addr_TB, shmem;\n    add.u64 %addr_TB, %addr_TB, {};\n",
+        addrs.qtile_min
+    ));
+    ptx.push_str("    ld.shared.u16 %qmin_TB, [%addr_TB];\n");
+    ptx.push_str(&format!(
+        "    cvta.shared.u64 %addr_TB, shmem;\n    add.u64 %addr_TB, %addr_TB, {};\n",
+        addrs.qtile_max
+    ));
+    ptx.push_str("    ld.shared.u16 %qmax_TB, [%addr_TB];\n");
+
+    // kvmin[kvt], kvmax[kvt]
+    ptx.push_str(&format!("    shl.b32 %tile_byte_TB, {kvt_reg}, 1;\n"));
+    ptx.push_str("    cvt.u64.u32 %addr_TB, %tile_byte_TB;\n");
+    ptx.push_str(&format!(
+        "    cvta.shared.u64 %addr_TB, shmem;\n    add.u64 %addr_TB, %addr_TB, {};\n",
+        addrs.kvtile_min
+    ));
+    ptx.push_str("    ld.shared.u16 %kvmin_TB, [%addr_TB];\n");
+    ptx.push_str(&format!(
+        "    cvta.shared.u64 %addr_TB, shmem;\n    add.u64 %addr_TB, %addr_TB, {};\n",
+        addrs.kvtile_max
+    ));
+    ptx.push_str("    ld.shared.u16 %kvmax_TB, [%addr_TB];\n");
+
+    // disjoint = (qmax < kvmin) || (qmin > kvmax)
+    ptx.push_str("    setp.lt.u16 %p_lt_TB, %qmax_TB, %kvmin_TB;\n");
+    ptx.push_str("    setp.gt.u16 %p_gt_TB, %qmin_TB, %kvmax_TB;\n");
+    ptx.push_str("    or.pred %p_skip_TB, %p_lt_TB, %p_gt_TB;\n");
+    ptx.push_str(&format!("    @%p_skip_TB bra {on_skip_label};\n"));
+    ptx.push_str("    // ----- end PCA Tier B skip predicate -----\n");
 }
 
 /// Emit PTX that writes the skip decision for `(b, h, qt, kvt)` to
@@ -469,7 +523,7 @@ mod tests {
         let mut s = String::new();
         let cfg = fa_base_for_test();
         emit_range_table_preamble(&mut s, &cfg, 4096, "seg_smem", 0);
-        emit_skip_predicate(&mut s, "%qt", "%kvt", "skip_kv_iter");
+        emit_skip_predicate(&mut s, &cfg, 4096, "%qt", "%kvt", 0, "skip_kv_iter");
         emit_skip_decision_writeback(&mut s, &cfg, "%qt", "%kvt", "%p_skip_TILERANGE", "%dec_buf");
         assert!(s.contains("PCA Tier B"), "output missing marker:\n{}", s);
     }
