@@ -24,15 +24,14 @@ pub fn emit_prologue_kicks(ptx: &mut String, _config: &FlashAttentionConfig) {
     ptx.push_str("    bar.sync 0;\n");
 }
 
-fn emit_cp_async_x_kv_for_slot(ptx: &mut String, slot: u32) {
+fn emit_cp_async_x_kv_for_slot(_ptx: &mut String, _slot: u32) {
     // B1.5 TODO: emit concrete cp.async.ca.shared.global instructions per slot
-    // (real per-thread iteration + offset arithmetic). For B1.4 the cadence
-    // (commit_group/wait_group placement) is what's load-bearing per spec §6.5;
-    // the body is a placeholder that the main FSM orchestrator will fill in.
-    ptx.push_str(&format!(
-        "    // (placeholder) cp.async.ca.shared.global slot[{}].x_kv from HBM -- B1.5 will emit real bursts\n",
-        slot
-    ));
+    // (per-thread iteration + offset arithmetic). Emits nothing until B1.5 --
+    // keeping the placeholder body empty makes the commit_group cadence
+    // (between the two slot-priming calls in emit_prologue_kicks) the sole
+    // PTX output of this section, which is the load-bearing FSM gate per
+    // spec section 6.5. Once a real PTX burst is emitted here, the snapshot
+    // for prologue_kicks_snapshot will need to be regenerated.
 }
 
 /// Phase A load: cp.async load x_kv slab into slot[curr].
@@ -44,6 +43,16 @@ pub fn emit_main_loop_phase_a_load(ptx: &mut String, _config: &FlashAttentionCon
 
 /// Phase C: kick off slot[next].x_kv load for kv_iter+2 + slot swap.
 /// Per spec section 4.2 Phase C.
+///
+/// **B1.5 prereq:** the main FSM prelude in `tier_b1::synthesize` must
+/// declare these named registers before this helper is invoked, or ptxas
+/// will reject with CUDA_ERROR_INVALID_PTX:
+/// ```text
+///   .reg .u32  %r_kv_iter_next, %r_n_kv, %r_slot_curr;
+///   .reg .pred %p_prefetch;
+/// ```
+/// (B1.4 ships these references unanchored because the orchestrator that
+/// owns the prelude is still a stub at this milestone.)
 pub fn emit_main_loop_phase_c_swap(ptx: &mut String, _config: &FlashAttentionConfig, kv_iter: u32) {
     ptx.push_str(&format!(
         "    // Phase C: prefetch kv_iter={} into the slot we just consumed\n",

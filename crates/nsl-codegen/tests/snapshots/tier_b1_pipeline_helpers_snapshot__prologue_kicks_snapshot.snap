@@ -4,10 +4,8 @@ expression: ptx
 ---
     // Tier B.1 outer prologue: prime slot[0] + slot[1] x_kv loads
     // === slot[0].x_kv <- HBM[kv_iter=0] ===
-    // (placeholder) cp.async.ca.shared.global slot[0].x_kv from HBM -- B1.5 will emit real bursts
     cp.async.commit_group; // group 0
     // === slot[1].x_kv <- HBM[kv_iter=1] ===
-    // (placeholder) cp.async.ca.shared.global slot[1].x_kv from HBM -- B1.5 will emit real bursts
     cp.async.commit_group; // group 1
     // wait for slot[0] (leaves slot[1] in flight)
     cp.async.wait_group 1;
