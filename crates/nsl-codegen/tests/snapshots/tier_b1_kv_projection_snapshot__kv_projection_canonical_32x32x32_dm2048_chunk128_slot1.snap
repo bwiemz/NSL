@@ -7,6 +7,11 @@ expression: ptx
     .reg .pred %tb1_kv_xnull, %tb1_kv_wknull, %tb1_kv_wvnull;
     .reg .u64 %tb1_kv_smem_wk, %tb1_kv_smem_wv, %tb1_kv_smem_x;
     .reg .u32 %tb1_kv_smem_wk_u32, %tb1_kv_smem_wv_u32, %tb1_kv_smem_x_u32;
+    .reg .u32 %tb1_kv_cp_tid_off;
+    .reg .u32 %tb1_kv_cp_smem_addr, %tb1_kv_cp_hbm_off;
+    .reg .u64 %tb1_kv_cp_hbm_addr;
+    mov.u32 %tb1_kv_cp_tid_off, %tid.x;
+    shl.b32 %tb1_kv_cp_tid_off, %tb1_kv_cp_tid_off, 4; // tid * 16 (B1.6 deferral #3)
     .reg .u64 %tb1_kv_smem_k, %tb1_kv_smem_v;
     .reg .u64 %tb1_kv_scatter_addr;
     .reg .b16 %tb1_kv_h0;
@@ -32,11 +37,26 @@ expression: ptx
     add.u64 %tb1_kv_smem_v, %shmem_base, 8192; // V output tile (slot=1)
     // -- KV-proj chunk 1/16 (d_model offset 0 .. 128) --
     // cp.async Wk[0:128] -> SMEM[wk_chunk_off slot 0]
-    cp.async.cg.shared.global [%tb1_kv_smem_wk], [%tb1_kv_wk_ptr + 0], 16;
+    add.u32 %tb1_kv_cp_smem_addr, %tb1_kv_smem_wk_u32, %tb1_kv_cp_tid_off;
+    cvt.u32.u64 %tb1_kv_cp_hbm_off, %tb1_kv_wk_ptr;
+    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, 0;
+    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, %tb1_kv_cp_tid_off;
+    cvt.u64.u32 %tb1_kv_cp_hbm_addr, %tb1_kv_cp_hbm_off;
+    cp.async.cg.shared.global [%tb1_kv_cp_smem_addr], [%tb1_kv_cp_hbm_addr], 16;
     // cp.async Wv[0:128] -> SMEM[wv_chunk_off slot 1]
-    cp.async.cg.shared.global [%tb1_kv_smem_wv], [%tb1_kv_wv_ptr + 0], 16;
+    add.u32 %tb1_kv_cp_smem_addr, %tb1_kv_smem_wv_u32, %tb1_kv_cp_tid_off;
+    cvt.u32.u64 %tb1_kv_cp_hbm_off, %tb1_kv_wv_ptr;
+    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, 0;
+    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, %tb1_kv_cp_tid_off;
+    cvt.u64.u32 %tb1_kv_cp_hbm_addr, %tb1_kv_cp_hbm_off;
+    cp.async.cg.shared.global [%tb1_kv_cp_smem_addr], [%tb1_kv_cp_hbm_addr], 16;
     // cp.async x_kv[kv_iter=0 chunk=0] -> SMEM[x_kv_off]
-    cp.async.cg.shared.global [%tb1_kv_smem_x], [%tb1_kv_x_ptr + 0], 16;
+    add.u32 %tb1_kv_cp_smem_addr, %tb1_kv_smem_x_u32, %tb1_kv_cp_tid_off;
+    cvt.u32.u64 %tb1_kv_cp_hbm_off, %tb1_kv_x_ptr;
+    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, 0;
+    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, %tb1_kv_cp_tid_off;
+    cvt.u64.u32 %tb1_kv_cp_hbm_addr, %tb1_kv_cp_hbm_off;
+    cp.async.cg.shared.global [%tb1_kv_cp_smem_addr], [%tb1_kv_cp_hbm_addr], 16;
     cp.async.commit_group;
     cp.async.wait_group 0;
     bar.sync 0;
@@ -88,11 +108,26 @@ expression: ptx
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     // -- KV-proj chunk 2/16 (d_model offset 128 .. 256) --
     // cp.async Wk[128:256] -> SMEM[wk_chunk_off slot 0]
-    cp.async.cg.shared.global [%tb1_kv_smem_wk], [%tb1_kv_wk_ptr + 8192], 16;
+    add.u32 %tb1_kv_cp_smem_addr, %tb1_kv_smem_wk_u32, %tb1_kv_cp_tid_off;
+    cvt.u32.u64 %tb1_kv_cp_hbm_off, %tb1_kv_wk_ptr;
+    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, 8192;
+    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, %tb1_kv_cp_tid_off;
+    cvt.u64.u32 %tb1_kv_cp_hbm_addr, %tb1_kv_cp_hbm_off;
+    cp.async.cg.shared.global [%tb1_kv_cp_smem_addr], [%tb1_kv_cp_hbm_addr], 16;
     // cp.async Wv[128:256] -> SMEM[wv_chunk_off slot 1]
-    cp.async.cg.shared.global [%tb1_kv_smem_wv], [%tb1_kv_wv_ptr + 8192], 16;
+    add.u32 %tb1_kv_cp_smem_addr, %tb1_kv_smem_wv_u32, %tb1_kv_cp_tid_off;
+    cvt.u32.u64 %tb1_kv_cp_hbm_off, %tb1_kv_wv_ptr;
+    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, 8192;
+    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, %tb1_kv_cp_tid_off;
+    cvt.u64.u32 %tb1_kv_cp_hbm_addr, %tb1_kv_cp_hbm_off;
+    cp.async.cg.shared.global [%tb1_kv_cp_smem_addr], [%tb1_kv_cp_hbm_addr], 16;
     // cp.async x_kv[kv_iter=0 chunk=1] -> SMEM[x_kv_off]
-    cp.async.cg.shared.global [%tb1_kv_smem_x], [%tb1_kv_x_ptr + 512], 16;
+    add.u32 %tb1_kv_cp_smem_addr, %tb1_kv_smem_x_u32, %tb1_kv_cp_tid_off;
+    cvt.u32.u64 %tb1_kv_cp_hbm_off, %tb1_kv_x_ptr;
+    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, 512;
+    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, %tb1_kv_cp_tid_off;
+    cvt.u64.u32 %tb1_kv_cp_hbm_addr, %tb1_kv_cp_hbm_off;
+    cp.async.cg.shared.global [%tb1_kv_cp_smem_addr], [%tb1_kv_cp_hbm_addr], 16;
     cp.async.commit_group;
     cp.async.wait_group 0;
     bar.sync 0;
@@ -144,11 +179,26 @@ expression: ptx
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     // -- KV-proj chunk 3/16 (d_model offset 256 .. 384) --
     // cp.async Wk[256:384] -> SMEM[wk_chunk_off slot 0]
-    cp.async.cg.shared.global [%tb1_kv_smem_wk], [%tb1_kv_wk_ptr + 16384], 16;
+    add.u32 %tb1_kv_cp_smem_addr, %tb1_kv_smem_wk_u32, %tb1_kv_cp_tid_off;
+    cvt.u32.u64 %tb1_kv_cp_hbm_off, %tb1_kv_wk_ptr;
+    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, 16384;
+    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, %tb1_kv_cp_tid_off;
+    cvt.u64.u32 %tb1_kv_cp_hbm_addr, %tb1_kv_cp_hbm_off;
+    cp.async.cg.shared.global [%tb1_kv_cp_smem_addr], [%tb1_kv_cp_hbm_addr], 16;
     // cp.async Wv[256:384] -> SMEM[wv_chunk_off slot 1]
-    cp.async.cg.shared.global [%tb1_kv_smem_wv], [%tb1_kv_wv_ptr + 16384], 16;
+    add.u32 %tb1_kv_cp_smem_addr, %tb1_kv_smem_wv_u32, %tb1_kv_cp_tid_off;
+    cvt.u32.u64 %tb1_kv_cp_hbm_off, %tb1_kv_wv_ptr;
+    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, 16384;
+    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, %tb1_kv_cp_tid_off;
+    cvt.u64.u32 %tb1_kv_cp_hbm_addr, %tb1_kv_cp_hbm_off;
+    cp.async.cg.shared.global [%tb1_kv_cp_smem_addr], [%tb1_kv_cp_hbm_addr], 16;
     // cp.async x_kv[kv_iter=0 chunk=2] -> SMEM[x_kv_off]
-    cp.async.cg.shared.global [%tb1_kv_smem_x], [%tb1_kv_x_ptr + 1024], 16;
+    add.u32 %tb1_kv_cp_smem_addr, %tb1_kv_smem_x_u32, %tb1_kv_cp_tid_off;
+    cvt.u32.u64 %tb1_kv_cp_hbm_off, %tb1_kv_x_ptr;
+    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, 1024;
+    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, %tb1_kv_cp_tid_off;
+    cvt.u64.u32 %tb1_kv_cp_hbm_addr, %tb1_kv_cp_hbm_off;
+    cp.async.cg.shared.global [%tb1_kv_cp_smem_addr], [%tb1_kv_cp_hbm_addr], 16;
     cp.async.commit_group;
     cp.async.wait_group 0;
     bar.sync 0;
@@ -200,11 +250,26 @@ expression: ptx
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     // -- KV-proj chunk 4/16 (d_model offset 384 .. 512) --
     // cp.async Wk[384:512] -> SMEM[wk_chunk_off slot 0]
-    cp.async.cg.shared.global [%tb1_kv_smem_wk], [%tb1_kv_wk_ptr + 24576], 16;
+    add.u32 %tb1_kv_cp_smem_addr, %tb1_kv_smem_wk_u32, %tb1_kv_cp_tid_off;
+    cvt.u32.u64 %tb1_kv_cp_hbm_off, %tb1_kv_wk_ptr;
+    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, 24576;
+    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, %tb1_kv_cp_tid_off;
+    cvt.u64.u32 %tb1_kv_cp_hbm_addr, %tb1_kv_cp_hbm_off;
+    cp.async.cg.shared.global [%tb1_kv_cp_smem_addr], [%tb1_kv_cp_hbm_addr], 16;
     // cp.async Wv[384:512] -> SMEM[wv_chunk_off slot 1]
-    cp.async.cg.shared.global [%tb1_kv_smem_wv], [%tb1_kv_wv_ptr + 24576], 16;
+    add.u32 %tb1_kv_cp_smem_addr, %tb1_kv_smem_wv_u32, %tb1_kv_cp_tid_off;
+    cvt.u32.u64 %tb1_kv_cp_hbm_off, %tb1_kv_wv_ptr;
+    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, 24576;
+    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, %tb1_kv_cp_tid_off;
+    cvt.u64.u32 %tb1_kv_cp_hbm_addr, %tb1_kv_cp_hbm_off;
+    cp.async.cg.shared.global [%tb1_kv_cp_smem_addr], [%tb1_kv_cp_hbm_addr], 16;
     // cp.async x_kv[kv_iter=0 chunk=3] -> SMEM[x_kv_off]
-    cp.async.cg.shared.global [%tb1_kv_smem_x], [%tb1_kv_x_ptr + 1536], 16;
+    add.u32 %tb1_kv_cp_smem_addr, %tb1_kv_smem_x_u32, %tb1_kv_cp_tid_off;
+    cvt.u32.u64 %tb1_kv_cp_hbm_off, %tb1_kv_x_ptr;
+    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, 1536;
+    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, %tb1_kv_cp_tid_off;
+    cvt.u64.u32 %tb1_kv_cp_hbm_addr, %tb1_kv_cp_hbm_off;
+    cp.async.cg.shared.global [%tb1_kv_cp_smem_addr], [%tb1_kv_cp_hbm_addr], 16;
     cp.async.commit_group;
     cp.async.wait_group 0;
     bar.sync 0;
@@ -256,11 +321,26 @@ expression: ptx
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     // -- KV-proj chunk 5/16 (d_model offset 512 .. 640) --
     // cp.async Wk[512:640] -> SMEM[wk_chunk_off slot 0]
-    cp.async.cg.shared.global [%tb1_kv_smem_wk], [%tb1_kv_wk_ptr + 32768], 16;
+    add.u32 %tb1_kv_cp_smem_addr, %tb1_kv_smem_wk_u32, %tb1_kv_cp_tid_off;
+    cvt.u32.u64 %tb1_kv_cp_hbm_off, %tb1_kv_wk_ptr;
+    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, 32768;
+    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, %tb1_kv_cp_tid_off;
+    cvt.u64.u32 %tb1_kv_cp_hbm_addr, %tb1_kv_cp_hbm_off;
+    cp.async.cg.shared.global [%tb1_kv_cp_smem_addr], [%tb1_kv_cp_hbm_addr], 16;
     // cp.async Wv[512:640] -> SMEM[wv_chunk_off slot 1]
-    cp.async.cg.shared.global [%tb1_kv_smem_wv], [%tb1_kv_wv_ptr + 32768], 16;
+    add.u32 %tb1_kv_cp_smem_addr, %tb1_kv_smem_wv_u32, %tb1_kv_cp_tid_off;
+    cvt.u32.u64 %tb1_kv_cp_hbm_off, %tb1_kv_wv_ptr;
+    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, 32768;
+    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, %tb1_kv_cp_tid_off;
+    cvt.u64.u32 %tb1_kv_cp_hbm_addr, %tb1_kv_cp_hbm_off;
+    cp.async.cg.shared.global [%tb1_kv_cp_smem_addr], [%tb1_kv_cp_hbm_addr], 16;
     // cp.async x_kv[kv_iter=0 chunk=4] -> SMEM[x_kv_off]
-    cp.async.cg.shared.global [%tb1_kv_smem_x], [%tb1_kv_x_ptr + 2048], 16;
+    add.u32 %tb1_kv_cp_smem_addr, %tb1_kv_smem_x_u32, %tb1_kv_cp_tid_off;
+    cvt.u32.u64 %tb1_kv_cp_hbm_off, %tb1_kv_x_ptr;
+    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, 2048;
+    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, %tb1_kv_cp_tid_off;
+    cvt.u64.u32 %tb1_kv_cp_hbm_addr, %tb1_kv_cp_hbm_off;
+    cp.async.cg.shared.global [%tb1_kv_cp_smem_addr], [%tb1_kv_cp_hbm_addr], 16;
     cp.async.commit_group;
     cp.async.wait_group 0;
     bar.sync 0;
@@ -312,11 +392,26 @@ expression: ptx
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     // -- KV-proj chunk 6/16 (d_model offset 640 .. 768) --
     // cp.async Wk[640:768] -> SMEM[wk_chunk_off slot 0]
-    cp.async.cg.shared.global [%tb1_kv_smem_wk], [%tb1_kv_wk_ptr + 40960], 16;
+    add.u32 %tb1_kv_cp_smem_addr, %tb1_kv_smem_wk_u32, %tb1_kv_cp_tid_off;
+    cvt.u32.u64 %tb1_kv_cp_hbm_off, %tb1_kv_wk_ptr;
+    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, 40960;
+    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, %tb1_kv_cp_tid_off;
+    cvt.u64.u32 %tb1_kv_cp_hbm_addr, %tb1_kv_cp_hbm_off;
+    cp.async.cg.shared.global [%tb1_kv_cp_smem_addr], [%tb1_kv_cp_hbm_addr], 16;
     // cp.async Wv[640:768] -> SMEM[wv_chunk_off slot 1]
-    cp.async.cg.shared.global [%tb1_kv_smem_wv], [%tb1_kv_wv_ptr + 40960], 16;
+    add.u32 %tb1_kv_cp_smem_addr, %tb1_kv_smem_wv_u32, %tb1_kv_cp_tid_off;
+    cvt.u32.u64 %tb1_kv_cp_hbm_off, %tb1_kv_wv_ptr;
+    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, 40960;
+    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, %tb1_kv_cp_tid_off;
+    cvt.u64.u32 %tb1_kv_cp_hbm_addr, %tb1_kv_cp_hbm_off;
+    cp.async.cg.shared.global [%tb1_kv_cp_smem_addr], [%tb1_kv_cp_hbm_addr], 16;
     // cp.async x_kv[kv_iter=0 chunk=5] -> SMEM[x_kv_off]
-    cp.async.cg.shared.global [%tb1_kv_smem_x], [%tb1_kv_x_ptr + 2560], 16;
+    add.u32 %tb1_kv_cp_smem_addr, %tb1_kv_smem_x_u32, %tb1_kv_cp_tid_off;
+    cvt.u32.u64 %tb1_kv_cp_hbm_off, %tb1_kv_x_ptr;
+    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, 2560;
+    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, %tb1_kv_cp_tid_off;
+    cvt.u64.u32 %tb1_kv_cp_hbm_addr, %tb1_kv_cp_hbm_off;
+    cp.async.cg.shared.global [%tb1_kv_cp_smem_addr], [%tb1_kv_cp_hbm_addr], 16;
     cp.async.commit_group;
     cp.async.wait_group 0;
     bar.sync 0;
@@ -368,11 +463,26 @@ expression: ptx
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     // -- KV-proj chunk 7/16 (d_model offset 768 .. 896) --
     // cp.async Wk[768:896] -> SMEM[wk_chunk_off slot 0]
-    cp.async.cg.shared.global [%tb1_kv_smem_wk], [%tb1_kv_wk_ptr + 49152], 16;
+    add.u32 %tb1_kv_cp_smem_addr, %tb1_kv_smem_wk_u32, %tb1_kv_cp_tid_off;
+    cvt.u32.u64 %tb1_kv_cp_hbm_off, %tb1_kv_wk_ptr;
+    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, 49152;
+    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, %tb1_kv_cp_tid_off;
+    cvt.u64.u32 %tb1_kv_cp_hbm_addr, %tb1_kv_cp_hbm_off;
+    cp.async.cg.shared.global [%tb1_kv_cp_smem_addr], [%tb1_kv_cp_hbm_addr], 16;
     // cp.async Wv[768:896] -> SMEM[wv_chunk_off slot 1]
-    cp.async.cg.shared.global [%tb1_kv_smem_wv], [%tb1_kv_wv_ptr + 49152], 16;
+    add.u32 %tb1_kv_cp_smem_addr, %tb1_kv_smem_wv_u32, %tb1_kv_cp_tid_off;
+    cvt.u32.u64 %tb1_kv_cp_hbm_off, %tb1_kv_wv_ptr;
+    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, 49152;
+    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, %tb1_kv_cp_tid_off;
+    cvt.u64.u32 %tb1_kv_cp_hbm_addr, %tb1_kv_cp_hbm_off;
+    cp.async.cg.shared.global [%tb1_kv_cp_smem_addr], [%tb1_kv_cp_hbm_addr], 16;
     // cp.async x_kv[kv_iter=0 chunk=6] -> SMEM[x_kv_off]
-    cp.async.cg.shared.global [%tb1_kv_smem_x], [%tb1_kv_x_ptr + 3072], 16;
+    add.u32 %tb1_kv_cp_smem_addr, %tb1_kv_smem_x_u32, %tb1_kv_cp_tid_off;
+    cvt.u32.u64 %tb1_kv_cp_hbm_off, %tb1_kv_x_ptr;
+    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, 3072;
+    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, %tb1_kv_cp_tid_off;
+    cvt.u64.u32 %tb1_kv_cp_hbm_addr, %tb1_kv_cp_hbm_off;
+    cp.async.cg.shared.global [%tb1_kv_cp_smem_addr], [%tb1_kv_cp_hbm_addr], 16;
     cp.async.commit_group;
     cp.async.wait_group 0;
     bar.sync 0;
@@ -424,11 +534,26 @@ expression: ptx
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     // -- KV-proj chunk 8/16 (d_model offset 896 .. 1024) --
     // cp.async Wk[896:1024] -> SMEM[wk_chunk_off slot 0]
-    cp.async.cg.shared.global [%tb1_kv_smem_wk], [%tb1_kv_wk_ptr + 57344], 16;
+    add.u32 %tb1_kv_cp_smem_addr, %tb1_kv_smem_wk_u32, %tb1_kv_cp_tid_off;
+    cvt.u32.u64 %tb1_kv_cp_hbm_off, %tb1_kv_wk_ptr;
+    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, 57344;
+    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, %tb1_kv_cp_tid_off;
+    cvt.u64.u32 %tb1_kv_cp_hbm_addr, %tb1_kv_cp_hbm_off;
+    cp.async.cg.shared.global [%tb1_kv_cp_smem_addr], [%tb1_kv_cp_hbm_addr], 16;
     // cp.async Wv[896:1024] -> SMEM[wv_chunk_off slot 1]
-    cp.async.cg.shared.global [%tb1_kv_smem_wv], [%tb1_kv_wv_ptr + 57344], 16;
+    add.u32 %tb1_kv_cp_smem_addr, %tb1_kv_smem_wv_u32, %tb1_kv_cp_tid_off;
+    cvt.u32.u64 %tb1_kv_cp_hbm_off, %tb1_kv_wv_ptr;
+    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, 57344;
+    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, %tb1_kv_cp_tid_off;
+    cvt.u64.u32 %tb1_kv_cp_hbm_addr, %tb1_kv_cp_hbm_off;
+    cp.async.cg.shared.global [%tb1_kv_cp_smem_addr], [%tb1_kv_cp_hbm_addr], 16;
     // cp.async x_kv[kv_iter=0 chunk=7] -> SMEM[x_kv_off]
-    cp.async.cg.shared.global [%tb1_kv_smem_x], [%tb1_kv_x_ptr + 3584], 16;
+    add.u32 %tb1_kv_cp_smem_addr, %tb1_kv_smem_x_u32, %tb1_kv_cp_tid_off;
+    cvt.u32.u64 %tb1_kv_cp_hbm_off, %tb1_kv_x_ptr;
+    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, 3584;
+    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, %tb1_kv_cp_tid_off;
+    cvt.u64.u32 %tb1_kv_cp_hbm_addr, %tb1_kv_cp_hbm_off;
+    cp.async.cg.shared.global [%tb1_kv_cp_smem_addr], [%tb1_kv_cp_hbm_addr], 16;
     cp.async.commit_group;
     cp.async.wait_group 0;
     bar.sync 0;
@@ -480,11 +605,26 @@ expression: ptx
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     // -- KV-proj chunk 9/16 (d_model offset 1024 .. 1152) --
     // cp.async Wk[1024:1152] -> SMEM[wk_chunk_off slot 0]
-    cp.async.cg.shared.global [%tb1_kv_smem_wk], [%tb1_kv_wk_ptr + 65536], 16;
+    add.u32 %tb1_kv_cp_smem_addr, %tb1_kv_smem_wk_u32, %tb1_kv_cp_tid_off;
+    cvt.u32.u64 %tb1_kv_cp_hbm_off, %tb1_kv_wk_ptr;
+    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, 65536;
+    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, %tb1_kv_cp_tid_off;
+    cvt.u64.u32 %tb1_kv_cp_hbm_addr, %tb1_kv_cp_hbm_off;
+    cp.async.cg.shared.global [%tb1_kv_cp_smem_addr], [%tb1_kv_cp_hbm_addr], 16;
     // cp.async Wv[1024:1152] -> SMEM[wv_chunk_off slot 1]
-    cp.async.cg.shared.global [%tb1_kv_smem_wv], [%tb1_kv_wv_ptr + 65536], 16;
+    add.u32 %tb1_kv_cp_smem_addr, %tb1_kv_smem_wv_u32, %tb1_kv_cp_tid_off;
+    cvt.u32.u64 %tb1_kv_cp_hbm_off, %tb1_kv_wv_ptr;
+    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, 65536;
+    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, %tb1_kv_cp_tid_off;
+    cvt.u64.u32 %tb1_kv_cp_hbm_addr, %tb1_kv_cp_hbm_off;
+    cp.async.cg.shared.global [%tb1_kv_cp_smem_addr], [%tb1_kv_cp_hbm_addr], 16;
     // cp.async x_kv[kv_iter=0 chunk=8] -> SMEM[x_kv_off]
-    cp.async.cg.shared.global [%tb1_kv_smem_x], [%tb1_kv_x_ptr + 4096], 16;
+    add.u32 %tb1_kv_cp_smem_addr, %tb1_kv_smem_x_u32, %tb1_kv_cp_tid_off;
+    cvt.u32.u64 %tb1_kv_cp_hbm_off, %tb1_kv_x_ptr;
+    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, 4096;
+    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, %tb1_kv_cp_tid_off;
+    cvt.u64.u32 %tb1_kv_cp_hbm_addr, %tb1_kv_cp_hbm_off;
+    cp.async.cg.shared.global [%tb1_kv_cp_smem_addr], [%tb1_kv_cp_hbm_addr], 16;
     cp.async.commit_group;
     cp.async.wait_group 0;
     bar.sync 0;
@@ -536,11 +676,26 @@ expression: ptx
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     // -- KV-proj chunk 10/16 (d_model offset 1152 .. 1280) --
     // cp.async Wk[1152:1280] -> SMEM[wk_chunk_off slot 0]
-    cp.async.cg.shared.global [%tb1_kv_smem_wk], [%tb1_kv_wk_ptr + 73728], 16;
+    add.u32 %tb1_kv_cp_smem_addr, %tb1_kv_smem_wk_u32, %tb1_kv_cp_tid_off;
+    cvt.u32.u64 %tb1_kv_cp_hbm_off, %tb1_kv_wk_ptr;
+    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, 73728;
+    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, %tb1_kv_cp_tid_off;
+    cvt.u64.u32 %tb1_kv_cp_hbm_addr, %tb1_kv_cp_hbm_off;
+    cp.async.cg.shared.global [%tb1_kv_cp_smem_addr], [%tb1_kv_cp_hbm_addr], 16;
     // cp.async Wv[1152:1280] -> SMEM[wv_chunk_off slot 1]
-    cp.async.cg.shared.global [%tb1_kv_smem_wv], [%tb1_kv_wv_ptr + 73728], 16;
+    add.u32 %tb1_kv_cp_smem_addr, %tb1_kv_smem_wv_u32, %tb1_kv_cp_tid_off;
+    cvt.u32.u64 %tb1_kv_cp_hbm_off, %tb1_kv_wv_ptr;
+    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, 73728;
+    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, %tb1_kv_cp_tid_off;
+    cvt.u64.u32 %tb1_kv_cp_hbm_addr, %tb1_kv_cp_hbm_off;
+    cp.async.cg.shared.global [%tb1_kv_cp_smem_addr], [%tb1_kv_cp_hbm_addr], 16;
     // cp.async x_kv[kv_iter=0 chunk=9] -> SMEM[x_kv_off]
-    cp.async.cg.shared.global [%tb1_kv_smem_x], [%tb1_kv_x_ptr + 4608], 16;
+    add.u32 %tb1_kv_cp_smem_addr, %tb1_kv_smem_x_u32, %tb1_kv_cp_tid_off;
+    cvt.u32.u64 %tb1_kv_cp_hbm_off, %tb1_kv_x_ptr;
+    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, 4608;
+    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, %tb1_kv_cp_tid_off;
+    cvt.u64.u32 %tb1_kv_cp_hbm_addr, %tb1_kv_cp_hbm_off;
+    cp.async.cg.shared.global [%tb1_kv_cp_smem_addr], [%tb1_kv_cp_hbm_addr], 16;
     cp.async.commit_group;
     cp.async.wait_group 0;
     bar.sync 0;
@@ -592,11 +747,26 @@ expression: ptx
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     // -- KV-proj chunk 11/16 (d_model offset 1280 .. 1408) --
     // cp.async Wk[1280:1408] -> SMEM[wk_chunk_off slot 0]
-    cp.async.cg.shared.global [%tb1_kv_smem_wk], [%tb1_kv_wk_ptr + 81920], 16;
+    add.u32 %tb1_kv_cp_smem_addr, %tb1_kv_smem_wk_u32, %tb1_kv_cp_tid_off;
+    cvt.u32.u64 %tb1_kv_cp_hbm_off, %tb1_kv_wk_ptr;
+    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, 81920;
+    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, %tb1_kv_cp_tid_off;
+    cvt.u64.u32 %tb1_kv_cp_hbm_addr, %tb1_kv_cp_hbm_off;
+    cp.async.cg.shared.global [%tb1_kv_cp_smem_addr], [%tb1_kv_cp_hbm_addr], 16;
     // cp.async Wv[1280:1408] -> SMEM[wv_chunk_off slot 1]
-    cp.async.cg.shared.global [%tb1_kv_smem_wv], [%tb1_kv_wv_ptr + 81920], 16;
+    add.u32 %tb1_kv_cp_smem_addr, %tb1_kv_smem_wv_u32, %tb1_kv_cp_tid_off;
+    cvt.u32.u64 %tb1_kv_cp_hbm_off, %tb1_kv_wv_ptr;
+    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, 81920;
+    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, %tb1_kv_cp_tid_off;
+    cvt.u64.u32 %tb1_kv_cp_hbm_addr, %tb1_kv_cp_hbm_off;
+    cp.async.cg.shared.global [%tb1_kv_cp_smem_addr], [%tb1_kv_cp_hbm_addr], 16;
     // cp.async x_kv[kv_iter=0 chunk=10] -> SMEM[x_kv_off]
-    cp.async.cg.shared.global [%tb1_kv_smem_x], [%tb1_kv_x_ptr + 5120], 16;
+    add.u32 %tb1_kv_cp_smem_addr, %tb1_kv_smem_x_u32, %tb1_kv_cp_tid_off;
+    cvt.u32.u64 %tb1_kv_cp_hbm_off, %tb1_kv_x_ptr;
+    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, 5120;
+    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, %tb1_kv_cp_tid_off;
+    cvt.u64.u32 %tb1_kv_cp_hbm_addr, %tb1_kv_cp_hbm_off;
+    cp.async.cg.shared.global [%tb1_kv_cp_smem_addr], [%tb1_kv_cp_hbm_addr], 16;
     cp.async.commit_group;
     cp.async.wait_group 0;
     bar.sync 0;
@@ -648,11 +818,26 @@ expression: ptx
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     // -- KV-proj chunk 12/16 (d_model offset 1408 .. 1536) --
     // cp.async Wk[1408:1536] -> SMEM[wk_chunk_off slot 0]
-    cp.async.cg.shared.global [%tb1_kv_smem_wk], [%tb1_kv_wk_ptr + 90112], 16;
+    add.u32 %tb1_kv_cp_smem_addr, %tb1_kv_smem_wk_u32, %tb1_kv_cp_tid_off;
+    cvt.u32.u64 %tb1_kv_cp_hbm_off, %tb1_kv_wk_ptr;
+    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, 90112;
+    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, %tb1_kv_cp_tid_off;
+    cvt.u64.u32 %tb1_kv_cp_hbm_addr, %tb1_kv_cp_hbm_off;
+    cp.async.cg.shared.global [%tb1_kv_cp_smem_addr], [%tb1_kv_cp_hbm_addr], 16;
     // cp.async Wv[1408:1536] -> SMEM[wv_chunk_off slot 1]
-    cp.async.cg.shared.global [%tb1_kv_smem_wv], [%tb1_kv_wv_ptr + 90112], 16;
+    add.u32 %tb1_kv_cp_smem_addr, %tb1_kv_smem_wv_u32, %tb1_kv_cp_tid_off;
+    cvt.u32.u64 %tb1_kv_cp_hbm_off, %tb1_kv_wv_ptr;
+    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, 90112;
+    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, %tb1_kv_cp_tid_off;
+    cvt.u64.u32 %tb1_kv_cp_hbm_addr, %tb1_kv_cp_hbm_off;
+    cp.async.cg.shared.global [%tb1_kv_cp_smem_addr], [%tb1_kv_cp_hbm_addr], 16;
     // cp.async x_kv[kv_iter=0 chunk=11] -> SMEM[x_kv_off]
-    cp.async.cg.shared.global [%tb1_kv_smem_x], [%tb1_kv_x_ptr + 5632], 16;
+    add.u32 %tb1_kv_cp_smem_addr, %tb1_kv_smem_x_u32, %tb1_kv_cp_tid_off;
+    cvt.u32.u64 %tb1_kv_cp_hbm_off, %tb1_kv_x_ptr;
+    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, 5632;
+    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, %tb1_kv_cp_tid_off;
+    cvt.u64.u32 %tb1_kv_cp_hbm_addr, %tb1_kv_cp_hbm_off;
+    cp.async.cg.shared.global [%tb1_kv_cp_smem_addr], [%tb1_kv_cp_hbm_addr], 16;
     cp.async.commit_group;
     cp.async.wait_group 0;
     bar.sync 0;
@@ -704,11 +889,26 @@ expression: ptx
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     // -- KV-proj chunk 13/16 (d_model offset 1536 .. 1664) --
     // cp.async Wk[1536:1664] -> SMEM[wk_chunk_off slot 0]
-    cp.async.cg.shared.global [%tb1_kv_smem_wk], [%tb1_kv_wk_ptr + 98304], 16;
+    add.u32 %tb1_kv_cp_smem_addr, %tb1_kv_smem_wk_u32, %tb1_kv_cp_tid_off;
+    cvt.u32.u64 %tb1_kv_cp_hbm_off, %tb1_kv_wk_ptr;
+    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, 98304;
+    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, %tb1_kv_cp_tid_off;
+    cvt.u64.u32 %tb1_kv_cp_hbm_addr, %tb1_kv_cp_hbm_off;
+    cp.async.cg.shared.global [%tb1_kv_cp_smem_addr], [%tb1_kv_cp_hbm_addr], 16;
     // cp.async Wv[1536:1664] -> SMEM[wv_chunk_off slot 1]
-    cp.async.cg.shared.global [%tb1_kv_smem_wv], [%tb1_kv_wv_ptr + 98304], 16;
+    add.u32 %tb1_kv_cp_smem_addr, %tb1_kv_smem_wv_u32, %tb1_kv_cp_tid_off;
+    cvt.u32.u64 %tb1_kv_cp_hbm_off, %tb1_kv_wv_ptr;
+    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, 98304;
+    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, %tb1_kv_cp_tid_off;
+    cvt.u64.u32 %tb1_kv_cp_hbm_addr, %tb1_kv_cp_hbm_off;
+    cp.async.cg.shared.global [%tb1_kv_cp_smem_addr], [%tb1_kv_cp_hbm_addr], 16;
     // cp.async x_kv[kv_iter=0 chunk=12] -> SMEM[x_kv_off]
-    cp.async.cg.shared.global [%tb1_kv_smem_x], [%tb1_kv_x_ptr + 6144], 16;
+    add.u32 %tb1_kv_cp_smem_addr, %tb1_kv_smem_x_u32, %tb1_kv_cp_tid_off;
+    cvt.u32.u64 %tb1_kv_cp_hbm_off, %tb1_kv_x_ptr;
+    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, 6144;
+    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, %tb1_kv_cp_tid_off;
+    cvt.u64.u32 %tb1_kv_cp_hbm_addr, %tb1_kv_cp_hbm_off;
+    cp.async.cg.shared.global [%tb1_kv_cp_smem_addr], [%tb1_kv_cp_hbm_addr], 16;
     cp.async.commit_group;
     cp.async.wait_group 0;
     bar.sync 0;
@@ -760,11 +960,26 @@ expression: ptx
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     // -- KV-proj chunk 14/16 (d_model offset 1664 .. 1792) --
     // cp.async Wk[1664:1792] -> SMEM[wk_chunk_off slot 0]
-    cp.async.cg.shared.global [%tb1_kv_smem_wk], [%tb1_kv_wk_ptr + 106496], 16;
+    add.u32 %tb1_kv_cp_smem_addr, %tb1_kv_smem_wk_u32, %tb1_kv_cp_tid_off;
+    cvt.u32.u64 %tb1_kv_cp_hbm_off, %tb1_kv_wk_ptr;
+    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, 106496;
+    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, %tb1_kv_cp_tid_off;
+    cvt.u64.u32 %tb1_kv_cp_hbm_addr, %tb1_kv_cp_hbm_off;
+    cp.async.cg.shared.global [%tb1_kv_cp_smem_addr], [%tb1_kv_cp_hbm_addr], 16;
     // cp.async Wv[1664:1792] -> SMEM[wv_chunk_off slot 1]
-    cp.async.cg.shared.global [%tb1_kv_smem_wv], [%tb1_kv_wv_ptr + 106496], 16;
+    add.u32 %tb1_kv_cp_smem_addr, %tb1_kv_smem_wv_u32, %tb1_kv_cp_tid_off;
+    cvt.u32.u64 %tb1_kv_cp_hbm_off, %tb1_kv_wv_ptr;
+    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, 106496;
+    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, %tb1_kv_cp_tid_off;
+    cvt.u64.u32 %tb1_kv_cp_hbm_addr, %tb1_kv_cp_hbm_off;
+    cp.async.cg.shared.global [%tb1_kv_cp_smem_addr], [%tb1_kv_cp_hbm_addr], 16;
     // cp.async x_kv[kv_iter=0 chunk=13] -> SMEM[x_kv_off]
-    cp.async.cg.shared.global [%tb1_kv_smem_x], [%tb1_kv_x_ptr + 6656], 16;
+    add.u32 %tb1_kv_cp_smem_addr, %tb1_kv_smem_x_u32, %tb1_kv_cp_tid_off;
+    cvt.u32.u64 %tb1_kv_cp_hbm_off, %tb1_kv_x_ptr;
+    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, 6656;
+    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, %tb1_kv_cp_tid_off;
+    cvt.u64.u32 %tb1_kv_cp_hbm_addr, %tb1_kv_cp_hbm_off;
+    cp.async.cg.shared.global [%tb1_kv_cp_smem_addr], [%tb1_kv_cp_hbm_addr], 16;
     cp.async.commit_group;
     cp.async.wait_group 0;
     bar.sync 0;
@@ -816,11 +1031,26 @@ expression: ptx
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     // -- KV-proj chunk 15/16 (d_model offset 1792 .. 1920) --
     // cp.async Wk[1792:1920] -> SMEM[wk_chunk_off slot 0]
-    cp.async.cg.shared.global [%tb1_kv_smem_wk], [%tb1_kv_wk_ptr + 114688], 16;
+    add.u32 %tb1_kv_cp_smem_addr, %tb1_kv_smem_wk_u32, %tb1_kv_cp_tid_off;
+    cvt.u32.u64 %tb1_kv_cp_hbm_off, %tb1_kv_wk_ptr;
+    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, 114688;
+    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, %tb1_kv_cp_tid_off;
+    cvt.u64.u32 %tb1_kv_cp_hbm_addr, %tb1_kv_cp_hbm_off;
+    cp.async.cg.shared.global [%tb1_kv_cp_smem_addr], [%tb1_kv_cp_hbm_addr], 16;
     // cp.async Wv[1792:1920] -> SMEM[wv_chunk_off slot 1]
-    cp.async.cg.shared.global [%tb1_kv_smem_wv], [%tb1_kv_wv_ptr + 114688], 16;
+    add.u32 %tb1_kv_cp_smem_addr, %tb1_kv_smem_wv_u32, %tb1_kv_cp_tid_off;
+    cvt.u32.u64 %tb1_kv_cp_hbm_off, %tb1_kv_wv_ptr;
+    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, 114688;
+    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, %tb1_kv_cp_tid_off;
+    cvt.u64.u32 %tb1_kv_cp_hbm_addr, %tb1_kv_cp_hbm_off;
+    cp.async.cg.shared.global [%tb1_kv_cp_smem_addr], [%tb1_kv_cp_hbm_addr], 16;
     // cp.async x_kv[kv_iter=0 chunk=14] -> SMEM[x_kv_off]
-    cp.async.cg.shared.global [%tb1_kv_smem_x], [%tb1_kv_x_ptr + 7168], 16;
+    add.u32 %tb1_kv_cp_smem_addr, %tb1_kv_smem_x_u32, %tb1_kv_cp_tid_off;
+    cvt.u32.u64 %tb1_kv_cp_hbm_off, %tb1_kv_x_ptr;
+    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, 7168;
+    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, %tb1_kv_cp_tid_off;
+    cvt.u64.u32 %tb1_kv_cp_hbm_addr, %tb1_kv_cp_hbm_off;
+    cp.async.cg.shared.global [%tb1_kv_cp_smem_addr], [%tb1_kv_cp_hbm_addr], 16;
     cp.async.commit_group;
     cp.async.wait_group 0;
     bar.sync 0;
@@ -872,11 +1102,26 @@ expression: ptx
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     // -- KV-proj chunk 16/16 (d_model offset 1920 .. 2048) --
     // cp.async Wk[1920:2048] -> SMEM[wk_chunk_off slot 0]
-    cp.async.cg.shared.global [%tb1_kv_smem_wk], [%tb1_kv_wk_ptr + 122880], 16;
+    add.u32 %tb1_kv_cp_smem_addr, %tb1_kv_smem_wk_u32, %tb1_kv_cp_tid_off;
+    cvt.u32.u64 %tb1_kv_cp_hbm_off, %tb1_kv_wk_ptr;
+    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, 122880;
+    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, %tb1_kv_cp_tid_off;
+    cvt.u64.u32 %tb1_kv_cp_hbm_addr, %tb1_kv_cp_hbm_off;
+    cp.async.cg.shared.global [%tb1_kv_cp_smem_addr], [%tb1_kv_cp_hbm_addr], 16;
     // cp.async Wv[1920:2048] -> SMEM[wv_chunk_off slot 1]
-    cp.async.cg.shared.global [%tb1_kv_smem_wv], [%tb1_kv_wv_ptr + 122880], 16;
+    add.u32 %tb1_kv_cp_smem_addr, %tb1_kv_smem_wv_u32, %tb1_kv_cp_tid_off;
+    cvt.u32.u64 %tb1_kv_cp_hbm_off, %tb1_kv_wv_ptr;
+    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, 122880;
+    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, %tb1_kv_cp_tid_off;
+    cvt.u64.u32 %tb1_kv_cp_hbm_addr, %tb1_kv_cp_hbm_off;
+    cp.async.cg.shared.global [%tb1_kv_cp_smem_addr], [%tb1_kv_cp_hbm_addr], 16;
     // cp.async x_kv[kv_iter=0 chunk=15] -> SMEM[x_kv_off]
-    cp.async.cg.shared.global [%tb1_kv_smem_x], [%tb1_kv_x_ptr + 7680], 16;
+    add.u32 %tb1_kv_cp_smem_addr, %tb1_kv_smem_x_u32, %tb1_kv_cp_tid_off;
+    cvt.u32.u64 %tb1_kv_cp_hbm_off, %tb1_kv_x_ptr;
+    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, 7680;
+    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, %tb1_kv_cp_tid_off;
+    cvt.u64.u32 %tb1_kv_cp_hbm_addr, %tb1_kv_cp_hbm_off;
+    cp.async.cg.shared.global [%tb1_kv_cp_smem_addr], [%tb1_kv_cp_hbm_addr], 16;
     cp.async.commit_group;
     cp.async.wait_group 0;
     bar.sync 0;

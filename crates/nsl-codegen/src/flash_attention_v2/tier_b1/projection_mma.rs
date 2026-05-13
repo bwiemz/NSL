@@ -541,6 +541,13 @@ pub fn emit_kv_projection_chunk_loop(
     // u32 sister registers for matmul_mma::emit_load_*_fragment_smem
     // (B1.6 deferral #1) — the helpers use 32-bit SMEM addressing.
     ptx.push_str("    .reg .u32 %tb1_kv_smem_wk_u32, %tb1_kv_smem_wv_u32, %tb1_kv_smem_x_u32;\n");
+    // Per-thread cp.async byte offset (B1.6 deferral #3): each of the 256
+    // threads stages its own 16-byte slot.
+    ptx.push_str("    .reg .u32 %tb1_kv_cp_tid_off;\n");
+    ptx.push_str("    .reg .u32 %tb1_kv_cp_smem_addr, %tb1_kv_cp_hbm_off;\n");
+    ptx.push_str("    .reg .u64 %tb1_kv_cp_hbm_addr;\n");
+    ptx.push_str("    mov.u32 %tb1_kv_cp_tid_off, %tid.x;\n");
+    ptx.push_str("    shl.b32 %tb1_kv_cp_tid_off, %tb1_kv_cp_tid_off, 4; // tid * 16 (B1.6 deferral #3)\n");
     ptx.push_str("    .reg .u64 %tb1_kv_smem_k, %tb1_kv_smem_v;\n");
     ptx.push_str("    .reg .u64 %tb1_kv_scatter_addr;\n");
     ptx.push_str("    .reg .b16 %tb1_kv_h0;\n");
@@ -609,15 +616,16 @@ pub fn emit_kv_projection_chunk_loop(
             chunk_idx * chunk,
             (chunk_idx + 1) * chunk
         ));
-        // B1.6 TODO (deferral #3): this is a single 16-byte burst, NOT a
-        // chunk-completing per-thread loop. A full Wk chunk = chunk*hd*2
-        // bytes (e.g. 8192 bytes for canonical 128*32*2). B1.6 must wrap
-        // this cp.async in a per-thread loop with per-thread destination
-        // offsets. See matching marker in emit_q_projection (B1.4 deferral #3).
+        // B1.6 deferral #3 partial: per-thread cp.async for Wk chunk.
+        ptx.push_str("    add.u32 %tb1_kv_cp_smem_addr, %tb1_kv_smem_wk_u32, %tb1_kv_cp_tid_off;\n");
+        ptx.push_str("    cvt.u32.u64 %tb1_kv_cp_hbm_off, %tb1_kv_wk_ptr;\n");
         ptx.push_str(&format!(
-            "    cp.async.cg.shared.global [%tb1_kv_smem_wk], [%tb1_kv_wk_ptr + {}], 16;\n",
+            "    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, {};\n",
             chunk_idx * chunk * hd * 2
         ));
+        ptx.push_str("    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, %tb1_kv_cp_tid_off;\n");
+        ptx.push_str("    cvt.u64.u32 %tb1_kv_cp_hbm_addr, %tb1_kv_cp_hbm_off;\n");
+        ptx.push_str("    cp.async.cg.shared.global [%tb1_kv_cp_smem_addr], [%tb1_kv_cp_hbm_addr], 16;\n");
 
         // cp.async stage Wv chunk: bytes = chunk * hd * 2 (f16).
         //
@@ -628,12 +636,16 @@ pub fn emit_kv_projection_chunk_loop(
             chunk_idx * chunk,
             (chunk_idx + 1) * chunk
         ));
-        // B1.6 TODO (deferral #3): same 16-byte placeholder as Wk above.
-        // Full Wv chunk requires the same per-thread loop fix. See B1.4 deferral #3.
+        // B1.6 deferral #3 partial: per-thread cp.async for Wv chunk.
+        ptx.push_str("    add.u32 %tb1_kv_cp_smem_addr, %tb1_kv_smem_wv_u32, %tb1_kv_cp_tid_off;\n");
+        ptx.push_str("    cvt.u32.u64 %tb1_kv_cp_hbm_off, %tb1_kv_wv_ptr;\n");
         ptx.push_str(&format!(
-            "    cp.async.cg.shared.global [%tb1_kv_smem_wv], [%tb1_kv_wv_ptr + {}], 16;\n",
+            "    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, {};\n",
             chunk_idx * chunk * hd * 2
         ));
+        ptx.push_str("    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, %tb1_kv_cp_tid_off;\n");
+        ptx.push_str("    cvt.u64.u32 %tb1_kv_cp_hbm_addr, %tb1_kv_cp_hbm_off;\n");
+        ptx.push_str("    cp.async.cg.shared.global [%tb1_kv_cp_smem_addr], [%tb1_kv_cp_hbm_addr], 16;\n");
 
         // cp.async stage x_kv chunk: bytes = bkv * chunk * 2 (f16 after f32->f16
         // narrowing during the load — the actual narrowing happens in B1.6).
@@ -645,14 +657,16 @@ pub fn emit_kv_projection_chunk_loop(
             "    // cp.async x_kv[kv_iter={} chunk={}] -> SMEM[x_kv_off]\n",
             kv_iter, chunk_idx
         ));
-        // B1.6 TODO (deferral #3): same 16-byte placeholder. Full x_kv
-        // chunk = bkv*chunk*2 bytes; per-thread loop fix required. See B1.4
-        // deferral #3 in emit_q_projection.
+        // B1.6 deferral #3 partial: per-thread cp.async for x_kv chunk.
+        ptx.push_str("    add.u32 %tb1_kv_cp_smem_addr, %tb1_kv_smem_x_u32, %tb1_kv_cp_tid_off;\n");
+        ptx.push_str("    cvt.u32.u64 %tb1_kv_cp_hbm_off, %tb1_kv_x_ptr;\n");
         ptx.push_str(&format!(
-            "    cp.async.cg.shared.global [%tb1_kv_smem_x], \
-             [%tb1_kv_x_ptr + {}], 16;\n",
+            "    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, {};\n",
             x_kv_hbm_base_off + chunk_idx * chunk * 4
         ));
+        ptx.push_str("    add.u32 %tb1_kv_cp_hbm_off, %tb1_kv_cp_hbm_off, %tb1_kv_cp_tid_off;\n");
+        ptx.push_str("    cvt.u64.u32 %tb1_kv_cp_hbm_addr, %tb1_kv_cp_hbm_off;\n");
+        ptx.push_str("    cp.async.cg.shared.global [%tb1_kv_cp_smem_addr], [%tb1_kv_cp_hbm_addr], 16;\n");
 
         // Commit + wait + barrier: synchronous chunk for B1.5 Phase A
         // (B1.6 overlaps via ping-pong).
