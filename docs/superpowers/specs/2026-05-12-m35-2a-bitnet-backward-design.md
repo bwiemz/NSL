@@ -101,19 +101,20 @@ V-P1-D is the *first* Linux-required step; M35.2 implementation requires Linux f
 
 **Acceptance:** a one-paragraph note in `docs/superpowers/specs/2026-05-12-m35-2a-bitnet-backward-design.md` (this file) recording the access mechanism + cost + estimated reliability. Updated before V-P1-D measurement begins.
 
-### 2.6 V-M35.2a-STE — confirm clipped STE matches b1.58 training reference (gates STE implementation)
+### 2.6 V-M35.2a-STE — confirm b1.58 training-reference STE choice (PASSED with spec amendment per PR #163)
 
-**Task:** verify the b1.58 reference STE choice. Q2's clipped-STE-with-clip-threshold-`|x_int8| == 127` decision rests on "matches the de-facto b1.58 reference behavior." STE lives in training code, not inference code; bitnet.cpp may not have backward. Verification procedure:
+**Status:** PASSED. Findings (PR #163) surveyed 3 community b1.58 reproductions and found unanimous use of **vanilla STE** (identity passthrough via the `x + (quant(x) - x).detach()` trick), not clipped STE as the original Q2 decision assumed. Spec §4 has been rewritten to commit to vanilla STE matching the reference; clipped STE deferred to Phase 2.1. See §4.4 for the canonical anchor (`1bitLLM/bitnet_b1_58-3B@af89e318...`).
 
-1. Check whether Microsoft's BitNet training code is publicly available (search the b1.58 paper's references + GitHub orgs).
-2. If unavailable, check HuggingFace's official BitNet training examples / notebooks.
-3. If neither, survey 2-3 community reproductions for STE-variant consensus.
-4. If all sources confirm clipped STE with `|x_int8| == 127` threshold: proceed with the spec as written.
-5. If sources disagree OR the threshold differs (e.g., 126 for asymmetric range): document the discrepancy, pick the most-supported variant, note alternatives for M35.2a Phase 2.1 if real training shows the choice matters.
+**Original task (preserved for historical record):** verify the b1.58 reference STE choice. Q2's original clipped-STE-with-threshold decision rested on "matches the de-facto b1.58 reference behavior." STE lives in training code, not inference code; bitnet.cpp doesn't have backward. Verification procedure was:
 
-**Findings doc:** `docs/superpowers/specs/2026-05-12-m35-2-ste-baseline-findings.md`. Same one-time-anchor discipline as M35.1's PI.1 trit-ordering verification (IR-002).
+1. Check whether Microsoft's BitNet training code is publicly available (search the b1.58 paper's references + GitHub orgs). **Result:** not publicly version-controlled (only a PDF; not a citable code anchor per IR-002).
+2. If unavailable, check HuggingFace's official BitNet training examples / notebooks. **Result:** HF's `BitNetModel` is inference-only.
+3. If neither, survey 2-3 community reproductions for STE-variant consensus. **Result:** 3 of 3 community reproductions (`1bitLLM`, `kyegomez/BitNet`, `AlarioAI/bitnet`) use vanilla STE — unanimous.
+4. If sources disagree OR the threshold differs: document the discrepancy, pick the most-supported variant, note alternatives for Phase 2.1. **Result:** spec amended to vanilla STE; clipped STE noted for Phase 2.1 (§10.3).
 
-**Budget:** ~30 minutes for the search + ~30 minutes for the findings doc. Cheap relative to the cost of training-instability bugs that surface during M35.2c gate verification.
+**Findings doc:** `docs/superpowers/specs/2026-05-12-m35-2-ste-baseline-findings.md` (PR #163). Same one-time-anchor discipline as M35.1's PI.1 trit-ordering verification (IR-002).
+
+**Budget actual:** ~30 minutes search + ~30 minutes findings doc. The pre-implementation verification paid off — caught the load-bearing STE-variant assumption before implementation work began, preventing ~80 PTX lines of wrong-STE emission + the corresponding test/fixture mismatch.
 
 ### 2.7 V-M35.2a-determinism — byte-identical preflight for Tier 2 single-step descent (gates Tier 2 equivalence assertion)
 
@@ -238,38 +239,44 @@ Backward SMEM budget formulation parallel to M35.1 spec §3.4:
 
 ---
 
-## 4. STE expression (Q2)
+## 4. STE expression (Q2; amended per V-M35.2a-STE findings PR #163)
 
-### 4.1 Clipped STE in `absmax_quant_backward`
+### 4.1 Vanilla STE in `absmax_quant_backward`
 
-`absmax_quant_backward::emit` produces PTX that, for each element:
+`absmax_quant_backward::emit` produces PTX that copies `dX_pre_STE` to `dX_final` per-element. No clip-mask detection, no `x_int8` load, no conditional move — vanilla STE is the identity-through pattern.
 
-1. Loads `dX_pre_STE[r, k]` (FP32) from HBM.
-2. Loads `x_int8_saved[r, k]` (i8) from HBM.
-3. Computes `is_saturated = (|x_int8| == 127)` — single PTX comparison.
-4. Emits `dX_final[r, k] = is_saturated ? 0.0 : dX_pre_STE[r, k]` via PTX `selp.f32` or equivalent conditional move.
-5. Stores `dX_final[r, k]` to HBM.
+Equivalent PyTorch (idiom α reference; see §5.2):
 
-Cheap: one comparison + one conditional move per element. No FP16 activations need to be saved by forward — saturation detection uses `x_int8 == ±127` (forward's `quantize_row_int8` clamps `x * 127.0 / scale` to ±127 iff `|x| >= scale`).
+```python
+def backward(ctx, grad_output):
+    _x_int8, x_scale, w_ternary = ctx.saved_tensors
+    grad_x_pre_ste = (grad_output @ w_ternary.t().float()) * (x_scale / 127.0)
+    grad_x = grad_x_pre_ste  # Vanilla STE: identity (per V-M35.2a-STE)
+    grad_w = _x_int8.t().float() @ grad_output
+    return grad_x, grad_w, None
+```
 
-### 4.2 Why not vanilla STE (calibrated rejection)
+The `absmax_quant_backward` PTX kernel is preserved as a discrete phase (not collapsed into `ternary_gemm_backward` for now) to maintain the two-chained-kernel architecture from Q1. Phase 2.1 may revive clipped STE here if needed; keeping the kernel separate preserves the API shape without committing to clipping today.
 
-QAT literature documents two distinct cost modes from vanilla STE at low bit-widths:
+### 4.2 Why not clipped STE (deferred to Phase 2.1)
 
-- **Training divergence (α):** at 1-2 bit weights (BitNet's regime), vanilla STE causes ~15-30% of training runs to fail convergence outright, per Hubara et al. 2017 and follow-up work. Mechanism: gradients flow through saturated activations, producing wrong gradient signals that destabilize optimization.
-- **Quality degradation (β):** even when training converges, vanilla STE produces 2-5% worse final perplexity than clipped STE at equivalent compute budgets.
+Original spec §4.2 calibrated the vanilla-STE rejection on QAT literature (Hubara et al. 2017's 15-30% training-divergence rate at 1-2 bit weights). V-M35.2a-STE findings (PR #163) surveyed 3 community b1.58 reproductions (`1bitLLM`, `kyegomez/BitNet`, `AlarioAI/bitnet`) and found **unanimous use of vanilla STE** — the predicted divergence does NOT appear empirically in the b1.58 regime. Plausible explanation: BitNet's architectural regularization (per-tensor absmean weight scaling, learned LayerNorm placement) compensates for the theoretical instability.
 
-The rejection is decisive on (α) alone: a 15-30% training-failure rate makes M35.2c's training-loss equivalence test flaky-or-failing across runs, blocking the gate's verification entirely. (β) is the additional cost even when (α) doesn't fire.
-
-If a future configuration shows clipped STE is unnecessarily conservative (e.g., the saturation rate at production scale is so low that vanilla STE would be safe), revisit as M35.2a Phase 2.1. The default for v1 is clipped STE per the b1.58 reference's STE choice (per V-M35.2a-STE findings).
+Phase 2.1 deferral: revisit clipped STE if real training on NSL's M35.2c gate produces ≥10% gradient instability (e.g., training-loss equivalence test shows step-N divergence >1% of FP16 baseline). The deferred amendment is small (~10 PTX lines to add clip-mask detection in `absmax_quant_backward::emit`); the deferral preserves implementation simplicity until evidence justifies the complexity.
 
 ### 4.3 Why not config-driven STE (V-P1-A exception erosion)
 
-Adding `BitNetKernelConfig::ste_variant: SteVariant { Vanilla, Clipped, Soft }` would expand the V-P1-A permitted-modification list beyond the three backward tile-size fields. The V-P1-A discipline requires structural (not preferential) justification for additional Phase 1 modifications; "research flexibility" doesn't meet the criterion. Revisit if/when production training shows the STE choice matters.
+Adding `BitNetKernelConfig::ste_variant: SteVariant { Vanilla, Clipped, Soft }` would expand the V-P1-A permitted-modification list beyond Q1.1's three backward tile-size fields. The V-P1-A discipline requires structural (not preferential) justification for additional Phase 1 modifications; "research flexibility" doesn't meet the criterion. Revisit if/when production training shows the STE choice matters.
 
-### 4.4 V-M35.2a-STE gates the STE implementation
+### 4.4 V-M35.2a-STE has PASSED (with spec amendment)
 
-§2.6 details. STE implementation in `absmax_quant_backward` waits for the findings doc to confirm clipped STE matches the b1.58 reference. If findings show a different convention (e.g., asymmetric clip at 126), the emitter adopts the verified convention.
+V-M35.2a-STE findings doc at `docs/superpowers/specs/2026-05-12-m35-2-ste-baseline-findings.md` (PR #163) is the authoritative source. The gate is satisfied:
+
+- Microsoft training code: not publicly version-controlled (only a PDF; not a citable code anchor per IR-002).
+- HuggingFace official examples: HF's `BitNetModel` is inference-only; no training reference.
+- Community reproductions: 3/3 use vanilla STE. Canonical anchor pinned at `1bitLLM/bitnet_b1_58-3B@af89e318d78a70802061246bf037199d2fb97020` — `utils_quant.py` `BitLinear.forward` uses the detach trick.
+
+This spec section now matches the verified b1.58 convention. M35.2a's `absmax_quant_backward` implementation in plan Stage D.4 emits vanilla STE.
 
 ---
 
@@ -302,17 +309,16 @@ class BitLinearSTE(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
-        x_int8, x_scale, w_ternary = ctx.saved_tensors
-        # Clipped STE: zero gradient where |x_int8| == 127
-        clip_mask = (x_int8.abs() != 127).float()
+        _x_int8, x_scale, w_ternary = ctx.saved_tensors
+        # Vanilla STE per V-M35.2a-STE findings (PR #163). x_int8 not used for
+        # backward of activations (no clip mask); preserved here only for dW.
         grad_x_pre_ste = (grad_output @ w_ternary.t().float()) * (x_scale / 127.0)
-        grad_x = grad_x_pre_ste * clip_mask
-        # dW computation
-        grad_w = x_int8.t().float() @ grad_output
+        grad_x = grad_x_pre_ste  # identity (vanilla STE)
+        grad_w = _x_int8.t().float() @ grad_output
         return grad_x, grad_w, None
 ```
 
-Idiom α is chosen because: (i) it matches the data flow of NSL's kernel (explicit gradient computation, explicit clip mask), making fixture comparison meaningful; (ii) it's the most-used pattern in BitNet community reproductions (per V-M35.2a-STE's findings); (iii) the `forward`/`backward` methods are inspection-friendly, supporting reviewer verification of the reference's correctness.
+Idiom α is chosen because: (i) it matches the data flow of NSL's kernel (explicit gradient computation, vanilla STE / identity passthrough), making fixture comparison meaningful; (ii) it's the most-used pattern in BitNet community reproductions (per V-M35.2a-STE's findings — all 3 surveyed reproductions use the vanilla-STE detach trick on the forward, equivalent to identity in backward); (iii) the `forward`/`backward` methods are inspection-friendly, supporting reviewer verification of the reference's correctness.
 
 Idioms β (detach trick) and γ (hooks) produce equivalent gradient values mathematically but obscure the relationship between reference and kernel. Avoided. If V-M35.2a-STE findings show the community uses a different idiom predominantly, switch to that.
 
@@ -327,15 +333,15 @@ Idioms β (detach trick) and γ (hooks) produce equivalent gradient values mathe
 | `bf03_outlier` | Yes (analog of f05) | Outlier dominates absmax; backward through compressed non-outliers |
 | `bf04_multi_row` | Yes (analog of f06) | Per-row scales in backward |
 | `bf05_zero_weight_col` | Yes (analog of f07) | Backward through zero-output columns (dW non-zero, dX zero) |
-| `bf06_saturated_input` | NEW | All `|x_int8| == 127`; expected `dX_final = 0` everywhere |
-| `bf07_partial_saturation` | NEW | Mix of 127s and non-127s; exercises clip-mask boundary |
+| `bf06_saturated_input` | NEW | All `\|x_int8\| == 127`; expected `dX_final = dX_pre_STE` everywhere (vanilla STE produces non-zero gradients through saturated values; clipped STE would have zeroed these). Stress-tests that the kernel does NOT mistakenly emit a clip mask. |
+| `bf07_partial_saturation` | NEW | Mix of 127s and non-127s; `dX_final = dX_pre_STE` everywhere (saturation has no effect under vanilla STE). Same anti-regression purpose as bf06. |
 | `bf08_zero_grad_output` | NEW | `grad_output = 0`; expected `dX_final = 0`, `dW = 0` |
-| `bf09_identity_grad_output` | NEW | `grad_output = 1` everywhere; tests un-saturated identity pathway |
+| `bf09_identity_grad_output` | NEW | `grad_output = 1` everywhere; tests identity pathway |
 | `bf10_random_seeded` | NEW | Fixed-seed random `grad_output` + inputs; deterministic cross-platform |
 
 Each fixture records: input `x`, `w_ternary`, `x_scale`, `grad_output` → expected `dX_final` (post-STE), `dW`. JSON format compatible with M35.1's `bitnet_reference_outputs.json` structure.
 
-Saturation-related fixtures (bf06, bf07) stress-test the clip mask directly; if the kernel emits the wrong clip mask, these fail.
+Saturation-related fixtures (bf06, bf07) are **anti-regression tests for accidental clip-mask emission**: under vanilla STE the kernel MUST pass gradients through saturated values unchanged. Phase 2.1 clipped-STE revival would deliberately fail these fixtures (saturated → zero); in M35.2a they MUST pass.
 
 **Fixture file:** `crates/nsl-codegen/tests/fixtures/bitnet_backward_reference_outputs.json`. **Reference source:** `crates/nsl-codegen/tests/fixtures/bitnet_backward_reference.py` (cross-platform; commit alongside fixtures).
 
@@ -392,12 +398,12 @@ Saving x_int8 (option 1) avoids all three concerns at the cost of one extra kern
 
 ### 7.1 Two-tier kernel-correctness gate
 
-**Tier 1: Fixture gradient bit-equivalence.** NSL backward asserts FP32-ULP match (1e-4 relative for dX/dW; bit-exact for clip mask + scales) against PyTorch reference JSON (§5.3 fixture set). Tolerance per CSHA Tier A's `O(sqrt(d)·ε_f16)` pattern, accounting for chain-rule accumulation across hidden_dim multiplications.
+**Tier 1: Fixture gradient bit-equivalence.** NSL backward asserts FP32-ULP match (1e-4 relative for dX/dW; bit-exact for scales) against PyTorch reference JSON (§5.3 fixture set). Tolerance per CSHA Tier A's `O(sqrt(d)·ε_f16)` pattern, accounting for chain-rule accumulation across hidden_dim multiplications.
 
 Bit-exact requirements:
 
-- Clip mask (the `is_saturated` boolean field): bit-exact match against reference.
 - `x_scale` (FP32): bit-exact (already validated in forward).
+- **Vanilla STE pass-through identity:** assert `dX_final[i] == dX_pre_STE[i]` bit-exact for every saturated element in bf06/bf07. This catches accidental clip-mask emission (Phase 2.1 clipped-STE work would deliberately fail this check; in M35.2a it MUST pass).
 
 Relative-tolerance requirements:
 
@@ -453,7 +459,7 @@ Sign-matching compares against hand-derived expected directions, NOT against PyT
 | Magnitude error in dX or dW | Tier 1 (fixture bit-equivalence) |
 | Sign-flip in gradient | Tier 2 (single-step descent) |
 | Transposed-matrix bug | Tier 2 (single-step descent) |
-| Clip-mask zero/one inversion | Tier 1 (clip mask bit-exact comparison) |
+| Accidental clip-mask emission (Phase 2.1 regression into M35.2a) | Tier 1 (vanilla-STE pass-through identity check on bf06/bf07) |
 | Cumulative gradient drift over many steps | M35.2c (training-loss equivalence) |
 | Wrong learning-rate-scale interaction | M35.2c (training-loss equivalence) |
 | Optimizer-momentum state drift | M35.2c (training-loss equivalence) |
@@ -468,8 +474,8 @@ Before Tier 2's sign-matching assertion ships, V-M35.2a-determinism (§2.7) gate
 
 If the M35.2a implementer suspects a bug that Tier 1 + Tier 2 don't catch, the response is NOT to add a lightweight multi-step training test (which would pull M35.2c scope into M35.2a, violating decomposition boundary). Instead:
 
-1. **Identify the specific bug class suspected.** "Vague unease about gradient correctness" isn't actionable; "I think the clip mask might be inverted for negative-zero edge cases" is.
-2. **Add a targeted Tier 1 fixture covering that bug class.** If clip-mask-on-negative-zero is the concern, add a fixture with negative-zero in `x_int8` and assert the clip mask handles it.
+1. **Identify the specific bug class suspected.** "Vague unease about gradient correctness" isn't actionable; "I think the `x_scale / 127.0` factor is being applied on the wrong axis for non-square inputs" is.
+2. **Add a targeted Tier 1 fixture covering that bug class.** If the scale-axis concern is the concern, add a fixture with asymmetric per-row scales and assert the per-row gradient scaling holds.
 3. **If the suspicion is about cumulative behavior** (gradient drift over many steps), defer to M35.2c's training-loss equivalence test. Don't replicate it in M35.2a.
 
 Each tier has a specific bug-class scope; expanding a tier should expand the bug-class coverage, not duplicate validation that downstream tiers handle.
@@ -600,7 +606,8 @@ The workflow runs on every PR touching the relevant paths. While `BLOCKED_ON_V_P
 ### 10.3 M35.2a Phase 2.1 deferrals (forward-looking)
 
 - **Epilogue-fused `ternary_gemm_backward_with_ste`** — if dX_pre_STE HBM round-trip is measurable bottleneck (>5% of training-step time at production scale). Cost: ~200 LOC + new public emitter.
-- **Config-driven STE variant** — if production training shows the STE choice matters and clipped STE is unnecessarily conservative for specific configurations. Cost: V-P1-A exception expansion + emitter switch logic.
+- **Clipped STE revival** — if M35.2c training-loss equivalence shows ≥10% gradient instability vs FP16 baseline (mechanism predicted by Hubara et al. 2017 but not observed in community b1.58 reproductions per V-M35.2a-STE findings). Cost: ~10 PTX lines re-introducing the clip-mask conditional in `absmax_quant_backward::emit` + saved-state contract for x_int8 propagation (x_int8 is already saved for `ternary_gemm_backward::dW`; Phase 2.1 adds the second consumer in `absmax_quant_backward`).
+- **Config-driven STE variant** — if production training shows the STE choice matters and a per-layer or per-config switch becomes necessary (e.g., one layer benefits from clipped STE while others use vanilla). Cost: V-P1-A exception expansion + emitter switch logic.
 - **Bf16 backward path** — if bf16 forward becomes common in BitNet workloads (M35.1's forward supports bf16; backward currently does too if `BitNetKernelConfig::activation_dtype == Bf16`, but a separate Phase 2.1 may optimize bf16-specific backward).
 
 ### 10.4 Out of M35.2 entirely
@@ -621,7 +628,7 @@ M35.2a's implementation commits gate on the verification table below. Implementa
 | 1 | `BLOCKED_ON_V_P1_D.md` deletion + `.github/workflows/design_only_enforcement.yml` retirement | D ✅ | — | — | — |
 | 2 | `backward_chunk_config::select` + supported-matrix CSV | — | — | — | — |
 | 3 | `bitnet/phases/ternary_gemm_backward.rs` (dX path, dW SMEM-tiled) | — | ✓ vs PyTorch ref | — | — |
-| 4 | `bitnet/phases/absmax_quant_backward.rs` (clipped STE) | STE ✅ | ✓ vs PyTorch ref | — | — |
+| 4 | `bitnet/phases/absmax_quant_backward.rs` (vanilla STE per V-M35.2a-STE) | STE ✅ | ✓ vs PyTorch ref | — | — |
 | 5 | `bitnet/orchestrator_train.rs` (training-mode wrapper + save kernels on parallel stream) | — | ✓ end-to-end | — | — |
 | 6 | Tier 2 single-step descent test + V-M35.2a-determinism preflight | determinism | ✓ | ✓ | ✓ |
 | 7 | Backward fixture JSON committed (10 fixtures from §5.3) | — | ✓ all 10 | — | — |
