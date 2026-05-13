@@ -4,14 +4,37 @@ expression: ptx
 ---
     // === Phase B: attention compute on slot[1] (kv_iter=1) ===
     // QK^T MMA: bq=32 bkv=32 tpw_qkt=1 slot=1 (scale=1/sqrt(32)=0f3E3504F3)
+    add.u64 %tb1_phase_b_smem_q, %shmem_base, 0; // Q tile @ tier_b1_q_offset
+    add.u64 %tb1_phase_b_smem_k, %shmem_base, 4096; // K tile @ slot=1 offset
+    .reg .u32 %tb1_phase_b_smem_q_u32, %tb1_phase_b_smem_k_u32;
+    cvt.u32.u64 %tb1_phase_b_smem_q_u32, %tb1_phase_b_smem_q;
+    cvt.u32.u64 %tb1_phase_b_smem_k_u32, %tb1_phase_b_smem_k;
     .reg .b32 %tb1_qkt_a_0_0, %tb1_qkt_a_0_1, %tb1_qkt_a_0_2, %tb1_qkt_a_0_3;
     .reg .b32 %tb1_qkt_b_0_0, %tb1_qkt_b_0_1;
-    ld.shared.b32 %tb1_qkt_a_0_0, [%tb1_phase_b_smem_q];
-    ld.shared.b32 %tb1_qkt_a_0_1, [%tb1_phase_b_smem_q];
-    ld.shared.b32 %tb1_qkt_a_0_2, [%tb1_phase_b_smem_q];
-    ld.shared.b32 %tb1_qkt_a_0_3, [%tb1_phase_b_smem_q];
-    ld.shared.b32 %tb1_qkt_b_0_0, [%tb1_phase_b_smem_k];
-    ld.shared.b32 %tb1_qkt_b_0_1, [%tb1_phase_b_smem_k];
+    // Load A-fragment (m16xk16 row-major) from shared memory
+    mul.lo.u32 %mma_addr, %mma_a_row, 64;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_phase_b_smem_q_u32;  // + smem base
+    ld.shared.b32 %tb1_qkt_a_0_0, [%mma_addr];
+    mul.lo.u32 %mma_addr, %mma_a_row, 64;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_phase_b_smem_q_u32;  // + smem base
+    add.u32 %mma_addr, %mma_addr, 8;  // + k byte offset
+    ld.shared.b32 %tb1_qkt_a_0_1, [%mma_addr];
+    mul.lo.u32 %mma_addr, %mma_a_row, 64;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_phase_b_smem_q_u32;  // + smem base
+    add.u32 %mma_addr, %mma_addr, 16;  // + k byte offset
+    ld.shared.b32 %tb1_qkt_a_0_2, [%mma_addr];
+    mul.lo.u32 %mma_addr, %mma_a_row, 64;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_phase_b_smem_q_u32;  // + smem base
+    add.u32 %mma_addr, %mma_addr, 24;  // + k byte offset
+    ld.shared.b32 %tb1_qkt_a_0_3, [%mma_addr];
+    // Load B-fragment (k16xn8 col-major) from shared memory
+    mul.lo.u32 %mma_addr, %mma_b_row, 64;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_phase_b_smem_k_u32;  // + smem base
+    ld.shared.b32 %tb1_qkt_b_0_0, [%mma_addr];
+    mul.lo.u32 %mma_addr, %mma_b_row, 64;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_phase_b_smem_k_u32;  // + smem base
+    add.u32 %mma_addr, %mma_addr, 16;  // + k byte offset
+    ld.shared.b32 %tb1_qkt_b_0_1, [%mma_addr];
     setp.eq.u32 %wo_pred, %warp_id, 0; // QK^T tile t=0 ownership
     @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%s_acc_0_0, %s_acc_0_1, %s_acc_0_2, %s_acc_0_3},
@@ -28,14 +51,23 @@ expression: ptx
     shfl.sync.bfly.b32 %s_acc_0_0, %s_acc_0_0, 4, 0x1f, 0xffffffff;
     mov.b32 %p_packed_0, %s_acc_0_0;
     // PV MMA: bq=32 hd=32 tpw_pv=1 slot=1
+    add.u64 %tb1_phase_b_smem_v, %shmem_base, 8192; // V tile @ slot=1 offset
+    .reg .u32 %tb1_phase_b_smem_v_u32;
+    cvt.u32.u64 %tb1_phase_b_smem_v_u32, %tb1_phase_b_smem_v;
     .reg .b32 %tb1_pv_a_0_0, %tb1_pv_a_0_1, %tb1_pv_a_0_2, %tb1_pv_a_0_3;
     .reg .b32 %tb1_pv_b_0_0, %tb1_pv_b_0_1;
     mov.b32 %tb1_pv_a_0_0, %p_packed_0;
     mov.b32 %tb1_pv_a_0_1, %p_packed_0;
     mov.b32 %tb1_pv_a_0_2, %p_packed_0;
     mov.b32 %tb1_pv_a_0_3, %p_packed_0;
-    ld.shared.b32 %tb1_pv_b_0_0, [%tb1_phase_b_smem_v];
-    ld.shared.b32 %tb1_pv_b_0_1, [%tb1_phase_b_smem_v];
+    // Load B-fragment (k16xn8 col-major) from shared memory
+    mul.lo.u32 %mma_addr, %mma_b_row, 64;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_phase_b_smem_v_u32;  // + smem base
+    ld.shared.b32 %tb1_pv_b_0_0, [%mma_addr];
+    mul.lo.u32 %mma_addr, %mma_b_row, 64;  // row * stride
+    add.u32 %mma_addr, %mma_addr, %tb1_phase_b_smem_v_u32;  // + smem base
+    add.u32 %mma_addr, %mma_addr, 16;  // + k byte offset
+    ld.shared.b32 %tb1_pv_b_0_1, [%mma_addr];
     setp.eq.u32 %wo_pred, %warp_id, 0; // PV tile t=0 ownership
     @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%o_acc_0_0, %o_acc_0_1, %o_acc_0_2, %o_acc_0_3},

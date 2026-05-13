@@ -17,7 +17,13 @@
 //! for the specific B1.6 swap targets.
 
 use crate::flash_attention::FlashAttentionConfig;
-use crate::matmul_mma::emit_mma_instruction_predicated;
+use crate::flash_attention_v2::smem_layout::{
+    tier_b1_k_offset_ping, tier_b1_k_offset_pong, tier_b1_q_offset, tier_b1_v_offset_ping,
+    tier_b1_v_offset_pong,
+};
+use crate::matmul_mma::{
+    emit_load_a_fragment_smem, emit_load_b_fragment_smem, emit_mma_instruction_predicated,
+};
 
 /// Number of (m16, n8) MMA tiles each of the 8 warps owns for the QK^T
 /// output (bq x bkv). Always at least 1.
@@ -122,10 +128,32 @@ fn emit_qkt_mma(ptx: &mut String, config: &FlashAttentionConfig, slot: u32) {
     ));
     // %tb1_phase_b_smem_q/k and %s_acc_<t>_<lane> are declared + zero-init'd
     // by register_budget::declare_registers at orchestrator scope (B1.6
-    // deferral #4 resolution).
-    // Placeholder A/B-fragment registers + uniform loads. (Same deferral
-    // class as Q/KV projection -- B1.6 swaps to matmul_mma helpers.)
+    // deferral #4 resolution). The placeholder zero-bases there are
+    // overwritten here with real SMEM offsets (B1.6 deferral #1).
+    let q_off = tier_b1_q_offset(config);
+    let k_off = if slot == 0 {
+        tier_b1_k_offset_ping(config)
+    } else {
+        tier_b1_k_offset_pong(config)
+    };
+    ptx.push_str(&format!(
+        "    add.u64 %tb1_phase_b_smem_q, %shmem_base, {}; // Q tile @ tier_b1_q_offset\n",
+        q_off
+    ));
+    ptx.push_str(&format!(
+        "    add.u64 %tb1_phase_b_smem_k, %shmem_base, {}; // K tile @ slot={} offset\n",
+        k_off, slot
+    ));
+    // u32 sister regs for the matmul_mma fragment-load helpers.
+    ptx.push_str("    .reg .u32 %tb1_phase_b_smem_q_u32, %tb1_phase_b_smem_k_u32;\n");
+    ptx.push_str("    cvt.u32.u64 %tb1_phase_b_smem_q_u32, %tb1_phase_b_smem_q;\n");
+    ptx.push_str("    cvt.u32.u64 %tb1_phase_b_smem_k_u32, %tb1_phase_b_smem_k;\n");
+
     for t in 0..tpw {
+        // B1.6 deferral #1 resolution: per-lane fragment loads via
+        // matmul_mma helpers. A-fragment from Q SMEM (stride hd*2 bytes);
+        // B-fragment from K SMEM (stride hd*2 bytes for the K-row layout
+        // that QK^T uses).
         ptx.push_str(&format!(
             "    .reg .b32 %tb1_qkt_a_{}_0, %tb1_qkt_a_{}_1, %tb1_qkt_a_{}_2, %tb1_qkt_a_{}_3;\n",
             t, t, t, t
@@ -134,18 +162,28 @@ fn emit_qkt_mma(ptx: &mut String, config: &FlashAttentionConfig, slot: u32) {
             "    .reg .b32 %tb1_qkt_b_{}_0, %tb1_qkt_b_{}_1;\n",
             t, t
         ));
-        for i in 0..4 {
-            ptx.push_str(&format!(
-                "    ld.shared.b32 %tb1_qkt_a_{}_{}, [%tb1_phase_b_smem_q];\n",
-                t, i
-            ));
-        }
-        for i in 0..2 {
-            ptx.push_str(&format!(
-                "    ld.shared.b32 %tb1_qkt_b_{}_{}, [%tb1_phase_b_smem_k];\n",
-                t, i
-            ));
-        }
+        let a_fragment_regs = [
+            format!("tb1_qkt_a_{}_0", t),
+            format!("tb1_qkt_a_{}_1", t),
+            format!("tb1_qkt_a_{}_2", t),
+            format!("tb1_qkt_a_{}_3", t),
+        ];
+        emit_load_a_fragment_smem(
+            ptx,
+            &a_fragment_regs,
+            "%tb1_phase_b_smem_q_u32",
+            (hd * 2) as usize,
+        );
+        let b_fragment_regs = [
+            format!("tb1_qkt_b_{}_0", t),
+            format!("tb1_qkt_b_{}_1", t),
+        ];
+        emit_load_b_fragment_smem(
+            ptx,
+            &b_fragment_regs,
+            "%tb1_phase_b_smem_k_u32",
+            (hd * 2) as usize,
+        );
         let d_regs = [
             format!("%s_acc_{}_0", t),
             format!("%s_acc_{}_1", t),
@@ -257,15 +295,27 @@ fn emit_online_softmax(ptx: &mut String, config: &FlashAttentionConfig, kv_iter:
 /// kv_iter loop iterations. Currently re-zero'd per call.
 fn emit_pv_mma(ptx: &mut String, config: &FlashAttentionConfig, slot: u32) {
     let tpw = tiles_per_warp_pv(config);
+    let hd = config.head_dim as u32;
     ptx.push_str(&format!(
         "    // PV MMA: bq={} hd={} tpw_pv={} slot={}\n",
         config.block_q, config.head_dim, tpw, slot
     ));
-    // %tb1_phase_b_smem_v and %o_acc_<t>_<lane> are declared + zero-init'd
-    // by register_budget::declare_registers at orchestrator scope (B1.6
-    // deferrals #4 and #8 resolved together). O_acc persists across all
-    // kv_iter calls per spec section 3.1 register-residency.
-    // Placeholder PV MMA per tile.
+    // B1.6 deferral #1 (Phase B PV): populate %tb1_phase_b_smem_v with the
+    // real V tile SMEM offset for the selected slot. The orchestrator's
+    // placeholder zero-base is overwritten here.
+    let v_off = if slot == 0 {
+        tier_b1_v_offset_ping(config)
+    } else {
+        tier_b1_v_offset_pong(config)
+    };
+    ptx.push_str(&format!(
+        "    add.u64 %tb1_phase_b_smem_v, %shmem_base, {}; // V tile @ slot={} offset\n",
+        v_off, slot
+    ));
+    // u32 sister reg for the B-fragment helper.
+    ptx.push_str("    .reg .u32 %tb1_phase_b_smem_v_u32;\n");
+    ptx.push_str("    cvt.u32.u64 %tb1_phase_b_smem_v_u32, %tb1_phase_b_smem_v;\n");
+
     for t in 0..tpw {
         ptx.push_str(&format!(
             "    .reg .b32 %tb1_pv_a_{}_0, %tb1_pv_a_{}_1, %tb1_pv_a_{}_2, %tb1_pv_a_{}_3;\n",
@@ -276,7 +326,10 @@ fn emit_pv_mma(ptx: &mut String, config: &FlashAttentionConfig, slot: u32) {
             t, t
         ));
         // P-packed is in %p_packed_<t>, reuse as the A-fragment lane 0.
-        // (Placeholder: real A-fragment for PV has 4 lanes per thread.)
+        // (Placeholder: real A-fragment for PV has 4 lanes per thread.
+        // Real mapping requires the m16n8k16 register-A-fragment layout
+        // which differs from the SMEM-A-fragment helper signature; deferred
+        // to a B1.6 follow-on commit.)
         ptx.push_str(&format!(
             "    mov.b32 %tb1_pv_a_{}_0, %p_packed_{};\n",
             t, t
@@ -284,12 +337,18 @@ fn emit_pv_mma(ptx: &mut String, config: &FlashAttentionConfig, slot: u32) {
         ptx.push_str(&format!("    mov.b32 %tb1_pv_a_{}_1, %p_packed_{};\n", t, t));
         ptx.push_str(&format!("    mov.b32 %tb1_pv_a_{}_2, %p_packed_{};\n", t, t));
         ptx.push_str(&format!("    mov.b32 %tb1_pv_a_{}_3, %p_packed_{};\n", t, t));
-        for i in 0..2 {
-            ptx.push_str(&format!(
-                "    ld.shared.b32 %tb1_pv_b_{}_{}, [%tb1_phase_b_smem_v];\n",
-                t, i
-            ));
-        }
+        // B1.6 deferral #1 (PV B-fragment): real per-lane V load.
+        // V is bkv rows x hd cols; B-fragment col-major stride is hd*2.
+        let b_fragment_regs = [
+            format!("tb1_pv_b_{}_0", t),
+            format!("tb1_pv_b_{}_1", t),
+        ];
+        emit_load_b_fragment_smem(
+            ptx,
+            &b_fragment_regs,
+            "%tb1_phase_b_smem_v_u32",
+            (hd * 2) as usize,
+        );
         let d_regs = [
             format!("%o_acc_{}_0", t),
             format!("%o_acc_{}_1", t),
