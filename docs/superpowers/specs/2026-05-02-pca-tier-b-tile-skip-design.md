@@ -252,7 +252,9 @@ Revised 2026-05-12 per IR-004; see `2026-05-12-pca-tier-b-revision-design.md` §
 /// adding `range_table_bytes(...)` to its dynamic-SMEM launch parameter.
 ///
 /// Returned offset is `align_up(2)` for u16 range-table slot alignment.
-pub fn tier_b_range_table_offset(config: &FlashAttentionConfig) -> u64 {
+/// Returns `u32` to match existing `kv_offset` / `sp_offset` convention;
+/// consumers widen to `u64` when computing PTX addresses.
+pub fn tier_b_range_table_offset(config: &FlashAttentionConfig) -> u32 {
     let base = backward_total_bytes(config) + seg_overhead(config);
     align_up(base, 2)
 }
@@ -267,10 +269,10 @@ Sits after the existing `kv_offset`, `sp_offset`, etc. accessors. Returned offse
 ```rust
 #[derive(Debug, Clone, Copy)]
 pub struct RangeTableAddrs {
-    pub qtile_min:  u64,
-    pub qtile_max:  u64,
-    pub kvtile_min: u64,
-    pub kvtile_max: u64,
+    pub qtile_min:  u32,
+    pub qtile_max:  u32,
+    pub kvtile_min: u32,
+    pub kvtile_max: u32,
 }
 
 /// Constructor for the four sub-table offsets within Tier B's
