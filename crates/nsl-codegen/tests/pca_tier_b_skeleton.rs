@@ -16,7 +16,7 @@ fn public_api_signatures_compile() {
     let _: u64 = TIER_B_RANGE_TABLE_BUDGET_BYTES;
     let _: fn(&mut String, &FlashAttentionConfig, u32, &str, u32) = emit_range_table_preamble;
     let _: fn(&mut String, &FlashAttentionConfig, u32, &str, &str, u32, &str) = emit_skip_predicate;
-    let _: fn(&mut String, &FlashAttentionConfig, &str, &str, &str, &str) =
+    let _: fn(&mut String, &FlashAttentionConfig, u32, &str, &str, &str, &str) =
         emit_skip_decision_writeback;
     let _: fn(&FlashAttentionConfig, u64, SegmentResidency) -> bool = should_emit_tier_b;
 }
@@ -24,4 +24,25 @@ fn public_api_signatures_compile() {
 #[test]
 fn budget_constant_is_8kb() {
     assert_eq!(TIER_B_RANGE_TABLE_BUDGET_BYTES, 8192);
+}
+
+#[test]
+#[cfg(feature = "debug_kernel_instrumentation")]
+fn skip_writeback_emits_when_feature_enabled() {
+    use nsl_codegen::flash_attention::RopeStyle;
+
+    let cfg = FlashAttentionConfig {
+        block_q: 64, block_kv: 64, head_dim: 64,
+        causal: true, paged: false, rope_q: true,
+        rope_style: RopeStyle::HalfSplit, gqa_group_size: 2,
+        tree_mask: false, gpu_sm: 120, segment_masked: true, csha: None,
+    };
+    let mut ptx = String::new();
+    emit_skip_decision_writeback(
+        &mut ptx, &cfg, 4096,
+        "%qt", "%kvt", "%p_skip_TB", "skip_decisions_ptr",
+    );
+    assert!(ptx.contains("st.global.u8"), "writeback should emit st.global.u8");
+    assert!(ptx.contains("@%p_owner_TB"), "writeback should be owner-gated");
+    assert!(ptx.contains("selp.u16 %dec_val_TB, 1, 0"), "selp decision encoding missing");
 }

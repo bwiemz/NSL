@@ -403,23 +403,78 @@ pub fn emit_skip_predicate(
 /// Emit PTX that writes the skip decision for `(b, h, qt, kvt)` to
 /// the debug instrumentation buffer at the matching slot.
 ///
-/// Lane 0 of the warp owning the tile pair writes; other threads
-/// no-op. Decision: `1` = disjoint (skipped), `0` = kept.
+/// Lane 0 of warp 0 within the CTA writes; other threads no-op.
+/// Decision: `1` = disjoint (skipped), `0` = kept.
+///
+/// Buffer shape: `[batch, head, num_q_tiles, num_kv_tiles] : u8`
+/// per spec §4.3.1. Slot index = `(bh_idx * num_q_tiles + qt) * num_kv + kvt`.
 ///
 /// Gated behind `cfg!(debug_kernel_instrumentation)` at codegen time
 /// — production builds never call this function.
 ///
-/// **Stub in skeleton — real emission in Task 5.**
+/// # Arguments
+///
+/// - `seq_len` — the sequence length; used to derive tile counts at
+///   codegen time (not a runtime register).
+/// - `qt_reg` / `kvt_reg` — PTX operands (register names or immediates)
+///   holding the current q-tile / kv-tile ordinal.
+/// - `is_skip_pred` — the predicate register produced by
+///   [`emit_skip_predicate`] (e.g. `%p_skip_TB`).
+/// - `decisions_buf_param` — the `.param .u64` parameter name holding
+///   the HBM buffer base pointer.
+///
+/// TODO(tier-b.2): replace warp-0 approximation with a real
+/// `owning_warp(qt, kvt)` helper when multi-warp ownership is needed.
 pub fn emit_skip_decision_writeback(
     ptx: &mut String,
     config: &FlashAttentionConfig,
+    seq_len: u32,
     qt_reg: &str,
     kvt_reg: &str,
-    is_skip_pred: &str,
-    decisions_buf_reg: &str,
+    is_skip_pred: &str,           // %p_skip_TB from emit_skip_predicate
+    decisions_buf_param: &str,    // .param .u64 holding the HBM buffer ptr
 ) {
-    let _ = (config, qt_reg, kvt_reg, is_skip_pred, decisions_buf_reg);
-    ptx.push_str("    // PCA Tier B: writeback (Task 5 stub)\n");
+    let num_kv = crate::pca_tile_config::num_tiles(seq_len, config.block_kv as u32);
+    let num_q_tiles_const = crate::pca_tile_config::num_tiles(seq_len, config.block_q as u32);
+
+    ptx.push_str("    // ----- PCA Tier B: skip-decision writeback (debug, spec sec 4.3) -----\n");
+    ptx.push_str("    .reg .u64 %dec_buf_TB, %dec_slot_TB;\n");
+    ptx.push_str("    .reg .u32 %slot_off_TB, %bh_TB, %bh_slot_TB;\n");
+    ptx.push_str("    .reg .u16 %dec_val_TB;\n");
+    ptx.push_str("    .reg .pred %p_owner_TB, %p_lane_TB;\n");
+    ptx.push_str("    .reg .u32 %warp_id_TB, %lane_TB;\n");
+    ptx.push_str("\n");
+
+    // (batch * num_heads + head) precomputed elsewhere as %bh_idx; reuse if available.
+    ptx.push_str("    mov.u32 %bh_TB, %bh_idx;\n");
+    ptx.push_str(&format!(
+        "    mad.lo.u32 %bh_slot_TB, %bh_TB, {num_q_tiles_const}, {qt_reg};\n"
+    ));
+    ptx.push_str(&format!(
+        "    mad.lo.u32 %slot_off_TB, %bh_slot_TB, {num_kv}, {kvt_reg};\n"
+    ));
+
+    // Load buffer base + add offset.
+    ptx.push_str(&format!(
+        "    ld.param.u64 %dec_buf_TB, [{decisions_buf_param}];\n"
+    ));
+    ptx.push_str("    cvt.u64.u32 %dec_slot_TB, %slot_off_TB;\n");
+    ptx.push_str("    add.u64 %dec_slot_TB, %dec_buf_TB, %dec_slot_TB;\n");
+
+    // Owner = lane 0 of owning warp. v1 approximates as warp 0 lane 0 within the CTA.
+    // TODO(tier-b.2): replace with the real owning_warp(qt, kvt) helper.
+    ptx.push_str("    mov.u32 %warp_id_TB, %warpid;\n");
+    ptx.push_str("    setp.eq.u32 %p_owner_TB, %warp_id_TB, 0;\n");
+    ptx.push_str("    mov.u32 %lane_TB, %laneid;\n");
+    ptx.push_str("    setp.eq.u32 %p_lane_TB, %lane_TB, 0;\n");
+    ptx.push_str("    and.pred %p_owner_TB, %p_owner_TB, %p_lane_TB;\n");
+
+    // Decision value: 1 if disjoint (skipped), 0 if kept.
+    ptx.push_str(&format!(
+        "    selp.u16 %dec_val_TB, 1, 0, {is_skip_pred};\n"
+    ));
+    ptx.push_str("    @%p_owner_TB st.global.u8 [%dec_slot_TB], %dec_val_TB;\n");
+    ptx.push_str("    // ----- end skip-decision writeback -----\n");
 }
 
 #[cfg(test)]
@@ -524,7 +579,7 @@ mod tests {
         let cfg = fa_base_for_test();
         emit_range_table_preamble(&mut s, &cfg, 4096, "seg_smem", 0);
         emit_skip_predicate(&mut s, &cfg, 4096, "%qt", "%kvt", 0, "skip_kv_iter");
-        emit_skip_decision_writeback(&mut s, &cfg, "%qt", "%kvt", "%p_skip_TILERANGE", "%dec_buf");
+        emit_skip_decision_writeback(&mut s, &cfg, 4096, "%qt", "%kvt", "%p_skip_TB", "%dec_buf");
         assert!(s.contains("PCA Tier B"), "output missing marker:\n{}", s);
     }
 }

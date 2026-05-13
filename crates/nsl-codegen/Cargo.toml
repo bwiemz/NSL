@@ -36,6 +36,7 @@ cuda = ["nsl-runtime/cuda", "dep:cudarc"]
 test-hooks = ["nsl-runtime/test-hooks"]
 test-helpers = []
 calibrate = ["dep:rand"]
+debug_kernel_instrumentation = []
 
 [dev-dependencies]
 string-interner.workspace = true
