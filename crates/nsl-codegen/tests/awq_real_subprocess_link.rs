@@ -80,6 +80,7 @@ fn awq_plans() -> (Vec<ObservePlanEntry>, Vec<FinalizePlanEntry>) {
 }
 
 #[test]
+#[cfg_attr(target_os = "macos", ignore = "Cranelift objects have text relocations rejected by the macOS ARM64 PIE linker; tracked separately")]
 fn two_object_link_produces_binary_with_resolved_wrapper_symbol() {
     let (ast, interner) = parse_awq_fixture();
     let projections = pre_scan_awq_projections_from_ast(&ast, &interner);

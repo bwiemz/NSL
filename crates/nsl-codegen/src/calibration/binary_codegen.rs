@@ -41,7 +41,6 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use cranelift_codegen::ir::condcodes::IntCC;
-use cranelift_codegen::settings::Configurable as _;
 use cranelift_codegen::ir::{
     types as cl_types, AbiParam, Function, InstBuilder, MemFlags, StackSlotData, StackSlotKind,
     UserFuncName,
@@ -572,13 +571,7 @@ const AWQ_DESC_BYTES: u32 = 32;
 fn new_calibration_object_module(
     name: &str,
 ) -> Result<(ObjectModule, cranelift_codegen::isa::CallConv), HarnessError> {
-    let mut flag_builder = cranelift_codegen::settings::builder();
-    // Enable PIC so Cranelift emits GOT-indirect references for external
-    // symbols rather than absolute relocations in .text. Absolute text
-    // relocations are hard linker errors on macOS ARM64 PIE targets.
-    flag_builder.enable("is_pic").map_err(|e| HarnessError::Infrastructure {
-        reason: format!("cranelift enable is_pic: {e}"),
-    })?;
+    let flag_builder = cranelift_codegen::settings::builder();
     let isa = cranelift_native::builder()
         .map_err(|e| HarnessError::Infrastructure {
             reason: format!("cranelift native builder: {e}"),
@@ -3461,10 +3454,7 @@ fn emit_and_link_calibration_binary(
     }
 
     // ── Build the ObjectModule targeting the host ───────────────────
-    let mut flag_builder = cranelift_codegen::settings::builder();
-    flag_builder.enable("is_pic").map_err(|e| HarnessError::Infrastructure {
-        reason: format!("cranelift enable is_pic: {e}"),
-    })?;
+    let flag_builder = cranelift_codegen::settings::builder();
     let isa = cranelift_native::builder()
         .map_err(|e| HarnessError::Infrastructure {
             reason: format!("cranelift native builder: {e}"),
