@@ -18,6 +18,11 @@ fn default_config() -> BitNetKernelConfig {
         fused_rmsnorm: false,
         fused_bias_add: false,
         fused_residual_add: false,
+        // M35.2a backward tiles (V-P1-A exception #1; spec §3.3).
+        // Default: same as forward; backward_chunk_config::select (Stage D.2) refines per-config.
+        block_m_backward: 64,
+        block_n_backward: 128,
+        block_k_backward: 128,
     }
 }
 

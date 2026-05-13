@@ -26,6 +26,11 @@ pub mod loader;
 pub mod pack;
 pub mod phases;
 
+// M35.2a training-mode wrapper — gated on V-P1-D pass per BLOCKED_ON_V_P1_D.md.
+// Real implementation lands in M35.2a implementation Stage D.5.
+#[doc(hidden)]
+pub mod orchestrator_train;
+
 pub use config::BitNetKernelConfig;
 
 /// Synthesize a complete BitNet GEMM kernel as PTX bytes.

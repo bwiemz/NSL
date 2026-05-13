@@ -31,3 +31,15 @@ pub mod quantized_ternary_gemm;
 // Public: finalize epilogue (FP32 -> F16/BF16 cast, optional bias/residual
 // add, HBM write). Composed by `synthesize_kernel` after the fused GEMM.
 pub mod finalize;
+
+// M35.2a Phase 2 stubs — gated on V-P1-D pass per BLOCKED_ON_V_P1_D.md.
+// Real emit() implementations land in M35.2a implementation Stage D.3 / D.4.
+#[doc(hidden)]
+pub mod ternary_gemm_backward;
+
+#[doc(hidden)]
+pub mod absmax_quant_backward;
+
+// M35.2b stub — intentionally not implemented in M35.2a; lands as part of M35.2b.
+#[doc(hidden)]
+pub mod quantize_shadow;
