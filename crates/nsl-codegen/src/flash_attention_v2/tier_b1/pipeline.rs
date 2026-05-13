@@ -48,9 +48,12 @@ pub fn emit_main_loop_phase_a_load(ptx: &mut String, _config: &FlashAttentionCon
 /// declare these named registers before this helper is invoked, or ptxas
 /// will reject with CUDA_ERROR_INVALID_PTX:
 /// ```text
-///   .reg .u32  %r_kv_iter_next, %r_n_kv, %r_slot_curr;
+///   .reg .u32  %r_kv_iter_next, %r_n_kv;
+///   .reg .b32  %r_slot_curr;
 ///   .reg .pred %p_prefetch;
 /// ```
+/// (`%r_slot_curr` is `.b32` because the emitted `xor.b32` requires a
+/// typeless 32-bit reg; the `.u32` pair is used by `setp.lt.u32` only.)
 /// (B1.4 ships these references unanchored because the orchestrator that
 /// owns the prelude is still a stub at this milestone.)
 pub fn emit_main_loop_phase_c_swap(ptx: &mut String, _config: &FlashAttentionConfig, kv_iter: u32) {
