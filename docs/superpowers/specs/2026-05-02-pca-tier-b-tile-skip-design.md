@@ -2,10 +2,11 @@
 
 ## Revision Changelog
 
+- **2026-05-13** — **SHIPPED forward path** on branch `worktree-feat+pca-tier-b-v2` (21 commits). Kernel verified ptxas-clean on sm_75 (0 spills, 41984 B SMEM, 58 regs). Tier B.2 backward deferred to fresh session. M3 parity launch harness + M2/M6 measurement bench binary deferred to Tier B.1.5 (scripts + scaffold in place).
 - **2026-05-12** — §3.1, §3.4, §6.3 revised after re-brainstorm; cites probe findings doc + plan v2; see `2026-05-12-pca-tier-b-revision-design.md` for the brainstorm output and the institutional-rules citations (IR-004, IR-005, IR-006, IR-007). Original §3.1/§3.4/§6.3 preserved in git history.
 - **2026-05-02** — Initial spec; execution paused after 6 prerequisite commits (PR #138) due to §3.1 inline `.shared` decl incompatibility with Blackwell sm_120.
 
-**Status:** Design (spec) — execution paused
+**Status:** SHIPPED forward path 2026-05-13 (Tier B.2 backward deferred)
 **Date:** 2026-05-02
 **Owner:** bwiemz
 **Paper:** `docs/research/CFTP.pdf` §2 ("PCA — Packed-Context Attention"), specifically the "Tile-skip optimisation" sub-section
