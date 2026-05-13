@@ -14,6 +14,7 @@ pub mod projection_mma;
 pub mod attention_mma;
 pub mod chunk_config;
 pub mod register_budget;
+pub mod finalize;
 
 use crate::flash_attention::FlashAttentionConfig;
 
@@ -129,25 +130,21 @@ pub fn synthesize(config: &FlashAttentionConfig, chunk: u32) -> Vec<u8> {
     attention_mma::emit_phase_b_attention(&mut ptx, config, kv_iter, slot);
     pipeline::emit_main_loop_phase_c_swap(&mut ptx, config, kv_iter);
 
-    // 8. Finalize: divide O_acc by row_sum, scatter to HBM.
+    // 8. Finalize: divide O_acc by row_sum + scatter to HBM + LSE.
     //
-    // B1.6 deferral #9 (register-namespace bridge): `finalize::emit` is
-    // the reused Tier A scatter that reads %f<O_BASE> (Tier A's pool-style
-    // O accumulator naming) and %row_sum (written by Tier A's softmax
-    // path). Phase B in this scaffold instead produces %o_acc_<t>_<lane>
-    // (B1.5 naming, see attention_mma.rs::emit_pv_mma) and never writes
-    // %row_sum (emit_online_softmax is a placeholder). The B1.6 hoist
-    // refactor must either (a) rename %o_acc to %f<O_BASE> indexing and
-    // wire %row_sum from the real softmax helper, OR (b) replace this
-    // finalize::emit call with a Tier-B1-native output scatter that
-    // reads %o_acc directly. Until then, the emitted finalize block
-    // operates on stale/undefined registers — ptxas accepts the code but
-    // it is NOT numerically meaningful.
-    for q_iter in 0..iters {
-        crate::flash_attention_v2::phases::forward::finalize::emit(
-            &mut ptx, config, q_iter,
-        );
-    }
+    // B1.6 deferral #9 RESOLVED: Tier-B1-native scatter (option b from
+    // the deferral memo) is implemented in `finalize::emit`. It reads
+    // `%o_acc_<t>_<lane>` + `%s_sum_<t>_<half>` + `%s_max_<t>_<half>` —
+    // the Tier B.1 D-fragment-shaped accumulator namespace — and writes
+    // the full block_q × head_dim output tile to HBM with per-tile warp
+    // gating matching the PV MMA ownership pattern. LSE = row_max +
+    // ln(row_sum) is emitted by one lane per row-quad per half.
+    //
+    // The Tier A `phases::forward::finalize::emit` is no longer called
+    // from this orchestrator. It was structurally invalid here: Tier A's
+    // one-q-row-per-warp register namespace (%f<O_BASE>, %row_sum) does
+    // not exist in Tier B.1's m16n8k16 D-fragment layout.
+    finalize::emit(&mut ptx, config);
 
     // 9. Sentinel comment + return. The sentinel is load-bearing for
     // the dispatch test (replaces the prior "Tier B.1 stub" marker).

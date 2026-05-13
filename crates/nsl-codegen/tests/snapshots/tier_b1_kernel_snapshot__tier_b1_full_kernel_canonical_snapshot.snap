@@ -2846,270 +2846,125 @@ V2_TIER_B1_PHASE_C_AFTER_PREFETCH:
     bar.sync 0;
     // slot swap: toggle slot[curr] in addressing arithmetic
     xor.b32 %r_slot_curr, %r_slot_curr, 1;
-    // Phase 6: finalize + output store (q_tile_iter = 0)
-    rcp.approx.f32 %f0, %row_sum;
-    mul.f32 %f48, %f48, %f0;
-    add.u32 %r7, %warp_id, 0;             // q_row_local = warp_id + q_tile_iter*4
-    cvt.u64.u32 %rd46, %r7;
-    add.u64 %rd47, %q_start, %rd46;           // q_row_global
-    mul.lo.u64 %rd48, %batch_idx, %rd5;       // batch*heads
-    add.u64 %rd48, %rd48, %head_idx;          // + head
-    mul.lo.u64 %rd48, %rd48, %rd6;            // * seq_len
-    add.u64 %rd48, %rd48, %rd47;              // + q_row_global
-    mul.lo.u64 %rd48, %rd48, %rd7;            // * head_dim
-    shl.b64 %rd48, %rd48, 1;                  // * 2 bytes f16 output
-    add.u64 %rd48, %rd3, %rd48;               // out_base_global
-    cvt.u64.u32 %rd49, %lane;
-    cvt.rn.f16.f32 %h0, %f48;
-    shl.b64 %rd49, %rd49, 1;                  // * 2 bytes f16
-    add.u64 %rd49, %rd48, %rd49;              // out_base + d*2
-    st.global.b16 [%rd49], %h0;
-    // LSE store (lane 0 only, null-guarded)
-    setp.eq.u32 %p1, %lane, 0;
-    setp.ne.u64 %p_has_lse, %logsumexp_base, 0;
-    and.pred %p1, %p1, %p_has_lse;
-    lg2.approx.f32 %log_sum, %row_sum;
-    mov.f32 %f1, 0f3F317218;                  // ln(2)
-    mul.f32 %log_sum, %log_sum, %f1;          // log_sum = ln(row_sum)
-    add.f32 %lse, %row_max, %log_sum;
-    mul.lo.u64 %rd50, %batch_idx, %rd5;
-    add.u64 %rd50, %rd50, %head_idx;
-    mul.lo.u64 %rd50, %rd50, %rd6;
-    add.u64 %rd50, %rd50, %rd47;
-    shl.b64 %rd50, %rd50, 2;
-    add.u64 %rd50, %logsumexp_base, %rd50;
-    @%p1 st.global.f32 [%rd50], %lse;
-    // Phase 6: finalize + output store (q_tile_iter = 1)
-    rcp.approx.f32 %f0, %row_sum;
-    mul.f32 %f48, %f48, %f0;
-    add.u32 %r7, %warp_id, 4;             // q_row_local = warp_id + q_tile_iter*4
-    cvt.u64.u32 %rd46, %r7;
-    add.u64 %rd47, %q_start, %rd46;           // q_row_global
-    mul.lo.u64 %rd48, %batch_idx, %rd5;       // batch*heads
-    add.u64 %rd48, %rd48, %head_idx;          // + head
-    mul.lo.u64 %rd48, %rd48, %rd6;            // * seq_len
-    add.u64 %rd48, %rd48, %rd47;              // + q_row_global
-    mul.lo.u64 %rd48, %rd48, %rd7;            // * head_dim
-    shl.b64 %rd48, %rd48, 1;                  // * 2 bytes f16 output
-    add.u64 %rd48, %rd3, %rd48;               // out_base_global
-    cvt.u64.u32 %rd49, %lane;
-    cvt.rn.f16.f32 %h0, %f48;
-    shl.b64 %rd49, %rd49, 1;                  // * 2 bytes f16
-    add.u64 %rd49, %rd48, %rd49;              // out_base + d*2
-    st.global.b16 [%rd49], %h0;
-    // LSE store (lane 0 only, null-guarded)
-    setp.eq.u32 %p1, %lane, 0;
-    setp.ne.u64 %p_has_lse, %logsumexp_base, 0;
-    and.pred %p1, %p1, %p_has_lse;
-    lg2.approx.f32 %log_sum, %row_sum;
-    mov.f32 %f1, 0f3F317218;                  // ln(2)
-    mul.f32 %log_sum, %log_sum, %f1;          // log_sum = ln(row_sum)
-    add.f32 %lse, %row_max, %log_sum;
-    mul.lo.u64 %rd50, %batch_idx, %rd5;
-    add.u64 %rd50, %rd50, %head_idx;
-    mul.lo.u64 %rd50, %rd50, %rd6;
-    add.u64 %rd50, %rd50, %rd47;
-    shl.b64 %rd50, %rd50, 2;
-    add.u64 %rd50, %logsumexp_base, %rd50;
-    @%p1 st.global.f32 [%rd50], %lse;
-    // Phase 6: finalize + output store (q_tile_iter = 2)
-    rcp.approx.f32 %f0, %row_sum;
-    mul.f32 %f48, %f48, %f0;
-    add.u32 %r7, %warp_id, 8;             // q_row_local = warp_id + q_tile_iter*4
-    cvt.u64.u32 %rd46, %r7;
-    add.u64 %rd47, %q_start, %rd46;           // q_row_global
-    mul.lo.u64 %rd48, %batch_idx, %rd5;       // batch*heads
-    add.u64 %rd48, %rd48, %head_idx;          // + head
-    mul.lo.u64 %rd48, %rd48, %rd6;            // * seq_len
-    add.u64 %rd48, %rd48, %rd47;              // + q_row_global
-    mul.lo.u64 %rd48, %rd48, %rd7;            // * head_dim
-    shl.b64 %rd48, %rd48, 1;                  // * 2 bytes f16 output
-    add.u64 %rd48, %rd3, %rd48;               // out_base_global
-    cvt.u64.u32 %rd49, %lane;
-    cvt.rn.f16.f32 %h0, %f48;
-    shl.b64 %rd49, %rd49, 1;                  // * 2 bytes f16
-    add.u64 %rd49, %rd48, %rd49;              // out_base + d*2
-    st.global.b16 [%rd49], %h0;
-    // LSE store (lane 0 only, null-guarded)
-    setp.eq.u32 %p1, %lane, 0;
-    setp.ne.u64 %p_has_lse, %logsumexp_base, 0;
-    and.pred %p1, %p1, %p_has_lse;
-    lg2.approx.f32 %log_sum, %row_sum;
-    mov.f32 %f1, 0f3F317218;                  // ln(2)
-    mul.f32 %log_sum, %log_sum, %f1;          // log_sum = ln(row_sum)
-    add.f32 %lse, %row_max, %log_sum;
-    mul.lo.u64 %rd50, %batch_idx, %rd5;
-    add.u64 %rd50, %rd50, %head_idx;
-    mul.lo.u64 %rd50, %rd50, %rd6;
-    add.u64 %rd50, %rd50, %rd47;
-    shl.b64 %rd50, %rd50, 2;
-    add.u64 %rd50, %logsumexp_base, %rd50;
-    @%p1 st.global.f32 [%rd50], %lse;
-    // Phase 6: finalize + output store (q_tile_iter = 3)
-    rcp.approx.f32 %f0, %row_sum;
-    mul.f32 %f48, %f48, %f0;
-    add.u32 %r7, %warp_id, 12;             // q_row_local = warp_id + q_tile_iter*4
-    cvt.u64.u32 %rd46, %r7;
-    add.u64 %rd47, %q_start, %rd46;           // q_row_global
-    mul.lo.u64 %rd48, %batch_idx, %rd5;       // batch*heads
-    add.u64 %rd48, %rd48, %head_idx;          // + head
-    mul.lo.u64 %rd48, %rd48, %rd6;            // * seq_len
-    add.u64 %rd48, %rd48, %rd47;              // + q_row_global
-    mul.lo.u64 %rd48, %rd48, %rd7;            // * head_dim
-    shl.b64 %rd48, %rd48, 1;                  // * 2 bytes f16 output
-    add.u64 %rd48, %rd3, %rd48;               // out_base_global
-    cvt.u64.u32 %rd49, %lane;
-    cvt.rn.f16.f32 %h0, %f48;
-    shl.b64 %rd49, %rd49, 1;                  // * 2 bytes f16
-    add.u64 %rd49, %rd48, %rd49;              // out_base + d*2
-    st.global.b16 [%rd49], %h0;
-    // LSE store (lane 0 only, null-guarded)
-    setp.eq.u32 %p1, %lane, 0;
-    setp.ne.u64 %p_has_lse, %logsumexp_base, 0;
-    and.pred %p1, %p1, %p_has_lse;
-    lg2.approx.f32 %log_sum, %row_sum;
-    mov.f32 %f1, 0f3F317218;                  // ln(2)
-    mul.f32 %log_sum, %log_sum, %f1;          // log_sum = ln(row_sum)
-    add.f32 %lse, %row_max, %log_sum;
-    mul.lo.u64 %rd50, %batch_idx, %rd5;
-    add.u64 %rd50, %rd50, %head_idx;
-    mul.lo.u64 %rd50, %rd50, %rd6;
-    add.u64 %rd50, %rd50, %rd47;
-    shl.b64 %rd50, %rd50, 2;
-    add.u64 %rd50, %logsumexp_base, %rd50;
-    @%p1 st.global.f32 [%rd50], %lse;
-    // Phase 6: finalize + output store (q_tile_iter = 4)
-    rcp.approx.f32 %f0, %row_sum;
-    mul.f32 %f48, %f48, %f0;
-    add.u32 %r7, %warp_id, 16;             // q_row_local = warp_id + q_tile_iter*4
-    cvt.u64.u32 %rd46, %r7;
-    add.u64 %rd47, %q_start, %rd46;           // q_row_global
-    mul.lo.u64 %rd48, %batch_idx, %rd5;       // batch*heads
-    add.u64 %rd48, %rd48, %head_idx;          // + head
-    mul.lo.u64 %rd48, %rd48, %rd6;            // * seq_len
-    add.u64 %rd48, %rd48, %rd47;              // + q_row_global
-    mul.lo.u64 %rd48, %rd48, %rd7;            // * head_dim
-    shl.b64 %rd48, %rd48, 1;                  // * 2 bytes f16 output
-    add.u64 %rd48, %rd3, %rd48;               // out_base_global
-    cvt.u64.u32 %rd49, %lane;
-    cvt.rn.f16.f32 %h0, %f48;
-    shl.b64 %rd49, %rd49, 1;                  // * 2 bytes f16
-    add.u64 %rd49, %rd48, %rd49;              // out_base + d*2
-    st.global.b16 [%rd49], %h0;
-    // LSE store (lane 0 only, null-guarded)
-    setp.eq.u32 %p1, %lane, 0;
-    setp.ne.u64 %p_has_lse, %logsumexp_base, 0;
-    and.pred %p1, %p1, %p_has_lse;
-    lg2.approx.f32 %log_sum, %row_sum;
-    mov.f32 %f1, 0f3F317218;                  // ln(2)
-    mul.f32 %log_sum, %log_sum, %f1;          // log_sum = ln(row_sum)
-    add.f32 %lse, %row_max, %log_sum;
-    mul.lo.u64 %rd50, %batch_idx, %rd5;
-    add.u64 %rd50, %rd50, %head_idx;
-    mul.lo.u64 %rd50, %rd50, %rd6;
-    add.u64 %rd50, %rd50, %rd47;
-    shl.b64 %rd50, %rd50, 2;
-    add.u64 %rd50, %logsumexp_base, %rd50;
-    @%p1 st.global.f32 [%rd50], %lse;
-    // Phase 6: finalize + output store (q_tile_iter = 5)
-    rcp.approx.f32 %f0, %row_sum;
-    mul.f32 %f48, %f48, %f0;
-    add.u32 %r7, %warp_id, 20;             // q_row_local = warp_id + q_tile_iter*4
-    cvt.u64.u32 %rd46, %r7;
-    add.u64 %rd47, %q_start, %rd46;           // q_row_global
-    mul.lo.u64 %rd48, %batch_idx, %rd5;       // batch*heads
-    add.u64 %rd48, %rd48, %head_idx;          // + head
-    mul.lo.u64 %rd48, %rd48, %rd6;            // * seq_len
-    add.u64 %rd48, %rd48, %rd47;              // + q_row_global
-    mul.lo.u64 %rd48, %rd48, %rd7;            // * head_dim
-    shl.b64 %rd48, %rd48, 1;                  // * 2 bytes f16 output
-    add.u64 %rd48, %rd3, %rd48;               // out_base_global
-    cvt.u64.u32 %rd49, %lane;
-    cvt.rn.f16.f32 %h0, %f48;
-    shl.b64 %rd49, %rd49, 1;                  // * 2 bytes f16
-    add.u64 %rd49, %rd48, %rd49;              // out_base + d*2
-    st.global.b16 [%rd49], %h0;
-    // LSE store (lane 0 only, null-guarded)
-    setp.eq.u32 %p1, %lane, 0;
-    setp.ne.u64 %p_has_lse, %logsumexp_base, 0;
-    and.pred %p1, %p1, %p_has_lse;
-    lg2.approx.f32 %log_sum, %row_sum;
-    mov.f32 %f1, 0f3F317218;                  // ln(2)
-    mul.f32 %log_sum, %log_sum, %f1;          // log_sum = ln(row_sum)
-    add.f32 %lse, %row_max, %log_sum;
-    mul.lo.u64 %rd50, %batch_idx, %rd5;
-    add.u64 %rd50, %rd50, %head_idx;
-    mul.lo.u64 %rd50, %rd50, %rd6;
-    add.u64 %rd50, %rd50, %rd47;
-    shl.b64 %rd50, %rd50, 2;
-    add.u64 %rd50, %logsumexp_base, %rd50;
-    @%p1 st.global.f32 [%rd50], %lse;
-    // Phase 6: finalize + output store (q_tile_iter = 6)
-    rcp.approx.f32 %f0, %row_sum;
-    mul.f32 %f48, %f48, %f0;
-    add.u32 %r7, %warp_id, 24;             // q_row_local = warp_id + q_tile_iter*4
-    cvt.u64.u32 %rd46, %r7;
-    add.u64 %rd47, %q_start, %rd46;           // q_row_global
-    mul.lo.u64 %rd48, %batch_idx, %rd5;       // batch*heads
-    add.u64 %rd48, %rd48, %head_idx;          // + head
-    mul.lo.u64 %rd48, %rd48, %rd6;            // * seq_len
-    add.u64 %rd48, %rd48, %rd47;              // + q_row_global
-    mul.lo.u64 %rd48, %rd48, %rd7;            // * head_dim
-    shl.b64 %rd48, %rd48, 1;                  // * 2 bytes f16 output
-    add.u64 %rd48, %rd3, %rd48;               // out_base_global
-    cvt.u64.u32 %rd49, %lane;
-    cvt.rn.f16.f32 %h0, %f48;
-    shl.b64 %rd49, %rd49, 1;                  // * 2 bytes f16
-    add.u64 %rd49, %rd48, %rd49;              // out_base + d*2
-    st.global.b16 [%rd49], %h0;
-    // LSE store (lane 0 only, null-guarded)
-    setp.eq.u32 %p1, %lane, 0;
-    setp.ne.u64 %p_has_lse, %logsumexp_base, 0;
-    and.pred %p1, %p1, %p_has_lse;
-    lg2.approx.f32 %log_sum, %row_sum;
-    mov.f32 %f1, 0f3F317218;                  // ln(2)
-    mul.f32 %log_sum, %log_sum, %f1;          // log_sum = ln(row_sum)
-    add.f32 %lse, %row_max, %log_sum;
-    mul.lo.u64 %rd50, %batch_idx, %rd5;
-    add.u64 %rd50, %rd50, %head_idx;
-    mul.lo.u64 %rd50, %rd50, %rd6;
-    add.u64 %rd50, %rd50, %rd47;
-    shl.b64 %rd50, %rd50, 2;
-    add.u64 %rd50, %logsumexp_base, %rd50;
-    @%p1 st.global.f32 [%rd50], %lse;
-    // Phase 6: finalize + output store (q_tile_iter = 7)
-    rcp.approx.f32 %f0, %row_sum;
-    mul.f32 %f48, %f48, %f0;
-    add.u32 %r7, %warp_id, 28;             // q_row_local = warp_id + q_tile_iter*4
-    cvt.u64.u32 %rd46, %r7;
-    add.u64 %rd47, %q_start, %rd46;           // q_row_global
-    mul.lo.u64 %rd48, %batch_idx, %rd5;       // batch*heads
-    add.u64 %rd48, %rd48, %head_idx;          // + head
-    mul.lo.u64 %rd48, %rd48, %rd6;            // * seq_len
-    add.u64 %rd48, %rd48, %rd47;              // + q_row_global
-    mul.lo.u64 %rd48, %rd48, %rd7;            // * head_dim
-    shl.b64 %rd48, %rd48, 1;                  // * 2 bytes f16 output
-    add.u64 %rd48, %rd3, %rd48;               // out_base_global
-    cvt.u64.u32 %rd49, %lane;
-    cvt.rn.f16.f32 %h0, %f48;
-    shl.b64 %rd49, %rd49, 1;                  // * 2 bytes f16
-    add.u64 %rd49, %rd48, %rd49;              // out_base + d*2
-    st.global.b16 [%rd49], %h0;
-    // LSE store (lane 0 only, null-guarded)
-    setp.eq.u32 %p1, %lane, 0;
-    setp.ne.u64 %p_has_lse, %logsumexp_base, 0;
-    and.pred %p1, %p1, %p_has_lse;
-    lg2.approx.f32 %log_sum, %row_sum;
-    mov.f32 %f1, 0f3F317218;                  // ln(2)
-    mul.f32 %log_sum, %log_sum, %f1;          // log_sum = ln(row_sum)
-    add.f32 %lse, %row_max, %log_sum;
-    mul.lo.u64 %rd50, %batch_idx, %rd5;
-    add.u64 %rd50, %rd50, %head_idx;
-    mul.lo.u64 %rd50, %rd50, %rd6;
-    add.u64 %rd50, %rd50, %rd47;
-    shl.b64 %rd50, %rd50, 2;
-    add.u64 %rd50, %logsumexp_base, %rd50;
-    @%p1 st.global.f32 [%rd50], %lse;
+    // === Tier B.1 native output scatter (B1.6 deferral #9) ===
+    .reg .f32 %fin_norm;
+    .reg .u32 %fin_lo_row, %fin_lo_col_base;
+    .reg .u32 %fin_row_in_tile, %fin_col_in_tile;
+    .reg .u32 %fin_q_row_u32, %fin_d_col_u32;
+    .reg .u32 %fin_laneid, %fin_lane_mod4;
+    .reg .u64 %fin_q_row, %fin_d_col, %fin_idx, %fin_idx2;
+    .reg .u64 %fin_addr;
+    .reg .b16 %fin_h;
+    .reg .pred %fin_warp_pred, %fin_lane0_pred;
+    mov.u32 %fin_laneid, %tid.x;
+    and.b32 %fin_laneid, %fin_laneid, 31;
+    shr.u32 %fin_lo_row, %fin_laneid, 2;       // l/4 = D-fragment row within lo half
+    and.b32 %fin_lo_col_base, %fin_laneid, 3;  // l%4
+    shl.b32 %fin_lo_col_base, %fin_lo_col_base, 1; // (l%4)*2 = D-fragment col base
+    and.b32 %fin_lane_mod4, %fin_laneid, 3;    // for LSE lane-0-of-quad gate
+    // ---- Output tile t=0 (m_tile=0, n_tile=0, warp owner = 0) ----
+    setp.eq.u32 %fin_warp_pred, %warp_id, 0;
+    div.approx.f32 %fin_norm, %o_acc_0_0, %s_sum_0_lo;
+    add.u32 %fin_row_in_tile, %fin_lo_row, 0;
+    add.u32 %fin_col_in_tile, %fin_lo_col_base, 0;
+    add.u32 %fin_q_row_u32, %fin_row_in_tile, 0;
+    add.u32 %fin_d_col_u32, %fin_col_in_tile, 0;
+    cvt.u64.u32 %fin_q_row, %fin_q_row_u32;
+    cvt.u64.u32 %fin_d_col, %fin_d_col_u32;
+    add.u64 %fin_q_row, %fin_q_row, %q_start;
+    mul.lo.u64 %fin_idx, %batch_idx, %rd5;
+    add.u64 %fin_idx, %fin_idx, %head_idx;
+    mul.lo.u64 %fin_idx, %fin_idx, %rd6;
+    add.u64 %fin_idx, %fin_idx, %fin_q_row;
+    mul.lo.u64 %fin_idx, %fin_idx, %rd7;
+    add.u64 %fin_idx, %fin_idx, %fin_d_col;
+    shl.b64 %fin_idx, %fin_idx, 1;  // f16 = 2 bytes
+    add.u64 %fin_addr, %rd3, %fin_idx;
+    cvt.rn.f16.f32 %fin_h, %fin_norm;
+    @%fin_warp_pred st.global.b16 [%fin_addr], %fin_h;
+    div.approx.f32 %fin_norm, %o_acc_0_1, %s_sum_0_lo;
+    add.u32 %fin_row_in_tile, %fin_lo_row, 0;
+    add.u32 %fin_col_in_tile, %fin_lo_col_base, 1;
+    add.u32 %fin_q_row_u32, %fin_row_in_tile, 0;
+    add.u32 %fin_d_col_u32, %fin_col_in_tile, 0;
+    cvt.u64.u32 %fin_q_row, %fin_q_row_u32;
+    cvt.u64.u32 %fin_d_col, %fin_d_col_u32;
+    add.u64 %fin_q_row, %fin_q_row, %q_start;
+    mul.lo.u64 %fin_idx, %batch_idx, %rd5;
+    add.u64 %fin_idx, %fin_idx, %head_idx;
+    mul.lo.u64 %fin_idx, %fin_idx, %rd6;
+    add.u64 %fin_idx, %fin_idx, %fin_q_row;
+    mul.lo.u64 %fin_idx, %fin_idx, %rd7;
+    add.u64 %fin_idx, %fin_idx, %fin_d_col;
+    shl.b64 %fin_idx, %fin_idx, 1;  // f16 = 2 bytes
+    add.u64 %fin_addr, %rd3, %fin_idx;
+    cvt.rn.f16.f32 %fin_h, %fin_norm;
+    @%fin_warp_pred st.global.b16 [%fin_addr], %fin_h;
+    div.approx.f32 %fin_norm, %o_acc_0_2, %s_sum_0_hi;
+    add.u32 %fin_row_in_tile, %fin_lo_row, 8;
+    add.u32 %fin_col_in_tile, %fin_lo_col_base, 0;
+    add.u32 %fin_q_row_u32, %fin_row_in_tile, 0;
+    add.u32 %fin_d_col_u32, %fin_col_in_tile, 0;
+    cvt.u64.u32 %fin_q_row, %fin_q_row_u32;
+    cvt.u64.u32 %fin_d_col, %fin_d_col_u32;
+    add.u64 %fin_q_row, %fin_q_row, %q_start;
+    mul.lo.u64 %fin_idx, %batch_idx, %rd5;
+    add.u64 %fin_idx, %fin_idx, %head_idx;
+    mul.lo.u64 %fin_idx, %fin_idx, %rd6;
+    add.u64 %fin_idx, %fin_idx, %fin_q_row;
+    mul.lo.u64 %fin_idx, %fin_idx, %rd7;
+    add.u64 %fin_idx, %fin_idx, %fin_d_col;
+    shl.b64 %fin_idx, %fin_idx, 1;  // f16 = 2 bytes
+    add.u64 %fin_addr, %rd3, %fin_idx;
+    cvt.rn.f16.f32 %fin_h, %fin_norm;
+    @%fin_warp_pred st.global.b16 [%fin_addr], %fin_h;
+    div.approx.f32 %fin_norm, %o_acc_0_3, %s_sum_0_hi;
+    add.u32 %fin_row_in_tile, %fin_lo_row, 8;
+    add.u32 %fin_col_in_tile, %fin_lo_col_base, 1;
+    add.u32 %fin_q_row_u32, %fin_row_in_tile, 0;
+    add.u32 %fin_d_col_u32, %fin_col_in_tile, 0;
+    cvt.u64.u32 %fin_q_row, %fin_q_row_u32;
+    cvt.u64.u32 %fin_d_col, %fin_d_col_u32;
+    add.u64 %fin_q_row, %fin_q_row, %q_start;
+    mul.lo.u64 %fin_idx, %batch_idx, %rd5;
+    add.u64 %fin_idx, %fin_idx, %head_idx;
+    mul.lo.u64 %fin_idx, %fin_idx, %rd6;
+    add.u64 %fin_idx, %fin_idx, %fin_q_row;
+    mul.lo.u64 %fin_idx, %fin_idx, %rd7;
+    add.u64 %fin_idx, %fin_idx, %fin_d_col;
+    shl.b64 %fin_idx, %fin_idx, 1;  // f16 = 2 bytes
+    add.u64 %fin_addr, %rd3, %fin_idx;
+    cvt.rn.f16.f32 %fin_h, %fin_norm;
+    @%fin_warp_pred st.global.b16 [%fin_addr], %fin_h;
+    setp.eq.u32 %fin_lane0_pred, %fin_lane_mod4, 0;
+    and.pred %fin_lane0_pred, %fin_lane0_pred, %fin_warp_pred;
+    and.pred %fin_lane0_pred, %fin_lane0_pred, %p_has_lse;
+    lg2.approx.f32 %log_sum, %s_sum_0_lo;
+    mul.f32 %log_sum, %log_sum, 0f3F317218; // * ln(2)
+    add.f32 %lse, %s_max_0_lo, %log_sum;
+    add.u32 %fin_q_row_u32, %fin_lo_row, 0;
+    cvt.u64.u32 %fin_q_row, %fin_q_row_u32;
+    add.u64 %fin_q_row, %fin_q_row, %q_start;
+    mul.lo.u64 %fin_idx2, %batch_idx, %rd5;
+    add.u64 %fin_idx2, %fin_idx2, %head_idx;
+    mul.lo.u64 %fin_idx2, %fin_idx2, %rd6;
+    add.u64 %fin_idx2, %fin_idx2, %fin_q_row;
+    shl.b64 %fin_idx2, %fin_idx2, 2;  // f32 = 4 bytes
+    add.u64 %fin_addr, %logsumexp_base, %fin_idx2;
+    @%fin_lane0_pred st.global.f32 [%fin_addr], %lse;
+    lg2.approx.f32 %log_sum, %s_sum_0_hi;
+    mul.f32 %log_sum, %log_sum, 0f3F317218; // * ln(2)
+    add.f32 %lse, %s_max_0_hi, %log_sum;
+    add.u32 %fin_q_row_u32, %fin_lo_row, 8;
+    cvt.u64.u32 %fin_q_row, %fin_q_row_u32;
+    add.u64 %fin_q_row, %fin_q_row, %q_start;
+    mul.lo.u64 %fin_idx2, %batch_idx, %rd5;
+    add.u64 %fin_idx2, %fin_idx2, %head_idx;
+    mul.lo.u64 %fin_idx2, %fin_idx2, %rd6;
+    add.u64 %fin_idx2, %fin_idx2, %fin_q_row;
+    shl.b64 %fin_idx2, %fin_idx2, 2;  // f32 = 4 bytes
+    add.u64 %fin_addr, %logsumexp_base, %fin_idx2;
+    @%fin_lane0_pred st.global.f32 [%fin_addr], %lse;
     // Tier B.1 single-iter scaffold complete (B1.5 Task 5.3); multi-iter loop B1.6
     ret;
 }
