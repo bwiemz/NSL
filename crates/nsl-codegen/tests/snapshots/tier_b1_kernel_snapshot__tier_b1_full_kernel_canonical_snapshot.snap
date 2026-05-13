@@ -2368,8 +2368,37 @@ V2_TIER_B1_KV_PROJ_SKIP_0:
     max.f32 %s_max_0_lo, %s_max_0_lo, %s_shfl_0_tmp;
     shfl.sync.bfly.b32 %s_shfl_0_tmp, %s_max_0_hi, 2, 0x1f, 0xffffffff; // lane k <-> k^2
     max.f32 %s_max_0_hi, %s_max_0_hi, %s_shfl_0_tmp;
-    // B1.6 TODO: subtract %s_max, exp, sum-reduce, divide -> %p_packed_0
-    mov.b32 %p_packed_0, %s_acc_0_0;
+    // subtract row_max, scale by log2(e), apply ex2.approx (deferral #6)
+    sub.f32 %s_acc_0_0, %s_acc_0_0, %s_max_0_lo;
+    mul.f32 %s_acc_0_0, %s_acc_0_0, 0f3FB8AA3B; // * log2(e)
+    ex2.approx.f32 %s_acc_0_0, %s_acc_0_0;
+    sub.f32 %s_acc_0_1, %s_acc_0_1, %s_max_0_lo;
+    mul.f32 %s_acc_0_1, %s_acc_0_1, 0f3FB8AA3B; // * log2(e)
+    ex2.approx.f32 %s_acc_0_1, %s_acc_0_1;
+    sub.f32 %s_acc_0_2, %s_acc_0_2, %s_max_0_hi;
+    mul.f32 %s_acc_0_2, %s_acc_0_2, 0f3FB8AA3B; // * log2(e)
+    ex2.approx.f32 %s_acc_0_2, %s_acc_0_2;
+    sub.f32 %s_acc_0_3, %s_acc_0_3, %s_max_0_hi;
+    mul.f32 %s_acc_0_3, %s_acc_0_3, 0f3FB8AA3B; // * log2(e)
+    ex2.approx.f32 %s_acc_0_3, %s_acc_0_3;
+    .reg .f32 %s_sum_0_lo, %s_sum_0_hi;
+    add.f32 %s_sum_0_lo, %s_acc_0_0, %s_acc_0_1;
+    add.f32 %s_sum_0_hi, %s_acc_0_2, %s_acc_0_3;
+    shfl.sync.bfly.b32 %s_shfl_0_tmp, %s_sum_0_lo, 1, 0x1f, 0xffffffff; // lane k <-> k^1
+    add.f32 %s_sum_0_lo, %s_sum_0_lo, %s_shfl_0_tmp;
+    shfl.sync.bfly.b32 %s_shfl_0_tmp, %s_sum_0_hi, 1, 0x1f, 0xffffffff; // lane k <-> k^1
+    add.f32 %s_sum_0_hi, %s_sum_0_hi, %s_shfl_0_tmp;
+    shfl.sync.bfly.b32 %s_shfl_0_tmp, %s_sum_0_lo, 2, 0x1f, 0xffffffff; // lane k <-> k^2
+    add.f32 %s_sum_0_lo, %s_sum_0_lo, %s_shfl_0_tmp;
+    shfl.sync.bfly.b32 %s_shfl_0_tmp, %s_sum_0_hi, 2, 0x1f, 0xffffffff; // lane k <-> k^2
+    add.f32 %s_sum_0_hi, %s_sum_0_hi, %s_shfl_0_tmp;
+    div.approx.f32 %s_acc_0_0, %s_acc_0_0, %s_sum_0_lo;
+    div.approx.f32 %s_acc_0_1, %s_acc_0_1, %s_sum_0_lo;
+    div.approx.f32 %s_acc_0_2, %s_acc_0_2, %s_sum_0_hi;
+    div.approx.f32 %s_acc_0_3, %s_acc_0_3, %s_sum_0_hi;
+    cvt.rn.f16.f32 %mma_h0, %s_acc_0_0;
+    cvt.rn.f16.f32 %mma_h1, %s_acc_0_1;
+    mov.b32 %p_packed_0, {%mma_h0, %mma_h1};
     // PV MMA: bq=32 hd=32 tpw_pv=1 slot=0
     add.u64 %tb1_phase_b_smem_v, %shmem_base, 6144; // V tile @ slot=0 offset
     .reg .u32 %tb1_phase_b_smem_v_u32;

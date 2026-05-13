@@ -300,17 +300,98 @@ fn emit_online_softmax(ptx: &mut String, config: &FlashAttentionConfig, kv_iter:
                 t, t, t
             ));
         }
-        // B1.6 TODO (full pipeline): subtract row_max, ex2.approx.f32,
-        // row_sum reduction (same bfly pattern as above), divide. Then
-        // %p_packed_<t> gets the real f16-packed P values. For now the
-        // mov-placeholder keeps the snapshot structure stable.
+        // ----- subtract row_max + exp ----- (B1.6 deferral #6 cont'd)
+        //
+        // Spec section 4.2: P = exp(S - row_max). PTX has no native exp,
+        // so we use the identity exp(x) = 2^(x * log2(e)) with the fast
+        // `ex2.approx.f32` instruction. The log2(e) constant is folded
+        // into the subtract: (S - row_max) * log2(e) → ex2.approx.f32.
+        //
+        // log2(e) = 1.4426950408889634 (IEEE-754 single = 0f3FB8AA3B).
         ptx.push_str(&format!(
-            "    // B1.6 TODO: subtract %s_max, exp, sum-reduce, divide -> %p_packed_{}\n",
+            "    // subtract row_max, scale by log2(e), apply ex2.approx (deferral #6)\n",
+        ));
+        // frag indices 0,1 belong to row_lo (subtract %s_max_<t>_lo);
+        // frag indices 2,3 belong to row_lo+8 (subtract %s_max_<t>_hi).
+        for (lane, max_var) in [(0u32, "lo"), (1u32, "lo"), (2u32, "hi"), (3u32, "hi")].iter() {
+            ptx.push_str(&format!(
+                "    sub.f32 %s_acc_{}_{}, %s_acc_{}_{}, %s_max_{}_{};\n",
+                t, lane, t, lane, t, max_var
+            ));
+            ptx.push_str(&format!(
+                "    mul.f32 %s_acc_{}_{}, %s_acc_{}_{}, 0f3FB8AA3B; // * log2(e)\n",
+                t, lane, t, lane
+            ));
+            ptx.push_str(&format!(
+                "    ex2.approx.f32 %s_acc_{}_{}, %s_acc_{}_{};\n",
+                t, lane, t, lane
+            ));
+        }
+
+        // ----- row_sum bfly tree ----- (deferral #6 cont'd)
+        //
+        // After exp, the lane's 4 fragment slots hold P values for
+        // (row_lo, cols col_pair*2..col_pair*2+1) and
+        // (row_lo+8, cols col_pair*2..col_pair*2+1). row_sum across 8
+        // cols of one row requires the same 4-lane bfly tree as row_max.
+        ptx.push_str(&format!(
+            "    .reg .f32 %s_sum_{}_lo, %s_sum_{}_hi;\n",
+            t, t
+        ));
+        ptx.push_str(&format!(
+            "    add.f32 %s_sum_{}_lo, %s_acc_{}_0, %s_acc_{}_1;\n",
+            t, t, t
+        ));
+        ptx.push_str(&format!(
+            "    add.f32 %s_sum_{}_hi, %s_acc_{}_2, %s_acc_{}_3;\n",
+            t, t, t
+        ));
+        for (mask, comment) in [(1u32, "lane k <-> k^1"), (2u32, "lane k <-> k^2")].iter() {
+            ptx.push_str(&format!(
+                "    shfl.sync.bfly.b32 %s_shfl_{}_tmp, %s_sum_{}_lo, {}, 0x1f, 0xffffffff; // {}\n",
+                t, t, mask, comment
+            ));
+            ptx.push_str(&format!(
+                "    add.f32 %s_sum_{}_lo, %s_sum_{}_lo, %s_shfl_{}_tmp;\n",
+                t, t, t
+            ));
+            ptx.push_str(&format!(
+                "    shfl.sync.bfly.b32 %s_shfl_{}_tmp, %s_sum_{}_hi, {}, 0x1f, 0xffffffff; // {}\n",
+                t, t, mask, comment
+            ));
+            ptx.push_str(&format!(
+                "    add.f32 %s_sum_{}_hi, %s_sum_{}_hi, %s_shfl_{}_tmp;\n",
+                t, t, t
+            ));
+        }
+
+        // ----- divide by row_sum ----- (deferral #6 cont'd)
+        //
+        // P_ij = exp(S_ij - row_max_i) / row_sum_i.
+        for (lane, sum_var) in [(0u32, "lo"), (1u32, "lo"), (2u32, "hi"), (3u32, "hi")].iter() {
+            ptx.push_str(&format!(
+                "    div.approx.f32 %s_acc_{}_{}, %s_acc_{}_{}, %s_sum_{}_{};\n",
+                t, lane, t, lane, t, sum_var
+            ));
+        }
+
+        // ----- pack 2 f32 P values into one b32 holding 2 f16 lanes -----
+        //
+        // Frag indices 0,1 hold cols col_pair*2 and col_pair*2+1 of
+        // row_lo (post-divide). The PV MMA's A-fragment expects f16 col
+        // pairs packed into b32 registers. Convert each f32 -> f16 then
+        // pack two f16 into one b32 via the PTX mov.b32 {h0,h1} syntax.
+        ptx.push_str(&format!(
+            "    cvt.rn.f16.f32 %mma_h0, %s_acc_{}_0;\n",
             t
         ));
         ptx.push_str(&format!(
-            "    mov.b32 %p_packed_{}, %s_acc_{}_0;\n",
-            t, t
+            "    cvt.rn.f16.f32 %mma_h1, %s_acc_{}_1;\n",
+            t
+        ));
+        ptx.push_str(&format!(
+            "    mov.b32 %p_packed_{}, {{%mma_h0, %mma_h1}};\n",
+            t
         ));
     }
 }
@@ -491,11 +572,19 @@ mod tests {
     fn phase_b_qkt_scale_count_equals_tpw_times_four() {
         // B1.6 deferral #5: 1/sqrt(head_dim) scale per S-accumulator lane
         // emitted after the MMA loop. Count must equal tpw_qkt * 4 lanes.
+        // Match on the QK^T-specific hex literal (different from the
+        // log2(e) scale that the softmax pipeline also emits, per #6).
         let cfg = make_config(32, 32, 32, 2048);
         let mut ptx = String::new();
         emit_phase_b_attention(&mut ptx, &cfg, 0, 0);
         let tpw = tiles_per_warp_qkt(&cfg);
-        let scale_count = ptx.matches("mul.f32 %s_acc_").count();
+        let qkt_scale_bits = (1.0_f32 / 32.0_f32.sqrt()).to_bits();
+        let qkt_scale_marker = format!("0f{:08X}", qkt_scale_bits);
+        // Match `mul.f32 ..., 0f<bits>` to exclude the diagnostic comment
+        // header that also prints the hex literal.
+        let scale_count = ptx
+            .matches(&format!(", {};", qkt_scale_marker)[..])
+            .count();
         assert_eq!(
             scale_count,
             (tpw * 4) as usize,
