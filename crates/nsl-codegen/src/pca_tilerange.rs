@@ -24,6 +24,50 @@
 use crate::flash_attention::FlashAttentionConfig;
 use crate::pca_segment::SegmentResidency;
 
+/// Four sub-table offsets inside the Tier B range-table region.
+/// Spec §3.4.3.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RangeTableAddrs {
+    pub qtile_min:  u32,
+    pub qtile_max:  u32,
+    pub kvtile_min: u32,
+    pub kvtile_max: u32,
+}
+
+/// Compute the four sub-table offsets given the range-table base and
+/// tile counts. `base` is assumed 2-byte aligned per
+/// `tier_b_range_table_offset`'s `align_up(2)` guarantee.
+///
+/// Layout:
+/// ```text
+///   base + 0                       : qtile_min  [num_q_tiles  × u16]
+///   base + num_q_tiles × 2         : qtile_max  [num_q_tiles  × u16]
+///   base + 2 × num_q_tiles × 2     : kvtile_min [num_kv_tiles × u16]
+///   base + (2*num_q + num_kv) × 2  : kvtile_max [num_kv_tiles × u16]
+/// ```
+pub fn range_table_addrs(base: u32, num_q_tiles: u32, num_kv_tiles: u32) -> RangeTableAddrs {
+    let q_bytes  = num_q_tiles  * 2;
+    let kv_bytes = num_kv_tiles * 2;
+    RangeTableAddrs {
+        qtile_min:  base,
+        qtile_max:  base + q_bytes,
+        kvtile_min: base + 2 * q_bytes,
+        kvtile_max: base + 2 * q_bytes + kv_bytes,
+    }
+}
+
+/// Total bytes consumed by the Tier B range table at the given config
+/// + seq_len. Used by `shared_mem_bytes_v2{_backward}_with_seqlen` to
+/// widen the dynamic-SMEM launch parameter when Tier B is admitted.
+pub fn tier_b_range_table_bytes(
+    config: &crate::flash_attention::FlashAttentionConfig,
+    seq_len: u32,
+) -> u32 {
+    let num_q  = crate::pca_tile_config::num_tiles(seq_len, config.block_q as u32);
+    let num_kv = crate::pca_tile_config::num_tiles(seq_len, config.block_kv as u32);
+    2 * (num_q + num_kv) * 2
+}
+
 /// Compute the SMEM bytes the range table consumes for a given
 /// (block_q, block_kv, seq_len) configuration.
 ///

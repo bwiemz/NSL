@@ -527,6 +527,39 @@ pub fn shared_mem_bytes_v2_backward(config: &FlashAttentionConfig) -> u32 {
     phases::backward::prelude::backward_total_bytes(config) + seg_overhead
 }
 
+/// SMEM byte count for a v2 forward kernel including Tier B contribution.
+///
+/// Called from launch sites that have access to `seq_len` and the Tier A
+/// residency decision. No-op guarantee: when Tier B is not emitted, returns
+/// exactly `shared_mem_bytes_v2(config)` — pre-Tier-B SMEM layout preserved
+/// byte-identically for non-Tier-B configs (spec §3.4.6).
+pub fn shared_mem_bytes_v2_with_seqlen(
+    config: &FlashAttentionConfig,
+    seq_len: u32,
+    residency: crate::pca_segment::SegmentResidency,
+) -> u32 {
+    let tier_b_bytes = if crate::pca_tilerange::should_emit_tier_b(config, seq_len as u64, residency) {
+        crate::pca_tilerange::tier_b_range_table_bytes(config, seq_len)
+    } else {
+        0
+    };
+    shared_mem_bytes_v2(config) + tier_b_bytes
+}
+
+/// Backward equivalent of `shared_mem_bytes_v2_with_seqlen`.
+pub fn shared_mem_bytes_v2_backward_with_seqlen(
+    config: &FlashAttentionConfig,
+    seq_len: u32,
+    residency: crate::pca_segment::SegmentResidency,
+) -> u32 {
+    let tier_b_bytes = if crate::pca_tilerange::should_emit_tier_b(config, seq_len as u64, residency) {
+        crate::pca_tilerange::tier_b_range_table_bytes(config, seq_len)
+    } else {
+        0
+    };
+    shared_mem_bytes_v2_backward(config) + tier_b_bytes
+}
+
 /// Tier C backward orchestrator — emits the full backward PTX kernel by
 /// wiring every Phase 3 emitter in the correct execution order.
 ///
