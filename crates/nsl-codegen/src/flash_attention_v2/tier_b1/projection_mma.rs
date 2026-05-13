@@ -46,7 +46,9 @@ use crate::flash_attention_v2::smem_layout::{
     tier_b1_k_offset_ping, tier_b1_k_offset_pong, tier_b1_q_offset, tier_b1_v_offset_ping,
     tier_b1_v_offset_pong, tier_b1_w_chunk_offset,
 };
-use crate::matmul_mma::{emit_load_a_fragment_smem, emit_load_b_fragment_smem, emit_mma_instruction_predicated};
+use crate::matmul_mma::{
+    emit_load_a_fragment_smem, emit_load_b_fragment_smem, emit_mma_instruction_predicated,
+};
 
 /// Number of (m16, n8) MMA tiles each of the 8 warps owns for the Q
 /// projection output (bq × hd). Always at least 1 — small configs
@@ -502,6 +504,9 @@ pub fn emit_kv_projection_chunk_loop(
     ptx.push_str(
         "    .reg .u64 %tb1_kv_smem_wk, %tb1_kv_smem_wv, %tb1_kv_smem_x;\n",
     );
+    // u32 sister registers for matmul_mma::emit_load_*_fragment_smem
+    // (B1.6 deferral #1) — the helpers use 32-bit SMEM addressing.
+    ptx.push_str("    .reg .u32 %tb1_kv_smem_wk_u32, %tb1_kv_smem_wv_u32, %tb1_kv_smem_x_u32;\n");
     ptx.push_str("    .reg .u64 %tb1_kv_smem_k, %tb1_kv_smem_v;\n");
     ptx.push_str("    .reg .u64 %tb1_kv_scatter_addr;\n");
     ptx.push_str("    .reg .b16 %tb1_kv_h0;\n");
@@ -531,9 +536,13 @@ pub fn emit_kv_projection_chunk_loop(
         wv_chunk_off
     ));
     ptx.push_str(&format!(
-        "    add.u64 %tb1_kv_smem_x, %shmem_base, {}; // x_kv chunk slot\n",
+        "    add.u64 %tb1_kv_smem_x, %shmem_base, {}; // x_kv chunk slot (will be narrowed to u32 below)\n",
         x_kv_off
     ));
+    // Narrow SMEM bases to u32 for the matmul_mma fragment-load helpers.
+    ptx.push_str("    cvt.u32.u64 %tb1_kv_smem_wk_u32, %tb1_kv_smem_wk;\n");
+    ptx.push_str("    cvt.u32.u64 %tb1_kv_smem_wv_u32, %tb1_kv_smem_wv;\n");
+    ptx.push_str("    cvt.u32.u64 %tb1_kv_smem_x_u32, %tb1_kv_smem_x;\n");
     ptx.push_str(&format!(
         "    add.u64 %tb1_kv_smem_k, %shmem_base, {}; // K output tile (slot={})\n",
         k_out_off, slot
@@ -644,42 +653,49 @@ pub fn emit_kv_projection_chunk_loop(
                 chunk_idx, t, chunk_idx, t
             ));
 
-            // Load A-fragment from x_kv SMEM (uniform address placeholder).
-            // B1.6 TODO (deferral #1): replace with matmul_mma::
-            // emit_load_a_fragment_smem(...) — that helper already does the
-            // CUTLASS-style per-(warp, lane, K-step) row*stride+base+offset
-            // arithmetic. Current uniform [%tb1_kv_smem_x] load is correct
-            // PTX syntax (ptxas accepts) but every lane reads the same 4
-            // bytes; numerics will only become correct after the swap.
-            // See matching marker in emit_q_projection (B1.4 deferral #1).
-            for i in 0..4 {
-                ptx.push_str(&format!(
-                    "    ld.shared.b32 %tb1_kv_a_{}_{}_{}, [%tb1_kv_smem_x];\n",
-                    chunk_idx, t, i
-                ));
-            }
+            // B1.6 deferral #1 resolution: A/B-fragment loads now use
+            // matmul_mma helpers with per-(warp, lane) addressing.
+            //
+            // A-fragment: x_kv rows from SMEM at %tb1_kv_smem_x_u32. Row
+            // stride is chunk * 2 bytes (x_kv chunk slab is bkv rows x
+            // chunk cols, f16). Shared between K and V MMAs.
+            let a_fragment_regs = [
+                format!("tb1_kv_a_{}_{}_0", chunk_idx, t),
+                format!("tb1_kv_a_{}_{}_1", chunk_idx, t),
+                format!("tb1_kv_a_{}_{}_2", chunk_idx, t),
+                format!("tb1_kv_a_{}_{}_3", chunk_idx, t),
+            ];
+            emit_load_a_fragment_smem(
+                ptx,
+                &a_fragment_regs,
+                "%tb1_kv_smem_x_u32",
+                (chunk * 2) as usize,
+            );
 
-            // Load K B-fragment from Wk SMEM (uniform address placeholder).
-            // B1.6 TODO (deferral #1): replace with matmul_mma::
-            // emit_load_b_fragment_smem(...) for per-lane B-fragment addressing.
-            // See matching marker in emit_q_projection (B1.4 deferral #1).
-            for i in 0..2 {
-                ptx.push_str(&format!(
-                    "    ld.shared.b32 %tb1_kv_bk_{}_{}_{}, [%tb1_kv_smem_wk];\n",
-                    chunk_idx, t, i
-                ));
-            }
+            // K B-fragment: Wk rows from SMEM at %tb1_kv_smem_wk_u32. Row
+            // stride is hd * 2 bytes (Wk chunk slab is chunk rows x hd cols).
+            let bk_fragment_regs = [
+                format!("tb1_kv_bk_{}_{}_0", chunk_idx, t),
+                format!("tb1_kv_bk_{}_{}_1", chunk_idx, t),
+            ];
+            emit_load_b_fragment_smem(
+                ptx,
+                &bk_fragment_regs,
+                "%tb1_kv_smem_wk_u32",
+                (hd * 2) as usize,
+            );
 
-            // Load V B-fragment from Wv SMEM (uniform address placeholder).
-            // B1.6 TODO (deferral #1): replace with matmul_mma::
-            // emit_load_b_fragment_smem(...) for per-lane B-fragment addressing.
-            // See matching marker in emit_q_projection (B1.4 deferral #1).
-            for i in 0..2 {
-                ptx.push_str(&format!(
-                    "    ld.shared.b32 %tb1_kv_bv_{}_{}_{}, [%tb1_kv_smem_wv];\n",
-                    chunk_idx, t, i
-                ));
-            }
+            // V B-fragment: Wv rows from SMEM at %tb1_kv_smem_wv_u32.
+            let bv_fragment_regs = [
+                format!("tb1_kv_bv_{}_{}_0", chunk_idx, t),
+                format!("tb1_kv_bv_{}_{}_1", chunk_idx, t),
+            ];
+            emit_load_b_fragment_smem(
+                ptx,
+                &bv_fragment_regs,
+                "%tb1_kv_smem_wv_u32",
+                (hd * 2) as usize,
+            );
 
             // --- MMA (a): K accumulation ---
             let k_d_regs = [
