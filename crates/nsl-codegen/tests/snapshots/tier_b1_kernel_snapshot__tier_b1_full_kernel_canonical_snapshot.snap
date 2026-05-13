@@ -3,7 +3,7 @@ source: crates/nsl-codegen/tests/tier_b1_kernel_snapshot.rs
 expression: ptx_str.into_owned()
 ---
 .version 8.7
-.target sm_75
+.target sm_80
 .address_size 64
 
 .visible .entry flash_attn_p0_r0_hs_g1_c1_t0_q32_kv32_cshaL2_n0_p0_o0_h0_v2 (
