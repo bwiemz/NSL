@@ -50,6 +50,166 @@ use crate::matmul_mma::{
     emit_load_a_fragment_smem, emit_load_b_fragment_smem, emit_mma_instruction_predicated,
 };
 
+/// Emit a D-fragment-aware scatter from per-warp m16n8k16 accumulators
+/// (`%<acc_prefix>_<t>_<lane>`) to a row-major SMEM tile
+/// `[m_dim_block × head_dim]` f16. Each thread writes the 4 f16 values
+/// it holds per tile per the standard m16n8k16 D-fragment lane mapping
+/// (spec §5.5):
+///   D0 = (row=lo_row,     col=lo_col_base    ) → +0 bytes
+///   D1 = (row=lo_row,     col=lo_col_base + 1) → +2 bytes
+///   D2 = (row=lo_row + 8, col=lo_col_base    ) → +8*head_dim*2 bytes
+///   D3 = (row=lo_row + 8, col=lo_col_base + 1) → +8*head_dim*2 + 2 bytes
+///
+/// Where `lo_row = laneid / 4` and `lo_col_base = (laneid % 4) * 2`.
+///
+/// Per-tile warp gating: tile t fires only when `%warp_id == (t % 8)`,
+/// matching the upstream MMA's ownership pattern.
+///
+/// `prefix` is the namespace for this call's scratch registers — caller
+/// MUST use a unique value per call site on the same ptx string (e.g.
+/// "qsc", "ksc", "vsc") or ptxas rejects with duplicate-declaration.
+///
+/// `acc_prefix` is the accumulator register prefix (e.g. "q_acc",
+/// "k_acc", "v_acc"). The accumulator is read as `%<acc_prefix>_<t>_<i>`.
+///
+/// `smem_u64_base` is the u64 SMEM base register expression — converted
+/// inside this helper to a u32 sister via `cvt.u32.u64`.
+///
+/// `n_tiles_d = head_dim / 8` is the count of n-tiles per m-row.
+fn emit_dfragment_scatter(
+    ptx: &mut String,
+    prefix: &str,
+    acc_prefix: &str,
+    smem_u64_base: &str,
+    head_dim: u32,
+    tpw: u32,
+) {
+    let n_tiles_d = (head_dim / 8).max(1);
+
+    ptx.push_str(&format!(
+        "    // === {} D-fragment scatter ({} tiles, head_dim={}) ===\n",
+        prefix, tpw, head_dim
+    ));
+
+    ptx.push_str(&format!(
+        "    .reg .u32 %{}_laneid, %{}_lo_row, %{}_lo_col_base;\n",
+        prefix, prefix, prefix
+    ));
+    ptx.push_str(&format!(
+        "    .reg .u32 %{}_row_off, %{}_col_off, %{}_lane_off;\n",
+        prefix, prefix, prefix
+    ));
+    ptx.push_str(&format!(
+        "    .reg .u32 %{}_base_u32, %{}_tile_u32, %{}_addr_u32, %{}_addr_i;\n",
+        prefix, prefix, prefix, prefix
+    ));
+    ptx.push_str(&format!("    .reg .b16 %{}_h;\n", prefix));
+    ptx.push_str(&format!("    .reg .pred %{}_warp_pred;\n", prefix));
+
+    // Per-lane (lo_row, lo_col_base, lane_off) computed once.
+    ptx.push_str(&format!("    mov.u32 %{}_laneid, %tid.x;\n", prefix));
+    ptx.push_str(&format!(
+        "    and.b32 %{}_laneid, %{}_laneid, 31;\n",
+        prefix, prefix
+    ));
+    ptx.push_str(&format!(
+        "    shr.u32 %{}_lo_row, %{}_laneid, 2;       // l/4\n",
+        prefix, prefix
+    ));
+    ptx.push_str(&format!(
+        "    and.b32 %{}_lo_col_base, %{}_laneid, 3;  // l%4\n",
+        prefix, prefix
+    ));
+    ptx.push_str(&format!(
+        "    shl.b32 %{}_lo_col_base, %{}_lo_col_base, 1; // (l%4)*2 = col base\n",
+        prefix, prefix
+    ));
+    ptx.push_str(&format!(
+        "    mul.lo.u32 %{}_row_off, %{}_lo_row, {};  // row * head_dim*2\n",
+        prefix,
+        prefix,
+        head_dim * 2
+    ));
+    ptx.push_str(&format!(
+        "    shl.b32 %{}_col_off, %{}_lo_col_base, 1;     // col * 2 bytes (f16)\n",
+        prefix, prefix
+    ));
+    ptx.push_str(&format!(
+        "    add.u32 %{}_lane_off, %{}_row_off, %{}_col_off;\n",
+        prefix, prefix, prefix
+    ));
+
+    // u32 sister for the SMEM base.
+    ptx.push_str(&format!(
+        "    cvt.u32.u64 %{}_base_u32, {};\n",
+        prefix, smem_u64_base
+    ));
+
+    for t in 0..tpw {
+        let m_tile = t / n_tiles_d;
+        let n_tile = t % n_tiles_d;
+        let tile_off_bytes = m_tile * 16 * head_dim * 2 + n_tile * 8 * 2;
+
+        ptx.push_str(&format!(
+            "    // {} tile t={} (m_tile={}, n_tile={}, warp owner = {})\n",
+            prefix,
+            t,
+            m_tile,
+            n_tile,
+            t % 8
+        ));
+        ptx.push_str(&format!(
+            "    setp.eq.u32 %{}_warp_pred, %warp_id, {};\n",
+            prefix,
+            t % 8
+        ));
+        if tile_off_bytes > 0 {
+            ptx.push_str(&format!(
+                "    add.u32 %{}_tile_u32, %{}_base_u32, {};\n",
+                prefix, prefix, tile_off_bytes
+            ));
+        } else {
+            ptx.push_str(&format!(
+                "    mov.u32 %{}_tile_u32, %{}_base_u32;\n",
+                prefix, prefix
+            ));
+        }
+        ptx.push_str(&format!(
+            "    add.u32 %{}_addr_u32, %{}_tile_u32, %{}_lane_off;\n",
+            prefix, prefix, prefix
+        ));
+
+        for i in 0..4u32 {
+            let off_bytes: u32 = match i {
+                0 => 0,
+                1 => 2,
+                2 => 8 * head_dim * 2,
+                3 => 8 * head_dim * 2 + 2,
+                _ => unreachable!(),
+            };
+            if off_bytes > 0 {
+                ptx.push_str(&format!(
+                    "    add.u32 %{}_addr_i, %{}_addr_u32, {};\n",
+                    prefix, prefix, off_bytes
+                ));
+            } else {
+                ptx.push_str(&format!(
+                    "    mov.u32 %{}_addr_i, %{}_addr_u32;\n",
+                    prefix, prefix
+                ));
+            }
+            ptx.push_str(&format!(
+                "    cvt.rn.f16.f32 %{}_h, %{}_{}_{};\n",
+                prefix, acc_prefix, t, i
+            ));
+            ptx.push_str(&format!(
+                "    @%{}_warp_pred st.shared.b16 [%{}_addr_i], %{}_h;\n",
+                prefix, prefix, prefix
+            ));
+        }
+    }
+}
+
 /// Number of (m16, n8) MMA tiles each of the 8 warps owns for the Q
 /// projection output (bq × hd). Always at least 1 — small configs
 /// (e.g. bq=32, hd=32 → 8 tiles total → 1 per warp) bottom out here.
@@ -369,35 +529,15 @@ pub fn emit_q_projection(ptx: &mut String, config: &FlashAttentionConfig, chunk:
         }
     }
 
-    // ----- 4. Pack f32 -> f16 and scatter to Q SMEM tile -----
+    // ----- 4. Pack f32 -> f16 and scatter Q accumulators to SMEM tile -----
     //
-    // Per spec §5.5 lane-coherent scatter: each thread holds 4 f32
-    // accumulator lanes per tile, which pack into 2 b32 regs (each
-    // holding 2 f16 lanes). For B1.3 the scatter uses one
-    // `st.shared.b32` per packed register; real CUTLASS-style
-    // lane→fragment offset arithmetic lands in B1.5.
-    ptx.push_str("    // Pack f32 -> f16 + scatter Q accumulators to SMEM at tier_b1_q_offset\n");
-    for t in 0..tpw {
-        // Pack pairs (lane 0,1) and (lane 2,3) via cvt + bfi pattern.
-        // Tier A's projection emitter uses a per-lane cvt.rn.f16.f32 +
-        // st.shared.b16 — we mirror that here for instruction-level
-        // continuity with Tier A's snapshots.
-        for lane in 0..4 {
-            ptx.push_str(&format!(
-                "    cvt.rn.f16.f32 %tb1_q_h0, %q_acc_{}_{};\n",
-                t, lane
-            ));
-            ptx.push_str(&format!(
-                "    add.u64 %tb1_q_scatter_addr, %tb1_q_smem_q, {}; // tile={} lane={} byte off\n",
-                t * 8 + lane * 2,
-                t,
-                lane
-            ));
-            ptx.push_str(
-                "    st.shared.b16 [%tb1_q_scatter_addr], %tb1_q_h0;\n",
-            );
-        }
-    }
+    // Per spec §5.5: each thread holds 4 f32 accumulator lanes per tile
+    // in the m16n8k16 D-fragment layout, scattered to a row-major
+    // [bq × head_dim] f16 tile at `tier_b1_q_offset`. The previous
+    // flat-address placeholder (`t*8 + lane*2`) had all 32 lanes writing
+    // the same address — replaced by `emit_dfragment_scatter` which uses
+    // proper D-fragment lane mapping + per-tile warp gating.
+    emit_dfragment_scatter(ptx, "qsc", "q_acc", "%tb1_q_smem_q", hd, tpw);
     ptx.push_str("    bar.sync 0; // FENCE: Q tile visible before downstream phases\n");
 
     // ----- 5. Null-guard skip label -----
@@ -788,47 +928,15 @@ pub fn emit_kv_projection_chunk_loop(
         }
     }
 
-    // ----- 4. Pack f32 -> f16 and scatter K accumulators to K SMEM tile -----
+    // ----- 4. Pack f32 -> f16 and scatter K + V accumulators to SMEM -----
     //
-    // Per spec §5.5 lane-coherent scatter: each thread holds 4 f32
-    // accumulator lanes per tile, packed and stored as f16 in SMEM.
-    // B1.5 uses one `st.shared.b16` per lane, mirroring Q-projection's
-    // scatter pattern. Real CUTLASS-style lane->fragment offset arithmetic
-    // lands in B1.6.
-    ptx.push_str("    // Pack f32 -> f16 + scatter K accumulators to SMEM at K tile offset\n");
-    for t in 0..tpw {
-        for lane in 0..4 {
-            ptx.push_str(&format!(
-                "    cvt.rn.f16.f32 %tb1_kv_h0, %k_acc_{}_{};\n",
-                t, lane
-            ));
-            ptx.push_str(&format!(
-                "    add.u64 %tb1_kv_scatter_addr, %tb1_kv_smem_k, {}; // tile={} lane={} byte off\n",
-                t * 8 + lane * 2,
-                t,
-                lane
-            ));
-            ptx.push_str("    st.shared.b16 [%tb1_kv_scatter_addr], %tb1_kv_h0;\n");
-        }
-    }
-
-    // ----- 4b. Pack f32 -> f16 and scatter V accumulators to V SMEM tile -----
-    ptx.push_str("    // Pack f32 -> f16 + scatter V accumulators to SMEM at V tile offset\n");
-    for t in 0..tpw {
-        for lane in 0..4 {
-            ptx.push_str(&format!(
-                "    cvt.rn.f16.f32 %tb1_kv_h0, %v_acc_{}_{};\n",
-                t, lane
-            ));
-            ptx.push_str(&format!(
-                "    add.u64 %tb1_kv_scatter_addr, %tb1_kv_smem_v, {}; // tile={} lane={} byte off\n",
-                t * 8 + lane * 2,
-                t,
-                lane
-            ));
-            ptx.push_str("    st.shared.b16 [%tb1_kv_scatter_addr], %tb1_kv_h0;\n");
-        }
-    }
+    // K written to tier_b1_k_offset_<slot>, V to tier_b1_v_offset_<slot>.
+    // Both share the same [bkv × head_dim] f16 row-major layout, scattered
+    // via `emit_dfragment_scatter` (D-fragment lane mapping + per-tile
+    // warp gate). Replaces the prior flat-address placeholder where all
+    // 32 lanes wrote the same byte offset.
+    emit_dfragment_scatter(ptx, "ksc", "k_acc", "%tb1_kv_smem_k", hd, tpw);
+    emit_dfragment_scatter(ptx, "vsc", "v_acc", "%tb1_kv_smem_v", hd, tpw);
     ptx.push_str("    bar.sync 0; // FENCE: K+V tiles visible before downstream phases\n");
 
     // ----- 5. Null-guard skip label -----

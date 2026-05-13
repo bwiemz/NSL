@@ -1499,19 +1499,37 @@ V2_CSHA_PROLOGUE_SKIP_7:
         {%tb1_q_a_15_0_0, %tb1_q_a_15_0_1, %tb1_q_a_15_0_2, %tb1_q_a_15_0_3},
         {%tb1_q_b_15_0_0, %tb1_q_b_15_0_1},
         {%q_acc_0_0, %q_acc_0_1, %q_acc_0_2, %q_acc_0_3};
-    // Pack f32 -> f16 + scatter Q accumulators to SMEM at tier_b1_q_offset
-    cvt.rn.f16.f32 %tb1_q_h0, %q_acc_0_0;
-    add.u64 %tb1_q_scatter_addr, %tb1_q_smem_q, 0; // tile=0 lane=0 byte off
-    st.shared.b16 [%tb1_q_scatter_addr], %tb1_q_h0;
-    cvt.rn.f16.f32 %tb1_q_h0, %q_acc_0_1;
-    add.u64 %tb1_q_scatter_addr, %tb1_q_smem_q, 2; // tile=0 lane=1 byte off
-    st.shared.b16 [%tb1_q_scatter_addr], %tb1_q_h0;
-    cvt.rn.f16.f32 %tb1_q_h0, %q_acc_0_2;
-    add.u64 %tb1_q_scatter_addr, %tb1_q_smem_q, 4; // tile=0 lane=2 byte off
-    st.shared.b16 [%tb1_q_scatter_addr], %tb1_q_h0;
-    cvt.rn.f16.f32 %tb1_q_h0, %q_acc_0_3;
-    add.u64 %tb1_q_scatter_addr, %tb1_q_smem_q, 6; // tile=0 lane=3 byte off
-    st.shared.b16 [%tb1_q_scatter_addr], %tb1_q_h0;
+    // === qsc D-fragment scatter (1 tiles, head_dim=32) ===
+    .reg .u32 %qsc_laneid, %qsc_lo_row, %qsc_lo_col_base;
+    .reg .u32 %qsc_row_off, %qsc_col_off, %qsc_lane_off;
+    .reg .u32 %qsc_base_u32, %qsc_tile_u32, %qsc_addr_u32, %qsc_addr_i;
+    .reg .b16 %qsc_h;
+    .reg .pred %qsc_warp_pred;
+    mov.u32 %qsc_laneid, %tid.x;
+    and.b32 %qsc_laneid, %qsc_laneid, 31;
+    shr.u32 %qsc_lo_row, %qsc_laneid, 2;       // l/4
+    and.b32 %qsc_lo_col_base, %qsc_laneid, 3;  // l%4
+    shl.b32 %qsc_lo_col_base, %qsc_lo_col_base, 1; // (l%4)*2 = col base
+    mul.lo.u32 %qsc_row_off, %qsc_lo_row, 64;  // row * head_dim*2
+    shl.b32 %qsc_col_off, %qsc_lo_col_base, 1;     // col * 2 bytes (f16)
+    add.u32 %qsc_lane_off, %qsc_row_off, %qsc_col_off;
+    cvt.u32.u64 %qsc_base_u32, %tb1_q_smem_q;
+    // qsc tile t=0 (m_tile=0, n_tile=0, warp owner = 0)
+    setp.eq.u32 %qsc_warp_pred, %warp_id, 0;
+    mov.u32 %qsc_tile_u32, %qsc_base_u32;
+    add.u32 %qsc_addr_u32, %qsc_tile_u32, %qsc_lane_off;
+    mov.u32 %qsc_addr_i, %qsc_addr_u32;
+    cvt.rn.f16.f32 %qsc_h, %q_acc_0_0;
+    @%qsc_warp_pred st.shared.b16 [%qsc_addr_i], %qsc_h;
+    add.u32 %qsc_addr_i, %qsc_addr_u32, 2;
+    cvt.rn.f16.f32 %qsc_h, %q_acc_0_1;
+    @%qsc_warp_pred st.shared.b16 [%qsc_addr_i], %qsc_h;
+    add.u32 %qsc_addr_i, %qsc_addr_u32, 512;
+    cvt.rn.f16.f32 %qsc_h, %q_acc_0_2;
+    @%qsc_warp_pred st.shared.b16 [%qsc_addr_i], %qsc_h;
+    add.u32 %qsc_addr_i, %qsc_addr_u32, 514;
+    cvt.rn.f16.f32 %qsc_h, %q_acc_0_3;
+    @%qsc_warp_pred st.shared.b16 [%qsc_addr_i], %qsc_h;
     bar.sync 0; // FENCE: Q tile visible before downstream phases
 V2_TIER_B1_Q_PROJ_SKIP:
     // Tier B.1 outer prologue: prime slot[0] + slot[1] x_kv loads
@@ -2693,32 +2711,68 @@ V2_TIER_B1_Q_PROJ_SKIP:
         {%tb1_kv_a_15_0_0, %tb1_kv_a_15_0_1, %tb1_kv_a_15_0_2, %tb1_kv_a_15_0_3},
         {%tb1_kv_bv_15_0_0, %tb1_kv_bv_15_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
-    // Pack f32 -> f16 + scatter K accumulators to SMEM at K tile offset
-    cvt.rn.f16.f32 %tb1_kv_h0, %k_acc_0_0;
-    add.u64 %tb1_kv_scatter_addr, %tb1_kv_smem_k, 0; // tile=0 lane=0 byte off
-    st.shared.b16 [%tb1_kv_scatter_addr], %tb1_kv_h0;
-    cvt.rn.f16.f32 %tb1_kv_h0, %k_acc_0_1;
-    add.u64 %tb1_kv_scatter_addr, %tb1_kv_smem_k, 2; // tile=0 lane=1 byte off
-    st.shared.b16 [%tb1_kv_scatter_addr], %tb1_kv_h0;
-    cvt.rn.f16.f32 %tb1_kv_h0, %k_acc_0_2;
-    add.u64 %tb1_kv_scatter_addr, %tb1_kv_smem_k, 4; // tile=0 lane=2 byte off
-    st.shared.b16 [%tb1_kv_scatter_addr], %tb1_kv_h0;
-    cvt.rn.f16.f32 %tb1_kv_h0, %k_acc_0_3;
-    add.u64 %tb1_kv_scatter_addr, %tb1_kv_smem_k, 6; // tile=0 lane=3 byte off
-    st.shared.b16 [%tb1_kv_scatter_addr], %tb1_kv_h0;
-    // Pack f32 -> f16 + scatter V accumulators to SMEM at V tile offset
-    cvt.rn.f16.f32 %tb1_kv_h0, %v_acc_0_0;
-    add.u64 %tb1_kv_scatter_addr, %tb1_kv_smem_v, 0; // tile=0 lane=0 byte off
-    st.shared.b16 [%tb1_kv_scatter_addr], %tb1_kv_h0;
-    cvt.rn.f16.f32 %tb1_kv_h0, %v_acc_0_1;
-    add.u64 %tb1_kv_scatter_addr, %tb1_kv_smem_v, 2; // tile=0 lane=1 byte off
-    st.shared.b16 [%tb1_kv_scatter_addr], %tb1_kv_h0;
-    cvt.rn.f16.f32 %tb1_kv_h0, %v_acc_0_2;
-    add.u64 %tb1_kv_scatter_addr, %tb1_kv_smem_v, 4; // tile=0 lane=2 byte off
-    st.shared.b16 [%tb1_kv_scatter_addr], %tb1_kv_h0;
-    cvt.rn.f16.f32 %tb1_kv_h0, %v_acc_0_3;
-    add.u64 %tb1_kv_scatter_addr, %tb1_kv_smem_v, 6; // tile=0 lane=3 byte off
-    st.shared.b16 [%tb1_kv_scatter_addr], %tb1_kv_h0;
+    // === ksc D-fragment scatter (1 tiles, head_dim=32) ===
+    .reg .u32 %ksc_laneid, %ksc_lo_row, %ksc_lo_col_base;
+    .reg .u32 %ksc_row_off, %ksc_col_off, %ksc_lane_off;
+    .reg .u32 %ksc_base_u32, %ksc_tile_u32, %ksc_addr_u32, %ksc_addr_i;
+    .reg .b16 %ksc_h;
+    .reg .pred %ksc_warp_pred;
+    mov.u32 %ksc_laneid, %tid.x;
+    and.b32 %ksc_laneid, %ksc_laneid, 31;
+    shr.u32 %ksc_lo_row, %ksc_laneid, 2;       // l/4
+    and.b32 %ksc_lo_col_base, %ksc_laneid, 3;  // l%4
+    shl.b32 %ksc_lo_col_base, %ksc_lo_col_base, 1; // (l%4)*2 = col base
+    mul.lo.u32 %ksc_row_off, %ksc_lo_row, 64;  // row * head_dim*2
+    shl.b32 %ksc_col_off, %ksc_lo_col_base, 1;     // col * 2 bytes (f16)
+    add.u32 %ksc_lane_off, %ksc_row_off, %ksc_col_off;
+    cvt.u32.u64 %ksc_base_u32, %tb1_kv_smem_k;
+    // ksc tile t=0 (m_tile=0, n_tile=0, warp owner = 0)
+    setp.eq.u32 %ksc_warp_pred, %warp_id, 0;
+    mov.u32 %ksc_tile_u32, %ksc_base_u32;
+    add.u32 %ksc_addr_u32, %ksc_tile_u32, %ksc_lane_off;
+    mov.u32 %ksc_addr_i, %ksc_addr_u32;
+    cvt.rn.f16.f32 %ksc_h, %k_acc_0_0;
+    @%ksc_warp_pred st.shared.b16 [%ksc_addr_i], %ksc_h;
+    add.u32 %ksc_addr_i, %ksc_addr_u32, 2;
+    cvt.rn.f16.f32 %ksc_h, %k_acc_0_1;
+    @%ksc_warp_pred st.shared.b16 [%ksc_addr_i], %ksc_h;
+    add.u32 %ksc_addr_i, %ksc_addr_u32, 512;
+    cvt.rn.f16.f32 %ksc_h, %k_acc_0_2;
+    @%ksc_warp_pred st.shared.b16 [%ksc_addr_i], %ksc_h;
+    add.u32 %ksc_addr_i, %ksc_addr_u32, 514;
+    cvt.rn.f16.f32 %ksc_h, %k_acc_0_3;
+    @%ksc_warp_pred st.shared.b16 [%ksc_addr_i], %ksc_h;
+    // === vsc D-fragment scatter (1 tiles, head_dim=32) ===
+    .reg .u32 %vsc_laneid, %vsc_lo_row, %vsc_lo_col_base;
+    .reg .u32 %vsc_row_off, %vsc_col_off, %vsc_lane_off;
+    .reg .u32 %vsc_base_u32, %vsc_tile_u32, %vsc_addr_u32, %vsc_addr_i;
+    .reg .b16 %vsc_h;
+    .reg .pred %vsc_warp_pred;
+    mov.u32 %vsc_laneid, %tid.x;
+    and.b32 %vsc_laneid, %vsc_laneid, 31;
+    shr.u32 %vsc_lo_row, %vsc_laneid, 2;       // l/4
+    and.b32 %vsc_lo_col_base, %vsc_laneid, 3;  // l%4
+    shl.b32 %vsc_lo_col_base, %vsc_lo_col_base, 1; // (l%4)*2 = col base
+    mul.lo.u32 %vsc_row_off, %vsc_lo_row, 64;  // row * head_dim*2
+    shl.b32 %vsc_col_off, %vsc_lo_col_base, 1;     // col * 2 bytes (f16)
+    add.u32 %vsc_lane_off, %vsc_row_off, %vsc_col_off;
+    cvt.u32.u64 %vsc_base_u32, %tb1_kv_smem_v;
+    // vsc tile t=0 (m_tile=0, n_tile=0, warp owner = 0)
+    setp.eq.u32 %vsc_warp_pred, %warp_id, 0;
+    mov.u32 %vsc_tile_u32, %vsc_base_u32;
+    add.u32 %vsc_addr_u32, %vsc_tile_u32, %vsc_lane_off;
+    mov.u32 %vsc_addr_i, %vsc_addr_u32;
+    cvt.rn.f16.f32 %vsc_h, %v_acc_0_0;
+    @%vsc_warp_pred st.shared.b16 [%vsc_addr_i], %vsc_h;
+    add.u32 %vsc_addr_i, %vsc_addr_u32, 2;
+    cvt.rn.f16.f32 %vsc_h, %v_acc_0_1;
+    @%vsc_warp_pred st.shared.b16 [%vsc_addr_i], %vsc_h;
+    add.u32 %vsc_addr_i, %vsc_addr_u32, 512;
+    cvt.rn.f16.f32 %vsc_h, %v_acc_0_2;
+    @%vsc_warp_pred st.shared.b16 [%vsc_addr_i], %vsc_h;
+    add.u32 %vsc_addr_i, %vsc_addr_u32, 514;
+    cvt.rn.f16.f32 %vsc_h, %v_acc_0_3;
+    @%vsc_warp_pred st.shared.b16 [%vsc_addr_i], %vsc_h;
     bar.sync 0; // FENCE: K+V tiles visible before downstream phases
 V2_TIER_B1_KV_PROJ_SKIP_0:
     // === Phase B: attention compute on slot[0] (kv_iter=0) ===

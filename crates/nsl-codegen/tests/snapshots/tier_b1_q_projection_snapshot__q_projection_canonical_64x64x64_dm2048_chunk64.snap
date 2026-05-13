@@ -4698,54 +4698,84 @@ expression: ptx
         {%tb1_q_a_31_3_0, %tb1_q_a_31_3_1, %tb1_q_a_31_3_2, %tb1_q_a_31_3_3},
         {%tb1_q_b_31_3_0, %tb1_q_b_31_3_1},
         {%q_acc_3_0, %q_acc_3_1, %q_acc_3_2, %q_acc_3_3};
-    // Pack f32 -> f16 + scatter Q accumulators to SMEM at tier_b1_q_offset
-    cvt.rn.f16.f32 %tb1_q_h0, %q_acc_0_0;
-    add.u64 %tb1_q_scatter_addr, %tb1_q_smem_q, 0; // tile=0 lane=0 byte off
-    st.shared.b16 [%tb1_q_scatter_addr], %tb1_q_h0;
-    cvt.rn.f16.f32 %tb1_q_h0, %q_acc_0_1;
-    add.u64 %tb1_q_scatter_addr, %tb1_q_smem_q, 2; // tile=0 lane=1 byte off
-    st.shared.b16 [%tb1_q_scatter_addr], %tb1_q_h0;
-    cvt.rn.f16.f32 %tb1_q_h0, %q_acc_0_2;
-    add.u64 %tb1_q_scatter_addr, %tb1_q_smem_q, 4; // tile=0 lane=2 byte off
-    st.shared.b16 [%tb1_q_scatter_addr], %tb1_q_h0;
-    cvt.rn.f16.f32 %tb1_q_h0, %q_acc_0_3;
-    add.u64 %tb1_q_scatter_addr, %tb1_q_smem_q, 6; // tile=0 lane=3 byte off
-    st.shared.b16 [%tb1_q_scatter_addr], %tb1_q_h0;
-    cvt.rn.f16.f32 %tb1_q_h0, %q_acc_1_0;
-    add.u64 %tb1_q_scatter_addr, %tb1_q_smem_q, 8; // tile=1 lane=0 byte off
-    st.shared.b16 [%tb1_q_scatter_addr], %tb1_q_h0;
-    cvt.rn.f16.f32 %tb1_q_h0, %q_acc_1_1;
-    add.u64 %tb1_q_scatter_addr, %tb1_q_smem_q, 10; // tile=1 lane=1 byte off
-    st.shared.b16 [%tb1_q_scatter_addr], %tb1_q_h0;
-    cvt.rn.f16.f32 %tb1_q_h0, %q_acc_1_2;
-    add.u64 %tb1_q_scatter_addr, %tb1_q_smem_q, 12; // tile=1 lane=2 byte off
-    st.shared.b16 [%tb1_q_scatter_addr], %tb1_q_h0;
-    cvt.rn.f16.f32 %tb1_q_h0, %q_acc_1_3;
-    add.u64 %tb1_q_scatter_addr, %tb1_q_smem_q, 14; // tile=1 lane=3 byte off
-    st.shared.b16 [%tb1_q_scatter_addr], %tb1_q_h0;
-    cvt.rn.f16.f32 %tb1_q_h0, %q_acc_2_0;
-    add.u64 %tb1_q_scatter_addr, %tb1_q_smem_q, 16; // tile=2 lane=0 byte off
-    st.shared.b16 [%tb1_q_scatter_addr], %tb1_q_h0;
-    cvt.rn.f16.f32 %tb1_q_h0, %q_acc_2_1;
-    add.u64 %tb1_q_scatter_addr, %tb1_q_smem_q, 18; // tile=2 lane=1 byte off
-    st.shared.b16 [%tb1_q_scatter_addr], %tb1_q_h0;
-    cvt.rn.f16.f32 %tb1_q_h0, %q_acc_2_2;
-    add.u64 %tb1_q_scatter_addr, %tb1_q_smem_q, 20; // tile=2 lane=2 byte off
-    st.shared.b16 [%tb1_q_scatter_addr], %tb1_q_h0;
-    cvt.rn.f16.f32 %tb1_q_h0, %q_acc_2_3;
-    add.u64 %tb1_q_scatter_addr, %tb1_q_smem_q, 22; // tile=2 lane=3 byte off
-    st.shared.b16 [%tb1_q_scatter_addr], %tb1_q_h0;
-    cvt.rn.f16.f32 %tb1_q_h0, %q_acc_3_0;
-    add.u64 %tb1_q_scatter_addr, %tb1_q_smem_q, 24; // tile=3 lane=0 byte off
-    st.shared.b16 [%tb1_q_scatter_addr], %tb1_q_h0;
-    cvt.rn.f16.f32 %tb1_q_h0, %q_acc_3_1;
-    add.u64 %tb1_q_scatter_addr, %tb1_q_smem_q, 26; // tile=3 lane=1 byte off
-    st.shared.b16 [%tb1_q_scatter_addr], %tb1_q_h0;
-    cvt.rn.f16.f32 %tb1_q_h0, %q_acc_3_2;
-    add.u64 %tb1_q_scatter_addr, %tb1_q_smem_q, 28; // tile=3 lane=2 byte off
-    st.shared.b16 [%tb1_q_scatter_addr], %tb1_q_h0;
-    cvt.rn.f16.f32 %tb1_q_h0, %q_acc_3_3;
-    add.u64 %tb1_q_scatter_addr, %tb1_q_smem_q, 30; // tile=3 lane=3 byte off
-    st.shared.b16 [%tb1_q_scatter_addr], %tb1_q_h0;
+    // === qsc D-fragment scatter (4 tiles, head_dim=64) ===
+    .reg .u32 %qsc_laneid, %qsc_lo_row, %qsc_lo_col_base;
+    .reg .u32 %qsc_row_off, %qsc_col_off, %qsc_lane_off;
+    .reg .u32 %qsc_base_u32, %qsc_tile_u32, %qsc_addr_u32, %qsc_addr_i;
+    .reg .b16 %qsc_h;
+    .reg .pred %qsc_warp_pred;
+    mov.u32 %qsc_laneid, %tid.x;
+    and.b32 %qsc_laneid, %qsc_laneid, 31;
+    shr.u32 %qsc_lo_row, %qsc_laneid, 2;       // l/4
+    and.b32 %qsc_lo_col_base, %qsc_laneid, 3;  // l%4
+    shl.b32 %qsc_lo_col_base, %qsc_lo_col_base, 1; // (l%4)*2 = col base
+    mul.lo.u32 %qsc_row_off, %qsc_lo_row, 128;  // row * head_dim*2
+    shl.b32 %qsc_col_off, %qsc_lo_col_base, 1;     // col * 2 bytes (f16)
+    add.u32 %qsc_lane_off, %qsc_row_off, %qsc_col_off;
+    cvt.u32.u64 %qsc_base_u32, %tb1_q_smem_q;
+    // qsc tile t=0 (m_tile=0, n_tile=0, warp owner = 0)
+    setp.eq.u32 %qsc_warp_pred, %warp_id, 0;
+    mov.u32 %qsc_tile_u32, %qsc_base_u32;
+    add.u32 %qsc_addr_u32, %qsc_tile_u32, %qsc_lane_off;
+    mov.u32 %qsc_addr_i, %qsc_addr_u32;
+    cvt.rn.f16.f32 %qsc_h, %q_acc_0_0;
+    @%qsc_warp_pred st.shared.b16 [%qsc_addr_i], %qsc_h;
+    add.u32 %qsc_addr_i, %qsc_addr_u32, 2;
+    cvt.rn.f16.f32 %qsc_h, %q_acc_0_1;
+    @%qsc_warp_pred st.shared.b16 [%qsc_addr_i], %qsc_h;
+    add.u32 %qsc_addr_i, %qsc_addr_u32, 1024;
+    cvt.rn.f16.f32 %qsc_h, %q_acc_0_2;
+    @%qsc_warp_pred st.shared.b16 [%qsc_addr_i], %qsc_h;
+    add.u32 %qsc_addr_i, %qsc_addr_u32, 1026;
+    cvt.rn.f16.f32 %qsc_h, %q_acc_0_3;
+    @%qsc_warp_pred st.shared.b16 [%qsc_addr_i], %qsc_h;
+    // qsc tile t=1 (m_tile=0, n_tile=1, warp owner = 1)
+    setp.eq.u32 %qsc_warp_pred, %warp_id, 1;
+    add.u32 %qsc_tile_u32, %qsc_base_u32, 16;
+    add.u32 %qsc_addr_u32, %qsc_tile_u32, %qsc_lane_off;
+    mov.u32 %qsc_addr_i, %qsc_addr_u32;
+    cvt.rn.f16.f32 %qsc_h, %q_acc_1_0;
+    @%qsc_warp_pred st.shared.b16 [%qsc_addr_i], %qsc_h;
+    add.u32 %qsc_addr_i, %qsc_addr_u32, 2;
+    cvt.rn.f16.f32 %qsc_h, %q_acc_1_1;
+    @%qsc_warp_pred st.shared.b16 [%qsc_addr_i], %qsc_h;
+    add.u32 %qsc_addr_i, %qsc_addr_u32, 1024;
+    cvt.rn.f16.f32 %qsc_h, %q_acc_1_2;
+    @%qsc_warp_pred st.shared.b16 [%qsc_addr_i], %qsc_h;
+    add.u32 %qsc_addr_i, %qsc_addr_u32, 1026;
+    cvt.rn.f16.f32 %qsc_h, %q_acc_1_3;
+    @%qsc_warp_pred st.shared.b16 [%qsc_addr_i], %qsc_h;
+    // qsc tile t=2 (m_tile=0, n_tile=2, warp owner = 2)
+    setp.eq.u32 %qsc_warp_pred, %warp_id, 2;
+    add.u32 %qsc_tile_u32, %qsc_base_u32, 32;
+    add.u32 %qsc_addr_u32, %qsc_tile_u32, %qsc_lane_off;
+    mov.u32 %qsc_addr_i, %qsc_addr_u32;
+    cvt.rn.f16.f32 %qsc_h, %q_acc_2_0;
+    @%qsc_warp_pred st.shared.b16 [%qsc_addr_i], %qsc_h;
+    add.u32 %qsc_addr_i, %qsc_addr_u32, 2;
+    cvt.rn.f16.f32 %qsc_h, %q_acc_2_1;
+    @%qsc_warp_pred st.shared.b16 [%qsc_addr_i], %qsc_h;
+    add.u32 %qsc_addr_i, %qsc_addr_u32, 1024;
+    cvt.rn.f16.f32 %qsc_h, %q_acc_2_2;
+    @%qsc_warp_pred st.shared.b16 [%qsc_addr_i], %qsc_h;
+    add.u32 %qsc_addr_i, %qsc_addr_u32, 1026;
+    cvt.rn.f16.f32 %qsc_h, %q_acc_2_3;
+    @%qsc_warp_pred st.shared.b16 [%qsc_addr_i], %qsc_h;
+    // qsc tile t=3 (m_tile=0, n_tile=3, warp owner = 3)
+    setp.eq.u32 %qsc_warp_pred, %warp_id, 3;
+    add.u32 %qsc_tile_u32, %qsc_base_u32, 48;
+    add.u32 %qsc_addr_u32, %qsc_tile_u32, %qsc_lane_off;
+    mov.u32 %qsc_addr_i, %qsc_addr_u32;
+    cvt.rn.f16.f32 %qsc_h, %q_acc_3_0;
+    @%qsc_warp_pred st.shared.b16 [%qsc_addr_i], %qsc_h;
+    add.u32 %qsc_addr_i, %qsc_addr_u32, 2;
+    cvt.rn.f16.f32 %qsc_h, %q_acc_3_1;
+    @%qsc_warp_pred st.shared.b16 [%qsc_addr_i], %qsc_h;
+    add.u32 %qsc_addr_i, %qsc_addr_u32, 1024;
+    cvt.rn.f16.f32 %qsc_h, %q_acc_3_2;
+    @%qsc_warp_pred st.shared.b16 [%qsc_addr_i], %qsc_h;
+    add.u32 %qsc_addr_i, %qsc_addr_u32, 1026;
+    cvt.rn.f16.f32 %qsc_h, %q_acc_3_3;
+    @%qsc_warp_pred st.shared.b16 [%qsc_addr_i], %qsc_h;
     bar.sync 0; // FENCE: Q tile visible before downstream phases
 V2_TIER_B1_Q_PROJ_SKIP:
