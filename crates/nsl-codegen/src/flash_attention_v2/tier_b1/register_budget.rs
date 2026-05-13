@@ -3,9 +3,108 @@
 //! Per spec section 5.4 register budget.
 
 use crate::flash_attention::FlashAttentionConfig;
+use crate::flash_attention_v2::tier_b1::attention_mma::{tiles_per_warp_pv, tiles_per_warp_qkt};
+use crate::flash_attention_v2::tier_b1::projection_mma::{tiles_per_warp, tiles_per_warp_kv};
 
 #[derive(Debug)]
 pub struct SpillRisk(pub String);
+
+/// Declare and zero-initialize all Tier B.1 per-warp accumulator
+/// registers + Phase B placeholder SMEM base regs at orchestrator scope.
+/// Resolves B1.6 deferrals #4 (multi-call .reg collision), #7 (running
+/// max/sum state lifetime), and #8 (O_acc cross-iter lifetime) — all
+/// three were architecturally the same hoist viewed from different
+/// sub-helpers.
+///
+/// Emission order:
+///   1. Q projection accumulators (`%q_acc_<t>_<lane>`)
+///   2. K projection accumulators (`%k_acc_<t>_<lane>`)
+///   3. V projection accumulators (`%v_acc_<t>_<lane>`)
+///   4. QK^T S accumulators (`%s_acc_<t>_<lane>`)
+///   5. PV O accumulators (`%o_acc_<t>_<lane>`)
+///   6. Softmax P-packed (`%p_packed_<t>`)
+///   7. Phase B placeholder SMEM base regs (B1.6 deferral #1 swaps these)
+///
+/// Each accumulator tile is 4 f32 lanes per thread (m16n8k16 fragment
+/// shape per spec section 5.5). Zero-init is emitted after the
+/// declarations so the snapshot diff has clean structure.
+pub fn declare_registers(ptx: &mut String, config: &FlashAttentionConfig) {
+    ptx.push_str("    // === Tier B.1 accumulator + scratch register declarations (B1.6 deferral #4) ===\n");
+
+    let tpw_q = tiles_per_warp(config);
+    let tpw_kv = tiles_per_warp_kv(config);
+    let tpw_qkt = tiles_per_warp_qkt(config);
+    let tpw_pv = tiles_per_warp_pv(config);
+
+    ptx.push_str(&format!("    // Q projection accumulators ({} tile(s)/warp x 4 f32 lanes)\n", tpw_q));
+    for t in 0..tpw_q {
+        for lane in 0..4 {
+            ptx.push_str(&format!("    .reg .f32 %q_acc_{}_{};\n", t, lane));
+        }
+    }
+
+    ptx.push_str(&format!("    // K projection accumulators ({} tile(s)/warp x 4 f32 lanes)\n", tpw_kv));
+    for t in 0..tpw_kv {
+        for lane in 0..4 {
+            ptx.push_str(&format!("    .reg .f32 %k_acc_{}_{};\n", t, lane));
+        }
+    }
+
+    ptx.push_str(&format!("    // V projection accumulators ({} tile(s)/warp x 4 f32 lanes)\n", tpw_kv));
+    for t in 0..tpw_kv {
+        for lane in 0..4 {
+            ptx.push_str(&format!("    .reg .f32 %v_acc_{}_{};\n", t, lane));
+        }
+    }
+
+    ptx.push_str(&format!("    // QK^T S accumulators ({} tile(s)/warp x 4 f32 lanes)\n", tpw_qkt));
+    for t in 0..tpw_qkt {
+        for lane in 0..4 {
+            ptx.push_str(&format!("    .reg .f32 %s_acc_{}_{};\n", t, lane));
+        }
+    }
+
+    ptx.push_str(&format!("    // PV O accumulators (REGISTER-RESIDENT across kv_iters; {} tile(s)/warp x 4 f32 lanes)\n", tpw_pv));
+    for t in 0..tpw_pv {
+        for lane in 0..4 {
+            ptx.push_str(&format!("    .reg .f32 %o_acc_{}_{};\n", t, lane));
+        }
+    }
+
+    ptx.push_str(&format!("    // Softmax P-packed ({} b32 holding 2 f16 lanes each)\n", tpw_qkt));
+    for t in 0..tpw_qkt {
+        ptx.push_str(&format!("    .reg .b32 %p_packed_{};\n", t));
+    }
+
+    ptx.push_str("    // Phase B placeholder SMEM base regs (B1.6 deferral #1 will replace)\n");
+    ptx.push_str("    .reg .u64 %tb1_phase_b_smem_q, %tb1_phase_b_smem_k, %tb1_phase_b_smem_v;\n");
+    ptx.push_str("    mov.u64 %tb1_phase_b_smem_q, 0;\n");
+    ptx.push_str("    mov.u64 %tb1_phase_b_smem_k, 0;\n");
+    ptx.push_str("    mov.u64 %tb1_phase_b_smem_v, 0;\n");
+
+    ptx.push_str("    // === Zero-init all f32 accumulators ===\n");
+    for t in 0..tpw_q {
+        for lane in 0..4 {
+            ptx.push_str(&format!("    mov.f32 %q_acc_{}_{}, 0f00000000;\n", t, lane));
+        }
+    }
+    for t in 0..tpw_kv {
+        for lane in 0..4 {
+            ptx.push_str(&format!("    mov.f32 %k_acc_{}_{}, 0f00000000;\n", t, lane));
+            ptx.push_str(&format!("    mov.f32 %v_acc_{}_{}, 0f00000000;\n", t, lane));
+        }
+    }
+    for t in 0..tpw_qkt {
+        for lane in 0..4 {
+            ptx.push_str(&format!("    mov.f32 %s_acc_{}_{}, 0f00000000;\n", t, lane));
+        }
+    }
+    for t in 0..tpw_pv {
+        for lane in 0..4 {
+            ptx.push_str(&format!("    mov.f32 %o_acc_{}_{}, 0f00000000;\n", t, lane));
+        }
+    }
+}
 
 /// Per-thread register cap on sm_80+ NVIDIA GPUs.
 const REG_CAP_PER_THREAD: u32 = 255;

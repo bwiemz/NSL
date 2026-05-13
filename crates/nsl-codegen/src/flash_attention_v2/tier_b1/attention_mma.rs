@@ -21,7 +21,7 @@ use crate::matmul_mma::emit_mma_instruction;
 
 /// Number of (m16, n8) MMA tiles each of the 8 warps owns for the QK^T
 /// output (bq x bkv). Always at least 1.
-fn tiles_per_warp_qkt(config: &FlashAttentionConfig) -> u32 {
+pub(crate) fn tiles_per_warp_qkt(config: &FlashAttentionConfig) -> u32 {
     let bq = config.block_q as u32;
     let bkv = config.block_kv as u32;
     let m_tiles = bq / 16;
@@ -32,7 +32,7 @@ fn tiles_per_warp_qkt(config: &FlashAttentionConfig) -> u32 {
 
 /// Number of (m16, n8) MMA tiles each of the 8 warps owns for the PV
 /// output (bq x hd). Identical to Q-projection's tile count.
-fn tiles_per_warp_pv(config: &FlashAttentionConfig) -> u32 {
+pub(crate) fn tiles_per_warp_pv(config: &FlashAttentionConfig) -> u32 {
     let bq = config.block_q as u32;
     let hd = config.head_dim as u32;
     let m_tiles = bq / 16;
@@ -116,26 +116,9 @@ fn emit_qkt_mma(ptx: &mut String, config: &FlashAttentionConfig, slot: u32) {
         "    // QK^T MMA: bq={} bkv={} tpw_qkt={} slot={}\n",
         config.block_q, config.block_kv, tpw, slot
     ));
-    // Declare placeholder SMEM base registers for Q and K input tiles.
-    // B1.6 deferral #1: these uniform addresses are replaced by per-thread
-    // offset arithmetic via matmul_mma::emit_load_{a,b}_fragment_smem.
-    ptx.push_str("    .reg .u64 %tb1_phase_b_smem_q, %tb1_phase_b_smem_k;\n");
-    ptx.push_str("    mov.u64 %tb1_phase_b_smem_q, 0; // placeholder (B1.6 deferral #1)\n");
-    ptx.push_str("    mov.u64 %tb1_phase_b_smem_k, 0; // placeholder (B1.6 deferral #1)\n");
-    // Declare per-warp S accumulators.
-    for t in 0..tpw {
-        for lane in 0..4 {
-            ptx.push_str(&format!("    .reg .f32 %s_acc_{}_{};\n", t, lane));
-        }
-    }
-    for t in 0..tpw {
-        for lane in 0..4 {
-            ptx.push_str(&format!(
-                "    mov.f32 %s_acc_{}_{}, 0f00000000;\n",
-                t, lane
-            ));
-        }
-    }
+    // %tb1_phase_b_smem_q/k and %s_acc_<t>_<lane> are declared + zero-init'd
+    // by register_budget::declare_registers at orchestrator scope (B1.6
+    // deferral #4 resolution).
     // Placeholder A/B-fragment registers + uniform loads. (Same deferral
     // class as Q/KV projection -- B1.6 swaps to matmul_mma helpers.)
     for t in 0..tpw {
@@ -223,7 +206,8 @@ fn emit_online_softmax(ptx: &mut String, config: &FlashAttentionConfig, kv_iter:
         // Pack to b32 holding two f16 lanes (placeholder).
         // B1.6 TODO (deferral #7): replace with real exp(S - row_max) + row_sum
         // correction using running %m_acc and %l_acc state from prologue scope.
-        ptx.push_str(&format!("    .reg .b32 %p_packed_{};\n", t));
+        // %p_packed_<t> is hoisted to register_budget::declare_registers (B1.6
+        // deferral #4 resolution); we just write into it.
         ptx.push_str(&format!(
             "    mov.b32 %p_packed_{}, %s_acc_{}_0;\n",
             t, t
@@ -255,24 +239,10 @@ fn emit_pv_mma(ptx: &mut String, config: &FlashAttentionConfig, slot: u32) {
         "    // PV MMA: bq={} hd={} tpw_pv={} slot={}\n",
         config.block_q, config.head_dim, tpw, slot
     ));
-    // Declare placeholder SMEM base register for V input tile.
-    // B1.6 deferral #1: replaced by per-thread offset arithmetic via
-    // matmul_mma::emit_load_b_fragment_smem for the V tile.
-    ptx.push_str("    .reg .u64 %tb1_phase_b_smem_v;\n");
-    ptx.push_str("    mov.u64 %tb1_phase_b_smem_v, 0; // placeholder (B1.6 deferral #1)\n");
-    // Declare per-warp O_acc + zero-init.
-    // B1.6 deferral #8 (lifetime): move these declarations to
-    // tier_b1::synthesize outer prologue so O_acc persists across all
-    // kv_iter calls to emit_phase_b_attention. Currently re-zero'd per call.
-    for t in 0..tpw {
-        for lane in 0..4 {
-            ptx.push_str(&format!("    .reg .f32 %o_acc_{}_{};\n", t, lane));
-            ptx.push_str(&format!(
-                "    mov.f32 %o_acc_{}_{}, 0f00000000;\n",
-                t, lane
-            ));
-        }
-    }
+    // %tb1_phase_b_smem_v and %o_acc_<t>_<lane> are declared + zero-init'd
+    // by register_budget::declare_registers at orchestrator scope (B1.6
+    // deferrals #4 and #8 resolved together). O_acc persists across all
+    // kv_iter calls per spec section 3.1 register-residency.
     // Placeholder PV MMA per tile.
     for t in 0..tpw {
         ptx.push_str(&format!(
@@ -379,13 +349,23 @@ mod tests {
     }
 
     #[test]
-    fn phase_b_o_acc_declared_in_pv_helper() {
+    fn phase_b_o_acc_declared_by_register_budget() {
+        // After B1.6 deferral #4 hoist, the O_acc registers are declared
+        // by register_budget::declare_registers at orchestrator scope.
+        // emit_phase_b_attention writes into them but no longer declares
+        // them — confirm both halves of the contract.
         let cfg = make_config(32, 32, 32, 2048);
-        let mut ptx = String::new();
-        emit_phase_b_attention(&mut ptx, &cfg, 0, 0);
+        let mut helper_ptx = String::new();
+        emit_phase_b_attention(&mut helper_ptx, &cfg, 0, 0);
         assert!(
-            ptx.contains(".reg .f32 %o_acc_0_0"),
-            "O_acc registers must be declared by emit_pv_mma (B1.6 deferral #8 will hoist)"
+            !helper_ptx.contains(".reg .f32 %o_acc_0_0"),
+            "emit_phase_b_attention must NOT declare %o_acc post-hoist; declaration belongs to register_budget::declare_registers"
+        );
+        let mut prelude_ptx = String::new();
+        crate::flash_attention_v2::tier_b1::register_budget::declare_registers(&mut prelude_ptx, &cfg);
+        assert!(
+            prelude_ptx.contains(".reg .f32 %o_acc_0_0"),
+            "register_budget::declare_registers must emit the %o_acc declaration"
         );
     }
 

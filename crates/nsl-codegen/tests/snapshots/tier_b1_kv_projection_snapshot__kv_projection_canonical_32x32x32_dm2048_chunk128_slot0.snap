@@ -3,30 +3,12 @@ source: crates/nsl-codegen/tests/tier_b1_kv_projection_snapshot.rs
 expression: ptx
 ---
     // === Tier B.1 KV projection: bkv=32 hd=32 d_model=2048 chunk=128 n_chunks=16 kv_iter=0 slot=0 tiles_per_warp_kv=1 ===
-    // Declare + zero per-warp K accumulator registers (4 f32 lanes/tile).
-    .reg .f32 %k_acc_0_0;
-    .reg .f32 %k_acc_0_1;
-    .reg .f32 %k_acc_0_2;
-    .reg .f32 %k_acc_0_3;
-    // Declare + zero per-warp V accumulator registers (4 f32 lanes/tile).
-    .reg .f32 %v_acc_0_0;
-    .reg .f32 %v_acc_0_1;
-    .reg .f32 %v_acc_0_2;
-    .reg .f32 %v_acc_0_3;
     .reg .u64 %tb1_kv_x_ptr, %tb1_kv_wk_ptr, %tb1_kv_wv_ptr;
     .reg .pred %tb1_kv_xnull, %tb1_kv_wknull, %tb1_kv_wvnull;
     .reg .u64 %tb1_kv_smem_wk, %tb1_kv_smem_wv, %tb1_kv_smem_x;
     .reg .u64 %tb1_kv_smem_k, %tb1_kv_smem_v;
     .reg .u64 %tb1_kv_scatter_addr;
     .reg .b16 %tb1_kv_h0;
-    mov.f32 %k_acc_0_0, 0f00000000;
-    mov.f32 %k_acc_0_1, 0f00000000;
-    mov.f32 %k_acc_0_2, 0f00000000;
-    mov.f32 %k_acc_0_3, 0f00000000;
-    mov.f32 %v_acc_0_0, 0f00000000;
-    mov.f32 %v_acc_0_1, 0f00000000;
-    mov.f32 %v_acc_0_2, 0f00000000;
-    mov.f32 %v_acc_0_3, 0f00000000;
     // Null-guard csha_x_ptr; on null, skip KV projection.
     ld.param.u64 %tb1_kv_x_ptr, [csha_x_ptr];
     setp.eq.u64 %tb1_kv_xnull, %tb1_kv_x_ptr, 0;

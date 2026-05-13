@@ -51,7 +51,7 @@ use crate::matmul_mma::emit_mma_instruction;
 /// Number of (m16, n8) MMA tiles each of the 8 warps owns for the Q
 /// projection output (bq × hd). Always at least 1 — small configs
 /// (e.g. bq=32, hd=32 → 8 tiles total → 1 per warp) bottom out here.
-fn tiles_per_warp(config: &FlashAttentionConfig) -> u32 {
+pub(crate) fn tiles_per_warp(config: &FlashAttentionConfig) -> u32 {
     let bq = config.block_q as u32;
     let hd = config.head_dim as u32;
     let m_tiles = bq / 16;
@@ -64,7 +64,7 @@ fn tiles_per_warp(config: &FlashAttentionConfig) -> u32 {
 /// projection output (bkv × hd). Always at least 1 — small configs
 /// (e.g. bkv=32, hd=32 → 8 tiles total → 1 per warp) bottom out here.
 /// Analogous to `tiles_per_warp` but uses `bkv` as the M dimension.
-fn tiles_per_warp_kv(config: &FlashAttentionConfig) -> u32 {
+pub(crate) fn tiles_per_warp_kv(config: &FlashAttentionConfig) -> u32 {
     let bkv = config.block_kv as u32;
     let hd = config.head_dim as u32;
     let m_tiles = bkv / 16;
@@ -166,27 +166,15 @@ pub fn emit_q_projection(ptx: &mut String, config: &FlashAttentionConfig, chunk:
         bq, hd, d_model, chunk, n_chunks, tpw
     ));
 
-    // ----- 1. Per-warp Q accumulator registers + zero-init -----
-    ptx.push_str("    // Declare + zero per-warp Q accumulator registers (4 f32 lanes/tile).\n");
-    for t in 0..tpw {
-        for lane in 0..4 {
-            ptx.push_str(&format!("    .reg .f32 %q_acc_{}_{};\n", t, lane));
-        }
-    }
-    // Plus scratch + addressing regs used by this emitter.
+    // ----- 1. Scratch + addressing regs used by this emitter only.
+    // The per-warp Q accumulators (%q_acc_<t>_<lane>) are hoisted to the
+    // orchestrator via register_budget::declare_registers (B1.6 deferral
+    // #4); this helper just writes into them.
     ptx.push_str("    .reg .u64 %tb1_q_x_ptr, %tb1_q_wq_ptr;\n");
     ptx.push_str("    .reg .pred %tb1_q_xnull, %tb1_q_wqnull;\n");
     ptx.push_str("    .reg .u64 %tb1_q_smem_w, %tb1_q_smem_x, %tb1_q_smem_q;\n");
     ptx.push_str("    .reg .u64 %tb1_q_scatter_addr;\n");
     ptx.push_str("    .reg .b16 %tb1_q_h0, %tb1_q_h1;\n");
-    for t in 0..tpw {
-        for lane in 0..4 {
-            ptx.push_str(&format!(
-                "    mov.f32 %q_acc_{}_{}, 0f00000000;\n",
-                t, lane
-            ));
-        }
-    }
 
     // ----- 2. Null-guards on csha_x_ptr + csha_wq_ptr -----
     ptx.push_str("    // Null-guard csha_x_ptr; on null, skip Q projection (Tier A path).\n");
@@ -498,20 +486,10 @@ pub fn emit_kv_projection_chunk_loop(
         bkv, hd, d_model, chunk, n_chunks, kv_iter, slot, tpw
     ));
 
-    // ----- 1. Per-warp K + V accumulator registers + zero-init -----
-    ptx.push_str("    // Declare + zero per-warp K accumulator registers (4 f32 lanes/tile).\n");
-    for t in 0..tpw {
-        for lane in 0..4 {
-            ptx.push_str(&format!("    .reg .f32 %k_acc_{}_{};\n", t, lane));
-        }
-    }
-    ptx.push_str("    // Declare + zero per-warp V accumulator registers (4 f32 lanes/tile).\n");
-    for t in 0..tpw {
-        for lane in 0..4 {
-            ptx.push_str(&format!("    .reg .f32 %v_acc_{}_{};\n", t, lane));
-        }
-    }
-    // Scratch + addressing regs used by this emitter.
+    // ----- 1. Scratch + addressing regs used by this emitter only.
+    // %k_acc_<t>_<lane> and %v_acc_<t>_<lane> are hoisted to the
+    // orchestrator via register_budget::declare_registers (B1.6 deferral
+    // #4); this helper just writes into them.
     ptx.push_str("    .reg .u64 %tb1_kv_x_ptr, %tb1_kv_wk_ptr, %tb1_kv_wv_ptr;\n");
     ptx.push_str("    .reg .pred %tb1_kv_xnull, %tb1_kv_wknull, %tb1_kv_wvnull;\n");
     ptx.push_str(
@@ -520,24 +498,6 @@ pub fn emit_kv_projection_chunk_loop(
     ptx.push_str("    .reg .u64 %tb1_kv_smem_k, %tb1_kv_smem_v;\n");
     ptx.push_str("    .reg .u64 %tb1_kv_scatter_addr;\n");
     ptx.push_str("    .reg .b16 %tb1_kv_h0;\n");
-    // Zero-init K accumulators.
-    for t in 0..tpw {
-        for lane in 0..4 {
-            ptx.push_str(&format!(
-                "    mov.f32 %k_acc_{}_{}, 0f00000000;\n",
-                t, lane
-            ));
-        }
-    }
-    // Zero-init V accumulators.
-    for t in 0..tpw {
-        for lane in 0..4 {
-            ptx.push_str(&format!(
-                "    mov.f32 %v_acc_{}_{}, 0f00000000;\n",
-                t, lane
-            ));
-        }
-    }
 
     // ----- 2. Null-guards on csha_x_ptr, csha_wk_ptr, csha_wv_ptr -----
     let skip_label = format!("V2_TIER_B1_KV_PROJ_SKIP_{}", slot);

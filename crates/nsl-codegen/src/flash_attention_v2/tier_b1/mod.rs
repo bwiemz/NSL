@@ -43,28 +43,23 @@ use crate::flash_attention::FlashAttentionConfig;
 ///   8. Finalize per q_tile_iter (reused).
 ///   9. `ret;` + closing brace.
 ///
-/// # Why single-iteration in B1.5
+/// # B1.6 deferral #4 RESOLVED (register hoist)
 ///
-/// `emit_phase_b_attention` declares per-warp `%s_acc_*`, `%p_packed_*`,
-/// `%o_acc_*`, plus fragment regs inside its sub-helpers. Calling it
-/// more than once on the same PTX string would emit duplicate `.reg`
-/// declarations and ptxas would reject. The full `for kv_iter in
-/// 0..n_kv_iters` loop is deferred to B1.6 alongside the
-/// hoist-to-orchestrator refactor that lifts those declarations into
-/// this function's prelude (see `attention_mma.rs` Phase-B deferral #4).
+/// Per-warp accumulator registers (`%q_acc_*`, `%k_acc_*`, `%v_acc_*`,
+/// `%s_acc_*`, `%o_acc_*`, `%p_packed_*`) and Phase B placeholder SMEM
+/// base regs (`%tb1_phase_b_smem_q/k/v`) are now declared + zero-init'd
+/// at step 2b via `register_budget::declare_registers`. The sub-helpers
+/// (`emit_q_projection`, `emit_kv_projection_chunk_loop`, the three
+/// `attention_mma.rs` sub-helpers) no longer emit `.reg` declarations
+/// for these names. Multi-call is now ptxas-safe — which resolves the
+/// architectural blocker on the `for kv_iter in 0..n_kv_iters` main loop
+/// expansion. The expansion itself lands in the immediate follow-up
+/// commit; this commit keeps the single-iter body for diff isolability.
 ///
-/// The same constraint applies to `emit_kv_projection_chunk_loop` and
-/// `emit_q_projection` (both declare per-warp accumulators), but those
-/// helpers are also called only once each in this scaffold.
-///
-/// **Plan-step deviation:** the plan template (step 2) calls for a
-/// `register_budget::declare_registers(ptx, config)` helper that would
-/// emit all Tier B.1 MMA-fragment registers in one orchestrator-owned
-/// block. That function does NOT exist in `register_budget.rs` (only
-/// `analyze` ships in B1.3); creating it requires the same hoist
-/// refactor as the multi-iter loop, so it's deferred to B1.6 alongside.
-/// The four pipeline-control registers are declared inline at step 2
-/// of this body as a stand-in.
+/// O_acc cross-iter lifetime (formerly deferral #8) and softmax running
+/// max/sum state register lifetime (formerly deferral #7) are both
+/// architecturally the same hoist viewed from different sub-helpers —
+/// all three deferrals (#4 + #7 + #8) are resolved by this commit.
 ///
 /// # FLIP-POINT for B1.6
 ///
@@ -93,6 +88,14 @@ pub fn synthesize(config: &FlashAttentionConfig, chunk: u32) -> Vec<u8> {
     // so the predicate falls through to the AFTER label every time).
     ptx.push_str("    mov.u32 %r_kv_iter_next, 1; // single-iter scaffold (B1.6)\n");
     ptx.push_str("    mov.u32 %r_n_kv, 1; // single-iter scaffold (B1.6)\n");
+
+    // 2b. Tier B.1 per-warp accumulator + scratch register declarations
+    // (B1.6 deferral #4 resolution). Hoisting these out of the sub-helpers
+    // means each helper can be called any number of times on the same PTX
+    // string without ptxas duplicate-declaration rejection. This unlocks
+    // the multi-iter main loop expansion that lands in the immediate
+    // follow-up commit.
+    register_budget::declare_registers(&mut ptx, config);
 
     // 3. CSHA A.4 active_heads guard (reused from Tier A unchanged).
     crate::flash_attention_v2::phases::forward::csha_hooks::emit_active_heads_guard(

@@ -3,44 +3,11 @@ source: crates/nsl-codegen/tests/tier_b1_q_projection_snapshot.rs
 expression: ptx
 ---
     // === Tier B.1 Q projection: bq=64 hd=64 d_model=2048 chunk=64 n_chunks=32 tiles_per_warp=4 ===
-    // Declare + zero per-warp Q accumulator registers (4 f32 lanes/tile).
-    .reg .f32 %q_acc_0_0;
-    .reg .f32 %q_acc_0_1;
-    .reg .f32 %q_acc_0_2;
-    .reg .f32 %q_acc_0_3;
-    .reg .f32 %q_acc_1_0;
-    .reg .f32 %q_acc_1_1;
-    .reg .f32 %q_acc_1_2;
-    .reg .f32 %q_acc_1_3;
-    .reg .f32 %q_acc_2_0;
-    .reg .f32 %q_acc_2_1;
-    .reg .f32 %q_acc_2_2;
-    .reg .f32 %q_acc_2_3;
-    .reg .f32 %q_acc_3_0;
-    .reg .f32 %q_acc_3_1;
-    .reg .f32 %q_acc_3_2;
-    .reg .f32 %q_acc_3_3;
     .reg .u64 %tb1_q_x_ptr, %tb1_q_wq_ptr;
     .reg .pred %tb1_q_xnull, %tb1_q_wqnull;
     .reg .u64 %tb1_q_smem_w, %tb1_q_smem_x, %tb1_q_smem_q;
     .reg .u64 %tb1_q_scatter_addr;
     .reg .b16 %tb1_q_h0, %tb1_q_h1;
-    mov.f32 %q_acc_0_0, 0f00000000;
-    mov.f32 %q_acc_0_1, 0f00000000;
-    mov.f32 %q_acc_0_2, 0f00000000;
-    mov.f32 %q_acc_0_3, 0f00000000;
-    mov.f32 %q_acc_1_0, 0f00000000;
-    mov.f32 %q_acc_1_1, 0f00000000;
-    mov.f32 %q_acc_1_2, 0f00000000;
-    mov.f32 %q_acc_1_3, 0f00000000;
-    mov.f32 %q_acc_2_0, 0f00000000;
-    mov.f32 %q_acc_2_1, 0f00000000;
-    mov.f32 %q_acc_2_2, 0f00000000;
-    mov.f32 %q_acc_2_3, 0f00000000;
-    mov.f32 %q_acc_3_0, 0f00000000;
-    mov.f32 %q_acc_3_1, 0f00000000;
-    mov.f32 %q_acc_3_2, 0f00000000;
-    mov.f32 %q_acc_3_3, 0f00000000;
     // Null-guard csha_x_ptr; on null, skip Q projection (Tier A path).
     ld.param.u64 %tb1_q_x_ptr, [csha_x_ptr];
     setp.eq.u64 %tb1_q_xnull, %tb1_q_x_ptr, 0;

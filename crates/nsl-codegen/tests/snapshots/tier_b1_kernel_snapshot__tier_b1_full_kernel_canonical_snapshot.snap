@@ -87,6 +87,60 @@ expression: ptx_str.into_owned()
     mov.b32 %r_slot_curr, 0;
     mov.u32 %r_kv_iter_next, 1; // single-iter scaffold (B1.6)
     mov.u32 %r_n_kv, 1; // single-iter scaffold (B1.6)
+    // === Tier B.1 accumulator + scratch register declarations (B1.6 deferral #4) ===
+    // Q projection accumulators (1 tile(s)/warp x 4 f32 lanes)
+    .reg .f32 %q_acc_0_0;
+    .reg .f32 %q_acc_0_1;
+    .reg .f32 %q_acc_0_2;
+    .reg .f32 %q_acc_0_3;
+    // K projection accumulators (1 tile(s)/warp x 4 f32 lanes)
+    .reg .f32 %k_acc_0_0;
+    .reg .f32 %k_acc_0_1;
+    .reg .f32 %k_acc_0_2;
+    .reg .f32 %k_acc_0_3;
+    // V projection accumulators (1 tile(s)/warp x 4 f32 lanes)
+    .reg .f32 %v_acc_0_0;
+    .reg .f32 %v_acc_0_1;
+    .reg .f32 %v_acc_0_2;
+    .reg .f32 %v_acc_0_3;
+    // QK^T S accumulators (1 tile(s)/warp x 4 f32 lanes)
+    .reg .f32 %s_acc_0_0;
+    .reg .f32 %s_acc_0_1;
+    .reg .f32 %s_acc_0_2;
+    .reg .f32 %s_acc_0_3;
+    // PV O accumulators (REGISTER-RESIDENT across kv_iters; 1 tile(s)/warp x 4 f32 lanes)
+    .reg .f32 %o_acc_0_0;
+    .reg .f32 %o_acc_0_1;
+    .reg .f32 %o_acc_0_2;
+    .reg .f32 %o_acc_0_3;
+    // Softmax P-packed (1 b32 holding 2 f16 lanes each)
+    .reg .b32 %p_packed_0;
+    // Phase B placeholder SMEM base regs (B1.6 deferral #1 will replace)
+    .reg .u64 %tb1_phase_b_smem_q, %tb1_phase_b_smem_k, %tb1_phase_b_smem_v;
+    mov.u64 %tb1_phase_b_smem_q, 0;
+    mov.u64 %tb1_phase_b_smem_k, 0;
+    mov.u64 %tb1_phase_b_smem_v, 0;
+    // === Zero-init all f32 accumulators ===
+    mov.f32 %q_acc_0_0, 0f00000000;
+    mov.f32 %q_acc_0_1, 0f00000000;
+    mov.f32 %q_acc_0_2, 0f00000000;
+    mov.f32 %q_acc_0_3, 0f00000000;
+    mov.f32 %k_acc_0_0, 0f00000000;
+    mov.f32 %v_acc_0_0, 0f00000000;
+    mov.f32 %k_acc_0_1, 0f00000000;
+    mov.f32 %v_acc_0_1, 0f00000000;
+    mov.f32 %k_acc_0_2, 0f00000000;
+    mov.f32 %v_acc_0_2, 0f00000000;
+    mov.f32 %k_acc_0_3, 0f00000000;
+    mov.f32 %v_acc_0_3, 0f00000000;
+    mov.f32 %s_acc_0_0, 0f00000000;
+    mov.f32 %s_acc_0_1, 0f00000000;
+    mov.f32 %s_acc_0_2, 0f00000000;
+    mov.f32 %s_acc_0_3, 0f00000000;
+    mov.f32 %o_acc_0_0, 0f00000000;
+    mov.f32 %o_acc_0_1, 0f00000000;
+    mov.f32 %o_acc_0_2, 0f00000000;
+    mov.f32 %o_acc_0_3, 0f00000000;
     // CSHA A.4: active_heads guard
     ld.param.u32 %r10, [csha_active_heads];
     setp.eq.u32 %p0, %r10, 0;
@@ -608,20 +662,11 @@ V2_CSHA_PROLOGUE_SKIP_6:
 V2_CSHA_PROLOGUE_SKIP_7:
     bar.sync 0;  // FENCE: all prologue writes complete
     // === Tier B.1 Q projection: bq=32 hd=32 d_model=2048 chunk=128 n_chunks=16 tiles_per_warp=1 ===
-    // Declare + zero per-warp Q accumulator registers (4 f32 lanes/tile).
-    .reg .f32 %q_acc_0_0;
-    .reg .f32 %q_acc_0_1;
-    .reg .f32 %q_acc_0_2;
-    .reg .f32 %q_acc_0_3;
     .reg .u64 %tb1_q_x_ptr, %tb1_q_wq_ptr;
     .reg .pred %tb1_q_xnull, %tb1_q_wqnull;
     .reg .u64 %tb1_q_smem_w, %tb1_q_smem_x, %tb1_q_smem_q;
     .reg .u64 %tb1_q_scatter_addr;
     .reg .b16 %tb1_q_h0, %tb1_q_h1;
-    mov.f32 %q_acc_0_0, 0f00000000;
-    mov.f32 %q_acc_0_1, 0f00000000;
-    mov.f32 %q_acc_0_2, 0f00000000;
-    mov.f32 %q_acc_0_3, 0f00000000;
     // Null-guard csha_x_ptr; on null, skip Q projection (Tier A path).
     ld.param.u64 %tb1_q_x_ptr, [csha_x_ptr];
     setp.eq.u64 %tb1_q_xnull, %tb1_q_x_ptr, 0;
@@ -1010,30 +1055,12 @@ V2_TIER_B1_Q_PROJ_SKIP:
     // Phase A: chunk-loop body lives in projection_mma; this helper just synchronizes.
     bar.sync 0;
     // === Tier B.1 KV projection: bkv=32 hd=32 d_model=2048 chunk=128 n_chunks=16 kv_iter=0 slot=0 tiles_per_warp_kv=1 ===
-    // Declare + zero per-warp K accumulator registers (4 f32 lanes/tile).
-    .reg .f32 %k_acc_0_0;
-    .reg .f32 %k_acc_0_1;
-    .reg .f32 %k_acc_0_2;
-    .reg .f32 %k_acc_0_3;
-    // Declare + zero per-warp V accumulator registers (4 f32 lanes/tile).
-    .reg .f32 %v_acc_0_0;
-    .reg .f32 %v_acc_0_1;
-    .reg .f32 %v_acc_0_2;
-    .reg .f32 %v_acc_0_3;
     .reg .u64 %tb1_kv_x_ptr, %tb1_kv_wk_ptr, %tb1_kv_wv_ptr;
     .reg .pred %tb1_kv_xnull, %tb1_kv_wknull, %tb1_kv_wvnull;
     .reg .u64 %tb1_kv_smem_wk, %tb1_kv_smem_wv, %tb1_kv_smem_x;
     .reg .u64 %tb1_kv_smem_k, %tb1_kv_smem_v;
     .reg .u64 %tb1_kv_scatter_addr;
     .reg .b16 %tb1_kv_h0;
-    mov.f32 %k_acc_0_0, 0f00000000;
-    mov.f32 %k_acc_0_1, 0f00000000;
-    mov.f32 %k_acc_0_2, 0f00000000;
-    mov.f32 %k_acc_0_3, 0f00000000;
-    mov.f32 %v_acc_0_0, 0f00000000;
-    mov.f32 %v_acc_0_1, 0f00000000;
-    mov.f32 %v_acc_0_2, 0f00000000;
-    mov.f32 %v_acc_0_3, 0f00000000;
     // Null-guard csha_x_ptr; on null, skip KV projection.
     ld.param.u64 %tb1_kv_x_ptr, [csha_x_ptr];
     setp.eq.u64 %tb1_kv_xnull, %tb1_kv_x_ptr, 0;
@@ -1609,17 +1636,6 @@ V2_TIER_B1_Q_PROJ_SKIP:
 V2_TIER_B1_KV_PROJ_SKIP_0:
     // === Phase B: attention compute on slot[0] (kv_iter=0) ===
     // QK^T MMA: bq=32 bkv=32 tpw_qkt=1 slot=0
-    .reg .u64 %tb1_phase_b_smem_q, %tb1_phase_b_smem_k;
-    mov.u64 %tb1_phase_b_smem_q, 0; // placeholder (B1.6 deferral #1)
-    mov.u64 %tb1_phase_b_smem_k, 0; // placeholder (B1.6 deferral #1)
-    .reg .f32 %s_acc_0_0;
-    .reg .f32 %s_acc_0_1;
-    .reg .f32 %s_acc_0_2;
-    .reg .f32 %s_acc_0_3;
-    mov.f32 %s_acc_0_0, 0f00000000;
-    mov.f32 %s_acc_0_1, 0f00000000;
-    mov.f32 %s_acc_0_2, 0f00000000;
-    mov.f32 %s_acc_0_3, 0f00000000;
     .reg .b32 %tb1_qkt_a_0_0, %tb1_qkt_a_0_1, %tb1_qkt_a_0_2, %tb1_qkt_a_0_3;
     .reg .b32 %tb1_qkt_b_0_0, %tb1_qkt_b_0_1;
     ld.shared.b32 %tb1_qkt_a_0_0, [%tb1_phase_b_smem_q];
@@ -1637,19 +1653,8 @@ V2_TIER_B1_KV_PROJ_SKIP_0:
     // Online softmax: bq=32 tpw_qkt=1 kv_iter=0
     // softmax tile t=0 -- placeholder bfly + exp (B1.6 deferral #6)
     shfl.sync.bfly.b32 %s_acc_0_0, %s_acc_0_0, 4, 0x1f, 0xffffffff;
-    .reg .b32 %p_packed_0;
     mov.b32 %p_packed_0, %s_acc_0_0;
     // PV MMA: bq=32 hd=32 tpw_pv=1 slot=0
-    .reg .u64 %tb1_phase_b_smem_v;
-    mov.u64 %tb1_phase_b_smem_v, 0; // placeholder (B1.6 deferral #1)
-    .reg .f32 %o_acc_0_0;
-    mov.f32 %o_acc_0_0, 0f00000000;
-    .reg .f32 %o_acc_0_1;
-    mov.f32 %o_acc_0_1, 0f00000000;
-    .reg .f32 %o_acc_0_2;
-    mov.f32 %o_acc_0_2, 0f00000000;
-    .reg .f32 %o_acc_0_3;
-    mov.f32 %o_acc_0_3, 0f00000000;
     .reg .b32 %tb1_pv_a_0_0, %tb1_pv_a_0_1, %tb1_pv_a_0_2, %tb1_pv_a_0_3;
     .reg .b32 %tb1_pv_b_0_0, %tb1_pv_b_0_1;
     mov.b32 %tb1_pv_a_0_0, %p_packed_0;
