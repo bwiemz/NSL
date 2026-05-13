@@ -57,6 +57,15 @@ use crate::flash_attention::FlashAttentionConfig;
 /// `emit_q_projection` (both declare per-warp accumulators), but those
 /// helpers are also called only once each in this scaffold.
 ///
+/// **Plan-step deviation:** the plan template (step 2) calls for a
+/// `register_budget::declare_registers(ptx, config)` helper that would
+/// emit all Tier B.1 MMA-fragment registers in one orchestrator-owned
+/// block. That function does NOT exist in `register_budget.rs` (only
+/// `analyze` ships in B1.3); creating it requires the same hoist
+/// refactor as the multi-iter loop, so it's deferred to B1.6 alongside.
+/// The four pipeline-control registers are declared inline at step 2
+/// of this body as a stand-in.
+///
 /// # FLIP-POINT for B1.6
 ///
 /// When B1.6 hoists the register declarations and wires the multi-iter
@@ -118,6 +127,19 @@ pub fn synthesize(config: &FlashAttentionConfig, chunk: u32) -> Vec<u8> {
     pipeline::emit_main_loop_phase_c_swap(&mut ptx, config, kv_iter);
 
     // 8. Finalize: divide O_acc by row_sum, scatter to HBM.
+    //
+    // B1.6 deferral #9 (register-namespace bridge): `finalize::emit` is
+    // the reused Tier A scatter that reads %f<O_BASE> (Tier A's pool-style
+    // O accumulator naming) and %row_sum (written by Tier A's softmax
+    // path). Phase B in this scaffold instead produces %o_acc_<t>_<lane>
+    // (B1.5 naming, see attention_mma.rs::emit_pv_mma) and never writes
+    // %row_sum (emit_online_softmax is a placeholder). The B1.6 hoist
+    // refactor must either (a) rename %o_acc to %f<O_BASE> indexing and
+    // wire %row_sum from the real softmax helper, OR (b) replace this
+    // finalize::emit call with a Tier-B1-native output scatter that
+    // reads %o_acc directly. Until then, the emitted finalize block
+    // operates on stale/undefined registers — ptxas accepts the code but
+    // it is NOT numerically meaningful.
     for q_iter in 0..iters {
         crate::flash_attention_v2::phases::forward::finalize::emit(
             &mut ptx, config, q_iter,
