@@ -1,43 +1,54 @@
 #!/usr/bin/env bash
-# M6 — single_doc wall-time regression.
-# Median of 5 runs; pass if (B / A) <= 1.01 (worst-case Tier B overhead
-# bound when no skipping is possible).
+# M6 — wall-time median-of-5 measurement for PCA Tier B.
 #
-# Spec: §7 M6.
+# Spec: §8 of docs/superpowers/specs/2026-05-13-pca-tier-b15-and-b2-design.md
+# Plan: B1.5-5 step 1 of docs/superpowers/plans/2026-05-13-pca-tier-b15-and-b2-implementation.md
+#
+# Per measurement protocol:
+#  - 5 outer runs x tier_b ∈ {on, off}
+#  - 100 inner iterations per outer run via bench's --iterations
+#  - Parse `tier_b_bench_result:` output line; extract median_us and skip_ratio
+#  - Emit CSV to stdout: fixture,outer_run,tier_b,median_us,skip_ratio,seed
+#
+# Usage:
+#   bash scripts/measure_tier_b_m6.sh [FIXTURE]
+#
+# Default fixture: gate_4096.
+
 set -euo pipefail
 
-FIXTURE="${FIXTURE:-single_doc}"
-N_RUNS="${N_RUNS:-5}"
-BENCH="${BENCH:-./target/release/nsl-codegen-bench}"
+FIXTURE="${1:-gate_4096}"
+OUTER_RUNS="${OUTER_RUNS:-5}"
+INNER_ITERS="${INNER_ITERS:-100}"
+SEED="${SEED:-42}"
 
-[ -x "$BENCH" ] || {
-    echo "ERR: bench binary not at $BENCH"
-    echo "Build first: cargo build --release -p nsl-codegen-bench --features cuda"
-    echo "(harness not yet in repo — see Task 9 / Tier B.1.5 deferral notes)"
-    exit 1
-}
+# Prefer pre-built binary if available; otherwise invoke via cargo run.
+BENCH_BIN_PATH="${BENCH_BIN:-target/release/bench.exe}"
+if [ -x "$BENCH_BIN_PATH" ]; then
+    BENCH_CMD=("$BENCH_BIN_PATH")
+elif [ -x "target/release/bench" ]; then
+    BENCH_CMD=("target/release/bench")
+else
+    BENCH_CMD=(cargo run -q -p nsl-codegen --features "cuda debug_kernel_instrumentation" --bin bench --release --)
+fi
 
-run_median() {
-    local mode=$1
-    local times=()
-    for _ in $(seq "$N_RUNS"); do
-        local t
-        t=$("$BENCH" --fixture "$FIXTURE" --tier-b="$mode" --emit-time-only)
-        times+=("$t")
+echo "fixture,outer_run,tier_b,median_us,skip_ratio,seed"
+for run in $(seq 1 "$OUTER_RUNS"); do
+    for tier_b in on off; do
+        OUT=$("${BENCH_CMD[@]}" \
+            --fixture "$FIXTURE" \
+            --tier-b "$tier_b" \
+            --seed "$SEED" \
+            --iterations "$INNER_ITERS" \
+            --emit-time-only \
+            2>/dev/null \
+            | grep '^tier_b_bench_result:' || true)
+        if [ -z "$OUT" ]; then
+            echo "ERR: bench produced no result line for $FIXTURE / $tier_b / run=$run" >&2
+            exit 2
+        fi
+        median=$(echo "$OUT" | sed -n 's/.*:median_us=\([0-9.eE+-]*\):.*/\1/p')
+        skip=$(  echo "$OUT" | sed -n 's/.*:skip_ratio=\([0-9.eE+-]*\):.*/\1/p')
+        echo "$FIXTURE,$run,$tier_b,$median,$skip,$SEED"
     done
-    printf '%s\n' "${times[@]}" | sort -n | awk -v n=$N_RUNS 'NR == int((n+1)/2) {print}'
-}
-
-echo "Measuring Tier-A-only median over $N_RUNS runs (fixture=$FIXTURE) ..."
-T_A=$(run_median off)
-echo "Measuring Tier-B-on median over $N_RUNS runs (fixture=$FIXTURE) ..."
-T_B=$(run_median on)
-
-RATIO=$(awk -v a="$T_A" -v b="$T_B" 'BEGIN {printf "%.4f", b/a}')
-
-echo ""
-echo "=== M6 results ==="
-echo "Tier-A-only median: ${T_A}us"
-echo "Tier-B-on median:   ${T_B}us"
-echo "Ratio B/A: $RATIO (pass criterion: <= 1.01)"
-awk -v r="$RATIO" 'BEGIN {exit (r > 1.01)}' && echo "M6 PASS" || echo "M6 FAIL"
+done

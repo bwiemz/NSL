@@ -1,52 +1,64 @@
 #!/usr/bin/env bash
-# M2 — FLOP reduction measurement.
-# Runs Nsight Compute on a Tier-A-only baseline and a Tier-B-on variant
-# of the standard_3doc fixture; computes FLOP ratio per spec sec 7 M2 formula.
+# M2 — skip-ratio sweep across the three-tier fixture matrix.
 #
-# Prerequisites:
-#   - $CUDA_PATH points to a CUDA 13.x install with `ncu` in bin/.
-#   - A bench binary that launches the Tier B forward kernel with a
-#     selectable --fixture flag and --tier-b={on,off} switch. The bench
-#     binary is NOT in the current repo; users should adapt the existing
-#     `pca_tier_a_forward_correctness::launch_forward` harness with a
-#     skip_decisions_ptr arg (deferred to Tier B.1.5; see Task 9 notes).
+# Spec: §4 + §8.4 of docs/superpowers/specs/2026-05-13-pca-tier-b15-and-b2-design.md
+# Plan: B1.5-5 step 2 of docs/superpowers/plans/2026-05-13-pca-tier-b15-and-b2-implementation.md
 #
-# Spec: §7 M2.
+# Per measurement protocol:
+#  - Sweep across gate + 3 sensitivity + 6 parity fixtures × tier_b ∈ {on, off}
+#  - Single outer run per fixture (m2 is structural skip-ratio; not 5-run median)
+#  - 100 inner iterations via bench's --iterations (matches m6 protocol)
+#  - Emit CSV to stdout: fixture,tier_b,skip_ratio,median_us,seed
+#
+# Usage:
+#   bash scripts/measure_tier_b_m2.sh
+
 set -euo pipefail
 
-FIXTURE="${FIXTURE:-standard_3doc}"
-NCU="${NCU:-$CUDA_PATH/bin/ncu}"
-BENCH="${BENCH:-./target/release/nsl-codegen-bench}"
+INNER_ITERS="${INNER_ITERS:-100}"
+SEED="${SEED:-42}"
 
-[ -x "$NCU" ] || { echo "ERR: ncu not at $NCU (set NCU= or CUDA_PATH=)"; exit 1; }
-[ -x "$BENCH" ] || {
-    echo "ERR: bench binary not at $BENCH"
-    echo "Build the bench harness first: cargo build --release -p nsl-codegen-bench --features cuda"
-    echo "(harness not yet in repo — see Task 9 / Tier B.1.5 deferral notes)"
-    exit 1
-}
+# Prefer pre-built binary if available; otherwise invoke via cargo run.
+BENCH_BIN_PATH="${BENCH_BIN:-target/release/bench.exe}"
+if [ -x "$BENCH_BIN_PATH" ]; then
+    BENCH_CMD=("$BENCH_BIN_PATH")
+elif [ -x "target/release/bench" ]; then
+    BENCH_CMD=("target/release/bench")
+else
+    BENCH_CMD=(cargo run -q -p nsl-codegen --features "cuda debug_kernel_instrumentation" --bin bench --release --)
+fi
 
-# Spec sec 7 M2 metric list.
-METRICS="smsp__sass_thread_inst_executed_op_fadd_pred_on.sum,\
-smsp__sass_thread_inst_executed_op_ffma_pred_on.sum,\
-smsp__sass_thread_inst_executed_op_fmul_pred_on.sum"
+FIXTURES=(
+    gate_4096
+    sensitivity_10
+    sensitivity_50
+    sensitivity_90
+    parity_1
+    parity_2
+    parity_3
+    parity_4
+    parity_5
+    parity_6
+)
 
-echo "Running Tier-A-only baseline (fixture=$FIXTURE) ..."
-"$NCU" --metrics "$METRICS" --csv "$BENCH" --fixture "$FIXTURE" --tier-b=off \
-    > /tmp/tier_a_baseline.csv
-
-echo "Running Tier-B-on variant (fixture=$FIXTURE) ..."
-"$NCU" --metrics "$METRICS" --csv "$BENCH" --fixture "$FIXTURE" --tier-b=on \
-    > /tmp/tier_b_on.csv
-
-# FLOPs = fadd + 2*ffma + fmul (per spec sec 7 M2 formula).
-FLOP_A=$(awk -F, 'NR>1 {f+=$2+2*$3+$4} END {print f}' /tmp/tier_a_baseline.csv)
-FLOP_B=$(awk -F, 'NR>1 {f+=$2+2*$3+$4} END {print f}' /tmp/tier_b_on.csv)
-REDUCTION=$(awk -v a="$FLOP_A" -v b="$FLOP_B" 'BEGIN {printf "%.4f", 1 - b/a}')
-
-echo ""
-echo "=== M2 results ==="
-echo "Tier-A FLOPs: $FLOP_A"
-echo "Tier-B FLOPs: $FLOP_B"
-echo "Reduction (1 - B/A): $REDUCTION (pass criterion: >= 0.30)"
-awk -v r="$REDUCTION" 'BEGIN {exit (r < 0.30)}' && echo "M2 PASS" || echo "M2 FAIL"
+echo "fixture,tier_b,skip_ratio,median_us,seed"
+for fx in "${FIXTURES[@]}"; do
+    for tier_b in on off; do
+        OUT=$("${BENCH_CMD[@]}" \
+            --fixture "$fx" \
+            --tier-b "$tier_b" \
+            --seed "$SEED" \
+            --iterations "$INNER_ITERS" \
+            --emit-time-only \
+            2>/dev/null \
+            | grep '^tier_b_bench_result:' || true)
+        if [ -z "$OUT" ]; then
+            echo "WARN: bench produced no result line for $fx / $tier_b — emitting NA row" >&2
+            echo "$fx,$tier_b,NA,NA,$SEED"
+            continue
+        fi
+        median=$(echo "$OUT" | sed -n 's/.*:median_us=\([0-9.eE+-]*\):.*/\1/p')
+        skip=$(  echo "$OUT" | sed -n 's/.*:skip_ratio=\([0-9.eE+-]*\):.*/\1/p')
+        echo "$fx,$tier_b,$skip,$median,$SEED"
+    done
+done
