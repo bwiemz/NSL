@@ -1,8 +1,10 @@
 # PCA Tier B Dispatch — Implementation Plan
 
+> **STATUS (2026-05-14): D-2 / D-3 / D-4 SUPERSEDED.** D-1 (V-dispatch-integration) ran and surfaced case-(β) finding (α=0, β=3, γ=0). The dispatch spec's §5.3 case-(α) path and §10 outcomes matrix were invalidated; see [design spec §14](../specs/2026-05-14-pca-tier-b-dispatch-design.md#14-amendment--v-dispatch-integration-outcome-2026-05-14). Activation pivots to a follow-on planner spec with three scoped options (Option B recommended: move dispatch past codegen). D-1 stays as the load-bearing artifact. D-2 / D-3 / D-4 do not execute under this plan.
+>
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Activate PCA Tier B emission for `segment_masked` configs at `seq_len >= floor` via a minimal heuristic in `flash_attention_v2::should_emit_tier_b`, replacing the unconditional-false stub from PR #168/#169.
+**Goal (original — see SUPERSEDED notice above):** Activate PCA Tier B emission for `segment_masked` configs at `seq_len >= floor` via a minimal heuristic in `flash_attention_v2::should_emit_tier_b`, replacing the unconditional-false stub from PR #168/#169.
 
 **Architecture:** Four sequential milestones — D-1 (verification, doc only) → D-2 (measurement, doc + CSV) → D-3 (heuristic implementation; signature change conditional on D-1 outcome) → D-4 (snapshot re-baseline + activation PR). The D-3 gate is **runtime parity** (kernel outputs byte-identical); the D-4 scope is **snapshot parity** (PTX content re-baseline). These distinct test surfaces must NOT be conflated — see design spec §12.2.
 

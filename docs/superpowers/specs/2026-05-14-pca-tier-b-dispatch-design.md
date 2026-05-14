@@ -477,7 +477,85 @@ Worth a new "Cited from" entry on IR-011 (distinct test surfaces roll up into a 
 
 > `docs/superpowers/specs/2026-05-14-pca-tier-b-dispatch-design.md` §3.3 — sensitivity tier's saturating-curve finding (from previous spec) enabled minimal-heuristic dispatch policy (which would otherwise have required user-overrideable shape to manage wrong-ON risk).
 
-## 14. References
+## 14. Amendment — V-dispatch-integration outcome (2026-05-14)
+
+V-dispatch-integration (Milestone D-1) ran on 2026-05-14. Findings doc: [`2026-05-14-tier-b-dispatch-integration-findings.md`](2026-05-14-tier-b-dispatch-integration-findings.md). Commit `3ddae7f4`.
+
+**This amendment invalidates the §5.3 "if case (α), proceed with option 4" path and supersedes §10's outcomes matrix for v1.**
+
+### 14.1 What V-dispatch-integration found
+
+All three production callers of `synthesize_flash_attention_ptx_v2` operate on `&[Stmt]` AST input during AOT module compilation:
+
+- `crates/nsl-codegen/src/compiler/kernel.rs:750` — `maybe_synthesize_csha_training_ptx(&mut self, stmts: &[Stmt])`. β.
+- `crates/nsl-codegen/src/compiler/kernel.rs:1050` — `compile_flash_attention_kernels(&mut self, stmts: &[Stmt])` autotune branch. β.
+- `crates/nsl-codegen/src/compiler/kernel.rs:1173` — same enclosing fn, single-config fallback. β.
+
+Tally: **α=0, β=3, γ=0.**
+
+Runtime `seq_len` is read by the host-side FFI dispatcher (`nsl_flash_attention_csha_*`) at launch time from the tensor's shape; PTX is shape-agnostic by construction. The kernel.rs:710–730 comment block independently documents this design choice: *"the runtime dispatcher reads sequence length from the tensor shape, not the PTX-baked block_kv."*
+
+Two non-production hits (`csha_hooks.rs:2045, 2072`) are inside the `#[cfg(test)] mod tests` block opening at `csha_hooks.rs:1378` and are correctly excluded from the tally. The `flash_attention_selector.rs:52` wrapper has zero non-test in-tree callers — a backwards-compat surface only.
+
+### 14.2 Why each §5.2 / §10 outcome fails to produce a working v1 activation
+
+The original spec's outcomes matrix (§10) assumed at least one option produces a working v1. V-dispatch-integration disproved that:
+
+- **Case (α) — option 4 (synthesizer arg).** Ruled out: no production caller can supply `seq_len`. Adding the arg would require sentinel values that defeat the gate (no activation) or synthetic worst-case values that codegen against bare-no-relation-to-runtime-input dimensions (unsound).
+- **Case (β-i) — "β callers stay no-op."** Functionally equivalent to shipping the dispatch with zero callers. Tier B activates nowhere in production. Violates IR-009: continues bounded dormancy past its measurement-pending bound.
+- **Case (β-ii) — sparsity-only collapse.** The heuristic `should_emit_tier_b(config) -> bool` returns `config.segment_masked`. But the downstream `_with_tier_b(config, Some((seq_len, residency)))` requires a compile-time `seq_len` to size the SMEM range table. β-ii doesn't actually work without resolving the seq_len-at-codegen problem.
+- **Case (γ) — option 3 (FlashAttentionConfig.seq_len field).** V-dispatch-integration found callers don't have seq_len **structurally** (the requirement for γ); they have AST input without it. Adding a `seq_len: u32` field would either bloat PTX-embed counts via per-length kernel-name mangling (one blob per length bucket) or be a config field deliberately ignored by the kernel-name mangler (the §5.3 "type-system honesty" criterion warns against this). Case (γ) reframing of case (β) doesn't solve the problem; it relocates it.
+
+**None of the original spec's outcomes produce a working v1 activation at the codegen layer.** The premise gap is real, not a minor refinement.
+
+### 14.3 Pivot — follow-on planner spec scope
+
+The dispatch decision is structurally a **runtime concern** (the data it would consume, `seq_len`, is bound at runtime). The follow-on spec must resolve at least one of:
+
+- **Option A — Make `seq_len` available at codegen time.** Modify the upstream pipeline so production callers DO have seq_len when invoking the synthesizer. Real architectural change in how shape information flows from AST through codegen. Cost: substantial; touches multiple upstream phases.
+- **Option B — Move dispatch decision past codegen (RECOMMENDED).** Tier B activation becomes a runtime decision implemented as a runtime branch in the kernel-launch wrapper rather than a codegen-time decision. PR #169's PTX is emitted unconditionally with `tier_b: Some(...)` for `segment_masked` configs; the launch wrapper picks which kernel variant to invoke based on runtime `seq_len`. Cost: PR #169's kernel-launch surface gains a runtime-branch; ~50 LOC at launch sites. Architecturally honest — aligns the decision-point with the data-availability.
+- **Option C — Defer to shape-inference maturity.** If NSL's roadmap includes adding seq_len to FlashAttentionConfig as part of a broader shape-inference improvement, dispatch activation waits for that work. Bounded dormancy extends to that milestone with explicit cited dependency. IR-009 honored because the dormancy is bounded by a specific upcoming work item, not indefinite.
+
+**Recommendation:** the follow-on spec investigates Option B first; falls back to A or C only if B has unforeseen complications. Option B's cost (~50 LOC at launch sites) is comparable to the original spec's case-(α) migration estimate, just at a different layer of the stack.
+
+### 14.4 What this spec leaves in tree
+
+- §1–§14 stay as the design record of what was attempted.
+- §14 (this amendment) documents what V-dispatch-integration found and why the original outcomes fail.
+- The findings doc ([D-1](2026-05-14-tier-b-dispatch-integration-findings.md)) is the load-bearing artifact for future readers.
+- The implementation plan ([`2026-05-14-pca-tier-b-dispatch-implementation.md`](../plans/2026-05-14-pca-tier-b-dispatch-implementation.md)) gets a header note: D-2 / D-3 / D-4 superseded by the follow-on planner spec.
+
+PR #169's Tier B kernel emission stays in tree — the kernel code itself is correct and covered by 16 parity tests. It remains accessible via the 2-arg `_with_tier_b(config, Some((seq_len, residency)))` API for tests, the bench binary, and any future code path that has `seq_len` available. The codegen-layer dispatch toggle stays at the existing dormant state until the follow-on planner spec lands.
+
+### 14.5 IR-009 framing under the pivot
+
+The dispatch spec was intended to discharge the bounded-dormancy state by activating the heuristic. The pivot doesn't discharge it; it redirects the work. To stay compliant with IR-009, the bounded-dormancy clock is **re-bounded** to the follow-on planner spec's expected ship date (a specific upcoming work item, not "later when convenient"). The decay timer continues from the M2/M6 findings doc's 2026-05-13 start date; the follow-on planner spec inherits the same six-month bound (2026-11-13). If the follow-on planner spec ships before then, IR-009 is satisfied. If it slips, the M3/M6 measurement infrastructure + PR #169's kernel code goes under explicit dead-code review.
+
+### 14.6 Institutional value of V-dispatch-integration
+
+V-dispatch-integration produced exactly the value it was designed to produce. The original dispatch spec framed the seq_len-source question as conditional on V-dispatch-integration's outcome; the verification ran; the answer was "the premise is wrong." This is the institutional discipline working at its highest level — a gate caught a load-bearing failure mode at the cost of 30-45 minutes of verification, preventing what would otherwise have been days of D-3 implementation work followed by integration failure.
+
+The brainstorm cycle's value is now visible across the full sequence:
+
+- **2026-05-02 original spec:** paused on the SMEM probe + Blackwell concern.
+- **2026-05-12 revision spec:** added probe-as-Phase-0 gate; caught the SMEM cap concern at design time.
+- **2026-05-13 B.1.5+B.2 spec:** measurement-gated keep/revert; caught the 99 KB Blackwell cap regression at B1.5-2; caught the skip_ratio=0 bug at B1.5-3.
+- **2026-05-14 dispatch spec:** V-dispatch-integration gate caught the seq_len-availability assumption gap.
+- **(now) amendment:** redirects to follow-on planner spec without losing institutional progress.
+
+Each spec contained the gates that caught the failure modes the next spec would otherwise have encountered. The discipline isn't preventing failures; it's catching them at the cheapest possible point in the work pipeline.
+
+### 14.7 IR-013 promotion (concurrent with this amendment)
+
+V-dispatch-integration's case-(β) finding is the canonical first instance of **external-caller-context assumption verification** — a specialization of IR-003 distinct from internal-code-graph assumptions. Promoting **IR-013 — External-caller-context assumptions warrant pre-implementation verification** now (single citation: this spec) is justified because:
+
+- The pattern produced a concrete failure mode with clear diagnostic value (the premise gap discovered).
+- Future specs depending on caller-context assumptions can be IR-013'd directly.
+- Keeping IR-013 narrow per §13.2's framing reasoning preserves diagnostic distinction across three+ specializations of IR-003 (caller-behavior here; upstream-reference for V-M35.2a-STE / SMEM probe candidates; runtime-value behavior for V-P1-D-style measurements).
+
+IR-013 lands in `docs/wiki/institutional-rules.md` alongside this amendment commit. Future second-instance citations of caller-context verification extend IR-013's "Cited from" list; they don't open IR-014 unless the verification discipline structurally diverges.
+
+## 15. References
 
 - `docs/superpowers/specs/2026-05-02-pca-tier-b-tile-skip-design.md` — original Tier B design.
 - `docs/superpowers/specs/2026-05-12-pca-tier-b-revision-design.md` — revision design (§3.1 / §3.4 / §6.3 in-place).
@@ -495,3 +573,4 @@ Worth a new "Cited from" entry on IR-011 (distinct test surfaces roll up into a 
 ## Revision changelog
 
 - **2026-05-14** — initial. Post-merge follow-up to PR #169. Four brainstorm decisions resolved: policy shape (minimal heuristic), no-op invariant evolution (1-arg form == heuristic's choice), seq_len source (V-dispatch-integration gates options 2/3/4), SegmentResidency default (Tiled). IR-003 extension + IR-011 extension + candidate IR-013 deferred per registry entry criterion.
+- **2026-05-14 (amendment §15)** — V-dispatch-integration ran (commit `3ddae7f4`); found α=0, β=3, γ=0 across all three production callers in `compiler/kernel.rs`. The §5.3 case-(α) path and §10 outcomes matrix are invalidated: no original-spec outcome produces a working v1 activation. Dispatch decision is structurally a runtime concern (the data it would consume is bound at runtime). Pivot to follow-on planner spec with three scoped options (recommendation: Option B — move dispatch past codegen). IR-013 promoted concurrently per §14.7. Implementation plan D-2 / D-3 / D-4 superseded.
