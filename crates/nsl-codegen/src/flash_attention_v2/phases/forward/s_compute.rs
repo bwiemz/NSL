@@ -91,7 +91,7 @@ pub fn emit(
     //     Codified in `docs/superpowers/specs/2026-05-13-tier-b-b15-3-skip-ratio-investigation.md`.
     if let Some((seq_len, residency)) = tier_b {
         if crate::pca_tilerange::should_emit_tier_b(config, seq_len as u64, residency) {
-            let log2_bkv = (block_kv as u32).trailing_zeros();
+            let log2_bkv = block_kv.trailing_zeros();
             let range_table_base =
                 crate::flash_attention_v2::smem_layout::tier_b_range_table_offset(
                     config,
