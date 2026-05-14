@@ -80,9 +80,15 @@ pub fn emit(
     //     start, set by the orchestrator BEFORE emit() is called.  We derive
     //     the kv-tile ordinal with a right-shift by log2(block_kv) (block_kv
     //     is always a power of 2 in the supported tile matrix).
-    //   - The q-tile ordinal is the compile-time constant `q_tile_iter`,
-    //     emitted as a PTX immediate literal — ptxas accepts an immediate
-    //     as the `a` operand of `shl.b32`.
+    //   - The q-tile ordinal is the per-CTA global index `%bid_x` (each CTA
+    //     handles ONE q-tile per the launch contract `grid_x = num_q_tiles`).
+    //     `q_tile_iter` is the WITHIN-CTA inner iter 0..(block_q/4 - 1) and
+    //     does NOT index the range table. Using `q_tile_iter` (as the v1
+    //     emission did) reads only range-table slots 0..15 regardless of
+    //     which q-tile this CTA is processing, so the predicate always
+    //     loaded entries for the first 16 global q-tiles — broken for any
+    //     CTA with bid_x >= 16 and incorrect even for bid_x ∈ 0..15.
+    //     Codified in `docs/superpowers/specs/2026-05-13-tier-b-b15-3-skip-ratio-investigation.md`.
     if let Some((seq_len, residency)) = tier_b {
         if crate::pca_tilerange::should_emit_tier_b(config, seq_len as u64, residency) {
             let log2_bkv = (block_kv as u32).trailing_zeros();
@@ -108,7 +114,7 @@ pub fn emit(
                 ptx,
                 config,
                 seq_len,
-                &q_tile_iter.to_string(), // qt is compile-time; emit as immediate
+                "%bid_x", // global q-tile index for THIS CTA (grid_x = num_q_tiles)
                 "%r_kvt_ord_TB",
                 range_table_base,
                 &skip_label,

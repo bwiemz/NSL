@@ -386,35 +386,53 @@ pub fn emit_skip_predicate(
     ptx.push_str("    .reg .u16  %qmin_TB, %qmax_TB, %kvmin_TB, %kvmax_TB;\n");
     ptx.push_str("    .reg .pred %p_lt_TB, %p_gt_TB, %p_skip_TB;\n");
     ptx.push_str("    .reg .u32  %tile_byte_TB;\n");
-    ptx.push_str("    .reg .u64  %addr_TB;\n");
+    ptx.push_str("    .reg .u64  %addr_TB, %tile_off_wide_TB;\n");
     ptx.push_str("\n");
 
-    // qmin[qt], qmax[qt]
+    // qmin[qt], qmax[qt].
+    //
+    // Pre-2026-05-13 bug: the per-tile byte offset was computed into
+    // `%addr_TB` via `cvt.u64.u32`, then `cvta.shared.u64 %addr_TB, shmem;`
+    // immediately OVERWROTE `%addr_TB` with the SMEM base — discarding the
+    // per-tile offset. Net effect: every predicate lookup read slot 0 of
+    // the range table regardless of `qt_reg` / `kvt_reg`, so `%p_skip_TB`
+    // was always false (qmin/qmax/kvmin/kvmax all from tile 0). Fix: hold
+    // the per-tile byte offset in a separate widened register so the
+    // `cvta` no longer clobbers it, then add base + table_offset +
+    // tile_offset.
     ptx.push_str(&format!("    shl.b32 %tile_byte_TB, {qt_reg}, 1;\n"));
-    ptx.push_str("    cvt.u64.u32 %addr_TB, %tile_byte_TB;\n");
+    ptx.push_str("    cvt.u64.u32 %tile_off_wide_TB, %tile_byte_TB;\n");
+    ptx.push_str("    cvta.shared.u64 %addr_TB, shmem;\n");
     ptx.push_str(&format!(
-        "    cvta.shared.u64 %addr_TB, shmem;\n    add.u64 %addr_TB, %addr_TB, {};\n",
+        "    add.u64 %addr_TB, %addr_TB, {};\n",
         addrs.qtile_min
     ));
+    ptx.push_str("    add.u64 %addr_TB, %addr_TB, %tile_off_wide_TB;\n");
     ptx.push_str("    ld.shared.u16 %qmin_TB, [%addr_TB];\n");
+    ptx.push_str("    cvta.shared.u64 %addr_TB, shmem;\n");
     ptx.push_str(&format!(
-        "    cvta.shared.u64 %addr_TB, shmem;\n    add.u64 %addr_TB, %addr_TB, {};\n",
+        "    add.u64 %addr_TB, %addr_TB, {};\n",
         addrs.qtile_max
     ));
+    ptx.push_str("    add.u64 %addr_TB, %addr_TB, %tile_off_wide_TB;\n");
     ptx.push_str("    ld.shared.u16 %qmax_TB, [%addr_TB];\n");
 
     // kvmin[kvt], kvmax[kvt]
     ptx.push_str(&format!("    shl.b32 %tile_byte_TB, {kvt_reg}, 1;\n"));
-    ptx.push_str("    cvt.u64.u32 %addr_TB, %tile_byte_TB;\n");
+    ptx.push_str("    cvt.u64.u32 %tile_off_wide_TB, %tile_byte_TB;\n");
+    ptx.push_str("    cvta.shared.u64 %addr_TB, shmem;\n");
     ptx.push_str(&format!(
-        "    cvta.shared.u64 %addr_TB, shmem;\n    add.u64 %addr_TB, %addr_TB, {};\n",
+        "    add.u64 %addr_TB, %addr_TB, {};\n",
         addrs.kvtile_min
     ));
+    ptx.push_str("    add.u64 %addr_TB, %addr_TB, %tile_off_wide_TB;\n");
     ptx.push_str("    ld.shared.u16 %kvmin_TB, [%addr_TB];\n");
+    ptx.push_str("    cvta.shared.u64 %addr_TB, shmem;\n");
     ptx.push_str(&format!(
-        "    cvta.shared.u64 %addr_TB, shmem;\n    add.u64 %addr_TB, %addr_TB, {};\n",
+        "    add.u64 %addr_TB, %addr_TB, {};\n",
         addrs.kvtile_max
     ));
+    ptx.push_str("    add.u64 %addr_TB, %addr_TB, %tile_off_wide_TB;\n");
     ptx.push_str("    ld.shared.u16 %kvmax_TB, [%addr_TB];\n");
 
     // disjoint = (qmax < kvmin) || (qmin > kvmax)

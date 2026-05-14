@@ -233,6 +233,23 @@ pub unsafe fn time_kernel_launches(
                 n_keep,
                 n_other
             );
+            // Dump first 128 bytes raw and the first non-zero byte's offset
+            // for diagnostic verification that the kernel writeback path is
+            // populating the buffer at the expected slot stride.
+            let head: Vec<String> =
+                host.iter().take(128).map(|b| format!("{:02x}", b)).collect();
+            eprintln!("[bench] first 128 bytes: {}", head.join(" "));
+            let first_nz = host.iter().enumerate().find(|(_, &b)| b != 0);
+            match first_nz {
+                Some((i, b)) => eprintln!(
+                    "[bench] first non-zero byte at offset {} = 0x{:02x}",
+                    i, b
+                ),
+                None => eprintln!(
+                    "[bench] no non-zero bytes in entire {} byte buffer",
+                    host.len()
+                ),
+            }
         }
         // Ratio is over the FULL buffer (not just written cells) — the spec
         // §4.3 contract pins the buffer shape; under-writing is a bench
