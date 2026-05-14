@@ -24,19 +24,22 @@ use std::path::Path;
 
 /// One quantized ternary weight tensor with its per-tensor scale.
 ///
-/// **TODO (M35.1 Linux follow-on, before un-ignoring `bitnet_logit_match`):**
-/// the `scale` field captured here is the BitLinear b1.58 per-tensor absmean
-/// scale used during forward dequantization. Phase 1's `finalize.rs` epilogue
-/// currently computes `Y = (act_scale / 127) * acc` and **omits the weight_scale
-/// factor**, so the emitted kernel produces results off by a per-layer constant.
-/// The Linux follow-on that fills in the full inference harness must:
-///   1. Pass each layer's `scale` as a kernel parameter (or burn it as a
-///      compile-time immediate in the synthesized PTX).
-///   2. Multiply the FP32 accumulator by `scale` inside `finalize.rs::emit`
-///      (or factor it into the activation-scale division to save one mul).
-/// Until that lands, `bitnet_logit_match`'s logit comparison is intentionally
-/// `#[ignore]`'d; pre-flight assertions about prompt-set shape and reference-
-/// logits file size are the only currently active gates.
+/// The `scale` field is the BitLinear b1.58 per-tensor absmean scale used
+/// during forward dequantization. The host passes it as the
+/// `.param .f32 weight_scale` kernel argument to `bitnet::synthesize_kernel`'s
+/// emitted PTX; `phases/finalize.rs::emit` loads it via `ld.param.f32` and
+/// multiplies the FP32 accumulator (`%f_y_out`) BEFORE optional bias/residual
+/// (which operate in output space and are not scaled). The full BitLinear
+/// forward implemented by the emitted kernel is:
+///
+/// ```text
+/// y = weight_scale * (act_scale / 127) * acc + [bias] + [residual]
+/// ```
+///
+/// `bitnet_logit_match` remains `#[ignore]`'d only because the reference
+/// logits binary at `tests/fixtures/bitnet_b158_3b_reference_logits.bin`
+/// requires bitnet.cpp running on the pinned checkpoint (Linux/macOS only;
+/// see that test's module docstring for the full procedure).
 #[derive(Debug)]
 pub struct LoadedTernaryWeight {
     /// Tensor name from the safetensors header (e.g., "model.layers.0.self_attn.q_proj.weight").

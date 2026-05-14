@@ -1,9 +1,12 @@
 ---
 source: crates/nsl-codegen/tests/bitnet_ptx_snapshots.rs
-assertion_line: 65
+assertion_line: 70
 expression: ptx
 ---
 // === BitNet finalize ===
+// weight_scale: %f_y_out *= ld.param.f32 weight_scale.
+ld.param.f32 %f_w_scale, [weight_scale];
+mul.f32 %f_y_out, %f_y_out, %f_w_scale;
 // Cast FP32 -> F16/BF16 and store to HBM.
 cvt.rn.f16.f32 %h_y, %f_y_out;
 mul.lo.u32 %r_yoff, %r_row_id, %r_out_dim;

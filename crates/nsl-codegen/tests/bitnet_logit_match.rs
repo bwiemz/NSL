@@ -3,7 +3,7 @@
 //! Spec: docs/superpowers/specs/2026-05-11-m35-1-bitnet-ternary-design.md §6.6.
 //! Tolerance: FP16 ULP (1e-3 relative) on all 32 reference prompts.
 //!
-//! ## Status: #[ignore]'d pending Linux follow-on artifacts
+//! ## Status: #[ignore]'d pending one remaining Linux follow-on artifact
 //!
 //! This test is the merge gate for M35.1 inference correctness. It requires:
 //!
@@ -17,6 +17,12 @@
 //!    the 32 prompt set). bitnet.cpp does not build on Windows MSVC; this
 //!    artifact is deferred to a Linux follow-on (parallel to the AWQ
 //!    PR #134 pattern where merge-gate work was deferred via #[ignore]).
+//!
+//! The `weight_scale` wiring through `phases/finalize.rs::emit` (the other
+//! historical Linux follow-on) is COMPLETE — the synthesized kernel now
+//! receives the per-tensor BitLinear absmean scale as `.param .f32
+//! weight_scale` and applies it before bias/residual. Only the reference
+//! logits artifact remains.
 //!
 //! Run with: `cargo test -p nsl-codegen --test bitnet_logit_match -- --ignored`.
 //! On a fresh machine, first run `bash scripts/fetch_bitnet_b158_3b.sh`.
@@ -185,10 +191,12 @@ fn end_to_end_logit_match_against_hf_b158_3b() {
         expected_vocab
     );
 
-    // TODO(M35.1 Linux follow-on): full inference comparison.
+    // TODO(M35.1 Linux follow-on — reference_logits.bin only; weight_scale wiring is done):
+    // full inference comparison.
     //
     // The inference path goes through nsl_codegen::bitnet::synthesize_kernel
-    // producing PTX, then a real-subprocess harness (parallel to AWQ's
+    // producing PTX (now including the .param .f32 weight_scale slot consumed
+    // by finalize.rs::emit), then a real-subprocess harness (parallel to AWQ's
     // end_to_end_real_subprocess_matches_analytical_reference in
     // tests/awq_full_pipeline.rs) tokenizes each prompt, runs forward, and
     // captures final-position logits. Per-prompt comparison:

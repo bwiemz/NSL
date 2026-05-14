@@ -1,5 +1,6 @@
 ---
 source: crates/nsl-codegen/tests/bitnet_orchestrator.rs
+assertion_line: 34
 expression: ptx
 ---
 .version 7.0
@@ -9,7 +10,8 @@ expression: ptx
 .visible .entry nsl_bitnet_b158_gemm_m64_n128_k128_f16 (
   .param .u64 act_in,
   .param .u64 weights_packed,
-  .param .u64 y_out
+  .param .u64 y_out,
+  .param .f32 weight_scale
 ) {
 // --- Body skeleton (Phase 1; runtime register definitions added in Task 10) ---
 // === BitNet packed_load (block_k=128, block_n=128) ===
@@ -151,6 +153,9 @@ mul.f32 %f_y_out, %f_inv127_scale, %f_acc;
 // === end BitNet ternary_gemm ===
 // === end BitNet fused quantized_ternary_gemm ===
 // === BitNet finalize ===
+// weight_scale: %f_y_out *= ld.param.f32 weight_scale.
+ld.param.f32 %f_w_scale, [weight_scale];
+mul.f32 %f_y_out, %f_y_out, %f_w_scale;
 // Cast FP32 -> F16/BF16 and store to HBM.
 cvt.rn.f16.f32 %h_y, %f_y_out;
 mul.lo.u32 %r_yoff, %r_row_id, %r_out_dim;
