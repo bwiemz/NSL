@@ -120,8 +120,53 @@ fn registry() -> Vec<Fixture> {
         parity("parity_4", 4096, 0.8),  // boundary_dense — 16 small docs, lots of empties
         parity("parity_5", 4096, 0.0),  // single_doc — no empties, predicate always false
         parity("parity_6", 4096, 0.5),  // tail_padding — 2 docs + padding sentinel
+        // Sensitivity tier (§4.3 / spec §4.3.1). Three fixtures sharing the
+        // gate fixture's dims (block 64×64×64, segment-masked causal, sm_120,
+        // seq_len=4096, batch=4, head_dim=64) and varying only `target_sparsity`
+        // to characterize the sparsity → benefit curve:
+        //
+        //   - sensitivity_10 (sub-threshold candidate): few skippable tiles;
+        //     answers "does Tier B actively hurt at low sparsity?"
+        //   - sensitivity_50 (gate redundancy): structurally identical to
+        //     `gate_4096` — cross-check that two independent measurements
+        //     of the same configuration agree within ±10% (§4.3.1).
+        //   - sensitivity_90 (saturation regime): most tiles skippable;
+        //     establishes the upper bound of Tier B's benefit.
+        //
+        // The triple feeds the §4.3.3 "keep with sparsity gate" outcome
+        // when the curve shows a threshold shape.
+        sensitivity("sensitivity_10", 0.1),
+        sensitivity("sensitivity_50", 0.5),
+        sensitivity("sensitivity_90", 0.9),
     ]
-    // Sensitivity (§4.3) fixtures are added in B1.5-4.
+}
+
+/// Helper to build a sensitivity fixture; shares the gate fixture's
+/// tile dims, seq_len, batch, and head_dim, varying only `target_sparsity`.
+/// Kept as a free fn (not a closure inside `registry()`) so the gate
+/// fixture's literal block above stays the single source-of-truth for the
+/// non-sparsity dims while still permitting per-fixture construction.
+fn sensitivity(name: &'static str, target_sparsity: f64) -> Fixture {
+    Fixture {
+        name,
+        config: FlashAttentionConfig {
+            block_q: 64,
+            block_kv: 64,
+            head_dim: 64,
+            causal: true,
+            paged: false,
+            rope_q: false,
+            rope_style: RopeStyle::HalfSplit,
+            gqa_group_size: 1,
+            tree_mask: false,
+            gpu_sm: 120,
+            segment_masked: true,
+            csha: None,
+        },
+        seq_len: 4096,
+        batch: 4,
+        target_sparsity,
+    }
 }
 
 #[cfg(test)]
