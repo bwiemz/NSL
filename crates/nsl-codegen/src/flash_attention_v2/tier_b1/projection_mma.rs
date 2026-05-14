@@ -376,6 +376,13 @@ pub fn emit_q_projection(ptx: &mut String, config: &FlashAttentionConfig, chunk:
         x_m_stride_bytes
     );
     let log2_x_m_stride = x_m_stride_bytes.trailing_zeros();
+    // N1c: Q-projection K-loop count = chunk / 16.
+    assert!(
+        chunk % 16 == 0,
+        "N1c: Q-projection K-loop requires chunk divisible by 16; got {}",
+        chunk
+    );
+    let n_k_iters_qproj = chunk / 16;
 
     // SMEM offsets (computed inline so the function is self-contained).
     let w_chunk_off = tier_b1_w_chunk_offset(config);
@@ -412,6 +419,8 @@ pub fn emit_q_projection(ptx: &mut String, config: &FlashAttentionConfig, chunk:
     ptx.push_str("    .reg .u32 %qmma_global_t, %qmma_m_tile, %qmma_n_tile;\n");
     ptx.push_str("    .reg .u32 %qmma_x_warp_off, %qmma_w_warp_off;\n");
     ptx.push_str("    .reg .u32 %qmma_a_base, %qmma_b_base;\n");
+    // N1c K-iter shifted bases.
+    ptx.push_str("    .reg .u32 %qmma_a_base_k, %qmma_b_base_k;\n");
 
     // ----- 2. Null-guards on csha_x_ptr + csha_wq_ptr -----
     ptx.push_str("    // Null-guard csha_x_ptr; on null, skip Q projection (Tier A path).\n");
@@ -568,48 +577,77 @@ pub fn emit_q_projection(ptx: &mut String, config: &FlashAttentionConfig, chunk:
                 "    .reg .b32 %tb1_q_b_{}_{}_0, %tb1_q_b_{}_{}_1;\n",
                 chunk_idx, t, chunk_idx, t
             ));
-            let a_fragment_regs = [
-                format!("tb1_q_a_{}_{}_0", chunk_idx, t),
-                format!("tb1_q_a_{}_{}_1", chunk_idx, t),
-                format!("tb1_q_a_{}_{}_2", chunk_idx, t),
-                format!("tb1_q_a_{}_{}_3", chunk_idx, t),
-            ];
-            emit_load_a_fragment_smem(
-                ptx,
-                &a_fragment_regs,
-                "%qmma_a_base",
-                (chunk * 2) as usize,
-            );
-            let b_fragment_regs = [
-                format!("tb1_q_b_{}_{}_0", chunk_idx, t),
-                format!("tb1_q_b_{}_{}_1", chunk_idx, t),
-            ];
-            emit_load_b_fragment_smem(
-                ptx,
-                &b_fragment_regs,
-                "%qmma_b_base",
-                (hd * 2) as usize,
-            );
-            let d_regs = [
-                format!("%q_acc_{}_0", t),
-                format!("%q_acc_{}_1", t),
-                format!("%q_acc_{}_2", t),
-                format!("%q_acc_{}_3", t),
-            ];
-            let a_regs = [
-                format!("%tb1_q_a_{}_{}_0", chunk_idx, t),
-                format!("%tb1_q_a_{}_{}_1", chunk_idx, t),
-                format!("%tb1_q_a_{}_{}_2", chunk_idx, t),
-                format!("%tb1_q_a_{}_{}_3", chunk_idx, t),
-            ];
-            let b_regs = [
-                format!("%tb1_q_b_{}_{}_0", chunk_idx, t),
-                format!("%tb1_q_b_{}_{}_1", chunk_idx, t),
-            ];
-            let c_regs = d_regs.clone();
-            // N3: unconditional MMA — each warp writes its OWN %q_acc_<t>_*
-            // slot for its OWN (m_tile, n_tile).
-            emit_mma_instruction(ptx, &d_regs, &a_regs, &b_regs, &c_regs);
+
+            // N1c: Q-projection K-loop. K-dim = chunk; for chunk > 16 we
+            // need chunk/16 K-iters, accumulating into the same
+            // %q_acc_<t>_*. Shifts:
+            //   - A (x_q[bq × chunk]) base by k_iter * 32 bytes (col shift)
+            //   - B (Wq[chunk × hd]) base by k_iter * 16 * hd * 2 bytes
+            //     (row shift down chunk dim, each row spans hd cols × 2 bytes)
+            for k_iter in 0..n_k_iters_qproj {
+                let a_base_expr: String = if k_iter == 0 {
+                    "%qmma_a_base".to_string()
+                } else {
+                    let off = k_iter * 32;
+                    ptx.push_str(&format!(
+                        "    add.u32 %qmma_a_base_k, %qmma_a_base, {}; // Q-proj A k_iter={}\n",
+                        off, k_iter
+                    ));
+                    "%qmma_a_base_k".to_string()
+                };
+                let b_base_expr: String = if k_iter == 0 {
+                    "%qmma_b_base".to_string()
+                } else {
+                    let off = k_iter * 16 * hd * 2;
+                    ptx.push_str(&format!(
+                        "    add.u32 %qmma_b_base_k, %qmma_b_base, {}; // Q-proj B k_iter={}\n",
+                        off, k_iter
+                    ));
+                    "%qmma_b_base_k".to_string()
+                };
+
+                let a_fragment_regs = [
+                    format!("tb1_q_a_{}_{}_0", chunk_idx, t),
+                    format!("tb1_q_a_{}_{}_1", chunk_idx, t),
+                    format!("tb1_q_a_{}_{}_2", chunk_idx, t),
+                    format!("tb1_q_a_{}_{}_3", chunk_idx, t),
+                ];
+                emit_load_a_fragment_smem(
+                    ptx,
+                    &a_fragment_regs,
+                    &a_base_expr,
+                    (chunk * 2) as usize,
+                );
+                let b_fragment_regs = [
+                    format!("tb1_q_b_{}_{}_0", chunk_idx, t),
+                    format!("tb1_q_b_{}_{}_1", chunk_idx, t),
+                ];
+                emit_load_b_fragment_smem(
+                    ptx,
+                    &b_fragment_regs,
+                    &b_base_expr,
+                    (hd * 2) as usize,
+                );
+                let d_regs = [
+                    format!("%q_acc_{}_0", t),
+                    format!("%q_acc_{}_1", t),
+                    format!("%q_acc_{}_2", t),
+                    format!("%q_acc_{}_3", t),
+                ];
+                let a_regs = [
+                    format!("%tb1_q_a_{}_{}_0", chunk_idx, t),
+                    format!("%tb1_q_a_{}_{}_1", chunk_idx, t),
+                    format!("%tb1_q_a_{}_{}_2", chunk_idx, t),
+                    format!("%tb1_q_a_{}_{}_3", chunk_idx, t),
+                ];
+                let b_regs = [
+                    format!("%tb1_q_b_{}_{}_0", chunk_idx, t),
+                    format!("%tb1_q_b_{}_{}_1", chunk_idx, t),
+                ];
+                let c_regs = d_regs.clone();
+                // N1c: accumulate into same %q_acc_<t>_* across K-iters.
+                emit_mma_instruction(ptx, &d_regs, &a_regs, &b_regs, &c_regs);
+            }
         }
     }
 
@@ -743,6 +781,13 @@ pub fn emit_kv_projection_chunk_loop(
         x_m_stride_kv_bytes
     );
     let log2_x_m_stride_kv = x_m_stride_kv_bytes.trailing_zeros();
+    // N1d: K/V-projection K-loop count = chunk / 16.
+    assert!(
+        chunk % 16 == 0,
+        "N1d: KV-projection K-loop requires chunk divisible by 16; got {}",
+        chunk
+    );
+    let n_k_iters_kvproj = chunk / 16;
 
     // SMEM offsets (computed inline so the function is self-contained).
     let w_chunk_off = tier_b1_w_chunk_offset(config);
@@ -798,6 +843,10 @@ pub fn emit_kv_projection_chunk_loop(
     ptx.push_str("    .reg .u32 %kvmma_global_t, %kvmma_m_tile, %kvmma_n_tile;\n");
     ptx.push_str("    .reg .u32 %kvmma_x_warp_off, %kvmma_w_warp_off;\n");
     ptx.push_str("    .reg .u32 %kvmma_a_base, %kvmma_bk_base, %kvmma_bv_base;\n");
+    // N1d K-iter shifted bases.
+    ptx.push_str(
+        "    .reg .u32 %kvmma_a_base_k, %kvmma_bk_base_k, %kvmma_bv_base_k;\n",
+    );
 
     // ----- 2. Null-guards on csha_x_ptr, csha_wk_ptr, csha_wv_ptr -----
     let skip_label = format!("V2_TIER_B1_KV_PROJ_SKIP_{}", slot);
@@ -982,83 +1031,117 @@ pub fn emit_kv_projection_chunk_loop(
                 "    add.u32 %kvmma_bv_base, %tb1_kv_smem_wv_u32, %kvmma_w_warp_off;\n",
             );
 
-            // B1.6 deferral #1 resolution: A/B-fragment loads via matmul_mma
-            // helpers with per-(warp, lane) addressing. Each warp's bases
-            // differ via N3 runtime offsets above.
-            //
-            // A-fragment: x_kv rows. Shared between K and V MMAs.
-            let a_fragment_regs = [
-                format!("tb1_kv_a_{}_{}_0", chunk_idx, t),
-                format!("tb1_kv_a_{}_{}_1", chunk_idx, t),
-                format!("tb1_kv_a_{}_{}_2", chunk_idx, t),
-                format!("tb1_kv_a_{}_{}_3", chunk_idx, t),
-            ];
-            emit_load_a_fragment_smem(
-                ptx,
-                &a_fragment_regs,
-                "%kvmma_a_base",
-                (chunk * 2) as usize,
-            );
+            // N1d: K/V projection K-loop. K-dim = chunk; for chunk > 16
+            // we need chunk/16 K-iters, accumulating into the same
+            // %k_acc_<t>_* and %v_acc_<t>_*. Shifts:
+            //   - A (x_kv[bkv × chunk]) base by k_iter * 32 bytes (col)
+            //   - B (Wk/Wv[chunk × hd]) base by k_iter * 16 * hd * 2 bytes (row)
+            for k_iter in 0..n_k_iters_kvproj {
+                let a_base_expr: String = if k_iter == 0 {
+                    "%kvmma_a_base".to_string()
+                } else {
+                    let off = k_iter * 32;
+                    ptx.push_str(&format!(
+                        "    add.u32 %kvmma_a_base_k, %kvmma_a_base, {}; // KV-proj A k_iter={}\n",
+                        off, k_iter
+                    ));
+                    "%kvmma_a_base_k".to_string()
+                };
+                let bk_base_expr: String = if k_iter == 0 {
+                    "%kvmma_bk_base".to_string()
+                } else {
+                    let off = k_iter * 16 * hd * 2;
+                    ptx.push_str(&format!(
+                        "    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, {}; // KV-proj Bk k_iter={}\n",
+                        off, k_iter
+                    ));
+                    "%kvmma_bk_base_k".to_string()
+                };
+                let bv_base_expr: String = if k_iter == 0 {
+                    "%kvmma_bv_base".to_string()
+                } else {
+                    let off = k_iter * 16 * hd * 2;
+                    ptx.push_str(&format!(
+                        "    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, {}; // KV-proj Bv k_iter={}\n",
+                        off, k_iter
+                    ));
+                    "%kvmma_bv_base_k".to_string()
+                };
 
-            // K B-fragment: Wk cols (warp-specific via n_tile).
-            let bk_fragment_regs = [
-                format!("tb1_kv_bk_{}_{}_0", chunk_idx, t),
-                format!("tb1_kv_bk_{}_{}_1", chunk_idx, t),
-            ];
-            emit_load_b_fragment_smem(
-                ptx,
-                &bk_fragment_regs,
-                "%kvmma_bk_base",
-                (hd * 2) as usize,
-            );
+                // A-fragment: x_kv rows. Shared between K and V MMAs.
+                let a_fragment_regs = [
+                    format!("tb1_kv_a_{}_{}_0", chunk_idx, t),
+                    format!("tb1_kv_a_{}_{}_1", chunk_idx, t),
+                    format!("tb1_kv_a_{}_{}_2", chunk_idx, t),
+                    format!("tb1_kv_a_{}_{}_3", chunk_idx, t),
+                ];
+                emit_load_a_fragment_smem(
+                    ptx,
+                    &a_fragment_regs,
+                    &a_base_expr,
+                    (chunk * 2) as usize,
+                );
 
-            // V B-fragment: Wv cols.
-            let bv_fragment_regs = [
-                format!("tb1_kv_bv_{}_{}_0", chunk_idx, t),
-                format!("tb1_kv_bv_{}_{}_1", chunk_idx, t),
-            ];
-            emit_load_b_fragment_smem(
-                ptx,
-                &bv_fragment_regs,
-                "%kvmma_bv_base",
-                (hd * 2) as usize,
-            );
+                // K B-fragment: Wk cols (warp-specific via n_tile).
+                let bk_fragment_regs = [
+                    format!("tb1_kv_bk_{}_{}_0", chunk_idx, t),
+                    format!("tb1_kv_bk_{}_{}_1", chunk_idx, t),
+                ];
+                emit_load_b_fragment_smem(
+                    ptx,
+                    &bk_fragment_regs,
+                    &bk_base_expr,
+                    (hd * 2) as usize,
+                );
 
-            // --- MMA (a): K accumulation ---
-            let k_d_regs = [
-                format!("%k_acc_{}_0", t),
-                format!("%k_acc_{}_1", t),
-                format!("%k_acc_{}_2", t),
-                format!("%k_acc_{}_3", t),
-            ];
-            let a_regs = [
-                format!("%tb1_kv_a_{}_{}_0", chunk_idx, t),
-                format!("%tb1_kv_a_{}_{}_1", chunk_idx, t),
-                format!("%tb1_kv_a_{}_{}_2", chunk_idx, t),
-                format!("%tb1_kv_a_{}_{}_3", chunk_idx, t),
-            ];
-            let bk_regs = [
-                format!("%tb1_kv_bk_{}_{}_0", chunk_idx, t),
-                format!("%tb1_kv_bk_{}_{}_1", chunk_idx, t),
-            ];
-            let k_c_regs = k_d_regs.clone();
-            // N3: unconditional K MMA — warps write distinct %k_acc_<t>_*.
-            emit_mma_instruction(ptx, &k_d_regs, &a_regs, &bk_regs, &k_c_regs);
+                // V B-fragment: Wv cols.
+                let bv_fragment_regs = [
+                    format!("tb1_kv_bv_{}_{}_0", chunk_idx, t),
+                    format!("tb1_kv_bv_{}_{}_1", chunk_idx, t),
+                ];
+                emit_load_b_fragment_smem(
+                    ptx,
+                    &bv_fragment_regs,
+                    &bv_base_expr,
+                    (hd * 2) as usize,
+                );
 
-            // --- MMA (b): V accumulation ---
-            let v_d_regs = [
-                format!("%v_acc_{}_0", t),
-                format!("%v_acc_{}_1", t),
-                format!("%v_acc_{}_2", t),
-                format!("%v_acc_{}_3", t),
-            ];
-            let bv_regs = [
-                format!("%tb1_kv_bv_{}_{}_0", chunk_idx, t),
-                format!("%tb1_kv_bv_{}_{}_1", chunk_idx, t),
-            ];
-            let v_c_regs = v_d_regs.clone();
-            // N3: unconditional V MMA — warps write distinct %v_acc_<t>_*.
-            emit_mma_instruction(ptx, &v_d_regs, &a_regs, &bv_regs, &v_c_regs);
+                // --- MMA (a): K accumulation ---
+                let k_d_regs = [
+                    format!("%k_acc_{}_0", t),
+                    format!("%k_acc_{}_1", t),
+                    format!("%k_acc_{}_2", t),
+                    format!("%k_acc_{}_3", t),
+                ];
+                let a_regs = [
+                    format!("%tb1_kv_a_{}_{}_0", chunk_idx, t),
+                    format!("%tb1_kv_a_{}_{}_1", chunk_idx, t),
+                    format!("%tb1_kv_a_{}_{}_2", chunk_idx, t),
+                    format!("%tb1_kv_a_{}_{}_3", chunk_idx, t),
+                ];
+                let bk_regs = [
+                    format!("%tb1_kv_bk_{}_{}_0", chunk_idx, t),
+                    format!("%tb1_kv_bk_{}_{}_1", chunk_idx, t),
+                ];
+                let k_c_regs = k_d_regs.clone();
+                // N1d: accumulate into same %k_acc_<t>_* across K-iters.
+                emit_mma_instruction(ptx, &k_d_regs, &a_regs, &bk_regs, &k_c_regs);
+
+                // --- MMA (b): V accumulation ---
+                let v_d_regs = [
+                    format!("%v_acc_{}_0", t),
+                    format!("%v_acc_{}_1", t),
+                    format!("%v_acc_{}_2", t),
+                    format!("%v_acc_{}_3", t),
+                ];
+                let bv_regs = [
+                    format!("%tb1_kv_bv_{}_{}_0", chunk_idx, t),
+                    format!("%tb1_kv_bv_{}_{}_1", chunk_idx, t),
+                ];
+                let v_c_regs = v_d_regs.clone();
+                // N1d: accumulate into same %v_acc_<t>_* across K-iters.
+                emit_mma_instruction(ptx, &v_d_regs, &a_regs, &bv_regs, &v_c_regs);
+            }
         }
     }
 
@@ -1126,16 +1209,18 @@ mod tests {
     }
 
     #[test]
-    fn mma_count_matches_tiles_per_warp_times_chunks() {
-        // (bq=32, hd=32): m_tiles=2, n_tiles=4, total=8 -> tpw = 1.
-        // n_chunks=16. Expected MMA count = 16 * 1 = 16.
+    fn mma_count_matches_tiles_per_warp_times_chunks_times_k_iters() {
+        // N1c: K-loop over chunk/16 added.
+        // (bq=32, hd=32, chunk=128): tpw=1, n_chunks=16, n_k_iters=8.
+        // Expected MMA count = tpw * n_chunks * n_k_iters = 1*16*8 = 128.
         let cfg = make_config(32, 32, 32, 2048);
         let mut ptx = String::new();
         emit_q_projection(&mut ptx, &cfg, 128);
         let mma_count = ptx.matches("mma.sync.aligned.m16n8k16").count();
-        assert_eq!(mma_count, 16,
-            "expected 16 MMA instructions (1 tile/warp * 16 chunks); got {}\nPTX:\n{}",
-            mma_count, ptx);
+        let expected = 1 * 16 * 8;
+        assert_eq!(mma_count, expected,
+            "expected {} MMA instructions (1 tile/warp * 16 chunks * 8 K-iters); got {}\nPTX:\n{}",
+            expected, mma_count, ptx);
     }
 
     #[test]
@@ -1205,21 +1290,22 @@ mod tests {
     }
 
     #[test]
-    fn kv_mma_count_is_two_times_tpw_times_chunks() {
-        // (bkv=32, hd=32): m_tiles=2, n_tiles=4, total=8, tpw_kv=1.
-        // n_chunks = 2048/128 = 16.
-        // Expected MMA count = 2 (K+V) * 1 (tpw_kv) * 16 (chunks) = 32.
+    fn kv_mma_count_is_two_times_tpw_times_chunks_times_k_iters() {
+        // N1d: K-loop over chunk/16 added.
+        // (bkv=32, hd=32, chunk=128): tpw_kv=1, n_chunks=16, n_k_iters=8.
+        // Expected = 2 (K+V) * tpw * n_chunks * n_k_iters = 2*1*16*8 = 256.
         let cfg = make_config(32, 32, 32, 2048);
         let mut ptx = String::new();
         emit_kv_projection_chunk_loop(&mut ptx, &cfg, 128, 0, 0);
         let mma_count = ptx.matches("mma.sync.aligned.m16n8k16").count();
         let tpw_kv = tiles_per_warp_kv(&cfg);
         let n_chunks = 2048 / 128;
-        let expected = 2 * tpw_kv * n_chunks;
+        let n_k_iters = 128 / 16;
+        let expected = 2 * tpw_kv * n_chunks * n_k_iters;
         assert_eq!(
             mma_count, expected as usize,
-            "expected {} MMA instructions (2 * {} tpw_kv * {} chunks); got {}\nPTX:\n{}",
-            expected, tpw_kv, n_chunks, mma_count, ptx
+            "expected {} MMA instructions (2 * {} tpw_kv * {} chunks * {} K-iters); got {}\nPTX:\n{}",
+            expected, tpw_kv, n_chunks, n_k_iters, mma_count, ptx
         );
     }
 

@@ -316,6 +316,16 @@ fn emit_qkt_mma(ptx: &mut String, config: &FlashAttentionConfig, slot: u32) {
     ptx.push_str("    .reg .u32 %qkt_global_t, %qkt_m_tile, %qkt_n_tile;\n");
     ptx.push_str("    .reg .u32 %qkt_q_warp_off, %qkt_k_warp_off;\n");
     ptx.push_str("    .reg .u32 %qkt_a_base, %qkt_b_base;\n");
+    // N1b K-iter shifted bases (for head_dim > 16).
+    ptx.push_str("    .reg .u32 %qkt_a_base_k, %qkt_b_base_k;\n");
+
+    // N1b: QK^T K-loop count = head_dim / 16.
+    assert!(
+        hd % 16 == 0,
+        "N1b: QK^T K-loop requires head_dim divisible by 16; got {}",
+        hd
+    );
+    let n_k_iters_qkt = hd / 16;
 
     for t in 0..tpw {
         // N3: compute warp-specific (m_tile, n_tile) at runtime.
@@ -349,9 +359,7 @@ fn emit_qkt_mma(ptx: &mut String, config: &FlashAttentionConfig, slot: u32) {
         ptx.push_str("    add.u32 %qkt_b_base, %tb1_phase_b_smem_k_u32, %qkt_k_warp_off;\n");
 
         // B1.6 deferral #1 resolution: per-lane fragment loads via
-        // matmul_mma helpers. A-fragment from Q SMEM (stride hd*2 bytes);
-        // B-fragment from K SMEM (stride hd*2 bytes for the K-row layout
-        // that QK^T uses). Each warp's bases differ via N3 runtime offset.
+        // matmul_mma helpers.
         ptx.push_str(&format!(
             "    .reg .b32 %tb1_qkt_a_{}_0, %tb1_qkt_a_{}_1, %tb1_qkt_a_{}_2, %tb1_qkt_a_{}_3;\n",
             t, t, t, t
@@ -360,49 +368,76 @@ fn emit_qkt_mma(ptx: &mut String, config: &FlashAttentionConfig, slot: u32) {
             "    .reg .b32 %tb1_qkt_b_{}_0, %tb1_qkt_b_{}_1;\n",
             t, t
         ));
-        let a_fragment_regs = [
-            format!("tb1_qkt_a_{}_0", t),
-            format!("tb1_qkt_a_{}_1", t),
-            format!("tb1_qkt_a_{}_2", t),
-            format!("tb1_qkt_a_{}_3", t),
-        ];
-        emit_load_a_fragment_smem(
-            ptx,
-            &a_fragment_regs,
-            "%qkt_a_base",
-            (hd * 2) as usize,
-        );
-        let b_fragment_regs = [
-            format!("tb1_qkt_b_{}_0", t),
-            format!("tb1_qkt_b_{}_1", t),
-        ];
-        emit_load_b_fragment_smem(
-            ptx,
-            &b_fragment_regs,
-            "%qkt_b_base",
-            (hd * 2) as usize,
-        );
-        let d_regs = [
-            format!("%s_acc_{}_0", t),
-            format!("%s_acc_{}_1", t),
-            format!("%s_acc_{}_2", t),
-            format!("%s_acc_{}_3", t),
-        ];
-        let a_regs = [
-            format!("%tb1_qkt_a_{}_0", t),
-            format!("%tb1_qkt_a_{}_1", t),
-            format!("%tb1_qkt_a_{}_2", t),
-            format!("%tb1_qkt_a_{}_3", t),
-        ];
-        let b_regs = [
-            format!("%tb1_qkt_b_{}_0", t),
-            format!("%tb1_qkt_b_{}_1", t),
-        ];
-        let c_regs = d_regs.clone();
-        // N3: no warp predicate — each warp's QK^T MMA reads from a
-        // DISTINCT (m_tile, n_tile) of Q/K SMEM via %qkt_a_base/%qkt_b_base
-        // and writes to its OWN %s_acc_<t>_* slot. All 8 warps fire.
-        emit_mma_instruction(ptx, &d_regs, &a_regs, &b_regs, &c_regs);
+
+        // N1b: QK^T K-loop. m16n8k16 K-dim = 16; for head_dim > 16 we
+        // need head_dim/16 K-iters, accumulating into the same
+        // %s_acc_<t>_*. Both A (Q) and B (K) shift by k_iter * 32 bytes
+        // along the k=hd dim (16 cols × 2 bytes per col).
+        for k_iter in 0..n_k_iters_qkt {
+            let a_base_expr: String = if k_iter == 0 {
+                "%qkt_a_base".to_string()
+            } else {
+                let off = k_iter * 32;
+                ptx.push_str(&format!(
+                    "    add.u32 %qkt_a_base_k, %qkt_a_base, {}; // QK^T A k_iter={}\n",
+                    off, k_iter
+                ));
+                "%qkt_a_base_k".to_string()
+            };
+            let b_base_expr: String = if k_iter == 0 {
+                "%qkt_b_base".to_string()
+            } else {
+                let off = k_iter * 32;
+                ptx.push_str(&format!(
+                    "    add.u32 %qkt_b_base_k, %qkt_b_base, {}; // QK^T B k_iter={}\n",
+                    off, k_iter
+                ));
+                "%qkt_b_base_k".to_string()
+            };
+
+            let a_fragment_regs = [
+                format!("tb1_qkt_a_{}_0", t),
+                format!("tb1_qkt_a_{}_1", t),
+                format!("tb1_qkt_a_{}_2", t),
+                format!("tb1_qkt_a_{}_3", t),
+            ];
+            emit_load_a_fragment_smem(
+                ptx,
+                &a_fragment_regs,
+                &a_base_expr,
+                (hd * 2) as usize,
+            );
+            let b_fragment_regs = [
+                format!("tb1_qkt_b_{}_0", t),
+                format!("tb1_qkt_b_{}_1", t),
+            ];
+            emit_load_b_fragment_smem(
+                ptx,
+                &b_fragment_regs,
+                &b_base_expr,
+                (hd * 2) as usize,
+            );
+            let d_regs = [
+                format!("%s_acc_{}_0", t),
+                format!("%s_acc_{}_1", t),
+                format!("%s_acc_{}_2", t),
+                format!("%s_acc_{}_3", t),
+            ];
+            let a_regs = [
+                format!("%tb1_qkt_a_{}_0", t),
+                format!("%tb1_qkt_a_{}_1", t),
+                format!("%tb1_qkt_a_{}_2", t),
+                format!("%tb1_qkt_a_{}_3", t),
+            ];
+            let b_regs = [
+                format!("%tb1_qkt_b_{}_0", t),
+                format!("%tb1_qkt_b_{}_1", t),
+            ];
+            let c_regs = d_regs.clone();
+            // N1b: accumulate into same %s_acc_<t>_* across K-iters.
+            // N3: unconditional MMA — each warp writes its OWN slot.
+            emit_mma_instruction(ptx, &d_regs, &a_regs, &b_regs, &c_regs);
+        }
     }
 
     // B1.6 deferral #5 resolution: scale S accumulators by 1/sqrt(head_dim).
@@ -664,6 +699,9 @@ fn emit_pv_mma(ptx: &mut String, config: &FlashAttentionConfig, slot: u32) {
     ptx.push_str("    .reg .u32 %pv_global_t, %pv_m_tile, %pv_n_tile;\n");
     ptx.push_str("    .reg .u32 %pv_p_warp_off, %pv_v_warp_off;\n");
     ptx.push_str("    .reg .u32 %pv_a_base, %pv_b_base;\n");
+    // N1a K-iter shifted bases (only emitted/used for k_iter > 0; the
+    // declaration is unconditional since `.reg` emission is cheap).
+    ptx.push_str("    .reg .u32 %pv_a_base_k, %pv_b_base_k;\n");
 
     for t in 0..tpw {
         ptx.push_str(&format!(
@@ -706,51 +744,90 @@ fn emit_pv_mma(ptx: &mut String, config: &FlashAttentionConfig, slot: u32) {
             "    add.u32 %pv_b_base, %tb1_phase_b_smem_v_u32, %pv_v_warp_off;\n",
         );
 
-        let a_fragment_regs = [
-            format!("tb1_pv_a_{}_0", t),
-            format!("tb1_pv_a_{}_1", t),
-            format!("tb1_pv_a_{}_2", t),
-            format!("tb1_pv_a_{}_3", t),
-        ];
-        emit_load_a_fragment_smem(
-            ptx,
-            &a_fragment_regs,
-            "%pv_a_base",
-            (bkv * 2) as usize,
+        // N1a: PV K-loop. m16n8k16 K-dim = 16; for block_kv > 16 we need
+        // ceil(block_kv / 16) K-iters per output tile, accumulating into
+        // the same %o_acc_<t>_*. Each K-iter shifts:
+        //   - A-base in P_smem by k_iter * 16 * 2 = k_iter * 32 bytes
+        //     (k-stride = 2 bytes per P col within the 16-row m-tile)
+        //   - B-base in V_smem by k_iter * 16 * hd * 2 bytes
+        //     (k-iter advances bkv-row position by 16, each bkv-row spans
+        //     hd cols × 2 bytes)
+        assert!(
+            bkv % 16 == 0,
+            "N1a: PV K-loop requires block_kv divisible by 16; got {}",
+            bkv
         );
+        let n_k_iters_pv = bkv / 16;
 
-        // B1.6 deferral #1 (PV B-fragment): real per-lane V load.
-        // V is bkv rows x hd cols; B-fragment col-major stride is hd*2.
-        let b_fragment_regs = [
-            format!("tb1_pv_b_{}_0", t),
-            format!("tb1_pv_b_{}_1", t),
-        ];
-        emit_load_b_fragment_smem(
-            ptx,
-            &b_fragment_regs,
-            "%pv_b_base",
-            (hd * 2) as usize,
-        );
-        let d_regs = [
-            format!("%o_acc_{}_0", t),
-            format!("%o_acc_{}_1", t),
-            format!("%o_acc_{}_2", t),
-            format!("%o_acc_{}_3", t),
-        ];
-        let a_regs = [
-            format!("%tb1_pv_a_{}_0", t),
-            format!("%tb1_pv_a_{}_1", t),
-            format!("%tb1_pv_a_{}_2", t),
-            format!("%tb1_pv_a_{}_3", t),
-        ];
-        let b_regs = [
-            format!("%tb1_pv_b_{}_0", t),
-            format!("%tb1_pv_b_{}_1", t),
-        ];
-        let c_regs = d_regs.clone();
-        // N3: unconditional MMA — each warp writes to its OWN %o_acc_<t>_*
-        // slot for its OWN (m_tile_pv, n_tile_pv).
-        emit_mma_instruction(ptx, &d_regs, &a_regs, &b_regs, &c_regs);
+        for k_iter in 0..n_k_iters_pv {
+            // Per-K-iter shifted bases.
+            let a_base_expr: String = if k_iter == 0 {
+                "%pv_a_base".to_string()
+            } else {
+                let off = k_iter * 32;
+                ptx.push_str(&format!(
+                    "    add.u32 %pv_a_base_k, %pv_a_base, {}; // PV A-base shift k_iter={}\n",
+                    off, k_iter
+                ));
+                "%pv_a_base_k".to_string()
+            };
+            let b_base_expr: String = if k_iter == 0 {
+                "%pv_b_base".to_string()
+            } else {
+                let off = k_iter * 16 * hd * 2;
+                ptx.push_str(&format!(
+                    "    add.u32 %pv_b_base_k, %pv_b_base, {}; // PV B-base shift k_iter={}\n",
+                    off, k_iter
+                ));
+                "%pv_b_base_k".to_string()
+            };
+
+            let a_fragment_regs = [
+                format!("tb1_pv_a_{}_0", t),
+                format!("tb1_pv_a_{}_1", t),
+                format!("tb1_pv_a_{}_2", t),
+                format!("tb1_pv_a_{}_3", t),
+            ];
+            emit_load_a_fragment_smem(
+                ptx,
+                &a_fragment_regs,
+                &a_base_expr,
+                (bkv * 2) as usize,
+            );
+
+            // B1.6 deferral #1 (PV B-fragment): per-lane V load via helper.
+            // V is bkv rows x hd cols; B-fragment col-major stride is hd*2.
+            let b_fragment_regs = [
+                format!("tb1_pv_b_{}_0", t),
+                format!("tb1_pv_b_{}_1", t),
+            ];
+            emit_load_b_fragment_smem(
+                ptx,
+                &b_fragment_regs,
+                &b_base_expr,
+                (hd * 2) as usize,
+            );
+            let d_regs = [
+                format!("%o_acc_{}_0", t),
+                format!("%o_acc_{}_1", t),
+                format!("%o_acc_{}_2", t),
+                format!("%o_acc_{}_3", t),
+            ];
+            let a_regs = [
+                format!("%tb1_pv_a_{}_0", t),
+                format!("%tb1_pv_a_{}_1", t),
+                format!("%tb1_pv_a_{}_2", t),
+                format!("%tb1_pv_a_{}_3", t),
+            ];
+            let b_regs = [
+                format!("%tb1_pv_b_{}_0", t),
+                format!("%tb1_pv_b_{}_1", t),
+            ];
+            let c_regs = d_regs.clone();
+            // N1a: accumulate into same %o_acc_<t>_* across K-iters.
+            // N3: unconditional MMA — each warp writes its OWN slot.
+            emit_mma_instruction(ptx, &d_regs, &a_regs, &b_regs, &c_regs);
+        }
     }
 }
 
@@ -796,11 +873,13 @@ mod tests {
         let cfg = make_config(32, 32, 32, 2048);
         let mut ptx = String::new();
         emit_phase_b_attention(&mut ptx, &cfg, 0, 0);
-        // QK^T tpw=1 + PV tpw=1 = 2 MMAs at canonical small config.
+        // N1: QK^T iterates head_dim/16 K-iters, PV iterates block_kv/16.
+        // At canonical 32x32x32: QK^T = 1 tpw * 2 K-iters = 2 MMAs;
+        // PV = 1 tpw * 2 K-iters = 2 MMAs. Total = 4.
         assert_eq!(
             ptx.matches("mma.sync.aligned.m16n8k16").count(),
-            2,
-            "expected 2 MMAs (1 QK^T + 1 PV) at canonical 32x32x32; got:\n{}",
+            4,
+            "expected 4 MMAs (2 QK^T K-iters + 2 PV K-iters) at canonical 32x32x32; got:\n{}",
             ptx
         );
     }
