@@ -3,40 +3,49 @@ source: crates/nsl-codegen/tests/tier_b1_phase_b_attention_snapshot.rs
 expression: ptx
 ---
     // === Phase B: attention compute on slot[0] (kv_iter=0) ===
-    // QK^T MMA: bq=32 bkv=32 tpw_qkt=1 slot=0 (scale=1/sqrt(32)=0f3E3504F3)
+    // QK^T MMA: bq=32 bkv=32 tpw_qkt=1 slot=0 (scale=1/sqrt(32)=0f3E3504F3) (N3)
     add.u64 %tb1_phase_b_smem_q, %shmem_base, 0; // Q tile @ tier_b1_q_offset
     add.u64 %tb1_phase_b_smem_k, %shmem_base, 2048; // K tile @ slot=0 offset
     .reg .u32 %tb1_phase_b_smem_q_u32, %tb1_phase_b_smem_k_u32;
     cvt.u32.u64 %tb1_phase_b_smem_q_u32, %tb1_phase_b_smem_q;
     cvt.u32.u64 %tb1_phase_b_smem_k_u32, %tb1_phase_b_smem_k;
+    .reg .u32 %qkt_global_t, %qkt_m_tile, %qkt_n_tile;
+    .reg .u32 %qkt_q_warp_off, %qkt_k_warp_off;
+    .reg .u32 %qkt_a_base, %qkt_b_base;
+    mov.u32 %qkt_global_t, %warp_id;
+    shr.u32 %qkt_m_tile, %qkt_global_t, 2;
+    and.b32 %qkt_n_tile, %qkt_global_t, 3;
+    shl.b32 %qkt_q_warp_off, %qkt_m_tile, 10;
+    add.u32 %qkt_a_base, %tb1_phase_b_smem_q_u32, %qkt_q_warp_off;
+    shl.b32 %qkt_k_warp_off, %qkt_n_tile, 9;
+    add.u32 %qkt_b_base, %tb1_phase_b_smem_k_u32, %qkt_k_warp_off;
     .reg .b32 %tb1_qkt_a_0_0, %tb1_qkt_a_0_1, %tb1_qkt_a_0_2, %tb1_qkt_a_0_3;
     .reg .b32 %tb1_qkt_b_0_0, %tb1_qkt_b_0_1;
     // Load A-fragment (m16xk16 row-major) from shared memory
     mul.lo.u32 %mma_addr, %mma_a_row, 64;  // row * stride
-    add.u32 %mma_addr, %mma_addr, %tb1_phase_b_smem_q_u32;  // + smem base
+    add.u32 %mma_addr, %mma_addr, %qkt_a_base;  // + smem base
     ld.shared.b32 %tb1_qkt_a_0_0, [%mma_addr];
     mul.lo.u32 %mma_addr, %mma_a_row, 64;  // row * stride
-    add.u32 %mma_addr, %mma_addr, %tb1_phase_b_smem_q_u32;  // + smem base
+    add.u32 %mma_addr, %mma_addr, %qkt_a_base;  // + smem base
     add.u32 %mma_addr, %mma_addr, 8;  // + k byte offset
     ld.shared.b32 %tb1_qkt_a_0_1, [%mma_addr];
     mul.lo.u32 %mma_addr, %mma_a_row, 64;  // row * stride
-    add.u32 %mma_addr, %mma_addr, %tb1_phase_b_smem_q_u32;  // + smem base
+    add.u32 %mma_addr, %mma_addr, %qkt_a_base;  // + smem base
     add.u32 %mma_addr, %mma_addr, 16;  // + k byte offset
     ld.shared.b32 %tb1_qkt_a_0_2, [%mma_addr];
     mul.lo.u32 %mma_addr, %mma_a_row, 64;  // row * stride
-    add.u32 %mma_addr, %mma_addr, %tb1_phase_b_smem_q_u32;  // + smem base
+    add.u32 %mma_addr, %mma_addr, %qkt_a_base;  // + smem base
     add.u32 %mma_addr, %mma_addr, 24;  // + k byte offset
     ld.shared.b32 %tb1_qkt_a_0_3, [%mma_addr];
     // Load B-fragment (k16xn8 col-major) from shared memory
     mul.lo.u32 %mma_addr, %mma_b_row, 64;  // row * stride
-    add.u32 %mma_addr, %mma_addr, %tb1_phase_b_smem_k_u32;  // + smem base
+    add.u32 %mma_addr, %mma_addr, %qkt_b_base;  // + smem base
     ld.shared.b32 %tb1_qkt_b_0_0, [%mma_addr];
     mul.lo.u32 %mma_addr, %mma_b_row, 64;  // row * stride
-    add.u32 %mma_addr, %mma_addr, %tb1_phase_b_smem_k_u32;  // + smem base
+    add.u32 %mma_addr, %mma_addr, %qkt_b_base;  // + smem base
     add.u32 %mma_addr, %mma_addr, 16;  // + k byte offset
     ld.shared.b32 %tb1_qkt_b_0_1, [%mma_addr];
-    setp.eq.u32 %wo_pred, %warp_id, 0; // QK^T tile t=0 ownership
-    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%s_acc_0_0, %s_acc_0_1, %s_acc_0_2, %s_acc_0_3},
         {%tb1_qkt_a_0_0, %tb1_qkt_a_0_1, %tb1_qkt_a_0_2, %tb1_qkt_a_0_3},
         {%tb1_qkt_b_0_0, %tb1_qkt_b_0_1},
@@ -90,13 +99,14 @@ expression: ptx
     cvt.rn.f16.f32 %mma_h0, %s_acc_0_0;
     cvt.rn.f16.f32 %mma_h1, %s_acc_0_1;
     mov.b32 %p_packed_0, {%mma_h0, %mma_h1};
-    // === P scatter to SMEM (PV A-fragment bridge) ===
+    // === P scatter to SMEM (PV A-fragment bridge + N3) ===
     .reg .u32 %sp_laneid, %sp_lo_row, %sp_lo_col_base;
     .reg .u32 %sp_row_off, %sp_col_off, %sp_lane_off;
     .reg .u32 %sp_addr_u32, %sp_addr_i;
+    .reg .u32 %sp_global_t, %sp_m_tile, %sp_n_tile;
+    .reg .u32 %sp_tile_off, %sp_m_off, %sp_n_off;
     .reg .u64 %sp_addr_u64;
     .reg .b16 %sp_h;
-    .reg .pred %sp_warp_pred;
     mov.u32 %sp_laneid, %tid.x;
     and.b32 %sp_laneid, %sp_laneid, 31;
     shr.u32 %sp_lo_row, %sp_laneid, 2;       // l/4 = D-fragment lo-row
@@ -105,61 +115,74 @@ expression: ptx
     mul.lo.u32 %sp_row_off, %sp_lo_row, 64;  // row * block_kv * 2 bytes
     shl.b32 %sp_col_off, %sp_lo_col_base, 1;     // col * 2 bytes (f16)
     add.u32 %sp_lane_off, %sp_row_off, %sp_col_off;
-    // P scatter tile t=0 (m_tile=0, n_tile=0, warp owner = 0)
-    setp.eq.u32 %sp_warp_pred, %warp_id, 0;
+    // P scatter slot local_t=0 (global_t = warp_id + 0*8 at runtime; N3)
+    mov.u32 %sp_global_t, %warp_id;
+    shr.u32 %sp_m_tile, %sp_global_t, 2;
+    and.b32 %sp_n_tile, %sp_global_t, 3;
+    shl.b32 %sp_m_off, %sp_m_tile, 10;
+    shl.b32 %sp_n_off, %sp_n_tile, 4;
+    add.u32 %sp_tile_off, %sp_m_off, %sp_n_off;
     add.u64 %sp_addr_u64, %shmem_base, 10240;
     cvt.u32.u64 %sp_addr_u32, %sp_addr_u64;
+    add.u32 %sp_addr_u32, %sp_addr_u32, %sp_tile_off;
     add.u32 %sp_addr_u32, %sp_addr_u32, %sp_lane_off;
     mov.u32 %sp_addr_i, %sp_addr_u32;
     cvt.rn.f16.f32 %sp_h, %s_acc_0_0;
-    @%sp_warp_pred st.shared.b16 [%sp_addr_i], %sp_h;
+    st.shared.b16 [%sp_addr_i], %sp_h;
     add.u32 %sp_addr_i, %sp_addr_u32, 2;
     cvt.rn.f16.f32 %sp_h, %s_acc_0_1;
-    @%sp_warp_pred st.shared.b16 [%sp_addr_i], %sp_h;
+    st.shared.b16 [%sp_addr_i], %sp_h;
     add.u32 %sp_addr_i, %sp_addr_u32, 512;
     cvt.rn.f16.f32 %sp_h, %s_acc_0_2;
-    @%sp_warp_pred st.shared.b16 [%sp_addr_i], %sp_h;
+    st.shared.b16 [%sp_addr_i], %sp_h;
     add.u32 %sp_addr_i, %sp_addr_u32, 514;
     cvt.rn.f16.f32 %sp_h, %s_acc_0_3;
-    @%sp_warp_pred st.shared.b16 [%sp_addr_i], %sp_h;
+    st.shared.b16 [%sp_addr_i], %sp_h;
     bar.sync 0;
-    // PV MMA: bq=32 hd=32 tpw_pv=1 slot=0
+    // PV MMA: bq=32 hd=32 tpw_pv=1 slot=0 (N3)
     add.u64 %tb1_phase_b_smem_v, %shmem_base, 6144; // V tile @ slot=0 offset
     .reg .u32 %tb1_phase_b_smem_v_u32;
     cvt.u32.u64 %tb1_phase_b_smem_v_u32, %tb1_phase_b_smem_v;
     add.u64 %tb1_phase_b_smem_q, %shmem_base, 10240; // P_smem base (reusing q-slot u64 reg)
-    .reg .u32 %tb1_phase_b_smem_p_u32, %tb1_phase_b_smem_p_tile_u32;
+    .reg .u32 %tb1_phase_b_smem_p_u32;
     cvt.u32.u64 %tb1_phase_b_smem_p_u32, %tb1_phase_b_smem_q;
+    .reg .u32 %pv_global_t, %pv_m_tile, %pv_n_tile;
+    .reg .u32 %pv_p_warp_off, %pv_v_warp_off;
+    .reg .u32 %pv_a_base, %pv_b_base;
     .reg .b32 %tb1_pv_a_0_0, %tb1_pv_a_0_1, %tb1_pv_a_0_2, %tb1_pv_a_0_3;
     .reg .b32 %tb1_pv_b_0_0, %tb1_pv_b_0_1;
-    // PV A-frag tile t=0: m_tile_pv=0 → P_smem +0 bytes
-    mov.u32 %tb1_phase_b_smem_p_tile_u32, %tb1_phase_b_smem_p_u32;
+    mov.u32 %pv_global_t, %warp_id;
+    shr.u32 %pv_m_tile, %pv_global_t, 2;
+    and.b32 %pv_n_tile, %pv_global_t, 3;
+    shl.b32 %pv_p_warp_off, %pv_m_tile, 10;
+    add.u32 %pv_a_base, %tb1_phase_b_smem_p_u32, %pv_p_warp_off;
+    shl.b32 %pv_v_warp_off, %pv_n_tile, 4;
+    add.u32 %pv_b_base, %tb1_phase_b_smem_v_u32, %pv_v_warp_off;
     // Load A-fragment (m16xk16 row-major) from shared memory
     mul.lo.u32 %mma_addr, %mma_a_row, 64;  // row * stride
-    add.u32 %mma_addr, %mma_addr, %tb1_phase_b_smem_p_tile_u32;  // + smem base
+    add.u32 %mma_addr, %mma_addr, %pv_a_base;  // + smem base
     ld.shared.b32 %tb1_pv_a_0_0, [%mma_addr];
     mul.lo.u32 %mma_addr, %mma_a_row, 64;  // row * stride
-    add.u32 %mma_addr, %mma_addr, %tb1_phase_b_smem_p_tile_u32;  // + smem base
+    add.u32 %mma_addr, %mma_addr, %pv_a_base;  // + smem base
     add.u32 %mma_addr, %mma_addr, 8;  // + k byte offset
     ld.shared.b32 %tb1_pv_a_0_1, [%mma_addr];
     mul.lo.u32 %mma_addr, %mma_a_row, 64;  // row * stride
-    add.u32 %mma_addr, %mma_addr, %tb1_phase_b_smem_p_tile_u32;  // + smem base
+    add.u32 %mma_addr, %mma_addr, %pv_a_base;  // + smem base
     add.u32 %mma_addr, %mma_addr, 16;  // + k byte offset
     ld.shared.b32 %tb1_pv_a_0_2, [%mma_addr];
     mul.lo.u32 %mma_addr, %mma_a_row, 64;  // row * stride
-    add.u32 %mma_addr, %mma_addr, %tb1_phase_b_smem_p_tile_u32;  // + smem base
+    add.u32 %mma_addr, %mma_addr, %pv_a_base;  // + smem base
     add.u32 %mma_addr, %mma_addr, 24;  // + k byte offset
     ld.shared.b32 %tb1_pv_a_0_3, [%mma_addr];
     // Load B-fragment (k16xn8 col-major) from shared memory
     mul.lo.u32 %mma_addr, %mma_b_row, 64;  // row * stride
-    add.u32 %mma_addr, %mma_addr, %tb1_phase_b_smem_v_u32;  // + smem base
+    add.u32 %mma_addr, %mma_addr, %pv_b_base;  // + smem base
     ld.shared.b32 %tb1_pv_b_0_0, [%mma_addr];
     mul.lo.u32 %mma_addr, %mma_b_row, 64;  // row * stride
-    add.u32 %mma_addr, %mma_addr, %tb1_phase_b_smem_v_u32;  // + smem base
+    add.u32 %mma_addr, %mma_addr, %pv_b_base;  // + smem base
     add.u32 %mma_addr, %mma_addr, 16;  // + k byte offset
     ld.shared.b32 %tb1_pv_b_0_1, [%mma_addr];
-    setp.eq.u32 %wo_pred, %warp_id, 0; // PV tile t=0 ownership
-    @%wo_pred mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%o_acc_0_0, %o_acc_0_1, %o_acc_0_2, %o_acc_0_3},
         {%tb1_pv_a_0_0, %tb1_pv_a_0_1, %tb1_pv_a_0_2, %tb1_pv_a_0_3},
         {%tb1_pv_b_0_0, %tb1_pv_b_0_1},

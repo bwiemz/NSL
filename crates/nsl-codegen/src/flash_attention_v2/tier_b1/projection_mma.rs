@@ -47,7 +47,7 @@ use crate::flash_attention_v2::smem_layout::{
     tier_b1_v_offset_pong, tier_b1_w_chunk_offset,
 };
 use crate::matmul_mma::{
-    emit_load_a_fragment_smem, emit_load_b_fragment_smem, emit_mma_instruction_predicated,
+    emit_load_a_fragment_smem, emit_load_b_fragment_smem, emit_mma_instruction,
 };
 
 /// Emit a D-fragment-aware scatter from per-warp m16n8k16 accumulators
@@ -62,8 +62,13 @@ use crate::matmul_mma::{
 ///
 /// Where `lo_row = laneid / 4` and `lo_col_base = (laneid % 4) * 2`.
 ///
-/// Per-tile warp gating: tile t fires only when `%warp_id == (t % 8)`,
-/// matching the upstream MMA's ownership pattern.
+/// **N3 resolution:** each warp's slot `local_t` maps to a DISTINCT
+/// global tile via `global_t = warp_id + local_t * 8`. The tile's
+/// (m_tile, n_tile) coordinates are computed from `global_t` at PTX
+/// runtime, so every warp writes to a different output tile. No
+/// store-time predicate; all 8 warps fire each iteration.
+///
+/// Requires `head_dim / 8` to be a power of 2 (asserted).
 ///
 /// `prefix` is the namespace for this call's scratch registers — caller
 /// MUST use a unique value per call site on the same ptx string (e.g.
@@ -74,8 +79,6 @@ use crate::matmul_mma::{
 ///
 /// `smem_u64_base` is the u64 SMEM base register expression — converted
 /// inside this helper to a u32 sister via `cvt.u32.u64`.
-///
-/// `n_tiles_d = head_dim / 8` is the count of n-tiles per m-row.
 fn emit_dfragment_scatter(
     ptx: &mut String,
     prefix: &str,
@@ -85,9 +88,23 @@ fn emit_dfragment_scatter(
     tpw: u32,
 ) {
     let n_tiles_d = (head_dim / 8).max(1);
+    assert!(
+        n_tiles_d.is_power_of_two(),
+        "N3: emit_dfragment_scatter requires head_dim/8 to be a power of 2; got {}",
+        n_tiles_d
+    );
+    let log2_n_tiles_d = n_tiles_d.trailing_zeros();
+    let n_tiles_d_mask = n_tiles_d - 1;
+    let m_stride_bytes = 16 * head_dim * 2;
+    assert!(
+        m_stride_bytes.is_power_of_two(),
+        "N3: emit_dfragment_scatter requires 16*head_dim*2 to be a power of 2; got {}",
+        m_stride_bytes
+    );
+    let log2_m_stride = m_stride_bytes.trailing_zeros();
 
     ptx.push_str(&format!(
-        "    // === {} D-fragment scatter ({} tiles, head_dim={}) ===\n",
+        "    // === {} D-fragment scatter ({} tiles, head_dim={}, N3) ===\n",
         prefix, tpw, head_dim
     ));
 
@@ -100,11 +117,18 @@ fn emit_dfragment_scatter(
         prefix, prefix, prefix
     ));
     ptx.push_str(&format!(
-        "    .reg .u32 %{}_base_u32, %{}_tile_u32, %{}_addr_u32, %{}_addr_i;\n",
+        "    .reg .u32 %{}_base_u32, %{}_addr_u32, %{}_addr_i;\n",
+        prefix, prefix, prefix
+    ));
+    ptx.push_str(&format!(
+        "    .reg .u32 %{}_global_t, %{}_m_tile, %{}_n_tile;\n",
+        prefix, prefix, prefix
+    ));
+    ptx.push_str(&format!(
+        "    .reg .u32 %{}_m_off, %{}_n_off, %{}_tile_off, %{}_tile_u32;\n",
         prefix, prefix, prefix, prefix
     ));
     ptx.push_str(&format!("    .reg .b16 %{}_h;\n", prefix));
-    ptx.push_str(&format!("    .reg .pred %{}_warp_pred;\n", prefix));
 
     // Per-lane (lo_row, lo_col_base, lane_off) computed once.
     ptx.push_str(&format!("    mov.u32 %{}_laneid, %tid.x;\n", prefix));
@@ -146,34 +170,50 @@ fn emit_dfragment_scatter(
     ));
 
     for t in 0..tpw {
-        let m_tile = t / n_tiles_d;
-        let n_tile = t % n_tiles_d;
-        let tile_off_bytes = m_tile * 16 * head_dim * 2 + n_tile * 8 * 2;
-
         ptx.push_str(&format!(
-            "    // {} tile t={} (m_tile={}, n_tile={}, warp owner = {})\n",
+            "    // {} slot local_t={} (global_t = warp_id + {}*8 at runtime; N3)\n",
             prefix,
             t,
-            m_tile,
-            n_tile,
-            t % 8
+            t
         ));
-        ptx.push_str(&format!(
-            "    setp.eq.u32 %{}_warp_pred, %warp_id, {};\n",
-            prefix,
-            t % 8
-        ));
-        if tile_off_bytes > 0 {
-            ptx.push_str(&format!(
-                "    add.u32 %{}_tile_u32, %{}_base_u32, {};\n",
-                prefix, prefix, tile_off_bytes
-            ));
+
+        // N3: global_t = warp_id + local_t * 8
+        if t == 0 {
+            ptx.push_str(&format!("    mov.u32 %{}_global_t, %warp_id;\n", prefix));
         } else {
             ptx.push_str(&format!(
-                "    mov.u32 %{}_tile_u32, %{}_base_u32;\n",
-                prefix, prefix
+                "    add.u32 %{}_global_t, %warp_id, {};\n",
+                prefix,
+                t * 8
             ));
         }
+        // (m_tile, n_tile) from global_t (shr/and since power of 2).
+        ptx.push_str(&format!(
+            "    shr.u32 %{}_m_tile, %{}_global_t, {};\n",
+            prefix, prefix, log2_n_tiles_d
+        ));
+        ptx.push_str(&format!(
+            "    and.b32 %{}_n_tile, %{}_global_t, {};\n",
+            prefix, prefix, n_tiles_d_mask
+        ));
+        // m_off = m_tile * (16 * head_dim * 2) bytes (shl since pow2).
+        ptx.push_str(&format!(
+            "    shl.b32 %{}_m_off, %{}_m_tile, {};\n",
+            prefix, prefix, log2_m_stride
+        ));
+        // n_off = n_tile * 8 * 2 = n_tile * 16 bytes (shl 4).
+        ptx.push_str(&format!(
+            "    shl.b32 %{}_n_off, %{}_n_tile, 4;\n",
+            prefix, prefix
+        ));
+        ptx.push_str(&format!(
+            "    add.u32 %{}_tile_off, %{}_m_off, %{}_n_off;\n",
+            prefix, prefix, prefix
+        ));
+        ptx.push_str(&format!(
+            "    add.u32 %{}_tile_u32, %{}_base_u32, %{}_tile_off;\n",
+            prefix, prefix, prefix
+        ));
         ptx.push_str(&format!(
             "    add.u32 %{}_addr_u32, %{}_tile_u32, %{}_lane_off;\n",
             prefix, prefix, prefix
@@ -202,9 +242,11 @@ fn emit_dfragment_scatter(
                 "    cvt.rn.f16.f32 %{}_h, %{}_{}_{};\n",
                 prefix, acc_prefix, t, i
             ));
+            // N3: unconditional store — each warp writes its own distinct
+            // (m_tile, n_tile) region of SMEM.
             ptx.push_str(&format!(
-                "    @%{}_warp_pred st.shared.b16 [%{}_addr_i], %{}_h;\n",
-                prefix, prefix, prefix
+                "    st.shared.b16 [%{}_addr_i], %{}_h;\n",
+                prefix, prefix
             ));
         }
     }
@@ -317,6 +359,24 @@ pub fn emit_q_projection(ptx: &mut String, config: &FlashAttentionConfig, chunk:
     let bq = config.block_q as u32;
     let tpw = tiles_per_warp(config);
 
+    // N3 constants: warp-distributed (m_tile, n_tile) over (bq/16, hd/8).
+    let n_tiles_d_q = (hd / 8).max(1);
+    assert!(
+        n_tiles_d_q.is_power_of_two(),
+        "N3: Q projection requires head_dim/8 to be a power of 2; got {}",
+        n_tiles_d_q
+    );
+    let log2_n_tiles_d_q = n_tiles_d_q.trailing_zeros();
+    let n_tiles_d_q_mask = n_tiles_d_q - 1;
+    // m_tile stride in x_q SMEM = 16 rows × chunk cols × 2 bytes.
+    let x_m_stride_bytes = 16 * chunk * 2;
+    assert!(
+        x_m_stride_bytes.is_power_of_two(),
+        "N3: Q projection requires 16*chunk*2 to be a power of 2; got {}",
+        x_m_stride_bytes
+    );
+    let log2_x_m_stride = x_m_stride_bytes.trailing_zeros();
+
     // SMEM offsets (computed inline so the function is self-contained).
     let w_chunk_off = tier_b1_w_chunk_offset(config);
     // Two W slots reserved by validate_tier_b1_config; x_q starts after both.
@@ -347,6 +407,11 @@ pub fn emit_q_projection(ptx: &mut String, config: &FlashAttentionConfig, chunk:
     ptx.push_str("    shl.b32 %tb1_q_cp_tid_off, %tb1_q_cp_tid_off, 4; // tid * 16 (B1.6 deferral #3)\n");
     ptx.push_str("    .reg .u64 %tb1_q_scatter_addr;\n");
     ptx.push_str("    .reg .b16 %tb1_q_h0, %tb1_q_h1;\n");
+
+    // N3 runtime tile-coords regs (warp-distributed Q-projection MMA).
+    ptx.push_str("    .reg .u32 %qmma_global_t, %qmma_m_tile, %qmma_n_tile;\n");
+    ptx.push_str("    .reg .u32 %qmma_x_warp_off, %qmma_w_warp_off;\n");
+    ptx.push_str("    .reg .u32 %qmma_a_base, %qmma_b_base;\n");
 
     // ----- 2. Null-guards on csha_x_ptr + csha_wq_ptr -----
     ptx.push_str("    // Null-guard csha_x_ptr; on null, skip Q projection (Tier A path).\n");
@@ -458,16 +523,43 @@ pub fn emit_q_projection(ptx: &mut String, config: &FlashAttentionConfig, chunk:
         ptx.push_str("    cp.async.wait_group 0;\n");
         ptx.push_str("    bar.sync 0;\n");
 
-        // ----- 3b. Inner MMA loop -----
-        // For each output tile `t` owned by this warp, emit one
-        // mma.sync.aligned.m16n8k16. A-fragment is x_q rows, B-fragment
-        // is Wq cols. Accumulators live in %q_acc_t_*.
+        // ----- 3b. Inner MMA loop (N3 warp-distributed) -----
+        // For each slot local_t this warp owns, emit one m16n8k16. The
+        // warp's global tile index is `warp_id + local_t * 8`, mapped to
+        // (m_tile, n_tile) at PTX runtime. A-frag base shifts by m_tile,
+        // B-frag base shifts by n_tile, and each warp writes its own slot.
         for t in 0..tpw {
-            // Per spec §5.3 lane→fragment mapping: lanes within a warp
-            // collectively own one m16n8k16 fragment per tile.
-            // B1.6 deferral #1 resolution: A/B-fragment loads now use the
-            // matmul_mma helpers which compute per-(warp, lane) addresses
-            // from %mma_a_row / %mma_b_row (set up by declare_registers).
+            // N3: compute warp-specific (m_tile, n_tile) at runtime.
+            if t == 0 {
+                ptx.push_str("    mov.u32 %qmma_global_t, %warp_id;\n");
+            } else {
+                ptx.push_str(&format!(
+                    "    add.u32 %qmma_global_t, %warp_id, {};\n",
+                    t * 8
+                ));
+            }
+            ptx.push_str(&format!(
+                "    shr.u32 %qmma_m_tile, %qmma_global_t, {};\n",
+                log2_n_tiles_d_q
+            ));
+            ptx.push_str(&format!(
+                "    and.b32 %qmma_n_tile, %qmma_global_t, {};\n",
+                n_tiles_d_q_mask
+            ));
+            // A-frag x_q base = x_q_smem + m_tile * 16 * chunk * 2 bytes.
+            ptx.push_str(&format!(
+                "    shl.b32 %qmma_x_warp_off, %qmma_m_tile, {};\n",
+                log2_x_m_stride
+            ));
+            ptx.push_str(
+                "    add.u32 %qmma_a_base, %tb1_q_smem_x_u32, %qmma_x_warp_off;\n",
+            );
+            // B-frag Wq base = Wq_smem + n_tile * 8 * 2 = n_tile * 16 bytes.
+            ptx.push_str("    shl.b32 %qmma_w_warp_off, %qmma_n_tile, 4;\n");
+            ptx.push_str(
+                "    add.u32 %qmma_b_base, %tb1_q_smem_w_u32, %qmma_w_warp_off;\n",
+            );
+
             ptx.push_str(&format!(
                 "    .reg .b32 %tb1_q_a_{}_{}_0, %tb1_q_a_{}_{}_1, %tb1_q_a_{}_{}_2, %tb1_q_a_{}_{}_3;\n",
                 chunk_idx, t, chunk_idx, t, chunk_idx, t, chunk_idx, t
@@ -476,8 +568,6 @@ pub fn emit_q_projection(ptx: &mut String, config: &FlashAttentionConfig, chunk:
                 "    .reg .b32 %tb1_q_b_{}_{}_0, %tb1_q_b_{}_{}_1;\n",
                 chunk_idx, t, chunk_idx, t
             ));
-            // A-fragment: x_q rows from SMEM at %tb1_q_smem_x. Row stride is
-            // chunk * 2 bytes (the x_q chunk slab is bq rows x chunk cols, f16).
             let a_fragment_regs = [
                 format!("tb1_q_a_{}_{}_0", chunk_idx, t),
                 format!("tb1_q_a_{}_{}_1", chunk_idx, t),
@@ -487,11 +577,9 @@ pub fn emit_q_projection(ptx: &mut String, config: &FlashAttentionConfig, chunk:
             emit_load_a_fragment_smem(
                 ptx,
                 &a_fragment_regs,
-                "%tb1_q_smem_x_u32",
+                "%qmma_a_base",
                 (chunk * 2) as usize,
             );
-            // B-fragment: Wq cols from SMEM at %tb1_q_smem_w. Row stride is
-            // hd * 2 bytes (Wq chunk slab is chunk rows x hd cols, f16).
             let b_fragment_regs = [
                 format!("tb1_q_b_{}_{}_0", chunk_idx, t),
                 format!("tb1_q_b_{}_{}_1", chunk_idx, t),
@@ -499,7 +587,7 @@ pub fn emit_q_projection(ptx: &mut String, config: &FlashAttentionConfig, chunk:
             emit_load_b_fragment_smem(
                 ptx,
                 &b_fragment_regs,
-                "%tb1_q_smem_w_u32",
+                "%qmma_b_base",
                 (hd * 2) as usize,
             );
             let d_regs = [
@@ -519,13 +607,9 @@ pub fn emit_q_projection(ptx: &mut String, config: &FlashAttentionConfig, chunk:
                 format!("%tb1_q_b_{}_{}_1", chunk_idx, t),
             ];
             let c_regs = d_regs.clone();
-            // B1.6 deferral #2 resolution: warp-ownership gate. Only the
-            // warp owning output tile `t` writes the MMA.
-            ptx.push_str(&format!(
-                "    setp.eq.u32 %wo_pred, %warp_id, {}; // Q-proj tile t={} ownership\n",
-                t % 8, t
-            ));
-            emit_mma_instruction_predicated(ptx, &d_regs, &a_regs, &b_regs, &c_regs, "wo_pred");
+            // N3: unconditional MMA — each warp writes its OWN %q_acc_<t>_*
+            // slot for its OWN (m_tile, n_tile).
+            emit_mma_instruction(ptx, &d_regs, &a_regs, &b_regs, &c_regs);
         }
     }
 
@@ -642,6 +726,24 @@ pub fn emit_kv_projection_chunk_loop(
     let bkv = config.block_kv as u32;
     let tpw = tiles_per_warp_kv(config);
 
+    // N3 constants: warp-distributed (m_tile, n_tile) over (bkv/16, hd/8).
+    let n_tiles_d_kv = (hd / 8).max(1);
+    assert!(
+        n_tiles_d_kv.is_power_of_two(),
+        "N3: KV projection requires head_dim/8 to be a power of 2; got {}",
+        n_tiles_d_kv
+    );
+    let log2_n_tiles_d_kv = n_tiles_d_kv.trailing_zeros();
+    let n_tiles_d_kv_mask = n_tiles_d_kv - 1;
+    // m_tile stride in x_kv SMEM = 16 rows × chunk cols × 2 bytes.
+    let x_m_stride_kv_bytes = 16 * chunk * 2;
+    assert!(
+        x_m_stride_kv_bytes.is_power_of_two(),
+        "N3: KV projection requires 16*chunk*2 to be a power of 2; got {}",
+        x_m_stride_kv_bytes
+    );
+    let log2_x_m_stride_kv = x_m_stride_kv_bytes.trailing_zeros();
+
     // SMEM offsets (computed inline so the function is self-contained).
     let w_chunk_off = tier_b1_w_chunk_offset(config);
     // slot 0: Wk chunk; slot 1: Wv chunk (each chunk*hd*2 bytes).
@@ -691,6 +793,11 @@ pub fn emit_kv_projection_chunk_loop(
     ptx.push_str("    .reg .u64 %tb1_kv_smem_k, %tb1_kv_smem_v;\n");
     ptx.push_str("    .reg .u64 %tb1_kv_scatter_addr;\n");
     ptx.push_str("    .reg .b16 %tb1_kv_h0;\n");
+
+    // N3 runtime tile-coords regs (warp-distributed K/V MMAs).
+    ptx.push_str("    .reg .u32 %kvmma_global_t, %kvmma_m_tile, %kvmma_n_tile;\n");
+    ptx.push_str("    .reg .u32 %kvmma_x_warp_off, %kvmma_w_warp_off;\n");
+    ptx.push_str("    .reg .u32 %kvmma_a_base, %kvmma_bk_base, %kvmma_bv_base;\n");
 
     // ----- 2. Null-guards on csha_x_ptr, csha_wk_ptr, csha_wv_ptr -----
     let skip_label = format!("V2_TIER_B1_KV_PROJ_SKIP_{}", slot);
@@ -841,12 +948,45 @@ pub fn emit_kv_projection_chunk_loop(
                 chunk_idx, t, chunk_idx, t
             ));
 
-            // B1.6 deferral #1 resolution: A/B-fragment loads now use
-            // matmul_mma helpers with per-(warp, lane) addressing.
+            // N3: compute warp-specific (m_tile, n_tile) at runtime.
+            if t == 0 {
+                ptx.push_str("    mov.u32 %kvmma_global_t, %warp_id;\n");
+            } else {
+                ptx.push_str(&format!(
+                    "    add.u32 %kvmma_global_t, %warp_id, {};\n",
+                    t * 8
+                ));
+            }
+            ptx.push_str(&format!(
+                "    shr.u32 %kvmma_m_tile, %kvmma_global_t, {};\n",
+                log2_n_tiles_d_kv
+            ));
+            ptx.push_str(&format!(
+                "    and.b32 %kvmma_n_tile, %kvmma_global_t, {};\n",
+                n_tiles_d_kv_mask
+            ));
+            // A-frag x_kv base = x_kv_smem + m_tile * 16 * chunk * 2 bytes.
+            ptx.push_str(&format!(
+                "    shl.b32 %kvmma_x_warp_off, %kvmma_m_tile, {};\n",
+                log2_x_m_stride_kv
+            ));
+            ptx.push_str(
+                "    add.u32 %kvmma_a_base, %tb1_kv_smem_x_u32, %kvmma_x_warp_off;\n",
+            );
+            // B-frag Wk/Wv bases = W_smem + n_tile * 8 * 2 bytes.
+            ptx.push_str("    shl.b32 %kvmma_w_warp_off, %kvmma_n_tile, 4;\n");
+            ptx.push_str(
+                "    add.u32 %kvmma_bk_base, %tb1_kv_smem_wk_u32, %kvmma_w_warp_off;\n",
+            );
+            ptx.push_str(
+                "    add.u32 %kvmma_bv_base, %tb1_kv_smem_wv_u32, %kvmma_w_warp_off;\n",
+            );
+
+            // B1.6 deferral #1 resolution: A/B-fragment loads via matmul_mma
+            // helpers with per-(warp, lane) addressing. Each warp's bases
+            // differ via N3 runtime offsets above.
             //
-            // A-fragment: x_kv rows from SMEM at %tb1_kv_smem_x_u32. Row
-            // stride is chunk * 2 bytes (x_kv chunk slab is bkv rows x
-            // chunk cols, f16). Shared between K and V MMAs.
+            // A-fragment: x_kv rows. Shared between K and V MMAs.
             let a_fragment_regs = [
                 format!("tb1_kv_a_{}_{}_0", chunk_idx, t),
                 format!("tb1_kv_a_{}_{}_1", chunk_idx, t),
@@ -856,12 +996,11 @@ pub fn emit_kv_projection_chunk_loop(
             emit_load_a_fragment_smem(
                 ptx,
                 &a_fragment_regs,
-                "%tb1_kv_smem_x_u32",
+                "%kvmma_a_base",
                 (chunk * 2) as usize,
             );
 
-            // K B-fragment: Wk rows from SMEM at %tb1_kv_smem_wk_u32. Row
-            // stride is hd * 2 bytes (Wk chunk slab is chunk rows x hd cols).
+            // K B-fragment: Wk cols (warp-specific via n_tile).
             let bk_fragment_regs = [
                 format!("tb1_kv_bk_{}_{}_0", chunk_idx, t),
                 format!("tb1_kv_bk_{}_{}_1", chunk_idx, t),
@@ -869,11 +1008,11 @@ pub fn emit_kv_projection_chunk_loop(
             emit_load_b_fragment_smem(
                 ptx,
                 &bk_fragment_regs,
-                "%tb1_kv_smem_wk_u32",
+                "%kvmma_bk_base",
                 (hd * 2) as usize,
             );
 
-            // V B-fragment: Wv rows from SMEM at %tb1_kv_smem_wv_u32.
+            // V B-fragment: Wv cols.
             let bv_fragment_regs = [
                 format!("tb1_kv_bv_{}_{}_0", chunk_idx, t),
                 format!("tb1_kv_bv_{}_{}_1", chunk_idx, t),
@@ -881,7 +1020,7 @@ pub fn emit_kv_projection_chunk_loop(
             emit_load_b_fragment_smem(
                 ptx,
                 &bv_fragment_regs,
-                "%tb1_kv_smem_wv_u32",
+                "%kvmma_bv_base",
                 (hd * 2) as usize,
             );
 
@@ -903,12 +1042,8 @@ pub fn emit_kv_projection_chunk_loop(
                 format!("%tb1_kv_bk_{}_{}_1", chunk_idx, t),
             ];
             let k_c_regs = k_d_regs.clone();
-            // B1.6 deferral #2 resolution: warp-ownership gate (K MMA).
-            ptx.push_str(&format!(
-                "    setp.eq.u32 %wo_pred, %warp_id, {}; // K-proj tile t={} ownership\n",
-                t % 8, t
-            ));
-            emit_mma_instruction_predicated(ptx, &k_d_regs, &a_regs, &bk_regs, &k_c_regs, "wo_pred");
+            // N3: unconditional K MMA — warps write distinct %k_acc_<t>_*.
+            emit_mma_instruction(ptx, &k_d_regs, &a_regs, &bk_regs, &k_c_regs);
 
             // --- MMA (b): V accumulation ---
             let v_d_regs = [
@@ -922,9 +1057,8 @@ pub fn emit_kv_projection_chunk_loop(
                 format!("%tb1_kv_bv_{}_{}_1", chunk_idx, t),
             ];
             let v_c_regs = v_d_regs.clone();
-            // B1.6 deferral #2 resolution: warp-ownership gate (V MMA).
-            // Same predicate value as K — both MMAs share the t % 8 ownership.
-            emit_mma_instruction_predicated(ptx, &v_d_regs, &a_regs, &bv_regs, &v_c_regs, "wo_pred");
+            // N3: unconditional V MMA — warps write distinct %v_acc_<t>_*.
+            emit_mma_instruction(ptx, &v_d_regs, &a_regs, &bv_regs, &v_c_regs);
         }
     }
 
