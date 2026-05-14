@@ -777,6 +777,7 @@ pub fn synthesize_backward_with_tier_b(
         })
         .unwrap_or(false);
     let log2_bkv = (config.block_kv as u32).trailing_zeros();
+    let log2_bq = (config.block_q as u32).trailing_zeros();
     if tier_b_active {
         ptx.push_str("    { // PCA Tier B.2: kv-tile ordinal scope (per kv-outer iter)\n");
         ptx.push_str("    .reg .u64 %rd_kvt_ord_TB_BWD;\n");
@@ -785,6 +786,22 @@ pub fn synthesize_backward_with_tier_b(
             "    shr.b64 %rd_kvt_ord_TB_BWD, %k_start, {log2_bkv};\n"
         ));
         ptx.push_str("    cvt.u32.u64 %r_kvt_ord_TB_BWD, %rd_kvt_ord_TB_BWD;\n");
+        // B2-2.5: q-tile ordinal derived from %q_start, not %bid_x. Backward
+        // launches with `grid_x = 1` in production (q-block encoded in
+        // `seq_lens_ptr` → `%q_launch_base` → `%q_start`); reading `%bid_x`
+        // here would always yield 0 and the predicate would see q-tile 0's
+        // segment range for every CTA. Computing qt = q_start >> log2(bq)
+        // is correct under BOTH launch ABIs:
+        //   grid_x = num_q_tiles (legacy bench): q_start = bid_x * bq → qt = bid_x.
+        //   grid_x = 1            (production):   q_start = q_launch_base → qt = q_block.
+        // qt is invariant across the kv-outer loop (q_start written once in
+        // prelude), so hoisting alongside %r_kvt_ord_TB_BWD is correct.
+        ptx.push_str("    .reg .u64 %rd_qt_ord_TB_BWD;\n");
+        ptx.push_str("    .reg .u32 %r_qt_ord_TB_BWD;\n");
+        ptx.push_str(&format!(
+            "    shr.b64 %rd_qt_ord_TB_BWD, %q_start, {log2_bq};\n"
+        ));
+        ptx.push_str("    cvt.u32.u64 %r_qt_ord_TB_BWD, %rd_qt_ord_TB_BWD;\n");
     }
     phases::backward::kv_load::emit_k_suffixed(&mut ptx, config, "MAIN");
     phases::backward::kv_load::emit_v_suffixed(&mut ptx, config, "MAIN");
@@ -836,11 +853,11 @@ pub fn synthesize_backward_with_tier_b(
         //
         // The label includes `q_iter` so different inner q_iters get distinct
         // PTX labels — required because we still want each q_iter to make an
-        // independent skip decision (qt = %bid_x is the same for all q_iters
-        // in a CTA, but kvt is the same for all q_iters too, so the predicate
-        // result is actually loop-invariant across q_iters; we still emit
-        // per-q_iter labels for ptxas's BRA.U inference and to avoid label
-        // namespace collisions).
+        // independent skip decision (qt is the same for all q_iters in a CTA
+        // — see B2-2.5: qt = %q_start >> log2(block_q) — but kvt is the same
+        // for all q_iters too, so the predicate result is actually loop-
+        // invariant across q_iters; we still emit per-q_iter labels for
+        // ptxas's BRA.U inference and to avoid label namespace collisions).
         if tier_b_active {
             if let Some((seq_len, _residency)) = tier_b {
                 let range_table_base =
@@ -856,7 +873,10 @@ pub fn synthesize_backward_with_tier_b(
                     &mut ptx,
                     config,
                     seq_len,
-                    "%bid_x", // CTA-global q-tile ordinal (grid_x = num_q_tiles)
+                    // B2-2.5: %r_qt_ord_TB_BWD = (%q_start >> log2(block_q)).
+                    // Correct under BOTH grid_x=num_q_tiles (bench legacy) and
+                    // grid_x=1 (production, q-block in seq_lens_ptr).
+                    "%r_qt_ord_TB_BWD",
                     "%r_kvt_ord_TB_BWD",
                     range_table_base,
                     &skip_label,

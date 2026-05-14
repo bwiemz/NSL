@@ -979,6 +979,10 @@ V2_BWD_LOOP_KV:
     .reg .u32 %r_kvt_ord_TB_BWD;
     shr.b64 %rd_kvt_ord_TB_BWD, %k_start, 5;
     cvt.u32.u64 %r_kvt_ord_TB_BWD, %rd_kvt_ord_TB_BWD;
+    .reg .u64 %rd_qt_ord_TB_BWD;
+    .reg .u32 %r_qt_ord_TB_BWD;
+    shr.b64 %rd_qt_ord_TB_BWD, %q_start, 5;
+    cvt.u32.u64 %r_qt_ord_TB_BWD, %rd_qt_ord_TB_BWD;
     // Tier C backward K-load (block_kv=32, slices/lane=1, rows/warp=8)
 V2_BWD_K_LOAD_MAIN:
     setp.eq.u64 %p0, %rd_bwd_k_proj, 0;
@@ -1449,7 +1453,7 @@ V2_BWD_V_LOAD_SKIP_MAIN:
     .reg .u32  %tile_byte_TB;
     .reg .u64  %addr_TB, %tile_off_wide_TB;
 
-    shl.b32 %tile_byte_TB, %bid_x, 1;
+    shl.b32 %tile_byte_TB, %r_qt_ord_TB_BWD, 1;
     cvt.u64.u32 %tile_off_wide_TB, %tile_byte_TB;
     cvta.shared.u64 %addr_TB, shmem;
     add.u64 %addr_TB, %addr_TB, 78208;
@@ -1866,7 +1870,7 @@ BWD_KV_TILE_SKIP_TB_0:
     .reg .u32  %tile_byte_TB;
     .reg .u64  %addr_TB, %tile_off_wide_TB;
 
-    shl.b32 %tile_byte_TB, %bid_x, 1;
+    shl.b32 %tile_byte_TB, %r_qt_ord_TB_BWD, 1;
     cvt.u64.u32 %tile_off_wide_TB, %tile_byte_TB;
     cvta.shared.u64 %addr_TB, shmem;
     add.u64 %addr_TB, %addr_TB, 78208;
@@ -2283,7 +2287,7 @@ BWD_KV_TILE_SKIP_TB_1:
     .reg .u32  %tile_byte_TB;
     .reg .u64  %addr_TB, %tile_off_wide_TB;
 
-    shl.b32 %tile_byte_TB, %bid_x, 1;
+    shl.b32 %tile_byte_TB, %r_qt_ord_TB_BWD, 1;
     cvt.u64.u32 %tile_off_wide_TB, %tile_byte_TB;
     cvta.shared.u64 %addr_TB, shmem;
     add.u64 %addr_TB, %addr_TB, 78208;
@@ -2700,7 +2704,7 @@ BWD_KV_TILE_SKIP_TB_2:
     .reg .u32  %tile_byte_TB;
     .reg .u64  %addr_TB, %tile_off_wide_TB;
 
-    shl.b32 %tile_byte_TB, %bid_x, 1;
+    shl.b32 %tile_byte_TB, %r_qt_ord_TB_BWD, 1;
     cvt.u64.u32 %tile_off_wide_TB, %tile_byte_TB;
     cvta.shared.u64 %addr_TB, shmem;
     add.u64 %addr_TB, %addr_TB, 78208;
@@ -3117,7 +3121,7 @@ BWD_KV_TILE_SKIP_TB_3:
     .reg .u32  %tile_byte_TB;
     .reg .u64  %addr_TB, %tile_off_wide_TB;
 
-    shl.b32 %tile_byte_TB, %bid_x, 1;
+    shl.b32 %tile_byte_TB, %r_qt_ord_TB_BWD, 1;
     cvt.u64.u32 %tile_off_wide_TB, %tile_byte_TB;
     cvta.shared.u64 %addr_TB, shmem;
     add.u64 %addr_TB, %addr_TB, 78208;
@@ -3534,7 +3538,7 @@ BWD_KV_TILE_SKIP_TB_4:
     .reg .u32  %tile_byte_TB;
     .reg .u64  %addr_TB, %tile_off_wide_TB;
 
-    shl.b32 %tile_byte_TB, %bid_x, 1;
+    shl.b32 %tile_byte_TB, %r_qt_ord_TB_BWD, 1;
     cvt.u64.u32 %tile_off_wide_TB, %tile_byte_TB;
     cvta.shared.u64 %addr_TB, shmem;
     add.u64 %addr_TB, %addr_TB, 78208;
@@ -3951,7 +3955,7 @@ BWD_KV_TILE_SKIP_TB_5:
     .reg .u32  %tile_byte_TB;
     .reg .u64  %addr_TB, %tile_off_wide_TB;
 
-    shl.b32 %tile_byte_TB, %bid_x, 1;
+    shl.b32 %tile_byte_TB, %r_qt_ord_TB_BWD, 1;
     cvt.u64.u32 %tile_off_wide_TB, %tile_byte_TB;
     cvta.shared.u64 %addr_TB, shmem;
     add.u64 %addr_TB, %addr_TB, 78208;
@@ -4368,7 +4372,7 @@ BWD_KV_TILE_SKIP_TB_6:
     .reg .u32  %tile_byte_TB;
     .reg .u64  %addr_TB, %tile_off_wide_TB;
 
-    shl.b32 %tile_byte_TB, %bid_x, 1;
+    shl.b32 %tile_byte_TB, %r_qt_ord_TB_BWD, 1;
     cvt.u64.u32 %tile_off_wide_TB, %tile_byte_TB;
     cvta.shared.u64 %addr_TB, shmem;
     add.u64 %addr_TB, %addr_TB, 78208;

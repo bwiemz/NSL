@@ -555,6 +555,32 @@ Re-baseline via `cargo insta accept`. PR description shows the per-snapshot offs
 
 The brainstorm's pre-implementation-verification discipline is the system that catches this class of issue. The discipline operating correctly means: each instance of "verification missed something" produces a tightening of the discipline. After the first instance (the SMEM probe added during the 2026-05-12 revision after the compile-time-unroll concern surfaced), the gates tightened to include the Phase 0 probe. After this second instance, §11.4 documents the gap and IR-003 gains a new "Cited from" entry making the fixture-pinned-resource-budget pattern visible for future spec reviews.
 
+### 11.6 Discovery during B2-3: backward launch-ABI mismatch
+
+**What surfaced.** During B2-3 (backward parity tier), the backward
+Tier B predicate as shipped in B2-2 read `%bid_x` as the q-tile
+ordinal. Bench tests using `grid_x = num_q_tiles` worked, but
+the production runtime launch (`crates/nsl-runtime/src/flash_attention.rs:934`)
+uses `grid_x = 1` with q-tile encoded in `seq_lens_ptr`. Under
+`grid_x = 1`, `%bid_x = 0` for every CTA → predicate over-skips.
+
+**Root cause.** B2-2 reused forward's predicate operand pattern
+(`%bid_x` as qt) without verifying backward's production launch
+ABI. Forward launches with `grid_x = num_q_tiles` so `%bid_x` is
+the correct qt; backward launches with `grid_x = 1` so it isn't.
+
+**Fix.** Backward's predicate now computes qt as
+`q_start >> log2(block_q)`, which works under BOTH grid_x ABIs.
+
+**Lesson** (extends IR-003's resource-budget specialization
+to launch-ABI verification): pre-implementation verification of
+spec-pinned cross-module assumptions must include launch ABI
+when the kernel and runtime launch site are co-evolved. The
+forward/backward asymmetry in grid_x was undocumented; B2-2
+should have grepped `crates/nsl-runtime/src/flash_attention.rs`
+for the backward launch's grid_x before assuming forward's
+operand pattern transferred.
+
 ### 11.5 LOC budget (rough)
 
 - B.1.5 total: ~480 LOC (mostly Rust; ~100 shell).

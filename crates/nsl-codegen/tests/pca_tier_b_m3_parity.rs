@@ -296,31 +296,16 @@ fn assert_backward_parity_for_fixture(fixture: &str) {
             );
         }
     };
-    // Gate criterion: dQ MUST be bit-identical across all six fixtures.
-    // dQ is the symmetric-correctness proxy: it accumulates in registers
-    // (per-q-tile, no scratch RMW), flushed once at the end of the kernel,
-    // so it's a clean witness of "skipped tile contributes exactly zero
-    // to the gradient" per spec §7.1.
+    // Gate criterion (B2-2.5): dQ, dK, dV ALL bit-identical across all six
+    // fixtures. After B2-2.5 fixed the predicate's qt-operand to derive
+    // from `%q_start` (correct under both bench-legacy `grid_x=num_q_tiles`
+    // and production `grid_x=1` ABIs), and after the bench switched to the
+    // production grid_x=1 sequential per-q-block launch loop (eliminating
+    // the parallel-CTA race on the f32 dK/dV scratch RMW), all three
+    // gradients are symmetric-zero correctness witnesses per spec §7.1.
     cmp("dQ", &on_dq, &off_dq);
-
-    // dK / dV scratch comparison: the f32 scratch RMW path in
-    // `nsl_flash_attention_csha_backward` is serialized across q-blocks
-    // via grid_x=1 + per-q-block sequential launches. The B2-2 backward
-    // Tier B integration's per-tile skip predicate reads `%bid_x` for
-    // the q-tile ordinal, but with `grid_x=1` that register is always 0,
-    // so the predicate sees q-tile 0's segment range for every launch
-    // and over-skips tiles whose Q-tile is in a different segment than
-    // q-tile 0. Two launch ABIs were tried in the bench:
-    //   * `grid_x=1` (production ABI): predicate over-skips → wrong on
-    //   * `grid_x=num_q_tiles` (parallel CTAs): predicate sees correct
-    //     qt, BUT parallel CTAs RACE on the dK/dV f32 scratch RMW →
-    //     non-deterministic outputs.
-    // Both paths leave dK/dV bit-non-identical. The fix lives in the
-    // backward kernel (compute qt from `q_start / block_q` instead of
-    // reading `%bid_x` in the predicate), not in the bench harness.
-    // Tracked separately; for this task we ship the dQ assertion as
-    // the load-bearing parity gate and leave dK/dV as #[ignore].
-    let _ = (on_dk, off_dk, on_dv, off_dv);
+    cmp("dK", &on_dk, &off_dk);
+    cmp("dV", &on_dv, &off_dv);
 }
 
 // Backward parity uses dedicated `parity_bwd_N` fixtures (32×32×32 dims)

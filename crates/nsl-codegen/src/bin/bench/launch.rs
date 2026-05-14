@@ -1400,29 +1400,24 @@ pub unsafe fn run_fixture_backward(
         bwd_args.push(&mut bw_skip_decisions as *mut _ as *mut c_void);
     }
 
-    // -- Step B12: Launch BACKWARD (single launch covering all q-tiles). --
+    // -- Step B12: Launch BACKWARD (production ABI: grid_x = 1, per-q-block loop). --
     //
-    // The backward Tier B predicate (B2-2, `synthesize_backward_with_tier_b`)
-    // reads `%bid_x` for the q-tile ordinal it feeds to
-    // `emit_skip_predicate`. The production runtime launch ABI
-    // (`nsl_flash_attention_csha_backward`) uses `grid_x = 1` and encodes
-    // the q-block ordinal in `seq_lens_ptr`, which causes `%bid_x` to be
-    // 0 for every launch — the predicate then always sees the segment
-    // range of q-tile 0 (≡ seg 0) and over-skips tiles whose Q-tile is
-    // not in seg 0. The forward kernel maps `bid_x` directly to the
-    // q-tile ordinal because its launch path uses `grid_x = num_q_tiles`.
+    // B2-2.5 fix: the backward Tier B predicate now reads
+    // `%r_qt_ord_TB_BWD = (%q_start >> log2(block_q))` instead of `%bid_x`,
+    // which is correct under both grid_x=1 (production) and the previous
+    // grid_x=num_q_tiles workaround. We therefore switch the bench to the
+    // production launch ABI (mirrors `nsl_flash_attention_csha_backward`):
+    //   grid_x = 1, q-block ordinal encoded in `seq_lens_ptr` (slot 16),
+    //   per-q-block sequential launches so the dK/dV f32 scratch RMW
+    //   serializes deterministically (no parallel-CTA race).
     //
-    // For backward parity to exercise the Tier B predicate correctly, the
-    // bench launches the backward with the SAME `grid_x = num_q_tiles`
-    // mapping as forward and passes `seq_lens_ptr = 0` so the kernel's
-    // `q_start = bid_x * block_q + q_launch_base` resolves to
-    // `bid_x * block_q` — i.e. exactly the per-CTA q-tile base the
-    // predicate expects.
+    // The previous grid_x=num_q_tiles parallel launch produced
+    // non-deterministic dK/dV outputs because parallel CTAs raced on the
+    // f32 scratch read-modify-write. Sequential per-q-block launches under
+    // grid_x=1 eliminate that race.
     let block_q_u32 = fixture.config.block_q as u32;
-    let bwd_grid_x = fixture.seq_len.div_ceil(block_q_u32);
     let bwd_grid_y = fixture.batch * heads;
-    bw_seq_lens = 0;
-    let _ = std::hint::black_box(&bw_seq_lens);
+    let q_blocks_bwd = fixture.seq_len.div_ceil(block_q_u32);
 
     let mut start_evt: sys::CUevent = std::ptr::null_mut();
     let mut stop_evt: sys::CUevent = std::ptr::null_mut();
@@ -1431,23 +1426,37 @@ pub unsafe fn run_fixture_backward(
     let mut times_ms: Vec<f32> = Vec::with_capacity(iterations as usize);
     for _it in 0..iterations.max(1) {
         let _ = sys::cuEventRecord(start_evt, std::ptr::null_mut());
-        let rc = sys::cuLaunchKernel(
-            bwd_func,
-            bwd_grid_x, bwd_grid_y, 1,
-            128, 1, 1,
-            bwd_shmem_bytes,
-            std::ptr::null_mut(),
-            bwd_args.as_mut_ptr(),
-            std::ptr::null_mut(),
-        );
-        if rc != sys::CUresult::CUDA_SUCCESS {
+        let mut launch_rc = sys::CUresult::CUDA_SUCCESS;
+        for q_block in 0..q_blocks_bwd {
+            // Thread the q-block base into seq_lens_ptr slot via `bw_seq_lens`.
+            // CUDA reads the pointee at launch time, so each iteration's
+            // assignment is picked up by the next launch. `black_box`
+            // prevents the optimizer from eliding the write because dataflow
+            // analysis can't see the read-through-ptr.
+            bw_seq_lens = (q_block as u64) * (fixture.config.block_q as u64);
+            let _ = std::hint::black_box(&bw_seq_lens);
+            let rc = sys::cuLaunchKernel(
+                bwd_func,
+                1, bwd_grid_y, 1,
+                128, 1, 1,
+                bwd_shmem_bytes,
+                std::ptr::null_mut(),
+                bwd_args.as_mut_ptr(),
+                std::ptr::null_mut(),
+            );
+            if rc != sys::CUresult::CUDA_SUCCESS {
+                launch_rc = rc;
+                break;
+            }
+        }
+        if launch_rc != sys::CUresult::CUDA_SUCCESS {
             let _ = sys::cuEventDestroy_v2(start_evt);
             let _ = sys::cuEventDestroy_v2(stop_evt);
             return Err(cleanup_and(
                 &allocations,
                 format!(
-                    "cuLaunchKernel(backward grid_x={bwd_grid_x}) rc={:?}: {}",
-                    rc, cu_error_string(rc)
+                    "cuLaunchKernel(backward grid_x=1, per-q-block loop) rc={:?}: {}",
+                    launch_rc, cu_error_string(launch_rc)
                 ),
             ));
         }
