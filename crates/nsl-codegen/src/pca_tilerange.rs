@@ -24,6 +24,33 @@
 use crate::flash_attention::FlashAttentionConfig;
 use crate::pca_segment::SegmentResidency;
 
+/// Which axis is the outer loop at the call site of [`emit_skip_predicate`].
+///
+/// - `QOuter` — forward FA-2 convention: per-CTA q-tile fixed by `%bid_x`,
+///   per-warp q-iter Rust-unrolled, kv-tile is the PTX-runtime inner loop.
+///   The skip target lands at the end of the kv-tile body (one label per
+///   `q_iter`, current emission: `KV_TILE_SKIP_TB_{q_iter}`).
+/// - `KVOuter` — backward FA-2 convention (case (β) per V-B.2-predicate):
+///   per-CTA q-tile fixed by `%bid_x`, kv-tile is the PTX-runtime OUTER
+///   loop, q-iter Rust-unrolled inside. The skip target lands at the end
+///   of the q-iter body (so a skipped (qt, kvt) pair bypasses
+///   `ds_compute + dv_accum + dqdk_accum` for THIS q_iter but the outer
+///   kv-loop still flushes dK/dV at its bottom).
+///
+/// The predicate body is mathematically symmetric in qt/kvt (proven in
+/// V-B.2-predicate findings §3), so this parameter governs label naming
+/// only — it does NOT change the PTX register loads, setp ordering, or
+/// the disjoint-test logic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IterationOrder {
+    /// Forward: q-tile outer (CTA-fixed via %bid_x, q_iter Rust-unrolled
+    /// per CTA), kv-tile inner (PTX-runtime loop).
+    QOuter,
+    /// Backward: kv-tile outer (PTX-runtime loop), q-iter inner
+    /// (Rust-unrolled per kv iter).
+    KVOuter,
+}
+
 /// Four sub-table offsets inside the Tier B range-table region.
 /// Spec §3.4.3.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -159,9 +186,25 @@ pub fn emit_range_table_preamble(
     ptx.push_str("    .reg .u32  %seg_byte_off_TILERANGE;\n");
     ptx.push_str("\n");
 
-    ptx.push_str(&format!(
-        "    cvta.shared.u64 %seg_smem_TILERANGE, {segment_ids_smem_base};\n"
-    ));
+    // `segment_ids_smem_base` can be either:
+    //   - a `.shared` array label (forward: `seg_smem`) — convert to generic
+    //     via `cvta.shared.u64`.
+    //   - a u64 register name beginning with `%` (backward: `%seg_base`,
+    //     already a generic-space address built off `%shmem_base + offset`)
+    //     — copy directly via `mov.u64`.
+    // This dual-mode lets backward pass its existing `%seg_base` register
+    // (which lives at the TAIL of the extern shmem region per the Blackwell
+    // static+extern fix) without forcing the emitter to relayout the
+    // segment_ids residency convention across directions.
+    if segment_ids_smem_base.starts_with('%') {
+        ptx.push_str(&format!(
+            "    mov.u64 %seg_smem_TILERANGE, {segment_ids_smem_base};\n"
+        ));
+    } else {
+        ptx.push_str(&format!(
+            "    cvta.shared.u64 %seg_smem_TILERANGE, {segment_ids_smem_base};\n"
+        ));
+    }
     ptx.push_str("    mov.u32 %lane_id_TILERANGE, %laneid;\n");
     ptx.push_str("\n");
 
@@ -365,6 +408,17 @@ fn emit_lane_zero_store(
 /// immediates) holding the current q-tile / kv-tile ordinal.
 /// `range_table_base` is the SMEM byte offset from
 /// `smem_layout::tier_b_range_table_offset`.
+///
+/// `iteration_order` declares whether the caller's outer loop is q-tile
+/// (forward) or kv-tile (backward, case (β) per V-B.2-predicate). The
+/// PTX body is structurally symmetric in qt/kvt, so this parameter does
+/// NOT change the emitted instructions — but it pins the call-site
+/// contract at the type level so a future B.3 refactor can't accidentally
+/// drop the kv-outer call site, and it gates the leading comment so
+/// `BWD_KV_TILE_SKIP_TB_*` labels are self-documenting in the SASS.
+///
+/// **No-op guarantee:** when `iteration_order = QOuter` the emitted PTX
+/// is byte-identical to the pre-B.2 emission (forward snapshots untouched).
 pub fn emit_skip_predicate(
     ptx: &mut String,
     config: &crate::flash_attention::FlashAttentionConfig,
@@ -373,12 +427,25 @@ pub fn emit_skip_predicate(
     kvt_reg: &str,           // PTX register holding the current kv-tile index
     range_table_base: u32,   // from smem_layout::tier_b_range_table_offset
     on_skip_label: &str,     // PTX label to branch to when ranges disjoint
+    iteration_order: IterationOrder,
 ) {
     let num_q  = crate::pca_tile_config::num_tiles(seq_len, config.block_q  as u32);
     let num_kv = crate::pca_tile_config::num_tiles(seq_len, config.block_kv as u32);
     let addrs = range_table_addrs(range_table_base, num_q, num_kv);
 
-    ptx.push_str("    // ----- PCA Tier B: skip predicate (spec sec 3.2) -----\n");
+    // Leading comment — for `QOuter` keep the EXACT existing string so the
+    // forward kernel snapshot remains byte-identical. `KVOuter` adds a
+    // direction marker so the backward predicate is self-documenting.
+    match iteration_order {
+        IterationOrder::QOuter => {
+            ptx.push_str("    // ----- PCA Tier B: skip predicate (spec sec 3.2) -----\n");
+        }
+        IterationOrder::KVOuter => {
+            ptx.push_str(
+                "    // ----- PCA Tier B: skip predicate (backward, kv-outer) (spec sec 3.2 + sec 7.3) -----\n",
+            );
+        }
+    }
     // Wrap in a PTX lexical scope so register decls are local to this
     // call site (predicate fires once per (q_iter, kv_iter) pair; without
     // the scope, repeat calls would re-declare and ptxas would reject).
@@ -674,8 +741,40 @@ mod tests {
         let mut s = String::new();
         let cfg = fa_base_for_test();
         emit_range_table_preamble(&mut s, &cfg, 4096, "seg_smem", 0);
-        emit_skip_predicate(&mut s, &cfg, 4096, "%qt", "%kvt", 0, "skip_kv_iter");
+        emit_skip_predicate(
+            &mut s, &cfg, 4096, "%qt", "%kvt", 0, "skip_kv_iter", IterationOrder::QOuter,
+        );
         emit_skip_decision_writeback(&mut s, &cfg, 4096, "%qt", "%kvt", "%p_skip_TB", "%dec_buf", 4);
         assert!(s.contains("PCA Tier B"), "output missing marker:\n{}", s);
+    }
+
+    /// No-op guarantee inside the predicate emitter: with `QOuter` the
+    /// output must be byte-identical to the pre-B.2 emission shape. The
+    /// only "shape" that ever existed was the QOuter shape, so any drift
+    /// in this snapshot-like equality check signals an accidental
+    /// regression for forward callers.
+    #[test]
+    #[cfg(not(feature = "debug_kernel_instrumentation"))]
+    fn qouter_emission_contains_unprefixed_marker_comment() {
+        let cfg = fa_base_for_test();
+
+        let mut s_q = String::new();
+        emit_skip_predicate(
+            &mut s_q, &cfg, 4096, "%qt", "%kvt", 0, "FWD_SKIP", IterationOrder::QOuter,
+        );
+        assert!(
+            s_q.contains("// ----- PCA Tier B: skip predicate (spec sec 3.2) -----"),
+            "QOuter must preserve the exact pre-B.2 leading comment for snapshot stability"
+        );
+        assert!(!s_q.contains("kv-outer"), "QOuter must not advertise as backward kv-outer");
+
+        let mut s_kv = String::new();
+        emit_skip_predicate(
+            &mut s_kv, &cfg, 4096, "%qt", "%kvt", 0, "BWD_SKIP", IterationOrder::KVOuter,
+        );
+        assert!(
+            s_kv.contains("kv-outer"),
+            "KVOuter must advertise its direction in the leading comment"
+        );
     }
 }

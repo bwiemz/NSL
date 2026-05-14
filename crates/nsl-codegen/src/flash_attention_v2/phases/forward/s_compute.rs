@@ -118,6 +118,9 @@ pub fn emit(
                 "%r_kvt_ord_TB",
                 range_table_base,
                 &skip_label,
+                // Forward FA-2: per-CTA q-tile fixed by %bid_x, q-iter
+                // Rust-unrolled, kv-tile is the PTX-runtime inner loop.
+                crate::pca_tilerange::IterationOrder::QOuter,
             );
             ptx.push_str("    } // end PCA Tier B per-q_iter scope\n");
         }

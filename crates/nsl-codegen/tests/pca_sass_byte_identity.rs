@@ -885,6 +885,7 @@ mod tier_b_sass {
         let mut predicate_ptx = String::new();
         nsl_codegen::pca_tilerange::emit_skip_predicate(
             &mut predicate_ptx, &cfg, 4096, "%qt", "%kvt", 0, "KV_TILE_SKIP",
+            nsl_codegen::pca_tilerange::IterationOrder::QOuter,
         );
 
         // Wrap predicate in a kernel with %qt, %kvt set up + a KV_TILE_SKIP target.
