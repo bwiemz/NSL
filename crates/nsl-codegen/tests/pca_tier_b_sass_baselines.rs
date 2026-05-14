@@ -201,8 +201,18 @@ fn check_baseline_for_variant(variant: &str, cfg: &FlashAttentionConfig) {
 // ---------------------------------------------------------------------------
 // CI gate tests (run by default)
 // ---------------------------------------------------------------------------
+//
+// Gated `cfg(not(feature = "debug_kernel_instrumentation"))` because the
+// baselines pin the **production** (no-instrumentation) SASS counts. When
+// the `debug_kernel_instrumentation` feature is on, the round-robin M3
+// writeback (B1.5-3) adds ~16 PTX blocks of ~16 instructions each — a
+// ~5% drift that exceeds the recorded tolerance. Regenerating baselines
+// under the feature would conflate production drift with debug-mode
+// drift; keep them no-feature-baselined and treat the feature-on path
+// as out-of-scope for this gate.
 
 #[test]
+#[cfg(not(feature = "debug_kernel_instrumentation"))]
 fn baseline_forward_kernel_segment_masked_tier_b_causal_32_32_32() {
     check_baseline_for_variant(
         "forward_kernel_segment_masked_tier_b_causal_32_32_32",
@@ -211,6 +221,7 @@ fn baseline_forward_kernel_segment_masked_tier_b_causal_32_32_32() {
 }
 
 #[test]
+#[cfg(not(feature = "debug_kernel_instrumentation"))]
 fn baseline_forward_kernel_segment_masked_tier_b_causal_64_64_64() {
     check_baseline_for_variant(
         "forward_kernel_segment_masked_tier_b_causal_64_64_64",

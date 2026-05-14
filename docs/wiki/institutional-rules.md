@@ -38,12 +38,13 @@ Cited from:
 
 ### IR-003 — Pre-implementation verification of load-bearing assumptions
 
-When a spec relies on cross-module behavior, verify the assumption via grep / probe / measurement before writing the code that depends on it. 15-minute verification beats multi-day rework.
+When a spec relies on cross-module behavior, verify the assumption via grep / probe / measurement before writing the code that depends on it. 15-minute verification beats multi-day rework. **Specialized case: resource-budget arithmetic at spec-pinned fixture dimensions.** When a spec pins specific fixture dimensions for measurement (e.g., gate fixtures), the spec's resource-budget arithmetic (SMEM, register pressure, occupancy) must be instantiated at those specific values, not left generic-over-config — otherwise the spec passes review based on plausible-generic numbers while the spec-pinned fixture has an unverified-specific failure mode.
 
 Cited from:
 - WGGO Phase 2 NodeId space (verified before backward-pass integration).
 - CSHA Tier B.1 V1/V2/V3 findings (verified pre-B1.2 kernel emission).
 - `docs/superpowers/specs/2026-05-12-pca-tier-b-revision-design.md` §2 — SMEM probe.
+- `docs/superpowers/specs/2026-05-13-pca-tier-b15-and-b2-design.md` §11.4 — gate fixture SMEM-budget verification gap (fixture-pinned SMEM exceeded device cap; uncaught because spec's §3.4 arithmetic was generic-over-config rather than instantiated-at-gate-fixture). First instance of the fixture-pinned-resource-budget specialization; if a second instance materializes (e.g., during M35.2a backward SMEM verification), promote to IR-013.
 
 ### IR-004 — APIs return aligned, ready-to-use values so consumers don't have to
 
@@ -88,3 +89,38 @@ Cited from:
 - FA-2 v2 Tier B.1 verification harness (V1/V2/V3 + cost-model snapshot).
 - BitNet Phase 1 validation harness + reference implementation.
 - `docs/superpowers/specs/2026-05-12-pca-tier-b-revision-design.md` overall §3.1 / §3.4 / §6.3 balance.
+
+### IR-009 — Dead-code lifecycle requires explicit removal triggers
+
+Dead-code (feature-flag-disabled-but-not-removed) without an explicit removal trigger becomes permanent. When a spec deprecates a feature via feature-flag disable rather than git-revert, the spec MUST pin (a) a decay timer (e.g., 6 months) by which a spec-level review re-evaluates dead-code maintenance cost vs option-value, (b) revival triggers (workload that re-justifies the feature, breakage that forces fix-or-revert choice), and (c) the breakage-trigger semantics (CUDA toolkit update, dependency drift). Without these, "we'll remove it later if not revived" decays into "it's been here forever and nobody knows why." The institutional pattern: dead-code is fine; permanent-dead-code is institutional debt that compounds.
+
+Cited from:
+- `docs/superpowers/specs/2026-04-27-awq-calibration-followup-design.md` — deprecated-shim lifecycle (the original surfacing).
+- `docs/superpowers/specs/2026-05-13-pca-tier-b15-and-b2-design.md` §3.4.1 — Tier B revert with 6-month decay timer.
+
+### IR-010 — Measurement-gated decisions specify thresholds, fail semantics, and protocol before the measurement runs
+
+Decisions deferred until after measurement risk post-hoc threshold negotiation — the natural human temptation to soften a gate that the measurement nearly cleared. Pinning all three at design time (pass thresholds with rationale, fail semantics with explicit action, measurement protocol with reproducibility tolerance) converts the gate from "decision support" to "data-driven decision." Post-measurement, only the data is examined; the decision rules are settled. If post-measurement analysis suggests a threshold was wrong, that analysis lands as a separate spec revision PR with explicit justification, not as a measurement-time adjustment. Same shape across BitNet Phase 1 → Phase 2 escalation criteria, CSHA Tier B.1 V1/V2/V3, and PCA Tier B keep/revert.
+
+Cited from:
+- `docs/superpowers/specs/2026-04-26-bitnet-phase1-design.md` — Phase 1 → Phase 2 escalation thresholds pinned at spec time.
+- `docs/superpowers/specs/2026-05-11-csha-tier-b1-pipelined-attention-design.md` — V1/V2/V3 verification decision matrices.
+- `docs/superpowers/specs/2026-05-13-pca-tier-b15-and-b2-design.md` §3 — Tier B acceptance bar with non-negotiability policy.
+
+### IR-011 — Distinct test surfaces roll up into a richer decision space than single-surface evaluation
+
+Multi-fixture compositions (gate / parity / sensitivity tiers; V1/V2/V3 verifications; per-commit milestone matrices) enable nuanced outcomes that single-surface evaluation forecloses. The composition is the load-bearing property, not the multiple surfaces themselves. Example: a single-fixture gate produces binary keep/revert; a three-tier matrix (gate + parity + sensitivity) produces three outcomes including "keep with sparsity gate" derived from the sensitivity curve. The richer outcome space emerges from composing surfaces whose individual purposes are distinct (correctness vs decision vs diagnostic). This is one level up from IR-006 (distinct test surfaces for distinct failure modes) — it's "distinct test surfaces roll up into outcomes IR-006 alone wouldn't have surfaced."
+
+Cited from:
+- `docs/superpowers/specs/2026-05-11-csha-tier-b1-pipelined-attention-design.md` — V1/V2/V3 multi-tier verification.
+- WGGO Phase 2 #134 — per-commit milestone matrix.
+- `docs/superpowers/specs/2026-05-13-pca-tier-b15-and-b2-design.md` §4 — gate/parity/sensitivity tiers unlock the "keep with sparsity gate" outcome.
+
+### IR-012 — Measurement-infrastructure contracts are explicit in spec, not implicit in implementation
+
+Shell scripts, CI configurations, and downstream tools encode measurement-binary contracts (output format, exit codes, fixture names, reproducibility seeds) as integration assumptions. Convention-only enforcement decays as the binary evolves; explicit contracts in spec persist. Pinning the contract — output format with stable prefix, exit code semantics, reproducibility seed default — prevents future refactors from silently breaking downstream consumers. Same discipline as CHANGELOG-CALIBRATION enforcement and SMEM-probe findings-doc append-only protocol.
+
+Cited from:
+- `docs/superpowers/specs/2026-04-27-awq-calibration-followup-design.md` — CHANGELOG-CALIBRATION enforcement.
+- `docs/superpowers/specs/2026-05-12-tier-b-smem-probe-findings.md` — append-only re-run log.
+- `docs/superpowers/specs/2026-05-13-pca-tier-b15-and-b2-design.md` §5.2 — nsl-codegen-bench invocation contract (output line format, exit codes, `--seed`).

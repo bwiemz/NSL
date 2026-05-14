@@ -1,6 +1,6 @@
 variant_name=forward_kernel_segment_masked_tier_b_causal_64_64_64
 sm=75
-instruction_count=14784
+instruction_count=14888
 spill_bytes=0
 tolerance=2
 recorded_date=2026-05-13

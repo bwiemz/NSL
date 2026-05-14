@@ -57,7 +57,7 @@ fn assemble_ptx(ptxas: &str, ptx: &[u8], sm: &str) -> Result<(), String> {
 
 fn synth_prelude_with_ret(config: &FlashAttentionConfig) -> Vec<u8> {
     let mut ptx = String::new();
-    backward::prelude::emit(&mut ptx, config);
+    backward::prelude::emit(&mut ptx, config, None);
     ptx.push_str("    ret;\n");
     ptx.push_str("}\n");
     // ptxas wants NUL-terminated input when loaded via cuModuleLoadData,
@@ -67,7 +67,7 @@ fn synth_prelude_with_ret(config: &FlashAttentionConfig) -> Vec<u8> {
 
 fn synth_prelude_q_load_with_ret(config: &FlashAttentionConfig) -> Vec<u8> {
     let mut ptx = String::new();
-    backward::prelude::emit(&mut ptx, config);
+    backward::prelude::emit(&mut ptx, config, None);
     backward::q_load::emit(&mut ptx, config, 0);
     ptx.push_str("    ret;\n");
     ptx.push_str("}\n");
@@ -76,7 +76,7 @@ fn synth_prelude_q_load_with_ret(config: &FlashAttentionConfig) -> Vec<u8> {
 
 fn synth_prelude_qload_ds_with_ret(config: &FlashAttentionConfig) -> Vec<u8> {
     let mut ptx = String::new();
-    backward::prelude::emit(&mut ptx, config);
+    backward::prelude::emit(&mut ptx, config, None);
     backward::q_load::emit(&mut ptx, config, 0);
     backward::ds_compute::emit(&mut ptx, config, 0);
     ptx.push_str("    ret;\n");
@@ -86,7 +86,7 @@ fn synth_prelude_qload_ds_with_ret(config: &FlashAttentionConfig) -> Vec<u8> {
 
 fn synth_prelude_qload_ds_dv_with_ret(config: &FlashAttentionConfig) -> Vec<u8> {
     let mut ptx = String::new();
-    backward::prelude::emit(&mut ptx, config);
+    backward::prelude::emit(&mut ptx, config, None);
     backward::q_load::emit(&mut ptx, config, 0);
     backward::ds_compute::emit(&mut ptx, config, 0);
     // Stand-in for the T4.1 orchestrator: zero the %f_dv_* accumulators
@@ -104,7 +104,7 @@ fn synth_prelude_qload_ds_dv_with_ret(config: &FlashAttentionConfig) -> Vec<u8> 
 
 fn synth_backward_through_dqdk_with_ret(config: &FlashAttentionConfig) -> Vec<u8> {
     let mut ptx = String::new();
-    backward::prelude::emit(&mut ptx, config);
+    backward::prelude::emit(&mut ptx, config, None);
     backward::q_load::emit(&mut ptx, config, 0);
     backward::ds_compute::emit(&mut ptx, config, 0);
     let slices_per_lane = ((config.head_dim as u32) / 32).max(1);
@@ -122,7 +122,7 @@ fn synth_backward_through_dqdk_with_ret(config: &FlashAttentionConfig) -> Vec<u8
 
 fn synth_backward_through_csha_hooks_with_ret(config: &FlashAttentionConfig) -> Vec<u8> {
     let mut ptx = String::new();
-    backward::prelude::emit(&mut ptx, config);
+    backward::prelude::emit(&mut ptx, config, None);
     backward::q_load::emit(&mut ptx, config, 0);
     backward::ds_compute::emit(&mut ptx, config, 0);
     let slices_per_lane = ((config.head_dim as u32) / 32).max(1);
@@ -143,7 +143,7 @@ fn synth_backward_through_csha_hooks_with_ret(config: &FlashAttentionConfig) -> 
 
 fn synth_backward_full_with_ret(config: &FlashAttentionConfig) -> Vec<u8> {
     let mut ptx = String::new();
-    backward::prelude::emit(&mut ptx, config);
+    backward::prelude::emit(&mut ptx, config, None);
     backward::q_load::emit(&mut ptx, config, 0);
     backward::ds_compute::emit(&mut ptx, config, 0);
     let slices_per_lane = ((config.head_dim as u32) / 32).max(1);

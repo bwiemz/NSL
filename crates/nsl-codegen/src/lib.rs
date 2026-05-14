@@ -166,6 +166,36 @@ pub mod wrga_roofline;
 pub mod wrga_spectral;
 pub mod zk;
 
+/// Binary-internal modules re-exposed at the library level so integration
+/// tests can reach them without the source code living twice. The actual
+/// binary entry points are in `src/bin/`; the submodules they consume live
+/// under `src/bin/<binname>/`.
+///
+/// Gated behind the binary's required Cargo features so non-`cuda` builds
+/// don't try to compile CUDA-dependent helpers.
+#[cfg(all(feature = "cuda", feature = "debug_kernel_instrumentation"))]
+pub mod bin {
+    pub mod bench {
+        #[path = "../../bin/bench/cli.rs"]
+        pub mod cli;
+        #[path = "../../bin/bench/fixtures.rs"]
+        pub mod fixtures;
+        #[path = "../../bin/bench/launch.rs"]
+        pub mod launch;
+        #[path = "../../bin/bench/output.rs"]
+        pub mod output;
+    }
+}
+
+// Note on the `#[path]` attributes above: when an inline `mod` is nested
+// inside another inline `mod`, Rust treats the directory as having descended
+// once per level. From `lib.rs` (in `src/`), entering `pub mod bin` notionally
+// descends into `src/bin/`, and entering `pub mod bench` descends again into
+// `src/bin/bench/`. The actual files live at `src/bin/bench/{cli,launch,output}.rs`,
+// so the relative path from `src/bin/bench/` UP two levels and back down is
+// `../../bin/bench/<file>.rs`. This keeps the binary and the library reading
+// from the same files.
+
 #[cfg(any(test, feature = "test-helpers"))]
 pub mod test_helpers;
 

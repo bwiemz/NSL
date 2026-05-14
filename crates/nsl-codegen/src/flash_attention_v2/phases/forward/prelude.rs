@@ -103,6 +103,22 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, tier_b: Option<(u32
     if config.segment_masked {
         params.push((".param .u64", "segment_ids_ptr"));
     }
+    // PCA Tier B M3 instrumentation (B1.5-3): per-tile skip-decision HBM
+    // buffer pointer. Only declared when:
+    //   1. Tier B is being emitted (tier_b is Some + budget admits), AND
+    //   2. the `debug_kernel_instrumentation` Cargo feature is enabled.
+    // The bench binary's kernel-args list passes this slot unconditionally
+    // when tier_b_on; production callers omit the feature and the param
+    // disappears from the signature, keeping the byte-identical no-op
+    // guarantee.
+    let tier_b_admitted = tier_b
+        .map(|(seq_len, residency)| {
+            crate::pca_tilerange::should_emit_tier_b(config, seq_len as u64, residency)
+        })
+        .unwrap_or(false);
+    if cfg!(feature = "debug_kernel_instrumentation") && tier_b_admitted {
+        params.push((".param .u64", "skip_decisions_ptr"));
+    }
     for (i, (ty, pname)) in params.iter().enumerate() {
         let comma = if i + 1 < params.len() { "," } else { "" };
         ptx.push_str(&format!("    {} {}{}\n", ty, pname, comma));
@@ -382,7 +398,10 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, tier_b: Option<(u32
         if let Some((seq_len, residency)) = tier_b {
             if crate::pca_tilerange::should_emit_tier_b(config, seq_len as u64, residency) {
                 let range_table_base =
-                    crate::flash_attention_v2::smem_layout::tier_b_range_table_offset(config);
+                    crate::flash_attention_v2::smem_layout::tier_b_range_table_offset(
+                        config,
+                        crate::flash_attention_v2::smem_layout::Direction::Forward,
+                    );
                 crate::pca_tilerange::emit_range_table_preamble(
                     ptx,
                     config,

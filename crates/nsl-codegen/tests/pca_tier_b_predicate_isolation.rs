@@ -3,7 +3,7 @@
 //! Per spec §5.1 + §3.2.
 
 use nsl_codegen::flash_attention::{FlashAttentionConfig, RopeStyle};
-use nsl_codegen::pca_tilerange::emit_skip_predicate;
+use nsl_codegen::pca_tilerange::{emit_skip_predicate, IterationOrder};
 
 fn fa_4k_block64_seg_masked() -> FlashAttentionConfig {
     FlashAttentionConfig {
@@ -14,7 +14,13 @@ fn fa_4k_block64_seg_masked() -> FlashAttentionConfig {
     }
 }
 
+// Snapshot is baselined for the production (non-instrumented) path. The
+// `debug_kernel_instrumentation` feature appends the M3 round-robin
+// writeback PTX inside the predicate scope (covered by the separate
+// `pca_tier_b_writeback_isolation` snapshot), so this snapshot's content
+// only matches when the feature is OFF. Gated via `cfg(not(feature = ...))`.
 #[test]
+#[cfg(not(feature = "debug_kernel_instrumentation"))]
 fn predicate_4k_block64_isolation_snapshot() {
     let mut ptx = String::new();
     emit_skip_predicate(
@@ -24,6 +30,7 @@ fn predicate_4k_block64_isolation_snapshot() {
         "%qt", "%kvt",
         0xDEAD_BEEF,
         "KV_TILE_SKIP",
+        IterationOrder::QOuter,
     );
     insta::assert_snapshot!("predicate_4k_block64", ptx);
 }
@@ -34,6 +41,7 @@ fn predicate_emits_four_range_table_loads() {
     emit_skip_predicate(
         &mut ptx, &fa_4k_block64_seg_masked(), 4096,
         "%qt", "%kvt", 0xDEAD_BEEF, "KV_TILE_SKIP",
+        IterationOrder::QOuter,
     );
     // 4 loads: qmin, qmax, kvmin, kvmax.
     assert_eq!(ptx.matches("ld.shared.u16").count(), 4);
@@ -45,6 +53,7 @@ fn predicate_uses_disjoint_logic() {
     emit_skip_predicate(
         &mut ptx, &fa_4k_block64_seg_masked(), 4096,
         "%qt", "%kvt", 0xDEAD_BEEF, "KV_TILE_SKIP",
+        IterationOrder::QOuter,
     );
     assert!(ptx.contains("setp.lt.u16 %p_lt_TB, %qmax_TB, %kvmin_TB"));
     assert!(ptx.contains("setp.gt.u16 %p_gt_TB, %qmin_TB, %kvmax_TB"));
@@ -57,6 +66,7 @@ fn predicate_branches_to_provided_label() {
     emit_skip_predicate(
         &mut ptx, &fa_4k_block64_seg_masked(), 4096,
         "%qt", "%kvt", 0xDEAD_BEEF, "MY_CUSTOM_LABEL",
+        IterationOrder::QOuter,
     );
     assert!(ptx.contains("@%p_skip_TB bra MY_CUSTOM_LABEL"));
 }
@@ -67,6 +77,7 @@ fn predicate_sentinel_visible() {
     emit_skip_predicate(
         &mut ptx, &fa_4k_block64_seg_masked(), 4096,
         "%qt", "%kvt", 0xDEAD_BEEF, "KV_TILE_SKIP",
+        IterationOrder::QOuter,
     );
     // Sentinel offsets appear as immediate operands of `add.u64`.
     // qmin offset = 0xDEADBEEF (base + 0), shows verbatim.

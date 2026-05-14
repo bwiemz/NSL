@@ -863,7 +863,15 @@ mod tier_b_sass {
         );
     }
 
+    // Gated `cfg(not(feature = "debug_kernel_instrumentation"))` because
+    // the round-robin writeback (B1.5-3) appends an `ld.param.u64
+    // [skip_decisions_ptr]` inside the predicate scope. That param is
+    // declared by the forward prelude when the feature is on but NOT by
+    // this test's minimal kernel wrapper — embedding the writeback here
+    // would make ptxas reject the assembled kernel. The feature-on path
+    // is covered by `pca_tier_b_writeback_isolation` instead.
     #[test]
+    #[cfg(not(feature = "debug_kernel_instrumentation"))]
     fn tier_b_skip_predicate_branch_is_uniform_sm120() {
         let (ptxas, cuobjdump) = match tools() {
             Some(t) => t,
@@ -877,6 +885,7 @@ mod tier_b_sass {
         let mut predicate_ptx = String::new();
         nsl_codegen::pca_tilerange::emit_skip_predicate(
             &mut predicate_ptx, &cfg, 4096, "%qt", "%kvt", 0, "KV_TILE_SKIP",
+            nsl_codegen::pca_tilerange::IterationOrder::QOuter,
         );
 
         // Wrap predicate in a kernel with %qt, %kvt set up + a KV_TILE_SKIP target.

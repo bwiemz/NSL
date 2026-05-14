@@ -537,6 +537,31 @@ pub fn flash_attention_kernel_name_v2(config: &FlashAttentionConfig) -> String {
     format!("{}_v2", crate::flash_attention::flash_attention_kernel_name(config))
 }
 
+/// Central dispatch toggle for PCA Tier B PTX emission.
+///
+/// Returns `true` when Tier B's range-table preamble + tile-skip predicate
+/// should be emitted for this FA config. Today returns `false`
+/// unconditionally — Tier B is dormant infrastructure per PR #168. The
+/// `nsl-codegen-bench` measurement harness overrides this gate by passing
+/// `Some((seq_len, residency))` directly to
+/// [`synthesize_flash_attention_ptx_v2_with_tier_b`], bypassing the
+/// planner-side decision.
+///
+/// After the M2/M6 measurements land (task B1.5-6 of the 2026-05-13 plan),
+/// this helper is updated per the §10 outcomes matrix of the design spec:
+///   - `keep` outcome — returns `true` when `config.segment_masked` and the
+///     fine-grained gate `pca_tilerange::should_emit_tier_b` admits.
+///   - `keep-with-sparsity-gate` — adds a measured sparsity threshold.
+///   - `revert` — stays at `false` (current state); the 6-month decay timer
+///     starts on the day the findings doc commits.
+///
+/// This is the single source of truth so planner-dispatch callers see one
+/// boolean, distinct from the fine-grained PTX-budget check in
+/// [`crate::pca_tilerange::should_emit_tier_b`].
+pub fn should_emit_tier_b(_config: &FlashAttentionConfig) -> bool {
+    false
+}
+
 /// SMEM byte count for a v2 kernel. Computed from the layout module so
 /// static-shmem declaration and launch-arg stay in sync.
 pub fn shared_mem_bytes_v2(config: &FlashAttentionConfig) -> u32 {
@@ -615,13 +640,39 @@ pub fn shared_mem_bytes_v2_backward_with_seqlen(
 /// `Direction::Backward` (the 99 KB budget check includes
 /// `backward_extra_bytes` for the gradient accumulator tiles).
 pub fn synthesize_backward(config: &FlashAttentionConfig) -> Result<String, String> {
+    synthesize_backward_with_tier_b(config, None)
+}
+
+/// Tier C backward orchestrator with optional PCA Tier B.2 support.
+///
+/// When `tier_b` is `None` this produces byte-identical output to
+/// `synthesize_backward(config)` (Tier B.2 no-op guarantee, spec §7.4).
+/// When `tier_b` is `Some((seq_len, residency))` and `should_emit_tier_b`
+/// returns true, the emitted PTX includes:
+///   1. Range-table preamble in the backward prelude (after Tier A bar.sync 0).
+///   2. Per-(q_iter, kvt) skip predicate at the head of each q_iter body
+///      inside `V2_BWD_LOOP_KV` (KV-outer / Q-inner per V-B.2-predicate
+///      case (β)).
+///   3. `BWD_KV_TILE_SKIP_TB_{q_iter}:` labels at the end of each q_iter body.
+///
+/// Symmetric correctness (spec §7.1): skipped tiles produce P=0 ⇒ dS=0;
+/// no contribution to dQ/dK/dV. dV/dK SMEM tiles are zero-initialised at the
+/// top of the kv-outer loop, so a skipped (q_iter, kvt) sees a no-op RMW.
+/// dQ is zero-initialised once at the top of the kernel and persists across
+/// kv-iters; skipped tiles leave it unchanged.
+pub fn synthesize_backward_with_tier_b(
+    config: &FlashAttentionConfig,
+    tier_b: Option<(u32, SegmentResidency)>,
+) -> Result<String, String> {
     smem_layout::validate_scalar_v2_config(config, smem_layout::Direction::Backward)
         .map_err(|e| format!("backward validator rejected: {e}"))?;
 
     let mut ptx = String::new();
 
     // Phase 0: header, .visible .entry, SMEM, register pool, indices.
-    phases::backward::prelude::emit(&mut ptx, config);
+    // tier_b forwarded so the Tier B range-table preamble (if admitted) is
+    // emitted after the Tier A segment_ids load + bar.sync 0.
+    phases::backward::prelude::emit(&mut ptx, config, tier_b);
 
     // CSHA A.4: head pruning guard — mirror forward. Runs ONCE before
     // any backward phase so blocks whose head_idx >= csha_active_heads
@@ -714,6 +765,44 @@ pub fn synthesize_backward(config: &FlashAttentionConfig) -> Result<String, Stri
     ptx.push_str("    mov.u64 %k_start, 0;\n");
     ptx.push_str("    mov.u64 %k_max, %rd6;\n");
     ptx.push_str("V2_BWD_LOOP_KV:\n");
+    // PCA Tier B.2: derive the kv-tile ordinal once per kv-outer iter and
+    // hoist it into a register that lives until the bottom of the kv-loop.
+    // Each per-q_iter skip predicate (below) reads this for `kvt_reg`.
+    // %k_start is a u64 induction var written at the top of the kv-loop by
+    // the prior iteration's add.u64; block_kv is a power-of-2 tile size, so
+    // shr.b64 by log2(block_kv) yields the kv-tile ordinal directly.
+    let tier_b_active = tier_b
+        .map(|(seq_len, residency)| {
+            crate::pca_tilerange::should_emit_tier_b(config, seq_len as u64, residency)
+        })
+        .unwrap_or(false);
+    let log2_bkv = (config.block_kv as u32).trailing_zeros();
+    let log2_bq = (config.block_q as u32).trailing_zeros();
+    if tier_b_active {
+        ptx.push_str("    { // PCA Tier B.2: kv-tile ordinal scope (per kv-outer iter)\n");
+        ptx.push_str("    .reg .u64 %rd_kvt_ord_TB_BWD;\n");
+        ptx.push_str("    .reg .u32 %r_kvt_ord_TB_BWD;\n");
+        ptx.push_str(&format!(
+            "    shr.b64 %rd_kvt_ord_TB_BWD, %k_start, {log2_bkv};\n"
+        ));
+        ptx.push_str("    cvt.u32.u64 %r_kvt_ord_TB_BWD, %rd_kvt_ord_TB_BWD;\n");
+        // B2-2.5: q-tile ordinal derived from %q_start, not %bid_x. Backward
+        // launches with `grid_x = 1` in production (q-block encoded in
+        // `seq_lens_ptr` → `%q_launch_base` → `%q_start`); reading `%bid_x`
+        // here would always yield 0 and the predicate would see q-tile 0's
+        // segment range for every CTA. Computing qt = q_start >> log2(bq)
+        // is correct under BOTH launch ABIs:
+        //   grid_x = num_q_tiles (legacy bench): q_start = bid_x * bq → qt = bid_x.
+        //   grid_x = 1            (production):   q_start = q_launch_base → qt = q_block.
+        // qt is invariant across the kv-outer loop (q_start written once in
+        // prelude), so hoisting alongside %r_kvt_ord_TB_BWD is correct.
+        ptx.push_str("    .reg .u64 %rd_qt_ord_TB_BWD;\n");
+        ptx.push_str("    .reg .u32 %r_qt_ord_TB_BWD;\n");
+        ptx.push_str(&format!(
+            "    shr.b64 %rd_qt_ord_TB_BWD, %q_start, {log2_bq};\n"
+        ));
+        ptx.push_str("    cvt.u32.u64 %r_qt_ord_TB_BWD, %rd_qt_ord_TB_BWD;\n");
+    }
     phases::backward::kv_load::emit_k_suffixed(&mut ptx, config, "MAIN");
     phases::backward::kv_load::emit_v_suffixed(&mut ptx, config, "MAIN");
     for (tag, off, total, per_thread) in [
@@ -751,6 +840,52 @@ pub fn synthesize_backward(config: &FlashAttentionConfig) -> Result<String, Stri
         ptx.push_str(&format!(
             "    // ====== BWD q_tile_iter = {q_iter} / {iters} ======\n"
         ));
+
+        // PCA Tier B.2 skip predicate — fires once per (q_iter, kvt) at the
+        // head of this q_iter body. When ranges are disjoint the predicate
+        // branches to BWD_KV_TILE_SKIP_TB_{q_iter}_{kvt-from-loop}, placed at
+        // the END of this q_iter body (after the dQ flush). The skip is
+        // SYMMETRIC-ZERO safe (spec §7.1): P=0 ⇒ dV=P^T·dO=0, dP=dO·V^T=0,
+        // dS=P⊙(dP-D)=0 ⇒ no contribution to dQ/dK/dV for this (qt, kvt).
+        // The dV/dK SMEM tiles were zero-initialised at the top of THIS kv
+        // iter; the dQ register reload+flush around the skip is a load-store
+        // of unchanged data (idempotent overwrite).
+        //
+        // The label includes `q_iter` so different inner q_iters get distinct
+        // PTX labels — required because we still want each q_iter to make an
+        // independent skip decision (qt is the same for all q_iters in a CTA
+        // — see B2-2.5: qt = %q_start >> log2(block_q) — but kvt is the same
+        // for all q_iters too, so the predicate result is actually loop-
+        // invariant across q_iters; we still emit per-q_iter labels for
+        // ptxas's BRA.U inference and to avoid label namespace collisions).
+        if tier_b_active {
+            if let Some((seq_len, _residency)) = tier_b {
+                let range_table_base =
+                    crate::flash_attention_v2::smem_layout::tier_b_range_table_offset(
+                        config,
+                        crate::flash_attention_v2::smem_layout::Direction::Backward,
+                    );
+                let skip_label = format!("BWD_KV_TILE_SKIP_TB_{q_iter}");
+                ptx.push_str(&format!(
+                    "    {{ // PCA Tier B.2 per-q_iter skip-predicate scope (q_iter={q_iter})\n"
+                ));
+                crate::pca_tilerange::emit_skip_predicate(
+                    &mut ptx,
+                    config,
+                    seq_len,
+                    // B2-2.5: %r_qt_ord_TB_BWD = (%q_start >> log2(block_q)).
+                    // Correct under BOTH grid_x=num_q_tiles (bench legacy) and
+                    // grid_x=1 (production, q-block in seq_lens_ptr).
+                    "%r_qt_ord_TB_BWD",
+                    "%r_kvt_ord_TB_BWD",
+                    range_table_base,
+                    &skip_label,
+                    crate::pca_tilerange::IterationOrder::KVOuter,
+                );
+                ptx.push_str("    } // end per-q_iter skip-predicate scope\n");
+            }
+        }
+
         let hd = config.head_dim as u32;
         let row_stride = hd * 4; // f32
         let slices = slices_per_lane;
@@ -825,6 +960,20 @@ pub fn synthesize_backward(config: &FlashAttentionConfig) -> Result<String, Stri
                 "    st.shared.f32 [%rd_dqs_addr], %f_dq_{slice};\n"
             ));
         }
+
+        // PCA Tier B.2 skip-predicate target — placed at the END of this
+        // q_iter body so a skip branches past ds_compute/dv_accum/dqdk_accum
+        // AND past the dQ flush. Skipped tiles produce S=0 ⇒ dS=0, and the
+        // dQ register contents are unchanged from the reload above, so even
+        // if we had flushed them back, the SMEM contents would be identical.
+        // Per-q_iter label namespace is `BWD_KV_TILE_SKIP_TB_{q_iter}` —
+        // distinct from forward's `KV_TILE_SKIP_TB_{q_iter}` namespace.
+        if tier_b_active {
+            ptx.push_str(&format!("BWD_KV_TILE_SKIP_TB_{q_iter}:\n"));
+        }
+    }
+    if tier_b_active {
+        ptx.push_str("    } // end PCA Tier B.2 kv-tile ordinal scope\n");
     }
     phases::backward::finalize::emit_store_kv_only(&mut ptx, config, 0);
     ptx.push_str(&format!("    add.u64 %k_start, %k_start, {};\n", config.block_kv));

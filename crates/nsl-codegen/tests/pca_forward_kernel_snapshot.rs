@@ -73,7 +73,14 @@ fn forward_kernel_segment_masked_causal_32_32_32() {
 //   - emit_skip_predicate block at the top of each KV-tile (via s_compute).
 //   - KV_TILE_SKIP_TB_{q_iter}: labels at the bottom of each KV-tile loop.
 
+// Snapshots are baselined for the production (no-instrumentation) PTX.
+// When `debug_kernel_instrumentation` is on the round-robin M3 writeback
+// (B1.5-3) is appended inside the predicate scope and the snapshot
+// content changes. The feature-on shape is covered separately by
+// `pca_tier_b_writeback_isolation`. Gate these tests off when the
+// feature is enabled to avoid spurious snapshot churn.
 #[test]
+#[cfg(not(feature = "debug_kernel_instrumentation"))]
 fn forward_kernel_segment_masked_tier_b_causal_32_32_32() {
     let cfg = minimal_segment_masked_config();
     let seq_len: u32 = 4096;
@@ -100,6 +107,7 @@ fn forward_kernel_segment_masked_tier_b_causal_32_32_32() {
 }
 
 #[test]
+#[cfg(not(feature = "debug_kernel_instrumentation"))]
 fn forward_kernel_segment_masked_tier_b_causal_64_64_64() {
     let cfg = segment_masked_config_64x64x64();
     let seq_len: u32 = 4096;

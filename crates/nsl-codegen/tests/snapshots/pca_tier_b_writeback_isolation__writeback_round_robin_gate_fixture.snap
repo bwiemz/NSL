@@ -1,0 +1,31 @@
+---
+source: crates/nsl-codegen/tests/pca_tier_b_writeback_isolation.rs
+assertion_line: 71
+expression: ptx
+---
+    // ----- PCA Tier B: skip-decision writeback (debug, spec sec 4.3 / sec 6.2) -----
+    {
+    .reg .u64 %dec_buf_TB, %dec_slot_TB;
+    .reg .u32 %slot_off_TB, %bh_TB, %bh_slot_TB;
+    .reg .u16 %dec_val_TB;
+    .reg .u32 %tid_local_TB, %warp_id_TB, %lane_local_TB, %owning_warp_TB;
+    .reg .pred %p_warp_owner_TB, %p_lane_owner_TB, %p_writeback_TB;
+
+    mov.u32 %bh_TB, %bid_y;
+    mad.lo.u32 %bh_slot_TB, %bh_TB, 64, %qt;
+    mad.lo.u32 %slot_off_TB, %bh_slot_TB, 64, %kvt;
+    ld.param.u64 %dec_buf_TB, [skip_decisions_ptr];
+    cvt.u64.u32 %dec_slot_TB, %slot_off_TB;
+    add.u64 %dec_slot_TB, %dec_buf_TB, %dec_slot_TB;
+    mov.u32 %tid_local_TB, %tid.x;
+    shr.u32 %warp_id_TB, %tid_local_TB, 5;
+    mad.lo.u32 %owning_warp_TB, %qt, 64, %kvt;
+    rem.u32 %owning_warp_TB, %owning_warp_TB, 4;
+    setp.eq.u32 %p_warp_owner_TB, %warp_id_TB, %owning_warp_TB;
+    and.b32 %lane_local_TB, %tid_local_TB, 0x1F;
+    setp.eq.u32 %p_lane_owner_TB, %lane_local_TB, 0;
+    and.pred %p_writeback_TB, %p_warp_owner_TB, %p_lane_owner_TB;
+    selp.u16 %dec_val_TB, 1, 0, %p_skip_TB;
+    @%p_writeback_TB st.global.u8 [%dec_slot_TB], %dec_val_TB;
+    }
+    // ----- end skip-decision writeback -----
