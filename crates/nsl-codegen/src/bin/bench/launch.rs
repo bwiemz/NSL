@@ -488,18 +488,18 @@ pub unsafe fn run_fixture(
     // `fwd_needs_dynamic_smem` heuristics. Opt in unconditionally; ptxas
     // ignores the attribute set when the kernel uses static SMEM only.
     //
-    // CRITICAL: when Tier B is on, the kernel's range-table base is
-    // computed by `smem_layout::tier_b_range_table_offset` which returns
-    // `backward_total_bytes + seg_overhead`. That offset is placed at the
-    // *backward* layout's tail so the same SMEM region serves both forward
-    // and backward kernels — but the offset is well past forward's
-    // `total_bytes`. If we pass only the forward helper's view of SMEM
-    // to `cuLaunchKernel`, the kernel writes the range table beyond the
-    // allocated region → CUDA_ERROR_ILLEGAL_ADDRESS at sync time.
+    // When Tier B is on, the kernel's range-table base is computed by
+    // `smem_layout::tier_b_range_table_offset(config, Direction::Forward)`
+    // — i.e. it rides at the tail of the *forward* total + seg_overhead
+    // (~50 KB at the gate fixture's pinned dims). Per design spec §11.4,
+    // forward-only kernels MUST pass `Direction::Forward`; passing
+    // `Direction::Backward` would inherit the backward-sized offset
+    // (~140 KB) and exceed the 99 KB per-CTA dynamic SMEM cap on
+    // Blackwell-class hardware.
     //
-    // Fix: compute the high-watermark of any SMEM offset the kernel
-    // touches, which is `range_table_base + range_table_bytes` when Tier B
-    // is on, or `forward total + seg_overhead` when off.
+    // Compute the high-watermark of any SMEM offset the kernel touches:
+    //   range_table_base + range_table_bytes  when Tier B is on
+    //   forward total + seg_overhead          when Tier B is off
     let shmem_bytes_base = shared_mem_bytes_v2_with_seqlen(
         &fixture.config,
         fixture.seq_len,
@@ -514,6 +514,7 @@ pub unsafe fn run_fixture(
     {
         let base = crate::flash_attention_v2::smem_layout::tier_b_range_table_offset(
             &fixture.config,
+            crate::flash_attention_v2::smem_layout::Direction::Forward,
         );
         let tbl =
             crate::pca_tilerange::tier_b_range_table_bytes(&fixture.config, fixture.seq_len);

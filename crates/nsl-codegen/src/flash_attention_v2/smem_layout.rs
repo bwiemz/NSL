@@ -300,20 +300,42 @@ pub fn sp_bytes(config: &FlashAttentionConfig) -> u32 {
     }
 }
 
-/// PCA Tier B range table — single tail offset into extern shmem.
+/// PCA Tier B range table — direction-aware tail offset into extern shmem.
 ///
-/// Returns `align_up(backward_total_bytes + seg_overhead, 2)` so the
-/// returned offset is 2-byte aligned for u16 slot loads. Alignment is
-/// owned here per IR-004; `pca_tilerange::range_table_addrs` assumes
-/// the base is ready-to-use.
-pub fn tier_b_range_table_offset(config: &crate::flash_attention::FlashAttentionConfig) -> u32 {
+/// Returns `align_up(direction_total + seg_overhead, 2)` so the returned
+/// offset is 2-byte aligned for u16 slot loads. Alignment is owned here
+/// per IR-004; `pca_tilerange::range_table_addrs` assumes the base is
+/// ready-to-use.
+///
+/// `direction` selects which SMEM total the range table sits at the tail
+/// of:
+///   - `Direction::Forward`  → `total_bytes(config) + seg_overhead`
+///     (used by forward-only kernels; forward total is ~17 KB at the
+///     spec-pinned gate fixture, leaving ample headroom under the 99 KB
+///     dynamic SMEM cap).
+///   - `Direction::Backward` → `backward_total_bytes(config) +
+///     seg_overhead` (used when backward Tier B ships in B.2; the table
+///     rides past the backward extras so forward+backward kernels can
+///     share an arena layout when emitted under a single SMEM budget).
+///
+/// Forward-only kernels at the gate fixture's pinned dims (block 64×64,
+/// head_dim=64) would otherwise inherit the backward-sized offset
+/// (~140 KB), pushing total SMEM past the 99 KB cap on Blackwell. See
+/// design spec §11.4 for the discovery and rationale.
+pub fn tier_b_range_table_offset(
+    config: &crate::flash_attention::FlashAttentionConfig,
+    direction: Direction,
+) -> u32 {
     let seg_overhead = if config.segment_masked {
         crate::pca_segment::DEFAULT_SMEM_SEGMENT_BUDGET as u32
     } else {
         0
     };
-    let base = crate::flash_attention_v2::phases::backward::prelude::backward_total_bytes(config)
-        + seg_overhead;
+    let base = match direction {
+        Direction::Forward => total_bytes(config),
+        Direction::Backward =>
+            crate::flash_attention_v2::phases::backward::prelude::backward_total_bytes(config),
+    } + seg_overhead;
     align_up_u32(base, 2)
 }
 

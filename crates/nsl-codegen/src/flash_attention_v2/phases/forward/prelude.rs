@@ -382,7 +382,10 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, tier_b: Option<(u32
         if let Some((seq_len, residency)) = tier_b {
             if crate::pca_tilerange::should_emit_tier_b(config, seq_len as u64, residency) {
                 let range_table_base =
-                    crate::flash_attention_v2::smem_layout::tier_b_range_table_offset(config);
+                    crate::flash_attention_v2::smem_layout::tier_b_range_table_offset(
+                        config,
+                        crate::flash_attention_v2::smem_layout::Direction::Forward,
+                    );
                 crate::pca_tilerange::emit_range_table_preamble(
                     ptx,
                     config,

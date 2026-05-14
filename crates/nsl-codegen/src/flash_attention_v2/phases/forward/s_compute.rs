@@ -87,7 +87,10 @@ pub fn emit(
         if crate::pca_tilerange::should_emit_tier_b(config, seq_len as u64, residency) {
             let log2_bkv = (block_kv as u32).trailing_zeros();
             let range_table_base =
-                crate::flash_attention_v2::smem_layout::tier_b_range_table_offset(config);
+                crate::flash_attention_v2::smem_layout::tier_b_range_table_offset(
+                    config,
+                    crate::flash_attention_v2::smem_layout::Direction::Forward,
+                );
             let skip_label = format!("KV_TILE_SKIP_TB_{q_tile_iter}");
             // Wrap in a PTX lexical scope so the kvt-ordinal registers
             // are local to this q_tile_iter (s_compute::emit is called
