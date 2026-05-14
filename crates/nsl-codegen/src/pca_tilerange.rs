@@ -184,7 +184,7 @@ pub fn emit_range_table_preamble(
     ptx.push_str("    .reg .u64  %addr_min_TILERANGE, %addr_max_TILERANGE;\n");
     ptx.push_str("    .reg .u64  %seg_smem_TILERANGE, %wide_tile_off_TILERANGE;\n");
     ptx.push_str("    .reg .u32  %seg_byte_off_TILERANGE;\n");
-    ptx.push_str("\n");
+    ptx.push('\n');
 
     // `segment_ids_smem_base` can be either:
     //   - a `.shared` array label (forward: `seg_smem`) — convert to generic
@@ -206,7 +206,7 @@ pub fn emit_range_table_preamble(
         ));
     }
     ptx.push_str("    mov.u32 %lane_id_TILERANGE, %laneid;\n");
-    ptx.push_str("\n");
+    ptx.push('\n');
 
     emit_phase(ptx, "q",  num_q_tiles,  block_q,  addrs.qtile_min,  addrs.qtile_max);
     emit_phase(ptx, "kv", num_kv_tiles, block_kv, addrs.kvtile_min, addrs.kvtile_max);
@@ -454,7 +454,7 @@ pub fn emit_skip_predicate(
     ptx.push_str("    .reg .pred %p_lt_TB, %p_gt_TB, %p_skip_TB;\n");
     ptx.push_str("    .reg .u32  %tile_byte_TB;\n");
     ptx.push_str("    .reg .u64  %addr_TB, %tile_off_wide_TB;\n");
-    ptx.push_str("\n");
+    ptx.push('\n');
 
     // qmin[qt], qmax[qt].
     //
@@ -593,7 +593,7 @@ pub fn emit_skip_decision_writeback(
     ptx.push_str("    .reg .u16 %dec_val_TB;\n");
     ptx.push_str("    .reg .u32 %tid_local_TB, %warp_id_TB, %lane_local_TB, %owning_warp_TB;\n");
     ptx.push_str("    .reg .pred %p_warp_owner_TB, %p_lane_owner_TB, %p_writeback_TB;\n");
-    ptx.push_str("\n");
+    ptx.push('\n');
 
     // ── Slot offset within the [B, H, Qtiles, KVtiles] u8 buffer. ──
     // `%bid_y` already encodes `batch_idx * num_heads + head_idx` because
