@@ -287,15 +287,24 @@ v2 migration cost: ~80 LOC for the residency parameter threading + per-variant t
 
 ### 8.1 What changes
 
-The 8 snapshots affected by activation (4 forward + 4 backward, for `segment_masked` configs at gate fixture dimensions and other test fixtures where seq_len >= floor) require re-baselining. The exact list:
+Activation affects **6 kernel snapshots** (4 forward + 4 backward, for `segment_masked` configs at gate fixture dimensions and below-floor seq_len fixtures) that require re-baselining, **plus 2 isolation snapshots** that are **expected-stable** and verified-stable as part of the D-3 gate.
+
+**6 affected (re-baseline scope):**
 
 - `pca_forward_kernel_snapshot__forward_kernel_segment_masked_tier_b_causal_32_32_32`
 - `pca_forward_kernel_snapshot__forward_kernel_segment_masked_tier_b_causal_64_64_64`
-- `pca_tier_b_preamble_isolation__preamble_4k_block64` (range-table-base immediate; possibly stable since the preamble emit is unchanged)
-- `pca_tier_b_predicate_isolation__predicate_4k_block64` (range-table-base immediate; possibly stable since the predicate emit is unchanged)
-- The 4 backward equivalents (`pca_backward_kernel_snapshot__backward_kernel_segment_masked_tier_b_*`)
+- The 4 backward equivalents (`pca_backward_kernel_snapshot__backward_kernel_segment_masked_tier_b_*` at the same dimensions).
 
-(The exact set may differ slightly once the heuristic is wired — the implementation phase determines the final list.)
+**2 expected-stable (D-3 verifies; do NOT re-baseline):**
+
+- `pca_tier_b_preamble_isolation__preamble_4k_block64`
+- `pca_tier_b_predicate_isolation__predicate_4k_block64`
+
+The two isolation tests call the emission functions (`emit_range_table_preamble`, `emit_skip_predicate`) **directly** per PR #168's design — they don't route through `synthesize_flash_attention_ptx_v2`. Therefore they are stable under dispatch activation; D-3 verifies this via a direct snapshot diff with expected: zero bytes changed.
+
+**If D-3 surfaces that the isolation tests DO change**, that indicates an unexpected call-graph dependency — investigation precedes acceptance per the "isolation tests' stability determined by call path" discipline. Re-baselining the isolation tests without investigation would mask a real architectural change.
+
+(The exact set may differ slightly once V-dispatch-integration's outcome is known — the implementation phase's first task in D-3 enumerates the final list.)
 
 ### 8.2 PR-description discipline
 
@@ -387,18 +396,32 @@ The work breaks into 4 sequential milestones.
 |---|---|---|---|---|---|
 | **D-1** | Verification | V-dispatch-integration: classify callers (α/β/γ); findings doc. | ~0 code, doc only | Findings doc committed with caller classification + outcome decision. Budget 30-45 min. | — |
 | **D-2** | Measurement | Floor derivation: 7-point seq_len sweep at sparsity=50%; findings doc. | ~0 code; ~50 LOC of measurement script reuse from B.1.5-5. | Findings doc committed with per-seq_len wall-time win %, derived floor value, curve-shape inference. Budget ~1 hour. | D-1 |
-| **D-3** | Implementation | Implement minimal heuristic per V-dispatch-integration outcome (option 2/3/4 from §5.2). `should_emit_tier_b` body; signature changes; 1-arg wrapper. | ~50-100 LOC implementation + ~50 LOC call-site updates (if α or γ). | `cargo build` clean; all 16 parity tests pass; new heuristic returns expected values at gate fixture + parity fixtures. | D-1 + D-2 |
-| **D-4** | Snapshots + PR | Re-baseline 8 snapshots per §8 PR-description discipline; ship activation PR. | ~0 code; snapshot diffs. | PR description includes per-snapshot diff, hand-derivation per fixture, cascade-narrative verification, cross-validation against parity. | D-3 |
+| **D-3** | Implementation | Implement minimal heuristic per V-dispatch-integration outcome (option 2/3/4 from §5.2). `should_emit_tier_b` body; signature changes; 1-arg wrapper. | ~50-100 LOC implementation + ~50 LOC call-site updates (if α or γ). | `cargo build` clean; all 16 **runtime parity tests** pass (per §12.2 gate clarification); 2 isolation snapshot tests stay byte-identical (per §8.1's expected-stable verification); new heuristic returns expected values at gate fixture + parity fixtures. | D-1 + D-2 |
+| **D-4** | Snapshots + PR | Re-baseline **6 affected kernel snapshots** per §8 PR-description discipline; ship activation PR. | ~0 code; snapshot diffs. | PR description includes per-snapshot diff, hand-derivation per fixture, cascade-narrative verification, cross-validation against runtime parity. | D-3 |
 
-### 12.2 Sequencing
+### 12.2 D-3 / D-4 gate clarification — runtime parity vs snapshot parity
+
+The D-3 gate criterion "all 16 parity tests pass" specifically refers to **runtime parity tests** that compare kernel outputs `Tier-B-on` vs `Tier-B-off` via execution. These tests assert `tier_b_on_output.as_bytes() == tier_b_off_output.as_bytes()` at the kernel-output layer; they pass regardless of PTX text changes because skipped tiles contribute exactly zero by construction (per the §4.2 of the previous spec's symmetric-correctness justification).
+
+The D-3 gate does NOT include snapshot-based tests (which check PTX content rather than kernel output). Snapshot-based tests for the 6 affected kernel snapshots WILL FAIL at D-3 because the heuristic now activates Tier B for fixtures that previously hit the Tier-B-off path. Their re-baselining is D-4's scope, not D-3's gate.
+
+**Implementation phase enumeration at D-3 start:**
+
+- **Runtime-based parity (D-3 gate):** the 10 forward + 6 backward parity tests from PR #169 are runtime — they invoke the bench binary as a subprocess and assert byte-equality on captured output blobs. These pass before D-4 begins.
+- **Snapshot-based PTX tests (D-4 scope):** the 6 kernel snapshots from §8.1. These re-baseline at D-4.
+- **Isolation snapshots (D-3 verification, expected-stable):** the 2 isolation tests from §8.1. They call emission functions directly; they stay byte-identical. D-3 verifies this directly (a diff would surface an unexpected call-graph dependency).
+
+Conflating runtime parity and snapshot parity in a single gate would create a circular dependency: "I can't pass D-3's gate because snapshots are mismatched, but I can't re-baseline until D-3 passes." The split per IR-006 (distinct failure modes warrant distinct test surfaces) pre-empts this deadlock. Runtime parity (output-layer regression) and snapshot parity (PTX-layer regression) have distinct diagnostic shapes and distinct re-baseline mechanics.
+
+### 12.3 Sequencing
 
 D-1 → D-2 → D-3 → D-4 strictly sequential. The verification gate determines the implementation path; the measurement determines the floor value; the implementation produces the snapshot diffs; the PR ships them.
 
-### 12.3 PR shape
+### 12.4 PR shape
 
 Single PR for the activation. Title: `feat(pca-tier-b): activate planner-side dispatch (minimal heuristic; floor=N)`. The N is the empirical floor from D-2.
 
-### 12.4 LOC budget (rough)
+### 12.5 LOC budget (rough)
 
 - D-1: 0 code; 1 findings doc (~1 page).
 - D-2: 0 code beyond shell-script reuse; 1 findings doc (~1 page) + 7 CSV rows.
@@ -417,9 +440,31 @@ This spec extends IR-003 (pre-implementation verification of load-bearing assump
 
 > `docs/superpowers/specs/2026-05-14-pca-tier-b-dispatch-design.md` §5 — V-dispatch-integration verification of caller behavior before pinning seq_len source. First instance of the external-system-state specialization (caller behavior is external to this spec's design surface; verification establishes facts about callers before the dispatch policy commits to a specific shape).
 
-### 13.2 IR-013 candidate (deferred per IR-NNN entry criteria)
+### 13.2 IR-013 candidate (deferred per IR-NNN entry criteria) — narrow framing
 
-If a second instance of external-system-state verification materializes — e.g., during a future spec where hardware capability or runtime-value assumptions need pre-implementation verification — promote to **IR-013: External-system-state assumptions warrant the same pre-implementation verification discipline as internal-code-graph assumptions.** Until a second instance lands, fold this specialization into IR-003's "Cited from" list (per the registry's ≥2-instance entry criterion from Section 5.4 of `docs/wiki/institutional-rules.md`).
+If a second instance of external-system-state verification materializes — specifically, **caller behavior in the same codebase** that needs pre-implementation verification — promote to **IR-013: Caller-behavior assumptions warrant the same pre-implementation verification discipline as internal-code-graph assumptions.** Until a second instance lands, fold this specialization into IR-003's "Cited from" list (per the registry's ≥2-instance entry criterion from Section 5.4 of `docs/wiki/institutional-rules.md`).
+
+**Narrow framing — deliberate choice over a broad framing:**
+
+The brainstorm series has produced multiple verifications that could be loosely described as "external-system-state":
+
+- **V-dispatch-integration** (this spec) — caller behavior in the same codebase.
+- **V-M35.2a-STE** (M35.2a spec) — upstream BitNet reference's training-time behavior.
+- **SMEM probe** (Phase 0 of revision spec) — hardware capability (Blackwell `.shared` decl behavior).
+- **V-P1-D measurement** (M35.2a Stage D) — runtime-value behavior under real workloads.
+
+Each has a structurally distinct verification discipline:
+
+- Caller-behavior verification: grep call-graph, classify cases (α/β/γ).
+- Upstream-reference verification: read external code, document idiom, amend spec.
+- Hardware-capability verification: emit forced-access probe, sweep configs, decision matrix.
+- Runtime-value verification: instrument production code path, measure on representative workload.
+
+Collapsing these into one broad IR-013 would lose diagnostic distinction. A future contributor citing "IR-013 applies here" would have to re-derive WHICH specialization fits.
+
+**Recommendation: keep IR-013's framing narrow** (caller-behavior in same codebase). If upstream-reference or hardware-capability patterns recur, they warrant **separate** institutional rules (IR-014, IR-015, etc.), each citing its specialized discipline. Three distinct specializations of IR-003 may warrant three distinct rules over time — that's better registry hygiene than one over-broad rule.
+
+The narrow framing is the deliberate choice; future readers see why IR-013 stays caller-behavior-specific rather than being a catch-all.
 
 ### 13.3 IR-011 extension — sensitivity tier's institutional value
 
