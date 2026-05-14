@@ -516,7 +516,46 @@ The B1.5-6 outcome gates the B.2 phase. The matrix:
   - revert → `feat(pca-tier-b): disable Tier B dispatch (B.1.5 measurements below thresholds)`
 - **Commit sequence reflects milestone IDs** (B1.5-1, B1.5-2, etc.) so reviewers can navigate the PR by phase.
 
-### 11.4 LOC budget (rough)
+### 11.4 Discovery during B1.5-2: spec-pinned fixture SMEM exceeds device cap
+
+**What surfaced.** During B1.5-2 (gate fixture wiring + launch harness), the spec-pinned gate fixture (block_q=64, block_kv=64, head_dim=64, segment-masked causal) produced a kernel requiring **141,056 bytes** of dynamic SMEM. RTX 5070 Ti's per-CTA `MAX_DYNAMIC_SHARED_SIZE_BYTES` opt-in cap is **99 KB** (101,376 bytes). `cuFuncSetAttribute(MAX_DYNAMIC_SHARED_SIZE_BYTES, 141056)` returns `CUDA_ERROR_INVALID_VALUE`; `cuLaunchKernel` then rejects with the same code. The `--tier-b=on` smoke test failed; the `--tier-b=off` path ran cleanly (38.4 ms median over 100 iter).
+
+**Root cause.** The original Tier B revision spec (§3.4 of `2026-05-12-pca-tier-b-revision-design.md`) derived `tier_b_range_table_offset(config) = backward_total_bytes(config) + seg_overhead(config)` — the range table rides at the tail of the **larger** of the two direction-specific SMEM totals so forward+backward can share. The "rides at the tail of the larger" choice was correct for cross-direction sharing; it was incorrect for the forward-only kernel case, which is the only case in production today (B.2 backward is gated on B1.5-6). Forward-only kernels inherit the backward-sized SMEM allocation without needing the backward-tile space (~90 KB of waste at the gate fixture's dims).
+
+**What would have caught it.** A pre-implementation SMEM-budget calculation **instantiated at the spec-pinned gate fixture dimensions**, run during spec review and recorded in the spec text. The CSHA Tier B.1 spec did this in its §3.5 ("canonical Tier A config does NOT fit Tier B on Blackwell-class SMEM" — the section that surfaced the cross-config-doesn't-fit problem pre-implementation). The PCA Tier B revision did not do this for the gate fixture specifically; the SMEM-budget arithmetic in §3.4 was generic over `(bq, bkv, hd)`, not instantiated at the gate fixture's `(64, 64, 64)`.
+
+**General lesson.** When a spec pins specific fixture dimensions for measurement (e.g., the gate fixture in §4.1), the spec's resource-budget arithmetic must be **instantiated at those specific values**, not left generic-over-config. Otherwise the spec passes review based on plausible-generic numbers while the spec-pinned fixture has an unverified-specific failure mode. This is an application of IR-003 (pre-implementation verification of load-bearing assumptions) specialized to resource-budget arithmetic.
+
+**Architectural fix (applied during B1.5-2 scope expansion).** Parameterize `tier_b_range_table_offset` by `Direction`:
+
+```rust
+pub enum Direction { Forward, Backward }
+
+pub fn tier_b_range_table_offset(config: &FlashAttentionConfig, direction: Direction) -> u32 {
+    let base = match direction {
+        Direction::Forward  => total_bytes(config),
+        Direction::Backward => backward_total_bytes(config),
+    } + seg_overhead(config);
+    align_up_u32(base, 2)
+}
+```
+
+Forward-only kernels pass `Direction::Forward`; the offset becomes `total_bytes(config) + seg_overhead(config)`. At the gate fixture's dims this drops the offset from ~140 KB to ~50 KB (forward total_bytes ~17 KB + seg_overhead 32 KB + range tables 0.5 KB = ~50 KB, well under the 99 KB cap). Backward kernels (when B.2 ships) pass `Direction::Backward` and get the original `backward_total_bytes(config) + seg_overhead(config)` semantics — no change for the not-yet-shipped backward direction.
+
+**Snapshot impact.** Four forward kernel snapshots are invalidated by the offset change:
+
+- `pca_forward_kernel_snapshot__forward_kernel_segment_masked_tier_b_causal_32_32_32`
+- `pca_forward_kernel_snapshot__forward_kernel_segment_masked_tier_b_causal_64_64_64`
+- `pca_tier_b_preamble_isolation` (range-table-base immediate changes)
+- `pca_tier_b_predicate_isolation` (range-table-base immediate changes)
+
+Re-baseline via `cargo insta accept`. PR description shows the per-snapshot offset diff for reviewer verification (e.g., "offset 141008 → 50688" — the literal in `add.u64 %addr_min_TILERANGE, %addr_min_TILERANGE, <NUM>;`). Backward kernel snapshots (not yet shipped) remain stable because backward inherits `Direction::Backward` and gets the original value. Same snapshot-re-baseline review discipline as WGGO Phase 2 #134 (per-snapshot diffs with rationale in PR body).
+
+**Institutional rule citation.** This finding is recorded as a new "Cited from" entry on IR-003 in `docs/wiki/institutional-rules.md`, NOT promoted to a new IR-013. Per the IR-NNN entry criteria (Section 5.4 of the institutional-rules registry: pattern must surface across ≥2 distinct specs to warrant a new rule), this is the first instance of fixture-pinned resource-budget verification failing as a load-bearing oversight. If a second instance materializes (e.g., during M35.2a backward SMEM verification at spec-pinned training fixture dims), promote to IR-013 then with both instances cited.
+
+The brainstorm's pre-implementation-verification discipline is the system that catches this class of issue. The discipline operating correctly means: each instance of "verification missed something" produces a tightening of the discipline. After the first instance (the SMEM probe added during the 2026-05-12 revision after the compile-time-unroll concern surfaced), the gates tightened to include the Phase 0 probe. After this second instance, §11.4 documents the gap and IR-003 gains a new "Cited from" entry making the fixture-pinned-resource-budget pattern visible for future spec reviews.
+
+### 11.5 LOC budget (rough)
 
 - B.1.5 total: ~480 LOC (mostly Rust; ~100 shell).
 - B.2 (if executed) total: ~250 LOC.

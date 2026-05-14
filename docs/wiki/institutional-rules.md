@@ -38,12 +38,13 @@ Cited from:
 
 ### IR-003 — Pre-implementation verification of load-bearing assumptions
 
-When a spec relies on cross-module behavior, verify the assumption via grep / probe / measurement before writing the code that depends on it. 15-minute verification beats multi-day rework.
+When a spec relies on cross-module behavior, verify the assumption via grep / probe / measurement before writing the code that depends on it. 15-minute verification beats multi-day rework. **Specialized case: resource-budget arithmetic at spec-pinned fixture dimensions.** When a spec pins specific fixture dimensions for measurement (e.g., gate fixtures), the spec's resource-budget arithmetic (SMEM, register pressure, occupancy) must be instantiated at those specific values, not left generic-over-config — otherwise the spec passes review based on plausible-generic numbers while the spec-pinned fixture has an unverified-specific failure mode.
 
 Cited from:
 - WGGO Phase 2 NodeId space (verified before backward-pass integration).
 - CSHA Tier B.1 V1/V2/V3 findings (verified pre-B1.2 kernel emission).
 - `docs/superpowers/specs/2026-05-12-pca-tier-b-revision-design.md` §2 — SMEM probe.
+- `docs/superpowers/specs/2026-05-13-pca-tier-b15-and-b2-design.md` §11.4 — gate fixture SMEM-budget verification gap (fixture-pinned SMEM exceeded device cap; uncaught because spec's §3.4 arithmetic was generic-over-config rather than instantiated-at-gate-fixture). First instance of the fixture-pinned-resource-budget specialization; if a second instance materializes (e.g., during M35.2a backward SMEM verification), promote to IR-013.
 
 ### IR-004 — APIs return aligned, ready-to-use values so consumers don't have to
 
