@@ -51,15 +51,34 @@ fn main() {
 
     // -- Step 2: Run end-to-end (PTX synth → module load → 100×launch with
     // CUDA events → skip-ratio readback). --
+    //
+    // When `--dump-backward-outputs <path>` is set, route to
+    // `run_fixture_backward` which (a) runs the forward kernel once to
+    // populate O/lse, then (b) runs the backward kernel and writes a
+    // 3-blob (dQ/dK/dV) capture to the path. Used by the B2-3 backward
+    // parity tier (spec §6.1 / §7.1). The forward `--dump-output` path
+    // is unchanged.
     let tier_b_on = args.tier_b == cli::TierB::On;
-    let result = unsafe {
-        launch::run_fixture(
-            &fixture,
-            tier_b_on,
-            args.seed,
-            args.iterations,
-            args.dump_output.as_deref(),
-        )
+    let result = if let Some(bwd_path) = args.dump_backward_outputs.as_deref() {
+        unsafe {
+            launch::run_fixture_backward(
+                &fixture,
+                tier_b_on,
+                args.seed,
+                args.iterations,
+                bwd_path,
+            )
+        }
+    } else {
+        unsafe {
+            launch::run_fixture(
+                &fixture,
+                tier_b_on,
+                args.seed,
+                args.iterations,
+                args.dump_output.as_deref(),
+            )
+        }
     };
     let result = match result {
         Ok(r) => r,

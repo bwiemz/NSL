@@ -84,6 +84,42 @@ fn registry() -> Vec<Fixture> {
         }
     }
 
+    // Backward parity fixture (B2-3 / spec §7.4). Same role as `parity()`
+    // above but with smaller tile dims (32×32×32) so the backward kernel's
+    // SMEM extras (P + dS + dQ + dK + dV + V_in + rms_strip ≈ 18.6 KB at
+    // these dims) + segment_ids overhead (32 KB) + forward total stays
+    // under the 99 KB dynamic SMEM cap. The 64×64×64 dims used by the
+    // forward parity fixtures fail the backward validator at 140 KB.
+    //
+    // Tile dims are still admit-by `should_emit_tier_b`:
+    //   range_table_bytes(seq=4096, block=32) = 2*(128+128)*2 = 1024 B ≤ 8 KB.
+    //
+    // Names match the forward parity fixtures (`parity_N`) so the test
+    // harness reuses them — distinguished only at runtime by the bench
+    // binary's `--dump-backward-outputs` flag routing.
+    fn parity_backward(name: &'static str, seq_len: u32, target_sparsity: f64) -> Fixture {
+        Fixture {
+            name,
+            config: FlashAttentionConfig {
+                block_q: 32,
+                block_kv: 32,
+                head_dim: 32,
+                causal: true,
+                paged: false,
+                rope_q: false,
+                rope_style: RopeStyle::HalfSplit,
+                gqa_group_size: 1,
+                tree_mask: false,
+                gpu_sm: 120,
+                segment_masked: true,
+                csha: None,
+            },
+            seq_len,
+            batch: 1,
+            target_sparsity,
+        }
+    }
+
     vec![
         Fixture {
             name: "gate_4096",
@@ -120,6 +156,16 @@ fn registry() -> Vec<Fixture> {
         parity("parity_4", 4096, 0.8),  // boundary_dense — 16 small docs, lots of empties
         parity("parity_5", 4096, 0.0),  // single_doc — no empties, predicate always false
         parity("parity_6", 4096, 0.5),  // tail_padding — 2 docs + padding sentinel
+        // Backward parity tier (B2-3 / spec §7.4): mirror the six forward
+        // packing patterns but with 32×32×32 dims so backward SMEM extras
+        // fit under the 99 KB cap. Names disambiguated by `_bwd_` infix so
+        // both tiers can coexist in the registry.
+        parity_backward("parity_bwd_1", 256, 0.3),
+        parity_backward("parity_bwd_2", 256, 0.3),
+        parity_backward("parity_bwd_3", 256, 0.5),
+        parity_backward("parity_bwd_4", 256, 0.8),
+        parity_backward("parity_bwd_5", 256, 0.0),
+        parity_backward("parity_bwd_6", 256, 0.5),
         // Sensitivity tier (§4.3 / spec §4.3.1). Three fixtures sharing the
         // gate fixture's dims (block 64×64×64, segment-masked causal, sm_120,
         // seq_len=4096, batch=4, head_dim=64) and varying only `target_sparsity`

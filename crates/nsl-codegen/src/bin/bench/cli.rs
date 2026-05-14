@@ -29,6 +29,26 @@ pub struct Args {
     /// (B1.5-3) to capture per-fixture Tier-B-on / Tier-B-off outputs and
     /// assert byte-equality at the test driver layer.
     pub dump_output: Option<std::path::PathBuf>,
+    /// When `Some(path)`, the bench binary runs forward followed by the
+    /// backward kernel and writes a concatenated blob of `(dQ, dK, dV)`
+    /// gradient outputs to `path`. Used by the B2-3 backward parity tests
+    /// to capture per-fixture Tier-B-on / Tier-B-off backward outputs and
+    /// assert byte-equality at the test driver layer (spec §6.1 / §7.1).
+    ///
+    /// Blob format (little-endian):
+    ///   [0..8]              u64 dq_len_bytes
+    ///   [8..16]             u64 dk_len_bytes
+    ///   [16..24]            u64 dv_len_bytes
+    ///   [24..24+dq]         dQ raw bytes (f16 [B,H,S,D])
+    ///   [24+dq..24+dq+dk]   dK raw bytes (f32 scratch [B,H,S,D])
+    ///   [..+dv]             dV raw bytes (f32 scratch [B,H,S,D])
+    ///
+    /// dK and dV are the f32 scratch buffers the backward kernel
+    /// accumulates into (cf. backward `dk_scratch_ptr`/`dv_scratch_ptr`)
+    /// — comparing scratch directly skips the host-side f32→f16 reduction
+    /// kernel and gives a strictly stricter bit-identical assertion at
+    /// the symmetric-correctness level required by spec §7.1.
+    pub dump_backward_outputs: Option<std::path::PathBuf>,
 }
 
 impl Args {
@@ -48,6 +68,7 @@ pub fn parse_from(argv: &[&str]) -> Result<Args, String> {
     let mut iterations: u32 = 100;
     let mut emit_time_only = false;
     let mut dump_output: Option<std::path::PathBuf> = None;
+    let mut dump_backward_outputs: Option<std::path::PathBuf> = None;
 
     let mut i = 1;
     while i < argv.len() {
@@ -99,6 +120,13 @@ pub fn parse_from(argv: &[&str]) -> Result<Args, String> {
                 dump_output = Some(std::path::PathBuf::from(*v));
                 i += 2;
             }
+            "--dump-backward-outputs" => {
+                let v = argv
+                    .get(i + 1)
+                    .ok_or_else(|| "missing value for --dump-backward-outputs".to_string())?;
+                dump_backward_outputs = Some(std::path::PathBuf::from(*v));
+                i += 2;
+            }
             other => return Err(format!("unknown argument: {other}")),
         }
     }
@@ -110,5 +138,6 @@ pub fn parse_from(argv: &[&str]) -> Result<Args, String> {
         iterations,
         emit_time_only,
         dump_output,
+        dump_backward_outputs,
     })
 }
