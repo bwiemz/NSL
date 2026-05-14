@@ -59,6 +59,37 @@ fn synthesize_kernel_includes_all_phases() {
     );
     assert!(ptx.contains(".visible .entry"), "missing .visible .entry");
 
+    // weight_scale param slot in the kernel signature. The per-tensor
+    // BitLinear b1.58 absmean scale must be passed by the host and consumed
+    // in finalize.rs::emit before bias/residual; without it the emitted
+    // kernel is off by a per-layer constant factor.
+    assert!(
+        ptx.contains(".param .f32 weight_scale"),
+        "kernel signature must include .param .f32 weight_scale"
+    );
+    // And finalize must actually load + multiply it.
+    assert!(
+        ptx.contains("ld.param.f32 %f_w_scale, [weight_scale];"),
+        "finalize must load weight_scale via ld.param.f32"
+    );
+    assert!(
+        ptx.contains("mul.f32 %f_y_out, %f_y_out, %f_w_scale;"),
+        "finalize must multiply %f_y_out by %f_w_scale"
+    );
+    // The weight_scale multiply must come BEFORE the FP32->output cast,
+    // and (when present) before bias/residual which operate in output space.
+    let i_wscale = ptx
+        .find("mul.f32 %f_y_out, %f_y_out, %f_w_scale;")
+        .expect("weight_scale mul present (asserted above)");
+    let i_cast = ptx
+        .find("cvt.rn.f16.f32")
+        .or_else(|| ptx.find("cvt.rn.bf16.f32"))
+        .expect("output-dtype cast must be present");
+    assert!(
+        i_wscale < i_cast,
+        "weight_scale mul must precede the FP32->output cast"
+    );
+
     // All three phases composed.
     assert!(
         ptx.contains("BitNet packed_load"),

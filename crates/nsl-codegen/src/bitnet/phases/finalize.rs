@@ -3,17 +3,27 @@
 //! Spec: docs/superpowers/specs/2026-05-11-m35-1-bitnet-ternary-design.md §4.4.
 //!
 //! Operates on the FP32 dequantized output from `ternary_gemm` (in
-//! `%f_y_out`), optionally adds bias and/or residual, casts to the
-//! configured output dtype (F16 or BF16), and stores to HBM.
+//! `%f_y_out`), multiplies by the per-tensor `weight_scale` to complete the
+//! BitLinear b1.58 forward, optionally adds bias and/or residual, casts to
+//! the configured output dtype (F16 or BF16), and stores to HBM.
+//!
+//! Full BitLinear forward math:
+//!
+//! ```text
+//! %f_y_out (in)  = (act_scale / 127.0) * acc        // produced by ternary_gemm
+//! %f_y_out      *= weight_scale                      // this phase, first step
+//! %f_y_out      += bias[col]                         // if fused_bias_add
+//! %f_y_out      += residual[row, col]                // if fused_residual_add
+//! out[row, col]  = cast_to_output_dtype(%f_y_out)
+//! ```
+//!
+//! `weight_scale` is read from the kernel `.param .f32 weight_scale` slot
+//! (see `mod.rs::synthesize_kernel`); the host passes the per-layer absmean
+//! scale produced by `loader.rs::LoadedTernaryWeight::scale` at
+//! quantize-at-load time. The multiplication MUST precede bias and residual
+//! because those operate in output space and are not scaled by weight_scale.
 //!
 //! Deferred to Phase 1.5: RMSNorm fold across layer boundaries.
-//!
-//! **TODO (M35.1 Linux follow-on):** the emitted epilogue currently
-//! omits the per-tensor weight_scale factor. See `loader.rs::LoadedTernaryWeight`
-//! for full context. Un-ignoring `bitnet_logit_match` requires injecting
-//! the weight_scale into this phase (either as a kernel param or burned as
-//! a compile-time immediate) and multiplying the FP32 accumulator before
-//! the FP16/BF16 cast.
 
 use crate::bitnet::config::BitNetKernelConfig;
 use crate::kernel_ir::KirType;
@@ -28,6 +38,14 @@ use crate::kernel_ir::KirType;
 /// - HBM at `%rd_y_global + (row_id * out_dim + col_id) * sizeof(dtype)`.
 pub fn emit(ptx: &mut String, config: &BitNetKernelConfig) {
     ptx.push_str("// === BitNet finalize ===\n");
+
+    // BitLinear weight_scale: per-tensor absmean scale (one f32 per layer).
+    // Multiply the FP32 dequant accumulator to complete
+    //   y = weight_scale * (act_scale / 127) * acc
+    // BEFORE bias/residual (which operate in output space and are not scaled).
+    ptx.push_str("// weight_scale: %f_y_out *= ld.param.f32 weight_scale.\n");
+    ptx.push_str("ld.param.f32 %f_w_scale, [weight_scale];\n");
+    ptx.push_str("mul.f32 %f_y_out, %f_y_out, %f_w_scale;\n");
 
     if config.fused_bias_add {
         ptx.push_str("// Bias add: load bias[col_id] from global and add to accumulator.\n");

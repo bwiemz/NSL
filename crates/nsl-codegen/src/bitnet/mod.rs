@@ -59,7 +59,12 @@ pub fn synthesize_kernel(config: &BitNetKernelConfig) -> Vec<u8> {
     ptx.push_str(&format!(".visible .entry {} (\n", config.kernel_name()));
     ptx.push_str("  .param .u64 act_in,\n");
     ptx.push_str("  .param .u64 weights_packed,\n");
-    ptx.push_str("  .param .u64 y_out");
+    ptx.push_str("  .param .u64 y_out,\n");
+    // Per-tensor BitLinear b1.58 absmean scale (one scalar per layer; loaded
+    // once by finalize.rs::emit and multiplied into the FP32 accumulator
+    // before bias/residual). Required for forward correctness; without it
+    // the emitted kernel is off by a per-layer constant factor.
+    ptx.push_str("  .param .f32 weight_scale");
     if config.fused_bias_add {
         ptx.push_str(",\n  .param .u64 bias");
     }
