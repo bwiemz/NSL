@@ -14,7 +14,13 @@ fn fa_4k_block64_seg_masked() -> FlashAttentionConfig {
     }
 }
 
+// Snapshot is baselined for the production (non-instrumented) path. The
+// `debug_kernel_instrumentation` feature appends the M3 round-robin
+// writeback PTX inside the predicate scope (covered by the separate
+// `pca_tier_b_writeback_isolation` snapshot), so this snapshot's content
+// only matches when the feature is OFF. Gated via `cfg(not(feature = ...))`.
 #[test]
+#[cfg(not(feature = "debug_kernel_instrumentation"))]
 fn predicate_4k_block64_isolation_snapshot() {
     let mut ptx = String::new();
     emit_skip_predicate(

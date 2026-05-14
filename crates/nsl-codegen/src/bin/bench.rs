@@ -53,7 +53,13 @@ fn main() {
     // CUDA events → skip-ratio readback). --
     let tier_b_on = args.tier_b == cli::TierB::On;
     let result = unsafe {
-        launch::run_fixture(&fixture, tier_b_on, args.seed, args.iterations)
+        launch::run_fixture(
+            &fixture,
+            tier_b_on,
+            args.seed,
+            args.iterations,
+            args.dump_output.as_deref(),
+        )
     };
     let result = match result {
         Ok(r) => r,

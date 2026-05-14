@@ -421,6 +421,25 @@ pub fn emit_skip_predicate(
     ptx.push_str("    setp.lt.u16 %p_lt_TB, %qmax_TB, %kvmin_TB;\n");
     ptx.push_str("    setp.gt.u16 %p_gt_TB, %qmin_TB, %kvmax_TB;\n");
     ptx.push_str("    or.pred %p_skip_TB, %p_lt_TB, %p_gt_TB;\n");
+
+    // PCA Tier B M3 instrumentation hook: when `debug_kernel_instrumentation`
+    // is enabled AND the kernel has a `skip_decisions_ptr` param plumbed in,
+    // emit the per-tile writeback BEFORE the @%p_skip_TB branch so the buffer
+    // records BOTH kept (0) and skipped (1) decisions. Lives inside the
+    // emit_skip_predicate scope so `%p_skip_TB` is in scope for the `selp`.
+    if cfg!(feature = "debug_kernel_instrumentation") {
+        emit_skip_decision_writeback(
+            ptx,
+            config,
+            seq_len,
+            qt_reg,
+            kvt_reg,
+            "%p_skip_TB",
+            "skip_decisions_ptr",
+            /* num_warps = */ 4, // FA2 v2's pinned thread-mapping contract.
+        );
+    }
+
     ptx.push_str(&format!("    @%p_skip_TB bra {on_skip_label};\n"));
     ptx.push_str("    }\n");
     ptx.push_str("    // ----- end PCA Tier B skip predicate -----\n");
@@ -429,14 +448,20 @@ pub fn emit_skip_predicate(
 /// Emit PTX that writes the skip decision for `(b, h, qt, kvt)` to
 /// the debug instrumentation buffer at the matching slot.
 ///
-/// Lane 0 of warp 0 within the CTA writes; other threads no-op.
-/// Decision: `1` = disjoint (skipped), `0` = kept.
+/// **Round-robin owner** per spec §6.2:
+/// `owning_warp(qt, kvt) = (qt * num_kv_tiles + kvt) % num_warps`.
+/// Lane 0 of the owning warp performs the write; all other lanes/warps
+/// no-op via predication. Decision: `1` = disjoint (skipped), `0` = kept.
 ///
 /// Buffer shape: `[batch, head, num_q_tiles, num_kv_tiles] : u8`
 /// per spec §4.3.1. Slot index = `(bh_idx * num_q_tiles + qt) * num_kv + kvt`.
 ///
 /// Gated behind `cfg!(debug_kernel_instrumentation)` at codegen time
 /// — production builds never call this function.
+///
+/// PTX is wrapped in a lexical scope `{ ... }` per IR-007 so the same
+/// helper can be called from multiple sites (per-q-iter and per-kv-iter
+/// loop contexts) without re-declaring registers.
 ///
 /// # Arguments
 ///
@@ -448,9 +473,10 @@ pub fn emit_skip_predicate(
 ///   [`emit_skip_predicate`] (e.g. `%p_skip_TB`).
 /// - `decisions_buf_param` — the `.param .u64` parameter name holding
 ///   the HBM buffer base pointer.
-///
-/// TODO(tier-b.2): replace warp-0 approximation with a real
-/// `owning_warp(qt, kvt)` helper when multi-warp ownership is needed.
+/// - `num_warps` — number of warps per CTA (compile-time constant; v2 = 4).
+///   Caller MUST ensure `num_warps > 0` (validated via `debug_assert!`).
+///   `num_warps == 1` is allowed and degrades to the v1 warp-0 behaviour
+///   (every tile written by warp 0 lane 0) per §6.4.
 pub fn emit_skip_decision_writeback(
     ptx: &mut String,
     config: &FlashAttentionConfig,
@@ -459,20 +485,37 @@ pub fn emit_skip_decision_writeback(
     kvt_reg: &str,
     is_skip_pred: &str,           // %p_skip_TB from emit_skip_predicate
     decisions_buf_param: &str,    // .param .u64 holding the HBM buffer ptr
+    num_warps: u32,
 ) {
+    // Spec §6.4: `num_warps == 0` is an invalid configuration; `(...) % 0`
+    // is undefined behaviour on most architectures. Refuse at codegen time.
+    debug_assert!(num_warps > 0, "Tier B M3 instrumentation requires num_warps > 0");
+
     let num_kv = crate::pca_tile_config::num_tiles(seq_len, config.block_kv as u32);
     let num_q_tiles_const = crate::pca_tile_config::num_tiles(seq_len, config.block_q as u32);
 
-    ptx.push_str("    // ----- PCA Tier B: skip-decision writeback (debug, spec sec 4.3) -----\n");
+    ptx.push_str("    // ----- PCA Tier B: skip-decision writeback (debug, spec sec 4.3 / sec 6.2) -----\n");
+    // Wrap in PTX lexical scope per IR-007 so register decls are local to
+    // this call site. Multiple call sites (per-q-iter, per-kv-iter loops)
+    // are safe to coexist without `ptxas: variable redeclared`.
+    //
+    // Register naming: `_local` suffix on tid/lane to avoid colliding with
+    // %tid.x / %laneid special-register names per the Phase 0 SMEM probe
+    // fix in PR #168 commit 378b843e.
+    ptx.push_str("    {\n");
     ptx.push_str("    .reg .u64 %dec_buf_TB, %dec_slot_TB;\n");
     ptx.push_str("    .reg .u32 %slot_off_TB, %bh_TB, %bh_slot_TB;\n");
     ptx.push_str("    .reg .u16 %dec_val_TB;\n");
-    ptx.push_str("    .reg .pred %p_owner_TB, %p_lane_TB;\n");
-    ptx.push_str("    .reg .u32 %warp_id_TB, %lane_TB;\n");
+    ptx.push_str("    .reg .u32 %tid_local_TB, %warp_id_TB, %lane_local_TB, %owning_warp_TB;\n");
+    ptx.push_str("    .reg .pred %p_warp_owner_TB, %p_lane_owner_TB, %p_writeback_TB;\n");
     ptx.push_str("\n");
 
-    // (batch * num_heads + head) precomputed elsewhere as %bh_idx; reuse if available.
-    ptx.push_str("    mov.u32 %bh_TB, %bh_idx;\n");
+    // ── Slot offset within the [B, H, Qtiles, KVtiles] u8 buffer. ──
+    // `%bid_y` already encodes `batch_idx * num_heads + head_idx` because
+    // the FA2 launch maps `(batch, head)` onto blockIdx.y in row-major
+    // order. Reuse it directly instead of re-deriving from %batch_idx and
+    // %head_idx (which were derived from %bid_y in the prelude anyway).
+    ptx.push_str("    mov.u32 %bh_TB, %bid_y;\n");
     ptx.push_str(&format!(
         "    mad.lo.u32 %bh_slot_TB, %bh_TB, {num_q_tiles_const}, {qt_reg};\n"
     ));
@@ -487,19 +530,28 @@ pub fn emit_skip_decision_writeback(
     ptx.push_str("    cvt.u64.u32 %dec_slot_TB, %slot_off_TB;\n");
     ptx.push_str("    add.u64 %dec_slot_TB, %dec_buf_TB, %dec_slot_TB;\n");
 
-    // Owner = lane 0 of owning warp. v1 approximates as warp 0 lane 0 within the CTA.
-    // TODO(tier-b.2): replace with the real owning_warp(qt, kvt) helper.
-    ptx.push_str("    mov.u32 %warp_id_TB, %warpid;\n");
-    ptx.push_str("    setp.eq.u32 %p_owner_TB, %warp_id_TB, 0;\n");
-    ptx.push_str("    mov.u32 %lane_TB, %laneid;\n");
-    ptx.push_str("    setp.eq.u32 %p_lane_TB, %lane_TB, 0;\n");
-    ptx.push_str("    and.pred %p_owner_TB, %p_owner_TB, %p_lane_TB;\n");
+    // ── Round-robin owning_warp(qt, kvt) = (qt * num_kv_tiles + kvt) % num_warps ──
+    // Per spec §6.2. Uniform-class registers because qt/kvt loop counters
+    // are warp-uniform → ptxas can fold the predicate into `BRA.U`.
+    ptx.push_str("    mov.u32 %tid_local_TB, %tid.x;\n");
+    ptx.push_str("    shr.u32 %warp_id_TB, %tid_local_TB, 5;\n");
+    ptx.push_str(&format!(
+        "    mad.lo.u32 %owning_warp_TB, {qt_reg}, {num_kv}, {kvt_reg};\n"
+    ));
+    ptx.push_str(&format!(
+        "    rem.u32 %owning_warp_TB, %owning_warp_TB, {num_warps};\n"
+    ));
+    ptx.push_str("    setp.eq.u32 %p_warp_owner_TB, %warp_id_TB, %owning_warp_TB;\n");
+    ptx.push_str("    and.b32 %lane_local_TB, %tid_local_TB, 0x1F;\n");
+    ptx.push_str("    setp.eq.u32 %p_lane_owner_TB, %lane_local_TB, 0;\n");
+    ptx.push_str("    and.pred %p_writeback_TB, %p_warp_owner_TB, %p_lane_owner_TB;\n");
 
     // Decision value: 1 if disjoint (skipped), 0 if kept.
     ptx.push_str(&format!(
         "    selp.u16 %dec_val_TB, 1, 0, {is_skip_pred};\n"
     ));
-    ptx.push_str("    @%p_owner_TB st.global.u8 [%dec_slot_TB], %dec_val_TB;\n");
+    ptx.push_str("    @%p_writeback_TB st.global.u8 [%dec_slot_TB], %dec_val_TB;\n");
+    ptx.push_str("    }\n");
     ptx.push_str("    // ----- end skip-decision writeback -----\n");
 }
 
@@ -605,7 +657,7 @@ mod tests {
         let cfg = fa_base_for_test();
         emit_range_table_preamble(&mut s, &cfg, 4096, "seg_smem", 0);
         emit_skip_predicate(&mut s, &cfg, 4096, "%qt", "%kvt", 0, "skip_kv_iter");
-        emit_skip_decision_writeback(&mut s, &cfg, 4096, "%qt", "%kvt", "%p_skip_TB", "%dec_buf");
+        emit_skip_decision_writeback(&mut s, &cfg, 4096, "%qt", "%kvt", "%p_skip_TB", "%dec_buf", 4);
         assert!(s.contains("PCA Tier B"), "output missing marker:\n{}", s);
     }
 }

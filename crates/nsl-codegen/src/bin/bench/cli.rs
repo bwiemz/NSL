@@ -24,6 +24,11 @@ pub struct Args {
     pub seed: u64,
     pub iterations: u32,
     pub emit_time_only: bool,
+    /// When `Some(path)`, the bench binary writes the forward output `O`
+    /// tensor to `path` after the timed loop. Used by the M3 parity tests
+    /// (B1.5-3) to capture per-fixture Tier-B-on / Tier-B-off outputs and
+    /// assert byte-equality at the test driver layer.
+    pub dump_output: Option<std::path::PathBuf>,
 }
 
 impl Args {
@@ -42,6 +47,7 @@ pub fn parse_from(argv: &[&str]) -> Result<Args, String> {
     let mut seed: u64 = 42;
     let mut iterations: u32 = 100;
     let mut emit_time_only = false;
+    let mut dump_output: Option<std::path::PathBuf> = None;
 
     let mut i = 1;
     while i < argv.len() {
@@ -86,6 +92,13 @@ pub fn parse_from(argv: &[&str]) -> Result<Args, String> {
                 emit_time_only = true;
                 i += 1;
             }
+            "--dump-output" => {
+                let v = argv
+                    .get(i + 1)
+                    .ok_or_else(|| "missing value for --dump-output".to_string())?;
+                dump_output = Some(std::path::PathBuf::from(*v));
+                i += 2;
+            }
             other => return Err(format!("unknown argument: {other}")),
         }
     }
@@ -96,5 +109,6 @@ pub fn parse_from(argv: &[&str]) -> Result<Args, String> {
         seed,
         iterations,
         emit_time_only,
+        dump_output,
     })
 }

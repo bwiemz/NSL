@@ -210,8 +210,36 @@ pub unsafe fn time_kernel_launches(
                 cu_error_string(rc)
             ));
         }
-        let set = host.iter().filter(|&&b| b != 0).count();
-        (set as f64) / (host.len().max(1) as f64)
+        // skip_ratio = #(byte == 1) / #(buffer slots written).
+        // Per spec §4.3.1 the buffer's shape is [B, H, num_q_tiles,
+        // num_kv_tiles]. The writeback emits one decision per
+        // (b, h, q_tile_iter, kv_tile_ord) — i.e. one per `iters` × `num_kv`
+        // per block. Slots OUTSIDE the actually-written region stay at
+        // their initial zero from `cuMemsetD8_v2`, so a naive `non-zero /
+        // total` ratio (a) understates by mixing in unwritten zeros and
+        // (b) cannot distinguish a written-but-kept-tile zero from an
+        // unwritten-slot zero. Optional env var `NSL_BENCH_PRINT_DECISIONS`
+        // dumps a histogram to stderr for diagnostic runs; the default
+        // skip_ratio is the simple non-zero-fraction (used by M2/M6
+        // measurement scripts that diff Tier-B-on vs Tier-B-off output).
+        let n_skip = host.iter().filter(|&&b| b == 1).count();
+        let n_keep = host.iter().filter(|&&b| b == 0).count();
+        let n_other = host.len() - n_skip - n_keep;
+        if std::env::var_os("NSL_BENCH_PRINT_DECISIONS").is_some() {
+            eprintln!(
+                "[bench] skip_decisions buffer: total={} bytes, n_skip(==1)={}, n_keep(==0)={}, n_other={}",
+                host.len(),
+                n_skip,
+                n_keep,
+                n_other
+            );
+        }
+        // Ratio is over the FULL buffer (not just written cells) — the spec
+        // §4.3 contract pins the buffer shape; under-writing is a bench
+        // measurement bias, not a correctness issue. Future B1.5-4 may
+        // refine this to "written-cells-only" once the kernel writes all
+        // num_q_tiles slots (currently writes only `iters` per block).
+        (n_skip as f64) / (host.len().max(1) as f64)
     } else {
         0.0
     };
@@ -252,6 +280,7 @@ pub unsafe fn run_fixture(
     tier_b_on: bool,
     seed: u64,
     iterations: u32,
+    dump_output: Option<&std::path::Path>,
 ) -> Result<LaunchResult, String> {
     // -- Step 1: Ensure CUDA context is current on this thread. --
     let mut ctx: sys::CUcontext = std::ptr::null_mut();
@@ -582,8 +611,16 @@ pub unsafe fn run_fixture(
     let mut a_row_sum: u64 = 0;
     let mut a_x_raw: u64 = 0;
     let mut a_seg_ids: u64 = seg_dev;
+    // 38th kernel-arg slot: skip_decisions_ptr (Tier B M3 instrumentation).
+    // PTX declares this param ONLY when `tier_b_on` AND the
+    // `debug_kernel_instrumentation` feature is enabled. Bench binary is
+    // always built with that feature (cf. `required-features` in Cargo.toml),
+    // so the slot is pushed onto the args list exactly when
+    // `skip_decisions_buf.is_some()`. When tier_b_on is false the param
+    // is absent from the PTX signature, so the slot is omitted from args.
+    let mut a_skip_decisions: u64 = skip_decisions_buf.map_or(0, |(p, _)| p);
 
-    let mut args: [*mut c_void; 37] = [
+    let mut args: Vec<*mut c_void> = vec![
         &mut a_q as *mut _ as *mut c_void,
         &mut a_k as *mut _ as *mut c_void,
         &mut a_v as *mut _ as *mut c_void,
@@ -622,6 +659,9 @@ pub unsafe fn run_fixture(
         &mut a_x_raw as *mut _ as *mut c_void,
         &mut a_seg_ids as *mut _ as *mut c_void,
     ];
+    if skip_decisions_buf.is_some() {
+        args.push(&mut a_skip_decisions as *mut _ as *mut c_void);
+    }
 
     // -- Step 8: Grid / block dims. --
     // Grid: (seq_len / block_q) along x, (batch * heads) along y. Mirrors
@@ -643,6 +683,44 @@ pub unsafe fn run_fixture(
         iterations,
         skip_decisions_buf,
     );
+
+    // -- Step 9b: M3-parity dump-output (B1.5-3). --
+    // After the timed loop the `out` device buffer holds the last
+    // iteration's forward output. Memcpy_dtoh and write the raw bytes to
+    // the requested path. This is invoked by the M3 parity tests to
+    // capture per-fixture Tier-B-on / Tier-B-off outputs and assert
+    // byte-equality (spec §6.1). The dump happens BEFORE Step 10's
+    // cleanup so we read from a still-live device allocation.
+    if let Some(path) = dump_output {
+        if result.is_ok() {
+            let mut host_out = vec![0u8; out_bytes];
+            let rc = sys::cuMemcpyDtoH_v2(
+                host_out.as_mut_ptr() as *mut c_void,
+                out_dev,
+                out_bytes,
+            );
+            if rc != sys::CUresult::CUDA_SUCCESS {
+                let msg = format!(
+                    "cuMemcpyDtoH(out for --dump-output) rc={:?}: {}",
+                    rc,
+                    cu_error_string(rc)
+                );
+                for p in &allocations {
+                    let _ = sys::cuMemFree_v2(*p);
+                }
+                let _ = sys::cuModuleUnload(module);
+                return Err(msg);
+            }
+            if let Err(e) = std::fs::write(path, &host_out) {
+                let msg = format!("failed to write --dump-output to {:?}: {}", path, e);
+                for p in &allocations {
+                    let _ = sys::cuMemFree_v2(*p);
+                }
+                let _ = sys::cuModuleUnload(module);
+                return Err(msg);
+            }
+        }
+    }
 
     // -- Step 10: Cleanup. --
     for p in &allocations {

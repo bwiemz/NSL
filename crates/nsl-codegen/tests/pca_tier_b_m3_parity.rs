@@ -1,19 +1,33 @@
 //! M3 estimator/runtime skip-mask parity test.
 //!
-//! For each fixture in spec §4.4: build the reference skip mask via
-//! pca_tileskip::build, launch the Tier B kernel with instrumentation
-//! enabled, read back the kernel's per-tile decisions, assert
-//! bit-equality. Spec §4.3.
+//! Spec §6.1 of `docs/superpowers/specs/2026-05-13-pca-tier-b15-and-b2-design.md`:
+//! For each of the six existing `PackingFixture` entries, invoke the bench
+//! binary twice (once with `--tier-b on`, once with `--tier-b off`, same seed)
+//! and assert the captured forward `O` outputs are **byte-identical**.
 //!
-//! The kernel-launch + readback harness is deferred to a Tier B.1.5
-//! follow-up; the per-fixture tests below are #[ignore]'d until that
-//! lands. The fixture matrix + reference-mask construction are testable
-//! today and run via `cargo test ... -- fixture_matrix_constructs`.
+//! Bit-identical (not tolerance-bounded) is the correctness-preserving
+//! guarantee: skipped tiles contribute exactly zero to softmax / PV
+//! accumulation, so Tier-B-on and Tier-B-off must agree to the last bit.
+//! Any divergence is a real bug, not a tolerance issue — stop and root
+//! cause; do not relax to `assert_relative_eq!`.
+//!
+//! The bench binary's `--dump-output <path>` flag captures the `O` tensor
+//! to disk after a single timed iteration. The test driver below invokes
+//! the bench as a subprocess (via `env!("CARGO_BIN_EXE_bench")`) twice per
+//! fixture and diffs the two files at the byte level.
+//!
+//! Build prerequisite: the bench binary is gated on `cuda` and
+//! `debug_kernel_instrumentation` features. Run via:
+//!
+//! ```text
+//! cargo test -p nsl-codegen --features "cuda debug_kernel_instrumentation" \
+//!     --test pca_tier_b_m3_parity --release
+//! ```
 
 mod fixtures {
     include!("fixtures/mod.rs");
 }
-use fixtures::{fixture_matrix, segment_ids_from_fixture, PackingFixture};
+use fixtures::{fixture_matrix, segment_ids_from_fixture};
 
 #[test]
 fn fixture_matrix_constructs_six_fixtures() {
@@ -59,56 +73,107 @@ fn single_doc_all_same_segment() {
     assert!(ids.iter().all(|&id| id == 0), "single_doc should be entirely doc 0");
 }
 
-fn run_parity_for_fixture(_block_q: u32, _block_kv: u32, _fixture: &PackingFixture) {
-    // Future Tier B.1.5: implement the launch + readback harness:
-    //   1. Synthesize PTX via synthesize_flash_attention_ptx_v2_with_tier_b
-    //      with the debug_kernel_instrumentation feature enabled.
-    //   2. Allocate decisions buffer [batch=1, head=1, num_q_tiles, num_kv_tiles]:u8.
-    //   3. Launch via cudarc with skip_decisions_ptr kernel param.
-    //   4. Sync + memcpy_dtov the decisions buffer.
-    //   5. Build reference mask via pca_tileskip::build(...).
-    //   6. Assert bit-equality, with failure diagnostic naming
-    //      the diverging (qt, kvt) coordinates.
-    //
-    // Reuses the launch helper shape from pca_tier_a_forward_correctness.rs
-    // with the addition of the decisions buffer + arg.
-    unimplemented!("M3 parity launch harness deferred to Tier B.1.5 follow-up — \
-                   see pca_tier_a_forward_correctness::launch_forward for the harness shape; \
-                   add skip_decisions buffer + arg + wire skip_decisions_ptr kernel param");
+// ── Bit-identical assertion harness (spec §6.1) ──────────────────────────
+//
+// Each test below invokes the bench binary as a subprocess with `--dump-output
+// <path>` twice — once with `--tier-b on`, once with `--tier-b off` — using
+// the same seed. The captured O tensor bytes MUST match exactly. The driver
+// is `#[cfg]`-gated on `debug_kernel_instrumentation` because the bench
+// binary requires that feature (see Cargo.toml `required-features`).
+
+#[cfg(all(feature = "cuda", feature = "debug_kernel_instrumentation"))]
+fn run_bench_capture_output_tensor(fixture: &str, tier_b: &str, seed: u64) -> Vec<u8> {
+    let output_path = std::env::temp_dir()
+        .join(format!("nsl_bench_out_{}_{}_{}.bin", fixture, tier_b, seed));
+    let bench_bin = env!("CARGO_BIN_EXE_bench");
+    let status = std::process::Command::new(bench_bin)
+        .args([
+            "--fixture",
+            fixture,
+            "--tier-b",
+            tier_b,
+            "--seed",
+            &seed.to_string(),
+            "--iterations",
+            "1",
+            "--dump-output",
+            &output_path.to_string_lossy(),
+        ])
+        .status()
+        .unwrap_or_else(|e| panic!("failed to spawn bench binary {bench_bin:?}: {e}"));
+    assert!(
+        status.success(),
+        "bench failed for fixture={fixture} tier_b={tier_b} (exit code = {:?})",
+        status.code()
+    );
+    std::fs::read(&output_path).unwrap_or_else(|e| {
+        panic!("failed to read --dump-output file {:?}: {e}", output_path)
+    })
 }
 
+#[cfg(all(feature = "cuda", feature = "debug_kernel_instrumentation"))]
+fn assert_parity_for_fixture(fixture: &str) {
+    let seed: u64 = 42;
+    let on = run_bench_capture_output_tensor(fixture, "on", seed);
+    let off = run_bench_capture_output_tensor(fixture, "off", seed);
+    assert_eq!(
+        on.len(),
+        off.len(),
+        "Tier-B-on and Tier-B-off output sizes differ for fixture={fixture}: \
+         on={} bytes, off={} bytes",
+        on.len(),
+        off.len()
+    );
+    if on != off {
+        let mismatches: Vec<usize> = on
+            .iter()
+            .zip(off.iter())
+            .enumerate()
+            .filter_map(|(i, (a, b))| if a != b { Some(i) } else { None })
+            .take(8)
+            .collect();
+        panic!(
+            "Tier B output bit-differs from Tier-B-off on fixture={fixture}: \
+             {} byte(s) mismatch; first offsets={:?} \
+             (skip logic is no longer correctness-preserving — see spec §6.1)",
+            on.iter().zip(off.iter()).filter(|(a, b)| a != b).count(),
+            mismatches
+        );
+    }
+}
+
+#[cfg(all(feature = "cuda", feature = "debug_kernel_instrumentation"))]
 #[test]
-#[ignore = "needs Tier B.1.5 launch harness + skip_decisions_ptr kernel param wiring"]
 fn m3_parity_standard_3doc() {
-    run_parity_for_fixture(64, 64, &fixture_matrix()[0]);
+    assert_parity_for_fixture("parity_1");
 }
 
+#[cfg(all(feature = "cuda", feature = "debug_kernel_instrumentation"))]
 #[test]
-#[ignore = "needs Tier B.1.5 launch harness"]
 fn m3_parity_long_seq_5doc() {
-    run_parity_for_fixture(64, 64, &fixture_matrix()[1]);
+    assert_parity_for_fixture("parity_2");
 }
 
+#[cfg(all(feature = "cuda", feature = "debug_kernel_instrumentation"))]
 #[test]
-#[ignore = "needs Tier B.1.5 launch harness"]
 fn m3_parity_skewed_packing() {
-    run_parity_for_fixture(64, 64, &fixture_matrix()[2]);
+    assert_parity_for_fixture("parity_3");
 }
 
+#[cfg(all(feature = "cuda", feature = "debug_kernel_instrumentation"))]
 #[test]
-#[ignore = "needs Tier B.1.5 launch harness"]
 fn m3_parity_boundary_dense() {
-    run_parity_for_fixture(64, 64, &fixture_matrix()[3]);
+    assert_parity_for_fixture("parity_4");
 }
 
+#[cfg(all(feature = "cuda", feature = "debug_kernel_instrumentation"))]
 #[test]
-#[ignore = "needs Tier B.1.5 launch harness"]
 fn m3_parity_single_doc() {
-    run_parity_for_fixture(64, 64, &fixture_matrix()[4]);
+    assert_parity_for_fixture("parity_5");
 }
 
+#[cfg(all(feature = "cuda", feature = "debug_kernel_instrumentation"))]
 #[test]
-#[ignore = "needs Tier B.1.5 launch harness"]
 fn m3_parity_tail_padding() {
-    run_parity_for_fixture(64, 64, &fixture_matrix()[5]);
+    assert_parity_for_fixture("parity_6");
 }

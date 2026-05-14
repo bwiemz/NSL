@@ -16,7 +16,7 @@ fn public_api_signatures_compile() {
     let _: u64 = TIER_B_RANGE_TABLE_BUDGET_BYTES;
     let _: fn(&mut String, &FlashAttentionConfig, u32, &str, u32) = emit_range_table_preamble;
     let _: fn(&mut String, &FlashAttentionConfig, u32, &str, &str, u32, &str) = emit_skip_predicate;
-    let _: fn(&mut String, &FlashAttentionConfig, u32, &str, &str, &str, &str) =
+    let _: fn(&mut String, &FlashAttentionConfig, u32, &str, &str, &str, &str, u32) =
         emit_skip_decision_writeback;
     let _: fn(&FlashAttentionConfig, u64, SegmentResidency) -> bool = should_emit_tier_b;
 }
@@ -41,8 +41,9 @@ fn skip_writeback_emits_when_feature_enabled() {
     emit_skip_decision_writeback(
         &mut ptx, &cfg, 4096,
         "%qt", "%kvt", "%p_skip_TB", "skip_decisions_ptr",
+        /* num_warps = */ 4,
     );
     assert!(ptx.contains("st.global.u8"), "writeback should emit st.global.u8");
-    assert!(ptx.contains("@%p_owner_TB"), "writeback should be owner-gated");
+    assert!(ptx.contains("@%p_writeback_TB"), "writeback should be owner-gated via round-robin predicate");
     assert!(ptx.contains("selp.u16 %dec_val_TB, 1, 0"), "selp decision encoding missing");
 }

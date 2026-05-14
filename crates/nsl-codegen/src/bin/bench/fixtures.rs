@@ -54,28 +54,74 @@ pub fn lookup(name: &str) -> Option<Fixture> {
 /// Sensitivity (§4.3) and parity (§4.2) fixtures are added in B1.5-4 /
 /// B1.5-3 respectively.
 fn registry() -> Vec<Fixture> {
-    vec![Fixture {
-        name: "gate_4096",
-        config: FlashAttentionConfig {
-            block_q: 64,
-            block_kv: 64,
-            head_dim: 64,
-            causal: true,
-            paged: false,
-            rope_q: false,
-            rope_style: RopeStyle::HalfSplit,
-            gqa_group_size: 1,
-            tree_mask: false,
-            gpu_sm: 120,
-            segment_masked: true,
-            csha: None,
+    // Helper to build a parity fixture; shares the gate fixture's tile
+    // dims (64×64×64, segment_masked causal, sm_120) and varies only
+    // seq_len and target_sparsity per the six existing `PackingFixture`
+    // configurations in `tests/fixtures/mod.rs`. Each `parity_N` fixture
+    // exercises the Tier B skip predicate on a different segment-id
+    // packing pattern; the M3 parity test runs each twice (`--tier-b on`
+    // and `--tier-b off`) and asserts byte-identical O outputs.
+    fn parity(name: &'static str, seq_len: u32, target_sparsity: f64) -> Fixture {
+        Fixture {
+            name,
+            config: FlashAttentionConfig {
+                block_q: 64,
+                block_kv: 64,
+                head_dim: 64,
+                causal: true,
+                paged: false,
+                rope_q: false,
+                rope_style: RopeStyle::HalfSplit,
+                gqa_group_size: 1,
+                tree_mask: false,
+                gpu_sm: 120,
+                segment_masked: true,
+                csha: None,
+            },
+            seq_len,
+            batch: 1,
+            target_sparsity,
+        }
+    }
+
+    vec![
+        Fixture {
+            name: "gate_4096",
+            config: FlashAttentionConfig {
+                block_q: 64,
+                block_kv: 64,
+                head_dim: 64,
+                causal: true,
+                paged: false,
+                rope_q: false,
+                rope_style: RopeStyle::HalfSplit,
+                gqa_group_size: 1,
+                tree_mask: false,
+                gpu_sm: 120,
+                segment_masked: true,
+                csha: None,
+            },
+            seq_len: 4096,
+            batch: 4,
+            target_sparsity: 0.5,
         },
-        seq_len: 4096,
-        batch: 4,
-        target_sparsity: 0.5,
-    }]
-    // Sensitivity (§4.3) and parity (§4.2) fixtures are added in B1.5-4 /
-    // B1.5-3 respectively.
+        // Parity tier (§4.2 / spec §6.1). Six fixtures drawn from the
+        // existing `PackingFixture` matrix in `tests/fixtures/mod.rs`.
+        // Names map 1:1 to the M3 parity test functions in
+        // `tests/pca_tier_b_m3_parity.rs`.
+        //
+        // The launch-time `target_sparsity` here only steers the
+        // segment-mask generator; the M3 assertion is byte-equality of
+        // Tier-B-on vs Tier-B-off outputs, which is correctness-preserving
+        // for ANY segment-mask shape per design §6.1.
+        parity("parity_1", 4096, 0.3),  // standard_3doc — 3 docs ≈ 30% empty kv-tiles
+        parity("parity_2", 16_384, 0.3), // long_seq_5doc — 5 docs, larger seq
+        parity("parity_3", 4096, 0.5),  // skewed_packing — uneven doc lengths
+        parity("parity_4", 4096, 0.8),  // boundary_dense — 16 small docs, lots of empties
+        parity("parity_5", 4096, 0.0),  // single_doc — no empties, predicate always false
+        parity("parity_6", 4096, 0.5),  // tail_padding — 2 docs + padding sentinel
+    ]
+    // Sensitivity (§4.3) fixtures are added in B1.5-4.
 }
 
 #[cfg(test)]
