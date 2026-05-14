@@ -178,6 +178,8 @@ pub mod bin {
     pub mod bench {
         #[path = "../../bin/bench/cli.rs"]
         pub mod cli;
+        #[path = "../../bin/bench/fixtures.rs"]
+        pub mod fixtures;
         #[path = "../../bin/bench/launch.rs"]
         pub mod launch;
         #[path = "../../bin/bench/output.rs"]

@@ -537,6 +537,31 @@ pub fn flash_attention_kernel_name_v2(config: &FlashAttentionConfig) -> String {
     format!("{}_v2", crate::flash_attention::flash_attention_kernel_name(config))
 }
 
+/// Central dispatch toggle for PCA Tier B PTX emission.
+///
+/// Returns `true` when Tier B's range-table preamble + tile-skip predicate
+/// should be emitted for this FA config. Today returns `false`
+/// unconditionally — Tier B is dormant infrastructure per PR #168. The
+/// `nsl-codegen-bench` measurement harness overrides this gate by passing
+/// `Some((seq_len, residency))` directly to
+/// [`synthesize_flash_attention_ptx_v2_with_tier_b`], bypassing the
+/// planner-side decision.
+///
+/// After the M2/M6 measurements land (task B1.5-6 of the 2026-05-13 plan),
+/// this helper is updated per the §10 outcomes matrix of the design spec:
+///   - `keep` outcome — returns `true` when `config.segment_masked` and the
+///     fine-grained gate `pca_tilerange::should_emit_tier_b` admits.
+///   - `keep-with-sparsity-gate` — adds a measured sparsity threshold.
+///   - `revert` — stays at `false` (current state); the 6-month decay timer
+///     starts on the day the findings doc commits.
+///
+/// This is the single source of truth so planner-dispatch callers see one
+/// boolean, distinct from the fine-grained PTX-budget check in
+/// [`crate::pca_tilerange::should_emit_tier_b`].
+pub fn should_emit_tier_b(_config: &FlashAttentionConfig) -> bool {
+    false
+}
+
 /// SMEM byte count for a v2 kernel. Computed from the layout module so
 /// static-shmem declaration and launch-arg stay in sync.
 pub fn shared_mem_bytes_v2(config: &FlashAttentionConfig) -> u32 {

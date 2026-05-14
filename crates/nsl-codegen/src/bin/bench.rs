@@ -12,11 +12,12 @@
 //! - `0` measurement succeeded; `tier_b_bench_result:` line emitted to stdout.
 //! - `1` CLI error / unknown fixture. Message to stderr, no output line.
 //! - `2` CUDA / kernel launch error. Message + diagnostic to stderr.
-//! - `3` framework error (timer setup failed, fixture loading not yet
-//!   implemented, etc.).
+//! - `3` framework error (timer setup failed, etc.).
 //!
-//! Task B1.5-1 scaffolds the binary (CLI + output emitter + launch-harness
-//! skeleton). Fixture loading and the real kernel launch land in B1.5-2.
+//! Task B1.5-1 scaffolded the binary (CLI + output emitter + launch-harness
+//! skeleton). Task B1.5-2 (this file's current state) fills in the gate
+//! fixture registry, the real launch + CUDA-event timing, and wires
+//! main() end-to-end.
 
 // The bench binary is gated on both `cuda` (for cudarc + PTX synthesis) and
 // `debug_kernel_instrumentation` (for the M3 skip-decision HBM writeback the
@@ -27,11 +28,7 @@
 // configurations.
 
 #[cfg(all(feature = "cuda", feature = "debug_kernel_instrumentation"))]
-use nsl_codegen::bin::bench::cli;
-
-// `launch` and `output` are reached via fully-qualified paths in B1.5-2's
-// main-body code; importing them here would currently flag unused. The lib
-// re-export keeps them callable as `nsl_codegen::bin::bench::{launch,output}`.
+use nsl_codegen::bin::bench::{cli, fixtures, launch, output};
 
 #[cfg(all(feature = "cuda", feature = "debug_kernel_instrumentation"))]
 fn main() {
@@ -43,16 +40,40 @@ fn main() {
         }
     };
 
-    // Task B1.5-2 fills in fixture loading + PTX module load + launch +
-    // skip-ratio readback + result-line emission here. For now the binary
-    // exits 3 (framework not ready) so shell scripts that wire this up
-    // early get a clear, deterministic signal.
-    eprintln!("bench scaffolding complete; fixture loading not yet implemented");
-    eprintln!(
-        "invoked: fixture={} tier_b={:?} seed={} iterations={} emit_time_only={}",
-        args.fixture, args.tier_b, args.seed, args.iterations, args.emit_time_only
-    );
-    std::process::exit(3);
+    // -- Step 1: Look up the fixture. --
+    let fixture = match fixtures::lookup(&args.fixture) {
+        Some(f) => f,
+        None => {
+            eprintln!("error: unknown fixture: {}", args.fixture);
+            std::process::exit(1);
+        }
+    };
+
+    // -- Step 2: Run end-to-end (PTX synth → module load → 100×launch with
+    // CUDA events → skip-ratio readback). --
+    let tier_b_on = args.tier_b == cli::TierB::On;
+    let result = unsafe {
+        launch::run_fixture(&fixture, tier_b_on, args.seed, args.iterations)
+    };
+    let result = match result {
+        Ok(r) => r,
+        Err(msg) => {
+            eprintln!("launch error: {msg}");
+            std::process::exit(2);
+        }
+    };
+
+    // -- Step 3: Emit the result line per §5.2. --
+    let line = output::emit_result(&output::ResultLine {
+        fixture: fixture.name.to_string(),
+        tier_b_on,
+        median_us: result.median_us,
+        n: args.iterations,
+        skip_ratio: result.skip_ratio,
+        seed: args.seed,
+    });
+    println!("{line}");
+    std::process::exit(0);
 }
 
 #[cfg(not(all(feature = "cuda", feature = "debug_kernel_instrumentation")))]
