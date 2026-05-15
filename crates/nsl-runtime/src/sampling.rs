@@ -28,7 +28,7 @@ pub extern "C" fn nsl_manual_seed(seed: i64) {
 
 /// Generate a uniform random f64 in [0, 1) using the thread-local seeded RNG.
 pub fn rng_f64() -> f64 {
-    RNG.with(|r| r.borrow_mut().gen::<f64>())
+    RNG.with(|r| r.borrow_mut().random::<f64>())
 }
 
 // ---------------------------------------------------------------------------
@@ -202,7 +202,7 @@ pub extern "C" fn nsl_tensor_multinomial(tensor_ptr: i64, num_samples: i64) -> i
         RNG.with(|r| {
             let mut rng = r.borrow_mut();
             for s in 0..num_samples {
-                let u: f64 = rng.gen::<f64>() * total;
+                let u: f64 = rng.random::<f64>() * total;
                 // Binary search for first CDF entry >= u
                 let mut lo = 0_usize;
                 let mut hi = num_categories;
