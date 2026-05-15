@@ -46,9 +46,18 @@ use crate::kernel_skeleton::indexing::emit_thread_lane_warp_register_decl;
 /// pointer lives in %shmem_base after a `cvta.shared.u64` from the
 /// `shmem` byte array declared here.
 pub fn emit(ptx: &mut String, config: &FlashAttentionConfig) {
-    // File header.
+    // File header. Target SM is config-aware: Tier B.1 (cp.async +
+    // m16n8k16) requires sm_80+; legacy Tier A defaults to sm_75 since
+    // `gpu_sm` is 75 for all its test configs. This resolves B1.6
+    // deferral #10 (stopgap `String::replace` removed from
+    // `tier_b1::synthesize`).
     use crate::kernel_skeleton::header::{emit_ptx_header, PtxVersion, TargetSm};
-    emit_ptx_header(ptx, PtxVersion::V8_7, TargetSm::Sm75);
+    let target_sm = if config.gpu_sm >= 80 {
+        TargetSm::Sm80
+    } else {
+        TargetSm::Sm75
+    };
+    emit_ptx_header(ptx, PtxVersion::V8_7, target_sm);
 
     // Dynamic SMEM module-scope declaration (must precede the .visible .entry).
     // In PTX, `.extern .shared` is a module-level directive — it CANNOT appear

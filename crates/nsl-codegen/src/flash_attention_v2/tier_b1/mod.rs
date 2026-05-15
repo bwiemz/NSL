@@ -152,14 +152,10 @@ pub fn synthesize(config: &FlashAttentionConfig, chunk: u32) -> Vec<u8> {
     ptx.push_str("    ret;\n");
     ptx.push_str("}\n");
 
-    // 9b. B1.6 deferral #10 (target-arch override). Tier A's prelude
-    // hardcodes ".target sm_75" via TargetSm::Sm75. Tier B.1's MMA m16n8k16
-    // + cp.async instructions require sm_80 or higher, so ptxas rejects
-    // the .target sm_75 line against those instructions. The proper fix is
-    // to make phases::forward::prelude::emit config-aware (consult
-    // config.gpu_sm), but that touches Tier A snapshots and is out of
-    // scope for B1.5. As a stopgap, post-rewrite the emitted target line.
-    let ptx = ptx.replace(".target sm_75\n", ".target sm_80\n");
+    // B1.6 deferral #10 RESOLVED: `phases::forward::prelude::emit` is now
+    // config-aware (consults `config.gpu_sm`) and emits `.target sm_80`
+    // directly when gpu_sm >= 80. The prior stopgap `String::replace`
+    // post-rewrite is no longer needed.
 
     let mut bytes = ptx.into_bytes();
     bytes.push(0);
