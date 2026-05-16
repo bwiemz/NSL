@@ -52,6 +52,14 @@ fn write_minimal_kernel_wrapper(ptx: &mut String, sm: u32) {
     writeln!(ptx, "    .param .u64 csha_wq_ptr").unwrap();
     writeln!(ptx, ") {{").unwrap();
     writeln!(ptx, "    .reg .u64 %shmem_base;").unwrap();
+    // Lane-derived address registers consumed by the matmul_mma fragment
+    // loaders (which the projection sweep calls). Per the post-N4
+    // helper rewrite, the helpers derive lane from `%tid.x` and write
+    // intermediate values into `%mma_addr` (u32 scratch) and `%mma_a_row`
+    // / `%mma_b_row` (u32 row+col accumulators). The full Tier B.1
+    // kernel declares these via `register_budget::declare_registers`;
+    // the standalone wrapper has to declare them itself.
+    writeln!(ptx, "    .reg .u32 %mma_addr, %mma_a_row, %mma_b_row;").unwrap();
     writeln!(ptx, "    cvta.shared.u64 %shmem_base, shmem;").unwrap();
 }
 

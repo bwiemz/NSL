@@ -66,28 +66,34 @@ fn no_hex_float_literals_in_mov_f32() {
     }
 }
 
-/// Defect class 2: `[%smem_ptr + offset]` addressing — the PTX ISA does not
-/// allow register + immediate in a bracket address expression for shared memory.
-/// The fix materialises the address first via `add.s64 %smem_addr, %shmem_base, offset`.
+/// Defect class 2: `[%reg + %other_reg]` (register-plus-register) and
+/// `[shmem + %reg]` (named-symbol + register) bracket-address expressions —
+/// both rejected by ptxas. The fix materialises the address first via
+/// `add.s64 %smem_addr, %shmem_base, offset`.
+///
+/// NOTE: `[%reg + immediate]` (register-plus-immediate) IS valid PTX in
+/// modern ptxas (7.0+) and is commonly emitted by the matmul_mma fragment
+/// loaders — those calls are explicitly NOT matched here.
 #[test]
 fn no_shmem_plus_reg_addressing() {
     for (i, cfg) in configs_to_lint().iter().enumerate() {
         let ptx = synthesize_flash_attention_ptx(cfg);
         let src = String::from_utf8_lossy(&ptx);
 
-        // Match `[%<ident> + ` which is the illegal pattern
+        // Match `[%<ident> + %<ident>` — illegal register-plus-register
+        // bracket addressing. Restricting to `+ %` excludes the
+        // register-plus-immediate form which is valid modern PTX.
         let bad_count = src
             .lines()
             .filter(|l| {
                 let l = l.trim();
-                // `[%reg + N]` or `[%reg +N]` — illegal computed bracket address
-                l.contains("[%") && l.contains(" + ")
+                l.contains("[%") && l.contains(" + %")
             })
             .count();
 
         assert_eq!(
             bad_count, 0,
-            "Config[{i}]: found {bad_count} illegal `[%reg + offset]` shared-memory address expression(s)"
+            "Config[{i}]: found {bad_count} illegal `[%reg + %reg]` shared-memory address expression(s)"
         );
 
         // Defect class 2b: `[shmem + %reg]` — ptxas rejects named-symbol + register addressing.

@@ -6836,17 +6836,39 @@ mod tests {
         // iteration. The load is emitted as `mul.lo.u32` + `add.u32`
         // rather than `mad.lo.u32` because the fused multiply-add form is
         // rejected by CUDA at runtime on PTX ISA 7.0 (see MEMORY.md).
+        //
+        // PTX-spec-rewrite update (post N4 helper rewrite, 2026-05-15): the
+        // A-fragment helper now computes per-lane addressing internally
+        // from `%lane` and writes to `%mma_a_row` as a scratch (rather
+        // than expecting callers to pre-set `%mma_a_row`). Emission is:
+        //   shr.u32 %mma_addr, %lane, 2          ; row_lo = lane / 4
+        //   mul.lo.u32 %mma_a_row, %mma_addr, <stride>
+        //   and.b32 %mma_addr, %lane, 3
+        //   shl.b32 %mma_addr, %mma_addr, 2      ; col_lo_bytes
+        //   add.u32 %mma_a_row, %mma_a_row, %mma_addr
+        //   add.u32 %mma_a_row, %mma_a_row, <base>
+        //   ld.shared.b32 ...                    ; reg 0
+        // Test assertions track the new pattern (multiplicand order swap;
+        // accumulator reg is %mma_a_row not %mma_addr; base add target
+        // is %mma_a_row).
         let ptx = String::from_utf8(synthesize_flash_attention_ptx(&csha_l2_config())).unwrap();
         // A stride = head_dim * 2 = 128 * 2 = 256 bytes.
+        // The new helper computes row_lo in %mma_a_row in-place
+        // (`shr.u32 %mma_a_row, %mma_addr, 2`) then multiplies that
+        // accumulator by the stride. Pattern is therefore
+        // `mul.lo.u32 %mma_a_row, %mma_a_row, <stride>`.
         assert!(
-            ptx.contains("mul.lo.u32 %mma_addr, %mma_a_row, 256;"),
-            "A-fragment load must multiply row by the tile stride"
+            ptx.contains("mul.lo.u32 %mma_a_row, %mma_a_row, 256;"),
+            "A-fragment load must multiply row offset by the tile stride; got:\n{}",
+            &ptx[..ptx.len().min(4000)]
         );
         assert!(
-            ptx.contains("add.u32 %mma_addr, %mma_addr, %ts_a_base;"),
-            "A-fragment load must add the tile-base register"
+            ptx.contains("add.u32 %mma_a_row, %mma_a_row, %ts_a_base;"),
+            "A-fragment load must add the tile-base register to the row+col offset"
         );
         // B stride = d_model.min(256) * 2 = 256 * 2 = 512 bytes.
+        // B-fragment helper has not yet been rewritten (still uses external
+        // %mma_b_row); assertions for B-frag stay on the legacy pattern.
         assert!(
             ptx.contains("mul.lo.u32 %mma_addr, %mma_b_row, 512;"),
             "B-fragment load must multiply row by the tile stride"

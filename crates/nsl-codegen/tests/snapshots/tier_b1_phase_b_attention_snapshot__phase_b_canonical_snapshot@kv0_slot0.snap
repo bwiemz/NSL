@@ -22,22 +22,22 @@ expression: ptx
     add.u32 %qkt_b_base, %tb1_phase_b_smem_k_u32, %qkt_k_warp_off;
     .reg .b32 %tb1_qkt_a_0_0, %tb1_qkt_a_0_1, %tb1_qkt_a_0_2, %tb1_qkt_a_0_3;
     .reg .b32 %tb1_qkt_b_0_0, %tb1_qkt_b_0_1;
-    // Load A-fragment (m16xk16 row-major) from shared memory
-    mul.lo.u32 %mma_addr, %mma_a_row, 64;  // row * stride
-    add.u32 %mma_addr, %mma_addr, %qkt_a_base;  // + smem base
-    ld.shared.b32 %tb1_qkt_a_0_0, [%mma_addr];
-    mul.lo.u32 %mma_addr, %mma_a_row, 64;  // row * stride
-    add.u32 %mma_addr, %mma_addr, %qkt_a_base;  // + smem base
-    add.u32 %mma_addr, %mma_addr, 8;  // + k byte offset
-    ld.shared.b32 %tb1_qkt_a_0_1, [%mma_addr];
-    mul.lo.u32 %mma_addr, %mma_a_row, 64;  // row * stride
-    add.u32 %mma_addr, %mma_addr, %qkt_a_base;  // + smem base
-    add.u32 %mma_addr, %mma_addr, 16;  // + k byte offset
-    ld.shared.b32 %tb1_qkt_a_0_2, [%mma_addr];
-    mul.lo.u32 %mma_addr, %mma_a_row, 64;  // row * stride
-    add.u32 %mma_addr, %mma_addr, %qkt_a_base;  // + smem base
-    add.u32 %mma_addr, %mma_addr, 24;  // + k byte offset
-    ld.shared.b32 %tb1_qkt_a_0_3, [%mma_addr];
+    // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
+    // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
+    //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
+    mov.u32 %mma_addr, %tid.x;              // load tid
+    and.b32 %mma_addr, %mma_addr, 31;       // lane = tid & 31
+    shr.u32 %mma_a_row, %mma_addr, 2;       // row_lo = lane / 4
+    mul.lo.u32 %mma_a_row, %mma_a_row, 64;  // row_lo * stride
+    and.b32 %mma_addr, %mma_addr, 3;        // lane % 4
+    shl.b32 %mma_addr, %mma_addr, 2;        // * 4 bytes (col_lo_bytes)
+    add.u32 %mma_a_row, %mma_a_row, %mma_addr;  // + col_lo_bytes
+    add.u32 %mma_a_row, %mma_a_row, %qkt_a_base;  // + smem base
+    ld.shared.b32 %tb1_qkt_a_0_0, [%mma_a_row];           // reg0 @ [row_lo, col_lo]
+    ld.shared.b32 %tb1_qkt_a_0_2, [%mma_a_row + 16];      // reg2 @ [row_lo, col_lo+8]
+    add.u32 %mma_a_row, %mma_a_row, 512;  // shift to row_hi (+8 rows)
+    ld.shared.b32 %tb1_qkt_a_0_1, [%mma_a_row];           // reg1 @ [row_hi, col_lo]
+    ld.shared.b32 %tb1_qkt_a_0_3, [%mma_a_row + 16];      // reg3 @ [row_hi, col_lo+8]
     // Load B-fragment (k16xn8 col-major) from shared memory
     mul.lo.u32 %mma_addr, %mma_b_row, 64;  // row * stride
     add.u32 %mma_addr, %mma_addr, %qkt_b_base;  // + smem base
@@ -53,22 +53,22 @@ expression: ptx
         {%s_acc_0_0, %s_acc_0_1, %s_acc_0_2, %s_acc_0_3};
     add.u32 %qkt_a_base_k, %qkt_a_base, 32; // QK^T A k_iter=1
     add.u32 %qkt_b_base_k, %qkt_b_base, 32; // QK^T B k_iter=1
-    // Load A-fragment (m16xk16 row-major) from shared memory
-    mul.lo.u32 %mma_addr, %mma_a_row, 64;  // row * stride
-    add.u32 %mma_addr, %mma_addr, %qkt_a_base_k;  // + smem base
-    ld.shared.b32 %tb1_qkt_a_0_0, [%mma_addr];
-    mul.lo.u32 %mma_addr, %mma_a_row, 64;  // row * stride
-    add.u32 %mma_addr, %mma_addr, %qkt_a_base_k;  // + smem base
-    add.u32 %mma_addr, %mma_addr, 8;  // + k byte offset
-    ld.shared.b32 %tb1_qkt_a_0_1, [%mma_addr];
-    mul.lo.u32 %mma_addr, %mma_a_row, 64;  // row * stride
-    add.u32 %mma_addr, %mma_addr, %qkt_a_base_k;  // + smem base
-    add.u32 %mma_addr, %mma_addr, 16;  // + k byte offset
-    ld.shared.b32 %tb1_qkt_a_0_2, [%mma_addr];
-    mul.lo.u32 %mma_addr, %mma_a_row, 64;  // row * stride
-    add.u32 %mma_addr, %mma_addr, %qkt_a_base_k;  // + smem base
-    add.u32 %mma_addr, %mma_addr, 24;  // + k byte offset
-    ld.shared.b32 %tb1_qkt_a_0_3, [%mma_addr];
+    // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
+    // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
+    //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
+    mov.u32 %mma_addr, %tid.x;              // load tid
+    and.b32 %mma_addr, %mma_addr, 31;       // lane = tid & 31
+    shr.u32 %mma_a_row, %mma_addr, 2;       // row_lo = lane / 4
+    mul.lo.u32 %mma_a_row, %mma_a_row, 64;  // row_lo * stride
+    and.b32 %mma_addr, %mma_addr, 3;        // lane % 4
+    shl.b32 %mma_addr, %mma_addr, 2;        // * 4 bytes (col_lo_bytes)
+    add.u32 %mma_a_row, %mma_a_row, %mma_addr;  // + col_lo_bytes
+    add.u32 %mma_a_row, %mma_a_row, %qkt_a_base_k;  // + smem base
+    ld.shared.b32 %tb1_qkt_a_0_0, [%mma_a_row];           // reg0 @ [row_lo, col_lo]
+    ld.shared.b32 %tb1_qkt_a_0_2, [%mma_a_row + 16];      // reg2 @ [row_lo, col_lo+8]
+    add.u32 %mma_a_row, %mma_a_row, 512;  // shift to row_hi (+8 rows)
+    ld.shared.b32 %tb1_qkt_a_0_1, [%mma_a_row];           // reg1 @ [row_hi, col_lo]
+    ld.shared.b32 %tb1_qkt_a_0_3, [%mma_a_row + 16];      // reg3 @ [row_hi, col_lo+8]
     // Load B-fragment (k16xn8 col-major) from shared memory
     mul.lo.u32 %mma_addr, %mma_b_row, 64;  // row * stride
     add.u32 %mma_addr, %mma_addr, %qkt_b_base_k;  // + smem base
@@ -191,22 +191,22 @@ expression: ptx
     add.u32 %pv_a_base, %tb1_phase_b_smem_p_u32, %pv_p_warp_off;
     shl.b32 %pv_v_warp_off, %pv_n_tile, 4;
     add.u32 %pv_b_base, %tb1_phase_b_smem_v_u32, %pv_v_warp_off;
-    // Load A-fragment (m16xk16 row-major) from shared memory
-    mul.lo.u32 %mma_addr, %mma_a_row, 64;  // row * stride
-    add.u32 %mma_addr, %mma_addr, %pv_a_base;  // + smem base
-    ld.shared.b32 %tb1_pv_a_0_0, [%mma_addr];
-    mul.lo.u32 %mma_addr, %mma_a_row, 64;  // row * stride
-    add.u32 %mma_addr, %mma_addr, %pv_a_base;  // + smem base
-    add.u32 %mma_addr, %mma_addr, 8;  // + k byte offset
-    ld.shared.b32 %tb1_pv_a_0_1, [%mma_addr];
-    mul.lo.u32 %mma_addr, %mma_a_row, 64;  // row * stride
-    add.u32 %mma_addr, %mma_addr, %pv_a_base;  // + smem base
-    add.u32 %mma_addr, %mma_addr, 16;  // + k byte offset
-    ld.shared.b32 %tb1_pv_a_0_2, [%mma_addr];
-    mul.lo.u32 %mma_addr, %mma_a_row, 64;  // row * stride
-    add.u32 %mma_addr, %mma_addr, %pv_a_base;  // + smem base
-    add.u32 %mma_addr, %mma_addr, 24;  // + k byte offset
-    ld.shared.b32 %tb1_pv_a_0_3, [%mma_addr];
+    // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
+    // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
+    //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
+    mov.u32 %mma_addr, %tid.x;              // load tid
+    and.b32 %mma_addr, %mma_addr, 31;       // lane = tid & 31
+    shr.u32 %mma_a_row, %mma_addr, 2;       // row_lo = lane / 4
+    mul.lo.u32 %mma_a_row, %mma_a_row, 64;  // row_lo * stride
+    and.b32 %mma_addr, %mma_addr, 3;        // lane % 4
+    shl.b32 %mma_addr, %mma_addr, 2;        // * 4 bytes (col_lo_bytes)
+    add.u32 %mma_a_row, %mma_a_row, %mma_addr;  // + col_lo_bytes
+    add.u32 %mma_a_row, %mma_a_row, %pv_a_base;  // + smem base
+    ld.shared.b32 %tb1_pv_a_0_0, [%mma_a_row];           // reg0 @ [row_lo, col_lo]
+    ld.shared.b32 %tb1_pv_a_0_2, [%mma_a_row + 16];      // reg2 @ [row_lo, col_lo+8]
+    add.u32 %mma_a_row, %mma_a_row, 512;  // shift to row_hi (+8 rows)
+    ld.shared.b32 %tb1_pv_a_0_1, [%mma_a_row];           // reg1 @ [row_hi, col_lo]
+    ld.shared.b32 %tb1_pv_a_0_3, [%mma_a_row + 16];      // reg3 @ [row_hi, col_lo+8]
     // Load B-fragment (k16xn8 col-major) from shared memory
     mul.lo.u32 %mma_addr, %mma_b_row, 64;  // row * stride
     add.u32 %mma_addr, %mma_addr, %pv_b_base;  // + smem base
@@ -222,22 +222,22 @@ expression: ptx
         {%o_acc_0_0, %o_acc_0_1, %o_acc_0_2, %o_acc_0_3};
     add.u32 %pv_a_base_k, %pv_a_base, 32; // PV A-base shift k_iter=1
     add.u32 %pv_b_base_k, %pv_b_base, 1024; // PV B-base shift k_iter=1
-    // Load A-fragment (m16xk16 row-major) from shared memory
-    mul.lo.u32 %mma_addr, %mma_a_row, 64;  // row * stride
-    add.u32 %mma_addr, %mma_addr, %pv_a_base_k;  // + smem base
-    ld.shared.b32 %tb1_pv_a_0_0, [%mma_addr];
-    mul.lo.u32 %mma_addr, %mma_a_row, 64;  // row * stride
-    add.u32 %mma_addr, %mma_addr, %pv_a_base_k;  // + smem base
-    add.u32 %mma_addr, %mma_addr, 8;  // + k byte offset
-    ld.shared.b32 %tb1_pv_a_0_1, [%mma_addr];
-    mul.lo.u32 %mma_addr, %mma_a_row, 64;  // row * stride
-    add.u32 %mma_addr, %mma_addr, %pv_a_base_k;  // + smem base
-    add.u32 %mma_addr, %mma_addr, 16;  // + k byte offset
-    ld.shared.b32 %tb1_pv_a_0_2, [%mma_addr];
-    mul.lo.u32 %mma_addr, %mma_a_row, 64;  // row * stride
-    add.u32 %mma_addr, %mma_addr, %pv_a_base_k;  // + smem base
-    add.u32 %mma_addr, %mma_addr, 24;  // + k byte offset
-    ld.shared.b32 %tb1_pv_a_0_3, [%mma_addr];
+    // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
+    // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
+    //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
+    mov.u32 %mma_addr, %tid.x;              // load tid
+    and.b32 %mma_addr, %mma_addr, 31;       // lane = tid & 31
+    shr.u32 %mma_a_row, %mma_addr, 2;       // row_lo = lane / 4
+    mul.lo.u32 %mma_a_row, %mma_a_row, 64;  // row_lo * stride
+    and.b32 %mma_addr, %mma_addr, 3;        // lane % 4
+    shl.b32 %mma_addr, %mma_addr, 2;        // * 4 bytes (col_lo_bytes)
+    add.u32 %mma_a_row, %mma_a_row, %mma_addr;  // + col_lo_bytes
+    add.u32 %mma_a_row, %mma_a_row, %pv_a_base_k;  // + smem base
+    ld.shared.b32 %tb1_pv_a_0_0, [%mma_a_row];           // reg0 @ [row_lo, col_lo]
+    ld.shared.b32 %tb1_pv_a_0_2, [%mma_a_row + 16];      // reg2 @ [row_lo, col_lo+8]
+    add.u32 %mma_a_row, %mma_a_row, 512;  // shift to row_hi (+8 rows)
+    ld.shared.b32 %tb1_pv_a_0_1, [%mma_a_row];           // reg1 @ [row_hi, col_lo]
+    ld.shared.b32 %tb1_pv_a_0_3, [%mma_a_row + 16];      // reg3 @ [row_hi, col_lo+8]
     // Load B-fragment (k16xn8 col-major) from shared memory
     mul.lo.u32 %mma_addr, %mma_b_row, 64;  // row * stride
     add.u32 %mma_addr, %mma_addr, %pv_b_base_k;  // + smem base
