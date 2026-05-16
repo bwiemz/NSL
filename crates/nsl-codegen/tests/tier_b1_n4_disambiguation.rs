@@ -2,6 +2,52 @@
 //! 32×32×32 (d_model=2048, chunk=128) config with deterministic inputs and
 //! compare numerically against the CPU naive-attention reference.
 //!
+//! ## Status (2026-05-15)
+//!
+//! Kernel launches and writes all output positions (no zeros, no crash on
+//! sm_120). Two GPU-correctness bugs were uncovered + fixed during the
+//! initial run:
+//!   1. `phases::forward::prelude::emit` was declaring `shmem[N]` at the
+//!      Tier-A baseline (`smem_layout::total_bytes`), not Tier B.1's
+//!      chunk-aware total. Writes to offsets past 36 KB walked off the
+//!      end of the static allocation, silently stomping neighbouring
+//!      GPU state. Fixed by `emit_with_smem_override` + the new
+//!      `smem_layout::tier_b1_total_smem_bytes` helper.
+//!   2. `tier_b1::projection_mma::emit_cp_async_multi_iter` was narrowing
+//!      the 64-bit HBM source pointer to u32 (`cvt.u32.u64`), then
+//!      sign-extending back to u64. On Blackwell HBM allocations live
+//!      near `0x7f00_0000_0000`; the upper 32 bits are non-zero, so the
+//!      narrowing produced `CUDA_ERROR_ILLEGAL_ADDRESS` at launch.
+//!      Fixed by switching the HBM address path to u64 throughout.
+//!
+//! After both fixes the kernel produces all-NaN output. This is a
+//! THIRD, ORTHOGONAL design gap discovered while running N4 (NOT the
+//! helper-convention question this test exists to answer):
+//!
+//!   * `csha_hooks::emit_prologue` reads + writes `csha_x_ptr` as `f32`
+//!     (RMSNorm prologue uses `ld.global.f32` / `st.global.f32`).
+//!   * `tier_b1::projection_mma` stages `csha_x_ptr` to SMEM as `f16`
+//!     (cp.async transfers raw bytes; the MMA reads them as `f16`).
+//!     The pre-existing rustdoc at `projection_mma.rs:590-596` says
+//!     "narrowing must happen upstream (csha RMSNorm path)" — but no
+//!     `f32 -> f16` narrowing pass exists. The MMA reads raw `f32` bit
+//!     patterns as `f16` values, producing arbitrary results that often
+//!     overflow to NaN through softmax.
+//!
+//! That bridge is in-scope for a follow-up CSHA Tier B.1 design pass —
+//! either add an `f32 -> f16` narrowing in `csha_hooks::emit_prologue`
+//! (writing a SEPARATE `f16` buffer + threading a new pointer through
+//! the FFI) or rewrite RMSNorm + projection to share a single `f16`
+//! convention from prologue through epilogue. Until that lands, the
+//! helper-convention disambiguation that this test exists for cannot be
+//! cleanly answered: any NaN-vs-NaN comparison is dominated by the
+//! dtype-mismatch noise, not the helper's correctness.
+//!
+//! The kernel launches without faulting and the data-flow plumbing is
+//! intact, so the test is kept in-tree as a regression sentinel for the
+//! two fixes above. When the narrowing bridge lands, this test should
+//! be re-run and the DIAGNOSIS branch below will classify the helper.
+//!
 //! ## What N4 disambiguates
 //!
 //! `matmul_mma::emit_load_a_fragment_smem` reads 4 b32 from a SINGLE SMEM
