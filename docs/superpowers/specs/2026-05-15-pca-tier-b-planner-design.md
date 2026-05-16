@@ -46,9 +46,9 @@ The dispatch spec's D-1 milestone (V-dispatch-integration) is complete. D-2 onwa
   |---|---|---|
   | MAX=16384/block=32 fits across all configs | B-ii unrestricted | Up to 16384 |
   | MAX=8192 fits but 16384 doesn't | B-ii-restricted (MAX=8192) | Up to 8192; configs above fall back to Tier-B-off |
-  | Only MAX=4096 fits | B-i (single-emission at MAX=4096) | Up to 4096 |
-  | Nothing fits | B-i (same as above) | Up to 4096 |
-  | Unpredictable | Investigation before proceeding | — |
+  | Only MAX=4096 fits | B-i (single-emission at MAX=4096) | Up to 4096; matches PR #169 baseline |
+  | MAX=4096 doesn't fit either | Investigation; B-iii becomes default | — |
+  | Unpredictable / non-monotonic | Investigation before proceeding | — |
 
 - **FFI signature extension** of `nsl_flash_attention_csha` (and 5 sibling launch entry points) — 2-param shape (`tier_b_ptx_ptr`, `tier_b_name_ptr`) in all sub-variants. In-place extension with sentinel defaults. Helper functions encapsulate sentinel construction (IR-001 discipline).
 - **Codegen emission policy**: for `segment_masked` configs, codegen emits a Tier-B-on PTX blob alongside the existing base (Tier-B-off) PTX. Non-`segment_masked` configs are unchanged.
@@ -127,7 +127,7 @@ Co-measurement is essentially free (the probe kernel allocates both regions; rec
 | MAX=16384/block=32 fits across all configs | **B-ii unrestricted** | Up to 16384 | Tier-B-on PTX sized at MAX=16384 |
 | MAX=8192 fits but 16384 doesn't | **B-ii-restricted (MAX=8192)** | Up to 8192; configs above fall back to Tier-B-off via runtime gate | Tier-B-on PTX sized at MAX=8192 |
 | Only MAX=4096 fits | **B-i (single-emission at MAX=4096)** | Up to 4096; matches PR #169's existing snapshot baseline | Tier-B-on PTX sized at MAX=4096 |
-| Nothing fits | **B-i (same)** | Up to 4096 | Same as above |
+| **MAX=4096 doesn't fit either** | **Investigation before proceeding; B-iii becomes default** | — | **P-2 blocks; single-emission infeasible at any conservative-max; HBM-resident range tables (B-iii) become the only path.** Revisit architecture per §3.4.1. |
 | Unpredictable / non-monotonic | **Investigation before proceeding** | — | P-2 blocks indefinitely until resolution |
 
 Same `pass thresholds + fail semantics + protocol pinned before measurement` discipline as IR-010.
@@ -921,3 +921,4 @@ These additions happen in the same PR that lands this spec. Activation PR checkl
 ## Revision changelog
 
 - **2026-05-15** — initial. Follow-on to dispatch spec's §14 amendment, grounded in V-planner-options findings (Option B viable; A architectural revision; C no roadmap). Commits to 2-param FFI extension shape (uniform across sub-variants); sub-variant resolved by V-Bii-SMEM probe with five-outcome decision matrix. Adds risk #9 (joint-outcome const assertion). Extends IR-008 and IR-011 "Cited from" lists. Implementation budget ~3-4 days across P-0 through P-4.
+- **2026-05-15 (post-review)** — reconciled §2.1 and §3.4 outcome matrices: "MAX=4096 doesn't fit either" is now its own investigation row (B-iii becomes default), distinct from "Only MAX=4096 fits" (B-i at MAX=4096, valid). Prior framing conflated the two as "B-i" — structurally contradictory because B-i at MAX=4096 requires MAX=4096 to fit.
