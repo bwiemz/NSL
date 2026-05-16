@@ -33,6 +33,11 @@ default = []
 cuda = ["dep:cudarc"]
 interop = ["dep:hf-hub", "dep:prost", "dep:half", "dep:regex-lite"]
 test-hooks = []
+# Opt-in feature for internal-only benchmark/test surfaces that touch the
+# `assert_tier_b_sentinels` discipline (planner spec §8.5). The associated
+# tests are #![cfg(feature = "bench-internal")]-gated so they don't run in
+# normal `cargo test` invocations.
+bench-internal = []
 # Force cuBLAS to use `CUBLAS_PEDANTIC_MATH` (strict f32) as the default math
 # mode instead of `CUBLAS_DEFAULT_MATH` (which enables TF32 tensor cores on
 # sm_80+). Per spec 2026-04-21-matmul-cublas-swap-design §9 this is the
