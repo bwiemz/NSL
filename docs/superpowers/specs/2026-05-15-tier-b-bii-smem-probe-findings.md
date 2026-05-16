@@ -36,6 +36,8 @@ cargo test -p nsl-codegen --features cuda --release \
 | 16384 | 32 | sm_120 | 8192 | 4096 | 12288 | 101376 | 12.12 | Pass |
 | 16384 | 64 | sm_120 | 8192 | 2048 | 10240 | 101376 | 10.10 | Pass |
 
+> **Note (per planner spec §3.2.1 co-measurement):** the `seg_smem (B)` column is the Tier-B-off baseline; `tier_b_extern (B)` is Tier B's incremental SMEM contribution; `total (B)` is the Tier-B-on combined allocation. The probe doubles as a SMEM-allocation regression checkpoint for the entire FA-2 v2 kernel.
+
 All 12 configurations pass; outcomes are strictly monotonic with respect to MAX (larger MAX → larger range-table bytes → larger total SMEM, with no fail boundary crossed at any MAX). Results are reproducible across runs (single-threaded test execution; CUDA primary context retained per process).
 
 ## Outcome (per §3.4 decision matrix)

@@ -55,7 +55,11 @@ enum ProbeOutcome {
     Pass,
     PtxasRejected(String),
     LaunchFailed(String),
-    ValueCorruption { expected: u8, found: u8 },
+    /// The `region` field disambiguates which SMEM allocation corrupted the
+    /// sentinel — `seg_smem` (Tier-B-off baseline) vs `shmem (extern)` (the
+    /// Tier-B-on dynamic region). The readback packs both bytes into one
+    /// u32 word so a single 4-byte device buffer is sufficient.
+    ValueCorruption { expected: u8, found: u8, region: String },
 }
 
 #[derive(Debug)]
@@ -79,9 +83,12 @@ struct ProbeResult {
 /// extern `shmem[]` (Tier B's range-table region, sized by the launch's
 /// dynamic shared-mem bytes parameter to `tier_b_extern_bytes` for the config).
 /// Every thread writes a sentinel `0xA5` to both regions, then `bar.sync 0`,
-/// then lane-0 reads back from `seg_smem[0]` and writes the byte (zero-extended
-/// to u32) to the global output pointer. Readback == 0xA5 confirms both
-/// allocation + execution.
+/// then lane-0 reads back from BOTH `seg_smem[0]` and `shmem[0]`, packs the
+/// two bytes into one u32 word (`(ext_byte << 8) | seg_byte`), and writes
+/// it to the global output pointer. Verifying both bytes mirrors the
+/// original probe's discipline (`tier_b_smem_probe.rs:90-99` reads both
+/// regions per thread) so a hypothetical access-time failure on the extern
+/// allocation cannot silently report `Pass`.
 fn build_probe_ptx(sm: u32) -> String {
     // PTX 8.7 covers sm_120 (Blackwell, CUDA 12.8+); it's also backward
     // compatible with sm_80 per the original probe's rationale.
@@ -97,8 +104,8 @@ fn build_probe_ptx(sm: u32) -> String {
     .param .u64 tier_b_bii_smem_probe_param_0
 ) {{
     .reg .u64 %out_ptr, %wide_seg_addr, %wide_shmem_addr, %slot_off;
-    .reg .u32 %t, %n, %sent, %read_back;
-    .reg .u16 %byte_a5, %read_u16;
+    .reg .u32 %t, %read_seg_u32, %read_ext_u32, %read_ext_shifted, %read_back;
+    .reg .u16 %byte_a5, %read_seg, %read_ext;
     .reg .pred %p_skip;
 
     ld.param.u64 %out_ptr, [tier_b_bii_smem_probe_param_0];
@@ -123,13 +130,18 @@ fn build_probe_ptx(sm: u32) -> String {
 
     bar.sync 0;
 
-    // Lane-0 readback from seg_smem[0] -> global output[0] (as u32 for an
-    // unambiguous host comparison). cvt.u32.u16 zero-extends the low byte.
+    // Lane-0 readback from BOTH seg_smem[0] and shmem[0]. Packs the two
+    // bytes into one u32 word: high byte = extern shmem, low byte =
+    // seg_smem. Host splits the word and asserts both bytes equal 0xA5.
     setp.ne.u32 %p_skip, %t, 0;
     @%p_skip ret;
 
-    ld.shared.u8 %read_u16, [seg_smem];
-    cvt.u32.u16 %read_back, %read_u16;
+    ld.shared.u8 %read_seg, [seg_smem];
+    ld.shared.u8 %read_ext, [shmem];
+    cvt.u32.u16 %read_seg_u32, %read_seg;
+    cvt.u32.u16 %read_ext_u32, %read_ext;
+    shl.b32 %read_ext_shifted, %read_ext_u32, 8;
+    or.b32 %read_back, %read_seg_u32, %read_ext_shifted;
     st.global.u32 [%out_ptr], %read_back;
     ret;
 }}
@@ -160,6 +172,22 @@ fn probe_ptx_contains_expected_sections() {
         "PTX must write sentinel 0xA5 to extern shmem"
     );
     assert!(ptx.contains("bar.sync 0"), "PTX must barrier-sync before readback");
+    assert!(
+        ptx.contains("ld.shared.u8 %read_seg, [seg_smem]"),
+        "PTX must read back from seg_smem (Tier-B-off baseline region)"
+    );
+    assert!(
+        ptx.contains("ld.shared.u8 %read_ext, [shmem]"),
+        "PTX must read back from extern shmem (Tier-B-on region)"
+    );
+    assert!(
+        ptx.contains("shl.b32 %read_ext_shifted, %read_ext_u32, 8"),
+        "PTX must pack ext byte into high byte of u32 readback word"
+    );
+    assert!(
+        ptx.contains("or.b32 %read_back, %read_seg_u32, %read_ext_shifted"),
+        "PTX must combine seg + ext bytes into one u32 word"
+    );
     assert!(
         ptx.contains("st.global.u32 [%out_ptr], %read_back"),
         "PTX must write readback to global output"
@@ -481,11 +509,16 @@ fn run_probe_config(max_seq_len: u32, block: u32, target_sm: u32) -> ProbeResult
             };
         }
 
-        // Readback word: the lane-0 store wrote a u32 zero-extended from
-        // the sentinel byte 0xA5. host_buf[0] should equal 0xA5; the
-        // remaining 3 bytes should be the zero-extension padding.
-        let found = host_buf[0];
-        if found != 0xA5 {
+        // Readback word: lane-0 packed two sentinel bytes into one u32:
+        // low byte (host_buf[0]) = seg_smem (Tier-B-off baseline region),
+        // next byte (host_buf[1]) = shmem extern (Tier-B-on region). Both
+        // must equal 0xA5 — verifying ONLY seg_smem would let a
+        // hypothetical access-time failure on the extern allocation
+        // silently report `Pass`, defeating the forced-access discipline
+        // inherited from `tier_b_smem_probe.rs:90-99`.
+        let seg_byte = host_buf[0];
+        let ext_byte = host_buf[1];
+        if seg_byte != 0xA5 {
             return ProbeResult {
                 max_seq_len,
                 block,
@@ -495,7 +528,28 @@ fn run_probe_config(max_seq_len: u32, block: u32, target_sm: u32) -> ProbeResult
                 total_smem_bytes,
                 cap_bytes,
                 utilization_pct,
-                outcome: ProbeOutcome::ValueCorruption { expected: 0xA5, found },
+                outcome: ProbeOutcome::ValueCorruption {
+                    expected: 0xA5,
+                    found: seg_byte,
+                    region: "seg_smem".to_string(),
+                },
+            };
+        }
+        if ext_byte != 0xA5 {
+            return ProbeResult {
+                max_seq_len,
+                block,
+                target_sm,
+                seg_smem_bytes: SEG_SMEM_STATIC_BYTES,
+                tier_b_extern_bytes,
+                total_smem_bytes,
+                cap_bytes,
+                utilization_pct,
+                outcome: ProbeOutcome::ValueCorruption {
+                    expected: 0xA5,
+                    found: ext_byte,
+                    region: "shmem (extern)".to_string(),
+                },
             };
         }
 
@@ -523,8 +577,10 @@ fn fmt_csv_row(r: &ProbeResult) -> String {
         ProbeOutcome::Pass => "Pass".to_string(),
         ProbeOutcome::PtxasRejected(m) => format!("PtxasRejected({m})"),
         ProbeOutcome::LaunchFailed(m) => format!("LaunchFailed({m})"),
-        ProbeOutcome::ValueCorruption { expected, found } => {
-            format!("ValueCorruption(expected={expected:#04x},found={found:#04x})")
+        ProbeOutcome::ValueCorruption { expected, found, region } => {
+            format!(
+                "ValueCorruption(region={region},expected={expected:#04x},found={found:#04x})"
+            )
         }
     };
     format!(
