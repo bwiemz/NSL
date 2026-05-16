@@ -476,6 +476,34 @@ pub fn tier_b1_w_chunk_offset(config: &FlashAttentionConfig) -> u32 {
     tier_b1_p_offset(config) + tier_b1_p_scratch_bytes(config)
 }
 
+/// Total SMEM bytes for a Tier B.1 kernel at the given chunk.
+///
+/// Layout:
+///   `q_tile`        — block_q × head_dim × 2 (f16)
+///   `4 × kv_slab`   — K_ping + K_pong + V_ping + V_pong, each block_kv × head_dim × 2
+///   `p_scratch`     — block_q × block_kv × 2 (f16 softmax-output bridge)
+///   `chunk_staging` — Wk + Wv slots (chunk × head_dim × 2 each)
+///                   + x_q + x_kv slots ((block_q + block_kv) × chunk × 2)
+///
+/// Mirrors `validate_tier_b1_config`'s formula exactly so the validator
+/// and the prelude's `.shared` allocation always agree byte-for-byte.
+/// Without this helper the prelude declared the Tier-A baseline (Q tile +
+/// KV tile + SP rows, ~5 KB), but Tier B.1 writes to offsets past 36 KB
+/// (the `x_kv` chunk slot lives at `tier_b1_w_chunk_offset + 3 * chunk*head_dim*2`).
+/// Static SMEM under-declaration silently stomps neighboring GPU state;
+/// ptxas can't detect it because SMEM offsets are computed dynamically.
+pub fn tier_b1_total_smem_bytes(config: &FlashAttentionConfig, chunk: u32) -> u32 {
+    let bq = config.block_q as u32;
+    let bkv = config.block_kv as u32;
+    let hd = config.head_dim as u32;
+    let q_tile = bq * hd * 2;
+    let kv_ping_pong = 2 * (bkv * hd * 2) + 2 * (bkv * hd * 2);
+    let p_scratch = tier_b1_p_scratch_bytes(config);
+    let chunk_staging = chunk * hd * 2 * 2          // Wk + Wv chunk slots
+                      + (bq + bkv) * chunk * 2;     // x_q + x_kv chunk slots
+    q_tile + kv_ping_pong + p_scratch + chunk_staging
+}
+
 /// Validate config against Tier B.1's SMEM budget (per spec section 3.4).
 /// Called by `tier_b1::chunk_config::select`. Returns the selected chunk
 /// on success; returns `ConfigError` if the budget is exceeded for this

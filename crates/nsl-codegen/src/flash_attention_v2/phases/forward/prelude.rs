@@ -46,6 +46,19 @@ use crate::kernel_skeleton::indexing::emit_thread_lane_warp_register_decl;
 /// pointer lives in %shmem_base after a `cvta.shared.u64` from the
 /// `shmem` byte array declared here.
 pub fn emit(ptx: &mut String, config: &FlashAttentionConfig) {
+    emit_with_smem_override(ptx, config, total_bytes(config));
+}
+
+/// Same as `emit`, but the caller supplies the exact byte count for the
+/// static `.shared` array. Used by Tier B.1's `synthesize` to declare
+/// `shmem[N]` at the Tier-B.1-sized total (q + 4×KV slabs + p_scratch +
+/// chunk_staging) rather than the Tier-A baseline returned by
+/// `total_bytes`. Without this override the prelude under-declares SMEM
+/// and Tier B.1's later `add.u64 %tb1_*_smem_*, %shmem_base, <offset>`
+/// arithmetic addresses bytes past the end of `shmem[]`, silently
+/// stomping neighboring GPU state at launch (ptxas can't detect this
+/// because SMEM offsets are computed dynamically at runtime).
+pub fn emit_with_smem_override(ptx: &mut String, config: &FlashAttentionConfig, smem_bytes: u32) {
     // File header. Target SM is config-aware: Tier B.1 (cp.async +
     // m16n8k16) requires sm_80+; legacy Tier A defaults to sm_75 since
     // `gpu_sm` is 75 for all its test configs. This resolves B1.6
@@ -117,9 +130,11 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig) {
     // Static shared memory declaration (inside function body).
     // Dynamic SMEM configs use `.extern .shared` at module scope (emitted above,
     // before the .visible .entry).  Static configs declare the array here.
+    // For Tier B.1, `smem_bytes` is the caller-supplied Tier-B.1 total (q +
+    // 4×KV slabs + p_scratch + chunk_staging) rather than the Tier-A baseline.
     if !fwd_needs_dynamic_smem(config) {
         use crate::kernel_skeleton::smem::emit_static_smem_decl;
-        emit_static_smem_decl(ptx, total_bytes(config) as usize);
+        emit_static_smem_decl(ptx, smem_bytes as usize);
     }
 
     // Register declarations. f32 pool must cover the highest-indexed

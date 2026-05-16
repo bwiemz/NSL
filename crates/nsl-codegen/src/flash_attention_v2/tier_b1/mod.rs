@@ -75,7 +75,19 @@ pub fn synthesize(config: &FlashAttentionConfig, chunk: u32) -> Vec<u8> {
     let mut ptx = String::new();
 
     // 1. PTX header (target, version, param block, register decls).
-    crate::flash_attention_v2::phases::forward::prelude::emit(&mut ptx, config);
+    // SMEM-size override: Tier B.1 declares `shmem[N]` at the chunk-aware
+    // total (q + 4×KV slabs + p_scratch + chunk_staging) rather than the
+    // Tier-A baseline `smem_layout::total_bytes`. Without this override the
+    // static `.shared` array is sized for ~5 KB while Tier B.1's chunk
+    // staging actually writes to offsets past 36 KB; the OOB writes
+    // silently stomp neighbouring GPU state at launch (ptxas can't catch
+    // this because SMEM addresses are computed dynamically).
+    let smem_bytes = crate::flash_attention_v2::smem_layout::tier_b1_total_smem_bytes(
+        config, chunk,
+    );
+    crate::flash_attention_v2::phases::forward::prelude::emit_with_smem_override(
+        &mut ptx, config, smem_bytes,
+    );
 
     // 2. Tier B.1 outer-prologue register declarations.
     // Required by pipeline::emit_main_loop_phase_c_swap (the helper
