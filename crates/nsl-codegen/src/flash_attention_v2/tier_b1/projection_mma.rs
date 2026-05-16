@@ -60,13 +60,23 @@ use crate::matmul_mma::{
 /// Resolves B1.6 deferral #3 multi-iter unroll (chunks > 4096 bytes).
 ///
 /// Caller is responsible for declaring + populating the named scratch
-/// registers (`smem_addr_u32`, `hbm_off_u32`, `hbm_addr_u64`) and the
-/// thread-local offset register (`tid_off_u32` = `%tid.x << 4`). Caller
-/// also passes:
+/// registers (`smem_addr_u32`, `hbm_addr_u64`) and the thread-local offset
+/// register (`tid_off_u32` = `%tid.x << 4`). Caller also passes:
 /// - `smem_base_u32`: u32 SMEM base reg for this destination slot
 /// - `hbm_ptr_u64`: u64 reg holding the HBM source pointer
 /// - `hbm_chunk_base_off_bytes`: codegen-time offset within the HBM
 ///   buffer (e.g. `chunk_idx * chunk * hd * 2` for the per-chunk shift)
+///
+/// `hbm_off_u32` is **legacy / unused** — earlier revisions computed HBM
+/// addresses through a u32 scratch register. On sm_80+ (Hopper, Blackwell)
+/// HBM device pointers occupy the full 64-bit virtual address space and
+/// the upper 32 bits are routinely non-zero, so the u32 narrowing
+/// produced an HBM address with the upper bits zeroed — virtually
+/// guaranteed to fault with `CUDA_ERROR_ILLEGAL_ADDRESS` at launch.
+/// Discovered during N4 GPU disambiguation (2026-05-15). The parameter
+/// is retained for call-site signature stability; the helper no longer
+/// touches the register, so callers may keep declaring it (ptxas prunes
+/// unused virtual regs) or strip it in a follow-up cleanup.
 fn emit_cp_async_multi_iter(
     ptx: &mut String,
     smem_dest_size_bytes: u32,
@@ -91,7 +101,9 @@ fn emit_cp_async_multi_iter(
                 sub_off
             ));
         }
-        // SMEM addr = smem_base + tid_off + sub_off
+        // SMEM addr (u32) = smem_base + tid_off + sub_off.
+        // SMEM-space addresses on sm_80+ are 32-bit, so u32 arithmetic is
+        // correct for the destination.
         ptx.push_str(&format!(
             "    add.u32 {}, {}, {};\n",
             smem_addr_u32, smem_base_u32, tid_off_u32
@@ -102,26 +114,35 @@ fn emit_cp_async_multi_iter(
                 smem_addr_u32, smem_addr_u32, sub_off
             ));
         }
-        // HBM off = hbm_ptr + hbm_chunk_base_off + sub_off + tid_off
+        // HBM addr (u64) = hbm_ptr + (hbm_chunk_base_off + sub_off) + tid_off.
+        // **CRITICAL:** keep the addressing in u64. On sm_80+ (Hopper,
+        // Blackwell) HBM device pointers occupy the full 64-bit virtual
+        // address space; the upper 32 bits are routinely non-zero. The
+        // earlier emission narrowed to u32 via `cvt.u32.u64` and operated
+        // on the truncated low half, which produced an HBM address with
+        // the upper 32 bits zeroed — virtually guaranteed to fault with
+        // CUDA_ERROR_ILLEGAL_ADDRESS at launch.
+        // The `hbm_off_u32` register passed by the caller is now unused;
+        // callers may keep declaring it (ptxas prunes unused virtual regs)
+        // but the helper no longer touches it.
+        let _ = hbm_off_u32;
+        // Widen tid_off (u32) into hbm_addr_u64 via cvt; then add the u64
+        // base + the codegen-time chunk + sub byte offset.
         ptx.push_str(&format!(
-            "    cvt.u32.u64 {}, {};\n",
-            hbm_off_u32, hbm_ptr_u64
+            "    cvt.u64.u32 {}, {};\n",
+            hbm_addr_u64, tid_off_u32
+        ));
+        ptx.push_str(&format!(
+            "    add.u64 {}, {}, {};\n",
+            hbm_addr_u64, hbm_addr_u64, hbm_ptr_u64
         ));
         let total_chunk_off = hbm_chunk_base_off_bytes + sub_off;
         if total_chunk_off > 0 {
             ptx.push_str(&format!(
-                "    add.u32 {}, {}, {};\n",
-                hbm_off_u32, hbm_off_u32, total_chunk_off
+                "    add.u64 {}, {}, {};\n",
+                hbm_addr_u64, hbm_addr_u64, total_chunk_off
             ));
         }
-        ptx.push_str(&format!(
-            "    add.u32 {}, {}, {};\n",
-            hbm_off_u32, hbm_off_u32, tid_off_u32
-        ));
-        ptx.push_str(&format!(
-            "    cvt.u64.u32 {}, {};\n",
-            hbm_addr_u64, hbm_off_u32
-        ));
         ptx.push_str(&format!(
             "    cp.async.cg.shared.global [{}], [{}], 16;\n",
             smem_addr_u32, hbm_addr_u64
