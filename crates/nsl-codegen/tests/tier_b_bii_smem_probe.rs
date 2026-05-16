@@ -515,6 +515,32 @@ fn run_probe_config(max_seq_len: u32, block: u32, target_sm: u32) -> ProbeResult
     }
 }
 
+/// Render one ProbeResult as a CSV-ish row. Shared between the smoke
+/// fixture's eprintln and the full sweep's summary table so the schema
+/// stays identical across both reporting paths.
+fn fmt_csv_row(r: &ProbeResult) -> String {
+    let outcome_str = match &r.outcome {
+        ProbeOutcome::Pass => "Pass".to_string(),
+        ProbeOutcome::PtxasRejected(m) => format!("PtxasRejected({m})"),
+        ProbeOutcome::LaunchFailed(m) => format!("LaunchFailed({m})"),
+        ProbeOutcome::ValueCorruption { expected, found } => {
+            format!("ValueCorruption(expected={expected:#04x},found={found:#04x})")
+        }
+    };
+    format!(
+        "{max},{block},sm_{sm},{seg},{extern_b},{total},{cap},{util:.2},{outcome}",
+        max = r.max_seq_len,
+        block = r.block,
+        sm = r.target_sm,
+        seg = r.seg_smem_bytes,
+        extern_b = r.tier_b_extern_bytes,
+        total = r.total_smem_bytes,
+        cap = r.cap_bytes,
+        util = r.utilization_pct,
+        outcome = outcome_str,
+    )
+}
+
 /// Smoke fixture for the launch path. Picks the easiest config —
 /// MAX=4096, block=64, sm_120 — which yields ~8.6% utilization on
 /// Blackwell. If this fails the rest of the sweep is also suspect.
@@ -534,3 +560,49 @@ fn probe_launch_smoke_sm120_max4096_block64() {
     assert_eq!(result.outcome, ProbeOutcome::Pass);
 }
 
+/// Full 12-config sweep across `MAX x block x arch`. Each result is
+/// printed to stderr in CSV-ish form suitable for direct paste into the
+/// findings doc's sweep table (§3.4 / §3.5).
+///
+/// sm_80 PTX is loaded via `cuModuleLoadDataEx` on Blackwell hardware;
+/// the driver JIT-compiles sm_80 PTX down to native sm_120 SASS, so the
+/// launch outcome reflects the SMEM cap binding on the resident GPU
+/// (sm_120 cap = 99 KB). The `target_sm` column distinguishes which PTX
+/// target line was emitted; the `cap_B` column reflects the architecture
+/// classification recorded in the planner spec's decision matrix.
+///
+/// Per planner spec §3.4: highest `MAX` that passes across BOTH archs
+/// AND both block sizes resolves the sub-variant (B-ii unrestricted /
+/// B-ii-restricted / B-i / investigation).
+#[test]
+fn probe_full_sweep() {
+    const MAXES: &[u32] = &[4096, 8192, 16384];
+    const BLOCKS: &[u32] = &[32, 64];
+    const ARCHES: &[u32] = &[80, 120];
+
+    let mut rows = Vec::new();
+    for &arch in ARCHES {
+        for &max in MAXES {
+            for &block in BLOCKS {
+                let row = run_probe_config(max, block, arch);
+                eprintln!("[V-Bii-SMEM] {}", fmt_csv_row(&row));
+                rows.push(row);
+            }
+        }
+    }
+
+    eprintln!();
+    eprintln!("=== V-Bii-SMEM probe sweep summary (12 configs) ===");
+    eprintln!(
+        "MAX,block,target_sm,seg_smem_B,tier_b_extern_B,total_B,cap_B,util_pct,outcome"
+    );
+    for r in &rows {
+        eprintln!("{}", fmt_csv_row(r));
+    }
+    eprintln!("=== End sweep ===");
+    eprintln!("Classify per planner spec §3.4 decision matrix; record SMEM headroom % per §3.5.");
+
+    // The sweep test is intentionally non-asserting: a row's outcome is
+    // evidence for the §3.4 matrix, not a pass/fail signal. Failures are
+    // recorded into rows and classified in the findings doc.
+}
