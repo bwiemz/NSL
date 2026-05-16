@@ -89,6 +89,7 @@ Cited from:
 - FA-2 v2 Tier B.1 verification harness (V1/V2/V3 + cost-model snapshot).
 - BitNet Phase 1 validation harness + reference implementation.
 - `docs/superpowers/specs/2026-05-12-pca-tier-b-revision-design.md` overall §3.1 / §3.4 / §6.3 balance.
+- `docs/superpowers/specs/2026-05-15-pca-tier-b-planner-design.md` §8.10 — 1.7× test-LOC-to-implementation-LOC ratio reported observationally per IR-008's original framing (not a budget ceiling); symptom-based v2 triggers (duplicate coverage, speculative tests, over-specification of settled surfaces) are the right shape for future test-surface review, not aggregate metric thresholds.
 
 ### IR-009 — Dead-code lifecycle requires explicit removal triggers
 
@@ -115,6 +116,7 @@ Cited from:
 - `docs/superpowers/specs/2026-05-11-csha-tier-b1-pipelined-attention-design.md` — V1/V2/V3 multi-tier verification.
 - WGGO Phase 2 #134 — per-commit milestone matrix.
 - `docs/superpowers/specs/2026-05-13-pca-tier-b15-and-b2-design.md` §4 — gate/parity/sensitivity tiers unlock the "keep with sparsity gate" outcome.
+- `docs/superpowers/specs/2026-05-15-pca-tier-b-planner-design.md` §9 — third instance of distinct test surfaces rolling up into a richer decision space: V-Bii-SMEM probe's five-outcome decision matrix + per-MAX SMEM-headroom recording roll up into a four-way v2 trigger split (path A extend baked max / path B B-iii migration; from MAX=16384 unrestricted vs MAX=8192 restricted), differentiating cost from ~30 min re-probe to ~500 LOC kernel-architecture migration. (First instance: dispatch spec §13.3 sensitivity tier; second instance: this spec's trigger-space split.)
 
 ### IR-012 — Measurement-infrastructure contracts are explicit in spec, not implicit in implementation
 
