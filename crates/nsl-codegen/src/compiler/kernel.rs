@@ -745,22 +745,31 @@ impl Compiler<'_> {
         };
 
         // ── Forward with saves ─────────────────────────────
+        // PCA Tier B Planner (planner spec §5): use the emission helper so the
+        // call site picks up the Tier-B-on variant when the training config has
+        // `segment_masked=true`. For non-`segment_masked` configs the helper
+        // returns `None` for the Tier-B-on PTX, preserving the previous
+        // single-PTX behaviour byte-identically (base PTX is
+        // `synthesize_flash_attention_ptx_v2_with_tier_b(config, None)`, which
+        // is exactly what the selector previously routed to).
+        //
+        // Selector pre-flight: the selector's `select_emitter_with_diag` runs
+        // its SMEM budget check; preserve that side effect by invoking the
+        // existing kernel-name selector once (which delegates to v2 + retains
+        // the diag-emit contract for API stability).
         let mut diags = Vec::<String>::new();
-        let fwd_ptx_bytes =
-            crate::flash_attention_selector::synthesize_flash_attention_ptx_selected_with_diag(
-                &training_config, &mut diags,
-            );
-        for d in diags { eprintln!("warning: {d}"); }
-        let mut diags = Vec::<String>::new();
-        let fwd_kernel_name =
+        let _ =
             crate::flash_attention_selector::flash_attention_kernel_name_selected_with_diag(
                 &training_config, &mut diags,
             );
         for d in diags { eprintln!("warning: {d}"); }
+        let fwd_emission =
+            crate::pca_tier_b::emit_tier_b_variants_for_config(&training_config);
+        let fwd_kernel_name = fwd_emission.base_kernel_name.clone();
 
         let fwd_ptx_id = self.embed_raw_data(
             &format!("__nsl_flash_ptx_csha_saves_{}", fwd_kernel_name),
-            fwd_ptx_bytes,
+            fwd_emission.base_ptx,
         )?;
         let mut fwd_name_bytes = fwd_kernel_name.as_bytes().to_vec();
         fwd_name_bytes.push(0);
@@ -769,12 +778,33 @@ impl Compiler<'_> {
             fwd_name_bytes,
         )?;
 
+        // Tier-B-on variant: embed only when the emission helper produced one.
+        let (fwd_tier_b_ptx_id, fwd_tier_b_name_id) = match (
+            fwd_emission.tier_b_on_ptx,
+            fwd_emission.tier_b_on_kernel_name,
+        ) {
+            (Some(on_ptx), Some(on_name)) => {
+                let on_ptx_id = self.embed_raw_data(
+                    &format!("__nsl_flash_ptx_csha_saves_{}", on_name),
+                    on_ptx,
+                )?;
+                let mut on_name_bytes = on_name.as_bytes().to_vec();
+                on_name_bytes.push(0);
+                let on_name_id = self.embed_raw_data(
+                    &format!("__nsl_flash_name_csha_saves_{}", on_name),
+                    on_name_bytes,
+                )?;
+                (Some(on_ptx_id), Some(on_name_id))
+            }
+            _ => (None, None),
+        };
+
         // ── Fused backward ─────────────────────────────────
         // The Tier C fused-backward validator has a tighter SMEM budget
         // (adds dQ/dK/dV tiles).  If it rejects the training config we
         // leave the backward IDs None — Gap C/D will detect this and
         // fall through to the legacy tape-op backward path.
-        let (bwd_ptx_id, bwd_name_id) =
+        let (bwd_ptx_id, bwd_name_id, bwd_tier_b_ptx_id, bwd_tier_b_name_id) =
             match crate::flash_attention_v2::synthesize_backward(&training_config) {
                 Ok(bwd_ptx_string) => {
                     // IMPORTANT: the backward PTX's `.visible .entry` is
@@ -801,13 +831,57 @@ impl Compiler<'_> {
                         &format!("__nsl_flash_name_csha_bwd_{}", fwd_kernel_name),
                         name_bytes,
                     )?;
-                    (Some(bwd_ptx_id), Some(bwd_name_id))
+
+                    // PCA Tier B Planner: emit Tier-B-on backward variant when
+                    // `segment_masked=true` (planner spec §5.4). The Tier B
+                    // arg uses the M2/M6-measured `SegmentResidency::Shared`
+                    // and the conservative-max `TIER_B_MAX_BAKED_SEQ_LEN`.
+                    let (tier_b_ptx_id_opt, tier_b_name_id_opt) =
+                        if crate::pca_tier_b::should_emit_tier_b_at_codegen(&training_config) {
+                            let tier_b_args = Some((
+                                crate::pca_tier_b::TIER_B_MAX_BAKED_SEQ_LEN,
+                                crate::pca_segment::SegmentResidency::Shared,
+                            ));
+                            match crate::flash_attention_v2::synthesize_backward_with_tier_b(
+                                &training_config, tier_b_args,
+                            ) {
+                                Ok(on_ptx) => {
+                                    let on_name = format!(
+                                        "{}_tier_b_max{}",
+                                        bwd_kernel_name,
+                                        crate::pca_tier_b::TIER_B_MAX_BAKED_SEQ_LEN,
+                                    );
+                                    let on_ptx_id = self.embed_raw_data(
+                                        &format!("__nsl_flash_ptx_csha_bwd_{}", on_name),
+                                        on_ptx.into_bytes(),
+                                    )?;
+                                    let mut on_name_bytes = on_name.as_bytes().to_vec();
+                                    on_name_bytes.push(0);
+                                    let on_name_id = self.embed_raw_data(
+                                        &format!("__nsl_flash_name_csha_bwd_{}", on_name),
+                                        on_name_bytes,
+                                    )?;
+                                    (Some(on_ptx_id), Some(on_name_id))
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "[csha-gap-b] Tier-B-on backward PTX synthesis skipped — \
+                                         validator rejected: {e}"
+                                    );
+                                    (None, None)
+                                }
+                            }
+                        } else {
+                            (None, None)
+                        };
+
+                    (Some(bwd_ptx_id), Some(bwd_name_id), tier_b_ptx_id_opt, tier_b_name_id_opt)
                 }
                 Err(e) => {
                     eprintln!(
                         "[csha-gap-b] backward PTX synthesis skipped — validator rejected: {e}"
                     );
-                    (None, None)
+                    (None, None, None, None)
                 }
             };
 
@@ -817,6 +891,12 @@ impl Compiler<'_> {
             ctx.csha_backward_ptx_data_id = bwd_ptx_id;
             ctx.csha_backward_name_data_id = bwd_name_id;
             ctx.csha_training_config = Some(training_config);
+            // PCA Tier B Planner: Tier-B-on variant data IDs (None for non-
+            // segment_masked configs).
+            ctx.csha_with_saves_tier_b_on_ptx_id = fwd_tier_b_ptx_id;
+            ctx.csha_with_saves_tier_b_on_name_id = fwd_tier_b_name_id;
+            ctx.csha_backward_tier_b_on_ptx_id = bwd_tier_b_ptx_id;
+            ctx.csha_backward_tier_b_on_name_id = bwd_tier_b_name_id;
         }
         Ok(())
     }
@@ -1045,18 +1125,34 @@ impl Compiler<'_> {
                     )));
                 }
 
-                // Synthesize and embed PTX for this variant
+                // PCA Tier B Planner (planner spec §5): use the emission helper.
+                // Autotune variants set `segment_masked: false`, so
+                // `should_emit_tier_b_at_codegen` returns false; the helper
+                // returns only `base_ptx` and the Tier-B-on PTX is `None`.
+                // Output is byte-identical to the pre-migration selector path
+                // because both ultimately call
+                // `synthesize_flash_attention_ptx_v2_with_tier_b(config, None)`.
+                //
+                // Retain the selector kernel-name call for its diagnostic side
+                // effect (API stability).
                 let mut diags = Vec::<String>::new();
-                let ptx_bytes = crate::flash_attention_selector::synthesize_flash_attention_ptx_selected_with_diag(
+                let _ = crate::flash_attention_selector::flash_attention_kernel_name_selected_with_diag(
                     &test_config, &mut diags,
                 );
                 for d in diags { eprintln!("warning: {d}"); }
-                let mut diags = Vec::<String>::new();
-                let variant_kernel_name = crate::flash_attention_selector::flash_attention_kernel_name_selected_with_diag(
-                    &test_config, &mut diags,
-                );
-                for d in diags { eprintln!("warning: {d}"); }
-                self.embed_flash_ptx(&variant_kernel_name, ptx_bytes)?;
+                let emission =
+                    crate::pca_tier_b::emit_tier_b_variants_for_config(&test_config);
+                let variant_kernel_name = emission.base_kernel_name.clone();
+                self.embed_flash_ptx(&variant_kernel_name, emission.base_ptx)?;
+                if let (Some(on_ptx), Some(on_name)) =
+                    (emission.tier_b_on_ptx, emission.tier_b_on_kernel_name)
+                {
+                    // Defensive: autotune variants are non-segment_masked, but
+                    // honour the emission helper's output uniformly so the
+                    // (currently dead) Tier-B-on path is wired identically
+                    // to the single-config and CSHA-training paths.
+                    self.embed_flash_ptx(&on_name, on_ptx)?;
+                }
             }
 
             // Select the middle values as the primary config (fallback / default dispatch)
@@ -1132,6 +1228,23 @@ impl Compiler<'_> {
             bwd_p2_name_bytes.push(0); // null-terminate
             let bwd_p2_name_id = self.embed_raw_data("__nsl_flash_bwd_p2_name", bwd_p2_name_bytes)?;
 
+            // PCA Tier B Planner: primary autotune variant's Tier-B-on IDs
+            // (looked up from `kernel_ptx_data` if `embed_flash_ptx` registered
+            // one — non-segment_masked configs never register one, so this is
+            // always None for the autotune path today).
+            let primary_tier_b_on_name = format!(
+                "flash_{}_tier_b_max{}",
+                kernel_name,
+                crate::pca_tier_b::TIER_B_MAX_BAKED_SEQ_LEN,
+            );
+            let (tier_b_on_ptx_data_id, tier_b_on_name_data_id) = self
+                .kernels
+                .kernel_ptx_data
+                .get(&primary_tier_b_on_name)
+                .copied()
+                .map(|(p, n)| (Some(p), Some(n)))
+                .unwrap_or((None, None));
+
             Ok(Some(FlashAttentionCompileContext {
                 ptx_data_id,
                 name_data_id,
@@ -1151,6 +1264,14 @@ impl Compiler<'_> {
                 csha_backward_ptx_data_id: None,
                 csha_backward_name_data_id: None,
                 csha_training_config: None,
+                // PCA Tier B Planner: primary forward Tier-B-on IDs (always None
+                // for autotune path's non-segment_masked configs).
+                tier_b_on_ptx_data_id,
+                tier_b_on_name_data_id,
+                csha_with_saves_tier_b_on_ptx_id: None,
+                csha_with_saves_tier_b_on_name_id: None,
+                csha_backward_tier_b_on_ptx_id: None,
+                csha_backward_tier_b_on_name_id: None,
             }))
         } else {
             // No @autotune — single-config path (original behaviour)
@@ -1169,16 +1290,23 @@ impl Compiler<'_> {
                 csha: None,
             };
 
+            // PCA Tier B Planner (planner spec §5): use the emission helper.
+            // Single-config path sets `segment_masked: false`, so
+            // `should_emit_tier_b_at_codegen` returns false; the helper returns
+            // only `base_ptx`. Output is byte-identical to the pre-migration
+            // selector path because both ultimately call
+            // `synthesize_flash_attention_ptx_v2_with_tier_b(config, None)`.
+            //
+            // Retain the selector kernel-name call for its diagnostic side
+            // effect (API stability).
             let mut diags = Vec::<String>::new();
-            let ptx_bytes = crate::flash_attention_selector::synthesize_flash_attention_ptx_selected_with_diag(
+            let _ = crate::flash_attention_selector::flash_attention_kernel_name_selected_with_diag(
                 &config, &mut diags,
             );
             for d in diags { eprintln!("warning: {d}"); }
-            let mut diags = Vec::<String>::new();
-            let kernel_name = crate::flash_attention_selector::flash_attention_kernel_name_selected_with_diag(
-                &config, &mut diags,
-            );
-            for d in diags { eprintln!("warning: {d}"); }
+            let emission = crate::pca_tier_b::emit_tier_b_variants_for_config(&config);
+            let kernel_name = emission.base_kernel_name.clone();
+            let ptx_bytes = emission.base_ptx;
 
             // Embed PTX bytes in .rodata
             let ptx_data_id = self
@@ -1234,6 +1362,29 @@ impl Compiler<'_> {
                     ))
                 })?;
 
+            // Tier-B-on variant: embed only when the emission helper produced one.
+            // Single-config sets `segment_masked: false` so this branch is dead
+            // today; wired for parity with the CSHA training path.
+            let (tier_b_on_ptx_id, tier_b_on_name_id) = match (
+                emission.tier_b_on_ptx,
+                emission.tier_b_on_kernel_name,
+            ) {
+                (Some(on_ptx), Some(on_name)) => {
+                    let on_ptx_id = self.embed_raw_data(
+                        &format!("__nsl_flash_ptx_{}", on_name),
+                        on_ptx,
+                    )?;
+                    let mut on_name_bytes = on_name.as_bytes().to_vec();
+                    on_name_bytes.push(0);
+                    let on_name_id = self.embed_raw_data(
+                        &format!("__nsl_flash_name_{}", on_name),
+                        on_name_bytes,
+                    )?;
+                    (Some(on_ptx_id), Some(on_name_id))
+                }
+                _ => (None, None),
+            };
+
             // Embed backward PTX alongside forward
             let bwd_config = crate::flash_attention::FlashAttentionBackwardConfig {
                 block_q: config.block_q,
@@ -1277,6 +1428,15 @@ impl Compiler<'_> {
                 csha_backward_ptx_data_id: None,
                 csha_backward_name_data_id: None,
                 csha_training_config: None,
+                // PCA Tier B Planner: primary forward Tier-B-on IDs (`None` for
+                // non-segment_masked single-config; helper returned `None`
+                // above).
+                tier_b_on_ptx_data_id: tier_b_on_ptx_id,
+                tier_b_on_name_data_id: tier_b_on_name_id,
+                csha_with_saves_tier_b_on_ptx_id: None,
+                csha_with_saves_tier_b_on_name_id: None,
+                csha_backward_tier_b_on_ptx_id: None,
+                csha_backward_tier_b_on_name_id: None,
             }))
         }
     }
