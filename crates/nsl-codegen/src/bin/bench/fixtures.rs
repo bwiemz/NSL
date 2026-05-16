@@ -184,6 +184,19 @@ fn registry() -> Vec<Fixture> {
         sensitivity("sensitivity_10", 0.1),
         sensitivity("sensitivity_50", 0.5),
         sensitivity("sensitivity_90", 0.9),
+        // Floor-sweep tier (P-1.0 / dispatch spec §6.3). Six fixtures sharing
+        // the gate fixture's dims (block 64×64×64, segment-masked causal,
+        // sm_120, batch=4, head_dim=64, target_sparsity=0.5) and varying
+        // only `seq_len` across {128, 256, 512, 1024, 2048, 8192}. Together
+        // with `gate_4096` (seq=4096) they form the 7-point seq_len sweep
+        // that P-1 (D-2 floor derivation) consumes to map kernel-launch
+        // overhead vs sequence length.
+        floor_sweep("floor_sweep_128", 128),
+        floor_sweep("floor_sweep_256", 256),
+        floor_sweep("floor_sweep_512", 512),
+        floor_sweep("floor_sweep_1024", 1024),
+        floor_sweep("floor_sweep_2048", 2048),
+        floor_sweep("floor_sweep_8192", 8192),
     ]
 }
 
@@ -212,6 +225,36 @@ fn sensitivity(name: &'static str, target_sparsity: f64) -> Fixture {
         seq_len: 4096,
         batch: 4,
         target_sparsity,
+    }
+}
+
+/// Helper to build a floor-sweep fixture; mirrors `gate_4096`'s config
+/// (block 64×64×64, segment-masked causal, sm_120, batch=4, head_dim=64,
+/// target_sparsity=0.5) and varies only `seq_len`. Used by the P-1
+/// D-2 floor derivation (dispatch spec §6.3) which sweeps seq_len across
+/// {128, 256, 512, 1024, 2048, 4096, 8192} to characterize kernel-launch
+/// overhead as a function of sequence length. Seq=4096 reuses the
+/// existing `gate_4096` entry; the other six points are registered here.
+fn floor_sweep(name: &'static str, seq_len: u32) -> Fixture {
+    Fixture {
+        name,
+        config: FlashAttentionConfig {
+            block_q: 64,
+            block_kv: 64,
+            head_dim: 64,
+            causal: true,
+            paged: false,
+            rope_q: false,
+            rope_style: RopeStyle::HalfSplit,
+            gqa_group_size: 1,
+            tree_mask: false,
+            gpu_sm: 120,
+            segment_masked: true,
+            csha: None,
+        },
+        seq_len,
+        batch: 4,
+        target_sparsity: 0.5,
     }
 }
 
