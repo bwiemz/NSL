@@ -1343,6 +1343,14 @@ impl Compiler<'_> {
         // extra register pressure when no saves are needed.
         let csha_with_saves_ptx_id = ctx.csha_forward_with_saves_ptx_id;
         let csha_with_saves_name_id = ctx.csha_forward_with_saves_name_id;
+        // PCA Tier B Planner (planner spec §4.2): capture Tier-B-on data IDs
+        // for the inference forward and the CSHA-with-saves forward so the
+        // sentinel construction below selects `tier_b_enabled(...)` when a
+        // Tier-B-on variant exists, falling back to `tier_b_disabled_sentinel`.
+        let tier_b_on_ptx_data_id = ctx.tier_b_on_ptx_data_id;
+        let tier_b_on_name_data_id = ctx.tier_b_on_name_data_id;
+        let csha_with_saves_tier_b_on_ptx_id = ctx.csha_with_saves_tier_b_on_ptx_id;
+        let csha_with_saves_tier_b_on_name_id = ctx.csha_with_saves_tier_b_on_name_id;
         let csha_training_shmem_bytes = ctx
             .csha_training_config
             .as_ref()
@@ -1665,6 +1673,22 @@ impl Compiler<'_> {
                 // with a deterministic trap (`TrapCode::unwrap_user(3)`)
                 // instead of silently producing zero-initialised save
                 // buffers that then NaN the backward pass.
+                // PCA Tier B Planner (planner spec §4.2): construct the
+                // tier_b sentinel pair via the IR-001-disciplined helpers.
+                // The CSHA-with-saves launch consumes the with-saves Tier-B-on
+                // pair (set by `maybe_synthesize_csha_training_ptx` when the
+                // training config has `segment_masked=true`).
+                let [tier_b_ptx_arg, tier_b_name_arg] = match (
+                    csha_with_saves_tier_b_on_ptx_id,
+                    csha_with_saves_tier_b_on_name_id,
+                ) {
+                    (Some(pid), Some(nid)) => {
+                        crate::pca_tier_b::tier_b_enabled(
+                            builder, &mut self.module, pid, nid,
+                        )
+                    }
+                    _ => crate::pca_tier_b::tier_b_disabled_sentinel(builder),
+                };
                 let launch_rc = self.compile_call_by_name(
                     builder,
                     "nsl_flash_attention_csha_with_saves",
@@ -1693,6 +1717,8 @@ impl Compiler<'_> {
                         // Task 5 will route real segment_ids device pointers
                         // through the compiler's PCA detection pass.
                         null,
+                        // PCA Tier B Planner: tier_b_ptx_ptr, tier_b_name_ptr.
+                        tier_b_ptx_arg, tier_b_name_arg,
                     ],
                 )?;
                 {
@@ -1727,6 +1753,21 @@ impl Compiler<'_> {
                 // TODO: audit non-@train callers once Gap D's adjoint
                 // wiring stabilises.
             } else {
+                // PCA Tier B Planner (planner spec §4.2): construct the
+                // tier_b sentinel pair via IR-001-disciplined helpers.
+                // The plain CSHA path uses the base (inference) Tier-B-on
+                // pair (`tier_b_on_ptx_data_id` / `tier_b_on_name_data_id`).
+                let [tier_b_ptx_arg, tier_b_name_arg] = match (
+                    tier_b_on_ptx_data_id,
+                    tier_b_on_name_data_id,
+                ) {
+                    (Some(pid), Some(nid)) => {
+                        crate::pca_tier_b::tier_b_enabled(
+                            builder, &mut self.module, pid, nid,
+                        )
+                    }
+                    _ => crate::pca_tier_b::tier_b_disabled_sentinel(builder),
+                };
                 let _err = self.compile_call_by_name(
                     builder,
                     "nsl_flash_attention_csha",
@@ -1770,10 +1811,29 @@ impl Compiler<'_> {
                         // Task 5 will route real segment_ids device pointers
                         // through the compiler's PCA detection pass.
                         null,
+                        // PCA Tier B Planner: tier_b_ptx_ptr, tier_b_name_ptr.
+                        tier_b_ptx_arg, tier_b_name_arg,
                     ],
                 )?;
             }
         } else {
+            // PCA Tier B Planner (planner spec §4.2): construct the tier_b
+            // sentinel pair via IR-001-disciplined helpers. Non-CSHA inference
+            // path: forward Tier-B-on pair lives at the base
+            // `tier_b_on_ptx_data_id` / `tier_b_on_name_data_id` (always None
+            // when the FA config is non-segment_masked; runtime gate would
+            // also reject due to segment_ids_ptr=0).
+            let [tier_b_ptx_arg, tier_b_name_arg] = match (
+                tier_b_on_ptx_data_id,
+                tier_b_on_name_data_id,
+            ) {
+                (Some(pid), Some(nid)) => {
+                    crate::pca_tier_b::tier_b_enabled(
+                        builder, &mut self.module, pid, nid,
+                    )
+                }
+                _ => crate::pca_tier_b::tier_b_disabled_sentinel(builder),
+            };
             let _err = self.compile_call_by_name(
                 builder,
                 "nsl_flash_attention",
@@ -1802,6 +1862,8 @@ impl Compiler<'_> {
                     block_q_val,
                     block_kv_val,
                     causal_val,
+                    // PCA Tier B Planner: tier_b_ptx_ptr, tier_b_name_ptr.
+                    tier_b_ptx_arg, tier_b_name_arg,
                 ],
             )?;
         }

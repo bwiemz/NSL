@@ -89,6 +89,7 @@ Cited from:
 - FA-2 v2 Tier B.1 verification harness (V1/V2/V3 + cost-model snapshot).
 - BitNet Phase 1 validation harness + reference implementation.
 - `docs/superpowers/specs/2026-05-12-pca-tier-b-revision-design.md` overall §3.1 / §3.4 / §6.3 balance.
+- `docs/superpowers/specs/2026-05-15-pca-tier-b-planner-design.md` §8.10 — 1.7× test-LOC-to-implementation-LOC ratio reported observationally per IR-008's original framing (not a budget ceiling); symptom-based v2 triggers (duplicate coverage, speculative tests, over-specification of settled surfaces) are the right shape for future test-surface review, not aggregate metric thresholds.
 
 ### IR-009 — Dead-code lifecycle requires explicit removal triggers
 
@@ -115,6 +116,7 @@ Cited from:
 - `docs/superpowers/specs/2026-05-11-csha-tier-b1-pipelined-attention-design.md` — V1/V2/V3 multi-tier verification.
 - WGGO Phase 2 #134 — per-commit milestone matrix.
 - `docs/superpowers/specs/2026-05-13-pca-tier-b15-and-b2-design.md` §4 — gate/parity/sensitivity tiers unlock the "keep with sparsity gate" outcome.
+- `docs/superpowers/specs/2026-05-15-pca-tier-b-planner-design.md` §9 — third instance of distinct test surfaces rolling up into a richer decision space: V-Bii-SMEM probe's five-outcome decision matrix + per-MAX SMEM-headroom recording roll up into a four-way v2 trigger split (path A extend baked max / path B B-iii migration; from MAX=16384 unrestricted vs MAX=8192 restricted), differentiating cost from ~30 min re-probe to ~500 LOC kernel-architecture migration. (First instance: dispatch spec §13.3 sensitivity tier; second instance: this spec's trigger-space split.)
 
 ### IR-012 — Measurement-infrastructure contracts are explicit in spec, not implicit in implementation
 
@@ -124,3 +126,18 @@ Cited from:
 - `docs/superpowers/specs/2026-04-27-awq-calibration-followup-design.md` — CHANGELOG-CALIBRATION enforcement.
 - `docs/superpowers/specs/2026-05-12-tier-b-smem-probe-findings.md` — append-only re-run log.
 - `docs/superpowers/specs/2026-05-13-pca-tier-b15-and-b2-design.md` §5.2 — nsl-codegen-bench invocation contract (output line format, exit codes, `--seed`).
+
+### IR-013 — External-caller-context assumptions warrant pre-implementation verification
+
+Specs whose design depends on what callers know, pass through, or have available at call time must verify those caller-context assumptions before implementation invests against them. Distinct from IR-003's general internal-code-graph verification (NodeId space, ABI signatures, predicate operand symmetry) — IR-013 is about **external** caller behavior: the input pipelines that feed your spec's surface. Plausibility-driven design ("callers probably have X at this layer") is the failure mode this rule prevents. The verification protocol mirrors IR-003: 30-45 minute grep / read-upward / classify before the dependent code is written.
+
+Narrow framing per the surfacing spec's §13.2 reasoning: IR-013 is caller-behavior-in-the-same-codebase specifically. Three structurally distinct verification disciplines surfaced across this brainstorm cycle, each potentially warranting its own institutional rule over time:
+
+- **IR-013 (here):** Caller-behavior verification — grep call-graph, classify cases (α/β/γ), document trace.
+- **IR-014 candidate (future):** Upstream-reference verification — read external project's code, document its idiom, amend spec (pattern of V-M35.2a-STE; promote on second instance).
+- **IR-015 candidate (future):** Hardware-capability or runtime-value verification — emit forced-access probe, sweep configs, measure (pattern of SMEM probe + V-P1-D; promote on second instance).
+
+Collapsing all three into a broad IR-013 would lose diagnostic distinction. The narrow framing preserves precision; the candidate slots reserve room for the other specializations to land as their own rules when they're justified.
+
+Cited from:
+- `docs/superpowers/specs/2026-05-14-pca-tier-b-dispatch-design.md` §5 + §14 — V-dispatch-integration of PCA Tier B dispatch callers; surfaced case-(β) finding (α=0, β=3, γ=0) that invalidated the original spec's case-(α) premise and pivoted the work to a follow-on planner spec. The verification ran in 30-45 minutes and prevented ~150 LOC of D-3 implementation work that would have hit integration failure. The canonical first instance.

@@ -78,6 +78,31 @@ pub struct FlashAttentionCompileContext {
     /// re-derive kernel name / SMEM bytes / launch dims for the
     /// with-saves PTX without re-running `synthesize_*` at call sites.
     pub csha_training_config: Option<crate::flash_attention::FlashAttentionConfig>,
+    /// PCA Tier B Planner (planner spec §4 + §5): Tier-B-on PTX variant
+    /// data IDs for the inference / base forward PTX (`ptx_data_id`).
+    /// `Some` iff the base config has `segment_masked=true` (per
+    /// `should_emit_tier_b_at_codegen`). The FA call site passes the
+    /// referenced data-section addresses to the FFI's
+    /// `tier_b_ptx_ptr` / `tier_b_name_ptr` slots via the sentinel-
+    /// construction helpers (`tier_b_disabled_sentinel` /
+    /// `tier_b_enabled`); the runtime dispatcher picks the Tier-B-on
+    /// variant iff `should_dispatch_tier_b_at_runtime` returns true.
+    pub tier_b_on_ptx_data_id: Option<DataId>,
+    pub tier_b_on_name_data_id: Option<DataId>,
+    /// PCA Tier B Planner (planner spec §4 + §5): Tier-B-on variant for
+    /// the CSHA-with-saves forward PTX (`csha_forward_with_saves_ptx_id`).
+    /// Mirrors the base/Tier-B-on pairing on the training-side PTX so the
+    /// `nsl_flash_attention_csha_with_saves` launch's Tier B slot is
+    /// populated when the training config has `segment_masked=true`.
+    pub csha_with_saves_tier_b_on_ptx_id: Option<DataId>,
+    pub csha_with_saves_tier_b_on_name_id: Option<DataId>,
+    /// PCA Tier B Planner (planner spec §4 + §5): Tier-B-on variant for
+    /// the CSHA fused-backward PTX (`csha_backward_ptx_data_id`). Same
+    /// shape as the with-saves forward pairing; the backward kernel is
+    /// emitted with a Tier-B-on variant when the training config has
+    /// `segment_masked=true`.
+    pub csha_backward_tier_b_on_ptx_id: Option<DataId>,
+    pub csha_backward_tier_b_on_name_id: Option<DataId>,
 }
 
 /// A lambda body to be compiled after the current function.
