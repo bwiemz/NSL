@@ -6866,16 +6866,17 @@ mod tests {
             ptx.contains("add.u32 %mma_a_row, %mma_a_row, %ts_a_base;"),
             "A-fragment load must add the tile-base register to the row+col offset"
         );
-        // B stride = d_model.min(256) * 2 = 256 * 2 = 512 bytes.
-        // B-fragment helper has not yet been rewritten (still uses external
-        // %mma_b_row); assertions for B-frag stay on the legacy pattern.
+        // B-fragment helper post-rewrite: same self-contained per-lane
+        // derivation as A-frag. Emission stores n_col*col_stride in
+        // %mma_b_row (in-place after shr → mul) then adds k_lo bytes +
+        // base. Pattern is `mul.lo.u32 %mma_b_row, %mma_b_row, <stride>`.
         assert!(
-            ptx.contains("mul.lo.u32 %mma_addr, %mma_b_row, 512;"),
-            "B-fragment load must multiply row by the tile stride"
+            ptx.contains("mul.lo.u32 %mma_b_row, %mma_b_row, 512;"),
+            "B-fragment load must multiply n_col by the col stride"
         );
         assert!(
-            ptx.contains("add.u32 %mma_addr, %mma_addr, %ts_b_base;"),
-            "B-fragment load must add the tile-base register"
+            ptx.contains("add.u32 %mma_b_row, %mma_b_row, %ts_b_base;"),
+            "B-fragment load must add the tile-base register to the n_col+k_lo offset"
         );
     }
 

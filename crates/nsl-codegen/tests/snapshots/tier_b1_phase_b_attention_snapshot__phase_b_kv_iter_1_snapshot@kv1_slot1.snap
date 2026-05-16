@@ -38,14 +38,18 @@ expression: ptx
     add.u32 %mma_a_row, %mma_a_row, 512;  // shift to row_hi (+8 rows)
     ld.shared.b32 %tb1_qkt_a_0_1, [%mma_a_row];           // reg1 @ [row_hi, col_lo]
     ld.shared.b32 %tb1_qkt_a_0_3, [%mma_a_row + 16];      // reg3 @ [row_hi, col_lo+8]
-    // Load B-fragment (k16xn8 col-major) from shared memory
-    mul.lo.u32 %mma_addr, %mma_b_row, 64;  // row * stride
-    add.u32 %mma_addr, %mma_addr, %qkt_b_base;  // + smem base
-    ld.shared.b32 %tb1_qkt_b_0_0, [%mma_addr];
-    mul.lo.u32 %mma_addr, %mma_b_row, 64;  // row * stride
-    add.u32 %mma_addr, %mma_addr, %qkt_b_base;  // + smem base
-    add.u32 %mma_addr, %mma_addr, 16;  // + k byte offset
-    ld.shared.b32 %tb1_qkt_b_0_1, [%mma_addr];
+    // Load B-fragment (k16xn8 col-major f16) per PTX m16n8k16 spec
+    // Lane t holds: reg0=B[(t%4)*2 .. +1, t/4], reg1=B[(t%4)*2+8 .. +9, t/4]
+    mov.u32 %mma_addr, %tid.x;              // load tid
+    and.b32 %mma_addr, %mma_addr, 31;       // lane = tid & 31
+    shr.u32 %mma_b_row, %mma_addr, 2;       // n_col = lane / 4
+    mul.lo.u32 %mma_b_row, %mma_b_row, 64;  // n_col * col_stride
+    and.b32 %mma_addr, %mma_addr, 3;        // lane % 4
+    shl.b32 %mma_addr, %mma_addr, 2;        // * 4 bytes (k_lo bytes)
+    add.u32 %mma_b_row, %mma_b_row, %mma_addr;  // + k_lo bytes
+    add.u32 %mma_b_row, %mma_b_row, %qkt_b_base;  // + smem base
+    ld.shared.b32 %tb1_qkt_b_0_0, [%mma_b_row];           // reg0 @ B[k_lo, n_col]
+    ld.shared.b32 %tb1_qkt_b_0_1, [%mma_b_row + 16];      // reg1 @ B[k_lo+8, n_col]
     mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%s_acc_0_0, %s_acc_0_1, %s_acc_0_2, %s_acc_0_3},
         {%tb1_qkt_a_0_0, %tb1_qkt_a_0_1, %tb1_qkt_a_0_2, %tb1_qkt_a_0_3},
@@ -69,14 +73,18 @@ expression: ptx
     add.u32 %mma_a_row, %mma_a_row, 512;  // shift to row_hi (+8 rows)
     ld.shared.b32 %tb1_qkt_a_0_1, [%mma_a_row];           // reg1 @ [row_hi, col_lo]
     ld.shared.b32 %tb1_qkt_a_0_3, [%mma_a_row + 16];      // reg3 @ [row_hi, col_lo+8]
-    // Load B-fragment (k16xn8 col-major) from shared memory
-    mul.lo.u32 %mma_addr, %mma_b_row, 64;  // row * stride
-    add.u32 %mma_addr, %mma_addr, %qkt_b_base_k;  // + smem base
-    ld.shared.b32 %tb1_qkt_b_0_0, [%mma_addr];
-    mul.lo.u32 %mma_addr, %mma_b_row, 64;  // row * stride
-    add.u32 %mma_addr, %mma_addr, %qkt_b_base_k;  // + smem base
-    add.u32 %mma_addr, %mma_addr, 16;  // + k byte offset
-    ld.shared.b32 %tb1_qkt_b_0_1, [%mma_addr];
+    // Load B-fragment (k16xn8 col-major f16) per PTX m16n8k16 spec
+    // Lane t holds: reg0=B[(t%4)*2 .. +1, t/4], reg1=B[(t%4)*2+8 .. +9, t/4]
+    mov.u32 %mma_addr, %tid.x;              // load tid
+    and.b32 %mma_addr, %mma_addr, 31;       // lane = tid & 31
+    shr.u32 %mma_b_row, %mma_addr, 2;       // n_col = lane / 4
+    mul.lo.u32 %mma_b_row, %mma_b_row, 64;  // n_col * col_stride
+    and.b32 %mma_addr, %mma_addr, 3;        // lane % 4
+    shl.b32 %mma_addr, %mma_addr, 2;        // * 4 bytes (k_lo bytes)
+    add.u32 %mma_b_row, %mma_b_row, %mma_addr;  // + k_lo bytes
+    add.u32 %mma_b_row, %mma_b_row, %qkt_b_base_k;  // + smem base
+    ld.shared.b32 %tb1_qkt_b_0_0, [%mma_b_row];           // reg0 @ B[k_lo, n_col]
+    ld.shared.b32 %tb1_qkt_b_0_1, [%mma_b_row + 16];      // reg1 @ B[k_lo+8, n_col]
     mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%s_acc_0_0, %s_acc_0_1, %s_acc_0_2, %s_acc_0_3},
         {%tb1_qkt_a_0_0, %tb1_qkt_a_0_1, %tb1_qkt_a_0_2, %tb1_qkt_a_0_3},
@@ -207,14 +215,18 @@ expression: ptx
     add.u32 %mma_a_row, %mma_a_row, 512;  // shift to row_hi (+8 rows)
     ld.shared.b32 %tb1_pv_a_0_1, [%mma_a_row];           // reg1 @ [row_hi, col_lo]
     ld.shared.b32 %tb1_pv_a_0_3, [%mma_a_row + 16];      // reg3 @ [row_hi, col_lo+8]
-    // Load B-fragment (k16xn8 col-major) from shared memory
-    mul.lo.u32 %mma_addr, %mma_b_row, 64;  // row * stride
-    add.u32 %mma_addr, %mma_addr, %pv_b_base;  // + smem base
-    ld.shared.b32 %tb1_pv_b_0_0, [%mma_addr];
-    mul.lo.u32 %mma_addr, %mma_b_row, 64;  // row * stride
-    add.u32 %mma_addr, %mma_addr, %pv_b_base;  // + smem base
-    add.u32 %mma_addr, %mma_addr, 16;  // + k byte offset
-    ld.shared.b32 %tb1_pv_b_0_1, [%mma_addr];
+    // Load B-fragment (k16xn8 col-major f16) per PTX m16n8k16 spec
+    // Lane t holds: reg0=B[(t%4)*2 .. +1, t/4], reg1=B[(t%4)*2+8 .. +9, t/4]
+    mov.u32 %mma_addr, %tid.x;              // load tid
+    and.b32 %mma_addr, %mma_addr, 31;       // lane = tid & 31
+    shr.u32 %mma_b_row, %mma_addr, 2;       // n_col = lane / 4
+    mul.lo.u32 %mma_b_row, %mma_b_row, 64;  // n_col * col_stride
+    and.b32 %mma_addr, %mma_addr, 3;        // lane % 4
+    shl.b32 %mma_addr, %mma_addr, 2;        // * 4 bytes (k_lo bytes)
+    add.u32 %mma_b_row, %mma_b_row, %mma_addr;  // + k_lo bytes
+    add.u32 %mma_b_row, %mma_b_row, %pv_b_base;  // + smem base
+    ld.shared.b32 %tb1_pv_b_0_0, [%mma_b_row];           // reg0 @ B[k_lo, n_col]
+    ld.shared.b32 %tb1_pv_b_0_1, [%mma_b_row + 16];      // reg1 @ B[k_lo+8, n_col]
     mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%o_acc_0_0, %o_acc_0_1, %o_acc_0_2, %o_acc_0_3},
         {%tb1_pv_a_0_0, %tb1_pv_a_0_1, %tb1_pv_a_0_2, %tb1_pv_a_0_3},
@@ -238,14 +250,18 @@ expression: ptx
     add.u32 %mma_a_row, %mma_a_row, 512;  // shift to row_hi (+8 rows)
     ld.shared.b32 %tb1_pv_a_0_1, [%mma_a_row];           // reg1 @ [row_hi, col_lo]
     ld.shared.b32 %tb1_pv_a_0_3, [%mma_a_row + 16];      // reg3 @ [row_hi, col_lo+8]
-    // Load B-fragment (k16xn8 col-major) from shared memory
-    mul.lo.u32 %mma_addr, %mma_b_row, 64;  // row * stride
-    add.u32 %mma_addr, %mma_addr, %pv_b_base_k;  // + smem base
-    ld.shared.b32 %tb1_pv_b_0_0, [%mma_addr];
-    mul.lo.u32 %mma_addr, %mma_b_row, 64;  // row * stride
-    add.u32 %mma_addr, %mma_addr, %pv_b_base_k;  // + smem base
-    add.u32 %mma_addr, %mma_addr, 16;  // + k byte offset
-    ld.shared.b32 %tb1_pv_b_0_1, [%mma_addr];
+    // Load B-fragment (k16xn8 col-major f16) per PTX m16n8k16 spec
+    // Lane t holds: reg0=B[(t%4)*2 .. +1, t/4], reg1=B[(t%4)*2+8 .. +9, t/4]
+    mov.u32 %mma_addr, %tid.x;              // load tid
+    and.b32 %mma_addr, %mma_addr, 31;       // lane = tid & 31
+    shr.u32 %mma_b_row, %mma_addr, 2;       // n_col = lane / 4
+    mul.lo.u32 %mma_b_row, %mma_b_row, 64;  // n_col * col_stride
+    and.b32 %mma_addr, %mma_addr, 3;        // lane % 4
+    shl.b32 %mma_addr, %mma_addr, 2;        // * 4 bytes (k_lo bytes)
+    add.u32 %mma_b_row, %mma_b_row, %mma_addr;  // + k_lo bytes
+    add.u32 %mma_b_row, %mma_b_row, %pv_b_base_k;  // + smem base
+    ld.shared.b32 %tb1_pv_b_0_0, [%mma_b_row];           // reg0 @ B[k_lo, n_col]
+    ld.shared.b32 %tb1_pv_b_0_1, [%mma_b_row + 16];      // reg1 @ B[k_lo+8, n_col]
     mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
         {%o_acc_0_0, %o_acc_0_1, %o_acc_0_2, %o_acc_0_3},
         {%tb1_pv_a_0_0, %tb1_pv_a_0_1, %tb1_pv_a_0_2, %tb1_pv_a_0_3},
