@@ -44,11 +44,14 @@ const _: () = assert!(
     "doc_starts SMEM bake must stay well under per-CTA budget"
 );
 
-// SMEM joint bake bound: project ships kernels ptxas-clean on sm_75 (48 KB
-// usable per CTA) for forward-compat with deployed inference hardware.
-// Active development target is sm_120 (RTX 5070 Ti, 100 KB) but the floor
-// stays sm_75 — assert against the tighter bound. Matches the planner spec's
-// PCA Tier B SMEM discipline (kernel ptxas-clean on sm_75).
+// SMEM joint bake bound — CONSERVATIVE CEILING. The project ships kernels
+// ptxas-clean on sm_75 (48 KB usable per CTA). The 16384+16384 figures are
+// upper-bound ceilings for Tier B's range-table region (TIER_B_MAX_BAKED_
+// SEQ_LEN per the planner spec, PR #175) and Tier A's segment_ids region
+// (≤2*seq_len bytes at u16 packing, capped at seq_len=8192 for conservatism).
+// Actual shipped joint usage is lower; this assert protects against
+// catastrophic regression, not as a precise budget. Active development
+// target is sm_120 (RTX 5070 Ti, 100 KB) but the floor stays sm_75.
 const _: () = assert!(
     (MAX_NUM_DOCS + 1) * 4 + 16384 + 16384 < 48 * 1024,
     "Tier B + Tier A + RoPE-reset SMEM joint bake must fit sm_75 limit"
@@ -56,13 +59,18 @@ const _: () = assert!(
 
 /// Construct a sentinel-zero `doc_starts_ptr` Value at a Cranelift call site.
 /// Identity-position semantics (matches pre-spec behavior).
+#[inline]
 pub fn doc_starts_disabled_sentinel(builder: &mut FunctionBuilder<'_>) -> Value {
     builder.ins().iconst(types::I64, 0)
 }
 
 /// Construct an enabled `doc_starts_ptr` Value pointing at a device tensor.
-/// The caller is responsible for ensuring `data_id` references an i32 tensor
-/// in device memory with at least `num_docs` valid entries.
+///
+/// The caller MUST ensure `data_id` was declared with element type `i32`.
+/// This helper does NOT type-check the data — passing a `DataId` for a
+/// different element type will silently corrupt loads downstream. See
+/// the spec's §2 for the producer-side i32 invariant.
+#[inline]
 pub fn doc_starts_enabled<M: Module>(
     builder: &mut FunctionBuilder<'_>,
     module: &mut M,
@@ -210,5 +218,17 @@ mod tests {
         let inst = builder.func.dfg.value_def(v).unwrap_inst();
         let opcode = builder.func.dfg.insts[inst].opcode();
         assert_eq!(opcode.to_string(), "iconst");
+
+        // Verify value == 0 (the spec's identity-position sentinel value).
+        let inst_data = builder.func.dfg.insts[inst];
+        match inst_data {
+            cranelift_codegen::ir::InstructionData::UnaryImm { imm, .. } => {
+                assert_eq!(imm.bits(), 0, "sentinel must be value 0, got {}", imm.bits());
+            }
+            other => panic!("expected UnaryImm for iconst, got {:?}", other),
+        }
+        // Verify type is I64.
+        let result_type = builder.func.dfg.value_type(v);
+        assert_eq!(result_type, types::I64, "sentinel must be I64");
     }
 }
