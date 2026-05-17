@@ -536,7 +536,7 @@ fn emit_fused_forward_under_claim(
     let active_heads_val = builder.ins().iconst(cl_types::I64, active_heads_i64);
     let d_model_val = builder.ins().iconst(cl_types::I64, d_model_i64);
 
-    // --- 7. Emit the fused-with-saves FFI call. ---
+    // --- 7. Emit the 36-arg fused-with-saves FFI call. ---
     // PR #93 edit 4: stop silently discarding the launch rc.  Runtime
     // trap (TrapCode::unwrap_user(3)) fires when the FFI returns non-zero,
     // preventing the silent zero-fill of save buffers that cascades into
@@ -544,25 +544,20 @@ fn emit_fused_forward_under_claim(
     // through this call — not the advanced.rs one — so the diagnostic
     // must exist here too.
     //
-    // PCA Tier B Planner (planner spec §4.2): construct the tier_b sentinel
-    // pair via IR-001-disciplined helpers. The @train CSHA-with-saves launch
-    // consumes the with-saves Tier-B-on pair (when the training config has
-    // `segment_masked=true`); falls back to disabled sentinel otherwise.
-    let (with_saves_tier_b_on_ptx_id, with_saves_tier_b_on_name_id) = compiler
-        .kernels
-        .flash_attention_context
-        .as_ref()
-        .map(|c| (c.csha_with_saves_tier_b_on_ptx_id, c.csha_with_saves_tier_b_on_name_id))
-        .unwrap_or((None, None));
-    let [tier_b_ptx_arg, tier_b_name_arg] = match (
-        with_saves_tier_b_on_ptx_id,
-        with_saves_tier_b_on_name_id,
-    ) {
-        (Some(pid), Some(nid)) => crate::pca_tier_b::tier_b_enabled(
-            builder, &mut compiler.module, pid, nid,
-        ),
-        _ => crate::pca_tier_b::tier_b_disabled_sentinel(builder),
-    };
+    // PCA §4.3 Task 3+4: hoist the doc_starts sentinel into a local so
+    // the &mut FunctionBuilder borrow doesn't overlap with `call(...)`.
+    //
+    // PCA §4.3 Task 11 note — live wiring deferred. The @train fused
+    // lowering path flows through this call site; the sibling segment_ids
+    // slot is also `null` here. The packer (T2.6) emits both tensors into
+    // `packed_batch_to_dict`, but the consumer-side wiring to look them up
+    // at the FA-2 call site is independent codegen plumbing not in T11
+    // scope. Sentinel-0 stays correct until that wiring lands.
+    //
+    // TODO(rope-reset-runtime-wiring): activate when batch dict supplies
+    // doc_starts (paired with segment_ids `null` in arg list below).
+    let doc_starts_v =
+        crate::pca_rope::doc_starts_disabled_sentinel(builder);
     let launch_rc = call(
         compiler,
         builder,
@@ -588,9 +583,13 @@ fn emit_fused_forward_under_claim(
             row_max_v, row_sum_v,
             x_raw_v,
             // PCA Tier A: segment_ids_ptr — 0 for unpacked paths.
+            // Sibling call site in expr/advanced.rs documents the wiring.
             null,
-            // PCA Tier B Planner: tier_b_ptx_ptr, tier_b_name_ptr.
-            tier_b_ptx_arg, tier_b_name_arg,
+            // PCA §4.3 Task 3+4: doc_starts_ptr — sentinel 0 preserves
+            // identity-position semantics (RoPE reset disabled). Task 5
+            // will swap in a real device pointer when the packing path
+            // is detected.
+            doc_starts_v,
         ],
     )?;
     {
@@ -1522,21 +1521,13 @@ fn lower_single_op(
                     (v1, v2, v3, v4)
                 };
 
-                // PCA Tier B Planner (planner spec §4.2): non-CSHA two-phase
-                // backward never carries a Tier-B-on variant (no segment
-                // masking is structurally possible here); emit the disabled
-                // sentinel pair via the IR-001-disciplined helper.
-                let [tier_b_ptx_arg, tier_b_name_arg] =
-                    crate::pca_tier_b::tier_b_disabled_sentinel(builder);
                 let list = call(
                     compiler,
                     builder,
                     "nsl_flash_attention_backward",
                     &[dout, q, k, v, fwd_out, lse_null,
                       scale_bits, batch, heads, seq_len, head_dim,
-                      causal_val, p1_ptx, p1_name, p2_ptx, p2_name,
-                      // PCA Tier B Planner: tier_b_ptx_ptr, tier_b_name_ptr.
-                      tier_b_ptx_arg, tier_b_name_arg],
+                      causal_val, p1_ptx, p1_name, p2_ptx, p2_name],
                 )?;
                 compiler.flash_attn_bwd_cache.insert(fwd_out, list);
                 list
@@ -1877,26 +1868,22 @@ fn lower_single_op(
             // pass 0 (kernel interprets as "all heads live").
             let active_heads_val = builder.ins().iconst(cl_types::I64, 0);
 
-            // PCA Tier B Planner (planner spec §4.2): construct the tier_b
-            // sentinel pair via IR-001-disciplined helpers. The fused CSHA
-            // backward consumes the backward Tier-B-on pair (set by
-            // `maybe_synthesize_csha_training_ptx` when the training config
-            // has `segment_masked=true`).
-            let (bwd_tier_b_on_ptx_id, bwd_tier_b_on_name_id) = compiler
-                .kernels
-                .flash_attention_context
-                .as_ref()
-                .map(|c| (c.csha_backward_tier_b_on_ptx_id, c.csha_backward_tier_b_on_name_id))
-                .unwrap_or((None, None));
-            let [tier_b_ptx_arg, tier_b_name_arg] = match (
-                bwd_tier_b_on_ptx_id,
-                bwd_tier_b_on_name_id,
-            ) {
-                (Some(pid), Some(nid)) => crate::pca_tier_b::tier_b_enabled(
-                    builder, &mut compiler.module, pid, nid,
-                ),
-                _ => crate::pca_tier_b::tier_b_disabled_sentinel(builder),
-            };
+            // PCA §4.3 Task 3+4: hoist the doc_starts sentinel into a local
+            // so the &mut FunctionBuilder borrow doesn't overlap with
+            // `call(...)` (which also borrows builder mutably).
+            //
+            // PCA §4.3 Task 11 note — live wiring deferred. This is the
+            // backward (Gap D.1) call into `nsl_flash_attention_csha_backward`;
+            // the sibling segment_ids slot in the arg list is `null` as well.
+            // Activation here must stay in lockstep with the forward at
+            // line ~565 above — both kernels need the same doc_starts pointer
+            // so the de-rotation math reproduces the forward's effective_pos.
+            //
+            // TODO(rope-reset-runtime-wiring): activate when batch dict
+            // supplies doc_starts (paired with segment_ids `null` below).
+            let doc_starts_v =
+                crate::pca_rope::doc_starts_disabled_sentinel(builder);
+
             let _rc = call(
                 compiler,
                 builder,
@@ -1935,8 +1922,11 @@ fn lower_single_op(
                     // Unpacked backward launches pass 0; segment_masked=true
                     // kernels will receive a real pointer once Task 5 wires it.
                     null,
-                    // PCA Tier B Planner: tier_b_ptx_ptr, tier_b_name_ptr.
-                    tier_b_ptx_arg, tier_b_name_arg,
+                    // PCA §4.3 Task 3+4: doc_starts_ptr trailing slot.
+                    // Sentinel 0 preserves identity-position semantics for the
+                    // backward kernel as well (matches the forward's reset
+                    // policy on the same launch).
+                    doc_starts_v,
                 ],
             )?;
 

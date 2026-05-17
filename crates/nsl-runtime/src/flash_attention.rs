@@ -509,6 +509,13 @@ pub extern "C" fn nsl_flash_attention_csha(
     // Tier B extension (planner spec §4):
     tier_b_ptx_ptr: i64,
     tier_b_name_ptr: i64,
+    // PCA §4.3: doc_starts device pointer for packed-sequence training
+    // with document-aware RoPE position reset. Per-row layout —
+    // [batch_size, MAX_NUM_DOCS+1] i32 tensor, total batch_size * 1028
+    // bytes. Pass 0 to disable (identity positions). When non-zero,
+    // kernel computes row offset as batch_idx * (MAX_NUM_DOCS+1) and
+    // loads only its row's 1028-byte subtable. See spec §3.
+    doc_starts_ptr: i64,
 ) -> i64 {
     use crate::pca_tier_b_runtime::{
         assert_tier_b_sentinels, should_dispatch_tier_b_at_runtime,
@@ -624,8 +631,11 @@ pub extern "C" fn nsl_flash_attention_csha(
         let mut xraw: u64 = 0;
         // PCA Tier A: segment_ids slot (trailing — matches prelude params Vec order).
         let mut seg_ids = segment_ids_ptr as u64;
+        // PCA §4.3: doc_starts slot (trailing — matches prelude params Vec order).
+        // Sentinel 0 = identity positions (RoPE reset disabled).
+        let mut doc_starts = doc_starts_ptr as u64;
 
-        let args: [*mut c_void; 37] = [
+        let args: [*mut c_void; 38] = [
             &mut q as *mut _ as *mut c_void,
             &mut k as *mut _ as *mut c_void,
             &mut v as *mut _ as *mut c_void,
@@ -666,6 +676,8 @@ pub extern "C" fn nsl_flash_attention_csha(
             &mut xraw as *mut _ as *mut c_void,
             // PCA Tier A: segment_ids slot (trailing — matches prelude params Vec order)
             &mut seg_ids as *mut _ as *mut c_void,
+            // PCA §4.3: doc_starts slot (trailing — matches prelude params Vec order)
+            &mut doc_starts as *mut _ as *mut c_void,
         ];
 
         let result = crate::cuda::inner::kernel_launch(
@@ -710,8 +722,8 @@ pub extern "C" fn nsl_flash_attention_csha(
         let _ = (cos_ptr, sin_ptr, seq_ids_ptr, seq_lens_ptr);
         let _ = (shared_mem_bytes, ptx_ptr, name_ptr, block_q, _block_kv, causal);
         let _ = (x_ptr, norm_weight_ptr, wq_ptr, wk_ptr, wv_ptr, wo_ptr);
-        let _ = (rmsnorm_eps_bits, active_heads, d_model, segment_ids_ptr);
-        let _ = (effective_ptx_ptr, effective_name_ptr);
+        let _ = (rmsnorm_eps_bits, active_heads, d_model, segment_ids_ptr, doc_starts_ptr);
+        let _ = (tier_b_ptx_ptr, tier_b_name_ptr, effective_ptx_ptr, effective_name_ptr);
         eprintln!("[nsl] CSHA FlashAttention requires CUDA; non-CUDA build cannot launch.");
         -1
     }
@@ -792,6 +804,13 @@ pub extern "C" fn nsl_flash_attention_csha_with_saves(
     // Tier B extension (planner spec §4):
     tier_b_ptx_ptr: i64,
     tier_b_name_ptr: i64,
+    // PCA §4.3: doc_starts device pointer for packed-sequence training
+    // with document-aware RoPE position reset. Per-row layout —
+    // [batch_size, MAX_NUM_DOCS+1] i32 tensor, total batch_size * 1028
+    // bytes. Pass 0 to disable (identity positions). When non-zero,
+    // kernel computes row offset as batch_idx * (MAX_NUM_DOCS+1) and
+    // loads only its row's 1028-byte subtable. See spec §3.
+    doc_starts_ptr: i64,
 ) -> i64 {
     use crate::pca_tier_b_runtime::{
         assert_tier_b_sentinels, should_dispatch_tier_b_at_runtime,
@@ -878,8 +897,11 @@ pub extern "C" fn nsl_flash_attention_csha_with_saves(
         let mut xraw = x_raw_ptr as u64;
         // PCA Tier A: segment_ids slot (trailing — matches prelude params Vec order).
         let mut seg_ids = segment_ids_ptr as u64;
+        // PCA §4.3: doc_starts slot (trailing — matches prelude params Vec order).
+        // Sentinel 0 = identity positions (RoPE reset disabled).
+        let mut doc_starts = doc_starts_ptr as u64;
 
-        let args: [*mut c_void; 37] = [
+        let args: [*mut c_void; 38] = [
             &mut q as *mut _ as *mut c_void,
             &mut k as *mut _ as *mut c_void,
             &mut v as *mut _ as *mut c_void,
@@ -918,6 +940,8 @@ pub extern "C" fn nsl_flash_attention_csha_with_saves(
             &mut xraw as *mut _ as *mut c_void,
             // PCA Tier A: segment_ids slot (trailing — matches prelude params Vec order)
             &mut seg_ids as *mut _ as *mut c_void,
+            // PCA §4.3: doc_starts slot (trailing — matches prelude params Vec order)
+            &mut doc_starts as *mut _ as *mut c_void,
         ];
 
         // NSL_CSHA_DUMP_GRADS=1 forward-side diag: read the PTX kernel name
@@ -1047,8 +1071,8 @@ pub extern "C" fn nsl_flash_attention_csha_with_saves(
         let _ = (shared_mem_bytes, ptx_ptr, name_ptr, block_q, _block_kv, causal);
         let _ = (x_ptr, norm_weight_ptr, wq_ptr, wk_ptr, wv_ptr, wo_ptr);
         let _ = (rmsnorm_eps_bits, active_heads, d_model);
-        let _ = (q_proj_ptr, k_proj_ptr, v_proj_ptr, row_max_ptr, row_sum_ptr, x_raw_ptr, segment_ids_ptr);
-        let _ = (effective_ptx_ptr, effective_name_ptr);
+        let _ = (q_proj_ptr, k_proj_ptr, v_proj_ptr, row_max_ptr, row_sum_ptr, x_raw_ptr, segment_ids_ptr, doc_starts_ptr);
+        let _ = (tier_b_ptx_ptr, tier_b_name_ptr, effective_ptx_ptr, effective_name_ptr);
         eprintln!("[nsl] CSHA FlashAttention w/ saves requires CUDA.");
         -1
     }
@@ -1137,6 +1161,13 @@ pub extern "C" fn nsl_flash_attention_csha_backward(
     // Tier B extension (planner spec §4):
     tier_b_ptx_ptr: i64,
     tier_b_name_ptr: i64,
+    // PCA §4.3: doc_starts device pointer for packed-sequence training
+    // with document-aware RoPE position reset. Per-row layout —
+    // [batch_size, MAX_NUM_DOCS+1] i32 tensor, total batch_size * 1028
+    // bytes. Pass 0 to disable (identity positions). When non-zero,
+    // kernel computes row offset as batch_idx * (MAX_NUM_DOCS+1) and
+    // loads only its row's 1028-byte subtable. See spec §3.
+    doc_starts_ptr: i64,
 ) -> i64 {
     use crate::pca_tier_b_runtime::{
         assert_tier_b_sentinels, should_dispatch_tier_b_at_runtime,
@@ -1250,6 +1281,9 @@ pub extern "C" fn nsl_flash_attention_csha_backward(
         // (not an NslTensor handle). Null on unpacked launches; the
         // segment_masked kernel variant reads it only when set.
         let mut seg_ids = segment_ids_ptr as u64;
+        // PCA §4.3: doc_starts device pointer — raw pass-through.
+        // Sentinel 0 = identity positions (RoPE reset disabled).
+        let mut doc_starts = doc_starts_ptr as u64;
 
         // Option A f32 scratch for dK/dV: accumulate in f32 to avoid the
         // f16-HBM saturation-to-inf that plagued the naive ld-add-store
@@ -1277,7 +1311,7 @@ pub extern "C" fn nsl_flash_attention_csha_backward(
         let mut dk_scratch = dk_scratch_raw as u64;
         let mut dv_scratch = dv_scratch_raw as u64;
 
-        let args: [*mut c_void; 48] = [
+        let args: [*mut c_void; 49] = [
             &mut q as *mut _ as *mut c_void,
             &mut k as *mut _ as *mut c_void,
             &mut v as *mut _ as *mut c_void,
@@ -1329,6 +1363,8 @@ pub extern "C" fn nsl_flash_attention_csha_backward(
             &mut dv_scratch as *mut _ as *mut c_void,
             // PCA Tier A Task 4B: segment_ids trailing slot.
             &mut seg_ids as *mut _ as *mut c_void,
+            // PCA §4.3: doc_starts trailing slot.
+            &mut doc_starts as *mut _ as *mut c_void,
         ];
 
         // The backward kernel is launched one q-block at a time with the
@@ -1471,8 +1507,8 @@ pub extern "C" fn nsl_flash_attention_csha_backward(
         let _ = (rmsnorm_eps_bits, active_heads, d_model);
         let _ = (q_proj_ptr, k_proj_ptr, v_proj_ptr, row_max_ptr, row_sum_ptr, x_raw_ptr);
         let _ = (do_ptr, dq_ptr, dk_ptr, dv_ptr, dwq_ptr, dwk_ptr, dwv_ptr, dx_ptr, dx_norm_ptr);
-        let _ = segment_ids_ptr;
-        let _ = (effective_ptx_ptr, effective_name_ptr);
+        let _ = (segment_ids_ptr, doc_starts_ptr);
+        let _ = (tier_b_ptx_ptr, tier_b_name_ptr, effective_ptx_ptr, effective_name_ptr);
         eprintln!("[nsl] CSHA backward requires CUDA.");
         -1
     }
@@ -3647,6 +3683,8 @@ mod tests {
             0,
             // PCA Tier B Planner: tier_b sentinel pair (both zero = disabled).
             0, 0,
+            // PCA §4.3: doc_starts_ptr (0 = identity positions).
+            0,
         );
         assert_eq!(r, -1, "non-CUDA build must return -1 for the CSHA FFI");
     }
@@ -3694,17 +3732,17 @@ mod tests {
         assert_eq!(a4_effective_heads(8, 8), 8);
     }
 
-    /// Smoke test: the CSHA FFI symbol resolves and the full parameter
-    /// signature is wired correctly through the `extern "C"` ABI.
-    /// This catches A.2.5 signature regressions (e.g. an accidentally
-    /// dropped extras arg) at link time — the forwarder version would
-    /// have silently ignored wrong-count calls.
-    /// Updated in PCA Tier A Task 3C: one trailing segment_ids_ptr added.
+    /// Smoke test: the CSHA FFI symbol resolves and the parameter signature
+    /// is wired correctly through the `extern "C"` ABI. This catches A.2.5
+    /// signature regressions (e.g. an accidentally dropped extras arg) at
+    /// link time — the forwarder version would have silently ignored
+    /// wrong-count calls.
+    /// Updated in PCA Tier A Task 3C: trailing segment_ids_ptr added.
     /// Updated in PCA Tier B Planner P-3.4: two trailing tier_b_* params added.
+    /// Updated in PCA §4.3 Task 3: trailing doc_starts_ptr added.
     #[test]
     #[cfg(not(feature = "cuda"))]
     fn a25_csha_ffi_signature_has_thirty_params() {
-        // Type-check: compiler enforces the full 36-arg signature.
         let _: extern "C" fn(
             i64, i64, i64, i64, i64, i64,
             i64, i64, i64, i64,
@@ -3719,6 +3757,8 @@ mod tests {
             i64,
             // PCA Tier B Planner: tier_b_ptx_ptr, tier_b_name_ptr
             i64, i64,
+            // PCA §4.3: doc_starts_ptr
+            i64,
         ) -> i64 = nsl_flash_attention_csha;
     }
 }

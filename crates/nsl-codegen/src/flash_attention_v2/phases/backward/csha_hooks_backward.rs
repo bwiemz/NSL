@@ -175,6 +175,18 @@ pub fn emit_xnorm_recompute(ptx: &mut String, config: &FlashAttentionConfig) {
 /// `pairs_per_lane = ceil(total/128)` each. V is never rotated (matches
 /// forward's Adjacent-layout epilogue).
 ///
+/// PCA §4.3 RoPE-reset (T9 sites 3+4): when
+/// `config.segment_masked && config.rope_q`, the cos/sin index (cs_idx)
+/// is rerouted through `%r_effective_pos_<q|k>` instead of the raw
+/// tile-local row. The SMEM dQ/dK tile addressing keeps using the
+/// tile-local row in `%rd33` — the two registers are deliberately
+/// decoupled so SMEM addressing stays correct after the cs_idx reroute.
+/// effective_pos = abs_row - smem_doc_starts[seg_ids[abs_row]] where
+/// abs_row = (q_start | k_start) + tile_local_row. The de-rotation
+/// must use bit-identical effective_pos to the forward so gradients
+/// flow back correctly through document-reset positions.
+/// Sentinel-disabled paths (segment_masked=false) are byte-stable.
+///
 /// No-op when `rope_q=false` or `csha=None`.
 pub fn emit_drope(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
     if config.csha.is_none() || !config.rope_q {
@@ -187,6 +199,9 @@ pub fn emit_drope(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: 
     let block_kv = config.block_kv as u32;
     let dq_off = backward_dq_offset(config);
     let dk_off = backward_dk_offset(config);
+    // PCA §4.3 RoPE-reset gate (T9): only the backward dQ+dK rotation sites
+    // emit the doc_starts lookup. Mirrors the forward T7+T8 gate.
+    let reset_active = config.segment_masked && config.rope_q;
 
     ptx.push_str(&format!(
         "    // Tier C backward dRoPE on dQ/dK gradient tiles \
@@ -243,7 +258,55 @@ pub fn emit_drope(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: 
             // cos/sin addr: cos_ptr + ((q_start + row) * half + pair_in_row)*2
             // (f16 stride). For K tile we use row directly against kv_start=0
             // in the smoke scope; matching emit_rope_pair_sweep's q_start use.
-            if label == "Q" {
+            //
+            // PCA §4.3 RoPE-reset (T9 site 3 Q / site 4 K): when reset_active,
+            // route the cs row through `%r_effective_pos_<q|k>` instead of
+            // the raw abs_row. SMEM addressing for dQ/dK below stays on the
+            // tile-local `%rd33` (deliberately decoupled — same lesson as
+            // the forward T7+T8). effective_pos = abs_row - smem_doc_starts
+            // [seg_ids[abs_row]]; bit-identical to the forward formula.
+            if reset_active {
+                let (site, eff_pos_reg, base_reg) = if label == "Q" {
+                    (3, "%r_effective_pos_q", "%q_start")
+                } else {
+                    // K-side abs_pos uses k_start; the backward prelude sets
+                    // k_start=0 for the single-KV-tile config, but use the
+                    // register so wider configs land safely.
+                    (4, "%r_effective_pos_k", "%k_start")
+                };
+                ptx.push_str(&format!(
+                    "    // PCA §4.3 site {site}: backward {label} effective_pos\n"
+                ));
+                // abs_row = (row narrowed to u32) + (base narrowed to u32).
+                ptx.push_str("    cvt.u32.u64 %r_abs_pos, %rd33;\n");
+                ptx.push_str(&format!("    cvt.u32.u64 %r_doc_starts_byte_off, {base_reg};\n"));
+                ptx.push_str("    add.u32 %r_abs_pos, %r_abs_pos, %r_doc_starts_byte_off;\n");
+                // sid = segment_ids[abs_row] from %seg_base (u16 entries; backward
+                // embeds seg_smem at the tail of the extern shmem region, so
+                // %seg_base is a generic-space u64 address — same load pattern
+                // as the forward's seg_smem cvta.shared base).
+                ptx.push_str("    mul.lo.u32 %r_doc_starts_byte_off, %r_abs_pos, 2;\n");
+                ptx.push_str("    cvt.u64.u32 %rd_doc_smem_addr, %r_doc_starts_byte_off;\n");
+                ptx.push_str("    add.u64 %rd_doc_smem_addr, %seg_base, %rd_doc_smem_addr;\n");
+                ptx.push_str("    ld.shared.u16 %rs_doc_seg, [%rd_doc_smem_addr];\n");
+                ptx.push_str("    cvt.u32.u16 %r_doc_starts_idx, %rs_doc_seg;\n");
+                // doc_start = smem_doc_starts[sid] (i32, 4 bytes per entry).
+                ptx.push_str("    mul.lo.u32 %r_doc_starts_byte_off, %r_doc_starts_idx, 4;\n");
+                ptx.push_str("    cvta.shared.u64 %r_doc_smem_base, smem_doc_starts;\n");
+                ptx.push_str("    cvt.u64.u32 %rd_doc_smem_addr, %r_doc_starts_byte_off;\n");
+                ptx.push_str("    add.u64 %rd_doc_smem_addr, %r_doc_smem_base, %rd_doc_smem_addr;\n");
+                ptx.push_str("    ld.shared.s32 %r_doc_start, [%rd_doc_smem_addr];\n");
+                // effective_pos = abs_row - doc_start (s32; non-negative under packing invariants).
+                ptx.push_str(&format!(
+                    "    sub.s32 {eff_pos_reg}, %r_abs_pos, %r_doc_start;\n"
+                ));
+                // Zero-extend effective_pos into %rd35 (cs row register).
+                // effective_pos is non-negative under the packing invariants
+                // (see pca_rope::plan), so a u32→u64 cvt is sufficient.
+                ptx.push_str(&format!(
+                    "    cvt.u64.u32 %rd35, {eff_pos_reg};\n"
+                ));
+            } else if label == "Q" {
                 ptx.push_str("    add.u64 %rd35, %rd33, %q_start;\n");
             } else {
                 // K tile: kv rows start at 0 for the configs this first cut

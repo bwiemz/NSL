@@ -1,0 +1,60 @@
+//! CFTP §4.3 — Layer 3 on-GPU smoke test scaffold.
+//!
+//! Launches a 2-doc packed config on a real GPU and compares against the
+//! Layer 2 CPU reference. Gated on `cfg(feature = "cuda")` AND the
+//! `NSL_GPU_SMOKE` env var so it doesn't run in default CI.
+//!
+//! The current state: the full launch + comparison is gated on a future
+//! on-GPU harness hookup (the codegen path is ready but the dataloader
+//! wiring for doc_starts is documented as a follow-on per T11). This
+//! file lands as a scaffold so the harness target is clear.
+
+#![cfg(feature = "cuda")]
+
+use nsl_codegen::flash_attention::{CshaExtras, FlashAttentionConfig, RopeStyle};
+use nsl_codegen::flash_attention_v2::synthesize_flash_attention_ptx_v2;
+use nsl_runtime::packing::build_segment_ids_and_doc_starts;
+
+fn smoke_config() -> FlashAttentionConfig {
+    FlashAttentionConfig {
+        block_q: 32,
+        block_kv: 32,
+        head_dim: 32,
+        causal: true,
+        paged: false,
+        rope_q: true,
+        rope_style: RopeStyle::HalfSplit,
+        gqa_group_size: 1,
+        tree_mask: false,
+        gpu_sm: 75,
+        segment_masked: true,
+        csha: Some(CshaExtras::default()),
+    }
+}
+
+#[test]
+fn two_doc_packed_e2e_scaffold() {
+    // Skip if NSL_GPU_SMOKE is not set (default — keeps CI quiet).
+    if std::env::var("NSL_GPU_SMOKE").is_err() {
+        eprintln!("skipped — set NSL_GPU_SMOKE=1 to run on-GPU smoke tests");
+        return;
+    }
+
+    let cfg = smoke_config();
+    let ptx = synthesize_flash_attention_ptx_v2(&cfg);
+    assert!(!ptx.is_empty(), "PTX must synthesize");
+
+    // Allocate 2-doc packed batch (this row's doc_lengths = [4, 4]).
+    let (segment_ids, doc_starts) = build_segment_ids_and_doc_starts(&[4u32, 4u32]);
+    assert_eq!(segment_ids.len(), 8);
+    assert_eq!(doc_starts[0], 0);
+    assert_eq!(doc_starts[1], 4);
+    assert_eq!(doc_starts[2], 8);
+    assert_eq!(doc_starts[3], -1);
+
+    // Full launch + numerical comparison vs CPU reference is gated on
+    // dataloader-to-FA2-call-site wiring (T11 documented as deferred —
+    // bc84acf5). When that lands, this scaffold expands to a real launch
+    // and a `assert!((gpu_out - cpu_ref).abs().max() < 5e-3)` style check.
+    eprintln!("on-GPU smoke scaffold ready; full launch pending T11 follow-on");
+}

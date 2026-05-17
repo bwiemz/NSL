@@ -1027,9 +1027,6 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
             types::I64,
             types::I64, // block_q, block_kv
             types::I64, // causal (0=false, 1=true)
-            // Tier B extension (planner spec §4):
-            types::I64, // tier_b_ptx_ptr
-            types::I64, // tier_b_name_ptr
         ],
         Some(types::I64),
     ),
@@ -1061,9 +1058,8 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
             types::I64, // d_model
             // PCA Tier A: segment_ids device pointer (0 = unpacked path)
             types::I64, // segment_ids_ptr
-            // Tier B extension (planner spec §4):
-            types::I64, // tier_b_ptx_ptr
-            types::I64, // tier_b_name_ptr
+            // PCA §4.3: doc_starts device pointer (0 = identity positions)
+            types::I64, // doc_starts_ptr
         ],
         Some(types::I64),
     ),
@@ -1103,9 +1099,8 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
             types::I64, // x_raw_ptr
             // PCA Tier A: segment_ids device pointer (0 = unpacked path)
             types::I64, // segment_ids_ptr
-            // Tier B extension (planner spec §4):
-            types::I64, // tier_b_ptx_ptr
-            types::I64, // tier_b_name_ptr
+            // PCA §4.3: doc_starts device pointer (0 = identity positions)
+            types::I64, // doc_starts_ptr
         ],
         Some(types::I64),
     ),
@@ -1178,9 +1173,7 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
             types::I64,                         // dx
             types::I64,                         // dx_norm (Gap I.5)
             types::I64,                         // segment_ids_ptr (PCA Tier A Task 4B)
-            // Tier B extension (planner spec §4):
-            types::I64,                         // tier_b_ptx_ptr
-            types::I64,                         // tier_b_name_ptr
+            types::I64,                         // doc_starts_ptr (PCA §4.3 Task 3)
         ],
         Some(types::I64),
     ),
@@ -1200,9 +1193,6 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
             types::I64, // phase1_name_ptr
             types::I64, // phase2_ptx_ptr
             types::I64, // phase2_name_ptr
-            // Tier B extension (planner spec §4):
-            types::I64, // tier_b_ptx_ptr
-            types::I64, // tier_b_name_ptr
         ],
         Some(types::I64),
     ),
@@ -1231,9 +1221,6 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
             types::I64, // ptx_ptr, name_ptr
             types::I64,
             types::I64, // block_q, block_kv
-            // Tier B extension (planner spec §4):
-            types::I64, // tier_b_ptx_ptr
-            types::I64, // tier_b_name_ptr
         ],
         Some(types::I64),
     ),

@@ -1150,6 +1150,7 @@ pub fn emit_rope_epilogue(ptx: &mut String, config: &FlashAttentionConfig, q_til
     // pre-pass completes (before the S-compute loop).
     emit_rope_pair_sweep(
         ptx,
+        config,
         q_tile_iter,
         "Q",
         "%q_smem_base",
@@ -1214,6 +1215,7 @@ pub fn emit_rope_k_epilogue(ptx: &mut String, config: &FlashAttentionConfig) {
 
     emit_rope_pair_sweep(
         ptx,
+        config,
         0, // not per-q_iter; runs once for the whole K tile
         "K",
         "%k_smem_base",
@@ -1241,9 +1243,20 @@ pub fn emit_rope_k_epilogue(ptx: &mut String, config: &FlashAttentionConfig) {
 ///
 /// All SMEM addresses are precomputed into u64 registers before use
 /// (bracket-register-arithmetic rejected by ptxas).
+///
+/// PCA §4.3 RoPE-reset (T7 forward Q / T8 forward K): when
+/// `config.segment_masked && config.rope_q`, the cos/sin index (cs_idx)
+/// is rerouted through `%r_effective_pos_<q|k>` instead of the raw
+/// tile-local row. The SMEM tile addressing (`%r_rope_smem_row_off`)
+/// keeps using the tile-local `%r_rope_row` — the two registers are
+/// deliberately decoupled so SMEM addressing stays correct after the
+/// cs_idx reroute. effective_pos = (q_start + tile_local_row)
+///                                  - smem_doc_starts[seg_ids[abs_row]].
+/// Sentinel-disabled paths (segment_masked=false) are byte-stable.
 #[allow(clippy::too_many_arguments)]
 fn emit_rope_pair_sweep(
     ptx: &mut String,
+    config: &FlashAttentionConfig,
     q_tile_iter: u32,
     tile_label: &str,    // "Q" or "K"
     smem_base_reg: &str, // "%q_smem_base" or "%k_smem_base"
@@ -1253,6 +1266,18 @@ fn emit_rope_pair_sweep(
     pairs_per_lane: u32,
 ) {
     let tl = tile_label; // short alias for label generation
+    // PCA §4.3 RoPE-reset gate: only the forward Q+K rotation sites (T7+T8)
+    // emit the doc_starts lookup. tile_label drives which effective_pos
+    // register name is used (Q vs K-side).
+    let reset_active = config.segment_masked && config.rope_q;
+    let effective_pos_reg = match tile_label {
+        "Q" => "%r_effective_pos_q",
+        "K" => "%r_effective_pos_k",
+        // Defensive: emit_rope_pair_sweep is only ever called with "Q" or "K"
+        // from the two epilogues; an unexpected label would silently fall
+        // through to the non-reset cs_idx (no semantic effect) but flag it.
+        other => panic!("emit_rope_pair_sweep: unexpected tile_label {other:?}, expected Q or K"),
+    };
     ptx.push_str(&format!(
         "    // A.2.4 RoPE {tl} sweep: block_q={block_q}, half_dim={half_dim}, pairs_per_lane={pairs_per_lane}\n"
     ));
@@ -1286,11 +1311,59 @@ fn emit_rope_pair_sweep(
         "    rem.u32 %r_rope_dim_pair, %r_rope_pair_idx, {half_dim};\n"
     ));
 
+    // PCA §4.3 RoPE-reset (T7 Q / T8 K): compute effective_pos for cs_idx.
+    //   abs_row       = q_start (u64 → u32) + tile_local_row   (Q and K
+    //                   share q_start in the fused path: the K pre-pass
+    //                   writes K rows at q_start + warp_row, so the SMEM
+    //                   tile-local row offsets match absolute positions
+    //                   under the single-tile assumption that the fused
+    //                   path inherits from the symmetric path.)
+    //   sid           = segment_ids[abs_row]   (read from seg_smem; u16)
+    //   doc_start     = smem_doc_starts[sid]   (read from smem_doc_starts; s32)
+    //   effective_pos = abs_row - doc_start    (s32 result; non-negative
+    //                   under the packing invariants from pca_rope::plan)
+    //
+    // %r_rope_row is left unchanged so the SMEM offset computation below
+    // (mul.lo.u32 %r_rope_smem_row_off, %r_rope_row, head_dim*2) still
+    // addresses the correct tile-local row.
+    if reset_active {
+        ptx.push_str(&format!(
+            "    // PCA §4.3 site {site}: forward {tl} effective_pos\n",
+            site = if tl == "Q" { 1 } else { 2 }
+        ));
+        // abs_row = (q_start narrowed to u32) + tile_local_row.
+        ptx.push_str("    cvt.u32.u64 %r_abs_pos, %q_start;\n");
+        ptx.push_str("    add.u32 %r_abs_pos, %r_abs_pos, %r_rope_row;\n");
+        // sid = segment_ids[abs_row] from seg_smem (u16 entries).
+        ptx.push_str("    mul.lo.u32 %r_doc_starts_byte_off, %r_abs_pos, 2;\n");
+        ptx.push_str("    cvt.u64.u32 %rd_doc_smem_addr, %r_doc_starts_byte_off;\n");
+        ptx.push_str("    add.u64 %rd_doc_smem_addr, %seg_base, %rd_doc_smem_addr;\n");
+        ptx.push_str("    ld.shared.u16 %rs_doc_seg, [%rd_doc_smem_addr];\n");
+        ptx.push_str("    cvt.u32.u16 %r_doc_starts_idx, %rs_doc_seg;\n");
+        // doc_start = smem_doc_starts[sid] (i32, 4 bytes per entry).
+        ptx.push_str("    mul.lo.u32 %r_doc_starts_byte_off, %r_doc_starts_idx, 4;\n");
+        ptx.push_str("    cvta.shared.u64 %r_doc_smem_base, smem_doc_starts;\n");
+        ptx.push_str("    cvt.u64.u32 %rd_doc_smem_addr, %r_doc_starts_byte_off;\n");
+        ptx.push_str("    add.u64 %rd_doc_smem_addr, %r_doc_smem_base, %rd_doc_smem_addr;\n");
+        ptx.push_str("    ld.shared.s32 %r_doc_start, [%rd_doc_smem_addr];\n");
+        // effective_pos = abs_row - doc_start (s32; abs_row reinterpreted via mov).
+        ptx.push_str(&format!(
+            "    sub.s32 {effective_pos_reg}, %r_abs_pos, %r_doc_start;\n"
+        ));
+    }
+
     // cos/sin HBM address:
     //   byte_offset = (row * half_dim + dim_pair) * 2   (f16 = 2 bytes)
     //   row * half_dim + dim_pair
+    //
+    // When PCA §4.3 RoPE-reset is active the cs_idx is computed against
+    // effective_pos (which encodes the document-relative position) instead
+    // of the tile-local row, so packed-batch positions wrap back to 0 at
+    // each document boundary. SMEM addressing further below still uses
+    // %r_rope_row.
+    let cs_row_reg = if reset_active { effective_pos_reg } else { "%r_rope_row" };
     ptx.push_str(&format!(
-        "    mul.lo.u32 %r_rope_cs_off, %r_rope_row, {half_dim};\n"
+        "    mul.lo.u32 %r_rope_cs_off, {cs_row_reg}, {half_dim};\n"
     ));
     ptx.push_str("    add.u32 %r_rope_cs_off, %r_rope_cs_off, %r_rope_dim_pair;\n");
     ptx.push_str("    cvt.u64.u32 %rd_rope_cs_idx, %r_rope_cs_off;\n");
