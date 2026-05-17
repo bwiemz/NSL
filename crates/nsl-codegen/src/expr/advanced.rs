@@ -1658,6 +1658,12 @@ impl Compiler<'_> {
                 let save_shmem_val = builder
                     .ins()
                     .iconst(cl_types::I64, csha_training_shmem_bytes);
+                // PCA §4.3 Task 3+4: hoist the doc_starts sentinel value into
+                // a local before the call so the &mut FunctionBuilder borrow
+                // doesn't overlap with the &mut self.compile_call_by_name
+                // borrow on the same scope.
+                let doc_starts_v =
+                    crate::pca_rope::doc_starts_disabled_sentinel(builder);
                 // PR #93 edit 4: stop silently discarding the launch rc.
                 // Previously bound to `_err` and dropped; now we emit a
                 // runtime `brif rc != 0 → trap` so an INVALID_PTX or
@@ -1693,6 +1699,12 @@ impl Compiler<'_> {
                         // Task 5 will route real segment_ids device pointers
                         // through the compiler's PCA detection pass.
                         null,
+                        // PCA §4.3 Task 3+4: doc_starts_ptr — sentinel 0
+                        // preserves identity-position semantics; the kernel
+                        // routes through the existing RoPE path unchanged.
+                        // Task 5 will swap in a real device pointer when the
+                        // compiler detects a packed-sequence training launch.
+                        doc_starts_v,
                     ],
                 )?;
                 {
@@ -1727,6 +1739,12 @@ impl Compiler<'_> {
                 // TODO: audit non-@train callers once Gap D's adjoint
                 // wiring stabilises.
             } else {
+                // PCA §4.3 Task 3+4: hoist the doc_starts sentinel value into
+                // a local before the call so the &mut FunctionBuilder borrow
+                // doesn't overlap with the &mut self.compile_call_by_name
+                // borrow on the same scope.
+                let doc_starts_v =
+                    crate::pca_rope::doc_starts_disabled_sentinel(builder);
                 let _err = self.compile_call_by_name(
                     builder,
                     "nsl_flash_attention_csha",
@@ -1770,6 +1788,11 @@ impl Compiler<'_> {
                         // Task 5 will route real segment_ids device pointers
                         // through the compiler's PCA detection pass.
                         null,
+                        // PCA §4.3 Task 3+4: doc_starts_ptr — sentinel 0
+                        // preserves identity-position semantics (RoPE reset
+                        // disabled). Task 5 will swap in a real device
+                        // pointer when packed-sequence training is detected.
+                        doc_starts_v,
                     ],
                 )?;
             }

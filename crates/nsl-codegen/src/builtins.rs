@@ -1058,6 +1058,8 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
             types::I64, // d_model
             // PCA Tier A: segment_ids device pointer (0 = unpacked path)
             types::I64, // segment_ids_ptr
+            // PCA §4.3: doc_starts device pointer (0 = identity positions)
+            types::I64, // doc_starts_ptr
         ],
         Some(types::I64),
     ),
@@ -1097,6 +1099,8 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
             types::I64, // x_raw_ptr
             // PCA Tier A: segment_ids device pointer (0 = unpacked path)
             types::I64, // segment_ids_ptr
+            // PCA §4.3: doc_starts device pointer (0 = identity positions)
+            types::I64, // doc_starts_ptr
         ],
         Some(types::I64),
     ),
@@ -1169,6 +1173,7 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
             types::I64,                         // dx
             types::I64,                         // dx_norm (Gap I.5)
             types::I64,                         // segment_ids_ptr (PCA Tier A Task 4B)
+            types::I64,                         // doc_starts_ptr (PCA §4.3 Task 3)
         ],
         Some(types::I64),
     ),

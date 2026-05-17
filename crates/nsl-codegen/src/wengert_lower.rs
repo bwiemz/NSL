@@ -543,6 +543,11 @@ fn emit_fused_forward_under_claim(
     // NaN gradients downstream.  The @train fused lowering path flows
     // through this call — not the advanced.rs one — so the diagnostic
     // must exist here too.
+    //
+    // PCA §4.3 Task 3+4: hoist the doc_starts sentinel into a local so
+    // the &mut FunctionBuilder borrow doesn't overlap with `call(...)`.
+    let doc_starts_v =
+        crate::pca_rope::doc_starts_disabled_sentinel(builder);
     let launch_rc = call(
         compiler,
         builder,
@@ -567,6 +572,14 @@ fn emit_fused_forward_under_claim(
             q_proj_v, k_proj_v, v_proj_v,
             row_max_v, row_sum_v,
             x_raw_v,
+            // PCA Tier A: segment_ids_ptr — 0 for unpacked paths.
+            // Sibling call site in expr/advanced.rs documents the wiring.
+            null,
+            // PCA §4.3 Task 3+4: doc_starts_ptr — sentinel 0 preserves
+            // identity-position semantics (RoPE reset disabled). Task 5
+            // will swap in a real device pointer when the packing path
+            // is detected.
+            doc_starts_v,
         ],
     )?;
     {
@@ -1845,6 +1858,12 @@ fn lower_single_op(
             // pass 0 (kernel interprets as "all heads live").
             let active_heads_val = builder.ins().iconst(cl_types::I64, 0);
 
+            // PCA §4.3 Task 3+4: hoist the doc_starts sentinel into a local
+            // so the &mut FunctionBuilder borrow doesn't overlap with
+            // `call(...)` (which also borrows builder mutably).
+            let doc_starts_v =
+                crate::pca_rope::doc_starts_disabled_sentinel(builder);
+
             let _rc = call(
                 compiler,
                 builder,
@@ -1883,6 +1902,11 @@ fn lower_single_op(
                     // Unpacked backward launches pass 0; segment_masked=true
                     // kernels will receive a real pointer once Task 5 wires it.
                     null,
+                    // PCA §4.3 Task 3+4: doc_starts_ptr trailing slot.
+                    // Sentinel 0 preserves identity-position semantics for the
+                    // backward kernel as well (matches the forward's reset
+                    // policy on the same launch).
+                    doc_starts_v,
                 ],
             )?;
 
