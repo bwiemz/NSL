@@ -103,6 +103,12 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, tier_b: Option<(u32
     if config.segment_masked {
         params.push((".param .u64", "segment_ids_ptr"));
     }
+    // PCA §4.3 RoPE-reset: doc_starts pointer only when both
+    // segment_masked AND rope_q are set. Appended after segment_ids_ptr
+    // so segment_masked=true && rope_q=false signatures stay byte-stable.
+    if config.segment_masked && config.rope_q {
+        params.push((".param .u64", "doc_starts_ptr"));
+    }
     // PCA Tier B M3 instrumentation (B1.5-3): per-tile skip-decision HBM
     // buffer pointer. Only declared when:
     //   1. Tier B is being emitted (tier_b is Some + budget admits), AND
@@ -264,6 +270,25 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, tier_b: Option<(u32
         ptx.push_str("    .reg .pred %p_rope_cos_null, %p_rope_sin_null, %p_rope_skip, %p_rope_done;\n");
     }
 
+    // PCA §4.3 RoPE-reset registers (sites 1-4 + CTA prologue).
+    // Gated on segment_masked && rope_q so sentinel-disabled (segment_masked=false)
+    // paths stay byte-stable. Registers consumed by:
+    //   * emit_doc_starts_smem_load (this prelude, below) — CTA prologue
+    //   * Tasks 7/8 (forward Q/K rotation sites) — read smem_doc_starts
+    //   * Task 9 (backward dQ/dK sites) — read smem_doc_starts
+    if config.segment_masked && config.rope_q {
+        ptx.push_str("    // PCA §4.3 RoPE-reset registers (sites 1-4 + CTA prologue)\n");
+        ptx.push_str("    .reg .u64 %rd_doc_starts_ptr, %rd_doc_starts_addr;\n");
+        // %r_doc_smem_base / %rd_doc_smem_addr: generic-space u64 SMEM base + per-iter
+        // store addr (ptxas rejects [symbol + %reg] in shared stores, so we
+        // mirror the Tier A seg_smem cvta.shared.u64 pattern).
+        ptx.push_str("    .reg .u64 %r_doc_smem_base, %rd_doc_smem_addr;\n");
+        ptx.push_str("    .reg .u32 %r_doc_starts_idx, %r_doc_starts_byte_off, %r_doc_starts_stride;\n");
+        ptx.push_str("    .reg .u32 %r_batch_idx, %r_row_offset_elems;\n");
+        ptx.push_str("    .reg .s32 %r_doc_start, %r_effective_pos_q, %r_effective_pos_k;\n");
+        ptx.push_str("    .reg .pred %p_doc_load_done;\n");
+    }
+
     // PCA Tier A: segment-mask helper scratch registers + SMEM buffer.
     // Only emitted when segment_masked is set; segment_masked=false kernels
     // remain byte-identical to pre-Task-3B.
@@ -391,6 +416,15 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, tier_b: Option<(u32
         // Fence: all threads (including warps 1+) see segment_ids before use.
         ptx.push_str("    bar.sync 0;\n");
         ptx.push_str("    // --- end PCA Tier A segment_ids load ---\n");
+
+        // PCA §4.3 RoPE-reset: CTA-prologue load of this row's doc_starts
+        // subtable into SMEM. Runs once per CTA, immediately after the
+        // segment_ids fence. Gated on rope_q so segment_masked && !rope_q
+        // configs stay byte-stable. The emitter includes its own bar.sync
+        // 0 so subsequent reads from smem_doc_starts are well-defined.
+        if config.rope_q {
+            crate::pca_rope::emit_doc_starts_smem_load(ptx);
+        }
 
         // PCA Tier B range-table preamble (only when admitted).
         // Runs after bar.sync 0 so segment_ids SMEM values are visible to all threads.

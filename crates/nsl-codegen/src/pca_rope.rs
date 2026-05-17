@@ -64,6 +64,70 @@ pub fn doc_starts_disabled_sentinel(builder: &mut FunctionBuilder<'_>) -> Value 
     builder.ins().iconst(types::I64, 0)
 }
 
+/// Emit the CTA-prologue PTX that loads ONE ROW's slice of `doc_starts`
+/// from HBM into SMEM. Each CTA owns one (batch_idx, head_idx) element;
+/// the CTA reads only its row's 1028-byte subtable from HBM offset
+/// `batch_idx * (MAX_NUM_DOCS + 1) * 4` (= `batch_idx * 1028`).
+///
+/// `batch_idx` is reused from the existing u64 `%batch_idx` register
+/// computed earlier in the prelude (`bid_y / heads`), so the caller does
+/// NOT need to pass `heads` — the runtime quantity is already factored
+/// into `%batch_idx`. This is a deviation from the original T5+T6 plan
+/// signature `(ptx, heads)` and is the correct one (heads is not a
+/// compile-time constant on FlashAttentionConfig / CshaExtras).
+///
+/// Sites 1-4 (Tasks 7-9) read from `smem_doc_starts[0..1028]` after this
+/// prologue runs. Sentinel-0 callers (doc_starts_ptr == 0) currently
+/// still execute the load (the PTX dereferences `[doc_starts_ptr]`); a
+/// future task can add a `setp.eq.u64 ..., %rd_doc_starts_ptr, 0` guard
+/// for true identity-position skipping. For now, the codegen-time gate
+/// (segment_masked=false → entire block elided) covers the common case.
+///
+/// Requires registers declared by the sibling block in
+/// `flash_attention_v2/phases/forward/prelude.rs` (gated on
+/// `segment_masked && rope_q`).
+pub fn emit_doc_starts_smem_load(ptx: &mut String) {
+    ptx.push_str("    // PCA §4.3 — CTA prologue: load this row's doc_starts to SMEM\n");
+    ptx.push_str("    .shared .align 4 .b8 smem_doc_starts[1028];\n");
+    ptx.push_str("    ld.param.u64 %rd_doc_starts_ptr, [doc_starts_ptr];\n");
+    // Narrow %batch_idx (u64) → %r_batch_idx (u32). batch_idx is small.
+    ptx.push_str("    cvt.u32.u64 %r_batch_idx, %batch_idx;\n");
+    // row_base_offset_bytes = batch_idx * 1028  (= (MAX_NUM_DOCS+1) * 4)
+    ptx.push_str("    mul.lo.u32 %r_row_offset_elems, %r_batch_idx, 1028;\n");
+    ptx.push_str("    cvt.u64.u32 %rd_doc_starts_addr, %r_row_offset_elems;\n");
+    ptx.push_str("    add.u64 %rd_doc_starts_ptr, %rd_doc_starts_ptr, %rd_doc_starts_addr;\n");
+    // Convert the smem_doc_starts label to a generic-space u64 base so
+    // store addresses can be built via plain u64 add — ptxas rejects the
+    // `[symbol + %reg]` mixed form (same constraint that caused the
+    // Tier A `seg_smem` cvta.shared.u64 pattern; see prelude.rs note).
+    ptx.push_str("    cvta.shared.u64 %r_doc_smem_base, smem_doc_starts;\n");
+    // Parallel cooperative load: each thread loads multiple i32s from the row.
+    // block_x >= 128 for all CSHA configs; (MAX_NUM_DOCS+1)=257 entries to load.
+    // With block_x=128 each thread issues ceil(257/128)=3 i32 loads max.
+    //
+    // Materialize %ntid.x into a regular register up-front — ptxas rejects
+    // special registers (%ntid.x, %tid.x, etc.) as direct add/sub operands.
+    ptx.push_str("    mov.u32 %r_doc_starts_idx, %tid.x;\n");
+    ptx.push_str("    mov.u32 %r_doc_starts_stride, %ntid.x;\n");
+    ptx.push_str("V2_PCA_ROPE_DOC_STARTS_LOAD_LOOP:\n");
+    ptx.push_str("    setp.ge.u32 %p_doc_load_done, %r_doc_starts_idx, 257;\n");
+    ptx.push_str("    @%p_doc_load_done bra V2_PCA_ROPE_DOC_STARTS_LOAD_LOOP_END;\n");
+    ptx.push_str("    mul.lo.u32 %r_doc_starts_byte_off, %r_doc_starts_idx, 4;\n");
+    // Build the HBM (global) source address.
+    ptx.push_str("    cvt.u64.u32 %rd_doc_starts_addr, %r_doc_starts_byte_off;\n");
+    ptx.push_str("    add.u64 %rd_doc_starts_addr, %rd_doc_starts_addr, %rd_doc_starts_ptr;\n");
+    ptx.push_str("    ld.global.s32 %r_doc_start, [%rd_doc_starts_addr];\n");
+    // Build the SMEM destination address (generic-space u64 from cvta.shared
+    // earlier; offset added in u64 to avoid mixed-width arithmetic).
+    ptx.push_str("    cvt.u64.u32 %rd_doc_smem_addr, %r_doc_starts_byte_off;\n");
+    ptx.push_str("    add.u64 %rd_doc_smem_addr, %rd_doc_smem_addr, %r_doc_smem_base;\n");
+    ptx.push_str("    st.shared.s32 [%rd_doc_smem_addr], %r_doc_start;\n");
+    ptx.push_str("    add.u32 %r_doc_starts_idx, %r_doc_starts_idx, %r_doc_starts_stride;\n");
+    ptx.push_str("    bra V2_PCA_ROPE_DOC_STARTS_LOAD_LOOP;\n");
+    ptx.push_str("V2_PCA_ROPE_DOC_STARTS_LOAD_LOOP_END:\n");
+    ptx.push_str("    bar.sync 0;\n");
+}
+
 /// Construct an enabled `doc_starts_ptr` Value pointing at a device tensor.
 ///
 /// The caller MUST ensure `data_id` was declared with element type `i32`.
