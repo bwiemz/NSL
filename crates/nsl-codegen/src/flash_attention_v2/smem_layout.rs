@@ -438,6 +438,152 @@ pub struct SmemLayout {
     pub total_bytes: usize,
 }
 
+// ---------------------------------------------------------------------------
+// Tier B.1 SMEM offsets
+// ---------------------------------------------------------------------------
+//
+// Layout (per spec section 3.3) for the Level-2 pipelined attention forward
+// kernel.  ALL offsets live within the single extern `.shared` region — per
+// the Blackwell sm_120 illegal-address invariant we MUST NOT mix static
+// `.shared` declarations with extern.  Tier B.1's emission uses one extern
+// allocation per CTA; these accessors give the byte offsets of each
+// sub-region within that single allocation.
+//
+// Region order:
+//   q_offset       = 0                                size = bq * hd * 2 (f16)
+//   k_offset_ping  = q_offset + (bq * hd * 2)         size = bkv * hd * 2
+//   k_offset_pong  = k_offset_ping + (bkv * hd * 2)   size = bkv * hd * 2
+//   v_offset_ping  = k_offset_pong + (bkv * hd * 2)   size = bkv * hd * 2
+//   v_offset_pong  = v_offset_ping + (bkv * hd * 2)   size = bkv * hd * 2
+//   w_chunk_offset = v_offset_pong + (bkv * hd * 2)   size = chunk-dependent
+//                                                     (W chunks + x chunks,
+//                                                      sized at emission time)
+
+/// Q tile offset (always 0 — Q lives at the start of the extern shared
+/// allocation). Parameter intentionally unused — offset is a constant.
+pub fn tier_b1_q_offset(_config: &FlashAttentionConfig) -> u32 { 0 }
+
+/// K ping slot offset. f16 row-major `[block_kv, head_dim]`. Lives
+/// immediately after the Q tile.
+pub fn tier_b1_k_offset_ping(config: &FlashAttentionConfig) -> u32 {
+    let bq = config.block_q as u32;
+    let hd = config.head_dim as u32;
+    bq * hd * 2
+}
+
+/// K pong slot offset. f16 row-major `[block_kv, head_dim]`. Lives
+/// immediately after K ping.
+pub fn tier_b1_k_offset_pong(config: &FlashAttentionConfig) -> u32 {
+    let bkv = config.block_kv as u32;
+    let hd = config.head_dim as u32;
+    tier_b1_k_offset_ping(config) + bkv * hd * 2
+}
+
+/// V ping slot offset. f16 row-major `[block_kv, head_dim]`. Lives
+/// immediately after K pong.
+pub fn tier_b1_v_offset_ping(config: &FlashAttentionConfig) -> u32 {
+    let bkv = config.block_kv as u32;
+    let hd = config.head_dim as u32;
+    tier_b1_k_offset_pong(config) + bkv * hd * 2
+}
+
+/// V pong slot offset. f16 row-major `[block_kv, head_dim]`. Lives
+/// immediately after V ping.
+pub fn tier_b1_v_offset_pong(config: &FlashAttentionConfig) -> u32 {
+    let bkv = config.block_kv as u32;
+    let hd = config.head_dim as u32;
+    tier_b1_v_offset_ping(config) + bkv * hd * 2
+}
+
+/// P scratch region offset. f16 row-major `[block_q, block_kv]`. Lives
+/// immediately after V pong. Used for the SMEM round-trip that bridges
+/// softmax D-fragment-shaped output into the PV MMA's A-fragment input
+/// (B1.6 deferral resolution — required for numerical correctness since
+/// the PV A-fragment k=16 span crosses two consecutive QK^T n-tiles
+/// which can't be sourced from a single D-fragment in-register).
+pub fn tier_b1_p_offset(config: &FlashAttentionConfig) -> u32 {
+    let bkv = config.block_kv as u32;
+    let hd = config.head_dim as u32;
+    tier_b1_v_offset_pong(config) + bkv * hd * 2
+}
+
+/// Size of the P scratch region in bytes (block_q × block_kv f16).
+pub fn tier_b1_p_scratch_bytes(config: &FlashAttentionConfig) -> u32 {
+    let bq = config.block_q as u32;
+    let bkv = config.block_kv as u32;
+    bq * bkv * 2
+}
+
+/// W chunk staging region offset. Lives immediately after P scratch. Size
+/// is chunk-dependent and sized at emission time (B1.3+) from the
+/// chunk selected by `tier_b1::chunk_config::select`.
+pub fn tier_b1_w_chunk_offset(config: &FlashAttentionConfig) -> u32 {
+    tier_b1_p_offset(config) + tier_b1_p_scratch_bytes(config)
+}
+
+/// Total SMEM bytes for a Tier B.1 kernel at the given chunk.
+///
+/// Layout:
+///   `q_tile`        — block_q × head_dim × 2 (f16)
+///   `4 × kv_slab`   — K_ping + K_pong + V_ping + V_pong, each block_kv × head_dim × 2
+///   `p_scratch`     — block_q × block_kv × 2 (f16 softmax-output bridge)
+///   `chunk_staging` — Wk + Wv slots (chunk × head_dim × 2 each)
+///                   + x_q + x_kv slots ((block_q + block_kv) × chunk × 2)
+///
+/// Mirrors `validate_tier_b1_config`'s formula exactly so the validator
+/// and the prelude's `.shared` allocation always agree byte-for-byte.
+/// Without this helper the prelude declared the Tier-A baseline (Q tile +
+/// KV tile + SP rows, ~5 KB), but Tier B.1 writes to offsets past 36 KB
+/// (the `x_kv` chunk slot lives at `tier_b1_w_chunk_offset + 3 * chunk*head_dim*2`).
+/// Static SMEM under-declaration silently stomps neighboring GPU state;
+/// ptxas can't detect it because SMEM offsets are computed dynamically.
+pub fn tier_b1_total_smem_bytes(config: &FlashAttentionConfig, chunk: u32) -> u32 {
+    let bq = config.block_q as u32;
+    let bkv = config.block_kv as u32;
+    let hd = config.head_dim as u32;
+    let q_tile = bq * hd * 2;
+    let kv_ping_pong = 2 * (bkv * hd * 2) + 2 * (bkv * hd * 2);
+    let p_scratch = tier_b1_p_scratch_bytes(config);
+    let chunk_staging = chunk * hd * 2 * 2          // Wk + Wv chunk slots
+                      + (bq + bkv) * chunk * 2;     // x_q + x_kv chunk slots
+    q_tile + kv_ping_pong + p_scratch + chunk_staging
+}
+
+/// Validate config against Tier B.1's SMEM budget (per spec section 3.4).
+/// Called by `tier_b1::chunk_config::select`. Returns the selected chunk
+/// on success; returns `ConfigError` if the budget is exceeded for this
+/// chunk.
+pub fn validate_tier_b1_config(
+    config: &FlashAttentionConfig,
+    chunk: u32,
+) -> Result<u32, ConfigError> {
+    let bq = config.block_q as u32;
+    let bkv = config.block_kv as u32;
+    let hd = config.head_dim as u32;
+
+    let q_tile = bq * hd * 2;
+    // 4 KV slabs total: K_ping + K_pong + V_ping + V_pong, each
+    // `bkv * hd * 2` bytes (f16).
+    let kv_ping_pong = 2 * (bkv * hd * 2) + 2 * (bkv * hd * 2);
+    // P scratch: SMEM round-trip for softmax(QK^T) D-fragment → PV
+    // A-fragment bridge (B1.6 deferral resolution). Size = block_q
+    // × block_kv f16.
+    let p_scratch = tier_b1_p_scratch_bytes(config);
+    let fixed_bytes = q_tile + kv_ping_pong + p_scratch;
+
+    let chunk_staging = chunk * hd * 2 * 2          // Wk + Wv chunk slots
+                      + (bq + bkv) * chunk * 2;     // x_q + x_kv chunk slots
+    let total = fixed_bytes + chunk_staging;
+
+    if total > SMEM_DYNAMIC_BUDGET_BYTES {
+        return Err(ConfigError(format!(
+            "Tier B.1 SMEM total {} exceeds dynamic budget {} (fixed={}, chunk_staging={})",
+            total, SMEM_DYNAMIC_BUDGET_BYTES, fixed_bytes, chunk_staging
+        )));
+    }
+    Ok(chunk)
+}
+
 /// Compute the full SMEM layout for a given config.
 pub fn compute_layout(config: &FlashAttentionConfig) -> SmemLayout {
     let q_bytes      = (config.block_q  * config.head_dim * 2) as usize;
@@ -652,5 +798,72 @@ mod tests {
             "smallest segment_masked backward (32x32x32 d_model=32) must fit \
              the 99 KB cap with seg_overhead included",
         );
+    }
+
+    // ---- Tier B.1 offset + validation tests ------------------------------
+
+    /// Build a canonical Tier B.1 forward config with caller-supplied tile
+    /// dimensions.  `csha.level = 2` (Pipeline) so eligibility checks pass.
+    fn tier_b1_cfg(block_q: i64, block_kv: i64, head_dim: i64) -> FlashAttentionConfig {
+        FlashAttentionConfig {
+            block_q, block_kv, head_dim,
+            causal: true, paged: false, rope_q: true,
+            rope_style: RopeStyle::HalfSplit,
+            gqa_group_size: 1,
+            tree_mask: false,
+            gpu_sm: 120,
+            segment_masked: false,
+            csha: Some(CshaExtras {
+                level: 2,
+                ..CshaExtras::default()
+            }),
+        }
+    }
+
+    #[test]
+    fn tier_b1_offsets_are_monotone() {
+        // Canonical Tier B.1 config (bq=64, bkv=64, hd=128) per spec §3.3.
+        let config = tier_b1_cfg(64, 64, 128);
+        assert!(tier_b1_q_offset(&config) < tier_b1_k_offset_ping(&config),
+            "q_offset must precede k_offset_ping");
+        assert!(tier_b1_k_offset_ping(&config) < tier_b1_k_offset_pong(&config),
+            "k_offset_ping must precede k_offset_pong");
+        assert!(tier_b1_k_offset_pong(&config) < tier_b1_v_offset_ping(&config),
+            "k_offset_pong must precede v_offset_ping");
+        assert!(tier_b1_v_offset_ping(&config) < tier_b1_v_offset_pong(&config),
+            "v_offset_ping must precede v_offset_pong");
+        assert!(tier_b1_v_offset_pong(&config) < tier_b1_p_offset(&config),
+            "v_offset_pong must precede p_offset");
+        assert!(tier_b1_p_offset(&config) < tier_b1_w_chunk_offset(&config),
+            "p_offset must precede w_chunk_offset");
+        // P scratch is block_q × block_kv f16.
+        assert_eq!(
+            tier_b1_w_chunk_offset(&config) - tier_b1_p_offset(&config),
+            tier_b1_p_scratch_bytes(&config),
+            "p_scratch region between p_offset and w_chunk_offset must equal block_q × block_kv × 2"
+        );
+    }
+
+    #[test]
+    fn tier_b1_validate_canonical_64_64_128_fails_at_chunk_64() {
+        // Per spec section 3.5: canonical config (64, 64, 128) at chunk=64
+        // exceeds 99 KB even with S/P-scratch reduction.  The V3 supported-
+        // matrix CSV at
+        // `docs/superpowers/specs/2026-05-11-tier-b1-v3-supported-matrix.csv`
+        // shows this tuple as rejected.
+        let config = tier_b1_cfg(64, 64, 128);
+        let err = validate_tier_b1_config(&config, 64);
+        assert!(err.is_err(),
+            "canonical (64,64,128) at chunk=64 must exceed 99 KB; got {:?}", err);
+    }
+
+    #[test]
+    fn tier_b1_validate_small_config_passes() {
+        // V3 CSV admits bq=bkv=32, hd=64 at chunk=64.
+        let config = tier_b1_cfg(32, 32, 64);
+        let result = validate_tier_b1_config(&config, 64);
+        assert!(result.is_ok(),
+            "small (32,32,64) at chunk=64 must fit 99 KB; got {:?}", result);
+        assert_eq!(result.unwrap(), 64, "validator must return selected chunk on success");
     }
 }

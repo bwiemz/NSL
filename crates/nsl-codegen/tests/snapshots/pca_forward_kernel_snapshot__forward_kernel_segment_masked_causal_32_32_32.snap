@@ -3,7 +3,7 @@ source: crates/nsl-codegen/tests/pca_forward_kernel_snapshot.rs
 expression: ptx
 ---
 .version 8.7
-.target sm_75
+.target sm_80
 .address_size 64
 
 .visible .entry flash_attn_p0_r0_hs_g1_c1_t0_q64_kv64_v2 (

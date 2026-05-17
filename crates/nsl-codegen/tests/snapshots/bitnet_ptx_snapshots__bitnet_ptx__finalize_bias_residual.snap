@@ -1,9 +1,12 @@
 ---
 source: crates/nsl-codegen/tests/bitnet_ptx_snapshots.rs
-assertion_line: 75
+assertion_line: 80
 expression: ptx
 ---
 // === BitNet finalize ===
+// weight_scale: %f_y_out *= ld.param.f32 weight_scale.
+ld.param.f32 %f_w_scale, [weight_scale];
+mul.f32 %f_y_out, %f_y_out, %f_w_scale;
 // Bias add: load bias[col_id] from global and add to accumulator.
 cvt.u64.u32 %rd_bias_off, %r_col_id;
 shl.b64 %rd_bias_off, %rd_bias_off, 2;

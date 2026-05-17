@@ -11,6 +11,14 @@ use std::sync::Mutex;
 pub static TRACING: AtomicBool = AtomicBool::new(false);
 static TRACE_GRAPH: Mutex<Option<TraceGraph>> = Mutex::new(None);
 
+// Test-only sentinel: set to `true` only while a `trace::tests` test body
+// is actively recording.  `record_op` checks this in `#[cfg(test)]` builds
+// so that tensor-op tests running in parallel (arithmetic, activation, etc.)
+// cannot inject spurious ops into the shared TRACE_GRAPH and cause
+// "expected N ops, got N+1" failures.
+#[cfg(test)]
+pub(crate) static TRACE_TEST_RECORDING: AtomicBool = AtomicBool::new(false);
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Types
 // ─────────────────────────────────────────────────────────────────────────────
@@ -97,6 +105,13 @@ pub fn record_op(
     attributes: Vec<(String, AttrValue)>,
 ) {
     if !is_tracing() {
+        return;
+    }
+    // In test builds, only record when a trace::tests body explicitly opted in.
+    // This blocks stray calls from parallel tensor-op tests (arithmetic,
+    // activation, etc.) that happen to run while TRACING=true.
+    #[cfg(test)]
+    if !TRACE_TEST_RECORDING.load(Ordering::SeqCst) {
         return;
     }
     let mut guard = TRACE_GRAPH.lock().expect("TRACE_GRAPH mutex poisoned");
@@ -205,6 +220,7 @@ mod tests {
     fn test_trace_basic_ops() {
         let _guard = TEST_LOCK.lock().unwrap();
         reset_trace();
+        TRACE_TEST_RECORDING.store(true, Ordering::SeqCst);
 
         // Start trace
         nsl_trace_start();
@@ -243,6 +259,7 @@ mod tests {
         assert!(!is_tracing(), "tracing should be inactive after nsl_trace_stop");
         assert_ne!(raw, 0, "nsl_trace_stop should return a non-null pointer");
 
+        TRACE_TEST_RECORDING.store(false, Ordering::SeqCst);
         let graph = unsafe { Box::from_raw(raw as *mut TraceGraph) };
 
         // Verify ops
@@ -274,6 +291,7 @@ mod tests {
     fn test_trace_pointer_resolution() {
         let _guard = TEST_LOCK.lock().unwrap();
         reset_trace();
+        TRACE_TEST_RECORDING.store(true, Ordering::SeqCst);
 
         nsl_trace_start();
 
@@ -292,6 +310,7 @@ mod tests {
         nsl_trace_register_output(40, output_name.as_ptr() as i64);
 
         let raw = nsl_trace_stop();
+        TRACE_TEST_RECORDING.store(false, Ordering::SeqCst);
         let graph = unsafe { Box::from_raw(raw as *mut TraceGraph) };
 
         // ptr 10 is in inputs

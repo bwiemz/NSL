@@ -81,7 +81,7 @@ pub fn rejection_sample_stochastic(
         let p_d = d_probs[t].max(1e-10);
         let accept_prob = (p_v / p_d).min(1.0);
 
-        if rng.gen::<f32>() >= accept_prob {
+        if rng.random::<f32>() >= accept_prob {
             let token = sample_adjusted_distribution(&v_probs, &d_probs, &mut rng);
             accepted_tokens.push(token as i64);
             return VerifyResult {
@@ -162,7 +162,7 @@ fn sample_adjusted_distribution(v_probs: &[f32], d_probs: &[f32], rng: &mut StdR
 }
 
 fn sample_from_probs(probs: &[f32], rng: &mut StdRng) -> usize {
-    let r: f32 = rng.gen();
+    let r: f32 = rng.random();
     let mut cumsum = 0.0;
     for (i, &p) in probs.iter().enumerate() {
         cumsum += p;

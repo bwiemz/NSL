@@ -192,7 +192,7 @@ impl DataLoader {
 
         let mut batch_order: Vec<usize> = (0..self.total_batches).collect();
         if self.config.shuffle {
-            let mut rng = rand::thread_rng();
+            let mut rng = rand::rng();
             batch_order.shuffle(&mut rng);
         }
         self._shuffle_offsets = batch_order.clone();

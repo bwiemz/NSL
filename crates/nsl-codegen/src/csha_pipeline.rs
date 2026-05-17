@@ -23,6 +23,23 @@ use crate::csha_boundary::BoundaryScan;
 use crate::gpu_specs::GpuSpec;
 use crate::wggo_cost::LayerShape;
 
+/// Smallest chunk value the Tier B.1 emitter's `chunk_config::select` may
+/// return — load-bearing for the planner / emitter contract.
+///
+/// `chunk_config::select` performs a descending search over `{128, 64, 32,
+/// 16}` and is REQUIRED to treat this constant as its floor: returning a
+/// smaller value would invalidate the planner's admission decision in
+/// `pipeline_smem_bytes`, which sizes chunk staging against this floor so
+/// any admitted config has SOME valid chunk choice. Conversely, the
+/// emitter MUST NOT silently downgrade below this floor or the planner
+/// over-admits.
+///
+/// If you change this value you MUST also update `chunk_config::select`'s
+/// descending search to match, and re-run the cost-model snapshot tests
+/// (`csha_pipeline_cost_model.rs::snapshot_*`) which freeze admission
+/// behavior across the V3 supported matrix.
+pub const CHUNK_PLANNER_FLOOR: u64 = 16;
+
 /// Selected CSHA fusion level for one layer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum FusionLevel {
@@ -132,28 +149,68 @@ pub fn smem_budget_bytes(gpu: &GpuSpec) -> u64 {
 /// SMEM bytes required by a Level-2 pipelined attention kernel at the
 /// given shape / tile config.
 ///
-/// Layout (paper §2.2):
-///   * Q tile (ping):  `block_q  * head_dim * 2`
-///   * K tile (ping):  `block_kv * head_dim * 2`
-///   * V tile (ping):  `block_kv * head_dim * 2`
-///   * O accumulator:  `block_q  * head_dim * 4` (fp32)
-///   * Stats:          `block_q  * 2 * 4`        (logsumexp + max)
-///   * Producer side buffers a single tile of each projection weight
-///     (we charge the worst case: `head_dim * d_model * 2`).
+/// Layout (Tier B.1 design spec §3.4 + V3 cost-model audit findings,
+/// `docs/superpowers/specs/2026-05-11-tier-b1-v3-cost-model-audit.md`):
+///   * Q tile          : `block_q  * head_dim * dtype`
+///   * K/V ping-pong   : `2 * (block_kv * head_dim * dtype)` per stream
+///                       (4 slabs total — Tier B.1 depth=2 over K and V)
+///   * O accumulator   : 0  (register-resident; was a phantom over-count)
+///   * Stats           : `block_q * 2 * 4`        (logsumexp + max, f32)
+///   * Chunk staging   : two W chunk slots (Wk + Wv) + two x chunk slots
+///                       (x_q + x_kv) — sized at the **minimum** chunk
+///                       (16) so the planner admits any config that any
+///                       valid chunk selection would accept.
+///
+/// **V3 audit corrections (2026-05-11) over the original formula:**
+///
+/// | Term            | Pre-correction         | Post-correction              | Why                                                                                  |
+/// |-----------------|------------------------|------------------------------|--------------------------------------------------------------------------------------|
+/// | `o_acc`         | `block_q*head_dim*4`   | **0**                        | Phantom term — Tier A already keeps O_acc in registers (V3 case alpha, retroactive). |
+/// | K tile          | `block_kv*head_dim*dt` | **2 × that**                 | Tier B.1 ping-pongs K (depth=2).                                                     |
+/// | V tile          | `block_kv*head_dim*dt` | **2 × that**                 | Tier B.1 ping-pongs V (depth=2).                                                     |
+/// | `w_tile` (one)  | `head_dim*min(dm,256)*2` | **chunk staging w/ chunk=16** | Single weight tile replaced by Wk/Wv + x_q/x_kv staging; min chunk=16 = most permissive admission. |
+///
+/// The retained `o_acc: u64 = 0` location is intentional per spec §7.2's
+/// "set to zero, not delete" discipline so a future Tier B.2 reintroducing
+/// SMEM O_acc has the location preserved.
+///
+/// Canonical example (small_shape, bq=bkv=64, hd=64, dtype=2, dm=512):
+///   q_tile        = 64*64*2  = 8192
+///   kv_tiles      = 2*(64*64*2 + 64*64*2) = 32768
+///   o_acc         = 0  (was 16384 phantom)
+///   stats         = 64*2*4   = 512
+///   chunk_staging = 2*(16*64*2) + (64+64)*16*2 = 4096 + 4096 = 8192
+///   Total         = 8192 + 32768 + 0 + 512 + 8192 = **49664**
+///
+/// (Pre-correction baseline was 74240; delta = -24576.)
 pub fn pipeline_smem_bytes(shape: LayerShape, tiles: TileConfig) -> u64 {
     let dtype = shape.dtype_bytes;
     let block_q = tiles.block_q as u64;
     let block_kv = tiles.block_kv as u64;
     let head_dim = tiles.head_dim as u64;
-    let d_model = shape.d_model;
+    let _ = shape.d_model; // dm is unused here; chunk selector lives in tier_b1::chunk_config.
 
     let q_tile = block_q * head_dim * dtype;
     let k_tile = block_kv * head_dim * dtype;
     let v_tile = block_kv * head_dim * dtype;
-    let o_acc = block_q * head_dim * 4;
+    // Tier B.1 ping-pong (depth=2) over both K and V — 4 slabs total.
+    let kv_tiles = 2 * (k_tile + v_tile);
+    // V3 case alpha: O_acc is register-resident (see `pv_accum::*`,
+    // `finalize::*`, `smem_layout::total_bytes` — no O region). Zeroed,
+    // not deleted, so B.2 has the location preserved.
+    let o_acc: u64 = 0;
     let stats = block_q * 2 * 4;
-    let w_tile = head_dim * d_model.min(256) * dtype;
-    q_tile + k_tile + v_tile + o_acc + stats + w_tile
+    // Chunk staging budget per spec §3.4: at any instant the kernel holds
+    // two W chunk slots (Wk_chunk + Wv_chunk) plus two x chunk slots
+    // (x_q_chunk + x_kv_chunk). The planner uses the MINIMUM chunk
+    // (`CHUNK_PLANNER_FLOOR`) so it admits configs that any valid chunk
+    // selection would accept; the actual chunk is selected at emission
+    // time by `tier_b1::chunk_config::select`, which descends
+    // {128, 64, 32, 16} and must treat `CHUNK_PLANNER_FLOOR` as its floor.
+    let chunk_staging =
+        2 * (CHUNK_PLANNER_FLOOR * head_dim * dtype)       // Wk + Wv chunk slots
+        + (block_q + block_kv) * CHUNK_PLANNER_FLOOR * dtype; // x_q + x_kv chunk slots
+    q_tile + kv_tiles + o_acc + stats + chunk_staging
 }
 
 /// SMEM for Level-3 block fusion — pipeline cost plus the FFN staging
@@ -247,12 +304,20 @@ pub fn fused_hbm_bytes(shape: LayerShape, level: FusionLevel) -> u64 {
             (baseline_hbm_bytes(shape) as f64 * 0.58) as u64
         }
         FusionLevel::Pipeline => {
-            // Paper §2.2: only x read + output write remain.
-            2 * bsd // read x + write out
+            // V3 audit (spec §7.1) correction: L2 reads x + writes attn_out,
+            // but the downstream Wo kernel must re-read attn_out from HBM
+            // (L2 does NOT fuse the output projection — that's L3 only).
+            // The original `2 * bsd` over-counted L2's savings by omitting
+            // the Wo re-read.
+            let x_in = bsd;
+            let attn_out_write = bsd;
+            let downstream_wo_in = bsd; // downstream Wo kernel re-reads attn_out
+            x_in + attn_out_write + downstream_wo_in // = 3 * bsd
         }
         FusionLevel::Block => {
-            // Paper §2.3: same as pipeline for a single block (block
-            // fusion eliminates intra-block HBM, not inter-block).
+            // L3 fuses Wo into the persistent kernel, eliminating the
+            // attn_out → Wo HBM round-trip. So 2*bsd is correct here: read
+            // x + write final output. (No Wo re-read — Wo is in-kernel.)
             2 * bsd
         }
     }
@@ -515,5 +580,106 @@ mod tests {
         let gpu = default_gpu();
         let b = smem_budget_bytes(gpu);
         assert!(b <= 228 * 1024);
+    }
+
+    // ----------------------------------------------------------------------
+    // B1.1 coverage: configurations newly admitted by the corrected formula
+    // ----------------------------------------------------------------------
+    //
+    // The B1.1 corrections (see V3 findings doc) shrink
+    // `pipeline_smem_bytes` for typical shapes via two competing effects:
+    //   * `+24576` from doubled K/V tiles + chunk staging (worst-case
+    //     inflation)
+    //   * `-bq*hd*4 - 2*hd*min(dm,256)` from O_acc zeroed + w_tile replaced
+    //     (worst-case savings)
+    //
+    // The net effect is a NEGATIVE delta for the common "hd=256" regime
+    // (e.g. -110_592 bytes at balanced tiles, -78_848 at compute-bound),
+    // which moves configurations that were over the 228 KB H100 cap into
+    // the admitted set.  Each test below picks a representative such
+    // config from the §3.4 supported matrix and asserts the planner now
+    // admits it at Pipeline level.
+
+    fn h100() -> &'static GpuSpec {
+        find_gpu("H100").unwrap_or_else(default_gpu)
+    }
+
+    fn shape_with(d_model: u64, head_dim: u64) -> LayerShape {
+        LayerShape {
+            batch: 1,
+            seq: 1024,
+            d_model,
+            head_dim,
+            n_kv_heads: 8,
+            dtype_bytes: 2,
+        }
+    }
+
+    #[test]
+    fn newly_unblocked_balanced_dm512_hd256_admits_pipeline() {
+        // roofline: ai = 512/2 = 256, balanced regime → (bq=64, bkv=64).
+        // Pre-B1.1:  74240 ... no wait — at hd=256 not hd=64:
+        //   pre  = 32768 + 32768 + 32768 + 65536 + 512 + 131072 = 295424  (over 228 KB)
+        //   post = 32768 + 131072 + 0 + 512 + 20480              = 184832  (fits)
+        let gpu = h100();
+        let plan = plan_layer(
+            "newly_unblocked_balanced_dm512_hd256",
+            shape_with(512, 256),
+            gpu,
+            FusionLevel::Pipeline,
+        );
+        assert_eq!(
+            plan.level,
+            FusionLevel::Pipeline,
+            "balanced (64,64) at hd=256 must admit Pipeline post-B1.1; got level={:?} reason={:?}",
+            plan.level,
+            plan.downgrade_reason
+        );
+        assert!(plan.downgrade_reason.is_none());
+    }
+
+    #[test]
+    fn newly_unblocked_balanced_dm1024_hd256_admits_pipeline() {
+        // roofline: ai = 1024/2 = 512, still balanced → (bq=64, bkv=64).
+        // Pre-B1.1: 295424 (same as dm=512 case — min(dm,256) caps the
+        //                   pre-correction w_tile term)
+        // Post-B1.1: 184832 (chunk staging does not depend on dm)
+        let gpu = h100();
+        let plan = plan_layer(
+            "newly_unblocked_balanced_dm1024_hd256",
+            shape_with(1024, 256),
+            gpu,
+            FusionLevel::Pipeline,
+        );
+        assert_eq!(
+            plan.level,
+            FusionLevel::Pipeline,
+            "balanced (64,64) at hd=256 dm=1024 must admit Pipeline post-B1.1; got level={:?} reason={:?}",
+            plan.level,
+            plan.downgrade_reason
+        );
+        assert!(plan.downgrade_reason.is_none());
+    }
+
+    #[test]
+    fn newly_unblocked_compute_bound_dm2048_hd256_admits_pipeline() {
+        // roofline: ai = 2048/2 = 1024, compute-bound → (bq=32, bkv=64).
+        //   pre  = 16384 + 32768 + 32768 + 32768 + 256 + 131072 = 246016  (over 228 KB)
+        //   post = 16384 + 131072 + 0 + 256 + 19456              = 167168  (fits)
+        let gpu = h100();
+        let plan = plan_layer(
+            "newly_unblocked_compute_dm2048_hd256",
+            shape_with(2048, 256),
+            gpu,
+            FusionLevel::Pipeline,
+        );
+        assert_eq!(
+            plan.level,
+            FusionLevel::Pipeline,
+            "compute-bound (32,64) at hd=256 dm=2048 must admit Pipeline post-B1.1; got level={:?} reason={:?}",
+            plan.level,
+            plan.downgrade_reason
+        );
+        assert!(plan.downgrade_reason.is_none());
     }
 }

@@ -1,0 +1,6 @@
+---
+source: crates/nsl-codegen/tests/csha_pipeline_cost_model_snapshot.rs
+assertion_line: 40
+expression: bytes.to_string()
+---
+49664
