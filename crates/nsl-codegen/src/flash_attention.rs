@@ -318,7 +318,7 @@ pub fn flash_attention_kernel_name(config: &FlashAttentionConfig) -> String {
         config.block_q,
         config.block_kv,
     );
-    match &config.csha {
+    let with_csha = match &config.csha {
         None => base,
         Some(c) => {
             // Encode which fusion phases are active so kernel-bytes
@@ -329,6 +329,18 @@ pub fn flash_attention_kernel_name(config: &FlashAttentionConfig) -> String {
             let h = c.active_heads;
             format!("{base}_cshaL{}_n{n}_p{p}_o{o}_h{h}", c.level)
         }
+    };
+    // PCA §4.3 Task 10 — append `_rope_reset_max{N}` suffix when the kernel
+    // is compiled with `segment_masked && rope_q`. This differentiates the
+    // RoPE-reset-aware variant from the sentinel-disabled (identity-position)
+    // variant so a single binary can host BOTH variants without colliding in
+    // the runtime PTX cache. `MAX_NUM_DOCS` is the compile-time SMEM bound
+    // (see `pca_rope`); the suffix bakes it in so a future bound change forces
+    // a fresh cache key.
+    if config.segment_masked && config.rope_q {
+        format!("{with_csha}_rope_reset_max{}", crate::pca_rope::MAX_NUM_DOCS)
+    } else {
+        with_csha
     }
 }
 

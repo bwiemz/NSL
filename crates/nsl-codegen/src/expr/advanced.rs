@@ -1662,6 +1662,21 @@ impl Compiler<'_> {
                 // a local before the call so the &mut FunctionBuilder borrow
                 // doesn't overlap with the &mut self.compile_call_by_name
                 // borrow on the same scope.
+                //
+                // PCA §4.3 Task 11 note — live wiring deferred. To switch this
+                // site to `doc_starts_enabled(builder, module, data_id)`, the
+                // caller's batch dict must propagate the `doc_starts` tensor
+                // (and the sibling `segment_ids` tensor, which also lands as
+                // `null` two slots below) into a known DataId at this call
+                // site. The packer (T2.6) already emits both tensors into
+                // `packed_batch_to_dict`; the consumer-side plumbing — looking
+                // them up here when this layer is compiled with
+                // `segment_masked && rope_q` — is independent runtime/codegen
+                // wiring work, NOT part of T11. Sentinel-0 is the correct
+                // intermediate state per the task spec.
+                //
+                // TODO(rope-reset-runtime-wiring): activate when batch dict
+                // supplies doc_starts (paired with segment_ids `null` below).
                 let doc_starts_v =
                     crate::pca_rope::doc_starts_disabled_sentinel(builder);
                 // PR #93 edit 4: stop silently discarding the launch rc.
@@ -1743,6 +1758,15 @@ impl Compiler<'_> {
                 // a local before the call so the &mut FunctionBuilder borrow
                 // doesn't overlap with the &mut self.compile_call_by_name
                 // borrow on the same scope.
+                //
+                // PCA §4.3 Task 11 note — live wiring deferred. This is the
+                // CSHA inference (no-saves) path; the sibling segment_ids slot
+                // below is also a hard-coded `null`. Switching to
+                // `doc_starts_enabled` is gated on the same batch-dict
+                // plumbing prerequisite as the _with_saves path above.
+                //
+                // TODO(rope-reset-runtime-wiring): activate when batch dict
+                // supplies doc_starts (paired with segment_ids `null` below).
                 let doc_starts_v =
                     crate::pca_rope::doc_starts_disabled_sentinel(builder);
                 let _err = self.compile_call_by_name(

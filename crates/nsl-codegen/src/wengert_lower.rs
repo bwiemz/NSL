@@ -546,6 +546,16 @@ fn emit_fused_forward_under_claim(
     //
     // PCA §4.3 Task 3+4: hoist the doc_starts sentinel into a local so
     // the &mut FunctionBuilder borrow doesn't overlap with `call(...)`.
+    //
+    // PCA §4.3 Task 11 note — live wiring deferred. The @train fused
+    // lowering path flows through this call site; the sibling segment_ids
+    // slot is also `null` here. The packer (T2.6) emits both tensors into
+    // `packed_batch_to_dict`, but the consumer-side wiring to look them up
+    // at the FA-2 call site is independent codegen plumbing not in T11
+    // scope. Sentinel-0 stays correct until that wiring lands.
+    //
+    // TODO(rope-reset-runtime-wiring): activate when batch dict supplies
+    // doc_starts (paired with segment_ids `null` in arg list below).
     let doc_starts_v =
         crate::pca_rope::doc_starts_disabled_sentinel(builder);
     let launch_rc = call(
@@ -1861,6 +1871,16 @@ fn lower_single_op(
             // PCA §4.3 Task 3+4: hoist the doc_starts sentinel into a local
             // so the &mut FunctionBuilder borrow doesn't overlap with
             // `call(...)` (which also borrows builder mutably).
+            //
+            // PCA §4.3 Task 11 note — live wiring deferred. This is the
+            // backward (Gap D.1) call into `nsl_flash_attention_csha_backward`;
+            // the sibling segment_ids slot in the arg list is `null` as well.
+            // Activation here must stay in lockstep with the forward at
+            // line ~565 above — both kernels need the same doc_starts pointer
+            // so the de-rotation math reproduces the forward's effective_pos.
+            //
+            // TODO(rope-reset-runtime-wiring): activate when batch dict
+            // supplies doc_starts (paired with segment_ids `null` below).
             let doc_starts_v =
                 crate::pca_rope::doc_starts_disabled_sentinel(builder);
 

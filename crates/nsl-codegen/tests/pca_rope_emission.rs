@@ -5,7 +5,9 @@
 //! (segment_masked=false) callers MUST remain byte-stable.
 
 use nsl_codegen::flash_attention::{CshaExtras, FlashAttentionConfig, RopeStyle};
-use nsl_codegen::flash_attention_v2::{synthesize_backward, synthesize_flash_attention_ptx_v2};
+use nsl_codegen::flash_attention_v2::{
+    flash_attention_kernel_name_v2, synthesize_backward, synthesize_flash_attention_ptx_v2,
+};
 
 fn config_segment_masked_with_rope() -> FlashAttentionConfig {
     // Use the CSHA L2 RoPE preset matching the existing ptxas-validated
@@ -298,6 +300,81 @@ fn backward_disabled_path_has_no_effective_pos_or_smem_load() {
     assert!(
         !ptx.contains("smem_doc_starts"),
         "Backward sentinel-disabled path must NOT load smem_doc_starts"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// T10 — kernel-name suffix `_rope_reset_max256` differentiates the live-
+// activation variant from the sentinel-disabled variant. Without this suffix
+// cached PTX bytes would collide between the two variants on a single binary.
+//
+// Backward kernel name derives from the forward via
+// `flash_attention_v2::phases::backward::prelude::kernel_name` (it strip-
+// prefixes `flash_attn_` → `flash_attn_backward_`), so the suffix inherits
+// automatically — but we still assert on the backward path to lock that in.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn kernel_name_has_rope_reset_max256_suffix_when_segment_masked_and_rope_q() {
+    let cfg = config_segment_masked_with_rope();
+    let name = flash_attention_kernel_name_v2(&cfg);
+    assert!(
+        name.contains("rope_reset_max256"),
+        "Kernel name {} must include rope_reset_max256 suffix when segment_masked && rope_q",
+        name
+    );
+}
+
+#[test]
+fn kernel_name_omits_rope_reset_suffix_when_segment_masked_off() {
+    let mut cfg = config_segment_masked_with_rope();
+    cfg.segment_masked = false;
+    let name = flash_attention_kernel_name_v2(&cfg);
+    assert!(
+        !name.contains("rope_reset_max"),
+        "Kernel name {} must NOT include rope_reset suffix when segment_masked=false",
+        name
+    );
+}
+
+#[test]
+fn kernel_name_omits_rope_reset_suffix_when_rope_q_off() {
+    let mut cfg = config_segment_masked_with_rope();
+    cfg.rope_q = false;
+    let name = flash_attention_kernel_name_v2(&cfg);
+    assert!(
+        !name.contains("rope_reset_max"),
+        "Kernel name {} must NOT include rope_reset suffix when rope_q=false",
+        name
+    );
+}
+
+#[test]
+fn backward_kernel_name_inherits_rope_reset_suffix() {
+    // The backward kernel name is derived from the forward name (strip
+    // `flash_attn_` → `flash_attn_backward_`), so the rope_reset suffix
+    // must appear in the backward variant too — proving the two kernels
+    // don't collide in the module cache.
+    let cfg = config_segment_masked_with_rope_for_backward();
+    let fwd_name = flash_attention_kernel_name_v2(&cfg);
+    assert!(
+        fwd_name.contains("rope_reset_max256"),
+        "Forward name {} must carry the suffix for the backward to inherit it",
+        fwd_name
+    );
+    // Sanity: the backward PTX text should contain a kernel-entry name that
+    // also carries the suffix. (The backward `kernel_name` helper is private
+    // to the backward module, so we check by scanning the synthesized PTX.)
+    let ptx = backward_ptx_string(&cfg);
+    let entry_line_count = ptx
+        .lines()
+        .filter(|l| l.contains(".visible .entry") && l.contains("rope_reset_max256"))
+        .count();
+    assert!(
+        entry_line_count >= 1,
+        "Backward PTX must declare a `.visible .entry` whose name contains \
+         rope_reset_max256; found {} matching entry lines",
+        entry_line_count
     );
 }
 
