@@ -529,10 +529,37 @@ fn emit_weight_tile_load(
     ptx.push_str("    bar.sync 0;  // FENCE: weight tile in SMEM\n");
 }
 
-/// Kernel entry-point name for v2. Same format as v1 with a `_v2` suffix
-/// so module caches never collide between versions.
+/// Kernel entry-point name for v2. Same format as v1 with a `_v2`
+/// suffix so module caches never collide between versions.
+///
+/// **Tier B.1 suffix**: when the dispatch criteria for the Tier B.1
+/// pipelined-MMA path are met (`csha.level >= 2` AND `gpu_sm >= 80`),
+/// the name is further suffixed with `_tier_b1`. This carries the
+/// launch-geometry signal through to the runtime FFI — Tier B.1 codegen
+/// requires 256 threads per CTA (8 warps for the `global_t = warp_id +
+/// local_t * 8` distribution), while Tier A v2 uses 128 threads (4
+/// warps). The shared `nsl_flash_attention_csha` FFI inspects the
+/// kernel-name string and picks block_x accordingly.
+///
+/// Carrying the signal in the name (rather than as a new FFI arg) is
+/// ABI-stable — Cranelift-emitted code already passes the name string
+/// through; no call-site signature changes.
 pub fn flash_attention_kernel_name_v2(config: &FlashAttentionConfig) -> String {
-    format!("{}_v2", crate::flash_attention::flash_attention_kernel_name(config))
+    let base = format!("{}_v2", crate::flash_attention::flash_attention_kernel_name(config));
+    if is_tier_b1_dispatch(config) {
+        format!("{}_tier_b1", base)
+    } else {
+        base
+    }
+}
+
+/// Returns `true` when `synthesize_flash_attention_ptx_v2` would
+/// dispatch to `tier_b1::synthesize` for the given config — i.e. both
+/// the CSHA pipelined level is requested AND the target GPU supports
+/// the cp.async + m16n8k16 path. Mirrors the dispatch predicate in
+/// `synthesize_flash_attention_ptx_v2` exactly.
+pub fn is_tier_b1_dispatch(config: &FlashAttentionConfig) -> bool {
+    config.csha.as_ref().is_some_and(|c| c.level >= 2) && config.gpu_sm >= 80
 }
 
 /// SMEM byte count for a v2 kernel. Computed from the layout module so

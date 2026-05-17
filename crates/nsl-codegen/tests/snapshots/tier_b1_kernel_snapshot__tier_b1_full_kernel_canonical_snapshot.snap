@@ -6,7 +6,7 @@ expression: ptx_str.into_owned()
 .target sm_80
 .address_size 64
 
-.visible .entry flash_attn_p0_r0_hs_g1_c1_t0_q32_kv32_cshaL2_n0_p0_o0_h0_v2 (
+.visible .entry flash_attn_p0_r0_hs_g1_c1_t0_q32_kv32_cshaL2_n0_p0_o0_h0_v2_tier_b1 (
     .param .u64 q_ptr,
     .param .u64 k_ptr,
     .param .u64 v_ptr,
