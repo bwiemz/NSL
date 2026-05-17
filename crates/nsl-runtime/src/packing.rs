@@ -36,12 +36,19 @@ pub struct PackedBatch {
     pub segment_ids: Vec<u16>,   // spec §3.5 — new, additive
     /// PCA §4.3 RoPE position-reset table, sibling to `segment_ids`.
     ///
-    /// Fixed length `MAX_NUM_DOCS + 1 = 257`. Valid prefix entries hold
-    /// absolute start positions (in the flat `batch_size * seq_len` token
-    /// stream) of documents 0..=num_docs; unused slots are sentinel `-1`.
-    /// Accumulated as a side effect of the EOS scan in `pack_batch`,
-    /// matching the offline builder `build_segment_ids_and_doc_starts`
-    /// flat-sequence semantics.
+    /// **Per-row layout** (spec v3, commit `2b8df4e6`): flat length
+    /// `batch_size * (MAX_NUM_DOCS + 1)`, indexed as
+    /// `doc_starts[r * 257 + k]` = start position of document `k` in batch
+    /// row `r`, **relative to that row's local position 0** (not the flat
+    /// batch_size * seq_len stream). Each row's 257-element subtable is
+    /// independently accumulated during the EOS scan; unused slots are
+    /// sentinel `-1`.
+    ///
+    /// The per-row shape is load-bearing for `batch_size > 1`: Tier A's
+    /// `segment_ids` resets to 0 per batch row, so the kernel must index
+    /// `doc_starts[batch_idx * 257 + segment_ids[idx]]` (handled in T6
+    /// CTA prologue). A flat single-table layout would collapse all rows'
+    /// document boundaries into row 0's positions.
     pub doc_starts:  Vec<i32>,
     pub batch_size:  usize,
     pub seq_len:     usize,
@@ -91,20 +98,29 @@ pub fn pack_batch(
     let mut mask = vec![-1e9f32; batch_size * seq_len * seq_len];
     let mut segment_ids: Vec<u16> = Vec::with_capacity(total);
 
-    // PCA §4.3 RoPE position-reset accumulator. Mirrors
-    // `build_segment_ids_and_doc_starts`'s flat-sequence semantics: doc_starts[k]
-    // is the absolute position (in the flat batch_size * seq_len stream) where
-    // document k begins. doc_starts[0] = 0 always; each EOS at flat position p
-    // appends p + 1 as the next doc start (matching the segment_ids semantics:
-    // EOS is part of the current segment, the next segment starts at p+1).
-    // Padded to MAX_NUM_DOCS + 1 = 257 with sentinel -1 so the kernel can emit
-    // a constant-size SMEM load. num_docs <= MAX_NUM_DOCS is asserted below.
-    let mut doc_starts = vec![-1i32; MAX_NUM_DOCS + 1];
-    doc_starts[0] = 0;
-    let mut next_doc_idx: usize = 1;
+    // PCA §4.3 RoPE position-reset accumulator (spec v3, per-row layout).
+    //
+    // Flat shape `batch_size * (MAX_NUM_DOCS + 1)`, indexed as
+    // `doc_starts[r * (MAX_NUM_DOCS+1) + k]` = start of document k in row r,
+    // *relative to row r's local position 0*. Each row's 257-element
+    // subtable is accumulated independently with its own cursor; sentinel
+    // `-1` for unused slots so the kernel emits a constant-size SMEM load.
+    //
+    // Why per-row: Tier A's `segment_ids` resets to 0 at the start of each
+    // batch row, so kernel indexing `doc_starts[batch_idx * 257 +
+    // segment_ids[idx]]` requires each row to carry its own boundaries
+    // expressed in row-local coordinates.
+    let row_stride = MAX_NUM_DOCS + 1;
+    let mut doc_starts = vec![-1i32; batch_size * row_stride];
 
     for b in 0..batch_size {
         let offset = b * seq_len;
+        let row_base = b * row_stride;
+
+        // Each new batch row opens doc 0 at local position 0; per-row cursor
+        // resets here so row r's subtable accumulates independently of row r-1.
+        doc_starts[row_base] = 0;
+        let mut current_row_doc_idx: usize = 1;
 
         // Labels: shifted by 1 within each sequence
         if seq_len > 0 {
@@ -128,19 +144,20 @@ pub fn pack_batch(
         for i in 0..seq_len {
             if i > 0 && input_ids[offset + i - 1] == eos_token {
                 current_doc += 1;
-                // PCA §4.3 — sibling accumulator. EOS at flat position
-                // (offset + i - 1) marks the end of a document; the next
-                // document starts at flat position (offset + i). Push that
-                // into doc_starts as the next entry. The MAX_NUM_DOCS bound
-                // is producer/consumer ABI: exceeding it would silently
-                // overflow the kernel's constant-size SMEM load.
+                // PCA §4.3 per-row accumulator: EOS at local position i-1
+                // ends the current doc; the next doc starts at local
+                // position i (row-local, not flat). Write into this row's
+                // 257-element subtable at offset row_base + current_row_doc_idx.
+                // MAX_NUM_DOCS is enforced *per row* — exceeding it would
+                // overflow this row's constant-size SMEM load on the kernel side.
                 assert!(
-                    next_doc_idx <= MAX_NUM_DOCS,
-                    "num_docs > MAX_NUM_DOCS {}: too many EOS-delimited documents in packed batch",
-                    MAX_NUM_DOCS
+                    current_row_doc_idx <= MAX_NUM_DOCS,
+                    "num_docs > MAX_NUM_DOCS {} in batch row {}: too many EOS-delimited documents",
+                    MAX_NUM_DOCS,
+                    b
                 );
-                doc_starts[next_doc_idx] = (offset + i) as i32;
-                next_doc_idx += 1;
+                doc_starts[row_base + current_row_doc_idx] = i as i32;
+                current_row_doc_idx += 1;
             }
             doc_ids[i] = current_doc;
         }
@@ -165,16 +182,13 @@ pub fn pack_batch(
         }
     }
 
-    // NOTE: doc_starts here uses *flat-stream* positions across the whole
-    // batch_size * seq_len token array, matching `build_segment_ids_and_doc_starts`'s
-    // flat-sequence semantics. For batch_size == 1 (the common packed-pretraining
-    // case) this is unambiguous and consistent with the offline builder's
-    // contract. For batch_size > 1, segment_ids resets to 0 per batch row,
-    // so a downstream kernel that indexes `doc_starts[segment_ids[i]]` for
-    // rows b > 0 will not get a correct answer without a per-row reconciliation
-    // pass at the consumer. The single-row case is the only one the §5
-    // activation gate currently exercises end-to-end; multi-row reconciliation
-    // is tracked alongside the producer/consumer ABI unification effort.
+    // NOTE: doc_starts is now [batch_size, MAX_NUM_DOCS+1] flat (spec v3).
+    // Each row's 257-element subtable stores ROW-LOCAL doc start positions
+    // (relative to that row's local position 0, in [0, seq_len)), so kernel
+    // indexing `doc_starts[batch_idx * 257 + segment_ids[idx]]` aligns with
+    // Tier A's segment_ids that reset per batch row. The offline builder
+    // `build_segment_ids_and_doc_starts` still uses flat-sequence semantics
+    // for the single-row case it serves (see its docstring).
     Some(PackedBatch {
         input_ids,
         labels,
@@ -189,11 +203,13 @@ pub fn pack_batch(
 /// Construct segment_ids + doc_starts tensors for a packed batch with the
 /// given per-document lengths.
 ///
-/// **Producer half of the PCA §4.3 RoPE position reset path.** This is the
-/// caller-driven path used when document boundaries are known upfront (e.g.
-/// from a packing planner that pre-computes per-doc lengths). The streaming
-/// `pack_batch` path that scans for EOS tokens is a separate producer; the
-/// two are not yet unified.
+/// **Single-row scope** (spec v3): this builder is the offline T2 path that
+/// pre-computes per-doc lengths and emits the *flat single-row* layout
+/// `doc_starts: [MAX_NUM_DOCS + 1]` with absolute positions. It is intended
+/// for `batch_size == 1` callers that need to construct test fixtures or
+/// drive a single-row consumer. The streaming `pack_batch` is the
+/// multi-batch source of truth and emits per-row `[batch_size,
+/// MAX_NUM_DOCS+1]` layout — do not mix outputs across the two paths.
 ///
 /// Returns `(segment_ids, doc_starts)` where:
 /// - `segment_ids` has length `doc_lengths.iter().sum()` (the packed length)
@@ -284,18 +300,19 @@ pub fn packed_batch_to_dict(batch: &PackedBatch) -> i64 {
         unsafe { *seg_data.add(i) = v as f32 };
     }
 
-    // doc_starts [MAX_NUM_DOCS + 1] — sibling to segment_ids (PCA §4.3 RoPE
-    // position-reset path). Logical dtype is i32 (codegen-side
-    // `pca_rope::doc_starts_enabled` consumes an i32-typed device tensor),
-    // but the current tensor helper allocates f32 storage and data_f32()
-    // asserts dtype==1. We use f32 backing matching segment_ids' existing
-    // narrow-dtype TODO above; i32 values in our range [−1, batch_size *
-    // seq_len] round-trip through f32 exactly (the typical packed-batch
-    // upper bound, e.g. 1 * 16384 = 16384, is far below 2^24 mantissa).
+    // doc_starts [batch_size, MAX_NUM_DOCS + 1] — sibling to segment_ids
+    // (PCA §4.3 RoPE position-reset path, per-row layout per spec v3).
+    // Logical dtype is i32 (codegen-side `pca_rope::doc_starts_enabled`
+    // consumes an i32-typed device tensor), but the current tensor helper
+    // allocates f32 storage and data_f32() asserts dtype==1. We use f32
+    // backing matching segment_ids' existing narrow-dtype TODO above;
+    // i32 values in our range [−1, seq_len) round-trip through f32 exactly
+    // (per-row local positions are bounded by seq_len, well below 2^24
+    // mantissa).
     // TODO(PCA Tier A, post-Task-7b): promote to true i32 storage once the
     // tensor helper supports narrow integer dtypes; sibling to the
     // segment_ids TODO above (both unblock together).
-    let ds_ptr = create_tensor_with_shape_rs_dtype(&[(MAX_NUM_DOCS + 1) as i64], 1);
+    let ds_ptr = create_tensor_with_shape_rs_dtype(&[b, (MAX_NUM_DOCS + 1) as i64], 1);
     let ds_tensor = NslTensor::from_ptr(ds_ptr);
     let ds_data = ds_tensor.data_f32();
     for (i, &v) in batch.doc_starts.iter().enumerate() {
@@ -614,15 +631,15 @@ mod tests {
 
     #[test]
     fn pack_batch_emits_doc_starts_during_eos_scan() {
-        // T2.5 — full pipeline test: pack_batch should accumulate doc_starts
-        // as a side effect of its EOS scan, in the *exact* shape the spec's
-        // §5 activation gate expects (`[0, len_a, len_a+len_b, len_a+len_b+len_c,
-        // -1, -1, ..., -1]`, total length MAX_NUM_DOCS+1 = 257).
+        // T2.5/T2.6 — single-row pipeline test: pack_batch accumulates doc_starts
+        // as a side effect of its EOS scan, in the per-row layout spec v3
+        // expects (`[batch_size, MAX_NUM_DOCS+1]` flat; single-row batch ⇒
+        // total length 1 * 257 = 257, all entries live at row 0).
         //
         // Stream lays out three EOS-delimited documents of lengths 3, 2, 4:
-        //   doc A: [10, 11, EOS=2]                  (positions 0..3)
-        //   doc B: [20, EOS=2]                      (positions 3..5)
-        //   doc C: [30, 31, 32, 33]                 (positions 5..9)
+        //   doc A: [10, 11, EOS=2]                  (local positions 0..3)
+        //   doc B: [20, EOS=2]                      (local positions 3..5)
+        //   doc C: [30, 31, 32, 33]                 (local positions 5..9)
         // No trailing EOS — last segment runs to the end of the pack.
         let stream: Vec<f64> = vec![
             10.0, 11.0, 2.0,       // doc A — len 3, ends with EOS at pos 2
@@ -635,7 +652,7 @@ mod tests {
             stream.len(),
             0,                // DTYPE_F64
             &mut cursor,
-            1,                // batch_size
+            1,                // batch_size — single-row case
             9,                // seq_len
             2,                // eos_token
         )
@@ -650,15 +667,17 @@ mod tests {
             "segment_ids precondition for the doc_starts shape this test asserts"
         );
 
-        // Fixed-length sibling table per spec §4.3 ABI.
-        assert_eq!(batch.doc_starts.len(), MAX_NUM_DOCS + 1);
+        // Per-row sibling table per spec v3: batch_size * (MAX_NUM_DOCS+1).
+        // For batch_size=1 the total length is 1 * 257 = 257.
+        assert_eq!(batch.doc_starts.len(), 1 * (MAX_NUM_DOCS + 1));
         assert_eq!(batch.doc_starts.len(), 257);
 
-        // Valid prefix: cumulative starts of docs 0, 1, 2, plus end-of-pack sentinel
-        // 9 == 3 + 2 + 4.
-        assert_eq!(batch.doc_starts[0], 0,  "doc 0 begins at flat position 0");
-        assert_eq!(batch.doc_starts[1], 3,  "doc 1 begins after doc A (len 3) including its EOS");
-        assert_eq!(batch.doc_starts[2], 5,  "doc 2 begins after doc A + doc B (len 3+2)");
+        // Row 0 subtable: cumulative starts of docs 0, 1, 2 (row-local positions).
+        // For batch_size=1 row-local positions coincide with the absolute pack
+        // positions, so 9 == 3 + 2 + 4 still falls out cleanly.
+        assert_eq!(batch.doc_starts[0], 0,  "row 0 doc 0 begins at local position 0");
+        assert_eq!(batch.doc_starts[1], 3,  "row 0 doc 1 begins after doc A (len 3) including its EOS");
+        assert_eq!(batch.doc_starts[2], 5,  "row 0 doc 2 begins after doc A + doc B (len 3+2)");
 
         // Slots 3..=256 are unused — sentinel -1 lets the kernel emit a
         // constant-size SMEM load independent of runtime num_docs.
@@ -668,9 +687,7 @@ mod tests {
 
         // End-to-end: packed_batch_to_dict must insert doc_starts into the
         // batch dict (key = "doc_starts") using the same allocation primitive
-        // as segment_ids. The values must round-trip from PackedBatch through
-        // the f32-backed tensor exactly (all our doc_starts fit well below
-        // 2^24 mantissa).
+        // as segment_ids, with per-row shape [batch_size, MAX_NUM_DOCS+1].
         let dict = packed_batch_to_dict(&batch);
         assert_eq!(
             nsl_dict_len(dict),
@@ -684,9 +701,10 @@ mod tests {
         assert!(ds_ptr != 0, "doc_starts must be present in the batch dict");
 
         let ds_tensor = NslTensor::from_ptr(ds_ptr);
-        assert_eq!(ds_tensor.ndim, 1, "doc_starts is 1-D [MAX_NUM_DOCS+1]");
+        assert_eq!(ds_tensor.ndim, 2, "doc_starts is 2-D [batch_size, MAX_NUM_DOCS+1]");
         unsafe {
-            assert_eq!(*ds_tensor.shape.add(0), (MAX_NUM_DOCS + 1) as i64);
+            assert_eq!(*ds_tensor.shape.add(0), 1, "single-row batch");
+            assert_eq!(*ds_tensor.shape.add(1), (MAX_NUM_DOCS + 1) as i64);
         }
         let ds_data = ds_tensor.data_f32();
         unsafe {
@@ -715,9 +733,99 @@ mod tests {
         )
         .expect("pack_batch produced a batch");
 
+        // Per-row layout: batch_size=1, so length is exactly 257.
         assert_eq!(batch.doc_starts.len(), 257);
         assert_eq!(batch.doc_starts[0], 0);
         assert_eq!(batch.doc_starts[1], -1);
         assert_eq!(batch.doc_starts[256], -1);
+    }
+
+    #[test]
+    fn pack_batch_doc_starts_per_row_layout_batch2() {
+        // T2.6 — multi-batch correctness gap from T2.5.
+        //
+        // batch_size=2 with rows that have *different* doc layouts:
+        //   row 0: [10, 11, EOS=2, 20, 21, 22]    — two docs: lengths 3, 3
+        //   row 1: [30, 31, 32, 33, EOS=2, 40]    — two docs: lengths 5, 1
+        //
+        // Tier A's segment_ids resets to 0 per batch row, so each row needs
+        // its own doc_starts subtable indexed *relative to that row's local
+        // position 0*. The kernel reads doc_starts[row * 257 + segment_ids[idx]].
+        //
+        // Expected per-row subtables:
+        //   row 0 (offset 0):   [0, 3, -1, -1, ..., -1]
+        //   row 1 (offset 257): [0, 5, -1, -1, ..., -1]
+        //
+        // The independence is the load-bearing assertion: row 1's doc 1 starts
+        // at local position 5, NOT at flat position 6 + 5 = 11. The pre-T2.6
+        // implementation would have written 9 (= flat offset 6 + local 3) into
+        // doc_starts[1] from row 0 *only* and left row 1's entries unset.
+        let stream: Vec<f64> = vec![
+            // row 0 — two docs: [10, 11, EOS=2] then [20, 21, 22]
+            10.0, 11.0, 2.0, 20.0, 21.0, 22.0,
+            // row 1 — two docs: [30, 31, 32, 33, EOS=2] then [40]
+            30.0, 31.0, 32.0, 33.0, 2.0, 40.0,
+        ];
+        let mut cursor: usize = 0;
+        let batch = pack_batch(
+            stream.as_ptr() as *const c_void,
+            stream.len(),
+            0,         // DTYPE_F64
+            &mut cursor,
+            2,         // batch_size — the point of this test
+            6,         // seq_len
+            2,         // eos_token
+        )
+        .expect("pack_batch produced a batch");
+
+        // Sanity: segment_ids resets per row (Tier A invariant).
+        // Row 0: EOS at local pos 2 → segment_ids = [0,0,0,1,1,1]
+        // Row 1: EOS at local pos 4 → segment_ids = [0,0,0,0,0,1]
+        assert_eq!(
+            batch.segment_ids,
+            vec![0u16, 0, 0, 1, 1, 1,  0, 0, 0, 0, 0, 1],
+            "segment_ids must reset to 0 at each new batch row"
+        );
+
+        // Per-row doc_starts layout: [batch_size, MAX_NUM_DOCS+1] flat.
+        assert_eq!(batch.doc_starts.len(), 2 * (MAX_NUM_DOCS + 1));
+        assert_eq!(batch.doc_starts.len(), 2 * 257);
+
+        // Row 0 subtable lives at offset 0..257.
+        assert_eq!(batch.doc_starts[0 * 257 + 0], 0, "row 0 doc 0 starts at local pos 0");
+        assert_eq!(batch.doc_starts[0 * 257 + 1], 3, "row 0 doc 1 starts at local pos 3 (after EOS)");
+        assert_eq!(batch.doc_starts[0 * 257 + 2], -1, "row 0 has only 2 docs; slot 2 is sentinel");
+        assert_eq!(batch.doc_starts[0 * 257 + 256], -1, "row 0 last sentinel");
+
+        // Row 1 subtable lives at offset 257..514 — *independent* of row 0.
+        // Note row 1 doc 1 starts at LOCAL pos 5, not flat pos 11.
+        assert_eq!(batch.doc_starts[1 * 257 + 0], 0, "row 1 doc 0 starts at local pos 0 (row-local!)");
+        assert_eq!(batch.doc_starts[1 * 257 + 1], 5, "row 1 doc 1 starts at local pos 5 (row-local!)");
+        assert_eq!(batch.doc_starts[1 * 257 + 2], -1, "row 1 has only 2 docs; slot 2 is sentinel");
+        assert_eq!(batch.doc_starts[1 * 257 + 256], -1, "row 1 last sentinel");
+
+        // End-to-end: packed_batch_to_dict emits a [batch_size, MAX_NUM_DOCS+1]
+        // tensor, not [MAX_NUM_DOCS+1].
+        let dict = packed_batch_to_dict(&batch);
+        let k_ds = nsl_str_from_rust("doc_starts");
+        let ds_ptr = crate::dict::nsl_dict_get_str(dict, k_ds);
+        crate::string::nsl_string_free(k_ds);
+        let ds_tensor = NslTensor::from_ptr(ds_ptr);
+        assert_eq!(ds_tensor.ndim, 2, "doc_starts is now 2-D [batch_size, MAX_NUM_DOCS+1]");
+        unsafe {
+            assert_eq!(*ds_tensor.shape.add(0), 2, "batch_size dim");
+            assert_eq!(*ds_tensor.shape.add(1), (MAX_NUM_DOCS + 1) as i64, "per-row table dim");
+        }
+        let ds_data = ds_tensor.data_f32();
+        unsafe {
+            // Row 0
+            assert_eq!(*ds_data.add(0 * 257 + 0), 0.0);
+            assert_eq!(*ds_data.add(0 * 257 + 1), 3.0);
+            assert_eq!(*ds_data.add(0 * 257 + 2), -1.0);
+            // Row 1
+            assert_eq!(*ds_data.add(1 * 257 + 0), 0.0);
+            assert_eq!(*ds_data.add(1 * 257 + 1), 5.0);
+            assert_eq!(*ds_data.add(1 * 257 + 2), -1.0);
+        }
     }
 }
