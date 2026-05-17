@@ -1,0 +1,269 @@
+---
+source: crates/nsl-codegen/tests/tier_b1_phase_b_attention_snapshot.rs
+expression: ptx
+---
+    // === Phase B: attention compute on slot[0] (kv_iter=0) ===
+    // QK^T MMA: bq=32 bkv=32 tpw_qkt=1 slot=0 (scale=1/sqrt(32)=0f3E3504F3) (N3)
+    add.u64 %tb1_phase_b_smem_q, %shmem_base, 0; // Q tile @ tier_b1_q_offset
+    add.u64 %tb1_phase_b_smem_k, %shmem_base, 2048; // K tile @ slot=0 offset
+    .reg .u32 %tb1_phase_b_smem_q_u32, %tb1_phase_b_smem_k_u32;
+    cvt.u32.u64 %tb1_phase_b_smem_q_u32, %tb1_phase_b_smem_q;
+    cvt.u32.u64 %tb1_phase_b_smem_k_u32, %tb1_phase_b_smem_k;
+    .reg .u32 %qkt_global_t, %qkt_m_tile, %qkt_n_tile;
+    .reg .u32 %qkt_q_warp_off, %qkt_k_warp_off;
+    .reg .u32 %qkt_a_base, %qkt_b_base;
+    .reg .u32 %qkt_a_base_k, %qkt_b_base_k;
+    mov.u32 %qkt_global_t, %warp_id;
+    shr.u32 %qkt_m_tile, %qkt_global_t, 2;
+    and.b32 %qkt_n_tile, %qkt_global_t, 3;
+    shl.b32 %qkt_q_warp_off, %qkt_m_tile, 10;
+    add.u32 %qkt_a_base, %tb1_phase_b_smem_q_u32, %qkt_q_warp_off;
+    shl.b32 %qkt_k_warp_off, %qkt_n_tile, 9;
+    add.u32 %qkt_b_base, %tb1_phase_b_smem_k_u32, %qkt_k_warp_off;
+    .reg .b32 %tb1_qkt_a_0_0, %tb1_qkt_a_0_1, %tb1_qkt_a_0_2, %tb1_qkt_a_0_3;
+    .reg .b32 %tb1_qkt_b_0_0, %tb1_qkt_b_0_1;
+    // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
+    // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
+    //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
+    mov.u32 %mma_addr, %tid.x;              // load tid
+    and.b32 %mma_addr, %mma_addr, 31;       // lane = tid & 31
+    shr.u32 %mma_a_row, %mma_addr, 2;       // row_lo = lane / 4
+    mul.lo.u32 %mma_a_row, %mma_a_row, 64;  // row_lo * stride
+    and.b32 %mma_addr, %mma_addr, 3;        // lane % 4
+    shl.b32 %mma_addr, %mma_addr, 2;        // * 4 bytes (col_lo_bytes)
+    add.u32 %mma_a_row, %mma_a_row, %mma_addr;  // + col_lo_bytes
+    add.u32 %mma_a_row, %mma_a_row, %qkt_a_base;  // + smem base
+    ld.shared.b32 %tb1_qkt_a_0_0, [%mma_a_row];           // reg0 @ [row_lo, col_lo]
+    ld.shared.b32 %tb1_qkt_a_0_2, [%mma_a_row + 16];      // reg2 @ [row_lo, col_lo+8]
+    add.u32 %mma_a_row, %mma_a_row, 512;  // shift to row_hi (+8 rows)
+    ld.shared.b32 %tb1_qkt_a_0_1, [%mma_a_row];           // reg1 @ [row_hi, col_lo]
+    ld.shared.b32 %tb1_qkt_a_0_3, [%mma_a_row + 16];      // reg3 @ [row_hi, col_lo+8]
+    // Load B-fragment (k16xn8 col-major f16) per PTX m16n8k16 spec
+    // Lane t holds: reg0=B[(t%4)*2 .. +1, t/4], reg1=B[(t%4)*2+8 .. +9, t/4]
+    mov.u32 %mma_addr, %tid.x;              // load tid
+    and.b32 %mma_addr, %mma_addr, 31;       // lane = tid & 31
+    shr.u32 %mma_b_row, %mma_addr, 2;       // n_col = lane / 4
+    mul.lo.u32 %mma_b_row, %mma_b_row, 64;  // n_col * col_stride
+    and.b32 %mma_addr, %mma_addr, 3;        // lane % 4
+    shl.b32 %mma_addr, %mma_addr, 2;        // * 4 bytes (k_lo bytes)
+    add.u32 %mma_b_row, %mma_b_row, %mma_addr;  // + k_lo bytes
+    add.u32 %mma_b_row, %mma_b_row, %qkt_b_base;  // + smem base
+    ld.shared.b32 %tb1_qkt_b_0_0, [%mma_b_row];           // reg0 @ B[k_lo, n_col]
+    ld.shared.b32 %tb1_qkt_b_0_1, [%mma_b_row + 16];      // reg1 @ B[k_lo+8, n_col]
+    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+        {%s_acc_0_0, %s_acc_0_1, %s_acc_0_2, %s_acc_0_3},
+        {%tb1_qkt_a_0_0, %tb1_qkt_a_0_1, %tb1_qkt_a_0_2, %tb1_qkt_a_0_3},
+        {%tb1_qkt_b_0_0, %tb1_qkt_b_0_1},
+        {%s_acc_0_0, %s_acc_0_1, %s_acc_0_2, %s_acc_0_3};
+    add.u32 %qkt_a_base_k, %qkt_a_base, 32; // QK^T A k_iter=1
+    add.u32 %qkt_b_base_k, %qkt_b_base, 32; // QK^T B k_iter=1
+    // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
+    // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
+    //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
+    mov.u32 %mma_addr, %tid.x;              // load tid
+    and.b32 %mma_addr, %mma_addr, 31;       // lane = tid & 31
+    shr.u32 %mma_a_row, %mma_addr, 2;       // row_lo = lane / 4
+    mul.lo.u32 %mma_a_row, %mma_a_row, 64;  // row_lo * stride
+    and.b32 %mma_addr, %mma_addr, 3;        // lane % 4
+    shl.b32 %mma_addr, %mma_addr, 2;        // * 4 bytes (col_lo_bytes)
+    add.u32 %mma_a_row, %mma_a_row, %mma_addr;  // + col_lo_bytes
+    add.u32 %mma_a_row, %mma_a_row, %qkt_a_base_k;  // + smem base
+    ld.shared.b32 %tb1_qkt_a_0_0, [%mma_a_row];           // reg0 @ [row_lo, col_lo]
+    ld.shared.b32 %tb1_qkt_a_0_2, [%mma_a_row + 16];      // reg2 @ [row_lo, col_lo+8]
+    add.u32 %mma_a_row, %mma_a_row, 512;  // shift to row_hi (+8 rows)
+    ld.shared.b32 %tb1_qkt_a_0_1, [%mma_a_row];           // reg1 @ [row_hi, col_lo]
+    ld.shared.b32 %tb1_qkt_a_0_3, [%mma_a_row + 16];      // reg3 @ [row_hi, col_lo+8]
+    // Load B-fragment (k16xn8 col-major f16) per PTX m16n8k16 spec
+    // Lane t holds: reg0=B[(t%4)*2 .. +1, t/4], reg1=B[(t%4)*2+8 .. +9, t/4]
+    mov.u32 %mma_addr, %tid.x;              // load tid
+    and.b32 %mma_addr, %mma_addr, 31;       // lane = tid & 31
+    shr.u32 %mma_b_row, %mma_addr, 2;       // n_col = lane / 4
+    mul.lo.u32 %mma_b_row, %mma_b_row, 64;  // n_col * col_stride
+    and.b32 %mma_addr, %mma_addr, 3;        // lane % 4
+    shl.b32 %mma_addr, %mma_addr, 2;        // * 4 bytes (k_lo bytes)
+    add.u32 %mma_b_row, %mma_b_row, %mma_addr;  // + k_lo bytes
+    add.u32 %mma_b_row, %mma_b_row, %qkt_b_base_k;  // + smem base
+    ld.shared.b32 %tb1_qkt_b_0_0, [%mma_b_row];           // reg0 @ B[k_lo, n_col]
+    ld.shared.b32 %tb1_qkt_b_0_1, [%mma_b_row + 16];      // reg1 @ B[k_lo+8, n_col]
+    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+        {%s_acc_0_0, %s_acc_0_1, %s_acc_0_2, %s_acc_0_3},
+        {%tb1_qkt_a_0_0, %tb1_qkt_a_0_1, %tb1_qkt_a_0_2, %tb1_qkt_a_0_3},
+        {%tb1_qkt_b_0_0, %tb1_qkt_b_0_1},
+        {%s_acc_0_0, %s_acc_0_1, %s_acc_0_2, %s_acc_0_3};
+    // Apply 1/sqrt(head_dim=32) scale to S accumulators (deferral #5)
+    mul.f32 %s_acc_0_0, %s_acc_0_0, 0f3E3504F3;
+    mul.f32 %s_acc_0_1, %s_acc_0_1, 0f3E3504F3;
+    mul.f32 %s_acc_0_2, %s_acc_0_2, 0f3E3504F3;
+    mul.f32 %s_acc_0_3, %s_acc_0_3, 0f3E3504F3;
+    // Online softmax: bq=32 tpw_qkt=1 kv_iter=0
+    // === softmax tile t=0 : row-max bfly tree (deferral #6 partial) ===
+    .reg .f32 %s_max_0_lo, %s_max_0_hi, %s_shfl_0_tmp;
+    max.f32 %s_max_0_lo, %s_acc_0_0, %s_acc_0_1;
+    max.f32 %s_max_0_hi, %s_acc_0_2, %s_acc_0_3;
+    shfl.sync.bfly.b32 %s_shfl_0_tmp, %s_max_0_lo, 1, 0x1f, 0xffffffff; // lane k <-> k^1
+    max.f32 %s_max_0_lo, %s_max_0_lo, %s_shfl_0_tmp;
+    shfl.sync.bfly.b32 %s_shfl_0_tmp, %s_max_0_hi, 1, 0x1f, 0xffffffff; // lane k <-> k^1
+    max.f32 %s_max_0_hi, %s_max_0_hi, %s_shfl_0_tmp;
+    shfl.sync.bfly.b32 %s_shfl_0_tmp, %s_max_0_lo, 2, 0x1f, 0xffffffff; // lane k <-> k^2
+    max.f32 %s_max_0_lo, %s_max_0_lo, %s_shfl_0_tmp;
+    shfl.sync.bfly.b32 %s_shfl_0_tmp, %s_max_0_hi, 2, 0x1f, 0xffffffff; // lane k <-> k^2
+    max.f32 %s_max_0_hi, %s_max_0_hi, %s_shfl_0_tmp;
+    // subtract row_max, scale by log2(e), apply ex2.approx (deferral #6)
+    sub.f32 %s_acc_0_0, %s_acc_0_0, %s_max_0_lo;
+    mul.f32 %s_acc_0_0, %s_acc_0_0, 0f3FB8AA3B; // * log2(e)
+    ex2.approx.f32 %s_acc_0_0, %s_acc_0_0;
+    sub.f32 %s_acc_0_1, %s_acc_0_1, %s_max_0_lo;
+    mul.f32 %s_acc_0_1, %s_acc_0_1, 0f3FB8AA3B; // * log2(e)
+    ex2.approx.f32 %s_acc_0_1, %s_acc_0_1;
+    sub.f32 %s_acc_0_2, %s_acc_0_2, %s_max_0_hi;
+    mul.f32 %s_acc_0_2, %s_acc_0_2, 0f3FB8AA3B; // * log2(e)
+    ex2.approx.f32 %s_acc_0_2, %s_acc_0_2;
+    sub.f32 %s_acc_0_3, %s_acc_0_3, %s_max_0_hi;
+    mul.f32 %s_acc_0_3, %s_acc_0_3, 0f3FB8AA3B; // * log2(e)
+    ex2.approx.f32 %s_acc_0_3, %s_acc_0_3;
+    .reg .f32 %s_sum_0_lo, %s_sum_0_hi;
+    add.f32 %s_sum_0_lo, %s_acc_0_0, %s_acc_0_1;
+    add.f32 %s_sum_0_hi, %s_acc_0_2, %s_acc_0_3;
+    shfl.sync.bfly.b32 %s_shfl_0_tmp, %s_sum_0_lo, 1, 0x1f, 0xffffffff; // lane k <-> k^1
+    add.f32 %s_sum_0_lo, %s_sum_0_lo, %s_shfl_0_tmp;
+    shfl.sync.bfly.b32 %s_shfl_0_tmp, %s_sum_0_hi, 1, 0x1f, 0xffffffff; // lane k <-> k^1
+    add.f32 %s_sum_0_hi, %s_sum_0_hi, %s_shfl_0_tmp;
+    shfl.sync.bfly.b32 %s_shfl_0_tmp, %s_sum_0_lo, 2, 0x1f, 0xffffffff; // lane k <-> k^2
+    add.f32 %s_sum_0_lo, %s_sum_0_lo, %s_shfl_0_tmp;
+    shfl.sync.bfly.b32 %s_shfl_0_tmp, %s_sum_0_hi, 2, 0x1f, 0xffffffff; // lane k <-> k^2
+    add.f32 %s_sum_0_hi, %s_sum_0_hi, %s_shfl_0_tmp;
+    div.approx.f32 %s_acc_0_0, %s_acc_0_0, %s_sum_0_lo;
+    div.approx.f32 %s_acc_0_1, %s_acc_0_1, %s_sum_0_lo;
+    div.approx.f32 %s_acc_0_2, %s_acc_0_2, %s_sum_0_hi;
+    div.approx.f32 %s_acc_0_3, %s_acc_0_3, %s_sum_0_hi;
+    cvt.rn.f16.f32 %mma_h0, %s_acc_0_0;
+    cvt.rn.f16.f32 %mma_h1, %s_acc_0_1;
+    mov.b32 %p_packed_0, {%mma_h0, %mma_h1};
+    // === P scatter to SMEM (PV A-fragment bridge + N3) ===
+    .reg .u32 %sp_laneid, %sp_lo_row, %sp_lo_col_base;
+    .reg .u32 %sp_row_off, %sp_col_off, %sp_lane_off;
+    .reg .u32 %sp_addr_u32, %sp_addr_i;
+    .reg .u32 %sp_global_t, %sp_m_tile, %sp_n_tile;
+    .reg .u32 %sp_tile_off, %sp_m_off, %sp_n_off;
+    .reg .u64 %sp_addr_u64;
+    .reg .b16 %sp_h;
+    mov.u32 %sp_laneid, %tid.x;
+    and.b32 %sp_laneid, %sp_laneid, 31;
+    shr.u32 %sp_lo_row, %sp_laneid, 2;       // l/4 = D-fragment lo-row
+    and.b32 %sp_lo_col_base, %sp_laneid, 3;  // l%4
+    shl.b32 %sp_lo_col_base, %sp_lo_col_base, 1; // (l%4)*2 = col base
+    mul.lo.u32 %sp_row_off, %sp_lo_row, 64;  // row * block_kv * 2 bytes
+    shl.b32 %sp_col_off, %sp_lo_col_base, 1;     // col * 2 bytes (f16)
+    add.u32 %sp_lane_off, %sp_row_off, %sp_col_off;
+    // P scatter slot local_t=0 (global_t = warp_id + 0*8 at runtime; N3)
+    mov.u32 %sp_global_t, %warp_id;
+    shr.u32 %sp_m_tile, %sp_global_t, 2;
+    and.b32 %sp_n_tile, %sp_global_t, 3;
+    shl.b32 %sp_m_off, %sp_m_tile, 10;
+    shl.b32 %sp_n_off, %sp_n_tile, 4;
+    add.u32 %sp_tile_off, %sp_m_off, %sp_n_off;
+    add.u64 %sp_addr_u64, %shmem_base, 10240;
+    cvt.u32.u64 %sp_addr_u32, %sp_addr_u64;
+    add.u32 %sp_addr_u32, %sp_addr_u32, %sp_tile_off;
+    add.u32 %sp_addr_u32, %sp_addr_u32, %sp_lane_off;
+    mov.u32 %sp_addr_i, %sp_addr_u32;
+    cvt.rn.f16.f32 %sp_h, %s_acc_0_0;
+    st.shared.b16 [%sp_addr_i], %sp_h;
+    add.u32 %sp_addr_i, %sp_addr_u32, 2;
+    cvt.rn.f16.f32 %sp_h, %s_acc_0_1;
+    st.shared.b16 [%sp_addr_i], %sp_h;
+    add.u32 %sp_addr_i, %sp_addr_u32, 512;
+    cvt.rn.f16.f32 %sp_h, %s_acc_0_2;
+    st.shared.b16 [%sp_addr_i], %sp_h;
+    add.u32 %sp_addr_i, %sp_addr_u32, 514;
+    cvt.rn.f16.f32 %sp_h, %s_acc_0_3;
+    st.shared.b16 [%sp_addr_i], %sp_h;
+    bar.sync 0;
+    // PV MMA: bq=32 hd=32 tpw_pv=1 slot=0 (N3)
+    add.u64 %tb1_phase_b_smem_v, %shmem_base, 6144; // V tile @ slot=0 offset
+    .reg .u32 %tb1_phase_b_smem_v_u32;
+    cvt.u32.u64 %tb1_phase_b_smem_v_u32, %tb1_phase_b_smem_v;
+    add.u64 %tb1_phase_b_smem_q, %shmem_base, 10240; // P_smem base (reusing q-slot u64 reg)
+    .reg .u32 %tb1_phase_b_smem_p_u32;
+    cvt.u32.u64 %tb1_phase_b_smem_p_u32, %tb1_phase_b_smem_q;
+    .reg .u32 %pv_global_t, %pv_m_tile, %pv_n_tile;
+    .reg .u32 %pv_p_warp_off, %pv_v_warp_off;
+    .reg .u32 %pv_a_base, %pv_b_base;
+    .reg .u32 %pv_a_base_k, %pv_b_base_k;
+    .reg .b32 %tb1_pv_a_0_0, %tb1_pv_a_0_1, %tb1_pv_a_0_2, %tb1_pv_a_0_3;
+    .reg .b32 %tb1_pv_b_0_0, %tb1_pv_b_0_1;
+    mov.u32 %pv_global_t, %warp_id;
+    shr.u32 %pv_m_tile, %pv_global_t, 2;
+    and.b32 %pv_n_tile, %pv_global_t, 3;
+    shl.b32 %pv_p_warp_off, %pv_m_tile, 10;
+    add.u32 %pv_a_base, %tb1_phase_b_smem_p_u32, %pv_p_warp_off;
+    shl.b32 %pv_v_warp_off, %pv_n_tile, 4;
+    add.u32 %pv_b_base, %tb1_phase_b_smem_v_u32, %pv_v_warp_off;
+    // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
+    // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
+    //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
+    mov.u32 %mma_addr, %tid.x;              // load tid
+    and.b32 %mma_addr, %mma_addr, 31;       // lane = tid & 31
+    shr.u32 %mma_a_row, %mma_addr, 2;       // row_lo = lane / 4
+    mul.lo.u32 %mma_a_row, %mma_a_row, 64;  // row_lo * stride
+    and.b32 %mma_addr, %mma_addr, 3;        // lane % 4
+    shl.b32 %mma_addr, %mma_addr, 2;        // * 4 bytes (col_lo_bytes)
+    add.u32 %mma_a_row, %mma_a_row, %mma_addr;  // + col_lo_bytes
+    add.u32 %mma_a_row, %mma_a_row, %pv_a_base;  // + smem base
+    ld.shared.b32 %tb1_pv_a_0_0, [%mma_a_row];           // reg0 @ [row_lo, col_lo]
+    ld.shared.b32 %tb1_pv_a_0_2, [%mma_a_row + 16];      // reg2 @ [row_lo, col_lo+8]
+    add.u32 %mma_a_row, %mma_a_row, 512;  // shift to row_hi (+8 rows)
+    ld.shared.b32 %tb1_pv_a_0_1, [%mma_a_row];           // reg1 @ [row_hi, col_lo]
+    ld.shared.b32 %tb1_pv_a_0_3, [%mma_a_row + 16];      // reg3 @ [row_hi, col_lo+8]
+    // Load B-fragment (k16xn8 col-major f16) per PTX m16n8k16 spec
+    // Lane t holds: reg0=B[(t%4)*2 .. +1, t/4], reg1=B[(t%4)*2+8 .. +9, t/4]
+    mov.u32 %mma_addr, %tid.x;              // load tid
+    and.b32 %mma_addr, %mma_addr, 31;       // lane = tid & 31
+    shr.u32 %mma_b_row, %mma_addr, 2;       // n_col = lane / 4
+    mul.lo.u32 %mma_b_row, %mma_b_row, 64;  // n_col * col_stride
+    and.b32 %mma_addr, %mma_addr, 3;        // lane % 4
+    shl.b32 %mma_addr, %mma_addr, 2;        // * 4 bytes (k_lo bytes)
+    add.u32 %mma_b_row, %mma_b_row, %mma_addr;  // + k_lo bytes
+    add.u32 %mma_b_row, %mma_b_row, %pv_b_base;  // + smem base
+    ld.shared.b32 %tb1_pv_b_0_0, [%mma_b_row];           // reg0 @ B[k_lo, n_col]
+    ld.shared.b32 %tb1_pv_b_0_1, [%mma_b_row + 16];      // reg1 @ B[k_lo+8, n_col]
+    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+        {%o_acc_0_0, %o_acc_0_1, %o_acc_0_2, %o_acc_0_3},
+        {%tb1_pv_a_0_0, %tb1_pv_a_0_1, %tb1_pv_a_0_2, %tb1_pv_a_0_3},
+        {%tb1_pv_b_0_0, %tb1_pv_b_0_1},
+        {%o_acc_0_0, %o_acc_0_1, %o_acc_0_2, %o_acc_0_3};
+    add.u32 %pv_a_base_k, %pv_a_base, 32; // PV A-base shift k_iter=1
+    add.u32 %pv_b_base_k, %pv_b_base, 1024; // PV B-base shift k_iter=1
+    // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
+    // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
+    //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
+    mov.u32 %mma_addr, %tid.x;              // load tid
+    and.b32 %mma_addr, %mma_addr, 31;       // lane = tid & 31
+    shr.u32 %mma_a_row, %mma_addr, 2;       // row_lo = lane / 4
+    mul.lo.u32 %mma_a_row, %mma_a_row, 64;  // row_lo * stride
+    and.b32 %mma_addr, %mma_addr, 3;        // lane % 4
+    shl.b32 %mma_addr, %mma_addr, 2;        // * 4 bytes (col_lo_bytes)
+    add.u32 %mma_a_row, %mma_a_row, %mma_addr;  // + col_lo_bytes
+    add.u32 %mma_a_row, %mma_a_row, %pv_a_base_k;  // + smem base
+    ld.shared.b32 %tb1_pv_a_0_0, [%mma_a_row];           // reg0 @ [row_lo, col_lo]
+    ld.shared.b32 %tb1_pv_a_0_2, [%mma_a_row + 16];      // reg2 @ [row_lo, col_lo+8]
+    add.u32 %mma_a_row, %mma_a_row, 512;  // shift to row_hi (+8 rows)
+    ld.shared.b32 %tb1_pv_a_0_1, [%mma_a_row];           // reg1 @ [row_hi, col_lo]
+    ld.shared.b32 %tb1_pv_a_0_3, [%mma_a_row + 16];      // reg3 @ [row_hi, col_lo+8]
+    // Load B-fragment (k16xn8 col-major f16) per PTX m16n8k16 spec
+    // Lane t holds: reg0=B[(t%4)*2 .. +1, t/4], reg1=B[(t%4)*2+8 .. +9, t/4]
+    mov.u32 %mma_addr, %tid.x;              // load tid
+    and.b32 %mma_addr, %mma_addr, 31;       // lane = tid & 31
+    shr.u32 %mma_b_row, %mma_addr, 2;       // n_col = lane / 4
+    mul.lo.u32 %mma_b_row, %mma_b_row, 64;  // n_col * col_stride
+    and.b32 %mma_addr, %mma_addr, 3;        // lane % 4
+    shl.b32 %mma_addr, %mma_addr, 2;        // * 4 bytes (k_lo bytes)
+    add.u32 %mma_b_row, %mma_b_row, %mma_addr;  // + k_lo bytes
+    add.u32 %mma_b_row, %mma_b_row, %pv_b_base_k;  // + smem base
+    ld.shared.b32 %tb1_pv_b_0_0, [%mma_b_row];           // reg0 @ B[k_lo, n_col]
+    ld.shared.b32 %tb1_pv_b_0_1, [%mma_b_row + 16];      // reg1 @ B[k_lo+8, n_col]
+    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32
+        {%o_acc_0_0, %o_acc_0_1, %o_acc_0_2, %o_acc_0_3},
+        {%tb1_pv_a_0_0, %tb1_pv_a_0_1, %tb1_pv_a_0_2, %tb1_pv_a_0_3},
+        {%tb1_pv_b_0_0, %tb1_pv_b_0_1},
+        {%o_acc_0_0, %o_acc_0_1, %o_acc_0_2, %o_acc_0_3};

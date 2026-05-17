@@ -409,6 +409,40 @@ fn csha_tensor_data_ptr(tensor_ptr: i64) -> u64 {
 /// extras declared by `emit_flash_attention_entry` (csha_x_ptr through
 /// csha_d_model).
 ///
+/// Pick the per-CTA threadcount (`block_x`) for the CSHA forward FFIs.
+///
+/// Tier B.1 codegen (`flash_attention_v2::tier_b1::synthesize`) emits a
+/// `global_t = warp_id + local_t * 8` warp distribution that assumes 8
+/// warps per CTA = 256 threads. Tier A v2 (and the classic FA path) uses
+/// 4 warps = 128 threads. The codegen embeds a `_tier_b1` suffix in the
+/// kernel name when Tier B.1 dispatch applies (`csha.level >= 2 &&
+/// gpu_sm >= 80` per `flash_attention_v2::is_tier_b1_dispatch`). This
+/// helper peeks at the null-terminated name string and selects the
+/// right block_x.
+///
+/// Carrying the signal in the kernel name (rather than as a new FFI
+/// arg) keeps the 37-arg ABI stable — every existing caller continues
+/// to work; only the name string they pass through changes for the
+/// Tier B.1 dispatch path.
+///
+/// Safety: caller guarantees `name_ptr`, when non-zero, points to a
+/// null-terminated C string allocated by `CString` or similar.
+#[cfg(feature = "cuda")]
+fn csha_block_x_for_kernel(name_ptr: i64) -> i64 {
+    if name_ptr == 0 {
+        return 128;
+    }
+    let name_bytes = unsafe {
+        std::ffi::CStr::from_ptr(name_ptr as *const i8).to_bytes()
+    };
+    // Marker is short (8 bytes); scan is O(name_len * 8) per launch.
+    if name_bytes.windows(b"_tier_b1".len()).any(|w| w == b"_tier_b1") {
+        256
+    } else {
+        128
+    }
+}
+
 /// A.2.5: this replaces the pre-A.2.5 forwarder (which invoked
 /// `nsl_flash_attention` and dropped the extras, causing a cuLaunch arg
 /// count mismatch on kernels whose body now references the CSHA params).
@@ -516,7 +550,19 @@ pub extern "C" fn nsl_flash_attention_csha(
         let grid_x = (seq_len + block_q - 1) / block_q;
         let grid_y = batch * effective_heads;
         let grid_z = 1i64;
-        let block_x = 128i64;
+        // Tier B.1 launch geometry: the pipelined-MMA codegen emits a
+        // `global_t = warp_id + local_t * 8` warp distribution
+        // assuming 8 warps per CTA. Tier A v2 (and the classic FA path)
+        // use 4 warps. The codegen embeds a `_tier_b1` suffix in the
+        // kernel name when Tier B.1 dispatch applies
+        // (`csha.level >= 2 && gpu_sm >= 80` per
+        // `flash_attention_v2::is_tier_b1_dispatch`). Peek at the
+        // null-terminated name string here to pick the right block_x.
+        //
+        // Carrying the signal in the kernel name keeps the FFI ABI
+        // stable — all existing 37-arg callers continue to work; only
+        // the name string they pass through changes for Tier B.1.
+        let block_x = csha_block_x_for_kernel(name_ptr);
         let block_y = 1i64;
         let block_z = 1i64;
 
@@ -780,7 +826,10 @@ pub extern "C" fn nsl_flash_attention_csha_with_saves(
         let grid_x = (seq_len + block_q - 1) / block_q;
         let grid_y = batch * effective_heads;
         let grid_z = 1i64;
-        let block_x = 128i64;
+        // Tier B.1 launch geometry signal via kernel name suffix; see
+        // `csha_block_x_for_kernel` and the matching comment in
+        // `nsl_flash_attention_csha`.
+        let block_x = csha_block_x_for_kernel(name_ptr);
         let block_y = 1i64;
         let block_z = 1i64;
 

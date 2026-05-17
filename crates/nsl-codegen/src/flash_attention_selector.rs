@@ -140,6 +140,7 @@ mod selector_tests {
                 rmsnorm_eps: 1e-5,
                 d_model: head_dim as u32,
                 save_activations_for_backward: false,
+                skip_rmsnorm_prologue: false,
             }),
         }
     }

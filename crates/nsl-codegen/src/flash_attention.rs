@@ -221,6 +221,16 @@ pub struct CshaExtras {
     /// compiler. Inference builds leave this false; forward pays zero
     /// extra HBM cost.
     pub save_activations_for_backward: bool,
+    /// **Tier B.1 only.** When true, `tier_b1::synthesize` omits the
+    /// RMSNorm prologue (`csha_hooks::emit_prologue`) entirely and
+    /// expects the caller to provide `csha_x_ptr` as already-normalized,
+    /// already-narrowed-to-f16, already-chunkified data in the
+    /// `[d_model/chunk, bq | bkv, chunk]` f16 chunks-major HBM layout
+    /// the projection cp.async expects. Used by the N4 end-to-end
+    /// validation test and by future CSHA pipelines that own the
+    /// narrow+chunkify pre-pass externally. Default false (RMSNorm
+    /// prologue runs as before; current callers see no behavior change).
+    pub skip_rmsnorm_prologue: bool,
 }
 
 impl CshaExtras {
@@ -236,6 +246,7 @@ impl CshaExtras {
             rmsnorm_eps,
             d_model: 0,
             save_activations_for_backward: false,
+            skip_rmsnorm_prologue: false,
         }
     }
 
@@ -250,6 +261,7 @@ impl CshaExtras {
             rmsnorm_eps,
             d_model,
             save_activations_for_backward: false,
+            skip_rmsnorm_prologue: false,
         }
     }
 
@@ -2180,103 +2192,24 @@ fn emit_f32_to_f16_pack(ptx: &mut String, src_f32: &[String], dst_b32: &[String]
     }
 }
 
-/// Emit PTX to load an MMA A-fragment (m16xk16, row-major f16) from shared memory.
-///
-/// In m16n8k16, the A-fragment maps as follows:
-/// - Thread t holds rows at: row = (t%4)*2 + (t/16), row+8 (for groups 0,1)
-/// - Each thread holds 8 f16 values in 4 .b32 registers
-/// - Registers a0,a1 cover k=0..7; a2,a3 cover k=8..15
-///
-/// `frag_regs`: 4 .b32 register names for the fragment output.
-/// `smem_base_expr`: PTX expression for shared memory base address.
-/// `row_stride`: row stride in bytes (head_dim * 2 for f16, or head_dim * 4 for f32 shmem).
-#[allow(dead_code)]
-fn emit_load_a_fragment_smem(
-    ptx: &mut String,
-    frag_regs: &[String; 4],
-    smem_base_expr: &str,
-    row_stride: usize,
-) {
-    ptx.push_str("    // Load A-fragment (m16xk16 row-major) from shared memory\n");
-    // Each thread's row: row = (laneid % 4) * 2 + (laneid / 16)
-    // But we load 4 .b32 registers covering 4 pairs of f16 values
-    // Registers 0,1 are k=0..7; registers 2,3 are k=8..15
-    // Within each pair, the two f16s are at consecutive addresses
-    for (reg_idx, k_base_pair) in [(0, 0usize), (1, 4), (2, 8), (3, 12)].iter() {
-        let byte_col_offset = k_base_pair * 2; // each f16 is 2 bytes, pairs of 2 f16 = 4 bytes
-        ptx.push_str(&format!(
-            "    mad.lo.u32 %mma_addr, %mma_a_row, {}, {};  // row * stride + base\n",
-            row_stride, smem_base_expr
-        ));
-        ptx.push_str(&format!(
-            "    add.u32 %mma_addr, %mma_addr, {};  // + k_col byte offset\n",
-            byte_col_offset
-        ));
-        ptx.push_str(&format!(
-            "    ld.shared.b32 %{}, [%mma_addr];\n",
-            frag_regs[*reg_idx]
-        ));
-    }
-}
-
-/// Emit PTX to load an MMA B-fragment (k16xn8, col-major f16) from shared memory.
-///
-/// In m16n8k16, the B-fragment maps as follows:
-/// - Each thread holds 4 f16 values in 2 .b32 registers
-/// - Registers b0 covers k=0..7, b1 covers k=8..15
-///
-/// `frag_regs`: 2 .b32 register names.
-/// `smem_base_expr`: PTX expression for shared memory base address.
-/// `row_stride`: row stride in bytes for the K/V matrix in shared memory.
-#[allow(dead_code)]
-fn emit_load_b_fragment_smem(
-    ptx: &mut String,
-    frag_regs: &[String; 2],
-    smem_base_expr: &str,
-    row_stride: usize,
-) {
-    ptx.push_str("    // Load B-fragment (k16xn8 col-major) from shared memory\n");
-    for (reg_idx, k_base_pair) in [(0, 0usize), (1, 8)].iter() {
-        let byte_col_offset = k_base_pair * 2;
-        ptx.push_str(&format!(
-            "    mad.lo.u32 %mma_addr, %mma_b_row, {}, {};  // row * stride + base\n",
-            row_stride, smem_base_expr
-        ));
-        ptx.push_str(&format!(
-            "    add.u32 %mma_addr, %mma_addr, {};  // + k byte offset\n",
-            byte_col_offset
-        ));
-        ptx.push_str(&format!(
-            "    ld.shared.b32 %{}, [%mma_addr];\n",
-            frag_regs[*reg_idx]
-        ));
-    }
-}
-
-/// Emit PTX for a single MMA instruction: D = A @ B + C (all in-register).
-#[allow(dead_code)]
-fn emit_mma_instruction(
-    ptx: &mut String,
-    d_regs: &[String; 4], // D accumulator (f32 x4)
-    a_regs: &[String; 4], // A fragment (.b32 x4)
-    b_regs: &[String; 2], // B fragment (.b32 x2)
-    c_regs: &[String; 4], // C accumulator (f32 x4)
-) {
-    ptx.push_str("    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32\n");
-    ptx.push_str(&format!(
-        "        {{{}, {}, {}, {}}},\n",
-        d_regs[0], d_regs[1], d_regs[2], d_regs[3]
-    ));
-    ptx.push_str(&format!(
-        "        {{{}, {}, {}, {}}},\n",
-        a_regs[0], a_regs[1], a_regs[2], a_regs[3]
-    ));
-    ptx.push_str(&format!("        {{{}, {}}},\n", b_regs[0], b_regs[1]));
-    ptx.push_str(&format!(
-        "        {{{}, {}, {}, {}}};\n",
-        c_regs[0], c_regs[1], c_regs[2], c_regs[3]
-    ));
-}
+// File-local duplicates of `emit_load_a_fragment_smem`,
+// `emit_load_b_fragment_smem`, and `emit_mma_instruction` were deleted
+// post-N4 helper rewrite (2026-05-15). They were dead production code —
+// the live call sites at lines ~1029-1056 use the
+// `crate::matmul_mma::emit_load_*_fragment_smem` versions, which the N4
+// helper-convention rewrite (commits 1ca2a62f + f6c9958b) brought into
+// PTX m16n8k16 spec compliance. The dead local copies still emitted the
+// broken single-row-fixed-col-pattern AND the `mad.lo.u32` form that
+// causes CUDA_ERROR_INVALID_PTX on PTX ISA 7.0 (see MEMORY.md). Keeping
+// them as `#[allow(dead_code)]` was a latent landmine: any future
+// reader copying the pattern would inherit both bugs.
+//
+// The three `#[cfg(test)]` tests that exercised them
+// (`test_load_a_fragment_emission`, `test_load_b_fragment_emission`,
+// `test_qk_mma_ptx_emission`) now call the public matmul_mma versions
+// directly via `crate::matmul_mma::emit_*` — they still validate the
+// emission shape (comment present, expected count of `ld.shared.b32` /
+// `mma.sync` lines).
 
 /// Emit the Q@K^T matmul using MMA instructions.
 ///
@@ -5589,7 +5522,7 @@ mod tests {
         let a = ["a0".into(), "a1".into(), "a2".into(), "a3".into()];
         let b = ["b0".into(), "b1".into()];
         let c = ["c0".into(), "c1".into(), "c2".into(), "c3".into()];
-        emit_mma_instruction(&mut ptx, &d, &a, &b, &c);
+        crate::matmul_mma::emit_mma_instruction(&mut ptx, &d, &a, &b, &c);
 
         assert!(
             ptx.contains("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32"),
@@ -5746,7 +5679,7 @@ mod tests {
     fn test_load_a_fragment_emission() {
         let mut ptx = String::new();
         let regs: [String; 4] = ["aq0".into(), "aq1".into(), "aq2".into(), "aq3".into()];
-        emit_load_a_fragment_smem(&mut ptx, &regs, "shmem_q", 256);
+        crate::matmul_mma::emit_load_a_fragment_smem(&mut ptx, &regs, "shmem_q", 256);
 
         assert!(ptx.contains("Load A-fragment"), "comment present");
         assert!(ptx.contains("ld.shared.b32 %aq0"), "loads first register");
@@ -5759,7 +5692,7 @@ mod tests {
     fn test_load_b_fragment_emission() {
         let mut ptx = String::new();
         let regs: [String; 2] = ["bk0".into(), "bk1".into()];
-        emit_load_b_fragment_smem(&mut ptx, &regs, "shmem_k", 128);
+        crate::matmul_mma::emit_load_b_fragment_smem(&mut ptx, &regs, "shmem_k", 128);
 
         assert!(ptx.contains("Load B-fragment"), "comment present");
         assert_eq!(ptx.matches("ld.shared.b32").count(), 2, "2 fragment loads");
@@ -6836,24 +6769,47 @@ mod tests {
         // iteration. The load is emitted as `mul.lo.u32` + `add.u32`
         // rather than `mad.lo.u32` because the fused multiply-add form is
         // rejected by CUDA at runtime on PTX ISA 7.0 (see MEMORY.md).
+        //
+        // PTX-spec-rewrite update (post N4 helper rewrite, 2026-05-15): the
+        // A-fragment helper now computes per-lane addressing internally
+        // from `%lane` and writes to `%mma_a_row` as a scratch (rather
+        // than expecting callers to pre-set `%mma_a_row`). Emission is:
+        //   shr.u32 %mma_addr, %lane, 2          ; row_lo = lane / 4
+        //   mul.lo.u32 %mma_a_row, %mma_addr, <stride>
+        //   and.b32 %mma_addr, %lane, 3
+        //   shl.b32 %mma_addr, %mma_addr, 2      ; col_lo_bytes
+        //   add.u32 %mma_a_row, %mma_a_row, %mma_addr
+        //   add.u32 %mma_a_row, %mma_a_row, <base>
+        //   ld.shared.b32 ...                    ; reg 0
+        // Test assertions track the new pattern (multiplicand order swap;
+        // accumulator reg is %mma_a_row not %mma_addr; base add target
+        // is %mma_a_row).
         let ptx = String::from_utf8(synthesize_flash_attention_ptx(&csha_l2_config())).unwrap();
         // A stride = head_dim * 2 = 128 * 2 = 256 bytes.
+        // The new helper computes row_lo in %mma_a_row in-place
+        // (`shr.u32 %mma_a_row, %mma_addr, 2`) then multiplies that
+        // accumulator by the stride. Pattern is therefore
+        // `mul.lo.u32 %mma_a_row, %mma_a_row, <stride>`.
         assert!(
-            ptx.contains("mul.lo.u32 %mma_addr, %mma_a_row, 256;"),
-            "A-fragment load must multiply row by the tile stride"
+            ptx.contains("mul.lo.u32 %mma_a_row, %mma_a_row, 256;"),
+            "A-fragment load must multiply row offset by the tile stride; got:\n{}",
+            &ptx[..ptx.len().min(4000)]
         );
         assert!(
-            ptx.contains("add.u32 %mma_addr, %mma_addr, %ts_a_base;"),
-            "A-fragment load must add the tile-base register"
+            ptx.contains("add.u32 %mma_a_row, %mma_a_row, %ts_a_base;"),
+            "A-fragment load must add the tile-base register to the row+col offset"
         );
-        // B stride = d_model.min(256) * 2 = 256 * 2 = 512 bytes.
+        // B-fragment helper post-rewrite: same self-contained per-lane
+        // derivation as A-frag. Emission stores n_col*col_stride in
+        // %mma_b_row (in-place after shr → mul) then adds k_lo bytes +
+        // base. Pattern is `mul.lo.u32 %mma_b_row, %mma_b_row, <stride>`.
         assert!(
-            ptx.contains("mul.lo.u32 %mma_addr, %mma_b_row, 512;"),
-            "B-fragment load must multiply row by the tile stride"
+            ptx.contains("mul.lo.u32 %mma_b_row, %mma_b_row, 512;"),
+            "B-fragment load must multiply n_col by the col stride"
         );
         assert!(
-            ptx.contains("add.u32 %mma_addr, %mma_addr, %ts_b_base;"),
-            "B-fragment load must add the tile-base register"
+            ptx.contains("add.u32 %mma_b_row, %mma_b_row, %ts_b_base;"),
+            "B-fragment load must add the tile-base register to the n_col+k_lo offset"
         );
     }
 
