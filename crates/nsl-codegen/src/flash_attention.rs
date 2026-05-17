@@ -221,6 +221,16 @@ pub struct CshaExtras {
     /// compiler. Inference builds leave this false; forward pays zero
     /// extra HBM cost.
     pub save_activations_for_backward: bool,
+    /// **Tier B.1 only.** When true, `tier_b1::synthesize` omits the
+    /// RMSNorm prologue (`csha_hooks::emit_prologue`) entirely and
+    /// expects the caller to provide `csha_x_ptr` as already-normalized,
+    /// already-narrowed-to-f16, already-chunkified data in the
+    /// `[d_model/chunk, bq | bkv, chunk]` f16 chunks-major HBM layout
+    /// the projection cp.async expects. Used by the N4 end-to-end
+    /// validation test and by future CSHA pipelines that own the
+    /// narrow+chunkify pre-pass externally. Default false (RMSNorm
+    /// prologue runs as before; current callers see no behavior change).
+    pub skip_rmsnorm_prologue: bool,
 }
 
 impl CshaExtras {
@@ -236,6 +246,7 @@ impl CshaExtras {
             rmsnorm_eps,
             d_model: 0,
             save_activations_for_backward: false,
+            skip_rmsnorm_prologue: false,
         }
     }
 
@@ -250,6 +261,7 @@ impl CshaExtras {
             rmsnorm_eps,
             d_model,
             save_activations_for_backward: false,
+            skip_rmsnorm_prologue: false,
         }
     }
 

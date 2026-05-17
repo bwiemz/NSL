@@ -118,10 +118,31 @@ pub fn synthesize(config: &FlashAttentionConfig, chunk: u32) -> Vec<u8> {
     // 4. RMSNorm pre-pass. Each q_tile_iter normalises its rows into
     // csha_x_ptr. 8-warp partition extension deferred to B1.6 (Task 5.2
     // module rustdoc Phase-B deferral #4 covers the broader hoist).
-    let iters = (config.block_q as u32).div_ceil(4);
-    for q_iter in 0..iters {
-        crate::flash_attention_v2::phases::forward::csha_hooks::emit_prologue(
-            &mut ptx, config, q_iter,
+    //
+    // Skipped entirely when `csha.skip_rmsnorm_prologue` is set —
+    // signals that the caller has already normalised + narrowed +
+    // chunkified x upstream and is providing `csha_x_ptr` in the f16
+    // chunks-major layout the projection cp.async expects (see
+    // `projection_mma.rs` rustdoc for the layout spec). Used by the
+    // N4 end-to-end validation path and by future CSHA pipelines that
+    // own the narrow+chunkify pre-pass externally.
+    let skip_prologue = config
+        .csha
+        .as_ref()
+        .is_some_and(|c| c.skip_rmsnorm_prologue);
+    if !skip_prologue {
+        let iters = (config.block_q as u32).div_ceil(4);
+        for q_iter in 0..iters {
+            crate::flash_attention_v2::phases::forward::csha_hooks::emit_prologue(
+                &mut ptx, config, q_iter,
+            );
+        }
+    } else {
+        ptx.push_str(
+            "    // RMSNorm prologue skipped (csha.skip_rmsnorm_prologue=true)\n",
+        );
+        ptx.push_str(
+            "    // -- caller provides csha_x_ptr in pre-normalised + pre-chunkified f16 layout\n",
         );
     }
 
