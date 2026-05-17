@@ -28,7 +28,36 @@
 //!   * Wk chunk staged at w_chunk_offset (slot 0).
 //!   * Wv chunk staged at w_chunk_offset + chunk * hd * 2 (slot 1).
 //!   * x_kv chunk staged at w_chunk_offset + 2*chunk*hd*2 + bq*chunk*2.
-//!   * x_kv HBM offset: kv_iter * bkv * d_model * 4 (f32 rows).
+//!   * x_kv HBM offset: kv_iter * bkv * d_model * 2 (f16, chunks-major).
+//!
+//! ### HBM layout assumed for x_q / x_kv (post chunk-stride fix)
+//!
+//! Both `csha_x_ptr` slices are expected in this layout:
+//!
+//! ```text
+//!   x_q  : [d_model/chunk, bq,  chunk]            f16 chunks-major
+//!   x_kv : [n_kv_iters, d_model/chunk, bkv, chunk] f16 chunks-major
+//! ```
+//!
+//! Per cp.async chunk band: `(bq | bkv) * chunk * 2` bytes contiguous.
+//! Per chunk_idx advance: `(bq | bkv) * chunk * 2` bytes (chunks-major).
+//! Per kv_iter advance (x_kv only): `bkv * d_model * 2` bytes.
+//!
+//! Prior to this fix the cp.async used `chunk_idx * chunk * 4` (f32
+//! stride + single-row-per-chunk addressing). Successive chunks then
+//! overlapped by ~94% of their content for canonical configs
+//! (chunk=128, bq=32: `chunk * 4 = 512` bytes between starts but each
+//! cp.async copies `bq * chunk * 2 = 8192` bytes). The projection MMA
+//! consequently fed garbage into the dot product. See commits 1ca2a62f
+//! + f6c9958b for the parallel matmul_mma fragment-load helper rewrite
+//! (those fixed the lane-mapping bug; this comment-block documents the
+//! orthogonal chunk-stride fix).
+//!
+//! **Caller responsibility**: produce x_q / x_kv in this layout
+//! upstream. The standard CSHA pipeline emits RMSNorm-normalised x as
+//! f32 `[bq, d_model]` (or `[seq, d_model]`); a narrow-and-chunkify
+//! pre-pass (out of scope for Tier B.1's codegen) must rearrange that
+//! buffer into the f16 chunks-major form before this kernel runs.
 //!
 //! Warp distribution (per spec §5.3):
 //!   * 8 warps per CTA.
@@ -587,13 +616,28 @@ pub fn emit_q_projection(ptx: &mut String, config: &FlashAttentionConfig, chunk:
             "%tb1_q_cp_hbm_addr",
         );
 
-        // cp.async stage x_q chunk: SMEM dest = bq * chunk * 2 bytes (f16
-        // after f32->f16 narrowing). NOTE: HBM source is f32 (stride 4
-        // bytes/element); SMEM dest is f16 (stride 2). The cp.async
-        // transfers raw bytes — narrowing must happen upstream (csha
-        // RMSNorm path) for the data to be interpreted correctly. This
-        // is a pre-existing mismatch outside the scope of #3; here we
-        // simply emit sub-iters sized to fill the SMEM dest region.
+        // cp.async stage x_q chunk: SMEM dest = bq * chunk * 2 bytes (f16).
+        //
+        // **HBM layout assumption** (correct after the chunk-stride fix
+        // below): `csha_x_ptr` points to x laid out as `[d_model/chunk,
+        // bq, chunk]` f16 chunks-major — i.e. each chunk band is `bq *
+        // chunk` f16 elements contiguous in memory, and successive
+        // chunk bands are stacked along d_model. With this layout the
+        // per-chunk advance is `bq * chunk * 2` bytes and the cp.async
+        // fetches exactly the `bq × chunk` tile needed by the SMEM
+        // slot. Prior to this fix the stride was `chunk_idx * chunk * 4`
+        // — implying both f32 element stride AND single-row-per-chunk
+        // addressing. Successive chunks then overlapped by ~94% of
+        // their content (chunk_idx=0 → bytes [0, 8192); chunk_idx=1 →
+        // bytes [512, 8704); etc.), producing garbage in the projection
+        // MMA for any d_model > chunk.
+        //
+        // Caller responsibility: produce `csha_x_ptr` in this layout
+        // upstream. The standard CSHA pipeline runs RMSNorm on x as
+        // f32 [bq, d_model] and writes f32 back to `csha_x_ptr`; a
+        // narrow-and-chunkify pre-pass (out of scope for Tier B.1's
+        // codegen) must transform that f32 buffer into the f16
+        // chunks-major layout before this kernel runs.
         ptx.push_str(&format!(
             "    // cp.async x_q[chunk={}] -> SMEM[x_chunk_off]\n",
             chunk_idx
@@ -604,7 +648,7 @@ pub fn emit_q_projection(ptx: &mut String, config: &FlashAttentionConfig, chunk:
             "%tb1_q_smem_x_u32",
             "%tb1_q_cp_tid_off",
             "%tb1_q_x_ptr",
-            chunk_idx * chunk * 4,
+            chunk_idx * bq * chunk * 2,
             "%tb1_q_cp_smem_addr",
             "%tb1_q_cp_hbm_off",
             "%tb1_q_cp_hbm_addr",
@@ -706,11 +750,23 @@ pub fn emit_q_projection(ptx: &mut String, config: &FlashAttentionConfig, chunk:
                     format!("tb1_q_b_{}_{}_0", chunk_idx, t),
                     format!("tb1_q_b_{}_{}_1", chunk_idx, t),
                 ];
+                // B-frag col_stride = chunk * 2 bytes. The new B-frag
+                // helper (commit f6c9958b) interprets `row_stride_bytes`
+                // as the stride between adjacent N columns in COL-MAJOR
+                // [hd_n, chunk_k] SMEM (each col = chunk * f16 = chunk*2
+                // bytes). Prior emission passed `hd * 2 = 64` under the
+                // OLD helper's row-major interpretation; with the new
+                // helper that stride misaddresses the B operand by ~4×
+                // (canonical chunk=128 → correct stride 256, was 64).
+                // SMEM HBM layout assumption: caller must store Wq
+                // col-major within each chunk band — `[d_model/chunk,
+                // hd, chunk]` f16. See the rustdoc at the top of this
+                // file for the full layout precondition.
                 emit_load_b_fragment_smem(
                     ptx,
                     &b_fragment_regs,
                     &b_base_expr,
-                    (hd * 2) as usize,
+                    (chunk * 2) as usize,
                 );
                 let d_regs = [
                     format!("%q_acc_{}_0", t),
@@ -891,8 +947,19 @@ pub fn emit_kv_projection_chunk_loop(
     } else {
         tier_b1_v_offset_pong(config)
     };
-    // x_kv HBM row-block offset: kv_iter * bkv rows, each of d_model f32 elements.
-    let x_kv_hbm_base_off = kv_iter * bkv * d_model * 4; // f32 = 4 bytes
+    // x_kv HBM row-block offset for kv_iter.
+    //
+    // **HBM layout assumption** (post chunk-stride fix): `csha_x_ptr`
+    // (the kv slice — typically the same buffer as the q slice) is
+    // laid out as `[n_kv_iters, d_model/chunk, bkv, chunk]` f16 — that
+    // is, the kv_iter "block" is the outermost dim, each block is
+    // `d_model * bkv` f16 elements = `bkv * d_model * 2` bytes, and
+    // within a block the chunks-major layout applies.
+    // Prior to the fix this was `* 4` (f32 stride) under the assumption
+    // that x_kv was f32 in HBM; with the new layout the stride is `* 2`
+    // (f16). The caller must produce x_kv in this layout upstream
+    // (narrow + chunkify + iter-block).
+    let x_kv_hbm_base_off = kv_iter * bkv * d_model * 2; // f16 = 2 bytes
 
     ptx.push_str(&format!(
         "    // === Tier B.1 KV projection: bkv={} hd={} d_model={} chunk={} n_chunks={} \
@@ -1031,25 +1098,27 @@ pub fn emit_kv_projection_chunk_loop(
             "%tb1_kv_cp_hbm_addr",
         );
 
-        // cp.async stage x_kv chunk: bytes = bkv * chunk * 2 (f16 after f32->f16
-        // narrowing during the load — the actual narrowing happens in B1.6).
+        // cp.async stage x_kv chunk: bytes = bkv * chunk * 2 (f16).
         //
-        // Source HBM offset: x_kv_hbm_base_off + chunk_idx * chunk * 4
-        // (x_kv is f32 in HBM after RMSNorm; element-stride is 4 bytes).
-        // Destination SMEM: x_kv_off.
+        // Source HBM offset: `x_kv_hbm_base_off + chunk_idx * bkv * chunk * 2`,
+        // matching the `[n_kv_iters, d_model/chunk, bkv, chunk]` f16
+        // chunks-major layout established for x_q above. Destination SMEM:
+        // x_kv_off.
+        //
+        // Prior emission used `chunk_idx * chunk * 4` — same f32 stride
+        // + single-row-per-chunk bug as x_q (chunks overlapped by ~94%).
         ptx.push_str(&format!(
             "    // cp.async x_kv[kv_iter={} chunk={}] -> SMEM[x_kv_off]\n",
             kv_iter, chunk_idx
         ));
-        // B1.6 deferral #3 RESOLVED: multi-iter cp.async for x_kv chunk.
-        // Same f32/f16 stride mismatch caveat applies as for x_q.
+        // Multi-iter cp.async for x_kv chunk.
         emit_cp_async_multi_iter(
             ptx,
             bkv * chunk * 2,
             "%tb1_kv_smem_x_u32",
             "%tb1_kv_cp_tid_off",
             "%tb1_kv_x_ptr",
-            x_kv_hbm_base_off + chunk_idx * chunk * 4,
+            x_kv_hbm_base_off + chunk_idx * bkv * chunk * 2,
             "%tb1_kv_cp_smem_addr",
             "%tb1_kv_cp_hbm_off",
             "%tb1_kv_cp_hbm_addr",
@@ -1174,6 +1243,10 @@ pub fn emit_kv_projection_chunk_loop(
                 );
 
                 // K B-fragment: Wk cols (warp-specific via n_tile).
+                // Same col_stride = chunk * 2 as Wq B-frag (see comment
+                // at Q-projection B-frag call site). HBM Wk must be
+                // stored col-major within each chunk band:
+                // `[d_model/chunk, hd, chunk]` f16.
                 let bk_fragment_regs = [
                     format!("tb1_kv_bk_{}_{}_0", chunk_idx, t),
                     format!("tb1_kv_bk_{}_{}_1", chunk_idx, t),
@@ -1182,10 +1255,10 @@ pub fn emit_kv_projection_chunk_loop(
                     ptx,
                     &bk_fragment_regs,
                     &bk_base_expr,
-                    (hd * 2) as usize,
+                    (chunk * 2) as usize,
                 );
 
-                // V B-fragment: Wv cols.
+                // V B-fragment: Wv cols. Same convention as Wk.
                 let bv_fragment_regs = [
                     format!("tb1_kv_bv_{}_{}_0", chunk_idx, t),
                     format!("tb1_kv_bv_{}_{}_1", chunk_idx, t),
@@ -1194,7 +1267,7 @@ pub fn emit_kv_projection_chunk_loop(
                     ptx,
                     &bv_fragment_regs,
                     &bv_base_expr,
-                    (hd * 2) as usize,
+                    (chunk * 2) as usize,
                 );
 
                 // --- MMA (a): K accumulation ---
