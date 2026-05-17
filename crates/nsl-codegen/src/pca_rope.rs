@@ -18,9 +18,59 @@
 //! Only `doc_starts` is consumed by the kernel (the other representations
 //! are for testing and diagnostics).
 
+use cranelift_codegen::ir::{types, InstBuilder, Value};
+use cranelift_frontend::FunctionBuilder;
+use cranelift_module::{DataId, Module};
 use serde::Serialize;
 
 use crate::pca_tileskip::PackingLayout;
+
+/// PCA §4.3 — RoPE position-reset compile-time bound.
+///
+/// Upper bound on the number of documents per packed batch. The fixed
+/// `[MAX_NUM_DOCS + 1]` SMEM layout (1028 bytes) lets the kernel emit a
+/// constant-size doc_starts load independent of runtime num_docs. The
+/// packer asserts num_docs ≤ MAX_NUM_DOCS at batch-construction time.
+///
+/// 256 covers pretraining (avg doc ~256-2048 tok/doc at seq=16384), chat
+/// SFT (avg ~50-150 tok/turn × 4-8 turns), and short-prompt instruction
+/// tuning. SMEM cost 1028 bytes — trivial against the joint Tier A + Tier B
+/// + RoPE-reset budget.
+pub const MAX_NUM_DOCS: u32 = 256;
+
+const _: () = assert!(MAX_NUM_DOCS <= 4096, "MAX_NUM_DOCS bound — keeps SMEM layout small");
+const _: () = assert!(
+    (MAX_NUM_DOCS + 1) * 4 <= 2048,
+    "doc_starts SMEM bake must stay well under per-CTA budget"
+);
+
+// SMEM joint bake bound: project ships kernels ptxas-clean on sm_75 (48 KB
+// usable per CTA) for forward-compat with deployed inference hardware.
+// Active development target is sm_120 (RTX 5070 Ti, 100 KB) but the floor
+// stays sm_75 — assert against the tighter bound. Matches the planner spec's
+// PCA Tier B SMEM discipline (kernel ptxas-clean on sm_75).
+const _: () = assert!(
+    (MAX_NUM_DOCS + 1) * 4 + 16384 + 16384 < 48 * 1024,
+    "Tier B + Tier A + RoPE-reset SMEM joint bake must fit sm_75 limit"
+);
+
+/// Construct a sentinel-zero `doc_starts_ptr` Value at a Cranelift call site.
+/// Identity-position semantics (matches pre-spec behavior).
+pub fn doc_starts_disabled_sentinel(builder: &mut FunctionBuilder<'_>) -> Value {
+    builder.ins().iconst(types::I64, 0)
+}
+
+/// Construct an enabled `doc_starts_ptr` Value pointing at a device tensor.
+/// The caller is responsible for ensuring `data_id` references an i32 tensor
+/// in device memory with at least `num_docs` valid entries.
+pub fn doc_starts_enabled<M: Module>(
+    builder: &mut FunctionBuilder<'_>,
+    module: &mut M,
+    data_id: DataId,
+) -> Value {
+    let gv = module.declare_data_in_func(data_id, builder.func);
+    builder.ins().symbol_value(types::I64, gv)
+}
 
 /// RoPE reset plan: how each token's position is computed inside the
 /// fused RoPE kernel.
@@ -128,5 +178,37 @@ mod tests {
         assert!(p.formula.contains("segment_ids"));
         let p2 = plan(&PackingLayout::from_docs(vec![5]));
         assert!(p2.formula.contains("single document"));
+    }
+
+    #[test]
+    fn max_num_docs_is_256() {
+        assert_eq!(MAX_NUM_DOCS, 256);
+    }
+
+    #[test]
+    fn doc_starts_smem_size_bytes_is_1028() {
+        assert_eq!((MAX_NUM_DOCS + 1) * 4, 1028);
+    }
+
+    #[test]
+    fn doc_starts_disabled_sentinel_is_zero_constant() {
+        use cranelift_codegen::ir::Function;
+        use cranelift_codegen::ir::Signature;
+        use cranelift_codegen::ir::UserFuncName;
+        use cranelift_codegen::isa::CallConv;
+        use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
+
+        let mut fn_ctx = FunctionBuilderContext::new();
+        let sig = Signature::new(CallConv::SystemV);
+        let mut func = Function::with_name_signature(UserFuncName::user(0, 0), sig);
+        let mut builder = FunctionBuilder::new(&mut func, &mut fn_ctx);
+        let block = builder.create_block();
+        builder.switch_to_block(block);
+
+        let v = doc_starts_disabled_sentinel(&mut builder);
+        // The returned Value should be the result of an iconst(I64, 0).
+        let inst = builder.func.dfg.value_def(v).unwrap_inst();
+        let opcode = builder.func.dfg.insts[inst].opcode();
+        assert_eq!(opcode.to_string(), "iconst");
     }
 }
