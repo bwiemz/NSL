@@ -36,13 +36,13 @@ This spec implements **CFTP §4.3 — Position ID Fusion**, the third of three P
 
 ### Data shape
 
-A new per-batch tensor:
+A new per-batch tensor with a **per-row** subtable for each element of the batch:
 
 ```text
-doc_starts: Tensor<[MAX_NUM_DOCS + 1], i32>
+doc_starts: Tensor<[batch_size, MAX_NUM_DOCS + 1], i32>
 ```
 
-with **`MAX_NUM_DOCS = 256`** (compile-time constant) and **sentinel `-1`** for unused slots. The tensor's logical content for a batch with `K` documents:
+with **`MAX_NUM_DOCS = 256`** (compile-time constant; this is a **per-row** bound — each row of the batch may have up to 256 documents) and **sentinel `-1`** for unused slots within a row. Tier A's `segment_ids` already resets to 0 per batch row; `doc_starts` mirrors that reset-per-row semantics. Each row r's logical content for `K_r` documents:
 
 ```text
 doc_starts[0]     = 0
@@ -124,15 +124,22 @@ sin = sin_ptr[%r_rope_cs_idx]
 
 ### New kernel behavior with doc_starts (applied at all four sites)
 
+Each CTA processes one (batch_idx, head_idx) element. `batch_idx` is derivable from the grid's y axis (`batch_idx = blockIdx.y / heads`). The CTA loads only **its row's** doc_starts subtable (1028 bytes from HBM at offset `batch_idx * (MAX_NUM_DOCS+1) * 4`):
+
 ```text
 [CTA prologue, executed once per CTA — emitted once, used by sites 1 and 2 in forward,
  and again by sites 3 and 4 in backward]
 if doc_starts_ptr != 0:
-    parallel-load doc_starts[0..MAX_NUM_DOCS+1] into SMEM (one warp, 257 i32 reads from HBM)
-    smem_doc_starts[0..MAX_NUM_DOCS+1] = doc_starts
+    batch_idx = blockIdx.y / heads
+    row_base_ptr = doc_starts_ptr + batch_idx * (MAX_NUM_DOCS + 1) * sizeof(i32)
+    parallel-load row_base_ptr[0..MAX_NUM_DOCS+1] into SMEM
+                  (one warp, 257 i32 reads from HBM at row_base_ptr)
+    smem_doc_starts[0..MAX_NUM_DOCS+1] = doc_starts[batch_idx, 0..MAX_NUM_DOCS+1]
 
 [At each of the four rotation sites, for each idx in the tile loop]
 sid = segment_ids[idx]                        # already SMEM-resident from Tier A
+                                              # Tier A's segment_ids reset to 0 per batch row,
+                                              # so sid is the in-row document index
 if doc_starts_ptr != 0:
     effective_pos = idx - smem_doc_starts[sid]
 else:
@@ -142,6 +149,8 @@ cos = cos_ptr[%r_rope_cs_idx]
 sin = sin_ptr[%r_rope_cs_idx]
 (x0', x1') = rotate(x0, x1, cos, sin)       # forward: rotate; backward: de-rotate via -sin
 ```
+
+**Per-row design rationale:** Tier A's `segment_ids` resets to 0 per batch row (each row is an independent packed sequence). For `doc_starts` to be usable as `doc_starts[segment_ids[idx]]`, each row needs its own subtable. Storing `doc_starts` as a `[batch_size, MAX_NUM_DOCS+1]` tensor and having each CTA load only its row's subtable preserves the simple in-kernel indexing while correctly handling multi-batch packed training. SMEM per CTA stays at 1028 bytes (each CTA owns one row's table).
 
 ### Forward Q/K consistency
 
@@ -356,6 +365,11 @@ Gated on `cfg(feature = "cuda")`:
 ## §9 — Revision changelog
 
 - **2026-05-16 v1** — initial design. Decisions captured: fixed-size [65] doc_starts with sentinel -1; MAX_NUM_DOCS=64; auto-on activation; 3-entry-point FFI extension; full validation strategy (snapshots + parity + on-GPU smoke).
+
+- **2026-05-16 v3** — multi-batch gap fix discovered during T2 implementation:
+  - **Issue:** v1/v2 spec said `doc_starts: Tensor<[MAX_NUM_DOCS+1], i32>` (flat). Tier A's `segment_ids` resets to 0 per batch row, so a single flat `doc_starts` table is wrong for `batch_size > 1` — kernel indexing `doc_starts[segment_ids[idx]]` would read row 0's table when running on row >0.
+  - **Fix:** Reshape `doc_starts` to `[batch_size, MAX_NUM_DOCS+1]`. Each CTA loads only its own row's 1028-byte subtable in the prologue (1028 bytes/CTA unchanged). Kernel indexing uses `batch_idx = blockIdx.y / heads` to derive the row offset. MAX_NUM_DOCS=256 is now a per-row bound — each row of the batch may have up to 256 documents.
+  - Surfaced by T2.5's producer-side discovery (subagent flagged that `pack_batch`'s segment_ids reset-per-row meant flat `doc_starts` was structurally wrong). Sibling consistency with Tier A's per-row semantics preserved.
 
 - **2026-05-16 v2** — review revisions (code-quality review at v1):
   - **B1 (accepted, major fix):** §3 enumerates four RoPE rotation sites (forward Q, forward K, backward dQ, backward dK) with file:line anchors and the shared effective_pos formula. The Q-only treatment in v1 was incomplete — `emit_rope_k_epilogue` at csha_hooks.rs:1180 is a separate emission site that also needs the same gate. §5 codegen-integration-sites lists all four sites + the shared CTA-prologue load.
