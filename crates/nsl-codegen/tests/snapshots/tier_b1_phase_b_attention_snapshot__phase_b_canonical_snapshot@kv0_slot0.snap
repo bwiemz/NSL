@@ -95,8 +95,65 @@ expression: ptx
     mul.f32 %s_acc_0_1, %s_acc_0_1, 0f3E3504F3;
     mul.f32 %s_acc_0_2, %s_acc_0_2, 0f3E3504F3;
     mul.f32 %s_acc_0_3, %s_acc_0_3, 0f3E3504F3;
-    // Online softmax: bq=32 tpw_qkt=1 kv_iter=0
-    // === softmax tile t=0 : row-max bfly tree (deferral #6 partial) ===
+    // Causal mask: -INF where k_global > q_global
+    .reg .u32 %cm_laneid, %cm_lo_row, %cm_lo_col_base;
+    .reg .u32 %cm_q_global, %cm_k_global;
+    .reg .pred %cm_mask;
+    mov.u32 %cm_laneid, %tid.x;
+    and.b32 %cm_laneid, %cm_laneid, 31;
+    shr.u32 %cm_lo_row, %cm_laneid, 2;       // lo_row = lane/4
+    and.b32 %cm_lo_col_base, %cm_laneid, 3;  // lane%4
+    shl.b32 %cm_lo_col_base, %cm_lo_col_base, 1; // *2
+    mov.u32 %qkt_global_t, %warp_id;
+    shr.u32 %qkt_m_tile, %qkt_global_t, 2;
+    and.b32 %qkt_n_tile, %qkt_global_t, 3;
+    shl.b32 %qkt_q_warp_off, %qkt_m_tile, 4;
+    shl.b32 %qkt_k_warp_off, %qkt_n_tile, 3;
+    add.u32 %cm_q_global, %qkt_q_warp_off, %cm_lo_row;
+    cvt.u32.u64 %cm_k_global, %q_start;  // q_start (low 32 bits)
+    add.u32 %cm_q_global, %cm_q_global, %cm_k_global;
+    add.u32 %cm_k_global, %qkt_k_warp_off, %cm_lo_col_base;
+    setp.gt.u32 %cm_mask, %cm_k_global, %cm_q_global;
+    @%cm_mask mov.f32 %s_acc_0_0, 0fC2C80000;
+    add.u32 %cm_q_global, %qkt_q_warp_off, %cm_lo_row;
+    cvt.u32.u64 %cm_k_global, %q_start;  // q_start (low 32 bits)
+    add.u32 %cm_q_global, %cm_q_global, %cm_k_global;
+    add.u32 %cm_k_global, %qkt_k_warp_off, %cm_lo_col_base;
+    add.u32 %cm_k_global, %cm_k_global, 1;
+    setp.gt.u32 %cm_mask, %cm_k_global, %cm_q_global;
+    @%cm_mask mov.f32 %s_acc_0_1, 0fC2C80000;
+    add.u32 %cm_q_global, %qkt_q_warp_off, %cm_lo_row;
+    add.u32 %cm_q_global, %cm_q_global, 8;
+    cvt.u32.u64 %cm_k_global, %q_start;  // q_start (low 32 bits)
+    add.u32 %cm_q_global, %cm_q_global, %cm_k_global;
+    add.u32 %cm_k_global, %qkt_k_warp_off, %cm_lo_col_base;
+    setp.gt.u32 %cm_mask, %cm_k_global, %cm_q_global;
+    @%cm_mask mov.f32 %s_acc_0_2, 0fC2C80000;
+    add.u32 %cm_q_global, %qkt_q_warp_off, %cm_lo_row;
+    add.u32 %cm_q_global, %cm_q_global, 8;
+    cvt.u32.u64 %cm_k_global, %q_start;  // q_start (low 32 bits)
+    add.u32 %cm_q_global, %cm_q_global, %cm_k_global;
+    add.u32 %cm_k_global, %qkt_k_warp_off, %cm_lo_col_base;
+    add.u32 %cm_k_global, %cm_k_global, 1;
+    setp.gt.u32 %cm_mask, %cm_k_global, %cm_q_global;
+    @%cm_mask mov.f32 %s_acc_0_3, 0fC2C80000;
+    // Online softmax (cross-warp combine): bq=32 bkv=32 n_tiles_kv=4 tpw_qkt=1 kv_iter=0
+    .reg .u32 %sm_laneid, %sm_lane_mod4, %sm_lo_row;
+    .reg .pred %sm_writer_pred;
+    .reg .u32 %sm_scratch_max_base, %sm_scratch_sum_base;
+    .reg .u32 %sm_addr, %sm_addr2, %sm_global_row;
+    .reg .f32 %sm_global_max_lo, %sm_global_max_hi;
+    .reg .f32 %sm_global_sum_lo, %sm_global_sum_hi;
+    .reg .f32 %sm_part_max, %sm_part_sum;
+    add.u64 %tb1_phase_b_smem_q, %shmem_base, 12288; // softmax scratch base (reusing %tb1_phase_b_smem_q as u64 scratch)
+    cvt.u32.u64 %sm_scratch_max_base, %tb1_phase_b_smem_q;
+    add.u32 %sm_scratch_sum_base, %sm_scratch_max_base, 512;
+    mov.u32 %sm_laneid, %tid.x;
+    and.b32 %sm_laneid, %sm_laneid, 31;
+    shr.u32 %sm_lo_row, %sm_laneid, 2;       // lo_row = lane/4
+    and.b32 %sm_lane_mod4, %sm_laneid, 3;    // lane%4
+    setp.eq.u32 %sm_writer_pred, %sm_lane_mod4, 0;
+    // === softmax tile t=0 : step 1 = per-warp partial row-max ===
     .reg .f32 %s_max_0_lo, %s_max_0_hi, %s_shfl_0_tmp;
     max.f32 %s_max_0_lo, %s_acc_0_0, %s_acc_0_1;
     max.f32 %s_max_0_hi, %s_acc_0_2, %s_acc_0_3;
@@ -108,7 +165,49 @@ expression: ptx
     max.f32 %s_max_0_lo, %s_max_0_lo, %s_shfl_0_tmp;
     shfl.sync.bfly.b32 %s_shfl_0_tmp, %s_max_0_hi, 2, 0x1f, 0xffffffff; // lane k <-> k^2
     max.f32 %s_max_0_hi, %s_max_0_hi, %s_shfl_0_tmp;
-    // subtract row_max, scale by log2(e), apply ex2.approx (deferral #6)
+    mov.u32 %qkt_global_t, %warp_id;
+    shr.u32 %qkt_m_tile, %qkt_global_t, 2;
+    and.b32 %qkt_n_tile, %qkt_global_t, 3;
+    shl.b32 %qkt_q_warp_off, %qkt_m_tile, 4;
+    add.u32 %sm_global_row, %qkt_q_warp_off, %sm_lo_row;
+    mul.lo.u32 %sm_addr, %sm_global_row, 16;
+    shl.b32 %sm_addr2, %qkt_n_tile, 2; // n_tile * 4 bytes
+    add.u32 %sm_addr, %sm_addr, %sm_addr2;
+    add.u32 %sm_addr, %sm_addr, %sm_scratch_max_base;
+    @%sm_writer_pred st.shared.f32 [%sm_addr], %s_max_0_lo;
+    add.u32 %sm_global_row, %sm_global_row, 8;
+    mul.lo.u32 %sm_addr, %sm_global_row, 16;
+    add.u32 %sm_addr, %sm_addr, %sm_addr2;
+    add.u32 %sm_addr, %sm_addr, %sm_scratch_max_base;
+    @%sm_writer_pred st.shared.f32 [%sm_addr], %s_max_0_hi;
+    bar.sync 0; // softmax cross-warp partial-max visibility
+    mov.u32 %qkt_global_t, %warp_id;
+    shr.u32 %qkt_m_tile, %qkt_global_t, 2;
+    shl.b32 %qkt_q_warp_off, %qkt_m_tile, 4;
+    add.u32 %sm_global_row, %qkt_q_warp_off, %sm_lo_row;
+    mul.lo.u32 %sm_addr, %sm_global_row, 16;
+    add.u32 %sm_addr, %sm_addr, %sm_scratch_max_base;
+    ld.shared.f32 %sm_global_max_lo, [%sm_addr];   // n=0
+    ld.shared.f32 %sm_part_max, [%sm_addr + 4];   // n=1
+    max.f32 %sm_global_max_lo, %sm_global_max_lo, %sm_part_max;
+    ld.shared.f32 %sm_part_max, [%sm_addr + 8];   // n=2
+    max.f32 %sm_global_max_lo, %sm_global_max_lo, %sm_part_max;
+    ld.shared.f32 %sm_part_max, [%sm_addr + 12];   // n=3
+    max.f32 %sm_global_max_lo, %sm_global_max_lo, %sm_part_max;
+    mov.f32 %s_max_0_lo, %sm_global_max_lo;
+    add.u32 %sm_global_row, %qkt_q_warp_off, %sm_lo_row;
+    add.u32 %sm_global_row, %sm_global_row, 8;
+    mul.lo.u32 %sm_addr, %sm_global_row, 16;
+    add.u32 %sm_addr, %sm_addr, %sm_scratch_max_base;
+    ld.shared.f32 %sm_global_max_hi, [%sm_addr];   // n=0
+    ld.shared.f32 %sm_part_max, [%sm_addr + 4];   // n=1
+    max.f32 %sm_global_max_hi, %sm_global_max_hi, %sm_part_max;
+    ld.shared.f32 %sm_part_max, [%sm_addr + 8];   // n=2
+    max.f32 %sm_global_max_hi, %sm_global_max_hi, %sm_part_max;
+    ld.shared.f32 %sm_part_max, [%sm_addr + 12];   // n=3
+    max.f32 %sm_global_max_hi, %sm_global_max_hi, %sm_part_max;
+    mov.f32 %s_max_0_hi, %sm_global_max_hi;
+    // === softmax tile t=0 : step 3 = exp(S - global_max) ===
     sub.f32 %s_acc_0_0, %s_acc_0_0, %s_max_0_lo;
     mul.f32 %s_acc_0_0, %s_acc_0_0, 0f3FB8AA3B; // * log2(e)
     ex2.approx.f32 %s_acc_0_0, %s_acc_0_0;
@@ -121,6 +220,7 @@ expression: ptx
     sub.f32 %s_acc_0_3, %s_acc_0_3, %s_max_0_hi;
     mul.f32 %s_acc_0_3, %s_acc_0_3, 0f3FB8AA3B; // * log2(e)
     ex2.approx.f32 %s_acc_0_3, %s_acc_0_3;
+    // === softmax tile t=0 : step 4 = per-warp partial row-sum ===
     .reg .f32 %s_sum_0_lo, %s_sum_0_hi;
     add.f32 %s_sum_0_lo, %s_acc_0_0, %s_acc_0_1;
     add.f32 %s_sum_0_hi, %s_acc_0_2, %s_acc_0_3;
@@ -132,10 +232,48 @@ expression: ptx
     add.f32 %s_sum_0_lo, %s_sum_0_lo, %s_shfl_0_tmp;
     shfl.sync.bfly.b32 %s_shfl_0_tmp, %s_sum_0_hi, 2, 0x1f, 0xffffffff; // lane k <-> k^2
     add.f32 %s_sum_0_hi, %s_sum_0_hi, %s_shfl_0_tmp;
-    div.approx.f32 %s_acc_0_0, %s_acc_0_0, %s_sum_0_lo;
-    div.approx.f32 %s_acc_0_1, %s_acc_0_1, %s_sum_0_lo;
-    div.approx.f32 %s_acc_0_2, %s_acc_0_2, %s_sum_0_hi;
-    div.approx.f32 %s_acc_0_3, %s_acc_0_3, %s_sum_0_hi;
+    mov.u32 %qkt_global_t, %warp_id;
+    shr.u32 %qkt_m_tile, %qkt_global_t, 2;
+    and.b32 %qkt_n_tile, %qkt_global_t, 3;
+    shl.b32 %qkt_q_warp_off, %qkt_m_tile, 4;
+    add.u32 %sm_global_row, %qkt_q_warp_off, %sm_lo_row;
+    mul.lo.u32 %sm_addr, %sm_global_row, 16;
+    shl.b32 %sm_addr2, %qkt_n_tile, 2;
+    add.u32 %sm_addr, %sm_addr, %sm_addr2;
+    add.u32 %sm_addr, %sm_addr, %sm_scratch_sum_base;
+    @%sm_writer_pred st.shared.f32 [%sm_addr], %s_sum_0_lo;
+    add.u32 %sm_global_row, %sm_global_row, 8;
+    mul.lo.u32 %sm_addr, %sm_global_row, 16;
+    add.u32 %sm_addr, %sm_addr, %sm_addr2;
+    add.u32 %sm_addr, %sm_addr, %sm_scratch_sum_base;
+    @%sm_writer_pred st.shared.f32 [%sm_addr], %s_sum_0_hi;
+    bar.sync 0; // softmax cross-warp partial-sum visibility
+    mov.u32 %qkt_global_t, %warp_id;
+    shr.u32 %qkt_m_tile, %qkt_global_t, 2;
+    shl.b32 %qkt_q_warp_off, %qkt_m_tile, 4;
+    add.u32 %sm_global_row, %qkt_q_warp_off, %sm_lo_row;
+    mul.lo.u32 %sm_addr, %sm_global_row, 16;
+    add.u32 %sm_addr, %sm_addr, %sm_scratch_sum_base;
+    ld.shared.f32 %sm_global_sum_lo, [%sm_addr];   // n=0
+    ld.shared.f32 %sm_part_sum, [%sm_addr + 4];   // n=1
+    add.f32 %sm_global_sum_lo, %sm_global_sum_lo, %sm_part_sum;
+    ld.shared.f32 %sm_part_sum, [%sm_addr + 8];   // n=2
+    add.f32 %sm_global_sum_lo, %sm_global_sum_lo, %sm_part_sum;
+    ld.shared.f32 %sm_part_sum, [%sm_addr + 12];   // n=3
+    add.f32 %sm_global_sum_lo, %sm_global_sum_lo, %sm_part_sum;
+    mov.f32 %s_sum_0_lo, %sm_global_sum_lo;
+    add.u32 %sm_global_row, %qkt_q_warp_off, %sm_lo_row;
+    add.u32 %sm_global_row, %sm_global_row, 8;
+    mul.lo.u32 %sm_addr, %sm_global_row, 16;
+    add.u32 %sm_addr, %sm_addr, %sm_scratch_sum_base;
+    ld.shared.f32 %sm_global_sum_hi, [%sm_addr];   // n=0
+    ld.shared.f32 %sm_part_sum, [%sm_addr + 4];   // n=1
+    add.f32 %sm_global_sum_hi, %sm_global_sum_hi, %sm_part_sum;
+    ld.shared.f32 %sm_part_sum, [%sm_addr + 8];   // n=2
+    add.f32 %sm_global_sum_hi, %sm_global_sum_hi, %sm_part_sum;
+    ld.shared.f32 %sm_part_sum, [%sm_addr + 12];   // n=3
+    add.f32 %sm_global_sum_hi, %sm_global_sum_hi, %sm_part_sum;
+    mov.f32 %s_sum_0_hi, %sm_global_sum_hi;
     cvt.rn.f16.f32 %mma_h0, %s_acc_0_0;
     cvt.rn.f16.f32 %mma_h1, %s_acc_0_1;
     mov.b32 %p_packed_0, {%mma_h0, %mma_h1};
@@ -197,7 +335,7 @@ expression: ptx
     and.b32 %pv_n_tile, %pv_global_t, 3;
     shl.b32 %pv_p_warp_off, %pv_m_tile, 10;
     add.u32 %pv_a_base, %tb1_phase_b_smem_p_u32, %pv_p_warp_off;
-    shl.b32 %pv_v_warp_off, %pv_n_tile, 4;
+    mul.lo.u32 %pv_v_warp_off, %pv_n_tile, 512;
     add.u32 %pv_b_base, %tb1_phase_b_smem_v_u32, %pv_v_warp_off;
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
@@ -233,7 +371,7 @@ expression: ptx
         {%tb1_pv_b_0_0, %tb1_pv_b_0_1},
         {%o_acc_0_0, %o_acc_0_1, %o_acc_0_2, %o_acc_0_3};
     add.u32 %pv_a_base_k, %pv_a_base, 32; // PV A-base shift k_iter=1
-    add.u32 %pv_b_base_k, %pv_b_base, 1024; // PV B-base shift k_iter=1
+    add.u32 %pv_b_base_k, %pv_b_base, 32; // PV B-base shift k_iter=1
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]

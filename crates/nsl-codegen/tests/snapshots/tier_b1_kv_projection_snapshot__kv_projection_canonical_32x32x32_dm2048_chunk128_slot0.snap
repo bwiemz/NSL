@@ -31,9 +31,9 @@ expression: ptx
     ld.param.u64 %tb1_kv_wv_ptr, [csha_wv_ptr];
     setp.eq.u64 %tb1_kv_wvnull, %tb1_kv_wv_ptr, 0;
     @%tb1_kv_wvnull bra V2_TIER_B1_KV_PROJ_SKIP_0;
-    add.u64 %tb1_kv_smem_wk, %shmem_base, 12288; // Wk chunk slot (w_chunk_off slot 0)
-    add.u64 %tb1_kv_smem_wv, %shmem_base, 20480; // Wv chunk slot (w_chunk_off slot 1)
-    add.u64 %tb1_kv_smem_x, %shmem_base, 36864; // x_kv chunk slot (will be narrowed to u32 below)
+    add.u64 %tb1_kv_smem_wk, %shmem_base, 13312; // Wk chunk slot (w_chunk_off slot 0)
+    add.u64 %tb1_kv_smem_wv, %shmem_base, 21504; // Wv chunk slot (w_chunk_off slot 1)
+    add.u64 %tb1_kv_smem_x, %shmem_base, 37888; // x_kv chunk slot (will be narrowed to u32 below)
     cvt.u32.u64 %tb1_kv_smem_wk_u32, %tb1_kv_smem_wk;
     cvt.u32.u64 %tb1_kv_smem_wv_u32, %tb1_kv_smem_wv;
     cvt.u32.u64 %tb1_kv_smem_x_u32, %tb1_kv_smem_x;
@@ -144,8 +144,8 @@ expression: ptx
         {%tb1_kv_bv_0_0_0, %tb1_kv_bv_0_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 32; // KV-proj A k_iter=1
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 1024; // KV-proj Bk k_iter=1
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 1024; // KV-proj Bv k_iter=1
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 32; // KV-proj Bk k_iter=1
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 32; // KV-proj Bv k_iter=1
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -197,8 +197,8 @@ expression: ptx
         {%tb1_kv_bv_0_0_0, %tb1_kv_bv_0_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 64; // KV-proj A k_iter=2
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 2048; // KV-proj Bk k_iter=2
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 2048; // KV-proj Bv k_iter=2
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 64; // KV-proj Bk k_iter=2
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 64; // KV-proj Bv k_iter=2
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -250,8 +250,8 @@ expression: ptx
         {%tb1_kv_bv_0_0_0, %tb1_kv_bv_0_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 96; // KV-proj A k_iter=3
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 3072; // KV-proj Bk k_iter=3
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 3072; // KV-proj Bv k_iter=3
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 96; // KV-proj Bk k_iter=3
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 96; // KV-proj Bv k_iter=3
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -303,8 +303,8 @@ expression: ptx
         {%tb1_kv_bv_0_0_0, %tb1_kv_bv_0_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 128; // KV-proj A k_iter=4
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 4096; // KV-proj Bk k_iter=4
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 4096; // KV-proj Bv k_iter=4
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 128; // KV-proj Bk k_iter=4
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 128; // KV-proj Bv k_iter=4
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -356,8 +356,8 @@ expression: ptx
         {%tb1_kv_bv_0_0_0, %tb1_kv_bv_0_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 160; // KV-proj A k_iter=5
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 5120; // KV-proj Bk k_iter=5
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 5120; // KV-proj Bv k_iter=5
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 160; // KV-proj Bk k_iter=5
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 160; // KV-proj Bv k_iter=5
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -409,8 +409,8 @@ expression: ptx
         {%tb1_kv_bv_0_0_0, %tb1_kv_bv_0_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 192; // KV-proj A k_iter=6
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 6144; // KV-proj Bk k_iter=6
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 6144; // KV-proj Bv k_iter=6
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 192; // KV-proj Bk k_iter=6
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 192; // KV-proj Bv k_iter=6
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -462,8 +462,8 @@ expression: ptx
         {%tb1_kv_bv_0_0_0, %tb1_kv_bv_0_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 224; // KV-proj A k_iter=7
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 7168; // KV-proj Bk k_iter=7
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 7168; // KV-proj Bv k_iter=7
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 224; // KV-proj Bk k_iter=7
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 224; // KV-proj Bv k_iter=7
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -622,8 +622,8 @@ expression: ptx
         {%tb1_kv_bv_1_0_0, %tb1_kv_bv_1_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 32; // KV-proj A k_iter=1
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 1024; // KV-proj Bk k_iter=1
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 1024; // KV-proj Bv k_iter=1
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 32; // KV-proj Bk k_iter=1
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 32; // KV-proj Bv k_iter=1
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -675,8 +675,8 @@ expression: ptx
         {%tb1_kv_bv_1_0_0, %tb1_kv_bv_1_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 64; // KV-proj A k_iter=2
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 2048; // KV-proj Bk k_iter=2
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 2048; // KV-proj Bv k_iter=2
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 64; // KV-proj Bk k_iter=2
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 64; // KV-proj Bv k_iter=2
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -728,8 +728,8 @@ expression: ptx
         {%tb1_kv_bv_1_0_0, %tb1_kv_bv_1_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 96; // KV-proj A k_iter=3
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 3072; // KV-proj Bk k_iter=3
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 3072; // KV-proj Bv k_iter=3
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 96; // KV-proj Bk k_iter=3
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 96; // KV-proj Bv k_iter=3
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -781,8 +781,8 @@ expression: ptx
         {%tb1_kv_bv_1_0_0, %tb1_kv_bv_1_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 128; // KV-proj A k_iter=4
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 4096; // KV-proj Bk k_iter=4
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 4096; // KV-proj Bv k_iter=4
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 128; // KV-proj Bk k_iter=4
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 128; // KV-proj Bv k_iter=4
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -834,8 +834,8 @@ expression: ptx
         {%tb1_kv_bv_1_0_0, %tb1_kv_bv_1_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 160; // KV-proj A k_iter=5
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 5120; // KV-proj Bk k_iter=5
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 5120; // KV-proj Bv k_iter=5
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 160; // KV-proj Bk k_iter=5
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 160; // KV-proj Bv k_iter=5
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -887,8 +887,8 @@ expression: ptx
         {%tb1_kv_bv_1_0_0, %tb1_kv_bv_1_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 192; // KV-proj A k_iter=6
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 6144; // KV-proj Bk k_iter=6
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 6144; // KV-proj Bv k_iter=6
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 192; // KV-proj Bk k_iter=6
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 192; // KV-proj Bv k_iter=6
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -940,8 +940,8 @@ expression: ptx
         {%tb1_kv_bv_1_0_0, %tb1_kv_bv_1_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 224; // KV-proj A k_iter=7
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 7168; // KV-proj Bk k_iter=7
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 7168; // KV-proj Bv k_iter=7
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 224; // KV-proj Bk k_iter=7
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 224; // KV-proj Bv k_iter=7
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -1100,8 +1100,8 @@ expression: ptx
         {%tb1_kv_bv_2_0_0, %tb1_kv_bv_2_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 32; // KV-proj A k_iter=1
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 1024; // KV-proj Bk k_iter=1
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 1024; // KV-proj Bv k_iter=1
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 32; // KV-proj Bk k_iter=1
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 32; // KV-proj Bv k_iter=1
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -1153,8 +1153,8 @@ expression: ptx
         {%tb1_kv_bv_2_0_0, %tb1_kv_bv_2_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 64; // KV-proj A k_iter=2
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 2048; // KV-proj Bk k_iter=2
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 2048; // KV-proj Bv k_iter=2
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 64; // KV-proj Bk k_iter=2
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 64; // KV-proj Bv k_iter=2
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -1206,8 +1206,8 @@ expression: ptx
         {%tb1_kv_bv_2_0_0, %tb1_kv_bv_2_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 96; // KV-proj A k_iter=3
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 3072; // KV-proj Bk k_iter=3
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 3072; // KV-proj Bv k_iter=3
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 96; // KV-proj Bk k_iter=3
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 96; // KV-proj Bv k_iter=3
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -1259,8 +1259,8 @@ expression: ptx
         {%tb1_kv_bv_2_0_0, %tb1_kv_bv_2_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 128; // KV-proj A k_iter=4
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 4096; // KV-proj Bk k_iter=4
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 4096; // KV-proj Bv k_iter=4
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 128; // KV-proj Bk k_iter=4
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 128; // KV-proj Bv k_iter=4
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -1312,8 +1312,8 @@ expression: ptx
         {%tb1_kv_bv_2_0_0, %tb1_kv_bv_2_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 160; // KV-proj A k_iter=5
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 5120; // KV-proj Bk k_iter=5
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 5120; // KV-proj Bv k_iter=5
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 160; // KV-proj Bk k_iter=5
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 160; // KV-proj Bv k_iter=5
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -1365,8 +1365,8 @@ expression: ptx
         {%tb1_kv_bv_2_0_0, %tb1_kv_bv_2_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 192; // KV-proj A k_iter=6
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 6144; // KV-proj Bk k_iter=6
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 6144; // KV-proj Bv k_iter=6
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 192; // KV-proj Bk k_iter=6
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 192; // KV-proj Bv k_iter=6
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -1418,8 +1418,8 @@ expression: ptx
         {%tb1_kv_bv_2_0_0, %tb1_kv_bv_2_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 224; // KV-proj A k_iter=7
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 7168; // KV-proj Bk k_iter=7
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 7168; // KV-proj Bv k_iter=7
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 224; // KV-proj Bk k_iter=7
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 224; // KV-proj Bv k_iter=7
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -1578,8 +1578,8 @@ expression: ptx
         {%tb1_kv_bv_3_0_0, %tb1_kv_bv_3_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 32; // KV-proj A k_iter=1
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 1024; // KV-proj Bk k_iter=1
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 1024; // KV-proj Bv k_iter=1
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 32; // KV-proj Bk k_iter=1
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 32; // KV-proj Bv k_iter=1
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -1631,8 +1631,8 @@ expression: ptx
         {%tb1_kv_bv_3_0_0, %tb1_kv_bv_3_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 64; // KV-proj A k_iter=2
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 2048; // KV-proj Bk k_iter=2
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 2048; // KV-proj Bv k_iter=2
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 64; // KV-proj Bk k_iter=2
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 64; // KV-proj Bv k_iter=2
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -1684,8 +1684,8 @@ expression: ptx
         {%tb1_kv_bv_3_0_0, %tb1_kv_bv_3_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 96; // KV-proj A k_iter=3
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 3072; // KV-proj Bk k_iter=3
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 3072; // KV-proj Bv k_iter=3
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 96; // KV-proj Bk k_iter=3
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 96; // KV-proj Bv k_iter=3
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -1737,8 +1737,8 @@ expression: ptx
         {%tb1_kv_bv_3_0_0, %tb1_kv_bv_3_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 128; // KV-proj A k_iter=4
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 4096; // KV-proj Bk k_iter=4
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 4096; // KV-proj Bv k_iter=4
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 128; // KV-proj Bk k_iter=4
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 128; // KV-proj Bv k_iter=4
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -1790,8 +1790,8 @@ expression: ptx
         {%tb1_kv_bv_3_0_0, %tb1_kv_bv_3_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 160; // KV-proj A k_iter=5
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 5120; // KV-proj Bk k_iter=5
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 5120; // KV-proj Bv k_iter=5
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 160; // KV-proj Bk k_iter=5
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 160; // KV-proj Bv k_iter=5
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -1843,8 +1843,8 @@ expression: ptx
         {%tb1_kv_bv_3_0_0, %tb1_kv_bv_3_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 192; // KV-proj A k_iter=6
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 6144; // KV-proj Bk k_iter=6
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 6144; // KV-proj Bv k_iter=6
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 192; // KV-proj Bk k_iter=6
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 192; // KV-proj Bv k_iter=6
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -1896,8 +1896,8 @@ expression: ptx
         {%tb1_kv_bv_3_0_0, %tb1_kv_bv_3_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 224; // KV-proj A k_iter=7
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 7168; // KV-proj Bk k_iter=7
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 7168; // KV-proj Bv k_iter=7
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 224; // KV-proj Bk k_iter=7
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 224; // KV-proj Bv k_iter=7
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -2056,8 +2056,8 @@ expression: ptx
         {%tb1_kv_bv_4_0_0, %tb1_kv_bv_4_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 32; // KV-proj A k_iter=1
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 1024; // KV-proj Bk k_iter=1
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 1024; // KV-proj Bv k_iter=1
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 32; // KV-proj Bk k_iter=1
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 32; // KV-proj Bv k_iter=1
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -2109,8 +2109,8 @@ expression: ptx
         {%tb1_kv_bv_4_0_0, %tb1_kv_bv_4_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 64; // KV-proj A k_iter=2
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 2048; // KV-proj Bk k_iter=2
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 2048; // KV-proj Bv k_iter=2
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 64; // KV-proj Bk k_iter=2
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 64; // KV-proj Bv k_iter=2
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -2162,8 +2162,8 @@ expression: ptx
         {%tb1_kv_bv_4_0_0, %tb1_kv_bv_4_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 96; // KV-proj A k_iter=3
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 3072; // KV-proj Bk k_iter=3
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 3072; // KV-proj Bv k_iter=3
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 96; // KV-proj Bk k_iter=3
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 96; // KV-proj Bv k_iter=3
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -2215,8 +2215,8 @@ expression: ptx
         {%tb1_kv_bv_4_0_0, %tb1_kv_bv_4_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 128; // KV-proj A k_iter=4
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 4096; // KV-proj Bk k_iter=4
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 4096; // KV-proj Bv k_iter=4
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 128; // KV-proj Bk k_iter=4
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 128; // KV-proj Bv k_iter=4
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -2268,8 +2268,8 @@ expression: ptx
         {%tb1_kv_bv_4_0_0, %tb1_kv_bv_4_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 160; // KV-proj A k_iter=5
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 5120; // KV-proj Bk k_iter=5
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 5120; // KV-proj Bv k_iter=5
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 160; // KV-proj Bk k_iter=5
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 160; // KV-proj Bv k_iter=5
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -2321,8 +2321,8 @@ expression: ptx
         {%tb1_kv_bv_4_0_0, %tb1_kv_bv_4_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 192; // KV-proj A k_iter=6
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 6144; // KV-proj Bk k_iter=6
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 6144; // KV-proj Bv k_iter=6
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 192; // KV-proj Bk k_iter=6
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 192; // KV-proj Bv k_iter=6
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -2374,8 +2374,8 @@ expression: ptx
         {%tb1_kv_bv_4_0_0, %tb1_kv_bv_4_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 224; // KV-proj A k_iter=7
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 7168; // KV-proj Bk k_iter=7
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 7168; // KV-proj Bv k_iter=7
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 224; // KV-proj Bk k_iter=7
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 224; // KV-proj Bv k_iter=7
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -2534,8 +2534,8 @@ expression: ptx
         {%tb1_kv_bv_5_0_0, %tb1_kv_bv_5_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 32; // KV-proj A k_iter=1
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 1024; // KV-proj Bk k_iter=1
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 1024; // KV-proj Bv k_iter=1
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 32; // KV-proj Bk k_iter=1
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 32; // KV-proj Bv k_iter=1
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -2587,8 +2587,8 @@ expression: ptx
         {%tb1_kv_bv_5_0_0, %tb1_kv_bv_5_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 64; // KV-proj A k_iter=2
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 2048; // KV-proj Bk k_iter=2
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 2048; // KV-proj Bv k_iter=2
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 64; // KV-proj Bk k_iter=2
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 64; // KV-proj Bv k_iter=2
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -2640,8 +2640,8 @@ expression: ptx
         {%tb1_kv_bv_5_0_0, %tb1_kv_bv_5_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 96; // KV-proj A k_iter=3
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 3072; // KV-proj Bk k_iter=3
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 3072; // KV-proj Bv k_iter=3
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 96; // KV-proj Bk k_iter=3
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 96; // KV-proj Bv k_iter=3
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -2693,8 +2693,8 @@ expression: ptx
         {%tb1_kv_bv_5_0_0, %tb1_kv_bv_5_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 128; // KV-proj A k_iter=4
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 4096; // KV-proj Bk k_iter=4
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 4096; // KV-proj Bv k_iter=4
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 128; // KV-proj Bk k_iter=4
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 128; // KV-proj Bv k_iter=4
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -2746,8 +2746,8 @@ expression: ptx
         {%tb1_kv_bv_5_0_0, %tb1_kv_bv_5_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 160; // KV-proj A k_iter=5
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 5120; // KV-proj Bk k_iter=5
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 5120; // KV-proj Bv k_iter=5
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 160; // KV-proj Bk k_iter=5
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 160; // KV-proj Bv k_iter=5
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -2799,8 +2799,8 @@ expression: ptx
         {%tb1_kv_bv_5_0_0, %tb1_kv_bv_5_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 192; // KV-proj A k_iter=6
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 6144; // KV-proj Bk k_iter=6
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 6144; // KV-proj Bv k_iter=6
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 192; // KV-proj Bk k_iter=6
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 192; // KV-proj Bv k_iter=6
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -2852,8 +2852,8 @@ expression: ptx
         {%tb1_kv_bv_5_0_0, %tb1_kv_bv_5_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 224; // KV-proj A k_iter=7
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 7168; // KV-proj Bk k_iter=7
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 7168; // KV-proj Bv k_iter=7
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 224; // KV-proj Bk k_iter=7
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 224; // KV-proj Bv k_iter=7
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -3012,8 +3012,8 @@ expression: ptx
         {%tb1_kv_bv_6_0_0, %tb1_kv_bv_6_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 32; // KV-proj A k_iter=1
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 1024; // KV-proj Bk k_iter=1
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 1024; // KV-proj Bv k_iter=1
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 32; // KV-proj Bk k_iter=1
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 32; // KV-proj Bv k_iter=1
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -3065,8 +3065,8 @@ expression: ptx
         {%tb1_kv_bv_6_0_0, %tb1_kv_bv_6_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 64; // KV-proj A k_iter=2
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 2048; // KV-proj Bk k_iter=2
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 2048; // KV-proj Bv k_iter=2
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 64; // KV-proj Bk k_iter=2
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 64; // KV-proj Bv k_iter=2
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -3118,8 +3118,8 @@ expression: ptx
         {%tb1_kv_bv_6_0_0, %tb1_kv_bv_6_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 96; // KV-proj A k_iter=3
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 3072; // KV-proj Bk k_iter=3
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 3072; // KV-proj Bv k_iter=3
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 96; // KV-proj Bk k_iter=3
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 96; // KV-proj Bv k_iter=3
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -3171,8 +3171,8 @@ expression: ptx
         {%tb1_kv_bv_6_0_0, %tb1_kv_bv_6_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 128; // KV-proj A k_iter=4
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 4096; // KV-proj Bk k_iter=4
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 4096; // KV-proj Bv k_iter=4
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 128; // KV-proj Bk k_iter=4
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 128; // KV-proj Bv k_iter=4
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -3224,8 +3224,8 @@ expression: ptx
         {%tb1_kv_bv_6_0_0, %tb1_kv_bv_6_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 160; // KV-proj A k_iter=5
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 5120; // KV-proj Bk k_iter=5
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 5120; // KV-proj Bv k_iter=5
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 160; // KV-proj Bk k_iter=5
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 160; // KV-proj Bv k_iter=5
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -3277,8 +3277,8 @@ expression: ptx
         {%tb1_kv_bv_6_0_0, %tb1_kv_bv_6_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 192; // KV-proj A k_iter=6
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 6144; // KV-proj Bk k_iter=6
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 6144; // KV-proj Bv k_iter=6
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 192; // KV-proj Bk k_iter=6
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 192; // KV-proj Bv k_iter=6
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -3330,8 +3330,8 @@ expression: ptx
         {%tb1_kv_bv_6_0_0, %tb1_kv_bv_6_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 224; // KV-proj A k_iter=7
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 7168; // KV-proj Bk k_iter=7
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 7168; // KV-proj Bv k_iter=7
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 224; // KV-proj Bk k_iter=7
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 224; // KV-proj Bv k_iter=7
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -3490,8 +3490,8 @@ expression: ptx
         {%tb1_kv_bv_7_0_0, %tb1_kv_bv_7_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 32; // KV-proj A k_iter=1
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 1024; // KV-proj Bk k_iter=1
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 1024; // KV-proj Bv k_iter=1
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 32; // KV-proj Bk k_iter=1
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 32; // KV-proj Bv k_iter=1
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -3543,8 +3543,8 @@ expression: ptx
         {%tb1_kv_bv_7_0_0, %tb1_kv_bv_7_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 64; // KV-proj A k_iter=2
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 2048; // KV-proj Bk k_iter=2
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 2048; // KV-proj Bv k_iter=2
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 64; // KV-proj Bk k_iter=2
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 64; // KV-proj Bv k_iter=2
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -3596,8 +3596,8 @@ expression: ptx
         {%tb1_kv_bv_7_0_0, %tb1_kv_bv_7_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 96; // KV-proj A k_iter=3
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 3072; // KV-proj Bk k_iter=3
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 3072; // KV-proj Bv k_iter=3
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 96; // KV-proj Bk k_iter=3
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 96; // KV-proj Bv k_iter=3
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -3649,8 +3649,8 @@ expression: ptx
         {%tb1_kv_bv_7_0_0, %tb1_kv_bv_7_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 128; // KV-proj A k_iter=4
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 4096; // KV-proj Bk k_iter=4
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 4096; // KV-proj Bv k_iter=4
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 128; // KV-proj Bk k_iter=4
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 128; // KV-proj Bv k_iter=4
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -3702,8 +3702,8 @@ expression: ptx
         {%tb1_kv_bv_7_0_0, %tb1_kv_bv_7_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 160; // KV-proj A k_iter=5
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 5120; // KV-proj Bk k_iter=5
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 5120; // KV-proj Bv k_iter=5
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 160; // KV-proj Bk k_iter=5
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 160; // KV-proj Bv k_iter=5
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -3755,8 +3755,8 @@ expression: ptx
         {%tb1_kv_bv_7_0_0, %tb1_kv_bv_7_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 192; // KV-proj A k_iter=6
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 6144; // KV-proj Bk k_iter=6
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 6144; // KV-proj Bv k_iter=6
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 192; // KV-proj Bk k_iter=6
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 192; // KV-proj Bv k_iter=6
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -3808,8 +3808,8 @@ expression: ptx
         {%tb1_kv_bv_7_0_0, %tb1_kv_bv_7_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 224; // KV-proj A k_iter=7
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 7168; // KV-proj Bk k_iter=7
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 7168; // KV-proj Bv k_iter=7
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 224; // KV-proj Bk k_iter=7
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 224; // KV-proj Bv k_iter=7
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -3968,8 +3968,8 @@ expression: ptx
         {%tb1_kv_bv_8_0_0, %tb1_kv_bv_8_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 32; // KV-proj A k_iter=1
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 1024; // KV-proj Bk k_iter=1
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 1024; // KV-proj Bv k_iter=1
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 32; // KV-proj Bk k_iter=1
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 32; // KV-proj Bv k_iter=1
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -4021,8 +4021,8 @@ expression: ptx
         {%tb1_kv_bv_8_0_0, %tb1_kv_bv_8_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 64; // KV-proj A k_iter=2
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 2048; // KV-proj Bk k_iter=2
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 2048; // KV-proj Bv k_iter=2
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 64; // KV-proj Bk k_iter=2
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 64; // KV-proj Bv k_iter=2
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -4074,8 +4074,8 @@ expression: ptx
         {%tb1_kv_bv_8_0_0, %tb1_kv_bv_8_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 96; // KV-proj A k_iter=3
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 3072; // KV-proj Bk k_iter=3
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 3072; // KV-proj Bv k_iter=3
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 96; // KV-proj Bk k_iter=3
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 96; // KV-proj Bv k_iter=3
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -4127,8 +4127,8 @@ expression: ptx
         {%tb1_kv_bv_8_0_0, %tb1_kv_bv_8_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 128; // KV-proj A k_iter=4
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 4096; // KV-proj Bk k_iter=4
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 4096; // KV-proj Bv k_iter=4
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 128; // KV-proj Bk k_iter=4
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 128; // KV-proj Bv k_iter=4
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -4180,8 +4180,8 @@ expression: ptx
         {%tb1_kv_bv_8_0_0, %tb1_kv_bv_8_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 160; // KV-proj A k_iter=5
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 5120; // KV-proj Bk k_iter=5
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 5120; // KV-proj Bv k_iter=5
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 160; // KV-proj Bk k_iter=5
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 160; // KV-proj Bv k_iter=5
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -4233,8 +4233,8 @@ expression: ptx
         {%tb1_kv_bv_8_0_0, %tb1_kv_bv_8_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 192; // KV-proj A k_iter=6
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 6144; // KV-proj Bk k_iter=6
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 6144; // KV-proj Bv k_iter=6
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 192; // KV-proj Bk k_iter=6
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 192; // KV-proj Bv k_iter=6
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -4286,8 +4286,8 @@ expression: ptx
         {%tb1_kv_bv_8_0_0, %tb1_kv_bv_8_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 224; // KV-proj A k_iter=7
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 7168; // KV-proj Bk k_iter=7
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 7168; // KV-proj Bv k_iter=7
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 224; // KV-proj Bk k_iter=7
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 224; // KV-proj Bv k_iter=7
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -4446,8 +4446,8 @@ expression: ptx
         {%tb1_kv_bv_9_0_0, %tb1_kv_bv_9_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 32; // KV-proj A k_iter=1
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 1024; // KV-proj Bk k_iter=1
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 1024; // KV-proj Bv k_iter=1
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 32; // KV-proj Bk k_iter=1
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 32; // KV-proj Bv k_iter=1
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -4499,8 +4499,8 @@ expression: ptx
         {%tb1_kv_bv_9_0_0, %tb1_kv_bv_9_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 64; // KV-proj A k_iter=2
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 2048; // KV-proj Bk k_iter=2
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 2048; // KV-proj Bv k_iter=2
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 64; // KV-proj Bk k_iter=2
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 64; // KV-proj Bv k_iter=2
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -4552,8 +4552,8 @@ expression: ptx
         {%tb1_kv_bv_9_0_0, %tb1_kv_bv_9_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 96; // KV-proj A k_iter=3
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 3072; // KV-proj Bk k_iter=3
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 3072; // KV-proj Bv k_iter=3
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 96; // KV-proj Bk k_iter=3
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 96; // KV-proj Bv k_iter=3
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -4605,8 +4605,8 @@ expression: ptx
         {%tb1_kv_bv_9_0_0, %tb1_kv_bv_9_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 128; // KV-proj A k_iter=4
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 4096; // KV-proj Bk k_iter=4
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 4096; // KV-proj Bv k_iter=4
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 128; // KV-proj Bk k_iter=4
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 128; // KV-proj Bv k_iter=4
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -4658,8 +4658,8 @@ expression: ptx
         {%tb1_kv_bv_9_0_0, %tb1_kv_bv_9_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 160; // KV-proj A k_iter=5
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 5120; // KV-proj Bk k_iter=5
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 5120; // KV-proj Bv k_iter=5
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 160; // KV-proj Bk k_iter=5
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 160; // KV-proj Bv k_iter=5
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -4711,8 +4711,8 @@ expression: ptx
         {%tb1_kv_bv_9_0_0, %tb1_kv_bv_9_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 192; // KV-proj A k_iter=6
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 6144; // KV-proj Bk k_iter=6
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 6144; // KV-proj Bv k_iter=6
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 192; // KV-proj Bk k_iter=6
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 192; // KV-proj Bv k_iter=6
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -4764,8 +4764,8 @@ expression: ptx
         {%tb1_kv_bv_9_0_0, %tb1_kv_bv_9_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 224; // KV-proj A k_iter=7
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 7168; // KV-proj Bk k_iter=7
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 7168; // KV-proj Bv k_iter=7
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 224; // KV-proj Bk k_iter=7
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 224; // KV-proj Bv k_iter=7
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -4924,8 +4924,8 @@ expression: ptx
         {%tb1_kv_bv_10_0_0, %tb1_kv_bv_10_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 32; // KV-proj A k_iter=1
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 1024; // KV-proj Bk k_iter=1
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 1024; // KV-proj Bv k_iter=1
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 32; // KV-proj Bk k_iter=1
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 32; // KV-proj Bv k_iter=1
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -4977,8 +4977,8 @@ expression: ptx
         {%tb1_kv_bv_10_0_0, %tb1_kv_bv_10_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 64; // KV-proj A k_iter=2
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 2048; // KV-proj Bk k_iter=2
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 2048; // KV-proj Bv k_iter=2
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 64; // KV-proj Bk k_iter=2
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 64; // KV-proj Bv k_iter=2
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -5030,8 +5030,8 @@ expression: ptx
         {%tb1_kv_bv_10_0_0, %tb1_kv_bv_10_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 96; // KV-proj A k_iter=3
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 3072; // KV-proj Bk k_iter=3
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 3072; // KV-proj Bv k_iter=3
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 96; // KV-proj Bk k_iter=3
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 96; // KV-proj Bv k_iter=3
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -5083,8 +5083,8 @@ expression: ptx
         {%tb1_kv_bv_10_0_0, %tb1_kv_bv_10_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 128; // KV-proj A k_iter=4
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 4096; // KV-proj Bk k_iter=4
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 4096; // KV-proj Bv k_iter=4
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 128; // KV-proj Bk k_iter=4
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 128; // KV-proj Bv k_iter=4
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -5136,8 +5136,8 @@ expression: ptx
         {%tb1_kv_bv_10_0_0, %tb1_kv_bv_10_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 160; // KV-proj A k_iter=5
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 5120; // KV-proj Bk k_iter=5
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 5120; // KV-proj Bv k_iter=5
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 160; // KV-proj Bk k_iter=5
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 160; // KV-proj Bv k_iter=5
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -5189,8 +5189,8 @@ expression: ptx
         {%tb1_kv_bv_10_0_0, %tb1_kv_bv_10_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 192; // KV-proj A k_iter=6
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 6144; // KV-proj Bk k_iter=6
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 6144; // KV-proj Bv k_iter=6
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 192; // KV-proj Bk k_iter=6
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 192; // KV-proj Bv k_iter=6
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -5242,8 +5242,8 @@ expression: ptx
         {%tb1_kv_bv_10_0_0, %tb1_kv_bv_10_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 224; // KV-proj A k_iter=7
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 7168; // KV-proj Bk k_iter=7
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 7168; // KV-proj Bv k_iter=7
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 224; // KV-proj Bk k_iter=7
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 224; // KV-proj Bv k_iter=7
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -5402,8 +5402,8 @@ expression: ptx
         {%tb1_kv_bv_11_0_0, %tb1_kv_bv_11_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 32; // KV-proj A k_iter=1
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 1024; // KV-proj Bk k_iter=1
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 1024; // KV-proj Bv k_iter=1
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 32; // KV-proj Bk k_iter=1
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 32; // KV-proj Bv k_iter=1
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -5455,8 +5455,8 @@ expression: ptx
         {%tb1_kv_bv_11_0_0, %tb1_kv_bv_11_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 64; // KV-proj A k_iter=2
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 2048; // KV-proj Bk k_iter=2
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 2048; // KV-proj Bv k_iter=2
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 64; // KV-proj Bk k_iter=2
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 64; // KV-proj Bv k_iter=2
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -5508,8 +5508,8 @@ expression: ptx
         {%tb1_kv_bv_11_0_0, %tb1_kv_bv_11_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 96; // KV-proj A k_iter=3
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 3072; // KV-proj Bk k_iter=3
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 3072; // KV-proj Bv k_iter=3
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 96; // KV-proj Bk k_iter=3
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 96; // KV-proj Bv k_iter=3
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -5561,8 +5561,8 @@ expression: ptx
         {%tb1_kv_bv_11_0_0, %tb1_kv_bv_11_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 128; // KV-proj A k_iter=4
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 4096; // KV-proj Bk k_iter=4
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 4096; // KV-proj Bv k_iter=4
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 128; // KV-proj Bk k_iter=4
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 128; // KV-proj Bv k_iter=4
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -5614,8 +5614,8 @@ expression: ptx
         {%tb1_kv_bv_11_0_0, %tb1_kv_bv_11_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 160; // KV-proj A k_iter=5
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 5120; // KV-proj Bk k_iter=5
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 5120; // KV-proj Bv k_iter=5
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 160; // KV-proj Bk k_iter=5
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 160; // KV-proj Bv k_iter=5
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -5667,8 +5667,8 @@ expression: ptx
         {%tb1_kv_bv_11_0_0, %tb1_kv_bv_11_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 192; // KV-proj A k_iter=6
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 6144; // KV-proj Bk k_iter=6
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 6144; // KV-proj Bv k_iter=6
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 192; // KV-proj Bk k_iter=6
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 192; // KV-proj Bv k_iter=6
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -5720,8 +5720,8 @@ expression: ptx
         {%tb1_kv_bv_11_0_0, %tb1_kv_bv_11_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 224; // KV-proj A k_iter=7
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 7168; // KV-proj Bk k_iter=7
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 7168; // KV-proj Bv k_iter=7
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 224; // KV-proj Bk k_iter=7
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 224; // KV-proj Bv k_iter=7
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -5880,8 +5880,8 @@ expression: ptx
         {%tb1_kv_bv_12_0_0, %tb1_kv_bv_12_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 32; // KV-proj A k_iter=1
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 1024; // KV-proj Bk k_iter=1
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 1024; // KV-proj Bv k_iter=1
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 32; // KV-proj Bk k_iter=1
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 32; // KV-proj Bv k_iter=1
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -5933,8 +5933,8 @@ expression: ptx
         {%tb1_kv_bv_12_0_0, %tb1_kv_bv_12_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 64; // KV-proj A k_iter=2
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 2048; // KV-proj Bk k_iter=2
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 2048; // KV-proj Bv k_iter=2
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 64; // KV-proj Bk k_iter=2
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 64; // KV-proj Bv k_iter=2
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -5986,8 +5986,8 @@ expression: ptx
         {%tb1_kv_bv_12_0_0, %tb1_kv_bv_12_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 96; // KV-proj A k_iter=3
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 3072; // KV-proj Bk k_iter=3
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 3072; // KV-proj Bv k_iter=3
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 96; // KV-proj Bk k_iter=3
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 96; // KV-proj Bv k_iter=3
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -6039,8 +6039,8 @@ expression: ptx
         {%tb1_kv_bv_12_0_0, %tb1_kv_bv_12_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 128; // KV-proj A k_iter=4
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 4096; // KV-proj Bk k_iter=4
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 4096; // KV-proj Bv k_iter=4
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 128; // KV-proj Bk k_iter=4
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 128; // KV-proj Bv k_iter=4
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -6092,8 +6092,8 @@ expression: ptx
         {%tb1_kv_bv_12_0_0, %tb1_kv_bv_12_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 160; // KV-proj A k_iter=5
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 5120; // KV-proj Bk k_iter=5
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 5120; // KV-proj Bv k_iter=5
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 160; // KV-proj Bk k_iter=5
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 160; // KV-proj Bv k_iter=5
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -6145,8 +6145,8 @@ expression: ptx
         {%tb1_kv_bv_12_0_0, %tb1_kv_bv_12_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 192; // KV-proj A k_iter=6
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 6144; // KV-proj Bk k_iter=6
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 6144; // KV-proj Bv k_iter=6
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 192; // KV-proj Bk k_iter=6
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 192; // KV-proj Bv k_iter=6
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -6198,8 +6198,8 @@ expression: ptx
         {%tb1_kv_bv_12_0_0, %tb1_kv_bv_12_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 224; // KV-proj A k_iter=7
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 7168; // KV-proj Bk k_iter=7
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 7168; // KV-proj Bv k_iter=7
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 224; // KV-proj Bk k_iter=7
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 224; // KV-proj Bv k_iter=7
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -6358,8 +6358,8 @@ expression: ptx
         {%tb1_kv_bv_13_0_0, %tb1_kv_bv_13_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 32; // KV-proj A k_iter=1
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 1024; // KV-proj Bk k_iter=1
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 1024; // KV-proj Bv k_iter=1
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 32; // KV-proj Bk k_iter=1
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 32; // KV-proj Bv k_iter=1
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -6411,8 +6411,8 @@ expression: ptx
         {%tb1_kv_bv_13_0_0, %tb1_kv_bv_13_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 64; // KV-proj A k_iter=2
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 2048; // KV-proj Bk k_iter=2
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 2048; // KV-proj Bv k_iter=2
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 64; // KV-proj Bk k_iter=2
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 64; // KV-proj Bv k_iter=2
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -6464,8 +6464,8 @@ expression: ptx
         {%tb1_kv_bv_13_0_0, %tb1_kv_bv_13_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 96; // KV-proj A k_iter=3
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 3072; // KV-proj Bk k_iter=3
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 3072; // KV-proj Bv k_iter=3
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 96; // KV-proj Bk k_iter=3
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 96; // KV-proj Bv k_iter=3
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -6517,8 +6517,8 @@ expression: ptx
         {%tb1_kv_bv_13_0_0, %tb1_kv_bv_13_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 128; // KV-proj A k_iter=4
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 4096; // KV-proj Bk k_iter=4
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 4096; // KV-proj Bv k_iter=4
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 128; // KV-proj Bk k_iter=4
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 128; // KV-proj Bv k_iter=4
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -6570,8 +6570,8 @@ expression: ptx
         {%tb1_kv_bv_13_0_0, %tb1_kv_bv_13_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 160; // KV-proj A k_iter=5
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 5120; // KV-proj Bk k_iter=5
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 5120; // KV-proj Bv k_iter=5
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 160; // KV-proj Bk k_iter=5
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 160; // KV-proj Bv k_iter=5
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -6623,8 +6623,8 @@ expression: ptx
         {%tb1_kv_bv_13_0_0, %tb1_kv_bv_13_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 192; // KV-proj A k_iter=6
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 6144; // KV-proj Bk k_iter=6
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 6144; // KV-proj Bv k_iter=6
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 192; // KV-proj Bk k_iter=6
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 192; // KV-proj Bv k_iter=6
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -6676,8 +6676,8 @@ expression: ptx
         {%tb1_kv_bv_13_0_0, %tb1_kv_bv_13_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 224; // KV-proj A k_iter=7
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 7168; // KV-proj Bk k_iter=7
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 7168; // KV-proj Bv k_iter=7
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 224; // KV-proj Bk k_iter=7
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 224; // KV-proj Bv k_iter=7
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -6836,8 +6836,8 @@ expression: ptx
         {%tb1_kv_bv_14_0_0, %tb1_kv_bv_14_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 32; // KV-proj A k_iter=1
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 1024; // KV-proj Bk k_iter=1
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 1024; // KV-proj Bv k_iter=1
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 32; // KV-proj Bk k_iter=1
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 32; // KV-proj Bv k_iter=1
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -6889,8 +6889,8 @@ expression: ptx
         {%tb1_kv_bv_14_0_0, %tb1_kv_bv_14_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 64; // KV-proj A k_iter=2
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 2048; // KV-proj Bk k_iter=2
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 2048; // KV-proj Bv k_iter=2
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 64; // KV-proj Bk k_iter=2
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 64; // KV-proj Bv k_iter=2
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -6942,8 +6942,8 @@ expression: ptx
         {%tb1_kv_bv_14_0_0, %tb1_kv_bv_14_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 96; // KV-proj A k_iter=3
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 3072; // KV-proj Bk k_iter=3
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 3072; // KV-proj Bv k_iter=3
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 96; // KV-proj Bk k_iter=3
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 96; // KV-proj Bv k_iter=3
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -6995,8 +6995,8 @@ expression: ptx
         {%tb1_kv_bv_14_0_0, %tb1_kv_bv_14_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 128; // KV-proj A k_iter=4
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 4096; // KV-proj Bk k_iter=4
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 4096; // KV-proj Bv k_iter=4
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 128; // KV-proj Bk k_iter=4
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 128; // KV-proj Bv k_iter=4
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -7048,8 +7048,8 @@ expression: ptx
         {%tb1_kv_bv_14_0_0, %tb1_kv_bv_14_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 160; // KV-proj A k_iter=5
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 5120; // KV-proj Bk k_iter=5
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 5120; // KV-proj Bv k_iter=5
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 160; // KV-proj Bk k_iter=5
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 160; // KV-proj Bv k_iter=5
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -7101,8 +7101,8 @@ expression: ptx
         {%tb1_kv_bv_14_0_0, %tb1_kv_bv_14_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 192; // KV-proj A k_iter=6
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 6144; // KV-proj Bk k_iter=6
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 6144; // KV-proj Bv k_iter=6
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 192; // KV-proj Bk k_iter=6
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 192; // KV-proj Bv k_iter=6
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -7154,8 +7154,8 @@ expression: ptx
         {%tb1_kv_bv_14_0_0, %tb1_kv_bv_14_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 224; // KV-proj A k_iter=7
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 7168; // KV-proj Bk k_iter=7
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 7168; // KV-proj Bv k_iter=7
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 224; // KV-proj Bk k_iter=7
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 224; // KV-proj Bv k_iter=7
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -7314,8 +7314,8 @@ expression: ptx
         {%tb1_kv_bv_15_0_0, %tb1_kv_bv_15_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 32; // KV-proj A k_iter=1
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 1024; // KV-proj Bk k_iter=1
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 1024; // KV-proj Bv k_iter=1
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 32; // KV-proj Bk k_iter=1
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 32; // KV-proj Bv k_iter=1
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -7367,8 +7367,8 @@ expression: ptx
         {%tb1_kv_bv_15_0_0, %tb1_kv_bv_15_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 64; // KV-proj A k_iter=2
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 2048; // KV-proj Bk k_iter=2
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 2048; // KV-proj Bv k_iter=2
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 64; // KV-proj Bk k_iter=2
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 64; // KV-proj Bv k_iter=2
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -7420,8 +7420,8 @@ expression: ptx
         {%tb1_kv_bv_15_0_0, %tb1_kv_bv_15_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 96; // KV-proj A k_iter=3
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 3072; // KV-proj Bk k_iter=3
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 3072; // KV-proj Bv k_iter=3
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 96; // KV-proj Bk k_iter=3
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 96; // KV-proj Bv k_iter=3
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -7473,8 +7473,8 @@ expression: ptx
         {%tb1_kv_bv_15_0_0, %tb1_kv_bv_15_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 128; // KV-proj A k_iter=4
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 4096; // KV-proj Bk k_iter=4
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 4096; // KV-proj Bv k_iter=4
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 128; // KV-proj Bk k_iter=4
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 128; // KV-proj Bv k_iter=4
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -7526,8 +7526,8 @@ expression: ptx
         {%tb1_kv_bv_15_0_0, %tb1_kv_bv_15_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 160; // KV-proj A k_iter=5
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 5120; // KV-proj Bk k_iter=5
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 5120; // KV-proj Bv k_iter=5
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 160; // KV-proj Bk k_iter=5
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 160; // KV-proj Bv k_iter=5
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -7579,8 +7579,8 @@ expression: ptx
         {%tb1_kv_bv_15_0_0, %tb1_kv_bv_15_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 192; // KV-proj A k_iter=6
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 6144; // KV-proj Bk k_iter=6
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 6144; // KV-proj Bv k_iter=6
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 192; // KV-proj Bk k_iter=6
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 192; // KV-proj Bv k_iter=6
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -7632,8 +7632,8 @@ expression: ptx
         {%tb1_kv_bv_15_0_0, %tb1_kv_bv_15_0_1},
         {%v_acc_0_0, %v_acc_0_1, %v_acc_0_2, %v_acc_0_3};
     add.u32 %kvmma_a_base_k, %kvmma_a_base, 224; // KV-proj A k_iter=7
-    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 7168; // KV-proj Bk k_iter=7
-    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 7168; // KV-proj Bv k_iter=7
+    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, 224; // KV-proj Bk k_iter=7
+    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, 224; // KV-proj Bv k_iter=7
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
     // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],
     //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]
@@ -7721,41 +7721,41 @@ expression: ptx
     add.u32 %ksc_addr_i, %ksc_addr_u32, 514;
     cvt.rn.f16.f32 %ksc_h, %k_acc_0_3;
     st.shared.b16 [%ksc_addr_i], %ksc_h;
-    // === vsc D-fragment scatter (1 tiles, head_dim=32, N3) ===
+    // === vsc D-fragment scatter COL-MAJOR (1 tiles, m_dim=32, head_dim=32, N3) ===
     .reg .u32 %vsc_laneid, %vsc_lo_row, %vsc_lo_col_base;
     .reg .u32 %vsc_row_off, %vsc_col_off, %vsc_lane_off;
     .reg .u32 %vsc_base_u32, %vsc_addr_u32, %vsc_addr_i;
     .reg .u32 %vsc_global_t, %vsc_m_tile, %vsc_n_tile;
-    .reg .u32 %vsc_m_off, %vsc_n_off, %vsc_tile_off, %vsc_tile_u32;
+    .reg .u32 %vsc_m_off, %vsc_n_off, %vsc_tile_off;
     .reg .b16 %vsc_h;
     mov.u32 %vsc_laneid, %tid.x;
     and.b32 %vsc_laneid, %vsc_laneid, 31;
     shr.u32 %vsc_lo_row, %vsc_laneid, 2;       // l/4
     and.b32 %vsc_lo_col_base, %vsc_laneid, 3;  // l%4
-    shl.b32 %vsc_lo_col_base, %vsc_lo_col_base, 1; // (l%4)*2 = col base
-    mul.lo.u32 %vsc_row_off, %vsc_lo_row, 64;  // row * head_dim*2
-    shl.b32 %vsc_col_off, %vsc_lo_col_base, 1;     // col * 2 bytes (f16)
-    add.u32 %vsc_lane_off, %vsc_row_off, %vsc_col_off;
+    shl.b32 %vsc_lo_col_base, %vsc_lo_col_base, 1; // *2
+    mul.lo.u32 %vsc_col_off, %vsc_lo_col_base, 64;  // lo_col_base * (m_block*2)
+    shl.b32 %vsc_row_off, %vsc_lo_row, 1;     // lo_row * 2 bytes
+    add.u32 %vsc_lane_off, %vsc_col_off, %vsc_row_off;
     cvt.u32.u64 %vsc_base_u32, %tb1_kv_smem_v;
     // vsc slot local_t=0 (global_t = warp_id + 0*8 at runtime; N3)
     mov.u32 %vsc_global_t, %warp_id;
     shr.u32 %vsc_m_tile, %vsc_global_t, 2;
     and.b32 %vsc_n_tile, %vsc_global_t, 3;
-    shl.b32 %vsc_m_off, %vsc_m_tile, 10;
-    shl.b32 %vsc_n_off, %vsc_n_tile, 4;
-    add.u32 %vsc_tile_off, %vsc_m_off, %vsc_n_off;
-    add.u32 %vsc_tile_u32, %vsc_base_u32, %vsc_tile_off;
-    add.u32 %vsc_addr_u32, %vsc_tile_u32, %vsc_lane_off;
+    mul.lo.u32 %vsc_n_off, %vsc_n_tile, 512;
+    shl.b32 %vsc_m_off, %vsc_m_tile, 5;
+    add.u32 %vsc_tile_off, %vsc_n_off, %vsc_m_off;
+    add.u32 %vsc_addr_u32, %vsc_base_u32, %vsc_tile_off;
+    add.u32 %vsc_addr_u32, %vsc_addr_u32, %vsc_lane_off;
     mov.u32 %vsc_addr_i, %vsc_addr_u32;
     cvt.rn.f16.f32 %vsc_h, %v_acc_0_0;
     st.shared.b16 [%vsc_addr_i], %vsc_h;
-    add.u32 %vsc_addr_i, %vsc_addr_u32, 2;
+    add.u32 %vsc_addr_i, %vsc_addr_u32, 64;
     cvt.rn.f16.f32 %vsc_h, %v_acc_0_1;
     st.shared.b16 [%vsc_addr_i], %vsc_h;
-    add.u32 %vsc_addr_i, %vsc_addr_u32, 512;
+    add.u32 %vsc_addr_i, %vsc_addr_u32, 16;
     cvt.rn.f16.f32 %vsc_h, %v_acc_0_2;
     st.shared.b16 [%vsc_addr_i], %vsc_h;
-    add.u32 %vsc_addr_i, %vsc_addr_u32, 514;
+    add.u32 %vsc_addr_i, %vsc_addr_u32, 80;
     cvt.rn.f16.f32 %vsc_h, %v_acc_0_3;
     st.shared.b16 [%vsc_addr_i], %vsc_h;
     bar.sync 0; // FENCE: K+V tiles visible before downstream phases

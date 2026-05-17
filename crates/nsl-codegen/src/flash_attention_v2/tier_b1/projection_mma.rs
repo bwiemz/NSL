@@ -381,6 +381,197 @@ fn emit_dfragment_scatter(
     }
 }
 
+/// Like `emit_dfragment_scatter` but writes a COL-MAJOR `[m_dim_block ×
+/// head_dim]` f16 tile to SMEM. Used for V only — the PV MMA's
+/// B-fragment requires V col-major so that 2 k-adjacent f16 are
+/// contiguous in a single b32 read.
+///
+/// Byte offset for V[k=m_tile*16 + lo_row + row_off, n=n_tile*8 + lo_col_base + col_off]
+/// in col-major storage with `m_dim_block` rows and `head_dim` cols:
+///   addr = base + n_idx * (m_dim_block * 2) + k_idx * 2
+///
+/// For the 4 D-fragment positions held per lane:
+///   D0 = (lo_row,     lo_col_base    ): tile_off + lo_col_base*(m_block*2) + lo_row*2 + 0
+///   D1 = (lo_row,     lo_col_base + 1): D0 + m_block*2
+///   D2 = (lo_row + 8, lo_col_base    ): D0 + 16  (8 rows × 2 bytes)
+///   D3 = (lo_row + 8, lo_col_base + 1): D0 + m_block*2 + 16
+///
+/// Per spec section 5.5 the m_tile and n_tile offsets are runtime
+/// (warp-distributed via N3 round-robin), same as the row-major variant.
+/// Tile-off (per (m_tile, n_tile)) = n_tile*8 * (m_block*2) + m_tile*16*2.
+///
+/// `m_dim_block` is the rows-of-the-tile-in-SMEM dim. For V that's
+/// `block_kv`. `head_dim` is the cols dim (NUMBER of n_tiles is
+/// `head_dim / 8`).
+///
+/// Requires `head_dim / 8` to be a power of 2 (asserted) AND
+/// `m_dim_block * 2` to be representable in u32 (always true).
+fn emit_dfragment_scatter_col_major(
+    ptx: &mut String,
+    prefix: &str,
+    acc_prefix: &str,
+    smem_u64_base: &str,
+    m_dim_block: u32,
+    head_dim: u32,
+    tpw: u32,
+) {
+    let n_tiles_d = (head_dim / 8).max(1);
+    assert!(
+        n_tiles_d.is_power_of_two(),
+        "emit_dfragment_scatter_col_major requires head_dim/8 to be a power of 2; got {}",
+        n_tiles_d
+    );
+    let log2_n_tiles_d = n_tiles_d.trailing_zeros();
+    let n_tiles_d_mask = n_tiles_d - 1;
+    let col_stride_bytes = m_dim_block * 2;
+
+    ptx.push_str(&format!(
+        "    // === {} D-fragment scatter COL-MAJOR ({} tiles, m_dim={}, head_dim={}, N3) ===\n",
+        prefix, tpw, m_dim_block, head_dim
+    ));
+    ptx.push_str(&format!(
+        "    .reg .u32 %{}_laneid, %{}_lo_row, %{}_lo_col_base;\n",
+        prefix, prefix, prefix
+    ));
+    ptx.push_str(&format!(
+        "    .reg .u32 %{}_row_off, %{}_col_off, %{}_lane_off;\n",
+        prefix, prefix, prefix
+    ));
+    ptx.push_str(&format!(
+        "    .reg .u32 %{}_base_u32, %{}_addr_u32, %{}_addr_i;\n",
+        prefix, prefix, prefix
+    ));
+    ptx.push_str(&format!(
+        "    .reg .u32 %{}_global_t, %{}_m_tile, %{}_n_tile;\n",
+        prefix, prefix, prefix
+    ));
+    ptx.push_str(&format!(
+        "    .reg .u32 %{}_m_off, %{}_n_off, %{}_tile_off;\n",
+        prefix, prefix, prefix
+    ));
+    ptx.push_str(&format!("    .reg .b16 %{}_h;\n", prefix));
+
+    // Per-lane (lo_row, lo_col_base, lane_off) computed once.
+    ptx.push_str(&format!("    mov.u32 %{}_laneid, %tid.x;\n", prefix));
+    ptx.push_str(&format!(
+        "    and.b32 %{}_laneid, %{}_laneid, 31;\n",
+        prefix, prefix
+    ));
+    ptx.push_str(&format!(
+        "    shr.u32 %{}_lo_row, %{}_laneid, 2;       // l/4\n",
+        prefix, prefix
+    ));
+    ptx.push_str(&format!(
+        "    and.b32 %{}_lo_col_base, %{}_laneid, 3;  // l%4\n",
+        prefix, prefix
+    ));
+    ptx.push_str(&format!(
+        "    shl.b32 %{}_lo_col_base, %{}_lo_col_base, 1; // *2\n",
+        prefix, prefix
+    ));
+    // lane_off = lo_col_base * col_stride + lo_row * 2
+    ptx.push_str(&format!(
+        "    mul.lo.u32 %{}_col_off, %{}_lo_col_base, {};  // lo_col_base * (m_block*2)\n",
+        prefix, prefix, col_stride_bytes
+    ));
+    ptx.push_str(&format!(
+        "    shl.b32 %{}_row_off, %{}_lo_row, 1;     // lo_row * 2 bytes\n",
+        prefix, prefix
+    ));
+    ptx.push_str(&format!(
+        "    add.u32 %{}_lane_off, %{}_col_off, %{}_row_off;\n",
+        prefix, prefix, prefix
+    ));
+
+    // u32 sister for the SMEM base.
+    ptx.push_str(&format!(
+        "    cvt.u32.u64 %{}_base_u32, {};\n",
+        prefix, smem_u64_base
+    ));
+
+    for t in 0..tpw {
+        ptx.push_str(&format!(
+            "    // {} slot local_t={} (global_t = warp_id + {}*8 at runtime; N3)\n",
+            prefix, t, t
+        ));
+        if t == 0 {
+            ptx.push_str(&format!("    mov.u32 %{}_global_t, %warp_id;\n", prefix));
+        } else {
+            ptx.push_str(&format!(
+                "    add.u32 %{}_global_t, %warp_id, {};\n",
+                prefix,
+                t * 8
+            ));
+        }
+        ptx.push_str(&format!(
+            "    shr.u32 %{}_m_tile, %{}_global_t, {};\n",
+            prefix, prefix, log2_n_tiles_d
+        ));
+        ptx.push_str(&format!(
+            "    and.b32 %{}_n_tile, %{}_global_t, {};\n",
+            prefix, prefix, n_tiles_d_mask
+        ));
+        // n_off = n_tile * 8 * col_stride_bytes
+        ptx.push_str(&format!(
+            "    mul.lo.u32 %{}_n_off, %{}_n_tile, {};\n",
+            prefix,
+            prefix,
+            8 * col_stride_bytes
+        ));
+        // m_off = m_tile * 16 * 2 bytes = m_tile * 32 bytes
+        ptx.push_str(&format!(
+            "    shl.b32 %{}_m_off, %{}_m_tile, 5;\n",
+            prefix, prefix
+        ));
+        ptx.push_str(&format!(
+            "    add.u32 %{}_tile_off, %{}_n_off, %{}_m_off;\n",
+            prefix, prefix, prefix
+        ));
+        ptx.push_str(&format!(
+            "    add.u32 %{}_addr_u32, %{}_base_u32, %{}_tile_off;\n",
+            prefix, prefix, prefix
+        ));
+        ptx.push_str(&format!(
+            "    add.u32 %{}_addr_u32, %{}_addr_u32, %{}_lane_off;\n",
+            prefix, prefix, prefix
+        ));
+
+        // 4 D-frag positions:
+        //   i=0: +0
+        //   i=1: +col_stride (next n col)
+        //   i=2: +16 (next 8 m rows: 8*2 bytes)
+        //   i=3: +col_stride + 16
+        for i in 0..4u32 {
+            let off_bytes: u32 = match i {
+                0 => 0,
+                1 => col_stride_bytes,
+                2 => 16,
+                3 => col_stride_bytes + 16,
+                _ => unreachable!(),
+            };
+            if off_bytes > 0 {
+                ptx.push_str(&format!(
+                    "    add.u32 %{}_addr_i, %{}_addr_u32, {};\n",
+                    prefix, prefix, off_bytes
+                ));
+            } else {
+                ptx.push_str(&format!(
+                    "    mov.u32 %{}_addr_i, %{}_addr_u32;\n",
+                    prefix, prefix
+                ));
+            }
+            ptx.push_str(&format!(
+                "    cvt.rn.f16.f32 %{}_h, %{}_{}_{};\n",
+                prefix, acc_prefix, t, i
+            ));
+            ptx.push_str(&format!(
+                "    st.shared.b16 [%{}_addr_i], %{}_h;\n",
+                prefix, prefix
+            ));
+        }
+    }
+}
+
 /// Number of (m16, n8) MMA tiles each of the 8 warps owns for the Q
 /// projection output (bq × hd). Always at least 1 — small configs
 /// (e.g. bq=32, hd=32 → 8 tiles total → 1 per warp) bottom out here.
@@ -726,7 +917,22 @@ pub fn emit_q_projection(ptx: &mut String, config: &FlashAttentionConfig, chunk:
                 let b_base_expr: String = if k_iter == 0 {
                     "%qmma_b_base".to_string()
                 } else {
-                    let off = k_iter * 16 * hd * 2;
+                    // Wq is stored COL-MAJOR within each chunk band as
+                    // `[hd, chunk]` (host pre-pass `w_to_col_major_
+                    // chunked_f16`). K-iter advances 16 K-positions =
+                    // 16 × 2 = 32 bytes along the col-major k-step.
+                    // The prior emission used `k_iter * 16 * hd * 2`,
+                    // which would be correct only if Wq were row-major
+                    // [chunk, hd]; in the actual col-major layout that
+                    // overshoots by exactly `hd` (= one full hd-tile of
+                    // cols) per K-iter, so successive K-iters read
+                    // entirely different n-columns rather than 16 more
+                    // K-positions of the same column. The full kernel
+                    // e2e exposed this because the projection accumulator
+                    // mixed unrelated weight cols together; snapshot/
+                    // ptxas/SASS tests don't catch it (none execute the
+                    // kernel against known numerical data).
+                    let off = k_iter * 32;
                     ptx.push_str(&format!(
                         "    add.u32 %qmma_b_base_k, %qmma_b_base, {}; // Q-proj B k_iter={}\n",
                         off, k_iter
@@ -1194,8 +1400,17 @@ pub fn emit_kv_projection_chunk_loop(
             // N1d: K/V projection K-loop. K-dim = chunk; for chunk > 16
             // we need chunk/16 K-iters, accumulating into the same
             // %k_acc_<t>_* and %v_acc_<t>_*. Shifts:
-            //   - A (x_kv[bkv × chunk]) base by k_iter * 32 bytes (col)
-            //   - B (Wk/Wv[chunk × hd]) base by k_iter * 16 * hd * 2 bytes (row)
+            //   - A (x_kv[bkv × chunk] row-major) base by k_iter * 32
+            //     bytes (k-step = 2 bytes per col, ×16 cols per K-iter).
+            //   - B (Wk/Wv stored COL-MAJOR within chunk as [hd, chunk]):
+            //     base shifts by k_iter * 32 bytes (k-step = 2 bytes per
+            //     row within the col, ×16 rows per K-iter). Prior emission
+            //     used `k_iter * 16 * hd * 2` (row-major-stride formula),
+            //     which under col-major B overshoots by `hd` (= one full
+            //     hd-tile of cols) per K-iter — successive K-iters read
+            //     unrelated n-cols instead of advancing along K within
+            //     the same col. Same bug as Q-projection (see comment at
+            //     the Q-proj K-iter site for the full diagnosis).
             for k_iter in 0..n_k_iters_kvproj {
                 let a_base_expr: String = if k_iter == 0 {
                     "%kvmma_a_base".to_string()
@@ -1210,7 +1425,7 @@ pub fn emit_kv_projection_chunk_loop(
                 let bk_base_expr: String = if k_iter == 0 {
                     "%kvmma_bk_base".to_string()
                 } else {
-                    let off = k_iter * 16 * hd * 2;
+                    let off = k_iter * 32;
                     ptx.push_str(&format!(
                         "    add.u32 %kvmma_bk_base_k, %kvmma_bk_base, {}; // KV-proj Bk k_iter={}\n",
                         off, k_iter
@@ -1220,7 +1435,7 @@ pub fn emit_kv_projection_chunk_loop(
                 let bv_base_expr: String = if k_iter == 0 {
                     "%kvmma_bv_base".to_string()
                 } else {
-                    let off = k_iter * 16 * hd * 2;
+                    let off = k_iter * 32;
                     ptx.push_str(&format!(
                         "    add.u32 %kvmma_bv_base_k, %kvmma_bv_base, {}; // KV-proj Bv k_iter={}\n",
                         off, k_iter
@@ -1311,13 +1526,23 @@ pub fn emit_kv_projection_chunk_loop(
 
     // ----- 4. Pack f32 -> f16 and scatter K + V accumulators to SMEM -----
     //
-    // K written to tier_b1_k_offset_<slot>, V to tier_b1_v_offset_<slot>.
-    // Both share the same [bkv × head_dim] f16 row-major layout, scattered
-    // via `emit_dfragment_scatter` (D-fragment lane mapping + per-tile
-    // warp gate). Replaces the prior flat-address placeholder where all
-    // 32 lanes wrote the same byte offset.
+    // K written to tier_b1_k_offset_<slot> ROW-MAJOR [bkv × head_dim] f16:
+    // QK^T's B-fragment treats K-transposed as col-major (B[k=hd_pos,
+    // n=bkv_pos]), which coincides byte-for-byte with row-major K storage,
+    // so K stays row-major.
+    //
+    // V written to tier_b1_v_offset_<slot> COL-MAJOR [bkv × head_dim] f16
+    // (i.e. each head_dim column is contiguous in memory, k-rows step by
+    // 2 bytes). PV's B-fragment expects V col-major because the MMA's
+    // `.col` operand layout requires k-adjacent f16 to be contiguous in a
+    // single b32 — which is true for col-major storage but NOT for
+    // row-major. Storing V row-major and reading via the col-major B-frag
+    // helper produced effectively P @ scrambled-V (the magnitude-bug
+    // root cause documented in PR follow-up #1).
     emit_dfragment_scatter(ptx, "ksc", "k_acc", "%tb1_kv_smem_k", hd, tpw);
-    emit_dfragment_scatter(ptx, "vsc", "v_acc", "%tb1_kv_smem_v", hd, tpw);
+    emit_dfragment_scatter_col_major(
+        ptx, "vsc", "v_acc", "%tb1_kv_smem_v", config.block_kv as u32, hd, tpw,
+    );
     ptx.push_str("    bar.sync 0; // FENCE: K+V tiles visible before downstream phases\n");
 
     // ----- 5. Null-guard skip label -----
