@@ -159,6 +159,57 @@ fn rope_reset_enabled_ptx_assembles_on_sm75_and_sm120() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// T7 + T8 — forward Q+K rotation sites consume the doc_starts SMEM table.
+//
+// effective_pos_q / effective_pos_k are computed inside emit_rope_pair_sweep
+// (inside the per-pair loop) when the gate is active. cs_idx (cos/sin table
+// lookup) is rerouted through the effective_pos register; %r_rope_row stays
+// as the tile-local row for SMEM addressing.
+//
+// Sentinel-disabled (segment_masked=false) PTX MUST be byte-stable: no
+// effective_pos register references, no sub.s32 against doc_start.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn forward_q_rotation_computes_effective_pos_when_doc_starts_active() {
+    let cfg = config_segment_masked_with_rope();
+    let ptx = ptx_string(&cfg);
+    assert!(
+        ptx.contains("%r_effective_pos_q"),
+        "Forward Q rotation must compute effective_pos_q"
+    );
+    assert!(
+        ptx.contains("sub.s32 %r_effective_pos_q"),
+        "Forward Q rotation must use sub.s32 to compute effective_pos_q from q_pos and doc_start"
+    );
+}
+
+#[test]
+fn forward_k_rotation_computes_effective_pos_when_doc_starts_active() {
+    let cfg = config_segment_masked_with_rope();
+    let ptx = ptx_string(&cfg);
+    assert!(
+        ptx.contains("%r_effective_pos_k"),
+        "Forward K rotation must compute effective_pos_k"
+    );
+    assert!(
+        ptx.contains("sub.s32 %r_effective_pos_k"),
+        "Forward K rotation must use sub.s32 to compute effective_pos_k from kv_pos and doc_start"
+    );
+}
+
+#[test]
+fn forward_rotation_sites_skip_effective_pos_when_disabled() {
+    let mut cfg = config_segment_masked_with_rope();
+    cfg.segment_masked = false;
+    let ptx = ptx_string(&cfg);
+    assert!(
+        !ptx.contains("%r_effective_pos_q") && !ptx.contains("%r_effective_pos_k"),
+        "Sentinel-disabled path must NOT use effective_pos registers"
+    );
+}
+
 #[test]
 #[ignore]
 fn dump_rope_reset_ptx() {

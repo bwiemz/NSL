@@ -285,6 +285,15 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, tier_b: Option<(u32
         ptx.push_str("    .reg .u64 %r_doc_smem_base, %rd_doc_smem_addr;\n");
         ptx.push_str("    .reg .u32 %r_doc_starts_idx, %r_doc_starts_byte_off, %r_doc_starts_stride;\n");
         ptx.push_str("    .reg .u32 %r_batch_idx, %r_row_offset_elems;\n");
+        // %r_abs_pos: abs_row = q_start (or kv_start in fused path) + tile-local
+        // row, used as the segment_ids[] index during Tasks 7/8 effective_pos
+        // computation. Distinct from %r_rope_row (tile-local) so SMEM addressing
+        // stays correct after cs_idx reroutes through effective_pos.
+        ptx.push_str("    .reg .u32 %r_abs_pos;\n");
+        // %rs_doc_seg: u16 scratch for ld.shared.u16 of segment_ids[abs_row].
+        // Distinct from segment_mask's %rs_q_SEGMASK / %rs_k_SEGMASK to avoid
+        // collisions if both helpers fire in the same kernel.
+        ptx.push_str("    .reg .b16 %rs_doc_seg;\n");
         ptx.push_str("    .reg .s32 %r_doc_start, %r_effective_pos_q, %r_effective_pos_k;\n");
         ptx.push_str("    .reg .pred %p_doc_load_done;\n");
     }
