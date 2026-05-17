@@ -514,11 +514,42 @@ pub fn tier_b1_p_scratch_bytes(config: &FlashAttentionConfig) -> u32 {
     bq * bkv * 2
 }
 
-/// W chunk staging region offset. Lives immediately after P scratch. Size
-/// is chunk-dependent and sized at emission time (B1.3+) from the
-/// chunk selected by `tier_b1::chunk_config::select`.
-pub fn tier_b1_w_chunk_offset(config: &FlashAttentionConfig) -> u32 {
+/// Softmax cross-warp scratch region offset. Lives immediately after the
+/// P scratch. Holds per-(global_q_row × n_tile_kv) partial row-max and
+/// row-sum f32 values used by the cross-warp softmax combine. Each warp
+/// contributes one (max, sum) pair per row in its (m_tile × n_tile) slice;
+/// all 32 lanes within a row's quad share the same partial (per-warp bfly
+/// reduction). The cross-warp combine then reads ALL n_tile slots for the
+/// row to compute the global max and sum.
+///
+/// Without this scratch, each warp normalized its P slice by its own
+/// 8-column partial sum rather than the full bkv-row sum, producing
+/// roughly `n_tiles_kv`-times-too-large attention contributions.
+pub fn tier_b1_softmax_scratch_offset(config: &FlashAttentionConfig) -> u32 {
     tier_b1_p_offset(config) + tier_b1_p_scratch_bytes(config)
+}
+
+/// Number of (m=16, n=8) tiles in the bkv direction. Powers of 2 only
+/// (asserted at codegen via the existing `tiles_per_warp_qkt` / N3 checks).
+pub fn tier_b1_n_tiles_kv(config: &FlashAttentionConfig) -> u32 {
+    (config.block_kv as u32 / 8).max(1)
+}
+
+/// Size of the softmax cross-warp scratch in bytes. Per global Q-row, we
+/// reserve one f32 partial-max + one f32 partial-sum per n_tile. That's
+/// `block_q * n_tiles_kv * 2 * 4` bytes total. For canonical 32×32 this
+/// is 32 × 4 × 2 × 4 = 1024 bytes; for 64×64×64 it's 64 × 8 × 2 × 4 = 4096.
+pub fn tier_b1_softmax_scratch_bytes(config: &FlashAttentionConfig) -> u32 {
+    let bq = config.block_q as u32;
+    let n_tiles_kv = tier_b1_n_tiles_kv(config);
+    bq * n_tiles_kv * 2 * 4
+}
+
+/// W chunk staging region offset. Lives immediately after the softmax
+/// cross-warp scratch. Size is chunk-dependent and sized at emission
+/// time (B1.3+) from the chunk selected by `tier_b1::chunk_config::select`.
+pub fn tier_b1_w_chunk_offset(config: &FlashAttentionConfig) -> u32 {
+    tier_b1_softmax_scratch_offset(config) + tier_b1_softmax_scratch_bytes(config)
 }
 
 /// Total SMEM bytes for a Tier B.1 kernel at the given chunk.
@@ -544,9 +575,10 @@ pub fn tier_b1_total_smem_bytes(config: &FlashAttentionConfig, chunk: u32) -> u3
     let q_tile = bq * hd * 2;
     let kv_ping_pong = 2 * (bkv * hd * 2) + 2 * (bkv * hd * 2);
     let p_scratch = tier_b1_p_scratch_bytes(config);
+    let softmax_scratch = tier_b1_softmax_scratch_bytes(config);
     let chunk_staging = chunk * hd * 2 * 2          // Wk + Wv chunk slots
                       + (bq + bkv) * chunk * 2;     // x_q + x_kv chunk slots
-    q_tile + kv_ping_pong + p_scratch + chunk_staging
+    q_tile + kv_ping_pong + p_scratch + softmax_scratch + chunk_staging
 }
 
 /// Validate config against Tier B.1's SMEM budget (per spec section 3.4).
@@ -569,7 +601,9 @@ pub fn validate_tier_b1_config(
     // A-fragment bridge (B1.6 deferral resolution). Size = block_q
     // × block_kv f16.
     let p_scratch = tier_b1_p_scratch_bytes(config);
-    let fixed_bytes = q_tile + kv_ping_pong + p_scratch;
+    // Softmax cross-warp scratch: per-(global_q_row, n_tile_kv) f32 (max, sum).
+    let softmax_scratch = tier_b1_softmax_scratch_bytes(config);
+    let fixed_bytes = q_tile + kv_ping_pong + p_scratch + softmax_scratch;
 
     let chunk_staging = chunk * hd * 2 * 2          // Wk + Wv chunk slots
                       + (bq + bkv) * chunk * 2;     // x_q + x_kv chunk slots
@@ -834,13 +868,21 @@ mod tests {
             "v_offset_ping must precede v_offset_pong");
         assert!(tier_b1_v_offset_pong(&config) < tier_b1_p_offset(&config),
             "v_offset_pong must precede p_offset");
-        assert!(tier_b1_p_offset(&config) < tier_b1_w_chunk_offset(&config),
-            "p_offset must precede w_chunk_offset");
+        assert!(tier_b1_p_offset(&config) < tier_b1_softmax_scratch_offset(&config),
+            "p_offset must precede softmax_scratch_offset");
+        assert!(tier_b1_softmax_scratch_offset(&config) < tier_b1_w_chunk_offset(&config),
+            "softmax_scratch_offset must precede w_chunk_offset");
         // P scratch is block_q × block_kv f16.
         assert_eq!(
-            tier_b1_w_chunk_offset(&config) - tier_b1_p_offset(&config),
+            tier_b1_softmax_scratch_offset(&config) - tier_b1_p_offset(&config),
             tier_b1_p_scratch_bytes(&config),
-            "p_scratch region between p_offset and w_chunk_offset must equal block_q × block_kv × 2"
+            "p_scratch region between p_offset and softmax_scratch_offset must equal block_q × block_kv × 2"
+        );
+        // Softmax cross-warp scratch sits between p_scratch and w_chunk_off.
+        assert_eq!(
+            tier_b1_w_chunk_offset(&config) - tier_b1_softmax_scratch_offset(&config),
+            tier_b1_softmax_scratch_bytes(&config),
+            "softmax scratch region size mismatch"
         );
     }
 

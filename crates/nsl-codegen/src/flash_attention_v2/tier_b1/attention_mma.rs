@@ -18,7 +18,8 @@
 
 use crate::flash_attention::FlashAttentionConfig;
 use crate::flash_attention_v2::smem_layout::{
-    tier_b1_k_offset_ping, tier_b1_k_offset_pong, tier_b1_p_offset, tier_b1_q_offset,
+    tier_b1_k_offset_ping, tier_b1_k_offset_pong, tier_b1_n_tiles_kv, tier_b1_p_offset,
+    tier_b1_q_offset, tier_b1_softmax_scratch_bytes, tier_b1_softmax_scratch_offset,
     tier_b1_v_offset_ping, tier_b1_v_offset_pong,
 };
 use crate::matmul_mma::{
@@ -458,6 +459,99 @@ fn emit_qkt_mma(ptx: &mut String, config: &FlashAttentionConfig, slot: u32) {
             ));
         }
     }
+
+    // Causal mask: set S[q, k] := -INF where k > q.
+    //
+    // Each lane holds 4 D-fragment positions per tile per spec §5.5:
+    //   D0 = S[m_tile*16 + lo_row,     n_tile*8 + lo_col_base + 0]
+    //   D1 = S[m_tile*16 + lo_row,     n_tile*8 + lo_col_base + 1]
+    //   D2 = S[m_tile*16 + lo_row + 8, n_tile*8 + lo_col_base + 0]
+    //   D3 = S[m_tile*16 + lo_row + 8, n_tile*8 + lo_col_base + 1]
+    //
+    // The position-in-tile (lo_row, lo_col_base) is derived from %laneid;
+    // (m_tile, n_tile) was computed per-t above via warp-distribution.
+    // q_global = %q_start + m_tile*16 + row_in_tile; k_global = kv_iter *
+    // block_kv + n_tile*8 + col_in_tile (the kv_iter offset is folded in
+    // via %kv_start_runtime if the caller writes it; for the single-iter
+    // scaffold kv_iter=0 so the offset is 0).
+    if config.causal {
+        ptx.push_str("    // Causal mask: -INF where k_global > q_global\n");
+        ptx.push_str("    .reg .u32 %cm_laneid, %cm_lo_row, %cm_lo_col_base;\n");
+        ptx.push_str("    .reg .u32 %cm_q_global, %cm_k_global;\n");
+        ptx.push_str("    .reg .pred %cm_mask;\n");
+        ptx.push_str("    mov.u32 %cm_laneid, %tid.x;\n");
+        ptx.push_str("    and.b32 %cm_laneid, %cm_laneid, 31;\n");
+        ptx.push_str("    shr.u32 %cm_lo_row, %cm_laneid, 2;       // lo_row = lane/4\n");
+        ptx.push_str("    and.b32 %cm_lo_col_base, %cm_laneid, 3;  // lane%4\n");
+        ptx.push_str("    shl.b32 %cm_lo_col_base, %cm_lo_col_base, 1; // *2\n");
+        // -inf as f32 IEEE 754 = 0xFF800000. Use a large negative value
+        // that survives the subsequent (S - max) - softmax_scale path
+        // without underflowing to -inf prematurely (we don't want NaN
+        // from inf-inf). 0xC2C80000 ≈ -100 is conservative for all
+        // post-scale S magnitudes the kernel produces.
+        let mask_neg_bits: u32 = 0xC2C80000; // -100.0f
+        for t in 0..tpw {
+            // Recompute (m_tile, n_tile) for this tile slot — same formula
+            // as the QK^T MMA above. Reuse %qkt_global_t/m_tile/n_tile
+            // (declared above; lives in scope here).
+            if t == 0 {
+                ptx.push_str("    mov.u32 %qkt_global_t, %warp_id;\n");
+            } else {
+                ptx.push_str(&format!(
+                    "    add.u32 %qkt_global_t, %warp_id, {};\n",
+                    t * 8
+                ));
+            }
+            ptx.push_str(&format!(
+                "    shr.u32 %qkt_m_tile, %qkt_global_t, {};\n",
+                log2_n_tiles_bkv
+            ));
+            ptx.push_str(&format!(
+                "    and.b32 %qkt_n_tile, %qkt_global_t, {};\n",
+                n_tiles_bkv_mask
+            ));
+            // m_tile*16 and n_tile*8 — reuse %qkt_q_warp_off/%qkt_k_warp_off
+            // as scratch (we no longer need them after the MMA).
+            ptx.push_str("    shl.b32 %qkt_q_warp_off, %qkt_m_tile, 4;\n");
+            ptx.push_str("    shl.b32 %qkt_k_warp_off, %qkt_n_tile, 3;\n");
+
+            for d_idx in 0..4u32 {
+                let row_offset = if d_idx < 2 { 0u32 } else { 8 };
+                let col_offset = d_idx % 2;
+                // q_global = q_start_low_u32 + m_tile*16 + lo_row + row_offset
+                ptx.push_str(&format!(
+                    "    add.u32 %cm_q_global, %qkt_q_warp_off, %cm_lo_row;\n"
+                ));
+                if row_offset > 0 {
+                    ptx.push_str(&format!(
+                        "    add.u32 %cm_q_global, %cm_q_global, {};\n",
+                        row_offset
+                    ));
+                }
+                ptx.push_str(
+                    "    cvt.u32.u64 %cm_k_global, %q_start;  // q_start (low 32 bits)\n",
+                );
+                ptx.push_str("    add.u32 %cm_q_global, %cm_q_global, %cm_k_global;\n");
+                // k_global = n_tile*8 + lo_col_base + col_offset
+                // (single-iter kv_iter=0; kv_start = 0).
+                ptx.push_str(&format!(
+                    "    add.u32 %cm_k_global, %qkt_k_warp_off, %cm_lo_col_base;\n"
+                ));
+                if col_offset > 0 {
+                    ptx.push_str(&format!(
+                        "    add.u32 %cm_k_global, %cm_k_global, {};\n",
+                        col_offset
+                    ));
+                }
+                // mask if k_global > q_global → set -INF-substitute.
+                ptx.push_str("    setp.gt.u32 %cm_mask, %cm_k_global, %cm_q_global;\n");
+                ptx.push_str(&format!(
+                    "    @%cm_mask mov.f32 %s_acc_{}_{}, 0f{:08X};\n",
+                    t, d_idx, mask_neg_bits
+                ));
+            }
+        }
+    }
 }
 
 /// Online softmax: row-max -> exp(S - max) -> row-sum + running
@@ -483,16 +577,60 @@ fn emit_qkt_mma(ptx: &mut String, config: &FlashAttentionConfig, slot: u32) {
 /// which is correct for kv_iter=0 only.
 fn emit_online_softmax(ptx: &mut String, config: &FlashAttentionConfig, kv_iter: u32) {
     let tpw = tiles_per_warp_qkt(config);
+    let bq = config.block_q as u32;
+    let bkv = config.block_kv as u32;
+    let n_tiles_kv = tier_b1_n_tiles_kv(config);
+    let softmax_off = tier_b1_softmax_scratch_offset(config);
+    let scratch_max_size = bq * n_tiles_kv * 4; // first half of scratch holds maxes
+    // The sum region lives at +scratch_max_size from the softmax base; that
+    // offset is added inline at the SMEM addressing site below.
+    // sanity: total reserved must match smem_layout helper
+    assert_eq!(
+        scratch_max_size + scratch_max_size,
+        tier_b1_softmax_scratch_bytes(config),
+        "softmax scratch byte budget mismatch"
+    );
+
     ptx.push_str(&format!(
-        "    // Online softmax: bq={} tpw_qkt={} kv_iter={}\n",
-        config.block_q, tpw, kv_iter
+        "    // Online softmax (cross-warp combine): bq={} bkv={} n_tiles_kv={} tpw_qkt={} kv_iter={}\n",
+        bq, bkv, n_tiles_kv, tpw, kv_iter
     ));
+
+    // ---- shared scratch register prelude (per-call but cheap; ptxas SSA
+    // collapses repeats across multi-iter when those are added). ----
+    ptx.push_str("    .reg .u32 %sm_laneid, %sm_lane_mod4, %sm_lo_row;\n");
+    ptx.push_str("    .reg .pred %sm_writer_pred;\n");
+    ptx.push_str("    .reg .u32 %sm_scratch_max_base, %sm_scratch_sum_base;\n");
+    ptx.push_str("    .reg .u32 %sm_addr, %sm_addr2, %sm_global_row;\n");
+    ptx.push_str("    .reg .f32 %sm_global_max_lo, %sm_global_max_hi;\n");
+    ptx.push_str("    .reg .f32 %sm_global_sum_lo, %sm_global_sum_hi;\n");
+    ptx.push_str("    .reg .f32 %sm_part_max, %sm_part_sum;\n");
+    // Convert SMEM scratch base from %shmem_base (u64) to u32 once.
+    ptx.push_str(&format!(
+        "    add.u64 %tb1_phase_b_smem_q, %shmem_base, {}; // softmax scratch base (reusing %tb1_phase_b_smem_q as u64 scratch)\n",
+        softmax_off
+    ));
+    ptx.push_str("    cvt.u32.u64 %sm_scratch_max_base, %tb1_phase_b_smem_q;\n");
+    ptx.push_str(&format!(
+        "    add.u32 %sm_scratch_sum_base, %sm_scratch_max_base, {};\n",
+        scratch_max_size
+    ));
+    ptx.push_str("    mov.u32 %sm_laneid, %tid.x;\n");
+    ptx.push_str("    and.b32 %sm_laneid, %sm_laneid, 31;\n");
+    ptx.push_str("    shr.u32 %sm_lo_row, %sm_laneid, 2;       // lo_row = lane/4\n");
+    ptx.push_str("    and.b32 %sm_lane_mod4, %sm_laneid, 3;    // lane%4\n");
+    // Writer-lane gate: only lane%4==0 writes (4 lanes per row group share
+    // the same per-warp partial after bfly; one of them does the SMEM store).
+    ptx.push_str("    setp.eq.u32 %sm_writer_pred, %sm_lane_mod4, 0;\n");
+
+    // ============================================================
+    // STEP 1: per-warp partial row-max + cross-warp combine to global_max.
+    // ============================================================
     for t in 0..tpw {
         ptx.push_str(&format!(
-            "    // === softmax tile t={} : row-max bfly tree (deferral #6 partial) ===\n",
+            "    // === softmax tile t={} : step 1 = per-warp partial row-max ===\n",
             t
         ));
-        // Per-tile scratch for the row-max reduction.
         ptx.push_str(&format!(
             "    .reg .f32 %s_max_{}_lo, %s_max_{}_hi, %s_shfl_{}_tmp;\n",
             t, t, t
@@ -507,10 +645,7 @@ fn emit_online_softmax(ptx: &mut String, config: &FlashAttentionConfig, kv_iter:
             "    max.f32 %s_max_{}_hi, %s_acc_{}_2, %s_acc_{}_3;\n",
             t, t, t
         ));
-        // Row-max bfly tree across the 4-lane row group. Per spec §5.5
-        // lanes (4k, 4k+1, 4k+2, 4k+3) share the same row_lo; pairing
-        // via bfly mask=1 then mask=2 reduces those 4 lanes to a common
-        // max. Same pattern applies independently to row_lo+8.
+        // Bfly within 4-lane row group → partial max for warp's 8-col slice.
         for (mask, comment) in [(1u32, "lane k <-> k^1"), (2u32, "lane k <-> k^2")].iter() {
             ptx.push_str(&format!(
                 "    shfl.sync.bfly.b32 %s_shfl_{}_tmp, %s_max_{}_lo, {}, 0x1f, 0xffffffff; // {}\n",
@@ -529,19 +664,129 @@ fn emit_online_softmax(ptx: &mut String, config: &FlashAttentionConfig, kv_iter:
                 t, t, t
             ));
         }
-        // ----- subtract row_max + exp ----- (B1.6 deferral #6 cont'd)
-        //
-        // Spec section 4.2: P = exp(S - row_max). PTX has no native exp,
-        // so we use the identity exp(x) = 2^(x * log2(e)) with the fast
-        // `ex2.approx.f32` instruction. The log2(e) constant is folded
-        // into the subtract: (S - row_max) * log2(e) → ex2.approx.f32.
-        //
-        // log2(e) = 1.4426950408889634 (IEEE-754 single = 0f3FB8AA3B).
+
+        // Writer-lane stores partial max for (m_tile*16 + lo_row, n_tile)
+        // and (m_tile*16 + lo_row + 8, n_tile). Recompute (m_tile, n_tile)
+        // from %warp_id and t (mirrors the QK^T MMA distribution).
+        if t == 0 {
+            ptx.push_str("    mov.u32 %qkt_global_t, %warp_id;\n");
+        } else {
+            ptx.push_str(&format!(
+                "    add.u32 %qkt_global_t, %warp_id, {};\n",
+                t * 8
+            ));
+        }
+        // m_tile = global_t / n_tiles_kv ; n_tile = global_t & (n_tiles_kv-1)
+        let log2_n_tiles_kv = n_tiles_kv.trailing_zeros();
+        let n_tiles_kv_mask = n_tiles_kv - 1;
         ptx.push_str(&format!(
-            "    // subtract row_max, scale by log2(e), apply ex2.approx (deferral #6)\n",
+            "    shr.u32 %qkt_m_tile, %qkt_global_t, {};\n",
+            log2_n_tiles_kv
         ));
-        // frag indices 0,1 belong to row_lo (subtract %s_max_<t>_lo);
-        // frag indices 2,3 belong to row_lo+8 (subtract %s_max_<t>_hi).
+        ptx.push_str(&format!(
+            "    and.b32 %qkt_n_tile, %qkt_global_t, {};\n",
+            n_tiles_kv_mask
+        ));
+        // global_row_lo = m_tile*16 + lo_row.
+        ptx.push_str("    shl.b32 %qkt_q_warp_off, %qkt_m_tile, 4;\n");
+        ptx.push_str("    add.u32 %sm_global_row, %qkt_q_warp_off, %sm_lo_row;\n");
+        // addr = scratch_max_base + (global_row * n_tiles_kv + n_tile) * 4.
+        ptx.push_str(&format!(
+            "    mul.lo.u32 %sm_addr, %sm_global_row, {};\n",
+            n_tiles_kv * 4
+        ));
+        ptx.push_str("    shl.b32 %sm_addr2, %qkt_n_tile, 2; // n_tile * 4 bytes\n");
+        ptx.push_str("    add.u32 %sm_addr, %sm_addr, %sm_addr2;\n");
+        ptx.push_str("    add.u32 %sm_addr, %sm_addr, %sm_scratch_max_base;\n");
+        ptx.push_str(&format!(
+            "    @%sm_writer_pred st.shared.f32 [%sm_addr], %s_max_{}_lo;\n",
+            t
+        ));
+        // Now the HI row: global_row + 8.
+        ptx.push_str(&format!(
+            "    add.u32 %sm_global_row, %sm_global_row, 8;\n"
+        ));
+        ptx.push_str(&format!(
+            "    mul.lo.u32 %sm_addr, %sm_global_row, {};\n",
+            n_tiles_kv * 4
+        ));
+        ptx.push_str("    add.u32 %sm_addr, %sm_addr, %sm_addr2;\n");
+        ptx.push_str("    add.u32 %sm_addr, %sm_addr, %sm_scratch_max_base;\n");
+        ptx.push_str(&format!(
+            "    @%sm_writer_pred st.shared.f32 [%sm_addr], %s_max_{}_hi;\n",
+            t
+        ));
+    }
+    // Make all partial maxes visible to all warps.
+    ptx.push_str("    bar.sync 0; // softmax cross-warp partial-max visibility\n");
+
+    // ============================================================
+    // STEP 2: each lane reads all n_tiles_kv partial maxes for its rows
+    // and computes the global_max. Two rows per lane (lo and hi).
+    // ============================================================
+    for t in 0..tpw {
+        // Recompute m_tile for this slot (same formula).
+        if t == 0 {
+            ptx.push_str("    mov.u32 %qkt_global_t, %warp_id;\n");
+        } else {
+            ptx.push_str(&format!(
+                "    add.u32 %qkt_global_t, %warp_id, {};\n",
+                t * 8
+            ));
+        }
+        let log2_n_tiles_kv = n_tiles_kv.trailing_zeros();
+        ptx.push_str(&format!(
+            "    shr.u32 %qkt_m_tile, %qkt_global_t, {};\n",
+            log2_n_tiles_kv
+        ));
+        ptx.push_str("    shl.b32 %qkt_q_warp_off, %qkt_m_tile, 4;\n");
+        // For each half (lo/hi), read all n_tiles_kv partials and reduce.
+        for (half_name, row_offset) in [("lo", 0u32), ("hi", 8u32)].iter() {
+            // sm_global_row = m_tile*16 + lo_row + row_offset
+            ptx.push_str("    add.u32 %sm_global_row, %qkt_q_warp_off, %sm_lo_row;\n");
+            if *row_offset > 0 {
+                ptx.push_str(&format!(
+                    "    add.u32 %sm_global_row, %sm_global_row, {};\n",
+                    row_offset
+                ));
+            }
+            // Initialize global_max from the n=0 partial; then max-fold n=1..
+            ptx.push_str(&format!(
+                "    mul.lo.u32 %sm_addr, %sm_global_row, {};\n",
+                n_tiles_kv * 4
+            ));
+            ptx.push_str("    add.u32 %sm_addr, %sm_addr, %sm_scratch_max_base;\n");
+            ptx.push_str(&format!(
+                "    ld.shared.f32 %sm_global_max_{}, [%sm_addr];   // n=0\n",
+                half_name
+            ));
+            for n in 1..n_tiles_kv {
+                ptx.push_str(&format!(
+                    "    ld.shared.f32 %sm_part_max, [%sm_addr + {}];   // n={}\n",
+                    n * 4,
+                    n
+                ));
+                ptx.push_str(&format!(
+                    "    max.f32 %sm_global_max_{}, %sm_global_max_{}, %sm_part_max;\n",
+                    half_name, half_name
+                ));
+            }
+            // Stash the global_max in %s_max_<t>_<half> for downstream use.
+            ptx.push_str(&format!(
+                "    mov.f32 %s_max_{}_{}, %sm_global_max_{};\n",
+                t, half_name, half_name
+            ));
+        }
+    }
+
+    // ============================================================
+    // STEP 3: P = exp((S - global_max) * log2(e)) per lane.
+    // ============================================================
+    for t in 0..tpw {
+        ptx.push_str(&format!(
+            "    // === softmax tile t={} : step 3 = exp(S - global_max) ===\n",
+            t
+        ));
         for (lane, max_var) in [(0u32, "lo"), (1u32, "lo"), (2u32, "hi"), (3u32, "hi")].iter() {
             ptx.push_str(&format!(
                 "    sub.f32 %s_acc_{}_{}, %s_acc_{}_{}, %s_max_{}_{};\n",
@@ -556,13 +801,18 @@ fn emit_online_softmax(ptx: &mut String, config: &FlashAttentionConfig, kv_iter:
                 t, lane, t, lane
             ));
         }
+    }
 
-        // ----- row_sum bfly tree ----- (deferral #6 cont'd)
-        //
-        // After exp, the lane's 4 fragment slots hold P values for
-        // (row_lo, cols col_pair*2..col_pair*2+1) and
-        // (row_lo+8, cols col_pair*2..col_pair*2+1). row_sum across 8
-        // cols of one row requires the same 4-lane bfly tree as row_max.
+    // ============================================================
+    // STEP 4: per-warp partial row-sum + cross-warp combine to global_sum.
+    // No correction factor needed since each warp's partial_sum was computed
+    // from exp(S - global_max) directly (not exp(S - partial_max)).
+    // ============================================================
+    for t in 0..tpw {
+        ptx.push_str(&format!(
+            "    // === softmax tile t={} : step 4 = per-warp partial row-sum ===\n",
+            t
+        ));
         ptx.push_str(&format!(
             "    .reg .f32 %s_sum_{}_lo, %s_sum_{}_hi;\n",
             t, t
@@ -593,23 +843,122 @@ fn emit_online_softmax(ptx: &mut String, config: &FlashAttentionConfig, kv_iter:
                 t, t, t
             ));
         }
-
-        // ----- divide by row_sum ----- (deferral #6 cont'd)
-        //
-        // P_ij = exp(S_ij - row_max_i) / row_sum_i.
-        for (lane, sum_var) in [(0u32, "lo"), (1u32, "lo"), (2u32, "hi"), (3u32, "hi")].iter() {
+        // Writer-lane writes partial_sum_lo at (global_row=m_tile*16+lo_row,
+        // n_tile) and partial_sum_hi at (global_row+8, n_tile).
+        if t == 0 {
+            ptx.push_str("    mov.u32 %qkt_global_t, %warp_id;\n");
+        } else {
             ptx.push_str(&format!(
-                "    div.approx.f32 %s_acc_{}_{}, %s_acc_{}_{}, %s_sum_{}_{};\n",
-                t, lane, t, lane, t, sum_var
+                "    add.u32 %qkt_global_t, %warp_id, {};\n",
+                t * 8
             ));
         }
+        let log2_n_tiles_kv = n_tiles_kv.trailing_zeros();
+        let n_tiles_kv_mask = n_tiles_kv - 1;
+        ptx.push_str(&format!(
+            "    shr.u32 %qkt_m_tile, %qkt_global_t, {};\n",
+            log2_n_tiles_kv
+        ));
+        ptx.push_str(&format!(
+            "    and.b32 %qkt_n_tile, %qkt_global_t, {};\n",
+            n_tiles_kv_mask
+        ));
+        ptx.push_str("    shl.b32 %qkt_q_warp_off, %qkt_m_tile, 4;\n");
+        ptx.push_str("    add.u32 %sm_global_row, %qkt_q_warp_off, %sm_lo_row;\n");
+        ptx.push_str(&format!(
+            "    mul.lo.u32 %sm_addr, %sm_global_row, {};\n",
+            n_tiles_kv * 4
+        ));
+        ptx.push_str("    shl.b32 %sm_addr2, %qkt_n_tile, 2;\n");
+        ptx.push_str("    add.u32 %sm_addr, %sm_addr, %sm_addr2;\n");
+        ptx.push_str("    add.u32 %sm_addr, %sm_addr, %sm_scratch_sum_base;\n");
+        ptx.push_str(&format!(
+            "    @%sm_writer_pred st.shared.f32 [%sm_addr], %s_sum_{}_lo;\n",
+            t
+        ));
+        ptx.push_str("    add.u32 %sm_global_row, %sm_global_row, 8;\n");
+        ptx.push_str(&format!(
+            "    mul.lo.u32 %sm_addr, %sm_global_row, {};\n",
+            n_tiles_kv * 4
+        ));
+        ptx.push_str("    add.u32 %sm_addr, %sm_addr, %sm_addr2;\n");
+        ptx.push_str("    add.u32 %sm_addr, %sm_addr, %sm_scratch_sum_base;\n");
+        ptx.push_str(&format!(
+            "    @%sm_writer_pred st.shared.f32 [%sm_addr], %s_sum_{}_hi;\n",
+            t
+        ));
+    }
+    ptx.push_str("    bar.sync 0; // softmax cross-warp partial-sum visibility\n");
 
-        // ----- pack 2 f32 P values into one b32 holding 2 f16 lanes -----
-        //
-        // Frag indices 0,1 hold cols col_pair*2 and col_pair*2+1 of
-        // row_lo (post-divide). The PV MMA's A-fragment expects f16 col
-        // pairs packed into b32 registers. Convert each f32 -> f16 then
-        // pack two f16 into one b32 via the PTX mov.b32 {h0,h1} syntax.
+    // ============================================================
+    // STEP 5: each lane reads all n_tiles_kv partial sums for its rows
+    // and computes the global_sum. Store in %s_sum_<t>_<half> so that
+    // (a) downstream code (P_packed packing — vestigial) sees consistent
+    // values and (b) finalize divides by the GLOBAL sum.
+    // ============================================================
+    for t in 0..tpw {
+        if t == 0 {
+            ptx.push_str("    mov.u32 %qkt_global_t, %warp_id;\n");
+        } else {
+            ptx.push_str(&format!(
+                "    add.u32 %qkt_global_t, %warp_id, {};\n",
+                t * 8
+            ));
+        }
+        let log2_n_tiles_kv = n_tiles_kv.trailing_zeros();
+        ptx.push_str(&format!(
+            "    shr.u32 %qkt_m_tile, %qkt_global_t, {};\n",
+            log2_n_tiles_kv
+        ));
+        ptx.push_str("    shl.b32 %qkt_q_warp_off, %qkt_m_tile, 4;\n");
+        for (half_name, row_offset) in [("lo", 0u32), ("hi", 8u32)].iter() {
+            ptx.push_str("    add.u32 %sm_global_row, %qkt_q_warp_off, %sm_lo_row;\n");
+            if *row_offset > 0 {
+                ptx.push_str(&format!(
+                    "    add.u32 %sm_global_row, %sm_global_row, {};\n",
+                    row_offset
+                ));
+            }
+            ptx.push_str(&format!(
+                "    mul.lo.u32 %sm_addr, %sm_global_row, {};\n",
+                n_tiles_kv * 4
+            ));
+            ptx.push_str("    add.u32 %sm_addr, %sm_addr, %sm_scratch_sum_base;\n");
+            ptx.push_str(&format!(
+                "    ld.shared.f32 %sm_global_sum_{}, [%sm_addr];   // n=0\n",
+                half_name
+            ));
+            for n in 1..n_tiles_kv {
+                ptx.push_str(&format!(
+                    "    ld.shared.f32 %sm_part_sum, [%sm_addr + {}];   // n={}\n",
+                    n * 4,
+                    n
+                ));
+                ptx.push_str(&format!(
+                    "    add.f32 %sm_global_sum_{}, %sm_global_sum_{}, %sm_part_sum;\n",
+                    half_name, half_name
+                ));
+            }
+            ptx.push_str(&format!(
+                "    mov.f32 %s_sum_{}_{}, %sm_global_sum_{};\n",
+                t, half_name, half_name
+            ));
+        }
+    }
+
+    // NO per-warp divide here. P (=exp(S - global_max)) is left in
+    // %s_acc_<t>_<lane>; finalize divides by %s_sum_<t>_<half> (global)
+    // as the SINGLE normalization step. The prior emission divided
+    // here AND in finalize, producing 1/global_sum^2 instead of
+    // 1/global_sum. The per-warp divide also normalized by a partial
+    // sum, which combined with the per-warp partial-only path produced
+    // n_tiles_kv-times-too-large attention contributions.
+
+    // ----- pack 2 f32 P values into one b32 holding 2 f16 lanes -----
+    // (Vestigial: %p_packed_<t> is no longer consumed by PV after the
+    // SMEM-bridge refactor. Kept until the next pass cleans it up; ptxas
+    // prunes dead registers so this is free at runtime.)
+    for t in 0..tpw {
         ptx.push_str(&format!(
             "    cvt.rn.f16.f32 %mma_h0, %s_acc_{}_0;\n",
             t
@@ -738,8 +1087,13 @@ fn emit_pv_mma(ptx: &mut String, config: &FlashAttentionConfig, slot: u32) {
         ptx.push_str(
             "    add.u32 %pv_a_base, %tb1_phase_b_smem_p_u32, %pv_p_warp_off;\n",
         );
-        // B-fragment base = V_smem + n_tile_pv * 8 * 2 = n_tile_pv * 16 bytes.
-        ptx.push_str("    shl.b32 %pv_v_warp_off, %pv_n_tile, 4;\n");
+        // B-fragment base = V_smem + n_tile_pv * 8 * (bkv*2) bytes. V is
+        // stored COL-MAJOR [bkv × hd] so n_tile advance = 8 cols ×
+        // bkv*2 byte-stride per col.
+        ptx.push_str(&format!(
+            "    mul.lo.u32 %pv_v_warp_off, %pv_n_tile, {};\n",
+            8 * bkv * 2
+        ));
         ptx.push_str(
             "    add.u32 %pv_b_base, %tb1_phase_b_smem_v_u32, %pv_v_warp_off;\n",
         );
@@ -774,7 +1128,13 @@ fn emit_pv_mma(ptx: &mut String, config: &FlashAttentionConfig, slot: u32) {
             let b_base_expr: String = if k_iter == 0 {
                 "%pv_b_base".to_string()
             } else {
-                let off = k_iter * 16 * hd * 2;
+                // V is COL-MAJOR [bkv × hd]: K-iter advances by 16
+                // k-positions = 16 * 2 = 32 bytes along the inner (m)
+                // dim. Prior emission used `k_iter * 16 * hd * 2` which
+                // matched the row-major V interpretation; under
+                // col-major that overshot by `hd` (= one full row span
+                // of 8 n-tiles) per K-iter.
+                let off = k_iter * 16 * 2;
                 ptx.push_str(&format!(
                     "    add.u32 %pv_b_base_k, %pv_b_base, {}; // PV B-base shift k_iter={}\n",
                     off, k_iter
@@ -796,7 +1156,15 @@ fn emit_pv_mma(ptx: &mut String, config: &FlashAttentionConfig, slot: u32) {
             );
 
             // B1.6 deferral #1 (PV B-fragment): per-lane V load via helper.
-            // V is bkv rows x hd cols; B-fragment col-major stride is hd*2.
+            // V is stored COL-MAJOR [bkv × hd] f16 in SMEM (the V-scatter
+            // uses `emit_dfragment_scatter_col_major`). B-fragment helper
+            // expects col_stride = bytes between adjacent N cols = bkv*2,
+            // and within each col, 2 k-adjacent f16 are contiguous (which
+            // they ARE in col-major). Prior emission passed (hd*2) under
+            // the assumption that V was row-major, which produced
+            // effectively P @ scrambled-V (helper read V at byte
+            // n*(hd*2) + k*2 — that byte position in row-major-stored V
+            // resolved to V[n, k] not V[k, n]).
             let b_fragment_regs = [
                 format!("tb1_pv_b_{}_0", t),
                 format!("tb1_pv_b_{}_1", t),
@@ -805,7 +1173,7 @@ fn emit_pv_mma(ptx: &mut String, config: &FlashAttentionConfig, slot: u32) {
                 ptx,
                 &b_fragment_regs,
                 &b_base_expr,
-                (hd * 2) as usize,
+                (bkv * 2) as usize,
             );
             let d_regs = [
                 format!("%o_acc_{}_0", t),
