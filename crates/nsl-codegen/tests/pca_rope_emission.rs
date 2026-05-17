@@ -5,7 +5,7 @@
 //! (segment_masked=false) callers MUST remain byte-stable.
 
 use nsl_codegen::flash_attention::{CshaExtras, FlashAttentionConfig, RopeStyle};
-use nsl_codegen::flash_attention_v2::synthesize_flash_attention_ptx_v2;
+use nsl_codegen::flash_attention_v2::{synthesize_backward, synthesize_flash_attention_ptx_v2};
 
 fn config_segment_masked_with_rope() -> FlashAttentionConfig {
     // Use the CSHA L2 RoPE preset matching the existing ptxas-validated
@@ -29,9 +29,24 @@ fn config_segment_masked_with_rope() -> FlashAttentionConfig {
     }
 }
 
+/// Backward-capable variant: same gating as the forward fixture, but with
+/// `save_activations_for_backward=true` so `synthesize_backward` accepts
+/// the config (the backward path reads from the saved post-RoPE Q/K/V).
+fn config_segment_masked_with_rope_for_backward() -> FlashAttentionConfig {
+    let mut cfg = config_segment_masked_with_rope();
+    if let Some(csha) = cfg.csha.as_mut() {
+        csha.save_activations_for_backward = true;
+    }
+    cfg
+}
+
 fn ptx_string(cfg: &FlashAttentionConfig) -> String {
     String::from_utf8(synthesize_flash_attention_ptx_v2(cfg))
         .expect("PTX must be valid UTF-8")
+}
+
+fn backward_ptx_string(cfg: &FlashAttentionConfig) -> String {
+    synthesize_backward(cfg).expect("backward synthesis must succeed")
 }
 
 #[test]
@@ -207,6 +222,82 @@ fn forward_rotation_sites_skip_effective_pos_when_disabled() {
     assert!(
         !ptx.contains("%r_effective_pos_q") && !ptx.contains("%r_effective_pos_k"),
         "Sentinel-disabled path must NOT use effective_pos registers"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// T9 — backward dQ + dK de-rotation sites consume the doc_starts SMEM table.
+//
+// Inverse-rotation math:
+//   dx0 =  dY[2i]*cos + dY[2i+1]*sin
+//   dx1 = -dY[2i]*sin + dY[2i+1]*cos
+// The cs_idx (cos/sin lookup) is identical to the forward — only the sign
+// of `sin` flips when applying. Therefore the effective_pos formula must be
+// bit-identical to T7+T8: effective_pos = abs_row - smem_doc_starts[seg_id].
+//
+// Sentinel-disabled (segment_masked=false) backward PTX MUST be byte-stable:
+// no effective_pos refs, no smem_doc_starts decl/load.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn backward_dq_de_rotation_computes_effective_pos_when_doc_starts_active() {
+    let cfg = config_segment_masked_with_rope_for_backward();
+    let ptx = backward_ptx_string(&cfg);
+    assert!(
+        ptx.contains("%r_effective_pos_q"),
+        "Backward dQ de-rotation must compute effective_pos_q"
+    );
+}
+
+#[test]
+fn backward_dk_de_rotation_computes_effective_pos_when_doc_starts_active() {
+    let cfg = config_segment_masked_with_rope_for_backward();
+    let ptx = backward_ptx_string(&cfg);
+    assert!(
+        ptx.contains("%r_effective_pos_k"),
+        "Backward dK de-rotation must compute effective_pos_k"
+    );
+}
+
+#[test]
+fn backward_loads_doc_starts_to_smem_when_segment_masked_and_rope_q() {
+    let cfg = config_segment_masked_with_rope_for_backward();
+    let ptx = backward_ptx_string(&cfg);
+    assert!(
+        ptx.contains("V2_PCA_ROPE_DOC_STARTS_LOAD_LOOP")
+            || ptx.contains("smem_doc_starts"),
+        "Backward CTA prologue must populate smem_doc_starts \
+         (either via emit_doc_starts_smem_load or equivalent)"
+    );
+}
+
+#[test]
+fn backward_rope_reset_enabled_ptx_assembles_on_sm75_and_sm120() {
+    let Some(ptxas) = find_ptxas() else {
+        eprintln!("ptxas not found — skipping");
+        return;
+    };
+    let cfg = config_segment_masked_with_rope_for_backward();
+    let ptx = backward_ptx_string(&cfg);
+    for sm in ["sm_75", "sm_120"] {
+        if let Err(stderr) = assemble_ptx(&ptxas, ptx.as_bytes(), sm) {
+            panic!("ptxas rejected backward PTX for {sm}:\n{stderr}");
+        }
+    }
+}
+
+#[test]
+fn backward_disabled_path_has_no_effective_pos_or_smem_load() {
+    let mut cfg = config_segment_masked_with_rope_for_backward();
+    cfg.segment_masked = false;
+    let ptx = backward_ptx_string(&cfg);
+    assert!(
+        !ptx.contains("%r_effective_pos_q") && !ptx.contains("%r_effective_pos_k"),
+        "Backward sentinel-disabled path must NOT use effective_pos"
+    );
+    assert!(
+        !ptx.contains("smem_doc_starts"),
+        "Backward sentinel-disabled path must NOT load smem_doc_starts"
     );
 }
 

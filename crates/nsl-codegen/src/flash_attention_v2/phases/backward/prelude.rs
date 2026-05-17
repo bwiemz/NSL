@@ -140,6 +140,13 @@ pub fn emit(
     if config.segment_masked {
         params.push((".param .u64", "segment_ids_ptr"));
     }
+    // PCA §4.3 RoPE-reset (T9): doc_starts pointer only when both
+    // segment_masked AND rope_q are set. Appended after segment_ids_ptr to
+    // mirror the forward prelude's layout so segment_masked=true &&
+    // rope_q=false signatures stay byte-stable.
+    if config.segment_masked && config.rope_q {
+        params.push((".param .u64", "doc_starts_ptr"));
+    }
     // PCA Tier B M3 instrumentation (B2-2 mirror of forward): per-tile
     // skip-decision HBM buffer pointer. Only declared when:
     //   1. Tier B is being emitted (tier_b is Some + budget admits), AND
@@ -253,6 +260,33 @@ pub fn emit(
     // backward phase emitters can use the same addressing helpers).
     ptx.push_str("    .reg .u64 %q_smem_base, %k_smem_base, %v_smem_base;\n");
     ptx.push_str("    .reg .u64 %warp_row;\n");
+
+    // PCA §4.3 RoPE-reset registers (sites 3+4 + CTA prologue) — backward
+    // mirror of the forward prelude.rs PCA §4.3 register block. Gated on
+    // segment_masked && rope_q so sentinel-disabled (segment_masked=false)
+    // paths stay byte-stable. Consumed by:
+    //   * emit_doc_starts_smem_load (this prelude, below) — CTA prologue
+    //   * Task 9 (backward dQ/dK rotation sites in csha_hooks_backward) —
+    //     reads smem_doc_starts to compute effective_pos before cs_idx.
+    if config.segment_masked && config.rope_q {
+        ptx.push_str("    // PCA §4.3 RoPE-reset registers (sites 3+4 + CTA prologue)\n");
+        ptx.push_str("    .reg .u64 %rd_doc_starts_ptr, %rd_doc_starts_addr;\n");
+        // %r_doc_smem_base / %rd_doc_smem_addr: generic-space u64 SMEM base + per-iter
+        // store addr (ptxas rejects [symbol + %reg] in shared stores, so we
+        // mirror the forward seg_smem cvta.shared.u64 pattern).
+        ptx.push_str("    .reg .u64 %r_doc_smem_base, %rd_doc_smem_addr;\n");
+        ptx.push_str("    .reg .u32 %r_doc_starts_idx, %r_doc_starts_byte_off, %r_doc_starts_stride;\n");
+        ptx.push_str("    .reg .u32 %r_batch_idx, %r_row_offset_elems;\n");
+        // %r_abs_pos: abs_row = q_start (or k_start) + tile-local row, used as
+        // the segment_ids[] index during Task 9 effective_pos computation.
+        // Distinct from %r_rope_row / tile-local registers so SMEM addressing
+        // stays correct after cs_idx reroutes through effective_pos.
+        ptx.push_str("    .reg .u32 %r_abs_pos;\n");
+        // %rs_doc_seg: u16 scratch for ld.shared.u16 of segment_ids[abs_row].
+        ptx.push_str("    .reg .b16 %rs_doc_seg;\n");
+        ptx.push_str("    .reg .s32 %r_doc_start, %r_effective_pos_q, %r_effective_pos_k;\n");
+        ptx.push_str("    .reg .pred %p_doc_load_done;\n");
+    }
 
     // PCA Tier A backward: segment-mask helper scratch registers + SMEM buffer.
     // Only emitted when segment_masked; segment_masked=false backward kernels
@@ -410,6 +444,16 @@ pub fn emit(
         // Fence: all threads (including warps 1+) see segment_ids before use.
         ptx.push_str("    bar.sync 0;\n");
         ptx.push_str("    // --- end PCA Tier A segment_ids load ---\n");
+
+        // PCA §4.3 RoPE-reset (T9): CTA-prologue load of this row's doc_starts
+        // subtable into SMEM. Mirrors forward prelude placement — runs once
+        // per CTA, immediately after the segment_ids fence. Gated on rope_q
+        // so segment_masked && !rope_q backward kernels stay byte-stable.
+        // The emitter includes its own bar.sync 0 so subsequent reads from
+        // smem_doc_starts are well-defined.
+        if config.rope_q {
+            crate::pca_rope::emit_doc_starts_smem_load(ptx);
+        }
 
         // PCA Tier B.2 range-table preamble — mirrors forward's prelude
         // wiring at the same insertion point (after bar.sync 0 so segment_ids
