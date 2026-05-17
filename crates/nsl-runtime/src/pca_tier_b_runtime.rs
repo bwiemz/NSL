@@ -62,8 +62,7 @@ pub fn should_dispatch_tier_b_at_runtime(
 ) -> bool {
     tier_b_ptx_ptr != 0
         && segment_ids_ptr != 0
-        && seq_len >= TIER_B_SEQ_LEN_FLOOR
-        && seq_len <= TIER_B_MAX_BAKED_SEQ_LEN
+        && (TIER_B_SEQ_LEN_FLOOR..=TIER_B_MAX_BAKED_SEQ_LEN).contains(&seq_len)
 }
 
 /// Asserts the Tier B sentinel pair has both values either zero or both non-zero.
