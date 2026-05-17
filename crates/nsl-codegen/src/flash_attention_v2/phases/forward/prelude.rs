@@ -4,7 +4,7 @@
 
 use crate::flash_attention::FlashAttentionConfig;
 use crate::flash_attention_v2::smem_layout::{needs_dynamic_smem, total_bytes, SMEM_BUDGET_BYTES};
-use crate::pca_segment::DEFAULT_SMEM_SEGMENT_BUDGET;
+use crate::pca_segment::{DEFAULT_SMEM_SEGMENT_BUDGET, SegmentResidency};
 
 /// Forward SMEM-routing gate that also accounts for PCA Tier A's
 /// `seg_smem` static array (when `config.segment_masked`).  Without
@@ -45,8 +45,16 @@ use crate::kernel_skeleton::indexing::emit_thread_lane_warp_register_decl;
 /// %logsumexp_base; %scale holds the softmax scale. Shared-memory base
 /// pointer lives in %shmem_base after a `cvta.shared.u64` from the
 /// `shmem` byte array declared here.
-pub fn emit(ptx: &mut String, config: &FlashAttentionConfig) {
-    emit_with_smem_override(ptx, config, total_bytes(config));
+/// `tier_b` — when `Some((seq_len, residency))`, emits the PCA Tier B
+/// range-table preamble after the Tier A segment_ids SMEM load + bar.sync.
+/// When `None` (all existing callers), the output is byte-identical to the
+/// pre-Tier-B baseline (spec §3.4.6 no-op guarantee).
+pub fn emit(
+    ptx: &mut String,
+    config: &FlashAttentionConfig,
+    tier_b: Option<(u32, SegmentResidency)>,
+) {
+    emit_with_smem_override(ptx, config, total_bytes(config), tier_b);
 }
 
 /// Same as `emit`, but the caller supplies the exact byte count for the
@@ -58,7 +66,17 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig) {
 /// arithmetic addresses bytes past the end of `shmem[]`, silently
 /// stomping neighboring GPU state at launch (ptxas can't detect this
 /// because SMEM offsets are computed dynamically at runtime).
-pub fn emit_with_smem_override(ptx: &mut String, config: &FlashAttentionConfig, smem_bytes: u32) {
+///
+/// `tier_b` is forwarded to the PCA Tier B range-table emission. Tier
+/// B.1 callers pass `None` here — CSHA Tier B.1 and PCA Tier B are
+/// different subsystems (see `synthesize_flash_attention_ptx_v2_with_tier_b`
+/// docstring).
+pub fn emit_with_smem_override(
+    ptx: &mut String,
+    config: &FlashAttentionConfig,
+    smem_bytes: u32,
+    tier_b: Option<(u32, SegmentResidency)>,
+) {
     // File header. Target SM is config-aware: Tier B.1 (cp.async +
     // m16n8k16) requires sm_80+; legacy Tier A defaults to sm_75 since
     // `gpu_sm` is 75 for all its test configs. This resolves B1.6
@@ -120,6 +138,22 @@ pub fn emit_with_smem_override(ptx: &mut String, config: &FlashAttentionConfig, 
     // stays byte-stable for segment_masked=false kernels.
     if config.segment_masked {
         params.push((".param .u64", "segment_ids_ptr"));
+    }
+    // PCA Tier B M3 instrumentation (B1.5-3): per-tile skip-decision HBM
+    // buffer pointer. Only declared when:
+    //   1. Tier B is being emitted (tier_b is Some + budget admits), AND
+    //   2. the `debug_kernel_instrumentation` Cargo feature is enabled.
+    // The bench binary's kernel-args list passes this slot unconditionally
+    // when tier_b_on; production callers omit the feature and the param
+    // disappears from the signature, keeping the byte-identical no-op
+    // guarantee.
+    let tier_b_admitted = tier_b
+        .map(|(seq_len, residency)| {
+            crate::pca_tilerange::should_emit_tier_b(config, seq_len as u64, residency)
+        })
+        .unwrap_or(false);
+    if cfg!(feature = "debug_kernel_instrumentation") && tier_b_admitted {
+        params.push((".param .u64", "skip_decisions_ptr"));
     }
     for (i, (ty, pname)) in params.iter().enumerate() {
         let comma = if i + 1 < params.len() { "," } else { "" };
@@ -395,5 +429,25 @@ pub fn emit_with_smem_override(ptx: &mut String, config: &FlashAttentionConfig, 
         // Fence: all threads (including warps 1+) see segment_ids before use.
         ptx.push_str("    bar.sync 0;\n");
         ptx.push_str("    // --- end PCA Tier A segment_ids load ---\n");
+
+        // PCA Tier B range-table preamble (only when admitted).
+        // Runs after bar.sync 0 so segment_ids SMEM values are visible to all threads.
+        // The preamble builds per-tile min/max tables used by emit_skip_predicate.
+        if let Some((seq_len, residency)) = tier_b {
+            if crate::pca_tilerange::should_emit_tier_b(config, seq_len as u64, residency) {
+                let range_table_base =
+                    crate::flash_attention_v2::smem_layout::tier_b_range_table_offset(
+                        config,
+                        crate::flash_attention_v2::smem_layout::Direction::Forward,
+                    );
+                crate::pca_tilerange::emit_range_table_preamble(
+                    ptx,
+                    config,
+                    seq_len,
+                    "seg_smem",
+                    range_table_base,
+                );
+            }
+        }
     }
 }

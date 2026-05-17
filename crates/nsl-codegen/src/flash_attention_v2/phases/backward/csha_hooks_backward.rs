@@ -962,7 +962,7 @@ mod tests {
         use crate::flash_attention_v2::phases::backward::prelude::emit as emit_prelude;
         let cfg = base_cfg_fused_backward(32, 32, 32, 4, 32);
         let mut ptx = String::new();
-        emit_prelude(&mut ptx, &cfg);
+        emit_prelude(&mut ptx, &cfg, None);
 
         assert!(
             ptx.contains(".param .u64 dx_norm_ptr"),

@@ -1504,6 +1504,8 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
                         *batch, *heads, *seq_len, *head_dim,
                         causal_i,
                         0, 0, 0, 0, // no PTX pointers — tape-based path uses CPU fallback
+                        // Tier B extension (planner spec §4): disabled sentinel.
+                        0, 0,
                     );
 
                     // Eagerly free saved Q, K, V and intermediates

@@ -83,6 +83,17 @@ pub enum Type {
     Int4,
     Uint8,
 
+    // M35.1 BitNet ternary dtypes (spec §1.1 + §2).
+    //
+    // `TernaryPacked` — 2 bits per trit, 4 trits per byte. Storage-only at-rest
+    // format in HBM; requires explicit `nsl.quant.ternary.unpack` to operate on.
+    // Mirrors `KirType::Tq2Packed` in codegen.
+    TernaryPacked,
+    // `TernaryUnpacked` — one trit per i8 register slot. Numerically operable;
+    // each element is in `{-1, 0, +1}`. Mirrors `KirType::TernaryUnpacked` in
+    // codegen.
+    TernaryUnpacked,
+
     // Compound types
     List(Box<Type>),
     Dict(Box<Type>, Box<Type>),
@@ -325,6 +336,11 @@ pub enum DType {
     Int4,
     Uint8,
     Bool,
+    /// M35.1 BitNet ternary, 2-bit packed (4 trits per byte). Storage-only.
+    /// Spec: docs/superpowers/specs/2026-05-11-m35-1-bitnet-ternary-design.md §2.1
+    TernaryPacked,
+    /// M35.1 BitNet ternary, unpacked (one trit per i8). Numerically operable.
+    TernaryUnpacked,
     /// Custom user-defined datatype (M23 BYOD)
     Custom(u16),  // runtime dtype ID (256+)
     Unknown,
@@ -340,6 +356,8 @@ impl DType {
             DType::Fp16 | DType::Bf16 | DType::Int16 => 2,
             DType::Fp8E4m3 | DType::Fp8E5m2 | DType::Int8 | DType::Uint8 | DType::Bool => 1,
             DType::Int4 => 1, // sub-byte; round up
+            // M35.1: ternary storage atom is 1 byte (packed: 4 trits/byte; unpacked: 1 trit/i8).
+            DType::TernaryPacked | DType::TernaryUnpacked => 1,
             DType::Custom(_) | DType::Unknown => 0,
         }
     }
@@ -510,6 +528,9 @@ pub fn wider_dtype(a: DType, b: DType) -> DType {
 fn dtype_to_rank(d: DType) -> u8 {
     match d {
         DType::Bool => 0,
+        // M35.1: ternary dtypes do NOT participate in numeric widening — explicit
+        // pack/unpack and quantized-GEMM ops are the only sanctioned conversions.
+        DType::TernaryPacked | DType::TernaryUnpacked => 0,
         DType::Int4 => 1,
         DType::Int8 | DType::Uint8 => 2,
         DType::Int16 => 3,
@@ -545,6 +566,8 @@ pub fn display_type(ty: &Type) -> String {
         Type::Int64 => "int64".into(),
         Type::Int4 => "int4".into(),
         Type::Uint8 => "uint8".into(),
+        Type::TernaryPacked => "ternary".into(),
+        Type::TernaryUnpacked => "ternary_unpacked".into(),
         Type::Tensor { shape, dtype, device } => {
             let shape_str = crate::shapes::fmt_shape(shape);
             let dtype_str = display_dtype(dtype);
@@ -621,6 +644,8 @@ fn display_dtype(dtype: &DType) -> String {
         DType::Int4 => "int4".into(),
         DType::Uint8 => "uint8".into(),
         DType::Bool => "bool".into(),
+        DType::TernaryPacked => "ternary".into(),
+        DType::TernaryUnpacked => "ternary_unpacked".into(),
         DType::Custom(id) => format!("custom:{}", id),
         DType::Unknown => "?".into(),
     }

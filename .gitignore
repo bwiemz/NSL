@@ -27,6 +27,10 @@ models/coder50m/data/tokenizer/
 *.lib
 *.nslm
 
+# Test-generated profiling manifests (written by `nsl run --monitor`; contain
+# absolute local paths and are regenerated on each test run).
+*.nsl-profile.json
+
 # Model binaries (regenerated from training)
 *.onnx
 *.safetensors

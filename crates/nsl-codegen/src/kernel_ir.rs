@@ -58,6 +58,24 @@ pub enum KirType {
     Bool,
     Ptr(Box<KirType>, AddressSpace),
     Vec(Box<KirType>, u32),
+    // BitNet M35.1: packed ternary representation (4 trits per byte, 2 bits per trit).
+    // At-rest format in HBM; unpacked into `TernaryUnpacked` for compute.
+    // Layout per docs/superpowers/specs/2026-05-11-m35-1-bitnet-ternary-design.md §2.1
+    // (high-bits-first ordering verified against bitnet.cpp).
+    //
+    // Naming rationale: KIR keeps the encoding density (`Tq2`) in the variant
+    // name because spec §7.1 reserves a future `Tq5Packed` variant (5 trits per
+    // byte, the information-theoretic optimum — ~20% bandwidth efficiency
+    // improvement). The semantic-layer counterpart is `Type::TernaryPacked`
+    // (single variant, no density suffix) because user source code thinks at
+    // dtype-level and shouldn't expose packing choices. The codegen bridge in
+    // `crates/nsl-codegen/src/types.rs` maps both `Type::TernaryPacked` and
+    // `Type::TernaryUnpacked` to `types::I8` (1 byte per storage atom).
+    Tq2Packed,
+    // BitNet M35.1: one trit per i8 (or register slot). Compute-time format.
+    // Conversions to/from Tq2Packed are explicit ops via `bitnet::pack`/`unpack`.
+    // Semantic-layer counterpart: `Type::TernaryUnpacked` (same name).
+    TernaryUnpacked,
 }
 
 impl KirType {
@@ -70,6 +88,8 @@ impl KirType {
             KirType::F16 | KirType::Bf16 => 2,
             KirType::Ptr(_, _) => 8,
             KirType::Vec(inner, n) => inner.size_bytes() * *n as usize,
+            KirType::Tq2Packed => 1,
+            KirType::TernaryUnpacked => 1,
         }
     }
 
@@ -82,6 +102,8 @@ impl KirType {
             KirType::F64 => "%fd",
             KirType::F16 | KirType::Bf16 => "%h",
             KirType::Vec(_, _) => "%v",
+            KirType::Tq2Packed => "%r",
+            KirType::TernaryUnpacked => "%r",
         }
     }
 
@@ -99,6 +121,8 @@ impl KirType {
             KirType::Bool => "pred",
             KirType::Ptr(_, _) => "u64",
             KirType::Vec(_, _) => "b32",
+            KirType::Tq2Packed => "b8",
+            KirType::TernaryUnpacked => "s8",
         }
     }
 }

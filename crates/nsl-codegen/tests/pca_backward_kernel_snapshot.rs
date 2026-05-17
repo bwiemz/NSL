@@ -10,7 +10,8 @@
 //!   - .shared .align 4 .b8 seg_smem[4096] inside the function body
 
 use nsl_codegen::flash_attention::{CshaExtras, FlashAttentionConfig, RopeStyle};
-use nsl_codegen::flash_attention_v2::synthesize_backward;
+use nsl_codegen::flash_attention_v2::{synthesize_backward, synthesize_backward_with_tier_b};
+use nsl_codegen::pca_segment::SegmentResidency;
 
 fn minimal_segment_masked_backward_config() -> FlashAttentionConfig {
     // Minimal config that passes the backward validator:
@@ -94,6 +95,85 @@ fn backward_kernel_segment_masked_causal_32_32_32() {
     assert!(
         ptx.contains("or.pred        %p1, %p1, %p_seg_SEGMASK"),
         "segment mask must OR-extend causal predicate %p1"
+    );
+
+    insta::assert_snapshot!(ptx);
+}
+
+// ── Tier B.2 no-op guarantee (Task B2-2) ──────────────────────────────────
+//
+// `synthesize_backward(config)` (1-arg form) must remain byte-identical to
+// the pre-B.2 baseline. Verified by checking it has no Tier B markers AND
+// equals the explicit `synthesize_backward_with_tier_b(config, None)` form.
+
+#[test]
+fn backward_kernel_tier_b_none_is_byte_identical_to_1arg() {
+    let cfg = minimal_segment_masked_backward_config();
+    let via_1arg = synthesize_backward(&cfg).expect("synthesize_backward must succeed");
+    let via_none = synthesize_backward_with_tier_b(&cfg, None)
+        .expect("synthesize_backward_with_tier_b(None) must succeed");
+    assert_eq!(
+        via_1arg, via_none,
+        "synthesize_backward_with_tier_b(cfg, None) must be byte-identical to \
+         synthesize_backward(cfg) — Tier B.2 no-op guarantee violated"
+    );
+}
+
+#[test]
+fn backward_kernel_tier_b_off_has_no_tier_b_markers() {
+    let cfg = minimal_segment_masked_backward_config();
+    let ptx = synthesize_backward(&cfg).expect("synthesize_backward must succeed");
+    assert!(
+        !ptx.contains("PCA Tier B: range-table preamble"),
+        "backward kernel must not contain Tier B preamble when tier_b=None"
+    );
+    // `BWD_KV_TILE_SKIP_TB_` literally contains `KV_TILE_SKIP_TB_` as a
+    // substring, so use newline-anchored / explicit-prefix checks here.
+    assert!(
+        !ptx.contains("\nKV_TILE_SKIP_TB_"),
+        "backward kernel must not contain forward's KV_TILE_SKIP_TB labels"
+    );
+    assert!(
+        !ptx.contains("BWD_KV_TILE_SKIP_TB_"),
+        "backward kernel must not contain BWD_KV_TILE_SKIP_TB labels when tier_b=None"
+    );
+}
+
+// ── Tier B.2 ON: backward kernel snapshot + structural assertions ─────────
+
+// Snapshot is baselined for the production (no-instrumentation) PTX. With
+// `debug_kernel_instrumentation` the round-robin M3 writeback is appended
+// inside the predicate scope; that path is covered separately by the
+// forward-predicate-isolation snapshot. Gate this test off when the
+// feature is enabled to avoid spurious churn.
+#[test]
+#[cfg(not(feature = "debug_kernel_instrumentation"))]
+fn backward_kernel_segment_masked_tier_b_on_causal_32_32_32() {
+    let cfg = minimal_segment_masked_backward_config();
+    let seq_len: u32 = 4096;
+    let residency = SegmentResidency::Shared;
+    let ptx = synthesize_backward_with_tier_b(&cfg, Some((seq_len, residency)))
+        .expect("synthesize_backward_with_tier_b must succeed");
+
+    // Structural assertions — Tier B.2 additions must be present.
+    assert!(
+        ptx.contains("PCA Tier B: range-table preamble"),
+        "backward prelude must contain Tier B range-table preamble"
+    );
+    assert!(
+        ptx.contains("BWD_KV_TILE_SKIP_TB_0:"),
+        "BWD_KV_TILE_SKIP_TB_0 label must appear in backward Tier-B-on kernel"
+    );
+    assert!(
+        ptx.contains("kv-outer"),
+        "predicate body must advertise its KV-outer direction in the comment"
+    );
+    // Forward namespace must NOT leak into backward. Use newline-anchored
+    // search because `BWD_KV_TILE_SKIP_TB_0:` contains the literal substring
+    // `KV_TILE_SKIP_TB_0:`.
+    assert!(
+        !ptx.contains("\nKV_TILE_SKIP_TB_0:"),
+        "backward kernel must not carry forward's KV_TILE_SKIP_TB_0 label"
     );
 
     insta::assert_snapshot!(ptx);

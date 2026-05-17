@@ -26,7 +26,7 @@ use crate::flash_attention_v2::smem_layout::{
 use crate::kernel_skeleton::indexing::{
     emit_thread_lane_warp_register_decl, emit_thread_lane_warp_register_init,
 };
-use crate::pca_segment::DEFAULT_SMEM_SEGMENT_BUDGET;
+use crate::pca_segment::{DEFAULT_SMEM_SEGMENT_BUDGET, SegmentResidency};
 
 /// Stable kernel-name prefix for backward variants.
 pub fn kernel_name(config: &FlashAttentionConfig) -> String {
@@ -65,7 +65,16 @@ fn backward_needs_dynamic_smem(config: &FlashAttentionConfig) -> bool {
 }
 
 /// Emit the backward prelude: header, entry, SMEM, registers, indices.
-pub fn emit(ptx: &mut String, config: &FlashAttentionConfig) {
+///
+/// `tier_b` — when `Some((seq_len, residency))`, emits the PCA Tier B
+/// range-table preamble after the Tier A segment_ids SMEM load + bar.sync 0.
+/// When `None` (default backward path), the output is byte-identical to the
+/// pre-Tier-B-2 baseline — Tier B.2 no-op guarantee per spec §7.4.
+pub fn emit(
+    ptx: &mut String,
+    config: &FlashAttentionConfig,
+    tier_b: Option<(u32, SegmentResidency)>,
+) {
     // Caller should have validated `Direction::Backward`; assert here so
     // a misrouted caller can't produce an invalid kernel.
     let _ = Direction::Backward;
@@ -130,6 +139,20 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig) {
     // for segment_masked=false backward kernels.
     if config.segment_masked {
         params.push((".param .u64", "segment_ids_ptr"));
+    }
+    // PCA Tier B M3 instrumentation (B2-2 mirror of forward): per-tile
+    // skip-decision HBM buffer pointer. Only declared when:
+    //   1. Tier B is being emitted (tier_b is Some + budget admits), AND
+    //   2. the `debug_kernel_instrumentation` Cargo feature is enabled.
+    // Production callers (feature off OR tier_b=None) keep the byte-identical
+    // no-op guarantee — the param disappears from the signature.
+    let tier_b_admitted = tier_b
+        .map(|(seq_len, residency)| {
+            crate::pca_tilerange::should_emit_tier_b(config, seq_len as u64, residency)
+        })
+        .unwrap_or(false);
+    if cfg!(feature = "debug_kernel_instrumentation") && tier_b_admitted {
+        params.push((".param .u64", "skip_decisions_ptr"));
     }
     for (i, (ty, pname)) in params.iter().enumerate() {
         let comma = if i + 1 < params.len() { "," } else { "" };
@@ -387,6 +410,33 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig) {
         // Fence: all threads (including warps 1+) see segment_ids before use.
         ptx.push_str("    bar.sync 0;\n");
         ptx.push_str("    // --- end PCA Tier A segment_ids load ---\n");
+
+        // PCA Tier B.2 range-table preamble — mirrors forward's prelude
+        // wiring at the same insertion point (after bar.sync 0 so segment_ids
+        // SMEM values are visible to all threads, before any KV-tile loop reads).
+        //
+        // Backward passes `%seg_base` (u64 generic-space address built off
+        // `%shmem_base + backward_total_bytes`) instead of a `.shared` array
+        // label — backward embeds seg_smem at the TAIL of the extern shmem[]
+        // region per the Blackwell static+extern fix, so no separate
+        // `.shared` label exists. `emit_range_table_preamble` detects the
+        // leading `%` and emits `mov.u64` instead of `cvta.shared.u64`.
+        if let Some((seq_len, residency)) = tier_b {
+            if crate::pca_tilerange::should_emit_tier_b(config, seq_len as u64, residency) {
+                let range_table_base =
+                    crate::flash_attention_v2::smem_layout::tier_b_range_table_offset(
+                        config,
+                        Direction::Backward,
+                    );
+                crate::pca_tilerange::emit_range_table_preamble(
+                    ptx,
+                    config,
+                    seq_len,
+                    "%seg_base",
+                    range_table_base,
+                );
+            }
+        }
     }
 }
 
@@ -418,7 +468,7 @@ mod tests {
     fn backward_prelude_declares_gradient_registers() {
         let cfg = base_cfg_fused_backward(32, 32, 32, 4, 32);
         let mut ptx = String::new();
-        emit(&mut ptx, &cfg);
+        emit(&mut ptx, &cfg, None);
 
         assert!(ptx.contains(".reg .f32 %f_dq") || ptx.contains(".reg .f32 %f_dq_"));
         assert!(ptx.contains("%f_dk"));
@@ -446,7 +496,7 @@ mod tests {
     fn backward_prelude_emits_rowsum_reduction_register() {
         let cfg = base_cfg_fused_backward(32, 32, 32, 4, 32);
         let mut ptx = String::new();
-        emit(&mut ptx, &cfg);
+        emit(&mut ptx, &cfg, None);
         assert!(
             ptx.contains("%f_rowsum_dP_P"),
             "softmax-Jacobian reduction register missing"

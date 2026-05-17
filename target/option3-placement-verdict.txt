@@ -1,7 +1,0 @@
-VERDICT: YES — adapter-field placement (specifically gate_Toy_w__gatedlora) is correctly handled by the existing B.3.1 infrastructure, and the train-block path will work once option 3 lands.
-
-Evidence from c:/tmp/probe_gate_placement.nsl (train-block only, source-AD, no option 3 yet): stdout prints "ok" and [nsl-gpu-launch-count] 0 with no "inputs not on GPU" warning. This is expected — source-AD does not yet dispatch the fused GatedLoRA FFI inside train blocks, so launch count is zero and no device-side check fires.
-
-Evidence from c:/tmp/probe_gate_no_train.nsl (train-block followed by one-off m.forward(x) inference with gate/lora_A/lora_B re-bound via .to(cuda)): stdout prints the 4x8 zero tensor and [nsl-gpu-launch-count] 1 with no "inputs not on GPU" warning. This proves the inference forward path takes the fused CUDA kernel, which can only happen if every adapter input (including gate) passes the FFI's gat.device > 0 check. Therefore the standard m.to(cuda) + init-train-block pattern leaves gate on GPU, and option 3 is unblocked on the placement axis.
-
-No alarms observed: no segfault, no fallback-to-CPU warning, no launch-failure error. Proceed with option 3 implementation (source-AD fused GatedLoRA forward dispatch inside train blocks).

@@ -26,14 +26,14 @@ fn non_csha_canonical() -> FlashAttentionConfig {
 #[test]
 fn phase_prelude__32x32x32_snapshot() {
     let mut ptx = String::new();
-    prelude::emit(&mut ptx, &csha_canonical());
+    prelude::emit(&mut ptx, &csha_canonical(), None);
     insta::assert_snapshot!("phase_prelude__32x32x32", ptx);
 }
 
 #[test]
 fn phase_prelude__64x64x128_snapshot() {
     let mut ptx = String::new();
-    prelude::emit(&mut ptx, &non_csha_canonical());
+    prelude::emit(&mut ptx, &non_csha_canonical(), None);
     insta::assert_snapshot!("phase_prelude__64x64x128", ptx);
 }
 
@@ -54,14 +54,14 @@ fn phase_q_load__64x64x128_snapshot() {
 #[test]
 fn phase_s_compute__32x32x32_causal_snapshot() {
     let mut ptx = String::new();
-    s_compute::emit(&mut ptx, &csha_canonical(), 0);
+    s_compute::emit(&mut ptx, &csha_canonical(), 0, None);
     insta::assert_snapshot!("phase_s_compute__32x32x32_causal_iter0", ptx);
 }
 
 #[test]
 fn phase_s_compute__64x64x128_causal_snapshot() {
     let mut ptx = String::new();
-    s_compute::emit(&mut ptx, &non_csha_canonical(), 0);
+    s_compute::emit(&mut ptx, &non_csha_canonical(), 0, None);
     insta::assert_snapshot!("phase_s_compute__64x64x128_causal_iter0", ptx);
 }
 
@@ -73,8 +73,8 @@ fn phase_s_compute__64x64x128_causal_snapshot() {
 fn phase_s_compute__label_uniqueness_across_iters() {
     let mut ptx0 = String::new();
     let mut ptx1 = String::new();
-    s_compute::emit(&mut ptx0, &csha_canonical(), 0);
-    s_compute::emit(&mut ptx1, &csha_canonical(), 1);
+    s_compute::emit(&mut ptx0, &csha_canonical(), 0, None);
+    s_compute::emit(&mut ptx1, &csha_canonical(), 1, None);
     assert!(ptx0.contains("V2_LOOP_S_OVER_K_0:"), "iter 0 label missing");
     assert!(ptx1.contains("V2_LOOP_S_OVER_K_1:"), "iter 1 label missing");
     assert!(!ptx0.contains("V2_LOOP_S_OVER_K_1"), "iter 0 leaks iter 1 label");

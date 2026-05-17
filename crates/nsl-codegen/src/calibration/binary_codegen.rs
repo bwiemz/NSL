@@ -571,6 +571,20 @@ const AWQ_DESC_BYTES: u32 = 32;
 fn new_calibration_object_module(
     name: &str,
 ) -> Result<(ObjectModule, cranelift_codegen::isa::CallConv), HarnessError> {
+    // On macOS ARM64 PIE targets, ld rejects absolute relocations in .text as
+    // hard errors. Enable PIC so Cranelift emits GOT-indirect / PC-relative
+    // references for external symbols. COFF/PE (Windows) does not use ELF-style
+    // GOT, so is_pic must only be set on macOS to avoid Windows link failures.
+    #[cfg(target_os = "macos")]
+    let flag_builder = {
+        use cranelift_codegen::settings::Configurable as _;
+        let mut b = cranelift_codegen::settings::builder();
+        b.enable("is_pic").map_err(|e| HarnessError::Infrastructure {
+            reason: format!("cranelift enable is_pic: {e}"),
+        })?;
+        b
+    };
+    #[cfg(not(target_os = "macos"))]
     let flag_builder = cranelift_codegen::settings::builder();
     let isa = cranelift_native::builder()
         .map_err(|e| HarnessError::Infrastructure {
@@ -2078,15 +2092,6 @@ pub fn emit_calibration_model_object(
     })
 }
 
-/// Emit the calibration scaffolding object (`main` + loop body).
-///
-/// `per_step_backward_symbols`: running-buffer symbol names that backward hooks
-/// need referenced per step (spec §4.5).  Each symbol must already be declared
-/// as an Export global via `finalize_plan` — the scaffolding reuses the
-/// `running_data_ids` entry.  The placeholder `symbol_value` + `stack_store`
-/// keeps the relocation alive so the linker sees a reference even before Task 21
-/// replaces this stub with real per-head dot+abs reduction IR.
-
 /// Compute the per-output-head count for a WGGO target.
 ///
 /// `n_o_heads = max(1, w_o_shape[0] / head_dim)` with a `head_dim == 0`
@@ -2105,6 +2110,14 @@ fn wggo_n_o_heads(target: &crate::calibration::discovery::WggoGradTarget) -> u32
     }
 }
 
+/// Emit the calibration scaffolding object (`main` + loop body).
+///
+/// `per_step_backward_symbols`: running-buffer symbol names that backward hooks
+/// need referenced per step (spec §4.5).  Each symbol must already be declared
+/// as an Export global via `finalize_plan` — the scaffolding reuses the
+/// `running_data_ids` entry.  The placeholder `symbol_value` + `stack_store`
+/// keeps the relocation alive so the linker sees a reference even before Task 21
+/// replaces this stub with real per-head dot+abs reduction IR.
 pub fn emit_calibration_scaffolding_object(
     observe_plan: &[ObservePlanEntry],
     finalize_plan: &[FinalizePlanEntry],
@@ -3455,6 +3468,18 @@ fn emit_and_link_calibration_binary(
     }
 
     // ── Build the ObjectModule targeting the host ───────────────────
+    // Enable PIC on macOS ARM64 to avoid text-relocation linker errors (see
+    // new_calibration_object_module for the full rationale).
+    #[cfg(target_os = "macos")]
+    let flag_builder = {
+        use cranelift_codegen::settings::Configurable as _;
+        let mut b = cranelift_codegen::settings::builder();
+        b.enable("is_pic").map_err(|e| HarnessError::Infrastructure {
+            reason: format!("cranelift enable is_pic: {e}"),
+        })?;
+        b
+    };
+    #[cfg(not(target_os = "macos"))]
     let flag_builder = cranelift_codegen::settings::builder();
     let isa = cranelift_native::builder()
         .map_err(|e| HarnessError::Infrastructure {

@@ -1,0 +1,60 @@
+# 8 short factual
+What is the capital of France?
+Who wrote the play Hamlet?
+What year did the Apollo 11 mission land on the moon?
+What is the chemical symbol for gold?
+Name the largest planet in our solar system.
+What language is spoken in Brazil?
+Who painted the Mona Lisa?
+What is the longest river in the world?
+# 8 code-completion
+def fibonacci(n):
+    if n <= 1:
+        return n
+    else:
+        return
+def quicksort(arr):
+    if len(arr) <= 1:
+        return arr
+    pivot =
+def factorial(n):
+    if n == 0:
+        return 1
+    return n *
+def is_prime(n):
+    if n < 2:
+        return False
+    for i in range(2, int(n ** 0.5) + 1):
+        if n % i == 0:
+def merge_sort(arr):
+    if len(arr) <= 1:
+        return arr
+    mid =
+def binary_search(arr, target):
+    lo, hi = 0, len(arr) - 1
+    while lo <= hi:
+        mid = (lo + hi) //
+def reverse_string(s):
+    return s[
+def fibonacci_iter(n):
+    a, b = 0, 1
+    for _ in range(n):
+        a, b =
+# 8 long-context (each ~200 words; full 1K-token prompts are paragraph-shaped)
+The transformer architecture, introduced by Vaswani et al. in 2017, has become the foundation of modern large language models. At its core, the transformer relies on self-attention mechanisms that allow each token in a sequence to attend to all other tokens, capturing long-range dependencies in a single layer rather than requiring sequential processing as in recurrent neural networks. The multi-head attention mechanism divides the attention computation across multiple parallel heads, each learning to focus on different aspects of the input. This parallelism enables transformers to be trained efficiently on modern hardware, leveraging matrix multiplication on GPUs. The architecture also includes position encodings to inject information about token order, since the self-attention mechanism itself is permutation-invariant. Recent advances such as rotary position embeddings (RoPE) further improve how positions are encoded, particularly for long-context applications. The decoder-only variant, popularized by GPT-style models, uses causal attention masks to ensure that each token can only attend to previous tokens, making the model suitable for autoregressive generation.
+Quantization in deep neural networks is the process of reducing the numerical precision of weights and activations from high-precision floating-point representations to lower-precision formats. Traditional approaches such as INT8 quantization map FP32 or FP16 values to 8-bit integers using affine transformations, often combined with per-channel or per-tensor scaling factors. More aggressive schemes like INT4 require careful calibration to avoid catastrophic accuracy loss. The BitNet b1.58 architecture takes this further by quantizing weights to just three possible values—negative one, zero, and positive one—achieving approximately 1.58 bits per parameter through information-theoretic packing. This ternary representation enables matrix multiplications using only additions and subtractions, eliminating the need for floating-point multipliers. The activation quantization in BitNet b1.58 uses 8-bit signed integers with per-row absmax scaling, preserving sufficient dynamic range while enabling efficient INT8 GEMM kernels. The combined effect is a substantial reduction in memory bandwidth and a path toward specialized hardware that can execute ternary networks with extreme efficiency.
+Modern compiler infrastructure for machine learning workloads has evolved to address the gap between high-level model descriptions and low-level hardware execution. Frameworks such as MLIR and Cranelift provide intermediate representations and optimization passes that target diverse hardware backends including CPUs, GPUs, and specialized accelerators. The NSL compiler in this project uses Cranelift as its primary function-emission backend while synthesizing PTX strings directly for GPU kernels. This separation allows different optimization concerns—register allocation for scalar code on CPU, memory hierarchy management for GPU kernels—to be addressed by specialists rather than a single monolithic optimizer. PTX is then JIT-compiled by the CUDA driver into device-specific SASS at runtime, allowing the same compiled NSL binary to target multiple GPU architectures from sm_80 through sm_120. The kernel synthesis approach permits aggressive fusion of normally-disjoint operations such as RMSNorm prologues with downstream GEMM kernels, reducing memory bandwidth requirements at the cost of compilation complexity.
+The development of large language models has been driven by scaling laws that relate model size, training data, and compute to downstream task performance. Empirical studies have shown that performance improves predictably with scale, but at significant cost: training a 3B parameter model from scratch requires hundreds of GPU-days, and serving such a model at inference time consumes substantial energy. Quantization-aware training offers one path to reducing inference cost without sacrificing accuracy, by simulating low-precision arithmetic during training so the model adapts to quantization noise. Post-training quantization techniques like GPTQ and AWQ further reduce deployment cost by quantizing pretrained weights without retraining, using calibration data to minimize accuracy degradation. The BitNet b1.58 approach pushes this to its extreme by training natively in ternary precision from initialization, demonstrating that the resulting models match the perplexity of FP16-equivalent baselines on standard benchmarks while requiring substantially less inference compute.
+Attention mechanisms in deep learning compute weighted combinations of value vectors using attention weights derived from query-key compatibility scores. The standard scaled dot-product attention computes softmax over the matrix product of queries and keys, then multiplies the resulting probability distribution by the value matrix. This operation has quadratic complexity in sequence length, making it expensive for long contexts. FlashAttention reduces memory usage by computing attention in blocks, never materializing the full attention matrix, and uses careful tile-level analysis to achieve near-optimal performance. Multi-query and grouped-query attention reduce the memory footprint of the key and value caches by sharing them across query heads, a critical optimization for long-context inference where the KV cache dominates memory consumption. Recent architectures such as Mamba and Linear Attention propose alternative formulations that achieve linear time complexity, trading off some expressivity for substantial efficiency gains in the long-sequence regime.
+Memory allocation in GPU computing involves careful management of multiple memory tiers including registers, shared memory, L1/L2 cache, and global HBM. Each tier has progressively higher capacity but progressively higher latency and lower bandwidth. High-performance GPU kernels arrange computation to maximize register reuse and minimize global memory traffic, often using techniques like loop tiling, software pipelining, and prefetching via cp.async on Ampere and later architectures. Tensor cores require specific data layouts and matrix dimensions, adding further constraints to kernel design. The CUDA programming model exposes these tiers explicitly, but achieving peak performance often requires hand-tuned PTX or SASS-level optimization. Modern compiler frameworks attempt to bridge this gap by auto-generating efficient code from higher-level descriptions, but bespoke kernels remain common for performance-critical operations such as attention and large GEMM operations. The NSL compiler explicitly supports both auto-generation and bespoke kernel paths, allowing users to drop down to PTX-level control when needed while benefiting from automatic optimization for common patterns.
+Open-source language models have transformed the research landscape by providing free access to pretrained checkpoints that approach the performance of frontier proprietary models. Projects such as LLaMA, Mistral, and the BitNet series have published model weights under permissive licenses, enabling academic study and practical deployment of large models without the infrastructure cost of training from scratch. These open releases come with both opportunities and responsibilities: the same checkpoints can be fine-tuned for beneficial applications such as scientific reasoning, or misused for generating misinformation. The community has responded by developing safety techniques such as reinforcement learning from human feedback, constitutional AI, and various forms of red-teaming to evaluate and mitigate risks. Beyond safety, the open ecosystem has produced inference frameworks like llama.cpp and vLLM that make large model deployment accessible to researchers without specialized hardware. The BitNet b1.58 release fits into this lineage by providing a checkpoint that can be served on modest hardware while approaching the performance of much larger FP16 models, lowering the barrier to high-quality language model deployment.
+Software engineering for machine learning systems combines techniques from compiler construction, distributed systems, and numerical computing. A modern ML compiler must handle automatic differentiation, kernel fusion, memory planning, and target-specific code generation, often under strict latency budgets for serving applications. Unlike traditional compilers that optimize against a fixed instruction set, ML compilers face a rapidly evolving target landscape including new tensor cores, custom datatypes such as MX formats, and specialized accelerators with non-standard execution models. This diversity demands compiler infrastructure with strong abstractions over hardware details while still permitting hardware-specific optimization. The Cranelift backend provides a sound foundation for CPU code generation with strong correctness guarantees, while direct PTX synthesis allows fine-grained control over GPU kernel layout. The combination, as used in this NSL project, demonstrates one viable architecture for production-quality ML compilation that supports diverse models and target hardware without sacrificing the ability to deeply optimize hot paths.
+# 8 edge-case
+a
+The
+0
+1
+.
+,
+True or False:
+"Hello, world!"

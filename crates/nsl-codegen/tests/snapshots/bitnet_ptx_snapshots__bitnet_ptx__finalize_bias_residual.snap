@@ -1,0 +1,33 @@
+---
+source: crates/nsl-codegen/tests/bitnet_ptx_snapshots.rs
+assertion_line: 80
+expression: ptx
+---
+// === BitNet finalize ===
+// weight_scale: %f_y_out *= ld.param.f32 weight_scale.
+ld.param.f32 %f_w_scale, [weight_scale];
+mul.f32 %f_y_out, %f_y_out, %f_w_scale;
+// Bias add: load bias[col_id] from global and add to accumulator.
+cvt.u64.u32 %rd_bias_off, %r_col_id;
+shl.b64 %rd_bias_off, %rd_bias_off, 2;
+add.s64 %rd_bias_addr, %rd_bias, %rd_bias_off;
+ld.global.f32 %f_bias, [%rd_bias_addr];
+add.f32 %f_y_out, %f_y_out, %f_bias;
+// Residual add: load residual[row, col] (FP32) and add.
+mul.lo.u32 %r_res_off, %r_row_id, %r_out_dim;
+add.u32 %r_res_off, %r_res_off, %r_col_id;
+shl.b32 %r_res_off, %r_res_off, 2;
+cvt.u64.u32 %rd_res_off, %r_res_off;
+add.s64 %rd_res_addr, %rd_residual, %rd_res_off;
+ld.global.f32 %f_res, [%rd_res_addr];
+add.f32 %f_y_out, %f_y_out, %f_res;
+// Cast FP32 -> F16/BF16 and store to HBM.
+cvt.rn.f16.f32 %h_y, %f_y_out;
+mul.lo.u32 %r_yoff, %r_row_id, %r_out_dim;
+add.u32 %r_yoff, %r_yoff, %r_col_id;
+shl.b32 %r_yoff, %r_yoff, 1;
+cvt.u64.u32 %rd_yoff, %r_yoff;
+cvta.to.global.u64 %rd_y_global, %rd_y_out;
+add.s64 %rd_y_addr, %rd_y_global, %rd_yoff;
+st.global.b16 [%rd_y_addr], %h_y;
+// === end BitNet finalize ===

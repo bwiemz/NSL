@@ -105,6 +105,30 @@ fn flash_attention_hopper(
 /// f32 scale is passed as i64 and reconstructed via f32::from_bits(scale as u32).
 ///
 /// Returns 0 on success, non-zero CUDA error code on failure.
+///
+/// # Tier B extension (planner spec §4)
+///
+/// The trailing `tier_b_ptx_ptr, tier_b_name_ptr` parameters carry the Tier-B-on
+/// variant per the planner spec's case-(β-ii) rehabilitated dispatch.
+///
+/// **Sentinel encoding:** `(0, 0)` = no Tier-B-on variant available (default for
+/// non-`segment_masked` configs). Non-zero pair = codegen emitted a Tier-B-on
+/// variant for this config.
+///
+/// **Precondition:** sentinel pair must agree (both zero or both non-zero).
+/// Mismatched pairs trigger `assert_tier_b_sentinels` → process abort with diagnostic.
+///
+/// **Construction discipline:** Cranelift-side call sites MUST emit the sentinel
+/// via `nsl_codegen::pca_tier_b::tier_b_disabled_sentinel()` or `tier_b_enabled(...)`,
+/// not inline `0, 0` literals.
+///
+/// Non-CSHA entry: this path has no `segment_ids_ptr` parameter, so the runtime
+/// gate is supplied `0` for that slot and always returns `false` — Tier B never
+/// fires for non-CSHA configs. The extension is present to keep all 6 FFI entry
+/// points uniformly shaped per planner spec §4.6.
+///
+/// See `docs/superpowers/specs/2026-05-15-pca-tier-b-planner-design.md` §4 and
+/// `docs/superpowers/specs/2026-05-15-tier-b-bii-smem-probe-findings.md`.
 #[no_mangle]
 pub extern "C" fn nsl_flash_attention(
     q_ptr: i64, k_ptr: i64, v_ptr: i64,
@@ -121,7 +145,34 @@ pub extern "C" fn nsl_flash_attention(
     ptx_ptr: i64, name_ptr: i64,
     block_q: i64, _block_kv: i64,
     causal: i64,
+    // Tier B extension (planner spec §4):
+    tier_b_ptx_ptr: i64,
+    tier_b_name_ptr: i64,
 ) -> i64 {
+    use crate::pca_tier_b_runtime::{
+        assert_tier_b_sentinels, should_dispatch_tier_b_at_runtime,
+    };
+
+    // Tier B extension entry: assert sentinel agreement (planner spec §4.3).
+    assert_tier_b_sentinels(
+        "nsl_flash_attention",
+        tier_b_ptx_ptr,
+        tier_b_name_ptr,
+    );
+
+    // Tier B extension: pick effective PTX/name based on runtime gate (planner spec §6.3).
+    // Non-CSHA path has no segment_ids_ptr parameter; pass 0, gate always returns false.
+    let (effective_ptx_ptr, effective_name_ptr) =
+        if should_dispatch_tier_b_at_runtime(
+            tier_b_ptx_ptr,
+            0,
+            seq_len as u32,
+        ) {
+            (tier_b_ptx_ptr, tier_b_name_ptr)
+        } else {
+            (ptx_ptr, name_ptr)
+        };
+
     #[cfg(feature = "cuda")]
     {
         let _scale = f32::from_bits(scale_bits as u32);
@@ -216,8 +267,8 @@ pub extern "C" fn nsl_flash_attention(
                 eprintln!("[nsl] Using FlashAttention-2 (Ampere mma.sync)");
             }
             crate::cuda::inner::kernel_launch(
-                ptx_ptr as *const u8,
-                name_ptr as *const u8,
+                effective_ptx_ptr as *const u8,
+                effective_name_ptr as *const u8,
                 [grid_x, grid_y, grid_z],
                 [block_x, block_y, block_z],
                 &args,
@@ -258,6 +309,7 @@ pub extern "C" fn nsl_flash_attention(
         let _ = (block_table_ptr, k_pool_ptr, v_pool_ptr, block_size);
         let _ = (cos_ptr, sin_ptr, seq_ids_ptr, seq_lens_ptr);
         let _ = (shared_mem_bytes, ptx_ptr, name_ptr, block_q, _block_kv, causal);
+        let _ = (effective_ptx_ptr, effective_name_ptr);
         eprintln!("[nsl] FlashAttention requires CUDA. Use naive path (no @flash_attention decorator).");
         -1
     }
@@ -403,6 +455,25 @@ fn csha_block_x_for_kernel(name_ptr: i64) -> i64 {
 /// FA3 Hopper fallback is intentionally skipped here — the FA3 kernel
 /// does not understand CSHA extras. Ampere/Hopper both run the Ampere
 /// mma.sync FA2 path when CSHA is active.
+///
+/// # Tier B extension (planner spec §4)
+///
+/// The trailing `tier_b_ptx_ptr, tier_b_name_ptr` parameters carry the Tier-B-on
+/// variant per the planner spec's case-(β-ii) rehabilitated dispatch.
+///
+/// **Sentinel encoding:** `(0, 0)` = no Tier-B-on variant available (default for
+/// non-`segment_masked` configs). Non-zero pair = codegen emitted a Tier-B-on
+/// variant for this config.
+///
+/// **Precondition:** sentinel pair must agree (both zero or both non-zero).
+/// Mismatched pairs trigger `assert_tier_b_sentinels` → process abort with diagnostic.
+///
+/// **Construction discipline:** Cranelift-side call sites MUST emit the sentinel
+/// via `nsl_codegen::pca_tier_b::tier_b_disabled_sentinel()` or `tier_b_enabled(...)`,
+/// not inline `0, 0` literals.
+///
+/// See `docs/superpowers/specs/2026-05-15-pca-tier-b-planner-design.md` §4 and
+/// `docs/superpowers/specs/2026-05-15-tier-b-bii-smem-probe-findings.md`.
 #[no_mangle]
 pub extern "C" fn nsl_flash_attention_csha(
     q_ptr: i64, k_ptr: i64, v_ptr: i64,
@@ -435,7 +506,33 @@ pub extern "C" fn nsl_flash_attention_csha(
     // segment_masked=true, in which case the pointer must be non-null and
     // reference a [B, S] u16 tensor in global memory.
     segment_ids_ptr: i64,
+    // Tier B extension (planner spec §4):
+    tier_b_ptx_ptr: i64,
+    tier_b_name_ptr: i64,
 ) -> i64 {
+    use crate::pca_tier_b_runtime::{
+        assert_tier_b_sentinels, should_dispatch_tier_b_at_runtime,
+    };
+
+    // Tier B extension entry: assert sentinel agreement (planner spec §4.3).
+    assert_tier_b_sentinels(
+        "nsl_flash_attention_csha",
+        tier_b_ptx_ptr,
+        tier_b_name_ptr,
+    );
+
+    // Tier B extension: pick effective PTX/name based on runtime gate (planner spec §6.3).
+    let (effective_ptx_ptr, effective_name_ptr) =
+        if should_dispatch_tier_b_at_runtime(
+            tier_b_ptx_ptr,
+            segment_ids_ptr,
+            seq_len as u32,
+        ) {
+            (tier_b_ptx_ptr, tier_b_name_ptr)
+        } else {
+            (ptx_ptr, name_ptr)
+        };
+
     #[cfg(feature = "cuda")]
     {
         // Grid / block identical to `nsl_flash_attention` — CSHA doesn't
@@ -572,8 +669,8 @@ pub extern "C" fn nsl_flash_attention_csha(
         ];
 
         let result = crate::cuda::inner::kernel_launch(
-            ptx_ptr as *const u8,
-            name_ptr as *const u8,
+            effective_ptx_ptr as *const u8,
+            effective_name_ptr as *const u8,
             [grid_x, grid_y, grid_z],
             [block_x, block_y, block_z],
             &args,
@@ -614,6 +711,7 @@ pub extern "C" fn nsl_flash_attention_csha(
         let _ = (shared_mem_bytes, ptx_ptr, name_ptr, block_q, _block_kv, causal);
         let _ = (x_ptr, norm_weight_ptr, wq_ptr, wk_ptr, wv_ptr, wo_ptr);
         let _ = (rmsnorm_eps_bits, active_heads, d_model, segment_ids_ptr);
+        let _ = (effective_ptx_ptr, effective_name_ptr);
         eprintln!("[nsl] CSHA FlashAttention requires CUDA; non-CUDA build cannot launch.");
         -1
     }
@@ -638,6 +736,25 @@ pub extern "C" fn nsl_flash_attention_csha(
 /// Callers MUST have compiled the kernel with
 /// `CshaExtras::save_activations_for_backward=true`; otherwise the PTX
 /// emits no save path and the pointers are ignored.
+///
+/// # Tier B extension (planner spec §4)
+///
+/// The trailing `tier_b_ptx_ptr, tier_b_name_ptr` parameters carry the Tier-B-on
+/// variant per the planner spec's case-(β-ii) rehabilitated dispatch.
+///
+/// **Sentinel encoding:** `(0, 0)` = no Tier-B-on variant available (default for
+/// non-`segment_masked` configs). Non-zero pair = codegen emitted a Tier-B-on
+/// variant for this config.
+///
+/// **Precondition:** sentinel pair must agree (both zero or both non-zero).
+/// Mismatched pairs trigger `assert_tier_b_sentinels` → process abort with diagnostic.
+///
+/// **Construction discipline:** Cranelift-side call sites MUST emit the sentinel
+/// via `nsl_codegen::pca_tier_b::tier_b_disabled_sentinel()` or `tier_b_enabled(...)`,
+/// not inline `0, 0` literals.
+///
+/// See `docs/superpowers/specs/2026-05-15-pca-tier-b-planner-design.md` §4 and
+/// `docs/superpowers/specs/2026-05-15-tier-b-bii-smem-probe-findings.md`.
 #[no_mangle]
 #[allow(clippy::too_many_arguments)]
 pub extern "C" fn nsl_flash_attention_csha_with_saves(
@@ -672,7 +789,33 @@ pub extern "C" fn nsl_flash_attention_csha_with_saves(
     // segment_masked=true, in which case the pointer must be non-null and
     // reference a [B, S] u16 tensor in global memory.
     segment_ids_ptr: i64,
+    // Tier B extension (planner spec §4):
+    tier_b_ptx_ptr: i64,
+    tier_b_name_ptr: i64,
 ) -> i64 {
+    use crate::pca_tier_b_runtime::{
+        assert_tier_b_sentinels, should_dispatch_tier_b_at_runtime,
+    };
+
+    // Tier B extension entry: assert sentinel agreement (planner spec §4.3).
+    assert_tier_b_sentinels(
+        "nsl_flash_attention_csha_with_saves",
+        tier_b_ptx_ptr,
+        tier_b_name_ptr,
+    );
+
+    // Tier B extension: pick effective PTX/name based on runtime gate (planner spec §6.3).
+    let (effective_ptx_ptr, effective_name_ptr) =
+        if should_dispatch_tier_b_at_runtime(
+            tier_b_ptx_ptr,
+            segment_ids_ptr,
+            seq_len as u32,
+        ) {
+            (tier_b_ptx_ptr, tier_b_name_ptr)
+        } else {
+            (ptx_ptr, name_ptr)
+        };
+
     #[cfg(feature = "cuda")]
     {
         let effective_heads = if active_heads > 0 && active_heads < heads {
@@ -785,7 +928,7 @@ pub extern "C" fn nsl_flash_attention_csha_with_saves(
         let dump_on = std::env::var_os("NSL_CSHA_DUMP_GRADS").map(|v| v != "0" && v != "").unwrap_or(false);
         if dump_on {
             let kname = unsafe {
-                let c = name_ptr as *const u8;
+                let c = effective_name_ptr as *const u8;
                 if c.is_null() { String::from("<null>") } else {
                     let mut end = 0usize;
                     while *c.add(end) != 0 && end < 256 { end += 1; }
@@ -800,7 +943,7 @@ pub extern "C" fn nsl_flash_attention_csha_with_saves(
             // Dump the full PTX to a file for offline inspection — only once
             // to avoid accumulating files.
             unsafe {
-                let c = ptx_ptr as *const u8;
+                let c = effective_ptx_ptr as *const u8;
                 if !c.is_null() {
                     let mut end = 0usize;
                     while *c.add(end) != 0 && end < (1 << 20) { end += 1; }
@@ -820,8 +963,8 @@ pub extern "C" fn nsl_flash_attention_csha_with_saves(
         }
 
         let fwd_rc = crate::cuda::inner::kernel_launch(
-            ptx_ptr as *const u8,
-            name_ptr as *const u8,
+            effective_ptx_ptr as *const u8,
+            effective_name_ptr as *const u8,
             [grid_x, grid_y, grid_z],
             [block_x, block_y, block_z],
             &args,
@@ -905,6 +1048,7 @@ pub extern "C" fn nsl_flash_attention_csha_with_saves(
         let _ = (x_ptr, norm_weight_ptr, wq_ptr, wk_ptr, wv_ptr, wo_ptr);
         let _ = (rmsnorm_eps_bits, active_heads, d_model);
         let _ = (q_proj_ptr, k_proj_ptr, v_proj_ptr, row_max_ptr, row_sum_ptr, x_raw_ptr, segment_ids_ptr);
+        let _ = (effective_ptx_ptr, effective_name_ptr);
         eprintln!("[nsl] CSHA FlashAttention w/ saves requires CUDA.");
         -1
     }
@@ -927,6 +1071,25 @@ pub extern "C" fn nsl_flash_attention_csha_with_saves(
 /// `nsl_flash_attention_csha_with_saves`; the backward kernel *reads*
 /// from them here. Null pointers on the gradient outputs let callers
 /// skip stores they don't need (e.g. freezing a weight).
+///
+/// # Tier B extension (planner spec §4)
+///
+/// The trailing `tier_b_ptx_ptr, tier_b_name_ptr` parameters carry the Tier-B-on
+/// variant per the planner spec's case-(β-ii) rehabilitated dispatch.
+///
+/// **Sentinel encoding:** `(0, 0)` = no Tier-B-on variant available (default for
+/// non-`segment_masked` configs). Non-zero pair = codegen emitted a Tier-B-on
+/// variant for this config.
+///
+/// **Precondition:** sentinel pair must agree (both zero or both non-zero).
+/// Mismatched pairs trigger `assert_tier_b_sentinels` → process abort with diagnostic.
+///
+/// **Construction discipline:** Cranelift-side call sites MUST emit the sentinel
+/// via `nsl_codegen::pca_tier_b::tier_b_disabled_sentinel()` or `tier_b_enabled(...)`,
+/// not inline `0, 0` literals.
+///
+/// See `docs/superpowers/specs/2026-05-15-pca-tier-b-planner-design.md` §4 and
+/// `docs/superpowers/specs/2026-05-15-tier-b-bii-smem-probe-findings.md`.
 #[no_mangle]
 #[allow(clippy::too_many_arguments)]
 pub extern "C" fn nsl_flash_attention_csha_backward(
@@ -971,7 +1134,33 @@ pub extern "C" fn nsl_flash_attention_csha_backward(
     // segment_masked=false variant doesn't read this slot, so passing 0 is safe
     // for all existing callers.
     segment_ids_ptr: i64,
+    // Tier B extension (planner spec §4):
+    tier_b_ptx_ptr: i64,
+    tier_b_name_ptr: i64,
 ) -> i64 {
+    use crate::pca_tier_b_runtime::{
+        assert_tier_b_sentinels, should_dispatch_tier_b_at_runtime,
+    };
+
+    // Tier B extension entry: assert sentinel agreement (planner spec §4.3).
+    assert_tier_b_sentinels(
+        "nsl_flash_attention_csha_backward",
+        tier_b_ptx_ptr,
+        tier_b_name_ptr,
+    );
+
+    // Tier B extension: pick effective PTX/name based on runtime gate (planner spec §6.3).
+    let (effective_ptx_ptr, effective_name_ptr) =
+        if should_dispatch_tier_b_at_runtime(
+            tier_b_ptx_ptr,
+            segment_ids_ptr,
+            seq_len as u32,
+        ) {
+            (tier_b_ptx_ptr, tier_b_name_ptr)
+        } else {
+            (ptx_ptr, name_ptr)
+        };
+
     #[cfg(feature = "cuda")]
     {
         let effective_heads = if active_heads > 0 && active_heads < heads {
@@ -1163,8 +1352,8 @@ pub extern "C" fn nsl_flash_attention_csha_backward(
             slens = (q_block * block_q) as u64;
             let _ = std::hint::black_box(&slens);
             rc = crate::cuda::inner::kernel_launch(
-                ptx_ptr as *const u8,
-                name_ptr as *const u8,
+                effective_ptx_ptr as *const u8,
+                effective_name_ptr as *const u8,
                 [grid_x, grid_y, grid_z],
                 [block_x, block_y, block_z],
                 &args,
@@ -1243,7 +1432,7 @@ pub extern "C" fn nsl_flash_attention_csha_backward(
         if std::env::var_os("NSL_CSHA_DUMP_GRADS").map(|v| v != "0" && v != "").unwrap_or(false) {
             unsafe { crate::cuda::inner::cu_ctx_synchronize(); }
             let kname = unsafe {
-                let c = name_ptr as *const u8;
+                let c = effective_name_ptr as *const u8;
                 if c.is_null() { String::from("<null>") } else {
                     let mut end = 0usize;
                     while *c.add(end) != 0 && end < 256 { end += 1; }
@@ -1283,6 +1472,7 @@ pub extern "C" fn nsl_flash_attention_csha_backward(
         let _ = (q_proj_ptr, k_proj_ptr, v_proj_ptr, row_max_ptr, row_sum_ptr, x_raw_ptr);
         let _ = (do_ptr, dq_ptr, dk_ptr, dv_ptr, dwq_ptr, dwk_ptr, dwv_ptr, dx_ptr, dx_norm_ptr);
         let _ = segment_ids_ptr;
+        let _ = (effective_ptx_ptr, effective_name_ptr);
         eprintln!("[nsl] CSHA backward requires CUDA.");
         -1
     }
@@ -1504,6 +1694,30 @@ fn csha_dump_backward_buffers(
 /// meta_k/meta_v: pointers to KvBlockQuantMeta arrays (null for FP8/None).
 ///
 /// Returns 0 on success, negative on error.
+///
+/// # Tier B extension (planner spec §4)
+///
+/// The trailing `tier_b_ptx_ptr, tier_b_name_ptr` parameters carry the Tier-B-on
+/// variant per the planner spec's case-(β-ii) rehabilitated dispatch.
+///
+/// **Sentinel encoding:** `(0, 0)` = no Tier-B-on variant available (default for
+/// non-`segment_masked` configs). Non-zero pair = codegen emitted a Tier-B-on
+/// variant for this config.
+///
+/// **Precondition:** sentinel pair must agree (both zero or both non-zero).
+/// Mismatched pairs trigger `assert_tier_b_sentinels` → process abort with diagnostic.
+///
+/// **Construction discipline:** Cranelift-side call sites MUST emit the sentinel
+/// via `nsl_codegen::pca_tier_b::tier_b_disabled_sentinel()` or `tier_b_enabled(...)`,
+/// not inline `0, 0` literals.
+///
+/// Non-CSHA entry: this path has no `segment_ids_ptr` parameter, so the runtime
+/// gate is supplied `0` for that slot and always returns `false` — Tier B never
+/// fires for non-CSHA configs. The extension is present to keep all 6 FFI entry
+/// points uniformly shaped per planner spec §4.6.
+///
+/// See `docs/superpowers/specs/2026-05-15-pca-tier-b-planner-design.md` §4 and
+/// `docs/superpowers/specs/2026-05-15-tier-b-bii-smem-probe-findings.md`.
 #[no_mangle]
 pub extern "C" fn nsl_flash_attention_quantized(
     q_ptr: i64, k_ptr: i64, v_ptr: i64,
@@ -1517,7 +1731,34 @@ pub extern "C" fn nsl_flash_attention_quantized(
     shared_mem_bytes: i64,
     ptx_ptr: i64, name_ptr: i64,
     block_q: i64, _block_kv: i64,
+    // Tier B extension (planner spec §4):
+    tier_b_ptx_ptr: i64,
+    tier_b_name_ptr: i64,
 ) -> i64 {
+    use crate::pca_tier_b_runtime::{
+        assert_tier_b_sentinels, should_dispatch_tier_b_at_runtime,
+    };
+
+    // Tier B extension entry: assert sentinel agreement (planner spec §4.3).
+    assert_tier_b_sentinels(
+        "nsl_flash_attention_quantized",
+        tier_b_ptx_ptr,
+        tier_b_name_ptr,
+    );
+
+    // Tier B extension: pick effective PTX/name based on runtime gate (planner spec §6.3).
+    // Non-CSHA path has no segment_ids_ptr parameter; pass 0, gate always returns false.
+    let (effective_ptx_ptr, effective_name_ptr) =
+        if should_dispatch_tier_b_at_runtime(
+            tier_b_ptx_ptr,
+            0,
+            seq_len as u32,
+        ) {
+            (tier_b_ptx_ptr, tier_b_name_ptr)
+        } else {
+            (ptx_ptr, name_ptr)
+        };
+
     #[cfg(feature = "cuda")]
     {
         let _scale = f32::from_bits(scale_bits as u32);
@@ -1575,8 +1816,8 @@ pub extern "C" fn nsl_flash_attention_quantized(
         //   FP8:  each tile load does direct E4M3→f32 cast via LUT
         //   INT4: each tile load unpacks nibbles + applies group scale/zero_point
         let result = crate::cuda::inner::kernel_launch(
-            ptx_ptr as *const u8,
-            name_ptr as *const u8,
+            effective_ptx_ptr as *const u8,
+            effective_name_ptr as *const u8,
             [grid_x, grid_y, grid_z],
             [block_x, block_y, block_z],
             &args,
@@ -1592,6 +1833,7 @@ pub extern "C" fn nsl_flash_attention_quantized(
         let _ = (block_table_ptr, k_pool_ptr, v_pool_ptr, block_size);
         let _ = (meta_k, meta_v, kv_quant_scheme);
         let _ = (shared_mem_bytes, ptx_ptr, name_ptr, block_q, _block_kv);
+        let _ = (effective_ptx_ptr, effective_name_ptr);
         eprintln!("[nsl] quantized FlashAttention requires CUDA.");
         -1
     }
@@ -2152,6 +2394,32 @@ fn flash_attention_backward_gpu(
 /// or GQA with different Q/KV head counts).
 ///
 /// When `logsumexp_ptr == 0`, the logsumexp is auto-computed from Q, K, scale.
+///
+/// # Tier B extension (planner spec §4)
+///
+/// The trailing `tier_b_ptx_ptr, tier_b_name_ptr` parameters carry the Tier-B-on
+/// variant per the planner spec's case-(β-ii) rehabilitated dispatch.
+///
+/// **Sentinel encoding:** `(0, 0)` = no Tier-B-on variant available (default for
+/// non-`segment_masked` configs). Non-zero pair = codegen emitted a Tier-B-on
+/// variant for this config.
+///
+/// **Precondition:** sentinel pair must agree (both zero or both non-zero).
+/// Mismatched pairs trigger `assert_tier_b_sentinels` → process abort with diagnostic.
+///
+/// **Construction discipline:** Cranelift-side call sites MUST emit the sentinel
+/// via `nsl_codegen::pca_tier_b::tier_b_disabled_sentinel()` or `tier_b_enabled(...)`,
+/// not inline `0, 0` literals.
+///
+/// **Two-phase backward structural note:** this entry uses `phase1_*`/`phase2_*` PTX
+/// pairs rather than a single `ptx_ptr`/`name_ptr` pair, so the canonical
+/// `(effective_ptx_ptr, effective_name_ptr)` dispatch substitution doesn't apply.
+/// Non-CSHA + non-`segment_masked`: the runtime gate would never select Tier-B-on
+/// even if a variant were provided. The sentinel assertion is retained for
+/// uniformity per planner spec §4.6; the params are accepted but unused.
+///
+/// See `docs/superpowers/specs/2026-05-15-pca-tier-b-planner-design.md` §4 and
+/// `docs/superpowers/specs/2026-05-15-tier-b-bii-smem-probe-findings.md`.
 #[no_mangle]
 pub extern "C" fn nsl_flash_attention_backward(
     dout_ptr: i64,
@@ -2164,7 +2432,23 @@ pub extern "C" fn nsl_flash_attention_backward(
     phase1_name_ptr: i64,
     phase2_ptx_ptr: i64,
     phase2_name_ptr: i64,
+    // Tier B extension (planner spec §4):
+    tier_b_ptx_ptr: i64,
+    tier_b_name_ptr: i64,
 ) -> i64 {
+    use crate::pca_tier_b_runtime::assert_tier_b_sentinels;
+
+    // Tier B extension entry: assert sentinel agreement (planner spec §4.3).
+    // Two-phase backward has no canonical dispatch shape; the runtime gate is
+    // structurally inapplicable here (non-CSHA + non-segment_masked). The
+    // sentinel assertion still runs to enforce call-site discipline.
+    assert_tier_b_sentinels(
+        "nsl_flash_attention_backward",
+        tier_b_ptx_ptr,
+        tier_b_name_ptr,
+    );
+    // Suppress "unused" — the params are accepted for FFI uniformity.
+    let _ = (tier_b_ptx_ptr, tier_b_name_ptr);
     let scale = f32::from_bits(scale_bits as u32);
     let b = batch as usize;
     let h = heads as usize;
@@ -3361,6 +3645,8 @@ mod tests {
             0, 0,
             // PCA Tier A: segment_ids_ptr (0 = unpacked path).
             0,
+            // PCA Tier B Planner: tier_b sentinel pair (both zero = disabled).
+            0, 0,
         );
         assert_eq!(r, -1, "non-CUDA build must return -1 for the CSHA FFI");
     }
@@ -3408,16 +3694,17 @@ mod tests {
         assert_eq!(a4_effective_heads(8, 8), 8);
     }
 
-    /// Smoke test: the CSHA FFI symbol resolves and the 34-parameter
+    /// Smoke test: the CSHA FFI symbol resolves and the full parameter
     /// signature is wired correctly through the `extern "C"` ABI.
     /// This catches A.2.5 signature regressions (e.g. an accidentally
     /// dropped extras arg) at link time — the forwarder version would
     /// have silently ignored wrong-count calls.
     /// Updated in PCA Tier A Task 3C: one trailing segment_ids_ptr added.
+    /// Updated in PCA Tier B Planner P-3.4: two trailing tier_b_* params added.
     #[test]
     #[cfg(not(feature = "cuda"))]
     fn a25_csha_ffi_signature_has_thirty_params() {
-        // Type-check: compiler enforces the full 34-arg signature.
+        // Type-check: compiler enforces the full 36-arg signature.
         let _: extern "C" fn(
             i64, i64, i64, i64, i64, i64,
             i64, i64, i64, i64,
@@ -3430,6 +3717,8 @@ mod tests {
             i64, i64, i64,
             // PCA Tier A: segment_ids_ptr
             i64,
+            // PCA Tier B Planner: tier_b_ptx_ptr, tier_b_name_ptr
+            i64, i64,
         ) -> i64 = nsl_flash_attention_csha;
     }
 }

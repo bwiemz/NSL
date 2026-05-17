@@ -22,6 +22,10 @@ pub fn nsl_type_to_cl(ty: &Type) -> types::Type {
         Type::Float | Type::F64 => types::F64,
         Type::F32 => types::F32,
         Type::Fp16 | Type::Bf16 | Type::Fp8E4m3 | Type::Fp8E5m2 => types::F32,
+        // M35.1 BitNet ternary: 1 byte per storage atom (packed: 4 trits;
+        // unpacked: one trit per i8). At Cranelift level both are I8 scalars;
+        // tensors wrap them via pointer through `Type::Tensor { .. }` below.
+        Type::TernaryPacked | Type::TernaryUnpacked => types::I8,
         Type::Str => types::I64,
         Type::List(_) => types::I64,
         Type::Struct { .. } => types::I64,

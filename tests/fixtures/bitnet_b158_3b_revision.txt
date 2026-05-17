@@ -1,0 +1,5 @@
+model_id=1bitLLM/bitnet_b1_58-3B
+revision=af89e318d78a70802061246bf037199d2fb97020
+paper=arxiv:2402.17764
+released=2024-03-29
+license=MIT

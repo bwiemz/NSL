@@ -85,8 +85,9 @@ pub fn synthesize(config: &FlashAttentionConfig, chunk: u32) -> Vec<u8> {
     let smem_bytes = crate::flash_attention_v2::smem_layout::tier_b1_total_smem_bytes(
         config, chunk,
     );
+    // Tier B.1 doesn't compose with PCA Tier B — pass `None` here.
     crate::flash_attention_v2::phases::forward::prelude::emit_with_smem_override(
-        &mut ptx, config, smem_bytes,
+        &mut ptx, config, smem_bytes, None,
     );
 
     // 2. Tier B.1 outer-prologue register declarations.

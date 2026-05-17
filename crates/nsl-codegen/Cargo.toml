@@ -28,7 +28,7 @@ half = { version = "2.4", features = ["std"] }
 base64 = "0.22"
 object = "0.36"
 cudarc = { version = "0.19.4", default-features = false, features = ["driver", "cublas", "cuda-version-from-build-system", "dynamic-linking"], optional = true }
-rand = { version = "0.8", optional = true }
+rand = { version = "0.9", optional = true }
 
 [features]
 default = []
@@ -36,6 +36,7 @@ cuda = ["nsl-runtime/cuda", "dep:cudarc"]
 test-hooks = ["nsl-runtime/test-hooks"]
 test-helpers = []
 calibrate = ["dep:rand"]
+debug_kernel_instrumentation = []
 
 [dev-dependencies]
 string-interner.workspace = true
@@ -57,3 +58,8 @@ required-features = ["calibrate"]
 [[bin]]
 name = "build_wggo_fixtures"
 path = "src/bin/build_wggo_fixtures.rs"
+
+[[bin]]
+name = "bench"
+path = "src/bin/bench.rs"
+required-features = ["cuda", "debug_kernel_instrumentation"]

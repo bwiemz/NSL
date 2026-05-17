@@ -1,8 +1,10 @@
 // Clippy style-lint churn new in 1.95+ that's not worth per-site fixes here:
 // - doc_overindented_list_items / doc_lazy_continuation / unused_parens: doc
 //   formatting pedantry that fires on preexisting ASCII diagrams.
-// - manual_checked_ops: explicit `if divisor == 0 { fallback }` is clearer
-//   than `.checked_div(...).unwrap_or(...)` at the call sites in question.
+// - manual_checked_ops (clippy 1.95+): explicit `if divisor == 0` fallback is
+//   clearer than `.checked_div(...).unwrap_or(...)` at the call sites here.
+//   `unknown_lints` is listed first so compilers older than 1.95 don't error on
+//   the unrecognised lint name under `-D warnings`.
 // - needless_range_loop: indexed loops where the index threads into multiple
 //   parallel buffers in lock-step.
 // - too_many_arguments: numerical-kernel / codegen-emit signatures have many
@@ -13,6 +15,7 @@
 //   represented via separate invariants, not "len == 0".
 // - field_reassign_with_default / type_complexity: style, not correctness.
 #![allow(
+    unknown_lints,
     unused_parens,
     clippy::doc_overindented_list_items,
     clippy::doc_lazy_continuation,
@@ -45,6 +48,7 @@ pub mod backend_amdgpu;
 pub mod backend_metal;
 pub mod backend_ptx;
 pub mod backend_wgsl;
+pub mod bitnet;
 pub mod cep;
 pub mod cep_importance;
 pub mod cep_oracle;
@@ -107,6 +111,8 @@ pub mod ownership_expr;
 pub mod pca_detect;
 pub mod pca_rope;
 pub mod pca_segment;
+pub mod pca_tier_b;
+pub mod pca_tile_config;
 pub mod pca_tilerange;
 pub mod pca_tileskip;
 pub mod training_report;
@@ -160,6 +166,36 @@ pub mod wrga_prune;
 pub mod wrga_roofline;
 pub mod wrga_spectral;
 pub mod zk;
+
+/// Binary-internal modules re-exposed at the library level so integration
+/// tests can reach them without the source code living twice. The actual
+/// binary entry points are in `src/bin/`; the submodules they consume live
+/// under `src/bin/<binname>/`.
+///
+/// Gated behind the binary's required Cargo features so non-`cuda` builds
+/// don't try to compile CUDA-dependent helpers.
+#[cfg(all(feature = "cuda", feature = "debug_kernel_instrumentation"))]
+pub mod bin {
+    pub mod bench {
+        #[path = "../../bin/bench/cli.rs"]
+        pub mod cli;
+        #[path = "../../bin/bench/fixtures.rs"]
+        pub mod fixtures;
+        #[path = "../../bin/bench/launch.rs"]
+        pub mod launch;
+        #[path = "../../bin/bench/output.rs"]
+        pub mod output;
+    }
+}
+
+// Note on the `#[path]` attributes above: when an inline `mod` is nested
+// inside another inline `mod`, Rust treats the directory as having descended
+// once per level. From `lib.rs` (in `src/`), entering `pub mod bin` notionally
+// descends into `src/bin/`, and entering `pub mod bench` descends again into
+// `src/bin/bench/`. The actual files live at `src/bin/bench/{cli,launch,output}.rs`,
+// so the relative path from `src/bin/bench/` UP two levels and back down is
+// `../../bin/bench/<file>.rs`. This keeps the binary and the library reading
+// from the same files.
 
 #[cfg(any(test, feature = "test-helpers"))]
 pub mod test_helpers;

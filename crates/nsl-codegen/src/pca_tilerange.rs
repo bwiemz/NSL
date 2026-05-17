@@ -24,6 +24,77 @@
 use crate::flash_attention::FlashAttentionConfig;
 use crate::pca_segment::SegmentResidency;
 
+/// Which axis is the outer loop at the call site of [`emit_skip_predicate`].
+///
+/// - `QOuter` — forward FA-2 convention: per-CTA q-tile fixed by `%bid_x`,
+///   per-warp q-iter Rust-unrolled, kv-tile is the PTX-runtime inner loop.
+///   The skip target lands at the end of the kv-tile body (one label per
+///   `q_iter`, current emission: `KV_TILE_SKIP_TB_{q_iter}`).
+/// - `KVOuter` — backward FA-2 convention (case (β) per V-B.2-predicate):
+///   per-CTA q-tile fixed by `%bid_x`, kv-tile is the PTX-runtime OUTER
+///   loop, q-iter Rust-unrolled inside. The skip target lands at the end
+///   of the q-iter body (so a skipped (qt, kvt) pair bypasses
+///   `ds_compute + dv_accum + dqdk_accum` for THIS q_iter but the outer
+///   kv-loop still flushes dK/dV at its bottom).
+///
+/// The predicate body is mathematically symmetric in qt/kvt (proven in
+/// V-B.2-predicate findings §3), so this parameter governs label naming
+/// only — it does NOT change the PTX register loads, setp ordering, or
+/// the disjoint-test logic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IterationOrder {
+    /// Forward: q-tile outer (CTA-fixed via %bid_x, q_iter Rust-unrolled
+    /// per CTA), kv-tile inner (PTX-runtime loop).
+    QOuter,
+    /// Backward: kv-tile outer (PTX-runtime loop), q-iter inner
+    /// (Rust-unrolled per kv iter).
+    KVOuter,
+}
+
+/// Four sub-table offsets inside the Tier B range-table region.
+/// Spec §3.4.3.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RangeTableAddrs {
+    pub qtile_min:  u32,
+    pub qtile_max:  u32,
+    pub kvtile_min: u32,
+    pub kvtile_max: u32,
+}
+
+/// Compute the four sub-table offsets given the range-table base and
+/// tile counts. `base` is assumed 2-byte aligned per
+/// `tier_b_range_table_offset`'s `align_up(2)` guarantee.
+///
+/// Layout:
+/// ```text
+///   base + 0                       : qtile_min  [num_q_tiles  × u16]
+///   base + num_q_tiles × 2         : qtile_max  [num_q_tiles  × u16]
+///   base + 2 × num_q_tiles × 2     : kvtile_min [num_kv_tiles × u16]
+///   base + (2*num_q + num_kv) × 2  : kvtile_max [num_kv_tiles × u16]
+/// ```
+pub fn range_table_addrs(base: u32, num_q_tiles: u32, num_kv_tiles: u32) -> RangeTableAddrs {
+    let q_bytes  = num_q_tiles  * 2;
+    let kv_bytes = num_kv_tiles * 2;
+    RangeTableAddrs {
+        qtile_min:  base,
+        qtile_max:  base + q_bytes,
+        kvtile_min: base + 2 * q_bytes,
+        kvtile_max: base + 2 * q_bytes + kv_bytes,
+    }
+}
+
+/// Total bytes consumed by the Tier B range table at the given config
+/// + seq_len. Used by `shared_mem_bytes_v2{_backward}_with_seqlen` to
+/// widen the dynamic-SMEM launch parameter when Tier B is admitted.
+pub fn tier_b_range_table_bytes(
+    config: &crate::flash_attention::FlashAttentionConfig,
+    seq_len: u32,
+) -> u32 {
+    let num_q  = crate::pca_tile_config::num_tiles(seq_len, config.block_q as u32);
+    let num_kv = crate::pca_tile_config::num_tiles(seq_len, config.block_kv as u32);
+    2 * (num_q + num_kv) * 2
+}
+
 /// Compute the SMEM bytes the range table consumes for a given
 /// (block_q, block_kv, seq_len) configuration.
 ///
@@ -76,53 +147,497 @@ pub fn should_emit_tier_b(
 /// Stores values as warp-uniform classified so subsequent
 /// [`emit_skip_predicate`] calls compile to `BRA.U`.
 ///
-/// **Stub in skeleton — real emission in Task 3.**
+/// Per spec §3.1 / §4: per-phase uniform-counter loop (BRA.U-eligible
+/// branch), warp-shuffle butterfly min/max reduction, lane-0 predicated
+/// store. Uniformity-through-load anti-pattern avoided: `%r_tile_*` is
+/// register-resident, `mov`-initialized, unconditionally incremented.
 pub fn emit_range_table_preamble(
     ptx: &mut String,
     config: &FlashAttentionConfig,
-    seq_len: u64,
-    segment_ids_reg: &str,
+    seq_len: u32,
+    segment_ids_smem_base: &str,
+    range_table_base: u32,
 ) {
-    let _ = (config, seq_len, segment_ids_reg);
-    ptx.push_str("    // PCA Tier B: range-table preamble (Task 3 stub)\n");
+    let block_q  = config.block_q  as u32;
+    let block_kv = config.block_kv as u32;
+    let num_q_tiles  = crate::pca_tile_config::num_tiles(seq_len, block_q);
+    let num_kv_tiles = crate::pca_tile_config::num_tiles(seq_len, block_kv);
+    let addrs = range_table_addrs(range_table_base, num_q_tiles, num_kv_tiles);
+
+    ptx.push_str("    // ----- PCA Tier B: range-table preamble (spec sec 3.1, v2) -----\n");
+    ptx.push_str(&format!(
+        "    // num_q_tiles={num_q_tiles}, num_kv_tiles={num_kv_tiles}, base=0x{range_table_base:X}\n"
+    ));
+
+    // Register declarations (declared once at the preamble; reused
+    // across q-phase and kv-phase iterations). Data registers are .b32
+    // because shfl.sync.bfly.b32 requires .b32 operands; u16 values
+    // ride in the low 16 bits (zero-extended on load via cvt.u32.u16,
+    // narrowed on store via cvt.u16.u32). min/max are computed as .u32
+    // which gives the same result as .u16 since high bits are 0.
+    ptx.push_str("    .reg .u32  %r_tile_q_TILERANGE,  %r_tile_kv_TILERANGE;\n");
+    ptx.push_str("    .reg .b32  %rs_min_TILERANGE,   %rs_max_TILERANGE;\n");
+    ptx.push_str("    .reg .b32  %rs_peer_min_TILERANGE, %rs_peer_max_TILERANGE;\n");
+    ptx.push_str("    .reg .u16  %rs_tmp_u16_TILERANGE;\n");
+    ptx.push_str("    .reg .u32  %lane_id_TILERANGE;\n");
+    ptx.push_str("    .reg .pred %p_done_TILERANGE,   %p_lane_zero_TILERANGE;\n");
+    ptx.push_str("    .reg .u64  %addr_min_TILERANGE, %addr_max_TILERANGE;\n");
+    ptx.push_str("    .reg .u64  %seg_smem_TILERANGE, %wide_tile_off_TILERANGE;\n");
+    ptx.push_str("    .reg .u32  %seg_byte_off_TILERANGE;\n");
+    ptx.push('\n');
+
+    // `segment_ids_smem_base` can be either:
+    //   - a `.shared` array label (forward: `seg_smem`) — convert to generic
+    //     via `cvta.shared.u64`.
+    //   - a u64 register name beginning with `%` (backward: `%seg_base`,
+    //     already a generic-space address built off `%shmem_base + offset`)
+    //     — copy directly via `mov.u64`.
+    // This dual-mode lets backward pass its existing `%seg_base` register
+    // (which lives at the TAIL of the extern shmem region per the Blackwell
+    // static+extern fix) without forcing the emitter to relayout the
+    // segment_ids residency convention across directions.
+    if segment_ids_smem_base.starts_with('%') {
+        ptx.push_str(&format!(
+            "    mov.u64 %seg_smem_TILERANGE, {segment_ids_smem_base};\n"
+        ));
+    } else {
+        ptx.push_str(&format!(
+            "    cvta.shared.u64 %seg_smem_TILERANGE, {segment_ids_smem_base};\n"
+        ));
+    }
+    ptx.push_str("    mov.u32 %lane_id_TILERANGE, %laneid;\n");
+    ptx.push('\n');
+
+    emit_phase(ptx, "q",  num_q_tiles,  block_q,  addrs.qtile_min,  addrs.qtile_max);
+    emit_phase(ptx, "kv", num_kv_tiles, block_kv, addrs.kvtile_min, addrs.kvtile_max);
+
+    ptx.push_str("    bar.sync 0;  // range tables visible to all warps before kv-tile loop reads\n");
+    ptx.push_str("    // ----- end PCA Tier B range-table preamble -----\n");
+}
+
+/// Emit one phase (q-phase or kv-phase) of the range-table reduction.
+///
+/// Per spec §4 (warp-uniformity discipline):
+///   - `%r_tile_*`: `.reg .u32`, initialized via `mov.u32 ..., 0`, incremented unconditionally.
+///   - Loop branch consumes a uniform predicate (setp on uniform register vs literal).
+///   - Lane-0 store uses PTX predicated execution, not thread-divergent branch.
+fn emit_phase(
+    ptx: &mut String,
+    tag: &str,        // "q" or "kv"
+    num_tiles: u32,
+    block_size: u32,
+    addr_min: u32,
+    addr_max: u32,
+) {
+    let r_tile = format!("%r_tile_{tag}_TILERANGE");
+    let loop_label = format!("LOOP_{}_TILERANGE", tag.to_uppercase());
+
+    ptx.push_str(&format!(
+        "    // --- {tag}-phase: {num_tiles} tiles x {block_size} tokens, addr_min=0x{addr_min:X}, addr_max=0x{addr_max:X} ---\n"
+    ));
+
+    // Uniform counter init.
+    ptx.push_str(&format!("    mov.u32 {r_tile}, 0;\n"));
+    ptx.push_str(&format!("{loop_label}:\n"));
+
+    // Per-iteration: load segment_ids[tile_start + lane], optional +lane+warp_size if block > 32,
+    // butterfly-reduce, lane-0 store.
+    emit_inner_reduction(ptx, tag, block_size, &r_tile);
+    emit_lane_zero_store(ptx, tag, &r_tile, addr_min, addr_max);
+
+    // Uniform increment + uniform-comparison branch (compiles to BRA.U).
+    ptx.push_str(&format!("    add.u32 {r_tile}, {r_tile}, 1;\n"));
+    ptx.push_str(&format!(
+        "    setp.lt.u32 %p_done_TILERANGE, {r_tile}, {num_tiles};\n"
+    ));
+    ptx.push_str(&format!("    @%p_done_TILERANGE bra {loop_label};\n\n"));
+}
+
+/// Per-iteration body: load segment IDs into lane-local `%rs_min`/`%rs_max`,
+/// then 5-step warp-shuffle butterfly reduction.
+fn emit_inner_reduction(
+    ptx: &mut String,
+    tag: &str,
+    block_size: u32,
+    r_tile: &str,
+) {
+    // tile_start = %r_tile * block_size
+    ptx.push_str(&format!(
+        "    mul.lo.u32 %seg_byte_off_TILERANGE, {r_tile}, {block_size};\n"
+    ));
+    // Add lane to the tile start.
+    ptx.push_str(
+        "    add.u32 %seg_byte_off_TILERANGE, %seg_byte_off_TILERANGE, %lane_id_TILERANGE;\n",
+    );
+    // Convert token-index → byte offset (x sizeof(u16) = x 2).
+    ptx.push_str(
+        "    shl.b32 %seg_byte_off_TILERANGE, %seg_byte_off_TILERANGE, 1;\n",
+    );
+    // Compute byte address into segment_ids SMEM.
+    ptx.push_str(
+        "    cvt.u64.u32 %wide_tile_off_TILERANGE, %seg_byte_off_TILERANGE;\n",
+    );
+    ptx.push_str(
+        "    add.u64 %wide_tile_off_TILERANGE, %seg_smem_TILERANGE, %wide_tile_off_TILERANGE;\n",
+    );
+    // Lane-local initial: load one u16 from SMEM, widen to b32 so shfl
+    // and min/max work in 32-bit (high bits stay zero).
+    ptx.push_str(
+        "    ld.shared.u16 %rs_tmp_u16_TILERANGE, [%wide_tile_off_TILERANGE];\n",
+    );
+    ptx.push_str(
+        "    cvt.u32.u16 %rs_min_TILERANGE, %rs_tmp_u16_TILERANGE;\n",
+    );
+    ptx.push_str(
+        "    mov.b32 %rs_max_TILERANGE, %rs_min_TILERANGE;\n",
+    );
+
+    // If block_size > warp_size, fold the second half (lane + 32, lane + 64, ...).
+    let warp_size: u32 = 32;
+    let mut extra_offset = warp_size;
+    while extra_offset < block_size {
+        let _ = tag; // silenced; tag may be referenced for debug comments in future
+        ptx.push_str(&format!(
+            "    // fold lane + {extra_offset} into lane-local min/max\n"
+        ));
+        ptx.push_str(&format!(
+            "    add.u64 %wide_tile_off_TILERANGE, %wide_tile_off_TILERANGE, {};\n",
+            extra_offset * 2 /* byte stride */
+        ));
+        ptx.push_str(
+            "    ld.shared.u16 %rs_tmp_u16_TILERANGE, [%wide_tile_off_TILERANGE];\n",
+        );
+        ptx.push_str(
+            "    cvt.u32.u16 %rs_peer_min_TILERANGE, %rs_tmp_u16_TILERANGE;\n",
+        );
+        ptx.push_str(
+            "    min.u32 %rs_min_TILERANGE, %rs_min_TILERANGE, %rs_peer_min_TILERANGE;\n",
+        );
+        ptx.push_str(
+            "    max.u32 %rs_max_TILERANGE, %rs_max_TILERANGE, %rs_peer_min_TILERANGE;\n",
+        );
+        extra_offset += warp_size;
+    }
+
+    // 5-step butterfly reduction (offsets 16, 8, 4, 2, 1). Operates on
+    // .b32 registers per PTX shfl.sync.bfly.b32 requirement; min/max
+    // computed as .u32 (high bits are zero so equivalent to u16 cmp).
+    for offset in [16u32, 8, 4, 2, 1] {
+        ptx.push_str(&format!(
+            "    shfl.sync.bfly.b32 %rs_peer_min_TILERANGE, %rs_min_TILERANGE, {offset}, 0x1F, 0xFFFFFFFF;\n"
+        ));
+        ptx.push_str(&format!(
+            "    shfl.sync.bfly.b32 %rs_peer_max_TILERANGE, %rs_max_TILERANGE, {offset}, 0x1F, 0xFFFFFFFF;\n"
+        ));
+        ptx.push_str(
+            "    min.u32 %rs_min_TILERANGE, %rs_min_TILERANGE, %rs_peer_min_TILERANGE;\n",
+        );
+        ptx.push_str(
+            "    max.u32 %rs_max_TILERANGE, %rs_max_TILERANGE, %rs_peer_max_TILERANGE;\n",
+        );
+    }
+}
+
+/// Lane-0 predicated store of (min, max) to `range_table[tile_idx]`.
+fn emit_lane_zero_store(
+    ptx: &mut String,
+    tag: &str,
+    r_tile: &str,
+    addr_min: u32,
+    addr_max: u32,
+) {
+    let _ = tag;
+    // Compute byte offset = 2 * %r_tile (u16 stride).
+    ptx.push_str(&format!(
+        "    shl.b32 %seg_byte_off_TILERANGE, {r_tile}, 1;\n"
+    ));
+    ptx.push_str(
+        "    cvt.u64.u32 %wide_tile_off_TILERANGE, %seg_byte_off_TILERANGE;\n",
+    );
+    // qtile_min/kvtile_min address.
+    ptx.push_str(
+        "    cvta.shared.u64 %addr_min_TILERANGE, shmem;\n"
+    );
+    ptx.push_str(&format!(
+        "    add.u64 %addr_min_TILERANGE, %addr_min_TILERANGE, {addr_min};\n"
+    ));
+    ptx.push_str(
+        "    add.u64 %addr_min_TILERANGE, %addr_min_TILERANGE, %wide_tile_off_TILERANGE;\n",
+    );
+    // qtile_max/kvtile_max address.
+    ptx.push_str(
+        "    cvta.shared.u64 %addr_max_TILERANGE, shmem;\n"
+    );
+    ptx.push_str(&format!(
+        "    add.u64 %addr_max_TILERANGE, %addr_max_TILERANGE, {addr_max};\n"
+    ));
+    ptx.push_str(
+        "    add.u64 %addr_max_TILERANGE, %addr_max_TILERANGE, %wide_tile_off_TILERANGE;\n",
+    );
+    // Lane-0 predicate.
+    ptx.push_str(
+        "    setp.eq.u32 %p_lane_zero_TILERANGE, %lane_id_TILERANGE, 0;\n",
+    );
+    // Predicated stores (NOT divergent branch -- see spec sec 4.3).
+    // Narrow b32 to u16 for the store (st.shared.u16 requires .u16 source).
+    ptx.push_str(
+        "    @%p_lane_zero_TILERANGE cvt.u16.u32 %rs_tmp_u16_TILERANGE, %rs_min_TILERANGE;\n",
+    );
+    ptx.push_str(
+        "    @%p_lane_zero_TILERANGE st.shared.u16 [%addr_min_TILERANGE], %rs_tmp_u16_TILERANGE;\n",
+    );
+    ptx.push_str(
+        "    @%p_lane_zero_TILERANGE cvt.u16.u32 %rs_tmp_u16_TILERANGE, %rs_max_TILERANGE;\n",
+    );
+    ptx.push_str(
+        "    @%p_lane_zero_TILERANGE st.shared.u16 [%addr_max_TILERANGE], %rs_tmp_u16_TILERANGE;\n",
+    );
 }
 
 /// Emit PTX that branches to `on_skip_label` if the `(qt, kvt)` tile
 /// pair has strictly disjoint segment ranges.
 ///
-/// Compiles to one comparison + one warp-uniform branch (`BRA.U`).
+/// Loads `qtile_seg_min[qt]`, `qtile_seg_max[qt]`, `kvtile_seg_min[kvt]`,
+/// `kvtile_seg_max[kvt]` from the range table in SMEM, then checks:
+///   disjoint = (qmax < kvmin) || (qmin > kvmax)
 ///
-/// **Stub in skeleton — real emission in Task 4.**
+/// When disjoint, branches to `on_skip_label` (warp-uniform → BRA.U).
+/// All scratch registers carry the `_TB` suffix to avoid collisions.
+///
+/// `qt_reg` and `kvt_reg` are u32 PTX operands (register names or
+/// immediates) holding the current q-tile / kv-tile ordinal.
+/// `range_table_base` is the SMEM byte offset from
+/// `smem_layout::tier_b_range_table_offset`.
+///
+/// `iteration_order` declares whether the caller's outer loop is q-tile
+/// (forward) or kv-tile (backward, case (β) per V-B.2-predicate). The
+/// PTX body is structurally symmetric in qt/kvt, so this parameter does
+/// NOT change the emitted instructions — but it pins the call-site
+/// contract at the type level so a future B.3 refactor can't accidentally
+/// drop the kv-outer call site, and it gates the leading comment so
+/// `BWD_KV_TILE_SKIP_TB_*` labels are self-documenting in the SASS.
+///
+/// **No-op guarantee:** when `iteration_order = QOuter` the emitted PTX
+/// is byte-identical to the pre-B.2 emission (forward snapshots untouched).
 pub fn emit_skip_predicate(
     ptx: &mut String,
-    qt_reg: &str,
-    kvt_reg: &str,
-    on_skip_label: &str,
+    config: &crate::flash_attention::FlashAttentionConfig,
+    seq_len: u32,
+    qt_reg: &str,            // PTX register holding the current q-tile index
+    kvt_reg: &str,           // PTX register holding the current kv-tile index
+    range_table_base: u32,   // from smem_layout::tier_b_range_table_offset
+    on_skip_label: &str,     // PTX label to branch to when ranges disjoint
+    iteration_order: IterationOrder,
 ) {
-    let _ = (qt_reg, kvt_reg, on_skip_label);
-    ptx.push_str("    // PCA Tier B: skip predicate (Task 4 stub)\n");
+    let num_q  = crate::pca_tile_config::num_tiles(seq_len, config.block_q  as u32);
+    let num_kv = crate::pca_tile_config::num_tiles(seq_len, config.block_kv as u32);
+    let addrs = range_table_addrs(range_table_base, num_q, num_kv);
+
+    // Leading comment — for `QOuter` keep the EXACT existing string so the
+    // forward kernel snapshot remains byte-identical. `KVOuter` adds a
+    // direction marker so the backward predicate is self-documenting.
+    match iteration_order {
+        IterationOrder::QOuter => {
+            ptx.push_str("    // ----- PCA Tier B: skip predicate (spec sec 3.2) -----\n");
+        }
+        IterationOrder::KVOuter => {
+            ptx.push_str(
+                "    // ----- PCA Tier B: skip predicate (backward, kv-outer) (spec sec 3.2 + sec 7.3) -----\n",
+            );
+        }
+    }
+    // Wrap in a PTX lexical scope so register decls are local to this
+    // call site (predicate fires once per (q_iter, kv_iter) pair; without
+    // the scope, repeat calls would re-declare and ptxas would reject).
+    ptx.push_str("    {\n");
+    ptx.push_str("    .reg .u16  %qmin_TB, %qmax_TB, %kvmin_TB, %kvmax_TB;\n");
+    ptx.push_str("    .reg .pred %p_lt_TB, %p_gt_TB, %p_skip_TB;\n");
+    ptx.push_str("    .reg .u32  %tile_byte_TB;\n");
+    ptx.push_str("    .reg .u64  %addr_TB, %tile_off_wide_TB;\n");
+    ptx.push('\n');
+
+    // qmin[qt], qmax[qt].
+    //
+    // Pre-2026-05-13 bug: the per-tile byte offset was computed into
+    // `%addr_TB` via `cvt.u64.u32`, then `cvta.shared.u64 %addr_TB, shmem;`
+    // immediately OVERWROTE `%addr_TB` with the SMEM base — discarding the
+    // per-tile offset. Net effect: every predicate lookup read slot 0 of
+    // the range table regardless of `qt_reg` / `kvt_reg`, so `%p_skip_TB`
+    // was always false (qmin/qmax/kvmin/kvmax all from tile 0). Fix: hold
+    // the per-tile byte offset in a separate widened register so the
+    // `cvta` no longer clobbers it, then add base + table_offset +
+    // tile_offset.
+    ptx.push_str(&format!("    shl.b32 %tile_byte_TB, {qt_reg}, 1;\n"));
+    ptx.push_str("    cvt.u64.u32 %tile_off_wide_TB, %tile_byte_TB;\n");
+    ptx.push_str("    cvta.shared.u64 %addr_TB, shmem;\n");
+    ptx.push_str(&format!(
+        "    add.u64 %addr_TB, %addr_TB, {};\n",
+        addrs.qtile_min
+    ));
+    ptx.push_str("    add.u64 %addr_TB, %addr_TB, %tile_off_wide_TB;\n");
+    ptx.push_str("    ld.shared.u16 %qmin_TB, [%addr_TB];\n");
+    ptx.push_str("    cvta.shared.u64 %addr_TB, shmem;\n");
+    ptx.push_str(&format!(
+        "    add.u64 %addr_TB, %addr_TB, {};\n",
+        addrs.qtile_max
+    ));
+    ptx.push_str("    add.u64 %addr_TB, %addr_TB, %tile_off_wide_TB;\n");
+    ptx.push_str("    ld.shared.u16 %qmax_TB, [%addr_TB];\n");
+
+    // kvmin[kvt], kvmax[kvt]
+    ptx.push_str(&format!("    shl.b32 %tile_byte_TB, {kvt_reg}, 1;\n"));
+    ptx.push_str("    cvt.u64.u32 %tile_off_wide_TB, %tile_byte_TB;\n");
+    ptx.push_str("    cvta.shared.u64 %addr_TB, shmem;\n");
+    ptx.push_str(&format!(
+        "    add.u64 %addr_TB, %addr_TB, {};\n",
+        addrs.kvtile_min
+    ));
+    ptx.push_str("    add.u64 %addr_TB, %addr_TB, %tile_off_wide_TB;\n");
+    ptx.push_str("    ld.shared.u16 %kvmin_TB, [%addr_TB];\n");
+    ptx.push_str("    cvta.shared.u64 %addr_TB, shmem;\n");
+    ptx.push_str(&format!(
+        "    add.u64 %addr_TB, %addr_TB, {};\n",
+        addrs.kvtile_max
+    ));
+    ptx.push_str("    add.u64 %addr_TB, %addr_TB, %tile_off_wide_TB;\n");
+    ptx.push_str("    ld.shared.u16 %kvmax_TB, [%addr_TB];\n");
+
+    // disjoint = (qmax < kvmin) || (qmin > kvmax)
+    ptx.push_str("    setp.lt.u16 %p_lt_TB, %qmax_TB, %kvmin_TB;\n");
+    ptx.push_str("    setp.gt.u16 %p_gt_TB, %qmin_TB, %kvmax_TB;\n");
+    ptx.push_str("    or.pred %p_skip_TB, %p_lt_TB, %p_gt_TB;\n");
+
+    // PCA Tier B M3 instrumentation hook: when `debug_kernel_instrumentation`
+    // is enabled AND the kernel has a `skip_decisions_ptr` param plumbed in,
+    // emit the per-tile writeback BEFORE the @%p_skip_TB branch so the buffer
+    // records BOTH kept (0) and skipped (1) decisions. Lives inside the
+    // emit_skip_predicate scope so `%p_skip_TB` is in scope for the `selp`.
+    if cfg!(feature = "debug_kernel_instrumentation") {
+        emit_skip_decision_writeback(
+            ptx,
+            config,
+            seq_len,
+            qt_reg,
+            kvt_reg,
+            "%p_skip_TB",
+            "skip_decisions_ptr",
+            /* num_warps = */ 4, // FA2 v2's pinned thread-mapping contract.
+        );
+    }
+
+    ptx.push_str(&format!("    @%p_skip_TB bra {on_skip_label};\n"));
+    ptx.push_str("    }\n");
+    ptx.push_str("    // ----- end PCA Tier B skip predicate -----\n");
 }
 
 /// Emit PTX that writes the skip decision for `(b, h, qt, kvt)` to
 /// the debug instrumentation buffer at the matching slot.
 ///
-/// Lane 0 of the warp owning the tile pair writes; other threads
-/// no-op. Decision: `1` = disjoint (skipped), `0` = kept.
+/// **Round-robin owner** per spec §6.2:
+/// `owning_warp(qt, kvt) = (qt * num_kv_tiles + kvt) % num_warps`.
+/// Lane 0 of the owning warp performs the write; all other lanes/warps
+/// no-op via predication. Decision: `1` = disjoint (skipped), `0` = kept.
+///
+/// Buffer shape: `[batch, head, num_q_tiles, num_kv_tiles] : u8`
+/// per spec §4.3.1. Slot index = `(bh_idx * num_q_tiles + qt) * num_kv + kvt`.
 ///
 /// Gated behind `cfg!(debug_kernel_instrumentation)` at codegen time
 /// — production builds never call this function.
 ///
-/// **Stub in skeleton — real emission in Task 5.**
+/// PTX is wrapped in a lexical scope `{ ... }` per IR-007 so the same
+/// helper can be called from multiple sites (per-q-iter and per-kv-iter
+/// loop contexts) without re-declaring registers.
+///
+/// # Arguments
+///
+/// - `seq_len` — the sequence length; used to derive tile counts at
+///   codegen time (not a runtime register).
+/// - `qt_reg` / `kvt_reg` — PTX operands (register names or immediates)
+///   holding the current q-tile / kv-tile ordinal.
+/// - `is_skip_pred` — the predicate register produced by
+///   [`emit_skip_predicate`] (e.g. `%p_skip_TB`).
+/// - `decisions_buf_param` — the `.param .u64` parameter name holding
+///   the HBM buffer base pointer.
+/// - `num_warps` — number of warps per CTA (compile-time constant; v2 = 4).
+///   Caller MUST ensure `num_warps > 0` (validated via `debug_assert!`).
+///   `num_warps == 1` is allowed and degrades to the v1 warp-0 behaviour
+///   (every tile written by warp 0 lane 0) per §6.4.
 pub fn emit_skip_decision_writeback(
     ptx: &mut String,
     config: &FlashAttentionConfig,
+    seq_len: u32,
     qt_reg: &str,
     kvt_reg: &str,
-    is_skip_pred: &str,
-    decisions_buf_reg: &str,
+    is_skip_pred: &str,           // %p_skip_TB from emit_skip_predicate
+    decisions_buf_param: &str,    // .param .u64 holding the HBM buffer ptr
+    num_warps: u32,
 ) {
-    let _ = (config, qt_reg, kvt_reg, is_skip_pred, decisions_buf_reg);
-    ptx.push_str("    // PCA Tier B: writeback (Task 5 stub)\n");
+    // Spec §6.4: `num_warps == 0` is an invalid configuration; `(...) % 0`
+    // is undefined behaviour on most architectures. Refuse at codegen time.
+    debug_assert!(num_warps > 0, "Tier B M3 instrumentation requires num_warps > 0");
+
+    let num_kv = crate::pca_tile_config::num_tiles(seq_len, config.block_kv as u32);
+    let num_q_tiles_const = crate::pca_tile_config::num_tiles(seq_len, config.block_q as u32);
+
+    ptx.push_str("    // ----- PCA Tier B: skip-decision writeback (debug, spec sec 4.3 / sec 6.2) -----\n");
+    // Wrap in PTX lexical scope per IR-007 so register decls are local to
+    // this call site. Multiple call sites (per-q-iter, per-kv-iter loops)
+    // are safe to coexist without `ptxas: variable redeclared`.
+    //
+    // Register naming: `_local` suffix on tid/lane to avoid colliding with
+    // %tid.x / %laneid special-register names per the Phase 0 SMEM probe
+    // fix in PR #168 commit 378b843e.
+    ptx.push_str("    {\n");
+    ptx.push_str("    .reg .u64 %dec_buf_TB, %dec_slot_TB;\n");
+    ptx.push_str("    .reg .u32 %slot_off_TB, %bh_TB, %bh_slot_TB;\n");
+    ptx.push_str("    .reg .u16 %dec_val_TB;\n");
+    ptx.push_str("    .reg .u32 %tid_local_TB, %warp_id_TB, %lane_local_TB, %owning_warp_TB;\n");
+    ptx.push_str("    .reg .pred %p_warp_owner_TB, %p_lane_owner_TB, %p_writeback_TB;\n");
+    ptx.push('\n');
+
+    // ── Slot offset within the [B, H, Qtiles, KVtiles] u8 buffer. ──
+    // `%bid_y` already encodes `batch_idx * num_heads + head_idx` because
+    // the FA2 launch maps `(batch, head)` onto blockIdx.y in row-major
+    // order. Reuse it directly instead of re-deriving from %batch_idx and
+    // %head_idx (which were derived from %bid_y in the prelude anyway).
+    ptx.push_str("    mov.u32 %bh_TB, %bid_y;\n");
+    ptx.push_str(&format!(
+        "    mad.lo.u32 %bh_slot_TB, %bh_TB, {num_q_tiles_const}, {qt_reg};\n"
+    ));
+    ptx.push_str(&format!(
+        "    mad.lo.u32 %slot_off_TB, %bh_slot_TB, {num_kv}, {kvt_reg};\n"
+    ));
+
+    // Load buffer base + add offset.
+    ptx.push_str(&format!(
+        "    ld.param.u64 %dec_buf_TB, [{decisions_buf_param}];\n"
+    ));
+    ptx.push_str("    cvt.u64.u32 %dec_slot_TB, %slot_off_TB;\n");
+    ptx.push_str("    add.u64 %dec_slot_TB, %dec_buf_TB, %dec_slot_TB;\n");
+
+    // ── Round-robin owning_warp(qt, kvt) = (qt * num_kv_tiles + kvt) % num_warps ──
+    // Per spec §6.2. Uniform-class registers because qt/kvt loop counters
+    // are warp-uniform → ptxas can fold the predicate into `BRA.U`.
+    ptx.push_str("    mov.u32 %tid_local_TB, %tid.x;\n");
+    ptx.push_str("    shr.u32 %warp_id_TB, %tid_local_TB, 5;\n");
+    ptx.push_str(&format!(
+        "    mad.lo.u32 %owning_warp_TB, {qt_reg}, {num_kv}, {kvt_reg};\n"
+    ));
+    ptx.push_str(&format!(
+        "    rem.u32 %owning_warp_TB, %owning_warp_TB, {num_warps};\n"
+    ));
+    ptx.push_str("    setp.eq.u32 %p_warp_owner_TB, %warp_id_TB, %owning_warp_TB;\n");
+    ptx.push_str("    and.b32 %lane_local_TB, %tid_local_TB, 0x1F;\n");
+    ptx.push_str("    setp.eq.u32 %p_lane_owner_TB, %lane_local_TB, 0;\n");
+    ptx.push_str("    and.pred %p_writeback_TB, %p_warp_owner_TB, %p_lane_owner_TB;\n");
+
+    // Decision value: 1 if disjoint (skipped), 0 if kept.
+    ptx.push_str(&format!(
+        "    selp.u16 %dec_val_TB, 1, 0, {is_skip_pred};\n"
+    ));
+    ptx.push_str("    @%p_writeback_TB st.global.u8 [%dec_slot_TB], %dec_val_TB;\n");
+    ptx.push_str("    }\n");
+    ptx.push_str("    // ----- end skip-decision writeback -----\n");
 }
 
 #[cfg(test)]
@@ -225,9 +740,41 @@ mod tests {
     fn skeleton_emitters_emit_marker_comments() {
         let mut s = String::new();
         let cfg = fa_base_for_test();
-        emit_range_table_preamble(&mut s, &cfg, 4096, "%seg_base");
-        emit_skip_predicate(&mut s, "%qt", "%kvt", "skip_kv_iter");
-        emit_skip_decision_writeback(&mut s, &cfg, "%qt", "%kvt", "%p_skip_TILERANGE", "%dec_buf");
+        emit_range_table_preamble(&mut s, &cfg, 4096, "seg_smem", 0);
+        emit_skip_predicate(
+            &mut s, &cfg, 4096, "%qt", "%kvt", 0, "skip_kv_iter", IterationOrder::QOuter,
+        );
+        emit_skip_decision_writeback(&mut s, &cfg, 4096, "%qt", "%kvt", "%p_skip_TB", "%dec_buf", 4);
         assert!(s.contains("PCA Tier B"), "output missing marker:\n{}", s);
+    }
+
+    /// No-op guarantee inside the predicate emitter: with `QOuter` the
+    /// output must be byte-identical to the pre-B.2 emission shape. The
+    /// only "shape" that ever existed was the QOuter shape, so any drift
+    /// in this snapshot-like equality check signals an accidental
+    /// regression for forward callers.
+    #[test]
+    #[cfg(not(feature = "debug_kernel_instrumentation"))]
+    fn qouter_emission_contains_unprefixed_marker_comment() {
+        let cfg = fa_base_for_test();
+
+        let mut s_q = String::new();
+        emit_skip_predicate(
+            &mut s_q, &cfg, 4096, "%qt", "%kvt", 0, "FWD_SKIP", IterationOrder::QOuter,
+        );
+        assert!(
+            s_q.contains("// ----- PCA Tier B: skip predicate (spec sec 3.2) -----"),
+            "QOuter must preserve the exact pre-B.2 leading comment for snapshot stability"
+        );
+        assert!(!s_q.contains("kv-outer"), "QOuter must not advertise as backward kv-outer");
+
+        let mut s_kv = String::new();
+        emit_skip_predicate(
+            &mut s_kv, &cfg, 4096, "%qt", "%kvt", 0, "BWD_SKIP", IterationOrder::KVOuter,
+        );
+        assert!(
+            s_kv.contains("kv-outer"),
+            "KVOuter must advertise its direction in the leading comment"
+        );
     }
 }

@@ -126,8 +126,10 @@ fn try_merge_pair(
     if aa.size_bytes != bb.size_bytes || aa.size_bytes == 0 {
         return false;
     }
-    // Non-overlap: `death_a < birth_b || death_b < birth_a`
-    let disjoint = aa.death < bb.birth || bb.death < aa.birth;
+    // Non-overlap (half-open intervals): death_a <= birth_b || death_b <= birth_a.
+    // Using <= matches intervals_overlap's strict-< semantics so that adjacent
+    // intervals ([0,5) and [5,10)) are correctly treated as non-overlapping.
+    let disjoint = aa.death <= bb.birth || bb.death <= aa.birth;
     if !disjoint {
         return false;
     }
@@ -298,7 +300,7 @@ impl LivenessAnalyzer {
                 if o_size != first_size { continue; }
                 let overlap = self.slot_liveness
                     .get(&target)
-                    .map(|ranges| ranges.iter().any(|&(b, d)| !(o_death < b || d < o_birth)))
+                    .map(|ranges| ranges.iter().any(|&(b, d)| !(o_death <= b || d <= o_birth)))
                     .unwrap_or(false);
                 if overlap { continue; }
                 if self.try_merge_activation_into_slot(other_var, target) {
@@ -845,6 +847,8 @@ fn dtype_byte_size(dtype: &nsl_semantic::types::DType) -> u64 {
         DType::Int8 | DType::Uint8 | DType::Bool => 1,
         DType::Fp8E4m3 | DType::Fp8E5m2 => 1,
         DType::Int4 => 1,                       // rounded up
+        // M35.1 BitNet: ternary storage atom is 1 byte (packed 2-bit×4 trits; unpacked i8).
+        DType::TernaryPacked | DType::TernaryUnpacked => 1,
         DType::Custom(_) | DType::Unknown => 4, // default to f32 size for unknown dtypes
     }
 }
@@ -2015,6 +2019,24 @@ mod wrga_hints_unit_tests {
             "zero size must refuse (guard against unallocated)"
         );
     }
+
+    // Half-open interval invariant: intervals [0, 5) and [5, 10) are adjacent
+    // but NOT overlapping — the slab planner's intervals_overlap uses strict < for
+    // this reason.  try_merge_pair must match that semantics (death <= birth means
+    // disjoint) so that WRGA hints don't silently fail to coalesce adjacent-lifetime
+    // activations that the slab planner would correctly place in the same slot.
+    #[test]
+    fn try_merge_pair_accepts_adjacent_intervals_death_eq_birth() {
+        let assignments = vec![
+            mk_assignment(1, 0, 64, 0, 5),
+            mk_assignment(2, 0, 64, 5, 10), // birth == death of previous → adjacent, not overlapping
+        ];
+        assert!(
+            try_merge_pair(&assignments, 0, 1),
+            "adjacent intervals (death == birth) must be accepted: \
+             [0,5) and [5,10) do not overlap under half-open semantics"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2063,5 +2085,33 @@ mod consume_hints_tests {
         let plan = mk_plan_with_shared_slot();
         let post = a.consume_hints(&plan);
         assert_eq!(post, 2, "size mismatch must refuse to merge");
+    }
+
+    // Half-open interval invariant: consume_hints must merge adjacent-lifetime
+    // activations ([0,5) and [5,10)) because the slab planner treats them as
+    // non-overlapping.  The hint pass must agree or it silently degrades memory
+    // reuse for the common sequential-backward-step pattern.
+    #[test]
+    fn consume_hints_merges_adjacent_lifetime_activations() {
+        let mut a = LivenessAnalyzer::new();
+        a.record_activation_alloc(1, 64);
+        a.record_activation_alloc(2, 64);
+
+        let mut plan = crate::wrga::WrgaPlan::test_dummy();
+        plan.memory = crate::wrga_memory::MemoryPlan {
+            assignments: vec![
+                crate::wrga_memory::SlotAssignment { var: 1, slot: 0, size_bytes: 64, birth: 0, death: 5 },
+                // birth == death of previous slot → adjacent, not overlapping (half-open)
+                crate::wrga_memory::SlotAssignment { var: 2, slot: 0, size_bytes: 64, birth: 5, death: 10 },
+            ],
+            stats: crate::wrga_memory::MemoryPlanStats::default(),
+        };
+
+        let post = a.consume_hints(&plan);
+        assert_eq!(
+            post, 1,
+            "adjacent-lifetime activations ([0,5) and [5,10)) must merge: \
+             they are not overlapping under half-open interval semantics"
+        );
     }
 }

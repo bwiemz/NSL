@@ -80,6 +80,24 @@ pub fn promote_types(a: KirType, b: KirType) -> KirType {
         // Bool promotes to the other type
         (Bool, other) | (other, Bool) => other,
 
+        // Ternary types do NOT participate in numeric promotion — they must be
+        // explicitly cast to/from int8 via `bitnet::pack`/`unpack` before
+        // arithmetic. Phase emitters that need int-ternary math should declare
+        // their operand types as `TernaryUnpacked` (one trit per i8 slot) and
+        // cast to i8/i32 before invoking promote_types via the KirOp path.
+        //
+        // Catching these here gives a clear error rather than the generic
+        // "Cannot promote" message, surfacing the design constraint to whoever
+        // is composing the kernel IR.
+        (Tq2Packed, _) | (_, Tq2Packed) => panic!(
+            "Tq2Packed cannot participate in type promotion; unpack to TernaryUnpacked or cast to i8 first"
+        ),
+        (TernaryUnpacked, TernaryUnpacked) => TernaryUnpacked,
+        (TernaryUnpacked, other) | (other, TernaryUnpacked) => panic!(
+            "TernaryUnpacked cannot promote with {:?}; cast TernaryUnpacked → I32 explicitly first",
+            other
+        ),
+
         // Pointer types and Vec types -- no arithmetic promotion
         (a, b) => panic!("Cannot promote types {:?} and {:?}", a, b),
     }

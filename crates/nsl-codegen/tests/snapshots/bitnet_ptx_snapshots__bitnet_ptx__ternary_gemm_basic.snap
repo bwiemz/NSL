@@ -1,0 +1,39 @@
+---
+source: crates/nsl-codegen/tests/bitnet_ptx_snapshots.rs
+assertion_line: 45
+expression: ptx
+---
+// === BitNet ternary_gemm (hidden_dim=1024) ===
+// Init i32 accumulator for this thread's (row, col) output.
+mov.s32 %r_acc, 0;
+// Inner loop: acc += q_act[row, k] * w_ternary[k, col] over k.
+mov.u32 %r_k, 0;
+GEMM_LOOP:
+setp.ge.u32 %p_gdone, %r_k, %r_hidden_dim;
+@%p_gdone bra GEMM_END;
+// Load q_act[row, k] = qact_smem[row * hidden_dim + k].
+mul.lo.u32 %r_qoff, %r_row_id, %r_hidden_dim;
+add.u32 %r_qoff, %r_qoff, %r_k;
+cvt.u64.u32 %rd_qoff, %r_qoff;
+add.s64 %rd_qaddr, %rd_qact_smem, %rd_qoff;
+ld.shared.s8 %rs_qact, [%rd_qaddr];
+cvt.s32.s8 %r_qact_i32, %rs_qact;
+// Load w_ternary[k, col] = w_smem[k * out_dim + col].
+mul.lo.u32 %r_woff, %r_k, %r_out_dim;
+add.u32 %r_woff, %r_woff, %r_col_id;
+cvt.u64.u32 %rd_woff, %r_woff;
+add.s64 %rd_waddr, %rd_w_smem, %rd_woff;
+ld.shared.s8 %rs_w, [%rd_waddr];
+cvt.s32.s8 %r_w_i32, %rs_w;
+// acc += qact * w  (mul.lo.s32 + add.s32 to avoid mad.lo.s32 risk).
+mul.lo.s32 %r_prod, %r_qact_i32, %r_w_i32;
+add.s32 %r_acc, %r_acc, %r_prod;
+add.u32 %r_k, %r_k, 1;
+bra GEMM_LOOP;
+GEMM_END:
+// Dequant: y = (scale / 127.0) * acc.
+cvt.rn.f32.s32 %f_acc, %r_acc;
+mov.f32 %f_127, 0f42FE0000;
+div.rn.f32 %f_inv127_scale, %f_scale, %f_127;
+mul.f32 %f_y_out, %f_inv127_scale, %f_acc;
+// === end BitNet ternary_gemm ===
