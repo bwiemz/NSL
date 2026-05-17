@@ -10,6 +10,24 @@ use crate::dict::{nsl_dict_new, nsl_dict_set_str};
 use crate::string::nsl_str_from_rust;
 use crate::tensor::{DTYPE_U16_SEGMENT, DTYPE_U16_TOKEN, NslTensor};
 
+/// Maximum number of documents per packed batch.
+///
+/// This constant is the producer-side bound for the PCA §4.3 RoPE position
+/// reset path. The `doc_starts` tensor emitted alongside `segment_ids` is
+/// padded to `[MAX_NUM_DOCS + 1]` with sentinel `-1` for unused slots so
+/// the GPU kernel can emit a constant-size SMEM load independent of the
+/// per-batch document count.
+///
+/// **Source of truth:** `crates/nsl-codegen/src/pca_rope.rs::MAX_NUM_DOCS`
+/// (declared there as `u32 = 256`). `nsl-runtime` cannot depend on
+/// `nsl-codegen` directly (would introduce a circular crate dependency),
+/// so the bound is duplicated here as `usize`. The two declarations MUST
+/// agree numerically; a divergence is a producer/consumer ABI bug. T1's
+/// const_assert on the codegen side keeps `(MAX_NUM_DOCS + 1) * 4` within
+/// the per-CTA SMEM budget, so changing the value here without also
+/// updating the codegen side will silently break the kernel.
+pub const MAX_NUM_DOCS: usize = 256;
+
 /// A packed batch of token sequences with attention mask.
 pub struct PackedBatch {
     pub input_ids:   Vec<i64>,
@@ -121,6 +139,50 @@ pub fn pack_batch(
         batch_size,
         seq_len,
     })
+}
+
+/// Construct segment_ids + doc_starts tensors for a packed batch with the
+/// given per-document lengths.
+///
+/// **Producer half of the PCA §4.3 RoPE position reset path.** This is the
+/// caller-driven path used when document boundaries are known upfront (e.g.
+/// from a packing planner that pre-computes per-doc lengths). The streaming
+/// `pack_batch` path that scans for EOS tokens is a separate producer; the
+/// two are not yet unified.
+///
+/// Returns `(segment_ids, doc_starts)` where:
+/// - `segment_ids` has length `doc_lengths.iter().sum()` (the packed length)
+///   and contains the segment ID (`0..doc_lengths.len()`) for each position.
+/// - `doc_starts` has fixed length `MAX_NUM_DOCS + 1 = 257` with valid
+///   prefix-sum entries for slots `0..=doc_lengths.len()` and sentinel `-1`
+///   for unused slots. The fixed length lets the GPU kernel emit a
+///   constant-size SMEM load.
+///
+/// # Panics
+///
+/// Panics if `doc_lengths.len() > MAX_NUM_DOCS` (256). The panic message
+/// starts with `"num_docs"` so callers can match it via
+/// `#[should_panic(expected = "num_docs")]`.
+pub fn build_segment_ids_and_doc_starts(doc_lengths: &[u32]) -> (Vec<u16>, Vec<i32>) {
+    assert!(
+        doc_lengths.len() <= MAX_NUM_DOCS,
+        "num_docs {} > MAX_NUM_DOCS {}",
+        doc_lengths.len(),
+        MAX_NUM_DOCS
+    );
+    let total: u32 = doc_lengths.iter().sum();
+    let mut segment_ids: Vec<u16> = Vec::with_capacity(total as usize);
+    let mut doc_starts = vec![-1i32; MAX_NUM_DOCS + 1];
+    let mut cursor: u32 = 0;
+    doc_starts[0] = 0;
+    for (k, &len) in doc_lengths.iter().enumerate() {
+        for _ in 0..len {
+            segment_ids.push(k as u16);
+        }
+        cursor += len;
+        doc_starts[k + 1] = cursor as i32;
+    }
+    (segment_ids, doc_starts)
 }
 
 /// Convert a `PackedBatch` into an NslDict with keys:
@@ -416,6 +478,41 @@ mod tests {
         .expect("pack_batch produced a batch");
 
         assert_eq!(batch.segment_ids, vec![0u16, 0, 0, 0]);
+    }
+
+    #[test]
+    fn pack_emits_doc_starts_with_sentinel_padding() {
+        // 3 documents of length [3, 2, 4] => doc_starts = [0, 3, 5, 9, -1, -1, ...]
+        let doc_lengths: Vec<u32> = vec![3, 2, 4];
+        let packed_len: u32 = doc_lengths.iter().sum();
+        let (segment_ids, doc_starts) = build_segment_ids_and_doc_starts(&doc_lengths);
+
+        assert_eq!(segment_ids.len(), packed_len as usize);
+        // first doc spans positions 0..3 with segment_id 0
+        assert_eq!(&segment_ids[0..3], &[0u16, 0, 0]);
+        // second doc spans positions 3..5 with segment_id 1
+        assert_eq!(&segment_ids[3..5], &[1u16, 1]);
+        // third doc spans positions 5..9 with segment_id 2
+        assert_eq!(&segment_ids[5..9], &[2u16, 2, 2, 2]);
+
+        // doc_starts fixed length MAX_NUM_DOCS+1 = 257
+        assert_eq!(doc_starts.len(), 257);
+        // valid slots
+        assert_eq!(doc_starts[0], 0);
+        assert_eq!(doc_starts[1], 3);
+        assert_eq!(doc_starts[2], 5);
+        assert_eq!(doc_starts[3], 9);
+        // sentinel slots
+        assert_eq!(doc_starts[4], -1);
+        assert_eq!(doc_starts[256], -1);
+    }
+
+    #[test]
+    #[should_panic(expected = "num_docs")]
+    fn pack_rejects_too_many_docs() {
+        // 257 single-token docs exceeds MAX_NUM_DOCS=256
+        let doc_lengths: Vec<u32> = vec![1; 257];
+        let _ = build_segment_ids_and_doc_starts(&doc_lengths);
     }
 
     #[test]
