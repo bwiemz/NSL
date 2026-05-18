@@ -19,7 +19,7 @@ use nsl_runtime::flash_attention::{
 
 /// PCA-FFI-1: `nsl_flash_attention_csha` accepts a trailing `doc_starts_ptr: i64`.
 ///
-/// Count: 24 base + 9 CSHA extras + 1 segment_ids_ptr + 1 doc_starts_ptr = 35 params.
+/// Count: 24 base + 9 CSHA extras + 1 segment_ids_ptr + 2 tier_b + 1 doc_starts_ptr = 37 params.
 #[test]
 fn csha_forward_ffi_accepts_trailing_doc_starts_ptr() {
     let _: extern "C" fn(
@@ -35,6 +35,8 @@ fn csha_forward_ffi_accepts_trailing_doc_starts_ptr() {
         i64, i64, i64,                  // rmsnorm_eps_bits, active_heads, d_model
         // PCA Tier A: segment_ids_ptr
         i64,
+        // Tier B extension (planner spec §4):
+        i64, i64,                       // tier_b_ptx_ptr, tier_b_name_ptr
         // PCA §4.3: doc_starts_ptr — the new trailing param under test.
         i64,
     ) -> i64 = nsl_flash_attention_csha;
@@ -59,6 +61,8 @@ fn csha_with_saves_ffi_accepts_trailing_doc_starts_ptr() {
         i64, i64, i64, i64, i64, i64,
         // PCA Tier A: segment_ids_ptr
         i64,
+        // Tier B extension (planner spec §4):
+        i64, i64,                       // tier_b_ptx_ptr, tier_b_name_ptr
         // PCA §4.3: doc_starts_ptr — the new trailing param under test.
         i64,
     ) -> i64 = nsl_flash_attention_csha_with_saves;
@@ -89,6 +93,8 @@ fn csha_backward_ffi_accepts_trailing_doc_starts_ptr() {
         i64,                            // dx_norm
         // PCA Tier A: segment_ids_ptr
         i64,
+        // Tier B extension (planner spec §4):
+        i64, i64,                       // tier_b_ptx_ptr, tier_b_name_ptr
         // PCA §4.3: doc_starts_ptr — the new trailing param under test.
         i64,
     ) -> i64 = nsl_flash_attention_csha_backward;
@@ -112,6 +118,8 @@ fn csha_forward_ffi_sentinel_zero_returns_minus_one_without_panic() {
         0, 0,
         // PCA Tier A: segment_ids_ptr (0 = unpacked).
         0,
+        // Tier B extension (planner spec §4): sentinels.
+        0, 0,
         // PCA §4.3: doc_starts_ptr (0 = identity positions).
         0,
     );

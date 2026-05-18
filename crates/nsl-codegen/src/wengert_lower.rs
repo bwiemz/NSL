@@ -585,6 +585,8 @@ fn emit_fused_forward_under_claim(
             // PCA Tier A: segment_ids_ptr — 0 for unpacked paths.
             // Sibling call site in expr/advanced.rs documents the wiring.
             null,
+            // Tier B extension (planner spec §4): sentinel 0 pair.
+            null, null,
             // PCA §4.3 Task 3+4: doc_starts_ptr — sentinel 0 preserves
             // identity-position semantics (RoPE reset disabled). Task 5
             // will swap in a real device pointer when the packing path
@@ -1922,6 +1924,8 @@ fn lower_single_op(
                     // Unpacked backward launches pass 0; segment_masked=true
                     // kernels will receive a real pointer once Task 5 wires it.
                     null,
+                    // Tier B extension (planner spec §4): sentinel 0 pair.
+                    null, null,
                     // PCA §4.3 Task 3+4: doc_starts_ptr trailing slot.
                     // Sentinel 0 preserves identity-position semantics for the
                     // backward kernel as well (matches the forward's reset
