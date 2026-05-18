@@ -1321,8 +1321,21 @@ mod backward_orchestrator_tests {
     #[test]
     fn synthesize_backward_with_tier_falls_back_to_scalar_in_phase1() {
         use crate::flash_attention::{CshaExtras, FlashAttentionConfig, RopeStyle};
+        // Small config so BOTH Tier B.2 dispatch (which triggers on
+        // hd ∈ {64, 128, 256} + level=2 + sm=80) AND the scalar v2
+        // backward fallback can accept it.
+        //
+        // Why not the canonical (bq=bkv=64, hd=128) config? Because
+        // scalar v2 backward's `backward_extra_bytes` at hd=128 alone
+        // exceeds the 99 KB SMEM cap (P+dS+dQ+dK+dV+V_in ~= 144 KB).
+        // Scalar v2 backward is therefore structurally incapable of
+        // handling hd=128 — which is precisely why Tier B.2 is the
+        // ONLY viable backward for production-scale configs, not an
+        // optimization. The fallback wrapper logic still needs to be
+        // exercised, so we use the smallest config that both paths
+        // accept.
         let cfg = FlashAttentionConfig {
-            block_q: 64, block_kv: 64, head_dim: 128,
+            block_q: 32, block_kv: 32, head_dim: 64,
             causal: true, paged: false,
             rope_q: false, rope_style: RopeStyle::HalfSplit,
             gqa_group_size: 1, tree_mask: false,
@@ -1330,10 +1343,10 @@ mod backward_orchestrator_tests {
             csha: Some(CshaExtras { level: 2, ..Default::default() }),
         };
         let result = synthesize_backward_with_tier(&cfg);
-        // Phase 1: tier_b2 emitter is a stub; the wrapper falls back to
-        // scalar v2. Scalar v2 should emit a non-empty PTX string for this
-        // config (it's the canonical bq=bkv=64 hd=128 case).
-        let ptx = result.expect("scalar v2 backward should accept canonical config");
+        // Phase 1: tier_b2 emitter is a stub; the wrapper falls back
+        // to scalar v2. Scalar v2 should emit a non-empty PTX string
+        // for this small config.
+        let ptx = result.expect("scalar v2 backward should accept small config");
         assert!(
             ptx.contains(".visible .entry"),
             "fallback PTX should be a valid kernel"
