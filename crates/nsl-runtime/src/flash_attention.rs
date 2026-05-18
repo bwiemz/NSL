@@ -983,8 +983,10 @@ pub extern "C" fn nsl_flash_attention_csha_with_saves(
         let grid_z = 1i64;
         // Tier B.1 launch geometry signal via kernel name suffix; see
         // `csha_block_x_for_kernel` and the matching comment in
-        // `nsl_flash_attention_csha`.
-        let block_x = csha_block_x_for_kernel(name_ptr);
+        // `nsl_flash_attention_csha`. Must use `effective_name_ptr` (the
+        // kernel actually launched) — when Tier B PCA dispatch swaps in
+        // a different variant, its name decides the block_x.
+        let block_x = csha_block_x_for_kernel(effective_name_ptr);
         let block_y = 1i64;
         let block_z = 1i64;
 
@@ -1024,6 +1026,37 @@ pub extern "C" fn nsl_flash_attention_csha_with_saves(
         let mut eps = f32::from_bits(rmsnorm_eps_bits as u32);
         let mut ah = active_heads as u32;
         let mut dm = d_model as u32;
+
+        // CSHA Tier B.1 production pre-pass — same orchestration as
+        // `nsl_flash_attention_csha`. When the dispatched kernel is a
+        // Tier B.1 variant (`_tier_b1_chunk<N>` suffix in its name) the
+        // host-side RMSNorm + narrow + chunkify runs on `x` and the
+        // narrow + col-major chunkify runs on Wq/Wk/Wv (cached
+        // process-globally), and the chunkified pointers are
+        // substituted before the kernel launch. The kernel itself was
+        // compiled with `skip_rmsnorm_prologue=true` so it reads the
+        // pre-pass'd x directly.
+        //
+        // `_prepass_handle` is RAII: its Drop runs `cuCtxSynchronize`
+        // and frees the per-call x-scratch. It MUST live until after
+        // `kernel_launch` returns.
+        let _prepass_handle = if let Some((nx, nwq, nwk, nwv, handle)) =
+            csha_tier_b1_prepass_substitute(
+                effective_name_ptr,
+                x, nw, wq, wk, wv,
+                seq_len, head_dim, d_model,
+                rmsnorm_eps_bits,
+            )
+        {
+            x = nx;
+            wq = nwq;
+            wk = nwk;
+            wv = nwv;
+            Some(handle)
+        } else {
+            None
+        };
+
         // Activation-save pointers: raw device buffers — pass through.
         let mut q_proj = q_proj_ptr as u64;
         let mut k_proj = k_proj_ptr as u64;
