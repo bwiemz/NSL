@@ -356,6 +356,17 @@ pub extern "C" fn nsl_grad_all_reduce(_grad_ptr: i64, _num_elems: i64) -> i64 {
 mod tests {
     use super::*;
     use std::ffi::c_void;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    // Tests that touch ZERO_CTX race on the shared global when run in
+    // parallel.  Serialize them with a module-local guard (same pattern as
+    // inspect_ffi.rs / health_ffi.rs) so `cargo test` is safe without
+    // requiring --test-threads=1 on the command line.
+    fn zero_serial_lock() -> MutexGuard<'static, ()> {
+        static SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
+        let m = SERIAL.get_or_init(|| Mutex::new(()));
+        m.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     #[test]
     fn test_zero_stage_parsing() {
@@ -385,6 +396,7 @@ mod tests {
 
     #[test]
     fn test_zero_ffi_lifecycle() {
+        let _serial = zero_serial_lock();
         // Ensure clean state
         {
             let mut guard = ZERO_CTX.lock().unwrap();
@@ -424,6 +436,7 @@ mod tests {
 
     #[test]
     fn test_zero_owns_param_not_initialized() {
+        let _serial = zero_serial_lock();
         {
             let mut guard = ZERO_CTX.lock().unwrap();
             *guard = None;
@@ -506,6 +519,7 @@ mod tests {
 
     #[test]
     fn test_partition_single_rank() {
+        let _serial = zero_serial_lock();
         // Ensure clean state
         {
             let mut guard = ZERO_CTX.lock().unwrap();

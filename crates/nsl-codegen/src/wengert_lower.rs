@@ -588,6 +588,11 @@ fn emit_fused_forward_under_claim(
             // PCA Tier A: segment_ids_ptr — read from the thread-local
             // packing registry (set by train block per step).
             seg_ids_ptr_v,
+            // Tier B extension (planner spec §4): sentinel 0 pair carries
+            // the Tier-B-on PTX variant.  Inactive in this @train fused
+            // forward path — the planner's dispatch decision is emitted
+            // at compile time, not via this CSHA forward launcher.
+            null, null,
             // PCA §4.3: doc_starts_ptr — read from the same registry.
             doc_starts_v,
         ],
@@ -1924,6 +1929,11 @@ fn lower_single_op(
                     // thread-local packing registry (same value the
                     // forward at line ~565 read on this step).
                     seg_ids_ptr_v,
+                    // Tier B extension (planner spec §4): sentinel 0 pair
+                    // matches the forward call above. Backward never
+                    // re-decides Tier B dispatch — it just consumes the
+                    // forward's saves, so sentinels here are correct.
+                    null, null,
                     // PCA §4.3: doc_starts_ptr — read from the same
                     // registry; matches the forward's effective_pos.
                     doc_starts_v,

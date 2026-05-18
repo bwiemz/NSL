@@ -168,9 +168,19 @@ pub unsafe extern "C" fn nsl_cfie_grammar_transition(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    // Tests that call nsl_cfie_ring_init / push / pop race on GLOBAL_RING
+    // when run in parallel.  Serialize them with a module-local guard.
+    fn cfie_serial_lock() -> MutexGuard<'static, ()> {
+        static SERIAL: OnceLock<Mutex<()>> = OnceLock::new();
+        let m = SERIAL.get_or_init(|| Mutex::new(()));
+        m.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     #[test]
     fn init_accepts_positive_capacity() {
+        let _serial = cfie_serial_lock();
         assert_eq!(nsl_cfie_ring_init(32), 0);
         assert_eq!(nsl_cfie_ring_init(0), -1);
         assert_eq!(nsl_cfie_ring_init(-1), -1);
@@ -178,6 +188,7 @@ mod tests {
 
     #[test]
     fn push_and_pop_roundtrip_through_ffi() {
+        let _serial = cfie_serial_lock();
         assert_eq!(nsl_cfie_ring_init(16), 0);
         assert_eq!(
             nsl_cfie_ring_push(42, 0x1000, 8, 128, 0, 0x0032_0032),
@@ -203,6 +214,7 @@ mod tests {
 
     #[test]
     fn pop_returns_zero_on_empty_ring() {
+        let _serial = cfie_serial_lock();
         assert_eq!(nsl_cfie_ring_init(16), 0);
         // Drain anything left from earlier tests.
         while nsl_cfie_ring_len() > 0 {
