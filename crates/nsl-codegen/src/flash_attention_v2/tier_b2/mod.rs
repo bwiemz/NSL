@@ -5,3 +5,5 @@
 //! Spec: docs/superpowers/specs/2026-05-18-csha-tier-b2-backward-design.md
 
 pub mod dispatch;
+
+pub use dispatch::BackwardTier;

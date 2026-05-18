@@ -456,10 +456,9 @@ pub fn plan_all(
 /// so Phase 2 can land the emitters without changing the cost-model.
 pub fn backward_dispatch_tier(
     config: &crate::flash_attention::FlashAttentionConfig,
-) -> crate::flash_attention_v2::tier_b2::dispatch::BackwardTier {
-    use crate::flash_attention_v2::tier_b2::dispatch::{
-        tier_b2_can_dispatch, BackwardTier,
-    };
+) -> crate::flash_attention_v2::tier_b2::BackwardTier {
+    use crate::flash_attention_v2::tier_b2::BackwardTier;
+    use crate::flash_attention_v2::tier_b2::dispatch::tier_b2_can_dispatch;
     match tier_b2_can_dispatch(config) {
         Ok(tier_b2) => tier_b2,
         Err(_) => BackwardTier::Scalar,

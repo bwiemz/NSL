@@ -120,6 +120,15 @@ mod tests {
     }
 
     #[test]
+    fn dispatches_at_hd64_sm80_level2() {
+        let result = tier_b2_can_dispatch(&cfg(64, 80, 2));
+        assert_eq!(
+            result,
+            Ok(BackwardTier::TierB2 { bq: 64, bkv: 64, chunk: 4 })
+        );
+    }
+
+    #[test]
     fn rejects_sm75_even_at_level2() {
         let result = tier_b2_can_dispatch(&cfg(128, 75, 2));
         assert_eq!(result, Err(DispatchReject::SmTooOld));
