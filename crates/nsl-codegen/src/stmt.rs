@@ -3776,6 +3776,80 @@ impl Compiler<'_> {
             let device_1 = builder.ins().iconst(cl_types::I64, 1);
             self.compile_call_by_name(builder, "nsl_tensor_prefetch", &[ids_tensor, device_1])?;
             self.compile_call_by_name(builder, "nsl_tensor_prefetch", &[lbl_tensor, device_1])?;
+
+            // CFTP §4.3 / Tier A activation (spec 2026-05-17): probe batch
+            // for segment_ids + doc_starts. When the DataLoader has
+            // packing=true, the packer (packing.rs::packed_batch_to_dict)
+            // emits both tensors per batch. Extract device pointers and
+            // stash them in the thread-local packing registry; the model's
+            // compiled @flash_attention call sites read them per launch.
+            //
+            // Probing at runtime (not codegen time) lets a single train
+            // block tolerate mixed-batch workloads or DataLoader
+            // implementations that conditionally emit segment_ids based
+            // on actual document structure. The probe is one CStr lookup
+            // — negligible cost vs kernel launches.
+            use cranelift_codegen::ir::condcodes::IntCC;
+            let k_seg = self.compile_string_literal(builder, "segment_ids")?;
+            let has_seg = self.compile_call_by_name(
+                builder,
+                "nsl_dict_contains",
+                &[batch_val, k_seg],
+            )?;
+            let has_seg_block = builder.create_block();
+            let no_seg_block = builder.create_block();
+            let after_block = builder.create_block();
+            let has_seg_cond = builder.ins().icmp_imm(IntCC::NotEqual, has_seg, 0);
+            builder.ins().brif(has_seg_cond, has_seg_block, &[], no_seg_block, &[]);
+
+            // Packing-enabled batch: extract device pointers and set the
+            // registry. Both segment_ids and doc_starts must be present
+            // together — the packer emits them as a pair.
+            builder.switch_to_block(has_seg_block);
+            builder.seal_block(has_seg_block);
+            let seg_tensor = self.compile_call_by_name(
+                builder,
+                "nsl_dict_get_str",
+                &[batch_val, k_seg],
+            )?;
+            let k_doc = self.compile_string_literal(builder, "doc_starts")?;
+            let doc_tensor = self.compile_call_by_name(
+                builder,
+                "nsl_dict_get_str",
+                &[batch_val, k_doc],
+            )?;
+            let seg_data_ptr = self.compile_call_by_name(
+                builder,
+                "nsl_tensor_data_ptr",
+                &[seg_tensor],
+            )?;
+            let doc_data_ptr = self.compile_call_by_name(
+                builder,
+                "nsl_tensor_data_ptr",
+                &[doc_tensor],
+            )?;
+            self.compile_call_by_name(
+                builder,
+                "nsl_packing_metadata_set",
+                &[seg_data_ptr, doc_data_ptr],
+            )?;
+            builder.ins().jump(after_block, &[]);
+
+            // Packing-disabled batch: clear the registry so stale state
+            // from a prior step doesn't leak. Setting to (0, 0) is the
+            // spec-defined sentinel for "identity path" at the kernel.
+            builder.switch_to_block(no_seg_block);
+            builder.seal_block(no_seg_block);
+            let zero = builder.ins().iconst(cl_types::I64, 0);
+            self.compile_call_by_name(
+                builder,
+                "nsl_packing_metadata_set",
+                &[zero, zero],
+            )?;
+            builder.ins().jump(after_block, &[]);
+
+            builder.switch_to_block(after_block);
+            builder.seal_block(after_block);
         }
 
         let prev_batch_scope = state.flags.in_dataloader_batch_scope;

@@ -469,6 +469,16 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
         &[types::I64, types::I64, types::I64],
         Some(types::I64),
     ),
+    // CFTP §4.3 / Tier A activation — extract raw device pointer from
+    // NslTensor* for use by nsl_packing_metadata_set. Returns 0 when
+    // tensor_ptr == 0. See spec 2026-05-17-pca-rope-activation-design.md.
+    ("nsl_tensor_data_ptr", &[types::I64], Some(types::I64)),
+    // CFTP §4.3 / Tier A activation — thread-local registry for the
+    // segment_ids/doc_starts pointers. Train block sets per step;
+    // CSHA call sites read.
+    ("nsl_packing_metadata_set", &[types::I64, types::I64], None),
+    ("nsl_packing_metadata_get_segment_ids", &[], Some(types::I64)),
+    ("nsl_packing_metadata_get_doc_starts", &[], Some(types::I64)),
     // In-place mutation ops (M14)
     ("nsl_tensor_copy_data", &[types::I64, types::I64], None),
     ("nsl_tensor_add_inplace", &[types::I64, types::I64], None),

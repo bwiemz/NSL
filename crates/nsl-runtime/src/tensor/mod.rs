@@ -1265,6 +1265,25 @@ pub extern "C" fn nsl_tensor_clone_if_valid(ptr: i64) -> i64 {
 
 // === In-place mutation ops (NOT taped -- used outside grad blocks) ===
 
+/// Extract the raw `data` field (device pointer) from an `NslTensor`.
+///
+/// Used by the train block (`stmt.rs::compile_train_block`) to forward
+/// `batch["segment_ids"]` and `batch["doc_starts"]` device pointers to
+/// `nsl_packing_metadata_set` per step (CFTP §4.3 activation, spec
+/// `2026-05-17-pca-rope-activation-design.md`).
+///
+/// Returns 0 when `tensor_ptr == 0` (matches the runtime's null-passthrough
+/// convention used at other FFI entry points). Returns whatever raw value
+/// the `data` field holds otherwise — no validation, same risk class as
+/// `csha_tensor_data_ptr`.
+#[no_mangle]
+pub extern "C" fn nsl_tensor_data_ptr(tensor_ptr: i64) -> i64 {
+    if tensor_ptr == 0 {
+        return 0;
+    }
+    unsafe { (*(tensor_ptr as *const NslTensor)).data as i64 }
+}
+
 #[no_mangle]
 pub extern "C" fn nsl_tensor_copy_data(dst_ptr: i64, src_ptr: i64) {
     if dst_ptr == 0 || src_ptr == 0 {

@@ -126,6 +126,7 @@ pub mod profiling;
 pub mod kernel_profiler;
 pub mod flash_attention;
 pub mod pca_tier_b_runtime;
+pub mod pca_rope_runtime;
 pub mod serving;
 pub mod tensor_parallel;
 pub mod moe;

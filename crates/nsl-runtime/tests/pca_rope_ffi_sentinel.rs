@@ -35,6 +35,8 @@ fn csha_forward_ffi_accepts_trailing_doc_starts_ptr() {
         i64, i64, i64,                  // rmsnorm_eps_bits, active_heads, d_model
         // PCA Tier A: segment_ids_ptr
         i64,
+        // PCA Tier B Planner (PR #175): tier_b_ptx_ptr, tier_b_name_ptr.
+        i64, i64,
         // PCA §4.3: doc_starts_ptr — the new trailing param under test.
         i64,
     ) -> i64 = nsl_flash_attention_csha;
@@ -59,6 +61,8 @@ fn csha_with_saves_ffi_accepts_trailing_doc_starts_ptr() {
         i64, i64, i64, i64, i64, i64,
         // PCA Tier A: segment_ids_ptr
         i64,
+        // PCA Tier B Planner (PR #175): tier_b_ptx_ptr, tier_b_name_ptr.
+        i64, i64,
         // PCA §4.3: doc_starts_ptr — the new trailing param under test.
         i64,
     ) -> i64 = nsl_flash_attention_csha_with_saves;
@@ -89,6 +93,8 @@ fn csha_backward_ffi_accepts_trailing_doc_starts_ptr() {
         i64,                            // dx_norm
         // PCA Tier A: segment_ids_ptr
         i64,
+        // PCA Tier B Planner (PR #175): tier_b_ptx_ptr, tier_b_name_ptr.
+        i64, i64,
         // PCA §4.3: doc_starts_ptr — the new trailing param under test.
         i64,
     ) -> i64 = nsl_flash_attention_csha_backward;
@@ -112,6 +118,8 @@ fn csha_forward_ffi_sentinel_zero_returns_minus_one_without_panic() {
         0, 0,
         // PCA Tier A: segment_ids_ptr (0 = unpacked).
         0,
+        // PCA Tier B Planner (PR #175): tier_b_ptx_ptr, tier_b_name_ptr.
+        0, 0,
         // PCA §4.3: doc_starts_ptr (0 = identity positions).
         0,
     );
