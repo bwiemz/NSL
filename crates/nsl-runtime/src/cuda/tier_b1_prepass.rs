@@ -289,9 +289,19 @@ use std::sync::Mutex;
 ///
 /// **Key invariant:** the input pointer is the (raw GPU device-pointer)
 /// base address of the f32 weight tile. The kernel must not be called
-/// with two different chunkified layouts for the same `(in_ptr, dm,
-/// hd, chunk)` tuple — but in practice all four are derived from the
-/// model config so there's no ambiguity.
+/// with two different chunkified layouts for the same `(ctx, in_ptr,
+/// dm, hd, chunk)` tuple — but in practice all four are derived from
+/// the model config so there's no ambiguity.
+///
+/// **Context safety:** the key includes the current `CUcontext` (as
+/// `u64`) so cache hits only return device pointers allocated in the
+/// same CUDA context. The codebase today uses a single primary
+/// context retained at startup, but if a caller ever drives the FFI
+/// from a thread with a different active context, the cache will not
+/// hand out a pointer that belongs to a different address space.
+/// If `cuCtxGetCurrent` fails or returns null, lookups return None
+/// (the caller will then allocate a fresh per-call scratch — slower
+/// but correct).
 ///
 /// **Lifetime:** entries hold owned `cuMemAlloc`'d device buffers that
 /// live until process exit. This intentionally leaks: for inference
@@ -300,6 +310,7 @@ use std::sync::Mutex;
 #[cfg(feature = "cuda")]
 #[derive(Eq, PartialEq, Hash, Clone, Copy)]
 struct WCacheKey {
+    ctx: u64,
     in_ptr: u64,
     d_model: u32,
     hd: u32,
@@ -312,11 +323,33 @@ fn w_cache() -> &'static Mutex<HashMap<WCacheKey, u64>> {
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Look up `(in_ptr, dm, hd, chunk)` in the global W cache. Returns
-/// the chunkified GPU pointer on hit. On miss, allocates a GPU
+/// Read the currently-active CUDA context for the calling thread.
+/// Returns `None` if no context is current, or if the driver call
+/// fails. Used as part of the W cache key so the cache cannot return a
+/// device pointer allocated in a different context.
+#[cfg(feature = "cuda")]
+fn current_cuda_context() -> Option<u64> {
+    let mut ctx: cudarc::driver::sys::CUcontext = std::ptr::null_mut();
+    let rc = unsafe { cudarc::driver::sys::cuCtxGetCurrent(&mut ctx) };
+    if rc as u32 != 0 || ctx.is_null() {
+        None
+    } else {
+        Some(ctx as u64)
+    }
+}
+
+/// Look up `(ctx, in_ptr, dm, hd, chunk)` in the global W cache.
+/// Returns the chunkified GPU pointer on hit. On miss, allocates a GPU
 /// scratch buffer, launches `launch_w_prepass`, inserts into the
-/// cache, and returns the new pointer. Returns `None` on allocation
-/// or kernel-launch failure.
+/// cache (when a context is current), and returns the new pointer.
+/// Returns `None` only on allocation or kernel-launch failure.
+///
+/// When `cuCtxGetCurrent` reports no current context, lookup and
+/// insertion are skipped (so the cache cannot return or remember a
+/// pointer that belongs to a different address space), but the
+/// allocation and pre-pass still run so the caller gets a valid
+/// chunkified pointer. The result simply isn't cached — a cost only
+/// paid on the (degraded) no-context path.
 #[cfg(feature = "cuda")]
 pub(crate) fn w_chunkified_cached(
     in_ptr: u64,
@@ -324,14 +357,18 @@ pub(crate) fn w_chunkified_cached(
     hd: u64,
     chunk: u64,
 ) -> Option<u64> {
-    let key = WCacheKey {
-        in_ptr,
-        d_model: d_model as u32,
-        hd: hd as u32,
-        chunk: chunk as u32,
-    };
-    if let Some(&p) = w_cache().lock().unwrap().get(&key) {
-        return Some(p);
+    let ctx_opt = current_cuda_context();
+    if let Some(ctx) = ctx_opt {
+        let key = WCacheKey {
+            ctx,
+            in_ptr,
+            d_model: d_model as u32,
+            hd: hd as u32,
+            chunk: chunk as u32,
+        };
+        if let Some(&p) = w_cache().lock().unwrap().get(&key) {
+            return Some(p);
+        }
     }
     let n_chunks = d_model / chunk;
     let bytes = (n_chunks * hd * chunk * 2) as usize;
@@ -341,7 +378,6 @@ pub(crate) fn w_chunkified_cached(
     }
     let rc = launch_w_prepass(in_ptr, scratch as u64, d_model, hd, chunk);
     if rc as u32 != 0 {
-        // Free the failed allocation; do NOT insert into cache.
         unsafe {
             let _ = cudarc::driver::sys::cuMemFree_v2(
                 scratch as cudarc::driver::sys::CUdeviceptr,
@@ -349,7 +385,16 @@ pub(crate) fn w_chunkified_cached(
         }
         return None;
     }
-    w_cache().lock().unwrap().insert(key, scratch as u64);
+    if let Some(ctx) = ctx_opt {
+        let key = WCacheKey {
+            ctx,
+            in_ptr,
+            d_model: d_model as u32,
+            hd: hd as u32,
+            chunk: chunk as u32,
+        };
+        w_cache().lock().unwrap().insert(key, scratch as u64);
+    }
     Some(scratch as u64)
 }
 

@@ -176,46 +176,36 @@ SCATTER_DONE:
     bytes
 }
 
-/// Select optimal tile size for expert batched GEMM based on problem size and GPU.
+/// Select tile size for expert batched GEMM based on problem size and GPU.
 ///
-/// Returns `(tile_m, tile_n, use_mma)`.
+/// Returns `(tile_m, tile_n)`. Tensor-core path was deleted (see PR
+/// notes — the inline MMA fragment loader was structurally wrong
+/// per the same m16n8k16 lane-mapping bug that bit CSHA Tier B.1).
+/// Future MoE MMA work should use the validated `matmul_mma::emit_load_*`
+/// helpers directly. For now all configurations use the scalar 16x16
+/// path; the `gpu_sm` argument is accepted but ignored to keep the
+/// call sites stable.
 pub fn select_moe_gemm_tile(
-    expert_m: usize,
-    expert_n: usize,
+    _expert_m: usize,
+    _expert_n: usize,
     _expert_k: usize,
-    gpu_sm: u32,
-) -> (usize, usize, bool) {
-    // Large matrices on A100+ -> 128x128 MMA tiles
-    if gpu_sm >= 80 && expert_m >= 128 && expert_n >= 128 {
-        return (128, 128, true);
-    }
-    // Medium matrices on A100+ -> 64x64 MMA tiles
-    if gpu_sm >= 80 && expert_m >= 64 && expert_n >= 64 {
-        return (64, 64, true);
-    }
-    // Small matrices or older GPUs -> 16x16 scalar
-    (16, 16, false)
+    _gpu_sm: u32,
+) -> (usize, usize) {
+    (16, 16)
 }
 
 /// Generate PTX for the batched expert GEMM kernel with configurable tile size.
 ///
-/// Uses blockIdx.z to select expert.
-///
-/// `tile_size`: side length of the square tile (16 for scalar, 64/128 for MMA)
-/// `use_mma`: if true, emit `mma.sync.aligned.m16n8k16` (sm_80+); else scalar fma
-///
-/// The scalar path uses the original 16x16 tiled matmul with `fma.rn.f32`.
-/// The MMA path loads f32 tiles from global to shared memory, converts to f16 on
-/// the fly for MMA fragment loads, and accumulates in f32 accumulators.
-pub fn gen_expert_batched_gemm_ptx_tiled(tile_size: usize, use_mma: bool) -> Vec<u8> {
+/// Uses blockIdx.z to select expert. Always emits the 16x16 scalar
+/// `fma.rn.f32` body — the MMA path was deleted (see `select_moe_gemm_tile`).
+/// The `tile_size` arg is kept so tests can exercise non-canonical sizes.
+pub fn gen_expert_batched_gemm_ptx_tiled(tile_size: usize) -> Vec<u8> {
     use std::fmt::Write;
 
     let mut ptx = String::with_capacity(8192);
 
-    // Header — MMA path requires sm_80
-    let target = if use_mma { "sm_80" } else { "sm_52" };
     writeln!(ptx, ".version 7.0").unwrap();
-    writeln!(ptx, ".target {target}").unwrap();
+    writeln!(ptx, ".target sm_52").unwrap();
     writeln!(ptx, ".address_size 64").unwrap();
     writeln!(ptx).unwrap();
 
@@ -229,24 +219,15 @@ pub fn gen_expert_batched_gemm_ptx_tiled(tile_size: usize, use_mma: bool) -> Vec
     writeln!(ptx, "    .param .u32 intermediate_dim").unwrap();
     writeln!(ptx, ") {{").unwrap();
 
-    // Common registers
     writeln!(ptx, "    .reg .u32 %r<32>;").unwrap();
     writeln!(ptx, "    .reg .u64 %rd<24>;").unwrap();
     writeln!(ptx, "    .reg .f32 %f<32>;").unwrap();
     writeln!(ptx, "    .reg .pred %p<8>;").unwrap();
 
-    // Shared memory — tile_size * tile_size elements
     let smem_elems = tile_size * tile_size;
-    if use_mma {
-        // MMA path: store as f32 in shared, convert to f16 on fragment load
-        writeln!(ptx, "    .shared .align 16 .f32 tile_A[{smem_elems}];").unwrap();
-        writeln!(ptx, "    .shared .align 16 .f32 tile_B[{smem_elems}];").unwrap();
-    } else {
-        writeln!(ptx, "    .shared .align 4 .f32 tile_A[{smem_elems}];").unwrap();
-        writeln!(ptx, "    .shared .align 4 .f32 tile_B[{smem_elems}];").unwrap();
-    }
+    writeln!(ptx, "    .shared .align 4 .f32 tile_A[{smem_elems}];").unwrap();
+    writeln!(ptx, "    .shared .align 4 .f32 tile_B[{smem_elems}];").unwrap();
 
-    // Expert assignment from blockIdx.z + param loads (same for both paths)
     writeln!(ptx, "    mov.u32 %r0, %ctaid.z;  // expert_id").unwrap();
     writeln!(ptx, "    mov.u32 %r1, %ctaid.x;  // m-tile index").unwrap();
     writeln!(ptx, "    mov.u32 %r2, %ctaid.y;  // n-tile index").unwrap();
@@ -261,7 +242,6 @@ pub fn gen_expert_batched_gemm_ptx_tiled(tile_size: usize, use_mma: bool) -> Vec
     writeln!(ptx, "    ld.param.u32 %r6, [intermediate_dim];").unwrap();
     writeln!(ptx).unwrap();
 
-    // Load expert boundaries
     writeln!(ptx, "    // Load expert boundaries").unwrap();
     writeln!(ptx, "    cvt.u64.u32 %rd4, %r0;").unwrap();
     writeln!(ptx, "    mul.lo.u64 %rd5, %rd4, 4;").unwrap();
@@ -274,11 +254,7 @@ pub fn gen_expert_batched_gemm_ptx_tiled(tile_size: usize, use_mma: bool) -> Vec
     writeln!(ptx, "    @%p0 bra GEMM_DONE;").unwrap();
     writeln!(ptx).unwrap();
 
-    if use_mma {
-        emit_mma_gemm_body(&mut ptx, tile_size);
-    } else {
-        emit_scalar_gemm_body(&mut ptx, tile_size);
-    }
+    emit_scalar_gemm_body(&mut ptx, tile_size);
 
     writeln!(ptx, "GEMM_DONE:").unwrap();
     writeln!(ptx, "    ret;").unwrap();
@@ -432,225 +408,12 @@ fn emit_scalar_gemm_body(ptx: &mut String, tile_size: usize) {
     writeln!(ptx, "    st.global.f32 [%rd13], %f0;").unwrap();
 }
 
-/// Emit the MMA-accelerated (m16n8k16) tiled GEMM body.
-///
-/// Processes one m-tile-row at a time to manage register pressure.
-/// Each warp computes one 16x8 output tile per MMA instruction.
-/// Tiles are loaded from shared memory (f32), converted to f16 for MMA.
-fn emit_mma_gemm_body(ptx: &mut String, tile_size: usize) {
-    use std::fmt::Write;
 
-    let mma_n: usize = 8;
-    let mma_k: usize = 16;
-    let n_tiles = tile_size / mma_n;
-
-    writeln!(
-        ptx,
-        "    // MMA tiled GEMM (tile_size={tile_size}, m16n8k16)"
-    )
-    .unwrap();
-
-    // MMA-specific registers
-    writeln!(
-        ptx,
-        "    .reg .b32 %aq_0, %aq_1, %aq_2, %aq_3;  // A-fragment"
-    )
-    .unwrap();
-    for nt in 0..n_tiles {
-        writeln!(
-            ptx,
-            "    .reg .b32 %bk_{nt}_0, %bk_{nt}_1;      // B-fragment n={nt}"
-        )
-        .unwrap();
-    }
-    for nt in 0..n_tiles {
-        writeln!(ptx, "    .reg .f32 %acc_{nt}_0, %acc_{nt}_1, %acc_{nt}_2, %acc_{nt}_3;  // accumulator n={nt}").unwrap();
-    }
-    writeln!(ptx, "    .reg .f16 %mma_h0, %mma_h1;     // f32->f16 temps").unwrap();
-    writeln!(ptx, "    .reg .u32 %mma_addr, %mma_k_blk;").unwrap();
-    writeln!(ptx, "    .reg .u32 %mma_laneid, %mma_a_row;").unwrap();
-    writeln!(ptx, "    .reg .f32 %mma_f32_lo, %mma_f32_hi;").unwrap();
-    writeln!(ptx, "    .reg .pred %mma_pk;").unwrap();
-    writeln!(ptx).unwrap();
-
-    // Compute laneid and A-row mapping
-    writeln!(ptx, "    mov.u32 %mma_laneid, %tid.x;").unwrap();
-    writeln!(ptx, "    and.b32 %mma_laneid, %mma_laneid, 31;").unwrap();
-    writeln!(ptx, "    // A-row = (laneid % 4) * 2 + (laneid / 16)").unwrap();
-    writeln!(ptx, "    and.b32 %mma_a_row, %mma_laneid, 3;").unwrap();
-    writeln!(ptx, "    shl.b32 %mma_a_row, %mma_a_row, 1;").unwrap();
-    writeln!(
-        ptx,
-        "    shr.u32 %mma_addr, %mma_laneid, 4;  // temp = laneid/16"
-    )
-    .unwrap();
-    writeln!(ptx, "    add.u32 %mma_a_row, %mma_a_row, %mma_addr;").unwrap();
-    writeln!(ptx).unwrap();
-
-    // Global row = blockIdx.x * tile_size + mma_a_row (for output store)
-    writeln!(ptx, "    mul.lo.u32 %r10, %r1, {tile_size};").unwrap();
-    writeln!(ptx, "    add.u32 %r10, %r10, %mma_a_row; // global row").unwrap();
-    writeln!(ptx, "    setp.ge.u32 %p1, %r10, %r9;     // row OOB?").unwrap();
-    writeln!(ptx).unwrap();
-
-    // Zero accumulators
-    for nt in 0..n_tiles {
-        for r in 0..4 {
-            writeln!(ptx, "    mov.f32 %acc_{nt}_{r}, 0.0;").unwrap();
-        }
-    }
-
-    // Outer K-tile loop (stride by tile_size through hidden_dim)
-    writeln!(ptx, "    mov.u32 %r12, 0;                // k_outer").unwrap();
-    writeln!(ptx, "K_OUTER_LOOP:").unwrap();
-    writeln!(ptx, "    setp.ge.u32 %p3, %r12, %r5;").unwrap();
-    writeln!(ptx, "    @%p3 bra K_OUTER_DONE;").unwrap();
-    writeln!(ptx).unwrap();
-
-    // Cooperative load of A and B tiles into shared memory
-    // Each thread loads tile_size*tile_size/blockDim elements
-    writeln!(
-        ptx,
-        "    // Cooperative tile load (A and B) into shared memory"
-    )
-    .unwrap();
-    writeln!(ptx, "    cvt.u64.u32 %rd8, %r3;          // tid.x").unwrap();
-    writeln!(ptx, "    cvt.u64.u32 %rd9, %r4;          // tid.y").unwrap();
-    // Simplified: each thread loads one element of A and one of B per iteration
-    // Full cooperative load would loop, but for clarity:
-    writeln!(
-        ptx,
-        "    // (cooperative load logic — each thread loads multiple elements)"
-    )
-    .unwrap();
-    writeln!(ptx, "    bar.sync 0;").unwrap();
-    writeln!(ptx).unwrap();
-
-    // Inner K-block loop (MMA_K=16 at a time within the tile)
-    writeln!(ptx, "    mov.u32 %mma_k_blk, 0;          // k_inner").unwrap();
-    writeln!(ptx, "MMA_K_INNER:").unwrap();
-    writeln!(ptx, "    setp.ge.u32 %mma_pk, %mma_k_blk, {tile_size};").unwrap();
-    writeln!(ptx, "    @%mma_pk bra MMA_K_DONE;").unwrap();
-    writeln!(ptx).unwrap();
-
-    // Load A-fragment from shared memory (f32->f16 conversion)
-    writeln!(ptx, "    // Load A-fragment from tile_A, convert f32->f16").unwrap();
-    for i in 0..4 {
-        let k_pair = i * 4;
-        writeln!(
-            ptx,
-            "    mul.lo.u32 %mma_addr, %mma_a_row, {};  // row * tile_size * 4",
-            tile_size * 4
-        )
-        .unwrap();
-        writeln!(
-            ptx,
-            "    add.u32 %mma_addr, %mma_addr, {};      // + k_pair={} * 4 bytes",
-            k_pair * 4,
-            k_pair
-        )
-        .unwrap();
-        writeln!(ptx, "    // Offset by k_inner block").unwrap();
-        writeln!(ptx, "    mul.lo.u32 %r15, %mma_k_blk, 4;").unwrap();
-        writeln!(
-            ptx,
-            "    add.u32 %mma_addr, %mma_addr, %r15;    // + k_inner offset"
-        )
-        .unwrap();
-        writeln!(ptx, "    ld.shared.f32 %mma_f32_lo, [tile_A + %mma_addr];").unwrap();
-        writeln!(ptx, "    add.u32 %mma_addr, %mma_addr, 4;").unwrap();
-        writeln!(ptx, "    ld.shared.f32 %mma_f32_hi, [tile_A + %mma_addr];").unwrap();
-        writeln!(ptx, "    cvt.rn.f16.f32 %mma_h0, %mma_f32_lo;").unwrap();
-        writeln!(ptx, "    cvt.rn.f16.f32 %mma_h1, %mma_f32_hi;").unwrap();
-        writeln!(ptx, "    mov.b32 %aq_{i}, {{%mma_h0, %mma_h1}};").unwrap();
-    }
-    writeln!(ptx).unwrap();
-
-    // Load B-fragments for each n-tile
-    for nt in 0..n_tiles {
-        writeln!(ptx, "    // Load B-fragment for n_tile={nt}").unwrap();
-        for bi in 0..2 {
-            let k_pair = bi * 8;
-            writeln!(
-                ptx,
-                "    mul.lo.u32 %mma_addr, %mma_a_row, {};",
-                tile_size * 4
-            )
-            .unwrap();
-            writeln!(
-                ptx,
-                "    add.u32 %mma_addr, %mma_addr, {};",
-                nt * mma_n * 4 + k_pair * 4
-            )
-            .unwrap();
-            writeln!(ptx, "    mul.lo.u32 %r15, %mma_k_blk, 4;").unwrap();
-            writeln!(ptx, "    add.u32 %mma_addr, %mma_addr, %r15;").unwrap();
-            writeln!(ptx, "    ld.shared.f32 %mma_f32_lo, [tile_B + %mma_addr];").unwrap();
-            writeln!(ptx, "    add.u32 %mma_addr, %mma_addr, 4;").unwrap();
-            writeln!(ptx, "    ld.shared.f32 %mma_f32_hi, [tile_B + %mma_addr];").unwrap();
-            writeln!(ptx, "    cvt.rn.f16.f32 %mma_h0, %mma_f32_lo;").unwrap();
-            writeln!(ptx, "    cvt.rn.f16.f32 %mma_h1, %mma_f32_hi;").unwrap();
-            writeln!(ptx, "    mov.b32 %bk_{nt}_{bi}, {{%mma_h0, %mma_h1}};").unwrap();
-        }
-    }
-    writeln!(ptx).unwrap();
-
-    // Issue MMA for each n-tile
-    for nt in 0..n_tiles {
-        writeln!(ptx, "    mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32").unwrap();
-        writeln!(
-            ptx,
-            "        {{%acc_{nt}_0, %acc_{nt}_1, %acc_{nt}_2, %acc_{nt}_3}},"
-        )
-        .unwrap();
-        writeln!(ptx, "        {{%aq_0, %aq_1, %aq_2, %aq_3}},").unwrap();
-        writeln!(ptx, "        {{%bk_{nt}_0, %bk_{nt}_1}},").unwrap();
-        writeln!(
-            ptx,
-            "        {{%acc_{nt}_0, %acc_{nt}_1, %acc_{nt}_2, %acc_{nt}_3}};"
-        )
-        .unwrap();
-    }
-    writeln!(ptx).unwrap();
-
-    // K-inner loop back
-    writeln!(ptx, "    add.u32 %mma_k_blk, %mma_k_blk, {mma_k};").unwrap();
-    writeln!(ptx, "    bra MMA_K_INNER;").unwrap();
-    writeln!(ptx, "MMA_K_DONE:").unwrap();
-    writeln!(ptx).unwrap();
-
-    // K-outer loop back
-    writeln!(ptx, "    add.u32 %r12, %r12, {tile_size};").unwrap();
-    writeln!(ptx, "    bra K_OUTER_LOOP;").unwrap();
-    writeln!(ptx, "K_OUTER_DONE:").unwrap();
-    writeln!(ptx).unwrap();
-
-    // Store accumulators to global memory
-    writeln!(ptx, "    @%p1 bra GEMM_DONE;  // row OOB").unwrap();
-    writeln!(ptx, "    // Store output tile from MMA accumulators").unwrap();
-    for nt in 0..n_tiles {
-        for r in 0..4 {
-            let col = nt * mma_n + r * 2; // approximate column mapping
-            writeln!(ptx, "    // acc_{nt}_{r} -> output[row, col={col}]").unwrap();
-            writeln!(ptx, "    add.u32 %r22, %r7, %r10;").unwrap();
-            writeln!(ptx, "    mul.lo.u32 %r22, %r22, %r6;").unwrap();
-            writeln!(ptx, "    add.u32 %r22, %r22, {};", col).unwrap();
-            // Add n-tile base from blockIdx.y
-            writeln!(ptx, "    mul.lo.u32 %r23, %r2, {tile_size};").unwrap();
-            writeln!(ptx, "    add.u32 %r22, %r22, %r23;").unwrap();
-            writeln!(ptx, "    cvt.u64.u32 %rd12, %r22;").unwrap();
-            writeln!(ptx, "    mul.lo.u64 %rd12, %rd12, 4;").unwrap();
-            writeln!(ptx, "    add.u64 %rd13, %rd2, %rd12;").unwrap();
-            writeln!(ptx, "    st.global.f32 [%rd13], %acc_{nt}_{r};").unwrap();
-        }
-    }
-}
-
-/// Generate PTX for the batched expert GEMM kernel (16x16 scalar, backwards compatible).
+/// Generate PTX for the batched expert GEMM kernel (16x16 scalar).
 ///
 /// This is the default entry point used by `all_moe_kernels()`.
 pub fn gen_expert_batched_gemm_ptx() -> Vec<u8> {
-    gen_expert_batched_gemm_ptx_tiled(16, false)
+    gen_expert_batched_gemm_ptx_tiled(16)
 }
 
 /// Generate PTX for the MoE weighted gather kernel.
@@ -818,26 +581,20 @@ mod tests {
     }
 
     #[test]
-    fn test_moe_tile_selection() {
-        // Large on A100 -> 128x128 MMA
-        assert_eq!(select_moe_gemm_tile(256, 512, 512, 80), (128, 128, true));
-
-        // Medium on A100 -> 64x64 MMA
-        assert_eq!(select_moe_gemm_tile(64, 128, 128, 80), (64, 64, true));
-
-        // Small on A100 -> 16x16 scalar
-        assert_eq!(select_moe_gemm_tile(16, 32, 64, 80), (16, 16, false));
-
-        // Any size on pre-Ampere -> 16x16 scalar
-        assert_eq!(select_moe_gemm_tile(256, 512, 512, 70), (16, 16, false));
-
-        // H100 large -> 128x128 MMA
-        assert_eq!(select_moe_gemm_tile(256, 512, 512, 90), (128, 128, true));
+    fn test_moe_tile_selection_is_scalar_only() {
+        // The MMA path was removed; tile selection always returns the
+        // 16x16 scalar shape until a future MoE wiring uses the
+        // validated `matmul_mma` helpers.
+        assert_eq!(select_moe_gemm_tile(256, 512, 512, 80), (16, 16));
+        assert_eq!(select_moe_gemm_tile(64, 128, 128, 80), (16, 16));
+        assert_eq!(select_moe_gemm_tile(16, 32, 64, 80), (16, 16));
+        assert_eq!(select_moe_gemm_tile(256, 512, 512, 70), (16, 16));
+        assert_eq!(select_moe_gemm_tile(256, 512, 512, 90), (16, 16));
     }
 
     #[test]
     fn test_moe_batched_gemm_scalar_16x16() {
-        let ptx_bytes = gen_expert_batched_gemm_ptx_tiled(16, false);
+        let ptx_bytes = gen_expert_batched_gemm_ptx_tiled(16);
         let ptx = std::str::from_utf8(&ptx_bytes[..ptx_bytes.len() - 1]).unwrap();
 
         assert!(ptx.contains("expert_batched_gemm"), "kernel name");
@@ -856,38 +613,21 @@ mod tests {
     }
 
     #[test]
-    fn test_moe_batched_gemm_mma_64x64() {
-        let ptx_bytes = gen_expert_batched_gemm_ptx_tiled(64, true);
-        let ptx = std::str::from_utf8(&ptx_bytes[..ptx_bytes.len() - 1]).unwrap();
-
-        assert!(ptx.contains("expert_batched_gemm"), "kernel name");
-        assert!(
-            ptx.contains("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32"),
-            "64x64 MMA tiles should use tensor core instructions"
-        );
-        assert!(ptx.contains(".target sm_80"), "MMA targets sm_80");
-        assert!(ptx.contains("cvt.rn.f16.f32"), "must convert f32 -> f16");
-        assert!(ptx.contains("%aq_"), "A-fragment registers");
-        assert!(ptx.contains("%bk_"), "B-fragment registers");
-        assert!(ptx.contains("%acc_"), "accumulator registers");
-
-        // 64/8 = 8 n-tiles, so 8 MMA instructions per K-inner iteration
-        let mma_count = ptx.matches("mma.sync.aligned").count();
-        assert_eq!(
-            mma_count, 8,
-            "8 MMA instructions for 64x64 tile (8 n-tiles)"
-        );
-    }
-
-    #[test]
-    fn test_moe_batched_gemm_mma_128x128() {
-        let ptx_bytes = gen_expert_batched_gemm_ptx_tiled(128, true);
-        let ptx = std::str::from_utf8(&ptx_bytes[..ptx_bytes.len() - 1]).unwrap();
-
-        assert!(ptx.contains("mma.sync.aligned"), "128x128 should use MMA");
-        // 128/8 = 16 n-tiles
-        let mma_count = ptx.matches("mma.sync.aligned").count();
-        assert_eq!(mma_count, 16, "16 MMA instructions for 128x128 tile");
+    fn test_moe_batched_gemm_mma_path_is_gone() {
+        // Belt-and-braces gate: no caller of moe_kernels can produce
+        // mma.sync, regardless of tile size. If MMA support is added
+        // back, it must go through `matmul_mma::emit_load_*_fragment_smem`
+        // (validated end-to-end by `matmul_mma_single_mma_e2e` at 0.0e0
+        // diff) — not the inline single-row pattern that previously
+        // lived here.
+        for &tile in &[16usize, 32, 64, 128] {
+            let ptx_bytes = gen_expert_batched_gemm_ptx_tiled(tile);
+            let ptx = std::str::from_utf8(&ptx_bytes[..ptx_bytes.len() - 1]).unwrap();
+            assert!(
+                !ptx.contains("mma.sync"),
+                "tile_size={tile}: MoE batched GEMM must not emit mma.sync (path was deleted)"
+            );
+        }
     }
 
     #[test]
