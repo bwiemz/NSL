@@ -63,7 +63,28 @@ pub fn synthesize_flash_attention_ptx_v2_with_tier_b(
         && config.gpu_sm >= 80;
     if want_tier_b1 {
         match tier_b1::chunk_config::select(config) {
-            Ok(chunk) => return tier_b1::synthesize(config, chunk),
+            Ok(chunk) => {
+                // Tier B.1 dispatch ALWAYS expects the caller-side pre-pass
+                // (`nsl-runtime::cuda::tier_b1_prepass::launch_x_prepass`)
+                // to have already RMSNormalized + narrowed + chunkified x.
+                // The runtime FFI orchestrates the pre-pass automatically
+                // when it sees the `_tier_b1_chunk<N>` kernel-name suffix.
+                // Force-override `skip_rmsnorm_prologue` so the in-kernel
+                // RMSNorm prologue is suppressed — otherwise x would be
+                // RMSNormalized twice (once by the pre-pass, once again
+                // here), and the second pass would re-divide an already-
+                // unit-RMS row by its own RMS, producing roughly-identity-
+                // looking but subtly drifted x_normed.
+                //
+                // Cloning the config (rather than mutating the borrow) keeps
+                // upstream config-builders' assumptions intact; the cloned
+                // value only escapes into `tier_b1::synthesize`.
+                let mut cfg = config.clone();
+                if let Some(c) = cfg.csha.as_mut() {
+                    c.skip_rmsnorm_prologue = true;
+                }
+                return tier_b1::synthesize(&cfg, chunk);
+            }
             Err(_reason) => {
                 // chunk_config::select failed despite planner having
                 // admitted L2.  Fall through to Tier A v2 path.  The
@@ -569,21 +590,36 @@ fn emit_weight_tile_load(
 /// suffix so module caches never collide between versions.
 ///
 /// **Tier B.1 suffix**: when the dispatch criteria for the Tier B.1
-/// pipelined-MMA path are met (`csha.level >= 2` AND `gpu_sm >= 80`),
-/// the name is further suffixed with `_tier_b1`. This carries the
-/// launch-geometry signal through to the runtime FFI — Tier B.1 codegen
-/// requires 256 threads per CTA (8 warps for the `global_t = warp_id +
-/// local_t * 8` distribution), while Tier A v2 uses 128 threads (4
-/// warps). The shared `nsl_flash_attention_csha` FFI inspects the
-/// kernel-name string and picks block_x accordingly.
+/// pipelined-MMA path are met (`csha.level >= 2` AND `gpu_sm >= 80`)
+/// AND `tier_b1::chunk_config::select` succeeds, the name is further
+/// suffixed with `_tier_b1_chunk<N>` where `N` is the selected chunk
+/// size. This carries TWO signals through to the runtime FFI:
 ///
-/// Carrying the signal in the name (rather than as a new FFI arg) is
+///   1. Tier B.1 codegen requires 256 threads per CTA (8 warps for the
+///      `global_t = warp_id + local_t * 8` distribution), while Tier A
+///      v2 uses 128 threads (4 warps). The shared `nsl_flash_attention_csha`
+///      FFI inspects the kernel-name string and picks block_x accordingly.
+///   2. The chunk size is needed by the runtime pre-pass orchestration
+///      (`nsl-runtime::cuda::tier_b1_prepass::launch_*`) to compute
+///      output strides for the RMSNorm + narrow + chunkify pass on `x`
+///      and the narrow + col-major chunkify pass on `Wq`/`Wk`/`Wv`.
+///
+/// Carrying both signals in the name (rather than as new FFI args) is
 /// ABI-stable — Cranelift-emitted code already passes the name string
 /// through; no call-site signature changes.
+///
+/// If `is_tier_b1_dispatch(config)` is true but `chunk_config::select`
+/// fails for the config (e.g. SMEM budget overflow at all candidate
+/// chunks), `synthesize_flash_attention_ptx_v2` falls through to the
+/// Tier A v2 path. The name reflects that fall-through by omitting the
+/// `_tier_b1_chunk<N>` suffix.
 pub fn flash_attention_kernel_name_v2(config: &FlashAttentionConfig) -> String {
     let base = format!("{}_v2", crate::flash_attention::flash_attention_kernel_name(config));
     if is_tier_b1_dispatch(config) {
-        format!("{}_tier_b1", base)
+        match tier_b1::chunk_config::select(config) {
+            Ok(chunk) => format!("{}_tier_b1_chunk{}", base, chunk),
+            Err(_) => base, // fell through to Tier A v2 path
+        }
     } else {
         base
     }

@@ -443,6 +443,108 @@ fn csha_block_x_for_kernel(name_ptr: i64) -> i64 {
     }
 }
 
+/// Extract the chunk size encoded in a Tier B.1 kernel name (the
+/// `_tier_b1_chunk<N>` suffix appended by
+/// `flash_attention_kernel_name_v2`). Returns `None` for non-Tier-B.1
+/// names. The runtime pre-pass uses this to size the chunkified
+/// scratch buffers + launch the narrow-and-chunkify kernels at the
+/// right output stride.
+///
+/// Safety: caller guarantees `name_ptr`, when non-zero, points to a
+/// null-terminated C string.
+#[cfg(feature = "cuda")]
+fn csha_tier_b1_chunk_for_kernel(name_ptr: i64) -> Option<u32> {
+    if name_ptr == 0 {
+        return None;
+    }
+    let name_bytes = unsafe {
+        std::ffi::CStr::from_ptr(name_ptr as *const i8).to_bytes()
+    };
+    let marker = b"_tier_b1_chunk";
+    let pos = name_bytes.windows(marker.len()).position(|w| w == marker)?;
+    let rest = &name_bytes[pos + marker.len()..];
+    let end = rest.iter().position(|&b| !b.is_ascii_digit()).unwrap_or(rest.len());
+    if end == 0 {
+        return None;
+    }
+    std::str::from_utf8(&rest[..end]).ok()?.parse::<u32>().ok()
+}
+
+/// Tier B.1 per-call x-scratch RAII holder. Drops free the GPU scratch
+/// buffer after `cuCtxSynchronize`, ensuring the kernel reading from
+/// it has completed.
+///
+/// **W is NOT held here.** Chunkified Wq/Wk/Wv buffers are owned by
+/// the process-global cache in `cuda::tier_b1_prepass::w_cache` —
+/// weights are static across inference calls, so caching them avoids
+/// re-running `launch_w_prepass` on every call.
+#[cfg(feature = "cuda")]
+struct PrepassScratch {
+    x_scratch: *mut std::ffi::c_void,
+}
+
+#[cfg(feature = "cuda")]
+impl Drop for PrepassScratch {
+    fn drop(&mut self) {
+        unsafe {
+            cudarc::driver::sys::cuCtxSynchronize();
+            if !self.x_scratch.is_null() {
+                let _ = cudarc::driver::sys::cuMemFree_v2(self.x_scratch as cudarc::driver::sys::CUdeviceptr);
+            }
+        }
+    }
+}
+
+/// Tier B.1 pre-pass orchestration. When the dispatched kernel is a
+/// `_tier_b1_chunk<N>` variant, run the RMSNorm + narrow + chunkify on
+/// `x` and the narrow + col-major chunkify on `Wq/Wk/Wv` (all on the
+/// GPU via `cuda::tier_b1_prepass`), writing to freshly-allocated
+/// scratch. Returns the substituted (x, Wq, Wk, Wv) pointers + RAII
+/// scratch handle whose `Drop` runs `cuCtxSynchronize` + frees the
+/// buffers. The caller MUST keep the handle alive until after the main
+/// kernel launch.
+///
+/// Returns `None` when the kernel is not Tier B.1 (caller uses original
+/// pointers unchanged).
+#[cfg(feature = "cuda")]
+fn csha_tier_b1_prepass_substitute(
+    name_ptr: i64,
+    x_data: u64, nw_data: u64,
+    wq_data: u64, wk_data: u64, wv_data: u64,
+    seq_len: i64, head_dim: i64, d_model: i64,
+    rmsnorm_eps_bits: i64,
+) -> Option<(u64, u64, u64, u64, PrepassScratch)> {
+    let chunk = csha_tier_b1_chunk_for_kernel(name_ptr)? as u64;
+    if x_data == 0 || nw_data == 0 || wq_data == 0 || wk_data == 0 || wv_data == 0 {
+        return None;
+    }
+    let seq = seq_len as u64;
+    let dm = d_model as u64;
+    let hd = head_dim as u64;
+    debug_assert_eq!(dm % chunk, 0, "d_model ({}) must be divisible by chunk ({})", dm, chunk);
+    let n_chunks = dm / chunk;
+    // X scratch is per-call (x changes every step). W is cached
+    // process-globally (weights are static across inference calls).
+    let x_bytes = (n_chunks * seq * chunk * 2) as usize;
+    let x_scratch = crate::cuda::inner::alloc_device(x_bytes);
+    if x_scratch.is_null() {
+        return None;
+    }
+    let scratch = PrepassScratch { x_scratch };
+    let eps = f32::from_bits(rmsnorm_eps_bits as u32);
+    let rc_x = crate::cuda::tier_b1_prepass::launch_x_prepass(
+        x_data, nw_data, scratch.x_scratch as u64, seq, dm, chunk, eps,
+    );
+    if rc_x as u32 != 0 {
+        eprintln!("[csha-tier-b1] x prepass launch failed rc={:?}", rc_x);
+        return None;
+    }
+    let wq_cached = crate::cuda::tier_b1_prepass::w_chunkified_cached(wq_data, dm, hd, chunk)?;
+    let wk_cached = crate::cuda::tier_b1_prepass::w_chunkified_cached(wk_data, dm, hd, chunk)?;
+    let wv_cached = crate::cuda::tier_b1_prepass::w_chunkified_cached(wv_data, dm, hd, chunk)?;
+    Some((scratch.x_scratch as u64, wq_cached, wk_cached, wv_cached, scratch))
+}
+
 /// A.2.5: this replaces the pre-A.2.5 forwarder (which invoked
 /// `nsl_flash_attention` and dropped the extras, causing a cuLaunch arg
 /// count mismatch on kernels whose body now references the CSHA params).
@@ -569,7 +671,11 @@ pub extern "C" fn nsl_flash_attention_csha(
         // Carrying the signal in the kernel name keeps the FFI ABI
         // stable — all existing 37-arg callers continue to work; only
         // the name string they pass through changes for Tier B.1.
-        let block_x = csha_block_x_for_kernel(name_ptr);
+        // (Use `effective_name_ptr` so the block_x reflects the actual
+        // kernel that will be launched — if a Tier B PCA variant was
+        // selected by `should_dispatch_tier_b_at_runtime`, its name is
+        // what cuLaunchKernel resolves the function from.)
+        let block_x = csha_block_x_for_kernel(effective_name_ptr);
         let block_y = 1i64;
         let block_z = 1i64;
 
@@ -621,6 +727,36 @@ pub extern "C" fn nsl_flash_attention_csha(
         let mut eps = f32::from_bits(rmsnorm_eps_bits as u32);
         let mut ah = active_heads as u32;
         let mut dm = d_model as u32;
+
+        // CSHA Tier B.1 production pre-pass orchestration.
+        // When the dispatched kernel's name contains `_tier_b1_chunk<N>`,
+        // we run the host-side RMSNorm + narrow + chunkify on `x` and
+        // the narrow + col-major chunkify on Wq/Wk/Wv (all GPU-side via
+        // `cuda::tier_b1_prepass`), then substitute the chunkified
+        // pointers in the args list. The kernel was compiled with
+        // `skip_rmsnorm_prologue=true` (force-overridden by codegen
+        // in the Tier B.1 dispatch path) so it reads the pre-pass'd x
+        // directly without re-RMSNormalizing.
+        //
+        // `_prepass_handle` is an RAII guard: its Drop runs
+        // `cuCtxSynchronize` and frees the scratch buffers. It MUST
+        // live until after `kernel_launch` returns.
+        let _prepass_handle = if let Some((nx, nwq, nwk, nwv, handle)) =
+            csha_tier_b1_prepass_substitute(
+                effective_name_ptr,
+                x, nw, wq, wk, wv,
+                seq_len, head_dim, d_model,
+                rmsnorm_eps_bits,
+            )
+        {
+            x = nx;
+            wq = nwq;
+            wk = nwk;
+            wv = nwv;
+            Some(handle)
+        } else {
+            None
+        };
         // Tier C activation-save pointers — always null for this FFI; the
         // `nsl_flash_attention_csha_with_saves` FFI passes real pointers.
         let mut q_proj: u64 = 0;

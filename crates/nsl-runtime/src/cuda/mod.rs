@@ -8,6 +8,7 @@ use std::ffi::c_void;
 pub(crate) mod kernels;
 pub(crate) mod fused_kernels;
 pub(crate) mod kernels_hopper;
+pub(crate) mod tier_b1_prepass;
 
 #[cfg(feature = "cuda")]
 pub(crate) mod caching_allocator;
