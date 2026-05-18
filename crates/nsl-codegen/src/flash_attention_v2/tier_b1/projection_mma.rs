@@ -698,7 +698,7 @@ pub fn emit_q_projection(ptx: &mut String, config: &FlashAttentionConfig, chunk:
     let log2_x_m_stride = x_m_stride_bytes.trailing_zeros();
     // N1c: Q-projection K-loop count = chunk / 16.
     assert!(
-        chunk % 16 == 0,
+        chunk.is_multiple_of(16),
         "N1c: Q-projection K-loop requires chunk divisible by 16; got {}",
         chunk
     );
@@ -1129,7 +1129,7 @@ pub fn emit_kv_projection_chunk_loop(
     let log2_x_m_stride_kv = x_m_stride_kv_bytes.trailing_zeros();
     // N1d: K/V-projection K-loop count = chunk / 16.
     assert!(
-        chunk % 16 == 0,
+        chunk.is_multiple_of(16),
         "N1d: KV-projection K-loop requires chunk divisible by 16; got {}",
         chunk
     );
