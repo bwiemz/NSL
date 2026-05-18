@@ -322,7 +322,7 @@ fn emit_qkt_mma(ptx: &mut String, config: &FlashAttentionConfig, slot: u32) {
 
     // N1b: QK^T K-loop count = head_dim / 16.
     assert!(
-        hd % 16 == 0,
+        hd.is_multiple_of(16),
         "N1b: QK^T K-loop requires head_dim divisible by 16; got {}",
         hd
     );
@@ -519,9 +519,9 @@ fn emit_qkt_mma(ptx: &mut String, config: &FlashAttentionConfig, slot: u32) {
                 let row_offset = if d_idx < 2 { 0u32 } else { 8 };
                 let col_offset = d_idx % 2;
                 // q_global = q_start_low_u32 + m_tile*16 + lo_row + row_offset
-                ptx.push_str(&format!(
-                    "    add.u32 %cm_q_global, %qkt_q_warp_off, %cm_lo_row;\n"
-                ));
+                ptx.push_str(
+                    "    add.u32 %cm_q_global, %qkt_q_warp_off, %cm_lo_row;\n",
+                );
                 if row_offset > 0 {
                     ptx.push_str(&format!(
                         "    add.u32 %cm_q_global, %cm_q_global, {};\n",
@@ -534,9 +534,9 @@ fn emit_qkt_mma(ptx: &mut String, config: &FlashAttentionConfig, slot: u32) {
                 ptx.push_str("    add.u32 %cm_q_global, %cm_q_global, %cm_k_global;\n");
                 // k_global = n_tile*8 + lo_col_base + col_offset
                 // (single-iter kv_iter=0; kv_start = 0).
-                ptx.push_str(&format!(
-                    "    add.u32 %cm_k_global, %qkt_k_warp_off, %cm_lo_col_base;\n"
-                ));
+                ptx.push_str(
+                    "    add.u32 %cm_k_global, %qkt_k_warp_off, %cm_lo_col_base;\n",
+                );
                 if col_offset > 0 {
                     ptx.push_str(&format!(
                         "    add.u32 %cm_k_global, %cm_k_global, {};\n",
@@ -703,9 +703,7 @@ fn emit_online_softmax(ptx: &mut String, config: &FlashAttentionConfig, kv_iter:
             t
         ));
         // Now the HI row: global_row + 8.
-        ptx.push_str(&format!(
-            "    add.u32 %sm_global_row, %sm_global_row, 8;\n"
-        ));
+        ptx.push_str("    add.u32 %sm_global_row, %sm_global_row, 8;\n");
         ptx.push_str(&format!(
             "    mul.lo.u32 %sm_addr, %sm_global_row, {};\n",
             n_tiles_kv * 4
@@ -1107,7 +1105,7 @@ fn emit_pv_mma(ptx: &mut String, config: &FlashAttentionConfig, slot: u32) {
         //     (k-iter advances bkv-row position by 16, each bkv-row spans
         //     hd cols × 2 bytes)
         assert!(
-            bkv % 16 == 0,
+            bkv.is_multiple_of(16),
             "N1a: PV K-loop requires block_kv divisible by 16; got {}",
             bkv
         );

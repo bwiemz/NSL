@@ -1710,6 +1710,12 @@ impl Compiler<'_> {
                         // thread-local packing registry (set by train block
                         // per step). 0 when uninitialized → identity path.
                         seg_ids_ptr_v,
+                        // Tier B extension (planner spec §4): sentinel 0
+                        // pair carries the Tier-B-on PTX variant. Inactive
+                        // at this call site — the Tier B planner emits the
+                        // dispatch decision at compile-time, not via the
+                        // CSHA forward path.
+                        null, null,
                         // PCA §4.3: doc_starts_ptr — read from the same
                         // registry. 0 when uninitialized → identity path
                         // (no RoPE reset).
@@ -1804,6 +1810,9 @@ impl Compiler<'_> {
                         // PCA Tier A: segment_ids_ptr — read from the
                         // thread-local packing registry.
                         seg_ids_ptr_v,
+                        // Tier B extension (planner spec §4): sentinel 0
+                        // pair carries the Tier-B-on PTX variant.
+                        null, null,
                         // PCA §4.3: doc_starts_ptr — read from the same
                         // registry.
                         doc_starts_v,
