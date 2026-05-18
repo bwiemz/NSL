@@ -544,20 +544,23 @@ fn emit_fused_forward_under_claim(
     // through this call — not the advanced.rs one — so the diagnostic
     // must exist here too.
     //
-    // PCA §4.3 Task 3+4: hoist the doc_starts sentinel into a local so
-    // the &mut FunctionBuilder borrow doesn't overlap with `call(...)`.
-    //
-    // PCA §4.3 Task 11 note — live wiring deferred. The @train fused
-    // lowering path flows through this call site; the sibling segment_ids
-    // slot is also `null` here. The packer (T2.6) emits both tensors into
-    // `packed_batch_to_dict`, but the consumer-side wiring to look them up
-    // at the FA-2 call site is independent codegen plumbing not in T11
-    // scope. Sentinel-0 stays correct until that wiring lands.
-    //
-    // TODO(rope-reset-runtime-wiring): activate when batch dict supplies
-    // doc_starts (paired with segment_ids `null` in arg list below).
-    let doc_starts_v =
-        crate::pca_rope::doc_starts_disabled_sentinel(builder);
+    // CFTP §4.3 / Tier A activation (spec 2026-05-17): read the per-step
+    // thread-local packing registry. Train block sets segment_ids /
+    // doc_starts at step body start; this @train fused launch reads them
+    // back. Both getters return 0 when uninitialized (test fixtures that
+    // skip the train block) → identity path.
+    let seg_ids_ptr_v = call(
+        compiler,
+        builder,
+        "nsl_packing_metadata_get_segment_ids",
+        &[],
+    )?;
+    let doc_starts_v = call(
+        compiler,
+        builder,
+        "nsl_packing_metadata_get_doc_starts",
+        &[],
+    )?;
     let launch_rc = call(
         compiler,
         builder,
@@ -582,13 +585,10 @@ fn emit_fused_forward_under_claim(
             q_proj_v, k_proj_v, v_proj_v,
             row_max_v, row_sum_v,
             x_raw_v,
-            // PCA Tier A: segment_ids_ptr — 0 for unpacked paths.
-            // Sibling call site in expr/advanced.rs documents the wiring.
-            null,
-            // PCA §4.3 Task 3+4: doc_starts_ptr — sentinel 0 preserves
-            // identity-position semantics (RoPE reset disabled). Task 5
-            // will swap in a real device pointer when the packing path
-            // is detected.
+            // PCA Tier A: segment_ids_ptr — read from the thread-local
+            // packing registry (set by train block per step).
+            seg_ids_ptr_v,
+            // PCA §4.3: doc_starts_ptr — read from the same registry.
             doc_starts_v,
         ],
     )?;
@@ -1868,21 +1868,23 @@ fn lower_single_op(
             // pass 0 (kernel interprets as "all heads live").
             let active_heads_val = builder.ins().iconst(cl_types::I64, 0);
 
-            // PCA §4.3 Task 3+4: hoist the doc_starts sentinel into a local
-            // so the &mut FunctionBuilder borrow doesn't overlap with
-            // `call(...)` (which also borrows builder mutably).
-            //
-            // PCA §4.3 Task 11 note — live wiring deferred. This is the
-            // backward (Gap D.1) call into `nsl_flash_attention_csha_backward`;
-            // the sibling segment_ids slot in the arg list is `null` as well.
-            // Activation here must stay in lockstep with the forward at
-            // line ~565 above — both kernels need the same doc_starts pointer
-            // so the de-rotation math reproduces the forward's effective_pos.
-            //
-            // TODO(rope-reset-runtime-wiring): activate when batch dict
-            // supplies doc_starts (paired with segment_ids `null` below).
-            let doc_starts_v =
-                crate::pca_rope::doc_starts_disabled_sentinel(builder);
+            // CFTP §4.3 / Tier A activation (spec 2026-05-17): read the
+            // per-step thread-local packing registry. The forward at
+            // line ~565 above reads the same registry on the same step,
+            // so the de-rotation math here uses identical segment_ids /
+            // doc_starts pointers — bit-identical effective_pos.
+            let seg_ids_ptr_v = call(
+                compiler,
+                builder,
+                "nsl_packing_metadata_get_segment_ids",
+                &[],
+            )?;
+            let doc_starts_v = call(
+                compiler,
+                builder,
+                "nsl_packing_metadata_get_doc_starts",
+                &[],
+            )?;
 
             let _rc = call(
                 compiler,
@@ -1918,14 +1920,12 @@ fn lower_single_op(
                     dwq_dev, dwk_dev, dwv_dev,
                     dx_dev,
                     dxn_dev,
-                    // PCA Tier A Task 4B: segment_ids_ptr trailing slot.
-                    // Unpacked backward launches pass 0; segment_masked=true
-                    // kernels will receive a real pointer once Task 5 wires it.
-                    null,
-                    // PCA §4.3 Task 3+4: doc_starts_ptr trailing slot.
-                    // Sentinel 0 preserves identity-position semantics for the
-                    // backward kernel as well (matches the forward's reset
-                    // policy on the same launch).
+                    // PCA Tier A: segment_ids_ptr — read from the
+                    // thread-local packing registry (same value the
+                    // forward at line ~565 read on this step).
+                    seg_ids_ptr_v,
+                    // PCA §4.3: doc_starts_ptr — read from the same
+                    // registry; matches the forward's effective_pos.
                     doc_starts_v,
                 ],
             )?;

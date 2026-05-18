@@ -1658,27 +1658,23 @@ impl Compiler<'_> {
                 let save_shmem_val = builder
                     .ins()
                     .iconst(cl_types::I64, csha_training_shmem_bytes);
-                // PCA §4.3 Task 3+4: hoist the doc_starts sentinel value into
-                // a local before the call so the &mut FunctionBuilder borrow
-                // doesn't overlap with the &mut self.compile_call_by_name
-                // borrow on the same scope.
-                //
-                // PCA §4.3 Task 11 note — live wiring deferred. To switch this
-                // site to `doc_starts_enabled(builder, module, data_id)`, the
-                // caller's batch dict must propagate the `doc_starts` tensor
-                // (and the sibling `segment_ids` tensor, which also lands as
-                // `null` two slots below) into a known DataId at this call
-                // site. The packer (T2.6) already emits both tensors into
-                // `packed_batch_to_dict`; the consumer-side plumbing — looking
-                // them up here when this layer is compiled with
-                // `segment_masked && rope_q` — is independent runtime/codegen
-                // wiring work, NOT part of T11. Sentinel-0 is the correct
-                // intermediate state per the task spec.
-                //
-                // TODO(rope-reset-runtime-wiring): activate when batch dict
-                // supplies doc_starts (paired with segment_ids `null` below).
-                let doc_starts_v =
-                    crate::pca_rope::doc_starts_disabled_sentinel(builder);
+                // CFTP §4.3 / Tier A activation (spec 2026-05-17): read the
+                // per-step thread-local packing registry. Both getters return
+                // 0 when the registry is uninitialized (inference path, no
+                // train block) — kernel takes the identity path. When the
+                // train block has set the registry from
+                // `batch["segment_ids"]` / `batch["doc_starts"]`, the kernel
+                // activates Tier A masking + RoPE position-reset.
+                let seg_ids_ptr_v = self.compile_call_by_name(
+                    builder,
+                    "nsl_packing_metadata_get_segment_ids",
+                    &[],
+                )?;
+                let doc_starts_v = self.compile_call_by_name(
+                    builder,
+                    "nsl_packing_metadata_get_doc_starts",
+                    &[],
+                )?;
                 // PR #93 edit 4: stop silently discarding the launch rc.
                 // Previously bound to `_err` and dropped; now we emit a
                 // runtime `brif rc != 0 → trap` so an INVALID_PTX or
@@ -1710,15 +1706,13 @@ impl Compiler<'_> {
                         q_proj_v, k_proj_v, v_proj_v,
                         row_max_v, row_sum_v,
                         x_raw_v,
-                        // PCA Tier A: segment_ids_ptr — 0 for unpacked paths.
-                        // Task 5 will route real segment_ids device pointers
-                        // through the compiler's PCA detection pass.
-                        null,
-                        // PCA §4.3 Task 3+4: doc_starts_ptr — sentinel 0
-                        // preserves identity-position semantics; the kernel
-                        // routes through the existing RoPE path unchanged.
-                        // Task 5 will swap in a real device pointer when the
-                        // compiler detects a packed-sequence training launch.
+                        // PCA Tier A: segment_ids_ptr — read from the
+                        // thread-local packing registry (set by train block
+                        // per step). 0 when uninitialized → identity path.
+                        seg_ids_ptr_v,
+                        // PCA §4.3: doc_starts_ptr — read from the same
+                        // registry. 0 when uninitialized → identity path
+                        // (no RoPE reset).
                         doc_starts_v,
                     ],
                 )?;
@@ -1754,21 +1748,20 @@ impl Compiler<'_> {
                 // TODO: audit non-@train callers once Gap D's adjoint
                 // wiring stabilises.
             } else {
-                // PCA §4.3 Task 3+4: hoist the doc_starts sentinel value into
-                // a local before the call so the &mut FunctionBuilder borrow
-                // doesn't overlap with the &mut self.compile_call_by_name
-                // borrow on the same scope.
-                //
-                // PCA §4.3 Task 11 note — live wiring deferred. This is the
-                // CSHA inference (no-saves) path; the sibling segment_ids slot
-                // below is also a hard-coded `null`. Switching to
-                // `doc_starts_enabled` is gated on the same batch-dict
-                // plumbing prerequisite as the _with_saves path above.
-                //
-                // TODO(rope-reset-runtime-wiring): activate when batch dict
-                // supplies doc_starts (paired with segment_ids `null` below).
-                let doc_starts_v =
-                    crate::pca_rope::doc_starts_disabled_sentinel(builder);
+                // CFTP §4.3 / Tier A activation (spec 2026-05-17): read the
+                // per-step thread-local packing registry. Inference path:
+                // registry typically uninitialized (no train block has set
+                // it) → both getters return 0 → identity path.
+                let seg_ids_ptr_v = self.compile_call_by_name(
+                    builder,
+                    "nsl_packing_metadata_get_segment_ids",
+                    &[],
+                )?;
+                let doc_starts_v = self.compile_call_by_name(
+                    builder,
+                    "nsl_packing_metadata_get_doc_starts",
+                    &[],
+                )?;
                 let _err = self.compile_call_by_name(
                     builder,
                     "nsl_flash_attention_csha",
@@ -1808,14 +1801,11 @@ impl Compiler<'_> {
                         eps_bits,
                         active_heads_val,
                         d_model_val,
-                        // PCA Tier A: segment_ids_ptr — 0 for unpacked paths.
-                        // Task 5 will route real segment_ids device pointers
-                        // through the compiler's PCA detection pass.
-                        null,
-                        // PCA §4.3 Task 3+4: doc_starts_ptr — sentinel 0
-                        // preserves identity-position semantics (RoPE reset
-                        // disabled). Task 5 will swap in a real device
-                        // pointer when packed-sequence training is detected.
+                        // PCA Tier A: segment_ids_ptr — read from the
+                        // thread-local packing registry.
+                        seg_ids_ptr_v,
+                        // PCA §4.3: doc_starts_ptr — read from the same
+                        // registry.
                         doc_starts_v,
                     ],
                 )?;
