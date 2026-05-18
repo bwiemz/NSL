@@ -1714,6 +1714,8 @@ impl Compiler<'_> {
                         // Task 5 will route real segment_ids device pointers
                         // through the compiler's PCA detection pass.
                         null,
+                        // Tier B extension (planner spec §4): sentinel 0 pair.
+                        null, null,
                         // PCA §4.3 Task 3+4: doc_starts_ptr — sentinel 0
                         // preserves identity-position semantics; the kernel
                         // routes through the existing RoPE path unchanged.
@@ -1812,6 +1814,8 @@ impl Compiler<'_> {
                         // Task 5 will route real segment_ids device pointers
                         // through the compiler's PCA detection pass.
                         null,
+                        // Tier B extension (planner spec §4): sentinel 0 pair.
+                        null, null,
                         // PCA §4.3 Task 3+4: doc_starts_ptr — sentinel 0
                         // preserves identity-position semantics (RoPE reset
                         // disabled). Task 5 will swap in a real device
