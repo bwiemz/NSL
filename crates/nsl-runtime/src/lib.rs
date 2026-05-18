@@ -60,6 +60,14 @@ pub use cuda::{
     nsl_test_cuda_jit_log,
 };
 
+// CSHA Tier B.1 pre-pass PTX kernels (exposed for the GPU validation
+// tests in `tests/tier_b1_prepass_gpu.rs`; the orchestration FFI uses
+// them internally via `cuda::tier_b1_prepass::launch_*`).
+#[doc(hidden)]
+pub use cuda::tier_b1_prepass::{
+    CSHA_TIER_B1_PREPASS_W_PTX, CSHA_TIER_B1_PREPASS_X_PTX,
+};
+
 // Test-only re-export: SM version query for dispatcher tests.
 #[cfg(feature = "test-hooks")]
 pub use cuda::test_detect_sm_version;
