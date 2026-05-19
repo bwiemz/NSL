@@ -1,14 +1,176 @@
 """DLPack zero-copy bridge between PyTorch/NumPy tensors and NSL.
 
-Implements the defensive copy guard from the M62b design:
+Implements the defensive copy guard:
   - Zero-copy when safe (aligned, contiguous, read-only)
   - Defensive copy when alignment or layout mismatches
+
+Also provides ``NslTensorDesc``-array marshaling helpers used by the
+named-dispatch :meth:`NslModel.call` Python facade.
 """
 
 from __future__ import annotations
 
 import ctypes
 from typing import Any, Callable, Optional, Sequence
+
+
+# ---------------------------------------------------------------------------
+# NslTensorDesc — ctypes mirror of the runtime C struct
+#
+# Layout matches `#[repr(C)] struct NslTensorDesc` in
+# `crates/nsl-runtime/src/c_api.rs` byte-for-byte.
+#
+# C API dtype encoding (NOT the internal NslTensor encoding!):
+#   0 = f32,  1 = f64,  2 = f16,  3 = bf16,
+#   4 = int32, 5 = int64, 6 = int8, 7 = uint8
+# ---------------------------------------------------------------------------
+
+class NslTensorDesc(ctypes.Structure):
+    _fields_ = [
+        ("data", ctypes.c_void_p),
+        ("shape", ctypes.POINTER(ctypes.c_int64)),
+        ("strides", ctypes.POINTER(ctypes.c_int64)),
+        ("ndim", ctypes.c_int32),
+        ("dtype", ctypes.c_int32),
+        ("device_type", ctypes.c_int32),
+        ("device_id", ctypes.c_int32),
+    ]
+
+
+_DTYPE_F32 = 0
+
+
+def _f32_desc_from_floats(values: Sequence[float]):
+    """Build a CPU f32 NslTensorDesc from a flat sequence of Python floats.
+
+    Returns (desc, data_buf, shape_buf). The caller MUST hold references
+    to data_buf and shape_buf for the duration of the FFI call.
+    """
+    n = len(values)
+    data = (ctypes.c_float * n)(*values)
+    shape = (ctypes.c_int64 * 1)(n)
+    desc = NslTensorDesc(
+        data=ctypes.cast(data, ctypes.c_void_p),
+        shape=shape,
+        strides=ctypes.cast(None, ctypes.POINTER(ctypes.c_int64)),
+        ndim=1,
+        dtype=_DTYPE_F32,
+        device_type=0,
+        device_id=0,
+    )
+    return desc, data, shape
+
+
+def build_input_descs(inputs: Sequence[Any]):
+    """Marshal a Python ``inputs`` sequence into a ``NslTensorDesc[n]`` array.
+
+    v1 supports the common single-input @export shape: each input is a
+    Python sequence (list/tuple) of Python floats, treated as a 1-D
+    ``Tensor<[len], f32>`` on CPU. Inputs supporting ``__dlpack__`` /
+    ``__array__`` are not yet supported by this helper; those paths go
+    through :meth:`NslModel.forward` instead.
+
+    Returns ``(descs_array, keepalive)`` where ``descs_array`` is a
+    ``(NslTensorDesc * n)()`` ctypes array and ``keepalive`` is a list of
+    backing buffers the caller must retain across the FFI call.
+    """
+    n = len(inputs)
+    if n == 0:
+        return (NslTensorDesc * 0)(), []
+    arr = (NslTensorDesc * n)()
+    keepalive: list[Any] = []
+    for i, x in enumerate(inputs):
+        if isinstance(x, (list, tuple)) and all(
+            isinstance(v, (int, float)) for v in x
+        ):
+            desc, data, shape = _f32_desc_from_floats([float(v) for v in x])
+            arr[i] = desc
+            keepalive.append(data)
+            keepalive.append(shape)
+        else:
+            raise TypeError(
+                f"NslModel.call input #{i}: unsupported type "
+                f"{type(x).__name__}. v1 accepts list/tuple of floats; "
+                "DLPack/numpy inputs are not yet wired into the named-"
+                "dispatch path."
+            )
+    return arr, keepalive
+
+
+def allocate_output_descs(
+    n_out: int,
+    input_descs: Optional[Any] = None,
+    n_in: int = 0,
+    max_output_elems: int = 4096,
+):
+    """Allocate caller-owned ``NslTensorDesc[n_out]`` for dispatch outputs.
+
+    The packed-array dispatch wrapper (see
+    ``crates/nsl-codegen/src/c_wrapper.rs::emit_c_abi_dispatch_wrapper``)
+    calls ``nsl_dispatch_apply_result`` which memcpy's the impl result
+    into ``dst.data``. The caller therefore MUST preallocate
+    ``dst.data`` large enough to hold the output. We size the buffer to
+    ``max(input_elems, max_output_elems)`` * sizeof(f32); v1 assumes f32
+    single-output exports whose result shape matches the largest input.
+
+    Returns ``(descs_array, keepalive_buffers)``.
+    """
+    arr = (NslTensorDesc * n_out)()
+    keepalive: list[Any] = []
+
+    # Size estimate: max input element-count, falling back to
+    # max_output_elems for nullary exports. f32 = 4 bytes/elem.
+    n_elems = max_output_elems
+    if input_descs is not None and n_in > 0:
+        try:
+            for i in range(n_in):
+                ndim = int(input_descs[i].ndim)
+                cnt = 1
+                for j in range(ndim):
+                    cnt *= int(input_descs[i].shape[j])
+                if cnt > n_elems:
+                    n_elems = cnt
+        except Exception:
+            pass
+
+    for i in range(n_out):
+        data_buf = (ctypes.c_float * n_elems)()
+        # The wrapper overwrites shape/ndim/dtype with the impl result's
+        # metadata, but we pre-populate shape so the desc is well-formed
+        # if any consumer reads it before the apply step finishes.
+        shape_buf = (ctypes.c_int64 * 1)(n_elems)
+        arr[i] = NslTensorDesc(
+            data=ctypes.cast(data_buf, ctypes.c_void_p),
+            shape=shape_buf,
+            strides=ctypes.cast(None, ctypes.POINTER(ctypes.c_int64)),
+            ndim=1,
+            dtype=_DTYPE_F32,
+            device_type=0,
+            device_id=0,
+        )
+        keepalive.append(data_buf)
+        keepalive.append(shape_buf)
+    return arr, keepalive
+
+
+def read_f32_output_desc(desc: NslTensorDesc) -> list[float]:
+    """Read a CPU f32 ``NslTensorDesc`` into a Python ``list[float]``.
+
+    Computes the element count from ``ndim`` + ``shape[i]`` and copies
+    ``ndim`` worth of f32 elements out of ``desc.data``. Raises
+    :class:`ValueError` on a degenerate (null-data) result.
+    """
+    if not desc.data:
+        raise ValueError("output desc has null data pointer")
+    if desc.ndim <= 0:
+        raise ValueError(f"output desc has non-positive ndim={desc.ndim}")
+    n_elems = 1
+    for i in range(desc.ndim):
+        n_elems *= int(desc.shape[i])
+    if n_elems <= 0:
+        raise ValueError(f"output desc resolves to <=0 elements: {n_elems}")
+    arr = ctypes.cast(desc.data, ctypes.POINTER(ctypes.c_float * n_elems))
+    return list(arr.contents)
 
 # ---------------------------------------------------------------------------
 # Tensor validation for zero-copy safety
