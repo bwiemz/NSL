@@ -139,6 +139,7 @@ pub mod kv_compress;
 pub mod grammar;
 pub mod token_alignment;
 pub mod gpu_backend;
+pub mod grad_context;
 pub mod vmap_runtime;
 pub mod backward_context;
 pub mod pipeline;
