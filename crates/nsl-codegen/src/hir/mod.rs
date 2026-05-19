@@ -7,6 +7,7 @@
 pub mod clock_reset;
 pub mod control;
 pub mod ids;
+pub mod lower;
 pub mod module;
 pub mod nodes;
 pub mod signals;
@@ -17,6 +18,7 @@ mod tests;
 pub use clock_reset::{ClkRef, ResetPolarity, ResetRef, ResetSync};
 pub use control::{ConstExpr, GenerateFor, GenerateIf};
 pub use ids::{ClockDomainId, GenvarId, RegisterId, ResetSignalId, WireId};
+pub use lower::KirToHirPass;
 pub use module::{HirModule, HirNode};
 pub use nodes::{Add, LocalParam, Max0, Mul, Port, Register, SignExtend, Wire};
 pub use signals::SignalRef;
