@@ -144,7 +144,7 @@ fn emit_inner_loop_body(ptx: &mut String, config: &FlashAttentionConfig) {
         emit_load_a_fragment_smem, emit_load_b_fragment_smem, emit_mma_instruction,
     };
     use crate::flash_attention_v2::smem_layout::{
-        tier_b2_dq_q_offset, tier_b2_dq_k_offset,
+        tier_b2_dq_q_offset, tier_b2_dq_k_offset, tier_b2_dq_dO_offset, tier_b2_dq_v_offset,
     };
 
     let hd = config.head_dim as u32;
@@ -214,8 +214,51 @@ fn emit_inner_loop_body(ptx: &mut String, config: &FlashAttentionConfig) {
     emit_load_b_fragment_smem(ptx, &b_regs, &k_smem_base, row_stride_bytes);
     emit_mma_instruction(ptx, &d_regs, &a_regs, &b_regs, &c_regs);
 
-    // Placeholder for Tasks 10-11.
-    ptx.push_str("    // TODO Tasks 10-11: P recompute + dP + dS + dQ-update\n");
+    // === P recompute (lane-by-lane, no SMEM) per spec §4.3 step 4 ===
+    ptx.push_str("    // === P recompute: P[q,k] = exp(S[q,k] - row_max[q]) * row_sum_recip[q] ===\n");
+    ptx.push_str("    // (Lane-by-lane on the f32 S-fragment values held in %s_d0..3.)\n");
+    ptx.push_str("    // row_max and row_sum_recip are loaded from HBM into %f_rmax and %f_rsum_recip\n");
+    ptx.push_str("    // (HBM load emission omitted; consumed in Task 11's dS compute too).\n");
+    ptx.push_str("    .reg .f32 %f_rmax, %f_rsum_recip;\n");
+    ptx.push_str("    .reg .f32 %p_recip_log2e;\n");
+    ptx.push_str("    mov.f32 %p_recip_log2e, 0F3FB8AA3B;  // 1/ln(2) = 1.4426950408889634\n");
+    for i in 0..4 {
+        ptx.push_str(&format!("    .reg .f32 %p_{};\n", i));
+        ptx.push_str(&format!("    sub.f32 %p_{}, %s_d{}, %f_rmax;\n", i, i));
+        ptx.push_str(&format!("    mul.f32 %p_{}, %p_{}, %p_recip_log2e;\n", i, i)); // x * log2(e)
+        ptx.push_str(&format!("    ex2.approx.f32 %p_{}, %p_{};\n", i, i));          // 2^(x*log2(e)) = exp(x)
+        ptx.push_str(&format!("    mul.f32 %p_{}, %p_{}, %f_rsum_recip;\n", i, i));
+    }
+    ptx.push('\n');
+
+    // === dP = dO @ V^T (m16n8k16, B-frag col-major) ===
+    ptx.push_str("    // === dP = dO @ V^T (m16n8k16, B-frag col-major) ===\n");
+
+    let do_off_expr = format!("{}", tier_b2_dq_dO_offset(config));
+    let v_off_expr = format!("{}", tier_b2_dq_v_offset(config));
+
+    let dp_a_regs: [String; 4] = ["dp_a0", "dp_a1", "dp_a2", "dp_a3"]
+        .iter().map(|s| s.to_string()).collect::<Vec<_>>().try_into().unwrap();
+    let dp_b_regs: [String; 2] = ["dp_b0", "dp_b1"]
+        .iter().map(|s| s.to_string()).collect::<Vec<_>>().try_into().unwrap();
+    let dp_c_regs: [String; 4] = ["dp_c0", "dp_c1", "dp_c2", "dp_c3"]
+        .iter().map(|s| s.to_string()).collect::<Vec<_>>().try_into().unwrap();
+    let dp_d_regs: [String; 4] = ["dp_d0", "dp_d1", "dp_d2", "dp_d3"]
+        .iter().map(|s| s.to_string()).collect::<Vec<_>>().try_into().unwrap();
+
+    for r in &dp_a_regs { ptx.push_str(&format!("    .reg .b32 %{};\n", r)); }
+    for r in &dp_b_regs { ptx.push_str(&format!("    .reg .b32 %{};\n", r)); }
+    for r in &dp_c_regs { ptx.push_str(&format!("    .reg .f32 %{};\n", r)); }
+    for r in &dp_d_regs { ptx.push_str(&format!("    .reg .f32 %{};\n", r)); }
+    for r in &dp_c_regs { ptx.push_str(&format!("    mov.f32 %{}, 0.0;\n", r)); }
+
+    emit_load_a_fragment_smem(ptx, &dp_a_regs, &do_off_expr, row_stride_bytes);
+    emit_load_b_fragment_smem(ptx, &dp_b_regs, &v_off_expr, row_stride_bytes);
+    emit_mma_instruction(ptx, &dp_d_regs, &dp_a_regs, &dp_b_regs, &dp_c_regs);
+    ptx.push('\n');
+
+    // Placeholder for Task 11.
+    ptx.push_str("    // TODO Task 11: dS = P * (dP - D); col-major K re-stage; dQ_acc += dS @ K\n");
     ptx.push('\n');
 
     ptx.push_str("DS_SKIP_LABEL:\n");
@@ -351,5 +394,34 @@ mod tests {
         // The helper emits "Load B-fragment (k16xn8 col-major" comment per matmul_mma.rs post-revert.
         assert!(ptx.contains("Load B-fragment (k16xn8 col-major"),
             "expected non-transposed B-frag load comment");
+    }
+
+    #[test]
+    fn synthesize_dq_kernel_emits_p_recompute() {
+        let ptx = synthesize_dq_kernel(&canonical_cfg()).unwrap();
+        // P = exp(S - row_max) * row_sum_recip — uses ex2.approx.f32 or exp
+        assert!(ptx.contains("ex2.approx.f32"),
+            "expected ex2.approx.f32 for P recompute (PTX-native exp), got:\n{ptx}");
+    }
+
+    #[test]
+    fn synthesize_dq_kernel_emits_dp_mma() {
+        let ptx = synthesize_dq_kernel(&canonical_cfg()).unwrap();
+        // dP = dO @ V^T via second m16n8k16 row.col MMA.
+        let mma_count = ptx.matches("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32").count();
+        assert!(mma_count >= 2,
+            "expected at least 2 MMAs (S + dP) after Task 10, got {}", mma_count);
+    }
+
+    #[test]
+    fn synthesize_dq_kernel_loads_v_for_dp() {
+        let ptx = synthesize_dq_kernel(&canonical_cfg()).unwrap();
+        // V tile is loaded as B-frag for dP = dO @ V^T using the same col-major
+        // byte-aliasing pattern as K in S = QK^T.
+        // The B-frag helper emits the same "Load B-fragment (k16xn8 col-major)" comment
+        // each time it's called, so count occurrences (must be at least 2 now: K then V).
+        let bfrag_loads = ptx.matches("Load B-fragment (k16xn8 col-major").count();
+        assert!(bfrag_loads >= 2,
+            "expected at least 2 B-frag loads (K for S, V for dP), got {}", bfrag_loads);
     }
 }
