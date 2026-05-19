@@ -15,13 +15,10 @@ use crate::autodiff::TapeOp;
 // Error message constants (carried over from Spec B T2 deferral)
 // ---------------------------------------------------------------------------
 
-#[allow(dead_code)]
 pub(crate) const ERR_FORWARD_IN_PROGRESS: &str =
     "nsl_model_forward_grad: forward already in progress on this thread";
-#[allow(dead_code)]
 pub(crate) const ERR_NULL_CONTEXT: &str =
     "nsl_model_backward: null context pointer";
-#[allow(dead_code)]
 pub(crate) const ERR_ALREADY_CONSUMED: &str =
     "nsl_model_backward: context already consumed";
 
@@ -40,12 +37,17 @@ fn set_error_static(msg: &'static str) {
 /// be passed across threads but at any given time only one thread
 /// owns it exclusively. Concurrent access is UB by user contract.
 ///
-/// Fields are populated here but only read by T4's
-/// `nsl_model_forward_grad` / `nsl_model_backward` FFI shims. The
-/// allow(dead_code) is removed when T4 lands.
-#[allow(dead_code)]
+/// Populated by `nsl_model_forward_grad` (§4.2), consumed by
+/// `nsl_model_backward` (§4.3), freed by `nsl_grad_context_destroy`
+/// (§4.1). The `consumed: bool` is intentionally non-atomic per the
+/// exclusive-ownership contract (§5.4).
 pub struct GradContext {
     pub(crate) ops: Vec<TapeOp>,
+    /// Snapshot of input `NslTensor*` produced by the forward call.
+    /// Reserved for cross-thread backward (§5.4) and future serialization
+    /// (§6) — backward replays from `ops` and writes grads into the
+    /// caller's desc array, so this field is currently unread.
+    #[allow(dead_code)]
     pub(crate) input_ptrs: Vec<i64>,
     pub(crate) output_ptrs: Vec<i64>,
     pub(crate) param_ptrs: Vec<i64>,
@@ -97,42 +99,261 @@ pub extern "C" fn nsl_grad_context_destroy(ctx_ptr: i64) {
 }
 
 // ---------------------------------------------------------------------------
-// Spec B T3 — FFI STUBS (replaced with real implementations in T4)
+// Spec B §4.2 — `nsl_model_forward_grad`
 // ---------------------------------------------------------------------------
-//
-// The stubs return -1 with a "not implemented yet" error so the headline-
-// invariant contract test in `tests/backward_does_not_consult_live_tape.rs`
-// can compile and FAIL at runtime (the `rc == 0` assertion fires). T4
-// replaces these with the real Spec B §4.2 / §4.3 implementations.
 
-const ERR_NOT_IMPLEMENTED_FORWARD: &str =
-    "nsl_model_forward_grad: not implemented yet (Spec B T4 stub)";
-const ERR_NOT_IMPLEMENTED_BACKWARD: &str =
-    "nsl_model_backward: not implemented yet (Spec B T4 stub)";
-
-/// Spec B §4.2 — STUB. Real implementation lands in T4.
+/// Record a forward pass into a fresh `GradContext`.
+///
+/// Workflow:
+///   1. Re-entry guard: if thread-local TAPE.recording is already true
+///      (§5.2), return -1 with the `ForwardInProgress` error.
+///   2. RAII drop guard (§5.3): any exit path (success, error, panic)
+///      clears the thread-local tape state.
+///   3. Start recording on `model.weight_ptrs` (registers them as
+///      parameters in `tape.param_set`).
+///   4. Snapshot input tensor pointers from the `NslTensorDesc` array
+///      so they can live inside the `GradContext` independently of
+///      the caller's desc memory.
+///   5. Dispatch the forward via Spec A's
+///      `nsl_model_call(model, "forward", ...)`.
+///   6. On success, MOVE ops out of the thread-local TAPE into the
+///      heap-allocated `GradContext` and return its pointer through
+///      `grad_context_out`.
+///
+/// The headline invariant from Spec B §2 holds because step 6 drains
+/// the tape into `ctx.ops`; the RAII guard then clears whatever
+/// residual state remained (it sees an empty Vec, so the only effect
+/// is `recording = false`). A subsequent `forward_grad` on the same
+/// thread starts with a clean tape; `nsl_model_backward(ctx_a, ...)`
+/// replays from `ctx_a.ops` regardless of what the live tape holds.
 #[no_mangle]
 pub extern "C" fn nsl_model_forward_grad(
-    _model_ptr: i64,
-    _inputs_ptr: i64,
-    _num_inputs: i64,
-    _outputs_ptr: i64,
-    _num_outputs: i64,
-    _grad_context_out: i64,
+    model_ptr: i64,
+    inputs_ptr: i64,
+    num_inputs: i64,
+    outputs_ptr: i64,
+    num_outputs: i64,
+    grad_context_out: i64, // *mut *mut GradContext
 ) -> i64 {
-    set_error_static(ERR_NOT_IMPLEMENTED_FORWARD);
-    -1
+    if model_ptr == 0 || grad_context_out == 0 {
+        set_error_static("nsl_model_forward_grad: null model or out pointer");
+        return -1;
+    }
+
+    // §5.3 RAII drop guard — fires on success, error, AND panic unwind.
+    // Always leaves the thread-local in a clean (recording=false, empty
+    // ops) state. Moving ops into ctx (step 6) happens BEFORE this
+    // guard drops, so the guard sees an empty Vec on the success path.
+    struct TapeGuard;
+    impl Drop for TapeGuard {
+        fn drop(&mut self) {
+            crate::autodiff::TAPE.with(|t| {
+                let mut tape = t.borrow_mut();
+                crate::autodiff::release_tape_op_refs(&tape.ops);
+                tape.ops.clear();
+                tape.recording = false;
+                tape.pause_depth = 0;
+            });
+        }
+    }
+
+    // §5.2 within-thread re-entry guard.
+    let already_recording =
+        crate::autodiff::TAPE.with(|t| t.borrow().recording);
+    if already_recording {
+        set_error_static(ERR_FORWARD_IN_PROGRESS);
+        return -1;
+    }
+
+    let _guard = TapeGuard;
+
+    // Build the param list for tape_start. nsl_tape_start clones
+    // pointers into tape.param_set; the list itself is freed below.
+    let param_list = crate::list::nsl_list_new();
+    let weight_ptrs = crate::c_api::nsl_model_get_weight_ptrs(model_ptr);
+    let n_weights = crate::c_api::nsl_model_get_num_weights(model_ptr);
+    if weight_ptrs != 0 && n_weights > 0 {
+        let weights_slice = unsafe {
+            std::slice::from_raw_parts(weight_ptrs as *const i64, n_weights as usize)
+        };
+        for &wptr in weights_slice {
+            crate::list::nsl_list_push(param_list, wptr);
+        }
+    }
+    crate::autodiff::nsl_tape_start(param_list);
+    crate::list::nsl_list_free(param_list);
+
+    // Snapshot raw `NslTensor*` for the input descs (used by backward
+    // for grad-input mapping; held by ctx). Each call to
+    // `desc_to_nsl_tensor` allocates a new NslTensor that borrows the
+    // desc's data buffer — the borrow is safe so long as the caller
+    // keeps the data buffer alive for at least the lifetime of the ctx.
+    let input_ptrs: Vec<i64> = if num_inputs > 0 && inputs_ptr != 0 {
+        let descs = unsafe {
+            std::slice::from_raw_parts(
+                inputs_ptr as *const crate::c_api::NslTensorDesc,
+                num_inputs as usize,
+            )
+        };
+        descs
+            .iter()
+            .map(crate::c_api::desc_to_nsl_tensor)
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    // Dispatch via Spec A: nsl_model_call(model, "forward", ...).
+    // The packed-array dispatch wrapper unpacks input/output descs and
+    // invokes the typed `forward` wrapper. Records tape ops as a side
+    // effect via the autodiff op surface.
+    let name = c"forward";
+    let rc = crate::c_api::nsl_model_call(
+        model_ptr,
+        name.as_ptr() as i64,
+        inputs_ptr,
+        num_inputs,
+        outputs_ptr,
+        num_outputs,
+    );
+    if rc != 0 {
+        // Free the input wrapper tensors before the guard fires.
+        for &p in &input_ptrs {
+            crate::tensor::nsl_tensor_free(p);
+        }
+        return rc;
+    }
+
+    // Snapshot output tensor pointers from the (now-populated) output
+    // descs. The first output is treated as the loss seed by backward
+    // (scalar-loss convention from `nsl_tape_backward`).
+    let output_ptrs: Vec<i64> = if num_outputs > 0 && outputs_ptr != 0 {
+        let descs = unsafe {
+            std::slice::from_raw_parts(
+                outputs_ptr as *const crate::c_api::NslTensorDesc,
+                num_outputs as usize,
+            )
+        };
+        descs
+            .iter()
+            .map(crate::c_api::desc_to_nsl_tensor)
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    // Snapshot the tape's param_set into a stable Vec. We collect from
+    // the live tape (rather than reusing weight_ptrs) so future hooks
+    // that register additional params during recording will surface
+    // through ctx.param_ptrs without changing this call site.
+    let param_ptrs: Vec<i64> =
+        crate::autodiff::TAPE.with(|t| t.borrow().param_set.iter().copied().collect());
+
+    // Move ops out of the thread-local TAPE into ctx.ops. This is the
+    // headline-invariant load-bearing line: from here on, ctx owns the
+    // recording, and the live tape is empty.
+    let ops: Vec<crate::autodiff::TapeOp> = crate::autodiff::TAPE.with(|t| {
+        let mut tape = t.borrow_mut();
+        std::mem::take(&mut tape.ops)
+    });
+
+    let ctx = Box::new(GradContext::new(ops, input_ptrs, output_ptrs, param_ptrs));
+    let raw_ctx = Box::into_raw(ctx);
+    // SAFETY: caller passed a valid `*mut *mut GradContext`. Write the
+    // pointer through the out param.
+    unsafe {
+        *(grad_context_out as *mut *mut GradContext) = raw_ctx;
+    }
+
+    // _guard drops here, cleaning the (now-empty) tape state. The empty
+    // ops Vec means release_tape_op_refs is a no-op; recording flips to
+    // false; pause_depth resets to 0.
+    0
 }
 
-/// Spec B §4.3 — STUB. Real implementation lands in T4.
+// ---------------------------------------------------------------------------
+// Spec B §4.3 — `nsl_model_backward(ctx, ...)`
+// ---------------------------------------------------------------------------
+
+/// Replay `ctx.ops` in reverse to compute gradients w.r.t. each
+/// parameter pointer in `ctx.param_ptrs`.
+///
+/// `grad_outputs_ptr` / `num_grad_outputs` are reserved for explicit
+/// upstream gradient seeds — the v1 implementation seeds with
+/// `ones_like(loss)` inside `run_backward_core`, matching the scalar-
+/// loss convention from the legacy `nsl_tape_backward`. The first
+/// element of `ctx.output_ptrs` is used as the loss tensor.
+///
+/// `grad_inputs_ptr` is a caller-allocated `NslTensorDesc*` array of
+/// length `num_grad_inputs`. The callee fills it with one descriptor
+/// per recorded parameter, in `ctx.param_ptrs` order. If the caller's
+/// buffer is shorter than `param_ptrs.len()`, only the first
+/// `num_grad_inputs` descriptors are written.
+///
+/// On success returns 0; on null ctx or double-backward returns -1
+/// with a thread-local error message (§5.5).
 #[no_mangle]
 pub extern "C" fn nsl_model_backward(
-    _ctx_ptr: i64,
-    _grad_outputs_ptr: i64,
-    _num_grad_outputs: i64,
-    _grad_inputs_ptr: i64,
-    _num_grad_inputs: i64,
+    ctx_ptr: i64,
+    grad_outputs_ptr: i64,
+    num_grad_outputs: i64,
+    grad_inputs_ptr: i64,
+    num_grad_inputs: i64,
 ) -> i64 {
-    set_error_static(ERR_NOT_IMPLEMENTED_BACKWARD);
-    -1
+    if ctx_ptr == 0 {
+        set_error_static(ERR_NULL_CONTEXT);
+        return -1;
+    }
+    // SAFETY: ctx_ptr is a `*mut GradContext` produced by
+    // `nsl_model_forward_grad`. §5.4 exclusive-ownership contract
+    // guarantees no other reference exists.
+    let ctx = unsafe { &mut *(ctx_ptr as *mut GradContext) };
+    if ctx.mark_consumed() {
+        set_error_static(ERR_ALREADY_CONSUMED);
+        return -1;
+    }
+
+    // Reserved for v2: explicit upstream gradient seeding via
+    // grad_outputs_ptr. v1 uses the scalar-loss seed inside
+    // run_backward_core.
+    let _ = (grad_outputs_ptr, num_grad_outputs);
+
+    // Move ops out of the ctx (steals ownership before replaying).
+    // The headline invariant from Spec B §2 says backward MUST NOT
+    // consult the live tape — `run_backward_core` operates entirely
+    // on the passed-in ops Vec (verified via the contract test in
+    // `tests/run_backward_core_matches_tape_backward.rs`).
+    let ops = ctx.take_ops();
+    let param_ptrs = ctx.param_ptrs.clone();
+    let loss_ptr = if !ctx.output_ptrs.is_empty() {
+        ctx.output_ptrs[0]
+    } else {
+        set_error_static("nsl_model_backward: context has no recorded outputs");
+        return -1;
+    };
+
+    let grads_list = crate::autodiff::run_backward_core(ops, loss_ptr, &param_ptrs);
+
+    // Write per-param grads into the caller's NslTensorDesc array, in
+    // ctx.param_ptrs order. The gradient tensors are referenced by the
+    // descriptors (which borrow the underlying data); the caller owns
+    // them via the desc's data pointer and is responsible for freeing.
+    if grad_inputs_ptr != 0 && num_grad_inputs > 0 {
+        let n = (num_grad_inputs as usize).min(param_ptrs.len());
+        let out_descs = unsafe {
+            std::slice::from_raw_parts_mut(
+                grad_inputs_ptr as *mut crate::c_api::NslTensorDesc,
+                n,
+            )
+        };
+        for (i, desc) in out_descs.iter_mut().enumerate() {
+            let g = crate::list::nsl_list_get(grads_list, i as i64);
+            if g != 0 {
+                crate::c_api::nsl_tensor_to_desc(g, desc);
+            }
+        }
+    }
+
+    crate::list::nsl_list_free(grads_list);
+    0
 }

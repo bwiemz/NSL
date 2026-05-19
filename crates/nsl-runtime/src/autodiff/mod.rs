@@ -182,6 +182,48 @@ thread_local! {
     pub(crate) static TAPE: RefCell<Tape> = RefCell::new(Tape::new());
 }
 
+// ---------------------------------------------------------------------------
+// Test-only helpers (gated on `test-hooks`)
+// ---------------------------------------------------------------------------
+//
+// Spec B's headline-invariant contract test
+// (`tests/backward_does_not_consult_live_tape.rs`) needs to inspect the
+// thread-local tape's op count to verify the move-out step left the
+// live tape empty. Exposing the `TAPE` thread_local directly would
+// require making it `pub`, which leaks the autodiff implementation
+// surface to every downstream crate. Instead, expose a narrow
+// inspector function under the `test-hooks` feature.
+
+/// Number of ops currently held in the thread-local tape. Used by
+/// Spec B's headline-invariant contract test to verify forward-grad's
+/// move-out step (§4.2) drains the tape.
+#[cfg(feature = "test-hooks")]
+pub fn test_tape_ops_len() -> usize {
+    TAPE.with(|t| t.borrow().ops.len())
+}
+
+/// Drain the thread-local tape's ops into a Vec, also snapshotting the
+/// current `param_set`. Mirrors the move-out step that
+/// `nsl_model_forward_grad` (§4.2) performs at the end of a successful
+/// forward. Used by Spec B's headline-invariant contract test to
+/// construct `GradContext` instances without going through the
+/// `@export` dispatch path (which currently doesn't thread weight
+/// pointers through to the tape — see `c_wrapper.rs:95-97`).
+///
+/// After this call, `recording` is reset to false and `pause_depth` to
+/// 0, matching the RAII drop guard's effect.
+#[cfg(feature = "test-hooks")]
+pub fn test_drain_tape_and_params() -> (Vec<TapeOp>, Vec<i64>) {
+    TAPE.with(|t| {
+        let mut tape = t.borrow_mut();
+        let params: Vec<i64> = tape.param_set.iter().copied().collect();
+        let ops = std::mem::take(&mut tape.ops);
+        tape.recording = false;
+        tape.pause_depth = 0;
+        (ops, params)
+    })
+}
+
 pub fn is_recording() -> bool {
     TAPE.with(|t| { let tape = t.borrow(); tape.recording && tape.pause_depth == 0 })
 }
