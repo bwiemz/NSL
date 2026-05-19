@@ -156,16 +156,18 @@ mod tests {
 
     #[test]
     fn layer1_matmul_single_active_input() {
-        // x[0] = 1, all others 0; W1[0, o] = o as i8 (mod 64 to stay in range)
+        // x[0] = 1, all others 0; W1[0, o] = (o % 64) to stay in range.
+        // Row-major layout: W1[i, o] = w1[i * n_out + o]; with i=0: w1[o].
         let mut x = vec![0i8; 784];
         x[0] = 1;
         let mut w1 = vec![0i8; 784 * 128];
-        for o in 0..128 {
-            w1[0 * 128 + o] = (o % 64) as i8;
+        // Row 0: W1[0, o] = w1[0*128 + o] = w1[o] for o in 0..128.
+        for (o, slot) in w1.iter_mut().enumerate().take(128) {
+            *slot = (o % 64) as i8;
         }
         let out = cpu_reference_layer1_matmul(&x, &w1);
-        for o in 0..128 {
-            assert_eq!(out[o], (o % 64) as i32, "mismatch at output {o}");
+        for (o, &v) in out.iter().enumerate() {
+            assert_eq!(v, (o % 64) as i32, "mismatch at output {o}");
         }
     }
 
@@ -178,11 +180,12 @@ mod tests {
 
     #[test]
     fn layer2_matmul_sign_extension() {
-        // w2 = -1 (i8 = 0xFF); h = [1, 0, ...0]; expect acc = -1
+        // w2 = -1 (i8 = 0xFF); h = [1, 0, ...0]; expect acc for output 0 = -1.
+        // Row-major layout: W2[i, o] = w2[i * n_out + o]; with i=0: w2[o].
         let mut h = vec![0i32; 128];
         h[0] = 1;
         let mut w2 = vec![0i8; 128 * 10];
-        w2[0 * 10 + 0] = -1i8;
+        w2[0] = -1i8; // W2[0, 0]: i=0, o=0 → index 0*10+0 = 0
         let out = cpu_reference_layer2_matmul(&h, &w2);
         assert_eq!(out[0], -1i64, "i8 -1 should sign-extend to i64 -1");
         assert_eq!(out[1], 0i64);

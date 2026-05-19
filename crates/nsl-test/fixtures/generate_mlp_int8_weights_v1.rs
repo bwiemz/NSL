@@ -52,15 +52,8 @@ fn write_block(
         let dim = if i < shape.len() { shape[i] } else { 0u64 };
         bin.extend_from_slice(&dim.to_le_bytes());
     }
-    // Header is exactly 4+4+4+4 + 4*8 = 48 bytes.
-    debug_assert_eq!(
-        {
-            // quick sanity: 16 bytes so far in this call context
-            // (we can't measure mid-write cleanly, so just trust the assert above)
-            48usize
-        },
-        48
-    );
+    // Header is exactly 4+4+4+4 + 4*8 = 48 bytes (verified by the
+    // per-block size assertions above; no runtime check needed here).
     bin.extend_from_slice(data);
 }
 
