@@ -13,6 +13,7 @@ pub mod smem_layout;
 pub mod register_budget;
 pub mod phases;
 pub mod tier_b1;
+pub mod tier_b2;
 
 use crate::flash_attention::FlashAttentionConfig;
 use crate::pca_segment::SegmentResidency;
@@ -740,6 +741,35 @@ pub fn synthesize_backward(config: &FlashAttentionConfig) -> Result<String, Stri
     synthesize_backward_with_tier_b(config, None)
 }
 
+/// Tier-aware backward synthesizer. Consults the planner's backward
+/// dispatch tier and routes to either the scalar v2 backward or (in
+/// Phase 2+) the Tier B.2 MMA backward.
+///
+/// Phase 1 contract: Tier B.2 emitter returns `Err(NotImplemented)`,
+/// so this function transparently falls back to scalar v2 in all cases
+/// today. Phase 2 will land the real Tier B.2 emitter and this fallback
+/// will only trigger for configs that fail the §6.4 SMEM ladder.
+pub fn synthesize_backward_with_tier(
+    config: &FlashAttentionConfig,
+) -> Result<String, String> {
+    use crate::csha_pipeline::backward_dispatch_tier;
+    use crate::flash_attention_v2::tier_b2::BackwardTier;
+    use crate::flash_attention_v2::tier_b2::backward::synthesize_tier_b2_backward;
+
+    match backward_dispatch_tier(config) {
+        BackwardTier::TierB2 { .. } => {
+            // Phase 1: stub returns NotImplemented; transparently fall
+            // back. Phase 2: stub returns the real PTX; only the SMEM
+            // ladder rejection path falls through to scalar.
+            match synthesize_tier_b2_backward(config) {
+                Ok(ptx) => Ok(ptx),
+                Err(_) => synthesize_backward(config),
+            }
+        }
+        BackwardTier::Scalar => synthesize_backward(config),
+    }
+}
+
 /// Tier C backward orchestrator with optional PCA Tier B.2 support.
 ///
 /// When `tier_b` is `None` this produces byte-identical output to
@@ -1285,6 +1315,41 @@ mod backward_orchestrator_tests {
             with_seg - unmasked,
             crate::pca_segment::DEFAULT_SMEM_SEGMENT_BUDGET as u32,
             "segment_masked must add exactly DEFAULT_SMEM_SEGMENT_BUDGET bytes"
+        );
+    }
+
+    #[test]
+    fn synthesize_backward_with_tier_falls_back_to_scalar_in_phase1() {
+        use crate::flash_attention::{CshaExtras, FlashAttentionConfig, RopeStyle};
+        // Small config so BOTH Tier B.2 dispatch (which triggers on
+        // hd ∈ {64, 128, 256} + level=2 + sm=80) AND the scalar v2
+        // backward fallback can accept it.
+        //
+        // Why not the canonical (bq=bkv=64, hd=128) config? Because
+        // scalar v2 backward's `backward_extra_bytes` at hd=128 alone
+        // exceeds the 99 KB SMEM cap (P+dS+dQ+dK+dV+V_in ~= 144 KB).
+        // Scalar v2 backward is therefore structurally incapable of
+        // handling hd=128 — which is precisely why Tier B.2 is the
+        // ONLY viable backward for production-scale configs, not an
+        // optimization. The fallback wrapper logic still needs to be
+        // exercised, so we use the smallest config that both paths
+        // accept.
+        let cfg = FlashAttentionConfig {
+            block_q: 32, block_kv: 32, head_dim: 64,
+            causal: true, paged: false,
+            rope_q: false, rope_style: RopeStyle::HalfSplit,
+            gqa_group_size: 1, tree_mask: false,
+            gpu_sm: 80, segment_masked: false,
+            csha: Some(CshaExtras { level: 2, ..Default::default() }),
+        };
+        let result = synthesize_backward_with_tier(&cfg);
+        // Phase 1: tier_b2 emitter is a stub; the wrapper falls back
+        // to scalar v2. Scalar v2 should emit a non-empty PTX string
+        // for this small config.
+        let ptx = result.expect("scalar v2 backward should accept small config");
+        assert!(
+            ptx.contains(".visible .entry"),
+            "fallback PTX should be a valid kernel"
         );
     }
 }
