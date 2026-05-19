@@ -120,19 +120,61 @@ def _load_lib(path: Optional[Path] = None) -> ctypes.CDLL:
     lib.nsl_clear_error.argtypes = []
     lib.nsl_clear_error.restype = ctypes.c_int64
 
-    # ── Backward pass ─────────────────────────────────────────────────
-    lib.nsl_model_backward.argtypes = [
-        ctypes.c_int64,  # model_ptr
-        ctypes.c_int64,  # grad_output_dlpack
-        ctypes.c_int64,  # num_grad_outputs
-        ctypes.c_int64,  # grad_inputs_buf (output)
-        ctypes.c_int64,  # num_grad_inputs_ptr (output)
-    ]
-    lib.nsl_model_backward.restype = ctypes.c_int64
+    # ── Spec B: per-call grad context FFIs ──────────────────────────────
+    # Bound centrally so the same ABI is enforced on both the standalone
+    # runtime and on @export-emitted shared libraries (which statically
+    # link the runtime). The new `nsl_model_backward` takes a
+    # `*mut GradContext` as the first argument (NOT a model handle —
+    # Spec B T8 removed the model-level grad path).
+    _bind_grad_context_ffis(lib)
 
     _bind_named_dispatch_ffis(lib)
 
     return lib
+
+
+def _bind_grad_context_ffis(lib: ctypes.CDLL) -> None:
+    """Bind the per-call grad-context FFIs (Spec B §4.2/§4.3/§4.4).
+
+    `nsl_model_forward_grad` records a forward pass into a fresh
+    `GradContext` and writes the ctx pointer out via a caller-supplied
+    `*mut *mut GradContext` slot.
+
+    `nsl_model_backward` REPLACES the legacy `nsl_model_backward(model, ...)`
+    signature — its first argument is now the `*mut GradContext` produced
+    by `forward_grad`, NOT a model handle. The runtime validates a 4-byte
+    magic header on the ctx pointer so a misuse (e.g. passing a model
+    handle) is caught and returned as rc=-1 with a typed error, not UB.
+
+    `nsl_grad_context_destroy` reclaims the ctx Box. Idempotent + safe
+    on a freed or bogus pointer thanks to the same magic-header gate.
+    """
+    if hasattr(lib, "nsl_model_forward_grad"):
+        lib.nsl_model_forward_grad.argtypes = [
+            ctypes.c_int64,  # model_ptr
+            ctypes.c_int64,  # inputs_ptr (NslTensorDesc*)
+            ctypes.c_int64,  # num_inputs
+            ctypes.c_int64,  # outputs_ptr (NslTensorDesc*)
+            ctypes.c_int64,  # num_outputs
+            ctypes.c_int64,  # grad_context_out (*mut *mut GradContext)
+        ]
+        lib.nsl_model_forward_grad.restype = ctypes.c_int64
+
+    if hasattr(lib, "nsl_model_backward"):
+        # NOTE: this REPLACES any prior binding. The legacy
+        # `nsl_model_backward(model, ...)` ABI was removed in Spec B T8.
+        lib.nsl_model_backward.argtypes = [
+            ctypes.c_int64,  # ctx_ptr (*mut GradContext)
+            ctypes.c_int64,  # grad_outputs_ptr (NslTensorDesc*) — v1 unused
+            ctypes.c_int64,  # num_grad_outputs                   — v1 unused
+            ctypes.c_int64,  # grad_inputs_ptr  (NslTensorDesc*)
+            ctypes.c_int64,  # num_grad_inputs
+        ]
+        lib.nsl_model_backward.restype = ctypes.c_int64
+
+    if hasattr(lib, "nsl_grad_context_destroy"):
+        lib.nsl_grad_context_destroy.argtypes = [ctypes.c_int64]
+        lib.nsl_grad_context_destroy.restype = None
 
 
 def _bind_base_lifecycle_ffis(lib: ctypes.CDLL) -> None:
@@ -309,6 +351,10 @@ class NslModel:
             _bind_named_dispatch_ffis(lib)
             # The base lifecycle/error FFIs we also need.
             _bind_base_lifecycle_ffis(lib)
+            # Spec B per-call grad bridge FFIs — exported by the
+            # @export-emitted shared library because the runtime is
+            # statically linked.
+            _bind_grad_context_ffis(lib)
             self._lib = lib
             self._owns_lib_handle = True
 
@@ -485,35 +531,70 @@ class NslModel:
         cleanup()
         return outputs[0] if len(outputs) == 1 else tuple(outputs)
 
-    def backward(self, grad_output, inputs=None):
-        """Run the model backward pass (gradient computation).
+    def forward_grad(self, *inputs):
+        """Run a forward pass that records a gradient tape.
 
-        Args:
-            grad_output: Gradient of the loss w.r.t. the model output.
-            inputs: Original inputs (needed for some AD modes).
+        Returns ``(output, ctx)`` where:
+          - ``output`` is a Python ``list[float]`` (CPU f32, v1 — same
+            convention as :meth:`call`).
+          - ``ctx`` is a :class:`GradContext` wrapping the runtime's
+            per-call ``*mut GradContext`` handle.  Pass ``ctx`` to
+            :meth:`GradContext.backward` to compute parameter gradients.
 
-        Returns:
-            Tuple of gradient tensors for each input.
+        The model-level ``enable_grad`` toggle was removed in Spec B T8;
+        every grad-tracked forward must go through this method.
+
+        Raises:
+            NslError: if the underlying ``nsl_model_forward_grad`` FFI
+                returns non-zero (re-entry, missing weights, dispatch
+                failure, etc.).
         """
-        from nslpy._bridge import prepare_inputs, convert_outputs
-        dl_grads, cleanup = prepare_inputs((grad_output,), self._lib)
-
-        max_grad_inputs = 8
-        grad_buf = (ctypes.c_int64 * max_grad_inputs)()
-        num_grads = ctypes.c_int64(0)
-
-        result = self._lib.nsl_model_backward(
-            self._handle,
-            ctypes.cast(dl_grads, ctypes.c_int64) if dl_grads else 0,
-            1,
-            ctypes.cast(grad_buf, ctypes.c_int64),
-            ctypes.addressof(num_grads),
+        from nslpy._bridge import (
+            build_input_descs,
+            allocate_output_descs,
+            read_f32_output_desc,
         )
-        _check_error(result, self._lib)
 
-        grads = convert_outputs(grad_buf, num_grads.value, self._lib)
-        cleanup()
-        return tuple(grads)
+        if self._handle == 0 or self._destroyed:
+            raise NslError("NslModel.forward_grad: model is closed or invalid")
+        if not hasattr(self._lib, "nsl_model_forward_grad"):
+            raise NslError(
+                "NslModel.forward_grad: nsl_model_forward_grad symbol not "
+                "present in this library — rebuild against a runtime that "
+                "exports the Spec B per-call grad FFIs."
+            )
+
+        in_descs, in_keepalive = build_input_descs(inputs)
+        n_in = len(inputs)
+        inputs_ptr = (
+            ctypes.cast(in_descs, ctypes.c_void_p).value or 0 if n_in > 0 else 0
+        )
+
+        n_out = 1
+        out_descs, out_buffers = allocate_output_descs(n_out, in_descs, n_in)
+        outputs_ptr = ctypes.cast(out_descs, ctypes.c_void_p).value or 0
+
+        ctx_slot = ctypes.c_int64(0)
+        ctx_slot_addr = ctypes.addressof(ctx_slot)
+
+        rc = self._lib.nsl_model_forward_grad(
+            ctypes.c_int64(self._handle),
+            ctypes.c_int64(inputs_ptr),
+            ctypes.c_int64(n_in),
+            ctypes.c_int64(outputs_ptr),
+            ctypes.c_int64(n_out),
+            ctypes.c_int64(ctx_slot_addr),
+        )
+        # Keep buffers alive across the FFI call.
+        _ = in_keepalive
+        _ = out_buffers
+        if rc != 0:
+            msg = _fetch_last_error(self._lib)
+            raise NslError(f"nsl_model_forward_grad returned rc={rc}: {msg}")
+
+        output = read_f32_output_desc(out_descs[0])
+        ctx = GradContext(self._lib, ctx_slot.value)
+        return output, ctx
 
     def __call__(self, *inputs):
         """Shorthand for forward()."""
@@ -541,3 +622,153 @@ class NslModel:
     def __repr__(self) -> str:
         n = self.num_weights if not self._destroyed else "?"
         return f"NslModel(path='{self._path}', weights={n})"
+
+
+# ---------------------------------------------------------------------------
+# GradContext — Python wrapper for a per-call runtime grad-context handle
+# ---------------------------------------------------------------------------
+
+
+class GradContext:
+    """A Python wrapper around the runtime's ``*mut GradContext`` handle.
+
+    Produced by :meth:`NslModel.forward_grad`.  Consumed by exactly one
+    successful :meth:`backward` call (double-backward raises) and
+    optionally explicitly freed via :meth:`destroy`. ``__del__``
+    best-effort destroys the ctx on garbage-collection.
+
+    The runtime validates a 4-byte magic header on every FFI entry so
+    using a stale or wrong-type handle returns ``-1`` with a typed
+    error (or, in :meth:`destroy`'s case, is a silent no-op) rather
+    than UB.
+    """
+
+    __slots__ = ("_lib", "_handle", "_consumed", "_destroyed")
+
+    def __init__(self, lib: ctypes.CDLL, handle: int):
+        self._lib = lib
+        self._handle = int(handle)
+        self._consumed = False
+        self._destroyed = False
+
+    @property
+    def _handle_int(self) -> int:
+        """Raw integer ctx handle (for tests + low-level callers)."""
+        return self._handle
+
+    def backward(self, grad_output=None):
+        """Replay the recorded tape and return per-parameter gradients.
+
+        Args:
+            grad_output: Reserved for v2 explicit upstream-gradient
+                seeding. v1 seeds with ``ones_like(loss)`` internally
+                (scalar-loss convention).
+
+        Returns:
+            ``dict[str, list[float]]`` mapping parameter slot (currently
+            indexed as ``"param_<i>"``; the runtime does not yet thread
+            name metadata through) to its f32 CPU gradient as a
+            Python list.
+
+        Raises:
+            NslError: if the context has already been consumed (double
+                backward), has been destroyed, or if the FFI returns
+                non-zero for any other reason.
+        """
+        if self._destroyed or self._handle == 0:
+            raise NslError("GradContext.backward: context is destroyed")
+
+        from nslpy._bridge import NslTensorDesc
+
+        # Caller-allocated grad-input desc array. v1: one desc per
+        # parameter slot; we don't know the param count up-front, so
+        # allocate a generous fixed-size slab and trust the runtime to
+        # fill only the parameters it actually has (see Spec B §4.3 —
+        # only the first `num_grad_inputs` descs are written).
+        max_grad_inputs = 64
+        grad_descs = (NslTensorDesc * max_grad_inputs)()
+        grad_descs_ptr = ctypes.cast(grad_descs, ctypes.c_void_p).value or 0
+
+        # v1: grad_outputs are ignored by the runtime (scalar-loss seed
+        # is computed internally); we keep the signature flexible for
+        # the future v2 explicit-seed path but pass null+0 today.
+        _ = grad_output
+
+        rc = self._lib.nsl_model_backward(
+            ctypes.c_int64(self._handle),
+            ctypes.c_int64(0),
+            ctypes.c_int64(0),
+            ctypes.c_int64(grad_descs_ptr),
+            ctypes.c_int64(max_grad_inputs),
+        )
+        if rc != 0:
+            msg = _fetch_last_error(self._lib)
+            if "already consumed" in msg:
+                # Raise with a stable substring for tests to match on.
+                raise RuntimeError(
+                    f"GradContext.backward: context already consumed: {msg}"
+                )
+            raise NslError(
+                f"nsl_model_backward returned rc={rc}: {msg}"
+            )
+        self._consumed = True
+
+        # Read out grads. Walk descs until we hit one with null data
+        # (sentinel for "runtime didn't fill this slot"); skip nulls
+        # to keep the dict semantically aligned with the runtime's
+        # actual param list.
+        from nslpy._bridge import read_f32_output_desc
+
+        grads: dict[str, list[float]] = {}
+        for i in range(max_grad_inputs):
+            desc = grad_descs[i]
+            if not desc.data:
+                continue
+            try:
+                grads[f"param_{i}"] = read_f32_output_desc(desc)
+            except (ValueError, Exception):
+                # Degenerate desc — skip rather than blowing up the
+                # whole backward call.
+                continue
+        return grads
+
+    def destroy(self) -> None:
+        """Explicitly release the underlying ctx Box.
+
+        Idempotent. Safe to call after a successful backward (which
+        does NOT auto-destroy — the Spec B contract is that backward
+        consumes-but-keeps the ctx until destroy clears it).
+        """
+        if self._destroyed or self._handle == 0:
+            return
+        try:
+            if hasattr(self._lib, "nsl_grad_context_destroy"):
+                self._lib.nsl_grad_context_destroy(
+                    ctypes.c_int64(self._handle)
+                )
+        finally:
+            self._destroyed = True
+            self._handle = 0
+
+    def __del__(self):
+        try:
+            destroyed = getattr(self, "_destroyed", True)
+            handle = getattr(self, "_handle", 0)
+            lib = getattr(self, "_lib", None)
+        except Exception:
+            return
+        if not destroyed and handle and lib is not None:
+            try:
+                if hasattr(lib, "nsl_grad_context_destroy"):
+                    lib.nsl_grad_context_destroy(ctypes.c_int64(handle))
+            except Exception:
+                pass
+
+    def __repr__(self) -> str:
+        state = "destroyed" if self._destroyed else (
+            "consumed" if self._consumed else "live"
+        )
+        return f"GradContext(handle=0x{self._handle:x}, {state})"
+
+
+# End of nslpy._core — NslModel and GradContext are defined above.
