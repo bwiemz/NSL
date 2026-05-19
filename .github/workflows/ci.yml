@@ -178,3 +178,13 @@ jobs:
 
       - name: Run Layer 3 Yosys gate
         run: cargo test -p nsl-codegen --test yosys_gate
+
+      - name: Fixture determinism check
+        run: |
+          cp crates/nsl-test/fixtures/mlp_int8_weights_v1.bin /tmp/committed.bin
+          cargo run -p nsl-test --bin generate_mlp_int8_weights_v1
+          cmp --silent /tmp/committed.bin crates/nsl-test/fixtures/mlp_int8_weights_v1.bin \
+            || (echo "ERROR: regenerated fixture differs from committed fixture" && exit 1)
+
+      - name: Run nsl-test lib unit tests
+        run: cargo test -p nsl-test --lib
