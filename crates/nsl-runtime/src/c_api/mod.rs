@@ -875,6 +875,105 @@ pub extern "C" fn nsl_tensor_to_desc_ffi(tensor_ptr: i64, desc_ptr: i64) {
     nsl_tensor_to_desc(tensor_ptr, desc);
 }
 
+/// Runtime helper used by the codegen-emitted packed-array dispatch wrapper.
+///
+/// The dispatch wrapper passes its own scratch `NslTensorDesc` to the typed
+/// wrapper so the typed wrapper's data-pointer overwrite lands in scratch
+/// (which the typed wrapper does — it borrows the impl tensor's data
+/// pointer rather than memcpy'ing into a caller buffer). This helper then
+/// folds the scratch desc back onto the caller's preallocated output desc:
+///
+///   - memcpy(`dst.data`, `src.data`, element_count * dtype_size_bytes)
+///   - dst.shape/strides/ndim/dtype/device_* := src.* (caller's preallocated
+///     `dst.data` ptr is preserved so subsequent caller reads see the copy)
+///
+/// Returns 0 on success, -1 on null inputs / unrecognized dtype.
+///
+/// `src_desc_ptr`: scratch desc post-typed-wrapper (data ptr is borrowed
+///                 from an impl-owned tensor; the metadata may have been
+///                 freshly written here).
+/// `dst_desc_ptr`: caller-supplied output desc whose `data` field holds a
+///                 preallocated buffer.
+#[no_mangle]
+pub extern "C" fn nsl_dispatch_apply_result(src_desc_ptr: i64, dst_desc_ptr: i64) -> i64 {
+    if src_desc_ptr == 0 || dst_desc_ptr == 0 {
+        set_error("nsl_dispatch_apply_result: null desc pointer\0".to_string());
+        return -1;
+    }
+    let src = unsafe { &*(src_desc_ptr as *const NslTensorDesc) };
+    let dst = unsafe { &mut *(dst_desc_ptr as *mut NslTensorDesc) };
+
+    // Bytes per element, indexed by C-ABI dtype (see NslTensorDesc::dtype).
+    let elem_bytes: usize = match src.dtype {
+        0 => 4, // f32
+        1 => 8, // f64
+        2 => 2, // f16
+        3 => 2, // bf16
+        4 => 4, // int32
+        5 => 8, // int64
+        6 => 1, // int8
+        7 => 1, // uint8
+        _ => {
+            set_error(format!(
+                "nsl_dispatch_apply_result: unrecognized dtype {}\0",
+                src.dtype
+            ));
+            return -1;
+        }
+    };
+
+    // Element count from shape product.
+    let ndim = src.ndim.max(0) as usize;
+    let mut n_elem: usize = 1;
+    if ndim == 0 {
+        n_elem = 1;
+    } else if src.shape.is_null() {
+        set_error("nsl_dispatch_apply_result: null src shape\0".to_string());
+        return -1;
+    } else {
+        for i in 0..ndim {
+            let d = unsafe { std::ptr::read_unaligned(src.shape.add(i)) };
+            if d < 0 {
+                set_error("nsl_dispatch_apply_result: negative dim in src shape\0".to_string());
+                return -1;
+            }
+            n_elem = n_elem.saturating_mul(d as usize);
+        }
+    }
+
+    let byte_count = n_elem.saturating_mul(elem_bytes);
+
+    let caller_buf = dst.data;
+    if byte_count > 0 {
+        if caller_buf.is_null() || src.data.is_null() {
+            set_error(
+                "nsl_dispatch_apply_result: null data pointer (caller buffer or impl result)\0"
+                    .to_string(),
+            );
+            return -1;
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                src.data as *const u8,
+                caller_buf as *mut u8,
+                byte_count,
+            );
+        }
+    }
+
+    // Mirror metadata (shape/strides/ndim/dtype/device) from src so that
+    // callers reading `dst.ndim`/`dst.shape` after the dispatch see the
+    // actual output shape, not whatever they had pre-populated. Preserve
+    // `dst.data` since that's the caller's buffer we just filled.
+    dst.shape = src.shape;
+    dst.strides = src.strides;
+    dst.ndim = src.ndim;
+    dst.dtype = src.dtype;
+    dst.device_type = src.device_type;
+    dst.device_id = src.device_id;
+    0
+}
+
 /// Convert an NslTensorDesc (C API) into an NslTensor pointer.
 /// The resulting tensor borrows the data buffer — caller must not free the
 /// original data while the tensor is live.

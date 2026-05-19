@@ -71,6 +71,21 @@ use cranelift_codegen::Context;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_module::{DataDescription, Linkage as ModuleLinkage, Module};
 
+/// Size of the C-ABI `NslTensorDesc` struct in bytes. Used by the
+/// packed-array dispatch wrapper to compute per-element pointer offsets
+/// into the input/output descriptor arrays.
+///
+/// Layout (must match `nsl_runtime::c_api::NslTensorDesc`, `#[repr(C)]`):
+///   data: *mut c_void  (8)
+///   shape: *mut i64    (8)
+///   strides: *mut i64  (8)
+///   ndim: i32          (4)
+///   dtype: i32         (4)
+///   device_type: i32   (4)
+///   device_id: i32     (4)
+/// Total = 40 bytes, 8-byte aligned.
+pub(crate) const NSL_TENSOR_DESC_SIZE: i64 = 40;
+
 pub fn emit_c_abi_wrapper(
     compiler: &mut Compiler,
     wrapper: &ExportWrapper,
@@ -208,6 +223,248 @@ pub fn emit_c_abi_wrapper(
         .module
         .define_function(wrapper.wrapper_func_id, &mut ctx)
         .map_err(|e| CodegenError::new(format!("define wrapper fn: {e:?}")))?;
+    Ok(())
+}
+
+/// Build the signature for the packed-array dispatch wrapper:
+///
+///   `fn <name>__nsl_dispatch(
+///        model_ptr: i64,
+///        inputs_desc_ptr: i64,
+///        num_inputs: i64,
+///        outputs_desc_ptr: i64,
+///        num_outputs: i64,
+///    ) -> i64`
+///
+/// This is the signature `ExportRegistry::lookup` consumers expect
+/// (matches `ExportFnPtr` in `nsl-runtime/src/c_api/exports.rs`).
+pub fn build_dispatch_wrapper_signature(call_conv: CallConv) -> Signature {
+    let mut sig = Signature::new(call_conv);
+    sig.params.push(AbiParam::new(types::I64)); // model_ptr
+    sig.params.push(AbiParam::new(types::I64)); // inputs_desc_ptr
+    sig.params.push(AbiParam::new(types::I64)); // num_inputs
+    sig.params.push(AbiParam::new(types::I64)); // outputs_desc_ptr
+    sig.params.push(AbiParam::new(types::I64)); // num_outputs
+    sig.returns.push(AbiParam::new(types::I64));
+    sig
+}
+
+/// Emit the packed-array sibling wrapper `<symbol>__nsl_dispatch`.
+///
+/// This wrapper consumes the `nsl_model_call` ABI (model + input/output
+/// descriptor arrays + counts) and forwards into the existing typed
+/// individual-arg wrapper (`emit_c_abi_wrapper`'s output). Semantics are
+/// identical to the typed wrapper; only the entry ABI differs.
+///
+/// Only tensor-typed parameters and a single-tensor (or single-scalar)
+/// return are supported. Other shapes (scalar params, tuple returns)
+/// fall back to an error stub that sets the thread-local error and
+/// returns -1 — the registry will still find the symbol, so dispatch
+/// callers get a clear runtime error rather than a missing-symbol
+/// dlopen failure.
+pub fn emit_c_abi_dispatch_wrapper(
+    compiler: &mut Compiler,
+    wrapper: &ExportWrapper,
+) -> Result<(), CodegenError> {
+    let call_conv = compiler.module.target_config().default_call_conv;
+    let dispatch_sig = build_dispatch_wrapper_signature(call_conv);
+    let dispatch_symbol = format!("{}__nsl_dispatch", wrapper.export_info.symbol_name);
+
+    let dispatch_fn_id = compiler
+        .module
+        .declare_function(&dispatch_symbol, ModuleLinkage::Export, &dispatch_sig)
+        .map_err(|e| {
+            CodegenError::new(format!(
+                "declare dispatch wrapper '{dispatch_symbol}': {e:?}"
+            ))
+        })?;
+
+    // Determine whether this signature is dispatch-compatible.
+    //   - All params must be tensors (packed-array ABI has no scalar slots).
+    //   - Return must be a single Tensor or Scalar (single output desc).
+    let all_tensor_params = wrapper
+        .export_info
+        .params
+        .iter()
+        .all(|p| matches!(p.ty, ExportTypeInfo::Tensor { .. }));
+    let single_output = matches!(
+        wrapper.export_info.return_type,
+        ExportTypeInfo::Tensor { .. } | ExportTypeInfo::Scalar(_)
+    );
+    let supported = all_tensor_params && single_output;
+
+    let expected_inputs = wrapper.export_info.params.len() as i64;
+    let expected_outputs: i64 = 1; // tuple returns not supported in v1
+
+    let mut ctx = Context::for_function(Function::with_name_signature(
+        UserFuncName::user(0, compiler.next_func_index()),
+        dispatch_sig,
+    ));
+    let mut fn_builder_ctx = FunctionBuilderContext::new();
+
+    {
+        let mut builder = FunctionBuilder::new(&mut ctx.func, &mut fn_builder_ctx);
+
+        let entry = builder.create_block();
+        builder.append_block_params_for_function_params(entry);
+        builder.switch_to_block(entry);
+        builder.seal_block(entry);
+
+        let params: Vec<_> = builder.block_params(entry).to_vec();
+        let model_ptr = params[0];
+        let inputs_ptr = params[1];
+        let num_inputs = params[2];
+        let outputs_ptr = params[3];
+        let num_outputs = params[4];
+
+        if !supported {
+            // Emit a stub that sets the thread-local error and returns -1.
+            // The symbol still exists so the registry's dlsym succeeds, but
+            // any call routes to a clear error rather than miscompiling.
+            let msg = format!(
+                "export '{}' has a signature unsupported by nsl_model_call \
+                 (only all-Tensor params + single Tensor/Scalar return are dispatchable)",
+                wrapper.export_info.raw_name
+            );
+            emit_set_error(&mut builder, &mut compiler.module, &msg)?;
+            let neg_one = builder.ins().iconst(cw_types::I64, -1);
+            builder.ins().return_(&[neg_one]);
+            builder.finalize();
+
+            compiler
+                .module
+                .define_function(dispatch_fn_id, &mut ctx)
+                .map_err(|e| CodegenError::new(format!("define dispatch wrapper stub: {e:?}")))?;
+            return Ok(());
+        }
+
+        // ── Validate arity ───────────────────────────────────────────────
+        let err_block = builder.create_block();
+        let check_outputs_block = builder.create_block();
+        let dispatch_block = builder.create_block();
+
+        let expected_in_val = builder.ins().iconst(cw_types::I64, expected_inputs);
+        let in_eq = builder
+            .ins()
+            .icmp(IntCC::Equal, num_inputs, expected_in_val);
+        builder
+            .ins()
+            .brif(in_eq, check_outputs_block, &[], err_block, &[]);
+
+        builder.switch_to_block(check_outputs_block);
+        builder.seal_block(check_outputs_block);
+        let expected_out_val = builder.ins().iconst(cw_types::I64, expected_outputs);
+        let out_eq = builder
+            .ins()
+            .icmp(IntCC::Equal, num_outputs, expected_out_val);
+        builder
+            .ins()
+            .brif(out_eq, dispatch_block, &[], err_block, &[]);
+
+        // Error path: set error, return -1.
+        builder.switch_to_block(err_block);
+        builder.seal_block(err_block);
+        let arity_msg = format!(
+            "export '{}' arity mismatch (expected {} inputs, {} outputs)",
+            wrapper.export_info.raw_name, expected_inputs, expected_outputs
+        );
+        emit_set_error(&mut builder, &mut compiler.module, &arity_msg)?;
+        let neg_one = builder.ins().iconst(cw_types::I64, -1);
+        builder.ins().return_(&[neg_one]);
+
+        // Dispatch path: unpack descriptor pointers, stage a scratch output
+        // desc, call the typed wrapper, then fold scratch into the caller's
+        // preallocated output desc (memcpy data, mirror metadata).
+        builder.switch_to_block(dispatch_block);
+        builder.seal_block(dispatch_block);
+
+        // Stack-allocate a scratch NslTensorDesc for the single output. The
+        // typed wrapper writes its result tensor's metadata here (and we
+        // don't want it overwriting the caller's `data` ptr — that's the
+        // preallocated buffer we need to memcpy into below).
+        let scratch_slot = builder.create_sized_stack_slot(
+            cranelift_codegen::ir::StackSlotData::new(
+                cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                NSL_TENSOR_DESC_SIZE as u32,
+                3, // align: 2^3 = 8 bytes (NslTensorDesc is 8-byte aligned)
+            ),
+        );
+        let scratch_ptr = builder
+            .ins()
+            .stack_addr(cw_types::I64, scratch_slot, 0);
+        // Zero-init scratch — typed wrapper will overwrite all 7 metadata
+        // fields, but zeroing first guards against any field being skipped.
+        let zero_i64_init = builder.ins().iconst(cw_types::I64, 0);
+        for off in (0..NSL_TENSOR_DESC_SIZE).step_by(8) {
+            builder
+                .ins()
+                .store(MemFlags::trusted(), zero_i64_init, scratch_ptr, off as i32);
+        }
+
+        let typed_ref = compiler
+            .module
+            .declare_func_in_func(wrapper.wrapper_func_id, builder.func);
+
+        let mut typed_args: Vec<cranelift_codegen::ir::Value> = Vec::new();
+        typed_args.push(model_ptr);
+
+        // One pointer per tensor input: inputs_ptr + i * sizeof(NslTensorDesc).
+        for i in 0..wrapper.export_info.params.len() {
+            let off = (i as i64) * NSL_TENSOR_DESC_SIZE;
+            let desc_ptr = if off == 0 {
+                inputs_ptr
+            } else {
+                builder.ins().iadd_imm(inputs_ptr, off)
+            };
+            typed_args.push(desc_ptr);
+        }
+
+        // Single output: typed wrapper writes into scratch (not caller's
+        // desc); we'll fold scratch back below. The arity check above
+        // already verified num_outputs == 1, so the typed wrapper (which
+        // doesn't take a count) is safe to call as a single-output sink.
+
+        let call_inst = builder.ins().call(typed_ref, &typed_args);
+        let rc_i32 = builder.inst_results(call_inst)[0];
+
+        // If the typed wrapper failed, skip the copy and return its code.
+        let fail_block = builder.create_block();
+        let copy_block = builder.create_block();
+        let zero_i32 = builder.ins().iconst(cw_types::I32, 0);
+        let typed_ok = builder.ins().icmp(IntCC::Equal, rc_i32, zero_i32);
+        builder.ins().brif(typed_ok, copy_block, &[], fail_block, &[]);
+
+        builder.switch_to_block(fail_block);
+        builder.seal_block(fail_block);
+        let fail_rc = builder.ins().sextend(cw_types::I64, rc_i32);
+        builder.ins().return_(&[fail_rc]);
+
+        builder.switch_to_block(copy_block);
+        builder.seal_block(copy_block);
+
+        // Fold scratch → caller's preallocated output desc.
+        let apply_fid = declare_runtime_fn(
+            &mut compiler.module,
+            "nsl_dispatch_apply_result",
+            &[cw_types::I64, cw_types::I64],
+            &[cw_types::I64],
+        )?;
+        let apply_ref = compiler
+            .module
+            .declare_func_in_func(apply_fid, builder.func);
+        let apply_call = builder
+            .ins()
+            .call(apply_ref, &[scratch_ptr, outputs_ptr]);
+        let apply_rc = builder.inst_results(apply_call)[0];
+        builder.ins().return_(&[apply_rc]);
+
+        builder.finalize();
+    }
+
+    compiler
+        .module
+        .define_function(dispatch_fn_id, &mut ctx)
+        .map_err(|e| CodegenError::new(format!("define dispatch wrapper fn: {e:?}")))?;
     Ok(())
 }
 

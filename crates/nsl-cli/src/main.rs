@@ -2326,6 +2326,14 @@ fn run_build_shared_single(
         .ok()
         .and_then(|g| g.as_ref().map(|v| v.iter().map(|e| e.symbol_name.clone()).collect()))
         .unwrap_or_default();
+    // Sibling packed-array dispatch wrappers (`<name>__nsl_dispatch`) emitted
+    // alongside every typed `<name>` wrapper. The runtime ExportRegistry
+    // dlsyms these via the suffix; MSVC requires them in the explicit export
+    // list to survive linking.
+    let dispatch_symbols: Vec<String> = export_symbols
+        .iter()
+        .map(|s| format!("{}__nsl_dispatch", s))
+        .collect();
     // M62 Task 9: also re-export the runtime lifecycle symbols so that ctypes
     // callers can call nsl_model_create / nsl_model_destroy / nsl_get_last_error
     // directly from the generated shared lib without loading a separate runtime DLL.
@@ -2342,8 +2350,10 @@ fn run_build_shared_single(
         "nsl_tensor_free",
         "nsl_get_num_exports",
         "nsl_get_export_name",
+        "nsl_dispatch_apply_result",
     ];
     let mut export_refs: Vec<&str> = export_symbols.iter().map(|s| s.as_str()).collect();
+    export_refs.extend(dispatch_symbols.iter().map(|s| s.as_str()));
     export_refs.extend_from_slice(&runtime_exports);
 
     match nsl_codegen::linker::link_shared_with_exports(
@@ -2605,6 +2615,12 @@ fn run_build_shared_multi(
         .ok()
         .and_then(|g| g.as_ref().map(|v| v.iter().map(|e| e.symbol_name.clone()).collect()))
         .unwrap_or_default();
+    // Sibling packed-array dispatch wrappers (`<name>__nsl_dispatch`); see
+    // single-file path above for rationale.
+    let dispatch_symbols: Vec<String> = export_symbols
+        .iter()
+        .map(|s| format!("{}__nsl_dispatch", s))
+        .collect();
     // M62 Task 9: mirror the single-file path and re-export runtime lifecycle
     // symbols so ctypes callers can load weights + call exports through the
     // generated DLL without loading a separate runtime DLL.
@@ -2621,8 +2637,10 @@ fn run_build_shared_multi(
         "nsl_tensor_free",
         "nsl_get_num_exports",
         "nsl_get_export_name",
+        "nsl_dispatch_apply_result",
     ];
     let mut export_refs: Vec<&str> = export_symbols.iter().map(|s| s.as_str()).collect();
+    export_refs.extend(dispatch_symbols.iter().map(|s| s.as_str()));
     export_refs.extend_from_slice(&runtime_exports);
 
     match nsl_codegen::linker::link_shared_with_exports(&obj_files, &lib_path, &export_refs) {

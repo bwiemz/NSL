@@ -1384,6 +1384,13 @@ impl<'a> Compiler<'a> {
         let wrappers = self.features.export_wrappers.clone();
         for wrapper in &wrappers {
             crate::c_wrapper::emit_c_abi_wrapper(self, wrapper)?;
+            // Sibling packed-array wrapper used by nsl_model_call. The typed
+            // wrapper above is unchanged (preserves the Spec §2.3 ABI
+            // bit-stability commitment for direct dlsym callers); this
+            // dispatch wrapper exposes the same export under the
+            // `__nsl_dispatch` suffix with the (model, in_arr, n_in,
+            // out_arr, n_out) -> i64 ABI.
+            crate::c_wrapper::emit_c_abi_dispatch_wrapper(self, wrapper)?;
         }
 
         let exports = self.features.export_functions.clone();

@@ -131,21 +131,32 @@ impl ExportRegistry {
             names
         };
 
+        // The HashMap is keyed by the user-facing export name (`alpha`,
+        // `custom_beta`, ...) so `registry.lookup("alpha")` works. The
+        // dlsym'd pointer, however, is the packed-array sibling
+        // (`<name>__nsl_dispatch`) which honors the `ExportFnPtr` ABI used by
+        // `nsl_model_call`. The typed `<name>` symbol still exists in the
+        // shared library for direct ctypes callers; the registry just doesn't
+        // route through it.
         let mut table: HashMap<CString, ExportFnPtr> = HashMap::with_capacity(names.len());
         for name in &names {
-            let cname = CString::new(name.as_str())
+            let user_cname = CString::new(name.as_str())
                 .expect("export name from codegen enumeration must not contain interior NUL");
+            let dispatch_sym = format!("{}__nsl_dispatch", name);
+            let dispatch_cname = CString::new(dispatch_sym.as_str()).expect(
+                "export name + __nsl_dispatch suffix must not contain interior NUL",
+            );
             let sym: libloading::Symbol<*mut c_void> =
-                unsafe { library.get(cname.as_bytes_with_nul()) }.map_err(|_| {
+                unsafe { library.get(dispatch_cname.as_bytes_with_nul()) }.map_err(|_| {
                     ExportRegistryError::ExportMissing {
-                        name: name.clone(),
+                        name: dispatch_sym.clone(),
                         available: names.clone(),
                     }
                 })?;
             let raw_ptr = *sym;
             let fn_ptr: ExportFnPtr =
                 unsafe { std::mem::transmute::<*mut c_void, ExportFnPtr>(raw_ptr) };
-            table.insert(cname, fn_ptr);
+            table.insert(user_cname, fn_ptr);
         }
 
         Ok(Self { library, table })

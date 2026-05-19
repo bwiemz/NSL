@@ -58,15 +58,12 @@ fn identity(x: Tensor<[4], f32>) -> Tensor<[4], f32>:
     (lib, weights)
 }
 
-// ABI dependency: c_wrapper.rs currently emits the per-`@export` symbol with
-// individual-arg signature (NslModel*, NslTensorDesc* x, NslTensorDesc* ret)
-// rather than the packed-array NslExportFn signature defined in Spec A §2.5
-// (NslModel*, const NslTensorDesc*, int32_t, NslTensorDesc*, int32_t). Until
-// the wrapper signature is updated to match the dispatcher ABI, end-to-end
-// dispatch via `nsl_model_call` corrupts the callee's stack frame and
-// crashes on the misaligned ret_desc pointer. Re-enable once the codegen
-// emits the packed-array wrapper.
-#[ignore]
+// Dispatch goes through the packed-array sibling wrapper
+// (`<name>__nsl_dispatch`) emitted alongside the typed `<name>` wrapper.
+// The dispatch wrapper unpacks the descriptor arrays and forwards into the
+// typed wrapper, so the ABI presented to `nsl_model_call` matches
+// `ExportFnPtr` while the typed wrapper still exists for direct ctypes
+// callers (Spec §2.3 ABI bit-stability).
 #[test]
 fn call_routes_to_named_export_and_produces_output() {
     let (lib, weights) = build_identity_lib();
