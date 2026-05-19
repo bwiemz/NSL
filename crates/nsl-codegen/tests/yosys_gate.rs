@@ -68,10 +68,10 @@ fn yosys_gate_v1_mlp_clean() {
     let module = pass.lower(&kir, "tiny_mlp").unwrap();
     let verilog = VerilogEmitter::emit_module(&module);
 
-    let tmp_dir = std::env::temp_dir().join("nsl_fpga_test");
-    std::fs::create_dir_all(&tmp_dir).unwrap();
-    let v_path = tmp_dir.join("tiny_mlp.v");
-    let log_path = tmp_dir.join("yosys-full.log");
+    // Per-test TempDir so parallel runs don't race on a shared path.
+    let tmp = tempfile::TempDir::new().expect("create tempdir");
+    let v_path = tmp.path().join("tiny_mlp.v");
+    let log_path = tmp.path().join("yosys-full.log");
     std::fs::write(&v_path, &verilog).unwrap();
 
     let result = YosysGate::run(&v_path, &log_path);
@@ -79,6 +79,9 @@ fn yosys_gate_v1_mlp_clean() {
         eprintln!("yosys gate failed: {e}");
         eprintln!("emitted Verilog snippet (first 200 lines):\n{}",
                   verilog.lines().take(200).collect::<Vec<_>>().join("\n"));
+        // Leak the tempdir on failure so the developer can inspect the log.
+        let preserved = tmp.keep();
+        eprintln!("Yosys log preserved at: {}", preserved.display());
     }
     result.expect("yosys gate must pass with zero warnings on v1 MLP");
 }
