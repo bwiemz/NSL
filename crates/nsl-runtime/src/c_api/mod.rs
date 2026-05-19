@@ -130,6 +130,14 @@ fn set_error(msg: String) {
     LAST_ERROR.with(|e| *e.borrow_mut() = Some(cstr));
 }
 
+/// Spec B §5.2/§5.5 helper: set the thread-local error from an already-
+/// constructed `CString`. Used by `grad_context.rs` to avoid the
+/// `String → CString` allocation churn for the small set of static
+/// messages used by the per-call grad-context FFIs.
+pub(crate) fn set_error_cstring(cstr: std::ffi::CString) {
+    LAST_ERROR.with(|e| *e.borrow_mut() = Some(cstr));
+}
+
 fn capi_trace(msg: impl AsRef<str>) {
     if std::env::var_os("NSL_CAPI_TRACE").is_some() {
         eprintln!("[nsl-capi] {}", msg.as_ref());
@@ -989,7 +997,7 @@ pub extern "C" fn nsl_dispatch_apply_result(src_desc_ptr: i64, dst_desc_ptr: i64
 /// Convert an NslTensorDesc (C API) into an NslTensor pointer.
 /// The resulting tensor borrows the data buffer — caller must not free the
 /// original data while the tensor is live.
-fn desc_to_nsl_tensor(desc: &NslTensorDesc) -> i64 {
+pub(crate) fn desc_to_nsl_tensor(desc: &NslTensorDesc) -> i64 {
     let ndim = desc.ndim as usize;
     let nsl_dtype = capi_dtype_to_nsl(desc.dtype);
 
@@ -1037,7 +1045,7 @@ fn desc_to_nsl_tensor(desc: &NslTensorDesc) -> i64 {
 }
 
 /// Fill an NslTensorDesc from an NslTensor pointer.
-fn nsl_tensor_to_desc(tensor_ptr: i64, desc: &mut NslTensorDesc) {
+pub(crate) fn nsl_tensor_to_desc(tensor_ptr: i64, desc: &mut NslTensorDesc) {
     let tensor = NslTensor::from_ptr(tensor_ptr);
     desc.data = tensor.data;
     desc.ndim = tensor.ndim as i32;
@@ -1071,110 +1079,16 @@ pub extern "C" fn nsl_model_enable_grad(model_ptr: i64, enable: i64) -> i64 {
     0
 }
 
-/// Run the model backward pass, computing gradients w.r.t. all weight parameters.
-///
-/// This function replays the tape recorded during the most recent grad-enabled
-/// forward pass (`nsl_model_enable_grad` + `nsl_model_forward`), computing
-/// ∂loss/∂param for every weight in the model.
-///
-/// Parameters:
-///   model_ptr:            NslModel* handle
-///   grad_outputs_ptr:     (reserved) upstream gradient tensors — currently unused;
-///                         the loss scalar is taken directly from the forward output
-///   num_grad_outputs:     number of upstream gradient tensors (reserved)
-///   grad_inputs_ptr:      pointer to a caller-allocated array of NslTensorDesc that
-///                         will be filled with one gradient descriptor per weight;
-///                         pass 0 to query the count only
-///   num_grad_inputs_ptr:  output — written with the number of weight gradients
-///
-/// Returns: 0 on success, negative on error (message in thread-local).
-///
-/// Typical usage (from Python/C bridge):
-///   nsl_model_enable_grad(model, 1);
-///   nsl_model_forward(model, inputs, n, outputs, n_out);
-///   nsl_model_backward(model, 0, 0, grad_buf, &num_grads);
-///   nsl_model_enable_grad(model, 0);  // optional: disable for inference
-#[no_mangle]
-pub extern "C" fn nsl_model_backward(
-    model_ptr: i64,
-    _grad_outputs_ptr: i64,
-    _num_grad_outputs: i64,
-    grad_inputs_ptr: i64,
-    num_grad_inputs_ptr: i64,
-) -> i64 {
-    if model_ptr == 0 {
-        set_error("nsl_model_backward: null model pointer\0".to_string());
-        return -1;
-    }
-    let model = unsafe { &*(model_ptr as *const NslModel) };
-
-    if !model.grad_enabled {
-        set_error("nsl_model_backward: grad not enabled — call nsl_model_enable_grad(model, 1) before nsl_model_forward\0".to_string());
-        return -1;
-    }
-
-    if model.last_forward_outputs.is_empty() {
-        set_error("nsl_model_backward: no forward pass recorded — call nsl_model_forward with grad enabled first\0".to_string());
-        return -1;
-    }
-
-    // Build the param list for tape_backward — same weights that were registered at tape_start.
-    let param_list = crate::list::nsl_list_new();
-    for &wptr in &model.weight_ptrs {
-        crate::list::nsl_list_push(param_list, wptr);
-    }
-
-    // Use the first forward output as the loss tensor.
-    // For standard training this is a scalar loss; for multi-output models the
-    // caller should pass grad_outputs to scale/combine, but that is reserved for
-    // a future revision. Chain-rule seeding from the scalar loss is sufficient
-    // for all current NSL training patterns.
-    let loss_ptr = model.last_forward_outputs[0];
-
-    // Run backward — this drains the tape ops and returns one gradient per param.
-    let grads_list = crate::autodiff::nsl_tape_backward(loss_ptr, param_list);
-
-    // Reset tape to clean state (recording=false, ops/param_set cleared).
-    crate::autodiff::nsl_tape_stop();
-
-    let num_params = model.weight_ptrs.len();
-
-    // Write gradient count to caller's output pointer.
-    if num_grad_inputs_ptr != 0 {
-        unsafe { *(num_grad_inputs_ptr as *mut i64) = num_params as i64 };
-    }
-
-    // Fill gradient descriptors if the caller provided a buffer.
-    if grad_inputs_ptr != 0 && num_params > 0 {
-        let out_descs = unsafe {
-            std::slice::from_raw_parts_mut(grad_inputs_ptr as *mut NslTensorDesc, num_params)
-        };
-        for (i, desc) in out_descs.iter_mut().enumerate() {
-            let grad_ptr = crate::list::nsl_list_get(grads_list, i as i64);
-            if grad_ptr != 0 {
-                nsl_tensor_to_desc(grad_ptr, desc);
-            }
-        }
-    }
-
-    // Clear the saved forward outputs now that backward is done.
-    // SAFETY: we hold a shared reference to model above but no longer read it,
-    // and last_forward_outputs is only mutated by this function and nsl_model_forward
-    // (never concurrently — the C API is single-threaded per the M62 contract).
-    {
-        let model_mut = unsafe { &mut *(model_ptr as *mut NslModel) };
-        model_mut.last_forward_outputs.clear();
-    }
-
-    // The gradient tensors in grads_list are referenced by the descriptors we
-    // filled above (the descriptors borrow the tensor data pointers). We free the
-    // list wrapper but leave the tensors alive — the caller owns them via the
-    // NslTensorDesc.data pointers and is responsible for freeing them.
-    crate::list::nsl_list_free(grads_list);
-    crate::list::nsl_list_free(param_list);
-
-    0
-}
+// Spec B §4.4 — the model-level `nsl_model_backward(model, ...)` FFI is
+// replaced by the per-call `nsl_model_backward(ctx, ...)` defined in
+// `grad_context.rs`. The two cannot coexist (same exported symbol); the
+// switch is structural to enforce the headline invariant from §2 (backward
+// reads only from `GradContext`, never from the thread-local tape).
+//
+// `nsl_model_enable_grad` and the `grad_enabled` / `last_forward_outputs`
+// fields on `NslModel` are intentionally kept until Spec B T8 — they are
+// dead in this commit's `c_api` but still needed by the Python autograd
+// bridge migration step.
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -1300,62 +1214,13 @@ mod tests {
         assert_eq!(nsl_model_enable_grad(0, 1), -1);
     }
 
-    #[test]
-    fn test_backward_null_model() {
-        assert_eq!(nsl_model_backward(0, 0, 0, 0, 0), -1);
-    }
-
-    #[test]
-    fn test_backward_without_enable_grad() {
-        // Build a minimal NslModel directly (no weights file needed).
-        let model = Box::new(NslModel {
-            version: 2,
-            weights: HashMap::new(),
-            weight_ptrs: vec![],
-            weights_path: String::new(),
-            grad_enabled: false,
-            last_forward_outputs: vec![],
-            exports: None,
-        });
-        let model_ptr = Box::into_raw(model) as i64;
-
-        // Backward without enabling grad must fail with a meaningful error.
-        let ret = nsl_model_backward(model_ptr, 0, 0, 0, 0);
-        assert_eq!(ret, -1);
-
-        // Error message should mention enable_grad.
-        let err_ptr = nsl_get_last_error() as *const std::os::raw::c_char;
-        let err_msg = unsafe { CStr::from_ptr(err_ptr) }.to_str().unwrap_or("");
-        assert!(err_msg.contains("grad not enabled"), "unexpected error: {err_msg}");
-
-        unsafe { drop(Box::from_raw(model_ptr as *mut NslModel)); }
-        nsl_clear_error();
-    }
-
-    #[test]
-    fn test_backward_without_forward() {
-        // Build a model with grad enabled but no prior forward pass.
-        let model = Box::new(NslModel {
-            version: 2,
-            weights: HashMap::new(),
-            weight_ptrs: vec![],
-            weights_path: String::new(),
-            grad_enabled: true,
-            last_forward_outputs: vec![],
-            exports: None,
-        });
-        let model_ptr = Box::into_raw(model) as i64;
-
-        let ret = nsl_model_backward(model_ptr, 0, 0, 0, 0);
-        assert_eq!(ret, -1);
-
-        let err_ptr = nsl_get_last_error() as *const std::os::raw::c_char;
-        let err_msg = unsafe { CStr::from_ptr(err_ptr) }.to_str().unwrap_or("");
-        assert!(err_msg.contains("no forward pass recorded"), "unexpected error: {err_msg}");
-
-        unsafe { drop(Box::from_raw(model_ptr as *mut NslModel)); }
-        nsl_clear_error();
-    }
+    // Spec B T3/T4 — the legacy `test_backward_null_model`,
+    // `test_backward_without_enable_grad`, and `test_backward_without_forward`
+    // tests exercised the model-level `nsl_model_backward(model, ...)` FFI
+    // that has been removed (replaced by per-call `nsl_model_backward(ctx,
+    // ...)` in `grad_context.rs`). Equivalent contract tests for the new
+    // signature live in `tests/backward_does_not_consult_live_tape.rs` and
+    // sibling integration files added by Spec B T5/T6.
 
     #[test]
     fn nsl_set_error_cstr_sets_thread_local() {
