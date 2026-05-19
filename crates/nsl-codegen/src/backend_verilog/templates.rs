@@ -262,7 +262,6 @@ mod tests {
 #[cfg(test)]
 mod register_tests {
     use super::*;
-    use crate::hir::clock_reset::*;
 
     fn default_name_tables() -> (BTreeMap<ClockDomainId, String>, BTreeMap<ResetSignalId, String>) {
         let mut cd = BTreeMap::new();
