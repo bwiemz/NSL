@@ -1,0 +1,33 @@
+---
+source: crates/nsl-codegen/tests/hir_pass_snapshots.rs
+expression: structural_summary(&module)
+---
+module: tiny_mlp
+test_taps: true
+ports: 0
+nodes: 6
+[0] GenerateFor lo=0 hi=128 body={
+  [0] GenerateFor lo=0 hi=784 body={
+    [0] Mul a_width=8 b_width=8 out_width=16 a="Port(__matmul_a)" b="Port(__matmul_b)"
+    [1] SignExtend src_width=16 dst_width=32
+    [2] Add width=32 a="Port(__matmul_acc_prev)" b="Wire(<id>)"
+  }
+}
+[1] GenerateFor lo=0 hi=128 body={
+  [0] Add width=32 a="Port(__bias_pre)" b="Port(__bias_b)"
+}
+[2] GenerateFor lo=0 hi=128 body={
+  [0] Max0 width=32 a="Port(__relu_in)"
+}
+[3] GenerateFor lo=0 hi=10 body={
+  [0] GenerateFor lo=0 hi=128 body={
+    [0] Mul a_width=32 b_width=32 out_width=64 a="Port(__matmul_a)" b="Port(__matmul_b)"
+    [1] Add width=64 a="Port(__matmul_acc_prev)" b="Wire(<id>)"
+  }
+}
+[4] GenerateFor lo=0 hi=10 body={
+  [0] Add width=64 a="Port(__bias_pre)" b="Port(__bias_b)"
+}
+[5] GenerateFor lo=0 hi=10 body={
+  [0] Max0 width=64 a="Port(__relu_in)"
+}
