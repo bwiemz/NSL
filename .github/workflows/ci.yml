@@ -140,3 +140,41 @@ jobs:
               issue_number: context.issue.number,
               body: '## merge-gate-preview output\n\n```\n' + truncated + '\n```\n\n_Reviewer: evaluate this output before approving the `#[ignore]` flip in commit 2. Failure does not block merge of commit 1._',
             });
+
+  fpga:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+
+      - name: Install Verilator + Yosys
+        run: sudo apt-get update && sudo apt-get install -y verilator yosys
+
+      - name: Record tool versions (provenance per §5.4)
+        run: |
+          echo "Ubuntu: $(lsb_release -ds)"
+          verilator --version
+          yosys -V
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/
+          key: ${{ runner.os }}-cargo-fpga-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build NSL codegen
+        run: cargo build -p nsl-codegen --release
+
+      - name: Run Layer 1 snapshot tests
+        run: cargo test -p nsl-codegen --test verilog_emission_snapshots --test hir_pass_snapshots
+
+      - name: Run Layer 3 Yosys gate
+        run: cargo test -p nsl-codegen --test yosys_gate
