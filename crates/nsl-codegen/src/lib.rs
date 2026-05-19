@@ -154,6 +154,7 @@ pub use wggo_overrides::{
 };
 pub mod fpga_error;
 pub mod hir;
+pub mod backend_verilog;
 pub mod wrga;
 pub mod matmul_mma;
 pub mod wrga_adapter_init;
