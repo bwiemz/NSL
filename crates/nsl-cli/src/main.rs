@@ -692,6 +692,33 @@ enum Cli {
         #[arg(long, default_value = "nsl")]
         ext: String,
     },
+
+    /// M57: Compile an NSL file to synthesizable Verilog for FPGA targets.
+    ///
+    /// NOTE: --target fpga is not yet end-to-end functional.
+    /// PRs 1-4 shipped the HIR + KIR->HIR + HIR->Verilog + Yosys-gate +
+    /// fixture infrastructure (M57 milestone).  AST -> structured KIR dispatch,
+    /// HIR port/wire generation, and CLI dispatch wiring are deferred to
+    /// M57.1 (v1 closure follow-on).
+    FpgaCompile {
+        /// Path to the .nsl file to compile
+        file: PathBuf,
+
+        /// Output directory for the emitted .v file
+        #[arg(short, long)]
+        output_dir: Option<PathBuf>,
+
+        /// Path to the weight fixture binary (.bin) for the v1 MLP.
+        /// Defaults to <input_dir>/<source_basename>_weights.bin (sidecar convention).
+        /// See spec §6.1 for the sidecar lookup rules.
+        #[arg(long)]
+        fixture: Option<PathBuf>,
+
+        /// Emit test-tap ports on all intermediate signals (Layer 2 + Layer 3 gates).
+        /// Only valid with --target fpga.
+        #[arg(long)]
+        test_taps: bool,
+    },
 }
 
 /// M55: ZK subcommands.
@@ -1933,6 +1960,31 @@ fn main_inner() {
         }
         Cli::Tokenize { dirs, output, vocab_size, min_freq, ext } => {
             run_tokenize(&dirs, &output, vocab_size, min_freq, &ext);
+        }
+
+        Cli::FpgaCompile { file: _, output_dir: _, fixture: _, test_taps: _ } => {
+            // M57 PR 1-4 shipped: HIR skeleton, KIR->HIR pass, HIR->Verilog
+            // emission, Yosys CI gate, fixture subsystem, CPU reference, and
+            // Verilator harness infrastructure.
+            //
+            // End-to-end `--target fpga` dispatch is NOT YET FUNCTIONAL.
+            // Deferred to M57.1 (v1 closure follow-on). Prerequisites:
+            //   1. AST -> structured KIR dispatch (KirOp::Matmul/Relu for Target::Fpga)
+            //   2. HIR port/wire declarations for signals derived from AST nodes
+            //   3. MAC-chain GenerateFor genvar indexing (acc[i] = acc[i-1] + product)
+            //   4. INT8 dtype keyword in NSL grammar (Tensor<[784], i8>)
+            eprintln!(
+                "error: --target fpga (nsl fpga-compile) is not yet end-to-end functional.\n\
+                 \n\
+                 PRs 1-4 shipped the HIR + KIR->HIR + HIR->Verilog + Yosys-gate +\n\
+                 fixture subsystem infrastructure (M57 milestone).\n\
+                 AST -> structured KIR dispatch, HIR port/wire generation, and\n\
+                 CLI dispatch wiring are deferred to M57.1 (v1 closure follow-on).\n\
+                 \n\
+                 See docs/superpowers/specs/2026-05-18-m57-fpga-verilog-design.md §1.5\n\
+                 for the deferred-to-named-milestones table."
+            );
+            process::exit(1);
         }
     }
 }
