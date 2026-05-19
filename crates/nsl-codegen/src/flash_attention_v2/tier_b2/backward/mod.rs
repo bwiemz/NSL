@@ -10,6 +10,7 @@
 //! individual emitters are callable directly for testing.
 
 pub mod d_prepass;
+pub mod dq;
 
 use crate::flash_attention::FlashAttentionConfig;
 
