@@ -980,11 +980,33 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
     // releasing saved activations as soon as they're consumed, rather than
     // holding all of them until tape_stop(). Since we own the ops, tape_stop()
     // will see an empty ops vec and skip release_tape_op_refs().
-    let mut ops: Vec<TapeOp> = TAPE.with(|t| {
+    let ops: Vec<TapeOp> = TAPE.with(|t| {
         let mut tape = t.borrow_mut();
         std::mem::take(&mut tape.ops)
     });
 
+    let result = run_backward_core(ops, loss_ptr, &param_ptrs);
+
+    // Resume recording (paired with the `pause_depth += 1` above).
+    TAPE.with(|t| t.borrow_mut().pause_depth -= 1);
+
+    result
+}
+
+/// Pure backward core: replay `ops` in reverse against `loss_ptr` to produce
+/// a gradient per parameter in `param_ptrs`, returned as an NslList in the
+/// same order as `param_ptrs`.
+///
+/// **Headline invariant (Spec B §2):** this function reads nothing from
+/// `crate::autodiff::TAPE`. It operates entirely on the passed-in ops
+/// vector. The thread-local-draining wrapper `nsl_tape_backward` owns the
+/// `pause_depth += 1` side effect; a later FFI (Spec B T4) will call this
+/// core with ops moved out of a `GradContext` instead.
+pub(crate) fn run_backward_core(
+    mut ops: Vec<TapeOp>,
+    loss_ptr: i64,
+    param_ptrs: &[i64],
+) -> i64 {
     // grad_map: tensor_ptr -> gradient tensor ptr
     let mut grad_map: HashMap<i64, i64> = HashMap::new();
 
@@ -1623,12 +1645,9 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
         }
     }
 
-    // Resume recording
-    TAPE.with(|t| t.borrow_mut().pause_depth -= 1);
-
     // Build result list: look up by tape_id when active, raw ptr fallback
     let result_list = crate::list::nsl_list_new();
-    for ptr in &param_ptrs {
+    for ptr in param_ptrs {
         let key = { let t = crate::tensor::NslTensor::from_ptr(*ptr); if t.tape_id != 0 { t.tape_id } else { *ptr } };
         if let Some(grad) = grad_map.remove(&key) {
             crate::list::nsl_list_push(result_list, grad);
