@@ -3,7 +3,7 @@
 
 use crate::fpga_error::{FpgaLoweringError, V1_SUPPORTED_OPS};
 use crate::hir::module::HirModule;
-use crate::kernel_ir::{KirOp, KernelIR};
+use crate::kernel_ir::{KirOp, KirType, KernelIR};
 
 pub struct KirToHirPass {
     pub test_taps: bool,
@@ -46,29 +46,151 @@ impl KirToHirPass {
 
     fn lower_matmul(
         &self,
-        _op: &KirOp,
-        _module: &mut HirModule,
+        op: &KirOp,
+        module: &mut HirModule,
     ) -> Result<(), FpgaLoweringError> {
-        // Implemented in Task 2.5.
+        use crate::hir::control::GenerateFor;
+        use crate::hir::module::HirNode;
+        use crate::hir::nodes::{Add, Mul, SignExtend};
+        use crate::hir::signals::SignalRef;
+
+        let (a_dtype, b_dtype, out_dtype, a_shape, b_shape) = match op {
+            KirOp::Matmul {
+                a_dtype,
+                b_dtype,
+                out_dtype,
+                a_shape,
+                b_shape,
+                ..
+            } => (a_dtype.clone(), b_dtype.clone(), out_dtype.clone(), *a_shape, *b_shape),
+            _ => unreachable!("lower_matmul called with non-Matmul op"),
+        };
+
+        let n_inputs = a_shape[1];
+        let n_outputs = b_shape[1];
+        assert_eq!(a_shape[1], b_shape[0], "Matmul inner dimensions must match");
+
+        let a_width = kir_dtype_width(a_dtype);
+        let b_width = kir_dtype_width(b_dtype);
+        let acc_width = kir_dtype_width(out_dtype);
+        let prod_width = a_width + b_width;
+
+        // Outer GenerateFor: iterate output dimension
+        let mut outer_body: Vec<HirNode> = Vec::new();
+
+        // Inner GenerateFor: MAC chain over input dimension
+        let mut inner_body: Vec<HirNode> = Vec::new();
+
+        // Mul: x[i] * W[i,o] → prod_i  (width: a_width × b_width → prod_width)
+        let mul = Mul::new(
+            SignalRef::port("__matmul_a"),
+            SignalRef::port("__matmul_b"),
+            a_width,
+            b_width,
+            prod_width,
+        );
+        let prod_id = mul.out;
+        inner_body.push(HirNode::Mul(mul));
+
+        // SignExtend prod_i → acc_width if needed (3-node MAC chain when prod < acc)
+        let add_input = if prod_width < acc_width {
+            let se = SignExtend::new(SignalRef::wire(prod_id), prod_width, acc_width);
+            let se_id = se.dst;
+            inner_body.push(HirNode::SignExtend(se));
+            SignalRef::wire(se_id)
+        } else {
+            // When prod_width == acc_width, MAC chain is 2-node: Mul → Add directly.
+            SignalRef::wire(prod_id)
+        };
+
+        // Add: acc_prev + extended_product → acc_next  (width: acc_width)
+        let add = Add::new(
+            SignalRef::port("__matmul_acc_prev"),
+            add_input,
+            acc_width,
+        );
+        inner_body.push(HirNode::Add(add));
+
+        outer_body.push(HirNode::GenerateFor(GenerateFor::new(
+            0,
+            n_inputs as i64,
+            inner_body,
+        )));
+
+        module.add_node(HirNode::GenerateFor(GenerateFor::new(
+            0,
+            n_outputs as i64,
+            outer_body,
+        )))?;
+
         Ok(())
     }
 
     fn lower_elementwise_add(
         &self,
-        _op: &KirOp,
-        _module: &mut HirModule,
+        op: &KirOp,
+        module: &mut HirModule,
     ) -> Result<(), FpgaLoweringError> {
-        // Implemented in Task 2.6.
+        use crate::hir::control::GenerateFor;
+        use crate::hir::module::HirNode;
+        use crate::hir::nodes::Add;
+        use crate::hir::signals::SignalRef;
+
+        let (dtype, shape) = match op {
+            KirOp::ElementwiseAdd { dtype, shape, .. } => (dtype.clone(), *shape),
+            _ => unreachable!(),
+        };
+
+        let width = kir_dtype_width(dtype);
+        let n = shape[0];
+
+        // GenerateFor over output dimension; body is one Add node.
+        let body = vec![HirNode::Add(Add::new(
+            SignalRef::port("__bias_pre"),
+            SignalRef::port("__bias_b"),
+            width,
+        ))];
+
+        module.add_node(HirNode::GenerateFor(GenerateFor::new(0, n as i64, body)))?;
+
         Ok(())
     }
 
     fn lower_relu(
         &self,
-        _op: &KirOp,
-        _module: &mut HirModule,
+        op: &KirOp,
+        module: &mut HirModule,
     ) -> Result<(), FpgaLoweringError> {
-        // Implemented in Task 2.7.
+        use crate::hir::control::GenerateFor;
+        use crate::hir::module::HirNode;
+        use crate::hir::nodes::Max0;
+        use crate::hir::signals::SignalRef;
+
+        let (dtype, shape) = match op {
+            KirOp::Relu { dtype, shape, .. } => (dtype.clone(), *shape),
+            _ => unreachable!(),
+        };
+
+        let width = kir_dtype_width(dtype);
+        let n = shape[0];
+
+        let body = vec![HirNode::Max0(Max0::new(SignalRef::port("__relu_in"), width))];
+
+        module.add_node(HirNode::GenerateFor(GenerateFor::new(0, n as i64, body)))?;
+
         Ok(())
+    }
+}
+
+/// Map KirType to bit-width for FPGA HIR construction.
+/// Panics on types not supported in v1 FPGA target.
+pub(crate) fn kir_dtype_width(dtype: KirType) -> usize {
+    match dtype {
+        KirType::I8 => 8,
+        KirType::I16 => 16,
+        KirType::I32 => 32,
+        KirType::I64 => 64,
+        other => panic!("KirType {:?} unsupported in v1 FPGA target", other),
     }
 }
 
