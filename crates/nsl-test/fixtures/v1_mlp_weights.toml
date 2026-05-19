@@ -1,0 +1,41 @@
+sha256                    = "0a8ae48194fd21e76040de17e4fd459f0a21a57c7f0a8a8bf810b613f3cd0342"
+generated_by              = "generate_mlp_int8_weights_v1.rs"
+generator_seed            = "0xC0DEFA11"
+nsl_version_at_generation = "0.9.0"
+
+[meta]
+description       = "v1 MLP fixture for M57 Tier-A Verilator + Yosys gates"
+overflow_analysis = "see Section 4.6 of M57 v1 design spec"
+spec_reference    = "docs/superpowers/specs/2026-05-18-m57-fpga-verilog-design.md"
+
+[[block]]
+name        = "W1"
+kind        = "weight"
+dtype       = "i8"
+layer       = 1
+shape       = [784, 128]
+value_range = [-64, 64]
+
+[[block]]
+name        = "b1"
+kind        = "bias"
+dtype       = "i32"
+layer       = 1
+shape       = [128]
+value_range = [-1048576, 1048576]
+
+[[block]]
+name        = "W2"
+kind        = "weight"
+dtype       = "i8"
+layer       = 2
+shape       = [128, 10]
+value_range = [-64, 64]
+
+[[block]]
+name        = "b2"
+kind        = "bias"
+dtype       = "i64"
+layer       = 2
+shape       = [10]
+value_range = [-1073741824, 1073741824]
