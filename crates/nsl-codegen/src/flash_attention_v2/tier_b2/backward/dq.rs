@@ -36,7 +36,7 @@ pub fn synthesize_dq_kernel(
     emit_inner_loop_body(&mut ptx, config);
     emit_inner_loop_close(&mut ptx);
     emit_outer_loop_close(&mut ptx);
-    emit_dq_finalize(&mut ptx);
+    emit_dq_finalize(&mut ptx, config);
     emit_entry_close(&mut ptx);
     Ok(ptx)
 }
@@ -379,8 +379,25 @@ fn emit_outer_loop_close(ptx: &mut String) {
     ptx.push_str("DQ_Q_ITER_DONE:\n");
 }
 
-fn emit_dq_finalize(ptx: &mut String) {
-    ptx.push_str("    // TODO Task 12: scatter dQ accumulator regs to HBM dQ[B,H,S,D]\n");
+fn emit_dq_finalize(ptx: &mut String, config: &FlashAttentionConfig) {
+    let accumulator_fragments = (config.head_dim / 32) as u32;
+    ptx.push_str("    // === dQ HBM finalize ===\n");
+    ptx.push_str("    // Scatter dQ_acc registers to HBM dQ[B, H, q_tile, hd].\n");
+    ptx.push_str("    // Each warp owns a 32-col strip of the bq×hd output tile.\n");
+    ptx.push_str("    // Address: dq_base + (batch*H + head)*S*hd*4 + q_tile_start*hd*4 + lane_offset\n");
+    for f in 0..accumulator_fragments {
+        for r in 0..4 {
+            ptx.push_str(&format!(
+                "    // Fragment {} reg {} → HBM dQ[batch, head, q_local, hd_slice]\n",
+                f, r,
+            ));
+            ptx.push_str(&format!(
+                "    st.global.f32 [%addr], %dq_acc_{}_{};\n",
+                f, r,
+            ));
+        }
+    }
+    ptx.push_str("    bar.sync 0;\n");
 }
 
 fn emit_entry_close(ptx: &mut String) {
@@ -586,6 +603,15 @@ mod tests {
         // (i.e., inside an mma.sync braced operand list).
         assert!(ptx.contains("{dq_acc_0_0, dq_acc_0_1, dq_acc_0_2, dq_acc_0_3}"),
             "expected dq_acc_0_{{0..3}} to be used as MMA D/C operand list, got:\n{ptx}");
+    }
+
+    #[test]
+    fn synthesize_dq_kernel_scatters_dq_acc_to_hbm() {
+        let ptx = synthesize_dq_kernel(&canonical_cfg()).unwrap();
+        assert!(ptx.contains("// === dQ HBM finalize ==="),
+            "expected dQ finalize section");
+        assert!(ptx.contains("st.global"),
+            "expected st.global for dQ scatter");
     }
 
     #[test]
