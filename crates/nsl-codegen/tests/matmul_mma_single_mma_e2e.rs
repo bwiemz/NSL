@@ -229,7 +229,7 @@ fn build_probe_ptx() -> Vec<u8> {
     emit_load_a_fragment_smem(&mut ptx, &a_regs, "%a_base_u32", 32);
     // B is col-major [K=16, N=8] f16 → col stride = K * 2 = 32 bytes.
     let b_regs = ["rb0".to_string(), "rb1".to_string()];
-    emit_load_b_fragment_smem(&mut ptx, &b_regs, "%b_base_u32", 32, false);
+    emit_load_b_fragment_smem(&mut ptx, &b_regs, "%b_base_u32", 32);
 
     // -- C = 0.
     ptx.push_str("    mov.f32 %rc0, 0f00000000;\n");

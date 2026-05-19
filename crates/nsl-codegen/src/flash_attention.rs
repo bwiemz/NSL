@@ -1061,7 +1061,6 @@ fn emit_csha_matmul_projection(ptx: &mut String, config: &FlashAttentionConfig) 
             b_regs,
             "%ts_b_base",
             b_stride_bytes,
-            false,
         );
         // The load helpers take bare register names (they prepend `%`
         // internally), but `emit_mma_instruction` embeds names
@@ -5705,7 +5704,7 @@ mod tests {
     fn test_load_b_fragment_emission() {
         let mut ptx = String::new();
         let regs: [String; 2] = ["bk0".into(), "bk1".into()];
-        crate::matmul_mma::emit_load_b_fragment_smem(&mut ptx, &regs, "shmem_k", 128, false);
+        crate::matmul_mma::emit_load_b_fragment_smem(&mut ptx, &regs, "shmem_k", 128);
 
         assert!(ptx.contains("Load B-fragment"), "comment present");
         assert_eq!(ptx.matches("ld.shared.b32").count(), 2, "2 fragment loads");

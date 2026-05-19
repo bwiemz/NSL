@@ -399,8 +399,8 @@ fn emit_fused_adapter_kernel_body(
     // The `_lane_u32` reg setup (still emitted by the prelude block above)
     // is now dead but harmless — ptxas prunes unused virtual regs.
     emit_load_a_fragment_smem(ptx, &main_a_frag_names, "%smem_base_x_u32", 32);
-    emit_load_b_fragment_smem(ptx, &main_b_frag_names, "%smem_base_w_u32", 32, false);
-    emit_load_b_fragment_smem(ptx, &epi_a_frag_names, "%smem_base_a_u32", 32, false);
+    emit_load_b_fragment_smem(ptx, &main_b_frag_names, "%smem_base_w_u32", 32);
+    emit_load_b_fragment_smem(ptx, &epi_a_frag_names, "%smem_base_a_u32", 32);
 
     // Main MMA: main_accum += x_tile @ w_tile
     emit_mma_instruction(ptx, &main_accum, &main_a_frag, &main_b_frag, &main_accum);
@@ -459,7 +459,7 @@ fn emit_fused_adapter_kernel_body(
     // Same col-major byte-offset addressing as main W-fragment load.
     // Per the post-N4 rewrite, pass the raw tile base + col stride; the
     // helper computes per-lane (k_lo, n_col) internally.
-    emit_load_b_fragment_smem(ptx, &epi_b_frag_names, "%smem_base_b_u32", 32, false);
+    emit_load_b_fragment_smem(ptx, &epi_b_frag_names, "%smem_base_b_u32", 32);
 
     // 8. Convert epi_interm (f32) → packed f16x2 (b32) for final MMA A-operand.
     //
@@ -686,7 +686,7 @@ pub fn synthesize_fused_ia3_ptx(config: &FusedIa3Config) -> String {
     // per-lane addressing from %tid.x. The pre-baked `_lane_u32` regs
     // are dead but harmless.
     emit_load_a_fragment_smem(&mut ptx, &main_a_frag_names, "%smem_base_x_u32", 32);
-    emit_load_b_fragment_smem(&mut ptx, &main_b_frag_names, "%smem_base_w_u32", 32, false);
+    emit_load_b_fragment_smem(&mut ptx, &main_b_frag_names, "%smem_base_w_u32", 32);
 
     // Main MMA: main_accum += x_tile @ w_tile
     emit_mma_instruction(&mut ptx, &main_accum, &main_a_frag, &main_b_frag, &main_accum);

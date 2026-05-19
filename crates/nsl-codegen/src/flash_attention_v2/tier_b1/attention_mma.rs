@@ -417,7 +417,6 @@ fn emit_qkt_mma(ptx: &mut String, config: &FlashAttentionConfig, slot: u32) {
                 &b_fragment_regs,
                 &b_base_expr,
                 (hd * 2) as usize,
-                false,
             );
             let d_regs = [
                 format!("%s_acc_{}_0", t),
@@ -1173,7 +1172,6 @@ fn emit_pv_mma(ptx: &mut String, config: &FlashAttentionConfig, slot: u32) {
                 &b_fragment_regs,
                 &b_base_expr,
                 (bkv * 2) as usize,
-                false,
             );
             let d_regs = [
                 format!("%o_acc_{}_0", t),
