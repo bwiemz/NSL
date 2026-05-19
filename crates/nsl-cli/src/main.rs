@@ -2329,10 +2329,6 @@ fn run_build_shared_single(
     // M62 Task 9: also re-export the runtime lifecycle symbols so that ctypes
     // callers can call nsl_model_create / nsl_model_destroy / nsl_get_last_error
     // directly from the generated shared lib without loading a separate runtime DLL.
-    //
-    // M62b Spec A Task 2: also re-export the export-table accessors emitted
-    // by `c_export_table::emit_export_table` so the runtime can dlsym them
-    // on Windows MSVC (where `Linkage::Export` alone is insufficient).
     let runtime_exports = [
         "nsl_model_create",
         "nsl_model_destroy",
@@ -2612,9 +2608,6 @@ fn run_build_shared_multi(
     // M62 Task 9: mirror the single-file path and re-export runtime lifecycle
     // symbols so ctypes callers can load weights + call exports through the
     // generated DLL without loading a separate runtime DLL.
-    //
-    // M62b Spec A Task 2: also re-export the export-table accessors emitted
-    // by `c_export_table::emit_export_table`.
     let runtime_exports = [
         "nsl_model_create",
         "nsl_model_destroy",

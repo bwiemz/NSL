@@ -1,10 +1,9 @@
 //! Codegen for the runtime export table that `nsl_model_create` reads
 //! to enumerate `@export`'d functions in the compiled .so/.dll.
 //!
-//! Spec A Task 2 of the M62b plan. Emits two FFI accessors **inside
-//! the compiled artifact itself** so the runtime can enumerate exports
-//! at load time without having to parse the host platform's symbol
-//! table:
+//! Emits two FFI accessors **inside the compiled artifact itself** so
+//! the runtime can probe every shared lib uniformly via dlsym without
+//! having to parse the host platform's symbol table:
 //!
 //!   - `nsl_get_num_exports() -> i64` — returns the export count.
 //!   - `nsl_get_export_name(idx: i64) -> *const c_char` — returns the
@@ -28,6 +27,7 @@
 //!    `bytes-with-nul`, in declaration order.
 
 use crate::c_header::ExportInfo;
+use crate::compiler::Compiler;
 use crate::error::CodegenError;
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{
@@ -39,18 +39,12 @@ use cranelift_module::{DataDescription, Linkage, Module};
 use std::ffi::CString;
 
 /// Emit the export-table data section plus the two accessor FFIs into
-/// `module`. `next_func_index` is used to allocate fresh `UserFuncName`
-/// indices so the new functions don't collide with the rest of the
-/// compilation unit.
-///
-/// Safe to call with an empty `exports` slice — the accessors are
-/// still emitted (so the runtime can probe any shared lib uniformly),
-/// `nsl_get_num_exports` returns 0, and `nsl_get_export_name` returns
-/// NULL for every index.
-pub fn emit_export_table<M: Module + ?Sized>(
-    module: &mut M,
+/// `compiler.module`. Fresh `UserFuncName` indices are pulled from
+/// `compiler.next_func_index()` so the new functions don't collide with
+/// the rest of the compilation unit.
+pub(crate) fn emit_export_table(
+    compiler: &mut Compiler<'_>,
     exports: &[ExportInfo],
-    mut next_func_index: impl FnMut() -> u32,
 ) -> Result<(), CodegenError> {
     // ── 1. Build the offset table + names blob ────────────────────────────
     let n = exports.len() as i64;
@@ -80,26 +74,29 @@ pub fn emit_export_table<M: Module + ?Sized>(
     // Linkage::Local — only the accessors below need it; the runtime
     // reaches the bytes through the accessors, never via dlsym on the
     // data symbol itself.
-    let names_data = module
+    let names_data = compiler
+        .module
         .declare_data("__nsl_export_names", Linkage::Local, false, false)
         .map_err(|e| CodegenError::new(format!("declare __nsl_export_names: {e:?}")))?;
     let mut desc = DataDescription::new();
     desc.define(full_blob.into_boxed_slice());
-    module
+    compiler
+        .module
         .define_data(names_data, &desc)
         .map_err(|e| CodegenError::new(format!("define __nsl_export_names: {e:?}")))?;
 
-    let call_conv = module.target_config().default_call_conv;
+    let call_conv = compiler.module.target_config().default_call_conv;
 
     // ── 3. Emit `nsl_get_num_exports() -> i64` ────────────────────────────
     {
         let mut num_sig = Signature::new(call_conv);
         num_sig.returns.push(AbiParam::new(cl_types::I64));
-        let num_fn = module
+        let num_fn = compiler
+            .module
             .declare_function("nsl_get_num_exports", Linkage::Export, &num_sig)
             .map_err(|e| CodegenError::new(format!("declare nsl_get_num_exports: {e:?}")))?;
         let mut ctx = Context::for_function(Function::with_name_signature(
-            UserFuncName::user(0, next_func_index()),
+            UserFuncName::user(0, compiler.next_func_index()),
             num_sig,
         ));
         let mut fb_ctx = FunctionBuilderContext::new();
@@ -112,7 +109,8 @@ pub fn emit_export_table<M: Module + ?Sized>(
             fb.ins().return_(&[count]);
             fb.finalize();
         }
-        module
+        compiler
+            .module
             .define_function(num_fn, &mut ctx)
             .map_err(|e| CodegenError::new(format!("define nsl_get_num_exports: {e:?}")))?;
     }
@@ -124,11 +122,12 @@ pub fn emit_export_table<M: Module + ?Sized>(
         let mut name_sig = Signature::new(call_conv);
         name_sig.params.push(AbiParam::new(cl_types::I64));
         name_sig.returns.push(AbiParam::new(cl_types::I64));
-        let name_fn = module
+        let name_fn = compiler
+            .module
             .declare_function("nsl_get_export_name", Linkage::Export, &name_sig)
             .map_err(|e| CodegenError::new(format!("declare nsl_get_export_name: {e:?}")))?;
         let mut ctx = Context::for_function(Function::with_name_signature(
-            UserFuncName::user(0, next_func_index()),
+            UserFuncName::user(0, compiler.next_func_index()),
             name_sig,
         ));
         let mut fb_ctx = FunctionBuilderContext::new();
@@ -158,7 +157,7 @@ pub fn emit_export_table<M: Module + ?Sized>(
             // ── In-range path: base + offset_table[idx] ───────────
             fb.switch_to_block(ok);
             fb.seal_block(ok);
-            let names_gv = module.declare_data_in_func(names_data, fb.func);
+            let names_gv = compiler.module.declare_data_in_func(names_data, fb.func);
             let base = fb.ins().symbol_value(cl_types::I64, names_gv);
             // idx * 8 — header is i64 (8-byte) offsets.
             let eight = fb.ins().iconst(cl_types::I64, 8);
@@ -170,7 +169,8 @@ pub fn emit_export_table<M: Module + ?Sized>(
 
             fb.finalize();
         }
-        module
+        compiler
+            .module
             .define_function(name_fn, &mut ctx)
             .map_err(|e| CodegenError::new(format!("define nsl_get_export_name: {e:?}")))?;
     }
@@ -178,114 +178,3 @@ pub fn emit_export_table<M: Module + ?Sized>(
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::c_header::{ExportDevice, ExportDtype, ExportParamInfo, ExportTypeInfo};
-    use cranelift_codegen::settings;
-    use cranelift_object::{ObjectBuilder, ObjectModule};
-
-    fn make_module() -> ObjectModule {
-        let flag_builder = settings::builder();
-        let isa = cranelift_native::builder()
-            .unwrap()
-            .finish(settings::Flags::new(flag_builder))
-            .unwrap();
-        let builder = ObjectBuilder::new(
-            isa,
-            "export_table_test",
-            cranelift_module::default_libcall_names(),
-        )
-        .unwrap();
-        ObjectModule::new(builder)
-    }
-
-    fn dummy_export(name: &str) -> ExportInfo {
-        ExportInfo {
-            symbol_name: name.into(),
-            raw_name: name.into(),
-            params: vec![ExportParamInfo {
-                name: "x".into(),
-                ty: ExportTypeInfo::Tensor {
-                    shape: vec!["4".into()],
-                    dtype: ExportDtype::F32,
-                    device: ExportDevice::Cpu,
-                },
-            }],
-            return_type: ExportTypeInfo::Tensor {
-                shape: vec!["4".into()],
-                dtype: ExportDtype::F32,
-                device: ExportDevice::Cpu,
-            },
-        }
-    }
-
-    /// Smoke test — emit_export_table on an empty list still defines
-    /// both accessors and the data section.
-    #[test]
-    fn empty_export_list_emits_both_accessors() {
-        let mut module = make_module();
-        let mut idx = 0u32;
-        let result = emit_export_table(&mut module, &[], || {
-            idx += 1;
-            idx
-        });
-        assert!(result.is_ok(), "emit_export_table empty: {result:?}");
-        // Both symbols must now be declared in the module.
-        let declarations = module.declarations();
-        assert!(
-            declarations.get_name("nsl_get_num_exports").is_some(),
-            "nsl_get_num_exports must be declared"
-        );
-        assert!(
-            declarations.get_name("nsl_get_export_name").is_some(),
-            "nsl_get_export_name must be declared"
-        );
-        assert!(
-            declarations.get_name("__nsl_export_names").is_some(),
-            "__nsl_export_names data symbol must be declared"
-        );
-    }
-
-    /// Smoke test — two exports emit cleanly with no panics.
-    #[test]
-    fn two_exports_emit_cleanly() {
-        let mut module = make_module();
-        let exports = vec![dummy_export("alpha"), dummy_export("beta")];
-        let mut idx = 100u32;
-        let result = emit_export_table(&mut module, &exports, || {
-            idx += 1;
-            idx
-        });
-        assert!(result.is_ok(), "emit_export_table two: {result:?}");
-    }
-
-    /// Layout test — the on-disk blob bytes start with the offset
-    /// table (n × i64 little-endian) followed by the concatenated
-    /// null-terminated names.
-    #[test]
-    fn blob_layout_matches_documented_format() {
-        // Construct the blob the same way emit_export_table does, then
-        // assert the byte-level layout that the runtime accessor reads.
-        let exports = vec![dummy_export("alpha"), dummy_export("beta")];
-        let n = exports.len();
-        let header_bytes = n * 8;
-
-        let mut offsets: Vec<i64> = Vec::with_capacity(n);
-        let mut pool: Vec<u8> = Vec::new();
-        let mut cursor = header_bytes as i64;
-        for e in &exports {
-            offsets.push(cursor);
-            let cstr = CString::new(e.symbol_name.as_str()).unwrap();
-            pool.extend_from_slice(cstr.as_bytes_with_nul());
-            cursor += cstr.as_bytes_with_nul().len() as i64;
-        }
-
-        // alpha = 5 bytes + NUL = 6 → first offset = 16
-        assert_eq!(offsets[0], 16);
-        // beta starts at 16 + 6 = 22
-        assert_eq!(offsets[1], 22);
-        // Pool ends with both names terminated:
-        assert_eq!(&pool, b"alpha\0beta\0");
-    }
-}

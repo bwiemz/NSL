@@ -30,7 +30,7 @@
 pub mod agent;
 pub mod autotune;
 pub mod builtins;
-pub mod c_export_table;
+pub(crate) mod c_export_table;
 pub mod c_header;
 pub mod c_wrapper;
 pub mod calibration;

@@ -2,10 +2,6 @@
 //! FFIs (emitted into every `--shared-lib` artifact) round-trip the
 //! list of `@export`-decorated functions known to codegen at build time.
 //!
-//! Spec A Task 2 of the M62b plan — exposes the export table to the
-//! runtime so `nsl_model_create` can enumerate exports via dlsym
-//! without parsing the shared-library symbol table.
-//!
 //! Uses `assert_cmd::Command::cargo_bin("nsl")` rather than
 //! `env!("CARGO_BIN_EXE_nsl")` because `nsl` lives in the sibling
 //! `nsl-cli` crate, not in `nsl-codegen`.
