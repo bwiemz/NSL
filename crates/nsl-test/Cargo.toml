@@ -9,15 +9,14 @@ repository.workspace = true
 
 [dependencies]
 nsl-codegen.workspace = true
-nsl-ast.workspace = true
-nsl-parser.workspace = true
 rand.workspace = true
 rand_chacha.workspace = true
 sha2 = "0.10"
 toml.workspace = true
-bytemuck.workspace = true
 thiserror = "1"
-regex = "1"
+# nsl-ast, nsl-parser, bytemuck, regex — reserved for M57.1 (end-to-end NSL
+# source compilation + Verilog port packing). Not added now to keep nsl-test
+# compile time minimal during the deferred-scope window.
 
 [[bin]]
 name = "generate_mlp_int8_weights_v1"

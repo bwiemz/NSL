@@ -185,8 +185,18 @@ pub fn parse(bytes: &[u8]) -> Result<FixtureFile, FixtureError> {
         offset += 48;
 
         let used_shape = &shape[..rank as usize];
+        // Defensive: parse() is pub and `Assumes hash already verified` is a
+        // soft precondition. If a caller bypasses hash verification, an
+        // adversarial shape (u64 dims that overflow usize on 32-bit, or
+        // n_elements*size_bytes that overflows usize anywhere) must not
+        // silently produce a truncated FixtureBlock.
         let n_elements: u64 = used_shape.iter().product();
-        let data_bytes = n_elements as usize * dtype.size_bytes();
+        let size_bytes_u64 = dtype.size_bytes() as u64;
+        let data_bytes_u64 = n_elements
+            .checked_mul(size_bytes_u64)
+            .ok_or(FixtureError::Truncated(offset))?;
+        let data_bytes = usize::try_from(data_bytes_u64)
+            .map_err(|_| FixtureError::Truncated(offset))?;
         if bytes.len() < offset + data_bytes {
             return Err(FixtureError::Truncated(offset));
         }

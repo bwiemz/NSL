@@ -281,6 +281,28 @@ mod tests {
     }
 
     #[test]
+    fn parse_output_round_trips_two_i32_words() {
+        // Testbench dumps multi-word taps high-word-first as big-endian hex
+        // bytes, then parse_output reverses the whole byte sequence so
+        // tap_i32 reads little-endian. Verify with two i32 words: [1, 2].
+        //
+        // Testbench would emit dut[1]=0x00000002 first, then dut[0]=0x00000001
+        // → "0x0000000200000001". Hex bytes msb-first:
+        //   [0x00,0x00,0x00,0x02,0x00,0x00,0x00,0x01]
+        // After flat reverse:
+        //   [0x01,0x00,0x00,0x00,0x02,0x00,0x00,0x00]
+        // tap_i32 reads as LE pairs → [1, 2]. ✓
+        let harness = VerilatorHarness {
+            sim_binary: PathBuf::from("/nonexistent"),
+            tap_descriptor: TapDescriptor::v1_mlp(),
+        };
+        let stdout = "tap_l1_matmul_out=0x0000000200000001\n";
+        let result = harness.parse_output(stdout).unwrap();
+        let words = result.tap_i32("tap_l1_matmul_out", 2);
+        assert_eq!(words, vec![1i32, 2i32]);
+    }
+
+    #[test]
     fn parse_output_rejects_malformed_line() {
         let harness = VerilatorHarness {
             sim_binary: PathBuf::from("/nonexistent"),
