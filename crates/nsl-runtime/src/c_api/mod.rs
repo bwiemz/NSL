@@ -25,6 +25,7 @@ pub mod exports;
 /// from NSL's internal convention (0=f64, 1=f32). The conversion functions
 /// `capi_dtype_to_nsl` and `nsl_dtype_to_capi` handle the mapping.
 #[repr(C)]
+#[derive(Default)]
 pub struct NslTensorDesc {
     pub data: *mut c_void,
     pub shape: *mut i64,
@@ -287,6 +288,157 @@ pub extern "C" fn nsl_model_export_count(model_ptr: i64) -> i64 {
     let model = unsafe { &*(model_ptr as *const NslModel) };
     match &model.exports {
         Some(r) => r.len() as i64,
+        None => 0,
+    }
+}
+
+/// Dispatch an `@export`'d function by string name.
+///
+/// `name_ptr` must point at a null-terminated C string. Returns -1 and
+/// sets the thread-local error if the name is not in the registry;
+/// otherwise invokes the cached function pointer with the supplied
+/// NslTensorDesc arrays and returns whatever the export returned.
+#[no_mangle]
+pub extern "C" fn nsl_model_call(
+    model_ptr: i64,
+    name_ptr: i64,
+    inputs_ptr: i64,
+    num_inputs: i64,
+    outputs_ptr: i64,
+    num_outputs: i64,
+) -> i64 {
+    if model_ptr == 0 || name_ptr == 0 {
+        set_error("nsl_model_call: null model or name pointer\0".to_string());
+        return -1;
+    }
+    let model = unsafe { &*(model_ptr as *const NslModel) };
+    let registry = match &model.exports {
+        Some(r) => r,
+        None => {
+            set_error(
+                "nsl_model_call: model created without export registry; \
+                 use nsl_model_create_with_lib(weights, lib)\0"
+                    .to_string(),
+            );
+            return -1;
+        }
+    };
+    let name = unsafe { CStr::from_ptr(name_ptr as *const c_char) }
+        .to_string_lossy()
+        .into_owned();
+    let fn_ptr = match registry.lookup(&name) {
+        Some(p) => p,
+        None => {
+            let available = registry.available_names();
+            set_error(format!(
+                "nsl_model_call: export '{}' not in registry. Available: {:?}\0",
+                name, available
+            ));
+            return -1;
+        }
+    };
+    capi_trace(format!(
+        "model_call name={} num_inputs={} num_outputs={}",
+        name, num_inputs, num_outputs
+    ));
+    unsafe { fn_ptr(model_ptr, inputs_ptr, num_inputs, outputs_ptr, num_outputs) }
+}
+
+/// DLPack variant of `nsl_model_call`. Bridges `DLManagedTensor*`-ABI
+/// inputs and outputs to the `NslTensorDesc*`-ABI export entry-point
+/// and reuses the same dispatcher.
+#[no_mangle]
+pub extern "C" fn nsl_model_call_dlpack(
+    model_ptr: i64,
+    name_ptr: i64,
+    dl_inputs_ptr: i64,
+    num_inputs: i64,
+    dl_outputs_ptr: i64,
+    num_outputs: i64,
+) -> i64 {
+    if model_ptr == 0 || name_ptr == 0 {
+        set_error("nsl_model_call_dlpack: null model or name pointer\0".to_string());
+        return -1;
+    }
+    // Import DLPack inputs to NslTensors via the existing bridge.
+    let input_tensor_ptrs: Vec<i64> = if num_inputs > 0 && dl_inputs_ptr != 0 {
+        let dlpacks = unsafe {
+            std::slice::from_raw_parts(
+                dl_inputs_ptr as *const *mut DLManagedTensor,
+                num_inputs as usize,
+            )
+        };
+        dlpacks
+            .iter()
+            .map(|&dl| crate::dlpack::dlpack_to_nsl_tensor(unsafe { &*dl }))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let mut input_descs: Vec<NslTensorDesc> = input_tensor_ptrs
+        .iter()
+        .map(|&p| {
+            let mut desc = NslTensorDesc::default();
+            nsl_tensor_to_desc(p, &mut desc);
+            desc
+        })
+        .collect();
+    let mut output_descs: Vec<NslTensorDesc> =
+        (0..num_outputs).map(|_| NslTensorDesc::default()).collect();
+    let rc = nsl_model_call(
+        model_ptr,
+        name_ptr,
+        input_descs.as_mut_ptr() as i64,
+        num_inputs,
+        output_descs.as_mut_ptr() as i64,
+        num_outputs,
+    );
+    if rc == 0 && dl_outputs_ptr != 0 {
+        let out_slot = dl_outputs_ptr as *mut *mut DLManagedTensor;
+        for (i, desc) in output_descs.iter().enumerate() {
+            let tensor_ptr = desc_to_nsl_tensor(desc);
+            let tensor = NslTensor::from_ptr(tensor_ptr);
+            let dl_ptr = crate::dlpack::nsl_tensor_to_dlpack(tensor, tensor_ptr);
+            unsafe {
+                *out_slot.add(i) = dl_ptr;
+            }
+        }
+    }
+    for ptr in &input_tensor_ptrs {
+        crate::tensor::nsl_tensor_free(*ptr);
+    }
+    rc
+}
+
+/// Return the cached fn pointer for an `@export` by name. Lets
+/// tight-loop callers skip the HashMap probe on every call.
+///
+/// Returns 0 (NULL) if the name is not in the registry or `model_ptr`
+/// is null. The thread-local error is set on null inputs and on the
+/// "no registry" path; missing-name on a populated registry returns 0
+/// silently (the caller is presumed to be probing).
+#[no_mangle]
+pub extern "C" fn nsl_model_lookup_function(model_ptr: i64, name_ptr: i64) -> i64 {
+    if model_ptr == 0 || name_ptr == 0 {
+        set_error("nsl_model_lookup_function: null pointer\0".to_string());
+        return 0;
+    }
+    let model = unsafe { &*(model_ptr as *const NslModel) };
+    let registry = match &model.exports {
+        Some(r) => r,
+        None => {
+            set_error(
+                "nsl_model_lookup_function: no registry; use nsl_model_create_with_lib\0"
+                    .to_string(),
+            );
+            return 0;
+        }
+    };
+    let name = unsafe { CStr::from_ptr(name_ptr as *const c_char) }
+        .to_string_lossy()
+        .into_owned();
+    match registry.lookup(&name) {
+        Some(p) => p as usize as i64,
         None => 0,
     }
 }
