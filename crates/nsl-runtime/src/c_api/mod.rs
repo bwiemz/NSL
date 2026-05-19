@@ -85,11 +85,6 @@ pub struct NslModel {
     /// Path the weights were loaded from (for diagnostics).
     #[allow(dead_code)]
     weights_path: String,
-    /// Whether to record the tape during the next forward pass (for backward).
-    grad_enabled: bool,
-    /// Output tensor pointers saved from the most recent grad-enabled forward pass.
-    /// Used to seed the backward pass.
-    last_forward_outputs: Vec<i64>,
     /// Dispatch table for `@export`ed functions. Populated eagerly at
     /// create time — either via runtime self-discovery in `nsl_model_create`
     /// or explicitly through `nsl_model_create_with_lib`. `None` when the
@@ -341,8 +336,6 @@ pub extern "C" fn nsl_model_create(weights_path_ptr: i64) -> i64 {
         weights,
         weight_ptrs,
         weights_path: path_str.to_string(),
-        grad_enabled: false,
-        last_forward_outputs: Vec::new(),
         exports,
     });
     Box::into_raw(model) as i64
@@ -1060,35 +1053,15 @@ pub(crate) fn nsl_tensor_to_desc(tensor_ptr: i64, desc: &mut NslTensorDesc) {
 // M62b: Backward pass FFI
 // ---------------------------------------------------------------------------
 
-/// Enable or disable tape recording during subsequent forward passes.
-///
-/// When `enable` is non-zero, the next call to `nsl_model_forward` will
-/// start recording the autodiff tape over the model's weight tensors.
-/// Call `nsl_model_backward` afterwards to replay the tape and compute
-/// parameter gradients.
-///
-/// Returns 0 on success, -1 if model_ptr is null.
-#[no_mangle]
-pub extern "C" fn nsl_model_enable_grad(model_ptr: i64, enable: i64) -> i64 {
-    if model_ptr == 0 {
-        set_error("nsl_model_enable_grad: null model pointer\0".to_string());
-        return -1;
-    }
-    let model = unsafe { &mut *(model_ptr as *mut NslModel) };
-    model.grad_enabled = enable != 0;
-    0
-}
-
 // Spec B §4.4 — the model-level `nsl_model_backward(model, ...)` FFI is
 // replaced by the per-call `nsl_model_backward(ctx, ...)` defined in
 // `grad_context.rs`. The two cannot coexist (same exported symbol); the
 // switch is structural to enforce the headline invariant from §2 (backward
 // reads only from `GradContext`, never from the thread-local tape).
 //
-// `nsl_model_enable_grad` and the `grad_enabled` / `last_forward_outputs`
-// fields on `NslModel` are intentionally kept until Spec B T8 — they are
-// dead in this commit's `c_api` but still needed by the Python autograd
-// bridge migration step.
+// Spec B T8 deleted `nsl_model_enable_grad` and the `grad_enabled` /
+// `last_forward_outputs` fields on `NslModel`. The Python autograd bridge
+// still references the gone symbol; its migration is T9.
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -1209,11 +1182,6 @@ mod tests {
         assert_eq!(nsl_model_get_weight(0, 0, 0), 0);
     }
 
-    #[test]
-    fn test_enable_grad_null_model() {
-        assert_eq!(nsl_model_enable_grad(0, 1), -1);
-    }
-
     // Spec B T3/T4 — the legacy `test_backward_null_model`,
     // `test_backward_without_enable_grad`, and `test_backward_without_forward`
     // tests exercised the model-level `nsl_model_backward(model, ...)` FFI
@@ -1250,13 +1218,10 @@ mod tests {
 
     // NOTE: the previous `test_backward_with_tape_e2e` exercised the legacy
     // tape-recording path that ran a Rust-closure `forward_fn` over weight
-    // pointers and saved outputs to `last_forward_outputs`. That path was
+    // pointers and saved outputs to a model-level output slot. That path was
     // removed when `nsl_model_forward` became a thin shim over
     // `nsl_model_call`; `@export` dispatch is inference-only and the
-    // tape/grad bridge is now exercised through the model-method grad
-    // bridge instead. The pure-error backward tests above
-    // (`test_backward_without_enable_grad`, `test_backward_without_forward`)
-    // continue to validate the public FFI's null/unprepared paths.
+    // tape/grad bridge is now exercised through `GradContext` (Spec B).
 
     #[test]
     fn nsl_model_get_weight_ptrs_returns_valid_pointer() {
@@ -1268,8 +1233,6 @@ mod tests {
             weights: HashMap::new(),
             weight_ptrs: vec![fake_weight_ptr],
             weights_path: String::new(),
-            grad_enabled: false,
-            last_forward_outputs: vec![],
             exports: None,
         });
         let model_ptr = &mut *model as *mut NslModel as i64;
@@ -1290,8 +1253,6 @@ mod tests {
             weights: HashMap::new(),
             weight_ptrs: vec![0x100, 0x200, 0x300],  // Use larger values to avoid null-like misalignment
             weights_path: String::new(),
-            grad_enabled: false,
-            last_forward_outputs: vec![],
             exports: None,
         });
         let model_ptr = &mut *model as *mut NslModel as i64;

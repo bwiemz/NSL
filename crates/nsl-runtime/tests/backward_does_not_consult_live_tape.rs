@@ -7,12 +7,11 @@
 //! `nsl_desc_to_tensor`) before the forward body runs. Those wrappers
 //! get fresh `tape_id`s that don't match the model's `weight_ptrs`
 //! tape_ids, so end-to-end gradient verification through `@export` is
-//! a separate (deferred) integration concern — see `c_wrapper.rs:95-97`:
-//!
-//! > Calling nsl_model_enable_grad(model, 1) before an @export wrapper
-//! > call has no effect on the @export dispatch path. For training
-//! > autograd, use nsl_model_forward + nsl_model_backward (see the
-//! > grad-context bridge fix).
+//! a separate (deferred) integration concern — see the GRAD SCOPE comment
+//! in `crates/nsl-codegen/src/c_wrapper.rs` (above `emit_c_abi_wrapper`).
+//! Spec B T8 removed the model-level `grad_enabled` slot and the
+//! `nsl_model_enable_grad` FFI; backward now reads from a `GradContext`
+//! produced by the grad-context bridge.
 //!
 //! This test therefore validates the HEADLINE INVARIANT (Spec B §2)
 //! **structurally** without depending on `@export` produce-correct-grads.

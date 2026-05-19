@@ -88,13 +88,15 @@ pub fn emit_c_abi_wrapper(
     compiler: &mut Compiler,
     wrapper: &ExportWrapper,
 ) -> Result<(), CodegenError> {
-    // GRAD SCOPE: @export dispatch is INFERENCE-ONLY. The wrapper does NOT:
-    //   - call nsl_tape_start over weight_ptrs
-    //   - save outputs to model.last_forward_outputs
-    //   - honor model.grad_enabled
-    // Calling nsl_model_enable_grad(model, 1) before an @export wrapper call
-    // has no effect on the @export dispatch path. For training autograd, use
-    // nsl_model_forward + nsl_model_backward (see the grad-context bridge fix).
+    // GRAD SCOPE: @export dispatch is INFERENCE-ONLY. The wrapper does NOT
+    // start a tape over weight_ptrs or record any per-call grad state.
+    // Spec B T8 removed the previous model-level grad slots
+    // (`grad_enabled`, `last_forward_outputs`, `nsl_model_enable_grad`); the
+    // backward pass now reads from a `GradContext` produced by the
+    // grad-context bridge (see `grad_context.rs`). An @export wrapper still
+    // can't drive training autograd today because the inputs are wrapped via
+    // `nsl_desc_to_tensor` into fresh tensors whose tape_ids do not match
+    // the model's weight tensors — closing that remains a follow-up.
     let call_conv = compiler.module.target_config().default_call_conv;
     let wrapper_sig = build_c_abi_wrapper_signature(&wrapper.export_info, call_conv);
 
