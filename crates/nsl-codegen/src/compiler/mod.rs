@@ -1373,6 +1373,12 @@ impl<'a> Compiler<'a> {
     /// After all internal function bodies have been emitted, synthesize the
     /// Cranelift body of each `@export` C-ABI wrapper registered during
     /// `declare_user_functions_with_linkage`. See `crate::c_wrapper`.
+    ///
+    /// Also emits the runtime export-table FFIs (`nsl_get_num_exports` and
+    /// `nsl_get_export_name`) — Spec A Task 2 of the M62b plan. The
+    /// accessors are emitted unconditionally (even when there are zero
+    /// exports) so the runtime can probe every shared lib uniformly via
+    /// dlsym; the empty-list case returns 0/NULL.
     pub fn emit_export_wrappers(&mut self) -> Result<(), CodegenError> {
         // Clone to side-step borrow of `self.features` during emission, which
         // itself calls `&mut self.module`.
@@ -1380,6 +1386,19 @@ impl<'a> Compiler<'a> {
         for wrapper in &wrappers {
             crate::c_wrapper::emit_c_abi_wrapper(self, wrapper)?;
         }
+
+        // Emit the export-table accessors. Clone the export list because
+        // `next_func_index` borrows `self` mutably for the duration of the
+        // call — `self.features` would otherwise need to be re-borrowed
+        // mid-emission.
+        let exports = self.features.export_functions.clone();
+        let module = &mut self.module;
+        let func_index = &mut self.func_index;
+        crate::c_export_table::emit_export_table(module, &exports, || {
+            let idx = *func_index;
+            *func_index += 1;
+            idx
+        })?;
         Ok(())
     }
 
