@@ -212,7 +212,7 @@ fn build_probe_ptx() -> Vec<u8> {
     // Call the helper under test. row_stride_bytes = 32 = k_dim * 2
     // (col stride for col-major [k=16, n=8] f16).
     let regs = ["rb0".to_string(), "rb1".to_string()];
-    emit_load_b_fragment_smem(&mut ptx, &regs, "%tile_base_u32", 32);
+    emit_load_b_fragment_smem(&mut ptx, &regs, "%tile_base_u32", 32, false);
 
     // Write 2 b32 per lane to HBM at lane * 8 bytes.
     ptx.push_str("    ld.param.u64 %rd_out, [output_ptr];\n");
