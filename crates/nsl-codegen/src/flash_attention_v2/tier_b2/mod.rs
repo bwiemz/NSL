@@ -6,5 +6,6 @@
 
 pub mod dispatch;
 pub mod backward;
+pub mod register_budget_backward;
 
 pub use dispatch::BackwardTier;
