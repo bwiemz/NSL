@@ -168,7 +168,17 @@ impl Compiler<'_> {
                 crate::kernel::KernelCompiler::compile(kernel, self.interner)
             }
             GpuTarget::Fpga => {
-                todo!("M57 PR 2/3 dispatch")
+                // M57.1 prerequisite: AST → structured KIR (Matmul/
+                // ElementwiseAdd/Relu) → KirToHirPass → VerilogEmitter +
+                // HIR port/wire generation. Currently unreachable because
+                // parse_target doesn't yet return GpuTarget::Fpga.
+                // See docs/superpowers/specs/2026-05-18-m57-fpga-verilog-design.md §1.5.
+                return Err(crate::error::CodegenError::new(
+                    "M57.1 prerequisite: AST → structured KIR dispatch + HIR \
+                     port/wire generation. Use `nsl fpga-compile` for the \
+                     intended workflow (currently also deferred — see CLI \
+                     error message)."
+                ));
             }
             GpuTarget::Rocm | GpuTarget::Metal | GpuTarget::WebGpu => {
                 // M47b: AST -> KIR -> backend-specific lowerer
