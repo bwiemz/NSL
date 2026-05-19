@@ -62,6 +62,8 @@ pub fn tier_b2_smem_bytes(bq: u32, bkv: u32, hd: u32, chunk: u32) -> u32 {
 pub fn tier_b2_can_dispatch(
     config: &FlashAttentionConfig,
 ) -> Result<BackwardTier, DispatchReject> {
+    use crate::flash_attention_v2::smem_layout::SMEM_DYNAMIC_BUDGET_BYTES;
+
     let Some(csha) = config.csha.as_ref() else {
         return Err(DispatchReject::NoCsha);
     };
@@ -77,10 +79,8 @@ pub fn tier_b2_can_dispatch(
     };
     let bkv = bq;
     let needed = tier_b2_smem_bytes(bq, bkv, hd, chunk);
-    // 99 KB dynamic SMEM budget on sm_120 (matches B.1 forward's constant).
-    const BUDGET: u32 = 99 * 1024;
-    if needed > BUDGET {
-        return Err(DispatchReject::SmemOverBudget { needed, budget: BUDGET });
+    if needed > SMEM_DYNAMIC_BUDGET_BYTES {
+        return Err(DispatchReject::SmemOverBudget { needed, budget: SMEM_DYNAMIC_BUDGET_BYTES });
     }
     Ok(BackwardTier::TierB2 { bq, bkv, chunk })
 }
