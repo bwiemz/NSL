@@ -22,14 +22,15 @@ impl GenerateFor {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+/// Compile-time boolean for `GenerateIf::cond`. The codegen evaluates the
+/// condition statically before HIR construction, so v1 only ever emits `True`
+/// or `False`. A future milestone that wants symbolic / parameterized
+/// conditions should introduce a richer expression type at that time
+/// (deliberate YAGNI — spec §1.5 deferred-roadmap).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConstExpr {
     True,
     False,
-    /// Reserved for future-milestone configuration expressions; v1 only emits
-    /// True/False (the codegen evaluates the condition statically before HIR
-    /// construction).
-    Literal(bool),
 }
 
 #[derive(Debug, Clone, PartialEq)]

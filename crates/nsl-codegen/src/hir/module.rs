@@ -41,7 +41,9 @@ impl HirNode {
 pub struct HirModule {
     pub name: String,
     pub ports: Vec<Port>,
-    pub bodies: Vec<HirNode>,
+    /// pub(crate) — readers access via `nodes()`; writers MUST use `add_node`
+    /// so the single-driver invariant (spec §3.4 invariant 1) is enforced.
+    pub(crate) bodies: Vec<HirNode>,
     pub local_params: Vec<LocalParam>,
     /// BTreeMap (not HashMap) for deterministic iteration order across Rust
     /// versions and platforms — Layer 1 Verilog emission snapshots depend on
@@ -51,7 +53,6 @@ pub struct HirModule {
     pub test_taps: bool,
 
     // Builder state — used by add_node to enforce single-driver invariant.
-    #[doc(hidden)]
     driven_wires: HashSet<WireId>,
 }
 
@@ -103,6 +104,12 @@ impl HirModule {
         }
         self.bodies.push(node);
         Ok(())
+    }
+
+    /// Read-only access to the SSA node list. Construction must go through
+    /// `add_node` so the single-driver invariant holds.
+    pub fn nodes(&self) -> &[HirNode] {
+        &self.bodies
     }
 }
 

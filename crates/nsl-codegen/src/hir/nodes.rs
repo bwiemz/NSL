@@ -35,7 +35,7 @@ impl Wire {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalParam {
     pub name: String,
     pub width: usize,
