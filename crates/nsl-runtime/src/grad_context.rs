@@ -21,6 +21,20 @@ pub(crate) const ERR_NULL_CONTEXT: &str =
     "nsl_model_backward: null context pointer";
 pub(crate) const ERR_ALREADY_CONSUMED: &str =
     "nsl_model_backward: context already consumed";
+pub(crate) const ERR_INVALID_CONTEXT: &str =
+    "nsl_model_backward: pointer does not point to a valid GradContext (wrong type or stale handle?)";
+
+/// Sentinel value placed at offset 0 of every live `GradContext` to
+/// distinguish a real ctx pointer from a stale handle or a misused
+/// `*mut NslModel` (the historical bug the legacy Python autograd
+/// path hit by calling `nsl_model_backward(model_handle, ...)`).
+///
+/// Chosen distinct from `tensor::TENSOR_MAGIC` (`0x4E534C54` = "NSLT").
+/// Value: `0x4E534C47` = "NSLG" ("NSL Grad context").
+pub(crate) const NSL_GRAD_CONTEXT_MAGIC: u32 = 0x4E534C47;
+/// Sentinel written into the magic field on drop so a use-after-free
+/// is caught instead of looking like a live ctx.
+pub(crate) const NSL_GRAD_CONTEXT_FREED: u32 = 0xDEAD4715;
 
 /// Convenience: route a `&'static str` error message to the thread-local
 /// last-error slot using the shared `set_error_cstring` helper. Keeps the
@@ -41,15 +55,28 @@ fn set_error_static(msg: &'static str) {
 /// `nsl_model_backward` (§4.3), freed by `nsl_grad_context_destroy`
 /// (§4.1). The `consumed: bool` is intentionally non-atomic per the
 /// exclusive-ownership contract (§5.4).
+#[repr(C)]
 pub struct GradContext {
+    /// Type-tag sentinel — `NSL_GRAD_CONTEXT_MAGIC` for a live ctx,
+    /// `NSL_GRAD_CONTEXT_FREED` after Drop. MUST be the first field so
+    /// callers can validate via a single 4-byte read at `ctx_ptr` before
+    /// dereferencing the struct (mirrors the `TENSOR_MAGIC` pattern from
+    /// `tensor::nsl_tensor_free_if_valid`).
+    magic: u32,
     pub(crate) ops: Vec<TapeOp>,
-    /// Snapshot of input `NslTensor*` produced by the forward call.
+    /// Raw NslTensor* the forward was called with. ctx-owned — these
+    /// are fresh wrappers created by `nsl_model_forward_grad` over the
+    /// caller's NslTensorDesc data; freed by `Drop for GradContext`.
     /// Reserved for cross-thread backward (§5.4) and future serialization
     /// (§6) — backward replays from `ops` and writes grads into the
     /// caller's desc array, so this field is currently unread.
     #[allow(dead_code)]
     pub(crate) input_ptrs: Vec<i64>,
+    /// Raw NslTensor* the forward returned. ctx-owned wrappers — same
+    /// lifetime as input_ptrs.
     pub(crate) output_ptrs: Vec<i64>,
+    /// Raw NslTensor* of trainable parameters. Borrowed from the model;
+    /// NOT freed by Drop.
     pub(crate) param_ptrs: Vec<i64>,
     consumed: bool,
 }
@@ -65,7 +92,14 @@ impl GradContext {
         output_ptrs: Vec<i64>,
         param_ptrs: Vec<i64>,
     ) -> Self {
-        Self { ops, input_ptrs, output_ptrs, param_ptrs, consumed: false }
+        Self {
+            magic: NSL_GRAD_CONTEXT_MAGIC,
+            ops,
+            input_ptrs,
+            output_ptrs,
+            param_ptrs,
+            consumed: false,
+        }
     }
 
     pub fn consumed(&self) -> bool {
@@ -86,13 +120,62 @@ impl GradContext {
     }
 }
 
-/// Spec B §4.1 — destroy a context. Idempotent on NULL. Frees the
-/// heap-allocated shell; the underlying tensor pointers in
-/// `input_ptrs` / `output_ptrs` / `param_ptrs` are NOT freed (the
-/// caller owns them).
+/// Free the ctx-owned input/output NslTensor wrappers on drop.
+///
+/// `input_ptrs` / `output_ptrs` are fresh wrappers created by
+/// `nsl_model_forward_grad` via `desc_to_nsl_tensor` over the caller's
+/// `NslTensorDesc` data buffers — they have `owns_data: 0`, so freeing
+/// the wrapper releases only the wrapper's own shape/strides allocations
+/// and the `Box<NslTensor>` itself; the caller's data buffer is left
+/// untouched (matching the desc-borrow contract).
+///
+/// `param_ptrs` are intentionally NOT freed — those are the model's
+/// weight tensors and the model still owns them.
+impl Drop for GradContext {
+    fn drop(&mut self) {
+        for ptr in self.input_ptrs.drain(..) {
+            if ptr != 0 {
+                crate::tensor::nsl_tensor_free(ptr);
+            }
+        }
+        for ptr in self.output_ptrs.drain(..) {
+            if ptr != 0 {
+                crate::tensor::nsl_tensor_free(ptr);
+            }
+        }
+        // param_ptrs intentionally NOT freed — those are the model's weight
+        // tensors, the model still owns them.
+        self.magic = NSL_GRAD_CONTEXT_FREED;
+    }
+}
+
+/// Spec B §4.1 — destroy a context. Idempotent on NULL. Validates the
+/// magic-header sentinel before `Box::from_raw` so passing a stale
+/// handle or a `*mut NslModel` (the legacy Python autograd-path bug)
+/// is a silent no-op rather than heap corruption.
+///
+/// `Drop for GradContext` frees the ctx-owned `input_ptrs` /
+/// `output_ptrs` wrappers. `param_ptrs` are borrowed from the model and
+/// are NOT freed here.
 #[no_mangle]
 pub extern "C" fn nsl_grad_context_destroy(ctx_ptr: i64) {
     if ctx_ptr == 0 {
+        return;
+    }
+    // Cheap sanity gates before the unsafe magic read: reject obviously
+    // bogus pointers (matches `nsl_tensor_free_if_valid`'s pattern).
+    if (ctx_ptr as u64) < 0x10000 {
+        return;
+    }
+    if !(ctx_ptr as usize).is_multiple_of(std::mem::align_of::<u32>()) {
+        return;
+    }
+    // SAFETY: read 4 bytes at `ctx_ptr`. If `ctx_ptr` is invalid this
+    // is UB — but the gates above filter the common misuse paths, and
+    // the magic check catches the realistic "stale or wrong-type
+    // pointer" failure mode. Same risk class as `nsl_tensor_free_if_valid`.
+    let magic = unsafe { *(ctx_ptr as *const u32) };
+    if magic != NSL_GRAD_CONTEXT_MAGIC {
         return;
     }
     unsafe { drop(Box::from_raw(ctx_ptr as *mut GradContext)); }
@@ -304,9 +387,33 @@ pub extern "C" fn nsl_model_backward(
         set_error_static(ERR_NULL_CONTEXT);
         return -1;
     }
-    // SAFETY: ctx_ptr is a `*mut GradContext` produced by
-    // `nsl_model_forward_grad`. §5.4 exclusive-ownership contract
-    // guarantees no other reference exists.
+    // Validate the magic-header sentinel BEFORE dereferencing as
+    // `&mut GradContext`. This catches the realistic legacy-Python
+    // failure mode (`autograd.py` passing a `*mut NslModel` where this
+    // FFI expects a `*mut GradContext`) — without it, the misused write
+    // through `mark_consumed()` would corrupt whatever byte aligns to
+    // `consumed`'s struct offset.
+    //
+    // Cheap sanity gates first (match `nsl_tensor_free_if_valid`'s
+    // pattern), then the 4-byte magic read.
+    if (ctx_ptr as u64) < 0x10000
+        || !(ctx_ptr as usize).is_multiple_of(std::mem::align_of::<u32>())
+    {
+        set_error_static(ERR_INVALID_CONTEXT);
+        return -1;
+    }
+    // SAFETY: 4-byte read at `ctx_ptr`. Same risk class as
+    // `nsl_tensor_free_if_valid`; the alignment + minimum-address gates
+    // above filter the common misuse paths.
+    let magic = unsafe { *(ctx_ptr as *const u32) };
+    if magic != NSL_GRAD_CONTEXT_MAGIC {
+        set_error_static(ERR_INVALID_CONTEXT);
+        return -1;
+    }
+    // SAFETY: ctx_ptr passed both the alignment/min-address gates and
+    // the magic-sentinel check, so it points to a live `GradContext`
+    // produced by `nsl_model_forward_grad`. §5.4 exclusive-ownership
+    // contract guarantees no other reference exists.
     let ctx = unsafe { &mut *(ctx_ptr as *mut GradContext) };
     if ctx.mark_consumed() {
         set_error_static(ERR_ALREADY_CONSUMED);
