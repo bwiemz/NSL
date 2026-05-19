@@ -2,12 +2,12 @@
 //!
 //! Phase 2 implements the three-kernel plan:
 //!   - D pre-pass (`d_prepass` module, Task 6)
-//!   - dQ-kernel (Task 8+)
+//!   - dQ-kernel (Tasks 8-16)
 //!   - dK/dV-kernel (Phase 3)
 //!
-//! Phase 1 contract: `synthesize_tier_b2_backward` still returns
-//! `Err(NotImplemented)` until the three kernels are integrated;
-//! individual emitters are callable directly for testing.
+//! Phase 2 contract: `synthesize_tier_b2_backward` concatenates the PTX
+//! output of `synthesize_d_prepass` + `synthesize_dq_kernel`.  Phase 3
+//! will extend with dK/dV-kernel synthesis.
 
 pub mod d_prepass;
 pub mod dq;
@@ -16,7 +16,8 @@ use crate::flash_attention::FlashAttentionConfig;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BackwardSynthError {
-    /// Phase 1 placeholder. Removed when all three kernels integrate.
+    /// Phase 1 placeholder. Kept for the `NotImplemented` variant so that
+    /// downstream match arms compile; unreachable in Phase 2+.
     NotImplemented,
     /// head_dim must be divisible by 32 for the warp-shfl reduction.
     UnsupportedHeadDim(u32),
@@ -40,14 +41,16 @@ impl std::fmt::Display for BackwardSynthError {
 
 impl std::error::Error for BackwardSynthError {}
 
-/// Phase 1 stub. Always returns `Err(NotImplemented)`.
+/// Phase 2 emitter: synthesize D pre-pass + dQ-kernel PTX.
 ///
-/// Phase 2 replaces this with the real emitter that produces the
-/// three-kernel PTX string per spec §3.
+/// Phase 3 will extend with dK/dV-kernel synthesis (separate kernel,
+/// concatenated into the output).
 pub fn synthesize_tier_b2_backward(
-    _config: &FlashAttentionConfig,
+    config: &FlashAttentionConfig,
 ) -> Result<String, BackwardSynthError> {
-    Err(BackwardSynthError::NotImplemented)
+    let d_prepass_ptx = d_prepass::synthesize_d_prepass(config)?;
+    let dq_ptx = dq::synthesize_dq_kernel(config)?;
+    Ok(format!("{}\n\n{}", d_prepass_ptx, dq_ptx))
 }
 
 #[cfg(test)]
@@ -67,8 +70,21 @@ mod tests {
     }
 
     #[test]
-    fn phase1_stub_returns_not_implemented() {
+    fn phase2_synthesize_concatenates_d_prepass_plus_dq_kernel() {
         let result = synthesize_tier_b2_backward(&canonical_cfg());
-        assert_eq!(result, Err(BackwardSynthError::NotImplemented));
+        let ptx = result.expect("Phase 2 emitter no longer returns NotImplemented");
+        // Must contain both kernels' entry points.
+        assert!(ptx.contains("tier_b2_d_prepass"),
+            "expected D pre-pass entry, got:\n{ptx}");
+        assert!(ptx.contains("tier_b2_dq_kernel"),
+            "expected dQ kernel entry, got:\n{ptx}");
+    }
+
+    #[test]
+    fn phase2_synthesize_rejects_invalid_head_dim() {
+        let mut cfg = canonical_cfg();
+        cfg.head_dim = 48;  // not divisible by 32
+        let result = synthesize_tier_b2_backward(&cfg);
+        assert_eq!(result, Err(BackwardSynthError::UnsupportedHeadDim(48)));
     }
 }
