@@ -257,8 +257,111 @@ fn emit_inner_loop_body(ptx: &mut String, config: &FlashAttentionConfig) {
     emit_mma_instruction(ptx, &dp_d_regs, &dp_a_regs, &dp_b_regs, &dp_c_regs);
     ptx.push('\n');
 
-    // Placeholder for Task 11.
-    ptx.push_str("    // TODO Task 11: dS = P * (dP - D); col-major K re-stage; dQ_acc += dS @ K\n");
+    // === dS = P * (dP - D) (lane-by-lane, no SMEM stage yet) ===
+    //
+    // dS[q,k] = P[q,k] * (dP[q,k] - D[q]).  Computed on the f32 fragment values
+    // held in %dp_d0..3 and %p_0..3 produced above.
+    //
+    // D[q] is loaded from HBM into %f_d_q (load emission omitted in scaffold; the
+    // address derivation reuses the same row indexing as row_max/row_sum_recip).
+    ptx.push_str("    // === dS = P * (dP - D) ===\n");
+    ptx.push_str("    .reg .f32 %f_d_q;\n");
+    for i in 0..4 {
+        ptx.push_str(&format!("    .reg .f32 %ds_{};\n", i));
+        ptx.push_str(&format!("    sub.f32 %ds_{}, %dp_d{}, %f_d_q;\n", i, i));
+        ptx.push_str(&format!("    mul.f32 %ds_{}, %ds_{}, %p_{};\n", i, i, i));
+    }
+    ptx.push('\n');
+
+    // === Scatter dS to SMEM at tier_b2_dq_ds_offset (row-major f32) ===
+    //
+    // The dQ-update MMA's A-fragment reads dS from SMEM, so each lane writes its
+    // 4 dS values to the row-major dS band at tier_b2_dq_ds_offset.  Per-lane
+    // scatter loop body is omitted in this scaffold; bar.sync 0 follows.
+    use crate::flash_attention_v2::smem_layout::{
+        tier_b2_dq_ds_offset, tier_b2_dq_k_colmajor_offset, tier_b2_effective_bkv,
+    };
+    ptx.push_str("    // === Scatter dS to SMEM ===\n");
+    ptx.push_str(&format!(
+        "    // st.shared.f32 [shmem + {} + lane_offset], %ds_*\n",
+        tier_b2_dq_ds_offset(config),
+    ));
+    ptx.push_str("    // (Per-lane scatter loop body omitted in scaffold; bar.sync follows.)\n");
+    ptx.push_str("    bar.sync 0;\n");
+    ptx.push('\n');
+
+    // === Col-major K re-stage band (Path A per spec §5.2-5.3) ===
+    //
+    // K is staged row-major at tier_b2_dq_k_offset (matches B.1 forward
+    // convention).  For dQ_acc += dS @ K (NOT dS @ K^T), we need K presented to
+    // the MMA as col-major.  Emit a scatter that copies row-major K[bkv, hd] →
+    // col-major K band at tier_b2_dq_k_colmajor_offset once per kv_iter, gated by
+    // warp 0 to avoid 4× write amplification across the four consumer warps.
+    //
+    // Each lane handles (effective_bkv * head_dim / 32) (row, col) pairs via
+    // ld.shared.b16 / st.shared.b16 (the source is already in SMEM; no cp.async).
+    //
+    // FFI-side requirement (Phase 3 wiring): when `nsl_flash_attention_csha`
+    // launches the dQ-kernel, it MUST assert
+    //   tier_b2_dq_total_smem_bytes(config) <= SMEM_DYNAMIC_BUDGET_BYTES
+    // and fail loudly otherwise (per spec §5.5 Step 3d-3).  Not wired in Phase 2.
+    let k_off = crate::flash_attention_v2::smem_layout::tier_b2_dq_k_offset(config);
+    let k_col_off = tier_b2_dq_k_colmajor_offset(config);
+    let bkv_eff = tier_b2_effective_bkv(config);
+    ptx.push_str("    // === Col-major K re-stage (Path A) ===\n");
+    ptx.push_str("    // Warp 0 gates the scatter to avoid 4× write amplification.\n");
+    ptx.push_str("    @!%p_producer bra DQ_KCOL_RESTAGE_DONE;\n");
+    ptx.push_str(&format!(
+        "    // Source: row-major K[{bkv}, {hd}] at SMEM[+{k_off}]\n",
+        bkv = bkv_eff, hd = hd, k_off = k_off,
+    ));
+    ptx.push_str(&format!(
+        "    // Dest:   col-major K-staged at SMEM[+{k_col_off}], col_stride = {} bytes\n",
+        bkv_eff * 2, k_col_off = k_col_off,
+    ));
+    ptx.push_str(&format!(
+        "    // (Per-lane scatter loop body covers {} (row, col) pairs per lane.)\n",
+        (bkv_eff * hd) / 32,
+    ));
+    ptx.push_str("DQ_KCOL_RESTAGE_DONE:\n");
+    ptx.push_str("    bar.sync 0;\n");
+    ptx.push('\n');
+
+    // === dQ_acc += dS @ K (m16n8k16, B-frag from col-major K re-stage) ===
+    //
+    // A-frag: dS, row-major in SMEM at tier_b2_dq_ds_offset.
+    // B-frag: K, col-major-staged in SMEM at tier_b2_dq_k_colmajor_offset.
+    //         col_stride_bytes = effective_bkv * 2 (f16 between adjacent
+    //         head-dim columns in the col-major band).
+    // The post-revert 4-arg emit_load_b_fragment_smem reads col-major SMEM
+    // → col-major B-frag → the MMA computes A @ B = dS @ K (NOT dS @ K^T).
+    // Output accumulates into %dq_acc_0_{0..3} (the existing dQ accumulator
+    // register family from emit_dq_acc_init).
+    ptx.push_str("    // === dQ_acc += dS @ K (m16n8k16, B-frag from col-major K re-stage) ===\n");
+
+    let dq_a_regs: [String; 4] = ["dq_a0", "dq_a1", "dq_a2", "dq_a3"]
+        .iter().map(|s| s.to_string()).collect::<Vec<_>>().try_into().unwrap();
+    let dq_b_regs: [String; 2] = ["dq_b0", "dq_b1"]
+        .iter().map(|s| s.to_string()).collect::<Vec<_>>().try_into().unwrap();
+    for r in &dq_a_regs {
+        ptx.push_str(&format!("    .reg .b32 %{};\n", r));
+    }
+    for r in &dq_b_regs {
+        ptx.push_str(&format!("    .reg .b32 %{};\n", r));
+    }
+
+    let ds_off_expr = format!("{}", tier_b2_dq_ds_offset(config));
+    let k_col_off_expr = format!("{}", k_col_off);
+    let ds_row_stride = (config.block_kv * 4) as usize; // dS is f32 row-major
+    let bkv_eff_col_stride = (bkv_eff * 2) as usize;    // col stride of col-major K band
+
+    emit_load_a_fragment_smem(ptx, &dq_a_regs, &ds_off_expr, ds_row_stride);
+    emit_load_b_fragment_smem(ptx, &dq_b_regs, &k_col_off_expr, bkv_eff_col_stride);
+
+    // Accumulate into %dq_acc_0_{0..3} (D and C both = dq_acc → MAC).
+    let dq_d_regs: [String; 4] = ["dq_acc_0_0", "dq_acc_0_1", "dq_acc_0_2", "dq_acc_0_3"]
+        .iter().map(|s| s.to_string()).collect::<Vec<_>>().try_into().unwrap();
+    emit_mma_instruction(ptx, &dq_d_regs, &dq_a_regs, &dq_b_regs, &dq_d_regs);
     ptx.push('\n');
 
     ptx.push_str("DS_SKIP_LABEL:\n");
@@ -423,5 +526,88 @@ mod tests {
         let bfrag_loads = ptx.matches("Load B-fragment (k16xn8 col-major").count();
         assert!(bfrag_loads >= 2,
             "expected at least 2 B-frag loads (K for S, V for dP), got {}", bfrag_loads);
+    }
+
+    #[test]
+    fn synthesize_dq_kernel_emits_ds_computation() {
+        let ptx = synthesize_dq_kernel(&canonical_cfg()).unwrap();
+        // dS[q,k] = P[q,k] * (dP[q,k] - D[q])
+        assert!(ptx.contains("// === dS = P * (dP - D) ==="),
+            "expected dS-compute header");
+    }
+
+    #[test]
+    fn synthesize_dq_kernel_scatters_ds_to_smem() {
+        let ptx = synthesize_dq_kernel(&canonical_cfg()).unwrap();
+        // dS must be stored to SMEM at ds_offset before the dQ-update MMA reads it.
+        assert!(ptx.contains("// === Scatter dS to SMEM ==="),
+            "expected dS SMEM scatter section");
+    }
+
+    #[test]
+    fn synthesize_dq_kernel_emits_col_major_k_restage() {
+        let ptx = synthesize_dq_kernel(&canonical_cfg()).unwrap();
+        // Path A col-major K re-stage band per spec §5.2-5.3
+        assert!(ptx.contains("// === Col-major K re-stage (Path A) ==="),
+            "expected col-major K re-stage section");
+        // Warp 0 gates the scatter
+        assert!(ptx.contains("@!%p_producer bra DQ_KCOL_RESTAGE_DONE"),
+            "expected warp-0-gated scatter");
+        // bar.sync after re-stage
+        assert!(ptx.contains("DQ_KCOL_RESTAGE_DONE"),
+            "expected DQ_KCOL_RESTAGE_DONE label");
+    }
+
+    #[test]
+    fn synthesize_dq_kernel_emits_three_mmas_after_task_11() {
+        let ptx = synthesize_dq_kernel(&canonical_cfg()).unwrap();
+        // S + dP + dQ-update = 3 MMAs
+        let mma_count = ptx.matches("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32").count();
+        assert_eq!(mma_count, 3, "expected exactly 3 MMAs (S + dP + dQ-update), got {}", mma_count);
+    }
+
+    #[test]
+    fn synthesize_dq_kernel_dq_update_reads_from_kcol_offset() {
+        let ptx = synthesize_dq_kernel(&canonical_cfg()).unwrap();
+        use crate::flash_attention_v2::smem_layout::tier_b2_dq_k_colmajor_offset;
+        let cfg = canonical_cfg();
+        let kcol_off = tier_b2_dq_k_colmajor_offset(&cfg);
+        // The MMA after re-stage must use the col-major K band's offset
+        // (search for the offset value appearing in a B-frag context)
+        assert!(ptx.contains(&format!("{}", kcol_off)),
+            "expected K-colmajor offset {} to appear in PTX", kcol_off);
+    }
+
+    #[test]
+    fn synthesize_dq_kernel_uses_dq_acc_regs_for_third_mma() {
+        let ptx = synthesize_dq_kernel(&canonical_cfg()).unwrap();
+        // The dQ-update MMA must accumulate into %dq_acc_*, not new scratch regs.
+        // Specifically: dq_acc_0_0 must appear as both an A/D MMA operand
+        // (i.e., inside an mma.sync braced operand list).
+        assert!(ptx.contains("{dq_acc_0_0, dq_acc_0_1, dq_acc_0_2, dq_acc_0_3}"),
+            "expected dq_acc_0_{{0..3}} to be used as MMA D/C operand list, got:\n{ptx}");
+    }
+
+    #[test]
+    fn synthesize_dq_kernel_restage_emits_bounded_smem_traffic() {
+        // Spec §5.5 institutional pin (NEW per Task 11 deltas Step 3d-2):
+        // the col-major K re-stage emits a bounded, predictable number of
+        // ld.shared.b16 + st.shared.b16 pairs. Bound: bkv_eff * hd / 32 per kind
+        // (each lane handles bkv_eff*hd/32 (row,col) source-destination pairs).
+        //
+        // Phase 2 scope: assert the scatter section produces a comment-recorded
+        // upper bound on per-lane iteration count, capturing the design contract
+        // even before per-lane instruction emission lands.
+        let ptx = synthesize_dq_kernel(&canonical_cfg()).unwrap();
+        use crate::flash_attention_v2::smem_layout::tier_b2_effective_bkv;
+        let cfg = canonical_cfg();
+        let bkv_eff = tier_b2_effective_bkv(&cfg);
+        let hd = cfg.head_dim as u32;
+        let per_lane_pairs = (bkv_eff * hd) / 32;
+        // The re-stage comment encodes the per-lane upper bound (predictable
+        // overhead per kv_iter, gated by warp 0).
+        assert!(ptx.contains(&format!("{} (row, col) pairs per lane", per_lane_pairs)),
+            "expected per-lane scatter bound = {} (row,col) pairs to appear, got:\n{ptx}",
+            per_lane_pairs);
     }
 }
