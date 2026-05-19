@@ -1,18 +1,24 @@
-//! Tier B.2 backward kernel emitter — Phase 1 stub.
+//! Tier B.2 backward kernel emitter — Phase 2 implementation.
 //!
-//! Phase 2 will replace this stub with the three-kernel implementation
-//! (D pre-pass + dQ-kernel + dK/dV-kernel) per spec §3.
+//! Phase 2 implements the three-kernel plan:
+//!   - D pre-pass (`d_prepass` module, Task 6)
+//!   - dQ-kernel (Task 8+)
+//!   - dK/dV-kernel (Phase 3)
 //!
-//! Phase 1 contract: returns `Err(NotImplemented)` so the selector can
-//! fall back to scalar v2 backward without panicking.
+//! Phase 1 contract: `synthesize_tier_b2_backward` still returns
+//! `Err(NotImplemented)` until the three kernels are integrated;
+//! individual emitters are callable directly for testing.
+
+pub mod d_prepass;
 
 use crate::flash_attention::FlashAttentionConfig;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BackwardSynthError {
-    /// Phase 1 placeholder. Phase 2 removes this variant when the
-    /// emitter ships.
+    /// Phase 1 placeholder. Removed when all three kernels integrate.
     NotImplemented,
+    /// head_dim must be divisible by 32 for the warp-shfl reduction.
+    UnsupportedHeadDim(u32),
 }
 
 impl std::fmt::Display for BackwardSynthError {
@@ -20,8 +26,12 @@ impl std::fmt::Display for BackwardSynthError {
         match self {
             Self::NotImplemented => write!(
                 f,
-                "Tier B.2 backward emitter not yet implemented (Phase 1 stub); \
-                 fall back to scalar v2 backward"
+                "Tier B.2 backward emitter path not yet implemented"
+            ),
+            Self::UnsupportedHeadDim(hd) => write!(
+                f,
+                "Tier B.2 backward requires head_dim divisible by 32, got {}",
+                hd
             ),
         }
     }
