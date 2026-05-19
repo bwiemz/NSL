@@ -51,6 +51,11 @@ pub enum KirType {
     I32,
     U64,
     I64,
+    // M57 v1: narrow signed integer types for FPGA INT8 quantized inference.
+    // I8  → layer-1 weight/activation dtype (i8×i8→i32, spec §4.6 layer 1)
+    // I16 → intermediate headroom dtype (spec §4.6 headroom math)
+    I8,
+    I16,
     F16,
     Bf16,
     F32,
@@ -82,28 +87,26 @@ impl KirType {
     /// Size in bytes.
     pub fn size_bytes(&self) -> usize {
         match self {
-            KirType::Bool => 1,
+            KirType::Bool | KirType::I8 | KirType::Tq2Packed | KirType::TernaryUnpacked => 1,
+            KirType::I16 | KirType::F16 | KirType::Bf16 => 2,
             KirType::U32 | KirType::I32 | KirType::F32 => 4,
             KirType::U64 | KirType::I64 | KirType::F64 => 8,
-            KirType::F16 | KirType::Bf16 => 2,
             KirType::Ptr(_, _) => 8,
             KirType::Vec(inner, n) => inner.size_bytes() * *n as usize,
-            KirType::Tq2Packed => 1,
-            KirType::TernaryUnpacked => 1,
         }
     }
 
     /// PTX register prefix.
     pub fn ptx_reg_prefix(&self) -> &'static str {
         match self {
-            KirType::U32 | KirType::I32 | KirType::Bool => "%r",
+            KirType::U32 | KirType::I32 | KirType::Bool
+            | KirType::I8 | KirType::I16
+            | KirType::Tq2Packed | KirType::TernaryUnpacked => "%r",
             KirType::U64 | KirType::I64 | KirType::Ptr(_, _) => "%rd",
             KirType::F32 => "%f",
             KirType::F64 => "%fd",
             KirType::F16 | KirType::Bf16 => "%h",
             KirType::Vec(_, _) => "%v",
-            KirType::Tq2Packed => "%r",
-            KirType::TernaryUnpacked => "%r",
         }
     }
 
@@ -114,6 +117,8 @@ impl KirType {
             KirType::I32 => "i32",
             KirType::U64 => "u64",
             KirType::I64 => "i64",
+            KirType::I8 => "s8",
+            KirType::I16 => "s16",
             KirType::F16 => "f16",
             KirType::Bf16 => "bf16",
             KirType::F32 => "f32",
@@ -191,6 +196,23 @@ pub enum KirOp {
 
     // Shared memory fence
     SharedMemFence,
+
+    // M57 v1: structured ops for FPGA target. GPU/CPU codegen ignores these
+    // (existing AST → templated PTX path for GPU; Cranelift for CPU);
+    // FPGA codegen consumes them in the KIR → HIR pass.
+    Matmul {
+        a: VarId, b: VarId, out: VarId,
+        a_dtype: KirType, b_dtype: KirType, out_dtype: KirType,
+        a_shape: [usize; 2], b_shape: [usize; 2],   // rank-2 hardcoded for v1
+    },
+    ElementwiseAdd {
+        a: VarId, b: VarId, out: VarId,
+        dtype: KirType, shape: [usize; 1],          // rank-1 hardcoded for v1
+    },
+    Relu {
+        a: VarId, out: VarId,
+        dtype: KirType, shape: [usize; 1],          // rank-1 hardcoded for v1
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -359,6 +381,13 @@ impl KernelIR {
         self.blocks.iter().map(|b| b.ops.len()).sum()
     }
 
+    /// Iterate all ops across all blocks in order.
+    /// M57: consumed by the KIR → HIR pass (v1 assumes single-block KIR;
+    /// multi-block KIR is out of scope until a future milestone).
+    pub fn ops(&self) -> impl Iterator<Item = &KirOp> {
+        self.blocks.iter().flat_map(|b| b.ops.iter())
+    }
+
     /// Validate that all blocks have terminators.
     pub fn is_well_formed(&self) -> bool {
         self.blocks.iter().all(|b| b.terminator.is_some())
@@ -493,5 +522,64 @@ mod tests {
             KirType::Ptr(Box::new(KirType::F32), AddressSpace::Global).ptx_reg_prefix(),
             "%rd"
         );
+    }
+}
+
+#[cfg(test)]
+mod m57_v1_tests {
+    use super::*;
+
+    #[test]
+    fn matmul_variant_carries_shape_and_dtype() {
+        let op = KirOp::Matmul {
+            a: 1, b: 2, out: 3,
+            a_dtype: KirType::I8, b_dtype: KirType::I8, out_dtype: KirType::I32,
+            a_shape: [1, 784], b_shape: [784, 128],
+        };
+        match op {
+            KirOp::Matmul { a_shape, b_shape, .. } => {
+                assert_eq!(a_shape[1], 784);
+                assert_eq!(b_shape[1], 128);
+            }
+            _ => panic!("expected Matmul variant"),
+        }
+    }
+
+    #[test]
+    fn elementwise_add_variant_is_rank_1() {
+        let op = KirOp::ElementwiseAdd {
+            a: 1, b: 2, out: 3,
+            dtype: KirType::I32, shape: [128],
+        };
+        match op {
+            KirOp::ElementwiseAdd { shape, .. } => assert_eq!(shape[0], 128),
+            _ => panic!("expected ElementwiseAdd"),
+        }
+    }
+
+    #[test]
+    fn relu_variant_is_rank_1() {
+        let op = KirOp::Relu {
+            a: 1, out: 2,
+            dtype: KirType::I32, shape: [128],
+        };
+        match op {
+            KirOp::Relu { shape, .. } => assert_eq!(shape[0], 128),
+            _ => panic!("expected Relu"),
+        }
+    }
+
+    #[test]
+    fn i8_type_has_correct_size_and_ptx() {
+        assert_eq!(KirType::I8.size_bytes(), 1);
+        assert_eq!(KirType::I8.ptx_reg_prefix(), "%r");
+        assert_eq!(KirType::I8.ptx_type(), "s8");
+    }
+
+    #[test]
+    fn i16_type_has_correct_size_and_ptx() {
+        assert_eq!(KirType::I16.size_bytes(), 2);
+        assert_eq!(KirType::I16.ptx_reg_prefix(), "%r");
+        assert_eq!(KirType::I16.ptx_type(), "s16");
     }
 }
