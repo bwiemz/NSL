@@ -229,6 +229,14 @@ pub fn emit_load_a_fragment_smem(
 /// `smem_base_expr` is a u32 PTX expression evaluating to the byte
 /// address of B[0, 0] in SMEM.
 ///
+/// `load_transposed` controls the SMEM-to-fragment mapping:
+/// - `false`: col-major SMEM → col-major B-frag presentation (B.1 forward S=QK^T pattern).
+///   Second .b32 reads from the same column at byte offset +16 (+8 k-rows in col-major).
+/// - `true`: col-major SMEM → row-major B-frag presentation (Phase 2 dQ-update pattern).
+///   Second .b32 reads from a DIFFERENT row (row + 8), presenting col-major SMEM
+///   transposed to the MMA. Used when the same SMEM tile needs to feed both row-col
+///   MMAs (S, dP) and row-row-effective MMAs (dQ_acc += dS @ K).
+///
 /// As with `emit_load_a_fragment_smem`, the helper computes the
 /// per-lane mapping internally from `%tid.x` and uses `%mma_addr` +
 /// `%mma_b_row` as scratch — no caller setup of `%mma_b_row` is
@@ -252,39 +260,75 @@ pub fn emit_load_b_fragment_smem(
     frag_regs: &[String; 2],
     smem_base_expr: &str,
     row_stride_bytes: usize,
+    load_transposed: bool,
 ) {
-    ptx.push_str("    // Load B-fragment (k16xn8 col-major f16) per PTX m16n8k16 spec\n");
-    ptx.push_str("    // Lane t holds: reg0=B[(t%4)*2 .. +1, t/4], reg1=B[(t%4)*2+8 .. +9, t/4]\n");
-    // Self-contained lane derivation from %tid.x.
-    ptx.push_str("    mov.u32 %mma_addr, %tid.x;              // load tid\n");
-    ptx.push_str("    and.b32 %mma_addr, %mma_addr, 31;       // lane = tid & 31\n");
-    // %mma_b_row = (lane / 4) * row_stride_bytes  (byte offset of column n_col).
-    ptx.push_str("    shr.u32 %mma_b_row, %mma_addr, 2;       // n_col = lane / 4\n");
-    ptx.push_str(&format!(
-        "    mul.lo.u32 %mma_b_row, %mma_b_row, {};  // n_col * col_stride\n",
-        row_stride_bytes
-    ));
-    // Add k_lo bytes = (lane % 4) * 4 bytes (2 f16 packed = 4 bytes wide).
-    ptx.push_str("    and.b32 %mma_addr, %mma_addr, 3;        // lane % 4\n");
-    ptx.push_str("    shl.b32 %mma_addr, %mma_addr, 2;        // * 4 bytes (k_lo bytes)\n");
-    ptx.push_str(
-        "    add.u32 %mma_b_row, %mma_b_row, %mma_addr;  // + k_lo bytes\n",
-    );
-    // Add smem base.
-    ptx.push_str(&format!(
-        "    add.u32 %mma_b_row, %mma_b_row, {};  // + smem base\n",
-        smem_base_expr
-    ));
-    // reg 0 = B[k_lo .. k_lo+1, n_col].
-    ptx.push_str(&format!(
-        "    ld.shared.b32 %{}, [%mma_b_row];           // reg0 @ B[k_lo, n_col]\n",
-        frag_regs[0]
-    ));
-    // reg 1 = B[k_lo+8 .. k_lo+9, n_col] (+16 bytes = +8 k-rows in col-major).
-    ptx.push_str(&format!(
-        "    ld.shared.b32 %{}, [%mma_b_row + 16];      // reg1 @ B[k_lo+8, n_col]\n",
-        frag_regs[1]
-    ));
+    if load_transposed {
+        ptx.push_str("    // Load B-fragment (transposed: col-major SMEM -> row-major B-frag)\n");
+        ptx.push_str("    // Lane t: reg0=B[row, 0], reg1=B[row+8, 0] where row=(t%4)*2, same-col-0\n");
+        // Self-contained lane derivation from %tid.x.
+        ptx.push_str("    mov.u32 %mma_addr, %tid.x;              // load tid\n");
+        ptx.push_str("    and.b32 %mma_addr, %mma_addr, 31;       // lane = tid & 31\n");
+        // k_row_lo = (lane % 4) * 2 — same k-row formula as the non-transposed variant.
+        ptx.push_str("    and.b32 %mma_b_row, %mma_addr, 3;       // lane % 4\n");
+        ptx.push_str("    shl.b32 %mma_b_row, %mma_b_row, 1;      // k_row_lo = (lane%4)*2\n");
+        // reg 0: B[k_row_lo, col=0] — byte address = k_row_lo * row_stride_bytes + smem base.
+        // IMPORTANT: Use mul.lo.u32 + add.u32, NOT mad.lo.u32 (ISA 7.0 runtime rejection).
+        ptx.push_str(&format!(
+            "    mul.lo.u32 %mma_addr, %mma_b_row, {};  // k_row_lo * stride\n",
+            row_stride_bytes
+        ));
+        ptx.push_str(&format!(
+            "    add.u32 %mma_addr, %mma_addr, {};  // + smem base\n",
+            smem_base_expr
+        ));
+        ptx.push_str(&format!(
+            "    ld.shared.b32 %{}, [%mma_addr];           // reg0 @ B[k_row_lo, col=0]\n",
+            frag_regs[0]
+        ));
+        // reg 1: B[k_row_lo + 8, col=0] — +8 rows = +8 * row_stride_bytes bytes.
+        let row8_bytes = 8 * row_stride_bytes;
+        ptx.push_str(&format!(
+            "    add.u32 %mma_addr, %mma_addr, {};  // + 8 rows\n",
+            row8_bytes
+        ));
+        ptx.push_str(&format!(
+            "    ld.shared.b32 %{}, [%mma_addr];           // reg1 @ B[k_row_lo+8, col=0]\n",
+            frag_regs[1]
+        ));
+    } else {
+        ptx.push_str("    // Load B-fragment (k16xn8 col-major f16) per PTX m16n8k16 spec\n");
+        ptx.push_str("    // Lane t holds: reg0=B[(t%4)*2 .. +1, t/4], reg1=B[(t%4)*2+8 .. +9, t/4]\n");
+        // Self-contained lane derivation from %tid.x.
+        ptx.push_str("    mov.u32 %mma_addr, %tid.x;              // load tid\n");
+        ptx.push_str("    and.b32 %mma_addr, %mma_addr, 31;       // lane = tid & 31\n");
+        // %mma_b_row = (lane / 4) * row_stride_bytes  (byte offset of column n_col).
+        ptx.push_str("    shr.u32 %mma_b_row, %mma_addr, 2;       // n_col = lane / 4\n");
+        ptx.push_str(&format!(
+            "    mul.lo.u32 %mma_b_row, %mma_b_row, {};  // n_col * col_stride\n",
+            row_stride_bytes
+        ));
+        // Add k_lo bytes = (lane % 4) * 4 bytes (2 f16 packed = 4 bytes wide).
+        ptx.push_str("    and.b32 %mma_addr, %mma_addr, 3;        // lane % 4\n");
+        ptx.push_str("    shl.b32 %mma_addr, %mma_addr, 2;        // * 4 bytes (k_lo bytes)\n");
+        ptx.push_str(
+            "    add.u32 %mma_b_row, %mma_b_row, %mma_addr;  // + k_lo bytes\n",
+        );
+        // Add smem base.
+        ptx.push_str(&format!(
+            "    add.u32 %mma_b_row, %mma_b_row, {};  // + smem base\n",
+            smem_base_expr
+        ));
+        // reg 0 = B[k_lo .. k_lo+1, n_col].
+        ptx.push_str(&format!(
+            "    ld.shared.b32 %{}, [%mma_b_row];           // reg0 @ B[k_lo, n_col]\n",
+            frag_regs[0]
+        ));
+        // reg 1 = B[k_lo+8 .. k_lo+9, n_col] (+16 bytes = +8 k-rows in col-major).
+        ptx.push_str(&format!(
+            "    ld.shared.b32 %{}, [%mma_b_row + 16];      // reg1 @ B[k_lo+8, n_col]\n",
+            frag_regs[1]
+        ));
+    }
 }
 
 #[cfg(test)]
@@ -329,9 +373,42 @@ mod tests {
     fn emit_load_b_fragment_emits_two_ld_shared() {
         let mut ptx = String::new();
         let regs = s2(&["rb0", "rb1"]);
-        emit_load_b_fragment_smem(&mut ptx, &regs, "%smem_base_w", 8);
+        emit_load_b_fragment_smem(&mut ptx, &regs, "%smem_base_w", 8, false);  // ADDED: false
         assert_eq!(ptx.matches("ld.shared.b32").count(), 2);
         assert!(ptx.contains("%rb0"));
         assert!(ptx.contains("%rb1"));
+    }
+
+    #[test]
+    fn emit_load_b_fragment_default_unchanged() {
+        let mut ptx_default = String::new();
+        let regs = s2(&["rb0", "rb1"]);
+        emit_load_b_fragment_smem(&mut ptx_default, &regs, "%smem_base_w", 8, false);
+        assert_eq!(ptx_default.matches("ld.shared.b32").count(), 2);
+        assert!(ptx_default.contains("%rb0"));
+        assert!(ptx_default.contains("%rb1"));
+        assert!(ptx_default.contains("16"), "default variant uses 16-byte offset: {ptx_default}");
+    }
+
+    #[test]
+    fn emit_load_b_fragment_transposed_offsets() {
+        let mut ptx_trans = String::new();
+        let regs = s2(&["rb0", "rb1"]);
+        emit_load_b_fragment_smem(&mut ptx_trans, &regs, "%smem_base_w", 8, true);
+        assert_eq!(ptx_trans.matches("ld.shared.b32").count(), 2);
+        assert!(
+            ptx_trans.contains("mul.lo.u32"),
+            "transposed variant emits a separate row*stride for the second load: {ptx_trans}",
+        );
+    }
+
+    #[test]
+    fn emit_load_b_fragment_variants_differ() {
+        let mut p_false = String::new();
+        let mut p_true = String::new();
+        let regs = s2(&["rb0", "rb1"]);
+        emit_load_b_fragment_smem(&mut p_false, &regs, "%smem", 8, false);
+        emit_load_b_fragment_smem(&mut p_true, &regs, "%smem", 8, true);
+        assert_ne!(p_false, p_true, "load_transposed must change emitted PTX");
     }
 }

@@ -973,6 +973,7 @@ pub fn emit_q_projection(ptx: &mut String, config: &FlashAttentionConfig, chunk:
                     &b_fragment_regs,
                     &b_base_expr,
                     (chunk * 2) as usize,
+                    false,
                 );
                 let d_regs = [
                     format!("%q_acc_{}_0", t),
@@ -1471,6 +1472,7 @@ pub fn emit_kv_projection_chunk_loop(
                     &bk_fragment_regs,
                     &bk_base_expr,
                     (chunk * 2) as usize,
+                    false,
                 );
 
                 // V B-fragment: Wv cols. Same convention as Wk.
@@ -1483,6 +1485,7 @@ pub fn emit_kv_projection_chunk_loop(
                     &bv_fragment_regs,
                     &bv_base_expr,
                     (chunk * 2) as usize,
+                    false,
                 );
 
                 // --- MMA (a): K accumulation ---
