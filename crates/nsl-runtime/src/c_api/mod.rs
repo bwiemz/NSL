@@ -513,6 +513,36 @@ pub extern "C" fn nsl_model_forward(
         set_error("nsl_model_forward: null model pointer\0".to_string());
         return -1;
     }
+    // Prefer the named-dispatch path when a registry exists.
+    let model = unsafe { &*(model_ptr as *const NslModel) };
+    if model.exports.is_some() {
+        let name = c"forward";
+        return nsl_model_call(
+            model_ptr,
+            name.as_ptr() as i64,
+            inputs_ptr,
+            num_inputs,
+            outputs_ptr,
+            num_outputs,
+        );
+    }
+    // Legacy fallback: a model created via the old `nsl_model_create`
+    // (no _with_lib path) uses the registered `forward_fn`. This path
+    // will be removed once all callers migrate.
+    legacy_forward_fn_path(model_ptr, inputs_ptr, num_inputs, outputs_ptr, num_outputs)
+}
+
+/// Legacy `nsl_model_forward` body — preserved as a fallback for models
+/// built via `nsl_model_create` (no shared-library path, so no export
+/// registry). Models created with `nsl_model_create_with_lib` route
+/// through `nsl_model_call` instead.
+fn legacy_forward_fn_path(
+    model_ptr: i64,
+    inputs_ptr: i64,
+    num_inputs: i64,
+    outputs_ptr: i64,
+    num_outputs: i64,
+) -> i64 {
     let model = unsafe { &*(model_ptr as *const NslModel) };
     capi_trace(format!(
         "model_forward start num_inputs={} num_outputs={} weights={}",
