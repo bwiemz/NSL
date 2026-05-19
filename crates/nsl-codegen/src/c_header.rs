@@ -228,9 +228,24 @@ pub fn emit(exports: &[ExportInfo], module_name: &str) -> String {
     out.push_str("    int32_t  device_id;\n");
     out.push_str("} NslTensorDesc;\n\n");
 
+    out.push_str(
+        "/* Function-pointer type for the runtime-dispatched export ABI.\n\
+         * Matches the signature of `nsl_model_call` minus the name pointer. */\n",
+    );
+    out.push_str(
+        "typedef int32_t (*NslExportFn)(\n    \
+              NslModel* model,\n    \
+              const NslTensorDesc* inputs, int32_t n_inputs,\n    \
+              NslTensorDesc* outputs, int32_t n_outputs\n\
+          );\n\n",
+    );
+
     out.push_str("/* Lifecycle (provided by libnsl_runtime) */\n");
     out.push_str("NslModel* nsl_model_create(const char* weights_path);\n");
-    out.push_str("void      nsl_model_destroy(NslModel* model);\n\n");
+    out.push_str("void      nsl_model_destroy(NslModel* model);\n");
+    out.push_str("int64_t   nsl_model_call(NslModel* model, const char* name,\n");
+    out.push_str("                          const NslTensorDesc* inputs, int64_t n_inputs,\n");
+    out.push_str("                          NslTensorDesc* outputs, int64_t n_outputs);\n\n");
 
     out.push_str("/* @export functions */\n");
     for info in exports {
@@ -238,12 +253,38 @@ pub fn emit(exports: &[ExportInfo], module_name: &str) -> String {
     }
     out.push('\n');
 
+    emit_static_inline_wrappers(&mut out, exports);
+
     out.push_str("#ifdef __cplusplus\n");
     out.push_str("}\n");
     out.push_str("#endif\n");
     out.push_str(&format!("#endif /* {guard} */\n"));
 
     out
+}
+
+/// Emit static-inline `nsl_model_forward`, `nsl_model_backward`, and
+/// `nsl_model_forward_with_saves` wrappers when the corresponding export
+/// names are present. These let C callers invoke the conventional named
+/// exports without explicitly threading the name through `nsl_model_call`.
+fn emit_static_inline_wrappers(out: &mut String, exports: &[ExportInfo]) {
+    for conv in &["forward", "backward", "forward_with_saves"] {
+        if exports.iter().any(|e| e.symbol_name == *conv) {
+            out.push_str(&format!(
+                "static inline int32_t nsl_model_{conv}(\n    \
+                     NslModel* model,\n    \
+                     const NslTensorDesc* inputs, int32_t n_inputs,\n    \
+                     NslTensorDesc* outputs, int32_t n_outputs\n\
+                 ) {{\n    \
+                     return (int32_t)nsl_model_call(\n        \
+                         model, \"{conv}\",\n        \
+                         inputs, (int64_t)n_inputs,\n        \
+                         outputs, (int64_t)n_outputs\n    \
+                     );\n\
+                 }}\n\n"
+            ));
+        }
+    }
 }
 
 fn sanitize_header_guard(name: &str) -> String {

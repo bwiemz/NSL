@@ -1252,6 +1252,7 @@ dependencies = [
  "cudarc",
  "half",
  "hf-hub",
+ "libc",
  "libloading 0.8.9",
  "memmap2",
  "once_cell",

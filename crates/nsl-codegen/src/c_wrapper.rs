@@ -418,9 +418,11 @@ pub fn emit_c_abi_dispatch_wrapper(
         }
 
         // Single output: typed wrapper writes into scratch (not caller's
-        // desc); we'll fold scratch back below. The arity check above
-        // already verified num_outputs == 1, so the typed wrapper (which
-        // doesn't take a count) is safe to call as a single-output sink.
+        // desc); we fold scratch back below. The arity check above
+        // already verified num_outputs == 1, so passing one scratch
+        // ret-desc slot is correct. (Tuple-return exports are routed to
+        // the unsupported-stub branch.)
+        typed_args.push(scratch_ptr);
 
         let call_inst = builder.ins().call(typed_ref, &typed_args);
         let rc_i32 = builder.inst_results(call_inst)[0];

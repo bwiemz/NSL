@@ -71,13 +71,8 @@ pub fn nsl_dtype_to_capi(nsl_dtype: u16) -> i32 {
 // NslModel — holds loaded weights and forward function pointer
 // ---------------------------------------------------------------------------
 
-/// Type alias for a compiled forward function.
-/// Signature: fn(weights: &[i64], inputs: &[i64]) -> Vec<i64>
-/// where each i64 is a pointer to an NslTensor.
-type ForwardFn = Box<dyn Fn(&[i64], &[i64]) -> Vec<i64> + Send + Sync>;
-
-/// Opaque model handle. Holds loaded weights and an optional compiled forward
-/// function for dispatching inference.
+/// Opaque model handle. Holds loaded weights and the eagerly-populated
+/// export dispatch table for `@export`-decorated functions.
 pub struct NslModel {
     /// Model version (for ABI compatibility).
     #[allow(dead_code)]
@@ -87,9 +82,6 @@ pub struct NslModel {
     weights: HashMap<String, i64>,
     /// Ordered list of weight tensor pointers (for positional access).
     weight_ptrs: Vec<i64>,
-    /// Optional compiled forward function. When set, nsl_model_forward
-    /// calls this instead of returning an error.
-    forward_fn: Option<ForwardFn>,
     /// Path the weights were loaded from (for diagnostics).
     #[allow(dead_code)]
     weights_path: String,
@@ -98,9 +90,11 @@ pub struct NslModel {
     /// Output tensor pointers saved from the most recent grad-enabled forward pass.
     /// Used to seed the backward pass.
     last_forward_outputs: Vec<i64>,
-    /// Dispatch table for `@export`ed functions. Populated eagerly at create
-    /// time via `nsl_model_create_with_lib`. `None` on the legacy
-    /// `nsl_model_create` path that doesn't carry the .so path.
+    /// Dispatch table for `@export`ed functions. Populated eagerly at
+    /// create time — either via runtime self-discovery in `nsl_model_create`
+    /// or explicitly through `nsl_model_create_with_lib`. `None` when the
+    /// containing object has no export table (e.g., model handles built
+    /// inside cargo test binaries with no `@export` functions).
     exports: Option<crate::c_api::exports::ExportRegistry>,
 }
 
@@ -166,6 +160,98 @@ pub extern "C" fn nsl_clear_error() -> i64 {
     0
 }
 
+/// Given a function pointer (as i64), return a heap-allocated null-
+/// terminated C string with the filesystem path of the shared library
+/// containing that function. Returns 0 (NULL) on failure.
+///
+/// The caller frees the returned pointer via `nsl_free_cstr`.
+///
+/// Implementation: `dladdr` on Unix, `GetModuleHandleEx + GetModuleFileName`
+/// on Windows. The function pointer must be a symbol whose address lives
+/// inside the target shared object; any code address emitted into the
+/// library works.
+#[no_mangle]
+pub extern "C" fn nsl_dl_path_for_fn_addr(fn_addr: i64) -> i64 {
+    if fn_addr == 0 {
+        return 0;
+    }
+    #[cfg(unix)]
+    unsafe {
+        let mut info: libc::Dl_info = std::mem::zeroed();
+        let probe = fn_addr as *const std::ffi::c_void;
+        if libc::dladdr(probe, &mut info) == 0 || info.dli_fname.is_null() {
+            return 0;
+        }
+        let s = std::ffi::CStr::from_ptr(info.dli_fname)
+            .to_string_lossy()
+            .into_owned();
+        match std::ffi::CString::new(s) {
+            Ok(cs) => cs.into_raw() as i64,
+            Err(_) => 0,
+        }
+    }
+    #[cfg(windows)]
+    unsafe {
+        use std::ffi::OsString;
+        use std::os::windows::ffi::OsStringExt;
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn GetModuleHandleExW(
+                flags: u32,
+                module_name: *const u16,
+                handle_out: *mut *mut std::ffi::c_void,
+            ) -> i32;
+            fn GetModuleFileNameW(
+                module: *mut std::ffi::c_void,
+                filename: *mut u16,
+                size: u32,
+            ) -> u32;
+        }
+        const GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS: u32 = 0x4;
+        const GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT: u32 = 0x2;
+        let mut module: *mut std::ffi::c_void = std::ptr::null_mut();
+        let ok = GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
+                | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            fn_addr as *const u16,
+            &mut module,
+        );
+        if ok == 0 || module.is_null() {
+            return 0;
+        }
+        let mut buf = vec![0u16; 32768];
+        let n = GetModuleFileNameW(module, buf.as_mut_ptr(), buf.len() as u32);
+        if n == 0 {
+            return 0;
+        }
+        buf.truncate(n as usize);
+        let os: OsString = OsString::from_wide(&buf);
+        let s = os.to_string_lossy().into_owned();
+        match std::ffi::CString::new(s) {
+            Ok(cs) => cs.into_raw() as i64,
+            Err(_) => 0,
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = fn_addr;
+        0
+    }
+}
+
+/// Free a C string allocated by NSL runtime FFIs that return ownership
+/// (currently only `nsl_dl_path_for_fn_addr`). Safe to call with a NULL
+/// pointer.
+#[no_mangle]
+pub extern "C" fn nsl_free_cstr(ptr: i64) {
+    if ptr == 0 {
+        return;
+    }
+    unsafe {
+        let _ = std::ffi::CString::from_raw(ptr as *mut std::os::raw::c_char);
+    }
+}
+
 /// Set the thread-local error string from a null-terminated C string pointer.
 /// Used by Cranelift-emitted `@export` wrappers; they can't call the Rust-typed
 /// `set_error(String)` directly.
@@ -191,9 +277,17 @@ pub extern "C" fn nsl_set_error_cstr(msg_ptr: i64) {
 
 /// Create a model instance from a weights file path (null-terminated C string).
 ///
-/// Loads weights from a `.safetensors` file into NslTensors. The caller can
-/// then register a forward function via `nsl_model_set_forward` or call
-/// `nsl_model_forward` which dispatches through the registered function.
+/// Loads weights from a `.safetensors` file into NslTensors. The runtime
+/// statically linked into the model's shared library self-discovers the
+/// containing .so/.dll/.dylib path (via `dladdr` on Unix / `GetModuleHandleEx`
+/// on Windows) and eagerly populates the `ExportRegistry` so subsequent
+/// `nsl_model_call`/`nsl_model_forward` calls route to `@export`-emitted
+/// dispatch wrappers without any caller-side knowledge of the .so path.
+///
+/// If self-discovery fails or the containing object has no export table
+/// (e.g., loaded from a unit-test binary), the model is returned with a
+/// `None` registry; the model is still usable for weight inspection but
+/// `nsl_model_call` will then return -1 with an explanatory error.
 ///
 /// Returns a pointer (as i64) to the model handle, or 0 on error.
 #[no_mangle]
@@ -223,17 +317,63 @@ pub extern "C" fn nsl_model_create(weights_path_ptr: i64) -> i64 {
     };
     capi_trace(format!("model_create loaded_weights={}", weight_ptrs.len()));
 
+    // Self-discover the containing shared library and eagerly populate the
+    // export registry. dladdr/GetModuleHandleEx on a function pointer that
+    // belongs to this very runtime (statically linked into the .so when the
+    // caller is a Python ctypes consumer of a `nsl build --shared-lib`
+    // artifact) returns the .so path. If self-discovery succeeds and the
+    // library exposes the codegen-emitted export-table FFIs, the registry
+    // populates. Failures (no export table, non-.so context) fall through
+    // to a model with `exports = None` — still valid; `nsl_model_call` will
+    // surface a clear error.
+    let exports = self_discover_export_registry();
+
     let model = Box::new(NslModel {
         version: 2,
         weights,
         weight_ptrs,
-        forward_fn: None,
         weights_path: path_str.to_string(),
         grad_enabled: false,
         last_forward_outputs: Vec::new(),
-        exports: None,
+        exports,
     });
     Box::into_raw(model) as i64
+}
+
+/// Best-effort self-discovery of the .so/.dll containing this runtime's
+/// code, followed by a `ExportRegistry::from_library_path` call. Used by
+/// `nsl_model_create` to populate the dispatch table without requiring
+/// callers to pass a library path explicitly.
+///
+/// Returns `None` if the platform path-lookup fails OR the discovered
+/// path has no codegen-emitted export-table FFIs (e.g., when running
+/// inside a cargo test binary that links the runtime statically but has
+/// no `@export`'d functions).
+fn self_discover_export_registry() -> Option<crate::c_api::exports::ExportRegistry> {
+    // `nsl_model_create as i64` is an address that lives in the same
+    // object file as the runtime code. dladdr / GetModuleHandleEx on
+    // that address returns the path of the containing .so/.dll.
+    let probe = nsl_model_create as *const () as i64;
+    let path_ptr = nsl_dl_path_for_fn_addr(probe);
+    if path_ptr == 0 {
+        capi_trace("model_create self_discover: dl path lookup failed");
+        return None;
+    }
+    let path = unsafe { CStr::from_ptr(path_ptr as *const c_char) }
+        .to_string_lossy()
+        .into_owned();
+    nsl_free_cstr(path_ptr);
+    let pb = std::path::PathBuf::from(&path);
+    capi_trace(format!("model_create self_discover lib={path}"));
+    match crate::c_api::exports::ExportRegistry::from_library_path(&pb) {
+        Ok(reg) => Some(reg),
+        Err(e) => {
+            capi_trace(format!(
+                "model_create self_discover registry build failed: {e}"
+            ));
+            None
+        }
+    }
 }
 
 /// Create a model and eagerly populate the export dispatch table from
@@ -453,52 +593,15 @@ pub extern "C" fn nsl_model_destroy(model_ptr: i64) -> i64 {
     0
 }
 
-/// Register a forward function for the model.
-///
-/// The function pointer must have the signature:
-///   `fn(num_weights: i64, weights_ptr: i64, num_inputs: i64, inputs_ptr: i64) -> i64`
-/// where weights_ptr and inputs_ptr are pointers to arrays of NslTensor pointers,
-/// and the return value is an NslTensor pointer (the output).
-///
-/// Returns 0 on success, -1 on error.
-#[no_mangle]
-pub extern "C" fn nsl_model_set_forward(model_ptr: i64, fn_ptr: i64) -> i64 {
-    if model_ptr == 0 || fn_ptr == 0 {
-        set_error("nsl_model_set_forward: null pointer\0".to_string());
-        return -1;
-    }
-    let model = unsafe { &mut *(model_ptr as *mut NslModel) };
-
-    // Wrap the raw function pointer in a ForwardFn closure
-    type RawForwardFn = extern "C" fn(i64, i64, i64, i64) -> i64;
-    let raw_fn: RawForwardFn = unsafe { std::mem::transmute(fn_ptr as *const ()) };
-    capi_trace("model_set_forward registered");
-
-    model.forward_fn = Some(Box::new(move |weights: &[i64], inputs: &[i64]| {
-        let result = raw_fn(
-            weights.len() as i64,
-            weights.as_ptr() as i64,
-            inputs.len() as i64,
-            inputs.as_ptr() as i64,
-        );
-        if result == 0 {
-            vec![]
-        } else {
-            vec![result]
-        }
-    }));
-    0
-}
-
 // ---------------------------------------------------------------------------
 // FFI: Forward pass
 // ---------------------------------------------------------------------------
 
 /// Run the model's forward pass with NslTensorDesc inputs/outputs.
 ///
-/// Converts C API tensor descriptors to internal NslTensors, calls the
-/// registered forward function, and writes results back to the output
-/// descriptors.
+/// Thin compatibility shim that delegates to `nsl_model_call(model,
+/// "forward", ...)`. Preserves the original C ABI bit-stably for Python
+/// ctypes callers while routing through the unified named-export dispatch.
 ///
 /// Returns 0 on success, -1 on error (message in thread-local).
 #[no_mangle]
@@ -513,122 +616,25 @@ pub extern "C" fn nsl_model_forward(
         set_error("nsl_model_forward: null model pointer\0".to_string());
         return -1;
     }
-    // Prefer the named-dispatch path when a registry exists.
-    let model = unsafe { &*(model_ptr as *const NslModel) };
-    if model.exports.is_some() {
-        let name = c"forward";
-        return nsl_model_call(
-            model_ptr,
-            name.as_ptr() as i64,
-            inputs_ptr,
-            num_inputs,
-            outputs_ptr,
-            num_outputs,
-        );
-    }
-    // Legacy fallback: a model created via the old `nsl_model_create`
-    // (no _with_lib path) uses the registered `forward_fn`. This path
-    // will be removed once all callers migrate.
-    legacy_forward_fn_path(model_ptr, inputs_ptr, num_inputs, outputs_ptr, num_outputs)
-}
-
-/// Legacy `nsl_model_forward` body — preserved as a fallback for models
-/// built via `nsl_model_create` (no shared-library path, so no export
-/// registry). Models created with `nsl_model_create_with_lib` route
-/// through `nsl_model_call` instead.
-fn legacy_forward_fn_path(
-    model_ptr: i64,
-    inputs_ptr: i64,
-    num_inputs: i64,
-    outputs_ptr: i64,
-    num_outputs: i64,
-) -> i64 {
-    let model = unsafe { &*(model_ptr as *const NslModel) };
-    capi_trace(format!(
-        "model_forward start num_inputs={} num_outputs={} weights={}",
+    let name = c"forward";
+    nsl_model_call(
+        model_ptr,
+        name.as_ptr() as i64,
+        inputs_ptr,
         num_inputs,
+        outputs_ptr,
         num_outputs,
-        model.weight_ptrs.len()
-    ));
-
-    // Check forward function is registered
-    let forward_fn = match &model.forward_fn {
-        Some(f) => f,
-        None => {
-            set_error("nsl_model_forward: no forward function registered (use nsl_model_set_forward)\0".to_string());
-            return -1;
-        }
-    };
-
-    // Convert input NslTensorDescs to NslTensor pointers
-    let mut input_ptrs = Vec::with_capacity(num_inputs as usize);
-    if num_inputs > 0 && inputs_ptr != 0 {
-        let descs = unsafe {
-            std::slice::from_raw_parts(inputs_ptr as *const NslTensorDesc, num_inputs as usize)
-        };
-        for (idx, desc) in descs.iter().enumerate() {
-            capi_trace(format!(
-                "model_forward import input={} ndim={} dtype={} shape_ptr={:?} strides_ptr={:?}",
-                idx,
-                desc.ndim,
-                desc.dtype,
-                desc.shape,
-                desc.strides
-            ));
-            let tensor_ptr = desc_to_nsl_tensor(desc);
-            input_ptrs.push(tensor_ptr);
-        }
-    }
-    capi_trace(format!("model_forward imported_inputs={}", input_ptrs.len()));
-
-    // If grad recording is enabled, start the tape over the weight parameters
-    // so that the backward pass can replay it.
-    let grad_enabled = model.grad_enabled;
-    if grad_enabled {
-        let param_list = crate::list::nsl_list_new();
-        for &wptr in &model.weight_ptrs {
-            crate::list::nsl_list_push(param_list, wptr);
-        }
-        crate::autodiff::nsl_tape_start(param_list);
-        crate::list::nsl_list_free(param_list);
-    }
-
-    // Call forward function
-    capi_trace("model_forward invoke_forward");
-    let output_tensor_ptrs = forward_fn(&model.weight_ptrs, &input_ptrs);
-    capi_trace(format!("model_forward outputs={}", output_tensor_ptrs.len()));
-
-    // Save forward outputs for the backward pass (before writing to output descs,
-    // since nsl_tensor_to_desc only borrows the pointer — the tensor stays alive).
-    if grad_enabled {
-        let model_mut = unsafe { &mut *(model_ptr as *mut NslModel) };
-        model_mut.last_forward_outputs = output_tensor_ptrs.clone();
-    }
-
-    // Write results to output descriptors
-    if num_outputs > 0 && outputs_ptr != 0 {
-        let out_descs = unsafe {
-            std::slice::from_raw_parts_mut(outputs_ptr as *mut NslTensorDesc, num_outputs as usize)
-        };
-        for (i, desc) in out_descs.iter_mut().enumerate() {
-            if i < output_tensor_ptrs.len() {
-                nsl_tensor_to_desc(output_tensor_ptrs[i], desc);
-            }
-        }
-    }
-
-    // Free the input wrapper tensors (they borrowed data, so this just frees the struct)
-    for ptr in &input_ptrs {
-        crate::tensor::nsl_tensor_free(*ptr);
-    }
-
-    0
+    )
 }
 
 /// Run the model's forward pass with DLPack tensors (zero-copy).
 ///
-/// Takes an array of DLManagedTensor pointers as input, calls the forward
-/// function, and returns output tensors as DLManagedTensor pointers.
+/// Compatibility shim that delegates to
+/// `nsl_model_call_dlpack(model, "forward", ...)`. Bridges the historical
+/// `num_outputs_ptr` (out-pointer style) ABI to the registry-based dispatch
+/// that takes a fixed `num_outputs` count, allocating an output array of
+/// `*num_outputs_ptr` slots before the call and writing the actual count
+/// back afterwards.
 ///
 /// Returns 0 on success, -1 on error.
 #[no_mangle]
@@ -643,60 +649,36 @@ pub extern "C" fn nsl_model_forward_dlpack(
         set_error("nsl_model_forward_dlpack: null model pointer\0".to_string());
         return -1;
     }
-    let model = unsafe { &*(model_ptr as *const NslModel) };
-
-    let forward_fn = match &model.forward_fn {
-        Some(f) => f,
-        None => {
-            set_error("nsl_model_forward_dlpack: no forward function registered\0".to_string());
-            return -1;
-        }
+    // For backwards ABI compatibility, treat `num_outputs_ptr` as both an
+    // in-pointer (caller pre-sets it with the slot count of `outputs_ptr`)
+    // and out-pointer. If the caller didn't set it, default to 1 — the
+    // overwhelmingly common single-output forward case.
+    let mut num_outputs: i64 = if num_outputs_ptr != 0 {
+        let n = unsafe { *(num_outputs_ptr as *const i64) };
+        if n <= 0 { 1 } else { n }
+    } else {
+        1
     };
 
-    // Import DLPack inputs to NslTensors
-    let mut input_ptrs = Vec::with_capacity(num_inputs as usize);
-    if num_inputs > 0 && inputs_ptr != 0 {
-        let dlpacks = unsafe {
-            std::slice::from_raw_parts(inputs_ptr as *const *mut DLManagedTensor, num_inputs as usize)
-        };
-        for &dlpack in dlpacks {
-            if dlpack.is_null() {
-                set_error("nsl_model_forward_dlpack: null input DLManagedTensor\0".to_string());
-                return -1;
-            }
-            let tensor_ptr = crate::dlpack::dlpack_to_nsl_tensor(unsafe { &*dlpack });
-            input_ptrs.push(tensor_ptr);
+    let name = c"forward";
+    let rc = nsl_model_call_dlpack(
+        model_ptr,
+        name.as_ptr() as i64,
+        inputs_ptr,
+        num_inputs,
+        outputs_ptr,
+        num_outputs,
+    );
+    if num_outputs_ptr != 0 {
+        // We don't have a true "actual count" from the dispatch path —
+        // `nsl_model_call_dlpack` writes exactly `num_outputs` slots. Mirror
+        // that back to the caller.
+        if rc != 0 {
+            num_outputs = 0;
         }
+        unsafe { *(num_outputs_ptr as *mut i64) = num_outputs };
     }
-
-    // Call forward
-    let output_tensor_ptrs = forward_fn(&model.weight_ptrs, &input_ptrs);
-
-    // Export outputs as DLPack
-    if outputs_ptr != 0 && num_outputs_ptr != 0 {
-        let out_array = unsafe { &mut *(outputs_ptr as *mut *mut DLManagedTensor) };
-        let num_out = unsafe { &mut *(num_outputs_ptr as *mut i64) };
-        *num_out = output_tensor_ptrs.len() as i64;
-
-        if !output_tensor_ptrs.is_empty() {
-            // Allocate array of DLManagedTensor pointers
-            let arr_size = output_tensor_ptrs.len() * std::mem::size_of::<*mut DLManagedTensor>();
-            let arr = checked_alloc(arr_size) as *mut *mut DLManagedTensor;
-            for (i, &tensor_ptr) in output_tensor_ptrs.iter().enumerate() {
-                let tensor = NslTensor::from_ptr(tensor_ptr);
-                let dlpack = crate::dlpack::nsl_tensor_to_dlpack(tensor, tensor_ptr);
-                unsafe { *arr.add(i) = dlpack; }
-            }
-            *out_array = unsafe { *arr }; // point to first element
-        }
-    }
-
-    // Free imported input tensors (borrowed data, struct-only free)
-    for ptr in &input_ptrs {
-        crate::tensor::nsl_tensor_free(*ptr);
-    }
-
-    0
+    rc
 }
 
 // ---------------------------------------------------------------------------
@@ -1330,7 +1312,6 @@ mod tests {
             version: 2,
             weights: HashMap::new(),
             weight_ptrs: vec![],
-            forward_fn: None,
             weights_path: String::new(),
             grad_enabled: false,
             last_forward_outputs: vec![],
@@ -1358,7 +1339,6 @@ mod tests {
             version: 2,
             weights: HashMap::new(),
             weight_ptrs: vec![],
-            forward_fn: None,
             weights_path: String::new(),
             grad_enabled: true,
             last_forward_outputs: vec![],
@@ -1403,68 +1383,15 @@ mod tests {
         assert_eq!(err_msg, "");
     }
 
-    #[test]
-    fn test_backward_with_tape_e2e() {
-        use std::ffi::c_void;
-        use crate::memory::checked_alloc;
-        use crate::tensor::NslTensor;
-
-        // Build a single-weight model: weight = [2.0] (f64 scalar).
-        // forward(w) = w * 3  → loss = w * 3
-        // d(loss)/d(w) = 3
-        let weight_data = checked_alloc(std::mem::size_of::<f64>()) as *mut f64;
-        unsafe { *weight_data = 2.0_f64 };
-        let weight_shape = checked_alloc(std::mem::size_of::<i64>()) as *mut i64;
-        unsafe { *weight_shape = 1 };
-        let weight_strides = NslTensor::compute_strides(weight_shape, 1);
-        let weight_tensor = Box::new(NslTensor::new(
-            weight_data as *mut c_void,
-            weight_shape,
-            weight_strides,
-            1,
-            1,
-            0,  // CPU
-            0,  // f64
-            1,  // owns_data
-            0,
-        ));
-        let weight_ptr = Box::into_raw(weight_tensor) as i64;
-
-        // Forward fn: loss = weight * 3
-        let fwd: ForwardFn = Box::new(move |weights: &[i64], _inputs: &[i64]| {
-            let w = weights[0];
-            let out = crate::tensor::nsl_tensor_mul_scalar(w, 3.0_f64, 0);
-            vec![out]
-        });
-
-        let mut weights = HashMap::new();
-        weights.insert("w".to_string(), weight_ptr);
-
-        let model = Box::new(NslModel {
-            version: 2,
-            weights,
-            weight_ptrs: vec![weight_ptr],
-            forward_fn: Some(fwd),
-            weights_path: String::new(),
-            grad_enabled: false,
-            last_forward_outputs: vec![],
-            exports: None,
-        });
-        let model_ptr = Box::into_raw(model) as i64;
-
-        // Enable grad, run forward, run backward.
-        assert_eq!(nsl_model_enable_grad(model_ptr, 1), 0);
-        assert_eq!(nsl_model_forward(model_ptr, 0, 0, 0, 0), 0);
-
-        let mut num_grads: i64 = 0;
-        let ret = nsl_model_backward(model_ptr, 0, 0, 0, &mut num_grads as *mut i64 as i64);
-        assert_eq!(ret, 0, "backward returned error");
-        assert_eq!(num_grads, 1, "expected 1 gradient (one weight)");
-
-        // Cleanup: destroy the model (frees weight tensor).
-        nsl_model_destroy(model_ptr);
-    }
-
+    // NOTE: the previous `test_backward_with_tape_e2e` exercised the legacy
+    // tape-recording path that ran a Rust-closure `forward_fn` over weight
+    // pointers and saved outputs to `last_forward_outputs`. That path was
+    // removed when `nsl_model_forward` became a thin shim over
+    // `nsl_model_call`; `@export` dispatch is inference-only and the
+    // tape/grad bridge is now exercised through the model-method grad
+    // bridge instead. The pure-error backward tests above
+    // (`test_backward_without_enable_grad`, `test_backward_without_forward`)
+    // continue to validate the public FFI's null/unprepared paths.
 
     #[test]
     fn nsl_model_get_weight_ptrs_returns_valid_pointer() {
@@ -1475,7 +1402,6 @@ mod tests {
             version: 2,
             weights: HashMap::new(),
             weight_ptrs: vec![fake_weight_ptr],
-            forward_fn: None,
             weights_path: String::new(),
             grad_enabled: false,
             last_forward_outputs: vec![],
@@ -1498,7 +1424,6 @@ mod tests {
             version: 2,
             weights: HashMap::new(),
             weight_ptrs: vec![0x100, 0x200, 0x300],  // Use larger values to avoid null-like misalignment
-            forward_fn: None,
             weights_path: String::new(),
             grad_enabled: false,
             last_forward_outputs: vec![],

@@ -2339,11 +2339,20 @@ fn run_build_shared_single(
     // directly from the generated shared lib without loading a separate runtime DLL.
     let runtime_exports = [
         "nsl_model_create",
+        "nsl_model_create_with_lib",
         "nsl_model_destroy",
+        "nsl_model_forward",
+        "nsl_model_backward",
+        "nsl_model_call",
+        "nsl_model_call_dlpack",
+        "nsl_model_export_count",
+        "nsl_model_lookup_function",
+        "nsl_model_enable_grad",
         "nsl_model_get_weight_ptrs",
         "nsl_model_get_num_weights",
         "nsl_model_num_weights",
         "nsl_get_last_error",
+        "nsl_clear_error",
         "nsl_set_error_cstr",
         "nsl_desc_to_tensor",
         "nsl_tensor_to_desc_ffi",
@@ -2351,6 +2360,8 @@ fn run_build_shared_single(
         "nsl_get_num_exports",
         "nsl_get_export_name",
         "nsl_dispatch_apply_result",
+        "nsl_dl_path_for_fn_addr",
+        "nsl_free_cstr",
     ];
     let mut export_refs: Vec<&str> = export_symbols.iter().map(|s| s.as_str()).collect();
     export_refs.extend(dispatch_symbols.iter().map(|s| s.as_str()));
@@ -2626,11 +2637,20 @@ fn run_build_shared_multi(
     // generated DLL without loading a separate runtime DLL.
     let runtime_exports = [
         "nsl_model_create",
+        "nsl_model_create_with_lib",
         "nsl_model_destroy",
+        "nsl_model_forward",
+        "nsl_model_backward",
+        "nsl_model_call",
+        "nsl_model_call_dlpack",
+        "nsl_model_export_count",
+        "nsl_model_lookup_function",
+        "nsl_model_enable_grad",
         "nsl_model_get_weight_ptrs",
         "nsl_model_get_num_weights",
         "nsl_model_num_weights",
         "nsl_get_last_error",
+        "nsl_clear_error",
         "nsl_set_error_cstr",
         "nsl_desc_to_tensor",
         "nsl_tensor_to_desc_ffi",
@@ -2638,6 +2658,8 @@ fn run_build_shared_multi(
         "nsl_get_num_exports",
         "nsl_get_export_name",
         "nsl_dispatch_apply_result",
+        "nsl_dl_path_for_fn_addr",
+        "nsl_free_cstr",
     ];
     let mut export_refs: Vec<&str> = export_symbols.iter().map(|s| s.as_str()).collect();
     export_refs.extend(dispatch_symbols.iter().map(|s| s.as_str()));
