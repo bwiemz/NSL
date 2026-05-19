@@ -1,0 +1,15 @@
+[package]
+name = "nsl-test"
+description = "Test utilities for NeuralScript kernel verification"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+half = { version = "2.4", features = ["std"] }
+
+[features]
+default = []
+cuda = []
