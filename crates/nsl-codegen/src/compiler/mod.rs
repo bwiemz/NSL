@@ -1375,9 +1375,15 @@ impl<'a> Compiler<'a> {
     /// `declare_user_functions_with_linkage`. See `crate::c_wrapper`.
     ///
     /// Also emits the runtime export-table FFIs (`nsl_get_num_exports` and
-    /// `nsl_get_export_name`), unconditionally — even when there are zero
-    /// exports — so the runtime can probe every shared lib uniformly via
-    /// dlsym; the empty-list case returns 0/NULL.
+    /// `nsl_get_export_name`) — but only when producing a single shared
+    /// library (`compile_options.shared_lib == true`). For multi-object
+    /// `nsl run` builds, every object would otherwise carry its own copy
+    /// of those two `Linkage::Export` symbols and the MSVC linker emits
+    /// LNK2005 (already-defined) when it joins the objects. Multi-object
+    /// builds do not consume the export-table FFIs (they're only reached
+    /// via dlsym on a loaded shared lib), so suppressing them is safe.
+    /// Empty-export shared libs still emit the table (returns 0/NULL),
+    /// preserving uniform runtime probing.
     pub fn emit_export_wrappers(&mut self) -> Result<(), CodegenError> {
         // Clone to side-step borrow of `self.features` during emission, which
         // itself calls `&mut self.module`.
@@ -1393,8 +1399,10 @@ impl<'a> Compiler<'a> {
             crate::c_wrapper::emit_c_abi_dispatch_wrapper(self, wrapper)?;
         }
 
-        let exports = self.features.export_functions.clone();
-        crate::c_export_table::emit_export_table(self, &exports)?;
+        if self.compile_options.shared_lib {
+            let exports = self.features.export_functions.clone();
+            crate::c_export_table::emit_export_table(self, &exports)?;
+        }
         Ok(())
     }
 
