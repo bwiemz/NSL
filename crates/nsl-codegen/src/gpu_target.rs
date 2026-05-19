@@ -8,6 +8,7 @@ pub enum GpuTarget {
     Rocm,
     Metal,
     WebGpu,
+    Fpga,  // M57 v1: FPGA Verilog backend
 }
 
 impl GpuTarget {
@@ -55,6 +56,7 @@ impl GpuTarget {
             GpuTarget::Rocm => "rocm",
             GpuTarget::Metal => "metal",
             GpuTarget::WebGpu => "webgpu",
+            GpuTarget::Fpga => "fpga",
         }
     }
 
@@ -84,6 +86,9 @@ impl GpuTarget {
                     | FeatureSet::F16_ARITHMETIC
             }
             GpuTarget::WebGpu => FeatureSet::SHARED_MEMORY | FeatureSet::F16_ARITHMETIC,
+            GpuTarget::Fpga => {
+                todo!("M57 PR 2/3 dispatch")
+            }
         }
     }
 
@@ -94,6 +99,9 @@ impl GpuTarget {
             GpuTarget::Rocm => 64,
             GpuTarget::Metal => 32,
             GpuTarget::WebGpu => 0, // no subgroup guarantees
+            GpuTarget::Fpga => {
+                todo!("M57 PR 2/3 dispatch")
+            }
         }
     }
 }

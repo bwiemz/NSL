@@ -167,6 +167,9 @@ impl Compiler<'_> {
                 // Original path: direct AST -> PTX
                 crate::kernel::KernelCompiler::compile(kernel, self.interner)
             }
+            GpuTarget::Fpga => {
+                todo!("M57 PR 2/3 dispatch")
+            }
             GpuTarget::Rocm | GpuTarget::Metal | GpuTarget::WebGpu => {
                 // M47b: AST -> KIR -> backend-specific lowerer
                 let kir = crate::kernel_lower::lower_kernel_to_ir(kernel, self.interner, target);
@@ -204,7 +207,7 @@ impl Compiler<'_> {
                         );
                         crate::backend_wgsl::lower_kir_to_wgsl(&kir)
                     }
-                    GpuTarget::Cuda => unreachable!(),
+                    GpuTarget::Cuda | GpuTarget::Fpga => unreachable!(),
                 };
 
                 // Null-terminate for consistency with PTX path
