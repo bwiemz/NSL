@@ -13,6 +13,8 @@ use crate::dlpack::DLManagedTensor;
 use crate::tensor::NslTensor;
 use crate::memory::checked_alloc;
 
+pub mod exports;
+
 // ---------------------------------------------------------------------------
 // NslTensorDesc — C API tensor descriptor
 // ---------------------------------------------------------------------------

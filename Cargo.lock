@@ -1247,6 +1247,7 @@ dependencies = [
 name = "nsl-runtime"
 version = "0.9.0"
 dependencies = [
+ "assert_cmd",
  "base64 0.22.1",
  "cudarc",
  "half",
