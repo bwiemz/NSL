@@ -1,0 +1,28 @@
+[package]
+name = "nsl-test"
+description = "Test infrastructure for M57 FPGA + future test scaffolding"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+nsl-codegen.workspace = true
+nsl-ast.workspace = true
+nsl-parser.workspace = true
+rand.workspace = true
+rand_chacha.workspace = true
+sha2 = "0.10"
+toml.workspace = true
+bytemuck.workspace = true
+thiserror = "1"
+regex = "1"
+
+[[bin]]
+name = "generate_mlp_int8_weights_v1"
+path = "fixtures/generate_mlp_int8_weights_v1.rs"
+
+[dev-dependencies]
+insta = "1"
+tempfile = "3"
