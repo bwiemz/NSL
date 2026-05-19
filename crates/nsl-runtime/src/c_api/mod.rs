@@ -97,6 +97,10 @@ pub struct NslModel {
     /// Output tensor pointers saved from the most recent grad-enabled forward pass.
     /// Used to seed the backward pass.
     last_forward_outputs: Vec<i64>,
+    /// Dispatch table for `@export`ed functions. Populated eagerly at create
+    /// time via `nsl_model_create_with_lib`. `None` on the legacy
+    /// `nsl_model_create` path that doesn't carry the .so path.
+    exports: Option<crate::c_api::exports::ExportRegistry>,
 }
 
 impl Drop for NslModel {
@@ -226,8 +230,65 @@ pub extern "C" fn nsl_model_create(weights_path_ptr: i64) -> i64 {
         weights_path: path_str.to_string(),
         grad_enabled: false,
         last_forward_outputs: Vec::new(),
+        exports: None,
     });
     Box::into_raw(model) as i64
+}
+
+/// Create a model and eagerly populate the export dispatch table from
+/// the model's own shared library.
+///
+/// `weights_path_ptr` — null-terminated C string, same semantics as
+///                      `nsl_model_create`.
+/// `lib_path_ptr`     — null-terminated C string pointing at the .so/
+///                      .dll/.dylib file the model was built from. The
+///                      registry dlopens this and caches export pointers.
+///
+/// Returns 0 on error (thread-local message set), or a model handle on
+/// success.
+#[no_mangle]
+pub extern "C" fn nsl_model_create_with_lib(
+    weights_path_ptr: i64,
+    lib_path_ptr: i64,
+) -> i64 {
+    let model_ptr = nsl_model_create(weights_path_ptr);
+    if model_ptr == 0 {
+        return 0;
+    }
+    if lib_path_ptr == 0 {
+        // Treat as legacy create — registry stays None.
+        return model_ptr;
+    }
+    let path_cstr = unsafe { CStr::from_ptr(lib_path_ptr as *const c_char) };
+    let path = std::path::PathBuf::from(path_cstr.to_string_lossy().into_owned());
+    capi_trace(format!("model_create_with_lib lib={}", path.display()));
+    match crate::c_api::exports::ExportRegistry::from_library_path(&path) {
+        Ok(reg) => {
+            let model = unsafe { &mut *(model_ptr as *mut NslModel) };
+            model.exports = Some(reg);
+            model_ptr
+        }
+        Err(e) => {
+            set_error(format!("nsl_model_create_with_lib: {}\0", e));
+            // Tear down the half-built model before returning 0.
+            let _ = nsl_model_destroy(model_ptr);
+            0
+        }
+    }
+}
+
+/// Number of registered exports. 0 if registry is None (legacy create
+/// path) or the library had no @export functions.
+#[no_mangle]
+pub extern "C" fn nsl_model_export_count(model_ptr: i64) -> i64 {
+    if model_ptr == 0 {
+        return 0;
+    }
+    let model = unsafe { &*(model_ptr as *const NslModel) };
+    match &model.exports {
+        Some(r) => r.len() as i64,
+        None => 0,
+    }
 }
 
 /// Destroy a model instance and free its resources (including weight tensors).
@@ -992,6 +1053,7 @@ mod tests {
             weights_path: String::new(),
             grad_enabled: false,
             last_forward_outputs: vec![],
+            exports: None,
         });
         let model_ptr = Box::into_raw(model) as i64;
 
@@ -1019,6 +1081,7 @@ mod tests {
             weights_path: String::new(),
             grad_enabled: true,
             last_forward_outputs: vec![],
+            exports: None,
         });
         let model_ptr = Box::into_raw(model) as i64;
 
@@ -1104,6 +1167,7 @@ mod tests {
             weights_path: String::new(),
             grad_enabled: false,
             last_forward_outputs: vec![],
+            exports: None,
         });
         let model_ptr = Box::into_raw(model) as i64;
 
@@ -1134,6 +1198,7 @@ mod tests {
             weights_path: String::new(),
             grad_enabled: false,
             last_forward_outputs: vec![],
+            exports: None,
         });
         let model_ptr = &mut *model as *mut NslModel as i64;
 
@@ -1156,6 +1221,7 @@ mod tests {
             weights_path: String::new(),
             grad_enabled: false,
             last_forward_outputs: vec![],
+            exports: None,
         });
         let model_ptr = &mut *model as *mut NslModel as i64;
 
