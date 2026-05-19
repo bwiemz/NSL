@@ -5,7 +5,6 @@ from __future__ import annotations
 import ctypes
 import os
 import platform
-import sys
 from pathlib import Path
 from typing import Optional, Sequence
 
