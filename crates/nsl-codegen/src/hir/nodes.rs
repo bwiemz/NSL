@@ -1,0 +1,1 @@
+//! HIR nodes submodule. See src/hir/mod.rs.

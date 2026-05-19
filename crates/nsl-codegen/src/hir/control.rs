@@ -1,0 +1,1 @@
+//! HIR control submodule. See src/hir/mod.rs.

@@ -1,0 +1,1 @@
+//! HIR ids submodule. See src/hir/mod.rs.

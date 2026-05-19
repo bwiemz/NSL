@@ -152,6 +152,7 @@ pub mod wggo_prune;
 pub use wggo_overrides::{
     OverrideDiagnostic, OverrideRejectReason, PerLayerOverride, WggoOverrides,
 };
+pub mod hir;
 pub mod wrga;
 pub mod matmul_mma;
 pub mod wrga_adapter_init;

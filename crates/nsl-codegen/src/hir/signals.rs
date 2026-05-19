@@ -1,0 +1,1 @@
+//! HIR signals submodule. See src/hir/mod.rs.
