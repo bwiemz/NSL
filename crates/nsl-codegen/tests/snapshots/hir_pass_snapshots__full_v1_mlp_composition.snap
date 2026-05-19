@@ -14,7 +14,7 @@ nodes: 6
   }
 }
 [1] GenerateFor lo=0 hi=128 body={
-  [0] Add width=32 a="Port(__bias_pre)" b="Port(__bias_b)"
+  [0] Add width=32 a="Port(__eltadd_a)" b="Port(__eltadd_b)"
 }
 [2] GenerateFor lo=0 hi=128 body={
   [0] Max0 width=32 a="Port(__relu_in)"
@@ -26,7 +26,7 @@ nodes: 6
   }
 }
 [4] GenerateFor lo=0 hi=10 body={
-  [0] Add width=64 a="Port(__bias_pre)" b="Port(__bias_b)"
+  [0] Add width=64 a="Port(__eltadd_a)" b="Port(__eltadd_b)"
 }
 [5] GenerateFor lo=0 hi=10 body={
   [0] Max0 width=64 a="Port(__relu_in)"

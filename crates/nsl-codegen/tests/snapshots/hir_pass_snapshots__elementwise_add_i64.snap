@@ -7,5 +7,5 @@ test_taps: true
 ports: 0
 nodes: 1
 [0] GenerateFor lo=0 hi=10 body={
-  [0] Add width=64 a="Port(__bias_pre)" b="Port(__bias_b)"
+  [0] Add width=64 a="Port(__eltadd_a)" b="Port(__eltadd_b)"
 }

@@ -66,7 +66,10 @@ impl KirToHirPass {
             _ => unreachable!("lower_matmul called with non-Matmul op"),
         };
 
-        let n_inputs = a_shape[1];
+        // Standard matmul C[r,c] = sum_k A[r,k] * B[k,c]:
+        //   k_dim     = a_shape[1] == b_shape[0]  (the reduction axis — inner MAC loop)
+        //   n_outputs = b_shape[1]                (output neuron count — outer loop)
+        let k_dim = a_shape[1];
         let n_outputs = b_shape[1];
         assert_eq!(a_shape[1], b_shape[0], "Matmul inner dimensions must match");
 
@@ -78,7 +81,7 @@ impl KirToHirPass {
         // Outer GenerateFor: iterate output dimension
         let mut outer_body: Vec<HirNode> = Vec::new();
 
-        // Inner GenerateFor: MAC chain over input dimension
+        // Inner GenerateFor: MAC chain over reduction dimension
         let mut inner_body: Vec<HirNode> = Vec::new();
 
         // Mul: x[i] * W[i,o] → prod_i  (width: a_width × b_width → prod_width)
@@ -113,7 +116,7 @@ impl KirToHirPass {
 
         outer_body.push(HirNode::GenerateFor(GenerateFor::new(
             0,
-            n_inputs as i64,
+            k_dim as i64,
             inner_body,
         )));
 
@@ -138,16 +141,19 @@ impl KirToHirPass {
 
         let (dtype, shape) = match op {
             KirOp::ElementwiseAdd { dtype, shape, .. } => (dtype.clone(), *shape),
-            _ => unreachable!(),
+            _ => unreachable!("lower_elementwise_add called with non-ElementwiseAdd op"),
         };
 
         let width = kir_dtype_width(dtype);
         let n = shape[0];
 
         // GenerateFor over output dimension; body is one Add node.
+        // Port names follow the __<op>_<operand> convention (consistent with
+        // __matmul_a/__matmul_b). PR 3's HIR→Verilog lowering will resolve
+        // these placeholder Ports to actual module ports / wire indices.
         let body = vec![HirNode::Add(Add::new(
-            SignalRef::port("__bias_pre"),
-            SignalRef::port("__bias_b"),
+            SignalRef::port("__eltadd_a"),
+            SignalRef::port("__eltadd_b"),
             width,
         ))];
 
@@ -168,7 +174,7 @@ impl KirToHirPass {
 
         let (dtype, shape) = match op {
             KirOp::Relu { dtype, shape, .. } => (dtype.clone(), *shape),
-            _ => unreachable!(),
+            _ => unreachable!("lower_relu called with non-Relu op"),
         };
 
         let width = kir_dtype_width(dtype);
