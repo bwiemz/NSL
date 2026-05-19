@@ -1,0 +1,15 @@
+# HuggingFace-style multi-export model with `forward` and `generate`
+# entry points dispatched by name.
+#
+# This is a documentation example — the model body is trivial. A real HF
+# model would have learnable parameters loaded from safetensors; here we
+# illustrate the export-by-name pattern that maps cleanly onto HF's
+# `model.generate(...)` / `model(input_ids)` API surface.
+
+@export
+fn forward(x: Tensor<[4], f32>) -> Tensor<[4], f32>:
+    return x
+
+@export
+fn generate(prompt: Tensor<[4], f32>) -> Tensor<[4], f32>:
+    return prompt + prompt
