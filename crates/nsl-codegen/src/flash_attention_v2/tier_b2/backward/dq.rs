@@ -33,8 +33,7 @@ pub fn synthesize_dq_kernel(
     emit_q_dO_producer_load(&mut ptx);
     emit_dq_acc_init(&mut ptx, config);
     emit_inner_loop_open(&mut ptx);
-    // Inner-loop body placeholder — filled in Tasks 9-11.
-    ptx.push_str("    // TODO Tasks 9-11: tile-skip predicate + S + P + dP + dS + dQ-update\n");
+    emit_inner_loop_body(&mut ptx, config);
     emit_inner_loop_close(&mut ptx);
     emit_outer_loop_close(&mut ptx);
     emit_dq_finalize(&mut ptx);
@@ -73,6 +72,8 @@ fn emit_register_decls(ptx: &mut String, config: &FlashAttentionConfig) {
     ptx.push_str("    .reg .pred %p_tile_active, %p_producer, %p_consumer;\n");
     ptx.push_str("    .reg .u32 %addr_lo, %tile_skip_predicate;\n");
     ptx.push_str("    .reg .u64 %addr;\n");
+    // Scratch registers used by matmul_mma helpers (emit_load_a/b_fragment_smem).
+    ptx.push_str("    .reg .u32 %mma_addr, %mma_a_row, %mma_b_row;\n");
     // SMEM extern: per SPEC AMENDMENT, size from tier_b2_dq_total_smem_bytes (incl. K-colmajor).
     let total_smem = tier_b2_dq_total_smem_bytes(config);
     ptx.push_str(&format!("    .extern .shared .align 16 .b8 shmem[{}];\n", total_smem));
@@ -136,6 +137,88 @@ fn emit_inner_loop_open(ptx: &mut String) {
     ptx.push_str("    cp.async.wait_group 0;\n");
     ptx.push_str("    bar.sync 0;\n");
     ptx.push('\n');
+}
+
+fn emit_inner_loop_body(ptx: &mut String, config: &FlashAttentionConfig) {
+    use crate::matmul_mma::{
+        emit_load_a_fragment_smem, emit_load_b_fragment_smem, emit_mma_instruction,
+    };
+    use crate::flash_attention_v2::smem_layout::{
+        tier_b2_dq_q_offset, tier_b2_dq_k_offset,
+    };
+
+    let hd = config.head_dim as u32;
+    // f16 row stride = head_dim * 2 bytes (tightly-packed row-major f16).
+    let row_stride_bytes = (hd * 2) as usize;
+
+    // === Tile-skip predicate (spec §9.2) ===
+    ptx.push_str("    // Tile-skip predicate: gate dP+dS+dQ-update as a single block.\n");
+    ptx.push_str("    setp.eq.u32 %p_tile_active, %tile_skip_predicate, 1;\n");
+    ptx.push_str("    @!%p_tile_active bra DS_SKIP_LABEL;\n");
+    ptx.push('\n');
+
+    // === S = Q @ K^T (m16n8k16, B-frag col-major-presenting-as-K^T) ===
+    // Row-major K[bkv, hd] byte-aliases to col-major K^T[hd, bkv] with
+    // col_stride_bytes = hd * 2.  The existing 4-arg helper reads it correctly
+    // and produces Q @ K^T in the MMA output.
+    ptx.push_str("    // === S = Q @ K^T (m16n8k16, B-frag col-major byte-alias) ===\n");
+
+    let q_smem_base = format!("{}", tier_b2_dq_q_offset(config));
+    let k_smem_base = format!("{}", tier_b2_dq_k_offset(config));
+
+    let a_regs: [String; 4] = ["s_a0", "s_a1", "s_a2", "s_a3"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect::<Vec<_>>()
+        .try_into()
+        .unwrap();
+    let b_regs: [String; 2] = ["s_b0", "s_b1"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect::<Vec<_>>()
+        .try_into()
+        .unwrap();
+    let c_regs: [String; 4] = ["s_c0", "s_c1", "s_c2", "s_c3"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect::<Vec<_>>()
+        .try_into()
+        .unwrap();
+    let d_regs: [String; 4] = ["s_d0", "s_d1", "s_d2", "s_d3"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect::<Vec<_>>()
+        .try_into()
+        .unwrap();
+
+    for r in &a_regs {
+        ptx.push_str(&format!("    .reg .b32 %{};\n", r));
+    }
+    for r in &b_regs {
+        ptx.push_str(&format!("    .reg .b32 %{};\n", r));
+    }
+    for r in &c_regs {
+        ptx.push_str(&format!("    .reg .f32 %{};\n", r));
+    }
+    for r in &d_regs {
+        ptx.push_str(&format!("    .reg .f32 %{};\n", r));
+    }
+    for r in &c_regs {
+        ptx.push_str(&format!("    mov.f32 %{}, 0.0;\n", r));
+    }
+
+    // Load Q tile as A-fragment (row-major, row_stride = hd * 2 bytes).
+    emit_load_a_fragment_smem(ptx, &a_regs, &q_smem_base, row_stride_bytes);
+    // Load K tile as B-fragment — row-major K[bkv, hd] with col_stride = hd * 2
+    // byte-aliases to col-major K^T[hd, bkv], producing Q @ K^T in the MMA.
+    emit_load_b_fragment_smem(ptx, &b_regs, &k_smem_base, row_stride_bytes);
+    emit_mma_instruction(ptx, &d_regs, &a_regs, &b_regs, &c_regs);
+
+    // Placeholder for Tasks 10-11.
+    ptx.push_str("    // TODO Tasks 10-11: P recompute + dP + dS + dQ-update\n");
+    ptx.push('\n');
+
+    ptx.push_str("DS_SKIP_LABEL:\n");
 }
 
 fn emit_inner_loop_close(ptx: &mut String) {
@@ -244,5 +327,29 @@ mod tests {
         // Loose check: must reference accumulators (e.g., %dq_acc_*)
         assert!(ptx.contains("dq_acc"),
             "expected dQ accumulator register decls");
+    }
+
+    #[test]
+    fn synthesize_dq_kernel_emits_tile_skip_predicate() {
+        let ptx = synthesize_dq_kernel(&canonical_cfg()).unwrap();
+        // Per Phase 1 spec §9.2: setp + @!predicate branch to DS_SKIP_LABEL
+        assert!(ptx.contains("setp.eq.u32 %p_tile_active"),
+            "expected tile-skip predicate set");
+        assert!(ptx.contains("@!%p_tile_active"),
+            "expected predicate-gated branch");
+        assert!(ptx.contains("DS_SKIP_LABEL"),
+            "expected DS_SKIP_LABEL target");
+    }
+
+    #[test]
+    fn synthesize_dq_kernel_emits_s_qkt_mma() {
+        let ptx = synthesize_dq_kernel(&canonical_cfg()).unwrap();
+        // S = Q @ K^T via m16n8k16 row.col MMA
+        assert!(ptx.contains("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32"),
+            "expected m16n8k16 MMA");
+        // K loaded as B-frag with the standard 4-arg helper (col-major SMEM read).
+        // The helper emits "Load B-fragment (k16xn8 col-major" comment per matmul_mma.rs post-revert.
+        assert!(ptx.contains("Load B-fragment (k16xn8 col-major"),
+            "expected non-transposed B-frag load comment");
     }
 }
