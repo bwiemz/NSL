@@ -224,6 +224,27 @@ pub fn test_drain_tape_and_params() -> (Vec<TapeOp>, Vec<i64>) {
     })
 }
 
+/// Test hook: directly set the thread-local `TAPE.recording` flag.
+/// Spec B T5 uses this to assert the re-entry guard fires without
+/// actually starting a forward.
+///
+/// Pairs with `is_recording()` for read-back. Does NOT touch
+/// `pause_depth` or `ops` — call `test_drain_tape_and_params` first
+/// (or after) if a fully-clean state is required.
+#[cfg(feature = "test-hooks")]
+#[no_mangle]
+pub extern "C" fn test_set_recording(on: bool) {
+    TAPE.with(|t| t.borrow_mut().recording = on);
+}
+
+/// Test hook: read the thread-local `TAPE.pause_depth` value
+/// directly. Spec B T5's RAII guard cleanup test uses this to
+/// verify the guard's Drop body reset pause_depth to 0.
+#[cfg(feature = "test-hooks")]
+pub fn test_tape_pause_depth() -> i32 {
+    TAPE.with(|t| t.borrow().pause_depth)
+}
+
 pub fn is_recording() -> bool {
     TAPE.with(|t| { let tape = t.borrow(); tape.recording && tape.pause_depth == 0 })
 }
