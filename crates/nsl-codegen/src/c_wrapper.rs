@@ -3,8 +3,6 @@
 //! See docs/superpowers/specs/2026-04-15-m62-c-wrappers-design.md.
 
 use crate::c_header::{ExportDtype, ExportInfo, ExportTypeInfo};
-#[cfg(test)]
-use crate::c_header::ExportParamInfo;
 use crate::error::CodegenError;
 use cranelift_codegen::ir::{types, AbiParam, Signature};
 use cranelift_codegen::isa::CallConv;
