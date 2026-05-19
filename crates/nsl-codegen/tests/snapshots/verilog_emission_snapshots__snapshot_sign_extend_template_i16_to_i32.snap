@@ -1,0 +1,5 @@
+---
+source: crates/nsl-codegen/tests/verilog_emission_snapshots.rs
+expression: emit_sign_extend(&s)
+---
+assign _w4 = {{16{_w3[15]}}, _w3};
