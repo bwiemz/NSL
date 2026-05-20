@@ -122,6 +122,18 @@ impl HirModule {
     pub fn local_params(&self) -> &[LocalParam] {
         &self.local_params
     }
+
+    /// Mutable access to declared LocalParams for CLI-time value baking.
+    ///
+    /// Task 4.1 (`nsl fpga-compile`) walks the FixtureFile's blocks and writes
+    /// the parsed weight/bias values into the matching `W<i>_<k>_<o>` and
+    /// `b<i>_<o>` LocalParams by name. This is the only sanctioned mutator —
+    /// `add_local_param` is the construction-time entry point and is preserved
+    /// for the KirToHirPass; this accessor is for post-construction value
+    /// substitution only. Callers must not push/remove entries through it.
+    pub fn local_params_mut(&mut self) -> &mut Vec<LocalParam> {
+        &mut self.local_params
+    }
 }
 
 #[cfg(test)]

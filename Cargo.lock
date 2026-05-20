@@ -1264,11 +1264,13 @@ dependencies = [
  "nsl-parser",
  "nsl-runtime",
  "nsl-semantic",
+ "nsl-test",
  "predicates",
  "safetensors",
  "serde_json",
  "tempfile",
  "tokenizers",
+ "toml",
 ]
 
 [[package]]
