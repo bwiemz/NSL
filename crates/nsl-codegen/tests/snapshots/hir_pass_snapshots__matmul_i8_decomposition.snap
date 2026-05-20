@@ -1,0 +1,15 @@
+---
+source: crates/nsl-codegen/tests/hir_pass_snapshots.rs
+expression: structural_summary(&module)
+---
+module: matmul_i8_test
+test_taps: true
+ports: 0
+nodes: 1
+[0] GenerateFor lo=0 hi=128 body={
+  [0] GenerateFor lo=0 hi=784 body={
+    [0] Mul a_width=8 b_width=8 out_width=16 a="Port(__matmul_a)" b="Port(__matmul_b)"
+    [1] SignExtend src_width=16 dst_width=32
+    [2] Add width=32 a="Port(__matmul_acc_prev)" b="Wire(<id>)"
+  }
+}

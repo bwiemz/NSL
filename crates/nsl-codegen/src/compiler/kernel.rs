@@ -167,6 +167,19 @@ impl Compiler<'_> {
                 // Original path: direct AST -> PTX
                 crate::kernel::KernelCompiler::compile(kernel, self.interner)
             }
+            GpuTarget::Fpga => {
+                // M57.1 prerequisite: AST → structured KIR (Matmul/
+                // ElementwiseAdd/Relu) → KirToHirPass → VerilogEmitter +
+                // HIR port/wire generation. Currently unreachable because
+                // parse_target doesn't yet return GpuTarget::Fpga.
+                // See docs/superpowers/specs/2026-05-18-m57-fpga-verilog-design.md §1.5.
+                return Err(crate::error::CodegenError::new(
+                    "M57.1 prerequisite: AST → structured KIR dispatch + HIR \
+                     port/wire generation. Use `nsl fpga-compile` for the \
+                     intended workflow (currently also deferred — see CLI \
+                     error message)."
+                ));
+            }
             GpuTarget::Rocm | GpuTarget::Metal | GpuTarget::WebGpu => {
                 // M47b: AST -> KIR -> backend-specific lowerer
                 let kir = crate::kernel_lower::lower_kernel_to_ir(kernel, self.interner, target);
@@ -204,7 +217,7 @@ impl Compiler<'_> {
                         );
                         crate::backend_wgsl::lower_kir_to_wgsl(&kir)
                     }
-                    GpuTarget::Cuda => unreachable!(),
+                    GpuTarget::Cuda | GpuTarget::Fpga => unreachable!(),
                 };
 
                 // Null-terminate for consistency with PTX path

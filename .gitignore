@@ -43,6 +43,9 @@ models/coder50m/data/tokenizer/
 # Log files (per-run, never versioned)
 *.log
 
+# Insta snapshot pending-review files (accepted snapshots land as .snap)
+*.snap.new
+
 # Python bytecode
 __pycache__/
 

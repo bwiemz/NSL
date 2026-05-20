@@ -1,0 +1,5 @@
+---
+source: crates/nsl-codegen/tests/verilog_emission_snapshots.rs
+expression: emit_mul(&m)
+---
+assign _w1 = $signed(x) * $signed(w);

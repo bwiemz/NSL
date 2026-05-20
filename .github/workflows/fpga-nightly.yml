@@ -1,0 +1,67 @@
+name: fpga-nightly
+
+on:
+  schedule:
+    - cron: '0 6 * * *'  # daily at 06:00 UTC
+  workflow_dispatch:
+
+jobs:
+  fpga-full-diagnostic:
+    name: FPGA nightly — Layer 2 full-diagnostic + Layer 3 ABC
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+
+      - name: Install Verilator + Yosys
+        run: sudo apt-get update && sudo apt-get install -y verilator yosys
+
+      - name: Record tool versions (provenance)
+        run: |
+          echo "Ubuntu: $(lsb_release -ds)"
+          verilator --version
+          yosys -V
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/
+          key: ${{ runner.os }}-cargo-fpga-nightly-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build workspace (release)
+        run: cargo build --workspace --release
+
+      - name: Fixture determinism check
+        run: |
+          cp crates/nsl-test/fixtures/mlp_int8_weights_v1.bin /tmp/committed.bin
+          cargo run -p nsl-test --bin generate_mlp_int8_weights_v1
+          cmp --silent /tmp/committed.bin crates/nsl-test/fixtures/mlp_int8_weights_v1.bin \
+            || (echo "ERROR: regenerated fixture differs from committed fixture" && exit 1)
+
+      # Layer 2 full-diagnostic: runs all 100 stimuli and reports up to 10
+      # failures.  This is the recommended pre-PR developer step per spec §7.2.
+      # The test is #[ignore]'d in the regular CI run (M57.1 prerequisite);
+      # the nightly job exercises it via --include-ignored.
+      - name: Layer 2 full-diagnostic (all 100 stimuli, --ignored)
+        run: |
+          cargo test -p nsl-test --test fpga_mlp_v1_parity -- \
+            --include-ignored fpga_mlp_v1_parity_full_diagnostic
+        # continue-on-error so Layer 3 still runs even if Layer 2 fails
+        continue-on-error: true
+
+      # Layer 3 with ABC: per spec §5.2, the nightly ABC-enabled gate
+      # complements the per-commit -noabc gate to catch synthesis regressions
+      # that only appear with technology mapping.
+      - name: Layer 3 with ABC (broader synthesizability gate, --ignored)
+        run: |
+          cargo test -p nsl-test --test fpga_mlp_v1_synth -- \
+            --include-ignored fpga_mlp_v1_yosys_clean

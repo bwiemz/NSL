@@ -484,6 +484,10 @@ fn emit_op(ptx: &mut String, op: &KirOp, ir: &KernelIR) {
         KirOp::SharedMemFence => {
             writeln!(ptx, "    membar.cta;").unwrap();
         }
+        KirOp::Matmul { .. } | KirOp::ElementwiseAdd { .. } | KirOp::Relu { .. } => {
+            unreachable!("M57 v1 structured KIR ops are only emitted for Target::Fpga; \
+                          this codegen path is GPU/CPU PTX")
+        }
     }
 }
 
@@ -570,6 +574,9 @@ fn extract_var_ids(op: &KirOp) -> Vec<VarId> {
         KirOp::WarpShuffle(d, v, o) => vec![*d, *v, *o],
         KirOp::Cmp(d, a, b, _) | KirOp::PtrOffset(d, a, b) => vec![*d, *a, *b],
         KirOp::Const(d, _) => vec![*d],
+        KirOp::Matmul { a, b, out, .. } => vec![*a, *b, *out],
+        KirOp::ElementwiseAdd { a, b, out, .. } => vec![*a, *b, *out],
+        KirOp::Relu { a, out, .. } => vec![*a, *out],
     }
 }
 

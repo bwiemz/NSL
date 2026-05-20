@@ -1,0 +1,55 @@
+# v1_mlp.nsl — v1 MLP NSL source for M57 FPGA target.
+#
+# Architecture: 784 → 128 → 10, two-layer INT8 MLP forward pass.
+#
+# TODO(M57.1): This file cannot be compiled end-to-end with `--target fpga`
+# yet. The missing prerequisites are:
+#
+#   1. AST → structured-KIR dispatch: the NSL frontend does not currently
+#      lower `@` (matmul) or function calls to KirOp::Matmul / KirOp::Relu
+#      when target = fpga. This requires a new KIR-lowering path gated on
+#      Target::Fpga in the compiler pipeline.
+#
+#   2. NSL type system has no INT8 tensor dtype in the user-facing grammar
+#      (the internal KirType::I8 exists, but `Tensor<[784], i8>` is not
+#      valid NSL syntax). The v1 MLP's INT8 weight/activation contract must
+#      be expressed either via a new `i8` dtype keyword or via a `@quant`
+#      decorator — design TBD for M57.1.
+#
+#   3. HIR port/wire declarations are not emitted by the KIR→HIR pass for
+#      signals derived from AST nodes. GenerateFor loops currently leave
+#      SignalRef::Port("__matmul_a") as a placeholder with no corresponding
+#      Port::Input declaration.
+#
+#   4. `--target fpga` CLI dispatch returns a "not yet implemented" error
+#      (see crates/nsl-cli/src/main.rs Cli::FpgaCompile arm).
+#
+# PRs 1-4 shipped: HIR skeleton, KIR→HIR pass, HIR→Verilog emission,
+# Yosys CI gate, fixture subsystem, CPU reference, Verilator harness
+# infrastructure. M57.1 (v1 closure) resolves prerequisites 1-4.
+#
+# The NSL syntax below is the closest approximation to the v1 MLP shape
+# expressible in the current grammar. It uses f32 tensors as a placeholder
+# for the INT8 dtypes that M57.1 will introduce.
+
+# Imported weights (loaded from mlp_int8_weights_v1.bin via --fixture).
+# In M57.1 these will be typed as i8/i32/i64 per spec §1.2.
+
+fn forward(
+    x:  Tensor<[784], f32>,
+    w1: Tensor<[784, 128], f32>,
+    b1: Tensor<[128], f32>,
+    w2: Tensor<[128, 10], f32>,
+    b2: Tensor<[10], f32>,
+) -> Tensor<[10], f32>:
+    # Layer 1: matmul + bias + ReLU
+    let l1 = x @ w1
+    let l1b = l1 + b1
+    let h = relu(l1b)
+
+    # Layer 2: matmul + bias + ReLU
+    let l2 = h @ w2
+    let l2b = l2 + b2
+    let out = relu(l2b)
+
+    return out
