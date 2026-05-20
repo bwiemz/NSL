@@ -4,15 +4,11 @@ expression: structural_summary(&module)
 ---
 module: tiny_mlp
 test_taps: true
-ports: 10
+ports: 6
   Port::Input x_l1 width=6272
-  Port::Input eltadd_a_l1 width=4096
-  Port::Input eltadd_b_l1 width=4096
   Port::Input relu_in_l1 width=4096
   Port::Output relu_out_l1 width=4096
   Port::Input x_l2 width=4096
-  Port::Input eltadd_a_l2 width=640
-  Port::Input eltadd_b_l2 width=640
   Port::Input relu_in_l2 width=640
   Port::Output relu_out_l2 width=640
 local_params: 101770
@@ -28,29 +24,25 @@ local_params: 101770
   LocalParam b2_0 width=64
   …(prefix="b2", 8 elided)…
   LocalParam b2_9 width=64
-nodes: 6
+nodes: 4
 [0] GenerateFor lo=0 hi=128 body={
-  [0] GenerateFor lo=0 hi=784 body={
+  [0] Wire width=32
+  [1] GenerateFor lo=0 hi=784 body={
     [0] Mul a_width=8 b_width=8 out_width=16 a="Port(x_l1)" b="LocalParam(W1)"
     [1] SignExtend src_width=16 dst_width=32
-    [2] Add width=32 a="Port(__matmul_acc_prev_LEGACY)" b="Wire(<id>)"
+    [2] Add width=32 a="Port(acc_l1_prev)" b="Wire(<id>)"
   }
 }
 [1] GenerateFor lo=0 hi=128 body={
-  [0] Add width=32 a="Port(eltadd_a_l1)" b="Port(eltadd_b_l1)"
-}
-[2] GenerateFor lo=0 hi=128 body={
   [0] Max0 width=32 a="Port(relu_in_l1)"
 }
-[3] GenerateFor lo=0 hi=10 body={
-  [0] GenerateFor lo=0 hi=128 body={
+[2] GenerateFor lo=0 hi=10 body={
+  [0] Wire width=64
+  [1] GenerateFor lo=0 hi=128 body={
     [0] Mul a_width=32 b_width=32 out_width=64 a="Port(x_l2)" b="LocalParam(W2)"
-    [1] Add width=64 a="Port(__matmul_acc_prev_LEGACY)" b="Wire(<id>)"
+    [1] Add width=64 a="Port(acc_l2_prev)" b="Wire(<id>)"
   }
 }
-[4] GenerateFor lo=0 hi=10 body={
-  [0] Add width=64 a="Port(eltadd_a_l2)" b="Port(eltadd_b_l2)"
-}
-[5] GenerateFor lo=0 hi=10 body={
+[3] GenerateFor lo=0 hi=10 body={
   [0] Max0 width=64 a="Port(relu_in_l2)"
 }

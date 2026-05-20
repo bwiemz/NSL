@@ -49,8 +49,8 @@ fn structural_summary(module: &HirModule) -> String {
     // collapse each group to first + last element so v1 matmul snapshots with
     // ~100k weight elements remain human-auditable. Group cardinality (the
     // primary correctness signal) is still asserted exactly.
-    out.push_str(&format!("local_params: {}\n", module.local_params.len()));
-    summarize_local_params(&mut out, &module.local_params);
+    out.push_str(&format!("local_params: {}\n", module.local_params().len()));
+    summarize_local_params(&mut out, module.local_params());
     out.push_str(&format!("nodes: {}\n", module.nodes().len()));
     for (i, node) in module.nodes().iter().enumerate() {
         summarize_node(&mut out, node, i, 0);
@@ -301,8 +301,11 @@ fn full_v1_mlp_composition() {
     let module = pass.lower(&kir, "tiny_mlp").unwrap();
     assert_snapshot!(structural_summary(&module));
 
-    // Sanity: module has 6 GenerateFor bodies (one per op)
-    assert_eq!(module.nodes().len(), 6);
+    // Sanity: module has 4 GenerateFor bodies — M57.1 §3.5 folds the
+    // adjacent ElementwiseAdd(bias) into the matmul's accumulator seed,
+    // so the post-MAC eltadd nodes are no longer emitted. Per-layer
+    // ordering: matmul-l1, relu-l1, matmul-l2, relu-l2.
+    assert_eq!(module.nodes().len(), 4);
     assert_eq!(module.name, "tiny_mlp");
     assert!(module.test_taps);
 }

@@ -75,39 +75,46 @@ impl KirToHirPass {
     /// M57.1 §3.5: wrapper that consumes an optional adjacent ElementwiseAdd(bias)
     /// for the ripple-chain bias-as-seed fold.
     ///
-    /// Task 3.1: behavior-preserving delegation. When `bias_op` is `Some`, the
-    /// caller has consumed the next KIR op (i += 2); to keep M57's HIR output
-    /// byte-identical we still emit a standalone ElementwiseAdd GenerateFor
-    /// here. Task 3.4 replaces that with a bias-as-seed fold (seeds the MAC
-    /// accumulator from `bias[o]` instead of zero, dropping the separate Add
-    /// block). When `bias_op` is `None`, the accumulator seeds from zero
-    /// (current M57 behavior).
+    /// Folds the bias into the MAC accumulator's initial value, replacing the
+    /// post-MAC ElementwiseAdd. Per the §3.5 ripple chain:
+    ///
+    /// ```text
+    ///   acc[o][0] = b<i>[o]                                   (bias-as-seed; Q3 Pin 3)
+    ///   for k ∈ [0, k_dim):
+    ///       prod[k] = sext( x[k] * W[k,o] )
+    ///       acc[o][k+1] = acc[o][k] + prod[k]
+    ///   result[o] = acc[o][k_dim]
+    /// ```
+    ///
+    /// When `bias_op` is `None` (defensive path), the accumulator seeds from
+    /// zero. v1 MLP always has bias; the no-bias path exists for completeness
+    /// (e.g. a stand-alone `Matmul` op that didn't have an adjacent bias-add).
+    ///
+    /// HIR structural encoding (approach (a) from plan §3.4 Step 1):
+    /// - Outer GenerateFor over n_outputs declares one `bias_seed_wire`
+    ///   (acc_width). The wire's driver is conceptually the bias LocalParam
+    ///   `b<i>_<o>` (or 0 when no bias); the Verilog emitter realizes the
+    ///   cross-iteration wire-array threading in PR 3.
+    /// - Inner GenerateFor over k_dim emits the per-iteration MAC body
+    ///   (Mul + optional SignExtend + Add), exactly as in M57. The Add's
+    ///   first operand is a layer-scoped accumulator placeholder
+    ///   (`acc_l<i>_prev`); the Verilog emitter resolves the
+    ///   cross-iteration wiring to acc[o][k].
+    ///
+    /// The separate ElementwiseAdd that previously implemented the bias is
+    /// NOT emitted when `bias_op` is `Some` — the fold subsumes it.
     fn lower_matmul_with_optional_bias(
         &self,
         matmul_op: &KirOp,
         bias_op: Option<&KirOp>,
         module: &mut HirModule,
     ) -> Result<(), FpgaLoweringError> {
-        self.lower_matmul(matmul_op, module)?;
-        // Task 3.4 will fold this into the Matmul's accumulator seed; for now
-        // we re-emit the standalone Add so HIR snapshots stay byte-identical.
-        if let Some(bias) = bias_op {
-            self.lower_elementwise_add(bias, module)?;
-        }
-        Ok(())
-    }
-
-    fn lower_matmul(
-        &self,
-        op: &KirOp,
-        module: &mut HirModule,
-    ) -> Result<(), FpgaLoweringError> {
         use crate::hir::control::GenerateFor;
         use crate::hir::module::HirNode;
-        use crate::hir::nodes::{Add, LocalParam, Mul, Port, SignExtend};
+        use crate::hir::nodes::{Add, LocalParam, Mul, Port, SignExtend, Wire};
         use crate::hir::signals::SignalRef;
 
-        let (a_dtype, b_dtype, out_dtype, a_shape, b_shape) = match op {
+        let (a_dtype, b_dtype, out_dtype, a_shape, b_shape) = match matmul_op {
             KirOp::Matmul {
                 a_dtype,
                 b_dtype,
@@ -116,7 +123,7 @@ impl KirToHirPass {
                 b_shape,
                 ..
             } => (a_dtype.clone(), b_dtype.clone(), out_dtype.clone(), *a_shape, *b_shape),
-            _ => unreachable!("lower_matmul called with non-Matmul op"),
+            _ => unreachable!("lower_matmul_with_optional_bias called with non-Matmul op"),
         };
 
         // Standard matmul C[r,c] = sum_k A[r,k] * B[k,c]:
@@ -130,6 +137,7 @@ impl KirToHirPass {
         let b_width = kir_dtype_width(b_dtype);
         let acc_width = kir_dtype_width(out_dtype);
         let prod_width = a_width + b_width;
+        let has_bias = bias_op.is_some();
 
         // ── M57.1 §3.4: Declare ports + LocalParams inline ──────────────────
         // Per the no-dangling-references invariant, every SignalRef::Port and
@@ -138,13 +146,6 @@ impl KirToHirPass {
         // x is the only true Port::Input (the stimulus passed by the testbench);
         // W and b are LocalParams (values baked at CLI time by Task 4.1's
         // bake_fixture_into_localparams).
-        //
-        // Layer-disambiguating suffix: scan existing LocalParams for unique
-        // `W<n>_` prefixes — robust to layers having different (k_dim, n_outputs)
-        // pairs (e.g. MLP 784→128→10). Picking by max-existing-index keeps the
-        // counter monotonic regardless of how many elements each prior layer
-        // contributed. Alternative would be &mut state on the pass; the
-        // count-derived index is implementation-light for v1.
         let layer_idx = next_layer_index(module);
         let x_port_name = format!("x_l{}", layer_idx);
         let w_lp_prefix = format!("W{}", layer_idx);
@@ -164,20 +165,55 @@ impl KirToHirPass {
                 module.add_local_param(LocalParam::new(elem_name, b_width, 0));
             }
         }
-        // Declare LocalParam for each bias element (n_outputs values).
-        // Width = acc_width — bias is added at accumulator precision in the
-        // bias-as-seed ripple chain (Task 3.4).
-        for o in 0..n_outputs {
-            let elem_name = format!("{}_{}", b_lp_prefix, o);
-            module.add_local_param(LocalParam::new(elem_name, acc_width, 0));
+        // M57.1 §3.5 Pin 3: bias LocalParams are declared only when we are
+        // folding an adjacent ElementwiseAdd(bias). The defensive no-bias path
+        // (zero-seeded accumulator) omits them so the structural HIR audit
+        // (snapshot tests) reflects the dispatch decision.
+        if has_bias {
+            for o in 0..n_outputs {
+                let elem_name = format!("{}_{}", b_lp_prefix, o);
+                module.add_local_param(LocalParam::new(elem_name, acc_width, 0));
+            }
         }
 
-        // ── Build the MAC body ──────────────────────────────────────────────
-        // The inner generate-for body emits one structural Mul + (optional)
-        // SignExtend + Add. The Verilog emitter resolves per-iteration indexing
-        // (`x_l<i>[k]`, `W<i>_<k>_<o>`) when it unrolls the genvars. SignalRef
-        // here uses the bare prefix; the emitter substitutes the indices.
+        // ── M57.1 §3.5: bias-as-seed combinational ripple chain ─────────────
+        //
+        // For each output o ∈ [0, n_outputs):
+        //   acc[o][0] = b<i>[o]                  (bias-as-seed; Q3 Pin 3)
+        //                  or 0 when has_bias=false  (defensive path)
+        //   for k ∈ [0, k_dim):
+        //       prod[k] = sext( x[k] * W[k,o] )
+        //       acc[o][k+1] = acc[o][k] + prod[k]
+        //   result[o] = acc[o][k_dim]
+        //
+        // HIR structural encoding (plan §3.4 approach (a), wire-array
+        // conceptual): the outer GenerateFor body declares a single
+        // `bias_seed_wire` (acc[o][0]); the inner GenerateFor body emits the
+        // per-iteration MAC body. The Verilog emitter (PR 3) resolves the
+        // cross-iteration wiring to a Verilog `wire [W-1:0] acc [K:0];` array.
+        //
+        // Tap-semantics note (§3.5 + §3 Concern #1): the matmul tap holds the
+        // post-bias accumulator now (was pre-bias product sum + separate
+        // bias-add). The historical name `tap_l<i>_matmul_out` is preserved
+        // for the M57.1 closure PR; semantic rename to `tap_l<i>_mac_out` is
+        // a deferred cosmetic cleanup.
         let mut outer_body: Vec<HirNode> = Vec::new();
+
+        // acc[o][0]: bias-seed wire declared once per output. Driver
+        // resolution to `b<i>_<o>` (or '0 for the no-bias path) is the
+        // Verilog emitter's job (wire-array cross-iteration threading is
+        // not representable directly at HIR-level today).
+        //
+        // We keep the SignalRef referencing the bias LocalParam (or a
+        // zero-port placeholder for the defensive path) attached to the
+        // ripple chain via the `acc_l<i>_prev` port name on the inner Add —
+        // see below. The bias_seed_wire HirNode merely declares the
+        // accumulator-array's slot at HIR level so structural audits can
+        // verify it exists.
+        let bias_seed_wire = Wire::new(acc_width);
+        outer_body.push(HirNode::Wire(bias_seed_wire));
+
+        // Inner generate-for body — one iteration of the MAC ripple.
         let mut inner_body: Vec<HirNode> = Vec::new();
 
         // Mul: x_l<i>[k] * W<i>_<k>_<o> → prod  (a_width × b_width → prod_width)
@@ -202,12 +238,18 @@ impl KirToHirPass {
             SignalRef::wire(prod_id)
         };
 
-        // TEMPORARY (one task only): keep the M57-shape accumulator placeholder.
-        // Task 3.4 replaces this with the bias-as-seed ripple chain — the very
-        // first MAC iteration seeds the accumulator from `b<i>_<o>` instead of
-        // referencing an external (and currently undeclared) acc_prev port.
+        // Ripple step: acc[o][k+1] = acc[o][k] + product[k].
+        // The first operand references `acc_l<i>_prev` — a layer-scoped
+        // accumulator placeholder name. The Verilog emitter resolves this to
+        // either the bias-seed wire (k=0) or the previous inner-iteration's
+        // accumulator (k>0), realizing the wire-array semantics.
+        //
+        // Naming changed from M57's universal `__matmul_acc_prev_LEGACY`
+        // (single-driver violation) to per-layer `acc_l<i>_prev` so multiple
+        // matmul layers can coexist without colliding.
+        let acc_prev_name = format!("acc_l{}_prev", layer_idx);
         let add = Add::new(
-            SignalRef::port("__matmul_acc_prev_LEGACY"),
+            SignalRef::port(&acc_prev_name),
             add_input,
             acc_width,
         );
@@ -224,6 +266,12 @@ impl KirToHirPass {
             n_outputs as i64,
             outer_body,
         )))?;
+
+        // Note: bias_op is consumed via the peekable iteration in
+        // KirToHirPass::lower (i += 2 when present). When bias_op is None,
+        // the bias-seed wire is still emitted but the bias LocalParams are
+        // omitted; the Verilog emitter drives acc[o][0] from '0 in that path.
+        let _ = bias_op;
 
         Ok(())
     }
@@ -247,11 +295,11 @@ impl KirToHirPass {
         let n = shape[0];
 
         // M57.1 §3.4: declare Port::Input for both operands inline so the
-        // no-dangling-references invariant holds on standalone ElementwiseAdd
-        // (v1 MLP path absorbs the matmul+bias pair into a fold at Task 3.4;
-        // until then Task 3.1's wrapper still re-emits the bias-add through
-        // this function — so the layer-disambiguation must agree between the
-        // two invocation contexts).
+        // no-dangling-references invariant holds on standalone ElementwiseAdd.
+        // M57.1 §3.5 (Task 3.4) folds matmul+bias pairs into the MAC ripple's
+        // accumulator seed, so this function is reached ONLY for non-bias
+        // standalone Adds in v1 (the recognizer doesn't emit these on the v1
+        // MLP path, but the lowering remains correct if they appear).
         //
         // Width is n * width — single packed bus carrying all n elements. The
         // Verilog emitter (PR 3) resolves per-element indexing via the
@@ -326,7 +374,7 @@ impl KirToHirPass {
 
 /// Derive the next 1-based layer index from already-declared LocalParams.
 ///
-/// Scans `module.local_params` for names matching `W<n>_…` and returns the
+/// Scans `module.local_params()` for names matching `W<n>_…` and returns the
 /// smallest 1-based index greater than the largest `<n>` seen (or 1 when no
 /// matching LocalParams exist).
 ///
@@ -334,6 +382,14 @@ impl KirToHirPass {
 /// (e.g. MLP 784→128→10), unlike the alternative of dividing the W count by
 /// a fixed per-layer element count. It also tolerates non-W LocalParams
 /// (e.g. biases) being interleaved.
+///
+/// Complexity note: per-call cost is O(P) where P is the number of
+/// LocalParams already declared. Called once per matmul layer, total cost
+/// across the pass is O(L · P) ≈ O(P²) for L layers with P proportional to
+/// layer width × depth. For v1 (≤ a few layers; the MLP fixture has 2),
+/// this is practical and avoids carrying mutable counter state on the
+/// pass. A v2 with arbitrary layer count can replace this with a
+/// `&mut layer_counter` threaded through `KirToHirPass`.
 fn next_layer_index(module: &HirModule) -> usize {
     let max_seen = module
         .local_params

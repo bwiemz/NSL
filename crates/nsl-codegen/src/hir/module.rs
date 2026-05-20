@@ -44,7 +44,11 @@ pub struct HirModule {
     /// pub(crate) — readers access via `nodes()`; writers MUST use `add_node`
     /// so the single-driver invariant (spec §3.4 invariant 1) is enforced.
     pub(crate) bodies: Vec<HirNode>,
-    pub local_params: Vec<LocalParam>,
+    /// pub(crate) — readers access via `local_params()`; writers go through
+    /// `add_local_param`. Task 4.1's CLI-time bake_fixture_into_localparams
+    /// will need mutable access — added then via a dedicated accessor.
+    /// (M57.1 Task 3.2 review follow-up.)
+    pub(crate) local_params: Vec<LocalParam>,
     /// BTreeMap (not HashMap) for deterministic iteration order across Rust
     /// versions and platforms — Layer 1 Verilog emission snapshots depend on
     /// reproducible output (spec §3.5 / §3 issue 5).
@@ -110,6 +114,13 @@ impl HirModule {
     /// `add_node` so the single-driver invariant holds.
     pub fn nodes(&self) -> &[HirNode] {
         &self.bodies
+    }
+
+    /// Read-only access to declared LocalParams. Construction must go through
+    /// `add_local_param`. (M57.1 Task 3.2 review follow-up: field tightened
+    /// to `pub(crate)`; this is the public reader.)
+    pub fn local_params(&self) -> &[LocalParam] {
+        &self.local_params
     }
 }
 

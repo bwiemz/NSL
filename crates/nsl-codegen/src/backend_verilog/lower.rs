@@ -31,7 +31,7 @@ impl VerilogEmitter {
         out.push_str("\n);\n\n");
 
         // LocalParam block
-        for lp in &module.local_params {
+        for lp in module.local_params() {
             out.push_str(&format!("    {}\n", emit_local_param(lp)));
         }
         out.push('\n');
