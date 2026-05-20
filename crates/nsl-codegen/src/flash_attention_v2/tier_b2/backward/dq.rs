@@ -28,13 +28,16 @@ pub fn synthesize_dq_kernel(
 
     let mut ptx = String::new();
     emit_prelude(&mut ptx);
+    // .extern .shared is a module-level PTX directive: must precede .visible .entry.
+    // See kernel_skeleton/EXTRACTION_INVENTORY.md and forward/prelude.rs comments.
+    emit_smem_extern_module_scope(&mut ptx, config);
     emit_entry_signature(&mut ptx);
     emit_register_decls(&mut ptx, config);
     emit_grid_id_setup(&mut ptx);
     emit_q_iter_count_setup(&mut ptx, config);
     emit_kv_iter_count_setup(&mut ptx, config);
     emit_outer_loop_open(&mut ptx);
-    emit_q_dO_producer_load(&mut ptx);
+    emit_q_dO_producer_load(&mut ptx, config);
     emit_dq_acc_init(&mut ptx, config);
     emit_inner_loop_open(&mut ptx);
     emit_tile_skip_predicate(&mut ptx, config);
@@ -50,6 +53,20 @@ fn emit_prelude(ptx: &mut String) {
     ptx.push_str(".version 7.0\n");
     ptx.push_str(".target sm_80\n");
     ptx.push_str(".address_size 64\n\n");
+}
+
+/// Emit the module-scope `.extern .shared` declaration.
+///
+/// PTX ISA rule: `.extern .shared` is a MODULE-level directive; it CANNOT appear
+/// inside a function body `{...}`. It must precede the `.visible .entry` block.
+/// See kernel_skeleton/EXTRACTION_INVENTORY.md and forward/prelude.rs for the
+/// canonical pattern used across all other kernels that require dynamic SMEM.
+///
+/// Per SPEC AMENDMENT: size comes from tier_b2_dq_total_smem_bytes which INCLUDES
+/// the col-major K re-stage band (Path A, spec §5.2).
+fn emit_smem_extern_module_scope(ptx: &mut String, config: &FlashAttentionConfig) {
+    let total_smem = tier_b2_dq_total_smem_bytes(config);
+    ptx.push_str(&format!(".extern .shared .align 16 .b8 shmem[{}];\n\n", total_smem));
 }
 
 fn emit_entry_signature(ptx: &mut String) {
@@ -71,8 +88,13 @@ fn emit_entry_signature(ptx: &mut String) {
     ptx.push_str("{\n");
 }
 
-fn emit_register_decls(ptx: &mut String, config: &FlashAttentionConfig) {
-    ptx.push_str("    .reg .u32 %tid, %lane_id, %warp_id;\n");
+fn emit_register_decls(ptx: &mut String, _config: &FlashAttentionConfig) {
+    // NOTE: .extern .shared shmem[N] is emitted at module scope by emit_smem_extern_module_scope
+    // before the .visible .entry. PTX ISA disallows .extern .shared inside a function body.
+    //
+    // NOTE: user register named %r_tid (not %tid) to avoid shadowing the PTX special register
+    // %tid (a vector); ptxas rejects %tid.x when %tid is declared as a user u32.
+    ptx.push_str("    .reg .u32 %r_tid, %lane_id, %warp_id;\n");
     ptx.push_str("    .reg .u32 %q_tile, %kv_tile, %head, %batch_idx;\n");
     ptx.push_str("    .reg .pred %p_tile_active, %p_producer, %p_consumer;\n");
     ptx.push_str("    .reg .u32 %addr_lo, %tile_skip_predicate;\n");
@@ -81,6 +103,9 @@ fn emit_register_decls(ptx: &mut String, config: &FlashAttentionConfig) {
     // seq_len scratch: declared here (not inside emit_q_iter_count_setup) so all
     // .reg directives precede executable instructions per PTX ISA.
     ptx.push_str("    .reg .u32 %seq_len_r;\n");
+    // heads_r: loaded from [heads] param in emit_grid_id_setup; used by cp.async
+    // HBM address helpers (emit_4d_byte_offset's heads_reg argument).
+    ptx.push_str("    .reg .u32 %heads_r;\n");
     // Outer q_iter loop: induction variable, upper bound, loop predicate.
     ptx.push_str("    .reg .u32 %q_iter, %num_q_iters;\n");
     ptx.push_str("    .reg .pred %p_q_iter_more;\n");
@@ -92,20 +117,26 @@ fn emit_register_decls(ptx: &mut String, config: &FlashAttentionConfig) {
     // D1 tile_skip predicate registers (causal: used; non-causal: declared but unused — ptxas tolerates).
     ptx.push_str("    .reg .u32 %q_tile_end, %kv_tile_start;\n");
     ptx.push_str("    .reg .pred %p_causal_active;\n");
-    // SMEM extern: per SPEC AMENDMENT, size from tier_b2_dq_total_smem_bytes (incl. K-colmajor).
-    let total_smem = tier_b2_dq_total_smem_bytes(config);
-    ptx.push_str(&format!("    .extern .shared .align 16 .b8 shmem[{}];\n", total_smem));
+    // C1 cp.async Q-tile registers. All .reg decls must precede executable instructions per PTX ISA.
+    // Prefixed %c1_* to avoid clashes with C2/C3/C4 register namespaces.
+    ptx.push_str("    .reg .u32 %c1_q_tile_start, %c1_lane_byte_off, %c1_smem_base32, %c1_smem_dst;\n");
+    ptx.push_str("    .reg .u64 %c1_q_hbm_off, %c1_q_hbm_base, %c1_lane_hbm_addr, %c1_smem_base64;\n");
     ptx.push('\n');
 }
 
 fn emit_grid_id_setup(ptx: &mut String) {
-    ptx.push_str("    mov.u32 %tid, %tid.x;\n");
-    ptx.push_str("    and.b32 %lane_id, %tid, 31;\n");
-    ptx.push_str("    shr.u32 %warp_id, %tid, 5;\n");
+    // Read thread ID X component from the special %tid vector into %r_tid.
+    // Cannot name the user register %tid — that shadows the PTX special %tid
+    // vector register, causing ptxas to reject %tid.x (error: "video selector").
+    ptx.push_str("    mov.u32 %r_tid, %tid.x;\n");
+    ptx.push_str("    and.b32 %lane_id, %r_tid, 31;\n");
+    ptx.push_str("    shr.u32 %warp_id, %r_tid, 5;\n");
     ptx.push_str("    mov.u32 %q_tile,    %ctaid.x;\n");
     ptx.push_str("    mov.u32 %head,      %ctaid.y;\n");
     ptx.push_str("    mov.u32 %batch_idx, %ctaid.z;\n");
     ptx.push_str("    setp.eq.u32 %p_producer, %warp_id, 0;\n");
+    // Load heads param for use by HBM address helpers (emit_4d_byte_offset).
+    ptx.push_str("    ld.param.u32 %heads_r, [heads];\n");
     ptx.push('\n');
 }
 
@@ -150,16 +181,114 @@ fn emit_outer_loop_open(ptx: &mut String) {
 }
 
 #[allow(non_snake_case)]
-fn emit_q_dO_producer_load(ptx: &mut String) {
+fn emit_q_dO_producer_load(ptx: &mut String, config: &FlashAttentionConfig) {
     ptx.push_str("    // Warp 0 (producer): issue cp.async for Q + dO tiles.\n");
     ptx.push_str("    // Warps 1-3 (consumers): wait on cp.async.wait_group.\n");
-    ptx.push_str("    @!%p_producer bra DQ_PROD_LOAD_DONE;\n");
-    ptx.push_str("    // cp.async Q tile -> shmem[+q_offset]\n");
-    ptx.push_str("    // cp.async dO tile -> shmem[+dO_offset]\n");
+    emit_q_producer_load(ptx, config);
+    // dO half deferred to C2 — keep the existing comment placeholder.
+    ptx.push_str("    // cp.async dO tile -> shmem[+dO_offset]  (C2 will replace)\n");
     ptx.push_str("    cp.async.commit_group;\n");
     ptx.push_str("DQ_PROD_LOAD_DONE:\n");
     ptx.push_str("    cp.async.wait_group 0;\n");
     ptx.push_str("    bar.sync 0;\n");
+}
+
+/// C1: emit the warp-0-gated cp.async load for the Q tile [effective_bq, hd] f16.
+///
+/// Uses A1's `emit_4d_byte_offset` for HBM addressing. Per-lane byte offset is
+/// `lane_id * 4` (each lane owns one 4-byte b32 chunk per cp.async iteration).
+/// Total cp.async instructions = (effective_bq * hd * 2) / (32 * 4) chunks per lane.
+///
+/// Register naming prefix `%c1_` prevents clashes with C2/C3/C4 registers.
+/// The warp-0 gate predicate (`@!%p_producer bra DQ_PROD_LOAD_DONE`) is emitted
+/// by the caller (`emit_q_dO_producer_load`) BEFORE this function so that both
+/// the Q load (C1) and the dO load (C2) share a single predicate branch.
+fn emit_q_producer_load(ptx: &mut String, config: &FlashAttentionConfig) {
+    use crate::flash_attention_v2::smem_layout::tier_b2_effective_bq;
+
+    let bq = tier_b2_effective_bq(config);
+    let hd = config.head_dim as u32;
+    // q_offset = 0 (Q always lives at start of dQ-kernel SMEM region).
+    // tier_b2_dq_q_offset returns 0; accessed via smem_layout for no-magic-number
+    // correctness — the accessor is the spec contract.
+    let q_smem_off: u32 = 0; // = tier_b2_dq_q_offset(config)
+
+    // Total Q tile bytes = bq * hd * 2 (f16).  Distributed across 32 lanes:
+    //   bytes_per_lane = (bq * hd * 2) / 32
+    //   chunks_per_lane = bytes_per_lane / 4  (each cp.async.cg issues b32 = 4 bytes)
+    let total_bytes = bq * hd * 2;
+    let bytes_per_lane = total_bytes / 32;
+    let chunks_per_lane = bytes_per_lane / 4;
+    debug_assert!(
+        chunks_per_lane >= 1,
+        "Q tile must have at least one b32 chunk per lane (bq={}, hd={})",
+        bq, hd
+    );
+
+    ptx.push_str("    // === C1: cp.async Q tile [bq, hd] f16 -> SMEM[+q_offset=0] ===\n");
+    // All %c1_* registers declared in emit_register_decls (PTX ISA: decls before exec instrs).
+
+    // q_tile_start = q_iter * bq  (u32, first sequence position of this Q tile)
+    ptx.push_str(&format!(
+        "    // q_tile_start = q_iter * {bq} (first seq position of Q tile)\n"
+    ));
+    ptx.push_str(&format!(
+        "    mul.lo.u32 %c1_q_tile_start, %q_iter, {bq};\n"
+    ));
+
+    // HBM byte offset for Q[batch_idx, head, q_tile_start, 0] using A1's helper.
+    // emit_4d_byte_offset uses %row_index_tmp as scratch (already declared in emit_register_decls).
+    crate::flash_attention_v2::tier_b2::backward::dq::hbm_addr::emit_4d_byte_offset(
+        ptx,
+        "%c1_q_hbm_off",
+        "%batch_idx",
+        "%head",
+        "%c1_q_tile_start",
+        "0",         // d=0: column index within the row (we load full row via multi-chunk loop)
+        "%heads_r",
+        "%seq_len_r",
+        hd,          // D = head_dim
+        2,           // sizeof(f16) = 2
+    );
+
+    // HBM source base: load q_saved_ptr from param space.
+    ptx.push_str("    ld.param.u64 %c1_q_hbm_base, [q_saved_ptr];\n");
+    ptx.push_str("    add.u64 %c1_q_hbm_base, %c1_q_hbm_base, %c1_q_hbm_off;\n");
+
+    // Per-lane byte offset within the tile: lane_id * 4 bytes.
+    // (Each lane copies one b32 = 4 bytes per cp.async iteration.)
+    ptx.push_str("    shl.b32 %c1_lane_byte_off, %lane_id, 2;  // lane_id * 4 bytes\n");
+
+    // HBM address for this lane = base + (q_tile_start row offset already in base) + lane_byte_off.
+    ptx.push_str("    cvt.u64.u32 %c1_lane_hbm_addr, %c1_lane_byte_off;\n");
+    ptx.push_str("    add.u64 %c1_lane_hbm_addr, %c1_lane_hbm_addr, %c1_q_hbm_base;\n");
+
+    // SMEM destination: u32 shared-space address via cvta.shared.u64 + cvt.u32.u64.
+    // q_smem_off = 0, so the base IS the destination.
+    ptx.push_str("    cvta.shared.u64 %c1_smem_base64, shmem;\n");
+    ptx.push_str("    cvt.u32.u64 %c1_smem_base32, %c1_smem_base64;\n");
+    if q_smem_off > 0 {
+        ptx.push_str(&format!(
+            "    add.u32 %c1_smem_base32, %c1_smem_base32, {q_smem_off};\n"
+        ));
+    }
+    // Add per-lane offset to SMEM destination.
+    ptx.push_str(
+        "    add.u32 %c1_smem_dst, %c1_smem_base32, %c1_lane_byte_off;\n",
+    );
+
+    // Emit cp.async.cg.shared.global.b32 for each chunk per lane.
+    // Chunk stride across lanes = 32 * 4 = 128 bytes per chunk iteration.
+    let chunk_stride = 32 * 4u32; // 32 lanes * 4 bytes each
+    // cp.async.ca supports 4-byte transactions (cp.async.cg requires 16 bytes).
+    // Per PTX 7.0 ISA: .ca = cache-all (L1+L2), 4/8/16 bytes; .cg = cache-global (L2), 16 bytes only.
+    for chunk_idx in 0..chunks_per_lane {
+        let chunk_off = chunk_idx * chunk_stride;
+        ptx.push_str(&format!(
+            "    cp.async.ca.shared.global [%c1_smem_dst + {chunk_off}], [%c1_lane_hbm_addr + {chunk_off}], 4;\n"
+        ));
+    }
+    // commit_group emitted by caller (emit_q_dO_producer_load) after dO part lands (C2).
 }
 
 fn emit_dq_acc_init(ptx: &mut String, config: &FlashAttentionConfig) {
