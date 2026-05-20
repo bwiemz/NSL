@@ -142,6 +142,17 @@ fn emit_register_decls(ptx: &mut String, _config: &FlashAttentionConfig) {
     ptx.push_str("    .reg .u32 %f1_addr_lolo, %f1_addr_lohi, %f1_addr_hilo, %f1_addr_hihi;\n");
     ptx.push_str("    .reg .u64 %f1_smem_base64;\n");
     ptx.push_str("    .reg .u32 %f1_smem_base32;\n");
+    // F2 col-major K re-stage scatter registers. Prefixed %f2_* to avoid clashes.
+    // Per PTX ISA all .reg decls must precede executable instructions -- declared here,
+    // used in emit_kcol_restage_scatter (called from emit_inner_loop_body).
+    ptx.push_str("    .reg .u32 %f2_lane_mod4, %f2_lane_div4;\n");
+    ptx.push_str("    .reg .u32 %f2_row_base, %f2_col_base;\n");
+    ptx.push_str("    .reg .u32 %f2_src_row, %f2_src_col;\n");
+    ptx.push_str("    .reg .u32 %f2_src_off, %f2_dst_off;\n");
+    ptx.push_str("    .reg .u32 %f2_src_addr, %f2_dst_addr;\n");
+    ptx.push_str("    .reg .u64 %f2_smem_base64;\n");
+    ptx.push_str("    .reg .u32 %f2_smem_base32;\n");
+    ptx.push_str("    .reg .b16 %f2_val;\n");
     ptx.push('\n');
 }
 
@@ -734,6 +745,117 @@ fn emit_ds_scatter_to_smem(ptx: &mut String, config: &FlashAttentionConfig) {
     ptx.push_str("    bar.sync 0;  // dS scatter visible to all warps\n");
 }
 
+/// F2: Emit the col-major K re-stage scatter (Path A, strongest treatment).
+///
+/// Copies row-major K[bkv, hd] (at `tier_b2_dq_k_offset`) to col-major
+/// K[hd, bkv] (at `tier_b2_dq_k_colmajor_offset`) via per-lane
+/// ld.shared.b16 / st.shared.b16, warp-0-gated to avoid 4x write
+/// amplification.
+///
+/// Partition: each lane handles `pairs_per_lane = (bkv/4)*(hd/8)` cells.
+///   src_row = lane%4 * (bkv/4) + (p % (bkv/4))     -- row in K[bkv, hd]
+///   src_col = lane/4 * (hd/8)  + (p / (bkv/4))     -- col in K[bkv, hd]
+///   src_off = k_off + src_row * hd * 2 + src_col * 2
+///   dst_off = k_colmajor_off + src_col * bkv * 2 + src_row * 2
+///
+/// This partition makes all four spec §5.5 institutional-pin terms contribute:
+///   - lane%4  via and.b32 %f2_lane_mod4, %lane_id, 3
+///   - lane/4  via shr.u32 %f2_lane_div4, %lane_id, 2  (THE BUG-CLASS TERM)
+///   - k_colmajor_offset literal (smem_base)
+///   - bkv_eff * 2 (col_stride_bytes for the col-major dst)
+///
+/// All `%f2_*` scratch registers are declared in `emit_register_decls`.
+fn emit_kcol_restage_scatter(ptx: &mut String, config: &FlashAttentionConfig) {
+    use crate::flash_attention_v2::smem_layout::{
+        tier_b2_dq_k_offset, tier_b2_dq_k_colmajor_offset, tier_b2_effective_bkv,
+    };
+
+    let k_off     = tier_b2_dq_k_offset(config);
+    let kcol_off  = tier_b2_dq_k_colmajor_offset(config);
+    let bkv       = tier_b2_effective_bkv(config);
+    let hd        = config.head_dim as u32;
+
+    // Partition parameters (all powers-of-two per spec §3.1 invariants).
+    // rows_per_lane_mod = bkv/4  (how many bkv rows a lane%4 group owns)
+    // cols_per_lane_div = hd/8   (how many hd cols a lane/4 group owns)
+    // pairs_per_lane   = rows_per_lane_mod * cols_per_lane_div = bkv*hd/32
+    let rows_per_lane_mod = bkv / 4;
+    let cols_per_lane_div = hd  / 8;
+    let pairs_per_lane    = rows_per_lane_mod * cols_per_lane_div;
+
+    let row_stride_src  = hd  * 2;  // row-major K src: hd*2 bytes per row
+    let col_stride_dst  = bkv * 2;  // col-major K dst: bkv*2 bytes per col
+
+    ptx.push_str("    // === Col-major K re-stage (Path A) ===\n");
+    ptx.push_str("    // Source: row-major K[bkv, hd] at SMEM[+k_offset], row stride hd*2 bytes\n");
+    ptx.push_str("    // Dest:   col-major K[hd, bkv] at SMEM[+k_colmajor_offset], col stride bkv*2 bytes\n");
+    ptx.push_str("    // Warp 0 gates the scatter (avoids 4x write amplification)\n");
+    ptx.push_str(&format!(
+        "    // (Per-lane scatter loop body covers {pairs_per_lane} (row, col) pairs per lane.)\n",
+    ));
+    ptx.push_str("    @!%p_producer bra DQ_KCOL_RESTAGE_DONE;\n");
+
+    // Derive lane%4 and lane/4 once (institutional-pin terms 1 and 2).
+    // These are the pre-declared %f2_* regs from emit_register_decls.
+    ptx.push_str("    and.b32 %f2_lane_mod4, %lane_id, 3;\n");
+    ptx.push_str("    shr.u32 %f2_lane_div4, %lane_id, 2;\n");
+
+    // Compute per-lane row/col base offsets (lane-dependent, pair-independent).
+    //   row_base = lane%4 * rows_per_lane_mod
+    //   col_base = lane/4 * cols_per_lane_div
+    ptx.push_str(&format!("    mul.lo.u32 %f2_row_base, %f2_lane_mod4, {rows_per_lane_mod};\n"));
+    ptx.push_str(&format!("    mul.lo.u32 %f2_col_base, %f2_lane_div4, {cols_per_lane_div};\n"));
+
+    // Obtain SMEM base as u32 shared-space address.
+    ptx.push_str("    cvta.shared.u64 %f2_smem_base64, shmem;\n");
+    ptx.push_str("    cvt.u32.u64 %f2_smem_base32, %f2_smem_base64;\n");
+
+    // Loop-unrolled per (row, col) pair.
+    // For pair p:
+    //   src_row = row_base + (p % rows_per_lane_mod)
+    //   src_col = col_base + (p / rows_per_lane_mod)
+    //   src_off = k_off + src_row * row_stride_src + src_col * 2
+    //   dst_off = kcol_off + src_col * col_stride_dst + src_row * 2
+    for p in 0..pairs_per_lane {
+        let pair_row_off = p % rows_per_lane_mod;  // row delta within lane's block
+        let pair_col_off = p / rows_per_lane_mod;  // col delta within lane's block
+
+        // src_row = row_base + pair_row_off
+        ptx.push_str(&format!("    add.u32 %f2_src_row, %f2_row_base, {pair_row_off};\n"));
+        // src_col = col_base + pair_col_off
+        ptx.push_str(&format!("    add.u32 %f2_src_col, %f2_col_base, {pair_col_off};\n"));
+
+        // src_off = k_off + src_row * row_stride_src + src_col * 2
+        ptx.push_str(&format!("    mul.lo.u32 %f2_src_off, %f2_src_row, {row_stride_src};\n"));
+        // src_col * 2: multiply by 2 then add
+        // Use a temporary for src_col_bytes to avoid clobbering %f2_src_col before dst_off.
+        // We compute dst_off before the shift to keep %f2_src_col intact.
+        // dst_off = kcol_off + src_col * col_stride_dst + src_row * 2
+        ptx.push_str(&format!("    mul.lo.u32 %f2_dst_off, %f2_src_col, {col_stride_dst};\n"));
+        // src_row * 2 for dst: shl src_row by 1 and add
+        // use %f2_src_addr as a scratch here (it's unused until after these address calcs)
+        ptx.push_str("    shl.b32 %f2_src_addr, %f2_src_row, 1;\n");
+        ptx.push_str("    add.u32 %f2_dst_off, %f2_dst_off, %f2_src_addr;\n");
+        ptx.push_str(&format!("    add.u32 %f2_dst_off, %f2_dst_off, {kcol_off};\n"));
+
+        // Now compute src_off += src_col * 2 (src_col still intact)
+        ptx.push_str("    shl.b32 %f2_dst_addr, %f2_src_col, 1;\n");  // reuse %f2_dst_addr as scratch
+        ptx.push_str("    add.u32 %f2_src_off, %f2_src_off, %f2_dst_addr;\n");
+        ptx.push_str(&format!("    add.u32 %f2_src_off, %f2_src_off, {k_off};\n"));
+
+        // Compute actual SMEM addresses.
+        ptx.push_str("    add.u32 %f2_src_addr, %f2_smem_base32, %f2_src_off;\n");
+        ptx.push_str("    add.u32 %f2_dst_addr, %f2_smem_base32, %f2_dst_off;\n");
+
+        // ld.shared.b16 from row-major src; st.shared.b16 to col-major dst.
+        ptx.push_str("    ld.shared.b16 %f2_val, [%f2_src_addr];\n");
+        ptx.push_str("    st.shared.b16 [%f2_dst_addr], %f2_val;\n");
+    }
+
+    ptx.push_str("DQ_KCOL_RESTAGE_DONE:\n");
+    ptx.push_str("    bar.sync 0;\n");
+}
+
 fn emit_inner_loop_body(ptx: &mut String, config: &FlashAttentionConfig) {
     use crate::matmul_mma::{
         emit_load_a_fragment_smem, emit_load_b_fragment_smem, emit_mma_instruction,
@@ -896,41 +1018,17 @@ fn emit_inner_loop_body(ptx: &mut String, config: &FlashAttentionConfig) {
     emit_ds_scatter_to_smem(ptx, config);
     ptx.push('\n');
 
-    // === Col-major K re-stage band (Path A per spec §5.2-5.3) ===
+    // === F2: Col-major K re-stage (Path A, strongest treatment per spec §5.2-5.3 + §4.4) ===
     //
-    // K is staged row-major at tier_b2_dq_k_offset (matches B.1 forward
-    // convention).  For dQ_acc += dS @ K (NOT dS @ K^T), we need K presented to
-    // the MMA as col-major.  Emit a scatter that copies row-major K[bkv, hd] →
-    // col-major K band at tier_b2_dq_k_colmajor_offset once per kv_iter, gated by
-    // warp 0 to avoid 4× write amplification across the four consumer warps.
+    // K is staged row-major at tier_b2_dq_k_offset (matches B.1 forward convention).
+    // For dQ_acc += dS @ K (NOT dS @ K^T), we need K presented to the MMA as col-major.
+    // emit_kcol_restage_scatter copies row-major K[bkv, hd] → col-major K band at
+    // tier_b2_dq_k_colmajor_offset, gated by warp 0, bar.sync'd before MMA reads it.
     //
-    // Each lane handles (effective_bkv * head_dim / 32) (row, col) pairs via
-    // ld.shared.b16 / st.shared.b16 (the source is already in SMEM; no cp.async).
-    //
-    // FFI-side requirement (Phase 3 wiring): when `nsl_flash_attention_csha`
-    // launches the dQ-kernel, it MUST assert
-    //   tier_b2_dq_total_smem_bytes(config) <= SMEM_DYNAMIC_BUDGET_BYTES
-    // and fail loudly otherwise (per spec §5.5 Step 3d-3).  Not wired in Phase 2.
-    let k_off = crate::flash_attention_v2::smem_layout::tier_b2_dq_k_offset(config);
-    let k_col_off = tier_b2_dq_k_colmajor_offset(config);
-    let bkv_eff = tier_b2_effective_bkv(config);
-    ptx.push_str("    // === Col-major K re-stage (Path A) ===\n");
-    ptx.push_str("    // Warp 0 gates the scatter to avoid 4x write amplification.\n");
-    ptx.push_str("    @!%p_producer bra DQ_KCOL_RESTAGE_DONE;\n");
-    ptx.push_str(&format!(
-        "    // Source: row-major K[{bkv}, {hd}] at SMEM[+{k_off}]\n",
-        bkv = bkv_eff, hd = hd, k_off = k_off,
-    ));
-    ptx.push_str(&format!(
-        "    // Dest:   col-major K-staged at SMEM[+{k_col_off}], col_stride = {} bytes\n",
-        bkv_eff * 2, k_col_off = k_col_off,
-    ));
-    ptx.push_str(&format!(
-        "    // (Per-lane scatter loop body covers {} (row, col) pairs per lane.)\n",
-        (bkv_eff * hd) / 32,
-    ));
-    ptx.push_str("DQ_KCOL_RESTAGE_DONE:\n");
-    ptx.push_str("    bar.sync 0;\n");
+    // FFI-side requirement (Phase 3 wiring): when `nsl_flash_attention_csha` launches
+    // the dQ-kernel, it MUST assert tier_b2_dq_total_smem_bytes <= SMEM_DYNAMIC_BUDGET_BYTES
+    // and fail loudly otherwise (per spec §5.5 Step 3d-3). Not wired in Phase 2.
+    emit_kcol_restage_scatter(ptx, config);
     ptx.push('\n');
 
     // === dQ_acc += dS @ K (m16n8k16, B-frag from col-major K re-stage) ===
@@ -956,6 +1054,8 @@ fn emit_inner_loop_body(ptx: &mut String, config: &FlashAttentionConfig) {
         ptx.push_str(&format!("    .reg .b32 %{};\n", r));
     }
 
+    let bkv_eff = tier_b2_effective_bkv(config);
+    let k_col_off = tier_b2_dq_k_colmajor_offset(config);
     let ds_off_expr = format!("{}", tier_b2_dq_ds_offset(config));
     let k_col_off_expr = format!("{}", k_col_off);
     let ds_row_stride = (config.block_kv * 4) as usize; // dS is f32 row-major
