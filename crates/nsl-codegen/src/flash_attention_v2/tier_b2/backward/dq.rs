@@ -32,6 +32,7 @@ pub fn synthesize_dq_kernel(
     emit_register_decls(&mut ptx, config);
     emit_grid_id_setup(&mut ptx);
     emit_q_iter_count_setup(&mut ptx, config);
+    emit_kv_iter_count_setup(&mut ptx, config);
     emit_outer_loop_open(&mut ptx);
     emit_q_dO_producer_load(&mut ptx);
     emit_dq_acc_init(&mut ptx, config);
@@ -76,9 +77,15 @@ fn emit_register_decls(ptx: &mut String, config: &FlashAttentionConfig) {
     ptx.push_str("    .reg .u32 %addr_lo, %tile_skip_predicate;\n");
     ptx.push_str("    .reg .u32 %row_index_tmp;\n");
     ptx.push_str("    .reg .u64 %addr;\n");
+    // seq_len scratch: declared here (not inside emit_q_iter_count_setup) so all
+    // .reg directives precede executable instructions per PTX ISA.
+    ptx.push_str("    .reg .u32 %seq_len_r;\n");
     // Outer q_iter loop: induction variable, upper bound, loop predicate.
     ptx.push_str("    .reg .u32 %q_iter, %num_q_iters;\n");
     ptx.push_str("    .reg .pred %p_q_iter_more;\n");
+    // Inner kv_iter loop: induction variable, upper bound, loop predicate.
+    ptx.push_str("    .reg .u32 %kv_iter, %num_kv_iters;\n");
+    ptx.push_str("    .reg .pred %p_kv_iter_more;\n");
     // Scratch registers used by matmul_mma helpers (emit_load_a/b_fragment_smem).
     ptx.push_str("    .reg .u32 %mma_addr, %mma_a_row, %mma_b_row;\n");
     // SMEM extern: per SPEC AMENDMENT, size from tier_b2_dq_total_smem_bytes (incl. K-colmajor).
@@ -104,17 +111,31 @@ fn emit_grid_id_setup(ptx: &mut String) {
 ///   num_q_iters = (seq_len + bq - 1) >> log2(bq)
 /// This avoids a division instruction entirely.
 ///
-/// %seq_len_r is a local scratch that reads the `seq_len` kernel param.
-/// It is NOT added to emit_register_decls because it is used only here and
-/// does not need to persist beyond this helper.
+/// %seq_len_r is declared in emit_register_decls so that all .reg directives
+/// precede executable instructions per PTX ISA.  The ld.param loads the value
+/// here because seq_len is first consumed in this helper.
 fn emit_q_iter_count_setup(ptx: &mut String, config: &FlashAttentionConfig) {
     let bq = tier_b2_effective_bq(config);
     let log2_bq = bq.trailing_zeros();
-    // %num_q_iters declared in emit_register_decls; %seq_len_r is a fresh local.
-    ptx.push_str("    .reg .u32 %seq_len_r;\n");
+    // %seq_len_r and %num_q_iters are both declared in emit_register_decls.
     ptx.push_str("    ld.param.u32 %seq_len_r, [seq_len];\n");
     ptx.push_str(&format!("    add.u32 %num_q_iters, %seq_len_r, {};\n", bq - 1));
     ptx.push_str(&format!("    shr.u32 %num_q_iters, %num_q_iters, {};\n", log2_bq));
+    ptx.push('\n');
+}
+
+/// Compute %num_kv_iters = ceil(seq_len / bkv) using power-of-2 shift.
+///
+/// bkv is power-of-2 (mirrors bq per Approach A"'s bq=bkv invariant), so:
+///   num_kv_iters = (seq_len + bkv - 1) >> log2(bkv)
+/// %seq_len_r is already loaded by emit_q_iter_count_setup, so this helper
+/// reuses it directly.
+fn emit_kv_iter_count_setup(ptx: &mut String, config: &FlashAttentionConfig) {
+    use crate::flash_attention_v2::smem_layout::tier_b2_effective_bkv;
+    let bkv = tier_b2_effective_bkv(config);
+    // bkv is power-of-2 per spec §3.1 (ALLOWED_BLOCK_KV), so use shift.
+    ptx.push_str(&format!("    add.u32 %num_kv_iters, %seq_len_r, {};\n", bkv - 1));
+    ptx.push_str(&format!("    shr.u32 %num_kv_iters, %num_kv_iters, {};\n", bkv.trailing_zeros()));
     ptx.push('\n');
 }
 
@@ -156,6 +177,7 @@ fn emit_dq_acc_init(ptx: &mut String, config: &FlashAttentionConfig) {
 }
 
 fn emit_inner_loop_open(ptx: &mut String) {
+    ptx.push_str("    mov.u32 %kv_iter, 0;\n");
     ptx.push_str("DQ_KV_ITER_LOOP:\n");
     ptx.push_str("    // Warp 0 issues cp.async for K, V tiles.\n");
     ptx.push_str("    @!%p_producer bra DQ_KV_LOAD_DONE;\n");
@@ -397,8 +419,10 @@ fn emit_inner_loop_body(ptx: &mut String, config: &FlashAttentionConfig) {
 }
 
 fn emit_inner_loop_close(ptx: &mut String) {
-    ptx.push_str("    // ... kv_iter increment + back-edge (Task 12 wires)\n");
-    ptx.push_str("    bra DQ_KV_ITER_DONE;  // placeholder unconditional exit until Task 12\n");
+    ptx.push_str("    // Inner-loop back-edge: kv_iter += 1; if kv_iter < num_kv_iters, branch back.\n");
+    ptx.push_str("    add.u32 %kv_iter, %kv_iter, 1;\n");
+    ptx.push_str("    setp.lt.u32 %p_kv_iter_more, %kv_iter, %num_kv_iters;\n");
+    ptx.push_str("    @%p_kv_iter_more bra DQ_KV_ITER_LOOP;\n");
     ptx.push_str("DQ_KV_ITER_DONE:\n");
 }
 
@@ -695,5 +719,18 @@ mod tests {
         let placeholder_count = ptx.matches("bra DQ_Q_ITER_DONE;  // placeholder").count();
         assert_eq!(placeholder_count, 0,
             "placeholder unconditional outer-loop exit must be removed");
+    }
+
+    #[test]
+    fn synthesize_dq_kernel_emits_real_inner_kv_iter_loop_with_back_edge() {
+        let ptx = synthesize_dq_kernel(&canonical_cfg()).unwrap();
+        assert!(ptx.contains("DQ_KV_ITER_LOOP"), "expected inner loop label");
+        assert!(ptx.contains("setp.lt.u32 %p_kv_iter_more"),
+            "expected kv_iter < num_kv_iters predicate");
+        assert!(ptx.contains("@%p_kv_iter_more bra DQ_KV_ITER_LOOP"),
+            "expected conditional back-edge to inner loop label");
+        let placeholder_count = ptx.matches("bra DQ_KV_ITER_DONE;  // placeholder").count();
+        assert_eq!(placeholder_count, 0,
+            "placeholder unconditional inner-loop exit must be removed");
     }
 }
