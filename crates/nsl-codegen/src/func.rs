@@ -175,7 +175,9 @@ impl Compiler<'_> {
                 {
                     let param_syms: std::collections::HashSet<nsl_ast::Symbol> =
                         fn_def.params.iter().map(|p| p.name).collect();
-                    let locals: Vec<_> = state.variables.iter()
+                    let locals: Vec<_> = state
+                        .variables
+                        .iter()
                         .filter(|(sym, _)| !param_syms.contains(sym))
                         .filter(|(sym, _)| !state.non_owning_symbols.contains(sym))
                         .filter_map(|(_, (var, cl_type))| {
@@ -190,7 +192,9 @@ impl Compiler<'_> {
                     for var in locals {
                         let val = builder.use_var(var);
                         let _ = self.compile_call_by_name(
-                            &mut builder, "nsl_tensor_free_if_valid", &[val],
+                            &mut builder,
+                            "nsl_tensor_free_if_valid",
+                            &[val],
                         );
                     }
                 }

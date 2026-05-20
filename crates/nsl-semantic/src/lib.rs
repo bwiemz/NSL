@@ -3,10 +3,10 @@ pub mod builtins;
 pub mod cep;
 pub mod cfie;
 pub mod cftp;
-pub mod csha;
 pub mod checker;
-pub mod cpdt;
 pub mod context_parallel;
+pub mod cpdt;
+pub mod csha;
 pub mod determinism;
 pub mod effects;
 pub mod export;
@@ -18,10 +18,10 @@ pub mod moe;
 pub mod multimodal;
 pub mod nan_analysis;
 pub mod ownership;
-pub mod pipeline;
 pub mod ownership_autodiff;
 pub mod ownership_walker;
 pub mod perf_budget;
+pub mod pipeline;
 pub mod resolve;
 pub mod scope;
 pub mod shape_algebra;
@@ -124,9 +124,8 @@ pub fn analyze_with_imports(
     // Runs after type checking so we have the TypeMap for tensor type detection.
     let mut ownership_info = HashMap::new();
     if linear_types {
-        let (ownership_diags, info) = ownership_walker::analyze_ownership(
-            module, interner, &type_map, &scopes,
-        );
+        let (ownership_diags, info) =
+            ownership_walker::analyze_ownership(module, interner, &type_map, &scopes);
         diagnostics.extend(ownership_diags);
         ownership_info = info;
     }

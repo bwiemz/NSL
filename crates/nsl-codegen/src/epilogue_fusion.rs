@@ -294,13 +294,7 @@ pub fn apply_epilogue_fusion(
         let root = nsl_ast::NodeId(chain.matmul_node);
         let mut constituents = Vec::with_capacity(1 + chain.eliminated_nodes.len());
         constituents.push(root);
-        constituents.extend(
-            chain
-                .eliminated_nodes
-                .iter()
-                .copied()
-                .map(nsl_ast::NodeId),
-        );
+        constituents.extend(chain.eliminated_nodes.iter().copied().map(nsl_ast::NodeId));
         plan.fused_node_groups.insert(root, constituents);
     }
 }
@@ -640,10 +634,7 @@ pub fn synthesize_epilogue_ptx(
                 // keeps the stand-alone epilogue kernel deterministic
                 // and shape-preserving while still tagging the fusion
                 // for downstream consumers.
-                ptx.push_str(&format!(
-                    "    // Epilogue: RoPE (CSHA L1, dim={})\n",
-                    dim,
-                ));
+                ptx.push_str(&format!("    // Epilogue: RoPE (CSHA L1, dim={})\n", dim,));
                 ptx.push_str(&format!("    mov.f32 %f{}, %f{};\n", out_reg, acc_reg));
             }
         }

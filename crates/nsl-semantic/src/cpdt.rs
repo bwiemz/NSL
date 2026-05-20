@@ -191,8 +191,7 @@ pub fn validate_cpdt_decorator(
                     }
                     _ => diagnostics.push(
                         Diagnostic::error(
-                            "@cpdt: target_memory must be a float or percentage string"
-                                .to_string(),
+                            "@cpdt: target_memory must be a float or percentage string".to_string(),
                         )
                         .with_label(arg.span, "expected number"),
                     ),
@@ -202,15 +201,19 @@ pub fn validate_cpdt_decorator(
                     // decode whatever the user provided into the
                     // optional cluster fields; unknown sub-keys are
                     // warned about but don't abort.
-                    decode_cluster_arg(&arg.value.kind, resolve_sym, &mut cluster, diagnostics, arg.span);
+                    decode_cluster_arg(
+                        &arg.value.kind,
+                        resolve_sym,
+                        &mut cluster,
+                        diagnostics,
+                        arg.span,
+                    );
                 }
                 "weight_aware" => match &arg.value.kind {
                     ExprKind::BoolLiteral(b) => weight_aware = *b,
                     _ => diagnostics.push(
-                        Diagnostic::error(
-                            "@cpdt: weight_aware must be a bool literal".to_string(),
-                        )
-                        .with_label(arg.span, "expected true or false"),
+                        Diagnostic::error("@cpdt: weight_aware must be a bool literal".to_string())
+                            .with_label(arg.span, "expected true or false"),
                     ),
                 },
                 _ => diagnostics.push(
@@ -325,7 +328,11 @@ mod tests {
 
     #[test]
     fn precision_roundtrip() {
-        for p in [PrecisionMode::Auto, PrecisionMode::Fp32, PrecisionMode::Mixed] {
+        for p in [
+            PrecisionMode::Auto,
+            PrecisionMode::Fp32,
+            PrecisionMode::Mixed,
+        ] {
             assert_eq!(PrecisionMode::parse(p.as_str()), Some(p));
         }
         assert!(PrecisionMode::parse("nonsense").is_none());

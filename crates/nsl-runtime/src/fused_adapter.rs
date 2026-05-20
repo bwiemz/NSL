@@ -38,10 +38,10 @@
 //! ownership stays with the caller; the returned tensor is freshly
 //! allocated and the caller must free it.
 
+use crate::tensor::activation::nsl_tensor_sigmoid;
 use crate::tensor::arithmetic::{
     nsl_tensor_add, nsl_tensor_matmul, nsl_tensor_mul, nsl_tensor_mul_scalar,
 };
-use crate::tensor::activation::nsl_tensor_sigmoid;
 use crate::tensor::fbip_flags::{RELINQUISH_A, RELINQUISH_B};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -257,14 +257,7 @@ fn try_cuda_launch_fused_lora(
     //    warp (32 threads) per (BM=16, BN=8) output tile.
     let grid = [(m + 15) / 16, (n + 7) / 8, 1];
     let block = [32i64, 1, 1];
-    let res = inner::kernel_launch(
-        ptx_cstr.as_ptr(),
-        name_cstr.as_ptr(),
-        grid,
-        block,
-        &args,
-        0,
-    );
+    let res = inner::kernel_launch(ptx_cstr.as_ptr(), name_cstr.as_ptr(), grid, block, &args, 0);
     if res as u32 != 0 {
         eprintln!(
             "[nsl-wrga] fused LoRA PTX launch failed ({:?}) — falling back to CPU math",
@@ -305,12 +298,7 @@ fn try_cuda_launch_fused_lora(
 }
 
 #[cfg(feature = "cuda")]
-fn try_cuda_launch_fused_ia3(
-    x: i64,
-    w: i64,
-    ia3_scale: i64,
-    kernel_handle: i64,
-) -> Option<i64> {
+fn try_cuda_launch_fused_ia3(x: i64, w: i64, ia3_scale: i64, kernel_handle: i64) -> Option<i64> {
     use crate::cuda::inner;
     use crate::tensor::NslTensor;
     use std::ffi::c_void;
@@ -346,7 +334,15 @@ fn try_cuda_launch_fused_ia3(
     }
     let strides = NslTensor::compute_strides(shape, 2);
     let out_box = Box::new(NslTensor::new(
-        out_data, shape, strides, 2, (m * n) as i64, xt.device, 1, 1, 0,
+        out_data,
+        shape,
+        strides,
+        2,
+        (m * n) as i64,
+        xt.device,
+        1,
+        1,
+        0,
     ));
     let out_ptr = Box::into_raw(out_box);
 
@@ -363,14 +359,7 @@ fn try_cuda_launch_fused_ia3(
 
     let grid = [(m + 15) / 16, (n + 7) / 8, 1];
     let block = [32i64, 1, 1];
-    let res = inner::kernel_launch(
-        ptx_cstr.as_ptr(),
-        name_cstr.as_ptr(),
-        grid,
-        block,
-        &args,
-        0,
-    );
+    let res = inner::kernel_launch(ptx_cstr.as_ptr(), name_cstr.as_ptr(), grid, block, &args, 0);
     if res as u32 != 0 {
         eprintln!(
             "[nsl-wrga] fused IA3 PTX launch failed ({:?}) — falling back to CPU math",
@@ -655,14 +644,7 @@ fn try_cuda_launch_fused_gatedlora(
     //    warp (32 threads) per (BM=16, BN=8) output tile.
     let grid = [(m + 15) / 16, (n + 7) / 8, 1];
     let block = [32i64, 1, 1];
-    let res = inner::kernel_launch(
-        ptx_cstr.as_ptr(),
-        name_cstr.as_ptr(),
-        grid,
-        block,
-        &args,
-        0,
-    );
+    let res = inner::kernel_launch(ptx_cstr.as_ptr(), name_cstr.as_ptr(), grid, block, &args, 0);
     if res as u32 != 0 {
         eprintln!(
             "[nsl-wrga] fused GatedLoRA PTX launch failed ({:?}) - falling back to CPU math",

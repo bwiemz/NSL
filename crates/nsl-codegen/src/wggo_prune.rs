@@ -16,8 +16,8 @@
 
 use std::collections::BTreeSet;
 
-use crate::wengert::{OpId, VarId, WengertList};
 use crate::weight_aware::WeightMap;
+use crate::wengert::{OpId, VarId, WengertList};
 use crate::wggo_apply::AppliedPlan;
 use crate::wggo_graph::LayerRole;
 
@@ -169,7 +169,9 @@ pub fn run(
     for plan in plans {
         // Capture pruned VarIds BEFORE the mutation (apply_rewrite will
         // delete ops and lose this info).
-        let mut removed_vars: Vec<VarId> = wengert.ops.iter()
+        let mut removed_vars: Vec<VarId> = wengert
+            .ops
+            .iter()
             .filter(|o| plan.closure_op_ids.contains(&o.id))
             .map(|o| o.result)
             .collect();
@@ -199,10 +201,7 @@ pub fn run(
 ///   - closure ops → DELETED
 ///   - residual Add → REWRITTEN (consumers repointed) then DELETED
 ///   - h_before → UNTOUCHED (belongs to the prior stream)
-fn apply_rewrite(
-    wengert: &mut WengertList,
-    plan: PruneRewritePlan,
-) -> PruneRewrite {
+fn apply_rewrite(wengert: &mut WengertList, plan: PruneRewritePlan) -> PruneRewrite {
     use std::collections::BTreeSet;
 
     // Collect the set of OpIds to delete: every closure op + the residual Add.
@@ -211,7 +210,9 @@ fn apply_rewrite(
 
     // Repoint every surviving op's inputs from h_after_var → h_before_var.
     for op in wengert.ops.iter_mut() {
-        if to_delete.contains(&op.id) { continue; }
+        if to_delete.contains(&op.id) {
+            continue;
+        }
         for input in op.inputs.iter_mut() {
             if *input == plan.h_after_var {
                 *input = plan.h_before_var;
@@ -230,8 +231,12 @@ fn apply_rewrite(
     // (h_before_var survives because it's produced by an upstream op outside the
     // closure OR is an initial input — either way, keep its entry.)
     let surviving_var_ids: BTreeSet<VarId> = wengert.ops.iter().map(|o| o.result).collect();
-    wengert.var_names.retain(|v, _| surviving_var_ids.contains(v) || *v == wengert.output);
-    wengert.var_types.retain(|v, _| surviving_var_ids.contains(v) || *v == wengert.output);
+    wengert
+        .var_names
+        .retain(|v, _| surviving_var_ids.contains(v) || *v == wengert.output);
+    wengert
+        .var_types
+        .retain(|v, _| surviving_var_ids.contains(v) || *v == wengert.output);
 
     let ops_deleted = plan.closure_op_ids.len() + 1; // +1 for the residual Add
     PruneRewrite {
@@ -261,8 +266,8 @@ pub(crate) enum PlanResult {
 pub(crate) struct PruneRewritePlan {
     pub(crate) layer_name: String,
     pub(crate) layer_role: LayerRole,
-    pub(crate) closure_op_ids: Vec<OpId>,    // deleted in Phase 3 (sorted in wengert order)
-    pub(crate) residual_add_op_id: OpId,     // rewritten then deleted
+    pub(crate) closure_op_ids: Vec<OpId>, // deleted in Phase 3 (sorted in wengert order)
+    pub(crate) residual_add_op_id: OpId,  // rewritten then deleted
     pub(crate) h_before_var: VarId,
     pub(crate) h_after_var: VarId,
     // Populated by Phase 1's residual-add resolver; Phase 3 currently
@@ -278,8 +283,13 @@ pub(crate) struct PruneRewritePlan {
 #[derive(Debug)]
 enum PartialRefusal {
     NoResidualAdd,
-    ParallelResidualBranches { add_ops: Vec<OpId> },
-    AmbiguousPatternMatch { h_before: VarId, candidate_adds: Vec<OpId> },
+    ParallelResidualBranches {
+        add_ops: Vec<OpId>,
+    },
+    AmbiguousPatternMatch {
+        h_before: VarId,
+        candidate_adds: Vec<OpId>,
+    },
 }
 
 // --- Phase 1 validator (positive case only — refusals land in Tasks 5-11) ---
@@ -366,34 +376,49 @@ pub(crate) fn plan_rewrite(
 
         // (a) Scan for external readers.
         for closure_op_id in &closure_op_ids {
-            let closure_op = wengert.ops.iter().find(|o| o.id == *closure_op_id)
+            let closure_op = wengert
+                .ops
+                .iter()
+                .find(|o| o.id == *closure_op_id)
                 .expect("closure op id missing from wengert.ops");
             let result_var = closure_op.result;
 
             for other_op in &wengert.ops {
-                if closure_set.contains(&other_op.id) { continue; }
-                if other_op.id == residual_add_op_id { continue; }
-                if !other_op.inputs.contains(&result_var) { continue; }
+                if closure_set.contains(&other_op.id) {
+                    continue;
+                }
+                if other_op.id == residual_add_op_id {
+                    continue;
+                }
+                if !other_op.inputs.contains(&result_var) {
+                    continue;
+                }
 
                 // Leak detected. Choose citation VarId: prefer the param itself
                 // if the closure op's result is a layer-N param VarId.
                 let (param_name, param_var) = if parameter_var_ids.contains(&result_var) {
                     (
-                        wengert.var_names.get(&result_var).cloned().unwrap_or_default(),
+                        wengert
+                            .var_names
+                            .get(&result_var)
+                            .cloned()
+                            .unwrap_or_default(),
                         result_var,
                     )
                 } else {
                     // Find a source param (input of this closure op that is in params).
-                    let sibling_param = closure_op.inputs.iter()
+                    let sibling_param = closure_op
+                        .inputs
+                        .iter()
                         .find(|v| parameter_var_ids.contains(v))
                         .copied();
                     match sibling_param {
-                        Some(p) => (
-                            wengert.var_names.get(&p).cloned().unwrap_or_default(),
-                            p,
-                        ),
+                        Some(p) => (wengert.var_names.get(&p).cloned().unwrap_or_default(), p),
                         None => (
-                            wengert.var_names.get(&result_var).cloned()
+                            wengert
+                                .var_names
+                                .get(&result_var)
+                                .cloned()
                                 .unwrap_or_else(|| format!("v{result_var}")),
                             result_var,
                         ),
@@ -415,20 +440,25 @@ pub(crate) fn plan_rewrite(
         //     Add's result — which is `h_after_var`).
         if wengert.output != h_after_var {
             for closure_op_id in &closure_op_ids {
-                let closure_op = wengert.ops.iter().find(|o| o.id == *closure_op_id)
+                let closure_op = wengert
+                    .ops
+                    .iter()
+                    .find(|o| o.id == *closure_op_id)
                     .expect("closure op id missing from wengert.ops");
                 if closure_op.result == wengert.output {
                     // Global escape leak.
-                    let sibling_param = closure_op.inputs.iter()
+                    let sibling_param = closure_op
+                        .inputs
+                        .iter()
                         .find(|v| parameter_var_ids.contains(v))
                         .copied();
                     let (param_name, param_var) = match sibling_param {
-                        Some(p) => (
-                            wengert.var_names.get(&p).cloned().unwrap_or_default(),
-                            p,
-                        ),
+                        Some(p) => (wengert.var_names.get(&p).cloned().unwrap_or_default(), p),
                         None => (
-                            wengert.var_names.get(&wengert.output).cloned()
+                            wengert
+                                .var_names
+                                .get(&wengert.output)
+                                .cloned()
                                 .unwrap_or_else(|| format!("v{}", wengert.output)),
                             wengert.output,
                         ),
@@ -536,9 +566,15 @@ fn find_residual_add(
     // exactly one input tainted).
     let mut candidates: Vec<(OpId, VarId, VarId)> = Vec::new(); // (add_op_id, h_before_var, h_after_var)
     for op in &wengert.ops {
-        if closure_set.contains(&op.id) { continue; }
-        if !matches!(op.op, PrimalOp::Add) { continue; }
-        if op.inputs.len() != 2 { continue; }
+        if closure_set.contains(&op.id) {
+            continue;
+        }
+        if !matches!(op.op, PrimalOp::Add) {
+            continue;
+        }
+        if op.inputs.len() != 2 {
+            continue;
+        }
 
         let a = op.inputs[0];
         let b = op.inputs[1];
@@ -585,12 +621,17 @@ fn refusal_with_context(
             layer_role,
             closure_size,
         },
-        PartialRefusal::ParallelResidualBranches { add_ops } => PruneRefusal::ParallelResidualBranches {
-            layer_name: layer.layer_name.clone(),
-            layer_role,
-            add_ops,
-        },
-        PartialRefusal::AmbiguousPatternMatch { h_before, candidate_adds } => PruneRefusal::AmbiguousPatternMatch {
+        PartialRefusal::ParallelResidualBranches { add_ops } => {
+            PruneRefusal::ParallelResidualBranches {
+                layer_name: layer.layer_name.clone(),
+                layer_role,
+                add_ops,
+            }
+        }
+        PartialRefusal::AmbiguousPatternMatch {
+            h_before,
+            candidate_adds,
+        } => PruneRefusal::AmbiguousPatternMatch {
             layer_name: layer.layer_name.clone(),
             layer_role,
             h_before_var: h_before,
@@ -610,18 +651,30 @@ pub fn diagnostic_code(r: &PruneRefusal) -> crate::wggo_overrides::OverrideRejec
     match r {
         PruneRefusal::CrossLayerParam { .. } => OverrideRejectReason::PruneCrossLayerParam,
         PruneRefusal::NoResidualAdd { .. } => OverrideRejectReason::PruneNoResidualAdd,
-        PruneRefusal::ParallelResidualBranches { .. } => OverrideRejectReason::PruneParallelResidualBranches,
-        PruneRefusal::AmbiguousPatternMatch { .. } => OverrideRejectReason::PruneAmbiguousPatternMatch,
+        PruneRefusal::ParallelResidualBranches { .. } => {
+            OverrideRejectReason::PruneParallelResidualBranches
+        }
+        PruneRefusal::AmbiguousPatternMatch { .. } => {
+            OverrideRejectReason::PruneAmbiguousPatternMatch
+        }
         PruneRefusal::EmptyClosure { .. } => OverrideRejectReason::PruneEmptyClosure,
-        PruneRefusal::WholeBlockUnsupported { .. } => OverrideRejectReason::PruneWholeBlockUnsupported,
-        PruneRefusal::ConflictingPruneDecisions { .. } => OverrideRejectReason::PruneConflictingDecisions,
+        PruneRefusal::WholeBlockUnsupported { .. } => {
+            OverrideRejectReason::PruneWholeBlockUnsupported
+        }
+        PruneRefusal::ConflictingPruneDecisions { .. } => {
+            OverrideRejectReason::PruneConflictingDecisions
+        }
     }
 }
 
 /// Spec §6.1 success-path stderr line. Format:
 ///   [prune] layer=N name=... role=... applied=true closure_size=K ops_deleted=K residual_add_op=ID
 /// Separator convention: key=value throughout (no colons).
-pub fn format_success_stderr(rewrite: &PruneRewrite, layer_index: u32, ops_deleted: usize) -> String {
+pub fn format_success_stderr(
+    rewrite: &PruneRewrite,
+    layer_index: u32,
+    ops_deleted: usize,
+) -> String {
     format!(
         "[prune] layer={} name={} role={:?} applied=true closure_size={} ops_deleted={} residual_add_op={}",
         layer_index,
@@ -639,9 +692,14 @@ pub fn format_success_stderr(rewrite: &PruneRewrite, layer_index: u32, ops_delet
 pub fn format_refusal(r: &PruneRefusal) -> String {
     match r {
         PruneRefusal::CrossLayerParam {
-            layer_name, layer_role, param_name, param_var, external_consumer, external_op_kind,
+            layer_name,
+            layer_role,
+            param_name,
+            param_var,
+            external_consumer,
+            external_op_kind,
         } => format!(
-"prune: layer has cross-layer parameter sharing (not supported in v1).
+            "prune: layer has cross-layer parameter sharing (not supported in v1).
   requested:  prune {layer_name}  (role={layer_role:?})
   expected:   all parameters matching `{layer_name}.*` consumed only within
               the layer's computational closure
@@ -650,8 +708,12 @@ pub fn format_refusal(r: &PruneRefusal) -> String {
               outside the closure for {layer_name}
 "
         ),
-        PruneRefusal::NoResidualAdd { layer_name, layer_role, closure_size } => format!(
-"prune: layer is not residual-structured (no boundary Add found).
+        PruneRefusal::NoResidualAdd {
+            layer_name,
+            layer_role,
+            closure_size,
+        } => format!(
+            "prune: layer is not residual-structured (no boundary Add found).
   requested:  prune {layer_name}  (role={layer_role:?})
   expected:   exactly one op in the closure matching Add(h_before, block_output)
               with block_output in closure and block_output single-consumer
@@ -660,8 +722,12 @@ pub fn format_refusal(r: &PruneRefusal) -> String {
               non-standard architecture)
 "
         ),
-        PruneRefusal::ParallelResidualBranches { layer_name, layer_role, add_ops } => format!(
-"prune: layer has parallel residual branches (not supported in v1).
+        PruneRefusal::ParallelResidualBranches {
+            layer_name,
+            layer_role,
+            add_ops,
+        } => format!(
+            "prune: layer has parallel residual branches (not supported in v1).
   requested:  prune {layer_name}  (role={layer_role:?})
   expected:   exactly one residual boundary Add
   found:      {k} residual Adds detected at ops {add_ops:?}; each appears to
@@ -671,8 +737,13 @@ pub fn format_refusal(r: &PruneRefusal) -> String {
 ",
             k = add_ops.len(),
         ),
-        PruneRefusal::AmbiguousPatternMatch { layer_name, layer_role, h_before_var, candidate_adds } => format!(
-"prune: layer has multiple candidate residual boundaries (pattern-match ambiguous).
+        PruneRefusal::AmbiguousPatternMatch {
+            layer_name,
+            layer_role,
+            h_before_var,
+            candidate_adds,
+        } => format!(
+            "prune: layer has multiple candidate residual boundaries (pattern-match ambiguous).
   requested:  prune {layer_name}  (role={layer_role:?})
   expected:   exactly one op matching the residual pattern
   found:      {k} candidate Adds match the residual pattern against the same
@@ -682,8 +753,12 @@ pub fn format_refusal(r: &PruneRefusal) -> String {
 ",
             k = candidate_adds.len(),
         ),
-        PruneRefusal::EmptyClosure { layer_name, layer_role, prefix } => format!(
-"prune: no parameters match the requested layer prefix.
+        PruneRefusal::EmptyClosure {
+            layer_name,
+            layer_role,
+            prefix,
+        } => format!(
+            "prune: no parameters match the requested layer prefix.
   requested:  prune {layer_name}  (role={layer_role:?})
   expected:   at least one parameter VarId with var_name starting
               with `{prefix}`
@@ -692,7 +767,7 @@ pub fn format_refusal(r: &PruneRefusal) -> String {
 "
         ),
         PruneRefusal::WholeBlockUnsupported { layer_name } => format!(
-"prune: whole-block pruning (LayerRole::Block) is not supported in v1.
+            "prune: whole-block pruning (LayerRole::Block) is not supported in v1.
   requested:  prune {layer_name}  (role=Block)
   supported:  prune {layer_name}.attn  (role=Attention)
               prune {layer_name}.ffn   (role=Ffn)
@@ -703,8 +778,12 @@ pub fn format_refusal(r: &PruneRefusal) -> String {
   planned:    whole-block prune tracked for v2 (chain-collapse transformation).
 "
         ),
-        PruneRefusal::ConflictingPruneDecisions { decision_a, decision_b, reason } => format!(
-"prune: two prune decisions in the same plan conflict.
+        PruneRefusal::ConflictingPruneDecisions {
+            decision_a,
+            decision_b,
+            reason,
+        } => format!(
+            "prune: two prune decisions in the same plan conflict.
   requested:  prune {decision_a} AND prune {decision_b} in the same plan
   expected:   each rewrite's closure and VarId aliasing is disjoint from every
               other rewrite's
@@ -717,10 +796,10 @@ pub fn format_refusal(r: &PruneRefusal) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::weight_aware::WeightMap;
     use crate::wengert::{PrimalOp, WengertOp};
     use crate::wggo_apply::{AppliedLayer, AppliedPlan};
     use crate::wggo_dp::LayerDecision;
-    use crate::weight_aware::WeightMap;
     use std::collections::HashMap;
 
     /// Build a minimal synthetic WengertList for unit tests.
@@ -736,16 +815,24 @@ mod tests {
     /// Shorthand: unary op with one input.
     fn op_unary(id: OpId, result: VarId, input: VarId, kind: PrimalOp) -> WengertOp {
         WengertOp {
-            id, result, op: kind, inputs: vec![input],
-            saved_for_backward: false, checkpointed: false,
+            id,
+            result,
+            op: kind,
+            inputs: vec![input],
+            saved_for_backward: false,
+            checkpointed: false,
         }
     }
 
     /// Shorthand: Add op.
     fn op_add(id: OpId, result: VarId, a: VarId, b: VarId) -> WengertOp {
         WengertOp {
-            id, result, op: PrimalOp::Add, inputs: vec![a, b],
-            saved_for_backward: false, checkpointed: false,
+            id,
+            result,
+            op: PrimalOp::Add,
+            inputs: vec![a, b],
+            saved_for_backward: false,
+            checkpointed: false,
         }
     }
 
@@ -783,20 +870,24 @@ mod tests {
         // Expected closure: {op0, op1}. The Add (op2) is the BOUNDARY, not the closure.
 
         let v_hb: VarId = 100;
-        let v0:   VarId = 200;
-        let v1:   VarId = 201;
+        let v0: VarId = 200;
+        let v1: VarId = 201;
         let v_ha: VarId = 202;
 
         let ops = vec![
-            op_unary(0, v0, v_hb, PrimalOp::Relu),  // produces v0 (a layer-7 param VarId)
-            op_unary(1, v1, v0, PrimalOp::Relu),    // reads layer-7 param → block_output
-            op_add(2, v_ha, v_hb, v1),               // residual Add — the boundary
+            op_unary(0, v0, v_hb, PrimalOp::Relu), // produces v0 (a layer-7 param VarId)
+            op_unary(1, v1, v0, PrimalOp::Relu),   // reads layer-7 param → block_output
+            op_add(2, v_ha, v_hb, v1),             // residual Add — the boundary
         ];
 
         let wengert = mk_wengert(
             ops,
             v_ha,
-            &[(v_hb, "h_before"), (v0, "blocks.7.attn.wq"), (v_ha, "h_after")],
+            &[
+                (v_hb, "h_before"),
+                (v0, "blocks.7.attn.wq"),
+                (v_ha, "h_after"),
+            ],
         );
 
         let layer = mk_prune_layer(7, "blocks.7.attn");
@@ -827,36 +918,54 @@ mod tests {
 
         let v_hb1: VarId = 100;
         let v_hb2: VarId = 110;
-        let v_p:   VarId = 200;   // shared layer-N param
-        let v_b1:  VarId = 201;
-        let v_b2:  VarId = 211;
-        let v_y1:  VarId = 300;
-        let v_y2:  VarId = 310;
+        let v_p: VarId = 200; // shared layer-N param
+        let v_b1: VarId = 201;
+        let v_b2: VarId = 211;
+        let v_y1: VarId = 300;
+        let v_y2: VarId = 310;
 
         let ops = vec![
-            op_unary(0, v_p,  v_hb1, PrimalOp::Relu),   // param producer
-            op_unary(1, v_b1, v_p,   PrimalOp::Relu),    // block_output branch 1
-            op_add  (2, v_y1, v_hb1, v_b1),              // residual branch 1: Add(h_before_1, block_output_1)
-            op_unary(3, v_b2, v_p,   PrimalOp::Relu),    // block_output branch 2 (reads same param)
-            op_add  (4, v_y2, v_hb2, v_b2),              // residual branch 2: Add(h_before_2, block_output_2) — DISTINCT h_before
+            op_unary(0, v_p, v_hb1, PrimalOp::Relu), // param producer
+            op_unary(1, v_b1, v_p, PrimalOp::Relu),  // block_output branch 1
+            op_add(2, v_y1, v_hb1, v_b1), // residual branch 1: Add(h_before_1, block_output_1)
+            op_unary(3, v_b2, v_p, PrimalOp::Relu), // block_output branch 2 (reads same param)
+            op_add(4, v_y2, v_hb2, v_b2), // residual branch 2: Add(h_before_2, block_output_2) — DISTINCT h_before
         ];
 
         let wengert = mk_wengert(
-            ops, v_y1,
-            &[(v_hb1, "h_before_1"), (v_hb2, "h_before_2"), (v_p, "blocks.7.attn.wq")],
+            ops,
+            v_y1,
+            &[
+                (v_hb1, "h_before_1"),
+                (v_hb2, "h_before_2"),
+                (v_p, "blocks.7.attn.wq"),
+            ],
         );
         let layer = mk_prune_layer(7, "blocks.7.attn");
         let weight_map = WeightMap::default();
 
         match plan_rewrite(&wengert, &layer, &weight_map) {
-            PlanResult::Refused(PruneRefusal::ParallelResidualBranches { layer_name, add_ops, .. }) => {
+            PlanResult::Refused(PruneRefusal::ParallelResidualBranches {
+                layer_name,
+                add_ops,
+                ..
+            }) => {
                 assert_eq!(layer_name, "blocks.7.attn");
-                assert_eq!(add_ops.len(), 2, "expected 2 parallel-branch Adds, got {}", add_ops.len());
-                assert!(add_ops.contains(&2) && add_ops.contains(&4),
-                    "expected parallel Adds at ops 2 and 4; got {add_ops:?}");
+                assert_eq!(
+                    add_ops.len(),
+                    2,
+                    "expected 2 parallel-branch Adds, got {}",
+                    add_ops.len()
+                );
+                assert!(
+                    add_ops.contains(&2) && add_ops.contains(&4),
+                    "expected parallel Adds at ops 2 and 4; got {add_ops:?}"
+                );
             }
             PlanResult::Ok(plan) => panic!("expected ParallelResidualBranches, got Ok({plan:?})"),
-            PlanResult::Refused(other) => panic!("expected ParallelResidualBranches, got: {other:?}"),
+            PlanResult::Refused(other) => {
+                panic!("expected ParallelResidualBranches, got: {other:?}")
+            }
         }
     }
 
@@ -877,35 +986,37 @@ mod tests {
         // candidate_adds containing {3, 4}.
 
         let v_hb: VarId = 100;
-        let v_p:  VarId = 200;
+        let v_p: VarId = 200;
         let v_b1: VarId = 201;
         let v_b2: VarId = 202;
         let v_y1: VarId = 300;
         let v_y2: VarId = 310;
 
         let ops = vec![
-            op_unary(0, v_p,  v_hb, PrimalOp::Relu),
-            op_unary(1, v_b1, v_p,  PrimalOp::Relu),
-            op_unary(2, v_b2, v_p,  PrimalOp::Relu),
-            op_add  (3, v_y1, v_hb, v_b1),             // Add(h_before=v_hb, block_output=v_b1)
-            op_add  (4, v_y2, v_hb, v_b2),             // Add(h_before=v_hb, block_output=v_b2)
+            op_unary(0, v_p, v_hb, PrimalOp::Relu),
+            op_unary(1, v_b1, v_p, PrimalOp::Relu),
+            op_unary(2, v_b2, v_p, PrimalOp::Relu),
+            op_add(3, v_y1, v_hb, v_b1), // Add(h_before=v_hb, block_output=v_b1)
+            op_add(4, v_y2, v_hb, v_b2), // Add(h_before=v_hb, block_output=v_b2)
         ];
-        let wengert = mk_wengert(
-            ops, v_y1,
-            &[(v_hb, "h_before"), (v_p, "blocks.7.attn.wq")],
-        );
+        let wengert = mk_wengert(ops, v_y1, &[(v_hb, "h_before"), (v_p, "blocks.7.attn.wq")]);
         let layer = mk_prune_layer(7, "blocks.7.attn");
         let weight_map = WeightMap::default();
 
         match plan_rewrite(&wengert, &layer, &weight_map) {
             PlanResult::Refused(PruneRefusal::AmbiguousPatternMatch {
-                layer_name, h_before_var, candidate_adds, ..
+                layer_name,
+                h_before_var,
+                candidate_adds,
+                ..
             }) => {
                 assert_eq!(layer_name, "blocks.7.attn");
                 assert_eq!(h_before_var, v_hb, "both Adds share the same h_before");
                 assert_eq!(candidate_adds.len(), 2, "expected 2 candidate Adds");
-                assert!(candidate_adds.contains(&3) && candidate_adds.contains(&4),
-                    "expected candidates {{3, 4}}; got {candidate_adds:?}");
+                assert!(
+                    candidate_adds.contains(&3) && candidate_adds.contains(&4),
+                    "expected candidates {{3, 4}}; got {candidate_adds:?}"
+                );
             }
             PlanResult::Ok(plan) => panic!("expected AmbiguousPatternMatch, got Ok({plan:?})"),
             PlanResult::Refused(other) => panic!("expected AmbiguousPatternMatch, got: {other:?}"),
@@ -918,22 +1029,21 @@ mod tests {
         // Prefix match returns zero VarIds → EmptyClosure refusal.
 
         let v_hb: VarId = 100;
-        let v_p:  VarId = 200;
-        let v_y:  VarId = 300;
+        let v_p: VarId = 200;
+        let v_y: VarId = 300;
 
         let ops = vec![
             op_unary(0, v_p, v_hb, PrimalOp::Relu),
-            op_add  (1, v_y, v_hb, v_p),
+            op_add(1, v_y, v_hb, v_p),
         ];
-        let wengert = mk_wengert(
-            ops, v_y,
-            &[(v_hb, "h_before"), (v_p, "blocks.0.attn.wq")],
-        );
-        let layer = mk_prune_layer(99, "blocks.99.attn");  // nonexistent layer
+        let wengert = mk_wengert(ops, v_y, &[(v_hb, "h_before"), (v_p, "blocks.0.attn.wq")]);
+        let layer = mk_prune_layer(99, "blocks.99.attn"); // nonexistent layer
         let weight_map = WeightMap::default();
 
         match plan_rewrite(&wengert, &layer, &weight_map) {
-            PlanResult::Refused(PruneRefusal::EmptyClosure { layer_name, prefix, .. }) => {
+            PlanResult::Refused(PruneRefusal::EmptyClosure {
+                layer_name, prefix, ..
+            }) => {
                 assert_eq!(layer_name, "blocks.99.attn");
                 assert_eq!(prefix, "blocks.99.attn.");
             }
@@ -957,28 +1067,28 @@ mod tests {
         // wengert.output = v_ext. Expected: CrossLayerParam refusal pointing at
         // v_p + op3 (the external consumer).
 
-        let v_hb:  VarId = 100;
-        let v_p:   VarId = 200;  // blocks.7.attn.wq
-        let v_b:   VarId = 201;
-        let v_y:   VarId = 300;
+        let v_hb: VarId = 100;
+        let v_p: VarId = 200; // blocks.7.attn.wq
+        let v_b: VarId = 201;
+        let v_y: VarId = 300;
         let v_ext: VarId = 400;
 
         let ops = vec![
-            op_unary(0, v_p,   v_hb, PrimalOp::Relu),
-            op_unary(1, v_b,   v_p,  PrimalOp::Relu),     // in-layer
-            op_add  (2, v_y,   v_hb, v_b),                // residual boundary
-            op_unary(3, v_ext, v_p,  PrimalOp::Relu),     // external consumer — CROSS-LAYER LEAK
+            op_unary(0, v_p, v_hb, PrimalOp::Relu),
+            op_unary(1, v_b, v_p, PrimalOp::Relu),   // in-layer
+            op_add(2, v_y, v_hb, v_b),               // residual boundary
+            op_unary(3, v_ext, v_p, PrimalOp::Relu), // external consumer — CROSS-LAYER LEAK
         ];
-        let wengert = mk_wengert(
-            ops, v_ext,
-            &[(v_hb, "h_before"), (v_p, "blocks.7.attn.wq")],
-        );
+        let wengert = mk_wengert(ops, v_ext, &[(v_hb, "h_before"), (v_p, "blocks.7.attn.wq")]);
         let layer = mk_prune_layer(7, "blocks.7.attn");
         let weight_map = WeightMap::default();
 
         match plan_rewrite(&wengert, &layer, &weight_map) {
             PlanResult::Refused(PruneRefusal::CrossLayerParam {
-                layer_name, param_var, external_consumer, ..
+                layer_name,
+                param_var,
+                external_consumer,
+                ..
             }) => {
                 assert_eq!(layer_name, "blocks.7.attn");
                 assert_eq!(param_var, v_p, "expected blocks.7.attn.wq VarId");
@@ -999,14 +1109,14 @@ mod tests {
         // suffix; matches the `blocks.N` pattern).
 
         let v_hb: VarId = 100;
-        let v_p:  VarId = 200;
-        let v_y:  VarId = 300;
+        let v_p: VarId = 200;
+        let v_y: VarId = 300;
         let ops = vec![
             op_unary(0, v_p, v_hb, PrimalOp::Relu),
-            op_add  (1, v_y, v_hb, v_p),
+            op_add(1, v_y, v_hb, v_p),
         ];
         let wengert = mk_wengert(ops, v_y, &[(v_hb, "h_before"), (v_p, "blocks.7.wq")]);
-        let layer = mk_prune_layer(7, "blocks.7");   // Block role — no .attn/.ffn suffix
+        let layer = mk_prune_layer(7, "blocks.7"); // Block role — no .attn/.ffn suffix
         let weight_map = WeightMap::default();
 
         match plan_rewrite(&wengert, &layer, &weight_map) {
@@ -1046,20 +1156,16 @@ mod tests {
         // entries both trying to delete the same ops.
 
         let v_hb: VarId = 100;
-        let v_p:  VarId = 200;   // blocks.7.attn.wq
-        let v_b:  VarId = 201;
-        let v_y:  VarId = 300;
+        let v_p: VarId = 200; // blocks.7.attn.wq
+        let v_b: VarId = 201;
+        let v_y: VarId = 300;
 
         let ops = vec![
             op_unary(0, v_p, v_hb, PrimalOp::Relu),
-            op_unary(1, v_b, v_p,  PrimalOp::Relu),
-            op_add  (2, v_y, v_hb, v_b),
+            op_unary(1, v_b, v_p, PrimalOp::Relu),
+            op_add(2, v_y, v_hb, v_b),
         ];
-        let mut wengert = mk_wengert(
-            ops,
-            v_y,
-            &[(v_hb, "h_before"), (v_p, "blocks.7.attn.wq")],
-        );
+        let mut wengert = mk_wengert(ops, v_y, &[(v_hb, "h_before"), (v_p, "blocks.7.attn.wq")]);
 
         // Plan with two prune decisions whose closures overlap (same layer name
         // — they'd both claim the same closure ops).
@@ -1075,7 +1181,9 @@ mod tests {
         let result = run(&mut wengert, &plan, &WeightMap::default());
 
         // Expect at least one ConflictingPruneDecisions refusal.
-        let found_conflict = result.refusals.iter()
+        let found_conflict = result
+            .refusals
+            .iter()
             .any(|r| matches!(r, PruneRefusal::ConflictingPruneDecisions { .. }));
         assert!(
             found_conflict,
@@ -1085,14 +1193,16 @@ mod tests {
 
         // Dry-run invariant (spec §5.3 Phase 2): on refusal, wengert is unchanged.
         assert_eq!(
-            wengert.ops.len(), 3,
+            wengert.ops.len(),
+            3,
             "wengert should be untouched on refusal (spec §5.3 Phase 2); still has {} ops",
             wengert.ops.len(),
         );
 
         // And result.rewrites must be empty per the dry-run contract.
         assert_eq!(
-            result.rewrites.len(), 0,
+            result.rewrites.len(),
+            0,
             "expected empty rewrites on refusal; got {}",
             result.rewrites.len(),
         );
@@ -1113,22 +1223,26 @@ mod tests {
         //   - op3's input v_ha is repointed to v_hb
         //   - wengert.output stays v_out (op3 survives)
 
-        let v_hb:  VarId = 100;
-        let v0:    VarId = 200;
-        let v1:    VarId = 201;
-        let v_ha:  VarId = 202;
+        let v_hb: VarId = 100;
+        let v0: VarId = 200;
+        let v1: VarId = 201;
+        let v_ha: VarId = 202;
         let v_out: VarId = 300;
 
         let ops = vec![
-            op_unary(0, v0,    v_hb, PrimalOp::Relu),
-            op_unary(1, v1,    v0,   PrimalOp::Relu),
-            op_add  (2, v_ha,  v_hb, v1),
+            op_unary(0, v0, v_hb, PrimalOp::Relu),
+            op_unary(1, v1, v0, PrimalOp::Relu),
+            op_add(2, v_ha, v_hb, v1),
             op_unary(3, v_out, v_ha, PrimalOp::Relu),
         ];
         let mut wengert = mk_wengert(
             ops,
             v_out,
-            &[(v_hb, "h_before"), (v0, "blocks.7.attn.wq"), (v_ha, "h_after")],
+            &[
+                (v_hb, "h_before"),
+                (v0, "blocks.7.attn.wq"),
+                (v_ha, "h_after"),
+            ],
         );
         let plan = AppliedPlan {
             layers: vec![mk_prune_layer(7, "blocks.7.attn")],
@@ -1144,14 +1258,23 @@ mod tests {
             result.refusals,
         );
         assert_eq!(result.rewrites.len(), 1);
-        assert_eq!(result.ops_deleted, 3, "closure=2 (op0+op1) + residual Add (op2) = 3");
+        assert_eq!(
+            result.ops_deleted, 3,
+            "closure=2 (op0+op1) + residual Add (op2) = 3"
+        );
 
         // Exactly one op survives: op3 (the downstream consumer).
-        assert_eq!(wengert.ops.len(), 1, "expected only op3 to survive; got {}", wengert.ops.len());
+        assert_eq!(
+            wengert.ops.len(),
+            1,
+            "expected only op3 to survive; got {}",
+            wengert.ops.len()
+        );
         let surviving = &wengert.ops[0];
         assert_eq!(surviving.id, 3);
         assert_eq!(
-            surviving.inputs, vec![v_hb],
+            surviving.inputs,
+            vec![v_hb],
             "downstream consumer must be aliased from v_ha to v_hb"
         );
 
@@ -1177,18 +1300,14 @@ mod tests {
         //   - wengert.output repointed to v_hb
 
         let v_hb: VarId = 100;
-        let v0:   VarId = 200;
+        let v0: VarId = 200;
         let v_ha: VarId = 201;
 
         let ops = vec![
-            op_unary(0, v0,   v_hb, PrimalOp::Relu),
-            op_add  (1, v_ha, v_hb, v0),
+            op_unary(0, v0, v_hb, PrimalOp::Relu),
+            op_add(1, v_ha, v_hb, v0),
         ];
-        let mut wengert = mk_wengert(
-            ops,
-            v_ha,
-            &[(v_hb, "h_before"), (v0, "blocks.7.attn.wq")],
-        );
+        let mut wengert = mk_wengert(ops, v_ha, &[(v_hb, "h_before"), (v0, "blocks.7.attn.wq")]);
         let plan = AppliedPlan {
             layers: vec![mk_prune_layer(7, "blocks.7.attn")],
             total_us: 0.0,
@@ -1199,7 +1318,10 @@ mod tests {
 
         assert!(result.refusals.is_empty(), "expected no refusals");
         assert_eq!(wengert.ops.len(), 0, "all ops deleted");
-        assert_eq!(wengert.output, v_hb, "wengert.output repointed from v_ha to v_hb");
+        assert_eq!(
+            wengert.output, v_hb,
+            "wengert.output repointed from v_ha to v_hb"
+        );
     }
 
     #[test]
@@ -1214,31 +1336,33 @@ mod tests {
         // Expected refusal: NoResidualAdd with closure_size = 3.
 
         let v_hb: VarId = 100;
-        let v0:   VarId = 200;
-        let v1:   VarId = 201;
-        let v2:   VarId = 202;
+        let v0: VarId = 200;
+        let v1: VarId = 201;
+        let v2: VarId = 202;
 
         let ops = vec![
             op_unary(0, v0, v_hb, PrimalOp::Relu),
-            op_unary(1, v1, v0,   PrimalOp::Relu),
-            op_unary(2, v2, v1,   PrimalOp::Relu),
+            op_unary(1, v1, v0, PrimalOp::Relu),
+            op_unary(2, v2, v1, PrimalOp::Relu),
         ];
-        let wengert = mk_wengert(
-            ops,
-            v2,
-            &[(v_hb, "h_before"), (v0, "blocks.7.attn.wq")],
-        );
+        let wengert = mk_wengert(ops, v2, &[(v_hb, "h_before"), (v0, "blocks.7.attn.wq")]);
         let layer = mk_prune_layer(7, "blocks.7.attn");
         let weight_map = WeightMap::default();
 
         match plan_rewrite(&wengert, &layer, &weight_map) {
-            PlanResult::Refused(PruneRefusal::NoResidualAdd { layer_name, closure_size, .. }) => {
+            PlanResult::Refused(PruneRefusal::NoResidualAdd {
+                layer_name,
+                closure_size,
+                ..
+            }) => {
                 assert_eq!(layer_name, "blocks.7.attn");
                 assert_eq!(closure_size, 3,
                     "all 3 Relu ops are in the closure (no Add to terminate at); got {closure_size}");
             }
             PlanResult::Ok(plan) => panic!("expected NoResidualAdd refusal, got Ok({plan:?})"),
-            PlanResult::Refused(other) => panic!("expected NoResidualAdd refusal, got other variant: {other:?}"),
+            PlanResult::Refused(other) => {
+                panic!("expected NoResidualAdd refusal, got other variant: {other:?}")
+            }
         }
     }
 }

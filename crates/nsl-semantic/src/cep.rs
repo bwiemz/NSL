@@ -124,8 +124,7 @@ pub fn validate_cep_prune_decorator(
                                 ExprKind::StringLiteral(s) => preserve.push(s.clone()),
                                 _ => diagnostics.push(
                                     Diagnostic::error(
-                                        "@cep_prune: preserve entries must be strings"
-                                            .to_string(),
+                                        "@cep_prune: preserve entries must be strings".to_string(),
                                     )
                                     .with_label(item.span, "expected string"),
                                 ),
@@ -223,10 +222,8 @@ pub fn validate_cep_search_decorator(
                     ExprKind::Ident(sym) => target = Some(*sym),
                     ExprKind::StringLiteral(_) => target = Some(*name_sym),
                     _ => diagnostics.push(
-                        Diagnostic::error(
-                            "@cep_search: target must be an identifier".to_string(),
-                        )
-                        .with_label(arg.span, "expected ident"),
+                        Diagnostic::error("@cep_search: target must be an identifier".to_string())
+                            .with_label(arg.span, "expected ident"),
                     ),
                 },
                 "objective" => {

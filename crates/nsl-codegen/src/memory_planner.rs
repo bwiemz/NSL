@@ -45,8 +45,10 @@ pub fn apply_wrga_hints(plan: &crate::wrga::WrgaPlan) -> usize {
     let mem = &plan.memory;
 
     // Group WRGA assignments by WRGA slot id.
-    let mut wrga_groups: HashMap<crate::wrga_memory::SlotId, Vec<&crate::wrga_memory::SlotAssignment>> =
-        HashMap::new();
+    let mut wrga_groups: HashMap<
+        crate::wrga_memory::SlotId,
+        Vec<&crate::wrga_memory::SlotAssignment>,
+    > = HashMap::new();
     for a in &mem.assignments {
         wrga_groups.entry(a.slot).or_default().push(a);
     }
@@ -105,10 +107,7 @@ pub fn apply_wrga_hints(plan: &crate::wrga::WrgaPlan) -> usize {
 /// WRGA Milestone B.2 Task 3: free-function shim around
 /// `LivenessAnalyzer::consume_hints`, mirroring `apply_wrga_hints`'s
 /// call site in `stmt.rs`.
-pub fn consume_hints(
-    allocator: &mut LivenessAnalyzer,
-    plan: &crate::wrga::WrgaPlan,
-) -> usize {
+pub fn consume_hints(allocator: &mut LivenessAnalyzer, plan: &crate::wrga::WrgaPlan) -> usize {
     allocator.consume_hints(plan)
 }
 
@@ -116,11 +115,7 @@ pub fn consume_hints(
 /// slot.  Requires: WRGA already agreed they don't overlap (implicit via
 /// shared WRGA slot), byte sizes equal, and `[birth, death]` intervals do
 /// not overlap (belt-and-braces check).
-fn try_merge_pair(
-    assignments: &[crate::wrga_memory::SlotAssignment],
-    a: usize,
-    b: usize,
-) -> bool {
+fn try_merge_pair(assignments: &[crate::wrga_memory::SlotAssignment], a: usize, b: usize) -> bool {
     let aa = &assignments[a];
     let bb = &assignments[b];
     if aa.size_bytes != bb.size_bytes || aa.size_bytes == 0 {
@@ -135,7 +130,6 @@ fn try_merge_pair(
     }
     true
 }
-
 
 // ---------------------------------------------------------------------------
 // Types
@@ -252,20 +246,29 @@ impl LivenessAnalyzer {
 
     /// Try to fold `var`'s real slot into `target`. Requires equal sizes
     /// and a live target slot; returns false otherwise.
-    pub fn try_merge_activation_into_slot(
-        &mut self,
-        var: VarId,
-        target: RealSlotId,
-    ) -> bool {
-        let Some(source) = self.real_slot_for_activation(var) else { return false; };
-        if source == target { return false; }
-        let Some(&src_size) = self.slot_sizes.get(&source) else { return false; };
-        let Some(&tgt_size) = self.slot_sizes.get(&target) else { return false; };
-        if src_size != tgt_size { return false; }
+    pub fn try_merge_activation_into_slot(&mut self, var: VarId, target: RealSlotId) -> bool {
+        let Some(source) = self.real_slot_for_activation(var) else {
+            return false;
+        };
+        if source == target {
+            return false;
+        }
+        let Some(&src_size) = self.slot_sizes.get(&source) else {
+            return false;
+        };
+        let Some(&tgt_size) = self.slot_sizes.get(&target) else {
+            return false;
+        };
+        if src_size != tgt_size {
+            return false;
+        }
         self.slots.insert(AllocationKey::Activation(var), target);
         self.slot_sizes.remove(&source);
         if let Some(src_liv) = self.slot_liveness.remove(&source) {
-            self.slot_liveness.entry(target).or_default().extend(src_liv);
+            self.slot_liveness
+                .entry(target)
+                .or_default()
+                .extend(src_liv);
         }
         true
     }
@@ -288,23 +291,35 @@ impl LivenessAnalyzer {
         crate::debug_bump_consume_hints_calls();
 
         for (_wrga_slot, group) in by_wrga_slot {
-            if group.len() < 2 { continue; }
+            if group.len() < 2 {
+                continue;
+            }
             let (first_var, first_birth, first_death, first_size) = group[0];
-            let Some(target) = self.real_slot_for_activation(first_var) else { continue; };
+            let Some(target) = self.real_slot_for_activation(first_var) else {
+                continue;
+            };
             // Seed target liveness with the anchor's range.
             self.slot_liveness
                 .entry(target)
                 .or_default()
                 .push((first_birth, first_death));
             for &(other_var, o_birth, o_death, o_size) in &group[1..] {
-                if o_size != first_size { continue; }
-                let overlap = self.slot_liveness
+                if o_size != first_size {
+                    continue;
+                }
+                let overlap = self
+                    .slot_liveness
                     .get(&target)
                     .map(|ranges| ranges.iter().any(|&(b, d)| !(o_death <= b || d <= o_birth)))
                     .unwrap_or(false);
-                if overlap { continue; }
+                if overlap {
+                    continue;
+                }
                 if self.try_merge_activation_into_slot(other_var, target) {
-                    self.slot_liveness.entry(target).or_default().push((o_birth, o_death));
+                    self.slot_liveness
+                        .entry(target)
+                        .or_default()
+                        .push((o_birth, o_death));
                 }
             }
         }
@@ -846,7 +861,7 @@ fn dtype_byte_size(dtype: &nsl_semantic::types::DType) -> u64 {
         DType::Fp16 | DType::Bf16 | DType::Int16 => 2,
         DType::Int8 | DType::Uint8 | DType::Bool => 1,
         DType::Fp8E4m3 | DType::Fp8E5m2 => 1,
-        DType::Int4 => 1,                       // rounded up
+        DType::Int4 => 1, // rounded up
         // M35.1 BitNet: ternary storage atom is 1 byte (packed 2-bit×4 trits; unpacked i8).
         DType::TernaryPacked | DType::TernaryUnpacked => 1,
         DType::Custom(_) | DType::Unknown => 4, // default to f32 size for unknown dtypes
@@ -2010,10 +2025,7 @@ mod wrga_hints_unit_tests {
 
     #[test]
     fn try_merge_pair_refuses_zero_size() {
-        let assignments = vec![
-            mk_assignment(1, 0, 0, 0, 5),
-            mk_assignment(2, 0, 0, 10, 15),
-        ];
+        let assignments = vec![mk_assignment(1, 0, 0, 0, 5), mk_assignment(2, 0, 0, 10, 15)];
         assert!(
             !try_merge_pair(&assignments, 0, 1),
             "zero size must refuse (guard against unallocated)"
@@ -2048,8 +2060,20 @@ mod consume_hints_tests {
         let mut plan = crate::wrga::WrgaPlan::test_dummy();
         plan.memory = MemoryPlan {
             assignments: vec![
-                SlotAssignment { var: 1, slot: 0, size_bytes: 64, birth: 0, death: 5 },
-                SlotAssignment { var: 2, slot: 0, size_bytes: 64, birth: 10, death: 15 },
+                SlotAssignment {
+                    var: 1,
+                    slot: 0,
+                    size_bytes: 64,
+                    birth: 0,
+                    death: 5,
+                },
+                SlotAssignment {
+                    var: 2,
+                    slot: 0,
+                    size_bytes: 64,
+                    birth: 10,
+                    death: 15,
+                },
             ],
             stats: MemoryPlanStats::default(),
         };
@@ -2100,9 +2124,21 @@ mod consume_hints_tests {
         let mut plan = crate::wrga::WrgaPlan::test_dummy();
         plan.memory = crate::wrga_memory::MemoryPlan {
             assignments: vec![
-                crate::wrga_memory::SlotAssignment { var: 1, slot: 0, size_bytes: 64, birth: 0, death: 5 },
+                crate::wrga_memory::SlotAssignment {
+                    var: 1,
+                    slot: 0,
+                    size_bytes: 64,
+                    birth: 0,
+                    death: 5,
+                },
                 // birth == death of previous slot → adjacent, not overlapping (half-open)
-                crate::wrga_memory::SlotAssignment { var: 2, slot: 0, size_bytes: 64, birth: 5, death: 10 },
+                crate::wrga_memory::SlotAssignment {
+                    var: 2,
+                    slot: 0,
+                    size_bytes: 64,
+                    birth: 5,
+                    death: 10,
+                },
             ],
             stats: crate::wrga_memory::MemoryPlanStats::default(),
         };

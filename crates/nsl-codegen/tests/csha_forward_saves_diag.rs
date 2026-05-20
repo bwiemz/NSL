@@ -27,17 +27,17 @@ use std::ffi::CString;
 
 use nsl_codegen::flash_attention::{CshaExtras, FlashAttentionConfig, RopeStyle};
 use nsl_codegen::flash_attention_v2::{
-    flash_attention_kernel_name_v2, synthesize_flash_attention_ptx_v2,
+    flash_attention_kernel_name_v2,
     smem_layout::{self, needs_dynamic_smem, Direction},
+    synthesize_flash_attention_ptx_v2,
 };
 
-use nsl_runtime::{
-    nsl_cuda_init, nsl_test_cuda_alloc, nsl_test_cuda_d2h,
-    nsl_test_cuda_free, nsl_test_cuda_h2d,
-};
 use nsl_runtime::flash_attention::{
     nsl_csha_alloc_backward_activations, nsl_csha_free_backward_activations,
     nsl_flash_attention_csha_with_saves,
+};
+use nsl_runtime::{
+    nsl_cuda_init, nsl_test_cuda_alloc, nsl_test_cuda_d2h, nsl_test_cuda_free, nsl_test_cuda_h2d,
 };
 
 fn f16_to_f32(bits: u16) -> f32 {
@@ -45,10 +45,15 @@ fn f16_to_f32(bits: u16) -> f32 {
     let exp = ((bits >> 10) & 0x1f) as u32;
     let mant = (bits & 0x3ff) as u32;
     let f32_bits = if exp == 0 {
-        if mant == 0 { sign << 31 } else {
+        if mant == 0 {
+            sign << 31
+        } else {
             let mut m = mant;
             let mut e: i32 = -1;
-            while m & 0x400 == 0 { m <<= 1; e -= 1; }
+            while m & 0x400 == 0 {
+                m <<= 1;
+                e -= 1;
+            }
             let e = (127 + e - 14) as u32;
             (sign << 31) | (e << 23) | ((m & 0x3ff) << 13)
         }
@@ -62,12 +67,16 @@ fn f16_to_f32(bits: u16) -> f32 {
 }
 
 fn f32_to_f16_bits(x: f32) -> u16 {
-    if x.is_nan() { return 0x7E00; }
+    if x.is_nan() {
+        return 0x7E00;
+    }
     let b = x.to_bits();
     let sign = (b >> 31) & 1;
     let exp = ((b >> 23) & 0xFF) as i32;
     let mant = b & 0x7FFFFF;
-    if exp == 255 { return ((sign << 15) | 0x7C00 | if mant != 0 { 0x200 } else { 0 }) as u16; }
+    if exp == 255 {
+        return ((sign << 15) | 0x7C00 | if mant != 0 { 0x200 } else { 0 }) as u16;
+    }
     let exp_f16 = exp - 127 + 15;
     if exp_f16 <= 0 {
         let shift = (1 - exp_f16).min(24) as u32;
@@ -75,7 +84,9 @@ fn f32_to_f16_bits(x: f32) -> u16 {
         let rounded = (shifted + 0x1000) >> 13;
         return ((sign << 15) | rounded) as u16;
     }
-    if exp_f16 >= 31 { return ((sign << 15) | 0x7C00) as u16; }
+    if exp_f16 >= 31 {
+        return ((sign << 15) | 0x7C00) as u16;
+    }
     let mant16 = (mant + 0x1000) >> 13;
     let overflow = (mant16 >> 10) & 1;
     let exp16 = (exp_f16 as u32 + overflow) & 0x1F;
@@ -84,30 +95,44 @@ fn f32_to_f16_bits(x: f32) -> u16 {
 
 fn det_seq(seed: u32, n: usize) -> Vec<f32> {
     let mut s = seed;
-    (0..n).map(|_| {
-        s = s.wrapping_mul(1_103_515_245).wrapping_add(12_345);
-        ((s >> 16) as f32 / 65535.0) - 0.5
-    }).collect()
+    (0..n)
+        .map(|_| {
+            s = s.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            ((s >> 16) as f32 / 65535.0) - 0.5
+        })
+        .collect()
 }
 
 fn cuda_available() -> bool {
-    if std::env::var("NSL_SKIP_CUDA_TESTS").is_ok() { return false; }
+    if std::env::var("NSL_SKIP_CUDA_TESTS").is_ok() {
+        return false;
+    }
     unsafe { nsl_cuda_init() == 0 }
 }
 
 fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b.iter()).map(|(&x, &y)| (x - y).abs()).fold(0f32, f32::max)
+    a.iter()
+        .zip(b.iter())
+        .map(|(&x, &y)| (x - y).abs())
+        .fold(0f32, f32::max)
 }
 
 fn dump_pair(name: &str, gpu: &[f32], cpu: &[f32], n: usize) {
     let n = n.min(gpu.len()).min(cpu.len());
     let mut buf = String::new();
     for i in 0..n {
-        buf.push_str(&format!("    [{i:2}] gpu={:+.4} cpu={:+.4} diff={:+.3e}\n",
-            gpu[i], cpu[i], gpu[i] - cpu[i]));
+        buf.push_str(&format!(
+            "    [{i:2}] gpu={:+.4} cpu={:+.4} diff={:+.3e}\n",
+            gpu[i],
+            cpu[i],
+            gpu[i] - cpu[i]
+        ));
     }
     let mad = max_abs_diff(gpu, cpu);
-    eprintln!("[diag] {name}: max_abs_diff={mad:.3e}  (elems={})\n{buf}", gpu.len());
+    eprintln!(
+        "[diag] {name}: max_abs_diff={mad:.3e}  (elems={})\n{buf}",
+        gpu.len()
+    );
 }
 
 #[test]
@@ -132,10 +157,18 @@ fn forward_saves_match_cpu_reference() {
     let kv_dim = heads * head_dim;
 
     let config = FlashAttentionConfig {
-        block_q: block_q as i64, block_kv: block_kv as i64, head_dim: head_dim as i64,
-        causal: false, paged: false, rope_q: false,
+        block_q: block_q as i64,
+        block_kv: block_kv as i64,
+        head_dim: head_dim as i64,
+        causal: false,
+        paged: false,
+        rope_q: false,
         rope_style: RopeStyle::Adjacent,
-        gqa_group_size: 1, tree_mask: false, gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras {
+        gqa_group_size: 1,
+        tree_mask: false,
+        gpu_sm: 75,
+        segment_masked: false,
+        csha: Some(CshaExtras {
             level: 2,
             fused_rmsnorm: true,
             fused_projections: true,
@@ -177,8 +210,10 @@ fn forward_saves_match_cpu_reference() {
         for i in 0..m {
             for j in 0..n {
                 let mut sum = 0.0f32;
-                for p in 0..k { sum += a[i*k+p] * b[p*n+j]; }
-                c[i*n+j] = sum;
+                for p in 0..k {
+                    sum += a[i * k + p] * b[p * n + j];
+                }
+                c[i * n + j] = sum;
             }
         }
         c
@@ -197,8 +232,8 @@ fn forward_saves_match_cpu_reference() {
             for j in 0..seq {
                 let mut dot = 0.0f32;
                 for d in 0..head_dim {
-                    dot += q_cpu[i*kv_dim + h*head_dim + d]
-                         * k_cpu[j*kv_dim + h*head_dim + d];
+                    dot +=
+                        q_cpu[i * kv_dim + h * head_dim + d] * k_cpu[j * kv_dim + h * head_dim + d];
                 }
                 s_row[j] = dot * scale;
             }
@@ -231,7 +266,9 @@ fn forward_saves_match_cpu_reference() {
     let v_cpu_save = reshape_to_save_layout(&v_cpu);
 
     // ── GPU forward-with-saves ──────────────────────────────────────────────
-    unsafe { nsl_cuda_init(); }
+    unsafe {
+        nsl_cuda_init();
+    }
     let qkv_bytes = (heads * seq * head_dim * 2) as i64;
     let lse_bytes = (batch * heads * seq * 4) as i64;
     let x_bytes = (heads * seq * head_dim * 4) as i64;
@@ -253,13 +290,11 @@ fn forward_saves_match_cpu_reference() {
     let sin_dev = unsafe { nsl_test_cuda_alloc(rope_bytes) };
 
     let saves = unsafe {
-        nsl_csha_alloc_backward_activations(
-            batch as i64, heads as i64, seq as i64, head_dim as i64,
-        )
+        nsl_csha_alloc_backward_activations(batch as i64, heads as i64, seq as i64, head_dim as i64)
     };
 
     unsafe {
-        nsl_test_cuda_h2d(x_dev,  x.as_ptr()  as i64, x_bytes);
+        nsl_test_cuda_h2d(x_dev, x.as_ptr() as i64, x_bytes);
         nsl_test_cuda_h2d(wq_dev, wq_f16.as_ptr() as i64, w_bytes);
         nsl_test_cuda_h2d(wk_dev, wk_f16.as_ptr() as i64, w_bytes);
         nsl_test_cuda_h2d(wv_dev, wv_f16.as_ptr() as i64, w_bytes);
@@ -271,25 +306,52 @@ fn forward_saves_match_cpu_reference() {
     let ptx = synthesize_flash_attention_ptx_v2(&config);
     let name = CString::new(flash_attention_kernel_name_v2(&config)).unwrap();
     let smem_total = smem_layout::total_bytes(&config);
-    let smem_dyn = if needs_dynamic_smem(&config) { smem_total as i64 } else { 0 };
+    let smem_dyn = if needs_dynamic_smem(&config) {
+        smem_total as i64
+    } else {
+        0
+    };
 
     let rc = unsafe {
         nsl_flash_attention_csha_with_saves(
-            q_dev, k_dev, v_dev, out_dev, lse_dev,
+            q_dev,
+            k_dev,
+            v_dev,
+            out_dev,
+            lse_dev,
             scale.to_bits() as i64,
-            batch as i64, heads as i64, seq as i64, head_dim as i64,
-            0, 0, 0, 0,
-            cos_dev, sin_dev,
-            0, 0,
-            smem_dyn,
-            ptx.as_ptr() as i64, name.as_ptr() as i64,
-            block_q as i64, block_kv as i64,
+            batch as i64,
+            heads as i64,
+            seq as i64,
+            head_dim as i64,
             0,
-            x_dev, nw_dev, wq_dev, wk_dev, wv_dev,
-            0, norm_eps.to_bits() as i64,
-            heads as i64, d_model as i64,
-            saves.q_proj, saves.k_proj, saves.v_proj,
-            saves.row_max, saves.row_sum,
+            0,
+            0,
+            0,
+            cos_dev,
+            sin_dev,
+            0,
+            0,
+            smem_dyn,
+            ptx.as_ptr() as i64,
+            name.as_ptr() as i64,
+            block_q as i64,
+            block_kv as i64,
+            0,
+            x_dev,
+            nw_dev,
+            wq_dev,
+            wk_dev,
+            wv_dev,
+            0,
+            norm_eps.to_bits() as i64,
+            heads as i64,
+            d_model as i64,
+            saves.q_proj,
+            saves.k_proj,
+            saves.v_proj,
+            saves.row_max,
+            saves.row_sum,
             saves.x_raw,
         )
     };
@@ -297,15 +359,19 @@ fn forward_saves_match_cpu_reference() {
 
     // Read back saves.
     let qkv_elems = batch * heads * seq * head_dim;
-    let rm_elems  = batch * heads * seq;
+    let rm_elems = batch * heads * seq;
     let read_f16 = |dev: i64, n: usize| -> Vec<f32> {
         let mut raw = vec![0u16; n];
-        unsafe { nsl_test_cuda_d2h(raw.as_mut_ptr() as i64, dev, (n * 2) as i64); }
+        unsafe {
+            nsl_test_cuda_d2h(raw.as_mut_ptr() as i64, dev, (n * 2) as i64);
+        }
         raw.iter().map(|&b| f16_to_f32(b)).collect()
     };
     let read_f32 = |dev: i64, n: usize| -> Vec<f32> {
         let mut out = vec![0f32; n];
-        unsafe { nsl_test_cuda_d2h(out.as_mut_ptr() as i64, dev, (n * 4) as i64); }
+        unsafe {
+            nsl_test_cuda_d2h(out.as_mut_ptr() as i64, dev, (n * 4) as i64);
+        }
         out
     };
     let q_gpu = read_f16(saves.q_proj, qkv_elems);
@@ -322,9 +388,13 @@ fn forward_saves_match_cpu_reference() {
 
     unsafe {
         nsl_csha_free_backward_activations(saves);
-        for p in [q_dev, k_dev, v_dev, out_dev, lse_dev, x_dev, nw_dev,
-                  wq_dev, wk_dev, wv_dev, cos_dev, sin_dev] {
-            if p != 0 { nsl_test_cuda_free(p); }
+        for p in [
+            q_dev, k_dev, v_dev, out_dev, lse_dev, x_dev, nw_dev, wq_dev, wk_dev, wv_dev, cos_dev,
+            sin_dev,
+        ] {
+            if p != 0 {
+                nsl_test_cuda_free(p);
+            }
         }
     }
 }

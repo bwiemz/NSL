@@ -59,6 +59,8 @@ fn phase_markers_annotate_rows() {
         plan: &plan,
         phase_markers: vec![(0, "forward_start".into()), (5, "loss".into())],
     });
-    assert!(tl.iter().any(|e| e.phase.as_deref() == Some("forward_start")));
+    assert!(tl
+        .iter()
+        .any(|e| e.phase.as_deref() == Some("forward_start")));
     assert!(tl.iter().any(|e| e.phase.as_deref() == Some("loss")));
 }

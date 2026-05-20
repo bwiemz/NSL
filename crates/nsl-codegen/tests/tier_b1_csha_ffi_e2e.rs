@@ -32,15 +32,14 @@ mod csha_reference;
 use csha_reference::{csha_reference, CshaInputs, CshaShape};
 
 use nsl_codegen::flash_attention::{CshaExtras, FlashAttentionConfig, RopeStyle};
-use nsl_codegen::flash_attention_v2::{
-    flash_attention_kernel_name_v2, shared_mem_bytes_v2,
-    synthesize_flash_attention_ptx_v2,
-};
 use nsl_codegen::flash_attention_v2::smem_layout::tier_b1_total_smem_bytes;
+use nsl_codegen::flash_attention_v2::{
+    flash_attention_kernel_name_v2, shared_mem_bytes_v2, synthesize_flash_attention_ptx_v2,
+};
 use nsl_runtime::flash_attention::nsl_flash_attention_csha;
 use nsl_runtime::{
-    nsl_cuda_init, nsl_test_cuda_alloc, nsl_test_cuda_d2h, nsl_test_cuda_free,
-    nsl_test_cuda_h2d, nsl_test_cuda_jit_log,
+    nsl_cuda_init, nsl_test_cuda_alloc, nsl_test_cuda_d2h, nsl_test_cuda_free, nsl_test_cuda_h2d,
+    nsl_test_cuda_jit_log,
 };
 use std::ffi::CString;
 
@@ -166,7 +165,12 @@ fn tier_b1_through_csha_ffi_matches_cpu_reference() {
             sin: &sin,
         },
         &CshaShape {
-            seq, heads, head_dim, d_model, causal, norm_eps,
+            seq,
+            heads,
+            head_dim,
+            d_model,
+            causal,
+            norm_eps,
         },
     );
 
@@ -190,9 +194,15 @@ fn tier_b1_through_csha_ffi_matches_cpu_reference() {
     let out_dev = unsafe { nsl_test_cuda_alloc(out_bytes) };
     let lse_dev = unsafe { nsl_test_cuda_alloc(lse_bytes) };
 
-    let all_ptrs = [x_dev, nw_dev, wq_dev, wk_dev, wv_dev, q_dev, k_dev, v_dev, out_dev, lse_dev];
+    let all_ptrs = [
+        x_dev, nw_dev, wq_dev, wk_dev, wv_dev, q_dev, k_dev, v_dev, out_dev, lse_dev,
+    ];
     if !all_ptrs.iter().all(|&p| p != 0) {
-        for &p in &all_ptrs { if p != 0 { unsafe { nsl_test_cuda_free(p) }; } }
+        for &p in &all_ptrs {
+            if p != 0 {
+                unsafe { nsl_test_cuda_free(p) };
+            }
+        }
         panic!("device alloc returned null");
     }
 
@@ -210,8 +220,12 @@ fn tier_b1_through_csha_ffi_matches_cpu_reference() {
     // `skip_rmsnorm_prologue=true` for this path so the kernel does
     // NOT re-RMSNormalize (the runtime FFI's pre-pass already did).
     let mut ptx = synthesize_flash_attention_ptx_v2(&config);
-    while ptx.last() == Some(&0) { ptx.pop(); }
-    if ptx.last() != Some(&b'\n') { ptx.push(b'\n'); }
+    while ptx.last() == Some(&0) {
+        ptx.pop();
+    }
+    if ptx.last() != Some(&b'\n') {
+        ptx.push(b'\n');
+    }
     let dump = std::env::temp_dir().join("tier_b1_csha_ffi_e2e.ptx");
     std::fs::write(&dump, &ptx).ok();
     eprintln!("[csha-ffi] PTX dumped to {}", dump.display());
@@ -239,22 +253,45 @@ fn tier_b1_through_csha_ffi_matches_cpu_reference() {
 
     // ---- Launch through the production FFI ----
     let rc = nsl_flash_attention_csha(
-        q_dev, k_dev, v_dev, out_dev, lse_dev,
+        q_dev,
+        k_dev,
+        v_dev,
+        out_dev,
+        lse_dev,
         scale.to_bits() as i64,
-        batch as i64, heads as i64, seq as i64, head_dim as i64,
-        0, 0, 0, 0,             // paging
-        0, 0, 0, 0,             // rope + ragged
+        batch as i64,
+        heads as i64,
+        seq as i64,
+        head_dim as i64,
+        0,
+        0,
+        0,
+        0, // paging
+        0,
+        0,
+        0,
+        0, // rope + ragged
         smem,
         ptx.as_ptr() as i64,
         kernel_name.as_ptr() as i64,
-        config.block_q as i64, config.block_kv as i64,
+        config.block_q as i64,
+        config.block_kv as i64,
         if causal { 1 } else { 0 },
         // CSHA extras: x, norm_weight, wq, wk, wv, wo, eps, ah, dm
-        x_dev, nw_dev, wq_dev, wk_dev, wv_dev, 0,
+        x_dev,
+        nw_dev,
+        wq_dev,
+        wk_dev,
+        wv_dev,
+        0,
         norm_eps.to_bits() as i64,
-        0, d_model as i64,
+        0,
+        d_model as i64,
         // segment_ids_ptr, tier_b sentinels, doc_starts
-        0, 0, 0, 0,
+        0,
+        0,
+        0,
+        0,
     );
 
     if rc != 0 {
@@ -268,7 +305,9 @@ fn tier_b1_through_csha_ffi_matches_cpu_reference() {
         } else {
             "<no log>".into()
         };
-        for &p in &all_ptrs { unsafe { nsl_test_cuda_free(p) }; }
+        for &p in &all_ptrs {
+            unsafe { nsl_test_cuda_free(p) };
+        }
         panic!("csha FFI launch rc={}\nJIT log:\n{}", rc, log);
     }
 
@@ -277,7 +316,9 @@ fn tier_b1_through_csha_ffi_matches_cpu_reference() {
     unsafe { nsl_test_cuda_d2h(out_f16.as_mut_ptr() as i64, out_dev, out_bytes) };
     let out_gpu: Vec<f32> = out_f16.iter().map(|&b| f16_to_f32(b)).collect();
 
-    for &p in &all_ptrs { unsafe { nsl_test_cuda_free(p) }; }
+    for &p in &all_ptrs {
+        unsafe { nsl_test_cuda_free(p) };
+    }
 
     let mut max_abs = 0f32;
     let mut sum_abs = 0f32;
@@ -307,8 +348,14 @@ fn tier_b1_through_csha_ffi_matches_cpu_reference() {
             max_idx, out_gpu[max_idx], cpu_out[max_idx]
         );
     }
-    eprintln!("\n[csha-ffi] first 8 GPU: {:?}", &out_gpu[..8.min(out_gpu.len())]);
-    eprintln!("[csha-ffi] first 8 CPU: {:?}", &cpu_out[..8.min(cpu_out.len())]);
+    eprintln!(
+        "\n[csha-ffi] first 8 GPU: {:?}",
+        &out_gpu[..8.min(out_gpu.len())]
+    );
+    eprintln!(
+        "[csha-ffi] first 8 CPU: {:?}",
+        &cpu_out[..8.min(cpu_out.len())]
+    );
 
     assert_eq!(n_nan, 0, "FFI path produced {} non-finite outputs", n_nan);
     // Same tolerance as `tier_b1_full_kernel_e2e` — the production FFI
@@ -319,12 +366,14 @@ fn tier_b1_through_csha_ffi_matches_cpu_reference() {
     assert!(
         max_abs <= MAX_ABS_TOL,
         "FFI-path max_abs {} > {} tolerance",
-        max_abs, MAX_ABS_TOL
+        max_abs,
+        MAX_ABS_TOL
     );
     assert!(
         mean_abs <= MEAN_ABS_TOL,
         "FFI-path mean_abs {} > {} tolerance",
-        mean_abs, MEAN_ABS_TOL
+        mean_abs,
+        MEAN_ABS_TOL
     );
     eprintln!(
         "[csha-ffi] PASS (max_abs={:.4e} ≤ {:.4e}; mean_abs={:.4e} ≤ {:.4e})",

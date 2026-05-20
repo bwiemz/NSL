@@ -4,7 +4,11 @@ use nsl_errors::{BytePos, Diagnostic};
 
 /// Lex a number literal starting at the current cursor position.
 /// The cursor should be positioned at the first digit.
-pub fn lex_number(cursor: &mut Cursor, start: BytePos, diagnostics: &mut Vec<Diagnostic>) -> TokenKind {
+pub fn lex_number(
+    cursor: &mut Cursor,
+    start: BytePos,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> TokenKind {
     let first = cursor.peek().unwrap_or('0');
 
     // Check for hex, octal, binary prefixes
@@ -98,7 +102,11 @@ fn lex_binary(cursor: &mut Cursor, start: BytePos, diagnostics: &mut Vec<Diagnos
     }
 }
 
-fn lex_decimal(cursor: &mut Cursor, start: BytePos, diagnostics: &mut Vec<Diagnostic>) -> TokenKind {
+fn lex_decimal(
+    cursor: &mut Cursor,
+    start: BytePos,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> TokenKind {
     let int_part = eat_digits(cursor, |c| c.is_ascii_digit());
     let mut is_float = false;
     let mut number_str = int_part.to_string();

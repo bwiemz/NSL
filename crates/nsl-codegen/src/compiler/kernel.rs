@@ -579,8 +579,7 @@ impl Compiler<'_> {
                 if let ModelMember::Method(_, decos) = member {
                     if decos.iter().any(|d| {
                         d.name.len() == 1
-                            && self.interner.resolve(d.name[0].0).unwrap_or("")
-                                == "flash_attention"
+                            && self.interner.resolve(d.name[0].0).unwrap_or("") == "flash_attention"
                     }) {
                         has_flash = true;
                         break;
@@ -594,7 +593,12 @@ impl Compiler<'_> {
             // Phase 1 — try `w_norm` (RMSNorm gamma) first. Both first
             // and last dim equal d_model for a 1-D gamma; we use first.
             for member in &md.members {
-                if let ModelMember::LayerDecl { name, init: Some(init), .. } = member {
+                if let ModelMember::LayerDecl {
+                    name,
+                    init: Some(init),
+                    ..
+                } = member
+                {
                     let nm = self.interner.resolve(name.0).unwrap_or("");
                     if NORM_NAMES.contains(&nm) {
                         if let Some(v) = first_dim_from_init_expr(init) {
@@ -609,7 +613,12 @@ impl Compiler<'_> {
             // `wq` is `[d_model, d_kv]` (input rows, output cols), so the
             // FIRST dim is d_model.
             for member in &md.members {
-                if let ModelMember::LayerDecl { name, init: Some(init), .. } = member {
+                if let ModelMember::LayerDecl {
+                    name,
+                    init: Some(init),
+                    ..
+                } = member
+                {
                     let nm = self.interner.resolve(name.0).unwrap_or("");
                     if PROJ_NAMES.contains(&nm) {
                         if let Some(v) = first_dim_from_init_expr(init) {
@@ -654,10 +663,7 @@ impl Compiler<'_> {
     /// forward inference PTX still works, and the Gap A save-pointer
     /// allocation continues to run (just into a kernel that ignores
     /// them).  Non-regression is preserved.
-    fn maybe_synthesize_csha_training_ptx(
-        &mut self,
-        stmts: &[Stmt],
-    ) -> Result<(), CodegenError> {
+    fn maybe_synthesize_csha_training_ptx(&mut self, stmts: &[Stmt]) -> Result<(), CodegenError> {
         if !stmts_contain_train_block(stmts) {
             return Ok(());
         }
@@ -759,13 +765,14 @@ impl Compiler<'_> {
         // existing kernel-name selector once (which delegates to v2 + retains
         // the diag-emit contract for API stability).
         let mut diags = Vec::<String>::new();
-        let _ =
-            crate::flash_attention_selector::flash_attention_kernel_name_selected_with_diag(
-                &training_config, &mut diags,
-            );
-        for d in diags { eprintln!("warning: {d}"); }
-        let fwd_emission =
-            crate::pca_tier_b::emit_tier_b_variants_for_config(&training_config);
+        let _ = crate::flash_attention_selector::flash_attention_kernel_name_selected_with_diag(
+            &training_config,
+            &mut diags,
+        );
+        for d in diags {
+            eprintln!("warning: {d}");
+        }
+        let fwd_emission = crate::pca_tier_b::emit_tier_b_variants_for_config(&training_config);
         let fwd_kernel_name = fwd_emission.base_kernel_name.clone();
 
         let fwd_ptx_id = self.embed_raw_data(
@@ -785,10 +792,8 @@ impl Compiler<'_> {
             fwd_emission.tier_b_on_kernel_name,
         ) {
             (Some(on_ptx), Some(on_name)) => {
-                let on_ptx_id = self.embed_raw_data(
-                    &format!("__nsl_flash_ptx_csha_saves_{}", on_name),
-                    on_ptx,
-                )?;
+                let on_ptx_id = self
+                    .embed_raw_data(&format!("__nsl_flash_ptx_csha_saves_{}", on_name), on_ptx)?;
                 let mut on_name_bytes = on_name.as_bytes().to_vec();
                 on_name_bytes.push(0);
                 let on_name_id = self.embed_raw_data(
@@ -844,7 +849,8 @@ impl Compiler<'_> {
                                 crate::pca_segment::SegmentResidency::Shared,
                             ));
                             match crate::flash_attention_v2::synthesize_backward_with_tier_b(
-                                &training_config, tier_b_args,
+                                &training_config,
+                                tier_b_args,
                             ) {
                                 Ok(on_ptx) => {
                                     let on_name = format!(
@@ -876,7 +882,12 @@ impl Compiler<'_> {
                             (None, None)
                         };
 
-                    (Some(bwd_ptx_id), Some(bwd_name_id), tier_b_ptx_id_opt, tier_b_name_id_opt)
+                    (
+                        Some(bwd_ptx_id),
+                        Some(bwd_name_id),
+                        tier_b_ptx_id_opt,
+                        tier_b_name_id_opt,
+                    )
                 }
                 Err(e) => {
                     eprintln!(
@@ -1108,9 +1119,12 @@ impl Compiler<'_> {
                 // Shared memory validation: (block_q + block_kv) * head_dim * 2 <= 49152 (48KB)
                 let mut diags = Vec::<String>::new();
                 let shmem = crate::flash_attention_selector::shared_mem_bytes_selected_with_diag(
-                    &test_config, &mut diags,
+                    &test_config,
+                    &mut diags,
                 );
-                for d in diags { eprintln!("warning: {d}"); }
+                for d in diags {
+                    eprintln!("warning: {d}");
+                }
                 if shmem > 49152 {
                     return Err(CodegenError::new(format!(
                         "@autotune variant (block_q={}, block_kv={}) requires {}KB shared memory, exceeds 48KB limit for sm_52",
@@ -1137,12 +1151,15 @@ impl Compiler<'_> {
                 // Retain the selector kernel-name call for its diagnostic side
                 // effect (API stability).
                 let mut diags = Vec::<String>::new();
-                let _ = crate::flash_attention_selector::flash_attention_kernel_name_selected_with_diag(
-                    &test_config, &mut diags,
-                );
-                for d in diags { eprintln!("warning: {d}"); }
-                let emission =
-                    crate::pca_tier_b::emit_tier_b_variants_for_config(&test_config);
+                let _ =
+                    crate::flash_attention_selector::flash_attention_kernel_name_selected_with_diag(
+                        &test_config,
+                        &mut diags,
+                    );
+                for d in diags {
+                    eprintln!("warning: {d}");
+                }
+                let emission = crate::pca_tier_b::emit_tier_b_variants_for_config(&test_config);
                 let variant_kernel_name = emission.base_kernel_name.clone();
                 self.embed_flash_ptx(&variant_kernel_name, emission.base_ptx)?;
                 if let (Some(on_ptx), Some(on_name)) =
@@ -1185,10 +1202,13 @@ impl Compiler<'_> {
             };
 
             let mut diags = Vec::<String>::new();
-            let kernel_name = crate::flash_attention_selector::flash_attention_kernel_name_selected_with_diag(
-                &config, &mut diags,
-            );
-            for d in diags { eprintln!("warning: {d}"); }
+            let kernel_name =
+                crate::flash_attention_selector::flash_attention_kernel_name_selected_with_diag(
+                    &config, &mut diags,
+                );
+            for d in diags {
+                eprintln!("warning: {d}");
+            }
 
             // The primary variant's PTX was already embedded in the loop above.
             // Look up its .rodata IDs from kernel_ptx_data (stored by embed_flash_ptx).
@@ -1219,15 +1239,19 @@ impl Compiler<'_> {
             let bwd_p2_id = self.embed_raw_data("__nsl_flash_bwd_p2", bwd_p2)?;
 
             // Embed backward kernel name strings as null-terminated C strings
-            let bwd_p1_name = crate::flash_attention::flash_attention_bwd_d_kernel_name(&bwd_config);
+            let bwd_p1_name =
+                crate::flash_attention::flash_attention_bwd_d_kernel_name(&bwd_config);
             let mut bwd_p1_name_bytes = bwd_p1_name.into_bytes();
             bwd_p1_name_bytes.push(0); // null-terminate
-            let bwd_p1_name_id = self.embed_raw_data("__nsl_flash_bwd_p1_name", bwd_p1_name_bytes)?;
+            let bwd_p1_name_id =
+                self.embed_raw_data("__nsl_flash_bwd_p1_name", bwd_p1_name_bytes)?;
 
-            let bwd_p2_name = crate::flash_attention::flash_attention_bwd_main_kernel_name(&bwd_config);
+            let bwd_p2_name =
+                crate::flash_attention::flash_attention_bwd_main_kernel_name(&bwd_config);
             let mut bwd_p2_name_bytes = bwd_p2_name.into_bytes();
             bwd_p2_name_bytes.push(0); // null-terminate
-            let bwd_p2_name_id = self.embed_raw_data("__nsl_flash_bwd_p2_name", bwd_p2_name_bytes)?;
+            let bwd_p2_name_id =
+                self.embed_raw_data("__nsl_flash_bwd_p2_name", bwd_p2_name_bytes)?;
 
             // PCA Tier B Planner: primary autotune variant's Tier-B-on IDs
             // (looked up from `kernel_ptx_data` if `embed_flash_ptx` registered
@@ -1304,7 +1328,9 @@ impl Compiler<'_> {
             let _ = crate::flash_attention_selector::flash_attention_kernel_name_selected_with_diag(
                 &config, &mut diags,
             );
-            for d in diags { eprintln!("warning: {d}"); }
+            for d in diags {
+                eprintln!("warning: {d}");
+            }
             let emission = crate::pca_tier_b::emit_tier_b_variants_for_config(&config);
             let kernel_name = emission.base_kernel_name.clone();
             let ptx_bytes = emission.base_ptx;
@@ -1366,25 +1392,21 @@ impl Compiler<'_> {
             // Tier-B-on variant: embed only when the emission helper produced one.
             // Single-config sets `segment_masked: false` so this branch is dead
             // today; wired for parity with the CSHA training path.
-            let (tier_b_on_ptx_id, tier_b_on_name_id) = match (
-                emission.tier_b_on_ptx,
-                emission.tier_b_on_kernel_name,
-            ) {
-                (Some(on_ptx), Some(on_name)) => {
-                    let on_ptx_id = self.embed_raw_data(
-                        &format!("__nsl_flash_ptx_{}", on_name),
-                        on_ptx,
-                    )?;
-                    let mut on_name_bytes = on_name.as_bytes().to_vec();
-                    on_name_bytes.push(0);
-                    let on_name_id = self.embed_raw_data(
-                        &format!("__nsl_flash_name_{}", on_name),
-                        on_name_bytes,
-                    )?;
-                    (Some(on_ptx_id), Some(on_name_id))
-                }
-                _ => (None, None),
-            };
+            let (tier_b_on_ptx_id, tier_b_on_name_id) =
+                match (emission.tier_b_on_ptx, emission.tier_b_on_kernel_name) {
+                    (Some(on_ptx), Some(on_name)) => {
+                        let on_ptx_id =
+                            self.embed_raw_data(&format!("__nsl_flash_ptx_{}", on_name), on_ptx)?;
+                        let mut on_name_bytes = on_name.as_bytes().to_vec();
+                        on_name_bytes.push(0);
+                        let on_name_id = self.embed_raw_data(
+                            &format!("__nsl_flash_name_{}", on_name),
+                            on_name_bytes,
+                        )?;
+                        (Some(on_ptx_id), Some(on_name_id))
+                    }
+                    _ => (None, None),
+                };
 
             // Embed backward PTX alongside forward
             let bwd_config = crate::flash_attention::FlashAttentionBackwardConfig {
@@ -1401,15 +1423,19 @@ impl Compiler<'_> {
             let bwd_p2_id = self.embed_raw_data("__nsl_flash_bwd_p2", bwd_p2)?;
 
             // Embed backward kernel name strings as null-terminated C strings
-            let bwd_p1_name = crate::flash_attention::flash_attention_bwd_d_kernel_name(&bwd_config);
+            let bwd_p1_name =
+                crate::flash_attention::flash_attention_bwd_d_kernel_name(&bwd_config);
             let mut bwd_p1_name_bytes = bwd_p1_name.into_bytes();
             bwd_p1_name_bytes.push(0);
-            let bwd_p1_name_id = self.embed_raw_data("__nsl_flash_bwd_p1_name", bwd_p1_name_bytes)?;
+            let bwd_p1_name_id =
+                self.embed_raw_data("__nsl_flash_bwd_p1_name", bwd_p1_name_bytes)?;
 
-            let bwd_p2_name = crate::flash_attention::flash_attention_bwd_main_kernel_name(&bwd_config);
+            let bwd_p2_name =
+                crate::flash_attention::flash_attention_bwd_main_kernel_name(&bwd_config);
             let mut bwd_p2_name_bytes = bwd_p2_name.into_bytes();
             bwd_p2_name_bytes.push(0);
-            let bwd_p2_name_id = self.embed_raw_data("__nsl_flash_bwd_p2_name", bwd_p2_name_bytes)?;
+            let bwd_p2_name_id =
+                self.embed_raw_data("__nsl_flash_bwd_p2_name", bwd_p2_name_bytes)?;
 
             Ok(Some(FlashAttentionCompileContext {
                 ptx_data_id,

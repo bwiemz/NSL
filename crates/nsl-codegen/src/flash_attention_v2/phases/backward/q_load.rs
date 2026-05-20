@@ -57,9 +57,7 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
     //   %rd6 = seq_len (from prelude).
     ptx.push_str("    add.u64 %rd34, %q_start, %warp_row;  // q_row_global\n");
     ptx.push_str("    setp.ge.u64 %p1, %rd34, %rd6;         // q_row_global >= seq_len?\n");
-    ptx.push_str(&format!(
-        "    @%p1 bra V2_BWD_Q_LOAD_SKIP_{q_tile_iter};\n"
-    ));
+    ptx.push_str(&format!("    @%p1 bra V2_BWD_Q_LOAD_SKIP_{q_tile_iter};\n"));
 
     // row_idx = batch_idx*(heads*seq) + head_idx*seq + (q_start + warp_row)
     //   %rd5 = heads, %rd6 = seq_len, %rd7 = head_dim (from prelude).
@@ -114,14 +112,24 @@ mod tests {
     use crate::flash_attention::{CshaExtras, FlashAttentionConfig, RopeStyle};
 
     fn base_cfg_fused_backward(
-        block_q: i64, block_kv: i64, head_dim: i64, heads: u32, d_model: u32,
+        block_q: i64,
+        block_kv: i64,
+        head_dim: i64,
+        heads: u32,
+        d_model: u32,
     ) -> FlashAttentionConfig {
         let _ = heads;
         FlashAttentionConfig {
-            block_q, block_kv, head_dim,
-            causal: false, paged: false, rope_q: false,
+            block_q,
+            block_kv,
+            head_dim,
+            causal: false,
+            paged: false,
+            rope_q: false,
             rope_style: RopeStyle::HalfSplit,
-            gqa_group_size: 1, tree_mask: false, gpu_sm: 75,
+            gqa_group_size: 1,
+            tree_mask: false,
+            gpu_sm: 75,
             segment_masked: false,
             csha: Some(CshaExtras {
                 fused_projections: true,
@@ -138,18 +146,21 @@ mod tests {
         let mut ptx = String::new();
         emit(&mut ptx, &cfg, 0);
 
-        assert!(ptx.contains("%rd_bwd_q_proj"),
-            "must reference prelude-loaded q_proj_ptr register");
-        assert!(ptx.contains("ld.global.b16"),
-            "f16 HBM load missing");
-        assert!(ptx.contains("st.shared.b16"),
-            "SMEM write missing");
-        assert!(ptx.contains("V2_BWD_Q_LOAD_0:"),
-            "per-iter label missing");
-        assert!(!ptx.contains("cos_ptr"),
-            "backward q_load must use saved post-RoPE Q (no RoPE recompute)");
-        assert!(!ptx.contains("sin_ptr"),
-            "backward q_load must use saved post-RoPE Q (no RoPE recompute)");
+        assert!(
+            ptx.contains("%rd_bwd_q_proj"),
+            "must reference prelude-loaded q_proj_ptr register"
+        );
+        assert!(ptx.contains("ld.global.b16"), "f16 HBM load missing");
+        assert!(ptx.contains("st.shared.b16"), "SMEM write missing");
+        assert!(ptx.contains("V2_BWD_Q_LOAD_0:"), "per-iter label missing");
+        assert!(
+            !ptx.contains("cos_ptr"),
+            "backward q_load must use saved post-RoPE Q (no RoPE recompute)"
+        );
+        assert!(
+            !ptx.contains("sin_ptr"),
+            "backward q_load must use saved post-RoPE Q (no RoPE recompute)"
+        );
     }
 
     #[test]
@@ -175,7 +186,9 @@ mod tests {
         let cfg = base_cfg_fused_backward(32, 32, 32, 4, 32);
         let mut ptx = String::new();
         emit(&mut ptx, &cfg, 0);
-        assert!(ptx.contains("setp.eq.u64") && ptx.contains("%rd_bwd_q_proj, 0"),
-            "null-guard on q_proj_ptr missing");
+        assert!(
+            ptx.contains("setp.eq.u64") && ptx.contains("%rd_bwd_q_proj, 0"),
+            "null-guard on q_proj_ptr missing"
+        );
     }
 }

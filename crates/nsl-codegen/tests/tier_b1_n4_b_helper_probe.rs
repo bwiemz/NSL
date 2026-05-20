@@ -54,8 +54,8 @@ use nsl_codegen::matmul_mma::emit_load_b_fragment_smem;
 use std::ffi::{c_void, CString};
 
 use nsl_runtime::{
-    nsl_cuda_init, nsl_test_cuda_alloc, nsl_test_cuda_d2h, nsl_test_cuda_free,
-    nsl_test_cuda_h2d, nsl_test_cuda_jit_log,
+    nsl_cuda_init, nsl_test_cuda_alloc, nsl_test_cuda_d2h, nsl_test_cuda_free, nsl_test_cuda_h2d,
+    nsl_test_cuda_jit_log,
 };
 
 extern "C" {
@@ -299,8 +299,12 @@ fn probe_emit_load_b_fragment_smem_layout() {
         nsl_kernel_launch(
             ptx.as_ptr() as i64,
             kernel_name.as_ptr() as i64,
-            1, 1, 1,
-            32, 1, 1,
+            1,
+            1,
+            1,
+            32,
+            1,
+            1,
             args.as_ptr() as i64,
             args.len() as i64,
             0,
@@ -398,8 +402,14 @@ fn probe_emit_load_b_fragment_smem_layout() {
     }
 
     eprintln!("\n[N4-b-probe] ── summary ──");
-    eprintln!("[N4-b-probe] lanes matching PTX m16n8k16 spec : {}/32", matches_spec);
-    eprintln!("[N4-b-probe] undecodable cells               : {}", undecodable);
+    eprintln!(
+        "[N4-b-probe] lanes matching PTX m16n8k16 spec : {}/32",
+        matches_spec
+    );
+    eprintln!(
+        "[N4-b-probe] undecodable cells               : {}",
+        undecodable
+    );
 
     if matches_spec == 32 {
         eprintln!("[N4-b-probe] DIAGNOSIS: B-frag helper is PTX-spec CORRECT.");

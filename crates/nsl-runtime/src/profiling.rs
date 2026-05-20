@@ -74,16 +74,12 @@ pub fn profiler_record_alloc(block_id: u32, seq_id: u64) {
         return;
     }
     let ts = elapsed_us();
-    PROFILER
-        .events
-        .lock()
-        .unwrap()
-        .push(ProfileEvent {
-            timestamp_us: ts,
-            event_type: EventType::Alloc,
-            block_id,
-            seq_id,
-        });
+    PROFILER.events.lock().unwrap().push(ProfileEvent {
+        timestamp_us: ts,
+        event_type: EventType::Alloc,
+        block_id,
+        seq_id,
+    });
     PROFILER.total_allocs.fetch_add(1, Ordering::Relaxed);
 
     // Increment current_blocks and update peak via CAS loop.
@@ -111,16 +107,12 @@ pub fn profiler_record_free(block_id: u32, seq_id: u64) {
         return;
     }
     let ts = elapsed_us();
-    PROFILER
-        .events
-        .lock()
-        .unwrap()
-        .push(ProfileEvent {
-            timestamp_us: ts,
-            event_type: EventType::Free,
-            block_id,
-            seq_id,
-        });
+    PROFILER.events.lock().unwrap().push(ProfileEvent {
+        timestamp_us: ts,
+        event_type: EventType::Free,
+        block_id,
+        seq_id,
+    });
     PROFILER.total_frees.fetch_add(1, Ordering::Relaxed);
     let prev = PROFILER.current_blocks.fetch_sub(1, Ordering::Relaxed);
     debug_assert!(prev > 0, "profiler current_blocks underflow");

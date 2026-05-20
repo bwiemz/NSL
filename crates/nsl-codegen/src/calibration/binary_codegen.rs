@@ -110,18 +110,14 @@ pub fn real_subprocess_entry(
     };
 
     // Build the arena layout and collect observe/finalize plans from hooks.
-    let (arena_batch, arena_seq) = forward_batch_seq
-        .map(|(_, seq)| (1, seq))
-        .unwrap_or((8, 4));
+    let (arena_batch, arena_seq) = forward_batch_seq.map(|(_, seq)| (1, seq)).unwrap_or((8, 4));
     let arena_layout = build_arena_layout(&cfg.projections, arena_batch, arena_seq);
     let observe_plan: Vec<ObservePlanEntry> = registry
         .iter()
         .flat_map(|h| h.observe_plan(&arena_layout))
         .collect();
-    let finalize_plan: Vec<FinalizePlanEntry> = registry
-        .iter()
-        .flat_map(|h| h.finalize_plan())
-        .collect();
+    let finalize_plan: Vec<FinalizePlanEntry> =
+        registry.iter().flat_map(|h| h.finalize_plan()).collect();
     // Spec §4.5: collect running-buffer symbols from hooks that require backward.
     // Passed into the scaffolding so the loop body emits per-step symbol references.
     let per_step_backward_symbols: Vec<String> = registry
@@ -132,13 +128,14 @@ pub fn real_subprocess_entry(
 
     // Emit and link the calibration binary.
     let binary_path = if needs_forward {
-        let compile_bundle = cfg
-            .compile_bundle
-            .clone()
-            .ok_or_else(|| HarnessError::Infrastructure {
-                reason: "real_subprocess_entry requires compile_bundle for forward-pass calibration"
-                    .into(),
-            })?;
+        let compile_bundle =
+            cfg.compile_bundle
+                .clone()
+                .ok_or_else(|| HarnessError::Infrastructure {
+                    reason:
+                        "real_subprocess_entry requires compile_bundle for forward-pass calibration"
+                            .into(),
+                })?;
         let (_count, seq) = forward_batch_seq.expect("forward path computed batch/seq above");
 
         // Pre-scan WGGO targets from the compile bundle AST. Used both to
@@ -174,12 +171,7 @@ pub fn real_subprocess_entry(
         }
 
         let model_obj = tmp.join("calib_model.o");
-        emit_calibration_model_object(
-            &compile_bundle.ast,
-            &model_opts,
-            &arena_layout,
-            &model_obj,
-        )?;
+        emit_calibration_model_object(&compile_bundle.ast, &model_opts, &arena_layout, &model_obj)?;
 
         let scaffolding_obj = tmp.join("scaffolding.o");
 
@@ -252,11 +244,10 @@ pub fn real_subprocess_entry(
     let json = fs::read(&sidecar_path).map_err(|e| HarnessError::Infrastructure {
         reason: format!("reading sidecar {}: {e}", sidecar_path.display()),
     })?;
-    let parsed: Sidecar = serde_json::from_slice(&json).map_err(|e| {
-        HarnessError::Infrastructure {
+    let parsed: Sidecar =
+        serde_json::from_slice(&json).map_err(|e| HarnessError::Infrastructure {
             reason: format!("parsing sidecar: {e}"),
-        }
-    })?;
+        })?;
 
     Ok(HarnessOutput {
         sidecar: parsed,
@@ -337,11 +328,11 @@ fn emit_2d_max_abs_loop(
     let ptr_ty = cl_types::I64;
 
     let row_header = b.create_block();
-    let row_body   = b.create_block();
+    let row_body = b.create_block();
     let col_header = b.create_block();
-    let col_body   = b.create_block();
-    let col_exit   = b.create_block();
-    let row_exit   = b.create_block();
+    let col_body = b.create_block();
+    let col_exit = b.create_block();
+    let row_exit = b.create_block();
 
     b.append_block_param(row_header, cl_types::I32); // i
     b.append_block_param(col_header, cl_types::I32); // j
@@ -373,11 +364,11 @@ fn emit_2d_max_abs_loop(
     b.seal_block(col_body);
 
     // src_addr = arena_base + src_offset + (i * channels + j) * 4
-    let i_ch  = b.ins().imul(i, ch_v);
-    let lin   = b.ins().iadd(i_ch, j);
-    let four  = b.ins().iconst(cl_types::I32, 4);
-    let lin4  = b.ins().imul(lin, four);
-    let soff  = b.ins().iconst(cl_types::I32, src_offset as i64);
+    let i_ch = b.ins().imul(i, ch_v);
+    let lin = b.ins().iadd(i_ch, j);
+    let four = b.ins().iconst(cl_types::I32, 4);
+    let lin4 = b.ins().imul(lin, four);
+    let soff = b.ins().iconst(cl_types::I32, src_offset as i64);
     let soff_t = b.ins().iadd(lin4, soff);
     let soff_p = b.ins().uextend(ptr_ty, soff_t);
     let src_addr = b.ins().iadd(arena_base, soff_p);
@@ -387,10 +378,10 @@ fn emit_2d_max_abs_loop(
     let j_off_p = b.ins().uextend(ptr_ty, j_off);
     let run_addr = b.ins().iadd(running_base, j_off_p);
 
-    let v    = b.ins().load(cl_types::F32, MemFlags::new(), src_addr, 0);
+    let v = b.ins().load(cl_types::F32, MemFlags::new(), src_addr, 0);
     let absv = b.ins().fabs(v);
-    let cur  = b.ins().load(cl_types::F32, MemFlags::new(), run_addr, 0);
-    let new  = b.ins().fmax(cur, absv);
+    let cur = b.ins().load(cl_types::F32, MemFlags::new(), run_addr, 0);
+    let new = b.ins().fmax(cur, absv);
     b.ins().store(MemFlags::new(), new, run_addr, 0);
 
     let jp1 = b.ins().iadd_imm(j, 1);
@@ -456,21 +447,21 @@ pub(crate) fn emit_per_head_dot_abs_accum(
     let ptr_ty = cl_types::I64;
 
     let head_header = b.create_block();
-    let head_body   = b.create_block();
+    let head_body = b.create_block();
     let elem_header = b.create_block();
-    let elem_body   = b.create_block();
-    let elem_exit   = b.create_block();
-    let head_exit   = b.create_block();
+    let elem_body = b.create_block();
+    let elem_exit = b.create_block();
+    let head_exit = b.create_block();
 
     // Block params: head_header carries h (I32), elem_header carries e (I32).
     b.append_block_param(head_header, cl_types::I32); // h
     b.append_block_param(elem_header, cl_types::I32); // e
 
-    let zero_i32      = b.ins().iconst(cl_types::I32, 0);
-    let four          = b.ins().iconst(cl_types::I32, 4);
-    let n_heads_v     = b.ins().iconst(cl_types::I32, n_proj_heads as i64);
-    let elems_v       = b.ins().iconst(cl_types::I32, elements_per_head as i64);
-    let soff_c        = b.ins().iconst(cl_types::I32, src_offset as i64);
+    let zero_i32 = b.ins().iconst(cl_types::I32, 0);
+    let four = b.ins().iconst(cl_types::I32, 4);
+    let n_heads_v = b.ins().iconst(cl_types::I32, n_proj_heads as i64);
+    let elems_v = b.ins().iconst(cl_types::I32, elements_per_head as i64);
+    let soff_c = b.ins().iconst(cl_types::I32, src_offset as i64);
 
     // Jump from caller into the outer loop.
     b.ins().jump(head_header, &[zero_i32]);
@@ -498,45 +489,45 @@ pub(crate) fn emit_per_head_dot_abs_accum(
 
     // Linear element index within this head: lin = h * elements_per_head + e
     let h_elems = b.ins().imul(h, elems_v);
-    let lin     = b.ins().iadd(h_elems, e);
+    let lin = b.ins().iadd(h_elems, e);
 
     // grad_addr = grad_arena_base + src_offset + lin * 4
-    let lin4_g   = b.ins().imul(lin, four);
-    let raw_g    = b.ins().iadd(lin4_g, soff_c);
-    let raw_g_p  = b.ins().uextend(ptr_ty, raw_g);
+    let lin4_g = b.ins().imul(lin, four);
+    let raw_g = b.ins().iadd(lin4_g, soff_c);
+    let raw_g_p = b.ins().uextend(ptr_ty, raw_g);
     let grad_addr = b.ins().iadd(grad_arena_base, raw_g_p);
 
     // weight_addr = weight_data_base + lin * 4  (weights are packed [out, in] f32;
     // no src_offset needed — weight_data_base already points at this projection's
     // weight slice, which Task 21 threads in from nsl_model_get_weight_ptrs).
-    let lin4_w    = b.ins().imul(lin, four);
-    let raw_w_p   = b.ins().uextend(ptr_ty, lin4_w);
-    let wt_addr   = b.ins().iadd(weight_data_base, raw_w_p);
+    let lin4_w = b.ins().imul(lin, four);
+    let raw_w_p = b.ins().uextend(ptr_ty, lin4_w);
+    let wt_addr = b.ins().iadd(weight_data_base, raw_w_p);
 
     // Load f32 values.
-    let gv  = b.ins().load(cl_types::F32, MemFlags::new(), grad_addr, 0);
-    let wv  = b.ins().load(cl_types::F32, MemFlags::new(), wt_addr,   0);
+    let gv = b.ins().load(cl_types::F32, MemFlags::new(), grad_addr, 0);
+    let wv = b.ins().load(cl_types::F32, MemFlags::new(), wt_addr, 0);
 
     // |grad * weight| — compute in f32, then promote to f64.
-    let prod    = b.ins().fmul(gv, wv);
+    let prod = b.ins().fmul(gv, wv);
     let abs_prod = b.ins().fabs(prod);
-    let v64     = b.ins().fpromote(cl_types::F64, abs_prod);
+    let v64 = b.ins().fpromote(cl_types::F64, abs_prod);
 
     // Unrolled replication loop: for r in 0..replication { running[h*rep+r] += v64 }
     // Each K/V head contributes to `replication` Q-head running slots.
     // The running buffer is f64 so each slot is 8 bytes.
-    let eight      = b.ins().iconst(cl_types::I32, 8);
-    let rep_v      = b.ins().iconst(cl_types::I32, replication as i64);
-    let base_slot  = b.ins().imul(h, rep_v); // h * replication
+    let eight = b.ins().iconst(cl_types::I32, 8);
+    let rep_v = b.ins().iconst(cl_types::I32, replication as i64);
+    let base_slot = b.ins().imul(h, rep_v); // h * replication
 
     for r in 0..replication {
-        let r_v      = b.ins().iconst(cl_types::I32, r as i64);
-        let slot_idx = b.ins().iadd(base_slot, r_v);      // h*rep + r
-        let slot_off = b.ins().imul(slot_idx, eight);      // * 8 bytes
-        let slot_p   = b.ins().uextend(ptr_ty, slot_off);
+        let r_v = b.ins().iconst(cl_types::I32, r as i64);
+        let slot_idx = b.ins().iadd(base_slot, r_v); // h*rep + r
+        let slot_off = b.ins().imul(slot_idx, eight); // * 8 bytes
+        let slot_p = b.ins().uextend(ptr_ty, slot_off);
         let run_addr = b.ins().iadd(running_base, slot_p);
-        let cur      = b.ins().load(cl_types::F64, MemFlags::new(), run_addr, 0);
-        let new_val  = b.ins().fadd(cur, v64);
+        let cur = b.ins().load(cl_types::F64, MemFlags::new(), run_addr, 0);
+        let new_val = b.ins().fadd(cur, v64);
         b.ins().store(MemFlags::new(), new_val, run_addr, 0);
     }
 
@@ -579,9 +570,10 @@ fn new_calibration_object_module(
     let flag_builder = {
         use cranelift_codegen::settings::Configurable as _;
         let mut b = cranelift_codegen::settings::builder();
-        b.enable("is_pic").map_err(|e| HarnessError::Infrastructure {
-            reason: format!("cranelift enable is_pic: {e}"),
-        })?;
+        b.enable("is_pic")
+            .map_err(|e| HarnessError::Infrastructure {
+                reason: format!("cranelift enable is_pic: {e}"),
+            })?;
         b
     };
     #[cfg(not(target_os = "macos"))]
@@ -611,14 +603,10 @@ fn new_calibration_object_module(
         }
     };
 
-    let builder = ObjectBuilder::new(
-        isa,
-        name,
-        cranelift_module::default_libcall_names(),
-    )
-    .map_err(|e| HarnessError::Infrastructure {
-        reason: format!("object builder: {e}"),
-    })?;
+    let builder = ObjectBuilder::new(isa, name, cranelift_module::default_libcall_names())
+        .map_err(|e| HarnessError::Infrastructure {
+            reason: format!("object builder: {e}"),
+        })?;
 
     Ok((ObjectModule::new(builder), call_conv))
 }
@@ -765,10 +753,18 @@ fn emit_model_forward_bridge(
 ) -> Result<cranelift_module::FuncId, HarnessError> {
     let mut model_get_weight_sig = compiler.module.make_signature();
     model_get_weight_sig.call_conv = compiler.call_conv;
-    model_get_weight_sig.params.push(AbiParam::new(cl_types::I64));
-    model_get_weight_sig.params.push(AbiParam::new(cl_types::I64));
-    model_get_weight_sig.params.push(AbiParam::new(cl_types::I64));
-    model_get_weight_sig.returns.push(AbiParam::new(cl_types::I64));
+    model_get_weight_sig
+        .params
+        .push(AbiParam::new(cl_types::I64));
+    model_get_weight_sig
+        .params
+        .push(AbiParam::new(cl_types::I64));
+    model_get_weight_sig
+        .params
+        .push(AbiParam::new(cl_types::I64));
+    model_get_weight_sig
+        .returns
+        .push(AbiParam::new(cl_types::I64));
     let model_get_weight_id = compiler
         .module
         .declare_function(
@@ -782,13 +778,25 @@ fn emit_model_forward_bridge(
 
     let mut tensor_transpose_sig = compiler.module.make_signature();
     tensor_transpose_sig.call_conv = compiler.call_conv;
-    tensor_transpose_sig.params.push(AbiParam::new(cl_types::I64));
-    tensor_transpose_sig.params.push(AbiParam::new(cl_types::I64));
-    tensor_transpose_sig.params.push(AbiParam::new(cl_types::I64));
-    tensor_transpose_sig.returns.push(AbiParam::new(cl_types::I64));
+    tensor_transpose_sig
+        .params
+        .push(AbiParam::new(cl_types::I64));
+    tensor_transpose_sig
+        .params
+        .push(AbiParam::new(cl_types::I64));
+    tensor_transpose_sig
+        .params
+        .push(AbiParam::new(cl_types::I64));
+    tensor_transpose_sig
+        .returns
+        .push(AbiParam::new(cl_types::I64));
     let tensor_transpose_id = compiler
         .module
-        .declare_function("nsl_tensor_transpose", Linkage::Import, &tensor_transpose_sig)
+        .declare_function(
+            "nsl_tensor_transpose",
+            Linkage::Import,
+            &tensor_transpose_sig,
+        )
         .map_err(|e| HarnessError::Infrastructure {
             reason: format!("declare nsl_tensor_transpose: {e}"),
         })?;
@@ -874,16 +882,14 @@ fn emit_model_forward_bridge(
                 continue;
             };
             let qualified_name = format!("{model_name}.{field_name}");
-            let symbol = format!(
-                "__nsl_calib_weight_name_{}_{}",
-                model_name,
-                field_name
-            );
+            let symbol = format!("__nsl_calib_weight_name_{}_{}", model_name, field_name);
             let name_data = declare_cstr_rodata(&mut compiler.module, &symbol, &qualified_name)?;
             let name_ref = compiler.module.declare_data_in_func(name_data, b.func);
             let name_ptr = b.ins().symbol_value(cl_types::I64, name_ref);
             let name_len = b.ins().iconst(cl_types::I64, qualified_name.len() as i64);
-            let tensor_call = b.ins().call(model_get_weight_ref, &[model_ptr, name_ptr, name_len]);
+            let tensor_call = b
+                .ins()
+                .call(model_get_weight_ref, &[model_ptr, name_ptr, name_len]);
             let mut tensor_ptr = b.inst_results(tensor_call)[0];
             let should_transpose = transpose_fields.contains(field_name)
                 || compiler
@@ -892,7 +898,9 @@ fn emit_model_forward_bridge(
                     .get(model_name)
                     .is_some_and(|fields| fields.contains_key(field_name));
             if should_transpose {
-                let transpose_call = b.ins().call(tensor_transpose_ref, &[tensor_ptr, zero_i64, one_i64]);
+                let transpose_call = b
+                    .ins()
+                    .call(tensor_transpose_ref, &[tensor_ptr, zero_i64, one_i64]);
                 tensor_ptr = b.inst_results(transpose_call)[0];
                 transposed_tensors.push(tensor_ptr);
             }
@@ -919,8 +927,8 @@ fn emit_model_forward_bridge(
             .get(&method_mangled)
             .cloned()
             .ok_or_else(|| HarnessError::Infrastructure {
-                reason: format!("forward impl '{method_mangled}' not registered"),
-            })?;
+            reason: format!("forward impl '{method_mangled}' not registered"),
+        })?;
         if forward_sig.params.len() != 2 {
             return Err(HarnessError::Infrastructure {
                 reason: format!(
@@ -977,16 +985,15 @@ fn emit_calibration_forward_wrapper(
     // rank since they only rely on the last-dim semantics.
     let shape_vals: Vec<i64> = vec![batch as i64, seq as i64, channels];
     let input_ndim: i32 = 3;
-    let shape_data = declare_i64_rodata(
-        &mut compiler.module,
-        "__nsl_calib_input_shape",
-        &shape_vals,
-    )?;
+    let shape_data =
+        declare_i64_rodata(&mut compiler.module, "__nsl_calib_input_shape", &shape_vals)?;
 
     let mut desc_to_tensor_sig = compiler.module.make_signature();
     desc_to_tensor_sig.call_conv = compiler.call_conv;
     desc_to_tensor_sig.params.push(AbiParam::new(cl_types::I64));
-    desc_to_tensor_sig.returns.push(AbiParam::new(cl_types::I64));
+    desc_to_tensor_sig
+        .returns
+        .push(AbiParam::new(cl_types::I64));
     let desc_to_tensor_id = compiler
         .module
         .declare_function("nsl_desc_to_tensor", Linkage::Import, &desc_to_tensor_sig)
@@ -1053,11 +1060,8 @@ fn emit_calibration_forward_wrapper(
         b.switch_to_block(shape_ok);
         b.seal_block(shape_ok);
 
-        let desc_slot = b.create_sized_stack_slot(StackSlotData::new(
-            StackSlotKind::ExplicitSlot,
-            40,
-            3,
-        ));
+        let desc_slot =
+            b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 40, 3));
         let desc_addr = b.ins().stack_addr(cl_types::I64, desc_slot, 0);
         let zero_i64 = b.ins().iconst(cl_types::I64, 0);
         let zero_i32 = b.ins().iconst(cl_types::I32, 0);
@@ -1074,12 +1078,17 @@ fn emit_calibration_forward_wrapper(
         b.ins().store(MemFlags::trusted(), zero_i32, desc_addr, 32);
         b.ins().store(MemFlags::trusted(), zero_i32, desc_addr, 36);
 
-        let desc_to_tensor_ref = compiler.module.declare_func_in_func(desc_to_tensor_id, b.func);
+        let desc_to_tensor_ref = compiler
+            .module
+            .declare_func_in_func(desc_to_tensor_id, b.func);
         let desc_call = b.ins().call(desc_to_tensor_ref, &[desc_addr]);
         let input_tensor = b.inst_results(desc_call)[0];
 
-        let model_forward_ref = compiler.module.declare_func_in_func(model_forward_id, b.func);
-        let fwd_call = b.ins()
+        let model_forward_ref = compiler
+            .module
+            .declare_func_in_func(model_forward_id, b.func);
+        let fwd_call = b
+            .ins()
             .call(model_forward_ref, &[weight_ptrs, num_weights, input_tensor]);
         // model_forward now returns y; free it here (forward wrapper only observes
         // activations via the retention arena — it does not need y itself).
@@ -1219,10 +1228,18 @@ fn emit_model_backward_bridge(
     // nsl_model_get_weight: (model_ptr: i64, name_ptr: i64, name_len: i64) -> i64
     let mut model_get_weight_sig = compiler.module.make_signature();
     model_get_weight_sig.call_conv = compiler.call_conv;
-    model_get_weight_sig.params.push(AbiParam::new(cl_types::I64));
-    model_get_weight_sig.params.push(AbiParam::new(cl_types::I64));
-    model_get_weight_sig.params.push(AbiParam::new(cl_types::I64));
-    model_get_weight_sig.returns.push(AbiParam::new(cl_types::I64));
+    model_get_weight_sig
+        .params
+        .push(AbiParam::new(cl_types::I64));
+    model_get_weight_sig
+        .params
+        .push(AbiParam::new(cl_types::I64));
+    model_get_weight_sig
+        .params
+        .push(AbiParam::new(cl_types::I64));
+    model_get_weight_sig
+        .returns
+        .push(AbiParam::new(cl_types::I64));
     let model_get_weight_id = compiler
         .module
         .declare_function(
@@ -1252,8 +1269,7 @@ fn emit_model_backward_bridge(
     // two paths cannot drift; #147 fixed a bug where this site silently
     // skipped WGGO-style `Tensor<[...]>` fields, breaking source-AD weight
     // resolution.
-    let tensor_fields: Vec<String> =
-        model_tensor_field_names(model_def, compiler.interner);
+    let tensor_fields: Vec<String> = model_tensor_field_names(model_def, compiler.interner);
 
     // Find the forward method body.  collect_models() / declare_user_functions()
     // have already run before this function is called, so model_method_bodies is
@@ -1306,9 +1322,8 @@ fn emit_model_backward_bridge(
     // no params (malformed model — rejected by the front-end), the extraction
     // will fail and we fall through to the stub path below.
     let self_sym = forward_fn_def.params.first().map(|p| p.name);
-    let self_param_name: Option<String> = self_sym.and_then(|sym| {
-        compiler.interner.resolve(sym.0).map(str::to_string)
-    });
+    let self_param_name: Option<String> =
+        self_sym.and_then(|sym| compiler.interner.resolve(sym.0).map(str::to_string));
     if let Some(sym) = self_sym {
         extractor.register_model_instance(sym, model_name);
     }
@@ -1403,14 +1418,14 @@ fn emit_model_backward_bridge(
         b.switch_to_block(entry);
         b.seal_block(entry);
 
-        let weight_ptrs   = b.block_params(entry)[0];
-        let _num_weights  = b.block_params(entry)[1];
-        let input_handle  = b.block_params(entry)[2];
+        let weight_ptrs = b.block_params(entry)[0];
+        let _num_weights = b.block_params(entry)[1];
+        let input_handle = b.block_params(entry)[2];
         // dy_handle: the upstream loss gradient dL/dy = 2·y computed by the
         // L2 wrapper (spec §4.2).  Must be used to seed the adjoint's loss_bar
         // VarId so weight gradients are scaled correctly; ignoring it would
         // silently corrupt per-head scoring magnitudes used by WGGO pruning.
-        let dy_handle     = b.block_params(entry)[3];
+        let dy_handle = b.block_params(entry)[3];
 
         // ── Step 1: load weight tensors from weight_ptrs ──────────────────
         // Mirrors emit_model_forward_bridge: call nsl_model_get_weight per field.
@@ -1418,23 +1433,20 @@ fn emit_model_backward_bridge(
         let model_get_weight_ref = compiler
             .module
             .declare_func_in_func(model_get_weight_id, b.func);
-        let tensor_free_ref = compiler
-            .module
-            .declare_func_in_func(tensor_free_id, b.func);
+        let tensor_free_ref = compiler.module.declare_func_in_func(tensor_free_id, b.func);
 
         let mut field_values: HashMap<String, cranelift_codegen::ir::Value> = HashMap::new();
         let mut loaded_weight_vals: Vec<cranelift_codegen::ir::Value> = Vec::new();
         for field_name in &tensor_fields {
             let qualified_name = format!("{model_name}.{field_name}");
-            let symbol = format!(
-                "__nsl_calib_bwd_weight_name_{}_{}",
-                model_name, field_name
-            );
+            let symbol = format!("__nsl_calib_bwd_weight_name_{}_{}", model_name, field_name);
             let name_data = declare_cstr_rodata(&mut compiler.module, &symbol, &qualified_name)?;
             let name_ref = compiler.module.declare_data_in_func(name_data, b.func);
             let name_ptr = b.ins().symbol_value(cl_types::I64, name_ref);
             let name_len = b.ins().iconst(cl_types::I64, qualified_name.len() as i64);
-            let call_inst = b.ins().call(model_get_weight_ref, &[weight_ptrs, name_ptr, name_len]);
+            let call_inst = b
+                .ins()
+                .call(model_get_weight_ref, &[weight_ptrs, name_ptr, name_len]);
             let tensor_val = b.inst_results(call_inst)[0];
             field_values.insert(field_name.clone(), tensor_val);
             loaded_weight_vals.push(tensor_val);
@@ -1515,7 +1527,9 @@ fn emit_model_backward_bridge(
         // `__nsl_calib_grad_arena` in the object's text section.
         // Spec §4.2 / test-spec §wggo_grad_arena_splice: "one relocation
         // per distinct W_* that the on_param_grad callback writes to."
-        let grad_arena_gv = compiler.module.declare_data_in_func(grad_arena_data_id, b.func);
+        let grad_arena_gv = compiler
+            .module
+            .declare_data_in_func(grad_arena_data_id, b.func);
 
         // ── Step 5: lower adjoint backward with on_param_grad callback ────
         // The callback: for each fired gradient VarId, load the raw data
@@ -1540,14 +1554,10 @@ fn emit_model_backward_bridge(
             let arena_base = fb.ins().symbol_value(cl_types::I64, grad_arena_gv);
             // Get raw data pointer from the NslTensor struct.
             // NslTensor.data is at offset NSL_TENSOR_DATA_OFFSET (= 8 bytes after magic).
-            const DATA_OFF: i32 =
-                nsl_runtime::tensor::NSL_TENSOR_DATA_OFFSET as i32;
-            let src_ptr = fb.ins().load(
-                cl_types::I64,
-                MemFlags::new(),
-                grad_val,
-                DATA_OFF,
-            );
+            const DATA_OFF: i32 = nsl_runtime::tensor::NSL_TENSOR_DATA_OFFSET as i32;
+            let src_ptr = fb
+                .ins()
+                .load(cl_types::I64, MemFlags::new(), grad_val, DATA_OFF);
             // Emit inline byte-copy loop to grad arena slot.
             crate::calibration::retention::emit_splice_memcpy(
                 fb,
@@ -1645,7 +1655,9 @@ fn emit_calibration_backward_wrapper(
     let mut desc_to_tensor_sig = compiler.module.make_signature();
     desc_to_tensor_sig.call_conv = compiler.call_conv;
     desc_to_tensor_sig.params.push(AbiParam::new(cl_types::I64));
-    desc_to_tensor_sig.returns.push(AbiParam::new(cl_types::I64));
+    desc_to_tensor_sig
+        .returns
+        .push(AbiParam::new(cl_types::I64));
     let desc_to_tensor_id = compiler
         .module
         .declare_function("nsl_desc_to_tensor", Linkage::Import, &desc_to_tensor_sig)
@@ -1721,11 +1733,8 @@ fn emit_calibration_backward_wrapper(
         //                            calibration batches are f32, so dtype=0 here.
         //   offset 32: device (i32, 0 = CPU)
         //   offset 36: pad (i32)
-        let desc_slot = b.create_sized_stack_slot(StackSlotData::new(
-            StackSlotKind::ExplicitSlot,
-            40,
-            3,
-        ));
+        let desc_slot =
+            b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 40, 3));
         let desc_addr = b.ins().stack_addr(cl_types::I64, desc_slot, 0);
         let zero_i64 = b.ins().iconst(cl_types::I64, 0);
         let zero_i32 = b.ins().iconst(cl_types::I32, 0);
@@ -1747,37 +1756,43 @@ fn emit_calibration_backward_wrapper(
         b.ins().store(MemFlags::trusted(), zero_i32, desc_addr, 32);
         b.ins().store(MemFlags::trusted(), zero_i32, desc_addr, 36);
 
-        let desc_to_tensor_ref =
-            compiler.module.declare_func_in_func(desc_to_tensor_id, b.func);
+        let desc_to_tensor_ref = compiler
+            .module
+            .declare_func_in_func(desc_to_tensor_id, b.func);
         let desc_call = b.ins().call(desc_to_tensor_ref, &[desc_addr]);
         let input_handle = b.inst_results(desc_call)[0];
 
         // ── Step 2: call model_forward(weight_ptrs, num_weights, input) → y. ──
-        let model_forward_ref =
-            compiler.module.declare_func_in_func(model_forward_id, b.func);
+        let model_forward_ref = compiler
+            .module
+            .declare_func_in_func(model_forward_id, b.func);
         let fwd_call = b
             .ins()
             .call(model_forward_ref, &[weight_ptrs, num_weights, input_handle]);
         let y_handle = b.inst_results(fwd_call)[0];
 
         // ── Step 3: dy = nsl_tensor_mul_scalar(y, 2.0, 0)  [L2: dL/dy = 2·y]. ──
-        let mul_scalar_ref =
-            compiler.module.declare_func_in_func(mul_scalar_id, b.func);
+        let mul_scalar_ref = compiler.module.declare_func_in_func(mul_scalar_id, b.func);
         let two_f64 = b.ins().f64const(2.0_f64);
         let flags_zero = b.ins().iconst(cl_types::I8, 0); // no FBIP relinquish flags
-        let dy_call = b.ins().call(mul_scalar_ref, &[y_handle, two_f64, flags_zero]);
+        let dy_call = b
+            .ins()
+            .call(mul_scalar_ref, &[y_handle, two_f64, flags_zero]);
         let dy_handle = b.inst_results(dy_call)[0];
 
         // ── Step 4: call model_backward(weight_ptrs, num_weights, input_handle, dy_handle). ──
         // Task 16: backward bridge now takes weight_ptrs and num_weights so it can
         // load weight tensors for source-AD primal forward re-run.
-        let model_backward_ref =
-            compiler.module.declare_func_in_func(model_backward_id, b.func);
-        b.ins().call(model_backward_ref, &[weight_ptrs, num_weights, input_handle, dy_handle]);
+        let model_backward_ref = compiler
+            .module
+            .declare_func_in_func(model_backward_id, b.func);
+        b.ins().call(
+            model_backward_ref,
+            &[weight_ptrs, num_weights, input_handle, dy_handle],
+        );
 
         // ── Step 5: free intermediates and return 0 (success). ──
-        let tensor_free_ref =
-            compiler.module.declare_func_in_func(tensor_free_id, b.func);
+        let tensor_free_ref = compiler.module.declare_func_in_func(tensor_free_id, b.func);
         b.ins().call(tensor_free_ref, &[input_handle]);
         b.ins().call(tensor_free_ref, &[y_handle]);
         b.ins().call(tensor_free_ref, &[dy_handle]);
@@ -1852,13 +1867,12 @@ pub fn emit_calibration_model_object(
     _arena_layout: &crate::calibration::ArenaLayout,
     out_path: &Path,
 ) -> Result<(), HarnessError> {
-    let bundle = opts
-        .calibration_compile_bundle
-        .as_ref()
-        .ok_or_else(|| HarnessError::Infrastructure {
-            reason: "emit_calibration_model_object requires calibration_compile_bundle"
-                .into(),
-        })?;
+    let bundle =
+        opts.calibration_compile_bundle
+            .as_ref()
+            .ok_or_else(|| HarnessError::Infrastructure {
+                reason: "emit_calibration_model_object requires calibration_compile_bundle".into(),
+            })?;
 
     let mut compile_opts = opts.clone();
 
@@ -1896,9 +1910,9 @@ pub fn emit_calibration_model_object(
             });
         }
     };
-    let first_projection = projections.first().expect(
-        "projections vec built from non-empty match arms — first() cannot fail",
-    );
+    let first_projection = projections
+        .first()
+        .expect("projections vec built from non-empty match arms — first() cannot fail");
     let channels = first_projection.weight_shape[1] as i64;
     let (batch, seq) = compile_opts.calibration_batch_seq.unwrap_or((8, 4));
     let model_name = first_projection
@@ -1920,11 +1934,12 @@ pub fn emit_calibration_model_object(
                 .map(str::to_string)
         })
         .collect();
-    let model_def = awq_model_def_from_ast(ast, &bundle.interner, &model_name).ok_or_else(|| {
-        HarnessError::Infrastructure {
-            reason: format!("cannot find AWQ model '{model_name}' in AST"),
-        }
-    })?;
+    let model_def =
+        awq_model_def_from_ast(ast, &bundle.interner, &model_name).ok_or_else(|| {
+            HarnessError::Infrastructure {
+                reason: format!("cannot find AWQ model '{model_name}' in AST"),
+            }
+        })?;
 
     // Spec safety: backward wrapper synthesises L2 loss from forward's output (dy = 2y).
     // A void-returning forward has no tensor to differentiate against — passing a null
@@ -1983,9 +1998,15 @@ pub fn emit_calibration_model_object(
     compiler.call_conv = call_conv;
 
     map_codegen_error("intern empty string", compiler.intern_string(""))?;
-    map_codegen_error("collect strings", compiler.collect_strings(&bundle.ast.stmts))?;
+    map_codegen_error(
+        "collect strings",
+        compiler.collect_strings(&bundle.ast.stmts),
+    )?;
     map_codegen_error("collect enums", compiler.collect_enums(&bundle.ast.stmts))?;
-    map_codegen_error("collect structs", compiler.collect_structs(&bundle.ast.stmts))?;
+    map_codegen_error(
+        "collect structs",
+        compiler.collect_structs(&bundle.ast.stmts),
+    )?;
     map_codegen_error("collect models", compiler.collect_models(&bundle.ast.stmts))?;
     map_codegen_error("emit retention arena", compiler.emit_retention_arena())?;
     // Task 10: backward (WGGO grad) sibling arena — spec §7.2 ordering invariant #2.
@@ -2002,9 +2023,7 @@ pub fn emit_calibration_model_object(
     // This fires when callers bypass the pre-scan refusal gate (`enforce_grad_mode_refusals`
     // in entry_points.rs) and pre-populate `calibration_grad_retention` themselves;
     // normal flows produce more actionable messages via the §5.4–§5.6 refusals above.
-    if compile_opts.calibration_grad_retention.is_some()
-        && compiler.grad_arena_layout.is_none()
-    {
+    if compile_opts.calibration_grad_retention.is_some() && compiler.grad_arena_layout.is_none() {
         return Err(HarnessError::Infrastructure {
             reason: "calibration: backward pass emitted but no grad observations declared.\n\
   requested:  run calibration subprocess with backward pass\n\
@@ -2019,7 +2038,10 @@ pub fn emit_calibration_model_object(
         });
     }
 
-    map_codegen_error("declare runtime functions", compiler.declare_runtime_functions())?;
+    map_codegen_error(
+        "declare runtime functions",
+        compiler.declare_runtime_functions(),
+    )?;
     map_codegen_error(
         "declare user functions",
         compiler.declare_user_functions(&model_only_stmts),
@@ -2030,7 +2052,10 @@ pub fn emit_calibration_model_object(
         "compile datatype defs",
         compiler.compile_datatype_defs(&bundle.ast.stmts),
     )?;
-    map_codegen_error("compile kernels", compiler.compile_kernels(&bundle.ast.stmts))?;
+    map_codegen_error(
+        "compile kernels",
+        compiler.compile_kernels(&bundle.ast.stmts),
+    )?;
     map_codegen_error(
         "compile flash-attention kernels",
         compiler.compile_flash_attention_kernels(&bundle.ast.stmts),
@@ -2050,12 +2075,8 @@ pub fn emit_calibration_model_object(
         compiler.compile_pending_lambdas(),
     )?;
 
-    let model_forward_id = emit_model_forward_bridge(
-        &mut compiler,
-        &model_name,
-        model_def,
-        &transpose_fields,
-    )?;
+    let model_forward_id =
+        emit_model_forward_bridge(&mut compiler, &model_name, model_def, &transpose_fields)?;
     emit_calibration_forward_wrapper(&mut compiler, model_forward_id, batch, seq, channels)?;
 
     // Spec §4.2: when grad retention is requested, also emit the backward path.
@@ -2170,7 +2191,12 @@ pub fn emit_calibration_scaffolding_object(
     let mut json_bytes: Vec<u8> = sidecar_json.to_vec();
     json_bytes.push(0);
     let json_data = module
-        .declare_data("__nsl_calibration_sidecar_json", Linkage::Local, false, false)
+        .declare_data(
+            "__nsl_calibration_sidecar_json",
+            Linkage::Local,
+            false,
+            false,
+        )
         .map_err(|e| HarnessError::Infrastructure {
             reason: format!("declare sidecar-json data: {e}"),
         })?;
@@ -2322,13 +2348,9 @@ pub fn emit_calibration_scaffolding_object(
                     .map(|(_, after)| after)
                     .unwrap_or(proj_path);
                 let qualified = format!("{}.{}", target.class_name, field);
-                let sym = format!(
-                    "__nsl_wggo_projname.{}",
-                    qualified.replace('.', "_")
-                );
+                let sym = format!("__nsl_wggo_projname.{}", qualified.replace('.', "_"));
                 let key_id = declare_cstr_rodata(&mut module, &sym, &qualified)?;
-                wggo_proj_name_data_ids
-                    .insert((proj_path.to_string(), qualified), key_id);
+                wggo_proj_name_data_ids.insert((proj_path.to_string(), qualified), key_id);
             }
         }
     }
@@ -2424,7 +2446,11 @@ pub fn emit_calibration_scaffolding_object(
     calib_batch_sig.params.push(AbiParam::new(cl_types::I64));
     calib_batch_sig.params.push(AbiParam::new(cl_types::I64));
     let calib_batch_id = module
-        .declare_function("nsl_calibration_batch_at", Linkage::Import, &calib_batch_sig)
+        .declare_function(
+            "nsl_calibration_batch_at",
+            Linkage::Import,
+            &calib_batch_sig,
+        )
         .map_err(|e| HarnessError::Infrastructure {
             reason: format!("declare nsl_calibration_batch_at: {e}"),
         })?;
@@ -2448,7 +2474,11 @@ pub fn emit_calibration_scaffolding_object(
     write_sidecar_sig.params.push(AbiParam::new(ptr_ty)); // wggo_count
     write_sidecar_sig.returns.push(AbiParam::new(cl_types::I32));
     let write_sidecar_id = module
-        .declare_function("nsl_calib_write_sidecar", Linkage::Import, &write_sidecar_sig)
+        .declare_function(
+            "nsl_calib_write_sidecar",
+            Linkage::Import,
+            &write_sidecar_sig,
+        )
         .map_err(|e| HarnessError::Infrastructure {
             reason: format!("declare nsl_calib_write_sidecar: {e}"),
         })?;
@@ -2476,7 +2506,9 @@ pub fn emit_calibration_scaffolding_object(
     let mut model_num_weights_sig = module.make_signature();
     model_num_weights_sig.call_conv = call_conv;
     model_num_weights_sig.params.push(AbiParam::new(ptr_ty));
-    model_num_weights_sig.returns.push(AbiParam::new(cl_types::I64));
+    model_num_weights_sig
+        .returns
+        .push(AbiParam::new(cl_types::I64));
     let model_num_weights_id = module
         .declare_function(
             "nsl_model_get_num_weights",
@@ -2634,21 +2666,12 @@ pub fn emit_calibration_scaffolding_object(
             let zero = b.ins().iconst(cl_types::I32, 0);
             b.ins().return_(&[zero]);
         } else {
-            let model_ptr_slot = b.create_sized_stack_slot(StackSlotData::new(
-                StackSlotKind::ExplicitSlot,
-                8,
-                0,
-            ));
-            let weight_ptrs_slot = b.create_sized_stack_slot(StackSlotData::new(
-                StackSlotKind::ExplicitSlot,
-                8,
-                0,
-            ));
-            let num_weights_slot = b.create_sized_stack_slot(StackSlotData::new(
-                StackSlotKind::ExplicitSlot,
-                8,
-                0,
-            ));
+            let model_ptr_slot =
+                b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 0));
+            let weight_ptrs_slot =
+                b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 0));
+            let num_weights_slot =
+                b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 0));
             let model_ptr_addr = b.ins().stack_addr(cl_types::I64, model_ptr_slot, 0);
             let weight_ptrs_addr = b.ins().stack_addr(cl_types::I64, weight_ptrs_slot, 0);
             let num_weights_addr = b.ins().stack_addr(cl_types::I64, num_weights_slot, 0);
@@ -2684,7 +2707,8 @@ pub fn emit_calibration_scaffolding_object(
             let count_call = b.ins().call(calib_count_ref, &[lm_batches]);
             let count = b.inst_results(count_call)[0];
             let has_batches = b.ins().icmp(IntCC::NotEqual, count, zero_i64);
-            b.ins().brif(has_batches, batch_preflight, &[], model_create_entry, &[]);
+            b.ins()
+                .brif(has_batches, batch_preflight, &[], model_create_entry, &[]);
 
             b.switch_to_block(batch_preflight);
             b.seal_block(batch_preflight);
@@ -2705,15 +2729,22 @@ pub fn emit_calibration_scaffolding_object(
                 let out_ptr_addr = b.ins().stack_addr(cl_types::I64, out_ptr_slot, 0);
                 let out_len_addr = b.ins().stack_addr(cl_types::I64, out_len_slot, 0);
                 let calib_batch_ref = module.declare_func_in_func(calib_batch_id, b.func);
-                b.ins().call(calib_batch_ref, &[lm_batches, zero_i64, out_ptr_addr, out_len_addr]);
+                b.ins().call(
+                    calib_batch_ref,
+                    &[lm_batches, zero_i64, out_ptr_addr, out_len_addr],
+                );
 
-                let batch_len = b.ins().load(cl_types::I64, MemFlags::new(), out_len_addr, 0);
+                let batch_len = b
+                    .ins()
+                    .load(cl_types::I64, MemFlags::new(), out_len_addr, 0);
                 let actual_batch_elems = b.ins().ushr_imm(batch_len, 2);
                 let expected_batch_elems =
                     b.ins().iconst(cl_types::I64, (first_entry.2 / 4) as i64);
-                let batch_ok =
-                    b.ins().icmp(IntCC::Equal, actual_batch_elems, expected_batch_elems);
-                b.ins().brif(batch_ok, model_create_entry, &[], batch_shape_err, &[]);
+                let batch_ok = b
+                    .ins()
+                    .icmp(IntCC::Equal, actual_batch_elems, expected_batch_elems);
+                b.ins()
+                    .brif(batch_ok, model_create_entry, &[], batch_shape_err, &[]);
 
                 b.switch_to_block(batch_shape_err);
                 b.seal_block(batch_shape_err);
@@ -2789,15 +2820,18 @@ pub fn emit_calibration_scaffolding_object(
             let num_weights_call = b.ins().call(model_num_weights_ref, &[mr_model_ptr]);
             let num_weights = b.inst_results(num_weights_call)[0];
 
-            let model_weight_ptrs_ref =
-                module.declare_func_in_func(model_weight_ptrs_id, b.func);
+            let model_weight_ptrs_ref = module.declare_func_in_func(model_weight_ptrs_id, b.func);
             let weight_ptrs_call = b.ins().call(model_weight_ptrs_ref, &[mr_model_ptr]);
             let weight_ptrs = b.inst_results(weight_ptrs_call)[0];
 
-            b.ins().store(MemFlags::new(), mr_model_ptr, model_ptr_addr, 0);
-            b.ins().store(MemFlags::new(), weight_ptrs, weight_ptrs_addr, 0);
-            b.ins().store(MemFlags::new(), num_weights, num_weights_addr, 0);
-            b.ins().jump(loop_header, &[mr_batches, mr_sidecar_ptr, zero_i64]);
+            b.ins()
+                .store(MemFlags::new(), mr_model_ptr, model_ptr_addr, 0);
+            b.ins()
+                .store(MemFlags::new(), weight_ptrs, weight_ptrs_addr, 0);
+            b.ins()
+                .store(MemFlags::new(), num_weights, num_weights_addr, 0);
+            b.ins()
+                .jump(loop_header, &[mr_batches, mr_sidecar_ptr, zero_i64]);
 
             b.switch_to_block(loop_header);
             let lh_batches = b.block_params(loop_header)[0];
@@ -2808,32 +2842,43 @@ pub fn emit_calibration_scaffolding_object(
             let count_call = b.ins().call(calib_count_ref, &[lh_batches]);
             let count = b.inst_results(count_call)[0];
             let loop_cond = b.ins().icmp(IntCC::UnsignedLessThan, i_cur, count);
-            b.ins().brif(loop_cond, loop_body, &[], loop_exit, &[lh_batches, lh_sidecar_ptr]);
+            b.ins().brif(
+                loop_cond,
+                loop_body,
+                &[],
+                loop_exit,
+                &[lh_batches, lh_sidecar_ptr],
+            );
 
             b.switch_to_block(loop_body);
             b.seal_block(loop_body);
 
-            let out_ptr_slot = b.create_sized_stack_slot(StackSlotData::new(
-                StackSlotKind::ExplicitSlot,
-                8,
-                0,
-            ));
-            let out_len_slot = b.create_sized_stack_slot(StackSlotData::new(
-                StackSlotKind::ExplicitSlot,
-                8,
-                0,
-            ));
+            let out_ptr_slot =
+                b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 0));
+            let out_len_slot =
+                b.create_sized_stack_slot(StackSlotData::new(StackSlotKind::ExplicitSlot, 8, 0));
             let out_ptr_addr = b.ins().stack_addr(cl_types::I64, out_ptr_slot, 0);
             let out_len_addr = b.ins().stack_addr(cl_types::I64, out_len_slot, 0);
 
             let calib_batch_ref = module.declare_func_in_func(calib_batch_id, b.func);
-            b.ins().call(calib_batch_ref, &[lh_batches, i_cur, out_ptr_addr, out_len_addr]);
+            b.ins().call(
+                calib_batch_ref,
+                &[lh_batches, i_cur, out_ptr_addr, out_len_addr],
+            );
 
-            let batch_ptr = b.ins().load(cl_types::I64, MemFlags::new(), out_ptr_addr, 0);
-            let batch_len = b.ins().load(cl_types::I64, MemFlags::new(), out_len_addr, 0);
+            let batch_ptr = b
+                .ins()
+                .load(cl_types::I64, MemFlags::new(), out_ptr_addr, 0);
+            let batch_len = b
+                .ins()
+                .load(cl_types::I64, MemFlags::new(), out_len_addr, 0);
             let batch_elems = b.ins().ushr_imm(batch_len, 2);
-            let model_ptr = b.ins().load(cl_types::I64, MemFlags::new(), model_ptr_addr, 0);
-            let num_weights = b.ins().load(cl_types::I64, MemFlags::new(), num_weights_addr, 0);
+            let model_ptr = b
+                .ins()
+                .load(cl_types::I64, MemFlags::new(), model_ptr_addr, 0);
+            let num_weights = b
+                .ins()
+                .load(cl_types::I64, MemFlags::new(), num_weights_addr, 0);
 
             // Task 17 (spec §4.5): dispatch to backward wrapper when needs_backward,
             // otherwise call forward.  The backward wrapper internally runs forward
@@ -2846,23 +2891,23 @@ pub fn emit_calibration_scaffolding_object(
             // this argument so the bytes-vs-elements mismatch was latent.
             let call_status = if needs_backward {
                 let bwd_ref = module.declare_func_in_func(
-                    calib_model_backward_id.expect("calib_model_backward_id is Some when needs_backward"),
+                    calib_model_backward_id
+                        .expect("calib_model_backward_id is Some when needs_backward"),
                     b.func,
                 );
-                let bwd_call = b.ins().call(
-                    bwd_ref,
-                    &[model_ptr, num_weights, batch_ptr, batch_elems],
-                );
+                let bwd_call = b
+                    .ins()
+                    .call(bwd_ref, &[model_ptr, num_weights, batch_ptr, batch_elems]);
                 b.inst_results(bwd_call)[0]
             } else {
                 let fwd_ref = module.declare_func_in_func(
-                    calib_model_forward_id.expect("calib_model_forward_id is Some when !needs_backward"),
+                    calib_model_forward_id
+                        .expect("calib_model_forward_id is Some when !needs_backward"),
                     b.func,
                 );
-                let fwd_call = b.ins().call(
-                    fwd_ref,
-                    &[model_ptr, num_weights, batch_ptr, batch_elems],
-                );
+                let fwd_call = b
+                    .ins()
+                    .call(fwd_ref, &[model_ptr, num_weights, batch_ptr, batch_elems]);
                 b.inst_results(fwd_call)[0]
             };
 
@@ -2886,13 +2931,13 @@ pub fn emit_calibration_scaffolding_object(
             b.switch_to_block(batch_mismatch_mid_loop);
             b.seal_block(batch_mismatch_mid_loop);
             let mid_mismatch_ref = module.declare_data_in_func(
-                batch_shape_mismatch_data
-                    .expect("forward path defines batch-shape mismatch data"),
+                batch_shape_mismatch_data.expect("forward path defines batch-shape mismatch data"),
                 b.func,
             );
             let mid_mismatch_ptr = b.ins().symbol_value(ptr_ty, mid_mismatch_ref);
             let mid_write_ref = module.declare_func_in_func(write_file_id, b.func);
-            b.ins().call(mid_write_ref, &[lh_sidecar_ptr, mid_mismatch_ptr]);
+            b.ins()
+                .call(mid_write_ref, &[lh_sidecar_ptr, mid_mismatch_ptr]);
             let mid_free_ref = module.declare_func_in_func(_calib_free_id, b.func);
             b.ins().call(mid_free_ref, &[lh_batches]);
             let mid_three = b.ins().iconst(cl_types::I32, 3);
@@ -2902,7 +2947,8 @@ pub fn emit_calibration_scaffolding_object(
             b.seal_block(observe_continue);
 
             for entry in observe_plan {
-                let arena_id = arena_data_id.expect("arena_data_id is Some when observe_plan is non-empty");
+                let arena_id =
+                    arena_data_id.expect("arena_data_id is Some when observe_plan is non-empty");
                 let arena_gv = module.declare_data_in_func(arena_id, b.func);
                 let arena_base = b.ins().symbol_value(ptr_ty, arena_gv);
                 let run_id = running_data_ids[&entry.running_symbol];
@@ -2941,12 +2987,12 @@ pub fn emit_calibration_scaffolding_object(
                         0,
                     ));
                     for sym in per_step_backward_symbols {
-                        let run_id = running_data_ids
-                            .get(sym.as_str())
-                            .unwrap_or_else(|| panic!(
+                        let run_id = running_data_ids.get(sym.as_str()).unwrap_or_else(|| {
+                            panic!(
                                 "per_step_backward_symbols entry '{sym}' not found in \
                                  running_data_ids — ensure it appears in finalize_plan"
-                            ));
+                            )
+                        });
                         let run_gv = module.declare_data_in_func(*run_id, b.func);
                         let run_ptr = b.ins().symbol_value(ptr_ty, run_gv);
                         b.ins().stack_store(run_ptr, scratch_slot, 0);
@@ -2989,10 +3035,8 @@ pub fn emit_calibration_scaffolding_object(
                     for target in wggo_targets.iter() {
                         let n_o_heads = wggo_n_o_heads(target);
 
-                        let running_sym = format!(
-                            "__nsl_wggo_grad.{}",
-                            target.layer_key.replace('.', "_")
-                        );
+                        let running_sym =
+                            format!("__nsl_wggo_grad.{}", target.layer_key.replace('.', "_"));
                         // Pre-scan/finalize-plan disagreement: skip rather than emitting a
                         // corrupt accumulation. The descriptor stack-build below treats this
                         // case as a hard error because a missing pointer there would write
@@ -3018,11 +3062,10 @@ pub fn emit_calibration_scaffolding_object(
                                 (proj_shape[0] / target.head_dim).max(1)
                             };
 
-                            let (byte_offset, byte_size) =
-                                match layout_map.get(*proj_path) {
-                                    Some(&v) => v,
-                                    None => continue, // projection not in grad arena; skip
-                                };
+                            let (byte_offset, byte_size) = match layout_map.get(*proj_path) {
+                                Some(&v) => v,
+                                None => continue, // projection not in grad arena; skip
+                            };
 
                             let total_f32 = byte_size / 4;
                             if n_proj_heads == 0 || total_f32 % n_proj_heads != 0 {
@@ -3055,14 +3098,17 @@ pub fn emit_calibration_scaffolding_object(
                             // (see `emit_model_forward_bridge`); reusing it here
                             // keeps the WGGO accumulator on the same code path
                             // as the model body.
-                            let model_ptr =
-                                b.ins().load(ptr_ty, cranelift_codegen::ir::MemFlags::new(), model_ptr_addr, 0);
+                            let model_ptr = b.ins().load(
+                                ptr_ty,
+                                cranelift_codegen::ir::MemFlags::new(),
+                                model_ptr_addr,
+                                0,
+                            );
                             let field = proj_path
                                 .split_once('.')
                                 .map(|(_, after)| after)
                                 .unwrap_or(*proj_path);
-                            let qualified =
-                                format!("{}.{}", target.class_name, field);
+                            let qualified = format!("{}.{}", target.class_name, field);
                             let name_data_id = wggo_proj_name_data_ids
                                 .get(&(proj_path.to_string(), qualified.clone()))
                                 .copied()
@@ -3073,11 +3119,9 @@ pub fn emit_calibration_scaffolding_object(
                                      (target, projection) tuples as the codegen \
                                      loop",
                                 );
-                            let name_gv =
-                                module.declare_data_in_func(name_data_id, b.func);
+                            let name_gv = module.declare_data_in_func(name_data_id, b.func);
                             let name_ptr = b.ins().symbol_value(ptr_ty, name_gv);
-                            let name_len =
-                                b.ins().iconst(ptr_ty, qualified.len() as i64);
+                            let name_len = b.ins().iconst(ptr_ty, qualified.len() as i64);
                             let get_weight_ref = module.declare_func_in_func(
                                 nsl_model_get_weight_id.expect(
                                     "nsl_model_get_weight_id is Some when \
@@ -3085,10 +3129,9 @@ pub fn emit_calibration_scaffolding_object(
                                 ),
                                 b.func,
                             );
-                            let weight_call = b.ins().call(
-                                get_weight_ref,
-                                &[model_ptr, name_ptr, name_len],
-                            );
+                            let weight_call = b
+                                .ins()
+                                .call(get_weight_ref, &[model_ptr, name_ptr, name_len]);
                             let weight_handle = b.inst_results(weight_call)[0];
 
                             // Dereference the NslTensor's `data` field to obtain
@@ -3131,7 +3174,8 @@ pub fn emit_calibration_scaffolding_object(
 
             let one_i64 = b.ins().iconst(cl_types::I64, 1);
             let i_next = b.ins().iadd(i_cur, one_i64);
-            b.ins().jump(loop_header, &[lh_batches, lh_sidecar_ptr, i_next]);
+            b.ins()
+                .jump(loop_header, &[lh_batches, lh_sidecar_ptr, i_next]);
 
             b.seal_block(loop_header);
 
@@ -3153,7 +3197,9 @@ pub fn emit_calibration_scaffolding_object(
                 let json_ptr = b.ins().symbol_value(cl_types::I64, json_gv);
                 let write_ref = module.declare_func_in_func(write_file_id, b.func);
                 b.ins().call(write_ref, &[fin_sidecar_ptr, json_ptr]);
-                let model_ptr = b.ins().load(cl_types::I64, MemFlags::new(), model_ptr_addr, 0);
+                let model_ptr = b
+                    .ins()
+                    .load(cl_types::I64, MemFlags::new(), model_ptr_addr, 0);
                 b.ins().call(model_destroy_ref, &[model_ptr]);
                 b.ins().call(calib_free_ref, &[fin_batches]);
                 let zero = b.ins().iconst(cl_types::I32, 0);
@@ -3175,8 +3221,7 @@ pub fn emit_calibration_scaffolding_object(
                     .iter()
                     .filter(|fp| fp.bytes_per_element == 4)
                     .collect();
-                let awq_desc_bytes =
-                    (awq_finalize_entries.len() as u32) * AWQ_DESC_BYTES;
+                let awq_desc_bytes = (awq_finalize_entries.len() as u32) * AWQ_DESC_BYTES;
                 // Cranelift requires every stack slot to be at least 1 byte;
                 // when there are no AWQ entries we still need a non-zero slot
                 // so the `stack_addr` instruction is valid. The base pointer
@@ -3215,8 +3260,7 @@ pub fn emit_calibration_scaffolding_object(
                 let sc_len_call = b.ins().call(strlen_ref2, &[fin_sidecar_ptr]);
                 let sidecar_path_len = b.inst_results(sc_len_call)[0];
 
-                let desc_count =
-                    b.ins().iconst(ptr_ty, awq_finalize_entries.len() as i64);
+                let desc_count = b.ins().iconst(ptr_ty, awq_finalize_entries.len() as i64);
 
                 // Task 3.6: build the WGGO descriptor array on the stack.
                 // `WggoLayerDescriptor` is 48 bytes, 8-byte aligned (spec §6.2).
@@ -3234,15 +3278,13 @@ pub fn emit_calibration_scaffolding_object(
                     (null_ptr, zero_wggo)
                 } else {
                     // Get batches_observed count.
-                    let calib_count_ref3 =
-                        module.declare_func_in_func(calib_count_id, b.func);
+                    let calib_count_ref3 = module.declare_func_in_func(calib_count_id, b.func);
                     let count_call3 = b.ins().call(calib_count_ref3, &[fin_batches]);
                     fin_batches_count_v = b.inst_results(count_call3)[0];
                     // Truncate i64 count to i32 for the descriptor field.
                     let batches_i32 = b.ins().ireduce(cl_types::I32, fin_batches_count_v);
 
-                    let total_wggo_bytes =
-                        (wggo_targets.len() as u32) * WGGO_DESC_BYTES;
+                    let total_wggo_bytes = (wggo_targets.len() as u32) * WGGO_DESC_BYTES;
                     let wggo_slot = b.create_sized_stack_slot(StackSlotData::new(
                         StackSlotKind::ExplicitSlot,
                         total_wggo_bytes,
@@ -3268,22 +3310,18 @@ pub fn emit_calibration_scaffolding_object(
                         b.ins().stack_store(key_ptr, wggo_slot, off + 8);
 
                         // layer_key_len: usize at offset 16
-                        let key_len_v =
-                            b.ins().iconst(ptr_ty, target.layer_key.len() as i64);
+                        let key_len_v = b.ins().iconst(ptr_ty, target.layer_key.len() as i64);
                         b.ins().stack_store(key_len_v, wggo_slot, off + 16);
 
                         // running_buffer_len: u32 at offset 24 (number of f64 slots = n_o_heads)
                         let n_o_heads = wggo_n_o_heads(target);
-                        let n_heads_v =
-                            b.ins().iconst(cl_types::I32, n_o_heads as i64);
+                        let n_heads_v = b.ins().iconst(cl_types::I32, n_o_heads as i64);
                         b.ins().stack_store(n_heads_v, wggo_slot, off + 24);
                         // _pad1: u32 at offset 28 — zero-initialised
 
                         // running_ptr: *const f64 at offset 32 (BSS running buffer)
-                        let running_sym = format!(
-                            "__nsl_wggo_grad.{}",
-                            target.layer_key.replace('.', "_")
-                        );
+                        let running_sym =
+                            format!("__nsl_wggo_grad.{}", target.layer_key.replace('.', "_"));
                         // A missing running_ptr here would write null into the descriptor —
                         // hard fail to prevent silent data corruption. The per-step block above
                         // can `continue` because a skipped batch is observable; a null pointer
@@ -3305,8 +3343,7 @@ pub fn emit_calibration_scaffolding_object(
                         // _pad2: u32 at offset 44 — zero-initialised
                     }
 
-                    let wggo_count =
-                        b.ins().iconst(ptr_ty, wggo_targets.len() as i64);
+                    let wggo_count = b.ins().iconst(ptr_ty, wggo_targets.len() as i64);
                     (base_v, wggo_count)
                 };
                 // Suppress unused-variable warning in the wggo_targets.is_empty() branch.
@@ -3315,10 +3352,19 @@ pub fn emit_calibration_scaffolding_object(
                 let write_sidecar_ref = module.declare_func_in_func(write_sidecar_id, b.func);
                 let ws_call = b.ins().call(
                     write_sidecar_ref,
-                    &[fin_sidecar_ptr, sidecar_path_len, descs_base, desc_count, wggo_descs_base, wggo_count_v],
+                    &[
+                        fin_sidecar_ptr,
+                        sidecar_path_len,
+                        descs_base,
+                        desc_count,
+                        wggo_descs_base,
+                        wggo_count_v,
+                    ],
                 );
                 let rc = b.inst_results(ws_call)[0];
-                let model_ptr = b.ins().load(cl_types::I64, MemFlags::new(), model_ptr_addr, 0);
+                let model_ptr = b
+                    .ins()
+                    .load(cl_types::I64, MemFlags::new(), model_ptr_addr, 0);
                 b.ins().call(model_destroy_ref, &[model_ptr]);
                 b.ins().call(calib_free_ref, &[fin_batches]);
 
@@ -3474,9 +3520,10 @@ fn emit_and_link_calibration_binary(
     let flag_builder = {
         use cranelift_codegen::settings::Configurable as _;
         let mut b = cranelift_codegen::settings::builder();
-        b.enable("is_pic").map_err(|e| HarnessError::Infrastructure {
-            reason: format!("cranelift enable is_pic: {e}"),
-        })?;
+        b.enable("is_pic")
+            .map_err(|e| HarnessError::Infrastructure {
+                reason: format!("cranelift enable is_pic: {e}"),
+            })?;
         b
     };
     #[cfg(not(target_os = "macos"))]
@@ -3522,7 +3569,12 @@ fn emit_and_link_calibration_binary(
     let mut json_bytes: Vec<u8> = sidecar_json.to_vec();
     json_bytes.push(0);
     let json_data = module
-        .declare_data("__nsl_calibration_sidecar_json", Linkage::Local, false, false)
+        .declare_data(
+            "__nsl_calibration_sidecar_json",
+            Linkage::Local,
+            false,
+            false,
+        )
         .map_err(|e| HarnessError::Infrastructure {
             reason: format!("declare sidecar-json data: {e}"),
         })?;
@@ -3660,7 +3712,11 @@ fn emit_and_link_calibration_binary(
     calib_batch_sig.params.push(AbiParam::new(cl_types::I64)); // *out_ptr
     calib_batch_sig.params.push(AbiParam::new(cl_types::I64)); // *out_len
     let calib_batch_id = module
-        .declare_function("nsl_calibration_batch_at", Linkage::Import, &calib_batch_sig)
+        .declare_function(
+            "nsl_calibration_batch_at",
+            Linkage::Import,
+            &calib_batch_sig,
+        )
         .map_err(|e| HarnessError::Infrastructure {
             reason: format!("declare nsl_calibration_batch_at: {e}"),
         })?;
@@ -3686,7 +3742,11 @@ fn emit_and_link_calibration_binary(
     write_sidecar_sig.params.push(AbiParam::new(ptr_ty)); // wggo_count
     write_sidecar_sig.returns.push(AbiParam::new(cl_types::I32));
     let write_sidecar_id = module
-        .declare_function("nsl_calib_write_sidecar", Linkage::Import, &write_sidecar_sig)
+        .declare_function(
+            "nsl_calib_write_sidecar",
+            Linkage::Import,
+            &write_sidecar_sig,
+        )
         .map_err(|e| HarnessError::Infrastructure {
             reason: format!("declare nsl_calib_write_sidecar: {e}"),
         })?;
@@ -3733,8 +3793,8 @@ fn emit_and_link_calibration_binary(
         //   write_err: return rc
         //   write_ok: return 0
 
-        let entry       = b.create_block();
-        let argc_err    = b.create_block();
+        let entry = b.create_block();
+        let argc_err = b.create_block();
 
         b.append_block_params_for_function_params(entry);
 
@@ -3744,7 +3804,9 @@ fn emit_and_link_calibration_binary(
         let argc = b.block_params(entry)[0];
         let argv = b.block_params(entry)[1];
         let four_i32 = b.ins().iconst(cl_types::I32, 4);
-        let argc_ok = b.ins().icmp(IntCC::SignedGreaterThanOrEqual, argc, four_i32);
+        let argc_ok = b
+            .ins()
+            .icmp(IntCC::SignedGreaterThanOrEqual, argc, four_i32);
 
         if !needs_forward_pass {
             // ── Observation-free path: just write pre-baked sidecar JSON ──
@@ -3763,7 +3825,9 @@ fn emit_and_link_calibration_binary(
 
             let off2 = b.ins().iconst(cl_types::I64, 16i64);
             let argv2_addr = b.ins().iadd(argv, off2);
-            let sidecar_path_ptr = b.ins().load(cl_types::I64, MemFlags::trusted(), argv2_addr, 0);
+            let sidecar_path_ptr = b
+                .ins()
+                .load(cl_types::I64, MemFlags::trusted(), argv2_addr, 0);
 
             let json_gv = module.declare_data_in_func(json_data, b.func);
             let json_ptr = b.ins().symbol_value(cl_types::I64, json_gv);
@@ -3776,14 +3840,14 @@ fn emit_and_link_calibration_binary(
             b.finalize();
         } else {
             // ── Forward-pass path: load calibration data + batch loop ──
-            let load_data   = b.create_block();
-            let data_null   = b.create_block();
+            let load_data = b.create_block();
+            let data_null = b.create_block();
             let loop_header = b.create_block();
-            let loop_body   = b.create_block();
-            let loop_exit   = b.create_block();
-            let finalize    = b.create_block();
-            let write_ok    = b.create_block();
-            let write_err   = b.create_block();
+            let loop_body = b.create_block();
+            let loop_exit = b.create_block();
+            let finalize = b.create_block();
+            let write_ok = b.create_block();
+            let write_err = b.create_block();
 
             // loop_header params: (batches_ptr: I64, sidecar_path_ptr: I64, i: I64)
             b.append_block_param(loop_header, cl_types::I64);
@@ -3811,23 +3875,31 @@ fn emit_and_link_calibration_binary(
             let argv1_addr = b.ins().iadd(argv, off1);
             let argv2_addr = b.ins().iadd(argv, off2);
 
-            let data_path_ptr    = b.ins().load(cl_types::I64, MemFlags::trusted(), argv1_addr, 0);
-            let sidecar_path_ptr = b.ins().load(cl_types::I64, MemFlags::trusted(), argv2_addr, 0);
+            let data_path_ptr = b
+                .ins()
+                .load(cl_types::I64, MemFlags::trusted(), argv1_addr, 0);
+            let sidecar_path_ptr = b
+                .ins()
+                .load(cl_types::I64, MemFlags::trusted(), argv2_addr, 0);
 
             let strlen_ref = module.declare_func_in_func(strlen_id, b.func);
             let data_len_call = b.ins().call(strlen_ref, &[data_path_ptr]);
             let data_path_len = b.inst_results(data_len_call)[0];
 
             let calib_load_ref = module.declare_func_in_func(calib_load_id, b.func);
-            let calib_call = b.ins().call(calib_load_ref, &[data_path_ptr, data_path_len]);
+            let calib_call = b
+                .ins()
+                .call(calib_load_ref, &[data_path_ptr, data_path_len]);
             let batches_ptr = b.inst_results(calib_call)[0];
 
             let batches_ok = b.ins().icmp_imm(IntCC::NotEqual, batches_ptr, 0);
             let zero_i64 = b.ins().iconst(cl_types::I64, 0);
             b.ins().brif(
                 batches_ok,
-                loop_header, &[batches_ptr, sidecar_path_ptr, zero_i64],
-                data_null, &[],
+                loop_header,
+                &[batches_ptr, sidecar_path_ptr, zero_i64],
+                data_null,
+                &[],
             );
 
             // data_null: return 4
@@ -3838,39 +3910,50 @@ fn emit_and_link_calibration_binary(
 
             // loop_header: if i < count → loop_body else loop_exit
             b.switch_to_block(loop_header);
-            let lh_batches     = b.block_params(loop_header)[0];
+            let lh_batches = b.block_params(loop_header)[0];
             let lh_sidecar_ptr = b.block_params(loop_header)[1];
-            let i_cur          = b.block_params(loop_header)[2];
+            let i_cur = b.block_params(loop_header)[2];
 
             let calib_count_ref = module.declare_func_in_func(calib_count_id, b.func);
             let count_call = b.ins().call(calib_count_ref, &[lh_batches]);
             let count = b.inst_results(count_call)[0];
 
             let loop_cond = b.ins().icmp(IntCC::UnsignedLessThan, i_cur, count);
-            b.ins().brif(loop_cond, loop_body, &[], loop_exit, &[lh_sidecar_ptr]);
+            b.ins()
+                .brif(loop_cond, loop_body, &[], loop_exit, &[lh_sidecar_ptr]);
 
             // loop_body: call nsl_calibration_batch_at + plan-driven 2D max-abs loops
             b.switch_to_block(loop_body);
             b.seal_block(loop_body);
 
-            let out_ptr_slot = b.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
-                cranelift_codegen::ir::StackSlotKind::ExplicitSlot, 8, 0,
-            ));
-            let out_len_slot = b.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
-                cranelift_codegen::ir::StackSlotKind::ExplicitSlot, 8, 0,
-            ));
+            let out_ptr_slot =
+                b.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
+                    cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                    8,
+                    0,
+                ));
+            let out_len_slot =
+                b.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
+                    cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                    8,
+                    0,
+                ));
             let out_ptr_addr = b.ins().stack_addr(cl_types::I64, out_ptr_slot, 0);
             let out_len_addr = b.ins().stack_addr(cl_types::I64, out_len_slot, 0);
 
             let calib_batch_ref = module.declare_func_in_func(calib_batch_id, b.func);
-            b.ins().call(calib_batch_ref, &[lh_batches, i_cur, out_ptr_addr, out_len_addr]);
+            b.ins().call(
+                calib_batch_ref,
+                &[lh_batches, i_cur, out_ptr_addr, out_len_addr],
+            );
 
             // ── Step 4: Plan-driven 2D max-abs reduction per projection ──
             // For each ObservePlanEntry, read from the retention arena and
             // accumulate into the corresponding running-buffer global.
             // `arena_data_id` is Some iff observe_plan is non-empty (declared together).
             for entry in observe_plan {
-                let arena_id = arena_data_id.expect("arena_data_id is Some when observe_plan is non-empty");
+                let arena_id =
+                    arena_data_id.expect("arena_data_id is Some when observe_plan is non-empty");
                 let arena_gv = module.declare_data_in_func(arena_id, b.func);
                 let arena_base = b.ins().symbol_value(ptr_ty, arena_gv);
                 let run_id = running_data_ids[&entry.running_symbol];
@@ -3891,7 +3974,8 @@ fn emit_and_link_calibration_binary(
 
             let one_i64 = b.ins().iconst(cl_types::I64, 1);
             let i_next = b.ins().iadd(i_cur, one_i64);
-            b.ins().jump(loop_header, &[lh_batches, lh_sidecar_ptr, i_next]);
+            b.ins()
+                .jump(loop_header, &[lh_batches, lh_sidecar_ptr, i_next]);
 
             b.seal_block(loop_header);
 
@@ -3965,7 +4049,14 @@ fn emit_and_link_calibration_binary(
                 let write_sidecar_ref = module.declare_func_in_func(write_sidecar_id, b.func);
                 let ws_call = b.ins().call(
                     write_sidecar_ref,
-                    &[fin_sidecar_ptr, sidecar_path_len, descs_base, desc_count, zero_ptr, zero_count],
+                    &[
+                        fin_sidecar_ptr,
+                        sidecar_path_len,
+                        descs_base,
+                        desc_count,
+                        zero_ptr,
+                        zero_count,
+                    ],
                 );
                 let rc = b.inst_results(ws_call)[0];
 
@@ -4024,11 +4115,7 @@ fn create_tmp_dir() -> Result<PathBuf, HarnessError> {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0);
-    let p = std::env::temp_dir().join(format!(
-        "nsl-calibration-{}-{}",
-        std::process::id(),
-        nanos
-    ));
+    let p = std::env::temp_dir().join(format!("nsl-calibration-{}-{}", std::process::id(), nanos));
     fs::create_dir_all(&p).map_err(|e| HarnessError::Infrastructure {
         reason: format!("cannot create {}: {e}", p.display()),
     })?;
@@ -4046,9 +4133,9 @@ impl Drop for TmpCleanup {
 mod tests {
     use super::*;
 
-    use object::{Object, ObjectSymbol};
     use nsl_errors::{FileId, Level};
     use nsl_lexer::{tokenize, Interner};
+    use object::{Object, ObjectSymbol};
 
     fn repo_root() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -4061,12 +4148,14 @@ mod tests {
     }
 
     fn parse_awq_fixture() -> (nsl_ast::Module, Interner) {
-        let source = std::fs::read_to_string(fixture("awq_calibration_mlp.nsl"))
-            .expect("fixture readable");
+        let source =
+            std::fs::read_to_string(fixture("awq_calibration_mlp.nsl")).expect("fixture readable");
         let mut interner = Interner::new();
         let (tokens, lex_diags) = tokenize(&source, FileId(0), &mut interner);
         assert!(
-            lex_diags.iter().all(|diag| !matches!(diag.level, Level::Error)),
+            lex_diags
+                .iter()
+                .all(|diag| !matches!(diag.level, Level::Error)),
             "fixture must lex cleanly: {lex_diags:?}"
         );
 
@@ -4111,13 +4200,8 @@ mod tests {
         let out_path = tmp.path().join("calib_model.o");
         let opts = awq_fixture_compile_options(&ast, &interner);
 
-        emit_calibration_model_object(
-            &ast,
-            &opts,
-            &arena_layout,
-            &out_path,
-        )
-        .expect("emit succeeds");
+        emit_calibration_model_object(&ast, &opts, &arena_layout, &out_path)
+            .expect("emit succeeds");
 
         assert!(out_path.exists(), "calib_model.o must be written");
         let obj_bytes = std::fs::read(&out_path).expect("object readable");
@@ -4146,7 +4230,8 @@ mod tests {
         let obj = object::File::parse(&*obj_bytes).expect("object::File::parse");
 
         assert!(
-            obj.symbols().any(|symbol| symbol.name() == Ok("model_forward")),
+            obj.symbols()
+                .any(|symbol| symbol.name() == Ok("model_forward")),
             "calib_model.o must export model_forward"
         );
     }
@@ -4200,24 +4285,33 @@ mod tests {
             .filter_map(|symbol| symbol.name().ok().map(str::to_string))
             .collect();
         assert!(
-            imports.iter().any(|symbol| symbol == "nsl_calib_model_forward"),
+            imports
+                .iter()
+                .any(|symbol| symbol == "nsl_calib_model_forward"),
             "scaffolding.o must import nsl_calib_model_forward"
         );
         assert!(
-            imports.iter().any(|symbol| symbol == "nsl_calibration_load"),
+            imports
+                .iter()
+                .any(|symbol| symbol == "nsl_calibration_load"),
             "scaffolding.o must import nsl_calibration_load"
         );
         assert!(
-            imports.iter().any(|symbol| symbol == "nsl_calibration_batch_at"),
+            imports
+                .iter()
+                .any(|symbol| symbol == "nsl_calibration_batch_at"),
             "scaffolding.o must import nsl_calibration_batch_at"
         );
         assert!(
-            imports.iter().any(|symbol| symbol == "nsl_calib_write_sidecar"),
+            imports
+                .iter()
+                .any(|symbol| symbol == "nsl_calib_write_sidecar"),
             "scaffolding.o must import nsl_calib_write_sidecar"
         );
 
         assert!(
-            obj.symbols().any(|symbol| symbol.name() == Ok("main") && !symbol.is_undefined()),
+            obj.symbols()
+                .any(|symbol| symbol.name() == Ok("main") && !symbol.is_undefined()),
             "scaffolding.o must export main"
         );
     }
@@ -4300,8 +4394,7 @@ mod tests {
             channels: 4,
             bytes_per_element: 8,
         }];
-        let per_step_backward_symbols =
-            vec!["__nsl_wggo_grad.model_layers_0".to_string()];
+        let per_step_backward_symbols = vec!["__nsl_wggo_grad.model_layers_0".to_string()];
 
         let tmp = tempfile::tempdir().expect("tempdir");
         let out_path = tmp.path().join("scaffolding_wggo_only.o");
@@ -4379,7 +4472,8 @@ mod tests {
         };
         let awq_fields = model_tensor_field_names(&awq, &interner);
         assert!(
-            awq_fields.iter().any(|f| f == "up_proj") && awq_fields.iter().any(|f| f == "down_proj"),
+            awq_fields.iter().any(|f| f == "up_proj")
+                && awq_fields.iter().any(|f| f == "down_proj"),
             "AWQ fixture's bare-`Tensor` projections must be detected: got {awq_fields:?}"
         );
 
@@ -4389,8 +4483,7 @@ mod tests {
         let mut wggo_interner = Interner::new();
         let (wggo_tokens, _) = tokenize(&wggo_source, FileId(0), &mut wggo_interner);
         let wggo_parsed = nsl_parser::parse(&wggo_tokens, &mut wggo_interner);
-        let wggo = find_model_def(&wggo_parsed.module.stmts)
-            .expect("wggo fixture has a ModelDef");
+        let wggo = find_model_def(&wggo_parsed.module.stmts).expect("wggo fixture has a ModelDef");
         let wggo_fields = model_tensor_field_names(&wggo, &wggo_interner);
         for name in &["q_proj", "k_proj", "v_proj", "o_proj"] {
             assert!(
@@ -4410,8 +4503,8 @@ mod tests {
 
 #[cfg(test)]
 mod grad_arena_emission {
-    use object::{Object, ObjectSection, ObjectSymbol};
     use nsl_lexer::Interner;
+    use object::{Object, ObjectSection, ObjectSymbol};
 
     use crate::calibration::discovery::WggoGradTarget;
     use crate::calibration::observation::ProjectionRef;
@@ -4455,8 +4548,7 @@ mod grad_arena_emission {
         opts.calibration_grad_retention = Some(targets);
 
         let mut compiler =
-            crate::compiler::Compiler::new(&interner, &type_map, &opts)
-                .expect("Compiler::new");
+            crate::compiler::Compiler::new(&interner, &type_map, &opts).expect("Compiler::new");
 
         // Should succeed and populate grad_arena_layout.
         compiler
@@ -4493,9 +4585,11 @@ mod grad_arena_emission {
         // On COFF (Windows) symbol sizes are stored in the containing section,
         // not in the symbol table entry, so sym.size() returns 0 for BSS.
         // We check the section's size instead, which is format-agnostic.
-        let section_idx = sym.section_index()
+        let section_idx = sym
+            .section_index()
             .expect("__nsl_calib_grad_arena must belong to a section");
-        let section = obj.section_by_index(section_idx)
+        let section = obj
+            .section_by_index(section_idx)
             .expect("section must be readable");
         assert_eq!(
             section.size(),
@@ -4512,8 +4606,7 @@ mod grad_arena_emission {
         let opts = crate::CompileOptions::default(); // calibration_grad_retention is None
 
         let mut compiler =
-            crate::compiler::Compiler::new(&interner, &type_map, &opts)
-                .expect("Compiler::new");
+            crate::compiler::Compiler::new(&interner, &type_map, &opts).expect("Compiler::new");
 
         compiler
             .emit_grad_retention_arena()
@@ -4529,9 +4622,9 @@ mod grad_arena_emission {
 #[cfg(test)]
 mod backward_wrapper {
     use super::*;
-    use object::{Object, ObjectSymbol};
     use nsl_errors::{FileId, Level};
     use nsl_lexer::{tokenize, Interner};
+    use object::{Object, ObjectSymbol};
 
     use crate::calibration::discovery::WggoGradTarget;
     use crate::calibration::observation::ProjectionRef;
@@ -4549,8 +4642,8 @@ mod backward_wrapper {
 
     /// Parse the AWQ MLP fixture — same model used by existing calib model tests.
     fn parse_awq_fixture() -> (nsl_ast::Module, Interner) {
-        let source = std::fs::read_to_string(fixture("awq_calibration_mlp.nsl"))
-            .expect("fixture readable");
+        let source =
+            std::fs::read_to_string(fixture("awq_calibration_mlp.nsl")).expect("fixture readable");
         let mut interner = Interner::new();
         let (tokens, lex_diags) = tokenize(&source, FileId(0), &mut interner);
         assert!(
@@ -4559,7 +4652,10 @@ mod backward_wrapper {
         );
         let parsed = nsl_parser::parse(&tokens, &mut interner);
         assert!(
-            parsed.diagnostics.iter().all(|d| !matches!(d.level, Level::Error)),
+            parsed
+                .diagnostics
+                .iter()
+                .all(|d| !matches!(d.level, Level::Error)),
             "fixture must parse cleanly: {:?}",
             parsed.diagnostics
         );
@@ -4629,9 +4725,8 @@ mod backward_wrapper {
         let obj = object::File::parse(&*obj_bytes).expect("object::File::parse");
 
         assert!(
-            obj.symbols().any(|s| {
-                s.name() == Ok("nsl_calib_model_backward") && !s.is_undefined()
-            }),
+            obj.symbols()
+                .any(|s| { s.name() == Ok("nsl_calib_model_backward") && !s.is_undefined() }),
             "calib_model.o must export nsl_calib_model_backward when grad-retention is set"
         );
     }
@@ -4670,7 +4765,8 @@ mod backward_wrapper {
         let obj = object::File::parse(&*obj_bytes).expect("object::File::parse");
 
         assert!(
-            !obj.symbols().any(|s| s.name() == Ok("nsl_calib_model_backward")),
+            !obj.symbols()
+                .any(|s| s.name() == Ok("nsl_calib_model_backward")),
             "calib_model.o must NOT export nsl_calib_model_backward when grad-retention is absent"
         );
     }
@@ -4710,22 +4806,22 @@ mod backward_wrapper {
         let obj = object::File::parse(&*obj_bytes).expect("object::File::parse");
 
         // Both wrappers must be exported — confirmed by symbol presence.
-        let fwd_exported = obj.symbols().any(|s| {
-            s.name() == Ok("nsl_calib_model_forward") && !s.is_undefined()
-        });
+        let fwd_exported = obj
+            .symbols()
+            .any(|s| s.name() == Ok("nsl_calib_model_forward") && !s.is_undefined());
         assert!(fwd_exported, "nsl_calib_model_forward must be exported");
 
-        let bwd_exported = obj.symbols().any(|s| {
-            s.name() == Ok("nsl_calib_model_backward") && !s.is_undefined()
-        });
+        let bwd_exported = obj
+            .symbols()
+            .any(|s| s.name() == Ok("nsl_calib_model_backward") && !s.is_undefined());
         assert!(bwd_exported, "nsl_calib_model_backward must be exported");
 
         // model_forward must now be a LOCAL (non-undefined) symbol — it's defined in
         // this object (not imported).  Before Task 15 it was Export; after refactoring
         // for backward use it remains defined here.
-        let model_fwd_defined = obj.symbols().any(|s| {
-            s.name() == Ok("model_forward") && !s.is_undefined()
-        });
+        let model_fwd_defined = obj
+            .symbols()
+            .any(|s| s.name() == Ok("model_forward") && !s.is_undefined());
         assert!(
             model_fwd_defined,
             "model_forward bridge must be defined (local/export) in calib_model.o"
@@ -4737,9 +4833,9 @@ mod backward_wrapper {
         // the compiled model code may already reference it).
         // We verify the emission compiles without error as the primary assertion;
         // the symbol check is a belt-and-suspenders indicator.
-        let has_mul_scalar = obj.symbols().any(|s| {
-            s.name() == Ok("nsl_tensor_mul_scalar")
-        });
+        let has_mul_scalar = obj
+            .symbols()
+            .any(|s| s.name() == Ok("nsl_tensor_mul_scalar"));
         assert!(
             has_mul_scalar,
             "calib_model.o must reference nsl_tensor_mul_scalar"
@@ -4764,7 +4860,10 @@ mod backward_wrapper {
         );
         let parsed = nsl_parser::parse(&tokens, &mut interner);
         assert!(
-            parsed.diagnostics.iter().all(|d| !matches!(d.level, Level::Error)),
+            parsed
+                .diagnostics
+                .iter()
+                .all(|d| !matches!(d.level, Level::Error)),
             "fixture must parse cleanly: {:?}",
             parsed.diagnostics
         );
@@ -4862,10 +4961,10 @@ mod loop_body_dispatch {
             &arena_layout,
             b"{}",
             true,
-            true,  // needs_backward = true
-            &[],   // no wggo per-step symbols for this forward-dispatch test
-            &[],   // no wggo targets for this dispatch test
-            None,  // no grad_arena_layout
+            true, // needs_backward = true
+            &[],  // no wggo per-step symbols for this forward-dispatch test
+            &[],  // no wggo targets for this dispatch test
+            None, // no grad_arena_layout
             &out_path,
         )
         .expect("emit succeeds with needs_backward=true");
@@ -4997,10 +5096,10 @@ mod loop_body_dispatch {
             &arena_layout,
             b"{}",
             true,
-            true,  // needs_backward = true
+            true, // needs_backward = true
             &per_step_backward_symbols,
-            &[],   // no wggo targets — exercises the placeholder relocation path
-            None,  // no grad_arena_layout
+            &[],  // no wggo targets — exercises the placeholder relocation path
+            None, // no grad_arena_layout
             &out_path,
         )
         .expect("emit succeeds with two WGGO per-step symbols");
@@ -5063,15 +5162,10 @@ mod per_head_dot {
     ///
     /// The three "base" pointer Values are materialised as `iconst(I64, 0)` — safe
     /// for IR text inspection; we never execute this function.
-    fn emit_helper_for_test(
-        n_proj_heads: u32,
-        elements_per_head: u32,
-        replication: u32,
-    ) -> String {
+    fn emit_helper_for_test(n_proj_heads: u32, elements_per_head: u32, replication: u32) -> String {
         // Build a no-arg, no-return signature.
-        let mut sig = cranelift_codegen::ir::Signature::new(
-            cranelift_codegen::isa::CallConv::SystemV,
-        );
+        let mut sig =
+            cranelift_codegen::ir::Signature::new(cranelift_codegen::isa::CallConv::SystemV);
         sig.params.push(AbiParam::new(cl_types::I64)); // grad_arena_base
         sig.params.push(AbiParam::new(cl_types::I64)); // weight_data_base
         sig.params.push(AbiParam::new(cl_types::I64)); // running_base
@@ -5085,7 +5179,7 @@ mod per_head_dot {
             b.switch_to_block(entry);
             b.seal_block(entry);
 
-            let grad_base   = b.block_params(entry)[0];
+            let grad_base = b.block_params(entry)[0];
             let weight_base = b.block_params(entry)[1];
             let running_base = b.block_params(entry)[2];
 
@@ -5112,15 +5206,14 @@ mod per_head_dot {
     /// Verified by checking the IR text for `fpromote`, `fadd`, and `load.f64`.
     #[test]
     fn emit_per_head_dot_abs_accum_emits_f64_accumulator() {
-        let ir = emit_helper_for_test(/*n_proj_heads=*/4, /*elements_per_head=*/16, /*replication=*/1);
+        let ir = emit_helper_for_test(
+            /*n_proj_heads=*/ 4, /*elements_per_head=*/ 16, /*replication=*/ 1,
+        );
         assert!(
             ir.contains("fpromote"),
             "must promote f32 → f64 before accumulating; got:\n{ir}"
         );
-        assert!(
-            ir.contains("fadd"),
-            "must accumulate (fadd); got:\n{ir}"
-        );
+        assert!(ir.contains("fadd"), "must accumulate (fadd); got:\n{ir}");
         // Cranelift displays f64 loads as "load.f64" in the textual IR.
         assert!(
             ir.contains("load.f64"),
@@ -5136,7 +5229,11 @@ mod per_head_dot {
         let n_proj_heads = 1;
         let elements_per_head = 16;
         let replication = 4;
-        let ir = emit_helper_for_test(/*n_proj_heads=*/n_proj_heads, /*elements_per_head=*/elements_per_head, /*replication=*/replication);
+        let ir = emit_helper_for_test(
+            /*n_proj_heads=*/ n_proj_heads,
+            /*elements_per_head=*/ elements_per_head,
+            /*replication=*/ replication,
+        );
 
         // The replication loop is unrolled at codegen time; element and head loops remain.
         // Textual IR shows one dynamic trace per loop iteration, with `replication` unrolled

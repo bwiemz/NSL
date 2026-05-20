@@ -17,8 +17,8 @@ fn forward(x: Tensor<[B=1, S=2048, D=512], bf16>, W: Tensor<[512, 512], bf16>) -
     opts.profile_kernels = true;
     // target_gpu/dtype defaults ("h100"/"bf16") are fine.
 
-    let result = nsl_codegen::test_helpers::run_pre_pass_only(src, &opts)
-        .expect("pre-pass should succeed");
+    let result =
+        nsl_codegen::test_helpers::run_pre_pass_only(src, &opts).expect("pre-pass should succeed");
     assert!(
         result.prediction_map_len > 0,
         "prediction_map should be non-empty for a module with at least one matmul \
@@ -43,8 +43,8 @@ fn forward(x: Tensor<[1, 2048, 512], bf16>, W: Tensor<[512, 512], bf16>) -> Tens
 "#;
     let mut opts = CompileOptions::default();
     opts.profile_kernels = true;
-    let _result = nsl_codegen::test_helpers::run_pre_pass_only(src, &opts)
-        .expect("pre-pass should succeed");
+    let _result =
+        nsl_codegen::test_helpers::run_pre_pass_only(src, &opts).expect("pre-pass should succeed");
 }
 
 #[test]

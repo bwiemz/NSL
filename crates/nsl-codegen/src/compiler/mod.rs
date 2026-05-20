@@ -28,9 +28,9 @@ use crate::error::CodegenError;
 
 // Re-export the free functions for `pub use compiler::{...}` in lib.rs
 pub use entry_points::{
-    compile, compile_entry, compile_module, compile_module_with_imports,
-    compile_module_with_imports_best_effort_plan, compile_module_with_imports_returning_plan,
-    compile_entry_returning_plan, compile_returning_plan,
+    compile, compile_entry, compile_entry_returning_plan, compile_module,
+    compile_module_with_imports, compile_module_with_imports_best_effort_plan,
+    compile_module_with_imports_returning_plan, compile_returning_plan,
     compile_returning_splice_count_for_tests, compile_standalone,
     compile_standalone_returning_plan, compile_test, compile_with_zk_info,
     compile_with_zk_info_returning_plan,
@@ -180,7 +180,10 @@ pub struct ModelMetadata {
     /// M62 Task 5: impl FuncId + signature for @export model methods.
     /// Key: (model_name, method_name). Consumed by Task 6 when compiling
     /// the impl body so it can reference the declared FuncId.
-    pub export_method_impls: std::collections::HashMap<(String, String), (cranelift_module::FuncId, cranelift_codegen::ir::Signature)>,
+    pub export_method_impls: std::collections::HashMap<
+        (String, String),
+        (cranelift_module::FuncId, cranelift_codegen::ir::Signature),
+    >,
     /// M56 Task 18: maps lowercase agent binding symbol (e.g. `drafter`) to
     /// the title-case agent type name (e.g. `"Drafter"`) for variables
     /// synthesised at `@pipeline_agent` fn entry.  Consulted by the
@@ -589,15 +592,13 @@ pub struct Compiler<'a> {
     /// independent clones — a mark-local stash would not be visible
     /// across both paths. Keyed by layer name keeps the map in sync
     /// with everything else that addresses CSHA state by layer.
-    pub csha_forward_saves:
-        std::collections::HashMap<String, crate::csha_apply::CshaSavePointers>,
+    pub csha_forward_saves: std::collections::HashMap<String, crate::csha_apply::CshaSavePointers>,
     /// B.3 Task 4: deduplicated fused-adapter PTX kernel cache.  Keyed by
     /// `(m, n, k, rank, target_sm)` so sites with identical kernel shapes
     /// (but potentially different α/rank scales) share one PTX string.
     /// Populated during the fusion-decision pass and consulted by the
     /// CUDA launcher (Task 5) to pick the right kernel per call site.
-    pub fused_ptx_kernels:
-        std::collections::HashMap<crate::wrga_fused_ptx::LoraKernelKey, String>,
+    pub fused_ptx_kernels: std::collections::HashMap<crate::wrga_fused_ptx::LoraKernelKey, String>,
     /// B.3.1 Task 5.0.c: deduplicated fused-GatedLoRA PTX kernel cache.
     /// Parallel to `fused_ptx_kernels` but for GatedLoRA sites.  Kept
     /// separate so the two adapter types can share the same
@@ -1244,9 +1245,7 @@ impl<'a> Compiler<'a> {
                 false, // not TLS
             )
             .map_err(|e| {
-                CodegenError::new(format!(
-                    "failed to declare retention arena data: {e}"
-                ))
+                CodegenError::new(format!("failed to declare retention arena data: {e}"))
             })?;
 
         let mut desc = DataDescription::new();
@@ -1292,16 +1291,14 @@ impl<'a> Compiler<'a> {
                 false, // not TLS
             )
             .map_err(|e| {
-                CodegenError::new(format!(
-                    "failed to declare grad retention arena data: {e}"
-                ))
+                CodegenError::new(format!("failed to declare grad retention arena data: {e}"))
             })?;
 
         let mut desc = DataDescription::new();
         desc.define_zeroinit(layout.total_bytes as usize);
-        self.module
-            .define_data(data_id, &desc)
-            .map_err(|e| CodegenError::new(format!("failed to define grad retention arena: {e}")))?;
+        self.module.define_data(data_id, &desc).map_err(|e| {
+            CodegenError::new(format!("failed to define grad retention arena: {e}"))
+        })?;
 
         self.grad_arena_layout = Some(layout);
         Ok(())
@@ -1354,17 +1351,13 @@ impl<'a> Compiler<'a> {
                 false, // not TLS
             )
             .map_err(|e| {
-                CodegenError::new(format!(
-                    "failed to declare FASE param-mode table data: {e}"
-                ))
+                CodegenError::new(format!("failed to declare FASE param-mode table data: {e}"))
             })?;
 
         let mut desc = DataDescription::new();
         desc.define(modes.to_vec().into_boxed_slice());
         self.module.define_data(data_id, &desc).map_err(|e| {
-            CodegenError::new(format!(
-                "failed to define FASE param-mode table data: {e}"
-            ))
+            CodegenError::new(format!("failed to define FASE param-mode table data: {e}"))
         })?;
 
         Ok(data_id)
@@ -1398,4 +1391,3 @@ impl<'a> Compiler<'a> {
             .map_err(|e| CodegenError::new(format!("failed to emit object: {e}")))
     }
 }
-

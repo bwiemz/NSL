@@ -18,13 +18,16 @@
 fn compile_src(src: &str) -> Result<Vec<u8>, String> {
     use nsl_errors::Level;
     let mut interner = nsl_lexer::Interner::new();
-    let (tokens, lex_diags) =
-        nsl_lexer::tokenize(src, nsl_errors::FileId(0), &mut interner);
+    let (tokens, lex_diags) = nsl_lexer::tokenize(src, nsl_errors::FileId(0), &mut interner);
     if lex_diags.iter().any(|d| matches!(d.level, Level::Error)) {
         return Err(format!("lex errors: {:?}", lex_diags));
     }
     let parsed = nsl_parser::parse(&tokens, &mut interner);
-    if parsed.diagnostics.iter().any(|d| matches!(d.level, Level::Error)) {
+    if parsed
+        .diagnostics
+        .iter()
+        .any(|d| matches!(d.level, Level::Error))
+    {
         return Err(format!("parse errors: {:?}", parsed.diagnostics));
     }
     let analysis = nsl_semantic::analyze(&parsed.module, &mut interner);
@@ -109,8 +112,8 @@ agent A:\n    fn a_fn(self, x: i32) -> i32:\n        return x\n\
 @pipeline_agent(agents=[A])\n\
 fn solo(x: i32) -> i32:\n    return a.a_fn(x)\n";
 
-    let bytes = compile_src(src)
-        .expect("single-agent @pipeline_agent fn must compile without errors");
+    let bytes =
+        compile_src(src).expect("single-agent @pipeline_agent fn must compile without errors");
 
     let obj_str = String::from_utf8_lossy(&bytes);
 

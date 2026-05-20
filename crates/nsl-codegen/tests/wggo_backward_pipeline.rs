@@ -20,8 +20,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use nsl_codegen::calibration::{
-    binary_codegen::real_subprocess_entry,
-    HarnessConfig, HarnessMode, HookRegistry,
+    binary_codegen::real_subprocess_entry, HarnessConfig, HarnessMode, HookRegistry,
 };
 
 #[path = "wggo_reference.rs"]
@@ -48,8 +47,7 @@ fn fixture(name: &str) -> PathBuf {
 // ---------------------------------------------------------------------------
 
 fn read_safetensors_flat(path: &std::path::Path, tensor_name: &str) -> Vec<f32> {
-    let bytes = std::fs::read(path)
-        .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
+    let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
     let tensors = safetensors::SafeTensors::deserialize(&bytes)
         .unwrap_or_else(|e| panic!("deserializing {}: {e}", path.display()));
     let tensor = tensors
@@ -129,19 +127,25 @@ fn assert_close(actual: &[f32], expected: &[f32], tol: f32, name: &str) {
 // analysis, and builds a CalibrationCompileBundle for real_subprocess_entry.
 // ---------------------------------------------------------------------------
 
-fn wggo_fixture_compile_bundle() -> std::sync::Arc<nsl_codegen::calibration::CalibrationCompileBundle> {
+fn wggo_fixture_compile_bundle(
+) -> std::sync::Arc<nsl_codegen::calibration::CalibrationCompileBundle> {
     let source = std::fs::read_to_string(fixture("wggo_attention_mlp_real.nsl"))
         .expect("merge-gate fixture readable");
     let mut interner = nsl_lexer::Interner::new();
     let (tokens, lex_diags) = nsl_lexer::tokenize(&source, nsl_errors::FileId(0), &mut interner);
     assert!(
-        lex_diags.iter().all(|d| !matches!(d.level, nsl_errors::Level::Error)),
+        lex_diags
+            .iter()
+            .all(|d| !matches!(d.level, nsl_errors::Level::Error)),
         "fixture must lex cleanly: {lex_diags:?}"
     );
 
     let parsed = nsl_parser::parse(&tokens, &mut interner);
     assert!(
-        parsed.diagnostics.iter().all(|d| !matches!(d.level, nsl_errors::Level::Error)),
+        parsed
+            .diagnostics
+            .iter()
+            .all(|d| !matches!(d.level, nsl_errors::Level::Error)),
         "fixture must parse cleanly: {:?}",
         parsed.diagnostics
     );
@@ -149,7 +153,10 @@ fn wggo_fixture_compile_bundle() -> std::sync::Arc<nsl_codegen::calibration::Cal
     let mut analysis_interner = interner.clone();
     let analysis = nsl_semantic::analyze(&parsed.module, &mut analysis_interner);
     assert!(
-        analysis.diagnostics.iter().all(|d| !matches!(d.level, nsl_errors::Level::Error)),
+        analysis
+            .diagnostics
+            .iter()
+            .all(|d| !matches!(d.level, nsl_errors::Level::Error)),
         "fixture must pass semantic analysis: {:?}",
         analysis.diagnostics
     );
@@ -210,11 +217,10 @@ fn end_to_end_backward_subprocess_matches_analytical_reference() {
     // the compile_bundle's AST.
     let compile_bundle = wggo_fixture_compile_bundle();
 
-    let pre_scan_targets =
-        nsl_codegen::calibration::discovery::pre_scan_wggo_targets_from_ast(
-            &compile_bundle.ast,
-            &compile_bundle.interner,
-        );
+    let pre_scan_targets = nsl_codegen::calibration::discovery::pre_scan_wggo_targets_from_ast(
+        &compile_bundle.ast,
+        &compile_bundle.interner,
+    );
     assert!(
         !pre_scan_targets.is_empty(),
         "fixture must have at least one @wggo_target-decorated model that pre-scan finds; \

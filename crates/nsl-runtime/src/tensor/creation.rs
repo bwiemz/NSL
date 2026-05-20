@@ -276,7 +276,9 @@ pub extern "C" fn nsl_tensor_arange(start: f64, stop: f64, step: f64) -> i64 {
 pub(crate) fn create_tensor_from_f64_data(data_slice: &[f64], shape_slice: &[i64]) -> i64 {
     let ndim = shape_slice.len() as i64;
     let len: i64 = shape_slice.iter().product();
-    if len == 0 { return 0; }
+    if len == 0 {
+        return 0;
+    }
 
     let shape = checked_alloc((ndim as usize) * std::mem::size_of::<i64>()) as *mut i64;
     for (i, &s) in shape_slice.iter().enumerate() {

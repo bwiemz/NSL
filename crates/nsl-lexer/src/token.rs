@@ -116,17 +116,17 @@ pub enum TokenKind {
     SlashEq,
 
     // === Operators: Pipe & Bitwise ===
-    Pipe,       // |>
-    Bar,        // |
-    Ampersand,  // &
+    Pipe,      // |>
+    Bar,       // |
+    Ampersand, // &
 
     // === Operators: Range ===
-    DotDot,     // ..
-    DotDotEq,   // ..=
+    DotDot,   // ..
+    DotDotEq, // ..=
 
     // === Operators: Arrows ===
-    Arrow,      // ->
-    FatArrow,   // =>
+    Arrow,    // ->
+    FatArrow, // =>
 
     // === Delimiters ===
     LeftParen,

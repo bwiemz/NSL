@@ -42,30 +42,48 @@ fn position_criticality_l3() {
 fn position_criticality_l4() {
     // First/last: 2.0. Near-extreme (l=1 or l=L-2=2): 1.0 + alpha.
     assert_eq!(position_criticality(Some(0), 4, CALIB_ALPHA), 2.0);
-    assert_eq!(position_criticality(Some(1), 4, CALIB_ALPHA), 1.0 + CALIB_ALPHA);
-    assert_eq!(position_criticality(Some(2), 4, CALIB_ALPHA), 1.0 + CALIB_ALPHA);
+    assert_eq!(
+        position_criticality(Some(1), 4, CALIB_ALPHA),
+        1.0 + CALIB_ALPHA
+    );
+    assert_eq!(
+        position_criticality(Some(2), 4, CALIB_ALPHA),
+        1.0 + CALIB_ALPHA
+    );
     assert_eq!(position_criticality(Some(3), 4, CALIB_ALPHA), 2.0);
 }
 
 #[test]
 fn position_criticality_l8() {
     assert_eq!(position_criticality(Some(0), 8, CALIB_ALPHA), 2.0);
-    assert_eq!(position_criticality(Some(1), 8, CALIB_ALPHA), 1.0 + CALIB_ALPHA);
+    assert_eq!(
+        position_criticality(Some(1), 8, CALIB_ALPHA),
+        1.0 + CALIB_ALPHA
+    );
     for l in 2..=5 {
         assert_eq!(position_criticality(Some(l), 8, CALIB_ALPHA), 1.0);
     }
-    assert_eq!(position_criticality(Some(6), 8, CALIB_ALPHA), 1.0 + CALIB_ALPHA);
+    assert_eq!(
+        position_criticality(Some(6), 8, CALIB_ALPHA),
+        1.0 + CALIB_ALPHA
+    );
     assert_eq!(position_criticality(Some(7), 8, CALIB_ALPHA), 2.0);
 }
 
 #[test]
 fn position_criticality_l16() {
     assert_eq!(position_criticality(Some(0), 16, CALIB_ALPHA), 2.0);
-    assert_eq!(position_criticality(Some(1), 16, CALIB_ALPHA), 1.0 + CALIB_ALPHA);
+    assert_eq!(
+        position_criticality(Some(1), 16, CALIB_ALPHA),
+        1.0 + CALIB_ALPHA
+    );
     for l in 2..=13 {
         assert_eq!(position_criticality(Some(l), 16, CALIB_ALPHA), 1.0);
     }
-    assert_eq!(position_criticality(Some(14), 16, CALIB_ALPHA), 1.0 + CALIB_ALPHA);
+    assert_eq!(
+        position_criticality(Some(14), 16, CALIB_ALPHA),
+        1.0 + CALIB_ALPHA
+    );
     assert_eq!(position_criticality(Some(15), 16, CALIB_ALPHA), 2.0);
 }
 
@@ -108,7 +126,10 @@ fn assign_tier_between_t2_t1_low() {
 
 #[test]
 fn assign_tier_below_t2_very_low() {
-    assert_eq!(assign_tier(CALIB_T2 - 1e-6, LayerKind::Generic), Tier::VeryLow);
+    assert_eq!(
+        assign_tier(CALIB_T2 - 1e-6, LayerKind::Generic),
+        Tier::VeryLow
+    );
 }
 
 // --- layer-kind overrides ---
@@ -161,10 +182,7 @@ fn classify_norm_patterns() {
         classify_layer_kind("blocks.3.attn_norm.weight", Some(3), 8),
         LayerKind::Norm
     );
-    assert_eq!(
-        classify_layer_kind("norm.weight", None, 8),
-        LayerKind::Norm
-    );
+    assert_eq!(classify_layer_kind("norm.weight", None, 8), LayerKind::Norm);
 }
 
 #[test]

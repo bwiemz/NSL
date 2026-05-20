@@ -1,8 +1,8 @@
-use serde::Serialize;
 use crate::operator::{BinOp, UnaryOp};
 use crate::pattern::Pattern;
 use crate::types::TypeExpr;
 use crate::{NodeId, Span, Symbol};
+use serde::Serialize;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Expr {

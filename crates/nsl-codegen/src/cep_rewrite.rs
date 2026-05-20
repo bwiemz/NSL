@@ -67,7 +67,10 @@ impl PruneDelta {
 
     /// Number of heads pruned across all layers.
     pub fn total_pruned_heads(&self) -> u32 {
-        self.per_layer.iter().map(|d| d.pruned_heads.len() as u32).sum()
+        self.per_layer
+            .iter()
+            .map(|d| d.pruned_heads.len() as u32)
+            .sum()
     }
 }
 
@@ -327,8 +330,7 @@ mod tests {
     #[test]
     fn pruning_never_yields_zero_heads() {
         let spec = base();
-        let delta = PruneDelta::for_spec(&spec)
-            .with_pruned_heads(0, vec![0, 1, 2, 3, 4, 5, 6, 7]); // try to drop all
+        let delta = PruneDelta::for_spec(&spec).with_pruned_heads(0, vec![0, 1, 2, 3, 4, 5, 6, 7]); // try to drop all
         let pruned = apply_delta(&spec, &delta);
         assert!(pruned.n_heads[0] >= 1);
         assert!(pruned.n_kv_heads[0] >= 1);

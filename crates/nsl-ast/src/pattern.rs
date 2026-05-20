@@ -1,7 +1,7 @@
-use serde::Serialize;
 use crate::expr::Expr;
 use crate::types::TypeExpr;
 use crate::{NodeId, Span, Symbol};
+use serde::Serialize;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Pattern {

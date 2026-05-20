@@ -59,7 +59,11 @@ enum ProbeOutcome {
     /// sentinel — `seg_smem` (Tier-B-off baseline) vs `shmem (extern)` (the
     /// Tier-B-on dynamic region). The readback packs both bytes into one
     /// u32 word so a single 4-byte device buffer is sufficient.
-    ValueCorruption { expected: u8, found: u8, region: String },
+    ValueCorruption {
+        expected: u8,
+        found: u8,
+        region: String,
+    },
 }
 
 #[derive(Debug)]
@@ -171,7 +175,10 @@ fn probe_ptx_contains_expected_sections() {
         ptx.contains("st.u8 [%wide_shmem_addr], %byte_a5"),
         "PTX must write sentinel 0xA5 to extern shmem"
     );
-    assert!(ptx.contains("bar.sync 0"), "PTX must barrier-sync before readback");
+    assert!(
+        ptx.contains("bar.sync 0"),
+        "PTX must barrier-sync before readback"
+    );
     assert!(
         ptx.contains("ld.shared.u8 %read_seg, [seg_smem]"),
         "PTX must read back from seg_smem (Tier-B-off baseline region)"
@@ -194,7 +201,10 @@ fn probe_ptx_contains_expected_sections() {
     );
 
     let ptx_sm80 = build_probe_ptx(80);
-    assert!(ptx_sm80.contains(".target sm_80"), "sm_80 variant must target sm_80");
+    assert!(
+        ptx_sm80.contains(".target sm_80"),
+        "sm_80 variant must target sm_80"
+    );
 }
 
 /// Execute one (max_seq_len, block, target_sm) probe configuration.
@@ -247,7 +257,9 @@ fn run_probe_config(max_seq_len: u32, block: u32, target_sm: u32) -> ProbeResult
                     total_smem_bytes,
                     cap_bytes,
                     utilization_pct,
-                    outcome: ProbeOutcome::LaunchFailed("cuDevicePrimaryCtxRetain failed".to_string()),
+                    outcome: ProbeOutcome::LaunchFailed(
+                        "cuDevicePrimaryCtxRetain failed".to_string(),
+                    ),
                 };
             }
             let set_rc = sys::cuCtxSetCurrent(ctx);
@@ -319,7 +331,9 @@ fn run_probe_config(max_seq_len: u32, block: u32, target_sm: u32) -> ProbeResult
             let mut err_name: *const std::os::raw::c_char = std::ptr::null();
             sys::cuGetErrorString(mod_rc, &mut err_name);
             let driver_msg = if !err_name.is_null() {
-                std::ffi::CStr::from_ptr(err_name).to_string_lossy().to_string()
+                std::ffi::CStr::from_ptr(err_name)
+                    .to_string_lossy()
+                    .to_string()
             } else {
                 format!("cuModuleLoadDataEx rc={:?}", mod_rc)
             };
@@ -408,7 +422,9 @@ fn run_probe_config(max_seq_len: u32, block: u32, target_sm: u32) -> ProbeResult
             let mut err_name: *const std::os::raw::c_char = std::ptr::null();
             sys::cuGetErrorString(attr_rc, &mut err_name);
             let msg = if !err_name.is_null() {
-                std::ffi::CStr::from_ptr(err_name).to_string_lossy().to_string()
+                std::ffi::CStr::from_ptr(err_name)
+                    .to_string_lossy()
+                    .to_string()
             } else {
                 format!("cuFuncSetAttribute failed with rc={:?}", attr_rc)
             };
@@ -433,8 +449,12 @@ fn run_probe_config(max_seq_len: u32, block: u32, target_sm: u32) -> ProbeResult
 
         let launch_rc = sys::cuLaunchKernel(
             func,
-            1, 1, 1,
-            num_threads, 1, 1,
+            1,
+            1,
+            1,
+            num_threads,
+            1,
+            1,
             tier_b_extern_bytes,
             std::ptr::null_mut(),
             args.as_mut_ptr(),
@@ -444,7 +464,9 @@ fn run_probe_config(max_seq_len: u32, block: u32, target_sm: u32) -> ProbeResult
             let mut err_name: *const std::os::raw::c_char = std::ptr::null();
             sys::cuGetErrorString(launch_rc, &mut err_name);
             let msg = if !err_name.is_null() {
-                std::ffi::CStr::from_ptr(err_name).to_string_lossy().to_string()
+                std::ffi::CStr::from_ptr(err_name)
+                    .to_string_lossy()
+                    .to_string()
             } else {
                 format!("cuLaunchKernel failed with rc={:?}", launch_rc)
             };
@@ -468,7 +490,9 @@ fn run_probe_config(max_seq_len: u32, block: u32, target_sm: u32) -> ProbeResult
             let mut err_name: *const std::os::raw::c_char = std::ptr::null();
             sys::cuGetErrorString(sync_rc, &mut err_name);
             let msg = if !err_name.is_null() {
-                std::ffi::CStr::from_ptr(err_name).to_string_lossy().to_string()
+                std::ffi::CStr::from_ptr(err_name)
+                    .to_string_lossy()
+                    .to_string()
             } else {
                 format!("cuCtxSynchronize failed with rc={:?}", sync_rc)
             };
@@ -488,11 +512,7 @@ fn run_probe_config(max_seq_len: u32, block: u32, target_sm: u32) -> ProbeResult
         }
 
         let mut host_buf = vec![0u8; out_size];
-        let copy_rc = sys::cuMemcpyDtoH_v2(
-            host_buf.as_mut_ptr() as *mut c_void,
-            out_buf,
-            out_size,
-        );
+        let copy_rc = sys::cuMemcpyDtoH_v2(host_buf.as_mut_ptr() as *mut c_void, out_buf, out_size);
         let _ = sys::cuMemFree_v2(out_buf);
         let _ = sys::cuModuleUnload(module);
         if copy_rc != sys::CUresult::CUDA_SUCCESS {
@@ -577,10 +597,12 @@ fn fmt_csv_row(r: &ProbeResult) -> String {
         ProbeOutcome::Pass => "Pass".to_string(),
         ProbeOutcome::PtxasRejected(m) => format!("PtxasRejected({m})"),
         ProbeOutcome::LaunchFailed(m) => format!("LaunchFailed({m})"),
-        ProbeOutcome::ValueCorruption { expected, found, region } => {
-            format!(
-                "ValueCorruption(region={region},expected={expected:#04x},found={found:#04x})"
-            )
+        ProbeOutcome::ValueCorruption {
+            expected,
+            found,
+            region,
+        } => {
+            format!("ValueCorruption(region={region},expected={expected:#04x},found={found:#04x})")
         }
     };
     format!(
@@ -649,9 +671,7 @@ fn probe_full_sweep() {
 
     eprintln!();
     eprintln!("=== V-Bii-SMEM probe sweep summary (12 configs) ===");
-    eprintln!(
-        "MAX,block,target_sm,seg_smem_B,tier_b_extern_B,total_B,cap_B,util_pct,outcome"
-    );
+    eprintln!("MAX,block,target_sm,seg_smem_B,tier_b_extern_B,total_B,cap_B,util_pct,outcome");
     for r in &rows {
         eprintln!("{}", fmt_csv_row(r));
     }

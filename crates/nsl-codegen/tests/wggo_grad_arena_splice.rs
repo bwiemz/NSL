@@ -5,13 +5,10 @@
 //! `__nsl_calib_grad_arena` ≥4 times (one relocation per distinct weight
 //! that the on_param_grad callback writes a grad slice to).
 
+use nsl_codegen::calibration::binary_codegen::emit_calibration_model_object;
+use nsl_codegen::calibration::{observation::ProjectionRef, retention_pass::build_arena_layout};
 use nsl_errors::{FileId, Level};
 use nsl_lexer::{tokenize, Interner};
-use nsl_codegen::calibration::{
-    observation::ProjectionRef,
-    retention_pass::build_arena_layout,
-};
-use nsl_codegen::calibration::binary_codegen::emit_calibration_model_object;
 
 // ── Helper: parse the four-projection fixture ─────────────────────────────────
 
@@ -34,7 +31,10 @@ fn parse_attn4_fixture() -> (nsl_ast::Module, Interner) {
     );
     let parsed = nsl_parser::parse(&tokens, &mut interner);
     assert!(
-        parsed.diagnostics.iter().all(|d| !matches!(d.level, Level::Error)),
+        parsed
+            .diagnostics
+            .iter()
+            .all(|d| !matches!(d.level, Level::Error)),
         "fixture must parse cleanly: {:?}",
         parsed.diagnostics
     );
@@ -43,10 +43,7 @@ fn parse_attn4_fixture() -> (nsl_ast::Module, Interner) {
 
 // ── Helper: build CompileOptions with backward enabled ───────────────────────
 
-fn opts_with_backward(
-    ast: &nsl_ast::Module,
-    interner: &Interner,
-) -> nsl_codegen::CompileOptions {
+fn opts_with_backward(ast: &nsl_ast::Module, interner: &Interner) -> nsl_codegen::CompileOptions {
     use nsl_codegen::calibration::discovery::WggoGradTarget;
 
     let mut analysis_interner = interner.clone();

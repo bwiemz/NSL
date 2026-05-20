@@ -35,7 +35,11 @@ pub fn parse(tokens: &[Token], interner: &mut Interner) -> ParseResult {
     let span = if stmts.is_empty() {
         Span::dummy()
     } else {
-        stmts.first().unwrap().span.merge(stmts.last().unwrap().span)
+        stmts
+            .first()
+            .unwrap()
+            .span
+            .merge(stmts.last().unwrap().span)
     };
 
     ParseResult {

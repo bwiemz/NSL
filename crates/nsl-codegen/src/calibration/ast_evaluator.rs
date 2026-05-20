@@ -75,13 +75,22 @@ impl std::fmt::Display for EvalError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::UnsupportedExpr { kind_summary, .. } => {
-                write!(f, "unsupported expression in calibration pre-scan: {kind_summary}")
+                write!(
+                    f,
+                    "unsupported expression in calibration pre-scan: {kind_summary}"
+                )
             }
             Self::UnboundIdent { name, .. } => {
-                write!(f, "unbound identifier '{name}' in calibration pre-scan scope")
+                write!(
+                    f,
+                    "unbound identifier '{name}' in calibration pre-scan scope"
+                )
             }
             Self::TypeMismatch { expected, got, .. } => {
-                write!(f, "type mismatch in calibration pre-scan: expected {expected}, got {got}")
+                write!(
+                    f,
+                    "type mismatch in calibration pre-scan: expected {expected}, got {got}"
+                )
             }
             Self::DivByZero { .. } => write!(f, "division by zero in calibration pre-scan"),
             Self::Overflow { op, .. } => {
@@ -106,10 +115,13 @@ pub fn evaluate_expr(
     match &expr.kind {
         ExprKind::IntLiteral(n) => Ok(EvalValue::Int(*n)),
 
-        ExprKind::Ident(sym) => scope.get(sym).cloned().ok_or_else(|| EvalError::UnboundIdent {
-            name: interner.resolve(sym.0).unwrap_or("?").to_string(),
-            span: expr.span,
-        }),
+        ExprKind::Ident(sym) => scope
+            .get(sym)
+            .cloned()
+            .ok_or_else(|| EvalError::UnboundIdent {
+                name: interner.resolve(sym.0).unwrap_or("?").to_string(),
+                span: expr.span,
+            }),
 
         ExprKind::BinaryOp { left, op, right } => {
             let l = expect_int(evaluate_expr(left, scope, interner)?, left.span)?;
@@ -179,10 +191,12 @@ pub fn evaluate_expr(
             let v = evaluate_expr(operand, scope, interner)?;
             match (op, v) {
                 (UnaryOp::Neg, EvalValue::Int(n)) => {
-                    n.checked_neg().map(EvalValue::Int).ok_or(EvalError::Overflow {
-                        span: expr.span,
-                        op: "negation",
-                    })
+                    n.checked_neg()
+                        .map(EvalValue::Int)
+                        .ok_or(EvalError::Overflow {
+                            span: expr.span,
+                            op: "negation",
+                        })
                 }
                 (UnaryOp::Neg, EvalValue::IntList(_)) => Err(EvalError::TypeMismatch {
                     expected: "int",
@@ -306,7 +320,10 @@ fn expect_int(v: EvalValue, span: Span) -> Result<i64, EvalError> {
 }
 
 fn is_tensor_init(name: &str) -> bool {
-    matches!(name, "zeros" | "ones" | "randn" | "rand" | "full" | "arange")
+    matches!(
+        name,
+        "zeros" | "ones" | "randn" | "rand" | "full" | "arange"
+    )
 }
 
 /// Stable, exhaustive label for every `BinOp` variant. Matches the
@@ -910,7 +927,11 @@ mod tests {
         let expr = unary_neg(ident(v));
         assert!(matches!(
             evaluate_expr(&expr, &scope, &interner),
-            Err(EvalError::TypeMismatch { expected: "int", got: "list", .. })
+            Err(EvalError::TypeMismatch {
+                expected: "int",
+                got: "list",
+                ..
+            })
         ));
     }
 
@@ -1030,7 +1051,10 @@ mod tests {
         let num_heads = intern(&mut interner, "num_heads");
         let params = vec![
             make_param(dim, Some(int_lit(4096))),
-            make_param(num_heads, Some(bin(BinOp::FloorDiv, ident(dim), int_lit(128)))),
+            make_param(
+                num_heads,
+                Some(bin(BinOp::FloorDiv, ident(dim), int_lit(128))),
+            ),
         ];
         let args: Vec<Arg> = vec![];
         let scope = bind_constructor_args(&params, &args, &interner).unwrap();

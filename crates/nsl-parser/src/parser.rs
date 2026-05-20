@@ -1,8 +1,8 @@
 use nsl_ast::Symbol;
 use nsl_ast::{NodeId, Span};
 use nsl_errors::Diagnostic;
-use nsl_lexer::{Token, TokenKind};
 use nsl_lexer::Interner;
+use nsl_lexer::{Token, TokenKind};
 
 /// Sentinel EOF token used when the parser has reached the end of input.
 const EOF_TOKEN: Token = Token {
@@ -183,8 +183,8 @@ impl<'a> Parser<'a> {
 
     /// Expect a newline or EOF or DEDENT (end of statement).
     pub fn expect_end_of_stmt(&mut self) {
-        let previous_was_dedent = self.pos > 0
-            && matches!(self.tokens[self.pos - 1].kind, TokenKind::Dedent);
+        let previous_was_dedent =
+            self.pos > 0 && matches!(self.tokens[self.pos - 1].kind, TokenKind::Dedent);
 
         if !self.at(&TokenKind::Newline)
             && !self.at(&TokenKind::Eof)

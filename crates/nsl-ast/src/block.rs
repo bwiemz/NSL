@@ -1,9 +1,9 @@
-use serde::Serialize;
 use crate::decl::{Decorator, Param};
 use crate::expr::{Arg, Expr};
 use crate::stmt::{Block, Stmt};
 use crate::types::TypeExpr;
 use crate::{Span, Symbol};
+use serde::Serialize;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TrainBlock {
@@ -17,14 +17,8 @@ pub enum TrainSection {
     Data(Vec<Stmt>),
     Optimizer(Expr),
     Scheduler(Expr),
-    Step {
-        param: Symbol,
-        body: Block,
-    },
-    Eval {
-        param: Symbol,
-        body: Block,
-    },
+    Step { param: Symbol, body: Block },
+    Eval { param: Symbol, body: Block },
     Callbacks(Vec<CallbackDef>),
     Distribute(Expr),
     Stmt(Box<Stmt>),

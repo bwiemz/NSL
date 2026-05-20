@@ -1,9 +1,7 @@
 // Compile-only skeleton check: the module, types, and entry point exist
 // and have the signatures the spec mandates.
 
-use nsl_codegen::wggo_prune::{
-    PruneRewrite, PruneRewriteResult, PruneRefusal, run,
-};
+use nsl_codegen::wggo_prune::{run, PruneRefusal, PruneRewrite, PruneRewriteResult};
 use std::collections::BTreeSet;
 
 #[test]

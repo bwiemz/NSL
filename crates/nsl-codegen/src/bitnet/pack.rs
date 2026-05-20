@@ -77,7 +77,13 @@ pub fn pack_trit_slice(trits: &[i8]) -> Vec<u8> {
     );
     trits
         .chunks_exact(4)
-        .map(|chunk| pack_trits(chunk.try_into().expect("chunks_exact(4) guarantees length 4")))
+        .map(|chunk| {
+            pack_trits(
+                chunk
+                    .try_into()
+                    .expect("chunks_exact(4) guarantees length 4"),
+            )
+        })
         .collect()
 }
 

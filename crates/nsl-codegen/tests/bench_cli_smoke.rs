@@ -52,7 +52,14 @@ fn cli_parses_optional_args() {
 
 #[test]
 fn cli_rejects_unknown_flag() {
-    let args = vec!["bench", "--fixture", "gate_4096", "--tier-b", "on", "--bogus"];
+    let args = vec![
+        "bench",
+        "--fixture",
+        "gate_4096",
+        "--tier-b",
+        "on",
+        "--bogus",
+    ];
     assert!(nsl_codegen::bin::bench::cli::parse_from(&args).is_err());
 }
 

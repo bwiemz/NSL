@@ -171,10 +171,7 @@ impl BridgeResult {
     /// with plan layer order (e.g. iterative `for block in self.blocks`
     /// after loop-unrolling), a name-based match picks the right
     /// layer's extras even if the ordinal would not.
-    pub fn extras_for_current_function(
-        &self,
-        fn_name: &str,
-    ) -> Option<(&str, &CshaExtras)> {
+    pub fn extras_for_current_function(&self, fn_name: &str) -> Option<(&str, &CshaExtras)> {
         let needle = fn_name.replace('.', "_");
         for (key, extras) in &self.extras {
             let normalised = key.replace('.', "_");
@@ -511,8 +508,10 @@ pub fn collect_chain_dispatch_map_with_wengert(
 
     // Group chains by layer so a single FusionMark + SDPA claim can cover
     // all three Q/K/V chains of one attention block.
-    let mut by_layer: std::collections::BTreeMap<String, Vec<&crate::csha_boundary::BoundaryChain>> =
-        std::collections::BTreeMap::new();
+    let mut by_layer: std::collections::BTreeMap<
+        String,
+        Vec<&crate::csha_boundary::BoundaryChain>,
+    > = std::collections::BTreeMap::new();
     for chain in &plan.boundary.chains {
         if let Some(layer) = chain.layer.as_ref() {
             by_layer.entry(layer.clone()).or_default().push(chain);
@@ -522,19 +521,15 @@ pub fn collect_chain_dispatch_map_with_wengert(
     for (layer, chains) in &by_layer {
         // Look up the bridge's per-layer FlashAttentionConfig (via any
         // matching NormPrologue mark).
-        let config = bridge_result
-            .extras_for_layer(layer)
-            .and_then(|_| {
-                bridge_result
-                    .marks
-                    .iter()
-                    .find(|m| {
-                        m.layer == *layer
-                            && m.role == MarkRole::NormPrologue
-                            && m.config.is_some()
-                    })
-                    .and_then(|m| m.config.clone())
-            });
+        let config = bridge_result.extras_for_layer(layer).and_then(|_| {
+            bridge_result
+                .marks
+                .iter()
+                .find(|m| {
+                    m.layer == *layer && m.role == MarkRole::NormPrologue && m.config.is_some()
+                })
+                .and_then(|m| m.config.clone())
+        });
 
         // Classify chains by projection.
         let q = chains.iter().find(|c| c.kind == ProjKind::Q).copied();
@@ -682,9 +677,7 @@ pub fn collect_chain_dispatch_map_with_wengert(
             // clamped tile (block_kv=32, no fusion flags). The plan-level
             // `config` carries the pipeline's fusion flags which inflate
             // the backward layout past the 99 KB cap at hd=32.
-            let mark_config = training_config
-                .cloned()
-                .or_else(|| config.clone());
+            let mark_config = training_config.cloned().or_else(|| config.clone());
             chain_marks.push(FusionMark {
                 layer: layer.clone(),
                 // The grouped mark represents the whole layer; pick Q as
@@ -728,9 +721,7 @@ pub fn collect_chain_dispatch_map_with_wengert(
 
                 // Gap I.1: legacy per-chain path — prefer training
                 // config when available, same as the grouped path above.
-                let per_chain_mark_config = training_config
-                    .cloned()
-                    .or(per_kind_config);
+                let per_chain_mark_config = training_config.cloned().or(per_kind_config);
                 chain_marks.push(FusionMark {
                     layer: layer.clone(),
                     kind: Some(chain.kind),
@@ -751,11 +742,7 @@ pub fn collect_chain_dispatch_map_with_wengert(
 ///
 /// `diagnostics` is threaded through to `flash_attention_selector`
 /// and emitted by the caller via `eprintln!`.
-pub fn bridge(
-    plan: &CshaPlan,
-    shape_head_dim: i64,
-    diagnostics: &mut Vec<String>,
-) -> BridgeResult {
+pub fn bridge(plan: &CshaPlan, shape_head_dim: i64, diagnostics: &mut Vec<String>) -> BridgeResult {
     let mut out = BridgeResult::default();
     if plan.per_layer.is_empty() {
         return out;
@@ -770,12 +757,13 @@ pub fn bridge(
     for layer_plan in &plan.per_layer {
         let pat = plan.patterns.get(&layer_plan.layer);
         let cfg = build_flash_config(layer_plan, &plan.specialization, pat, shape_head_dim);
-        let kernel_name = crate::flash_attention_selector::flash_attention_kernel_name_selected_with_diag(
-            &cfg, diagnostics,
-        );
-        let smem = crate::flash_attention_selector::shared_mem_bytes_selected_with_diag(
-            &cfg, diagnostics,
-        );
+        let kernel_name =
+            crate::flash_attention_selector::flash_attention_kernel_name_selected_with_diag(
+                &cfg,
+                diagnostics,
+            );
+        let smem =
+            crate::flash_attention_selector::shared_mem_bytes_selected_with_diag(&cfg, diagnostics);
 
         out.kernels.push(KernelSpec {
             layer: layer_plan.layer.clone(),
@@ -784,11 +772,9 @@ pub fn bridge(
             smem_bytes: smem,
         });
         if let Some(ref extras) = cfg.csha {
-            out.extras
-                .insert(layer_plan.layer.clone(), extras.clone());
+            out.extras.insert(layer_plan.layer.clone(), extras.clone());
         }
-        out.configs
-            .insert(layer_plan.layer.clone(), (&cfg).into());
+        out.configs.insert(layer_plan.layer.clone(), (&cfg).into());
         full_configs.insert(layer_plan.layer.clone(), cfg);
     }
 
@@ -837,8 +823,11 @@ pub fn bridge(
     }
 
     out.marks.sort_by(|a, b| {
-        (a.layer.as_str(), a.kind.map(|k| k as u8), a.role as u8)
-            .cmp(&(b.layer.as_str(), b.kind.map(|k| k as u8), b.role as u8))
+        (a.layer.as_str(), a.kind.map(|k| k as u8), a.role as u8).cmp(&(
+            b.layer.as_str(),
+            b.kind.map(|k| k as u8),
+            b.role as u8,
+        ))
     });
     out
 }
@@ -857,7 +846,12 @@ fn build_flash_config(
     // Causal defaults to true (autoregressive LLMs); the pattern pass
     // flips it to false for bidirectional models.
     let causal = pattern
-        .map(|p| !matches!(p.causal_mask, crate::csha_patterns::CausalMaskStrategy::None))
+        .map(|p| {
+            !matches!(
+                p.causal_mask,
+                crate::csha_patterns::CausalMaskStrategy::None
+            )
+        })
         .unwrap_or(true);
     let gqa_group_size: u32 = match pattern.map(|p| p.gqa) {
         Some(crate::csha_patterns::GqaStrategy::ZeroCopyStride { group_size }) => group_size,
@@ -1498,11 +1492,7 @@ mod tests {
 
         // Minimal fusion graph: one param node consumed by one matmul.
         let mut g = FusionGraph::new();
-        let p = g.add_named_node(
-            "blocks.0.attn.wq".into(),
-            FusionOp::Input,
-            vec![],
-        );
+        let p = g.add_named_node("blocks.0.attn.wq".into(), FusionOp::Input, vec![]);
         let mm = g.add_node(FusionOp::Matmul, vec![p]);
         g.nodes[p as usize].consumers.push(mm);
 
@@ -1595,9 +1585,10 @@ mod tests {
             "H.1: bridge must emit at least one NormPrologue mark"
         );
         for m in &norm_marks {
-            let cfg = m.config.as_ref().unwrap_or_else(|| {
-                panic!("H.1: NormPrologue mark {:?} has no config", m.layer)
-            });
+            let cfg = m
+                .config
+                .as_ref()
+                .unwrap_or_else(|| panic!("H.1: NormPrologue mark {:?} has no config", m.layer));
             assert_eq!(
                 cfg.head_dim, 32,
                 "H.1: FusionMark {:?}/{:?} config.head_dim = {} \
@@ -1615,9 +1606,10 @@ mod tests {
             "H.1: dispatch map must produce at least one chain mark"
         );
         for m in &chain_marks {
-            let cfg = m.config.as_ref().unwrap_or_else(|| {
-                panic!("H.1: chain mark {:?} has no config", m.layer)
-            });
+            let cfg = m
+                .config
+                .as_ref()
+                .unwrap_or_else(|| panic!("H.1: chain mark {:?} has no config", m.layer));
             assert_eq!(
                 cfg.head_dim, 32,
                 "H.1: chain FusionMark {:?}/{:?} config.head_dim = {} \

@@ -18,10 +18,7 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
-fn run_check_with_report(
-    fixture_name: &str,
-    format: Option<&str>,
-) -> (i32, String, String) {
+fn run_check_with_report(fixture_name: &str, format: Option<&str>) -> (i32, String, String) {
     let root = workspace_root();
     let cargo_toml = root.join("Cargo.toml");
     let stdlib_path = root.join("stdlib");
@@ -52,10 +49,7 @@ fn run_check_with_report(
 
 #[test]
 fn fase_deferred_text_report_has_expected_fields() {
-    let (code, stdout, stderr) = run_check_with_report(
-        "training_report_fase_deferred.nsl",
-        None,
-    );
+    let (code, stdout, stderr) = run_check_with_report("training_report_fase_deferred.nsl", None);
     assert_eq!(code, 0, "exit code non-zero; stderr:\n{}", stderr);
     assert!(
         stdout.contains("Training Pipeline Report"),
@@ -81,19 +75,16 @@ fn fase_deferred_text_report_has_expected_fields() {
 
 #[test]
 fn fase_deferred_json_report_round_trips() {
-    let (code, stdout, stderr) = run_check_with_report(
-        "training_report_fase_deferred.nsl",
-        Some("json"),
-    );
+    let (code, stdout, stderr) =
+        run_check_with_report("training_report_fase_deferred.nsl", Some("json"));
     assert_eq!(code, 0, "exit code non-zero; stderr:\n{}", stderr);
     // Strip any non-JSON prefix (e.g. "OK: ..." line before the JSON blob).
-    let json_start = stdout.find('{').unwrap_or_else(|| {
-        panic!("no JSON object in stdout:\n{}", stdout)
-    });
+    let json_start = stdout
+        .find('{')
+        .unwrap_or_else(|| panic!("no JSON object in stdout:\n{}", stdout));
     let json_str = &stdout[json_start..];
-    let json: serde_json::Value = serde_json::from_str(json_str).unwrap_or_else(|e| {
-        panic!("invalid JSON: {}\nstdout:\n{}", e, stdout)
-    });
+    let json: serde_json::Value = serde_json::from_str(json_str)
+        .unwrap_or_else(|e| panic!("invalid JSON: {}\nstdout:\n{}", e, stdout));
     // The JSON should contain train_blocks[0].fase.plan.mode = "Deferred"
     let mode = json
         .pointer("/train_blocks/0/fase/plan/mode")
@@ -108,10 +99,7 @@ fn fase_deferred_json_report_round_trips() {
 
 #[test]
 fn lion_optimizer_triggers_full_buffer_mode() {
-    let (code, stdout, stderr) = run_check_with_report(
-        "training_report_lion_fallback.nsl",
-        None,
-    );
+    let (code, stdout, stderr) = run_check_with_report("training_report_lion_fallback.nsl", None);
     assert_eq!(code, 0, "exit code non-zero; stderr:\n{}", stderr);
     // Lion is in FaseOptimizer::Lion; planner returns FaseMode::FullBuffer.
     assert!(
@@ -128,10 +116,7 @@ fn lion_optimizer_triggers_full_buffer_mode() {
 
 #[test]
 fn no_train_blocks_reports_empty_gracefully() {
-    let (code, stdout, stderr) = run_check_with_report(
-        "training_report_no_train.nsl",
-        None,
-    );
+    let (code, stdout, stderr) = run_check_with_report("training_report_no_train.nsl", None);
     assert_eq!(code, 0, "exit code non-zero; stderr:\n{}", stderr);
     assert!(
         stdout.contains("No train blocks found"),

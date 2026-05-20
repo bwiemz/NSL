@@ -62,11 +62,11 @@ use crate::pca_segment::SegmentResidency;
 /// more than once per kernel, so fixed names are fine; if a future
 /// tier needs multiple calls, introduce a seed parameter then.
 pub fn emit_segment_mask_predicate(
-    ptx:             &mut String,
-    q_pos_reg:       &str,
-    k_pos_reg:       &str,
+    ptx: &mut String,
+    q_pos_reg: &str,
+    k_pos_reg: &str,
     segment_ids_reg: &str,
-    residency:       SegmentResidency,
+    residency: SegmentResidency,
     mask_pred_inout: &str,
 ) {
     ptx.push_str("    // PCA Tier A: extend %p0 with cross-segment disjunction (spec 5.1)\n");
@@ -87,11 +87,11 @@ pub fn emit_segment_mask_predicate(
 ///
 /// Residency-aware: `Shared` = `ld.shared.u16`, `Streamed` = `trap;` (Tier A out of scope).
 fn emit_segment_id_load(
-    ptx:             &mut String,
-    pos_reg:         &str,
+    ptx: &mut String,
+    pos_reg: &str,
     segment_ids_reg: &str,
-    residency:       SegmentResidency,
-    tag:             char,
+    residency: SegmentResidency,
+    tag: char,
 ) {
     let rd_off = format!("%rd_{tag}_SEGMASK");
     let rs = format!("%rs_{tag}_SEGMASK");
@@ -108,9 +108,7 @@ fn emit_segment_id_load(
             ptx.push_str(&format!(
                 "    add.u64        {rd_off}, {segment_ids_reg}, {rd_off};     // &seg[{tag}]\n"
             ));
-            ptx.push_str(&format!(
-                "    ld.shared.u16  {rs}, [{rd_off}];\n"
-            ));
+            ptx.push_str(&format!("    ld.shared.u16  {rs}, [{rd_off}];\n"));
         }
         SegmentResidency::Streamed => {
             ptx.push_str("    // SegmentResidency::Streamed is out of scope for PCA Tier A\n");

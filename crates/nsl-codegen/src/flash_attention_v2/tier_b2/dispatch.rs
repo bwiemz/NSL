@@ -34,7 +34,7 @@ pub enum DispatchReject {
 /// Returns `None` if `head_dim` isn't in the supported set.
 fn ladder_row(head_dim: u32) -> Option<(u32, u32)> {
     match head_dim {
-        64  => Some((64, 4)),
+        64 => Some((64, 4)),
         128 => Some((64, 4)),
         256 => Some((32, 4)),
         _ => None,
@@ -51,7 +51,7 @@ pub fn tier_b2_smem_bytes(bq: u32, bkv: u32, hd: u32, chunk: u32) -> u32 {
               + bq * bkv * 4; // dS
     let chunk_staging = chunk * hd * 2 * 2   // Wk_chunk + Wv_chunk
                       + bq * chunk * 2       // x_q_chunk
-                      + bkv * chunk * 2;     // x_kv_chunk
+                      + bkv * chunk * 2; // x_kv_chunk
     fixed + chunk_staging
 }
 
@@ -59,9 +59,7 @@ pub fn tier_b2_smem_bytes(bq: u32, bkv: u32, hd: u32, chunk: u32) -> u32 {
 ///
 /// Returns `Ok(BackwardTier::TierB2 {...})` with the planner-pinned bq/chunk
 /// on success, `Err(DispatchReject)` with the rejection reason otherwise.
-pub fn tier_b2_can_dispatch(
-    config: &FlashAttentionConfig,
-) -> Result<BackwardTier, DispatchReject> {
+pub fn tier_b2_can_dispatch(config: &FlashAttentionConfig) -> Result<BackwardTier, DispatchReject> {
     use crate::flash_attention_v2::smem_layout::SMEM_DYNAMIC_BUDGET_BYTES;
 
     let Some(csha) = config.csha.as_ref() else {
@@ -80,7 +78,10 @@ pub fn tier_b2_can_dispatch(
     let bkv = bq;
     let needed = tier_b2_smem_bytes(bq, bkv, hd, chunk);
     if needed > SMEM_DYNAMIC_BUDGET_BYTES {
-        return Err(DispatchReject::SmemOverBudget { needed, budget: SMEM_DYNAMIC_BUDGET_BYTES });
+        return Err(DispatchReject::SmemOverBudget {
+            needed,
+            budget: SMEM_DYNAMIC_BUDGET_BYTES,
+        });
     }
     Ok(BackwardTier::TierB2 { bq, bkv, chunk })
 }
@@ -115,7 +116,11 @@ mod tests {
         let result = tier_b2_can_dispatch(&cfg(128, 80, 2));
         assert_eq!(
             result,
-            Ok(BackwardTier::TierB2 { bq: 64, bkv: 64, chunk: 4 })
+            Ok(BackwardTier::TierB2 {
+                bq: 64,
+                bkv: 64,
+                chunk: 4
+            })
         );
     }
 
@@ -124,7 +129,11 @@ mod tests {
         let result = tier_b2_can_dispatch(&cfg(64, 80, 2));
         assert_eq!(
             result,
-            Ok(BackwardTier::TierB2 { bq: 64, bkv: 64, chunk: 4 })
+            Ok(BackwardTier::TierB2 {
+                bq: 64,
+                bkv: 64,
+                chunk: 4
+            })
         );
     }
 
@@ -145,7 +154,11 @@ mod tests {
         let result = tier_b2_can_dispatch(&cfg(256, 80, 2));
         assert_eq!(
             result,
-            Ok(BackwardTier::TierB2 { bq: 32, bkv: 32, chunk: 4 })
+            Ok(BackwardTier::TierB2 {
+                bq: 32,
+                bkv: 32,
+                chunk: 4
+            })
         );
     }
 

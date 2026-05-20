@@ -29,8 +29,7 @@ pub fn validate_inspect_decorator(
         None => {
             diagnostics.push(
                 Diagnostic::error(
-                    "@inspect requires arguments: first positional is the tensor"
-                        .to_string(),
+                    "@inspect requires arguments: first positional is the tensor".to_string(),
                 )
                 .with_label(deco.span, "missing arguments"),
             );
@@ -40,10 +39,8 @@ pub fn validate_inspect_decorator(
 
     if args.is_empty() {
         diagnostics.push(
-            Diagnostic::error(
-                "@inspect requires at least one argument (the tensor)".to_string(),
-            )
-            .with_label(deco.span, "empty argument list"),
+            Diagnostic::error("@inspect requires at least one argument (the tensor)".to_string())
+                .with_label(deco.span, "empty argument list"),
         );
         return;
     }

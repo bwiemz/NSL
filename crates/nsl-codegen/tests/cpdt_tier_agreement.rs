@@ -69,14 +69,16 @@ fn tier_agreement_full_on_calib_small_by_construction() {
     let wm_small = WeightMap::load(&fixture("calib_small")).unwrap();
     let plan_small = plan_map(
         &wm_small,
-        &PrecisionConfig { n_layers: 8, ..Default::default() },
+        &PrecisionConfig {
+            n_layers: 8,
+            ..Default::default()
+        },
     );
     let counts_small = tier_counts_of(&plan_small);
 
     // Per-fixture sanity on calib_small: at least one primary tier populated.
     // Catches the "all generics landed VeryLow" degeneracy that Phase 1 shipped.
-    let small_primary_count =
-        counts_small.high + counts_small.medium + counts_small.low;
+    let small_primary_count = counts_small.high + counts_small.medium + counts_small.low;
     assert!(
         small_primary_count > 0,
         "calib_small has no primary-tier assignments (degenerate distribution)"
@@ -167,7 +169,10 @@ fn try_load_plan_medium() -> Option<PrecisionPlan> {
     let wm = WeightMap::load(&p).ok()?;
     let plan = plan_map(
         &wm,
-        &PrecisionConfig { n_layers: 16, ..Default::default() },
+        &PrecisionConfig {
+            n_layers: 16,
+            ..Default::default()
+        },
     );
     Some(plan)
 }

@@ -65,7 +65,7 @@ impl Compiler<'_> {
         m_partial_ptr: Value,
         v_ptr: Value,
         recipe: &crate::fase::UpdateRecipe,
-        bc_params: Option<(Value, Value)>,  // (bc1_inv, bc2_inv) — None for non-AdamW
+        bc_params: Option<(Value, Value)>, // (bc1_inv, bc2_inv) — None for non-AdamW
     ) -> Result<(), crate::error::CodegenError> {
         use crate::fase_optimizer::{emit_final_step, Register, UpdateOp};
 
@@ -94,21 +94,25 @@ impl Compiler<'_> {
             v_hat_ptr: Option<Value>,
         ) -> Result<Value, crate::error::CodegenError> {
             match r {
-                Register::Theta    => Ok(theta_ptr),
-                Register::M        => Ok(m_ptr),
+                Register::Theta => Ok(theta_ptr),
+                Register::M => Ok(m_ptr),
                 Register::MPartial => Ok(m_partial_ptr),
-                Register::V        => Ok(v_ptr),
-                Register::MHat     => m_hat_ptr.ok_or_else(|| crate::error::CodegenError::new(
-                    "Register::MHat read before ScalarMulByBc wrote it"
-                )),
-                Register::VHat     => v_hat_ptr.ok_or_else(|| crate::error::CodegenError::new(
-                    "Register::VHat read before ScalarMulByBc wrote it"
-                )),
+                Register::V => Ok(v_ptr),
+                Register::MHat => m_hat_ptr.ok_or_else(|| {
+                    crate::error::CodegenError::new(
+                        "Register::MHat read before ScalarMulByBc wrote it",
+                    )
+                }),
+                Register::VHat => v_hat_ptr.ok_or_else(|| {
+                    crate::error::CodegenError::new(
+                        "Register::VHat read before ScalarMulByBc wrote it",
+                    )
+                }),
                 Register::G => Err(crate::error::CodegenError::new(
-                    "final-step recipe must not reference Register::G"
+                    "final-step recipe must not reference Register::G",
                 )),
                 Register::Tmp => Err(crate::error::CodegenError::new(
-                    "Tmp register must be resolved via tmp_val, not resolve_reg"
+                    "Tmp register must be resolved via tmp_val, not resolve_reg",
                 )),
             }
         }
@@ -120,7 +124,15 @@ impl Compiler<'_> {
             match op {
                 // ── Zero ────────────────────────────────────────────────────
                 UpdateOp::Zero(r) => {
-                    let ptr = resolve_reg(*r, theta_ptr, m_ptr, m_partial_ptr, v_ptr, m_hat_ptr, v_hat_ptr)?;
+                    let ptr = resolve_reg(
+                        *r,
+                        theta_ptr,
+                        m_ptr,
+                        m_partial_ptr,
+                        v_ptr,
+                        m_hat_ptr,
+                        v_hat_ptr,
+                    )?;
                     self.compile_call_by_name(builder, "nsl_tensor_zero_inplace", &[ptr])?;
                 }
 
@@ -129,36 +141,76 @@ impl Compiler<'_> {
                 // alias src (e.g. M = β₁·M + (1-β₁)·MPartial).
                 // Strategy: compute each scaled term into an owned temp, copy
                 // the first term into dst, then add_inplace the second.
-                UpdateOp::ScalarMulAdd { dst, src, a, b_src, b_scale } => {
-                    let src_ptr = resolve_reg(*src, theta_ptr, m_ptr, m_partial_ptr, v_ptr, m_hat_ptr, v_hat_ptr)?;
+                UpdateOp::ScalarMulAdd {
+                    dst,
+                    src,
+                    a,
+                    b_src,
+                    b_scale,
+                } => {
+                    let src_ptr = resolve_reg(
+                        *src,
+                        theta_ptr,
+                        m_ptr,
+                        m_partial_ptr,
+                        v_ptr,
+                        m_hat_ptr,
+                        v_hat_ptr,
+                    )?;
                     let dst_ptr = if *dst == Register::Tmp {
                         // If dst is Tmp, we'll handle the pointer below.
                         None
                     } else {
-                        Some(resolve_reg(*dst, theta_ptr, m_ptr, m_partial_ptr, v_ptr, m_hat_ptr, v_hat_ptr)?)
+                        Some(resolve_reg(
+                            *dst,
+                            theta_ptr,
+                            m_ptr,
+                            m_partial_ptr,
+                            v_ptr,
+                            m_hat_ptr,
+                            v_hat_ptr,
+                        )?)
                     };
 
                     // tmp1 = a * src  (owned)
                     let a_val = builder.ins().f64const(*a);
                     let tmp1 = self.compile_call_by_name(
-                        builder, "nsl_tensor_mul_scalar", &[src_ptr, a_val, flags_zero]
+                        builder,
+                        "nsl_tensor_mul_scalar",
+                        &[src_ptr, a_val, flags_zero],
                     )?;
 
                     let result = if let Some(b_reg) = b_src {
                         // tmp2 = b_scale * b_src  (owned)
                         let b_ptr = if *b_reg == Register::Tmp {
-                            tmp_val.ok_or_else(|| crate::error::CodegenError::new(
-                                "ScalarMulAdd: Tmp register read before first write"
-                            ))?
+                            tmp_val.ok_or_else(|| {
+                                crate::error::CodegenError::new(
+                                    "ScalarMulAdd: Tmp register read before first write",
+                                )
+                            })?
                         } else {
-                            resolve_reg(*b_reg, theta_ptr, m_ptr, m_partial_ptr, v_ptr, m_hat_ptr, v_hat_ptr)?
+                            resolve_reg(
+                                *b_reg,
+                                theta_ptr,
+                                m_ptr,
+                                m_partial_ptr,
+                                v_ptr,
+                                m_hat_ptr,
+                                v_hat_ptr,
+                            )?
                         };
                         let b_scale_val = builder.ins().f64const(*b_scale);
                         let tmp2 = self.compile_call_by_name(
-                            builder, "nsl_tensor_mul_scalar", &[b_ptr, b_scale_val, flags_zero]
+                            builder,
+                            "nsl_tensor_mul_scalar",
+                            &[b_ptr, b_scale_val, flags_zero],
                         )?;
                         // Merge: tmp1 += tmp2  (tmp1 is owned so we can mutate it)
-                        self.compile_call_by_name(builder, "nsl_tensor_add_inplace", &[tmp1, tmp2])?;
+                        self.compile_call_by_name(
+                            builder,
+                            "nsl_tensor_add_inplace",
+                            &[tmp1, tmp2],
+                        )?;
                         self.compile_call_by_name(builder, "nsl_tensor_free", &[tmp2])?;
                         tmp1
                     } else {
@@ -173,24 +225,46 @@ impl Compiler<'_> {
                     } else {
                         // Copy result into dst (which is a borrowed buffer), then free temp.
                         let dst_ptr = dst_ptr.unwrap();
-                        self.compile_call_by_name(builder, "nsl_tensor_copy_data", &[dst_ptr, result])?;
+                        self.compile_call_by_name(
+                            builder,
+                            "nsl_tensor_copy_data",
+                            &[dst_ptr, result],
+                        )?;
                         self.compile_call_by_name(builder, "nsl_tensor_free", &[result])?;
                     }
                 }
 
                 // ── Square: dst = src * src ──────────────────────────────────
                 UpdateOp::Square { dst, src } => {
-                    let src_ptr = resolve_reg(*src, theta_ptr, m_ptr, m_partial_ptr, v_ptr, m_hat_ptr, v_hat_ptr)?;
+                    let src_ptr = resolve_reg(
+                        *src,
+                        theta_ptr,
+                        m_ptr,
+                        m_partial_ptr,
+                        v_ptr,
+                        m_hat_ptr,
+                        v_hat_ptr,
+                    )?;
                     // flags=0: do not consume src (borrowed)
                     let sq = self.compile_call_by_name(
-                        builder, "nsl_tensor_mul", &[src_ptr, src_ptr, flags_zero]
+                        builder,
+                        "nsl_tensor_mul",
+                        &[src_ptr, src_ptr, flags_zero],
                     )?;
                     if *dst == Register::Tmp {
                         if let Some(old) = tmp_val.replace(sq) {
                             self.compile_call_by_name(builder, "nsl_tensor_free", &[old])?;
                         }
                     } else {
-                        let dst_ptr = resolve_reg(*dst, theta_ptr, m_ptr, m_partial_ptr, v_ptr, m_hat_ptr, v_hat_ptr)?;
+                        let dst_ptr = resolve_reg(
+                            *dst,
+                            theta_ptr,
+                            m_ptr,
+                            m_partial_ptr,
+                            v_ptr,
+                            m_hat_ptr,
+                            v_hat_ptr,
+                        )?;
                         self.compile_call_by_name(builder, "nsl_tensor_copy_data", &[dst_ptr, sq])?;
                         self.compile_call_by_name(builder, "nsl_tensor_free", &[sq])?;
                     }
@@ -200,24 +274,43 @@ impl Compiler<'_> {
                 // dst and src are always the same register (e.g. V = V + …).
                 // Strategy: compute sq=operand², scaled_sq=scale*sq, then
                 // add_inplace(dst, scaled_sq).  No copy needed when dst==src.
-                UpdateOp::SquaredAccumulate { dst, src, operand, scale } => {
+                UpdateOp::SquaredAccumulate {
+                    dst,
+                    src,
+                    operand,
+                    scale,
+                } => {
                     let operand_ptr = if *operand == Register::Tmp {
-                        tmp_val.ok_or_else(|| crate::error::CodegenError::new(
-                            "SquaredAccumulate: Tmp operand read before first write"
-                        ))?
+                        tmp_val.ok_or_else(|| {
+                            crate::error::CodegenError::new(
+                                "SquaredAccumulate: Tmp operand read before first write",
+                            )
+                        })?
                     } else {
-                        resolve_reg(*operand, theta_ptr, m_ptr, m_partial_ptr, v_ptr, m_hat_ptr, v_hat_ptr)?
+                        resolve_reg(
+                            *operand,
+                            theta_ptr,
+                            m_ptr,
+                            m_partial_ptr,
+                            v_ptr,
+                            m_hat_ptr,
+                            v_hat_ptr,
+                        )?
                     };
 
                     // sq = operand * operand  (owned)
                     let sq = self.compile_call_by_name(
-                        builder, "nsl_tensor_mul", &[operand_ptr, operand_ptr, flags_zero]
+                        builder,
+                        "nsl_tensor_mul",
+                        &[operand_ptr, operand_ptr, flags_zero],
                     )?;
                     // scaled_sq = scale * sq  (owned; relinquish sq)
                     let scale_val = builder.ins().f64const(*scale);
                     let flags_relinq = builder.ins().iconst(cl_types::I8, 0b0000_0001); // relinquish_a
                     let scaled_sq = self.compile_call_by_name(
-                        builder, "nsl_tensor_mul_scalar", &[sq, scale_val, flags_relinq]
+                        builder,
+                        "nsl_tensor_mul_scalar",
+                        &[sq, scale_val, flags_relinq],
                     )?;
 
                     // dst += scaled_sq.
@@ -225,18 +318,52 @@ impl Compiler<'_> {
                     // If dst != src, copy src into dst first (shouldn't happen in
                     // the current optimizer programs, but handle for safety).
                     if dst != src {
-                        let src_ptr = resolve_reg(*src, theta_ptr, m_ptr, m_partial_ptr, v_ptr, m_hat_ptr, v_hat_ptr)?;
-                        let dst_ptr = resolve_reg(*dst, theta_ptr, m_ptr, m_partial_ptr, v_ptr, m_hat_ptr, v_hat_ptr)?;
-                        self.compile_call_by_name(builder, "nsl_tensor_copy_data", &[dst_ptr, src_ptr])?;
+                        let src_ptr = resolve_reg(
+                            *src,
+                            theta_ptr,
+                            m_ptr,
+                            m_partial_ptr,
+                            v_ptr,
+                            m_hat_ptr,
+                            v_hat_ptr,
+                        )?;
+                        let dst_ptr = resolve_reg(
+                            *dst,
+                            theta_ptr,
+                            m_ptr,
+                            m_partial_ptr,
+                            v_ptr,
+                            m_hat_ptr,
+                            v_hat_ptr,
+                        )?;
+                        self.compile_call_by_name(
+                            builder,
+                            "nsl_tensor_copy_data",
+                            &[dst_ptr, src_ptr],
+                        )?;
                     }
                     let dst_ptr = if *dst == Register::Tmp {
-                        tmp_val.ok_or_else(|| crate::error::CodegenError::new(
-                            "SquaredAccumulate: Tmp dst not yet allocated"
-                        ))?
+                        tmp_val.ok_or_else(|| {
+                            crate::error::CodegenError::new(
+                                "SquaredAccumulate: Tmp dst not yet allocated",
+                            )
+                        })?
                     } else {
-                        resolve_reg(*dst, theta_ptr, m_ptr, m_partial_ptr, v_ptr, m_hat_ptr, v_hat_ptr)?
+                        resolve_reg(
+                            *dst,
+                            theta_ptr,
+                            m_ptr,
+                            m_partial_ptr,
+                            v_ptr,
+                            m_hat_ptr,
+                            v_hat_ptr,
+                        )?
                     };
-                    self.compile_call_by_name(builder, "nsl_tensor_add_inplace", &[dst_ptr, scaled_sq])?;
+                    self.compile_call_by_name(
+                        builder,
+                        "nsl_tensor_add_inplace",
+                        &[dst_ptr, scaled_sq],
+                    )?;
                     // FBIP relinq contract: when mul_scalar reuses the input
                     // buffer in-place, it bumps refcount so the input ptr is
                     // still valid post-call. The caller must free BOTH the
@@ -260,11 +387,21 @@ impl Compiler<'_> {
                 // when tmp_val is replaced.
                 UpdateOp::SqrtPlusEps { dst, src, eps } => {
                     let src_ptr = if *src == Register::Tmp {
-                        tmp_val.ok_or_else(|| crate::error::CodegenError::new(
-                            "SqrtPlusEps: Tmp src read before first write"
-                        ))?
+                        tmp_val.ok_or_else(|| {
+                            crate::error::CodegenError::new(
+                                "SqrtPlusEps: Tmp src read before first write",
+                            )
+                        })?
                     } else {
-                        resolve_reg(*src, theta_ptr, m_ptr, m_partial_ptr, v_ptr, m_hat_ptr, v_hat_ptr)?
+                        resolve_reg(
+                            *src,
+                            theta_ptr,
+                            m_ptr,
+                            m_partial_ptr,
+                            v_ptr,
+                            m_hat_ptr,
+                            v_hat_ptr,
+                        )?
                     };
 
                     // Force a non-FBIP copy of src so the persistent V buffer is not
@@ -272,7 +409,9 @@ impl Compiler<'_> {
                     // add_scalar with flags=0 (no relinquish) always allocates a fresh tensor.
                     let zero_val = builder.ins().f64const(0.0);
                     let src_copy = self.compile_call_by_name(
-                        builder, "nsl_tensor_add_scalar", &[src_ptr, zero_val, flags_zero]
+                        builder,
+                        "nsl_tensor_add_scalar",
+                        &[src_ptr, zero_val, flags_zero],
                     )?;
 
                     // sqrt_val = sqrt(src_copy).  nsl_tensor_sqrt may FBIP if refcount==1.
@@ -282,15 +421,16 @@ impl Compiler<'_> {
                     // leaving sqrt_val alive with refcount=1.
                     // If FBIP does NOT fire (future-proofing), sqrt_val is a fresh tensor
                     // and freeing src_copy correctly drops it to 0.
-                    let sqrt_val = self.compile_call_by_name(
-                        builder, "nsl_tensor_sqrt", &[src_copy]
-                    )?;
+                    let sqrt_val =
+                        self.compile_call_by_name(builder, "nsl_tensor_sqrt", &[src_copy])?;
                     self.compile_call_by_name(builder, "nsl_tensor_free", &[src_copy])?;
                     // eps_result = sqrt_val + eps  (relinquish sqrt_val → FBIP may mutate in-place)
                     let eps_val = builder.ins().f64const(*eps);
                     let flags_relinq = builder.ins().iconst(cl_types::I8, 0b0000_0001);
                     let eps_result = self.compile_call_by_name(
-                        builder, "nsl_tensor_add_scalar", &[sqrt_val, eps_val, flags_relinq]
+                        builder,
+                        "nsl_tensor_add_scalar",
+                        &[sqrt_val, eps_val, flags_relinq],
                     )?;
 
                     if *dst == Register::Tmp {
@@ -298,8 +438,20 @@ impl Compiler<'_> {
                             self.compile_call_by_name(builder, "nsl_tensor_free", &[old])?;
                         }
                     } else {
-                        let dst_ptr = resolve_reg(*dst, theta_ptr, m_ptr, m_partial_ptr, v_ptr, m_hat_ptr, v_hat_ptr)?;
-                        self.compile_call_by_name(builder, "nsl_tensor_copy_data", &[dst_ptr, eps_result])?;
+                        let dst_ptr = resolve_reg(
+                            *dst,
+                            theta_ptr,
+                            m_ptr,
+                            m_partial_ptr,
+                            v_ptr,
+                            m_hat_ptr,
+                            v_hat_ptr,
+                        )?;
+                        self.compile_call_by_name(
+                            builder,
+                            "nsl_tensor_copy_data",
+                            &[dst_ptr, eps_result],
+                        )?;
                         self.compile_call_by_name(builder, "nsl_tensor_free", &[eps_result])?;
                     }
                     // FBIP relinq contract: caller must also free the input we
@@ -312,23 +464,43 @@ impl Compiler<'_> {
                 // ── Div: dst = src / divisor ─────────────────────────────────
                 UpdateOp::Div { dst, src, divisor } => {
                     let src_ptr = if *src == Register::Tmp {
-                        tmp_val.ok_or_else(|| crate::error::CodegenError::new(
-                            "Div: Tmp src read before first write"
-                        ))?
+                        tmp_val.ok_or_else(|| {
+                            crate::error::CodegenError::new("Div: Tmp src read before first write")
+                        })?
                     } else {
-                        resolve_reg(*src, theta_ptr, m_ptr, m_partial_ptr, v_ptr, m_hat_ptr, v_hat_ptr)?
+                        resolve_reg(
+                            *src,
+                            theta_ptr,
+                            m_ptr,
+                            m_partial_ptr,
+                            v_ptr,
+                            m_hat_ptr,
+                            v_hat_ptr,
+                        )?
                     };
                     let divisor_ptr = if *divisor == Register::Tmp {
-                        tmp_val.ok_or_else(|| crate::error::CodegenError::new(
-                            "Div: Tmp divisor read before first write"
-                        ))?
+                        tmp_val.ok_or_else(|| {
+                            crate::error::CodegenError::new(
+                                "Div: Tmp divisor read before first write",
+                            )
+                        })?
                     } else {
-                        resolve_reg(*divisor, theta_ptr, m_ptr, m_partial_ptr, v_ptr, m_hat_ptr, v_hat_ptr)?
+                        resolve_reg(
+                            *divisor,
+                            theta_ptr,
+                            m_ptr,
+                            m_partial_ptr,
+                            v_ptr,
+                            m_hat_ptr,
+                            v_hat_ptr,
+                        )?
                     };
 
                     // result = src / divisor  (owned; flags=0 — borrow both)
                     let result = self.compile_call_by_name(
-                        builder, "nsl_tensor_div", &[src_ptr, divisor_ptr, flags_zero]
+                        builder,
+                        "nsl_tensor_div",
+                        &[src_ptr, divisor_ptr, flags_zero],
                     )?;
 
                     if *dst == Register::Tmp {
@@ -337,8 +509,20 @@ impl Compiler<'_> {
                             self.compile_call_by_name(builder, "nsl_tensor_free", &[old])?;
                         }
                     } else {
-                        let dst_ptr = resolve_reg(*dst, theta_ptr, m_ptr, m_partial_ptr, v_ptr, m_hat_ptr, v_hat_ptr)?;
-                        self.compile_call_by_name(builder, "nsl_tensor_copy_data", &[dst_ptr, result])?;
+                        let dst_ptr = resolve_reg(
+                            *dst,
+                            theta_ptr,
+                            m_ptr,
+                            m_partial_ptr,
+                            v_ptr,
+                            m_hat_ptr,
+                            v_hat_ptr,
+                        )?;
+                        self.compile_call_by_name(
+                            builder,
+                            "nsl_tensor_copy_data",
+                            &[dst_ptr, result],
+                        )?;
                         self.compile_call_by_name(builder, "nsl_tensor_free", &[result])?;
                     }
                 }
@@ -352,31 +536,53 @@ impl Compiler<'_> {
                 //   free adj
                 UpdateOp::Update { lr, wd, scaled_m } => {
                     let scaled_m_ptr = if *scaled_m == Register::Tmp {
-                        tmp_val.ok_or_else(|| crate::error::CodegenError::new(
-                            "Update: Tmp scaled_m read before first write"
-                        ))?
+                        tmp_val.ok_or_else(|| {
+                            crate::error::CodegenError::new(
+                                "Update: Tmp scaled_m read before first write",
+                            )
+                        })?
                     } else {
-                        resolve_reg(*scaled_m, theta_ptr, m_ptr, m_partial_ptr, v_ptr, m_hat_ptr, v_hat_ptr)?
+                        resolve_reg(
+                            *scaled_m,
+                            theta_ptr,
+                            m_ptr,
+                            m_partial_ptr,
+                            v_ptr,
+                            m_hat_ptr,
+                            v_hat_ptr,
+                        )?
                     };
 
                     // adj = -lr * scaled_m  (owned)
                     let neg_lr = builder.ins().f64const(-(*lr));
                     let adj = self.compile_call_by_name(
-                        builder, "nsl_tensor_mul_scalar", &[scaled_m_ptr, neg_lr, flags_zero]
+                        builder,
+                        "nsl_tensor_mul_scalar",
+                        &[scaled_m_ptr, neg_lr, flags_zero],
                     )?;
 
                     if *wd != 0.0 {
                         // wd_term = (-lr * wd) * θ  (owned)
                         let neg_lr_wd = builder.ins().f64const(-(*lr) * (*wd));
                         let wd_term = self.compile_call_by_name(
-                            builder, "nsl_tensor_mul_scalar", &[theta_ptr, neg_lr_wd, flags_zero]
+                            builder,
+                            "nsl_tensor_mul_scalar",
+                            &[theta_ptr, neg_lr_wd, flags_zero],
                         )?;
-                        self.compile_call_by_name(builder, "nsl_tensor_add_inplace", &[adj, wd_term])?;
+                        self.compile_call_by_name(
+                            builder,
+                            "nsl_tensor_add_inplace",
+                            &[adj, wd_term],
+                        )?;
                         self.compile_call_by_name(builder, "nsl_tensor_free", &[wd_term])?;
                     }
 
                     // θ += adj  (modifies θ buffer in-place)
-                    self.compile_call_by_name(builder, "nsl_tensor_add_inplace", &[theta_ptr, adj])?;
+                    self.compile_call_by_name(
+                        builder,
+                        "nsl_tensor_add_inplace",
+                        &[theta_ptr, adj],
+                    )?;
                     self.compile_call_by_name(builder, "nsl_tensor_free", &[adj])?;
                 }
 
@@ -385,10 +591,16 @@ impl Compiler<'_> {
                     // adj = -lr * m_partial  (owned)
                     let neg_lr = builder.ins().f64const(-(*lr));
                     let adj = self.compile_call_by_name(
-                        builder, "nsl_tensor_mul_scalar", &[m_partial_ptr, neg_lr, flags_zero]
+                        builder,
+                        "nsl_tensor_mul_scalar",
+                        &[m_partial_ptr, neg_lr, flags_zero],
                     )?;
                     // θ += adj  (in-place)
-                    self.compile_call_by_name(builder, "nsl_tensor_add_inplace", &[theta_ptr, adj])?;
+                    self.compile_call_by_name(
+                        builder,
+                        "nsl_tensor_add_inplace",
+                        &[theta_ptr, adj],
+                    )?;
                     self.compile_call_by_name(builder, "nsl_tensor_free", &[adj])?;
                 }
 
@@ -397,7 +609,7 @@ impl Compiler<'_> {
                 // If this is reached, the plan is malformed.
                 UpdateOp::Sign { .. } => {
                     return Err(crate::error::CodegenError::new(
-                        "Sign op reached in Deferred path — Lion should be FullBuffer"
+                        "Sign op reached in Deferred path — Lion should be FullBuffer",
                     ));
                 }
 
@@ -417,9 +629,12 @@ impl Compiler<'_> {
                     let src_ptr = match src {
                         Register::M => m_ptr,
                         Register::V => v_ptr,
-                        other => return Err(crate::error::CodegenError::new(
-                            format!("ScalarMulByBc src must be M or V, got {:?}", other)
-                        )),
+                        other => {
+                            return Err(crate::error::CodegenError::new(format!(
+                                "ScalarMulByBc src must be M or V, got {:?}",
+                                other
+                            )))
+                        }
                     };
 
                     // Allocate owned tensor: out = src * bc_val.
@@ -444,9 +659,12 @@ impl Compiler<'_> {
                             }
                             v_hat_ptr = Some(out);
                         }
-                        other => return Err(crate::error::CodegenError::new(
-                            format!("ScalarMulByBc dst must be MHat or VHat, got {:?}", other)
-                        )),
+                        other => {
+                            return Err(crate::error::CodegenError::new(format!(
+                                "ScalarMulByBc dst must be MHat or VHat, got {:?}",
+                                other
+                            )))
+                        }
                     }
                 }
             }
@@ -496,19 +714,29 @@ impl Compiler<'_> {
         // this, `nsl_tensor_add_inplace` below hits a device/dtype mismatch
         // (CPU f64 src into GPU f32 dst) and panics inside the runtime.
         // `to_device_like` is a no-op (refcount++) when placements already match.
-        let grad_migrated =
-            self.compile_call_by_name(builder, "nsl_tensor_to_device_like", &[grad_ptr, m_partial_ptr])?;
+        let grad_migrated = self.compile_call_by_name(
+            builder,
+            "nsl_tensor_to_device_like",
+            &[grad_ptr, m_partial_ptr],
+        )?;
 
         // Step 1: scaled_grad = grad_migrated * accum_scale  (owned new tensor)
         let scale_val = builder.ins().f64const(accum_scale);
         // flags=1: relinquish `grad_migrated` — we own the refcount bump from
         // to_device_like and mul_scalar can reuse the buffer when unique.
         let flags_relinq = builder.ins().iconst(cl_types::I8, 1);
-        let scaled_grad =
-            self.compile_call_by_name(builder, "nsl_tensor_mul_scalar", &[grad_migrated, scale_val, flags_relinq])?;
+        let scaled_grad = self.compile_call_by_name(
+            builder,
+            "nsl_tensor_mul_scalar",
+            &[grad_migrated, scale_val, flags_relinq],
+        )?;
 
         // Step 2: m_partial += scaled_grad  (in-place, void)
-        self.compile_call_by_name(builder, "nsl_tensor_add_inplace", &[m_partial_ptr, scaled_grad])?;
+        self.compile_call_by_name(
+            builder,
+            "nsl_tensor_add_inplace",
+            &[m_partial_ptr, scaled_grad],
+        )?;
 
         // Step 3: free both refs to the buffer mul_scalar relinquished into.
         // Under FBIP, scaled_grad and grad_migrated alias the same tensor
@@ -589,8 +817,14 @@ impl Compiler<'_> {
                     builder,
                     opt_fn,
                     &[
-                        param_val, grad_val, s1,
-                        lr, momentum_const, dampening_const, weight_decay_const, nesterov_const,
+                        param_val,
+                        grad_val,
+                        s1,
+                        lr,
+                        momentum_const,
+                        dampening_const,
+                        weight_decay_const,
+                        nesterov_const,
                     ],
                 )?;
             }
@@ -603,8 +837,16 @@ impl Compiler<'_> {
                     builder,
                     opt_fn,
                     &[
-                        param_val, grad_val, s1, s2,
-                        lr, beta1_const, beta2_const, eps_const, weight_decay_const, t_float,
+                        param_val,
+                        grad_val,
+                        s1,
+                        s2,
+                        lr,
+                        beta1_const,
+                        beta2_const,
+                        eps_const,
+                        weight_decay_const,
+                        t_float,
                     ],
                 )?;
             }
@@ -613,8 +855,13 @@ impl Compiler<'_> {
                     builder,
                     opt_fn,
                     &[
-                        param_val, grad_val, s1,
-                        lr, beta1_const, beta2_const, weight_decay_const,
+                        param_val,
+                        grad_val,
+                        s1,
+                        lr,
+                        beta1_const,
+                        beta2_const,
+                        weight_decay_const,
                     ],
                 )?;
             }
@@ -623,8 +870,13 @@ impl Compiler<'_> {
                     builder,
                     opt_fn,
                     &[
-                        param_val, grad_val, s1,
-                        lr, momentum_const, weight_decay_const, nesterov_const,
+                        param_val,
+                        grad_val,
+                        s1,
+                        lr,
+                        momentum_const,
+                        weight_decay_const,
+                        nesterov_const,
                     ],
                 )?;
             }
@@ -637,8 +889,15 @@ impl Compiler<'_> {
                     builder,
                     opt_fn,
                     &[
-                        param_val, grad_val, s1, s2,
-                        lr, beta1_const, beta2_const, eps_const, t_float_s,
+                        param_val,
+                        grad_val,
+                        s1,
+                        s2,
+                        lr,
+                        beta1_const,
+                        beta2_const,
+                        eps_const,
+                        t_float_s,
                     ],
                 )?;
             }
@@ -696,8 +955,7 @@ impl Compiler<'_> {
         let sc_val = builder.use_var(step_count_var);
         let one_i64 = builder.ins().iconst(cl_types::I64, 1);
         let sc_plus_one = builder.ins().iadd(sc_val, one_i64);
-        let grad_accum_const =
-            builder.ins().iconst(cl_types::I64, grad_accumulation_steps);
+        let grad_accum_const = builder.ins().iconst(cl_types::I64, grad_accumulation_steps);
         let opt_step = builder.ins().sdiv(sc_plus_one, grad_accum_const);
         let beta1_for_bc = builder.ins().f64const(fase_plan.recipe.beta1);
         let beta2_for_bc = builder.ins().f64const(fase_plan.recipe.beta2);
@@ -735,16 +993,15 @@ impl Compiler<'_> {
             builder.ins().jump(pa_hdr, &[]);
             builder.switch_to_block(pa_hdr);
             let pa_i = builder.use_var(pa_i_var);
-            let pa_cont =
-                builder.ins().icmp(IntCC::SignedLessThan, pa_i, num_params_val);
+            let pa_cont = builder
+                .ins()
+                .icmp(IntCC::SignedLessThan, pa_i, num_params_val);
             builder.ins().brif(pa_cont, pa_body, &[], pa_exit, &[]);
             builder.switch_to_block(pa_body);
             builder.seal_block(pa_body);
 
-            let pa_mpart =
-                self.compile_call_by_name(builder, "nsl_list_get", &[accum, pa_i])?;
-            let pa_sq =
-                self.compile_call_by_name(builder, "nsl_tensor_sum_sq", &[pa_mpart])?;
+            let pa_mpart = self.compile_call_by_name(builder, "nsl_list_get", &[accum, pa_i])?;
+            let pa_sq = self.compile_call_by_name(builder, "nsl_tensor_sum_sq", &[pa_mpart])?;
             let pa_tot_cur = builder.use_var(pa_tot_var);
             let pa_tot_new = builder.ins().fadd(pa_tot_cur, pa_sq);
             builder.def_var(pa_tot_var, pa_tot_new);
@@ -780,16 +1037,16 @@ impl Compiler<'_> {
         builder.ins().jump(hdr, &[]);
         builder.switch_to_block(hdr);
         let opt_i = builder.use_var(opt_i_var);
-        let cont = builder.ins().icmp(IntCC::SignedLessThan, opt_i, num_params_val);
+        let cont = builder
+            .ins()
+            .icmp(IntCC::SignedLessThan, opt_i, num_params_val);
         builder.ins().brif(cont, body, &[], exit, &[]);
         builder.switch_to_block(body);
         builder.seal_block(body);
 
         // Common per-param loads (theta, s1, s2) — shared by both paths.
-        let theta =
-            self.compile_call_by_name(builder, "nsl_list_get", &[param_list, opt_i])?;
-        let s1 =
-            self.compile_call_by_name(builder, "nsl_list_get", &[state_list_1, opt_i])?;
+        let theta = self.compile_call_by_name(builder, "nsl_list_get", &[param_list, opt_i])?;
+        let s1 = self.compile_call_by_name(builder, "nsl_list_get", &[state_list_1, opt_i])?;
         let s2 = if num_state_buffers >= 2 {
             self.compile_call_by_name(builder, "nsl_list_get", &[state_list_2, opt_i])?
         } else {
@@ -800,20 +1057,13 @@ impl Compiler<'_> {
         let deferred_blk = builder.create_block();
         let fullbuf_blk = builder.create_block();
         let iter_join = builder.create_block();
-        self.emit_fase_mode_branch(
-            builder,
-            mode_table_base,
-            opt_i,
-            deferred_blk,
-            fullbuf_blk,
-        );
+        self.emit_fase_mode_branch(builder, mode_table_base, opt_i, deferred_blk, fullbuf_blk);
 
         // ── Deferred path: m_partial-driven fused step ──
         builder.switch_to_block(deferred_blk);
         builder.seal_block(deferred_blk);
         if let Some(accum) = accum_list {
-            let m_partial =
-                self.compile_call_by_name(builder, "nsl_list_get", &[accum, opt_i])?;
+            let m_partial = self.compile_call_by_name(builder, "nsl_list_get", &[accum, opt_i])?;
             if let Some(cf) = clip_factor {
                 self.compile_call_by_name(
                     builder,
@@ -836,8 +1086,7 @@ impl Compiler<'_> {
         // ── FullBuffer path: stdlib optimizer dispatch ──
         builder.switch_to_block(fullbuf_blk);
         builder.seal_block(fullbuf_blk);
-        let grad =
-            self.compile_call_by_name(builder, "nsl_list_get", &[opt_grads, opt_i])?;
+        let grad = self.compile_call_by_name(builder, "nsl_list_get", &[opt_grads, opt_i])?;
         self.emit_stdlib_optim_call(
             builder,
             optimizer_name,

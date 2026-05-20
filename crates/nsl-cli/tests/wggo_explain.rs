@@ -6,9 +6,7 @@ use nsl_codegen::wggo_apply::AppliedPlan;
 use nsl_codegen::wggo_conflicts::Resolution;
 use nsl_codegen::wggo_dp::InterLayerPlan;
 use nsl_codegen::wggo_graph::OptGraph;
-use nsl_codegen::wggo_ilp::{
-    DecisionKind, DecisionTrace, LayerDecision, LayerIlpSolution,
-};
+use nsl_codegen::wggo_ilp::{DecisionKind, DecisionTrace, LayerDecision, LayerIlpSolution};
 
 fn mk_trace(kind: DecisionKind, chosen: &str, reason: &str) -> DecisionTrace {
     DecisionTrace {
@@ -116,8 +114,10 @@ fn renders_skip_message_for_empty_layer_trace() {
 #[test]
 fn renders_csha_downgrade_resolution() {
     let mut plan = mk_plan_with_one_layer();
-    plan.resolutions
-        .push(Resolution::DowngradeCsha { layer: 0, to_level: 1 });
+    plan.resolutions.push(Resolution::DowngradeCsha {
+        layer: 0,
+        to_level: 1,
+    });
     let out = render_explain(&plan);
     assert!(out.contains("Conflict resolved: CSHA downgrade → Level 1"));
 }

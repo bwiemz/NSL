@@ -51,7 +51,9 @@ impl Heartbeat {
             rank: u32::from_le_bytes(buf[0..4].try_into().unwrap()),
             iteration: u64::from_le_bytes(buf[4..12].try_into().unwrap()),
             timestamp_ns: u64::from_le_bytes(buf[12..20].try_into().unwrap()),
-            gpu_utilization_pct: f32::from_bits(u32::from_le_bytes(buf[20..24].try_into().unwrap())),
+            gpu_utilization_pct: f32::from_bits(u32::from_le_bytes(
+                buf[20..24].try_into().unwrap(),
+            )),
             gpu_mem_used_bytes: u32::from_le_bytes(buf[24..28].try_into().unwrap()) as u64,
         }
     }
@@ -85,13 +87,16 @@ impl HeartbeatMonitor {
         let mut rank_states = HashMap::new();
         let now = Instant::now();
         for rank in 0..world_size {
-            rank_states.insert(rank, RankState {
-                health: RankHealth::Alive,
-                last_heartbeat: now,
-                last_iteration: 0,
-                failure_count: 0,
-                last_failure_time: None,
-            });
+            rank_states.insert(
+                rank,
+                RankState {
+                    health: RankHealth::Alive,
+                    last_heartbeat: now,
+                    last_iteration: 0,
+                    failure_count: 0,
+                    last_failure_time: None,
+                },
+            );
         }
 
         Self {
@@ -155,12 +160,16 @@ impl HeartbeatMonitor {
 
     /// Get the current health of a rank.
     pub fn get_health(&self, rank: u32) -> RankHealth {
-        self.rank_states.get(&rank).map(|s| s.health).unwrap_or(RankHealth::Dead)
+        self.rank_states
+            .get(&rank)
+            .map(|s| s.health)
+            .unwrap_or(RankHealth::Dead)
     }
 
     /// Get all alive rank IDs.
     pub fn alive_ranks(&self) -> Vec<u32> {
-        self.rank_states.iter()
+        self.rank_states
+            .iter()
             .filter(|(_, s)| s.health == RankHealth::Alive || s.health == RankHealth::Suspect)
             .map(|(&r, _)| r)
             .collect()
@@ -246,8 +255,11 @@ mod tests {
     fn test_monitor_record_heartbeat() {
         let mut monitor = HeartbeatMonitor::new(2, 30_000, 2.0);
         let hb = Heartbeat {
-            rank: 1, iteration: 10, timestamp_ns: 0,
-            gpu_mem_used_bytes: 0, gpu_utilization_pct: 80.0,
+            rank: 1,
+            iteration: 10,
+            timestamp_ns: 0,
+            gpu_mem_used_bytes: 0,
+            gpu_utilization_pct: 80.0,
         };
         monitor.record_heartbeat(&hb);
         assert_eq!(monitor.get_health(1), RankHealth::Alive);
@@ -257,7 +269,10 @@ mod tests {
     fn test_health_check_no_failures() {
         let mut monitor = HeartbeatMonitor::new(2, 30_000, 2.0);
         let dead = monitor.check_health();
-        assert!(dead.is_empty(), "no failures expected immediately after creation");
+        assert!(
+            dead.is_empty(),
+            "no failures expected immediately after creation"
+        );
     }
 
     #[test]

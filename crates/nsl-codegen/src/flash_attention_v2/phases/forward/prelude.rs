@@ -4,7 +4,7 @@
 
 use crate::flash_attention::FlashAttentionConfig;
 use crate::flash_attention_v2::smem_layout::{needs_dynamic_smem, total_bytes, SMEM_BUDGET_BYTES};
-use crate::pca_segment::{DEFAULT_SMEM_SEGMENT_BUDGET, SegmentResidency};
+use crate::pca_segment::{SegmentResidency, DEFAULT_SMEM_SEGMENT_BUDGET};
 
 /// Forward SMEM-routing gate that also accounts for PCA Tier A's
 /// `seg_smem` static array (when `config.segment_masked`).  Without
@@ -23,8 +23,7 @@ fn fwd_needs_dynamic_smem(config: &FlashAttentionConfig) -> bool {
     } else {
         0
     };
-    total_bytes(config) + seg_overhead > SMEM_BUDGET_BYTES
-        || needs_dynamic_smem(config)
+    total_bytes(config) + seg_overhead > SMEM_BUDGET_BYTES || needs_dynamic_smem(config)
 }
 use crate::kernel_skeleton::indexing::emit_thread_lane_warp_register_decl;
 
@@ -108,25 +107,42 @@ pub fn emit_with_smem_override(
     let name = crate::flash_attention_v2::flash_attention_kernel_name_v2(config);
     ptx.push_str(&format!(".visible .entry {} (\n", name));
     let mut params: Vec<(&str, &str)> = vec![
-        (".param .u64", "q_ptr"), (".param .u64", "k_ptr"), (".param .u64", "v_ptr"),
-        (".param .u64", "out_ptr"), (".param .f32", "scale"),
-        (".param .u64", "batch"), (".param .u64", "heads"), (".param .u64", "seq_len"),
-        (".param .u64", "head_dim"), (".param .u64", "block_table_ptr"),
-        (".param .u64", "k_pool_ptr"), (".param .u64", "v_pool_ptr"),
-        (".param .u64", "block_size"), (".param .u64", "cos_ptr"),
-        (".param .u64", "sin_ptr"), (".param .u64", "seq_ids_ptr"),
-        (".param .u64", "seq_lens_ptr"), (".param .u64", "dfs_enter_ptr"),
-        (".param .u64", "dfs_exit_ptr"), (".param .u64", "num_tree_nodes"),
+        (".param .u64", "q_ptr"),
+        (".param .u64", "k_ptr"),
+        (".param .u64", "v_ptr"),
+        (".param .u64", "out_ptr"),
+        (".param .f32", "scale"),
+        (".param .u64", "batch"),
+        (".param .u64", "heads"),
+        (".param .u64", "seq_len"),
+        (".param .u64", "head_dim"),
+        (".param .u64", "block_table_ptr"),
+        (".param .u64", "k_pool_ptr"),
+        (".param .u64", "v_pool_ptr"),
+        (".param .u64", "block_size"),
+        (".param .u64", "cos_ptr"),
+        (".param .u64", "sin_ptr"),
+        (".param .u64", "seq_ids_ptr"),
+        (".param .u64", "seq_lens_ptr"),
+        (".param .u64", "dfs_enter_ptr"),
+        (".param .u64", "dfs_exit_ptr"),
+        (".param .u64", "num_tree_nodes"),
         (".param .u64", "param_logsumexp"),
-        (".param .u64", "csha_x_ptr"), (".param .u64", "csha_norm_weight_ptr"),
-        (".param .u64", "csha_wq_ptr"), (".param .u64", "csha_wk_ptr"),
-        (".param .u64", "csha_wv_ptr"), (".param .u64", "csha_wo_ptr"),
-        (".param .f32", "csha_eps"), (".param .u32", "csha_active_heads"),
+        (".param .u64", "csha_x_ptr"),
+        (".param .u64", "csha_norm_weight_ptr"),
+        (".param .u64", "csha_wq_ptr"),
+        (".param .u64", "csha_wk_ptr"),
+        (".param .u64", "csha_wv_ptr"),
+        (".param .u64", "csha_wo_ptr"),
+        (".param .f32", "csha_eps"),
+        (".param .u32", "csha_active_heads"),
         (".param .u32", "csha_d_model"),
         // Tier C: post-RoPE activation save pointers (null when not in use).
-        (".param .u64", "q_proj_ptr"), (".param .u64", "k_proj_ptr"),
+        (".param .u64", "q_proj_ptr"),
+        (".param .u64", "k_proj_ptr"),
         (".param .u64", "v_proj_ptr"),
-        (".param .u64", "row_max_ptr"), (".param .u64", "row_sum_ptr"),
+        (".param .u64", "row_max_ptr"),
+        (".param .u64", "row_sum_ptr"),
         // Tier C: pre-RMSNorm raw-x save (null = skip). Forward stages a
         // copy here BEFORE writing x_normed back into csha_x_ptr; backward
         // dRMSNorm reads from this slot to recover the un-normed x its
@@ -213,9 +229,10 @@ pub fn emit_with_smem_override(
     // The wider declaration is cheap (three u64 registers) and only materialises
     // when the CSHA branch actually needs SMEM-base plumbing.  See
     // `phases/forward/csha_hooks.rs` for the mirrored init guard.
-    let needs_qkv_smem_base = config.csha.as_ref().is_some_and(|c| {
-        c.fused_projections || c.save_activations_for_backward
-    });
+    let needs_qkv_smem_base = config
+        .csha
+        .as_ref()
+        .is_some_and(|c| c.fused_projections || c.save_activations_for_backward);
     if config.csha.as_ref().is_some_and(|c| c.fused_projections) {
         let slices_per_lane = ((config.head_dim as u32) / 32).max(1);
         for label in ["Q", "K", "V"] {
@@ -228,14 +245,8 @@ pub fn emit_with_smem_override(
                     "    .reg .b16 %h_x_{}_{}, %h_w_{}_{}, %h_out_{}_{};\n",
                     label, slice, label, slice, label, slice
                 ));
-                ptx.push_str(&format!(
-                    "    .reg .u32 %r_indim_{}_{};\n",
-                    label, slice
-                ));
-                ptx.push_str(&format!(
-                    "    .reg .pred %p_indim_{}_{};\n",
-                    label, slice
-                ));
+                ptx.push_str(&format!("    .reg .u32 %r_indim_{}_{};\n", label, slice));
+                ptx.push_str(&format!("    .reg .pred %p_indim_{}_{};\n", label, slice));
             }
         }
         // Weight-tile load scratch registers (shared across all three tile loads).
@@ -270,7 +281,11 @@ pub fn emit_with_smem_override(
     // capture regs written in softmax.rs at the three decisive points
     // (post-butterfly-max, post-online-update, post-butterfly-sum). All are
     // declared unconditionally because ptxas prunes unused virtual regs.
-    if config.csha.as_ref().is_some_and(|c| c.save_activations_for_backward) {
+    if config
+        .csha
+        .as_ref()
+        .is_some_and(|c| c.save_activations_for_backward)
+    {
         ptx.push_str(
             "    .reg .u64 %rd_save_base, %rd_save_off, %rd_save_elem, %rd_save_smem, %rd_save_wrow, %rd_save_col, %rd_save_colb;\n",
         );
@@ -305,7 +320,9 @@ pub fn emit_with_smem_override(
         ptx.push_str("    .reg .u32 %r_rope_cs_off, %r_rope_smem_row_off;\n");
         ptx.push_str("    .reg .u32 %r_rope_x0_col, %r_rope_x0_off, %r_rope_x1_off;\n");
         // Predicate registers for null-guard and loop exit.
-        ptx.push_str("    .reg .pred %p_rope_cos_null, %p_rope_sin_null, %p_rope_skip, %p_rope_done;\n");
+        ptx.push_str(
+            "    .reg .pred %p_rope_cos_null, %p_rope_sin_null, %p_rope_skip, %p_rope_done;\n",
+        );
     }
 
     // PCA §4.3 RoPE-reset registers (sites 1-4 + CTA prologue).
@@ -321,7 +338,9 @@ pub fn emit_with_smem_override(
         // store addr (ptxas rejects [symbol + %reg] in shared stores, so we
         // mirror the Tier A seg_smem cvta.shared.u64 pattern).
         ptx.push_str("    .reg .u64 %r_doc_smem_base, %rd_doc_smem_addr;\n");
-        ptx.push_str("    .reg .u32 %r_doc_starts_idx, %r_doc_starts_byte_off, %r_doc_starts_stride;\n");
+        ptx.push_str(
+            "    .reg .u32 %r_doc_starts_idx, %r_doc_starts_byte_off, %r_doc_starts_stride;\n",
+        );
         ptx.push_str("    .reg .u32 %r_batch_idx, %r_row_offset_elems;\n");
         // %r_abs_pos: abs_row = q_start (or kv_start in fused path) + tile-local
         // row, used as the segment_ids[] index during Tasks 7/8 effective_pos

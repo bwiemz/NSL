@@ -30,21 +30,21 @@ fn main() {
     // Backward pps 16..=22 consume activations in reverse but produce no
     // new long-lived slots (activation grads are immediately propagated).
     let intervals = [
-        (0,  23, a),   // embed       consumed by dembed       @ pp22
-        (1,  22, a),   // ln1         consumed by dln1         @ pp21
-        (2,  21, a),   // q_proj      consumed by dq           @ pp20
-        (3,  21, a),   // k_proj      consumed by dk           @ pp20
-        (4,  21, a),   // v_proj      consumed by dv           @ pp20
-        (5,  20, sc),  // attn_scores consumed by dscores      @ pp19
-        (6,  19, sc),  // attn_probs  consumed by dprobs       @ pp18
-        (7,  18, a),   // attn_out    consumed by dattn_out    @ pp17
-        (8,  18, a),   // proj_out    consumed by dproj_out    @ pp17
-        (9,  18, a),   // residual1   consumed by dres1        @ pp17
-        (10, 17, a),   // ln2         consumed by dln2         @ pp16
-        (11, 17, ff),  // fc1_out     consumed by dfc1         @ pp16
-        (12, 17, ff),  // gelu_out    consumed by dgelu        @ pp16
-        (13, 17, a),   // fc2_out     consumed by dfc2         @ pp16
-        (14, 17, a),   // residual2   consumed by dres2        @ pp16
+        (0, 23, a),   // embed       consumed by dembed       @ pp22
+        (1, 22, a),   // ln1         consumed by dln1         @ pp21
+        (2, 21, a),   // q_proj      consumed by dq           @ pp20
+        (3, 21, a),   // k_proj      consumed by dk           @ pp20
+        (4, 21, a),   // v_proj      consumed by dv           @ pp20
+        (5, 20, sc),  // attn_scores consumed by dscores      @ pp19
+        (6, 19, sc),  // attn_probs  consumed by dprobs       @ pp18
+        (7, 18, a),   // attn_out    consumed by dattn_out    @ pp17
+        (8, 18, a),   // proj_out    consumed by dproj_out    @ pp17
+        (9, 18, a),   // residual1   consumed by dres1        @ pp17
+        (10, 17, a),  // ln2         consumed by dln2         @ pp16
+        (11, 17, ff), // fc1_out     consumed by dfc1         @ pp16
+        (12, 17, ff), // gelu_out    consumed by dgelu        @ pp16
+        (13, 17, a),  // fc2_out     consumed by dfc2         @ pp16
+        (14, 17, a),  // residual2   consumed by dres2        @ pp16
     ];
 
     let assignments: Vec<SlotAssignment> = intervals
@@ -65,10 +65,10 @@ fn main() {
     };
 
     let phase_markers = vec![
-        (0,  "embed".into()),
-        (2,  "attn: Q/K/V proj".into()),
-        (5,  "attn: scores (B·H·S·S)".into()),
-        (7,  "attn: out".into()),
+        (0, "embed".into()),
+        (2, "attn: Q/K/V proj".into()),
+        (5, "attn: scores (B·H·S·S)".into()),
+        (7, "attn: out".into()),
         (10, "ffn: 4x up-proj".into()),
         (14, "forward peak".into()),
         (15, "=== LOSS ===".into()),

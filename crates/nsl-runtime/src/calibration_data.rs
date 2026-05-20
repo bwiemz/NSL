@@ -54,9 +54,9 @@ impl std::fmt::Display for CalibDataError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             CalibDataError::UnsupportedExt(e) => write!(f, "unsupported extension: {e}"),
-            CalibDataError::Io(e)             => write!(f, "io: {e}"),
-            CalibDataError::BinHeader(e)      => write!(f, "bin header: {e}"),
-            CalibDataError::Safetensors(e)    => write!(f, "safetensors: {e}"),
+            CalibDataError::Io(e) => write!(f, "io: {e}"),
+            CalibDataError::BinHeader(e) => write!(f, "bin header: {e}"),
+            CalibDataError::Safetensors(e) => write!(f, "safetensors: {e}"),
         }
     }
 }
@@ -82,9 +82,9 @@ impl From<std::io::Error> for CalibDataError {
 pub fn load(path: &Path) -> Result<Batches, CalibDataError> {
     match path.extension().and_then(|s| s.to_str()) {
         Some("safetensors") => load_safetensors(path),
-        Some("bin")         => load_bin(path),
-        Some(other)         => Err(CalibDataError::UnsupportedExt(other.to_string())),
-        None                => Err(CalibDataError::UnsupportedExt(String::new())),
+        Some("bin") => load_bin(path),
+        Some(other) => Err(CalibDataError::UnsupportedExt(other.to_string())),
+        None => Err(CalibDataError::UnsupportedExt(String::new())),
     }
 }
 
@@ -146,7 +146,12 @@ fn load_bin(path: &Path) -> Result<Batches, CalibDataError> {
             count * batch_nbytes
         )));
     }
-    Ok(Batches { count, batch_nbytes, data, shape })
+    Ok(Batches {
+        count,
+        batch_nbytes,
+        data,
+        shape,
+    })
 }
 
 // ── .safetensors loader ───────────────────────────────────────────────────────
@@ -287,7 +292,7 @@ mod tests {
     fn bin_batch_at_returns_correct_slice() {
         let mut tmp = NamedTempFile::with_suffix(".bin").unwrap();
         tmp.write_all(b"NSLB").unwrap();
-        tmp.write_all(&2u32.to_le_bytes()).unwrap();   // rank=2
+        tmp.write_all(&2u32.to_le_bytes()).unwrap(); // rank=2
         for d in [2u32, 4] {
             tmp.write_all(&d.to_le_bytes()).unwrap();
         }
@@ -315,14 +320,17 @@ mod tests {
         tmp.write_all(&0u32.to_le_bytes()).unwrap();
         tmp.flush().unwrap();
 
-        assert!(matches!(load(tmp.path()), Err(CalibDataError::BinHeader(_))));
+        assert!(matches!(
+            load(tmp.path()),
+            Err(CalibDataError::BinHeader(_))
+        ));
     }
 
     #[test]
     fn bin_payload_mismatch_errors() {
         let mut tmp = NamedTempFile::with_suffix(".bin").unwrap();
         tmp.write_all(b"NSLB").unwrap();
-        tmp.write_all(&2u32.to_le_bytes()).unwrap();   // rank=2
+        tmp.write_all(&2u32.to_le_bytes()).unwrap(); // rank=2
         for d in [4u32, 4] {
             tmp.write_all(&d.to_le_bytes()).unwrap();
         }
@@ -332,7 +340,10 @@ mod tests {
         }
         tmp.flush().unwrap();
 
-        assert!(matches!(load(tmp.path()), Err(CalibDataError::BinHeader(_))));
+        assert!(matches!(
+            load(tmp.path()),
+            Err(CalibDataError::BinHeader(_))
+        ));
     }
 
     // ── extension tests ─────────────────────────────────────────────────────
@@ -349,7 +360,10 @@ mod tests {
     #[test]
     fn rejects_no_extension() {
         // NamedTempFile without suffix has no extension on most platforms
-        let tmp = tempfile::Builder::new().prefix("calib_no_ext").tempfile().unwrap();
+        let tmp = tempfile::Builder::new()
+            .prefix("calib_no_ext")
+            .tempfile()
+            .unwrap();
         assert!(matches!(
             load(tmp.path()),
             Err(CalibDataError::UnsupportedExt(_))
@@ -424,7 +438,7 @@ mod tests {
     fn ffi_count_and_batch_at() {
         let mut tmp = NamedTempFile::with_suffix(".bin").unwrap();
         tmp.write_all(b"NSLB").unwrap();
-        tmp.write_all(&2u32.to_le_bytes()).unwrap();   // rank=2
+        tmp.write_all(&2u32.to_le_bytes()).unwrap(); // rank=2
         for d in [3u32, 2] {
             tmp.write_all(&d.to_le_bytes()).unwrap();
         }
@@ -458,6 +472,9 @@ mod tests {
     fn ffi_null_safety() {
         assert_eq!(nsl_calibration_count(std::ptr::null_mut()), 0);
         nsl_calibration_free(std::ptr::null_mut()); // must not panic
-        assert_eq!(nsl_calibration_load(std::ptr::null(), 0), std::ptr::null_mut());
+        assert_eq!(
+            nsl_calibration_load(std::ptr::null(), 0),
+            std::ptr::null_mut()
+        );
     }
 }

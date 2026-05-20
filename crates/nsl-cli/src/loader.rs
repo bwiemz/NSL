@@ -57,7 +57,11 @@ pub struct ModuleGraph {
 #[derive(Clone)]
 enum ImportInfo {
     From(FromImportStmt),
-    Alias { #[allow(dead_code)] stmt: ImportStmt, alias: Symbol },
+    Alias {
+        #[allow(dead_code)]
+        stmt: ImportStmt,
+        alias: Symbol,
+    },
 }
 
 /// Scan a module's AST for import statements and resolve them to file paths.
@@ -71,38 +75,33 @@ fn discover_imports(
     for stmt in stmts {
         match &stmt.kind {
             StmtKind::FromImport(from_import) => {
-                let resolved = resolver::resolve_import(
-                    &from_import.module_path,
-                    source_file,
-                    interner,
-                )?;
+                let resolved =
+                    resolver::resolve_import(&from_import.module_path, source_file, interner)?;
                 imports.push((resolved, ImportInfo::From(from_import.clone())));
             }
             StmtKind::Import(import_stmt) if import_stmt.alias.is_some() => {
-                let resolved = resolver::resolve_import(
-                    &import_stmt.path,
-                    source_file,
-                    interner,
-                )?;
-                imports.push((resolved, ImportInfo::Alias {
-                    stmt: import_stmt.clone(),
-                    alias: import_stmt.alias.unwrap(),
-                }));
+                let resolved = resolver::resolve_import(&import_stmt.path, source_file, interner)?;
+                imports.push((
+                    resolved,
+                    ImportInfo::Alias {
+                        stmt: import_stmt.clone(),
+                        alias: import_stmt.alias.unwrap(),
+                    },
+                ));
             }
             StmtKind::Import(import_stmt)
                 if matches!(import_stmt.items, ImportItems::Glob | ImportItems::Named(_)) =>
             {
-                let resolved = resolver::resolve_import(
-                    &import_stmt.path,
-                    source_file,
-                    interner,
-                )?;
+                let resolved = resolver::resolve_import(&import_stmt.path, source_file, interner)?;
                 // Treat `import X.*` / `import X.{Y,Z}` like `from X import *` / `from X import {Y,Z}`
-                imports.push((resolved, ImportInfo::From(FromImportStmt {
-                    module_path: import_stmt.path.clone(),
-                    items: import_stmt.items.clone(),
-                    span: import_stmt.span,
-                })));
+                imports.push((
+                    resolved,
+                    ImportInfo::From(FromImportStmt {
+                        module_path: import_stmt.path.clone(),
+                        items: import_stmt.items.clone(),
+                        span: import_stmt.span,
+                    }),
+                ));
             }
             _ => {}
         }
@@ -114,10 +113,7 @@ fn discover_imports(
 /// Scan statements for train blocks and inject synthetic `from nsl.optim.X import *`
 /// imports so the optimizer stdlib modules are compiled and linked automatically.
 /// Also injects `from nsl.nn.losses import *` since train blocks commonly use loss functions.
-fn inject_train_block_imports(
-    stmts: &[Stmt],
-    interner: &mut Interner,
-) -> Vec<Stmt> {
+fn inject_train_block_imports(stmts: &[Stmt], interner: &mut Interner) -> Vec<Stmt> {
     let mut synthetic_stmts = Vec::new();
 
     for stmt in stmts {
@@ -235,11 +231,17 @@ fn extract_enum_info(
 
     for stmt in stmts {
         if let StmtKind::EnumDef(ed) = &stmt.kind {
-            let enum_name = interner.resolve(ed.name.0).unwrap_or("<unknown>").to_string();
+            let enum_name = interner
+                .resolve(ed.name.0)
+                .unwrap_or("<unknown>")
+                .to_string();
             let mut variant_list = Vec::new();
 
             for (i, variant) in ed.variants.iter().enumerate() {
-                let vname = interner.resolve(variant.name.0).unwrap_or("<unknown>").to_string();
+                let vname = interner
+                    .resolve(variant.name.0)
+                    .unwrap_or("<unknown>")
+                    .to_string();
                 let tag = i as i64;
                 // Only store qualified names for cross-module imports to avoid
                 // collisions when two modules export enums with the same variant name.
@@ -267,9 +269,12 @@ pub fn load_all_modules(
     source_map: &mut SourceMap,
     interner: &mut Interner,
 ) -> Result<ModuleGraph, String> {
-    let entry_path = entry_file
-        .canonicalize()
-        .map_err(|e| format!("cannot canonicalize entry file '{}': {e}", entry_file.display()))?;
+    let entry_path = entry_file.canonicalize().map_err(|e| {
+        format!(
+            "cannot canonicalize entry file '{}': {e}",
+            entry_file.display()
+        )
+    })?;
 
     // Phase 1: Parse all modules (iterative worklist)
     let mut parsed: HashMap<PathBuf, (Module, Vec<(PathBuf, ImportInfo)>)> = HashMap::new();
@@ -296,7 +301,10 @@ pub fn load_all_modules(
         for diag in &parse_result.diagnostics {
             source_map.emit_diagnostic(diag);
         }
-        let has_parse_errors = parse_result.diagnostics.iter().any(|d| d.level == Level::Error);
+        let has_parse_errors = parse_result
+            .diagnostics
+            .iter()
+            .any(|d| d.level == Level::Error);
 
         if has_lex_errors || has_parse_errors {
             return Err(format!("errors in '{}'", file_path.display()));
@@ -371,13 +379,22 @@ pub fn load_all_modules(
         let (enum_variants, enum_defs) = extract_enum_info(&ast.stmts, interner);
 
         // Collect struct names for later codegen import
-        let struct_names: Vec<String> = ast.stmts.iter().filter_map(|s| {
-            if let StmtKind::StructDef(sd) = &s.kind {
-                Some(interner.resolve(sd.name.0).unwrap_or("<unknown>").to_string())
-            } else {
-                None
-            }
-        }).collect();
+        let struct_names: Vec<String> = ast
+            .stmts
+            .iter()
+            .filter_map(|s| {
+                if let StmtKind::StructDef(sd) = &s.kind {
+                    Some(
+                        interner
+                            .resolve(sd.name.0)
+                            .unwrap_or("<unknown>")
+                            .to_string(),
+                    )
+                } else {
+                    None
+                }
+            })
+            .collect();
 
         let dep_paths: Vec<PathBuf> = imports.iter().map(|(p, _)| p.clone()).collect();
 
@@ -390,22 +407,25 @@ pub fn load_all_modules(
             crate::mangling::module_prefix(path, base_dir)
         };
 
-        modules.insert(path.clone(), ModuleData {
-            path: path.clone(),
-            ast,
-            type_map: analysis.type_map,
-            scopes: analysis.scopes,
-            exports,
-            struct_names,
-            enum_variants,
-            enum_defs,
-            dependencies: dep_paths,
-            module_prefix,
-            wrga_configs: analysis.wrga_configs,
-            freeze_configs: analysis.freeze_configs,
-            adapter_configs: analysis.adapter_configs,
-            weight_index_map: analysis.weight_index_map,
-        });
+        modules.insert(
+            path.clone(),
+            ModuleData {
+                path: path.clone(),
+                ast,
+                type_map: analysis.type_map,
+                scopes: analysis.scopes,
+                exports,
+                struct_names,
+                enum_variants,
+                enum_defs,
+                dependencies: dep_paths,
+                module_prefix,
+                wrga_configs: analysis.wrga_configs,
+                freeze_configs: analysis.freeze_configs,
+                adapter_configs: analysis.adapter_configs,
+                weight_index_map: analysis.weight_index_map,
+            },
+        );
     }
 
     Ok(ModuleGraph {
@@ -480,7 +500,10 @@ fn topological_sort(
             return Ok(());
         }
         if in_stack.contains(path) {
-            return Err(format!("circular import detected involving '{}'", path.display()));
+            return Err(format!(
+                "circular import detected involving '{}'",
+                path.display()
+            ));
         }
 
         in_stack.insert(path.clone());

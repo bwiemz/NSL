@@ -71,10 +71,7 @@ fn run_profile_pre_pass(
             .and_then(|p| std::fs::read_to_string(p).ok())
             .unwrap_or_default(),
     };
-    compiler.source_file_name = options
-        .profile_source_file_name
-        .clone()
-        .unwrap_or_default();
+    compiler.source_file_name = options.profile_source_file_name.clone().unwrap_or_default();
 
     match walk_ops(ast, &analysis, interner, EntryKind::Auto, &env, gpu, dtype) {
         Ok(report) => {
@@ -113,13 +110,12 @@ fn install_calibration_compile_bundle(
     interner: &Interner,
     type_map: &TypeMap,
 ) {
-    compiler.compile_options.calibration_compile_bundle = Some(Arc::new(
-        crate::calibration::CalibrationCompileBundle {
+    compiler.compile_options.calibration_compile_bundle =
+        Some(Arc::new(crate::calibration::CalibrationCompileBundle {
             ast: ast.clone(),
             interner: interner.clone(),
             type_map: type_map.clone(),
-        },
-    ));
+        }));
 }
 
 /// Dev Tools Phase 2, Task 6: drain `Compiler.manifest_builder` (if set) and
@@ -183,9 +179,8 @@ fn load_and_register_weights_if_needed(
         return Ok(());
     };
 
-    let mut wmap = crate::weight_aware::WeightMap::load(weight_path).map_err(|e| {
-        crate::error::CodegenError::new(format!("failed to load weights: {}", e))
-    })?;
+    let mut wmap = crate::weight_aware::WeightMap::load(weight_path)
+        .map_err(|e| crate::error::CodegenError::new(format!("failed to load weights: {}", e)))?;
     let integrity = crate::weight_aware::WeightIntegrity::new(*wmap.hash());
 
     // Sparsity analysis for sparse codegen / dead-weight elimination.
@@ -200,8 +195,7 @@ fn load_and_register_weights_if_needed(
 
     // Dead-weight elimination.
     if options.weight_config.dead_weight_elim {
-        let eliminator =
-            crate::weight_aware::DeadWeightEliminator::new(&options.weight_config);
+        let eliminator = crate::weight_aware::DeadWeightEliminator::new(&options.weight_config);
         let names: Vec<String> = wmap.names().map(|s| s.to_string()).collect();
         for name in &names {
             if let Some(entry) = wmap.get_mut(name) {
@@ -317,8 +311,7 @@ fn apply_auto_mode_fallback_note(
     let trigger_reason: Option<String> = if !decorators_in_ast {
         Some("no @wggo_target decorators in source".to_string())
     } else if resolved_targets.is_empty() {
-        let decorated =
-            crate::calibration::discovery::list_decorated_class_names(ast, interner);
+        let decorated = crate::calibration::discovery::list_decorated_class_names(ast, interner);
         let entry = crate::calibration::discovery::entry_point_fn_name(ast, interner)
             .unwrap_or_else(|| "(unknown)".to_string());
         Some(format!(
@@ -1168,7 +1161,6 @@ pub fn compile_module_with_imports_best_effort_plan(
     (result, plan)
 }
 
-
 /// Compile the entry module with imported functions from other modules.
 /// Own functions use Linkage::Export, imported functions use Linkage::Import.
 /// imported_fns entries are (raw_name, mangled_name, signature).
@@ -1341,8 +1333,7 @@ mod tests {
 
     fn parse_module(source: &str) -> (nsl_ast::Module, Interner) {
         let mut interner = Interner::new();
-        let (tokens, lex_diags) =
-            nsl_lexer::tokenize(source, nsl_errors::FileId(0), &mut interner);
+        let (tokens, lex_diags) = nsl_lexer::tokenize(source, nsl_errors::FileId(0), &mut interner);
         assert!(
             lex_diags
                 .iter()
@@ -1442,7 +1433,10 @@ mod tests {
             "model NoAttn:\n    weight: Tensor = zeros([4, 4])\n\nfn main():\n    let m = NoAttn()\n";
         let (ast, interner) = parse_module(source);
 
-        for importance in [crate::WggoImportance::Grad, crate::WggoImportance::Magnitude] {
+        for importance in [
+            crate::WggoImportance::Grad,
+            crate::WggoImportance::Magnitude,
+        ] {
             let mut opts = crate::CompileOptions::default();
             opts.wggo_importance = importance;
             let resolved = run_pre_scan_phase(&ast, &interner, opts);

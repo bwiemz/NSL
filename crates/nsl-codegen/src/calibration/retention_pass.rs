@@ -9,8 +9,8 @@
 //! 2. The splice point in `expr/mod.rs`: to compute the per-projection offset
 //!    before emitting the `emit_splice_memcpy` call.
 
-use crate::calibration::retention::ArenaLayout;
 use crate::calibration::discovery::DiscoveredProjection;
+use crate::calibration::retention::ArenaLayout;
 
 /// Build a flat `ArenaLayout` from a slice of discovered projections.
 ///
@@ -65,7 +65,11 @@ mod tests {
         // entry 1 offset must equal entry 0's nbytes
         assert_eq!(layout.entries[1].1, 8192, "down_proj offset wrong");
         // entry 1: batch=8, seq=4, in_features=128 → 8*4*128*4 = 16384
-        assert_eq!(layout.entries[1].2, 8 * 4 * 128 * 4, "down_proj nbytes wrong");
+        assert_eq!(
+            layout.entries[1].2,
+            8 * 4 * 128 * 4,
+            "down_proj nbytes wrong"
+        );
         // total = 8192 + 16384 = 24576
         assert_eq!(layout.total_bytes(), 24_576);
     }

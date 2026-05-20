@@ -26,7 +26,7 @@ use crate::flash_attention_v2::smem_layout::{
 use crate::kernel_skeleton::indexing::{
     emit_thread_lane_warp_register_decl, emit_thread_lane_warp_register_init,
 };
-use crate::pca_segment::{DEFAULT_SMEM_SEGMENT_BUDGET, SegmentResidency};
+use crate::pca_segment::{SegmentResidency, DEFAULT_SMEM_SEGMENT_BUDGET};
 
 /// Stable kernel-name prefix for backward variants.
 pub fn kernel_name(config: &FlashAttentionConfig) -> String {
@@ -94,30 +94,51 @@ pub fn emit(
         // Forward-compatible block (35 args, identical to forward prelude
         // so tooling can treat the backward kernel as a drop-in CSHA
         // variant for name lookup / launch-list validation).
-        (".param .u64", "q_ptr"), (".param .u64", "k_ptr"), (".param .u64", "v_ptr"),
-        (".param .u64", "out_ptr"), (".param .f32", "scale"),
-        (".param .u64", "batch"), (".param .u64", "heads"), (".param .u64", "seq_len"),
-        (".param .u64", "head_dim"), (".param .u64", "block_table_ptr"),
-        (".param .u64", "k_pool_ptr"), (".param .u64", "v_pool_ptr"),
-        (".param .u64", "block_size"), (".param .u64", "cos_ptr"),
-        (".param .u64", "sin_ptr"), (".param .u64", "seq_ids_ptr"),
-        (".param .u64", "seq_lens_ptr"), (".param .u64", "dfs_enter_ptr"),
-        (".param .u64", "dfs_exit_ptr"), (".param .u64", "num_tree_nodes"),
+        (".param .u64", "q_ptr"),
+        (".param .u64", "k_ptr"),
+        (".param .u64", "v_ptr"),
+        (".param .u64", "out_ptr"),
+        (".param .f32", "scale"),
+        (".param .u64", "batch"),
+        (".param .u64", "heads"),
+        (".param .u64", "seq_len"),
+        (".param .u64", "head_dim"),
+        (".param .u64", "block_table_ptr"),
+        (".param .u64", "k_pool_ptr"),
+        (".param .u64", "v_pool_ptr"),
+        (".param .u64", "block_size"),
+        (".param .u64", "cos_ptr"),
+        (".param .u64", "sin_ptr"),
+        (".param .u64", "seq_ids_ptr"),
+        (".param .u64", "seq_lens_ptr"),
+        (".param .u64", "dfs_enter_ptr"),
+        (".param .u64", "dfs_exit_ptr"),
+        (".param .u64", "num_tree_nodes"),
         (".param .u64", "param_logsumexp"),
-        (".param .u64", "csha_x_ptr"), (".param .u64", "csha_norm_weight_ptr"),
-        (".param .u64", "csha_wq_ptr"), (".param .u64", "csha_wk_ptr"),
-        (".param .u64", "csha_wv_ptr"), (".param .u64", "csha_wo_ptr"),
-        (".param .f32", "csha_eps"), (".param .u32", "csha_active_heads"),
+        (".param .u64", "csha_x_ptr"),
+        (".param .u64", "csha_norm_weight_ptr"),
+        (".param .u64", "csha_wq_ptr"),
+        (".param .u64", "csha_wk_ptr"),
+        (".param .u64", "csha_wv_ptr"),
+        (".param .u64", "csha_wo_ptr"),
+        (".param .f32", "csha_eps"),
+        (".param .u32", "csha_active_heads"),
         (".param .u32", "csha_d_model"),
-        (".param .u64", "q_proj_ptr"), (".param .u64", "k_proj_ptr"),
+        (".param .u64", "q_proj_ptr"),
+        (".param .u64", "k_proj_ptr"),
         (".param .u64", "v_proj_ptr"),
-        (".param .u64", "row_max_ptr"), (".param .u64", "row_sum_ptr"),
+        (".param .u64", "row_max_ptr"),
+        (".param .u64", "row_sum_ptr"),
         // Tier C: pre-RMSNorm raw-x save (forward staged it; backward reads it).
         (".param .u64", "x_raw_ptr"),
         // Tier C backward-specific append.
         (".param .u64", "dO_ptr"),
-        (".param .u64", "dq_ptr"), (".param .u64", "dk_ptr"), (".param .u64", "dv_ptr"),
-        (".param .u64", "dwq_ptr"), (".param .u64", "dwk_ptr"), (".param .u64", "dwv_ptr"),
+        (".param .u64", "dq_ptr"),
+        (".param .u64", "dk_ptr"),
+        (".param .u64", "dv_ptr"),
+        (".param .u64", "dwq_ptr"),
+        (".param .u64", "dwk_ptr"),
+        (".param .u64", "dwv_ptr"),
         (".param .u64", "dx_ptr"),
         // 8th gradient output (Option A of the Gap I.5 fix): `dx_norm_ptr`
         // receives the SMEM `dx_norm` tile (gradient w.r.t. the RMSNorm
@@ -192,7 +213,9 @@ pub fn emit(
     ptx.push_str("    .reg .u32 %r<16>;\n");
     ptx.push_str("    .reg .f32 %scale, %log2e;\n");
     ptx.push_str("    .reg .f32 %row_max, %row_sum;\n");
-    ptx.push_str("    .reg .u64 %q_start, %q_launch_base, %head_idx, %batch_idx, %k_start, %k_max;\n");
+    ptx.push_str(
+        "    .reg .u64 %q_start, %q_launch_base, %head_idx, %batch_idx, %k_start, %k_max;\n",
+    );
     ptx.push_str("    .reg .u64 %shmem_base, %smem_addr;\n");
 
     // Tier C backward-specific registers. Per-slice f32 accumulators for
@@ -209,7 +232,9 @@ pub fn emit(
     // Softmax-recompute state registers (scalar per thread per KV tile
     // column; ds/dp/p share the same reduction shape).
     ptx.push_str("    .reg .f32 %f_P, %f_dP, %f_dS;\n");
-    ptx.push_str("    .reg .f32 %f_rowsum_dP_P;      // sum_k P[i,k]*dP[i,k] for softmax Jacobian\n");
+    ptx.push_str(
+        "    .reg .f32 %f_rowsum_dP_P;      // sum_k P[i,k]*dP[i,k] for softmax Jacobian\n",
+    );
     // CSHA hook registers (T3.6): dRMSNorm per-dim gradient scratch
     // (g_d = dx_norm * norm_weight).
     ptx.push_str("    .reg .f32 %f_g;                // dRMSNorm per-dim gradient term\n");
@@ -275,7 +300,9 @@ pub fn emit(
         // store addr (ptxas rejects [symbol + %reg] in shared stores, so we
         // mirror the forward seg_smem cvta.shared.u64 pattern).
         ptx.push_str("    .reg .u64 %r_doc_smem_base, %rd_doc_smem_addr;\n");
-        ptx.push_str("    .reg .u32 %r_doc_starts_idx, %r_doc_starts_byte_off, %r_doc_starts_stride;\n");
+        ptx.push_str(
+            "    .reg .u32 %r_doc_starts_idx, %r_doc_starts_byte_off, %r_doc_starts_stride;\n",
+        );
         ptx.push_str("    .reg .u32 %r_batch_idx, %r_row_offset_elems;\n");
         // %r_abs_pos: abs_row = q_start (or k_start) + tile-local row, used as
         // the segment_ids[] index during Task 9 effective_pos computation.
@@ -345,10 +372,12 @@ pub fn emit(
     let v_in_off = crate::flash_attention_v2::smem_layout::backward_v_input_offset(config);
     ptx.push_str("    mov.u64 %q_smem_base, %shmem_base;\n");
     ptx.push_str(&format!(
-        "    add.u64 %k_smem_base, %shmem_base, {};\n", kv_off
+        "    add.u64 %k_smem_base, %shmem_base, {};\n",
+        kv_off
     ));
     ptx.push_str(&format!(
-        "    add.u64 %v_smem_base, %shmem_base, {};\n", v_in_off
+        "    add.u64 %v_smem_base, %shmem_base, {};\n",
+        v_in_off
     ));
 
     // Scalar param loads.
@@ -490,14 +519,24 @@ mod tests {
     use crate::flash_attention::{CshaExtras, FlashAttentionConfig, RopeStyle};
 
     fn base_cfg_fused_backward(
-        block_q: i64, block_kv: i64, head_dim: i64, heads: u32, d_model: u32,
+        block_q: i64,
+        block_kv: i64,
+        head_dim: i64,
+        heads: u32,
+        d_model: u32,
     ) -> FlashAttentionConfig {
         let _ = heads;
         FlashAttentionConfig {
-            block_q, block_kv, head_dim,
-            causal: false, paged: false, rope_q: false,
+            block_q,
+            block_kv,
+            head_dim,
+            causal: false,
+            paged: false,
+            rope_q: false,
             rope_style: RopeStyle::HalfSplit,
-            gqa_group_size: 1, tree_mask: false, gpu_sm: 75,
+            gqa_group_size: 1,
+            tree_mask: false,
+            gpu_sm: 75,
             segment_masked: false,
             csha: Some(CshaExtras {
                 fused_projections: true,

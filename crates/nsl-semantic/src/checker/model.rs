@@ -62,8 +62,7 @@ impl<'a> TypeChecker<'a> {
                                                 .to_string();
                                             match aname.as_str() {
                                                 "dim" => {
-                                                    if let ExprKind::IntLiteral(n) =
-                                                        &arg.value.kind
+                                                    if let ExprKind::IntLiteral(n) = &arg.value.kind
                                                     {
                                                         if *n < 0 {
                                                             self.diagnostics.push(
@@ -96,10 +95,7 @@ impl<'a> TypeChecker<'a> {
                                                             "@shard: unknown argument '{}'",
                                                             aname
                                                         ))
-                                                        .with_label(
-                                                            arg.span,
-                                                            "unknown argument",
-                                                        ),
+                                                        .with_label(arg.span, "unknown argument"),
                                                     );
                                                 }
                                             }
@@ -110,10 +106,7 @@ impl<'a> TypeChecker<'a> {
                             // M32: @moe decorator validation
                             if dname == "moe" {
                                 let resolve = |s: nsl_ast::Symbol| -> String {
-                                    self.interner
-                                        .resolve(s.0)
-                                        .unwrap_or("")
-                                        .to_string()
+                                    self.interner.resolve(s.0).unwrap_or("").to_string()
                                 };
                                 crate::moe::validate_moe_decorator(
                                     deco,
@@ -124,10 +117,7 @@ impl<'a> TypeChecker<'a> {
                             // M33: @speculative decorator validation
                             if dname == "speculative" {
                                 let resolve = |s: nsl_ast::Symbol| -> String {
-                                    self.interner
-                                        .resolve(s.0)
-                                        .unwrap_or("")
-                                        .to_string()
+                                    self.interner.resolve(s.0).unwrap_or("").to_string()
                                 };
                                 crate::speculative::validate_speculative_decorator(
                                     deco,
@@ -138,10 +128,7 @@ impl<'a> TypeChecker<'a> {
                             // M33b: @medusa decorator validation
                             if dname == "medusa" {
                                 let resolve = |s: nsl_ast::Symbol| -> String {
-                                    self.interner
-                                        .resolve(s.0)
-                                        .unwrap_or("")
-                                        .to_string()
+                                    self.interner.resolve(s.0).unwrap_or("").to_string()
                                 };
                                 crate::speculative::validate_medusa_decorator(
                                     deco,
@@ -152,10 +139,7 @@ impl<'a> TypeChecker<'a> {
                             // M34: @context_parallel decorator validation
                             if dname == "context_parallel" {
                                 let resolve = |s: nsl_ast::Symbol| -> String {
-                                    self.interner
-                                        .resolve(s.0)
-                                        .unwrap_or("")
-                                        .to_string()
+                                    self.interner.resolve(s.0).unwrap_or("").to_string()
                                 };
                                 crate::context_parallel::validate_context_parallel_decorator(
                                     deco,
@@ -166,10 +150,7 @@ impl<'a> TypeChecker<'a> {
                             // M35: @fp8_compute decorator validation
                             if dname == "fp8_compute" {
                                 let resolve = |s: nsl_ast::Symbol| -> String {
-                                    self.interner
-                                        .resolve(s.0)
-                                        .unwrap_or("")
-                                        .to_string()
+                                    self.interner.resolve(s.0).unwrap_or("").to_string()
                                 };
                                 crate::fp8::validate_fp8_compute_decorator(
                                     deco,
@@ -180,10 +161,7 @@ impl<'a> TypeChecker<'a> {
                             // M50: @sparse decorator validation
                             if dname == "sparse" {
                                 let resolve = |s: nsl_ast::Symbol| -> String {
-                                    self.interner
-                                        .resolve(s.0)
-                                        .unwrap_or("")
-                                        .to_string()
+                                    self.interner.resolve(s.0).unwrap_or("").to_string()
                                 };
                                 crate::sparse::validate_sparse_decorator(
                                     deco,
@@ -194,10 +172,7 @@ impl<'a> TypeChecker<'a> {
                             // M37: @perf_budget decorator validation
                             if dname == "perf_budget" {
                                 let resolve = |s: nsl_ast::Symbol| -> String {
-                                    self.interner
-                                        .resolve(s.0)
-                                        .unwrap_or("")
-                                        .to_string()
+                                    self.interner.resolve(s.0).unwrap_or("").to_string()
                                 };
                                 crate::perf_budget::validate_perf_budget_decorator(
                                     deco,
@@ -217,8 +192,7 @@ impl<'a> TypeChecker<'a> {
                                             match aname.as_str() {
                                                 "block_size" | "num_blocks" | "num_heads"
                                                 | "head_dim" | "num_layers" => {
-                                                    if let ExprKind::IntLiteral(n) =
-                                                        &arg.value.kind
+                                                    if let ExprKind::IntLiteral(n) = &arg.value.kind
                                                     {
                                                         if *n <= 0 {
                                                             self.diagnostics.push(
@@ -251,10 +225,7 @@ impl<'a> TypeChecker<'a> {
                                                             "@paged_kv: unknown argument '{}'",
                                                             aname
                                                         ))
-                                                        .with_label(
-                                                            arg.span,
-                                                            "unknown argument",
-                                                        ),
+                                                        .with_label(arg.span, "unknown argument"),
                                                     );
                                                 }
                                             }
@@ -265,10 +236,7 @@ impl<'a> TypeChecker<'a> {
                             // M42: @kv_compress decorator validation
                             if dname == "kv_compress" {
                                 let resolve = |s: nsl_ast::Symbol| -> String {
-                                    self.interner
-                                        .resolve(s.0)
-                                        .unwrap_or("")
-                                        .to_string()
+                                    self.interner.resolve(s.0).unwrap_or("").to_string()
                                 };
                                 crate::kv_compress::validate_kv_compress_decorator(
                                     deco,
@@ -279,10 +247,7 @@ impl<'a> TypeChecker<'a> {
                             // M43: @pipeline decorator validation
                             if dname == "pipeline" {
                                 let resolve = |s: nsl_ast::Symbol| -> String {
-                                    self.interner
-                                        .resolve(s.0)
-                                        .unwrap_or("")
-                                        .to_string()
+                                    self.interner.resolve(s.0).unwrap_or("").to_string()
                                 };
                                 crate::pipeline::validate_pipeline_decorator(
                                     deco,
@@ -293,10 +258,7 @@ impl<'a> TypeChecker<'a> {
                             // M44: @grammar decorator validation
                             if dname == "grammar" {
                                 let resolve = |s: nsl_ast::Symbol| -> String {
-                                    self.interner
-                                        .resolve(s.0)
-                                        .unwrap_or("")
-                                        .to_string()
+                                    self.interner.resolve(s.0).unwrap_or("").to_string()
                                 };
                                 crate::grammar::validate_grammar_decorator(
                                     deco,
@@ -307,10 +269,7 @@ impl<'a> TypeChecker<'a> {
                             // M48: @multimodal decorator validation
                             if dname == "multimodal" {
                                 let resolve = |s: nsl_ast::Symbol| -> String {
-                                    self.interner
-                                        .resolve(s.0)
-                                        .unwrap_or("")
-                                        .to_string()
+                                    self.interner.resolve(s.0).unwrap_or("").to_string()
                                 };
                                 crate::multimodal::validate_multimodal_decorator(
                                     deco,
@@ -321,10 +280,7 @@ impl<'a> TypeChecker<'a> {
                             // M47: @target decorator validation
                             if dname == "target" {
                                 let resolve = |s: nsl_ast::Symbol| -> String {
-                                    self.interner
-                                        .resolve(s.0)
-                                        .unwrap_or("")
-                                        .to_string()
+                                    self.interner.resolve(s.0).unwrap_or("").to_string()
                                 };
                                 crate::target::validate_target_decorator(
                                     deco,
@@ -433,15 +389,22 @@ impl<'a> TypeChecker<'a> {
             if let ModelMember::Method(fn_def, _decos) = member {
                 let method_ty = self.build_fn_type(fn_def);
 
-                let method_scope =
-                    self.scopes.push_scope(self.current_scope, ScopeKind::Method);
+                let method_scope = self
+                    .scopes
+                    .push_scope(self.current_scope, ScopeKind::Method);
                 let prev_method = self.current_scope;
                 let prev_return = self.current_return_type.take();
                 self.current_scope = method_scope;
 
                 // Declare self with complete model type
                 let self_sym = Symbol(self.interner.get_or_intern_static("self"));
-                self.declare_symbol(self_sym, complete_self_type.clone(), fn_def.span, false, true);
+                self.declare_symbol(
+                    self_sym,
+                    complete_self_type.clone(),
+                    fn_def.span,
+                    false,
+                    true,
+                );
 
                 // Set return type
                 if let Type::Function { ret, .. } = &method_ty {

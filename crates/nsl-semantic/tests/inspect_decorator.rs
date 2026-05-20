@@ -53,7 +53,8 @@ fn forward(x: Tensor<[1, 8, 16], bf16>) -> Tensor:
 "#;
     let errs = inspect_errs(src);
     assert!(
-        errs.iter().any(|e| e.contains("every") || e.contains("condition")),
+        errs.iter()
+            .any(|e| e.contains("every") || e.contains("condition")),
         "expected error mentioning every=/condition=, got {:?}",
         errs
     );
@@ -68,7 +69,11 @@ fn forward(x: Tensor<[1, 8, 16], bf16>) -> Tensor:
     return h
 "#;
     let errs = inspect_errs(src);
-    assert!(errs.is_empty(), "expected no @inspect errors, got {:?}", errs);
+    assert!(
+        errs.is_empty(),
+        "expected no @inspect errors, got {:?}",
+        errs
+    );
 }
 
 #[test]
@@ -80,7 +85,11 @@ fn forward(x: Tensor<[1, 8, 16], bf16>) -> Tensor:
     return h
 "#;
     let errs = inspect_errs(src);
-    assert!(errs.is_empty(), "expected no @inspect errors, got {:?}", errs);
+    assert!(
+        errs.is_empty(),
+        "expected no @inspect errors, got {:?}",
+        errs
+    );
 }
 
 #[test]
@@ -92,7 +101,11 @@ fn forward(x: Tensor<[1, 8, 16], bf16>) -> Tensor:
     return h
 "#;
     let errs = inspect_errs(src);
-    assert!(errs.is_empty(), "expected no @inspect errors, got {:?}", errs);
+    assert!(
+        errs.is_empty(),
+        "expected no @inspect errors, got {:?}",
+        errs
+    );
 }
 
 #[test]

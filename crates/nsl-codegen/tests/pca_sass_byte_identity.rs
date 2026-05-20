@@ -107,8 +107,7 @@ fn find_cuobjdump() -> Option<String> {
             return Some(name.to_string());
         }
     }
-    let win =
-        r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.2\bin\cuobjdump.exe";
+    let win = r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.2\bin\cuobjdump.exe";
     if std::path::Path::new(win).exists() {
         return Some(win.to_string());
     }
@@ -123,8 +122,8 @@ fn find_cuobjdump() -> Option<String> {
 /// `---`) and any trailing NUL bytes that insta appends, returning the raw
 /// PTX body.
 fn extract_ptx_from_snapshot(path: &str) -> String {
-    let bytes = std::fs::read(path)
-        .unwrap_or_else(|e| panic!("cannot read snapshot {}: {}", path, e));
+    let bytes =
+        std::fs::read(path).unwrap_or_else(|e| panic!("cannot read snapshot {}: {}", path, e));
     let text = String::from_utf8_lossy(&bytes);
     let lines: Vec<&str> = text.lines().collect();
 
@@ -164,8 +163,7 @@ fn ptx_to_sass(ptxas: &str, cuobjdump: &str, ptx: &str, label: &str) -> Result<S
     let tmp_ptx = std::env::temp_dir().join(format!("pca_sass_gate_{}.ptx", label));
     let tmp_cubin = std::env::temp_dir().join(format!("pca_sass_gate_{}.cubin", label));
 
-    std::fs::write(&tmp_ptx, ptx.as_bytes())
-        .map_err(|e| format!("write ptx: {}", e))?;
+    std::fs::write(&tmp_ptx, ptx.as_bytes()).map_err(|e| format!("write ptx: {}", e))?;
 
     // Assemble.
     let asm = Command::new(ptxas)
@@ -322,10 +320,7 @@ fn is_reg_reg_isetp_ne(line: &str) -> bool {
     };
     // After the opcode: "Pn, PT, Rnn, Rnn, PT"
     // We want to confirm the 3rd and 4th comma-separated tokens are both "R…"
-    let parts: Vec<&str> = after_pn
-        .splitn(6, ',')
-        .map(|s| s.trim())
-        .collect();
+    let parts: Vec<&str> = after_pn.splitn(6, ',').map(|s| s.trim()).collect();
     // parts[0] = "ISETP.NE.U32.AND Pn"
     // parts[1] = "PT"
     // parts[2] = "Rnn"   ← first operand
@@ -418,7 +413,11 @@ fn replace_reg_names(s: &str) -> String {
             // PT is the true-predicate sentinel — preserve.
             if i + 1 < bytes.len() && bytes[i + 1] == b'T' {
                 // Check it's "PT" not "PT0" etc.
-                let after = if i + 2 < bytes.len() { bytes[i + 2] } else { b' ' };
+                let after = if i + 2 < bytes.len() {
+                    bytes[i + 2]
+                } else {
+                    b' '
+                };
                 if !after.is_ascii_digit() {
                     out.push('P');
                     out.push('T');
@@ -485,18 +484,16 @@ fn forward_and_backward_helper_sass_opcode_pattern_equivalent() {
     // Resolve snapshot paths relative to the workspace root.  Cargo sets
     // CARGO_MANIFEST_DIR to the crate directory; snapshots live under
     // tests/snapshots/ from there.
-    let manifest = std::env::var("CARGO_MANIFEST_DIR")
-        .expect("CARGO_MANIFEST_DIR not set by Cargo");
+    let manifest =
+        std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set by Cargo");
     let snap_dir = std::path::PathBuf::from(&manifest)
         .join("tests")
         .join("snapshots");
 
-    let fwd_snap = snap_dir.join(
-        "pca_forward_kernel_snapshot__forward_kernel_segment_masked_causal_32_32_32.snap",
-    );
-    let bwd_snap = snap_dir.join(
-        "pca_backward_kernel_snapshot__backward_kernel_segment_masked_causal_32_32_32.snap",
-    );
+    let fwd_snap = snap_dir
+        .join("pca_forward_kernel_snapshot__forward_kernel_segment_masked_causal_32_32_32.snap");
+    let bwd_snap = snap_dir
+        .join("pca_backward_kernel_snapshot__backward_kernel_segment_masked_causal_32_32_32.snap");
 
     for snap in [&fwd_snap, &bwd_snap] {
         assert!(
@@ -532,17 +529,11 @@ fn forward_and_backward_helper_sass_opcode_pattern_equivalent() {
     let bwd_sigs = extract_helper_signatures(&bwd_sass);
 
     // Diagnostic output (always printed; only visible on failure or --nocapture).
-    println!(
-        "FWD kernel: {} helper instance(s) found",
-        fwd_sigs.len()
-    );
+    println!("FWD kernel: {} helper instance(s) found", fwd_sigs.len());
     for (i, sig) in fwd_sigs.iter().enumerate() {
         println!("  [{i}] {}", sig.description());
     }
-    println!(
-        "BWD kernel: {} helper instance(s) found",
-        bwd_sigs.len()
-    );
+    println!("BWD kernel: {} helper instance(s) found", bwd_sigs.len());
     for (i, sig) in bwd_sigs.iter().enumerate() {
         println!("  [{i}] {}", sig.description());
     }
@@ -576,19 +567,22 @@ fn forward_and_backward_helper_sass_opcode_pattern_equivalent() {
                 assert!(
                     ne.contains("ISETP.NE.U32.AND"),
                     "Helper instance [{}] (TwoInstr): wrong NE opcode: {}",
-                    i, ne
+                    i,
+                    ne
                 );
                 assert!(
                     or.contains("ISETP.GT.U32.OR"),
                     "Helper instance [{}] (TwoInstr): unexpected OR-fusion opcode: {}",
-                    i, or
+                    i,
+                    or
                 );
             }
             HelperSig::Fused { instr } => {
                 assert!(
                     instr.contains("ISETP.NE.U32.OR"),
                     "Helper instance [{}] (Fused): wrong fused opcode: {}",
-                    i, instr
+                    i,
+                    instr
                 );
             }
         }
@@ -615,7 +609,8 @@ fn forward_and_backward_helper_sass_opcode_pattern_equivalent() {
     println!(
         "PASS: both kernels emit a recognised segment-mask helper signature \
          ({} forward, {} backward); all opcodes normalise correctly.",
-        fwd_sigs.len(), bwd_sigs.len()
+        fwd_sigs.len(),
+        bwd_sigs.len()
     );
 }
 
@@ -760,7 +755,11 @@ mod tier_b_sass {
         let cfg = tier_b_test_fixture();
         let mut preamble = String::new();
         nsl_codegen::pca_tilerange::emit_range_table_preamble(
-            &mut preamble, &cfg, 4096, "seg_smem", 0,
+            &mut preamble,
+            &cfg,
+            4096,
+            "seg_smem",
+            0,
         );
 
         let kernel_ptx = wrap_in_minimal_kernel(&preamble, 120);
@@ -803,7 +802,11 @@ mod tier_b_sass {
         let cfg = tier_b_test_fixture();
         let mut preamble = String::new();
         nsl_codegen::pca_tilerange::emit_range_table_preamble(
-            &mut preamble, &cfg, 4096, "seg_smem", 0,
+            &mut preamble,
+            &cfg,
+            4096,
+            "seg_smem",
+            0,
         );
 
         let kernel_ptx = wrap_in_minimal_kernel(&preamble, 120);
@@ -844,7 +847,11 @@ mod tier_b_sass {
         let cfg = tier_b_test_fixture();
         let mut preamble = String::new();
         nsl_codegen::pca_tilerange::emit_range_table_preamble(
-            &mut preamble, &cfg, 4096, "seg_smem", 0,
+            &mut preamble,
+            &cfg,
+            4096,
+            "seg_smem",
+            0,
         );
 
         let kernel_ptx = wrap_in_minimal_kernel(&preamble, 120);
@@ -884,7 +891,13 @@ mod tier_b_sass {
         let cfg = tier_b_test_fixture();
         let mut predicate_ptx = String::new();
         nsl_codegen::pca_tilerange::emit_skip_predicate(
-            &mut predicate_ptx, &cfg, 4096, "%qt", "%kvt", 0, "KV_TILE_SKIP",
+            &mut predicate_ptx,
+            &cfg,
+            4096,
+            "%qt",
+            "%kvt",
+            0,
+            "KV_TILE_SKIP",
             nsl_codegen::pca_tilerange::IterationOrder::QOuter,
         );
 
@@ -907,7 +920,11 @@ mod tier_b_sass {
         // marker comment and "end PCA Tier B skip predicate" marker. ptxas may drop those
         // comments from SASS, so fall back to grepping the whole SASS for BRA.U as a proxy.
         let predicate_sass = sass_between(&sass, "PCA Tier B", "end PCA Tier B");
-        let target_sass = if predicate_sass.trim().is_empty() { &sass[..] } else { &predicate_sass };
+        let target_sass = if predicate_sass.trim().is_empty() {
+            &sass[..]
+        } else {
+            &predicate_sass
+        };
         assert!(
             target_sass.contains("BRA.U") || target_sass.contains("BRA.UNI"),
             "skip predicate branch not BRA.U on sm_120:\n{target_sass}"
@@ -928,7 +945,11 @@ mod tier_b_sass {
         cfg.gpu_sm = 80;
         let mut preamble = String::new();
         nsl_codegen::pca_tilerange::emit_range_table_preamble(
-            &mut preamble, &cfg, 4096, "seg_smem", 0,
+            &mut preamble,
+            &cfg,
+            4096,
+            "seg_smem",
+            0,
         );
 
         let kernel_ptx = wrap_in_minimal_kernel(&preamble, 80);
@@ -943,7 +964,11 @@ mod tier_b_sass {
         let q_region = sass_between(&sass, "LOOP_Q_TILERANGE", "LOOP_KV_TILERANGE");
         // On sm_80 labels may be preserved or dropped; check either the region
         // or the whole SASS for BRA.U as a warp-uniform proxy.
-        let target = if q_region.is_empty() { &sass } else { &q_region };
+        let target = if q_region.is_empty() {
+            &sass
+        } else {
+            &q_region
+        };
         assert!(
             target.contains("BRA.U") || target.contains("BRA.UNI"),
             "sm_80 q-phase loop branch not BRA.U (uniform-class proxy) \

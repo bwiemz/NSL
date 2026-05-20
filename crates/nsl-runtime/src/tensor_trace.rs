@@ -174,8 +174,15 @@ unsafe fn compute_stats(ptr: *const NslTensor) -> TensorStats {
     let len = t.len as usize;
     if len == 0 || t.data.is_null() {
         return TensorStats {
-            ndim, dtype, device, _pad: 0, shape,
-            min: 0.0, max: 0.0, mean: 0.0, std: 0.0,
+            ndim,
+            dtype,
+            device,
+            _pad: 0,
+            shape,
+            min: 0.0,
+            max: 0.0,
+            mean: 0.0,
+            std: 0.0,
         };
     }
 
@@ -183,20 +190,33 @@ unsafe fn compute_stats(ptr: *const NslTensor) -> TensorStats {
     #[cfg(feature = "cuda")]
     if device != 0 {
         let c_ptr = crate::tensor::nsl_tensor_contiguous(ptr as i64);
-        let [min_val, max_val, mean_val, std_val] =
-            crate::cuda::gpu_tensor_stats_f32(c_ptr);
+        let [min_val, max_val, mean_val, std_val] = crate::cuda::gpu_tensor_stats_f32(c_ptr);
         crate::tensor::nsl_tensor_free(c_ptr);
         return TensorStats {
-            ndim, dtype, device, _pad: 0, shape,
-            min: min_val, max: max_val, mean: mean_val, std: std_val,
+            ndim,
+            dtype,
+            device,
+            _pad: 0,
+            shape,
+            min: min_val,
+            max: max_val,
+            mean: mean_val,
+            std: std_val,
         };
     }
 
     #[cfg(not(feature = "cuda"))]
     if device != 0 {
         return TensorStats {
-            ndim, dtype, device, _pad: 0, shape,
-            min: 0.0, max: 0.0, mean: 0.0, std: 0.0,
+            ndim,
+            dtype,
+            device,
+            _pad: 0,
+            shape,
+            min: 0.0,
+            max: 0.0,
+            mean: 0.0,
+            std: 0.0,
         };
     }
 
@@ -209,8 +229,12 @@ unsafe fn compute_stats(ptr: *const NslTensor) -> TensorStats {
         let mut sum = 0.0_f64;
         for i in 0..len {
             let v = *data.add(i);
-            if v < min_val { min_val = v; }
-            if v > max_val { max_val = v; }
+            if v < min_val {
+                min_val = v;
+            }
+            if v > max_val {
+                max_val = v;
+            }
             sum += v as f64;
         }
         let mean_val = sum / len as f64;
@@ -221,8 +245,15 @@ unsafe fn compute_stats(ptr: *const NslTensor) -> TensorStats {
         }
         let std_val = (var_sum / len as f64).sqrt();
         return TensorStats {
-            ndim, dtype, device, _pad: 0, shape,
-            min: min_val, max: max_val, mean: mean_val as f32, std: std_val as f32,
+            ndim,
+            dtype,
+            device,
+            _pad: 0,
+            shape,
+            min: min_val,
+            max: max_val,
+            mean: mean_val as f32,
+            std: std_val as f32,
         };
     }
 
@@ -556,7 +587,11 @@ mod tests {
 
         let entries = get_entries();
         assert_eq!(entries.len(), 1);
-        assert_ne!(entries[0].get_flags() & FLAG_NAN_INF, 0, "NaN flag should be set");
+        assert_ne!(
+            entries[0].get_flags() & FLAG_NAN_INF,
+            0,
+            "NaN flag should be set"
+        );
 
         nsl_trace_destroy();
     }

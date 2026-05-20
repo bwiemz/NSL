@@ -408,7 +408,6 @@ fn emit_scalar_gemm_body(ptx: &mut String, tile_size: usize) {
     writeln!(ptx, "    st.global.f32 [%rd13], %f0;").unwrap();
 }
 
-
 /// Generate PTX for the batched expert GEMM kernel (16x16 scalar).
 ///
 /// This is the default entry point used by `all_moe_kernels()`.

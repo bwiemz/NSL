@@ -23,7 +23,10 @@ fn aggregates_across_many_pairs_without_growing_unbounded() {
     let agg = c.snapshot().into_iter().find(|a| a.kernel_id == 0).unwrap();
     assert_eq!(agg.count, 10_000);
     assert!((agg.sum_us - 10_000.0).abs() < 1e-3);
-    assert!(c.drain_queue_len(0) == 0, "drain queue should be flushed by snapshot()");
+    assert!(
+        c.drain_queue_len(0) == 0,
+        "drain queue should be flushed by snapshot()"
+    );
 }
 
 #[test]

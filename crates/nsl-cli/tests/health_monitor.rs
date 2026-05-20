@@ -1,4 +1,4 @@
-use nsl_cli::health_monitor::{HealthRenderer, group_by_layer_prefix};
+use nsl_cli::health_monitor::{group_by_layer_prefix, HealthRenderer};
 use nsl_runtime::health::collector::HealthSnapshot;
 use std::collections::HashMap;
 
@@ -28,7 +28,11 @@ fn renders_header_and_per_layer_block() {
     assert!(body.contains("L1:"));
     assert!(body.contains("L2:"));
     assert!(body.contains("18.7"));
-    assert!(body.contains("⚠ elevated"), "L2 over threshold should be flagged: {}", body);
+    assert!(
+        body.contains("⚠ elevated"),
+        "L2 over threshold should be flagged: {}",
+        body
+    );
 }
 
 #[test]

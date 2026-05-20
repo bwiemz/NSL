@@ -30,9 +30,9 @@
 
 use std::collections::HashMap;
 
-use nsl_ast::expr::{Expr, ExprKind, Arg, FStringPart, SubscriptKind, MatchArm, CompGenerator};
+use nsl_ast::expr::{Arg, CompGenerator, Expr, ExprKind, FStringPart, MatchArm, SubscriptKind};
 use nsl_ast::operator::BinOp;
-use nsl_ast::stmt::{Stmt, StmtKind, Block};
+use nsl_ast::stmt::{Block, Stmt, StmtKind};
 use nsl_ast::{NodeId, Symbol};
 
 use crate::wrga_adapter_inject::AdapterSite;
@@ -161,16 +161,10 @@ pub fn rewrite_stmts_for_model(
         .iter()
         .find(|p| compiler.resolve_sym(p.name) == "self")
         .map(|p| p.name);
-    if let Some(field_map) = compiler
-        .models
-        .model_field_types
-        .get(model_name)
-        .cloned()
-    {
+    if let Some(field_map) = compiler.models.model_field_types.get(model_name).cloned() {
         for fname in field_map.keys() {
             if let Some(s) = compiler.interner.get(fname) {
-                ctx.field_symbols
-                    .insert(fname.clone(), nsl_ast::Symbol(s));
+                ctx.field_symbols.insert(fname.clone(), nsl_ast::Symbol(s));
             }
         }
     }
@@ -186,8 +180,7 @@ pub fn rewrite_stmts_for_model(
     {
         for fname in field_map.keys() {
             if let Some(s) = compiler.interner.get(fname) {
-                ctx.field_symbols
-                    .insert(fname.clone(), nsl_ast::Symbol(s));
+                ctx.field_symbols.insert(fname.clone(), nsl_ast::Symbol(s));
             }
         }
     }
@@ -243,7 +236,11 @@ pub fn match_adapter_site<'a, 'b>(
     ctx: &'a RewriteContext<'a>,
 ) -> Option<(&'a AdapterSite, &'b Expr)> {
     let (left, right) = match &expr.kind {
-        ExprKind::BinaryOp { left, op: BinOp::MatMul, right } => (left.as_ref(), right.as_ref()),
+        ExprKind::BinaryOp {
+            left,
+            op: BinOp::MatMul,
+            right,
+        } => (left.as_ref(), right.as_ref()),
         _ => return None,
     };
     let (obj, member) = match &right.kind {
@@ -256,16 +253,16 @@ pub fn match_adapter_site<'a, 'b>(
     // Resolve member symbol to a string via the context's field_symbols
     // reverse lookup (the rewrite caller populates this by resolving
     // `self.resolve_sym` once up front).
-    let member_name = ctx
-        .field_symbols
-        .iter()
-        .find_map(|(name, sym)| if *sym == member { Some(name.as_str()) } else { None });
+    let member_name = ctx.field_symbols.iter().find_map(|(name, sym)| {
+        if *sym == member {
+            Some(name.as_str())
+        } else {
+            None
+        }
+    });
     let member_name = member_name?;
     for site in &ctx.sites {
-        if site.target_field == member_name
-            && site.input_dim > 0
-            && site.output_dim > 0
-        {
+        if site.target_field == member_name && site.input_dim > 0 && site.output_dim > 0 {
             return Some((*site, left));
         }
     }
@@ -293,8 +290,7 @@ fn make_synth_member_access(
     sentinel_sym: Symbol,
 ) -> Expr {
     let node_id = NodeId::next();
-    ctx.synth_overrides
-        .insert(node_id, field_name.to_string());
+    ctx.synth_overrides.insert(node_id, field_name.to_string());
     Expr {
         kind: ExprKind::MemberAccess {
             object: Box::new(object_self),
@@ -439,10 +435,26 @@ pub fn synthesize_lora_fused_call(
     };
 
     let args = vec![
-        Arg { name: None, value: lhs.clone(), span },
-        Arg { name: None, value: self_w, span },
-        Arg { name: None, value: ma_a, span },
-        Arg { name: None, value: ma_b, span },
+        Arg {
+            name: None,
+            value: lhs.clone(),
+            span,
+        },
+        Arg {
+            name: None,
+            value: self_w,
+            span,
+        },
+        Arg {
+            name: None,
+            value: ma_a,
+            span,
+        },
+        Arg {
+            name: None,
+            value: ma_b,
+            span,
+        },
         Arg {
             name: None,
             value: make_float(scale, span),
@@ -570,9 +582,21 @@ pub fn synthesize_ia3_fused_call(
     };
 
     let args = vec![
-        Arg { name: None, value: lhs_expr, span },
-        Arg { name: None, value: self_w, span },
-        Arg { name: None, value: ma_scale, span },
+        Arg {
+            name: None,
+            value: lhs_expr,
+            span,
+        },
+        Arg {
+            name: None,
+            value: self_w,
+            span,
+        },
+        Arg {
+            name: None,
+            value: ma_scale,
+            span,
+        },
         Arg {
             name: None,
             value: Expr {
@@ -670,9 +694,7 @@ pub fn synthesize_gatedlora_fused_call(
     let kernel_handle: i64 = {
         let target_sm = ctx.target_sm.unwrap_or(0);
         let rank_u32 = match &site.fusion_decision {
-            Some(crate::wrga_fusion::FusionTarget::EpilogueFusedGatedLora { rank }) => {
-                *rank as u32
-            }
+            Some(crate::wrga_fusion::FusionTarget::EpilogueFusedGatedLora { rank }) => *rank as u32,
             _ => site.rank as u32,
         };
         let key = crate::wrga_fused_ptx::LoraKernelKey {
@@ -700,12 +722,36 @@ pub fn synthesize_gatedlora_fused_call(
     };
 
     let args = vec![
-        Arg { name: None, value: lhs.clone(), span },
-        Arg { name: None, value: self_w, span },
-        Arg { name: None, value: ma_a, span },
-        Arg { name: None, value: ma_b, span },
-        Arg { name: None, value: make_float(scale, span), span },
-        Arg { name: None, value: ma_g, span },
+        Arg {
+            name: None,
+            value: lhs.clone(),
+            span,
+        },
+        Arg {
+            name: None,
+            value: self_w,
+            span,
+        },
+        Arg {
+            name: None,
+            value: ma_a,
+            span,
+        },
+        Arg {
+            name: None,
+            value: ma_b,
+            span,
+        },
+        Arg {
+            name: None,
+            value: make_float(scale, span),
+            span,
+        },
+        Arg {
+            name: None,
+            value: ma_g,
+            span,
+        },
         Arg {
             name: None,
             value: Expr {
@@ -824,7 +870,11 @@ pub fn synthesize_gatedlora_unfused(
     let sigmoid_call = Expr {
         kind: ExprKind::Call {
             callee: Box::new(sigmoid_callee),
-            args: vec![Arg { name: None, value: ma_g, span }],
+            args: vec![Arg {
+                name: None,
+                value: ma_g,
+                span,
+            }],
         },
         span,
         id: NodeId::next(),
@@ -872,7 +922,11 @@ pub fn rewrite_expr(mut expr: Expr, ctx: &mut RewriteContext<'_>) -> Expr {
             callee: Box::new(rewrite_expr(*callee, ctx)),
             args: args
                 .into_iter()
-                .map(|a| Arg { name: a.name, value: rewrite_expr(a.value, ctx), span: a.span })
+                .map(|a| Arg {
+                    name: a.name,
+                    value: rewrite_expr(a.value, ctx),
+                    span: a.span,
+                })
                 .collect(),
         },
         ExprKind::ListLiteral(items) => {
@@ -898,25 +952,40 @@ pub fn rewrite_expr(mut expr: Expr, ctx: &mut RewriteContext<'_>) -> Expr {
         ),
         ExprKind::Paren(inner) => ExprKind::Paren(Box::new(rewrite_expr(*inner, ctx))),
         ExprKind::Await(inner) => ExprKind::Await(Box::new(rewrite_expr(*inner, ctx))),
-        ExprKind::IfExpr { condition, then_expr, else_expr } => ExprKind::IfExpr {
+        ExprKind::IfExpr {
+            condition,
+            then_expr,
+            else_expr,
+        } => ExprKind::IfExpr {
             condition: Box::new(rewrite_expr(*condition, ctx)),
             then_expr: Box::new(rewrite_expr(*then_expr, ctx)),
             else_expr: Box::new(rewrite_expr(*else_expr, ctx)),
         },
         ExprKind::BlockExpr(block) => ExprKind::BlockExpr(rewrite_block(block, ctx)),
-        ExprKind::Range { start, end, inclusive } => ExprKind::Range {
+        ExprKind::Range {
+            start,
+            end,
+            inclusive,
+        } => ExprKind::Range {
             start: start.map(|e| Box::new(rewrite_expr(*e, ctx))),
             end: end.map(|e| Box::new(rewrite_expr(*e, ctx))),
             inclusive,
         },
-        ExprKind::ListComp { element, generators } => ExprKind::ListComp {
+        ExprKind::ListComp {
+            element,
+            generators,
+        } => ExprKind::ListComp {
             element: Box::new(rewrite_expr(*element, ctx)),
             generators: generators
                 .into_iter()
                 .map(|g| CompGenerator {
                     pattern: g.pattern,
                     iterable: rewrite_expr(g.iterable, ctx),
-                    conditions: g.conditions.into_iter().map(|c| rewrite_expr(c, ctx)).collect(),
+                    conditions: g
+                        .conditions
+                        .into_iter()
+                        .map(|c| rewrite_expr(c, ctx))
+                        .collect(),
                 })
                 .collect(),
         },
@@ -976,15 +1045,22 @@ fn rewrite_subscript(sub: SubscriptKind, ctx: &mut RewriteContext<'_>) -> Subscr
             upper: upper.map(|e| rewrite_expr(e, ctx)),
             step: step.map(|e| rewrite_expr(e, ctx)),
         },
-        SubscriptKind::MultiDim(parts) => {
-            SubscriptKind::MultiDim(parts.into_iter().map(|p| rewrite_subscript(p, ctx)).collect())
-        }
+        SubscriptKind::MultiDim(parts) => SubscriptKind::MultiDim(
+            parts
+                .into_iter()
+                .map(|p| rewrite_subscript(p, ctx))
+                .collect(),
+        ),
     }
 }
 
 fn rewrite_block(block: Block, ctx: &mut RewriteContext<'_>) -> Block {
     Block {
-        stmts: block.stmts.into_iter().map(|s| rewrite_stmt(s, ctx)).collect(),
+        stmts: block
+            .stmts
+            .into_iter()
+            .map(|s| rewrite_stmt(s, ctx))
+            .collect(),
         span: block.span,
     }
 }
@@ -994,7 +1070,12 @@ pub fn rewrite_stmt(stmt: Stmt, ctx: &mut RewriteContext<'_>) -> Stmt {
         StmtKind::Expr(e) => StmtKind::Expr(rewrite_expr(e, ctx)),
         StmtKind::Return(opt) => StmtKind::Return(opt.map(|e| rewrite_expr(e, ctx))),
         StmtKind::Yield(opt) => StmtKind::Yield(opt.map(|e| rewrite_expr(e, ctx))),
-        StmtKind::VarDecl { is_const, pattern, type_ann, value } => StmtKind::VarDecl {
+        StmtKind::VarDecl {
+            is_const,
+            pattern,
+            type_ann,
+            value,
+        } => StmtKind::VarDecl {
             is_const,
             pattern,
             type_ann,
@@ -1005,7 +1086,12 @@ pub fn rewrite_stmt(stmt: Stmt, ctx: &mut RewriteContext<'_>) -> Stmt {
             op,
             value: rewrite_expr(value, ctx),
         },
-        StmtKind::If { condition, then_block, elif_clauses, else_block } => StmtKind::If {
+        StmtKind::If {
+            condition,
+            then_block,
+            elif_clauses,
+            else_block,
+        } => StmtKind::If {
             condition: rewrite_expr(condition, ctx),
             then_block: rewrite_block(then_block, ctx),
             elif_clauses: elif_clauses
@@ -1014,7 +1100,11 @@ pub fn rewrite_stmt(stmt: Stmt, ctx: &mut RewriteContext<'_>) -> Stmt {
                 .collect(),
             else_block: else_block.map(|b| rewrite_block(b, ctx)),
         },
-        StmtKind::For { pattern, iterable, body } => StmtKind::For {
+        StmtKind::For {
+            pattern,
+            iterable,
+            body,
+        } => StmtKind::For {
             pattern,
             iterable: rewrite_expr(iterable, ctx),
             body: rewrite_block(body, ctx),
@@ -1023,7 +1113,11 @@ pub fn rewrite_stmt(stmt: Stmt, ctx: &mut RewriteContext<'_>) -> Stmt {
             condition: rewrite_expr(condition, ctx),
             body: rewrite_block(body, ctx),
         },
-        StmtKind::WhileLet { pattern, expr, body } => StmtKind::WhileLet {
+        StmtKind::WhileLet {
+            pattern,
+            expr,
+            body,
+        } => StmtKind::WhileLet {
             pattern,
             expr: rewrite_expr(expr, ctx),
             body: rewrite_block(body, ctx),
@@ -1042,7 +1136,11 @@ pub fn rewrite_stmt(stmt: Stmt, ctx: &mut RewriteContext<'_>) -> Stmt {
         },
         other => other,
     };
-    Stmt { kind, span: stmt.span, id: stmt.id }
+    Stmt {
+        kind,
+        span: stmt.span,
+        id: stmt.id,
+    }
 }
 
 #[cfg(test)]
@@ -1075,16 +1173,27 @@ mod tests {
     }
 
     fn ident(sym: Symbol) -> Expr {
-        Expr { kind: ExprKind::Ident(sym), span: dummy_span(), id: NodeId::next() }
+        Expr {
+            kind: ExprKind::Ident(sym),
+            span: dummy_span(),
+            id: NodeId::next(),
+        }
     }
 
     fn self_ref() -> Expr {
-        Expr { kind: ExprKind::SelfRef, span: dummy_span(), id: NodeId::next() }
+        Expr {
+            kind: ExprKind::SelfRef,
+            span: dummy_span(),
+            id: NodeId::next(),
+        }
     }
 
     fn member(object: Expr, sym: Symbol) -> Expr {
         Expr {
-            kind: ExprKind::MemberAccess { object: Box::new(object), member: sym },
+            kind: ExprKind::MemberAccess {
+                object: Box::new(object),
+                member: sym,
+            },
             span: dummy_span(),
             id: NodeId::next(),
         }
@@ -1092,7 +1201,11 @@ mod tests {
 
     fn bin(left: Expr, op: BinOp, right: Expr) -> Expr {
         Expr {
-            kind: ExprKind::BinaryOp { left: Box::new(left), op, right: Box::new(right) },
+            kind: ExprKind::BinaryOp {
+                left: Box::new(left),
+                op,
+                right: Box::new(right),
+            },
             span: dummy_span(),
             id: NodeId::next(),
         }
@@ -1190,10 +1303,16 @@ mod tests {
         let out = rewrite_expr(matmul, &mut ctx);
         // Expected: (x @ self.w) * self.ia3_scale_<site>
         match &out.kind {
-            ExprKind::BinaryOp { op: BinOp::Mul, left, right } => {
+            ExprKind::BinaryOp {
+                op: BinOp::Mul,
+                left,
+                right,
+            } => {
                 // left: matmul x @ self.w
                 match &left.kind {
-                    ExprKind::BinaryOp { op: BinOp::MatMul, .. } => {}
+                    ExprKind::BinaryOp {
+                        op: BinOp::MatMul, ..
+                    } => {}
                     other => panic!("expected MatMul on left, got {:?}", other),
                 }
                 // right: MemberAccess (self, ia3_scale_<site>)
@@ -1233,15 +1352,25 @@ mod tests {
         let out = rewrite_expr(matmul, &mut ctx);
         // Top-level should be Add (original + scaled gated LoRA).
         match &out.kind {
-            ExprKind::BinaryOp { op: BinOp::Add, left, right } => {
+            ExprKind::BinaryOp {
+                op: BinOp::Add,
+                left,
+                right,
+            } => {
                 // left: original matmul
                 match &left.kind {
-                    ExprKind::BinaryOp { op: BinOp::MatMul, .. } => {}
+                    ExprKind::BinaryOp {
+                        op: BinOp::MatMul, ..
+                    } => {}
                     other => panic!("expected original MatMul on left, got {:?}", other),
                 }
                 // right: Mul(..., scale_float)
                 match &right.kind {
-                    ExprKind::BinaryOp { op: BinOp::Mul, left: inner_left, right: inner_right } => {
+                    ExprKind::BinaryOp {
+                        op: BinOp::Mul,
+                        left: inner_left,
+                        right: inner_right,
+                    } => {
                         // inner_right must be a float literal (alpha/rank scale)
                         match &inner_right.kind {
                             ExprKind::FloatLiteral(_) => {}
@@ -1257,18 +1386,14 @@ mod tests {
                                 // gate_side: sigmoid(self.gate_<site>)
                                 match &gate_side.kind {
                                     ExprKind::Call { .. } => {}
-                                    other => panic!(
-                                        "expected sigmoid Call, got {:?}",
-                                        other
-                                    ),
+                                    other => panic!("expected sigmoid Call, got {:?}", other),
                                 }
                                 // lora_side: (x @ A) @ B
                                 match &lora_side.kind {
-                                    ExprKind::BinaryOp { op: BinOp::MatMul, .. } => {}
-                                    other => panic!(
-                                        "expected LoRA chain MatMul, got {:?}",
-                                        other
-                                    ),
+                                    ExprKind::BinaryOp {
+                                        op: BinOp::MatMul, ..
+                                    } => {}
+                                    other => panic!("expected LoRA chain MatMul, got {:?}", other),
                                 }
                             }
                             other => panic!("expected gated Mul, got {:?}", other),

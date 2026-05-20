@@ -39,7 +39,10 @@ pub extern "C" fn nsl_free(ptr: *mut u8) {
             unsafe { dealloc(ptr, layout) };
         }
         None => {
-            eprintln!("nsl: warning: nsl_free called on untracked pointer {:p}", ptr);
+            eprintln!(
+                "nsl: warning: nsl_free called on untracked pointer {:p}",
+                ptr
+            );
         }
     }
 }
@@ -50,7 +53,9 @@ pub extern "C" fn nsl_free(ptr: *mut u8) {
 /// Captured values are i64 copies (not owned pointers), so no recursive free needed.
 #[no_mangle]
 pub extern "C" fn nsl_closure_free(ptr: i64) {
-    if ptr == 0 { return; }
+    if ptr == 0 {
+        return;
+    }
     nsl_free(ptr as *mut u8);
 }
 
@@ -223,14 +228,30 @@ pub mod stats {
         CUDA_FREE_BYTES.with(|c| c.set(c.get() + size));
     }
 
-    pub fn alloc_count() -> usize { ALLOC_COUNT.with(|c| c.get()) }
-    pub fn free_count() -> usize { FREE_COUNT.with(|c| c.get()) }
-    pub fn alloc_bytes() -> usize { ALLOC_BYTES.with(|c| c.get()) }
-    pub fn free_bytes() -> usize { FREE_BYTES.with(|c| c.get()) }
-    pub fn cuda_alloc_count() -> usize { CUDA_ALLOC_COUNT.with(|c| c.get()) }
-    pub fn cuda_free_count() -> usize { CUDA_FREE_COUNT.with(|c| c.get()) }
-    pub fn cuda_alloc_bytes() -> usize { CUDA_ALLOC_BYTES.with(|c| c.get()) }
-    pub fn cuda_free_bytes() -> usize { CUDA_FREE_BYTES.with(|c| c.get()) }
+    pub fn alloc_count() -> usize {
+        ALLOC_COUNT.with(|c| c.get())
+    }
+    pub fn free_count() -> usize {
+        FREE_COUNT.with(|c| c.get())
+    }
+    pub fn alloc_bytes() -> usize {
+        ALLOC_BYTES.with(|c| c.get())
+    }
+    pub fn free_bytes() -> usize {
+        FREE_BYTES.with(|c| c.get())
+    }
+    pub fn cuda_alloc_count() -> usize {
+        CUDA_ALLOC_COUNT.with(|c| c.get())
+    }
+    pub fn cuda_free_count() -> usize {
+        CUDA_FREE_COUNT.with(|c| c.get())
+    }
+    pub fn cuda_alloc_bytes() -> usize {
+        CUDA_ALLOC_BYTES.with(|c| c.get())
+    }
+    pub fn cuda_free_bytes() -> usize {
+        CUDA_FREE_BYTES.with(|c| c.get())
+    }
 }
 
 #[cfg(all(test, feature = "test-hooks"))]

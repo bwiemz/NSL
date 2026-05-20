@@ -28,10 +28,7 @@ pub struct PrePassBundle {
 ///
 /// This avoids handing out a `Compiler<'a>` whose lifetime would collide
 /// with the temporary `Interner`/`TypeMap` at call sites.
-pub fn run_pre_pass_only(
-    src: &str,
-    opts: &crate::CompileOptions,
-) -> Result<PrePassResult, String> {
+pub fn run_pre_pass_only(src: &str, opts: &crate::CompileOptions) -> Result<PrePassResult, String> {
     use nsl_errors::{FileId, Level};
 
     let mut interner = Interner::new();
@@ -90,17 +87,14 @@ pub fn run_pre_pass_only(
                 .and_then(|p| std::fs::read_to_string(p).ok())
                 .unwrap_or_default(),
         };
-        compiler.source_file_name = opts
-            .profile_source_file_name
-            .clone()
-            .unwrap_or_default();
+        compiler.source_file_name = opts.profile_source_file_name.clone().unwrap_or_default();
         source_text_out = compiler.source_text.clone();
 
         let env = ShapeEnv::with_defaults();
         let target_gpu = opts.target_gpu.as_str();
         let dtype = opts.dtype.as_str();
-        let gpu = find_gpu(target_gpu)
-            .ok_or_else(|| format!("unknown GPU target: {}", target_gpu))?;
+        let gpu =
+            find_gpu(target_gpu).ok_or_else(|| format!("unknown GPU target: {}", target_gpu))?;
 
         let synth_analysis = nsl_semantic::AnalysisResult {
             diagnostics: Vec::new(),
@@ -277,9 +271,7 @@ pub fn flash_gap_b_context_for_source(src: &str) -> (bool, bool, Option<u8>) {
 /// - `has_backward_ptx` is `true` iff the Tier C SMEM validator
 ///   accepted the config and embedded the fused-backward PTX
 ///   (at hd=64 this is always false; at hd=32 it is true).
-pub fn flash_gap_f_context_for_source(
-    src: &str,
-) -> (bool, Option<i64>, bool) {
+pub fn flash_gap_f_context_for_source(src: &str) -> (bool, Option<i64>, bool) {
     use nsl_errors::FileId;
 
     let mut interner = Interner::new();

@@ -11,8 +11,8 @@
 
 pub mod gpu_init;
 
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
 
 // ---------------------------------------------------------------------------
 // Serial console (COM1 at 0x3F8)
@@ -34,7 +34,9 @@ pub fn serial_putc(byte: u8) {
         loop {
             let status: u8;
             core::arch::asm!("in al, dx", out("al") status, in("dx") COM1_PORT + 5);
-            if status & 0x20 != 0 { break; }
+            if status & 0x20 != 0 {
+                break;
+            }
         }
         // Write byte
         core::arch::asm!("out dx, al", in("al") byte, in("dx") COM1_PORT);
@@ -67,7 +69,7 @@ pub fn serial_init() {
         // Set divisor to 1 (115200 baud)
         port_outb(COM1_PORT + 0, 0x01); // low byte
         port_outb(COM1_PORT + 1, 0x00); // high byte
-        // 8 bits, no parity, one stop bit
+                                        // 8 bits, no parity, one stop bit
         port_outb(COM1_PORT + 3, 0x03);
         // Enable FIFO, clear, 14-byte threshold
         port_outb(COM1_PORT + 2, 0xC7);
@@ -143,10 +145,11 @@ impl BumpAllocator {
                 return 0; // out of memory
             }
 
-            if self.next.compare_exchange_weak(
-                current, new_next,
-                Ordering::AcqRel, Ordering::Relaxed,
-            ).is_ok() {
+            if self
+                .next
+                .compare_exchange_weak(current, new_next, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
                 return aligned;
             }
             // CAS failed — retry
@@ -228,7 +231,8 @@ pub fn parse_boot_config(json: &str) -> BootConfig {
                     }
                 }
                 "listen_host" => {
-                    let octets: Vec<u8> = value.split('.')
+                    let octets: Vec<u8> = value
+                        .split('.')
                         .filter_map(|o| o.trim_matches('"').parse::<u8>().ok())
                         .collect();
                     if octets.len() == 4 {

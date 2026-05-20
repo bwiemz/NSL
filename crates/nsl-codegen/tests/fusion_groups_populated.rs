@@ -2,13 +2,9 @@
 //! Task 2: apply_reduction_fusion populates FusionPlan.fused_node_groups.
 
 use nsl_ast::NodeId as AstNodeId;
-use nsl_codegen::epilogue_fusion::{
-    apply_epilogue_fusion, EpilogueChain, EpilogueOp, MatmulKind,
-};
+use nsl_codegen::epilogue_fusion::{apply_epilogue_fusion, EpilogueChain, EpilogueOp, MatmulKind};
 use nsl_codegen::fusion_graph::{FusionGraph, FusionOp};
-use nsl_codegen::reduction_fusion::{
-    apply_reduction_fusion, detect_reduction_patterns,
-};
+use nsl_codegen::reduction_fusion::{apply_reduction_fusion, detect_reduction_patterns};
 use nsl_codegen::wrga_fusion::FusionPlan;
 use nsl_semantic::types::DType;
 

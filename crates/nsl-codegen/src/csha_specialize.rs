@@ -331,7 +331,12 @@ mod tests {
     use super::*;
     use crate::csha_boundary::BoundaryChain;
 
-    fn synthetic_weight(name: &str, rows: usize, cols: usize, fill: impl Fn(usize, usize) -> f32) -> WeightEntry {
+    fn synthetic_weight(
+        name: &str,
+        rows: usize,
+        cols: usize,
+        fill: impl Fn(usize, usize) -> f32,
+    ) -> WeightEntry {
         let mut data = Vec::with_capacity(rows * cols * 4);
         for r in 0..rows {
             for c in 0..cols {

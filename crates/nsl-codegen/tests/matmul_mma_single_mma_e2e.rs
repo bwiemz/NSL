@@ -53,8 +53,8 @@ use nsl_codegen::matmul_mma::{
 use std::ffi::{c_void, CString};
 
 use nsl_runtime::{
-    nsl_cuda_init, nsl_test_cuda_alloc, nsl_test_cuda_d2h, nsl_test_cuda_free,
-    nsl_test_cuda_h2d, nsl_test_cuda_jit_log,
+    nsl_cuda_init, nsl_test_cuda_alloc, nsl_test_cuda_d2h, nsl_test_cuda_free, nsl_test_cuda_h2d,
+    nsl_test_cuda_jit_log,
 };
 
 extern "C" {
@@ -359,8 +359,12 @@ fn single_mma_matches_cpu_reference() {
         nsl_kernel_launch(
             ptx.as_ptr() as i64,
             kernel_name.as_ptr() as i64,
-            1, 1, 1,
-            32, 1, 1,
+            1,
+            1,
+            1,
+            32,
+            1,
+            1,
             args.as_ptr() as i64,
             args.len() as i64,
             0,

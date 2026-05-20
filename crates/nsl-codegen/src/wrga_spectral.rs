@@ -28,7 +28,11 @@ struct Xorshift64(u64);
 impl Xorshift64 {
     fn new(seed: u64) -> Self {
         // Avoid the degenerate 0 state.
-        Xorshift64(if seed == 0 { 0x9E37_79B9_7F4A_7C15 } else { seed })
+        Xorshift64(if seed == 0 {
+            0x9E37_79B9_7F4A_7C15
+        } else {
+            seed
+        })
     }
 
     fn next_u64(&mut self) -> u64 {
@@ -446,7 +450,10 @@ pub fn allocate_ranks(
     r_max: usize,
     per_site_slack: Option<&HashMap<String, f64>>,
     overrides: Option<&crate::wggo_overrides::WggoOverrides>,
-) -> (Vec<RankAllocation>, Vec<crate::wggo_overrides::OverrideDiagnostic>) {
+) -> (
+    Vec<RankAllocation>,
+    Vec<crate::wggo_overrides::OverrideDiagnostic>,
+) {
     use crate::wggo_overrides::{OverrideDiagnostic, OverrideRejectReason};
     use std::cmp::Ordering;
 
@@ -557,74 +564,79 @@ pub fn allocate_ranks(
     // Lowest `priority_for_alloc` (effective_rank × slack) loses rank first.
     // We only emit diagnostics for layers that have a WGGO override entry;
     // spectral-fallback layers that get downgraded are silent.
-    if overrides.is_some() { loop {
-        let total: usize = allocations.iter().map(|a| a.adapter_params).sum();
-        if total <= r_total {
-            break;
-        }
+    if overrides.is_some() {
+        loop {
+            let total: usize = allocations.iter().map(|a| a.adapter_params).sum();
+            if total <= r_total {
+                break;
+            }
 
-        // Find victim: lowest priority among those still above r_min.
-        let victim_idx = allocations
-            .iter()
-            .enumerate()
-            .filter(|(_, a)| a.rank > r_min)
-            .min_by(|(_, aa), (_, bb)| {
-                let pa = priority_for_alloc(aa, per_site_slack);
-                let pb = priority_for_alloc(bb, per_site_slack);
-                pa.partial_cmp(&pb).unwrap_or(Ordering::Equal)
-            })
-            .map(|(i, _)| i);
-
-        let Some(victim_idx) = victim_idx else {
-            break; // everyone is at r_min; can't shrink further
-        };
-
-        let name = allocations[victim_idx].name.clone();
-        let m_plus_n = {
-            // Look up shape from spectral — find by name.
-            spectral
+            // Find victim: lowest priority among those still above r_min.
+            let victim_idx = allocations
                 .iter()
-                .find(|s| s.name == name)
-                .map(|s| s.shape[0] + s.shape[1])
-                .unwrap_or(1)
-        };
+                .enumerate()
+                .filter(|(_, a)| a.rank > r_min)
+                .min_by(|(_, aa), (_, bb)| {
+                    let pa = priority_for_alloc(aa, per_site_slack);
+                    let pb = priority_for_alloc(bb, per_site_slack);
+                    pa.partial_cmp(&pb).unwrap_or(Ordering::Equal)
+                })
+                .map(|(i, _)| i);
 
-        {
-            let v = &mut allocations[victim_idx];
-            v.rank -= 1;
-            v.adapter_params = v.rank * m_plus_n;
-        }
+            let Some(victim_idx) = victim_idx else {
+                break; // everyone is at r_min; can't shrink further
+            };
 
-        // Emit / update diagnostic only for WGGO-overridden layers.
-        if let Some(ov) = overrides.and_then(|o| o.find_by_layer_containing(&name)) {
-            let final_rank = allocations[victim_idx].rank as u32;
-            let existing = diags.iter_mut().find(|d| {
-                d.layer_name == name
-                    && matches!(d.reason, OverrideRejectReason::BudgetExceededDowngraded { .. })
-            });
-            if let Some(d) = existing {
-                if let OverrideRejectReason::BudgetExceededDowngraded {
-                    final_rank: ref mut fr,
-                    ..
-                } = d.reason
-                {
-                    *fr = final_rank;
-                }
-                d.applied = final_rank.to_string();
-            } else {
-                diags.push(OverrideDiagnostic {
-                    layer_index: ov.layer_index,
-                    layer_name: name.clone(),
-                    reason: OverrideRejectReason::BudgetExceededDowngraded {
-                        original_rank: ov.adapter_rank as u32,
-                        final_rank,
-                    },
-                    requested: ov.adapter_rank.to_string(),
-                    applied: final_rank.to_string(),
+            let name = allocations[victim_idx].name.clone();
+            let m_plus_n = {
+                // Look up shape from spectral — find by name.
+                spectral
+                    .iter()
+                    .find(|s| s.name == name)
+                    .map(|s| s.shape[0] + s.shape[1])
+                    .unwrap_or(1)
+            };
+
+            {
+                let v = &mut allocations[victim_idx];
+                v.rank -= 1;
+                v.adapter_params = v.rank * m_plus_n;
+            }
+
+            // Emit / update diagnostic only for WGGO-overridden layers.
+            if let Some(ov) = overrides.and_then(|o| o.find_by_layer_containing(&name)) {
+                let final_rank = allocations[victim_idx].rank as u32;
+                let existing = diags.iter_mut().find(|d| {
+                    d.layer_name == name
+                        && matches!(
+                            d.reason,
+                            OverrideRejectReason::BudgetExceededDowngraded { .. }
+                        )
                 });
+                if let Some(d) = existing {
+                    if let OverrideRejectReason::BudgetExceededDowngraded {
+                        final_rank: ref mut fr,
+                        ..
+                    } = d.reason
+                    {
+                        *fr = final_rank;
+                    }
+                    d.applied = final_rank.to_string();
+                } else {
+                    diags.push(OverrideDiagnostic {
+                        layer_index: ov.layer_index,
+                        layer_name: name.clone(),
+                        reason: OverrideRejectReason::BudgetExceededDowngraded {
+                            original_rank: ov.adapter_rank as u32,
+                            final_rank,
+                        },
+                        requested: ov.adapter_rank.to_string(),
+                        applied: final_rank.to_string(),
+                    });
+                }
             }
         }
-    } } // end `if overrides.is_some() { loop { ... } }`
+    } // end `if overrides.is_some() { loop { ... } }`
 
     (allocations, diags)
 }
@@ -891,7 +903,10 @@ mod override_tests {
         ]);
         // Budget large enough that no downgrade fires.
         let (alloc, diags) = allocate_ranks(&spectral, 100_000, 2, 16, None, Some(&over));
-        assert!(diags.is_empty(), "all requests fit; no diagnostics, got: {diags:?}");
+        assert!(
+            diags.is_empty(),
+            "all requests fit; no diagnostics, got: {diags:?}"
+        );
         let ranks: Vec<usize> = alloc.iter().map(|a| a.rank).collect();
         assert_eq!(ranks, vec![8, 8, 4, 4]);
     }
@@ -1076,8 +1091,8 @@ mod override_tests {
             },
         ];
         let over = overrides_with_ranks(&[("blocks.0", 8), ("blocks.1", 8)]);
-        let total_at_8 = 2 * 8 * 64_usize;  // 1024
-        let tight = total_at_8 - 64;        // 960 — exactly 1 rank step under
+        let total_at_8 = 2 * 8 * 64_usize; // 1024
+        let tight = total_at_8 - 64; // 960 — exactly 1 rank step under
         let (alloc, _diags) = allocate_ranks(&spectral, tight, 2, 16, None, Some(&over));
         let b0 = alloc.iter().find(|a| a.name == "blocks.0.attn.wq").unwrap();
         let b1 = alloc.iter().find(|a| a.name == "blocks.1.attn.wq").unwrap();

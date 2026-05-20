@@ -16,8 +16,8 @@
 //! same commit.
 
 pub struct CshaInputs<'a> {
-    pub x: &'a [f32],           // [seq, d_model]
-    pub wq: &'a [f32],          // [d_model, head_dim * heads]
+    pub x: &'a [f32],  // [seq, d_model]
+    pub wq: &'a [f32], // [d_model, head_dim * heads]
     pub wk: &'a [f32],
     pub wv: &'a [f32],
     pub norm_weight: &'a [f32], // [d_model]
@@ -76,7 +76,10 @@ fn matmul(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
 fn apply_rope(q: &mut [f32], seq: usize, heads: usize, head_dim: usize, cos: &[f32], sin: &[f32]) {
     // Consistency guard: this function only implements Adjacent layout.
     // If head_dim is 0 somehow, the loop is a no-op — but flag odd configs.
-    debug_assert!(head_dim > 0 && head_dim % 2 == 0, "apply_rope requires even head_dim > 0");
+    debug_assert!(
+        head_dim > 0 && head_dim % 2 == 0,
+        "apply_rope requires even head_dim > 0"
+    );
     let half = head_dim / 2;
     for s in 0..seq {
         for h in 0..heads {
@@ -86,7 +89,7 @@ fn apply_rope(q: &mut [f32], seq: usize, heads: usize, head_dim: usize, cos: &[f
                 let sin_val = sin[s * half + pair];
                 let x0 = q[base + 2 * pair];
                 let x1 = q[base + 2 * pair + 1];
-                q[base + 2 * pair]     = x0 * cos_val - x1 * sin_val;
+                q[base + 2 * pair] = x0 * cos_val - x1 * sin_val;
                 q[base + 2 * pair + 1] = x0 * sin_val + x1 * cos_val;
             }
         }
@@ -113,7 +116,14 @@ fn softmax_rows(s: &mut [f32], rows: usize, cols: usize) {
 ///
 /// Returns O of shape `[seq, heads * head_dim]` — the pre-Wo attention output.
 pub fn csha_reference(inputs: &CshaInputs<'_>, shape: &CshaShape) -> Vec<f32> {
-    let CshaShape { seq, heads, head_dim, d_model, causal, norm_eps } = *shape;
+    let CshaShape {
+        seq,
+        heads,
+        head_dim,
+        d_model,
+        causal,
+        norm_eps,
+    } = *shape;
     let kv_dim = heads * head_dim;
 
     // Step 1: RMSNorm(x) -> x_norm   shape [seq, d_model]
@@ -126,7 +136,7 @@ pub fn csha_reference(inputs: &CshaInputs<'_>, shape: &CshaShape) -> Vec<f32> {
     // Step 2: x_norm @ Wq/Wk/Wv -> Q, K, V   each [seq, kv_dim]
     let mut q = matmul(&x_norm, inputs.wq, seq, d_model, kv_dim);
     let mut k = matmul(&x_norm, inputs.wk, seq, d_model, kv_dim);
-    let     v = matmul(&x_norm, inputs.wv, seq, d_model, kv_dim);
+    let v = matmul(&x_norm, inputs.wv, seq, d_model, kv_dim);
 
     // Reshape Q, K from [seq, kv_dim] to [seq, heads, head_dim] is logical;
     // the flat layout [seq * heads * head_dim] is the same either way.
@@ -222,9 +232,9 @@ pub struct CshaGradients {
 /// Re-computed from inputs rather than cached on CshaInputs so the
 /// forward reference stays stateless.
 struct Intermediates {
-    x_norm: Vec<f32>,          // [seq, d_model]
-    rms: Vec<f32>,             // [seq]
-    q: Vec<f32>,               // [seq, heads*head_dim], post-RoPE
+    x_norm: Vec<f32>, // [seq, d_model]
+    rms: Vec<f32>,    // [seq]
+    q: Vec<f32>,      // [seq, heads*head_dim], post-RoPE
     k: Vec<f32>,
     v: Vec<f32>,
     p_per_head: Vec<Vec<f32>>, // heads × [seq, seq]
@@ -233,7 +243,14 @@ struct Intermediates {
 /// Compute the full set of forward intermediates. Keeps the chain-rule
 /// backward arithmetically closed-form (no numerical re-derivation).
 fn forward_intermediates(inputs: &CshaInputs<'_>, shape: &CshaShape) -> Intermediates {
-    let CshaShape { seq, heads, head_dim, d_model, causal, norm_eps } = *shape;
+    let CshaShape {
+        seq,
+        heads,
+        head_dim,
+        d_model,
+        causal,
+        norm_eps,
+    } = *shape;
     let kv_dim = heads * head_dim;
 
     let mut x_norm = Vec::with_capacity(seq * d_model);
@@ -261,8 +278,7 @@ fn forward_intermediates(inputs: &CshaInputs<'_>, shape: &CshaShape) -> Intermed
             for j in 0..seq {
                 let mut dot = 0.0f32;
                 for d in 0..head_dim {
-                    dot += q[(i * kv_dim) + h * head_dim + d]
-                         * k[(j * kv_dim) + h * head_dim + d];
+                    dot += q[(i * kv_dim) + h * head_dim + d] * k[(j * kv_dim) + h * head_dim + d];
                 }
                 s_mat[i * seq + j] = dot * scale;
             }
@@ -278,7 +294,14 @@ fn forward_intermediates(inputs: &CshaInputs<'_>, shape: &CshaShape) -> Intermed
         p_per_head.push(s_mat);
     }
 
-    Intermediates { x_norm, rms, q, k, v, p_per_head }
+    Intermediates {
+        x_norm,
+        rms,
+        q,
+        k,
+        v,
+        p_per_head,
+    }
 }
 
 /// Reverse-mode backward through the full CSHA chain: O → (dQ, dK, dV,
@@ -292,7 +315,14 @@ pub fn csha_reference_backward(
     shape: &CshaShape,
     do_out: &[f32],
 ) -> CshaGradients {
-    let CshaShape { seq, heads, head_dim, d_model, causal: _, norm_eps: _ } = *shape;
+    let CshaShape {
+        seq,
+        heads,
+        head_dim,
+        d_model,
+        causal: _,
+        norm_eps: _,
+    } = *shape;
     let kv_dim = heads * head_dim;
     let inter = forward_intermediates(inputs, shape);
     let scale = 1.0f32 / (head_dim as f32).sqrt();
@@ -312,7 +342,7 @@ pub fn csha_reference_backward(
                 let mut acc = 0.0f32;
                 for d in 0..head_dim {
                     acc += do_out[i * kv_dim + h * head_dim + d]
-                         * inter.v[j * kv_dim + h * head_dim + d];
+                        * inter.v[j * kv_dim + h * head_dim + d];
                 }
                 d_p[i * seq + j] = acc;
             }
@@ -376,7 +406,7 @@ pub fn csha_reference_backward(
                     let sin_v = inputs.sin[s * half + pair];
                     let y0 = tensor[base + 2 * pair];
                     let y1 = tensor[base + 2 * pair + 1];
-                    tensor[base + 2 * pair]     =  y0 * cos_v + y1 * sin_v;
+                    tensor[base + 2 * pair] = y0 * cos_v + y1 * sin_v;
                     tensor[base + 2 * pair + 1] = -y0 * sin_v + y1 * cos_v;
                 }
             }
@@ -414,8 +444,8 @@ pub fn csha_reference_backward(
             let mut acc = 0.0f32;
             for j in 0..kv_dim {
                 acc += d_q[s * kv_dim + j] * inputs.wq[p * kv_dim + j]
-                     + d_k[s * kv_dim + j] * inputs.wk[p * kv_dim + j]
-                     + d_v[s * kv_dim + j] * inputs.wv[p * kv_dim + j];
+                    + d_k[s * kv_dim + j] * inputs.wk[p * kv_dim + j]
+                    + d_v[s * kv_dim + j] * inputs.wv[p * kv_dim + j];
             }
             d_x_norm[s * d_model + p] = acc;
         }
@@ -439,11 +469,20 @@ pub fn csha_reference_backward(
         }
         for d in 0..d_model {
             let g_d = d_x_norm[i * d_model + d] * inputs.norm_weight[d];
-            d_x[i * d_model + d] = g_d / r - inputs.x[i * d_model + d] * s_grad / (d_model as f32 * r3);
+            d_x[i * d_model + d] =
+                g_d / r - inputs.x[i * d_model + d] * s_grad / (d_model as f32 * r3);
         }
     }
 
-    CshaGradients { dq: d_q, dk: d_k, dv: d_v, dwq: d_wq, dwk: d_wk, dwv: d_wv, dx: d_x }
+    CshaGradients {
+        dq: d_q,
+        dk: d_k,
+        dv: d_v,
+        dwq: d_wq,
+        dwk: d_wk,
+        dwv: d_wv,
+        dx: d_x,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -531,10 +570,7 @@ mod tests {
         ];
         assert_eq!(out.len(), 16);
         for (i, (a, b)) in out.iter().zip(expected.iter()).enumerate() {
-            assert!(
-                (a - b).abs() < 1e-6,
-                "index {i}: got {a}, expected {b}"
-            );
+            assert!((a - b).abs() < 1e-6, "index {i}: got {a}, expected {b}");
         }
     }
 
@@ -579,8 +615,13 @@ mod tests {
         let cos = det_seq(46, shape.seq * shape.head_dim / 2);
         let sin = det_seq(47, shape.seq * shape.head_dim / 2);
         let inputs = CshaInputs {
-            x: &x, wq: &wq, wk: &wk, wv: &wv,
-            norm_weight: &norm_weight, cos: &cos, sin: &sin,
+            x: &x,
+            wq: &wq,
+            wk: &wk,
+            wv: &wv,
+            norm_weight: &norm_weight,
+            cos: &cos,
+            sin: &sin,
         };
         let do_out = vec![1.0f32; shape.seq * kv_dim];
 
@@ -595,8 +636,12 @@ mod tests {
         assert_eq!(g.dx.len(), shape.seq * shape.d_model);
 
         for (name, arr) in [
-            ("dq", &g.dq), ("dk", &g.dk), ("dv", &g.dv),
-            ("dwq", &g.dwq), ("dwk", &g.dwk), ("dwv", &g.dwv),
+            ("dq", &g.dq),
+            ("dk", &g.dk),
+            ("dv", &g.dv),
+            ("dwq", &g.dwq),
+            ("dwk", &g.dwk),
+            ("dwv", &g.dwv),
             ("dx", &g.dx),
         ] {
             for (i, &v) in arr.iter().enumerate() {
@@ -604,8 +649,10 @@ mod tests {
             }
             // At least one non-zero entry — all-zero would mean the
             // backward path is silently dropping gradients.
-            assert!(arr.iter().any(|&v| v.abs() > 0.0),
-                "{name} is all-zero; backward chain may be broken");
+            assert!(
+                arr.iter().any(|&v| v.abs() > 0.0),
+                "{name} is all-zero; backward chain may be broken"
+            );
         }
     }
 
@@ -633,16 +680,23 @@ mod tests {
         let norm_weight = vec![1.0f32; shape.d_model];
         // Non-trivial RoPE angles.
         let cos: Vec<f32> = (0..shape.seq * shape.head_dim / 2)
-            .map(|i| ((i as f32) * 0.1).cos()).collect();
+            .map(|i| ((i as f32) * 0.1).cos())
+            .collect();
         let sin: Vec<f32> = (0..shape.seq * shape.head_dim / 2)
-            .map(|i| ((i as f32) * 0.1).sin()).collect();
+            .map(|i| ((i as f32) * 0.1).sin())
+            .collect();
         let do_out = vec![1.0f32; shape.seq * kv_dim]; // loss = sum(O)
 
         // Compute analytical gradients once.
         let g = {
             let inputs = CshaInputs {
-                x: &x, wq: &wq, wk: &wk, wv: &wv,
-                norm_weight: &norm_weight, cos: &cos, sin: &sin,
+                x: &x,
+                wq: &wq,
+                wk: &wk,
+                wv: &wv,
+                norm_weight: &norm_weight,
+                cos: &cos,
+                sin: &sin,
             };
             csha_reference_backward(&inputs, &shape, &do_out)
         };
@@ -651,8 +705,13 @@ mod tests {
         let eps = 1e-3f32;
         let loss_of = |x_: &[f32], wq_: &[f32], wk_: &[f32]| {
             let inputs = CshaInputs {
-                x: x_, wq: wq_, wk: wk_, wv: &wv,
-                norm_weight: &norm_weight, cos: &cos, sin: &sin,
+                x: x_,
+                wq: wq_,
+                wk: wk_,
+                wv: &wv,
+                norm_weight: &norm_weight,
+                cos: &cos,
+                sin: &sin,
             };
             csha_reference(&inputs, &shape).iter().sum::<f32>()
         };
@@ -673,7 +732,9 @@ mod tests {
             assert!(
                 diff < 1e-2,
                 "dx[{i}]: analytical={}, fd={}, diff={}",
-                g.dx[i], fd, diff
+                g.dx[i],
+                fd,
+                diff
             );
         }
         for &i in &probes_w {
@@ -688,7 +749,9 @@ mod tests {
             assert!(
                 diff < 1e-2,
                 "dwq[{i}]: analytical={}, fd={}, diff={}",
-                g.dwq[i], fd, diff
+                g.dwq[i],
+                fd,
+                diff
             );
         }
         for &i in &probes_w {
@@ -703,7 +766,9 @@ mod tests {
             assert!(
                 diff < 1e-2,
                 "dwk[{i}]: analytical={}, fd={}, diff={}",
-                g.dwk[i], fd, diff
+                g.dwk[i],
+                fd,
+                diff
             );
         }
     }

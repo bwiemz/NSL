@@ -113,12 +113,11 @@ impl DisaggregatedRouter {
             return None;
         }
         match self.config.prefill_policy {
-            PrefillPolicy::LeastLoaded => {
-                self.prefill_pool
-                    .iter()
-                    .min_by_key(|w| w.active_requests)
-                    .map(|w| w.rank)
-            }
+            PrefillPolicy::LeastLoaded => self
+                .prefill_pool
+                .iter()
+                .min_by_key(|w| w.active_requests)
+                .map(|w| w.rank),
             PrefillPolicy::RoundRobin => {
                 let idx = self.round_robin_prefill % self.prefill_pool.len();
                 self.round_robin_prefill += 1;
@@ -133,27 +132,30 @@ impl DisaggregatedRouter {
             return None;
         }
         match self.config.decode_policy {
-            DecodePolicy::LeastLoaded => {
-                self.decode_pool
-                    .iter()
-                    .min_by_key(|w| w.active_requests)
-                    .map(|w| w.rank)
-            }
-            DecodePolicy::MemoryAware => {
-                self.decode_pool
-                    .iter()
-                    .max_by_key(|w| w.free_kv_blocks)
-                    .map(|w| w.rank)
-            }
+            DecodePolicy::LeastLoaded => self
+                .decode_pool
+                .iter()
+                .min_by_key(|w| w.active_requests)
+                .map(|w| w.rank),
+            DecodePolicy::MemoryAware => self
+                .decode_pool
+                .iter()
+                .max_by_key(|w| w.free_kv_blocks)
+                .map(|w| w.rank),
         }
     }
 
     /// Mark a request as dispatched to a prefill worker.
     pub fn mark_prefilling(&mut self, request_id: u64, prefill_rank: i32) {
-        if let Some(worker) = self.prefill_pool.iter_mut().find(|w| w.rank == prefill_rank) {
+        if let Some(worker) = self
+            .prefill_pool
+            .iter_mut()
+            .find(|w| w.rank == prefill_rank)
+        {
             worker.active_requests += 1;
         }
-        self.requests.insert(request_id, DisaggRequestState::Prefilling { prefill_rank });
+        self.requests
+            .insert(request_id, DisaggRequestState::Prefilling { prefill_rank });
     }
 
     /// Mark a request as transferring KV from prefill to decode.
@@ -161,7 +163,10 @@ impl DisaggregatedRouter {
         if let Some(worker) = self.prefill_pool.iter_mut().find(|w| w.rank == from_rank) {
             worker.active_requests = worker.active_requests.saturating_sub(1);
         }
-        self.requests.insert(request_id, DisaggRequestState::Transferring { from_rank, to_rank });
+        self.requests.insert(
+            request_id,
+            DisaggRequestState::Transferring { from_rank, to_rank },
+        );
     }
 
     /// Mark a request as decoding on a decode worker, reserving KV blocks.
@@ -170,28 +175,37 @@ impl DisaggregatedRouter {
             worker.active_requests += 1;
             worker.free_kv_blocks = worker.free_kv_blocks.saturating_sub(kv_blocks_used);
         }
-        self.requests.insert(request_id, DisaggRequestState::Decoding {
-            decode_rank,
-            tokens_generated: 0,
-        });
+        self.requests.insert(
+            request_id,
+            DisaggRequestState::Decoding {
+                decode_rank,
+                tokens_generated: 0,
+            },
+        );
     }
 
     /// Record a generated token for a request.
     pub fn record_token(&mut self, request_id: u64) {
-        if let Some(DisaggRequestState::Decoding { tokens_generated, .. }) = self.requests.get_mut(&request_id) {
+        if let Some(DisaggRequestState::Decoding {
+            tokens_generated, ..
+        }) = self.requests.get_mut(&request_id)
+        {
             *tokens_generated += 1;
         }
     }
 
     /// Mark a request as complete.
     pub fn mark_complete(&mut self, request_id: u64, total_tokens: u32) {
-        if let Some(DisaggRequestState::Decoding { decode_rank, .. }) = self.requests.get(&request_id) {
+        if let Some(DisaggRequestState::Decoding { decode_rank, .. }) =
+            self.requests.get(&request_id)
+        {
             let decode_rank = *decode_rank;
             if let Some(worker) = self.decode_pool.iter_mut().find(|w| w.rank == decode_rank) {
                 worker.active_requests = worker.active_requests.saturating_sub(1);
             }
         }
-        self.requests.insert(request_id, DisaggRequestState::Complete { total_tokens });
+        self.requests
+            .insert(request_id, DisaggRequestState::Complete { total_tokens });
     }
 
     /// Get the current state of a request.
@@ -201,28 +215,40 @@ impl DisaggregatedRouter {
 
     /// Number of active (non-complete, non-queued) requests.
     pub fn active_request_count(&self) -> usize {
-        self.requests.values().filter(|s| {
-            matches!(s,
-                DisaggRequestState::Prefilling { .. }
-                | DisaggRequestState::Transferring { .. }
-                | DisaggRequestState::Decoding { .. }
-            )
-        }).count()
+        self.requests
+            .values()
+            .filter(|s| {
+                matches!(
+                    s,
+                    DisaggRequestState::Prefilling { .. }
+                        | DisaggRequestState::Transferring { .. }
+                        | DisaggRequestState::Decoding { .. }
+                )
+            })
+            .count()
     }
 
     /// Number of queued requests waiting for prefill.
     pub fn queued_count(&self) -> usize {
-        self.requests.values().filter(|s| matches!(s, DisaggRequestState::Queued)).count()
+        self.requests
+            .values()
+            .filter(|s| matches!(s, DisaggRequestState::Queued))
+            .count()
     }
 
     /// Number of completed requests.
     pub fn completed_count(&self) -> usize {
-        self.requests.values().filter(|s| matches!(s, DisaggRequestState::Complete { .. })).count()
+        self.requests
+            .values()
+            .filter(|s| matches!(s, DisaggRequestState::Complete { .. }))
+            .count()
     }
 
     /// Drain completed requests, returning their IDs.
     pub fn drain_completed(&mut self) -> Vec<u64> {
-        let completed: Vec<u64> = self.requests.iter()
+        let completed: Vec<u64> = self
+            .requests
+            .iter()
             .filter(|(_, s)| matches!(s, DisaggRequestState::Complete { .. }))
             .map(|(id, _)| *id)
             .collect();
@@ -321,7 +347,10 @@ pub extern "C" fn nsl_disagg_select_prefill() -> i64 {
         Some(r) => r,
         None => return -2, // not initialized
     };
-    router.select_prefill_worker().map(|r| r as i64).unwrap_or(-1)
+    router
+        .select_prefill_worker()
+        .map(|r| r as i64)
+        .unwrap_or(-1)
 }
 
 /// Select a decode worker. Returns the worker rank, or -1 if none.
@@ -335,7 +364,10 @@ pub extern "C" fn nsl_disagg_select_decode(kv_blocks_needed: i64) -> i64 {
         Some(r) => r,
         None => return -2, // not initialized
     };
-    router.select_decode_worker(kv_blocks_needed as u32).map(|r| r as i64).unwrap_or(-1)
+    router
+        .select_decode_worker(kv_blocks_needed as u32)
+        .map(|r| r as i64)
+        .unwrap_or(-1)
 }
 
 /// Mark a request as prefilling on the given worker.
@@ -355,7 +387,11 @@ pub extern "C" fn nsl_disagg_mark_prefilling(request_id: i64, prefill_rank: i64)
 
 /// Mark a request as decoding on the given worker, reserving kv_blocks_used blocks.
 #[no_mangle]
-pub extern "C" fn nsl_disagg_mark_decoding(request_id: i64, decode_rank: i64, kv_blocks_used: i64) -> i64 {
+pub extern "C" fn nsl_disagg_mark_decoding(
+    request_id: i64,
+    decode_rank: i64,
+    kv_blocks_used: i64,
+) -> i64 {
     let mut guard = match DISAGG_CTX.lock() {
         Ok(g) => g,
         Err(_) => return -1, // mutex poisoned
@@ -496,7 +532,10 @@ mod tests {
         // Generate tokens
         router.record_token(req0);
         router.record_token(req0);
-        if let Some(DisaggRequestState::Decoding { tokens_generated, .. }) = router.request_state(req0) {
+        if let Some(DisaggRequestState::Decoding {
+            tokens_generated, ..
+        }) = router.request_state(req0)
+        {
             assert_eq!(*tokens_generated, 2);
         }
 

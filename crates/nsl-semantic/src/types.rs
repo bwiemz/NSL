@@ -26,7 +26,9 @@ pub enum Effect {
 
 impl Effect {
     /// Pure effect — no side effects.
-    pub fn pure() -> Self { Effect::Concrete(EffectSet::PURE) }
+    pub fn pure() -> Self {
+        Effect::Concrete(EffectSet::PURE)
+    }
 
     /// Substitute effect variables using the given bindings.
     /// Returns a concrete EffectSet.
@@ -52,7 +54,10 @@ impl Effect {
     pub fn collect_vars(&self, out: &mut Vec<Symbol>) {
         match self {
             Effect::Var(name) => out.push(*name),
-            Effect::Union(a, b) => { a.collect_vars(out); b.collect_vars(out); }
+            Effect::Union(a, b) => {
+                a.collect_vars(out);
+                b.collect_vars(out);
+            }
             Effect::Concrete(_) | Effect::Inferred => {}
         }
     }
@@ -215,7 +220,10 @@ impl Type {
     /// Returns true if this type is a tensor family type.
     pub fn is_tensor(&self) -> bool {
         match self {
-            Type::Tensor { .. } | Type::Param { .. } | Type::Buffer { .. } | Type::Sparse { .. } => true,
+            Type::Tensor { .. }
+            | Type::Param { .. }
+            | Type::Buffer { .. }
+            | Type::Sparse { .. } => true,
             Type::Borrow(inner) => inner.is_tensor(),
             _ => false,
         }
@@ -235,7 +243,11 @@ impl Type {
     /// Sees through borrows: `&Tensor<...>` returns the inner tensor parts.
     pub fn as_tensor_parts(&self) -> Option<(&Shape, &DType, Device)> {
         match self {
-            Type::Tensor { shape, dtype, device } => Some((shape, dtype, device.clone())),
+            Type::Tensor {
+                shape,
+                dtype,
+                device,
+            } => Some((shape, dtype, device.clone())),
             Type::Param { shape, dtype } => Some((shape, dtype, Device::Unknown)),
             Type::Buffer { shape, dtype } => Some((shape, dtype, Device::Unknown)),
             Type::Borrow(inner) => inner.as_tensor_parts(),
@@ -271,10 +283,18 @@ pub enum DimExpr {
 
 impl DimExpr {
     pub fn as_lit(&self) -> Option<i64> {
-        if let DimExpr::Lit(v) = self { Some(*v) } else { None }
+        if let DimExpr::Lit(v) = self {
+            Some(*v)
+        } else {
+            None
+        }
     }
     pub fn as_sym(&self) -> Option<Symbol> {
-        if let DimExpr::Sym(s) = self { Some(*s) } else { None }
+        if let DimExpr::Sym(s) = self {
+            Some(*s)
+        } else {
+            None
+        }
     }
 }
 
@@ -316,7 +336,9 @@ impl Shape {
 
     /// Returns true if any dimension is symbolic, bounded, or computed.
     pub fn has_symbolic(&self) -> bool {
-        self.dims.iter().any(|d| matches!(d, Dim::Symbolic(_) | Dim::Bounded { .. } | Dim::Computed(_)))
+        self.dims
+            .iter()
+            .any(|d| matches!(d, Dim::Symbolic(_) | Dim::Bounded { .. } | Dim::Computed(_)))
     }
 }
 
@@ -342,7 +364,7 @@ pub enum DType {
     /// M35.1 BitNet ternary, unpacked (one trit per i8). Numerically operable.
     TernaryUnpacked,
     /// Custom user-defined datatype (M23 BYOD)
-    Custom(u16),  // runtime dtype ID (256+)
+    Custom(u16), // runtime dtype ID (256+)
     Unknown,
 }
 
@@ -444,15 +466,32 @@ pub fn is_assignable(source: &Type, target: &Type) -> bool {
         return true;
     }
     // Param assignable to Tensor (subtyping)
-    if let (Type::Param { shape: s1, dtype: d1 }, Type::Tensor { shape: s2, dtype: d2, .. }) =
-        (source, target)
+    if let (
+        Type::Param {
+            shape: s1,
+            dtype: d1,
+        },
+        Type::Tensor {
+            shape: s2,
+            dtype: d2,
+            ..
+        },
+    ) = (source, target)
     {
         return s1 == s2 && d1 == d2;
     }
     // Tensor-to-Tensor assignability with shape checking
     if let (
-        Type::Tensor { shape: vs, dtype: vd, device: vdev },
-        Type::Tensor { shape: as_, dtype: ad, device: adev },
+        Type::Tensor {
+            shape: vs,
+            dtype: vd,
+            device: vdev,
+        },
+        Type::Tensor {
+            shape: as_,
+            dtype: ad,
+            device: adev,
+        },
     ) = (source, target)
     {
         // Unknown shape is always compatible
@@ -541,7 +580,7 @@ fn dtype_to_rank(d: DType) -> u8 {
         DType::Bf16 => 8,
         DType::F32 => 9,
         DType::F64 => 10,
-        DType::Custom(_) => 0,  // custom dtypes don't participate in widening
+        DType::Custom(_) => 0, // custom dtypes don't participate in widening
         DType::Unknown => 0,
     }
 }
@@ -568,7 +607,11 @@ pub fn display_type(ty: &Type) -> String {
         Type::Uint8 => "uint8".into(),
         Type::TernaryPacked => "ternary".into(),
         Type::TernaryUnpacked => "ternary_unpacked".into(),
-        Type::Tensor { shape, dtype, device } => {
+        Type::Tensor {
+            shape,
+            dtype,
+            device,
+        } => {
             let shape_str = crate::shapes::fmt_shape(shape);
             let dtype_str = display_dtype(dtype);
             let dev_str = display_device(device);
@@ -588,7 +631,11 @@ pub fn display_type(ty: &Type) -> String {
             let dtype_str = display_dtype(dtype);
             format!("Buffer<{}, {}>", shape_str, dtype_str)
         }
-        Type::Sparse { shape, dtype, format } => {
+        Type::Sparse {
+            shape,
+            dtype,
+            format,
+        } => {
             let shape_str = crate::shapes::fmt_shape(shape);
             let dtype_str = display_dtype(dtype);
             let fmt_str = match format {
@@ -607,7 +654,11 @@ pub fn display_type(ty: &Type) -> String {
             format!("({})", inner.join(", "))
         }
         Type::Optional(inner) => format!("{}?", display_type(inner)),
-        Type::Function { params, ret, effect } => {
+        Type::Function {
+            params,
+            ret,
+            effect,
+        } => {
             let ps: Vec<String> = params.iter().map(display_type).collect();
             let eff_str = match effect {
                 Effect::Concrete(set) if !set.is_pure() => format!(" | {{{}}}", set.display()),
@@ -747,7 +798,9 @@ mod tests {
     #[test]
     fn borrow_tensor_auto_borrow() {
         let tensor = Type::Tensor {
-            shape: Shape { dims: vec![Dim::Concrete(4)] },
+            shape: Shape {
+                dims: vec![Dim::Concrete(4)],
+            },
             dtype: DType::F32,
             device: Device::Unknown,
         };
@@ -764,7 +817,9 @@ mod tests {
         assert_eq!(display_type(&borrow_int), "&int");
 
         let borrow_tensor = Type::Borrow(Box::new(Type::Tensor {
-            shape: Shape { dims: vec![Dim::Concrete(4)] },
+            shape: Shape {
+                dims: vec![Dim::Concrete(4)],
+            },
             dtype: DType::F32,
             device: Device::Unknown,
         }));
@@ -774,7 +829,9 @@ mod tests {
     #[test]
     fn borrow_is_tensor() {
         let tensor = Type::Tensor {
-            shape: Shape { dims: vec![Dim::Concrete(4)] },
+            shape: Shape {
+                dims: vec![Dim::Concrete(4)],
+            },
             dtype: DType::F32,
             device: Device::Unknown,
         };

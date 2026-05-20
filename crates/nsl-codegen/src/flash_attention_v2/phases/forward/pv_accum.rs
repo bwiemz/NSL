@@ -27,7 +27,7 @@ pub const O_BASE: u32 = 48;
 
 pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
     let head_dim = config.head_dim as u32;
-    let slices   = head_dim / 32;
+    let slices = head_dim / 32;
     let block_kv = config.block_kv as u32;
     let fused = config.csha.as_ref().is_some_and(|c| c.fused_projections);
     // SP slice base offset for this q_tile_iter (same logic as softmax.rs).
@@ -48,7 +48,8 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
     for i in 0..slices {
         ptx.push_str(&format!(
             "    mul.f32 %f{}, %f{}, %correction;\n",
-            O_BASE + i, O_BASE + i
+            O_BASE + i,
+            O_BASE + i
         ));
     }
 
@@ -83,7 +84,10 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
         head_dim
     ));
     ptx.push_str("    shl.b64 %rd44, %rd44, 1;                  // * 2 bytes f16\n");
-    ptx.push_str(&format!("    add.u64 %rd44, %rd44, {};\n", kv_offset(config)));
+    ptx.push_str(&format!(
+        "    add.u64 %rd44, %rd44, {};\n",
+        kv_offset(config)
+    ));
     ptx.push_str("    add.u64 %rd44, %rd44, %shmem_base;\n");
 
     // Per-slice V load + fma into O_acc.
@@ -98,7 +102,8 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
         ptx.push_str("    cvt.f32.f16 %f1, %h0;                     // V[k, d]\n");
         ptx.push_str(&format!(
             "    fma.rn.f32 %f{}, %f0, %f1, %f{};          // O_acc[i] += P*V\n",
-            O_BASE + i, O_BASE + i
+            O_BASE + i,
+            O_BASE + i
         ));
     }
 

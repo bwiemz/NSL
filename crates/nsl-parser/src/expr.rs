@@ -62,10 +62,7 @@ fn parse_expr_bp(p: &mut Parser, min_bp: u8) -> Expr {
                 } else {
                     None
                 };
-                let span = end
-                    .as_ref()
-                    .map(|e| start.merge(e.span))
-                    .unwrap_or(start);
+                let span = end.as_ref().map(|e| start.merge(e.span)).unwrap_or(start);
                 lhs = Expr {
                     kind: ExprKind::Range {
                         start: Some(Box::new(lhs)),
@@ -716,8 +713,7 @@ fn parse_fstring(p: &mut Parser) -> Expr {
             _ => {
                 let span = p.current_span();
                 p.diagnostics.push(
-                    Diagnostic::error("unexpected token in f-string")
-                        .with_label(span, "here"),
+                    Diagnostic::error("unexpected token in f-string").with_label(span, "here"),
                 );
                 return Expr {
                     kind: ExprKind::Error,

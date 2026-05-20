@@ -7,6 +7,4 @@ pub mod backward;
 pub mod forward;
 pub mod segment_mask;
 
-pub use forward::{
-    prelude, q_load, s_compute, softmax, pv_accum, finalize, csha_hooks,
-};
+pub use forward::{csha_hooks, finalize, prelude, pv_accum, q_load, s_compute, softmax};

@@ -1,7 +1,7 @@
 //! M35: AWQ (Activation-Aware Weight Quantization) 4-bit runtime.
 
-use std::sync::atomic::AtomicI64;
 use std::ffi::c_void;
+use std::sync::atomic::AtomicI64;
 
 use crate::memory::checked_alloc;
 use crate::tensor::NslTensor;
@@ -151,7 +151,8 @@ pub fn awq_dequantize_cpu(packed: &AwqPackedWeight) -> Vec<f64> {
     let mut result = vec![0.0f64; k * n];
 
     let data = unsafe { std::slice::from_raw_parts(packed.data, (k * n).div_ceil(2)) };
-    let scales = unsafe { std::slice::from_raw_parts(packed.scales, packed.num_groups as usize * n) };
+    let scales =
+        unsafe { std::slice::from_raw_parts(packed.scales, packed.num_groups as usize * n) };
     let zeros = unsafe { std::slice::from_raw_parts(packed.zeros, packed.num_groups as usize * n) };
 
     for col in 0..n {
@@ -172,9 +173,18 @@ pub unsafe fn awq_free_packed(packed: &AwqPackedWeight) {
     let k = packed.k as usize;
     let n = packed.n as usize;
     let num_groups = packed.num_groups as usize;
-    let _ = Box::from_raw(std::ptr::slice_from_raw_parts_mut(packed.data, (k * n).div_ceil(2)));
-    let _ = Box::from_raw(std::ptr::slice_from_raw_parts_mut(packed.scales, num_groups * n));
-    let _ = Box::from_raw(std::ptr::slice_from_raw_parts_mut(packed.zeros, num_groups * n));
+    let _ = Box::from_raw(std::ptr::slice_from_raw_parts_mut(
+        packed.data,
+        (k * n).div_ceil(2),
+    ));
+    let _ = Box::from_raw(std::ptr::slice_from_raw_parts_mut(
+        packed.scales,
+        num_groups * n,
+    ));
+    let _ = Box::from_raw(std::ptr::slice_from_raw_parts_mut(
+        packed.zeros,
+        num_groups * n,
+    ));
 }
 
 // ---------------------------------------------------------------------------
@@ -205,7 +215,8 @@ pub fn awq_matmul_cpu(input: &[f64], packed: &AwqPackedWeight, m: usize) -> Vec<
     let group_size = packed.group_size as usize;
 
     let data = unsafe { std::slice::from_raw_parts(packed.data, (k * n).div_ceil(2)) };
-    let scales = unsafe { std::slice::from_raw_parts(packed.scales, packed.num_groups as usize * n) };
+    let scales =
+        unsafe { std::slice::from_raw_parts(packed.scales, packed.num_groups as usize * n) };
     let zeros = unsafe { std::slice::from_raw_parts(packed.zeros, packed.num_groups as usize * n) };
 
     let mut output = vec![0.0f64; m * n];
@@ -231,14 +242,17 @@ pub fn awq_matmul_cpu(input: &[f64], packed: &AwqPackedWeight, m: usize) -> Vec<
 
 /// Quantize weight tensor to AWQ4 packed format.
 #[no_mangle]
-pub extern "C" fn nsl_awq_quantize(
-    weight_ptr: i64,
-    group_size: i64,
-    _calibration_ptr: i64,
-) -> i64 {
-    if weight_ptr == 0 { eprintln!("nsl_awq_quantize: null weight tensor"); return 0; }
+pub extern "C" fn nsl_awq_quantize(weight_ptr: i64, group_size: i64, _calibration_ptr: i64) -> i64 {
+    if weight_ptr == 0 {
+        eprintln!("nsl_awq_quantize: null weight tensor");
+        return 0;
+    }
     let t = unsafe { &*(weight_ptr as *const NslTensor) };
-    assert!(t.ndim >= 2, "nsl_awq_quantize requires 2D weight tensor (got {}D)", t.ndim);
+    assert!(
+        t.ndim >= 2,
+        "nsl_awq_quantize requires 2D weight tensor (got {}D)",
+        t.ndim
+    );
     let len = t.len as usize;
 
     let data: Vec<f64> = if t.dtype == 1 {
@@ -258,12 +272,11 @@ pub extern "C" fn nsl_awq_quantize(
 
 /// AWQ dequantize-in-GEMM matmul.
 #[no_mangle]
-pub extern "C" fn nsl_awq_matmul(
-    input_ptr: i64,
-    packed_ptr: i64,
-    _group_size: i64,
-) -> i64 {
-    if input_ptr == 0 || packed_ptr == 0 { eprintln!("nsl_awq_matmul: null pointer"); return 0; }
+pub extern "C" fn nsl_awq_matmul(input_ptr: i64, packed_ptr: i64, _group_size: i64) -> i64 {
+    if input_ptr == 0 || packed_ptr == 0 {
+        eprintln!("nsl_awq_matmul: null pointer");
+        return 0;
+    }
     let input_t = unsafe { &*(input_ptr as *const NslTensor) };
     let packed = unsafe { &*(packed_ptr as *const AwqPackedWeight) };
 
@@ -337,7 +350,10 @@ pub extern "C" fn nsl_awq_pre_scale_weight(
     }
     let t = unsafe { &*(weight_ptr as *const NslTensor) };
     if t.ndim < 2 {
-        eprintln!("nsl_awq_pre_scale_weight: weight must be 2D (got {}D)", t.ndim);
+        eprintln!(
+            "nsl_awq_pre_scale_weight: weight must be 2D (got {}D)",
+            t.ndim
+        );
         return 0;
     }
 
@@ -386,8 +402,7 @@ pub extern "C" fn nsl_awq_pre_scale_weight(
 fn make_f32_tensor(data: &[f32], shape: &[i64]) -> i64 {
     let ndim = shape.len() as i64;
     let total = data.len();
-    let shape_ptr =
-        crate::memory::checked_alloc(std::mem::size_of_val(shape)) as *mut i64;
+    let shape_ptr = crate::memory::checked_alloc(std::mem::size_of_val(shape)) as *mut i64;
     for (i, &s) in shape.iter().enumerate() {
         unsafe { *shape_ptr.add(i) = s };
     }
@@ -401,10 +416,10 @@ fn make_f32_tensor(data: &[f32], shape: &[i64]) -> i64 {
         strides,
         ndim,
         total as i64,
-        0,  // device: CPU
-        1,  // dtype: f32
-        1,  // owns_data
-        0,  // data_owner
+        0, // device: CPU
+        1, // dtype: f32
+        1, // owns_data
+        0, // data_owner
     ));
     Box::into_raw(t) as i64
 }
@@ -481,7 +496,9 @@ mod tests {
             assert!(
                 (orig - rec).abs() < 0.15,
                 "AWQ error too high at index {}: orig={}, recovered={}",
-                i, orig, rec
+                i,
+                orig,
+                rec
             );
         }
 
@@ -491,9 +508,7 @@ mod tests {
     #[test]
     fn test_awq_matmul_cpu() {
         let input = vec![1.0f64, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
-        let weights = vec![
-            0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2,
-        ];
+        let weights = vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2];
 
         let reference = matmul_cpu(&input, &weights, 2, 4, 3);
         let packed = awq_quantize_cpu(&weights, 4, 3, 4);
@@ -504,7 +519,9 @@ mod tests {
             assert!(
                 (r - a).abs() < tol,
                 "AWQ matmul error at {}: ref={}, awq={}",
-                i, r, a
+                i,
+                r,
+                a
             );
         }
 
@@ -553,7 +570,10 @@ impl std::fmt::Display for AwqScalesError {
             Self::MissingAwqKey => write!(f, "sidecar has no '{AWQ_SIDECAR_KEY}' key"),
             Self::BadBase64(e) => write!(f, "bad base64 for awq blob: {e}"),
             Self::BlobTooSmall { need, got } => write!(f, "blob too small: need {need}, got {got}"),
-            Self::UnsupportedVersion { got } => write!(f, "unsupported AWQ sidecar version {got} (expected {AWQ_SIDECAR_VERSION})"),
+            Self::UnsupportedVersion { got } => write!(
+                f,
+                "unsupported AWQ sidecar version {got} (expected {AWQ_SIDECAR_VERSION})"
+            ),
             Self::BlobTruncated { at } => write!(f, "blob truncated at {at}"),
             Self::BadUtf8 => write!(f, "invalid UTF-8 in projection name"),
         }
@@ -563,14 +583,19 @@ impl std::fmt::Display for AwqScalesError {
 impl std::error::Error for AwqScalesError {}
 
 impl From<std::io::Error> for AwqScalesError {
-    fn from(e: std::io::Error) -> Self { Self::Io(e) }
+    fn from(e: std::io::Error) -> Self {
+        Self::Io(e)
+    }
 }
 
 impl AwqScales {
     /// Parse the raw AWQ-format blob produced by the calibration harness.
     pub fn from_blob(blob: &[u8]) -> Result<Self, AwqScalesError> {
         if blob.len() < 8 {
-            return Err(AwqScalesError::BlobTooSmall { need: 8, got: blob.len() });
+            return Err(AwqScalesError::BlobTooSmall {
+                need: 8,
+                got: blob.len(),
+            });
         }
         let version = u32::from_le_bytes(blob[0..4].try_into().unwrap());
         if version != AWQ_SIDECAR_VERSION {
@@ -583,7 +608,8 @@ impl AwqScales {
             if blob.len() < cursor + 4 {
                 return Err(AwqScalesError::BlobTruncated { at: "name_len" });
             }
-            let name_len = u32::from_le_bytes(blob[cursor..cursor + 4].try_into().unwrap()) as usize;
+            let name_len =
+                u32::from_le_bytes(blob[cursor..cursor + 4].try_into().unwrap()) as usize;
             cursor += 4;
             if blob.len() < cursor + name_len {
                 return Err(AwqScalesError::BlobTruncated { at: "name bytes" });
@@ -593,11 +619,19 @@ impl AwqScales {
                 .to_string();
             cursor += name_len;
             if blob.len() < cursor + 4 {
-                return Err(AwqScalesError::BlobTruncated { at: "channel_count" });
+                return Err(AwqScalesError::BlobTruncated {
+                    at: "channel_count",
+                });
             }
-            let channel_count = u32::from_le_bytes(blob[cursor..cursor + 4].try_into().unwrap()) as usize;
+            let channel_count =
+                u32::from_le_bytes(blob[cursor..cursor + 4].try_into().unwrap()) as usize;
             cursor += 4;
-            let scale_bytes = channel_count.checked_mul(4).ok_or(AwqScalesError::BlobTruncated { at: "scales (channel_count overflow)" })?;
+            let scale_bytes =
+                channel_count
+                    .checked_mul(4)
+                    .ok_or(AwqScalesError::BlobTruncated {
+                        at: "scales (channel_count overflow)",
+                    })?;
             if blob.len() < cursor + scale_bytes {
                 return Err(AwqScalesError::BlobTruncated { at: "scales" });
             }
@@ -617,13 +651,16 @@ impl AwqScales {
     pub fn from_sidecar_json_path(path: &Path) -> Result<Self, AwqScalesError> {
         use base64::{engine::general_purpose::STANDARD, Engine};
         let json = std::fs::read_to_string(path)?;
-        let v: serde_json::Value = serde_json::from_str(&json).map_err(|e| AwqScalesError::BadJson(e.to_string()))?;
+        let v: serde_json::Value =
+            serde_json::from_str(&json).map_err(|e| AwqScalesError::BadJson(e.to_string()))?;
         let b64 = v
             .get("hooks")
             .and_then(|h| h.get(AWQ_SIDECAR_KEY))
             .and_then(|s| s.as_str())
             .ok_or(AwqScalesError::MissingAwqKey)?;
-        let blob = STANDARD.decode(b64).map_err(|e| AwqScalesError::BadBase64(e.to_string()))?;
+        let blob = STANDARD
+            .decode(b64)
+            .map_err(|e| AwqScalesError::BadBase64(e.to_string()))?;
         Self::from_blob(&blob)
     }
 }
@@ -657,8 +694,14 @@ mod awq_sidecar_reader_tests {
             ("blocks.0.attn.wk", &[0.5, 0.25, 0.125]),
         ]);
         let scales = AwqScales::from_blob(&blob).unwrap();
-        assert_eq!(scales.by_projection.get("blocks.0.attn.wq").unwrap(), &vec![1.0, 2.0]);
-        assert_eq!(scales.by_projection.get("blocks.0.attn.wk").unwrap(), &vec![0.5, 0.25, 0.125]);
+        assert_eq!(
+            scales.by_projection.get("blocks.0.attn.wq").unwrap(),
+            &vec![1.0, 2.0]
+        );
+        assert_eq!(
+            scales.by_projection.get("blocks.0.attn.wk").unwrap(),
+            &vec![0.5, 0.25, 0.125]
+        );
         assert!(scales.by_projection.get("missing").is_none());
     }
 
@@ -685,7 +728,10 @@ mod awq_sidecar_reader_tests {
             r#"{{"version":1,"checkpoint_sha256":"","calibration_data_sha256":"","hook_set_sha256":"","cache_key_digest":"","num_samples_used":0,"hooks":{{"awq_activation_scales":"{b64}"}}}}"#
         );
         let tmp = std::env::temp_dir().join(format!("nsl-awq-sidecar-{}.json", std::process::id()));
-        std::fs::File::create(&tmp).unwrap().write_all(sidecar_json.as_bytes()).unwrap();
+        std::fs::File::create(&tmp)
+            .unwrap()
+            .write_all(sidecar_json.as_bytes())
+            .unwrap();
         let scales = AwqScales::from_sidecar_json_path(&tmp).unwrap();
         assert_eq!(scales.by_projection.get("p").unwrap(), &vec![0.5]);
         let _ = std::fs::remove_file(&tmp);
@@ -694,7 +740,8 @@ mod awq_sidecar_reader_tests {
     #[test]
     fn from_sidecar_errors_when_awq_key_absent() {
         let sidecar_json = r#"{"version":1,"checkpoint_sha256":"","calibration_data_sha256":"","hook_set_sha256":"","cache_key_digest":"","num_samples_used":0,"hooks":{}}"#;
-        let tmp = std::env::temp_dir().join(format!("nsl-awq-sidecar-empty-{}.json", std::process::id()));
+        let tmp =
+            std::env::temp_dir().join(format!("nsl-awq-sidecar-empty-{}.json", std::process::id()));
         std::fs::write(&tmp, sidecar_json).unwrap();
         assert!(AwqScales::from_sidecar_json_path(&tmp).is_err());
         let _ = std::fs::remove_file(&tmp);
@@ -729,7 +776,11 @@ pub fn awq_quantize_with_scales(
     scales: Option<&[f32]>,
     alpha: f32,
 ) -> AwqQuantizedChecked {
-    assert_eq!(weight.len(), in_channels * out_channels, "weight length mismatch");
+    assert_eq!(
+        weight.len(),
+        in_channels * out_channels,
+        "weight length mismatch"
+    );
     let effective: Vec<f32> = match scales {
         Some(s) => {
             assert_eq!(s.len(), in_channels, "scales length must equal in_channels");
@@ -758,7 +809,9 @@ pub fn awq_quantize_with_scales(
             .fold(0.0_f32, f32::max)
             .max(1e-9);
         for i in 0..in_channels {
-            let q = ((scaled[start + i] / amax) * 127.0).round().clamp(-128.0, 127.0);
+            let q = ((scaled[start + i] / amax) * 127.0)
+                .round()
+                .clamp(-128.0, 127.0);
             out_bytes.push(q as i8 as u8);
         }
     }
@@ -783,8 +836,10 @@ mod awq_quantize_with_scales_tests {
         let out_none = awq_quantize_with_scales(&weight, 16, 8, None, 0.5);
         let ones = vec![1.0_f32; 16];
         let out_ones = awq_quantize_with_scales(&weight, 16, 8, Some(&ones), 0.5);
-        assert_eq!(out_none.dequantized_check_bytes, out_ones.dequantized_check_bytes,
-            "None scales must equal [1.0; in_channels] scales after s^alpha (1^x = 1)");
+        assert_eq!(
+            out_none.dequantized_check_bytes, out_ones.dequantized_check_bytes,
+            "None scales must equal [1.0; in_channels] scales after s^alpha (1^x = 1)"
+        );
     }
 
     #[test]
@@ -794,17 +849,18 @@ mod awq_quantize_with_scales_tests {
         let varied: Vec<f32> = (0..16).map(|i| 0.5 + i as f32 * 0.2).collect();
         let out_ones = awq_quantize_with_scales(&weight, 16, 8, Some(&ones), 0.5);
         let out_varied = awq_quantize_with_scales(&weight, 16, 8, Some(&varied), 0.5);
-        assert_ne!(out_ones.dequantized_check_bytes, out_varied.dequantized_check_bytes,
-            "Non-trivial scales must change quantization output");
+        assert_ne!(
+            out_ones.dequantized_check_bytes, out_varied.dequantized_check_bytes,
+            "Non-trivial scales must change quantization output"
+        );
     }
 
     #[test]
     fn quantize_rejects_wrong_length_scales() {
         let weight = toy_weight(8, 16);
         let bad = vec![1.0_f32; 99]; // wrong length
-        let result = std::panic::catch_unwind(|| {
-            awq_quantize_with_scales(&weight, 16, 8, Some(&bad), 0.5)
-        });
+        let result =
+            std::panic::catch_unwind(|| awq_quantize_with_scales(&weight, 16, 8, Some(&bad), 0.5));
         assert!(result.is_err(), "mismatched scales length must panic");
     }
 }
@@ -815,11 +871,11 @@ mod awq_quantize_with_scales_tests {
 
 #[repr(C)]
 pub struct AwqProjectionDescriptor {
-    pub path_ptr:     *const u8,
-    pub path_len:     usize,
-    pub channels:     u32,
-    pub _pad:         u32,
-    pub running_ptr:  *const f32,
+    pub path_ptr: *const u8,
+    pub path_len: usize,
+    pub channels: u32,
+    pub _pad: u32,
+    pub running_ptr: *const f32,
 }
 
 /// Per-layer WGGO Phase 2 gradient-importance descriptor.
@@ -916,9 +972,8 @@ pub extern "C" fn nsl_calib_write_sidecar(
         // `d.channels` f32 elements, properly aligned, and non-aliased for the
         // lifetime of this call. The C-ABI contract on `nsl_calib_write_sidecar`
         // places this responsibility on the caller.
-        let values = unsafe {
-            std::slice::from_raw_parts(d.running_ptr, d.channels as usize).to_vec()
-        };
+        let values =
+            unsafe { std::slice::from_raw_parts(d.running_ptr, d.channels as usize).to_vec() };
         awq_by_projection.insert(name, values);
     }
 
@@ -978,15 +1033,18 @@ pub extern "C" fn nsl_calib_write_sidecar(
         // `d.running_buffer_len` f64 elements, properly aligned, and non-aliased
         // for the lifetime of this call. The C-ABI contract on
         // `nsl_calib_write_sidecar` places this responsibility on the caller.
-        let f64s = unsafe {
-            std::slice::from_raw_parts(d.running_ptr, d.running_buffer_len as usize)
-        };
+        let f64s =
+            unsafe { std::slice::from_raw_parts(d.running_ptr, d.running_buffer_len as usize) };
         // Convert f64 → f32 at the boundary; sanitize NaN/Inf to 0.0.
         let per_head_score: Vec<f32> = f64s
             .iter()
             .map(|v| {
                 let f = *v as f32;
-                if f.is_finite() { f } else { 0.0 }
+                if f.is_finite() {
+                    f
+                } else {
+                    0.0
+                }
             })
             .collect();
 
@@ -1002,11 +1060,17 @@ pub extern "C" fn nsl_calib_write_sidecar(
     // ── Compose the JSON ────────────────────────────────────────────────
     let mut hooks_obj = serde_json::Map::new();
     if let Some(b64) = awq_blob_b64 {
-        hooks_obj.insert("awq_activation_scales".to_string(), serde_json::Value::String(b64));
+        hooks_obj.insert(
+            "awq_activation_scales".to_string(),
+            serde_json::Value::String(b64),
+        );
     }
 
     let mut top = serde_json::Map::new();
-    top.insert("version".into(), serde_json::json!(CALIB_SIDECAR_JSON_VERSION));
+    top.insert(
+        "version".into(),
+        serde_json::json!(CALIB_SIDECAR_JSON_VERSION),
+    );
     top.insert("checkpoint_sha256".into(), serde_json::json!(""));
     top.insert("calibration_data_sha256".into(), serde_json::json!(""));
     top.insert("hook_set_sha256".into(), serde_json::json!(""));
@@ -1118,8 +1182,10 @@ mod write_sidecar_tests {
         ];
 
         let rc = nsl_awq_write_sidecar(
-            path_str.as_ptr(), path_str.len(),
-            descs.as_ptr(), descs.len(),
+            path_str.as_ptr(),
+            path_str.len(),
+            descs.as_ptr(),
+            descs.len(),
         );
         assert_eq!(rc, 0);
 
@@ -1132,10 +1198,7 @@ mod write_sidecar_tests {
     #[allow(deprecated)] // Exercises the shim during rename transition.
     fn returns_1_on_invalid_utf8_path() {
         let bad: [u8; 4] = [0xff, 0xfe, 0xfd, 0xfc];
-        let rc = nsl_awq_write_sidecar(
-            bad.as_ptr(), bad.len(),
-            std::ptr::null(), 0,
-        );
+        let rc = nsl_awq_write_sidecar(bad.as_ptr(), bad.len(), std::ptr::null(), 0);
         assert_eq!(rc, 1);
     }
 
@@ -1155,9 +1218,12 @@ mod write_sidecar_tests {
         }];
 
         let rc = nsl_calib_write_sidecar(
-            path_str.as_ptr(), path_str.len(),
-            descs.as_ptr(), descs.len(),
-            std::ptr::null(), 0,  // empty WGGO array
+            path_str.as_ptr(),
+            path_str.len(),
+            descs.as_ptr(),
+            descs.len(),
+            std::ptr::null(),
+            0, // empty WGGO array
         );
         assert_eq!(rc, 0);
 
@@ -1185,20 +1251,27 @@ mod write_sidecar_tests {
         }];
 
         let rc = nsl_calib_write_sidecar(
-            path_str.as_ptr(), path_str.len(),
-            std::ptr::null(), 0,
-            wggo_descs.as_ptr(), wggo_descs.len(),
+            path_str.as_ptr(),
+            path_str.len(),
+            std::ptr::null(),
+            0,
+            wggo_descs.as_ptr(),
+            wggo_descs.len(),
         );
         assert_eq!(rc, 0);
 
         let raw = std::fs::read_to_string(tmp.path()).unwrap();
         let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
         let by_layer = &json["wggo_head_gradients"]["by_layer"];
-        let scores = by_layer["AttentionMLP"]["per_head_score"].as_array().unwrap();
+        let scores = by_layer["AttentionMLP"]["per_head_score"]
+            .as_array()
+            .unwrap();
         assert_eq!(scores.len(), 4);
         let s0 = scores[0].as_f64().unwrap();
         assert!((s0 - 0.001).abs() < 1e-6, "score[0] = {s0}");
-        let batches = by_layer["AttentionMLP"]["batches_observed"].as_u64().unwrap();
+        let batches = by_layer["AttentionMLP"]["batches_observed"]
+            .as_u64()
+            .unwrap();
         assert_eq!(batches, 8);
     }
 
@@ -1234,9 +1307,12 @@ mod write_sidecar_tests {
         }];
 
         let rc = nsl_calib_write_sidecar(
-            path_str.as_ptr(), path_str.len(),
-            awq_descs.as_ptr(), awq_descs.len(),
-            wggo_descs.as_ptr(), wggo_descs.len(),
+            path_str.as_ptr(),
+            path_str.len(),
+            awq_descs.as_ptr(),
+            awq_descs.len(),
+            wggo_descs.as_ptr(),
+            wggo_descs.len(),
         );
         assert_eq!(rc, 0);
 
@@ -1258,15 +1334,25 @@ mod write_sidecar_tests {
         let path_str = tmp.path().to_string_lossy().to_string();
 
         let rc = nsl_calib_write_sidecar(
-            path_str.as_ptr(), path_str.len(),
-            std::ptr::null(), 0,
-            std::ptr::null(), 0,
+            path_str.as_ptr(),
+            path_str.len(),
+            std::ptr::null(),
+            0,
+            std::ptr::null(),
+            0,
         );
-        assert_eq!(rc, 4, "both-empty descriptor counts must return EmptyCalibration (4)");
+        assert_eq!(
+            rc, 4,
+            "both-empty descriptor counts must return EmptyCalibration (4)"
+        );
 
         // The sidecar file must NOT be written.
         let metadata = std::fs::metadata(tmp.path()).unwrap();
-        assert_eq!(metadata.len(), 0, "EmptyCalibration must not write any bytes");
+        assert_eq!(
+            metadata.len(),
+            0,
+            "EmptyCalibration must not write any bytes"
+        );
     }
 
     #[test]
@@ -1289,11 +1375,17 @@ mod write_sidecar_tests {
         }];
 
         let rc = nsl_calib_write_sidecar(
-            path_str.as_ptr(), path_str.len(),
-            std::ptr::null(), 0,
-            wggo_descs.as_ptr(), wggo_descs.len(),
+            path_str.as_ptr(),
+            path_str.len(),
+            std::ptr::null(),
+            0,
+            wggo_descs.as_ptr(),
+            wggo_descs.len(),
         );
-        assert_eq!(rc, 5, "unknown WggoLayerDescriptor.version must return UnknownVersion (5)");
+        assert_eq!(
+            rc, 5,
+            "unknown WggoLayerDescriptor.version must return UnknownVersion (5)"
+        );
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1318,9 +1410,12 @@ mod write_sidecar_tests {
 
         let final_path_str = final_path.to_string_lossy().to_string();
         let rc = nsl_calib_write_sidecar(
-            final_path_str.as_ptr(), final_path_str.len(),
-            awq_descs.as_ptr(), awq_descs.len(),
-            std::ptr::null(), 0,
+            final_path_str.as_ptr(),
+            final_path_str.len(),
+            awq_descs.as_ptr(),
+            awq_descs.len(),
+            std::ptr::null(),
+            0,
         );
         assert_eq!(rc, 0);
 

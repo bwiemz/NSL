@@ -9,9 +9,9 @@
 //! `NSL_FA_EMITTER=v2` and `gpu_sm < 80`. The MMA path (sm>=80) stays on
 //! v1 until a separate spec covers MMA correctness.
 
-pub mod smem_layout;
-pub mod register_budget;
 pub mod phases;
+pub mod register_budget;
+pub mod smem_layout;
 pub mod tier_b1;
 pub mod tier_b2;
 
@@ -60,8 +60,7 @@ pub fn synthesize_flash_attention_ptx_v2_with_tier_b(
     tier_b: Option<(u32, SegmentResidency)>,
 ) -> Vec<u8> {
     // CSHA Tier B.1 dispatch (orthogonal to PCA Tier B; see docstring).
-    let want_tier_b1 = config.csha.as_ref().is_some_and(|c| c.level >= 2)
-        && config.gpu_sm >= 80;
+    let want_tier_b1 = config.csha.as_ref().is_some_and(|c| c.level >= 2) && config.gpu_sm >= 80;
     if want_tier_b1 {
         match tier_b1::chunk_config::select(config) {
             Ok(chunk) => {
@@ -151,7 +150,14 @@ pub fn synthesize_flash_attention_ptx_v2_with_tier_b(
         ptx.push_str("    // CSHA K/V pre-pass: load weight tiles (Wq/Wk/Wv) once\n");
         emit_weight_tile_load(&mut ptx, config, "Wq", "csha_wq_ptr", base, 0);
         emit_weight_tile_load(&mut ptx, config, "Wk", "csha_wk_ptr", base + wt_bytes, 0);
-        emit_weight_tile_load(&mut ptx, config, "Wv", "csha_wv_ptr", base + 2 * wt_bytes, 0);
+        emit_weight_tile_load(
+            &mut ptx,
+            config,
+            "Wv",
+            "csha_wv_ptr",
+            base + 2 * wt_bytes,
+            0,
+        );
 
         // ── Step 3: K pre-pass — all kv_iters write K rows to kv_offset.
         //   Reads normalized x (written by RMSNorm pre-pass above).  Uses
@@ -187,10 +193,17 @@ pub fn synthesize_flash_attention_ptx_v2_with_tier_b(
         //   Gated on `save_activations_for_backward` at the orchestrator
         //   level to avoid emitting N×"skip" comment lines when saves are
         //   disabled (the shipped-binary common case).
-        if config.csha.as_ref().is_some_and(|c| c.save_activations_for_backward) {
+        if config
+            .csha
+            .as_ref()
+            .is_some_and(|c| c.save_activations_for_backward)
+        {
             for kv_iter in 0..kv_iters {
                 phases::csha_hooks::emit_save_activations_subset(
-                    &mut ptx, config, kv_iter, phases::csha_hooks::SaveSet::K,
+                    &mut ptx,
+                    config,
+                    kv_iter,
+                    phases::csha_hooks::SaveSet::K,
                 );
             }
         }
@@ -223,7 +236,10 @@ pub fn synthesize_flash_attention_ptx_v2_with_tier_b(
             // rows, not iters.  V SMEM tile aliases K during the S-pass
             // and is saved after the V pre-pass below (Step 5).
             phases::csha_hooks::emit_save_activations_subset(
-                &mut ptx, config, q_iter, phases::csha_hooks::SaveSet::Q,
+                &mut ptx,
+                config,
+                q_iter,
+                phases::csha_hooks::SaveSet::Q,
             );
 
             // Q load (q_smem → registers).
@@ -242,7 +258,10 @@ pub fn synthesize_flash_attention_ptx_v2_with_tier_b(
             if tier_b.is_some() {
                 ptx.push_str(&format!("KV_TILE_SKIP_TB_{}:\n", q_iter));
             }
-            ptx.push_str(&format!("    add.u64 %k_start, %k_start, {};\n", config.block_kv));
+            ptx.push_str(&format!(
+                "    add.u64 %k_start, %k_start, {};\n",
+                config.block_kv
+            ));
             ptx.push_str("    setp.lt.u64 %p0, %k_start, %k_max;\n");
             ptx.push_str(&format!("    @%p0 bra V2_LOOP_KV_S_{};\n", q_iter));
 
@@ -267,7 +286,10 @@ pub fn synthesize_flash_attention_ptx_v2_with_tier_b(
         // `kv_iters` to cover all block_kv V rows.
         for kv_iter in 0..kv_iters {
             phases::csha_hooks::emit_save_activations_subset(
-                &mut ptx, config, kv_iter, phases::csha_hooks::SaveSet::V,
+                &mut ptx,
+                config,
+                kv_iter,
+                phases::csha_hooks::SaveSet::V,
             );
         }
 
@@ -292,7 +314,10 @@ pub fn synthesize_flash_attention_ptx_v2_with_tier_b(
             ptx.push_str(&format!("V2_LOOP_KV_PV_{}:\n", q_iter));
             emit_v_tile_load(&mut ptx, config, q_iter);
             phases::pv_accum::emit(&mut ptx, config, q_iter);
-            ptx.push_str(&format!("    add.u64 %k_start, %k_start, {};\n", config.block_kv));
+            ptx.push_str(&format!(
+                "    add.u64 %k_start, %k_start, {};\n",
+                config.block_kv
+            ));
             ptx.push_str("    setp.lt.u64 %p0, %k_start, %k_max;\n");
             ptx.push_str(&format!("    @%p0 bra V2_LOOP_KV_PV_{};\n", q_iter));
 
@@ -338,7 +363,10 @@ pub fn synthesize_flash_attention_ptx_v2_with_tier_b(
             // saved immediately after its HBM load and BEFORE v_tile_load
             // overwrites the slot.  SaveSet::V runs after v_tile_load below.
             phases::csha_hooks::emit_save_activations_subset(
-                &mut ptx, config, q_iter, phases::csha_hooks::SaveSet::QK,
+                &mut ptx,
+                config,
+                q_iter,
+                phases::csha_hooks::SaveSet::QK,
             );
 
             // K/V-tile loop.
@@ -372,7 +400,10 @@ pub fn synthesize_flash_attention_ptx_v2_with_tier_b(
             // assembles and launch rc=0 so structural gradients flow; a
             // proper addressing rewrite is tracked as a separate follow-up.
             phases::csha_hooks::emit_save_activations_subset(
-                &mut ptx, config, q_iter, phases::csha_hooks::SaveSet::V,
+                &mut ptx,
+                config,
+                q_iter,
+                phases::csha_hooks::SaveSet::V,
             );
             phases::pv_accum::emit(&mut ptx, config, q_iter);
 
@@ -453,10 +484,7 @@ fn emit_k_tile_load(ptx: &mut String, config: &FlashAttentionConfig, q_iter: u32
     ptx.push_str("    add.u64 %smem_addr, %rd60, %shmem_base;\n");
     ptx.push_str("    st.shared.b16 [%smem_addr], %h0;\n");
     ptx.push_str("    add.u64 %rd59, %rd59, 128;\n");
-    ptx.push_str(&format!(
-        "    setp.lt.u64 %p0, %rd59, {};\n",
-        total_k_elems
-    ));
+    ptx.push_str(&format!("    setp.lt.u64 %p0, %rd59, {};\n", total_k_elems));
     ptx.push_str(&format!("    @%p0 bra V2_LOOP_K_LOAD_{};\n", q_iter));
 
     if fused_k {
@@ -508,10 +536,7 @@ fn emit_v_tile_load(ptx: &mut String, config: &FlashAttentionConfig, q_iter: u32
     ptx.push_str("    add.u64 %smem_addr, %rd60, %shmem_base;\n");
     ptx.push_str("    st.shared.b16 [%smem_addr], %h0;\n");
     ptx.push_str("    add.u64 %rd59, %rd59, 128;\n");
-    ptx.push_str(&format!(
-        "    setp.lt.u64 %p0, %rd59, {};\n",
-        total_v_elems
-    ));
+    ptx.push_str(&format!("    setp.lt.u64 %p0, %rd59, {};\n", total_v_elems));
     ptx.push_str(&format!("    @%p0 bra V2_LOOP_V_LOAD_{};\n", q_iter));
 
     if fused_v {
@@ -532,17 +557,17 @@ fn emit_v_tile_load(ptx: &mut String, config: &FlashAttentionConfig, q_iter: u32
 fn emit_weight_tile_load(
     ptx: &mut String,
     config: &FlashAttentionConfig,
-    label: &str,              // e.g. "Wq"
-    weight_param: &str,       // PTX param name, e.g. "csha_wq_ptr"
-    smem_byte_offset: u32,    // byte offset from shmem[] base
+    label: &str,           // e.g. "Wq"
+    weight_param: &str,    // PTX param name, e.g. "csha_wq_ptr"
+    smem_byte_offset: u32, // byte offset from shmem[] base
     q_iter: u32,
 ) {
     let csha = match &config.csha {
         Some(c) if c.fused_projections => c,
         _ => return,
     };
-    let d_model    = csha.d_model as u64;
-    let head_dim   = config.head_dim as u64;
+    let d_model = csha.d_model as u64;
+    let head_dim = config.head_dim as u64;
     let total_elems = d_model * head_dim; // number of f16 elements
 
     let loop_label = format!("V2_WT_LOAD_{}_{}", label.to_uppercase(), q_iter);
@@ -553,10 +578,7 @@ fn emit_weight_tile_load(
         label, d_model, head_dim, smem_byte_offset
     ));
     // Null-guard: skip load if the weight pointer is 0.
-    ptx.push_str(&format!(
-        "    ld.param.u64 %rd_wt, [{}];\n",
-        weight_param
-    ));
+    ptx.push_str(&format!("    ld.param.u64 %rd_wt, [{}];\n", weight_param));
     ptx.push_str("    setp.eq.u64 %p_wt, %rd_wt, 0;\n");
     ptx.push_str(&format!("    @%p_wt bra {};\n", skip_label));
 
@@ -615,7 +637,10 @@ fn emit_weight_tile_load(
 /// Tier A v2 path. The name reflects that fall-through by omitting the
 /// `_tier_b1_chunk<N>` suffix.
 pub fn flash_attention_kernel_name_v2(config: &FlashAttentionConfig) -> String {
-    let base = format!("{}_v2", crate::flash_attention::flash_attention_kernel_name(config));
+    let base = format!(
+        "{}_v2",
+        crate::flash_attention::flash_attention_kernel_name(config)
+    );
     if is_tier_b1_dispatch(config) {
         match tier_b1::chunk_config::select(config) {
             Ok(chunk) => format!("{}_tier_b1_chunk{}", base, chunk),
@@ -695,11 +720,12 @@ pub fn shared_mem_bytes_v2_with_seqlen(
     seq_len: u32,
     residency: crate::pca_segment::SegmentResidency,
 ) -> u32 {
-    let tier_b_bytes = if crate::pca_tilerange::should_emit_tier_b(config, seq_len as u64, residency) {
-        crate::pca_tilerange::tier_b_range_table_bytes(config, seq_len)
-    } else {
-        0
-    };
+    let tier_b_bytes =
+        if crate::pca_tilerange::should_emit_tier_b(config, seq_len as u64, residency) {
+            crate::pca_tilerange::tier_b_range_table_bytes(config, seq_len)
+        } else {
+            0
+        };
     shared_mem_bytes_v2(config) + tier_b_bytes
 }
 
@@ -709,11 +735,12 @@ pub fn shared_mem_bytes_v2_backward_with_seqlen(
     seq_len: u32,
     residency: crate::pca_segment::SegmentResidency,
 ) -> u32 {
-    let tier_b_bytes = if crate::pca_tilerange::should_emit_tier_b(config, seq_len as u64, residency) {
-        crate::pca_tilerange::tier_b_range_table_bytes(config, seq_len)
-    } else {
-        0
-    };
+    let tier_b_bytes =
+        if crate::pca_tilerange::should_emit_tier_b(config, seq_len as u64, residency) {
+            crate::pca_tilerange::tier_b_range_table_bytes(config, seq_len)
+        } else {
+            0
+        };
     shared_mem_bytes_v2_backward(config) + tier_b_bytes
 }
 
@@ -749,12 +776,10 @@ pub fn synthesize_backward(config: &FlashAttentionConfig) -> Result<String, Stri
 /// so this function transparently falls back to scalar v2 in all cases
 /// today. Phase 2 will land the real Tier B.2 emitter and this fallback
 /// will only trigger for configs that fail the §6.4 SMEM ladder.
-pub fn synthesize_backward_with_tier(
-    config: &FlashAttentionConfig,
-) -> Result<String, String> {
+pub fn synthesize_backward_with_tier(config: &FlashAttentionConfig) -> Result<String, String> {
     use crate::csha_pipeline::backward_dispatch_tier;
-    use crate::flash_attention_v2::tier_b2::BackwardTier;
     use crate::flash_attention_v2::tier_b2::backward::synthesize_tier_b2_backward;
+    use crate::flash_attention_v2::tier_b2::BackwardTier;
 
     match backward_dispatch_tier(config) {
         BackwardTier::TierB2 { .. } => {
@@ -865,7 +890,8 @@ pub fn synthesize_backward_with_tier_b(
             ));
         }
         ptx.push_str(&format!(
-            "    setp.lt.u64 %p_zero, %rd_zero_idx, {};\n", dq_cells
+            "    setp.lt.u64 %p_zero, %rd_zero_idx, {};\n",
+            dq_cells
         ));
         ptx.push_str("    shl.b64 %rd_zero_idx, %rd_zero_idx, 2;\n");
         ptx.push_str(&format!(
@@ -950,12 +976,11 @@ pub fn synthesize_backward_with_tier_b(
                 ));
             }
             ptx.push_str(&format!(
-                "    setp.lt.u64 %p_zero, %rd_zero_idx, {};\n", total
+                "    setp.lt.u64 %p_zero, %rd_zero_idx, {};\n",
+                total
             ));
             ptx.push_str("    shl.b64 %rd_zero_idx, %rd_zero_idx, 2;\n");
-            ptx.push_str(&format!(
-                "    add.u64 %rd_zero_idx, %rd_zero_idx, {off};\n"
-            ));
+            ptx.push_str(&format!("    add.u64 %rd_zero_idx, %rd_zero_idx, {off};\n"));
             ptx.push_str("    add.u64 %rd_zero_idx, %shmem_base, %rd_zero_idx;\n");
             ptx.push_str("    mov.f32 %f_zero_val, 0f00000000;\n");
             ptx.push_str("    @%p_zero st.shared.f32 [%rd_zero_idx], %f_zero_val;\n");
@@ -1019,9 +1044,7 @@ pub fn synthesize_backward_with_tier_b(
         ptx.push_str(&format!(
             "    // BWD reload dQ SMEM tile -> %f_dq (q_tile_iter={q_iter})\n"
         ));
-        ptx.push_str(&format!(
-            "    add.u32 %r0, %warp_id, {};\n", q_iter * 4
-        ));
+        ptx.push_str(&format!("    add.u32 %r0, %warp_id, {};\n", q_iter * 4));
         ptx.push_str("    cvt.u64.u32 %rd_dqs_row, %r0;\n");
         ptx.push_str(&format!(
             "    mul.lo.u64 %rd_dqs_row, %rd_dqs_row, {row_stride};\n"
@@ -1038,9 +1061,7 @@ pub fn synthesize_backward_with_tier_b(
                 ));
             }
             if slice > 0 {
-                ptx.push_str(&format!(
-                    "    add.u64 %rd_dqs_col, %rd_dqs_col, {slice};\n"
-                ));
+                ptx.push_str(&format!("    add.u64 %rd_dqs_col, %rd_dqs_col, {slice};\n"));
             }
             ptx.push_str("    shl.b64 %rd_dqs_col, %rd_dqs_col, 2;\n");
             ptx.push_str("    add.u64 %rd_dqs_addr, %rd_dqs_row, %rd_dqs_col;\n");
@@ -1056,9 +1077,7 @@ pub fn synthesize_backward_with_tier_b(
         ptx.push_str(&format!(
             "    // BWD flush %f_dq -> dQ SMEM tile (q_tile_iter={q_iter})\n"
         ));
-        ptx.push_str(&format!(
-            "    add.u32 %r0, %warp_id, {};\n", q_iter * 4
-        ));
+        ptx.push_str(&format!("    add.u32 %r0, %warp_id, {};\n", q_iter * 4));
         ptx.push_str("    cvt.u64.u32 %rd_dqs_row, %r0;\n");
         ptx.push_str(&format!(
             "    mul.lo.u64 %rd_dqs_row, %rd_dqs_row, {row_stride};\n"
@@ -1075,14 +1094,10 @@ pub fn synthesize_backward_with_tier_b(
                 ));
             }
             if slice > 0 {
-                ptx.push_str(&format!(
-                    "    add.u64 %rd_dqs_col, %rd_dqs_col, {slice};\n"
-                ));
+                ptx.push_str(&format!("    add.u64 %rd_dqs_col, %rd_dqs_col, {slice};\n"));
             }
             ptx.push_str("    shl.b64 %rd_dqs_col, %rd_dqs_col, 2;\n");
-            ptx.push_str(
-                "    add.u64 %rd_dqs_addr, %rd_dqs_row, %rd_dqs_col;\n",
-            );
+            ptx.push_str("    add.u64 %rd_dqs_addr, %rd_dqs_row, %rd_dqs_col;\n");
             ptx.push_str(&format!(
                 "    st.shared.f32 [%rd_dqs_addr], %f_dq_{slice};\n"
             ));
@@ -1103,7 +1118,10 @@ pub fn synthesize_backward_with_tier_b(
         ptx.push_str("    } // end PCA Tier B.2 kv-tile ordinal scope\n");
     }
     phases::backward::finalize::emit_store_kv_only(&mut ptx, config, 0);
-    ptx.push_str(&format!("    add.u64 %k_start, %k_start, {};\n", config.block_kv));
+    ptx.push_str(&format!(
+        "    add.u64 %k_start, %k_start, {};\n",
+        config.block_kv
+    ));
     ptx.push_str("    setp.lt.u64 %p0, %k_start, %k_max;\n");
     ptx.push_str("    @%p0 bra V2_BWD_LOOP_KV;\n");
     ptx.push_str("    bar.sync 0;  // dQ SMEM tile complete across all KV tiles\n");
@@ -1134,14 +1152,24 @@ mod backward_orchestrator_tests {
     use crate::flash_attention::{CshaExtras, FlashAttentionConfig, RopeStyle};
 
     fn base_cfg_fused_backward(
-        block_q: i64, block_kv: i64, head_dim: i64, heads: u32, d_model: u32,
+        block_q: i64,
+        block_kv: i64,
+        head_dim: i64,
+        heads: u32,
+        d_model: u32,
     ) -> FlashAttentionConfig {
         let _ = heads;
         FlashAttentionConfig {
-            block_q, block_kv, head_dim,
-            causal: false, paged: false, rope_q: true,
+            block_q,
+            block_kv,
+            head_dim,
+            causal: false,
+            paged: false,
+            rope_q: true,
             rope_style: RopeStyle::Adjacent,
-            gqa_group_size: 1, tree_mask: false, gpu_sm: 75,
+            gqa_group_size: 1,
+            tree_mask: false,
+            gpu_sm: 75,
             segment_masked: false,
             csha: Some(CshaExtras {
                 fused_projections: true,
@@ -1157,14 +1185,22 @@ mod backward_orchestrator_tests {
         let cfg = base_cfg_fused_backward(32, 32, 32, 4, 32);
         let ptx = synthesize_backward(&cfg).expect("synth backward");
 
-        let idx_prelude = ptx.find(".visible .entry").expect(".visible .entry missing");
+        let idx_prelude = ptx
+            .find(".visible .entry")
+            .expect(".visible .entry missing");
         let idx_qload = ptx.find("V2_BWD_Q_LOAD_0:").expect("q_load label missing");
         let idx_ds = ptx.find("V2_BWD_DS_0:").expect("dS label missing");
         let idx_dv = ptx.find("V2_BWD_DV_ACCUM_0:").expect("dV label missing");
         let idx_dq = ptx.find("V2_BWD_DQ_ACCUM_0:").expect("dQ label missing");
-        let idx_drope = ptx.find("V2_BWD_DROPE_Q_LOOP_0:").expect("dRoPE label missing");
-        let idx_dproj = ptx.find("V2_BWD_DPROJ_WQ_LOOP_0:").expect("dproj label missing");
-        let idx_drmsnorm = ptx.find("V2_BWD_DRMSNORM_0:").expect("dRMSNorm label missing");
+        let idx_drope = ptx
+            .find("V2_BWD_DROPE_Q_LOOP_0:")
+            .expect("dRoPE label missing");
+        let idx_dproj = ptx
+            .find("V2_BWD_DPROJ_WQ_LOOP_0:")
+            .expect("dproj label missing");
+        let idx_drmsnorm = ptx
+            .find("V2_BWD_DRMSNORM_0:")
+            .expect("dRMSNorm label missing");
         // Use rfind so we match the trailing `ret;` that closes the
         // kernel body, not the guarded `@%p0 ret;` inside the A.4
         // dead-head guard that sits between prelude and q_load.
@@ -1185,8 +1221,7 @@ mod backward_orchestrator_tests {
         // head_dim=64, heads=8, block_q=64 with backward tiles should
         // blow the 99 KB cap (see T2.1's rejection test).
         let cfg = base_cfg_fused_backward(64, 64, 64, 8, 64);
-        let err = synthesize_backward(&cfg)
-            .expect_err("expected backward validator rejection");
+        let err = synthesize_backward(&cfg).expect_err("expected backward validator rejection");
         assert!(err.contains("backward validator rejected"), "err: {err}");
         assert!(err.contains("Backward"), "err must name direction: {err}");
     }
@@ -1195,8 +1230,10 @@ mod backward_orchestrator_tests {
     fn synthesize_backward_nul_terminated() {
         let cfg = base_cfg_fused_backward(32, 32, 32, 4, 32);
         let ptx = synthesize_backward(&cfg).expect("synth backward");
-        assert!(ptx.ends_with('\0'),
-            "cuModuleLoadData requires NUL terminator");
+        assert!(
+            ptx.ends_with('\0'),
+            "cuModuleLoadData requires NUL terminator"
+        );
     }
 
     #[test]
@@ -1228,9 +1265,7 @@ mod backward_orchestrator_tests {
         let idx_guard = ptx
             .find("CSHA A.4: active_heads guard")
             .expect("guard annotation missing");
-        let idx_qload = ptx
-            .find("V2_BWD_Q_LOAD_0:")
-            .expect("q_load label missing");
+        let idx_qload = ptx.find("V2_BWD_Q_LOAD_0:").expect("q_load label missing");
         assert!(
             idx_guard < idx_qload,
             "A.4 guard must precede q_load so dead-head blocks skip all backward work"
@@ -1244,10 +1279,16 @@ mod backward_orchestrator_tests {
         // kernels are byte-identical to pre-guard emission modulo the
         // single comment line.
         let cfg = FlashAttentionConfig {
-            block_q: 32, block_kv: 32, head_dim: 32,
-            causal: false, paged: false, rope_q: false,
+            block_q: 32,
+            block_kv: 32,
+            head_dim: 32,
+            causal: false,
+            paged: false,
+            rope_q: false,
             rope_style: RopeStyle::Adjacent,
-            gqa_group_size: 1, tree_mask: false, gpu_sm: 75,
+            gqa_group_size: 1,
+            tree_mask: false,
+            gpu_sm: 75,
             segment_masked: false,
             csha: None,
         };
@@ -1277,12 +1318,18 @@ mod backward_orchestrator_tests {
         // via register-SMEM cycle inside each q_tile_iter). dK/dV are
         // zeroed at the TOP of each KV iter since they flush to f32
         // scratch (Option A) after every iter.
-        assert!(ptx.contains("BWD zero-init DQ SMEM tile"),
-            "orchestrator must zero dQ SMEM tile");
-        assert!(ptx.contains("BWD zero-init DK SMEM tile"),
-            "orchestrator must zero dK SMEM tile");
-        assert!(ptx.contains("BWD zero-init DV SMEM tile"),
-            "orchestrator must zero dV SMEM tile");
+        assert!(
+            ptx.contains("BWD zero-init DQ SMEM tile"),
+            "orchestrator must zero dQ SMEM tile"
+        );
+        assert!(
+            ptx.contains("BWD zero-init DK SMEM tile"),
+            "orchestrator must zero dK SMEM tile"
+        );
+        assert!(
+            ptx.contains("BWD zero-init DV SMEM tile"),
+            "orchestrator must zero dV SMEM tile"
+        );
     }
 
     /// `shared_mem_bytes_v2_backward` must be strictly larger than the
@@ -1308,7 +1355,10 @@ mod backward_orchestrator_tests {
     #[test]
     fn backward_shmem_includes_segment_budget_when_masked() {
         let base = base_cfg_fused_backward(32, 32, 32, 4, 32);
-        let masked = FlashAttentionConfig { segment_masked: true, ..base.clone() };
+        let masked = FlashAttentionConfig {
+            segment_masked: true,
+            ..base.clone()
+        };
         let unmasked = shared_mem_bytes_v2_backward(&base);
         let with_seg = shared_mem_bytes_v2_backward(&masked);
         assert_eq!(
@@ -1335,12 +1385,21 @@ mod backward_orchestrator_tests {
         // exercised, so we use the smallest config that both paths
         // accept.
         let cfg = FlashAttentionConfig {
-            block_q: 32, block_kv: 32, head_dim: 64,
-            causal: true, paged: false,
-            rope_q: false, rope_style: RopeStyle::HalfSplit,
-            gqa_group_size: 1, tree_mask: false,
-            gpu_sm: 80, segment_masked: false,
-            csha: Some(CshaExtras { level: 2, ..Default::default() }),
+            block_q: 32,
+            block_kv: 32,
+            head_dim: 64,
+            causal: true,
+            paged: false,
+            rope_q: false,
+            rope_style: RopeStyle::HalfSplit,
+            gqa_group_size: 1,
+            tree_mask: false,
+            gpu_sm: 80,
+            segment_masked: false,
+            csha: Some(CshaExtras {
+                level: 2,
+                ..Default::default()
+            }),
         };
         let result = synthesize_backward_with_tier(&cfg);
         // Phase 1: tier_b2 emitter is a stub; the wrapper falls back

@@ -41,7 +41,11 @@ pub extern "C" fn nsl_append_file(path: i64, content: i64) {
     use std::io::Write;
     let path_str = unsafe { as_cstr(path) }.to_str().unwrap_or("");
     let content_str = unsafe { as_cstr(content) }.to_str().unwrap_or("");
-    let mut file = match std::fs::OpenOptions::new().append(true).create(true).open(path_str) {
+    let mut file = match std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(path_str)
+    {
         Ok(f) => f,
         Err(_) => {
             eprintln!("nsl: could not open file '{}' for appending", path_str);
@@ -57,5 +61,9 @@ pub extern "C" fn nsl_append_file(path: i64, content: i64) {
 #[no_mangle]
 pub extern "C" fn nsl_file_exists(path: i64) -> i8 {
     let path_str = unsafe { as_cstr(path) }.to_str().unwrap_or("");
-    if std::path::Path::new(path_str).exists() { 1 } else { 0 }
+    if std::path::Path::new(path_str).exists() {
+        1
+    } else {
+        0
+    }
 }

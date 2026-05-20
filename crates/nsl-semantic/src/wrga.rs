@@ -280,10 +280,8 @@ pub fn validate_adapter_decorator(
 
     let Some(ref args) = deco.args else {
         diagnostics.push(
-            Diagnostic::error(
-                "@adapter requires at least a `type=...` argument".to_string(),
-            )
-            .with_label(deco.span, "missing arguments"),
+            Diagnostic::error("@adapter requires at least a `type=...` argument".to_string())
+                .with_label(deco.span, "missing arguments"),
         );
         return None;
     };
@@ -326,8 +324,7 @@ pub fn validate_adapter_decorator(
                             ExprKind::StringLiteral(s) => targets.push(s.clone()),
                             _ => diagnostics.push(
                                 Diagnostic::error(
-                                    "@adapter: target entries must be string literals"
-                                        .to_string(),
+                                    "@adapter: target entries must be string literals".to_string(),
                                 )
                                 .with_label(item.span, "expected string"),
                             ),
@@ -440,8 +437,7 @@ fn extract_mode_symbol(
         _ => {
             diagnostics.push(
                 Diagnostic::error(
-                    "@wrga: mode must be an identifier or string (auto|manual|hybrid)"
-                        .to_string(),
+                    "@wrga: mode must be an identifier or string (auto|manual|hybrid)".to_string(),
                 )
                 .with_label(arg.span, "expected ident or string"),
             );
@@ -466,7 +462,10 @@ mod tests {
     fn adapter_kind_parses() {
         assert_eq!(AdapterKind::parse("lora"), Some(AdapterKind::Lora));
         assert_eq!(AdapterKind::parse("ia3"), Some(AdapterKind::Ia3));
-        assert_eq!(AdapterKind::parse("gatedlora"), Some(AdapterKind::GatedLora));
+        assert_eq!(
+            AdapterKind::parse("gatedlora"),
+            Some(AdapterKind::GatedLora)
+        );
         assert_eq!(AdapterKind::parse("unknown"), None);
     }
 

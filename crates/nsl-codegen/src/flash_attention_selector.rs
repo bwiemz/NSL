@@ -6,12 +6,14 @@
 
 use crate::flash_attention::FlashAttentionConfig;
 use crate::flash_attention_v2::{
-    flash_attention_kernel_name_v2, shared_mem_bytes_v2, synthesize_flash_attention_ptx_v2,
-    smem_layout,
+    flash_attention_kernel_name_v2, shared_mem_bytes_v2, smem_layout,
+    synthesize_flash_attention_ptx_v2,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Emitter { V2 }
+pub enum Emitter {
+    V2,
+}
 
 /// Select the emitter, validating the config against the v2 scalar matrix.
 ///
@@ -27,7 +29,8 @@ pub fn select_emitter_with_diag(
     diagnostics: &mut Vec<String>,
 ) -> Emitter {
     let _ = diagnostics; // v1 fallback diagnostics no longer apply
-    if let Err(e) = smem_layout::validate_scalar_v2_config(config, smem_layout::Direction::Forward) {
+    if let Err(e) = smem_layout::validate_scalar_v2_config(config, smem_layout::Direction::Forward)
+    {
         panic!(
             "v2 rejected config (block_q={}, block_kv={}, head_dim={}): {}; \
              v1 is deleted — fix the config or use a supported matrix entry",
@@ -155,7 +158,10 @@ mod selector_tests {
         let mut diagnostics = vec![];
         let result = select_emitter_with_diag(&config, &mut diagnostics);
         assert_eq!(result, Emitter::V2);
-        assert!(diagnostics.is_empty(), "no diagnostic expected on valid config");
+        assert!(
+            diagnostics.is_empty(),
+            "no diagnostic expected on valid config"
+        );
     }
 
     #[test]
@@ -164,7 +170,11 @@ mod selector_tests {
         let config = cfg(32, 32, 32, 75);
         let mut diagnostics = vec![];
         let result = select_emitter_with_diag(&config, &mut diagnostics);
-        assert_eq!(result, Emitter::V2, "selector must return V2 on valid config");
+        assert_eq!(
+            result,
+            Emitter::V2,
+            "selector must return V2 on valid config"
+        );
         assert!(diagnostics.is_empty(), "no diagnostic on valid config");
     }
 
@@ -174,7 +184,11 @@ mod selector_tests {
         let _guard = lock_env();
         let config = cfg(32, 32, 32, 80);
         let result = select_emitter(&config);
-        assert_eq!(result, Emitter::V2, "sm>=80 routes to v2 scalar until MMA forward spec lands");
+        assert_eq!(
+            result,
+            Emitter::V2,
+            "sm>=80 routes to v2 scalar until MMA forward spec lands"
+        );
     }
 
     // ---- C5 new test ----
@@ -187,7 +201,11 @@ mod selector_tests {
         // This config is now valid (66 KB < 228 KB dynamic limit).
         let config = cfg(128, 128, 128, 75);
         let result = select_emitter(&config);
-        assert_eq!(result, Emitter::V2, "128x128x128 no-CSHA must be valid post Track B");
+        assert_eq!(
+            result,
+            Emitter::V2,
+            "128x128x128 no-CSHA must be valid post Track B"
+        );
         // Verify dynamic SMEM is flagged.
         assert!(
             smem_layout::needs_dynamic_smem(&config),

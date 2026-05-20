@@ -11,11 +11,11 @@
 //! subprocess path.
 
 use nsl_codegen::calibration::{
-    CalibCtx, CalibrationHook, CalibrationResult, ProjectionRef,
     awq_hook::AwqCalibrationHook,
     retention::{RetentionTable, TensorShape},
+    CalibCtx, CalibrationHook, CalibrationResult, ProjectionRef,
 };
-use nsl_runtime::awq::{AwqScales, awq_quantize_with_scales};
+use nsl_runtime::awq::{awq_quantize_with_scales, AwqScales};
 
 fn setup_retention(projections: &[ProjectionRef], in_channels: u64) -> RetentionTable {
     let mut table = RetentionTable::new();
@@ -47,7 +47,13 @@ fn awq_calibration_produces_nonuniform_scales_that_alter_quantization() {
     for sample_idx in 0..4 {
         let handle = *hook.handles_for_test().get(&proj).unwrap();
         let per_sample: Vec<f32> = (0..in_channels)
-            .map(|c| if c == 4 { 10.0 + sample_idx as f32 } else { 1.0 })
+            .map(|c| {
+                if c == 4 {
+                    10.0 + sample_idx as f32
+                } else {
+                    1.0
+                }
+            })
             .collect();
         ctx.stub_running_max_abs(handle, &per_sample);
     }
@@ -150,10 +156,12 @@ fn main():
 
 /// Build an AWQ sidecar blob for the given projection → scales mapping and
 /// wrap it in a `Sidecar` struct ready to set as `CompileOptions::calibration_sidecar`.
-fn build_awq_sidecar(projections: &[(&str, Vec<f32>)]) -> nsl_codegen::calibration::sidecar::Sidecar {
-    use std::collections::BTreeMap;
+fn build_awq_sidecar(
+    projections: &[(&str, Vec<f32>)],
+) -> nsl_codegen::calibration::sidecar::Sidecar {
     use nsl_codegen::calibration::awq_sidecar;
     use nsl_codegen::calibration::sidecar::{Sidecar, SIDECAR_VERSION};
+    use std::collections::BTreeMap;
 
     let mut map: BTreeMap<String, Vec<f32>> = BTreeMap::new();
     for (name, scales) in projections {
@@ -178,13 +186,9 @@ fn build_awq_sidecar(projections: &[(&str, Vec<f32>)]) -> nsl_codegen::calibrati
 
 /// Helper: parse + semantic-analyse + compile a module.  Returns the
 /// `CodegenError` on failure (as its `Debug` string for easy assertion).
-fn try_compile(
-    src: &str,
-    opts: &nsl_codegen::CompileOptions,
-) -> Result<Vec<u8>, String> {
+fn try_compile(src: &str, opts: &nsl_codegen::CompileOptions) -> Result<Vec<u8>, String> {
     let mut interner = nsl_lexer::Interner::new();
-    let (tokens, _) =
-        nsl_lexer::tokenize(src, nsl_errors::FileId(0), &mut interner);
+    let (tokens, _) = nsl_lexer::tokenize(src, nsl_errors::FileId(0), &mut interner);
     let parsed = nsl_parser::parse(&tokens, &mut interner);
     // Tolerate semantic warnings/notes but not hard errors — the model
     // above is intentionally minimal and may produce unused-variable hints.
@@ -204,15 +208,16 @@ fn try_compile(
 fn missing_scales_is_hard_error_when_sidecar_present() {
     // Sidecar exists but contains "Tiny.other_field" — NOT "Tiny.w".
     // compile_quant_block must return MissingScales for "Tiny.w".
-    let sidecar =
-        build_awq_sidecar(&[("Tiny.other_field", vec![1.0, 1.0, 1.0, 1.0])]);
+    let sidecar = build_awq_sidecar(&[("Tiny.other_field", vec![1.0, 1.0, 1.0, 1.0])]);
     let mut opts = nsl_codegen::CompileOptions::default();
     opts.calibration_sidecar = Some(sidecar);
 
     let err = try_compile(TINY_AWQ_SRC, &opts)
         .expect_err("compile must fail when projection is missing from sidecar");
     assert!(
-        err.contains("MissingScales") || err.contains("missing scales") || err.contains("missing_scales"),
+        err.contains("MissingScales")
+            || err.contains("missing scales")
+            || err.contains("missing_scales"),
         "expected a MissingScales error, got:\n{err}"
     );
     assert!(

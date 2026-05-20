@@ -53,12 +53,7 @@ pub(crate) fn emit_adapter_init_sidetable(
     plan: &WrgaPlan,
 ) -> Result<(), CodegenError> {
     // 1. Check this model has a side-table slot reserved.
-    let Some(layout) = compiler
-        .types
-        .struct_layouts
-        .get(model_type_name)
-        .cloned()
-    else {
+    let Some(layout) = compiler.types.struct_layouts.get(model_type_name).cloned() else {
         return Ok(());
     };
     let Some(slot_off) = layout.adapter_sidetable_offset else {
@@ -173,23 +168,17 @@ pub(crate) fn emit_adapter_init_sidetable(
                 &[tensor_ptr, ref_tensor_ptr],
             )?;
             let byte_off = (idx * 8) as i32;
-            builder.ins().store(
-                MemFlags::trusted(),
-                placed_tensor,
-                table_ptr,
-                byte_off,
-            );
+            builder
+                .ins()
+                .store(MemFlags::trusted(), placed_tensor, table_ptr, byte_off);
             idx += 1;
         }
     }
 
     // 5. Store the table pointer into the model struct at the reserved slot.
-    builder.ins().store(
-        MemFlags::trusted(),
-        table_ptr,
-        model_ptr,
-        slot_off as i32,
-    );
+    builder
+        .ins()
+        .store(MemFlags::trusted(), table_ptr, model_ptr, slot_off as i32);
 
     Ok(())
 }

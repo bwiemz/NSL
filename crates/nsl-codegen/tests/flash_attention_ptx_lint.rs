@@ -18,7 +18,9 @@ fn base_config() -> FlashAttentionConfig {
         rope_style: RopeStyle::HalfSplit,
         gqa_group_size: 1,
         tree_mask: false,
-        gpu_sm: 80, segment_masked: false, csha: None,
+        gpu_sm: 80,
+        segment_masked: false,
+        csha: None,
     }
 }
 

@@ -88,7 +88,9 @@ fn scan_stmt_for_weight_ref(stmt: &Stmt, interner: &Interner) -> Option<PathBuf>
                 .as_ref()
                 .and_then(|b| scan_block_for_weight_ref(b, interner))
         }
-        StmtKind::While { condition, body, .. } => scan_expr_for_weight_ref(condition, interner)
+        StmtKind::While {
+            condition, body, ..
+        } => scan_expr_for_weight_ref(condition, interner)
             .or_else(|| scan_block_for_weight_ref(body, interner)),
         StmtKind::For { iterable, body, .. } => scan_expr_for_weight_ref(iterable, interner)
             .or_else(|| scan_block_for_weight_ref(body, interner)),
@@ -276,10 +278,7 @@ fn scan_expr_for_weight_ref(expr: &Expr, interner: &Interner) -> Option<PathBuf>
     }
 }
 
-fn scan_subscript_for_weight_ref(
-    index: &SubscriptKind,
-    interner: &Interner,
-) -> Option<PathBuf> {
+fn scan_subscript_for_weight_ref(index: &SubscriptKind, interner: &Interner) -> Option<PathBuf> {
     match index {
         SubscriptKind::Index(e) => scan_expr_for_weight_ref(e, interner),
         SubscriptKind::Slice { lower, upper, step } => lower
@@ -332,7 +331,10 @@ fn first_string_literal_arg(args: &[Arg]) -> Option<String> {
 
 fn scan_stmt_for_cpdt_weight_aware(stmt: &Stmt, interner: &Interner) -> Option<bool> {
     match &stmt.kind {
-        StmtKind::Decorated { decorators, stmt: inner } => {
+        StmtKind::Decorated {
+            decorators,
+            stmt: inner,
+        } => {
             for d in decorators {
                 if let Some(b) = extract_cpdt_weight_aware(d, interner) {
                     return Some(b);
@@ -413,7 +415,10 @@ mod tests {
         let (tokens, _) = nsl_lexer::tokenize(src, FileId(0), &mut interner);
         let parse = nsl_parser::parse(&tokens, &mut interner);
         assert!(
-            parse.diagnostics.iter().all(|d| !matches!(d.level, nsl_errors::Level::Error)),
+            parse
+                .diagnostics
+                .iter()
+                .all(|d| !matches!(d.level, nsl_errors::Level::Error)),
             "parse errors in test source: {:?}",
             parse.diagnostics
         );
@@ -431,19 +436,23 @@ mod tests {
 
     #[test]
     fn find_weight_ref_ignores_non_string_literal() {
-        let (m, ip) = parse(r#"
+        let (m, ip) = parse(
+            r#"
 let path = "weights.safetensors"
 let w = load_safetensors(path)
-"#);
+"#,
+        );
         assert_eq!(find_ast_weight_ref(&m, &ip), None);
     }
 
     #[test]
     fn find_weight_ref_takes_first_match() {
-        let (m, ip) = parse(r#"
+        let (m, ip) = parse(
+            r#"
 let w1 = load_safetensors("first.safetensors")
 let w2 = load_safetensors("second.safetensors")
-"#);
+"#,
+        );
         assert_eq!(
             find_ast_weight_ref(&m, &ip),
             Some(PathBuf::from("first.safetensors"))

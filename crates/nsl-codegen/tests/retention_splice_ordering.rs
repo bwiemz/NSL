@@ -57,10 +57,11 @@ fn retention_splice_fires_when_arena_declared_before_method_codegen() {
     let source = TINY_MLP_FIXTURE;
 
     let mut interner = nsl_lexer::Interner::new();
-    let (tokens, lex_diags) =
-        nsl_lexer::tokenize(&source, nsl_errors::FileId(0), &mut interner);
+    let (tokens, lex_diags) = nsl_lexer::tokenize(&source, nsl_errors::FileId(0), &mut interner);
     assert!(
-        lex_diags.iter().all(|d| !matches!(d.level, nsl_errors::Level::Error)),
+        lex_diags
+            .iter()
+            .all(|d| !matches!(d.level, nsl_errors::Level::Error)),
         "fixture must lex cleanly: {lex_diags:?}"
     );
     let parsed = nsl_parser::parse(&tokens, &mut interner);
@@ -132,8 +133,7 @@ fn retention_splice_does_not_fire_without_calibration_retention() {
     let source = TINY_MLP_FIXTURE;
 
     let mut interner = nsl_lexer::Interner::new();
-    let (tokens, _) =
-        nsl_lexer::tokenize(source, nsl_errors::FileId(0), &mut interner);
+    let (tokens, _) = nsl_lexer::tokenize(source, nsl_errors::FileId(0), &mut interner);
     let parsed = nsl_parser::parse(&tokens, &mut interner);
     let analysis = nsl_semantic::analyze(&parsed.module, &mut interner);
 

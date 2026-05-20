@@ -290,10 +290,7 @@ fn link_gcc_multi(
         // `security-framework` crate); the symbols end up in
         // `libnsl_runtime.a` but Cargo's link directives don't reach this
         // standalone link step, so we add them explicitly.
-        cmd.args([
-            "-framework", "Security",
-            "-framework", "CoreFoundation",
-        ]);
+        cmd.args(["-framework", "Security", "-framework", "CoreFoundation"]);
     }
 
     // Link CUDA driver library if available (Linux: lib64/, Windows: lib/x64/)
@@ -749,10 +746,7 @@ fn link_shared_gcc(
             .unwrap_or_else(|| "15.5".to_string());
         cmd.args([format!("-Wl,-platform_version,macos,{sdk_ver},{sdk_ver}")]);
         // native-tls → security-framework (see `link_gcc_multi` comment).
-        cmd.args([
-            "-framework", "Security",
-            "-framework", "CoreFoundation",
-        ]);
+        cmd.args(["-framework", "Security", "-framework", "CoreFoundation"]);
     }
 
     // Link CUDA driver + cuBLAS libraries if available (Linux: lib64/, Windows: lib/x64/).
@@ -814,7 +808,9 @@ fn objs_contain_symbol(obj_paths: &[PathBuf], name: &str) -> bool {
     needle.extend_from_slice(name.as_bytes());
     needle.push(0);
     for p in obj_paths {
-        let Ok(bytes) = std::fs::read(p) else { continue };
+        let Ok(bytes) = std::fs::read(p) else {
+            continue;
+        };
         if bytes.windows(needle.len()).any(|w| w == needle) {
             return true;
         }

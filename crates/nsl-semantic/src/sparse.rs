@@ -7,8 +7,8 @@ use nsl_errors::Diagnostic;
 
 /// Parsed configuration from `@sparse(pattern="2:4")` or `@sparse(pattern="block", block_size=64)`.
 pub struct SparseConfig {
-    pub pattern: String,      // "2:4", "block"
-    pub block_size: usize,    // for pattern="block" (default 16)
+    pub pattern: String,   // "2:4", "block"
+    pub block_size: usize, // for pattern="block" (default 16)
 }
 
 /// Validate `@sparse` decorator arguments.
@@ -60,7 +60,8 @@ pub fn validate_sparse_decorator(
                             if *n <= 0 {
                                 diagnostics.push(
                                     Diagnostic::error(
-                                        "@sparse: block_size must be a positive integer".to_string(),
+                                        "@sparse: block_size must be a positive integer"
+                                            .to_string(),
                                     )
                                     .with_label(arg.span, "must be > 0"),
                                 );
@@ -121,7 +122,11 @@ mod tests {
     use nsl_ast::Span;
     use nsl_errors::{BytePos, FileId};
 
-    const ZERO_SPAN: Span = Span { file_id: FileId(0), start: BytePos(0), end: BytePos(0) };
+    const ZERO_SPAN: Span = Span {
+        file_id: FileId(0),
+        start: BytePos(0),
+        end: BytePos(0),
+    };
 
     fn make_sym(n: u32) -> Symbol {
         // Safety: we construct test symbols directly; in real code the interner handles this
@@ -181,10 +186,7 @@ mod tests {
     fn valid_block_pattern_with_size() {
         let deco = Decorator {
             name: vec![make_sym(0)],
-            args: Some(vec![
-                make_string_arg(10, "block"),
-                make_int_arg(11, 64),
-            ]),
+            args: Some(vec![make_string_arg(10, "block"), make_int_arg(11, 64)]),
             span: ZERO_SPAN,
         };
         let mut diags = vec![];
@@ -227,10 +229,7 @@ mod tests {
     fn block_size_on_non_block_warns() {
         let deco = Decorator {
             name: vec![make_sym(0)],
-            args: Some(vec![
-                make_string_arg(10, "2:4"),
-                make_int_arg(11, 32),
-            ]),
+            args: Some(vec![make_string_arg(10, "2:4"), make_int_arg(11, 32)]),
             span: ZERO_SPAN,
         };
         let mut diags = vec![];

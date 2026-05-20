@@ -180,7 +180,11 @@ pub(crate) fn tensor_elementwise_op(a_ptr: i64, b_ptr: i64, op: fn(f64, f64) -> 
 }
 
 /// Elementwise binary op with NumPy-style broadcasting (f32 path).
-pub(crate) fn tensor_elementwise_op_f32_impl(a_ptr: i64, b_ptr: i64, op: impl Fn(f32, f32) -> f32) -> i64 {
+pub(crate) fn tensor_elementwise_op_f32_impl(
+    a_ptr: i64,
+    b_ptr: i64,
+    op: impl Fn(f32, f32) -> f32,
+) -> i64 {
     let a = NslTensor::from_ptr(a_ptr);
     let b = NslTensor::from_ptr(b_ptr);
 
@@ -612,11 +616,7 @@ pub extern "C" fn nsl_fused_elementwise_2(
 /// Fused unary elementwise: applies chain of unary ops to a single input.
 /// Example: sigmoid(neg(x)) → ops=[NEG, SIGMOID]
 #[no_mangle]
-pub extern "C" fn nsl_fused_elementwise_1(
-    a_ptr: i64,
-    ops_ptr: i64,
-    num_ops: i64,
-) -> i64 {
+pub extern "C" fn nsl_fused_elementwise_1(a_ptr: i64, ops_ptr: i64, num_ops: i64) -> i64 {
     let a = NslTensor::from_ptr(a_ptr);
     let ops_list = crate::list::NslList::from_ptr(ops_ptr);
 
@@ -779,14 +779,7 @@ const TILE_N: usize = 64;
 ///
 /// Tile loop order: jj (N tiles) -> kk (K tiles) -> ii (M tiles)
 /// Inner loop order: i -> k -> j (maximizes B-tile reuse in registers)
-pub fn tiled_matmul_f64(
-    a: *const f64,
-    b: *const f64,
-    c: *mut f64,
-    m: usize,
-    k: usize,
-    n: usize,
-) {
+pub fn tiled_matmul_f64(a: *const f64, b: *const f64, c: *mut f64, m: usize, k: usize, n: usize) {
     unsafe {
         let mut jj = 0;
         while jj < n {
@@ -815,14 +808,7 @@ pub fn tiled_matmul_f64(
 }
 
 /// Cache-tiled matrix multiply for f32: C[m,n] += A[m,k] @ B[k,n]
-pub fn tiled_matmul_f32(
-    a: *const f32,
-    b: *const f32,
-    c: *mut f32,
-    m: usize,
-    k: usize,
-    n: usize,
-) {
+pub fn tiled_matmul_f32(a: *const f32, b: *const f32, c: *mut f32, m: usize, k: usize, n: usize) {
     unsafe {
         let mut jj = 0;
         while jj < n {
@@ -878,17 +864,16 @@ pub(crate) fn create_tensor_with_shape_rs_dtype(shape: &[i64], dtype: u16) -> i6
         total *= s;
     }
 
-    let shape_ptr =
-        checked_alloc(std::mem::size_of_val(shape)) as *mut i64;
+    let shape_ptr = checked_alloc(std::mem::size_of_val(shape)) as *mut i64;
     for (i, &s) in shape.iter().enumerate() {
         unsafe { *shape_ptr.add(i) = s };
     }
     let strides = NslTensor::compute_strides(shape_ptr, ndim);
 
     let elem_size = match dtype {
-        1 => std::mem::size_of::<f32>(),    // f32
-        4 => std::mem::size_of::<i32>(),    // i32 (token IDs)
-        _ => std::mem::size_of::<f64>(),    // f64 (default)
+        1 => std::mem::size_of::<f32>(), // f32
+        4 => std::mem::size_of::<i32>(), // i32 (token IDs)
+        _ => std::mem::size_of::<f64>(), // f64 (default)
     };
     let data = checked_alloc_zeroed((total as usize) * elem_size);
 
@@ -915,9 +900,7 @@ mod matmul_tests {
         // 2x3 @ 3x4 = 2x4
         let a: Vec<f64> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
         let b: Vec<f64> = vec![
-            7.0, 8.0, 9.0, 10.0,
-            11.0, 12.0, 13.0, 14.0,
-            15.0, 16.0, 17.0, 18.0,
+            7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0, 17.0, 18.0,
         ];
         let mut c = vec![0.0f64; 8];
 
@@ -961,8 +944,13 @@ mod matmul_tests {
         }
 
         for i in 0..m * n {
-            assert!((c_tiled[i] - c_naive[i]).abs() < 1e-6,
-                "mismatch at {}: {} vs {}", i, c_tiled[i], c_naive[i]);
+            assert!(
+                (c_tiled[i] - c_naive[i]).abs() < 1e-6,
+                "mismatch at {}: {} vs {}",
+                i,
+                c_tiled[i],
+                c_naive[i]
+            );
         }
     }
 
@@ -989,8 +977,13 @@ mod matmul_tests {
         }
 
         for i in 0..m * n {
-            assert!((c_tiled[i] - c_naive[i]).abs() < 1e-6,
-                "mismatch at {}: {} vs {}", i, c_tiled[i], c_naive[i]);
+            assert!(
+                (c_tiled[i] - c_naive[i]).abs() < 1e-6,
+                "mismatch at {}: {} vs {}",
+                i,
+                c_tiled[i],
+                c_naive[i]
+            );
         }
     }
 

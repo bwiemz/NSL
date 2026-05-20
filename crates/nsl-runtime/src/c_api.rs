@@ -10,8 +10,8 @@ use std::ffi::{c_void, CStr};
 use std::os::raw::c_char;
 
 use crate::dlpack::DLManagedTensor;
-use crate::tensor::NslTensor;
 use crate::memory::checked_alloc;
+use crate::tensor::NslTensor;
 
 // ---------------------------------------------------------------------------
 // NslTensorDesc — C API tensor descriptor
@@ -234,7 +234,9 @@ pub extern "C" fn nsl_model_destroy(model_ptr: i64) -> i64 {
     if model_ptr == 0 {
         return 0;
     }
-    unsafe { drop(Box::from_raw(model_ptr as *mut NslModel)); }
+    unsafe {
+        drop(Box::from_raw(model_ptr as *mut NslModel));
+    }
     0
 }
 
@@ -310,7 +312,10 @@ pub extern "C" fn nsl_model_forward(
     let forward_fn = match &model.forward_fn {
         Some(f) => f,
         None => {
-            set_error("nsl_model_forward: no forward function registered (use nsl_model_set_forward)\0".to_string());
+            set_error(
+                "nsl_model_forward: no forward function registered (use nsl_model_set_forward)\0"
+                    .to_string(),
+            );
             return -1;
         }
     };
@@ -324,17 +329,16 @@ pub extern "C" fn nsl_model_forward(
         for (idx, desc) in descs.iter().enumerate() {
             capi_trace(format!(
                 "model_forward import input={} ndim={} dtype={} shape_ptr={:?} strides_ptr={:?}",
-                idx,
-                desc.ndim,
-                desc.dtype,
-                desc.shape,
-                desc.strides
+                idx, desc.ndim, desc.dtype, desc.shape, desc.strides
             ));
             let tensor_ptr = desc_to_nsl_tensor(desc);
             input_ptrs.push(tensor_ptr);
         }
     }
-    capi_trace(format!("model_forward imported_inputs={}", input_ptrs.len()));
+    capi_trace(format!(
+        "model_forward imported_inputs={}",
+        input_ptrs.len()
+    ));
 
     // If grad recording is enabled, start the tape over the weight parameters
     // so that the backward pass can replay it.
@@ -351,7 +355,10 @@ pub extern "C" fn nsl_model_forward(
     // Call forward function
     capi_trace("model_forward invoke_forward");
     let output_tensor_ptrs = forward_fn(&model.weight_ptrs, &input_ptrs);
-    capi_trace(format!("model_forward outputs={}", output_tensor_ptrs.len()));
+    capi_trace(format!(
+        "model_forward outputs={}",
+        output_tensor_ptrs.len()
+    ));
 
     // Save forward outputs for the backward pass (before writing to output descs,
     // since nsl_tensor_to_desc only borrows the pointer — the tensor stays alive).
@@ -412,7 +419,10 @@ pub extern "C" fn nsl_model_forward_dlpack(
     let mut input_ptrs = Vec::with_capacity(num_inputs as usize);
     if num_inputs > 0 && inputs_ptr != 0 {
         let dlpacks = unsafe {
-            std::slice::from_raw_parts(inputs_ptr as *const *mut DLManagedTensor, num_inputs as usize)
+            std::slice::from_raw_parts(
+                inputs_ptr as *const *mut DLManagedTensor,
+                num_inputs as usize,
+            )
         };
         for &dlpack in dlpacks {
             if dlpack.is_null() {
@@ -440,7 +450,9 @@ pub extern "C" fn nsl_model_forward_dlpack(
             for (i, &tensor_ptr) in output_tensor_ptrs.iter().enumerate() {
                 let tensor = NslTensor::from_ptr(tensor_ptr);
                 let dlpack = crate::dlpack::nsl_tensor_to_dlpack(tensor, tensor_ptr);
-                unsafe { *arr.add(i) = dlpack; }
+                unsafe {
+                    *arr.add(i) = dlpack;
+                }
             }
             *out_array = unsafe { *arr }; // point to first element
         }
@@ -468,7 +480,9 @@ pub extern "C" fn nsl_model_get_version() -> i64 {
 /// Get the number of weight tensors in the model.
 #[no_mangle]
 pub extern "C" fn nsl_model_num_weights(model_ptr: i64) -> i64 {
-    if model_ptr == 0 { return 0; }
+    if model_ptr == 0 {
+        return 0;
+    }
     let model = unsafe { &*(model_ptr as *const NslModel) };
     model.weight_ptrs.len() as i64
 }
@@ -488,7 +502,9 @@ pub extern "C" fn nsl_model_get_num_weights(model_ptr: i64) -> i64 {
 /// compiled impl function.
 #[no_mangle]
 pub extern "C" fn nsl_model_get_weight_ptrs(model_ptr: i64) -> i64 {
-    if model_ptr == 0 { return 0; }
+    if model_ptr == 0 {
+        return 0;
+    }
     let model = unsafe { &*(model_ptr as *const NslModel) };
     if model.weight_ptrs.is_empty() {
         return 0;
@@ -499,14 +515,19 @@ pub extern "C" fn nsl_model_get_weight_ptrs(model_ptr: i64) -> i64 {
 /// Get a weight tensor by name. Returns NslTensor pointer or 0 if not found.
 #[no_mangle]
 pub extern "C" fn nsl_model_get_weight(model_ptr: i64, name_ptr: i64, name_len: i64) -> i64 {
-    if model_ptr == 0 || name_ptr == 0 { return 0; }
+    if model_ptr == 0 || name_ptr == 0 {
+        return 0;
+    }
     let model = unsafe { &*(model_ptr as *const NslModel) };
     let name = unsafe {
         let slice = std::slice::from_raw_parts(name_ptr as *const u8, name_len as usize);
         std::str::from_utf8_unchecked(slice)
     };
     let weight = model.weights.get(name).copied().unwrap_or(0);
-    capi_trace(format!("model_get_weight name={name} found={}", weight != 0));
+    capi_trace(format!(
+        "model_get_weight name={name} found={}",
+        weight != 0
+    ));
     weight
 }
 
@@ -532,8 +553,7 @@ fn _gap_i_compile_note(model_ptr: i64) -> i64 {
 /// Load weights from a safetensors file.
 #[cfg(feature = "interop")]
 fn load_safetensors_weights(path: &str) -> Result<(HashMap<String, i64>, Vec<i64>), String> {
-    let data = std::fs::read(path)
-        .map_err(|e| format!("failed to read '{path}': {e}"))?;
+    let data = std::fs::read(path).map_err(|e| format!("failed to read '{path}': {e}"))?;
 
     let tensors = safetensors::SafeTensors::deserialize(&data)
         .map_err(|e| format!("failed to parse safetensors '{path}': {e}"))?;
@@ -560,7 +580,9 @@ fn load_safetensors_weights(path: &str) -> Result<(HashMap<String, i64>, Vec<i64
 
         let shape_ptr = checked_alloc(ndim * std::mem::size_of::<i64>()) as *mut i64;
         for (i, &s) in shape.iter().enumerate() {
-            unsafe { *shape_ptr.add(i) = s; }
+            unsafe {
+                *shape_ptr.add(i) = s;
+            }
         }
         let strides = NslTensor::compute_strides(shape_ptr, ndim as i64);
 
@@ -626,7 +648,9 @@ fn convert_weight_to_f32(dtype: safetensors::Dtype, data: &[u8], len: usize) -> 
 /// Fallback when interop feature is not enabled — cannot load safetensors.
 #[cfg(not(feature = "interop"))]
 fn load_safetensors_weights(path: &str) -> Result<(HashMap<String, i64>, Vec<i64>), String> {
-    Err(format!("safetensors loading requires --features interop (path: '{path}')"))
+    Err(format!(
+        "safetensors loading requires --features interop (path: '{path}')"
+    ))
 }
 
 /// Public wrapper for `desc_to_nsl_tensor` — used by disaggregated workers
@@ -687,13 +711,14 @@ fn desc_to_nsl_tensor(desc: &NslTensorDesc) -> i64 {
     };
 
     let len = NslTensor::total_elements(shape_ptr, desc.ndim as i64);
-    let device = if desc.device_type > 0 { desc.device_id as u8 + 1 } else { 0 };
+    let device = if desc.device_type > 0 {
+        desc.device_id as u8 + 1
+    } else {
+        0
+    };
     capi_trace(format!(
         "desc_to_tensor ndim={} len={} device={} dtype={}",
-        desc.ndim,
-        len,
-        device,
-        nsl_dtype
+        desc.ndim, len, device, nsl_dtype
     ));
 
     let tensor = Box::new(NslTensor::new(
@@ -717,7 +742,11 @@ fn nsl_tensor_to_desc(tensor_ptr: i64, desc: &mut NslTensorDesc) {
     desc.ndim = tensor.ndim as i32;
     desc.dtype = nsl_dtype_to_capi(tensor.dtype);
     desc.device_type = if tensor.device > 0 { 1 } else { 0 };
-    desc.device_id = if tensor.device > 0 { (tensor.device - 1) as i32 } else { 0 };
+    desc.device_id = if tensor.device > 0 {
+        (tensor.device - 1) as i32
+    } else {
+        0
+    };
     desc.shape = tensor.shape;
     desc.strides = tensor.strides;
 }
@@ -948,9 +977,13 @@ mod tests {
 
         // Read back via desc
         let mut out_desc = NslTensorDesc {
-            data: std::ptr::null_mut(), shape: std::ptr::null_mut(),
-            strides: std::ptr::null_mut(), ndim: 0, dtype: 0,
-            device_type: 0, device_id: 0,
+            data: std::ptr::null_mut(),
+            shape: std::ptr::null_mut(),
+            strides: std::ptr::null_mut(),
+            ndim: 0,
+            dtype: 0,
+            device_type: 0,
+            device_id: 0,
         };
         nsl_tensor_to_desc(tensor_ptr, &mut out_desc);
         assert_eq!(out_desc.ndim, 2);
@@ -1000,9 +1033,14 @@ mod tests {
         // Error message should mention enable_grad.
         let err_ptr = nsl_get_last_error() as *const std::os::raw::c_char;
         let err_msg = unsafe { CStr::from_ptr(err_ptr) }.to_str().unwrap_or("");
-        assert!(err_msg.contains("grad not enabled"), "unexpected error: {err_msg}");
+        assert!(
+            err_msg.contains("grad not enabled"),
+            "unexpected error: {err_msg}"
+        );
 
-        unsafe { drop(Box::from_raw(model_ptr as *mut NslModel)); }
+        unsafe {
+            drop(Box::from_raw(model_ptr as *mut NslModel));
+        }
         nsl_clear_error();
     }
 
@@ -1025,9 +1063,14 @@ mod tests {
 
         let err_ptr = nsl_get_last_error() as *const std::os::raw::c_char;
         let err_msg = unsafe { CStr::from_ptr(err_ptr) }.to_str().unwrap_or("");
-        assert!(err_msg.contains("no forward pass recorded"), "unexpected error: {err_msg}");
+        assert!(
+            err_msg.contains("no forward pass recorded"),
+            "unexpected error: {err_msg}"
+        );
 
-        unsafe { drop(Box::from_raw(model_ptr as *mut NslModel)); }
+        unsafe {
+            drop(Box::from_raw(model_ptr as *mut NslModel));
+        }
         nsl_clear_error();
     }
 
@@ -1053,15 +1096,19 @@ mod tests {
         nsl_set_error_cstr(0);
         // Should not panic; clear_error still works after
         let err_ptr = nsl_get_last_error();
-        let err_msg = unsafe { CStr::from_ptr(err_ptr as *const c_char).to_str().unwrap_or("") };
+        let err_msg = unsafe {
+            CStr::from_ptr(err_ptr as *const c_char)
+                .to_str()
+                .unwrap_or("")
+        };
         assert_eq!(err_msg, "");
     }
 
     #[test]
     fn test_backward_with_tape_e2e() {
-        use std::ffi::c_void;
         use crate::memory::checked_alloc;
         use crate::tensor::NslTensor;
+        use std::ffi::c_void;
 
         // Build a single-weight model: weight = [2.0] (f64 scalar).
         // forward(w) = w * 3  → loss = w * 3
@@ -1077,9 +1124,9 @@ mod tests {
             weight_strides,
             1,
             1,
-            0,  // CPU
-            0,  // f64
-            1,  // owns_data
+            0, // CPU
+            0, // f64
+            1, // owns_data
             0,
         ));
         let weight_ptr = Box::into_raw(weight_tensor) as i64;
@@ -1118,7 +1165,6 @@ mod tests {
         nsl_model_destroy(model_ptr);
     }
 
-
     #[test]
     fn nsl_model_get_weight_ptrs_returns_valid_pointer() {
         // Create a model with a single weight pointer.
@@ -1149,7 +1195,7 @@ mod tests {
         let mut model = Box::new(NslModel {
             version: 2,
             weights: HashMap::new(),
-            weight_ptrs: vec![0x100, 0x200, 0x300],  // Use larger values to avoid null-like misalignment
+            weight_ptrs: vec![0x100, 0x200, 0x300], // Use larger values to avoid null-like misalignment
             forward_fn: None,
             weights_path: String::new(),
             grad_enabled: false,

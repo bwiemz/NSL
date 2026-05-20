@@ -34,7 +34,9 @@ unsafe impl Sync for CudaEventClock {}
 
 impl CudaEventClock {
     pub fn new() -> Self {
-        Self { pool: Mutex::new(Vec::with_capacity(128)) }
+        Self {
+            pool: Mutex::new(Vec::with_capacity(128)),
+        }
     }
 
     /// Get a `CUevent` from the pool (or create a fresh one), returned as a
@@ -63,7 +65,9 @@ impl CudaEventClock {
 }
 
 impl Default for CudaEventClock {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ClockSource for CudaEventClock {

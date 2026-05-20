@@ -13,8 +13,7 @@
 //! for an RTX 5070 Ti and an H100 will receive different placements.
 
 use crate::cost_model::{
-    arithmetic_intensity, classify_op, matmul_cost, rmsnorm_cost, softmax_cost,
-    BoundClassification,
+    arithmetic_intensity, classify_op, matmul_cost, rmsnorm_cost, softmax_cost, BoundClassification,
 };
 use crate::gpu_specs::GpuSpec;
 use serde::{Deserialize, Serialize};
@@ -216,7 +215,11 @@ pub fn place_adapters(
             let ai = arithmetic_intensity(flops, br, bw);
             let ridge = gpu.crossover(site.dtype_bytes as usize);
             let class = classify_op(ai, ridge);
-            let slack = if ridge > 0.0 { ridge / ai.max(1e-12) } else { 1.0 };
+            let slack = if ridge > 0.0 {
+                ridge / ai.max(1e-12)
+            } else {
+                1.0
+            };
             let (kind, rank, why) = choose_adapter(class, site.kind, r_min, r_max);
             AdapterPlacement {
                 name: site.name.clone(),
@@ -246,19 +249,18 @@ mod tests {
 
     fn test_gpu() -> &'static GpuSpec {
         // Prefer H100 if present, otherwise first entry.
-        find_gpu("H100").or_else(|| find_gpu("h100")).unwrap_or(&GPU_DATABASE[0])
+        find_gpu("H100")
+            .or_else(|| find_gpu("h100"))
+            .unwrap_or(&GPU_DATABASE[0])
     }
 
     #[test]
     fn small_softmax_is_memory_bound_and_gets_ia3() {
         let gpu = test_gpu();
-        let sites = vec![AdapterSite::new(
-            "blocks.6.softmax",
-            SiteKind::Softmax,
-            vec![128],
-            2,
-        )
-        .with_batch(32, 512)];
+        let sites = vec![
+            AdapterSite::new("blocks.6.softmax", SiteKind::Softmax, vec![128], 2)
+                .with_batch(32, 512),
+        ];
         let plan = place_adapters(&sites, gpu, 2, 16);
         assert_eq!(plan.len(), 1);
         assert_eq!(plan[0].classification, BoundClassification::MemoryBound);
@@ -269,13 +271,10 @@ mod tests {
     fn compute_bound_matmul_gets_small_rank_or_skip() {
         let gpu = test_gpu();
         // Large matmul at batch×seq = 32×1024 — tensor cores saturate.
-        let sites = vec![AdapterSite::new(
-            "blocks.6.wq",
-            SiteKind::Matmul,
-            vec![4096, 4096],
-            2,
-        )
-        .with_batch(32, 1024)];
+        let sites = vec![
+            AdapterSite::new("blocks.6.wq", SiteKind::Matmul, vec![4096, 4096], 2)
+                .with_batch(32, 1024),
+        ];
         let plan = place_adapters(&sites, gpu, 2, 16);
         let p = &plan[0];
         // Must either be compute-bound with minimal rank, or classified
@@ -291,13 +290,9 @@ mod tests {
     #[test]
     fn norm_is_memory_bound_ia3() {
         let gpu = test_gpu();
-        let sites = vec![AdapterSite::new(
-            "blocks.6.norm",
-            SiteKind::Norm,
-            vec![512],
-            2,
-        )
-        .with_batch(8, 128)];
+        let sites = vec![
+            AdapterSite::new("blocks.6.norm", SiteKind::Norm, vec![512], 2).with_batch(8, 128),
+        ];
         let plan = place_adapters(&sites, gpu, 2, 16);
         assert_eq!(plan[0].adapter, AdapterKind::Ia3);
     }
@@ -306,13 +301,8 @@ mod tests {
     fn roofline_slack_monotonic_with_bound() {
         let gpu = test_gpu();
         let mem_bound = AdapterSite::new("norm", SiteKind::Norm, vec![512], 2).with_batch(2, 64);
-        let comp_bound = AdapterSite::new(
-            "big_mm",
-            SiteKind::Matmul,
-            vec![4096, 4096],
-            2,
-        )
-        .with_batch(32, 1024);
+        let comp_bound =
+            AdapterSite::new("big_mm", SiteKind::Matmul, vec![4096, 4096], 2).with_batch(32, 1024);
         let plan = place_adapters(&[mem_bound, comp_bound], gpu, 2, 16);
         // Memory-bound site should have larger slack (ridge/ai) than the
         // compute-bound one.
@@ -324,12 +314,7 @@ mod tests {
         // A zero-sized matmul produces flops=0 → ai=0 → classification Memory
         // (ai < 0.8·ridge).  Make sure we don't explode.
         let gpu = test_gpu();
-        let sites = vec![AdapterSite::new(
-            "noop",
-            SiteKind::Matmul,
-            vec![0, 0],
-            2,
-        )];
+        let sites = vec![AdapterSite::new("noop", SiteKind::Matmul, vec![0, 0], 2)];
         let plan = place_adapters(&sites, gpu, 2, 16);
         assert_eq!(plan.len(), 1);
         // AI is 0 → memory-bound classification; we pick LoRA r=max.  Just

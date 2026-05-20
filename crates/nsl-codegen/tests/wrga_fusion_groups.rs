@@ -1,4 +1,4 @@
-use nsl_codegen::wrga_fusion::{FusionPlan, build_fusion_plan};
+use nsl_codegen::wrga_fusion::{build_fusion_plan, FusionPlan};
 use std::collections::HashMap;
 
 fn nid(n: u32) -> nsl_ast::NodeId {

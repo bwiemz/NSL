@@ -139,7 +139,10 @@ impl Default for DpConfig {
 /// Candidate transitions the DP considers for one layer.
 fn candidate_decisions(layer: &Layer, cfg: &DpConfig) -> Vec<LayerDecision> {
     let mut out = vec![LayerDecision::KeepFull];
-    if layer.role == LayerRole::Block || layer.role == LayerRole::Attention || layer.role == LayerRole::Ffn {
+    if layer.role == LayerRole::Block
+        || layer.role == LayerRole::Attention
+        || layer.role == LayerRole::Ffn
+    {
         let score = cfg
             .importance
             .per_layer
@@ -281,7 +284,11 @@ mod tests {
                 role: LayerRole::Block,
                 op_indices: vec![i as u32],
                 param_names: vec![format!("blocks.{i}.wq")],
-                depends_on: if i == 0 { Vec::new() } else { vec![(i - 1) as u32] },
+                depends_on: if i == 0 {
+                    Vec::new()
+                } else {
+                    vec![(i - 1) as u32]
+                },
             });
         }
         OptGraph {

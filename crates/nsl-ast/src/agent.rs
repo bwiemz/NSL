@@ -1,11 +1,11 @@
 //! M56: Agent declaration AST nodes. Mirrors `ModelDef`/`ModelMember` (see
 //! `decl.rs:48-66`) with agent-specific ownership markers and port derivation.
 
-use serde::Serialize;
 use crate::decl::{Decorator, FnDef, Param, TypeParam};
-use crate::types::TypeExpr;
 use crate::expr::Expr;
+use crate::types::TypeExpr;
 use crate::{Span, Symbol};
+use serde::Serialize;
 
 /// An `agent Name(params): <members>` declaration.
 #[derive(Debug, Clone, Serialize)]

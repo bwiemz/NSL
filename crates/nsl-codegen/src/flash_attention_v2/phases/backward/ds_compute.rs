@@ -52,7 +52,8 @@ pub fn emit_d_correction(ptx: &mut String, config: &FlashAttentionConfig, q_tile
          d_per_lane={d_per_lane})\n"
     ));
     ptx.push_str(&format!(
-        "    add.u32 %r0, %warp_id, {}; // warp_row\n", q_tile_iter * 4
+        "    add.u32 %r0, %warp_id, {}; // warp_row\n",
+        q_tile_iter * 4
     ));
     ptx.push_str("    cvt.u64.u32 %warp_row, %r0;\n");
     ptx.push_str("    add.u64 %rd39, %q_start, %warp_row;\n");
@@ -127,7 +128,7 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
     );
     let head_dim = config.head_dim as u32;
     let block_kv = config.block_kv as u32;
-    let row_stride_bytes = head_dim * 2;  // f16 row stride in Q/K/V SMEM tiles
+    let row_stride_bytes = head_dim * 2; // f16 row stride in Q/K/V SMEM tiles
     let p_offset = backward_p_offset(config);
     let ds_offset = backward_ds_offset(config);
 
@@ -254,9 +255,7 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
 
     // ── dP[row, lane] = dO[row, :] · V[lane, :] ────────────────────────────
     ptx.push_str("    setp.ge.u64 %p0, %rd39, %rd6;\n");
-    ptx.push_str(&format!(
-        "    @%p0 bra V2_BWD_DP_ZERO_{q_tile_iter};\n"
-    ));
+    ptx.push_str(&format!("    @%p0 bra V2_BWD_DP_ZERO_{q_tile_iter};\n"));
     ptx.push_str("    mov.f32 %f_dP, 0f00000000;\n");
     // dO[warp_row, d] base in HBM:
     //   row_idx_bytes (computed into %rd46) =
@@ -300,7 +299,8 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
 
     ptx.push_str("    shl.b64 %rd45, %warp_row, 2;\n");
     ptx.push_str(&format!(
-        "    add.u64 %rd45, %rd45, {};\n", backward_rms_strip_offset(config)
+        "    add.u64 %rd45, %rd45, {};\n",
+        backward_rms_strip_offset(config)
     ));
     ptx.push_str("    add.u64 %rd45, %shmem_base, %rd45;\n");
     ptx.push_str("    ld.shared.f32 %f_rowsum_dP_P, [%rd45];\n");
@@ -314,10 +314,7 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
     ptx.push_str("    mul.f32 %f_dS, %f_P, %f0;\n");
 
     // SMEM slot: backward_ds_offset + (warp_row * block_kv + lane) * 4
-    ptx.push_str(&format!(
-        "    mul.lo.u64 %rd44, %warp_row, {};\n",
-        block_kv
-    ));
+    ptx.push_str(&format!("    mul.lo.u64 %rd44, %warp_row, {};\n", block_kv));
     ptx.push_str("    cvt.u64.u32 %rd45, %lane;\n");
     ptx.push_str("    add.u64 %rd44, %rd44, %rd45;\n");
     ptx.push_str("    shl.b64 %rd44, %rd44, 2;\n");
@@ -336,14 +333,24 @@ mod tests {
     use crate::flash_attention::{CshaExtras, FlashAttentionConfig, RopeStyle};
 
     fn base_cfg_fused_backward(
-        block_q: i64, block_kv: i64, head_dim: i64, heads: u32, d_model: u32,
+        block_q: i64,
+        block_kv: i64,
+        head_dim: i64,
+        heads: u32,
+        d_model: u32,
     ) -> FlashAttentionConfig {
         let _ = heads;
         FlashAttentionConfig {
-            block_q, block_kv, head_dim,
-            causal: false, paged: false, rope_q: false,
+            block_q,
+            block_kv,
+            head_dim,
+            causal: false,
+            paged: false,
+            rope_q: false,
             rope_style: RopeStyle::HalfSplit,
-            gqa_group_size: 1, tree_mask: false, gpu_sm: 75,
+            gqa_group_size: 1,
+            tree_mask: false,
+            gpu_sm: 75,
             segment_masked: false,
             csha: Some(CshaExtras {
                 fused_projections: true,
@@ -372,13 +379,19 @@ mod tests {
         // (pre-KV-loop correction strip); `emit` reads the correction
         // from the SMEM strip rather than re-reducing.
         assert!(ptx.contains("%f_dS"));
-        assert!(ptx.contains("%f_rowsum_dP_P"),
-            "dS must consume the pre-reduced correction strip");
+        assert!(
+            ptx.contains("%f_rowsum_dP_P"),
+            "dS must consume the pre-reduced correction strip"
+        );
         // Real SMEM addressing (not placeholder constants):
-        assert!(ptx.contains("ld.shared.b16 %h0"),
-            "must read Q/K/V from SMEM");
-        assert!(ptx.contains("%rd_bwd_do"),
-            "dP must read dO from HBM (not placeholder)");
+        assert!(
+            ptx.contains("ld.shared.b16 %h0"),
+            "must read Q/K/V from SMEM"
+        );
+        assert!(
+            ptx.contains("%rd_bwd_do"),
+            "dP must read dO from HBM (not placeholder)"
+        );
     }
 
     #[test]

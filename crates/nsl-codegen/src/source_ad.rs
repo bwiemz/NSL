@@ -341,11 +341,12 @@ impl AdjointGenerator {
                                     launch_inputs.push(v.wq_var); // [6]
                                     launch_inputs.push(v.wk_var); // [7]
                                     launch_inputs.push(v.wv_var); // [8]
-                                    // Null (VarId 0) when the RMSNorm
-                                    // has no trainable gamma param. The
-                                    // backward PTX null-guards on
-                                    // `csha_norm_weight_ptr`.
-                                    launch_inputs.push(v.norm_weight_var.unwrap_or(0)); // [9]
+                                                                  // Null (VarId 0) when the RMSNorm
+                                                                  // has no trainable gamma param. The
+                                                                  // backward PTX null-guards on
+                                                                  // `csha_norm_weight_ptr`.
+                                    launch_inputs.push(v.norm_weight_var.unwrap_or(0));
+                                    // [9]
                                 }
 
                                 let launch_result = self.emit_op(
@@ -419,8 +420,7 @@ impl AdjointGenerator {
                                     // Gap D.1 contract for chains without a
                                     // trainable RMSNorm (no x_raw_var
                                     // resolution is performed in that case).
-                                    let x_raw_target =
-                                        v.x_raw_var.unwrap_or(v.x_norm_var);
+                                    let x_raw_target = v.x_raw_var.unwrap_or(v.x_norm_var);
                                     self.accumulate_adjoint(x_raw_target, extract_results[6]);
                                     self.accumulate_adjoint(v.x_norm_var, extract_results[7]);
 
@@ -475,10 +475,7 @@ impl AdjointGenerator {
                                             "[nsl] CSHA fused backward: emitted dgamma \
                                              (NormGammaBackward) for layer '{}' → \
                                              gamma VarId {} (x_raw VarId {}, eps={:e})",
-                                            mark_layer,
-                                            gamma_var,
-                                            x_raw_var,
-                                            v.rmsnorm_eps,
+                                            mark_layer, gamma_var, x_raw_var, v.rmsnorm_eps,
                                         );
                                     }
                                 } else {
@@ -553,11 +550,41 @@ impl AdjointGenerator {
                 let dy_sc = self.emit_op(PrimalOp::Mul, vec![dy, scale_c]);
                 let xa = self.emit_op(PrimalOp::Matmul, vec![x, a]);
 
-                let x_t = self.emit_op(PrimalOp::Transpose { dim0: usize::MAX - 1, dim1: usize::MAX }, vec![x]);
-                let w_t = self.emit_op(PrimalOp::Transpose { dim0: usize::MAX - 1, dim1: usize::MAX }, vec![w]);
-                let a_t = self.emit_op(PrimalOp::Transpose { dim0: usize::MAX - 1, dim1: usize::MAX }, vec![a]);
-                let b_t = self.emit_op(PrimalOp::Transpose { dim0: usize::MAX - 1, dim1: usize::MAX }, vec![b_in]);
-                let xa_t = self.emit_op(PrimalOp::Transpose { dim0: usize::MAX - 1, dim1: usize::MAX }, vec![xa]);
+                let x_t = self.emit_op(
+                    PrimalOp::Transpose {
+                        dim0: usize::MAX - 1,
+                        dim1: usize::MAX,
+                    },
+                    vec![x],
+                );
+                let w_t = self.emit_op(
+                    PrimalOp::Transpose {
+                        dim0: usize::MAX - 1,
+                        dim1: usize::MAX,
+                    },
+                    vec![w],
+                );
+                let a_t = self.emit_op(
+                    PrimalOp::Transpose {
+                        dim0: usize::MAX - 1,
+                        dim1: usize::MAX,
+                    },
+                    vec![a],
+                );
+                let b_t = self.emit_op(
+                    PrimalOp::Transpose {
+                        dim0: usize::MAX - 1,
+                        dim1: usize::MAX,
+                    },
+                    vec![b_in],
+                );
+                let xa_t = self.emit_op(
+                    PrimalOp::Transpose {
+                        dim0: usize::MAX - 1,
+                        dim1: usize::MAX,
+                    },
+                    vec![xa],
+                );
 
                 let dw = self.emit_op(PrimalOp::Matmul, vec![x_t, dy]);
                 self.accumulate_adjoint(w, dw);
@@ -594,8 +621,20 @@ impl AdjointGenerator {
                 let xw = self.emit_op(PrimalOp::Matmul, vec![x, w]);
                 let dxw = self.emit_op(PrimalOp::Mul, vec![dy, gamma]);
 
-                let x_t = self.emit_op(PrimalOp::Transpose { dim0: usize::MAX - 1, dim1: usize::MAX }, vec![x]);
-                let w_t = self.emit_op(PrimalOp::Transpose { dim0: usize::MAX - 1, dim1: usize::MAX }, vec![w]);
+                let x_t = self.emit_op(
+                    PrimalOp::Transpose {
+                        dim0: usize::MAX - 1,
+                        dim1: usize::MAX,
+                    },
+                    vec![x],
+                );
+                let w_t = self.emit_op(
+                    PrimalOp::Transpose {
+                        dim0: usize::MAX - 1,
+                        dim1: usize::MAX,
+                    },
+                    vec![w],
+                );
 
                 let dw = self.emit_op(PrimalOp::Matmul, vec![x_t, dxw]);
                 self.accumulate_adjoint(w, dw);
@@ -653,23 +692,53 @@ impl AdjointGenerator {
                 let scale_c = self.emit_constant(scale as f64);
                 let dy_sig_sc = self.emit_op(PrimalOp::Mul, vec![dy_sig, scale_c]);
 
-                let x_t = self.emit_op(PrimalOp::Transpose { dim0: usize::MAX - 1, dim1: usize::MAX }, vec![x]);
+                let x_t = self.emit_op(
+                    PrimalOp::Transpose {
+                        dim0: usize::MAX - 1,
+                        dim1: usize::MAX,
+                    },
+                    vec![x],
+                );
                 let dw = self.emit_op(PrimalOp::Matmul, vec![x_t, dy]);
                 self.accumulate_adjoint(w, dw);
 
-                let b_t = self.emit_op(PrimalOp::Transpose { dim0: usize::MAX - 1, dim1: usize::MAX }, vec![b_in]);
+                let b_t = self.emit_op(
+                    PrimalOp::Transpose {
+                        dim0: usize::MAX - 1,
+                        dim1: usize::MAX,
+                    },
+                    vec![b_in],
+                );
                 let xt_dysigsc = self.emit_op(PrimalOp::Matmul, vec![x_t, dy_sig_sc]);
                 let da = self.emit_op(PrimalOp::Matmul, vec![xt_dysigsc, b_t]);
                 self.accumulate_adjoint(a, da);
 
-                let xa_t = self.emit_op(PrimalOp::Transpose { dim0: usize::MAX - 1, dim1: usize::MAX }, vec![xa]);
+                let xa_t = self.emit_op(
+                    PrimalOp::Transpose {
+                        dim0: usize::MAX - 1,
+                        dim1: usize::MAX,
+                    },
+                    vec![xa],
+                );
                 let db = self.emit_op(PrimalOp::Matmul, vec![xa_t, dy_sig_sc]);
                 self.accumulate_adjoint(b_in, db);
 
-                let w_t = self.emit_op(PrimalOp::Transpose { dim0: usize::MAX - 1, dim1: usize::MAX }, vec![w]);
+                let w_t = self.emit_op(
+                    PrimalOp::Transpose {
+                        dim0: usize::MAX - 1,
+                        dim1: usize::MAX,
+                    },
+                    vec![w],
+                );
                 let dx_base = self.emit_op(PrimalOp::Matmul, vec![dy, w_t]);
                 let dy_sig_sc_bt = self.emit_op(PrimalOp::Matmul, vec![dy_sig_sc, b_t]);
-                let a_t = self.emit_op(PrimalOp::Transpose { dim0: usize::MAX - 1, dim1: usize::MAX }, vec![a]);
+                let a_t = self.emit_op(
+                    PrimalOp::Transpose {
+                        dim0: usize::MAX - 1,
+                        dim1: usize::MAX,
+                    },
+                    vec![a],
+                );
                 let dx_adapter = self.emit_op(PrimalOp::Matmul, vec![dy_sig_sc_bt, a_t]);
                 let dx = self.emit_op(PrimalOp::Add, vec![dx_base, dx_adapter]);
                 self.accumulate_adjoint(x, dx);
@@ -914,10 +983,8 @@ impl AdjointGenerator {
             // Sub broadcasts naturally (e.g. [B,nh,S,1] against [B,nh,S,S]).
             AdjointExpr::SoftmaxBackward(y_bar, y) => {
                 let dot = self.emit_op(PrimalOp::Mul, vec![y_bar, y]);
-                let dot_sum = self.emit_op(
-                    PrimalOp::Passthrough("sum_keepdim_last".into()),
-                    vec![dot],
-                );
+                let dot_sum =
+                    self.emit_op(PrimalOp::Passthrough("sum_keepdim_last".into()), vec![dot]);
                 let diff = self.emit_op(PrimalOp::Sub, vec![y_bar, dot_sum]);
                 self.emit_op(PrimalOp::Mul, vec![y, diff])
             }
@@ -946,7 +1013,10 @@ impl AdjointGenerator {
                 let mean = self.emit_op(PrimalOp::Passthrough("mean_keepdim_last".into()), vec![x]);
                 let x_centered = self.emit_op(PrimalOp::Sub, vec![x, mean]);
                 let x_sq = self.emit_op(PrimalOp::Mul, vec![x_centered, x_centered]);
-                let var = self.emit_op(PrimalOp::Passthrough("mean_keepdim_last".into()), vec![x_sq]);
+                let var = self.emit_op(
+                    PrimalOp::Passthrough("mean_keepdim_last".into()),
+                    vec![x_sq],
+                );
                 let eps = self.emit_constant(eps_val);
                 let var_eps = self.emit_op(PrimalOp::Add, vec![var, eps]);
                 let std = self.emit_op(PrimalOp::Sqrt, vec![var_eps]);
@@ -954,9 +1024,15 @@ impl AdjointGenerator {
                 let rstd = self.emit_op(PrimalOp::Div, vec![one, std]);
                 let x_hat = self.emit_op(PrimalOp::Mul, vec![x_centered, rstd]);
                 // Compute gradient corrections
-                let mean_grad = self.emit_op(PrimalOp::Passthrough("mean_keepdim_last".into()), vec![y_bar]);
+                let mean_grad = self.emit_op(
+                    PrimalOp::Passthrough("mean_keepdim_last".into()),
+                    vec![y_bar],
+                );
                 let grad_x_hat = self.emit_op(PrimalOp::Mul, vec![y_bar, x_hat]);
-                let mean_gxh = self.emit_op(PrimalOp::Passthrough("mean_keepdim_last".into()), vec![grad_x_hat]);
+                let mean_gxh = self.emit_op(
+                    PrimalOp::Passthrough("mean_keepdim_last".into()),
+                    vec![grad_x_hat],
+                );
                 let correction = self.emit_op(PrimalOp::Mul, vec![x_hat, mean_gxh]);
                 let t1 = self.emit_op(PrimalOp::Sub, vec![y_bar, mean_grad]);
                 let t2 = self.emit_op(PrimalOp::Sub, vec![t1, correction]);
@@ -1222,10 +1298,8 @@ impl AdjointGenerator {
             // which equals -rotate_half(dy). Lower as a Passthrough rotate_half
             // followed by Neg.
             AdjointExpr::RotateHalfBackward(y_bar) => {
-                let rotated = self.emit_op(
-                    PrimalOp::Passthrough("rotate_half".into()),
-                    vec![y_bar],
-                );
+                let rotated =
+                    self.emit_op(PrimalOp::Passthrough("rotate_half".into()), vec![y_bar]);
                 self.emit_op(PrimalOp::Neg, vec![rotated])
             }
         }
@@ -1314,10 +1388,7 @@ pub fn eliminate_by_backward_live(
     backward_live: &std::collections::BTreeSet<VarId>,
     adjoint_vars: &HashMap<VarId, VarId>,
 ) -> Vec<WengertOp> {
-    let adj_to_primal: HashMap<VarId, VarId> = adjoint_vars
-        .iter()
-        .map(|(&p, &a)| (a, p))
-        .collect();
+    let adj_to_primal: HashMap<VarId, VarId> = adjoint_vars.iter().map(|(&p, &a)| (a, p)).collect();
 
     let mut kept = Vec::with_capacity(ops.len());
     let mut dropped = 0usize;
@@ -1741,9 +1812,8 @@ impl<'a> WengertExtractor<'a> {
                 // synth_member_names. Consult it FIRST so we recover e.g.
                 // `lora_A_<site>` instead of the sentinel 'w'.
                 let synth_name = self.synth_member_names.get(&expr.id).cloned();
-                let member_name_owned = synth_name.unwrap_or_else(|| {
-                    self.interner.resolve(member.0).unwrap_or("?").to_string()
-                });
+                let member_name_owned = synth_name
+                    .unwrap_or_else(|| self.interner.resolve(member.0).unwrap_or("?").to_string());
                 let member_name = member_name_owned.as_str();
                 if member_name == "shape" || member_name == "ndim" {
                     if let Some(obj_var) = self.extract_expr(object) {
@@ -1894,11 +1964,13 @@ impl<'a> WengertExtractor<'a> {
                             if self.context_to_model_type.contains_key(&ctx) {
                                 let compound = format!("{}.{}", ctx, ident_name);
                                 // Check if already present in var_names (idempotent).
-                                let existing = self
-                                    .list
-                                    .var_names
-                                    .iter()
-                                    .find_map(|(&vid, n)| if n == &compound { Some(vid) } else { None });
+                                let existing = self.list.var_names.iter().find_map(|(&vid, n)| {
+                                    if n == &compound {
+                                        Some(vid)
+                                    } else {
+                                        None
+                                    }
+                                });
                                 if let Some(vid) = existing {
                                     Some(vid)
                                 } else {
@@ -2402,7 +2474,10 @@ impl<'a> WengertExtractor<'a> {
                         let scale = match &args[4].value.kind {
                             ExprKind::FloatLiteral(v) => *v as f32,
                             ExprKind::IntLiteral(v) => *v as f32,
-                            ExprKind::UnaryOp { op: AstUnaryOp::Neg, operand } => match &operand.kind {
+                            ExprKind::UnaryOp {
+                                op: AstUnaryOp::Neg,
+                                operand,
+                            } => match &operand.kind {
                                 ExprKind::FloatLiteral(v) => -(*v) as f32,
                                 ExprKind::IntLiteral(v) => -(*v) as f32,
                                 _ => return None,
@@ -2411,19 +2486,24 @@ impl<'a> WengertExtractor<'a> {
                         };
                         let kernel_handle = match &args[5].value.kind {
                             ExprKind::IntLiteral(v) => *v,
-                            ExprKind::UnaryOp { op: AstUnaryOp::Neg, operand } => match &operand.kind {
+                            ExprKind::UnaryOp {
+                                op: AstUnaryOp::Neg,
+                                operand,
+                            } => match &operand.kind {
                                 ExprKind::IntLiteral(v) => -*v,
                                 _ => return None,
                             },
                             _ => return None,
                         };
-                        let four_inputs = vec![
-                            input_vars[0], input_vars[1], input_vars[2], input_vars[3],
-                        ];
+                        let four_inputs =
+                            vec![input_vars[0], input_vars[1], input_vars[2], input_vars[3]];
                         self.push_op(WengertOp {
                             id: self.list.ops.len() as u32,
                             result,
-                            op: PrimalOp::FusedLoraMatmul { scale, kernel_handle },
+                            op: PrimalOp::FusedLoraMatmul {
+                                scale,
+                                kernel_handle,
+                            },
                             inputs: four_inputs,
                             saved_for_backward: false,
                             checkpointed: false,
@@ -2444,7 +2524,10 @@ impl<'a> WengertExtractor<'a> {
                         }
                         let kernel_handle = match &args[3].value.kind {
                             ExprKind::IntLiteral(v) => *v,
-                            ExprKind::UnaryOp { op: AstUnaryOp::Neg, operand } => match &operand.kind {
+                            ExprKind::UnaryOp {
+                                op: AstUnaryOp::Neg,
+                                operand,
+                            } => match &operand.kind {
                                 ExprKind::IntLiteral(v) => -*v,
                                 _ => return None,
                             },
@@ -2479,7 +2562,10 @@ impl<'a> WengertExtractor<'a> {
                         let scale = match &args[4].value.kind {
                             ExprKind::FloatLiteral(v) => *v as f32,
                             ExprKind::IntLiteral(v) => *v as f32,
-                            ExprKind::UnaryOp { op: AstUnaryOp::Neg, operand } => match &operand.kind {
+                            ExprKind::UnaryOp {
+                                op: AstUnaryOp::Neg,
+                                operand,
+                            } => match &operand.kind {
                                 ExprKind::FloatLiteral(v) => -(*v) as f32,
                                 ExprKind::IntLiteral(v) => -(*v) as f32,
                                 _ => return None,
@@ -2488,19 +2574,29 @@ impl<'a> WengertExtractor<'a> {
                         };
                         let kernel_handle = match &args[6].value.kind {
                             ExprKind::IntLiteral(v) => *v,
-                            ExprKind::UnaryOp { op: AstUnaryOp::Neg, operand } => match &operand.kind {
+                            ExprKind::UnaryOp {
+                                op: AstUnaryOp::Neg,
+                                operand,
+                            } => match &operand.kind {
                                 ExprKind::IntLiteral(v) => -*v,
                                 _ => return None,
                             },
                             _ => return None,
                         };
                         let five_inputs = vec![
-                            input_vars[0], input_vars[1], input_vars[2], input_vars[3], input_vars[5],
+                            input_vars[0],
+                            input_vars[1],
+                            input_vars[2],
+                            input_vars[3],
+                            input_vars[5],
                         ];
                         self.push_op(WengertOp {
                             id: self.list.ops.len() as u32,
                             result,
-                            op: PrimalOp::FusedGatedLoraMatmul { scale, kernel_handle },
+                            op: PrimalOp::FusedGatedLoraMatmul {
+                                scale,
+                                kernel_handle,
+                            },
                             inputs: five_inputs,
                             saved_for_backward: false,
                             checkpointed: false,
@@ -3187,16 +3283,14 @@ mod tests {
         // elim must walk back: 300 → Mul → 200 → extract(0) → launch
         // → chain_key. Without the I.2+M fix, the extract's inputs
         // would be only [chain_key] and the launch would be pruned.
-        let mut ops = vec![
-            make_op(
-                0,
-                100,
-                PrimalOp::FusedCshaBackward {
-                    layer: "blocks.0".into(),
-                },
-                vec![1 /* chain_key */],
-            ),
-        ];
+        let mut ops = vec![make_op(
+            0,
+            100,
+            PrimalOp::FusedCshaBackward {
+                layer: "blocks.0".into(),
+            },
+            vec![1 /* chain_key */],
+        )];
         for c in 0u8..=6u8 {
             ops.push(make_op(
                 (c as u32) + 1,
@@ -3228,12 +3322,9 @@ mod tests {
         );
 
         // The live extract (component 0) must also be kept.
-        let extract0_kept = pruned.iter().any(|o| {
-            matches!(
-                &o.op,
-                PrimalOp::CshaFusedBackwardExtract { component: 0 }
-            )
-        });
+        let extract0_kept = pruned
+            .iter()
+            .any(|o| matches!(&o.op, PrimalOp::CshaFusedBackwardExtract { component: 0 }));
         assert!(
             extract0_kept,
             "extract(0) feeds the consumer at var 300 and must survive"

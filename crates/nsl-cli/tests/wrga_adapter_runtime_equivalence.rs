@@ -80,9 +80,7 @@ fn run_nsl(src_path: &Path, extra_args: &[&str]) -> (bool, String, String) {
 fn run_nsl_expect_ok(src_path: &Path, extra_args: &[&str]) -> String {
     let (ok, stdout, stderr) = run_nsl(src_path, extra_args);
     if !ok {
-        panic!(
-            "nsl run failed.\nstdout:\n{stdout}\nstderr:\n{stderr}",
-        );
+        panic!("nsl run failed.\nstdout:\n{stdout}\nstderr:\n{stderr}",);
     }
     stdout
 }
@@ -243,10 +241,7 @@ fn build_3_sanity_b_nonzero_diverges() {
     // If seeding + rewrite both fire, LoRA-A is Kaiming-random so output is
     // deterministic per-seed but nonzero in at least one element. If either
     // fails, we'd see all zeros (Build 1 / Build 2).
-    let any_nonzero = tensor
-        .iter()
-        .flat_map(|r| r.iter())
-        .any(|v| v.abs() > 1e-5);
+    let any_nonzero = tensor.iter().flat_map(|r| r.iter()).any(|v| v.abs() > 1e-5);
     assert!(
         any_nonzero,
         "Build 3: output must diverge from Build 1 when LoRA-B is seeded nonzero; got {tensor:?}",
@@ -346,8 +341,7 @@ fn task_4_fused_ffi_is_referenced_when_target_sm80() {
     let tmp = TempDir::new().unwrap();
     let src_path = tmp.path().join("task4_sm80.nsl");
     fs::write(&src_path, BUILD4_SRC).unwrap();
-    let stdout =
-        run_nsl_expect_ok(&src_path, &["--source-ad", "--target", "cuda_sm80"]);
+    let stdout = run_nsl_expect_ok(&src_path, &["--source-ad", "--target", "cuda_sm80"]);
     let tensor = parse_tensor_2d(&stdout);
     assert_eq!(tensor.len(), 4, "expected 4 rows, got {tensor:?}");
     for (i, row) in tensor.iter().enumerate() {
@@ -382,8 +376,7 @@ fn build_4_fused() {
     let tmp = TempDir::new().unwrap();
     let src_path = tmp.path().join("build4_fused.nsl");
     fs::write(&src_path, BUILD4_SRC).unwrap();
-    let stdout =
-        run_nsl_expect_ok(&src_path, &["--source-ad", "--target", "cuda_sm80"]);
+    let stdout = run_nsl_expect_ok(&src_path, &["--source-ad", "--target", "cuda_sm80"]);
     let tensor = parse_tensor_2d(&stdout);
     assert_eq!(tensor.len(), 4, "expected 4 rows, got {tensor:?}");
     let mut max_diff: f32 = 0.0;
@@ -624,7 +617,9 @@ fn build_4_fused_real_launch() {
     );
 
     // Assert the REAL cudarc launch fired (not CPU fallback).
-    let gpu_count_line = stderr.lines().find(|l| l.contains("[nsl-gpu-launch-count]"));
+    let gpu_count_line = stderr
+        .lines()
+        .find(|l| l.contains("[nsl-gpu-launch-count]"));
     let count: u64 = gpu_count_line
         .and_then(|l| l.split_whitespace().next_back())
         .and_then(|s| s.parse().ok())
@@ -837,7 +832,9 @@ fn run_gatedlora_fixture(src: &str, expected: f32, tolerance: f32, fixture_name:
     );
 
     // Assert fused PTX actually fired (not CPU fallback).
-    let gpu_count_line = stderr.lines().find(|l| l.contains("[nsl-gpu-launch-count]"));
+    let gpu_count_line = stderr
+        .lines()
+        .find(|l| l.contains("[nsl-gpu-launch-count]"));
     let count: u64 = gpu_count_line
         .and_then(|l| l.split_whitespace().next_back())
         .and_then(|s| s.parse().ok())
@@ -1443,5 +1440,10 @@ fn gatedlora_fused_unchanged_inference_behavior() {
     // Each of the 4 fixtures is itself a #[test]; they'd run in parallel
     // anyway. This test just runs the helper directly on fixture A to
     // catch mass regressions in a single fast signal.
-    run_gatedlora_fixture(GATEDLORA_FIXTURE_A_SRC, 16.0, 1e-4, "regression_gatedlora_a");
+    run_gatedlora_fixture(
+        GATEDLORA_FIXTURE_A_SRC,
+        16.0,
+        1e-4,
+        "regression_gatedlora_a",
+    );
 }

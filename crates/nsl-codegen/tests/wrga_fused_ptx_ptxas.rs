@@ -257,10 +257,7 @@ fn assert_at_scale(m: u32, n: u32, k: u32, rank: u32, kind: &str) {
                 Err(msg) if msg.contains("nvcc not available") => {
                     eprintln!("[skip] IA³ scale config ({}, {}, {}) — {}", m, n, k, msg);
                 }
-                Err(msg) => panic!(
-                    "IA³ PTX rejected at scale ({}, {}, {}):\n{}",
-                    m, n, k, msg
-                ),
+                Err(msg) => panic!("IA³ PTX rejected at scale ({}, {}, {}):\n{}", m, n, k, msg),
             }
         }
         _ => unreachable!(),

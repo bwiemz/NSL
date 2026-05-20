@@ -7,10 +7,18 @@ use nsl_codegen::pca_tilerange::{emit_skip_predicate, IterationOrder};
 
 fn fa_4k_block64_seg_masked() -> FlashAttentionConfig {
     FlashAttentionConfig {
-        block_q: 64, block_kv: 64, head_dim: 64,
-        causal: true, paged: false, rope_q: true,
-        rope_style: RopeStyle::HalfSplit, gqa_group_size: 2,
-        tree_mask: false, gpu_sm: 120, segment_masked: true, csha: None,
+        block_q: 64,
+        block_kv: 64,
+        head_dim: 64,
+        causal: true,
+        paged: false,
+        rope_q: true,
+        rope_style: RopeStyle::HalfSplit,
+        gqa_group_size: 2,
+        tree_mask: false,
+        gpu_sm: 120,
+        segment_masked: true,
+        csha: None,
     }
 }
 
@@ -27,7 +35,8 @@ fn predicate_4k_block64_isolation_snapshot() {
         &mut ptx,
         &fa_4k_block64_seg_masked(),
         4096,
-        "%qt", "%kvt",
+        "%qt",
+        "%kvt",
         0xDEAD_BEEF,
         "KV_TILE_SKIP",
         IterationOrder::QOuter,
@@ -39,8 +48,13 @@ fn predicate_4k_block64_isolation_snapshot() {
 fn predicate_emits_four_range_table_loads() {
     let mut ptx = String::new();
     emit_skip_predicate(
-        &mut ptx, &fa_4k_block64_seg_masked(), 4096,
-        "%qt", "%kvt", 0xDEAD_BEEF, "KV_TILE_SKIP",
+        &mut ptx,
+        &fa_4k_block64_seg_masked(),
+        4096,
+        "%qt",
+        "%kvt",
+        0xDEAD_BEEF,
+        "KV_TILE_SKIP",
         IterationOrder::QOuter,
     );
     // 4 loads: qmin, qmax, kvmin, kvmax.
@@ -51,8 +65,13 @@ fn predicate_emits_four_range_table_loads() {
 fn predicate_uses_disjoint_logic() {
     let mut ptx = String::new();
     emit_skip_predicate(
-        &mut ptx, &fa_4k_block64_seg_masked(), 4096,
-        "%qt", "%kvt", 0xDEAD_BEEF, "KV_TILE_SKIP",
+        &mut ptx,
+        &fa_4k_block64_seg_masked(),
+        4096,
+        "%qt",
+        "%kvt",
+        0xDEAD_BEEF,
+        "KV_TILE_SKIP",
         IterationOrder::QOuter,
     );
     assert!(ptx.contains("setp.lt.u16 %p_lt_TB, %qmax_TB, %kvmin_TB"));
@@ -64,8 +83,13 @@ fn predicate_uses_disjoint_logic() {
 fn predicate_branches_to_provided_label() {
     let mut ptx = String::new();
     emit_skip_predicate(
-        &mut ptx, &fa_4k_block64_seg_masked(), 4096,
-        "%qt", "%kvt", 0xDEAD_BEEF, "MY_CUSTOM_LABEL",
+        &mut ptx,
+        &fa_4k_block64_seg_masked(),
+        4096,
+        "%qt",
+        "%kvt",
+        0xDEAD_BEEF,
+        "MY_CUSTOM_LABEL",
         IterationOrder::QOuter,
     );
     assert!(ptx.contains("@%p_skip_TB bra MY_CUSTOM_LABEL"));
@@ -75,8 +99,13 @@ fn predicate_branches_to_provided_label() {
 fn predicate_sentinel_visible() {
     let mut ptx = String::new();
     emit_skip_predicate(
-        &mut ptx, &fa_4k_block64_seg_masked(), 4096,
-        "%qt", "%kvt", 0xDEAD_BEEF, "KV_TILE_SKIP",
+        &mut ptx,
+        &fa_4k_block64_seg_masked(),
+        4096,
+        "%qt",
+        "%kvt",
+        0xDEAD_BEEF,
+        "KV_TILE_SKIP",
         IterationOrder::QOuter,
     );
     // Sentinel offsets appear as immediate operands of `add.u64`.

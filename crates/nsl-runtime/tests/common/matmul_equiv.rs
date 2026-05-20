@@ -181,13 +181,7 @@ fn scaled_tolerance(base: f32, k: usize) -> f32 {
 /// `base_tolerance` is the spec-mandated floor (1e-5 for pedantic,
 /// 5e-3 for TF32); `scaled_tolerance(base, K)` applies a √K envelope
 /// to accommodate cuBLAS's tile-reduction summation order.
-pub fn run_matmul_and_verify(
-    m: usize,
-    n: usize,
-    k: usize,
-    base_tolerance: f32,
-    label: &str,
-) {
+pub fn run_matmul_and_verify(m: usize, n: usize, k: usize, base_tolerance: f32, label: &str) {
     let tolerance_rel = scaled_tolerance(base_tolerance, k);
     let _guard = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
 
@@ -199,10 +193,7 @@ pub fn run_matmul_and_verify(
 
     let c_ref = cpu_ref_matmul_f32(&a, &b, m, k, n);
 
-    let tmp = std::env::temp_dir().join(format!(
-        "matmul_cublas_{label}_{}x{}x{}.json",
-        m, n, k
-    ));
+    let tmp = std::env::temp_dir().join(format!("matmul_cublas_{label}_{}x{}x{}.json", m, n, k));
     let path_str = tmp.to_str().unwrap().to_string();
     nsl_kernel_profiler_start();
     let c_gpu = gpu_matmul(&a, &b, m, n, k);
@@ -212,7 +203,11 @@ pub fn run_matmul_and_verify(
         nsl_kernel_profiler_flush(path_str.as_ptr(), path_str.len() as i64);
     }
 
-    assert_eq!(c_gpu.len(), c_ref.len(), "{label} {m}x{n}x{k}: shape mismatch");
+    assert_eq!(
+        c_gpu.len(),
+        c_ref.len(),
+        "{label} {m}x{n}x{k}: shape mismatch"
+    );
     let mut max_abs = 0.0_f32;
     let mut max_rel = 0.0_f32;
     for (i, (&g, &r)) in c_gpu.iter().zip(c_ref.iter()).enumerate() {
@@ -252,11 +247,7 @@ pub fn run_matmul_and_verify(
 /// Llama-scale entry unless `include_slow` is true.  `label` goes into
 /// profile-file names and diagnostic output so failures from either test
 /// binary are immediately distinguishable.
-pub fn run_matmul_equivalence_suite(
-    tolerance_rel: f32,
-    label: &str,
-    include_slow: bool,
-) {
+pub fn run_matmul_equivalence_suite(tolerance_rel: f32, label: &str, include_slow: bool) {
     for (idx, &(m, n, k)) in SHAPE_MATRIX.iter().enumerate() {
         if idx == LLAMA_SHAPE_IDX && !include_slow {
             continue;

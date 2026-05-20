@@ -81,29 +81,38 @@ impl OpCategory {
     pub fn all() -> &'static [OpCategory] {
         use OpCategory::*;
         &[
-            Matmul, AttentionFused, AdapterFused,
-            ElementwiseArith, ElementwiseActivation,
-            Reduction, Normalization, Indexing, CopyLayout,
-            DropoutDequant, Sparse, Moe, Other,
+            Matmul,
+            AttentionFused,
+            AdapterFused,
+            ElementwiseArith,
+            ElementwiseActivation,
+            Reduction,
+            Normalization,
+            Indexing,
+            CopyLayout,
+            DropoutDequant,
+            Sparse,
+            Moe,
+            Other,
         ]
     }
 
     pub fn label(self) -> &'static str {
         use OpCategory::*;
         match self {
-            Matmul                => "matmul",
-            AttentionFused        => "attention_fused",
-            AdapterFused          => "adapter_fused",
-            ElementwiseArith      => "elementwise_arith",
+            Matmul => "matmul",
+            AttentionFused => "attention_fused",
+            AdapterFused => "adapter_fused",
+            ElementwiseArith => "elementwise_arith",
             ElementwiseActivation => "elementwise_activation",
-            Reduction             => "reduction",
-            Normalization         => "normalization",
-            Indexing              => "indexing",
-            CopyLayout            => "copy_layout",
-            DropoutDequant        => "dropout_dequant",
-            Sparse                => "sparse",
-            Moe                   => "moe",
-            Other                 => "other",
+            Reduction => "reduction",
+            Normalization => "normalization",
+            Indexing => "indexing",
+            CopyLayout => "copy_layout",
+            DropoutDequant => "dropout_dequant",
+            Sparse => "sparse",
+            Moe => "moe",
+            Other => "other",
         }
     }
 }
@@ -182,24 +191,39 @@ pub fn categorize_kernel(name: &str) -> OpCategory {
     // variants like `nsl_sigmoid_backward_f32` don't route to arith).
     if matches!(
         name,
-        "nsl_relu_f32"    | "nsl_relu_backward_f32"    |
-        "nsl_sigmoid_f32" | "nsl_sigmoid_backward_f32" |
-        "nsl_tanh_f32"    | "nsl_tanh_backward_f32"    |
-        "nsl_gelu_f32"    | "nsl_gelu_backward_f32"    |
-        "nsl_silu_f32"    | "nsl_silu_backward_f32"    |
-        "nsl_exp_f32"     | "nsl_log_f32"              |
-        "nsl_sqrt_f32"    | "nsl_cos_f32"              | "nsl_sin_f32" |
-        "nsl_rotate_half_f32" |
-        "nsl_clamp_f32"   | "nsl_clamp_backward_f32"
+        "nsl_relu_f32"
+            | "nsl_relu_backward_f32"
+            | "nsl_sigmoid_f32"
+            | "nsl_sigmoid_backward_f32"
+            | "nsl_tanh_f32"
+            | "nsl_tanh_backward_f32"
+            | "nsl_gelu_f32"
+            | "nsl_gelu_backward_f32"
+            | "nsl_silu_f32"
+            | "nsl_silu_backward_f32"
+            | "nsl_exp_f32"
+            | "nsl_log_f32"
+            | "nsl_sqrt_f32"
+            | "nsl_cos_f32"
+            | "nsl_sin_f32"
+            | "nsl_rotate_half_f32"
+            | "nsl_clamp_f32"
+            | "nsl_clamp_backward_f32"
     ) {
         return OpCategory::ElementwiseActivation;
     }
     // Pointwise arithmetic.
     if matches!(
         name,
-        "nsl_add_f32" | "nsl_sub_f32" | "nsl_mul_f32" | "nsl_div_f32" |
-        "nsl_neg_f32" | "nsl_abs_f32" | "nsl_sign_f32" |
-        "nsl_add_scalar_f32" | "nsl_mul_scalar_f32"
+        "nsl_add_f32"
+            | "nsl_sub_f32"
+            | "nsl_mul_f32"
+            | "nsl_div_f32"
+            | "nsl_neg_f32"
+            | "nsl_abs_f32"
+            | "nsl_sign_f32"
+            | "nsl_add_scalar_f32"
+            | "nsl_mul_scalar_f32"
     ) {
         return OpCategory::ElementwiseArith;
     }
@@ -225,12 +249,24 @@ pub fn parse_trace_from_json(text: &str) -> Result<Vec<TraceEvent>, String> {
         .ok_or_else(|| "missing traceEvents".to_string())?;
     let mut out: Vec<TraceEvent> = Vec::with_capacity(events.len());
     for ev in events {
-        let name = ev.get("name").and_then(|n| n.as_str()).unwrap_or("").to_string();
+        let name = ev
+            .get("name")
+            .and_then(|n| n.as_str())
+            .unwrap_or("")
+            .to_string();
         let dur = ev.get("dur").and_then(|d| d.as_f64()).unwrap_or(0.0);
-        let ts  = ev.get("ts" ).and_then(|t| t.as_f64()).unwrap_or(0.0);
-        out.push(TraceEvent { name, dur_us: dur, ts_us: ts });
+        let ts = ev.get("ts").and_then(|t| t.as_f64()).unwrap_or(0.0);
+        out.push(TraceEvent {
+            name,
+            dur_us: dur,
+            ts_us: ts,
+        });
     }
-    out.sort_by(|a, b| a.ts_us.partial_cmp(&b.ts_us).unwrap_or(std::cmp::Ordering::Equal));
+    out.sort_by(|a, b| {
+        a.ts_us
+            .partial_cmp(&b.ts_us)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     Ok(out)
 }
 
@@ -246,14 +282,17 @@ pub fn parse_trace(path: &Path) -> Result<Vec<TraceEvent>, String> {
 ///
 /// Returns a `Vec<Vec<TraceEvent>>` with one inner vec per marker found.
 #[allow(dead_code)]
-pub fn partition_by_marker(
-    events: &[TraceEvent],
-    marker_prefix: &str,
-) -> Vec<Vec<TraceEvent>> {
+pub fn partition_by_marker(events: &[TraceEvent], marker_prefix: &str) -> Vec<Vec<TraceEvent>> {
     let marker_idxs: Vec<usize> = events
         .iter()
         .enumerate()
-        .filter_map(|(i, e)| if e.name.starts_with(marker_prefix) { Some(i) } else { None })
+        .filter_map(|(i, e)| {
+            if e.name.starts_with(marker_prefix) {
+                Some(i)
+            } else {
+                None
+            }
+        })
         .collect();
     if marker_idxs.is_empty() {
         return Vec::new();
@@ -338,34 +377,82 @@ mod categorizer_tests {
 
     #[test]
     fn elementwise_arith_and_activation_are_separated() {
-        assert_eq!(categorize_kernel("nsl_add_f32"),         OpCategory::ElementwiseArith);
-        assert_eq!(categorize_kernel("nsl_mul_scalar_f32"),  OpCategory::ElementwiseArith);
-        assert_eq!(categorize_kernel("nsl_sigmoid_f32"),     OpCategory::ElementwiseActivation);
-        assert_eq!(categorize_kernel("nsl_gelu_backward_f32"), OpCategory::ElementwiseActivation);
-        assert_eq!(categorize_kernel("nsl_rotate_half_f32"), OpCategory::ElementwiseActivation);
+        assert_eq!(
+            categorize_kernel("nsl_add_f32"),
+            OpCategory::ElementwiseArith
+        );
+        assert_eq!(
+            categorize_kernel("nsl_mul_scalar_f32"),
+            OpCategory::ElementwiseArith
+        );
+        assert_eq!(
+            categorize_kernel("nsl_sigmoid_f32"),
+            OpCategory::ElementwiseActivation
+        );
+        assert_eq!(
+            categorize_kernel("nsl_gelu_backward_f32"),
+            OpCategory::ElementwiseActivation
+        );
+        assert_eq!(
+            categorize_kernel("nsl_rotate_half_f32"),
+            OpCategory::ElementwiseActivation
+        );
     }
 
     #[test]
     fn reductions_and_norms_are_separated() {
-        assert_eq!(categorize_kernel("nsl_global_sum_f32"),   OpCategory::Reduction);
-        assert_eq!(categorize_kernel("nsl_sum_dim_f32"),      OpCategory::Reduction);
-        assert_eq!(categorize_kernel("nsl_max_dim_f32"),      OpCategory::Reduction);
-        assert_eq!(categorize_kernel("nsl_rmsnorm_f32"),      OpCategory::Normalization);
-        assert_eq!(categorize_kernel("nsl_layernorm_f32"),    OpCategory::Normalization);
-        assert_eq!(categorize_kernel("nsl_softmax_f32"),      OpCategory::Normalization);
-        assert_eq!(categorize_kernel("nsl_log_softmax_f32"),  OpCategory::Normalization);
+        assert_eq!(
+            categorize_kernel("nsl_global_sum_f32"),
+            OpCategory::Reduction
+        );
+        assert_eq!(categorize_kernel("nsl_sum_dim_f32"), OpCategory::Reduction);
+        assert_eq!(categorize_kernel("nsl_max_dim_f32"), OpCategory::Reduction);
+        assert_eq!(
+            categorize_kernel("nsl_rmsnorm_f32"),
+            OpCategory::Normalization
+        );
+        assert_eq!(
+            categorize_kernel("nsl_layernorm_f32"),
+            OpCategory::Normalization
+        );
+        assert_eq!(
+            categorize_kernel("nsl_softmax_f32"),
+            OpCategory::Normalization
+        );
+        assert_eq!(
+            categorize_kernel("nsl_log_softmax_f32"),
+            OpCategory::Normalization
+        );
     }
 
     #[test]
     fn indexing_copy_dropout_are_routed() {
-        assert_eq!(categorize_kernel("nsl_gather_f32"),       OpCategory::Indexing);
-        assert_eq!(categorize_kernel("nsl_scatter_add_f32"),  OpCategory::Indexing);
-        assert_eq!(categorize_kernel("nsl_embedding_i32idx"), OpCategory::Indexing);
-        assert_eq!(categorize_kernel("nsl_slice_f32"),        OpCategory::Indexing);
-        assert_eq!(categorize_kernel("nsl_strided_copy_f32"), OpCategory::CopyLayout);
-        assert_eq!(categorize_kernel("nsl_bias_add_f32"),     OpCategory::CopyLayout);
-        assert_eq!(categorize_kernel("nsl_rope_cache_write"), OpCategory::CopyLayout);
-        assert_eq!(categorize_kernel("nsl_dropout_f32"),      OpCategory::DropoutDequant);
+        assert_eq!(categorize_kernel("nsl_gather_f32"), OpCategory::Indexing);
+        assert_eq!(
+            categorize_kernel("nsl_scatter_add_f32"),
+            OpCategory::Indexing
+        );
+        assert_eq!(
+            categorize_kernel("nsl_embedding_i32idx"),
+            OpCategory::Indexing
+        );
+        assert_eq!(categorize_kernel("nsl_slice_f32"), OpCategory::Indexing);
+        assert_eq!(
+            categorize_kernel("nsl_strided_copy_f32"),
+            OpCategory::CopyLayout
+        );
+        assert_eq!(
+            categorize_kernel("nsl_bias_add_f32"),
+            OpCategory::CopyLayout
+        );
+        assert_eq!(
+            categorize_kernel("nsl_rope_cache_write"),
+            OpCategory::CopyLayout
+        );
+        assert_eq!(
+            categorize_kernel("nsl_dropout_f32"),
+            OpCategory::DropoutDequant
+        );
         assert_eq!(
             categorize_kernel("nsl_dequant_fp8_e4m3_f32"),
             OpCategory::DropoutDequant
@@ -374,18 +461,21 @@ mod categorizer_tests {
 
     #[test]
     fn sparse_and_moe_route_specifically() {
-        assert_eq!(categorize_kernel("nsl_csr_spmm_f32"),     OpCategory::Sparse);
-        assert_eq!(categorize_kernel("nsl_coo_spmv_f32"),     OpCategory::Sparse);
-        assert_eq!(categorize_kernel("nsl_bsr_spmm_f32"),     OpCategory::Sparse);
-        assert_eq!(categorize_kernel("moe_gather"),           OpCategory::Moe);
-        assert_eq!(categorize_kernel("moe_scatter"),          OpCategory::Moe);
-        assert_eq!(categorize_kernel("expert_batched_gemm"),  OpCategory::Moe);
+        assert_eq!(categorize_kernel("nsl_csr_spmm_f32"), OpCategory::Sparse);
+        assert_eq!(categorize_kernel("nsl_coo_spmv_f32"), OpCategory::Sparse);
+        assert_eq!(categorize_kernel("nsl_bsr_spmm_f32"), OpCategory::Sparse);
+        assert_eq!(categorize_kernel("moe_gather"), OpCategory::Moe);
+        assert_eq!(categorize_kernel("moe_scatter"), OpCategory::Moe);
+        assert_eq!(categorize_kernel("expert_batched_gemm"), OpCategory::Moe);
     }
 
     #[test]
     fn unknown_names_fall_through_to_other() {
         assert_eq!(categorize_kernel(""), OpCategory::Other);
-        assert_eq!(categorize_kernel("nsl_experimental_voodoo"), OpCategory::Other);
+        assert_eq!(
+            categorize_kernel("nsl_experimental_voodoo"),
+            OpCategory::Other
+        );
         assert_eq!(categorize_kernel("unknown_kernel"), OpCategory::Other);
     }
 
@@ -404,7 +494,11 @@ mod trace_partition_tests {
     use super::*;
 
     fn ev(name: &str, ts: f64, dur: f64) -> TraceEvent {
-        TraceEvent { name: name.into(), ts_us: ts, dur_us: dur }
+        TraceEvent {
+            name: name.into(),
+            ts_us: ts,
+            dur_us: dur,
+        }
     }
 
     #[test]
@@ -425,12 +519,12 @@ mod trace_partition_tests {
     #[test]
     fn partition_by_marker_groups_between_markers() {
         let events = vec![
-            ev("init_noise",                                  10.0, 1.0),
-            ev("nsl_wrga_fused_gatedlora_m1n4096k4096r16",    20.0, 2.0),
-            ev("sgemm_cublas",                                30.0, 3.0),
-            ev("nsl_add_f32",                                 40.0, 0.5),
-            ev("nsl_wrga_fused_gatedlora_m1n4096k4096r16",    50.0, 2.0),
-            ev("sgemm_cublas",                                60.0, 3.0),
+            ev("init_noise", 10.0, 1.0),
+            ev("nsl_wrga_fused_gatedlora_m1n4096k4096r16", 20.0, 2.0),
+            ev("sgemm_cublas", 30.0, 3.0),
+            ev("nsl_add_f32", 40.0, 0.5),
+            ev("nsl_wrga_fused_gatedlora_m1n4096k4096r16", 50.0, 2.0),
+            ev("sgemm_cublas", 60.0, 3.0),
         ];
         let iters = partition_by_marker(&events, "nsl_wrga_fused_gatedlora_");
         assert_eq!(iters.len(), 2, "two markers → two iter groups");
@@ -438,7 +532,9 @@ mod trace_partition_tests {
         assert_eq!(iters[1].len(), 2, "iter 1: marker + sgemm");
         // Event BEFORE first marker (init_noise) must be dropped.
         assert!(
-            !iters.iter().any(|g| g.iter().any(|e| e.name == "init_noise")),
+            !iters
+                .iter()
+                .any(|g| g.iter().any(|e| e.name == "init_noise")),
             "init events before first marker must be dropped"
         );
     }
@@ -454,20 +550,20 @@ mod trace_partition_tests {
     fn breakdown_iter_sums_by_category() {
         let iter = vec![
             ev("nsl_wrga_fused_gatedlora_m1n4096k4096r16", 100.0, 3_000.0),
-            ev("sgemm_cublas",                             103.0, 8_750.0),
-            ev("sgemm_cublas",                             112.0, 0.0), // double-counting guard
-            ev("nsl_sigmoid_f32",                          112.0, 320.0),
-            ev("nsl_add_f32",                              113.0, 890.0),
-            ev("nsl_sum_dim_f32",                          114.0, 480.0),
+            ev("sgemm_cublas", 103.0, 8_750.0),
+            ev("sgemm_cublas", 112.0, 0.0), // double-counting guard
+            ev("nsl_sigmoid_f32", 112.0, 320.0),
+            ev("nsl_add_f32", 113.0, 890.0),
+            ev("nsl_sum_dim_f32", 114.0, 480.0),
         ];
         let bd = breakdown_iter(&iter);
         assert_eq!(bd.launch_count, 6);
         let m = bd.by_category_us;
-        assert_eq!(m["matmul"],                 8_750.0);
-        assert_eq!(m["adapter_fused"],          3_000.0);
+        assert_eq!(m["matmul"], 8_750.0);
+        assert_eq!(m["adapter_fused"], 3_000.0);
         assert_eq!(m["elementwise_activation"], 320.0);
-        assert_eq!(m["elementwise_arith"],      890.0);
-        assert_eq!(m["reduction"],              480.0);
+        assert_eq!(m["elementwise_arith"], 890.0);
+        assert_eq!(m["reduction"], 480.0);
         assert_eq!(bd.total_gpu_us, 8_750.0 + 3_000.0 + 320.0 + 890.0 + 480.0);
     }
 }
@@ -484,7 +580,12 @@ mod bench {
 
     fn workspace_root() -> PathBuf {
         let manifest_dir = env!("CARGO_MANIFEST_DIR");
-        Path::new(manifest_dir).parent().unwrap().parent().unwrap().to_path_buf()
+        Path::new(manifest_dir)
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf()
     }
 
     const WARMUP_ITERS: usize = 3;
@@ -521,16 +622,26 @@ train(model = m, epochs = {n}):
         let pred = m.forward(x)
         let loss = mse_loss(pred, y_target)
 "#,
-            dim = dim, rank = rank, alpha = alpha, tokens = tokens, n = n
+            dim = dim,
+            rank = rank,
+            alpha = alpha,
+            tokens = tokens,
+            n = n
         )
     }
 
     /// Median of a sorted slice — returns 0.0 for empty.
     fn median(v: &mut [f64]) -> f64 {
-        if v.is_empty() { return 0.0; }
+        if v.is_empty() {
+            return 0.0;
+        }
         v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let n = v.len();
-        if n % 2 == 0 { 0.5 * (v[n/2 - 1] + v[n/2]) } else { v[n/2] }
+        if n % 2 == 0 {
+            0.5 * (v[n / 2 - 1] + v[n / 2])
+        } else {
+            v[n / 2]
+        }
     }
 
     #[test]
@@ -607,9 +718,17 @@ train(model = m, epochs = {n}):
         // flag means CI never sees this; the output is for the engineer
         // running the scoping bench.
         println!("\n=== WRGA B.3.2 per-op breakdown — prescribed shape (b=32, seq=2048, dim=4096, r=16) ===");
-        println!("wall_clock_total:  {:>12.1} ms  (across {} iters including warmup)", wall_us / 1000.0, total_markers);
+        println!(
+            "wall_clock_total:  {:>12.1} ms  (across {} iters including warmup)",
+            wall_us / 1000.0,
+            total_markers
+        );
         println!("wall_per_iter:     {:>12.1} ms", wall_per_iter_us / 1000.0);
-        println!("median_gpu/iter:   {:>12.1} ms  ({:.1}% of wall)", median_gpu_us / 1000.0, 100.0 * median_gpu_us / wall_per_iter_us);
+        println!(
+            "median_gpu/iter:   {:>12.1} ms  ({:.1}% of wall)",
+            median_gpu_us / 1000.0,
+            100.0 * median_gpu_us / wall_per_iter_us
+        );
         println!("host_overhead:     {:>12.1} ms  ({:.1}% of wall)  [allocator / tape / CUDA API / source-AD]",
             host_overhead_us / 1000.0, 100.0 * host_overhead_us / wall_per_iter_us);
         println!();
@@ -622,7 +741,11 @@ train(model = m, epochs = {n}):
             .collect();
         rows.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         for (cat, ms) in &rows {
-            let pct = if median_gpu_us > 0.0 { 100.0 * ms / median_gpu_us } else { 0.0 };
+            let pct = if median_gpu_us > 0.0 {
+                100.0 * ms / median_gpu_us
+            } else {
+                0.0
+            };
             println!("{:<28} {:>12.2} {:>7.1}%", cat, ms / 1000.0, pct);
         }
         println!();
@@ -635,9 +758,15 @@ train(model = m, epochs = {n}):
         let gpu_share = 100.0 * median_gpu_us / wall_per_iter_us.max(1.0);
         println!("matmul % of GPU time:       {:>6.1}%", matmul_pct);
         println!("GPU % of wall-clock:        {:>6.1}%", gpu_share);
-        println!("matmul % of wall-clock:     {:>6.1}%  ← B.3.2 fused-backward's max theoretical share", 0.01 * matmul_pct * gpu_share);
+        println!(
+            "matmul % of wall-clock:     {:>6.1}%  ← B.3.2 fused-backward's max theoretical share",
+            0.01 * matmul_pct * gpu_share
+        );
         if gpu_share < 30.0 {
-            println!("  → host-dominated: fused backward's ceiling is bounded by the {:.0}% GPU share.", gpu_share);
+            println!(
+                "  → host-dominated: fused backward's ceiling is bounded by the {:.0}% GPU share.",
+                gpu_share
+            );
             println!("    Allocator / tape optimisation likely outranks B.3.2 in expected impact.");
         } else if matmul_pct > 60.0 {
             println!("  → matmul-dominated within GPU time AND GPU dominates wall: B.3.2 proceed with confidence.");

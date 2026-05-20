@@ -64,7 +64,11 @@ impl ModelSize {
         self.per_layer_activation_bytes.iter().sum()
     }
     pub fn peak_activation_bytes(&self) -> u64 {
-        self.per_layer_activation_bytes.iter().max().copied().unwrap_or(0)
+        self.per_layer_activation_bytes
+            .iter()
+            .max()
+            .copied()
+            .unwrap_or(0)
     }
     pub fn n_layers(&self) -> usize {
         self.per_layer_param_bytes.len()
@@ -213,9 +217,8 @@ pub fn evaluate_config(
 
     let param_per_gpu = (total_params / config.s_p as u64).max(1);
     let grad_per_gpu = (total_params / config.s_g as u64).max(1);
-    let optim_per_gpu = ((total_params as f64 * model.optim_state_multiplier
-        / config.s_os as f64) as u64)
-        .max(1);
+    let optim_per_gpu =
+        ((total_params as f64 * model.optim_state_multiplier / config.s_os as f64) as u64).max(1);
     let activation_per_gpu = model.peak_activation_bytes();
     let memory = param_per_gpu + grad_per_gpu + optim_per_gpu + activation_per_gpu;
     let feasible = memory <= cluster.memory_budget_bytes;
@@ -236,10 +239,10 @@ pub fn evaluate_config(
 
     let step_time_us = compute_total_us + exposed;
 
-    let comm_volume_bytes =
-        (config.s_p as u64 - 1).saturating_mul(param_per_gpu) * dtype_factor as u64
-            + (config.s_g as u64 - 1).saturating_mul(grad_per_gpu)
-            + (config.s_os as u64 - 1).saturating_mul(param_per_gpu);
+    let comm_volume_bytes = (config.s_p as u64 - 1).saturating_mul(param_per_gpu)
+        * dtype_factor as u64
+        + (config.s_g as u64 - 1).saturating_mul(grad_per_gpu)
+        + (config.s_os as u64 - 1).saturating_mul(param_per_gpu);
 
     ZeroEvaluation {
         config,

@@ -11,8 +11,7 @@
 //! compile-time-bounded.
 
 use crate::cost_model::{
-    arithmetic_intensity, classify_op, matmul_cost, rmsnorm_cost, softmax_cost,
-    BoundClassification,
+    arithmetic_intensity, classify_op, matmul_cost, rmsnorm_cost, softmax_cost, BoundClassification,
 };
 use crate::gpu_specs::GpuSpec;
 
@@ -155,7 +154,10 @@ impl LayerCostLut {
 /// the ILP objective a simple table lookup.
 pub fn build_lut(shape: &LayerShape, gpu: &GpuSpec, axes: &LutAxes) -> LayerCostLut {
     let mut entries = Vec::with_capacity(
-        axes.head_counts.len() * axes.ffn_widths.len() * axes.csha_levels.len() * axes.adapter_ranks.len(),
+        axes.head_counts.len()
+            * axes.ffn_widths.len()
+            * axes.csha_levels.len()
+            * axes.adapter_ranks.len(),
     );
     let bs = shape.batch * shape.seq;
     for &heads in &axes.head_counts {
@@ -196,8 +198,8 @@ fn smem_required(shape: &LayerShape, heads: u64, csha: u8) -> u64 {
     let tile = 64 * shape.head_dim * bytes;
     match csha {
         0 => 0,
-        1 => 4 * 1024 + tile,               // norm scratch + one tile
-        2 => 2 * tile + heads * tile,        // producer + consumer + weight tiles
+        1 => 4 * 1024 + tile,                 // norm scratch + one tile
+        2 => 2 * tile + heads * tile,         // producer + consumer + weight tiles
         3 => 4 * tile + heads * tile + 32768, // plus FFN scratch
         _ => 0,
     }
@@ -216,7 +218,8 @@ fn evaluate_single(
     let dtype = shape.dtype_bytes as usize;
 
     // Attention projections: 3× matmul [BS, d_model] × [d_model, d_out_attn].
-    let (proj_flops, proj_br, proj_bw) = matmul_cost(bs, shape.d_model, d_out_attn, shape.dtype_bytes);
+    let (proj_flops, proj_br, proj_bw) =
+        matmul_cost(bs, shape.d_model, d_out_attn, shape.dtype_bytes);
     let proj_us = 3.0 * latency_us(proj_flops, proj_br + proj_bw, gpu, dtype);
 
     // FFN: two matmuls [BS, d_model] × [d_model, ffn] + [BS, ffn] × [ffn, d_model].
@@ -226,8 +229,13 @@ fn evaluate_single(
         + latency_us(ffn2_flops, ffn2_br + ffn2_bw, gpu, dtype);
 
     // Norm + softmax.
-    let (nrm_f, nrm_r, nrm_w) = rmsnorm_cost(shape.batch, shape.seq, shape.d_model, shape.dtype_bytes);
-    let (sm_f, sm_r, sm_w) = softmax_cost(shape.batch * heads, shape.seq * shape.seq, shape.dtype_bytes);
+    let (nrm_f, nrm_r, nrm_w) =
+        rmsnorm_cost(shape.batch, shape.seq, shape.d_model, shape.dtype_bytes);
+    let (sm_f, sm_r, sm_w) = softmax_cost(
+        shape.batch * heads,
+        shape.seq * shape.seq,
+        shape.dtype_bytes,
+    );
     let norm_us = latency_us(nrm_f, nrm_r + nrm_w, gpu, dtype);
     let softmax_us = latency_us(sm_f, sm_r + sm_w, gpu, dtype);
 
@@ -254,7 +262,8 @@ fn evaluate_single(
 
     // Parameters: attention 4·d_model·d_out_attn (Q/K/V/O) + FFN 3·d_model·ffn
     // (SwiGLU gate+up+down).
-    let param_bytes = (4 * shape.d_model * d_out_attn + 3 * shape.d_model * ffn) * shape.dtype_bytes
+    let param_bytes = (4 * shape.d_model * d_out_attn + 3 * shape.d_model * ffn)
+        * shape.dtype_bytes
         + (rank * shape.d_model + rank * d_out_attn) * shape.dtype_bytes;
 
     let activation_bytes = bs * shape.d_model * shape.dtype_bytes * 4;

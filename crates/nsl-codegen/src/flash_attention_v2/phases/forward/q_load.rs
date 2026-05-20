@@ -33,10 +33,7 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
     // by emit_rope_epilogue).  In this path we load Q from SMEM into the
     // Q registers (%f{Q_BASE..}) so s_compute can proceed -- we do NOT
     // reload from the HBM q_ptr, which would overwrite the projected Q.
-    let csha_fused_q = config
-        .csha
-        .as_ref()
-        .is_some_and(|c| c.fused_projections);
+    let csha_fused_q = config.csha.as_ref().is_some_and(|c| c.fused_projections);
 
     // q_row_local = q_tile_iter * 4 + warp_id
     ptx.push_str(&format!(
@@ -120,16 +117,15 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
         for i in 0..slices {
             ptx.push_str(&format!(
                 "    // slice {}: d = lane + 32*{} = lane + {}\n",
-                i, i, i * 32
+                i,
+                i,
+                i * 32
             ));
             ptx.push_str("    cvt.u64.u32 %rd28, %lane;\n");
             ptx.push_str(&format!("    add.u64 %rd28, %rd28, {};\n", i * 32));
             ptx.push_str("    shl.b64 %rd29, %rd28, 2;                  // * 4 bytes f32\n");
             ptx.push_str("    add.u64 %rd29, %rd22, %rd29;              // q_base + d*4\n");
-            ptx.push_str(&format!(
-                "    ld.global.f32 %f{}, [%rd29];\n",
-                Q_BASE + i
-            ));
+            ptx.push_str(&format!("    ld.global.f32 %f{}, [%rd29];\n", Q_BASE + i));
 
             // Inline RoPE rotation: only when rope_q=true AND CSHA has not
             // already rotated Q via emit_rope_epilogue (prevents double-rotation).
@@ -156,12 +152,7 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
 // rope_q=false (not called) and will be exercised once Task 13's sweep
 // or a dedicated rope test lands.
 #[allow(dead_code)]
-fn emit_rope_rotation_inline(
-    ptx: &mut String,
-    reg: u32,
-    slice_idx: u32,
-    style: RopeStyle,
-) {
+fn emit_rope_rotation_inline(ptx: &mut String, reg: u32, slice_idx: u32, style: RopeStyle) {
     match style {
         RopeStyle::HalfSplit => {
             ptx.push_str(&format!(
@@ -176,8 +167,14 @@ fn emit_rope_rotation_inline(
                 reg
             ));
             ptx.push_str("    setp.lt.u32 %p0, %lane, 16;\n");
-            ptx.push_str(&format!("    @%p0  fma.rn.f32 %f{}, %f{}, %f0, %f1;\n", reg, reg));
-            ptx.push_str(&format!("    @!%p0 fma.rn.f32 %f{}, %f{}, %f0, %f1;\n", reg, reg));
+            ptx.push_str(&format!(
+                "    @%p0  fma.rn.f32 %f{}, %f{}, %f0, %f1;\n",
+                reg, reg
+            ));
+            ptx.push_str(&format!(
+                "    @!%p0 fma.rn.f32 %f{}, %f{}, %f0, %f1;\n",
+                reg, reg
+            ));
         }
         RopeStyle::Adjacent => {
             ptx.push_str(&format!(

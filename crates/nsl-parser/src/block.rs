@@ -238,11 +238,26 @@ pub fn parse_quant_block_stmt(p: &mut Parser) -> Stmt {
                     if let TokenKind::Ident(dtype_sym) = p.peek().clone() {
                         let dtype_text = p.interner.resolve(dtype_sym).unwrap_or("").to_string();
                         match dtype_text.as_str() {
-                            "int4" => { p.advance(); default_dtype = Some(QuantDtype::Int4); }
-                            "int8" => { p.advance(); default_dtype = Some(QuantDtype::Int8); }
-                            "awq4" => { p.advance(); default_dtype = Some(QuantDtype::Awq4); }
-                            "gptq4" => { p.advance(); default_dtype = Some(QuantDtype::Gptq4); }
-                            "gptq8" => { p.advance(); default_dtype = Some(QuantDtype::Gptq8); }
+                            "int4" => {
+                                p.advance();
+                                default_dtype = Some(QuantDtype::Int4);
+                            }
+                            "int8" => {
+                                p.advance();
+                                default_dtype = Some(QuantDtype::Int8);
+                            }
+                            "awq4" => {
+                                p.advance();
+                                default_dtype = Some(QuantDtype::Awq4);
+                            }
+                            "gptq4" => {
+                                p.advance();
+                                default_dtype = Some(QuantDtype::Gptq4);
+                            }
+                            "gptq8" => {
+                                p.advance();
+                                default_dtype = Some(QuantDtype::Gptq8);
+                            }
                             _ => {
                                 p.diagnostics.push(
                                     nsl_errors::Diagnostic::error(format!(
@@ -1079,7 +1094,11 @@ mod tokenizer_dataset_tests {
         let (tokens, _lex_errs) = nsl_lexer::tokenize(source, file_id, &mut interner);
         let result = crate::parse(&tokens, &mut interner);
 
-        assert!(result.diagnostics.is_empty(), "unexpected parser diagnostics: {:?}", result.diagnostics);
+        assert!(
+            result.diagnostics.is_empty(),
+            "unexpected parser diagnostics: {:?}",
+            result.diagnostics
+        );
         assert_eq!(result.module.stmts.len(), 1);
 
         if let nsl_ast::stmt::StmtKind::TokenizerDef(tok) = &result.module.stmts[0].kind {
@@ -1102,7 +1121,11 @@ mod tokenizer_dataset_tests {
         let (tokens, _lex_errs) = nsl_lexer::tokenize(source, file_id, &mut interner);
         let result = crate::parse(&tokens, &mut interner);
 
-        assert!(result.diagnostics.is_empty(), "unexpected parser diagnostics: {:?}", result.diagnostics);
+        assert!(
+            result.diagnostics.is_empty(),
+            "unexpected parser diagnostics: {:?}",
+            result.diagnostics
+        );
         assert_eq!(result.module.stmts.len(), 1);
 
         if let nsl_ast::stmt::StmtKind::DatasetDef(ds) = &result.module.stmts[0].kind {

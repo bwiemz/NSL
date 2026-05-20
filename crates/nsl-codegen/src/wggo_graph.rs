@@ -137,7 +137,10 @@ pub fn infer_role(name: &str) -> LayerRole {
         LayerRole::Ffn
     } else if lname.contains("attn") {
         LayerRole::Attention
-    } else if lname.starts_with("blocks.") || lname.starts_with("layers.") || lname.starts_with("h.") {
+    } else if lname.starts_with("blocks.")
+        || lname.starts_with("layers.")
+        || lname.starts_with("h.")
+    {
         LayerRole::Block
     } else {
         LayerRole::Other

@@ -104,8 +104,8 @@ use nsl_codegen::flash_attention_v2::{
 use std::ffi::{c_void, CString};
 
 use nsl_runtime::{
-    nsl_cuda_init, nsl_test_cuda_alloc, nsl_test_cuda_d2h, nsl_test_cuda_free,
-    nsl_test_cuda_h2d, nsl_test_cuda_jit_log,
+    nsl_cuda_init, nsl_test_cuda_alloc, nsl_test_cuda_d2h, nsl_test_cuda_free, nsl_test_cuda_h2d,
+    nsl_test_cuda_jit_log,
 };
 
 // `nsl_kernel_launch` is `#[no_mangle] pub extern "C"` in nsl-runtime but
@@ -431,8 +431,12 @@ fn tier_b1_canonical_matches_cpu_reference() {
         nsl_kernel_launch(
             ptx.as_ptr() as i64,
             kernel_name.as_ptr() as i64,
-            /* grid */ 1, 1, 1,
-            /* block */ 256, 1, 1,
+            /* grid */ 1,
+            1,
+            1,
+            /* block */ 256,
+            1,
+            1,
             args.as_ptr() as i64,
             args.len() as i64,
             /* smem_dynamic */ 0,
@@ -529,7 +533,10 @@ fn tier_b1_canonical_matches_cpu_reference() {
     } else if max_abs < 5e-3 {
         eprintln!("[N4] DIAGNOSIS (a): helper convention is CORRECT (max_abs={:.4e} within f16 tolerance)", max_abs);
     } else if max_abs < 1.0 {
-        eprintln!("[N4] DIAGNOSIS (b): STRUCTURED drift (max_abs={:.4e}); see per-row pattern above", max_abs);
+        eprintln!(
+            "[N4] DIAGNOSIS (b): STRUCTURED drift (max_abs={:.4e}); see per-row pattern above",
+            max_abs
+        );
     } else {
         eprintln!("[N4] DIAGNOSIS (c): UNSTRUCTURED drift (max_abs={:.4e}); helper likely needs PTX-spec rewrite", max_abs);
     }

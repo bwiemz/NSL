@@ -91,8 +91,7 @@ train(model = m, epochs = 1):
 
 #[test]
 fn method_decorator_inference_populates_context() {
-    let (ctx_set, head_dim, _has_bwd) =
-        flash_gap_f_context_for_source(METHOD_INFERENCE_SRC);
+    let (ctx_set, head_dim, _has_bwd) = flash_gap_f_context_for_source(METHOD_INFERENCE_SRC);
     assert!(
         ctx_set,
         "Gap F.1: `@flash_attention` on a `ModelMember::Method` must \
@@ -111,8 +110,7 @@ fn method_decorator_inference_populates_context() {
 
 #[test]
 fn method_decorator_training_hd32_embeds_backward_ptx() {
-    let (ctx_set, head_dim, has_bwd) =
-        flash_gap_f_context_for_source(METHOD_TRAINING_HD32_SRC);
+    let (ctx_set, head_dim, has_bwd) = flash_gap_f_context_for_source(METHOD_TRAINING_HD32_SRC);
     assert!(
         ctx_set,
         "Gap F.1 + F.2: `@flash_attention(head_dim=32)` on a \

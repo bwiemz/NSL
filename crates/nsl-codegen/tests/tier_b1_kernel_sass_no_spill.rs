@@ -110,15 +110,13 @@ fn tier_b1_canonical_no_register_spills() {
     );
 
     assert_eq!(
-        ldl_count,
-        0,
+        ldl_count, 0,
         "tier_b1 canonical config emitted {} LDL (register spill loads); \
          spec section 11 requires 0 for admitted V3 supported-matrix configs",
         ldl_count
     );
     assert_eq!(
-        stl_count,
-        0,
+        stl_count, 0,
         "tier_b1 canonical config emitted {} STL (register spill stores); \
          spec section 11 requires 0 for admitted V3 supported-matrix configs",
         stl_count

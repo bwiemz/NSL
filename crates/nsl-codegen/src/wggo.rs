@@ -22,13 +22,13 @@ use crate::wggo_apply::{apply, AppliedPlan};
 use crate::wggo_conflicts::{greedy_resolve, LayerDecisions, Resolution};
 use crate::wggo_cost::{build_lut, LayerCostLut, LayerShape, LutAxes};
 use crate::wggo_dp::{solve as dp_solve, ClusterSpec, DpConfig, ImportanceScores, InterLayerPlan};
+use crate::wggo_gradient_scorer::GradientScorer;
 use crate::wggo_graph::{build as build_graph, OptGraph};
 use crate::wggo_ilp::{
     solve_all_greedy as ilp_solve_all_greedy, solve_all_templated as ilp_solve_all_templated,
     LayerIlpConstraints, LayerIlpSolution, TemplateStats,
 };
 use crate::wggo_schedule::{build_schedule, CommSchedule};
-use crate::wggo_gradient_scorer::GradientScorer;
 use crate::wggo_weight_analysis::{
     analyze as analyze_weights, score_layer_magnitude, AnalysisConfig, NullWeightProvider,
     WeightAnalysisReport, WeightProvider,
@@ -138,9 +138,21 @@ impl WggoPlan {
             s,
             "  Pipeline stages: {}, ZeRO shard: params={}/grads={}/optim={}",
             self.inter_layer.pipeline_stages,
-            self.inter_layer.layers.first().map(|l| l.shard_params).unwrap_or(1),
-            self.inter_layer.layers.first().map(|l| l.shard_grads).unwrap_or(1),
-            self.inter_layer.layers.first().map(|l| l.shard_optim).unwrap_or(1),
+            self.inter_layer
+                .layers
+                .first()
+                .map(|l| l.shard_params)
+                .unwrap_or(1),
+            self.inter_layer
+                .layers
+                .first()
+                .map(|l| l.shard_grads)
+                .unwrap_or(1),
+            self.inter_layer
+                .layers
+                .first()
+                .map(|l| l.shard_optim)
+                .unwrap_or(1),
         )
         .unwrap();
         writeln!(s, "Level 2 (per-layer ILP):").unwrap();
@@ -156,7 +168,11 @@ impl WggoPlan {
                 layer.adapter_rank,
                 layer.optim_m_bits,
                 layer.optim_v_bits,
-                if layer.fase_fused { "fused" } else { "deferred" },
+                if layer.fase_fused {
+                    "fused"
+                } else {
+                    "deferred"
+                },
                 match layer.packing_mode {
                     0 => "none",
                     1 => "segment_id",
@@ -181,7 +197,12 @@ impl WggoPlan {
             self.applied.peak_memory_bytes as f64 / 1e6
         )
         .unwrap();
-        writeln!(s, "  Solve time: {:.2} ms", self.estimated_solve_us as f64 / 1000.0).unwrap();
+        writeln!(
+            s,
+            "  Solve time: {:.2} ms",
+            self.estimated_solve_us as f64 / 1000.0
+        )
+        .unwrap();
         writeln!(
             s,
             "  Templates: {} solved, {} layers reused",
@@ -517,8 +538,7 @@ pub fn run_on_wengert_with_weights(
 
     // Check the sidecar cache first — a hit lets us skip the
     // checkpoint load entirely.
-    let cached_report = weights_path
-        .and_then(crate::wggo_weight_analysis_cache::try_load);
+    let cached_report = weights_path.and_then(crate::wggo_weight_analysis_cache::try_load);
 
     // Load the weights file up front so its lifetime covers the call.
     // Skip the load when the cache hit already carries the scores.
@@ -539,9 +559,8 @@ pub fn run_on_wengert_with_weights(
             }
         })
     };
-    let weights_ref: Option<&dyn WeightProvider> = checkpoint
-        .as_ref()
-        .map(|ck| ck as &dyn WeightProvider);
+    let weights_ref: Option<&dyn WeightProvider> =
+        checkpoint.as_ref().map(|ck| ck as &dyn WeightProvider);
 
     // Build the gradient scorer when compile options are present.
     // `build_scorer` selects Null/Magnitude/Calibrated based on
@@ -551,8 +570,7 @@ pub fn run_on_wengert_with_weights(
     // validation, but we guard here too).
     let scorer: Option<Box<dyn crate::wggo_gradient_scorer::GradientScorer>> =
         if let Some(opts) = compile_options {
-            let provider: Arc<dyn WeightProvider + Send + Sync> =
-                Arc::new(NullWeightProvider);
+            let provider: Arc<dyn WeightProvider + Send + Sync> = Arc::new(NullWeightProvider);
             match build_scorer(opts, provider) {
                 Ok(s) => Some(s),
                 Err(e) => {
@@ -823,7 +841,10 @@ mod tests {
         // still populates per_layer and the report field.
         let w = two_block_wengert();
         let plan = run(toy_input(&w));
-        assert_eq!(plan.weight_analysis.per_layer.len(), plan.inter_layer.layers.len());
+        assert_eq!(
+            plan.weight_analysis.per_layer.len(),
+            plan.inter_layer.layers.len()
+        );
         assert!(plan.weight_analysis.layers_without_weights >= 1);
         let rep = plan.render_report();
         assert!(rep.contains("Weight analysis"));
@@ -1001,7 +1022,7 @@ mod tests {
         let scorer: Box<dyn GradientScorer> = Box::new(CalibratedGradientScorer::new(
             scores,
             MagnitudeFallbackScorer::new(
-                Arc::new(NullWeightProvider) as Arc<dyn WeightProvider + Send + Sync>,
+                Arc::new(NullWeightProvider) as Arc<dyn WeightProvider + Send + Sync>
             ),
         ));
 

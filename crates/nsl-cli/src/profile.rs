@@ -37,9 +37,8 @@ pub fn run_profile(args: &ProfileArgs) -> Result<String, String> {
         )
     })?;
 
-    let src = std::fs::read_to_string(&args.file).map_err(|e| {
-        format!("could not read '{}': {}", args.file.display(), e)
-    })?;
+    let src = std::fs::read_to_string(&args.file)
+        .map_err(|e| format!("could not read '{}': {}", args.file.display(), e))?;
     let input = crate::shape_debug::ShapeDebugInput::from_source(
         &src,
         args.file.to_str().unwrap_or("<file>"),
@@ -115,13 +114,8 @@ pub fn run_profile(args: &ProfileArgs) -> Result<String, String> {
         // When Phase-4 source-AD lands in `nsl profile`, replace with the
         // real wengert extraction.
         let wengert = synth_two_block_wengert();
-        let plan = nsl_codegen::wggo::run_on_wengert(
-            &wengert,
-            &args.target,
-            "full",
-            1,
-        )
-        .ok_or_else(|| "WGGO mode 'full' rejected — internal error".to_string())?;
+        let plan = nsl_codegen::wggo::run_on_wengert(&wengert, &args.target, "full", 1)
+            .ok_or_else(|| "WGGO mode 'full' rejected — internal error".to_string())?;
         if args.json {
             report.wggo_explain = Some(plan);
         } else {

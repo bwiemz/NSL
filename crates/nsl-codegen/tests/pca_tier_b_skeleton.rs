@@ -34,18 +34,40 @@ fn skip_writeback_emits_when_feature_enabled() {
     use nsl_codegen::flash_attention::RopeStyle;
 
     let cfg = FlashAttentionConfig {
-        block_q: 64, block_kv: 64, head_dim: 64,
-        causal: true, paged: false, rope_q: true,
-        rope_style: RopeStyle::HalfSplit, gqa_group_size: 2,
-        tree_mask: false, gpu_sm: 120, segment_masked: true, csha: None,
+        block_q: 64,
+        block_kv: 64,
+        head_dim: 64,
+        causal: true,
+        paged: false,
+        rope_q: true,
+        rope_style: RopeStyle::HalfSplit,
+        gqa_group_size: 2,
+        tree_mask: false,
+        gpu_sm: 120,
+        segment_masked: true,
+        csha: None,
     };
     let mut ptx = String::new();
     emit_skip_decision_writeback(
-        &mut ptx, &cfg, 4096,
-        "%qt", "%kvt", "%p_skip_TB", "skip_decisions_ptr",
+        &mut ptx,
+        &cfg,
+        4096,
+        "%qt",
+        "%kvt",
+        "%p_skip_TB",
+        "skip_decisions_ptr",
         /* num_warps = */ 4,
     );
-    assert!(ptx.contains("st.global.u8"), "writeback should emit st.global.u8");
-    assert!(ptx.contains("@%p_writeback_TB"), "writeback should be owner-gated via round-robin predicate");
-    assert!(ptx.contains("selp.u16 %dec_val_TB, 1, 0"), "selp decision encoding missing");
+    assert!(
+        ptx.contains("st.global.u8"),
+        "writeback should emit st.global.u8"
+    );
+    assert!(
+        ptx.contains("@%p_writeback_TB"),
+        "writeback should be owner-gated via round-robin predicate"
+    );
+    assert!(
+        ptx.contains("selp.u16 %dec_val_TB, 1, 0"),
+        "selp decision encoding missing"
+    );
 }

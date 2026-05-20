@@ -119,7 +119,10 @@ impl<'a> Compiler<'a> {
                 // Idempotent.
             }
             Some(Ownership::Owned) => {
-                state.cleanup.expr_ownership.insert(val, Ownership::TapeHeld);
+                state
+                    .cleanup
+                    .expr_ownership
+                    .insert(val, Ownership::TapeHeld);
                 state.cleanup.owned_temporaries.retain(|&v| v != val);
                 if !state.cleanup.tape_held.contains(&val) {
                     state.cleanup.tape_held.push(val);
@@ -127,7 +130,10 @@ impl<'a> Compiler<'a> {
             }
             Some(Ownership::Unknown) | None => {
                 let _ = self.compile_call_by_name(builder, "nsl_tensor_retain", &[val]);
-                state.cleanup.expr_ownership.insert(val, Ownership::TapeHeld);
+                state
+                    .cleanup
+                    .expr_ownership
+                    .insert(val, Ownership::TapeHeld);
                 if !state.cleanup.tape_held.contains(&val) {
                     state.cleanup.tape_held.push(val);
                 }
@@ -166,19 +172,11 @@ impl<'a> Compiler<'a> {
     /// branch compiles and pass that snapshot as `base_len`. The
     /// legacy `tensor_temporaries` queue is drained separately by the
     /// existing per-branch truncate + explicit free loop.
-    pub fn purge_branch_local_ownership(
-        &self,
-        state: &mut FuncState,
-        base_len: usize,
-    ) {
+    pub fn purge_branch_local_ownership(&self, state: &mut FuncState, base_len: usize) {
         if state.cleanup.owned_temporaries.len() <= base_len {
             return;
         }
-        let drained: Vec<_> = state
-            .cleanup
-            .owned_temporaries
-            .drain(base_len..)
-            .collect();
+        let drained: Vec<_> = state.cleanup.owned_temporaries.drain(base_len..).collect();
         for v in drained {
             state.cleanup.expr_ownership.remove(&v);
         }

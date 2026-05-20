@@ -65,18 +65,18 @@
 
 use nsl_codegen::flash_attention::{CshaExtras, FlashAttentionConfig, RopeStyle};
 use nsl_codegen::flash_attention_selector::{
-    flash_attention_kernel_name_selected,
-    shared_mem_bytes_selected,
+    flash_attention_kernel_name_selected, shared_mem_bytes_selected,
     synthesize_flash_attention_ptx_selected,
 };
-use nsl_codegen::flash_attention_v2::smem_layout::{needs_dynamic_smem, total_bytes, validate_scalar_v2_config, Direction};
+use nsl_codegen::flash_attention_v2::smem_layout::{
+    needs_dynamic_smem, total_bytes, validate_scalar_v2_config, Direction,
+};
 use std::ffi::CString;
 
-use nsl_runtime::{
-    nsl_cuda_init, nsl_test_cuda_alloc, nsl_test_cuda_free,
-    nsl_test_cuda_h2d, nsl_test_cuda_d2h,
-};
 use nsl_runtime::flash_attention::nsl_flash_attention_csha;
+use nsl_runtime::{
+    nsl_cuda_init, nsl_test_cuda_alloc, nsl_test_cuda_d2h, nsl_test_cuda_free, nsl_test_cuda_h2d,
+};
 
 fn cuda_available() -> bool {
     if std::env::var("NSL_SKIP_CUDA_TESTS").is_ok() {
@@ -94,14 +94,18 @@ fn cuda_available() -> bool {
 /// Build a CSHA config for head_dim=128, fused projections, with explicit d_model.
 fn cfg_128(d_model: u32) -> FlashAttentionConfig {
     FlashAttentionConfig {
-        block_q: 32, block_kv: 32, head_dim: 128,
+        block_q: 32,
+        block_kv: 32,
+        head_dim: 128,
         causal: false,
         paged: false,
         rope_q: false,
         rope_style: RopeStyle::HalfSplit,
         gqa_group_size: 1,
         tree_mask: false,
-        gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras {
+        gpu_sm: 75,
+        segment_masked: false,
+        csha: Some(CshaExtras {
             level: 2,
             fused_rmsnorm: true,
             fused_projections: true,
@@ -129,7 +133,8 @@ fn track_b_d_model_128_rejected_by_validator() {
     let smem_total = total_bytes(&config);
     eprintln!(
         "[TrackB] d_model=128 smem_total={} bytes ({:.2} KB)",
-        smem_total, smem_total as f32 / 1024.0
+        smem_total,
+        smem_total as f32 / 1024.0
     );
 
     // Must require dynamic SMEM (> 48 KB static cap).
@@ -145,9 +150,13 @@ fn track_b_d_model_128_rejected_by_validator() {
         result.is_err(),
         "d_model=128 ({} bytes = {:.2} KB) must be rejected by validator \
          (device limit 99 KB)",
-        smem_total, smem_total as f32 / 1024.0
+        smem_total,
+        smem_total as f32 / 1024.0
     );
-    eprintln!("[TrackB] d_model=128 correctly rejected: {:?}", result.err());
+    eprintln!(
+        "[TrackB] d_model=128 correctly rejected: {:?}",
+        result.err()
+    );
 }
 
 /// Part B regression: d_model=32 with head_dim=128 must launch successfully.
@@ -162,17 +171,19 @@ fn track_b_d_model_128_rejected_by_validator() {
 #[test]
 #[ignore = "requires CUDA GPU"]
 fn track_b_head_dim_128_d_model_32_launches() {
-    if !cuda_available() { return; }
+    if !cuda_available() {
+        return;
+    }
 
-    let head_dim  = 128usize;
-    let d_model   = 32usize;
-    let block_q   = 32u32;
-    let block_kv  = 32u32;
-    let heads     = 4usize;
-    let seq       = block_q as usize;
-    let batch     = 1usize;
-    let norm_eps  = 1e-5f32;
-    let scale     = 1.0f32 / (head_dim as f32).sqrt();
+    let head_dim = 128usize;
+    let d_model = 32usize;
+    let block_q = 32u32;
+    let block_kv = 32u32;
+    let heads = 4usize;
+    let seq = block_q as usize;
+    let batch = 1usize;
+    let norm_eps = 1e-5f32;
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
 
     let config = cfg_128(d_model as u32);
 
@@ -181,7 +192,9 @@ fn track_b_head_dim_128_d_model_32_launches() {
     let is_dynamic = needs_dynamic_smem(&config);
     eprintln!(
         "[TrackB] d_model=32 head_dim=128 smem_total={} bytes ({:.2} KB) dynamic={}",
-        smem_total, smem_total as f32 / 1024.0, is_dynamic
+        smem_total,
+        smem_total as f32 / 1024.0,
+        is_dynamic
     );
     assert!(
         !is_dynamic,
@@ -200,8 +213,12 @@ fn track_b_head_dim_128_d_model_32_launches() {
 
     // Synthesize PTX.
     let mut ptx = synthesize_flash_attention_ptx_selected(&config);
-    while ptx.last() == Some(&0) { ptx.pop(); }
-    if ptx.last() != Some(&b'\n') { ptx.push(b'\n'); }
+    while ptx.last() == Some(&0) {
+        ptx.pop();
+    }
+    if ptx.last() != Some(&b'\n') {
+        ptx.push(b'\n');
+    }
     let dump = std::env::temp_dir().join("track_b_head_dim_128_d32.ptx");
     std::fs::write(&dump, &ptx).ok();
     eprintln!("[TrackB] PTX dumped to: {}", dump.display());
@@ -218,30 +235,41 @@ fn track_b_head_dim_128_d_model_32_launches() {
         !ptx_str.contains(".extern .shared"),
         "d_model=32 head_dim=128 PTX must NOT use .extern .shared (fits static budget)"
     );
-    eprintln!("[TrackB] PTX SMEM declaration: OK (static .shared[{}])", smem_total);
+    eprintln!(
+        "[TrackB] PTX SMEM declaration: OK (static .shared[{}])",
+        smem_total
+    );
 
-    ptx.push(0);  // NUL-terminate for cuModuleLoadData.
+    ptx.push(0); // NUL-terminate for cuModuleLoadData.
     let kernel_name = CString::new(flash_attention_kernel_name_selected(&config)).unwrap();
-    let smem_dynamic = 0i64;  // static SMEM — pass 0 so runtime skips cuFuncSetAttribute
+    let smem_dynamic = 0i64; // static SMEM — pass 0 so runtime skips cuFuncSetAttribute
 
     // Allocate device memory.
-    let x_elems   = batch * heads * seq * head_dim;
-    let w_elems   = d_model * head_dim;
+    let x_elems = batch * heads * seq * head_dim;
+    let w_elems = d_model * head_dim;
     let qkv_elems = batch * heads * seq * head_dim;
-    let x_dev  = unsafe { nsl_test_cuda_alloc((x_elems   * 4) as i64) };
-    let wq_dev = unsafe { nsl_test_cuda_alloc((w_elems    * 2) as i64) };
-    let wk_dev = unsafe { nsl_test_cuda_alloc((w_elems    * 2) as i64) };
-    let wv_dev = unsafe { nsl_test_cuda_alloc((w_elems    * 2) as i64) };
-    let nw_dev = unsafe { nsl_test_cuda_alloc((head_dim   * 4) as i64) };
-    let q_dev  = unsafe { nsl_test_cuda_alloc((qkv_elems  * 4) as i64) };
-    let k_dev  = unsafe { nsl_test_cuda_alloc((qkv_elems  * 4) as i64) };
-    let v_dev  = unsafe { nsl_test_cuda_alloc((qkv_elems  * 4) as i64) };
+    let x_dev = unsafe { nsl_test_cuda_alloc((x_elems * 4) as i64) };
+    let wq_dev = unsafe { nsl_test_cuda_alloc((w_elems * 2) as i64) };
+    let wk_dev = unsafe { nsl_test_cuda_alloc((w_elems * 2) as i64) };
+    let wv_dev = unsafe { nsl_test_cuda_alloc((w_elems * 2) as i64) };
+    let nw_dev = unsafe { nsl_test_cuda_alloc((head_dim * 4) as i64) };
+    let q_dev = unsafe { nsl_test_cuda_alloc((qkv_elems * 4) as i64) };
+    let k_dev = unsafe { nsl_test_cuda_alloc((qkv_elems * 4) as i64) };
+    let v_dev = unsafe { nsl_test_cuda_alloc((qkv_elems * 4) as i64) };
     let out_dev = unsafe { nsl_test_cuda_alloc((qkv_elems * 2) as i64) };
     let lse_dev = unsafe { nsl_test_cuda_alloc((batch * heads * seq * 4) as i64) };
 
-    let ptrs = [x_dev, wq_dev, wk_dev, wv_dev, nw_dev, q_dev, k_dev, v_dev, out_dev, lse_dev];
+    let ptrs = [
+        x_dev, wq_dev, wk_dev, wv_dev, nw_dev, q_dev, k_dev, v_dev, out_dev, lse_dev,
+    ];
     if !ptrs.iter().all(|&p| p != 0) {
-        for &p in &ptrs { if p != 0 { unsafe { nsl_test_cuda_free(p); } } }
+        for &p in &ptrs {
+            if p != 0 {
+                unsafe {
+                    nsl_test_cuda_free(p);
+                }
+            }
+        }
         panic!("[TrackB] device allocation failed");
     }
 
@@ -252,49 +280,73 @@ fn track_b_head_dim_128_d_model_32_launches() {
         .collect();
     let nw_f32 = vec![1.0f32; head_dim];
     unsafe {
-        nsl_test_cuda_h2d(x_dev,  x_f32.as_ptr()  as i64, (x_elems * 4) as i64);
-        nsl_test_cuda_h2d(wq_dev, w_f16.as_ptr()  as i64, (w_elems * 2) as i64);
-        nsl_test_cuda_h2d(wk_dev, w_f16.as_ptr()  as i64, (w_elems * 2) as i64);
-        nsl_test_cuda_h2d(wv_dev, w_f16.as_ptr()  as i64, (w_elems * 2) as i64);
+        nsl_test_cuda_h2d(x_dev, x_f32.as_ptr() as i64, (x_elems * 4) as i64);
+        nsl_test_cuda_h2d(wq_dev, w_f16.as_ptr() as i64, (w_elems * 2) as i64);
+        nsl_test_cuda_h2d(wk_dev, w_f16.as_ptr() as i64, (w_elems * 2) as i64);
+        nsl_test_cuda_h2d(wv_dev, w_f16.as_ptr() as i64, (w_elems * 2) as i64);
         nsl_test_cuda_h2d(nw_dev, nw_f32.as_ptr() as i64, (head_dim * 4) as i64);
     }
 
     // Launch — this tests that head_dim=128 with d_model=32 launches cleanly.
     let rc = unsafe {
         nsl_flash_attention_csha(
-            q_dev, k_dev, v_dev, out_dev, lse_dev,
+            q_dev,
+            k_dev,
+            v_dev,
+            out_dev,
+            lse_dev,
             scale.to_bits() as i64,
-            batch as i64, heads as i64, seq as i64, head_dim as i64,
-            0, 0, 0, 0,    // paging: block_table, k_pool, v_pool, block_size
-            0, 0,          // cos_ptr=0, sin_ptr=0 (identity)
-            0, 0,          // seq_ids, seq_lens
+            batch as i64,
+            heads as i64,
+            seq as i64,
+            head_dim as i64,
+            0,
+            0,
+            0,
+            0, // paging: block_table, k_pool, v_pool, block_size
+            0,
+            0, // cos_ptr=0, sin_ptr=0 (identity)
+            0,
+            0, // seq_ids, seq_lens
             smem_dynamic,
             ptx.as_ptr() as i64,
             kernel_name.as_ptr() as i64,
-            block_q as i64, block_kv as i64,
-            0i64,          // causal=false
+            block_q as i64,
+            block_kv as i64,
+            0i64, // causal=false
             x_dev,
             nw_dev,
-            wq_dev, wk_dev, wv_dev,
-            0i64,          // wo_ptr=null
+            wq_dev,
+            wk_dev,
+            wv_dev,
+            0i64, // wo_ptr=null
             norm_eps.to_bits() as i64,
             heads as i64,
             d_model as i64,
         )
     };
 
-    for &p in &ptrs { unsafe { nsl_test_cuda_free(p); } }
+    for &p in &ptrs {
+        unsafe {
+            nsl_test_cuda_free(p);
+        }
+    }
 
-    assert_eq!(rc, 0, "[TrackB] nsl_flash_attention_csha rc={rc} (expected 0 = CUDA_SUCCESS)");
+    assert_eq!(
+        rc, 0,
+        "[TrackB] nsl_flash_attention_csha rc={rc} (expected 0 = CUDA_SUCCESS)"
+    );
     eprintln!("[TrackB] head_dim=128 d_model=32 launch: OK (rc=0)");
 }
 
 /// Minimal f32 -> f16 helper (round-to-nearest).
 fn f32_to_f16(x: f32) -> u16 {
-    if x.is_nan() { return 0x7E00; }
+    if x.is_nan() {
+        return 0x7E00;
+    }
     let bits = x.to_bits();
     let sign = (bits >> 31) & 1;
-    let exp  = ((bits >> 23) & 0xFF) as i32;
+    let exp = ((bits >> 23) & 0xFF) as i32;
     let mant = bits & 0x7FFFFF;
     if exp == 255 {
         return ((sign << 15) | 0x7C00 | if mant != 0 { 0x200 } else { 0 }) as u16;

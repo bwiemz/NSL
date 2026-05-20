@@ -187,7 +187,11 @@ fn emit_adamw(recipe: &UpdateRecipe, decoupled_wd: bool) -> UpdateProgram {
     //   4. tmp = sqrt(v_hat) + ε
     //   5. tmp = m_hat / tmp
     //   6. θ -= lr * (tmp + wd·θ)    [AdamW]   or   θ -= lr·tmp [Adam, coupled]
-    let wd = if decoupled_wd { recipe.weight_decay } else { 0.0 };
+    let wd = if decoupled_wd {
+        recipe.weight_decay
+    } else {
+        0.0
+    };
 
     let ops = vec![
         // 0. m = β₁·m + (1-β₁)·m_partial     [persistent state update]
@@ -338,7 +342,14 @@ mod tests {
     fn accumulate_is_single_scalar_add() {
         let prog = emit_accumulate(&adamw_recipe());
         assert_eq!(prog.ops.len(), 1);
-        assert!(matches!(prog.ops[0], UpdateOp::ScalarMulAdd { dst: Register::MPartial, src: Register::MPartial, .. }));
+        assert!(matches!(
+            prog.ops[0],
+            UpdateOp::ScalarMulAdd {
+                dst: Register::MPartial,
+                src: Register::MPartial,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -371,7 +382,10 @@ mod tests {
         })
         .recipe;
         let prog = emit_final_step(&recipe);
-        assert!(prog.ops.iter().any(|op| matches!(op, UpdateOp::Sign { .. })));
+        assert!(prog
+            .ops
+            .iter()
+            .any(|op| matches!(op, UpdateOp::Sign { .. })));
     }
 
     #[test]
@@ -418,7 +432,14 @@ mod tests {
         };
         let prog = emit_accumulate(&recipe);
         // m_partial += 0.25 * g
-        let UpdateOp::ScalarMulAdd { dst, src, a, b_src, b_scale } = &prog.ops[0] else {
+        let UpdateOp::ScalarMulAdd {
+            dst,
+            src,
+            a,
+            b_src,
+            b_scale,
+        } = &prog.ops[0]
+        else {
             panic!("expected ScalarMulAdd, got {:?}", prog.ops[0]);
         };
         assert_eq!(*dst, Register::MPartial);
@@ -440,9 +461,12 @@ mod tests {
         let recipe = UpdateRecipe {
             optimizer: FaseOptimizer::Sgd,
             lr: 0.01,
-            beta1: 0.0, beta2: 0.0,
-            one_minus_beta1: 0.0, one_minus_beta2: 0.0,
-            eps: 0.0, weight_decay: 0.0,
+            beta1: 0.0,
+            beta2: 0.0,
+            one_minus_beta1: 0.0,
+            one_minus_beta2: 0.0,
+            eps: 0.0,
+            weight_decay: 0.0,
             accum_scale: 0.25,
             v_uses_approx: false,
         };
@@ -458,14 +482,20 @@ mod tests {
         let recipe = UpdateRecipe {
             optimizer: FaseOptimizer::SgdMomentum,
             lr: 0.01,
-            beta1: 0.0, beta2: 0.0,
-            one_minus_beta1: 0.0, one_minus_beta2: 0.0,
-            eps: 0.0, weight_decay: 0.0,
+            beta1: 0.0,
+            beta2: 0.0,
+            one_minus_beta1: 0.0,
+            one_minus_beta2: 0.0,
+            eps: 0.0,
+            weight_decay: 0.0,
             accum_scale: 0.25,
             v_uses_approx: false,
         };
         let prog = emit_sgd(&recipe, /*with_momentum=*/ true);
-        let UpdateOp::ScalarMulAdd { dst, src, b_src, .. } = &prog.ops[0] else {
+        let UpdateOp::ScalarMulAdd {
+            dst, src, b_src, ..
+        } = &prog.ops[0]
+        else {
             panic!("op 0 should be ScalarMulAdd");
         };
         assert_eq!(*dst, Register::M);
@@ -490,17 +520,33 @@ mod tests {
         let prog = emit_adamw(&recipe, /*decoupled_wd=*/ true);
 
         // Op 0: m = β₁·m + (1-β₁)·m_partial
-        let UpdateOp::ScalarMulAdd { dst, src, a, b_src, b_scale } = &prog.ops[0] else {
+        let UpdateOp::ScalarMulAdd {
+            dst,
+            src,
+            a,
+            b_src,
+            b_scale,
+        } = &prog.ops[0]
+        else {
             panic!("op 0 should be ScalarMulAdd");
         };
         assert_eq!(*dst, Register::M);
         assert_eq!(*src, Register::M);
         assert!((a - 0.9).abs() < 1e-12);
         assert_eq!(*b_src, Some(Register::MPartial));
-        assert!((b_scale - 0.1).abs() < 1e-12, "b_scale must be one_minus_beta1, no extra 1/N");
+        assert!(
+            (b_scale - 0.1).abs() < 1e-12,
+            "b_scale must be one_minus_beta1, no extra 1/N"
+        );
 
         // Op 1: v = β₂·v + (1-β₂)·m_partial²
-        let UpdateOp::SquaredAccumulate { dst, src, operand, scale } = &prog.ops[1] else {
+        let UpdateOp::SquaredAccumulate {
+            dst,
+            src,
+            operand,
+            scale,
+        } = &prog.ops[1]
+        else {
             panic!("op 1 should be SquaredAccumulate");
         };
         assert_eq!(*dst, Register::V);

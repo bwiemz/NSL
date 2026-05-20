@@ -46,7 +46,12 @@ unsafe impl Send for BlockAllocator {}
 
 impl BlockAllocator {
     /// Create a new CPU-backed block allocator.
-    pub fn new_cpu(num_blocks: usize, block_size: usize, num_heads: usize, head_dim: usize) -> Self {
+    pub fn new_cpu(
+        num_blocks: usize,
+        block_size: usize,
+        num_heads: usize,
+        head_dim: usize,
+    ) -> Self {
         let block_stride = num_heads * block_size * head_dim * std::mem::size_of::<f32>();
         let pool_bytes = num_blocks * block_stride;
 
@@ -81,7 +86,12 @@ impl BlockAllocator {
 
     /// Create a new GPU-backed block allocator (requires the `cuda` feature).
     #[cfg(feature = "cuda")]
-    pub fn new_gpu(num_blocks: usize, block_size: usize, num_heads: usize, head_dim: usize) -> Self {
+    pub fn new_gpu(
+        num_blocks: usize,
+        block_size: usize,
+        num_heads: usize,
+        head_dim: usize,
+    ) -> Self {
         let block_stride = num_heads * block_size * head_dim * std::mem::size_of::<f32>();
         let pool_bytes = num_blocks * block_stride;
 
@@ -254,7 +264,10 @@ mod tests {
         let mut ba = BlockAllocator::new_cpu(2, 1, 1, 1);
         assert!(ba.alloc().is_some());
         assert!(ba.alloc().is_some());
-        assert!(ba.alloc().is_none(), "pool should be exhausted after 2 allocs");
+        assert!(
+            ba.alloc().is_none(),
+            "pool should be exhausted after 2 allocs"
+        );
     }
 
     #[test]

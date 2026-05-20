@@ -41,8 +41,8 @@ fn monitor_writes_codegen_manifest_for_matmul_fixture() {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    let manifest_text = std::fs::read_to_string(&manifest_path)
-        .expect("manifest exists but unreadable");
+    let manifest_text =
+        std::fs::read_to_string(&manifest_path).expect("manifest exists but unreadable");
     let manifest: nsl_codegen::profiling::instrument::Manifest =
         serde_json::from_str(&manifest_text).expect("manifest should parse as JSON");
 

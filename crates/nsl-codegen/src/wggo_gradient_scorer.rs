@@ -181,8 +181,8 @@ pub fn build_scorer(
 mod tests {
     use super::*;
     use crate::calibration::sidecar::{PerLayerGradient, Sidecar, WggoHeadGradients};
-    use crate::{CompileOptions, WggoImportance};
     use crate::wggo_weight_analysis::NullWeightProvider;
+    use crate::{CompileOptions, WggoImportance};
 
     fn fixture_shape() -> LayerShape {
         // d_model=256, head_dim=64 → num_heads=4; matches default_for_test_4heads.
@@ -198,10 +198,14 @@ mod tests {
 
     #[test]
     fn magnitude_fallback_returns_some_uniform_with_null_provider() {
-        let s = MagnitudeFallbackScorer::new(Arc::new(NullWeightProvider) as Arc<dyn WeightProvider + Send + Sync>);
+        let s = MagnitudeFallbackScorer::new(
+            Arc::new(NullWeightProvider) as Arc<dyn WeightProvider + Send + Sync>
+        );
         let hi = s.score_layer("k", &fixture_shape()).unwrap();
         assert!(
-            hi.per_head.iter().all(|&v| (v - hi.per_head[0]).abs() < 1e-6),
+            hi.per_head
+                .iter()
+                .all(|&v| (v - hi.per_head[0]).abs() < 1e-6),
             "uniform fallback expected with NullWeightProvider, got {:?}",
             hi.per_head
         );
@@ -213,7 +217,9 @@ mod tests {
         scores.insert("k".into(), vec![10.0f32, 20.0, 30.0, 40.0]);
         let s = CalibratedGradientScorer::new(
             scores,
-            MagnitudeFallbackScorer::new(Arc::new(NullWeightProvider) as Arc<dyn WeightProvider + Send + Sync>),
+            MagnitudeFallbackScorer::new(
+                Arc::new(NullWeightProvider) as Arc<dyn WeightProvider + Send + Sync>
+            ),
         );
         let hi = s.score_layer("k", &fixture_shape()).unwrap();
         assert_eq!(hi.per_head, vec![10.0, 20.0, 30.0, 40.0]);
@@ -223,12 +229,16 @@ mod tests {
     fn calibrated_falls_back_to_magnitude_on_missing_layer() {
         let s = CalibratedGradientScorer::new(
             BTreeMap::new(),
-            MagnitudeFallbackScorer::new(Arc::new(NullWeightProvider) as Arc<dyn WeightProvider + Send + Sync>),
+            MagnitudeFallbackScorer::new(
+                Arc::new(NullWeightProvider) as Arc<dyn WeightProvider + Send + Sync>
+            ),
         );
         // Missing key → magnitude fallback → Some(uniform)
         let hi = s.score_layer("k", &fixture_shape()).unwrap();
         assert!(
-            hi.per_head.iter().all(|&v| (v - hi.per_head[0]).abs() < 1e-6),
+            hi.per_head
+                .iter()
+                .all(|&v| (v - hi.per_head[0]).abs() < 1e-6),
             "expected uniform fallback, got {:?}",
             hi.per_head
         );
@@ -240,7 +250,9 @@ mod tests {
         // return Some — the fallback path covers missing entries.
         let s = CalibratedGradientScorer::new(
             BTreeMap::new(),
-            MagnitudeFallbackScorer::new(Arc::new(NullWeightProvider) as Arc<dyn WeightProvider + Send + Sync>),
+            MagnitudeFallbackScorer::new(
+                Arc::new(NullWeightProvider) as Arc<dyn WeightProvider + Send + Sync>
+            ),
         );
         assert!(s.score_layer("any_layer", &fixture_shape()).is_some());
     }
@@ -250,18 +262,22 @@ mod tests {
         // Verify all three impls can be used through Box<dyn GradientScorer>.
         let scorers: Vec<Box<dyn GradientScorer>> = vec![
             Box::new(NullGradientScorer),
-            Box::new(MagnitudeFallbackScorer::new(Arc::new(NullWeightProvider) as Arc<dyn WeightProvider + Send + Sync>)),
+            Box::new(MagnitudeFallbackScorer::new(
+                Arc::new(NullWeightProvider) as Arc<dyn WeightProvider + Send + Sync>
+            )),
             Box::new(CalibratedGradientScorer::new(
                 BTreeMap::new(),
-                MagnitudeFallbackScorer::new(Arc::new(NullWeightProvider) as Arc<dyn WeightProvider + Send + Sync>),
+                MagnitudeFallbackScorer::new(
+                    Arc::new(NullWeightProvider) as Arc<dyn WeightProvider + Send + Sync>
+                ),
             )),
         ];
         let shape = fixture_shape();
         let results: Vec<Option<HeadImportance>> =
             scorers.iter().map(|s| s.score_layer("l", &shape)).collect();
-        assert!(results[0].is_none());  // Null
-        assert!(results[1].is_some());  // Magnitude
-        assert!(results[2].is_some());  // Calibrated (empty sidecar → fallback)
+        assert!(results[0].is_none()); // Null
+        assert!(results[1].is_some()); // Magnitude
+        assert!(results[2].is_some()); // Calibrated (empty sidecar → fallback)
     }
 
     // -----------------------------------------------------------------------
@@ -342,7 +358,10 @@ mod tests {
         assert_eq!(hit.per_head, vec![1.0]);
         // Missing key falls back to magnitude — uniform with null provider.
         let miss = s.score_layer("y", &fixture_shape()).unwrap();
-        assert!(miss.per_head.iter().all(|&v| (v - miss.per_head[0]).abs() < 1e-6));
+        assert!(miss
+            .per_head
+            .iter()
+            .all(|&v| (v - miss.per_head[0]).abs() < 1e-6));
     }
 
     #[test]
@@ -449,7 +468,10 @@ mod tests {
         // No entry → falls back to magnitude → uniform with NullWeightProvider.
         let scores = s.score_layer("layers.0", &fixture_shape()).unwrap();
         assert!(
-            scores.per_head.iter().all(|&v| (v - scores.per_head[0]).abs() < 1e-6),
+            scores
+                .per_head
+                .iter()
+                .all(|&v| (v - scores.per_head[0]).abs() < 1e-6),
             "empty sidecar should yield uniform magnitude fallback, got {:?}",
             scores.per_head
         );

@@ -163,7 +163,9 @@ pub extern "C" fn nsl_elastic_resize(
     // 4. Adjust grad_accum_steps
     // 5. Resume training
     let new_world = _current_world_size - 1;
-    if new_world <= 0 { return -1; }
+    if new_world <= 0 {
+        return -1;
+    }
     new_world
 }
 
@@ -194,7 +196,7 @@ mod tests {
 
         assert_eq!(result.new_world_size, 28);
         assert_eq!(result.new_dp_replicas, 3); // 28 / (4*2) = 3.5 → 3
-        // Grad accum should increase: 128 / (8 * 3) ≈ 5.33 → 5
+                                               // Grad accum should increase: 128 / (8 * 3) ≈ 5.33 → 5
         assert!(result.new_grad_accum_steps >= 5);
         // Effective batch should be close to original (may differ by rounding)
         let new_batch = result.effective_batch_size;

@@ -15,13 +15,16 @@ fn pre_pass_reads_source_from_disk_when_text_is_none() {
 
     let mut opts = CompileOptions::default();
     opts.profile_kernels = true;
-    opts.profile_source_text = None;                                  // no explicit text
+    opts.profile_source_text = None; // no explicit text
     opts.profile_source_file_name = Some(path.display().to_string()); // only path
 
     // Pass empty src to run_pre_pass_only to force reliance on the disk fallback.
     let result = nsl_codegen::test_helpers::run_pre_pass_only("", &opts).unwrap();
-    assert!(result.source_text.contains("fn forward"),
-        "expected disk-read source in PrePassResult, got {:?}", result.source_text);
+    assert!(
+        result.source_text.contains("fn forward"),
+        "expected disk-read source in PrePassResult, got {:?}",
+        result.source_text
+    );
 }
 
 #[test]
@@ -32,8 +35,10 @@ fn pre_pass_prefers_explicit_text_over_disk_read() {
     opts.profile_source_file_name = Some("/nonexistent/bogus.nsl".to_string());
 
     let result = nsl_codegen::test_helpers::run_pre_pass_only("", &opts).unwrap();
-    assert_eq!(result.source_text, "# explicit override",
-        "explicit profile_source_text should win over disk read");
+    assert_eq!(
+        result.source_text, "# explicit override",
+        "explicit profile_source_text should win over disk read"
+    );
 }
 
 #[test]
@@ -45,6 +50,8 @@ fn pre_pass_tolerates_missing_file_silently() {
 
     // Should not error — fallback is silent; source_text stays empty.
     let result = nsl_codegen::test_helpers::run_pre_pass_only("", &opts).unwrap();
-    assert_eq!(result.source_text, "",
-        "missing file should degrade silently to empty source_text");
+    assert_eq!(
+        result.source_text, "",
+        "missing file should degrade silently to empty source_text"
+    );
 }

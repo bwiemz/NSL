@@ -61,7 +61,9 @@ impl Collector {
         }
     }
     fn drain(&mut self, kernel_id: u32) {
-        let Some(q) = self.drains.get_mut(&kernel_id) else { return };
+        let Some(q) = self.drains.get_mut(&kernel_id) else {
+            return;
+        };
         let agg = self.aggregates.entry(kernel_id).or_insert(Aggregate {
             kernel_id,
             count: 0,
@@ -96,7 +98,9 @@ impl Collector {
         v
     }
     pub fn flush_to(&mut self, path: &Path) -> std::io::Result<()> {
-        let report = ActualReport { aggregates: self.snapshot() };
+        let report = ActualReport {
+            aggregates: self.snapshot(),
+        };
         let s = serde_json::to_string_pretty(&report)?;
         std::fs::write(path, s)
     }

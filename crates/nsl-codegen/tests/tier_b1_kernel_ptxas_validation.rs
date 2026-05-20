@@ -41,11 +41,7 @@ fn run_ptxas_for_sm(sm: u32) {
     }
 
     let mut tmp = std::env::temp_dir();
-    tmp.push(format!(
-        "tier_b1_full_sm{}_{}.ptx",
-        sm,
-        std::process::id()
-    ));
+    tmp.push(format!("tier_b1_full_sm{}_{}.ptx", sm, std::process::id()));
     std::fs::write(&tmp, &ptx_bytes).expect("write ptx temp");
 
     let out = Command::new("ptxas")

@@ -80,8 +80,12 @@ mod tests {
 
     struct DummyHook;
     impl CalibrationHook for DummyHook {
-        fn id(&self) -> &'static str { "dummy" }
-        fn requires(&self) -> ObservationSet { ObservationSet::Empty }
+        fn id(&self) -> &'static str {
+            "dummy"
+        }
+        fn requires(&self) -> ObservationSet {
+            ObservationSet::Empty
+        }
         fn emit_init(&self, _ctx: &mut CalibCtx) {}
         fn emit_per_step(&self, _ctx: &mut CalibCtx) {}
         fn emit_finalize(&self, _ctx: &mut CalibCtx) -> CalibrationResult {

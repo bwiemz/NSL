@@ -1,8 +1,8 @@
-use serde::Serialize;
 use crate::expr::{Arg, Expr};
 use crate::stmt::Block;
 use crate::types::TypeExpr;
 use crate::{Span, Symbol};
+use serde::Serialize;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct FnDef {

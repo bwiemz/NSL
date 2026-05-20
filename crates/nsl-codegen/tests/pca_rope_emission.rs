@@ -43,8 +43,7 @@ fn config_segment_masked_with_rope_for_backward() -> FlashAttentionConfig {
 }
 
 fn ptx_string(cfg: &FlashAttentionConfig) -> String {
-    String::from_utf8(synthesize_flash_attention_ptx_v2(cfg))
-        .expect("PTX must be valid UTF-8")
+    String::from_utf8(synthesize_flash_attention_ptx_v2(cfg)).expect("PTX must be valid UTF-8")
 }
 
 fn backward_ptx_string(cfg: &FlashAttentionConfig) -> String {
@@ -153,7 +152,9 @@ fn assemble_ptx(ptxas_path: &str, ptx_bytes: &[u8], sm_arch: &str) -> Result<(),
         .ok_or("ptxas stdin closed")?
         .write_all(ptx_bytes)
         .map_err(|e| format!("write ptx failed: {e}"))?;
-    let out = child.wait_with_output().map_err(|e| format!("ptxas wait: {e}"))?;
+    let out = child
+        .wait_with_output()
+        .map_err(|e| format!("ptxas wait: {e}"))?;
     if out.status.success() {
         Ok(())
     } else {
@@ -266,8 +267,7 @@ fn backward_loads_doc_starts_to_smem_when_segment_masked_and_rope_q() {
     let cfg = config_segment_masked_with_rope_for_backward();
     let ptx = backward_ptx_string(&cfg);
     assert!(
-        ptx.contains("V2_PCA_ROPE_DOC_STARTS_LOAD_LOOP")
-            || ptx.contains("smem_doc_starts"),
+        ptx.contains("V2_PCA_ROPE_DOC_STARTS_LOAD_LOOP") || ptx.contains("smem_doc_starts"),
         "Backward CTA prologue must populate smem_doc_starts \
          (either via emit_doc_starts_smem_load or equivalent)"
     );
@@ -390,9 +390,13 @@ fn dump_rope_reset_ptx() {
     eprintln!("--- doc_starts section ---");
     let mut in_section = false;
     for line in ptx.lines() {
-        if line.contains("doc_starts_ptr") || line.contains("smem_doc_starts")
-            || line.contains("V2_PCA_ROPE_DOC_STARTS") || line.contains("RoPE-reset")
-            || line.contains("CTA prologue") || line.contains("doc_starts to SMEM") {
+        if line.contains("doc_starts_ptr")
+            || line.contains("smem_doc_starts")
+            || line.contains("V2_PCA_ROPE_DOC_STARTS")
+            || line.contains("RoPE-reset")
+            || line.contains("CTA prologue")
+            || line.contains("doc_starts to SMEM")
+        {
             in_section = true;
         }
         if in_section {

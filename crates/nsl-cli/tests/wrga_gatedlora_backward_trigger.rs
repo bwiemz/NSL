@@ -166,10 +166,7 @@ train(model = m, epochs = {n}):
 }
 
 #[cfg(feature = "cuda")]
-fn run_and_profile(
-    src: &str,
-    name: &str,
-) -> Result<(PathBuf, TempDir), String> {
+fn run_and_profile(src: &str, name: &str) -> Result<(PathBuf, TempDir), String> {
     let tmp = TempDir::new().map_err(|e| e.to_string())?;
     let src_path = tmp.path().join(format!("{name}.nsl"));
     fs::write(&src_path, src).map_err(|e| e.to_string())?;
@@ -303,11 +300,7 @@ fn spread_flag(s: &Stats) -> &'static str {
 }
 
 #[cfg(feature = "cuda")]
-fn measure_phase(
-    src: &str,
-    name: &str,
-    init_markers: usize,
-) -> Result<Stats, String> {
+fn measure_phase(src: &str, name: &str, init_markers: usize) -> Result<Stats, String> {
     let (json_path, _tmp) = run_and_profile(src, name)?;
     let events = parse_trace(&json_path)?;
     let min_expected = init_markers + WARMUP_ITERS + TIMED_ITERS;
@@ -374,9 +367,7 @@ fn wrga_b32_trigger_measurement() {
             let msg = fwd_res.as_ref().err().unwrap();
             if is_oom(msg) {
                 eprintln!("  forward: OOM");
-                report.push_str(
-                    "- forward: **OOM** — workload does not fit on this GPU\n\n",
-                );
+                report.push_str("- forward: **OOM** — workload does not fit on this GPU\n\n");
                 continue;
             }
         }
@@ -385,9 +376,7 @@ fn wrga_b32_trigger_measurement() {
             let msg = bwd_res.as_ref().err().unwrap();
             if is_oom(msg) {
                 eprintln!("  fwd+bwd: OOM");
-                report.push_str(
-                    "- fwd+bwd: **OOM** — workload does not fit on this GPU\n\n",
-                );
+                report.push_str("- fwd+bwd: **OOM** — workload does not fit on this GPU\n\n");
                 continue;
             }
         }
@@ -787,9 +776,7 @@ fn wrga_b32_fused_trigger_final() {
         let verdict = if ratio > 2.5 {
             format!("**TRIGGER FIRES (ratio {ratio:.3}x > 2.5x) - B.3.2 should be scheduled**")
         } else {
-            format!(
-                "trigger does not fire (ratio {ratio:.3}x <= 2.5x) - B.3.2 stays deferred"
-            )
+            format!("trigger does not fire (ratio {ratio:.3}x <= 2.5x) - B.3.2 stays deferred")
         };
         eprintln!(
             "  fused fwd: {:.2}ms/iter   fwd+bwd: {:.2}ms/iter   ratio: {:.3}x   bwd-only: {:.2}ms",
@@ -813,7 +800,10 @@ fn wrga_b32_fused_trigger_final() {
         let _ = fs::create_dir_all(parent);
     }
     fs::write(&report_path, &report).expect("write fused trigger report");
-    eprintln!("\nFused-trigger report written to {}", report_path.display());
+    eprintln!(
+        "\nFused-trigger report written to {}",
+        report_path.display()
+    );
 }
 
 #[cfg(feature = "cuda")]

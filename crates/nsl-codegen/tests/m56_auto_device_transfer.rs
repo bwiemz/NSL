@@ -33,7 +33,11 @@ fn compile_src(src: &str) -> Result<Vec<u8>, String> {
         return Err(format!("lex errors: {:?}", lex_diags));
     }
     let parsed = nsl_parser::parse(&tokens, &mut interner);
-    if parsed.diagnostics.iter().any(|d| matches!(d.level, Level::Error)) {
+    if parsed
+        .diagnostics
+        .iter()
+        .any(|d| matches!(d.level, Level::Error))
+    {
         return Err(format!("parse errors: {:?}", parsed.diagnostics));
     }
     let analysis = nsl_semantic::analyze(&parsed.module, &mut interner);

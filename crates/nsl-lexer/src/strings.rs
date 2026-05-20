@@ -4,7 +4,12 @@ use nsl_errors::{BytePos, Diagnostic};
 
 /// Lex a string literal (single-quoted, double-quoted, or triple-quoted).
 /// The cursor should be positioned at the opening quote character.
-pub fn lex_string(cursor: &mut Cursor, quote: char, start: BytePos, diagnostics: &mut Vec<Diagnostic>) -> TokenKind {
+pub fn lex_string(
+    cursor: &mut Cursor,
+    quote: char,
+    start: BytePos,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> TokenKind {
     cursor.advance(); // consume opening quote
 
     // Check for triple-quoted string
@@ -44,7 +49,12 @@ pub fn lex_string(cursor: &mut Cursor, quote: char, start: BytePos, diagnostics:
     }
 }
 
-fn lex_triple_string(cursor: &mut Cursor, quote: char, start: BytePos, diagnostics: &mut Vec<Diagnostic>) -> TokenKind {
+fn lex_triple_string(
+    cursor: &mut Cursor,
+    quote: char,
+    start: BytePos,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> TokenKind {
     let mut value = String::new();
     let end_seq = [quote; 3];
 
@@ -57,9 +67,10 @@ fn lex_triple_string(cursor: &mut Cursor, quote: char, start: BytePos, diagnosti
                 );
                 return TokenKind::Error("unterminated triple-quoted string".into());
             }
-            Some(c) if c == end_seq[0]
-                && cursor.peek_at(1) == Some(end_seq[1])
-                && cursor.peek_at(2) == Some(end_seq[2]) =>
+            Some(c)
+                if c == end_seq[0]
+                    && cursor.peek_at(1) == Some(end_seq[1])
+                    && cursor.peek_at(2) == Some(end_seq[2]) =>
             {
                 cursor.advance();
                 cursor.advance();
@@ -80,7 +91,11 @@ fn lex_triple_string(cursor: &mut Cursor, quote: char, start: BytePos, diagnosti
     }
 }
 
-fn lex_escape(cursor: &mut Cursor, start: BytePos, diagnostics: &mut Vec<Diagnostic>) -> Option<char> {
+fn lex_escape(
+    cursor: &mut Cursor,
+    start: BytePos,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Option<char> {
     match cursor.advance() {
         Some('n') => Some('\n'),
         Some('t') => Some('\t'),
@@ -149,8 +164,11 @@ fn lex_escape(cursor: &mut Cursor, start: BytePos, diagnostics: &mut Vec<Diagnos
                     Some(ch) => Some(ch),
                     None => {
                         diagnostics.push(
-                            Diagnostic::error(format!("invalid unicode code point: U+{:04X}", code))
-                                .with_label(cursor.span_from(start), "here"),
+                            Diagnostic::error(format!(
+                                "invalid unicode code point: U+{:04X}",
+                                code
+                            ))
+                            .with_label(cursor.span_from(start), "here"),
                         );
                         None
                     }

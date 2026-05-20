@@ -7,8 +7,8 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use nsl_codegen::calibration::{
-    binary_codegen::real_subprocess_entry, identity_hook::IdentityHook, HarnessConfig,
-    HarnessMode, HookRegistry,
+    binary_codegen::real_subprocess_entry, identity_hook::IdentityHook, HarnessConfig, HarnessMode,
+    HookRegistry,
 };
 use nsl_errors::{FileId, Level};
 use nsl_lexer::{tokenize, Interner};
@@ -23,17 +23,18 @@ fn fixture(name: &str) -> PathBuf {
     repo_root().join("tests").join("fixtures").join(name)
 }
 
-fn awq_fixture_compile_bundle(
-) -> (
+fn awq_fixture_compile_bundle() -> (
     Vec<nsl_codegen::calibration::discovery::DiscoveredProjection>,
     Arc<nsl_codegen::calibration::CalibrationCompileBundle>,
 ) {
-    let source = std::fs::read_to_string(fixture("awq_calibration_mlp.nsl"))
-        .expect("awq fixture readable");
+    let source =
+        std::fs::read_to_string(fixture("awq_calibration_mlp.nsl")).expect("awq fixture readable");
     let mut interner = Interner::new();
     let (tokens, lex_diags) = tokenize(&source, FileId(0), &mut interner);
     assert!(
-        lex_diags.iter().all(|diag| !matches!(diag.level, Level::Error)),
+        lex_diags
+            .iter()
+            .all(|diag| !matches!(diag.level, Level::Error)),
         "fixture must lex cleanly: {lex_diags:?}"
     );
 
@@ -47,10 +48,8 @@ fn awq_fixture_compile_bundle(
         parsed.diagnostics
     );
 
-    let projections = nsl_codegen::calibration::pre_scan_awq_projections_from_ast(
-        &parsed.module,
-        &interner,
-    );
+    let projections =
+        nsl_codegen::calibration::pre_scan_awq_projections_from_ast(&parsed.module, &interner);
     let mut analysis_interner = interner.clone();
     let analysis = nsl_semantic::analyze(&parsed.module, &mut analysis_interner);
     let bundle = Arc::new(nsl_codegen::calibration::CalibrationCompileBundle {
@@ -64,7 +63,10 @@ fn awq_fixture_compile_bundle(
 
 #[test]
 fn real_subprocess_entry_produces_runnable_binary_with_identity_hook() {
-    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
     let tmp_dir = std::env::temp_dir().join(format!("nsl-calib-binary-test-{nanos}"));
     fs::create_dir_all(&tmp_dir).unwrap();
     let ckpt = tmp_dir.join("ckpt.safetensors");
@@ -111,7 +113,10 @@ fn real_subprocess_entry_produces_runnable_binary_with_identity_hook() {
 fn real_subprocess_entry_accepts_linear_input_activations_hooks() {
     use nsl_codegen::calibration::awq_hook::AwqCalibrationHook;
 
-    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
     let tmp_dir = std::env::temp_dir().join(format!("nsl-calib-accept-test-{nanos}"));
     fs::create_dir_all(&tmp_dir).unwrap();
     let ckpt = tmp_dir.join("ckpt.safetensors");
@@ -120,7 +125,11 @@ fn real_subprocess_entry_accepts_linear_input_activations_hooks() {
 
     let (mut projections, compile_bundle) = awq_fixture_compile_bundle();
     projections.retain(|projection| projection.weight_shape[1] == 64);
-    assert_eq!(projections.len(), 1, "fixture should retain exactly one 64-channel projection");
+    assert_eq!(
+        projections.len(),
+        1,
+        "fixture should retain exactly one 64-channel projection"
+    );
 
     let mut registry = HookRegistry::new();
     registry.register(Box::new(AwqCalibrationHook::from_discovered(&projections)));
@@ -167,7 +176,10 @@ fn real_subprocess_entry_accepts_linear_input_activations_hooks() {
 fn real_subprocess_entry_reports_batch_shape_mismatch_for_forward_hooks() {
     use nsl_codegen::calibration::awq_hook::AwqCalibrationHook;
 
-    let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
     let tmp_dir = std::env::temp_dir().join(format!("nsl-calib-batch-shape-test-{nanos}"));
     fs::create_dir_all(&tmp_dir).unwrap();
     let ckpt = tmp_dir.join("ckpt.safetensors");
@@ -219,7 +231,11 @@ fn real_subprocess_entry_with_valid_awq_weights_produces_sidecar() {
 
     let (mut projections, compile_bundle) = awq_fixture_compile_bundle();
     projections.retain(|projection| projection.weight_shape[1] == 64);
-    assert_eq!(projections.len(), 1, "fixture should retain exactly one 64-channel projection");
+    assert_eq!(
+        projections.len(),
+        1,
+        "fixture should retain exactly one 64-channel projection"
+    );
 
     let mut registry = HookRegistry::new();
     registry.register(Box::new(AwqCalibrationHook::from_discovered(&projections)));

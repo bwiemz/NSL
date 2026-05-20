@@ -128,8 +128,7 @@ pub fn read_trace_file(path: &Path) -> io::Result<(TraceHeader, Vec<TraceEntry>)
     // Read header.
     let mut header_bytes = [0u8; std::mem::size_of::<TraceHeader>()];
     file.read_exact(&mut header_bytes)?;
-    let header =
-        unsafe { std::ptr::read_unaligned(header_bytes.as_ptr() as *const TraceHeader) };
+    let header = unsafe { std::ptr::read_unaligned(header_bytes.as_ptr() as *const TraceHeader) };
 
     if header.magic != TRACE_MAGIC {
         return Err(io::Error::new(
@@ -145,8 +144,7 @@ pub fn read_trace_file(path: &Path) -> io::Result<(TraceHeader, Vec<TraceEntry>)
     let mut entry_bytes = vec![0u8; entry_size];
     for _ in 0..num_ops {
         file.read_exact(&mut entry_bytes)?;
-        let entry =
-            unsafe { std::ptr::read_unaligned(entry_bytes.as_ptr() as *const TraceEntry) };
+        let entry = unsafe { std::ptr::read_unaligned(entry_bytes.as_ptr() as *const TraceEntry) };
         entries.push(entry);
     }
 
@@ -176,11 +174,7 @@ pub enum DiffResult {
 ///
 /// Compares entry-by-entry: first checks op_type match, then checks whether
 /// the output stats (mean, max) diverge beyond `threshold`.
-pub fn find_first_divergence(
-    a: &[TraceEntry],
-    b: &[TraceEntry],
-    threshold: f32,
-) -> DiffResult {
+pub fn find_first_divergence(a: &[TraceEntry], b: &[TraceEntry], threshold: f32) -> DiffResult {
     if a.len() != b.len() {
         return DiffResult::LengthMismatch {
             len_a: a.len(),
@@ -189,10 +183,7 @@ pub fn find_first_divergence(
     }
     for i in 0..a.len() {
         if a[i].op_type() != b[i].op_type() {
-            return DiffResult::OpMismatch {
-                pos_a: i,
-                pos_b: i,
-            };
+            return DiffResult::OpMismatch { pos_a: i, pos_b: i };
         }
         let delta_mean = (a[i].out_mean() - b[i].out_mean()).abs();
         let delta_max = (a[i].out_max() - b[i].out_max()).abs();
@@ -261,12 +252,7 @@ pub fn export_chrome_json(entries: &[TraceEntry], op_names: &[&str]) -> String {
 
 /// Run the debug command: read trace, print summary, optionally find NaN,
 /// diff, or export Chrome JSON.
-pub fn run_debug(
-    file: &Path,
-    find_nan: bool,
-    diff: Option<&Path>,
-    export_chrome: Option<&Path>,
-) {
+pub fn run_debug(file: &Path, find_nan: bool, diff: Option<&Path>, export_chrome: Option<&Path>) {
     let (header, entries) = read_trace_file(file).unwrap_or_else(|e| {
         eprintln!("error: failed to read trace '{}': {e}", file.display());
         std::process::exit(1);
@@ -493,9 +479,7 @@ mod tests {
         let b = vec![make_entry(0, 1, 0, 5.0, 2.0)];
         match find_first_divergence(&a, &b, 0.5) {
             DiffResult::StatsDiverge {
-                op_id,
-                delta_mean,
-                ..
+                op_id, delta_mean, ..
             } => {
                 assert_eq!(op_id, 0);
                 assert!((delta_mean - 4.0).abs() < 0.01);
@@ -507,10 +491,7 @@ mod tests {
     #[test]
     fn diff_length_mismatch() {
         let a = vec![make_entry(0, 1, 0, 1.0, 2.0)];
-        let b = vec![
-            make_entry(0, 1, 0, 1.0, 2.0),
-            make_entry(1, 2, 0, 3.0, 4.0),
-        ];
+        let b = vec![make_entry(0, 1, 0, 1.0, 2.0), make_entry(1, 2, 0, 3.0, 4.0)];
         match find_first_divergence(&a, &b, 0.01) {
             DiffResult::LengthMismatch { len_a, len_b } => {
                 assert_eq!(len_a, 1);

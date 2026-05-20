@@ -55,7 +55,8 @@ pub extern "C" fn nsl_serve_enqueue(
     };
     let mut guard = SERVE_CTX.lock().unwrap();
     let ctx = guard.as_mut().expect("nsl_serve_init not called");
-    ctx.scheduler.enqueue(tokens, max_tokens as usize, temperature, top_p) as i64
+    ctx.scheduler
+        .enqueue(tokens, max_tokens as usize, temperature, top_p) as i64
 }
 
 #[no_mangle]
@@ -70,7 +71,14 @@ pub extern "C" fn nsl_serve_step() -> i64 {
 pub extern "C" fn nsl_serve_record_token(request_id: i64, token_id: i64) -> i64 {
     let mut guard = SERVE_CTX.lock().unwrap();
     let ctx = guard.as_mut().expect("nsl_serve_init not called");
-    if ctx.scheduler.record_token(request_id as RequestId, token_id) { 1 } else { 0 }
+    if ctx
+        .scheduler
+        .record_token(request_id as RequestId, token_id)
+    {
+        1
+    } else {
+        0
+    }
 }
 
 #[no_mangle]
@@ -86,7 +94,11 @@ pub extern "C" fn nsl_serve_drain_completed() -> i64 {
 pub extern "C" fn nsl_serve_has_work() -> i64 {
     let guard = SERVE_CTX.lock().unwrap();
     let ctx = guard.as_ref().expect("nsl_serve_init not called");
-    if ctx.scheduler.has_work() { 1 } else { 0 }
+    if ctx.scheduler.has_work() {
+        1
+    } else {
+        0
+    }
 }
 
 #[no_mangle]
@@ -100,7 +112,12 @@ pub extern "C" fn nsl_serve_completed_count() -> i64 {
 pub extern "C" fn nsl_serve_preempt(request_id: i64) -> i64 {
     let mut guard = SERVE_CTX.lock().unwrap();
     let ctx = guard.as_mut().expect("nsl_serve_init not called");
-    if let Some(req) = ctx.scheduler.active.iter_mut().find(|r| r.id == request_id as u64) {
+    if let Some(req) = ctx
+        .scheduler
+        .active
+        .iter_mut()
+        .find(|r| r.id == request_id as u64)
+    {
         PreemptionManager::preempt_recompute(req);
         0
     } else {
@@ -136,7 +153,12 @@ pub extern "C" fn nsl_serve_apply_grammar(request_id: i64, logits_ptr: i64) -> i
     };
 
     // Find the request and apply its grammar mask
-    if let Some(req) = ctx.scheduler.active.iter().find(|r| r.id == request_id as u64) {
+    if let Some(req) = ctx
+        .scheduler
+        .active
+        .iter()
+        .find(|r| r.id == request_id as u64)
+    {
         if let Some(ref grammar_state) = req.grammar_state {
             if grammar_state.active {
                 // Lock GRAMMAR_CTX directly — avoid FFI wrapper's redundant lock in hot path
@@ -152,7 +174,9 @@ pub extern "C" fn nsl_serve_apply_grammar(request_id: i64, logits_ptr: i64) -> i
                                 grammar_ctx.fsm.vocab_size,
                             )
                         };
-                        grammar_ctx.fsm.apply_logit_mask(logits, grammar_state.current_state);
+                        grammar_ctx
+                            .fsm
+                            .apply_logit_mask(logits, grammar_state.current_state);
                     }
                 }
             }
@@ -175,7 +199,12 @@ pub extern "C" fn nsl_serve_advance_grammar(request_id: i64, token_id: i64) -> i
         None => return -2,
     };
 
-    if let Some(req) = ctx.scheduler.active.iter_mut().find(|r| r.id == request_id as u64) {
+    if let Some(req) = ctx
+        .scheduler
+        .active
+        .iter_mut()
+        .find(|r| r.id == request_id as u64)
+    {
         if let Some(ref mut grammar_state) = req.grammar_state {
             if grammar_state.active {
                 // Lock GRAMMAR_CTX directly — avoid FFI wrapper's redundant lock
@@ -184,7 +213,10 @@ pub extern "C" fn nsl_serve_advance_grammar(request_id: i64, token_id: i64) -> i
                     Err(_) => return -1,
                 };
                 if let Some(ref grammar_ctx) = *grammar_guard {
-                    if let Some(next) = grammar_ctx.fsm.step(grammar_state.current_state, token_id as u32) {
+                    if let Some(next) = grammar_ctx
+                        .fsm
+                        .step(grammar_state.current_state, token_id as u32)
+                    {
                         grammar_state.current_state = next;
                     } else {
                         grammar_state.active = false;
@@ -211,7 +243,12 @@ pub extern "C" fn nsl_serve_set_grammar(request_id: i64, start_state: i64) -> i6
     };
 
     // Set grammar on waiting or active request
-    for req in ctx.scheduler.waiting.iter_mut().chain(ctx.scheduler.active.iter_mut()) {
+    for req in ctx
+        .scheduler
+        .waiting
+        .iter_mut()
+        .chain(ctx.scheduler.active.iter_mut())
+    {
         if req.id == request_id as u64 {
             req.grammar_state = Some(crate::grammar::GrammarRequestState::new(start_state as u32));
             return 0;
@@ -255,7 +292,10 @@ mod tests {
         // Verify grammar_state is set by checking the request
         let guard = SERVE_CTX.lock().unwrap();
         let ctx = guard.as_ref().unwrap();
-        let req = ctx.scheduler.waiting.iter()
+        let req = ctx
+            .scheduler
+            .waiting
+            .iter()
             .chain(ctx.scheduler.active.iter())
             .find(|r| r.id == req_id as u64)
             .unwrap();

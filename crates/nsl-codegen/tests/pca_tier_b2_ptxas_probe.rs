@@ -176,5 +176,9 @@ fn backward_tier_b_on_is_larger_than_tier_b_off() {
         delta >= 2048,
         "Tier B.2 delta ({delta} bytes) suspiciously small — preamble or predicate may be missing"
     );
-    eprintln!("Tier B.2 backward PTX delta: {delta} bytes ({} → {})", off.len(), on.len());
+    eprintln!(
+        "Tier B.2 backward PTX delta: {delta} bytes ({} → {})",
+        off.len(),
+        on.len()
+    );
 }

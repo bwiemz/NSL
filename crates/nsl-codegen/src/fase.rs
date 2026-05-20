@@ -276,10 +276,7 @@ pub fn plan(cfg: &FaseConfig) -> FasePlan {
 /// - FullBuffer global (Lion/Unknown/allow_v_approx=false) → `Deferred`
 ///   requests clamp to `FullBuffer` with a `FaseModeInfeasible` diagnostic.
 ///   `FullBuffer` requests apply verbatim.
-pub fn plan_with_overrides(
-    cfg: &FaseConfig,
-    wggo_fused_per_layer: &[bool],
-) -> FasePlan {
+pub fn plan_with_overrides(cfg: &FaseConfig, wggo_fused_per_layer: &[bool]) -> FasePlan {
     let mut p = plan(cfg);
 
     if wggo_fused_per_layer.is_empty() || p.mode == FaseMode::Passthrough {
@@ -301,7 +298,9 @@ pub fn plan_with_overrides(
             .iter()
             .enumerate()
             .filter_map(|(i, &fused)| {
-                if fused { return None; }
+                if fused {
+                    return None;
+                }
                 Some(crate::wggo_overrides::OverrideDiagnostic {
                     layer_index: i as u32,
                     layer_name: format!("layer_{i}"),
@@ -322,7 +321,11 @@ pub fn plan_with_overrides(
     let mut diagnostics = Vec::new();
 
     for (i, &fused) in wggo_fused_per_layer.iter().enumerate() {
-        let requested = if fused { FaseMode::Deferred } else { FaseMode::FullBuffer };
+        let requested = if fused {
+            FaseMode::Deferred
+        } else {
+            FaseMode::FullBuffer
+        };
         let applied = match (p.mode, requested) {
             (FaseMode::FullBuffer, FaseMode::Deferred) => {
                 diagnostics.push(crate::wggo_overrides::OverrideDiagnostic {
@@ -686,10 +689,19 @@ mod tests {
         assert_eq!(p.mode, FaseMode::Deferred);
         assert_eq!(
             p.per_layer_mode,
-            Some(vec![FaseMode::Deferred, FaseMode::Deferred, FaseMode::Deferred, FaseMode::Deferred])
+            Some(vec![
+                FaseMode::Deferred,
+                FaseMode::Deferred,
+                FaseMode::Deferred,
+                FaseMode::Deferred
+            ])
         );
         assert_eq!(p.override_diagnostics.len(), 2);
-        let layer_indices: Vec<u32> = p.override_diagnostics.iter().map(|d| d.layer_index).collect();
+        let layer_indices: Vec<u32> = p
+            .override_diagnostics
+            .iter()
+            .map(|d| d.layer_index)
+            .collect();
         assert_eq!(layer_indices, vec![1, 3]);
         for d in &p.override_diagnostics {
             assert_eq!(d.requested, "FullBuffer");
@@ -728,7 +740,12 @@ mod tests {
         let p = plan_with_overrides(&cfg, &[true, false, true, false]);
         assert_eq!(
             p.per_layer_mode,
-            Some(vec![FaseMode::Deferred, FaseMode::FullBuffer, FaseMode::Deferred, FaseMode::FullBuffer])
+            Some(vec![
+                FaseMode::Deferred,
+                FaseMode::FullBuffer,
+                FaseMode::Deferred,
+                FaseMode::FullBuffer
+            ])
         );
         assert!(p.override_diagnostics.is_empty());
     }

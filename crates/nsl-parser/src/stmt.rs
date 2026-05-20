@@ -274,19 +274,14 @@ fn parse_return_stmt(p: &mut Parser) -> Stmt {
     let start = p.current_span();
     p.advance(); // consume 'return'
 
-    let value = if !p.at(&TokenKind::Newline)
-        && !p.at(&TokenKind::Eof)
-        && !p.at(&TokenKind::Dedent)
+    let value = if !p.at(&TokenKind::Newline) && !p.at(&TokenKind::Eof) && !p.at(&TokenKind::Dedent)
     {
         Some(parse_expr(p))
     } else {
         None
     };
 
-    let span = value
-        .as_ref()
-        .map(|v| start.merge(v.span))
-        .unwrap_or(start);
+    let span = value.as_ref().map(|v| start.merge(v.span)).unwrap_or(start);
     p.expect_end_of_stmt();
 
     Stmt {
@@ -322,19 +317,14 @@ fn parse_yield_stmt(p: &mut Parser) -> Stmt {
     let start = p.current_span();
     p.advance(); // consume 'yield'
 
-    let value = if !p.at(&TokenKind::Newline)
-        && !p.at(&TokenKind::Eof)
-        && !p.at(&TokenKind::Dedent)
+    let value = if !p.at(&TokenKind::Newline) && !p.at(&TokenKind::Eof) && !p.at(&TokenKind::Dedent)
     {
         Some(parse_expr(p))
     } else {
         None
     };
 
-    let span = value
-        .as_ref()
-        .map(|v| start.merge(v.span))
-        .unwrap_or(start);
+    let span = value.as_ref().map(|v| start.merge(v.span)).unwrap_or(start);
     p.expect_end_of_stmt();
 
     Stmt {
@@ -348,9 +338,7 @@ fn parse_yield_stmt(p: &mut Parser) -> Stmt {
 fn is_valid_assign_target(expr: &nsl_ast::expr::Expr) -> bool {
     use nsl_ast::expr::ExprKind;
     match &expr.kind {
-        ExprKind::Ident(_)
-        | ExprKind::MemberAccess { .. }
-        | ExprKind::Subscript { .. } => true,
+        ExprKind::Ident(_) | ExprKind::MemberAccess { .. } | ExprKind::Subscript { .. } => true,
         ExprKind::TupleLiteral(items) | ExprKind::ListLiteral(items) => {
             items.iter().all(is_valid_assign_target)
         }

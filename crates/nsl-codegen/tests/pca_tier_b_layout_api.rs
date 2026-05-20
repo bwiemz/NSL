@@ -4,16 +4,24 @@
 use nsl_codegen::flash_attention::{FlashAttentionConfig, RopeStyle};
 use nsl_codegen::flash_attention_v2::smem_layout::{tier_b_range_table_offset, Direction};
 use nsl_codegen::flash_attention_v2::{shared_mem_bytes_v2, shared_mem_bytes_v2_backward};
+use nsl_codegen::pca_segment::SegmentResidency;
 use nsl_codegen::pca_tile_config::num_tiles;
 use nsl_codegen::pca_tilerange::{range_table_addrs, should_emit_tier_b};
-use nsl_codegen::pca_segment::SegmentResidency;
 
 fn fa_base_seg_masked() -> FlashAttentionConfig {
     FlashAttentionConfig {
-        block_q: 64, block_kv: 64, head_dim: 64,
-        causal: true, paged: false, rope_q: true,
-        rope_style: RopeStyle::HalfSplit, gqa_group_size: 2,
-        tree_mask: false, gpu_sm: 120, segment_masked: true, csha: None,
+        block_q: 64,
+        block_kv: 64,
+        head_dim: 64,
+        causal: true,
+        paged: false,
+        rope_q: true,
+        rope_style: RopeStyle::HalfSplit,
+        gqa_group_size: 2,
+        tree_mask: false,
+        gpu_sm: 120,
+        segment_masked: true,
+        csha: None,
     }
 }
 
@@ -66,8 +74,8 @@ fn tier_b_forward_offset_strictly_less_than_backward() {
 #[test]
 fn range_table_addrs_monotonic_offsets() {
     let addrs = range_table_addrs(0, 64, 64);
-    assert_eq!(addrs.qtile_min,  0);
-    assert_eq!(addrs.qtile_max,  64 * 2);
+    assert_eq!(addrs.qtile_min, 0);
+    assert_eq!(addrs.qtile_max, 64 * 2);
     assert_eq!(addrs.kvtile_min, 2 * 64 * 2);
     assert_eq!(addrs.kvtile_max, (2 * 64 + 64) * 2);
 }
@@ -75,8 +83,8 @@ fn range_table_addrs_monotonic_offsets() {
 #[test]
 fn range_table_addrs_asymmetric_blocks() {
     let addrs = range_table_addrs(0x1000, 512, 256);
-    assert_eq!(addrs.qtile_min,  0x1000);
-    assert_eq!(addrs.qtile_max,  0x1000 + 512 * 2);
+    assert_eq!(addrs.qtile_min, 0x1000);
+    assert_eq!(addrs.qtile_max, 0x1000 + 512 * 2);
     assert_eq!(addrs.kvtile_min, 0x1000 + 2 * 512 * 2);
     assert_eq!(addrs.kvtile_max, 0x1000 + 2 * 512 * 2 + 256 * 2);
 }

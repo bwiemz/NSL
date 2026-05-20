@@ -39,8 +39,8 @@ fn weighted_disagreement_below_monitoring_threshold() {
     let fixtures = [("calib_tiny", 2u32), ("calib_small", 8u32)];
     let mut disagreeing_params: u64 = 0;
     let mut total_params: u64 = 0;
-    let fixture_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tests/fixtures/cpdt_calibration");
+    let fixture_dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/cpdt_calibration");
     for (name, n_layers) in fixtures {
         let path = fixture_dir.join(format!("{name}.safetensors"));
         let wm = WeightMap::load(&path)

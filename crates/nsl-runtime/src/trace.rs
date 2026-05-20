@@ -11,13 +11,16 @@ use std::sync::Mutex;
 pub static TRACING: AtomicBool = AtomicBool::new(false);
 static TRACE_GRAPH: Mutex<Option<TraceGraph>> = Mutex::new(None);
 
-// Test-only sentinel: set to `true` only while a `trace::tests` test body
-// is actively recording.  `record_op` checks this in `#[cfg(test)]` builds
-// so that tensor-op tests running in parallel (arithmetic, activation, etc.)
-// cannot inject spurious ops into the shared TRACE_GRAPH and cause
-// "expected N ops, got N+1" failures.
+// Test-only sentinel: set to `true` only on the thread running a `trace::tests`
+// body.  `record_op` checks this in `#[cfg(test)]` builds so that tensor-op
+// tests running in parallel (arithmetic, activation, etc.) cannot inject
+// spurious ops into the shared TRACE_GRAPH and cause "expected N ops, got N+1"
+// failures.  Thread-local storage ensures that only the test thread's own
+// `record_op` calls pass the guard; other threads always see `false`.
 #[cfg(test)]
-pub(crate) static TRACE_TEST_RECORDING: AtomicBool = AtomicBool::new(false);
+thread_local! {
+    pub(crate) static TRACE_TEST_RECORDING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Types
@@ -107,11 +110,12 @@ pub fn record_op(
     if !is_tracing() {
         return;
     }
-    // In test builds, only record when a trace::tests body explicitly opted in.
-    // This blocks stray calls from parallel tensor-op tests (arithmetic,
-    // activation, etc.) that happen to run while TRACING=true.
+    // In test builds, only record when the current thread's trace sentinel is
+    // set.  Thread-local storage means only the specific test thread that opted
+    // in passes this guard; other threads running parallel tests always see
+    // `false` regardless of the global TRACING flag.
     #[cfg(test)]
-    if !TRACE_TEST_RECORDING.load(Ordering::SeqCst) {
+    if !TRACE_TEST_RECORDING.with(|f| f.get()) {
         return;
     }
     let mut guard = TRACE_GRAPH.lock().expect("TRACE_GRAPH mutex poisoned");
@@ -220,11 +224,14 @@ mod tests {
     fn test_trace_basic_ops() {
         let _guard = TEST_LOCK.lock().unwrap();
         reset_trace();
-        TRACE_TEST_RECORDING.store(true, Ordering::SeqCst);
+        TRACE_TEST_RECORDING.with(|f| f.set(true));
 
         // Start trace
         nsl_trace_start();
-        assert!(is_tracing(), "tracing should be active after nsl_trace_start");
+        assert!(
+            is_tracing(),
+            "tracing should be active after nsl_trace_start"
+        );
 
         // Register input: fake tensor pointer 100, name "input"
         let input_name = b"input\0";
@@ -256,10 +263,13 @@ mod tests {
 
         // Stop trace and recover the graph
         let raw = nsl_trace_stop();
-        assert!(!is_tracing(), "tracing should be inactive after nsl_trace_stop");
+        assert!(
+            !is_tracing(),
+            "tracing should be inactive after nsl_trace_stop"
+        );
         assert_ne!(raw, 0, "nsl_trace_stop should return a non-null pointer");
 
-        TRACE_TEST_RECORDING.store(false, Ordering::SeqCst);
+        TRACE_TEST_RECORDING.with(|f| f.set(false));
         let graph = unsafe { Box::from_raw(raw as *mut TraceGraph) };
 
         // Verify ops
@@ -291,7 +301,7 @@ mod tests {
     fn test_trace_pointer_resolution() {
         let _guard = TEST_LOCK.lock().unwrap();
         reset_trace();
-        TRACE_TEST_RECORDING.store(true, Ordering::SeqCst);
+        TRACE_TEST_RECORDING.with(|f| f.set(true));
 
         nsl_trace_start();
 
@@ -310,12 +320,15 @@ mod tests {
         nsl_trace_register_output(40, output_name.as_ptr() as i64);
 
         let raw = nsl_trace_stop();
-        TRACE_TEST_RECORDING.store(false, Ordering::SeqCst);
+        TRACE_TEST_RECORDING.with(|f| f.set(false));
         let graph = unsafe { Box::from_raw(raw as *mut TraceGraph) };
 
         // ptr 10 is in inputs
         let input_ptrs: Vec<i64> = graph.inputs.iter().map(|(p, _)| *p).collect();
-        assert!(input_ptrs.contains(&10), "ptr 10 should be registered as input");
+        assert!(
+            input_ptrs.contains(&10),
+            "ptr 10 should be registered as input"
+        );
 
         // ptr 20 is NOT in ptr_to_node — it's an initializer/weight, not a computed output
         assert!(

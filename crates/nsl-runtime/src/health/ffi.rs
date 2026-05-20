@@ -66,10 +66,7 @@ pub unsafe extern "C" fn nsl_health_record_weight_norm(
 /// they own for the duration of the call, or path_ptr is null (prints JSON
 /// to stdout instead).
 #[no_mangle]
-pub unsafe extern "C" fn nsl_health_flush_snapshot(
-    path_ptr: *const u8,
-    path_len: usize,
-) -> i32 {
+pub unsafe extern "C" fn nsl_health_flush_snapshot(path_ptr: *const u8, path_len: usize) -> i32 {
     let snap = COLLECTOR.lock().unwrap().snapshot();
     let json = match serde_json::to_string(&snap) {
         Ok(s) => s,

@@ -86,7 +86,10 @@ pub(crate) fn convert_to_f32(dtype: safetensors::Dtype, data: &[u8]) -> Vec<f32>
             out
         }
         other => {
-            eprintln!("[nsl] safetensors_load: unsupported dtype {:?}, treating as zeros", other);
+            eprintln!(
+                "[nsl] safetensors_load: unsupported dtype {:?}, treating as zeros",
+                other
+            );
             Vec::new()
         }
     }
@@ -266,14 +269,12 @@ pub extern "C" fn nsl_safetensors_save(dict_ptr: i64, path_ptr: i64, path_len: i
         let f32_bytes: Vec<u8> = match tensor.dtype {
             1 => {
                 // Already f32
-                let slice =
-                    unsafe { std::slice::from_raw_parts(tensor.data_f32(), len) };
+                let slice = unsafe { std::slice::from_raw_parts(tensor.data_f32(), len) };
                 slice.iter().flat_map(|v| v.to_le_bytes()).collect()
             }
             0 => {
                 // f64 → f32
-                let slice =
-                    unsafe { std::slice::from_raw_parts(tensor.data_f64(), len) };
+                let slice = unsafe { std::slice::from_raw_parts(tensor.data_f64(), len) };
                 slice
                     .iter()
                     .flat_map(|v| (*v as f32).to_le_bytes())
@@ -300,7 +301,10 @@ pub extern "C" fn nsl_safetensors_save(dict_ptr: i64, path_ptr: i64, path_len: i
                 bytes.as_slice(),
             )
             .unwrap_or_else(|e| {
-                eprintln!("[nsl] safetensors_save: TensorView error for '{}': {}", name, e);
+                eprintln!(
+                    "[nsl] safetensors_save: TensorView error for '{}': {}",
+                    name, e
+                );
                 std::process::abort();
             });
             (name.clone(), view)
@@ -333,18 +337,11 @@ mod tests {
     use std::io::Write;
 
     // Helper: write a minimal safetensors file to a temp path and return the path
-    fn write_temp_safetensors(
-        name: &str,
-        shape: &[usize],
-        data_f32: &[f32],
-    ) -> tempfile::TempPath {
+    fn write_temp_safetensors(name: &str, shape: &[usize], data_f32: &[f32]) -> tempfile::TempPath {
         let bytes: Vec<u8> = data_f32.iter().flat_map(|v| v.to_le_bytes()).collect();
-        let view = safetensors::tensor::TensorView::new(
-            safetensors::Dtype::F32,
-            shape.to_vec(),
-            &bytes,
-        )
-        .unwrap();
+        let view =
+            safetensors::tensor::TensorView::new(safetensors::Dtype::F32, shape.to_vec(), &bytes)
+                .unwrap();
         let mut map = HashMap::new();
         map.insert(name.to_string(), view);
         let serialized = safetensors::tensor::serialize(&map, &None).unwrap();
@@ -360,12 +357,9 @@ mod tests {
         data_f16: &[half::f16],
     ) -> tempfile::TempPath {
         let bytes: Vec<u8> = data_f16.iter().flat_map(|v| v.to_le_bytes()).collect();
-        let view = safetensors::tensor::TensorView::new(
-            safetensors::Dtype::F16,
-            shape.to_vec(),
-            &bytes,
-        )
-        .unwrap();
+        let view =
+            safetensors::tensor::TensorView::new(safetensors::Dtype::F16, shape.to_vec(), &bytes)
+                .unwrap();
         let mut map = HashMap::new();
         map.insert(name.to_string(), view);
         let serialized = safetensors::tensor::serialize(&map, &None).unwrap();
@@ -416,11 +410,7 @@ mod tests {
         let path = write_temp_safetensors_f16("bias", &[3], &data_f16);
         let path_str = path.to_str().unwrap();
 
-        let dict = nsl_safetensors_load(
-            path_str.as_ptr() as i64,
-            path_str.len() as i64,
-            0,
-        );
+        let dict = nsl_safetensors_load(path_str.as_ptr() as i64, path_str.len() as i64, 0);
 
         let key = alloc_c_string("bias");
         let tensor_ptr = crate::dict::nsl_dict_get_str(dict, key as i64);
@@ -449,16 +439,8 @@ mod tests {
         let path_a_str = path_a.to_str().unwrap();
         let path_b_str = path_b.to_str().unwrap();
 
-        let dict_a = nsl_safetensors_load(
-            path_a_str.as_ptr() as i64,
-            path_a_str.len() as i64,
-            0,
-        );
-        let dict_b = nsl_safetensors_load(
-            path_b_str.as_ptr() as i64,
-            path_b_str.len() as i64,
-            0,
-        );
+        let dict_a = nsl_safetensors_load(path_a_str.as_ptr() as i64, path_a_str.len() as i64, 0);
+        let dict_b = nsl_safetensors_load(path_b_str.as_ptr() as i64, path_b_str.len() as i64, 0);
 
         // Build a combined safetensors file with both tensors for round-trip
         let key_a_ptr = alloc_c_string("a");
@@ -476,18 +458,10 @@ mod tests {
         // Save to temp file
         let out_tmp = tempfile::NamedTempFile::new().unwrap();
         let out_path = out_tmp.path().to_str().unwrap().to_owned();
-        nsl_safetensors_save(
-            combined,
-            out_path.as_ptr() as i64,
-            out_path.len() as i64,
-        );
+        nsl_safetensors_save(combined, out_path.as_ptr() as i64, out_path.len() as i64);
 
         // Reload and verify count
-        let reloaded = nsl_safetensors_load(
-            out_path.as_ptr() as i64,
-            out_path.len() as i64,
-            0,
-        );
+        let reloaded = nsl_safetensors_load(out_path.as_ptr() as i64, out_path.len() as i64, 0);
         let reloaded_count = crate::dict::nsl_dict_len(reloaded);
         assert_eq!(reloaded_count, 2, "round-trip should have 2 entries");
 

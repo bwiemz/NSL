@@ -18,7 +18,8 @@ impl<'a> TypeChecker<'a> {
                     self.diagnostics.push(
                         Diagnostic::error(format!(
                             "type mismatch: annotation is {}, but value has type {}",
-                            display_type(ann), display_type(val)
+                            display_type(ann),
+                            display_type(val)
                         ))
                         .with_label(
                             value.unwrap().span,
@@ -47,7 +48,9 @@ impl<'a> TypeChecker<'a> {
         }
 
         // Push function scope
-        let scope = self.scopes.push_scope(self.current_scope, ScopeKind::Function);
+        let scope = self
+            .scopes
+            .push_scope(self.current_scope, ScopeKind::Function);
         let prev_scope = self.current_scope;
         let prev_return = self.current_return_type.take();
         self.current_scope = scope;
@@ -85,13 +88,18 @@ impl<'a> TypeChecker<'a> {
 
         // M51: Register function with effect checker for propagation/validation.
         // Local effects are computed from direct builtin calls in the callee list.
-        let fn_name = self.interner.resolve(fn_def.name.0).unwrap_or("?").to_string();
+        let fn_name = self
+            .interner
+            .resolve(fn_def.name.0)
+            .unwrap_or("?")
+            .to_string();
         let mut local_effects = crate::effects::EffectSet::PURE;
         for callee in &callees {
             let ce = crate::effects::classify_builtin_effects(callee);
             local_effects |= ce;
         }
-        self.effect_checker.register_function(&fn_name, local_effects, callees);
+        self.effect_checker
+            .register_function(&fn_name, local_effects, callees);
 
         self.current_scope = prev_scope;
         self.current_return_type = prev_return;
@@ -152,8 +160,11 @@ impl<'a> TypeChecker<'a> {
                     .with_label(variant.span, "duplicate variant"),
                 );
             }
-            let field_types: Vec<Type> =
-                variant.fields.iter().map(|t| self.resolve_type(t)).collect();
+            let field_types: Vec<Type> = variant
+                .fields
+                .iter()
+                .map(|t| self.resolve_type(t))
+                .collect();
             variants.push((variant.name, field_types.clone()));
 
             let type_params: Vec<Symbol> = enum_def.type_params.iter().map(|tp| tp.name).collect();
@@ -202,7 +213,9 @@ impl<'a> TypeChecker<'a> {
             self.declare_symbol(fn_def.name, fn_ty.clone(), fn_def.span, true, false);
         }
 
-        let scope = self.scopes.push_scope(self.current_scope, ScopeKind::Function);
+        let scope = self
+            .scopes
+            .push_scope(self.current_scope, ScopeKind::Function);
         let prev_scope = self.current_scope;
         let prev_return = self.current_return_type.take();
         self.current_scope = scope;
@@ -294,7 +307,11 @@ impl<'a> TypeChecker<'a> {
     pub(crate) fn check_import(&mut self, import: &ImportStmt) {
         // Handle `import nsl.math as math` — alias imports
         if let Some(alias) = import.alias {
-            let ty = self.import_types.get(&alias).cloned().unwrap_or(Type::Unknown);
+            let ty = self
+                .import_types
+                .get(&alias)
+                .cloned()
+                .unwrap_or(Type::Unknown);
             self.declare_symbol(alias, ty, import.span, true, false);
             return;
         }
@@ -303,7 +320,11 @@ impl<'a> TypeChecker<'a> {
             ImportItems::Module => {
                 // `import nsl.nn` — declare last path segment
                 if let Some(last) = import.path.last() {
-                    let ty = self.import_types.get(last).cloned().unwrap_or(Type::Unknown);
+                    let ty = self
+                        .import_types
+                        .get(last)
+                        .cloned()
+                        .unwrap_or(Type::Unknown);
                     self.declare_symbol(*last, ty, import.span, true, false);
                 }
             }
@@ -312,7 +333,9 @@ impl<'a> TypeChecker<'a> {
                     let local_name = item.alias.unwrap_or(item.name);
                     // Look up by original name first (import_types is keyed by export name),
                     // then fall back to alias name for compatibility.
-                    let ty = self.import_types.get(&item.name)
+                    let ty = self
+                        .import_types
+                        .get(&item.name)
                         .or_else(|| self.import_types.get(&local_name))
                         .cloned()
                         .unwrap_or(Type::Unknown);
@@ -321,7 +344,9 @@ impl<'a> TypeChecker<'a> {
             }
             ImportItems::Glob => {
                 // For glob imports, all import_types have been pre-populated by the loader
-                let entries: Vec<_> = self.import_types.iter()
+                let entries: Vec<_> = self
+                    .import_types
+                    .iter()
                     .map(|(sym, ty)| (*sym, ty.clone()))
                     .collect();
                 for (sym, ty) in entries {
@@ -337,7 +362,9 @@ impl<'a> TypeChecker<'a> {
             ImportItems::Named(items) => {
                 for item in items {
                     let local_name = item.alias.unwrap_or(item.name);
-                    let ty = self.import_types.get(&item.name)
+                    let ty = self
+                        .import_types
+                        .get(&item.name)
                         .or_else(|| self.import_types.get(&local_name))
                         .cloned()
                         .unwrap_or(Type::Unknown);
@@ -346,7 +373,9 @@ impl<'a> TypeChecker<'a> {
             }
             ImportItems::Glob => {
                 // For glob imports, all import_types have been pre-populated by the loader
-                let entries: Vec<_> = self.import_types.iter()
+                let entries: Vec<_> = self
+                    .import_types
+                    .iter()
                     .map(|(sym, ty)| (*sym, ty.clone()))
                     .collect();
                 for (sym, ty) in entries {

@@ -19,12 +19,14 @@ fn fixture(name: &str) -> PathBuf {
 }
 
 fn parse_awq_fixture() -> (nsl_ast::Module, Interner) {
-    let source = std::fs::read_to_string(fixture("awq_calibration_mlp.nsl"))
-        .expect("fixture readable");
+    let source =
+        std::fs::read_to_string(fixture("awq_calibration_mlp.nsl")).expect("fixture readable");
     let mut interner = Interner::new();
     let (tokens, lex_diags) = tokenize(&source, FileId(0), &mut interner);
     assert!(
-        lex_diags.iter().all(|diag| !matches!(diag.level, Level::Error)),
+        lex_diags
+            .iter()
+            .all(|diag| !matches!(diag.level, Level::Error)),
         "fixture must lex cleanly: {lex_diags:?}"
     );
 
@@ -89,13 +91,8 @@ fn two_object_link_produces_binary_with_resolved_wrapper_symbol() {
     let opts = awq_fixture_compile_options(&ast, &interner);
 
     let model_obj = tmp.path().join("calib_model.o");
-    emit_calibration_model_object(
-        &ast,
-        &opts,
-        &arena_layout,
-        &model_obj,
-    )
-    .expect("emit calib_model.o");
+    emit_calibration_model_object(&ast, &opts, &arena_layout, &model_obj)
+        .expect("emit calib_model.o");
 
     let scaffolding_obj = tmp.path().join("scaffolding.o");
     emit_calibration_scaffolding_object(

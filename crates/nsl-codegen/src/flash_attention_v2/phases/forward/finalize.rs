@@ -53,10 +53,7 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
         if i > 0 {
             ptx.push_str(&format!("    add.u64 %rd49, %rd49, {};\n", i * 32));
         }
-        ptx.push_str(&format!(
-            "    cvt.rn.f16.f32 %h0, %f{};\n",
-            O_BASE + i
-        ));
+        ptx.push_str(&format!("    cvt.rn.f16.f32 %h0, %f{};\n", O_BASE + i));
         ptx.push_str("    shl.b64 %rd49, %rd49, 1;                  // * 2 bytes f16\n");
         ptx.push_str("    add.u64 %rd49, %rd48, %rd49;              // out_base + d*2\n");
         ptx.push_str("    st.global.b16 [%rd49], %h0;\n");

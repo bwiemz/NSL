@@ -24,7 +24,7 @@ pub struct KvBlockQuantMeta {
     pub num_scales: u16,
     pub _pad: u8,
     pub scales: [f32; MAX_SCALES],
-    pub zero_points: [f32; MAX_SCALES],  // f32 to avoid i8 overflow for large min_val/scale ratios
+    pub zero_points: [f32; MAX_SCALES], // f32 to avoid i8 overflow for large min_val/scale ratios
 }
 
 impl Default for KvBlockQuantMeta {
@@ -45,19 +45,28 @@ impl Default for KvBlockQuantMeta {
 /// - `num_heads`: attention heads in this layer
 /// - `block_size`: tokens per block
 /// - `head_dim`: dimension per head
-pub fn block_data_bytes(scheme: KvQuantScheme, num_heads: usize, block_size: usize, head_dim: usize) -> usize {
+pub fn block_data_bytes(
+    scheme: KvQuantScheme,
+    num_heads: usize,
+    block_size: usize,
+    head_dim: usize,
+) -> usize {
     let elements = num_heads * block_size * head_dim;
     match scheme {
-        KvQuantScheme::None => elements * 2,          // FP16: 2 bytes
-        KvQuantScheme::Int8PerHead |
-        KvQuantScheme::Int8PerToken => elements,      // INT8: 1 byte
+        KvQuantScheme::None => elements * 2, // FP16: 2 bytes
+        KvQuantScheme::Int8PerHead | KvQuantScheme::Int8PerToken => elements, // INT8: 1 byte
         KvQuantScheme::Int4PerGroup => elements.div_ceil(2), // INT4: 0.5 bytes, round up
-        KvQuantScheme::Fp8 => elements,               // FP8: 1 byte
+        KvQuantScheme::Fp8 => elements,      // FP8: 1 byte
     }
 }
 
 /// Total block bytes including metadata (K or V, not both).
-pub fn block_total_bytes(scheme: KvQuantScheme, num_heads: usize, block_size: usize, head_dim: usize) -> usize {
+pub fn block_total_bytes(
+    scheme: KvQuantScheme,
+    num_heads: usize,
+    block_size: usize,
+    head_dim: usize,
+) -> usize {
     let data = block_data_bytes(scheme, num_heads, block_size, head_dim);
     let meta = match scheme {
         KvQuantScheme::None | KvQuantScheme::Fp8 => 0,
@@ -163,7 +172,9 @@ pub fn quantize_int8_per_token(
         for h in 0..num_heads {
             let offset = h * block_size * head_dim + t * head_dim;
             for d in 0..head_dim {
-                let q = (values[offset + d] * inv_scale).round().clamp(-127.0, 127.0) as i8;
+                let q = (values[offset + d] * inv_scale)
+                    .round()
+                    .clamp(-127.0, 127.0) as i8;
                 output[offset + d] = q;
             }
         }
@@ -224,7 +235,7 @@ pub fn quantize_int4_per_group(
         let range = max_val - min_val;
         let scale = if range == 0.0 { 1.0 } else { range / 15.0 };
         meta.scales[g] = scale;
-        meta.zero_points[g] = min_val;  // store min_val directly as f32 (no i8 overflow)
+        meta.zero_points[g] = min_val; // store min_val directly as f32 (no i8 overflow)
 
         let inv_scale = 1.0 / scale;
         for (i, &v) in group.iter().enumerate() {
@@ -318,7 +329,7 @@ fn fp8_e4m3_to_f32(b: u8) -> f32 {
         return f32::NAN;
     }
     let f32_exp = (exp - 7 + 127) as u32; // unbias E4M3, rebias f32
-    let f32_mantissa = mantissa << 20;     // position in f32 mantissa
+    let f32_mantissa = mantissa << 20; // position in f32 mantissa
     let bits = ((sign as u32) << 31) | (f32_exp << 23) | f32_mantissa;
     f32::from_bits(bits)
 }
@@ -338,18 +349,35 @@ mod tests {
         let mut quantized = vec![0i8; n];
         let mut meta = KvBlockQuantMeta::default();
 
-        quantize_int8_per_head(&values, &mut quantized, &mut meta, num_heads, block_size, head_dim);
+        quantize_int8_per_head(
+            &values,
+            &mut quantized,
+            &mut meta,
+            num_heads,
+            block_size,
+            head_dim,
+        );
         assert_eq!(meta.scheme, KvQuantScheme::Int8PerHead as u8);
         assert_eq!(meta.num_scales, 4);
 
         let mut restored = vec![0.0f32; n];
-        dequantize_int8_per_head(&quantized, &mut restored, &meta, num_heads, block_size, head_dim);
+        dequantize_int8_per_head(
+            &quantized,
+            &mut restored,
+            &meta,
+            num_heads,
+            block_size,
+            head_dim,
+        );
 
         // Max error < 0.5% of range
         let range = values.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
         for (orig, rest) in values.iter().zip(restored.iter()) {
             let err = (orig - rest).abs() / range.max(1e-6);
-            assert!(err < 0.01, "INT8 per-head error too large: orig={orig}, restored={rest}, err={err}");
+            assert!(
+                err < 0.01,
+                "INT8 per-head error too large: orig={orig}, restored={rest}, err={err}"
+            );
         }
     }
 
@@ -364,17 +392,34 @@ mod tests {
         let mut quantized = vec![0i8; n];
         let mut meta = KvBlockQuantMeta::default();
 
-        quantize_int8_per_token(&values, &mut quantized, &mut meta, num_heads, block_size, head_dim);
+        quantize_int8_per_token(
+            &values,
+            &mut quantized,
+            &mut meta,
+            num_heads,
+            block_size,
+            head_dim,
+        );
         assert_eq!(meta.scheme, KvQuantScheme::Int8PerToken as u8);
         assert_eq!(meta.num_scales, 4);
 
         let mut restored = vec![0.0f32; n];
-        dequantize_int8_per_token(&quantized, &mut restored, &meta, num_heads, block_size, head_dim);
+        dequantize_int8_per_token(
+            &quantized,
+            &mut restored,
+            &meta,
+            num_heads,
+            block_size,
+            head_dim,
+        );
 
         let range = values.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
         for (orig, rest) in values.iter().zip(restored.iter()) {
             let err = (orig - rest).abs() / range.max(1e-6);
-            assert!(err < 0.01, "INT8 per-token error too large: orig={orig}, restored={rest}");
+            assert!(
+                err < 0.01,
+                "INT8 per-token error too large: orig={orig}, restored={rest}"
+            );
         }
     }
 
@@ -395,7 +440,10 @@ mod tests {
         let range = values.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
         for (orig, rest) in values.iter().zip(restored.iter()) {
             let err = (orig - rest).abs() / range.max(1e-6);
-            assert!(err < 0.10, "INT4 error too large: orig={orig}, restored={rest}, err={err}");
+            assert!(
+                err < 0.10,
+                "INT4 error too large: orig={orig}, restored={rest}, err={err}"
+            );
         }
     }
 
@@ -421,9 +469,18 @@ mod tests {
         let dim = 128;
         let elems = heads * bs * dim; // 65536
 
-        assert_eq!(block_data_bytes(KvQuantScheme::None, heads, bs, dim), elems * 2);
-        assert_eq!(block_data_bytes(KvQuantScheme::Int8PerHead, heads, bs, dim), elems);
-        assert_eq!(block_data_bytes(KvQuantScheme::Int4PerGroup, heads, bs, dim), elems / 2);
+        assert_eq!(
+            block_data_bytes(KvQuantScheme::None, heads, bs, dim),
+            elems * 2
+        );
+        assert_eq!(
+            block_data_bytes(KvQuantScheme::Int8PerHead, heads, bs, dim),
+            elems
+        );
+        assert_eq!(
+            block_data_bytes(KvQuantScheme::Int4PerGroup, heads, bs, dim),
+            elems / 2
+        );
         assert_eq!(block_data_bytes(KvQuantScheme::Fp8, heads, bs, dim), elems);
     }
 

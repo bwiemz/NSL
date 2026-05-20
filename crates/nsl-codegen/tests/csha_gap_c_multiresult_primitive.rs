@@ -73,10 +73,7 @@ fn csha_fused_bwd_cache_roundtrips_seven_slot_entry() {
     // All eight slots preserved in order — lowerer's `component as usize`
     // indexes this array, so ordering matters.
     for (i, v) in slots.iter().enumerate() {
-        assert_eq!(
-            fetched[i], *v,
-            "slot {i} must preserve the stored Value"
-        );
+        assert_eq!(fetched[i], *v, "slot {i} must preserve the stored Value");
     }
 }
 
@@ -94,8 +91,7 @@ fn extract_op_component_range_matches_seven_outputs() {
         let same = PrimalOp::CshaFusedBackwardExtract { component: c };
         assert_eq!(op, same);
         if c > 0 {
-            let prev =
-                PrimalOp::CshaFusedBackwardExtract { component: c - 1 };
+            let prev = PrimalOp::CshaFusedBackwardExtract { component: c - 1 };
             assert_ne!(op, prev, "component {c} must not equal {}", c - 1);
         }
     }
@@ -124,9 +120,14 @@ fn clear_csha_per_function_caches_empties_both_maps() {
     // Populate `csha_fused_bwd_cache` the way `FusedCshaBackward` does.
     let key = Value::from_u32(42);
     let slots: [Value; 8] = [
-        Value::from_u32(300), Value::from_u32(301), Value::from_u32(302),
-        Value::from_u32(303), Value::from_u32(304), Value::from_u32(305),
-        Value::from_u32(306), Value::from_u32(307),
+        Value::from_u32(300),
+        Value::from_u32(301),
+        Value::from_u32(302),
+        Value::from_u32(303),
+        Value::from_u32(304),
+        Value::from_u32(305),
+        Value::from_u32(306),
+        Value::from_u32(307),
     ];
     compiler.csha_fused_bwd_cache.insert(key, slots);
 
@@ -139,7 +140,7 @@ fn clear_csha_per_function_caches_empties_both_maps() {
             v_proj: Value::from_u32(402),
             row_max: Value::from_u32(403),
             row_sum: Value::from_u32(404),
-            x_raw:   Value::from_u32(405),
+            x_raw: Value::from_u32(405),
             backward_ptx_data_id: None,
             backward_name_data_id: None,
         },

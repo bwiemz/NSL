@@ -138,8 +138,10 @@ pub fn validate_medusa_decorator(
                         if let ExprKind::IntLiteral(n) = &arg.value.kind {
                             if *n < 1 {
                                 diagnostics.push(
-                                    Diagnostic::error("@medusa: num_heads must be >= 1".to_string())
-                                        .with_label(arg.span, "must be >= 1"),
+                                    Diagnostic::error(
+                                        "@medusa: num_heads must be >= 1".to_string(),
+                                    )
+                                    .with_label(arg.span, "must be >= 1"),
                                 );
                             } else {
                                 num_heads = Some(*n as usize);
@@ -150,8 +152,10 @@ pub fn validate_medusa_decorator(
                         if let ExprKind::IntLiteral(n) = &arg.value.kind {
                             if *n < 1 {
                                 diagnostics.push(
-                                    Diagnostic::error("@medusa: tree_width must be >= 1".to_string())
-                                        .with_label(arg.span, "must be >= 1"),
+                                    Diagnostic::error(
+                                        "@medusa: tree_width must be >= 1".to_string(),
+                                    )
+                                    .with_label(arg.span, "must be >= 1"),
                                 );
                             } else {
                                 tree_width = *n as usize;

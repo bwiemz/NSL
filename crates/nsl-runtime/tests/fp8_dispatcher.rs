@@ -42,14 +42,20 @@ mod cuda_tests {
         let v_mma = read_tensor_f32(out_mma);
 
         let reference = Fp8ReferenceMatmul {
-            m, n, k,
+            m,
+            n,
+            k,
             format: Fp8Format::E4M3,
             scale,
         };
         let v_fallback = reference.compute_f32(&a_data, &b_data);
 
-        assert_abs_err_le(&v_mma, &v_fallback, DISPATCH_ABS_TOL,
-            &format!("MMA vs fallback {m}x{k}x{n}"));
+        assert_abs_err_le(
+            &v_mma,
+            &v_fallback,
+            DISPATCH_ABS_TOL,
+            &format!("MMA vs fallback {m}x{k}x{n}"),
+        );
 
         nsl_tensor_free(a_f32);
         nsl_tensor_free(b_f32);
@@ -59,16 +65,24 @@ mod cuda_tests {
     }
 
     #[test]
-    fn dispatch_16x16x16() { run_dispatch_at_shape(16, 16, 16); }
+    fn dispatch_16x16x16() {
+        run_dispatch_at_shape(16, 16, 16);
+    }
 
     #[test]
-    fn dispatch_32x32x32() { run_dispatch_at_shape(32, 32, 32); }
+    fn dispatch_32x32x32() {
+        run_dispatch_at_shape(32, 32, 32);
+    }
 
     #[test]
-    fn dispatch_64x64x64() { run_dispatch_at_shape(64, 64, 64); }
+    fn dispatch_64x64x64() {
+        run_dispatch_at_shape(64, 64, 64);
+    }
 
     #[test]
-    fn dispatch_128x128x128() { run_dispatch_at_shape(128, 128, 128); }
+    fn dispatch_128x128x128() {
+        run_dispatch_at_shape(128, 128, 128);
+    }
 }
 
 #[cfg(not(feature = "cuda"))]

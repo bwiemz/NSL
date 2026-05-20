@@ -301,9 +301,7 @@ fn emit_dfragment_scatter(
     for t in 0..tpw {
         ptx.push_str(&format!(
             "    // {} slot local_t={} (global_t = warp_id + {}*8 at runtime; N3)\n",
-            prefix,
-            t,
-            t
+            prefix, t, t
         ));
 
         // N3: global_t = warp_id + local_t * 8
@@ -731,7 +729,9 @@ pub fn emit_q_projection(ptx: &mut String, config: &FlashAttentionConfig, chunk:
     ptx.push_str("    .reg .u32 %tb1_q_cp_smem_addr, %tb1_q_cp_hbm_off;\n");
     ptx.push_str("    .reg .u64 %tb1_q_cp_hbm_addr;\n");
     ptx.push_str("    mov.u32 %tb1_q_cp_tid_off, %tid.x;\n");
-    ptx.push_str("    shl.b32 %tb1_q_cp_tid_off, %tb1_q_cp_tid_off, 4; // tid * 16 (B1.6 deferral #3)\n");
+    ptx.push_str(
+        "    shl.b32 %tb1_q_cp_tid_off, %tb1_q_cp_tid_off, 4; // tid * 16 (B1.6 deferral #3)\n",
+    );
     ptx.push_str("    .reg .u64 %tb1_q_scatter_addr;\n");
     ptx.push_str("    .reg .b16 %tb1_q_h0, %tb1_q_h1;\n");
 
@@ -879,14 +879,10 @@ pub fn emit_q_projection(ptx: &mut String, config: &FlashAttentionConfig, chunk:
                 "    shl.b32 %qmma_x_warp_off, %qmma_m_tile, {};\n",
                 log2_x_m_stride
             ));
-            ptx.push_str(
-                "    add.u32 %qmma_a_base, %tb1_q_smem_x_u32, %qmma_x_warp_off;\n",
-            );
+            ptx.push_str("    add.u32 %qmma_a_base, %tb1_q_smem_x_u32, %qmma_x_warp_off;\n");
             // B-frag Wq base = Wq_smem + n_tile * 8 * 2 = n_tile * 16 bytes.
             ptx.push_str("    shl.b32 %qmma_w_warp_off, %qmma_n_tile, 4;\n");
-            ptx.push_str(
-                "    add.u32 %qmma_b_base, %tb1_q_smem_w_u32, %qmma_w_warp_off;\n",
-            );
+            ptx.push_str("    add.u32 %qmma_b_base, %tb1_q_smem_w_u32, %qmma_w_warp_off;\n");
 
             ptx.push_str(&format!(
                 "    .reg .b32 %tb1_q_a_{}_{}_0, %tb1_q_a_{}_{}_1, %tb1_q_a_{}_{}_2, %tb1_q_a_{}_{}_3;\n",
@@ -1179,9 +1175,7 @@ pub fn emit_kv_projection_chunk_loop(
     // #4); this helper just writes into them.
     ptx.push_str("    .reg .u64 %tb1_kv_x_ptr, %tb1_kv_wk_ptr, %tb1_kv_wv_ptr;\n");
     ptx.push_str("    .reg .pred %tb1_kv_xnull, %tb1_kv_wknull, %tb1_kv_wvnull;\n");
-    ptx.push_str(
-        "    .reg .u64 %tb1_kv_smem_wk, %tb1_kv_smem_wv, %tb1_kv_smem_x;\n",
-    );
+    ptx.push_str("    .reg .u64 %tb1_kv_smem_wk, %tb1_kv_smem_wv, %tb1_kv_smem_x;\n");
     // u32 sister registers for matmul_mma::emit_load_*_fragment_smem
     // (B1.6 deferral #1) — the helpers use 32-bit SMEM addressing.
     ptx.push_str("    .reg .u32 %tb1_kv_smem_wk_u32, %tb1_kv_smem_wv_u32, %tb1_kv_smem_x_u32;\n");
@@ -1191,7 +1185,9 @@ pub fn emit_kv_projection_chunk_loop(
     ptx.push_str("    .reg .u32 %tb1_kv_cp_smem_addr, %tb1_kv_cp_hbm_off;\n");
     ptx.push_str("    .reg .u64 %tb1_kv_cp_hbm_addr;\n");
     ptx.push_str("    mov.u32 %tb1_kv_cp_tid_off, %tid.x;\n");
-    ptx.push_str("    shl.b32 %tb1_kv_cp_tid_off, %tb1_kv_cp_tid_off, 4; // tid * 16 (B1.6 deferral #3)\n");
+    ptx.push_str(
+        "    shl.b32 %tb1_kv_cp_tid_off, %tb1_kv_cp_tid_off, 4; // tid * 16 (B1.6 deferral #3)\n",
+    );
     ptx.push_str("    .reg .u64 %tb1_kv_smem_k, %tb1_kv_smem_v;\n");
     ptx.push_str("    .reg .u64 %tb1_kv_scatter_addr;\n");
     ptx.push_str("    .reg .b16 %tb1_kv_h0;\n");
@@ -1201,9 +1197,7 @@ pub fn emit_kv_projection_chunk_loop(
     ptx.push_str("    .reg .u32 %kvmma_x_warp_off, %kvmma_w_warp_off;\n");
     ptx.push_str("    .reg .u32 %kvmma_a_base, %kvmma_bk_base, %kvmma_bv_base;\n");
     // N1d K-iter shifted bases.
-    ptx.push_str(
-        "    .reg .u32 %kvmma_a_base_k, %kvmma_bk_base_k, %kvmma_bv_base_k;\n",
-    );
+    ptx.push_str("    .reg .u32 %kvmma_a_base_k, %kvmma_bk_base_k, %kvmma_bv_base_k;\n");
 
     // ----- 2. Null-guards on csha_x_ptr, csha_wk_ptr, csha_wv_ptr -----
     let skip_label = format!("V2_TIER_B1_KV_PROJ_SKIP_{}", slot);
@@ -1385,17 +1379,11 @@ pub fn emit_kv_projection_chunk_loop(
                 "    shl.b32 %kvmma_x_warp_off, %kvmma_m_tile, {};\n",
                 log2_x_m_stride_kv
             ));
-            ptx.push_str(
-                "    add.u32 %kvmma_a_base, %tb1_kv_smem_x_u32, %kvmma_x_warp_off;\n",
-            );
+            ptx.push_str("    add.u32 %kvmma_a_base, %tb1_kv_smem_x_u32, %kvmma_x_warp_off;\n");
             // B-frag Wk/Wv bases = W_smem + n_tile * 8 * 2 bytes.
             ptx.push_str("    shl.b32 %kvmma_w_warp_off, %kvmma_n_tile, 4;\n");
-            ptx.push_str(
-                "    add.u32 %kvmma_bk_base, %tb1_kv_smem_wk_u32, %kvmma_w_warp_off;\n",
-            );
-            ptx.push_str(
-                "    add.u32 %kvmma_bv_base, %tb1_kv_smem_wv_u32, %kvmma_w_warp_off;\n",
-            );
+            ptx.push_str("    add.u32 %kvmma_bk_base, %tb1_kv_smem_wk_u32, %kvmma_w_warp_off;\n");
+            ptx.push_str("    add.u32 %kvmma_bv_base, %tb1_kv_smem_wv_u32, %kvmma_w_warp_off;\n");
 
             // N1d: K/V projection K-loop. K-dim = chunk; for chunk > 16
             // we need chunk/16 K-iters, accumulating into the same
@@ -1541,7 +1529,13 @@ pub fn emit_kv_projection_chunk_loop(
     // root cause documented in PR follow-up #1).
     emit_dfragment_scatter(ptx, "ksc", "k_acc", "%tb1_kv_smem_k", hd, tpw);
     emit_dfragment_scatter_col_major(
-        ptx, "vsc", "v_acc", "%tb1_kv_smem_v", config.block_kv as u32, hd, tpw,
+        ptx,
+        "vsc",
+        "v_acc",
+        "%tb1_kv_smem_v",
+        config.block_kv as u32,
+        hd,
+        tpw,
     );
     ptx.push_str("    bar.sync 0; // FENCE: K+V tiles visible before downstream phases\n");
 
@@ -1580,10 +1574,18 @@ mod tests {
         let cfg = make_config(32, 32, 32, 2048);
         let mut ptx = String::new();
         emit_q_projection(&mut ptx, &cfg, 128);
-        assert_eq!(ptx.matches("setp.eq.u64 %tb1_q_").count(), 2,
-            "expected 2 null-guards (x_ptr + wq_ptr); got: {}", ptx);
-        assert_eq!(ptx.matches("V2_TIER_B1_Q_PROJ_SKIP").count(), 3,
-            "expected 3 occurrences of the skip label (2 bra + 1 landing): {}", ptx);
+        assert_eq!(
+            ptx.matches("setp.eq.u64 %tb1_q_").count(),
+            2,
+            "expected 2 null-guards (x_ptr + wq_ptr); got: {}",
+            ptx
+        );
+        assert_eq!(
+            ptx.matches("V2_TIER_B1_Q_PROJ_SKIP").count(),
+            3,
+            "expected 3 occurrences of the skip label (2 bra + 1 landing): {}",
+            ptx
+        );
     }
 
     #[test]
@@ -1593,8 +1595,11 @@ mod tests {
         emit_q_projection(&mut ptx, &cfg, 128);
         // n_chunks = 2048 / 128 = 16. We emit one cp.async pair per chunk.
         // Count cp.async.commit_group to match n_chunks.
-        assert_eq!(ptx.matches("cp.async.commit_group").count(), 16,
-            "expected 16 chunk iterations (2048 / 128)");
+        assert_eq!(
+            ptx.matches("cp.async.commit_group").count(),
+            16,
+            "expected 16 chunk iterations (2048 / 128)"
+        );
     }
 
     #[test]
@@ -1607,9 +1612,11 @@ mod tests {
         emit_q_projection(&mut ptx, &cfg, 128);
         let mma_count = ptx.matches("mma.sync.aligned.m16n8k16").count();
         let expected = 1 * 16 * 8;
-        assert_eq!(mma_count, expected,
+        assert_eq!(
+            mma_count, expected,
             "expected {} MMA instructions (1 tile/warp * 16 chunks * 8 K-iters); got {}\nPTX:\n{}",
-            expected, mma_count, ptx);
+            expected, mma_count, ptx
+        );
     }
 
     #[test]
@@ -1741,8 +1748,8 @@ mod tests {
         // slot=0 must reference k_offset_ping / v_offset_ping.
         // slot=1 must reference k_offset_pong / v_offset_pong.
         use crate::flash_attention_v2::smem_layout::{
-            tier_b1_k_offset_ping, tier_b1_k_offset_pong,
-            tier_b1_v_offset_ping, tier_b1_v_offset_pong,
+            tier_b1_k_offset_ping, tier_b1_k_offset_pong, tier_b1_v_offset_ping,
+            tier_b1_v_offset_pong,
         };
         let cfg = make_config(32, 32, 32, 2048);
         let mut ptx0 = String::new();
@@ -1757,19 +1764,23 @@ mod tests {
 
         assert!(
             ptx0.contains(&format!("// K output tile (slot=0)")),
-            "slot=0 K tile comment must be present; k_ping={}", k_ping
+            "slot=0 K tile comment must be present; k_ping={}",
+            k_ping
         );
         assert!(
             ptx0.contains(&format!("// V output tile (slot=0)")),
-            "slot=0 V tile comment must be present; v_ping={}", v_ping
+            "slot=0 V tile comment must be present; v_ping={}",
+            v_ping
         );
         assert!(
             ptx1.contains(&format!("// K output tile (slot=1)")),
-            "slot=1 K tile comment must be present; k_pong={}", k_pong
+            "slot=1 K tile comment must be present; k_pong={}",
+            k_pong
         );
         assert!(
             ptx1.contains(&format!("// V output tile (slot=1)")),
-            "slot=1 V tile comment must be present; v_pong={}", v_pong
+            "slot=1 V tile comment must be present; v_pong={}",
+            v_pong
         );
     }
 

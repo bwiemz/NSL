@@ -62,10 +62,7 @@ fn comparison_within_5pct_no_flag() {
 
 #[test]
 fn comparison_missing_actual_shows_na() {
-    let out = render_comparison(
-        &mk_manifest(),
-        &ActualReport { aggregates: vec![] },
-    );
+    let out = render_comparison(&mk_manifest(), &ActualReport { aggregates: vec![] });
     assert!(out.contains("n/a"));
 }
 

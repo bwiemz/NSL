@@ -44,7 +44,12 @@ fn step() -> Tensor<[4, 8], f32>:
     .expect("walk_ops");
 
     let matmuls: Vec<_> = report.ops.iter().filter(|o| o.name == "matmul").collect();
-    assert_eq!(matmuls.len(), 1, "expected exactly one matmul op, got {:?}", report.ops);
+    assert_eq!(
+        matmuls.len(),
+        1,
+        "expected exactly one matmul op, got {:?}",
+        report.ops
+    );
     // 2 * M * K * N = 2 * 4 * 16 * 8 = 1024 FLOPs
     assert_eq!(matmuls[0].flops, 2 * 4 * 16 * 8);
 }
@@ -81,7 +86,11 @@ fn step_fn() -> Tensor<[4, 8], f32>:
     assert!(
         matmul_count >= 1,
         "expected at least one matmul from inlined forward, got ops={:?}",
-        report.ops.iter().map(|o| o.name.clone()).collect::<Vec<_>>()
+        report
+            .ops
+            .iter()
+            .map(|o| o.name.clone())
+            .collect::<Vec<_>>()
     );
 }
 
@@ -107,11 +116,19 @@ fn step() -> Tensor<[4, 8], f32>:
     )
     .expect("walk_ops");
 
-    let unknowns: Vec<_> = report.ops.iter().filter(|o| o.name.starts_with("unknown")).collect();
+    let unknowns: Vec<_> = report
+        .ops
+        .iter()
+        .filter(|o| o.name.starts_with("unknown"))
+        .collect();
     assert!(
         !unknowns.is_empty(),
         "expected at least one unknown op, got {:?}",
-        report.ops.iter().map(|o| o.name.clone()).collect::<Vec<_>>()
+        report
+            .ops
+            .iter()
+            .map(|o| o.name.clone())
+            .collect::<Vec<_>>()
     );
     assert_eq!(unknowns[0].flops, 0);
     assert!(
@@ -164,13 +181,21 @@ fn forward(x: Tensor<[B=1, S=2048, D=512], bf16>, W: Tensor<[512, 512], bf16>) -
     let gpu = nsl_codegen::gpu_specs::find_gpu("h100").unwrap();
     let env = nsl_codegen::profiling::shape_env::ShapeEnv::with_defaults();
     let r = nsl_codegen::profiling::walker::walk_ops(
-        &m, &analysis, &interner,
+        &m,
+        &analysis,
+        &interner,
         nsl_codegen::profiling::types::EntryKind::Auto,
-        &env, gpu, "bf16",
-    ).unwrap();
+        &env,
+        gpu,
+        "bf16",
+    )
+    .unwrap();
     assert!(!r.ops.is_empty());
     for op in &r.ops {
-        assert!(op.origin_node.is_some(),
-            "every walked op should carry its source NodeId, got None for {}", op.name);
+        assert!(
+            op.origin_node.is_some(),
+            "every walked op should carry its source NodeId, got None for {}",
+            op.name
+        );
     }
 }

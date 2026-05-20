@@ -151,13 +151,15 @@ fn collect_in_compile_discovery(
 
 #[test]
 fn differential_agrees_on_awq_calibration_mlp_fixture() {
-    let source = std::fs::read_to_string(fixture("awq_calibration_mlp.nsl"))
-        .expect("fixture readable");
+    let source =
+        std::fs::read_to_string(fixture("awq_calibration_mlp.nsl")).expect("fixture readable");
 
     let mut interner = Interner::new();
     let (tokens, lex_diags) = tokenize(&source, FileId(0), &mut interner);
     assert!(
-        lex_diags.iter().all(|diag| !matches!(diag.level, Level::Error)),
+        lex_diags
+            .iter()
+            .all(|diag| !matches!(diag.level, Level::Error)),
         "fixture must lex cleanly: {lex_diags:?}"
     );
 

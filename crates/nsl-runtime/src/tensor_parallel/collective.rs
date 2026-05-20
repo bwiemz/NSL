@@ -78,22 +78,10 @@ pub trait CollectiveBackend {
     fn barrier(&self) -> i32;
 
     /// Point-to-point send to a specific rank.
-    fn send(
-        &self,
-        sendbuf: *const c_void,
-        count: usize,
-        dtype_bytes: usize,
-        dst_rank: i32,
-    ) -> i32;
+    fn send(&self, sendbuf: *const c_void, count: usize, dtype_bytes: usize, dst_rank: i32) -> i32;
 
     /// Point-to-point receive from a specific rank.
-    fn recv(
-        &self,
-        recvbuf: *mut c_void,
-        count: usize,
-        dtype_bytes: usize,
-        src_rank: i32,
-    ) -> i32;
+    fn recv(&self, recvbuf: *mut c_void, count: usize, dtype_bytes: usize, src_rank: i32) -> i32;
 
     /// This process's rank (0-based).
     fn rank(&self) -> i32;
@@ -130,10 +118,15 @@ fn half_to_f32(bits: u16) -> f32 {
     let mant = (bits & 0x3FF) as u32;
     if exp == 0 {
         // Subnormal or zero
-        if mant == 0 { return f32::from_bits(sign); }
+        if mant == 0 {
+            return f32::from_bits(sign);
+        }
         let mut e = 1u32;
         let mut m = mant;
-        while (m & 0x400) == 0 { m <<= 1; e += 1; }
+        while (m & 0x400) == 0 {
+            m <<= 1;
+            e += 1;
+        }
         let f_exp = (127 - 15 + 1 - e) << 23;
         let f_mant = (m & 0x3FF) << 13;
         f32::from_bits(sign | f_exp | f_mant)
@@ -152,13 +145,16 @@ fn f32_to_half(val: f32) -> u16 {
     let sign = ((bits >> 16) & 0x8000) as u16;
     let exp = ((bits >> 23) & 0xFF) as i32;
     let mant = bits & 0x7FFFFF;
-    if exp >= 143 { // overflow → inf
+    if exp >= 143 {
+        // overflow → inf
         return sign | 0x7C00;
     }
-    if exp <= 102 { // underflow → zero
+    if exp <= 102 {
+        // underflow → zero
         return sign;
     }
-    if exp <= 112 { // subnormal
+    if exp <= 112 {
+        // subnormal
         let shift = 113 - exp;
         let m = (0x800000 | mant) >> (shift + 13);
         return sign | m as u16;
@@ -209,7 +205,12 @@ impl SimulatedBackend {
     /// * `shm_ptr` — pointer to mmap'd shared region; may be null when `world_size == 1`.
     /// * `shm_len` — byte length of the shared region.
     pub fn new(rank: i32, world_size: i32, shm_ptr: *mut u8, shm_len: usize) -> Self {
-        Self { rank, world_size, shm_ptr, shm_len }
+        Self {
+            rank,
+            world_size,
+            shm_ptr,
+            shm_len,
+        }
     }
 
     // -- internal helpers ---------------------------------------------------
@@ -222,7 +223,10 @@ impl SimulatedBackend {
     /// Returns a mutable pointer to the start of rank `r`'s data slot.
     fn slot_ptr(&self, r: i32, slot_bytes: usize) -> *mut u8 {
         let offset = DATA_OFFSET + (r as usize) * slot_bytes;
-        assert!(offset + slot_bytes <= self.shm_len, "slot exceeds shm bounds");
+        assert!(
+            offset + slot_bytes <= self.shm_len,
+            "slot exceeds shm bounds"
+        );
         unsafe { self.shm_ptr.add(offset) }
     }
 
@@ -238,7 +242,8 @@ impl SimulatedBackend {
         if prev + 1 == self.world_size as u32 {
             // Last to arrive — reset arrival and bump generation.
             hdr.arrival.store(0, Ordering::Release);
-            hdr.generation.store(gen_before.wrapping_add(1), Ordering::Release);
+            hdr.generation
+                .store(gen_before.wrapping_add(1), Ordering::Release);
         } else {
             // Spin until generation advances.
             while hdr.generation.load(Ordering::Acquire) == gen_before {
@@ -258,20 +263,26 @@ impl CollectiveBackend for SimulatedBackend {
         _stream: StreamHandle,
     ) -> i32 {
         let bw = dtype_byte_width(dtype);
-        if bw == 0 { return -1; }
+        if bw == 0 {
+            return -1;
+        }
         let nbytes = count * bw;
 
         // Single-rank fast path: just copy.
         if self.world_size == 1 {
             if !std::ptr::eq(sendbuf, recvbuf) {
-                unsafe { std::ptr::copy_nonoverlapping(sendbuf as *const u8, recvbuf as *mut u8, nbytes); }
+                unsafe {
+                    std::ptr::copy_nonoverlapping(sendbuf as *const u8, recvbuf as *mut u8, nbytes);
+                }
             }
             return 0;
         }
 
         // Write local data into our slot.
         let slot = self.slot_ptr(self.rank, nbytes);
-        unsafe { std::ptr::copy_nonoverlapping(sendbuf as *const u8, slot, nbytes); }
+        unsafe {
+            std::ptr::copy_nonoverlapping(sendbuf as *const u8, slot, nbytes);
+        }
 
         // Wait for all ranks to finish writing.
         self.spin_barrier();
@@ -286,7 +297,9 @@ impl CollectiveBackend for SimulatedBackend {
                         let src = self.slot_ptr(r, nbytes) as *const f32;
                         acc += unsafe { *src.add(i) };
                     }
-                    unsafe { *dst.add(i) = acc; }
+                    unsafe {
+                        *dst.add(i) = acc;
+                    }
                 }
             }
             DTYPE_F64 => {
@@ -297,7 +310,9 @@ impl CollectiveBackend for SimulatedBackend {
                         let src = self.slot_ptr(r, nbytes) as *const f64;
                         acc += unsafe { *src.add(i) };
                     }
-                    unsafe { *dst.add(i) = acc; }
+                    unsafe {
+                        *dst.add(i) = acc;
+                    }
                 }
             }
             DTYPE_F16 | DTYPE_BF16 => {
@@ -321,7 +336,9 @@ impl CollectiveBackend for SimulatedBackend {
                     } else {
                         f32_to_bf16(acc)
                     };
-                    unsafe { *dst.add(i) = result_bits; }
+                    unsafe {
+                        *dst.add(i) = result_bits;
+                    }
                 }
             }
             _ => return -2, // unsupported dtype for reduction
@@ -341,20 +358,26 @@ impl CollectiveBackend for SimulatedBackend {
         _stream: StreamHandle,
     ) -> i32 {
         let bw = dtype_byte_width(dtype);
-        if bw == 0 { return -1; }
+        if bw == 0 {
+            return -1;
+        }
         let nbytes = send_count * bw;
 
         // Single-rank fast path.
         if self.world_size == 1 {
             if !std::ptr::eq(sendbuf, recvbuf) {
-                unsafe { std::ptr::copy_nonoverlapping(sendbuf as *const u8, recvbuf as *mut u8, nbytes); }
+                unsafe {
+                    std::ptr::copy_nonoverlapping(sendbuf as *const u8, recvbuf as *mut u8, nbytes);
+                }
             }
             return 0;
         }
 
         // Write local chunk into our slot.
         let slot = self.slot_ptr(self.rank, nbytes);
-        unsafe { std::ptr::copy_nonoverlapping(sendbuf as *const u8, slot, nbytes); }
+        unsafe {
+            std::ptr::copy_nonoverlapping(sendbuf as *const u8, slot, nbytes);
+        }
 
         self.spin_barrier();
 
@@ -380,7 +403,9 @@ impl CollectiveBackend for SimulatedBackend {
         _stream: StreamHandle,
     ) -> i32 {
         let bw = dtype_byte_width(dtype);
-        if bw == 0 { return -1; }
+        if bw == 0 {
+            return -1;
+        }
         let nbytes = count * bw;
 
         // Single-rank fast path: buf already contains the data.
@@ -391,7 +416,9 @@ impl CollectiveBackend for SimulatedBackend {
         // Root writes data into its slot.
         if self.rank == root_rank {
             let slot = self.slot_ptr(root_rank, nbytes);
-            unsafe { std::ptr::copy_nonoverlapping(buf as *const u8, slot, nbytes); }
+            unsafe {
+                std::ptr::copy_nonoverlapping(buf as *const u8, slot, nbytes);
+            }
         }
 
         self.spin_barrier();
@@ -399,7 +426,9 @@ impl CollectiveBackend for SimulatedBackend {
         // Non-root ranks copy from root's slot.
         if self.rank != root_rank {
             let src = self.slot_ptr(root_rank, nbytes);
-            unsafe { std::ptr::copy_nonoverlapping(src, buf as *mut u8, nbytes); }
+            unsafe {
+                std::ptr::copy_nonoverlapping(src, buf as *mut u8, nbytes);
+            }
         }
 
         self.spin_barrier();
@@ -427,7 +456,9 @@ impl CollectiveBackend for SimulatedBackend {
             // Caller must ensure shm is allocated even for single-rank p2p.
             if !self.shm_ptr.is_null() {
                 let slot = self.slot_ptr(self.rank, nbytes);
-                unsafe { std::ptr::copy_nonoverlapping(sendbuf as *const u8, slot, nbytes); }
+                unsafe {
+                    std::ptr::copy_nonoverlapping(sendbuf as *const u8, slot, nbytes);
+                }
             }
             return 0;
         }
@@ -435,26 +466,24 @@ impl CollectiveBackend for SimulatedBackend {
         // Multi-rank: write to our slot, barrier so receiver can read, barrier again to
         // protect against slot reuse before receiver finishes.
         let slot = self.slot_ptr(self.rank, nbytes);
-        unsafe { std::ptr::copy_nonoverlapping(sendbuf as *const u8, slot, nbytes); }
+        unsafe {
+            std::ptr::copy_nonoverlapping(sendbuf as *const u8, slot, nbytes);
+        }
         self.spin_barrier(); // 1: data visible
         self.spin_barrier(); // 2: receiver done reading
         0
     }
 
-    fn recv(
-        &self,
-        recvbuf: *mut c_void,
-        count: usize,
-        dtype_bytes: usize,
-        src_rank: i32,
-    ) -> i32 {
+    fn recv(&self, recvbuf: *mut c_void, count: usize, dtype_bytes: usize, src_rank: i32) -> i32 {
         let nbytes = count * dtype_bytes;
 
         if self.world_size == 1 {
             // Single-rank: read from our slot (written by previous send).
             if !self.shm_ptr.is_null() {
                 let slot = self.slot_ptr(src_rank, nbytes);
-                unsafe { std::ptr::copy_nonoverlapping(slot, recvbuf as *mut u8, nbytes); }
+                unsafe {
+                    std::ptr::copy_nonoverlapping(slot, recvbuf as *mut u8, nbytes);
+                }
             }
             return 0;
         }
@@ -462,7 +491,9 @@ impl CollectiveBackend for SimulatedBackend {
         // Multi-rank: barrier (wait for sender), read, barrier (signal done).
         self.spin_barrier(); // 1: data visible
         let slot = self.slot_ptr(src_rank, nbytes);
-        unsafe { std::ptr::copy_nonoverlapping(slot, recvbuf as *mut u8, nbytes); }
+        unsafe {
+            std::ptr::copy_nonoverlapping(slot, recvbuf as *mut u8, nbytes);
+        }
         self.spin_barrier(); // 2: done reading
         0
     }
@@ -689,13 +720,17 @@ mod tests {
 
         let rc = backend.send(
             send_data.as_ptr() as *const c_void,
-            4, std::mem::size_of::<f32>(), 0,
+            4,
+            std::mem::size_of::<f32>(),
+            0,
         );
         assert_eq!(rc, 0);
 
         let rc = backend.recv(
             recv_data.as_mut_ptr() as *mut c_void,
-            4, std::mem::size_of::<f32>(), 0,
+            4,
+            std::mem::size_of::<f32>(),
+            0,
         );
         assert_eq!(rc, 0);
         assert_eq!(recv_data, send_data);
@@ -725,14 +760,18 @@ mod tests {
             s.spawn(|| {
                 let rc = b0.send(
                     send0.as_ptr() as *const c_void,
-                    count, std::mem::size_of::<f32>(), 1,
+                    count,
+                    std::mem::size_of::<f32>(),
+                    1,
                 );
                 assert_eq!(rc, 0);
             });
             s.spawn(|| {
                 let rc = b1.recv(
                     recv1.as_mut_ptr() as *mut c_void,
-                    count, std::mem::size_of::<f32>(), 0,
+                    count,
+                    std::mem::size_of::<f32>(),
+                    0,
                 );
                 assert_eq!(rc, 0);
             });

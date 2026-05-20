@@ -15,7 +15,9 @@ pub struct ShapeEnv {
 impl ShapeEnv {
     /// Empty env — every lookup returns `None`.
     pub fn new() -> Self {
-        Self { dims: HashMap::new() }
+        Self {
+            dims: HashMap::new(),
+        }
     }
 
     /// Convenient defaults for a training/inference probe: `B=1`, `S=2048`.

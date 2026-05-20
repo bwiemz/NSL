@@ -22,9 +22,7 @@
 //!   dO  — HBM via `%rd_bwd_do` (backward prelude loaded the pointer).
 
 use crate::flash_attention::FlashAttentionConfig;
-use crate::flash_attention_v2::smem_layout::{
-    backward_dv_offset, backward_p_offset,
-};
+use crate::flash_attention_v2::smem_layout::{backward_dv_offset, backward_p_offset};
 
 pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
     assert_eq!(
@@ -68,21 +66,15 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
     ptx.push_str("    cvt.u64.u32 %rd39, %r2;\n");
     ptx.push_str("    add.u64 %rd39, %rd39, %q_start;\n");
     ptx.push_str("    setp.ge.u64 %p0, %rd39, %rd6;\n");
-    ptx.push_str(&format!(
-        "    @%p0 bra V2_BWD_DV_SKIP_ROW_{q_tile_iter};\n"
-    ));
+    ptx.push_str(&format!("    @%p0 bra V2_BWD_DV_SKIP_ROW_{q_tile_iter};\n"));
 
     // Load P[row_global, lane] from SMEM.
     ptx.push_str("    cvt.u64.u32 %rd30, %r2;\n");
-    ptx.push_str(&format!(
-        "    mul.lo.u64 %rd30, %rd30, {};\n", block_kv
-    ));
+    ptx.push_str(&format!("    mul.lo.u64 %rd30, %rd30, {};\n", block_kv));
     ptx.push_str("    cvt.u64.u32 %rd31, %lane;\n");
     ptx.push_str("    add.u64 %rd30, %rd30, %rd31;\n");
     ptx.push_str("    shl.b64 %rd30, %rd30, 2;\n");
-    ptx.push_str(&format!(
-        "    add.u64 %rd30, %rd30, {p_offset};\n"
-    ));
+    ptx.push_str(&format!("    add.u64 %rd30, %rd30, {p_offset};\n"));
     ptx.push_str("    add.u64 %rd30, %shmem_base, %rd30;\n");
     ptx.push_str("    ld.shared.f32 %f_P, [%rd30];\n");
 
@@ -105,9 +97,7 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
         "    mul.lo.u64 %rd34, %rd34, {};  // lane * head_dim * 4\n",
         head_dim * 4
     ));
-    ptx.push_str(&format!(
-        "    add.u64 %rd34, %rd34, {dv_offset};\n"
-    ));
+    ptx.push_str(&format!("    add.u64 %rd34, %rd34, {dv_offset};\n"));
     ptx.push_str("    add.u64 %rd34, %shmem_base, %rd34;  // &dV[lane, 0]\n");
 
     // Inner loop over this warp's d-slice: d = warp_id*d_per_warp + k, k ∈ 0..d_per_warp.
@@ -121,7 +111,8 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
     // dO byte offset for this warp's d-base = warp_id * d_per_warp * 2 (f16).
     ptx.push_str("    cvt.u64.u32 %rd36, %warp_id;\n");
     ptx.push_str(&format!(
-        "    mul.lo.u64 %rd36, %rd36, {};\n", d_per_warp * 2
+        "    mul.lo.u64 %rd36, %rd36, {};\n",
+        d_per_warp * 2
     ));
 
     for k in 0..d_per_warp {
@@ -144,16 +135,12 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
     }
 
     ptx.push_str("    add.u32 %r1, %r1, 1;\n");
-    ptx.push_str(&format!(
-        "    setp.lt.u32 %p0, %r1, {iter_row_count};\n"
-    ));
+    ptx.push_str(&format!("    setp.lt.u32 %p0, %r1, {iter_row_count};\n"));
     ptx.push_str(&format!("    @%p0 bra V2_BWD_DV_INNER_{q_tile_iter};\n"));
     ptx.push_str(&format!("    bra V2_BWD_DV_DONE_ROW_{q_tile_iter};\n"));
     ptx.push_str(&format!("V2_BWD_DV_SKIP_ROW_{q_tile_iter}:\n"));
     ptx.push_str("    add.u32 %r1, %r1, 1;\n");
-    ptx.push_str(&format!(
-        "    setp.lt.u32 %p0, %r1, {iter_row_count};\n"
-    ));
+    ptx.push_str(&format!("    setp.lt.u32 %p0, %r1, {iter_row_count};\n"));
     ptx.push_str(&format!("    @%p0 bra V2_BWD_DV_INNER_{q_tile_iter};\n"));
     ptx.push_str(&format!("V2_BWD_DV_DONE_ROW_{q_tile_iter}:\n"));
 
@@ -167,10 +154,16 @@ mod tests {
 
     fn base_cfg(hd: i64, dm: u32) -> FlashAttentionConfig {
         FlashAttentionConfig {
-            block_q: 32, block_kv: 32, head_dim: hd,
-            causal: false, paged: false, rope_q: false,
+            block_q: 32,
+            block_kv: 32,
+            head_dim: hd,
+            causal: false,
+            paged: false,
+            rope_q: false,
             rope_style: RopeStyle::HalfSplit,
-            gqa_group_size: 1, tree_mask: false, gpu_sm: 75,
+            gqa_group_size: 1,
+            tree_mask: false,
+            gpu_sm: 75,
             segment_masked: false,
             csha: Some(CshaExtras {
                 fused_projections: true,
@@ -190,15 +183,20 @@ mod tests {
         assert!(ptx.contains("V2_BWD_DV_ACCUM_0:"));
         assert!(ptx.contains("fma.rn.f32"));
         // SMEM-based accumulation pattern:
-        assert!(ptx.contains("ld.shared.f32 %f0"),
-            "must load current dV from SMEM");
-        assert!(ptx.contains("st.shared.f32 [%rd37]"),
-            "must store updated dV back to SMEM");
-        assert!(ptx.contains("%rd_bwd_do"),
-            "must read dO from HBM");
+        assert!(
+            ptx.contains("ld.shared.f32 %f0"),
+            "must load current dV from SMEM"
+        );
+        assert!(
+            ptx.contains("st.shared.f32 [%rd37]"),
+            "must store updated dV back to SMEM"
+        );
+        assert!(ptx.contains("%rd_bwd_do"), "must read dO from HBM");
         // Register-based accumulator path removed — no more %f_dv_*.
-        assert!(!ptx.contains("%f_dv_"),
-            "register-based accumulator replaced by SMEM tile");
+        assert!(
+            !ptx.contains("%f_dv_"),
+            "register-based accumulator replaced by SMEM tile"
+        );
     }
 
     #[test]

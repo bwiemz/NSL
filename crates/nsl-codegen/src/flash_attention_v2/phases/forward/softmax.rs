@@ -164,23 +164,14 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
     // === Step 3: compute P[k] = exp(S[k] - new_max), writeback, sum ===
     ptx.push_str("    mov.f32 %f2, 0f00000000;                  // partial_sum = 0\n");
     for chunk in 0..chunks {
-        ptx.push_str(&format!(
-            "    // P writeback chunk {}\n",
-            chunk
-        ));
+        ptx.push_str(&format!("    // P writeback chunk {}\n", chunk));
         ptx.push_str("    cvt.u64.u32 %rd40, %warp_id;\n");
-        ptx.push_str(&format!(
-            "    mul.lo.u64 %rd40, %rd40, {};\n",
-            block_kv
-        ));
+        ptx.push_str(&format!("    mul.lo.u64 %rd40, %rd40, {};\n", block_kv));
         ptx.push_str("    cvt.u64.u32 %rd41, %lane;\n");
         if chunk > 0 {
             ptx.push_str(&format!("    add.u64 %rd41, %rd41, {};\n", chunk * 32));
         }
-        ptx.push_str(&format!(
-            "    setp.lt.u64 %p0, %rd41, {};\n",
-            block_kv
-        ));
+        ptx.push_str(&format!("    setp.lt.u64 %p0, %rd41, {};\n", block_kv));
         ptx.push_str("    add.u64 %rd41, %rd41, %rd40;\n");
         ptx.push_str("    shl.b64 %rd41, %rd41, 2;\n");
         ptx.push_str(&format!("    add.u64 %rd41, %rd41, {};\n", sp_iter_offset));
@@ -290,10 +281,17 @@ mod tests {
 
     fn cfg_with_save(save: bool) -> FlashAttentionConfig {
         FlashAttentionConfig {
-            block_q: 32, block_kv: 32, head_dim: 32,
-            causal: false, paged: false, rope_q: false,
-            rope_style: RopeStyle::HalfSplit, gqa_group_size: 1,
-            tree_mask: false, gpu_sm: 75, segment_masked: false,
+            block_q: 32,
+            block_kv: 32,
+            head_dim: 32,
+            causal: false,
+            paged: false,
+            rope_q: false,
+            rope_style: RopeStyle::HalfSplit,
+            gqa_group_size: 1,
+            tree_mask: false,
+            gpu_sm: 75,
+            segment_masked: false,
             csha: Some(CshaExtras {
                 fused_projections: false,
                 save_activations_for_backward: save,

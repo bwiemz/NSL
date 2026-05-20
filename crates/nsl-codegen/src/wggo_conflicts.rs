@@ -36,17 +36,11 @@ pub enum ConflictKind {
     /// FASE wants to fuse the optimizer step during backward, but CPDT
     /// needs reduce-scatter before the step can run.  The two must be
     /// co-scheduled (fused step → after reduce-scatter).
-    FaseVsCpdt {
-        layer: u32,
-        shard_factor: u32,
-    },
+    FaseVsCpdt { layer: u32, shard_factor: u32 },
     /// CEP produced heterogeneous layer dimensions, which defeats CPDT's
     /// bucketed allreduce.  Either accept a bigger allreduce or
     /// re-prune to uniform shapes.
-    CepVsCpdt {
-        layer: u32,
-        head_count: u32,
-    },
+    CepVsCpdt { layer: u32, head_count: u32 },
 }
 
 /// Resolution verdict emitted by the resolver.
@@ -93,10 +87,7 @@ pub fn detect(decisions: &[LayerDecisions]) -> Vec<ConflictKind> {
                 pruned_heads: d.pruned_heads,
             });
         }
-        if d.adapter_rank > 0
-            && d.shard_factor > 1
-            && d.adapter_comm_cost > d.adapter_comm_budget
-        {
+        if d.adapter_rank > 0 && d.shard_factor > 1 && d.adapter_comm_cost > d.adapter_comm_budget {
             out.push(ConflictKind::WrgaVsCpdt {
                 layer: d.layer,
                 adapter_rank: d.adapter_rank,
@@ -136,10 +127,15 @@ pub fn resolve(conflicts: &[ConflictKind]) -> Vec<Resolution> {
     conflicts
         .iter()
         .map(|c| match *c {
-            ConflictKind::CshaVsCep { layer, csha_level, .. } => {
+            ConflictKind::CshaVsCep {
+                layer, csha_level, ..
+            } => {
                 // CEP wins over CSHA → downgrade.  Level 2/3 → Level 1.
                 let to = csha_level.saturating_sub(1).min(1);
-                Resolution::DowngradeCsha { layer, to_level: to }
+                Resolution::DowngradeCsha {
+                    layer,
+                    to_level: to,
+                }
             }
             ConflictKind::WrgaVsCpdt { layer, .. } => {
                 // CPDT wins over WRGA → drop the adapter.
@@ -160,7 +156,9 @@ pub fn resolve(conflicts: &[ConflictKind]) -> Vec<Resolution> {
 /// Greedy mode (paper §5.3): run each technique independently, detect
 /// conflicts, and resolve with priority ordering.  Returns the resolved
 /// decisions and how many changes were applied.
-pub fn greedy_resolve(mut decisions: Vec<LayerDecisions>) -> (Vec<LayerDecisions>, Vec<Resolution>) {
+pub fn greedy_resolve(
+    mut decisions: Vec<LayerDecisions>,
+) -> (Vec<LayerDecisions>, Vec<Resolution>) {
     let conflicts = detect(&decisions);
     let resolutions = resolve(&conflicts);
     for res in &resolutions {
@@ -272,7 +270,9 @@ mod tests {
             },
         ];
         let conflicts = detect(&d);
-        assert!(conflicts.iter().any(|c| matches!(c, ConflictKind::CepVsCpdt { .. })));
+        assert!(conflicts
+            .iter()
+            .any(|c| matches!(c, ConflictKind::CepVsCpdt { .. })));
     }
 
     #[test]
@@ -283,7 +283,13 @@ mod tests {
             pruned_heads: 2,
         }];
         let r = resolve(&c);
-        assert_eq!(r[0], Resolution::DowngradeCsha { layer: 5, to_level: 1 });
+        assert_eq!(
+            r[0],
+            Resolution::DowngradeCsha {
+                layer: 5,
+                to_level: 1
+            }
+        );
     }
 
     #[test]
@@ -298,7 +304,10 @@ mod tests {
 
     #[test]
     fn resolve_defers_fase_step() {
-        let c = vec![ConflictKind::FaseVsCpdt { layer: 3, shard_factor: 4 }];
+        let c = vec![ConflictKind::FaseVsCpdt {
+            layer: 3,
+            shard_factor: 4,
+        }];
         assert_eq!(resolve(&c)[0], Resolution::DeferFaseStep { layer: 3 });
     }
 

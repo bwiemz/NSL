@@ -178,10 +178,11 @@ pub fn scan(list: &WengertList) -> BoundaryScan {
         }
 
         // Identify the weight-param input and the norm input.
-        let (weight_param, norm_var) = match classify_matmul_inputs(list, mm_op.inputs[0], mm_op.inputs[1]) {
-            Some(pair) => pair,
-            None => continue,
-        };
+        let (weight_param, norm_var) =
+            match classify_matmul_inputs(list, mm_op.inputs[0], mm_op.inputs[1]) {
+                Some(pair) => pair,
+                None => continue,
+            };
 
         let kind = match ProjKind::from_param_name(&weight_param) {
             Some(k) => k,
@@ -198,13 +199,11 @@ pub fn scan(list: &WengertList) -> BoundaryScan {
         }
 
         // Check whether the Matmul's output is consumed by a RoPE op.
-        let rope_op_idx = consumers
-            .get(&mm_op.result)
-            .and_then(|cs| {
-                cs.iter()
-                    .find(|&&c| matches!(list.ops[c as usize].op, PrimalOp::RoPE { .. }))
-                    .copied()
-            });
+        let rope_op_idx = consumers.get(&mm_op.result).and_then(|cs| {
+            cs.iter()
+                .find(|&&c| matches!(list.ops[c as usize].op, PrimalOp::RoPE { .. }))
+                .copied()
+        });
 
         // V must NOT have RoPE; Q/K must have RoPE.  If the topology
         // contradicts this, skip the chain to stay conservative.
@@ -259,18 +258,20 @@ pub fn scan(list: &WengertList) -> BoundaryScan {
     }
 
     // Deterministic output order.
-    chains.sort_by_key(|c| (c.layer.clone().unwrap_or_default(), c.kind as u8, c.matmul_op));
+    chains.sort_by_key(|c| {
+        (
+            c.layer.clone().unwrap_or_default(),
+            c.kind as u8,
+            c.matmul_op,
+        )
+    });
     BoundaryScan { chains }
 }
 
 /// Classify the two inputs of a Matmul into (weight_param_name,
 /// other_input_var_id).  Returns `None` if exactly one side isn't a
 /// `Param(...)` op.
-fn classify_matmul_inputs(
-    list: &WengertList,
-    lhs: VarId,
-    rhs: VarId,
-) -> Option<(String, VarId)> {
+fn classify_matmul_inputs(list: &WengertList, lhs: VarId, rhs: VarId) -> Option<(String, VarId)> {
     let lhs_param = param_name_of(list, lhs);
     let rhs_param = param_name_of(list, rhs);
     match (lhs_param, rhs_param) {
@@ -442,7 +443,12 @@ mod tests {
         };
         let x = push(PrimalOp::Input("x".into()), vec![], &mut ops, &mut next);
         for i in 0..2 {
-            let n = push(PrimalOp::RMSNorm { eps: 1e-5 }, vec![x], &mut ops, &mut next);
+            let n = push(
+                PrimalOp::RMSNorm { eps: 1e-5 },
+                vec![x],
+                &mut ops,
+                &mut next,
+            );
             let wq = push(
                 PrimalOp::Param(format!("blocks.{}.attn.wq", i)),
                 vec![],
@@ -467,10 +473,22 @@ mod tests {
 
     #[test]
     fn proj_kind_recognises_common_naming_schemes() {
-        assert_eq!(ProjKind::from_param_name("blocks.0.attn.wq"), Some(ProjKind::Q));
-        assert_eq!(ProjKind::from_param_name("blocks.0.attn.wk"), Some(ProjKind::K));
-        assert_eq!(ProjKind::from_param_name("blocks.0.attn.wv"), Some(ProjKind::V));
-        assert_eq!(ProjKind::from_param_name("layers.3.q_proj"), Some(ProjKind::Q));
+        assert_eq!(
+            ProjKind::from_param_name("blocks.0.attn.wq"),
+            Some(ProjKind::Q)
+        );
+        assert_eq!(
+            ProjKind::from_param_name("blocks.0.attn.wk"),
+            Some(ProjKind::K)
+        );
+        assert_eq!(
+            ProjKind::from_param_name("blocks.0.attn.wv"),
+            Some(ProjKind::V)
+        );
+        assert_eq!(
+            ProjKind::from_param_name("layers.3.q_proj"),
+            Some(ProjKind::Q)
+        );
         assert_eq!(ProjKind::from_param_name("h.1.attn.wo"), None);
         assert_eq!(ProjKind::from_param_name("blocks.0.ffn.w1"), None);
     }

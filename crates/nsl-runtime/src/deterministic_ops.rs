@@ -73,11 +73,17 @@ pub extern "C" fn nsl_tensor_reduce_sum_deterministic(input: i64, dim: i64, keep
                 crate::cuda::gpu_det_global_sum_f32(c_ptr)
             } else {
                 let ndim = tensor.ndim as usize;
-                let d = if dim < 0 { (dim + ndim as i64) as usize } else { dim as usize };
+                let d = if dim < 0 {
+                    (dim + ndim as i64) as usize
+                } else {
+                    dim as usize
+                };
                 // Per-dim deterministic sum: one thread per output, sequential inner loop
                 crate::cuda::gpu_det_sum_dim_f32(c_ptr, d, keepdim_bool)
             };
-            if c_ptr != input { crate::tensor::nsl_tensor_free(c_ptr); }
+            if c_ptr != input {
+                crate::tensor::nsl_tensor_free(c_ptr);
+            }
             return result;
         }
         #[cfg(not(feature = "cuda"))]
@@ -115,25 +121,37 @@ pub extern "C" fn nsl_tensor_reduce_mean_deterministic(input: i64, dim: i64, kee
                 // Global deterministic mean: det_sum / total_elements
                 let num_elements = tensor.len;
                 let sum_ptr = crate::cuda::gpu_det_global_sum_f32(c_ptr);
-                if c_ptr != input { crate::tensor::nsl_tensor_free(c_ptr); }
+                if c_ptr != input {
+                    crate::tensor::nsl_tensor_free(c_ptr);
+                }
                 let inv = 1.0_f32 / num_elements as f32;
                 crate::cuda::gpu_scalar_op_inplace(
-                    sum_ptr, inv,
-                    crate::cuda::kernels::MUL_SCALAR_F32_PTX, "nsl_mul_scalar_f32\0",
+                    sum_ptr,
+                    inv,
+                    crate::cuda::kernels::MUL_SCALAR_F32_PTX,
+                    "nsl_mul_scalar_f32\0",
                 );
                 return sum_ptr;
             }
 
             let ndim = tensor.ndim as usize;
-            let d = if dim < 0 { (dim + ndim as i64) as usize } else { dim as usize };
+            let d = if dim < 0 {
+                (dim + ndim as i64) as usize
+            } else {
+                dim as usize
+            };
             let shape_slice = unsafe { std::slice::from_raw_parts(tensor.shape, ndim) };
             let dim_size = shape_slice[d];
             let sum_ptr = crate::cuda::gpu_det_sum_dim_f32(c_ptr, d, keepdim_bool);
-            if c_ptr != input { crate::tensor::nsl_tensor_free(c_ptr); }
+            if c_ptr != input {
+                crate::tensor::nsl_tensor_free(c_ptr);
+            }
             let inv = 1.0_f32 / dim_size as f32;
             crate::cuda::gpu_scalar_op_inplace(
-                sum_ptr, inv,
-                crate::cuda::kernels::MUL_SCALAR_F32_PTX, "nsl_mul_scalar_f32\0",
+                sum_ptr,
+                inv,
+                crate::cuda::kernels::MUL_SCALAR_F32_PTX,
+                "nsl_mul_scalar_f32\0",
             );
             return sum_ptr;
         }
@@ -161,11 +179,7 @@ pub extern "C" fn nsl_tensor_reduce_mean_deterministic(input: i64, dim: i64, kee
 /// A full GPU-native sort-based PTX kernel (bitonic sort + sequential accumulate)
 /// is deferred to M46c — the CPU fallback is correct and sufficient for now.
 #[no_mangle]
-pub extern "C" fn nsl_tensor_scatter_add_deterministic(
-    input: i64,
-    indices: i64,
-    src: i64,
-) -> i64 {
+pub extern "C" fn nsl_tensor_scatter_add_deterministic(input: i64, indices: i64, src: i64) -> i64 {
     if input == 0 || indices == 0 || src == 0 {
         return 0;
     }
@@ -186,7 +200,8 @@ pub extern "C" fn nsl_tensor_scatter_add_deterministic(
             let cpu_indices = crate::tensor::nsl_tensor_to_device(indices, 0);
             let cpu_src = crate::tensor::nsl_tensor_to_device(src, 0);
 
-            let cpu_result = nsl_tensor_scatter_add_deterministic_cpu(cpu_input, cpu_indices, cpu_src);
+            let cpu_result =
+                nsl_tensor_scatter_add_deterministic_cpu(cpu_input, cpu_indices, cpu_src);
             let gpu_result = crate::tensor::nsl_tensor_to_device(cpu_result, device);
 
             crate::tensor::nsl_tensor_free(cpu_input);
@@ -203,21 +218,21 @@ pub extern "C" fn nsl_tensor_scatter_add_deterministic(
 }
 
 /// CPU implementation of sort-based deterministic scatter_add.
-fn nsl_tensor_scatter_add_deterministic_cpu(
-    input: i64,
-    indices: i64,
-    src: i64,
-) -> i64 {
+fn nsl_tensor_scatter_add_deterministic_cpu(input: i64, indices: i64, src: i64) -> i64 {
     // Clone input tensor as output base
     let output = crate::tensor::nsl_tensor_clone(input);
-    if output == 0 { return 0; }
+    if output == 0 {
+        return 0;
+    }
 
     let idx_tensor = unsafe { &*(indices as *const crate::tensor::NslTensor) };
     let src_tensor = unsafe { &*(src as *const crate::tensor::NslTensor) };
     let out_tensor = unsafe { &mut *(output as *mut crate::tensor::NslTensor) };
 
     let n = idx_tensor.len as usize;
-    if n == 0 { return output; }
+    if n == 0 {
+        return output;
+    }
 
     // Build sorted (index, value) pairs for deterministic ordering
     let mut pairs: Vec<(i64, f64)> = Vec::with_capacity(n);
@@ -233,7 +248,9 @@ fn nsl_tensor_scatter_add_deterministic_cpu(
     let out_data = out_tensor.data as *mut f64;
     for (idx, val) in &pairs {
         if *idx >= 0 && (*idx as usize) < out_tensor.len as usize {
-            unsafe { *out_data.add(*idx as usize) += val; }
+            unsafe {
+                *out_data.add(*idx as usize) += val;
+            }
         }
     }
 
@@ -312,7 +329,11 @@ mod tests {
         let std_val = unsafe { *std_t.data_f64() };
         let det_val = unsafe { *det_t.data_f64() };
 
-        assert!((std_val - det_val).abs() < 1e-10,
-            "CPU deterministic sum ({}) should match standard sum ({})", det_val, std_val);
+        assert!(
+            (std_val - det_val).abs() < 1e-10,
+            "CPU deterministic sum ({}) should match standard sum ({})",
+            det_val,
+            std_val
+        );
     }
 }

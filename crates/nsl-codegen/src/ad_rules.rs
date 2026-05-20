@@ -1416,14 +1416,24 @@ mod tests {
     }
 
     fn base_cfg_fused_backward(
-        block_q: i64, block_kv: i64, head_dim: i64, heads: u32, d_model: u32,
+        block_q: i64,
+        block_kv: i64,
+        head_dim: i64,
+        heads: u32,
+        d_model: u32,
     ) -> crate::flash_attention::FlashAttentionConfig {
         let _ = heads;
         crate::flash_attention::FlashAttentionConfig {
-            block_q, block_kv, head_dim,
-            causal: false, paged: false, rope_q: false,
+            block_q,
+            block_kv,
+            head_dim,
+            causal: false,
+            paged: false,
+            rope_q: false,
             rope_style: crate::flash_attention::RopeStyle::HalfSplit,
-            gqa_group_size: 1, tree_mask: false, gpu_sm: 75,
+            gqa_group_size: 1,
+            tree_mask: false,
+            gpu_sm: 75,
             segment_masked: false,
             csha: Some(crate::flash_attention::CshaExtras {
                 fused_projections: true,

@@ -1,10 +1,6 @@
 /// Reorder input tokens according to sorted_token_indices.
 /// Returns a new Vec with tokens in expert-grouped order.
-pub fn scatter_tokens(
-    tokens: &[f32],
-    sorted_indices: &[i32],
-    hidden_dim: usize,
-) -> Vec<f32> {
+pub fn scatter_tokens(tokens: &[f32], sorted_indices: &[i32], hidden_dim: usize) -> Vec<f32> {
     let num_assigned = sorted_indices.len();
     let mut sorted = vec![0.0f32; num_assigned * hidden_dim];
     for (dst_row, &src_row) in sorted_indices.iter().enumerate() {
@@ -45,11 +41,7 @@ mod tests {
 
     #[test]
     fn test_scatter_gather_roundtrip() {
-        let tokens: Vec<f32> = vec![
-            1.0, 2.0,
-            3.0, 4.0,
-            5.0, 6.0,
-        ];
+        let tokens: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
         let sorted_indices = vec![2i32, 0, 1];
         let hidden_dim = 2;
 
@@ -61,8 +53,12 @@ mod tests {
         let reverse_indices = vec![2i32, 0, 1];
 
         let gathered = gather_tokens(
-            &expert_outputs, &reverse_indices, &expert_weights,
-            3, 1, hidden_dim,
+            &expert_outputs,
+            &reverse_indices,
+            &expert_weights,
+            3,
+            1,
+            hidden_dim,
         );
         assert_eq!(gathered, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
     }
@@ -70,12 +66,7 @@ mod tests {
     #[test]
     fn test_moe_full_pipeline_matches_naive() {
         // 4 tokens, 2 experts, top_k=1, hidden_dim=3, intermediate_dim=2
-        let tokens: Vec<f32> = vec![
-            1.0, 0.0, 0.0,
-            0.0, 1.0, 0.0,
-            0.0, 0.0, 1.0,
-            1.0, 1.0, 0.0,
-        ];
+        let tokens: Vec<f32> = vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0];
         let hidden_dim = 3;
         let intermediate_dim = 2;
         let num_experts = 2;
@@ -83,22 +74,12 @@ mod tests {
         // expert_weights[expert][hidden][intermediate] row-major
         let expert_weights: Vec<f32> = vec![
             // expert 0: [3x2]
-            1.0, 0.0,
-            0.0, 1.0,
-            0.5, 0.5,
-            // expert 1: [3x2]
-            0.0, 1.0,
-            1.0, 0.0,
-            0.5, 0.5,
+            1.0, 0.0, 0.0, 1.0, 0.5, 0.5, // expert 1: [3x2]
+            0.0, 1.0, 1.0, 0.0, 0.5, 0.5,
         ];
 
         // Force routing: tokens 0,3 -> expert 0, tokens 1,2 -> expert 1
-        let logits: Vec<f32> = vec![
-            5.0, 0.0,
-            0.0, 5.0,
-            0.0, 5.0,
-            5.0, 0.0,
-        ];
+        let logits: Vec<f32> = vec![5.0, 0.0, 0.0, 5.0, 0.0, 5.0, 5.0, 0.0];
 
         let routing = crate::moe::router::route_topk(&logits, 4, num_experts, 1, 2.0);
 
@@ -114,7 +95,8 @@ mod tests {
                     let mut sum = 0.0f32;
                     for k in 0..hidden_dim {
                         sum += scattered[t * hidden_dim + k]
-                            * expert_weights[e * hidden_dim * intermediate_dim + k * intermediate_dim + j];
+                            * expert_weights
+                                [e * hidden_dim * intermediate_dim + k * intermediate_dim + j];
                     }
                     expert_outputs[t * intermediate_dim + j] = sum;
                 }
@@ -140,19 +122,11 @@ mod tests {
 
     #[test]
     fn test_gather_topk2_weighted_sum() {
-        let expert_outputs: Vec<f32> = vec![
-            10.0, 20.0,
-            30.0, 40.0,
-            50.0, 60.0,
-            70.0, 80.0,
-        ];
+        let expert_outputs: Vec<f32> = vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0];
         let reverse_indices = vec![0i32, 0, 1, 1];
         let expert_weights = vec![0.6f32, 0.4, 0.7, 0.3];
 
-        let gathered = gather_tokens(
-            &expert_outputs, &reverse_indices, &expert_weights,
-            2, 2, 2,
-        );
+        let gathered = gather_tokens(&expert_outputs, &reverse_indices, &expert_weights, 2, 2, 2);
         assert!((gathered[0] - 18.0).abs() < 1e-5);
         assert!((gathered[1] - 28.0).abs() < 1e-5);
         assert!((gathered[2] - 56.0).abs() < 1e-5);

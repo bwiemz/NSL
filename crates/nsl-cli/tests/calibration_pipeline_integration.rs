@@ -11,7 +11,10 @@ fn nsl_binary() -> std::path::PathBuf {
 }
 
 fn run(args: &[&str]) -> (String, String, i32) {
-    let out = Command::new(nsl_binary()).args(args).output().expect("run nsl");
+    let out = Command::new(nsl_binary())
+        .args(args)
+        .output()
+        .expect("run nsl");
     (
         String::from_utf8_lossy(&out.stdout).to_string(),
         String::from_utf8_lossy(&out.stderr).to_string(),
@@ -44,9 +47,12 @@ fn build_with_calibration_data_emits_no_consumer_warning() {
     std::fs::write(&data, blob).unwrap();
 
     let (_, err, code) = run(&[
-        "build", model,
-        "--calibration-data", data.to_str().unwrap(),
-        "--calibrate", "best-effort",
+        "build",
+        model,
+        "--calibration-data",
+        data.to_str().unwrap(),
+        "--calibrate",
+        "best-effort",
     ]);
     let _ = std::fs::remove_file(&data);
     assert_eq!(code, 0, "best-effort should not fail the build");

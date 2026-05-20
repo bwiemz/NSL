@@ -383,9 +383,7 @@ impl Compiler<'_> {
         gl_order.sort_by_key(|(k, _)| (k.m, k.n, k.k, k.rank, k.target_sm));
 
         let register_id = self.registry.runtime_fns["nsl_wrga_register_fused_ptx"].0;
-        let register_ref = self
-            .module
-            .declare_func_in_func(register_id, builder.func);
+        let register_ref = self.module.declare_func_in_func(register_id, builder.func);
 
         /// Emit one `nsl_wrga_register_fused_ptx` call.
         ///
@@ -419,13 +417,11 @@ impl Compiler<'_> {
                 })?;
             let mut ptx_desc = cranelift_module::DataDescription::new();
             ptx_desc.define(ptx_bytes.into_boxed_slice());
-            module
-                .define_data(ptx_data_id, &ptx_desc)
-                .map_err(|e| {
-                    CodegenError::new(format!(
-                        "failed to define fused-PTX data '{ptx_label}': {e}"
-                    ))
-                })?;
+            module.define_data(ptx_data_id, &ptx_desc).map_err(|e| {
+                CodegenError::new(format!(
+                    "failed to define fused-PTX data '{ptx_label}': {e}"
+                ))
+            })?;
 
             let name_len = kernel_name.len() as i64;
             let mut name_bytes = kernel_name.as_bytes().to_vec();
@@ -443,13 +439,11 @@ impl Compiler<'_> {
                 })?;
             let mut name_desc = cranelift_module::DataDescription::new();
             name_desc.define(name_bytes.into_boxed_slice());
-            module
-                .define_data(name_data_id, &name_desc)
-                .map_err(|e| {
-                    CodegenError::new(format!(
-                        "failed to define fused-PTX name data '{name_label}': {e}"
-                    ))
-                })?;
+            module.define_data(name_data_id, &name_desc).map_err(|e| {
+                CodegenError::new(format!(
+                    "failed to define fused-PTX name data '{name_label}': {e}"
+                ))
+            })?;
 
             // Emit the call: nsl_wrga_register_fused_ptx(handle, ptx_ptr,
             //   ptx_len, name_ptr, name_len)

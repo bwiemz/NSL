@@ -17,11 +17,16 @@ pub const MMA_M16N8K16: MmaShape = MmaShape { m: 16, n: 8, k: 16 };
 /// but the caller can remap via SMEM stride if a different source
 /// layout is needed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FragmentLayout { Row, Col }
+pub enum FragmentLayout {
+    Row,
+    Col,
+}
 
 /// Accumulator dtype for MMA.  B.3 uses only F32.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AccDtype { F32 }
+pub enum AccDtype {
+    F32,
+}
 
 /// Emit PTX for a single m16n8k16 mma.sync.
 ///
@@ -134,9 +139,7 @@ pub fn emit_load_a_fragment_smem(
     row_stride_bytes: usize,
 ) {
     ptx.push_str("    // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec\n");
-    ptx.push_str(
-        "    // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],\n",
-    );
+    ptx.push_str("    // Lane t holds: reg0=SMEM[t/4,(t%4)*2], reg1=SMEM[t/4+8,(t%4)*2],\n");
     ptx.push_str("    //                reg2=SMEM[t/4,(t%4)*2+8], reg3=SMEM[t/4+8,(t%4)*2+8]\n");
     // Self-contained lane derivation from %tid.x (a PTX built-in special
     // register, always available). We can't rely on a caller-declared
@@ -154,9 +157,7 @@ pub fn emit_load_a_fragment_smem(
     // Step 2: add col_lo bytes = (lane % 4) * 4 bytes (2 f16 packed = 4 bytes).
     ptx.push_str("    and.b32 %mma_addr, %mma_addr, 3;        // lane % 4\n");
     ptx.push_str("    shl.b32 %mma_addr, %mma_addr, 2;        // * 4 bytes (col_lo_bytes)\n");
-    ptx.push_str(
-        "    add.u32 %mma_a_row, %mma_a_row, %mma_addr;  // + col_lo_bytes\n",
-    );
+    ptx.push_str("    add.u32 %mma_a_row, %mma_a_row, %mma_addr;  // + col_lo_bytes\n");
     // Step 3: add smem base.
     ptx.push_str(&format!(
         "    add.u32 %mma_a_row, %mma_a_row, {};  // + smem base\n",
@@ -267,9 +268,7 @@ pub fn emit_load_b_fragment_smem(
     // Add k_lo bytes = (lane % 4) * 4 bytes (2 f16 packed = 4 bytes wide).
     ptx.push_str("    and.b32 %mma_addr, %mma_addr, 3;        // lane % 4\n");
     ptx.push_str("    shl.b32 %mma_addr, %mma_addr, 2;        // * 4 bytes (k_lo bytes)\n");
-    ptx.push_str(
-        "    add.u32 %mma_b_row, %mma_b_row, %mma_addr;  // + k_lo bytes\n",
-    );
+    ptx.push_str("    add.u32 %mma_b_row, %mma_b_row, %mma_addr;  // + k_lo bytes\n");
     // Add smem base.
     ptx.push_str(&format!(
         "    add.u32 %mma_b_row, %mma_b_row, {};  // + smem base\n",
@@ -294,7 +293,9 @@ mod tests {
     fn s(xs: &[&str; 4]) -> [String; 4] {
         [xs[0].into(), xs[1].into(), xs[2].into(), xs[3].into()]
     }
-    fn s2(xs: &[&str; 2]) -> [String; 2] { [xs[0].into(), xs[1].into()] }
+    fn s2(xs: &[&str; 2]) -> [String; 2] {
+        [xs[0].into(), xs[1].into()]
+    }
 
     #[test]
     fn emit_mma_instruction_produces_expected_shape() {
@@ -319,8 +320,11 @@ mod tests {
         let mut ptx = String::new();
         let regs = s(&["ra0", "ra1", "ra2", "ra3"]);
         emit_load_a_fragment_smem(&mut ptx, &regs, "%smem_base_x", 16);
-        assert_eq!(ptx.matches("ld.shared.b32").count(), 4,
-            "should emit 4 ld.shared for A-fragment; got: {ptx}");
+        assert_eq!(
+            ptx.matches("ld.shared.b32").count(),
+            4,
+            "should emit 4 ld.shared for A-fragment; got: {ptx}"
+        );
         assert!(ptx.contains("%ra0"));
         assert!(ptx.contains("%ra3"));
     }

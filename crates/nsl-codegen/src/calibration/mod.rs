@@ -3,13 +3,12 @@
 
 pub mod ast_evaluator;
 pub mod awq_hook;
-pub mod discovery;
-pub mod wggo_gradient_hook;
 pub mod awq_sidecar;
 pub mod binary_codegen;
 pub mod cache;
 pub mod ctx;
 pub mod data_loader;
+pub mod discovery;
 pub mod hooks;
 pub mod identity_hook;
 pub mod observation;
@@ -18,23 +17,23 @@ pub mod retention;
 pub mod retention_pass;
 pub mod sidecar;
 pub mod subprocess;
+pub mod wggo_gradient_hook;
 
+pub use binary_codegen::{
+    emit_calibration_model_object, emit_calibration_scaffolding_object, link_calibration_binary,
+};
 pub use ctx::{BssGlobalEntry, BufferHandle, CalibCtx};
 pub use discovery::{
     discover_awq_projections, discover_awq_projections_from_state,
     pre_scan_awq_projections_from_ast, DiscoveredProjection, DiscoveryError,
 };
 pub use hooks::{CalibrationHook, CalibrationResult, FinalizePlanEntry, ObservePlanEntry};
-pub use binary_codegen::{
-    emit_calibration_model_object, emit_calibration_scaffolding_object,
-    link_calibration_binary,
-};
-pub use wggo_gradient_hook::WggoGradientHook;
 pub use identity_hook::IdentityHook;
 pub use observation::{LayerRef, ObservationPlan, ObservationSet, ParamRef, ProjectionRef};
 pub use registry::HookRegistry;
 pub use retention::{ArenaLayout, RetentionTable, TensorShape};
 pub use retention_pass::build_arena_layout;
+pub use wggo_gradient_hook::WggoGradientHook;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -75,7 +74,10 @@ impl std::fmt::Display for HarnessError {
                 write!(f, "calibration infrastructure failure: {reason}")
             }
             Self::Degenerate { hook_id, reason } => {
-                write!(f, "calibration hook '{hook_id}' returned degenerate data: {reason}")
+                write!(
+                    f,
+                    "calibration hook '{hook_id}' returned degenerate data: {reason}"
+                )
             }
         }
     }
@@ -170,8 +172,7 @@ pub enum HarnessMode {
     BestEffort,
 }
 
-pub type SubprocessEntry =
-    fn(&HarnessConfig, &HookRegistry) -> Result<HarnessOutput, HarnessError>;
+pub type SubprocessEntry = fn(&HarnessConfig, &HookRegistry) -> Result<HarnessOutput, HarnessError>;
 
 pub fn run_harness_simulated(
     registry: &HookRegistry,
@@ -187,9 +188,12 @@ pub fn run_harness_simulated(
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let primary_ckpt = cfg.checkpoints.first().ok_or(HarnessError::Infrastructure {
-        reason: "no checkpoint paths supplied".into(),
-    })?;
+    let primary_ckpt = cfg
+        .checkpoints
+        .first()
+        .ok_or(HarnessError::Infrastructure {
+            reason: "no checkpoint paths supplied".into(),
+        })?;
 
     // Compute the full cache-key digest covering all invalidation
     // dimensions — checkpoints, calibration data, hook set, knobs.
@@ -267,13 +271,14 @@ pub fn run_harness_production(
     registry: &HookRegistry,
     cfg: &HarnessConfig,
 ) -> Result<HarnessOutput, HarnessError> {
-    run_harness_simulated(registry, cfg, crate::calibration::binary_codegen::real_subprocess_entry)
+    run_harness_simulated(
+        registry,
+        cfg,
+        crate::calibration::binary_codegen::real_subprocess_entry,
+    )
 }
 
-fn empty_sidecar_for_fallback(
-    ckpt_hashes: &[String],
-    registry: &HookRegistry,
-) -> Sidecar {
+fn empty_sidecar_for_fallback(ckpt_hashes: &[String], registry: &HookRegistry) -> Sidecar {
     Sidecar {
         version: SIDECAR_VERSION,
         checkpoint_sha256: ckpt_hashes.first().cloned().unwrap_or_default(),
@@ -355,7 +360,10 @@ mod driver_tests {
         let mut registry = HookRegistry::new();
         registry.register(Box::new(IdentityHook::new(b"fixed-bytes".to_vec())));
         let out = run_harness_stub(&registry, b"c", b"d", 4).unwrap();
-        assert_eq!(out.sidecar.hooks.get("identity"), Some(&b"fixed-bytes".to_vec()));
+        assert_eq!(
+            out.sidecar.hooks.get("identity"),
+            Some(&b"fixed-bytes".to_vec())
+        );
         assert_eq!(out.sidecar.num_samples_used, 4);
     }
 
@@ -414,21 +422,15 @@ mod driver_tests {
             compile_bundle: None,
         };
 
-        let r1 = run_harness_simulated(&registry, &cfg, simulated_ok_subprocess)
-            .expect("first run ok");
+        let r1 =
+            run_harness_simulated(&registry, &cfg, simulated_ok_subprocess).expect("first run ok");
         assert_eq!(r1.outcome_repr, "clean");
-        assert_eq!(
-            r1.sidecar.hooks.get("identity"),
-            Some(&b"payload".to_vec())
-        );
+        assert_eq!(r1.sidecar.hooks.get("identity"), Some(&b"payload".to_vec()));
 
-        let r2 = run_harness_simulated(&registry, &cfg, simulated_would_panic)
-            .expect("second run ok");
+        let r2 =
+            run_harness_simulated(&registry, &cfg, simulated_would_panic).expect("second run ok");
         assert_eq!(r2.outcome_repr, "cached");
-        assert_eq!(
-            r2.sidecar.hooks.get("identity"),
-            Some(&b"payload".to_vec())
-        );
+        assert_eq!(r2.sidecar.hooks.get("identity"), Some(&b"payload".to_vec()));
 
         let _ = fs::remove_file(&ckpt);
         let _ = fs::remove_file(&data);
@@ -547,7 +549,10 @@ mod driver_tests {
         // Change sample count → cache must miss.
         cfg.samples = 8;
         let r2 = run_harness_simulated(&registry, &cfg, simulated_ok_subprocess).unwrap();
-        assert_eq!(r2.outcome_repr, "clean", "expected cache miss on sample-count change");
+        assert_eq!(
+            r2.outcome_repr, "clean",
+            "expected cache miss on sample-count change"
+        );
 
         let _ = fs::remove_file(&ckpt);
         let _ = fs::remove_file(&data);
@@ -587,11 +592,11 @@ mod driver_tests {
 #[cfg(test)]
 mod wggo_routing_tests {
     use super::*;
-    use crate::calibration::wggo_gradient_hook::WggoGradientHook;
     use crate::calibration::discovery::WggoGradTarget;
     use crate::calibration::observation::ProjectionRef;
     use crate::calibration::registry::HookRegistry;
     use crate::calibration::sidecar::WggoHeadGradients;
+    use crate::calibration::wggo_gradient_hook::WggoGradientHook;
 
     fn proj(name: &str) -> ProjectionRef {
         ProjectionRef(name.to_string())
@@ -726,7 +731,10 @@ mod wggo_routing_tests {
     fn corrupt_wggo_payload_in_hooks_out_yields_none() {
         let mut hooks_out: std::collections::BTreeMap<String, Vec<u8>> =
             std::collections::BTreeMap::new();
-        hooks_out.insert("wggo_head_gradients".to_string(), b"not-valid-json".to_vec());
+        hooks_out.insert(
+            "wggo_head_gradients".to_string(),
+            b"not-valid-json".to_vec(),
+        );
 
         let sidecar = Sidecar {
             version: SIDECAR_VERSION,

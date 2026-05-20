@@ -299,8 +299,7 @@ pub fn analyze(
     let layers = per_layer
         .iter()
         .map(|plan| {
-            let causal_mask =
-                decide_causal_mask(shape.seq, plan.tiles.block_kv as u64, cfg.causal);
+            let causal_mask = decide_causal_mask(shape.seq, plan.tiles.block_kv as u64, cfg.causal);
             PatternDecision {
                 layer: plan.layer.clone(),
                 causal_mask,
@@ -480,15 +479,24 @@ mod tests {
     #[test]
     fn analyze_composes_per_layer_causal_and_shared_gqa_sink() {
         let per_layer = vec![
-            layer_plan("blocks.0", 128), // seq=1024, block_kv=128 → bitmask
-            layer_plan("blocks.1", 256), // seq=1024, block_kv=256 → bitmask
+            layer_plan("blocks.0", 128),  // seq=1024, block_kv=128 → bitmask
+            layer_plan("blocks.1", 256),  // seq=1024, block_kv=256 → bitmask
             layer_plan("blocks.2", 2048), // seq=1024 < block_kv=2048 → single-tile
         ];
         let plan = analyze(&per_layer, &shape(1024), 8, None, &PatternConfig::default());
         assert_eq!(plan.layers.len(), 3);
-        assert_eq!(plan.layers[0].causal_mask, CausalMaskStrategy::TileAlignedBitmask);
-        assert_eq!(plan.layers[1].causal_mask, CausalMaskStrategy::TileAlignedBitmask);
-        assert_eq!(plan.layers[2].causal_mask, CausalMaskStrategy::SingleTileStatic);
+        assert_eq!(
+            plan.layers[0].causal_mask,
+            CausalMaskStrategy::TileAlignedBitmask
+        );
+        assert_eq!(
+            plan.layers[1].causal_mask,
+            CausalMaskStrategy::TileAlignedBitmask
+        );
+        assert_eq!(
+            plan.layers[2].causal_mask,
+            CausalMaskStrategy::SingleTileStatic
+        );
         // GQA and sink are model-wide.
         for d in &plan.layers {
             assert_eq!(d.gqa, GqaStrategy::ZeroCopyStride { group_size: 2 });

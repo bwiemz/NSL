@@ -25,8 +25,7 @@ fn workspace_root() -> PathBuf {
 }
 
 fn fixture_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/fase_peak_memory.nsl")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fase_peak_memory.nsl")
 }
 
 /// Locate the nsl_runtime static lib that was built with `test-hooks` active.
@@ -72,7 +71,10 @@ fn active_features_include_test_hooks(json: &str) -> bool {
     // The value ends at the first unescaped `"` that closes the string.
     // Since the content is an escaped JSON array like `[\"default\"]`,
     // we find the `]"` sequence which marks the end of the value.
-    let end = after_key.find("]\"").map(|i| i + 1).unwrap_or(after_key.len());
+    let end = after_key
+        .find("]\"")
+        .map(|i| i + 1)
+        .unwrap_or(after_key.len());
     let features_value = &after_key[..end];
     features_value.contains("test-hooks")
 }
@@ -190,7 +192,9 @@ fn build_fixture(source_ad: bool, out_dir: &Path) -> PathBuf {
         cmd.env("NSL_RUNTIME_LIB_PATH_OVERRIDE", &lib_path);
     }
 
-    let output = cmd.output().expect("failed to spawn cargo run nsl-cli build");
+    let output = cmd
+        .output()
+        .expect("failed to spawn cargo run nsl-cli build");
 
     assert!(
         output.status.success(),
@@ -223,9 +227,8 @@ fn run_and_measure_peak(dll_path: &Path) -> usize {
         let peak: Symbol<unsafe extern "C" fn() -> i64> = lib
             .get(b"nsl_cpu_peak_bytes\0")
             .expect("nsl_cpu_peak_bytes symbol not exported");
-        let main_fn: Symbol<unsafe extern "C" fn()> = lib
-            .get(b"main\0")
-            .expect("main symbol not exported");
+        let main_fn: Symbol<unsafe extern "C" fn()> =
+            lib.get(b"main\0").expect("main symbol not exported");
 
         reset();
         main_fn();

@@ -8,10 +8,9 @@
 use std::sync::Mutex;
 
 use super::kv_transfer::{
-    KvTransferHeader, KvBlockTransferEntry, KvTransferBackend,
-    SharedMemBackend, KV_TRANSFER_MAGIC,
+    KvBlockTransferEntry, KvTransferBackend, KvTransferHeader, SharedMemBackend, KV_TRANSFER_MAGIC,
 };
-use super::messages::{WorkerRole, RouterMessage, serialize_message, deserialize_message};
+use super::messages::{deserialize_message, serialize_message, RouterMessage, WorkerRole};
 
 // ---------------------------------------------------------------------------
 // Worker state
@@ -22,7 +21,7 @@ static WORKER_CTX: Mutex<Option<WorkerContext>> = Mutex::new(None);
 struct WorkerContext {
     role: WorkerRole,
     rank: i32,
-    model_ptr: i64,  // opaque model handle from codegen
+    model_ptr: i64,       // opaque model handle from codegen
     kv_cache_handle: i64, // opaque KvCacheManager handle (0 = not set)
 }
 
@@ -125,7 +124,10 @@ fn post_response(msg: &RouterMessage) {
 pub fn drain_responses() -> Vec<RouterMessage> {
     let mut guard = RESPONSE_MAILBOX.lock().unwrap();
     let bytes_list: Vec<Vec<u8>> = guard.drain(..).collect();
-    bytes_list.iter().filter_map(|b| deserialize_message(b)).collect()
+    bytes_list
+        .iter()
+        .filter_map(|b| deserialize_message(b))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -214,7 +216,11 @@ fn call_model_forward(model_ptr: i64, input_tensor_ptr: i64) -> Vec<i64> {
         ndim: tensor.ndim as i32,
         dtype: crate::c_api::nsl_dtype_to_capi(tensor.dtype),
         device_type: if tensor.device > 0 { 1 } else { 0 },
-        device_id: if tensor.device > 0 { (tensor.device - 1) as i32 } else { 0 },
+        device_id: if tensor.device > 0 {
+            (tensor.device - 1) as i32
+        } else {
+            0
+        },
     };
 
     // Prepare output descriptor
@@ -259,8 +265,8 @@ fn call_model_forward(model_ptr: i64, input_tensor_ptr: i64) -> Vec<i64> {
 /// Returns an NslTensor* (as i64) with shape [num_tokens] and dtype f64 (NSL default).
 /// The tensor owns a copy of the data. Returns 0 if token_ids_ptr is null/zero.
 fn create_token_tensor(token_ids_ptr: i64, num_tokens: u32) -> i64 {
-    use crate::tensor::NslTensor;
     use crate::memory::checked_alloc;
+    use crate::tensor::NslTensor;
 
     if token_ids_ptr == 0 || num_tokens == 0 {
         return 0;
@@ -273,25 +279,31 @@ fn create_token_tensor(token_ids_ptr: i64, num_tokens: u32) -> i64 {
     // Copy token IDs (i64) into f64 buffer (NSL's default CPU dtype)
     let src = token_ids_ptr as *const i64;
     for i in 0..n {
-        unsafe { *data_ptr.add(i) = *src.add(i) as f64; }
+        unsafe {
+            *data_ptr.add(i) = *src.add(i) as f64;
+        }
     }
 
     let shape_ptr = checked_alloc(std::mem::size_of::<i64>()) as *mut i64;
-    unsafe { *shape_ptr = n as i64; }
+    unsafe {
+        *shape_ptr = n as i64;
+    }
 
     let strides_ptr = checked_alloc(std::mem::size_of::<i64>()) as *mut i64;
-    unsafe { *strides_ptr = 1; }
+    unsafe {
+        *strides_ptr = 1;
+    }
 
     let tensor = Box::new(NslTensor::new(
         data_ptr as *mut std::ffi::c_void,
         shape_ptr,
         strides_ptr,
-        1,      // ndim
+        1, // ndim
         n as i64,
-        0,      // device = CPU
-        0,      // dtype = f64
-        1,      // owns_data
-        0,      // data_owner
+        0, // device = CPU
+        0, // dtype = f64
+        1, // owns_data
+        0, // data_owner
     ));
     NslTensor::publish(tensor)
 }
@@ -445,7 +457,11 @@ pub extern "C" fn nsl_disagg_prefill_loop(config_ptr: i64) -> i64 {
                 for i in 0..num_blocks as u32 {
                     let valid_tokens = if i == num_blocks as u32 - 1 {
                         let remainder = num_tokens % config.block_size;
-                        if remainder == 0 { config.block_size } else { remainder }
+                        if remainder == 0 {
+                            config.block_size
+                        } else {
+                            remainder
+                        }
                     } else {
                         config.block_size
                     };
@@ -477,8 +493,16 @@ pub extern "C" fn nsl_disagg_prefill_loop(config_ptr: i64) -> i64 {
                     );
                 }
 
-                let k_data_ptr = if total_bytes > 0 { k_buf.as_ptr() as *const std::ffi::c_void } else { std::ptr::null() };
-                let v_data_ptr = if total_bytes > 0 { v_buf.as_ptr() as *const std::ffi::c_void } else { std::ptr::null() };
+                let k_data_ptr = if total_bytes > 0 {
+                    k_buf.as_ptr() as *const std::ffi::c_void
+                } else {
+                    std::ptr::null()
+                };
+                let v_data_ptr = if total_bytes > 0 {
+                    v_buf.as_ptr() as *const std::ffi::c_void
+                } else {
+                    std::ptr::null()
+                };
 
                 let _rc = kv_backend.send_kv(
                     target_decode_rank,
@@ -572,7 +596,9 @@ pub extern "C" fn nsl_disagg_decode_loop(config_ptr: i64) -> i64 {
                 }
                 // Process one decode step per active sequence
                 let mut completed = Vec::new();
-                for (&request_id, (prompt_len, tokens_generated, max_tokens, last_token_id)) in active_sequences.iter_mut() {
+                for (&request_id, (prompt_len, tokens_generated, max_tokens, last_token_id)) in
+                    active_sequences.iter_mut()
+                {
                     if *tokens_generated >= *max_tokens
                         || prompt_len.saturating_add(*tokens_generated) >= config.max_seq_len
                     {
@@ -590,10 +616,7 @@ pub extern "C" fn nsl_disagg_decode_loop(config_ptr: i64) -> i64 {
                     let token_id = if model_ptr != 0 {
                         // Create a 1-element tensor with the last generated token
                         let single_token = [*last_token_id];
-                        let input_tensor = create_token_tensor(
-                            single_token.as_ptr() as i64,
-                            1,
-                        );
+                        let input_tensor = create_token_tensor(single_token.as_ptr() as i64, 1);
                         if input_tensor != 0 {
                             let outputs = call_model_forward(model_ptr, input_tensor);
                             crate::tensor::nsl_tensor_free(input_tensor);
@@ -781,7 +804,10 @@ mod tests {
         let responses = drain_responses();
         assert!(!responses.is_empty(), "prefill should post PrefillComplete");
         match &responses[0] {
-            RouterMessage::PrefillComplete { request_id, num_kv_blocks } => {
+            RouterMessage::PrefillComplete {
+                request_id,
+                num_kv_blocks,
+            } => {
                 assert_eq!(*request_id, 42);
                 // 128 tokens / 16 block_size = 8 blocks
                 assert_eq!(*num_kv_blocks, 8);
@@ -817,14 +843,26 @@ mod tests {
             speculative_temperature_bits: 0,
             eos_token_id: 2,
         };
-        assert_eq!(nsl_disagg_prefill_loop(&cfg as *const WorkerConfig as i64), 0);
+        assert_eq!(
+            nsl_disagg_prefill_loop(&cfg as *const WorkerConfig as i64),
+            0
+        );
 
         let responses = drain_responses();
-        let complete = responses.iter().find(|m| matches!(m, RouterMessage::PrefillComplete { .. }));
+        let complete = responses
+            .iter()
+            .find(|m| matches!(m, RouterMessage::PrefillComplete { .. }));
         assert!(complete.is_some(), "prefill should complete request 77");
-        if let Some(RouterMessage::PrefillComplete { request_id, num_kv_blocks }) = complete {
+        if let Some(RouterMessage::PrefillComplete {
+            request_id,
+            num_kv_blocks,
+        }) = complete
+        {
             assert_eq!(*request_id, 77);
-            assert_eq!(*num_kv_blocks, 3, "17 tokens with block_size=8 should use 3 KV blocks");
+            assert_eq!(
+                *num_kv_blocks, 3,
+                "17 tokens with block_size=8 should use 3 KV blocks"
+            );
         }
 
         assert_eq!(nsl_disagg_worker_destroy(), 0);
@@ -850,10 +888,12 @@ mod tests {
         // Check generated tokens
         let responses = drain_responses();
         // Should have 3 TokenGenerated + 1 DecodeComplete = 4 messages
-        let token_msgs: Vec<_> = responses.iter()
+        let token_msgs: Vec<_> = responses
+            .iter()
             .filter(|m| matches!(m, RouterMessage::TokenGenerated { .. }))
             .collect();
-        let complete_msgs: Vec<_> = responses.iter()
+        let complete_msgs: Vec<_> = responses
+            .iter()
             .filter(|m| matches!(m, RouterMessage::DecodeComplete { .. }))
             .collect();
 
@@ -866,7 +906,11 @@ mod tests {
         }
 
         // DecodeComplete should have total_tokens=3
-        if let RouterMessage::DecodeComplete { request_id, total_tokens } = complete_msgs[0] {
+        if let RouterMessage::DecodeComplete {
+            request_id,
+            total_tokens,
+        } = complete_msgs[0]
+        {
             assert_eq!(*request_id, 99);
             assert_eq!(*total_tokens, 3);
         }
@@ -900,19 +944,35 @@ mod tests {
             speculative_temperature_bits: 0.25f32.to_bits(),
             eos_token_id: 2,
         };
-        assert_eq!(nsl_disagg_decode_loop(&cfg as *const WorkerConfig as i64), 0);
+        assert_eq!(
+            nsl_disagg_decode_loop(&cfg as *const WorkerConfig as i64),
+            0
+        );
 
         let responses = drain_responses();
-        let token_msgs: Vec<_> = responses.iter()
+        let token_msgs: Vec<_> = responses
+            .iter()
             .filter(|m| matches!(m, RouterMessage::TokenGenerated { .. }))
             .collect();
-        let complete_msgs: Vec<_> = responses.iter()
+        let complete_msgs: Vec<_> = responses
+            .iter()
             .filter(|m| matches!(m, RouterMessage::DecodeComplete { .. }))
             .collect();
 
-        assert!(token_msgs.is_empty(), "prompt_len already exceeds max_seq_len, so decode should emit no tokens");
-        assert_eq!(complete_msgs.len(), 1, "custom max_seq_len should still complete the request");
-        if let RouterMessage::DecodeComplete { request_id, total_tokens } = complete_msgs[0] {
+        assert!(
+            token_msgs.is_empty(),
+            "prompt_len already exceeds max_seq_len, so decode should emit no tokens"
+        );
+        assert_eq!(
+            complete_msgs.len(),
+            1,
+            "custom max_seq_len should still complete the request"
+        );
+        if let RouterMessage::DecodeComplete {
+            request_id,
+            total_tokens,
+        } = complete_msgs[0]
+        {
             assert_eq!(*request_id, 7);
             assert_eq!(*total_tokens, 0);
         }
@@ -946,8 +1006,16 @@ mod tests {
             .collect();
 
         assert!(token_msgs.is_empty(), "max_tokens=0 should emit no tokens");
-        assert_eq!(complete_msgs.len(), 1, "max_tokens=0 should complete immediately");
-        if let RouterMessage::DecodeComplete { request_id, total_tokens } = complete_msgs[0] {
+        assert_eq!(
+            complete_msgs.len(),
+            1,
+            "max_tokens=0 should complete immediately"
+        );
+        if let RouterMessage::DecodeComplete {
+            request_id,
+            total_tokens,
+        } = complete_msgs[0]
+        {
             assert_eq!(*request_id, 8);
             assert_eq!(*total_tokens, 0);
         }
@@ -981,7 +1049,10 @@ mod tests {
             speculative_temperature_bits: 0,
             eos_token_id: 2,
         };
-        assert_eq!(nsl_disagg_decode_loop(&cfg as *const WorkerConfig as i64), 0);
+        assert_eq!(
+            nsl_disagg_decode_loop(&cfg as *const WorkerConfig as i64),
+            0
+        );
 
         let responses = drain_responses();
         let token_msgs: Vec<_> = responses
@@ -993,12 +1064,27 @@ mod tests {
             .filter(|m| matches!(m, RouterMessage::DecodeComplete { .. }))
             .collect();
 
-        assert_eq!(token_msgs.len(), 1, "one final token should be emitted when it lands exactly on max_seq_len");
-        assert_eq!(complete_msgs.len(), 1, "request should complete at the exact sequence-length boundary");
+        assert_eq!(
+            token_msgs.len(),
+            1,
+            "one final token should be emitted when it lands exactly on max_seq_len"
+        );
+        assert_eq!(
+            complete_msgs.len(),
+            1,
+            "request should complete at the exact sequence-length boundary"
+        );
         if let RouterMessage::TokenGenerated { is_eos, .. } = token_msgs[0] {
-            assert_eq!(*is_eos, 1, "the boundary token should terminate the sequence");
+            assert_eq!(
+                *is_eos, 1,
+                "the boundary token should terminate the sequence"
+            );
         }
-        if let RouterMessage::DecodeComplete { request_id, total_tokens } = complete_msgs[0] {
+        if let RouterMessage::DecodeComplete {
+            request_id,
+            total_tokens,
+        } = complete_msgs[0]
+        {
             assert_eq!(*request_id, 9);
             assert_eq!(*total_tokens, 1);
         }
@@ -1021,7 +1107,9 @@ mod tests {
         assert_eq!(nsl_disagg_prefill_loop(0), 0);
         let prefill_responses = drain_responses();
         assert!(
-            prefill_responses.iter().any(|m| matches!(m, RouterMessage::PrefillComplete { request_id: 1, .. })),
+            prefill_responses
+                .iter()
+                .any(|m| matches!(m, RouterMessage::PrefillComplete { request_id: 1, .. })),
             "prefill should complete request 1"
         );
         assert_eq!(nsl_disagg_worker_destroy(), 0);
@@ -1038,9 +1126,15 @@ mod tests {
         assert_eq!(nsl_disagg_decode_loop(0), 0);
         let decode_responses = drain_responses();
 
-        let complete = decode_responses.iter().find(|m| matches!(m, RouterMessage::DecodeComplete { .. }));
+        let complete = decode_responses
+            .iter()
+            .find(|m| matches!(m, RouterMessage::DecodeComplete { .. }));
         assert!(complete.is_some(), "decode should complete");
-        if let Some(RouterMessage::DecodeComplete { request_id, total_tokens }) = complete {
+        if let Some(RouterMessage::DecodeComplete {
+            request_id,
+            total_tokens,
+        }) = complete
+        {
             assert_eq!(*request_id, 1);
             assert_eq!(*total_tokens, 5);
         }
@@ -1079,7 +1173,8 @@ mod tests {
 
         assert_eq!(nsl_disagg_prefill_loop(0), 0);
         let responses = drain_responses();
-        let completes: Vec<_> = responses.iter()
+        let completes: Vec<_> = responses
+            .iter()
             .filter(|m| matches!(m, RouterMessage::PrefillComplete { .. }))
             .collect();
         assert_eq!(completes.len(), 3, "should complete all 3 prefill requests");

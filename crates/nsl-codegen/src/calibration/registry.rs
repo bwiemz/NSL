@@ -59,8 +59,12 @@ mod tests {
 
     struct HookA;
     impl CalibrationHook for HookA {
-        fn id(&self) -> &'static str { "a" }
-        fn requires(&self) -> ObservationSet { ObservationSet::Empty }
+        fn id(&self) -> &'static str {
+            "a"
+        }
+        fn requires(&self) -> ObservationSet {
+            ObservationSet::Empty
+        }
         fn emit_init(&self, _: &mut CalibCtx) {}
         fn emit_per_step(&self, _: &mut CalibCtx) {}
         fn emit_finalize(&self, _: &mut CalibCtx) -> CalibrationResult {
@@ -69,8 +73,12 @@ mod tests {
     }
     struct HookB;
     impl CalibrationHook for HookB {
-        fn id(&self) -> &'static str { "b" }
-        fn requires(&self) -> ObservationSet { ObservationSet::Empty }
+        fn id(&self) -> &'static str {
+            "b"
+        }
+        fn requires(&self) -> ObservationSet {
+            ObservationSet::Empty
+        }
         fn emit_init(&self, _: &mut CalibCtx) {}
         fn emit_per_step(&self, _: &mut CalibCtx) {}
         fn emit_finalize(&self, _: &mut CalibCtx) -> CalibrationResult {
@@ -91,9 +99,8 @@ mod tests {
     fn registry_rejects_duplicate_ids() {
         let mut r = HookRegistry::new();
         r.register(Box::new(HookA));
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            r.register(Box::new(HookA))
-        }));
+        let result =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| r.register(Box::new(HookA))));
         assert!(result.is_err(), "duplicate register should panic");
     }
 

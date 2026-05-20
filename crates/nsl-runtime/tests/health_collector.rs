@@ -29,8 +29,14 @@ fn decreasing_loss_produces_negative_slope() {
         c.record_loss(i, 100.0 - i as f64);
     }
     let snap = c.snapshot();
-    let slope = snap.loss_ema_slope.expect("slope should exist with 20 samples");
-    assert!(slope < -0.5, "expected strongly negative slope, got {}", slope);
+    let slope = snap
+        .loss_ema_slope
+        .expect("slope should exist with 20 samples");
+    assert!(
+        slope < -0.5,
+        "expected strongly negative slope, got {}",
+        slope
+    );
 }
 
 #[test]
@@ -39,7 +45,11 @@ fn weight_init_then_update_produces_pct_delta() {
     c.record_weight_norm("m.l0.w", 100.0, true);
     c.record_weight_norm("m.l0.w", 105.0, false);
     let snap = c.snapshot();
-    let pct = snap.per_tensor_weight_pct_delta.get("m.l0.w").copied().unwrap();
+    let pct = snap
+        .per_tensor_weight_pct_delta
+        .get("m.l0.w")
+        .copied()
+        .unwrap();
     assert!((pct - 5.0).abs() < 1e-6, "expected +5%, got {}", pct);
 }
 

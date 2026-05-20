@@ -94,12 +94,7 @@ fn nsl_run_with_args(fixture: &Path, workdir: &Path, extra: &[&str]) {
 /// Because all 4 micro-batches see the same (x, y), the FASE Deferred
 /// mean(g_k) = g, so the accumulated result must exactly match a single
 /// plain SGD step.
-fn sgd_reference(
-    w_init: &[f32; 2],
-    x: &[[f32; 2]; 4],
-    y: &[[f32; 1]; 4],
-    lr: f32,
-) -> [f32; 2] {
+fn sgd_reference(w_init: &[f32; 2], x: &[[f32; 2]; 4], y: &[[f32; 1]; 4], lr: f32) -> [f32; 2] {
     // Forward: pred[i] = sum_j x[i][j] * w[j]
     let mut pred = [0.0_f32; 4];
     for i in 0..4 {
@@ -244,8 +239,7 @@ fn adamw_fase_deferred_reference(
             // m = β₁·m + (1-β₁)·m_partial
             m_state[j] = beta1 * m_state[j] + (1.0 - beta1) * m_partial[j];
             // v = β₂·v + (1-β₂)·m_partial²  (FASE approximation)
-            v_state[j] =
-                beta2 * v_state[j] + (1.0 - beta2) * m_partial[j] * m_partial[j];
+            v_state[j] = beta2 * v_state[j] + (1.0 - beta2) * m_partial[j] * m_partial[j];
             // Bias correction
             let bc1 = 1.0 - beta1.powi(step as i32);
             let bc2 = 1.0 - beta2.powi(step as i32);
@@ -265,10 +259,7 @@ fn adamw_fase_deferred_reference(
 #[test]
 fn adamw_fase_deferred_pipeline_equivalence() {
     let tmp = TempDir::new().expect("tempdir");
-    nsl_run(
-        &fixture("fase_deferred_adamw_equivalence.nsl"),
-        tmp.path(),
-    );
+    nsl_run(&fixture("fase_deferred_adamw_equivalence.nsl"), tmp.path());
 
     let checkpoint = tmp.path().join("adamw_out.nslm");
     assert!(
@@ -293,15 +284,8 @@ fn adamw_fase_deferred_pipeline_equivalence() {
     let x = [[1.0, 1.0]; 4];
     let y = [[0.0]; 4];
     let w_ref = adamw_fase_deferred_reference(
-        &w_init,
-        &x,
-        &y,
-        /*lr=*/ 0.001,
-        /*beta1=*/ 0.9,
-        /*beta2=*/ 0.999,
-        /*eps=*/ 1e-8,
-        /*wd=*/ 0.01,
-        /*windows=*/ 3,
+        &w_init, &x, &y, /*lr=*/ 0.001, /*beta1=*/ 0.9, /*beta2=*/ 0.999,
+        /*eps=*/ 1e-8, /*wd=*/ 0.01, /*windows=*/ 3,
     );
 
     println!("AdamW FASE-Deferred equivalence check:");
@@ -373,8 +357,7 @@ fn adamw_fase_deferred_clipped_reference(
         for j in 0..2 {
             m_partial[j] *= clip_factor;
             m_state[j] = beta1 * m_state[j] + (1.0 - beta1) * m_partial[j];
-            v_state[j] =
-                beta2 * v_state[j] + (1.0 - beta2) * m_partial[j] * m_partial[j];
+            v_state[j] = beta2 * v_state[j] + (1.0 - beta2) * m_partial[j] * m_partial[j];
             let bc1 = 1.0 - beta1.powi(step as i32);
             let bc2 = 1.0 - beta2.powi(step as i32);
             let m_hat = m_state[j] / bc1;
@@ -414,16 +397,8 @@ fn adamw_deferred_with_grad_clip() {
     let x = [[1.0, 1.0]; 4];
     let y = [[0.0]; 4];
     let w_ref = adamw_fase_deferred_clipped_reference(
-        &w_init,
-        &x,
-        &y,
-        /*lr=*/ 0.001,
-        /*beta1=*/ 0.9,
-        /*beta2=*/ 0.999,
-        /*eps=*/ 1e-8,
-        /*wd=*/ 0.01,
-        /*tau=*/ 0.01,
-        /*windows=*/ 3,
+        &w_init, &x, &y, /*lr=*/ 0.001, /*beta1=*/ 0.9, /*beta2=*/ 0.999,
+        /*eps=*/ 1e-8, /*wd=*/ 0.01, /*tau=*/ 0.01, /*windows=*/ 3,
     );
 
     println!("AdamW+clip FASE-Deferred equivalence check:");
@@ -477,15 +452,8 @@ fn adamw_fase_deferred_source_ad_pipeline_equivalence() {
     let x = [[1.0, 1.0]; 4];
     let y = [[0.0]; 4];
     let w_ref = adamw_fase_deferred_reference(
-        &w_init,
-        &x,
-        &y,
-        /*lr=*/ 0.001,
-        /*beta1=*/ 0.9,
-        /*beta2=*/ 0.999,
-        /*eps=*/ 1e-8,
-        /*wd=*/ 0.01,
-        /*windows=*/ 3,
+        &w_init, &x, &y, /*lr=*/ 0.001, /*beta1=*/ 0.9, /*beta2=*/ 0.999,
+        /*eps=*/ 1e-8, /*wd=*/ 0.01, /*windows=*/ 3,
     );
 
     println!("AdamW FASE-Deferred (source-AD) equivalence check:");

@@ -91,10 +91,7 @@ pub struct PipelineContextPool {
 impl PipelineContextPool {
     /// Construct a pool with `pool_size` contexts. Panics on construction
     /// failure; for fallible construction use `try_new`.
-    pub fn new<F: FnMut() -> PipelineContext>(
-        pool_size: usize,
-        constructor: F,
-    ) -> Self {
+    pub fn new<F: FnMut() -> PipelineContext>(pool_size: usize, constructor: F) -> Self {
         Self::try_new(pool_size, constructor).expect("pool construction failed")
     }
 
@@ -120,7 +117,11 @@ impl PipelineContextPool {
             contexts.push(Some(constructor()));
             available.push_back(i);
         }
-        Ok(Self { contexts, available, size: pool_size })
+        Ok(Self {
+            contexts,
+            available,
+            size: pool_size,
+        })
     }
 
     /// Number of currently-available contexts (non-leased, non-tombstoned).
@@ -147,7 +148,9 @@ impl PipelineContextPool {
     /// decrement `size`, log the diagnostic, and do NOT re-add the index.
     pub fn release(&mut self, lease: Lease) {
         let idx = lease.index;
-        let Some(slot) = self.contexts.get_mut(idx) else { return };
+        let Some(slot) = self.contexts.get_mut(idx) else {
+            return;
+        };
         let Some(ctx) = slot.as_mut() else {
             // Already tombstoned by a prior path; nothing to do.
             return;
@@ -200,9 +203,14 @@ mod tests {
         let l2 = pool.acquire().unwrap();
         let l3 = pool.acquire().unwrap();
         let l4 = pool.acquire().unwrap();
-        assert!(matches!(pool.acquire(), Err(AcquireError::Exhausted)),
-            "5th acquire should fail with Exhausted");
-        pool.release(l1); pool.release(l2); pool.release(l3); pool.release(l4);
+        assert!(
+            matches!(pool.acquire(), Err(AcquireError::Exhausted)),
+            "5th acquire should fail with Exhausted"
+        );
+        pool.release(l1);
+        pool.release(l2);
+        pool.release(l3);
+        pool.release(l4);
         assert_eq!(pool.available_count(), 4);
     }
 
@@ -212,18 +220,31 @@ mod tests {
         let l1 = pool.acquire().unwrap();
         let l2 = pool.acquire().unwrap();
         pool.release(l1);
-        assert_eq!(pool.effective_size(), 1, "after first reset failure, effective size = 1");
+        assert_eq!(
+            pool.effective_size(),
+            1,
+            "after first reset failure, effective size = 1"
+        );
         pool.release(l2);
-        assert_eq!(pool.effective_size(), 0, "after second reset failure, effective size = 0");
+        assert_eq!(
+            pool.effective_size(),
+            0,
+            "after second reset failure, effective size = 0"
+        );
         // Capacity does NOT bounce back in v1 (tombstone + lazy replacement).
-        assert!(matches!(pool.acquire(), Err(AcquireError::Exhausted)),
-            "acquire after total tombstoning should fail");
+        assert!(
+            matches!(pool.acquire(), Err(AcquireError::Exhausted)),
+            "acquire after total tombstoning should fail"
+        );
     }
 
     #[test]
     fn pool_oversize_fails_at_construction() {
         let r = PipelineContextPool::try_new(usize::MAX, PipelineContext::new_test);
-        assert!(r.is_err(), "memory-exceeding pool_size should fail at construction");
+        assert!(
+            r.is_err(),
+            "memory-exceeding pool_size should fail at construction"
+        );
     }
 
     #[test]

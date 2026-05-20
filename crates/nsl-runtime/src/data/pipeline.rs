@@ -62,7 +62,9 @@ impl<T> BoundedChannel<T> {
     fn push(&self, item: T) -> bool {
         let mut guard = self.queue.lock().unwrap();
         while guard.len() >= self.capacity {
-            if self.closed.load(Ordering::Acquire) { return false; }
+            if self.closed.load(Ordering::Acquire) {
+                return false;
+            }
             guard = self.not_full.wait(guard).unwrap();
         }
         guard.push_back(item);
@@ -265,7 +267,9 @@ pub extern "C" fn nsl_data_prefetch_create(
 /// Destroy a prefetch pipeline.
 #[no_mangle]
 pub extern "C" fn nsl_data_prefetch_destroy(handle: i64) -> i64 {
-    if handle == 0 { return -1; }
+    if handle == 0 {
+        return -1;
+    }
     let pipeline = unsafe { Box::from_raw(handle as *mut PrefetchPipeline) };
     pipeline.shutdown();
     0
@@ -314,9 +318,8 @@ mod tests {
             num_io_workers: 1,
         };
 
-        let mut pipeline = PrefetchPipeline::new(config, |idx| {
-            format!("sample_{idx}").into_bytes()
-        });
+        let mut pipeline =
+            PrefetchPipeline::new(config, |idx| format!("sample_{idx}").into_bytes());
 
         // Get first batch
         let batch = pipeline.next_batch().unwrap();
@@ -337,9 +340,7 @@ mod tests {
             num_io_workers: 1,
         };
 
-        let mut pipeline = PrefetchPipeline::new(config, |idx| {
-            vec![idx as u8; 10]
-        });
+        let mut pipeline = PrefetchPipeline::new(config, |idx| vec![idx as u8; 10]);
 
         // Consume 3 batches
         for _ in 0..3 {

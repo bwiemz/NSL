@@ -85,8 +85,7 @@ fn forward_kernel_segment_masked_tier_b_causal_32_32_32() {
     let cfg = minimal_segment_masked_config();
     let seq_len: u32 = 4096;
     let residency = SegmentResidency::Shared;
-    let ptx_bytes =
-        synthesize_flash_attention_ptx_v2_with_tier_b(&cfg, Some((seq_len, residency)));
+    let ptx_bytes = synthesize_flash_attention_ptx_v2_with_tier_b(&cfg, Some((seq_len, residency)));
     let ptx = String::from_utf8(ptx_bytes).expect("PTX must be valid UTF-8");
 
     // Structural assertions: Tier B additions must be present.
@@ -112,8 +111,7 @@ fn forward_kernel_segment_masked_tier_b_causal_64_64_64() {
     let cfg = segment_masked_config_64x64x64();
     let seq_len: u32 = 4096;
     let residency = SegmentResidency::Shared;
-    let ptx_bytes =
-        synthesize_flash_attention_ptx_v2_with_tier_b(&cfg, Some((seq_len, residency)));
+    let ptx_bytes = synthesize_flash_attention_ptx_v2_with_tier_b(&cfg, Some((seq_len, residency)));
     let ptx = String::from_utf8(ptx_bytes).expect("PTX must be valid UTF-8");
 
     // Structural assertions: Tier B additions must be present.

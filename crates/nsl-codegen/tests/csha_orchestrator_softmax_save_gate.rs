@@ -4,10 +4,17 @@ use nsl_codegen::flash_attention_v2::synthesize_flash_attention_ptx_v2;
 #[test]
 fn forward_synthesis_includes_row_max_hbm_save_under_save_activations_without_fused() {
     let cfg = FlashAttentionConfig {
-        block_q: 32, block_kv: 32, head_dim: 32,
-        causal: false, paged: false, rope_q: false,
-        rope_style: RopeStyle::HalfSplit, gqa_group_size: 1,
-        tree_mask: false, segment_masked: false, gpu_sm: 89,
+        block_q: 32,
+        block_kv: 32,
+        head_dim: 32,
+        causal: false,
+        paged: false,
+        rope_q: false,
+        rope_style: RopeStyle::HalfSplit,
+        gqa_group_size: 1,
+        tree_mask: false,
+        segment_masked: false,
+        gpu_sm: 89,
         csha: Some(CshaExtras {
             level: 1,
             fused_projections: false,

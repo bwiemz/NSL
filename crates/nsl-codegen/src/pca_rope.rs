@@ -38,7 +38,10 @@ use crate::pca_tileskip::PackingLayout;
 /// + RoPE-reset budget.
 pub const MAX_NUM_DOCS: u32 = 256;
 
-const _: () = assert!(MAX_NUM_DOCS <= 4096, "MAX_NUM_DOCS bound — keeps SMEM layout small");
+const _: () = assert!(
+    MAX_NUM_DOCS <= 4096,
+    "MAX_NUM_DOCS bound — keeps SMEM layout small"
+);
 const _: () = assert!(
     (MAX_NUM_DOCS + 1) * 4 <= 2048,
     "doc_starts SMEM bake must stay well under per-CTA budget"
@@ -214,10 +217,7 @@ mod tests {
     fn three_docs_reset_positions() {
         let p = plan(&PackingLayout::from_docs(vec![3, 2, 4]));
         assert!(p.needs_reset);
-        assert_eq!(
-            p.position_offsets,
-            vec![0, 1, 2, 0, 1, 0, 1, 2, 3]
-        );
+        assert_eq!(p.position_offsets, vec![0, 1, 2, 0, 1, 0, 1, 2, 3]);
     }
 
     #[test]
@@ -287,7 +287,12 @@ mod tests {
         let inst_data = builder.func.dfg.insts[inst];
         match inst_data {
             cranelift_codegen::ir::InstructionData::UnaryImm { imm, .. } => {
-                assert_eq!(imm.bits(), 0, "sentinel must be value 0, got {}", imm.bits());
+                assert_eq!(
+                    imm.bits(),
+                    0,
+                    "sentinel must be value 0, got {}",
+                    imm.bits()
+                );
             }
             other => panic!("expected UnaryImm for iconst, got {:?}", other),
         }

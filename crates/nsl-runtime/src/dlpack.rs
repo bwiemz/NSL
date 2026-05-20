@@ -8,7 +8,7 @@ use std::ffi::c_void;
 use std::os::raw::c_int;
 
 use crate::memory::checked_alloc;
-use crate::tensor::{NslTensor, DTYPE_F32, DTYPE_F64, DTYPE_FP16, DTYPE_BF16, DTYPE_INT8};
+use crate::tensor::{NslTensor, DTYPE_BF16, DTYPE_F32, DTYPE_F64, DTYPE_FP16, DTYPE_INT8};
 
 // ---------------------------------------------------------------------------
 // DLPack v0.8 C ABI structs
@@ -86,12 +86,36 @@ pub struct DLManagedTensor {
 /// Convert an NSL dtype code to a DLPack DLDataType.
 fn nsl_dtype_to_dl(dtype: u16) -> DLDataType {
     match dtype {
-        DTYPE_F64 => DLDataType { code: DLDataTypeCode::KDLFloat as u8, bits: 64, lanes: 1 },
-        DTYPE_F32 => DLDataType { code: DLDataTypeCode::KDLFloat as u8, bits: 32, lanes: 1 },
-        DTYPE_FP16 => DLDataType { code: DLDataTypeCode::KDLFloat as u8, bits: 16, lanes: 1 },
-        DTYPE_BF16 => DLDataType { code: DLDataTypeCode::KDLBfloat as u8, bits: 16, lanes: 1 },
-        DTYPE_INT8 => DLDataType { code: DLDataTypeCode::KDLInt as u8, bits: 8, lanes: 1 },
-        _ => DLDataType { code: DLDataTypeCode::KDLFloat as u8, bits: 64, lanes: 1 },
+        DTYPE_F64 => DLDataType {
+            code: DLDataTypeCode::KDLFloat as u8,
+            bits: 64,
+            lanes: 1,
+        },
+        DTYPE_F32 => DLDataType {
+            code: DLDataTypeCode::KDLFloat as u8,
+            bits: 32,
+            lanes: 1,
+        },
+        DTYPE_FP16 => DLDataType {
+            code: DLDataTypeCode::KDLFloat as u8,
+            bits: 16,
+            lanes: 1,
+        },
+        DTYPE_BF16 => DLDataType {
+            code: DLDataTypeCode::KDLBfloat as u8,
+            bits: 16,
+            lanes: 1,
+        },
+        DTYPE_INT8 => DLDataType {
+            code: DLDataTypeCode::KDLInt as u8,
+            bits: 8,
+            lanes: 1,
+        },
+        _ => DLDataType {
+            code: DLDataTypeCode::KDLFloat as u8,
+            bits: 64,
+            lanes: 1,
+        },
     }
 }
 
@@ -110,9 +134,15 @@ fn dl_dtype_to_nsl(dt: &DLDataType) -> Option<u16> {
 /// Convert an NSL device code to a DLPack DLDevice.
 fn nsl_device_to_dl(device: u8) -> DLDevice {
     if device == 0 {
-        DLDevice { device_type: DLDeviceType::KDLCpu, device_id: 0 }
+        DLDevice {
+            device_type: DLDeviceType::KDLCpu,
+            device_id: 0,
+        }
     } else {
-        DLDevice { device_type: DLDeviceType::KDLCuda, device_id: (device - 1) as c_int }
+        DLDevice {
+            device_type: DLDeviceType::KDLCuda,
+            device_id: (device - 1) as c_int,
+        }
     }
 }
 
@@ -196,7 +226,11 @@ pub fn nsl_tensor_to_dlpack(tensor: &NslTensor, tensor_ptr: i64) -> *mut DLManag
         ndim: ndim as c_int,
         dtype: nsl_dtype_to_dl(tensor.dtype),
         shape: ctx.shape.as_mut_ptr(),
-        strides: if ctx.strides.is_empty() { std::ptr::null_mut() } else { ctx.strides.as_mut_ptr() },
+        strides: if ctx.strides.is_empty() {
+            std::ptr::null_mut()
+        } else {
+            ctx.strides.as_mut_ptr()
+        },
         byte_offset: 0,
     };
 
@@ -243,7 +277,9 @@ pub fn dlpack_to_nsl_tensor(managed: &DLManagedTensor) -> i64 {
     // Copy shape into NSL-managed memory.
     let shape_ptr = if ndim > 0 && !dl.shape.is_null() {
         let ptr = checked_alloc(ndim * std::mem::size_of::<i64>()) as *mut i64;
-        unsafe { std::ptr::copy_nonoverlapping(dl.shape, ptr, ndim); }
+        unsafe {
+            std::ptr::copy_nonoverlapping(dl.shape, ptr, ndim);
+        }
         ptr
     } else {
         std::ptr::null_mut()
@@ -253,7 +289,9 @@ pub fn dlpack_to_nsl_tensor(managed: &DLManagedTensor) -> i64 {
     let strides_ptr = if ndim > 0 {
         if !dl.strides.is_null() {
             let ptr = checked_alloc(ndim * std::mem::size_of::<i64>()) as *mut i64;
-            unsafe { std::ptr::copy_nonoverlapping(dl.strides, ptr, ndim); }
+            unsafe {
+                std::ptr::copy_nonoverlapping(dl.strides, ptr, ndim);
+            }
             ptr
         } else {
             // Compute contiguous strides.
@@ -334,8 +372,8 @@ pub extern "C" fn nsl_dlpack_free(dlpack_ptr: i64) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tensor::NslTensor;
     use crate::memory::checked_alloc;
+    use crate::tensor::NslTensor;
     use std::ffi::c_void;
 
     /// Helper: create a simple f64 tensor on CPU for testing.
@@ -345,10 +383,14 @@ mod tests {
         assert_eq!(data.len(), len as usize);
 
         let data_ptr = checked_alloc(len as usize * std::mem::size_of::<f64>()) as *mut f64;
-        unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), data_ptr, len as usize); }
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr(), data_ptr, len as usize);
+        }
 
         let shape_ptr = checked_alloc(ndim * std::mem::size_of::<i64>()) as *mut i64;
-        unsafe { std::ptr::copy_nonoverlapping(shape.as_ptr(), shape_ptr, ndim); }
+        unsafe {
+            std::ptr::copy_nonoverlapping(shape.as_ptr(), shape_ptr, ndim);
+        }
 
         let strides_ptr = NslTensor::compute_strides(shape_ptr, ndim as i64);
 
@@ -375,10 +417,14 @@ mod tests {
         assert_eq!(data.len(), len as usize);
 
         let data_ptr = checked_alloc(len as usize * std::mem::size_of::<f32>()) as *mut f32;
-        unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), data_ptr, len as usize); }
+        unsafe {
+            std::ptr::copy_nonoverlapping(data.as_ptr(), data_ptr, len as usize);
+        }
 
         let shape_ptr = checked_alloc(ndim * std::mem::size_of::<i64>()) as *mut i64;
-        unsafe { std::ptr::copy_nonoverlapping(shape.as_ptr(), shape_ptr, ndim); }
+        unsafe {
+            std::ptr::copy_nonoverlapping(shape.as_ptr(), shape_ptr, ndim);
+        }
 
         let strides_ptr = NslTensor::compute_strides(shape_ptr, ndim as i64);
 
@@ -484,7 +530,9 @@ mod tests {
         // Clean up
         nsl_dlpack_free(dlpack_ptr);
         // Free the imported tensor (only the wrapper, not the data since owns_data=0)
-        unsafe { drop(Box::from_raw(imported_ptr as *mut NslTensor)); }
+        unsafe {
+            drop(Box::from_raw(imported_ptr as *mut NslTensor));
+        }
     }
 
     #[test]
@@ -511,7 +559,9 @@ mod tests {
         assert_eq!(imported_data, &[1.0f32, 2.0, 3.0, 4.0]);
 
         nsl_dlpack_free(dlpack_ptr);
-        unsafe { drop(Box::from_raw(imported_ptr as *mut NslTensor)); }
+        unsafe {
+            drop(Box::from_raw(imported_ptr as *mut NslTensor));
+        }
     }
 
     #[test]
@@ -530,9 +580,16 @@ mod tests {
 
         let dl_tensor = DLTensor {
             data: data.as_ptr() as *mut c_void,
-            device: DLDevice { device_type: DLDeviceType::KDLCpu, device_id: 0 },
+            device: DLDevice {
+                device_type: DLDeviceType::KDLCpu,
+                device_id: 0,
+            },
             ndim: 1,
-            dtype: DLDataType { code: 5, bits: 128, lanes: 1 }, // unsupported
+            dtype: DLDataType {
+                code: 5,
+                bits: 128,
+                lanes: 1,
+            }, // unsupported
             shape: shape.as_ptr() as *mut i64,
             strides: std::ptr::null_mut(),
             byte_offset: 0,
@@ -552,7 +609,9 @@ mod tests {
     fn test_scalar_tensor() {
         // Scalar tensor: ndim=0, shape=[], len=1
         let data_ptr = checked_alloc(std::mem::size_of::<f64>()) as *mut f64;
-        unsafe { *data_ptr = 42.0; }
+        unsafe {
+            *data_ptr = 42.0;
+        }
 
         let tensor = Box::new(NslTensor::new(
             data_ptr as *mut c_void,
@@ -584,6 +643,8 @@ mod tests {
         assert_eq!(val, 42.0);
 
         nsl_dlpack_free(dlpack_ptr);
-        unsafe { drop(Box::from_raw(imported_ptr as *mut NslTensor)); }
+        unsafe {
+            drop(Box::from_raw(imported_ptr as *mut NslTensor));
+        }
     }
 }

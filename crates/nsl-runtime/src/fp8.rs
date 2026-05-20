@@ -197,12 +197,7 @@ pub fn fp8_matmul_cpu(a: &[f64], b: &[f64], m: usize, k: usize, n: usize) -> Vec
 /// FP8 matmul FFI: both inputs are FP8-cast tensors. Output is f32 on CPU.
 /// scale_a and scale_b are passed but on CPU, scale is already applied at cast time.
 #[no_mangle]
-pub extern "C" fn nsl_fp8_matmul(
-    a_ptr: i64,
-    b_ptr: i64,
-    _scale_a: f64,
-    _scale_b: f64,
-) -> i64 {
+pub extern "C" fn nsl_fp8_matmul(a_ptr: i64, b_ptr: i64, _scale_a: f64, _scale_b: f64) -> i64 {
     // On CPU, tensors are already dequantized f32. Delegate to standard matmul.
     crate::tensor::nsl_tensor_matmul(a_ptr, b_ptr, 0)
 }
@@ -214,11 +209,7 @@ pub extern "C" fn nsl_fp8_matmul(
 /// Auto-retrieves scales from FP8_SCALES table and computes K from tensor shape.
 /// Same 2-arg signature as nsl_tensor_matmul for easy codegen swap.
 #[no_mangle]
-pub extern "C" fn nsl_fp8_matmul_training(
-    a_ptr: i64,
-    b_ptr: i64,
-    flags: u8,
-) -> i64 {
+pub extern "C" fn nsl_fp8_matmul_training(a_ptr: i64, b_ptr: i64, flags: u8) -> i64 {
     use crate::autodiff;
     use crate::tensor::fbip_flags::{relinquish_a, relinquish_b};
     use crate::tensor::NslTensor;
@@ -280,8 +271,12 @@ pub extern "C" fn nsl_fp8_matmul_training(
     // FBIP-3: fp8 matmul has no in-place path; the flag only enables eager
     // freeing of A and B after the matmul (and after tape recording has
     // consumed their metadata).
-    if relinq_a { crate::tensor::nsl_tensor_free(a_ptr); }
-    if relinq_b { crate::tensor::nsl_tensor_free(b_ptr); }
+    if relinq_a {
+        crate::tensor::nsl_tensor_free(a_ptr);
+    }
+    if relinq_b {
+        crate::tensor::nsl_tensor_free(b_ptr);
+    }
     result
 }
 
@@ -305,7 +300,11 @@ pub fn calibrate_gradient_scale(tensor_ptr: i64) -> f32 {
         let data = unsafe { std::slice::from_raw_parts(t.data as *const f64, len) };
         data.iter().map(|v| v.abs() as f32).fold(0.0f32, f32::max)
     };
-    if amax == 0.0 { 1.0 } else { amax / FP8E5M2_MAX }
+    if amax == 0.0 {
+        1.0
+    } else {
+        amax / FP8E5M2_MAX
+    }
 }
 
 /// Quantize a tensor to E5M2 format for backward pass.
@@ -330,12 +329,7 @@ pub extern "C" fn nsl_fp8_gradient_scale(tensor_ptr: i64) -> f64 {
 /// On GPU (sm_90+): would launch E5M2 MMA kernel (future: kernel caching).
 ///
 /// Returns f32 output tensor (dequantized).
-pub fn fp8_matmul_e5m2_backward(
-    a_ptr: i64,
-    b_ptr: i64,
-    scale_a: f32,
-    scale_b: f32,
-) -> i64 {
+pub fn fp8_matmul_e5m2_backward(a_ptr: i64, b_ptr: i64, scale_a: f32, scale_b: f32) -> i64 {
     // Quantize both inputs to E5M2 precision (simulates precision loss)
     let a_e5m2 = nsl_fp8_cast(a_ptr, FP8_FORMAT_E5M2, scale_a as f64);
     let b_e5m2 = nsl_fp8_cast(b_ptr, FP8_FORMAT_E5M2, scale_b as f64);
@@ -415,15 +409,13 @@ impl Fp8CalibrationState {
 
     /// Update running max with a new batch of values.
     pub fn update(&mut self, data: &[f32]) {
-        let batch_amax = data.iter()
-            .map(|x| x.abs())
-            .fold(0.0_f32, f32::max);
+        let batch_amax = data.iter().map(|x| x.abs()).fold(0.0_f32, f32::max);
 
         if self.num_samples == 0 {
             self.running_amax = batch_amax;
         } else {
-            self.running_amax = self.ema_decay * self.running_amax
-                + (1.0 - self.ema_decay) * batch_amax;
+            self.running_amax =
+                self.ema_decay * self.running_amax + (1.0 - self.ema_decay) * batch_amax;
         }
         self.num_samples += 1;
     }
@@ -431,11 +423,19 @@ impl Fp8CalibrationState {
     /// Compute the scale factor for quantization to FP8.
     /// scale = amax / fp8_max  (to be used as: quantized = value / scale)
     pub fn compute_scale_e4m3(&self) -> f32 {
-        if self.running_amax == 0.0 { 1.0 } else { self.running_amax / FP8E4M3_MAX }
+        if self.running_amax == 0.0 {
+            1.0
+        } else {
+            self.running_amax / FP8E4M3_MAX
+        }
     }
 
     pub fn compute_scale_e5m2(&self) -> f32 {
-        if self.running_amax == 0.0 { 1.0 } else { self.running_amax / FP8E5M2_MAX }
+        if self.running_amax == 0.0 {
+            1.0
+        } else {
+            self.running_amax / FP8E5M2_MAX
+        }
     }
 }
 
@@ -614,7 +614,11 @@ pub fn quantize_mxfp8(data: &[f32], block_size: usize, fp8_format: i64) -> MxFp8
         }
     }
 
-    MxFp8Quantized { data: quantized, scales, len: n }
+    MxFp8Quantized {
+        data: quantized,
+        scales,
+        len: n,
+    }
 }
 
 /// FFI: Quantize tensor with MXFP8 per-block scaling.
@@ -628,7 +632,9 @@ pub extern "C" fn nsl_mxfp8_quantize(tensor_ptr: i64, block_size: i64, fp8_forma
 
     let src: Vec<f32> = if t.dtype == 0 {
         unsafe { std::slice::from_raw_parts(t.data as *const f64, len) }
-            .iter().map(|&v| v as f32).collect()
+            .iter()
+            .map(|&v| v as f32)
+            .collect()
     } else {
         unsafe { std::slice::from_raw_parts(t.data as *const f32, len) }.to_vec()
     };
@@ -670,7 +676,10 @@ pub extern "C" fn nsl_mxfp8_quantize(tensor_ptr: i64, block_size: i64, fp8_forma
 /// Input length must be a power of 2. Normalizes by 1/sqrt(n).
 pub fn fast_hadamard_transform(x: &mut [f32]) {
     let n = x.len();
-    debug_assert!(n.is_power_of_two(), "FWHT requires power-of-2 length, got {n}");
+    debug_assert!(
+        n.is_power_of_two(),
+        "FWHT requires power-of-2 length, got {n}"
+    );
 
     let mut h = 1;
     while h < n {
@@ -703,21 +712,32 @@ pub fn inverse_hadamard_transform(x: &mut [f32]) {
 /// Quantize a single f32 value to FP4 E2M1 (simulated as f32 with E2M1 precision loss).
 /// E2M1 can represent: 0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0 (and negatives).
 fn quantize_fp4_e2m1(value: f32, scale: f32) -> f32 {
-    if scale == 0.0 { return 0.0; }
+    if scale == 0.0 {
+        return 0.0;
+    }
     let scaled = value / scale;
     let clamped = scaled.clamp(-FP4E2M1_MAX, FP4E2M1_MAX);
     // E2M1 representable values (positive): 0, 0.5, 1, 1.5, 2, 3, 4, 6
     // Round to nearest representable value
     let abs_val = clamped.abs();
     let sign = clamped.signum();
-    let quantized = if abs_val < 0.25 { 0.0 }
-        else if abs_val < 0.75 { 0.5 }
-        else if abs_val < 1.25 { 1.0 }
-        else if abs_val < 1.75 { 1.5 }
-        else if abs_val < 2.5 { 2.0 }
-        else if abs_val < 3.5 { 3.0 }
-        else if abs_val < 5.0 { 4.0 }
-        else { 6.0 };
+    let quantized = if abs_val < 0.25 {
+        0.0
+    } else if abs_val < 0.75 {
+        0.5
+    } else if abs_val < 1.25 {
+        1.0
+    } else if abs_val < 1.75 {
+        1.5
+    } else if abs_val < 2.5 {
+        2.0
+    } else if abs_val < 3.5 {
+        3.0
+    } else if abs_val < 5.0 {
+        4.0
+    } else {
+        6.0
+    };
     sign * quantized * scale
 }
 
@@ -770,7 +790,12 @@ pub fn quantize_nvfp4(data: &[f32], block_size: usize, apply_hadamard: bool) -> 
         }
     }
 
-    NvFp4Quantized { data: quantized, block_scales, len: n, hadamard_applied }
+    NvFp4Quantized {
+        data: quantized,
+        block_scales,
+        len: n,
+        hadamard_applied,
+    }
 }
 
 /// Dequantize NVFP4 data back to f32.
@@ -792,7 +817,9 @@ pub extern "C" fn nsl_nvfp4_quantize(tensor_ptr: i64, block_size: i64, apply_had
 
     let src: Vec<f32> = if t.dtype == 0 {
         unsafe { std::slice::from_raw_parts(t.data as *const f64, len) }
-            .iter().map(|&v| v as f32).collect()
+            .iter()
+            .map(|&v| v as f32)
+            .collect()
     } else {
         unsafe { std::slice::from_raw_parts(t.data as *const f32, len) }.to_vec()
     };
@@ -971,7 +998,10 @@ mod tests {
             assert!(
                 (recovered - v).abs() <= max_err + 1e-10,
                 "E5M2 round-trip error {} > max {} for value {} (scale={})",
-                (recovered - v).abs(), max_err, v, scale
+                (recovered - v).abs(),
+                max_err,
+                v,
+                scale
             );
         }
     }
@@ -984,7 +1014,11 @@ mod tests {
         let scale_e5m2 = 1.0; // scale = 1.0 — value is well within E5M2 range
         let quant = quantize_fp8(value, scale_e5m2, FP8_FORMAT_E5M2);
         let recovered = dequantize_fp8(quant, scale_e5m2);
-        assert!((recovered - value).abs() < 1.0, "E5M2 should handle value={}", value);
+        assert!(
+            (recovered - value).abs() < 1.0,
+            "E5M2 should handle value={}",
+            value
+        );
 
         // Same value in E4M3 would clamp to 448
         let quant_e4m3 = quantize_fp8(value, 1.0, FP8_FORMAT_E4M3);
@@ -996,7 +1030,8 @@ mod tests {
         // Gradient scale should be computed fresh (no EMA), just amax / FP8E5M2_MAX
         use std::sync::atomic::AtomicI64;
         let data = vec![0.5f32, -1.0, 0.25, 0.75];
-        let data_ptr = crate::memory::checked_alloc(data.len() * std::mem::size_of::<f32>()) as *mut f32;
+        let data_ptr =
+            crate::memory::checked_alloc(data.len() * std::mem::size_of::<f32>()) as *mut f32;
         for (i, &v) in data.iter().enumerate() {
             unsafe { *data_ptr.add(i) = v };
         }
@@ -1017,7 +1052,12 @@ mod tests {
         let ptr = Box::into_raw(tensor) as i64;
         let scale = calibrate_gradient_scale(ptr);
         let expected = 1.0 / FP8E5M2_MAX; // amax=1.0
-        assert!((scale - expected).abs() < 1e-10, "gradient scale={} expected={}", scale, expected);
+        assert!(
+            (scale - expected).abs() < 1e-10,
+            "gradient scale={} expected={}",
+            scale,
+            expected
+        );
         crate::tensor::nsl_tensor_free(ptr);
     }
 
@@ -1041,23 +1081,35 @@ mod tests {
         let ref_grad_b = vec![4.0, 4.0, 6.0, 6.0];
 
         // E5M2 backward (simulate precision loss)
-        let scale_g = compute_scale(&g.iter().map(|&v| v as f64).collect::<Vec<_>>(), FP8_FORMAT_E5M2);
-        let scale_b = compute_scale(&b.iter().map(|&v| v as f64).collect::<Vec<_>>(), FP8_FORMAT_E5M2);
-        let scale_a = compute_scale(&a.iter().map(|&v| v as f64).collect::<Vec<_>>(), FP8_FORMAT_E5M2);
+        let scale_g = compute_scale(
+            &g.iter().map(|&v| v as f64).collect::<Vec<_>>(),
+            FP8_FORMAT_E5M2,
+        );
+        let scale_b = compute_scale(
+            &b.iter().map(|&v| v as f64).collect::<Vec<_>>(),
+            FP8_FORMAT_E5M2,
+        );
+        let scale_a = compute_scale(
+            &a.iter().map(|&v| v as f64).collect::<Vec<_>>(),
+            FP8_FORMAT_E5M2,
+        );
 
         // Quantize G and B^T for grad_A = G_e5m2 @ B_e5m2^T
-        let g_e5m2: Vec<f64> = g.iter()
+        let g_e5m2: Vec<f64> = g
+            .iter()
             .map(|&v| dequantize_fp8(quantize_fp8(v as f64, scale_g, FP8_FORMAT_E5M2), scale_g))
             .collect();
         let b_t = vec![b[0], b[2], b[1], b[3]]; // transpose
-        let bt_e5m2: Vec<f64> = b_t.iter()
+        let bt_e5m2: Vec<f64> = b_t
+            .iter()
             .map(|&v| dequantize_fp8(quantize_fp8(v as f64, scale_b, FP8_FORMAT_E5M2), scale_b))
             .collect();
         let e5m2_grad_a = fp8_matmul_cpu(&g_e5m2, &bt_e5m2, 2, 2, 2);
 
         // Quantize A^T and G for grad_B = A_e5m2^T @ G_e5m2
         let a_t = vec![a[0], a[2], a[1], a[3]]; // transpose
-        let at_e5m2: Vec<f64> = a_t.iter()
+        let at_e5m2: Vec<f64> = a_t
+            .iter()
             .map(|&v| dequantize_fp8(quantize_fp8(v as f64, scale_a, FP8_FORMAT_E5M2), scale_a))
             .collect();
         let e5m2_grad_b = fp8_matmul_cpu(&at_e5m2, &g_e5m2, 2, 2, 2);
@@ -1068,7 +1120,10 @@ mod tests {
             assert!(
                 rel_err < 0.01,
                 "grad_A[{}]: E5M2={} vs f32={}, rel_err={:.4}%",
-                i, e5m2_val, ref_val, rel_err * 100.0
+                i,
+                e5m2_val,
+                ref_val,
+                rel_err * 100.0
             );
         }
         for (i, (&ref_val, &e5m2_val)) in ref_grad_b.iter().zip(e5m2_grad_b.iter()).enumerate() {
@@ -1076,7 +1131,10 @@ mod tests {
             assert!(
                 rel_err < 0.01,
                 "grad_B[{}]: E5M2={} vs f32={}, rel_err={:.4}%",
-                i, e5m2_val, ref_val, rel_err * 100.0
+                i,
+                e5m2_val,
+                ref_val,
+                rel_err * 100.0
             );
         }
     }
@@ -1089,7 +1147,8 @@ mod tests {
 
         let make_tensor = |data: &[f32]| -> i64 {
             let len = data.len();
-            let data_ptr = crate::memory::checked_alloc(len * std::mem::size_of::<f32>()) as *mut f32;
+            let data_ptr =
+                crate::memory::checked_alloc(len * std::mem::size_of::<f32>()) as *mut f32;
             for (i, &v) in data.iter().enumerate() {
                 unsafe { *data_ptr.add(i) = v };
             }
@@ -1141,12 +1200,16 @@ mod tests {
 
         let make_2d_tensor = |data: &[f32], rows: i64, cols: i64| -> i64 {
             let len = data.len();
-            let data_ptr = crate::memory::checked_alloc(len * std::mem::size_of::<f32>()) as *mut f32;
+            let data_ptr =
+                crate::memory::checked_alloc(len * std::mem::size_of::<f32>()) as *mut f32;
             for (i, &v) in data.iter().enumerate() {
                 unsafe { *data_ptr.add(i) = v };
             }
             let shape = crate::memory::checked_alloc(2 * std::mem::size_of::<i64>()) as *mut i64;
-            unsafe { *shape = rows; *shape.add(1) = cols };
+            unsafe {
+                *shape = rows;
+                *shape.add(1) = cols
+            };
             let strides = crate::tensor::NslTensor::compute_strides(shape, 2);
             let tensor = Box::new(crate::tensor::NslTensor::new(
                 data_ptr as *mut std::ffi::c_void,
@@ -1201,8 +1264,14 @@ mod tests {
         cache_fp8_ptx(128, FP8_FORMAT_E5M2, "test_e5m2_ptx_k128".to_string());
         cache_fp8_ptx(64, FP8_FORMAT_E4M3, "test_e4m3_ptx_k64".to_string());
 
-        assert_eq!(get_cached_fp8_ptx(128, FP8_FORMAT_E5M2), Some("test_e5m2_ptx_k128".to_string()));
-        assert_eq!(get_cached_fp8_ptx(64, FP8_FORMAT_E4M3), Some("test_e4m3_ptx_k64".to_string()));
+        assert_eq!(
+            get_cached_fp8_ptx(128, FP8_FORMAT_E5M2),
+            Some("test_e5m2_ptx_k128".to_string())
+        );
+        assert_eq!(
+            get_cached_fp8_ptx(64, FP8_FORMAT_E4M3),
+            Some("test_e4m3_ptx_k64".to_string())
+        );
         assert_eq!(get_cached_fp8_ptx(256, FP8_FORMAT_E5M2), None); // not cached
     }
 
@@ -1262,22 +1331,29 @@ mod tests {
 
         // Per-tensor: scale dominated by outlier, small values in block 0 crushed to zero
         let per_tensor_scale = data.iter().map(|x| x.abs()).fold(0.0f32, f32::max) / FP8E4M3_MAX;
-        let per_tensor_err: f32 = data[..32].iter()
+        let per_tensor_err: f32 = data[..32]
+            .iter()
             .map(|&v| {
                 let q = (v / per_tensor_scale / 0.125).round() * 0.125 * per_tensor_scale;
                 (v - q).abs()
             })
-            .sum::<f32>() / 32.0;
+            .sum::<f32>()
+            / 32.0;
 
         // MXFP8: block 0 has its own scale optimized for 0.01, unaffected by outlier
         let result = quantize_mxfp8(&data, MXFP8_BLOCK_SIZE, FP8_FORMAT_E4M3);
-        let mxfp8_err: f32 = data[..32].iter().zip(result.data[..32].iter())
+        let mxfp8_err: f32 = data[..32]
+            .iter()
+            .zip(result.data[..32].iter())
             .map(|(&orig, &quant)| (orig - quant).abs())
-            .sum::<f32>() / 32.0;
+            .sum::<f32>()
+            / 32.0;
 
         // MXFP8 should have lower error for block 0
-        assert!(mxfp8_err < per_tensor_err,
-            "MXFP8 err ({mxfp8_err}) should be less than per-tensor err ({per_tensor_err})");
+        assert!(
+            mxfp8_err < per_tensor_err,
+            "MXFP8 err ({mxfp8_err}) should be less than per-tensor err ({per_tensor_err})"
+        );
     }
 
     #[test]
@@ -1321,8 +1397,10 @@ mod tests {
         fast_hadamard_transform(&mut data);
         let norm_after: f32 = data.iter().map(|x| x * x).sum::<f32>().sqrt();
 
-        assert!((norm_before - norm_after).abs() < 1e-4,
-            "Norm changed: {norm_before} → {norm_after}");
+        assert!(
+            (norm_before - norm_after).abs() < 1e-4,
+            "Norm changed: {norm_before} → {norm_after}"
+        );
     }
 
     #[test]
@@ -1337,8 +1415,10 @@ mod tests {
 
         // After Hadamard, the outlier energy is spread across all elements
         // max should decrease by roughly sqrt(n)
-        assert!(max_after < max_before,
-            "Hadamard should reduce max: {max_before} → {max_after}");
+        assert!(
+            max_after < max_before,
+            "Hadamard should reduce max: {max_before} → {max_after}"
+        );
     }
 
     #[test]
@@ -1346,12 +1426,22 @@ mod tests {
         // Verify E2M1 quantization snaps to representable values
         let scale = 1.0;
         let cases = [
-            (0.0, 0.0), (0.3, 0.5), (0.7, 0.5), (1.1, 1.0),
-            (1.6, 1.5), (2.2, 2.0), (3.2, 3.0), (4.5, 4.0), (5.5, 6.0),
+            (0.0, 0.0),
+            (0.3, 0.5),
+            (0.7, 0.5),
+            (1.1, 1.0),
+            (1.6, 1.5),
+            (2.2, 2.0),
+            (3.2, 3.0),
+            (4.5, 4.0),
+            (5.5, 6.0),
         ];
         for (input, expected) in cases {
             let result = quantize_fp4_e2m1(input, scale);
-            assert_eq!(result, expected, "FP4 E2M1: {input} should map to {expected}, got {result}");
+            assert_eq!(
+                result, expected,
+                "FP4 E2M1: {input} should map to {expected}, got {result}"
+            );
         }
     }
 
@@ -1386,7 +1476,10 @@ mod tests {
         let recovered = dequantize_nvfp4(&result);
         for (orig, rec) in data.iter().zip(recovered.iter()) {
             let err = (orig - rec).abs();
-            assert!(err < 2.0, "NVFP4 roundtrip error too large: {orig} → {rec} (err={err})");
+            assert!(
+                err < 2.0,
+                "NVFP4 roundtrip error too large: {orig} → {rec} (err={err})"
+            );
         }
     }
 
@@ -1403,8 +1496,10 @@ mod tests {
 
         // After Hadamard, the single outlier is spread across all 8 elements
         // max should decrease by sqrt(8) ≈ 2.83
-        assert!(max_after < max_before * 0.5,
+        assert!(
+            max_after < max_before * 0.5,
             "Hadamard should reduce max from {max_before} to < {}, got {max_after}",
-            max_before * 0.5);
+            max_before * 0.5
+        );
     }
 }

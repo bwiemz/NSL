@@ -269,9 +269,7 @@ const PREFIX_SUMMARY_MAX: usize = 8;
 pub enum ValidationError {
     /// Phase 2: a specific tensor declared by the model is absent from
     /// the weight map. Unused in Phase 1.
-    MissingTensor {
-        tensor_name: String,
-    },
+    MissingTensor { tensor_name: String },
     /// Phase 2: a tensor's declared shape doesn't match the weight map.
     /// Unused in Phase 1.
     ShapeMismatch {

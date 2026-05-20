@@ -8,7 +8,9 @@ use std::sync::Mutex;
 use crate::calibration::awq_sidecar;
 use crate::calibration::ctx::{BufferHandle, CalibCtx};
 use crate::calibration::discovery::DiscoveredProjection;
-use crate::calibration::hooks::{CalibrationHook, CalibrationResult, FinalizePlanEntry, ObservePlanEntry};
+use crate::calibration::hooks::{
+    CalibrationHook, CalibrationResult, FinalizePlanEntry, ObservePlanEntry,
+};
 use crate::calibration::observation::{ObservationSet, ProjectionRef};
 use crate::calibration::retention::ArenaLayout;
 
@@ -65,13 +67,17 @@ impl AwqCalibrationHook {
     /// as an external dependency — can drive the stub reduction path.
     /// Not intended for production callers.
     #[doc(hidden)]
-    pub fn handles_for_test(&self) -> std::sync::MutexGuard<'_, BTreeMap<ProjectionRef, BufferHandle>> {
+    pub fn handles_for_test(
+        &self,
+    ) -> std::sync::MutexGuard<'_, BTreeMap<ProjectionRef, BufferHandle>> {
         self.handles.lock().unwrap()
     }
 }
 
 impl CalibrationHook for AwqCalibrationHook {
-    fn id(&self) -> &'static str { "awq_activation_scales" }
+    fn id(&self) -> &'static str {
+        "awq_activation_scales"
+    }
 
     fn requires(&self) -> ObservationSet {
         ObservationSet::LinearInputActivations(self.projections.clone())
@@ -107,35 +113,53 @@ impl CalibrationHook for AwqCalibrationHook {
     fn emit_observe_batch(&self, ctx: &mut CalibCtx, arena: &ArenaLayout) {
         let handles = self.handles.lock().unwrap();
         for (projection, offset, nbytes) in &arena.entries {
-            let Some(&handle) = handles.get(projection) else { continue };
-            let Some(&in_feat) = self.in_features.get(projection) else { continue };
-            if in_feat == 0 { continue; }
+            let Some(&handle) = handles.get(projection) else {
+                continue;
+            };
+            let Some(&in_feat) = self.in_features.get(projection) else {
+                continue;
+            };
+            if in_feat == 0 {
+                continue;
+            }
             let total_floats = nbytes / 4;
-            if total_floats % in_feat != 0 { continue; }
+            if total_floats % in_feat != 0 {
+                continue;
+            }
             let rows = total_floats / in_feat;
             ctx.emit_per_channel_max_abs_update(&projection.0, *offset, rows, in_feat, handle);
         }
     }
 
     fn observe_plan(&self, arena: &ArenaLayout) -> Vec<ObservePlanEntry> {
-        arena.entries.iter().filter_map(|(proj, offset, nbytes)| {
-            let channels = *self.in_features.get(proj)?;
-            if channels == 0 { return None; }
-            let total = nbytes / 4;
-            if total % channels != 0 { return None; }
-            let rows = total / channels;
-            Some(ObservePlanEntry {
-                projection: proj.clone(),
-                src_offset: *offset,
-                rows,
-                channels,
-                running_symbol: running_symbol_for(proj),
+        arena
+            .entries
+            .iter()
+            .filter_map(|(proj, offset, nbytes)| {
+                let channels = *self.in_features.get(proj)?;
+                if channels == 0 {
+                    return None;
+                }
+                let total = nbytes / 4;
+                if total % channels != 0 {
+                    return None;
+                }
+                let rows = total / channels;
+                Some(ObservePlanEntry {
+                    projection: proj.clone(),
+                    src_offset: *offset,
+                    rows,
+                    channels,
+                    running_symbol: running_symbol_for(proj),
+                })
             })
-        }).collect()
+            .collect()
     }
 
     fn finalize_plan(&self) -> Vec<FinalizePlanEntry> {
-        let mut entries: Vec<FinalizePlanEntry> = self.in_features.iter()
+        let mut entries: Vec<FinalizePlanEntry> = self
+            .in_features
+            .iter()
             .map(|(proj, &channels)| FinalizePlanEntry {
                 projection: proj.clone(),
                 running_symbol: running_symbol_for(proj),
@@ -163,7 +187,10 @@ impl CalibrationHook for AwqCalibrationHook {
             }
             if scales.iter().all(|v| *v == 0.0) {
                 return CalibrationResult::Degenerate {
-                    reason: format!("projection {} produced all-zero scales (no variance in calibration data?)", p.0),
+                    reason: format!(
+                        "projection {} produced all-zero scales (no variance in calibration data?)",
+                        p.0
+                    ),
                 };
             }
             by_projection.insert(p.0.clone(), scales);
@@ -213,8 +240,11 @@ mod tests {
         let mut ctx = CalibCtx::for_tests(&table);
         hook.emit_init(&mut ctx);
         for p in &projs {
-            assert!(hook.handles_for_test().contains_key(p),
-                "emit_init should have allocated handle for {}", p.0);
+            assert!(
+                hook.handles_for_test().contains_key(p),
+                "emit_init should have allocated handle for {}",
+                p.0
+            );
         }
     }
 
@@ -306,7 +336,11 @@ mod tests {
         // running buffer manually by calling emit_init via a stub table
         // that knows about model.up with shape [1, 2, 4] (so in_channels=4).
         let mut table = RetentionTable::new();
-        table.register(ProjectionRef::new("model.up"), TensorShape::new(vec![1, 2, 4]), 4);
+        table.register(
+            ProjectionRef::new("model.up"),
+            TensorShape::new(vec![1, 2, 4]),
+            4,
+        );
         let mut ctx = CalibCtx::for_tests(&table);
         hook.emit_init(&mut ctx);
 
@@ -317,10 +351,13 @@ mod tests {
 
         // 2 rows (batch*seq=2) × 4 channels.
         // Channel-wise max-abs should end up [1.0, 2.0, 7.0, 4.0].
-        ctx.stub_set_arena_buffer("model.up", &[
-            1.0,  2.0,  3.0,  4.0,   // row 0
-           -1.0, -2.0, -7.0, -4.0,   // row 1
-        ]);
+        ctx.stub_set_arena_buffer(
+            "model.up",
+            &[
+                1.0, 2.0, 3.0, 4.0, // row 0
+                -1.0, -2.0, -7.0, -4.0, // row 1
+            ],
+        );
         hook.emit_observe_batch(&mut ctx, &layout);
 
         let running = ctx.stub_running_max_abs_named("model.up");
@@ -336,7 +373,11 @@ mod tests {
         let hook = AwqCalibrationHook::from_discovered(&discovered);
 
         let mut table = RetentionTable::new();
-        table.register(ProjectionRef::new("model.down"), TensorShape::new(vec![1, 1, 3]), 4);
+        table.register(
+            ProjectionRef::new("model.down"),
+            TensorShape::new(vec![1, 1, 3]),
+            4,
+        );
         let mut ctx = CalibCtx::for_tests(&table);
         hook.emit_init(&mut ctx);
 
@@ -359,8 +400,8 @@ mod tests {
     #[test]
     fn awq_observe_plan_has_one_entry_per_projection() {
         use crate::calibration::build_arena_layout;
-        use crate::calibration::observation::ProjectionRef;
         use crate::calibration::discovery::DiscoveredProjection;
+        use crate::calibration::observation::ProjectionRef;
 
         let ps = vec![
             DiscoveredProjection {
@@ -379,12 +420,21 @@ mod tests {
         assert_eq!(observe.len(), 2);
 
         // Look up entries by projection (order is arena-entry order, which is insertion order).
-        let up_entry = observe.iter().find(|e| e.projection.0 == "TinyMLP.up_proj").unwrap();
+        let up_entry = observe
+            .iter()
+            .find(|e| e.projection.0 == "TinyMLP.up_proj")
+            .unwrap();
         assert_eq!(up_entry.running_symbol, "__nsl_awq_running.TinyMLP_up_proj");
         assert_eq!(up_entry.channels, 64);
         assert_eq!(up_entry.rows, 32);
-        let down_entry = observe.iter().find(|e| e.projection.0 == "TinyMLP.down_proj").unwrap();
-        assert_eq!(down_entry.running_symbol, "__nsl_awq_running.TinyMLP_down_proj");
+        let down_entry = observe
+            .iter()
+            .find(|e| e.projection.0 == "TinyMLP.down_proj")
+            .unwrap();
+        assert_eq!(
+            down_entry.running_symbol,
+            "__nsl_awq_running.TinyMLP_down_proj"
+        );
         assert_eq!(down_entry.channels, 128);
 
         let finalize = hook.finalize_plan();
@@ -392,7 +442,10 @@ mod tests {
         // Finalize entries are sorted by projection path for determinism.
         assert_eq!(finalize[0].projection.0, "TinyMLP.down_proj");
         assert_eq!(finalize[0].channels, 128);
-        assert_eq!(finalize[0].running_symbol, "__nsl_awq_running.TinyMLP_down_proj");
+        assert_eq!(
+            finalize[0].running_symbol,
+            "__nsl_awq_running.TinyMLP_down_proj"
+        );
         assert_eq!(finalize[1].projection.0, "TinyMLP.up_proj");
         assert_eq!(finalize[1].channels, 64);
     }

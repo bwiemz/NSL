@@ -86,10 +86,7 @@ impl CommSchedule {
 /// Build the schedule for a given `ZeroConfig` and per-layer param-byte
 /// vector.  The forward pass prefetches parameters one layer ahead; the
 /// backward pass reduces gradients as they're produced.
-pub fn build_schedule(
-    config: ZeroConfig,
-    per_layer_param_bytes: &[u64],
-) -> CommSchedule {
+pub fn build_schedule(config: ZeroConfig, per_layer_param_bytes: &[u64]) -> CommSchedule {
     let mut schedule = CommSchedule::default();
     let n = per_layer_param_bytes.len() as u32;
     let mut order = 0u32;
@@ -130,7 +127,10 @@ pub fn build_schedule(
                 bytes,
                 order,
                 async_: true,
-                rationale: format!("scatter grad {l} while layer {} computes", layer.saturating_sub(1).max(0)),
+                rationale: format!(
+                    "scatter grad {l} while layer {} computes",
+                    layer.saturating_sub(1).max(0)
+                ),
             });
             order += 1;
             layer -= 1;
@@ -239,7 +239,10 @@ mod tests {
     #[test]
     fn async_count_matches_forward_plus_backward() {
         let sched = build_schedule(ZeroConfig::zero_3(8), &sizes());
-        assert_eq!(sched.async_count(), sched.forward.len() + sched.backward.len());
+        assert_eq!(
+            sched.async_count(),
+            sched.forward.len() + sched.backward.len()
+        );
     }
 
     #[test]

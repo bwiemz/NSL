@@ -13,7 +13,11 @@ pub struct SlidingWindowManager {
 
 impl SlidingWindowManager {
     pub fn new(window_size: usize, num_sinks: usize, block_size: usize) -> Self {
-        SlidingWindowManager { window_size, num_sinks, block_size }
+        SlidingWindowManager {
+            window_size,
+            num_sinks,
+            block_size,
+        }
     }
 
     /// Check if eviction is needed. Returns logical block indices to evict.

@@ -6,10 +6,10 @@
 
 use std::collections::HashMap;
 
+use nsl_ast::decl::ModelMember;
 use nsl_ast::expr::{Expr, ExprKind};
 use nsl_ast::pattern::PatternKind;
-use nsl_ast::stmt::{Stmt, StmtKind, Block};
-use nsl_ast::decl::ModelMember;
+use nsl_ast::stmt::{Block, Stmt, StmtKind};
 use nsl_errors::Diagnostic;
 use nsl_lexer::Interner;
 
@@ -29,7 +29,13 @@ pub fn analyze_ownership(
     let mut ownership_info = HashMap::new();
 
     for stmt in &module.stmts {
-        walk_top_level_stmt(stmt, interner, type_map, &mut all_diagnostics, &mut ownership_info);
+        walk_top_level_stmt(
+            stmt,
+            interner,
+            type_map,
+            &mut all_diagnostics,
+            &mut ownership_info,
+        );
     }
 
     (all_diagnostics, ownership_info)
@@ -44,9 +50,7 @@ fn walk_top_level_stmt(
 ) {
     match &stmt.kind {
         StmtKind::FnDef(fn_def) => {
-            let fn_name = interner.resolve(fn_def.name.0)
-                .unwrap_or("?")
-                .to_string();
+            let fn_name = interner.resolve(fn_def.name.0).unwrap_or("?").to_string();
 
             let mut checker = OwnershipChecker::new(interner);
             let mut info = FunctionOwnershipInfo::default();
@@ -73,12 +77,11 @@ fn walk_top_level_stmt(
             // Walk each method in the model
             for member in &model_def.members {
                 if let ModelMember::Method(method, _decorators) = member {
-                    let model_name = interner.resolve(model_def.name.0)
+                    let model_name = interner
+                        .resolve(model_def.name.0)
                         .unwrap_or("?")
                         .to_string();
-                    let method_name = interner.resolve(method.name.0)
-                        .unwrap_or("?")
-                        .to_string();
+                    let method_name = interner.resolve(method.name.0).unwrap_or("?").to_string();
                     let mangled = format!("__nsl_model_{model_name}_{method_name}");
 
                     let mut checker = OwnershipChecker::new(interner);
@@ -129,7 +132,12 @@ fn walk_stmt(stmt: &Stmt, checker: &mut OwnershipChecker<'_>, type_map: &TypeMap
             walk_expr(expr, checker, type_map);
         }
         StmtKind::Return(None) | StmtKind::Yield(None) => {}
-        StmtKind::If { condition, then_block, elif_clauses, else_block } => {
+        StmtKind::If {
+            condition,
+            then_block,
+            elif_clauses,
+            else_block,
+        } => {
             walk_expr(condition, checker, type_map);
 
             let before = checker.snapshot_all();
@@ -160,19 +168,21 @@ fn walk_stmt(stmt: &Stmt, checker: &mut OwnershipChecker<'_>, type_map: &TypeMap
 
             checker.restore_all(before.clone());
 
-            checker.check_multi_branch_symmetry(
-                &before.states,
-                &branch_states,
-                condition.span,
-            );
+            checker.check_multi_branch_symmetry(&before.states, &branch_states, condition.span);
         }
-        StmtKind::While { condition, body, .. } => {
+        StmtKind::While {
+            condition, body, ..
+        } => {
             walk_expr(condition, checker, type_map);
             checker.enter_loop();
             walk_block(body, checker, type_map);
             checker.exit_loop();
         }
-        StmtKind::WhileLet { pattern, expr, body } => {
+        StmtKind::WhileLet {
+            pattern,
+            expr,
+            body,
+        } => {
             walk_expr(expr, checker, type_map);
             // The bound value has the same type as the expression
             register_pattern_bindings(pattern, checker, type_map, Some(expr));
@@ -180,7 +190,11 @@ fn walk_stmt(stmt: &Stmt, checker: &mut OwnershipChecker<'_>, type_map: &TypeMap
             walk_block(body, checker, type_map);
             checker.exit_loop();
         }
-        StmtKind::For { pattern, iterable, body } => {
+        StmtKind::For {
+            pattern,
+            iterable,
+            body,
+        } => {
             walk_expr(iterable, checker, type_map);
             let elem_ty = iter_element_type(type_map.get(&iterable.id));
             register_pattern_bindings_with_type(pattern, checker, &elem_ty);
@@ -192,9 +206,7 @@ fn walk_stmt(stmt: &Stmt, checker: &mut OwnershipChecker<'_>, type_map: &TypeMap
             walk_expr(subject, checker, type_map);
             for arm in arms {
                 // Register match arm pattern bindings (subject's type)
-                register_pattern_bindings(
-                    &arm.pattern, checker, type_map, Some(subject),
-                );
+                register_pattern_bindings(&arm.pattern, checker, type_map, Some(subject));
                 if let Some(guard) = &arm.guard {
                     walk_expr(guard, checker, type_map);
                 }
@@ -228,18 +240,29 @@ fn walk_expr(expr: &Expr, checker: &mut OwnershipChecker<'_>, type_map: &TypeMap
         }
         ExprKind::Call { callee, args } => {
             walk_expr(callee, checker, type_map);
-            for arg in args { walk_expr(&arg.value, checker, type_map); }
+            for arg in args {
+                walk_expr(&arg.value, checker, type_map);
+            }
         }
         ExprKind::Lambda { body, .. } => walk_expr(body, checker, type_map),
         ExprKind::BlockExpr(block) => walk_block(block, checker, type_map),
-        ExprKind::ListComp { element, generators } => {
+        ExprKind::ListComp {
+            element,
+            generators,
+        } => {
             walk_expr(element, checker, type_map);
             for gen in generators {
                 walk_expr(&gen.iterable, checker, type_map);
-                for cond in &gen.conditions { walk_expr(cond, checker, type_map); }
+                for cond in &gen.conditions {
+                    walk_expr(cond, checker, type_map);
+                }
             }
         }
-        ExprKind::IfExpr { condition, then_expr, else_expr } => {
+        ExprKind::IfExpr {
+            condition,
+            then_expr,
+            else_expr,
+        } => {
             walk_expr(condition, checker, type_map);
 
             let before = checker.snapshot_all();
@@ -262,7 +285,9 @@ fn walk_expr(expr: &Expr, checker: &mut OwnershipChecker<'_>, type_map: &TypeMap
             );
         }
         ExprKind::ListLiteral(elems) | ExprKind::TupleLiteral(elems) => {
-            for e in elems { walk_expr(e, checker, type_map); }
+            for e in elems {
+                walk_expr(e, checker, type_map);
+            }
         }
         ExprKind::DictLiteral(pairs) => {
             for (k, v) in pairs {
@@ -278,8 +303,12 @@ fn walk_expr(expr: &Expr, checker: &mut OwnershipChecker<'_>, type_map: &TypeMap
             }
         }
         ExprKind::Range { start, end, .. } => {
-            if let Some(e) = start { walk_expr(e, checker, type_map); }
-            if let Some(e) = end { walk_expr(e, checker, type_map); }
+            if let Some(e) = start {
+                walk_expr(e, checker, type_map);
+            }
+            if let Some(e) = end {
+                walk_expr(e, checker, type_map);
+            }
         }
         ExprKind::Paren(e) | ExprKind::Await(e) => walk_expr(e, checker, type_map),
         ExprKind::MatchExpr { subject, arms } => {
@@ -288,7 +317,9 @@ fn walk_expr(expr: &Expr, checker: &mut OwnershipChecker<'_>, type_map: &TypeMap
                 if let Some(guard) = &arm.guard {
                     walk_expr(guard, checker, type_map);
                 }
-                for stmt in &arm.body.stmts { walk_stmt(stmt, checker, type_map); }
+                for stmt in &arm.body.stmts {
+                    walk_stmt(stmt, checker, type_map);
+                }
             }
         }
         _ => {} // Literals, SelfRef, Error
@@ -303,12 +334,20 @@ fn walk_subscript(
     match index {
         nsl_ast::expr::SubscriptKind::Index(e) => walk_expr(e, checker, type_map),
         nsl_ast::expr::SubscriptKind::Slice { lower, upper, step } => {
-            if let Some(e) = lower { walk_expr(e, checker, type_map); }
-            if let Some(e) = upper { walk_expr(e, checker, type_map); }
-            if let Some(e) = step { walk_expr(e, checker, type_map); }
+            if let Some(e) = lower {
+                walk_expr(e, checker, type_map);
+            }
+            if let Some(e) = upper {
+                walk_expr(e, checker, type_map);
+            }
+            if let Some(e) = step {
+                walk_expr(e, checker, type_map);
+            }
         }
         nsl_ast::expr::SubscriptKind::MultiDim(dims) => {
-            for d in dims { walk_subscript(d, checker, type_map); }
+            for d in dims {
+                walk_subscript(d, checker, type_map);
+            }
         }
     }
 }
@@ -381,10 +420,11 @@ fn register_pattern_bindings_with_type(
 /// Check if a function parameter is tensor-typed from its type annotation.
 fn is_tensor_param(param: &nsl_ast::decl::Param) -> bool {
     if let Some(ref ann) = param.type_ann {
-        matches!(ann.kind,
+        matches!(
+            ann.kind,
             nsl_ast::types::TypeExprKind::Tensor { .. }
-            | nsl_ast::types::TypeExprKind::Param { .. }
-            | nsl_ast::types::TypeExprKind::Buffer { .. }
+                | nsl_ast::types::TypeExprKind::Param { .. }
+                | nsl_ast::types::TypeExprKind::Buffer { .. }
         )
     } else {
         false

@@ -6,12 +6,13 @@ pub mod numbers;
 pub mod strings;
 pub mod token;
 
-pub use token::{Token, TokenKind, Symbol};
+pub use token::{Symbol, Token, TokenKind};
 
 use nsl_errors::{Diagnostic, FileId};
 use string_interner::StringInterner;
 
-pub type Interner = StringInterner<string_interner::backend::BucketBackend<string_interner::DefaultSymbol>>;
+pub type Interner =
+    StringInterner<string_interner::backend::BucketBackend<string_interner::DefaultSymbol>>;
 
 /// Tokenize NSL source code into a stream of tokens.
 pub fn tokenize(

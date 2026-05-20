@@ -79,7 +79,11 @@ fn parse_nslweights_header(raw: &[u8]) -> (Vec<TensorMeta>, usize) {
         eprintln!("nsl: weight_provider: invalid .nslweights blob (bad magic)");
         std::process::abort();
     }
-    let version = u32::from_le_bytes(raw[4..8].try_into().unwrap_or_else(|_| std::process::abort()));
+    let version = u32::from_le_bytes(
+        raw[4..8]
+            .try_into()
+            .unwrap_or_else(|_| std::process::abort()),
+    );
     if version != NSLW_VERSION {
         eprintln!(
             "nsl: weight_provider: unsupported version {} (expected {})",
@@ -87,7 +91,11 @@ fn parse_nslweights_header(raw: &[u8]) -> (Vec<TensorMeta>, usize) {
         );
         std::process::abort();
     }
-    let header_size = u64::from_le_bytes(raw[8..16].try_into().unwrap_or_else(|_| std::process::abort())) as usize;
+    let header_size = u64::from_le_bytes(
+        raw[8..16]
+            .try_into()
+            .unwrap_or_else(|_| std::process::abort()),
+    ) as usize;
 
     let header_end = 16 + header_size;
     if raw.len() < header_end {
@@ -134,7 +142,13 @@ fn parse_nslweights_header(raw: &[u8]) -> (Vec<TensorMeta>, usize) {
                 .iter()
                 .map(|v| v.as_i64().unwrap_or(0))
                 .collect();
-            TensorMeta { name, shape, dtype, offset, nbytes }
+            TensorMeta {
+                name,
+                shape,
+                dtype,
+                offset,
+                nbytes,
+            }
         })
         .collect();
 
@@ -193,10 +207,8 @@ pub extern "C" fn nsl_standalone_init_sidecar(compiled_path_ptr: i64, compiled_p
         std::process::abort();
     }
     let compiled_path_str = unsafe {
-        let slice = std::slice::from_raw_parts(
-            compiled_path_ptr as *const u8,
-            compiled_path_len as usize,
-        );
+        let slice =
+            std::slice::from_raw_parts(compiled_path_ptr as *const u8, compiled_path_len as usize);
         std::str::from_utf8(slice).unwrap_or("")
     };
 
@@ -274,7 +286,11 @@ pub extern "C" fn nsl_standalone_init_sidecar(compiled_path_ptr: i64, compiled_p
 /// Returns 1 if the weight provider has been initialized, 0 otherwise.
 #[no_mangle]
 pub extern "C" fn nsl_standalone_has_weights() -> i64 {
-    if WEIGHT_PROVIDER.get().is_some() { 1 } else { 0 }
+    if WEIGHT_PROVIDER.get().is_some() {
+        1
+    } else {
+        0
+    }
 }
 
 // ── Internal helpers ─────────────────────────────────────────────────────────
@@ -286,7 +302,11 @@ fn build_provider(data: WeightData, metas: Vec<TensorMeta>) -> WeightProvider {
         ordered_names.push(m.name.clone());
         index.insert(m.name.clone(), m);
     }
-    WeightProvider { data, index, ordered_names }
+    WeightProvider {
+        data,
+        index,
+        ordered_names,
+    }
 }
 
 // ── Integration with nsl_model_load ─────────────────────────────────────────
@@ -308,7 +328,10 @@ pub fn try_load_from_provider(tensors: &crate::list::NslList) -> bool {
         let byte_count = (tensor.len as usize) * tensor.element_size();
 
         // Look up by index order
-        let meta = provider.ordered_names.get(i).and_then(|n| provider.index.get(n));
+        let meta = provider
+            .ordered_names
+            .get(i)
+            .and_then(|n| provider.index.get(n));
         let meta = match meta {
             Some(m) => m,
             None => {
@@ -332,7 +355,10 @@ pub fn try_load_from_provider(tensors: &crate::list::NslList) -> bool {
         if src_offset + byte_count > raw.len() {
             eprintln!(
                 "nsl: weight_provider: tensor '{}' offset {} + {} exceeds blob size {}",
-                meta.name, src_offset, byte_count, raw.len()
+                meta.name,
+                src_offset,
+                byte_count,
+                raw.len()
             );
             std::process::abort();
         }

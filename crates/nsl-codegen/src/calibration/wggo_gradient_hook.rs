@@ -8,13 +8,12 @@
 //! - `emit_finalize` reads back the running buffers and serialises them
 //!   into the sidecar's `wggo_head_gradients` field.
 
-use crate::calibration::{
-    ArenaLayout, CalibCtx, CalibrationHook, CalibrationResult, FinalizePlanEntry,
-    ObservePlanEntry,
-};
-use crate::calibration::observation::{ObservationSet, ProjectionRef};
 use crate::calibration::discovery::WggoGradTarget;
+use crate::calibration::observation::{ObservationSet, ProjectionRef};
 use crate::calibration::sidecar::{PerLayerGradient, WggoHeadGradients};
+use crate::calibration::{
+    ArenaLayout, CalibCtx, CalibrationHook, CalibrationResult, FinalizePlanEntry, ObservePlanEntry,
+};
 
 // ── Symbol naming ─────────────────────────────────────────────────────────────
 
@@ -35,7 +34,9 @@ fn running_symbol_for(layer_key: &str) -> String {
 /// is undefined for that head; treating it as `0.0` effectively removes the
 /// head from the importance ranking rather than aborting calibration.
 fn sanitize_payload(payload: &WggoHeadGradients) -> WggoHeadGradients {
-    let mut out = WggoHeadGradients { by_layer: std::collections::BTreeMap::new() };
+    let mut out = WggoHeadGradients {
+        by_layer: std::collections::BTreeMap::new(),
+    };
     for (k, v) in &payload.by_layer {
         let sanitized_scores: Vec<f32> = v
             .per_head_score
@@ -129,8 +130,8 @@ impl CalibrationHook for WggoGradientHook {
         // empty).  This is safe because the production scaffolding performs the
         // real IR emission independently.
 
-        use std::collections::HashMap;
         use crate::calibration::observation::ProjectionRef;
+        use std::collections::HashMap;
 
         // Build the layout map ONCE — spec §4.6 requires this to be outside
         // the per-target loop to avoid O(targets²) behaviour.
@@ -231,8 +232,9 @@ impl CalibrationHook for WggoGradientHook {
             // safest fallback — it effectively removes those heads from the
             // importance ranking rather than crashing calibration entirely.
             let sanitized = sanitize_payload(&payload);
-            serde_json::to_vec(&sanitized)
-                .expect("serialize WggoHeadGradients after NaN/Inf sanitization (per_head_score: f32)")
+            serde_json::to_vec(&sanitized).expect(
+                "serialize WggoHeadGradients after NaN/Inf sanitization (per_head_score: f32)",
+            )
         });
         CalibrationResult::Ok(bytes)
     }
@@ -253,8 +255,7 @@ impl CalibrationHook for WggoGradientHook {
                 (t.w_o_shape[0] / t.head_dim).max(1)
             };
             for proj in [&t.w_q, &t.w_k, &t.w_v, &t.w_o] {
-                if let Some((_, offset, nbytes)) =
-                    arena.entries.iter().find(|(p, _, _)| p == proj)
+                if let Some((_, offset, nbytes)) = arena.entries.iter().find(|(p, _, _)| p == proj)
                 {
                     // Validate the arena entry is evenly divisible by n_heads.
                     let total_f32 = *nbytes / 4;
@@ -309,8 +310,8 @@ impl CalibrationHook for WggoGradientHook {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::calibration::retention::ArenaLayout;
     use crate::calibration::discovery::WggoGradTarget;
+    use crate::calibration::retention::ArenaLayout;
 
     fn proj(name: &str) -> ProjectionRef {
         ProjectionRef(name.to_string())
@@ -368,8 +369,7 @@ mod tests {
             assert_eq!(e.channels, 4, "n_heads should be 4 (256/64)");
             assert_eq!(e.rows, 1, "16 bytes / 4 bytes_per_f32 / 4 heads = 1 row");
             assert_eq!(
-                e.running_symbol,
-                "__nsl_wggo_grad.model_layers_0",
+                e.running_symbol, "__nsl_wggo_grad.model_layers_0",
                 "dots in layer_key must be replaced by underscores"
             );
         }
@@ -421,12 +421,10 @@ mod tests {
 
     #[test]
     fn finalize_plan_one_entry_per_layer() {
-        let hook = WggoGradientHook::new(
-            vec![
-                fixture_target_4heads("model.layers.0"),
-                fixture_target_4heads("model.layers.1"),
-            ],
-        );
+        let hook = WggoGradientHook::new(vec![
+            fixture_target_4heads("model.layers.0"),
+            fixture_target_4heads("model.layers.1"),
+        ]);
         let plan = hook.finalize_plan();
         assert_eq!(plan.len(), 2);
         assert_eq!(plan[0].channels, 4);
@@ -477,12 +475,10 @@ mod tests {
 
     #[test]
     fn requires_returns_backward_gradients_for_all_layers() {
-        let hook = WggoGradientHook::new(
-            vec![
-                fixture_target_4heads("model.layers.0"),
-                fixture_target_4heads("model.layers.1"),
-            ],
-        );
+        let hook = WggoGradientHook::new(vec![
+            fixture_target_4heads("model.layers.0"),
+            fixture_target_4heads("model.layers.1"),
+        ]);
         match hook.requires() {
             ObservationSet::BackwardGradients(refs) => {
                 assert_eq!(refs.len(), 2);
@@ -516,16 +512,25 @@ mod tests {
         let CalibrationResult::Ok(bytes) = result else {
             panic!("expected CalibrationResult::Ok, got {result:?}")
         };
-        assert!(!bytes.is_empty(), "stub-era empty payload regression: emit_finalize must return non-empty bytes");
+        assert!(
+            !bytes.is_empty(),
+            "stub-era empty payload regression: emit_finalize must return non-empty bytes"
+        );
 
         let payload: WggoHeadGradients = serde_json::from_slice(&bytes)
             .expect("emit_finalize bytes must be valid WggoHeadGradients JSON");
 
-        let l0 = payload.by_layer.get("layers.0").expect("layers.0 missing from payload");
+        let l0 = payload
+            .by_layer
+            .get("layers.0")
+            .expect("layers.0 missing from payload");
         assert_eq!(l0.per_head_score, vec![1.0f32, 2.0, 3.0, 4.0]);
         assert_eq!(l0.batches_observed, 10);
 
-        let l1 = payload.by_layer.get("layers.1").expect("layers.1 missing from payload");
+        let l1 = payload
+            .by_layer
+            .get("layers.1")
+            .expect("layers.1 missing from payload");
         assert_eq!(l1.per_head_score, vec![5.0f32, 6.0, 7.0, 8.0]);
         assert_eq!(l1.batches_observed, 10);
     }
@@ -539,16 +544,22 @@ mod tests {
         let targets = vec![fixture_target("layers.nan", 64, [256, 256])];
         let hook = WggoGradientHook::new(targets);
         let mut ctx = crate::calibration::ctx::CalibCtx::stub_for_tests();
-        ctx.set_running_buffer_f64("__nsl_wggo_grad.layers_nan", &[
-            f64::NAN, f64::INFINITY, 1.0, f64::NEG_INFINITY,
-        ]);
+        ctx.set_running_buffer_f64(
+            "__nsl_wggo_grad.layers_nan",
+            &[f64::NAN, f64::INFINITY, 1.0, f64::NEG_INFINITY],
+        );
         ctx.set_batches_processed(5);
 
         let result = hook.emit_finalize(&mut ctx);
-        let CalibrationResult::Ok(bytes) = result else { panic!("expected Ok, got {result:?}") };
+        let CalibrationResult::Ok(bytes) = result else {
+            panic!("expected Ok, got {result:?}")
+        };
         let payload: WggoHeadGradients = serde_json::from_slice(&bytes)
             .expect("emit_finalize bytes must be valid WggoHeadGradients JSON after sanitization");
-        let layer = payload.by_layer.get("layers.nan").expect("layers.nan missing from payload");
+        let layer = payload
+            .by_layer
+            .get("layers.nan")
+            .expect("layers.nan missing from payload");
         // NaN and ±Inf are sanitized to 0.0; finite values pass through unchanged.
         assert_eq!(layer.per_head_score, vec![0.0f32, 0.0, 1.0, 0.0]);
         assert_eq!(layer.batches_observed, 5);
@@ -564,25 +575,27 @@ mod tests {
         let CalibrationResult::Ok(bytes) = hook.emit_finalize(&mut ctx) else {
             panic!("expected Ok")
         };
-        assert!(!bytes.is_empty(), "JSON serialisation of empty map must not be empty bytes");
+        assert!(
+            !bytes.is_empty(),
+            "JSON serialisation of empty map must not be empty bytes"
+        );
         let payload: WggoHeadGradients = serde_json::from_slice(&bytes).unwrap();
         assert!(payload.by_layer.is_empty());
     }
 
     #[test]
     fn hook_is_object_safe_via_box() {
-        let hook: Box<dyn CalibrationHook> = Box::new(WggoGradientHook::new(
-            vec![fixture_target_4heads("model.layers.0")],
-        ));
+        let hook: Box<dyn CalibrationHook> =
+            Box::new(WggoGradientHook::new(vec![fixture_target_4heads(
+                "model.layers.0",
+            )]));
         assert_eq!(hook.id(), "wggo_head_gradients");
     }
 
     #[test]
     fn running_symbol_sanitises_dots() {
         // Indirectly test through finalize_plan.
-        let hook = WggoGradientHook::new(
-            vec![fixture_target_4heads("a.b.c")],
-        );
+        let hook = WggoGradientHook::new(vec![fixture_target_4heads("a.b.c")]);
         let plan = hook.finalize_plan();
         assert_eq!(plan[0].running_symbol, "__nsl_wggo_grad.a_b_c");
     }
@@ -593,12 +606,18 @@ mod tests {
     /// path could bypass it.  All three division sites must not panic.
     #[test]
     fn head_dim_zero_does_not_panic_in_emit_init() {
-        let t = fixture_target("model.layers.0", /*head_dim=*/ 0, /*w_o_shape=*/ [256, 256]);
+        let t = fixture_target(
+            "model.layers.0",
+            /*head_dim=*/ 0,
+            /*w_o_shape=*/ [256, 256],
+        );
         let hook = WggoGradientHook::new(vec![t]);
         let mut ctx = crate::calibration::ctx::CalibCtx::stub_for_tests();
         // Must not panic; should emit a 1-head buffer (8 bytes).
         hook.emit_init(&mut ctx);
-        let g = ctx.lookup_bss_global("__nsl_wggo_grad.model_layers_0").unwrap();
+        let g = ctx
+            .lookup_bss_global("__nsl_wggo_grad.model_layers_0")
+            .unwrap();
         assert_eq!(g.size_bytes, 8, "head_dim=0 → 1 head → 8 bytes");
     }
 
@@ -643,8 +662,8 @@ mod tests {
         let hook = WggoGradientHook::new(targets);
         let bytes_per_proj = 256 * 256 * 4u32;
         let mut ctx = crate::calibration::ctx::CalibCtx::stub_for_tests_with_grad_layout(&[
-            ("layers.0.w_q", 0,                 bytes_per_proj),
-            ("layers.0.w_k", bytes_per_proj,     bytes_per_proj),
+            ("layers.0.w_q", 0, bytes_per_proj),
+            ("layers.0.w_k", bytes_per_proj, bytes_per_proj),
             ("layers.0.w_v", 2 * bytes_per_proj, bytes_per_proj),
             ("layers.0.w_o", 3 * bytes_per_proj, bytes_per_proj),
             ("layers.1.w_q", 4 * bytes_per_proj, bytes_per_proj),
@@ -655,12 +674,14 @@ mod tests {
         hook.emit_per_step(&mut ctx);
         // 2 layers × 4 projections = 8 per_head_dot calls
         assert_eq!(
-            ctx.per_head_dot_call_count(), 8,
+            ctx.per_head_dot_call_count(),
+            8,
             "expected 8 per_head_dot calls (2 layers × 4 projections)"
         );
         // The layout HashMap must be built ONCE, not once per target.
         assert_eq!(
-            ctx.layout_map_build_count(), 1,
+            ctx.layout_map_build_count(),
+            1,
             "layout HashMap must be built exactly once (outside per-target loop)"
         );
     }
@@ -674,12 +695,15 @@ mod tests {
         let bytes_per_proj = 256 * 256 * 4u32;
         // Only w_q and w_k in layout; w_v and w_o absent.
         let mut ctx = crate::calibration::ctx::CalibCtx::stub_for_tests_with_grad_layout(&[
-            ("layers.0.w_q", 0,            bytes_per_proj),
+            ("layers.0.w_q", 0, bytes_per_proj),
             ("layers.0.w_k", bytes_per_proj, bytes_per_proj),
         ]);
         hook.emit_per_step(&mut ctx);
-        assert_eq!(ctx.per_head_dot_call_count(), 2,
-            "only 2 projections present in layout; 2 calls expected");
+        assert_eq!(
+            ctx.per_head_dot_call_count(),
+            2,
+            "only 2 projections present in layout; 2 calls expected"
+        );
     }
 
     /// An empty layout produces zero per_head_dot calls.
@@ -697,7 +721,7 @@ mod tests {
     /// head_dim=0 in emit_per_step must not panic (same guard as emit_init).
     #[test]
     fn emit_per_step_head_dim_zero_does_not_panic() {
-        let target = fixture_target("layers.0", /*head_dim=*/0, [256, 256]);
+        let target = fixture_target("layers.0", /*head_dim=*/ 0, [256, 256]);
         let hook = WggoGradientHook::new(vec![target]);
         let bytes_per_proj = 256 * 256 * 4u32;
         let mut ctx = crate::calibration::ctx::CalibCtx::stub_for_tests_with_grad_layout(&[
@@ -716,7 +740,11 @@ mod tests {
     #[test]
     fn emit_init_declares_per_layer_running_buffers_as_bss_globals() {
         let targets = vec![
-            fixture_target("model.layers.0", /*head_dim=*/ 128, /*w_o_shape=*/ [4096, 4096]),
+            fixture_target(
+                "model.layers.0",
+                /*head_dim=*/ 128,
+                /*w_o_shape=*/ [4096, 4096],
+            ),
             fixture_target("model.layers.1", 128, [4096, 4096]),
         ];
         let hook = WggoGradientHook::new(targets);
@@ -724,9 +752,13 @@ mod tests {
         hook.emit_init(&mut ctx);
 
         // n_o_heads = 4096 / 128 = 32; buffer = 32 × 8 bytes = 256 bytes per layer
-        let g0 = ctx.lookup_bss_global("__nsl_wggo_grad.model_layers_0").unwrap();
+        let g0 = ctx
+            .lookup_bss_global("__nsl_wggo_grad.model_layers_0")
+            .unwrap();
         assert_eq!(g0.size_bytes, 256);
-        let g1 = ctx.lookup_bss_global("__nsl_wggo_grad.model_layers_1").unwrap();
+        let g1 = ctx
+            .lookup_bss_global("__nsl_wggo_grad.model_layers_1")
+            .unwrap();
         assert_eq!(g1.size_bytes, 256);
     }
 }

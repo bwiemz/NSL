@@ -18,7 +18,7 @@ const NAME_MAPPINGS: &[(&str, &str)] = &[
     ("lm_head", "head"),
     ("input_layernorm", "norm1"),
     ("post_attention_layernorm", "norm2"),
-    ("model.", ""),  // strip common "model." prefix
+    ("model.", ""), // strip common "model." prefix
 ];
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -36,7 +36,11 @@ pub extern "C" fn nsl_str_eq(a: i64, b: i64) -> i64 {
     }
     let sa = unsafe { as_cstr(a) }.to_bytes();
     let sb = unsafe { as_cstr(b) }.to_bytes();
-    if sa == sb { 1 } else { 0 }
+    if sa == sb {
+        1
+    } else {
+        0
+    }
 }
 
 #[no_mangle]
@@ -58,10 +62,18 @@ pub extern "C" fn nsl_str_slice(s: i64, lo: i64, hi: i64, step_val: i64) -> i64 
     if step > 0 {
         let mut low = if lo == i64::MIN { 0 } else { lo };
         let mut high = if hi == i64::MIN { len } else { hi };
-        if low < 0 { low += len; }
-        if high < 0 { high += len; }
-        if low < 0 { low = 0; }
-        if high > len { high = len; }
+        if low < 0 {
+            low += len;
+        }
+        if high < 0 {
+            high += len;
+        }
+        if low < 0 {
+            low = 0;
+        }
+        if high > len {
+            high = len;
+        }
 
         let mut i = low;
         while i < high {
@@ -72,9 +84,15 @@ pub extern "C" fn nsl_str_slice(s: i64, lo: i64, hi: i64, step_val: i64) -> i64 
         let mut low = if lo == i64::MIN { len - 1 } else { lo };
         let high = if hi == i64::MIN { -(len + 1) } else { hi };
         let mut adj_high = high;
-        if low < 0 { low += len; }
-        if adj_high < 0 { adj_high += len; }
-        if low >= len { low = len - 1; }
+        if low < 0 {
+            low += len;
+        }
+        if adj_high < 0 {
+            adj_high += len;
+        }
+        if low >= len {
+            low = len - 1;
+        }
 
         let mut i = low;
         while i > adj_high {

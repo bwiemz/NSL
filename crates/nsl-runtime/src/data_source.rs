@@ -10,7 +10,7 @@ use std::io::{BufRead, BufReader};
 use crate::list::{nsl_list_new, nsl_list_push};
 use crate::memory::checked_alloc;
 use crate::string::nsl_str_from_rust;
-use crate::tensor::{DTYPE_U16_TOKEN, NslTensor};
+use crate::tensor::{NslTensor, DTYPE_U16_TOKEN};
 
 /// Convert a (ptr, len) pair from the NSL ABI into a Rust `String`.
 unsafe fn str_from_ptr_len(ptr: i64, len: i64) -> String {
@@ -25,15 +25,7 @@ fn create_mmap_tensor(data: *mut c_void, len: i64, dtype: u16, owns_data: u8) ->
     let strides = NslTensor::compute_strides(shape_ptr, 1);
 
     let tensor = Box::new(NslTensor::new(
-        data,
-        shape_ptr,
-        strides,
-        1,
-        len,
-        0,
-        dtype,
-        owns_data,
-        0,
+        data, shape_ptr, strides, 1, len, 0, dtype, owns_data, 0,
     ));
     Box::into_raw(tensor) as i64
 }
@@ -70,7 +62,11 @@ pub extern "C" fn nsl_load_jsonl(
         let line = match line_result {
             Ok(l) => l,
             Err(e) => {
-                eprintln!("nsl: nsl_load_jsonl: read error at line {}: {}", line_no + 1, e);
+                eprintln!(
+                    "nsl: nsl_load_jsonl: read error at line {}: {}",
+                    line_no + 1,
+                    e
+                );
                 continue;
             }
         };
@@ -143,12 +139,7 @@ fn parse_csv_line(line: &str) -> Vec<String> {
 /// `has_header`: 1 = skip first line, 0 = no header.
 /// Returns an NslList of NSL string pointers.
 #[no_mangle]
-pub extern "C" fn nsl_load_csv(
-    path_ptr: i64,
-    path_len: i64,
-    col_idx: i64,
-    has_header: i64,
-) -> i64 {
+pub extern "C" fn nsl_load_csv(path_ptr: i64, path_len: i64, col_idx: i64, has_header: i64) -> i64 {
     let path = unsafe { str_from_ptr_len(path_ptr, path_len) };
 
     let file = match fs::File::open(&path) {
@@ -173,7 +164,11 @@ pub extern "C" fn nsl_load_csv(
         let line = match line_result {
             Ok(l) => l,
             Err(e) => {
-                eprintln!("nsl: nsl_load_csv: read error at line {}: {}", line_no + 1, e);
+                eprintln!(
+                    "nsl: nsl_load_csv: read error at line {}: {}",
+                    line_no + 1,
+                    e
+                );
                 continue;
             }
         };
@@ -334,7 +329,10 @@ mod tests {
         {
             let data: [f64; 4] = [1.0, 2.0, 3.0, 4.0];
             let bytes: &[u8] = unsafe {
-                std::slice::from_raw_parts(data.as_ptr() as *const u8, 4 * std::mem::size_of::<f64>())
+                std::slice::from_raw_parts(
+                    data.as_ptr() as *const u8,
+                    4 * std::mem::size_of::<f64>(),
+                )
             };
             fs::write(&path, bytes).unwrap();
         }
@@ -449,11 +447,7 @@ mod tests {
         }
 
         let path_str = path.to_str().unwrap();
-        let tensor_ptr = nsl_load_mmap(
-            path_str.as_ptr() as i64,
-            path_str.len() as i64,
-            3,
-        );
+        let tensor_ptr = nsl_load_mmap(path_str.as_ptr() as i64, path_str.len() as i64, 3);
 
         let shape = crate::list::nsl_list_new();
         crate::list::nsl_list_push(shape, 2);

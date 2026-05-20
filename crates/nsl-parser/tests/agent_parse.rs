@@ -1,5 +1,5 @@
-use nsl_ast::stmt::StmtKind;
 use nsl_ast::agent::AgentMember;
+use nsl_ast::stmt::StmtKind;
 use nsl_errors::FileId;
 
 #[test]
@@ -10,7 +10,11 @@ fn parses_agent_with_field_and_method() {
     assert!(lex_diags.is_empty(), "lex errors: {:?}", lex_diags);
 
     let result = nsl_parser::parse(&tokens, &mut interner);
-    assert!(result.diagnostics.is_empty(), "parse errors: {:?}", result.diagnostics);
+    assert!(
+        result.diagnostics.is_empty(),
+        "parse errors: {:?}",
+        result.diagnostics
+    );
 
     let stmt = &result.module.stmts[0];
     let agent = match &stmt.kind {

@@ -5,8 +5,9 @@
 
 mod common;
 use common::fp8_reference::*;
-use nsl_runtime::fp8::{nsl_fp8_compute_scale, FP8_FORMAT_E4M3, FP8_FORMAT_E5M2,
-                       FP8E4M3_MAX, FP8E5M2_MAX};
+use nsl_runtime::fp8::{
+    nsl_fp8_compute_scale, FP8E4M3_MAX, FP8E5M2_MAX, FP8_FORMAT_E4M3, FP8_FORMAT_E5M2,
+};
 use nsl_runtime::tensor::nsl_tensor_free;
 
 #[test]
@@ -16,8 +17,10 @@ fn e4m3_scale_matches_max_div_format_max() {
 
     let scale = nsl_fp8_compute_scale(ptr, FP8_FORMAT_E4M3) as f32;
     let expected = 4.0_f32 / FP8E4M3_MAX;
-    assert!((scale - expected).abs() <= f32::EPSILON,
-        "E4M3 scale {scale} != expected {expected}");
+    assert!(
+        (scale - expected).abs() <= f32::EPSILON,
+        "E4M3 scale {scale} != expected {expected}"
+    );
 
     nsl_tensor_free(ptr);
 }
@@ -29,8 +32,10 @@ fn e5m2_scale_matches_max_div_format_max() {
 
     let scale = nsl_fp8_compute_scale(ptr, FP8_FORMAT_E5M2) as f32;
     let expected = 10000.0_f32 / FP8E5M2_MAX;
-    assert!((scale - expected).abs() <= f32::EPSILON,
-        "E5M2 scale {scale} != expected {expected}");
+    assert!(
+        (scale - expected).abs() <= f32::EPSILON,
+        "E5M2 scale {scale} != expected {expected}"
+    );
 
     nsl_tensor_free(ptr);
 }
@@ -77,8 +82,10 @@ fn large_magnitude_e4m3_clamps_to_max() {
 
     let scale = nsl_fp8_compute_scale(ptr, FP8_FORMAT_E4M3) as f32;
     let scaled_max = 10000.0_f32 / scale;
-    assert!((scaled_max - FP8E4M3_MAX).abs() <= 1e-3,
-        "scaled max {scaled_max} should equal {FP8E4M3_MAX}");
+    assert!(
+        (scaled_max - FP8E4M3_MAX).abs() <= 1e-3,
+        "scaled max {scaled_max} should equal {FP8E4M3_MAX}"
+    );
 
     nsl_tensor_free(ptr);
 }

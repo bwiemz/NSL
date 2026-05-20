@@ -91,8 +91,7 @@ pub fn find_ptxas() -> Option<String> {
             return Some(name.to_string());
         }
     }
-    let win =
-        r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.2\bin\ptxas.exe";
+    let win = r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.2\bin\ptxas.exe";
     if std::path::Path::new(win).exists() {
         return Some(win.to_string());
     }
@@ -111,8 +110,7 @@ pub fn find_cuobjdump() -> Option<String> {
             return Some(name.to_string());
         }
     }
-    let win =
-        r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.2\bin\cuobjdump.exe";
+    let win = r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.2\bin\cuobjdump.exe";
     if std::path::Path::new(win).exists() {
         return Some(win.to_string());
     }

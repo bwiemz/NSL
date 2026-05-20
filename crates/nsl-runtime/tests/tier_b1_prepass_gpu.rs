@@ -22,8 +22,8 @@
 #![cfg(feature = "cuda")]
 
 use nsl_runtime::{
-    nsl_cuda_init, nsl_test_cuda_alloc, nsl_test_cuda_d2h, nsl_test_cuda_free,
-    nsl_test_cuda_h2d, CSHA_TIER_B1_PREPASS_W_PTX, CSHA_TIER_B1_PREPASS_X_PTX,
+    nsl_cuda_init, nsl_test_cuda_alloc, nsl_test_cuda_d2h, nsl_test_cuda_free, nsl_test_cuda_h2d,
+    CSHA_TIER_B1_PREPASS_W_PTX, CSHA_TIER_B1_PREPASS_X_PTX,
 };
 
 extern "C" {
@@ -155,8 +155,12 @@ fn x_prepass_matches_cpu_reference() {
         nsl_kernel_launch(
             ptx.as_ptr() as i64,
             kernel_name.as_ptr() as i64,
-            seq as i64, 1, 1,
-            256, 1, 1,
+            seq as i64,
+            1,
+            1,
+            256,
+            1,
+            1,
             args.as_ptr() as i64,
             args.len() as i64,
             0,
@@ -187,7 +191,10 @@ fn x_prepass_matches_cpu_reference() {
         }
         if d > 1e-2 {
             if mismatches < 5 {
-                eprintln!("[x-prepass] mismatch @ {}: expected {:.6} got {:.6}", i, e_f, g_f);
+                eprintln!(
+                    "[x-prepass] mismatch @ {}: expected {:.6} got {:.6}",
+                    i, e_f, g_f
+                );
             }
             mismatches += 1;
         }
@@ -266,8 +273,12 @@ fn w_prepass_matches_cpu_reference() {
         nsl_kernel_launch(
             ptx.as_ptr() as i64,
             kernel_name.as_ptr() as i64,
-            grid_x, 1, 1,
-            256, 1, 1,
+            grid_x,
+            1,
+            1,
+            256,
+            1,
+            1,
             args.as_ptr() as i64,
             args.len() as i64,
             0,
@@ -291,13 +302,23 @@ fn w_prepass_matches_cpu_reference() {
             if mismatches < 5 {
                 let e_f = f16_to_f32(e);
                 let g_f = f16_to_f32(g);
-                eprintln!("[w-prepass] mismatch @ {}: expected 0x{:04x}={:.6} got 0x{:04x}={:.6}", i, e, e_f, g, g_f);
+                eprintln!(
+                    "[w-prepass] mismatch @ {}: expected 0x{:04x}={:.6} got 0x{:04x}={:.6}",
+                    i, e, e_f, g, g_f
+                );
             }
             mismatches += 1;
         }
     }
-    assert_eq!(mismatches, 0, "{} elements differ between CPU and GPU w prepass", mismatches);
-    eprintln!("[w-prepass] all {} elements bit-exact match", expected.len());
+    assert_eq!(
+        mismatches, 0,
+        "{} elements differ between CPU and GPU w prepass",
+        mismatches
+    );
+    eprintln!(
+        "[w-prepass] all {} elements bit-exact match",
+        expected.len()
+    );
 }
 
 // Local copy of f32_to_f16_bits matching the kernel's cvt.rn.f16.f32 rounding.

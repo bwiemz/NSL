@@ -13,8 +13,7 @@ fn fixture(name: &str) -> String {
     let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     p.push("tests/fixtures");
     p.push(name);
-    std::fs::read_to_string(&p)
-        .unwrap_or_else(|e| panic!("failed to read fixture {:?}: {}", p, e))
+    std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("failed to read fixture {:?}: {}", p, e))
 }
 
 #[test]

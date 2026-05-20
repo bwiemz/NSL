@@ -9,8 +9,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use nsl_codegen::calibration::{
-    HarnessConfig, HarnessError, HarnessMode, HarnessOutput, HookRegistry,
-    identity_hook::IdentityHook, run_harness_simulated,
+    identity_hook::IdentityHook, run_harness_simulated, HarnessConfig, HarnessError, HarnessMode,
+    HarnessOutput, HookRegistry,
 };
 
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -77,16 +77,16 @@ fn e2e_single_hook_round_trip() {
 
     let _ = fs::remove_file(&ckpt);
     let _ = fs::remove_file(&data);
-    let _ = fs::remove_file(
-        nsl_codegen::calibration::cache::sidecar_path_for(&ckpt),
-    );
+    let _ = fs::remove_file(nsl_codegen::calibration::cache::sidecar_path_for(&ckpt));
 }
 
 #[test]
 fn e2e_multi_hook_sidecar_isolation() {
     struct A;
     impl nsl_codegen::calibration::CalibrationHook for A {
-        fn id(&self) -> &'static str { "hook_a" }
+        fn id(&self) -> &'static str {
+            "hook_a"
+        }
         fn requires(&self) -> nsl_codegen::calibration::ObservationSet {
             nsl_codegen::calibration::ObservationSet::Empty
         }
@@ -101,7 +101,9 @@ fn e2e_multi_hook_sidecar_isolation() {
     }
     struct B;
     impl nsl_codegen::calibration::CalibrationHook for B {
-        fn id(&self) -> &'static str { "hook_b" }
+        fn id(&self) -> &'static str {
+            "hook_b"
+        }
         fn requires(&self) -> nsl_codegen::calibration::ObservationSet {
             nsl_codegen::calibration::ObservationSet::Empty
         }
@@ -142,7 +144,5 @@ fn e2e_multi_hook_sidecar_isolation() {
 
     let _ = fs::remove_file(&ckpt);
     let _ = fs::remove_file(&data);
-    let _ = fs::remove_file(
-        nsl_codegen::calibration::cache::sidecar_path_for(&ckpt),
-    );
+    let _ = fs::remove_file(nsl_codegen::calibration::cache::sidecar_path_for(&ckpt));
 }

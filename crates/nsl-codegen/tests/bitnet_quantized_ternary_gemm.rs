@@ -109,8 +109,7 @@ fn fused_quantized_ternary_gemm_matches_all_10_fixtures() {
                 "Fixture {}: output row {r} length mismatch",
                 fixture.name
             );
-            for (c, (&actual, &expected)) in
-                actual_row.iter().zip(expected_row.iter()).enumerate()
+            for (c, (&actual, &expected)) in actual_row.iter().zip(expected_row.iter()).enumerate()
             {
                 let abs_diff = (actual - expected).abs();
                 let rel_diff = abs_diff / expected.abs().max(1e-30);

@@ -49,7 +49,11 @@ impl<'a> TypeResolver<'a> {
                 dtype: self.resolve_dtype(*dtype),
                 format: self.resolve_sparse_format(*format),
             },
-            TypeExprKind::Function { params, ret, effect } => {
+            TypeExprKind::Function {
+                params,
+                ret,
+                effect,
+            } => {
                 let resolved_effect = if let Some(eff_expr) = effect {
                     self.resolve_effect_expr(eff_expr, scope)
                 } else {
@@ -60,7 +64,7 @@ impl<'a> TypeResolver<'a> {
                     ret: Box::new(self.resolve(ret, scope)),
                     effect: resolved_effect,
                 }
-            },
+            }
             TypeExprKind::Union(types) => {
                 Type::Union(types.iter().map(|t| self.resolve(t, scope)).collect())
             }
@@ -71,7 +75,10 @@ impl<'a> TypeResolver<'a> {
             TypeExprKind::FixedArray { element_type, size } => {
                 let elem = self.resolve(element_type, scope);
                 if let Type::Model { name, .. } = &elem {
-                    Type::FixedModelArray { element_model: *name, size: *size }
+                    Type::FixedModelArray {
+                        element_model: *name,
+                        size: *size,
+                    }
                 } else {
                     // For now, only model arrays supported
                     Type::Unknown
@@ -362,9 +369,10 @@ impl<'a> TypeResolver<'a> {
                     size: Box::new(size),
                 }
             }
-            AstDimExpr::Bounded { name, upper_bound } => {
-                Dim::Bounded { name: *name, upper_bound: *upper_bound }
-            }
+            AstDimExpr::Bounded { name, upper_bound } => Dim::Bounded {
+                name: *name,
+                upper_bound: *upper_bound,
+            },
             AstDimExpr::Wildcard => Dim::Wildcard,
         }
     }
@@ -431,9 +439,13 @@ impl<'a> TypeResolver<'a> {
     }
 
     /// Resolve an effect expression into a semantic Effect.
-    pub fn resolve_effect_expr(&mut self, eff: &nsl_ast::decl::EffectExpr, _scope: ScopeId) -> Effect {
-        use nsl_ast::decl::EffectExpr;
+    pub fn resolve_effect_expr(
+        &mut self,
+        eff: &nsl_ast::decl::EffectExpr,
+        _scope: ScopeId,
+    ) -> Effect {
         use crate::effects::EffectSet;
+        use nsl_ast::decl::EffectExpr;
 
         match eff {
             EffectExpr::Var(sym) => {
@@ -466,13 +478,15 @@ impl<'a> TypeResolver<'a> {
                 }
             }
             EffectExpr::Union(parts) => {
-                let resolved: Vec<Effect> = parts.iter()
+                let resolved: Vec<Effect> = parts
+                    .iter()
                     .map(|p| self.resolve_effect_expr(p, _scope))
                     .collect();
                 // Fold into nested unions
-                resolved.into_iter().reduce(|a, b| {
-                    Effect::Union(Box::new(a), Box::new(b))
-                }).unwrap_or(Effect::pure())
+                resolved
+                    .into_iter()
+                    .reduce(|a, b| Effect::Union(Box::new(a), Box::new(b)))
+                    .unwrap_or(Effect::pure())
             }
         }
     }
@@ -505,12 +519,22 @@ fn substitute_type(ty: &Type, bindings: &HashMap<Symbol, Type>) -> Type {
             Box::new(substitute_type(key, bindings)),
             Box::new(substitute_type(value, bindings)),
         ),
-        Type::Tuple(items) => {
-            Type::Tuple(items.iter().map(|item| substitute_type(item, bindings)).collect())
-        }
+        Type::Tuple(items) => Type::Tuple(
+            items
+                .iter()
+                .map(|item| substitute_type(item, bindings))
+                .collect(),
+        ),
         Type::Optional(inner) => Type::Optional(Box::new(substitute_type(inner, bindings))),
-        Type::Function { params, ret, effect } => Type::Function {
-            params: params.iter().map(|param| substitute_type(param, bindings)).collect(),
+        Type::Function {
+            params,
+            ret,
+            effect,
+        } => Type::Function {
+            params: params
+                .iter()
+                .map(|param| substitute_type(param, bindings))
+                .collect(),
             ret: Box::new(substitute_type(ret, bindings)),
             effect: effect.clone(),
         },
@@ -582,7 +606,10 @@ fn substitute_type(ty: &Type, bindings: &HashMap<Symbol, Type>) -> Type {
                 methods: methods
                     .iter()
                     .map(|(method_name, method_ty)| {
-                        (*method_name, substitute_type(method_ty, &effective_bindings))
+                        (
+                            *method_name,
+                            substitute_type(method_ty, &effective_bindings),
+                        )
                     })
                     .collect(),
             }
@@ -611,7 +638,10 @@ fn substitute_type(ty: &Type, bindings: &HashMap<Symbol, Type>) -> Type {
                 methods: methods
                     .iter()
                     .map(|(method_name, method_ty)| {
-                        (*method_name, substitute_type(method_ty, &effective_bindings))
+                        (
+                            *method_name,
+                            substitute_type(method_ty, &effective_bindings),
+                        )
                     })
                     .collect(),
             }

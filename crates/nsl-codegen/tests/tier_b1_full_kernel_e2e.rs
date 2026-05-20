@@ -47,8 +47,8 @@ use nsl_codegen::flash_attention_v2::{
 use std::ffi::{c_void, CString};
 
 use nsl_runtime::{
-    nsl_cuda_init, nsl_test_cuda_alloc, nsl_test_cuda_d2h, nsl_test_cuda_free,
-    nsl_test_cuda_h2d, nsl_test_cuda_jit_log,
+    nsl_cuda_init, nsl_test_cuda_alloc, nsl_test_cuda_d2h, nsl_test_cuda_free, nsl_test_cuda_h2d,
+    nsl_test_cuda_jit_log,
 };
 
 extern "C" {
@@ -165,9 +165,7 @@ fn rmsnorm_rows_full_dmodel(x: &[f32], seq: usize, d_model: usize, eps: f32) -> 
 ///
 /// where `c` is the inner offset within the chunk (0..chunk-1) and
 /// the underlying d_model column is `chunk_idx * chunk + c`.
-fn x_to_chunks_major_f16(
-    x: &[f32], seq: usize, d_model: usize, chunk: usize,
-) -> Vec<u16> {
+fn x_to_chunks_major_f16(x: &[f32], seq: usize, d_model: usize, chunk: usize) -> Vec<u16> {
     assert!(d_model % chunk == 0, "d_model must be divisible by chunk");
     let n_chunks = d_model / chunk;
     let mut out = vec![0u16; n_chunks * seq * chunk];
@@ -193,9 +191,7 @@ fn x_to_chunks_major_f16(
 ///
 /// where `k_in_chunk` indexes a row within the chunk and the
 /// underlying d_model row is `chunk_idx * chunk + k_in_chunk`.
-fn w_to_col_major_chunked_f16(
-    w: &[f32], d_model: usize, hd: usize, chunk: usize,
-) -> Vec<u16> {
+fn w_to_col_major_chunked_f16(w: &[f32], d_model: usize, hd: usize, chunk: usize) -> Vec<u16> {
     assert!(d_model % chunk == 0, "d_model must be divisible by chunk");
     let n_chunks = d_model / chunk;
     let mut out = vec![0u16; n_chunks * hd * chunk];
@@ -297,7 +293,12 @@ fn tier_b1_full_kernel_e2e_matches_cpu_reference() {
             sin: &sin,
         },
         &CshaShape {
-            seq, heads, head_dim, d_model, causal, norm_eps,
+            seq,
+            heads,
+            head_dim,
+            d_model,
+            causal,
+            norm_eps,
         },
     );
 
@@ -447,8 +448,12 @@ fn tier_b1_full_kernel_e2e_matches_cpu_reference() {
         nsl_kernel_launch(
             ptx.as_ptr() as i64,
             kernel_name.as_ptr() as i64,
-            /* grid */ 1, 1, 1,
-            /* block */ 256, 1, 1,
+            /* grid */ 1,
+            1,
+            1,
+            /* block */ 256,
+            1,
+            1,
             args.as_ptr() as i64,
             args.len() as i64,
             /* smem_dynamic */ 0,
@@ -510,8 +515,14 @@ fn tier_b1_full_kernel_e2e_matches_cpu_reference() {
             max_idx, out_gpu[max_idx], cpu_out[max_idx]
         );
     }
-    eprintln!("\n[B1-e2e] first 8 GPU: {:?}", &out_gpu[..8.min(out_gpu.len())]);
-    eprintln!("[B1-e2e] first 8 CPU: {:?}", &cpu_out[..8.min(cpu_out.len())]);
+    eprintln!(
+        "\n[B1-e2e] first 8 GPU: {:?}",
+        &out_gpu[..8.min(out_gpu.len())]
+    );
+    eprintln!(
+        "[B1-e2e] first 8 CPU: {:?}",
+        &cpu_out[..8.min(cpu_out.len())]
+    );
 
     eprintln!("\n[B1-e2e] ── per-row max_abs ──");
     for row in 0..seq.min(8) {
@@ -541,10 +552,7 @@ fn tier_b1_full_kernel_e2e_matches_cpu_reference() {
     const MAX_ABS_TOL: f32 = 0.6;
     const MEAN_ABS_TOL: f32 = 0.25;
     if n_nan > 0 {
-        panic!(
-            "[B1-e2e] FAIL: {} non-finite GPU outputs",
-            n_nan
-        );
+        panic!("[B1-e2e] FAIL: {} non-finite GPU outputs", n_nan);
     }
     eprintln!(
         "\n[B1-e2e] DIAGNOSIS: max_abs={:.4e} mean_abs={:.4e} (n_nan={})",
@@ -553,12 +561,14 @@ fn tier_b1_full_kernel_e2e_matches_cpu_reference() {
     assert!(
         max_abs <= MAX_ABS_TOL,
         "GPU output drifted further than tolerance: max_abs={:.4e} > {:.4e}",
-        max_abs, MAX_ABS_TOL
+        max_abs,
+        MAX_ABS_TOL
     );
     assert!(
         mean_abs <= MEAN_ABS_TOL,
         "GPU output mean drift exceeds tolerance: mean_abs={:.4e} > {:.4e}",
-        mean_abs, MEAN_ABS_TOL
+        mean_abs,
+        MEAN_ABS_TOL
     );
     eprintln!(
         "[B1-e2e] PASS: numerical match (max_abs={:.4e} ≤ {:.4e}; mean_abs={:.4e} ≤ {:.4e})",

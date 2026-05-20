@@ -69,11 +69,7 @@ pub fn resolve_import(
 
     let segments: Vec<&str> = import_path
         .iter()
-        .map(|sym| {
-            interner
-                .resolve(sym.0)
-                .unwrap_or("<unknown>")
-        })
+        .map(|sym| interner.resolve(sym.0).unwrap_or("<unknown>"))
         .collect();
 
     let module_name = segments.join(".");
@@ -89,17 +85,23 @@ pub fn resolve_import(
     }
 
     // 1. Resolve relative to the importing file's parent directory
-    let base_dir = importing_file
-        .parent()
-        .ok_or_else(|| format!("cannot determine parent directory of '{}'", importing_file.display()))?;
+    let base_dir = importing_file.parent().ok_or_else(|| {
+        format!(
+            "cannot determine parent directory of '{}'",
+            importing_file.display()
+        )
+    })?;
 
     let relative_candidate = base_dir.join(&rel);
 
     if relative_candidate.is_file() {
         // Canonicalize to get a stable key for the module graph
-        return relative_candidate
-            .canonicalize()
-            .map_err(|e| format!("module '{module_name}' found at '{}' but cannot canonicalize: {e}", relative_candidate.display()));
+        return relative_candidate.canonicalize().map_err(|e| {
+            format!(
+                "module '{module_name}' found at '{}' but cannot canonicalize: {e}",
+                relative_candidate.display()
+            )
+        });
     }
 
     // 2 & 3. Try all stdlib roots (env var first, then exe-relative)
@@ -110,9 +112,12 @@ pub fn resolve_import(
         searched.push(stdlib_candidate.display().to_string());
 
         if stdlib_candidate.is_file() {
-            return stdlib_candidate
-                .canonicalize()
-                .map_err(|e| format!("module '{module_name}' found at '{}' but cannot canonicalize: {e}", stdlib_candidate.display()));
+            return stdlib_candidate.canonicalize().map_err(|e| {
+                format!(
+                    "module '{module_name}' found at '{}' but cannot canonicalize: {e}",
+                    stdlib_candidate.display()
+                )
+            });
         }
     }
 

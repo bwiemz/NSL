@@ -51,7 +51,7 @@ pub(crate) fn invoke_cpdt_if_enabled(
     applied_plan: &crate::wggo_apply::AppliedPlan,
     train_block: Option<&nsl_ast::block::TrainBlock>,
 ) {
-    use crate::cpdt::{CpdtInput, CpdtMode, run as cpdt_run};
+    use crate::cpdt::{run as cpdt_run, CpdtInput, CpdtMode};
     use crate::cpdt_expert::ExpertConfig;
     use crate::cpdt_joint::JointConfig;
     use crate::cpdt_tier_apply::{compute_tier_agreement, plan_map_noweights, PrecisionConfig};
@@ -388,9 +388,7 @@ impl Compiler<'_> {
             PatternKind::Rest(Some(sym)) => {
                 targets.insert(*sym);
             }
-            PatternKind::Wildcard
-            | PatternKind::Literal(_)
-            | PatternKind::Rest(None) => {}
+            PatternKind::Wildcard | PatternKind::Literal(_) | PatternKind::Rest(None) => {}
         }
     }
 
@@ -484,9 +482,10 @@ impl Compiler<'_> {
                 if !is_tensor {
                     return None;
                 }
-                state.variables.get(&sym).and_then(|(var, cl_type)| {
-                    (*cl_type == cl_types::I64).then_some((sym, *var))
-                })
+                state
+                    .variables
+                    .get(&sym)
+                    .and_then(|(var, cl_type)| (*cl_type == cl_types::I64).then_some((sym, *var)))
             })
             .collect();
 
@@ -3395,7 +3394,11 @@ impl Compiler<'_> {
         let fase_cfg = crate::fase::FaseConfig {
             accumulation: grad_accumulation_steps.max(1) as u32,
             optimizer: crate::fase::FaseOptimizer::parse(&optimizer_name),
-            grad_clip: if grad_clip < f64::MAX { Some(grad_clip) } else { None },
+            grad_clip: if grad_clip < f64::MAX {
+                Some(grad_clip)
+            } else {
+                None
+            },
             lr: lr_value,
             beta1: beta1_value,
             beta2: beta2_value,
@@ -3791,43 +3794,30 @@ impl Compiler<'_> {
             // — negligible cost vs kernel launches.
             use cranelift_codegen::ir::condcodes::IntCC;
             let k_seg = self.compile_string_literal(builder, "segment_ids")?;
-            let has_seg = self.compile_call_by_name(
-                builder,
-                "nsl_dict_contains",
-                &[batch_val, k_seg],
-            )?;
+            let has_seg =
+                self.compile_call_by_name(builder, "nsl_dict_contains", &[batch_val, k_seg])?;
             let has_seg_block = builder.create_block();
             let no_seg_block = builder.create_block();
             let after_block = builder.create_block();
             let has_seg_cond = builder.ins().icmp_imm(IntCC::NotEqual, has_seg, 0);
-            builder.ins().brif(has_seg_cond, has_seg_block, &[], no_seg_block, &[]);
+            builder
+                .ins()
+                .brif(has_seg_cond, has_seg_block, &[], no_seg_block, &[]);
 
             // Packing-enabled batch: extract device pointers and set the
             // registry. Both segment_ids and doc_starts must be present
             // together — the packer emits them as a pair.
             builder.switch_to_block(has_seg_block);
             builder.seal_block(has_seg_block);
-            let seg_tensor = self.compile_call_by_name(
-                builder,
-                "nsl_dict_get_str",
-                &[batch_val, k_seg],
-            )?;
+            let seg_tensor =
+                self.compile_call_by_name(builder, "nsl_dict_get_str", &[batch_val, k_seg])?;
             let k_doc = self.compile_string_literal(builder, "doc_starts")?;
-            let doc_tensor = self.compile_call_by_name(
-                builder,
-                "nsl_dict_get_str",
-                &[batch_val, k_doc],
-            )?;
-            let seg_data_ptr = self.compile_call_by_name(
-                builder,
-                "nsl_tensor_data_ptr",
-                &[seg_tensor],
-            )?;
-            let doc_data_ptr = self.compile_call_by_name(
-                builder,
-                "nsl_tensor_data_ptr",
-                &[doc_tensor],
-            )?;
+            let doc_tensor =
+                self.compile_call_by_name(builder, "nsl_dict_get_str", &[batch_val, k_doc])?;
+            let seg_data_ptr =
+                self.compile_call_by_name(builder, "nsl_tensor_data_ptr", &[seg_tensor])?;
+            let doc_data_ptr =
+                self.compile_call_by_name(builder, "nsl_tensor_data_ptr", &[doc_tensor])?;
             self.compile_call_by_name(
                 builder,
                 "nsl_packing_metadata_set",
@@ -3841,11 +3831,7 @@ impl Compiler<'_> {
             builder.switch_to_block(no_seg_block);
             builder.seal_block(no_seg_block);
             let zero = builder.ins().iconst(cl_types::I64, 0);
-            self.compile_call_by_name(
-                builder,
-                "nsl_packing_metadata_set",
-                &[zero, zero],
-            )?;
+            self.compile_call_by_name(builder, "nsl_packing_metadata_set", &[zero, zero])?;
             builder.ins().jump(after_block, &[]);
 
             builder.switch_to_block(after_block);
@@ -3894,7 +3880,10 @@ impl Compiler<'_> {
         // The downstream grads_list construction + accumulation loops are
         // skipped; grads_list is a null sentinel (i64 0).
         let fase_hook_active = fase_deferred && self.features.source_ad_enabled;
-        let (grads_list, loss_val, source_ad_loss_owned, mut wengert_freed_vals) = if self.features.source_ad_enabled {
+        let (grads_list, loss_val, source_ad_loss_owned, mut wengert_freed_vals) = if self
+            .features
+            .source_ad_enabled
+        {
             // === Source AD path (compile-time backward) ===
             eprintln!("[nsl] Using source-to-source AD for backward pass");
 
@@ -4086,7 +4075,9 @@ impl Compiler<'_> {
                             // of the decision silently no-opping.  Empty
                             // iterator when no layer is planned for pruning
                             // (shipped-binary common case).
-                            for diag in crate::wggo_overrides::collect_prune_diagnostics(&plan.applied) {
+                            for diag in
+                                crate::wggo_overrides::collect_prune_diagnostics(&plan.applied)
+                            {
                                 // Dispatch through `diag.reason` rather than
                                 // calling the reason-string helper directly,
                                 // so a future Prune-adjacent reason variant
@@ -4150,17 +4141,16 @@ impl Compiler<'_> {
                         // The dispatcher then silently falls back to per-op
                         // adjoints and the toy pretrain smoke never emits
                         // `nsl_flash_attention_csha_backward`.
-                        let csha_shape_override = self
-                            .kernels
-                            .flash_attention_context
-                            .as_ref()
-                            .map(|ctx| crate::wggo_cost::LayerShape {
-                                batch: 1,
-                                seq: 1024,
-                                d_model: 512,
-                                head_dim: ctx.config.head_dim as u64,
-                                n_kv_heads: 4,
-                                dtype_bytes: 2,
+                        let csha_shape_override =
+                            self.kernels.flash_attention_context.as_ref().map(|ctx| {
+                                crate::wggo_cost::LayerShape {
+                                    batch: 1,
+                                    seq: 1024,
+                                    d_model: 512,
+                                    head_dim: ctx.config.head_dim as u64,
+                                    n_kv_heads: 4,
+                                    dtype_bytes: 2,
+                                }
                             });
                         if let Some(plan) = crate::csha::run_on_wengert(
                             extractor.wengert_list(),
@@ -4221,15 +4211,16 @@ impl Compiler<'_> {
                                 extras.save_activations_for_backward = true;
                             }
                             self.last_csha_bridge = Some(bridge_out);
-                            for d in diags { eprintln!("warning: {d}"); }
+                            for d in diags {
+                                eprintln!("warning: {d}");
+                            }
                             // A.2.1d: record the Wengert op indices CSHA
                             // has claimed across all boundary chains so
                             // downstream passes (A.2.2 RMSNorm prologue,
                             // A.2.3 matmul projection, A.2.4 RoPE
                             // epilogue) can ask `is_csha_claimed(op)`
                             // before emitting a redundant launch.
-                            self.csha_claimed_ops =
-                                crate::csha_apply::collect_claimed_ops(&plan);
+                            self.csha_claimed_ops = crate::csha_apply::collect_claimed_ops(&plan);
                             // T7.1 / Gap D.1: build the chain-level dispatch
                             // map for the AD reverse walk. Gap D.1 passes the
                             // Wengert list so the dispatcher can resolve
@@ -4305,7 +4296,11 @@ impl Compiler<'_> {
                 // gets a stderr marker that Task 15 will upgrade to format_refusal output.
                 if let Some(ref applied_plan) = wggo_applied {
                     let empty_weight_map = crate::weight_aware::WeightMap::default();
-                    let weight_map_ref = self.features.weight_map.as_ref().unwrap_or(&empty_weight_map);
+                    let weight_map_ref = self
+                        .features
+                        .weight_map
+                        .as_ref()
+                        .unwrap_or(&empty_weight_map);
                     let wggo_prune_result = crate::wggo_prune::run(
                         extractor.wengert_list_mut(),
                         applied_plan,
@@ -4329,14 +4324,16 @@ impl Compiler<'_> {
                     // layer_index is looked up from applied_plan.layers by name match
                     // so we report the index the planner assigned, not the Vec position.
                     for rewrite in &wggo_prune_result.rewrites {
-                        let layer_index = applied_plan.layers.iter()
+                        let layer_index = applied_plan
+                            .layers
+                            .iter()
                             .find(|l| l.layer_name == rewrite.layer_name)
                             .map(|l| l.layer_index)
                             .unwrap_or(0);
                         let line = crate::wggo_prune::format_success_stderr(
                             rewrite,
                             layer_index,
-                            rewrite.ops_deleted,  // per-rewrite, not aggregate
+                            rewrite.ops_deleted, // per-rewrite, not aggregate
                         );
                         eprintln!("{line}");
                     }
@@ -4402,11 +4399,7 @@ impl Compiler<'_> {
                 let init_plan = {
                     let train_has_decorated = wrga_plan
                         .as_ref()
-                        .map(|p| {
-                            p.placements
-                                .iter()
-                                .any(|pl| pl.decorator_kind.is_some())
-                        })
+                        .map(|p| p.placements.iter().any(|pl| pl.decorator_kind.is_some()))
                         .unwrap_or(false);
                     if train_has_decorated {
                         wrga_plan.clone()
@@ -4458,8 +4451,7 @@ impl Compiler<'_> {
                             );
                             continue;
                         }
-                        if let Some(field) =
-                            current_layout.fields.iter().find(|f| &f.name == part)
+                        if let Some(field) = current_layout.fields.iter().find(|f| &f.name == part)
                         {
                             let offset = field.offset as i32;
                             let field_val = builder.ins().load(
@@ -4631,12 +4623,11 @@ impl Compiler<'_> {
                 if fase_hook_active {
                     // Build a compile-time name→index map from param_paths
                     // (param_paths[i] corresponds to accum_list[i]).
-                    let param_name_to_accum_idx: std::collections::HashMap<&str, i64> =
-                        param_paths
-                            .iter()
-                            .enumerate()
-                            .map(|(i, p)| (p.as_str(), i as i64))
-                            .collect();
+                    let param_name_to_accum_idx: std::collections::HashMap<&str, i64> = param_paths
+                        .iter()
+                        .enumerate()
+                        .map(|(i, p)| (p.as_str(), i as i64))
+                        .collect();
 
                     for (param_name, primal_vid) in extractor.named_param_var_ids() {
                         if !self.is_trainable_param_name(param_name) {
@@ -4674,9 +4665,7 @@ impl Compiler<'_> {
                     // The callback receives &mut Compiler explicitly so no
                     // double-borrow occurs.
                     let accum_val = accum_list.ok_or_else(|| {
-                        CodegenError::new(
-                            "fase_hook_active requires accum_list to be Some",
-                        )
+                        CodegenError::new("fase_hook_active requires accum_list to be Some")
                     })?;
                     let accum_scale = fase_plan.recipe.accum_scale;
                     let num_params = num_params_val;
@@ -4701,7 +4690,9 @@ impl Compiler<'_> {
                         // accum_list[accum_idx] == the m_partial for this param
                         // (both are param_paths-ordered).
                         let _ = entry.primal_val; // present for future alias detection
-                        let idx_val = b.ins().iconst(cranelift_codegen::ir::types::I64, entry.accum_idx);
+                        let idx_val = b
+                            .ins()
+                            .iconst(cranelift_codegen::ir::types::I64, entry.accum_idx);
                         let _ = num_params; // captured for guard assertions if needed
                         let _ = plist;
                         let m_partial =
@@ -4730,8 +4721,7 @@ impl Compiler<'_> {
                     }
                 } else {
                     match crate::wengert_lower::compile_wengert_ops(
-                        self, builder, state, &adjoint, full_vars,
-                        None,
+                        self, builder, state, &adjoint, full_vars, None,
                     ) {
                         Ok(gv) => gv,
                         Err(e) => {
@@ -4831,184 +4821,191 @@ impl Compiler<'_> {
                 // relying on a compile-time DFS path enumeration matching the
                 // runtime collector's traversal.
                 let grads = if !fase_hook_active {
-                let grads_inner = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
+                    let grads_inner = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
 
-                // 8a. Initialize one zero gradient per runtime parameter.
-                let fill_i_var = state.new_variable();
-                builder.declare_var(fill_i_var, cl_types::I64);
-                let fill_zero = builder.ins().iconst(cl_types::I64, 0);
-                builder.def_var(fill_i_var, fill_zero);
-                let fill_hdr = builder.create_block();
-                let fill_body = builder.create_block();
-                let fill_exit = builder.create_block();
-                builder.ins().jump(fill_hdr, &[]);
-                builder.switch_to_block(fill_hdr);
-                let fi = builder.use_var(fill_i_var);
-                let fc = builder
-                    .ins()
-                    .icmp(IntCC::SignedLessThan, fi, num_params_val);
-                builder.ins().brif(fc, fill_body, &[], fill_exit, &[]);
-                builder.switch_to_block(fill_body);
-                builder.seal_block(fill_body);
-                let p = self.compile_call_by_name(builder, "nsl_list_get", &[param_list, fi])?;
-                let z = self.compile_call_by_name(builder, "nsl_tensor_zeros_like", &[p])?;
-                self.compile_call_by_name(builder, "nsl_list_push", &[grads_inner, z])?;
-                let fill_one = builder.ins().iconst(cl_types::I64, 1);
-                let fill_next = builder.ins().iadd(fi, fill_one);
-                builder.def_var(fill_i_var, fill_next);
-                builder.ins().jump(fill_hdr, &[]);
-                builder.seal_block(fill_hdr);
-                builder.switch_to_block(fill_exit);
-                builder.seal_block(fill_exit);
-                state.current_block = Some(fill_exit);
+                    // 8a. Initialize one zero gradient per runtime parameter.
+                    let fill_i_var = state.new_variable();
+                    builder.declare_var(fill_i_var, cl_types::I64);
+                    let fill_zero = builder.ins().iconst(cl_types::I64, 0);
+                    builder.def_var(fill_i_var, fill_zero);
+                    let fill_hdr = builder.create_block();
+                    let fill_body = builder.create_block();
+                    let fill_exit = builder.create_block();
+                    builder.ins().jump(fill_hdr, &[]);
+                    builder.switch_to_block(fill_hdr);
+                    let fi = builder.use_var(fill_i_var);
+                    let fc = builder
+                        .ins()
+                        .icmp(IntCC::SignedLessThan, fi, num_params_val);
+                    builder.ins().brif(fc, fill_body, &[], fill_exit, &[]);
+                    builder.switch_to_block(fill_body);
+                    builder.seal_block(fill_body);
+                    let p =
+                        self.compile_call_by_name(builder, "nsl_list_get", &[param_list, fi])?;
+                    let z = self.compile_call_by_name(builder, "nsl_tensor_zeros_like", &[p])?;
+                    self.compile_call_by_name(builder, "nsl_list_push", &[grads_inner, z])?;
+                    let fill_one = builder.ins().iconst(cl_types::I64, 1);
+                    let fill_next = builder.ins().iadd(fi, fill_one);
+                    builder.def_var(fill_i_var, fill_next);
+                    builder.ins().jump(fill_hdr, &[]);
+                    builder.seal_block(fill_hdr);
+                    builder.switch_to_block(fill_exit);
+                    builder.seal_block(fill_exit);
+                    state.current_block = Some(fill_exit);
 
-                // 8b. Replace zero slots with actual source-AD gradients by
-                // scanning the runtime param_list for each resolved parameter
-                // leaf from the extracted forward graph.
-                let tensor_param_paths: std::collections::HashSet<String> = self
-                    .enumerate_all_model_tensor_paths(&model_var_name, &model_type_name)
-                    .into_iter()
-                    .collect();
-                let trainable_tensor_param_paths: std::collections::HashSet<String> =
-                    tensor_param_paths
-                        .iter()
-                        .filter(|path| self.is_trainable_param_name(path))
-                        .cloned()
+                    // 8b. Replace zero slots with actual source-AD gradients by
+                    // scanning the runtime param_list for each resolved parameter
+                    // leaf from the extracted forward graph.
+                    let tensor_param_paths: std::collections::HashSet<String> = self
+                        .enumerate_all_model_tensor_paths(&model_var_name, &model_type_name)
+                        .into_iter()
                         .collect();
-                let mut seen_trainable_tensor_params: std::collections::HashSet<String> =
-                    std::collections::HashSet::new();
+                    let trainable_tensor_param_paths: std::collections::HashSet<String> =
+                        tensor_param_paths
+                            .iter()
+                            .filter(|path| self.is_trainable_param_name(path))
+                            .cloned()
+                            .collect();
+                    let mut seen_trainable_tensor_params: std::collections::HashSet<String> =
+                        std::collections::HashSet::new();
 
-                let mut grad_connected = 0usize;
-                let mut grad_ignored_config_tensor = 0usize;
-                let mut grad_ignored_non_tensor = 0usize;
-                let mut grad_skipped_no_primal = 0usize;
-                let mut grad_skipped_no_adjoint = 0usize;
-                let mut grad_skipped_no_lowered = 0usize;
-                for (param_name, vid) in extractor.named_param_var_ids() {
-                    match classify_source_ad_param_name(param_name, &tensor_param_paths) {
-                        SourceAdParamDiagnosticKind::Trainable => {
-                            seen_trainable_tensor_params.insert(param_name.clone());
+                    let mut grad_connected = 0usize;
+                    let mut grad_ignored_config_tensor = 0usize;
+                    let mut grad_ignored_non_tensor = 0usize;
+                    let mut grad_skipped_no_primal = 0usize;
+                    let mut grad_skipped_no_adjoint = 0usize;
+                    let mut grad_skipped_no_lowered = 0usize;
+                    for (param_name, vid) in extractor.named_param_var_ids() {
+                        match classify_source_ad_param_name(param_name, &tensor_param_paths) {
+                            SourceAdParamDiagnosticKind::Trainable => {
+                                seen_trainable_tensor_params.insert(param_name.clone());
+                            }
+                            SourceAdParamDiagnosticKind::IgnoredConfig => {
+                                grad_ignored_config_tensor += 1;
+                                continue;
+                            }
+                            SourceAdParamDiagnosticKind::IgnoredNonTensor => {
+                                grad_ignored_non_tensor += 1;
+                                continue;
+                            }
                         }
-                        SourceAdParamDiagnosticKind::IgnoredConfig => {
-                            grad_ignored_config_tensor += 1;
+                        let Some(param_ptr) = full_vars.get(vid).copied() else {
+                            eprintln!("[nsl] source AD: param '{}' has no primal value (VarId {:?} not in full_vars)", param_name, vid);
+                            grad_skipped_no_primal += 1;
+                            continue;
+                        };
+                        let Some(adj_vid) = gen.adjoint_of(*vid) else {
+                            eprintln!("[nsl] source AD: param '{}' has no adjoint (VarId {:?} — no gradient generated)", param_name, vid);
+                            grad_skipped_no_adjoint += 1;
+                            continue;
+                        };
+                        let Some(grad_val) = grad_vars.get(&adj_vid).copied() else {
+                            eprintln!("[nsl] source AD: param '{}' adjoint VarId {:?} not in lowered grad vars (cascade skip)", param_name, adj_vid);
+                            grad_skipped_no_lowered += 1;
+                            continue;
+                        };
+                        grad_connected += 1;
+
+                        // WRGA B.3.2 Option 3: adapter-injected params (lora_A_*,
+                        // lora_B_*, ia3_scale_*, gate_*) are NOT in the runtime
+                        // param_list (the runtime list is built from
+                        // `enumerate_model_tensor_paths`, which excludes side-table
+                        // entries). Skip the align-with-runtime scan for them —
+                        // we count them as connected for the gradient-summary
+                        // diagnostic but don't emit the `nsl_assert` that would
+                        // always fire "missing param" for these paths.
+                        let leaf = param_name.rsplit('.').next().unwrap_or(param_name.as_str());
+                        if crate::expr::access::is_synthesized_adapter_field_name(leaf) {
                             continue;
                         }
-                        SourceAdParamDiagnosticKind::IgnoredNonTensor => {
-                            grad_ignored_non_tensor += 1;
-                            continue;
-                        }
+
+                        let scan_i_var = state.new_variable();
+                        let scan_match_count_var = state.new_variable();
+                        builder.declare_var(scan_i_var, cl_types::I64);
+                        builder.declare_var(scan_match_count_var, cl_types::I64);
+                        let scan_zero = builder.ins().iconst(cl_types::I64, 0);
+                        builder.def_var(scan_i_var, scan_zero);
+                        builder.def_var(scan_match_count_var, scan_zero);
+
+                        let scan_hdr = builder.create_block();
+                        let scan_body = builder.create_block();
+                        let scan_match = builder.create_block();
+                        let scan_next = builder.create_block();
+                        let scan_exit = builder.create_block();
+
+                        builder.ins().jump(scan_hdr, &[]);
+                        builder.switch_to_block(scan_hdr);
+                        let si = builder.use_var(scan_i_var);
+                        let scan_cond =
+                            builder
+                                .ins()
+                                .icmp(IntCC::SignedLessThan, si, num_params_val);
+                        builder
+                            .ins()
+                            .brif(scan_cond, scan_body, &[], scan_exit, &[]);
+
+                        builder.switch_to_block(scan_body);
+                        builder.seal_block(scan_body);
+                        let runtime_param =
+                            self.compile_call_by_name(builder, "nsl_list_get", &[param_list, si])?;
+                        let is_match = builder.ins().icmp(IntCC::Equal, runtime_param, param_ptr);
+                        builder
+                            .ins()
+                            .brif(is_match, scan_match, &[], scan_next, &[]);
+
+                        builder.switch_to_block(scan_match);
+                        builder.seal_block(scan_match);
+                        let old_grad =
+                            self.compile_call_by_name(builder, "nsl_list_get", &[grads_inner, si])?;
+                        // ELTLS (FBIP-3): nsl_tensor_add takes a flags byte (flags=0 here).
+                        let flags_zero = builder.ins().iconst(cl_types::I8, 0);
+                        let summed_grad = self.compile_call_by_name(
+                            builder,
+                            "nsl_tensor_add",
+                            &[old_grad, grad_val, flags_zero],
+                        )?;
+                        let match_count = builder.use_var(scan_match_count_var);
+                        let match_one = builder.ins().iconst(cl_types::I64, 1);
+                        let next_match_count = builder.ins().iadd(match_count, match_one);
+                        builder.def_var(scan_match_count_var, next_match_count);
+                        self.compile_call_by_name(builder, "nsl_tensor_free", &[old_grad])?;
+                        self.compile_call_by_name(
+                            builder,
+                            "nsl_list_set",
+                            &[grads_inner, si, summed_grad],
+                        )?;
+                        builder.ins().jump(scan_next, &[]);
+
+                        builder.switch_to_block(scan_next);
+                        builder.seal_block(scan_next);
+                        let scan_one = builder.ins().iconst(cl_types::I64, 1);
+                        let scan_inc = builder.ins().iadd(si, scan_one);
+                        builder.def_var(scan_i_var, scan_inc);
+                        builder.ins().jump(scan_hdr, &[]);
+
+                        builder.seal_block(scan_hdr);
+                        builder.switch_to_block(scan_exit);
+                        builder.seal_block(scan_exit);
+                        let match_count = builder.use_var(scan_match_count_var);
+                        let matched = builder.ins().icmp_imm(IntCC::NotEqual, match_count, 0);
+                        let missing_msg = format!(
+                            "source AD gradient could not be aligned with runtime param list: {}",
+                            param_name,
+                        );
+                        self.intern_string(&missing_msg)?;
+                        let missing_msg_ptr = self.compile_string_literal(builder, &missing_msg)?;
+                        self.compile_call_by_name(
+                            builder,
+                            "nsl_assert",
+                            &[matched, missing_msg_ptr],
+                        )?;
+                        state.current_block = Some(scan_exit);
                     }
-                    let Some(param_ptr) = full_vars.get(vid).copied() else {
-                        eprintln!("[nsl] source AD: param '{}' has no primal value (VarId {:?} not in full_vars)", param_name, vid);
-                        grad_skipped_no_primal += 1;
-                        continue;
-                    };
-                    let Some(adj_vid) = gen.adjoint_of(*vid) else {
-                        eprintln!("[nsl] source AD: param '{}' has no adjoint (VarId {:?} — no gradient generated)", param_name, vid);
-                        grad_skipped_no_adjoint += 1;
-                        continue;
-                    };
-                    let Some(grad_val) = grad_vars.get(&adj_vid).copied() else {
-                        eprintln!("[nsl] source AD: param '{}' adjoint VarId {:?} not in lowered grad vars (cascade skip)", param_name, adj_vid);
-                        grad_skipped_no_lowered += 1;
-                        continue;
-                    };
-                    grad_connected += 1;
 
-                    // WRGA B.3.2 Option 3: adapter-injected params (lora_A_*,
-                    // lora_B_*, ia3_scale_*, gate_*) are NOT in the runtime
-                    // param_list (the runtime list is built from
-                    // `enumerate_model_tensor_paths`, which excludes side-table
-                    // entries). Skip the align-with-runtime scan for them —
-                    // we count them as connected for the gradient-summary
-                    // diagnostic but don't emit the `nsl_assert` that would
-                    // always fire "missing param" for these paths.
-                    let leaf = param_name
-                        .rsplit('.')
-                        .next()
-                        .unwrap_or(param_name.as_str());
-                    if crate::expr::access::is_synthesized_adapter_field_name(leaf) {
-                        continue;
-                    }
-
-                    let scan_i_var = state.new_variable();
-                    let scan_match_count_var = state.new_variable();
-                    builder.declare_var(scan_i_var, cl_types::I64);
-                    builder.declare_var(scan_match_count_var, cl_types::I64);
-                    let scan_zero = builder.ins().iconst(cl_types::I64, 0);
-                    builder.def_var(scan_i_var, scan_zero);
-                    builder.def_var(scan_match_count_var, scan_zero);
-
-                    let scan_hdr = builder.create_block();
-                    let scan_body = builder.create_block();
-                    let scan_match = builder.create_block();
-                    let scan_next = builder.create_block();
-                    let scan_exit = builder.create_block();
-
-                    builder.ins().jump(scan_hdr, &[]);
-                    builder.switch_to_block(scan_hdr);
-                    let si = builder.use_var(scan_i_var);
-                    let scan_cond = builder
-                        .ins()
-                        .icmp(IntCC::SignedLessThan, si, num_params_val);
-                    builder
-                        .ins()
-                        .brif(scan_cond, scan_body, &[], scan_exit, &[]);
-
-                    builder.switch_to_block(scan_body);
-                    builder.seal_block(scan_body);
-                    let runtime_param =
-                        self.compile_call_by_name(builder, "nsl_list_get", &[param_list, si])?;
-                    let is_match = builder.ins().icmp(IntCC::Equal, runtime_param, param_ptr);
-                    builder
-                        .ins()
-                        .brif(is_match, scan_match, &[], scan_next, &[]);
-
-                    builder.switch_to_block(scan_match);
-                    builder.seal_block(scan_match);
-                    let old_grad =
-                        self.compile_call_by_name(builder, "nsl_list_get", &[grads_inner, si])?;
-                    // ELTLS (FBIP-3): nsl_tensor_add takes a flags byte (flags=0 here).
-                    let flags_zero = builder.ins().iconst(cl_types::I8, 0);
-                    let summed_grad = self.compile_call_by_name(
-                        builder,
-                        "nsl_tensor_add",
-                        &[old_grad, grad_val, flags_zero],
-                    )?;
-                    let match_count = builder.use_var(scan_match_count_var);
-                    let match_one = builder.ins().iconst(cl_types::I64, 1);
-                    let next_match_count = builder.ins().iadd(match_count, match_one);
-                    builder.def_var(scan_match_count_var, next_match_count);
-                    self.compile_call_by_name(builder, "nsl_tensor_free", &[old_grad])?;
-                    self.compile_call_by_name(builder, "nsl_list_set", &[grads_inner, si, summed_grad])?;
-                    builder.ins().jump(scan_next, &[]);
-
-                    builder.switch_to_block(scan_next);
-                    builder.seal_block(scan_next);
-                    let scan_one = builder.ins().iconst(cl_types::I64, 1);
-                    let scan_inc = builder.ins().iadd(si, scan_one);
-                    builder.def_var(scan_i_var, scan_inc);
-                    builder.ins().jump(scan_hdr, &[]);
-
-                    builder.seal_block(scan_hdr);
-                    builder.switch_to_block(scan_exit);
-                    builder.seal_block(scan_exit);
-                    let match_count = builder.use_var(scan_match_count_var);
-                    let matched = builder.ins().icmp_imm(IntCC::NotEqual, match_count, 0);
-                    let missing_msg = format!(
-                        "source AD gradient could not be aligned with runtime param list: {}",
-                        param_name,
-                    );
-                    self.intern_string(&missing_msg)?;
-                    let missing_msg_ptr = self.compile_string_literal(builder, &missing_msg)?;
-                    self.compile_call_by_name(builder, "nsl_assert", &[matched, missing_msg_ptr])?;
-                    state.current_block = Some(scan_exit);
-                }
-
-                let grad_missing_trainable = trainable_tensor_param_paths
-                    .len()
-                    .saturating_sub(seen_trainable_tensor_params.len());
-                eprintln!(
+                    let grad_missing_trainable = trainable_tensor_param_paths
+                        .len()
+                        .saturating_sub(seen_trainable_tensor_params.len());
+                    eprintln!(
                     "[nsl] source AD gradient summary: {}/{} trainable tensor params connected, {} missing-from-forward, {} no-primal, {} no-adjoint, {} cascade-skip, {} ignored config-tensor, {} ignored non-tensor",
                     grad_connected,
                     trainable_tensor_param_paths.len(),
@@ -5019,7 +5016,7 @@ impl Compiler<'_> {
                     grad_ignored_config_tensor,
                     grad_ignored_non_tensor,
                 );
-                grads_inner // value returned from the `if !fase_hook_active` arm
+                    grads_inner // value returned from the `if !fase_hook_active` arm
                 } else {
                     // Hook consumed all param grads during adjoint lowering.
                     // Emit a null sentinel — downstream grads_list consumers are
@@ -5042,7 +5039,8 @@ impl Compiler<'_> {
 
                 // Collect all Cranelift Values freed by the Wengert cleanup so the
                 // step-variable sweep (below) doesn't double-free them.
-                let mut wengert_freed: std::collections::HashSet<Value> = std::collections::HashSet::new();
+                let mut wengert_freed: std::collections::HashSet<Value> =
+                    std::collections::HashSet::new();
                 for (vid, val, _) in &grad_lowered.owned_values {
                     if !freed_adjoint_vars.contains(vid) {
                         wengert_freed.insert(*val);
@@ -5093,17 +5091,9 @@ impl Compiler<'_> {
 
             // (a) Record loss: scalarize loss_val and call
             //     nsl_health_record_loss(loss_scalar, step).
-            let loss_scalar = self.compile_call_by_name(
-                builder,
-                "nsl_tensor_item",
-                &[loss_val],
-            )?;
+            let loss_scalar = self.compile_call_by_name(builder, "nsl_tensor_item", &[loss_val])?;
             let step_now = builder.use_var(step_count_var);
-            self.compile_call_by_name(
-                builder,
-                "nsl_health_record_loss",
-                &[loss_scalar, step_now],
-            )?;
+            self.compile_call_by_name(builder, "nsl_health_record_loss", &[loss_scalar, step_now])?;
 
             // Precompute step-gating flags shared by grad/weight/flush hooks.
             let zero_i64_h = builder.ins().iconst(cl_types::I64, 0);
@@ -5125,25 +5115,14 @@ impl Compiler<'_> {
                 let path_data_id = self.intern_string(path)?;
                 let gv = self.module.declare_data_in_func(path_data_id, builder.func);
                 let path_ptr = builder.ins().symbol_value(cl_types::I64, gv);
-                let path_len = builder
-                    .ins()
-                    .iconst(cl_types::I64, path.len() as i64);
+                let path_len = builder.ins().iconst(cl_types::I64, path.len() as i64);
                 let layer_idx = parse_layer_idx_for_health(path);
-                let layer_idx_val = builder
-                    .ins()
-                    .iconst(cl_types::I32, layer_idx as i64);
+                let layer_idx_val = builder.ins().iconst(cl_types::I32, layer_idx as i64);
 
                 let idx_val = builder.ins().iconst(cl_types::I64, i as i64);
-                let grad = self.compile_call_by_name(
-                    builder,
-                    "nsl_list_get",
-                    &[grads_list, idx_val],
-                )?;
-                let gnorm = self.compile_call_by_name(
-                    builder,
-                    "nsl_tensor_l2_norm",
-                    &[grad],
-                )?;
+                let grad =
+                    self.compile_call_by_name(builder, "nsl_list_get", &[grads_list, idx_val])?;
+                let gnorm = self.compile_call_by_name(builder, "nsl_tensor_l2_norm", &[grad])?;
                 self.compile_call_by_name(
                     builder,
                     "nsl_health_record_grad_norm",
@@ -5167,20 +5146,11 @@ impl Compiler<'_> {
                 let path_data_id = self.intern_string(path)?;
                 let gv = self.module.declare_data_in_func(path_data_id, builder.func);
                 let path_ptr = builder.ins().symbol_value(cl_types::I64, gv);
-                let path_len = builder
-                    .ins()
-                    .iconst(cl_types::I64, path.len() as i64);
+                let path_len = builder.ins().iconst(cl_types::I64, path.len() as i64);
                 let idx_val = builder.ins().iconst(cl_types::I64, i as i64);
-                let param = self.compile_call_by_name(
-                    builder,
-                    "nsl_list_get",
-                    &[param_list, idx_val],
-                )?;
-                let wnorm = self.compile_call_by_name(
-                    builder,
-                    "nsl_tensor_l2_norm",
-                    &[param],
-                )?;
+                let param =
+                    self.compile_call_by_name(builder, "nsl_list_get", &[param_list, idx_val])?;
+                let wnorm = self.compile_call_by_name(builder, "nsl_tensor_l2_norm", &[param])?;
                 // is_init flag: 1 iff step == 0.
                 let step_cmp = builder.use_var(step_count_var);
                 let zero_cmp = builder.ins().iconst(cl_types::I64, 0);
@@ -5207,14 +5177,8 @@ impl Compiler<'_> {
             let snap_data_id = self.intern_string(&snap_path)?;
             let snap_gv = self.module.declare_data_in_func(snap_data_id, builder.func);
             let snap_ptr = builder.ins().symbol_value(cl_types::I64, snap_gv);
-            let snap_len = builder
-                .ins()
-                .iconst(cl_types::I64, snap_path.len() as i64);
-            self.compile_call_by_name(
-                builder,
-                "nsl_health_flush_snapshot",
-                &[snap_ptr, snap_len],
-            )?;
+            let snap_len = builder.ins().iconst(cl_types::I64, snap_path.len() as i64);
+            self.compile_call_by_name(builder, "nsl_health_flush_snapshot", &[snap_ptr, snap_len])?;
 
             builder.ins().jump(after_wnorm, &[]);
             builder.switch_to_block(after_wnorm);
@@ -5258,125 +5222,130 @@ impl Compiler<'_> {
         }
 
         if !fase_hook_active {
-        if let Some(accum) = accum_list {
-            // When two_phase_clip is active, Phase A (in the optimizer block) handles
-            // the final micro-batch's accumulation as part of the fused accumulate+sum_sq
-            // pass.  Skip the standard accumulation loop on the final micro-batch to
-            // avoid double-accumulating.
-            let run_standard_accum = if fase_plan.two_phase_clip {
-                // Emit a runtime conditional: skip the loop when should_step == true.
-                let pre_accum_skip = builder.create_block();
-                let pre_accum_run = builder.create_block();
-                let pre_accum_join = builder.create_block();
-                let ss_check = builder.use_var(should_step_var);
-                builder.ins().brif(ss_check, pre_accum_skip, &[], pre_accum_run, &[]);
+            if let Some(accum) = accum_list {
+                // When two_phase_clip is active, Phase A (in the optimizer block) handles
+                // the final micro-batch's accumulation as part of the fused accumulate+sum_sq
+                // pass.  Skip the standard accumulation loop on the final micro-batch to
+                // avoid double-accumulating.
+                let run_standard_accum = if fase_plan.two_phase_clip {
+                    // Emit a runtime conditional: skip the loop when should_step == true.
+                    let pre_accum_skip = builder.create_block();
+                    let pre_accum_run = builder.create_block();
+                    let pre_accum_join = builder.create_block();
+                    let ss_check = builder.use_var(should_step_var);
+                    builder
+                        .ins()
+                        .brif(ss_check, pre_accum_skip, &[], pre_accum_run, &[]);
 
-                builder.switch_to_block(pre_accum_run);
-                builder.seal_block(pre_accum_run);
-                // Standard accumulation loop lives here; we fall into the shared
-                // emission below via the `run_standard_accum` flag.
-                // (We use a sentinel to tell the loop-emission code which block to
-                // land in after the loop; the join block is pre_accum_join.)
-                Some((pre_accum_skip, pre_accum_join))
-            } else {
-                None
-            };
+                    builder.switch_to_block(pre_accum_run);
+                    builder.seal_block(pre_accum_run);
+                    // Standard accumulation loop lives here; we fall into the shared
+                    // emission below via the `run_standard_accum` flag.
+                    // (We use a sentinel to tell the loop-emission code which block to
+                    // land in after the loop; the join block is pre_accum_join.)
+                    Some((pre_accum_skip, pre_accum_join))
+                } else {
+                    None
+                };
 
-            // Runtime loop: accum[i] += grads[i], then free grads[i]
-            let ga_i_var = state.new_variable();
-            builder.declare_var(ga_i_var, cl_types::I64);
-            let ga_zero = builder.ins().iconst(cl_types::I64, 0);
-            builder.def_var(ga_i_var, ga_zero);
-            let ga_hdr = builder.create_block();
-            let ga_body = builder.create_block();
-            let ga_exit = builder.create_block();
-            builder.ins().jump(ga_hdr, &[]);
-            builder.switch_to_block(ga_hdr);
-            let gai = builder.use_var(ga_i_var);
-            let gac = builder
-                .ins()
-                .icmp(IntCC::SignedLessThan, gai, num_params_val);
-            builder.ins().brif(gac, ga_body, &[], ga_exit, &[]);
-            builder.switch_to_block(ga_body);
-            builder.seal_block(ga_body);
-            let accum_buf = self.compile_call_by_name(builder, "nsl_list_get", &[accum, gai])?;
-            let grad = self.compile_call_by_name(builder, "nsl_list_get", &[grads_list, gai])?;
-            if let Some(mtb) = mode_table_base {
-                // FASE Codegen Phase 2: per-param dispatch via runtime byte load.
-                let ga_deferred = builder.create_block();
-                let ga_fullbuf = builder.create_block();
-                let ga_join = builder.create_block();
+                // Runtime loop: accum[i] += grads[i], then free grads[i]
+                let ga_i_var = state.new_variable();
+                builder.declare_var(ga_i_var, cl_types::I64);
+                let ga_zero = builder.ins().iconst(cl_types::I64, 0);
+                builder.def_var(ga_i_var, ga_zero);
+                let ga_hdr = builder.create_block();
+                let ga_body = builder.create_block();
+                let ga_exit = builder.create_block();
+                builder.ins().jump(ga_hdr, &[]);
+                builder.switch_to_block(ga_hdr);
+                let gai = builder.use_var(ga_i_var);
+                let gac = builder
+                    .ins()
+                    .icmp(IntCC::SignedLessThan, gai, num_params_val);
+                builder.ins().brif(gac, ga_body, &[], ga_exit, &[]);
+                builder.switch_to_block(ga_body);
+                builder.seal_block(ga_body);
+                let accum_buf =
+                    self.compile_call_by_name(builder, "nsl_list_get", &[accum, gai])?;
+                let grad =
+                    self.compile_call_by_name(builder, "nsl_list_get", &[grads_list, gai])?;
+                if let Some(mtb) = mode_table_base {
+                    // FASE Codegen Phase 2: per-param dispatch via runtime byte load.
+                    let ga_deferred = builder.create_block();
+                    let ga_fullbuf = builder.create_block();
+                    let ga_join = builder.create_block();
 
-                self.emit_fase_mode_branch(builder, mtb, gai, ga_deferred, ga_fullbuf);
+                    self.emit_fase_mode_branch(builder, mtb, gai, ga_deferred, ga_fullbuf);
 
-                // Deferred path
-                builder.switch_to_block(ga_deferred);
-                builder.seal_block(ga_deferred);
-                self.fase_emit_accumulate(
-                    builder,
-                    accum_buf,
-                    grad,
-                    fase_plan.recipe.accum_scale,
-                )?;
-                builder.ins().jump(ga_join, &[]);
+                    // Deferred path
+                    builder.switch_to_block(ga_deferred);
+                    builder.seal_block(ga_deferred);
+                    self.fase_emit_accumulate(
+                        builder,
+                        accum_buf,
+                        grad,
+                        fase_plan.recipe.accum_scale,
+                    )?;
+                    builder.ins().jump(ga_join, &[]);
 
-                // FullBuffer path
-                builder.switch_to_block(ga_fullbuf);
-                builder.seal_block(ga_fullbuf);
-                let n_elems =
-                    self.compile_call_by_name(builder, "nsl_tensor_len", &[accum_buf])?;
-                self.compile_call_by_name(
-                    builder,
-                    "nsl_grad_accumulate_add",
-                    &[accum_buf, grad, n_elems],
-                )?;
-                builder.ins().jump(ga_join, &[]);
+                    // FullBuffer path
+                    builder.switch_to_block(ga_fullbuf);
+                    builder.seal_block(ga_fullbuf);
+                    let n_elems =
+                        self.compile_call_by_name(builder, "nsl_tensor_len", &[accum_buf])?;
+                    self.compile_call_by_name(
+                        builder,
+                        "nsl_grad_accumulate_add",
+                        &[accum_buf, grad, n_elems],
+                    )?;
+                    builder.ins().jump(ga_join, &[]);
 
-                // Join — single tensor_free regardless of path
-                builder.switch_to_block(ga_join);
-                builder.seal_block(ga_join);
-            } else if fase_deferred {
-                // Pre-Phase-2 monolithic Deferred path (byte-identical when no overrides).
-                // FASE Deferred: m_partial += (1/N) * grad  (scaled accumulation)
-                self.fase_emit_accumulate(
-                    builder,
-                    accum_buf,
-                    grad,
-                    fase_plan.recipe.accum_scale,
-                )?;
-            } else {
-                // Pre-Phase-2 monolithic FullBuffer path (byte-identical).
-                // Existing path: raw gradient sum (divided / zeroed after optimizer step)
-                let n_elems = self.compile_call_by_name(builder, "nsl_tensor_len", &[accum_buf])?;
-                self.compile_call_by_name(
-                    builder,
-                    "nsl_grad_accumulate_add",
-                    &[accum_buf, grad, n_elems],
-                )?;
+                    // Join — single tensor_free regardless of path
+                    builder.switch_to_block(ga_join);
+                    builder.seal_block(ga_join);
+                } else if fase_deferred {
+                    // Pre-Phase-2 monolithic Deferred path (byte-identical when no overrides).
+                    // FASE Deferred: m_partial += (1/N) * grad  (scaled accumulation)
+                    self.fase_emit_accumulate(
+                        builder,
+                        accum_buf,
+                        grad,
+                        fase_plan.recipe.accum_scale,
+                    )?;
+                } else {
+                    // Pre-Phase-2 monolithic FullBuffer path (byte-identical).
+                    // Existing path: raw gradient sum (divided / zeroed after optimizer step)
+                    let n_elems =
+                        self.compile_call_by_name(builder, "nsl_tensor_len", &[accum_buf])?;
+                    self.compile_call_by_name(
+                        builder,
+                        "nsl_grad_accumulate_add",
+                        &[accum_buf, grad, n_elems],
+                    )?;
+                }
+                self.compile_call_by_name(builder, "nsl_tensor_free", &[grad])?;
+                let ga_one = builder.ins().iconst(cl_types::I64, 1);
+                let ga_next = builder.ins().iadd(gai, ga_one);
+                builder.def_var(ga_i_var, ga_next);
+                builder.ins().jump(ga_hdr, &[]);
+                builder.seal_block(ga_hdr);
+                builder.switch_to_block(ga_exit);
+                builder.seal_block(ga_exit);
+                state.current_block = Some(ga_exit);
+                self.compile_call_by_name(builder, "nsl_list_free", &[grads_list])?;
+
+                // If two_phase_clip gated the loop: jump to join, then wire the skip
+                // path in, and continue from join.
+                if let Some((skip_block, join_block)) = run_standard_accum {
+                    builder.ins().jump(join_block, &[]);
+                    builder.switch_to_block(skip_block);
+                    builder.seal_block(skip_block);
+                    builder.ins().jump(join_block, &[]);
+                    builder.switch_to_block(join_block);
+                    builder.seal_block(join_block);
+                    state.current_block = Some(join_block);
+                }
             }
-            self.compile_call_by_name(builder, "nsl_tensor_free", &[grad])?;
-            let ga_one = builder.ins().iconst(cl_types::I64, 1);
-            let ga_next = builder.ins().iadd(gai, ga_one);
-            builder.def_var(ga_i_var, ga_next);
-            builder.ins().jump(ga_hdr, &[]);
-            builder.seal_block(ga_hdr);
-            builder.switch_to_block(ga_exit);
-            builder.seal_block(ga_exit);
-            state.current_block = Some(ga_exit);
-            self.compile_call_by_name(builder, "nsl_list_free", &[grads_list])?;
-
-            // If two_phase_clip gated the loop: jump to join, then wire the skip
-            // path in, and continue from join.
-            if let Some((skip_block, join_block)) = run_standard_accum {
-                builder.ins().jump(join_block, &[]);
-                builder.switch_to_block(skip_block);
-                builder.seal_block(skip_block);
-                builder.ins().jump(join_block, &[]);
-                builder.switch_to_block(join_block);
-                builder.seal_block(join_block);
-                state.current_block = Some(join_block);
-            }
-        }
         } // end if !fase_hook_active (per-micro-batch accumulation guard)
 
         // 7e4. Gradient accumulation gate: only step optimizer every N batches
@@ -5574,8 +5543,9 @@ impl Compiler<'_> {
                     builder.ins().jump(pa_hdr, &[]);
                     builder.switch_to_block(pa_hdr);
                     let pa_i = builder.use_var(pa_i_var);
-                    let pa_cont =
-                        builder.ins().icmp(IntCC::SignedLessThan, pa_i, num_params_val);
+                    let pa_cont = builder
+                        .ins()
+                        .icmp(IntCC::SignedLessThan, pa_i, num_params_val);
                     builder.ins().brif(pa_cont, pa_body, &[], pa_exit, &[]);
                     builder.switch_to_block(pa_body);
                     builder.seal_block(pa_body);
@@ -5604,11 +5574,8 @@ impl Compiler<'_> {
                         )?;
                         self.compile_call_by_name(builder, "nsl_tensor_free", &[pa_grad])?;
                     }
-                    let pa_sq = self.compile_call_by_name(
-                        builder,
-                        "nsl_tensor_sum_sq",
-                        &[pa_mpart],
-                    )?;
+                    let pa_sq =
+                        self.compile_call_by_name(builder, "nsl_tensor_sum_sq", &[pa_mpart])?;
                     let pa_tot_cur = builder.use_var(pa_tot_var);
                     let pa_tot_new = builder.ins().fadd(pa_tot_cur, pa_sq);
                     builder.def_var(pa_tot_var, pa_tot_new);
@@ -5650,8 +5617,9 @@ impl Compiler<'_> {
                     builder.ins().jump(pb_hdr, &[]);
                     builder.switch_to_block(pb_hdr);
                     let pb_i = builder.use_var(pb_i_var);
-                    let pb_cont =
-                        builder.ins().icmp(IntCC::SignedLessThan, pb_i, num_params_val);
+                    let pb_cont = builder
+                        .ins()
+                        .icmp(IntCC::SignedLessThan, pb_i, num_params_val);
                     builder.ins().brif(pb_cont, pb_body, &[], pb_exit, &[]);
                     builder.switch_to_block(pb_body);
                     builder.seal_block(pb_body);
@@ -5663,22 +5631,12 @@ impl Compiler<'_> {
                         "nsl_tensor_mul_scalar_inplace",
                         &[pb_mpart, clip_factor],
                     )?;
-                    let pb_theta = self.compile_call_by_name(
-                        builder,
-                        "nsl_list_get",
-                        &[param_list, pb_i],
-                    )?;
-                    let pb_m = self.compile_call_by_name(
-                        builder,
-                        "nsl_list_get",
-                        &[state_list_1, pb_i],
-                    )?;
+                    let pb_theta =
+                        self.compile_call_by_name(builder, "nsl_list_get", &[param_list, pb_i])?;
+                    let pb_m =
+                        self.compile_call_by_name(builder, "nsl_list_get", &[state_list_1, pb_i])?;
                     let pb_v = if num_state_buffers >= 2 {
-                        self.compile_call_by_name(
-                            builder,
-                            "nsl_list_get",
-                            &[state_list_2, pb_i],
-                        )?
+                        self.compile_call_by_name(builder, "nsl_list_get", &[state_list_2, pb_i])?
                     } else {
                         pb_m
                     };
@@ -5712,8 +5670,9 @@ impl Compiler<'_> {
                     builder.ins().jump(fs_hdr, &[]);
                     builder.switch_to_block(fs_hdr);
                     let fs_i = builder.use_var(fs_i_var);
-                    let fs_cont =
-                        builder.ins().icmp(IntCC::SignedLessThan, fs_i, num_params_val);
+                    let fs_cont = builder
+                        .ins()
+                        .icmp(IntCC::SignedLessThan, fs_i, num_params_val);
                     builder.ins().brif(fs_cont, fs_body, &[], fs_exit, &[]);
                     builder.switch_to_block(fs_body);
                     builder.seal_block(fs_body);
@@ -5756,146 +5715,148 @@ impl Compiler<'_> {
                 state.current_block = Some(post_optimizer_block);
             }
         } else {
+            // 7f. Optimizer step loop: for i in 0..num_params (runtime loop)
+            {
+                let opt_i_var = state.new_variable();
+                builder.declare_var(opt_i_var, cl_types::I64);
+                let opt_zero = builder.ins().iconst(cl_types::I64, 0);
+                builder.def_var(opt_i_var, opt_zero);
 
-        // 7f. Optimizer step loop: for i in 0..num_params (runtime loop)
-        {
-            let opt_i_var = state.new_variable();
-            builder.declare_var(opt_i_var, cl_types::I64);
-            let opt_zero = builder.ins().iconst(cl_types::I64, 0);
-            builder.def_var(opt_i_var, opt_zero);
+                let opt_header = builder.create_block();
+                let opt_body = builder.create_block();
+                let opt_exit = builder.create_block();
 
-            let opt_header = builder.create_block();
-            let opt_body = builder.create_block();
-            let opt_exit = builder.create_block();
+                builder.ins().jump(opt_header, &[]);
+                builder.switch_to_block(opt_header);
+                state.current_block = Some(opt_header);
 
-            builder.ins().jump(opt_header, &[]);
-            builder.switch_to_block(opt_header);
-            state.current_block = Some(opt_header);
+                let idx = builder.use_var(opt_i_var);
+                let opt_cond = builder
+                    .ins()
+                    .icmp(IntCC::SignedLessThan, idx, num_params_val);
+                builder.ins().brif(opt_cond, opt_body, &[], opt_exit, &[]);
 
-            let idx = builder.use_var(opt_i_var);
-            let opt_cond = builder
-                .ins()
-                .icmp(IntCC::SignedLessThan, idx, num_params_val);
-            builder.ins().brif(opt_cond, opt_body, &[], opt_exit, &[]);
+                builder.switch_to_block(opt_body);
+                builder.seal_block(opt_body);
+                state.current_block = Some(opt_body);
 
-            builder.switch_to_block(opt_body);
-            builder.seal_block(opt_body);
-            state.current_block = Some(opt_body);
+                // Get param, gradient, state buffers via runtime list indexing
+                let param_val =
+                    self.compile_call_by_name(builder, "nsl_list_get", &[param_list, idx])?;
+                let grad_val =
+                    self.compile_call_by_name(builder, "nsl_list_get", &[opt_grads, idx])?;
+                let s1 =
+                    self.compile_call_by_name(builder, "nsl_list_get", &[state_list_1, idx])?;
 
-            // Get param, gradient, state buffers via runtime list indexing
-            let param_val =
-                self.compile_call_by_name(builder, "nsl_list_get", &[param_list, idx])?;
-            let grad_val = self.compile_call_by_name(builder, "nsl_list_get", &[opt_grads, idx])?;
-            let s1 = self.compile_call_by_name(builder, "nsl_list_get", &[state_list_1, idx])?;
+                let s2 = if num_state_buffers >= 2 {
+                    self.compile_call_by_name(builder, "nsl_list_get", &[state_list_2, idx])?
+                } else {
+                    s1 // placeholder for non-Adam/SOAP optimizers (ignored by helper)
+                };
+                self.emit_stdlib_optim_call(
+                    builder,
+                    optimizer_name.as_str(),
+                    &opt_fn,
+                    param_val,
+                    grad_val,
+                    s1,
+                    s2,
+                    lr,
+                    momentum_const,
+                    dampening_const,
+                    weight_decay_const,
+                    nesterov_const,
+                    beta1_const,
+                    beta2_const,
+                    eps_const,
+                    step_count_var,
+                )?;
 
-            let s2 = if num_state_buffers >= 2 {
-                self.compile_call_by_name(builder, "nsl_list_get", &[state_list_2, idx])?
-            } else {
-                s1 // placeholder for non-Adam/SOAP optimizers (ignored by helper)
-            };
-            self.emit_stdlib_optim_call(
-                builder,
-                optimizer_name.as_str(),
-                &opt_fn,
-                param_val,
-                grad_val,
-                s1,
-                s2,
-                lr,
-                momentum_const,
-                dampening_const,
-                weight_decay_const,
-                nesterov_const,
-                beta1_const,
-                beta2_const,
-                eps_const,
-                step_count_var,
-            )?;
+                let one_opt = builder.ins().iconst(cl_types::I64, 1);
+                let next_opt = builder.ins().iadd(idx, one_opt);
+                builder.def_var(opt_i_var, next_opt);
+                builder.ins().jump(opt_header, &[]);
+                builder.seal_block(opt_header);
 
-            let one_opt = builder.ins().iconst(cl_types::I64, 1);
-            let next_opt = builder.ins().iadd(idx, one_opt);
-            builder.def_var(opt_i_var, next_opt);
-            builder.ins().jump(opt_header, &[]);
-            builder.seal_block(opt_header);
+                builder.switch_to_block(opt_exit);
+                builder.seal_block(opt_exit);
+                state.current_block = Some(opt_exit);
+            }
 
-            builder.switch_to_block(opt_exit);
-            builder.seal_block(opt_exit);
-            state.current_block = Some(opt_exit);
-        }
+            // M43b: ZeRO Stage 1+ — all-gather updated params after optimizer step
+            if zero_enabled {
+                self.compile_call_by_name(builder, "nsl_zero_step", &[])?;
+            }
 
-        // M43b: ZeRO Stage 1+ — all-gather updated params after optimizer step
-        if zero_enabled {
-            self.compile_call_by_name(builder, "nsl_zero_step", &[])?;
-        }
+            // 7g. Post-optimizer cleanup: zero accum buffers or free direct grads
+            // Runtime loop over num_params_val
+            if let Some(accum) = accum_list {
+                let cleanup_i_var = state.new_variable();
+                builder.declare_var(cleanup_i_var, cl_types::I64);
+                let c_zero = builder.ins().iconst(cl_types::I64, 0);
+                builder.def_var(cleanup_i_var, c_zero);
+                let c_header = builder.create_block();
+                let c_body = builder.create_block();
+                let c_exit = builder.create_block();
+                builder.ins().jump(c_header, &[]);
+                builder.switch_to_block(c_header);
+                let ci = builder.use_var(cleanup_i_var);
+                let cc = builder
+                    .ins()
+                    .icmp(IntCC::SignedLessThan, ci, num_params_val);
+                builder.ins().brif(cc, c_body, &[], c_exit, &[]);
+                builder.switch_to_block(c_body);
+                builder.seal_block(c_body);
+                let buf = self.compile_call_by_name(builder, "nsl_list_get", &[accum, ci])?;
+                let n_elems = self.compile_call_by_name(builder, "nsl_tensor_len", &[buf])?;
+                self.compile_call_by_name(builder, "nsl_grad_zero", &[buf, n_elems])?;
+                let c_one = builder.ins().iconst(cl_types::I64, 1);
+                let c_next = builder.ins().iadd(ci, c_one);
+                builder.def_var(cleanup_i_var, c_next);
+                builder.ins().jump(c_header, &[]);
+                builder.seal_block(c_header);
+                builder.switch_to_block(c_exit);
+                builder.seal_block(c_exit);
+                state.current_block = Some(c_exit);
+            } else if !fase_hook_active {
+                // No accumulation — free gradient tensors and grads_list every batch.
+                // Skip when FASE hook is active: grads are already freed during
+                // adjoint lowering, and grads_list is a null sentinel.
+                let cleanup_i_var = state.new_variable();
+                builder.declare_var(cleanup_i_var, cl_types::I64);
+                let c_zero = builder.ins().iconst(cl_types::I64, 0);
+                builder.def_var(cleanup_i_var, c_zero);
+                let c_header = builder.create_block();
+                let c_body = builder.create_block();
+                let c_exit = builder.create_block();
+                builder.ins().jump(c_header, &[]);
+                builder.switch_to_block(c_header);
+                let ci = builder.use_var(cleanup_i_var);
+                let cc = builder
+                    .ins()
+                    .icmp(IntCC::SignedLessThan, ci, num_params_val);
+                builder.ins().brif(cc, c_body, &[], c_exit, &[]);
+                builder.switch_to_block(c_body);
+                builder.seal_block(c_body);
+                let grad_val =
+                    self.compile_call_by_name(builder, "nsl_list_get", &[grads_list, ci])?;
+                self.compile_call_by_name(builder, "nsl_tensor_free", &[grad_val])?;
+                let c_one = builder.ins().iconst(cl_types::I64, 1);
+                let c_next = builder.ins().iadd(ci, c_one);
+                builder.def_var(cleanup_i_var, c_next);
+                builder.ins().jump(c_header, &[]);
+                builder.seal_block(c_header);
+                builder.switch_to_block(c_exit);
+                builder.seal_block(c_exit);
+                state.current_block = Some(c_exit);
+                self.compile_call_by_name(builder, "nsl_list_free", &[grads_list])?;
+            }
 
-        // 7g. Post-optimizer cleanup: zero accum buffers or free direct grads
-        // Runtime loop over num_params_val
-        if let Some(accum) = accum_list {
-            let cleanup_i_var = state.new_variable();
-            builder.declare_var(cleanup_i_var, cl_types::I64);
-            let c_zero = builder.ins().iconst(cl_types::I64, 0);
-            builder.def_var(cleanup_i_var, c_zero);
-            let c_header = builder.create_block();
-            let c_body = builder.create_block();
-            let c_exit = builder.create_block();
-            builder.ins().jump(c_header, &[]);
-            builder.switch_to_block(c_header);
-            let ci = builder.use_var(cleanup_i_var);
-            let cc = builder
-                .ins()
-                .icmp(IntCC::SignedLessThan, ci, num_params_val);
-            builder.ins().brif(cc, c_body, &[], c_exit, &[]);
-            builder.switch_to_block(c_body);
-            builder.seal_block(c_body);
-            let buf = self.compile_call_by_name(builder, "nsl_list_get", &[accum, ci])?;
-            let n_elems = self.compile_call_by_name(builder, "nsl_tensor_len", &[buf])?;
-            self.compile_call_by_name(builder, "nsl_grad_zero", &[buf, n_elems])?;
-            let c_one = builder.ins().iconst(cl_types::I64, 1);
-            let c_next = builder.ins().iadd(ci, c_one);
-            builder.def_var(cleanup_i_var, c_next);
-            builder.ins().jump(c_header, &[]);
-            builder.seal_block(c_header);
-            builder.switch_to_block(c_exit);
-            builder.seal_block(c_exit);
-            state.current_block = Some(c_exit);
-        } else if !fase_hook_active {
-            // No accumulation — free gradient tensors and grads_list every batch.
-            // Skip when FASE hook is active: grads are already freed during
-            // adjoint lowering, and grads_list is a null sentinel.
-            let cleanup_i_var = state.new_variable();
-            builder.declare_var(cleanup_i_var, cl_types::I64);
-            let c_zero = builder.ins().iconst(cl_types::I64, 0);
-            builder.def_var(cleanup_i_var, c_zero);
-            let c_header = builder.create_block();
-            let c_body = builder.create_block();
-            let c_exit = builder.create_block();
-            builder.ins().jump(c_header, &[]);
-            builder.switch_to_block(c_header);
-            let ci = builder.use_var(cleanup_i_var);
-            let cc = builder
-                .ins()
-                .icmp(IntCC::SignedLessThan, ci, num_params_val);
-            builder.ins().brif(cc, c_body, &[], c_exit, &[]);
-            builder.switch_to_block(c_body);
-            builder.seal_block(c_body);
-            let grad_val = self.compile_call_by_name(builder, "nsl_list_get", &[grads_list, ci])?;
-            self.compile_call_by_name(builder, "nsl_tensor_free", &[grad_val])?;
-            let c_one = builder.ins().iconst(cl_types::I64, 1);
-            let c_next = builder.ins().iadd(ci, c_one);
-            builder.def_var(cleanup_i_var, c_next);
-            builder.ins().jump(c_header, &[]);
-            builder.seal_block(c_header);
-            builder.switch_to_block(c_exit);
-            builder.seal_block(c_exit);
-            state.current_block = Some(c_exit);
-            self.compile_call_by_name(builder, "nsl_list_free", &[grads_list])?;
-        }
-
-        // Jump to post-optimizer block (merges optimizer and skip paths)
-        builder.ins().jump(post_optimizer_block, &[]);
-        builder.switch_to_block(post_optimizer_block);
-        builder.seal_block(post_optimizer_block);
-        state.current_block = Some(post_optimizer_block);
+            // Jump to post-optimizer block (merges optimizer and skip paths)
+            builder.ins().jump(post_optimizer_block, &[]);
+            builder.switch_to_block(post_optimizer_block);
+            builder.seal_block(post_optimizer_block);
+            state.current_block = Some(post_optimizer_block);
         } // end else (non-FASE-Deferred optimizer path)
 
         // 7g2. Scheduler: update learning rate if scheduler is configured
@@ -7805,20 +7766,15 @@ impl Compiler<'_> {
                         }
                         Some(scales_map) => {
                             // Sidecar present — projection MUST have scales.
-                            let projection_path =
-                                format!("{}.{}", model_type_name, field.name);
+                            let projection_path = format!("{}.{}", model_type_name, field.name);
                             let field_scales = scales_map
                                 .by_projection
                                 .get(&projection_path)
-                                .ok_or_else(|| {
-                                    CodegenError::missing_scales(&projection_path)
-                                })?;
+                                .ok_or_else(|| CodegenError::missing_scales(&projection_path))?;
 
                             // Embed scale data as a compile-time constant in .rodata.
-                            let data_label = format!(
-                                "__nsl_awq_scales_{}_{}",
-                                model_type_name, field.name
-                            );
+                            let data_label =
+                                format!("__nsl_awq_scales_{}_{}", model_type_name, field.name);
                             let scale_bytes: Vec<u8> = field_scales
                                 .iter()
                                 .flat_map(|v: &f32| v.to_le_bytes())
@@ -7852,8 +7808,7 @@ impl Compiler<'_> {
                             let scale_gv = self
                                 .module
                                 .declare_data_in_func(scale_data_id, builder.func);
-                            let scales_ptr =
-                                builder.ins().symbol_value(cl_types::I64, scale_gv);
+                            let scales_ptr = builder.ins().symbol_value(cl_types::I64, scale_gv);
                             let scales_len = builder
                                 .ins()
                                 .iconst(cl_types::I64, field_scales.len() as i64);
@@ -7977,7 +7932,7 @@ impl Compiler<'_> {
                 field_types,
                 tensor_shapes,
                 &[], // no exclusions from the Compiler-level stub; the QuantBlock's
-                     // exclude list is stored in the AST which isn't retained here.
+                // exclude list is stored in the AST which isn't retained here.
                 self.interner,
             ) {
                 Ok(discovered) => {
@@ -8000,7 +7955,6 @@ impl Compiler<'_> {
             Some(all_projections)
         }
     }
-
 
     /// Dev Tools Phase 5 Task 7: emit IR for one `@inspect(target, every=?, condition=?)`
     /// decorator attached to a `let` binding.
@@ -8081,9 +8035,7 @@ impl Compiler<'_> {
 
         // Intern the tensor name once — shared by stats + dump branches.
         let name_data_id = self.intern_string(&tensor_name)?;
-        let name_gv = self
-            .module
-            .declare_data_in_func(name_data_id, builder.func);
+        let name_gv = self.module.declare_data_in_func(name_data_id, builder.func);
 
         // ── (a) Stats branch: every=N ────────────────────────────────────
         if let Some(n) = every_n {
@@ -8107,20 +8059,14 @@ impl Compiler<'_> {
 
             // Allocate a 48-byte 8-aligned stack slot for the stats struct
             // (matches the runtime's NslTensorStats layout — 6 × f64).
-            let slot = builder.create_sized_stack_slot(
-                cranelift_codegen::ir::StackSlotData::new(
-                    cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
-                    48,
-                    3,
-                ),
-            );
+            let slot = builder.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
+                cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                48,
+                3,
+            ));
             let stats_ptr = builder.ins().stack_addr(cl_types::I64, slot, 0);
 
-            self.compile_call_by_name(
-                builder,
-                "nsl_tensor_stats",
-                &[tensor_val, stats_ptr],
-            )?;
+            self.compile_call_by_name(builder, "nsl_tensor_stats", &[tensor_val, stats_ptr])?;
 
             let name_ptr = builder.ins().symbol_value(cl_types::I64, name_gv);
             let name_len = builder
@@ -8158,8 +8104,7 @@ impl Compiler<'_> {
                 Some(e) => e.clone(),
                 None => return Ok(()),
             };
-            let get_loss_ema_ref =
-                self.module.declare_func_in_func(lema_id, builder.func);
+            let get_loss_ema_ref = self.module.declare_func_in_func(lema_id, builder.func);
             let (lslope_id, _) = match self
                 .registry
                 .runtime_fns
@@ -8168,8 +8113,7 @@ impl Compiler<'_> {
                 Some(e) => e.clone(),
                 None => return Ok(()),
             };
-            let get_loss_ema_slope_ref =
-                self.module.declare_func_in_func(lslope_id, builder.func);
+            let get_loss_ema_slope_ref = self.module.declare_func_in_func(lslope_id, builder.func);
             let (gnt_id, _) = match self
                 .registry
                 .runtime_fns
@@ -8178,8 +8122,7 @@ impl Compiler<'_> {
                 Some(e) => e.clone(),
                 None => return Ok(()),
             };
-            let get_grad_norm_total_ref =
-                self.module.declare_func_in_func(gnt_id, builder.func);
+            let get_grad_norm_total_ref = self.module.declare_func_in_func(gnt_id, builder.func);
             let (nic_id, _) = match self
                 .registry
                 .runtime_fns
@@ -8203,12 +8146,13 @@ impl Compiler<'_> {
                 get_grad_norm_total_ref,
                 get_nan_inf_count_window_ref,
             };
-            let pred_val =
-                crate::inspect::predicate::lower_predicate(&ast, builder, &ctx);
+            let pred_val = crate::inspect::predicate::lower_predicate(&ast, builder, &ctx);
 
             let do_block = builder.create_block();
             let after_block = builder.create_block();
-            builder.ins().brif(pred_val, do_block, &[], after_block, &[]);
+            builder
+                .ins()
+                .brif(pred_val, do_block, &[], after_block, &[]);
 
             builder.switch_to_block(do_block);
             builder.seal_block(do_block);

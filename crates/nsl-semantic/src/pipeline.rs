@@ -35,10 +35,8 @@ pub fn validate_pipeline_decorator(
                         if let ExprKind::IntLiteral(n) = &arg.value.kind {
                             if *n < 2 {
                                 diagnostics.push(
-                                    Diagnostic::error(
-                                        "@pipeline: stages must be >= 2".to_string(),
-                                    )
-                                    .with_label(arg.span, "must be >= 2"),
+                                    Diagnostic::error("@pipeline: stages must be >= 2".to_string())
+                                        .with_label(arg.span, "must be >= 2"),
                                 );
                             } else {
                                 num_stages = Some(*n as usize);
@@ -92,11 +90,8 @@ pub fn validate_pipeline_decorator(
                     }
                     _ => {
                         diagnostics.push(
-                            Diagnostic::error(format!(
-                                "@pipeline: unknown argument '{}'",
-                                aname
-                            ))
-                            .with_label(arg.span, "unknown argument"),
+                            Diagnostic::error(format!("@pipeline: unknown argument '{}'", aname))
+                                .with_label(arg.span, "unknown argument"),
                         );
                     }
                 }

@@ -285,13 +285,7 @@ fn add_columnar_scores(
 
 /// Add L2-norm-per-row-block into `out`.  Matrix `data` has shape
 /// `[n_blocks * block_rows, cols]` in row-major layout.
-fn add_row_scores(
-    out: &mut [f64],
-    data: &[f32],
-    cols: usize,
-    n_blocks: usize,
-    block_rows: usize,
-) {
+fn add_row_scores(out: &mut [f64], data: &[f32], cols: usize, n_blocks: usize, block_rows: usize) {
     let total_rows = n_blocks * block_rows;
     if data.len() < total_rows * cols {
         return;
@@ -317,8 +311,8 @@ fn add_row_scores(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wengert::{PrimalOp, WengertList, WengertOp};
     use crate::wggo_graph::{build as build_graph, OptGraph};
-    use crate::wengert::{PrimalOp, WengertOp, WengertList};
     use std::collections::HashMap;
 
     /// Test-only provider backed by a `HashMap`.
@@ -379,11 +373,7 @@ mod tests {
         build_graph(&wl)
     }
 
-    fn find_layer_scores<'a>(
-        g: &OptGraph,
-        rep: &'a WeightAnalysisReport,
-        name: &str,
-    ) -> &'a [f64] {
+    fn find_layer_scores<'a>(g: &OptGraph, rep: &'a WeightAnalysisReport, name: &str) -> &'a [f64] {
         let idx = g
             .layers
             .iter()
@@ -395,7 +385,13 @@ mod tests {
     #[test]
     fn null_provider_yields_equal_scores() {
         let g = single_block_graph();
-        let rep = analyze(&g, &shape(4), 4, &NullWeightProvider, &AnalysisConfig::default());
+        let rep = analyze(
+            &g,
+            &shape(4),
+            4,
+            &NullWeightProvider,
+            &AnalysisConfig::default(),
+        );
         assert_eq!(rep.per_layer.len(), g.layers.len());
         assert_eq!(rep.layers_without_weights, g.layers.len() as u32);
         for imp in &rep.per_layer {
@@ -508,7 +504,13 @@ mod tests {
     #[test]
     fn caller_override_wins_over_default_threshold() {
         let g = single_block_graph();
-        let rep = analyze(&g, &shape(4), 4, &NullWeightProvider, &AnalysisConfig::default());
+        let rep = analyze(
+            &g,
+            &shape(4),
+            4,
+            &NullWeightProvider,
+            &AnalysisConfig::default(),
+        );
         let mut cons = vec![LayerIlpConstraints {
             num_heads: 4,
             min_retained_importance: 42.0, // explicit override
@@ -540,7 +542,10 @@ mod tests {
         }];
         rep.apply_to(&mut cons);
         assert!(cons[0].min_retained_importance > 0.0);
-        assert_eq!(cons[0].min_retained_importance, rep.per_layer[0].default_min_retained);
+        assert_eq!(
+            cons[0].min_retained_importance,
+            rep.per_layer[0].default_min_retained
+        );
     }
 
     #[test]

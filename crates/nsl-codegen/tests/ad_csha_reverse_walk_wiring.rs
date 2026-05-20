@@ -58,7 +58,9 @@ fn ok_config() -> FlashAttentionConfig {
         rope_style: RopeStyle::HalfSplit,
         gqa_group_size: 1,
         tree_mask: false,
-        gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras {
+        gpu_sm: 75,
+        segment_masked: false,
+        csha: Some(CshaExtras {
             fused_projections: true,
             save_activations_for_backward: true,
             d_model: 32,
@@ -78,7 +80,9 @@ fn over_budget_config() -> FlashAttentionConfig {
         rope_style: RopeStyle::HalfSplit,
         gqa_group_size: 1,
         tree_mask: false,
-        gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras {
+        gpu_sm: 75,
+        segment_masked: false,
+        csha: Some(CshaExtras {
             fused_projections: true,
             save_activations_for_backward: true,
             d_model: 64,
@@ -87,14 +91,12 @@ fn over_budget_config() -> FlashAttentionConfig {
     }
 }
 
-fn build_claims(
-    config: FlashAttentionConfig,
-) -> CshaBackwardClaims {
+fn build_claims(config: FlashAttentionConfig) -> CshaBackwardClaims {
     // Chain: ops 1 (norm), 3 (matmul), 4 (rope) all map to chain 0.
     let mut op_to_chain = HashMap::new();
     op_to_chain.insert(1, 0usize); // RMSNorm
-    op_to_chain.insert(3, 0);      // Matmul
-    op_to_chain.insert(4, 0);      // RoPE
+    op_to_chain.insert(3, 0); // Matmul
+    op_to_chain.insert(4, 0); // RoPE
 
     let chain_marks = vec![FusionMark {
         layer: "blocks.0".into(),
@@ -136,10 +138,7 @@ fn fallback_chain_emits_per_op_adjoints_for_all_ops() {
 
     // Diagnostics should contain the rejection reason.
     let diags = gen.csha_diagnostics();
-    assert!(
-        !diags.is_empty(),
-        "fallback must record a diagnostic"
-    );
+    assert!(!diags.is_empty(), "fallback must record a diagnostic");
     let joined = diags.join(" || ");
     assert!(
         joined.contains("CSHA fused backward rejected"),
@@ -225,7 +224,10 @@ fn smoke_config_records_fused_event() {
     assert_eq!(ev.head_dim, 32);
     assert_eq!(ev.block_q, 32);
     assert_eq!(ev.block_kv, 32);
-    assert!(ev.smoke_config, "hd=32 smoke config must mark smoke_config=true");
+    assert!(
+        ev.smoke_config,
+        "hd=32 smoke config must mark smoke_config=true"
+    );
 }
 
 /// T7.2: scope gate — configs bigger than the smoke shape still get an
@@ -238,10 +240,18 @@ fn non_smoke_config_records_event_with_scope_gate() {
 
     // hd=64 passes the backward validator but is outside the smoke scope.
     let hd64_ok_cfg = FlashAttentionConfig {
-        block_q: 32, block_kv: 32, head_dim: 64,
-        causal: false, paged: false, rope_q: false,
+        block_q: 32,
+        block_kv: 32,
+        head_dim: 64,
+        causal: false,
+        paged: false,
+        rope_q: false,
         rope_style: RopeStyle::HalfSplit,
-        gqa_group_size: 1, tree_mask: false, gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras {
+        gqa_group_size: 1,
+        tree_mask: false,
+        gpu_sm: 75,
+        segment_masked: false,
+        csha: Some(CshaExtras {
             fused_projections: true,
             save_activations_for_backward: true,
             d_model: 64,
@@ -251,9 +261,7 @@ fn non_smoke_config_records_event_with_scope_gate() {
 
     // Ensure the config passes the backward validator — otherwise this
     // test is silently exercising the fallback path.
-    use nsl_codegen::flash_attention_v2::smem_layout::{
-        validate_scalar_v2_config, Direction,
-    };
+    use nsl_codegen::flash_attention_v2::smem_layout::{validate_scalar_v2_config, Direction};
     assert!(
         validate_scalar_v2_config(&hd64_ok_cfg, Direction::Backward).is_ok(),
         "harness config must pass backward validation"
@@ -315,9 +323,7 @@ fn fallback_chain_records_no_fused_event() {
 #[test]
 fn gap_i1_training_config_clamps_plan_fusion_flags() {
     use nsl_codegen::ad_rules::{csha_dispatch_for_op, CshaDispatchDecision};
-    use nsl_codegen::flash_attention_v2::smem_layout::{
-        validate_scalar_v2_config, Direction,
-    };
+    use nsl_codegen::flash_attention_v2::smem_layout::{validate_scalar_v2_config, Direction};
 
     // Plan-level config: fused_projections + fused_output_proj at
     // head_dim=128 + d_model=128 blows the SMEM budget (116 KB+ exceeds
@@ -337,7 +343,9 @@ fn gap_i1_training_config_clamps_plan_fusion_flags() {
         rope_style: RopeStyle::HalfSplit,
         gqa_group_size: 1,
         tree_mask: false,
-        gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras {
+        gpu_sm: 75,
+        segment_masked: false,
+        csha: Some(CshaExtras {
             fused_projections: true,
             fused_output_proj: true,
             save_activations_for_backward: true,
@@ -366,7 +374,9 @@ fn gap_i1_training_config_clamps_plan_fusion_flags() {
         rope_style: RopeStyle::HalfSplit,
         gqa_group_size: 1,
         tree_mask: false,
-        gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras {
+        gpu_sm: 75,
+        segment_masked: false,
+        csha: Some(CshaExtras {
             level: 1,
             fused_projections: false,
             fused_output_proj: false,
@@ -413,17 +423,15 @@ fn gap_i1_training_config_clamps_plan_fusion_flags() {
                 "expected plan-config rejection, got: {diagnostic}"
             );
         }
-        other => panic!(
-            "plan config MUST be rejected by dispatcher; got {other:?}"
-        ),
+        other => panic!("plan config MUST be rejected by dispatcher; got {other:?}"),
     }
 
     // With the clamped training config, the dispatcher MUST emit fused.
     match csha_dispatch_for_op(&clamped_mark, 0) {
         CshaDispatchDecision::EmitFused => {}
-        other => panic!(
-            "I.1 regression — clamped training config MUST accept EmitFused; got {other:?}"
-        ),
+        other => {
+            panic!("I.1 regression — clamped training config MUST accept EmitFused; got {other:?}")
+        }
     }
 }
 
@@ -433,8 +441,8 @@ fn gap_i1_training_config_clamps_plan_fusion_flags() {
 fn collect_chain_dispatch_map_maps_ops_to_chain_marks() {
     use nsl_codegen::csha::CshaMode;
     use nsl_codegen::csha_apply::{bridge, collect_chain_dispatch_map};
-    use nsl_codegen::wggo_cost::LayerShape;
     use nsl_codegen::csha_specialize::SpecConfig;
+    use nsl_codegen::wggo_cost::LayerShape;
 
     // Build a toy plan with one CSHA-active layer.
     let w = {
@@ -480,7 +488,12 @@ fn collect_chain_dispatch_map_maps_ops_to_chain_marks() {
     let (op_to_chain, chain_marks) = collect_chain_dispatch_map(&plan, &br);
 
     // Three chains (Q, K, V) → three chain marks.
-    assert_eq!(chain_marks.len(), 3, "expected 3 chains, got {}", chain_marks.len());
+    assert_eq!(
+        chain_marks.len(),
+        3,
+        "expected 3 chains, got {}",
+        chain_marks.len()
+    );
 
     // All claimed op indices must be mapped.
     assert!(op_to_chain.contains_key(&1), "RMSNorm op 1 must be mapped");
@@ -493,7 +506,10 @@ fn collect_chain_dispatch_map_maps_ops_to_chain_marks() {
     // Ops within the same chain must map to the same chain index.
     // Q chain: ops 1, 3, 4.
     let q_chain = op_to_chain[&3];
-    assert_eq!(op_to_chain[&4], q_chain, "Q RoPE must share chain with Q matmul");
+    assert_eq!(
+        op_to_chain[&4], q_chain,
+        "Q RoPE must share chain with Q matmul"
+    );
 
     // Each chain mark should carry a config (from the bridge).
     for (i, mark) in chain_marks.iter().enumerate() {

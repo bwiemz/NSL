@@ -167,10 +167,8 @@ fn parse_before_after(stdout: &str) -> Result<Vec<(String, f64, f64, f64)>, Stri
     // marker (skipping any non-numeric log lines).
     let lines: Vec<&str> = stdout.lines().collect();
     let param_order = ["wq", "wk", "wv", "w_norm"];
-    let mut befores: std::collections::HashMap<String, f64> =
-        std::collections::HashMap::new();
-    let mut afters: std::collections::HashMap<String, f64> =
-        std::collections::HashMap::new();
+    let mut befores: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+    let mut afters: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
 
     fn next_float_after(lines: &[&str], idx: usize) -> Option<f64> {
         for line in lines.iter().skip(idx + 1) {
@@ -211,12 +209,14 @@ fn parse_before_after(stdout: &str) -> Result<Vec<(String, f64, f64, f64)>, Stri
 
     let mut out = Vec::new();
     for name in param_order {
-        let before = befores.get(name).copied().ok_or_else(|| {
-            format!("no BEFORE_{name} numeric line in stdout")
-        })?;
-        let after = afters.get(name).copied().ok_or_else(|| {
-            format!("no AFTER_{name} numeric line in stdout")
-        })?;
+        let before = befores
+            .get(name)
+            .copied()
+            .ok_or_else(|| format!("no BEFORE_{name} numeric line in stdout"))?;
+        let after = afters
+            .get(name)
+            .copied()
+            .ok_or_else(|| format!("no AFTER_{name} numeric line in stdout"))?;
         out.push((name.to_string(), before, after, after - before));
     }
     Ok(out)
@@ -307,9 +307,7 @@ fn csha_gap_gpu_e2e_weights_change_after_one_step() {
 
     eprintln!("[csha-gpu-e2e] per-parameter weight deltas:");
     for (name, before, after, delta) in &deltas {
-        eprintln!(
-            "  {name:>8}: before={before:>14.6}  after={after:>14.6}  delta={delta:>+14.6}"
-        );
+        eprintln!("  {name:>8}: before={before:>14.6}  after={after:>14.6}  delta={delta:>+14.6}");
     }
 
     // Finiteness guard — NaN or Inf in any sum means a numerical
@@ -384,8 +382,10 @@ fn csha_gap_gpu_e2e_csha_fused_path() {
 
     let mut cmd = Command::cargo_bin("nsl").expect("locate nsl binary");
     cmd.env("NSL_STDLIB_PATH", stdlib_path())
-        .env("NSL_CSHA_DUMP_GRADS",
-             std::env::var("NSL_CSHA_DUMP_GRADS").unwrap_or_default())
+        .env(
+            "NSL_CSHA_DUMP_GRADS",
+            std::env::var("NSL_CSHA_DUMP_GRADS").unwrap_or_default(),
+        )
         .arg("run")
         .arg("--source-ad")
         .arg("--csha")
@@ -438,8 +438,8 @@ fn csha_gap_gpu_e2e_csha_fused_path() {
             );
             return;
         }
-        let dmodel_zero_signature = stderr.contains("dim 3: 0 vs 32")
-            || stderr.contains("a_shape=[1, 1, 32, 0]");
+        let dmodel_zero_signature =
+            stderr.contains("dim 3: 0 vs 32") || stderr.contains("a_shape=[1, 1, 32, 0]");
         assert!(
             !dmodel_zero_signature,
             "[csha-gpu-e2e-csha] REGRESSION — d_model=0 crash signature is back.\n\
@@ -496,8 +496,7 @@ fn csha_gap_gpu_e2e_csha_fused_path() {
         // above + in the dedicated test file) are observable and the
         // runtime follow-up is a separate PR scope.
         let device_placement_signature =
-            stderr.contains("cuMemcpyHtoD_v2")
-                && stderr.contains("CUDA_ERROR_ILLEGAL_ADDRESS");
+            stderr.contains("cuMemcpyHtoD_v2") && stderr.contains("CUDA_ERROR_ILLEGAL_ADDRESS");
         if device_placement_signature {
             eprintln!(
                 "[csha-gpu-e2e-csha] SKIP — REGRESSION: cuMemcpyHtoD_v2 \
@@ -530,9 +529,7 @@ fn csha_gap_gpu_e2e_csha_fused_path() {
 
     eprintln!("[csha-gpu-e2e-csha] per-parameter weight deltas:");
     for (name, before, after, delta) in &deltas {
-        eprintln!(
-            "  {name:>8}: before={before:>14.6}  after={after:>14.6}  delta={delta:>+14.6}"
-        );
+        eprintln!("  {name:>8}: before={before:>14.6}  after={after:>14.6}  delta={delta:>+14.6}");
     }
 
     for (name, before, _, _) in &deltas {
@@ -598,7 +595,11 @@ fn csha_gap_gpu_e2e_csha_fused_path() {
              and AFTER_{{{}}} = NaN.  Run with `NSL_CSHA_DUMP_GRADS=1` for the \
              full d2h dump.  When the softmax-state save gate is widened, flip \
              this graceful-skip back to the hard-asserts below.",
-            nan_afters.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(",")
+            nan_afters
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(",")
         );
         return;
     }

@@ -1,6 +1,5 @@
 use crate::kernel_skeleton::params::{
-    emit_ld_param_f32, emit_ld_param_u32, emit_ld_param_u64, emit_param_block,
-    Param, ParamTy,
+    emit_ld_param_f32, emit_ld_param_u32, emit_ld_param_u64, emit_param_block, Param, ParamTy,
 };
 
 #[test]
@@ -40,12 +39,30 @@ fn ld_param_f32_test() {
 fn param_block_wrga_lora_test() {
     let mut ptx = String::new();
     let params = [
-        Param { ty: ParamTy::U64, name: "x_ptr" },
-        Param { ty: ParamTy::U64, name: "w_ptr" },
-        Param { ty: ParamTy::U64, name: "a_ptr" },
-        Param { ty: ParamTy::U64, name: "b_ptr" },
-        Param { ty: ParamTy::F32, name: "scale" },
-        Param { ty: ParamTy::U64, name: "y_ptr" },
+        Param {
+            ty: ParamTy::U64,
+            name: "x_ptr",
+        },
+        Param {
+            ty: ParamTy::U64,
+            name: "w_ptr",
+        },
+        Param {
+            ty: ParamTy::U64,
+            name: "a_ptr",
+        },
+        Param {
+            ty: ParamTy::U64,
+            name: "b_ptr",
+        },
+        Param {
+            ty: ParamTy::F32,
+            name: "scale",
+        },
+        Param {
+            ty: ParamTy::U64,
+            name: "y_ptr",
+        },
     ];
     emit_param_block(&mut ptx, "nsl_wrga_fused_lora_test", &params);
     assert_eq!(

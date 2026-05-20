@@ -17,7 +17,7 @@ use serde::Serialize;
 
 use crate::fase::{self, FaseConfig, FaseOptimizer, FasePlan};
 use crate::fase_memory::MemorySchedule;
-use crate::pca_detect::{DatasetPackingConfig, PcaDetection, PcaDetectConfig};
+use crate::pca_detect::{DatasetPackingConfig, PcaDetectConfig, PcaDetection};
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TrainingReport {
@@ -63,7 +63,11 @@ pub struct PcaSection {
 /// `MemorySchedule` (`FaseSection::memory`) is always `None` because it
 /// requires a `ModelFootprint` that cannot be cheaply derived from the AST
 /// without running semantic analysis; this is deferred to a later task.
-pub fn build_report(ast: &nsl_ast::Module, interner: &Interner, source_path: &std::path::Path) -> TrainingReport {
+pub fn build_report(
+    ast: &nsl_ast::Module,
+    interner: &Interner,
+    source_path: &std::path::Path,
+) -> TrainingReport {
     let dataset_configs = collect_dataset_configs(ast, interner);
     let mut blocks = Vec::new();
     for stmt in &ast.stmts {
@@ -205,7 +209,12 @@ fn extract_dataset_ref(train: &TrainBlock, interner: &Interner) -> Option<String
                     }
                 }
                 // Pattern: `let source = <ident>` → StmtKind::VarDecl
-                if let StmtKind::VarDecl { pattern, value: Some(val), .. } = &stmt.kind {
+                if let StmtKind::VarDecl {
+                    pattern,
+                    value: Some(val),
+                    ..
+                } = &stmt.kind
+                {
                     if let nsl_ast::pattern::PatternKind::Ident(name) = &pattern.kind {
                         if resolve(interner, *name) == "source" {
                             if let ExprKind::Ident(val_sym) = &val.kind {
@@ -227,7 +236,10 @@ fn extract_dataset_ref(train: &TrainBlock, interner: &Interner) -> Option<String
 /// `mean_doc_length`, `doc_length_stddev`, and `separator_token_id`
 /// keys inside the dataset body are extracted.  Unknown keys are silently
 /// ignored for forward-compatibility.
-fn collect_dataset_configs(ast: &nsl_ast::Module, interner: &Interner) -> HashMap<String, DatasetPackingConfig> {
+fn collect_dataset_configs(
+    ast: &nsl_ast::Module,
+    interner: &Interner,
+) -> HashMap<String, DatasetPackingConfig> {
     let mut map = HashMap::new();
     for stmt in &ast.stmts {
         if let StmtKind::DatasetDef(def) = &stmt.kind {
@@ -503,11 +515,8 @@ mod tests {
     #[test]
     fn build_report_has_expected_signature() {
         fn _assert_sig() {
-            let _f: fn(
-                &nsl_ast::Module,
-                &nsl_lexer::Interner,
-                &std::path::Path,
-            ) -> TrainingReport = build_report;
+            let _f: fn(&nsl_ast::Module, &nsl_lexer::Interner, &std::path::Path) -> TrainingReport =
+                build_report;
         }
     }
 

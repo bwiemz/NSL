@@ -44,14 +44,18 @@ fn read_pinned_revision_returns_pi2_values() {
     let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("..");
-    let (model_id, revision) =
-        read_pinned_revision(&repo_root).expect("read pinned revision");
-    assert_eq!(model_id, "1bitLLM/bitnet_b1_58-3B",
-               "model_id must match PI.2's pinned value");
-    assert_eq!(revision.len(), 40,
-               "revision SHA must be 40 hex chars");
-    assert!(revision.chars().all(|c| c.is_ascii_hexdigit()),
-            "revision SHA must be hex");
-    assert_eq!(revision, "af89e318d78a70802061246bf037199d2fb97020",
-               "revision SHA must match PI.2's pinned value");
+    let (model_id, revision) = read_pinned_revision(&repo_root).expect("read pinned revision");
+    assert_eq!(
+        model_id, "1bitLLM/bitnet_b1_58-3B",
+        "model_id must match PI.2's pinned value"
+    );
+    assert_eq!(revision.len(), 40, "revision SHA must be 40 hex chars");
+    assert!(
+        revision.chars().all(|c| c.is_ascii_hexdigit()),
+        "revision SHA must be hex"
+    );
+    assert_eq!(
+        revision, "af89e318d78a70802061246bf037199d2fb97020",
+        "revision SHA must match PI.2's pinned value"
+    );
 }

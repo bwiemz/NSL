@@ -37,7 +37,10 @@ pub struct StructPayload {
 
 impl StructPayload {
     pub fn new(bytes: Vec<u8>) -> Self {
-        Self { bytes, _descriptor_id: 0 }
+        Self {
+            bytes,
+            _descriptor_id: 0,
+        }
     }
 
     pub fn as_bytes(&self) -> &[u8] {

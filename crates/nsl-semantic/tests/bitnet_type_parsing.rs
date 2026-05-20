@@ -50,19 +50,20 @@ fn ternary_keyword_lexes_as_identifier() {
     let (tokens, diags) = lex("ternary\n");
     assert!(diags.is_empty(), "unexpected lex diagnostics: {diags:?}");
     assert!(
-        tokens
-            .iter()
-            .any(|t| matches!(t.kind, TokenKind::Ident(_))),
+        tokens.iter().any(|t| matches!(t.kind, TokenKind::Ident(_))),
         "expected an Ident token for `ternary`, got {:?}",
-        tokens
-            .iter()
-            .map(|t| &t.kind)
-            .collect::<Vec<_>>()
+        tokens.iter().map(|t| &t.kind).collect::<Vec<_>>()
     );
     // The resolved string must be exactly "ternary".
     let names: Vec<String> = lex_with_names("ternary\n")
         .into_iter()
-        .filter_map(|(k, n)| if matches!(k, TokenKind::Ident(_)) { Some(n) } else { None })
+        .filter_map(|(k, n)| {
+            if matches!(k, TokenKind::Ident(_)) {
+                Some(n)
+            } else {
+                None
+            }
+        })
         .collect();
     assert_eq!(names, vec!["ternary".to_string()]);
 }
@@ -73,13 +74,17 @@ fn ternary_unpacked_keyword_lexes_as_identifier() {
     assert!(diags.is_empty(), "unexpected lex diagnostics: {diags:?}");
     let names: Vec<String> = lex_with_names("ternary_unpacked\n")
         .into_iter()
-        .filter_map(|(k, n)| if matches!(k, TokenKind::Ident(_)) { Some(n) } else { None })
+        .filter_map(|(k, n)| {
+            if matches!(k, TokenKind::Ident(_)) {
+                Some(n)
+            } else {
+                None
+            }
+        })
         .collect();
     assert_eq!(names, vec!["ternary_unpacked".to_string()]);
     assert!(
-        tokens
-            .iter()
-            .any(|t| matches!(t.kind, TokenKind::Ident(_))),
+        tokens.iter().any(|t| matches!(t.kind, TokenKind::Ident(_))),
         "expected an Ident token for `ternary_unpacked`"
     );
 }
@@ -110,7 +115,10 @@ fn parses_tensor_with_ternary_dtype() {
         other => panic!("expected FnDef, got {other:?}"),
     };
     let param = f.params.first().expect("missing parameter");
-    let type_ann = param.type_ann.as_ref().expect("parameter has no type annotation");
+    let type_ann = param
+        .type_ann
+        .as_ref()
+        .expect("parameter has no type annotation");
     let dtype_sym = match &type_ann.kind {
         TypeExprKind::Tensor { dtype, .. } => *dtype,
         other => panic!("expected TypeExprKind::Tensor, got {other:?}"),
@@ -170,7 +178,10 @@ fn parses_tensor_with_ternary_unpacked_dtype() {
         other => panic!("expected FnDef, got {other:?}"),
     };
     let param = f.params.first().expect("missing parameter");
-    let type_ann = param.type_ann.as_ref().expect("parameter has no type annotation");
+    let type_ann = param
+        .type_ann
+        .as_ref()
+        .expect("parameter has no type annotation");
     let dtype_sym = match &type_ann.kind {
         TypeExprKind::Tensor { dtype, .. } => *dtype,
         other => panic!("expected TypeExprKind::Tensor, got {other:?}"),
@@ -199,7 +210,9 @@ fn parses_tensor_with_ternary_unpacked_dtype() {
         .map(|d| d.message.clone())
         .collect();
     assert!(
-        !errs.iter().any(|m| m.contains("undefined type `ternary_unpacked`")),
+        !errs
+            .iter()
+            .any(|m| m.contains("undefined type `ternary_unpacked`")),
         "semantic resolver still treats `ternary_unpacked` as undefined; errors = {errs:?}"
     );
 }

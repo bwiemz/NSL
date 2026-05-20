@@ -211,10 +211,7 @@ pub struct LayerIlpSolution {
 /// prec_v) domain.  The bounding function is the LUT's argmin — the
 /// cheapest feasible entry — multiplied by the current partial assignment
 /// contribution.
-pub fn solve_layer(
-    lut: &LayerCostLut,
-    constraints: &LayerIlpConstraints,
-) -> LayerIlpSolution {
+pub fn solve_layer(lut: &LayerCostLut, constraints: &LayerIlpConstraints) -> LayerIlpSolution {
     // Pre-compute global cheapest feasible entry as an initial bound.
     let initial_best = lut.argmin_feasible().map(|(_, _, _, _, e)| e.total_us());
     let mut state = SolverState {
@@ -260,11 +257,8 @@ pub fn solve_layer(
                                     }
                                     let adj_fase =
                                         apply_fase(base, fase, constraints.fase_backward_speedup);
-                                    let entry = apply_packing(
-                                        adj_fase,
-                                        pack,
-                                        &constraints.packing_savings,
-                                    );
+                                    let entry =
+                                        apply_packing(adj_fase, pack, &constraints.packing_savings);
                                     if entry.smem_bytes > constraints.smem_budget {
                                         continue;
                                     }
@@ -837,7 +831,11 @@ fn enumerate_packing_modes(c: &LayerIlpConstraints) -> Vec<u8> {
 /// Packing skips padded tokens, so forward + backward compute both shrink
 /// by the same fraction.  Memory and SMEM are unaffected.
 fn apply_packing(base: LayerCostEntry, mode: u8, savings: &[f64; 4]) -> LayerCostEntry {
-    let s = savings.get(mode as usize).copied().unwrap_or(0.0).clamp(0.0, 0.95);
+    let s = savings
+        .get(mode as usize)
+        .copied()
+        .unwrap_or(0.0)
+        .clamp(0.0, 0.95);
     LayerCostEntry {
         forward_us: base.forward_us * (1.0 - s),
         backward_us: base.backward_us * (1.0 - s),
@@ -974,7 +972,11 @@ mod tests {
         let constraints = LayerIlpConstraints::default();
         let sols = solve_all(
             &[lut.clone(), lut.clone(), lut.clone()],
-            &[constraints.clone(), constraints.clone(), constraints.clone()],
+            &[
+                constraints.clone(),
+                constraints.clone(),
+                constraints.clone(),
+            ],
         );
         assert_eq!(sols.len(), 3);
         for s in &sols {
@@ -1040,7 +1042,7 @@ mod tests {
         let c1 = LayerIlpConstraints::default();
         let mut c2 = c1.clone();
         c2.smem_budget = 4096; // forces csha=0 → different solution
-        // Pattern: A, A, B, A — three template switches, two solves of A.
+                               // Pattern: A, A, B, A — three template switches, two solves of A.
         let luts = vec![lut.clone(); 4];
         let cs = vec![c1.clone(), c1.clone(), c2, c1];
         let (sols, stats) = solve_all_templated(&luts, &cs);
@@ -1072,7 +1074,11 @@ mod tests {
         let sol = solve_layer(&lut, &LayerIlpConstraints::default());
         // Sanity bound: (2^8 - 1) × 5 × 4 × 5 × 3 × 3 × 2 (FASE) × 4 (PCA)
         // = 1 836 000.  Allow 2× for expansion inside branches.
-        assert!(sol.nodes_explored <= 4_000_000, "nodes={}", sol.nodes_explored);
+        assert!(
+            sol.nodes_explored <= 4_000_000,
+            "nodes={}",
+            sol.nodes_explored
+        );
     }
 
     #[test]

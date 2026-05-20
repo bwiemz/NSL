@@ -7,7 +7,7 @@ use std::sync::atomic::Ordering;
 use crate::autodiff;
 use crate::memory::checked_alloc;
 
-use super::{NslTensor, nsl_tensor_contiguous, nsl_tensor_free};
+use super::{nsl_tensor_contiguous, nsl_tensor_free, NslTensor};
 
 #[no_mangle]
 pub extern "C" fn nsl_tensor_sin(tensor_ptr: i64) -> i64 {
@@ -16,10 +16,16 @@ pub extern "C" fn nsl_tensor_sin(tensor_ptr: i64) -> i64 {
         if ta.device > 0 {
             #[cfg(feature = "cuda")]
             {
-                return crate::cuda::gpu_elementwise_unary(tensor_ptr, crate::cuda::kernels::SIN_F32_PTX, "nsl_sin_f32\0");
+                return crate::cuda::gpu_elementwise_unary(
+                    tensor_ptr,
+                    crate::cuda::kernels::SIN_F32_PTX,
+                    "nsl_sin_f32\0",
+                );
             }
             #[cfg(not(feature = "cuda"))]
-            { panic!("CUDA support not compiled"); }
+            {
+                panic!("CUDA support not compiled");
+            }
         }
     }
     let t_c = nsl_tensor_contiguous(tensor_ptr);
@@ -44,22 +50,18 @@ pub extern "C" fn nsl_tensor_sin(tensor_ptr: i64) -> i64 {
     };
 
     let result = Box::new(NslTensor::new(
-        data,
-        shape,
-        strides,
-        ndim,
-        len,
-        a.device,
-        a.dtype,
-        1,
-        0,
+        data, shape, strides, ndim, len, a.device, a.dtype, 1, 0,
     ));
     let result = NslTensor::publish(result);
     nsl_tensor_free(t_c);
     if autodiff::is_recording() {
-        NslTensor::from_ptr(tensor_ptr).refcount.fetch_add(1, Ordering::SeqCst);
+        NslTensor::from_ptr(tensor_ptr)
+            .refcount
+            .fetch_add(1, Ordering::SeqCst);
         autodiff::maybe_record(autodiff::TapeOp::Sin {
-            a: tensor_ptr, out: result, saved_a: tensor_ptr,
+            a: tensor_ptr,
+            out: result,
+            saved_a: tensor_ptr,
         });
     }
     result
@@ -72,10 +74,16 @@ pub extern "C" fn nsl_tensor_cos(tensor_ptr: i64) -> i64 {
         if ta.device > 0 {
             #[cfg(feature = "cuda")]
             {
-                return crate::cuda::gpu_elementwise_unary(tensor_ptr, crate::cuda::kernels::COS_F32_PTX, "nsl_cos_f32\0");
+                return crate::cuda::gpu_elementwise_unary(
+                    tensor_ptr,
+                    crate::cuda::kernels::COS_F32_PTX,
+                    "nsl_cos_f32\0",
+                );
             }
             #[cfg(not(feature = "cuda"))]
-            { panic!("CUDA support not compiled"); }
+            {
+                panic!("CUDA support not compiled");
+            }
         }
     }
     let t_c = nsl_tensor_contiguous(tensor_ptr);
@@ -100,22 +108,18 @@ pub extern "C" fn nsl_tensor_cos(tensor_ptr: i64) -> i64 {
     };
 
     let result = Box::new(NslTensor::new(
-        data,
-        shape,
-        strides,
-        ndim,
-        len,
-        a.device,
-        a.dtype,
-        1,
-        0,
+        data, shape, strides, ndim, len, a.device, a.dtype, 1, 0,
     ));
     let result = NslTensor::publish(result);
     nsl_tensor_free(t_c);
     if autodiff::is_recording() {
-        NslTensor::from_ptr(tensor_ptr).refcount.fetch_add(1, Ordering::SeqCst);
+        NslTensor::from_ptr(tensor_ptr)
+            .refcount
+            .fetch_add(1, Ordering::SeqCst);
         autodiff::maybe_record(autodiff::TapeOp::Cos {
-            a: tensor_ptr, out: result, saved_a: tensor_ptr,
+            a: tensor_ptr,
+            out: result,
+            saved_a: tensor_ptr,
         });
     }
     result

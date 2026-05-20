@@ -74,13 +74,7 @@ impl Compiler<'_> {
                     arg_vals.push(self.compile_expr(builder, state, &arg.value)?);
                 }
                 let result = self.compile_call_by_name(builder, &member_name, &arg_vals)?;
-                self.register_ffi_result_ownership(
-                    builder,
-                    state,
-                    &member_name,
-                    result,
-                    &arg_vals,
-                );
+                self.register_ffi_result_ownership(builder, state, &member_name, result, &arg_vals);
                 return Ok(result);
             }
             if matches!(obj_type, Type::Str) {
@@ -165,8 +159,9 @@ impl Compiler<'_> {
                             // device, so insertion is safe-by-default for I64 tensor values.
                             let compiled_ty = builder.func.dfg.value_type(compiled);
                             if compiled_ty == cl_types::I64 {
-                                if let Some(&(_, target_device)) =
-                                    device_transfers.iter().find(|(idx, _)| *idx == call_arg_idx)
+                                if let Some(&(_, target_device)) = device_transfers
+                                    .iter()
+                                    .find(|(idx, _)| *idx == call_arg_idx)
                                 {
                                     let device_val =
                                         builder.ins().iconst(cl_types::I64, target_device);
@@ -1193,7 +1188,8 @@ impl Compiler<'_> {
 
             // Check if the enclosing function has @flash_attention decorator
             if self.kernels.flash_attention_context.is_some() {
-                return self.compile_flash_attention_call(builder, state, q_val, k_val, v_val, scale_val);
+                return self
+                    .compile_flash_attention_call(builder, state, q_val, k_val, v_val, scale_val);
             }
 
             // M34: Check for context parallelism (ring attention)
@@ -1289,9 +1285,16 @@ impl Compiler<'_> {
             )?;
             // ELTLS (FBIP-3): nsl_tensor_matmul takes a flags byte.
             let matmul_flags0 = builder.ins().iconst(cl_types::I8, 0);
-            let scores = self.compile_traced_call(builder, "nsl_tensor_matmul", &[q_val, k_t, matmul_flags0])?;
-            let scaled =
-                self.compile_traced_call(builder, "nsl_tensor_mul_scalar", &[scores, scale_val, matmul_flags0])?;
+            let scores = self.compile_traced_call(
+                builder,
+                "nsl_tensor_matmul",
+                &[q_val, k_t, matmul_flags0],
+            )?;
+            let scaled = self.compile_traced_call(
+                builder,
+                "nsl_tensor_mul_scalar",
+                &[scores, scale_val, matmul_flags0],
+            )?;
 
             let masked = if causal {
                 let dim_neg2 = builder.ins().iconst(cl_types::I64, -2_i64);
@@ -1302,7 +1305,11 @@ impl Compiler<'_> {
                 {
                     // ELTLS (FBIP-3): nsl_tensor_add takes flags=0 here.
                     let flags_zero = builder.ins().iconst(cl_types::I8, 0);
-                    self.compile_traced_call(builder, "nsl_tensor_add", &[scaled, mask, flags_zero])?
+                    self.compile_traced_call(
+                        builder,
+                        "nsl_tensor_add",
+                        &[scaled, mask, flags_zero],
+                    )?
                 }
             } else {
                 scaled
@@ -1313,7 +1320,11 @@ impl Compiler<'_> {
                 self.compile_traced_call(builder, "nsl_tensor_softmax", &[masked, dim_neg1])?;
             // ELTLS (FBIP-3): nsl_tensor_matmul takes a flags byte.
             let final_matmul_flags0 = builder.ins().iconst(cl_types::I8, 0);
-            return self.compile_traced_call(builder, "nsl_tensor_matmul", &[attn_weights, v_val, final_matmul_flags0]);
+            return self.compile_traced_call(
+                builder,
+                "nsl_tensor_matmul",
+                &[attn_weights, v_val, final_matmul_flags0],
+            );
         }
 
         // sum/mean with dim args -- overload: sum(tensor) or sum(tensor, dim, keepdim)
@@ -2081,13 +2092,7 @@ impl Compiler<'_> {
                 arg_vals.push(self.compile_expr(builder, state, &arg.value)?);
             }
             let result = self.compile_call_by_name(builder, &func_name, &arg_vals)?;
-            self.register_ffi_result_ownership(
-                builder,
-                state,
-                &func_name,
-                result,
-                &arg_vals,
-            );
+            self.register_ffi_result_ownership(builder, state, &func_name, result, &arg_vals);
             return Ok(result);
         }
 
@@ -2143,7 +2148,9 @@ impl Compiler<'_> {
                 .runtime_fns
                 .get(alias)
                 .cloned()
-                .ok_or_else(|| CodegenError::new(format!("undefined function '{effective_name}'")))?
+                .ok_or_else(|| {
+                    CodegenError::new(format!("undefined function '{effective_name}'"))
+                })?
         } else {
             return Err(CodegenError::new(format!(
                 "undefined function '{effective_name}'"

@@ -111,11 +111,12 @@ pub extern "C" fn nsl_lookahead_init(ngram_size: i64, window: i64) -> i64 {
 /// Seed the n-gram pool from prompt tokens.
 #[no_mangle]
 pub extern "C" fn nsl_lookahead_seed(runner_ptr: i64, tokens_ptr: i64, num_tokens: i64) -> i64 {
-    if runner_ptr == 0 || tokens_ptr == 0 { return -1; }
+    if runner_ptr == 0 || tokens_ptr == 0 {
+        return -1;
+    }
     let runner = unsafe { &mut *(runner_ptr as *mut LookaheadRunner) };
-    let tokens = unsafe {
-        std::slice::from_raw_parts(tokens_ptr as *const i64, num_tokens as usize)
-    };
+    let tokens =
+        unsafe { std::slice::from_raw_parts(tokens_ptr as *const i64, num_tokens as usize) };
     runner.seed_from_prompt(tokens);
     0
 }
@@ -130,16 +131,19 @@ pub extern "C" fn nsl_lookahead_generate(
     out_ptr: i64,
     max_out: i64,
 ) -> i64 {
-    if runner_ptr == 0 || context_ptr == 0 || out_ptr == 0 { return 0; }
+    if runner_ptr == 0 || context_ptr == 0 || out_ptr == 0 {
+        return 0;
+    }
     let runner = unsafe { &*(runner_ptr as *const LookaheadRunner) };
-    let context = unsafe {
-        std::slice::from_raw_parts(context_ptr as *const i64, context_len as usize)
-    };
+    let context =
+        unsafe { std::slice::from_raw_parts(context_ptr as *const i64, context_len as usize) };
     let candidates = runner.generate_candidates(context);
     let n = candidates.len().min(max_out as usize);
     let out = out_ptr as *mut i64;
     for (i, &tok) in candidates.iter().take(n).enumerate() {
-        unsafe { *out.add(i) = tok; }
+        unsafe {
+            *out.add(i) = tok;
+        }
     }
     n as i64
 }
@@ -147,8 +151,12 @@ pub extern "C" fn nsl_lookahead_generate(
 /// Destroy a LookaheadRunner.
 #[no_mangle]
 pub extern "C" fn nsl_lookahead_destroy(runner_ptr: i64) -> i64 {
-    if runner_ptr == 0 { return 0; }
-    unsafe { drop(Box::from_raw(runner_ptr as *mut LookaheadRunner)); }
+    if runner_ptr == 0 {
+        return 0;
+    }
+    unsafe {
+        drop(Box::from_raw(runner_ptr as *mut LookaheadRunner));
+    }
     0
 }
 
@@ -221,8 +229,11 @@ mod tests {
         let context: Vec<i64> = vec![3, 4];
         let mut out = vec![0i64; 5];
         let n = nsl_lookahead_generate(
-            runner, context.as_ptr() as i64, context.len() as i64,
-            out.as_mut_ptr() as i64, out.len() as i64,
+            runner,
+            context.as_ptr() as i64,
+            context.len() as i64,
+            out.as_mut_ptr() as i64,
+            out.len() as i64,
         );
         assert_eq!(n, 1);
         assert_eq!(out[0], 5);

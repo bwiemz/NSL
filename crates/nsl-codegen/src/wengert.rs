@@ -424,7 +424,11 @@ mod tests {
         let components: Vec<PrimalOp> = (0u8..=7)
             .map(|c| PrimalOp::CshaFusedBackwardExtract { component: c })
             .collect();
-        assert_eq!(components.len(), 8, "CSHA fused backward has 8 outputs (7+dx_norm)");
+        assert_eq!(
+            components.len(),
+            8,
+            "CSHA fused backward has 8 outputs (7+dx_norm)"
+        );
         // All seven variants are PartialEq-distinct.
         for (i, a) in components.iter().enumerate() {
             for (j, b) in components.iter().enumerate() {

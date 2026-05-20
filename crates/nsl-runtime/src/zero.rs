@@ -184,7 +184,9 @@ pub extern "C" fn nsl_zero_reduce_grads(grads_list_ptr: i64, num_params: i64) ->
                     // f64
                     let data = tensor.data as *mut f64;
                     for j in 0..len {
-                        unsafe { *data.add(j) /= ws; }
+                        unsafe {
+                            *data.add(j) /= ws;
+                        }
                     }
                 }
                 1 => {
@@ -192,7 +194,9 @@ pub extern "C" fn nsl_zero_reduce_grads(grads_list_ptr: i64, num_params: i64) ->
                     let data = tensor.data as *mut f32;
                     let ws32 = ws as f32;
                     for j in 0..len {
-                        unsafe { *data.add(j) /= ws32; }
+                        unsafe {
+                            *data.add(j) /= ws32;
+                        }
                     }
                 }
                 _ => {} // Other dtypes: skip for now
@@ -253,11 +257,7 @@ pub extern "C" fn nsl_zero_destroy() -> i64 {
 /// `num_elems` is the number of elements to accumulate (must match tensor lengths).
 /// Returns 0 on success, -1 on error.
 #[no_mangle]
-pub extern "C" fn nsl_grad_accumulate_add(
-    dst_ptr: i64,
-    src_ptr: i64,
-    num_elems: i64,
-) -> i64 {
+pub extern "C" fn nsl_grad_accumulate_add(dst_ptr: i64, src_ptr: i64, num_elems: i64) -> i64 {
     let dst_tensor = dst_ptr as *mut NslTensor;
     let src_tensor = src_ptr as *const NslTensor;
     if dst_tensor.is_null() || src_tensor.is_null() {
@@ -279,7 +279,9 @@ pub extern "C" fn nsl_grad_accumulate_add(
             let d = dst.data as *mut f64;
             let s = src.data as *const f64;
             for i in 0..n {
-                unsafe { *d.add(i) += *s.add(i); }
+                unsafe {
+                    *d.add(i) += *s.add(i);
+                }
             }
         }
         (1, 1) => {
@@ -287,7 +289,9 @@ pub extern "C" fn nsl_grad_accumulate_add(
             let d = dst.data as *mut f32;
             let s = src.data as *const f32;
             for i in 0..n {
-                unsafe { *d.add(i) += *s.add(i); }
+                unsafe {
+                    *d.add(i) += *s.add(i);
+                }
             }
         }
         _ => {
@@ -295,7 +299,9 @@ pub extern "C" fn nsl_grad_accumulate_add(
             let d = dst.data as *mut f64;
             let s = src.data as *const f64;
             for i in 0..n {
-                unsafe { *d.add(i) += *s.add(i); }
+                unsafe {
+                    *d.add(i) += *s.add(i);
+                }
             }
         }
     }
@@ -324,7 +330,7 @@ pub extern "C" fn nsl_grad_zero(grad_ptr: i64, num_elems: i64) -> i64 {
         0 => 8usize, // f64
         1 => 4,      // f32
         2 | 3 => 2,  // f16/bf16
-        4..=6 => 1, // i8/fp8
+        4..=6 => 1,  // i8/fp8
         _ => 8,      // default to f64 width
     };
 
@@ -414,11 +420,11 @@ mod tests {
         assert_eq!(owned, 3);
 
         // Check ownership
-        assert_eq!(nsl_zero_owns_param(0), 1);  // owned
-        assert_eq!(nsl_zero_owns_param(4), 1);  // owned
-        assert_eq!(nsl_zero_owns_param(8), 1);  // owned
-        assert_eq!(nsl_zero_owns_param(1), 0);  // not owned
-        assert_eq!(nsl_zero_owns_param(2), 0);  // not owned
+        assert_eq!(nsl_zero_owns_param(0), 1); // owned
+        assert_eq!(nsl_zero_owns_param(4), 1); // owned
+        assert_eq!(nsl_zero_owns_param(8), 1); // owned
+        assert_eq!(nsl_zero_owns_param(1), 0); // not owned
+        assert_eq!(nsl_zero_owns_param(2), 0); // not owned
 
         // Reduce and step are no-ops for world_size=1 processes
         // (even though world_size=4, we're single-process so reduce_grads
@@ -460,7 +466,7 @@ mod tests {
             len: 4,
             refcount: std::sync::atomic::AtomicI64::new(1),
             device: 0,
-            dtype: 0, // f64
+            dtype: 0,     // f64
             owns_data: 0, // borrowed
             data_owner: 0,
             slab_managed: 0,

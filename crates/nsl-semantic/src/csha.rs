@@ -83,10 +83,8 @@ pub fn validate_csha_decorator(
         for arg in args {
             let Some(ref name_sym) = arg.name else {
                 diagnostics.push(
-                    Diagnostic::error(
-                        "@csha: positional arguments are not allowed".to_string(),
-                    )
-                    .with_label(arg.span, "expected `key = value`"),
+                    Diagnostic::error("@csha: positional arguments are not allowed".to_string())
+                        .with_label(arg.span, "expected `key = value`"),
                 );
                 continue;
             };
@@ -96,16 +94,13 @@ pub fn validate_csha_decorator(
                     ExprKind::IntLiteral(n) => match CshaLevel::from_u8(*n as u8) {
                         Some(l) => level = Some(l),
                         None => diagnostics.push(
-                            Diagnostic::error(format!(
-                                "@csha: level must be 1, 2, or 3 (got {n})"
-                            ))
-                            .with_label(arg.span, "invalid level"),
+                            Diagnostic::error(format!("@csha: level must be 1, 2, or 3 (got {n})"))
+                                .with_label(arg.span, "invalid level"),
                         ),
                     },
                     _ => diagnostics.push(
                         Diagnostic::error(
-                            "@csha: level must be an integer literal (1, 2, or 3)"
-                                .to_string(),
+                            "@csha: level must be an integer literal (1, 2, or 3)".to_string(),
                         )
                         .with_label(arg.span, "expected integer"),
                     ),
@@ -124,10 +119,8 @@ pub fn validate_csha_decorator(
                 "disable" | "disabled" => match &arg.value.kind {
                     ExprKind::BoolLiteral(b) => disabled = *b,
                     _ => diagnostics.push(
-                        Diagnostic::error(
-                            "@csha: disable must be a boolean literal".to_string(),
-                        )
-                        .with_label(arg.span, "expected bool"),
+                        Diagnostic::error("@csha: disable must be a boolean literal".to_string())
+                            .with_label(arg.span, "expected bool"),
                     ),
                 },
                 _ => diagnostics.push(
@@ -143,10 +136,8 @@ pub fn validate_csha_decorator(
     // other compiler-native-training decorators.
     if disabled && level.is_some() {
         diagnostics.push(
-            Diagnostic::error(
-                "@csha: cannot specify both `level` and `disable=true`".to_string(),
-            )
-            .with_label(deco.span, "conflicting arguments"),
+            Diagnostic::error("@csha: cannot specify both `level` and `disable=true`".to_string())
+                .with_label(deco.span, "conflicting arguments"),
         );
     }
 

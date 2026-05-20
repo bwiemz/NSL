@@ -30,7 +30,11 @@ impl Span {
     };
 
     pub fn new(file_id: FileId, start: BytePos, end: BytePos) -> Self {
-        Self { file_id, start, end }
+        Self {
+            file_id,
+            start,
+            end,
+        }
     }
 
     pub fn dummy() -> Self {
@@ -38,7 +42,10 @@ impl Span {
     }
 
     pub fn merge(self, other: Span) -> Span {
-        assert_eq!(self.file_id, other.file_id, "cannot merge spans from different files");
+        assert_eq!(
+            self.file_id, other.file_id,
+            "cannot merge spans from different files"
+        );
         Span {
             file_id: self.file_id,
             start: std::cmp::min(self.start, other.start),

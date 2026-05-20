@@ -23,7 +23,11 @@ impl PreemptionManager {
         }
     }
 
-    pub fn choose_policy(&self, total_tokens: usize, kv_bytes_per_token: usize) -> PreemptionPolicy {
+    pub fn choose_policy(
+        &self,
+        total_tokens: usize,
+        kv_bytes_per_token: usize,
+    ) -> PreemptionPolicy {
         let swap_time = (total_tokens * kv_bytes_per_token) as f64 / self.pcie_bandwidth;
         let recompute_time = total_tokens as f64 / self.prefill_throughput;
         if swap_time < recompute_time {
@@ -35,7 +39,9 @@ impl PreemptionManager {
 
     pub fn preempt_recompute(request: &mut InferenceRequest) {
         let generated = request.generated_tokens.clone();
-        request.state = RequestState::Preempted { generated_so_far: generated };
+        request.state = RequestState::Preempted {
+            generated_so_far: generated,
+        };
         request.kv_seq_id = None;
     }
 
@@ -44,7 +50,9 @@ impl PreemptionManager {
             let mut full_tokens = request.prompt_tokens.clone();
             full_tokens.extend(generated_so_far);
             request.prompt_tokens = full_tokens;
-            request.state = RequestState::Prefilling { tokens_processed: 0 };
+            request.state = RequestState::Prefilling {
+                tokens_processed: 0,
+            };
         }
     }
 }
@@ -84,7 +92,12 @@ mod tests {
         assert!(req.kv_seq_id.is_none());
 
         PreemptionManager::resume_recompute(&mut req);
-        assert!(matches!(req.state, RequestState::Prefilling { tokens_processed: 0 }));
+        assert!(matches!(
+            req.state,
+            RequestState::Prefilling {
+                tokens_processed: 0
+            }
+        ));
         assert_eq!(req.prompt_tokens, vec![1, 2, 3, 10, 11, 12]);
     }
 }

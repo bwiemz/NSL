@@ -1,4 +1,4 @@
-use nsl_runtime::inspect::format::{StatsHeader, FullHeader, write_stats, write_full};
+use nsl_runtime::inspect::format::{write_full, write_stats, FullHeader, StatsHeader};
 
 #[test]
 fn write_stats_round_trips_header() {
@@ -30,9 +30,15 @@ fn write_full_aligns_data_to_64_bytes() {
         dtype: "bf16".into(),
         shape: vec![1, 8, 16],
         stats: StatsHeader {
-            step: 5, tensor_name: "qkv".into(), kind: "full".into(),
-            mean: 0.0, std: 1.0, min: -1.0, max: 1.0,
-            nan_count: 0, inf_count: 0,
+            step: 5,
+            tensor_name: "qkv".into(),
+            kind: "full".into(),
+            mean: 0.0,
+            std: 1.0,
+            min: -1.0,
+            max: 1.0,
+            nan_count: 0,
+            inf_count: 0,
         },
     };
     let data: Vec<u8> = (0..256u16).flat_map(|n| n.to_le_bytes()).collect();
@@ -43,7 +49,10 @@ fn write_full_aligns_data_to_64_bytes() {
     let header_len = u64::from_le_bytes(bytes[8..16].try_into().unwrap()) as usize;
     let expected_data_start = ((16 + header_len + 63) / 64) * 64;
     assert_eq!(expected_data_start % 64, 0);
-    assert_eq!(&bytes[expected_data_start..expected_data_start + data.len()], &data[..]);
+    assert_eq!(
+        &bytes[expected_data_start..expected_data_start + data.len()],
+        &data[..]
+    );
 }
 
 #[test]

@@ -96,7 +96,10 @@ impl FusionPlan {
     }
 
     pub fn fused_count(&self) -> usize {
-        self.decisions.iter().filter(|d| d.target.is_fused()).count()
+        self.decisions
+            .iter()
+            .filter(|d| d.target.is_fused())
+            .count()
     }
     pub fn total_count(&self) -> usize {
         self.decisions
@@ -116,10 +119,7 @@ impl FusionPlan {
 /// Decide fusion for every placement.  The returned plan is in the same order
 /// as the input; a 1:1 map is intentional so callers can zip against other
 /// per-site arrays (e.g. rank allocations).
-pub fn build_fusion_plan(
-    placements: &[AdapterPlacement],
-    ranks: Option<&[usize]>,
-) -> FusionPlan {
+pub fn build_fusion_plan(placements: &[AdapterPlacement], ranks: Option<&[usize]>) -> FusionPlan {
     let mut decisions = Vec::with_capacity(placements.len());
     for (idx, p) in placements.iter().enumerate() {
         let eff_rank = match ranks {
@@ -162,11 +162,7 @@ fn infer_site_kind(name: &str, ai: f64) -> SiteKind {
 
 fn decide(p: &AdapterPlacement, rank: usize) -> (FusionTarget, String, u64) {
     match p.adapter {
-        AdapterKind::Skip => (
-            FusionTarget::NoOp,
-            "placement skipped this site".into(),
-            0,
-        ),
+        AdapterKind::Skip => (FusionTarget::NoOp, "placement skipped this site".into(), 0),
         AdapterKind::Ia3 => {
             // IA³ is a per-output scaling vector — always fusible into the
             // host kernel's epilogue (norm / softmax).
@@ -185,10 +181,7 @@ fn decide(p: &AdapterPlacement, rank: usize) -> (FusionTarget, String, u64) {
                 // B.3.1: if the user decorated this as GatedLoRA, emit the
                 // dedicated EpilogueFusedGatedLora variant so the AST rewrite
                 // dispatch chooses the GatedLoRA fused path.
-                if matches!(
-                    p.decorator_kind,
-                    Some(crate::AdapterKind::GatedLora)
-                ) {
+                if matches!(p.decorator_kind, Some(crate::AdapterKind::GatedLora)) {
                     return (
                         FusionTarget::EpilogueFusedGatedLora { rank },
                         format!(
@@ -236,8 +229,7 @@ pub fn verify_fused_sites_have_no_intermediate(
         // B.3.1: also verify GatedLoRA fused sites have no intermediates.
         if !matches!(
             decision.target,
-            FusionTarget::EpilogueFusedLora { .. }
-                | FusionTarget::EpilogueFusedGatedLora { .. }
+            FusionTarget::EpilogueFusedLora { .. } | FusionTarget::EpilogueFusedGatedLora { .. }
         ) {
             continue;
         }

@@ -3,25 +3,14 @@ use std::ffi::c_void;
 
 use crate::list::NslList;
 use crate::tensor::{
-    nsl_tensor_clone as tensor_clone,
-    nsl_tensor_cos as tensor_cos,
-    nsl_tensor_div as tensor_div,
-    nsl_tensor_free as tensor_free,
-    nsl_tensor_item as tensor_item,
-    nsl_tensor_matmul as tensor_matmul,
-    nsl_tensor_mul as tensor_mul,
-    nsl_tensor_mul_scalar as tensor_mul_scalar,
-    nsl_tensor_neg as tensor_neg,
-    nsl_tensor_rotate_half as tensor_rotate_half,
-    nsl_tensor_select as nsl_tensor_select,
-    nsl_tensor_shape as tensor_shape,
-    nsl_tensor_sign as tensor_sign,
-    nsl_tensor_sin as tensor_sin,
-    nsl_tensor_sum_dim as nsl_tensor_sum_dim,
-    nsl_tensor_to_device,
-    nsl_tensor_transpose as tensor_transpose,
-    nsl_tensor_zeros as tensor_zeros,
-    NslTensor,
+    nsl_tensor_clone as tensor_clone, nsl_tensor_cos as tensor_cos, nsl_tensor_div as tensor_div,
+    nsl_tensor_free as tensor_free, nsl_tensor_item as tensor_item,
+    nsl_tensor_matmul as tensor_matmul, nsl_tensor_mul as tensor_mul,
+    nsl_tensor_mul_scalar as tensor_mul_scalar, nsl_tensor_neg as tensor_neg,
+    nsl_tensor_rotate_half as tensor_rotate_half, nsl_tensor_select,
+    nsl_tensor_shape as tensor_shape, nsl_tensor_sign as tensor_sign, nsl_tensor_sin as tensor_sin,
+    nsl_tensor_sum_dim, nsl_tensor_to_device, nsl_tensor_transpose as tensor_transpose,
+    nsl_tensor_zeros as tensor_zeros, NslTensor,
 };
 
 use super::grad_utils::{
@@ -44,7 +33,11 @@ fn relu_backward(grad_ptr: i64, input_ptr: i64) -> i64 {
     let in_dtype = input.dtype;
     let shape = NslTensor::copy_shape(input.shape, ndim);
     let strides = NslTensor::compute_strides(shape, ndim);
-    let elem_size = if in_dtype == 1 { std::mem::size_of::<f32>() } else { std::mem::size_of::<f64>() };
+    let elem_size = if in_dtype == 1 {
+        std::mem::size_of::<f32>()
+    } else {
+        std::mem::size_of::<f64>()
+    };
     let data_raw = crate::memory::checked_alloc(len * elem_size);
     if in_dtype == 1 {
         let data = data_raw as *mut f32;
@@ -88,7 +81,11 @@ fn gelu_backward(grad_ptr: i64, input_ptr: i64) -> i64 {
     let in_dtype = input.dtype;
     let shape = NslTensor::copy_shape(input.shape, ndim);
     let strides = NslTensor::compute_strides(shape, ndim);
-    let elem_size = if in_dtype == 1 { std::mem::size_of::<f32>() } else { std::mem::size_of::<f64>() };
+    let elem_size = if in_dtype == 1 {
+        std::mem::size_of::<f32>()
+    } else {
+        std::mem::size_of::<f64>()
+    };
     let data_raw = crate::memory::checked_alloc(len * elem_size);
     let c = (2.0_f64 / std::f64::consts::PI).sqrt();
     if in_dtype == 1 {
@@ -100,7 +97,8 @@ fn gelu_backward(grad_ptr: i64, input_ptr: i64) -> i64 {
             let inner = c * (x + 0.044715 * x * x * x);
             let tanh_inner = inner.tanh();
             let sech2 = 1.0 - tanh_inner * tanh_inner;
-            let deriv = 0.5 * (1.0 + tanh_inner) + 0.5 * x * sech2 * c * (1.0 + 3.0 * 0.044715 * x * x);
+            let deriv =
+                0.5 * (1.0 + tanh_inner) + 0.5 * x * sech2 * c * (1.0 + 3.0 * 0.044715 * x * x);
             unsafe { *data.add(i) = (g * deriv) as f32 };
             let _ = c_f32; // suppress unused warning
         }
@@ -112,7 +110,8 @@ fn gelu_backward(grad_ptr: i64, input_ptr: i64) -> i64 {
             let inner = c * (x + 0.044715 * x * x * x);
             let tanh_inner = inner.tanh();
             let sech2 = 1.0 - tanh_inner * tanh_inner;
-            let deriv = 0.5 * (1.0 + tanh_inner) + 0.5 * x * sech2 * c * (1.0 + 3.0 * 0.044715 * x * x);
+            let deriv =
+                0.5 * (1.0 + tanh_inner) + 0.5 * x * sech2 * c * (1.0 + 3.0 * 0.044715 * x * x);
             unsafe { *data.add(i) = g * deriv };
         }
     }
@@ -143,7 +142,11 @@ fn silu_backward(grad_ptr: i64, input_ptr: i64) -> i64 {
     let in_dtype = input.dtype;
     let shape = NslTensor::copy_shape(input.shape, ndim);
     let strides = NslTensor::compute_strides(shape, ndim);
-    let elem_size = if in_dtype == 1 { std::mem::size_of::<f32>() } else { std::mem::size_of::<f64>() };
+    let elem_size = if in_dtype == 1 {
+        std::mem::size_of::<f32>()
+    } else {
+        std::mem::size_of::<f64>()
+    };
     let data_raw = crate::memory::checked_alloc(len * elem_size);
     if in_dtype == 1 {
         let data = data_raw as *mut f32;
@@ -191,7 +194,11 @@ fn sigmoid_backward(grad_ptr: i64, out_ptr: i64) -> i64 {
     let out_dtype = out.dtype;
     let shape = NslTensor::copy_shape(out.shape, ndim);
     let strides = NslTensor::compute_strides(shape, ndim);
-    let elem_size = if out_dtype == 1 { std::mem::size_of::<f32>() } else { std::mem::size_of::<f64>() };
+    let elem_size = if out_dtype == 1 {
+        std::mem::size_of::<f32>()
+    } else {
+        std::mem::size_of::<f64>()
+    };
     let data_raw = crate::memory::checked_alloc(len * elem_size);
     if out_dtype == 1 {
         let data = data_raw as *mut f32;
@@ -235,7 +242,11 @@ fn tanh_backward(grad_ptr: i64, out_ptr: i64) -> i64 {
     let out_dtype = out.dtype;
     let shape = NslTensor::copy_shape(out.shape, ndim);
     let strides = NslTensor::compute_strides(shape, ndim);
-    let elem_size = if out_dtype == 1 { std::mem::size_of::<f32>() } else { std::mem::size_of::<f64>() };
+    let elem_size = if out_dtype == 1 {
+        std::mem::size_of::<f32>()
+    } else {
+        std::mem::size_of::<f64>()
+    };
     let data_raw = crate::memory::checked_alloc(len * elem_size);
     if out_dtype == 1 {
         let data = data_raw as *mut f32;
@@ -288,13 +299,25 @@ fn softmax_backward(grad_ptr: i64, out_ptr: i64, dim: i64) -> i64 {
     let out_dtype = out.dtype;
     let shape = NslTensor::copy_shape(out.shape, ndim);
     let strides = NslTensor::compute_strides(shape, ndim);
-    let elem_size = if out_dtype == 1 { std::mem::size_of::<f32>() } else { std::mem::size_of::<f64>() };
+    let elem_size = if out_dtype == 1 {
+        std::mem::size_of::<f32>()
+    } else {
+        std::mem::size_of::<f64>()
+    };
     let data_size = len * elem_size;
     let data_raw: *mut c_void = crate::memory::checked_alloc_zeroed(data_size) as *mut c_void;
 
-    let d = if dim < 0 { (ndim + dim) as usize } else { dim as usize };
-    let o_shape: Vec<i64> = (0..ndim as usize).map(|i| unsafe { *out.shape.add(i) }).collect();
-    let o_strides: Vec<i64> = (0..ndim as usize).map(|i| unsafe { *out.strides.add(i) }).collect();
+    let d = if dim < 0 {
+        (ndim + dim) as usize
+    } else {
+        dim as usize
+    };
+    let o_shape: Vec<i64> = (0..ndim as usize)
+        .map(|i| unsafe { *out.shape.add(i) })
+        .collect();
+    let o_strides: Vec<i64> = (0..ndim as usize)
+        .map(|i| unsafe { *out.strides.add(i) })
+        .collect();
     let dim_size = o_shape[d] as usize;
     let num_slices = len / dim_size;
 
@@ -302,7 +325,9 @@ fn softmax_backward(grad_ptr: i64, out_ptr: i64, dim: i64) -> i64 {
         let mut remaining = slice_idx;
         let mut base_offset: usize = 0;
         for axis in (0..ndim as usize).rev() {
-            if axis == d { continue; }
+            if axis == d {
+                continue;
+            }
             let idx = remaining % (o_shape[axis] as usize);
             remaining /= o_shape[axis] as usize;
             base_offset += idx * (o_strides[axis] as usize);
@@ -311,15 +336,31 @@ fn softmax_backward(grad_ptr: i64, out_ptr: i64, dim: i64) -> i64 {
         let mut dot = 0.0_f64;
         for k in 0..dim_size {
             let offset = base_offset + k * (o_strides[d] as usize);
-            let g = if out_dtype == 1 { unsafe { *grad.data_f32().add(offset) as f64 } } else { unsafe { *grad.data_f64().add(offset) } };
-            let o = if out_dtype == 1 { unsafe { *out.data_f32().add(offset) as f64 } } else { unsafe { *out.data_f64().add(offset) } };
+            let g = if out_dtype == 1 {
+                unsafe { *grad.data_f32().add(offset) as f64 }
+            } else {
+                unsafe { *grad.data_f64().add(offset) }
+            };
+            let o = if out_dtype == 1 {
+                unsafe { *out.data_f32().add(offset) as f64 }
+            } else {
+                unsafe { *out.data_f64().add(offset) }
+            };
             dot += g * o;
         }
 
         for k in 0..dim_size {
             let offset = base_offset + k * (o_strides[d] as usize);
-            let g = if out_dtype == 1 { unsafe { *grad.data_f32().add(offset) as f64 } } else { unsafe { *grad.data_f64().add(offset) } };
-            let o = if out_dtype == 1 { unsafe { *out.data_f32().add(offset) as f64 } } else { unsafe { *out.data_f64().add(offset) } };
+            let g = if out_dtype == 1 {
+                unsafe { *grad.data_f32().add(offset) as f64 }
+            } else {
+                unsafe { *grad.data_f64().add(offset) }
+            };
+            let o = if out_dtype == 1 {
+                unsafe { *out.data_f32().add(offset) as f64 }
+            } else {
+                unsafe { *out.data_f64().add(offset) }
+            };
             let val = o * (g - dot);
             if out_dtype == 1 {
                 unsafe { *(data_raw as *mut f32).add(offset) = val as f32 };
@@ -365,13 +406,25 @@ fn log_softmax_backward(grad_ptr: i64, out_ptr: i64, dim: i64) -> i64 {
     let out_dtype = out.dtype;
     let shape = NslTensor::copy_shape(out.shape, ndim);
     let strides = NslTensor::compute_strides(shape, ndim);
-    let elem_size = if out_dtype == 1 { std::mem::size_of::<f32>() } else { std::mem::size_of::<f64>() };
+    let elem_size = if out_dtype == 1 {
+        std::mem::size_of::<f32>()
+    } else {
+        std::mem::size_of::<f64>()
+    };
     let data_size = len * elem_size;
     let data_raw: *mut c_void = crate::memory::checked_alloc_zeroed(data_size) as *mut c_void;
 
-    let d = if dim < 0 { (ndim + dim) as usize } else { dim as usize };
-    let o_shape: Vec<i64> = (0..ndim as usize).map(|i| unsafe { *out.shape.add(i) }).collect();
-    let o_strides: Vec<i64> = (0..ndim as usize).map(|i| unsafe { *out.strides.add(i) }).collect();
+    let d = if dim < 0 {
+        (ndim + dim) as usize
+    } else {
+        dim as usize
+    };
+    let o_shape: Vec<i64> = (0..ndim as usize)
+        .map(|i| unsafe { *out.shape.add(i) })
+        .collect();
+    let o_strides: Vec<i64> = (0..ndim as usize)
+        .map(|i| unsafe { *out.strides.add(i) })
+        .collect();
     let dim_size = o_shape[d] as usize;
     let num_slices = len / dim_size;
 
@@ -379,7 +432,9 @@ fn log_softmax_backward(grad_ptr: i64, out_ptr: i64, dim: i64) -> i64 {
         let mut remaining = slice_idx;
         let mut base_offset: usize = 0;
         for axis in (0..ndim as usize).rev() {
-            if axis == d { continue; }
+            if axis == d {
+                continue;
+            }
             let idx = remaining % (o_shape[axis] as usize);
             remaining /= o_shape[axis] as usize;
             base_offset += idx * (o_strides[axis] as usize);
@@ -389,15 +444,27 @@ fn log_softmax_backward(grad_ptr: i64, out_ptr: i64, dim: i64) -> i64 {
         let mut sum_grad = 0.0_f64;
         for k in 0..dim_size {
             let offset = base_offset + k * (o_strides[d] as usize);
-            let g = if out_dtype == 1 { unsafe { *grad.data_f32().add(offset) as f64 } } else { unsafe { *grad.data_f64().add(offset) } };
+            let g = if out_dtype == 1 {
+                unsafe { *grad.data_f32().add(offset) as f64 }
+            } else {
+                unsafe { *grad.data_f64().add(offset) }
+            };
             sum_grad += g;
         }
 
         // result[i] = grad[i] - exp(log_softmax_output[i]) * sum(grad)
         for k in 0..dim_size {
             let offset = base_offset + k * (o_strides[d] as usize);
-            let g = if out_dtype == 1 { unsafe { *grad.data_f32().add(offset) as f64 } } else { unsafe { *grad.data_f64().add(offset) } };
-            let o = if out_dtype == 1 { unsafe { *out.data_f32().add(offset) as f64 } } else { unsafe { *out.data_f64().add(offset) } };
+            let g = if out_dtype == 1 {
+                unsafe { *grad.data_f32().add(offset) as f64 }
+            } else {
+                unsafe { *grad.data_f64().add(offset) }
+            };
+            let o = if out_dtype == 1 {
+                unsafe { *out.data_f32().add(offset) as f64 }
+            } else {
+                unsafe { *out.data_f64().add(offset) }
+            };
             let val = g - o.exp() * sum_grad;
             if out_dtype == 1 {
                 unsafe { *(data_raw as *mut f32).add(offset) = val as f32 };
@@ -483,11 +550,14 @@ fn cat_backward(grad_ptr: i64, dim: usize, split_sizes: &[i64]) -> Vec<i64> {
         let device = grad.device;
         let grad_cpu = nsl_tensor_to_device(grad_ptr, 0);
         let cpu_results = cat_backward(grad_cpu, dim, split_sizes);
-        let gpu_results: Vec<i64> = cpu_results.iter().map(|&r| {
-            let gpu_r = nsl_tensor_to_device(r, device as i64);
-            tensor_free(r);
-            gpu_r
-        }).collect();
+        let gpu_results: Vec<i64> = cpu_results
+            .iter()
+            .map(|&r| {
+                let gpu_r = nsl_tensor_to_device(r, device as i64);
+                tensor_free(r);
+                gpu_r
+            })
+            .collect();
         tensor_free(grad_cpu);
         return gpu_results;
     }
@@ -495,9 +565,7 @@ fn cat_backward(grad_ptr: i64, dim: usize, split_sizes: &[i64]) -> Vec<i64> {
     let ndim = grad.ndim as usize;
     let grad_dtype = grad.dtype;
 
-    let grad_shape: Vec<i64> = (0..ndim)
-        .map(|i| unsafe { *grad.shape.add(i) })
-        .collect();
+    let grad_shape: Vec<i64> = (0..ndim).map(|i| unsafe { *grad.shape.add(i) }).collect();
     let grad_strides: Vec<usize> = (0..ndim)
         .map(|i| unsafe { *grad.strides.add(i) } as usize)
         .collect();
@@ -548,10 +616,16 @@ fn cat_backward(grad_ptr: i64, dim: usize, split_sizes: &[i64]) -> Vec<i64> {
 ///   d_x = (1/N) * inv_std * (N * d_normalized - sum(d_normalized) - normalized * sum(d_normalized * normalized))
 ///   d_weight = sum(d_out * normalized, across batch)
 ///   d_bias = sum(d_out, across batch)
-fn layernorm_backward(grad_ptr: i64, input_ptr: i64, mean_ptr: i64, inv_std_ptr: i64, weight_ptr: i64) -> (i64, i64, i64) {
+fn layernorm_backward(
+    grad_ptr: i64,
+    input_ptr: i64,
+    mean_ptr: i64,
+    inv_std_ptr: i64,
+    weight_ptr: i64,
+) -> (i64, i64, i64) {
     let grad = NslTensor::from_ptr(grad_ptr);
     let input = NslTensor::from_ptr(input_ptr);
-    let mean_t = NslTensor::from_ptr(mean_ptr);   // always f64
+    let mean_t = NslTensor::from_ptr(mean_ptr); // always f64
     let inv_std_t = NslTensor::from_ptr(inv_std_ptr); // always f64
     let weight = NslTensor::from_ptr(weight_ptr);
 
@@ -564,7 +638,8 @@ fn layernorm_backward(grad_ptr: i64, input_ptr: i64, mean_ptr: i64, inv_std_ptr:
         let mean_cpu = nsl_tensor_to_device(mean_ptr, 0);
         let inv_std_cpu = nsl_tensor_to_device(inv_std_ptr, 0);
         let weight_cpu = nsl_tensor_to_device(weight_ptr, 0);
-        let (dx_cpu, dw_cpu, db_cpu) = layernorm_backward(grad_cpu, input_cpu, mean_cpu, inv_std_cpu, weight_cpu);
+        let (dx_cpu, dw_cpu, db_cpu) =
+            layernorm_backward(grad_cpu, input_cpu, mean_cpu, inv_std_cpu, weight_cpu);
         let dx_gpu = nsl_tensor_to_device(dx_cpu, out_device as i64);
         let dw_gpu = nsl_tensor_to_device(dw_cpu, out_device as i64);
         let db_gpu = nsl_tensor_to_device(db_cpu, out_device as i64);
@@ -587,19 +662,35 @@ fn layernorm_backward(grad_ptr: i64, input_ptr: i64, mean_ptr: i64, inv_std_ptr:
     let nf = n as f64;
 
     let read_grad = |i: usize| -> f64 {
-        if grad.dtype == 1 { unsafe { *grad.data_f32().add(i) as f64 } } else { unsafe { *grad.data_f64().add(i) } }
+        if grad.dtype == 1 {
+            unsafe { *grad.data_f32().add(i) as f64 }
+        } else {
+            unsafe { *grad.data_f64().add(i) }
+        }
     };
     let read_weight = |i: usize| -> f64 {
-        if weight.dtype == 1 { unsafe { *weight.data_f32().add(i) as f64 } } else { unsafe { *weight.data_f64().add(i) } }
+        if weight.dtype == 1 {
+            unsafe { *weight.data_f32().add(i) as f64 }
+        } else {
+            unsafe { *weight.data_f64().add(i) }
+        }
     };
     let read_input = |i: usize| -> f64 {
-        if in_dtype == 1 { unsafe { *input.data_f32().add(i) as f64 } } else { unsafe { *input.data_f64().add(i) } }
+        if in_dtype == 1 {
+            unsafe { *input.data_f32().add(i) as f64 }
+        } else {
+            unsafe { *input.data_f64().add(i) }
+        }
     };
 
     // grad_input: same shape as input (matches input dtype)
     let dx_ptr = create_tensor_with_shape_dtype_device(
-        &(0..ndim).map(|i| unsafe { *input.shape.add(i) }).collect::<Vec<_>>(),
-        0.0, in_dtype, out_device,
+        &(0..ndim)
+            .map(|i| unsafe { *input.shape.add(i) })
+            .collect::<Vec<_>>(),
+        0.0,
+        in_dtype,
+        out_device,
     );
     let dx = NslTensor::from_ptr(dx_ptr);
 
@@ -610,16 +701,25 @@ fn layernorm_backward(grad_ptr: i64, input_ptr: i64, mean_ptr: i64, inv_std_ptr:
     let db = NslTensor::from_ptr(db_ptr);
 
     let write_dx = |i: usize, val: f64| {
-        if in_dtype == 1 { unsafe { *dx.data_f32().add(i) = val as f32 } }
-        else { unsafe { *dx.data_f64().add(i) = val } }
+        if in_dtype == 1 {
+            unsafe { *dx.data_f32().add(i) = val as f32 }
+        } else {
+            unsafe { *dx.data_f64().add(i) = val }
+        }
     };
     let write_dw = |i: usize, val: f64| {
-        if dw.dtype == 1 { unsafe { *dw.data_f32().add(i) = (*dw.data_f32().add(i) as f64 + val) as f32 } }
-        else { unsafe { *dw.data_f64().add(i) += val } }
+        if dw.dtype == 1 {
+            unsafe { *dw.data_f32().add(i) = (*dw.data_f32().add(i) as f64 + val) as f32 }
+        } else {
+            unsafe { *dw.data_f64().add(i) += val }
+        }
     };
     let write_db = |i: usize, val: f64| {
-        if db.dtype == 1 { unsafe { *db.data_f32().add(i) = (*db.data_f32().add(i) as f64 + val) as f32 } }
-        else { unsafe { *db.data_f64().add(i) += val } }
+        if db.dtype == 1 {
+            unsafe { *db.data_f32().add(i) = (*db.data_f32().add(i) as f64 + val) as f32 }
+        } else {
+            unsafe { *db.data_f64().add(i) += val }
+        }
     };
 
     for row in 0..num_rows {
@@ -649,7 +749,9 @@ fn layernorm_backward(grad_ptr: i64, input_ptr: i64, mean_ptr: i64, inv_std_ptr:
             let x = read_input(base + j);
             let normalized = (x - mean_val) * inv_std_val;
             let d_normalized = g * w;
-            let d_x = (1.0 / nf) * inv_std_val * (nf * d_normalized - sum_dnorm - normalized * sum_dnorm_norm);
+            let d_x = (1.0 / nf)
+                * inv_std_val
+                * (nf * d_normalized - sum_dnorm - normalized * sum_dnorm_norm);
             write_dx(base + j, d_x);
         }
     }
@@ -695,19 +797,35 @@ fn rmsnorm_backward(grad_ptr: i64, input_ptr: i64, rms_ptr: i64, weight_ptr: i64
     let nf = n as f64;
 
     let read_grad = |i: usize| -> f64 {
-        if grad.dtype == 1 { unsafe { *grad.data_f32().add(i) as f64 } } else { unsafe { *grad.data_f64().add(i) } }
+        if grad.dtype == 1 {
+            unsafe { *grad.data_f32().add(i) as f64 }
+        } else {
+            unsafe { *grad.data_f64().add(i) }
+        }
     };
     let read_weight = |i: usize| -> f64 {
-        if weight.dtype == 1 { unsafe { *weight.data_f32().add(i) as f64 } } else { unsafe { *weight.data_f64().add(i) } }
+        if weight.dtype == 1 {
+            unsafe { *weight.data_f32().add(i) as f64 }
+        } else {
+            unsafe { *weight.data_f64().add(i) }
+        }
     };
     let read_input = |i: usize| -> f64 {
-        if in_dtype == 1 { unsafe { *input.data_f32().add(i) as f64 } } else { unsafe { *input.data_f64().add(i) } }
+        if in_dtype == 1 {
+            unsafe { *input.data_f32().add(i) as f64 }
+        } else {
+            unsafe { *input.data_f64().add(i) }
+        }
     };
 
     // grad_input: same shape as input (matches input dtype)
     let dx_ptr = create_tensor_with_shape_dtype_device(
-        &(0..ndim).map(|i| unsafe { *input.shape.add(i) }).collect::<Vec<_>>(),
-        0.0, in_dtype, out_device,
+        &(0..ndim)
+            .map(|i| unsafe { *input.shape.add(i) })
+            .collect::<Vec<_>>(),
+        0.0,
+        in_dtype,
+        out_device,
     );
     let dx = NslTensor::from_ptr(dx_ptr);
 
@@ -716,12 +834,18 @@ fn rmsnorm_backward(grad_ptr: i64, input_ptr: i64, rms_ptr: i64, weight_ptr: i64
     let dw = NslTensor::from_ptr(dw_ptr);
 
     let write_dx = |i: usize, val: f64| {
-        if in_dtype == 1 { unsafe { *dx.data_f32().add(i) = val as f32 } }
-        else { unsafe { *dx.data_f64().add(i) = val } }
+        if in_dtype == 1 {
+            unsafe { *dx.data_f32().add(i) = val as f32 }
+        } else {
+            unsafe { *dx.data_f64().add(i) = val }
+        }
     };
     let write_dw = |i: usize, val: f64| {
-        if dw.dtype == 1 { unsafe { *dw.data_f32().add(i) = (*dw.data_f32().add(i) as f64 + val) as f32 } }
-        else { unsafe { *dw.data_f64().add(i) += val } }
+        if dw.dtype == 1 {
+            unsafe { *dw.data_f32().add(i) = (*dw.data_f32().add(i) as f64 + val) as f32 }
+        } else {
+            unsafe { *dw.data_f64().add(i) += val }
+        }
     };
 
     for row in 0..num_rows {
@@ -776,7 +900,11 @@ fn dropout_backward(grad_ptr: i64, mask_ptr: i64, scale: f64) -> i64 {
     let grad_dtype = grad.dtype;
     let shape = NslTensor::copy_shape(grad.shape, ndim);
     let strides = NslTensor::compute_strides(shape, ndim);
-    let elem_size = if grad_dtype == 1 { std::mem::size_of::<f32>() } else { std::mem::size_of::<f64>() };
+    let elem_size = if grad_dtype == 1 {
+        std::mem::size_of::<f32>()
+    } else {
+        std::mem::size_of::<f64>()
+    };
     let data_raw = crate::memory::checked_alloc(len * elem_size);
     if grad_dtype == 1 {
         let data = data_raw as *mut f32;
@@ -828,7 +956,9 @@ fn conv2d_backward(
         let grad_cpu = nsl_tensor_to_device(grad_ptr, 0);
         let input_cpu = nsl_tensor_to_device(input_ptr, 0);
         let weight_cpu = nsl_tensor_to_device(weight_ptr, 0);
-        let (dx_cpu, dw_cpu, db_cpu) = conv2d_backward(grad_cpu, input_cpu, weight_cpu, stride_h, stride_w, pad_h, pad_w);
+        let (dx_cpu, dw_cpu, db_cpu) = conv2d_backward(
+            grad_cpu, input_cpu, weight_cpu, stride_h, stride_w, pad_h, pad_w,
+        );
         let dx_gpu = nsl_tensor_to_device(dx_cpu, device as i64);
         let dw_gpu = nsl_tensor_to_device(dw_cpu, device as i64);
         let db_gpu = nsl_tensor_to_device(db_cpu, device as i64);
@@ -860,21 +990,38 @@ fn conv2d_backward(
     let dw_dtype = weight.dtype;
 
     let read_grad = |i: usize| -> f64 {
-        if grad_dtype == 1 { unsafe { *grad.data_f32().add(i) as f64 } } else { unsafe { *grad.data_f64().add(i) } }
+        if grad_dtype == 1 {
+            unsafe { *grad.data_f32().add(i) as f64 }
+        } else {
+            unsafe { *grad.data_f64().add(i) }
+        }
     };
     let read_input = |i: usize| -> f64 {
-        if in_dtype == 1 { unsafe { *input.data_f32().add(i) as f64 } } else { unsafe { *input.data_f64().add(i) } }
+        if in_dtype == 1 {
+            unsafe { *input.data_f32().add(i) as f64 }
+        } else {
+            unsafe { *input.data_f64().add(i) }
+        }
     };
     let read_weight = |i: usize| -> f64 {
-        if weight.dtype == 1 { unsafe { *weight.data_f32().add(i) as f64 } } else { unsafe { *weight.data_f64().add(i) } }
+        if weight.dtype == 1 {
+            unsafe { *weight.data_f32().add(i) as f64 }
+        } else {
+            unsafe { *weight.data_f64().add(i) }
+        }
     };
 
     // Allocate grad_input [N, C_in, H, W]
-    let dx_ptr = create_tensor_with_shape_dtype(&[n as i64, c_in as i64, h as i64, w as i64], 0.0, dx_dtype);
+    let dx_ptr =
+        create_tensor_with_shape_dtype(&[n as i64, c_in as i64, h as i64, w as i64], 0.0, dx_dtype);
     let dx = NslTensor::from_ptr(dx_ptr);
 
     // Allocate grad_weight [C_out, C_in, kH, kW]
-    let dw_ptr = create_tensor_with_shape_dtype(&[c_out as i64, c_in as i64, kh as i64, kw as i64], 0.0, dw_dtype);
+    let dw_ptr = create_tensor_with_shape_dtype(
+        &[c_out as i64, c_in as i64, kh as i64, kw as i64],
+        0.0,
+        dw_dtype,
+    );
     let dw = NslTensor::from_ptr(dw_ptr);
 
     // Allocate grad_bias [C_out] — matches weight dtype
@@ -882,23 +1029,33 @@ fn conv2d_backward(
     let db = NslTensor::from_ptr(db_ptr);
 
     let add_dx = |i: usize, val: f64| {
-        if dx_dtype == 1 { unsafe { *dx.data_f32().add(i) = (*dx.data_f32().add(i) as f64 + val) as f32 } }
-        else { unsafe { *dx.data_f64().add(i) += val } }
+        if dx_dtype == 1 {
+            unsafe { *dx.data_f32().add(i) = (*dx.data_f32().add(i) as f64 + val) as f32 }
+        } else {
+            unsafe { *dx.data_f64().add(i) += val }
+        }
     };
     let add_dw = |i: usize, val: f64| {
-        if dw_dtype == 1 { unsafe { *dw.data_f32().add(i) = (*dw.data_f32().add(i) as f64 + val) as f32 } }
-        else { unsafe { *dw.data_f64().add(i) += val } }
+        if dw_dtype == 1 {
+            unsafe { *dw.data_f32().add(i) = (*dw.data_f32().add(i) as f64 + val) as f32 }
+        } else {
+            unsafe { *dw.data_f64().add(i) += val }
+        }
     };
     let add_db = |i: usize, val: f64| {
-        if dw_dtype == 1 { unsafe { *db.data_f32().add(i) = (*db.data_f32().add(i) as f64 + val) as f32 } }
-        else { unsafe { *db.data_f64().add(i) += val } }
+        if dw_dtype == 1 {
+            unsafe { *db.data_f32().add(i) = (*db.data_f32().add(i) as f64 + val) as f32 }
+        } else {
+            unsafe { *db.data_f64().add(i) += val }
+        }
     };
 
     for ni in 0..n {
         for co in 0..c_out {
             for oh in 0..h_out {
                 for ow in 0..w_out {
-                    let g_idx = ni * (c_out * h_out * w_out) + co * (h_out * w_out) + oh * w_out + ow;
+                    let g_idx =
+                        ni * (c_out * h_out * w_out) + co * (h_out * w_out) + oh * w_out + ow;
                     let g_val = read_grad(g_idx);
 
                     add_db(co, g_val);
@@ -911,8 +1068,10 @@ fn conv2d_backward(
                                 if ih >= pad_h && iw >= pad_w && ih - pad_h < h && iw - pad_w < w {
                                     let real_ih = ih - pad_h;
                                     let real_iw = iw - pad_w;
-                                    let input_idx = ni * (c_in * h * w) + ci * (h * w) + real_ih * w + real_iw;
-                                    let weight_idx = co * (c_in * kh * kw) + ci * (kh * kw) + ky * kw + kx;
+                                    let input_idx =
+                                        ni * (c_in * h * w) + ci * (h * w) + real_ih * w + real_iw;
+                                    let weight_idx =
+                                        co * (c_in * kh * kw) + ci * (kh * kw) + ky * kw + kx;
 
                                     add_dw(weight_idx, g_val * read_input(input_idx));
                                     add_dx(input_idx, g_val * read_weight(weight_idx));
@@ -990,7 +1149,14 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
 
     // Seed: gradient of loss w.r.t. itself = ones_like(loss)
     let seed = ones_like(loss_ptr);
-    let loss_key = { let t = crate::tensor::NslTensor::from_ptr(loss_ptr); if t.tape_id != 0 { t.tape_id } else { loss_ptr } };
+    let loss_key = {
+        let t = crate::tensor::NslTensor::from_ptr(loss_ptr);
+        if t.tape_id != 0 {
+            t.tape_id
+        } else {
+            loss_ptr
+        }
+    };
     grad_map.insert(loss_key, seed);
 
     // Walk tape in reverse, applying chain rule.
@@ -999,7 +1165,13 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
     ops.reverse();
     for op in ops.iter_mut() {
         match op {
-            TapeOp::Add { a, b, out, a_shape, b_shape } => {
+            TapeOp::Add {
+                a,
+                b,
+                out,
+                a_shape,
+                b_shape,
+            } => {
                 if let Some(&g) = grad_map.get(out) {
                     let ga = reduce_grad_for_broadcast(g, a_shape);
                     let gb = reduce_grad_for_broadcast(g, b_shape);
@@ -1007,19 +1179,35 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
                     accumulate_grad(&mut grad_map, *b, gb);
                 }
             }
-            TapeOp::Sub { a, b, out, a_shape, b_shape } => {
+            TapeOp::Sub {
+                a,
+                b,
+                out,
+                a_shape,
+                b_shape,
+            } => {
                 if let Some(&g) = grad_map.get(out) {
                     let ga = reduce_grad_for_broadcast(g, a_shape);
                     let g_clone = tensor_clone(g);
                     let gb_full = tensor_neg(g_clone);
                     tensor_free(g_clone); // free the clone; tensor_neg created a new tensor
                     let gb = reduce_grad_for_broadcast(gb_full, b_shape);
-                    if gb != gb_full { tensor_free(gb_full); }
+                    if gb != gb_full {
+                        tensor_free(gb_full);
+                    }
                     accumulate_grad(&mut grad_map, *a, ga);
                     accumulate_grad(&mut grad_map, *b, gb);
                 }
             }
-            TapeOp::Mul { a, b, out, saved_a, saved_b, a_shape, b_shape } => {
+            TapeOp::Mul {
+                a,
+                b,
+                out,
+                saved_a,
+                saved_b,
+                a_shape,
+                b_shape,
+            } => {
                 if let Some(&g) = grad_map.get(out) {
                     // d/da(a*b) = g * b, d/db(a*b) = g * a
                     let g_clone1 = tensor_clone(g);
@@ -1035,13 +1223,25 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
                     tensor_free(g_clone2);
                     let grad_a = reduce_grad_for_broadcast(grad_a_full, a_shape);
                     let grad_b = reduce_grad_for_broadcast(grad_b_full, b_shape);
-                    if grad_a != grad_a_full { tensor_free(grad_a_full); }
-                    if grad_b != grad_b_full { tensor_free(grad_b_full); }
+                    if grad_a != grad_a_full {
+                        tensor_free(grad_a_full);
+                    }
+                    if grad_b != grad_b_full {
+                        tensor_free(grad_b_full);
+                    }
                     accumulate_grad(&mut grad_map, *a, grad_a);
                     accumulate_grad(&mut grad_map, *b, grad_b);
                 }
             }
-            TapeOp::Div { a, b, out, saved_a, saved_b, a_shape, b_shape } => {
+            TapeOp::Div {
+                a,
+                b,
+                out,
+                saved_a,
+                saved_b,
+                a_shape,
+                b_shape,
+            } => {
                 if let Some(&g) = grad_map.get(out) {
                     let g_clone1 = tensor_clone(g);
                     let g_clone2 = tensor_clone(g);
@@ -1050,7 +1250,9 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
                     let grad_a_full = tensor_div(g_clone1, *saved_b, 0);
                     tensor_free(g_clone1);
                     let grad_a = reduce_grad_for_broadcast(grad_a_full, a_shape);
-                    if grad_a != grad_a_full { tensor_free(grad_a_full); }
+                    if grad_a != grad_a_full {
+                        tensor_free(grad_a_full);
+                    }
                     accumulate_grad(&mut grad_map, *a, grad_a);
 
                     // d/db(a/b) = -g * a / b^2
@@ -1072,11 +1274,19 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
                     tensor_free(neg_ga);
                     tensor_free(b_sq);
                     let grad_b = reduce_grad_for_broadcast(grad_b_full, b_shape);
-                    if grad_b != grad_b_full { tensor_free(grad_b_full); }
+                    if grad_b != grad_b_full {
+                        tensor_free(grad_b_full);
+                    }
                     accumulate_grad(&mut grad_map, *b, grad_b);
                 }
             }
-            TapeOp::MatMul { a, b, out, saved_a, saved_b } => {
+            TapeOp::MatMul {
+                a,
+                b,
+                out,
+                saved_a,
+                saved_b,
+            } => {
                 if let Some(&g) = grad_map.get(out) {
                     // d/dA(A@B) = G @ B^T, d/dB(A@B) = A^T @ G
                     // Use -2,-1 to transpose the last two dims (correct for batched matmul)
@@ -1129,7 +1339,13 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
                     accumulate_grad(&mut grad_map, *a, grad_a);
                 }
             }
-            TapeOp::SumReduce { a, out, dim, input_shape, .. } => {
+            TapeOp::SumReduce {
+                a,
+                out,
+                dim,
+                input_shape,
+                ..
+            } => {
                 if let Some(&g) = grad_map.get(out) {
                     if *dim == -1 {
                         // Global reduction: g is scalar, broadcast to input shape
@@ -1146,14 +1362,22 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
                     }
                 }
             }
-            TapeOp::MeanReduce { a, out, dim, num_elements, input_shape, .. } => {
+            TapeOp::MeanReduce {
+                a,
+                out,
+                dim,
+                num_elements,
+                input_shape,
+                ..
+            } => {
                 if let Some(&g) = grad_map.get(out) {
                     if *dim == -1 {
                         // Global reduction
                         let scalar_val = tensor_item(g);
                         let g_dtype = crate::tensor::NslTensor::from_ptr(g).dtype;
                         let ones = ones_from_shape(input_shape, g_dtype);
-                        let grad_a = tensor_mul_scalar(ones, scalar_val / (*num_elements as f64), 0);
+                        let grad_a =
+                            tensor_mul_scalar(ones, scalar_val / (*num_elements as f64), 0);
                         tensor_free(ones);
                         accumulate_grad(&mut grad_map, *a, grad_a);
                     } else {
@@ -1165,14 +1389,28 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
                     }
                 }
             }
-            TapeOp::ReduceMax { a, out, dim, saved_argmax, input_shape, .. } => {
+            TapeOp::ReduceMax {
+                a,
+                out,
+                dim,
+                saved_argmax,
+                input_shape,
+                ..
+            } => {
                 if let Some(&g) = grad_map.get(out) {
                     // Scatter grad to argmax positions, zero elsewhere
-                    let grad_a = scatter_grad_to_argmax(g, input_shape, *dim as usize, saved_argmax);
+                    let grad_a =
+                        scatter_grad_to_argmax(g, input_shape, *dim as usize, saved_argmax);
                     accumulate_grad(&mut grad_map, *a, grad_a);
                 }
             }
-            TapeOp::Gather { a, out, dim, indices_ptr, input_shape } => {
+            TapeOp::Gather {
+                a,
+                out,
+                dim,
+                indices_ptr,
+                input_shape,
+            } => {
                 if let Some(&g) = grad_map.get(out) {
                     let grad_a = scatter_gather_grad(g, input_shape, *dim as usize, *indices_ptr);
                     accumulate_grad(&mut grad_map, *a, grad_a);
@@ -1218,12 +1456,17 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
                     accumulate_grad(&mut grad_map, *a, grad_a);
                 }
             }
-            TapeOp::Clamp { a, out, saved_a, min_val, max_val } => {
+            TapeOp::Clamp {
+                a,
+                out,
+                saved_a,
+                min_val,
+                max_val,
+            } => {
                 // Gradient passes through where unclamped, zero where clamped
                 if let Some(&g) = grad_map.get(out) {
-                    let grad_a = crate::tensor::nsl_tensor_clamp_backward(
-                        g, *saved_a, *min_val, *max_val,
-                    );
+                    let grad_a =
+                        crate::tensor::nsl_tensor_clamp_backward(g, *saved_a, *min_val, *max_val);
                     accumulate_grad(&mut grad_map, *a, grad_a);
                 }
             }
@@ -1286,14 +1529,24 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
                     accumulate_grad(&mut grad_map, *a, grad_a);
                 }
             }
-            TapeOp::Softmax { a, out, saved_out, dim } => {
+            TapeOp::Softmax {
+                a,
+                out,
+                saved_out,
+                dim,
+            } => {
                 // grad_input_i = output_i * (grad_i - sum(grad * output)) along softmax dim
                 if let Some(&g) = grad_map.get(out) {
                     let grad_a = softmax_backward(g, *saved_out, *dim);
                     accumulate_grad(&mut grad_map, *a, grad_a);
                 }
             }
-            TapeOp::LogSoftmax { a, out, saved_out, dim } => {
+            TapeOp::LogSoftmax {
+                a,
+                out,
+                saved_out,
+                dim,
+            } => {
                 // grad_input[i] = grad[i] - exp(log_softmax_output[i]) * sum(grad, dim)
                 if let Some(&g) = grad_map.get(out) {
                     let grad_a = log_softmax_backward(g, *saved_out, *dim);
@@ -1302,24 +1555,41 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
                     accumulate_grad(&mut grad_map, *a, grad_a);
                 }
             }
-            TapeOp::Slice { a, out, dim, start, input_shape } => {
+            TapeOp::Slice {
+                a,
+                out,
+                dim,
+                start,
+                input_shape,
+            } => {
                 // Backward: create zeros with original input shape, copy grad into [start, start+slice_len)
                 if let Some(&g) = grad_map.get(out) {
                     let grad_a = slice_backward(g, input_shape, *dim as usize, *start as usize);
                     accumulate_grad(&mut grad_map, *a, grad_a);
                 }
             }
-            TapeOp::EmbeddingLookup { weight, indices: _, out, saved_weight, saved_indices } => {
+            TapeOp::EmbeddingLookup {
+                weight,
+                indices: _,
+                out,
+                saved_weight,
+                saved_indices,
+            } => {
                 // Backward: scatter-add output gradient rows into weight gradient
                 if let Some(&g) = grad_map.get(out) {
                     // Transfer to CPU for backward computation if on GPU
                     let g_device = crate::tensor::NslTensor::from_ptr(g).device;
                     let (g_cpu, g_needs_free) = if g_device > 0 {
                         (nsl_tensor_to_device(g, 0), true)
-                    } else { (g, false) };
-                    let (idx_cpu, idx_needs_free) = if crate::tensor::NslTensor::from_ptr(*saved_indices).device > 0 {
-                        (nsl_tensor_to_device(*saved_indices, 0), true)
-                    } else { (*saved_indices, false) };
+                    } else {
+                        (g, false)
+                    };
+                    let (idx_cpu, idx_needs_free) =
+                        if crate::tensor::NslTensor::from_ptr(*saved_indices).device > 0 {
+                            (nsl_tensor_to_device(*saved_indices, 0), true)
+                        } else {
+                            (*saved_indices, false)
+                        };
 
                     let w = crate::tensor::NslTensor::from_ptr(*saved_weight);
                     let idx_t = crate::tensor::NslTensor::from_ptr(idx_cpu);
@@ -1341,18 +1611,29 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
                             for j in 0..embed_dim {
                                 if grad_w_dtype == 1 {
                                     let g_val = unsafe { *g_t.data_f32().add(i * embed_dim + j) };
-                                    unsafe { *grad_w_t.data_f32().add(idx * embed_dim + j) += g_val };
+                                    unsafe {
+                                        *grad_w_t.data_f32().add(idx * embed_dim + j) += g_val
+                                    };
                                 } else {
-                                    let g_val = if g_t.dtype == 1 { unsafe { *g_t.data_f32().add(i * embed_dim + j) as f64 } }
-                                                else { unsafe { *g_t.data_f64().add(i * embed_dim + j) } };
-                                    unsafe { *grad_w_t.data_f64().add(idx * embed_dim + j) += g_val };
+                                    let g_val = if g_t.dtype == 1 {
+                                        unsafe { *g_t.data_f32().add(i * embed_dim + j) as f64 }
+                                    } else {
+                                        unsafe { *g_t.data_f64().add(i * embed_dim + j) }
+                                    };
+                                    unsafe {
+                                        *grad_w_t.data_f64().add(idx * embed_dim + j) += g_val
+                                    };
                                 }
                             }
                         }
                     }
 
-                    if g_needs_free { tensor_free(g_cpu); }
-                    if idx_needs_free { tensor_free(idx_cpu); }
+                    if g_needs_free {
+                        tensor_free(g_cpu);
+                    }
+                    if idx_needs_free {
+                        tensor_free(idx_cpu);
+                    }
 
                     // Eagerly free saved tensors
                     tensor_free(*saved_weight);
@@ -1365,11 +1646,18 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
                         let gpu_gw = nsl_tensor_to_device(grad_w, g_device as i64);
                         tensor_free(grad_w);
                         gpu_gw
-                    } else { grad_w };
+                    } else {
+                        grad_w
+                    };
                     accumulate_grad(&mut grad_map, *weight, final_grad_w);
                 }
             }
-            TapeOp::Cat { inputs, out, dim, split_sizes } => {
+            TapeOp::Cat {
+                inputs,
+                out,
+                dim,
+                split_sizes,
+            } => {
                 // Backward: split the gradient along the cat dim into pieces
                 if let Some(&g) = grad_map.get(out) {
                     let grads = cat_backward(g, *dim as usize, split_sizes);
@@ -1378,9 +1666,24 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
                     }
                 }
             }
-            TapeOp::LayerNorm { input, weight, bias, out, saved_input, saved_mean, saved_inv_std, saved_weight } => {
+            TapeOp::LayerNorm {
+                input,
+                weight,
+                bias,
+                out,
+                saved_input,
+                saved_mean,
+                saved_inv_std,
+                saved_weight,
+            } => {
                 if let Some(&g) = grad_map.get(out) {
-                    let grad_input = layernorm_backward(g, *saved_input, *saved_mean, *saved_inv_std, *saved_weight);
+                    let grad_input = layernorm_backward(
+                        g,
+                        *saved_input,
+                        *saved_mean,
+                        *saved_inv_std,
+                        *saved_weight,
+                    );
                     // Eagerly free saved tensors
                     tensor_free(*saved_input);
                     tensor_free(*saved_mean);
@@ -1395,7 +1698,14 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
                     accumulate_grad(&mut grad_map, *bias, grad_input.2);
                 }
             }
-            TapeOp::RMSNorm { input, weight, out, saved_input, saved_rms, saved_weight } => {
+            TapeOp::RMSNorm {
+                input,
+                weight,
+                out,
+                saved_input,
+                saved_rms,
+                saved_weight,
+            } => {
                 if let Some(&g) = grad_map.get(out) {
                     let grad_result = rmsnorm_backward(g, *saved_input, *saved_rms, *saved_weight);
                     // Eagerly free saved tensors
@@ -1409,17 +1719,39 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
                     accumulate_grad(&mut grad_map, *weight, grad_result.1);
                 }
             }
-            TapeOp::Dropout { a, out, saved_mask, scale } => {
+            TapeOp::Dropout {
+                a,
+                out,
+                saved_mask,
+                scale,
+            } => {
                 // grad_input = grad_output * mask * scale
                 if let Some(&g) = grad_map.get(out) {
                     let grad_a = dropout_backward(g, *saved_mask, *scale);
                     accumulate_grad(&mut grad_map, *a, grad_a);
                 }
             }
-            TapeOp::Conv2d { input, weight, bias, out, saved_input, saved_weight, stride_h, stride_w, pad_h, pad_w } => {
+            TapeOp::Conv2d {
+                input,
+                weight,
+                bias,
+                out,
+                saved_input,
+                saved_weight,
+                stride_h,
+                stride_w,
+                pad_h,
+                pad_w,
+            } => {
                 if let Some(&g) = grad_map.get(out) {
                     let (grad_input, grad_weight, grad_bias) = conv2d_backward(
-                        g, *saved_input, *saved_weight, *stride_h, *stride_w, *pad_h, *pad_w,
+                        g,
+                        *saved_input,
+                        *saved_weight,
+                        *stride_h,
+                        *stride_w,
+                        *pad_h,
+                        *pad_w,
                     );
                     // Eagerly free saved tensors
                     tensor_free(*saved_input);
@@ -1435,26 +1767,39 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
                     }
                 }
             }
-            TapeOp::MaxPool2d { a, out, saved_argmax, input_shape } => {
+            TapeOp::MaxPool2d {
+                a,
+                out,
+                saved_argmax,
+                input_shape,
+            } => {
                 if let Some(&g) = grad_map.get(out) {
                     let grad_a = maxpool2d_backward(g, input_shape, saved_argmax);
                     accumulate_grad(&mut grad_map, *a, grad_a);
                 }
             }
-            TapeOp::Unsqueeze { input, out, input_shape } => {
+            TapeOp::Unsqueeze {
+                input,
+                out,
+                input_shape,
+            } => {
                 // Unsqueeze backward: reshape gradient back to original shape
                 if let Some(&g) = grad_map.get(out) {
                     let grad_input = reshape_to_shape(g, input_shape);
                     accumulate_grad(&mut grad_map, *input, grad_input);
                 }
             }
-            TapeOp::Expand { input, out, original_shape } => {
+            TapeOp::Expand {
+                input,
+                out,
+                original_shape,
+            } => {
                 // Expand backward: sum along each broadcast dimension, then reshape to original shape
                 if let Some(&g) = grad_map.get(out) {
                     let grad_t = crate::tensor::NslTensor::from_ptr(g);
-                    let grad_shape: Vec<i64> = unsafe {
-                        std::slice::from_raw_parts(grad_t.shape, grad_t.ndim as usize)
-                    }.to_vec();
+                    let grad_shape: Vec<i64> =
+                        unsafe { std::slice::from_raw_parts(grad_t.shape, grad_t.ndim as usize) }
+                            .to_vec();
 
                     // Right-align original shape with grad shape
                     let offset = grad_shape.len() - original_shape.len();
@@ -1462,7 +1807,11 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
 
                     // Sum along broadcast dims (iterate in reverse to keep dim indices stable)
                     for d in (0..grad_shape.len()).rev() {
-                        let orig_d = if d >= offset { original_shape[d - offset] } else { 1 };
+                        let orig_d = if d >= offset {
+                            original_shape[d - offset]
+                        } else {
+                            1
+                        };
                         if orig_d == 1 && grad_shape[d] > 1 {
                             let old = result;
                             result = nsl_tensor_sum_dim(result, d as i64, 1); // keepdim=1
@@ -1472,7 +1821,9 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
                     // Reshape to original shape
                     let old = result;
                     result = reshape_to_shape(result, original_shape);
-                    if old != result { tensor_free(old); }
+                    if old != result {
+                        tensor_free(old);
+                    }
 
                     accumulate_grad(&mut grad_map, *input, result);
                 }
@@ -1487,23 +1838,38 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
                 }
             }
             TapeOp::FlashAttention {
-                q, k, v, out, logsumexp, scale,
-                batch, heads, seq_len, head_dim, causal,
-                saved_q, saved_k, saved_v, ..
+                q,
+                k,
+                v,
+                out,
+                logsumexp,
+                scale,
+                batch,
+                heads,
+                seq_len,
+                head_dim,
+                causal,
+                saved_q,
+                saved_k,
+                saved_v,
+                ..
             } => {
-                let out_key = { let t = crate::tensor::NslTensor::from_ptr(*out); if t.tape_id != 0 { t.tape_id } else { *out } };
+                let out_key = {
+                    let t = crate::tensor::NslTensor::from_ptr(*out);
+                    if t.tape_id != 0 {
+                        t.tape_id
+                    } else {
+                        *out
+                    }
+                };
                 if let Some(&g) = grad_map.get(&out_key) {
                     let scale_bits = scale.to_bits() as i64;
                     let causal_i = if *causal { 1i64 } else { 0i64 };
 
                     let result_list = crate::flash_attention::nsl_flash_attention_backward(
-                        g,
-                        *saved_q, *saved_k, *saved_v,
-                        *out, *logsumexp,
-                        scale_bits,
-                        *batch, *heads, *seq_len, *head_dim,
-                        causal_i,
-                        0, 0, 0, 0, // no PTX pointers — tape-based path uses CPU fallback
+                        g, *saved_q, *saved_k, *saved_v, *out, *logsumexp, scale_bits, *batch,
+                        *heads, *seq_len, *head_dim, causal_i, 0, 0, 0,
+                        0, // no PTX pointers — tape-based path uses CPU fallback
                         // Tier B extension (planner spec §4): disabled sentinel.
                         0, 0,
                     );
@@ -1546,17 +1912,23 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
                     // Transfer to CPU if on GPU
                     let (g_bias_cpu, g_bias_free) = if g_device_bias > 0 {
                         (nsl_tensor_to_device(g, 0), true)
-                    } else { (g, false) };
+                    } else {
+                        (g, false)
+                    };
                     let g_t = crate::tensor::NslTensor::from_ptr(g_bias_cpu);
                     if g_t.ndim < 2 {
-                        eprintln!("nsl: BiasAdd backward expects 2D+ gradient, got {}D", g_t.ndim);
+                        eprintln!(
+                            "nsl: BiasAdd backward expects 2D+ gradient, got {}D",
+                            g_t.ndim
+                        );
                         std::process::abort();
                     }
                     let rows = unsafe { *g_t.shape.add(0) } as usize;
                     let cols = unsafe { *g_t.shape.add(1) } as usize;
 
                     let g_dtype = g_t.dtype;
-                    let grad_bias = crate::cpu::create_tensor_with_shape_rs_dtype(&[cols as i64], g_dtype);
+                    let grad_bias =
+                        crate::cpu::create_tensor_with_shape_rs_dtype(&[cols as i64], g_dtype);
                     let grad_bias_t = crate::tensor::NslTensor::from_ptr(grad_bias);
                     for i in 0..rows {
                         for j in 0..cols {
@@ -1569,27 +1941,39 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
                             }
                         }
                     }
-                    if g_bias_free { tensor_free(g_bias_cpu); }
+                    if g_bias_free {
+                        tensor_free(g_bias_cpu);
+                    }
 
                     // Transfer bias grad to GPU if needed
                     let final_grad_bias = if g_device_bias > 0 {
                         let gpu_gb = nsl_tensor_to_device(grad_bias, g_device_bias as i64);
                         tensor_free(grad_bias);
                         gpu_gb
-                    } else { grad_bias };
+                    } else {
+                        grad_bias
+                    };
                     accumulate_grad(&mut grad_map, *bias, final_grad_bias);
                 }
             }
-            TapeOp::Fp8MatMul { a, b, out, saved_a, saved_b, scale_a, scale_b, k_dim, device } => {
+            TapeOp::Fp8MatMul {
+                a,
+                b,
+                out,
+                saved_a,
+                saved_b,
+                scale_a,
+                scale_b,
+                k_dim,
+                device,
+            } => {
                 if let Some(&g) = grad_map.get(out) {
                     let _ = (k_dim, device);
 
                     let scale_g = crate::fp8::calibrate_gradient_scale(g);
 
                     let b_t = tensor_transpose(*saved_b, -2, -1);
-                    let grad_a = crate::fp8::fp8_matmul_e5m2_backward(
-                        g, b_t, scale_g, *scale_b,
-                    );
+                    let grad_a = crate::fp8::fp8_matmul_e5m2_backward(g, b_t, scale_g, *scale_b);
                     tensor_free(b_t);
 
                     let a_t = tensor_transpose(*saved_a, -2, -1);
@@ -1598,9 +1982,7 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
                     tensor_free(*saved_b);
                     *saved_a = 0;
                     *saved_b = 0;
-                    let grad_b = crate::fp8::fp8_matmul_e5m2_backward(
-                        a_t, g, *scale_a, scale_g,
-                    );
+                    let grad_b = crate::fp8::fp8_matmul_e5m2_backward(a_t, g, *scale_a, scale_g);
                     tensor_free(a_t);
 
                     accumulate_grad(&mut grad_map, *a, grad_a);
@@ -1629,7 +2011,14 @@ pub extern "C" fn nsl_tape_backward(loss_ptr: i64, param_list: i64) -> i64 {
     // Build result list: look up by tape_id when active, raw ptr fallback
     let result_list = crate::list::nsl_list_new();
     for ptr in &param_ptrs {
-        let key = { let t = crate::tensor::NslTensor::from_ptr(*ptr); if t.tape_id != 0 { t.tape_id } else { *ptr } };
+        let key = {
+            let t = crate::tensor::NslTensor::from_ptr(*ptr);
+            if t.tape_id != 0 {
+                t.tape_id
+            } else {
+                *ptr
+            }
+        };
         if let Some(grad) = grad_map.remove(&key) {
             crate::list::nsl_list_push(result_list, grad);
         } else {
@@ -1685,17 +2074,29 @@ pub extern "C" fn nsl_debug_grad_checksum(grads_list: i64, num_params: i64) {
         if grad.dtype == 1 {
             for j in 0..len {
                 let v = unsafe { *grad.data_f32().add(j) } as f64;
-                if v.is_nan() { has_nan = true; }
-                if v.is_infinite() { has_inf = true; }
-                if v != 0.0 { all_zero = false; }
+                if v.is_nan() {
+                    has_nan = true;
+                }
+                if v.is_infinite() {
+                    has_inf = true;
+                }
+                if v != 0.0 {
+                    all_zero = false;
+                }
                 sum_abs += v.abs();
             }
         } else {
             for j in 0..len {
                 let v = unsafe { *grad.data_f64().add(j) };
-                if v.is_nan() { has_nan = true; }
-                if v.is_infinite() { has_inf = true; }
-                if v != 0.0 { all_zero = false; }
+                if v.is_nan() {
+                    has_nan = true;
+                }
+                if v.is_infinite() {
+                    has_inf = true;
+                }
+                if v != 0.0 {
+                    all_zero = false;
+                }
                 sum_abs += v.abs();
             }
         }
@@ -1709,7 +2110,12 @@ pub extern "C" fn nsl_debug_grad_checksum(grads_list: i64, num_params: i64) {
         } else {
             "ok"
         };
-        eprintln!("  param[{}]: sum|grad|={:.6e}  len={}  [{}]", i, sum_abs, len, status);
-        if needs_free { tensor_free(actual_ptr); }
+        eprintln!(
+            "  param[{}]: sum|grad|={:.6e}  len={}  [{}]",
+            i, sum_abs, len, status
+        );
+        if needs_free {
+            tensor_free(actual_ptr);
+        }
     }
 }

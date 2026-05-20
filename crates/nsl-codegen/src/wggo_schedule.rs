@@ -327,8 +327,8 @@ mod tests {
         let applied = applied_for(&inter, false);
         let s = build_schedule(&inter, &applied);
         assert_eq!(s.deferred_step_count, 0); // not picked → not counted
-        // No fused step; sharded layers don't pin a FASE position when
-        // the user didn't pick fusion.
+                                              // No fused step; sharded layers don't pin a FASE position when
+                                              // the user didn't pick fusion.
         for e in &s.entries {
             assert_eq!(e.fase_position, FaseStepPosition::NotApplicable);
         }

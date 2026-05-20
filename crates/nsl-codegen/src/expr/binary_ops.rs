@@ -179,10 +179,8 @@ impl Compiler<'_> {
             // rationale), so `consume_ownership` below is a dead branch
             // until the switch is flipped.
             use crate::ownership_expr::Ownership;
-            let lhs_was_owned =
-                matches!(self.get_ownership(state, lhs), Ownership::Owned);
-            let rhs_was_owned =
-                matches!(self.get_ownership(state, rhs), Ownership::Owned);
+            let lhs_was_owned = matches!(self.get_ownership(state, lhs), Ownership::Owned);
+            let rhs_was_owned = matches!(self.get_ownership(state, rhs), Ownership::Owned);
             let flags = self.compute_fbip_flags(builder, state, lhs, rhs);
             let result = self.compile_tensor_binary_op(
                 builder,

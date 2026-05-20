@@ -87,7 +87,11 @@ pub fn parse_from(argv: &[&str]) -> Result<Args, String> {
                 tier_b = Some(match *v {
                     "on" => TierB::On,
                     "off" => TierB::Off,
-                    other => return Err(format!("invalid --tier-b value: {other} (expected 'on' or 'off')")),
+                    other => {
+                        return Err(format!(
+                            "invalid --tier-b value: {other} (expected 'on' or 'off')"
+                        ))
+                    }
                 });
                 i += 2;
             }

@@ -53,9 +53,7 @@ pub fn select(config: &FlashAttentionConfig) -> Result<u32, DowngradeReason> {
         // 2. Register budget check (independent of chunk — depends only
         //    on bq/bkv/hd. Run AFTER SMEM passes to avoid the surface
         //    where SMEM was the proximate issue.)
-        if let Err(spill) =
-            crate::flash_attention_v2::tier_b1::register_budget::analyze(config)
-        {
+        if let Err(spill) = crate::flash_attention_v2::tier_b1::register_budget::analyze(config) {
             last_err = Some(format!("chunk={} fits SMEM but {}", chunk, spill.0));
             // Register pressure is chunk-independent. Once it fails for
             // one chunk it'll fail for all — short-circuit to error.

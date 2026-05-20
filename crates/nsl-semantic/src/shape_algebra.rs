@@ -5,9 +5,9 @@
 //!
 //! Uses the EXISTING `DimExpr` from `crate::types`.
 
-use std::collections::HashMap;
-use nsl_ast::Symbol;
 use crate::types::DimExpr;
+use nsl_ast::Symbol;
+use std::collections::HashMap;
 
 // ---------------------------------------------------------------------------
 // ProofFailure — explains why a proof could not be completed
@@ -153,7 +153,11 @@ impl ShapeAlgebraSolver {
                 let sa = self.simplify(a);
                 let sb = self.simplify(b);
                 if let (DimExpr::Lit(va), DimExpr::Lit(vb)) = (&sa, &sb) {
-                    if *vb != 0 { DimExpr::Lit(va / vb) } else { DimExpr::Div(Box::new(sa), Box::new(sb)) }
+                    if *vb != 0 {
+                        DimExpr::Lit(va / vb)
+                    } else {
+                        DimExpr::Div(Box::new(sa), Box::new(sb))
+                    }
                 } else {
                     DimExpr::Div(Box::new(sa), Box::new(sb))
                 }
@@ -162,7 +166,11 @@ impl ShapeAlgebraSolver {
                 let sa = self.simplify(a);
                 let sb = self.simplify(b);
                 if let (DimExpr::Lit(va), DimExpr::Lit(vb)) = (&sa, &sb) {
-                    if *vb != 0 { DimExpr::Lit(va % vb) } else { DimExpr::Mod(Box::new(sa), Box::new(sb)) }
+                    if *vb != 0 {
+                        DimExpr::Lit(va % vb)
+                    } else {
+                        DimExpr::Mod(Box::new(sa), Box::new(sb))
+                    }
                 } else {
                     DimExpr::Mod(Box::new(sa), Box::new(sb))
                 }
@@ -206,8 +214,8 @@ impl ShapeAlgebraSolver {
 
         // Strategy 5: Bound-derived equality (if both sides have singleton bounds [v, v])
         if let (DimExpr::Sym(a), DimExpr::Sym(b)) = (&sl, &sr) {
-            if let (Some((Some(lo_a), Some(hi_a))), Some((Some(lo_b), Some(hi_b))))
-                = (self.bounds.get(a), self.bounds.get(b))
+            if let (Some((Some(lo_a), Some(hi_a))), Some((Some(lo_b), Some(hi_b)))) =
+                (self.bounds.get(a), self.bounds.get(b))
             {
                 if lo_a == hi_a && lo_b == hi_b && lo_a == lo_b {
                     return Ok(());
@@ -294,7 +302,8 @@ impl ShapeAlgebraSolver {
 
         // Strategy 3: Product of terms — if a*b and b % divisor == 0, then a*b % divisor == 0
         if let DimExpr::Mul(a, b) = expr {
-            if self.prove_divisible(a, divisor).is_ok() || self.prove_divisible(b, divisor).is_ok() {
+            if self.prove_divisible(a, divisor).is_ok() || self.prove_divisible(b, divisor).is_ok()
+            {
                 return Ok(());
             }
         }
@@ -341,7 +350,11 @@ impl ShapeAlgebraSolver {
                 let ua = self.upper_bound(a)?;
                 let ub = self.upper_bound(b)?;
                 // Only correct for non-negative bounds
-                if ua >= 0 && ub >= 0 { Some(ua * ub) } else { None }
+                if ua >= 0 && ub >= 0 {
+                    Some(ua * ub)
+                } else {
+                    None
+                }
             }
             _ => self.evaluate(expr),
         }
@@ -368,7 +381,11 @@ impl ShapeAlgebraSolver {
             DimExpr::Mul(a, b) => {
                 let la = self.lower_bound(a)?;
                 let lb = self.lower_bound(b)?;
-                if la >= 0 && lb >= 0 { Some(la * lb) } else { None }
+                if la >= 0 && lb >= 0 {
+                    Some(la * lb)
+                } else {
+                    None
+                }
             }
             _ => self.evaluate(expr),
         }
@@ -383,7 +400,9 @@ impl ShapeAlgebraSolver {
     pub fn prove_le(&self, expr: &DimExpr, value: i64) -> Result<(), ProofFailure> {
         // Strategy 1: concrete evaluation
         if let Some(v) = self.evaluate(expr) {
-            return if v <= value { Ok(()) } else {
+            return if v <= value {
+                Ok(())
+            } else {
                 Err(ProofFailure {
                     goal: format!("{:?} <= {}", expr, value),
                     attempts: vec!["concrete evaluation".into()],
@@ -394,7 +413,9 @@ impl ShapeAlgebraSolver {
 
         // Strategy 2: upper bound from bounds database
         if let Some(ub) = self.upper_bound(expr) {
-            if ub <= value { return Ok(()); }
+            if ub <= value {
+                return Ok(());
+            }
         }
 
         // Strategy 3: Fourier-Motzkin for transitive bounds
@@ -404,7 +425,11 @@ impl ShapeAlgebraSolver {
 
         Err(ProofFailure {
             goal: format!("{:?} <= {}", expr, value),
-            attempts: vec!["concrete".into(), "upper bound".into(), "Fourier-Motzkin".into()],
+            attempts: vec![
+                "concrete".into(),
+                "upper bound".into(),
+                "Fourier-Motzkin".into(),
+            ],
             reason: "insufficient information".into(),
         })
     }
@@ -412,7 +437,9 @@ impl ShapeAlgebraSolver {
     /// Try to prove `expr >= value`.
     pub fn prove_ge(&self, expr: &DimExpr, value: i64) -> Result<(), ProofFailure> {
         if let Some(v) = self.evaluate(expr) {
-            return if v >= value { Ok(()) } else {
+            return if v >= value {
+                Ok(())
+            } else {
                 Err(ProofFailure {
                     goal: format!("{:?} >= {}", expr, value),
                     attempts: vec!["concrete evaluation".into()],
@@ -422,7 +449,9 @@ impl ShapeAlgebraSolver {
         }
 
         if let Some(lb) = self.lower_bound(expr) {
-            if lb >= value { return Ok(()); }
+            if lb >= value {
+                return Ok(());
+            }
         }
 
         Err(ProofFailure {
@@ -458,15 +487,23 @@ impl ShapeAlgebraSolver {
                     seen.insert(v);
                 }
             }
-            seen.into_iter().filter(|v| !target_vars.contains(v)).collect()
+            seen.into_iter()
+                .filter(|v| !target_vars.contains(v))
+                .collect()
         };
 
         // Limit elimination to 3 variables
-        let to_eliminate = if all_vars.len() > 3 { &all_vars[..3] } else { &all_vars };
+        let to_eliminate = if all_vars.len() > 3 {
+            &all_vars[..3]
+        } else {
+            &all_vars
+        };
 
         for var in to_eliminate {
             constraints = Self::eliminate_variable(&constraints, *var);
-            if constraints.len() > 50 { return false; } // blowup guard
+            if constraints.len() > 50 {
+                return false;
+            } // blowup guard
         }
 
         // Convert target: expr <= value  →  expr - value <= 0
@@ -488,21 +525,33 @@ impl ShapeAlgebraSolver {
             if let Some(lo_val) = lo {
                 let mut coeffs = HashMap::new();
                 coeffs.insert(sym, -1);
-                out.push(FmConstraint { coeffs, constant: lo_val });
+                out.push(FmConstraint {
+                    coeffs,
+                    constant: lo_val,
+                });
             }
             if let Some(hi_val) = hi {
                 let mut coeffs = HashMap::new();
                 coeffs.insert(sym, 1);
-                out.push(FmConstraint { coeffs, constant: -hi_val });
+                out.push(FmConstraint {
+                    coeffs,
+                    constant: -hi_val,
+                });
             }
         }
         for (&sym, &val) in &self.bindings {
             let mut c1 = HashMap::new();
             c1.insert(sym, 1);
-            out.push(FmConstraint { coeffs: c1, constant: -val });
+            out.push(FmConstraint {
+                coeffs: c1,
+                constant: -val,
+            });
             let mut c2 = HashMap::new();
             c2.insert(sym, -1);
-            out.push(FmConstraint { coeffs: c2, constant: val });
+            out.push(FmConstraint {
+                coeffs: c2,
+                constant: val,
+            });
         }
         out
     }
@@ -510,7 +559,9 @@ impl ShapeAlgebraSolver {
     /// Convert equalities to paired <= constraints.
     fn equalities_as_constraints(&self, out: &mut Vec<FmConstraint>) {
         for (lhs, rhs) in &self.equalities {
-            if let (Some(mut c_fwd), Some(c_rhs)) = (self.expr_to_linear(lhs), self.expr_to_linear(rhs)) {
+            if let (Some(mut c_fwd), Some(c_rhs)) =
+                (self.expr_to_linear(lhs), self.expr_to_linear(rhs))
+            {
                 // lhs - rhs <= 0
                 for (var, coeff) in &c_rhs.coeffs {
                     *c_fwd.coeffs.entry(*var).or_insert(0) -= coeff;
@@ -531,14 +582,23 @@ impl ShapeAlgebraSolver {
     /// Returns None for non-linear expressions (e.g., sym * sym).
     fn expr_to_linear(&self, expr: &DimExpr) -> Option<FmConstraint> {
         match expr {
-            DimExpr::Lit(v) => Some(FmConstraint { coeffs: HashMap::new(), constant: *v }),
+            DimExpr::Lit(v) => Some(FmConstraint {
+                coeffs: HashMap::new(),
+                constant: *v,
+            }),
             DimExpr::Sym(s) => {
                 if let Some(&v) = self.bindings.get(s) {
-                    Some(FmConstraint { coeffs: HashMap::new(), constant: v })
+                    Some(FmConstraint {
+                        coeffs: HashMap::new(),
+                        constant: v,
+                    })
                 } else {
                     let mut coeffs = HashMap::new();
                     coeffs.insert(*s, 1);
-                    Some(FmConstraint { coeffs, constant: 0 })
+                    Some(FmConstraint {
+                        coeffs,
+                        constant: 0,
+                    })
                 }
             }
             DimExpr::Add(a, b) => {
@@ -582,7 +642,11 @@ impl ShapeAlgebraSolver {
 
     fn collect_vars_inner(expr: &DimExpr, vars: &mut Vec<Symbol>) {
         match expr {
-            DimExpr::Sym(s) => { if !vars.contains(s) { vars.push(*s); } }
+            DimExpr::Sym(s) => {
+                if !vars.contains(s) {
+                    vars.push(*s);
+                }
+            }
             DimExpr::Lit(_) => {}
             DimExpr::Add(a, b) | DimExpr::Mul(a, b) | DimExpr::Div(a, b) | DimExpr::Mod(a, b) => {
                 Self::collect_vars_inner(a, vars);
@@ -609,15 +673,19 @@ impl ShapeAlgebraSolver {
 
         for u in &upper {
             for l in &lower {
-                let u_coeff = *u.coeffs.get(&var).unwrap();           // positive
-                let l_coeff = -(*l.coeffs.get(&var).unwrap());        // make positive
+                let u_coeff = *u.coeffs.get(&var).unwrap(); // positive
+                let l_coeff = -(*l.coeffs.get(&var).unwrap()); // make positive
 
                 let mut new_coeffs = HashMap::new();
                 for (&v, &c) in &u.coeffs {
-                    if v != var { *new_coeffs.entry(v).or_insert(0) += c * l_coeff; }
+                    if v != var {
+                        *new_coeffs.entry(v).or_insert(0) += c * l_coeff;
+                    }
                 }
                 for (&v, &c) in &l.coeffs {
-                    if v != var { *new_coeffs.entry(v).or_insert(0) += c * u_coeff; }
+                    if v != var {
+                        *new_coeffs.entry(v).or_insert(0) += c * u_coeff;
+                    }
                 }
                 new_coeffs.retain(|_, v| *v != 0);
 
@@ -658,7 +726,9 @@ impl ShapeAlgebraSolver {
                             // t_coeff * x + t.const <= 0  means  x <= -t.const/t_coeff
                             // Implied when -c.const/c_coeff <= -t.const/t_coeff
                             // i.e., c.const * t_coeff >= t.const * c_coeff (cross-multiply, both positive)
-                            if (c.constant as i128) * (t_coeff as i128) >= (target.constant as i128) * (c_coeff as i128) {
+                            if (c.constant as i128) * (t_coeff as i128)
+                                >= (target.constant as i128) * (c_coeff as i128)
+                            {
                                 return true;
                             }
                         } else if c_coeff < 0 && t_coeff < 0 {
@@ -666,7 +736,9 @@ impl ShapeAlgebraSolver {
                             // Implied when c.const/|c| >= t.const/|t|
                             // Cross-multiply (both negative, so flip): c.const * |t| <= t.const * |c|
                             // With c_coeff, t_coeff both negative: c.const * t_coeff >= t.const * c_coeff
-                            if (c.constant as i128) * (t_coeff as i128) >= (target.constant as i128) * (c_coeff as i128) {
+                            if (c.constant as i128) * (t_coeff as i128)
+                                >= (target.constant as i128) * (c_coeff as i128)
+                            {
                                 return true;
                             }
                         }
@@ -711,12 +783,14 @@ impl ShapeAlgebraSolver {
                     DimExpr::Mul(Box::new(nb), Box::new(na))
                 }
             }
-            DimExpr::Div(a, b) => {
-                DimExpr::Div(Box::new(self.normalize_inner(a)), Box::new(self.normalize_inner(b)))
-            }
-            DimExpr::Mod(a, b) => {
-                DimExpr::Mod(Box::new(self.normalize_inner(a)), Box::new(self.normalize_inner(b)))
-            }
+            DimExpr::Div(a, b) => DimExpr::Div(
+                Box::new(self.normalize_inner(a)),
+                Box::new(self.normalize_inner(b)),
+            ),
+            DimExpr::Mod(a, b) => DimExpr::Mod(
+                Box::new(self.normalize_inner(a)),
+                Box::new(self.normalize_inner(b)),
+            ),
         }
     }
 
@@ -743,7 +817,9 @@ impl ShapeAlgebraSolver {
 }
 
 impl Default for ShapeAlgebraSolver {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[cfg(test)]
@@ -761,8 +837,12 @@ mod tests {
     #[test]
     fn literal_equality() {
         let solver = ShapeAlgebraSolver::new();
-        assert!(solver.prove_eq(&DimExpr::Lit(42), &DimExpr::Lit(42)).is_ok());
-        assert!(solver.prove_eq(&DimExpr::Lit(42), &DimExpr::Lit(43)).is_err());
+        assert!(solver
+            .prove_eq(&DimExpr::Lit(42), &DimExpr::Lit(42))
+            .is_ok());
+        assert!(solver
+            .prove_eq(&DimExpr::Lit(42), &DimExpr::Lit(43))
+            .is_err());
     }
 
     #[test]
@@ -771,10 +851,7 @@ mod tests {
         let s = make_sym(&mut interner, "S");
         let solver = ShapeAlgebraSolver::new();
 
-        let expr = DimExpr::Mul(
-            Box::new(DimExpr::Sym(s)),
-            Box::new(DimExpr::Lit(768)),
-        );
+        let expr = DimExpr::Mul(Box::new(DimExpr::Sym(s)), Box::new(DimExpr::Lit(768)));
         assert!(solver.prove_eq(&expr, &expr).is_ok());
     }
 
@@ -786,9 +863,13 @@ mod tests {
         solver.bind(d, 768);
 
         // D == 768
-        assert!(solver.prove_eq(&DimExpr::Sym(d), &DimExpr::Lit(768)).is_ok());
+        assert!(solver
+            .prove_eq(&DimExpr::Sym(d), &DimExpr::Lit(768))
+            .is_ok());
         // D != 512
-        assert!(solver.prove_eq(&DimExpr::Sym(d), &DimExpr::Lit(512)).is_err());
+        assert!(solver
+            .prove_eq(&DimExpr::Sym(d), &DimExpr::Lit(512))
+            .is_err());
     }
 
     #[test]
@@ -823,7 +904,7 @@ mod tests {
         let mut solver = ShapeAlgebraSolver::new();
         solver.bind(d, 768);
 
-        assert!(solver.prove_divisible(&DimExpr::Sym(d), 12).is_ok());  // 768 % 12 == 0
+        assert!(solver.prove_divisible(&DimExpr::Sym(d), 12).is_ok()); // 768 % 12 == 0
         assert!(solver.prove_divisible(&DimExpr::Sym(d), 11).is_err()); // 768 % 11 != 0
     }
 
@@ -893,7 +974,9 @@ mod tests {
         let y = make_sym(&mut interner, "Y");
         let solver = ShapeAlgebraSolver::new();
 
-        let err = solver.prove_eq(&DimExpr::Sym(x), &DimExpr::Sym(y)).unwrap_err();
+        let err = solver
+            .prove_eq(&DimExpr::Sym(x), &DimExpr::Sym(y))
+            .unwrap_err();
         assert!(!err.attempts.is_empty());
         assert!(err.reason.contains("insufficient"));
     }
@@ -909,7 +992,10 @@ mod tests {
 
         // (B + S) * 2 = (32 + 128) * 2 = 320
         let expr = DimExpr::Mul(
-            Box::new(DimExpr::Add(Box::new(DimExpr::Sym(b)), Box::new(DimExpr::Sym(s)))),
+            Box::new(DimExpr::Add(
+                Box::new(DimExpr::Sym(b)),
+                Box::new(DimExpr::Sym(s)),
+            )),
             Box::new(DimExpr::Lit(2)),
         );
         assert_eq!(solver.evaluate(&expr), Some(320));
@@ -932,8 +1018,10 @@ mod tests {
         // S is exactly 32 (singleton bound)
         solver.assert_bound(s, Some(32), Some(32));
 
-        assert!(solver.prove_eq(&DimExpr::Sym(s), &DimExpr::Lit(32)).is_ok(),
-            "S with bounds [32, 32] should equal 32");
+        assert!(
+            solver.prove_eq(&DimExpr::Sym(s), &DimExpr::Lit(32)).is_ok(),
+            "S with bounds [32, 32] should equal 32"
+        );
     }
 
     #[test]
@@ -945,8 +1033,10 @@ mod tests {
         solver.assert_bound(a, Some(64), Some(64));
         solver.assert_bound(b, Some(64), Some(64));
 
-        assert!(solver.prove_eq(&DimExpr::Sym(a), &DimExpr::Sym(b)).is_ok(),
-            "A=[64,64] and B=[64,64] should be equal");
+        assert!(
+            solver.prove_eq(&DimExpr::Sym(a), &DimExpr::Sym(b)).is_ok(),
+            "A=[64,64] and B=[64,64] should be equal"
+        );
     }
 
     #[test]
@@ -956,12 +1046,18 @@ mod tests {
         let mut solver = ShapeAlgebraSolver::new();
         solver.assert_bound(s, Some(1), Some(4096));
 
-        assert!(solver.prove_le(&DimExpr::Sym(s), 4096).is_ok(),
-            "S <= 4096 should hold when S in [1, 4096]");
-        assert!(solver.prove_le(&DimExpr::Sym(s), 8192).is_ok(),
-            "S <= 8192 should hold when S in [1, 4096]");
-        assert!(solver.prove_le(&DimExpr::Sym(s), 100).is_err(),
-            "S <= 100 cannot be proven when S upper bound is 4096");
+        assert!(
+            solver.prove_le(&DimExpr::Sym(s), 4096).is_ok(),
+            "S <= 4096 should hold when S in [1, 4096]"
+        );
+        assert!(
+            solver.prove_le(&DimExpr::Sym(s), 8192).is_ok(),
+            "S <= 8192 should hold when S in [1, 4096]"
+        );
+        assert!(
+            solver.prove_le(&DimExpr::Sym(s), 100).is_err(),
+            "S <= 100 cannot be proven when S upper bound is 4096"
+        );
     }
 
     #[test]
@@ -971,12 +1067,18 @@ mod tests {
         let mut solver = ShapeAlgebraSolver::new();
         solver.assert_bound(s, Some(1), Some(4096));
 
-        assert!(solver.prove_ge(&DimExpr::Sym(s), 1).is_ok(),
-            "S >= 1 should hold when S in [1, 4096]");
-        assert!(solver.prove_ge(&DimExpr::Sym(s), 0).is_ok(),
-            "S >= 0 should hold when S >= 1");
-        assert!(solver.prove_ge(&DimExpr::Sym(s), 2).is_err(),
-            "S >= 2 cannot be proven when lower bound is 1");
+        assert!(
+            solver.prove_ge(&DimExpr::Sym(s), 1).is_ok(),
+            "S >= 1 should hold when S in [1, 4096]"
+        );
+        assert!(
+            solver.prove_ge(&DimExpr::Sym(s), 0).is_ok(),
+            "S >= 0 should hold when S >= 1"
+        );
+        assert!(
+            solver.prove_ge(&DimExpr::Sym(s), 2).is_err(),
+            "S >= 2 cannot be proven when lower bound is 1"
+        );
     }
 
     #[test]
@@ -1016,8 +1118,10 @@ mod tests {
         solver.assert_bound(b, Some(1), Some(1024));
 
         // A <= 1024 via transitive: A == B, B <= 1024
-        assert!(solver.prove_le(&DimExpr::Sym(a), 1024).is_ok(),
-            "A <= 1024 via A == B, B <= 1024");
+        assert!(
+            solver.prove_le(&DimExpr::Sym(a), 1024).is_ok(),
+            "A <= 1024 via A == B, B <= 1024"
+        );
     }
 
     // ── Commutative normalization tests ──────────────────────────────
@@ -1050,8 +1154,10 @@ mod tests {
         // Standard prove_eq fails (different structure)
         assert!(solver.prove_eq(&ab, &ba).is_err());
         // Normalized prove_eq succeeds
-        assert!(solver.prove_eq_normalized(&ab, &ba).is_ok(),
-            "A*B == B*A should be provable via normalization");
+        assert!(
+            solver.prove_eq_normalized(&ab, &ba).is_ok(),
+            "A*B == B*A should be provable via normalization"
+        );
     }
 
     // ── Fourier-Motzkin elimination tests ──────────────────────────────
@@ -1071,8 +1177,10 @@ mod tests {
         solver.assert_bound(b, Some(0), Some(1024));
         solver.assert_eq(DimExpr::Sym(a), DimExpr::Sym(b)); // A == B implies A <= 1024
 
-        assert!(solver.prove_le(&DimExpr::Sym(a), 1024).is_ok(),
-            "A <= 1024 via A == B, B <= 1024 (FM elimination)");
+        assert!(
+            solver.prove_le(&DimExpr::Sym(a), 1024).is_ok(),
+            "A <= 1024 via A == B, B <= 1024 (FM elimination)"
+        );
     }
 
     #[test]
@@ -1087,8 +1195,10 @@ mod tests {
         solver.assert_eq(DimExpr::Sym(b), DimExpr::Sym(c));
         solver.assert_bound(c, Some(1), Some(100));
 
-        assert!(solver.prove_le(&DimExpr::Sym(a), 100).is_ok(),
-            "A <= 100 via A == B == C, C <= 100");
+        assert!(
+            solver.prove_le(&DimExpr::Sym(a), 100).is_ok(),
+            "A <= 100 via A == B == C, C <= 100"
+        );
     }
 
     #[test]
@@ -1100,10 +1210,14 @@ mod tests {
         solver.assert_bound(s, Some(1), Some(100));
 
         let two_s = DimExpr::Mul(Box::new(DimExpr::Lit(2)), Box::new(DimExpr::Sym(s)));
-        assert!(solver.prove_le(&two_s, 200).is_ok(),
-            "2*S <= 200 when S <= 100");
-        assert!(solver.prove_le(&two_s, 199).is_err(),
-            "2*S <= 199 should fail when S can be 100");
+        assert!(
+            solver.prove_le(&two_s, 200).is_ok(),
+            "2*S <= 200 when S <= 100"
+        );
+        assert!(
+            solver.prove_le(&two_s, 199).is_err(),
+            "2*S <= 199 should fail when S can be 100"
+        );
     }
 
     #[test]
@@ -1117,10 +1231,14 @@ mod tests {
         solver.assert_bound(b, Some(0), Some(50));
 
         let sum = DimExpr::Add(Box::new(DimExpr::Sym(a)), Box::new(DimExpr::Sym(b)));
-        assert!(solver.prove_le(&sum, 100).is_ok(),
-            "A + B <= 100 when both in [0, 50]");
-        assert!(solver.prove_le(&sum, 99).is_err(),
-            "A + B <= 99 should fail when both can be 50");
+        assert!(
+            solver.prove_le(&sum, 100).is_ok(),
+            "A + B <= 100 when both in [0, 50]"
+        );
+        assert!(
+            solver.prove_le(&sum, 99).is_err(),
+            "A + B <= 99 should fail when both can be 50"
+        );
     }
 
     #[test]
@@ -1144,8 +1262,10 @@ mod tests {
         let mut solver = ShapeAlgebraSolver::new();
         solver.assert_bound(a, Some(1), Some(100));
 
-        assert!(solver.prove_le(&DimExpr::Sym(a), 50).is_err(),
-            "Should not prove A <= 50 when upper bound is 100");
+        assert!(
+            solver.prove_le(&DimExpr::Sym(a), 50).is_err(),
+            "Should not prove A <= 50 when upper bound is 100"
+        );
     }
 
     #[test]
@@ -1156,9 +1276,13 @@ mod tests {
         let mut solver = ShapeAlgebraSolver::new();
         solver.assert_bound(s, Some(32), Some(32));
 
-        assert!(solver.prove_divisible(&DimExpr::Sym(s), 8).is_ok(),
-            "S=[32,32] should be divisible by 8");
-        assert!(solver.prove_divisible(&DimExpr::Sym(s), 7).is_err(),
-            "S=[32,32] should not be divisible by 7");
+        assert!(
+            solver.prove_divisible(&DimExpr::Sym(s), 8).is_ok(),
+            "S=[32,32] should be divisible by 8"
+        );
+        assert!(
+            solver.prove_divisible(&DimExpr::Sym(s), 7).is_err(),
+            "S=[32,32] should not be divisible by 7"
+        );
     }
 }

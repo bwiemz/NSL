@@ -11,7 +11,10 @@ fn nsl_binary() -> std::path::PathBuf {
 }
 
 fn run(args: &[&str]) -> (String, String, i32) {
-    let out = Command::new(nsl_binary()).args(args).output().expect("run nsl");
+    let out = Command::new(nsl_binary())
+        .args(args)
+        .output()
+        .expect("run nsl");
     (
         String::from_utf8_lossy(&out.stdout).to_string(),
         String::from_utf8_lossy(&out.stderr).to_string(),
@@ -21,7 +24,12 @@ fn run(args: &[&str]) -> (String, String, i32) {
 
 #[test]
 fn calibrate_without_data_errors() {
-    let (_o, e, code) = run(&["build", "models/coder-rl/train_sft.nsl", "--calibrate", "best-effort"]);
+    let (_o, e, code) = run(&[
+        "build",
+        "models/coder-rl/train_sft.nsl",
+        "--calibrate",
+        "best-effort",
+    ]);
     assert_ne!(code, 0);
     assert!(e.contains("--calibrate") && e.contains("--calibration-data"));
 }
@@ -29,9 +37,12 @@ fn calibrate_without_data_errors() {
 #[test]
 fn bad_calibrate_mode_errors() {
     let (_o, e, code) = run(&[
-        "build", "models/coder-rl/train_sft.nsl",
-        "--calibration-data", "/tmp/any.bin",
-        "--calibrate", "maybe",
+        "build",
+        "models/coder-rl/train_sft.nsl",
+        "--calibration-data",
+        "/tmp/any.bin",
+        "--calibrate",
+        "maybe",
     ]);
     assert_ne!(code, 0);
     assert!(e.contains("required") || e.contains("best-effort"));
@@ -40,8 +51,10 @@ fn bad_calibrate_mode_errors() {
 #[test]
 fn nonexistent_calibration_data_errors() {
     let (_o, e, code) = run(&[
-        "build", "models/coder-rl/train_sft.nsl",
-        "--calibration-data", "/nonexistent/path/to/data.bin",
+        "build",
+        "models/coder-rl/train_sft.nsl",
+        "--calibration-data",
+        "/nonexistent/path/to/data.bin",
     ]);
     assert_ne!(code, 0);
     assert!(e.contains("calibration-data") && e.contains("does not exist"));
@@ -53,8 +66,10 @@ fn bad_extension_errors() {
     p.push("nsl-calib-bad-ext.jsonl");
     std::fs::write(&p, b"x").unwrap();
     let (_o, e, code) = run(&[
-        "build", "models/coder-rl/train_sft.nsl",
-        "--calibration-data", p.to_str().unwrap(),
+        "build",
+        "models/coder-rl/train_sft.nsl",
+        "--calibration-data",
+        p.to_str().unwrap(),
     ]);
     let _ = std::fs::remove_file(&p);
     assert_ne!(code, 0);
@@ -64,8 +79,10 @@ fn bad_extension_errors() {
 #[test]
 fn samples_zero_errors() {
     let (_o, e, code) = run(&[
-        "build", "models/coder-rl/train_sft.nsl",
-        "--calibration-samples", "0",
+        "build",
+        "models/coder-rl/train_sft.nsl",
+        "--calibration-samples",
+        "0",
     ]);
     assert_ne!(code, 0);
     assert!(e.contains("calibration-samples"));

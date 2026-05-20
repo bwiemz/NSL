@@ -80,20 +80,20 @@ use csha_reference::{csha_reference, det_seq, CshaInputs, CshaShape};
 
 use nsl_codegen::flash_attention::{CshaExtras, FlashAttentionConfig, RopeStyle};
 use nsl_codegen::flash_attention_selector::{
-    flash_attention_kernel_name_selected, shared_mem_bytes_selected,
-    synthesize_flash_attention_ptx_selected, Emitter, select_emitter,
+    flash_attention_kernel_name_selected, select_emitter, shared_mem_bytes_selected,
+    synthesize_flash_attention_ptx_selected, Emitter,
 };
 use nsl_codegen::flash_attention_v2::smem_layout::{self, needs_dynamic_smem};
 use std::ffi::CString;
 
-use nsl_runtime::{
-    nsl_cuda_init, nsl_test_cuda_alloc, nsl_test_cuda_d2h, nsl_test_cuda_free,
-    nsl_test_cuda_h2d, nsl_test_cuda_jit_log,
-};
 use nsl_runtime::flash_attention::{
     nsl_csha_alloc_backward_activations, nsl_csha_free_backward_activations,
     nsl_flash_attention_csha, nsl_flash_attention_csha_backward,
     nsl_flash_attention_csha_with_saves, CshaBackwardActivations,
+};
+use nsl_runtime::{
+    nsl_cuda_init, nsl_test_cuda_alloc, nsl_test_cuda_d2h, nsl_test_cuda_free, nsl_test_cuda_h2d,
+    nsl_test_cuda_jit_log,
 };
 
 // --------------------------------------------------------------------------
@@ -126,7 +126,10 @@ fn f16_to_f32(bits: u16) -> f32 {
         } else {
             let mut m = mant;
             let mut e: i32 = -1;
-            while m & 0x400 == 0 { m <<= 1; e -= 1; }
+            while m & 0x400 == 0 {
+                m <<= 1;
+                e -= 1;
+            }
             let e = (127 + e - 14) as u32;
             (sign << 31) | (e << 23) | ((m & 0x3ff) << 13)
         }
@@ -141,7 +144,9 @@ fn f16_to_f32(bits: u16) -> f32 {
 
 /// f32 → f16 bits (round-to-nearest, clamp on overflow).
 fn f32_to_f16_bits(x: f32) -> u16 {
-    if x.is_nan() { return 0x7E00; }
+    if x.is_nan() {
+        return 0x7E00;
+    }
     let bits = x.to_bits();
     let sign = (bits >> 31) & 1;
     let exp = ((bits >> 23) & 0xFF) as i32;
@@ -171,14 +176,22 @@ fn f32_to_f16_bits(x: f32) -> u16 {
 
 fn free_all(ptrs: &[i64]) {
     for &p in ptrs {
-        if p != 0 { unsafe { nsl_test_cuda_free(p); } }
+        if p != 0 {
+            unsafe {
+                nsl_test_cuda_free(p);
+            }
+        }
     }
 }
 
 fn read_jit_log(ptx_ptr: i64) -> String {
     let log_ptr = unsafe { nsl_test_cuda_jit_log(ptx_ptr) };
     if log_ptr != 0 {
-        unsafe { std::ffi::CStr::from_ptr(log_ptr as *const i8).to_string_lossy().into_owned() }
+        unsafe {
+            std::ffi::CStr::from_ptr(log_ptr as *const i8)
+                .to_string_lossy()
+                .into_owned()
+        }
     } else {
         "<no log>".into()
     }
@@ -233,8 +246,8 @@ fn run_fused_config_dmodel(
     rope_q: bool,
 ) -> Result<f32 /* max_abs_diff */, String> {
     // d_model = d_model_param; kernel RMSNorm normalises head_dim features per row.
-    let batch    = 1usize;
-    let heads    = heads as usize;
+    let batch = 1usize;
+    let heads = heads as usize;
     // seq = block_q (= block_kv in the single-tile design used by C2/C3).
     // The fused-projection K pre-pass fills exactly block_kv K rows from the
     // normalized x buffer.  If seq > block_kv, the KV loop's second iteration
@@ -243,11 +256,11 @@ fn run_fused_config_dmodel(
     // For asymmetric configs with block_q < block_kv, use block_kv so the KV
     // tile is at least fully populated for the single iteration.
     // For block_q > block_kv, use block_q so all q-warps reference valid rows.
-    let seq      = (block_q as usize).max(block_kv as usize);
+    let seq = (block_q as usize).max(block_kv as usize);
     let head_dim = head_dim as usize;
-    let d_model  = d_model_param as usize;
+    let d_model = d_model_param as usize;
     let norm_eps = 1e-5f32;
-    let scale    = 1.0f32 / (head_dim as f32).sqrt();
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
     let active_heads_i = heads as i64;
 
     // ── Config validation: check SMEM budget before launching ───────────────
@@ -255,21 +268,25 @@ fn run_fused_config_dmodel(
     // falls back to v1 (SMEM budget exceeded), return a descriptive error so
     // the matrix driver can mark the row as SMEM-blocked (not a numerical fail).
     let config = FlashAttentionConfig {
-        block_q: block_q as i64, block_kv: block_kv as i64, head_dim: head_dim as i64,
+        block_q: block_q as i64,
+        block_kv: block_kv as i64,
+        head_dim: head_dim as i64,
         causal,
-        paged:           false,
+        paged: false,
         rope_q,
-        rope_style:      RopeStyle::HalfSplit,
-        gqa_group_size:  1,
-        tree_mask:       false,
-        gpu_sm:          75, segment_masked: false, csha: Some(CshaExtras {
-            level:             2,
-            fused_rmsnorm:     true,
+        rope_style: RopeStyle::HalfSplit,
+        gqa_group_size: 1,
+        tree_mask: false,
+        gpu_sm: 75,
+        segment_masked: false,
+        csha: Some(CshaExtras {
+            level: 2,
+            fused_rmsnorm: true,
             fused_projections: true,
             fused_output_proj: false,
-            active_heads:      active_heads_i as u32,
-            rmsnorm_eps:       norm_eps,
-            d_model:           d_model as u32,
+            active_heads: active_heads_i as u32,
+            rmsnorm_eps: norm_eps,
+            d_model: d_model as u32,
             save_activations_for_backward: false,
         }),
     };
@@ -277,7 +294,8 @@ fn run_fused_config_dmodel(
     // Pre-validate before calling select_emitter: v1 is deleted so out-of-matrix
     // configs now panic.  Return Err here so the matrix driver can mark the row
     // as SMEM-blocked (not a numerical failure) without catching a panic.
-    if let Err(e) = smem_layout::validate_scalar_v2_config(&config, smem_layout::Direction::Forward) {
+    if let Err(e) = smem_layout::validate_scalar_v2_config(&config, smem_layout::Direction::Forward)
+    {
         return Err(format!(
             "SMEM budget exceeded or config out-of-matrix: {}; not a numerical failure",
             e
@@ -317,7 +335,7 @@ fn run_fused_config_dmodel(
     // pointers for cos/sin to the kernel.  This tests Q/K/V projection + softmax;
     // actual RoPE numerical validation is a separate concern.
     let zeros_rope = vec![0f32; seq * (head_dim / 2)];
-    let ones_cos   = vec![1.0f32; seq * (head_dim / 2)];
+    let ones_cos = vec![1.0f32; seq * (head_dim / 2)];
 
     let mut cpu_out = vec![0f32; seq * heads * head_dim];
     for h in 0..heads {
@@ -331,11 +349,21 @@ fn run_fused_config_dmodel(
         let out_h = if d_model == head_dim {
             // Standard path: d_model == head_dim, CPU reference handles both.
             let shape = CshaShape {
-                seq, heads: 1, head_dim, d_model: head_dim, causal, norm_eps,
+                seq,
+                heads: 1,
+                head_dim,
+                d_model: head_dim,
+                causal,
+                norm_eps,
             };
             let inputs = CshaInputs {
-                x: &x_h, wq: &wq_f32, wk: &wk_f32, wv: &wv_f32,
-                norm_weight: &norm_weight_f32, cos: &ones_cos, sin: &zeros_rope,
+                x: &x_h,
+                wq: &wq_f32,
+                wk: &wk_f32,
+                wv: &wv_f32,
+                norm_weight: &norm_weight_f32,
+                cos: &ones_cos,
+                sin: &zeros_rope,
             };
             csha_reference(&inputs, &shape)
         } else {
@@ -358,7 +386,12 @@ fn run_fused_config_dmodel(
             // Step 3: project using [d_model, head_dim] weight tiles.
             // CPU ref with d_model=d_model, head_dim=head_dim, norm already done.
             let shape = CshaShape {
-                seq, heads: 1, head_dim, d_model, causal, norm_eps,
+                seq,
+                heads: 1,
+                head_dim,
+                d_model,
+                causal,
+                norm_eps,
             };
             // Use all-ones norm_weight and pass pre-normalised x_norm_dmodel
             // as the x input, with identity norm (norm_eps=0, weight=1 ensures
@@ -366,12 +399,16 @@ fn run_fused_config_dmodel(
             // but that only works when x is already normalised to unit RMS.
             // Simpler: inline the full matmul + attention here.
             let _ = shape; // avoid lint for now
-            // Full inline: matmul + attention directly.
+                           // Full inline: matmul + attention directly.
             fn matmul_f32(a: &[f32], b: &[f32], m: usize, k: usize, n: usize) -> Vec<f32> {
                 let mut c = vec![0f32; m * n];
-                for i in 0..m { for j in 0..n { for p in 0..k {
-                    c[i * n + j] += a[i * k + p] * b[p * n + j];
-                }}}
+                for i in 0..m {
+                    for j in 0..n {
+                        for p in 0..k {
+                            c[i * n + j] += a[i * k + p] * b[p * n + j];
+                        }
+                    }
+                }
                 c
             }
             let q_h = matmul_f32(&x_norm_dmodel, &wq_f32, seq, d_model, head_dim);
@@ -380,55 +417,71 @@ fn run_fused_config_dmodel(
             // S = Q @ K^T / sqrt(head_dim); softmax; O = P @ V.
             let scale_local = 1.0f32 / (head_dim as f32).sqrt();
             let mut s_mat = vec![0f32; seq * seq];
-            for i in 0..seq { for j in 0..seq {
-                let mut dot = 0f32;
-                for d in 0..head_dim { dot += q_h[i * head_dim + d] * k_h[j * head_dim + d]; }
-                s_mat[i * seq + j] = dot * scale_local;
-            }}
+            for i in 0..seq {
+                for j in 0..seq {
+                    let mut dot = 0f32;
+                    for d in 0..head_dim {
+                        dot += q_h[i * head_dim + d] * k_h[j * head_dim + d];
+                    }
+                    s_mat[i * seq + j] = dot * scale_local;
+                }
+            }
             if causal {
-                for i in 0..seq { for j in (i + 1)..seq { s_mat[i * seq + j] = f32::NEG_INFINITY; }}
+                for i in 0..seq {
+                    for j in (i + 1)..seq {
+                        s_mat[i * seq + j] = f32::NEG_INFINITY;
+                    }
+                }
             }
             for i in 0..seq {
                 let row = &mut s_mat[i * seq..(i + 1) * seq];
                 let mx = row.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
                 let mut sum = 0f32;
-                for v in row.iter_mut() { *v = (*v - mx).exp(); sum += *v; }
-                for v in row.iter_mut() { *v /= sum; }
+                for v in row.iter_mut() {
+                    *v = (*v - mx).exp();
+                    sum += *v;
+                }
+                for v in row.iter_mut() {
+                    *v /= sum;
+                }
             }
             let mut o_h = vec![0f32; seq * head_dim];
-            for i in 0..seq { for j in 0..head_dim {
-                let mut acc = 0f32;
-                for k in 0..seq { acc += s_mat[i * seq + k] * v_h[k * head_dim + j]; }
-                o_h[i * head_dim + j] = acc;
-            }}
+            for i in 0..seq {
+                for j in 0..head_dim {
+                    let mut acc = 0f32;
+                    for k in 0..seq {
+                        acc += s_mat[i * seq + k] * v_h[k * head_dim + j];
+                    }
+                    o_h[i * head_dim + j] = acc;
+                }
+            }
             o_h
         };
 
         for s in 0..seq {
-            cpu_out[s * heads * head_dim + h * head_dim
-                ..s * heads * head_dim + (h + 1) * head_dim]
+            cpu_out[s * heads * head_dim + h * head_dim..s * heads * head_dim + (h + 1) * head_dim]
                 .copy_from_slice(&out_h[s * head_dim..(s + 1) * head_dim]);
         }
     }
 
     // ── Device allocations ────────────────────────────────────────────────────
-    let x_bytes       = (x_kernel.len() * 4) as i64;
-    let w_bytes       = (wq_f16.len() * 2) as i64;
-    let nw_bytes      = (norm_weight_f32.len() * 4) as i64;
-    let qkv_elems     = batch * heads * seq * head_dim;
+    let x_bytes = (x_kernel.len() * 4) as i64;
+    let w_bytes = (wq_f16.len() * 2) as i64;
+    let nw_bytes = (norm_weight_f32.len() * 4) as i64;
+    let qkv_elems = batch * heads * seq * head_dim;
     let qkv_f16_bytes = (qkv_elems * 2) as i64;
     let qkv_f32_bytes = (qkv_elems * 4) as i64;
-    let out_bytes     = qkv_f16_bytes;
-    let lse_bytes     = (batch * heads * seq * 4) as i64;
+    let out_bytes = qkv_f16_bytes;
+    let lse_bytes = (batch * heads * seq * 4) as i64;
 
-    let x_dev   = unsafe { nsl_test_cuda_alloc(x_bytes) };
-    let wq_dev  = unsafe { nsl_test_cuda_alloc(w_bytes) };
-    let wk_dev  = unsafe { nsl_test_cuda_alloc(w_bytes) };
-    let wv_dev  = unsafe { nsl_test_cuda_alloc(w_bytes) };
-    let nw_dev  = unsafe { nsl_test_cuda_alloc(nw_bytes) };
-    let q_dev   = unsafe { nsl_test_cuda_alloc(qkv_f32_bytes) };
-    let k_dev   = unsafe { nsl_test_cuda_alloc(qkv_f32_bytes) };
-    let v_dev   = unsafe { nsl_test_cuda_alloc(qkv_f32_bytes) };
+    let x_dev = unsafe { nsl_test_cuda_alloc(x_bytes) };
+    let wq_dev = unsafe { nsl_test_cuda_alloc(w_bytes) };
+    let wk_dev = unsafe { nsl_test_cuda_alloc(w_bytes) };
+    let wv_dev = unsafe { nsl_test_cuda_alloc(w_bytes) };
+    let nw_dev = unsafe { nsl_test_cuda_alloc(nw_bytes) };
+    let q_dev = unsafe { nsl_test_cuda_alloc(qkv_f32_bytes) };
+    let k_dev = unsafe { nsl_test_cuda_alloc(qkv_f32_bytes) };
+    let v_dev = unsafe { nsl_test_cuda_alloc(qkv_f32_bytes) };
     let out_dev = unsafe { nsl_test_cuda_alloc(out_bytes) };
     let lse_dev = unsafe { nsl_test_cuda_alloc(lse_bytes) };
 
@@ -441,10 +494,10 @@ fn run_fused_config_dmodel(
     }
 
     unsafe {
-        nsl_test_cuda_h2d(x_dev,  x_kernel.as_ptr()        as i64, x_bytes);
-        nsl_test_cuda_h2d(wq_dev, wq_f16.as_ptr()          as i64, w_bytes);
-        nsl_test_cuda_h2d(wk_dev, wk_f16.as_ptr()          as i64, w_bytes);
-        nsl_test_cuda_h2d(wv_dev, wv_f16.as_ptr()          as i64, w_bytes);
+        nsl_test_cuda_h2d(x_dev, x_kernel.as_ptr() as i64, x_bytes);
+        nsl_test_cuda_h2d(wq_dev, wq_f16.as_ptr() as i64, w_bytes);
+        nsl_test_cuda_h2d(wk_dev, wk_f16.as_ptr() as i64, w_bytes);
+        nsl_test_cuda_h2d(wv_dev, wv_f16.as_ptr() as i64, w_bytes);
         nsl_test_cuda_h2d(nw_dev, norm_weight_f32.as_ptr() as i64, nw_bytes);
     }
 
@@ -454,18 +507,23 @@ fn run_fused_config_dmodel(
         Ok(p) => p,
         Err(e) => {
             free_all(&all_ptrs);
-            let msg = e.downcast_ref::<String>().cloned()
+            let msg = e
+                .downcast_ref::<String>()
+                .cloned()
                 .or_else(|| e.downcast_ref::<&str>().map(|s| (*s).to_string()))
                 .unwrap_or_else(|| "<non-string panic>".into());
             return Err(format!("emitter panicked: {msg}"));
         }
     };
 
-    while ptx.last() == Some(&0) { ptx.pop(); }
-    if ptx.last() != Some(&b'\n') { ptx.push(b'\n'); }
-    let dump_name = format!(
-        "csha_fused_bq{block_q}_bkv{block_kv}_hd{head_dim}_h{heads}_c{causal}.ptx"
-    );
+    while ptx.last() == Some(&0) {
+        ptx.pop();
+    }
+    if ptx.last() != Some(&b'\n') {
+        ptx.push(b'\n');
+    }
+    let dump_name =
+        format!("csha_fused_bq{block_q}_bkv{block_kv}_hd{head_dim}_h{heads}_c{causal}.ptx");
     let dump = std::env::temp_dir().join(&dump_name);
     std::fs::write(&dump, &ptx).ok();
     eprintln!("[C3] PTX dumped to: {}", dump.display());
@@ -478,27 +536,44 @@ fn run_fused_config_dmodel(
     // cuLaunchKernel receives the correct sharedMemBytes.
     // For static-SMEM configs (total <= 48 KB), pass 0 — the static .shared
     // declaration bakes the size in; cuLaunchKernel ignores sharedMemBytes=0.
-    let smem_dynamic: i64 = if needs_dynamic_smem(&config) { smem_total as i64 } else { 0 };
+    let smem_dynamic: i64 = if needs_dynamic_smem(&config) {
+        smem_total as i64
+    } else {
+        0
+    };
     eprintln!(
         "[C3] kernel={} smem_total={}B dynamic={}",
-        kernel_name.to_str().unwrap(), smem_total, smem_dynamic > 0
+        kernel_name.to_str().unwrap(),
+        smem_total,
+        smem_dynamic > 0
     );
 
     // ── Launch ────────────────────────────────────────────────────────────────
     let rc = unsafe {
         nsl_flash_attention_csha(
-            q_dev, k_dev, v_dev,
+            q_dev,
+            k_dev,
+            v_dev,
             out_dev,
             lse_dev,
             scale.to_bits() as i64,
-            batch as i64, heads as i64, seq as i64, head_dim as i64,
-            0, 0, 0, 0,   // paging: block_table, k_pool, v_pool, block_size
-            0, 0,         // cos_ptr=0, sin_ptr=0 (identity RoPE for comparison)
-            0, 0,         // seq_ids, seq_lens
+            batch as i64,
+            heads as i64,
+            seq as i64,
+            head_dim as i64,
+            0,
+            0,
+            0,
+            0, // paging: block_table, k_pool, v_pool, block_size
+            0,
+            0, // cos_ptr=0, sin_ptr=0 (identity RoPE for comparison)
+            0,
+            0, // seq_ids, seq_lens
             smem_dynamic,
             ptx.as_ptr() as i64,
             kernel_name.as_ptr() as i64,
-            block_q as i64, block_kv as i64,
+            block_q as i64,
+            block_kv as i64,
             if causal { 1i64 } else { 0i64 },
             // CSHA extras
             x_dev,
@@ -506,7 +581,7 @@ fn run_fused_config_dmodel(
             wq_dev,
             wk_dev,
             wv_dev,
-            0i64,         // wo_ptr=null (fused_output_proj=false)
+            0i64, // wo_ptr=null (fused_output_proj=false)
             norm_eps.to_bits() as i64,
             active_heads_i,
             d_model as i64,
@@ -522,7 +597,9 @@ fn run_fused_config_dmodel(
 
     // ── Readback + compare ───────────────────────────────────────────────────
     let mut out_f16 = vec![0u16; qkv_elems];
-    unsafe { nsl_test_cuda_d2h(out_f16.as_mut_ptr() as i64, out_dev, out_bytes); }
+    unsafe {
+        nsl_test_cuda_d2h(out_f16.as_mut_ptr() as i64, out_dev, out_bytes);
+    }
 
     // GPU stores in [heads, seq, head_dim] order (batch=1).
     // CPU reference stores in [seq, heads, head_dim] order.
@@ -555,7 +632,10 @@ fn run_fused_config_dmodel(
     let mut max_idx = 0usize;
     for (i, (&g, &c)) in out_gpu.iter().zip(cpu_out.iter()).enumerate() {
         let abs = (g - c).abs();
-        if abs > max_abs { max_abs = abs; max_idx = i; }
+        if abs > max_abs {
+            max_abs = abs;
+            max_idx = i;
+        }
     }
     eprintln!(
         "[C3] bq={block_q} bkv={block_kv} hd={head_dim} h={heads} c={causal}: \
@@ -580,17 +660,31 @@ fn run_fused_config_dmodel(
 #[test]
 #[ignore = "requires CUDA GPU"]
 fn fused_csha_32x32x32_heads4_nocausal() {
-    if !cuda_available() { return; }
+    if !cuda_available() {
+        return;
+    }
 
     // Confirm v2 routing (only emitter post-C5) before spending time on GPU launch.
     let probe = FlashAttentionConfig {
-        block_q: 32, block_kv: 32, head_dim: 32,
-        causal: false, paged: false, rope_q: false,
-        rope_style: RopeStyle::HalfSplit, gqa_group_size: 1,
-        tree_mask: false, gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras {
-            level: 2, fused_rmsnorm: true, fused_projections: true,
-            fused_output_proj: false, active_heads: 4,
-            rmsnorm_eps: 1e-5, d_model: 32,
+        block_q: 32,
+        block_kv: 32,
+        head_dim: 32,
+        causal: false,
+        paged: false,
+        rope_q: false,
+        rope_style: RopeStyle::HalfSplit,
+        gqa_group_size: 1,
+        tree_mask: false,
+        gpu_sm: 75,
+        segment_masked: false,
+        csha: Some(CshaExtras {
+            level: 2,
+            fused_rmsnorm: true,
+            fused_projections: true,
+            fused_output_proj: false,
+            active_heads: 4,
+            rmsnorm_eps: 1e-5,
+            d_model: 32,
             save_activations_for_backward: false,
         }),
     };
@@ -600,8 +694,8 @@ fn fused_csha_32x32x32_heads4_nocausal() {
         "selector must return V2 (only emitter post-C5)"
     );
 
-    let max_abs = run_fused_config(32, 32, 32, 4, false, false)
-        .expect("C2 smoke: unexpected error");
+    let max_abs =
+        run_fused_config(32, 32, 32, 4, false, false).expect("C2 smoke: unexpected error");
 
     assert!(
         max_abs <= 5e-3,
@@ -649,47 +743,55 @@ fn fused_csha_32x32x32_heads4_nocausal() {
 #[test]
 #[ignore = "requires CUDA GPU"]
 fn csha_fused_matrix_sweep() {
-    if !cuda_available() { return; }
+    if !cuda_available() {
+        return;
+    }
 
     // (block_q, block_kv, head_dim, heads, causal, rope_q)
     let configs: &[(u32, u32, u32, u32, bool, bool)] = &[
         // Core §4 matrix: head_dim ∈ {32, 64, 128}, causal ∈ {false, true}
         (32, 32, 32, 4, false, false),
-        (32, 32, 32, 4, true,  false),
+        (32, 32, 32, 4, true, false),
         (32, 32, 64, 4, false, false),
-        (32, 32, 64, 4, true,  false),
+        (32, 32, 64, 4, true, false),
         (64, 64, 32, 8, false, false),
-        (64, 64, 32, 8, true,  false),
+        (64, 64, 32, 8, true, false),
         // (64,64,64,8): 56.5 KB > 48 KB static cap → dynamic SMEM opt-in (valid, not blocked).
         (64, 64, 64, 8, false, false),
-        (64, 64, 64, 8, true,  false),
+        (64, 64, 64, 8, true, false),
         // Track B: head_dim=128 rows.  d_model=32 keeps SMEM at 44.25 KB (static).
         // head_dim=128 with d_model=128 would require 116.25 KB > 99 KB device limit.
         // Using d_model=32 (the minimum that exercises the fused-projection path
         // without exceeding the RTX 5070 Ti's 99 KB cuFuncSetAttribute limit).
         (32, 32, 128, 4, false, false),
-        (32, 32, 128, 4, true,  false),
+        (32, 32, 128, 4, true, false),
         // Asymmetric (block_q, block_kv) combos.  The K pre-pass now decouples
         // its iteration count from block_q (uses `kv_iters = block_kv / 4`),
         // so asymmetric configs are valid.  Two representative rows: one
         // block_q < block_kv (wide-KV: long-context prefill shape), one
         // block_q > block_kv (narrow-KV: short-sequence training shape).
         (32, 64, 32, 4, false, false),
-        (32, 64, 32, 4, true,  false),
+        (32, 64, 32, 4, true, false),
         (64, 32, 32, 4, false, false),
-        (64, 32, 32, 4, true,  false),
+        (64, 32, 32, 4, true, false),
     ];
 
-    let mut failures  = Vec::new();
+    let mut failures = Vec::new();
     let mut smem_blocked = Vec::new();
-    let mut results   = Vec::new();
+    let mut results = Vec::new();
 
     for &(bq, bkv, hd, h, causal, rope) in configs {
         let label = format!("bq={bq} bkv={bkv} hd={hd} h={h} c={causal} rq={rope}");
         // f16 accumulation error scales as O(sqrt(head_dim) × ε_f16).
         // head_dim=32: ~5e-3. head_dim=64: ~2e-2. head_dim=128: ~4e-2.
         // Tighter bounds require f32 accumulation (follow-up).
-        let tol: f32 = if hd <= 32 { 5e-3 } else if hd <= 64 { 2e-2 } else { 4e-2 };
+        let tol: f32 = if hd <= 32 {
+            5e-3
+        } else if hd <= 64 {
+            2e-2
+        } else {
+            4e-2
+        };
         // For head_dim=128, use d_model=32 to stay within the static 48 KB SMEM
         // budget.  d_model=128 would require 116.25 KB > 99 KB device opt-in limit.
         let d_model_for_config = if hd >= 128 { 32 } else { hd };
@@ -698,15 +800,19 @@ fn csha_fused_matrix_sweep() {
                 let verdict = if max_diff < tol { "PASS" } else { "FAIL" };
                 eprintln!("[C3] {verdict}  {label}: max_abs={max_diff:.3e} tol={tol:.0e}");
                 if max_diff >= tol {
-                    failures.push(format!("{label}: tolerance exceeded ({max_diff:.3e} >= {tol:.0e})"));
+                    failures.push(format!(
+                        "{label}: tolerance exceeded ({max_diff:.3e} >= {tol:.0e})"
+                    ));
                 }
                 results.push((label, max_diff, true));
             }
-            Err(ref e) if e.contains("SMEM budget exceeded")
-                || e.contains("exceeds")
-                || e.contains("routed to V1")
-                || e.contains("selector routed")
-                || e.contains("block_q == block_kv") => {
+            Err(ref e)
+                if e.contains("SMEM budget exceeded")
+                    || e.contains("exceeds")
+                    || e.contains("routed to V1")
+                    || e.contains("selector routed")
+                    || e.contains("block_q == block_kv") =>
+            {
                 eprintln!("[C3] CONSTRAINT-BLOCKED  {label}: {e}");
                 smem_blocked.push(label.clone());
                 results.push((label, f32::NAN, false));
@@ -720,7 +826,8 @@ fn csha_fused_matrix_sweep() {
     }
 
     let v2_count = results.iter().filter(|(_, _, v2)| *v2).count();
-    let pass_count = results.iter()
+    let pass_count = results
+        .iter()
         .filter(|(_, diff, v2)| *v2 && diff.is_finite())
         .count();
     eprintln!(
@@ -756,8 +863,12 @@ fn csha_fused_matrix_sweep() {
 /// matching the T1.4 invariant: the save code must not perturb forward O/LSE.
 #[cfg(feature = "cuda")]
 fn run_with_saves(
-    block_q: u32, block_kv: u32, head_dim: u32, heads: u32,
-    causal: bool, rope_q: bool,
+    block_q: u32,
+    block_kv: u32,
+    head_dim: u32,
+    heads: u32,
+    causal: bool,
+    rope_q: bool,
     seq_override: Option<usize>,
     saves: Option<CshaBackwardActivations>,
     segment_ids: Option<&[u16]>,
@@ -775,10 +886,18 @@ fn run_with_saves(
     }
 
     let config = FlashAttentionConfig {
-        block_q: block_q as i64, block_kv: block_kv as i64, head_dim: hd as i64,
-        causal, paged: false, rope_q,
+        block_q: block_q as i64,
+        block_kv: block_kv as i64,
+        head_dim: hd as i64,
+        causal,
+        paged: false,
+        rope_q,
         rope_style: RopeStyle::HalfSplit,
-        gqa_group_size: 1, tree_mask: false, gpu_sm: 75, segment_masked, csha: Some(CshaExtras {
+        gqa_group_size: 1,
+        tree_mask: false,
+        gpu_sm: 75,
+        segment_masked,
+        csha: Some(CshaExtras {
             level: 2,
             fused_rmsnorm: true,
             fused_projections: true,
@@ -790,13 +909,14 @@ fn run_with_saves(
         }),
     };
 
-    if let Err(e) = smem_layout::validate_scalar_v2_config(&config, smem_layout::Direction::Forward) {
+    if let Err(e) = smem_layout::validate_scalar_v2_config(&config, smem_layout::Direction::Forward)
+    {
         return Err(format!("SMEM/validator: {e}"));
     }
     let emitter = select_emitter(&config);
     debug_assert_eq!(emitter, Emitter::V2);
 
-    let x      = det_seq(42, heads_u * seq * hd);
+    let x = det_seq(42, heads_u * seq * hd);
     let wq_f32 = det_seq(43, dm * hd);
     let wk_f32 = det_seq(44, dm * hd);
     let wv_f32 = det_seq(45, dm * hd);
@@ -805,14 +925,16 @@ fn run_with_saves(
     let wv: Vec<u16> = wv_f32.iter().map(|&v| f32_to_f16_bits(v)).collect();
     let nw = vec![1.0f32; hd];
 
-    unsafe { nsl_cuda_init(); }
+    unsafe {
+        nsl_cuda_init();
+    }
     let qkv_elems = heads_u * seq * hd;
     let lse_elems = batch * heads_u * seq;
-    let qkv_bytes = (qkv_elems * 2) as i64;   // f16
-    let lse_bytes = (lse_elems * 4) as i64;   // f32
-    let x_bytes   = (x.len() * 4) as i64;     // f32
-    let w_bytes   = (dm * hd * 2) as i64;     // f16
-    let nw_bytes  = (hd * 4) as i64;          // f32
+    let qkv_bytes = (qkv_elems * 2) as i64; // f16
+    let lse_bytes = (lse_elems * 4) as i64; // f32
+    let x_bytes = (x.len() * 4) as i64; // f32
+    let w_bytes = (dm * hd * 2) as i64; // f16
+    let nw_bytes = (hd * 4) as i64; // f32
 
     let q_dev = unsafe { nsl_test_cuda_alloc(qkv_bytes) };
     let k_dev = unsafe { nsl_test_cuda_alloc(qkv_bytes) };
@@ -827,7 +949,9 @@ fn run_with_saves(
     let seg_ids_dev: i64 = if let Some(ids) = segment_ids {
         let seg_bytes = (ids.len() * std::mem::size_of::<u16>()) as i64;
         let ptr = unsafe { nsl_test_cuda_alloc(seg_bytes) };
-        unsafe { nsl_test_cuda_h2d(ptr, ids.as_ptr() as i64, seg_bytes); }
+        unsafe {
+            nsl_test_cuda_h2d(ptr, ids.as_ptr() as i64, seg_bytes);
+        }
         ptr
     } else {
         0i64
@@ -835,10 +959,22 @@ fn run_with_saves(
     // seg_ids_dev is included in all_ptrs only when non-zero — free_all skips
     // zeros via its own check, but allocating 11 elements unconditionally
     // keeps the array shape stable.
-    let all_ptrs = [q_dev, k_dev, v_dev, out_dev, lse_dev, x_dev, wq_dev, wk_dev, wv_dev, nw_dev, seg_ids_dev];
+    let all_ptrs = [
+        q_dev,
+        k_dev,
+        v_dev,
+        out_dev,
+        lse_dev,
+        x_dev,
+        wq_dev,
+        wk_dev,
+        wv_dev,
+        nw_dev,
+        seg_ids_dev,
+    ];
 
     unsafe {
-        nsl_test_cuda_h2d(x_dev,  x.as_ptr()  as i64, x_bytes);
+        nsl_test_cuda_h2d(x_dev, x.as_ptr() as i64, x_bytes);
         nsl_test_cuda_h2d(wq_dev, wq.as_ptr() as i64, w_bytes);
         nsl_test_cuda_h2d(wk_dev, wk.as_ptr() as i64, w_bytes);
         nsl_test_cuda_h2d(wv_dev, wv.as_ptr() as i64, w_bytes);
@@ -848,7 +984,11 @@ fn run_with_saves(
     let ptx = synthesize_flash_attention_ptx_selected(&config);
     let kernel_name = CString::new(flash_attention_kernel_name_selected(&config)).unwrap();
     let smem_total = shared_mem_bytes_selected(&config);
-    let smem_dynamic = if needs_dynamic_smem(&config) { smem_total as i64 } else { 0 };
+    let smem_dynamic = if needs_dynamic_smem(&config) {
+        smem_total as i64
+    } else {
+        0
+    };
 
     let (qp, kp, vp, rmx, rsm, xr) = saves
         .map(|s| (s.q_proj, s.k_proj, s.v_proj, s.row_max, s.row_sum, s.x_raw))
@@ -856,21 +996,45 @@ fn run_with_saves(
 
     let rc = unsafe {
         nsl_flash_attention_csha_with_saves(
-            q_dev, k_dev, v_dev, out_dev, lse_dev,
+            q_dev,
+            k_dev,
+            v_dev,
+            out_dev,
+            lse_dev,
             scale.to_bits() as i64,
-            batch as i64, heads as i64, seq as i64, hd as i64,
-            0, 0, 0, 0,
-            0, 0,
-            0, 0,
+            batch as i64,
+            heads as i64,
+            seq as i64,
+            hd as i64,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
             smem_dynamic,
             ptx.as_ptr() as i64,
             kernel_name.as_ptr() as i64,
-            block_q as i64, block_kv as i64,
+            block_q as i64,
+            block_kv as i64,
             if causal { 1 } else { 0 },
-            x_dev, nw_dev, wq_dev, wk_dev, wv_dev,
-            0, norm_eps.to_bits() as i64,
-            heads as i64, dm as i64,
-            qp, kp, vp, rmx, rsm, xr,
+            x_dev,
+            nw_dev,
+            wq_dev,
+            wk_dev,
+            wv_dev,
+            0,
+            norm_eps.to_bits() as i64,
+            heads as i64,
+            dm as i64,
+            qp,
+            kp,
+            vp,
+            rmx,
+            rsm,
+            xr,
             seg_ids_dev,
         )
     };
@@ -906,21 +1070,31 @@ fn t1_forward_output_invariant_under_save_activations_flag() {
     let (block_q, block_kv, head_dim, heads) = (32u32, 32, 32, 4);
     let seq = block_q.max(block_kv) as i64;
 
-    let (out_no_save, lse_no_save) =
-        run_with_saves(block_q, block_kv, head_dim, heads, false, false, None, None, None)
-            .expect("launch (save=None) failed");
+    let (out_no_save, lse_no_save) = run_with_saves(
+        block_q, block_kv, head_dim, heads, false, false, None, None, None,
+    )
+    .expect("launch (save=None) failed");
 
-    let saves = unsafe {
-        nsl_csha_alloc_backward_activations(1, heads as i64, seq, head_dim as i64)
-    };
+    let saves =
+        unsafe { nsl_csha_alloc_backward_activations(1, heads as i64, seq, head_dim as i64) };
     assert_ne!(saves.q_proj, 0, "activation alloc failed");
 
     let (out_save, lse_save) = run_with_saves(
-        block_q, block_kv, head_dim, heads, false, false, None, Some(saves), None,
+        block_q,
+        block_kv,
+        head_dim,
+        heads,
+        false,
+        false,
+        None,
+        Some(saves),
+        None,
     )
     .expect("launch (save=Some) failed");
 
-    unsafe { nsl_csha_free_backward_activations(saves); }
+    unsafe {
+        nsl_csha_free_backward_activations(saves);
+    }
 
     assert_eq!(
         out_no_save, out_save,
@@ -946,9 +1120,18 @@ fn t1_forward_output_invariant_under_save_activations_flag_multitile() {
     let (block_q, block_kv, head_dim, heads) = (32u32, 32, 32, 4);
     let seq = 128usize;
 
-    let (out_no_save, lse_no_save) =
-        run_with_saves(block_q, block_kv, head_dim, heads, false, false, Some(seq), None, None)
-            .expect("launch (save=None) failed");
+    let (out_no_save, lse_no_save) = run_with_saves(
+        block_q,
+        block_kv,
+        head_dim,
+        heads,
+        false,
+        false,
+        Some(seq),
+        None,
+        None,
+    )
+    .expect("launch (save=None) failed");
 
     let saves = unsafe {
         nsl_csha_alloc_backward_activations(1, heads as i64, seq as i64, head_dim as i64)
@@ -956,11 +1139,21 @@ fn t1_forward_output_invariant_under_save_activations_flag_multitile() {
     assert_ne!(saves.q_proj, 0, "activation alloc failed");
 
     let (out_save, lse_save) = run_with_saves(
-        block_q, block_kv, head_dim, heads, false, false, Some(seq), Some(saves), None,
+        block_q,
+        block_kv,
+        head_dim,
+        heads,
+        false,
+        false,
+        Some(seq),
+        Some(saves),
+        None,
     )
     .expect("launch (save=Some) failed");
 
-    unsafe { nsl_csha_free_backward_activations(saves); }
+    unsafe {
+        nsl_csha_free_backward_activations(saves);
+    }
 
     assert_eq!(
         out_no_save, out_save,
@@ -984,7 +1177,15 @@ fn t1_forward_output_invariant_under_save_activations_flag_multitile_causal() {
     let seq = 128usize;
 
     let (out_no_save, lse_no_save) = run_with_saves(
-        block_q, block_kv, head_dim, heads, true, false, Some(seq), None, None,
+        block_q,
+        block_kv,
+        head_dim,
+        heads,
+        true,
+        false,
+        Some(seq),
+        None,
+        None,
     )
     .expect("launch (save=None) failed");
 
@@ -994,11 +1195,21 @@ fn t1_forward_output_invariant_under_save_activations_flag_multitile_causal() {
     assert_ne!(saves.q_proj, 0, "activation alloc failed");
 
     let (out_save, lse_save) = run_with_saves(
-        block_q, block_kv, head_dim, heads, true, false, Some(seq), Some(saves), None,
+        block_q,
+        block_kv,
+        head_dim,
+        heads,
+        true,
+        false,
+        Some(seq),
+        Some(saves),
+        None,
     )
     .expect("launch (save=Some) failed");
 
-    unsafe { nsl_csha_free_backward_activations(saves); }
+    unsafe {
+        nsl_csha_free_backward_activations(saves);
+    }
 
     assert_eq!(
         out_no_save, out_save,
@@ -1008,7 +1219,10 @@ fn t1_forward_output_invariant_under_save_activations_flag_multitile_causal() {
         .iter()
         .zip(&lse_save)
         .all(|(&a, &b)| a.to_bits() == b.to_bits());
-    assert!(lse_bits_eq, "T1.4 multitile causal invariant broken: LSE diverged");
+    assert!(
+        lse_bits_eq,
+        "T1.4 multitile causal invariant broken: LSE diverged"
+    );
 }
 
 /// T1.4-multitile-segmented (PCA caveat closure): the save-enabled fused
@@ -1030,10 +1244,20 @@ fn t1_forward_output_invariant_under_save_activations_flag_multitile_segmented_t
     let (block_q, block_kv, head_dim, heads) = (32u32, 32, 32, 4);
     let seq = 128usize;
     let mut seg_ids = vec![0u16; seq];
-    for s in seg_ids.iter_mut().take(seq).skip(64) { *s = 1; }
+    for s in seg_ids.iter_mut().take(seq).skip(64) {
+        *s = 1;
+    }
 
     let (out_no_save, lse_no_save) = run_with_saves(
-        block_q, block_kv, head_dim, heads, false, false, Some(seq), None, Some(&seg_ids),
+        block_q,
+        block_kv,
+        head_dim,
+        heads,
+        false,
+        false,
+        Some(seq),
+        None,
+        Some(&seg_ids),
     )
     .expect("launch (save=None, segmented) failed");
 
@@ -1043,11 +1267,21 @@ fn t1_forward_output_invariant_under_save_activations_flag_multitile_segmented_t
     assert_ne!(saves.q_proj, 0, "activation alloc failed");
 
     let (out_save, lse_save) = run_with_saves(
-        block_q, block_kv, head_dim, heads, false, false, Some(seq), Some(saves), Some(&seg_ids),
+        block_q,
+        block_kv,
+        head_dim,
+        heads,
+        false,
+        false,
+        Some(seq),
+        Some(saves),
+        Some(&seg_ids),
     )
     .expect("launch (save=Some, segmented) failed");
 
-    unsafe { nsl_csha_free_backward_activations(saves); }
+    unsafe {
+        nsl_csha_free_backward_activations(saves);
+    }
 
     assert_eq!(
         out_no_save, out_save,
@@ -1077,11 +1311,25 @@ fn t1_forward_output_invariant_under_save_activations_flag_multitile_segmented_t
     let seq = 128usize;
     let mut seg_ids = vec![0u16; seq];
     for (i, s) in seg_ids.iter_mut().enumerate() {
-        *s = if i < 38 { 0 } else if i < 38 + 64 { 1 } else { 2 };
+        *s = if i < 38 {
+            0
+        } else if i < 38 + 64 {
+            1
+        } else {
+            2
+        };
     }
 
     let (out_no_save, lse_no_save) = run_with_saves(
-        block_q, block_kv, head_dim, heads, false, false, Some(seq), None, Some(&seg_ids),
+        block_q,
+        block_kv,
+        head_dim,
+        heads,
+        false,
+        false,
+        Some(seq),
+        None,
+        Some(&seg_ids),
     )
     .expect("launch (save=None, segmented) failed");
 
@@ -1091,11 +1339,21 @@ fn t1_forward_output_invariant_under_save_activations_flag_multitile_segmented_t
     assert_ne!(saves.q_proj, 0, "activation alloc failed");
 
     let (out_save, lse_save) = run_with_saves(
-        block_q, block_kv, head_dim, heads, false, false, Some(seq), Some(saves), Some(&seg_ids),
+        block_q,
+        block_kv,
+        head_dim,
+        heads,
+        false,
+        false,
+        Some(seq),
+        Some(saves),
+        Some(&seg_ids),
     )
     .expect("launch (save=Some, segmented) failed");
 
-    unsafe { nsl_csha_free_backward_activations(saves); }
+    unsafe {
+        nsl_csha_free_backward_activations(saves);
+    }
 
     assert_eq!(
         out_no_save, out_save,
@@ -1124,9 +1382,7 @@ fn t1_forward_output_invariant_under_save_activations_flag_multitile_segmented_t
 #[ignore]
 #[cfg(feature = "cuda")]
 fn t4_csha_backward_ffi_smoke() {
-    use nsl_codegen::flash_attention_v2::{
-        flash_attention_kernel_name_v2, synthesize_backward,
-    };
+    use nsl_codegen::flash_attention_v2::{flash_attention_kernel_name_v2, synthesize_backward};
 
     if !cuda_available() {
         eprintln!("[T4.2] skipping — no CUDA");
@@ -1140,11 +1396,21 @@ fn t4_csha_backward_ffi_smoke() {
     let scale = 1.0f32 / (head_dim as f32).sqrt();
 
     let config = FlashAttentionConfig {
-        block_q, block_kv, head_dim,
-        causal: false, paged: false, rope_q: false,
+        block_q,
+        block_kv,
+        head_dim,
+        causal: false,
+        paged: false,
+        rope_q: false,
         rope_style: RopeStyle::HalfSplit,
-        gqa_group_size: 1, tree_mask: false, gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras {
-            level: 2, fused_rmsnorm: true, fused_projections: true,
+        gqa_group_size: 1,
+        tree_mask: false,
+        gpu_sm: 75,
+        segment_masked: false,
+        csha: Some(CshaExtras {
+            level: 2,
+            fused_rmsnorm: true,
+            fused_projections: true,
             fused_output_proj: false,
             save_activations_for_backward: true,
             active_heads: heads as u32,
@@ -1153,11 +1419,13 @@ fn t4_csha_backward_ffi_smoke() {
         }),
     };
 
-    let mut ptx_str = synthesize_backward(&config)
-        .expect("synthesize_backward should succeed on minimal config");
+    let mut ptx_str =
+        synthesize_backward(&config).expect("synthesize_backward should succeed on minimal config");
     // Keep the NUL that synthesize_backward appends — cuModuleLoadData
     // expects a NUL-terminated C string.
-    if !ptx_str.ends_with('\0') { ptx_str.push('\0'); }
+    if !ptx_str.ends_with('\0') {
+        ptx_str.push('\0');
+    }
     let ptx_bytes = ptx_str.into_bytes();
     // Backward kernel name: forward name + "_v2" with "flash_attn_" →
     // "flash_attn_backward_" rewrite (see prelude::kernel_name). Use a
@@ -1170,7 +1438,9 @@ fn t4_csha_backward_ffi_smoke() {
     };
     let kernel_cstr = CString::new(kernel_name).unwrap();
 
-    unsafe { nsl_cuda_init(); }
+    unsafe {
+        nsl_cuda_init();
+    }
 
     let qkv_bytes = (heads * seq * head_dim * 2) as i64;
     let stats_bytes = (heads * seq * 4) as i64;
@@ -1190,9 +1460,7 @@ fn t4_csha_backward_ffi_smoke() {
     let wk_dev = unsafe { nsl_test_cuda_alloc(w_bytes) };
     let wv_dev = unsafe { nsl_test_cuda_alloc(w_bytes) };
 
-    let saves = unsafe {
-        nsl_csha_alloc_backward_activations(batch, heads, seq, head_dim)
-    };
+    let saves = unsafe { nsl_csha_alloc_backward_activations(batch, heads, seq, head_dim) };
     assert_ne!(saves.q_proj, 0, "activation alloc failed");
 
     let do_dev = unsafe { nsl_test_cuda_alloc(qkv_bytes) };
@@ -1209,38 +1477,67 @@ fn t4_csha_backward_ffi_smoke() {
     let dxn_dev = unsafe { nsl_test_cuda_alloc(dxn_bytes) };
 
     let all_ptrs = [
-        q_dev, k_dev, v_dev, out_dev, lse_dev, x_dev, nw_dev,
-        wq_dev, wk_dev, wv_dev,
-        do_dev, dq_dev, dk_dev, dv_dev, dwq_dev, dwk_dev, dwv_dev, dx_dev,
-        dxn_dev,
+        q_dev, k_dev, v_dev, out_dev, lse_dev, x_dev, nw_dev, wq_dev, wk_dev, wv_dev, do_dev,
+        dq_dev, dk_dev, dv_dev, dwq_dev, dwk_dev, dwv_dev, dx_dev, dxn_dev,
     ];
 
     let rc = unsafe {
         nsl_flash_attention_csha_backward(
-            q_dev, k_dev, v_dev, out_dev, lse_dev,
+            q_dev,
+            k_dev,
+            v_dev,
+            out_dev,
+            lse_dev,
             scale.to_bits() as i64,
-            batch, heads, seq, head_dim,
-            0, 0, 0, 0, 0, 0, 0, 0,
-            0,  // shared_mem_bytes (static SMEM for this config)
+            batch,
+            heads,
+            seq,
+            head_dim,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0, // shared_mem_bytes (static SMEM for this config)
             ptx_bytes.as_ptr() as i64,
             kernel_cstr.as_ptr() as i64,
-            block_q, block_kv,
-            0,  // causal
-            x_dev, nw_dev, wq_dev, wk_dev, wv_dev,
-            0,  // wo_ptr
+            block_q,
+            block_kv,
+            0, // causal
+            x_dev,
+            nw_dev,
+            wq_dev,
+            wk_dev,
+            wv_dev,
+            0, // wo_ptr
             norm_eps.to_bits() as i64,
-            heads, d_model,
-            saves.q_proj, saves.k_proj, saves.v_proj,
-            saves.row_max, saves.row_sum,
+            heads,
+            d_model,
+            saves.q_proj,
+            saves.k_proj,
+            saves.v_proj,
+            saves.row_max,
+            saves.row_sum,
             saves.x_raw,
-            do_dev, dq_dev, dk_dev, dv_dev,
-            dwq_dev, dwk_dev, dwv_dev, dx_dev,
+            do_dev,
+            dq_dev,
+            dk_dev,
+            dv_dev,
+            dwq_dev,
+            dwk_dev,
+            dwv_dev,
+            dx_dev,
             dxn_dev,
             0,
         )
     };
 
-    unsafe { nsl_csha_free_backward_activations(saves); }
+    unsafe {
+        nsl_csha_free_backward_activations(saves);
+    }
     free_all(&all_ptrs);
 
     if rc != 0 {
@@ -1250,7 +1547,8 @@ fn t4_csha_backward_ffi_smoke() {
         panic!(
             "nsl_flash_attention_csha_backward launch failed rc={rc}\n\
              kernel={}\ndump={}\nJIT log:\n{log}",
-            kernel_cstr.to_string_lossy(), dump.display()
+            kernel_cstr.to_string_lossy(),
+            dump.display()
         );
     }
 }

@@ -11,9 +11,7 @@
 //! returns a freshly-allocated `*NslTensor` that the caller owns and must
 //! free with `nsl_tensor_free`.
 
-use crate::tensor::arithmetic::{
-    nsl_tensor_add, nsl_tensor_matmul, nsl_tensor_mul_scalar,
-};
+use crate::tensor::arithmetic::{nsl_tensor_add, nsl_tensor_matmul, nsl_tensor_mul_scalar};
 use crate::tensor::fbip_flags::{RELINQUISH_A, RELINQUISH_B};
 use crate::tensor::nsl_tensor_free;
 

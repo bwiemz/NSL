@@ -19,8 +19,7 @@ use nsl_codegen::agent::{compute_agent_layout, AGENT_CACHE_LINE_ALIGNMENT};
 
 fn compile_src(src: &str) -> Result<Vec<u8>, String> {
     let mut interner = nsl_lexer::Interner::new();
-    let (tokens, lex_diags) =
-        nsl_lexer::tokenize(src, nsl_errors::FileId(0), &mut interner);
+    let (tokens, lex_diags) = nsl_lexer::tokenize(src, nsl_errors::FileId(0), &mut interner);
     if lex_diags
         .iter()
         .any(|d| matches!(d.level, nsl_errors::Level::Error))
@@ -93,7 +92,10 @@ fn agent_struct_layout_size_and_alignment() {
     // The closure receives (field_sym, type_ann) and must return (field_name, cl_type).
     let layout = compute_agent_layout(&agent_def, |field_sym, type_ann| {
         // Resolve the field name.
-        let field_name = interner.resolve(field_sym.0).unwrap_or("unknown").to_string();
+        let field_name = interner
+            .resolve(field_sym.0)
+            .unwrap_or("unknown")
+            .to_string();
         // Resolve the Cranelift type from the type annotation.
         let cl_type = match &type_ann.kind {
             nsl_ast::types::TypeExprKind::Named(type_sym) => {
@@ -128,8 +130,10 @@ fn agent_struct_layout_size_and_alignment() {
         0,
         "total_size must be a multiple of 64 (cache-line alignment)"
     );
-    assert_eq!(layout.total_size, AGENT_CACHE_LINE_ALIGNMENT,
-        "single-field i32 agent should pad up to exactly 64 bytes");
+    assert_eq!(
+        layout.total_size, AGENT_CACHE_LINE_ALIGNMENT,
+        "single-field i32 agent should pad up to exactly 64 bytes"
+    );
 
     // alignment is always 64.
     assert_eq!(
@@ -227,7 +231,10 @@ fn agent_multi_field_layout_ordering() {
         .expect("must find AgentDef");
 
     let layout = compute_agent_layout(&agent_def, |field_sym, type_ann| {
-        let field_name = interner.resolve(field_sym.0).unwrap_or("unknown").to_string();
+        let field_name = interner
+            .resolve(field_sym.0)
+            .unwrap_or("unknown")
+            .to_string();
         let cl_type = match &type_ann.kind {
             nsl_ast::types::TypeExprKind::Named(type_sym) => {
                 match interner.resolve(type_sym.0).unwrap_or("i64") {

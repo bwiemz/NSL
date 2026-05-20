@@ -84,10 +84,7 @@ pub fn run(plan: &mut WrgaPlan) -> AdapterInjectResult {
         let Some(kind) = placement.decorator_kind else {
             continue;
         };
-        let rank = placement
-            .suggested_rank
-            .max(1)
-            .min(i64::MAX as usize) as i64;
+        let rank = placement.suggested_rank.max(1).min(i64::MAX as usize) as i64;
         let rank = rank.max(1);
         let alpha = placement.alpha.unwrap_or(rank).max(1);
         let site_id = site_id_for(&placement.name, kind);
@@ -303,11 +300,9 @@ pub fn run_with_compiler(
             }
         }
         let _ = var_name; // reserved for later let-binding-type-map resolution
-        // B.3: single-pass epilogue requires rank <= 16. Multi-pass is a
-        // follow-up milestone.
-        if site.rank > 16
-            && matches!(site.kind, AdapterKind::Lora | AdapterKind::GatedLora)
-        {
+                          // B.3: single-pass epilogue requires rank <= 16. Multi-pass is a
+                          // follow-up milestone.
+        if site.rank > 16 && matches!(site.kind, AdapterKind::Lora | AdapterKind::GatedLora) {
             eprintln!(
                 "[wrga] @adapter(target='{}'): rank={} > 16; B.3 single-pass epilogue \
                  does not support rank > 16.  Use rank <= 16 or await multi-pass support.",
@@ -344,7 +339,10 @@ mod tests {
         outer.insert("Toy".to_string(), inner);
         let (input_dim, output_dim) =
             resolve_dims_for_target("Toy", "w", &outer).expect("dims must resolve");
-        assert_eq!(input_dim, 16, "input_dim = k_in (second dim of Tensor<[out, in]>)");
+        assert_eq!(
+            input_dim, 16,
+            "input_dim = k_in (second dim of Tensor<[out, in]>)"
+        );
         assert_eq!(output_dim, 32, "output_dim = d_out (first dim)");
     }
 
@@ -378,9 +376,6 @@ mod tests {
             "blocks_6_wq__lora",
         );
         assert_eq!(site_id_for("m.w", AdapterKind::Ia3), "m_w__ia3");
-        assert_eq!(
-            site_id_for("m.w", AdapterKind::GatedLora),
-            "m_w__gatedlora",
-        );
+        assert_eq!(site_id_for("m.w", AdapterKind::GatedLora), "m_w__gatedlora",);
     }
 }

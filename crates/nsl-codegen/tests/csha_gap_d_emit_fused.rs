@@ -284,7 +284,9 @@ fn emit_fused_produces_launch_op_plus_seven_extracts() {
         rope_style: RopeStyle::HalfSplit,
         gqa_group_size: 1,
         tree_mask: false,
-        gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras {
+        gpu_sm: 75,
+        segment_masked: false,
+        csha: Some(CshaExtras {
             level: 1,
             fused_projections: true,
             save_activations_for_backward: true,
@@ -422,9 +424,7 @@ fn gap_i2_launch_op_survives_dead_grad_elim_in_generated_adjoint() {
     use nsl_codegen::csha_apply::FusionMark;
     use nsl_codegen::csha_boundary::ProjKind;
     use nsl_codegen::flash_attention::{CshaExtras, FlashAttentionConfig, RopeStyle};
-    use nsl_codegen::source_ad::{
-        eliminate_dead_gradients, AdjointGenerator, CshaBackwardClaims,
-    };
+    use nsl_codegen::source_ad::{eliminate_dead_gradients, AdjointGenerator, CshaBackwardClaims};
     use nsl_codegen::wengert::{PrimalOp, WengertList, WengertOp, WengertType};
     use std::collections::{HashMap, HashSet};
 
@@ -478,7 +478,9 @@ fn gap_i2_launch_op_survives_dead_grad_elim_in_generated_adjoint() {
         rope_style: RopeStyle::HalfSplit,
         gqa_group_size: 1,
         tree_mask: false,
-        gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras {
+        gpu_sm: 75,
+        segment_masked: false,
+        csha: Some(CshaExtras {
             level: 1,
             fused_projections: false,
             fused_output_proj: false,
@@ -743,7 +745,9 @@ fn gap_d1_adjoint_routing_populates_correct_varids() {
         rope_style: RopeStyle::HalfSplit,
         gqa_group_size: 1,
         tree_mask: false,
-        gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras {
+        gpu_sm: 75,
+        segment_masked: false,
+        csha: Some(CshaExtras {
             level: 1,
             fused_projections: true,
             save_activations_for_backward: true,
@@ -896,7 +900,12 @@ fn gap_i4_norm_weight_var_populated_for_trainable_gamma() {
     let w = WengertList {
         ops: vec![
             mk(0, 0, PrimalOp::Input("x".into()), vec![]),
-            mk(1, 1, PrimalOp::Param("blocks.0.attn.norm_weight".into()), vec![]),
+            mk(
+                1,
+                1,
+                PrimalOp::Param("blocks.0.attn.norm_weight".into()),
+                vec![],
+            ),
             mk(2, 2, PrimalOp::RMSNorm { eps: 1e-5 }, vec![0, 1]),
             mk(3, 3, PrimalOp::Param("blocks.0.attn.wq".into()), vec![]),
             mk(4, 4, PrimalOp::Matmul, vec![2, 3]),
@@ -1094,7 +1103,9 @@ fn gap_i4_launch_inputs_thread_weight_and_norm_pointers() {
         rope_style: RopeStyle::HalfSplit,
         gqa_group_size: 1,
         tree_mask: false,
-        gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras {
+        gpu_sm: 75,
+        segment_masked: false,
+        csha: Some(CshaExtras {
             level: 1,
             fused_projections: true,
             save_activations_for_backward: true,
@@ -1234,7 +1245,9 @@ fn gap_i4_launch_inputs_pass_null_for_none_norm_weight() {
         rope_style: RopeStyle::HalfSplit,
         gqa_group_size: 1,
         tree_mask: false,
-        gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras {
+        gpu_sm: 75,
+        segment_masked: false,
+        csha: Some(CshaExtras {
             level: 1,
             fused_projections: true,
             save_activations_for_backward: true,
@@ -1283,7 +1296,11 @@ fn gap_i4_launch_inputs_pass_null_for_none_norm_weight() {
         .iter()
         .find(|o| matches!(&o.op, PrimalOp::FusedCshaBackward { .. }))
         .expect("launch op must exist");
-    assert_eq!(launch.inputs.len(), 10, "Gap I.4 launch always carries 10 entries when chain_varids is Some");
+    assert_eq!(
+        launch.inputs.len(),
+        10,
+        "Gap I.4 launch always carries 10 entries when chain_varids is Some"
+    );
     assert_eq!(
         launch.inputs[9], 0,
         "Gap I.4: norm_weight_var=None → launch_inputs[9] must be the \

@@ -51,9 +51,9 @@ pub extern "C" fn nsl_model_save(
             .map(|d| unsafe { *tensor.shape.add(d) })
             .collect();
         let name_ptr = unsafe { *names.data.add(i) };
-        let name = unsafe {
-            std::ffi::CStr::from_ptr(name_ptr as *const std::os::raw::c_char)
-        }.to_str().unwrap_or("?");
+        let name = unsafe { std::ffi::CStr::from_ptr(name_ptr as *const std::os::raw::c_char) }
+            .to_str()
+            .unwrap_or("?");
         let dtype_str = if tensor.dtype == 1 { "f32" } else { "f64" };
         params_json.push(format!(
             r#"{{"name":"{}","shape":{:?},"dtype":"{}","offset":{},"nbytes":{}}}"#,
@@ -97,15 +97,13 @@ pub extern "C" fn nsl_model_save(
             // GPU tensor: copy to CPU staging buffer before writing
             let cpu_ptr = crate::tensor::nsl_tensor_to_device(tensor_ptr, 0);
             let cpu_tensor = NslTensor::from_ptr(cpu_ptr);
-            let data_slice = unsafe {
-                std::slice::from_raw_parts(cpu_tensor.data as *const u8, byte_count)
-            };
+            let data_slice =
+                unsafe { std::slice::from_raw_parts(cpu_tensor.data as *const u8, byte_count) };
             write_or_abort(&mut file, data_slice, "write tensor data (GPU→CPU)");
             crate::tensor::nsl_tensor_free(cpu_ptr);
         } else {
-            let data_slice = unsafe {
-                std::slice::from_raw_parts(tensor.data as *const u8, byte_count)
-            };
+            let data_slice =
+                unsafe { std::slice::from_raw_parts(tensor.data as *const u8, byte_count) };
             write_or_abort(&mut file, data_slice, "write tensor data");
         }
     }
@@ -201,22 +199,23 @@ pub extern "C" fn nsl_model_load(path_ptr: i64, path_len: i64, param_tensors_ptr
             {
                 let staging = crate::memory::checked_alloc(byte_count);
                 unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        data[offset..].as_ptr(),
-                        staging,
-                        byte_count,
-                    );
+                    std::ptr::copy_nonoverlapping(data[offset..].as_ptr(), staging, byte_count);
                 }
                 crate::cuda::inner::memcpy_htod(
                     tensor.data,
                     staging as *const std::ffi::c_void,
                     byte_count,
                 );
-                unsafe { crate::memory::checked_free(staging, byte_count); }
+                unsafe {
+                    crate::memory::checked_free(staging, byte_count);
+                }
             }
             #[cfg(not(feature = "cuda"))]
             {
-                eprintln!("nsl: model_load: tensor {} is on GPU but CUDA not compiled", i);
+                eprintln!(
+                    "nsl: model_load: tensor {} is on GPU but CUDA not compiled",
+                    i
+                );
                 std::process::abort();
             }
         } else {
@@ -243,14 +242,18 @@ pub extern "C" fn nsl_model_load(path_ptr: i64, path_len: i64, param_tensors_ptr
                                 .try_into()
                                 .unwrap_or_else(|_| std::process::abort()),
                         );
-                        unsafe { *tensor.data_f32().add(j) = val; }
+                        unsafe {
+                            *tensor.data_f32().add(j) = val;
+                        }
                     } else {
                         let val = f64::from_le_bytes(
                             data[start..start + 8]
                                 .try_into()
                                 .unwrap_or_else(|_| std::process::abort()),
                         );
-                        unsafe { *tensor.data_f64().add(j) = val; }
+                        unsafe {
+                            *tensor.data_f64().add(j) = val;
+                        }
                     }
                 }
             }

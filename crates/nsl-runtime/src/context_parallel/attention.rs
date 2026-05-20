@@ -3,8 +3,12 @@ use crate::context_parallel::softmax::partial_softmax;
 /// Naive full attention: softmax(Q @ K^T / sqrt(d)) @ V
 /// Q,K,V: flat [seq_len, dim]
 pub fn naive_attention(
-    q: &[f32], k: &[f32], v: &[f32],
-    seq_len: usize, dim: usize, causal: bool,
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    seq_len: usize,
+    dim: usize,
+    causal: bool,
 ) -> Vec<f32> {
     let scale = 1.0 / (dim as f32).sqrt();
     let mut out = vec![0.0f32; seq_len * dim];
@@ -147,13 +151,27 @@ mod tests {
 
         // GPU 0: chunks at global offsets [0, 2]
         let out0 = ring_attention_cpu(
-            &q0, &[&k0, &k1], &[&v0, &v1], local_seq, dim, false, &[0, 2], 0,
+            &q0,
+            &[&k0, &k1],
+            &[&v0, &v1],
+            local_seq,
+            dim,
+            false,
+            &[0, 2],
+            0,
         );
 
         let q1 = partition::partition_sequence(&q, seq_len, dim, 2, 1);
         // GPU 1: chunks at global offsets [2, 0]
         let out1 = ring_attention_cpu(
-            &q1, &[&k1, &k0], &[&v1, &v0], local_seq, dim, false, &[2, 0], 2,
+            &q1,
+            &[&k1, &k0],
+            &[&v1, &v0],
+            local_seq,
+            dim,
+            false,
+            &[2, 0],
+            2,
         );
 
         let ring_out = partition::gather_sequence(&[out0, out1], seq_len, dim);
@@ -161,7 +179,10 @@ mod tests {
         for (i, (a, b)) in standard_out.iter().zip(ring_out.iter()).enumerate() {
             assert!(
                 (a - b).abs() < 1e-4,
-                "mismatch at index {}: standard={}, ring={}", i, a, b
+                "mismatch at index {}: standard={}, ring={}",
+                i,
+                a,
+                b
             );
         }
     }
@@ -187,13 +208,27 @@ mod tests {
         // GPU 0 (tokens 0,1): causal, only needs local chunk [0..2]
         // chunk 1 at global offset 2 is entirely in the future for tokens 0,1
         let out0 = ring_attention_cpu(
-            &q0, &[&k0, &k1], &[&v0, &v1], local_seq, dim, true, &[0, 2], 0,
+            &q0,
+            &[&k0, &k1],
+            &[&v0, &v1],
+            local_seq,
+            dim,
+            true,
+            &[0, 2],
+            0,
         );
 
         let q1 = partition::partition_sequence(&q, seq_len, dim, 2, 1);
         // GPU 1 (tokens 2,3): needs both chunks
         let out1 = ring_attention_cpu(
-            &q1, &[&k1, &k0], &[&v1, &v0], local_seq, dim, true, &[2, 0], 2,
+            &q1,
+            &[&k1, &k0],
+            &[&v1, &v0],
+            local_seq,
+            dim,
+            true,
+            &[2, 0],
+            2,
         );
 
         let ring_out = partition::gather_sequence(&[out0, out1], seq_len, dim);
@@ -201,7 +236,10 @@ mod tests {
         for (i, (a, b)) in standard_out.iter().zip(ring_out.iter()).enumerate() {
             assert!(
                 (a - b).abs() < 1e-4,
-                "causal mismatch at index {}: standard={}, ring={}", i, a, b
+                "causal mismatch at index {}: standard={}, ring={}",
+                i,
+                a,
+                b
             );
         }
     }

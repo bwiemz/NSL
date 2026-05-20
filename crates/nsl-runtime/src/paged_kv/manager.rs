@@ -303,8 +303,16 @@ pub extern "C" fn nsl_kv_cache_init_gpu(
         eprintln!(
             "nsl: nsl_kv_cache_init_gpu called but CUDA feature is disabled, falling back to CPU"
         );
-        nsl_kv_cache_init(num_blocks, block_size, num_heads, head_dim, num_layers,
-                          compress_scheme, compress_window, compress_sinks)
+        nsl_kv_cache_init(
+            num_blocks,
+            block_size,
+            num_heads,
+            head_dim,
+            num_layers,
+            compress_scheme,
+            compress_window,
+            compress_sinks,
+        )
     }
 }
 
@@ -437,11 +445,18 @@ mod tests {
             mgr.append_token(seq).expect("append should succeed");
         }
         assert_eq!(mgr.seq_token_count(seq), 6);
-        assert!(mgr.utilization() > 0.0, "utilization should be non-zero after appending");
+        assert!(
+            mgr.utilization() > 0.0,
+            "utilization should be non-zero after appending"
+        );
 
         // Free the sequence.
         mgr.free_sequence(seq);
-        assert_eq!(mgr.utilization(), 0.0, "utilization should return to 0 after freeing");
+        assert_eq!(
+            mgr.utilization(),
+            0.0,
+            "utilization should return to 0 after freeing"
+        );
         assert_eq!(mgr.num_sequences(), 0);
     }
 
@@ -523,7 +538,11 @@ mod tests {
         }
 
         let ids = mgr.seq_block_ids(seq);
-        assert_eq!(ids.len(), 3, "5 tokens with block_size=2 should span 3 blocks");
+        assert_eq!(
+            ids.len(),
+            3,
+            "5 tokens with block_size=2 should span 3 blocks"
+        );
 
         // Block IDs should be distinct.
         let mut sorted = ids.to_vec();

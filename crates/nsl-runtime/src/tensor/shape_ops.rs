@@ -8,7 +8,7 @@ use crate::autodiff;
 use crate::list::NslList;
 use crate::memory::checked_alloc;
 
-use super::{NslTensor, nsl_tensor_free};
+use super::{nsl_tensor_free, NslTensor};
 
 #[inline]
 fn alloc_preserved_dtype_buffer(dtype: u16, len: usize) -> *mut c_void {
@@ -47,9 +47,16 @@ pub extern "C" fn nsl_tensor_shape(tensor_ptr: i64) -> i64 {
 pub extern "C" fn nsl_tensor_shape_dim(tensor_ptr: i64, dim: i64) -> i64 {
     let tensor = NslTensor::from_ptr(tensor_ptr);
     let ndim = tensor.ndim as usize;
-    let d = if dim < 0 { (dim + ndim as i64) as usize } else { dim as usize };
+    let d = if dim < 0 {
+        (dim + ndim as i64) as usize
+    } else {
+        dim as usize
+    };
     if d >= ndim {
-        eprintln!("nsl: shape_dim dimension {} out of range for {}D tensor", dim, ndim);
+        eprintln!(
+            "nsl: shape_dim dimension {} out of range for {}D tensor",
+            dim, ndim
+        );
         std::process::abort();
     }
     unsafe { *tensor.shape.add(d) }
@@ -57,7 +64,11 @@ pub extern "C" fn nsl_tensor_shape_dim(tensor_ptr: i64, dim: i64) -> i64 {
 
 /// Assert that tensor dimension `dim_index` equals `expected_value`.
 #[no_mangle]
-pub extern "C" fn nsl_tensor_assert_dim(tensor_ptr: i64, dim_index: i64, expected_value: i64) -> i64 {
+pub extern "C" fn nsl_tensor_assert_dim(
+    tensor_ptr: i64,
+    dim_index: i64,
+    expected_value: i64,
+) -> i64 {
     let tensor = NslTensor::from_ptr(tensor_ptr);
     let ndim = tensor.ndim as usize;
     let dim_idx = if dim_index < 0 {
@@ -88,7 +99,11 @@ pub extern "C" fn nsl_tensor_assert_dim(tensor_ptr: i64, dim_index: i64, expecte
 
 /// Assert that a tensor dimension does not exceed an upper bound.
 #[no_mangle]
-pub extern "C" fn nsl_tensor_assert_dim_bound(tensor_ptr: i64, dim_index: i64, upper_bound: i64) -> i64 {
+pub extern "C" fn nsl_tensor_assert_dim_bound(
+    tensor_ptr: i64,
+    dim_index: i64,
+    upper_bound: i64,
+) -> i64 {
     let tensor = NslTensor::from_ptr(tensor_ptr);
     let ndim = tensor.ndim as usize;
     let dim_idx = if dim_index < 0 {
@@ -169,11 +184,23 @@ pub extern "C" fn nsl_tensor_reshape(tensor_ptr: i64, new_shape_list: i64) -> i6
 
     let result = if is_contig {
         // Contiguous — return a zero-copy view directly
-        NslTensor::new_view_i64(tensor_ptr, &new_shape_vec, &new_strides_vec, new_ndim, new_len)
+        NslTensor::new_view_i64(
+            tensor_ptr,
+            &new_shape_vec,
+            &new_strides_vec,
+            new_ndim,
+            new_len,
+        )
     } else {
         // Non-contiguous — materialize to contiguous first, then create view of result
         let contig_ptr = nsl_tensor_contiguous(tensor_ptr);
-        let view = NslTensor::new_view_i64(contig_ptr, &new_shape_vec, &new_strides_vec, new_ndim, new_len);
+        let view = NslTensor::new_view_i64(
+            contig_ptr,
+            &new_shape_vec,
+            &new_strides_vec,
+            new_ndim,
+            new_len,
+        );
         // Free the intermediate contiguous tensor (view holds the ref via data_owner)
         nsl_tensor_free(contig_ptr);
         view
@@ -183,8 +210,17 @@ pub extern "C" fn nsl_tensor_reshape(tensor_ptr: i64, new_shape_list: i64) -> i6
     #[cfg(feature = "interop")]
     if crate::trace::is_tracing() {
         let rt = NslTensor::from_ptr(result);
-        let shape: Vec<i64> = (0..rt.ndim as usize).map(|d| unsafe { *rt.shape.add(d) }).collect();
-        crate::trace::record_op(crate::trace::OpType::Reshape, vec![tensor_ptr], result, shape, rt.dtype, vec![]);
+        let shape: Vec<i64> = (0..rt.ndim as usize)
+            .map(|d| unsafe { *rt.shape.add(d) })
+            .collect();
+        crate::trace::record_op(
+            crate::trace::OpType::Reshape,
+            vec![tensor_ptr],
+            result,
+            shape,
+            rt.dtype,
+            vec![],
+        );
     }
 
     result
@@ -242,8 +278,17 @@ pub extern "C" fn nsl_tensor_transpose(tensor_ptr: i64, dim0: i64, dim1: i64) ->
     #[cfg(feature = "interop")]
     if crate::trace::is_tracing() {
         let rt = NslTensor::from_ptr(out_ptr);
-        let shape: Vec<i64> = (0..rt.ndim as usize).map(|d| unsafe { *rt.shape.add(d) }).collect();
-        crate::trace::record_op(crate::trace::OpType::Transpose, vec![tensor_ptr], out_ptr, shape, rt.dtype, vec![]);
+        let shape: Vec<i64> = (0..rt.ndim as usize)
+            .map(|d| unsafe { *rt.shape.add(d) })
+            .collect();
+        crate::trace::record_op(
+            crate::trace::OpType::Transpose,
+            vec![tensor_ptr],
+            out_ptr,
+            shape,
+            rt.dtype,
+            vec![],
+        );
     }
 
     out_ptr
@@ -262,7 +307,12 @@ pub extern "C" fn nsl_tensor_unsqueeze(tensor_ptr: i64, dim: i64) -> i64 {
         dim as usize
     };
 
-    assert!(insert_pos <= ndim, "unsqueeze dim {} out of range for ndim {}", dim, ndim);
+    assert!(
+        insert_pos <= ndim,
+        "unsqueeze dim {} out of range for ndim {}",
+        dim,
+        ndim
+    );
 
     let mut new_shape = Vec::with_capacity(new_ndim);
     let mut new_strides = Vec::with_capacity(new_ndim);
@@ -298,9 +348,7 @@ pub extern "C" fn nsl_tensor_unsqueeze(tensor_ptr: i64, dim: i64) -> i64 {
 
     // Autodiff tape (preserve existing behavior)
     if crate::autodiff::is_recording() {
-        let input_shape = unsafe {
-            std::slice::from_raw_parts(tensor.shape, ndim)
-        }.to_vec();
+        let input_shape = unsafe { std::slice::from_raw_parts(tensor.shape, ndim) }.to_vec();
         autodiff::maybe_record(autodiff::TapeOp::Unsqueeze {
             input: tensor_ptr,
             out: out_ptr,
@@ -310,8 +358,17 @@ pub extern "C" fn nsl_tensor_unsqueeze(tensor_ptr: i64, dim: i64) -> i64 {
     #[cfg(feature = "interop")]
     if crate::trace::is_tracing() {
         let rt = NslTensor::from_ptr(out_ptr);
-        let shape: Vec<i64> = (0..rt.ndim as usize).map(|d| unsafe { *rt.shape.add(d) }).collect();
-        crate::trace::record_op(crate::trace::OpType::Unsqueeze, vec![tensor_ptr], out_ptr, shape, rt.dtype, vec![]);
+        let shape: Vec<i64> = (0..rt.ndim as usize)
+            .map(|d| unsafe { *rt.shape.add(d) })
+            .collect();
+        crate::trace::record_op(
+            crate::trace::OpType::Unsqueeze,
+            vec![tensor_ptr],
+            out_ptr,
+            shape,
+            rt.dtype,
+            vec![],
+        );
     }
 
     out_ptr
@@ -336,7 +393,11 @@ pub extern "C" fn nsl_tensor_select(tensor_ptr: i64, dim: i64, index: i64) -> i6
     let ndim = tensor.ndim as usize;
 
     // Normalize dim
-    let d = if dim < 0 { (tensor.ndim + dim) as usize } else { dim as usize };
+    let d = if dim < 0 {
+        (tensor.ndim + dim) as usize
+    } else {
+        dim as usize
+    };
     if d >= ndim {
         eprintln!("nsl: select dim {} out of range for ndim {}", dim, ndim);
         std::process::abort();
@@ -369,10 +430,14 @@ pub extern "C" fn nsl_tensor_select(tensor_ptr: i64, dim: i64, index: i64) -> i6
     let out_strides = NslTensor::compute_strides(out_shape, out_ndim);
     let out_len = NslTensor::total_elements(out_shape, out_ndim);
 
-    let in_strides: Vec<i64> = (0..ndim).map(|i| unsafe { *tensor.strides.add(i) }).collect();
+    let in_strides: Vec<i64> = (0..ndim)
+        .map(|i| unsafe { *tensor.strides.add(i) })
+        .collect();
     let base_offset = idx * in_strides[d] as usize;
 
-    let out_stride_vec: Vec<i64> = (0..ndim - 1).map(|i| unsafe { *out_strides.add(i) }).collect();
+    let out_stride_vec: Vec<i64> = (0..ndim - 1)
+        .map(|i| unsafe { *out_strides.add(i) })
+        .collect();
     let axis_map: Vec<usize> = (0..ndim).filter(|&i| i != d).collect();
 
     let data = alloc_preserved_dtype_buffer(tensor.dtype, out_len as usize);
@@ -454,7 +519,8 @@ pub extern "C" fn nsl_tensor_stack(list_ptr: i64, dim: i64) -> i64 {
     assert!(
         insert_pos <= in_ndim,
         "nsl_tensor_stack: dim {} out of range for ndim {}",
-        dim, in_ndim
+        dim,
+        in_ndim
     );
 
     // Validate all tensors have the same shape
@@ -462,16 +528,18 @@ pub extern "C" fn nsl_tensor_stack(list_ptr: i64, dim: i64) -> i64 {
         let t = NslTensor::from_ptr(cp);
         assert_eq!(t.ndim as usize, in_ndim, "nsl_tensor_stack: ndim mismatch");
         assert_eq!(
-            t.dtype,
-            first.dtype,
+            t.dtype, first.dtype,
             "nsl_tensor_stack: dtype mismatch ({} vs {})",
-            t.dtype,
-            first.dtype,
+            t.dtype, first.dtype,
         );
         for axis in 0..in_ndim {
             let s1 = unsafe { *first.shape.add(axis) };
             let s2 = unsafe { *t.shape.add(axis) };
-            assert_eq!(s1, s2, "nsl_tensor_stack: shape mismatch at axis {}: {} vs {}", axis, s1, s2);
+            assert_eq!(
+                s1, s2,
+                "nsl_tensor_stack: shape mismatch at axis {}: {} vs {}",
+                axis, s1, s2
+            );
         }
     }
 
@@ -573,12 +641,13 @@ pub extern "C" fn nsl_tensor_expand(tensor_ptr: i64, shape_list: i64) -> i64 {
 
     // Validate: source dim must be 1 or match target
     for (i, &t) in target_shape.iter().enumerate() {
-        let s = if i < pad { 1 } else { unsafe { *tensor.shape.add(i - pad) } };
+        let s = if i < pad {
+            1
+        } else {
+            unsafe { *tensor.shape.add(i - pad) }
+        };
         if s != 1 && s != t {
-            eprintln!(
-                "nsl: expand: cannot expand dim {} from {} to {}",
-                i, s, t
-            );
+            eprintln!("nsl: expand: cannot expand dim {} from {} to {}", i, s, t);
             std::process::abort();
         }
     }
@@ -633,9 +702,8 @@ pub extern "C" fn nsl_tensor_expand(tensor_ptr: i64, shape_list: i64) -> i64 {
     let out_ptr = NslTensor::publish(out);
 
     if autodiff::is_recording() {
-        let original_shape = unsafe {
-            std::slice::from_raw_parts(tensor.shape, tensor.ndim as usize)
-        }.to_vec();
+        let original_shape =
+            unsafe { std::slice::from_raw_parts(tensor.shape, tensor.ndim as usize) }.to_vec();
         autodiff::maybe_record(autodiff::TapeOp::Expand {
             input: tensor_ptr,
             out: out_ptr,
@@ -645,8 +713,17 @@ pub extern "C" fn nsl_tensor_expand(tensor_ptr: i64, shape_list: i64) -> i64 {
     #[cfg(feature = "interop")]
     if crate::trace::is_tracing() {
         let rt = NslTensor::from_ptr(out_ptr);
-        let shape: Vec<i64> = (0..rt.ndim as usize).map(|d| unsafe { *rt.shape.add(d) }).collect();
-        crate::trace::record_op(crate::trace::OpType::Expand, vec![tensor_ptr], out_ptr, shape, rt.dtype, vec![]);
+        let shape: Vec<i64> = (0..rt.ndim as usize)
+            .map(|d| unsafe { *rt.shape.add(d) })
+            .collect();
+        crate::trace::record_op(
+            crate::trace::OpType::Expand,
+            vec![tensor_ptr],
+            out_ptr,
+            shape,
+            rt.dtype,
+            vec![],
+        );
     }
 
     out_ptr
@@ -697,12 +774,24 @@ pub extern "C" fn nsl_tensor_slice(tensor_ptr: i64, dim: i64, start: i64, end: i
         #[cfg(feature = "cuda")]
         {
             let ndim = t.ndim as usize;
-            let d = if dim < 0 { (t.ndim + dim) as usize } else { dim as usize };
-            let s = if start < 0 { (unsafe { *t.shape.add(d) } + start) as usize } else { start as usize };
+            let d = if dim < 0 {
+                (t.ndim + dim) as usize
+            } else {
+                dim as usize
+            };
+            let s = if start < 0 {
+                (unsafe { *t.shape.add(d) } + start) as usize
+            } else {
+                start as usize
+            };
             let dim_size = unsafe { *t.shape.add(d) };
-            let e = if end < 0 { (dim_size + end) as usize }
-                    else if end > dim_size { dim_size as usize }
-                    else { end as usize };
+            let e = if end < 0 {
+                (dim_size + end) as usize
+            } else if end > dim_size {
+                dim_size as usize
+            } else {
+                end as usize
+            };
             let slice_len = e.saturating_sub(s);
             if slice_len == 0 {
                 // Empty slice: fall back to CPU path for correct empty tensor handling
@@ -716,20 +805,37 @@ pub extern "C" fn nsl_tensor_slice(tensor_ptr: i64, dim: i64, start: i64, end: i
             return crate::cuda::gpu_slice_f32_with_shape(tensor_ptr, d, s, slice_len);
         }
         #[cfg(not(feature = "cuda"))]
-        { panic!("CUDA support not compiled"); }
+        {
+            panic!("CUDA support not compiled");
+        }
     }
 
     let tensor = NslTensor::from_ptr(tensor_ptr);
     super::assert_elementwise_byte_copy(tensor.dtype, "nsl_tensor_slice");
     let ndim = tensor.ndim as usize;
 
-    let d = if dim < 0 { (tensor.ndim + dim) as usize } else { dim as usize };
-    assert!(d < ndim, "nsl_tensor_slice: dim {dim} out of range for ndim {ndim}");
+    let d = if dim < 0 {
+        (tensor.ndim + dim) as usize
+    } else {
+        dim as usize
+    };
+    assert!(
+        d < ndim,
+        "nsl_tensor_slice: dim {dim} out of range for ndim {ndim}"
+    );
 
     let dim_size = unsafe { *tensor.shape.add(d) };
 
-    let s = if start < 0 { (dim_size + start).max(0) } else { start.min(dim_size) };
-    let e = if end < 0 { (dim_size + end).max(0) } else { end.min(dim_size) };
+    let s = if start < 0 {
+        (dim_size + start).max(0)
+    } else {
+        start.min(dim_size)
+    };
+    let e = if end < 0 {
+        (dim_size + end).max(0)
+    } else {
+        end.min(dim_size)
+    };
     let slice_len = (e - s).max(0);
 
     let out_shape = checked_alloc(ndim * std::mem::size_of::<i64>()) as *mut i64;
@@ -746,9 +852,7 @@ pub extern "C" fn nsl_tensor_slice(tensor_ptr: i64, dim: i64, start: i64, end: i
     let in_strides: Vec<i64> = (0..ndim)
         .map(|i| unsafe { *tensor.strides.add(i) })
         .collect();
-    let o_strides: Vec<i64> = (0..ndim)
-        .map(|i| unsafe { *out_strides.add(i) })
-        .collect();
+    let o_strides: Vec<i64> = (0..ndim).map(|i| unsafe { *out_strides.add(i) }).collect();
 
     let data = alloc_preserved_dtype_buffer(tensor.dtype, out_len as usize);
     for flat in 0..out_len as usize {
@@ -766,9 +870,7 @@ pub extern "C" fn nsl_tensor_slice(tensor_ptr: i64, dim: i64, start: i64, end: i
         unsafe { copy_preserved_dtype_element(tensor, in_offset, data, flat) };
     }
 
-    let input_shape: Vec<i64> = (0..ndim)
-        .map(|i| unsafe { *tensor.shape.add(i) })
-        .collect();
+    let input_shape: Vec<i64> = (0..ndim).map(|i| unsafe { *tensor.shape.add(i) }).collect();
 
     let out = Box::new(NslTensor::new(
         data,
@@ -834,8 +936,15 @@ pub extern "C" fn nsl_tensor_cat(tensor_list: i64, dim: i64) -> i64 {
     let first = NslTensor::from_ptr(contiguous_ptrs[0]);
     super::assert_elementwise_byte_copy(first.dtype, "nsl_tensor_cat");
     let ndim = first.ndim as usize;
-    let d = if dim < 0 { (first.ndim + dim) as usize } else { dim as usize };
-    assert!(d < ndim, "nsl_tensor_cat: dim {dim} out of range for ndim {ndim}");
+    let d = if dim < 0 {
+        (first.ndim + dim) as usize
+    } else {
+        dim as usize
+    };
+    assert!(
+        d < ndim,
+        "nsl_tensor_cat: dim {dim} out of range for ndim {ndim}"
+    );
 
     let mut split_sizes: Vec<i64> = Vec::with_capacity(num_tensors);
     let mut total_cat_dim: i64 = 0;
@@ -844,11 +953,9 @@ pub extern "C" fn nsl_tensor_cat(tensor_list: i64, dim: i64) -> i64 {
         let t = NslTensor::from_ptr(cp);
         assert_eq!(t.ndim as usize, ndim, "nsl_tensor_cat: ndim mismatch");
         assert_eq!(
-            t.dtype,
-            first.dtype,
+            t.dtype, first.dtype,
             "nsl_tensor_cat: dtype mismatch ({} vs {})",
-            t.dtype,
-            first.dtype,
+            t.dtype, first.dtype,
         );
         let cat_size = unsafe { *t.shape.add(d) };
         split_sizes.push(cat_size);
@@ -857,7 +964,10 @@ pub extern "C" fn nsl_tensor_cat(tensor_list: i64, dim: i64) -> i64 {
             if axis != d {
                 let s1 = unsafe { *first.shape.add(axis) };
                 let s2 = unsafe { *t.shape.add(axis) };
-                assert_eq!(s1, s2, "nsl_tensor_cat: shape mismatch at dim {axis}: {s1} vs {s2}");
+                assert_eq!(
+                    s1, s2,
+                    "nsl_tensor_cat: shape mismatch at dim {axis}: {s1} vs {s2}"
+                );
             }
         }
     }
@@ -875,9 +985,7 @@ pub extern "C" fn nsl_tensor_cat(tensor_list: i64, dim: i64) -> i64 {
     let out_strides = NslTensor::compute_strides(out_shape, out_ndim);
     let out_len = NslTensor::total_elements(out_shape, out_ndim);
 
-    let o_strides: Vec<i64> = (0..ndim)
-        .map(|i| unsafe { *out_strides.add(i) })
-        .collect();
+    let o_strides: Vec<i64> = (0..ndim).map(|i| unsafe { *out_strides.add(i) }).collect();
 
     let data = alloc_preserved_dtype_buffer(out_dtype, out_len as usize);
     let mut cat_offset: usize = 0;
@@ -940,8 +1048,17 @@ pub extern "C" fn nsl_tensor_cat(tensor_list: i64, dim: i64) -> i64 {
     #[cfg(feature = "interop")]
     if crate::trace::is_tracing() {
         let rt = NslTensor::from_ptr(out_ptr);
-        let shape: Vec<i64> = (0..rt.ndim as usize).map(|d| unsafe { *rt.shape.add(d) }).collect();
-        crate::trace::record_op(crate::trace::OpType::Concat, trace_input_ptrs, out_ptr, shape, rt.dtype, vec![]);
+        let shape: Vec<i64> = (0..rt.ndim as usize)
+            .map(|d| unsafe { *rt.shape.add(d) })
+            .collect();
+        crate::trace::record_op(
+            crate::trace::OpType::Concat,
+            trace_input_ptrs,
+            out_ptr,
+            shape,
+            rt.dtype,
+            vec![],
+        );
     }
 
     out_ptr
@@ -1032,7 +1149,8 @@ pub extern "C" fn nsl_tensor_rotate_half(tensor_ptr: i64) -> i64 {
 
     if crate::autodiff::is_recording() {
         crate::autodiff::maybe_record(crate::autodiff::TapeOp::RotateHalf {
-            a: tensor_ptr, out: result,
+            a: tensor_ptr,
+            out: result,
         });
     }
     result

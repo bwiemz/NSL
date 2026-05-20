@@ -65,8 +65,9 @@ impl Compiler<'_> {
             .iconst(cl_types::I32, WORKER_DEFAULT_NUM_LAYERS);
         let speculative_tokens_val = builder.ins().iconst(cl_types::I32, spec.speculative_tokens);
         let speculative_method_val = builder.ins().iconst(cl_types::I32, spec.speculative_method);
-        let speculative_tree_width_val =
-            builder.ins().iconst(cl_types::I32, spec.speculative_tree_width);
+        let speculative_tree_width_val = builder
+            .ins()
+            .iconst(cl_types::I32, spec.speculative_tree_width);
         let speculative_temp_bits_val = builder
             .ins()
             .iconst(cl_types::I32, spec.speculative_temperature_bits);

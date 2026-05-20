@@ -67,10 +67,7 @@ fn applied_plan_with_shard(n_layers: usize, shard: u32) -> AppliedPlan {
     }
 }
 
-fn cpdt_input_from_plan<'a>(
-    applied: &AppliedPlan,
-    num_gpus: u32,
-) -> CpdtInput<'a> {
+fn cpdt_input_from_plan<'a>(applied: &AppliedPlan, num_gpus: u32) -> CpdtInput<'a> {
     let overrides = WggoOverrides::from_applied(applied);
     CpdtInput {
         mode: CpdtMode::Full,
