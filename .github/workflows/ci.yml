@@ -211,3 +211,52 @@ jobs:
           NSL_BIN: ${{ github.workspace }}/target/debug/nsl
         working-directory: python
         run: python -m pytest tests/test_m62_onnx_op.py -v
+
+  # M57 FPGA/Neuromorphic — Verilator + Yosys gate (from origin/main PR #193).
+  fpga:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+
+      - name: Install Verilator + Yosys
+        run: sudo apt-get update && sudo apt-get install -y verilator yosys
+
+      - name: Record tool versions (provenance per §5.4)
+        run: |
+          echo "Ubuntu: $(lsb_release -ds)"
+          verilator --version
+          yosys -V
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target/
+          key: ${{ runner.os }}-cargo-fpga-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build NSL codegen
+        run: cargo build -p nsl-codegen --release
+
+      - name: Run Layer 1 snapshot tests
+        run: cargo test -p nsl-codegen --test verilog_emission_snapshots --test hir_pass_snapshots
+
+      - name: Run Layer 3 Yosys gate
+        run: cargo test -p nsl-codegen --test yosys_gate
+
+      - name: Fixture determinism check
+        run: |
+          cp crates/nsl-test/fixtures/mlp_int8_weights_v1.bin /tmp/committed.bin
+          cargo run -p nsl-test --bin generate_mlp_int8_weights_v1
+          cmp --silent /tmp/committed.bin crates/nsl-test/fixtures/mlp_int8_weights_v1.bin \
+            || (echo "ERROR: regenerated fixture differs from committed fixture" && exit 1)
+
+      - name: Run nsl-test lib unit tests
+        run: cargo test -p nsl-test --lib

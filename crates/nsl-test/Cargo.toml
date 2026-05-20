@@ -1,0 +1,34 @@
+[package]
+name = "nsl-test"
+description = "Test utilities for NeuralScript kernel verification + M57 FPGA test infrastructure"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+# CSHA backward-kernel diagnostic mode (origin/main)
+half = { version = "2.4", features = ["std"] }
+# M57 FPGA test infrastructure (this branch)
+nsl-codegen.workspace = true
+rand.workspace = true
+rand_chacha.workspace = true
+sha2 = "0.10"
+toml.workspace = true
+thiserror = "1"
+# nsl-ast, nsl-parser, bytemuck, regex — reserved for M57.1 (end-to-end NSL
+# source compilation + Verilog port packing). Not added now to keep nsl-test
+# compile time minimal during the deferred-scope window.
+
+[features]
+default = []
+cuda = []
+
+[[bin]]
+name = "generate_mlp_int8_weights_v1"
+path = "fixtures/generate_mlp_int8_weights_v1.rs"
+
+[dev-dependencies]
+insta = "1"
+tempfile = "3"

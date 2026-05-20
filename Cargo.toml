@@ -9,6 +9,7 @@ members = [
     "crates/nsl-codegen",
     "crates/nsl-runtime",
     "crates/nsl-cli",
+    "crates/nsl-test",
 ]
 
 [workspace.package]
@@ -39,3 +40,7 @@ cranelift-module = "0.116"
 cranelift-object = "0.116"
 cranelift-native = "0.116"
 target-lexicon = "0.12"
+rand = "0.9"
+rand_chacha = "0.9"
+toml = "0.8"
+bytemuck = { version = "1", features = ["derive"] }

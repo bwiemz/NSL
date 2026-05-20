@@ -1,0 +1,5 @@
+---
+source: crates/nsl-codegen/tests/verilog_emission_snapshots.rs
+expression: emit_local_param(&lp)
+---
+localparam signed [31:0] W1_0_0 = 32'sd-1234;

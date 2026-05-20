@@ -8,6 +8,7 @@ pub enum GpuTarget {
     Rocm,
     Metal,
     WebGpu,
+    Fpga,  // M57 v1: FPGA Verilog backend
 }
 
 impl GpuTarget {
@@ -55,6 +56,7 @@ impl GpuTarget {
             GpuTarget::Rocm => "rocm",
             GpuTarget::Metal => "metal",
             GpuTarget::WebGpu => "webgpu",
+            GpuTarget::Fpga => "fpga",
         }
     }
 
@@ -84,6 +86,13 @@ impl GpuTarget {
                     | FeatureSet::F16_ARITHMETIC
             }
             GpuTarget::WebGpu => FeatureSet::SHARED_MEMORY | FeatureSet::F16_ARITHMETIC,
+            GpuTarget::Fpga => {
+                // FPGA target uses the HIR pipeline (kernel_ir → hir::lower →
+                // backend_verilog), not the SIMT FeatureSet model. M57.1 wires
+                // up parse_target to return GpuTarget::Fpga; until then this
+                // arm is unreachable from CLI but defined for exhaustiveness.
+                FeatureSet::NONE
+            }
         }
     }
 
@@ -94,6 +103,7 @@ impl GpuTarget {
             GpuTarget::Rocm => 64,
             GpuTarget::Metal => 32,
             GpuTarget::WebGpu => 0, // no subgroup guarantees
+            GpuTarget::Fpga => 1, // dataflow — no warp concept; 1 is a benign sentinel
         }
     }
 }

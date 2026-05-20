@@ -909,3 +909,293 @@ mod tests {
         assert_eq!(result.unwrap(), 64, "validator must return selected chunk on success");
     }
 }
+
+// =====================================================================
+// Tier B.2 backward sub-kernel SMEM accessors (Phase 2 — dQ-kernel only;
+// dK/dV-kernel accessors stubbed for Phase 3).
+//
+// Spec: docs/superpowers/specs/2026-05-19-csha-tier-b2-phase2-design.md §3.1 + §5.2
+//
+// Per-sub-kernel layout (canonical hd=128, EFFECTIVE bq=32 after fallback, chunk=4):
+//   q_offset:                0       (effective_bq * hd * 2 bytes, f16 Q tile)
+//   k_offset:                        (effective_bkv * hd * 2 bytes, f16 K tile row-major)
+//   v_offset:                        (effective_bkv * hd * 2 bytes, f16 V tile row-major)
+//   dO_offset:                       (effective_bq * hd * 2 bytes, f16 dO tile, resident across kv_iter)
+//   ds_offset:                       (effective_bq * effective_bkv * 4 bytes, f32 dS scratch)
+//   wk_chunk_offset:                 (chunk * hd * 2 bytes, RMSNorm chunk staging)
+//   wv_chunk_offset:                 (chunk * hd * 2 bytes)
+//   x_q_chunk_offset:                (effective_bq * chunk * 2 bytes)
+//   x_kv_chunk_offset:               (effective_bkv * chunk * 2 bytes)
+//   k_colmajor_offset:               (effective_bkv * hd * 2 bytes, Path A re-stage)
+//
+// "chunk=4" is B.1's RMSNorm/projection chunked-sweep count (NOT accumulator
+// staging). With dO-in-SMEM there is no separate x_norm accumulator staging.
+//
+// effective_bq differs from config.block_q at hd in {128, 256} per the Approach A"
+// fallback schedule extended by Phase 2 spec §5.2 to also cover hd=128 SMEM pressure.
+
+const TIER_B2_RMSNORM_CHUNK: u32 = 4;
+
+/// Per-hd bq fallback schedule (extends Approach A" from register-pressure to
+/// SMEM-pressure triggers per Phase 2 spec §5.2).
+///
+/// - hd in {32, 64}: no fallback (returns config.block_q).
+/// - hd = 128: SMEM-pressure fallback to bq=32 (Path A col-major K re-stage
+///   at bq=64 would push total SMEM to exactly the 99 KB cap with no headroom).
+/// - hd = 256: register-pressure fallback to bq=32 (existing Approach A").
+pub fn tier_b2_effective_bq(config: &FlashAttentionConfig) -> u32 {
+    let raw_bq = config.block_q as u32;
+    match config.head_dim {
+        128 | 256 => raw_bq.min(32),
+        _ => raw_bq,
+    }
+}
+
+/// Symmetric helper to `tier_b2_effective_bq`, applied to bkv (Approach A"'s
+/// bq=bkv invariant means the fallback applies to both).
+pub fn tier_b2_effective_bkv(config: &FlashAttentionConfig) -> u32 {
+    let raw_bkv = config.block_kv as u32;
+    match config.head_dim {
+        128 | 256 => raw_bkv.min(32),
+        _ => raw_bkv,
+    }
+}
+
+/// Q tile offset (always 0 — Q lives at the start of the dQ-kernel SMEM region).
+pub fn tier_b2_dq_q_offset(_config: &FlashAttentionConfig) -> u32 {
+    0
+}
+
+/// K tile offset. f16 row-major `[effective_bkv, head_dim]`.
+/// Lives immediately after the Q tile.
+pub fn tier_b2_dq_k_offset(config: &FlashAttentionConfig) -> u32 {
+    let bq = tier_b2_effective_bq(config);
+    let hd = config.head_dim as u32;
+    bq * hd * 2
+}
+
+/// V tile offset. f16 row-major `[effective_bkv, head_dim]`.
+/// Lives immediately after the K tile.
+pub fn tier_b2_dq_v_offset(config: &FlashAttentionConfig) -> u32 {
+    let bkv = tier_b2_effective_bkv(config);
+    let hd = config.head_dim as u32;
+    tier_b2_dq_k_offset(config) + bkv * hd * 2
+}
+
+/// dO tile offset. f16 row-major `[effective_bq, head_dim]`.
+/// Resident across kv_iter — loaded once per dQ-kernel CTA, not per kv-block.
+/// Lives immediately after the V tile.
+#[allow(non_snake_case)]
+pub fn tier_b2_dq_dO_offset(config: &FlashAttentionConfig) -> u32 {
+    let bkv = tier_b2_effective_bkv(config);
+    let hd = config.head_dim as u32;
+    tier_b2_dq_v_offset(config) + bkv * hd * 2
+}
+
+/// dS scratch tile offset. f32 `[effective_bq, effective_bkv]`.
+/// Written by the `dP = dO @ V^T` + softmax-backward combine.
+/// Lives immediately after the dO tile.
+pub fn tier_b2_dq_ds_offset(config: &FlashAttentionConfig) -> u32 {
+    let bq = tier_b2_effective_bq(config);
+    let hd = config.head_dim as u32;
+    tier_b2_dq_dO_offset(config) + bq * hd * 2
+}
+
+/// Wk chunk staging region offset. f16 `[TIER_B2_RMSNORM_CHUNK, head_dim]`.
+/// Used for the RMSNorm projection chunked sweep (mirrors B.1 forward's Wk slot).
+/// Lives immediately after the dS scratch tile.
+pub fn tier_b2_dq_wk_chunk_offset(config: &FlashAttentionConfig) -> u32 {
+    let bq = tier_b2_effective_bq(config);
+    let bkv = tier_b2_effective_bkv(config);
+    tier_b2_dq_ds_offset(config) + bq * bkv * 4
+}
+
+/// Wv chunk staging region offset. f16 `[TIER_B2_RMSNORM_CHUNK, head_dim]`.
+/// Lives immediately after the Wk chunk slot.
+pub fn tier_b2_dq_wv_chunk_offset(config: &FlashAttentionConfig) -> u32 {
+    let hd = config.head_dim as u32;
+    tier_b2_dq_wk_chunk_offset(config) + TIER_B2_RMSNORM_CHUNK * hd * 2
+}
+
+/// x_q chunk staging region offset. f16 `[effective_bq, TIER_B2_RMSNORM_CHUNK]`.
+/// Lives immediately after the Wv chunk slot.
+pub fn tier_b2_dq_x_q_chunk_offset(config: &FlashAttentionConfig) -> u32 {
+    let hd = config.head_dim as u32;
+    tier_b2_dq_wv_chunk_offset(config) + TIER_B2_RMSNORM_CHUNK * hd * 2
+}
+
+/// x_kv chunk staging region offset. f16 `[effective_bkv, TIER_B2_RMSNORM_CHUNK]`.
+/// Lives immediately after the x_q chunk slot.
+pub fn tier_b2_dq_x_kv_chunk_offset(config: &FlashAttentionConfig) -> u32 {
+    let bq = tier_b2_effective_bq(config);
+    tier_b2_dq_x_q_chunk_offset(config) + bq * TIER_B2_RMSNORM_CHUNK * 2
+}
+
+/// Col-major K re-stage band offset (Path A per Phase 2 spec §5.2-5.3).
+/// f16 `[head_dim, effective_bkv]` — stored col-major so MMA B-fragment
+/// loads can use `emit_load_b_fragment_smem` without a transpose.
+/// LAST SMEM band; placed after all chunk-staging bands.
+pub fn tier_b2_dq_k_colmajor_offset(config: &FlashAttentionConfig) -> u32 {
+    let bkv = tier_b2_effective_bkv(config);
+    tier_b2_dq_x_kv_chunk_offset(config) + bkv * TIER_B2_RMSNORM_CHUNK * 2
+}
+
+/// Col-major K re-stage band size in bytes (f16 storage).
+/// Size = effective_bkv * head_dim * 2 (same capacity as the row-major K
+/// tile, different layout for MMA B-fragment compatibility).
+pub fn tier_b2_dq_k_colmajor_bytes(config: &FlashAttentionConfig) -> u32 {
+    let bkv = tier_b2_effective_bkv(config);
+    let hd = config.head_dim as u32;
+    bkv * hd * 2
+}
+
+/// Total dQ-kernel SMEM bytes (sums all bands including K-colmajor).
+/// Must be <= SMEM_DYNAMIC_BUDGET_BYTES (99 KB) at all canonical configs.
+///
+/// Per-hd totals at canonical block_q=block_kv=64 requested (after fallback):
+///   hd=32  bq=64  (no fallback):     38400 bytes = 37.5 KB (61.5 KB headroom)
+///   hd=64  bq=64  (no fallback):     59392 bytes = 58.0 KB (41.0 KB headroom)
+///   hd=128 bq=32  (SMEM fallback):   47616 bytes = 46.5 KB (52.5 KB headroom)
+///   hd=256 bq=32  (reg-pressure fallback): 90624 bytes = 88.5 KB (10.5 KB headroom)
+pub fn tier_b2_dq_total_smem_bytes(config: &FlashAttentionConfig) -> u32 {
+    tier_b2_dq_k_colmajor_offset(config) + tier_b2_dq_k_colmajor_bytes(config)
+}
+
+// Phase 3 dK/dV-kernel SMEM offset stubs — return 0 for now, filled in
+// when the dK/dV-kernel lands. Declared here for forward-compat so callers
+// can reference them without a Phase 3 stub PR.
+pub fn tier_b2_dkdv_q_offset(_config: &FlashAttentionConfig) -> u32 { 0 }
+pub fn tier_b2_dkdv_k_offset(_config: &FlashAttentionConfig) -> u32 { 0 }
+pub fn tier_b2_dkdv_v_offset(_config: &FlashAttentionConfig) -> u32 { 0 }
+#[allow(non_snake_case)]
+pub fn tier_b2_dkdv_dO_offset(_config: &FlashAttentionConfig) -> u32 { 0 }
+pub fn tier_b2_dkdv_ds_offset(_config: &FlashAttentionConfig) -> u32 { 0 }
+pub fn tier_b2_dkdv_total_smem_bytes(_config: &FlashAttentionConfig) -> u32 { 0 }
+
+#[cfg(test)]
+mod tier_b2_dq_offset_tests {
+    use super::*;
+    use crate::flash_attention::{CshaExtras, FlashAttentionConfig, RopeStyle};
+
+    fn canonical_hd128_cfg() -> FlashAttentionConfig {
+        FlashAttentionConfig {
+            block_q: 64, block_kv: 64, head_dim: 128,
+            causal: true, paged: false,
+            rope_q: false, rope_style: RopeStyle::HalfSplit,
+            gqa_group_size: 1, tree_mask: false,
+            gpu_sm: 80, segment_masked: false,
+            csha: Some(CshaExtras { level: 2, ..Default::default() }),
+        }
+    }
+
+    // === Per-hd bq fallback schedule (spec §5.2) ===
+
+    #[test]
+    fn tier_b2_effective_bq_no_fallback_at_hd_32() {
+        let mut cfg = canonical_hd128_cfg();
+        cfg.head_dim = 32;
+        cfg.block_q = 64;
+        assert_eq!(tier_b2_effective_bq(&cfg), 64);
+    }
+
+    #[test]
+    fn tier_b2_effective_bq_no_fallback_at_hd_64() {
+        let mut cfg = canonical_hd128_cfg();
+        cfg.head_dim = 64;
+        cfg.block_q = 64;
+        assert_eq!(tier_b2_effective_bq(&cfg), 64);
+    }
+
+    #[test]
+    fn tier_b2_effective_bq_smem_pressure_fallback_at_hd_128() {
+        let mut cfg = canonical_hd128_cfg();
+        cfg.head_dim = 128;
+        cfg.block_q = 64;
+        assert_eq!(tier_b2_effective_bq(&cfg), 32, "hd=128 SMEM-pressure fallback");
+    }
+
+    #[test]
+    fn tier_b2_effective_bq_register_pressure_fallback_at_hd_256() {
+        let mut cfg = canonical_hd128_cfg();
+        cfg.head_dim = 256;
+        cfg.block_q = 64;
+        assert_eq!(tier_b2_effective_bq(&cfg), 32, "hd=256 register-pressure fallback");
+    }
+
+    #[test]
+    fn tier_b2_effective_bkv_mirrors_effective_bq() {
+        // Approach A"'s bq=bkv invariant: effective_bkv must mirror effective_bq.
+        for &hd in &[32i64, 64, 128, 256] {
+            let mut cfg = canonical_hd128_cfg();
+            cfg.head_dim = hd;
+            cfg.block_q = 64;
+            cfg.block_kv = 64;
+            assert_eq!(
+                tier_b2_effective_bkv(&cfg),
+                tier_b2_effective_bq(&cfg),
+                "hd={} effective_bkv must mirror effective_bq", hd,
+            );
+        }
+    }
+
+    // === SMEM offset accessors (9 from original Task 3 + 1 new for K-colmajor) ===
+
+    #[test]
+    fn tier_b2_dq_offsets_match_spec_at_canonical_hd128() {
+        let cfg = canonical_hd128_cfg();
+        // At hd=128 with bq=64 requested, effective bq is 32 per spec §5.2 fallback.
+        // SMEM layout uses effective_bq, NOT raw config.block_q.
+        let eff_bq = tier_b2_effective_bq(&cfg);
+        let eff_bkv = tier_b2_effective_bkv(&cfg);
+        let hd = cfg.head_dim as u32;
+
+        assert_eq!(tier_b2_dq_q_offset(&cfg), 0);
+        assert_eq!(tier_b2_dq_k_offset(&cfg), eff_bq * hd * 2);
+        assert_eq!(tier_b2_dq_v_offset(&cfg), eff_bq * hd * 2 + eff_bkv * hd * 2);
+        // K-colmajor must be the last band
+        assert!(tier_b2_dq_k_colmajor_offset(&cfg) > tier_b2_dq_x_kv_chunk_offset(&cfg),
+            "K-colmajor band must be the LAST SMEM band");
+        assert_eq!(tier_b2_dq_k_colmajor_bytes(&cfg), eff_bkv * hd * 2);
+    }
+
+    #[test]
+    fn tier_b2_dq_k_colmajor_bytes_scales_with_hd_and_effective_bkv() {
+        // hd=32 bq=64: K-colmajor = 64 * 32 * 2 = 4 KB
+        let mut cfg = canonical_hd128_cfg();
+        cfg.head_dim = 32;
+        cfg.block_q = 64; cfg.block_kv = 64;
+        assert_eq!(tier_b2_dq_k_colmajor_bytes(&cfg), 4 * 1024);
+
+        // hd=64 bq=64: K-colmajor = 64 * 64 * 2 = 8 KB
+        cfg.head_dim = 64;
+        assert_eq!(tier_b2_dq_k_colmajor_bytes(&cfg), 8 * 1024);
+
+        // hd=128 bq=64 (with fallback to effective bq=32): K-colmajor = 32 * 128 * 2 = 8 KB
+        cfg.head_dim = 128;
+        assert_eq!(tier_b2_dq_k_colmajor_bytes(&cfg), 8 * 1024);
+    }
+
+    #[test]
+    fn tier_b2_dq_total_smem_under_dynamic_budget_at_all_hd() {
+        for &hd in &[32i64, 64, 128, 256] {
+            let mut cfg = canonical_hd128_cfg();
+            cfg.head_dim = hd;
+            cfg.block_q = 64;  // requested; effective may differ via fallback
+            cfg.block_kv = 64;
+            let total = tier_b2_dq_total_smem_bytes(&cfg);
+            assert!(total <= SMEM_DYNAMIC_BUDGET_BYTES,
+                "hd={} total SMEM {} > 99 KB cap", hd, total);
+        }
+    }
+
+    #[test]
+    fn tier_b2_dq_total_smem_includes_k_colmajor_band() {
+        let cfg = canonical_hd128_cfg();
+        // The K-colmajor band size must be reflected in the total.
+        let total_with = tier_b2_dq_total_smem_bytes(&cfg);
+        let last_band_start = tier_b2_dq_k_colmajor_offset(&cfg);
+        let last_band_size = tier_b2_dq_k_colmajor_bytes(&cfg);
+        assert_eq!(total_with, last_band_start + last_band_size,
+            "total must equal K-colmajor offset + K-colmajor bytes");
+    }
+}

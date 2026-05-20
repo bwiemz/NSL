@@ -6,6 +6,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]
 
+### Added — CSHA Tier B.2 backward Phase 2 (foundation + dQ-kernel emitter)
+
+- `flash_attention_v2::tier_b2::backward::d_prepass::synthesize_d_prepass` — D pre-pass kernel emitter (row-per-lane schedule: 32 lanes × 1 row each, sequential over `head_dim`; no inter-lane reduction; no SMEM; sm_80+; computes `D[b,h,q] = rowsum(dO * O)`). Spec §3.3's original butterfly-reduction schedule was replaced after the first GPU launch revealed a row/col conflation bug — both schedules are HBM-bandwidth-bound at canonical sizes, and the row-per-lane schedule avoids the bug class entirely.
+- `flash_attention_v2::tier_b2::backward::dq::synthesize_dq_kernel` — dQ-kernel emitter (~700 LOC), producer-consumer warp specialization, register-resident dQ accumulator across kv-inner loop, **no atomicAdd**. Inner-loop MAC chain: S = QK^T → P recompute → dP = dO·V^T → dS = P·(dP - D) → col-major K re-stage band (Path A) → dQ_acc += dS @ K.
+- `flash_attention_v2::tier_b2::register_budget_backward` — `BackwardKernel` enum (DPrePass | DQ | DKDV), `count_registers_backward`, `predict_fallback` planner helper covering BOTH SMEM-pressure (hd=128) and register-pressure (hd=256) cases.
+- `flash_attention_v2::smem_layout::tier_b2_dq_*_offset` accessors including the new `tier_b2_dq_k_colmajor_offset` Path A re-stage band, plus `tier_b2_effective_bq`/`tier_b2_effective_bkv` per-hd fallback schedule and `tier_b2_dkdv_*` stubs for Phase 3.
+- `matmul_mma::emit_load_b_fragment_smem` parameter renamed `row_stride_bytes` → `col_stride_bytes` (was misnamed for B.1's actual use as the column stride between adjacent n-axis positions). The Task 2 `load_transposed: bool` extension was reverted after V-B2-5 verification found it architecturally unsound (commit `275d849d`).
+- `nsl-test` crate (new workspace member) with `nsl_test::diagnostic_mode::{DSource, compute_d_for_test}` — permanent test utility for backward-kernel localizability (swap CPU-D in for B.2-pre-pass-D to bisect failures). Phase 3 dK/dV-kernel and future-milestone backward work inherit the primitive.
+- `crates/nsl-codegen/tests/tier_b2_no_atomic_in_dq.rs` — Rust-level PTX-parse invariant test (CPU-only, runs every commit; asserts dQ-kernel emits zero `atom.*` instructions per spec §7.2).
+- `crates/nsl-codegen/tests/tier_b2_dq_k_colmajor_lane_mapping.rs` — Spec §5.5 institutional pin: lane-mapping byte-pattern test for the col-major K re-stage band.
+- `crates/nsl-codegen/tests/tier_b2_dq_kernel_cpu_reference.rs` — Layer-1 dQ tests (Test 1: D pre-pass standalone; Test 2: dQ smoke at canonical; Test 3: dQ head_dim sweep across {32, 64, 128}). All `#[ignore]` + `feature="cuda"` — manual GPU validation gates Phase 2 closure.
+- `crates/nsl-test/tests/diagnostic_mode_localizes_d_bug.rs` — Spec §7.3 sharpened FAIL→PASS exit criterion: injects corrupted D and proves the swap localizes correctly.
+- Phase 1 `synthesize_tier_b2_backward → Err(NotImplemented)` stub removed; selector wrapper now routes through the real emitter.
+- `crates/nsl-codegen/tests/tier_b2_ascii_only_ptx.rs` — ASCII-only invariant guardrail: every byte of emitted PTX must be 7-bit ASCII. Catches Unicode characters in `//` comments that cause cudarc's ptxas JIT to abort with `CUDA_ERROR_INVALID_PTX`. First-incident origin: 2026-05-20 D pre-pass launch failed because of em-dash + multiplication-sign characters in section comments.
+
+### Validated on GPU (RTX 5070 Ti sm_120, 2026-05-20)
+
+- D pre-pass GPU validation: **max_abs = 0.0** (bit-exact vs CPU reference) at all 4 tested configurations: canonical `(b=1, h=1, s=32, hd=32)` plus sweep cases `(1,1,64,32)` / `(1,2,96,64)` / `(2,1,128,128)`. Tolerances 5e-3 / 2e-2 / 4e-2 not even relevant — match is exact.
+- `run_d_prepass_on_gpu` cudarc launcher wired (via `nsl_kernel_launch` + `nsl_test_cuda_*` primitives).
+- `run_b1_forward_for_test` + `run_dq_kernel_on_gpu` remain `unimplemented!()`, **explicitly gated on Phase 2.5**. The dQ-kernel emitter is currently a structural scaffold (sections + register decls + MMA chain + labels — verified by ~20 ptxas/structural tests) but is **not data-mobile**: cp.async loads, HBM address derivation, dS SMEM scatter, col-major K re-stage scatter, tile_skip predicate computation, MMA fragment row/col setup, and loop back-edges all ship as PTX comments rather than emitted instructions. A launched dQ-kernel would read uninitialized SMEM. Phase 2.5 fills the data-mobility gap and is the gate to dQ GPU validation (Tests 2 + 3 in `tier_b2_dq_kernel_cpu_reference.rs`).
+
 ### Changed
 - Moved the root-level research PDFs into `docs/research/` so research artifacts live with the rest of the repository's research material.
 - Refreshed `README.md` to reflect the current documentation layout and the current local validation snapshot instead of stale passing-test counts.

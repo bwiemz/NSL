@@ -1,0 +1,11 @@
+---
+source: crates/nsl-codegen/tests/hir_pass_snapshots.rs
+expression: structural_summary(&module)
+---
+module: relu_test
+test_taps: true
+ports: 0
+nodes: 1
+[0] GenerateFor lo=0 hi=128 body={
+  [0] Max0 width=32 a="Port(__relu_in)"
+}

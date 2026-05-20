@@ -1,9 +1,10 @@
 ---
 source: crates/nsl-codegen/tests/pca_forward_kernel_snapshot.rs
+assertion_line: 129
 expression: ptx
 ---
 .version 8.7
-.target sm_75
+.target sm_80
 .address_size 64
 
 .extern .shared .align 16 .b8 shmem[];
