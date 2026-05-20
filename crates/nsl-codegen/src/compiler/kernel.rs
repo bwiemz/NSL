@@ -168,16 +168,13 @@ impl Compiler<'_> {
                 crate::kernel::KernelCompiler::compile(kernel, self.interner)
             }
             GpuTarget::Fpga => {
-                // M57.1 prerequisite: AST → structured KIR (Matmul/
-                // ElementwiseAdd/Relu) → KirToHirPass → VerilogEmitter +
-                // HIR port/wire generation. Currently unreachable because
-                // parse_target doesn't yet return GpuTarget::Fpga.
-                // See docs/superpowers/specs/2026-05-18-m57-fpga-verilog-design.md §1.5.
+                // M57.1 §3.2: `nsl build --target fpga` parses successfully (parse_target
+                // recognizes "fpga"), but general-kernel FPGA compilation is not in v1's
+                // scope. Model-block compilation routes through `nsl fpga-compile`; this
+                // arm rejects non-model invocations with a redirecting error.
                 return Err(crate::error::CodegenError::new(
-                    "M57.1 prerequisite: AST → structured KIR dispatch + HIR \
-                     port/wire generation. Use `nsl fpga-compile` for the \
-                     intended workflow (currently also deferred — see CLI \
-                     error message)."
+                    "`--target fpga` for general kernels is not supported in v1. \
+                     Use `nsl fpga-compile <source>` for model-block FPGA compilation."
                 ));
             }
             GpuTarget::Rocm | GpuTarget::Metal | GpuTarget::WebGpu => {
