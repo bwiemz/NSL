@@ -2378,22 +2378,54 @@ fn run_build_shared_single(
         .ok()
         .and_then(|g| g.as_ref().map(|v| v.iter().map(|e| e.symbol_name.clone()).collect()))
         .unwrap_or_default();
+    // Sibling packed-array dispatch wrappers (`<name>__nsl_dispatch`) emitted
+    // alongside every typed `<name>` wrapper. The runtime ExportRegistry
+    // dlsyms these via the suffix; MSVC requires them in the explicit export
+    // list to survive linking.
+    let dispatch_symbols: Vec<String> = export_symbols
+        .iter()
+        .map(|s| format!("{}__nsl_dispatch", s))
+        .collect();
     // M62 Task 9: also re-export the runtime lifecycle symbols so that ctypes
     // callers can call nsl_model_create / nsl_model_destroy / nsl_get_last_error
     // directly from the generated shared lib without loading a separate runtime DLL.
-    let runtime_exports = [
+    // `mut` is only used when --features onnx-rt-op is on; harmless otherwise.
+    #[allow(unused_mut)]
+    let mut runtime_exports: Vec<&'static str> = vec![
         "nsl_model_create",
+        "nsl_model_create_with_lib",
         "nsl_model_destroy",
+        "nsl_model_forward",
+        "nsl_model_forward_grad",
+        "nsl_model_backward",
+        "nsl_grad_context_destroy",
+        "nsl_model_call",
+        "nsl_model_call_dlpack",
+        "nsl_model_export_count",
+        "nsl_model_lookup_function",
         "nsl_model_get_weight_ptrs",
         "nsl_model_get_num_weights",
         "nsl_model_num_weights",
         "nsl_get_last_error",
+        "nsl_clear_error",
         "nsl_set_error_cstr",
         "nsl_desc_to_tensor",
         "nsl_tensor_to_desc_ffi",
         "nsl_tensor_free",
+        "nsl_get_num_exports",
+        "nsl_get_export_name",
+        "nsl_dispatch_apply_result",
+        "nsl_dl_path_for_fn_addr",
+        "nsl_free_cstr",
     ];
+    // M62b Spec C — when nsl-cli is built with --features onnx-rt-op the nsl-runtime
+    // crate compiles in `RegisterCustomOps` (the ORT custom-op registration entry
+    // point). MSVC requires the symbol to be in the explicit export list to survive
+    // linking into the .dll; on other platforms the extra entry is harmless.
+    #[cfg(feature = "onnx-rt-op")]
+    runtime_exports.push("RegisterCustomOps");
     let mut export_refs: Vec<&str> = export_symbols.iter().map(|s| s.as_str()).collect();
+    export_refs.extend(dispatch_symbols.iter().map(|s| s.as_str()));
     export_refs.extend_from_slice(&runtime_exports);
 
     match nsl_codegen::linker::link_shared_with_exports(
@@ -2655,22 +2687,50 @@ fn run_build_shared_multi(
         .ok()
         .and_then(|g| g.as_ref().map(|v| v.iter().map(|e| e.symbol_name.clone()).collect()))
         .unwrap_or_default();
+    // Sibling packed-array dispatch wrappers (`<name>__nsl_dispatch`); see
+    // single-file path above for rationale.
+    let dispatch_symbols: Vec<String> = export_symbols
+        .iter()
+        .map(|s| format!("{}__nsl_dispatch", s))
+        .collect();
     // M62 Task 9: mirror the single-file path and re-export runtime lifecycle
     // symbols so ctypes callers can load weights + call exports through the
     // generated DLL without loading a separate runtime DLL.
-    let runtime_exports = [
+    // `mut` is only used when --features onnx-rt-op is on; harmless otherwise.
+    #[allow(unused_mut)]
+    let mut runtime_exports: Vec<&'static str> = vec![
         "nsl_model_create",
+        "nsl_model_create_with_lib",
         "nsl_model_destroy",
+        "nsl_model_forward",
+        "nsl_model_forward_grad",
+        "nsl_model_backward",
+        "nsl_grad_context_destroy",
+        "nsl_model_call",
+        "nsl_model_call_dlpack",
+        "nsl_model_export_count",
+        "nsl_model_lookup_function",
         "nsl_model_get_weight_ptrs",
         "nsl_model_get_num_weights",
         "nsl_model_num_weights",
         "nsl_get_last_error",
+        "nsl_clear_error",
         "nsl_set_error_cstr",
         "nsl_desc_to_tensor",
         "nsl_tensor_to_desc_ffi",
         "nsl_tensor_free",
+        "nsl_get_num_exports",
+        "nsl_get_export_name",
+        "nsl_dispatch_apply_result",
+        "nsl_dl_path_for_fn_addr",
+        "nsl_free_cstr",
     ];
+    // M62b Spec C — mirror single-file path: surface `RegisterCustomOps` for the
+    // MSVC linker when nsl-cli is built with --features onnx-rt-op.
+    #[cfg(feature = "onnx-rt-op")]
+    runtime_exports.push("RegisterCustomOps");
     let mut export_refs: Vec<&str> = export_symbols.iter().map(|s| s.as_str()).collect();
+    export_refs.extend(dispatch_symbols.iter().map(|s| s.as_str()));
     export_refs.extend_from_slice(&runtime_exports);
 
     match nsl_codegen::linker::link_shared_with_exports(&obj_files, &lib_path, &export_refs) {

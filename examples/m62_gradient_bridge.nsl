@@ -1,0 +1,28 @@
+# M62b Spec B example — PyTorch-style backward flowing through NSL
+# via the per-call grad-context API.
+#
+# A trivial learnable linear layer with `y = w * x + b` declared as a
+# regular NSL `model` block, exposed to the Python world through an
+# `@export fn forward` wrapper.  The Python harness in
+# `examples/m62_gradient_bridge.py` drives the canonical
+#   `model.forward_grad(x)` → `ctx.backward(seed)` → `ctx.destroy()`
+# flow against this shared library.
+#
+# The model uses default initializers (w=1.0, b=0.0) so the example is
+# self-contained — no safetensors weights needed for the forward output
+# to be meaningful.  This mirrors the test fixture in
+# `python/tests/test_m62_grad_context.py` which deliberately keeps the
+# fixture stateless so the demo focuses on the ABI flow rather than
+# weight-loading plumbing.
+
+model Linear:
+    w: Tensor<[1], f32> = ones([1])
+    b: Tensor<[1], f32> = zeros([1])
+
+    fn forward(self, x: Tensor<[1], f32>) -> Tensor<[1], f32>:
+        return self.w * x + self.b
+
+@export
+fn forward(x: Tensor<[1], f32>) -> Tensor<[1], f32>:
+    let m = Linear()
+    return m.forward(x)

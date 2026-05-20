@@ -109,6 +109,8 @@ pub mod trace;
 pub mod onnx;
 #[cfg(feature = "interop")]
 pub mod onnx_proto;
+#[cfg(feature = "onnx-rt-op")]
+pub mod onnx_rt_op;
 
 // Stubs for interop FFI symbols when feature is disabled.
 // The codegen always declares these as external imports, so the linker
@@ -139,6 +141,7 @@ pub mod kv_compress;
 pub mod grammar;
 pub mod token_alignment;
 pub mod gpu_backend;
+pub mod grad_context;
 pub mod vmap_runtime;
 pub mod backward_context;
 pub mod pipeline;

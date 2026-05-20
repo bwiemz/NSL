@@ -1,0 +1,15 @@
+# Multi-export model demonstrating named dispatch via
+# the runtime `nsl_model_call` FFI surfaced to Python as
+# `NslModel.call`.
+#
+# Two exports — identity (passthrough) and double (element-wise +) — both
+# called by string name from the same Python harness without dlsym'ing
+# each symbol individually.
+
+@export
+fn identity(x: Tensor<[4], f32>) -> Tensor<[4], f32>:
+    return x
+
+@export
+fn double(x: Tensor<[4], f32>) -> Tensor<[4], f32>:
+    return x + x

@@ -1373,12 +1373,35 @@ impl<'a> Compiler<'a> {
     /// After all internal function bodies have been emitted, synthesize the
     /// Cranelift body of each `@export` C-ABI wrapper registered during
     /// `declare_user_functions_with_linkage`. See `crate::c_wrapper`.
+    ///
+    /// Also emits the runtime export-table FFIs (`nsl_get_num_exports` and
+    /// `nsl_get_export_name`) — but only when producing a single shared
+    /// library (`compile_options.shared_lib == true`). For multi-object
+    /// `nsl run` builds, every object would otherwise carry its own copy
+    /// of those two `Linkage::Export` symbols and the MSVC linker emits
+    /// LNK2005 (already-defined) when it joins the objects. Multi-object
+    /// builds do not consume the export-table FFIs (they're only reached
+    /// via dlsym on a loaded shared lib), so suppressing them is safe.
+    /// Empty-export shared libs still emit the table (returns 0/NULL),
+    /// preserving uniform runtime probing.
     pub fn emit_export_wrappers(&mut self) -> Result<(), CodegenError> {
         // Clone to side-step borrow of `self.features` during emission, which
         // itself calls `&mut self.module`.
         let wrappers = self.features.export_wrappers.clone();
         for wrapper in &wrappers {
             crate::c_wrapper::emit_c_abi_wrapper(self, wrapper)?;
+            // Sibling packed-array wrapper used by nsl_model_call. The typed
+            // wrapper above is unchanged (preserves the Spec §2.3 ABI
+            // bit-stability commitment for direct dlsym callers); this
+            // dispatch wrapper exposes the same export under the
+            // `__nsl_dispatch` suffix with the (model, in_arr, n_in,
+            // out_arr, n_out) -> i64 ABI.
+            crate::c_wrapper::emit_c_abi_dispatch_wrapper(self, wrapper)?;
+        }
+
+        if self.compile_options.shared_lib {
+            let exports = self.features.export_functions.clone();
+            crate::c_export_table::emit_export_table(self, &exports)?;
         }
         Ok(())
     }
