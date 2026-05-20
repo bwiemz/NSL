@@ -791,20 +791,30 @@ pub(crate) mod inner {
         }
 
         // Dynamic SMEM opt-in for kernels using `.extern .shared` PTX declarations.
-        // When a kernel requests more than 48 KB of shared memory (the static SMEM
-        // cap on all SM generations), the PTX uses `extern .shared` instead of a
-        // fixed-size static declaration.  Before launch we must call
-        // cuFuncSetAttribute(CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, N)
-        // to raise the per-block SMEM limit.  Typical limits by architecture:
+        // The canonical dynamic-SMEM form `.extern .shared shmem[]` (empty brackets) does NOT
+        // bake any size into the PTX — the CUDA driver allocates exactly the bytes we request
+        // here via cuFuncSetAttribute.  We must call the attribute for ANY non-zero request:
+        //
+        //   * shared_mem_bytes <= 48 KB: the driver accepts values within the static cap
+        //     without the attribute call, but calling it is harmless and ensures the per-block
+        //     budget is explicitly set (guards against driver default being 0 for extern decls).
+        //   * shared_mem_bytes > 48 KB: mandatory — without the call the driver silently uses
+        //     the static default (48 KB) and the launch fails with CUDA_ERROR_INVALID_VALUE.
+        //
+        // Guard lowered from `> 48 KB` to `> 0` so that kernels in the 1..=48 KB range (e.g.
+        // hd=32, SMEM=37.5 KB) also get the attribute set.  The old 48 KB threshold was correct
+        // when kernels used sized externs (`shmem[N]`), which bake the static allocation into
+        // the PTX and don't need the attribute for sub-48-KB requests.
+        //
+        // Callers that do not use dynamic SMEM at all pass shared_mem_bytes=0 — the guard
+        // below skips the attribute call for them, preserving existing behaviour.
+        //
+        // Typical opt-in SMEM limits by architecture:
         //   sm_120 (Blackwell, RTX 5xxx): 99 KB (CU_DEVICE_ATTRIBUTE_…_OPTIN = 101376)
         //   sm_90  (Hopper):              99 KB
         //   sm_89  (Ada Lovelace):        99 KB
         //   sm_86  (Ampere high-end):    ~100 KB
-        // Callers that do not need dynamic SMEM pass shared_mem_bytes=0 (the static
-        // declaration already bakes in the size); only those with total_bytes > 48 KB
-        // pass the full total as shared_mem_bytes, which triggers this opt-in.
-        const STATIC_SMEM_CAP: u32 = 48 * 1024;
-        if shared_mem_bytes > STATIC_SMEM_CAP {
+        if shared_mem_bytes > 0 {
             // Query the device's opt-in SMEM limit before attempting the attribute set.
             let device_smem_limit = {
                 let mut guard2 = state.lock().unwrap();
