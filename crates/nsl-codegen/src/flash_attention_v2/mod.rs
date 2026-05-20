@@ -1115,8 +1115,6 @@ pub fn synthesize_backward_with_tier_b(
     phases::backward::csha_hooks_backward::emit_drope(&mut ptx, config, 0);
     phases::backward::csha_hooks_backward::emit_dproj(&mut ptx, config, 0);
     phases::backward::csha_hooks_backward::emit_drmsnorm(&mut ptx, config, 0);
-    // phases::backward::csha_hooks_backward::emit_dproj(&mut ptx, config, 0);
-    // phases::backward::csha_hooks_backward::emit_drmsnorm(&mut ptx, config, 0);
 
     // Phase 4: cooperative global stores of the 7 gradients + final fence.
     phases::backward::finalize::emit_store_dq_only(&mut ptx, config, 0);

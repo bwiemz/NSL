@@ -450,10 +450,12 @@ pub fn plan_all(
 /// Returns which backward kernel family the planner should dispatch for this config.
 /// Tier B.2 takes precedence when its preconditions hold; falls back to scalar v2 otherwise.
 ///
-/// **Note:** Tier B.2 emitters are not implemented until Phase 2. Until then, callers
-/// that receive `BackwardTier::TierB2` should panic or log an unimplemented warning —
-/// this function's PURPOSE in Phase 1 is to let the planner reserve the dispatch path
-/// so Phase 2 can land the emitters without changing the cost-model.
+/// **Phase 1 contract:** Tier B.2 emitters are stubs that always return
+/// `Err(NotImplemented)`. Callers that receive `BackwardTier::TierB2` MUST
+/// transparently fall back to scalar v2 backward (see
+/// `flash_attention_v2::synthesize_backward_with_tier`). This reserves the
+/// dispatch path so Phase 2 can replace the stubs without changing the
+/// cost-model or planner interface.
 pub fn backward_dispatch_tier(
     config: &crate::flash_attention::FlashAttentionConfig,
 ) -> crate::flash_attention_v2::tier_b2::BackwardTier {
