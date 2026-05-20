@@ -56,6 +56,14 @@ fn header_contains_expected_prototypes() {
     // Required types
     assert!(header.contains("typedef struct NslModel NslModel"), "missing NslModel typedef: {header}");
     assert!(header.contains("NslTensorDesc"), "missing NslTensorDesc: {header}");
+    // tape_id field carries autodiff identity across desc round-trips
+    // (per-call grad context, Spec B). Pinning the field here so a
+    // future struct-shrinking refactor is caught before the runtime
+    // layout silently diverges.
+    assert!(
+        header.contains("int64_t  tape_id;"),
+        "missing tape_id field in NslTensorDesc emission: {header}"
+    );
 
     // Lifecycle
     assert!(header.contains("nsl_model_create"), "missing nsl_model_create proto: {header}");

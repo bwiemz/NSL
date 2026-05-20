@@ -249,6 +249,50 @@ pub fn is_recording() -> bool {
     TAPE.with(|t| { let tape = t.borrow(); tape.recording && tape.pause_depth == 0 })
 }
 
+/// Debug-only invariant check for `desc_to_nsl_tensor`'s tape_id import path.
+///
+/// `Tape::next_id` is monotonic for the lifetime of the thread (initialized
+/// to 1 by `Tape::new`, only mutated by `get_or_assign_id`'s `+= 1`, never
+/// reset — both `nsl_tape_start` and `nsl_tape_stop` have explicit
+/// "Do NOT reset next_id" comments). So any tape_id observed in a desc on
+/// this thread was assigned at a moment when `next_id` was at most
+/// `tape_id`, and `next_id` has only grown since.
+///
+/// A violation of `tape_id < next_id` would mean either:
+///   - a future change introduced a `next_id` reset, silently re-using ids
+///     across forwards (Case A: cross-generation misattribution), or
+///   - a desc was constructed on a different thread (cross-thread import
+///     is not currently a supported path; `GradContext` is `Send + !Sync`
+///     but its output_ptrs are constructed on the producing thread).
+///
+/// Either case would produce wrong-but-plausible backward grads. The
+/// assertion fires loudly at the import boundary instead.
+///
+/// Threshold note: in the special case that the assert runs on a thread
+/// whose tape has never recorded (e.g., a Python helper thread that
+/// only consumes ctxs), `next_id == 1`. A `tape_id >= 1` would trigger.
+/// Callers are expected to hit this only on the producing thread; the
+/// `tape_id != 0` early-return in `desc_to_nsl_tensor` already covers
+/// the "I'm a virgin thread reading a Python-supplied desc" case.
+#[inline]
+pub fn debug_assert_tape_id_in_range(tape_id: i64) {
+    debug_assert!(
+        tape_id != 0,
+        "debug_assert_tape_id_in_range called with tape_id=0; caller must early-return on 0"
+    );
+    TAPE.with(|t| {
+        let tape = t.borrow();
+        debug_assert!(
+            tape_id < tape.next_id,
+            "imported desc.tape_id={} >= tape.next_id={} — Tape::next_id monotonicity invariant violated. \
+             Either next_id was reset (forbidden — see autodiff/mod.rs:291,399), or the desc was \
+             constructed on a different thread (cross-thread desc import is not a supported path).",
+            tape_id,
+            tape.next_id,
+        );
+    });
+}
+
 pub fn pop_last_op() {
     TAPE.with(|t| { t.borrow_mut().ops.pop(); });
 }

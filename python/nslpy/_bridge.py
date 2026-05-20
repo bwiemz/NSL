@@ -34,6 +34,11 @@ class NslTensorDesc(ctypes.Structure):
         ("dtype", ctypes.c_int32),
         ("device_type", ctypes.c_int32),
         ("device_id", ctypes.c_int32),
+        # Autodiff tape id, copied verbatim across desc round-trips.
+        # Python-supplied input tensors have no tape history → 0 (ctypes
+        # auto-zeroes unset fields, but listing it explicitly here
+        # keeps the C ABI mirror byte-exact at 48 bytes).
+        ("tape_id", ctypes.c_int64),
     ]
 
 

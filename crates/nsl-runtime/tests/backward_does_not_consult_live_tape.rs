@@ -55,6 +55,7 @@ struct Desc {
     dtype: i32,
     device_type: i32,
     device_id: i32,
+    tape_id: i64,
 }
 
 /// Mimic the move-out step at the end of `nsl_model_forward_grad`:
@@ -141,6 +142,7 @@ fn backward_does_not_consult_live_tape() {
         dtype: 0,
         device_type: 0,
         device_id: 0,
+        tape_id: 0,
     }];
     let rc = nsl_model_backward(
         ctx_a,

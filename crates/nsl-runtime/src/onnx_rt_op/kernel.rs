@@ -175,6 +175,10 @@ unsafe fn ort_input_to_desc(
         dtype: nsl_dtype,
         device_type: 0, // CPU only for v1
         device_id: 0,
+        // ORT inputs cross the FFI boundary fresh per compute — no autodiff
+        // tape history to inherit. CPU custom ops are inference-only in v1;
+        // training-aware ORT integration is M62c scope.
+        tape_id: 0,
     }
 }
 
@@ -213,6 +217,7 @@ unsafe fn ort_alloc_output_desc(
         dtype: template.dtype,
         device_type: 0,
         device_id: 0,
+        tape_id: 0, // ORT outputs are inference-only in v1
     }
 }
 

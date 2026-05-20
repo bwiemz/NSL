@@ -48,6 +48,7 @@ class NslTensorDesc(ctypes.Structure):
         ("dtype",       ctypes.c_int32),
         ("device_type", ctypes.c_int32),
         ("device_id",   ctypes.c_int32),
+        ("tape_id",     ctypes.c_int64),
     ]
 
 

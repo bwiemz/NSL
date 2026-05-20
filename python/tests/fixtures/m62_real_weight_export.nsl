@@ -1,0 +1,22 @@
+# Gating fixture for the c_wrapper.rs `tape_id` round-trip fix
+# (NslTensorDesc + tape_id field).
+#
+# Single-weight `@export` model: `forward(x) = w * x` (element-wise).
+# Backward seed = ones_like(y) implies `dy/dw = x` and `dy/dx = w`.
+# The Python harness in test_m62_grad_context.py asserts the returned
+# parameter gradient equals `x` exactly — which the pre-fix code path
+# could NOT produce (the loss seed's tape_id was 0, so the chain rule
+# dropped the seed and every param grad fell back to zeros_like).
+#
+# Single weight (not bias+weight) keeps the assertion order-independent:
+# `nsl_model_forward_grad` snapshots `param_set` via `HashSet::iter`
+# which is undefined-order in Rust's default RandomState, so a
+# multi-param model could not match grads to expected values reliably
+# without exposing param-name plumbing through the @export ABI.
+
+model RealWeight:
+    w: Tensor<[1], f32>
+
+    @export
+    fn forward(self, x: Tensor<[1], f32>) -> Tensor<[1], f32>:
+        return self.w * x

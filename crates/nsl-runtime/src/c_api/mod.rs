@@ -24,6 +24,35 @@ pub mod exports;
 /// Note: The C API uses dtype convention 0=f32, 1=f64 — this is **different**
 /// from NSL's internal convention (0=f64, 1=f32). The conversion functions
 /// `capi_dtype_to_nsl` and `nsl_dtype_to_capi` handle the mapping.
+///
+/// Layout (48 bytes, 8-byte aligned):
+///   offset  0: data         (*mut c_void, 8)
+///   offset  8: shape        (*mut i64,    8)
+///   offset 16: strides      (*mut i64,    8)
+///   offset 24: ndim         (i32,         4)
+///   offset 28: dtype        (i32,         4)
+///   offset 32: device_type  (i32,         4)
+///   offset 36: device_id    (i32,         4)
+///   offset 40: tape_id      (i64,         8)
+///
+/// `tape_id` carries the source tensor's autodiff tape id verbatim so that
+/// a desc round-trip (`nsl_tensor_to_desc` → `desc_to_nsl_tensor`) does not
+/// strip the id. Required for the per-call grad context (Spec B): the
+/// loss seed in `run_backward_core` keys on `t.tape_id`, which would fall
+/// through to the raw-pointer fallback if the desc dropped the id.
+///
+/// Semantics of `tape_id`:
+///   - `tape_id == 0`: source tensor was never autodiff-tracked (constants,
+///     freshly-allocated wrappers, inputs from non-grad code paths).
+///   - `tape_id > 0`: matches the source tensor's `tape_id` as assigned by
+///     `Tape::get_or_assign_id`. Thread-local `next_id` is monotonic
+///     (never reset — see `autodiff/mod.rs:291, 399`), so on the same
+///     thread an imported id is guaranteed `< tape.next_id`.
+///
+/// `#[derive(Default)]` is preserved for the two scratch-desc allocation
+/// sites in `nsl_model_call_dlpack`; new struct-literal sites are
+/// compiler-required to specify `tape_id` explicitly (no `..Default::default()`
+/// shorthand is currently used).
 #[repr(C)]
 #[derive(Default)]
 pub struct NslTensorDesc {
@@ -37,6 +66,10 @@ pub struct NslTensorDesc {
     pub device_type: i32,
     /// GPU index (0 for CPU)
     pub device_id: i32,
+    /// Autodiff tape id of the source tensor, copied verbatim across desc
+    /// round-trips. `0` means "untracked" (the legacy semantics that
+    /// produced the bug fixed by this commit).
+    pub tape_id: i64,
 }
 
 // ---------------------------------------------------------------------------
@@ -974,22 +1007,38 @@ pub extern "C" fn nsl_dispatch_apply_result(src_desc_ptr: i64, dst_desc_ptr: i64
         }
     }
 
-    // Mirror metadata (shape/strides/ndim/dtype/device) from src so that
-    // callers reading `dst.ndim`/`dst.shape` after the dispatch see the
+    // Mirror metadata (shape/strides/ndim/dtype/device/tape_id) from src so
+    // that callers reading `dst.ndim`/`dst.shape` after the dispatch see the
     // actual output shape, not whatever they had pre-populated. Preserve
     // `dst.data` since that's the caller's buffer we just filled.
+    //
+    // `tape_id` is the load-bearing line for per-call grad context backward:
+    // the typed wrapper writes the impl tensor's tape_id into scratch via
+    // `nsl_tensor_to_desc_ffi`, and we forward it onto the caller's desc here
+    // so `nsl_model_forward_grad` can reconstruct the loss-seed tape_id when
+    // it re-wraps the output desc via `desc_to_nsl_tensor`.
     dst.shape = src.shape;
     dst.strides = src.strides;
     dst.ndim = src.ndim;
     dst.dtype = src.dtype;
     dst.device_type = src.device_type;
     dst.device_id = src.device_id;
+    dst.tape_id = src.tape_id;
     0
 }
 
 /// Convert an NslTensorDesc (C API) into an NslTensor pointer.
 /// The resulting tensor borrows the data buffer — caller must not free the
 /// original data while the tensor is live.
+///
+/// **`tape_id` round-trip:** if `desc.tape_id != 0`, the new wrapper inherits
+/// it verbatim. This is the load-bearing line for per-call grad context
+/// backward: the loss seed in `run_backward_core` keys on
+/// `if t.tape_id != 0 { t.tape_id } else { loss_ptr }`, so a fresh wrapper
+/// must carry the same id the impl-emitted output tensor was assigned by
+/// `Tape::get_or_assign_id` during forward. See `c_api::NslTensorDesc` for
+/// the monotonicity invariant; the debug-assert below catches any future
+/// regression that violates it.
 pub(crate) fn desc_to_nsl_tensor(desc: &NslTensorDesc) -> i64 {
     let ndim = desc.ndim as usize;
     let nsl_dtype = capi_dtype_to_nsl(desc.dtype);
@@ -1016,14 +1065,15 @@ pub(crate) fn desc_to_nsl_tensor(desc: &NslTensorDesc) -> i64 {
     let len = NslTensor::total_elements(shape_ptr, desc.ndim as i64);
     let device = if desc.device_type > 0 { desc.device_id as u8 + 1 } else { 0 };
     capi_trace(format!(
-        "desc_to_tensor ndim={} len={} device={} dtype={}",
+        "desc_to_tensor ndim={} len={} device={} dtype={} tape_id={}",
         desc.ndim,
         len,
         device,
-        nsl_dtype
+        nsl_dtype,
+        desc.tape_id,
     ));
 
-    let tensor = Box::new(NslTensor::new(
+    let mut tensor = Box::new(NslTensor::new(
         desc.data,
         shape_ptr,
         strides,
@@ -1034,10 +1084,31 @@ pub(crate) fn desc_to_nsl_tensor(desc: &NslTensorDesc) -> i64 {
         0,
         0,
     ));
+
+    // Inherit the autodiff tape id from the desc verbatim. The thread-local
+    // `next_id` counter is monotonic (`autodiff/mod.rs:291, 399` — explicit
+    // "Do NOT reset next_id" comments at both `nsl_tape_start` and
+    // `nsl_tape_stop`), so on the same thread an imported id is guaranteed
+    // strictly less than `tape.next_id`. The debug-assert below pins this
+    // invariant: a violation would mean a future change introduced a
+    // `next_id` reset, which would silently misattribute the loss seed in
+    // backward.
+    if desc.tape_id != 0 {
+        debug_assert!(
+            desc.tape_id > 0,
+            "negative desc.tape_id={} — Tape::get_or_assign_id only emits >= 1",
+            desc.tape_id,
+        );
+        crate::autodiff::debug_assert_tape_id_in_range(desc.tape_id);
+        tensor.tape_id = desc.tape_id;
+    }
     Box::into_raw(tensor) as i64
 }
 
 /// Fill an NslTensorDesc from an NslTensor pointer.
+///
+/// Copies `tape_id` verbatim so that a subsequent `desc_to_nsl_tensor`
+/// reconstructs the autodiff identity (Spec B per-call grad context).
 pub(crate) fn nsl_tensor_to_desc(tensor_ptr: i64, desc: &mut NslTensorDesc) {
     let tensor = NslTensor::from_ptr(tensor_ptr);
     desc.data = tensor.data;
@@ -1047,6 +1118,7 @@ pub(crate) fn nsl_tensor_to_desc(tensor_ptr: i64, desc: &mut NslTensorDesc) {
     desc.device_id = if tensor.device > 0 { (tensor.device - 1) as i32 } else { 0 };
     desc.shape = tensor.shape;
     desc.strides = tensor.strides;
+    desc.tape_id = tensor.tape_id;
 }
 
 // ---------------------------------------------------------------------------
@@ -1147,6 +1219,7 @@ mod tests {
             dtype: 0, // C API f32
             device_type: 0,
             device_id: 0,
+            tape_id: 0,
         };
 
         let tensor_ptr = desc_to_nsl_tensor(&desc);
@@ -1158,16 +1231,18 @@ mod tests {
         assert_eq!(tensor.dtype, 1); // NSL f32
         assert_eq!(tensor.device, 0);
         assert_eq!(tensor.owns_data, 0); // borrowed
+        assert_eq!(tensor.tape_id, 0); // untracked input
 
         // Read back via desc
         let mut out_desc = NslTensorDesc {
             data: std::ptr::null_mut(), shape: std::ptr::null_mut(),
             strides: std::ptr::null_mut(), ndim: 0, dtype: 0,
-            device_type: 0, device_id: 0,
+            device_type: 0, device_id: 0, tape_id: 0,
         };
         nsl_tensor_to_desc(tensor_ptr, &mut out_desc);
         assert_eq!(out_desc.ndim, 2);
         assert_eq!(out_desc.dtype, 0); // back to C API f32
+        assert_eq!(out_desc.tape_id, 0); // wrapper has no tape_id assigned
 
         crate::tensor::nsl_tensor_free(tensor_ptr);
     }

@@ -15,6 +15,7 @@ struct NslTensorDesc {
     dtype: i32,
     device_type: i32,
     device_id: i32,
+    tape_id: i64,
 }
 
 fn build_identity_lib() -> (std::path::PathBuf, std::path::PathBuf) {
@@ -85,6 +86,7 @@ fn call_routes_to_named_export_and_produces_output() {
         dtype: 0,
         device_type: 0,
         device_id: 0,
+        tape_id: 0,
     };
     let mut output_shape = vec![4i64];
     let mut output_data = vec![0.0f32; 4];
@@ -96,6 +98,7 @@ fn call_routes_to_named_export_and_produces_output() {
         dtype: 0,
         device_type: 0,
         device_id: 0,
+        tape_id: 0,
     };
 
     let name = CString::new("identity").unwrap();

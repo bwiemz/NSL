@@ -26,6 +26,7 @@ struct Desc {
     dtype: i32,
     device_type: i32,
     device_id: i32,
+    tape_id: i64,
 }
 
 #[test]

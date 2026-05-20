@@ -16,6 +16,7 @@ struct Desc {
     dtype: i32,
     device_type: i32,
     device_id: i32,
+    tape_id: i64,
 }
 
 fn build_forward_lib() -> (std::path::PathBuf, std::path::PathBuf) {
@@ -78,6 +79,7 @@ fn forward_and_named_call_produce_identical_outputs() {
         dtype: 0,
         device_type: 0,
         device_id: 0,
+        tape_id: 0,
     };
 
     let mut shape_a = vec![4i64];
@@ -90,6 +92,7 @@ fn forward_and_named_call_produce_identical_outputs() {
         dtype: 0,
         device_type: 0,
         device_id: 0,
+        tape_id: 0,
     };
     let rc_a = nsl_runtime::c_api::nsl_model_forward(
         model,
@@ -109,6 +112,7 @@ fn forward_and_named_call_produce_identical_outputs() {
         dtype: 0,
         device_type: 0,
         device_id: 0,
+        tape_id: 0,
     };
     let fwd = CString::new("forward").unwrap();
     let rc_b = nsl_runtime::c_api::nsl_model_call(
