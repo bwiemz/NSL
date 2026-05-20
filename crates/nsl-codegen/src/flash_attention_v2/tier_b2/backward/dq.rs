@@ -129,6 +129,10 @@ fn emit_register_decls(ptx: &mut String, _config: &FlashAttentionConfig) {
     // K tile is [effective_bkv, hd] f16, per-kv_iter (not resident). Loaded in emit_inner_loop_open.
     ptx.push_str("    .reg .u32 %c3_kv_tile_start, %c3_lane_byte_off, %c3_smem_base32, %c3_smem_dst;\n");
     ptx.push_str("    .reg .u64 %c3_k_hbm_off, %c3_k_hbm_base, %c3_lane_hbm_addr, %c3_smem_base64;\n");
+    // C4 cp.async V-tile registers. Prefixed %c4_* to avoid clashes with C1/C2/C3 namespaces.
+    // V tile is [effective_bkv, hd] f16, per-kv_iter (not resident). Loaded in emit_inner_loop_open.
+    ptx.push_str("    .reg .u32 %c4_kv_tile_start, %c4_lane_byte_off, %c4_smem_base32, %c4_smem_dst;\n");
+    ptx.push_str("    .reg .u64 %c4_v_hbm_off, %c4_v_hbm_base, %c4_lane_hbm_addr, %c4_smem_base64;\n");
     ptx.push('\n');
 }
 
@@ -485,6 +489,102 @@ fn emit_k_producer_load(ptx: &mut String, config: &FlashAttentionConfig) {
     // commit_group emitted by caller (emit_inner_loop_open) after both C3 and C4 land.
 }
 
+/// C4: emit the cp.async load for the V tile [effective_bkv, hd] f16 into SMEM.
+///
+/// V is **per-kv_iter** (spec §1.3) — loaded once per inner loop iteration.
+/// Mirrors C3 (K tile) exactly, with only the SMEM destination and HBM source
+/// param changed.  HBM source: `v_saved_ptr` param.
+/// SMEM destination: `tier_b2_dq_v_offset(config)` bytes from shmem base.
+///
+/// Uses A1's `emit_4d_byte_offset` for HBM addressing, with `%c4_kv_tile_start`
+/// (= `kv_iter * bkv`) as the row index — NOT `%q_iter` (which C1/C2 use).
+///
+/// Register naming prefix `%c4_` prevents clashes with C1/C2/C3 namespaces.
+///
+/// The warp-0 gate (`@!%p_producer bra DQ_KV_LOAD_DONE`) is emitted by the
+/// caller (`emit_inner_loop_open`) — shared with C3 (K tile), no duplicate branch.
+fn emit_v_producer_load(ptx: &mut String, config: &FlashAttentionConfig) {
+    use crate::flash_attention_v2::smem_layout::{
+        tier_b2_effective_bkv, tier_b2_dq_v_offset,
+    };
+
+    let bkv = tier_b2_effective_bkv(config);
+    let hd = config.head_dim as u32;
+    let v_smem_off = tier_b2_dq_v_offset(config);
+
+    // Total V tile bytes = bkv * hd * 2 (f16). Distributed across 32 lanes:
+    //   bytes_per_lane = (bkv * hd * 2) / 32
+    //   chunks_per_lane = bytes_per_lane / 4  (each cp.async.ca issues b32 = 4 bytes)
+    let total_bytes = bkv * hd * 2;
+    let bytes_per_lane = total_bytes / 32;
+    let chunks_per_lane = bytes_per_lane / 4;
+    debug_assert!(
+        chunks_per_lane >= 1,
+        "V tile must have at least one b32 chunk per lane (bkv={}, hd={})",
+        bkv, hd
+    );
+
+    ptx.push_str(&format!(
+        "    // === C4: cp.async V tile [bkv={bkv}, hd={hd}] f16 -> SMEM[+v_offset={v_smem_off}] ===\n"
+    ));
+    // All %c4_* registers declared in emit_register_decls (PTX ISA: decls before exec instrs).
+
+    // kv_tile_start = kv_iter * bkv (first KV sequence position of this V tile; per-kv_iter).
+    ptx.push_str(&format!(
+        "    // kv_tile_start = kv_iter * {bkv} (V tile rows are kv-iter-aligned; refreshed each kv_iter)\n"
+    ));
+    ptx.push_str(&format!(
+        "    mul.lo.u32 %c4_kv_tile_start, %kv_iter, {bkv};\n"
+    ));
+
+    // HBM byte offset for V[batch_idx, head, kv_tile_start, 0] using A1's helper.
+    // emit_4d_byte_offset uses %row_index_tmp as scratch (declared in emit_register_decls).
+    crate::flash_attention_v2::tier_b2::backward::dq::hbm_addr::emit_4d_byte_offset(
+        ptx,
+        "%c4_v_hbm_off",
+        "%batch_idx",
+        "%head",
+        "%c4_kv_tile_start",
+        "0",     // d=0: column index within the row (full row loaded via multi-chunk loop)
+        "%heads_r",
+        "%seq_len_r",
+        hd,      // D = head_dim
+        2,       // sizeof(f16) = 2
+    );
+
+    // HBM source base: load v_saved_ptr from param space.
+    ptx.push_str("    ld.param.u64 %c4_v_hbm_base, [v_saved_ptr];\n");
+    ptx.push_str("    add.u64 %c4_v_hbm_base, %c4_v_hbm_base, %c4_v_hbm_off;\n");
+
+    // Per-lane byte offset within the tile: lane_id * 4 bytes.
+    ptx.push_str("    shl.b32 %c4_lane_byte_off, %lane_id, 2;  // lane_id * 4 bytes\n");
+
+    // HBM address for this lane = base + lane_byte_off.
+    ptx.push_str("    cvt.u64.u32 %c4_lane_hbm_addr, %c4_lane_byte_off;\n");
+    ptx.push_str("    add.u64 %c4_lane_hbm_addr, %c4_lane_hbm_addr, %c4_v_hbm_base;\n");
+
+    // SMEM destination: u32 shared-space address via cvta.shared.u64 + cvt.u32.u64 + v_offset.
+    ptx.push_str("    cvta.shared.u64 %c4_smem_base64, shmem;\n");
+    ptx.push_str("    cvt.u32.u64 %c4_smem_base32, %c4_smem_base64;\n");
+    // v_smem_off > 0 (V follows Q+K tiles), so always add the offset.
+    ptx.push_str(&format!(
+        "    add.u32 %c4_smem_base32, %c4_smem_base32, {v_smem_off};  // +v_offset\n"
+    ));
+    // Add per-lane byte offset to SMEM destination.
+    ptx.push_str("    add.u32 %c4_smem_dst, %c4_smem_base32, %c4_lane_byte_off;\n");
+
+    // Emit cp.async.ca.shared.global for each chunk per lane.
+    // Chunk stride across lanes = 32 * 4 = 128 bytes per chunk iteration.
+    let chunk_stride = 32 * 4u32; // 32 lanes * 4 bytes each
+    for chunk_idx in 0..chunks_per_lane {
+        let chunk_off = chunk_idx * chunk_stride;
+        ptx.push_str(&format!(
+            "    cp.async.ca.shared.global [%c4_smem_dst + {chunk_off}], [%c4_lane_hbm_addr + {chunk_off}], 4;\n"
+        ));
+    }
+    // commit_group emitted by caller (emit_inner_loop_open) after both C3 and C4 land.
+}
+
 fn emit_dq_acc_init(ptx: &mut String, config: &FlashAttentionConfig) {
     // Per SPEC AMENDMENT: use tier_b2_effective_bq for any block_q-dependent
     // sizing. accumulator_fragments = head_dim / 32 (independent of bq, but
@@ -510,7 +610,7 @@ fn emit_inner_loop_open(ptx: &mut String, config: &FlashAttentionConfig) {
     ptx.push_str("    // Warps 1-3 (consumers): wait on cp.async.wait_group.\n");
     ptx.push_str("    @!%p_producer bra DQ_KV_LOAD_DONE;\n");
     emit_k_producer_load(ptx, config);
-    // cp.async V -> shmem[+v_offset]  (C4 will replace)
+    emit_v_producer_load(ptx, config);
     ptx.push_str("    cp.async.commit_group;\n");
     ptx.push_str("DQ_KV_LOAD_DONE:\n");
     ptx.push_str("    cp.async.wait_group 0;\n");
