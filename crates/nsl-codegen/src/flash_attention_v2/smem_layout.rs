@@ -1052,11 +1052,11 @@ pub fn tier_b2_dq_k_colmajor_bytes(config: &FlashAttentionConfig) -> u32 {
 /// Total dQ-kernel SMEM bytes (sums all bands including K-colmajor).
 /// Must be <= SMEM_DYNAMIC_BUDGET_BYTES (99 KB) at all canonical configs.
 ///
-/// Per-hd totals at canonical bq=64 requested (after fallback):
-///   hd=32  bq=64 (no fallback):  ~71 KB (28 KB headroom)
-///   hd=64  bq=64 (no fallback):  ~75 KB (24 KB headroom)
-///   hd=128 bq=32 (SMEM fallback): ~83 KB (16 KB headroom)
-///   hd=256 bq=32 (reg fallback):  bounded similarly
+/// Per-hd totals at canonical block_q=block_kv=64 requested (after fallback):
+///   hd=32  bq=64  (no fallback):     38400 bytes = 37.5 KB (61.5 KB headroom)
+///   hd=64  bq=64  (no fallback):     59392 bytes = 58.0 KB (41.0 KB headroom)
+///   hd=128 bq=32  (SMEM fallback):   47616 bytes = 46.5 KB (52.5 KB headroom)
+///   hd=256 bq=32  (reg-pressure fallback): 90624 bytes = 88.5 KB (10.5 KB headroom)
 pub fn tier_b2_dq_total_smem_bytes(config: &FlashAttentionConfig) -> u32 {
     tier_b2_dq_k_colmajor_offset(config) + tier_b2_dq_k_colmajor_bytes(config)
 }

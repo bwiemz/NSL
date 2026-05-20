@@ -4,23 +4,75 @@
 //!     cargo test -p nsl-codegen --test tier_b2_dq_kernel_cpu_reference \
 //!         --features cuda -- --ignored --nocapture
 //!
-//! - Test 1: D pre-pass standalone vs CPU rowsum (Task 7)
-//! - Test 2: dQ smoke at canonical (Task 14)
-//! - Test 3: dQ head_dim sweep (Task 14)
+//! - Test 1: D pre-pass standalone vs CPU rowsum (Task 7) — **WIRED + launchable**
+//! - Test 2: dQ smoke at canonical (Task 14) — **gated on Phase 2.5**
+//! - Test 3: dQ head_dim sweep (Task 14) — **gated on Phase 2.5**
 //!
-//! GPU launcher helpers are STUBS for Phase 2 — real cudarc-based launchers wire
-//! during PR review when manual GPU runs are performed. The `unimplemented!()`
-//! bodies trip immediately when an #[ignore]'d test is actually run, which is
-//! exactly the right behavior for "the test must be executed manually on GPU
-//! hardware before closure."
+//! Test 1 wires through `run_d_prepass_on_gpu` against the real `nsl_kernel_launch`
+//! FFI; the D pre-pass kernel is data-mobile (real ld.global / fma / shfl /
+//! st.global) and can be GPU-validated today.
+//!
+//! Tests 2 + 3 are gated on **Phase 2.5** — the dQ-kernel emitter is currently
+//! a *structural scaffold* (sections, register decls, MMA chain shape, labels
+//! all verified by ~20 ptxas/structural tests) but is **not data-mobile**:
+//! cp.async loads, HBM address derivation, dS SMEM scatter, col-major K
+//! re-stage, tile_skip predicate loads, MMA fragment row/col setup, and loop
+//! back-edges are placeholder comments rather than emitted instructions. A
+//! launched dQ-kernel would read uninitialized SMEM. Phase 2.5 fills the
+//! data-mobility gap and is the gate to dQ GPU validation.
 //!
 //! Spec: docs/superpowers/specs/2026-05-19-csha-tier-b2-phase2-design.md §6.1
 
 #![cfg(feature = "cuda")]
 
+use std::ffi::{c_void, CString};
+
 use nsl_codegen::flash_attention::{CshaExtras, FlashAttentionConfig, RopeStyle};
 use nsl_codegen::flash_attention_v2::tier_b2::backward::d_prepass::synthesize_d_prepass;
 use nsl_codegen::flash_attention_v2::tier_b2::backward::dq::synthesize_dq_kernel;
+use nsl_runtime::{
+    nsl_cuda_init, nsl_test_cuda_alloc, nsl_test_cuda_d2h, nsl_test_cuda_free,
+    nsl_test_cuda_h2d, nsl_test_cuda_jit_log,
+};
+
+extern "C" {
+    fn nsl_kernel_launch(
+        ptx_ptr: i64,
+        name_ptr: i64,
+        grid_x: i64,
+        grid_y: i64,
+        grid_z: i64,
+        block_x: i64,
+        block_y: i64,
+        block_z: i64,
+        args_ptr: i64,
+        num_args: i64,
+        shared_mem_bytes: i64,
+    ) -> i64;
+}
+
+fn cuda_available() -> bool {
+    if std::env::var("NSL_SKIP_CUDA_TESTS").is_ok() {
+        eprintln!("[tier_b2] skipping: NSL_SKIP_CUDA_TESTS set");
+        return false;
+    }
+    let rc = unsafe { nsl_cuda_init() };
+    if rc != 0 {
+        eprintln!("[tier_b2] skipping: nsl_cuda_init returned {}", rc);
+        return false;
+    }
+    true
+}
+
+/// Null-terminate a PTX string for cuModuleLoadData.
+fn ptx_to_cstr_bytes(ptx: &str) -> Vec<u8> {
+    let mut bytes = ptx.as_bytes().to_vec();
+    if bytes.last() != Some(&b'\n') {
+        bytes.push(b'\n');
+    }
+    bytes.push(0);
+    bytes
+}
 
 fn tol_for_head_dim(hd: u32) -> f32 {
     if hd >= 128 {
@@ -75,6 +127,10 @@ fn tier_b2_d_prepass_vs_cpu_reduction() {
     // Validates the D pre-pass kernel in isolation, before dQ-kernel consumes D.
     // Tolerance: tol_for_head_dim(32) = 5e-3.
 
+    if !cuda_available() {
+        return;
+    }
+
     let cfg_c = canonical_hd32_cfg();
     let batch = 1usize;
     let heads = 1usize;
@@ -115,6 +171,11 @@ fn tier_b2_d_prepass_vs_cpu_reduction() {
         .map(|(a, b)| (a - b).abs())
         .fold(0.0f32, f32::max);
 
+    eprintln!(
+        "[tier_b2_d_prepass] batch={batch} heads={heads} seq={seq} hd={hd} \
+         max_abs={max_abs:.6e} tol={tol:.6e}"
+    );
+
     assert!(
         max_abs <= tol,
         "D pre-pass max_abs {} > tolerance {} for hd={}",
@@ -122,6 +183,96 @@ fn tier_b2_d_prepass_vs_cpu_reduction() {
         tol,
         hd
     );
+}
+
+// === Test 1b: D pre-pass at non-trivial grid + hd sweep ===
+
+#[test]
+#[ignore]
+fn tier_b2_d_prepass_grid_dispatch_and_hd_sweep() {
+    // Exercises the kernel's full grid (ceil(seq/32), heads, batch) and the
+    // 32-row CTA strip handling for seq > 32. Sweeps hd ∈ {32, 64, 128} to
+    // verify the per-row column loop scales correctly with head_dim. Reuses
+    // the row-per-lane schedule; numerical match should remain near machine
+    // epsilon for these magnitudes.
+
+    if !cuda_available() {
+        return;
+    }
+
+    struct Case {
+        batch: usize,
+        heads: usize,
+        seq: usize,
+        hd: i64,
+    }
+    let cases = [
+        Case { batch: 1, heads: 1, seq: 64,  hd: 32  }, // 2 CTAs in x
+        Case { batch: 1, heads: 2, seq: 96,  hd: 64  }, // 3 CTAs in x, 2 in y
+        Case { batch: 2, heads: 1, seq: 128, hd: 128 }, // 4 CTAs in x, 2 in z
+    ];
+
+    for case in cases.iter() {
+        let cfg_c = FlashAttentionConfig {
+            block_q: 32,
+            block_kv: 32,
+            head_dim: case.hd,
+            causal: false,
+            paged: false,
+            rope_q: false,
+            rope_style: RopeStyle::HalfSplit,
+            gqa_group_size: 1,
+            tree_mask: false,
+            gpu_sm: 80,
+            segment_masked: false,
+            csha: Some(CshaExtras { level: 2, ..Default::default() }),
+        };
+        let hd = case.hd as usize;
+
+        let d_o_host: Vec<half::f16> = (0..case.batch * case.heads * case.seq * hd)
+            .map(|i| half::f16::from_f32(((i as f32 * 0.137).sin() * 0.1) as f32))
+            .collect();
+        let o_host: Vec<half::f16> = (0..case.batch * case.heads * case.seq * hd)
+            .map(|i| half::f16::from_f32(((i as f32 * 0.241).cos() * 0.1) as f32))
+            .collect();
+
+        let mut d_ref = vec![0.0f32; case.batch * case.heads * case.seq];
+        for b in 0..case.batch {
+            for h in 0..case.heads {
+                for q in 0..case.seq {
+                    let base = ((b * case.heads + h) * case.seq + q) * hd;
+                    let sum: f32 = (0..hd)
+                        .map(|d| d_o_host[base + d].to_f32() * o_host[base + d].to_f32())
+                        .sum();
+                    d_ref[(b * case.heads + h) * case.seq + q] = sum;
+                }
+            }
+        }
+
+        let ptx = synthesize_d_prepass(&cfg_c).expect("D pre-pass synthesis");
+        let d_gpu = run_d_prepass_on_gpu(
+            &ptx, &d_o_host, &o_host, case.batch, case.heads, case.seq, hd,
+        );
+
+        let tol = tol_for_head_dim(hd as u32);
+        let max_abs = d_ref
+            .iter()
+            .zip(d_gpu.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+
+        eprintln!(
+            "[tier_b2_d_prepass_sweep] batch={} heads={} seq={} hd={} \
+             max_abs={:.6e} tol={:.6e}",
+            case.batch, case.heads, case.seq, case.hd, max_abs, tol
+        );
+
+        assert!(
+            max_abs <= tol,
+            "D pre-pass sweep max_abs {} > tol {} (batch={}, heads={}, seq={}, hd={})",
+            max_abs, tol, case.batch, case.heads, case.seq, case.hd,
+        );
+    }
 }
 
 // === Test 2: dQ-kernel smoke at canonical (Task 14) ===
@@ -267,10 +418,27 @@ fn cpu_naive_dq(
     dq
 }
 
-// === GPU launcher stubs (Task 14 scope; real launchers wire during PR-prep) ===
+// === GPU launchers ===
+//
+// `run_d_prepass_on_gpu` is wired to the real `nsl_kernel_launch` FFI — the
+// D pre-pass kernel is data-mobile and validates against the CPU reference
+// today.
+//
+// `run_b1_forward_for_test` and `run_dq_kernel_on_gpu` remain unimplemented:
+// **gated on Phase 2.5**. The dQ-kernel emitter is currently a structural
+// scaffold (sections + register decls + MMA chain + labels) with cp.async
+// loads, HBM address derivation, dS SMEM scatter, col-major K re-stage,
+// tile_skip predicate, MMA fragment row/col setup, and loop back-edges all
+// shipped as PTX comments rather than emitted instructions. A launched
+// dQ-kernel would read uninitialized SMEM. Wiring these two launchers before
+// Phase 2.5 fills the data-mobility gap would produce false-green smoke
+// tests against garbage output — exactly the failure mode the lane-mapping
+// test discipline (spec §5.5) was institutionally pinned to prevent.
 
-/// Stub for the B.1 forward FFI; returns (row_max, row_sum, O).
-/// Real impl calls nsl_runtime's `nsl_flash_attention_csha_with_saves`.
+/// Phase-2.5-gated stub for the B.1 forward FFI; would return (row_max, row_sum, O).
+/// Real impl will call nsl_runtime's `nsl_flash_attention_csha_with_saves` once
+/// the dQ-kernel is data-mobile (Phase 2.5) and its smoke + sweep tests are
+/// ready to consume B.1 saves.
 fn run_b1_forward_for_test(
     _q: &[half::f16],
     _k: &[half::f16],
@@ -282,9 +450,9 @@ fn run_b1_forward_for_test(
 ) -> (Vec<f32>, Vec<f32>, Vec<half::f16>) {
     let total_rows = batch * heads * seq;
     let _total_o = total_rows * hd;
-    // Real impl: cudarc HBM alloc + nsl_flash_attention_csha_with_saves + dtoh copy.
     unimplemented!(
-        "run_b1_forward_for_test stub — wire to nsl_flash_attention_csha_with_saves during GPU validation"
+        "run_b1_forward_for_test: gated on Phase 2.5 (dQ-kernel data-mobility). \
+         Wires only after the dQ-kernel emits real cp.async + HBM addressing."
     );
     #[allow(unreachable_code)]
     (
@@ -294,26 +462,7 @@ fn run_b1_forward_for_test(
     )
 }
 
-/// Stub for D pre-pass GPU launcher. Compiles + tests succeed only when wired.
-fn run_d_prepass_on_gpu(
-    _ptx: &str,
-    _d_o: &[half::f16],
-    _o: &[half::f16],
-    batch: usize,
-    heads: usize,
-    seq: usize,
-    _hd: usize,
-) -> Vec<f32> {
-    let total_rows = batch * heads * seq;
-    let _ = total_rows;
-    unimplemented!(
-        "run_d_prepass_on_gpu stub — wire cudarc launcher during GPU validation"
-    );
-    #[allow(unreachable_code)]
-    vec![0.0f32; batch * heads * seq]
-}
-
-/// Stub for dQ-kernel GPU launcher.
+/// Phase-2.5-gated stub for the dQ-kernel GPU launcher.
 fn run_dq_kernel_on_gpu(
     _ptx: &str,
     _q: &[half::f16],
@@ -330,8 +479,99 @@ fn run_dq_kernel_on_gpu(
 ) -> Vec<f32> {
     let _ = (batch, heads, seq, hd);
     unimplemented!(
-        "run_dq_kernel_on_gpu stub — wire cudarc launcher during GPU validation"
+        "run_dq_kernel_on_gpu: gated on Phase 2.5 (dQ-kernel data-mobility). \
+         The current emitter ships a structural scaffold; launching it would \
+         read uninitialized SMEM. See dq.rs — cp.async / HBM addressing / dS \
+         scatter / K re-stage / tile_skip / MMA-fragment-setup / loop \
+         back-edges are placeholder comments."
     );
     #[allow(unreachable_code)]
     vec![0.0f32; batch * heads * seq * hd]
+}
+
+/// D pre-pass GPU launcher.
+///
+/// Allocates HBM buffers for dO + O + D_out, copies dO/O host→device, calls
+/// `nsl_kernel_launch` with grid (ceil(seq/32), heads, batch) and block (32,1,1),
+/// copies D back, then frees. Returns the f32 D vector laid out [B, H, S].
+fn run_d_prepass_on_gpu(
+    ptx: &str,
+    d_o: &[half::f16],
+    o: &[half::f16],
+    batch: usize,
+    heads: usize,
+    seq: usize,
+    hd: usize,
+) -> Vec<f32> {
+    assert_eq!(d_o.len(), batch * heads * seq * hd, "d_o size mismatch");
+    assert_eq!(o.len(), batch * heads * seq * hd, "o size mismatch");
+
+    let in_bytes = (batch * heads * seq * hd * 2) as i64;
+    let out_bytes = (batch * heads * seq * 4) as i64;
+
+    let d_o_dev = nsl_test_cuda_alloc(in_bytes);
+    let o_dev = nsl_test_cuda_alloc(in_bytes);
+    let d_out_dev = nsl_test_cuda_alloc(out_bytes);
+    assert!(
+        d_o_dev != 0 && o_dev != 0 && d_out_dev != 0,
+        "D pre-pass device alloc failed"
+    );
+
+    nsl_test_cuda_h2d(d_o_dev, d_o.as_ptr() as i64, in_bytes);
+    nsl_test_cuda_h2d(o_dev, o.as_ptr() as i64, in_bytes);
+
+    let ptx_bytes = ptx_to_cstr_bytes(ptx);
+    let kernel_name = CString::new("tier_b2_d_prepass").unwrap();
+
+    let mut d_o_ptr_u64 = d_o_dev as u64;
+    let mut o_ptr_u64 = o_dev as u64;
+    let mut d_out_ptr_u64 = d_out_dev as u64;
+    let mut seq_len_u32 = seq as u32;
+    let mut heads_u32 = heads as u32;
+    let args: [*mut c_void; 5] = [
+        &mut d_o_ptr_u64 as *mut _ as *mut c_void,
+        &mut o_ptr_u64 as *mut _ as *mut c_void,
+        &mut d_out_ptr_u64 as *mut _ as *mut c_void,
+        &mut seq_len_u32 as *mut _ as *mut c_void,
+        &mut heads_u32 as *mut _ as *mut c_void,
+    ];
+
+    let grid_x = ((seq as i64) + 31) / 32;
+    let rc = unsafe {
+        nsl_kernel_launch(
+            ptx_bytes.as_ptr() as i64,
+            kernel_name.as_ptr() as i64,
+            grid_x,
+            heads as i64,
+            batch as i64,
+            32, 1, 1,
+            args.as_ptr() as i64,
+            args.len() as i64,
+            0, // no dynamic SMEM
+        )
+    };
+
+    if rc != 0 {
+        let log_ptr = nsl_test_cuda_jit_log(ptx_bytes.as_ptr() as i64);
+        let log = if log_ptr != 0 {
+            unsafe {
+                std::ffi::CStr::from_ptr(log_ptr as *const i8)
+                    .to_string_lossy()
+                    .into_owned()
+            }
+        } else {
+            "<no JIT log>".into()
+        };
+        nsl_test_cuda_free(d_o_dev);
+        nsl_test_cuda_free(o_dev);
+        nsl_test_cuda_free(d_out_dev);
+        panic!("D pre-pass launch failed rc={}\nJIT log:\n{}", rc, log);
+    }
+
+    let mut d_host = vec![0.0f32; batch * heads * seq];
+    nsl_test_cuda_d2h(d_host.as_mut_ptr() as i64, d_out_dev, out_bytes);
+    nsl_test_cuda_free(d_o_dev);
+    nsl_test_cuda_free(o_dev);
+    nsl_test_cuda_free(d_out_dev);
+    d_host
 }

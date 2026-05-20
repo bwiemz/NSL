@@ -3,10 +3,21 @@
 //! Computes D[batch, head, q] = sum_d (dO[b,h,q,d] * O[b,h,q,d])
 //! for use by dQ-kernel and dK/dV-kernel as part of dS = P * (dP - D).
 //!
-//! Grid: (ceil(seq_len / 32), heads, batch); Block: (32, 1, 1) — one warp.
-//! SMEM: none. Per-warp reduction via shfl.sync.bfly butterfly.
-//! HBM in:  dO, O — both f16 [B, H, S, D].
-//! HBM out: D — f32 [B, H, S] (batch * heads * seq * 4 bytes).
+//! Grid: (ceil(seq_len / 32), heads, batch); Block: (32, 1, 1) - one warp.
+//! Schedule: 1 lane = 1 row. Each lane independently sums all `head_dim` cols
+//! of its row into an f32 accumulator (no inter-lane shfl reduction needed
+//! because no two lanes share a row). No SMEM.
+//!
+//! HBM in:  dO, O - both f16 [B, H, S, D].
+//! HBM out: D - f32 [B, H, S] (batch * heads * seq * 4 bytes).
+//!
+//! Spec deviation note: spec §3.3 described a "warp-shfl butterfly reduction"
+//! where 32 lanes cooperate on a single row (D/32 cols each). The kernel
+//! implements the dual: 32 lanes each own one row (D cols each, sequentially).
+//! Both schedules are HBM-bandwidth-bound at canonical seq/hd sizes and
+//! produce identical numerical results; the per-lane-per-row schedule is
+//! strictly simpler (no butterfly, no lane-0-only store) and avoids the
+//! row-vs-col-conflation bug class that bit the original spec'd schedule.
 //!
 //! Spec: docs/superpowers/specs/2026-05-19-csha-tier-b2-phase2-design.md §3.3
 
@@ -15,16 +26,16 @@ use crate::flash_attention_v2::tier_b2::backward::BackwardSynthError;
 
 /// Emit a single-warp PTX kernel that computes the D pre-pass.
 ///
-/// Each lane in the 32-thread CTA handles exactly one row (q index).
-/// Within that row, each lane processes `head_dim / 32` f16 elements
-/// in an interleaved pattern (`lane_id + iter * 32`) for coalesced HBM
-/// access, fma's them into an f32 accumulator, then a 5-stage
-/// `shfl.sync.bfly` reduces the 32 partial sums to lane 0, which
-/// writes the result to D.
+/// Each lane in the 32-thread CTA handles exactly one row (q index). The
+/// lane iterates over all `head_dim` columns sequentially, fma'ing
+/// `dO[q,d] * O[q,d]` into an f32 accumulator, then writes its row's D
+/// value directly. No inter-lane reduction is required because the warp's
+/// rows are disjoint.
 ///
 /// # Errors
 /// Returns `BackwardSynthError::UnsupportedHeadDim` when `head_dim` is
-/// not divisible by 32.
+/// not divisible by 32 (kept as a config-validation gate; the loop itself
+/// doesn't require that exact divisibility).
 pub fn synthesize_d_prepass(
     config: &FlashAttentionConfig,
 ) -> Result<String, BackwardSynthError> {
@@ -32,7 +43,6 @@ pub fn synthesize_d_prepass(
     if !hd.is_multiple_of(32) {
         return Err(BackwardSynthError::UnsupportedHeadDim(hd));
     }
-    let elements_per_lane = hd / 32; // >= 1
 
     let mut ptx = String::new();
 
@@ -42,13 +52,15 @@ pub fn synthesize_d_prepass(
     ptx.push_str(".address_size 64\n\n");
 
     // ── Entry signature ──────────────────────────────────────────────────
+    // `batch` is recovered from %ctaid.z (grid dim z) and `heads` is read for
+    // the [B, H, S] row-index flattening below — no separate `batch` param
+    // is needed because the grid-z dimension determines that index at launch.
     ptx.push_str(".visible .entry tier_b2_d_prepass(\n");
     ptx.push_str("    .param .u64 d_o_ptr,\n");
     ptx.push_str("    .param .u64 o_ptr,\n");
     ptx.push_str("    .param .u64 d_out_ptr,\n");
     ptx.push_str("    .param .u32 seq_len,\n");
-    ptx.push_str("    .param .u32 heads,\n");
-    ptx.push_str("    .param .u32 batch\n");
+    ptx.push_str("    .param .u32 heads\n");
     ptx.push_str(")\n");
     ptx.push_str(".maxntid 32, 1, 1\n");
     ptx.push_str("{\n");
@@ -57,10 +69,10 @@ pub fn synthesize_d_prepass(
     ptx.push_str("    .reg .u32  %lane_id, %q_strip, %head, %batch_idx, %row_global;\n");
     ptx.push_str("    .reg .u32  %seq_len_r, %heads_r;\n");
     ptx.push_str("    .reg .u32  %row_index;\n");
-    ptx.push_str("    .reg .u64  %d_o_base, %o_base, %d_out_base, %addr_64, %offset_64, %lane_off;\n");
+    ptx.push_str("    .reg .u64  %d_o_base, %o_base, %d_out_base, %addr_64, %offset_64, %row_byte_base;\n");
     ptx.push_str("    .reg .b16  %dO_h, %o_h;\n");
-    ptx.push_str("    .reg .f32  %dO_f, %o_f, %acc, %tmp;\n");
-    ptx.push_str("    .reg .pred %p_in_range, %p_lane0;\n");
+    ptx.push_str("    .reg .f32  %dO_f, %o_f, %acc;\n");
+    ptx.push_str("    .reg .pred %p_in_range;\n");
     ptx.push('\n');
 
     // ── Load kernel parameters ───────────────────────────────────────────
@@ -93,6 +105,12 @@ pub fn synthesize_d_prepass(
 
     // ── Flat row index in [B, H, S] layout ──────────────────────────────
     // row_index = (batch_idx * heads + head) * seq_len + row_global
+    //
+    // u32 range: at the largest canonical config (batch=8, heads=32, seq=8192)
+    // the max row_index is (8*32 + 31) * 8192 + 8191 ≈ 2.1M, well below 2^32.
+    // The downstream `mul.wide.u32 %offset_64, %row_index, hd*2` widens to u64
+    // before any byte-offset arithmetic, so overflow risk is bounded to the
+    // u32 intermediate above (and confirmed safe).
     ptx.push_str("    mul.lo.u32 %row_index, %batch_idx, %heads_r;\n");
     ptx.push_str("    add.u32    %row_index, %row_index, %head;\n");
     ptx.push_str("    mul.lo.u32 %row_index, %row_index, %seq_len_r;\n");
@@ -103,78 +121,49 @@ pub fn synthesize_d_prepass(
     ptx.push_str("    mov.f32 %acc, 0.0;\n");
     ptx.push('\n');
 
-    // ── Pre-compute per-lane base byte offset: lane_id * 2 bytes ─────────
-    // lane_off = (u64) lane_id * 2
-    ptx.push_str("    mul.wide.u32 %lane_off, %lane_id, 2;\n");
+    // ── Per-row column sweep ─────────────────────────────────────────────
+    // HBM layout: dO / O are [B, H, S, D] in row-major f16.
+    // Each lane owns row `row_index`; lane sums all `hd` cols of that row.
+    // Element at col d has byte offset row_index * (hd*2) + d*2.
+    //
+    // We pre-compute %row_byte_base = row_index * (hd*2) once outside the loop,
+    // then walk the row by adding 2 bytes per iteration. The loop is unrolled
+    // at PTX emission time so the column index is a compile-time constant —
+    // ptxas can fold the address arithmetic.
+    let row_stride_bytes = hd * 2; // bytes per full row of f16
+    ptx.push_str(&format!(
+        "    mul.wide.u32 %row_byte_base, %row_index, {};\n",
+        row_stride_bytes
+    ));
     ptx.push('\n');
 
-    // ── Per-lane element loop ─────────────────────────────────────────────
-    // HBM layout: dO / O are [B, H, S, D] in row-major f16.
-    // Element at (row_index, d) has byte offset = row_index * hd * 2 + d * 2.
-    // Lane `lane_id` owns the interleaved elements:
-    //   d = lane_id + iter * 32   for iter in 0..elements_per_lane
-    // Byte offset within the row: (lane_id + iter*32) * 2
-    //                           = lane_id*2 + iter*64
-    //
-    // Total byte address = base + row_index * (hd*2) + lane_id*2 + iter*64
-    //
-    // We pre-compute `row_byte_base = base + row_index * (hd*2) + lane_id*2`
-    // then add the constant `iter*64` per iteration.
-    let row_stride_bytes = hd * 2; // bytes per full row of f16
-
-    for i in 0..elements_per_lane {
-        let iter_extra_bytes = i * 64u32; // iter * 32 lanes * 2 bytes/f16
-        ptx.push_str(&format!("    // Element {}/{} — d = lane_id + {}*32\n", i + 1, elements_per_lane, i));
-
-        // offset_64 = row_index * row_stride_bytes
-        ptx.push_str(&format!(
-            "    mul.wide.u32 %offset_64, %row_index, {};\n",
-            row_stride_bytes
-        ));
-        // offset_64 += lane_id * 2
-        ptx.push_str("    add.u64 %offset_64, %offset_64, %lane_off;\n");
-        // offset_64 += iter * 64  (constant, skip for i==0)
-        if iter_extra_bytes > 0 {
+    for d in 0..hd {
+        let col_bytes = d * 2u32;
+        // offset_64 = row_byte_base + d*2
+        if col_bytes == 0 {
+            ptx.push_str("    mov.u64 %offset_64, %row_byte_base;\n");
+        } else {
             ptx.push_str(&format!(
-                "    add.u64 %offset_64, %offset_64, {};\n",
-                iter_extra_bytes
+                "    add.u64 %offset_64, %row_byte_base, {};\n",
+                col_bytes
             ));
         }
-
-        // Load dO[row_global, d]
+        // Load dO[row, d]
         ptx.push_str("    add.u64 %addr_64, %d_o_base, %offset_64;\n");
         ptx.push_str("    ld.global.b16 %dO_h, [%addr_64];\n");
-
-        // Load O[row_global, d]
+        // Load O[row, d]
         ptx.push_str("    add.u64 %addr_64, %o_base, %offset_64;\n");
         ptx.push_str("    ld.global.b16 %o_h, [%addr_64];\n");
-
-        // Convert f16 -> f32
+        // f16 -> f32
         ptx.push_str("    cvt.f32.f16 %dO_f, %dO_h;\n");
         ptx.push_str("    cvt.f32.f16 %o_f, %o_h;\n");
-
-        // Accumulate: acc += dO_f * o_f
+        // acc += dO_f * o_f
         ptx.push_str("    fma.rn.f32 %acc, %dO_f, %o_f, %acc;\n");
-        ptx.push('\n');
-    }
-
-    // ── Warp butterfly reduction: 32 partial sums → lane 0 ──────────────
-    // 5 stages: stride 16, 8, 4, 2, 1
-    ptx.push_str("    // Warp-shfl butterfly reduction (32 -> 1)\n");
-    for stride in [16u32, 8, 4, 2, 1] {
-        ptx.push_str(&format!(
-            "    shfl.sync.bfly.b32 %tmp, %acc, {}, 0x1f, 0xffffffff;\n",
-            stride
-        ));
-        ptx.push_str("    add.f32 %acc, %acc, %tmp;\n");
     }
     ptx.push('\n');
 
-    // ── Lane 0 stores D[batch, head, row_global] ─────────────────────────
-    // D layout: [B, H, S] f32 — byte offset = row_index * 4
-    ptx.push_str("    setp.eq.u32 %p_lane0, %lane_id, 0;\n");
-    ptx.push_str("    @!%p_lane0 bra D_PREPASS_DONE;\n");
-    ptx.push('\n');
+    // ── Each lane stores its row's D directly ────────────────────────────
+    // D layout: [B, H, S] f32. Byte offset = row_index * 4.
     ptx.push_str("    mul.wide.u32 %offset_64, %row_index, 4;\n");
     ptx.push_str("    add.u64 %addr_64, %d_out_base, %offset_64;\n");
     ptx.push_str("    st.global.f32 [%addr_64], %acc;\n");
@@ -217,14 +206,16 @@ mod tests {
     }
 
     #[test]
-    fn d_prepass_emits_warp_shfl_reduction() {
+    fn d_prepass_emits_no_warp_shfl_reduction() {
+        // Per the row-per-lane schedule (see module doc spec-deviation note):
+        // each lane owns one row independently, so no inter-lane reduction is
+        // needed. Asserts the kernel does NOT emit shfl.sync — a guardrail
+        // against accidentally re-introducing the original row/col-conflated
+        // schedule that bit the first GPU launch (2026-05-20).
         let ptx = synthesize_d_prepass(&canonical_cfg()).unwrap();
-        assert!(ptx.contains("shfl.sync.bfly"));
-        // 5 butterfly stages for 32->1 reduction
-        assert_eq!(
-            ptx.matches("shfl.sync.bfly").count(),
-            5,
-            "expected exactly 5 shfl.sync.bfly stages"
+        assert!(
+            !ptx.contains("shfl.sync"),
+            "row-per-lane schedule must not emit shfl.sync"
         );
     }
 
@@ -244,11 +235,13 @@ mod tests {
     #[test]
     fn d_prepass_loads_d_o_and_o_from_global() {
         let ptx = synthesize_d_prepass(&canonical_cfg()).unwrap();
-        // Both dO and O must be loaded from HBM (f16).
-        // hd=128 -> 4 elements/lane -> 4 dO loads + 4 O loads = 8 ld.global
-        assert!(
-            ptx.matches("ld.global").count() >= 2,
-            "expected at least 2 ld.global (dO + O), got:\n{ptx}"
+        // Each lane processes head_dim cols, each loading dO + O = 2 ld.global
+        // per col. canonical hd=128 -> 256 ld.global total.
+        let n_loads = ptx.matches("ld.global").count();
+        let expected = (canonical_cfg().head_dim * 2) as usize;
+        assert_eq!(
+            n_loads, expected,
+            "expected exactly {expected} ld.global (hd * 2), got {n_loads}"
         );
     }
 

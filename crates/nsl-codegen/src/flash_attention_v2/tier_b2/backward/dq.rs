@@ -309,7 +309,7 @@ fn emit_inner_loop_body(ptx: &mut String, config: &FlashAttentionConfig) {
     let k_col_off = tier_b2_dq_k_colmajor_offset(config);
     let bkv_eff = tier_b2_effective_bkv(config);
     ptx.push_str("    // === Col-major K re-stage (Path A) ===\n");
-    ptx.push_str("    // Warp 0 gates the scatter to avoid 4× write amplification.\n");
+    ptx.push_str("    // Warp 0 gates the scatter to avoid 4x write amplification.\n");
     ptx.push_str("    @!%p_producer bra DQ_KCOL_RESTAGE_DONE;\n");
     ptx.push_str(&format!(
         "    // Source: row-major K[{bkv}, {hd}] at SMEM[+{k_off}]\n",
@@ -383,12 +383,12 @@ fn emit_dq_finalize(ptx: &mut String, config: &FlashAttentionConfig) {
     let accumulator_fragments = (config.head_dim / 32) as u32;
     ptx.push_str("    // === dQ HBM finalize ===\n");
     ptx.push_str("    // Scatter dQ_acc registers to HBM dQ[B, H, q_tile, hd].\n");
-    ptx.push_str("    // Each warp owns a 32-col strip of the bq×hd output tile.\n");
+    ptx.push_str("    // Each warp owns a 32-col strip of the bq x hd output tile.\n");
     ptx.push_str("    // Address: dq_base + (batch*H + head)*S*hd*4 + q_tile_start*hd*4 + lane_offset\n");
     for f in 0..accumulator_fragments {
         for r in 0..4 {
             ptx.push_str(&format!(
-                "    // Fragment {} reg {} → HBM dQ[batch, head, q_local, hd_slice]\n",
+                "    // Fragment {} reg {} -> HBM dQ[batch, head, q_local, hd_slice]\n",
                 f, r,
             ));
             ptx.push_str(&format!(
