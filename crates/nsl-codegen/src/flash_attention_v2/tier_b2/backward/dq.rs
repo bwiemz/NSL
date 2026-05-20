@@ -31,6 +31,7 @@ pub fn synthesize_dq_kernel(
     emit_entry_signature(&mut ptx);
     emit_register_decls(&mut ptx, config);
     emit_grid_id_setup(&mut ptx);
+    emit_q_iter_count_setup(&mut ptx, config);
     emit_outer_loop_open(&mut ptx);
     emit_q_dO_producer_load(&mut ptx);
     emit_dq_acc_init(&mut ptx, config);
@@ -75,6 +76,9 @@ fn emit_register_decls(ptx: &mut String, config: &FlashAttentionConfig) {
     ptx.push_str("    .reg .u32 %addr_lo, %tile_skip_predicate;\n");
     ptx.push_str("    .reg .u32 %row_index_tmp;\n");
     ptx.push_str("    .reg .u64 %addr;\n");
+    // Outer q_iter loop: induction variable, upper bound, loop predicate.
+    ptx.push_str("    .reg .u32 %q_iter, %num_q_iters;\n");
+    ptx.push_str("    .reg .pred %p_q_iter_more;\n");
     // Scratch registers used by matmul_mma helpers (emit_load_a/b_fragment_smem).
     ptx.push_str("    .reg .u32 %mma_addr, %mma_a_row, %mma_b_row;\n");
     // SMEM extern: per SPEC AMENDMENT, size from tier_b2_dq_total_smem_bytes (incl. K-colmajor).
@@ -94,7 +98,29 @@ fn emit_grid_id_setup(ptx: &mut String) {
     ptx.push('\n');
 }
 
+/// Compute %num_q_iters = ceil(seq_len / bq) using power-of-2 shift.
+///
+/// bq is power-of-2 per spec §3.1 (ALLOWED_BLOCK_Q), so:
+///   num_q_iters = (seq_len + bq - 1) >> log2(bq)
+/// This avoids a division instruction entirely.
+///
+/// %seq_len_r is a local scratch that reads the `seq_len` kernel param.
+/// It is NOT added to emit_register_decls because it is used only here and
+/// does not need to persist beyond this helper.
+fn emit_q_iter_count_setup(ptx: &mut String, config: &FlashAttentionConfig) {
+    let bq = tier_b2_effective_bq(config);
+    let log2_bq = bq.trailing_zeros();
+    // %num_q_iters declared in emit_register_decls; %seq_len_r is a fresh local.
+    ptx.push_str("    .reg .u32 %seq_len_r;\n");
+    ptx.push_str("    ld.param.u32 %seq_len_r, [seq_len];\n");
+    ptx.push_str(&format!("    add.u32 %num_q_iters, %seq_len_r, {};\n", bq - 1));
+    ptx.push_str(&format!("    shr.u32 %num_q_iters, %num_q_iters, {};\n", log2_bq));
+    ptx.push('\n');
+}
+
 fn emit_outer_loop_open(ptx: &mut String) {
+    // Initialize induction variable. %num_q_iters computed in emit_q_iter_count_setup.
+    ptx.push_str("    mov.u32 %q_iter, 0;\n");
     ptx.push_str("DQ_Q_ITER_LOOP:\n");
 }
 
@@ -377,8 +403,11 @@ fn emit_inner_loop_close(ptx: &mut String) {
 }
 
 fn emit_outer_loop_close(ptx: &mut String) {
-    ptx.push_str("    // ... q_iter increment + back-edge (Task 12 wires)\n");
-    ptx.push_str("    bra DQ_Q_ITER_DONE;  // placeholder unconditional exit until Task 12\n");
+    // Outer-loop back-edge: q_iter += 1; if q_iter < num_q_iters, branch back.
+    ptx.push_str("    // Outer-loop back-edge: q_iter += 1; if q_iter < num_q_iters, branch back.\n");
+    ptx.push_str("    add.u32 %q_iter, %q_iter, 1;\n");
+    ptx.push_str("    setp.lt.u32 %p_q_iter_more, %q_iter, %num_q_iters;\n");
+    ptx.push_str("    @%p_q_iter_more bra DQ_Q_ITER_LOOP;\n");
     ptx.push_str("DQ_Q_ITER_DONE:\n");
 }
 
@@ -651,5 +680,20 @@ mod tests {
             ptx.contains(".reg .u32 %row_index_tmp"),
             "synthesize_dq_kernel must declare %row_index_tmp scratch (caller contract for dq::hbm_addr helpers)"
         );
+    }
+
+    #[test]
+    fn synthesize_dq_kernel_emits_real_outer_q_iter_loop_with_back_edge() {
+        let ptx = synthesize_dq_kernel(&canonical_cfg()).unwrap();
+        // Real loop: induction var setup, comparison, conditional back-edge
+        assert!(ptx.contains("DQ_Q_ITER_LOOP"), "expected outer loop label");
+        assert!(ptx.contains("setp.lt.u32 %p_q_iter_more"),
+            "expected q_iter < num_q_iters predicate");
+        assert!(ptx.contains("@%p_q_iter_more bra DQ_Q_ITER_LOOP"),
+            "expected conditional back-edge to outer loop label");
+        // Confirm the old placeholder `bra DQ_Q_ITER_DONE` (unconditional) is GONE
+        let placeholder_count = ptx.matches("bra DQ_Q_ITER_DONE;  // placeholder").count();
+        assert_eq!(placeholder_count, 0,
+            "placeholder unconditional outer-loop exit must be removed");
     }
 }
