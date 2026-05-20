@@ -42,13 +42,15 @@ pub fn synthesize_d_prepass(
     ptx.push_str(".address_size 64\n\n");
 
     // ── Entry signature ──────────────────────────────────────────────────
+    // `batch` is recovered from %ctaid.z (grid dim z) and `heads` is read for
+    // the [B, H, S] row-index flattening below — no separate `batch` param
+    // is needed because the grid-z dimension determines that index at launch.
     ptx.push_str(".visible .entry tier_b2_d_prepass(\n");
     ptx.push_str("    .param .u64 d_o_ptr,\n");
     ptx.push_str("    .param .u64 o_ptr,\n");
     ptx.push_str("    .param .u64 d_out_ptr,\n");
     ptx.push_str("    .param .u32 seq_len,\n");
-    ptx.push_str("    .param .u32 heads,\n");
-    ptx.push_str("    .param .u32 batch\n");
+    ptx.push_str("    .param .u32 heads\n");
     ptx.push_str(")\n");
     ptx.push_str(".maxntid 32, 1, 1\n");
     ptx.push_str("{\n");
@@ -93,6 +95,12 @@ pub fn synthesize_d_prepass(
 
     // ── Flat row index in [B, H, S] layout ──────────────────────────────
     // row_index = (batch_idx * heads + head) * seq_len + row_global
+    //
+    // u32 range: at the largest canonical config (batch=8, heads=32, seq=8192)
+    // the max row_index is (8*32 + 31) * 8192 + 8191 ≈ 2.1M, well below 2^32.
+    // The downstream `mul.wide.u32 %offset_64, %row_index, hd*2` widens to u64
+    // before any byte-offset arithmetic, so overflow risk is bounded to the
+    // u32 intermediate above (and confirmed safe).
     ptx.push_str("    mul.lo.u32 %row_index, %batch_idx, %heads_r;\n");
     ptx.push_str("    add.u32    %row_index, %row_index, %head;\n");
     ptx.push_str("    mul.lo.u32 %row_index, %row_index, %seq_len_r;\n");
