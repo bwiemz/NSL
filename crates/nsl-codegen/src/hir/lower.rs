@@ -444,6 +444,141 @@ fn next_port_layer_index(module: &HirModule, prefix: &str) -> usize {
     max_seen + 1
 }
 
+/// M57.1 wire-array mini §3.2: fused emitter for a single v1 MLP layer.
+/// Emits acc_l<i> + relu_l<i> WireArrays at module scope, generate-for
+/// bodies driving bias-as-seed ripple + final-column ReLU.
+///
+/// **W3 scope (this task)**: declarations only — `Port::Input(x_l<i>)`,
+/// `LocalParam`s (`W<i>_<k>_<o>`, `b<i>_<o>`), `HirNode::WireArray(acc_l<i>)`,
+/// `HirNode::WireArray(relu_l<i>)`. The generate-for ripple body,
+/// final-column relu, tap outputs, and `is_final_layer` output port all
+/// land in subsequent W-tasks (W4 = AssignWireArrayElement body; W5 =
+/// full multi-layer dispatch).
+///
+/// Inputs:
+/// - `matmul`: the `KirOp::Matmul` for this layer.
+/// - `eltadd`: optional `KirOp::ElementwiseAdd` (bias). When `None`, no
+///   bias LocalParams are emitted; the accumulator will seed from zero in
+///   W4 (defensive path not exercised by v1 MLP).
+/// - `relu`: the `KirOp::Relu` for this layer (used in W4/W5 for the
+///   final-column max0; in W3 only consumed for type-checking).
+/// - `prev_relu_array_name`: when `Some`, this is layer i > 1 — reads
+///   from the previous layer's relu WireArray instead of declaring
+///   `Port::Input`. When `None`, declares `Port::Input("x_l<i>", …)`.
+/// - `layer_idx`: 1-based layer index for naming.
+/// - `is_final_layer`: when true, future tasks will declare
+///   `Port::Output("out")`. In W3 it is stored only for the signature
+///   contract.
+/// - `module`: HirModule to mutate.
+//
+// W3 lands the scaffold; production dispatch from `KirToHirPass::lower` is
+// wired in W5 (multi-layer dispatch). Allow dead_code until then so the
+// scaffold compiles clippy-clean.
+#[allow(dead_code)]
+pub(crate) fn lower_v1_mlp_single_layer(
+    matmul: &KirOp,
+    eltadd: Option<&KirOp>,
+    relu: &KirOp,
+    prev_relu_array_name: Option<&str>,
+    layer_idx: usize,
+    is_final_layer: bool,
+    module: &mut HirModule,
+) -> Result<(), FpgaLoweringError> {
+    use crate::hir::module::HirNode;
+    use crate::hir::nodes::{LocalParam, Port, WireArray};
+
+    // ── Extract Matmul shapes + dtypes ─────────────────────────────────
+    let (a_dtype, b_dtype, out_dtype, a_shape, b_shape) = match matmul {
+        KirOp::Matmul {
+            a_dtype,
+            b_dtype,
+            out_dtype,
+            a_shape,
+            b_shape,
+            ..
+        } => (
+            a_dtype.clone(),
+            b_dtype.clone(),
+            out_dtype.clone(),
+            *a_shape,
+            *b_shape,
+        ),
+        _ => unreachable!("lower_v1_mlp_single_layer called with non-Matmul matmul"),
+    };
+
+    // Type-check relu (W3 scope: just confirm it is a Relu op; the Max0
+    // body lands in W4).
+    if !matches!(relu, KirOp::Relu { .. }) {
+        unreachable!("lower_v1_mlp_single_layer called with non-Relu relu");
+    }
+
+    let k_dim = a_shape[1];
+    let n_outputs = b_shape[1];
+    assert_eq!(
+        a_shape[1], b_shape[0],
+        "Matmul inner dimensions must match"
+    );
+
+    let a_width = kir_dtype_width(a_dtype);
+    let b_width = kir_dtype_width(b_dtype);
+    let acc_width = kir_dtype_width(out_dtype);
+
+    let has_bias = eltadd.is_some();
+    let x_port_name = format!("x_l{}", layer_idx);
+    let w_lp_prefix = format!("W{}", layer_idx);
+    let b_lp_prefix = format!("b{}", layer_idx);
+    let acc_array = format!("acc_l{}", layer_idx);
+    let relu_array = format!("relu_l{}", layer_idx);
+
+    // ── Layer 1: declare Port::Input(x_l1). Layers 2+: skip (read from
+    //    prev_relu_array_name in W5). ────────────────────────────────────
+    if prev_relu_array_name.is_none() {
+        module.add_port(Port::input(&x_port_name, k_dim * a_width));
+    }
+
+    // ── LocalParams: W<i>_<k>_<o> ──────────────────────────────────────
+    for o in 0..n_outputs {
+        for k in 0..k_dim {
+            module.add_local_param(LocalParam::new(
+                format!("{}_{}_{}", w_lp_prefix, k, o),
+                b_width,
+                0,
+            ));
+        }
+    }
+
+    // ── LocalParams: b<i>_<o> (only when bias is present) ─────────────
+    if has_bias {
+        for o in 0..n_outputs {
+            module.add_local_param(LocalParam::new(
+                format!("{}_{}", b_lp_prefix, o),
+                acc_width,
+                0,
+            ));
+        }
+    }
+
+    // ── WireArrays: acc_l<i> [n_outputs][k_dim+1] + relu_l<i> [n_outputs] ─
+    module.add_node(HirNode::WireArray(WireArray {
+        name: acc_array,
+        dims: vec![n_outputs, k_dim + 1],
+        width: acc_width,
+    }))?;
+
+    module.add_node(HirNode::WireArray(WireArray {
+        name: relu_array,
+        dims: vec![n_outputs],
+        width: acc_width,
+    }))?;
+
+    // W3 scope: declarations only. Generate-for body + relu final column
+    // + tap outputs + final-layer Port::Output all land in W4/W5.
+    let _ = is_final_layer;
+    let _ = prev_relu_array_name;
+
+    Ok(())
+}
+
 /// Map KirType to bit-width for FPGA HIR construction.
 /// Panics on types not supported in v1 FPGA target.
 pub(crate) fn kir_dtype_width(dtype: KirType) -> usize {
@@ -493,5 +628,110 @@ pub(crate) fn kir_op_kind_name(op: &KirOp) -> &'static str {
         KirOp::Matmul { .. } => "Matmul",
         KirOp::ElementwiseAdd { .. } => "ElementwiseAdd",
         KirOp::Relu { .. } => "Relu",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hir::module::HirNode;
+    use crate::hir::nodes::{Port, WireArray};
+
+    /// M57.1 wire-array mini §3.2 / Task W3: smallest single-layer case
+    /// (layer 1, with bias). Verifies the scaffold emits the expected
+    /// Port::Input + LocalParams + WireArray declarations.
+    #[test]
+    fn lower_v1_mlp_single_layer_w3_scaffold_emits_decls() {
+        // Smallest possible MLP layer: 2 inputs → 3 outputs, i8 × i8 → i32.
+        let matmul = KirOp::Matmul {
+            a: 0, b: 1, out: 2,
+            a_dtype: KirType::I8, b_dtype: KirType::I8, out_dtype: KirType::I32,
+            a_shape: [1, 2], b_shape: [2, 3],
+        };
+        let eltadd = KirOp::ElementwiseAdd {
+            a: 2, b: 3, out: 4,
+            dtype: KirType::I32, shape: [3],
+        };
+        let relu = KirOp::Relu {
+            a: 4, out: 5,
+            dtype: KirType::I32, shape: [3],
+        };
+
+        let mut module = HirModule::new("test");
+        lower_v1_mlp_single_layer(
+            &matmul, Some(&eltadd), &relu,
+            None, 1, true, &mut module,
+        ).expect("single-layer scaffold lowers");
+
+        // Verify the two WireArrays were declared.
+        let wire_arrays: Vec<&WireArray> = module.nodes().iter().filter_map(|n| match n {
+            HirNode::WireArray(wa) => Some(wa),
+            _ => None,
+        }).collect();
+        assert_eq!(wire_arrays.len(), 2, "should declare acc_l1 + relu_l1");
+        assert_eq!(wire_arrays[0].name, "acc_l1");
+        assert_eq!(wire_arrays[0].dims, vec![3, 3]); // n_outputs=3, k_dim+1=3
+        assert_eq!(wire_arrays[0].width, 32);
+        assert_eq!(wire_arrays[1].name, "relu_l1");
+        assert_eq!(wire_arrays[1].dims, vec![3]);
+        assert_eq!(wire_arrays[1].width, 32);
+
+        // Verify Port::Input(x_l1) declared (layer 1, prev_relu_array_name is None).
+        let inputs: Vec<&str> = module.ports.iter().filter_map(|p| match p {
+            Port::Input { name, .. } => Some(name.as_str()),
+            _ => None,
+        }).collect();
+        assert!(inputs.contains(&"x_l1"), "x_l1 Port::Input must be declared");
+
+        // LocalParams: 2*3 W + 3 b = 9
+        assert_eq!(module.local_params().len(), 9, "expected 6 W + 3 b LocalParams");
+    }
+
+    /// M57.1 wire-array mini §3.2 / Task W3: layer 2+ must NOT declare a
+    /// Port::Input — its `x` is read from the previous layer's relu
+    /// WireArray (`prev_relu_array_name`).
+    #[test]
+    fn lower_v1_mlp_single_layer_w3_layer_2_skips_port_input() {
+        // Layer 2: prev_relu_array_name is Some — no Port::Input declared.
+        let matmul = KirOp::Matmul {
+            a: 0, b: 1, out: 2,
+            a_dtype: KirType::I32, b_dtype: KirType::I8, out_dtype: KirType::I64,
+            a_shape: [1, 3], b_shape: [3, 2],
+        };
+        let eltadd = KirOp::ElementwiseAdd {
+            a: 2, b: 3, out: 4,
+            dtype: KirType::I64, shape: [2],
+        };
+        let relu = KirOp::Relu {
+            a: 4, out: 5,
+            dtype: KirType::I64, shape: [2],
+        };
+
+        let mut module = HirModule::new("test_l2");
+        lower_v1_mlp_single_layer(
+            &matmul, Some(&eltadd), &relu,
+            Some("relu_l1"), 2, true, &mut module,
+        ).expect("single-layer scaffold lowers");
+
+        // Layer 2 must NOT declare any Port::Input.
+        let inputs: Vec<&str> = module.ports.iter().filter_map(|p| match p {
+            Port::Input { name, .. } => Some(name.as_str()),
+            _ => None,
+        }).collect();
+        assert!(
+            inputs.is_empty(),
+            "layer 2 must not declare Port::Input (reads from prev_relu_array)"
+        );
+
+        // But layer 2 still declares its own LocalParams + WireArrays.
+        // 3*2 W + 2 b = 8 LocalParams.
+        assert_eq!(module.local_params().len(), 3 * 2 + 2, "3*2 W + 2 b LocalParams");
+        let wire_arrays: Vec<&WireArray> = module.nodes().iter().filter_map(|n| match n {
+            HirNode::WireArray(wa) => Some(wa),
+            _ => None,
+        }).collect();
+        assert_eq!(wire_arrays.len(), 2);
+        assert_eq!(wire_arrays[0].name, "acc_l2");
+        assert_eq!(wire_arrays[1].name, "relu_l2");
     }
 }
