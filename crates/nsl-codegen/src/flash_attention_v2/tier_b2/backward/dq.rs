@@ -37,6 +37,7 @@ pub fn synthesize_dq_kernel(
     emit_q_dO_producer_load(&mut ptx);
     emit_dq_acc_init(&mut ptx, config);
     emit_inner_loop_open(&mut ptx);
+    emit_tile_skip_predicate(&mut ptx, config);
     emit_inner_loop_body(&mut ptx, config);
     emit_inner_loop_close(&mut ptx);
     emit_outer_loop_close(&mut ptx);
@@ -88,6 +89,9 @@ fn emit_register_decls(ptx: &mut String, config: &FlashAttentionConfig) {
     ptx.push_str("    .reg .pred %p_kv_iter_more;\n");
     // Scratch registers used by matmul_mma helpers (emit_load_a/b_fragment_smem).
     ptx.push_str("    .reg .u32 %mma_addr, %mma_a_row, %mma_b_row;\n");
+    // D1 tile_skip predicate registers (causal: used; non-causal: declared but unused — ptxas tolerates).
+    ptx.push_str("    .reg .u32 %q_tile_end, %kv_tile_start;\n");
+    ptx.push_str("    .reg .pred %p_causal_active;\n");
     // SMEM extern: per SPEC AMENDMENT, size from tier_b2_dq_total_smem_bytes (incl. K-colmajor).
     let total_smem = tier_b2_dq_total_smem_bytes(config);
     ptx.push_str(&format!("    .extern .shared .align 16 .b8 shmem[{}];\n", total_smem));
@@ -188,6 +192,33 @@ fn emit_inner_loop_open(ptx: &mut String) {
     ptx.push_str("    cp.async.wait_group 0;\n");
     ptx.push_str("    bar.sync 0;\n");
     ptx.push('\n');
+}
+
+/// D1: emit tile_skip predicate per Phase 1 spec §9.2.
+///
+/// Produces `%tile_skip_predicate` (u32, 0=skip, 1=active) used by the
+/// `setp.eq + @!bra DS_SKIP_LABEL` consumer at the top of emit_inner_loop_body.
+///
+/// Spec §2.4 pin: predicate gates *consumption* (E1/F1/F2/G1), not loads.
+/// Load-skip bandwidth optimization is deferred beyond Phase 2.5.
+fn emit_tile_skip_predicate(ptx: &mut String, config: &FlashAttentionConfig) {
+    use crate::flash_attention_v2::smem_layout::{tier_b2_effective_bq, tier_b2_effective_bkv};
+    let bq = tier_b2_effective_bq(config);
+    let bkv = tier_b2_effective_bkv(config);
+    if config.causal {
+        // q_tile_end = q_iter * bq + (bq - 1)
+        // kv_tile_start = kv_iter * bkv
+        // predicate (1=active, 0=skip) = (kv_tile_start <= q_tile_end)
+        ptx.push_str("    // === D1: tile_skip predicate (causal) ===\n");
+        ptx.push_str(&format!("    mul.lo.u32 %q_tile_end, %q_iter, {bq};\n"));
+        ptx.push_str(&format!("    add.u32 %q_tile_end, %q_tile_end, {};\n", bq - 1));
+        ptx.push_str(&format!("    mul.lo.u32 %kv_tile_start, %kv_iter, {bkv};\n"));
+        ptx.push_str("    setp.le.u32 %p_causal_active, %kv_tile_start, %q_tile_end;\n");
+        ptx.push_str("    selp.u32 %tile_skip_predicate, 1, 0, %p_causal_active;\n");
+    } else {
+        ptx.push_str("    // === D1: tile_skip predicate (non-causal, always active) ===\n");
+        ptx.push_str("    mov.u32 %tile_skip_predicate, 1;\n");
+    }
 }
 
 fn emit_inner_loop_body(ptx: &mut String, config: &FlashAttentionConfig) {
@@ -732,5 +763,30 @@ mod tests {
         let placeholder_count = ptx.matches("bra DQ_KV_ITER_DONE;  // placeholder").count();
         assert_eq!(placeholder_count, 0,
             "placeholder unconditional inner-loop exit must be removed");
+    }
+
+    #[test]
+    fn d1_tile_skip_predicate_set_by_real_derivation_not_placeholder() {
+        let mut cfg = canonical_cfg();
+        cfg.causal = true;
+        let ptx = synthesize_dq_kernel(&cfg).unwrap();
+        // Real predicate derivation: q_tile_end + kv_tile_start computed
+        assert!(ptx.contains("%kv_tile_start"), "expected kv_tile_start register");
+        assert!(ptx.contains("%q_tile_end"), "expected q_tile_end register");
+        // For causal, predicate = kv_tile_start <= q_tile_end
+        assert!(ptx.contains("setp.le.u32 %p_causal_active"),
+            "expected setp.le for causal tile_skip");
+        // %tile_skip_predicate must be materialized (selp.u32 ..., 1, 0, %p_causal_active)
+        assert!(ptx.contains("selp.u32 %tile_skip_predicate"),
+            "expected selp to materialize predicate as u32");
+    }
+
+    #[test]
+    fn d1_non_causal_predicate_is_always_active() {
+        let mut cfg = canonical_cfg();
+        cfg.causal = false;
+        let ptx = synthesize_dq_kernel(&cfg).unwrap();
+        assert!(ptx.contains("mov.u32 %tile_skip_predicate, 1"),
+            "expected non-causal predicate = constant 1");
     }
 }
