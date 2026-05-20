@@ -3,15 +3,16 @@ source: crates/nsl-codegen/tests/verilog_emission_snapshots.rs
 expression: skeleton
 ---
 module tiny_mlp(
-
+    input  wire signed [6271:0] x_l1,
+    input  wire signed [4095:0] x_l2
 );
 
 
     generate for (genvar _gv2 = 0; _gv2 < 128; _gv2++) begin : gen_2
         generate for (genvar _gv1 = 0; _gv1 < 784; _gv1++) begin : gen_1
-            assign _w1 = $signed(__matmul_a) * $signed(__matmul_b);
+            assign _w1 = $signed(x_l1) * $signed(W1);
             assign _w2 = {{16{_w1[15]}}, _w1};
-            assign _w3 = $signed(__matmul_acc_prev) + $signed(_w2);
+            assign _w3 = $signed(__matmul_acc_prev_LEGACY) + $signed(_w2);
         end endgenerate
     end endgenerate
     generate for (genvar _gv3 = 0; _gv3 < 128; _gv3++) begin : gen_3
@@ -22,8 +23,8 @@ module tiny_mlp(
     end endgenerate
     generate for (genvar _gv6 = 0; _gv6 < 10; _gv6++) begin : gen_6
         generate for (genvar _gv5 = 0; _gv5 < 128; _gv5++) begin : gen_5
-            assign _w6 = $signed(__matmul_a) * $signed(__matmul_b);
-            assign _w7 = $signed(__matmul_acc_prev) + $signed(_w6);
+            assign _w6 = $signed(x_l2) * $signed(W2);
+            assign _w7 = $signed(__matmul_acc_prev_LEGACY) + $signed(_w6);
         end endgenerate
     end endgenerate
     generate for (genvar _gv7 = 0; _gv7 < 10; _gv7++) begin : gen_7

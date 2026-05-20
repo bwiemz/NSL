@@ -4,13 +4,28 @@ expression: structural_summary(&module)
 ---
 module: tiny_mlp
 test_taps: true
-ports: 0
+ports: 2
+  Port::Input x_l1 width=6272
+  Port::Input x_l2 width=4096
+local_params: 101770
+  LocalParam W1_0_0 width=8
+  …(prefix="W1", 100350 elided)…
+  LocalParam W1_783_127 width=8
+  LocalParam b1_0 width=32
+  …(prefix="b1", 126 elided)…
+  LocalParam b1_127 width=32
+  LocalParam W2_0_0 width=32
+  …(prefix="W2", 1278 elided)…
+  LocalParam W2_127_9 width=32
+  LocalParam b2_0 width=64
+  …(prefix="b2", 8 elided)…
+  LocalParam b2_9 width=64
 nodes: 6
 [0] GenerateFor lo=0 hi=128 body={
   [0] GenerateFor lo=0 hi=784 body={
-    [0] Mul a_width=8 b_width=8 out_width=16 a="Port(__matmul_a)" b="Port(__matmul_b)"
+    [0] Mul a_width=8 b_width=8 out_width=16 a="Port(x_l1)" b="LocalParam(W1)"
     [1] SignExtend src_width=16 dst_width=32
-    [2] Add width=32 a="Port(__matmul_acc_prev)" b="Wire(<id>)"
+    [2] Add width=32 a="Port(__matmul_acc_prev_LEGACY)" b="Wire(<id>)"
   }
 }
 [1] GenerateFor lo=0 hi=128 body={
@@ -21,8 +36,8 @@ nodes: 6
 }
 [3] GenerateFor lo=0 hi=10 body={
   [0] GenerateFor lo=0 hi=128 body={
-    [0] Mul a_width=32 b_width=32 out_width=64 a="Port(__matmul_a)" b="Port(__matmul_b)"
-    [1] Add width=64 a="Port(__matmul_acc_prev)" b="Wire(<id>)"
+    [0] Mul a_width=32 b_width=32 out_width=64 a="Port(x_l2)" b="LocalParam(W2)"
+    [1] Add width=64 a="Port(__matmul_acc_prev_LEGACY)" b="Wire(<id>)"
   }
 }
 [4] GenerateFor lo=0 hi=10 body={

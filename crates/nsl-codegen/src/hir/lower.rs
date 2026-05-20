@@ -104,7 +104,7 @@ impl KirToHirPass {
     ) -> Result<(), FpgaLoweringError> {
         use crate::hir::control::GenerateFor;
         use crate::hir::module::HirNode;
-        use crate::hir::nodes::{Add, Mul, SignExtend};
+        use crate::hir::nodes::{Add, LocalParam, Mul, Port, SignExtend};
         use crate::hir::signals::SignalRef;
 
         let (a_dtype, b_dtype, out_dtype, a_shape, b_shape) = match op {
@@ -131,16 +131,59 @@ impl KirToHirPass {
         let acc_width = kir_dtype_width(out_dtype);
         let prod_width = a_width + b_width;
 
-        // Outer GenerateFor: iterate output dimension
-        let mut outer_body: Vec<HirNode> = Vec::new();
+        // ── M57.1 §3.4: Declare ports + LocalParams inline ──────────────────
+        // Per the no-dangling-references invariant, every SignalRef::Port and
+        // SignalRef::LocalParam emitted below must be backed by a declaration.
+        //
+        // x is the only true Port::Input (the stimulus passed by the testbench);
+        // W and b are LocalParams (values baked at CLI time by Task 4.1's
+        // bake_fixture_into_localparams).
+        //
+        // Layer-disambiguating suffix: scan existing LocalParams for unique
+        // `W<n>_` prefixes — robust to layers having different (k_dim, n_outputs)
+        // pairs (e.g. MLP 784→128→10). Picking by max-existing-index keeps the
+        // counter monotonic regardless of how many elements each prior layer
+        // contributed. Alternative would be &mut state on the pass; the
+        // count-derived index is implementation-light for v1.
+        let layer_idx = next_layer_index(module);
+        let x_port_name = format!("x_l{}", layer_idx);
+        let w_lp_prefix = format!("W{}", layer_idx);
+        let b_lp_prefix = format!("b{}", layer_idx);
 
-        // Inner GenerateFor: MAC chain over reduction dimension
+        // Declare Port::Input for the layer input. Width is k_dim * a_width —
+        // a single packed bus carrying all k input elements. Per-element
+        // indexing is resolved by the Verilog emitter (PR 3) using genvars.
+        module.add_port(Port::input(&x_port_name, k_dim * a_width));
+
+        // Declare LocalParam for each W element (k_dim × n_outputs values).
+        // Value is 0 placeholder; baked to fixture-derived value at CLI time
+        // (Task 4.1). Width = b_width (matches the operand of Mul below).
+        for o in 0..n_outputs {
+            for k in 0..k_dim {
+                let elem_name = format!("{}_{}_{}", w_lp_prefix, k, o);
+                module.add_local_param(LocalParam::new(elem_name, b_width, 0));
+            }
+        }
+        // Declare LocalParam for each bias element (n_outputs values).
+        // Width = acc_width — bias is added at accumulator precision in the
+        // bias-as-seed ripple chain (Task 3.4).
+        for o in 0..n_outputs {
+            let elem_name = format!("{}_{}", b_lp_prefix, o);
+            module.add_local_param(LocalParam::new(elem_name, acc_width, 0));
+        }
+
+        // ── Build the MAC body ──────────────────────────────────────────────
+        // The inner generate-for body emits one structural Mul + (optional)
+        // SignExtend + Add. The Verilog emitter resolves per-iteration indexing
+        // (`x_l<i>[k]`, `W<i>_<k>_<o>`) when it unrolls the genvars. SignalRef
+        // here uses the bare prefix; the emitter substitutes the indices.
+        let mut outer_body: Vec<HirNode> = Vec::new();
         let mut inner_body: Vec<HirNode> = Vec::new();
 
-        // Mul: x[i] * W[i,o] → prod_i  (width: a_width × b_width → prod_width)
+        // Mul: x_l<i>[k] * W<i>_<k>_<o> → prod  (a_width × b_width → prod_width)
         let mul = Mul::new(
-            SignalRef::port("__matmul_a"),
-            SignalRef::port("__matmul_b"),
+            SignalRef::port(&x_port_name),
+            SignalRef::local_param(&w_lp_prefix),
             a_width,
             b_width,
             prod_width,
@@ -148,7 +191,7 @@ impl KirToHirPass {
         let prod_id = mul.out;
         inner_body.push(HirNode::Mul(mul));
 
-        // SignExtend prod_i → acc_width if needed (3-node MAC chain when prod < acc)
+        // SignExtend prod → acc_width if needed (3-node MAC chain when prod < acc)
         let add_input = if prod_width < acc_width {
             let se = SignExtend::new(SignalRef::wire(prod_id), prod_width, acc_width);
             let se_id = se.dst;
@@ -159,9 +202,12 @@ impl KirToHirPass {
             SignalRef::wire(prod_id)
         };
 
-        // Add: acc_prev + extended_product → acc_next  (width: acc_width)
+        // TEMPORARY (one task only): keep the M57-shape accumulator placeholder.
+        // Task 3.4 replaces this with the bias-as-seed ripple chain — the very
+        // first MAC iteration seeds the accumulator from `b<i>_<o>` instead of
+        // referencing an external (and currently undeclared) acc_prev port.
         let add = Add::new(
-            SignalRef::port("__matmul_acc_prev"),
+            SignalRef::port("__matmul_acc_prev_LEGACY"),
             add_input,
             acc_width,
         );
@@ -239,6 +285,39 @@ impl KirToHirPass {
 
         Ok(())
     }
+}
+
+/// Derive the next 1-based layer index from already-declared LocalParams.
+///
+/// Scans `module.local_params` for names matching `W<n>_…` and returns the
+/// smallest 1-based index greater than the largest `<n>` seen (or 1 when no
+/// matching LocalParams exist).
+///
+/// This is robust to layers having heterogeneous (k_dim × n_outputs) shapes
+/// (e.g. MLP 784→128→10), unlike the alternative of dividing the W count by
+/// a fixed per-layer element count. It also tolerates non-W LocalParams
+/// (e.g. biases) being interleaved.
+fn next_layer_index(module: &HirModule) -> usize {
+    let max_seen = module
+        .local_params
+        .iter()
+        .filter_map(|lp| {
+            // Match prefix exactly: "W" then ASCII digits then "_". Rejects
+            // e.g. "Weight…" (would parse `eight…` as non-digit and bail).
+            let rest = lp.name.strip_prefix('W')?;
+            let (digits, tail) = rest
+                .char_indices()
+                .find(|(_, c)| !c.is_ascii_digit())
+                .map(|(i, _)| rest.split_at(i))
+                .unwrap_or((rest, ""));
+            if !tail.starts_with('_') || digits.is_empty() {
+                return None;
+            }
+            digits.parse::<usize>().ok()
+        })
+        .max()
+        .unwrap_or(0);
+    max_seen + 1
 }
 
 /// Map KirType to bit-width for FPGA HIR construction.

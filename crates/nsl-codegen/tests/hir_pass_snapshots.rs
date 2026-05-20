@@ -24,16 +24,92 @@ fn kir_with_ops(name: &str, ops: Vec<KirOp>) -> KernelIR {
 /// Produce a stable structural summary of an HirModule for snapshot testing.
 /// Strips non-deterministic WireId/GenvarId/RegisterId values; keeps node
 /// kinds, widths, and port names which are the auditable content.
+///
+/// M57.1 §3.4 (Task 3.2): summary also enumerates declared Port::Input names +
+/// LocalParam names so the no-dangling-references invariant is auditable in
+/// the snapshot. LocalParams are listed by name+width only (the baked `value`
+/// field is Task 4.1's responsibility and lands as a separate snapshot diff).
 fn structural_summary(module: &HirModule) -> String {
+    use nsl_codegen::hir::Port;
     let mut out = String::new();
     out.push_str(&format!("module: {}\n", module.name));
     out.push_str(&format!("test_taps: {}\n", module.test_taps));
     out.push_str(&format!("ports: {}\n", module.ports.len()));
+    for port in &module.ports {
+        match port {
+            Port::Input { name, width } => {
+                out.push_str(&format!("  Port::Input {name} width={width}\n"));
+            }
+            Port::Output { name, width, .. } => {
+                out.push_str(&format!("  Port::Output {name} width={width}\n"));
+            }
+        }
+    }
+    // Group LocalParams by leading-alpha prefix (e.g. "W1_…" and "b1_…") and
+    // collapse each group to first + last element so v1 matmul snapshots with
+    // ~100k weight elements remain human-auditable. Group cardinality (the
+    // primary correctness signal) is still asserted exactly.
+    out.push_str(&format!("local_params: {}\n", module.local_params.len()));
+    summarize_local_params(&mut out, &module.local_params);
     out.push_str(&format!("nodes: {}\n", module.nodes().len()));
     for (i, node) in module.nodes().iter().enumerate() {
         summarize_node(&mut out, node, i, 0);
     }
     out
+}
+
+/// Group LocalParams by the prefix that precedes the first `_<digit>` segment
+/// (e.g. `W1_0_0` and `W1_127_9` both group as `W1`; `b1_0` and `b1_9` as
+/// `b1`). Within each contiguous run of same-prefix entries, emit the first +
+/// last element only with an ellipsis showing the omitted middle count.
+fn summarize_local_params(
+    out: &mut String,
+    lps: &[nsl_codegen::hir::LocalParam],
+) {
+    fn prefix(name: &str) -> &str {
+        // Find the first `_` followed by an ASCII digit; everything before it
+        // is the prefix. Anchoring on `_<digit>` lets `W1_0_0` group as `W1`
+        // and `b1_0` group as `b1` without conflating with hypothetical names
+        // like `Weights_…` (which would have no leading `_<digit>`).
+        let bytes = name.as_bytes();
+        let mut i = 0;
+        while i + 1 < bytes.len() {
+            if bytes[i] == b'_' && bytes[i + 1].is_ascii_digit() {
+                return &name[..i];
+            }
+            i += 1;
+        }
+        name
+    }
+
+    let mut i = 0;
+    while i < lps.len() {
+        let p = prefix(&lps[i].name);
+        let mut j = i + 1;
+        while j < lps.len() && prefix(&lps[j].name) == p {
+            j += 1;
+        }
+        let run = &lps[i..j];
+        if run.len() == 1 {
+            out.push_str(&format!(
+                "  LocalParam {} width={}\n",
+                run[0].name, run[0].width
+            ));
+        } else {
+            out.push_str(&format!(
+                "  LocalParam {} width={}\n",
+                run[0].name, run[0].width
+            ));
+            if run.len() > 2 {
+                out.push_str(&format!("  …(prefix={p:?}, {} elided)…\n", run.len() - 2));
+            }
+            out.push_str(&format!(
+                "  LocalParam {} width={}\n",
+                run[run.len() - 1].name, run[run.len() - 1].width
+            ));
+        }
+        i = j;
+    }
 }
 
 fn summarize_node(out: &mut String, node: &HirNode, idx: usize, depth: usize) {
