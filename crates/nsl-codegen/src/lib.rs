@@ -156,6 +156,7 @@ pub use wggo_overrides::{
 pub mod fpga_error;
 pub mod hir;
 pub mod backend_verilog;
+pub mod kernel_lower_fpga;  // M57.1 §3.3
 pub mod wrga;
 pub mod matmul_mma;
 pub mod wrga_adapter_init;
