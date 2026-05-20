@@ -4,7 +4,15 @@ expression: skeleton
 ---
 module tiny_mlp(
     input  wire signed [6271:0] x_l1,
-    input  wire signed [4095:0] x_l2
+    input  wire signed [4095:0] eltadd_a_l1,
+    input  wire signed [4095:0] eltadd_b_l1,
+    input  wire signed [4095:0] relu_in_l1,
+    input  wire signed [4095:0] x_l2,
+    input  wire signed [639:0] eltadd_a_l2,
+    input  wire signed [639:0] eltadd_b_l2,
+    input  wire signed [639:0] relu_in_l2,
+    output wire signed [4095:0] relu_out_l1,
+    output wire signed [639:0] relu_out_l2
 );
 
 
@@ -16,10 +24,10 @@ module tiny_mlp(
         end endgenerate
     end endgenerate
     generate for (genvar _gv3 = 0; _gv3 < 128; _gv3++) begin : gen_3
-        assign _w4 = $signed(__eltadd_a) + $signed(__eltadd_b);
+        assign _w4 = $signed(eltadd_a_l1) + $signed(eltadd_b_l1);
     end endgenerate
     generate for (genvar _gv4 = 0; _gv4 < 128; _gv4++) begin : gen_4
-        assign _w5 = ($signed(__relu_in) > 0) ? __relu_in : '0;
+        assign _w5 = ($signed(relu_in_l1) > 0) ? relu_in_l1 : '0;
     end endgenerate
     generate for (genvar _gv6 = 0; _gv6 < 10; _gv6++) begin : gen_6
         generate for (genvar _gv5 = 0; _gv5 < 128; _gv5++) begin : gen_5
@@ -28,9 +36,11 @@ module tiny_mlp(
         end endgenerate
     end endgenerate
     generate for (genvar _gv7 = 0; _gv7 < 10; _gv7++) begin : gen_7
-        assign _w8 = $signed(__eltadd_a) + $signed(__eltadd_b);
+        assign _w8 = $signed(eltadd_a_l2) + $signed(eltadd_b_l2);
     end endgenerate
     generate for (genvar _gv8 = 0; _gv8 < 10; _gv8++) begin : gen_8
-        assign _w9 = ($signed(__relu_in) > 0) ? __relu_in : '0;
+        assign _w9 = ($signed(relu_in_l2) > 0) ? relu_in_l2 : '0;
     end endgenerate
+    assign relu_out_l1 = _w5;
+    assign relu_out_l2 = _w9;
 endmodule

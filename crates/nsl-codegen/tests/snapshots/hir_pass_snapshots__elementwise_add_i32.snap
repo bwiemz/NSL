@@ -4,9 +4,11 @@ expression: structural_summary(&module)
 ---
 module: bias_add_test
 test_taps: true
-ports: 0
+ports: 2
+  Port::Input eltadd_a_l1 width=4096
+  Port::Input eltadd_b_l1 width=4096
 local_params: 0
 nodes: 1
 [0] GenerateFor lo=0 hi=128 body={
-  [0] Add width=32 a="Port(__eltadd_a)" b="Port(__eltadd_b)"
+  [0] Add width=32 a="Port(eltadd_a_l1)" b="Port(eltadd_b_l1)"
 }

@@ -235,7 +235,7 @@ impl KirToHirPass {
     ) -> Result<(), FpgaLoweringError> {
         use crate::hir::control::GenerateFor;
         use crate::hir::module::HirNode;
-        use crate::hir::nodes::Add;
+        use crate::hir::nodes::{Add, Port};
         use crate::hir::signals::SignalRef;
 
         let (dtype, shape) = match op {
@@ -246,13 +246,25 @@ impl KirToHirPass {
         let width = kir_dtype_width(dtype);
         let n = shape[0];
 
-        // GenerateFor over output dimension; body is one Add node.
-        // Port names follow the __<op>_<operand> convention (consistent with
-        // __matmul_a/__matmul_b). PR 3's HIR→Verilog lowering will resolve
-        // these placeholder Ports to actual module ports / wire indices.
+        // M57.1 §3.4: declare Port::Input for both operands inline so the
+        // no-dangling-references invariant holds on standalone ElementwiseAdd
+        // (v1 MLP path absorbs the matmul+bias pair into a fold at Task 3.4;
+        // until then Task 3.1's wrapper still re-emits the bias-add through
+        // this function — so the layer-disambiguation must agree between the
+        // two invocation contexts).
+        //
+        // Width is n * width — single packed bus carrying all n elements. The
+        // Verilog emitter (PR 3) resolves per-element indexing via the
+        // generate-for genvar.
+        let layer_idx = next_port_layer_index(module, "eltadd_a_l");
+        let a_name = format!("eltadd_a_l{}", layer_idx);
+        let b_name = format!("eltadd_b_l{}", layer_idx);
+        module.add_port(Port::input(&a_name, n * width));
+        module.add_port(Port::input(&b_name, n * width));
+
         let body = vec![HirNode::Add(Add::new(
-            SignalRef::port("__eltadd_a"),
-            SignalRef::port("__eltadd_b"),
+            SignalRef::port(&a_name),
+            SignalRef::port(&b_name),
             width,
         ))];
 
@@ -268,7 +280,7 @@ impl KirToHirPass {
     ) -> Result<(), FpgaLoweringError> {
         use crate::hir::control::GenerateFor;
         use crate::hir::module::HirNode;
-        use crate::hir::nodes::Max0;
+        use crate::hir::nodes::{Max0, Port};
         use crate::hir::signals::SignalRef;
 
         let (dtype, shape) = match op {
@@ -279,9 +291,34 @@ impl KirToHirPass {
         let width = kir_dtype_width(dtype);
         let n = shape[0];
 
-        let body = vec![HirNode::Max0(Max0::new(SignalRef::port("__relu_in"), width))];
+        // M57.1 §3.4: declare Port::Input for the ReLU input + Port::Output
+        // for the layer's result. The output port doubles as the layer tap
+        // for parity testing (M57 §2.6.2).
+        //
+        // The Max0 node's own `out` WireId is the driver of the output port —
+        // no separate Wire node is needed (Mul/Add/Max0/SignExtend each carry
+        // their own implicit output WireId; only stateful registers and
+        // explicitly-named wires use HirNode::Wire). Construct the Max0 first
+        // so we can hand its `out` WireId to Port::output as the driver.
+        let layer_idx = next_port_layer_index(module, "relu_in_l");
+        let in_name = format!("relu_in_l{}", layer_idx);
+        let out_name = format!("relu_out_l{}", layer_idx);
+
+        module.add_port(Port::input(&in_name, n * width));
+
+        let max0 = Max0::new(SignalRef::port(&in_name), width);
+        let max0_out_id = max0.out;
+
+        let body = vec![HirNode::Max0(max0)];
 
         module.add_node(HirNode::GenerateFor(GenerateFor::new(0, n as i64, body)))?;
+
+        // Output port driven by the Max0 wire (tap-enabled per M57 §2.6.2).
+        module.add_port(Port::output(
+            &out_name,
+            n * width,
+            SignalRef::wire(max0_out_id),
+        ));
 
         Ok(())
     }
@@ -314,6 +351,37 @@ fn next_layer_index(module: &HirModule) -> usize {
                 return None;
             }
             digits.parse::<usize>().ok()
+        })
+        .max()
+        .unwrap_or(0);
+    max_seen + 1
+}
+
+/// Derive the next 1-based layer index from already-declared ports whose name
+/// starts with `prefix` followed by ASCII digits (and nothing more, OR digits
+/// followed by an underscore — but in v1 the eltadd/relu port-naming scheme
+/// terminates the layer-index at end-of-name, e.g. `eltadd_a_l1`, `relu_in_l2`).
+///
+/// Counterpart to `next_layer_index` (which scans LocalParams for matmul's
+/// `W<n>_` prefix). `lower_elementwise_add` and `lower_relu` declare ports —
+/// not LocalParams — so they need port-scanning disambiguation. Each lowering
+/// function picks its own anchor prefix (`eltadd_a_l` / `relu_in_l`) which
+/// keeps eltadd and relu indices independent (both can be "l1" without
+/// colliding).
+fn next_port_layer_index(module: &HirModule, prefix: &str) -> usize {
+    use crate::hir::nodes::Port;
+    let max_seen = module
+        .ports
+        .iter()
+        .filter_map(|p| {
+            let name = match p {
+                Port::Input { name, .. } | Port::Output { name, .. } => name,
+            };
+            let rest = name.strip_prefix(prefix)?;
+            if rest.is_empty() || !rest.chars().all(|c| c.is_ascii_digit()) {
+                return None;
+            }
+            rest.parse::<usize>().ok()
         })
         .max()
         .unwrap_or(0);
