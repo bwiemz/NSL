@@ -677,4 +677,112 @@ model TinyMlp:
         assert!(matches!(ops[4], KirOp::ElementwiseAdd { .. }));
         assert!(matches!(ops[5], KirOp::Relu { .. }));
     }
+
+    #[test]
+    fn missing_bias_layer_rejects() {
+        // M57.1 §3.3: model fields must include both W<i> and b<i> per layer.
+        // A model with only W<i> (no bias) must error with UnsupportedV1Shape.
+        let src = "\
+model NoBias:
+    W1: Tensor<[784, 128], i8>
+
+    fn forward(self, x: Tensor<[1, 784], i8>) -> Tensor<[1, 128], i32>:
+        return relu(matmul(x, self.W1))
+";
+        let (ast, interner) = parse_source(src);
+        let err = lower(&ast, &interner).expect_err("missing bias should fail");
+        assert!(matches!(err, FpgaLoweringError::UnsupportedV1Shape { .. }));
+    }
+
+    #[test]
+    fn dtype_aliases_resolve_in_v1_mlp() {
+        // M57.1 cross-test: the v1 MLP source uses i8/i32/i64 short-form (Phase 1 §3.1).
+        // Confirms parse + lower pipeline accepts the short-form in tensor type
+        // annotations and produces the expected 3 KIR ops for a 1-layer MLP.
+        let src = "\
+model TinyMlp:
+    W1: Tensor<[784, 128], i8>
+    b1: Tensor<[128], i32>
+
+    fn forward(self, x: Tensor<[1, 784], i8>) -> Tensor<[1, 128], i32>:
+        return relu(matmul(x, self.W1) + self.b1)
+";
+        let (ast, interner) = parse_source(src);
+        let kir = lower(&ast, &interner).expect("v1 MLP w/ i8 aliases must lower");
+        let n_ops = kir.ops().count();
+        assert_eq!(
+            n_ops, 3,
+            "1-layer MLP = 3 KIR ops (Matmul + ElementwiseAdd + Relu)"
+        );
+    }
+
+    #[test]
+    fn layer_threading_relu_output_feeds_next_matmul_input() {
+        // M57.1 §3.3: per-layer threading invariant — layer i's Relu output var
+        // must be exactly layer i+1's Matmul input var (SSA continuity).
+        let src = "\
+model TwoLayer:
+    W1: Tensor<[10, 20], i8>
+    b1: Tensor<[20], i32>
+    W2: Tensor<[20, 5], i32>
+    b2: Tensor<[5], i64>
+
+    fn forward(self, x: Tensor<[1, 10], i8>) -> Tensor<[1, 5], i64>:
+        let h = relu(matmul(x, self.W1) + self.b1)
+        return relu(matmul(h, self.W2) + self.b2)
+";
+        let (ast, interner) = parse_source(src);
+        let kir = lower(&ast, &interner).expect("two-layer MLP must lower");
+
+        // Walk KIR ops in order. Find layer-1 Relu output (ops[2].out) and
+        // assert it equals layer-2 Matmul input (ops[3].a).
+        let ops: Vec<&KirOp> = kir.ops().collect();
+        assert_eq!(ops.len(), 6, "2 layers x 3 ops = 6 KIR ops total");
+
+        let layer1_relu_out = match ops[2] {
+            KirOp::Relu { out, .. } => *out,
+            other => panic!("ops[2] should be Relu, got {other:?}"),
+        };
+        let layer2_matmul_in = match ops[3] {
+            KirOp::Matmul { a, .. } => *a,
+            other => panic!("ops[3] should be Matmul, got {other:?}"),
+        };
+        assert_eq!(
+            layer1_relu_out, layer2_matmul_in,
+            "layer 1 Relu.out VarId must thread into layer 2 Matmul.a (SSA continuity)"
+        );
+    }
+
+    #[test]
+    fn rejects_non_relu_activation() {
+        // M57.1 §3.3 v1 recognizer only accepts ReLU as the activation function.
+        // sigmoid, tanh, etc. must error with UnsupportedV1Shape.
+        let src = "\
+model BadActivation:
+    W1: Tensor<[10, 5], i8>
+    b1: Tensor<[5], i32>
+
+    fn forward(self, x: Tensor<[1, 10], i8>) -> Tensor<[1, 5], i32>:
+        return sigmoid(matmul(x, self.W1) + self.b1)
+";
+        let (ast, interner) = parse_source(src);
+        let err = lower(&ast, &interner).expect_err("sigmoid should not be recognized");
+        assert!(matches!(err, FpgaLoweringError::UnsupportedV1Shape { .. }));
+    }
+
+    #[test]
+    fn rejects_matmul_with_wrong_arg_count() {
+        // matmul must be a 2-arg call (matmul(x, W)). 1-arg matmul must error.
+        let src = "\
+model BadMatmulArity:
+    W1: Tensor<[10, 5], i8>
+    b1: Tensor<[5], i32>
+
+    fn forward(self, x: Tensor<[1, 10], i8>) -> Tensor<[1, 5], i32>:
+        return relu(matmul(x) + self.b1)
+";
+        let (ast, interner) = parse_source(src);
+        let err = lower(&ast, &interner).expect_err("1-arg matmul should fail");
+        assert!(matches!(err, FpgaLoweringError::UnsupportedV1Shape { .. }));
+    }
 }
