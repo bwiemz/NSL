@@ -14,7 +14,8 @@ fn normalize_floats(text: &str) -> String {
 
     while i < n {
         // Look for float patterns: optional minus, digits, dot, digits
-        if chars[i].is_ascii_digit() || (chars[i] == '-' && i + 1 < n && chars[i + 1].is_ascii_digit())
+        if chars[i].is_ascii_digit()
+            || (chars[i] == '-' && i + 1 < n && chars[i + 1].is_ascii_digit())
         {
             let start = i;
             if chars[i] == '-' {
@@ -109,7 +110,9 @@ fn run_example(name: &str) -> String {
     if !output.status.success() {
         panic!(
             "nsl run failed for '{}' (exit {:?}):\nstderr: {}",
-            name, output.status.code(), stderr
+            name,
+            output.status.code(),
+            stderr
         );
     }
     String::from_utf8_lossy(&output.stdout).to_string()
@@ -279,7 +282,9 @@ fn e2e_m12_grad_source_ad_unresolved_target_fallback() {
     );
 
     let actual = normalize(&String::from_utf8_lossy(&output.stdout));
-    let expected = normalize(&expected_output("m12_grad_source_ad_unresolved_target_fallback"));
+    let expected = normalize(&expected_output(
+        "m12_grad_source_ad_unresolved_target_fallback",
+    ));
     assert_eq!(
         actual.trim(),
         expected.trim(),
@@ -583,7 +588,8 @@ fn e2e_trait_definition_check() {
         stderr
     );
     assert!(
-        !stderr.contains("duplicate trait method") && !stderr.contains("bound must reference a trait"),
+        !stderr.contains("duplicate trait method")
+            && !stderr.contains("bound must reference a trait"),
         "Unexpected trait-definition diagnostics: {}",
         stderr
     );
@@ -712,8 +718,7 @@ fn create_small_safetensors(dir: &std::path::Path) -> std::path::PathBuf {
 
     let weight_view =
         safetensors::tensor::TensorView::new(Dtype::F64, vec![4, 3], &weight_bytes).unwrap();
-    let bias_view =
-        safetensors::tensor::TensorView::new(Dtype::F64, vec![3], &bias_bytes).unwrap();
+    let bias_view = safetensors::tensor::TensorView::new(Dtype::F64, vec![3], &bias_bytes).unwrap();
 
     let mut tensors: HashMap<String, safetensors::tensor::TensorView<'_>> = HashMap::new();
     tensors.insert("bias".to_string(), bias_view);
@@ -957,8 +962,8 @@ fn e2e_m25_profiling() {
     );
 
     // Parse and validate the JSON content.
-    let json_str = std::fs::read_to_string(&profile_path)
-        .expect("failed to read memory_profile.json");
+    let json_str =
+        std::fs::read_to_string(&profile_path).expect("failed to read memory_profile.json");
     let parsed: serde_json::Value =
         serde_json::from_str(&json_str).expect("memory_profile.json is not valid JSON");
 
@@ -1388,7 +1393,7 @@ fn build_nslm_f32(tensors: &[(&str, Vec<usize>, Vec<f32>)]) -> Vec<u8> {
 
     let mut out: Vec<u8> = Vec::new();
     out.extend_from_slice(b"NSLM");
-    out.extend_from_slice(&1u32.to_le_bytes());       // version
+    out.extend_from_slice(&1u32.to_le_bytes()); // version
     out.extend_from_slice(&header_size.to_le_bytes()); // header_size u64
     out.extend_from_slice(header_bytes);
 
@@ -1442,7 +1447,12 @@ fn e2e_convert_nslm_to_safetensors() {
         v.sort();
         v
     };
-    assert_eq!(names, vec!["bias".to_string(), "weight".to_string()], "unexpected tensor names: {:?}", names);
+    assert_eq!(
+        names,
+        vec!["bias".to_string(), "weight".to_string()],
+        "unexpected tensor names: {:?}",
+        names
+    );
 
     // Check weight values (f32)
     let weight_view = st.tensor("weight").unwrap();
@@ -1453,8 +1463,16 @@ fn e2e_convert_nslm_to_safetensors() {
         .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
         .collect();
     assert_eq!(weight_f32.len(), 6);
-    assert!((weight_f32[0] - 1.0f32).abs() < 1e-5, "weight[0] = {}", weight_f32[0]);
-    assert!((weight_f32[5] - 6.0f32).abs() < 1e-5, "weight[5] = {}", weight_f32[5]);
+    assert!(
+        (weight_f32[0] - 1.0f32).abs() < 1e-5,
+        "weight[0] = {}",
+        weight_f32[0]
+    );
+    assert!(
+        (weight_f32[5] - 6.0f32).abs() < 1e-5,
+        "weight[5] = {}",
+        weight_f32[5]
+    );
 
     // Check bias values
     let bias_view = st.tensor("bias").unwrap();
@@ -1464,8 +1482,16 @@ fn e2e_convert_nslm_to_safetensors() {
         .chunks_exact(4)
         .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
         .collect();
-    assert!((bias_f32[0] - 0.1f32).abs() < 1e-4, "bias[0] = {}", bias_f32[0]);
-    assert!((bias_f32[2] - 0.3f32).abs() < 1e-4, "bias[2] = {}", bias_f32[2]);
+    assert!(
+        (bias_f32[0] - 0.1f32).abs() < 1e-4,
+        "bias[0] = {}",
+        bias_f32[0]
+    );
+    assert!(
+        (bias_f32[2] - 0.3f32).abs() < 1e-4,
+        "bias[2] = {}",
+        bias_f32[2]
+    );
 }
 
 #[test]
@@ -1587,7 +1613,9 @@ fn e2e_convert_nslm_safetensors_round_trip() {
         assert!(
             (got - expected).abs() < 1e-5,
             "round-trip mismatch at [{}]: expected {}, got {}",
-            i, expected, got
+            i,
+            expected,
+            got
         );
     }
 

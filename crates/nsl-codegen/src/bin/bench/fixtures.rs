@@ -150,12 +150,12 @@ fn registry() -> Vec<Fixture> {
         // segment-mask generator; the M3 assertion is byte-equality of
         // Tier-B-on vs Tier-B-off outputs, which is correctness-preserving
         // for ANY segment-mask shape per design §6.1.
-        parity("parity_1", 4096, 0.3),  // standard_3doc — 3 docs ≈ 30% empty kv-tiles
+        parity("parity_1", 4096, 0.3), // standard_3doc — 3 docs ≈ 30% empty kv-tiles
         parity("parity_2", 16_384, 0.3), // long_seq_5doc — 5 docs, larger seq
-        parity("parity_3", 4096, 0.5),  // skewed_packing — uneven doc lengths
-        parity("parity_4", 4096, 0.8),  // boundary_dense — 16 small docs, lots of empties
-        parity("parity_5", 4096, 0.0),  // single_doc — no empties, predicate always false
-        parity("parity_6", 4096, 0.5),  // tail_padding — 2 docs + padding sentinel
+        parity("parity_3", 4096, 0.5), // skewed_packing — uneven doc lengths
+        parity("parity_4", 4096, 0.8), // boundary_dense — 16 small docs, lots of empties
+        parity("parity_5", 4096, 0.0), // single_doc — no empties, predicate always false
+        parity("parity_6", 4096, 0.5), // tail_padding — 2 docs + padding sentinel
         // Backward parity tier (B2-3 / spec §7.4): mirror the six forward
         // packing patterns but with 32×32×32 dims so backward SMEM extras
         // fit under the 99 KB cap. Names disambiguated by `_bwd_` infix so

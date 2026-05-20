@@ -11,10 +11,7 @@
 /// Caller must emit this AFTER the `.visible .entry ... { ` opener but
 /// BEFORE any register decl that uses shmem (via %shmem_base).
 pub fn emit_static_smem_decl(ptx: &mut String, bytes: usize) {
-    ptx.push_str(&format!(
-        "    .shared .align 16 .b8 shmem[{}];\n",
-        bytes
-    ));
+    ptx.push_str(&format!("    .shared .align 16 .b8 shmem[{}];\n", bytes));
 }
 
 /// Emit dynamic SMEM extern declaration at MODULE scope:

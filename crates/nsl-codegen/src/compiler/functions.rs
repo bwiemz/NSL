@@ -34,8 +34,7 @@ impl Compiler<'_> {
                 if let StmtKind::Decorated { decorators, stmt } = &s.kind {
                     if let StmtKind::FnDef(fn_def) = &stmt.kind {
                         let is_pipeline = decorators.iter().any(|d| {
-                            d.name.len() == 1
-                                && self.resolve_sym(d.name[0]) == "pipeline_agent"
+                            d.name.len() == 1 && self.resolve_sym(d.name[0]) == "pipeline_agent"
                         });
                         if is_pipeline {
                             return Some(self.resolve_sym(fn_def.name).to_string());
@@ -658,9 +657,9 @@ impl Compiler<'_> {
             let model_name = self.resolve_sym(md.name).to_string();
             for member in &md.members {
                 if let ModelMember::Method(fn_def, decos) = member {
-                    let is_export = decos.iter().any(|d| {
-                        d.name.len() == 1 && self.resolve_sym(d.name[0]) == "export"
-                    });
+                    let is_export = decos
+                        .iter()
+                        .any(|d| d.name.len() == 1 && self.resolve_sym(d.name[0]) == "export");
                     if !is_export {
                         continue;
                     }
@@ -686,8 +685,7 @@ impl Compiler<'_> {
                     let mut fn_builder_ctx = FunctionBuilderContext::new();
 
                     {
-                        let mut builder =
-                            FunctionBuilder::new(&mut ctx.func, &mut fn_builder_ctx);
+                        let mut builder = FunctionBuilder::new(&mut ctx.func, &mut fn_builder_ctx);
                         let mut state = FuncState::new();
 
                         let entry = builder.create_block();
@@ -707,8 +705,7 @@ impl Compiler<'_> {
                         builder.declare_var(weight_ptrs_var, cl_types::I64);
                         builder.def_var(weight_ptrs_var, weight_ptrs_val);
 
-                        state.self_resolution =
-                            SelfResolution::WeightPtrsArray { weight_ptrs_var };
+                        state.self_resolution = SelfResolution::WeightPtrsArray { weight_ptrs_var };
 
                         // Bind non-self method params starting at Cranelift param index 2.
                         let mut cl_param_idx = 2usize;
@@ -769,22 +766,21 @@ impl Compiler<'_> {
                     }
 
                     if self.dump_ir {
-                        let impl_name =
-                            format!("__nsl_export_impl_{model_name}_{method_name}");
+                        let impl_name = format!("__nsl_export_impl_{model_name}_{method_name}");
                         eprintln!(
                             "--- IR: @export impl '{impl_name}' ---\n{}",
                             ctx.func.display()
                         );
                     }
 
-                    self.module.define_function(func_id, &mut ctx).map_err(
-                        |e| {
+                    self.module
+                        .define_function(func_id, &mut ctx)
+                        .map_err(|e| {
                             CodegenError::new(format!(
                                 "failed to define @export impl '{}::{}': {:?}",
                                 model_name, method_name, e
                             ))
-                        },
-                    )?;
+                        })?;
                 }
             }
         }

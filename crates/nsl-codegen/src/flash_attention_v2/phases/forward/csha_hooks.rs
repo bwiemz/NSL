@@ -113,7 +113,10 @@ pub fn emit_prologue(ptx: &mut String, config: &FlashAttentionConfig, q_tile_ite
 
     // Second pass: x_normed[d] = x[d] * (1/rms) * norm_weight[d], writeback.
     for i in 0..slices {
-        ptx.push_str(&format!("    // x slice {}: normalize + scale, writeback\n", i));
+        ptx.push_str(&format!(
+            "    // x slice {}: normalize + scale, writeback\n",
+            i
+        ));
         ptx.push_str("    cvt.u64.u32 %rd53, %lane;\n");
         if i > 0 {
             ptx.push_str(&format!("    add.u64 %rd53, %rd53, {};\n", i * 32));
@@ -299,7 +302,11 @@ pub fn emit_matmul_projection(ptx: &mut String, config: &FlashAttentionConfig, q
 /// When `csha.fused_projections` is false (or `csha` is None), or `csha_wv_ptr`
 /// was null at kernel entry, this is a no-op (the classic `emit_v_tile_load`
 /// path handled V from HBM).
-pub fn emit_v_projection_in_kv_loop(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
+pub fn emit_v_projection_in_kv_loop(
+    ptx: &mut String,
+    config: &FlashAttentionConfig,
+    q_tile_iter: u32,
+) {
     let fused = config.csha.as_ref().is_some_and(|c| c.fused_projections);
     if !fused {
         ptx.push_str("    // CSHA V projection (deferred): fused_projections=false, no-op\n");
@@ -332,10 +339,13 @@ fn emit_warp_per_row_sweep(
     ptx: &mut String,
     config: &FlashAttentionConfig,
     q_tile_iter: u32,
-    label: &str,       // "Q" / "K" / "V"
-    smem_base: &str,   // destination SMEM base register name
+    label: &str,     // "Q" / "K" / "V"
+    smem_base: &str, // destination SMEM base register name
 ) {
-    let csha    = config.csha.as_ref().expect("fused_projections checked by caller");
+    let csha = config
+        .csha
+        .as_ref()
+        .expect("fused_projections checked by caller");
     let d_model = csha.d_model;
     let head_dim = config.head_dim as u32;
     // slices_per_lane: each lane owns this many output d positions.
@@ -406,10 +416,7 @@ fn emit_warp_per_row_sweep(
             ));
         }
         if slice > 0 {
-            ptx.push_str(&format!(
-                "    add.u64 %rd_wt_off, %rd_wt_off, {};\n",
-                slice
-            ));
+            ptx.push_str(&format!("    add.u64 %rd_wt_off, %rd_wt_off, {};\n", slice));
         }
         ptx.push_str("    shl.b64 %rd_wt_off, %rd_wt_off, 1; // * 2 bytes (f16)\n");
         ptx.push_str("    add.u64 %rd_wt_dst, %rd_wt_dst, %rd_wt_off;\n");
@@ -473,10 +480,7 @@ fn emit_warp_per_row_sweep(
             ));
         }
         if slice > 0 {
-            ptx.push_str(&format!(
-                "    add.u64 %rd_wt_off, %rd_wt_off, {};\n",
-                slice
-            ));
+            ptx.push_str(&format!("    add.u64 %rd_wt_off, %rd_wt_off, {};\n", slice));
         }
         ptx.push_str("    shl.b64 %rd_wt_off, %rd_wt_off, 1;\n");
         ptx.push_str("    add.u64 %rd_wt_dst, %rd_wt_dst, %rd_wt_off;\n");
@@ -524,10 +528,7 @@ fn emit_kv_prepass_reginit(ptx: &mut String, config: &FlashAttentionConfig, q_ti
     ));
 
     // Weight tile SMEM bases.
-    ptx.push_str(&format!(
-        "    add.u64 %q_tile, %shmem_base, {};\n",
-        wt_base
-    ));
+    ptx.push_str(&format!("    add.u64 %q_tile, %shmem_base, {};\n", wt_base));
     ptx.push_str(&format!(
         "    add.u64 %k_tile, %shmem_base, {};\n",
         wt_base + wt_bytes
@@ -554,14 +555,16 @@ pub fn emit_k_prepass_sweep(ptx: &mut String, config: &FlashAttentionConfig, q_t
         return;
     }
     ptx.push_str(&format!(
-        "    // K pre-pass sweep q_tile_iter={}\n", q_tile_iter
+        "    // K pre-pass sweep q_tile_iter={}\n",
+        q_tile_iter
     ));
     // Load Wk pointer (already in SMEM from the one-time weight tile load;
     // re-load into %rd61 for the sweep's null-guard pattern).
     ptx.push_str("    ld.param.u64 %rd61, [csha_wk_ptr];\n");
     ptx.push_str("    setp.eq.u64 %p0, %rd61, 0;\n");
     ptx.push_str(&format!(
-        "    @%p0 bra V2_K_PREPASS_SKIP_{};\n", q_tile_iter
+        "    @%p0 bra V2_K_PREPASS_SKIP_{};\n",
+        q_tile_iter
     ));
     emit_kv_prepass_reginit(ptx, config, q_tile_iter);
     emit_warp_per_row_sweep(ptx, config, q_tile_iter, "K", "%k_smem_base");
@@ -576,13 +579,15 @@ pub fn emit_q_projection_only(ptx: &mut String, config: &FlashAttentionConfig, q
         return;
     }
     ptx.push_str(&format!(
-        "    // Q-only projection sweep q_tile_iter={}\n", q_tile_iter
+        "    // Q-only projection sweep q_tile_iter={}\n",
+        q_tile_iter
     ));
     // Load Wq pointer for null guard.
     ptx.push_str("    ld.param.u64 %rd60, [csha_wq_ptr];\n");
     ptx.push_str("    setp.eq.u64 %p0, %rd60, 0;\n");
     ptx.push_str(&format!(
-        "    @%p0 bra V2_Q_ONLY_PROJ_SKIP_{};\n", q_tile_iter
+        "    @%p0 bra V2_Q_ONLY_PROJ_SKIP_{};\n",
+        q_tile_iter
     ));
     emit_kv_prepass_reginit(ptx, config, q_tile_iter);
     emit_warp_per_row_sweep(ptx, config, q_tile_iter, "Q", "%q_smem_base");
@@ -597,12 +602,14 @@ pub fn emit_v_prepass_sweep(ptx: &mut String, config: &FlashAttentionConfig, q_t
         return;
     }
     ptx.push_str(&format!(
-        "    // V pre-pass sweep q_tile_iter={}\n", q_tile_iter
+        "    // V pre-pass sweep q_tile_iter={}\n",
+        q_tile_iter
     ));
     ptx.push_str("    ld.param.u64 %rd62, [csha_wv_ptr];\n");
     ptx.push_str("    setp.eq.u64 %p0, %rd62, 0;\n");
     ptx.push_str(&format!(
-        "    @%p0 bra V2_V_PREPASS_SKIP_{};\n", q_tile_iter
+        "    @%p0 bra V2_V_PREPASS_SKIP_{};\n",
+        q_tile_iter
     ));
     emit_kv_prepass_reginit(ptx, config, q_tile_iter);
     emit_warp_per_row_sweep(ptx, config, q_tile_iter, "V", "%v_smem_base");
@@ -647,7 +654,13 @@ pub fn emit_save_activations(ptx: &mut String, config: &FlashAttentionConfig, q_
 /// have independent row counts and are written from distinct orchestrator
 /// loops.  `QK` and `All` are retained for callers in the symmetric fused
 /// path and the non-fused path that save multiple tiles at a single site.
-pub enum SaveSet { All, QK, V, Q, K }
+pub enum SaveSet {
+    All,
+    QK,
+    V,
+    Q,
+    K,
+}
 
 pub fn emit_save_activations_subset(
     ptx: &mut String,
@@ -665,10 +678,7 @@ pub fn emit_save_activations_subset(
     }
     let head_dim = config.head_dim as u32;
     let slices_per_lane = (head_dim / 32).max(1);
-    let fused = config
-        .csha
-        .as_ref()
-        .is_some_and(|c| c.fused_projections);
+    let fused = config.csha.as_ref().is_some_and(|c| c.fused_projections);
 
     ptx.push_str(&format!(
         "    // CSHA Tier C: save post-RoPE activations (q_tile_iter={}, slices/lane={}, set={:?})\n",
@@ -694,7 +704,9 @@ pub fn emit_save_activations_subset(
     if !fused {
         let kv_off = crate::flash_attention_v2::smem_layout::kv_offset(config);
         ptx.push_str("    // save_activations && !fused_projections: init SMEM base registers\n");
-        ptx.push_str("    mov.u64 %q_smem_base, %shmem_base;              // Q tile at q_offset(=0)\n");
+        ptx.push_str(
+            "    mov.u64 %q_smem_base, %shmem_base;              // Q tile at q_offset(=0)\n",
+        );
         ptx.push_str(&format!(
             "    add.u64 %k_smem_base, %shmem_base, {}; // K tile at kv_offset\n",
             kv_off
@@ -716,9 +728,9 @@ pub fn emit_save_activations_subset(
     let entries: &[(&str, &str, &str)] = match set {
         SaveSet::All => &all,
         SaveSet::QK => &all[0..2],
-        SaveSet::Q  => &all[0..1],
-        SaveSet::K  => &all[1..2],
-        SaveSet::V  => &all[2..3],
+        SaveSet::Q => &all[0..1],
+        SaveSet::K => &all[1..2],
+        SaveSet::V => &all[2..3],
     };
     for &(label, ptr_name, smem_base) in entries {
         ptx.push_str(&format!(
@@ -951,30 +963,19 @@ pub(crate) fn emit_save_softmax_state_with_diag(
                 rm_src
             ));
         } else {
-            ptx.push_str(
-                "    // row_max write suppressed - direct_* mode wrote it from softmax\n",
-            );
+            ptx.push_str("    // row_max write suppressed - direct_* mode wrote it from softmax\n");
         }
         let _ = q_tile_iter;
 
         let (rs_setup, rs_src): (&str, &str) = match diag {
-            "wrow" => (
-                "    cvt.rn.f32.u32 %f_diag, %r_save_wrow;\n",
-                "%f_diag",
-            ),
-            "wid" => (
-                "    cvt.rn.f32.u32 %f_diag, %lane;\n",
-                "%f_diag",
-            ),
-            "qstart" => (
-                "    cvt.rn.f32.u32 %f_diag, %r_save_wrow;\n",
-                "%f_diag",
-            ),
+            "wrow" => ("    cvt.rn.f32.u32 %f_diag, %r_save_wrow;\n", "%f_diag"),
+            "wid" => ("    cvt.rn.f32.u32 %f_diag, %lane;\n", "%f_diag"),
+            "qstart" => ("    cvt.rn.f32.u32 %f_diag, %r_save_wrow;\n", "%f_diag"),
             // J-A3: both slots store the same softmax-captured scratch — makes
             // it unambiguous when reading back which register we're inspecting.
-            "fmax"   => ("", "%f_sdx_fmax"),
+            "fmax" => ("", "%f_sdx_fmax"),
             "newmax" => ("", "%f_sdx_nmax"),
-            "fsum"   => ("", "%f_sdx_fsum"),
+            "fsum" => ("", "%f_sdx_fsum"),
             _ => ("", "%row_sum"),
         };
 
@@ -995,7 +996,11 @@ pub(crate) fn emit_save_softmax_state_with_diag(
 ///
 /// Symmetric to `emit_save_softmax_state`.  Called at the start of the PV-accum
 /// pass for each q_tile_iter.
-pub fn emit_restore_softmax_state(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
+pub fn emit_restore_softmax_state(
+    ptx: &mut String,
+    config: &FlashAttentionConfig,
+    q_tile_iter: u32,
+) {
     if !config.csha.as_ref().is_some_and(|c| c.fused_projections) {
         return;
     }
@@ -1122,7 +1127,7 @@ pub fn emit_rope_epilogue(ptx: &mut String, config: &FlashAttentionConfig, q_til
         config.rope_style
     );
 
-    let block_q  = config.block_q  as u32;
+    let block_q = config.block_q as u32;
     let head_dim = config.head_dim as u32;
     let half_dim = head_dim / 2;
     // Each of 128 threads covers ceil(block_q * half_dim / 128) pairs.
@@ -1266,9 +1271,9 @@ fn emit_rope_pair_sweep(
     pairs_per_lane: u32,
 ) {
     let tl = tile_label; // short alias for label generation
-    // PCA §4.3 RoPE-reset gate: only the forward Q+K rotation sites (T7+T8)
-    // emit the doc_starts lookup. tile_label drives which effective_pos
-    // register name is used (Q vs K-side).
+                         // PCA §4.3 RoPE-reset gate: only the forward Q+K rotation sites (T7+T8)
+                         // emit the doc_starts lookup. tile_label drives which effective_pos
+                         // register name is used (Q vs K-side).
     let reset_active = config.segment_masked && config.rope_q;
     let effective_pos_reg = match tile_label {
         "Q" => "%r_effective_pos_q",
@@ -1361,7 +1366,11 @@ fn emit_rope_pair_sweep(
     // of the tile-local row, so packed-batch positions wrap back to 0 at
     // each document boundary. SMEM addressing further below still uses
     // %r_rope_row.
-    let cs_row_reg = if reset_active { effective_pos_reg } else { "%r_rope_row" };
+    let cs_row_reg = if reset_active {
+        effective_pos_reg
+    } else {
+        "%r_rope_row"
+    };
     ptx.push_str(&format!(
         "    mul.lo.u32 %r_rope_cs_off, {cs_row_reg}, {half_dim};\n"
     ));
@@ -1440,9 +1449,7 @@ fn emit_rope_pair_sweep(
 
     // Advance by 128 (one full warp-block stride).
     ptx.push_str("    add.u32 %r_rope_pair_idx, %r_rope_pair_idx, 128;\n");
-    ptx.push_str(&format!(
-        "    bra V2_CSHA_ROPE_{tl}_LOOP_{q_tile_iter};\n"
-    ));
+    ptx.push_str(&format!("    bra V2_CSHA_ROPE_{tl}_LOOP_{q_tile_iter};\n"));
 
     ptx.push_str(&format!("V2_CSHA_ROPE_{tl}_END_{q_tile_iter}:\n"));
     ptx.push_str("    bar.sync 0;  // FENCE: RoPE tile writes complete\n");
@@ -1464,7 +1471,13 @@ mod tests {
             rope_style: RopeStyle::HalfSplit,
             gqa_group_size: 1,
             tree_mask: false,
-            gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras { fused_projections: true, d_model: 128, ..CshaExtras::default() }),
+            gpu_sm: 75,
+            segment_masked: false,
+            csha: Some(CshaExtras {
+                fused_projections: true,
+                d_model: 128,
+                ..CshaExtras::default()
+            }),
         }
     }
 
@@ -1477,10 +1490,16 @@ mod tests {
             causal: false,
             paged: false,
             rope_q: true,
-            rope_style: RopeStyle::Adjacent,  // emit_rope_pair_sweep implements Adjacent (x[2i], x[2i+1])
+            rope_style: RopeStyle::Adjacent, // emit_rope_pair_sweep implements Adjacent (x[2i], x[2i+1])
             gqa_group_size: 1,
             tree_mask: false,
-            gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras { fused_projections: true, d_model: 128, ..CshaExtras::default() }),
+            gpu_sm: 75,
+            segment_masked: false,
+            csha: Some(CshaExtras {
+                fused_projections: true,
+                d_model: 128,
+                ..CshaExtras::default()
+            }),
         }
     }
 
@@ -1490,19 +1509,37 @@ mod tests {
         let mut ptx = String::new();
         emit_rope_epilogue(&mut ptx, &cfg, 0);
 
-        assert!(ptx.contains("ld.param.u64 %rd_rope_cos, [cos_ptr];"), "cos_ptr load missing");
-        assert!(ptx.contains("ld.param.u64 %rd_rope_sin, [sin_ptr];"), "sin_ptr load missing");
+        assert!(
+            ptx.contains("ld.param.u64 %rd_rope_cos, [cos_ptr];"),
+            "cos_ptr load missing"
+        );
+        assert!(
+            ptx.contains("ld.param.u64 %rd_rope_sin, [sin_ptr];"),
+            "sin_ptr load missing"
+        );
         // emit_rope_epilogue only rotates Q; K rotation is in emit_rope_k_epilogue (called once after K pre-pass).
-        assert!(ptx.contains("V2_CSHA_ROPE_Q_LOOP_0:"), "Q rotation loop label missing");
-        assert!(!ptx.contains("V2_CSHA_ROPE_K_LOOP_0:"), "K rotation belongs in emit_rope_k_epilogue, not here");
-        assert!(!ptx.contains("V2_CSHA_ROPE_V_LOOP"), "V must not be rotated");
+        assert!(
+            ptx.contains("V2_CSHA_ROPE_Q_LOOP_0:"),
+            "Q rotation loop label missing"
+        );
+        assert!(
+            !ptx.contains("V2_CSHA_ROPE_K_LOOP_0:"),
+            "K rotation belongs in emit_rope_k_epilogue, not here"
+        );
+        assert!(
+            !ptx.contains("V2_CSHA_ROPE_V_LOOP"),
+            "V must not be rotated"
+        );
         // 4 fma.rn.f32 per pair (2 for new_x0, 2 for new_x1) for Q sweep only
         assert!(
             ptx.matches("fma.rn.f32").count() >= 2,
             "expected at least 2 fma.rn.f32, got {}",
             ptx.matches("fma.rn.f32").count()
         );
-        assert!(ptx.contains("cvt.rn.f16.f32"), "f16 conversion for store missing");
+        assert!(
+            ptx.contains("cvt.rn.f16.f32"),
+            "f16 conversion for store missing"
+        );
     }
 
     #[test]
@@ -1529,8 +1566,14 @@ mod tests {
         assert!(ptx.contains("V2_CSHA_ROPE_Q_LOOP_0:"));
         assert!(ptx.contains("V2_CSHA_ROPE_Q_LOOP_1:"));
         // K rotation is in emit_rope_k_epilogue, not here.
-        assert!(!ptx.contains("V2_CSHA_ROPE_K_LOOP_0:"), "K rotation belongs in emit_rope_k_epilogue");
-        assert!(!ptx.contains("V2_CSHA_ROPE_K_LOOP_1:"), "K rotation belongs in emit_rope_k_epilogue");
+        assert!(
+            !ptx.contains("V2_CSHA_ROPE_K_LOOP_0:"),
+            "K rotation belongs in emit_rope_k_epilogue"
+        );
+        assert!(
+            !ptx.contains("V2_CSHA_ROPE_K_LOOP_1:"),
+            "K rotation belongs in emit_rope_k_epilogue"
+        );
     }
 
     #[test]
@@ -1540,14 +1583,32 @@ mod tests {
         emit_rope_k_epilogue(&mut ptx, &cfg);
 
         // K rotation loop must be present.
-        assert!(ptx.contains("V2_CSHA_ROPE_K_LOOP_0:"), "K rotation loop label missing");
-        assert!(ptx.contains("V2_CSHA_ROPE_K_FUSED_SKIP:"), "K skip label missing");
+        assert!(
+            ptx.contains("V2_CSHA_ROPE_K_LOOP_0:"),
+            "K rotation loop label missing"
+        );
+        assert!(
+            ptx.contains("V2_CSHA_ROPE_K_FUSED_SKIP:"),
+            "K skip label missing"
+        );
         // Null-guard on cos/sin.
-        assert!(ptx.contains("ld.param.u64 %rd_rope_cos, [cos_ptr];"), "cos_ptr load missing");
-        assert!(ptx.contains("ld.param.u64 %rd_rope_sin, [sin_ptr];"), "sin_ptr load missing");
+        assert!(
+            ptx.contains("ld.param.u64 %rd_rope_cos, [cos_ptr];"),
+            "cos_ptr load missing"
+        );
+        assert!(
+            ptx.contains("ld.param.u64 %rd_rope_sin, [sin_ptr];"),
+            "sin_ptr load missing"
+        );
         // Must NOT rotate Q or V.
-        assert!(!ptx.contains("V2_CSHA_ROPE_Q_LOOP"), "Q must not be rotated in K epilogue");
-        assert!(!ptx.contains("V2_CSHA_ROPE_V_LOOP"), "V must not be rotated");
+        assert!(
+            !ptx.contains("V2_CSHA_ROPE_Q_LOOP"),
+            "Q must not be rotated in K epilogue"
+        );
+        assert!(
+            !ptx.contains("V2_CSHA_ROPE_V_LOOP"),
+            "V must not be rotated"
+        );
         // fma instructions for rotation math.
         assert!(
             ptx.matches("fma.rn.f32").count() >= 2,
@@ -1558,10 +1619,17 @@ mod tests {
     #[test]
     fn a4_rope_k_epilogue_skipped_when_not_fused() {
         let mut cfg = base_cfg_for_rope_test();
-        cfg.csha = Some(CshaExtras { fused_projections: false, d_model: 128, ..CshaExtras::default() });
+        cfg.csha = Some(CshaExtras {
+            fused_projections: false,
+            d_model: 128,
+            ..CshaExtras::default()
+        });
         let mut ptx = String::new();
         emit_rope_k_epilogue(&mut ptx, &cfg);
-        assert!(!ptx.contains("V2_CSHA_ROPE_K_LOOP"), "K rotation should not emit when fused_projections=false");
+        assert!(
+            !ptx.contains("V2_CSHA_ROPE_K_LOOP"),
+            "K rotation should not emit when fused_projections=false"
+        );
     }
 
     #[test]
@@ -1570,7 +1638,10 @@ mod tests {
         cfg.rope_q = false;
         let mut ptx = String::new();
         emit_rope_k_epilogue(&mut ptx, &cfg);
-        assert!(!ptx.contains("V2_CSHA_ROPE_K_LOOP"), "K rotation should not emit when rope_q=false");
+        assert!(
+            !ptx.contains("V2_CSHA_ROPE_K_LOOP"),
+            "K rotation should not emit when rope_q=false"
+        );
     }
 
     #[test]
@@ -1580,15 +1651,32 @@ mod tests {
         emit_matmul_projection(&mut ptx, &cfg, 0);
 
         // All three weight pointer loads present with independent null-guards.
-        assert!(ptx.contains("ld.param.u64 %rd60, [csha_wq_ptr];"), "missing Wq null-check load");
-        assert!(ptx.contains("ld.param.u64 %rd61, [csha_wk_ptr];"), "missing Wk null-check load");
-        assert!(ptx.contains("ld.param.u64 %rd62, [csha_wv_ptr];"), "missing Wv null-check load");
+        assert!(
+            ptx.contains("ld.param.u64 %rd60, [csha_wq_ptr];"),
+            "missing Wq null-check load"
+        );
+        assert!(
+            ptx.contains("ld.param.u64 %rd61, [csha_wk_ptr];"),
+            "missing Wk null-check load"
+        );
+        assert!(
+            ptx.contains("ld.param.u64 %rd62, [csha_wv_ptr];"),
+            "missing Wv null-check load"
+        );
         // Q and K sweeps emitted here (§9a); V is deferred to emit_v_projection_in_kv_loop
         // because K and V share kv_offset — emitting V here would overwrite K before s_compute.
-        assert!(ptx.contains("V2_CSHA_PROJ_Q_LOOP_0:"), "missing Q loop label");
-        assert!(ptx.contains("V2_CSHA_PROJ_K_LOOP_0:"), "missing K loop label");
-        assert!(!ptx.contains("V2_CSHA_PROJ_V_LOOP_0:"),
-            "V sweep must be deferred to emit_v_projection_in_kv_loop (K/V share kv_offset)");
+        assert!(
+            ptx.contains("V2_CSHA_PROJ_Q_LOOP_0:"),
+            "missing Q loop label"
+        );
+        assert!(
+            ptx.contains("V2_CSHA_PROJ_K_LOOP_0:"),
+            "missing K loop label"
+        );
+        assert!(
+            !ptx.contains("V2_CSHA_PROJ_V_LOOP_0:"),
+            "V sweep must be deferred to emit_v_projection_in_kv_loop (K/V share kv_offset)"
+        );
         // No warp butterfly reduction: each lane independently accumulates its own output column.
         assert_eq!(
             ptx.matches("shfl.sync.bfly.b32").count(),
@@ -1597,7 +1685,10 @@ mod tests {
             ptx.matches("shfl.sync.bfly.b32").count()
         );
         // Output store uses %rd_wt_dst scratch (smem_base is NOT mutated).
-        assert!(ptx.contains("st.shared.b16 [%rd_wt_dst]"), "missing Q SMEM store via %rd_wt_dst");
+        assert!(
+            ptx.contains("st.shared.b16 [%rd_wt_dst]"),
+            "missing Q SMEM store via %rd_wt_dst"
+        );
     }
 
     #[test]
@@ -1607,12 +1698,24 @@ mod tests {
         emit_v_projection_in_kv_loop(&mut ptx, &cfg, 0);
 
         // V sweep is emitted by the deferred hook (for kv_loop placement).
-        assert!(ptx.contains("V2_CSHA_PROJ_V_LOOP_0:"), "missing deferred V loop label");
+        assert!(
+            ptx.contains("V2_CSHA_PROJ_V_LOOP_0:"),
+            "missing deferred V loop label"
+        );
         // Q and K must NOT appear here (they belong to emit_matmul_projection).
-        assert!(!ptx.contains("V2_CSHA_PROJ_Q_LOOP_0:"), "Q must not appear in deferred V hook");
-        assert!(!ptx.contains("V2_CSHA_PROJ_K_LOOP_0:"), "K must not appear in deferred V hook");
+        assert!(
+            !ptx.contains("V2_CSHA_PROJ_Q_LOOP_0:"),
+            "Q must not appear in deferred V hook"
+        );
+        assert!(
+            !ptx.contains("V2_CSHA_PROJ_K_LOOP_0:"),
+            "K must not appear in deferred V hook"
+        );
         // Null-guard re-loads Wv pointer.
-        assert!(ptx.contains("[csha_wv_ptr]"), "missing Wv null-guard reload");
+        assert!(
+            ptx.contains("[csha_wv_ptr]"),
+            "missing Wv null-guard reload"
+        );
     }
 
     #[test]
@@ -1626,16 +1729,43 @@ mod tests {
         emit_v_projection_in_kv_loop(&mut ptx, &cfg, 1);
 
         // Every label must include its q_tile_iter suffix — for all three sweeps.
-        assert!(ptx.contains("V2_CSHA_PROJ_Q_LOOP_0:"), "missing iter-0 Q label");
-        assert!(ptx.contains("V2_CSHA_PROJ_Q_LOOP_1:"), "missing iter-1 Q label");
-        assert!(ptx.contains("V2_CSHA_PROJ_K_LOOP_0:"), "missing iter-0 K label");
-        assert!(ptx.contains("V2_CSHA_PROJ_K_LOOP_1:"), "missing iter-1 K label");
-        assert!(ptx.contains("V2_CSHA_PROJ_V_LOOP_0:"), "missing iter-0 V label");
-        assert!(ptx.contains("V2_CSHA_PROJ_V_LOOP_1:"), "missing iter-1 V label");
+        assert!(
+            ptx.contains("V2_CSHA_PROJ_Q_LOOP_0:"),
+            "missing iter-0 Q label"
+        );
+        assert!(
+            ptx.contains("V2_CSHA_PROJ_Q_LOOP_1:"),
+            "missing iter-1 Q label"
+        );
+        assert!(
+            ptx.contains("V2_CSHA_PROJ_K_LOOP_0:"),
+            "missing iter-0 K label"
+        );
+        assert!(
+            ptx.contains("V2_CSHA_PROJ_K_LOOP_1:"),
+            "missing iter-1 K label"
+        );
+        assert!(
+            ptx.contains("V2_CSHA_PROJ_V_LOOP_0:"),
+            "missing iter-0 V label"
+        );
+        assert!(
+            ptx.contains("V2_CSHA_PROJ_V_LOOP_1:"),
+            "missing iter-1 V label"
+        );
         // No unsuffixed labels for any sweep
-        assert!(!ptx.contains("V2_CSHA_PROJ_Q_LOOP:"), "found unsuffixed Q label");
-        assert!(!ptx.contains("V2_CSHA_PROJ_K_LOOP:"), "found unsuffixed K label");
-        assert!(!ptx.contains("V2_CSHA_PROJ_V_LOOP:"), "found unsuffixed V label");
+        assert!(
+            !ptx.contains("V2_CSHA_PROJ_Q_LOOP:"),
+            "found unsuffixed Q label"
+        );
+        assert!(
+            !ptx.contains("V2_CSHA_PROJ_K_LOOP:"),
+            "found unsuffixed K label"
+        );
+        assert!(
+            !ptx.contains("V2_CSHA_PROJ_V_LOOP:"),
+            "found unsuffixed V label"
+        );
     }
 
     /// Regression test: RoPE epilogue must appear BEFORE the attention body
@@ -1655,7 +1785,9 @@ mod tests {
             rope_style: RopeStyle::HalfSplit,
             gqa_group_size: 1,
             tree_mask: false,
-            gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras {
+            gpu_sm: 75,
+            segment_masked: false,
+            csha: Some(CshaExtras {
                 fused_projections: true,
                 fused_output_proj: true,
                 d_model: 128,
@@ -1690,7 +1822,10 @@ mod tests {
             "residual-skip label for null x_ptr missing"
         );
         // Overall Wo skip label (for null Wo ptr branch)
-        assert!(ptx.contains("V2_CSHA_WO_SKIP_0:"), "Wo overall skip label missing");
+        assert!(
+            ptx.contains("V2_CSHA_WO_SKIP_0:"),
+            "Wo overall skip label missing"
+        );
         // Spec R2 note in emitted PTX
         assert!(
             ptx.contains("separate kernel") || ptx.contains("spec R2"),
@@ -1713,7 +1848,10 @@ mod tests {
             ptx.contains("fused_output=false") || ptx.is_empty(),
             "expected no-emit marker or empty string, got: {ptx}"
         );
-        assert!(!ptx.contains("V2_CSHA_WO_LOOP"), "should not emit WO loop when disabled");
+        assert!(
+            !ptx.contains("V2_CSHA_WO_LOOP"),
+            "should not emit WO loop when disabled"
+        );
     }
 
     /// A5.1 — null x_ptr skip label exists (tested at stub level; runtime
@@ -1813,7 +1951,9 @@ mod tests {
             rope_style: RopeStyle::HalfSplit,
             gqa_group_size: 1,
             tree_mask: false,
-            gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras {
+            gpu_sm: 75,
+            segment_masked: false,
+            csha: Some(CshaExtras {
                 fused_projections: true,
                 save_activations_for_backward: true,
                 d_model: 128,
@@ -1847,10 +1987,17 @@ mod tests {
     #[test]
     fn save_softmax_state_lane_gate_uses_setp_ne() {
         let cfg = FlashAttentionConfig {
-            block_q: 32, block_kv: 32, head_dim: 32,
-            causal: false, paged: false, rope_q: false,
-            rope_style: RopeStyle::HalfSplit, gqa_group_size: 1,
-            tree_mask: false, gpu_sm: 75, segment_masked: false,
+            block_q: 32,
+            block_kv: 32,
+            head_dim: 32,
+            causal: false,
+            paged: false,
+            rope_q: false,
+            rope_style: RopeStyle::HalfSplit,
+            gqa_group_size: 1,
+            tree_mask: false,
+            gpu_sm: 75,
+            segment_masked: false,
             csha: Some(CshaExtras {
                 fused_projections: false,
                 save_activations_for_backward: true,
@@ -1876,10 +2023,17 @@ mod tests {
     #[test]
     fn save_softmax_state_diag_wrow_replaces_source_operand() {
         let cfg = FlashAttentionConfig {
-            block_q: 32, block_kv: 32, head_dim: 32,
-            causal: false, paged: false, rope_q: false,
-            rope_style: RopeStyle::HalfSplit, gqa_group_size: 1,
-            tree_mask: false, gpu_sm: 75, segment_masked: false,
+            block_q: 32,
+            block_kv: 32,
+            head_dim: 32,
+            causal: false,
+            paged: false,
+            rope_q: false,
+            rope_style: RopeStyle::HalfSplit,
+            gqa_group_size: 1,
+            tree_mask: false,
+            gpu_sm: 75,
+            segment_masked: false,
             csha: Some(CshaExtras {
                 fused_projections: false,
                 save_activations_for_backward: true,
@@ -1918,10 +2072,17 @@ mod tests {
     #[test]
     fn save_softmax_state_diag_wid_splits_sources() {
         let cfg = FlashAttentionConfig {
-            block_q: 32, block_kv: 32, head_dim: 32,
-            causal: false, paged: false, rope_q: false,
-            rope_style: RopeStyle::HalfSplit, gqa_group_size: 1,
-            tree_mask: false, gpu_sm: 75, segment_masked: false,
+            block_q: 32,
+            block_kv: 32,
+            head_dim: 32,
+            causal: false,
+            paged: false,
+            rope_q: false,
+            rope_style: RopeStyle::HalfSplit,
+            gqa_group_size: 1,
+            tree_mask: false,
+            gpu_sm: 75,
+            segment_masked: false,
             csha: Some(CshaExtras {
                 fused_projections: false,
                 save_activations_for_backward: true,
@@ -1946,10 +2107,17 @@ mod tests {
     #[test]
     fn save_softmax_state_diag_qstart_dumps_carrier_reg() {
         let cfg = FlashAttentionConfig {
-            block_q: 32, block_kv: 32, head_dim: 32,
-            causal: false, paged: false, rope_q: false,
-            rope_style: RopeStyle::HalfSplit, gqa_group_size: 1,
-            tree_mask: false, gpu_sm: 75, segment_masked: false,
+            block_q: 32,
+            block_kv: 32,
+            head_dim: 32,
+            causal: false,
+            paged: false,
+            rope_q: false,
+            rope_style: RopeStyle::HalfSplit,
+            gqa_group_size: 1,
+            tree_mask: false,
+            gpu_sm: 75,
+            segment_masked: false,
             csha: Some(CshaExtras {
                 fused_projections: false,
                 save_activations_for_backward: true,
@@ -1973,10 +2141,17 @@ mod tests {
     #[test]
     fn save_softmax_state_diag_annotation_gated() {
         let cfg = FlashAttentionConfig {
-            block_q: 32, block_kv: 32, head_dim: 32,
-            causal: false, paged: false, rope_q: false,
-            rope_style: RopeStyle::HalfSplit, gqa_group_size: 1,
-            tree_mask: false, gpu_sm: 75, segment_masked: false,
+            block_q: 32,
+            block_kv: 32,
+            head_dim: 32,
+            causal: false,
+            paged: false,
+            rope_q: false,
+            rope_style: RopeStyle::HalfSplit,
+            gqa_group_size: 1,
+            tree_mask: false,
+            gpu_sm: 75,
+            segment_masked: false,
             csha: Some(CshaExtras {
                 fused_projections: false,
                 save_activations_for_backward: true,
@@ -2003,10 +2178,17 @@ mod tests {
     #[test]
     fn save_softmax_state_diag_fmax_sources_from_softmax_capture() {
         let cfg = FlashAttentionConfig {
-            block_q: 32, block_kv: 32, head_dim: 32,
-            causal: false, paged: false, rope_q: false,
-            rope_style: RopeStyle::HalfSplit, gqa_group_size: 1,
-            tree_mask: false, gpu_sm: 75, segment_masked: false,
+            block_q: 32,
+            block_kv: 32,
+            head_dim: 32,
+            causal: false,
+            paged: false,
+            rope_q: false,
+            rope_style: RopeStyle::HalfSplit,
+            gqa_group_size: 1,
+            tree_mask: false,
+            gpu_sm: 75,
+            segment_masked: false,
             csha: Some(CshaExtras {
                 fused_projections: false,
                 save_activations_for_backward: true,
@@ -2035,10 +2217,17 @@ mod tests {
     #[test]
     fn save_softmax_state_diag_newmax_sources_from_online_update() {
         let cfg = FlashAttentionConfig {
-            block_q: 32, block_kv: 32, head_dim: 32,
-            causal: false, paged: false, rope_q: false,
-            rope_style: RopeStyle::HalfSplit, gqa_group_size: 1,
-            tree_mask: false, gpu_sm: 75, segment_masked: false,
+            block_q: 32,
+            block_kv: 32,
+            head_dim: 32,
+            causal: false,
+            paged: false,
+            rope_q: false,
+            rope_style: RopeStyle::HalfSplit,
+            gqa_group_size: 1,
+            tree_mask: false,
+            gpu_sm: 75,
+            segment_masked: false,
             csha: Some(CshaExtras {
                 fused_projections: false,
                 save_activations_for_backward: true,
@@ -2062,10 +2251,17 @@ mod tests {
     #[test]
     fn save_softmax_state_diag_fsum_sources_from_butterfly_sum() {
         let cfg = FlashAttentionConfig {
-            block_q: 32, block_kv: 32, head_dim: 32,
-            causal: false, paged: false, rope_q: false,
-            rope_style: RopeStyle::HalfSplit, gqa_group_size: 1,
-            tree_mask: false, gpu_sm: 75, segment_masked: false,
+            block_q: 32,
+            block_kv: 32,
+            head_dim: 32,
+            causal: false,
+            paged: false,
+            rope_q: false,
+            rope_style: RopeStyle::HalfSplit,
+            gqa_group_size: 1,
+            tree_mask: false,
+            gpu_sm: 75,
+            segment_masked: false,
             csha: Some(CshaExtras {
                 fused_projections: false,
                 save_activations_for_backward: true,
@@ -2097,7 +2293,9 @@ mod tests {
             rope_style: RopeStyle::HalfSplit,
             gqa_group_size: 1,
             tree_mask: false,
-            gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras {
+            gpu_sm: 75,
+            segment_masked: false,
+            csha: Some(CshaExtras {
                 fused_projections: true,
                 save_activations_for_backward: false,
                 d_model: 128,
@@ -2114,8 +2312,7 @@ mod tests {
     #[test]
     fn a4_rope_epilogue_placed_before_attention_body() {
         let cfg = base_cfg_for_rope_test();
-        let ptx_bytes =
-            crate::flash_attention_v2::synthesize_flash_attention_ptx_v2(&cfg);
+        let ptx_bytes = crate::flash_attention_v2::synthesize_flash_attention_ptx_v2(&cfg);
         // synthesize returns a NUL-terminated byte vec; drop the trailing NUL.
         let ptx = std::str::from_utf8(&ptx_bytes[..ptx_bytes.len().saturating_sub(1)])
             .expect("PTX should be valid UTF-8");
@@ -2141,8 +2338,7 @@ mod tests {
     #[test]
     fn a4_rope_k_epilogue_placed_before_s_compute_in_full_ptx() {
         let cfg = base_cfg_for_rope_test();
-        let ptx_bytes =
-            crate::flash_attention_v2::synthesize_flash_attention_ptx_v2(&cfg);
+        let ptx_bytes = crate::flash_attention_v2::synthesize_flash_attention_ptx_v2(&cfg);
         let ptx = std::str::from_utf8(&ptx_bytes[..ptx_bytes.len().saturating_sub(1)])
             .expect("PTX should be valid UTF-8");
 

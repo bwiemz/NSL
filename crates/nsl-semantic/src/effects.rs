@@ -2,8 +2,8 @@
 //!
 //! Pipeline: Phase 1 (local inference) → Phase 2 (call graph propagation) → Phase 3 (assertion validation)
 
-use std::collections::{HashMap, HashSet};
 use nsl_errors::Diagnostic;
+use std::collections::{HashMap, HashSet};
 
 // ---------------------------------------------------------------------------
 // EffectSet — bitset of computational effects
@@ -37,12 +37,22 @@ impl EffectSet {
 
     /// Human-readable effect list.
     pub fn display(&self) -> String {
-        if self.is_pure() { return "Pure".to_string(); }
+        if self.is_pure() {
+            return "Pure".to_string();
+        }
         let mut parts = Vec::new();
-        if self.contains(Self::IO) { parts.push("IO"); }
-        if self.contains(Self::RANDOM) { parts.push("Random"); }
-        if self.contains(Self::MUTATION) { parts.push("Mutation"); }
-        if self.contains(Self::COMMUNICATION) { parts.push("Communication"); }
+        if self.contains(Self::IO) {
+            parts.push("IO");
+        }
+        if self.contains(Self::RANDOM) {
+            parts.push("Random");
+        }
+        if self.contains(Self::MUTATION) {
+            parts.push("Mutation");
+        }
+        if self.contains(Self::COMMUNICATION) {
+            parts.push("Communication");
+        }
         parts.join(" + ")
     }
 
@@ -58,11 +68,15 @@ impl EffectSet {
 
 impl std::ops::BitOr for EffectSet {
     type Output = Self;
-    fn bitor(self, rhs: Self) -> Self { self.union(rhs) }
+    fn bitor(self, rhs: Self) -> Self {
+        self.union(rhs)
+    }
 }
 
 impl std::ops::BitOrAssign for EffectSet {
-    fn bitor_assign(&mut self, rhs: Self) { self.0 |= rhs.0; }
+    fn bitor_assign(&mut self, rhs: Self) {
+        self.0 |= rhs.0;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -73,45 +87,104 @@ impl std::ops::BitOrAssign for EffectSet {
 pub fn classify_builtin_effects(name: &str) -> EffectSet {
     match name {
         // IO effects
-        "print" | "println" | "eprint" | "eprintln"
-        | "read_line" | "read_file" | "write_file" | "open" | "close"
-        | "nsl_trace_record_op" | "nsl_trace_flush"
-        | "model_save" | "model_load"
-        | "nsl_model_save" | "nsl_model_load"
-        => EffectSet::IO,
+        "print"
+        | "println"
+        | "eprint"
+        | "eprintln"
+        | "read_line"
+        | "read_file"
+        | "write_file"
+        | "open"
+        | "close"
+        | "nsl_trace_record_op"
+        | "nsl_trace_flush"
+        | "model_save"
+        | "model_load"
+        | "nsl_model_save"
+        | "nsl_model_load" => EffectSet::IO,
 
         // Random effects
-        "rand" | "randn" | "random" | "random_normal" | "random_uniform"
-        | "dropout" | "bernoulli"
-        => EffectSet::RANDOM,
+        "rand" | "randn" | "random" | "random_normal" | "random_uniform" | "dropout"
+        | "bernoulli" => EffectSet::RANDOM,
 
         // Mutation effects
-        "nsl_tensor_add_inplace" | "nsl_tensor_zero_inplace"
-        | "nsl_tensor_copy_data" | "nsl_grad_zero"
-        => EffectSet::MUTATION,
+        "nsl_tensor_add_inplace"
+        | "nsl_tensor_zero_inplace"
+        | "nsl_tensor_copy_data"
+        | "nsl_grad_zero" => EffectSet::MUTATION,
 
         // Communication effects
-        "nsl_tp_all_reduce_sum" | "nsl_tp_all_gather" | "nsl_tp_broadcast"
-        | "nsl_tp_barrier" | "nsl_pipeline_send" | "nsl_pipeline_recv"
-        | "nsl_pipeline_send_grad" | "nsl_pipeline_recv_grad"
-        | "nccl_all_reduce" | "nccl_all_gather" | "nccl_broadcast"
-        => EffectSet::COMMUNICATION,
+        "nsl_tp_all_reduce_sum"
+        | "nsl_tp_all_gather"
+        | "nsl_tp_broadcast"
+        | "nsl_tp_barrier"
+        | "nsl_pipeline_send"
+        | "nsl_pipeline_recv"
+        | "nsl_pipeline_send_grad"
+        | "nsl_pipeline_recv_grad"
+        | "nccl_all_reduce"
+        | "nccl_all_gather"
+        | "nccl_broadcast" => EffectSet::COMMUNICATION,
 
         // Known pure operations (tensor math, reductions, activations, creation)
-        "relu" | "gelu" | "silu" | "sigmoid" | "tanh" | "softmax" | "log_softmax"
-        | "exp" | "log" | "sqrt" | "abs" | "sign" | "clamp" | "tensor_sin" | "tensor_cos" | "rotate_half"
-        | "matmul" | "nsl_tensor_matmul" | "nsl_tensor_add" | "nsl_tensor_sub"
-        | "nsl_tensor_mul" | "nsl_tensor_div" | "nsl_tensor_neg"
-        | "sum" | "mean" | "max" | "min" | "argmax"
-        | "nsl_tensor_sum" | "nsl_tensor_mean" | "nsl_tensor_reduce_max"
-        | "reshape" | "transpose" | "unsqueeze" | "squeeze" | "cat" | "stack" | "slice" | "contiguous"
-        | "zeros" | "ones" | "full" | "arange"
-        | "nsl_tensor_zeros" | "nsl_tensor_ones" | "nsl_tensor_full"
-        | "nsl_tensor_reshape" | "nsl_tensor_transpose" | "nsl_tensor_clone"
-        | "cross_entropy" | "mse_loss" | "l1_loss" | "bce_loss"
-        | "layernorm" | "rmsnorm" | "embedding_lookup"
-        | "nsl_tensor_softmax" | "nsl_tensor_gather"
-        => EffectSet::PURE,
+        "relu"
+        | "gelu"
+        | "silu"
+        | "sigmoid"
+        | "tanh"
+        | "softmax"
+        | "log_softmax"
+        | "exp"
+        | "log"
+        | "sqrt"
+        | "abs"
+        | "sign"
+        | "clamp"
+        | "tensor_sin"
+        | "tensor_cos"
+        | "rotate_half"
+        | "matmul"
+        | "nsl_tensor_matmul"
+        | "nsl_tensor_add"
+        | "nsl_tensor_sub"
+        | "nsl_tensor_mul"
+        | "nsl_tensor_div"
+        | "nsl_tensor_neg"
+        | "sum"
+        | "mean"
+        | "max"
+        | "min"
+        | "argmax"
+        | "nsl_tensor_sum"
+        | "nsl_tensor_mean"
+        | "nsl_tensor_reduce_max"
+        | "reshape"
+        | "transpose"
+        | "unsqueeze"
+        | "squeeze"
+        | "cat"
+        | "stack"
+        | "slice"
+        | "contiguous"
+        | "zeros"
+        | "ones"
+        | "full"
+        | "arange"
+        | "nsl_tensor_zeros"
+        | "nsl_tensor_ones"
+        | "nsl_tensor_full"
+        | "nsl_tensor_reshape"
+        | "nsl_tensor_transpose"
+        | "nsl_tensor_clone"
+        | "cross_entropy"
+        | "mse_loss"
+        | "l1_loss"
+        | "bce_loss"
+        | "layernorm"
+        | "rmsnorm"
+        | "embedding_lookup"
+        | "nsl_tensor_softmax"
+        | "nsl_tensor_gather" => EffectSet::PURE,
 
         // Unknown/unclassified: conservatively assume MUTATION only.
         // Most unrecognized builtins are tensor ops that mutate state but
@@ -167,7 +240,12 @@ impl EffectChecker {
     // --- Phase 0: Registration ---
 
     /// Register a function's direct (local) effects and its callees.
-    pub fn register_function(&mut self, name: &str, local_effects: EffectSet, callees: Vec<String>) {
+    pub fn register_function(
+        &mut self,
+        name: &str,
+        local_effects: EffectSet,
+        callees: Vec<String>,
+    ) {
         self.fn_effects.insert(name.to_string(), local_effects);
         self.call_graph.insert(name.to_string(), callees);
     }
@@ -212,13 +290,26 @@ impl EffectChecker {
             let names: Vec<String> = self.fn_effects.keys().cloned().collect();
             for name in &names {
                 let callees = self.call_graph.get(name).cloned().unwrap_or_default();
-                let mut total = self.fn_effects.get(name).copied().unwrap_or(EffectSet::PURE);
+                let mut total = self
+                    .fn_effects
+                    .get(name)
+                    .copied()
+                    .unwrap_or(EffectSet::PURE);
                 for callee in &callees {
-                    let callee_effects = self.fn_effects.get(callee).copied()
+                    let callee_effects = self
+                        .fn_effects
+                        .get(callee)
+                        .copied()
                         .unwrap_or_else(|| classify_builtin_effects(callee));
                     total |= callee_effects;
                 }
-                if total != self.fn_effects.get(name).copied().unwrap_or(EffectSet::PURE) {
+                if total
+                    != self
+                        .fn_effects
+                        .get(name)
+                        .copied()
+                        .unwrap_or(EffectSet::PURE)
+                {
                     self.fn_effects.insert(name.clone(), total);
                     changed = true;
                 }
@@ -232,48 +323,56 @@ impl EffectChecker {
     pub fn validate(&mut self) {
         // @pure: must have no effects
         for name in self.pure_fns.clone() {
-            let effects = self.fn_effects.get(&name).copied().unwrap_or(EffectSet::PURE);
+            let effects = self
+                .fn_effects
+                .get(&name)
+                .copied()
+                .unwrap_or(EffectSet::PURE);
             if !effects.is_pure() {
-                self.diagnostics.push(
-                    Diagnostic::error(format!(
-                        "@pure function '{}' has effects: {}",
-                        name, effects.display()
-                    )),
-                );
+                self.diagnostics.push(Diagnostic::error(format!(
+                    "@pure function '{}' has effects: {}",
+                    name,
+                    effects.display()
+                )));
             }
         }
 
         // @deterministic: must have no Random effect (unless controlled via explicit Rng param)
         for name in self.deterministic_fns.clone() {
-            let effects = self.fn_effects.get(&name).copied().unwrap_or(EffectSet::PURE);
+            let effects = self
+                .fn_effects
+                .get(&name)
+                .copied()
+                .unwrap_or(EffectSet::PURE);
             if !effects.is_deterministic() {
                 // Allow Random if the function takes an explicit Rng parameter —
                 // randomness is "controlled" (deterministic given the same seed).
                 if self.has_explicit_rng(&name) {
                     continue;
                 }
-                self.diagnostics.push(
-                    Diagnostic::error(format!(
-                        "@deterministic function '{}' has Random effect — \
+                self.diagnostics.push(Diagnostic::error(format!(
+                    "@deterministic function '{}' has Random effect — \
                          add an explicit `rng: Rng` parameter to make randomness controlled, \
                          or remove @deterministic",
-                        name
-                    )),
-                );
+                    name
+                )));
             }
         }
 
         // @checkpoint: requires @pure (recomputation must produce same result)
         for name in self.checkpointed_fns.clone() {
-            let effects = self.fn_effects.get(&name).copied().unwrap_or(EffectSet::PURE);
+            let effects = self
+                .fn_effects
+                .get(&name)
+                .copied()
+                .unwrap_or(EffectSet::PURE);
             if !effects.is_pure() {
-                self.diagnostics.push(
-                    Diagnostic::error(format!(
-                        "@checkpoint function '{}' has effects: {} — \
+                self.diagnostics.push(Diagnostic::error(format!(
+                    "@checkpoint function '{}' has effects: {} — \
                          @checkpoint recomputes during backward, requires @pure",
-                        name, effects.display()
-                    )),
-                );
+                    name,
+                    effects.display()
+                )));
             }
         }
     }
@@ -282,7 +381,10 @@ impl EffectChecker {
 
     /// Get the inferred effects for a function.
     pub fn get_effects(&self, name: &str) -> EffectSet {
-        self.fn_effects.get(name).copied().unwrap_or(EffectSet::PURE)
+        self.fn_effects
+            .get(name)
+            .copied()
+            .unwrap_or(EffectSet::PURE)
     }
 
     /// Check if a function is pure.
@@ -298,7 +400,9 @@ impl EffectChecker {
 }
 
 impl Default for EffectChecker {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[cfg(test)]
@@ -349,8 +453,14 @@ mod tests {
         assert_eq!(classify_builtin_effects("print"), EffectSet::IO);
         assert_eq!(classify_builtin_effects("rand"), EffectSet::RANDOM);
         assert_eq!(classify_builtin_effects("dropout"), EffectSet::RANDOM);
-        assert_eq!(classify_builtin_effects("nsl_tp_all_reduce_sum"), EffectSet::COMMUNICATION);
-        assert_eq!(classify_builtin_effects("nsl_tensor_add_inplace"), EffectSet::MUTATION);
+        assert_eq!(
+            classify_builtin_effects("nsl_tp_all_reduce_sum"),
+            EffectSet::COMMUNICATION
+        );
+        assert_eq!(
+            classify_builtin_effects("nsl_tensor_add_inplace"),
+            EffectSet::MUTATION
+        );
     }
 
     #[test]
@@ -378,7 +488,11 @@ mod tests {
     #[test]
     fn pure_function_validates() {
         let mut checker = EffectChecker::new();
-        checker.register_function("attention", EffectSet::PURE, vec!["matmul".into(), "softmax".into()]);
+        checker.register_function(
+            "attention",
+            EffectSet::PURE,
+            vec!["matmul".into(), "softmax".into()],
+        );
         checker.mark_pure("attention");
         checker.analyze();
         assert!(checker.diagnostics.is_empty());
@@ -419,7 +533,11 @@ mod tests {
     #[test]
     fn deterministic_without_random_passes() {
         let mut checker = EffectChecker::new();
-        checker.register_function("forward", EffectSet::PURE, vec!["matmul".into(), "relu".into()]);
+        checker.register_function(
+            "forward",
+            EffectSet::PURE,
+            vec!["matmul".into(), "relu".into()],
+        );
         checker.mark_deterministic("forward");
         checker.analyze();
         assert!(checker.diagnostics.is_empty());
@@ -438,7 +556,11 @@ mod tests {
     #[test]
     fn checkpoint_pure_passes() {
         let mut checker = EffectChecker::new();
-        checker.register_function("block", EffectSet::PURE, vec!["matmul".into(), "relu".into()]);
+        checker.register_function(
+            "block",
+            EffectSet::PURE,
+            vec!["matmul".into(), "relu".into()],
+        );
         checker.mark_checkpointed("block");
         checker.analyze();
         assert!(checker.diagnostics.is_empty());
@@ -470,9 +592,11 @@ mod tests {
         checker.analyze();
 
         // Should NOT produce a diagnostic — controlled randomness is allowed
-        assert!(checker.diagnostics.is_empty(),
+        assert!(
+            checker.diagnostics.is_empty(),
             "@deterministic should allow Random with explicit Rng, got: {:?}",
-            checker.diagnostics);
+            checker.diagnostics
+        );
     }
 
     #[test]
@@ -484,11 +608,17 @@ mod tests {
         // NOT calling mark_has_explicit_rng — no Rng param
         checker.analyze();
 
-        assert_eq!(checker.diagnostics.len(), 1,
-            "Should reject uncontrolled Random");
+        assert_eq!(
+            checker.diagnostics.len(),
+            1,
+            "Should reject uncontrolled Random"
+        );
         let msg = format!("{:?}", checker.diagnostics[0]);
         assert!(msg.contains("Random"), "Error should mention Random: {msg}");
-        assert!(msg.contains("Rng"), "Error should hint about adding Rng param: {msg}");
+        assert!(
+            msg.contains("Rng"),
+            "Error should hint about adding Rng param: {msg}"
+        );
     }
 
     #[test]
@@ -505,8 +635,11 @@ mod tests {
         // IO is not checked by @deterministic — only @pure checks all effects.
         // So this should pass (is_deterministic only cares about Random).
         // Let's verify:
-        assert!(checker.diagnostics.is_empty(),
-            "@deterministic only checks Random, not IO: {:?}", checker.diagnostics);
+        assert!(
+            checker.diagnostics.is_empty(),
+            "@deterministic only checks Random, not IO: {:?}",
+            checker.diagnostics
+        );
     }
 
     #[test]
@@ -610,10 +743,7 @@ mod tests {
     fn effect_collect_vars() {
         let sym1 = test_sym(1);
         let sym2 = test_sym(2);
-        let eff = Effect::Union(
-            Box::new(Effect::Var(sym1)),
-            Box::new(Effect::Var(sym2)),
-        );
+        let eff = Effect::Union(Box::new(Effect::Var(sym1)), Box::new(Effect::Var(sym2)));
         let mut vars = Vec::new();
         eff.collect_vars(&mut vars);
         assert_eq!(vars.len(), 2);
@@ -651,10 +781,8 @@ mod tests {
         // fn combine(f: fn() | E1, g: fn() | E2) -> T | E1 | E2
         let sym_e1 = test_sym(101);
         let sym_e2 = test_sym(102);
-        let return_effect = Effect::Union(
-            Box::new(Effect::Var(sym_e1)),
-            Box::new(Effect::Var(sym_e2)),
-        );
+        let return_effect =
+            Effect::Union(Box::new(Effect::Var(sym_e1)), Box::new(Effect::Var(sym_e2)));
         let mut bindings = std::collections::HashMap::new();
         bindings.insert(sym_e1, EffectSet::IO);
         bindings.insert(sym_e2, EffectSet::RANDOM);

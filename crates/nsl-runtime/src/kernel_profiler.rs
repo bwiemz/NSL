@@ -152,7 +152,9 @@ extern "C" fn kernel_profiler_atexit() {
         let path = "kernel_profile.json";
         let ptr = path.as_ptr();
         let len = path.len() as i64;
-        unsafe { nsl_kernel_profiler_flush(ptr, len); }
+        unsafe {
+            nsl_kernel_profiler_flush(ptr, len);
+        }
         eprintln!("[nsl] kernel profile written to {}", path);
     }
 }
@@ -254,15 +256,15 @@ pub(crate) fn flush_traces_gpu(path: &str) {
 
     KERNEL_PROFILER.enabled.store(false, Ordering::Relaxed);
 
-    unsafe { cuda::cu_ctx_synchronize(); }
+    unsafe {
+        cuda::cu_ctx_synchronize();
+    }
 
     let traces: Vec<KernelTrace> = {
         let mut guard = KERNEL_PROFILER.traces.lock().unwrap();
         std::mem::take(&mut *guard)
     };
-    let pool: Vec<(u64, u64)> = {
-        KERNEL_PROFILER.event_pool.lock().unwrap().clone()
-    };
+    let pool: Vec<(u64, u64)> = { KERNEL_PROFILER.event_pool.lock().unwrap().clone() };
     let base_event = *KERNEL_PROFILER.gpu_base_event.lock().unwrap();
     let cpu_start = 0.0f64;
 
@@ -270,7 +272,9 @@ pub(crate) fn flush_traces_gpu(path: &str) {
     let mut total_kernel_time_ms = 0.0f64;
 
     for trace in traces.iter() {
-        if trace.pool_idx >= pool.len() { continue; }
+        if trace.pool_idx >= pool.len() {
+            continue;
+        }
         let (start_event, stop_event) = pool[trace.pool_idx];
 
         let mut duration_ms: f32 = 0.0;
@@ -319,7 +323,9 @@ fn destroy_event_pool() {
     }
     let base = *KERNEL_PROFILER.gpu_base_event.lock().unwrap();
     if base != 0 {
-        unsafe { crate::cuda::cu_event_destroy(base); }
+        unsafe {
+            crate::cuda::cu_event_destroy(base);
+        }
         *KERNEL_PROFILER.gpu_base_event.lock().unwrap() = 0;
     }
     *KERNEL_PROFILER.pool_cursor.lock().unwrap() = 0;
@@ -334,7 +340,9 @@ pub unsafe extern "C" fn nsl_kernel_profiler_flush(path_ptr: *const u8, path_len
         "kernel_profile.json".to_string()
     } else {
         let bytes = std::slice::from_raw_parts(path_ptr, path_len as usize);
-        std::str::from_utf8(bytes).unwrap_or("kernel_profile.json").to_string()
+        std::str::from_utf8(bytes)
+            .unwrap_or("kernel_profile.json")
+            .to_string()
     };
 
     #[cfg(feature = "cuda")]
@@ -453,7 +461,10 @@ mod tests {
 
         // Verify JSON
         let mut contents = String::new();
-        std::fs::File::open(&tmp).unwrap().read_to_string(&mut contents).unwrap();
+        std::fs::File::open(&tmp)
+            .unwrap()
+            .read_to_string(&mut contents)
+            .unwrap();
         assert!(contents.contains("traceEvents"));
         assert!(contents.contains("matmul_256"));
         assert!(contents.contains("fused_relu_add"));

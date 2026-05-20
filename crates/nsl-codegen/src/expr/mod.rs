@@ -50,12 +50,7 @@ impl Compiler<'_> {
                     // subsequent consumer commits may inspect the map.
                     let ident_ty = self.node_type(expr.id).clone();
                     if ident_ty.is_tensor() || ident_ty.is_indeterminate() {
-                        self.set_ownership(
-                            builder,
-                            state,
-                            val,
-                            Ownership::BorrowedFromVar(var),
-                        );
+                        self.set_ownership(builder, state, val, Ownership::BorrowedFromVar(var));
                     }
                     // M38b: If ownership lowering says this linear binding should be
                     // freed at consumption, enqueue it for post-statement cleanup.
@@ -95,8 +90,12 @@ impl Compiler<'_> {
             ExprKind::BinaryOp { left, op, right } => {
                 self.compile_binary_op(builder, state, left, *op, right, expr)
             }
-            ExprKind::UnaryOp { op, operand } => self.compile_unary_op(builder, state, *op, operand),
-            ExprKind::Call { callee, args } => self.compile_call(builder, state, callee, args, expr),
+            ExprKind::UnaryOp { op, operand } => {
+                self.compile_unary_op(builder, state, *op, operand)
+            }
+            ExprKind::Call { callee, args } => {
+                self.compile_call(builder, state, callee, args, expr)
+            }
             ExprKind::MemberAccess { object, member } => {
                 self.compile_member_access(builder, state, object, *member, expr)
             }
@@ -290,7 +289,10 @@ impl Compiler<'_> {
         );
 
         if let Some(ref weight_map) = self.features.weight_map {
-            let candidates = [format!("{}.{}", model_name, field_name), field_name.to_string()];
+            let candidates = [
+                format!("{}.{}", model_name, field_name),
+                field_name.to_string(),
+            ];
             for key in &candidates {
                 if weight_map.get(key).is_some() {
                     state.weight_values.insert(field_val, key.clone());
@@ -305,8 +307,12 @@ impl Compiler<'_> {
 
         self.try_emit_retention_splice(builder, field_name, input_val);
         let flags_zero = builder.ins().iconst(cl_types::I8, 0);
-        self.compile_traced_call(builder, "nsl_tensor_matmul", &[input_val, field_val, flags_zero])
-            .map(Some)
+        self.compile_traced_call(
+            builder,
+            "nsl_tensor_matmul",
+            &[input_val, field_val, flags_zero],
+        )
+        .map(Some)
     }
 
     // ── M38b: Ownership-aware helpers ──────────────────────────────
@@ -466,16 +472,12 @@ impl Compiler<'_> {
             // `nsl_tensor_mul_scalar(tensor, f64)` would otherwise pass an f64
             // where the trace hook expects an i64, tripping Cranelift's verifier.
             let zero_i64 = builder.ins().iconst(cl_types::I64, 0);
-            let in0 = if !args.is_empty()
-                && builder.func.dfg.value_type(args[0]) == cl_types::I64
-            {
+            let in0 = if !args.is_empty() && builder.func.dfg.value_type(args[0]) == cl_types::I64 {
                 args[0]
             } else {
                 zero_i64
             };
-            let in1 = if args.len() > 1
-                && builder.func.dfg.value_type(args[1]) == cl_types::I64
-            {
+            let in1 = if args.len() > 1 && builder.func.dfg.value_type(args[1]) == cl_types::I64 {
                 args[1]
             } else {
                 zero_i64
@@ -561,17 +563,17 @@ impl Compiler<'_> {
             Some(id) => id,
             None => return, // arena not declared yet — skip
         };
-        let arena_gv = self.module.declare_data_in_func(arena_data_id, builder.func);
+        let arena_gv = self
+            .module
+            .declare_data_in_func(arena_data_id, builder.func);
         let arena_ptr = builder.ins().symbol_value(cl_types::I64, arena_gv);
 
         // Determine the data pointer inside the repr(C) NslTensor layout.
         const DATA_FIELD_OFFSET: i32 = nsl_runtime::tensor::NSL_TENSOR_DATA_OFFSET as i32;
-        let data_ptr = builder.ins().load(
-            cl_types::I64,
-            MemFlags::new(),
-            input_val,
-            DATA_FIELD_OFFSET,
-        );
+        let data_ptr =
+            builder
+                .ins()
+                .load(cl_types::I64, MemFlags::new(), input_val, DATA_FIELD_OFFSET);
 
         // Compute nbytes: batch * seq * in_features * 4.
         // These were baked into the arena layout at emit_retention_arena time.
@@ -582,11 +584,7 @@ impl Compiler<'_> {
         let nbytes = (batch * seq * in_features * 4) as u64;
 
         crate::calibration::retention::emit_splice_memcpy(
-            builder,
-            arena_ptr,
-            offset,
-            data_ptr,
-            nbytes,
+            builder, arena_ptr, offset, data_ptr, nbytes,
         );
         self.retention_splices_emitted = self.retention_splices_emitted.saturating_add(1);
     }

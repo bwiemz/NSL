@@ -60,18 +60,15 @@ fn current_commit_sha() -> String {
         .current_dir(env!("CARGO_MANIFEST_DIR"))
         .output();
     match output {
-        Ok(out) if out.status.success() => {
-            String::from_utf8(out.stdout)
-                .map(|s| s.trim().to_string())
-                .unwrap_or_else(|_| String::from("unknown-utf8-decode-failed"))
-        }
+        Ok(out) if out.status.success() => String::from_utf8(out.stdout)
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|_| String::from("unknown-utf8-decode-failed")),
         _ => String::from("unknown-git-failed"),
     }
 }
 
 fn fixture_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/bitnet_reference_outputs.json")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/bitnet_reference_outputs.json")
 }
 
 /// Helper: repeat the same `[hidden_dim]`-long row `hidden_dim` times to
@@ -169,11 +166,7 @@ fn build_fixture_inputs() -> Vec<(String, Vec<Vec<f32>>, Vec<Vec<i8>>)> {
     out
 }
 
-fn run_reference_on_fixture(
-    name: &str,
-    acts: &[Vec<f32>],
-    weights: &[Vec<i8>],
-) -> Fixture {
+fn run_reference_on_fixture(name: &str, acts: &[Vec<f32>], weights: &[Vec<i8>]) -> Fixture {
     let (scales, q_acts, output) = forward_reference(acts, weights);
     Fixture {
         name: name.to_string(),
@@ -246,8 +239,7 @@ fn reference_matches_committed_fixtures() {
     let path = fixture_path();
     let text = fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("Could not read {}: {e}", path.display()));
-    let file: FixtureFile =
-        serde_json::from_str(&text).expect("invalid fixture JSON");
+    let file: FixtureFile = serde_json::from_str(&text).expect("invalid fixture JSON");
     println!(
         "Validating reference against {} ({})",
         file.source, file.source_revision
@@ -310,8 +302,7 @@ fn reference_matches_committed_fixtures() {
                 "Fixture {}: output row {r} length mismatch",
                 fixture.name
             );
-            for (c, (&actual, &expected)) in
-                actual_row.iter().zip(expected_row.iter()).enumerate()
+            for (c, (&actual, &expected)) in actual_row.iter().zip(expected_row.iter()).enumerate()
             {
                 let abs_diff = (actual - expected).abs();
                 let rel_diff = abs_diff / expected.abs().max(1e-30);

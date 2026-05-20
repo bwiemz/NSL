@@ -46,10 +46,8 @@ pub fn validate_moe_decorator(
                         if let ExprKind::IntLiteral(n) = &arg.value.kind {
                             if *n != 1 && *n != 2 {
                                 diagnostics.push(
-                                    Diagnostic::error(
-                                        "@moe: top_k must be 1 or 2".to_string(),
-                                    )
-                                    .with_label(arg.span, "must be 1 or 2"),
+                                    Diagnostic::error("@moe: top_k must be 1 or 2".to_string())
+                                        .with_label(arg.span, "must be 1 or 2"),
                                 );
                             } else {
                                 top_k = *n as usize;

@@ -1,4 +1,6 @@
-use nsl_codegen::{compile_returning_plan, compile_returning_splice_count_for_tests, CompileOptions};
+use nsl_codegen::{
+    compile_returning_plan, compile_returning_splice_count_for_tests, CompileOptions,
+};
 
 const AUTO_DISCOVERY_FIXTURE: &str = r#"
 fn up_proj(x: Tensor) -> Tensor:
@@ -41,8 +43,7 @@ fn main():
 
 fn splice_count_for_source(source: &str) -> u32 {
     let mut interner = nsl_lexer::Interner::new();
-    let (tokens, lex_diags) =
-        nsl_lexer::tokenize(source, nsl_errors::FileId(0), &mut interner);
+    let (tokens, lex_diags) = nsl_lexer::tokenize(source, nsl_errors::FileId(0), &mut interner);
     assert!(
         lex_diags
             .iter()
@@ -79,8 +80,7 @@ fn splice_count_for_source(source: &str) -> u32 {
 
 fn compile_plan_error_for_source(source: &str) -> String {
     let mut interner = nsl_lexer::Interner::new();
-    let (tokens, lex_diags) =
-        nsl_lexer::tokenize(source, nsl_errors::FileId(0), &mut interner);
+    let (tokens, lex_diags) = nsl_lexer::tokenize(source, nsl_errors::FileId(0), &mut interner);
     assert!(
         lex_diags
             .iter()

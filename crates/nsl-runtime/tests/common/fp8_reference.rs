@@ -14,8 +14,9 @@ use nsl_runtime::fp8::{
 // fp8_dispatcher's no-cuda path uses neither) — silence the unused-import
 // warnings this produces in those binaries.
 #[allow(unused_imports)]
-pub use nsl_runtime::tensor::{test_build_tensor_2d_f32 as make_tensor_2d_f32,
-                               test_read_tensor_f32 as read_tensor_f32};
+pub use nsl_runtime::tensor::{
+    test_build_tensor_2d_f32 as make_tensor_2d_f32, test_read_tensor_f32 as read_tensor_f32,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Fp8Format {
@@ -101,12 +102,8 @@ pub fn seeded_input(len: usize, seed: u64) -> Vec<f32> {
     (0..len).map(|_| rng.gen_range(-1.0_f32..1.0)).collect()
 }
 
-pub const FIXTURE_SHAPES: &[(usize, usize, usize)] = &[
-    (16, 16, 16),
-    (32, 32, 32),
-    (64, 64, 64),
-    (128, 128, 128),
-];
+pub const FIXTURE_SHAPES: &[(usize, usize, usize)] =
+    &[(16, 16, 16), (32, 32, 32), (64, 64, 64), (128, 128, 128)];
 
 pub fn compute_pertensor_scale(a: &[f32], b: &[f32], fmt: Fp8Format) -> f32 {
     let combined: Vec<f64> = a.iter().chain(b.iter()).map(|&v| v as f64).collect();
@@ -117,16 +114,37 @@ pub fn assert_rel_err_le(test: &[f32], reference: &[f32], tol: f32, label: &str)
     assert_eq!(test.len(), reference.len(), "{label}: length mismatch");
     let max_ref_abs = reference.iter().map(|v| v.abs()).fold(0.0_f32, f32::max);
     if max_ref_abs < 1e-12 {
-        let max_abs_err = test.iter().zip(reference).map(|(t, r)| (t - r).abs()).fold(0.0_f32, f32::max);
-        assert!(max_abs_err < tol, "{label}: reference is ~zero; max abs err {max_abs_err} > tol {tol}");
+        let max_abs_err = test
+            .iter()
+            .zip(reference)
+            .map(|(t, r)| (t - r).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            max_abs_err < tol,
+            "{label}: reference is ~zero; max abs err {max_abs_err} > tol {tol}"
+        );
         return;
     }
-    let max_rel_err = test.iter().zip(reference).map(|(t, r)| (t - r).abs() / max_ref_abs).fold(0.0_f32, f32::max);
-    assert!(max_rel_err <= tol, "{label}: max rel err {max_rel_err} > tol {tol} (max_ref_abs = {max_ref_abs})");
+    let max_rel_err = test
+        .iter()
+        .zip(reference)
+        .map(|(t, r)| (t - r).abs() / max_ref_abs)
+        .fold(0.0_f32, f32::max);
+    assert!(
+        max_rel_err <= tol,
+        "{label}: max rel err {max_rel_err} > tol {tol} (max_ref_abs = {max_ref_abs})"
+    );
 }
 
 pub fn assert_abs_err_le(test: &[f32], reference: &[f32], tol: f32, label: &str) {
     assert_eq!(test.len(), reference.len(), "{label}: length mismatch");
-    let max_abs_err = test.iter().zip(reference).map(|(t, r)| (t - r).abs()).fold(0.0_f32, f32::max);
-    assert!(max_abs_err <= tol, "{label}: max abs err {max_abs_err} > tol {tol}");
+    let max_abs_err = test
+        .iter()
+        .zip(reference)
+        .map(|(t, r)| (t - r).abs())
+        .fold(0.0_f32, f32::max);
+    assert!(
+        max_abs_err <= tol,
+        "{label}: max abs err {max_abs_err} > tol {tol}"
+    );
 }

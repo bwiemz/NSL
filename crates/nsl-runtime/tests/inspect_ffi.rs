@@ -66,7 +66,8 @@ fn record_stats_creates_dir_if_missing() {
 
 #[test]
 fn nsl_tensor_stats_symbol_exists() {
-    let _f: extern "C" fn(i64, *mut f64) -> i32 = nsl_runtime::inspect::stats_kernel::nsl_tensor_stats;
+    let _f: extern "C" fn(i64, *mut f64) -> i32 =
+        nsl_runtime::inspect::stats_kernel::nsl_tensor_stats;
 }
 
 #[test]

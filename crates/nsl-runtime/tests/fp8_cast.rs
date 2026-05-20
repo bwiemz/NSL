@@ -66,8 +66,12 @@ fn cast_auto_scale_matches_explicit_scale() {
     let v_explicit = read_tensor_f32(out_explicit);
     let v_auto = read_tensor_f32(out_auto);
 
-    assert_abs_err_le(&v_auto, &v_explicit, 1e-6,
-        "auto-scale must match explicit scale exactly");
+    assert_abs_err_le(
+        &v_auto,
+        &v_explicit,
+        1e-6,
+        "auto-scale must match explicit scale exactly",
+    );
 
     nsl_tensor_free(input_a);
     nsl_tensor_free(input_b);

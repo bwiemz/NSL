@@ -71,8 +71,7 @@ impl KvQuantPlan {
         if self.bytes_per_token_uniform_fp16 == 0 {
             return 0.0;
         }
-        1.0 - (self.bytes_per_token_selected as f64
-            / self.bytes_per_token_uniform_fp16 as f64)
+        1.0 - (self.bytes_per_token_selected as f64 / self.bytes_per_token_uniform_fp16 as f64)
     }
     pub fn int8_layer_count(&self) -> usize {
         self.layers
@@ -121,7 +120,7 @@ fn position_factor(layer: u32, n_layers: u32) -> f64 {
     // U-shape with steeper endpoints — first and last layers must
     // survive at FP16.  Normalised to [0, 1] with peaks at 1.0.
     let t = layer as f64 / (n_layers - 1) as f64;
-    
+
     (2.0 * t - 1.0).abs()
 }
 
@@ -247,8 +246,8 @@ pub fn plan(cfg: &KvQuantConfig, weights: Option<&WeightMap>) -> KvQuantPlan {
                 }
             )
         };
-        total_selected_bytes += bytes_per_head_token
-            * (kp.byte_width() as u64 + vp.byte_width() as u64);
+        total_selected_bytes +=
+            bytes_per_head_token * (kp.byte_width() as u64 + vp.byte_width() as u64);
         cumulative_fp16 += total_fp16_bytes;
         layers.push(LayerKvDecision {
             layer,
@@ -305,7 +304,13 @@ mod tests {
     fn int8_layers_counted_correctly() {
         let cfg = KvQuantConfig::new(8, 4, 64);
         let plan = plan(&cfg, None);
-        assert_eq!(plan.int8_layer_count(), plan.layers.iter().filter(|l| matches!(l.k_precision, KvPrecision::Int8)).count());
+        assert_eq!(
+            plan.int8_layer_count(),
+            plan.layers
+                .iter()
+                .filter(|l| matches!(l.k_precision, KvPrecision::Int8))
+                .count()
+        );
         assert!(plan.int8_layer_count() > 0);
     }
 

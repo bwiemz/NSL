@@ -357,10 +357,26 @@ mod tests {
             start_state: 0,
             accept_states: vec![3],
             edges: vec![
-                GrammarEdge { from: 0, token_id: 0, to: 1 },
-                GrammarEdge { from: 0, token_id: 1, to: 2 },
-                GrammarEdge { from: 1, token_id: 0, to: 3 },
-                GrammarEdge { from: 2, token_id: 0, to: 3 },
+                GrammarEdge {
+                    from: 0,
+                    token_id: 0,
+                    to: 1,
+                },
+                GrammarEdge {
+                    from: 0,
+                    token_id: 1,
+                    to: 2,
+                },
+                GrammarEdge {
+                    from: 1,
+                    token_id: 0,
+                    to: 3,
+                },
+                GrammarEdge {
+                    from: 2,
+                    token_id: 0,
+                    to: 3,
+                },
             ],
         };
         let dfa = compile(&spec).unwrap();
@@ -397,8 +413,16 @@ mod tests {
             start_state: 0,
             accept_states: vec![2],
             edges: vec![
-                GrammarEdge { from: 0, token_id: 1, to: 1 },
-                GrammarEdge { from: 1, token_id: 2, to: 2 },
+                GrammarEdge {
+                    from: 0,
+                    token_id: 1,
+                    to: 1,
+                },
+                GrammarEdge {
+                    from: 1,
+                    token_id: 2,
+                    to: 2,
+                },
             ],
         };
         let dfa = compile(&spec).unwrap();
@@ -413,8 +437,16 @@ mod tests {
             start_state: 0,
             accept_states: vec![1],
             edges: vec![
-                GrammarEdge { from: 0, token_id: 1, to: 1 },
-                GrammarEdge { from: 0, token_id: 1, to: 1 }, // duplicate
+                GrammarEdge {
+                    from: 0,
+                    token_id: 1,
+                    to: 1,
+                },
+                GrammarEdge {
+                    from: 0,
+                    token_id: 1,
+                    to: 1,
+                }, // duplicate
             ],
         };
         let dfa = compile(&spec).unwrap();

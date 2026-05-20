@@ -1,8 +1,8 @@
 //! Copy-on-Write page branching for speculative decoding (M33).
 
-use super::BlockId;
 use super::block_alloc::BlockAllocator;
 use super::page_table::PageTable;
+use super::BlockId;
 
 /// Branch a sequence's page table for speculative decoding.
 /// The child shares all physical pages with the parent.

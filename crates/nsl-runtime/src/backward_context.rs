@@ -12,7 +12,7 @@
 /// Context for storing intermediate tensors needed by the backward pass.
 /// Created per `grad` block with a fixed number of slots determined at compile time.
 pub struct BackwardContext {
-    slots: Vec<i64>,  // i64 tensor pointers (0 = empty)
+    slots: Vec<i64>, // i64 tensor pointers (0 = empty)
     num_slots: usize,
 }
 
@@ -65,7 +65,9 @@ pub extern "C" fn nsl_backward_ctx_new(num_slots: i64) -> i64 {
 /// Returns 0 on success, -1 if handle is null.
 #[no_mangle]
 pub extern "C" fn nsl_backward_ctx_save(ctx_handle: i64, slot: i64, tensor_ptr: i64) -> i64 {
-    if ctx_handle == 0 { return -1; }
+    if ctx_handle == 0 {
+        return -1;
+    }
     let ctx = unsafe { &mut *(ctx_handle as *mut BackwardContext) };
     ctx.save(slot as usize, tensor_ptr);
     0
@@ -75,7 +77,9 @@ pub extern "C" fn nsl_backward_ctx_save(ctx_handle: i64, slot: i64, tensor_ptr: 
 /// Returns the tensor pointer, or 0 if slot is empty/invalid or handle is null.
 #[no_mangle]
 pub extern "C" fn nsl_backward_ctx_load(ctx_handle: i64, slot: i64) -> i64 {
-    if ctx_handle == 0 { return 0; }
+    if ctx_handle == 0 {
+        return 0;
+    }
     let ctx = unsafe { &*(ctx_handle as *const BackwardContext) };
     ctx.load(slot as usize)
 }
@@ -84,8 +88,12 @@ pub extern "C" fn nsl_backward_ctx_load(ctx_handle: i64, slot: i64) -> i64 {
 /// Returns 0 on success, -1 if handle is null.
 #[no_mangle]
 pub extern "C" fn nsl_backward_ctx_free(ctx_handle: i64) -> i64 {
-    if ctx_handle == 0 { return -1; }
-    unsafe { drop(Box::from_raw(ctx_handle as *mut BackwardContext)); }
+    if ctx_handle == 0 {
+        return -1;
+    }
+    unsafe {
+        drop(Box::from_raw(ctx_handle as *mut BackwardContext));
+    }
     0
 }
 

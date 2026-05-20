@@ -1,4 +1,3 @@
-use serde::Serialize;
 use crate::block::*;
 use crate::decl::*;
 use crate::expr::{Expr, MatchArm};
@@ -6,6 +5,7 @@ use crate::operator::AssignOp;
 use crate::pattern::Pattern;
 use crate::types::TypeExpr;
 use crate::{NodeId, Span};
+use serde::Serialize;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Stmt {

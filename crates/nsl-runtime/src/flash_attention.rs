@@ -10,9 +10,9 @@ use std::ffi::c_void;
 #[cfg(feature = "cuda")]
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::tensor::NslTensor;
 #[cfg(feature = "cuda")]
 use crate::autodiff;
+use crate::tensor::NslTensor;
 
 /// One-time log guard: prints the selected kernel variant (FA3 or FA2) only once.
 #[cfg(feature = "cuda")]
@@ -22,10 +22,16 @@ static FA_VARIANT_LOGGED: AtomicBool = AtomicBool::new(false);
 /// Returns 0 on success, -1 if the launch failed (caller should fall back to FA2).
 #[cfg(feature = "cuda")]
 fn flash_attention_hopper(
-    q_ptr: i64, k_ptr: i64, v_ptr: i64,
-    out_ptr: i64, logsumexp_ptr: i64,
+    q_ptr: i64,
+    k_ptr: i64,
+    v_ptr: i64,
+    out_ptr: i64,
+    logsumexp_ptr: i64,
     scale: f32,
-    batch: i64, heads: i64, seq_len: i64, head_dim: i64,
+    batch: i64,
+    heads: i64,
+    seq_len: i64,
+    head_dim: i64,
     causal: bool,
 ) -> i64 {
     use crate::cuda::kernels_hopper::{generate_flash_attention_3_ptx, FA3Config};
@@ -63,18 +69,18 @@ fn flash_attention_hopper(
     let mut num_kv = config.num_kv_tiles() as u64;
 
     let args: [*mut c_void; 9] = [
-        &mut q_data   as *mut _ as *mut c_void,
-        &mut k_data   as *mut _ as *mut c_void,
-        &mut v_data   as *mut _ as *mut c_void,
-        &mut o_data   as *mut _ as *mut c_void,
+        &mut q_data as *mut _ as *mut c_void,
+        &mut k_data as *mut _ as *mut c_void,
+        &mut v_data as *mut _ as *mut c_void,
+        &mut o_data as *mut _ as *mut c_void,
         &mut lse_data as *mut _ as *mut c_void,
         &mut scale_val as *mut _ as *mut c_void,
-        &mut seq_val  as *mut _ as *mut c_void,
-        &mut hd_val   as *mut _ as *mut c_void,
-        &mut num_kv   as *mut _ as *mut c_void,
+        &mut seq_val as *mut _ as *mut c_void,
+        &mut hd_val as *mut _ as *mut c_void,
+        &mut num_kv as *mut _ as *mut c_void,
     ];
 
-    let grid  = config.grid();
+    let grid = config.grid();
     let block = config.block();
     let shared = config.shared_mem_bytes();
 
@@ -95,7 +101,9 @@ fn flash_attention_hopper(
         return -1;
     }
 
-    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+    unsafe {
+        cudarc::driver::sys::cuCtxSynchronize();
+    }
     0
 }
 
@@ -131,43 +139,43 @@ fn flash_attention_hopper(
 /// `docs/superpowers/specs/2026-05-15-tier-b-bii-smem-probe-findings.md`.
 #[no_mangle]
 pub extern "C" fn nsl_flash_attention(
-    q_ptr: i64, k_ptr: i64, v_ptr: i64,
+    q_ptr: i64,
+    k_ptr: i64,
+    v_ptr: i64,
     out_ptr: i64,
-    logsumexp_ptr: i64,  // backward aux output (0 = skip, inference-only)
+    logsumexp_ptr: i64, // backward aux output (0 = skip, inference-only)
     scale_bits: i64,
-    batch: i64, heads: i64, seq_len: i64, head_dim: i64,
+    batch: i64,
+    heads: i64,
+    seq_len: i64,
+    head_dim: i64,
     block_table_ptr: i64,
-    k_pool_ptr: i64, v_pool_ptr: i64,
+    k_pool_ptr: i64,
+    v_pool_ptr: i64,
     block_size: i64,
-    cos_ptr: i64, sin_ptr: i64,
-    seq_ids_ptr: i64, seq_lens_ptr: i64,
+    cos_ptr: i64,
+    sin_ptr: i64,
+    seq_ids_ptr: i64,
+    seq_lens_ptr: i64,
     shared_mem_bytes: i64,
-    ptx_ptr: i64, name_ptr: i64,
-    block_q: i64, _block_kv: i64,
+    ptx_ptr: i64,
+    name_ptr: i64,
+    block_q: i64,
+    _block_kv: i64,
     causal: i64,
     // Tier B extension (planner spec §4):
     tier_b_ptx_ptr: i64,
     tier_b_name_ptr: i64,
 ) -> i64 {
-    use crate::pca_tier_b_runtime::{
-        assert_tier_b_sentinels, should_dispatch_tier_b_at_runtime,
-    };
+    use crate::pca_tier_b_runtime::{assert_tier_b_sentinels, should_dispatch_tier_b_at_runtime};
 
     // Tier B extension entry: assert sentinel agreement (planner spec §4.3).
-    assert_tier_b_sentinels(
-        "nsl_flash_attention",
-        tier_b_ptx_ptr,
-        tier_b_name_ptr,
-    );
+    assert_tier_b_sentinels("nsl_flash_attention", tier_b_ptx_ptr, tier_b_name_ptr);
 
     // Tier B extension: pick effective PTX/name based on runtime gate (planner spec §6.3).
     // Non-CSHA path has no segment_ids_ptr parameter; pass 0, gate always returns false.
     let (effective_ptx_ptr, effective_name_ptr) =
-        if should_dispatch_tier_b_at_runtime(
-            tier_b_ptx_ptr,
-            0,
-            seq_len as u32,
-        ) {
+        if should_dispatch_tier_b_at_runtime(tier_b_ptx_ptr, 0, seq_len as u32) {
             (tier_b_ptx_ptr, tier_b_name_ptr)
         } else {
             (ptx_ptr, name_ptr)
@@ -242,9 +250,16 @@ pub extern "C" fn nsl_flash_attention(
         let sm = crate::cuda::inner::detect_sm_version();
         let fa3_ok = if sm >= 90 {
             let fa3_result = flash_attention_hopper(
-                q_ptr, k_ptr, v_ptr, out_ptr, logsumexp_ptr,
+                q_ptr,
+                k_ptr,
+                v_ptr,
+                out_ptr,
+                logsumexp_ptr,
                 f32::from_bits(scale_bits as u32),
-                batch, heads, seq_len, head_dim,
+                batch,
+                heads,
+                seq_len,
+                head_dim,
                 causal != 0,
             );
             if fa3_result == 0 {
@@ -280,19 +295,34 @@ pub extern "C" fn nsl_flash_attention(
         if autodiff::is_recording() {
             let scale = f32::from_bits(scale_bits as u32);
             // Bump refcounts on Q, K, V so they survive until backward
-            NslTensor::from_ptr(q_ptr).refcount.fetch_add(1, Ordering::SeqCst);
-            NslTensor::from_ptr(k_ptr).refcount.fetch_add(1, Ordering::SeqCst);
-            NslTensor::from_ptr(v_ptr).refcount.fetch_add(1, Ordering::SeqCst);
+            NslTensor::from_ptr(q_ptr)
+                .refcount
+                .fetch_add(1, Ordering::SeqCst);
+            NslTensor::from_ptr(k_ptr)
+                .refcount
+                .fetch_add(1, Ordering::SeqCst);
+            NslTensor::from_ptr(v_ptr)
+                .refcount
+                .fetch_add(1, Ordering::SeqCst);
             // Bump refcount on out so it survives until backward (needed for D[i] = dO . O)
-            NslTensor::from_ptr(out_ptr).refcount.fetch_add(1, Ordering::SeqCst);
+            NslTensor::from_ptr(out_ptr)
+                .refcount
+                .fetch_add(1, Ordering::SeqCst);
             // Bump refcount on logsumexp so it survives until backward
-            NslTensor::from_ptr(logsumexp_ptr).refcount.fetch_add(1, Ordering::SeqCst);
+            NslTensor::from_ptr(logsumexp_ptr)
+                .refcount
+                .fetch_add(1, Ordering::SeqCst);
             autodiff::maybe_record(autodiff::TapeOp::FlashAttention {
-                q: q_ptr, k: k_ptr, v: v_ptr,
+                q: q_ptr,
+                k: k_ptr,
+                v: v_ptr,
                 out: out_ptr,
                 logsumexp: logsumexp_ptr,
                 scale,
-                batch, heads, seq_len, head_dim,
+                batch,
+                heads,
+                seq_len,
+                head_dim,
                 causal: causal != 0,
                 saved_q: q_ptr,
                 saved_k: k_ptr,
@@ -308,9 +338,18 @@ pub extern "C" fn nsl_flash_attention(
         let _ = (batch, heads, seq_len, head_dim);
         let _ = (block_table_ptr, k_pool_ptr, v_pool_ptr, block_size);
         let _ = (cos_ptr, sin_ptr, seq_ids_ptr, seq_lens_ptr);
-        let _ = (shared_mem_bytes, ptx_ptr, name_ptr, block_q, _block_kv, causal);
+        let _ = (
+            shared_mem_bytes,
+            ptx_ptr,
+            name_ptr,
+            block_q,
+            _block_kv,
+            causal,
+        );
         let _ = (effective_ptx_ptr, effective_name_ptr);
-        eprintln!("[nsl] FlashAttention requires CUDA. Use naive path (no @flash_attention decorator).");
+        eprintln!(
+            "[nsl] FlashAttention requires CUDA. Use naive path (no @flash_attention decorator)."
+        );
         -1
     }
 }
@@ -362,7 +401,7 @@ fn csha_tensor_data_ptr(tensor_ptr: i64) -> u64 {
     // `cuMemAlloc`/`cuMemAllocPitch` results.
     unsafe {
         use cudarc::driver::sys::{
-            cuPointerGetAttribute, CUpointer_attribute, CUmemorytype, CUresult,
+            cuPointerGetAttribute, CUmemorytype, CUpointer_attribute, CUresult,
         };
         let mut mem_type: u32 = 0;
         let rc = cuPointerGetAttribute(
@@ -370,9 +409,7 @@ fn csha_tensor_data_ptr(tensor_ptr: i64) -> u64 {
             CUpointer_attribute::CU_POINTER_ATTRIBUTE_MEMORY_TYPE,
             tensor_ptr as cudarc::driver::sys::CUdeviceptr,
         );
-        if rc == CUresult::CUDA_SUCCESS
-            && mem_type == CUmemorytype::CU_MEMORYTYPE_DEVICE as u32
-        {
+        if rc == CUresult::CUDA_SUCCESS && mem_type == CUmemorytype::CU_MEMORYTYPE_DEVICE as u32 {
             // Raw device pointer — test-only path. Pass through.
             return tensor_ptr as u64;
         }
@@ -432,11 +469,12 @@ fn csha_block_x_for_kernel(name_ptr: i64) -> i64 {
     if name_ptr == 0 {
         return 128;
     }
-    let name_bytes = unsafe {
-        std::ffi::CStr::from_ptr(name_ptr as *const i8).to_bytes()
-    };
+    let name_bytes = unsafe { std::ffi::CStr::from_ptr(name_ptr as *const i8).to_bytes() };
     // Marker is short (8 bytes); scan is O(name_len * 8) per launch.
-    if name_bytes.windows(b"_tier_b1".len()).any(|w| w == b"_tier_b1") {
+    if name_bytes
+        .windows(b"_tier_b1".len())
+        .any(|w| w == b"_tier_b1")
+    {
         256
     } else {
         128
@@ -457,13 +495,14 @@ fn csha_tier_b1_chunk_for_kernel(name_ptr: i64) -> Option<u32> {
     if name_ptr == 0 {
         return None;
     }
-    let name_bytes = unsafe {
-        std::ffi::CStr::from_ptr(name_ptr as *const i8).to_bytes()
-    };
+    let name_bytes = unsafe { std::ffi::CStr::from_ptr(name_ptr as *const i8).to_bytes() };
     let marker = b"_tier_b1_chunk";
     let pos = name_bytes.windows(marker.len()).position(|w| w == marker)?;
     let rest = &name_bytes[pos + marker.len()..];
-    let end = rest.iter().position(|&b| !b.is_ascii_digit()).unwrap_or(rest.len());
+    let end = rest
+        .iter()
+        .position(|&b| !b.is_ascii_digit())
+        .unwrap_or(rest.len());
     if end == 0 {
         return None;
     }
@@ -489,7 +528,9 @@ impl Drop for PrepassScratch {
         unsafe {
             cudarc::driver::sys::cuCtxSynchronize();
             if !self.x_scratch.is_null() {
-                let _ = cudarc::driver::sys::cuMemFree_v2(self.x_scratch as cudarc::driver::sys::CUdeviceptr);
+                let _ = cudarc::driver::sys::cuMemFree_v2(
+                    self.x_scratch as cudarc::driver::sys::CUdeviceptr,
+                );
             }
         }
     }
@@ -509,9 +550,14 @@ impl Drop for PrepassScratch {
 #[cfg(feature = "cuda")]
 fn csha_tier_b1_prepass_substitute(
     name_ptr: i64,
-    x_data: u64, nw_data: u64,
-    wq_data: u64, wk_data: u64, wv_data: u64,
-    seq_len: i64, head_dim: i64, d_model: i64,
+    x_data: u64,
+    nw_data: u64,
+    wq_data: u64,
+    wk_data: u64,
+    wv_data: u64,
+    seq_len: i64,
+    head_dim: i64,
+    d_model: i64,
     rmsnorm_eps_bits: i64,
 ) -> Option<(u64, u64, u64, u64, PrepassScratch)> {
     let chunk = csha_tier_b1_chunk_for_kernel(name_ptr)? as u64;
@@ -521,7 +567,13 @@ fn csha_tier_b1_prepass_substitute(
     let seq = seq_len as u64;
     let dm = d_model as u64;
     let hd = head_dim as u64;
-    debug_assert_eq!(dm % chunk, 0, "d_model ({}) must be divisible by chunk ({})", dm, chunk);
+    debug_assert_eq!(
+        dm % chunk,
+        0,
+        "d_model ({}) must be divisible by chunk ({})",
+        dm,
+        chunk
+    );
     let n_chunks = dm / chunk;
     // X scratch is per-call (x changes every step). W is cached
     // process-globally (weights are static across inference calls).
@@ -533,7 +585,13 @@ fn csha_tier_b1_prepass_substitute(
     let scratch = PrepassScratch { x_scratch };
     let eps = f32::from_bits(rmsnorm_eps_bits as u32);
     let rc_x = crate::cuda::tier_b1_prepass::launch_x_prepass(
-        x_data, nw_data, scratch.x_scratch as u64, seq, dm, chunk, eps,
+        x_data,
+        nw_data,
+        scratch.x_scratch as u64,
+        seq,
+        dm,
+        chunk,
+        eps,
     );
     if rc_x as u32 != 0 {
         eprintln!("[csha-tier-b1] x prepass launch failed rc={:?}", rc_x);
@@ -542,7 +600,13 @@ fn csha_tier_b1_prepass_substitute(
     let wq_cached = crate::cuda::tier_b1_prepass::w_chunkified_cached(wq_data, dm, hd, chunk)?;
     let wk_cached = crate::cuda::tier_b1_prepass::w_chunkified_cached(wk_data, dm, hd, chunk)?;
     let wv_cached = crate::cuda::tier_b1_prepass::w_chunkified_cached(wv_data, dm, hd, chunk)?;
-    Some((scratch.x_scratch as u64, wq_cached, wk_cached, wv_cached, scratch))
+    Some((
+        scratch.x_scratch as u64,
+        wq_cached,
+        wk_cached,
+        wv_cached,
+        scratch,
+    ))
 }
 
 /// A.2.5: this replaces the pre-A.2.5 forwarder (which invoked
@@ -578,19 +642,29 @@ fn csha_tier_b1_prepass_substitute(
 /// `docs/superpowers/specs/2026-05-15-tier-b-bii-smem-probe-findings.md`.
 #[no_mangle]
 pub extern "C" fn nsl_flash_attention_csha(
-    q_ptr: i64, k_ptr: i64, v_ptr: i64,
+    q_ptr: i64,
+    k_ptr: i64,
+    v_ptr: i64,
     out_ptr: i64,
     logsumexp_ptr: i64,
     scale_bits: i64,
-    batch: i64, heads: i64, seq_len: i64, head_dim: i64,
+    batch: i64,
+    heads: i64,
+    seq_len: i64,
+    head_dim: i64,
     block_table_ptr: i64,
-    k_pool_ptr: i64, v_pool_ptr: i64,
+    k_pool_ptr: i64,
+    v_pool_ptr: i64,
     block_size: i64,
-    cos_ptr: i64, sin_ptr: i64,
-    seq_ids_ptr: i64, seq_lens_ptr: i64,
+    cos_ptr: i64,
+    sin_ptr: i64,
+    seq_ids_ptr: i64,
+    seq_lens_ptr: i64,
     shared_mem_bytes: i64,
-    ptx_ptr: i64, name_ptr: i64,
-    block_q: i64, _block_kv: i64,
+    ptx_ptr: i64,
+    name_ptr: i64,
+    block_q: i64,
+    _block_kv: i64,
     causal: i64,
     // CSHA extras consumed by the PTX prologue/projection/epilogue
     // scaffolds (A.2.2/A.2.3/A.2.4). Each pointer is null-checked
@@ -598,7 +672,10 @@ pub extern "C" fn nsl_flash_attention_csha(
     // to the classic path without dereferencing garbage.
     x_ptr: i64,
     norm_weight_ptr: i64,
-    wq_ptr: i64, wk_ptr: i64, wv_ptr: i64, wo_ptr: i64,
+    wq_ptr: i64,
+    wk_ptr: i64,
+    wv_ptr: i64,
+    wo_ptr: i64,
     rmsnorm_eps_bits: i64,
     active_heads: i64,
     d_model: i64,
@@ -619,24 +696,14 @@ pub extern "C" fn nsl_flash_attention_csha(
     // loads only its row's 1028-byte subtable. See spec §3.
     doc_starts_ptr: i64,
 ) -> i64 {
-    use crate::pca_tier_b_runtime::{
-        assert_tier_b_sentinels, should_dispatch_tier_b_at_runtime,
-    };
+    use crate::pca_tier_b_runtime::{assert_tier_b_sentinels, should_dispatch_tier_b_at_runtime};
 
     // Tier B extension entry: assert sentinel agreement (planner spec §4.3).
-    assert_tier_b_sentinels(
-        "nsl_flash_attention_csha",
-        tier_b_ptx_ptr,
-        tier_b_name_ptr,
-    );
+    assert_tier_b_sentinels("nsl_flash_attention_csha", tier_b_ptx_ptr, tier_b_name_ptr);
 
     // Tier B extension: pick effective PTX/name based on runtime gate (planner spec §6.3).
     let (effective_ptx_ptr, effective_name_ptr) =
-        if should_dispatch_tier_b_at_runtime(
-            tier_b_ptx_ptr,
-            segment_ids_ptr,
-            seq_len as u32,
-        ) {
+        if should_dispatch_tier_b_at_runtime(tier_b_ptx_ptr, segment_ids_ptr, seq_len as u32) {
             (tier_b_ptx_ptr, tier_b_name_ptr)
         } else {
             (ptx_ptr, name_ptr)
@@ -744,11 +811,16 @@ pub extern "C" fn nsl_flash_attention_csha(
         let _prepass_handle = if let Some((nx, nwq, nwk, nwv, handle)) =
             csha_tier_b1_prepass_substitute(
                 effective_name_ptr,
-                x, nw, wq, wk, wv,
-                seq_len, head_dim, d_model,
+                x,
+                nw,
+                wq,
+                wk,
+                wv,
+                seq_len,
+                head_dim,
+                d_model,
                 rmsnorm_eps_bits,
-            )
-        {
+            ) {
             x = nx;
             wq = nwq;
             wk = nwk;
@@ -830,17 +902,32 @@ pub extern "C" fn nsl_flash_attention_csha(
         // from the same pointers the caller supplied.
         if autodiff::is_recording() {
             let scale = f32::from_bits(scale_bits as u32);
-            NslTensor::from_ptr(q_ptr).refcount.fetch_add(1, Ordering::SeqCst);
-            NslTensor::from_ptr(k_ptr).refcount.fetch_add(1, Ordering::SeqCst);
-            NslTensor::from_ptr(v_ptr).refcount.fetch_add(1, Ordering::SeqCst);
-            NslTensor::from_ptr(out_ptr).refcount.fetch_add(1, Ordering::SeqCst);
-            NslTensor::from_ptr(logsumexp_ptr).refcount.fetch_add(1, Ordering::SeqCst);
+            NslTensor::from_ptr(q_ptr)
+                .refcount
+                .fetch_add(1, Ordering::SeqCst);
+            NslTensor::from_ptr(k_ptr)
+                .refcount
+                .fetch_add(1, Ordering::SeqCst);
+            NslTensor::from_ptr(v_ptr)
+                .refcount
+                .fetch_add(1, Ordering::SeqCst);
+            NslTensor::from_ptr(out_ptr)
+                .refcount
+                .fetch_add(1, Ordering::SeqCst);
+            NslTensor::from_ptr(logsumexp_ptr)
+                .refcount
+                .fetch_add(1, Ordering::SeqCst);
             autodiff::maybe_record(autodiff::TapeOp::FlashAttention {
-                q: q_ptr, k: k_ptr, v: v_ptr,
+                q: q_ptr,
+                k: k_ptr,
+                v: v_ptr,
                 out: out_ptr,
                 logsumexp: logsumexp_ptr,
                 scale,
-                batch, heads, seq_len, head_dim,
+                batch,
+                heads,
+                seq_len,
+                head_dim,
                 causal: causal != 0,
                 saved_q: q_ptr,
                 saved_k: k_ptr,
@@ -856,10 +943,28 @@ pub extern "C" fn nsl_flash_attention_csha(
         let _ = (batch, heads, seq_len, head_dim);
         let _ = (block_table_ptr, k_pool_ptr, v_pool_ptr, block_size);
         let _ = (cos_ptr, sin_ptr, seq_ids_ptr, seq_lens_ptr);
-        let _ = (shared_mem_bytes, ptx_ptr, name_ptr, block_q, _block_kv, causal);
+        let _ = (
+            shared_mem_bytes,
+            ptx_ptr,
+            name_ptr,
+            block_q,
+            _block_kv,
+            causal,
+        );
         let _ = (x_ptr, norm_weight_ptr, wq_ptr, wk_ptr, wv_ptr, wo_ptr);
-        let _ = (rmsnorm_eps_bits, active_heads, d_model, segment_ids_ptr, doc_starts_ptr);
-        let _ = (tier_b_ptx_ptr, tier_b_name_ptr, effective_ptx_ptr, effective_name_ptr);
+        let _ = (
+            rmsnorm_eps_bits,
+            active_heads,
+            d_model,
+            segment_ids_ptr,
+            doc_starts_ptr,
+        );
+        let _ = (
+            tier_b_ptx_ptr,
+            tier_b_name_ptr,
+            effective_ptx_ptr,
+            effective_name_ptr,
+        );
         eprintln!("[nsl] CSHA FlashAttention requires CUDA; non-CUDA build cannot launch.");
         -1
     }
@@ -906,27 +1011,45 @@ pub extern "C" fn nsl_flash_attention_csha(
 #[no_mangle]
 #[allow(clippy::too_many_arguments)]
 pub extern "C" fn nsl_flash_attention_csha_with_saves(
-    q_ptr: i64, k_ptr: i64, v_ptr: i64,
+    q_ptr: i64,
+    k_ptr: i64,
+    v_ptr: i64,
     out_ptr: i64,
     logsumexp_ptr: i64,
     scale_bits: i64,
-    batch: i64, heads: i64, seq_len: i64, head_dim: i64,
+    batch: i64,
+    heads: i64,
+    seq_len: i64,
+    head_dim: i64,
     block_table_ptr: i64,
-    k_pool_ptr: i64, v_pool_ptr: i64,
+    k_pool_ptr: i64,
+    v_pool_ptr: i64,
     block_size: i64,
-    cos_ptr: i64, sin_ptr: i64,
-    seq_ids_ptr: i64, seq_lens_ptr: i64,
+    cos_ptr: i64,
+    sin_ptr: i64,
+    seq_ids_ptr: i64,
+    seq_lens_ptr: i64,
     shared_mem_bytes: i64,
-    ptx_ptr: i64, name_ptr: i64,
-    block_q: i64, _block_kv: i64,
+    ptx_ptr: i64,
+    name_ptr: i64,
+    block_q: i64,
+    _block_kv: i64,
     causal: i64,
-    x_ptr: i64, norm_weight_ptr: i64,
-    wq_ptr: i64, wk_ptr: i64, wv_ptr: i64, wo_ptr: i64,
+    x_ptr: i64,
+    norm_weight_ptr: i64,
+    wq_ptr: i64,
+    wk_ptr: i64,
+    wv_ptr: i64,
+    wo_ptr: i64,
     rmsnorm_eps_bits: i64,
-    active_heads: i64, d_model: i64,
+    active_heads: i64,
+    d_model: i64,
     // Tier C activation-save pointers.
-    q_proj_ptr: i64, k_proj_ptr: i64, v_proj_ptr: i64,
-    row_max_ptr: i64, row_sum_ptr: i64,
+    q_proj_ptr: i64,
+    k_proj_ptr: i64,
+    v_proj_ptr: i64,
+    row_max_ptr: i64,
+    row_sum_ptr: i64,
     // Tier C: raw-x save pointer (forward stages a copy of x BEFORE
     // RMSNorm overwrites csha_x_ptr in place, so the backward dRMSNorm
     // can read pre-norm x). Null = skip the save.
@@ -948,9 +1071,7 @@ pub extern "C" fn nsl_flash_attention_csha_with_saves(
     // loads only its row's 1028-byte subtable. See spec §3.
     doc_starts_ptr: i64,
 ) -> i64 {
-    use crate::pca_tier_b_runtime::{
-        assert_tier_b_sentinels, should_dispatch_tier_b_at_runtime,
-    };
+    use crate::pca_tier_b_runtime::{assert_tier_b_sentinels, should_dispatch_tier_b_at_runtime};
 
     // Tier B extension entry: assert sentinel agreement (planner spec §4.3).
     assert_tier_b_sentinels(
@@ -961,11 +1082,7 @@ pub extern "C" fn nsl_flash_attention_csha_with_saves(
 
     // Tier B extension: pick effective PTX/name based on runtime gate (planner spec §6.3).
     let (effective_ptx_ptr, effective_name_ptr) =
-        if should_dispatch_tier_b_at_runtime(
-            tier_b_ptx_ptr,
-            segment_ids_ptr,
-            seq_len as u32,
-        ) {
+        if should_dispatch_tier_b_at_runtime(tier_b_ptx_ptr, segment_ids_ptr, seq_len as u32) {
             (tier_b_ptx_ptr, tier_b_name_ptr)
         } else {
             (ptx_ptr, name_ptr)
@@ -1043,11 +1160,16 @@ pub extern "C" fn nsl_flash_attention_csha_with_saves(
         let _prepass_handle = if let Some((nx, nwq, nwk, nwv, handle)) =
             csha_tier_b1_prepass_substitute(
                 effective_name_ptr,
-                x, nw, wq, wk, wv,
-                seq_len, head_dim, d_model,
+                x,
+                nw,
+                wq,
+                wk,
+                wv,
+                seq_len,
+                head_dim,
+                d_model,
                 rmsnorm_eps_bits,
-            )
-        {
+            ) {
             x = nx;
             wq = nwq;
             wk = nwk;
@@ -1118,13 +1240,19 @@ pub extern "C" fn nsl_flash_attention_csha_with_saves(
         // mismatched PTX selection (inference PTX instead of the _with_saves
         // variant) is visible. Also prints the save pointers so they can be
         // confirmed non-null and distinct.
-        let dump_on = std::env::var_os("NSL_CSHA_DUMP_GRADS").map(|v| v != "0" && v != "").unwrap_or(false);
+        let dump_on = std::env::var_os("NSL_CSHA_DUMP_GRADS")
+            .map(|v| v != "0" && v != "")
+            .unwrap_or(false);
         if dump_on {
             let kname = unsafe {
                 let c = effective_name_ptr as *const u8;
-                if c.is_null() { String::from("<null>") } else {
+                if c.is_null() {
+                    String::from("<null>")
+                } else {
                     let mut end = 0usize;
-                    while *c.add(end) != 0 && end < 256 { end += 1; }
+                    while *c.add(end) != 0 && end < 256 {
+                        end += 1;
+                    }
                     String::from_utf8_lossy(std::slice::from_raw_parts(c, end)).into_owned()
                 }
             };
@@ -1139,16 +1267,17 @@ pub extern "C" fn nsl_flash_attention_csha_with_saves(
                 let c = effective_ptx_ptr as *const u8;
                 if !c.is_null() {
                     let mut end = 0usize;
-                    while *c.add(end) != 0 && end < (1 << 20) { end += 1; }
+                    while *c.add(end) != 0 && end < (1 << 20) {
+                        end += 1;
+                    }
                     if end > 0 {
                         let bytes = std::slice::from_raw_parts(c, end);
-                        let _ = std::fs::write(
-                            std::env::temp_dir().join("csha_with_saves.ptx"),
-                            bytes,
-                        );
+                        let _ =
+                            std::fs::write(std::env::temp_dir().join("csha_with_saves.ptx"), bytes);
                         eprintln!(
                             "[csha-dump-fwd] ptx written to {}/csha_with_saves.ptx ({} bytes)",
-                            std::env::temp_dir().display(), end
+                            std::env::temp_dir().display(),
+                            end
                         );
                     }
                 }
@@ -1170,7 +1299,9 @@ pub extern "C" fn nsl_flash_attention_csha_with_saves(
         // PTX synthesis and launch lost the `save_activations_for_backward`
         // flag OR the saves emit but to wrong addresses.
         if dump_on {
-            unsafe { crate::cuda::inner::cu_ctx_synchronize(); }
+            unsafe {
+                crate::cuda::inner::cu_ctx_synchronize();
+            }
             eprintln!("[csha-dump-fwd-post] launch_rc={:?}", fwd_rc);
             let qkv_elems = (batch * heads * seq_len * head_dim) as usize;
             let stats_elems = (batch * heads * seq_len) as usize;
@@ -1186,8 +1317,11 @@ pub extern "C" fn nsl_flash_attention_csha_with_saves(
                     );
                 }
                 let nz = host.iter().filter(|&&b| b != 0).count();
-                let first8: Vec<f32> = host.iter().take(8)
-                    .map(|&b| crate::tensor::f16_bits_to_f32(b)).collect();
+                let first8: Vec<f32> = host
+                    .iter()
+                    .take(8)
+                    .map(|&b| crate::tensor::f16_bits_to_f32(b))
+                    .collect();
                 eprintln!(
                     "[csha-dump-fwd-post]  q_proj first8={:?} nonzero_bits={}/{}",
                     first8, nz, qkv_elems
@@ -1207,7 +1341,8 @@ pub extern "C" fn nsl_flash_attention_csha_with_saves(
                 eprintln!(
                     "[csha-dump-fwd-post]  row_sum first8={:?} nonzero={}/{}",
                     host.iter().take(8).cloned().collect::<Vec<_>>(),
-                    nz, stats_elems
+                    nz,
+                    stats_elems
                 );
             }
             // x_raw (f32)
@@ -1224,7 +1359,8 @@ pub extern "C" fn nsl_flash_attention_csha_with_saves(
                 eprintln!(
                     "[csha-dump-fwd-post]  x_raw  first8={:?} nonzero={}/{}",
                     host.iter().take(8).cloned().collect::<Vec<_>>(),
-                    nz, x_elems
+                    nz,
+                    x_elems
                 );
             }
         }
@@ -1237,11 +1373,32 @@ pub extern "C" fn nsl_flash_attention_csha_with_saves(
         let _ = (batch, heads, seq_len, head_dim);
         let _ = (block_table_ptr, k_pool_ptr, v_pool_ptr, block_size);
         let _ = (cos_ptr, sin_ptr, seq_ids_ptr, seq_lens_ptr);
-        let _ = (shared_mem_bytes, ptx_ptr, name_ptr, block_q, _block_kv, causal);
+        let _ = (
+            shared_mem_bytes,
+            ptx_ptr,
+            name_ptr,
+            block_q,
+            _block_kv,
+            causal,
+        );
         let _ = (x_ptr, norm_weight_ptr, wq_ptr, wk_ptr, wv_ptr, wo_ptr);
         let _ = (rmsnorm_eps_bits, active_heads, d_model);
-        let _ = (q_proj_ptr, k_proj_ptr, v_proj_ptr, row_max_ptr, row_sum_ptr, x_raw_ptr, segment_ids_ptr, doc_starts_ptr);
-        let _ = (tier_b_ptx_ptr, tier_b_name_ptr, effective_ptx_ptr, effective_name_ptr);
+        let _ = (
+            q_proj_ptr,
+            k_proj_ptr,
+            v_proj_ptr,
+            row_max_ptr,
+            row_sum_ptr,
+            x_raw_ptr,
+            segment_ids_ptr,
+            doc_starts_ptr,
+        );
+        let _ = (
+            tier_b_ptx_ptr,
+            tier_b_name_ptr,
+            effective_ptx_ptr,
+            effective_name_ptr,
+        );
         eprintln!("[nsl] CSHA FlashAttention w/ saves requires CUDA.");
         -1
     }
@@ -1286,34 +1443,56 @@ pub extern "C" fn nsl_flash_attention_csha_with_saves(
 #[no_mangle]
 #[allow(clippy::too_many_arguments)]
 pub extern "C" fn nsl_flash_attention_csha_backward(
-    q_ptr: i64, k_ptr: i64, v_ptr: i64,
+    q_ptr: i64,
+    k_ptr: i64,
+    v_ptr: i64,
     out_ptr: i64,
     logsumexp_ptr: i64,
     scale_bits: i64,
-    batch: i64, heads: i64, seq_len: i64, head_dim: i64,
+    batch: i64,
+    heads: i64,
+    seq_len: i64,
+    head_dim: i64,
     block_table_ptr: i64,
-    k_pool_ptr: i64, v_pool_ptr: i64,
+    k_pool_ptr: i64,
+    v_pool_ptr: i64,
     block_size: i64,
-    cos_ptr: i64, sin_ptr: i64,
-    seq_ids_ptr: i64, seq_lens_ptr: i64,
+    cos_ptr: i64,
+    sin_ptr: i64,
+    seq_ids_ptr: i64,
+    seq_lens_ptr: i64,
     shared_mem_bytes: i64,
-    ptx_ptr: i64, name_ptr: i64,
-    block_q: i64, _block_kv: i64,
+    ptx_ptr: i64,
+    name_ptr: i64,
+    block_q: i64,
+    _block_kv: i64,
     causal: i64,
-    x_ptr: i64, norm_weight_ptr: i64,
-    wq_ptr: i64, wk_ptr: i64, wv_ptr: i64, wo_ptr: i64,
+    x_ptr: i64,
+    norm_weight_ptr: i64,
+    wq_ptr: i64,
+    wk_ptr: i64,
+    wv_ptr: i64,
+    wo_ptr: i64,
     rmsnorm_eps_bits: i64,
-    active_heads: i64, d_model: i64,
+    active_heads: i64,
+    d_model: i64,
     // Saved activations (inputs to backward).
-    q_proj_ptr: i64, k_proj_ptr: i64, v_proj_ptr: i64,
-    row_max_ptr: i64, row_sum_ptr: i64,
+    q_proj_ptr: i64,
+    k_proj_ptr: i64,
+    v_proj_ptr: i64,
+    row_max_ptr: i64,
+    row_sum_ptr: i64,
     // Tier C raw-x save: forward staged a copy here before RMSNorm
     // overwrote csha_x_ptr in place; backward dRMSNorm reads it.
     x_raw_ptr: i64,
     // Tier C backward-specific.
     do_ptr: i64,
-    dq_ptr: i64, dk_ptr: i64, dv_ptr: i64,
-    dwq_ptr: i64, dwk_ptr: i64, dwv_ptr: i64,
+    dq_ptr: i64,
+    dk_ptr: i64,
+    dv_ptr: i64,
+    dwq_ptr: i64,
+    dwk_ptr: i64,
+    dwv_ptr: i64,
     dx_ptr: i64,
     // Gap I.5 fix (Option A): 8th gradient output — dx_norm (gradient
     // w.r.t. the RMSNorm output, i.e. dy_norm). Consumed by the AD-side
@@ -1338,9 +1517,7 @@ pub extern "C" fn nsl_flash_attention_csha_backward(
     // loads only its row's 1028-byte subtable. See spec §3.
     doc_starts_ptr: i64,
 ) -> i64 {
-    use crate::pca_tier_b_runtime::{
-        assert_tier_b_sentinels, should_dispatch_tier_b_at_runtime,
-    };
+    use crate::pca_tier_b_runtime::{assert_tier_b_sentinels, should_dispatch_tier_b_at_runtime};
 
     // Tier B extension entry: assert sentinel agreement (planner spec §4.3).
     assert_tier_b_sentinels(
@@ -1351,11 +1528,7 @@ pub extern "C" fn nsl_flash_attention_csha_backward(
 
     // Tier B extension: pick effective PTX/name based on runtime gate (planner spec §6.3).
     let (effective_ptx_ptr, effective_name_ptr) =
-        if should_dispatch_tier_b_at_runtime(
-            tier_b_ptx_ptr,
-            segment_ids_ptr,
-            seq_len as u32,
-        ) {
+        if should_dispatch_tier_b_at_runtime(tier_b_ptx_ptr, segment_ids_ptr, seq_len as u32) {
             (tier_b_ptx_ptr, tier_b_name_ptr)
         } else {
             (ptx_ptr, name_ptr)
@@ -1570,18 +1743,27 @@ pub extern "C" fn nsl_flash_attention_csha_backward(
         }
 
         if rc == cudarc::driver::sys::CUresult::CUDA_SUCCESS
-            && std::env::var_os("NSL_CSHA_DUMP_GRADS").map(|v| v != "0" && v != "").unwrap_or(false)
+            && std::env::var_os("NSL_CSHA_DUMP_GRADS")
+                .map(|v| v != "0" && v != "")
+                .unwrap_or(false)
         {
             let dump_first_nonfinite_scratch = |name: &str, ptr: *mut c_void| {
                 if ptr.is_null() || qkv_elems == 0 {
                     return;
                 }
                 let mut host = vec![0f32; qkv_elems];
-                crate::cuda::inner::memcpy_dtoh(host.as_mut_ptr() as *mut c_void, ptr, scratch_bytes);
-                if let Some((idx, value)) = host.iter().copied().enumerate().find(|(_, x)| !x.is_finite()) {
-                    eprintln!(
-                        "[csha-dump-bwd-scratch] first non-finite {name}[{idx}]={value:?}"
-                    );
+                crate::cuda::inner::memcpy_dtoh(
+                    host.as_mut_ptr() as *mut c_void,
+                    ptr,
+                    scratch_bytes,
+                );
+                if let Some((idx, value)) = host
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .find(|(_, x)| !x.is_finite())
+                {
+                    eprintln!("[csha-dump-bwd-scratch] first non-finite {name}[{idx}]={value:?}");
                 } else {
                     let first = host.iter().take(4).copied().collect::<Vec<_>>();
                     eprintln!(
@@ -1597,19 +1779,18 @@ pub extern "C" fn nsl_flash_attention_csha_backward(
         // Convert f32 scratch → f16 output for dK and dV.
         if rc == cudarc::driver::sys::CUresult::CUDA_SUCCESS {
             if !dk_scratch_raw.is_null() && d_k != 0 {
-                let c_rc = csha_bwd_convert_f32_to_f16(
-                    dk_scratch_raw, d_k as *mut c_void, qkv_elems,
-                );
+                let c_rc =
+                    csha_bwd_convert_f32_to_f16(dk_scratch_raw, d_k as *mut c_void, qkv_elems);
                 if c_rc != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
                     rc = c_rc;
                 }
             }
             if rc == cudarc::driver::sys::CUresult::CUDA_SUCCESS
-                && !dv_scratch_raw.is_null() && d_v != 0
+                && !dv_scratch_raw.is_null()
+                && d_v != 0
             {
-                let c_rc = csha_bwd_convert_f32_to_f16(
-                    dv_scratch_raw, d_v as *mut c_void, qkv_elems,
-                );
+                let c_rc =
+                    csha_bwd_convert_f32_to_f16(dv_scratch_raw, d_v as *mut c_void, qkv_elems);
                 if c_rc != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
                     rc = c_rc;
                 }
@@ -1634,13 +1815,22 @@ pub extern "C" fn nsl_flash_attention_csha_backward(
         // pointers above). Shape info is derived from {batch, heads, seq_len,
         // head_dim, d_model}. Synchronises the device first so any async
         // kernel-launch failure or stale writeback is visible.
-        if std::env::var_os("NSL_CSHA_DUMP_GRADS").map(|v| v != "0" && v != "").unwrap_or(false) {
-            unsafe { crate::cuda::inner::cu_ctx_synchronize(); }
+        if std::env::var_os("NSL_CSHA_DUMP_GRADS")
+            .map(|v| v != "0" && v != "")
+            .unwrap_or(false)
+        {
+            unsafe {
+                crate::cuda::inner::cu_ctx_synchronize();
+            }
             let kname = unsafe {
                 let c = effective_name_ptr as *const u8;
-                if c.is_null() { String::from("<null>") } else {
+                if c.is_null() {
+                    String::from("<null>")
+                } else {
                     let mut end = 0usize;
-                    while *c.add(end) != 0 && end < 256 { end += 1; }
+                    while *c.add(end) != 0 && end < 256 {
+                        end += 1;
+                    }
                     String::from_utf8_lossy(std::slice::from_raw_parts(c, end)).into_owned()
                 }
             };
@@ -1656,10 +1846,8 @@ pub extern "C" fn nsl_flash_attention_csha_backward(
                 d_o, d_q, d_k, d_v, d_wq, d_wk, d_wv, d_x, d_xn
             );
             csha_dump_backward_buffers(
-                rc as i64,
-                batch, heads, seq_len, head_dim, d_model,
-                qp, kpj, vpj, rmax, rsum, xraw,
-                d_o, d_q, d_k, d_v, d_wq, d_wk, d_wv, d_x, d_xn,
+                rc as i64, batch, heads, seq_len, head_dim, d_model, qp, kpj, vpj, rmax, rsum,
+                xraw, d_o, d_q, d_k, d_v, d_wq, d_wk, d_wv, d_x, d_xn,
             );
         }
 
@@ -1671,13 +1859,42 @@ pub extern "C" fn nsl_flash_attention_csha_backward(
         let _ = (batch, heads, seq_len, head_dim);
         let _ = (block_table_ptr, k_pool_ptr, v_pool_ptr, block_size);
         let _ = (cos_ptr, sin_ptr, seq_ids_ptr, seq_lens_ptr);
-        let _ = (shared_mem_bytes, ptx_ptr, name_ptr, block_q, _block_kv, causal);
+        let _ = (
+            shared_mem_bytes,
+            ptx_ptr,
+            name_ptr,
+            block_q,
+            _block_kv,
+            causal,
+        );
         let _ = (x_ptr, norm_weight_ptr, wq_ptr, wk_ptr, wv_ptr, wo_ptr);
         let _ = (rmsnorm_eps_bits, active_heads, d_model);
-        let _ = (q_proj_ptr, k_proj_ptr, v_proj_ptr, row_max_ptr, row_sum_ptr, x_raw_ptr);
-        let _ = (do_ptr, dq_ptr, dk_ptr, dv_ptr, dwq_ptr, dwk_ptr, dwv_ptr, dx_ptr, dx_norm_ptr);
+        let _ = (
+            q_proj_ptr,
+            k_proj_ptr,
+            v_proj_ptr,
+            row_max_ptr,
+            row_sum_ptr,
+            x_raw_ptr,
+        );
+        let _ = (
+            do_ptr,
+            dq_ptr,
+            dk_ptr,
+            dv_ptr,
+            dwq_ptr,
+            dwk_ptr,
+            dwv_ptr,
+            dx_ptr,
+            dx_norm_ptr,
+        );
         let _ = (segment_ids_ptr, doc_starts_ptr);
-        let _ = (tier_b_ptx_ptr, tier_b_name_ptr, effective_ptx_ptr, effective_name_ptr);
+        let _ = (
+            tier_b_ptx_ptr,
+            tier_b_name_ptr,
+            effective_ptx_ptr,
+            effective_name_ptr,
+        );
         eprintln!("[nsl] CSHA backward requires CUDA.");
         -1
     }
@@ -1778,12 +1995,26 @@ fn csha_bwd_convert_f32_to_f16(
 #[allow(clippy::too_many_arguments)]
 fn csha_dump_backward_buffers(
     launch_rc: i64,
-    batch: i64, heads: i64, seq_len: i64, head_dim: i64, d_model: i64,
-    q_proj_dev: u64, k_proj_dev: u64, v_proj_dev: u64,
-    row_max_dev: u64, row_sum_dev: u64, x_raw_dev: u64,
-    d_o_dev: u64, d_q_dev: u64, d_k_dev: u64, d_v_dev: u64,
-    d_wq_dev: u64, d_wk_dev: u64, d_wv_dev: u64,
-    d_x_dev: u64, d_xn_dev: u64,
+    batch: i64,
+    heads: i64,
+    seq_len: i64,
+    head_dim: i64,
+    d_model: i64,
+    q_proj_dev: u64,
+    k_proj_dev: u64,
+    v_proj_dev: u64,
+    row_max_dev: u64,
+    row_sum_dev: u64,
+    x_raw_dev: u64,
+    d_o_dev: u64,
+    d_q_dev: u64,
+    d_k_dev: u64,
+    d_v_dev: u64,
+    d_wq_dev: u64,
+    d_wk_dev: u64,
+    d_wv_dev: u64,
+    d_x_dev: u64,
+    d_xn_dev: u64,
 ) {
     eprintln!(
         "[csha-dump] launch_rc={} batch={} heads={} seq={} head_dim={} d_model={}",
@@ -1803,7 +2034,10 @@ fn csha_dump_backward_buffers(
 
     fn dump_f16(name: &str, dev_ptr: u64, n: usize) {
         if dev_ptr == 0 || n == 0 {
-            eprintln!("[csha-dump] {:>9} = <null or empty> dev=0x{:x} n={}", name, dev_ptr, n);
+            eprintln!(
+                "[csha-dump] {:>9} = <null or empty> dev=0x{:x} n={}",
+                name, dev_ptr, n
+            );
             return;
         }
         let mut host: Vec<u16> = vec![0u16; n];
@@ -1819,12 +2053,22 @@ fn csha_dump_backward_buffers(
         let mut sum: f64 = 0.0;
         for &bits in &host {
             let v = crate::tensor::f16_bits_to_f32(bits);
-            if v.is_nan() { nan_count += 1; }
+            if v.is_nan() {
+                nan_count += 1;
+            }
             let a = v.abs();
-            if a.is_finite() && a > max_abs { max_abs = a; }
-            if v.is_finite() { sum += v as f64; }
+            if a.is_finite() && a > max_abs {
+                max_abs = a;
+            }
+            if v.is_finite() {
+                sum += v as f64;
+            }
         }
-        let first8: Vec<f32> = host.iter().take(8).map(|&b| crate::tensor::f16_bits_to_f32(b)).collect();
+        let first8: Vec<f32> = host
+            .iter()
+            .take(8)
+            .map(|&b| crate::tensor::f16_bits_to_f32(b))
+            .collect();
         eprintln!(
             "[csha-dump] {:>9} [f16 n={}]: first8={:?} max|.|={:.6e} sum={:.6e} nan_count={}",
             name, n, first8, max_abs, sum, nan_count
@@ -1833,7 +2077,10 @@ fn csha_dump_backward_buffers(
 
     fn dump_f32(name: &str, dev_ptr: u64, n: usize) {
         if dev_ptr == 0 || n == 0 {
-            eprintln!("[csha-dump] {:>9} = <null or empty> dev=0x{:x} n={}", name, dev_ptr, n);
+            eprintln!(
+                "[csha-dump] {:>9} = <null or empty> dev=0x{:x} n={}",
+                name, dev_ptr, n
+            );
             return;
         }
         let mut host: Vec<f32> = vec![0.0f32; n];
@@ -1848,10 +2095,16 @@ fn csha_dump_backward_buffers(
         let mut max_abs: f32 = 0.0;
         let mut sum: f64 = 0.0;
         for &v in &host {
-            if v.is_nan() { nan_count += 1; }
+            if v.is_nan() {
+                nan_count += 1;
+            }
             let a = v.abs();
-            if a.is_finite() && a > max_abs { max_abs = a; }
-            if v.is_finite() { sum += v as f64; }
+            if a.is_finite() && a > max_abs {
+                max_abs = a;
+            }
+            if v.is_finite() {
+                sum += v as f64;
+            }
         }
         let first8: Vec<f32> = host.iter().take(8).cloned().collect();
         eprintln!(
@@ -1861,26 +2114,26 @@ fn csha_dump_backward_buffers(
     }
 
     // Save buffers (inputs to backward kernel — forward populated them).
-    dump_f16("q_proj",   q_proj_dev, qkv_elems);
-    dump_f16("k_proj",   k_proj_dev, qkv_elems);
-    dump_f16("v_proj",   v_proj_dev, qkv_elems);
-    dump_f32("row_max",  row_max_dev, stats_elems);
-    dump_f32("row_sum",  row_sum_dev, stats_elems);
-    dump_f32("x_raw",    x_raw_dev,   x_elems);
+    dump_f16("q_proj", q_proj_dev, qkv_elems);
+    dump_f16("k_proj", k_proj_dev, qkv_elems);
+    dump_f16("v_proj", v_proj_dev, qkv_elems);
+    dump_f32("row_max", row_max_dev, stats_elems);
+    dump_f32("row_sum", row_sum_dev, stats_elems);
+    dump_f32("x_raw", x_raw_dev, x_elems);
 
     // Backward seed.
     // dO is f16 (attention output gradient), shape [batch, heads, seq, head_dim].
-    dump_f16("dO",       d_o_dev,  qkv_elems);
+    dump_f16("dO", d_o_dev, qkv_elems);
 
     // Gradient outputs.
-    dump_f16("dq",       d_q_dev,  qkv_elems);
-    dump_f16("dk",       d_k_dev,  qkv_elems);
-    dump_f16("dv",       d_v_dev,  qkv_elems);
-    dump_f16("dwq",      d_wq_dev, dw_elems);
-    dump_f16("dwk",      d_wk_dev, dw_elems);
-    dump_f16("dwv",      d_wv_dev, dw_elems);
-    dump_f32("dx",       d_x_dev,  dx_elems);
-    dump_f32("dx_norm",  d_xn_dev, dx_elems);
+    dump_f16("dq", d_q_dev, qkv_elems);
+    dump_f16("dk", d_k_dev, qkv_elems);
+    dump_f16("dv", d_v_dev, qkv_elems);
+    dump_f16("dwq", d_wq_dev, dw_elems);
+    dump_f16("dwk", d_wk_dev, dw_elems);
+    dump_f16("dwv", d_wv_dev, dw_elems);
+    dump_f32("dx", d_x_dev, dx_elems);
+    dump_f32("dx_norm", d_xn_dev, dx_elems);
 }
 
 /// M42b: Quantized FlashAttention — KV-cache in INT8/FP8, Q in f16/f32.
@@ -1925,24 +2178,32 @@ fn csha_dump_backward_buffers(
 /// `docs/superpowers/specs/2026-05-15-tier-b-bii-smem-probe-findings.md`.
 #[no_mangle]
 pub extern "C" fn nsl_flash_attention_quantized(
-    q_ptr: i64, k_ptr: i64, v_ptr: i64,
-    out_ptr: i64, scale_bits: i64,
-    batch: i64, heads: i64, seq_len: i64, head_dim: i64,
+    q_ptr: i64,
+    k_ptr: i64,
+    v_ptr: i64,
+    out_ptr: i64,
+    scale_bits: i64,
+    batch: i64,
+    heads: i64,
+    seq_len: i64,
+    head_dim: i64,
     block_table_ptr: i64,
-    k_pool_ptr: i64, v_pool_ptr: i64,
+    k_pool_ptr: i64,
+    v_pool_ptr: i64,
     block_size: i64,
-    meta_k: i64, meta_v: i64,
+    meta_k: i64,
+    meta_v: i64,
     kv_quant_scheme: i64,
     shared_mem_bytes: i64,
-    ptx_ptr: i64, name_ptr: i64,
-    block_q: i64, _block_kv: i64,
+    ptx_ptr: i64,
+    name_ptr: i64,
+    block_q: i64,
+    _block_kv: i64,
     // Tier B extension (planner spec §4):
     tier_b_ptx_ptr: i64,
     tier_b_name_ptr: i64,
 ) -> i64 {
-    use crate::pca_tier_b_runtime::{
-        assert_tier_b_sentinels, should_dispatch_tier_b_at_runtime,
-    };
+    use crate::pca_tier_b_runtime::{assert_tier_b_sentinels, should_dispatch_tier_b_at_runtime};
 
     // Tier B extension entry: assert sentinel agreement (planner spec §4.3).
     assert_tier_b_sentinels(
@@ -1954,11 +2215,7 @@ pub extern "C" fn nsl_flash_attention_quantized(
     // Tier B extension: pick effective PTX/name based on runtime gate (planner spec §6.3).
     // Non-CSHA path has no segment_ids_ptr parameter; pass 0, gate always returns false.
     let (effective_ptx_ptr, effective_name_ptr) =
-        if should_dispatch_tier_b_at_runtime(
-            tier_b_ptx_ptr,
-            0,
-            seq_len as u32,
-        ) {
+        if should_dispatch_tier_b_at_runtime(tier_b_ptx_ptr, 0, seq_len as u32) {
             (tier_b_ptx_ptr, tier_b_name_ptr)
         } else {
             (ptx_ptr, name_ptr)
@@ -2050,14 +2307,22 @@ pub extern "C" fn nsl_flash_attention_quantized(
 /// Grid: (num_tokens, num_heads, ceil(head_dim/2))
 #[no_mangle]
 pub extern "C" fn nsl_rope_cache_write(
-    k_projected_ptr: i64, v_projected_ptr: i64,
-    cos_ptr: i64, sin_ptr: i64,
+    k_projected_ptr: i64,
+    v_projected_ptr: i64,
+    cos_ptr: i64,
+    sin_ptr: i64,
     positions_ptr: i64,
-    k_pool_ptr: i64, v_pool_ptr: i64,
+    k_pool_ptr: i64,
+    v_pool_ptr: i64,
     block_table_ptr: i64,
-    seq_ids_ptr: i64, seq_lens_ptr: i64,
-    num_tokens: i64, num_heads: i64, head_dim: i64, block_size: i64,
-    ptx_ptr: i64, name_ptr: i64,
+    seq_ids_ptr: i64,
+    seq_lens_ptr: i64,
+    num_tokens: i64,
+    num_heads: i64,
+    head_dim: i64,
+    block_size: i64,
+    ptx_ptr: i64,
+    name_ptr: i64,
 ) -> i64 {
     #[cfg(feature = "cuda")]
     {
@@ -2114,9 +2379,23 @@ pub extern "C" fn nsl_rope_cache_write(
     }
     #[cfg(not(feature = "cuda"))]
     {
-        let _ = (k_projected_ptr, v_projected_ptr, cos_ptr, sin_ptr, positions_ptr);
-        let _ = (k_pool_ptr, v_pool_ptr, block_table_ptr, seq_ids_ptr, seq_lens_ptr);
-        let _ = (num_tokens, num_heads, head_dim, block_size, ptx_ptr, name_ptr);
+        let _ = (
+            k_projected_ptr,
+            v_projected_ptr,
+            cos_ptr,
+            sin_ptr,
+            positions_ptr,
+        );
+        let _ = (
+            k_pool_ptr,
+            v_pool_ptr,
+            block_table_ptr,
+            seq_ids_ptr,
+            seq_lens_ptr,
+        );
+        let _ = (
+            num_tokens, num_heads, head_dim, block_size, ptx_ptr, name_ptr,
+        );
         eprintln!("[nsl] rope_cache_write requires CUDA.");
         -1
     }
@@ -2146,11 +2425,21 @@ pub extern "C" fn nsl_rope_cache_write(
 ///     dK[j] += ds * Q[i] * scale
 #[allow(clippy::too_many_arguments)]
 pub fn flash_attention_backward_cpu(
-    q: &[f32], k: &[f32], v: &[f32],
-    out: &[f32], logsumexp: &[f32], dout: &[f32],
-    dq: &mut [f32], dk: &mut [f32], dv: &mut [f32],
-    batch: usize, heads: usize, seq_len: usize, head_dim: usize,
-    scale: f32, causal: bool,
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    out: &[f32],
+    logsumexp: &[f32],
+    dout: &[f32],
+    dq: &mut [f32],
+    dk: &mut [f32],
+    dv: &mut [f32],
+    batch: usize,
+    heads: usize,
+    seq_len: usize,
+    head_dim: usize,
+    scale: f32,
+    causal: bool,
 ) {
     // Strides for [batch, heads, seq_len, head_dim] layout
     let bh_stride = heads * seq_len * head_dim;
@@ -2229,11 +2518,23 @@ pub fn flash_attention_backward_cpu(
 /// dK, dV have shape [batch, kv_heads, seq, head_dim].
 #[allow(clippy::too_many_arguments)]
 pub fn flash_attention_backward_cpu_gqa(
-    q: &[f32], k: &[f32], v: &[f32],
-    out: &[f32], logsumexp: &[f32], dout: &[f32],
-    dq: &mut [f32], dk: &mut [f32], dv: &mut [f32],
-    batch: usize, heads: usize, kv_heads: usize, seq_len: usize, head_dim: usize,
-    scale: f32, causal: bool, gqa_groups: usize,
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    out: &[f32],
+    logsumexp: &[f32],
+    dout: &[f32],
+    dq: &mut [f32],
+    dk: &mut [f32],
+    dv: &mut [f32],
+    batch: usize,
+    heads: usize,
+    kv_heads: usize,
+    seq_len: usize,
+    head_dim: usize,
+    scale: f32,
+    causal: bool,
+    gqa_groups: usize,
 ) {
     // Q/dQ/out/dout strides: [batch, heads, seq_len, head_dim]
     let q_bh_stride = heads * seq_len * head_dim;
@@ -2321,9 +2622,15 @@ pub fn flash_attention_backward_cpu_gqa(
 /// lse[b,h,i] = log(sum_j(exp(Q[b,h,i,:] . K[b,h//gqa_groups,j,:] * scale)))
 #[allow(clippy::too_many_arguments)]
 fn compute_logsumexp_gqa(
-    q: &[f32], k: &[f32],
-    batch: usize, heads: usize, kv_heads: usize, seq_len: usize, head_dim: usize,
-    scale: f32, causal: bool,
+    q: &[f32],
+    k: &[f32],
+    batch: usize,
+    heads: usize,
+    kv_heads: usize,
+    seq_len: usize,
+    head_dim: usize,
+    scale: f32,
+    causal: bool,
 ) -> Vec<f32> {
     let q_bh_stride = heads * seq_len * head_dim;
     let q_h_stride = seq_len * head_dim;
@@ -2388,19 +2695,30 @@ fn compute_logsumexp_gqa(
 #[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]
 fn flash_attention_backward_gpu(
-    dout_ptr: i64, q_ptr: i64, k_ptr: i64, v_ptr: i64,
-    out_ptr: i64, _logsumexp_ptr: i64,
+    dout_ptr: i64,
+    q_ptr: i64,
+    k_ptr: i64,
+    v_ptr: i64,
+    out_ptr: i64,
+    _logsumexp_ptr: i64,
     scale: f32,
-    b: usize, h: usize, s: usize, d: usize,
+    b: usize,
+    h: usize,
+    s: usize,
+    d: usize,
     is_causal: bool,
-    phase1_ptx_ptr: i64, phase1_name_ptr: i64,
-    phase2_ptx_ptr: i64, phase2_name_ptr: i64,
+    phase1_ptx_ptr: i64,
+    phase1_name_ptr: i64,
+    phase2_ptx_ptr: i64,
+    phase2_name_ptr: i64,
 ) -> i64 {
     use crate::cuda::inner;
     use std::ffi::c_void;
 
     // Sync before reading tensor data pointers
-    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+    unsafe {
+        cudarc::driver::sys::cuCtxSynchronize();
+    }
 
     let dout_t = NslTensor::from_ptr(dout_ptr);
     let q_t = NslTensor::from_ptr(q_ptr);
@@ -2451,7 +2769,10 @@ fn flash_attention_backward_gpu(
         let res = inner::kernel_launch(
             phase1_ptx_ptr as *const u8,
             phase1_name_ptr as *const u8,
-            grid, block, &args, 0,
+            grid,
+            block,
+            &args,
+            0,
         );
         if res != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
             eprintln!("[flash-bwd] Phase 1 kernel launch failed: {:?}", res);
@@ -2465,12 +2786,14 @@ fn flash_attention_backward_gpu(
         let pad: i64 = 4;
         let hd_padded = d as i64 + pad;
         let tile_bytes = |rows: i64, cols: i64| -> i64 { rows * cols * 4 };
-        let shmem = (tile_bytes(block_kv, hd_padded) * 2  // K, V tiles
+        let shmem = (
+            tile_bytes(block_kv, hd_padded) * 2  // K, V tiles
             + tile_bytes(block_q, hd_padded) * 2           // Q, dO tiles
             + tile_bytes(block_kv, hd_padded) * 2          // dK, dV accumulators
             + tile_bytes(block_q, block_kv)                // S tile
             + block_q * 4                                  // D vector
-            + block_q * 4                                  // L (logsumexp) vector
+            + block_q * 4
+            // L (logsumexp) vector
         ) as u32;
 
         // Compute logsumexp on GPU: reuse D buffer area as scratch for lse
@@ -2497,11 +2820,7 @@ fn flash_attention_backward_gpu(
             );
 
             let lse_cpu = compute_logsumexp_gqa(&q_cpu, &k_cpu, b, h, h, s, d, scale, is_causal);
-            inner::memcpy_htod(
-                lse_gpu,
-                lse_cpu.as_ptr() as *const c_void,
-                total_lse * 4,
-            );
+            inner::memcpy_htod(lse_gpu, lse_cpu.as_ptr() as *const c_void, total_lse * 4);
             lse_gpu
         };
 
@@ -2539,14 +2858,19 @@ fn flash_attention_backward_gpu(
         let res = inner::kernel_launch(
             phase2_ptx_ptr as *const u8,
             phase2_name_ptr as *const u8,
-            grid, block, &args, shmem,
+            grid,
+            block,
+            &args,
+            shmem,
         );
         if res != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
             eprintln!("[flash-bwd] Phase 2 kernel launch failed: {:?}", res);
         }
 
         // Sync after all kernels
-        unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+        unsafe {
+            cudarc::driver::sys::cuCtxSynchronize();
+        }
 
         // Free logsumexp scratch buffer
         inner::free_managed(lse_data);
@@ -2628,10 +2952,16 @@ fn flash_attention_backward_gpu(
 #[no_mangle]
 pub extern "C" fn nsl_flash_attention_backward(
     dout_ptr: i64,
-    q_ptr: i64, k_ptr: i64, v_ptr: i64,
-    out_ptr: i64, logsumexp_ptr: i64,
+    q_ptr: i64,
+    k_ptr: i64,
+    v_ptr: i64,
+    out_ptr: i64,
+    logsumexp_ptr: i64,
     scale_bits: i64,
-    batch: i64, heads: i64, seq_len: i64, head_dim: i64,
+    batch: i64,
+    heads: i64,
+    seq_len: i64,
+    head_dim: i64,
     causal: i64,
     phase1_ptx_ptr: i64,
     phase1_name_ptr: i64,
@@ -2675,21 +3005,40 @@ pub extern "C" fn nsl_flash_attention_backward(
 
         if dout_t.device > 0 && phase1_ptx_ptr != 0 && kv_h == h {
             return flash_attention_backward_gpu(
-                dout_ptr, q_ptr, k_ptr, v_ptr, out_ptr, logsumexp_ptr,
-                scale, b, h, s, d, is_causal,
-                phase1_ptx_ptr, phase1_name_ptr,
-                phase2_ptx_ptr, phase2_name_ptr,
+                dout_ptr,
+                q_ptr,
+                k_ptr,
+                v_ptr,
+                out_ptr,
+                logsumexp_ptr,
+                scale,
+                b,
+                h,
+                s,
+                d,
+                is_causal,
+                phase1_ptx_ptr,
+                phase1_name_ptr,
+                phase2_ptx_ptr,
+                phase2_name_ptr,
             );
         }
 
         if dout_t.device > 0 {
-            unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+            unsafe {
+                cudarc::driver::sys::cuCtxSynchronize();
+            }
         }
     }
 
     #[cfg(not(feature = "cuda"))]
     {
-        let _ = (phase1_ptx_ptr, phase1_name_ptr, phase2_ptx_ptr, phase2_name_ptr);
+        let _ = (
+            phase1_ptx_ptr,
+            phase1_name_ptr,
+            phase2_ptx_ptr,
+            phase2_name_ptr,
+        );
     }
 
     // Read input tensors
@@ -2754,7 +3103,9 @@ pub extern "C" fn nsl_flash_attention_backward(
                 }
                 f64_buf.iter().map(|&v| v as f32).collect()
             } else {
-                (0..len).map(|i| unsafe { *t.data_f64().add(i) as f32 }).collect()
+                (0..len)
+                    .map(|i| unsafe { *t.data_f64().add(i) as f32 })
+                    .collect()
             }
         }
     }
@@ -2785,11 +3136,23 @@ pub extern "C" fn nsl_flash_attention_backward(
 
     // Run the CPU backward with GQA support
     flash_attention_backward_cpu_gqa(
-        &q_data, &k_data, &v_data,
-        &out_data, &lse_data, &dout_data,
-        &mut dq_data, &mut dk_data, &mut dv_data,
-        b, h, kv_h, s, d,
-        scale, is_causal, gqa_groups,
+        &q_data,
+        &k_data,
+        &v_data,
+        &out_data,
+        &lse_data,
+        &dout_data,
+        &mut dq_data,
+        &mut dk_data,
+        &mut dv_data,
+        b,
+        h,
+        kv_h,
+        s,
+        d,
+        scale,
+        is_causal,
+        gqa_groups,
     );
 
     // Create output tensors (f32 dtype, matching Q shape for dQ, KV shape for dK/dV)
@@ -2871,11 +3234,14 @@ pub struct CshaBackwardActivations {
 /// Caller must call `nsl_csha_free_backward_activations` to release.
 #[no_mangle]
 pub unsafe extern "C" fn nsl_csha_alloc_backward_activations(
-    batch: i64, heads: i64, seq: i64, head_dim: i64,
+    batch: i64,
+    heads: i64,
+    seq: i64,
+    head_dim: i64,
 ) -> CshaBackwardActivations {
-    let qkv_bytes = batch * heads * seq * head_dim * 2;  // f16 = 2 bytes
-    let stats_bytes = batch * heads * seq * 4;           // f32 = 4 bytes
-    // x_raw mirrors the kernel-visible x buffer: [batch, heads, seq, head_dim] f32.
+    let qkv_bytes = batch * heads * seq * head_dim * 2; // f16 = 2 bytes
+    let stats_bytes = batch * heads * seq * 4; // f32 = 4 bytes
+                                               // x_raw mirrors the kernel-visible x buffer: [batch, heads, seq, head_dim] f32.
     let xraw_bytes = batch * heads * seq * head_dim * 4;
     #[cfg(feature = "cuda")]
     {
@@ -2893,7 +3259,12 @@ pub unsafe extern "C" fn nsl_csha_alloc_backward_activations(
     {
         let _ = (qkv_bytes, stats_bytes, xraw_bytes);
         CshaBackwardActivations {
-            q_proj: 0, k_proj: 0, v_proj: 0, row_max: 0, row_sum: 0, x_raw: 0,
+            q_proj: 0,
+            k_proj: 0,
+            v_proj: 0,
+            row_max: 0,
+            row_sum: 0,
+            x_raw: 0,
         }
     }
 }
@@ -2901,21 +3272,33 @@ pub unsafe extern "C" fn nsl_csha_alloc_backward_activations(
 /// Free the 5 HBM buffers allocated by `nsl_csha_alloc_backward_activations`.
 /// Safe to call with zero pointers — they are silently skipped.
 #[no_mangle]
-pub unsafe extern "C" fn nsl_csha_free_backward_activations(
-    a: CshaBackwardActivations,
-) {
+pub unsafe extern "C" fn nsl_csha_free_backward_activations(a: CshaBackwardActivations) {
     #[cfg(feature = "cuda")]
     {
         use crate::cuda::inner;
-        if a.q_proj != 0 { inner::free_managed(a.q_proj as *mut std::ffi::c_void); }
-        if a.k_proj != 0 { inner::free_managed(a.k_proj as *mut std::ffi::c_void); }
-        if a.v_proj != 0 { inner::free_managed(a.v_proj as *mut std::ffi::c_void); }
-        if a.row_max != 0 { inner::free_managed(a.row_max as *mut std::ffi::c_void); }
-        if a.row_sum != 0 { inner::free_managed(a.row_sum as *mut std::ffi::c_void); }
-        if a.x_raw != 0 { inner::free_managed(a.x_raw as *mut std::ffi::c_void); }
+        if a.q_proj != 0 {
+            inner::free_managed(a.q_proj as *mut std::ffi::c_void);
+        }
+        if a.k_proj != 0 {
+            inner::free_managed(a.k_proj as *mut std::ffi::c_void);
+        }
+        if a.v_proj != 0 {
+            inner::free_managed(a.v_proj as *mut std::ffi::c_void);
+        }
+        if a.row_max != 0 {
+            inner::free_managed(a.row_max as *mut std::ffi::c_void);
+        }
+        if a.row_sum != 0 {
+            inner::free_managed(a.row_sum as *mut std::ffi::c_void);
+        }
+        if a.x_raw != 0 {
+            inner::free_managed(a.x_raw as *mut std::ffi::c_void);
+        }
     }
     #[cfg(not(feature = "cuda"))]
-    { let _ = a; }
+    {
+        let _ = a;
+    }
 }
 
 /// Gap A: codegen-friendly wrapper around
@@ -2935,7 +3318,10 @@ pub unsafe extern "C" fn nsl_csha_free_backward_activations(
 /// memory and be 8-byte aligned.
 #[no_mangle]
 pub unsafe extern "C" fn nsl_csha_alloc_backward_activations_into(
-    batch: i64, heads: i64, seq: i64, head_dim: i64,
+    batch: i64,
+    heads: i64,
+    seq: i64,
+    head_dim: i64,
     out_ptr: i64,
 ) -> i64 {
     let a = nsl_csha_alloc_backward_activations(batch, heads, seq, head_dim);
@@ -2964,11 +3350,20 @@ pub unsafe extern "C" fn nsl_csha_alloc_backward_activations_into(
 /// `nsl_csha_free_backward_activations`.
 #[no_mangle]
 pub unsafe extern "C" fn nsl_csha_free_backward_activations_from(
-    q_proj: i64, k_proj: i64, v_proj: i64,
-    row_max: i64, row_sum: i64, x_raw: i64,
+    q_proj: i64,
+    k_proj: i64,
+    v_proj: i64,
+    row_max: i64,
+    row_sum: i64,
+    x_raw: i64,
 ) {
     let a = CshaBackwardActivations {
-        q_proj, k_proj, v_proj, row_max, row_sum, x_raw,
+        q_proj,
+        k_proj,
+        v_proj,
+        row_max,
+        row_sum,
+        x_raw,
     };
     nsl_csha_free_backward_activations(a);
 }
@@ -2993,14 +3388,22 @@ mod tests {
         assert_ne!(r.row_max, 0, "row_max alloc failed");
         assert_ne!(r.row_sum, 0, "row_sum alloc failed");
         assert_ne!(r.x_raw, 0, "x_raw alloc failed");
-        unsafe { nsl_csha_free_backward_activations(r); }
+        unsafe {
+            nsl_csha_free_backward_activations(r);
+        }
     }
 
     /// Naive attention forward for reference: O = softmax(Q @ K^T * scale) @ V
     fn naive_attention_forward(
-        q: &[f32], k: &[f32], v: &[f32],
-        batch: usize, heads: usize, seq_len: usize, head_dim: usize,
-        scale: f32, causal: bool,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        batch: usize,
+        heads: usize,
+        seq_len: usize,
+        head_dim: usize,
+        scale: f32,
+        causal: bool,
     ) -> (Vec<f32>, Vec<f32>) {
         // Returns (output, logsumexp)
         let bh_stride = heads * seq_len * head_dim;
@@ -3068,10 +3471,16 @@ mod tests {
 
     /// Naive attention backward for reference (full S^2 computation)
     fn naive_attention_backward(
-        q: &[f32], k: &[f32], v: &[f32],
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
         dout: &[f32],
-        batch: usize, heads: usize, seq_len: usize, head_dim: usize,
-        scale: f32, causal: bool,
+        batch: usize,
+        heads: usize,
+        seq_len: usize,
+        head_dim: usize,
+        scale: f32,
+        causal: bool,
     ) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
         let bh_stride = heads * seq_len * head_dim;
         let h_stride = seq_len * head_dim;
@@ -3173,7 +3582,10 @@ mod tests {
     }
 
     fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
-        a.iter().zip(b.iter()).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max)
+        a.iter()
+            .zip(b.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max)
     }
 
     #[allow(dead_code)]
@@ -3182,7 +3594,9 @@ mod tests {
         for (x, y) in a.iter().zip(b.iter()) {
             let denom = x.abs().max(y.abs()).max(1e-8);
             let rel = (x - y).abs() / denom;
-            if rel > max_rel { max_rel = rel; }
+            if rel > max_rel {
+                max_rel = rel;
+            }
         }
         max_rel
     }
@@ -3198,14 +3612,21 @@ mod tests {
 
         // Deterministic test data
         let q: Vec<f32> = (0..total).map(|i| (i as f32 * 0.1).sin() * 0.5).collect();
-        let k: Vec<f32> = (0..total).map(|i| (i as f32 * 0.2 + 1.0).cos() * 0.5).collect();
-        let v: Vec<f32> = (0..total).map(|i| (i as f32 * 0.3 + 2.0).sin() * 0.5).collect();
+        let k: Vec<f32> = (0..total)
+            .map(|i| (i as f32 * 0.2 + 1.0).cos() * 0.5)
+            .collect();
+        let v: Vec<f32> = (0..total)
+            .map(|i| (i as f32 * 0.3 + 2.0).sin() * 0.5)
+            .collect();
 
         // Forward pass (naive reference)
-        let (out, lse) = naive_attention_forward(&q, &k, &v, batch, heads, seq_len, head_dim, scale, false);
+        let (out, lse) =
+            naive_attention_forward(&q, &k, &v, batch, heads, seq_len, head_dim, scale, false);
 
         // Random-ish upstream gradient
-        let dout: Vec<f32> = (0..total).map(|i| (i as f32 * 0.7 + 3.0).cos() * 0.3).collect();
+        let dout: Vec<f32> = (0..total)
+            .map(|i| (i as f32 * 0.7 + 3.0).cos() * 0.3)
+            .collect();
 
         // Naive backward
         let (dq_naive, dk_naive, dv_naive) = naive_attention_backward(
@@ -3217,10 +3638,21 @@ mod tests {
         let mut dk_flash = vec![0.0f32; total];
         let mut dv_flash = vec![0.0f32; total];
         flash_attention_backward_cpu(
-            &q, &k, &v, &out, &lse, &dout,
-            &mut dq_flash, &mut dk_flash, &mut dv_flash,
-            batch, heads, seq_len, head_dim,
-            scale, false,
+            &q,
+            &k,
+            &v,
+            &out,
+            &lse,
+            &dout,
+            &mut dq_flash,
+            &mut dk_flash,
+            &mut dv_flash,
+            batch,
+            heads,
+            seq_len,
+            head_dim,
+            scale,
+            false,
         );
 
         let tol = 1e-4;
@@ -3228,9 +3660,18 @@ mod tests {
         let dk_err = max_abs_diff(&dk_naive, &dk_flash);
         let dv_err = max_abs_diff(&dv_naive, &dv_flash);
 
-        assert!(dq_err < tol, "dQ max abs diff = {dq_err} exceeds tolerance {tol}");
-        assert!(dk_err < tol, "dK max abs diff = {dk_err} exceeds tolerance {tol}");
-        assert!(dv_err < tol, "dV max abs diff = {dv_err} exceeds tolerance {tol}");
+        assert!(
+            dq_err < tol,
+            "dQ max abs diff = {dq_err} exceeds tolerance {tol}"
+        );
+        assert!(
+            dk_err < tol,
+            "dK max abs diff = {dk_err} exceeds tolerance {tol}"
+        );
+        assert!(
+            dv_err < tol,
+            "dV max abs diff = {dv_err} exceeds tolerance {tol}"
+        );
     }
 
     #[test]
@@ -3243,12 +3684,19 @@ mod tests {
         let total = batch * heads * seq_len * head_dim;
 
         let q: Vec<f32> = (0..total).map(|i| (i as f32 * 0.13).sin() * 0.4).collect();
-        let k: Vec<f32> = (0..total).map(|i| (i as f32 * 0.17 + 1.0).cos() * 0.4).collect();
-        let v: Vec<f32> = (0..total).map(|i| (i as f32 * 0.23 + 2.0).sin() * 0.4).collect();
+        let k: Vec<f32> = (0..total)
+            .map(|i| (i as f32 * 0.17 + 1.0).cos() * 0.4)
+            .collect();
+        let v: Vec<f32> = (0..total)
+            .map(|i| (i as f32 * 0.23 + 2.0).sin() * 0.4)
+            .collect();
 
-        let (out, lse) = naive_attention_forward(&q, &k, &v, batch, heads, seq_len, head_dim, scale, true);
+        let (out, lse) =
+            naive_attention_forward(&q, &k, &v, batch, heads, seq_len, head_dim, scale, true);
 
-        let dout: Vec<f32> = (0..total).map(|i| (i as f32 * 0.31 + 3.0).cos() * 0.3).collect();
+        let dout: Vec<f32> = (0..total)
+            .map(|i| (i as f32 * 0.31 + 3.0).cos() * 0.3)
+            .collect();
 
         let (dq_naive, dk_naive, dv_naive) = naive_attention_backward(
             &q, &k, &v, &dout, batch, heads, seq_len, head_dim, scale, true,
@@ -3258,10 +3706,21 @@ mod tests {
         let mut dk_flash = vec![0.0f32; total];
         let mut dv_flash = vec![0.0f32; total];
         flash_attention_backward_cpu(
-            &q, &k, &v, &out, &lse, &dout,
-            &mut dq_flash, &mut dk_flash, &mut dv_flash,
-            batch, heads, seq_len, head_dim,
-            scale, true,
+            &q,
+            &k,
+            &v,
+            &out,
+            &lse,
+            &dout,
+            &mut dq_flash,
+            &mut dk_flash,
+            &mut dv_flash,
+            batch,
+            heads,
+            seq_len,
+            head_dim,
+            scale,
+            true,
         );
 
         let tol = 1e-4;
@@ -3269,9 +3728,18 @@ mod tests {
         let dk_err = max_abs_diff(&dk_naive, &dk_flash);
         let dv_err = max_abs_diff(&dv_naive, &dv_flash);
 
-        assert!(dq_err < tol, "dQ max abs diff = {dq_err} exceeds tolerance {tol} (causal)");
-        assert!(dk_err < tol, "dK max abs diff = {dk_err} exceeds tolerance {tol} (causal)");
-        assert!(dv_err < tol, "dV max abs diff = {dv_err} exceeds tolerance {tol} (causal)");
+        assert!(
+            dq_err < tol,
+            "dQ max abs diff = {dq_err} exceeds tolerance {tol} (causal)"
+        );
+        assert!(
+            dk_err < tol,
+            "dK max abs diff = {dk_err} exceeds tolerance {tol} (causal)"
+        );
+        assert!(
+            dv_err < tol,
+            "dV max abs diff = {dv_err} exceeds tolerance {tol} (causal)"
+        );
     }
 
     #[test]
@@ -3284,12 +3752,19 @@ mod tests {
         let total = batch * heads * seq_len * head_dim;
 
         let q: Vec<f32> = (0..total).map(|i| (i as f32 * 0.07).sin() * 0.3).collect();
-        let k: Vec<f32> = (0..total).map(|i| (i as f32 * 0.11 + 0.5).cos() * 0.3).collect();
-        let v: Vec<f32> = (0..total).map(|i| (i as f32 * 0.19 + 1.5).sin() * 0.3).collect();
+        let k: Vec<f32> = (0..total)
+            .map(|i| (i as f32 * 0.11 + 0.5).cos() * 0.3)
+            .collect();
+        let v: Vec<f32> = (0..total)
+            .map(|i| (i as f32 * 0.19 + 1.5).sin() * 0.3)
+            .collect();
 
-        let (out, lse) = naive_attention_forward(&q, &k, &v, batch, heads, seq_len, head_dim, scale, false);
+        let (out, lse) =
+            naive_attention_forward(&q, &k, &v, batch, heads, seq_len, head_dim, scale, false);
 
-        let dout: Vec<f32> = (0..total).map(|i| (i as f32 * 0.29 + 2.5).cos() * 0.2).collect();
+        let dout: Vec<f32> = (0..total)
+            .map(|i| (i as f32 * 0.29 + 2.5).cos() * 0.2)
+            .collect();
 
         let (dq_naive, dk_naive, dv_naive) = naive_attention_backward(
             &q, &k, &v, &dout, batch, heads, seq_len, head_dim, scale, false,
@@ -3299,16 +3774,36 @@ mod tests {
         let mut dk_flash = vec![0.0f32; total];
         let mut dv_flash = vec![0.0f32; total];
         flash_attention_backward_cpu(
-            &q, &k, &v, &out, &lse, &dout,
-            &mut dq_flash, &mut dk_flash, &mut dv_flash,
-            batch, heads, seq_len, head_dim,
-            scale, false,
+            &q,
+            &k,
+            &v,
+            &out,
+            &lse,
+            &dout,
+            &mut dq_flash,
+            &mut dk_flash,
+            &mut dv_flash,
+            batch,
+            heads,
+            seq_len,
+            head_dim,
+            scale,
+            false,
         );
 
         let tol = 1e-4;
-        assert!(max_abs_diff(&dq_naive, &dq_flash) < tol, "dQ mismatch in batched test");
-        assert!(max_abs_diff(&dk_naive, &dk_flash) < tol, "dK mismatch in batched test");
-        assert!(max_abs_diff(&dv_naive, &dv_flash) < tol, "dV mismatch in batched test");
+        assert!(
+            max_abs_diff(&dq_naive, &dq_flash) < tol,
+            "dQ mismatch in batched test"
+        );
+        assert!(
+            max_abs_diff(&dk_naive, &dk_flash) < tol,
+            "dK mismatch in batched test"
+        );
+        assert!(
+            max_abs_diff(&dv_naive, &dv_flash) < tol,
+            "dV mismatch in batched test"
+        );
     }
 
     #[test]
@@ -3338,7 +3833,8 @@ mod tests {
             }
         }
 
-        let (out, lse) = naive_attention_forward(&q, &k, &v, batch, heads, seq_len, head_dim, scale, true);
+        let (out, lse) =
+            naive_attention_forward(&q, &k, &v, batch, heads, seq_len, head_dim, scale, true);
 
         // Gradient only on the first query row
         let mut dout = vec![0.0f32; total];
@@ -3350,10 +3846,21 @@ mod tests {
         let mut dk_flash = vec![0.0f32; total];
         let mut dv_flash = vec![0.0f32; total];
         flash_attention_backward_cpu(
-            &q, &k, &v, &out, &lse, &dout,
-            &mut dq_flash, &mut dk_flash, &mut dv_flash,
-            batch, heads, seq_len, head_dim,
-            scale, true,
+            &q,
+            &k,
+            &v,
+            &out,
+            &lse,
+            &dout,
+            &mut dq_flash,
+            &mut dk_flash,
+            &mut dv_flash,
+            batch,
+            heads,
+            seq_len,
+            head_dim,
+            scale,
+            true,
         );
 
         // With causal mask, Q[0] only attends to K[0], so:
@@ -3362,17 +3869,21 @@ mod tests {
         // Check dK[1..] are zero
         for j in 1..seq_len {
             for d in 0..head_dim {
-                assert!(dk_flash[j * head_dim + d].abs() < 1e-6,
+                assert!(
+                    dk_flash[j * head_dim + d].abs() < 1e-6,
                     "dK[{j},{d}] = {} should be zero for causal mask with dout only at row 0",
-                    dk_flash[j * head_dim + d]);
+                    dk_flash[j * head_dim + d]
+                );
             }
         }
         // dV for positions j>0 should also be zero (P[0,j]=0 for j>0)
         for j in 1..seq_len {
             for d in 0..head_dim {
-                assert!(dv_flash[j * head_dim + d].abs() < 1e-6,
+                assert!(
+                    dv_flash[j * head_dim + d].abs() < 1e-6,
                     "dV[{j},{d}] = {} should be zero for causal mask with dout only at row 0",
-                    dv_flash[j * head_dim + d]);
+                    dv_flash[j * head_dim + d]
+                );
             }
         }
     }
@@ -3388,12 +3899,17 @@ mod tests {
         let total = batch * heads * seq_len * head_dim;
 
         let q: Vec<f32> = (0..total).map(|i| (i as f32 * 0.1).sin() * 0.5).collect();
-        let k: Vec<f32> = (0..total).map(|i| (i as f32 * 0.2 + 1.0).cos() * 0.5).collect();
-        let v: Vec<f32> = (0..total).map(|i| (i as f32 * 0.3 + 2.0).sin() * 0.5).collect();
+        let k: Vec<f32> = (0..total)
+            .map(|i| (i as f32 * 0.2 + 1.0).cos() * 0.5)
+            .collect();
+        let v: Vec<f32> = (0..total)
+            .map(|i| (i as f32 * 0.3 + 2.0).sin() * 0.5)
+            .collect();
 
         let eps = 1e-3f32;
 
-        let (out, lse) = naive_attention_forward(&q, &k, &v, batch, heads, seq_len, head_dim, scale, false);
+        let (out, lse) =
+            naive_attention_forward(&q, &k, &v, batch, heads, seq_len, head_dim, scale, false);
         let dout: Vec<f32> = vec![1.0; total]; // all-ones upstream gradient = computing d(sum(O))/d(param)
 
         // Analytic gradients
@@ -3401,9 +3917,21 @@ mod tests {
         let mut dk_analytic = vec![0.0f32; total];
         let mut dv_analytic = vec![0.0f32; total];
         flash_attention_backward_cpu(
-            &q, &k, &v, &out, &lse, &dout,
-            &mut dq_analytic, &mut dk_analytic, &mut dv_analytic,
-            batch, heads, seq_len, head_dim, scale, false,
+            &q,
+            &k,
+            &v,
+            &out,
+            &lse,
+            &dout,
+            &mut dq_analytic,
+            &mut dk_analytic,
+            &mut dv_analytic,
+            batch,
+            heads,
+            seq_len,
+            head_dim,
+            scale,
+            false,
         );
 
         // Finite-difference check for dQ
@@ -3413,18 +3941,28 @@ mod tests {
             q_plus[idx] += eps;
             q_minus[idx] -= eps;
 
-            let (out_plus, _) = naive_attention_forward(&q_plus, &k, &v, batch, heads, seq_len, head_dim, scale, false);
-            let (out_minus, _) = naive_attention_forward(&q_minus, &k, &v, batch, heads, seq_len, head_dim, scale, false);
+            let (out_plus, _) = naive_attention_forward(
+                &q_plus, &k, &v, batch, heads, seq_len, head_dim, scale, false,
+            );
+            let (out_minus, _) = naive_attention_forward(
+                &q_minus, &k, &v, batch, heads, seq_len, head_dim, scale, false,
+            );
 
-            let fd_grad: f32 = out_plus.iter().zip(out_minus.iter())
+            let fd_grad: f32 = out_plus
+                .iter()
+                .zip(out_minus.iter())
                 .map(|(p, m)| (p - m) / (2.0 * eps))
                 .sum();
 
             let diff = (dq_analytic[idx] - fd_grad).abs();
             let denom = dq_analytic[idx].abs().max(fd_grad.abs()).max(1e-6);
-            assert!(diff / denom < 0.05,
+            assert!(
+                diff / denom < 0.05,
                 "dQ[{idx}] analytic={} fd={} rel_err={}",
-                dq_analytic[idx], fd_grad, diff / denom);
+                dq_analytic[idx],
+                fd_grad,
+                diff / denom
+            );
         }
 
         // Finite-difference check for dK
@@ -3434,18 +3972,28 @@ mod tests {
             k_plus[idx] += eps;
             k_minus[idx] -= eps;
 
-            let (out_plus, _) = naive_attention_forward(&q, &k_plus, &v, batch, heads, seq_len, head_dim, scale, false);
-            let (out_minus, _) = naive_attention_forward(&q, &k_minus, &v, batch, heads, seq_len, head_dim, scale, false);
+            let (out_plus, _) = naive_attention_forward(
+                &q, &k_plus, &v, batch, heads, seq_len, head_dim, scale, false,
+            );
+            let (out_minus, _) = naive_attention_forward(
+                &q, &k_minus, &v, batch, heads, seq_len, head_dim, scale, false,
+            );
 
-            let fd_grad: f32 = out_plus.iter().zip(out_minus.iter())
+            let fd_grad: f32 = out_plus
+                .iter()
+                .zip(out_minus.iter())
                 .map(|(p, m)| (p - m) / (2.0 * eps))
                 .sum();
 
             let diff = (dk_analytic[idx] - fd_grad).abs();
             let denom = dk_analytic[idx].abs().max(fd_grad.abs()).max(1e-6);
-            assert!(diff / denom < 0.05,
+            assert!(
+                diff / denom < 0.05,
                 "dK[{idx}] analytic={} fd={} rel_err={}",
-                dk_analytic[idx], fd_grad, diff / denom);
+                dk_analytic[idx],
+                fd_grad,
+                diff / denom
+            );
         }
 
         // Finite-difference check for dV
@@ -3455,18 +4003,28 @@ mod tests {
             v_plus[idx] += eps;
             v_minus[idx] -= eps;
 
-            let (out_plus, _) = naive_attention_forward(&q, &k, &v_plus, batch, heads, seq_len, head_dim, scale, false);
-            let (out_minus, _) = naive_attention_forward(&q, &k, &v_minus, batch, heads, seq_len, head_dim, scale, false);
+            let (out_plus, _) = naive_attention_forward(
+                &q, &k, &v_plus, batch, heads, seq_len, head_dim, scale, false,
+            );
+            let (out_minus, _) = naive_attention_forward(
+                &q, &k, &v_minus, batch, heads, seq_len, head_dim, scale, false,
+            );
 
-            let fd_grad: f32 = out_plus.iter().zip(out_minus.iter())
+            let fd_grad: f32 = out_plus
+                .iter()
+                .zip(out_minus.iter())
                 .map(|(p, m)| (p - m) / (2.0 * eps))
                 .sum();
 
             let diff = (dv_analytic[idx] - fd_grad).abs();
             let denom = dv_analytic[idx].abs().max(fd_grad.abs()).max(1e-6);
-            assert!(diff / denom < 0.05,
+            assert!(
+                diff / denom < 0.05,
                 "dV[{idx}] analytic={} fd={} rel_err={}",
-                dv_analytic[idx], fd_grad, diff / denom);
+                dv_analytic[idx],
+                fd_grad,
+                diff / denom
+            );
         }
     }
 
@@ -3484,8 +4042,10 @@ mod tests {
         let total_attn = batch * heads * seq_len * seq_len;
 
         // logsumexp is O(N), attention matrix would be O(N^2)
-        assert!(total_lse < total_attn,
-            "logsumexp ({total_lse}) should be much smaller than full attention ({total_attn})");
+        assert!(
+            total_lse < total_attn,
+            "logsumexp ({total_lse}) should be much smaller than full attention ({total_attn})"
+        );
         assert_eq!(total_lse, batch * heads * seq_len);
     }
 
@@ -3494,9 +4054,16 @@ mod tests {
     /// Naive GQA-aware forward: Q [b, h_q, s, d], K/V [b, h_kv, s, d]
     /// Each group of h_q/h_kv Q heads shares one KV head.
     fn naive_attention_forward_gqa(
-        q: &[f32], k: &[f32], v: &[f32],
-        batch: usize, h_q: usize, h_kv: usize, seq_len: usize, head_dim: usize,
-        scale: f32, causal: bool,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        batch: usize,
+        h_q: usize,
+        h_kv: usize,
+        seq_len: usize,
+        head_dim: usize,
+        scale: f32,
+        causal: bool,
     ) -> (Vec<f32>, Vec<f32>) {
         let groups = h_q / h_kv;
         let q_bh = h_q * seq_len * head_dim;
@@ -3519,14 +4086,22 @@ mod tests {
                     for j in 0..seq_len {
                         let kj = kv_base + j * head_dim;
                         let mut dot = 0.0f32;
-                        for dd in 0..head_dim { dot += q[qi + dd] * k[kj + dd]; }
+                        for dd in 0..head_dim {
+                            dot += q[qi + dd] * k[kj + dd];
+                        }
                         scores[j] = dot * scale;
                     }
-                    if causal { for j in (i+1)..seq_len { scores[j] = f32::NEG_INFINITY; } }
+                    if causal {
+                        for j in (i + 1)..seq_len {
+                            scores[j] = f32::NEG_INFINITY;
+                        }
+                    }
 
                     let max_s = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
                     let mut sum_exp = 0.0f32;
-                    for &s in &scores { sum_exp += (s - max_s).exp(); }
+                    for &s in &scores {
+                        sum_exp += (s - max_s).exp();
+                    }
                     logsumexp[lse_base + i] = max_s + sum_exp.ln();
                     let lse = logsumexp[lse_base + i];
 
@@ -3545,9 +4120,17 @@ mod tests {
 
     /// Naive GQA backward reference: returns (dQ [b,h_q,s,d], dK [b,h_kv,s,d], dV [b,h_kv,s,d])
     fn naive_attention_backward_gqa(
-        q: &[f32], k: &[f32], v: &[f32], dout: &[f32],
-        batch: usize, h_q: usize, h_kv: usize, seq_len: usize, head_dim: usize,
-        scale: f32, causal: bool,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        dout: &[f32],
+        batch: usize,
+        h_q: usize,
+        h_kv: usize,
+        seq_len: usize,
+        head_dim: usize,
+        scale: f32,
+        causal: bool,
     ) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
         let groups = h_q / h_kv;
         let q_bh = h_q * seq_len * head_dim;
@@ -3573,14 +4156,25 @@ mod tests {
                     for j in 0..seq_len {
                         let kj = kv_base + j * head_dim;
                         let mut dot = 0.0f32;
-                        for dd in 0..head_dim { dot += q[qi + dd] * k[kj + dd]; }
+                        for dd in 0..head_dim {
+                            dot += q[qi + dd] * k[kj + dd];
+                        }
                         scores[j] = dot * scale;
                     }
-                    if causal { for j in (i+1)..seq_len { scores[j] = f32::NEG_INFINITY; } }
+                    if causal {
+                        for j in (i + 1)..seq_len {
+                            scores[j] = f32::NEG_INFINITY;
+                        }
+                    }
                     let max_s = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
                     let mut sum_exp = 0.0f32;
-                    for s in &mut scores { *s = (*s - max_s).exp(); sum_exp += *s; }
-                    for j in 0..seq_len { probs[i][j] = scores[j] / sum_exp; }
+                    for s in &mut scores {
+                        *s = (*s - max_s).exp();
+                        sum_exp += *s;
+                    }
+                    for j in 0..seq_len {
+                        probs[i][j] = scores[j] / sum_exp;
+                    }
                 }
 
                 // dV[j] += sum_i P[i,j] * dO[i]  (accumulated across GQA group)
@@ -3601,7 +4195,9 @@ mod tests {
                     for j in 0..seq_len {
                         let vj = kv_base + j * head_dim;
                         let mut dp_ij = 0.0f32;
-                        for dd in 0..head_dim { dp_ij += dout[doi + dd] * v[vj + dd]; }
+                        for dd in 0..head_dim {
+                            dp_ij += dout[doi + dd] * v[vj + dd];
+                        }
                         d_i += probs[i][j] * dp_ij;
                     }
 
@@ -3609,7 +4205,9 @@ mod tests {
                         let kj = kv_base + j * head_dim;
                         let vj = kv_base + j * head_dim;
                         let mut dp_ij = 0.0f32;
-                        for dd in 0..head_dim { dp_ij += dout[doi + dd] * v[vj + dd]; }
+                        for dd in 0..head_dim {
+                            dp_ij += dout[doi + dd] * v[vj + dd];
+                        }
                         let ds_ij = probs[i][j] * (dp_ij - d_i);
 
                         let qi = q_base + i * head_dim;
@@ -3640,34 +4238,64 @@ mod tests {
 
         // Deterministic test data
         let q: Vec<f32> = (0..total_q).map(|i| (i as f32 * 0.1).sin() * 0.5).collect();
-        let k: Vec<f32> = (0..total_kv).map(|i| (i as f32 * 0.2 + 1.0).cos() * 0.5).collect();
-        let v: Vec<f32> = (0..total_kv).map(|i| (i as f32 * 0.3 + 2.0).sin() * 0.5).collect();
+        let k: Vec<f32> = (0..total_kv)
+            .map(|i| (i as f32 * 0.2 + 1.0).cos() * 0.5)
+            .collect();
+        let v: Vec<f32> = (0..total_kv)
+            .map(|i| (i as f32 * 0.3 + 2.0).sin() * 0.5)
+            .collect();
 
         // GQA forward
         let (out, lse) = naive_attention_forward_gqa(&q, &k, &v, b, h_q, h_kv, s, d, scale, false);
 
-        let dout: Vec<f32> = (0..total_q).map(|i| (i as f32 * 0.7 + 3.0).cos() * 0.3).collect();
+        let dout: Vec<f32> = (0..total_q)
+            .map(|i| (i as f32 * 0.7 + 3.0).cos() * 0.3)
+            .collect();
 
         // Naive GQA backward (reference)
-        let (dq_naive, dk_naive, dv_naive) = naive_attention_backward_gqa(
-            &q, &k, &v, &dout, b, h_q, h_kv, s, d, scale, false,
-        );
+        let (dq_naive, dk_naive, dv_naive) =
+            naive_attention_backward_gqa(&q, &k, &v, &dout, b, h_q, h_kv, s, d, scale, false);
 
         // Flash GQA backward (under test)
         let mut dq_flash = vec![0.0f32; total_q];
         let mut dk_flash = vec![0.0f32; total_kv];
         let mut dv_flash = vec![0.0f32; total_kv];
         flash_attention_backward_cpu_gqa(
-            &q, &k, &v, &out, &lse, &dout,
-            &mut dq_flash, &mut dk_flash, &mut dv_flash,
-            b, h_q, h_kv, s, d,
-            scale, false, groups,
+            &q,
+            &k,
+            &v,
+            &out,
+            &lse,
+            &dout,
+            &mut dq_flash,
+            &mut dk_flash,
+            &mut dv_flash,
+            b,
+            h_q,
+            h_kv,
+            s,
+            d,
+            scale,
+            false,
+            groups,
         );
 
         // Verify shapes implicitly via lengths
-        assert_eq!(dq_flash.len(), total_q, "dQ should have Q shape [b, h_q, s, d]");
-        assert_eq!(dk_flash.len(), total_kv, "dK should have KV shape [b, h_kv, s, d]");
-        assert_eq!(dv_flash.len(), total_kv, "dV should have KV shape [b, h_kv, s, d]");
+        assert_eq!(
+            dq_flash.len(),
+            total_q,
+            "dQ should have Q shape [b, h_q, s, d]"
+        );
+        assert_eq!(
+            dk_flash.len(),
+            total_kv,
+            "dK should have KV shape [b, h_kv, s, d]"
+        );
+        assert_eq!(
+            dv_flash.len(),
+            total_kv,
+            "dV should have KV shape [b, h_kv, s, d]"
+        );
 
         // Verify non-zero gradients
         let dq_norm: f32 = dq_flash.iter().map(|x| x * x).sum();
@@ -3682,9 +4310,18 @@ mod tests {
         let dq_err = max_abs_diff(&dq_naive, &dq_flash);
         let dk_err = max_abs_diff(&dk_naive, &dk_flash);
         let dv_err = max_abs_diff(&dv_naive, &dv_flash);
-        assert!(dq_err < tol, "GQA dQ max abs diff = {dq_err} exceeds tol {tol}");
-        assert!(dk_err < tol, "GQA dK max abs diff = {dk_err} exceeds tol {tol}");
-        assert!(dv_err < tol, "GQA dV max abs diff = {dv_err} exceeds tol {tol}");
+        assert!(
+            dq_err < tol,
+            "GQA dQ max abs diff = {dq_err} exceeds tol {tol}"
+        );
+        assert!(
+            dk_err < tol,
+            "GQA dK max abs diff = {dk_err} exceeds tol {tol}"
+        );
+        assert!(
+            dv_err < tol,
+            "GQA dV max abs diff = {dv_err} exceeds tol {tol}"
+        );
 
         // Cross-check: summing dK from non-GQA (h_q heads, same K for each group)
         // should match the GQA dK. Run a non-GQA backward with K replicated.
@@ -3705,16 +4342,27 @@ mod tests {
         }
 
         // Non-GQA backward with expanded K/V
-        let (out_exp, lse_exp) = naive_attention_forward(
-            &q, &k_expanded, &v_expanded, b, h_q, s, d, scale, false,
-        );
+        let (out_exp, lse_exp) =
+            naive_attention_forward(&q, &k_expanded, &v_expanded, b, h_q, s, d, scale, false);
         let mut dk_expanded = vec![0.0f32; total_q];
         let mut dq_expanded = vec![0.0f32; total_q];
         let mut dv_expanded = vec![0.0f32; total_q];
         flash_attention_backward_cpu(
-            &q, &k_expanded, &v_expanded, &out_exp, &lse_exp, &dout,
-            &mut dq_expanded, &mut dk_expanded, &mut dv_expanded,
-            b, h_q, s, d, scale, false,
+            &q,
+            &k_expanded,
+            &v_expanded,
+            &out_exp,
+            &lse_exp,
+            &dout,
+            &mut dq_expanded,
+            &mut dk_expanded,
+            &mut dv_expanded,
+            b,
+            h_q,
+            s,
+            d,
+            scale,
+            false,
         );
 
         // Sum dk_expanded across groups to get per-KV-head gradients
@@ -3735,8 +4383,10 @@ mod tests {
         }
 
         let dk_cross_err = max_abs_diff(&dk_summed, &dk_flash);
-        assert!(dk_cross_err < tol,
-            "GQA dK should match sum of expanded non-GQA dK, err={dk_cross_err}");
+        assert!(
+            dk_cross_err < tol,
+            "GQA dK should match sum of expanded non-GQA dK, err={dk_cross_err}"
+        );
     }
 
     #[test]
@@ -3753,35 +4403,64 @@ mod tests {
         let total_q = b * h_q * s * d;
         let total_kv = b * h_kv * s * d;
 
-        let q: Vec<f32> = (0..total_q).map(|i| (i as f32 * 0.13).sin() * 0.4).collect();
-        let k: Vec<f32> = (0..total_kv).map(|i| (i as f32 * 0.17 + 1.0).cos() * 0.4).collect();
-        let v: Vec<f32> = (0..total_kv).map(|i| (i as f32 * 0.23 + 2.0).sin() * 0.4).collect();
+        let q: Vec<f32> = (0..total_q)
+            .map(|i| (i as f32 * 0.13).sin() * 0.4)
+            .collect();
+        let k: Vec<f32> = (0..total_kv)
+            .map(|i| (i as f32 * 0.17 + 1.0).cos() * 0.4)
+            .collect();
+        let v: Vec<f32> = (0..total_kv)
+            .map(|i| (i as f32 * 0.23 + 2.0).sin() * 0.4)
+            .collect();
 
         let (out, lse) = naive_attention_forward_gqa(&q, &k, &v, b, h_q, h_kv, s, d, scale, true);
 
-        let dout: Vec<f32> = (0..total_q).map(|i| (i as f32 * 0.31 + 3.0).cos() * 0.3).collect();
+        let dout: Vec<f32> = (0..total_q)
+            .map(|i| (i as f32 * 0.31 + 3.0).cos() * 0.3)
+            .collect();
 
-        let (dq_naive, dk_naive, dv_naive) = naive_attention_backward_gqa(
-            &q, &k, &v, &dout, b, h_q, h_kv, s, d, scale, true,
-        );
+        let (dq_naive, dk_naive, dv_naive) =
+            naive_attention_backward_gqa(&q, &k, &v, &dout, b, h_q, h_kv, s, d, scale, true);
 
         let mut dq_flash = vec![0.0f32; total_q];
         let mut dk_flash = vec![0.0f32; total_kv];
         let mut dv_flash = vec![0.0f32; total_kv];
         flash_attention_backward_cpu_gqa(
-            &q, &k, &v, &out, &lse, &dout,
-            &mut dq_flash, &mut dk_flash, &mut dv_flash,
-            b, h_q, h_kv, s, d,
-            scale, true, groups,
+            &q,
+            &k,
+            &v,
+            &out,
+            &lse,
+            &dout,
+            &mut dq_flash,
+            &mut dk_flash,
+            &mut dv_flash,
+            b,
+            h_q,
+            h_kv,
+            s,
+            d,
+            scale,
+            true,
+            groups,
         );
 
         let tol = 1e-4;
         let dq_err = max_abs_diff(&dq_naive, &dq_flash);
         let dk_err = max_abs_diff(&dk_naive, &dk_flash);
         let dv_err = max_abs_diff(&dv_naive, &dv_flash);
-        assert!(dq_err < tol, "GQA causal dQ err = {dq_err} exceeds tol {tol}");
-        assert!(dk_err < tol, "GQA causal dK err = {dk_err} exceeds tol {tol}");
-        assert!(dv_err < tol, "GQA causal dV err = {dv_err} exceeds tol {tol}");
+        assert!(
+            dq_err < tol,
+            "GQA causal dQ err = {dq_err} exceeds tol {tol}"
+        );
+        assert!(
+            dk_err < tol,
+            "GQA causal dK err = {dk_err} exceeds tol {tol}"
+        );
+        assert!(
+            dv_err < tol,
+            "GQA causal dV err = {dv_err} exceeds tol {tol}"
+        );
 
         // Causal check: with dout only at position 0, positions j > 0
         // should not receive gradient from Q[0] for any head
@@ -3796,10 +4475,23 @@ mod tests {
         let mut dq_causal = vec![0.0f32; total_q];
         let mut dv_causal = vec![0.0f32; total_kv];
         flash_attention_backward_cpu_gqa(
-            &q, &k, &v, &out, &lse, &dout_first,
-            &mut dq_causal, &mut dk_causal, &mut dv_causal,
-            b, h_q, h_kv, s, d,
-            scale, true, groups,
+            &q,
+            &k,
+            &v,
+            &out,
+            &lse,
+            &dout_first,
+            &mut dq_causal,
+            &mut dk_causal,
+            &mut dv_causal,
+            b,
+            h_q,
+            h_kv,
+            s,
+            d,
+            scale,
+            true,
+            groups,
         );
 
         // With causal mask and dout only at row 0, K/V positions j>0
@@ -3838,20 +4530,45 @@ mod tests {
     #[cfg(not(feature = "cuda"))]
     fn a25_csha_ffi_noncuda_returns_error_without_panic() {
         let r = nsl_flash_attention_csha(
-            0, 0, 0, 0, 0, 1.0f32.to_bits() as i64,
-            1, 1, 16, 64,
-            0, 0, 0, 0,
-            0, 0, 0, 0,
-            0, 0, 0,
-            64, 64, 0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            1.0f32.to_bits() as i64,
+            1,
+            1,
+            16,
+            64,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            64,
+            64,
+            0,
             // CSHA extras (all null / zero — matches current call-site state).
-            0, 0, 0, 0, 0, 0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
             1e-5f32.to_bits() as i64,
-            0, 0,
+            0,
+            0,
             // PCA Tier A: segment_ids_ptr (0 = unpacked path).
             0,
             // PCA Tier B Planner: tier_b sentinel pair (both zero = disabled).
-            0, 0,
+            0,
+            0,
             // PCA §4.3: doc_starts_ptr (0 = identity positions).
             0,
         );
@@ -3913,19 +4630,45 @@ mod tests {
     #[cfg(not(feature = "cuda"))]
     fn a25_csha_ffi_signature_has_thirty_params() {
         let _: extern "C" fn(
-            i64, i64, i64, i64, i64, i64,
-            i64, i64, i64, i64,
-            i64, i64, i64, i64,
-            i64, i64, i64, i64,
-            i64, i64, i64,
-            i64, i64, i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
             // extras
-            i64, i64, i64, i64, i64, i64,
-            i64, i64, i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
             // PCA Tier A: segment_ids_ptr
             i64,
             // PCA Tier B Planner: tier_b_ptx_ptr, tier_b_name_ptr
-            i64, i64,
+            i64,
+            i64,
             // PCA §4.3: doc_starts_ptr
             i64,
         ) -> i64 = nsl_flash_attention_csha;

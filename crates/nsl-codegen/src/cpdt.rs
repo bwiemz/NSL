@@ -340,7 +340,7 @@ mod override_tests {
     ) -> CpdtInput<'static> {
         let memory_budget_bytes = match memory_pressure {
             "low" => 80u64 * 1024 * 1024 * 1024, // 80 GB — all tuples feasible
-            "high" => 75_000_000u64,              // 75 MB — only s_p ≥ 4 feasible
+            "high" => 75_000_000u64,             // 75 MB — only s_p ≥ 4 feasible
             other => panic!("unknown memory_pressure: {other}"),
         };
         CpdtInput {
@@ -378,7 +378,10 @@ mod override_tests {
         let input = cpdt_input_with(8, Some(4), "low");
         let plan = run(input);
         let s_p = plan.zero.as_ref().expect("zero eval").config.s_p;
-        assert!(s_p <= 4, "applied s_p must not exceed recommendation; got {s_p}");
+        assert!(
+            s_p <= 4,
+            "applied s_p must not exceed recommendation; got {s_p}"
+        );
         assert!(
             plan.override_diagnostics.is_empty(),
             "no diagnostics expected; got {:?}",
@@ -437,7 +440,10 @@ mod override_tests {
         let input = cpdt_input_with(8, None, "low");
         let plan = run(input);
         assert!(plan.override_diagnostics.is_empty());
-        assert!(plan.zero.is_some(), "planner must produce a zero evaluation");
+        assert!(
+            plan.zero.is_some(),
+            "planner must produce a zero evaluation"
+        );
     }
 
     #[test]
@@ -541,7 +547,10 @@ mod tests {
         // (DDP is expected when the model fits comfortably in a single
         // GPU's budget — tiny_model's 48 MB fits the default 80 GB).
         let stage = plan.zero.as_ref().unwrap().config.stage_label();
-        assert!(matches!(stage, "DDP" | "ZeRO-1" | "ZeRO-2" | "ZeRO-3" | "Mixed"));
+        assert!(matches!(
+            stage,
+            "DDP" | "ZeRO-1" | "ZeRO-2" | "ZeRO-3" | "Mixed"
+        ));
         // If any shard factor > 1, we must have a non-empty schedule.
         let cfg = plan.zero.as_ref().unwrap().config;
         let sharded = cfg.s_p > 1 || cfg.s_g > 1 || cfg.s_os > 1;

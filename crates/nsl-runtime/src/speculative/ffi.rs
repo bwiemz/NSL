@@ -56,12 +56,18 @@ pub extern "C" fn nsl_speculative_draft(
 /// Also frees the tokens and logits tensors within.
 #[no_mangle]
 pub extern "C" fn nsl_speculative_draft_result_free(result_ptr: i64) -> i64 {
-    if result_ptr == 0 { return 0; }
+    if result_ptr == 0 {
+        return 0;
+    }
     let out = result_ptr as *mut i64;
     let tokens_ptr = unsafe { *out };
     let logits_ptr = unsafe { *out.add(1) };
-    if tokens_ptr != 0 { crate::tensor::nsl_tensor_free(tokens_ptr); }
-    if logits_ptr != 0 { crate::tensor::nsl_tensor_free(logits_ptr); }
+    if tokens_ptr != 0 {
+        crate::tensor::nsl_tensor_free(tokens_ptr);
+    }
+    if logits_ptr != 0 {
+        crate::tensor::nsl_tensor_free(logits_ptr);
+    }
     unsafe { crate::memory::checked_free(out as *mut u8, 3 * std::mem::size_of::<i64>()) };
     0
 }
@@ -169,9 +175,9 @@ pub extern "C" fn nsl_speculative_decode_step(
     num_draft_tokens: i64,
     vocab_size: i64,
     temperature_bits: i64,
-    _num_tokens: i64,   // configured K from @speculative decorator (reserved for future use)
-    _method: i64,       // 0=Draft, 1=Medusa, 2=Eagle2, 3=Lookahead (reserved for future use)
-    _tree_width: i64,   // branching factor for tree-based methods (reserved for future use)
+    _num_tokens: i64, // configured K from @speculative decorator (reserved for future use)
+    _method: i64,     // 0=Draft, 1=Medusa, 2=Eagle2, 3=Lookahead (reserved for future use)
+    _tree_width: i64, // branching factor for tree-based methods (reserved for future use)
 ) -> i64 {
     let k = num_draft_tokens as usize;
     let vocab = vocab_size as usize;
@@ -191,20 +197,24 @@ pub extern "C" fn nsl_speculative_decode_step(
     // Read draft logits [K, vocab_size] as f32
     let draft_logits_tensor = NslTensor::from_ptr(draft_logits_ptr);
     let draft_logits: Vec<f32> = if draft_logits_tensor.dtype == 0 {
-        let data = unsafe { slice::from_raw_parts(draft_logits_tensor.data as *const f64, k * vocab) };
+        let data =
+            unsafe { slice::from_raw_parts(draft_logits_tensor.data as *const f64, k * vocab) };
         data.iter().map(|&v| v as f32).collect()
     } else {
-        let data = unsafe { slice::from_raw_parts(draft_logits_tensor.data as *const f32, k * vocab) };
+        let data =
+            unsafe { slice::from_raw_parts(draft_logits_tensor.data as *const f32, k * vocab) };
         data.to_vec()
     };
 
     // Read verifier logits [K+1, vocab_size] as f32
     let verifier_tensor = NslTensor::from_ptr(verifier_logits_ptr);
     let verifier_logits: Vec<f32> = if verifier_tensor.dtype == 0 {
-        let data = unsafe { slice::from_raw_parts(verifier_tensor.data as *const f64, (k + 1) * vocab) };
+        let data =
+            unsafe { slice::from_raw_parts(verifier_tensor.data as *const f64, (k + 1) * vocab) };
         data.iter().map(|&v| v as f32).collect()
     } else {
-        let data = unsafe { slice::from_raw_parts(verifier_tensor.data as *const f32, (k + 1) * vocab) };
+        let data =
+            unsafe { slice::from_raw_parts(verifier_tensor.data as *const f32, (k + 1) * vocab) };
         data.to_vec()
     };
 
@@ -288,7 +298,9 @@ pub extern "C" fn nsl_speculative_build_tree(
         unsafe { slice::from_raw_parts(logits_tensor.data as *const f64, total) }.to_vec()
     } else {
         unsafe { slice::from_raw_parts(logits_tensor.data as *const f32, total) }
-            .iter().map(|&v| v as f64).collect()
+            .iter()
+            .map(|&v| v as f64)
+            .collect()
     };
 
     // Extract top-k tokens from each head
@@ -296,7 +308,8 @@ pub extern "C" fn nsl_speculative_build_tree(
     let mut flat_logits = Vec::new();
     for h in 0..actual_heads {
         let head = &all_logits[h * vocab..(h + 1) * vocab];
-        let mut indexed: Vec<(usize, f64)> = head.iter().enumerate().map(|(i, &v)| (i, v)).collect();
+        let mut indexed: Vec<(usize, f64)> =
+            head.iter().enumerate().map(|(i, &v)| (i, v)).collect();
         indexed.sort_by(|a, b| b.1.total_cmp(&a.1));
         for &(tok, logit) in indexed.iter().take(width) {
             flat_tokens.push(tok as i64);
@@ -352,7 +365,9 @@ pub extern "C" fn nsl_speculative_verify_tree(
     // Deserialize tree from buffer
     let buf = tree_ptr as *const i64;
     let n = unsafe { *buf } as usize;
-    if n == 0 { return 0; }
+    if n == 0 {
+        return 0;
+    }
 
     let mut nodes = Vec::with_capacity(n);
     let mut dfs_enter = Vec::with_capacity(n);
@@ -389,7 +404,9 @@ pub extern "C" fn nsl_speculative_verify_tree(
 
     let logits_f32: Vec<f32> = if logits_tensor.dtype == 0 {
         unsafe { slice::from_raw_parts(logits_tensor.data as *const f64, total) }
-            .iter().map(|&v| v as f32).collect()
+            .iter()
+            .map(|&v| v as f32)
+            .collect()
     } else {
         unsafe { slice::from_raw_parts(logits_tensor.data as *const f32, total) }.to_vec()
     };
@@ -406,8 +423,12 @@ pub extern "C" fn nsl_speculative_verify_tree(
         let row = &logits_f32[i * vocab_size..(i + 1) * vocab_size];
         if temperature == 0.0 {
             // Greedy: accept iff verifier's argmax matches candidate
-            let verifier_best = row.iter().enumerate()
-                .max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0;
+            let verifier_best = row
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .unwrap()
+                .0;
             nodes[i].accepted = verifier_best as i64 == nodes[i].token_id;
         } else {
             // Stochastic: accept with probability p_target / p_draft
@@ -419,8 +440,12 @@ pub extern "C" fn nsl_speculative_verify_tree(
     }
 
     let mut tree = super::types::SpeculativeTree {
-        nodes, dfs_enter, dfs_exit, children,
-        tree_depth: 0, tree_width: 0,
+        nodes,
+        dfs_enter,
+        dfs_exit,
+        children,
+        tree_depth: 0,
+        tree_width: 0,
     };
     let _ = &mut tree; // suppress unused warning
 
@@ -429,7 +454,9 @@ pub extern "C" fn nsl_speculative_verify_tree(
     // Write accepted tokens to result buffer
     let out = result_ptr as *mut i64;
     for (i, &token) in accepted_path.iter().enumerate() {
-        unsafe { *out.add(i) = token; }
+        unsafe {
+            *out.add(i) = token;
+        }
     }
 
     accepted_path.len() as i64

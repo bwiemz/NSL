@@ -5,8 +5,8 @@
 use std::ffi::c_void;
 // AtomicI64 and Ordering used by inner module functions when cuda feature is enabled
 
-pub(crate) mod kernels;
 pub(crate) mod fused_kernels;
+pub(crate) mod kernels;
 pub(crate) mod kernels_hopper;
 pub(crate) mod tier_b1_prepass;
 
@@ -38,7 +38,8 @@ pub(crate) mod inner {
 
     static CUDA_STATE: OnceLock<Mutex<CudaState>> = OnceLock::new();
 
-    static CUDA_SYNC_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    static CUDA_SYNC_MODE: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
 
     pub fn set_cuda_sync_mode(enabled: bool) {
         CUDA_SYNC_MODE.store(enabled, std::sync::atomic::Ordering::Relaxed);
@@ -51,7 +52,8 @@ pub(crate) mod inner {
     #[cfg(test)]
     use std::collections::HashMap as TestHashMap;
     #[cfg(test)]
-    static CUDA_SIZE_REGISTRY: std::sync::OnceLock<std::sync::Mutex<TestHashMap<usize, usize>>> = std::sync::OnceLock::new();
+    static CUDA_SIZE_REGISTRY: std::sync::OnceLock<std::sync::Mutex<TestHashMap<usize, usize>>> =
+        std::sync::OnceLock::new();
 
     #[cfg(test)]
     fn cuda_size_registry() -> &'static std::sync::Mutex<TestHashMap<usize, usize>> {
@@ -106,9 +108,14 @@ pub(crate) mod inner {
                     "cuCtxSetCurrent failed: {:?}",
                     result
                 );
-                if std::env::var("NSL_CUDA_SYNC").map(|v| v == "1").unwrap_or(false) {
+                if std::env::var("NSL_CUDA_SYNC")
+                    .map(|v| v == "1")
+                    .unwrap_or(false)
+                {
                     CUDA_SYNC_MODE.store(true, std::sync::atomic::Ordering::Relaxed);
-                    eprintln!("[nsl] CUDA sync mode ENABLED — synchronizing after every kernel launch");
+                    eprintln!(
+                        "[nsl] CUDA sync mode ENABLED — synchronizing after every kernel launch"
+                    );
                 }
                 // Register atexit handler for memory stats if NSL_MEMSTATS=1
                 if super::caching_allocator::memstats_enabled() {
@@ -232,10 +239,13 @@ pub(crate) mod inner {
                - Enable gradient checkpointing (@checkpoint)\n\
                - Use lower precision (fp16, fp8, int8)\n\
                - Set NSL_ASYNC_ALLOC=1 for stream-ordered allocation",
-            requested, format_bytes(requested),
-            format_bytes(free_vram), format_bytes(total_vram),
+            requested,
+            format_bytes(requested),
+            format_bytes(free_vram),
+            format_bytes(total_vram),
             format_bytes(pool_freed),
-            alloc_num, op_line,
+            alloc_num,
+            op_line,
         )
     }
 
@@ -243,14 +253,18 @@ pub(crate) mod inner {
     /// Handles registration and test stats. Returns None on failure.
     fn caching_alloc(size_bytes: usize) -> Option<*mut c_void> {
         let mut alloc = super::caching_allocator::CACHING_ALLOCATOR.lock().unwrap();
-        let ptr = alloc.alloc_from_cache(size_bytes)
+        let ptr = alloc
+            .alloc_from_cache(size_bytes)
             .or_else(|| alloc.alloc_with_grow(size_bytes))?;
         drop(alloc);
         register_cuda_alloc(ptr);
         #[cfg(test)]
         crate::memory::stats::cuda_alloc(size_bytes);
         #[cfg(test)]
-        cuda_size_registry().lock().unwrap().insert(ptr as usize, size_bytes);
+        cuda_size_registry()
+            .lock()
+            .unwrap()
+            .insert(ptr as usize, size_bytes);
         Some(ptr)
     }
 
@@ -273,7 +287,9 @@ pub(crate) mod inner {
     /// Try to allocate GPU memory with OOM recovery. Returns None after all
     /// recovery attempts fail. Use this for ops that can fall back to CPU.
     pub(crate) fn try_alloc_managed(size_bytes: usize) -> Option<*mut c_void> {
-        if size_bytes == 0 { return None; }
+        if size_bytes == 0 {
+            return None;
+        }
 
         // Async alloc path (opt-in, bypasses caching allocator)
         if async_alloc_enabled() {
@@ -293,7 +309,9 @@ pub(crate) mod inner {
         }
 
         // Attempt 2: synchronize device (flushes pending async frees) and retry
-        unsafe { cuCtxSynchronize(); }
+        unsafe {
+            cuCtxSynchronize();
+        }
         if let Some(ptr) = caching_alloc(size_bytes) {
             return Some(ptr);
         }
@@ -317,7 +335,9 @@ pub(crate) mod inner {
     /// IMPORTANT: The returned pointer is a device pointer. CPU code must NOT
     /// dereference it. Use `memcpy_htod` / `memcpy_dtoh` for data transfer.
     pub(crate) fn alloc_managed(size_bytes: usize) -> *mut c_void {
-        if size_bytes == 0 { return std::ptr::null_mut(); }
+        if size_bytes == 0 {
+            return std::ptr::null_mut();
+        }
 
         let n = ALLOC_COUNT_DBG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
@@ -340,7 +360,9 @@ pub(crate) mod inner {
 
         // === OOM Recovery ===
         // Step 1: synchronize device — flushes pending async frees
-        unsafe { cuCtxSynchronize(); }
+        unsafe {
+            cuCtxSynchronize();
+        }
         if let Some(ptr) = caching_alloc(size_bytes) {
             return ptr;
         }
@@ -370,7 +392,9 @@ pub(crate) mod inner {
     }
 
     pub(crate) fn is_cuda_alloc(ptr: *mut c_void) -> bool {
-        if ptr.is_null() { return false; }
+        if ptr.is_null() {
+            return false;
+        }
         CUDA_ALLOC_SET.lock().unwrap().contains(&(ptr as usize))
     }
 
@@ -383,14 +407,18 @@ pub(crate) mod inner {
     /// Returns to caching allocator's free-list (with coalescing).
     /// Routes async-allocated pointers to cuMemFreeAsync.
     pub(crate) fn free_managed(ptr: *mut c_void) {
-        if ptr.is_null() { return; }
+        if ptr.is_null() {
+            return;
+        }
         // Check if this was async-allocated before removing from general set
         if is_async_alloc(ptr) {
             free_async(ptr);
             return;
         }
         let was_cuda = CUDA_ALLOC_SET.lock().unwrap().remove(&(ptr as usize));
-        if !was_cuda { return; }
+        if !was_cuda {
+            return;
+        }
         // Ensure CUDA context BEFORE acquiring CACHING_ALLOCATOR lock.
         // Lock ordering: CUDA_STATE first, then CACHING_ALLOCATOR.
         // Reversing this order causes ABBA deadlock with alloc_managed.
@@ -461,7 +489,9 @@ pub(crate) mod inner {
 
     /// Free device memory that was allocated via cuMemAllocAsync.
     pub(crate) fn free_async(ptr: *mut c_void) {
-        if ptr.is_null() { return; }
+        if ptr.is_null() {
+            return;
+        }
         CUDA_ALLOC_SET.lock().unwrap().remove(&(ptr as usize));
         ASYNC_ALLOC_SET.lock().unwrap().remove(&(ptr as usize));
         ensure_context();
@@ -476,7 +506,9 @@ pub(crate) mod inner {
 
     /// Check if a pointer was async-allocated.
     pub(crate) fn is_async_alloc(ptr: *mut c_void) -> bool {
-        if ptr.is_null() { return false; }
+        if ptr.is_null() {
+            return false;
+        }
         ASYNC_ALLOC_SET.lock().unwrap().contains(&(ptr as usize))
     }
 
@@ -615,10 +647,18 @@ pub(crate) mod inner {
     }
 
     /// Copy `size_bytes` bytes from one device pointer to another.
-    pub(crate) fn memcpy_dtod(dst_device: *mut c_void, src_device: *const c_void, size_bytes: usize) {
+    pub(crate) fn memcpy_dtod(
+        dst_device: *mut c_void,
+        src_device: *const c_void,
+        size_bytes: usize,
+    ) {
         ensure_context();
         unsafe {
-            let result = cuMemcpyDtoD_v2(dst_device as CUdeviceptr, src_device as CUdeviceptr, size_bytes);
+            let result = cuMemcpyDtoD_v2(
+                dst_device as CUdeviceptr,
+                src_device as CUdeviceptr,
+                size_bytes,
+            );
             assert_eq!(
                 result,
                 CUresult::CUDA_SUCCESS,
@@ -652,13 +692,15 @@ pub(crate) mod inner {
         unsafe {
             let location = CUmemLocation {
                 type_: CUmemLocationType::CU_MEM_LOCATION_TYPE_DEVICE,
-                __bindgen_anon_1: cudarc::driver::sys::CUmemLocation_st__bindgen_ty_1 { id: device_id },
+                __bindgen_anon_1: cudarc::driver::sys::CUmemLocation_st__bindgen_ty_1 {
+                    id: device_id,
+                },
             };
             let result = cuMemPrefetchAsync_v2(
                 ptr as CUdeviceptr,
                 size_bytes,
                 location,
-                0, // flags
+                0,                    // flags
                 std::ptr::null_mut(), // default stream
             );
             if result != CUresult::CUDA_SUCCESS
@@ -707,7 +749,9 @@ pub(crate) mod inner {
     pub unsafe fn cu_event_create_checked() -> Result<u64, CUresult> {
         let mut e: CUevent = std::ptr::null_mut();
         let res = cuEventCreate(&mut e, 0);
-        if res != CUresult::CUDA_SUCCESS { return Err(res); }
+        if res != CUresult::CUDA_SUCCESS {
+            return Err(res);
+        }
         Ok(e as u64)
     }
 
@@ -740,7 +784,9 @@ pub(crate) mod inner {
         let state = state();
         let func = {
             let mut guard = state.lock().unwrap();
-            unsafe { cuCtxSetCurrent(guard.context); }
+            unsafe {
+                cuCtxSetCurrent(guard.context);
+            }
 
             // Cache modules by FNV-1a hash of PTX content.
             // Using pointer address as key (the old approach) caused
@@ -750,7 +796,9 @@ pub(crate) mod inner {
             let cache_key = {
                 // Compute length by scanning for the NUL terminator.
                 let mut len = 0usize;
-                while unsafe { *ptx_ptr.add(len) } != 0 { len += 1; }
+                while unsafe { *ptx_ptr.add(len) } != 0 {
+                    len += 1;
+                }
                 let ptx_bytes = unsafe { std::slice::from_raw_parts(ptx_ptr, len) };
                 // FNV-1a 64-bit hash (no external dep, no alloc).
                 let mut h: u64 = 14695981039346656037u64;
@@ -765,7 +813,9 @@ pub(crate) mod inner {
             } else {
                 let mut module: CUmodule = std::ptr::null_mut();
                 let res = unsafe { cuModuleLoadData(&mut module, ptx_ptr as *const c_void) };
-                if res != CUresult::CUDA_SUCCESS { return res; }
+                if res != CUresult::CUDA_SUCCESS {
+                    return res;
+                }
                 guard.module_cache.insert(cache_key, module);
                 module
             };
@@ -773,7 +823,9 @@ pub(crate) mod inner {
             let name = unsafe { std::ffi::CStr::from_ptr(name_ptr as *const i8) };
             let mut func: CUfunction = std::ptr::null_mut();
             let res = unsafe { cuModuleGetFunction(&mut func, module, name.as_ptr()) };
-            if res != CUresult::CUDA_SUCCESS { return res; }
+            if res != CUresult::CUDA_SUCCESS {
+                return res;
+            }
 
             func
         }; // guard dropped here — no lock held for CUDA calls
@@ -787,7 +839,9 @@ pub(crate) mod inner {
 
         // Record start event before launch
         if let Some((start, _, _)) = &profiler_events {
-            unsafe { cuEventRecord(*start as CUevent, std::ptr::null_mut()); }
+            unsafe {
+                cuEventRecord(*start as CUevent, std::ptr::null_mut());
+            }
         }
 
         // Dynamic SMEM opt-in for kernels using `.extern .shared` PTX declarations.
@@ -837,23 +891,37 @@ pub(crate) mod inner {
         }
 
         // Validate launch dimensions
-        debug_assert!(grid[0] > 0 && grid[1] > 0 && grid[2] > 0,
-            "kernel_launch: invalid grid dimensions {:?}", grid);
-        debug_assert!(block[0] > 0 && block[1] > 0 && block[2] > 0,
-            "kernel_launch: invalid block dimensions {:?}", block);
-        debug_assert!(block[0] * block[1] * block[2] <= 1024,
+        debug_assert!(
+            grid[0] > 0 && grid[1] > 0 && grid[2] > 0,
+            "kernel_launch: invalid grid dimensions {:?}",
+            grid
+        );
+        debug_assert!(
+            block[0] > 0 && block[1] > 0 && block[2] > 0,
+            "kernel_launch: invalid block dimensions {:?}",
+            block
+        );
+        debug_assert!(
+            block[0] * block[1] * block[2] <= 1024,
             "kernel_launch: block size {} exceeds max 1024 threads",
-            block[0] * block[1] * block[2]);
+            block[0] * block[1] * block[2]
+        );
 
         // Launch kernel (no lock held)
         let mut kernel_args: Vec<*mut c_void> = args.to_vec();
         let res = unsafe {
             cuLaunchKernel(
                 func,
-                grid[0] as u32, grid[1] as u32, grid[2] as u32,
-                block[0] as u32, block[1] as u32, block[2] as u32,
-                shared_mem_bytes, std::ptr::null_mut(),
-                kernel_args.as_mut_ptr(), std::ptr::null_mut(),
+                grid[0] as u32,
+                grid[1] as u32,
+                grid[2] as u32,
+                block[0] as u32,
+                block[1] as u32,
+                block[2] as u32,
+                shared_mem_bytes,
+                std::ptr::null_mut(),
+                kernel_args.as_mut_ptr(),
+                std::ptr::null_mut(),
             )
         };
 
@@ -861,7 +929,8 @@ pub(crate) mod inner {
         if sync_mode_enabled() {
             let sync_result = unsafe { cuCtxSynchronize() };
             if sync_result != CUresult::CUDA_SUCCESS {
-                let name_cstr = unsafe { std::ffi::CStr::from_ptr(name_ptr as *const std::ffi::c_char) };
+                let name_cstr =
+                    unsafe { std::ffi::CStr::from_ptr(name_ptr as *const std::ffi::c_char) };
                 let name_str = name_cstr.to_string_lossy();
                 panic!(
                     "[nsl] CUDA async error after kernel '{}' (grid={:?}, block={:?}, shared={}B): {:?}",
@@ -872,7 +941,9 @@ pub(crate) mod inner {
 
         // Record stop event after launch
         if let Some((_, stop, _)) = &profiler_events {
-            unsafe { cuEventRecord(*stop as CUevent, std::ptr::null_mut()); }
+            unsafe {
+                cuEventRecord(*stop as CUevent, std::ptr::null_mut());
+            }
             // Push trace (lock-push-unlock on profiler mutex)
             let name = unsafe { std::ffi::CStr::from_ptr(name_ptr as *const i8) };
             let name_str = name.to_str().unwrap_or("unknown");
@@ -890,10 +961,15 @@ pub(crate) mod inner {
 }
 
 #[cfg(feature = "cuda")]
-pub(crate) use inner::{cu_event_create, cu_event_record, cu_event_elapsed_time, cu_event_destroy, cu_ctx_synchronize};
+pub(crate) use inner::{
+    cu_ctx_synchronize, cu_event_create, cu_event_destroy, cu_event_elapsed_time, cu_event_record,
+};
 
 #[cfg(feature = "cuda")]
-pub use inner::{current_stream, cu_event_create_checked, cu_event_record_on_current_stream, cu_event_synchronize_raw, cu_event_elapsed_time_raw};
+pub use inner::{
+    cu_event_create_checked, cu_event_elapsed_time_raw, cu_event_record_on_current_stream,
+    cu_event_synchronize_raw, current_stream,
+};
 
 // === cuBLAS handle + sgemm wrapper (spec 2026-04-21-matmul-cublas-swap-design) ===
 
@@ -1051,13 +1127,15 @@ pub(crate) mod cublas_inner {
             m as i32, // cublas n = M (rows of row-major C)
             k as i32, // contraction dim
             &alpha,
-            b_dev, n as i32, // A^cublas := B_row, lda = N
-            a_dev, k as i32, // B^cublas := A_row, ldb = K
+            b_dev,
+            n as i32, // A^cublas := B_row, lda = N
+            a_dev,
+            k as i32, // B^cublas := A_row, ldb = K
             &beta,
-            c_dev, n as i32, // C^cublas := C_row, ldc = N
+            c_dev,
+            n as i32, // C^cublas := C_row, ldc = N
         )
     }
-
 }
 
 // === GPU op helpers ===
@@ -1066,7 +1144,11 @@ pub(crate) mod cublas_inner {
 #[cfg(feature = "cuda")]
 fn cpu_fallback_binary(a_ptr: i64, b_ptr: i64, kernel_name: &str) -> i64 {
     let a = unsafe { &*(a_ptr as *const crate::tensor::NslTensor) };
-    let a_cpu = if a.device > 0 { crate::tensor::nsl_tensor_to_device(a_ptr, 0) } else { a_ptr };
+    let a_cpu = if a.device > 0 {
+        crate::tensor::nsl_tensor_to_device(a_ptr, 0)
+    } else {
+        a_ptr
+    };
     let b_cpu = if unsafe { &*(b_ptr as *const crate::tensor::NslTensor) }.device > 0 {
         crate::tensor::nsl_tensor_to_device(b_ptr, 0)
     } else {
@@ -1082,15 +1164,23 @@ fn cpu_fallback_binary(a_ptr: i64, b_ptr: i64, kernel_name: &str) -> i64 {
     let result_cpu = crate::cpu::tensor_elementwise_op(a_cpu, b_cpu, op_fn);
     // Transfer back to GPU — alloc_managed will retry/drain internally
     let result_gpu = crate::tensor::nsl_tensor_to_device(result_cpu, a.device as i64);
-    if a_cpu != a_ptr { crate::tensor::nsl_tensor_free(a_cpu); }
-    if b_cpu != b_ptr { crate::tensor::nsl_tensor_free(b_cpu); }
+    if a_cpu != a_ptr {
+        crate::tensor::nsl_tensor_free(a_cpu);
+    }
+    if b_cpu != b_ptr {
+        crate::tensor::nsl_tensor_free(b_cpu);
+    }
     crate::tensor::nsl_tensor_free(result_cpu);
     result_gpu
 }
 
 #[cfg(feature = "cuda")]
 fn tensor_shape_slice<'a>(tensor: &'a crate::tensor::NslTensor) -> &'a [i64] {
-    assert!(tensor.ndim >= 0, "tensor has negative ndim: {}", tensor.ndim);
+    assert!(
+        tensor.ndim >= 0,
+        "tensor has negative ndim: {}",
+        tensor.ndim
+    );
     let ndim = tensor.ndim as usize;
     if ndim == 0 {
         return &[];
@@ -1107,14 +1197,25 @@ fn tensor_shape_slice<'a>(tensor: &'a crate::tensor::NslTensor) -> &'a [i64] {
 }
 
 #[cfg(feature = "cuda")]
-fn gpu_broadcast_shape(a: &crate::tensor::NslTensor, b: &crate::tensor::NslTensor) -> Option<Vec<i64>> {
+fn gpu_broadcast_shape(
+    a: &crate::tensor::NslTensor,
+    b: &crate::tensor::NslTensor,
+) -> Option<Vec<i64>> {
     let a_shape = tensor_shape_slice(a);
     let b_shape = tensor_shape_slice(b);
     let out_ndim = a_shape.len().max(b_shape.len());
     let mut out_shape = vec![1i64; out_ndim];
     for i in 0..out_ndim {
-        let a_dim = if i < out_ndim - a_shape.len() { 1 } else { a_shape[i - (out_ndim - a_shape.len())] };
-        let b_dim = if i < out_ndim - b_shape.len() { 1 } else { b_shape[i - (out_ndim - b_shape.len())] };
+        let a_dim = if i < out_ndim - a_shape.len() {
+            1
+        } else {
+            a_shape[i - (out_ndim - a_shape.len())]
+        };
+        let b_dim = if i < out_ndim - b_shape.len() {
+            1
+        } else {
+            b_shape[i - (out_ndim - b_shape.len())]
+        };
         if a_dim == b_dim || a_dim == 1 || b_dim == 1 {
             out_shape[i] = a_dim.max(b_dim);
         } else {
@@ -1170,7 +1271,9 @@ pub(crate) fn gpu_elementwise_binary(a_ptr: i64, b_ptr: i64, ptx: &str, kernel_n
     let a = unsafe { &*(a_ptr as *const NslTensor) };
     let b = unsafe { &*(b_ptr as *const NslTensor) };
     if a.len != b.len || !a.is_contiguous() || !b.is_contiguous() {
-        if let Some((prepared_a, prepared_b, free_a, free_b)) = gpu_prepare_binary_operands(a_ptr, b_ptr) {
+        if let Some((prepared_a, prepared_b, free_a, free_b)) =
+            gpu_prepare_binary_operands(a_ptr, b_ptr)
+        {
             if prepared_a != a_ptr || prepared_b != b_ptr {
                 let result = gpu_elementwise_binary(prepared_a, prepared_b, ptx, kernel_name);
                 if free_a {
@@ -1193,22 +1296,17 @@ pub(crate) fn gpu_elementwise_binary(a_ptr: i64, b_ptr: i64, ptx: &str, kernel_n
     let out_data = match inner::try_alloc_managed(n * 4) {
         Some(ptr) => ptr,
         None => {
-            eprintln!("[nsl] GPU OOM in {} — falling back to CPU", kernel_name.trim_end_matches('\0'));
+            eprintln!(
+                "[nsl] GPU OOM in {} — falling back to CPU",
+                kernel_name.trim_end_matches('\0')
+            );
             return cpu_fallback_binary(a_ptr, b_ptr, kernel_name);
         }
     };
     let shape = NslTensor::copy_shape(a.shape, a.ndim);
     let strides = NslTensor::compute_strides(shape, a.ndim);
     let out = Box::new(NslTensor::new(
-        out_data,
-        shape,
-        strides,
-        a.ndim,
-        a.len,
-        a.device,
-        1,
-        1,
-        0,
+        out_data, shape, strides, a.ndim, a.len, a.device, 1, 1, 0,
     ));
     let out_ptr = Box::into_raw(out);
     let out_t = unsafe { &*out_ptr };
@@ -1226,17 +1324,29 @@ pub(crate) fn gpu_elementwise_binary(a_ptr: i64, b_ptr: i64, ptx: &str, kernel_n
     let block = 256i64;
     let grid = ((n as i64) + block - 1) / block;
     let result = inner::kernel_launch(
-        ptx.as_ptr(), kernel_name.as_ptr(),
-        [grid, 1, 1], [block, 1, 1], &args, 0,
+        ptx.as_ptr(),
+        kernel_name.as_ptr(),
+        [grid, 1, 1],
+        [block, 1, 1],
+        &args,
+        0,
     );
     if result as u32 != 0 {
         // Free the allocated tensor+data to avoid leak on kernel failure
-        eprintln!("GPU kernel '{}' failed: {}", kernel_name.trim_end_matches('\0'), result as u32);
-        unsafe { let _ = Box::from_raw(out_ptr); }
+        eprintln!(
+            "GPU kernel '{}' failed: {}",
+            kernel_name.trim_end_matches('\0'),
+            result as u32
+        );
+        unsafe {
+            let _ = Box::from_raw(out_ptr);
+        }
         inner::free_managed(out_data);
         return 0;
     }
-    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+    unsafe {
+        cudarc::driver::sys::cuCtxSynchronize();
+    }
     out_ptr as i64
 }
 
@@ -1244,7 +1354,11 @@ pub(crate) fn gpu_elementwise_binary(a_ptr: i64, b_ptr: i64, ptx: &str, kernel_n
 #[cfg(feature = "cuda")]
 fn cpu_fallback_unary(a_ptr: i64, kernel_name: &str) -> i64 {
     let a = unsafe { &*(a_ptr as *const crate::tensor::NslTensor) };
-    let a_cpu = if a.device > 0 { crate::tensor::nsl_tensor_to_device(a_ptr, 0) } else { a_ptr };
+    let a_cpu = if a.device > 0 {
+        crate::tensor::nsl_tensor_to_device(a_ptr, 0)
+    } else {
+        a_ptr
+    };
     let op_fn: fn(f64) -> f64 = match kernel_name.trim_end_matches('\0') {
         "nsl_neg_f32" => |x| -x,
         "nsl_relu_f32" => |x| if x > 0.0 { x } else { 0.0 },
@@ -1252,7 +1366,15 @@ fn cpu_fallback_unary(a_ptr: i64, kernel_name: &str) -> i64 {
         "nsl_log_f32" => |x| x.ln(),
         "nsl_sqrt_f32" => |x| x.sqrt(),
         "nsl_abs_f32" => |x| x.abs(),
-        "nsl_sign_f32" => |x| if x > 0.0 { 1.0 } else if x < 0.0 { -1.0 } else { 0.0 },
+        "nsl_sign_f32" => |x| {
+            if x > 0.0 {
+                1.0
+            } else if x < 0.0 {
+                -1.0
+            } else {
+                0.0
+            }
+        },
         "nsl_sigmoid_f32" => |x| 1.0 / (1.0 + (-x).exp()),
         "nsl_tanh_f32" => |x| x.tanh(),
         _ => |x| x,
@@ -1264,10 +1386,14 @@ fn cpu_fallback_unary(a_ptr: i64, kernel_name: &str) -> i64 {
     let result_t = unsafe { &*(result_ptr as *const crate::tensor::NslTensor) };
     let dst = result_t.data as *mut f64;
     for i in 0..n {
-        unsafe { *dst.add(i) = op_fn(*src.add(i)); }
+        unsafe {
+            *dst.add(i) = op_fn(*src.add(i));
+        }
     }
     let result_gpu = crate::tensor::nsl_tensor_to_device(result_ptr, a.device as i64);
-    if a_cpu != a_ptr { crate::tensor::nsl_tensor_free(a_cpu); }
+    if a_cpu != a_ptr {
+        crate::tensor::nsl_tensor_free(a_cpu);
+    }
     crate::tensor::nsl_tensor_free(result_ptr);
     result_gpu
 }
@@ -1283,22 +1409,17 @@ pub(crate) fn gpu_elementwise_unary(a_ptr: i64, ptx: &str, kernel_name: &str) ->
     let out_data = match inner::try_alloc_managed(n * 4) {
         Some(ptr) => ptr,
         None => {
-            eprintln!("[nsl] GPU OOM in {} — falling back to CPU", kernel_name.trim_end_matches('\0'));
+            eprintln!(
+                "[nsl] GPU OOM in {} — falling back to CPU",
+                kernel_name.trim_end_matches('\0')
+            );
             return cpu_fallback_unary(a_ptr, kernel_name);
         }
     };
     let shape = NslTensor::copy_shape(a.shape, a.ndim);
     let strides = NslTensor::compute_strides(shape, a.ndim);
     let out = Box::new(NslTensor::new(
-        out_data,
-        shape,
-        strides,
-        a.ndim,
-        a.len,
-        a.device,
-        1,
-        1,
-        0,
+        out_data, shape, strides, a.ndim, a.len, a.device, 1, 1, 0,
     ));
     let out_ptr = Box::into_raw(out);
     let out_t = unsafe { &*out_ptr };
@@ -1314,11 +1435,23 @@ pub(crate) fn gpu_elementwise_unary(a_ptr: i64, ptx: &str, kernel_name: &str) ->
     let block = 256i64;
     let grid = ((n as i64) + block - 1) / block;
     let result = inner::kernel_launch(
-        ptx.as_ptr(), kernel_name.as_ptr(),
-        [grid, 1, 1], [block, 1, 1], &args, 0,
+        ptx.as_ptr(),
+        kernel_name.as_ptr(),
+        [grid, 1, 1],
+        [block, 1, 1],
+        &args,
+        0,
     );
-    assert_eq!(result as u32, 0, "GPU kernel '{}' failed: {}", kernel_name.trim_end_matches('\0'), result as u32);
-    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+    assert_eq!(
+        result as u32,
+        0,
+        "GPU kernel '{}' failed: {}",
+        kernel_name.trim_end_matches('\0'),
+        result as u32
+    );
+    unsafe {
+        cudarc::driver::sys::cuCtxSynchronize();
+    }
     out_ptr as i64
 }
 
@@ -1340,7 +1473,10 @@ pub(crate) fn gpu_rotate_half_f32(tensor_ptr: i64) -> i64 {
     inner::set_oom_context(KERNEL_NAME.trim_end_matches('\0'));
 
     let tensor = unsafe { &*(tensor_ptr as *const NslTensor) };
-    assert!(tensor.device > 0, "gpu_rotate_half_f32 requires a CUDA tensor");
+    assert!(
+        tensor.device > 0,
+        "gpu_rotate_half_f32 requires a CUDA tensor"
+    );
 
     let contiguous_ptr = if tensor.is_contiguous() {
         tensor_ptr
@@ -1424,7 +1560,9 @@ pub(crate) fn gpu_rotate_half_f32(tensor_ptr: i64) -> i64 {
         KERNEL_NAME.trim_end_matches('\0'),
         result as u32
     );
-    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+    unsafe {
+        cudarc::driver::sys::cuCtxSynchronize();
+    }
 
     if contiguous_ptr != tensor_ptr {
         crate::tensor::nsl_tensor_free(contiguous_ptr);
@@ -1451,11 +1589,23 @@ pub(crate) fn gpu_elementwise_unary_inplace(a_ptr: i64, ptx: &str, kernel_name: 
     let block = 256i64;
     let grid = ((n as i64) + block - 1) / block;
     let result = inner::kernel_launch(
-        ptx.as_ptr(), kernel_name.as_ptr(),
-        [grid, 1, 1], [block, 1, 1], &args, 0,
+        ptx.as_ptr(),
+        kernel_name.as_ptr(),
+        [grid, 1, 1],
+        [block, 1, 1],
+        &args,
+        0,
     );
-    assert_eq!(result as u32, 0, "GPU inplace kernel '{}' failed: {}", kernel_name.trim_end_matches('\0'), result as u32);
-    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+    assert_eq!(
+        result as u32,
+        0,
+        "GPU inplace kernel '{}' failed: {}",
+        kernel_name.trim_end_matches('\0'),
+        result as u32
+    );
+    unsafe {
+        cudarc::driver::sys::cuCtxSynchronize();
+    }
 }
 
 /// GPU elementwise binary op — in-place (FBIP). Writes output to left operand's buffer.
@@ -1481,11 +1631,23 @@ pub(crate) fn gpu_elementwise_binary_inplace(a_ptr: i64, b_ptr: i64, ptx: &str, 
     let block = 256i64;
     let grid = ((n as i64) + block - 1) / block;
     let result = inner::kernel_launch(
-        ptx.as_ptr(), kernel_name.as_ptr(),
-        [grid, 1, 1], [block, 1, 1], &args, 0,
+        ptx.as_ptr(),
+        kernel_name.as_ptr(),
+        [grid, 1, 1],
+        [block, 1, 1],
+        &args,
+        0,
     );
-    assert_eq!(result as u32, 0, "GPU inplace kernel '{}' failed: {}", kernel_name.trim_end_matches('\0'), result as u32);
-    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+    assert_eq!(
+        result as u32,
+        0,
+        "GPU inplace kernel '{}' failed: {}",
+        kernel_name.trim_end_matches('\0'),
+        result as u32
+    );
+    unsafe {
+        cudarc::driver::sys::cuCtxSynchronize();
+    }
 }
 
 /// GPU scalar op — in-place (FBIP). Writes output to input buffer.
@@ -1508,11 +1670,23 @@ pub(crate) fn gpu_scalar_op_inplace(a_ptr: i64, scalar: f32, ptx: &str, kernel_n
     let block = 256i64;
     let grid = ((n as i64) + block - 1) / block;
     let result = inner::kernel_launch(
-        ptx.as_ptr(), kernel_name.as_ptr(),
-        [grid, 1, 1], [block, 1, 1], &args, 0,
+        ptx.as_ptr(),
+        kernel_name.as_ptr(),
+        [grid, 1, 1],
+        [block, 1, 1],
+        &args,
+        0,
     );
-    assert_eq!(result as u32, 0, "GPU inplace scalar kernel '{}' failed: {}", kernel_name.trim_end_matches('\0'), result as u32);
-    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+    assert_eq!(
+        result as u32,
+        0,
+        "GPU inplace scalar kernel '{}' failed: {}",
+        kernel_name.trim_end_matches('\0'),
+        result as u32
+    );
+    unsafe {
+        cudarc::driver::sys::cuCtxSynchronize();
+    }
 }
 
 /// GPU matrix multiplication: C[M,N] = A[M,K] @ B[K,N], f32 inputs.
@@ -1544,10 +1718,23 @@ pub(crate) fn gpu_matmul_f32(a_ptr: i64, b_ptr: i64) -> i64 {
 
     let mut out_batch: Vec<i64> = Vec::with_capacity(max_batch_nd);
     for i in 0..max_batch_nd {
-        let a_dim = if i < max_batch_nd - a_batch.len() { 1 } else { a_batch[i - (max_batch_nd - a_batch.len())] };
-        let b_dim = if i < max_batch_nd - b_batch.len() { 1 } else { b_batch[i - (max_batch_nd - b_batch.len())] };
-        assert!(a_dim == b_dim || a_dim == 1 || b_dim == 1,
-            "matmul batch dim mismatch at {}: {} vs {}", i, a_dim, b_dim);
+        let a_dim = if i < max_batch_nd - a_batch.len() {
+            1
+        } else {
+            a_batch[i - (max_batch_nd - a_batch.len())]
+        };
+        let b_dim = if i < max_batch_nd - b_batch.len() {
+            1
+        } else {
+            b_batch[i - (max_batch_nd - b_batch.len())]
+        };
+        assert!(
+            a_dim == b_dim || a_dim == 1 || b_dim == 1,
+            "matmul batch dim mismatch at {}: {} vs {}",
+            i,
+            a_dim,
+            b_dim
+        );
         out_batch.push(a_dim.max(b_dim));
     }
 
@@ -1589,8 +1776,16 @@ pub(crate) fn gpu_matmul_f32(a_ptr: i64, b_ptr: i64) -> i64 {
     // Broadcast: stride=0 means A or B is shared across all batches
     let a_total_batch: u64 = a_batch.iter().product::<i64>().max(1) as u64;
     let b_total_batch: u64 = b_batch.iter().product::<i64>().max(1) as u64;
-    let stride_a = if a_total_batch == 1 { 0u64 } else { a_mat_stride };
-    let stride_b = if b_total_batch == 1 { 0u64 } else { b_mat_stride };
+    let stride_a = if a_total_batch == 1 {
+        0u64
+    } else {
+        a_mat_stride
+    };
+    let stride_b = if b_total_batch == 1 {
+        0u64
+    } else {
+        b_mat_stride
+    };
     let stride_c = c_mat_stride;
 
     if total_batch == 1 {
@@ -1629,11 +1824,16 @@ pub(crate) fn gpu_matmul_f32(a_ptr: i64, b_ptr: i64) -> i64 {
                 a.data as *const f32,
                 b.data as *const f32,
                 out_data as *mut f32,
-                m, n, k,
+                m,
+                n,
+                k,
             )
         };
         if let Err(e) = res {
-            eprintln!("[nsl-matmul] cuBLAS sgemm failed ({}x{}x{}): {:?}", m, n, k, e);
+            eprintln!(
+                "[nsl-matmul] cuBLAS sgemm failed ({}x{}x{}): {:?}",
+                m, n, k, e
+            );
             // Match existing failure convention: null pointer so callers can
             // detect the failure (existing kernel path used assert_eq!; this
             // is a safer non-panicking failure mode).
@@ -1705,11 +1905,14 @@ pub(crate) fn gpu_matmul_f32(a_ptr: i64, b_ptr: i64) -> i64 {
             b"nsl_bmm_f32\0".as_ptr(),
             [grid_x, grid_y, grid_z],
             [block, block, 1],
-            &args, 0,
+            &args,
+            0,
         );
         assert_eq!(result as u32, 0, "GPU BMM kernel failed: {}", result as u32);
     }
-    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+    unsafe {
+        cudarc::driver::sys::cuCtxSynchronize();
+    }
 
     out_ptr as i64
 }
@@ -1725,15 +1928,7 @@ pub(crate) fn gpu_scalar_op(a_ptr: i64, scalar: f32, ptx: &str, kernel_name: &st
     let shape = NslTensor::copy_shape(a.shape, a.ndim);
     let strides = NslTensor::compute_strides(shape, a.ndim);
     let out = Box::new(NslTensor::new(
-        out_data,
-        shape,
-        strides,
-        a.ndim,
-        a.len,
-        a.device,
-        1,
-        1,
-        0,
+        out_data, shape, strides, a.ndim, a.len, a.device, 1, 1, 0,
     ));
     let out_ptr = Box::into_raw(out);
     let out_t = unsafe { &*out_ptr };
@@ -1751,11 +1946,23 @@ pub(crate) fn gpu_scalar_op(a_ptr: i64, scalar: f32, ptx: &str, kernel_name: &st
     let block = 256i64;
     let grid = ((n as i64) + block - 1) / block;
     let result = inner::kernel_launch(
-        ptx.as_ptr(), kernel_name.as_ptr(),
-        [grid, 1, 1], [block, 1, 1], &args, 0,
+        ptx.as_ptr(),
+        kernel_name.as_ptr(),
+        [grid, 1, 1],
+        [block, 1, 1],
+        &args,
+        0,
     );
-    assert_eq!(result as u32, 0, "GPU kernel '{}' failed: {}", kernel_name.trim_end_matches('\0'), result as u32);
-    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+    assert_eq!(
+        result as u32,
+        0,
+        "GPU kernel '{}' failed: {}",
+        kernel_name.trim_end_matches('\0'),
+        result as u32
+    );
+    unsafe {
+        cudarc::driver::sys::cuCtxSynchronize();
+    }
     out_ptr as i64
 }
 
@@ -1768,22 +1975,17 @@ pub(crate) fn gpu_backward_binary(a_ptr: i64, b_ptr: i64, ptx: &str, kernel_name
     inner::set_oom_context(kernel_name.trim_end_matches('\0'));
     let a = unsafe { &*(a_ptr as *const NslTensor) };
     let b = unsafe { &*(b_ptr as *const NslTensor) };
-    assert_eq!(a.len, b.len, "GPU backward: length mismatch between grad and saved tensors");
+    assert_eq!(
+        a.len, b.len,
+        "GPU backward: length mismatch between grad and saved tensors"
+    );
 
     let n = a.len as usize;
     let out_data = inner::alloc_managed(n * 4); // f32 = 4 bytes
     let shape = NslTensor::copy_shape(a.shape, a.ndim);
     let strides = NslTensor::compute_strides(shape, a.ndim);
     let out = Box::new(NslTensor::new(
-        out_data,
-        shape,
-        strides,
-        a.ndim,
-        a.len,
-        a.device,
-        1,
-        1,
-        0,
+        out_data, shape, strides, a.ndim, a.len, a.device, 1, 1, 0,
     ));
     let out_ptr = Box::into_raw(out);
     let out_t = unsafe { &*out_ptr };
@@ -1801,19 +2003,32 @@ pub(crate) fn gpu_backward_binary(a_ptr: i64, b_ptr: i64, ptx: &str, kernel_name
     let block = 256i64;
     let grid = ((n as i64) + block - 1) / block;
     let result = inner::kernel_launch(
-        ptx.as_ptr(), kernel_name.as_ptr(),
-        [grid, 1, 1], [block, 1, 1], &args, 0,
+        ptx.as_ptr(),
+        kernel_name.as_ptr(),
+        [grid, 1, 1],
+        [block, 1, 1],
+        &args,
+        0,
     );
-    assert_eq!(result as u32, 0, "GPU backward kernel '{}' failed: {}", kernel_name.trim_end_matches('\0'), result as u32);
+    assert_eq!(
+        result as u32,
+        0,
+        "GPU backward kernel '{}' failed: {}",
+        kernel_name.trim_end_matches('\0'),
+        result as u32
+    );
     #[allow(unused_unsafe)]
-    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+    unsafe {
+        cudarc::driver::sys::cuCtxSynchronize();
+    }
     out_ptr as i64
 }
 
 #[cfg(feature = "cuda")]
 pub(crate) fn gpu_relu_backward(grad: i64, input: i64) -> i64 {
     gpu_backward_binary(
-        grad, input,
+        grad,
+        input,
         kernels::RELU_BACKWARD_F32_PTX,
         "nsl_relu_backward_f32\0",
     )
@@ -1822,7 +2037,8 @@ pub(crate) fn gpu_relu_backward(grad: i64, input: i64) -> i64 {
 #[cfg(feature = "cuda")]
 pub(crate) fn gpu_sigmoid_backward(grad: i64, saved_out: i64) -> i64 {
     gpu_backward_binary(
-        grad, saved_out,
+        grad,
+        saved_out,
         kernels::SIGMOID_BACKWARD_F32_PTX,
         "nsl_sigmoid_backward_f32\0",
     )
@@ -1831,7 +2047,8 @@ pub(crate) fn gpu_sigmoid_backward(grad: i64, saved_out: i64) -> i64 {
 #[cfg(feature = "cuda")]
 pub(crate) fn gpu_tanh_backward(grad: i64, saved_out: i64) -> i64 {
     gpu_backward_binary(
-        grad, saved_out,
+        grad,
+        saved_out,
         kernels::TANH_BACKWARD_F32_PTX,
         "nsl_tanh_backward_f32\0",
     )
@@ -1840,7 +2057,8 @@ pub(crate) fn gpu_tanh_backward(grad: i64, saved_out: i64) -> i64 {
 #[cfg(feature = "cuda")]
 pub(crate) fn gpu_gelu_backward(grad: i64, input: i64) -> i64 {
     gpu_backward_binary(
-        grad, input,
+        grad,
+        input,
         kernels::GELU_BACKWARD_F32_PTX,
         "nsl_gelu_backward_f32\0",
     )
@@ -1849,7 +2067,8 @@ pub(crate) fn gpu_gelu_backward(grad: i64, input: i64) -> i64 {
 #[cfg(feature = "cuda")]
 pub(crate) fn gpu_silu_backward(grad: i64, input: i64) -> i64 {
     gpu_backward_binary(
-        grad, input,
+        grad,
+        input,
         kernels::SILU_BACKWARD_F32_PTX,
         "nsl_silu_backward_f32\0",
     )
@@ -1866,15 +2085,7 @@ pub(crate) fn gpu_clamp_f32(a_ptr: i64, lo: f32, hi: f32) -> i64 {
     let shape = NslTensor::copy_shape(a.shape, a.ndim);
     let strides = NslTensor::compute_strides(shape, a.ndim);
     let out = Box::new(NslTensor::new(
-        out_data,
-        shape,
-        strides,
-        a.ndim,
-        a.len,
-        a.device,
-        1,
-        1,
-        0,
+        out_data, shape, strides, a.ndim, a.len, a.device, 1, 1, 0,
     ));
     let out_ptr = Box::into_raw(out);
     let out_t = unsafe { &*out_ptr };
@@ -1896,10 +2107,19 @@ pub(crate) fn gpu_clamp_f32(a_ptr: i64, lo: f32, hi: f32) -> i64 {
     let result = inner::kernel_launch(
         kernels::CLAMP_F32_PTX.as_ptr(),
         "nsl_clamp_f32\0".as_ptr(),
-        [grid, 1, 1], [block, 1, 1], &args, 0,
+        [grid, 1, 1],
+        [block, 1, 1],
+        &args,
+        0,
     );
-    assert_eq!(result as u32, 0, "GPU clamp kernel failed: {}", result as u32);
-    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+    assert_eq!(
+        result as u32, 0,
+        "GPU clamp kernel failed: {}",
+        result as u32
+    );
+    unsafe {
+        cudarc::driver::sys::cuCtxSynchronize();
+    }
     out_ptr as i64
 }
 
@@ -1927,10 +2147,19 @@ pub(crate) fn gpu_clamp_f32_inplace(a_ptr: i64, lo: f32, hi: f32) {
     let result = inner::kernel_launch(
         kernels::CLAMP_F32_PTX.as_ptr(),
         "nsl_clamp_f32\0".as_ptr(),
-        [grid, 1, 1], [block, 1, 1], &args, 0,
+        [grid, 1, 1],
+        [block, 1, 1],
+        &args,
+        0,
     );
-    assert_eq!(result as u32, 0, "GPU clamp inplace kernel failed: {}", result as u32);
-    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+    assert_eq!(
+        result as u32, 0,
+        "GPU clamp inplace kernel failed: {}",
+        result as u32
+    );
+    unsafe {
+        cudarc::driver::sys::cuCtxSynchronize();
+    }
 }
 
 #[cfg(feature = "cuda")]
@@ -1945,15 +2174,7 @@ pub(crate) fn gpu_clamp_backward(grad: i64, input: i64, min_val: f32, max_val: f
     let shape = NslTensor::copy_shape(a.shape, a.ndim);
     let strides = NslTensor::compute_strides(shape, a.ndim);
     let out = Box::new(NslTensor::new(
-        out_data,
-        shape,
-        strides,
-        a.ndim,
-        a.len,
-        a.device,
-        1,
-        1,
-        0,
+        out_data, shape, strides, a.ndim, a.len, a.device, 1, 1, 0,
     ));
     let out_ptr = Box::into_raw(out);
     let out_t = unsafe { &*out_ptr };
@@ -1977,11 +2198,20 @@ pub(crate) fn gpu_clamp_backward(grad: i64, input: i64, min_val: f32, max_val: f
     let result = inner::kernel_launch(
         kernels::CLAMP_BACKWARD_F32_PTX.as_ptr(),
         "nsl_clamp_backward_f32\0".as_ptr(),
-        [grid, 1, 1], [block, 1, 1], &args, 0,
+        [grid, 1, 1],
+        [block, 1, 1],
+        &args,
+        0,
     );
-    assert_eq!(result as u32, 0, "GPU clamp_backward kernel failed: {}", result as u32);
+    assert_eq!(
+        result as u32, 0,
+        "GPU clamp_backward kernel failed: {}",
+        result as u32
+    );
     #[allow(unused_unsafe)]
-    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+    unsafe {
+        cudarc::driver::sys::cuCtxSynchronize();
+    }
     out_ptr as i64
 }
 
@@ -2016,12 +2246,32 @@ pub(crate) fn gpu_log_softmax_f32(tensor_ptr: i64) -> i64 {
     let block = 256i64;
     let grid = rows as i64;
     let result = inner::kernel_launch(
-        LOG_SOFTMAX_F32_PTX.as_ptr(), b"nsl_log_softmax_f32\0".as_ptr(),
-        [grid, 1, 1], [block, 1, 1], &args, 256 * 4 * 2,
+        LOG_SOFTMAX_F32_PTX.as_ptr(),
+        b"nsl_log_softmax_f32\0".as_ptr(),
+        [grid, 1, 1],
+        [block, 1, 1],
+        &args,
+        256 * 4 * 2,
     );
-    assert_eq!(result as u32, 0, "GPU log_softmax kernel failed: {:?}", result);
-    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
-    let out = Box::new(NslTensor::new(out_data, out_shape, out_strides, t.ndim, t.len, t.device, 1, 1, 0));
+    assert_eq!(
+        result as u32, 0,
+        "GPU log_softmax kernel failed: {:?}",
+        result
+    );
+    unsafe {
+        cudarc::driver::sys::cuCtxSynchronize();
+    }
+    let out = Box::new(NslTensor::new(
+        out_data,
+        out_shape,
+        out_strides,
+        t.ndim,
+        t.len,
+        t.device,
+        1,
+        1,
+        0,
+    ));
     NslTensor::publish(out)
 }
 
@@ -2076,14 +2326,22 @@ pub extern "C" fn nsl_kernel_launch(
             name_ptr as *const u8,
             [grid_x, grid_y, grid_z],
             [block_x, block_y, block_z],
-            args_slice, shared_mem_bytes as u32,
+            args_slice,
+            shared_mem_bytes as u32,
         );
         result as i64
     }
     #[cfg(not(feature = "cuda"))]
     {
         let _ = (ptx_ptr, name_ptr, grid_x, grid_y, grid_z);
-        let _ = (block_x, block_y, block_z, args_ptr, num_args, shared_mem_bytes);
+        let _ = (
+            block_x,
+            block_y,
+            block_z,
+            args_ptr,
+            num_args,
+            shared_mem_bytes,
+        );
         eprintln!("CUDA support not compiled. Rebuild with --features cuda");
         std::process::abort();
     }
@@ -2152,17 +2410,30 @@ pub(crate) fn gpu_embedding_lookup(weight_ptr: i64, indices_ptr: i64) -> i64 {
     // Select kernel based on indices dtype: i32 indices use ld.global.s32,
     // f32 indices use ld.global.f32 + cvt.rzi.u64.f32
     let (ptx, kernel_name): (&str, &[u8]) = if indices_gpu.dtype == 4 {
-        (fused_kernels::EMBEDDING_I32IDX_PTX, b"nsl_embedding_i32idx\0")
+        (
+            fused_kernels::EMBEDDING_I32IDX_PTX,
+            b"nsl_embedding_i32idx\0",
+        )
     } else {
         (fused_kernels::EMBEDDING_F32_PTX, b"nsl_embedding_f32\0")
     };
 
     let result = inner::kernel_launch(
-        ptx.as_ptr(), kernel_name.as_ptr(),
-        [grid_x, grid_y, 1], [block_x, block_y, 1], &args, 0,
+        ptx.as_ptr(),
+        kernel_name.as_ptr(),
+        [grid_x, grid_y, 1],
+        [block_x, block_y, 1],
+        &args,
+        0,
     );
-    assert_eq!(result as u32, 0, "GPU embedding kernel failed: {:?}", result);
-    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+    assert_eq!(
+        result as u32, 0,
+        "GPU embedding kernel failed: {:?}",
+        result
+    );
+    unsafe {
+        cudarc::driver::sys::cuCtxSynchronize();
+    }
 
     crate::tensor::nsl_tensor_free(indices_on_gpu);
 
@@ -2236,11 +2507,17 @@ pub(crate) fn gpu_bias_add(tensor_ptr: i64, bias_ptr: i64) -> i64 {
     let grid = ((total as i64) + block - 1) / block;
 
     let result = inner::kernel_launch(
-        BIAS_ADD_F32_PTX.as_ptr(), b"nsl_bias_add_f32\0".as_ptr(),
-        [grid, 1, 1], [block, 1, 1], &args, 0,
+        BIAS_ADD_F32_PTX.as_ptr(),
+        b"nsl_bias_add_f32\0".as_ptr(),
+        [grid, 1, 1],
+        [block, 1, 1],
+        &args,
+        0,
     );
     assert_eq!(result as u32, 0, "GPU bias_add kernel failed: {:?}", result);
-    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+    unsafe {
+        cudarc::driver::sys::cuCtxSynchronize();
+    }
 
     crate::tensor::nsl_tensor_free(bias_on_gpu);
 
@@ -2296,11 +2573,17 @@ pub(crate) fn gpu_softmax_f32(tensor_ptr: i64) -> i64 {
     let grid = rows as i64;
 
     let result = inner::kernel_launch(
-        SOFTMAX_F32_PTX.as_ptr(), b"nsl_softmax_f32\0".as_ptr(),
-        [grid, 1, 1], [block, 1, 1], &args, 256 * 4 * 2, // shared mem: smax[256] + ssum[256]
+        SOFTMAX_F32_PTX.as_ptr(),
+        b"nsl_softmax_f32\0".as_ptr(),
+        [grid, 1, 1],
+        [block, 1, 1],
+        &args,
+        256 * 4 * 2, // shared mem: smax[256] + ssum[256]
     );
     assert_eq!(result as u32, 0, "GPU softmax kernel failed: {:?}", result);
-    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+    unsafe {
+        cudarc::driver::sys::cuCtxSynchronize();
+    }
 
     let out = Box::new(NslTensor::new(
         out_data,
@@ -2331,27 +2614,40 @@ pub(crate) fn gpu_sum_dim_f32(tensor_ptr: i64, dim: usize, keepdim: bool) -> i64
     let reduce_size = shape_slice[dim] as u64;
 
     // Compute outer = product of dims before dim
-    let outer: u64 = shape_slice[..dim].iter().map(|&s| s as u64).product::<u64>().max(1);
+    let outer: u64 = shape_slice[..dim]
+        .iter()
+        .map(|&s| s as u64)
+        .product::<u64>()
+        .max(1);
     // Compute inner = product of dims after dim
-    let inner: u64 = shape_slice[dim + 1..].iter().map(|&s| s as u64).product::<u64>().max(1);
+    let inner: u64 = shape_slice[dim + 1..]
+        .iter()
+        .map(|&s| s as u64)
+        .product::<u64>()
+        .max(1);
 
     let out_total = (outer * inner) as usize;
     let out_data = inner::alloc_managed(out_total * 4); // f32
 
     // Build output shape
     let out_shape_vec: Vec<i64> = if keepdim {
-        shape_slice.iter().enumerate()
+        shape_slice
+            .iter()
+            .enumerate()
             .map(|(i, &s)| if i == dim { 1 } else { s })
             .collect()
     } else {
-        shape_slice.iter().enumerate()
+        shape_slice
+            .iter()
+            .enumerate()
             .filter(|&(i, _)| i != dim)
             .map(|(_, &s)| s)
             .collect()
     };
 
     let out_ndim = out_shape_vec.len() as i64;
-    let out_shape = crate::memory::checked_alloc(out_shape_vec.len() * std::mem::size_of::<i64>()) as *mut i64;
+    let out_shape =
+        crate::memory::checked_alloc(out_shape_vec.len() * std::mem::size_of::<i64>()) as *mut i64;
     for (i, &v) in out_shape_vec.iter().enumerate() {
         unsafe { *out_shape.add(i) = v };
     }
@@ -2375,11 +2671,17 @@ pub(crate) fn gpu_sum_dim_f32(tensor_ptr: i64, dim: usize, keepdim: bool) -> i64
     let grid = out_total as i64;
 
     let result = inner::kernel_launch(
-        SUM_DIM_F32_PTX.as_ptr(), b"nsl_sum_dim_f32\0".as_ptr(),
-        [grid, 1, 1], [block, 1, 1], &args, 256 * 4,
+        SUM_DIM_F32_PTX.as_ptr(),
+        b"nsl_sum_dim_f32\0".as_ptr(),
+        [grid, 1, 1],
+        [block, 1, 1],
+        &args,
+        256 * 4,
     );
     assert_eq!(result as u32, 0, "GPU sum_dim kernel failed: {:?}", result);
-    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+    unsafe {
+        cudarc::driver::sys::cuCtxSynchronize();
+    }
 
     let out = Box::new(NslTensor::new(
         out_data,
@@ -2425,11 +2727,21 @@ pub(crate) fn gpu_global_sum_f32(tensor_ptr: i64) -> i64 {
     let grid = 1i64;
 
     let result = inner::kernel_launch(
-        GLOBAL_SUM_F32_PTX.as_ptr(), b"nsl_global_sum_f32\0".as_ptr(),
-        [grid, 1, 1], [block, 1, 1], &args, 256 * 4,
+        GLOBAL_SUM_F32_PTX.as_ptr(),
+        b"nsl_global_sum_f32\0".as_ptr(),
+        [grid, 1, 1],
+        [block, 1, 1],
+        &args,
+        256 * 4,
     );
-    assert_eq!(result as u32, 0, "GPU global_sum kernel failed: {:?}", result);
-    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+    assert_eq!(
+        result as u32, 0,
+        "GPU global_sum kernel failed: {:?}",
+        result
+    );
+    unsafe {
+        cudarc::driver::sys::cuCtxSynchronize();
+    }
 
     let out = Box::new(NslTensor::new(
         out_data,
@@ -2476,11 +2788,21 @@ pub(crate) fn gpu_tensor_stats_f32(tensor_ptr: i64) -> [f32; 4] {
     ];
 
     let result = inner::kernel_launch(
-        TENSOR_STATS_F32_PTX.as_ptr(), b"nsl_tensor_stats_f32\0".as_ptr(),
-        [1, 1, 1], [256, 1, 1], &args, 256 * 4 * 4, // 4 shared arrays of 256 f32
+        TENSOR_STATS_F32_PTX.as_ptr(),
+        b"nsl_tensor_stats_f32\0".as_ptr(),
+        [1, 1, 1],
+        [256, 1, 1],
+        &args,
+        256 * 4 * 4, // 4 shared arrays of 256 f32
     );
-    assert_eq!(result as u32, 0, "GPU tensor_stats kernel failed: {:?}", result);
-    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+    assert_eq!(
+        result as u32, 0,
+        "GPU tensor_stats kernel failed: {:?}",
+        result
+    );
+    unsafe {
+        cudarc::driver::sys::cuCtxSynchronize();
+    }
 
     // Read back 4 f32s from device
     let mut raw = [0f32; 4];
@@ -2541,10 +2863,18 @@ pub(crate) fn gpu_dequant_int8_per_head_f32(
     let grid = ((n + 255) / 256) as i64;
 
     let result = inner::kernel_launch(
-        DEQUANT_INT8_PER_HEAD_F32_PTX.as_ptr(), b"nsl_dequant_int8_per_head_f32\0".as_ptr(),
-        [grid, 1, 1], [block, 1, 1], &args, 0,
+        DEQUANT_INT8_PER_HEAD_F32_PTX.as_ptr(),
+        b"nsl_dequant_int8_per_head_f32\0".as_ptr(),
+        [grid, 1, 1],
+        [block, 1, 1],
+        &args,
+        0,
     );
-    assert_eq!(result as u32, 0, "GPU dequant_int8_per_head kernel failed: {:?}", result);
+    assert_eq!(
+        result as u32, 0,
+        "GPU dequant_int8_per_head kernel failed: {:?}",
+        result
+    );
 }
 
 /// Dequantize INT8 per-token data on GPU.
@@ -2579,10 +2909,18 @@ pub(crate) fn gpu_dequant_int8_per_token_f32(
     let grid = ((n + 255) / 256) as i64;
 
     let result = inner::kernel_launch(
-        DEQUANT_INT8_PER_TOKEN_F32_PTX.as_ptr(), b"nsl_dequant_int8_per_token_f32\0".as_ptr(),
-        [grid, 1, 1], [block, 1, 1], &args, 0,
+        DEQUANT_INT8_PER_TOKEN_F32_PTX.as_ptr(),
+        b"nsl_dequant_int8_per_token_f32\0".as_ptr(),
+        [grid, 1, 1],
+        [block, 1, 1],
+        &args,
+        0,
     );
-    assert_eq!(result as u32, 0, "GPU dequant_int8_per_token kernel failed: {:?}", result);
+    assert_eq!(
+        result as u32, 0,
+        "GPU dequant_int8_per_token kernel failed: {:?}",
+        result
+    );
 }
 
 /// Dequantize INT4 per-group data on GPU.
@@ -2617,10 +2955,18 @@ pub(crate) fn gpu_dequant_int4_per_group_f32(
     let grid = ((n + 255) / 256) as i64;
 
     let result = inner::kernel_launch(
-        DEQUANT_INT4_PER_GROUP_F32_PTX.as_ptr(), b"nsl_dequant_int4_per_group_f32\0".as_ptr(),
-        [grid, 1, 1], [block, 1, 1], &args, 0,
+        DEQUANT_INT4_PER_GROUP_F32_PTX.as_ptr(),
+        b"nsl_dequant_int4_per_group_f32\0".as_ptr(),
+        [grid, 1, 1],
+        [block, 1, 1],
+        &args,
+        0,
     );
-    assert_eq!(result as u32, 0, "GPU dequant_int4_per_group kernel failed: {:?}", result);
+    assert_eq!(
+        result as u32, 0,
+        "GPU dequant_int4_per_group kernel failed: {:?}",
+        result
+    );
 }
 
 /// Dequantize FP8 E4M3 data on GPU: bit-manipulation u8 → f32.
@@ -2646,10 +2992,18 @@ pub(crate) fn gpu_dequant_fp8_e4m3_f32(
     let grid = ((n + 255) / 256) as i64;
 
     let result = inner::kernel_launch(
-        DEQUANT_FP8_E4M3_F32_PTX.as_ptr(), b"nsl_dequant_fp8_e4m3_f32\0".as_ptr(),
-        [grid, 1, 1], [block, 1, 1], &args, 0,
+        DEQUANT_FP8_E4M3_F32_PTX.as_ptr(),
+        b"nsl_dequant_fp8_e4m3_f32\0".as_ptr(),
+        [grid, 1, 1],
+        [block, 1, 1],
+        &args,
+        0,
     );
-    assert_eq!(result as u32, 0, "GPU dequant_fp8_e4m3 kernel failed: {:?}", result);
+    assert_eq!(
+        result as u32, 0,
+        "GPU dequant_fp8_e4m3 kernel failed: {:?}",
+        result
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -2685,11 +3039,21 @@ pub(crate) fn gpu_det_global_sum_f32(tensor_ptr: i64) -> i64 {
 
     // Single block, single thread — guarantees sequential deterministic accumulation
     let result = inner::kernel_launch(
-        DET_GLOBAL_SUM_F32_PTX.as_ptr(), b"nsl_det_global_sum_f32\0".as_ptr(),
-        [1, 1, 1], [1, 1, 1], &args, 0,
+        DET_GLOBAL_SUM_F32_PTX.as_ptr(),
+        b"nsl_det_global_sum_f32\0".as_ptr(),
+        [1, 1, 1],
+        [1, 1, 1],
+        &args,
+        0,
     );
-    assert_eq!(result as u32, 0, "GPU det_global_sum kernel failed: {:?}", result);
-    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+    assert_eq!(
+        result as u32, 0,
+        "GPU det_global_sum kernel failed: {:?}",
+        result
+    );
+    unsafe {
+        cudarc::driver::sys::cuCtxSynchronize();
+    }
 
     let out = Box::new(NslTensor::new(
         out_data,
@@ -2722,26 +3086,39 @@ pub(crate) fn gpu_det_sum_dim_f32(tensor_ptr: i64, dim: usize, keepdim: bool) ->
     let shape_slice = unsafe { std::slice::from_raw_parts(t.shape, ndim) };
 
     let reduce_size = shape_slice[dim] as u64;
-    let outer: u64 = shape_slice[..dim].iter().map(|&s| s as u64).product::<u64>().max(1);
-    let inner: u64 = shape_slice[dim + 1..].iter().map(|&s| s as u64).product::<u64>().max(1);
+    let outer: u64 = shape_slice[..dim]
+        .iter()
+        .map(|&s| s as u64)
+        .product::<u64>()
+        .max(1);
+    let inner: u64 = shape_slice[dim + 1..]
+        .iter()
+        .map(|&s| s as u64)
+        .product::<u64>()
+        .max(1);
 
     let out_total = (outer * inner) as usize;
     let out_data = inner::alloc_managed(out_total * 4); // f32
 
     // Build output shape
     let out_shape_vec: Vec<i64> = if keepdim {
-        shape_slice.iter().enumerate()
+        shape_slice
+            .iter()
+            .enumerate()
             .map(|(i, &s)| if i == dim { 1 } else { s })
             .collect()
     } else {
-        shape_slice.iter().enumerate()
+        shape_slice
+            .iter()
+            .enumerate()
             .filter(|&(i, _)| i != dim)
             .map(|(_, &s)| s)
             .collect()
     };
 
     let out_ndim = out_shape_vec.len() as i64;
-    let out_shape = crate::memory::checked_alloc(out_shape_vec.len() * std::mem::size_of::<i64>()) as *mut i64;
+    let out_shape =
+        crate::memory::checked_alloc(out_shape_vec.len() * std::mem::size_of::<i64>()) as *mut i64;
     for (i, &v) in out_shape_vec.iter().enumerate() {
         unsafe { *out_shape.add(i) = v };
     }
@@ -2764,11 +3141,21 @@ pub(crate) fn gpu_det_sum_dim_f32(tensor_ptr: i64, dim: usize, keepdim: bool) ->
     // One block per output element, single thread per block — sequential accumulation
     let grid = out_total as i64;
     let result = inner::kernel_launch(
-        DET_SUM_DIM_F32_PTX.as_ptr(), b"nsl_det_sum_dim_f32\0".as_ptr(),
-        [grid, 1, 1], [1, 1, 1], &args, 0,
+        DET_SUM_DIM_F32_PTX.as_ptr(),
+        b"nsl_det_sum_dim_f32\0".as_ptr(),
+        [grid, 1, 1],
+        [1, 1, 1],
+        &args,
+        0,
     );
-    assert_eq!(result as u32, 0, "GPU det_sum_dim kernel failed: {:?}", result);
-    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+    assert_eq!(
+        result as u32, 0,
+        "GPU det_sum_dim kernel failed: {:?}",
+        result
+    );
+    unsafe {
+        cudarc::driver::sys::cuCtxSynchronize();
+    }
 
     let out = Box::new(NslTensor::new(
         out_data,
@@ -2793,11 +3180,7 @@ pub(crate) fn gpu_det_sum_dim_f32(tensor_ptr: i64, dim: usize, keepdim: bool) ->
 /// Guarantees bit-identical results regardless of GPU scheduling (no atomics).
 /// All tensors must be on GPU (f32).
 #[cfg(feature = "cuda")]
-pub(crate) fn gpu_det_scatter_add_f32(
-    input_ptr: i64,
-    indices_ptr: i64,
-    src_ptr: i64,
-) -> i64 {
+pub(crate) fn gpu_det_scatter_add_f32(input_ptr: i64, indices_ptr: i64, src_ptr: i64) -> i64 {
     use crate::tensor::NslTensor;
     use fused_kernels::DET_SCATTER_ADD_F32_PTX;
 
@@ -2810,7 +3193,11 @@ pub(crate) fn gpu_det_scatter_add_f32(
 
     // input is [vocab_size, embed_dim] (or [vocab_size] for 1D)
     let vocab_size = input_shape[0] as u64;
-    let embed_dim = if input_ndim >= 2 { input_shape[1] as u64 } else { 1u64 };
+    let embed_dim = if input_ndim >= 2 {
+        input_shape[1] as u64
+    } else {
+        1u64
+    };
 
     let num_indices = indices.len as u64;
 
@@ -2860,11 +3247,21 @@ pub(crate) fn gpu_det_scatter_add_f32(
     let grid_y = ((embed_dim as i64) + block_y - 1) / block_y;
 
     let result = inner::kernel_launch(
-        DET_SCATTER_ADD_F32_PTX.as_ptr(), b"nsl_det_scatter_add_f32\0".as_ptr(),
-        [grid_x, grid_y, 1], [block_x, block_y, 1], &args, 0,
+        DET_SCATTER_ADD_F32_PTX.as_ptr(),
+        b"nsl_det_scatter_add_f32\0".as_ptr(),
+        [grid_x, grid_y, 1],
+        [block_x, block_y, 1],
+        &args,
+        0,
     );
-    assert_eq!(result as u32, 0, "GPU det_scatter_add kernel failed: {:?}", result);
-    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+    assert_eq!(
+        result as u32, 0,
+        "GPU det_scatter_add kernel failed: {:?}",
+        result
+    );
+    unsafe {
+        cudarc::driver::sys::cuCtxSynchronize();
+    }
 
     crate::tensor::nsl_tensor_free(indices_on_gpu);
 
@@ -2894,25 +3291,38 @@ pub(crate) fn gpu_max_dim_f32(tensor_ptr: i64, dim: usize, keepdim: bool) -> i64
     let shape_slice = unsafe { std::slice::from_raw_parts(t.shape, ndim) };
 
     let reduce_size = shape_slice[dim] as u64;
-    let outer: u64 = shape_slice[..dim].iter().map(|&s| s as u64).product::<u64>().max(1);
-    let inner: u64 = shape_slice[dim + 1..].iter().map(|&s| s as u64).product::<u64>().max(1);
+    let outer: u64 = shape_slice[..dim]
+        .iter()
+        .map(|&s| s as u64)
+        .product::<u64>()
+        .max(1);
+    let inner: u64 = shape_slice[dim + 1..]
+        .iter()
+        .map(|&s| s as u64)
+        .product::<u64>()
+        .max(1);
 
     let out_total = (outer * inner) as usize;
     let out_data = inner::alloc_managed(out_total * 4);
 
     let out_shape_vec: Vec<i64> = if keepdim {
-        shape_slice.iter().enumerate()
+        shape_slice
+            .iter()
+            .enumerate()
             .map(|(i, &s)| if i == dim { 1 } else { s })
             .collect()
     } else {
-        shape_slice.iter().enumerate()
+        shape_slice
+            .iter()
+            .enumerate()
             .filter(|&(i, _)| i != dim)
             .map(|(_, &s)| s)
             .collect()
     };
 
     let out_ndim = out_shape_vec.len() as i64;
-    let out_shape = crate::memory::checked_alloc(out_shape_vec.len() * std::mem::size_of::<i64>()) as *mut i64;
+    let out_shape =
+        crate::memory::checked_alloc(out_shape_vec.len() * std::mem::size_of::<i64>()) as *mut i64;
     for (i, &v) in out_shape_vec.iter().enumerate() {
         unsafe { *out_shape.add(i) = v };
     }
@@ -2936,11 +3346,17 @@ pub(crate) fn gpu_max_dim_f32(tensor_ptr: i64, dim: usize, keepdim: bool) -> i64
     let grid = out_total as i64;
 
     let result = inner::kernel_launch(
-        MAX_DIM_F32_PTX.as_ptr(), b"nsl_max_dim_f32\0".as_ptr(),
-        [grid, 1, 1], [block, 1, 1], &args, 256 * 4,
+        MAX_DIM_F32_PTX.as_ptr(),
+        b"nsl_max_dim_f32\0".as_ptr(),
+        [grid, 1, 1],
+        [block, 1, 1],
+        &args,
+        256 * 4,
     );
     assert_eq!(result as u32, 0, "GPU max_dim kernel failed: {:?}", result);
-    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+    unsafe {
+        cudarc::driver::sys::cuCtxSynchronize();
+    }
 
     let out = Box::new(NslTensor::new(
         out_data,
@@ -3002,11 +3418,21 @@ pub(crate) fn gpu_layernorm_f32(input_ptr: i64, gamma_ptr: i64, beta_ptr: i64, e
     let grid = rows as i64;
 
     let result = inner::kernel_launch(
-        LAYERNORM_F32_PTX.as_ptr(), b"nsl_layernorm_f32\0".as_ptr(),
-        [grid, 1, 1], [block, 1, 1], &args, 256 * 4,
+        LAYERNORM_F32_PTX.as_ptr(),
+        b"nsl_layernorm_f32\0".as_ptr(),
+        [grid, 1, 1],
+        [block, 1, 1],
+        &args,
+        256 * 4,
     );
-    assert_eq!(result as u32, 0, "GPU layernorm kernel failed: {:?}", result);
-    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+    assert_eq!(
+        result as u32, 0,
+        "GPU layernorm kernel failed: {:?}",
+        result
+    );
+    unsafe {
+        cudarc::driver::sys::cuCtxSynchronize();
+    }
 
     let out = Box::new(NslTensor::new(
         out_data,
@@ -3065,11 +3491,17 @@ pub(crate) fn gpu_rmsnorm_f32(input_ptr: i64, gamma_ptr: i64, eps: f32) -> i64 {
     let grid = rows as i64;
 
     let result = inner::kernel_launch(
-        RMSNORM_F32_PTX.as_ptr(), b"nsl_rmsnorm_f32\0".as_ptr(),
-        [grid, 1, 1], [block, 1, 1], &args, 256 * 4,
+        RMSNORM_F32_PTX.as_ptr(),
+        b"nsl_rmsnorm_f32\0".as_ptr(),
+        [grid, 1, 1],
+        [block, 1, 1],
+        &args,
+        256 * 4,
     );
     assert_eq!(result as u32, 0, "GPU rmsnorm kernel failed: {:?}", result);
-    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+    unsafe {
+        cudarc::driver::sys::cuCtxSynchronize();
+    }
 
     let out = Box::new(NslTensor::new(
         out_data,
@@ -3094,11 +3526,7 @@ pub(crate) fn gpu_rmsnorm_f32(input_ptr: i64, gamma_ptr: i64, eps: f32) -> i64 {
 /// `out` must be pre-zeroed. Both src and indices must be on GPU.
 /// Returns a new GPU tensor of shape [vocab_size, embed_dim].
 #[cfg(feature = "cuda")]
-pub(crate) fn gpu_scatter_add_f32(
-    src_ptr: i64,
-    indices_ptr: i64,
-    vocab_size: u64,
-) -> i64 {
+pub(crate) fn gpu_scatter_add_f32(src_ptr: i64, indices_ptr: i64, vocab_size: u64) -> i64 {
     use crate::tensor::NslTensor;
     use fused_kernels::SCATTER_ADD_F32_PTX;
 
@@ -3111,7 +3539,7 @@ pub(crate) fn gpu_scatter_add_f32(
     // Allocate output: [vocab_size, embed_dim], zeroed
     let out_elems = (vocab_size * embed_dim) as usize;
     let out_data = inner::alloc_managed(out_elems * 4); // f32
-    // Zero the output (scatter_add accumulates into it)
+                                                        // Zero the output (scatter_add accumulates into it)
     unsafe {
         std::ptr::write_bytes(out_data as *mut u8, 0, out_elems * 4);
     }
@@ -3155,11 +3583,21 @@ pub(crate) fn gpu_scatter_add_f32(
     let grid_y = ((embed_dim as i64) + block_y - 1) / block_y;
 
     let result = inner::kernel_launch(
-        SCATTER_ADD_F32_PTX.as_ptr(), b"nsl_scatter_add_f32\0".as_ptr(),
-        [grid_x, grid_y, 1], [block_x, block_y, 1], &args, 0,
+        SCATTER_ADD_F32_PTX.as_ptr(),
+        b"nsl_scatter_add_f32\0".as_ptr(),
+        [grid_x, grid_y, 1],
+        [block_x, block_y, 1],
+        &args,
+        0,
     );
-    assert_eq!(result as u32, 0, "GPU scatter_add kernel failed: {:?}", result);
-    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+    assert_eq!(
+        result as u32, 0,
+        "GPU scatter_add kernel failed: {:?}",
+        result
+    );
+    unsafe {
+        cudarc::driver::sys::cuCtxSynchronize();
+    }
 
     crate::tensor::nsl_tensor_free(indices_on_gpu);
 
@@ -3195,7 +3633,9 @@ pub(crate) fn gpu_gather_f32(input_ptr: i64, indices_ptr: i64) -> i64 {
 
     let input_rows = unsafe { *input.shape.add(0) } as u64;
     let inner_dim: u64 = if input.ndim >= 2 {
-        (1..input.ndim as usize).map(|d| unsafe { *input.shape.add(d) } as u64).product()
+        (1..input.ndim as usize)
+            .map(|d| unsafe { *input.shape.add(d) } as u64)
+            .product()
     } else {
         1
     };
@@ -3217,7 +3657,8 @@ pub(crate) fn gpu_gather_f32(input_ptr: i64, indices_ptr: i64) -> i64 {
 
     // Build output shape: [num_indices, dim1, dim2, ...]
     let out_ndim = input.ndim;
-    let out_shape = crate::memory::checked_alloc(out_ndim as usize * std::mem::size_of::<i64>()) as *mut i64;
+    let out_shape =
+        crate::memory::checked_alloc(out_ndim as usize * std::mem::size_of::<i64>()) as *mut i64;
     unsafe {
         *out_shape.add(0) = num_indices as i64;
         for d in 1..out_ndim as usize {
@@ -3255,11 +3696,17 @@ pub(crate) fn gpu_gather_f32(input_ptr: i64, indices_ptr: i64) -> i64 {
     };
 
     let result = inner::kernel_launch(
-        ptx.as_ptr(), kernel_name.as_ptr(),
-        [grid_x, grid_y, 1], [block_x, block_y, 1], &args, 0,
+        ptx.as_ptr(),
+        kernel_name.as_ptr(),
+        [grid_x, grid_y, 1],
+        [block_x, block_y, 1],
+        &args,
+        0,
     );
     assert_eq!(result as u32, 0, "GPU gather kernel failed: {:?}", result);
-    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+    unsafe {
+        cudarc::driver::sys::cuCtxSynchronize();
+    }
 
     crate::tensor::nsl_tensor_free(indices_on_gpu);
 
@@ -3285,8 +3732,13 @@ pub(crate) fn gpu_gather_f32(input_ptr: i64, indices_ptr: i64) -> i64 {
 /// Input must be 4D NCHW [N, C_in, H, W], weight [C_out, C_in, kH, kW].
 #[cfg(feature = "cuda")]
 pub(crate) fn gpu_conv2d_f32(
-    input_ptr: i64, weight_ptr: i64, bias_ptr: i64,
-    stride_h: u64, stride_w: u64, pad_h: u64, pad_w: u64,
+    input_ptr: i64,
+    weight_ptr: i64,
+    bias_ptr: i64,
+    stride_h: u64,
+    stride_w: u64,
+    pad_h: u64,
+    pad_w: u64,
 ) -> i64 {
     inner::set_oom_context("conv2d_f32");
     use crate::tensor::NslTensor;
@@ -3348,11 +3800,20 @@ pub(crate) fn gpu_conv2d_f32(
     let mut wt_data = weight_gpu.data as u64;
     let mut bias_val = bias_data;
     let mut out_val = out_data as u64;
-    let mut n_val = n; let mut cin_val = c_in; let mut h_val = h; let mut w_val = w;
-    let mut cout_val = c_out; let mut kh_val = kh; let mut kw_val = kw;
-    let mut sh_val = stride_h; let mut sw_val = stride_w;
-    let mut ph_val = pad_h; let mut pw_val = pad_w;
-    let mut hout_val = h_out; let mut wout_val = w_out; let mut total_val = total;
+    let mut n_val = n;
+    let mut cin_val = c_in;
+    let mut h_val = h;
+    let mut w_val = w;
+    let mut cout_val = c_out;
+    let mut kh_val = kh;
+    let mut kw_val = kw;
+    let mut sh_val = stride_h;
+    let mut sw_val = stride_w;
+    let mut ph_val = pad_h;
+    let mut pw_val = pad_w;
+    let mut hout_val = h_out;
+    let mut wout_val = w_out;
+    let mut total_val = total;
 
     let args: [*mut std::ffi::c_void; 18] = [
         &mut inp_data as *mut _ as *mut std::ffi::c_void,
@@ -3379,17 +3840,30 @@ pub(crate) fn gpu_conv2d_f32(
     let grid = ((total as i64) + block - 1) / block;
 
     let result = inner::kernel_launch(
-        CONV2D_F32_PTX.as_ptr(), b"nsl_conv2d_f32\0".as_ptr(),
-        [grid, 1, 1], [block, 1, 1], &args, 0,
+        CONV2D_F32_PTX.as_ptr(),
+        b"nsl_conv2d_f32\0".as_ptr(),
+        [grid, 1, 1],
+        [block, 1, 1],
+        &args,
+        0,
     );
     assert_eq!(result as u32, 0, "GPU conv2d kernel failed: {:?}", result);
-    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+    unsafe {
+        cudarc::driver::sys::cuCtxSynchronize();
+    }
 
     crate::tensor::nsl_tensor_free(weight_on_gpu);
 
     let out = Box::new(NslTensor::new(
-        out_data, out_shape, out_strides,
-        4, total as i64, input.device, 1, 1, 0,
+        out_data,
+        out_shape,
+        out_strides,
+        4,
+        total as i64,
+        input.device,
+        1,
+        1,
+        0,
     ));
     NslTensor::publish(out)
 }
@@ -3402,7 +3876,11 @@ pub(crate) fn gpu_conv2d_f32(
 /// Input must be 4D NCHW. Returns output tensor; argmax stored for backward.
 #[cfg(feature = "cuda")]
 pub(crate) fn gpu_maxpool2d_f32(
-    input_ptr: i64, kh: u64, kw: u64, stride: u64, padding: u64,
+    input_ptr: i64,
+    kh: u64,
+    kw: u64,
+    stride: u64,
+    padding: u64,
 ) -> (i64, Vec<u64>) {
     use crate::tensor::NslTensor;
     use fused_kernels::MAXPOOL2D_F32_PTX;
@@ -3433,10 +3911,17 @@ pub(crate) fn gpu_maxpool2d_f32(
     let mut inp_data = input.data as u64;
     let mut out_val = out_data as u64;
     let mut argmax_val = argmax_data as u64;
-    let mut n_val = n; let mut c_val = c; let mut h_val = h; let mut w_val = w;
-    let mut kh_val = kh; let mut kw_val = kw;
-    let mut stride_val = stride; let mut pad_val = padding;
-    let mut hout_val = h_out; let mut wout_val = w_out; let mut total_val = total;
+    let mut n_val = n;
+    let mut c_val = c;
+    let mut h_val = h;
+    let mut w_val = w;
+    let mut kh_val = kh;
+    let mut kw_val = kw;
+    let mut stride_val = stride;
+    let mut pad_val = padding;
+    let mut hout_val = h_out;
+    let mut wout_val = w_out;
+    let mut total_val = total;
 
     let args: [*mut std::ffi::c_void; 14] = [
         &mut inp_data as *mut _ as *mut std::ffi::c_void,
@@ -3459,22 +3944,38 @@ pub(crate) fn gpu_maxpool2d_f32(
     let grid = ((total as i64) + block - 1) / block;
 
     let result = inner::kernel_launch(
-        MAXPOOL2D_F32_PTX.as_ptr(), b"nsl_maxpool2d_f32\0".as_ptr(),
-        [grid, 1, 1], [block, 1, 1], &args, 0,
+        MAXPOOL2D_F32_PTX.as_ptr(),
+        b"nsl_maxpool2d_f32\0".as_ptr(),
+        [grid, 1, 1],
+        [block, 1, 1],
+        &args,
+        0,
     );
-    assert_eq!(result as u32, 0, "GPU maxpool2d kernel failed: {:?}", result);
-    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+    assert_eq!(
+        result as u32, 0,
+        "GPU maxpool2d kernel failed: {:?}",
+        result
+    );
+    unsafe {
+        cudarc::driver::sys::cuCtxSynchronize();
+    }
 
     // Read argmax indices back to CPU (needed for backward tape)
-    let argmax_vec: Vec<u64> = unsafe {
-        std::slice::from_raw_parts(argmax_data as *const u64, total as usize).to_vec()
-    };
+    let argmax_vec: Vec<u64> =
+        unsafe { std::slice::from_raw_parts(argmax_data as *const u64, total as usize).to_vec() };
     // Free GPU argmax buffer
     inner::free_managed(argmax_data);
 
     let out = Box::new(NslTensor::new(
-        out_data, out_shape, out_strides,
-        4, total as i64, input.device, 1, 1, 0,
+        out_data,
+        out_shape,
+        out_strides,
+        4,
+        total as i64,
+        input.device,
+        1,
+        1,
+        0,
     ));
     (NslTensor::publish(out), argmax_vec)
 }
@@ -3537,19 +4038,39 @@ pub(crate) fn gpu_dropout_f32(input_ptr: i64, p: f64) -> (i64, i64) {
     let grid = ((len as i64) + block - 1) / block;
 
     let result = inner::kernel_launch(
-        DROPOUT_F32_PTX.as_ptr(), b"nsl_dropout_f32\0".as_ptr(),
-        [grid, 1, 1], [block, 1, 1], &args, 0,
+        DROPOUT_F32_PTX.as_ptr(),
+        b"nsl_dropout_f32\0".as_ptr(),
+        [grid, 1, 1],
+        [block, 1, 1],
+        &args,
+        0,
     );
     assert_eq!(result as u32, 0, "GPU dropout kernel failed: {:?}", result);
-    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+    unsafe {
+        cudarc::driver::sys::cuCtxSynchronize();
+    }
 
     let out = Box::new(NslTensor::new(
-        out_data, out_shape, out_strides,
-        ndim, len as i64, input.device, 1, 1, 0,
+        out_data,
+        out_shape,
+        out_strides,
+        ndim,
+        len as i64,
+        input.device,
+        1,
+        1,
+        0,
     ));
     let mask = Box::new(NslTensor::new(
-        mask_data, mask_shape, mask_strides,
-        ndim, len as i64, input.device, 1, 1, 0,
+        mask_data,
+        mask_shape,
+        mask_strides,
+        ndim,
+        len as i64,
+        input.device,
+        1,
+        1,
+        0,
     ));
     (NslTensor::publish(out), NslTensor::publish(mask))
 }
@@ -3607,7 +4128,11 @@ pub(crate) fn gpu_slice_f32_with_shape(
     let out_shape = crate::memory::checked_alloc((ndim) * std::mem::size_of::<i64>()) as *mut i64;
     let mut total: i64 = 1;
     for i in 0..ndim {
-        let s = if i == dim { slice_len as i64 } else { unsafe { *t.shape.add(i) } };
+        let s = if i == dim {
+            slice_len as i64
+        } else {
+            unsafe { *t.shape.add(i) }
+        };
         unsafe { *out_shape.add(i) = s };
         total *= s;
     }
@@ -3621,8 +4146,16 @@ pub(crate) fn gpu_slice_f32_with_shape(
     let gpu_dst_strides = inner::alloc_managed(arr_bytes);
 
     inner::memcpy_htod(gpu_shape, out_shape as *const std::ffi::c_void, arr_bytes);
-    inner::memcpy_htod(gpu_src_strides, t.strides as *const std::ffi::c_void, arr_bytes);
-    inner::memcpy_htod(gpu_dst_strides, out_strides as *const std::ffi::c_void, arr_bytes);
+    inner::memcpy_htod(
+        gpu_src_strides,
+        t.strides as *const std::ffi::c_void,
+        arr_bytes,
+    );
+    inner::memcpy_htod(
+        gpu_dst_strides,
+        out_strides as *const std::ffi::c_void,
+        arr_bytes,
+    );
 
     let mut src_data = t.data as u64;
     let mut dst_data = out_data as u64;
@@ -3650,11 +4183,17 @@ pub(crate) fn gpu_slice_f32_with_shape(
     let grid = ((total as i64) + block - 1) / block;
 
     let result = inner::kernel_launch(
-        GPU_SLICE_F32_PTX.as_ptr(), b"nsl_slice_f32\0".as_ptr(),
-        [grid, 1, 1], [block, 1, 1], &args, 0,
+        GPU_SLICE_F32_PTX.as_ptr(),
+        b"nsl_slice_f32\0".as_ptr(),
+        [grid, 1, 1],
+        [block, 1, 1],
+        &args,
+        0,
     );
     assert_eq!(result as u32, 0, "GPU slice kernel failed: {:?}", result);
-    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+    unsafe {
+        cudarc::driver::sys::cuCtxSynchronize();
+    }
 
     // Free GPU metadata arrays
     inner::free_managed(gpu_shape);
@@ -3662,8 +4201,15 @@ pub(crate) fn gpu_slice_f32_with_shape(
     inner::free_managed(gpu_dst_strides);
 
     let out = Box::new(NslTensor::new(
-        out_data, out_shape, out_strides,
-        ndim as i64, total, t.device, 1, 1, 0,
+        out_data,
+        out_shape,
+        out_strides,
+        ndim as i64,
+        total,
+        t.device,
+        1,
+        1,
+        0,
     ));
     NslTensor::publish(out)
 }
@@ -3675,10 +4221,17 @@ pub(crate) fn gpu_slice_f32_with_shape(
 
 /// GPU CSR SpMM from NslSparseTensor: uploads CSR arrays to device, launches kernel.
 #[cfg(feature = "cuda")]
-pub(crate) fn gpu_csr_spmm_f32_from_sparse(sparse: &crate::sparse::NslSparseTensor, dense_ptr: i64) -> i64 {
+pub(crate) fn gpu_csr_spmm_f32_from_sparse(
+    sparse: &crate::sparse::NslSparseTensor,
+    dense_ptr: i64,
+) -> i64 {
     use crate::tensor::NslTensor;
     let b = unsafe { &*(dense_ptr as *const NslTensor) };
-    let n_out = if b.ndim >= 2 { unsafe { *b.shape.add(b.ndim as usize - 1) } } else { 1 } as usize;
+    let n_out = if b.ndim >= 2 {
+        unsafe { *b.shape.add(b.ndim as usize - 1) }
+    } else {
+        1
+    } as usize;
     let m = sparse.rows as usize;
     let nnz = sparse.nnz as usize;
 
@@ -3698,23 +4251,41 @@ pub(crate) fn gpu_csr_spmm_f32_from_sparse(sparse: &crate::sparse::NslSparseTens
     // row_ptrs: i64 → u32
     let staging_rp = crate::memory::checked_alloc(rp_bytes) as *mut u32;
     let src_rp = unsafe { std::slice::from_raw_parts(sparse.indices_0, m + 1) };
-    for i in 0..m + 1 { unsafe { *staging_rp.add(i) = src_rp[i] as u32; } }
+    for i in 0..m + 1 {
+        unsafe {
+            *staging_rp.add(i) = src_rp[i] as u32;
+        }
+    }
     inner::memcpy_htod(gpu_rp, staging_rp as *const std::ffi::c_void, rp_bytes);
-    unsafe { crate::memory::checked_free(staging_rp as *mut u8, rp_bytes); }
+    unsafe {
+        crate::memory::checked_free(staging_rp as *mut u8, rp_bytes);
+    }
 
     // col_indices: i64 → u32
     let staging_ci = crate::memory::checked_alloc(ci_bytes) as *mut u32;
     let src_ci = unsafe { std::slice::from_raw_parts(sparse.indices_1, nnz) };
-    for i in 0..nnz { unsafe { *staging_ci.add(i) = src_ci[i] as u32; } }
+    for i in 0..nnz {
+        unsafe {
+            *staging_ci.add(i) = src_ci[i] as u32;
+        }
+    }
     inner::memcpy_htod(gpu_ci, staging_ci as *const std::ffi::c_void, ci_bytes);
-    unsafe { crate::memory::checked_free(staging_ci as *mut u8, ci_bytes); }
+    unsafe {
+        crate::memory::checked_free(staging_ci as *mut u8, ci_bytes);
+    }
 
     // values: f64 → f32
     let staging_v = crate::memory::checked_alloc(v_bytes) as *mut f32;
     let src_v = unsafe { std::slice::from_raw_parts(sparse.data as *const f64, nnz) };
-    for i in 0..nnz { unsafe { *staging_v.add(i) = src_v[i] as f32; } }
+    for i in 0..nnz {
+        unsafe {
+            *staging_v.add(i) = src_v[i] as f32;
+        }
+    }
     inner::memcpy_htod(gpu_v, staging_v as *const std::ffi::c_void, v_bytes);
-    unsafe { crate::memory::checked_free(staging_v as *mut u8, v_bytes); }
+    unsafe {
+        crate::memory::checked_free(staging_v as *mut u8, v_bytes);
+    }
 
     let mut rp = gpu_rp as u64;
     let mut ci = gpu_ci as u64;
@@ -3738,20 +4309,39 @@ pub(crate) fn gpu_csr_spmm_f32_from_sparse(sparse: &crate::sparse::NslSparseTens
     let grid_x = m as i64;
     let grid_y = ((n_out as i64) + block - 1) / block;
     let result = inner::kernel_launch(
-        fused_kernels::CSR_SPMM_F32_PTX.as_ptr(), b"nsl_csr_spmm_f32\0".as_ptr(),
-        [grid_x, grid_y, 1], [block, 1, 1], &args, 0,
+        fused_kernels::CSR_SPMM_F32_PTX.as_ptr(),
+        b"nsl_csr_spmm_f32\0".as_ptr(),
+        [grid_x, grid_y, 1],
+        [block, 1, 1],
+        &args,
+        0,
     );
     assert_eq!(result as u32, 0, "GPU CSR SpMM kernel failed");
-    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+    unsafe {
+        cudarc::driver::sys::cuCtxSynchronize();
+    }
 
     inner::free_managed(gpu_rp);
     inner::free_managed(gpu_ci);
     inner::free_managed(gpu_v);
 
     let out_shape = crate::memory::checked_alloc(2 * 8) as *mut i64;
-    unsafe { *out_shape = m as i64; *out_shape.add(1) = n_out as i64; }
+    unsafe {
+        *out_shape = m as i64;
+        *out_shape.add(1) = n_out as i64;
+    }
     let out_strides = NslTensor::compute_strides(out_shape, 2);
-    let out = Box::new(NslTensor::new(out_data, out_shape, out_strides, 2, out_total as i64, b.device, 1, 1, 0));
+    let out = Box::new(NslTensor::new(
+        out_data,
+        out_shape,
+        out_strides,
+        2,
+        out_total as i64,
+        b.device,
+        1,
+        1,
+        0,
+    ));
     NslTensor::publish(out)
 }
 
@@ -3760,7 +4350,11 @@ pub(crate) fn gpu_csr_spmm_f32_from_sparse(sparse: &crate::sparse::NslSparseTens
 pub(crate) fn gpu_coo_spmm_f32(sparse: &crate::sparse::NslSparseTensor, dense_ptr: i64) -> i64 {
     use crate::tensor::NslTensor;
     let b = unsafe { &*(dense_ptr as *const NslTensor) };
-    let n_out = if b.ndim >= 2 { unsafe { *b.shape.add(b.ndim as usize - 1) } } else { 1 } as usize;
+    let n_out = if b.ndim >= 2 {
+        unsafe { *b.shape.add(b.ndim as usize - 1) }
+    } else {
+        1
+    } as usize;
     let m = sparse.rows as usize;
     let nnz = sparse.nnz as usize;
 
@@ -3771,21 +4365,35 @@ pub(crate) fn gpu_coo_spmm_f32(sparse: &crate::sparse::NslSparseTensor, dense_pt
     // Upload COO arrays: row_indices(i64), col_indices(i64), values(f32)
     let ri_bytes = nnz * 8; // i64
     let ci_bytes = nnz * 8;
-    let v_bytes = nnz * 4;  // f32
+    let v_bytes = nnz * 4; // f32
 
     let gpu_ri = inner::alloc_managed(ri_bytes);
     let gpu_ci = inner::alloc_managed(ci_bytes);
     let gpu_v = inner::alloc_managed(v_bytes);
 
     // Convert f64 values to f32 for GPU, upload indices as-is (i64)
-    inner::memcpy_htod(gpu_ri, sparse.indices_0 as *const std::ffi::c_void, ri_bytes);
-    inner::memcpy_htod(gpu_ci, sparse.indices_1 as *const std::ffi::c_void, ci_bytes);
+    inner::memcpy_htod(
+        gpu_ri,
+        sparse.indices_0 as *const std::ffi::c_void,
+        ri_bytes,
+    );
+    inner::memcpy_htod(
+        gpu_ci,
+        sparse.indices_1 as *const std::ffi::c_void,
+        ci_bytes,
+    );
     // Values: sparse stores f64 on CPU, need f32 for GPU kernel
     let staging = crate::memory::checked_alloc(v_bytes) as *mut f32;
     let src_vals = unsafe { std::slice::from_raw_parts(sparse.data as *const f64, nnz) };
-    for i in 0..nnz { unsafe { *staging.add(i) = src_vals[i] as f32; } }
+    for i in 0..nnz {
+        unsafe {
+            *staging.add(i) = src_vals[i] as f32;
+        }
+    }
     inner::memcpy_htod(gpu_v, staging as *const std::ffi::c_void, v_bytes);
-    unsafe { crate::memory::checked_free(staging as *mut u8, v_bytes); }
+    unsafe {
+        crate::memory::checked_free(staging as *mut u8, v_bytes);
+    }
 
     let mut ri_val = gpu_ri as u64;
     let mut ci_val = gpu_ci as u64;
@@ -3808,20 +4416,39 @@ pub(crate) fn gpu_coo_spmm_f32(sparse: &crate::sparse::NslSparseTensor, dense_pt
     let block = 256i64;
     let grid = ((nnz as i64) + block - 1) / block;
     let result = inner::kernel_launch(
-        fused_kernels::COO_SPMM_F32_PTX.as_ptr(), b"nsl_coo_spmm_f32\0".as_ptr(),
-        [grid, 1, 1], [block, 1, 1], &args, 0,
+        fused_kernels::COO_SPMM_F32_PTX.as_ptr(),
+        b"nsl_coo_spmm_f32\0".as_ptr(),
+        [grid, 1, 1],
+        [block, 1, 1],
+        &args,
+        0,
     );
     assert_eq!(result as u32, 0, "GPU COO SpMM kernel failed");
-    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+    unsafe {
+        cudarc::driver::sys::cuCtxSynchronize();
+    }
 
     inner::free_managed(gpu_ri);
     inner::free_managed(gpu_ci);
     inner::free_managed(gpu_v);
 
     let out_shape = crate::memory::checked_alloc(2 * 8) as *mut i64;
-    unsafe { *out_shape = m as i64; *out_shape.add(1) = n_out as i64; }
+    unsafe {
+        *out_shape = m as i64;
+        *out_shape.add(1) = n_out as i64;
+    }
     let out_strides = NslTensor::compute_strides(out_shape, 2);
-    let out = Box::new(NslTensor::new(out_data, out_shape, out_strides, 2, out_total as i64, b.device, 1, 1, 0));
+    let out = Box::new(NslTensor::new(
+        out_data,
+        out_shape,
+        out_strides,
+        2,
+        out_total as i64,
+        b.device,
+        1,
+        1,
+        0,
+    ));
     NslTensor::publish(out)
 }
 
@@ -3848,21 +4475,39 @@ pub(crate) fn gpu_csr_spmv_f32(sparse: &crate::sparse::NslSparseTensor, vec_ptr:
     // Convert i64 row_ptrs/col_indices to u32 for GPU, f64 values to f32
     let staging_rp = crate::memory::checked_alloc(rp_bytes) as *mut u32;
     let src_rp = unsafe { std::slice::from_raw_parts(sparse.indices_0, m + 1) };
-    for i in 0..m + 1 { unsafe { *staging_rp.add(i) = src_rp[i] as u32; } }
+    for i in 0..m + 1 {
+        unsafe {
+            *staging_rp.add(i) = src_rp[i] as u32;
+        }
+    }
     inner::memcpy_htod(gpu_rp, staging_rp as *const std::ffi::c_void, rp_bytes);
-    unsafe { crate::memory::checked_free(staging_rp as *mut u8, rp_bytes); }
+    unsafe {
+        crate::memory::checked_free(staging_rp as *mut u8, rp_bytes);
+    }
 
     let staging_ci = crate::memory::checked_alloc(ci_bytes) as *mut u32;
     let src_ci = unsafe { std::slice::from_raw_parts(sparse.indices_1, nnz) };
-    for i in 0..nnz { unsafe { *staging_ci.add(i) = src_ci[i] as u32; } }
+    for i in 0..nnz {
+        unsafe {
+            *staging_ci.add(i) = src_ci[i] as u32;
+        }
+    }
     inner::memcpy_htod(gpu_ci, staging_ci as *const std::ffi::c_void, ci_bytes);
-    unsafe { crate::memory::checked_free(staging_ci as *mut u8, ci_bytes); }
+    unsafe {
+        crate::memory::checked_free(staging_ci as *mut u8, ci_bytes);
+    }
 
     let staging_v = crate::memory::checked_alloc(v_bytes) as *mut f32;
     let src_v = unsafe { std::slice::from_raw_parts(sparse.data as *const f64, nnz) };
-    for i in 0..nnz { unsafe { *staging_v.add(i) = src_v[i] as f32; } }
+    for i in 0..nnz {
+        unsafe {
+            *staging_v.add(i) = src_v[i] as f32;
+        }
+    }
     inner::memcpy_htod(gpu_v, staging_v as *const std::ffi::c_void, v_bytes);
-    unsafe { crate::memory::checked_free(staging_v as *mut u8, v_bytes); }
+    unsafe {
+        crate::memory::checked_free(staging_v as *mut u8, v_bytes);
+    }
 
     let mut rp = gpu_rp as u64;
     let mut ci = gpu_ci as u64;
@@ -3883,20 +4528,38 @@ pub(crate) fn gpu_csr_spmv_f32(sparse: &crate::sparse::NslSparseTensor, vec_ptr:
     let block = 256i64;
     let grid = ((m as i64) + block - 1) / block;
     let result = inner::kernel_launch(
-        fused_kernels::CSR_SPMV_F32_PTX.as_ptr(), b"nsl_csr_spmv_f32\0".as_ptr(),
-        [grid, 1, 1], [block, 1, 1], &args, 0,
+        fused_kernels::CSR_SPMV_F32_PTX.as_ptr(),
+        b"nsl_csr_spmv_f32\0".as_ptr(),
+        [grid, 1, 1],
+        [block, 1, 1],
+        &args,
+        0,
     );
     assert_eq!(result as u32, 0, "GPU CSR SpMV kernel failed");
-    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+    unsafe {
+        cudarc::driver::sys::cuCtxSynchronize();
+    }
 
     inner::free_managed(gpu_rp);
     inner::free_managed(gpu_ci);
     inner::free_managed(gpu_v);
 
     let out_shape = crate::memory::checked_alloc(8) as *mut i64;
-    unsafe { *out_shape = m as i64; }
+    unsafe {
+        *out_shape = m as i64;
+    }
     let out_strides = NslTensor::compute_strides(out_shape, 1);
-    let out = Box::new(NslTensor::new(out_data, out_shape, out_strides, 1, m as i64, x.device, 1, 1, 0));
+    let out = Box::new(NslTensor::new(
+        out_data,
+        out_shape,
+        out_strides,
+        1,
+        m as i64,
+        x.device,
+        1,
+        1,
+        0,
+    ));
     NslTensor::publish(out)
 }
 
@@ -3905,11 +4568,17 @@ pub(crate) fn gpu_csr_spmv_f32(sparse: &crate::sparse::NslSparseTensor, vec_ptr:
 pub(crate) fn gpu_bsr_spmm_f32(sparse: &crate::sparse::NslSparseTensor, dense_ptr: i64) -> i64 {
     use crate::tensor::NslTensor;
     let b = unsafe { &*(dense_ptr as *const NslTensor) };
-    let n_out = if b.ndim >= 2 { unsafe { *b.shape.add(b.ndim as usize - 1) } } else { 1 } as usize;
+    let n_out = if b.ndim >= 2 {
+        unsafe { *b.shape.add(b.ndim as usize - 1) }
+    } else {
+        1
+    } as usize;
     let m = sparse.rows as usize;
     let br = sparse.block_rows as usize;
     let bc = sparse.block_cols as usize;
-    if br == 0 || bc == 0 { return 0; }
+    if br == 0 || bc == 0 {
+        return 0;
+    }
     let nblk_rows = (m + br - 1) / br;
     let num_blocks = sparse.nnz as usize;
     let block_size = br * bc;
@@ -3930,23 +4599,42 @@ pub(crate) fn gpu_bsr_spmm_f32(sparse: &crate::sparse::NslSparseTensor, dense_pt
     // Convert i64 → u32 for row_ptrs
     let staging_rp = crate::memory::checked_alloc(rp_bytes) as *mut u32;
     let src_rp = unsafe { std::slice::from_raw_parts(sparse.indices_0, nblk_rows + 1) };
-    for i in 0..nblk_rows + 1 { unsafe { *staging_rp.add(i) = src_rp[i] as u32; } }
+    for i in 0..nblk_rows + 1 {
+        unsafe {
+            *staging_rp.add(i) = src_rp[i] as u32;
+        }
+    }
     inner::memcpy_htod(gpu_rp, staging_rp as *const std::ffi::c_void, rp_bytes);
-    unsafe { crate::memory::checked_free(staging_rp as *mut u8, rp_bytes); }
+    unsafe {
+        crate::memory::checked_free(staging_rp as *mut u8, rp_bytes);
+    }
 
     // Convert i64 → u32 for col_indices
     let staging_ci = crate::memory::checked_alloc(ci_bytes) as *mut u32;
     let src_ci = unsafe { std::slice::from_raw_parts(sparse.indices_1, num_blocks) };
-    for i in 0..num_blocks { unsafe { *staging_ci.add(i) = src_ci[i] as u32; } }
+    for i in 0..num_blocks {
+        unsafe {
+            *staging_ci.add(i) = src_ci[i] as u32;
+        }
+    }
     inner::memcpy_htod(gpu_ci, staging_ci as *const std::ffi::c_void, ci_bytes);
-    unsafe { crate::memory::checked_free(staging_ci as *mut u8, ci_bytes); }
+    unsafe {
+        crate::memory::checked_free(staging_ci as *mut u8, ci_bytes);
+    }
 
     // Convert f64 → f32 for values
     let staging_v = crate::memory::checked_alloc(v_bytes) as *mut f32;
-    let src_v = unsafe { std::slice::from_raw_parts(sparse.data as *const f64, num_blocks * block_size) };
-    for i in 0..num_blocks * block_size { unsafe { *staging_v.add(i) = src_v[i] as f32; } }
+    let src_v =
+        unsafe { std::slice::from_raw_parts(sparse.data as *const f64, num_blocks * block_size) };
+    for i in 0..num_blocks * block_size {
+        unsafe {
+            *staging_v.add(i) = src_v[i] as f32;
+        }
+    }
     inner::memcpy_htod(gpu_v, staging_v as *const std::ffi::c_void, v_bytes);
-    unsafe { crate::memory::checked_free(staging_v as *mut u8, v_bytes); }
+    unsafe {
+        crate::memory::checked_free(staging_v as *mut u8, v_bytes);
+    }
 
     let mut rp = gpu_rp as u64;
     let mut ci = gpu_ci as u64;
@@ -3974,20 +4662,39 @@ pub(crate) fn gpu_bsr_spmm_f32(sparse: &crate::sparse::NslSparseTensor, dense_pt
     let grid_x = nblk_rows as i64;
     let grid_y = ((n_out as i64) + block_x - 1) / block_x;
     let result = inner::kernel_launch(
-        fused_kernels::BSR_SPMM_F32_PTX.as_ptr(), b"nsl_bsr_spmm_f32\0".as_ptr(),
-        [grid_x, grid_y, 1], [block_x, br as i64, 1], &args, 0,
+        fused_kernels::BSR_SPMM_F32_PTX.as_ptr(),
+        b"nsl_bsr_spmm_f32\0".as_ptr(),
+        [grid_x, grid_y, 1],
+        [block_x, br as i64, 1],
+        &args,
+        0,
     );
     assert_eq!(result as u32, 0, "GPU BSR SpMM kernel failed");
-    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+    unsafe {
+        cudarc::driver::sys::cuCtxSynchronize();
+    }
 
     inner::free_managed(gpu_rp);
     inner::free_managed(gpu_ci);
     inner::free_managed(gpu_v);
 
     let out_shape = crate::memory::checked_alloc(2 * 8) as *mut i64;
-    unsafe { *out_shape = m as i64; *out_shape.add(1) = n_out as i64; }
+    unsafe {
+        *out_shape = m as i64;
+        *out_shape.add(1) = n_out as i64;
+    }
     let out_strides = NslTensor::compute_strides(out_shape, 2);
-    let out = Box::new(NslTensor::new(out_data, out_shape, out_strides, 2, out_total as i64, b.device, 1, 1, 0));
+    let out = Box::new(NslTensor::new(
+        out_data,
+        out_shape,
+        out_strides,
+        2,
+        out_total as i64,
+        b.device,
+        1,
+        1,
+        0,
+    ));
     NslTensor::publish(out)
 }
 
@@ -4010,13 +4717,27 @@ pub(crate) fn gpu_coo_spmv_f32(sparse: &crate::sparse::NslSparseTensor, vec_ptr:
     let gpu_ci = inner::alloc_managed(ci_bytes);
     let gpu_v = inner::alloc_managed(v_bytes);
 
-    inner::memcpy_htod(gpu_ri, sparse.indices_0 as *const std::ffi::c_void, ri_bytes);
-    inner::memcpy_htod(gpu_ci, sparse.indices_1 as *const std::ffi::c_void, ci_bytes);
+    inner::memcpy_htod(
+        gpu_ri,
+        sparse.indices_0 as *const std::ffi::c_void,
+        ri_bytes,
+    );
+    inner::memcpy_htod(
+        gpu_ci,
+        sparse.indices_1 as *const std::ffi::c_void,
+        ci_bytes,
+    );
     let staging_v = crate::memory::checked_alloc(v_bytes) as *mut f32;
     let src_v = unsafe { std::slice::from_raw_parts(sparse.data as *const f64, nnz) };
-    for i in 0..nnz { unsafe { *staging_v.add(i) = src_v[i] as f32; } }
+    for i in 0..nnz {
+        unsafe {
+            *staging_v.add(i) = src_v[i] as f32;
+        }
+    }
     inner::memcpy_htod(gpu_v, staging_v as *const std::ffi::c_void, v_bytes);
-    unsafe { crate::memory::checked_free(staging_v as *mut u8, v_bytes); }
+    unsafe {
+        crate::memory::checked_free(staging_v as *mut u8, v_bytes);
+    }
 
     let mut ri = gpu_ri as u64;
     let mut ci = gpu_ci as u64;
@@ -4037,20 +4758,38 @@ pub(crate) fn gpu_coo_spmv_f32(sparse: &crate::sparse::NslSparseTensor, vec_ptr:
     let block = 256i64;
     let grid = ((nnz as i64) + block - 1) / block;
     let result = inner::kernel_launch(
-        fused_kernels::COO_SPMV_F32_PTX.as_ptr(), b"nsl_coo_spmv_f32\0".as_ptr(),
-        [grid, 1, 1], [block, 1, 1], &args, 0,
+        fused_kernels::COO_SPMV_F32_PTX.as_ptr(),
+        b"nsl_coo_spmv_f32\0".as_ptr(),
+        [grid, 1, 1],
+        [block, 1, 1],
+        &args,
+        0,
     );
     assert_eq!(result as u32, 0, "GPU COO SpMV kernel failed");
-    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+    unsafe {
+        cudarc::driver::sys::cuCtxSynchronize();
+    }
 
     inner::free_managed(gpu_ri);
     inner::free_managed(gpu_ci);
     inner::free_managed(gpu_v);
 
     let out_shape = crate::memory::checked_alloc(8) as *mut i64;
-    unsafe { *out_shape = m as i64; }
+    unsafe {
+        *out_shape = m as i64;
+    }
     let out_strides = NslTensor::compute_strides(out_shape, 1);
-    let out = Box::new(NslTensor::new(out_data, out_shape, out_strides, 1, m as i64, x.device, 1, 1, 0));
+    let out = Box::new(NslTensor::new(
+        out_data,
+        out_shape,
+        out_strides,
+        1,
+        m as i64,
+        x.device,
+        1,
+        1,
+        0,
+    ));
     NslTensor::publish(out)
 }
 
@@ -4101,9 +4840,21 @@ pub(crate) fn gpu_sparse_matmul_csr_f32(
     let gpu_col_indices = inner::alloc_managed(ci_bytes);
     let gpu_values = inner::alloc_managed(val_bytes);
 
-    inner::memcpy_htod(gpu_row_ptrs, row_ptrs.as_ptr() as *const std::ffi::c_void, rp_bytes);
-    inner::memcpy_htod(gpu_col_indices, col_indices.as_ptr() as *const std::ffi::c_void, ci_bytes);
-    inner::memcpy_htod(gpu_values, values_f32.as_ptr() as *const std::ffi::c_void, val_bytes);
+    inner::memcpy_htod(
+        gpu_row_ptrs,
+        row_ptrs.as_ptr() as *const std::ffi::c_void,
+        rp_bytes,
+    );
+    inner::memcpy_htod(
+        gpu_col_indices,
+        col_indices.as_ptr() as *const std::ffi::c_void,
+        ci_bytes,
+    );
+    inner::memcpy_htod(
+        gpu_values,
+        values_f32.as_ptr() as *const std::ffi::c_void,
+        val_bytes,
+    );
 
     let mut rp_val = gpu_row_ptrs as u64;
     let mut ci_val = gpu_col_indices as u64;
@@ -4129,11 +4880,17 @@ pub(crate) fn gpu_sparse_matmul_csr_f32(
     let grid_y = ((n_out as i64) + block - 1) / block;
 
     let result = inner::kernel_launch(
-        CSR_SPMM_F32_PTX.as_ptr(), b"nsl_csr_spmm_f32\0".as_ptr(),
-        [grid_x, grid_y, 1], [block, 1, 1], &args, 0,
+        CSR_SPMM_F32_PTX.as_ptr(),
+        b"nsl_csr_spmm_f32\0".as_ptr(),
+        [grid_x, grid_y, 1],
+        [block, 1, 1],
+        &args,
+        0,
     );
     assert_eq!(result as u32, 0, "GPU CSR SpMM kernel failed: {:?}", result);
-    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+    unsafe {
+        cudarc::driver::sys::cuCtxSynchronize();
+    }
 
     // Free device CSR arrays
     inner::free_managed(gpu_row_ptrs);
@@ -4148,7 +4905,15 @@ pub(crate) fn gpu_sparse_matmul_csr_f32(
     }
     let out_strides = NslTensor::compute_strides(out_shape, 2);
     let out = Box::new(NslTensor::new(
-        out_data, out_shape, out_strides, 2, out_total as i64, b.device, 1, 1, 0,
+        out_data,
+        out_shape,
+        out_strides,
+        2,
+        out_total as i64,
+        b.device,
+        1,
+        1,
+        0,
     ));
     NslTensor::publish(out)
 }
@@ -4207,11 +4972,21 @@ pub(crate) fn gpu_strided_copy_f32(tensor_ptr: i64) -> i64 {
     let grid = ((total as i64) + block - 1) / block;
 
     let result = inner::kernel_launch(
-        STRIDED_COPY_F32_PTX.as_ptr(), b"nsl_strided_copy_f32\0".as_ptr(),
-        [grid, 1, 1], [block, 1, 1], &args, 0,
+        STRIDED_COPY_F32_PTX.as_ptr(),
+        b"nsl_strided_copy_f32\0".as_ptr(),
+        [grid, 1, 1],
+        [block, 1, 1],
+        &args,
+        0,
     );
-    assert_eq!(result as u32, 0, "GPU strided copy kernel failed: {:?}", result);
-    unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+    assert_eq!(
+        result as u32, 0,
+        "GPU strided copy kernel failed: {:?}",
+        result
+    );
+    unsafe {
+        cudarc::driver::sys::cuCtxSynchronize();
+    }
 
     // Free GPU metadata arrays
     inner::free_managed(gpu_shape);
@@ -4219,8 +4994,15 @@ pub(crate) fn gpu_strided_copy_f32(tensor_ptr: i64) -> i64 {
     inner::free_managed(gpu_dst_strides);
 
     let out = Box::new(NslTensor::new(
-        out_data, out_shape, out_strides,
-        t.ndim, total as i64, t.device, 1, 1, 0,
+        out_data,
+        out_shape,
+        out_strides,
+        t.ndim,
+        total as i64,
+        t.device,
+        1,
+        1,
+        0,
     ));
     NslTensor::publish(out)
 }
@@ -4244,7 +5026,10 @@ pub extern "C" fn nsl_test_cuda_alloc(bytes: i64) -> i64 {
         inner::alloc_device(bytes as usize) as i64
     }
     #[cfg(not(feature = "cuda"))]
-    { let _ = bytes; 0 }
+    {
+        let _ = bytes;
+        0
+    }
 }
 
 /// Free device memory previously returned by `nsl_test_cuda_alloc`.
@@ -4253,10 +5038,14 @@ pub extern "C" fn nsl_test_cuda_alloc(bytes: i64) -> i64 {
 pub extern "C" fn nsl_test_cuda_free(ptr: i64) {
     #[cfg(feature = "cuda")]
     {
-        if ptr != 0 { inner::free_managed(ptr as *mut std::ffi::c_void); }
+        if ptr != 0 {
+            inner::free_managed(ptr as *mut std::ffi::c_void);
+        }
     }
     #[cfg(not(feature = "cuda"))]
-    { let _ = ptr; }
+    {
+        let _ = ptr;
+    }
 }
 
 /// Copy `bytes` from host pointer `src` to device pointer `dst`.
@@ -4272,7 +5061,9 @@ pub extern "C" fn nsl_test_cuda_h2d(dst: i64, src: i64, bytes: i64) {
         );
     }
     #[cfg(not(feature = "cuda"))]
-    { let _ = (dst, src, bytes); }
+    {
+        let _ = (dst, src, bytes);
+    }
 }
 
 /// Attempt to JIT-compile a PTX string via `cuModuleLoadDataEx` with an
@@ -4315,19 +5106,28 @@ pub extern "C" fn nsl_test_cuda_jit_log(ptx_ptr: i64) -> i64 {
                 vals.as_mut_ptr(),
             );
         }
-        let end = log_buf.iter().position(|&b| b == 0).unwrap_or(log_buf.len());
+        let end = log_buf
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(log_buf.len());
         // Empty log ⇒ JIT succeeded (or wrote nothing). Return 0 so the
         // caller's fallback ("<no log>") kicks in and we don't leak a
         // dummy CString on every call. When end > 0 we *do* leak — this
         // is a test-only diagnostic helper, so the cost is bounded by the
         // number of launch failures per test run (typically one).
-        if end == 0 { return 0; }
-        let msg = std::ffi::CString::new(&log_buf[..end]).unwrap_or_else(|_| std::ffi::CString::new("<binary>").unwrap());
+        if end == 0 {
+            return 0;
+        }
+        let msg = std::ffi::CString::new(&log_buf[..end])
+            .unwrap_or_else(|_| std::ffi::CString::new("<binary>").unwrap());
         let leaked = Box::leak(msg.into_boxed_c_str());
         leaked.as_ptr() as i64
     }
     #[cfg(not(feature = "cuda"))]
-    { let _ = ptx_ptr; 0 }
+    {
+        let _ = ptx_ptr;
+        0
+    }
 }
 
 /// Copy `bytes` from device pointer `src` to host pointer `dst`.
@@ -4336,7 +5136,9 @@ pub extern "C" fn nsl_test_cuda_jit_log(ptx_ptr: i64) -> i64 {
 pub extern "C" fn nsl_test_cuda_d2h(dst: i64, src: i64, bytes: i64) {
     #[cfg(feature = "cuda")]
     {
-        unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+        unsafe {
+            cudarc::driver::sys::cuCtxSynchronize();
+        }
         inner::memcpy_dtoh(
             dst as *mut std::ffi::c_void,
             src as *const std::ffi::c_void,
@@ -4344,7 +5146,9 @@ pub extern "C" fn nsl_test_cuda_d2h(dst: i64, src: i64, bytes: i64) {
         );
     }
     #[cfg(not(feature = "cuda"))]
-    { let _ = (dst, src, bytes); }
+    {
+        let _ = (dst, src, bytes);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -4366,7 +5170,7 @@ pub extern "C" fn test_detect_sm_version() -> u32 {
 #[cfg(all(test, feature = "cuda"))]
 mod tests {
     use super::*;
-    use crate::tensor::{DTYPE_F32, NslTensor};
+    use crate::tensor::{NslTensor, DTYPE_F32};
 
     const VEC_ADD_PTX: &str = "\
 .version 7.0
@@ -4451,7 +5255,8 @@ DONE:
             "vec_add\0".as_ptr(),
             [grid_size, 1, 1],
             [block_size, 1, 1],
-            &args.map(|p| p), 0,
+            &args.map(|p| p),
+            0,
         );
         assert_eq!(result as u32, 0, "kernel launch failed");
 
@@ -4541,7 +5346,12 @@ DONE:
             *byte = (i % 256) as u8;
         }
         for (i, &byte) in slice.iter().enumerate() {
-            assert_eq!(byte, (i % 256) as u8, "pinned memory mismatch at byte {}", i);
+            assert_eq!(
+                byte,
+                (i % 256) as u8,
+                "pinned memory mismatch at byte {}",
+                i
+            );
         }
 
         inner::free_pinned(ptr);
@@ -4556,7 +5366,11 @@ DONE:
         let dev_ptr = inner::alloc_device(size_bytes);
         assert!(!dev_ptr.is_null(), "alloc_device returned null");
 
-        inner::memcpy_htod(dev_ptr, host_data.as_ptr() as *const std::ffi::c_void, size_bytes);
+        inner::memcpy_htod(
+            dev_ptr,
+            host_data.as_ptr() as *const std::ffi::c_void,
+            size_bytes,
+        );
 
         // Sync to ensure transfer is complete before freeing.
         unsafe {
@@ -4569,7 +5383,7 @@ DONE:
 
     #[test]
     fn test_tensor_to_device_roundtrip() {
-        use crate::tensor::{NslTensor, nsl_tensor_to_device};
+        use crate::tensor::{nsl_tensor_to_device, NslTensor};
 
         // Create a CPU tensor manually: [1.0, 2.0, 3.0, 4.0]
         let data = vec![1.0f64, 2.0, 3.0, 4.0];
@@ -4608,13 +5422,19 @@ DONE:
         for i in 0..4 {
             let val = unsafe { *cpu_t.data_f64().add(i) };
             let expected = (i + 1) as f64;
-            assert!((val - expected).abs() < 1e-6, "mismatch at {}: {} vs {}", i, val, expected);
+            assert!(
+                (val - expected).abs() < 1e-6,
+                "mismatch at {}: {} vs {}",
+                i,
+                val,
+                expected
+            );
         }
     }
 
     #[test]
     fn test_gpu_matmul() {
-        use crate::tensor::{NslTensor, nsl_tensor_to_device, nsl_tensor_matmul};
+        use crate::tensor::{nsl_tensor_matmul, nsl_tensor_to_device, NslTensor};
 
         // A = [[1,2,3],[4,5,6]] (2x3)
         let a_data = vec![1.0f64, 2.0, 3.0, 4.0, 5.0, 6.0];
@@ -4631,7 +5451,9 @@ DONE:
             1,
             0,
         ));
-        std::mem::forget(a_data); std::mem::forget(a_shape); std::mem::forget(a_strides);
+        std::mem::forget(a_data);
+        std::mem::forget(a_shape);
+        std::mem::forget(a_strides);
         let a_cpu = Box::into_raw(a) as i64;
 
         // B = [[7,8],[9,10],[11,12]] (3x2)
@@ -4649,7 +5471,9 @@ DONE:
             1,
             0,
         ));
-        std::mem::forget(b_data); std::mem::forget(b_shape); std::mem::forget(b_strides);
+        std::mem::forget(b_data);
+        std::mem::forget(b_shape);
+        std::mem::forget(b_strides);
         let b_cpu = Box::into_raw(b) as i64;
 
         // Transfer to GPU
@@ -4660,7 +5484,9 @@ DONE:
         let c_gpu = nsl_tensor_matmul(a_gpu, b_gpu, 0);
 
         // Sync and transfer back
-        unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+        unsafe {
+            cudarc::driver::sys::cuCtxSynchronize();
+        }
         let c_cpu = nsl_tensor_to_device(c_gpu, 0);
         let c = unsafe { &*(c_cpu as *const NslTensor) };
 
@@ -4670,13 +5496,19 @@ DONE:
         let expected = [58.0, 64.0, 139.0, 154.0];
         for i in 0..4 {
             let val = unsafe { *c.data_f64().add(i) };
-            assert!((val - expected[i]).abs() < 0.5, "matmul mismatch at {}: {} vs {}", i, val, expected[i]);
+            assert!(
+                (val - expected[i]).abs() < 0.5,
+                "matmul mismatch at {}: {} vs {}",
+                i,
+                val,
+                expected[i]
+            );
         }
     }
 
     #[test]
     fn test_gpu_elementwise_add() {
-        use crate::tensor::{NslTensor, nsl_tensor_to_device, nsl_tensor_add};
+        use crate::tensor::{nsl_tensor_add, nsl_tensor_to_device, NslTensor};
 
         // Create CPU tensors manually
         let a_data = vec![1.0f64, 2.0, 3.0, 4.0];
@@ -4695,7 +5527,9 @@ DONE:
             1,
             0,
         ));
-        std::mem::forget(a_data); std::mem::forget(shape.clone()); std::mem::forget(strides.clone());
+        std::mem::forget(a_data);
+        std::mem::forget(shape.clone());
+        std::mem::forget(strides.clone());
         let a_cpu = Box::into_raw(a) as i64;
 
         let shape2 = vec![4i64];
@@ -4711,7 +5545,9 @@ DONE:
             1,
             0,
         ));
-        std::mem::forget(b_data); std::mem::forget(shape2); std::mem::forget(strides2);
+        std::mem::forget(b_data);
+        std::mem::forget(shape2);
+        std::mem::forget(strides2);
         let b_cpu = Box::into_raw(b) as i64;
 
         // Transfer to GPU
@@ -4722,14 +5558,22 @@ DONE:
         let c_gpu = nsl_tensor_add(a_gpu, b_gpu, 0);
 
         // Sync and transfer back
-        unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+        unsafe {
+            cudarc::driver::sys::cuCtxSynchronize();
+        }
         let c_cpu = nsl_tensor_to_device(c_gpu, 0);
         let c = unsafe { &*(c_cpu as *const NslTensor) };
 
         let expected = [11.0, 22.0, 33.0, 44.0];
         for i in 0..4 {
             let val = unsafe { *c.data_f64().add(i) };
-            assert!((val - expected[i]).abs() < 0.1, "mismatch at {}: {} vs {}", i, val, expected[i]);
+            assert!(
+                (val - expected[i]).abs() < 0.1,
+                "mismatch at {}: {} vs {}",
+                i,
+                val,
+                expected[i]
+            );
         }
     }
 }

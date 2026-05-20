@@ -19,16 +19,16 @@ use crate::wrga_fused_ptx::{FusedIa3Config, FusedLoraConfig};
 /// Register pool spec for WRGA fused LoRA kernel.
 #[derive(Debug, Clone)]
 pub struct LoraRegisterBudget {
-    pub main_accum_count: u32,   // 8 (f32, x@W accumulator)
-    pub epi_interm_count: u32,   // 4 (f32, x@A accumulator)
-    pub epi_final_count: u32,    // 4 (f32, (x@A)@B accumulator)
-    pub main_a_frag_count: u32,  // 4 (b32, x fragment)
-    pub main_b_frag_count: u32,  // 2 (b32, W fragment)
-    pub epi_a_frag_count: u32,   // 2 (b32, A-as-B-operand fragment — col-major B-fragment)
-    pub epi_b_frag_count: u32,   // 2 (b32, B fragment)
-    pub rd_scratch: u32,         // ~16 (u64)
-    pub u32_scratch: u32,        // ~12
-    pub pred_count: u32,         // ~4
+    pub main_accum_count: u32,  // 8 (f32, x@W accumulator)
+    pub epi_interm_count: u32,  // 4 (f32, x@A accumulator)
+    pub epi_final_count: u32,   // 4 (f32, (x@A)@B accumulator)
+    pub main_a_frag_count: u32, // 4 (b32, x fragment)
+    pub main_b_frag_count: u32, // 2 (b32, W fragment)
+    pub epi_a_frag_count: u32,  // 2 (b32, A-as-B-operand fragment — col-major B-fragment)
+    pub epi_b_frag_count: u32,  // 2 (b32, B fragment)
+    pub rd_scratch: u32,        // ~16 (u64)
+    pub u32_scratch: u32,       // ~12
+    pub pred_count: u32,        // ~4
 }
 
 pub fn wrga_lora_register_budget(_cfg: &FusedLoraConfig) -> LoraRegisterBudget {
@@ -49,13 +49,34 @@ pub fn wrga_lora_register_budget(_cfg: &FusedLoraConfig) -> LoraRegisterBudget {
 /// Emit the WRGA-LoRA register pool declarations.  Callers pass the
 /// output of `wrga_lora_register_budget`.
 pub fn emit_lora_register_pool(ptx: &mut String, b: &LoraRegisterBudget) {
-    ptx.push_str(&format!("    .reg .f32 %main_accum<{}>;\n", b.main_accum_count));
-    ptx.push_str(&format!("    .reg .f32 %epi_interm<{}>;\n", b.epi_interm_count));
-    ptx.push_str(&format!("    .reg .f32 %epi_final<{}>;\n", b.epi_final_count));
-    ptx.push_str(&format!("    .reg .b32 %main_a_frag<{}>;\n", b.main_a_frag_count));
-    ptx.push_str(&format!("    .reg .b32 %main_b_frag<{}>;\n", b.main_b_frag_count));
-    ptx.push_str(&format!("    .reg .b32 %epi_a_frag<{}>;\n", b.epi_a_frag_count));
-    ptx.push_str(&format!("    .reg .b32 %epi_b_frag<{}>;\n", b.epi_b_frag_count));
+    ptx.push_str(&format!(
+        "    .reg .f32 %main_accum<{}>;\n",
+        b.main_accum_count
+    ));
+    ptx.push_str(&format!(
+        "    .reg .f32 %epi_interm<{}>;\n",
+        b.epi_interm_count
+    ));
+    ptx.push_str(&format!(
+        "    .reg .f32 %epi_final<{}>;\n",
+        b.epi_final_count
+    ));
+    ptx.push_str(&format!(
+        "    .reg .b32 %main_a_frag<{}>;\n",
+        b.main_a_frag_count
+    ));
+    ptx.push_str(&format!(
+        "    .reg .b32 %main_b_frag<{}>;\n",
+        b.main_b_frag_count
+    ));
+    ptx.push_str(&format!(
+        "    .reg .b32 %epi_a_frag<{}>;\n",
+        b.epi_a_frag_count
+    ));
+    ptx.push_str(&format!(
+        "    .reg .b32 %epi_b_frag<{}>;\n",
+        b.epi_b_frag_count
+    ));
     ptx.push_str(&format!("    .reg .u64 %rd<{}>;\n", b.rd_scratch));
     ptx.push_str(&format!("    .reg .u32 %r<{}>;\n", b.u32_scratch));
     ptx.push_str(&format!("    .reg .pred %p<{}>;\n", b.pred_count));
@@ -174,10 +195,22 @@ pub const LORA_B_TILE_OFFSET: u32 = 1280;
 /// Initialize the per-tile SMEM base registers from %shmem_base.
 /// Called ONCE in the prolog after `emit_shmem_base_cvta`.
 pub fn emit_lora_tile_bases(ptx: &mut String) {
-    ptx.push_str(&format!("    add.u64 %x_tile_base, %shmem_base, {};\n", LORA_X_TILE_OFFSET));
-    ptx.push_str(&format!("    add.u64 %w_tile_base, %shmem_base, {};\n", LORA_W_TILE_OFFSET));
-    ptx.push_str(&format!("    add.u64 %a_tile_base, %shmem_base, {};\n", LORA_A_TILE_OFFSET));
-    ptx.push_str(&format!("    add.u64 %b_tile_base, %shmem_base, {};\n", LORA_B_TILE_OFFSET));
+    ptx.push_str(&format!(
+        "    add.u64 %x_tile_base, %shmem_base, {};\n",
+        LORA_X_TILE_OFFSET
+    ));
+    ptx.push_str(&format!(
+        "    add.u64 %w_tile_base, %shmem_base, {};\n",
+        LORA_W_TILE_OFFSET
+    ));
+    ptx.push_str(&format!(
+        "    add.u64 %a_tile_base, %shmem_base, {};\n",
+        LORA_A_TILE_OFFSET
+    ));
+    ptx.push_str(&format!(
+        "    add.u64 %b_tile_base, %shmem_base, {};\n",
+        LORA_B_TILE_OFFSET
+    ));
     // matmul_mma helpers look up %smem_base_x/w/a/b by name — alias.
     ptx.push_str("    mov.u64 %smem_base_x, %x_tile_base;\n");
     ptx.push_str("    mov.u64 %smem_base_w, %w_tile_base;\n");
@@ -225,23 +258,14 @@ pub fn emit_lora_stage_x_tile(ptx: &mut String, _m: u32, k: u32) {
             let row_byte_imm1 = row_byte_imm + 4;
             if needs_k_tail {
                 // Need runtime k-bound predicate on each column.
-                ptx.push_str(&format!(
-                    "    add.u32 %r_k_idx, %k_index_base, {};\n",
-                    col
-                ));
-                ptx.push_str(&format!(
-                    "    setp.lt.u32 %p_k_v0, %r_k_idx, {};\n",
-                    k
-                ));
+                ptx.push_str(&format!("    add.u32 %r_k_idx, %k_index_base, {};\n", col));
+                ptx.push_str(&format!("    setp.lt.u32 %p_k_v0, %r_k_idx, {};\n", k));
                 ptx.push_str("    and.pred %p_load0, %p1, %p_k_v0;\n");
                 ptx.push_str(&format!(
                     "    add.u32 %r_k_idx, %k_index_base, {};\n",
                     col + 1
                 ));
-                ptx.push_str(&format!(
-                    "    setp.lt.u32 %p_k_v1, %r_k_idx, {};\n",
-                    k
-                ));
+                ptx.push_str(&format!("    setp.lt.u32 %p_k_v1, %r_k_idx, {};\n", k));
                 ptx.push_str("    and.pred %p_load1, %p1, %p_k_v1;\n");
                 ptx.push_str(&format!(
                     "    @%p_load0 ld.global.f32 %stg_f0, [%rd_x_iter + {}];\n",
@@ -322,10 +346,7 @@ pub fn emit_lora_stage_w_tile(ptx: &mut String, n: u32, k: u32) {
                     "    add.u32 %r_k_idx, %k_index_base, {};\n",
                     k_row
                 ));
-                ptx.push_str(&format!(
-                    "    setp.lt.u32 %p_k_v0, %r_k_idx, {};\n",
-                    k
-                ));
+                ptx.push_str(&format!("    setp.lt.u32 %p_k_v0, %r_k_idx, {};\n", k));
                 ptx.push_str(&format!(
                     "    @%p_k_v0 ld.global.f32 %stg_f0, [%rd_w_iter + {}];\n",
                     gl_offset_imm
@@ -362,7 +383,9 @@ pub fn emit_lora_stage_a_tile(ptx: &mut String, rank: u32, k: u32) {
     // Runtime K-iter version. Precondition: %rd_a_iter = %rd_a + (%k_iter *
     // (16 * rank * 4)), set up in emit_fused_adapter_kernel_body's loop prolog.
     // %k_index_base = %k_iter * 16 (u32).
-    ptx.push_str(&format!("    // Stage a_tile for runtime K-iter (rank={rank}, f32 global, col-major f16 SMEM)\n"));
+    ptx.push_str(&format!(
+        "    // Stage a_tile for runtime K-iter (rank={rank}, f32 global, col-major f16 SMEM)\n"
+    ));
     ptx.push_str("    setp.eq.u32 %p0, %tid_x, 0;\n");
     ptx.push_str("    @!%p0 bra lora_a_stage_done;\n");
     let needs_k_tail = !k.is_multiple_of(16);
@@ -387,10 +410,7 @@ pub fn emit_lora_stage_a_tile(ptx: &mut String, rank: u32, k: u32) {
                     "    add.u32 %r_k_idx, %k_index_base, {};\n",
                     k_row
                 ));
-                ptx.push_str(&format!(
-                    "    setp.lt.u32 %p_k_v0, %r_k_idx, {};\n",
-                    k
-                ));
+                ptx.push_str(&format!("    setp.lt.u32 %p_k_v0, %r_k_idx, {};\n", k));
                 ptx.push_str(&format!(
                     "    @%p_k_v0 ld.global.f32 %stg_f0, [%rd_a_iter + {}];\n",
                     gl_offset_imm
@@ -496,7 +516,10 @@ pub fn emit_lora_store_output(ptx: &mut String, n: u32) {
     // positions: (r,c), (r,c+1), (r+8,c), (r+8,c+1) relative to tile origin.
     let offsets: [(u32, u32); 4] = [(0, 0), (0, 1), (8, 0), (8, 1)];
     for (i, (row_off, col_off)) in offsets.iter().enumerate() {
-        ptx.push_str(&format!("    // Store main_accum{} (row+{}, col+{})\n", i, row_off, col_off));
+        ptx.push_str(&format!(
+            "    // Store main_accum{} (row+{}, col+{})\n",
+            i, row_off, col_off
+        ));
         // row_in_tile = %r4 + row_off
         ptx.push_str(&format!("    add.u32 %r6, %r4, {};\n", row_off));
         // col_in_tile = %r5 + col_off
@@ -512,7 +535,10 @@ pub fn emit_lora_store_output(ptx: &mut String, n: u32) {
         ptx.push_str("    shl.b32 %r8, %r8, 2;\n");
         ptx.push_str("    cvt.u64.u32 %rd0, %r8;\n");
         ptx.push_str("    add.u64 %rd0, %rd_y, %rd0;\n");
-        ptx.push_str(&format!("    @%p1 st.global.f32 [%rd0], %main_accum{};\n", i));
+        ptx.push_str(&format!(
+            "    @%p1 st.global.f32 [%rd0], %main_accum{};\n",
+            i
+        ));
     }
 }
 
@@ -573,10 +599,19 @@ pub fn wrga_ia3_register_budget(_cfg: &FusedIa3Config) -> Ia3RegisterBudget {
 /// %gamma<2> holds the 2 per-thread γ column values loaded by
 /// emit_ia3_load_gamma.
 pub fn emit_ia3_register_pool(ptx: &mut String, b: &Ia3RegisterBudget) {
-    ptx.push_str(&format!("    .reg .f32 %main_accum<{}>;\n", b.main_accum_count));
+    ptx.push_str(&format!(
+        "    .reg .f32 %main_accum<{}>;\n",
+        b.main_accum_count
+    ));
     ptx.push_str(&format!("    .reg .f32 %gamma<{}>;\n", b.gamma_count));
-    ptx.push_str(&format!("    .reg .b32 %main_a_frag<{}>;\n", b.main_a_frag_count));
-    ptx.push_str(&format!("    .reg .b32 %main_b_frag<{}>;\n", b.main_b_frag_count));
+    ptx.push_str(&format!(
+        "    .reg .b32 %main_a_frag<{}>;\n",
+        b.main_a_frag_count
+    ));
+    ptx.push_str(&format!(
+        "    .reg .b32 %main_b_frag<{}>;\n",
+        b.main_b_frag_count
+    ));
     ptx.push_str(&format!("    .reg .u64 %rd<{}>;\n", b.rd_scratch));
     ptx.push_str(&format!("    .reg .u32 %r<{}>;\n", b.u32_scratch));
     ptx.push_str(&format!("    .reg .pred %p<{}>;\n", b.pred_count));
@@ -621,8 +656,14 @@ pub const IA3_W_TILE_OFFSET: u32 = 512;
 /// needed by emit_load_b_fragment_smem.  The col-major B-tile lane
 /// formula is identical to LoRA: (tid/4)*32 bytes.
 pub fn emit_ia3_tile_bases(ptx: &mut String) {
-    ptx.push_str(&format!("    add.u64 %x_tile_base, %shmem_base, {};\n", IA3_X_TILE_OFFSET));
-    ptx.push_str(&format!("    add.u64 %w_tile_base, %shmem_base, {};\n", IA3_W_TILE_OFFSET));
+    ptx.push_str(&format!(
+        "    add.u64 %x_tile_base, %shmem_base, {};\n",
+        IA3_X_TILE_OFFSET
+    ));
+    ptx.push_str(&format!(
+        "    add.u64 %w_tile_base, %shmem_base, {};\n",
+        IA3_W_TILE_OFFSET
+    ));
     // matmul_mma helpers look up %smem_base_x/w by name — alias.
     ptx.push_str("    mov.u64 %smem_base_x, %x_tile_base;\n");
     ptx.push_str("    mov.u64 %smem_base_w, %w_tile_base;\n");
@@ -740,15 +781,11 @@ pub fn emit_sigmoid_approx_fused_maybe_guarded(
     ptx.push_str(&format!(
         "    {g}mul.f32  %sig_tmp, {input}, 0fBFB8AA3B;   // * -log2(e)\n"
     ));
-    ptx.push_str(&format!(
-        "    {g}ex2.approx.f32 %sig_tmp, %sig_tmp;\n"
-    ));
+    ptx.push_str(&format!("    {g}ex2.approx.f32 %sig_tmp, %sig_tmp;\n"));
     ptx.push_str(&format!(
         "    {g}add.f32  %sig_tmp, %sig_tmp, 0f3F800000;   // + 1.0\n"
     ));
-    ptx.push_str(&format!(
-        "    {g}rcp.approx.f32 {output}, %sig_tmp;\n"
-    ));
+    ptx.push_str(&format!("    {g}rcp.approx.f32 {output}, %sig_tmp;\n"));
 }
 
 /// Emit a per-thread gate load for the GatedLoRA fused kernel.
@@ -792,9 +829,7 @@ pub fn emit_gate_load_per_thread_maybe_guarded(ptx: &mut String, guard: Option<&
     ptx.push_str(&format!(
         "    {g}add.u64  %rd_gate_addr, %rd_gate, %rd_gate_addr;\n"
     ));
-    ptx.push_str(&format!(
-        "    {g}ld.global.f32 %gate0, [%rd_gate_addr];\n"
-    ));
+    ptx.push_str(&format!("    {g}ld.global.f32 %gate0, [%rd_gate_addr];\n"));
     ptx.push_str(&format!(
         "    {g}ld.global.f32 %gate1, [%rd_gate_addr + 4];\n"
     ));
@@ -859,7 +894,8 @@ mod sigmoid_tests {
         emit_sigmoid_approx_fused(&mut ptx, "%in", "%out");
 
         // Critical: the mul line must use the NEGATIVE log2(e) constant.
-        let mul_line = ptx.lines()
+        let mul_line = ptx
+            .lines()
             .find(|l| l.contains("mul.f32") && l.contains("%sig_tmp"))
             .expect("expected mul.f32 %sig_tmp line in emission");
         assert!(
@@ -895,13 +931,15 @@ mod sigmoid_tests {
 
         // Predicate setup: two setp.lt.u32 for the two-column fold.
         assert_eq!(
-            ptx.matches("setp.lt.u32").count(), 2,
+            ptx.matches("setp.lt.u32").count(),
+            2,
             "expected 2 setp.lt.u32 for %p_col0 and %p_col1; got:\n{ptx}"
         );
 
         // 4 predicated adds, one per main_accum[0..3].
         assert_eq!(
-            ptx.matches("@%p_col").count(), 4,
+            ptx.matches("@%p_col").count(),
+            4,
             "expected 4 predicated adds (main_accum0..3); got:\n{ptx}"
         );
 
@@ -935,7 +973,9 @@ mod sigmoid_tests {
 
         // Scale multiplication present exactly 4 times (one per main_accum position).
         assert_eq!(
-            ptx.matches("mul.f32      %fold_tmp, %fold_tmp, %scale_reg").count(), 4,
+            ptx.matches("mul.f32      %fold_tmp, %fold_tmp, %scale_reg")
+                .count(),
+            4,
             "expected 4 scale multiplications; got:\n{ptx}"
         );
     }

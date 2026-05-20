@@ -10,15 +10,15 @@ use crate::flash_attention::FlashAttentionConfig;
 // Supported-config matrix. Published so Task 3's per-config iteration
 // tests and downstream phase emitters can consume the same lists the
 // validator uses (single source of truth — no duplication).
-pub const ALLOWED_BLOCK_Q:   &[i64] = &[4, 8, 16, 32, 64, 128];
-pub const ALLOWED_BLOCK_KV:  &[i64] = &[16, 32, 64, 128];
-pub const ALLOWED_HEAD_DIM:  &[i64] = &[32, 64, 128, 256];
-pub const ALLOWED_GQA:       &[u32] = &[1, 2, 4, 8];
+pub const ALLOWED_BLOCK_Q: &[i64] = &[4, 8, 16, 32, 64, 128];
+pub const ALLOWED_BLOCK_KV: &[i64] = &[16, 32, 64, 128];
+pub const ALLOWED_HEAD_DIM: &[i64] = &[32, 64, 128, 256];
+pub const ALLOWED_GQA: &[u32] = &[1, 2, 4, 8];
 /// 48 KB: CUDA static `.shared` cap (all SM generations).
 /// Configs within this budget use a statically-sized shmem array in PTX;
 /// configs above it use an `extern .shared` declaration and require dynamic
 /// SMEM opt-in via `cuFuncSetAttribute(MAX_DYNAMIC_SHARED_SIZE_BYTES)`.
-pub const SMEM_BUDGET_BYTES: u32         = 48 * 1024;
+pub const SMEM_BUDGET_BYTES: u32 = 48 * 1024;
 /// 99 KB: dynamic shared memory opt-in cap.
 /// `CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN` returns 101376 bytes
 /// (99 KB) on RTX 5070 Ti (sm_120 / Blackwell) with CUDA 13.2.  sm_90/sm_89
@@ -163,7 +163,8 @@ pub fn validate_scalar_v2_config(
 ) -> Result<(), ConfigError> {
     if !ALLOWED_BLOCK_Q.contains(&config.block_q) {
         return Err(ConfigError(format!(
-            "block_q = {}: must be one of {:?}", config.block_q, ALLOWED_BLOCK_Q
+            "block_q = {}: must be one of {:?}",
+            config.block_q, ALLOWED_BLOCK_Q
         )));
     }
     if config.block_q % 4 != 0 {
@@ -174,12 +175,14 @@ pub fn validate_scalar_v2_config(
     }
     if !ALLOWED_BLOCK_KV.contains(&config.block_kv) {
         return Err(ConfigError(format!(
-            "block_kv = {}: must be one of {:?}", config.block_kv, ALLOWED_BLOCK_KV
+            "block_kv = {}: must be one of {:?}",
+            config.block_kv, ALLOWED_BLOCK_KV
         )));
     }
     if !ALLOWED_HEAD_DIM.contains(&config.head_dim) {
         return Err(ConfigError(format!(
-            "head_dim = {}: must be one of {:?}", config.head_dim, ALLOWED_HEAD_DIM
+            "head_dim = {}: must be one of {:?}",
+            config.head_dim, ALLOWED_HEAD_DIM
         )));
     }
     if !ALLOWED_GQA.contains(&config.gqa_group_size) {
@@ -198,9 +201,7 @@ pub fn validate_scalar_v2_config(
     // rows, exactly matches the tile size for both dimensions).  Asymmetric
     // configs (`block_q != block_kv`) are therefore valid and no additional
     // predicate is needed here.
-    if config.csha.as_ref().is_some_and(|c| c.fused_projections)
-        && (config.block_kv % 4 != 0)
-    {
+    if config.csha.as_ref().is_some_and(|c| c.fused_projections) && (config.block_kv % 4 != 0) {
         return Err(ConfigError(format!(
             "fused_projections requires block_kv to be a multiple of 4 \
              (warp-per-row contract); got block_kv={}",
@@ -232,23 +233,32 @@ pub fn validate_scalar_v2_config(
         0
     };
     let total = fwd_total + extra + seg_overhead;
-    let q_region  = kv_start;              // Q region: [0, kv_start)
-    let kv_region = sp_start - kv_start;   // KV region: [kv_start, sp_start)
-    let sp_region = fwd_total - sp_start;  // SP + weight + save region: [sp_start, fwd_total)
+    let q_region = kv_start; // Q region: [0, kv_start)
+    let kv_region = sp_start - kv_start; // KV region: [kv_start, sp_start)
+    let sp_region = fwd_total - sp_start; // SP + weight + save region: [sp_start, fwd_total)
     if total > SMEM_DYNAMIC_BUDGET_BYTES {
         return Err(ConfigError(match direction {
             Direction::Forward => format!(
                 "SMEM total {} bytes ({:.1} KB) exceeds 99 KB dynamic SMEM budget \
                  (Q={} KV={} SP+rest={} seg={}); reduce head_dim, block_q/block_kv, or d_model",
-                total, total as f32 / 1024.0, q_region, kv_region, sp_region, seg_overhead
+                total,
+                total as f32 / 1024.0,
+                q_region,
+                kv_region,
+                sp_region,
+                seg_overhead
             ),
             Direction::Backward => format!(
                 "CSHA fused Backward rejected: {} bytes > {} byte cap at \
                  (block_q={}, head_dim={}); forward={} backward_extra={} seg={} \
                  (P+dQ+dK+dV). Reduce head_dim, block_q/block_kv, or d_model.",
-                total, SMEM_DYNAMIC_BUDGET_BYTES,
-                config.block_q, config.head_dim,
-                fwd_total, extra, seg_overhead
+                total,
+                SMEM_DYNAMIC_BUDGET_BYTES,
+                config.block_q,
+                config.head_dim,
+                fwd_total,
+                extra,
+                seg_overhead
             ),
         }));
     }
@@ -269,7 +279,9 @@ pub fn needs_dynamic_smem(config: &FlashAttentionConfig) -> bool {
 }
 
 /// Q tile always starts at byte 0 (parameter intentionally unused — offset is a constant).
-pub fn q_offset(_config: &FlashAttentionConfig) -> u32 { 0 }
+pub fn q_offset(_config: &FlashAttentionConfig) -> u32 {
+    0
+}
 
 /// KV tile starts immediately after the Q tile (block_q × head_dim × 2 bytes, f16).
 pub fn kv_offset(config: &FlashAttentionConfig) -> u32 {
@@ -289,9 +301,9 @@ pub fn sp_offset(config: &FlashAttentionConfig) -> u32 {
 /// PV-accums) requires keeping P values for EVERY q_tile_iter live at the same
 /// time; without the expanded region each S-pass overwrites the previous iter's P.
 pub fn sp_bytes(config: &FlashAttentionConfig) -> u32 {
-    let warps     = 4u32;
-    let block_kv  = config.block_kv as u32;
-    let base      = warps * block_kv * 4;
+    let warps = 4u32;
+    let block_kv = config.block_kv as u32;
+    let base = warps * block_kv * 4;
     if config.csha.as_ref().is_some_and(|c| c.fused_projections) {
         let iters = (config.block_q as u32).div_ceil(4);
         iters * base
@@ -333,8 +345,9 @@ pub fn tier_b_range_table_offset(
     };
     let base = match direction {
         Direction::Forward => total_bytes(config),
-        Direction::Backward =>
-            crate::flash_attention_v2::phases::backward::prelude::backward_total_bytes(config),
+        Direction::Backward => {
+            crate::flash_attention_v2::phases::backward::prelude::backward_total_bytes(config)
+        }
     } + seg_overhead;
     align_up_u32(base, 2)
 }
@@ -351,8 +364,11 @@ fn align_up_u32(x: u32, align: u32) -> u32 {
 /// When `csha.fused_output_proj`, also includes Wo tile + x_residual input slot.
 pub fn total_bytes(config: &FlashAttentionConfig) -> u32 {
     let base = sp_offset(config) + sp_bytes(config);
-    base + wq_tile_bytes(config) + wk_tile_bytes(config) + wv_tile_bytes(config)
-        + wo_tile_bytes(config) + x_residual_bytes(config)
+    base + wq_tile_bytes(config)
+        + wk_tile_bytes(config)
+        + wv_tile_bytes(config)
+        + wo_tile_bytes(config)
+        + x_residual_bytes(config)
         + softmax_save_bytes(config)
 }
 
@@ -410,7 +426,7 @@ pub fn x_residual_bytes(config: &FlashAttentionConfig) -> u32 {
 pub fn softmax_save_bytes(config: &FlashAttentionConfig) -> u32 {
     if config.csha.as_ref().is_some_and(|c| c.fused_projections) {
         let iters = (config.block_q as u32).div_ceil(4);
-        4 * iters * 2 * 4  // 4 warps × iters × (row_max, row_sum) × sizeof(f32)
+        4 * iters * 2 * 4 // 4 warps × iters × (row_max, row_sum) × sizeof(f32)
     } else {
         0
     }
@@ -420,8 +436,11 @@ pub fn softmax_save_bytes(config: &FlashAttentionConfig) -> u32 {
 /// Valid only when `fused_projections` is true; returns 0 otherwise.
 pub fn softmax_save_offset(config: &FlashAttentionConfig) -> u32 {
     let base = sp_offset(config) + sp_bytes(config);
-    base + wq_tile_bytes(config) + wk_tile_bytes(config) + wv_tile_bytes(config)
-        + wo_tile_bytes(config) + x_residual_bytes(config)
+    base + wq_tile_bytes(config)
+        + wk_tile_bytes(config)
+        + wv_tile_bytes(config)
+        + wo_tile_bytes(config)
+        + x_residual_bytes(config)
 }
 
 /// SmemLayout captures all per-config SMEM region sizes.
@@ -461,7 +480,9 @@ pub struct SmemLayout {
 
 /// Q tile offset (always 0 — Q lives at the start of the extern shared
 /// allocation). Parameter intentionally unused — offset is a constant.
-pub fn tier_b1_q_offset(_config: &FlashAttentionConfig) -> u32 { 0 }
+pub fn tier_b1_q_offset(_config: &FlashAttentionConfig) -> u32 {
+    0
+}
 
 /// K ping slot offset. f16 row-major `[block_kv, head_dim]`. Lives
 /// immediately after the Q tile.
@@ -577,7 +598,7 @@ pub fn tier_b1_total_smem_bytes(config: &FlashAttentionConfig, chunk: u32) -> u3
     let p_scratch = tier_b1_p_scratch_bytes(config);
     let softmax_scratch = tier_b1_softmax_scratch_bytes(config);
     let chunk_staging = chunk * hd * 2 * 2          // Wk + Wv chunk slots
-                      + (bq + bkv) * chunk * 2;     // x_q + x_kv chunk slots
+                      + (bq + bkv) * chunk * 2; // x_q + x_kv chunk slots
     q_tile + kv_ping_pong + p_scratch + softmax_scratch + chunk_staging
 }
 
@@ -606,7 +627,7 @@ pub fn validate_tier_b1_config(
     let fixed_bytes = q_tile + kv_ping_pong + p_scratch + softmax_scratch;
 
     let chunk_staging = chunk * hd * 2 * 2          // Wk + Wv chunk slots
-                      + (bq + bkv) * chunk * 2;     // x_q + x_kv chunk slots
+                      + (bq + bkv) * chunk * 2; // x_q + x_kv chunk slots
     let total = fixed_bytes + chunk_staging;
 
     if total > SMEM_DYNAMIC_BUDGET_BYTES {
@@ -620,15 +641,15 @@ pub fn validate_tier_b1_config(
 
 /// Compute the full SMEM layout for a given config.
 pub fn compute_layout(config: &FlashAttentionConfig) -> SmemLayout {
-    let q_bytes      = (config.block_q  * config.head_dim * 2) as usize;
-    let kv_bytes     = (config.block_kv * config.head_dim * 2) as usize;
-    let sp_bytes     = sp_bytes(config) as usize;
-    let wq_bytes     = wq_tile_bytes(config) as usize;
-    let wk_bytes     = wk_tile_bytes(config) as usize;
-    let wv_bytes     = wv_tile_bytes(config) as usize;
-    let wo_bytes     = wo_tile_bytes(config) as usize;
-    let xres_bytes   = x_residual_bytes(config) as usize;
-    let save_bytes   = softmax_save_bytes(config) as usize;
+    let q_bytes = (config.block_q * config.head_dim * 2) as usize;
+    let kv_bytes = (config.block_kv * config.head_dim * 2) as usize;
+    let sp_bytes = sp_bytes(config) as usize;
+    let wq_bytes = wq_tile_bytes(config) as usize;
+    let wk_bytes = wk_tile_bytes(config) as usize;
+    let wv_bytes = wv_tile_bytes(config) as usize;
+    let wo_bytes = wo_tile_bytes(config) as usize;
+    let xres_bytes = x_residual_bytes(config) as usize;
+    let save_bytes = softmax_save_bytes(config) as usize;
     SmemLayout {
         q_tile_bytes: q_bytes,
         kv_tile_bytes: kv_bytes,
@@ -638,8 +659,15 @@ pub fn compute_layout(config: &FlashAttentionConfig) -> SmemLayout {
         wv_tile_bytes: wv_bytes,
         wo_tile_bytes: wo_bytes,
         x_residual_bytes: xres_bytes,
-        total_bytes: q_bytes + kv_bytes + sp_bytes + wq_bytes + wk_bytes + wv_bytes
-            + wo_bytes + xres_bytes + save_bytes,
+        total_bytes: q_bytes
+            + kv_bytes
+            + sp_bytes
+            + wq_bytes
+            + wk_bytes
+            + wv_bytes
+            + wo_bytes
+            + xres_bytes
+            + save_bytes,
     }
 }
 
@@ -674,7 +702,8 @@ mod tests {
         // Config: block_q=32, block_kv=32, head_dim=32, d_model=32
         // SP(fused) = 8*4*32*4 = 4096 B; Wq=Wk=Wv=Wo=2048 B each; total ~ 16640 B.
         let mut cfg = base_cfg();
-        cfg.rope_q = true; cfg.causal = true;
+        cfg.rope_q = true;
+        cfg.causal = true;
         cfg.csha = Some(CshaExtras {
             fused_projections: true,
             fused_output_proj: true,
@@ -684,19 +713,28 @@ mod tests {
         let layout = compute_layout(&cfg);
         assert!(
             layout.total_bytes <= 48 * 1024,
-            "fused proj+output config exceeds 48 KB SMEM: {} bytes", layout.total_bytes
+            "fused proj+output config exceeds 48 KB SMEM: {} bytes",
+            layout.total_bytes
         );
     }
 
     // ── T2.1 Direction-parameterised validator tests ──────────────────────
 
     fn base_cfg_fused_forward(
-        block_q: i64, block_kv: i64, head_dim: i64, heads: u32, d_model: u32,
+        block_q: i64,
+        block_kv: i64,
+        head_dim: i64,
+        heads: u32,
+        d_model: u32,
     ) -> FlashAttentionConfig {
         let _ = heads;
         FlashAttentionConfig {
-            block_q, block_kv, head_dim,
-            causal: false, paged: false, rope_q: false,
+            block_q,
+            block_kv,
+            head_dim,
+            causal: false,
+            paged: false,
+            rope_q: false,
             rope_style: RopeStyle::HalfSplit,
             gqa_group_size: 1,
             tree_mask: false,
@@ -711,7 +749,11 @@ mod tests {
     }
 
     fn base_cfg_fused_backward(
-        block_q: i64, block_kv: i64, head_dim: i64, heads: u32, d_model: u32,
+        block_q: i64,
+        block_kv: i64,
+        head_dim: i64,
+        heads: u32,
+        d_model: u32,
     ) -> FlashAttentionConfig {
         let mut cfg = base_cfg_fused_forward(block_q, block_kv, head_dim, heads, d_model);
         cfg.csha = Some(CshaExtras {
@@ -738,9 +780,18 @@ mod tests {
         let err = validate_scalar_v2_config(&cfg, Direction::Backward)
             .expect_err("expected backward over-budget rejection");
         let msg = format!("{err}");
-        assert!(msg.contains("bytes >"), "err must include byte comparison: {msg}");
-        assert!(msg.contains("block_q=64"), "err must include block_q: {msg}");
-        assert!(msg.contains("head_dim=64"), "err must include head_dim: {msg}");
+        assert!(
+            msg.contains("bytes >"),
+            "err must include byte comparison: {msg}"
+        );
+        assert!(
+            msg.contains("block_q=64"),
+            "err must include block_q: {msg}"
+        );
+        assert!(
+            msg.contains("head_dim=64"),
+            "err must include head_dim: {msg}"
+        );
         assert!(msg.contains("Backward"), "err must name direction: {msg}");
     }
 
@@ -757,8 +808,10 @@ mod tests {
         // P = dS = dQ = dK = dV = 32*32*4 = 4096 each (20480); V_in = 32*32*2 = 2048.
         // x_norm = dx_norm = 32*32*4 = 4096 each (8192); rms_strip = 32*4 = 128.
         // Total = 22528 + 8192 + 128 = 30848.
-        assert_eq!(extra, 30848,
-            "backward_extra_bytes = P+dS+dQ+dK+dV+V_in+x_norm+dx_norm+rms_strip");
+        assert_eq!(
+            extra, 30848,
+            "backward_extra_bytes = P+dS+dQ+dK+dV+V_in+x_norm+dx_norm+rms_strip"
+        );
     }
 
     #[test]
@@ -771,7 +824,11 @@ mod tests {
     #[test]
     fn a3_smem_includes_wq_wk_wv_tiles() {
         let mut cfg = base_cfg();
-        cfg.csha = Some(CshaExtras { fused_projections: true, d_model: 128, ..CshaExtras::default() });
+        cfg.csha = Some(CshaExtras {
+            fused_projections: true,
+            d_model: 128,
+            ..CshaExtras::default()
+        });
         let layout = compute_layout(&cfg);
         assert!(layout.wq_tile_bytes > 0, "wq tile missing");
         assert!(layout.wk_tile_bytes > 0, "wk tile missing");
@@ -792,8 +849,7 @@ mod tests {
         // (99 KB - 32 KB, 99 KB] window — passes without seg, fails with.
         let mut cfg = base_cfg_fused_backward(64, 64, 64, 8, 64);
         cfg.segment_masked = false;
-        let unmasked_total =
-            total_bytes(&cfg) + backward_extra_bytes(&cfg);
+        let unmasked_total = total_bytes(&cfg) + backward_extra_bytes(&cfg);
         // Only run the assertion when the fixture actually lands in the
         // sensitive window — otherwise the property we're testing isn't
         // exercised (the test still passes either way, but the assertion
@@ -812,9 +868,8 @@ mod tests {
             let msg = format!("{err}");
             assert!(
                 msg.contains("seg=")
-                    && msg.contains(
-                        &(crate::pca_segment::DEFAULT_SMEM_SEGMENT_BUDGET).to_string(),
-                    ),
+                    && msg
+                        .contains(&(crate::pca_segment::DEFAULT_SMEM_SEGMENT_BUDGET).to_string(),),
                 "rejection diagnostic must surface seg_overhead value: {msg}"
             );
         }
@@ -840,8 +895,12 @@ mod tests {
     /// dimensions.  `csha.level = 2` (Pipeline) so eligibility checks pass.
     fn tier_b1_cfg(block_q: i64, block_kv: i64, head_dim: i64) -> FlashAttentionConfig {
         FlashAttentionConfig {
-            block_q, block_kv, head_dim,
-            causal: true, paged: false, rope_q: true,
+            block_q,
+            block_kv,
+            head_dim,
+            causal: true,
+            paged: false,
+            rope_q: true,
             rope_style: RopeStyle::HalfSplit,
             gqa_group_size: 1,
             tree_mask: false,
@@ -858,20 +917,34 @@ mod tests {
     fn tier_b1_offsets_are_monotone() {
         // Canonical Tier B.1 config (bq=64, bkv=64, hd=128) per spec §3.3.
         let config = tier_b1_cfg(64, 64, 128);
-        assert!(tier_b1_q_offset(&config) < tier_b1_k_offset_ping(&config),
-            "q_offset must precede k_offset_ping");
-        assert!(tier_b1_k_offset_ping(&config) < tier_b1_k_offset_pong(&config),
-            "k_offset_ping must precede k_offset_pong");
-        assert!(tier_b1_k_offset_pong(&config) < tier_b1_v_offset_ping(&config),
-            "k_offset_pong must precede v_offset_ping");
-        assert!(tier_b1_v_offset_ping(&config) < tier_b1_v_offset_pong(&config),
-            "v_offset_ping must precede v_offset_pong");
-        assert!(tier_b1_v_offset_pong(&config) < tier_b1_p_offset(&config),
-            "v_offset_pong must precede p_offset");
-        assert!(tier_b1_p_offset(&config) < tier_b1_softmax_scratch_offset(&config),
-            "p_offset must precede softmax_scratch_offset");
-        assert!(tier_b1_softmax_scratch_offset(&config) < tier_b1_w_chunk_offset(&config),
-            "softmax_scratch_offset must precede w_chunk_offset");
+        assert!(
+            tier_b1_q_offset(&config) < tier_b1_k_offset_ping(&config),
+            "q_offset must precede k_offset_ping"
+        );
+        assert!(
+            tier_b1_k_offset_ping(&config) < tier_b1_k_offset_pong(&config),
+            "k_offset_ping must precede k_offset_pong"
+        );
+        assert!(
+            tier_b1_k_offset_pong(&config) < tier_b1_v_offset_ping(&config),
+            "k_offset_pong must precede v_offset_ping"
+        );
+        assert!(
+            tier_b1_v_offset_ping(&config) < tier_b1_v_offset_pong(&config),
+            "v_offset_ping must precede v_offset_pong"
+        );
+        assert!(
+            tier_b1_v_offset_pong(&config) < tier_b1_p_offset(&config),
+            "v_offset_pong must precede p_offset"
+        );
+        assert!(
+            tier_b1_p_offset(&config) < tier_b1_softmax_scratch_offset(&config),
+            "p_offset must precede softmax_scratch_offset"
+        );
+        assert!(
+            tier_b1_softmax_scratch_offset(&config) < tier_b1_w_chunk_offset(&config),
+            "softmax_scratch_offset must precede w_chunk_offset"
+        );
         // P scratch is block_q × block_kv f16.
         assert_eq!(
             tier_b1_softmax_scratch_offset(&config) - tier_b1_p_offset(&config),
@@ -895,8 +968,11 @@ mod tests {
         // shows this tuple as rejected.
         let config = tier_b1_cfg(64, 64, 128);
         let err = validate_tier_b1_config(&config, 64);
-        assert!(err.is_err(),
-            "canonical (64,64,128) at chunk=64 must exceed 99 KB; got {:?}", err);
+        assert!(
+            err.is_err(),
+            "canonical (64,64,128) at chunk=64 must exceed 99 KB; got {:?}",
+            err
+        );
     }
 
     #[test]
@@ -904,8 +980,15 @@ mod tests {
         // V3 CSV admits bq=bkv=32, hd=64 at chunk=64.
         let config = tier_b1_cfg(32, 32, 64);
         let result = validate_tier_b1_config(&config, 64);
-        assert!(result.is_ok(),
-            "small (32,32,64) at chunk=64 must fit 99 KB; got {:?}", result);
-        assert_eq!(result.unwrap(), 64, "validator must return selected chunk on success");
+        assert!(
+            result.is_ok(),
+            "small (32,32,64) at chunk=64 must fit 99 KB; got {:?}",
+            result
+        );
+        assert_eq!(
+            result.unwrap(),
+            64,
+            "validator must return selected chunk on success"
+        );
     }
 }

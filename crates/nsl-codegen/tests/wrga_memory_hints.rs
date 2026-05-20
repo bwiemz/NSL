@@ -96,7 +96,8 @@ fn wrga_memory_hints_reduce_or_maintain_slot_count() {
         assert!(
             post <= pre,
             "post-hint slot count {} must be ≤ pre-hint {}",
-            post, pre,
+            post,
+            pre,
         );
     }
 

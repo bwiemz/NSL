@@ -27,29 +27,33 @@ use std::ffi::CString;
 
 use nsl_codegen::flash_attention::{CshaExtras, FlashAttentionConfig, RopeStyle};
 use nsl_codegen::flash_attention_v2::{
-    flash_attention_kernel_name_v2, synthesize_backward,
-    synthesize_flash_attention_ptx_v2,
+    flash_attention_kernel_name_v2,
     smem_layout::{self, needs_dynamic_smem, Direction},
+    synthesize_backward, synthesize_flash_attention_ptx_v2,
 };
 
-use nsl_runtime::{
-    nsl_cuda_init, nsl_test_cuda_alloc, nsl_test_cuda_d2h,
-    nsl_test_cuda_free, nsl_test_cuda_h2d, nsl_test_cuda_jit_log,
-};
 use nsl_runtime::flash_attention::{
     nsl_csha_alloc_backward_activations, nsl_csha_free_backward_activations,
     nsl_flash_attention_csha_backward, nsl_flash_attention_csha_with_saves,
+};
+use nsl_runtime::{
+    nsl_cuda_init, nsl_test_cuda_alloc, nsl_test_cuda_d2h, nsl_test_cuda_free, nsl_test_cuda_h2d,
+    nsl_test_cuda_jit_log,
 };
 
 // ── Float helpers (clone of csha_cuda_backward.rs helpers) ─────────────────
 
 fn f32_to_f16_bits(x: f32) -> u16 {
-    if x.is_nan() { return 0x7E00; }
+    if x.is_nan() {
+        return 0x7E00;
+    }
     let b = x.to_bits();
     let sign = (b >> 31) & 1;
     let exp = ((b >> 23) & 0xFF) as i32;
     let mant = b & 0x7FFFFF;
-    if exp == 255 { return ((sign << 15) | 0x7C00 | if mant != 0 { 0x200 } else { 0 }) as u16; }
+    if exp == 255 {
+        return ((sign << 15) | 0x7C00 | if mant != 0 { 0x200 } else { 0 }) as u16;
+    }
     let exp_f16 = exp - 127 + 15;
     if exp_f16 <= 0 {
         let shift = (1 - exp_f16).min(24) as u32;
@@ -57,7 +61,9 @@ fn f32_to_f16_bits(x: f32) -> u16 {
         let rounded = (shifted + 0x1000) >> 13;
         return ((sign << 15) | rounded) as u16;
     }
-    if exp_f16 >= 31 { return ((sign << 15) | 0x7C00) as u16; }
+    if exp_f16 >= 31 {
+        return ((sign << 15) | 0x7C00) as u16;
+    }
     let mant16 = (mant + 0x1000) >> 13;
     let overflow = (mant16 >> 10) & 1;
     let exp16 = (exp_f16 as u32 + overflow) & 0x1F;
@@ -66,19 +72,27 @@ fn f32_to_f16_bits(x: f32) -> u16 {
 
 fn det_seq(seed: u32, n: usize) -> Vec<f32> {
     let mut s = seed;
-    (0..n).map(|_| {
-        s = s.wrapping_mul(1_103_515_245).wrapping_add(12_345);
-        ((s >> 16) as f32 / 65535.0) - 0.5
-    }).collect()
+    (0..n)
+        .map(|_| {
+            s = s.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            ((s >> 16) as f32 / 65535.0) - 0.5
+        })
+        .collect()
 }
 
 fn cuda_available() -> bool {
-    if std::env::var("NSL_SKIP_CUDA_TESTS").is_ok() { return false; }
+    if std::env::var("NSL_SKIP_CUDA_TESTS").is_ok() {
+        return false;
+    }
     nsl_cuda_init() == 0
 }
 
 fn free_all(ptrs: &[i64]) {
-    for &p in ptrs { if p != 0 { nsl_test_cuda_free(p); } }
+    for &p in ptrs {
+        if p != 0 {
+            nsl_test_cuda_free(p);
+        }
+    }
 }
 
 fn backward_kernel_name(cfg: &FlashAttentionConfig) -> String {
@@ -147,8 +161,7 @@ fn dx_norm_hbm_buffer_is_populated() {
     // `wq/wk/wv = ones([32,32])`, `w_norm = ones([32])`. Any
     // deterministic-random alternative would obscure whether the bug is
     // shape-dependent or value-dependent.
-    let diag_input = std::env::var("NSL_DX_NORM_DIAG_INPUT")
-        .unwrap_or_else(|_| "ones".into());
+    let diag_input = std::env::var("NSL_DX_NORM_DIAG_INPUT").unwrap_or_else(|_| "ones".into());
     let (x, wq_f32, wk_f32, wv_f32): (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) =
         if diag_input == "random" {
             (
@@ -217,15 +230,11 @@ fn dx_norm_hbm_buffer_is_populated() {
     // SAFETY: alloc_backward_activations is marked unsafe because it
     // returns raw device pointers; we own them for the rest of the test.
     let saves = unsafe {
-        nsl_csha_alloc_backward_activations(
-            batch as i64, h as i64, seq as i64, hd as i64,
-        )
+        nsl_csha_alloc_backward_activations(batch as i64, h as i64, seq as i64, hd as i64)
     };
     let all_dev = [
-        q_dev, k_dev, v_dev, out_dev, lse_dev, x_dev, nw_dev,
-        wq_dev, wk_dev, wv_dev, cos_dev, sin_dev,
-        do_dev, dq_dev, dk_dev, dv_dev, dwq_dev, dwk_dev, dwv_dev, dx_dev,
-        dxn_dev,
+        q_dev, k_dev, v_dev, out_dev, lse_dev, x_dev, nw_dev, wq_dev, wk_dev, wv_dev, cos_dev,
+        sin_dev, do_dev, dq_dev, dk_dev, dv_dev, dwq_dev, dwk_dev, dwv_dev, dx_dev, dxn_dev,
     ];
 
     nsl_test_cuda_h2d(x_dev, x.as_ptr() as i64, x_bytes);
@@ -241,54 +250,111 @@ fn dx_norm_hbm_buffer_is_populated() {
     let fwd_ptx = synthesize_flash_attention_ptx_v2(&config);
     let fwd_name = CString::new(flash_attention_kernel_name_v2(&config)).unwrap();
     let fwd_smem_total = smem_layout::total_bytes(&config);
-    let fwd_smem_dyn = if needs_dynamic_smem(&config) { fwd_smem_total as i64 } else { 0 };
+    let fwd_smem_dyn = if needs_dynamic_smem(&config) {
+        fwd_smem_total as i64
+    } else {
+        0
+    };
 
     let rc_fwd = nsl_flash_attention_csha_with_saves(
-        q_dev, k_dev, v_dev, out_dev, lse_dev,
+        q_dev,
+        k_dev,
+        v_dev,
+        out_dev,
+        lse_dev,
         scale.to_bits() as i64,
-        batch as i64, h as i64, seq as i64, hd as i64,
-        0, 0, 0, 0,
-        cos_dev, sin_dev,
-        0, 0,
+        batch as i64,
+        h as i64,
+        seq as i64,
+        hd as i64,
+        0,
+        0,
+        0,
+        0,
+        cos_dev,
+        sin_dev,
+        0,
+        0,
         fwd_smem_dyn,
-        fwd_ptx.as_ptr() as i64, fwd_name.as_ptr() as i64,
-        block_q as i64, block_kv as i64,
+        fwd_ptx.as_ptr() as i64,
+        fwd_name.as_ptr() as i64,
+        block_q as i64,
+        block_kv as i64,
         if causal { 1 } else { 0 },
-        x_dev, nw_dev, wq_dev, wk_dev, wv_dev,
-        0, norm_eps.to_bits() as i64,
-        h as i64, dm as i64,
-        saves.q_proj, saves.k_proj, saves.v_proj,
-        saves.row_max, saves.row_sum,
+        x_dev,
+        nw_dev,
+        wq_dev,
+        wk_dev,
+        wv_dev,
+        0,
+        norm_eps.to_bits() as i64,
+        h as i64,
+        dm as i64,
+        saves.q_proj,
+        saves.k_proj,
+        saves.v_proj,
+        saves.row_max,
+        saves.row_sum,
         saves.x_raw,
     );
     assert_eq!(rc_fwd, 0, "forward-with-saves rc={rc_fwd}");
 
     // ── Backward ────────────────────────────────────────────────────────
-    let mut bwd_ptx_str = synthesize_backward(&config)
-        .expect("synth backward should succeed");
-    if !bwd_ptx_str.ends_with('\0') { bwd_ptx_str.push('\0'); }
+    let mut bwd_ptx_str = synthesize_backward(&config).expect("synth backward should succeed");
+    if !bwd_ptx_str.ends_with('\0') {
+        bwd_ptx_str.push('\0');
+    }
     let bwd_ptx = bwd_ptx_str.into_bytes();
     let bwd_name = CString::new(backward_kernel_name(&config)).unwrap();
 
     let rc_bwd = nsl_flash_attention_csha_backward(
-        q_dev, k_dev, v_dev, out_dev, lse_dev,
+        q_dev,
+        k_dev,
+        v_dev,
+        out_dev,
+        lse_dev,
         scale.to_bits() as i64,
-        batch as i64, h as i64, seq as i64, hd as i64,
-        0, 0, 0, 0,
-        cos_dev, sin_dev,
-        0, 0,
+        batch as i64,
+        h as i64,
+        seq as i64,
+        hd as i64,
         0,
-        bwd_ptx.as_ptr() as i64, bwd_name.as_ptr() as i64,
-        block_q as i64, block_kv as i64,
+        0,
+        0,
+        0,
+        cos_dev,
+        sin_dev,
+        0,
+        0,
+        0,
+        bwd_ptx.as_ptr() as i64,
+        bwd_name.as_ptr() as i64,
+        block_q as i64,
+        block_kv as i64,
         if causal { 1 } else { 0 },
-        x_dev, nw_dev, wq_dev, wk_dev, wv_dev,
-        0, norm_eps.to_bits() as i64,
-        h as i64, dm as i64,
-        saves.q_proj, saves.k_proj, saves.v_proj,
-        saves.row_max, saves.row_sum,
+        x_dev,
+        nw_dev,
+        wq_dev,
+        wk_dev,
+        wv_dev,
+        0,
+        norm_eps.to_bits() as i64,
+        h as i64,
+        dm as i64,
+        saves.q_proj,
+        saves.k_proj,
+        saves.v_proj,
+        saves.row_max,
+        saves.row_sum,
         saves.x_raw,
-        do_dev, dq_dev, dk_dev, dv_dev,
-        dwq_dev, dwk_dev, dwv_dev, dx_dev,
+        do_dev,
+        dq_dev,
+        dk_dev,
+        dv_dev,
+        dwq_dev,
+        dwk_dev,
+        dwv_dev,
+        dx_dev,
         dxn_dev,
     );
     if rc_bwd != 0 {
@@ -302,7 +368,9 @@ fn dx_norm_hbm_buffer_is_populated() {
                 "<no log>".into()
             }
         };
-        unsafe { nsl_csha_free_backward_activations(saves); }
+        unsafe {
+            nsl_csha_free_backward_activations(saves);
+        }
         free_all(&all_dev);
         panic!("backward rc={rc_bwd}\nJIT log:\n{log}");
     }
@@ -317,10 +385,7 @@ fn dx_norm_hbm_buffer_is_populated() {
 
     // ── Inspection ──────────────────────────────────────────────────────
     let sum: f64 = dxn_host.iter().map(|&v| v as f64).sum();
-    let max_abs: f32 = dxn_host
-        .iter()
-        .map(|&v| v.abs())
-        .fold(0f32, f32::max);
+    let max_abs: f32 = dxn_host.iter().map(|&v| v.abs()).fold(0f32, f32::max);
     let nonzero_count = dxn_host.iter().filter(|&&v| v != 0.0).count();
     let first8: Vec<f32> = dxn_host.iter().take(8).copied().collect();
 
@@ -344,7 +409,9 @@ fn dx_norm_hbm_buffer_is_populated() {
         eprintln!("[dx_norm diag] non-zero positions: {locs:?}");
     }
 
-    unsafe { nsl_csha_free_backward_activations(saves); }
+    unsafe {
+        nsl_csha_free_backward_activations(saves);
+    }
     free_all(&all_dev);
 
     // ── Assertions ──────────────────────────────────────────────────────

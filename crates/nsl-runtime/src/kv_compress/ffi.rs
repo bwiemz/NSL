@@ -3,10 +3,10 @@
 
 use std::sync::Mutex;
 
-use super::KvQuantScheme;
+use super::h2o::H2OManager;
 use super::quantize::{self, KvBlockQuantMeta};
 use super::sliding_window::SlidingWindowManager;
-use super::h2o::H2OManager;
+use super::KvQuantScheme;
 
 // ---------------------------------------------------------------------------
 // Quantization FFI
@@ -63,16 +63,44 @@ pub extern "C" fn nsl_kv_quantize_and_store(
             let v_out = unsafe { std::slice::from_raw_parts_mut(block_v as *mut i8, n) };
             let k_meta = unsafe { &mut *(meta_k as *mut KvBlockQuantMeta) };
             let v_meta = unsafe { &mut *(meta_v as *mut KvBlockQuantMeta) };
-            quantize::quantize_int8_per_head(k_values, k_out, k_meta, num_heads as usize, num_tokens as usize, head_dim as usize);
-            quantize::quantize_int8_per_head(v_values, v_out, v_meta, num_heads as usize, num_tokens as usize, head_dim as usize);
+            quantize::quantize_int8_per_head(
+                k_values,
+                k_out,
+                k_meta,
+                num_heads as usize,
+                num_tokens as usize,
+                head_dim as usize,
+            );
+            quantize::quantize_int8_per_head(
+                v_values,
+                v_out,
+                v_meta,
+                num_heads as usize,
+                num_tokens as usize,
+                head_dim as usize,
+            );
         }
         KvQuantScheme::Int8PerToken => {
             let k_out = unsafe { std::slice::from_raw_parts_mut(block_k as *mut i8, n) };
             let v_out = unsafe { std::slice::from_raw_parts_mut(block_v as *mut i8, n) };
             let k_meta = unsafe { &mut *(meta_k as *mut KvBlockQuantMeta) };
             let v_meta = unsafe { &mut *(meta_v as *mut KvBlockQuantMeta) };
-            quantize::quantize_int8_per_token(k_values, k_out, k_meta, num_heads as usize, num_tokens as usize, head_dim as usize);
-            quantize::quantize_int8_per_token(v_values, v_out, v_meta, num_heads as usize, num_tokens as usize, head_dim as usize);
+            quantize::quantize_int8_per_token(
+                k_values,
+                k_out,
+                k_meta,
+                num_heads as usize,
+                num_tokens as usize,
+                head_dim as usize,
+            );
+            quantize::quantize_int8_per_token(
+                v_values,
+                v_out,
+                v_meta,
+                num_heads as usize,
+                num_tokens as usize,
+                head_dim as usize,
+            );
         }
         KvQuantScheme::Int4PerGroup => {
             let packed_len = n.div_ceil(2);
@@ -141,7 +169,9 @@ pub extern "C" fn nsl_kv_dequantize_gpu(
                 crate::cuda::inner::memcpy_dtod(out, data, n_val as usize * 4);
             }
             KvQuantScheme::Int8PerHead => {
-                if meta_ptr == 0 { return -1; }
+                if meta_ptr == 0 {
+                    return -1;
+                }
                 let meta = unsafe { &*(meta_ptr as *const KvBlockQuantMeta) };
                 // Upload scales to GPU
                 let scales_bytes = meta.num_scales as usize * 4;
@@ -152,13 +182,21 @@ pub extern "C" fn nsl_kv_dequantize_gpu(
                     scales_bytes,
                 );
                 crate::cuda::gpu_dequant_int8_per_head_f32(
-                    data, out, gpu_scales as *const c_void, n_val, head_stride,
+                    data,
+                    out,
+                    gpu_scales as *const c_void,
+                    n_val,
+                    head_stride,
                 );
-                unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+                unsafe {
+                    cudarc::driver::sys::cuCtxSynchronize();
+                }
                 crate::cuda::inner::free_managed(gpu_scales);
             }
             KvQuantScheme::Int8PerToken => {
-                if meta_ptr == 0 { return -1; }
+                if meta_ptr == 0 {
+                    return -1;
+                }
                 let meta = unsafe { &*(meta_ptr as *const KvBlockQuantMeta) };
                 let scales_bytes = meta.num_scales as usize * 4;
                 let gpu_scales = crate::cuda::inner::alloc_managed(scales_bytes);
@@ -168,13 +206,22 @@ pub extern "C" fn nsl_kv_dequantize_gpu(
                     scales_bytes,
                 );
                 crate::cuda::gpu_dequant_int8_per_token_f32(
-                    data, out, gpu_scales as *const c_void, n_val, head_stride, head_dim as u64,
+                    data,
+                    out,
+                    gpu_scales as *const c_void,
+                    n_val,
+                    head_stride,
+                    head_dim as u64,
                 );
-                unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+                unsafe {
+                    cudarc::driver::sys::cuCtxSynchronize();
+                }
                 crate::cuda::inner::free_managed(gpu_scales);
             }
             KvQuantScheme::Int4PerGroup => {
-                if meta_ptr == 0 { return -1; }
+                if meta_ptr == 0 {
+                    return -1;
+                }
                 let meta = unsafe { &*(meta_ptr as *const KvBlockQuantMeta) };
                 let num_groups = meta.num_scales as usize;
                 let bytes = num_groups * 4;
@@ -191,19 +238,24 @@ pub extern "C" fn nsl_kv_dequantize_gpu(
                     bytes,
                 );
                 crate::cuda::gpu_dequant_int4_per_group_f32(
-                    data, out,
+                    data,
+                    out,
                     gpu_scales as *const c_void,
                     gpu_zp as *const c_void,
                     n_val,
                     quantize::INT4_GROUP_SIZE as u64,
                 );
-                unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+                unsafe {
+                    cudarc::driver::sys::cuCtxSynchronize();
+                }
                 crate::cuda::inner::free_managed(gpu_scales);
                 crate::cuda::inner::free_managed(gpu_zp);
             }
             KvQuantScheme::Fp8 => {
                 crate::cuda::gpu_dequant_fp8_e4m3_f32(data, out, n_val);
-                unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+                unsafe {
+                    cudarc::driver::sys::cuCtxSynchronize();
+                }
             }
         }
         0
@@ -211,7 +263,9 @@ pub extern "C" fn nsl_kv_dequantize_gpu(
 
     #[cfg(not(feature = "cuda"))]
     {
-        let _ = (data_ptr, out_ptr, meta_ptr, n, num_heads, block_size, head_dim, qs);
+        let _ = (
+            data_ptr, out_ptr, meta_ptr, n, num_heads, block_size, head_dim, qs,
+        );
         eprintln!("[nsl] nsl_kv_dequantize_gpu requires CUDA");
         -1
     }
@@ -226,11 +280,7 @@ static SW_CTX: Mutex<Option<SlidingWindowManager>> = Mutex::new(None);
 /// Initialize sliding window manager.
 /// Returns 0 on success, -1 if already initialized.
 #[no_mangle]
-pub extern "C" fn nsl_kv_sliding_window_init(
-    window: i64,
-    sinks: i64,
-    block_size: i64,
-) -> i64 {
+pub extern "C" fn nsl_kv_sliding_window_init(window: i64, sinks: i64, block_size: i64) -> i64 {
     let mut guard = SW_CTX.lock().unwrap();
     if guard.is_some() {
         return -1;
@@ -253,7 +303,9 @@ pub extern "C" fn nsl_kv_sliding_window_check(
     max_evict: i64,
 ) -> i64 {
     let guard = SW_CTX.lock().unwrap();
-    let mgr = guard.as_ref().expect("nsl_kv_sliding_window_init not called");
+    let mgr = guard
+        .as_ref()
+        .expect("nsl_kv_sliding_window_init not called");
 
     let evicted = mgr.check_eviction(current_len as usize);
     let count = evicted.len().min(max_evict as usize);
@@ -301,11 +353,7 @@ pub extern "C" fn nsl_kv_h2o_init(budget: i64, sinks: i64, block_size: i64) -> i
 /// scores_ptr: *const f32, [seq_len] averaged scores from latest decode step.
 /// Returns 0 on success.
 #[no_mangle]
-pub extern "C" fn nsl_kv_h2o_accumulate(
-    seq_id: i64,
-    scores_ptr: i64,
-    seq_len: i64,
-) -> i64 {
+pub extern "C" fn nsl_kv_h2o_accumulate(seq_id: i64, scores_ptr: i64, seq_len: i64) -> i64 {
     let mut guard = H2O_CTX.lock().unwrap();
     let mgr = guard.as_mut().expect("nsl_kv_h2o_init not called");
 
@@ -392,10 +440,16 @@ mod tests {
         let mut v_out = vec![0.0f32; 4];
 
         let rc = nsl_kv_quantize_and_store(
-            k.as_ptr() as i64, v.as_ptr() as i64,
-            k_out.as_mut_ptr() as i64, v_out.as_mut_ptr() as i64,
-            0, 0, // no metadata for None
-            0, 1, 1, 4, // offset=0, tokens=1, heads=1, dim=4
+            k.as_ptr() as i64,
+            v.as_ptr() as i64,
+            k_out.as_mut_ptr() as i64,
+            v_out.as_mut_ptr() as i64,
+            0,
+            0, // no metadata for None
+            0,
+            1,
+            1,
+            4, // offset=0, tokens=1, heads=1, dim=4
             0, // scheme=None
         );
         assert_eq!(rc, 0);
@@ -414,10 +468,16 @@ mod tests {
         let mut v_meta = KvBlockQuantMeta::default();
 
         let rc = nsl_kv_quantize_and_store(
-            k.as_ptr() as i64, v.as_ptr() as i64,
-            k_out.as_mut_ptr() as i64, v_out.as_mut_ptr() as i64,
-            &mut k_meta as *mut _ as i64, &mut v_meta as *mut _ as i64,
-            0, 1, 2, 4, // offset=0, tokens=1, heads=2, dim=4
+            k.as_ptr() as i64,
+            v.as_ptr() as i64,
+            k_out.as_mut_ptr() as i64,
+            v_out.as_mut_ptr() as i64,
+            &mut k_meta as *mut _ as i64,
+            &mut v_meta as *mut _ as i64,
+            0,
+            1,
+            2,
+            4, // offset=0, tokens=1, heads=2, dim=4
             1, // scheme=Int8PerHead
         );
         assert_eq!(rc, 0);

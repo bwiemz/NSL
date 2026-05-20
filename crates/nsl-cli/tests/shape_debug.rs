@@ -20,9 +20,18 @@ fn trace_emits_one_line_per_typed_let() {
     let input = ShapeDebugInput::from_source(SRC, "model.nsl").unwrap();
     let out = format_trace(&input);
     eprintln!("{out}");
-    assert!(out.contains("layernorm(x)"), "output missing 'layernorm(x)':\n{out}");
-    assert!(out.contains("[8, 2048, 512]"), "output missing '[8, 2048, 512]':\n{out}");
-    assert!(out.contains("matmul(h, W)"), "output missing 'matmul(h, W)':\n{out}");
+    assert!(
+        out.contains("layernorm(x)"),
+        "output missing 'layernorm(x)':\n{out}"
+    );
+    assert!(
+        out.contains("[8, 2048, 512]"),
+        "output missing '[8, 2048, 512]':\n{out}"
+    );
+    assert!(
+        out.contains("matmul(h, W)"),
+        "output missing 'matmul(h, W)':\n{out}"
+    );
     assert!(
         out.lines().filter(|l| l.contains("\u{2705}")).count() >= 2,
         "expected >=2 check marks:\n{out}"
@@ -52,6 +61,9 @@ fn forward(x: Tensor<[8, 2048, 512], bf16>) -> Tensor<[8, 2048, 384], bf16>:
     let out = format_trace(&input);
     eprintln!("{out}");
     assert!(out.contains("\u{274C}"), "expected red X in:\n{out}");
-    assert!(out.contains("Expected"), "expected 'Expected' block in:\n{out}");
+    assert!(
+        out.contains("Expected"),
+        "expected 'Expected' block in:\n{out}"
+    );
     assert!(out.contains("Cause"), "expected 'Cause' block in:\n{out}");
 }

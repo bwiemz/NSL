@@ -125,9 +125,9 @@ fn wrga_report_without_source_ad_errors_when_decorators_present() {
         .arg("build")
         .arg(&src_path)
         .arg("--wrga-report"); // no --source-ad
-    cmd.assert()
-        .failure()
-        .stderr(predicate::str::contains("--wrga-report requires --source-ad"));
+    cmd.assert().failure().stderr(predicate::str::contains(
+        "--wrga-report requires --source-ad",
+    ));
 }
 
 /// Task 4 (B.2): `--wrga-report` must emit the report header on the `--zk-circuit`
@@ -140,8 +140,11 @@ fn wrga_report_works_on_zk_build_path() {
 
     let mut cmd = Command::cargo_bin("nsl").unwrap();
     cmd.env("NSL_STDLIB_PATH", stdlib_path())
-        .arg("build").arg(&src_path)
-        .arg("--zk-circuit").arg("--source-ad").arg("--wrga-report");
+        .arg("build")
+        .arg(&src_path)
+        .arg("--zk-circuit")
+        .arg("--source-ad")
+        .arg("--wrga-report");
     cmd.assert()
         .stdout(predicate::str::contains("=== WRGA Compilation Report ==="));
 }
@@ -174,10 +177,13 @@ fn wrga_report_works_on_standalone_build_path() {
 
     let mut cmd = Command::cargo_bin("nsl").unwrap();
     cmd.env("NSL_STDLIB_PATH", stdlib_path())
-        .arg("build").arg(&src_path)
+        .arg("build")
+        .arg(&src_path)
         .arg("--standalone")
-        .arg("-w").arg(&w_path)
-        .arg("--source-ad").arg("--wrga-report");
+        .arg("-w")
+        .arg(&w_path)
+        .arg("--source-ad")
+        .arg("--wrga-report");
     cmd.assert()
         .stdout(predicate::str::contains("=== WRGA Compilation Report ==="));
 }

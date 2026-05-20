@@ -53,7 +53,12 @@ impl DraftModelRunner {
         temperature: f32,
         vocab_size: usize,
     ) -> Self {
-        Self { forward_fn, num_tokens, temperature, vocab_size }
+        Self {
+            forward_fn,
+            num_tokens,
+            temperature,
+            vocab_size,
+        }
     }
 
     /// Run the draft model autoregressively for up to K steps.
@@ -62,7 +67,12 @@ impl DraftModelRunner {
     /// candidate tokens by running forward_fn in a loop.
     ///
     /// Returns a DraftSequence with token IDs and logits tensors.
-    pub fn run_draft(&self, last_token: i64, kv_cache_handle: i64, start_pos: i64) -> DraftSequence {
+    pub fn run_draft(
+        &self,
+        last_token: i64,
+        kv_cache_handle: i64,
+        start_pos: i64,
+    ) -> DraftSequence {
         let k = self.num_tokens;
         let vocab = self.vocab_size;
 
@@ -93,12 +103,16 @@ impl DraftModelRunner {
 
             // Copy logits to our buffer
             if logits_tensor.dtype == 0 {
-                let src = unsafe { std::slice::from_raw_parts(logits_tensor.data as *const f64, actual_vocab) };
+                let src = unsafe {
+                    std::slice::from_raw_parts(logits_tensor.data as *const f64, actual_vocab)
+                };
                 for (i, &v) in src.iter().enumerate() {
                     unsafe { *logits_data.add(step * vocab + i) = v };
                 }
             } else {
-                let src = unsafe { std::slice::from_raw_parts(logits_tensor.data as *const f32, actual_vocab) };
+                let src = unsafe {
+                    std::slice::from_raw_parts(logits_tensor.data as *const f32, actual_vocab)
+                };
                 for (i, &v) in src.iter().enumerate() {
                     unsafe { *logits_data.add(step * vocab + i) = v as f64 };
                 }
@@ -135,14 +149,20 @@ impl DraftModelRunner {
             // Free oversized originals
             unsafe {
                 crate::memory::checked_free(tokens_data as *mut u8, k * std::mem::size_of::<f64>());
-                crate::memory::checked_free(logits_data as *mut u8, k * vocab * std::mem::size_of::<f64>());
+                crate::memory::checked_free(
+                    logits_data as *mut u8,
+                    k * vocab * std::mem::size_of::<f64>(),
+                );
             }
             (t, l)
         } else if num_drafted == 0 {
             // Nothing drafted — free originals, use 1-element placeholders
             unsafe {
                 crate::memory::checked_free(tokens_data as *mut u8, k * std::mem::size_of::<f64>());
-                crate::memory::checked_free(logits_data as *mut u8, k * vocab * std::mem::size_of::<f64>());
+                crate::memory::checked_free(
+                    logits_data as *mut u8,
+                    k * vocab * std::mem::size_of::<f64>(),
+                );
             }
             let t = checked_alloc(std::mem::size_of::<f64>()) as *mut f64;
             let l = checked_alloc(std::mem::size_of::<f64>()) as *mut f64;
@@ -182,17 +202,23 @@ impl DraftModelRunner {
         let mut max_val = f64::NEG_INFINITY;
         for i in 0..vocab {
             let v = unsafe { *logits_data.add(step * vocab + i) };
-            if v > max_val { max_val = v; }
+            if v > max_val {
+                max_val = v;
+            }
         }
 
         // Compute softmax with temperature
-        let mut probs: Vec<f64> = (0..vocab).map(|i| {
-            let v = unsafe { *logits_data.add(step * vocab + i) };
-            ((v - max_val) / temp).exp()
-        }).collect();
+        let mut probs: Vec<f64> = (0..vocab)
+            .map(|i| {
+                let v = unsafe { *logits_data.add(step * vocab + i) };
+                ((v - max_val) / temp).exp()
+            })
+            .collect();
         let sum: f64 = probs.iter().sum();
         if sum > 0.0 {
-            for p in &mut probs { *p /= sum; }
+            for p in &mut probs {
+                *p /= sum;
+            }
         } else {
             probs.fill(1.0 / vocab as f64);
         }
@@ -203,7 +229,9 @@ impl DraftModelRunner {
         let mut cum = 0.0;
         for (i, &p) in probs.iter().enumerate() {
             cum += p;
-            if r < cum { return i as i64; }
+            if r < cum {
+                return i as i64;
+            }
         }
         (vocab - 1) as i64
     }
@@ -254,9 +282,15 @@ impl DraftModelRunner {
     /// Create a 2D tensor [rows, cols] from an existing data pointer.
     fn make_2d_tensor(data: *mut f64, rows: usize, cols: usize) -> Box<NslTensor> {
         let shape = checked_alloc(2 * std::mem::size_of::<i64>()) as *mut i64;
-        unsafe { *shape = rows as i64; *shape.add(1) = cols as i64 };
+        unsafe {
+            *shape = rows as i64;
+            *shape.add(1) = cols as i64
+        };
         let strides = checked_alloc(2 * std::mem::size_of::<i64>()) as *mut i64;
-        unsafe { *strides = cols as i64; *strides.add(1) = 1 };
+        unsafe {
+            *strides = cols as i64;
+            *strides.add(1) = 1
+        };
         Box::new(NslTensor::new(
             data as *mut c_void,
             shape,
@@ -306,7 +340,12 @@ impl MedusaDraftRunner {
         tree_width: usize,
         vocab_size: usize,
     ) -> Self {
-        Self { forward_fn, num_heads, tree_width, vocab_size }
+        Self {
+            forward_fn,
+            num_heads,
+            tree_width,
+            vocab_size,
+        }
     }
 
     /// Run backbone + Medusa heads and build a speculation tree.
@@ -314,7 +353,12 @@ impl MedusaDraftRunner {
     /// A single forward pass produces `num_heads` sets of logits.
     /// Each head predicts a token at a different future position.
     /// We build a tree of width `tree_width` from the top-k tokens at each head.
-    pub fn run_draft(&self, last_token: i64, kv_cache_handle: i64, seq_pos: i64) -> MedusaDraftResult {
+    pub fn run_draft(
+        &self,
+        last_token: i64,
+        kv_cache_handle: i64,
+        seq_pos: i64,
+    ) -> MedusaDraftResult {
         // Create input tensor
         let input_tensor = DraftModelRunner::make_token_tensor(last_token);
         let input_ptr = Box::into_raw(input_tensor) as i64;
@@ -330,10 +374,13 @@ impl MedusaDraftRunner {
 
             // Read all head logits
             let all_logits: Vec<f64> = if logits_tensor.dtype == 0 {
-                unsafe { std::slice::from_raw_parts(logits_tensor.data as *const f64, total) }.to_vec()
+                unsafe { std::slice::from_raw_parts(logits_tensor.data as *const f64, total) }
+                    .to_vec()
             } else {
                 unsafe { std::slice::from_raw_parts(logits_tensor.data as *const f32, total) }
-                    .iter().map(|&v| v as f64).collect()
+                    .iter()
+                    .map(|&v| v as f64)
+                    .collect()
             };
 
             // For each head, find top-k tokens
@@ -341,8 +388,11 @@ impl MedusaDraftRunner {
             let mut flat_logits = Vec::new();
             for h in 0..num_heads {
                 let head_logits = &all_logits[h * self.vocab_size..(h + 1) * self.vocab_size];
-                let mut indexed: Vec<(usize, f64)> = head_logits.iter().enumerate()
-                    .map(|(i, &v)| (i, v)).collect();
+                let mut indexed: Vec<(usize, f64)> = head_logits
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &v)| (i, v))
+                    .collect();
                 indexed.sort_by(|a, b| b.1.total_cmp(&a.1));
 
                 for &(tok, logit) in indexed.iter().take(self.tree_width) {
@@ -351,12 +401,7 @@ impl MedusaDraftRunner {
                 }
             }
 
-            super::tree::build_tree(
-                num_heads,
-                self.tree_width,
-                &flat_tokens,
-                &flat_logits,
-            )
+            super::tree::build_tree(num_heads, self.tree_width, &flat_tokens, &flat_logits)
         } else {
             // Forward pass failed — return empty tree
             super::types::SpeculativeTree {
@@ -394,10 +439,10 @@ mod tests {
         let vocab = 4;
         let data = checked_alloc(vocab * std::mem::size_of::<f64>()) as *mut f64;
         unsafe {
-            *data.add(0) = -1.0;  // token 0
-            *data.add(1) = -2.0;  // token 1
-            *data.add(2) = 5.0;   // token 2 — max
-            *data.add(3) = -0.5;  // token 3
+            *data.add(0) = -1.0; // token 0
+            *data.add(1) = -2.0; // token 1
+            *data.add(2) = 5.0; // token 2 — max
+            *data.add(3) = -0.5; // token 3
         }
 
         let shape = checked_alloc(std::mem::size_of::<i64>()) as *mut i64;
@@ -438,7 +483,12 @@ mod tests {
         let logits = unsafe { std::slice::from_raw_parts(logits_tensor.data as *const f64, 3 * 4) };
         for step in 0..3 {
             let row = &logits[step * 4..(step + 1) * 4];
-            let argmax = row.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0;
+            let argmax = row
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .unwrap()
+                .0;
             assert_eq!(argmax, 2);
         }
 
@@ -490,14 +540,26 @@ mod tests {
         let data = checked_alloc(total * std::mem::size_of::<f64>()) as *mut f64;
         unsafe {
             // Head 0: [0.1, 5.0, -1.0, 0.5] → token 1 is max
-            *data.add(0) = 0.1; *data.add(1) = 5.0; *data.add(2) = -1.0; *data.add(3) = 0.5;
+            *data.add(0) = 0.1;
+            *data.add(1) = 5.0;
+            *data.add(2) = -1.0;
+            *data.add(3) = 0.5;
             // Head 1: [-2.0, 0.0, 1.0, 4.0] → token 3 is max
-            *data.add(4) = -2.0; *data.add(5) = 0.0; *data.add(6) = 1.0; *data.add(7) = 4.0;
+            *data.add(4) = -2.0;
+            *data.add(5) = 0.0;
+            *data.add(6) = 1.0;
+            *data.add(7) = 4.0;
         }
         let shape = checked_alloc(2 * std::mem::size_of::<i64>()) as *mut i64;
-        unsafe { *shape = num_heads as i64; *shape.add(1) = vocab as i64 };
+        unsafe {
+            *shape = num_heads as i64;
+            *shape.add(1) = vocab as i64
+        };
         let strides = checked_alloc(2 * std::mem::size_of::<i64>()) as *mut i64;
-        unsafe { *strides = vocab as i64; *strides.add(1) = 1 };
+        unsafe {
+            *strides = vocab as i64;
+            *strides.add(1) = 1
+        };
         let tensor = Box::new(NslTensor::new(
             data as *mut c_void,
             shape,
@@ -519,14 +581,19 @@ mod tests {
 
         // Should have a tree with: root + 2 tokens from head 0 + 2*2 from head 1
         assert!(!result.tree.nodes.is_empty(), "tree should have nodes");
-        assert!(result.tree.nodes.len() >= 3, "tree should have root + at least 2 children");
+        assert!(
+            result.tree.nodes.len() >= 3,
+            "tree should have root + at least 2 children"
+        );
 
         // The top-1 token from head 0 should be token 1 (highest logit)
         // Find first non-root node at depth 1
-        let depth1_nodes: Vec<_> = result.tree.nodes.iter()
-            .filter(|n| n.depth == 1).collect();
+        let depth1_nodes: Vec<_> = result.tree.nodes.iter().filter(|n| n.depth == 1).collect();
         assert!(!depth1_nodes.is_empty(), "should have depth-1 nodes");
-        assert_eq!(depth1_nodes[0].token_id, 1, "head 0's top token should be 1");
+        assert_eq!(
+            depth1_nodes[0].token_id, 1,
+            "head 0's top token should be 1"
+        );
 
         // Clean up head logits tensor
         if result.head_logits_ptr != 0 {

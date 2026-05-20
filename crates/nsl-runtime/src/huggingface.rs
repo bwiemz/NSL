@@ -100,9 +100,10 @@ pub fn load_weights_from_dict(model_ptr: i64, metadata: &[ParamMeta], dict_ptr: 
                 let n_keys = crate::list::nsl_list_len(keys_list);
                 for k in 0..n_keys {
                     let k_ptr = crate::list::nsl_list_get(keys_list, k);
-                    let k_str = unsafe { std::ffi::CStr::from_ptr(k_ptr as *const std::ffi::c_char) }
-                        .to_str()
-                        .unwrap_or("?");
+                    let k_str =
+                        unsafe { std::ffi::CStr::from_ptr(k_ptr as *const std::ffi::c_char) }
+                            .to_str()
+                            .unwrap_or("?");
                     eprintln!("  - {}", k_str);
                 }
                 std::process::abort();
@@ -179,8 +180,7 @@ pub extern "C" fn nsl_hf_load(
         use hf_hub::api::sync::Api;
 
         let repo_id = unsafe {
-            let slice =
-                std::slice::from_raw_parts(repo_id_ptr as *const u8, repo_id_len as usize);
+            let slice = std::slice::from_raw_parts(repo_id_ptr as *const u8, repo_id_len as usize);
             std::str::from_utf8(slice).unwrap_or_else(|_| {
                 eprintln!("[nsl] hf_load: repo_id is not valid UTF-8");
                 std::process::abort();
@@ -225,8 +225,8 @@ pub extern "C" fn nsl_hf_load(
                     std::process::abort();
                 });
 
-                let index_json: serde_json::Value =
-                    serde_json::from_str(&index_content).unwrap_or_else(|e| {
+                let index_json: serde_json::Value = serde_json::from_str(&index_content)
+                    .unwrap_or_else(|e| {
                         eprintln!("[nsl] hf_load: failed to parse index JSON: {}", e);
                         std::process::abort();
                     });
@@ -258,14 +258,13 @@ pub extern "C" fn nsl_hf_load(
 
                 for shard_name in &shard_names {
                     eprintln!("[nsl] hf_load: downloading shard '{}'...", shard_name);
-                    let shard_path =
-                        model_repo.get(shard_name).unwrap_or_else(|e| {
-                            eprintln!(
-                                "[nsl] hf_load: failed to download shard '{}': {}",
-                                shard_name, e
-                            );
-                            std::process::abort();
-                        });
+                    let shard_path = model_repo.get(shard_name).unwrap_or_else(|e| {
+                        eprintln!(
+                            "[nsl] hf_load: failed to download shard '{}': {}",
+                            shard_name, e
+                        );
+                        std::process::abort();
+                    });
 
                     let shard_path_str = shard_path.to_str().unwrap_or_else(|| {
                         eprintln!("[nsl] hf_load: shard path is not valid UTF-8");
@@ -283,8 +282,7 @@ pub extern "C" fn nsl_hf_load(
                     let keys_list = crate::list::NslList::from_ptr(keys_list_ptr);
                     for i in 0..keys_list.len as usize {
                         let key_i64 = unsafe { *keys_list.data.add(i) };
-                        let tensor_ptr =
-                            crate::dict::nsl_dict_get_str(shard_dict, key_i64);
+                        let tensor_ptr = crate::dict::nsl_dict_get_str(shard_dict, key_i64);
                         crate::dict::nsl_dict_set_str(merged_dict, key_i64, tensor_ptr);
                     }
                     // Free the per-shard dict structure (values moved to merged_dict)
@@ -313,7 +311,14 @@ pub extern "C" fn nsl_hf_load(
 
     #[cfg(not(feature = "interop"))]
     {
-        let _ = (model_ptr, metadata_ptr, metadata_len, repo_id_ptr, repo_id_len, device);
+        let _ = (
+            model_ptr,
+            metadata_ptr,
+            metadata_len,
+            repo_id_ptr,
+            repo_id_len,
+            device,
+        );
         eprintln!("[nsl] nsl_hf_load: requires 'interop' feature");
         std::process::abort();
     }
@@ -386,19 +391,33 @@ mod tests {
         load_weights_from_dict(model_ptr, &metadata, dict_ptr);
 
         // Both fields should now hold non-zero tensor pointers
-        assert_ne!(model.field_a, 0, "field_a should be a non-zero tensor pointer");
-        assert_ne!(model.field_b, 0, "field_b should be a non-zero tensor pointer");
+        assert_ne!(
+            model.field_a, 0,
+            "field_a should be a non-zero tensor pointer"
+        );
+        assert_ne!(
+            model.field_b, 0,
+            "field_b should be a non-zero tensor pointer"
+        );
 
         // Verify the tensor data is accessible
         let ta = NslTensor::from_ptr(model.field_a);
         assert_eq!(ta.len, 4);
         let v0 = unsafe { *ta.data_f32().add(0) };
-        assert!((v0 - 1.0f32).abs() < 1e-5, "field_a[0] should be 1.0, got {}", v0);
+        assert!(
+            (v0 - 1.0f32).abs() < 1e-5,
+            "field_a[0] should be 1.0, got {}",
+            v0
+        );
 
         let tb = NslTensor::from_ptr(model.field_b);
         assert_eq!(tb.len, 3);
         let v0b = unsafe { *tb.data_f32().add(0) };
-        assert!((v0b - 5.0f32).abs() < 1e-5, "field_b[0] should be 5.0, got {}", v0b);
+        assert!(
+            (v0b - 5.0f32).abs() < 1e-5,
+            "field_b[0] should be 5.0, got {}",
+            v0b
+        );
     }
 
     #[test]
@@ -462,6 +481,9 @@ mod tests {
         let model_ptr = &mut slot as *mut i64 as i64;
         load_weights_from_dict(model_ptr, &metadata, dict_ptr);
 
-        assert_ne!(slot, 0, "embedding.weight should be found via HF name mapping");
+        assert_ne!(
+            slot, 0,
+            "embedding.weight should be found via HF name mapping"
+        );
     }
 }

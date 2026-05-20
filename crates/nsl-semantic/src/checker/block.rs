@@ -30,7 +30,7 @@ impl<'a> TypeChecker<'a> {
                     has_step = true;
                     // DataLoader yields Dict<Str, Tensor> batches. Type the step
                     // parameter concretely so field access (batch.input_ids) is validated.
-                    use crate::types::{Shape, DType, Device};
+                    use crate::types::{DType, Device, Shape};
                     let batch_type = Type::Dict(
                         Box::new(Type::Str),
                         Box::new(Type::Tensor {
@@ -286,8 +286,10 @@ impl<'a> TypeChecker<'a> {
                             ExprKind::StringLiteral(_) => {}
                             _ => {
                                 self.diagnostics.push(
-                                    Diagnostic::error("special token values must be string literals")
-                                        .with_label(entry.value.span, "expected string literal"),
+                                    Diagnostic::error(
+                                        "special token values must be string literals",
+                                    )
+                                    .with_label(entry.value.span, "expected string literal"),
                                 );
                             }
                         }
@@ -313,8 +315,7 @@ impl<'a> TypeChecker<'a> {
                                 );
                             }
                             "pad_to" => match &entry.value.kind {
-                                ExprKind::Ident(sym)
-                                    if self.resolve_name(*sym) == "longest" => {}
+                                ExprKind::Ident(sym) if self.resolve_name(*sym) == "longest" => {}
                                 ExprKind::Ident(_) => {
                                     self.diagnostics.push(
                                         Diagnostic::error(
@@ -333,10 +334,8 @@ impl<'a> TypeChecker<'a> {
                             },
                             _ => {
                                 self.diagnostics.push(
-                                    Diagnostic::error(format!(
-                                        "unknown padding entry '{key}'"
-                                    ))
-                                    .with_label(entry.span, "unknown padding entry"),
+                                    Diagnostic::error(format!("unknown padding entry '{key}'"))
+                                        .with_label(entry.span, "unknown padding entry"),
                                 );
                             }
                         }
@@ -364,10 +363,8 @@ impl<'a> TypeChecker<'a> {
                             }
                             _ => {
                                 self.diagnostics.push(
-                                    Diagnostic::error(format!(
-                                        "unknown truncation entry '{key}'"
-                                    ))
-                                    .with_label(entry.span, "unknown truncation entry"),
+                                    Diagnostic::error(format!("unknown truncation entry '{key}'"))
+                                        .with_label(entry.span, "unknown truncation entry"),
                                 );
                             }
                         }
@@ -402,7 +399,11 @@ impl<'a> TypeChecker<'a> {
                     self.check_expr(&entry.value);
                 }
                 "shuffle" | "packing" => {
-                    self.check_assignable_expr(&entry.value, &Type::Bool, &format!("dataset {key}"));
+                    self.check_assignable_expr(
+                        &entry.value,
+                        &Type::Bool,
+                        &format!("dataset {key}"),
+                    );
                 }
                 "sequence_length" | "max_samples" | "shuffle_buffer" | "pack_separator" => {
                     self.check_assignable_expr(&entry.value, &Type::Int, &format!("dataset {key}"));
@@ -485,11 +486,8 @@ impl<'a> TypeChecker<'a> {
             }
             _ => {
                 self.diagnostics.push(
-                    Diagnostic::error(format!(
-                        "{context} must be one of: {}",
-                        allowed.join(", ")
-                    ))
-                    .with_label(expr.span, "expected identifier value"),
+                    Diagnostic::error(format!("{context} must be one of: {}", allowed.join(", ")))
+                        .with_label(expr.span, "expected identifier value"),
                 );
             }
         }

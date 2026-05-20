@@ -15,11 +15,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use nsl_ast::block::WrgaMode;
 
 use crate::gpu_specs::{default_gpu, find_gpu};
-use crate::wengert::{PrimalOp, VarId, WengertList};
 use crate::weight_aware::WeightMap;
-use crate::wrga_fusion::{
-    build_fusion_plan, verify_fused_sites_have_no_intermediate, FusionPlan,
-};
+use crate::wengert::{PrimalOp, VarId, WengertList};
+use crate::wrga_fusion::{build_fusion_plan, verify_fused_sites_have_no_intermediate, FusionPlan};
 use crate::wrga_memory::{plan_memory_with_pin, MemoryPlan, SizeHints};
 use crate::wrga_prune::{prune, PruneResult};
 use crate::wrga_roofline::{place_adapters, AdapterPlacement, AdapterSite, SiteKind};
@@ -196,8 +194,7 @@ pub fn run(input: WrgaInput) -> WrgaPlan {
     let (spectral, ranks, override_diags) = run_spectral(input.weights, &placements, &input);
 
     // ── Stage 5: Fusion integration ───────────────────────────────────────
-    let rank_overrides: Vec<usize> =
-        ranks.iter().map(|r| r.rank).collect();
+    let rank_overrides: Vec<usize> = ranks.iter().map(|r| r.rank).collect();
     let fusion = build_fusion_plan(&placements, Some(&rank_overrides));
     verify_fused_sites_have_no_intermediate(&fusion, input.wengert);
 
@@ -250,10 +247,7 @@ fn select_trainable(list: &WengertList, input: &WrgaInput) -> BTreeSet<VarId> {
                 if input.trainable_patterns.is_empty() {
                     true
                 } else {
-                    input
-                        .trainable_patterns
-                        .iter()
-                        .any(|p| glob_match(p, name))
+                    input.trainable_patterns.iter().any(|p| glob_match(p, name))
                 }
             }
             WrgaMode::Manual => {
@@ -335,7 +329,11 @@ fn run_spectral(
     weights: Option<&WeightMap>,
     placements: &[AdapterPlacement],
     input: &WrgaInput,
-) -> (Vec<SpectralAnalysis>, Vec<RankAllocation>, Vec<crate::wggo_overrides::OverrideDiagnostic>) {
+) -> (
+    Vec<SpectralAnalysis>,
+    Vec<RankAllocation>,
+    Vec<crate::wggo_overrides::OverrideDiagnostic>,
+) {
     let Some(wm) = weights else {
         // Without weights, fall back to uniform r_max (clamped by budget) per
         // non-skipped placement.
@@ -373,8 +371,14 @@ fn run_spectral(
     } else {
         spectral.len().max(1) * input.r_max
     };
-    let (ranks, override_diags) =
-        allocate_ranks(&spectral, budget, input.r_min, input.r_max, Some(&slack), input.wggo_overrides);
+    let (ranks, override_diags) = allocate_ranks(
+        &spectral,
+        budget,
+        input.r_min,
+        input.r_max,
+        Some(&slack),
+        input.wggo_overrides,
+    );
 
     (spectral, ranks, override_diags)
 }

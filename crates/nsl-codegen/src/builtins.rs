@@ -133,7 +133,11 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_assert", &[types::I8, types::I64], None),
     ("nsl_exit", &[types::I64], None),
     // Training diagnostics (temporary)
-    ("nsl_debug_train_step", &[types::I64, types::I64, types::I64], None),
+    (
+        "nsl_debug_train_step",
+        &[types::I64, types::I64, types::I64],
+        None,
+    ),
     ("nsl_debug_gpu_mem", &[types::I64], None),
     ("nsl_gpu_drain_cache", &[], None),
     ("nsl_gpu_set_persistent_pool", &[], None),
@@ -256,11 +260,7 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
         Some(types::F64),
     ),
     // FASE Deferred two-phase grad clip: sum of squared elements, in-place scale.
-    (
-        "nsl_tensor_sum_sq",
-        &[types::I64],
-        Some(types::F64),
-    ),
+    ("nsl_tensor_sum_sq", &[types::I64], Some(types::F64)),
     (
         "nsl_tensor_mul_scalar_inplace",
         &[types::I64, types::F64],
@@ -363,11 +363,7 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_health_get_loss_ema", &[], Some(types::F64)),
     ("nsl_health_get_loss_ema_slope", &[], Some(types::F64)),
     ("nsl_health_get_grad_norm_total", &[], Some(types::F64)),
-    (
-        "nsl_health_get_nan_inf_count_window",
-        &[],
-        Some(types::I64),
-    ),
+    ("nsl_health_get_nan_inf_count_window", &[], Some(types::I64)),
     // Tensor display
     ("nsl_tensor_print", &[types::I64], None),
     // Tensor memory
@@ -477,7 +473,11 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     // segment_ids/doc_starts pointers. Train block sets per step;
     // CSHA call sites read.
     ("nsl_packing_metadata_set", &[types::I64, types::I64], None),
-    ("nsl_packing_metadata_get_segment_ids", &[], Some(types::I64)),
+    (
+        "nsl_packing_metadata_get_segment_ids",
+        &[],
+        Some(types::I64),
+    ),
     ("nsl_packing_metadata_get_doc_starts", &[], Some(types::I64)),
     // In-place mutation ops (M14)
     ("nsl_tensor_copy_data", &[types::I64, types::I64], None),
@@ -1048,21 +1048,37 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     (
         "nsl_flash_attention_csha",
         &[
-            types::I64, types::I64, types::I64, types::I64, // q, k, v, out
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64, // q, k, v, out
             types::I64, // logsumexp
             types::I64, // scale_bits
-            types::I64, types::I64, types::I64, types::I64, // batch, heads, seq_len, head_dim
-            types::I64, types::I64, types::I64, types::I64, // block_table, k_pool, v_pool, block_size
-            types::I64, types::I64, // cos, sin
-            types::I64, types::I64, // seq_ids, seq_lens
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64, // batch, heads, seq_len, head_dim
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64, // block_table, k_pool, v_pool, block_size
+            types::I64,
+            types::I64, // cos, sin
+            types::I64,
+            types::I64, // seq_ids, seq_lens
             types::I64, // shared_mem_bytes
-            types::I64, types::I64, // ptx_ptr, name_ptr
-            types::I64, types::I64, // block_q, block_kv
+            types::I64,
+            types::I64, // ptx_ptr, name_ptr
+            types::I64,
+            types::I64, // block_q, block_kv
             types::I64, // causal
             // CSHA extras:
             types::I64, // x_ptr
             types::I64, // norm_weight_ptr
-            types::I64, types::I64, types::I64, types::I64, // Wq, Wk, Wv, Wo
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64, // Wq, Wk, Wv, Wo
             types::I64, // rmsnorm_eps_bits (f32 as i64)
             types::I64, // active_heads
             types::I64, // d_model
@@ -1085,21 +1101,37 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     (
         "nsl_flash_attention_csha_with_saves",
         &[
-            types::I64, types::I64, types::I64, types::I64, // q, k, v, out
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64, // q, k, v, out
             types::I64, // logsumexp
             types::I64, // scale_bits
-            types::I64, types::I64, types::I64, types::I64, // batch, heads, seq_len, head_dim
-            types::I64, types::I64, types::I64, types::I64, // block_table, k_pool, v_pool, block_size
-            types::I64, types::I64, // cos, sin
-            types::I64, types::I64, // seq_ids, seq_lens
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64, // batch, heads, seq_len, head_dim
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64, // block_table, k_pool, v_pool, block_size
+            types::I64,
+            types::I64, // cos, sin
+            types::I64,
+            types::I64, // seq_ids, seq_lens
             types::I64, // shared_mem_bytes
-            types::I64, types::I64, // ptx_ptr, name_ptr
-            types::I64, types::I64, // block_q, block_kv
+            types::I64,
+            types::I64, // ptx_ptr, name_ptr
+            types::I64,
+            types::I64, // block_q, block_kv
             types::I64, // causal
             // CSHA extras (9):
             types::I64, // x_ptr
             types::I64, // norm_weight_ptr
-            types::I64, types::I64, types::I64, types::I64, // Wq, Wk, Wv, Wo
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64, // Wq, Wk, Wv, Wo
             types::I64, // rmsnorm_eps_bits
             types::I64, // active_heads
             types::I64, // d_model
@@ -1162,36 +1194,60 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     (
         "nsl_flash_attention_csha_backward",
         &[
-            types::I64, types::I64, types::I64, // q, k, v
-            types::I64, types::I64,             // out, logsumexp
-            types::I64,                         // scale_bits
-            types::I64, types::I64, types::I64, types::I64, // batch, heads, seq_len, head_dim
-            types::I64, types::I64, types::I64, types::I64, // block_table, k_pool, v_pool, block_size
-            types::I64, types::I64,             // cos, sin
-            types::I64, types::I64,             // seq_ids, seq_lens
-            types::I64,                         // shmem_bytes
-            types::I64, types::I64,             // bwd_ptx_ptr, bwd_name_ptr
-            types::I64, types::I64,             // block_q, block_kv
-            types::I64,                         // causal
-            types::I64, types::I64,             // x_ptr, norm_weight_ptr
-            types::I64, types::I64, types::I64, // wq, wk, wv
-            types::I64,                         // wo (null)
-            types::I64,                         // rmsnorm_eps_bits
-            types::I64, types::I64,             // active_heads, d_model
+            types::I64,
+            types::I64,
+            types::I64, // q, k, v
+            types::I64,
+            types::I64, // out, logsumexp
+            types::I64, // scale_bits
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64, // batch, heads, seq_len, head_dim
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64, // block_table, k_pool, v_pool, block_size
+            types::I64,
+            types::I64, // cos, sin
+            types::I64,
+            types::I64, // seq_ids, seq_lens
+            types::I64, // shmem_bytes
+            types::I64,
+            types::I64, // bwd_ptx_ptr, bwd_name_ptr
+            types::I64,
+            types::I64, // block_q, block_kv
+            types::I64, // causal
+            types::I64,
+            types::I64, // x_ptr, norm_weight_ptr
+            types::I64,
+            types::I64,
+            types::I64, // wq, wk, wv
+            types::I64, // wo (null)
+            types::I64, // rmsnorm_eps_bits
+            types::I64,
+            types::I64, // active_heads, d_model
             // Saved activations (6):
-            types::I64, types::I64, types::I64, // q_proj, k_proj, v_proj
-            types::I64, types::I64,             // row_max, row_sum
-            types::I64,                         // x_raw
+            types::I64,
+            types::I64,
+            types::I64, // q_proj, k_proj, v_proj
+            types::I64,
+            types::I64, // row_max, row_sum
+            types::I64, // x_raw
             // Gradient outputs (dO + 8):
-            types::I64,                         // do_ptr
-            types::I64, types::I64, types::I64, // dq, dk, dv
-            types::I64, types::I64, types::I64, // dwq, dwk, dwv
-            types::I64,                         // dx
-            types::I64,                         // dx_norm (Gap I.5)
-            types::I64,                         // segment_ids_ptr (PCA Tier A Task 4B)
-            types::I64,                         // tier_b_ptx_ptr (planner spec §4)
-            types::I64,                         // tier_b_name_ptr (planner spec §4)
-            types::I64,                         // doc_starts_ptr (PCA §4.3 Task 3)
+            types::I64, // do_ptr
+            types::I64,
+            types::I64,
+            types::I64, // dq, dk, dv
+            types::I64,
+            types::I64,
+            types::I64, // dwq, dwk, dwv
+            types::I64, // dx
+            types::I64, // dx_norm (Gap I.5)
+            types::I64, // segment_ids_ptr (PCA Tier A Task 4B)
+            types::I64, // tier_b_ptx_ptr (planner spec §4)
+            types::I64, // tier_b_name_ptr (planner spec §4)
+            types::I64, // doc_starts_ptr (PCA §4.3 Task 3)
         ],
         Some(types::I64),
     ),
@@ -1201,11 +1257,16 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
         "nsl_flash_attention_backward",
         &[
             types::I64, // dout
-            types::I64, types::I64, types::I64, // q, k, v
+            types::I64,
+            types::I64,
+            types::I64, // q, k, v
             types::I64, // out (forward output)
             types::I64, // logsumexp (0 = auto-compute)
             types::I64, // scale_bits (f32 as i64)
-            types::I64, types::I64, types::I64, types::I64, // batch, heads, seq_len, head_dim
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64, // batch, heads, seq_len, head_dim
             types::I64, // causal
             types::I64, // phase1_ptx_ptr (0 = CPU fallback)
             types::I64, // phase1_name_ptr
@@ -2090,12 +2151,24 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_unikernel_gpu_device_id", &[], Some(types::I64)),
     // --- M56 v1 agent runtime FFI (Task 16). Signatures from spec §3.4. ---
     // All raw pointers are I64 per the workspace convention; time: u64 is also I64.
-    ("nsl_agent_pool_new", &[types::I64, types::I64], Some(types::I64)),
+    (
+        "nsl_agent_pool_new",
+        &[types::I64, types::I64],
+        Some(types::I64),
+    ),
     ("nsl_agent_pool_destroy", &[types::I64], None),
-    ("nsl_agent_pool_acquire", &[types::I64, types::I64], Some(types::I64)),
+    (
+        "nsl_agent_pool_acquire",
+        &[types::I64, types::I64],
+        Some(types::I64),
+    ),
     ("nsl_agent_pool_release", &[types::I64, types::I64], None),
     ("nsl_agent_scheduler_step", &[types::I64], Some(types::I32)),
-    ("nsl_agent_mailbox_write", &[types::I64, types::I64, types::I64], Some(types::I32)),
+    (
+        "nsl_agent_mailbox_write",
+        &[types::I64, types::I64, types::I64],
+        Some(types::I32),
+    ),
     ("nsl_agent_mailbox_read", &[types::I64], Some(types::I64)),
 ];
 

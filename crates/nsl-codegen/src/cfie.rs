@@ -7,7 +7,9 @@
 
 use serde::Serialize;
 
-use crate::cfie_fused_sample::{emit_program as emit_sample, FusedSampleProgram, LmHeadShape, SamplingParams};
+use crate::cfie_fused_sample::{
+    emit_program as emit_sample, FusedSampleProgram, LmHeadShape, SamplingParams,
+};
 use crate::cfie_grammar::{compile as compile_dfa, CompiledDfa, GrammarSpec};
 use crate::cfie_kv_plan::{plan as plan_kv, KvBudget, KvLayoutPlan, KvShape};
 use crate::cfie_kv_quant::{plan as plan_kv_quant, KvQuantConfig, KvQuantPlan};
@@ -93,7 +95,13 @@ impl CfiePlan {
         writeln!(s, "Target: {}", self.target_gpu).unwrap();
         writeln!(s).unwrap();
         writeln!(s, "Optimizations applied:").unwrap();
-        writeln!(s, "  [1] KV layout: {} ({})", self.kv.kind.as_str(), self.kv.rationale).unwrap();
+        writeln!(
+            s,
+            "  [1] KV layout: {} ({})",
+            self.kv.kind.as_str(),
+            self.kv.rationale
+        )
+        .unwrap();
         writeln!(
             s,
             "  [2] Fused decode-sample: {} ops ({:.1} KB HBM saved per token)",
@@ -149,9 +157,12 @@ impl CfiePlan {
             100.0 * self.launch_reduction()
         )
         .unwrap();
-        writeln!(s, "Continuous batching: on ({} active slots, ring capacity {})",
-                 self.persistent.scheduler.max_active,
-                 self.persistent.scheduler.ring_buffer.capacity).unwrap();
+        writeln!(
+            s,
+            "Continuous batching: on ({} active slots, ring capacity {})",
+            self.persistent.scheduler.max_active, self.persistent.scheduler.ring_buffer.capacity
+        )
+        .unwrap();
         writeln!(s, "Solve time: {:.2} ms", self.solve_us as f64 / 1000.0).unwrap();
         s
     }
@@ -224,7 +235,8 @@ pub fn run(input: CfieInput) -> CfiePlan {
 
     // Kernel-launch accounting.
     let baseline = 500u32; // paper §1's "~500-1000 launches/token" figure
-    let saved_persistent = (persistent.baseline_launches_per_layer
+    let saved_persistent = (persistent
+        .baseline_launches_per_layer
         .saturating_sub(persistent.persistent_launches_per_layer))
         * input.persistent_model.n_layers;
     // Sampling + residual layers: one fused kernel versus six.

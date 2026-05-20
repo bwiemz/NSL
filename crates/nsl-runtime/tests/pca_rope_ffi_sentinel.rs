@@ -23,20 +23,45 @@ use nsl_runtime::flash_attention::{
 #[test]
 fn csha_forward_ffi_accepts_trailing_doc_starts_ptr() {
     let _: extern "C" fn(
-        i64, i64, i64, i64, i64, i64,   // q, k, v, out, lse, scale_bits
-        i64, i64, i64, i64,             // batch, heads, seq_len, head_dim
-        i64, i64, i64, i64,             // block_table, k_pool, v_pool, block_size
-        i64, i64,                       // cos, sin
-        i64, i64,                       // seq_ids, seq_lens
-        i64, i64, i64,                  // shmem_bytes, ptx, name
-        i64, i64, i64,                  // block_q, block_kv, causal
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64, // q, k, v, out, lse, scale_bits
+        i64,
+        i64,
+        i64,
+        i64, // batch, heads, seq_len, head_dim
+        i64,
+        i64,
+        i64,
+        i64, // block_table, k_pool, v_pool, block_size
+        i64,
+        i64, // cos, sin
+        i64,
+        i64, // seq_ids, seq_lens
+        i64,
+        i64,
+        i64, // shmem_bytes, ptx, name
+        i64,
+        i64,
+        i64, // block_q, block_kv, causal
         // CSHA extras (9):
-        i64, i64, i64, i64, i64, i64,   // x, norm_weight, Wq, Wk, Wv, Wo
-        i64, i64, i64,                  // rmsnorm_eps_bits, active_heads, d_model
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64, // x, norm_weight, Wq, Wk, Wv, Wo
+        i64,
+        i64,
+        i64, // rmsnorm_eps_bits, active_heads, d_model
         // PCA Tier A: segment_ids_ptr
         i64,
         // PCA Tier B Planner (PR #175): tier_b_ptx_ptr, tier_b_name_ptr.
-        i64, i64,
+        i64,
+        i64,
         // PCA §4.3: doc_starts_ptr — the new trailing param under test.
         i64,
     ) -> i64 = nsl_flash_attention_csha;
@@ -47,22 +72,52 @@ fn csha_forward_ffi_accepts_trailing_doc_starts_ptr() {
 #[test]
 fn csha_with_saves_ffi_accepts_trailing_doc_starts_ptr() {
     let _: extern "C" fn(
-        i64, i64, i64, i64, i64, i64,   // q, k, v, out, lse, scale_bits
-        i64, i64, i64, i64,             // batch, heads, seq_len, head_dim
-        i64, i64, i64, i64,             // block_table, k_pool, v_pool, block_size
-        i64, i64,                       // cos, sin
-        i64, i64,                       // seq_ids, seq_lens
-        i64, i64, i64,                  // shmem_bytes, ptx, name
-        i64, i64, i64,                  // block_q, block_kv, causal
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64, // q, k, v, out, lse, scale_bits
+        i64,
+        i64,
+        i64,
+        i64, // batch, heads, seq_len, head_dim
+        i64,
+        i64,
+        i64,
+        i64, // block_table, k_pool, v_pool, block_size
+        i64,
+        i64, // cos, sin
+        i64,
+        i64, // seq_ids, seq_lens
+        i64,
+        i64,
+        i64, // shmem_bytes, ptx, name
+        i64,
+        i64,
+        i64, // block_q, block_kv, causal
         // CSHA extras (9):
-        i64, i64, i64, i64, i64, i64,   // x, norm_weight, Wq, Wk, Wv, Wo
-        i64, i64, i64,                  // rmsnorm_eps_bits, active_heads, d_model
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64, // x, norm_weight, Wq, Wk, Wv, Wo
+        i64,
+        i64,
+        i64, // rmsnorm_eps_bits, active_heads, d_model
         // Tier C save pointers (6):
-        i64, i64, i64, i64, i64, i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
         // PCA Tier A: segment_ids_ptr
         i64,
         // PCA Tier B Planner (PR #175): tier_b_ptx_ptr, tier_b_name_ptr.
-        i64, i64,
+        i64,
+        i64,
         // PCA §4.3: doc_starts_ptr — the new trailing param under test.
         i64,
     ) -> i64 = nsl_flash_attention_csha_with_saves;
@@ -73,28 +128,62 @@ fn csha_with_saves_ffi_accepts_trailing_doc_starts_ptr() {
 #[test]
 fn csha_backward_ffi_accepts_trailing_doc_starts_ptr() {
     let _: extern "C" fn(
-        i64, i64, i64, i64, i64, i64,   // q, k, v, out, lse, scale_bits
-        i64, i64, i64, i64,             // batch, heads, seq_len, head_dim
-        i64, i64, i64, i64,             // block_table, k_pool, v_pool, block_size
-        i64, i64,                       // cos, sin
-        i64, i64,                       // seq_ids, seq_lens
-        i64, i64, i64,                  // shmem_bytes, ptx, name
-        i64, i64, i64,                  // block_q, block_kv, causal
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64, // q, k, v, out, lse, scale_bits
+        i64,
+        i64,
+        i64,
+        i64, // batch, heads, seq_len, head_dim
+        i64,
+        i64,
+        i64,
+        i64, // block_table, k_pool, v_pool, block_size
+        i64,
+        i64, // cos, sin
+        i64,
+        i64, // seq_ids, seq_lens
+        i64,
+        i64,
+        i64, // shmem_bytes, ptx, name
+        i64,
+        i64,
+        i64, // block_q, block_kv, causal
         // CSHA extras (9):
-        i64, i64, i64, i64, i64, i64,   // x, norm_weight, Wq, Wk, Wv, Wo
-        i64, i64, i64,                  // rmsnorm_eps_bits, active_heads, d_model
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64, // x, norm_weight, Wq, Wk, Wv, Wo
+        i64,
+        i64,
+        i64, // rmsnorm_eps_bits, active_heads, d_model
         // Saved activations (6):
-        i64, i64, i64, i64, i64, i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
         // dO + 8 gradient outputs:
-        i64,                            // do_ptr
-        i64, i64, i64,                  // dq, dk, dv
-        i64, i64, i64,                  // dwq, dwk, dwv
-        i64,                            // dx
-        i64,                            // dx_norm
+        i64, // do_ptr
+        i64,
+        i64,
+        i64, // dq, dk, dv
+        i64,
+        i64,
+        i64, // dwq, dwk, dwv
+        i64, // dx
+        i64, // dx_norm
         // PCA Tier A: segment_ids_ptr
         i64,
         // PCA Tier B Planner (PR #175): tier_b_ptx_ptr, tier_b_name_ptr.
-        i64, i64,
+        i64,
+        i64,
         // PCA §4.3: doc_starts_ptr — the new trailing param under test.
         i64,
     ) -> i64 = nsl_flash_attention_csha_backward;
@@ -106,20 +195,45 @@ fn csha_backward_ffi_accepts_trailing_doc_starts_ptr() {
 #[cfg(not(feature = "cuda"))]
 fn csha_forward_ffi_sentinel_zero_returns_minus_one_without_panic() {
     let r = nsl_flash_attention_csha(
-        0, 0, 0, 0, 0, 1.0f32.to_bits() as i64,
-        1, 1, 16, 64,
-        0, 0, 0, 0,
-        0, 0, 0, 0,
-        0, 0, 0,
-        64, 64, 0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1.0f32.to_bits() as i64,
+        1,
+        1,
+        16,
+        64,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        64,
+        64,
+        0,
         // CSHA extras (all null / zero).
-        0, 0, 0, 0, 0, 0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
         1e-5f32.to_bits() as i64,
-        0, 0,
+        0,
+        0,
         // PCA Tier A: segment_ids_ptr (0 = unpacked).
         0,
         // PCA Tier B Planner (PR #175): tier_b_ptx_ptr, tier_b_name_ptr.
-        0, 0,
+        0,
+        0,
         // PCA §4.3: doc_starts_ptr (0 = identity positions).
         0,
     );

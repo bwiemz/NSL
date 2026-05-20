@@ -43,25 +43,25 @@
 
 #[path = "csha_reference.rs"]
 mod csha_reference;
-use csha_reference::{csha_reference_backward, CshaInputs, CshaShape, CshaGradients};
+use csha_reference::{csha_reference_backward, CshaGradients, CshaInputs, CshaShape};
 
 use std::ffi::CString;
 
 use nsl_codegen::flash_attention::{CshaExtras, FlashAttentionConfig, RopeStyle};
 use nsl_codegen::flash_attention_v2::{
-    flash_attention_kernel_name_v2, synthesize_backward,
-    synthesize_flash_attention_ptx_v2,
+    flash_attention_kernel_name_v2,
     smem_layout::{self, needs_dynamic_smem, Direction},
+    synthesize_backward, synthesize_flash_attention_ptx_v2,
 };
 
-use nsl_runtime::{
-    nsl_cuda_init, nsl_test_cuda_alloc, nsl_test_cuda_d2h,
-    nsl_test_cuda_free, nsl_test_cuda_h2d, nsl_test_cuda_jit_log,
-};
 use nsl_runtime::flash_attention::{
     nsl_csha_alloc_backward_activations, nsl_csha_free_backward_activations,
     nsl_flash_attention_csha_backward, nsl_flash_attention_csha_with_saves,
     CshaBackwardActivations,
+};
+use nsl_runtime::{
+    nsl_cuda_init, nsl_test_cuda_alloc, nsl_test_cuda_d2h, nsl_test_cuda_free, nsl_test_cuda_h2d,
+    nsl_test_cuda_jit_log,
 };
 
 // ── Gates ──────────────────────────────────────────────────────────────────
@@ -80,18 +80,23 @@ use nsl_runtime::flash_attention::{
 //   the closed-form dx formula. Fix requires a new forward save pointer
 //   (e.g. `x_raw_save`) on the backward activations struct.
 const NUMERICAL_GATE_DQKV_ENABLED: bool = true;
-const NUMERICAL_GATE_DW_ENABLED:   bool = true;
-const NUMERICAL_GATE_DX_ENABLED:   bool = true;
+const NUMERICAL_GATE_DW_ENABLED: bool = true;
+const NUMERICAL_GATE_DX_ENABLED: bool = true;
 
 fn f16_to_f32(bits: u16) -> f32 {
     let sign = (bits >> 15) as u32;
     let exp = ((bits >> 10) & 0x1f) as u32;
     let mant = (bits & 0x3ff) as u32;
     let f32_bits = if exp == 0 {
-        if mant == 0 { sign << 31 } else {
+        if mant == 0 {
+            sign << 31
+        } else {
             let mut m = mant;
             let mut e: i32 = -1;
-            while m & 0x400 == 0 { m <<= 1; e -= 1; }
+            while m & 0x400 == 0 {
+                m <<= 1;
+                e -= 1;
+            }
             let e = (127 + e - 14) as u32;
             (sign << 31) | (e << 23) | ((m & 0x3ff) << 13)
         }
@@ -105,12 +110,16 @@ fn f16_to_f32(bits: u16) -> f32 {
 }
 
 fn f32_to_f16_bits(x: f32) -> u16 {
-    if x.is_nan() { return 0x7E00; }
+    if x.is_nan() {
+        return 0x7E00;
+    }
     let b = x.to_bits();
     let sign = (b >> 31) & 1;
     let exp = ((b >> 23) & 0xFF) as i32;
     let mant = b & 0x7FFFFF;
-    if exp == 255 { return ((sign << 15) | 0x7C00 | if mant != 0 { 0x200 } else { 0 }) as u16; }
+    if exp == 255 {
+        return ((sign << 15) | 0x7C00 | if mant != 0 { 0x200 } else { 0 }) as u16;
+    }
     let exp_f16 = exp - 127 + 15;
     if exp_f16 <= 0 {
         let shift = (1 - exp_f16).min(24) as u32;
@@ -118,7 +127,9 @@ fn f32_to_f16_bits(x: f32) -> u16 {
         let rounded = (shifted + 0x1000) >> 13;
         return ((sign << 15) | rounded) as u16;
     }
-    if exp_f16 >= 31 { return ((sign << 15) | 0x7C00) as u16; }
+    if exp_f16 >= 31 {
+        return ((sign << 15) | 0x7C00) as u16;
+    }
     let mant16 = (mant + 0x1000) >> 13;
     let overflow = (mant16 >> 10) & 1;
     let exp16 = (exp_f16 as u32 + overflow) & 0x1F;
@@ -127,19 +138,29 @@ fn f32_to_f16_bits(x: f32) -> u16 {
 
 fn det_seq(seed: u32, n: usize) -> Vec<f32> {
     let mut s = seed;
-    (0..n).map(|_| {
-        s = s.wrapping_mul(1_103_515_245).wrapping_add(12_345);
-        ((s >> 16) as f32 / 65535.0) - 0.5
-    }).collect()
+    (0..n)
+        .map(|_| {
+            s = s.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            ((s >> 16) as f32 / 65535.0) - 0.5
+        })
+        .collect()
 }
 
 fn cuda_available() -> bool {
-    if std::env::var("NSL_SKIP_CUDA_TESTS").is_ok() { return false; }
+    if std::env::var("NSL_SKIP_CUDA_TESTS").is_ok() {
+        return false;
+    }
     unsafe { nsl_cuda_init() == 0 }
 }
 
 fn free_all(ptrs: &[i64]) {
-    for &p in ptrs { if p != 0 { unsafe { nsl_test_cuda_free(p); } } }
+    for &p in ptrs {
+        if p != 0 {
+            unsafe {
+                nsl_test_cuda_free(p);
+            }
+        }
+    }
 }
 
 fn backward_kernel_name(cfg: &FlashAttentionConfig) -> String {
@@ -155,9 +176,20 @@ fn backward_kernel_name(cfg: &FlashAttentionConfig) -> String {
 /// launches, all 7 gradient outputs finite, shapes match CPU reference.
 #[allow(clippy::too_many_arguments)]
 fn run_fused_backward_config(
-    block_q: u32, block_kv: u32, head_dim: u32, heads: u32, d_model: u32,
-    causal: bool, rope_q: bool,
-) -> Result<(CshaGradients /*gpu_as_f32*/, CshaGradients /*cpu*/), String> {
+    block_q: u32,
+    block_kv: u32,
+    head_dim: u32,
+    heads: u32,
+    d_model: u32,
+    causal: bool,
+    rope_q: bool,
+) -> Result<
+    (
+        CshaGradients, /*gpu_as_f32*/
+        CshaGradients, /*cpu*/
+    ),
+    String,
+> {
     let batch = 1usize;
     let seq = (block_q as usize).max(block_kv as usize);
     let hd = head_dim as usize;
@@ -168,10 +200,18 @@ fn run_fused_backward_config(
     let kv_dim = h * hd;
 
     let config = FlashAttentionConfig {
-        block_q: block_q as i64, block_kv: block_kv as i64, head_dim: hd as i64,
-        causal, paged: false, rope_q,
+        block_q: block_q as i64,
+        block_kv: block_kv as i64,
+        head_dim: hd as i64,
+        causal,
+        paged: false,
+        rope_q,
         rope_style: RopeStyle::Adjacent,
-        gqa_group_size: 1, tree_mask: false, gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras {
+        gqa_group_size: 1,
+        tree_mask: false,
+        gpu_sm: 75,
+        segment_masked: false,
+        csha: Some(CshaExtras {
             level: 2,
             fused_rmsnorm: true,
             fused_projections: true,
@@ -208,12 +248,16 @@ fn run_fused_backward_config(
     // precision (avoids spurious divergence from f32-only cos/sin in CPU
     // vs f16-truncated cos/sin in GPU).
     let cos_f32: Vec<f32> = if rope_q {
-        (0..seq * hd / 2).map(|i| ((i as f32) * 0.1).cos()).collect()
+        (0..seq * hd / 2)
+            .map(|i| ((i as f32) * 0.1).cos())
+            .collect()
     } else {
         vec![1.0f32; seq * hd / 2]
     };
     let sin_f32: Vec<f32> = if rope_q {
-        (0..seq * hd / 2).map(|i| ((i as f32) * 0.1).sin()).collect()
+        (0..seq * hd / 2)
+            .map(|i| ((i as f32) * 0.1).sin())
+            .collect()
     } else {
         vec![0.0f32; seq * hd / 2]
     };
@@ -230,23 +274,34 @@ fn run_fused_backward_config(
 
     // ── CPU reference ──────────────────────────────────────────────────────
     let inputs = CshaInputs {
-        x: &x_for_ref, wq: &wq_f32, wk: &wk_f32, wv: &wv_f32,
-        norm_weight: &nw, cos: &cos, sin: &sin,
+        x: &x_for_ref,
+        wq: &wq_f32,
+        wk: &wk_f32,
+        wv: &wv_f32,
+        norm_weight: &nw,
+        cos: &cos,
+        sin: &sin,
     };
     let shape = CshaShape {
-        seq, heads: h, head_dim: hd, d_model: dm,
-        causal, norm_eps,
+        seq,
+        heads: h,
+        head_dim: hd,
+        d_model: dm,
+        causal,
+        norm_eps,
     };
     let cpu_grads = csha_reference_backward(&inputs, &shape, &do_host);
 
     // ── GPU: forward-with-saves then fused backward ────────────────────────
-    unsafe { nsl_cuda_init(); }
+    unsafe {
+        nsl_cuda_init();
+    }
     let qkv_bytes = (h * seq * hd * 2) as i64;
     let lse_bytes = (batch * h * seq * 4) as i64;
-    let x_bytes = (h * seq * hd * 4) as i64;  // kernel x is f32 per-head
-    let w_bytes = (dm * kv_dim * 2) as i64;    // stored as one [dm, kv_dim] f16 block
+    let x_bytes = (h * seq * hd * 4) as i64; // kernel x is f32 per-head
+    let w_bytes = (dm * kv_dim * 2) as i64; // stored as one [dm, kv_dim] f16 block
     let nw_bytes = (hd * 4) as i64;
-    let rope_bytes = (seq * hd / 2 * 2) as i64;  // f16, 2 bytes per element
+    let rope_bytes = (seq * hd / 2 * 2) as i64; // f16, 2 bytes per element
     let dw_bytes = (dm * kv_dim * 2) as i64;
     let dx_bytes = (h * seq * hd * 4) as i64;
 
@@ -278,19 +333,15 @@ fn run_fused_backward_config(
     let dxn_dev = unsafe { nsl_test_cuda_alloc(dxn_bytes) };
 
     let saves = unsafe {
-        nsl_csha_alloc_backward_activations(
-            batch as i64, heads as i64, seq as i64, hd as i64,
-        )
+        nsl_csha_alloc_backward_activations(batch as i64, heads as i64, seq as i64, hd as i64)
     };
     let all_dev = [
-        q_dev, k_dev, v_dev, out_dev, lse_dev, x_dev, nw_dev,
-        wq_dev, wk_dev, wv_dev, cos_dev, sin_dev,
-        do_dev, dq_dev, dk_dev, dv_dev, dwq_dev, dwk_dev, dwv_dev, dx_dev,
-        dxn_dev,
+        q_dev, k_dev, v_dev, out_dev, lse_dev, x_dev, nw_dev, wq_dev, wk_dev, wv_dev, cos_dev,
+        sin_dev, do_dev, dq_dev, dk_dev, dv_dev, dwq_dev, dwk_dev, dwv_dev, dx_dev, dxn_dev,
     ];
 
     unsafe {
-        nsl_test_cuda_h2d(x_dev,  x.as_ptr()  as i64, x_bytes);
+        nsl_test_cuda_h2d(x_dev, x.as_ptr() as i64, x_bytes);
         nsl_test_cuda_h2d(wq_dev, wq_f16.as_ptr() as i64, w_bytes);
         nsl_test_cuda_h2d(wk_dev, wk_f16.as_ptr() as i64, w_bytes);
         nsl_test_cuda_h2d(wv_dev, wv_f16.as_ptr() as i64, w_bytes);
@@ -304,25 +355,52 @@ fn run_fused_backward_config(
     let fwd_ptx = synthesize_flash_attention_ptx_v2(&config);
     let fwd_name = CString::new(flash_attention_kernel_name_v2(&config)).unwrap();
     let fwd_smem_total = smem_layout::total_bytes(&config);
-    let fwd_smem_dyn = if needs_dynamic_smem(&config) { fwd_smem_total as i64 } else { 0 };
+    let fwd_smem_dyn = if needs_dynamic_smem(&config) {
+        fwd_smem_total as i64
+    } else {
+        0
+    };
 
     let rc_fwd = unsafe {
         nsl_flash_attention_csha_with_saves(
-            q_dev, k_dev, v_dev, out_dev, lse_dev,
+            q_dev,
+            k_dev,
+            v_dev,
+            out_dev,
+            lse_dev,
             scale.to_bits() as i64,
-            batch as i64, heads as i64, seq as i64, hd as i64,
-            0, 0, 0, 0,
-            cos_dev, sin_dev,
-            0, 0,
+            batch as i64,
+            heads as i64,
+            seq as i64,
+            hd as i64,
+            0,
+            0,
+            0,
+            0,
+            cos_dev,
+            sin_dev,
+            0,
+            0,
             fwd_smem_dyn,
-            fwd_ptx.as_ptr() as i64, fwd_name.as_ptr() as i64,
-            block_q as i64, block_kv as i64,
+            fwd_ptx.as_ptr() as i64,
+            fwd_name.as_ptr() as i64,
+            block_q as i64,
+            block_kv as i64,
             if causal { 1 } else { 0 },
-            x_dev, nw_dev, wq_dev, wk_dev, wv_dev,
-            0, norm_eps.to_bits() as i64,
-            heads as i64, dm as i64,
-            saves.q_proj, saves.k_proj, saves.v_proj,
-            saves.row_max, saves.row_sum,
+            x_dev,
+            nw_dev,
+            wq_dev,
+            wk_dev,
+            wv_dev,
+            0,
+            norm_eps.to_bits() as i64,
+            heads as i64,
+            dm as i64,
+            saves.q_proj,
+            saves.k_proj,
+            saves.v_proj,
+            saves.row_max,
+            saves.row_sum,
             saves.x_raw,
         )
     };
@@ -330,41 +408,78 @@ fn run_fused_backward_config(
         let log = unsafe {
             let p = nsl_test_cuda_jit_log(fwd_ptx.as_ptr() as i64);
             if p != 0 {
-                std::ffi::CStr::from_ptr(p as *const i8).to_string_lossy().into_owned()
-            } else { "<no log>".into() }
+                std::ffi::CStr::from_ptr(p as *const i8)
+                    .to_string_lossy()
+                    .into_owned()
+            } else {
+                "<no log>".into()
+            }
         };
-        unsafe { nsl_csha_free_backward_activations(saves); }
+        unsafe {
+            nsl_csha_free_backward_activations(saves);
+        }
         free_all(&all_dev);
         return Err(format!("forward rc={rc_fwd}\nJIT log:\n{log}"));
     }
 
     // Backward PTX + name.
-    let mut bwd_ptx_str = synthesize_backward(&config)
-        .map_err(|e| format!("synth backward: {e}"))?;
-    if !bwd_ptx_str.ends_with('\0') { bwd_ptx_str.push('\0'); }
+    let mut bwd_ptx_str =
+        synthesize_backward(&config).map_err(|e| format!("synth backward: {e}"))?;
+    if !bwd_ptx_str.ends_with('\0') {
+        bwd_ptx_str.push('\0');
+    }
     let bwd_ptx = bwd_ptx_str.into_bytes();
     let bwd_name = CString::new(backward_kernel_name(&config)).unwrap();
 
     let rc_bwd = unsafe {
         nsl_flash_attention_csha_backward(
-            q_dev, k_dev, v_dev, out_dev, lse_dev,
+            q_dev,
+            k_dev,
+            v_dev,
+            out_dev,
+            lse_dev,
             scale.to_bits() as i64,
-            batch as i64, heads as i64, seq as i64, hd as i64,
-            0, 0, 0, 0,
-            cos_dev, sin_dev,
-            0, 0,
+            batch as i64,
+            heads as i64,
+            seq as i64,
+            hd as i64,
             0,
-            bwd_ptx.as_ptr() as i64, bwd_name.as_ptr() as i64,
-            block_q as i64, block_kv as i64,
+            0,
+            0,
+            0,
+            cos_dev,
+            sin_dev,
+            0,
+            0,
+            0,
+            bwd_ptx.as_ptr() as i64,
+            bwd_name.as_ptr() as i64,
+            block_q as i64,
+            block_kv as i64,
             if causal { 1 } else { 0 },
-            x_dev, nw_dev, wq_dev, wk_dev, wv_dev,
-            0, norm_eps.to_bits() as i64,
-            heads as i64, dm as i64,
-            saves.q_proj, saves.k_proj, saves.v_proj,
-            saves.row_max, saves.row_sum,
+            x_dev,
+            nw_dev,
+            wq_dev,
+            wk_dev,
+            wv_dev,
+            0,
+            norm_eps.to_bits() as i64,
+            heads as i64,
+            dm as i64,
+            saves.q_proj,
+            saves.k_proj,
+            saves.v_proj,
+            saves.row_max,
+            saves.row_sum,
             saves.x_raw,
-            do_dev, dq_dev, dk_dev, dv_dev,
-            dwq_dev, dwk_dev, dwv_dev, dx_dev,
+            do_dev,
+            dq_dev,
+            dk_dev,
+            dv_dev,
+            dwq_dev,
+            dwk_dev,
+            dwv_dev,
+            dx_dev,
             dxn_dev,
         )
     };
@@ -372,10 +487,16 @@ fn run_fused_backward_config(
         let log = unsafe {
             let p = nsl_test_cuda_jit_log(bwd_ptx.as_ptr() as i64);
             if p != 0 {
-                std::ffi::CStr::from_ptr(p as *const i8).to_string_lossy().into_owned()
-            } else { "<no log>".into() }
+                std::ffi::CStr::from_ptr(p as *const i8)
+                    .to_string_lossy()
+                    .into_owned()
+            } else {
+                "<no log>".into()
+            }
         };
-        unsafe { nsl_csha_free_backward_activations(saves); }
+        unsafe {
+            nsl_csha_free_backward_activations(saves);
+        }
         free_all(&all_dev);
         return Err(format!("backward rc={rc_bwd}\nJIT log:\n{log}"));
     }
@@ -383,12 +504,16 @@ fn run_fused_backward_config(
     // Readback.
     let read_f16 = |dev: i64, elems: usize| -> Vec<f32> {
         let mut raw = vec![0u16; elems];
-        unsafe { nsl_test_cuda_d2h(raw.as_mut_ptr() as i64, dev, (elems * 2) as i64); }
+        unsafe {
+            nsl_test_cuda_d2h(raw.as_mut_ptr() as i64, dev, (elems * 2) as i64);
+        }
         raw.iter().map(|&b| f16_to_f32(b)).collect()
     };
     let read_f32 = |dev: i64, elems: usize| -> Vec<f32> {
         let mut out = vec![0f32; elems];
-        unsafe { nsl_test_cuda_d2h(out.as_mut_ptr() as i64, dev, (elems * 4) as i64); }
+        unsafe {
+            nsl_test_cuda_d2h(out.as_mut_ptr() as i64, dev, (elems * 4) as i64);
+        }
         out
     };
 
@@ -405,20 +530,29 @@ fn run_fused_backward_config(
         dx: read_f32(dx_dev, dx_elems),
     };
 
-    unsafe { nsl_csha_free_backward_activations(saves); }
+    unsafe {
+        nsl_csha_free_backward_activations(saves);
+    }
     free_all(&all_dev);
 
     Ok((gpu_grads, cpu_grads))
 }
 
 fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b.iter())
+    a.iter()
+        .zip(b.iter())
         .map(|(&x, &y)| (x - y).abs())
         .fold(0f32, f32::max)
 }
 
 fn tol_for_head_dim(hd: u32) -> f32 {
-    if hd >= 128 { 4e-2 } else if hd >= 64 { 2e-2 } else { 5e-3 }
+    if hd >= 128 {
+        4e-2
+    } else if hd >= 64 {
+        2e-2
+    } else {
+        5e-3
+    }
 }
 
 #[test]
@@ -438,8 +572,12 @@ fn t6_3_smoke_single_config() {
 
     // Structural assertions — always enforced.
     for (name, arr) in [
-        ("dq", &gpu.dq), ("dk", &gpu.dk), ("dv", &gpu.dv),
-        ("dwq", &gpu.dwq), ("dwk", &gpu.dwk), ("dwv", &gpu.dwv),
+        ("dq", &gpu.dq),
+        ("dk", &gpu.dk),
+        ("dv", &gpu.dv),
+        ("dwq", &gpu.dwq),
+        ("dwk", &gpu.dwk),
+        ("dwv", &gpu.dwv),
         ("dx", &gpu.dx),
     ] {
         for (i, &v) in arr.iter().enumerate() {
@@ -534,44 +672,56 @@ fn t6_3_matrix_sweep_numerical() {
                 // forward alloc.  Construct the same config shape as
                 // run_fused_backward_config.
                 let pre_cfg = FlashAttentionConfig {
-                    block_q: bq as i64, block_kv: bkv as i64, head_dim: hd as i64,
-                    causal, paged: false, rope_q,
+                    block_q: bq as i64,
+                    block_kv: bkv as i64,
+                    head_dim: hd as i64,
+                    causal,
+                    paged: false,
+                    rope_q,
                     rope_style: RopeStyle::Adjacent,
-                    gqa_group_size: 1, tree_mask: false, gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras {
-                        level: 2, fused_rmsnorm: true, fused_projections: true,
+                    gqa_group_size: 1,
+                    tree_mask: false,
+                    gpu_sm: 75,
+                    segment_masked: false,
+                    csha: Some(CshaExtras {
+                        level: 2,
+                        fused_rmsnorm: true,
+                        fused_projections: true,
                         fused_output_proj: false,
                         save_activations_for_backward: true,
                         active_heads: heads,
-                        rmsnorm_eps: 1e-5, d_model: dm,
+                        rmsnorm_eps: 1e-5,
+                        d_model: dm,
                     }),
                 };
-                if let Err(e) = smem_layout::validate_scalar_v2_config(
-                    &pre_cfg, Direction::Backward,
-                ) {
+                if let Err(e) =
+                    smem_layout::validate_scalar_v2_config(&pre_cfg, Direction::Backward)
+                {
                     let fwd = smem_layout::total_bytes(&pre_cfg);
                     let extra = smem_layout::backward_extra_bytes(&pre_cfg);
                     eprintln!(
                         "[sweep] hd={hd} causal={} rope={} SKIP validator \
                          (fwd={fwd}B extra={extra}B total={}B): {e}",
-                        causal as u8, rope_q as u8, fwd + extra
+                        causal as u8,
+                        rope_q as u8,
+                        fwd + extra
                     );
                     tally.skipped_validator += 1;
                     continue;
                 }
 
-                let (gpu, cpu) = match run_fused_backward_config(
-                    bq, bkv, hd, heads, dm, causal, rope_q,
-                ) {
-                    Ok(pair) => pair,
-                    Err(e) => {
-                        eprintln!(
-                            "[sweep] hd={hd} causal={} rope={} SKIP launch: {e}",
-                            causal as u8, rope_q as u8
-                        );
-                        tally.skipped_launch += 1;
-                        continue;
-                    }
-                };
+                let (gpu, cpu) =
+                    match run_fused_backward_config(bq, bkv, hd, heads, dm, causal, rope_q) {
+                        Ok(pair) => pair,
+                        Err(e) => {
+                            eprintln!(
+                                "[sweep] hd={hd} causal={} rope={} SKIP launch: {e}",
+                                causal as u8, rope_q as u8
+                            );
+                            tally.skipped_launch += 1;
+                            continue;
+                        }
+                    };
 
                 let dq = max_abs_diff(&gpu.dq, &cpu.dq);
                 let dk = max_abs_diff(&gpu.dk, &cpu.dk);
@@ -589,14 +739,26 @@ fn t6_3_matrix_sweep_numerical() {
 
                 let mut fails: Vec<String> = Vec::new();
                 if NUMERICAL_GATE_DQKV_ENABLED {
-                    if dq >= tol { fails.push(format!("dq={dq:.2e}>{tol:.0e}")); }
-                    if dk >= tol { fails.push(format!("dk={dk:.2e}>{tol:.0e}")); }
-                    if dv >= tol { fails.push(format!("dv={dv:.2e}>{tol:.0e}")); }
+                    if dq >= tol {
+                        fails.push(format!("dq={dq:.2e}>{tol:.0e}"));
+                    }
+                    if dk >= tol {
+                        fails.push(format!("dk={dk:.2e}>{tol:.0e}"));
+                    }
+                    if dv >= tol {
+                        fails.push(format!("dv={dv:.2e}>{tol:.0e}"));
+                    }
                 }
                 if NUMERICAL_GATE_DW_ENABLED {
-                    if dwq >= tol { fails.push(format!("dwq={dwq:.2e}>{tol:.0e}")); }
-                    if dwk >= tol { fails.push(format!("dwk={dwk:.2e}>{tol:.0e}")); }
-                    if dwv >= tol { fails.push(format!("dwv={dwv:.2e}>{tol:.0e}")); }
+                    if dwq >= tol {
+                        fails.push(format!("dwq={dwq:.2e}>{tol:.0e}"));
+                    }
+                    if dwk >= tol {
+                        fails.push(format!("dwk={dwk:.2e}>{tol:.0e}"));
+                    }
+                    if dwv >= tol {
+                        fails.push(format!("dwv={dwv:.2e}>{tol:.0e}"));
+                    }
                 }
                 if NUMERICAL_GATE_DX_ENABLED && dx >= dx_tol {
                     fails.push(format!("dx={dx:.2e}>{dx_tol:.0e}"));
@@ -607,8 +769,13 @@ fn t6_3_matrix_sweep_numerical() {
                     "[sweep] hd={hd} causal={} rope={}: dq={dq:.2e} dk={dk:.2e} \
                      dv={dv:.2e} dwq={dwq:.2e} dwk={dwk:.2e} dwv={dwv:.2e} dx={dx:.2e} \
                      [{status}]{}",
-                    causal as u8, rope_q as u8,
-                    if fails.is_empty() { "".into() } else { format!(" ({})", fails.join(",")) }
+                    causal as u8,
+                    rope_q as u8,
+                    if fails.is_empty() {
+                        "".into()
+                    } else {
+                        format!(" ({})", fails.join(","))
+                    }
                 );
                 if fails.is_empty() {
                     tally.pass += 1;
@@ -616,7 +783,9 @@ fn t6_3_matrix_sweep_numerical() {
                     tally.fail += 1;
                     tally.fail_detail.push(format!(
                         "hd={hd} causal={} rope={}: {}",
-                        causal as u8, rope_q as u8, fails.join(",")
+                        causal as u8,
+                        rope_q as u8,
+                        fails.join(",")
                     ));
                 }
             }
@@ -630,7 +799,8 @@ fn t6_3_matrix_sweep_numerical() {
     if tally.fail > 0 {
         panic!(
             "numerical sweep: {} config(s) failed:\n  {}",
-            tally.fail, tally.fail_detail.join("\n  ")
+            tally.fail,
+            tally.fail_detail.join("\n  ")
         );
     }
 }
@@ -646,7 +816,7 @@ fn t6_3_matrix_sweep_structural() {
     // finite gradients. Numerical tolerance comparison stays blocked.
     let configs: &[(u32, u32, u32, u32, u32, bool, bool)] = &[
         (32, 32, 32, 1, 32, false, false),
-        (32, 32, 32, 1, 32, true,  false),
+        (32, 32, 32, 1, 32, true, false),
         (32, 32, 32, 1, 32, false, true),
     ];
     for &(bq, bkv, hd, h, dm, causal, rope) in configs {
@@ -664,8 +834,12 @@ fn t6_3_matrix_sweep_structural() {
                 // row_sum=0 on a zero-init readback slot). Once real
                 // HBM loads land, enable alongside NUMERICAL_GATE_ENABLED.
                 for (name, arr) in [
-                    ("dq", &gpu.dq), ("dk", &gpu.dk), ("dv", &gpu.dv),
-                    ("dwq", &gpu.dwq), ("dwk", &gpu.dwk), ("dwv", &gpu.dwv),
+                    ("dq", &gpu.dq),
+                    ("dk", &gpu.dk),
+                    ("dv", &gpu.dv),
+                    ("dwq", &gpu.dwq),
+                    ("dwk", &gpu.dwk),
+                    ("dwv", &gpu.dwv),
                     ("dx", &gpu.dx),
                 ] {
                     let bad = arr.iter().filter(|v| !v.is_finite()).count();
@@ -710,31 +884,56 @@ fn t6_3_element_dump_diag() {
         let mut peak_idx = 0usize;
         for (i, (&g, &c)) in gpu.iter().zip(cpu.iter()).enumerate() {
             let d = (g - c).abs();
-            if d > max_abs { max_abs = d; peak_idx = i; }
+            if d > max_abs {
+                max_abs = d;
+                peak_idx = i;
+            }
         }
         let zeros = gpu.iter().filter(|v| v.abs() < 1e-8).count();
         let const_q = {
             // crude "is it nearly constant" heuristic: min/max spread
             let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
-            for &v in gpu { if v < lo { lo = v; } if v > hi { hi = v; } }
+            for &v in gpu {
+                if v < lo {
+                    lo = v;
+                }
+                if v > hi {
+                    hi = v;
+                }
+            }
             hi - lo
         };
         // cpu × scalar check: median(gpu/cpu) — pick a few non-tiny cpu entries.
         let mut ratios = Vec::new();
         for (&g, &c) in gpu.iter().zip(cpu.iter()).take(64) {
-            if c.abs() > 1e-3 { ratios.push(g / c); }
+            if c.abs() > 1e-3 {
+                ratios.push(g / c);
+            }
         }
         ratios.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-        let median_ratio = if ratios.is_empty() { f32::NAN } else { ratios[ratios.len() / 2] };
+        let median_ratio = if ratios.is_empty() {
+            f32::NAN
+        } else {
+            ratios[ratios.len() / 2]
+        };
 
         eprintln!("─── {name}  len={}  max_abs_diff={:.3e}  zero_count={}/{}  spread(hi-lo)={:.3e}  median(g/c)={:.3e}",
             gpu.len(), max_abs, zeros, gpu.len(), const_q, median_ratio);
-        eprintln!("  peak idx={peak_idx} gpu={:.4e} cpu={:.4e} diff={:.4e}",
-            gpu[peak_idx], cpu[peak_idx], gpu[peak_idx] - cpu[peak_idx]);
+        eprintln!(
+            "  peak idx={peak_idx} gpu={:.4e} cpu={:.4e} diff={:.4e}",
+            gpu[peak_idx],
+            cpu[peak_idx],
+            gpu[peak_idx] - cpu[peak_idx]
+        );
         eprintln!("  first 8:   idx | gpu           | cpu           | diff");
         for i in 0..8.min(gpu.len()) {
-            eprintln!("            {:>3} | {:>13.5e} | {:>13.5e} | {:>13.5e}",
-                i, gpu[i], cpu[i], gpu[i] - cpu[i]);
+            eprintln!(
+                "            {:>3} | {:>13.5e} | {:>13.5e} | {:>13.5e}",
+                i,
+                gpu[i],
+                cpu[i],
+                gpu[i] - cpu[i]
+            );
         }
     }
 
@@ -742,10 +941,12 @@ fn t6_3_element_dump_diag() {
     dump("dq", &gpu.dq, &cpu.dq);
     dump("dk", &gpu.dk, &cpu.dk);
     dump("dv", &gpu.dv, &cpu.dv);
-    eprintln!("[T6.3 diag] SMEM-aliasing hypothesis: backward prelude sets \
+    eprintln!(
+        "[T6.3 diag] SMEM-aliasing hypothesis: backward prelude sets \
         %k_smem_base and %v_smem_base BOTH to kv_offset (phases/backward/prelude.rs:174-179). \
         After kv_load::emit_v runs (mod.rs:472), the K tile holds V data. ds_compute then \
         recomputes S = Q·V^T instead of Q·K^T (ds_compute.rs:75), corrupting P, dS, dP \
         and therefore dq/dk/dv. Fix: allocate a separate V-input SMEM region (e.g. extend \
-        backward_extra_bytes by block_kv*head_dim*2) and point %v_smem_base there.");
+        backward_extra_bytes by block_kv*head_dim*2) and point %v_smem_base there."
+    );
 }

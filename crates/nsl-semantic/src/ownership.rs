@@ -121,7 +121,10 @@ impl<'a> OwnershipChecker<'a> {
             Some(OwnershipState::Shared) => {
                 // @shared — always valid
             }
-            Some(OwnershipState::Consumed { at: prev_span, by: prev_by }) => {
+            Some(OwnershipState::Consumed {
+                at: prev_span,
+                by: prev_by,
+            }) => {
                 self.diagnostics.push(
                     Diagnostic::error(format!("use of moved tensor '{name}'"))
                         .with_label(*prev_span, format!("value moved here, by '{prev_by}'"))
@@ -131,8 +134,10 @@ impl<'a> OwnershipChecker<'a> {
             Some(OwnershipState::Borrowed) => {
                 // Cannot consume a borrow — it's read-only
                 self.diagnostics.push(
-                    Diagnostic::error(format!("cannot consume borrowed tensor '{name}' — borrows are read-only"))
-                        .with_label(at, "attempted to consume borrow"),
+                    Diagnostic::error(format!(
+                        "cannot consume borrowed tensor '{name}' — borrows are read-only"
+                    ))
+                    .with_label(at, "attempted to consume borrow"),
                 );
             }
             Some(OwnershipState::Owned) | None => {
@@ -153,10 +158,7 @@ impl<'a> OwnershipChecker<'a> {
                 if self.loop_depth > 0 {
                     // Search ALL loop frames, not just innermost — a tensor defined
                     // in an outer loop is valid to consume in an inner loop.
-                    let defined_in_loop = self
-                        .loop_defined
-                        .iter()
-                        .any(|s| s.contains_key(&sym));
+                    let defined_in_loop = self.loop_defined.iter().any(|s| s.contains_key(&sym));
                     if !defined_in_loop {
                         self.diagnostics.push(
                             Diagnostic::error(format!(
@@ -257,7 +259,11 @@ impl<'a> OwnershipChecker<'a> {
         after_else: &HashMap<Symbol, OwnershipState>,
         if_span: Span,
     ) {
-        self.check_multi_branch_symmetry(before, &[after_then.clone(), after_else.clone()], if_span);
+        self.check_multi_branch_symmetry(
+            before,
+            &[after_then.clone(), after_else.clone()],
+            if_span,
+        );
     }
 
     pub fn check_multi_branch_symmetry(
@@ -298,12 +304,16 @@ impl<'a> OwnershipChecker<'a> {
                 .iter()
                 .all(|branch| branch.get(&sym).map(|s| s.is_consumed()).unwrap_or(false));
             if consumed_in_all {
-                if let Some(OwnershipState::Consumed { at, by }) = branches
-                    .iter()
-                    .find_map(|branch| branch.get(&sym))
+                if let Some(OwnershipState::Consumed { at, by }) =
+                    branches.iter().find_map(|branch| branch.get(&sym))
                 {
-                    self.states
-                        .insert(sym, OwnershipState::Consumed { at: *at, by: by.clone() });
+                    self.states.insert(
+                        sym,
+                        OwnershipState::Consumed {
+                            at: *at,
+                            by: by.clone(),
+                        },
+                    );
                 }
             }
         }

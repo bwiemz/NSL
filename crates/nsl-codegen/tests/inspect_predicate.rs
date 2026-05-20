@@ -65,7 +65,11 @@ fn parses_parens() {
 fn rejects_unknown_identifier() {
     let err = parse_predicate("foo > 1").unwrap_err();
     assert!(err.contains("unknown identifier"), "got {:?}", err);
-    assert!(err.contains("foo"), "should mention the bad ident: {:?}", err);
+    assert!(
+        err.contains("foo"),
+        "should mention the bad ident: {:?}",
+        err
+    );
 }
 
 #[test]
@@ -85,7 +89,14 @@ fn accepts_all_comparators() {
 
 #[test]
 fn accepts_all_health_idents() {
-    for ident in &["step", "loss", "loss_ema", "loss_ema_slope", "grad_norm_total", "nan_inf_count_window"] {
+    for ident in &[
+        "step",
+        "loss",
+        "loss_ema",
+        "loss_ema_slope",
+        "grad_norm_total",
+        "nan_inf_count_window",
+    ] {
         let src = format!("{} > 0", ident);
         assert!(parse_predicate(&src).is_ok(), "should parse {:?}", src);
     }

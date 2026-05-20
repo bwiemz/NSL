@@ -41,11 +41,13 @@ pub fn emit_store_dq_only(ptx: &mut String, config: &FlashAttentionConfig, q_til
         ptx.push_str("    cvt.u64.u32 %rd_dq_idx, %tid_x;\n");
         if thread_cell > 0 {
             ptx.push_str(&format!(
-                "    add.u64 %rd_dq_idx, %rd_dq_idx, {};\n", thread_cell
+                "    add.u64 %rd_dq_idx, %rd_dq_idx, {};\n",
+                thread_cell
             ));
         }
         ptx.push_str(&format!(
-            "    setp.lt.u64 %p_dq_g, %rd_dq_idx, {};\n", dq_cells
+            "    setp.lt.u64 %p_dq_g, %rd_dq_idx, {};\n",
+            dq_cells
         ));
         ptx.push_str("    div.u64 %rd42, %rd_dq_idx, %rd7;\n");
         ptx.push_str("    add.u64 %rd43, %rd42, %q_start;\n");
@@ -109,11 +111,13 @@ pub fn emit_store_kv_only(ptx: &mut String, config: &FlashAttentionConfig, q_til
             ptx.push_str("    cvt.u64.u32 %rd_dk_idx, %tid_x;\n");
             if thread_cell > 0 {
                 ptx.push_str(&format!(
-                    "    add.u64 %rd_dk_idx, %rd_dk_idx, {};\n", thread_cell
+                    "    add.u64 %rd_dk_idx, %rd_dk_idx, {};\n",
+                    thread_cell
                 ));
             }
             ptx.push_str(&format!(
-                "    setp.lt.u64 %p_dk, %rd_dk_idx, {};\n", total_cells
+                "    setp.lt.u64 %p_dk, %rd_dk_idx, {};\n",
+                total_cells
             ));
             ptx.push_str("    div.u64 %rd42, %rd_dk_idx, %rd7;\n");
             ptx.push_str("    add.u64 %rd43, %rd42, %k_start;\n");
@@ -133,9 +137,7 @@ pub fn emit_store_kv_only(ptx: &mut String, config: &FlashAttentionConfig, q_til
             ptx.push_str("    @%p_dk add.f32 %f_dk_tmp, %f_dk_tmp, %f0;\n");
             ptx.push_str("    @%p_dk st.global.f32 [%rd_dk_hbm], %f_dk_tmp;\n");
         }
-        ptx.push_str(&format!(
-            "V2_BWD_STORE_{label}_SKIP_{q_tile_iter}:\n"
-        ));
+        ptx.push_str(&format!("V2_BWD_STORE_{label}_SKIP_{q_tile_iter}:\n"));
     }
     ptx.push_str("    bar.sync 0;\n");
 }
@@ -192,9 +194,7 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
         ptx.push_str(&format!(
             "    @%p0 bra V2_BWD_STORE_{label}_SKIP_{q_tile_iter};\n"
         ));
-        ptx.push_str(&format!(
-            "V2_BWD_STORE_{label}_SKIP_{q_tile_iter}:\n"
-        ));
+        ptx.push_str(&format!("V2_BWD_STORE_{label}_SKIP_{q_tile_iter}:\n"));
     }
 
     // DX — hook-managed (emit_drmsnorm phase 2 writes f32 directly).
@@ -203,9 +203,7 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
     ptx.push_str(&format!(
         "    @%p0 bra V2_BWD_STORE_DX_SKIP_{q_tile_iter};\n"
     ));
-    ptx.push_str(&format!(
-        "V2_BWD_STORE_DX_SKIP_{q_tile_iter}:\n"
-    ));
+    ptx.push_str(&format!("V2_BWD_STORE_DX_SKIP_{q_tile_iter}:\n"));
 
     // Final fence: all lanes must finish before kernel exits so no
     // store-in-flight beats the implicit grid fence from cuLaunch.
@@ -218,14 +216,24 @@ mod tests {
     use crate::flash_attention::{CshaExtras, FlashAttentionConfig, RopeStyle};
 
     fn base_cfg_fused_backward(
-        block_q: i64, block_kv: i64, head_dim: i64, heads: u32, d_model: u32,
+        block_q: i64,
+        block_kv: i64,
+        head_dim: i64,
+        heads: u32,
+        d_model: u32,
     ) -> FlashAttentionConfig {
         let _ = heads;
         FlashAttentionConfig {
-            block_q, block_kv, head_dim,
-            causal: false, paged: false, rope_q: false,
+            block_q,
+            block_kv,
+            head_dim,
+            causal: false,
+            paged: false,
+            rope_q: false,
             rope_style: RopeStyle::HalfSplit,
-            gqa_group_size: 1, tree_mask: false, gpu_sm: 75,
+            gqa_group_size: 1,
+            tree_mask: false,
+            gpu_sm: 75,
             segment_masked: false,
             csha: Some(CshaExtras {
                 fused_projections: true,
@@ -251,8 +259,10 @@ mod tests {
         // param block now.
         assert!(ptx.contains("dk_scratch_ptr"));
         assert!(ptx.contains("dv_scratch_ptr"));
-        assert!(ptx.contains("st.global.f32"),
-            "dK/dV must RMW into f32 scratch (not f16)");
+        assert!(
+            ptx.contains("st.global.f32"),
+            "dK/dV must RMW into f32 scratch (not f16)"
+        );
         assert!(ptx.contains("dwq_ptr"));
         assert!(ptx.contains("dwk_ptr"));
         assert!(ptx.contains("dwv_ptr"));
@@ -269,10 +279,14 @@ mod tests {
         let cfg = base_cfg_fused_backward(32, 32, 32, 4, 32);
         let mut ptx = String::new();
         emit(&mut ptx, &cfg, 0);
-        assert!(ptx.contains("st.global.b16"),
-            "dQ is still written as f16 in finalize");
-        assert!(ptx.contains("st.global.f32"),
-            "dK/dV accumulate in f32 scratch (saturation fix)");
+        assert!(
+            ptx.contains("st.global.b16"),
+            "dQ is still written as f16 in finalize"
+        );
+        assert!(
+            ptx.contains("st.global.f32"),
+            "dK/dV accumulate in f32 scratch (saturation fix)"
+        );
     }
 
     #[test]

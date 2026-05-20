@@ -44,8 +44,8 @@ use std::path::PathBuf;
 /// `CARGO_MANIFEST_DIR` points to `crates/nsl-codegen`, so we go two
 /// levels up to reach the workspace root.
 fn baselines_dir() -> PathBuf {
-    let manifest = std::env::var("CARGO_MANIFEST_DIR")
-        .expect("CARGO_MANIFEST_DIR not set by Cargo");
+    let manifest =
+        std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set by Cargo");
     PathBuf::from(&manifest)
         .join("..")
         .join("..")
@@ -248,7 +248,10 @@ fn regenerate_baseline(variant: &str, cfg: &FlashAttentionConfig, sm: u32) {
             write_baseline_file(&path, &b, "2026-05-13");
             eprintln!(
                 "[WROTE] {} → {} (instruction_count={}, spill_bytes={})",
-                variant, path.display(), b.instruction_count, b.spill_bytes,
+                variant,
+                path.display(),
+                b.instruction_count,
+                b.spill_bytes,
             );
         }
         None => {
@@ -275,7 +278,8 @@ fn regenerate_baseline(variant: &str, cfg: &FlashAttentionConfig, sm: u32) {
             write_baseline_file(&path, &b, "2026-05-13");
             eprintln!(
                 "[WROTE placeholder] {} → {} (instruction_count=0, spill_bytes=0)",
-                variant, path.display(),
+                variant,
+                path.display(),
             );
         }
     }

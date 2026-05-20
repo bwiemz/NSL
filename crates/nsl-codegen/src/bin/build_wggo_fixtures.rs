@@ -55,8 +55,7 @@ fn main() {
             // Default: tests/fixtures/ relative to the manifest dir (repo root).
             // CARGO_MANIFEST_DIR points to the crate dir; go up two levels to reach
             // the workspace root, then into tests/fixtures/.
-            let manifest = std::env::var("CARGO_MANIFEST_DIR")
-                .unwrap_or_else(|_| ".".into());
+            let manifest = std::env::var("CARGO_MANIFEST_DIR").unwrap_or_else(|_| ".".into());
             PathBuf::from(&manifest)
                 .join("../..")
                 .join("tests/fixtures")
@@ -67,7 +66,10 @@ fn main() {
 
     let out_dir = Path::new(&out_dir_string);
     std::fs::create_dir_all(out_dir).unwrap_or_else(|e| {
-        eprintln!("error: could not create output directory {}: {e}", out_dir.display());
+        eprintln!(
+            "error: could not create output directory {}: {e}",
+            out_dir.display()
+        );
         std::process::exit(1);
     });
 

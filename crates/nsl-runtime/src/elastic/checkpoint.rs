@@ -100,7 +100,8 @@ impl CheckpointManager {
         self.cpu_buffer.clear();
         self.cpu_buffer.extend_from_slice(model_data);
         self.last_tier1 = iteration;
-        self.tier1_bytes.fetch_add(model_data.len() as u64, Ordering::Relaxed);
+        self.tier1_bytes
+            .fetch_add(model_data.len() as u64, Ordering::Relaxed);
     }
 
     /// Perform Tier 2 checkpoint: write CPU buffer to NVMe.
@@ -120,7 +121,7 @@ impl CheckpointManager {
         data.extend_from_slice(b"NSLM"); // magic
         data.extend_from_slice(&iteration.to_le_bytes()); // iteration
         data.extend_from_slice(&(self.cpu_buffer.len() as u64).to_le_bytes()); // data size
-        // Pad to 64-byte alignment
+                                                                               // Pad to 64-byte alignment
         let padding = (64 - (data.len() % 64)) % 64;
         data.extend(vec![0u8; padding]);
         data.extend_from_slice(&self.cpu_buffer);
@@ -129,7 +130,8 @@ impl CheckpointManager {
             .map_err(|e| format!("failed to write checkpoint to '{}': {e}", path.display()))?;
 
         self.last_tier2 = iteration;
-        self.tier2_bytes.fetch_add(data.len() as u64, Ordering::Relaxed);
+        self.tier2_bytes
+            .fetch_add(data.len() as u64, Ordering::Relaxed);
         Ok(())
     }
 
@@ -142,10 +144,8 @@ impl CheckpointManager {
         // Real implementation would use multipart upload to S3/GCS.
         // For now, just record that we would upload.
         self.last_tier3 = iteration;
-        self.tier3_bytes.fetch_add(
-            self.tier2_bytes.load(Ordering::Relaxed),
-            Ordering::Relaxed,
-        );
+        self.tier3_bytes
+            .fetch_add(self.tier2_bytes.load(Ordering::Relaxed), Ordering::Relaxed);
         Ok(())
     }
 
@@ -198,7 +198,10 @@ impl CheckpointManager {
             return Err("checkpoint file truncated".into());
         }
 
-        Ok((stored_iter, raw[data_start..data_start + data_size].to_vec()))
+        Ok((
+            stored_iter,
+            raw[data_start..data_start + data_size].to_vec(),
+        ))
     }
 
     /// Calculate optimal checkpoint interval using sqrt(2*C*MTBF).
@@ -252,7 +255,10 @@ mod tests {
         assert_eq!(mgr.should_checkpoint(5), None);
         assert_eq!(mgr.should_checkpoint(10), Some(CheckpointTier::GpuToCpu));
         assert_eq!(mgr.should_checkpoint(100), Some(CheckpointTier::CpuToNvme));
-        assert_eq!(mgr.should_checkpoint(1000), Some(CheckpointTier::NvmeToRemote));
+        assert_eq!(
+            mgr.should_checkpoint(1000),
+            Some(CheckpointTier::NvmeToRemote)
+        );
         assert_eq!(mgr.should_checkpoint(50), Some(CheckpointTier::GpuToCpu));
     }
 
@@ -291,7 +297,9 @@ mod tests {
     fn test_optimal_interval() {
         // 1000-GPU cluster: MTBF ≈ 2 hours (7200s), checkpoint cost ≈ 30s
         let interval = CheckpointManager::optimal_interval(30.0, 7200.0);
-        assert!(interval > 600.0 && interval < 700.0,
-            "optimal interval should be ~657s for MTBF=2h, C=30s, got {interval}");
+        assert!(
+            interval > 600.0 && interval < 700.0,
+            "optimal interval should be ~657s for MTBF=2h, C=30s, got {interval}"
+        );
     }
 }

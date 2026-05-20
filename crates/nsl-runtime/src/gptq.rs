@@ -19,9 +19,7 @@
 use std::sync::atomic::AtomicI64;
 use std::sync::Mutex;
 
-use crate::awq::{
-    AwqPackedWeight, compute_group_params, quantize_int4, write_nibble,
-};
+use crate::awq::{compute_group_params, quantize_int4, write_nibble, AwqPackedWeight};
 use crate::memory::checked_alloc;
 use crate::tensor::NslTensor;
 
@@ -254,7 +252,9 @@ pub fn gptq_quantize_obq(
     let col_order: Vec<usize> = if config.act_order {
         let mut order: Vec<usize> = (0..k).collect();
         order.sort_by(|&a, &b| {
-            hessian[b * k + b].partial_cmp(&hessian[a * k + a]).unwrap_or(std::cmp::Ordering::Equal)
+            hessian[b * k + b]
+                .partial_cmp(&hessian[a * k + a])
+                .unwrap_or(std::cmp::Ordering::Equal)
         });
         order
     } else {
@@ -271,7 +271,11 @@ pub fn gptq_quantize_obq(
     let mut zeros = vec![0.0f64; num_groups * n];
 
     // Step 4: Column-wise OBQ with optional blocking
-    let block_size = if config.block_size > 0 { config.block_size.min(k) } else { k };
+    let block_size = if config.block_size > 0 {
+        config.block_size.min(k)
+    } else {
+        k
+    };
 
     for block_start in (0..k).step_by(block_size) {
         let block_end = (block_start + block_size).min(k);
@@ -342,10 +346,7 @@ pub fn gptq_quantize_obq(
                     let scale = scales[g * n + row];
                     let zero = zeros[g * n + row];
 
-                    let q = crate::awq::read_nibble(
-                        &packed_data,
-                        col * n + row,
-                    );
+                    let q = crate::awq::read_nibble(&packed_data, col * n + row);
                     let q_val = (q as f64) * scale + zero;
                     // Use the weight value as it was when this column was quantized
                     // (already includes within-block error compensation from earlier columns).
@@ -502,7 +503,9 @@ pub extern "C" fn nsl_gptq_hessian_finalize() -> i64 {
     let len = k * k;
     let data = checked_alloc(len * std::mem::size_of::<f64>()) as *mut f64;
     for (i, &v) in h.iter().enumerate() {
-        unsafe { *data.add(i) = v; }
+        unsafe {
+            *data.add(i) = v;
+        }
     }
 
     let shape = checked_alloc(2 * std::mem::size_of::<i64>()) as *mut i64;
@@ -518,10 +521,10 @@ pub extern "C" fn nsl_gptq_hessian_finalize() -> i64 {
         strides,
         2,
         len as i64,
-        0,  // CPU
-        0,  // f64
-        1,  // owns_data
-        0,  // no owner
+        0, // CPU
+        0, // f64
+        1, // owns_data
+        0, // no owner
     ));
     NslTensor::publish(tensor)
 }
@@ -545,9 +548,16 @@ pub extern "C" fn nsl_gptq_quantize(
     group_size: i64,
     bits: i64,
 ) -> i64 {
-    if weight_ptr == 0 { eprintln!("nsl_gptq_quantize: null weight tensor"); return 0; }
+    if weight_ptr == 0 {
+        eprintln!("nsl_gptq_quantize: null weight tensor");
+        return 0;
+    }
     let t = unsafe { &*(weight_ptr as *const NslTensor) };
-    assert!(t.ndim >= 2, "nsl_gptq_quantize requires 2D weight tensor (got {}D)", t.ndim);
+    assert!(
+        t.ndim >= 2,
+        "nsl_gptq_quantize requires 2D weight tensor (got {}D)",
+        t.ndim
+    );
     let len = t.len as usize;
 
     let data: Vec<f64> = if t.dtype == 1 {
@@ -614,7 +624,9 @@ pub extern "C" fn nsl_gptq_quantize_ext(
     let hessian = if hessian_ptr == 0 {
         // No Hessian → identity for RTN
         let mut h = vec![0.0; k * k];
-        for i in 0..k { h[i * k + i] = 1.0; }
+        for i in 0..k {
+            h[i * k + i] = 1.0;
+        }
         h
     } else {
         let h = unsafe { &*(hessian_ptr as *const NslTensor) };
@@ -670,7 +682,11 @@ mod tests {
     /// Compute mean squared error between two vectors.
     fn mse(a: &[f64], b: &[f64]) -> f64 {
         assert_eq!(a.len(), b.len());
-        a.iter().zip(b.iter()).map(|(x, y)| (x - y).powi(2)).sum::<f64>() / a.len() as f64
+        a.iter()
+            .zip(b.iter())
+            .map(|(x, y)| (x - y).powi(2))
+            .sum::<f64>()
+            / a.len() as f64
     }
 
     /// Reference matmul A[M,K] @ B[K,N] -> C[M,N]
@@ -696,17 +712,13 @@ mod tests {
     fn test_hessian_accumulator_identity() {
         // If calibration data is identity matrix, H = I/n
         let mut acc = HessianAccumulator::new(3);
-        let identity = vec![
-            1.0, 0.0, 0.0,
-            0.0, 1.0, 0.0,
-            0.0, 0.0, 1.0,
-        ];
+        let identity = vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
         acc.add_batch(&identity, 3);
         let h = acc.finalize();
         // H should be I/3
-        assert!((h[0] - 1.0/3.0).abs() < 1e-10);
-        assert!((h[4] - 1.0/3.0).abs() < 1e-10);
-        assert!((h[8] - 1.0/3.0).abs() < 1e-10);
+        assert!((h[0] - 1.0 / 3.0).abs() < 1e-10);
+        assert!((h[4] - 1.0 / 3.0).abs() < 1e-10);
+        assert!((h[8] - 1.0 / 3.0).abs() < 1e-10);
         assert!(h[1].abs() < 1e-10);
     }
 
@@ -773,7 +785,9 @@ mod tests {
             assert!(
                 (orig - rec).abs() < 0.15,
                 "GPTQ RTN error too high at {}: orig={}, recovered={}",
-                i, orig, rec
+                i,
+                orig,
+                rec
             );
         }
 
@@ -832,7 +846,8 @@ mod tests {
         assert!(
             mse_obq <= mse_rtn * 1.05, // allow 5% tolerance for edge cases
             "OBQ MSE ({:.6}) should be <= RTN MSE ({:.6})",
-            mse_obq, mse_rtn
+            mse_obq,
+            mse_rtn
         );
 
         unsafe {
@@ -867,7 +882,9 @@ mod tests {
             assert!(
                 (orig - rec).abs() < 0.2,
                 "OBQ with identity H error too high at {}: orig={:.3}, recovered={:.3}",
-                i, orig, rec
+                i,
+                orig,
+                rec
             );
         }
 
@@ -915,7 +932,11 @@ mod tests {
 
         // Both should produce reasonable quantization
         assert!(mse_full < 0.1, "Full OBQ MSE too high: {:.6}", mse_full);
-        assert!(mse_blocked < 0.1, "Blocked OBQ MSE too high: {:.6}", mse_blocked);
+        assert!(
+            mse_blocked < 0.1,
+            "Blocked OBQ MSE too high: {:.6}",
+            mse_blocked
+        );
 
         unsafe {
             awq_free_packed(&packed_full);
@@ -987,7 +1008,9 @@ mod tests {
 
         // GPTQ quantized matmul
         let mut hessian = vec![0.0; k * k];
-        for i in 0..k { hessian[i * k + i] = 1.0; }
+        for i in 0..k {
+            hessian[i * k + i] = 1.0;
+        }
         let config = GptqConfig {
             bits: 4,
             group_size: k,
@@ -1002,7 +1025,9 @@ mod tests {
             assert!(
                 (r - g).abs() < tol,
                 "GPTQ matmul error at {}: ref={:.4}, gptq={:.4}",
-                i, r, g
+                i,
+                r,
+                g
             );
         }
 
@@ -1087,7 +1112,9 @@ mod tests {
         let n = 4;
         let weights: Vec<f64> = (0..16).map(|i| i as f64 * 0.1).collect();
         let mut hessian = vec![0.0; k * k];
-        for i in 0..k { hessian[i * k + i] = 1.0; }
+        for i in 0..k {
+            hessian[i * k + i] = 1.0;
+        }
 
         let packed = gptq_quantize_cpu(&weights, &hessian, k, n, 4, 4);
         let recovered = awq_dequantize_cpu(&packed);

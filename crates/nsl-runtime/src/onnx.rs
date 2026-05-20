@@ -80,20 +80,14 @@ unsafe fn tensor_raw_bytes(t: &NslTensor) -> (Vec<u8>, i32) {
             // f64 CPU
             let ptr = t.data as *const f64;
             let slice = std::slice::from_raw_parts(ptr, len);
-            let bytes: Vec<u8> = slice
-                .iter()
-                .flat_map(|v| v.to_le_bytes())
-                .collect();
+            let bytes: Vec<u8> = slice.iter().flat_map(|v| v.to_le_bytes()).collect();
             (bytes, DOUBLE)
         }
         1 => {
             // f32 GPU or CPU
             let ptr = t.data as *const f32;
             let slice = std::slice::from_raw_parts(ptr, len);
-            let bytes: Vec<u8> = slice
-                .iter()
-                .flat_map(|v| v.to_le_bytes())
-                .collect();
+            let bytes: Vec<u8> = slice.iter().flat_map(|v| v.to_le_bytes()).collect();
             (bytes, FLOAT)
         }
         _ => {
@@ -164,9 +158,7 @@ pub fn build_onnx_model(graph: &TraceGraph) -> ModelProto {
                 let (raw_bytes, data_type, dims) = if ptr != 0 {
                     let t = NslTensor::from_ptr(ptr);
                     let shape: Vec<i64> = if t.ndim > 0 && !t.shape.is_null() {
-                        unsafe {
-                            std::slice::from_raw_parts(t.shape, t.ndim as usize).to_vec()
-                        }
+                        unsafe { std::slice::from_raw_parts(t.shape, t.ndim as usize).to_vec() }
                     } else {
                         vec![]
                     };

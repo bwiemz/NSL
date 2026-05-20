@@ -90,11 +90,10 @@ pub fn check_matmul(lhs: &Shape, rhs: &Shape, op_span: Span) -> Result<Shape, Di
             fmt_shape(lhs),
             fmt_shape(rhs)
         ))
-        .with_label(op_span, format!(
-            "inner dims: {} vs {}",
-            fmt_dim(l_inner),
-            fmt_dim(r_inner)
-        )));
+        .with_label(
+            op_span,
+            format!("inner dims: {} vs {}", fmt_dim(l_inner), fmt_dim(r_inner)),
+        ));
     }
 
     // Verify batch dimensions are compatible
@@ -110,11 +109,14 @@ pub fn check_matmul(lhs: &Shape, rhs: &Shape, op_span: Span) -> Result<Shape, Di
                 fmt_shape(lhs),
                 fmt_shape(rhs)
             ))
-            .with_label(op_span, format!(
-                "batch dim mismatch: {} vs {}",
-                fmt_dim(l_dim),
-                fmt_dim(r_dim)
-            )));
+            .with_label(
+                op_span,
+                format!(
+                    "batch dim mismatch: {} vs {}",
+                    fmt_dim(l_dim),
+                    fmt_dim(r_dim)
+                ),
+            ));
         }
     }
 
@@ -162,24 +164,49 @@ pub fn unify_dim(a: &Dim, b: &Dim) -> Option<Dim> {
         // Bounded unifies with Concrete if value is within bound
         (Dim::Bounded { upper_bound, .. }, Dim::Concrete(n))
         | (Dim::Concrete(n), Dim::Bounded { upper_bound, .. }) => {
-            if *n <= *upper_bound { Some(Dim::Concrete(*n)) } else { None }
+            if *n <= *upper_bound {
+                Some(Dim::Concrete(*n))
+            } else {
+                None
+            }
         }
 
         // Bounded unifies with same-named Symbolic → keeps bound
-        (Dim::Bounded { name: n1, upper_bound }, Dim::Symbolic(n2))
-        | (Dim::Symbolic(n2), Dim::Bounded { name: n1, upper_bound }) if n1 == n2 => {
-            Some(Dim::Bounded { name: *n1, upper_bound: *upper_bound })
-        }
+        (
+            Dim::Bounded {
+                name: n1,
+                upper_bound,
+            },
+            Dim::Symbolic(n2),
+        )
+        | (
+            Dim::Symbolic(n2),
+            Dim::Bounded {
+                name: n1,
+                upper_bound,
+            },
+        ) if n1 == n2 => Some(Dim::Bounded {
+            name: *n1,
+            upper_bound: *upper_bound,
+        }),
 
         // Bounded unifies with different Symbolic → None
-        (Dim::Bounded { .. }, Dim::Symbolic(_))
-        | (Dim::Symbolic(_), Dim::Bounded { .. }) => None,
+        (Dim::Bounded { .. }, Dim::Symbolic(_)) | (Dim::Symbolic(_), Dim::Bounded { .. }) => None,
 
         // Two Bounded with same name → take tighter (smaller) bound
-        (Dim::Bounded { name: n1, upper_bound: u1 }, Dim::Bounded { name: n2, upper_bound: u2 })
-            if n1 == n2 => {
-            Some(Dim::Bounded { name: *n1, upper_bound: *u1.min(u2) })
-        }
+        (
+            Dim::Bounded {
+                name: n1,
+                upper_bound: u1,
+            },
+            Dim::Bounded {
+                name: n2,
+                upper_bound: u2,
+            },
+        ) if n1 == n2 => Some(Dim::Bounded {
+            name: *n1,
+            upper_bound: *u1.min(u2),
+        }),
 
         // Two Bounded with different names → None
         (Dim::Bounded { .. }, Dim::Bounded { .. }) => None,
@@ -251,10 +278,7 @@ mod tests {
         let a = concrete_shape(&[3, 4]);
         let b = concrete_shape(&[4, 5]);
         let result = check_matmul(&a, &b, Span::DUMMY).unwrap();
-        assert_eq!(
-            result.dims,
-            vec![Dim::Concrete(3), Dim::Concrete(5)]
-        );
+        assert_eq!(result.dims, vec![Dim::Concrete(3), Dim::Concrete(5)]);
     }
 
     #[test]
@@ -318,10 +342,7 @@ mod tests {
         let a = concrete_shape(&[3, 4]);
         let b = concrete_shape(&[4]);
         let result = check_elementwise(&a, &b, Span::DUMMY).unwrap();
-        assert_eq!(
-            result.dims,
-            vec![Dim::Concrete(3), Dim::Concrete(4)]
-        );
+        assert_eq!(result.dims, vec![Dim::Concrete(3), Dim::Concrete(4)]);
     }
 
     #[test]
@@ -330,10 +351,7 @@ mod tests {
         let a = concrete_shape(&[3, 4]);
         let b = concrete_shape(&[1]);
         let result = check_elementwise(&a, &b, Span::DUMMY).unwrap();
-        assert_eq!(
-            result.dims,
-            vec![Dim::Concrete(3), Dim::Concrete(4)]
-        );
+        assert_eq!(result.dims, vec![Dim::Concrete(3), Dim::Concrete(4)]);
     }
 
     #[test]
@@ -342,10 +360,7 @@ mod tests {
         let a = concrete_shape(&[3, 1]);
         let b = concrete_shape(&[1, 4]);
         let result = check_elementwise(&a, &b, Span::DUMMY).unwrap();
-        assert_eq!(
-            result.dims,
-            vec![Dim::Concrete(3), Dim::Concrete(4)]
-        );
+        assert_eq!(result.dims, vec![Dim::Concrete(3), Dim::Concrete(4)]);
     }
 
     #[test]
@@ -375,17 +390,20 @@ mod tests {
         };
         let b = concrete_shape(&[3, 4]);
         let result = check_elementwise(&a, &b, Span::DUMMY).unwrap();
-        assert_eq!(
-            result.dims,
-            vec![Dim::Concrete(3), Dim::Concrete(4)]
-        );
+        assert_eq!(result.dims, vec![Dim::Concrete(3), Dim::Concrete(4)]);
     }
 
     #[test]
     fn unify_bounded_with_concrete() {
         let sym = make_sym(10);
         assert_eq!(
-            unify_dim(&Dim::Bounded { name: sym, upper_bound: 4096 }, &Dim::Concrete(512)),
+            unify_dim(
+                &Dim::Bounded {
+                    name: sym,
+                    upper_bound: 4096
+                },
+                &Dim::Concrete(512)
+            ),
             Some(Dim::Concrete(512))
         );
     }
@@ -394,7 +412,13 @@ mod tests {
     fn unify_bounded_with_concrete_exceeds() {
         let sym = make_sym(10);
         assert_eq!(
-            unify_dim(&Dim::Bounded { name: sym, upper_bound: 4096 }, &Dim::Concrete(8192)),
+            unify_dim(
+                &Dim::Bounded {
+                    name: sym,
+                    upper_bound: 4096
+                },
+                &Dim::Concrete(8192)
+            ),
             None
         );
     }
@@ -403,8 +427,17 @@ mod tests {
     fn unify_bounded_with_symbolic() {
         let sym = make_sym(10);
         assert_eq!(
-            unify_dim(&Dim::Bounded { name: sym, upper_bound: 4096 }, &Dim::Symbolic(sym)),
-            Some(Dim::Bounded { name: sym, upper_bound: 4096 })
+            unify_dim(
+                &Dim::Bounded {
+                    name: sym,
+                    upper_bound: 4096
+                },
+                &Dim::Symbolic(sym)
+            ),
+            Some(Dim::Bounded {
+                name: sym,
+                upper_bound: 4096
+            })
         );
     }
 
@@ -413,10 +446,19 @@ mod tests {
         let sym = make_sym(10);
         assert_eq!(
             unify_dim(
-                &Dim::Bounded { name: sym, upper_bound: 4096 },
-                &Dim::Bounded { name: sym, upper_bound: 2048 }
+                &Dim::Bounded {
+                    name: sym,
+                    upper_bound: 4096
+                },
+                &Dim::Bounded {
+                    name: sym,
+                    upper_bound: 2048
+                }
             ),
-            Some(Dim::Bounded { name: sym, upper_bound: 2048 })
+            Some(Dim::Bounded {
+                name: sym,
+                upper_bound: 2048
+            })
         );
     }
 }

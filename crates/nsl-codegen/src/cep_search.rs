@@ -123,8 +123,7 @@ pub struct PruneStep {
 }
 
 fn satisfies_constraints(profile: &CompilationProfile, c: &Constraints) -> bool {
-    profile.peak_memory_bytes <= c.peak_memory_bytes
-        && profile.estimated_latency_us <= c.latency_us
+    profile.peak_memory_bytes <= c.peak_memory_bytes && profile.estimated_latency_us <= c.latency_us
 }
 
 fn sparsity_reached(baseline_params: u64, current_params: u64, target: f64) -> bool {
@@ -222,14 +221,22 @@ pub fn prune_greedy(
             new_latency_us: current_profile.estimated_latency_us,
         });
 
-        if sparsity_reached(baseline_params, current_spec.param_count(), constraints.target_sparsity) {
+        if sparsity_reached(
+            baseline_params,
+            current_spec.param_count(),
+            constraints.target_sparsity,
+        ) {
             break;
         }
     }
 
     // FFN-granularity sweep: shrink each layer's FFN if allowed.
     if matches!(granularity, Granularity::Ffn | Granularity::HeadAndFfn)
-        && !sparsity_reached(baseline_params, current_spec.param_count(), constraints.target_sparsity)
+        && !sparsity_reached(
+            baseline_params,
+            current_spec.param_count(),
+            constraints.target_sparsity,
+        )
     {
         let candidate_widths: [u32; 3] = [1024, 768, 512];
         // Iterate from least-important layer (low importance score).
@@ -334,15 +341,13 @@ pub fn architecture_search(
     }
     // Rank by score (descending).  Infeasible candidates end up at the
     // bottom because their score is often negative or dominated.
-    evaluated.sort_by(|a, b| {
-        match (a.feasible, b.feasible) {
-            (true, false) => std::cmp::Ordering::Less,
-            (false, true) => std::cmp::Ordering::Greater,
-            _ => b
-                .score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal),
-        }
+    evaluated.sort_by(|a, b| match (a.feasible, b.feasible) {
+        (true, false) => std::cmp::Ordering::Less,
+        (false, true) => std::cmp::Ordering::Greater,
+        _ => b
+            .score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal),
     });
     let candidates_evaluated = evaluated.len() as u32;
     let chosen = evaluated.iter().find(|c| c.feasible).cloned();
@@ -389,7 +394,11 @@ mod tests {
                     position_factor: 1.0,
                     // Give later heads in the last layer very low scores
                     // so the greedy search picks them first.
-                    score: if layer as u32 == spec.n_layers - 1 { 0.1 } else { 1.0 },
+                    score: if layer as u32 == spec.n_layers - 1 {
+                        0.1
+                    } else {
+                        1.0
+                    },
                 });
             }
         }
@@ -501,10 +510,7 @@ mod tests {
         assert!(outcome.candidates_evaluated > 0);
         // The first entry must be feasible (or none are).
         if let Some(first) = outcome.ranked_candidates.first() {
-            assert!(
-                first.feasible
-                    || outcome.ranked_candidates.iter().all(|c| !c.feasible)
-            );
+            assert!(first.feasible || outcome.ranked_candidates.iter().all(|c| !c.feasible));
         }
     }
 
@@ -525,12 +531,14 @@ mod tests {
             batch: 1,
             dtype_bytes: 2,
         };
-        let outcome = architecture_search(&axes, gpu(), &Constraints::default(), NasObjective::MinLatency);
+        let outcome = architecture_search(
+            &axes,
+            gpu(),
+            &Constraints::default(),
+            NasObjective::MinLatency,
+        );
         if outcome.ranked_candidates.len() >= 2 {
-            let (first, second) = (
-                &outcome.ranked_candidates[0],
-                &outcome.ranked_candidates[1],
-            );
+            let (first, second) = (&outcome.ranked_candidates[0], &outcome.ranked_candidates[1]);
             assert!(first.profile.estimated_latency_us <= second.profile.estimated_latency_us);
         }
     }
@@ -552,7 +560,12 @@ mod tests {
             batch: 1,
             dtype_bytes: 2,
         };
-        let outcome = architecture_search(&axes, gpu(), &Constraints::default(), NasObjective::ParamEfficiency);
+        let outcome = architecture_search(
+            &axes,
+            gpu(),
+            &Constraints::default(),
+            NasObjective::ParamEfficiency,
+        );
         assert_eq!(outcome.candidates_evaluated, 0);
         assert!(outcome.chosen.is_none());
     }

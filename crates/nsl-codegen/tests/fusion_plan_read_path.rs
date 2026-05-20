@@ -8,9 +8,7 @@
 #![cfg(feature = "test-helpers")]
 
 use nsl_ast::NodeId as AstNodeId;
-use nsl_codegen::epilogue_fusion::{
-    apply_epilogue_fusion, EpilogueChain, EpilogueOp, MatmulKind,
-};
+use nsl_codegen::epilogue_fusion::{apply_epilogue_fusion, EpilogueChain, EpilogueOp, MatmulKind};
 use nsl_codegen::fusion_graph::{FusionGraph, FusionOp};
 use nsl_codegen::wrga_fusion::FusionPlan;
 use nsl_codegen::CompileOptions;
@@ -24,8 +22,8 @@ fn pre_pass_seeds_fusion_plan_as_some() {
     let src = "fn forward(x: int) -> int:\n    return x\n";
     let mut opts = CompileOptions::default();
     opts.profile_kernels = true;
-    let result = nsl_codegen::test_helpers::run_pre_pass_only(src, &opts)
-        .expect("pre-pass should succeed");
+    let result =
+        nsl_codegen::test_helpers::run_pre_pass_only(src, &opts).expect("pre-pass should succeed");
     assert!(
         result.manifest_builder_set,
         "manifest_builder should be populated on the profile path"
@@ -76,9 +74,7 @@ fn seeded_fusion_plan_round_trips_through_fusion_constituents() {
 
     // THE critical step: thread the Compiler-owned plan (not a throwaway)
     // into apply_epilogue_fusion.
-    let plan = compiler
-        .profile_fusion_plan_mut()
-        .expect("seeded above");
+    let plan = compiler.profile_fusion_plan_mut().expect("seeded above");
     apply_epilogue_fusion(&mut graph, &[chain], 0, plan);
 
     // Read back through the Compiler API — this asserts the mutations landed

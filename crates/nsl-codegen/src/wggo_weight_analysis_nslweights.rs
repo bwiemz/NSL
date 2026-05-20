@@ -42,18 +42,41 @@ const NSLW_VERSION: u32 = 1;
 #[derive(Debug)]
 pub enum NslWeightsError {
     Io(io::Error),
-    TooSmall { need: usize, got: usize },
+    TooSmall {
+        need: usize,
+        got: usize,
+    },
     BadMagic,
-    UnsupportedVersion { got: u32 },
-    TruncatedHeader { need: usize, got: usize },
+    UnsupportedVersion {
+        got: u32,
+    },
+    TruncatedHeader {
+        need: usize,
+        got: usize,
+    },
     BadUtf8,
     BadJson(String),
     MissingParamsArray,
-    MissingField { param: String, field: &'static str },
+    MissingField {
+        param: String,
+        field: &'static str,
+    },
     BadShape(String),
-    UnknownDtype { param: String, dtype: String },
-    TensorOutOfBounds { param: String, offset: usize, nbytes: usize, total: usize },
-    DtypeSizeMismatch { param: String, dtype: String, nbytes: usize },
+    UnknownDtype {
+        param: String,
+        dtype: String,
+    },
+    TensorOutOfBounds {
+        param: String,
+        offset: usize,
+        nbytes: usize,
+        total: usize,
+    },
+    DtypeSizeMismatch {
+        param: String,
+        dtype: String,
+        nbytes: usize,
+    },
 }
 
 impl std::fmt::Display for NslWeightsError {
@@ -181,7 +204,10 @@ struct TensorMeta {
 
 fn parse_header(raw: &[u8]) -> Result<(Vec<TensorMeta>, usize), NslWeightsError> {
     if raw.len() < 16 {
-        return Err(NslWeightsError::TooSmall { need: 16, got: raw.len() });
+        return Err(NslWeightsError::TooSmall {
+            need: 16,
+            got: raw.len(),
+        });
     }
     if &raw[0..4] != NSLW_MAGIC {
         return Err(NslWeightsError::BadMagic);
@@ -200,8 +226,8 @@ fn parse_header(raw: &[u8]) -> Result<(Vec<TensorMeta>, usize), NslWeightsError>
     }
     let json_bytes = &raw[16..header_end];
     let json_str = std::str::from_utf8(json_bytes).map_err(|_| NslWeightsError::BadUtf8)?;
-    let root: serde_json::Value = serde_json::from_str(json_str)
-        .map_err(|e| NslWeightsError::BadJson(e.to_string()))?;
+    let root: serde_json::Value =
+        serde_json::from_str(json_str).map_err(|e| NslWeightsError::BadJson(e.to_string()))?;
     let params = root["params"]
         .as_array()
         .ok_or(NslWeightsError::MissingParamsArray)?;
@@ -215,10 +241,7 @@ fn parse_header(raw: &[u8]) -> Result<(Vec<TensorMeta>, usize), NslWeightsError>
                 field: "name",
             })?
             .to_string();
-        let dtype = p["dtype"]
-            .as_str()
-            .unwrap_or("f64")
-            .to_string();
+        let dtype = p["dtype"].as_str().unwrap_or("f64").to_string();
         let offset = p["offset"]
             .as_u64()
             .ok_or_else(|| NslWeightsError::MissingField {
@@ -237,7 +260,13 @@ fn parse_header(raw: &[u8]) -> Result<(Vec<TensorMeta>, usize), NslWeightsError>
             .iter()
             .map(|v| v.as_i64().unwrap_or(0))
             .collect();
-        metas.push(TensorMeta { name, shape, dtype, offset, nbytes });
+        metas.push(TensorMeta {
+            name,
+            shape,
+            dtype,
+            offset,
+            nbytes,
+        });
     }
 
     let total_header = 16 + header_size;
@@ -456,16 +485,14 @@ mod tests {
         let blob = build_blob(&[("blocks.0.attn.wq", "f32", vec![16, 16], data)]);
         let ck = NslWeightsCheckpoint::from_bytes(&blob).unwrap();
 
-        let ops = vec![
-            WengertOp {
-                id: 0,
-                result: 0,
-                op: PrimalOp::Param("blocks.0.attn.wq".into()),
-                inputs: vec![],
-                saved_for_backward: false,
-                checkpointed: false,
-            },
-        ];
+        let ops = vec![WengertOp {
+            id: 0,
+            result: 0,
+            op: PrimalOp::Param("blocks.0.attn.wq".into()),
+            inputs: vec![],
+            saved_for_backward: false,
+            checkpointed: false,
+        }];
         let wl = WengertList {
             ops,
             output: 0,
@@ -483,11 +510,7 @@ mod tests {
             dtype_bytes: 2,
         };
         let rep = analyze(&g, &shape, 4, &ck, &AnalysisConfig::default());
-        let idx = g
-            .layers
-            .iter()
-            .position(|l| l.name == "blocks.0")
-            .unwrap();
+        let idx = g.layers.iter().position(|l| l.name == "blocks.0").unwrap();
         let s = &rep.per_layer[idx].head_scores;
         assert!(s[2] > s[0] && s[2] > s[1] && s[2] > s[3]);
     }

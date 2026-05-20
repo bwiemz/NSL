@@ -7,7 +7,7 @@
 //! - Multi-modal streaming (text, image, audio, video)
 //! - Checkpoint-aware data position for exact resumption
 
-pub mod shards;
 pub mod gds;
-pub mod pipeline;
 pub mod multimodal;
+pub mod pipeline;
+pub mod shards;

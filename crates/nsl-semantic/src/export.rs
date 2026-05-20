@@ -88,15 +88,17 @@ fn validate_model_method_exports(
             continue;
         };
 
-        let has_export = decos.iter().any(|d| {
-            d.name.len() == 1
-                && interner.resolve(d.name[0].0).unwrap_or("") == "export"
-        });
+        let has_export = decos
+            .iter()
+            .any(|d| d.name.len() == 1 && interner.resolve(d.name[0].0).unwrap_or("") == "export");
         if !has_export {
             continue;
         }
 
-        let method_name = interner.resolve(fn_def.name.0).unwrap_or("<unknown>").to_string();
+        let method_name = interner
+            .resolve(fn_def.name.0)
+            .unwrap_or("<unknown>")
+            .to_string();
         let has_self = fn_def
             .params
             .first()
@@ -104,12 +106,10 @@ fn validate_model_method_exports(
             .unwrap_or(false);
 
         if !has_self {
-            diagnostics.push(
-                Diagnostic::error(format!(
-                    "@export model method '{method_name}' requires `self` as first parameter; \
+            diagnostics.push(Diagnostic::error(format!(
+                "@export model method '{method_name}' requires `self` as first parameter; \
                      for a standalone function export use a top-level `@export fn`"
-                )),
-            );
+            )));
             continue;
         }
 
@@ -166,70 +166,155 @@ fn resolve_self_field_accesses_in_stmt(
     match &stmt.kind {
         StmtKind::Return(Some(e)) | StmtKind::Yield(Some(e)) | StmtKind::Expr(e) => {
             resolve_self_field_accesses_in_expr(
-                e, interner, weight_fields, all_fields, diagnostics, weight_index_map,
+                e,
+                interner,
+                weight_fields,
+                all_fields,
+                diagnostics,
+                weight_index_map,
             );
         }
         StmtKind::VarDecl { value: Some(e), .. } => {
             resolve_self_field_accesses_in_expr(
-                e, interner, weight_fields, all_fields, diagnostics, weight_index_map,
+                e,
+                interner,
+                weight_fields,
+                all_fields,
+                diagnostics,
+                weight_index_map,
             );
         }
         StmtKind::Assign { target, value, .. } => {
             resolve_self_field_accesses_in_expr(
-                target, interner, weight_fields, all_fields, diagnostics, weight_index_map,
+                target,
+                interner,
+                weight_fields,
+                all_fields,
+                diagnostics,
+                weight_index_map,
             );
             resolve_self_field_accesses_in_expr(
-                value, interner, weight_fields, all_fields, diagnostics, weight_index_map,
+                value,
+                interner,
+                weight_fields,
+                all_fields,
+                diagnostics,
+                weight_index_map,
             );
         }
-        StmtKind::If { condition, then_block, elif_clauses, else_block } => {
+        StmtKind::If {
+            condition,
+            then_block,
+            elif_clauses,
+            else_block,
+        } => {
             resolve_self_field_accesses_in_expr(
-                condition, interner, weight_fields, all_fields, diagnostics, weight_index_map,
+                condition,
+                interner,
+                weight_fields,
+                all_fields,
+                diagnostics,
+                weight_index_map,
             );
             resolve_self_field_accesses(
-                then_block, interner, weight_fields, all_fields, diagnostics, weight_index_map,
+                then_block,
+                interner,
+                weight_fields,
+                all_fields,
+                diagnostics,
+                weight_index_map,
             );
             for (cond, blk) in elif_clauses {
                 resolve_self_field_accesses_in_expr(
-                    cond, interner, weight_fields, all_fields, diagnostics, weight_index_map,
+                    cond,
+                    interner,
+                    weight_fields,
+                    all_fields,
+                    diagnostics,
+                    weight_index_map,
                 );
                 resolve_self_field_accesses(
-                    blk, interner, weight_fields, all_fields, diagnostics, weight_index_map,
+                    blk,
+                    interner,
+                    weight_fields,
+                    all_fields,
+                    diagnostics,
+                    weight_index_map,
                 );
             }
             if let Some(eb) = else_block {
                 resolve_self_field_accesses(
-                    eb, interner, weight_fields, all_fields, diagnostics, weight_index_map,
+                    eb,
+                    interner,
+                    weight_fields,
+                    all_fields,
+                    diagnostics,
+                    weight_index_map,
                 );
             }
         }
         StmtKind::For { iterable, body, .. } => {
             resolve_self_field_accesses_in_expr(
-                iterable, interner, weight_fields, all_fields, diagnostics, weight_index_map,
+                iterable,
+                interner,
+                weight_fields,
+                all_fields,
+                diagnostics,
+                weight_index_map,
             );
             resolve_self_field_accesses(
-                body, interner, weight_fields, all_fields, diagnostics, weight_index_map,
+                body,
+                interner,
+                weight_fields,
+                all_fields,
+                diagnostics,
+                weight_index_map,
             );
         }
         StmtKind::While { condition, body } => {
             resolve_self_field_accesses_in_expr(
-                condition, interner, weight_fields, all_fields, diagnostics, weight_index_map,
+                condition,
+                interner,
+                weight_fields,
+                all_fields,
+                diagnostics,
+                weight_index_map,
             );
             resolve_self_field_accesses(
-                body, interner, weight_fields, all_fields, diagnostics, weight_index_map,
+                body,
+                interner,
+                weight_fields,
+                all_fields,
+                diagnostics,
+                weight_index_map,
             );
         }
         StmtKind::WhileLet { expr, body, .. } => {
             resolve_self_field_accesses_in_expr(
-                expr, interner, weight_fields, all_fields, diagnostics, weight_index_map,
+                expr,
+                interner,
+                weight_fields,
+                all_fields,
+                diagnostics,
+                weight_index_map,
             );
             resolve_self_field_accesses(
-                body, interner, weight_fields, all_fields, diagnostics, weight_index_map,
+                body,
+                interner,
+                weight_fields,
+                all_fields,
+                diagnostics,
+                weight_index_map,
             );
         }
         StmtKind::Decorated { stmt: inner, .. } => {
             resolve_self_field_accesses_in_stmt(
-                inner, interner, weight_fields, all_fields, diagnostics, weight_index_map,
+                inner,
+                interner,
+                weight_fields,
+                all_fields,
+                diagnostics,
+                weight_index_map,
             );
         }
         _ => {}
@@ -264,137 +349,277 @@ fn resolve_self_field_accesses_in_expr(
             } else {
                 // Recurse into the object (chained access).
                 resolve_self_field_accesses_in_expr(
-                    object, interner, weight_fields, all_fields, diagnostics, weight_index_map,
+                    object,
+                    interner,
+                    weight_fields,
+                    all_fields,
+                    diagnostics,
+                    weight_index_map,
                 );
             }
         }
         ExprKind::BinaryOp { left, right, .. } => {
             resolve_self_field_accesses_in_expr(
-                left, interner, weight_fields, all_fields, diagnostics, weight_index_map,
+                left,
+                interner,
+                weight_fields,
+                all_fields,
+                diagnostics,
+                weight_index_map,
             );
             resolve_self_field_accesses_in_expr(
-                right, interner, weight_fields, all_fields, diagnostics, weight_index_map,
+                right,
+                interner,
+                weight_fields,
+                all_fields,
+                diagnostics,
+                weight_index_map,
             );
         }
-        ExprKind::UnaryOp { operand, .. }
-        | ExprKind::Paren(operand)
-        | ExprKind::Await(operand) => {
+        ExprKind::UnaryOp { operand, .. } | ExprKind::Paren(operand) | ExprKind::Await(operand) => {
             resolve_self_field_accesses_in_expr(
-                operand, interner, weight_fields, all_fields, diagnostics, weight_index_map,
+                operand,
+                interner,
+                weight_fields,
+                all_fields,
+                diagnostics,
+                weight_index_map,
             );
         }
         ExprKind::Pipe { left, right } => {
             resolve_self_field_accesses_in_expr(
-                left, interner, weight_fields, all_fields, diagnostics, weight_index_map,
+                left,
+                interner,
+                weight_fields,
+                all_fields,
+                diagnostics,
+                weight_index_map,
             );
             resolve_self_field_accesses_in_expr(
-                right, interner, weight_fields, all_fields, diagnostics, weight_index_map,
+                right,
+                interner,
+                weight_fields,
+                all_fields,
+                diagnostics,
+                weight_index_map,
             );
         }
         ExprKind::Call { callee, args } => {
             resolve_self_field_accesses_in_expr(
-                callee, interner, weight_fields, all_fields, diagnostics, weight_index_map,
+                callee,
+                interner,
+                weight_fields,
+                all_fields,
+                diagnostics,
+                weight_index_map,
             );
             for arg in args {
                 resolve_self_field_accesses_in_expr(
-                    &arg.value, interner, weight_fields, all_fields, diagnostics, weight_index_map,
+                    &arg.value,
+                    interner,
+                    weight_fields,
+                    all_fields,
+                    diagnostics,
+                    weight_index_map,
                 );
             }
         }
         ExprKind::Subscript { object, index } => {
             resolve_self_field_accesses_in_expr(
-                object, interner, weight_fields, all_fields, diagnostics, weight_index_map,
+                object,
+                interner,
+                weight_fields,
+                all_fields,
+                diagnostics,
+                weight_index_map,
             );
             resolve_self_field_accesses_in_subscript(
-                index, interner, weight_fields, all_fields, diagnostics, weight_index_map,
+                index,
+                interner,
+                weight_fields,
+                all_fields,
+                diagnostics,
+                weight_index_map,
             );
         }
         ExprKind::ListLiteral(exprs) | ExprKind::TupleLiteral(exprs) => {
             for e in exprs {
                 resolve_self_field_accesses_in_expr(
-                    e, interner, weight_fields, all_fields, diagnostics, weight_index_map,
+                    e,
+                    interner,
+                    weight_fields,
+                    all_fields,
+                    diagnostics,
+                    weight_index_map,
                 );
             }
         }
         ExprKind::DictLiteral(pairs) => {
             for (k, v) in pairs {
                 resolve_self_field_accesses_in_expr(
-                    k, interner, weight_fields, all_fields, diagnostics, weight_index_map,
+                    k,
+                    interner,
+                    weight_fields,
+                    all_fields,
+                    diagnostics,
+                    weight_index_map,
                 );
                 resolve_self_field_accesses_in_expr(
-                    v, interner, weight_fields, all_fields, diagnostics, weight_index_map,
+                    v,
+                    interner,
+                    weight_fields,
+                    all_fields,
+                    diagnostics,
+                    weight_index_map,
                 );
             }
         }
-        ExprKind::IfExpr { condition, then_expr, else_expr } => {
+        ExprKind::IfExpr {
+            condition,
+            then_expr,
+            else_expr,
+        } => {
             resolve_self_field_accesses_in_expr(
-                condition, interner, weight_fields, all_fields, diagnostics, weight_index_map,
+                condition,
+                interner,
+                weight_fields,
+                all_fields,
+                diagnostics,
+                weight_index_map,
             );
             resolve_self_field_accesses_in_expr(
-                then_expr, interner, weight_fields, all_fields, diagnostics, weight_index_map,
+                then_expr,
+                interner,
+                weight_fields,
+                all_fields,
+                diagnostics,
+                weight_index_map,
             );
             resolve_self_field_accesses_in_expr(
-                else_expr, interner, weight_fields, all_fields, diagnostics, weight_index_map,
+                else_expr,
+                interner,
+                weight_fields,
+                all_fields,
+                diagnostics,
+                weight_index_map,
             );
         }
         ExprKind::BlockExpr(block) => {
             resolve_self_field_accesses(
-                block, interner, weight_fields, all_fields, diagnostics, weight_index_map,
+                block,
+                interner,
+                weight_fields,
+                all_fields,
+                diagnostics,
+                weight_index_map,
             );
         }
         ExprKind::FString(parts) => {
             for part in parts {
                 if let nsl_ast::expr::FStringPart::Expr(e) = part {
                     resolve_self_field_accesses_in_expr(
-                        e, interner, weight_fields, all_fields, diagnostics, weight_index_map,
+                        e,
+                        interner,
+                        weight_fields,
+                        all_fields,
+                        diagnostics,
+                        weight_index_map,
                     );
                 }
             }
         }
         ExprKind::Lambda { body, .. } => {
             resolve_self_field_accesses_in_expr(
-                body, interner, weight_fields, all_fields, diagnostics, weight_index_map,
+                body,
+                interner,
+                weight_fields,
+                all_fields,
+                diagnostics,
+                weight_index_map,
             );
         }
-        ExprKind::ListComp { element, generators } => {
+        ExprKind::ListComp {
+            element,
+            generators,
+        } => {
             resolve_self_field_accesses_in_expr(
-                element, interner, weight_fields, all_fields, diagnostics, weight_index_map,
+                element,
+                interner,
+                weight_fields,
+                all_fields,
+                diagnostics,
+                weight_index_map,
             );
             for gen in generators {
                 resolve_self_field_accesses_in_expr(
-                    &gen.iterable, interner, weight_fields, all_fields, diagnostics, weight_index_map,
+                    &gen.iterable,
+                    interner,
+                    weight_fields,
+                    all_fields,
+                    diagnostics,
+                    weight_index_map,
                 );
                 for cond in &gen.conditions {
                     resolve_self_field_accesses_in_expr(
-                        cond, interner, weight_fields, all_fields, diagnostics, weight_index_map,
+                        cond,
+                        interner,
+                        weight_fields,
+                        all_fields,
+                        diagnostics,
+                        weight_index_map,
                     );
                 }
             }
         }
         ExprKind::MatchExpr { subject, arms } => {
             resolve_self_field_accesses_in_expr(
-                subject, interner, weight_fields, all_fields, diagnostics, weight_index_map,
+                subject,
+                interner,
+                weight_fields,
+                all_fields,
+                diagnostics,
+                weight_index_map,
             );
             for arm in arms {
                 if let Some(guard) = &arm.guard {
                     resolve_self_field_accesses_in_expr(
-                        guard, interner, weight_fields, all_fields, diagnostics, weight_index_map,
+                        guard,
+                        interner,
+                        weight_fields,
+                        all_fields,
+                        diagnostics,
+                        weight_index_map,
                     );
                 }
                 resolve_self_field_accesses(
-                    &arm.body, interner, weight_fields, all_fields, diagnostics, weight_index_map,
+                    &arm.body,
+                    interner,
+                    weight_fields,
+                    all_fields,
+                    diagnostics,
+                    weight_index_map,
                 );
             }
         }
         ExprKind::Range { start, end, .. } => {
             if let Some(e) = start {
                 resolve_self_field_accesses_in_expr(
-                    e, interner, weight_fields, all_fields, diagnostics, weight_index_map,
+                    e,
+                    interner,
+                    weight_fields,
+                    all_fields,
+                    diagnostics,
+                    weight_index_map,
                 );
             }
             if let Some(e) = end {
                 resolve_self_field_accesses_in_expr(
-                    e, interner, weight_fields, all_fields, diagnostics, weight_index_map,
+                    e,
+                    interner,
+                    weight_fields,
+                    all_fields,
+                    diagnostics,
+                    weight_index_map,
                 );
             }
         }
@@ -421,20 +646,35 @@ fn resolve_self_field_accesses_in_subscript(
     match index {
         nsl_ast::expr::SubscriptKind::Index(e) => {
             resolve_self_field_accesses_in_expr(
-                e, interner, weight_fields, all_fields, diagnostics, weight_index_map,
+                e,
+                interner,
+                weight_fields,
+                all_fields,
+                diagnostics,
+                weight_index_map,
             );
         }
         nsl_ast::expr::SubscriptKind::Slice { lower, upper, step } => {
             for e in [lower, upper, step].into_iter().flatten() {
                 resolve_self_field_accesses_in_expr(
-                    e, interner, weight_fields, all_fields, diagnostics, weight_index_map,
+                    e,
+                    interner,
+                    weight_fields,
+                    all_fields,
+                    diagnostics,
+                    weight_index_map,
                 );
             }
         }
         nsl_ast::expr::SubscriptKind::MultiDim(dims) => {
             for d in dims {
                 resolve_self_field_accesses_in_subscript(
-                    d, interner, weight_fields, all_fields, diagnostics, weight_index_map,
+                    d,
+                    interner,
+                    weight_fields,
+                    all_fields,
+                    diagnostics,
+                    weight_index_map,
                 );
             }
         }
@@ -442,16 +682,17 @@ fn resolve_self_field_accesses_in_subscript(
 }
 
 fn validate_stmt(stmt: &Stmt, interner: &Interner, diagnostics: &mut Vec<Diagnostic>) {
-    let StmtKind::Decorated { decorators, stmt: inner } = &stmt.kind else {
+    let StmtKind::Decorated {
+        decorators,
+        stmt: inner,
+    } = &stmt.kind
+    else {
         return;
     };
 
     let export_occurrences: Vec<&Decorator> = decorators
         .iter()
-        .filter(|d| {
-            d.name.len() == 1
-                && interner.resolve(d.name[0].0).unwrap_or("") == "export"
-        })
+        .filter(|d| d.name.len() == 1 && interner.resolve(d.name[0].0).unwrap_or("") == "export")
         .collect();
 
     if export_occurrences.is_empty() {
@@ -485,11 +726,7 @@ fn validate_stmt(stmt: &Stmt, interner: &Interner, diagnostics: &mut Vec<Diagnos
     validate_fn_signature(fn_def, interner, export_occurrences[0], false, diagnostics);
 }
 
-fn validate_export_args(
-    d: &Decorator,
-    interner: &Interner,
-    diagnostics: &mut Vec<Diagnostic>,
-) {
+fn validate_export_args(d: &Decorator, interner: &Interner, diagnostics: &mut Vec<Diagnostic>) {
     let Some(ref args) = d.args else {
         return; // bare @export is fine
     };
@@ -576,8 +813,7 @@ fn validate_fn_signature(
         if !is_c_abi_compatible(ret_ty, interner) {
             diagnostics.push(
                 Diagnostic::error(
-                    "@export function must return a tensor, scalar, or tuple of those"
-                        .to_string(),
+                    "@export function must return a tensor, scalar, or tuple of those".to_string(),
                 )
                 .with_label(ret_ty.span, "non-ABI return type"),
             );
@@ -686,12 +922,28 @@ fn is_model_typed(ty: &TypeExpr, interner: &Interner) -> bool {
         let name = interner.resolve(sym.0).unwrap_or("");
         !matches!(
             name,
-            "f32" | "f64" | "f16" | "bf16" | "fp32" | "fp64" | "fp16"
-                | "i8" | "i16" | "i32" | "i64"
-                | "u8" | "u16" | "u32" | "u64"
-                | "int" | "long" | "bool"
-                | "float" | "double"
-                | "str" | "string"
+            "f32"
+                | "f64"
+                | "f16"
+                | "bf16"
+                | "fp32"
+                | "fp64"
+                | "fp16"
+                | "i8"
+                | "i16"
+                | "i32"
+                | "i64"
+                | "u8"
+                | "u16"
+                | "u32"
+                | "u64"
+                | "int"
+                | "long"
+                | "bool"
+                | "float"
+                | "double"
+                | "str"
+                | "string"
         )
     } else {
         false
@@ -722,32 +974,35 @@ fn find_weight_access_in_stmt(
         StmtKind::Return(Some(expr)) | StmtKind::Yield(Some(expr)) | StmtKind::Expr(expr) => {
             find_weight_access_in_expr(expr, suspects, has_self_param)
         }
-        StmtKind::VarDecl { value: Some(expr), .. } => {
-            find_weight_access_in_expr(expr, suspects, has_self_param)
-        }
+        StmtKind::VarDecl {
+            value: Some(expr), ..
+        } => find_weight_access_in_expr(expr, suspects, has_self_param),
         StmtKind::Assign { target, value, .. } => {
             find_weight_access_in_expr(target, suspects, has_self_param)
                 .or_else(|| find_weight_access_in_expr(value, suspects, has_self_param))
         }
-        StmtKind::If { condition, then_block, elif_clauses, else_block } => {
-            find_weight_access_in_expr(condition, suspects, has_self_param)
-                .or_else(|| find_weight_access_in_block(then_block, suspects, has_self_param))
-                .or_else(|| {
-                    for (cond, blk) in elif_clauses {
-                        if let Some(s) = find_weight_access_in_expr(cond, suspects, has_self_param)
-                            .or_else(|| find_weight_access_in_block(blk, suspects, has_self_param))
-                        {
-                            return Some(s);
-                        }
+        StmtKind::If {
+            condition,
+            then_block,
+            elif_clauses,
+            else_block,
+        } => find_weight_access_in_expr(condition, suspects, has_self_param)
+            .or_else(|| find_weight_access_in_block(then_block, suspects, has_self_param))
+            .or_else(|| {
+                for (cond, blk) in elif_clauses {
+                    if let Some(s) = find_weight_access_in_expr(cond, suspects, has_self_param)
+                        .or_else(|| find_weight_access_in_block(blk, suspects, has_self_param))
+                    {
+                        return Some(s);
                     }
-                    None
-                })
-                .or_else(|| {
-                    else_block
-                        .as_ref()
-                        .and_then(|b| find_weight_access_in_block(b, suspects, has_self_param))
-                })
-        }
+                }
+                None
+            })
+            .or_else(|| {
+                else_block
+                    .as_ref()
+                    .and_then(|b| find_weight_access_in_block(b, suspects, has_self_param))
+            }),
         StmtKind::For { iterable, body, .. } => {
             find_weight_access_in_expr(iterable, suspects, has_self_param)
                 .or_else(|| find_weight_access_in_block(body, suspects, has_self_param))
@@ -810,9 +1065,8 @@ fn find_weight_access_in_expr(
             })
         }
         ExprKind::Subscript { object, index } => {
-            find_weight_access_in_expr(object, suspects, has_self_param).or_else(|| {
-                find_weight_access_in_subscript(index, suspects, has_self_param)
-            })
+            find_weight_access_in_expr(object, suspects, has_self_param)
+                .or_else(|| find_weight_access_in_subscript(index, suspects, has_self_param))
         }
         ExprKind::ListLiteral(exprs) | ExprKind::TupleLiteral(exprs) => {
             for e in exprs {
@@ -832,14 +1086,14 @@ fn find_weight_access_in_expr(
             }
             None
         }
-        ExprKind::IfExpr { condition, then_expr, else_expr } => {
-            find_weight_access_in_expr(condition, suspects, has_self_param)
-                .or_else(|| find_weight_access_in_expr(then_expr, suspects, has_self_param))
-                .or_else(|| find_weight_access_in_expr(else_expr, suspects, has_self_param))
-        }
-        ExprKind::BlockExpr(block) => {
-            find_weight_access_in_block(block, suspects, has_self_param)
-        }
+        ExprKind::IfExpr {
+            condition,
+            then_expr,
+            else_expr,
+        } => find_weight_access_in_expr(condition, suspects, has_self_param)
+            .or_else(|| find_weight_access_in_expr(then_expr, suspects, has_self_param))
+            .or_else(|| find_weight_access_in_expr(else_expr, suspects, has_self_param)),
+        ExprKind::BlockExpr(block) => find_weight_access_in_block(block, suspects, has_self_param),
         ExprKind::FString(parts) => {
             for part in parts {
                 if let nsl_ast::expr::FStringPart::Expr(e) = part {
@@ -850,34 +1104,29 @@ fn find_weight_access_in_expr(
             }
             None
         }
-        ExprKind::Lambda { body, .. } => {
-            find_weight_access_in_expr(body, suspects, has_self_param)
-        }
-        ExprKind::ListComp { element, generators } => {
-            find_weight_access_in_expr(element, suspects, has_self_param).or_else(|| {
-                for gen in generators {
-                    if let Some(s) =
-                        find_weight_access_in_expr(&gen.iterable, suspects, has_self_param)
-                    {
+        ExprKind::Lambda { body, .. } => find_weight_access_in_expr(body, suspects, has_self_param),
+        ExprKind::ListComp {
+            element,
+            generators,
+        } => find_weight_access_in_expr(element, suspects, has_self_param).or_else(|| {
+            for gen in generators {
+                if let Some(s) = find_weight_access_in_expr(&gen.iterable, suspects, has_self_param)
+                {
+                    return Some(s);
+                }
+                for cond in &gen.conditions {
+                    if let Some(s) = find_weight_access_in_expr(cond, suspects, has_self_param) {
                         return Some(s);
                     }
-                    for cond in &gen.conditions {
-                        if let Some(s) =
-                            find_weight_access_in_expr(cond, suspects, has_self_param)
-                        {
-                            return Some(s);
-                        }
-                    }
                 }
-                None
-            })
-        }
+            }
+            None
+        }),
         ExprKind::MatchExpr { subject, arms } => {
             find_weight_access_in_expr(subject, suspects, has_self_param).or_else(|| {
                 for arm in arms {
                     if let Some(guard) = &arm.guard {
-                        if let Some(s) =
-                            find_weight_access_in_expr(guard, suspects, has_self_param)
+                        if let Some(s) = find_weight_access_in_expr(guard, suspects, has_self_param)
                         {
                             return Some(s);
                         }
@@ -891,15 +1140,13 @@ fn find_weight_access_in_expr(
                 None
             })
         }
-        ExprKind::Range { start, end, .. } => {
-            start
-                .as_ref()
-                .and_then(|e| find_weight_access_in_expr(e, suspects, has_self_param))
-                .or_else(|| {
-                    end.as_ref()
-                        .and_then(|e| find_weight_access_in_expr(e, suspects, has_self_param))
-                })
-        }
+        ExprKind::Range { start, end, .. } => start
+            .as_ref()
+            .and_then(|e| find_weight_access_in_expr(e, suspects, has_self_param))
+            .or_else(|| {
+                end.as_ref()
+                    .and_then(|e| find_weight_access_in_expr(e, suspects, has_self_param))
+            }),
         // Leaf nodes — no sub-expressions.
         ExprKind::Ident(_)
         | ExprKind::SelfRef
@@ -950,18 +1197,33 @@ fn is_closure_type(ty: &TypeExpr) -> bool {
 
 fn is_c_abi_compatible(ty: &TypeExpr, interner: &Interner) -> bool {
     match &ty.kind {
-        TypeExprKind::Tensor { .. }
-        | TypeExprKind::Param { .. }
-        | TypeExprKind::Buffer { .. } => true,
+        TypeExprKind::Tensor { .. } | TypeExprKind::Param { .. } | TypeExprKind::Buffer { .. } => {
+            true
+        }
         TypeExprKind::Named(sym) => {
             let name = interner.resolve(sym.0).unwrap_or("");
             matches!(
                 name,
-                "f32" | "f64" | "f16" | "bf16" | "fp32" | "fp64" | "fp16"
-                    | "i8" | "i16" | "i32" | "i64"
-                    | "u8" | "u16" | "u32" | "u64"
-                    | "int" | "long" | "bool"
-                    | "float" | "double"
+                "f32"
+                    | "f64"
+                    | "f16"
+                    | "bf16"
+                    | "fp32"
+                    | "fp64"
+                    | "fp16"
+                    | "i8"
+                    | "i16"
+                    | "i32"
+                    | "i64"
+                    | "u8"
+                    | "u16"
+                    | "u32"
+                    | "u64"
+                    | "int"
+                    | "long"
+                    | "bool"
+                    | "float"
+                    | "double"
             )
         }
         TypeExprKind::Tuple(elems) => elems.iter().all(|e| is_c_abi_compatible(e, interner)),
@@ -1066,7 +1328,8 @@ fn foo(x: Tensor<[4], f32>) -> Tensor<[4], f32>:
 ";
         let errs = parse_and_validate(src);
         assert!(
-            errs.iter().any(|d| d.message.contains("valid C identifier")),
+            errs.iter()
+                .any(|d| d.message.contains("valid C identifier")),
             "expected 'valid C identifier' error, got: {:?}",
             errs
         );
@@ -1133,7 +1396,9 @@ fn predict(net: Net, x: Tensor<[4], f32>) -> Tensor<[4], f32>:
             .filter(|d| d.level == nsl_errors::Level::Warning)
             .collect();
         assert!(
-            warnings.iter().any(|d| d.message.contains("weight") && d.message.contains("predict")),
+            warnings
+                .iter()
+                .any(|d| d.message.contains("weight") && d.message.contains("predict")),
             "expected weight-reference warning for 'predict', got: {:?}",
             diags
         );
@@ -1151,9 +1416,7 @@ fn add(a: Tensor<[4], f32>, b: Tensor<[4], f32>) -> Tensor<[4], f32>:
         let diags = parse_and_validate(src);
         let weight_warnings: Vec<_> = diags
             .iter()
-            .filter(|d| {
-                d.level == nsl_errors::Level::Warning && d.message.contains("weight")
-            })
+            .filter(|d| d.level == nsl_errors::Level::Warning && d.message.contains("weight"))
             .collect();
         assert!(
             weight_warnings.is_empty(),
@@ -1282,6 +1545,11 @@ model Net:
         // Both indices must be 0 and 1 (order may vary by NodeId).
         let mut indices: Vec<usize> = weight_map.values().copied().collect();
         indices.sort_unstable();
-        assert_eq!(indices, vec![0, 1], "expected indices [0, 1], got: {:?}", indices);
+        assert_eq!(
+            indices,
+            vec![0, 1],
+            "expected indices [0, 1], got: {:?}",
+            indices
+        );
     }
 }

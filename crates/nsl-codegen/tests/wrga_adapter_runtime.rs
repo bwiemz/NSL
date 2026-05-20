@@ -386,7 +386,12 @@ fn main():
         .fusion
         .decisions
         .iter()
-        .filter(|d| matches!(d.target, nsl_codegen::FusionTarget::EpilogueFusedLora { .. }))
+        .filter(|d| {
+            matches!(
+                d.target,
+                nsl_codegen::FusionTarget::EpilogueFusedLora { .. }
+            )
+        })
         .count();
     // Post-Task 4 this test tightens: adapter_related_count must be ≤ 1.
     let _ = (adapter_related_count, fused_decisions);

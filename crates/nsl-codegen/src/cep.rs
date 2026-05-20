@@ -249,12 +249,14 @@ fn synthetic_importance(spec: &ModelSpec, slacks: &RooflineSlackTable) -> Import
                 weight_magnitude: 1.0,
                 spectral_energy: 0.5,
                 roofline_slack: slack,
-                position_factor: crate::cep_importance::position_factor(layer as u32, spec.n_layers),
+                position_factor: crate::cep_importance::position_factor(
+                    layer as u32,
+                    spec.n_layers,
+                ),
                 // Earlier/later layers and lower-slack (compute-bound) layers
                 // get higher scores so the greedy search targets the middle
                 // first.
-                score: slack
-                    * crate::cep_importance::position_factor(layer as u32, spec.n_layers),
+                score: slack * crate::cep_importance::position_factor(layer as u32, spec.n_layers),
             });
         }
     }

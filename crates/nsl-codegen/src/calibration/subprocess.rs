@@ -24,7 +24,11 @@ pub enum SubprocessOutcome {
 ///
 /// `args` are passed as positional CLI arguments: `argv[1]`, `argv[2]`, etc.
 /// No environment variables are used for path passing.
-pub fn run_subprocess(binary: &Path, args: &[&str], timeout: Duration) -> std::io::Result<SubprocessOutcome> {
+pub fn run_subprocess(
+    binary: &Path,
+    args: &[&str],
+    timeout: Duration,
+) -> std::io::Result<SubprocessOutcome> {
     let mut child = Command::new(binary)
         .args(args)
         .stdout(Stdio::inherit())
@@ -58,9 +62,9 @@ fn classify_exit(code: Option<i32>) -> SubprocessOutcome {
         Some(other) => SubprocessOutcome::Infrastructure(format!(
             "calibration subprocess exited with status {other}"
         )),
-        None => SubprocessOutcome::Infrastructure(
-            "calibration subprocess terminated by signal".into(),
-        ),
+        None => {
+            SubprocessOutcome::Infrastructure("calibration subprocess terminated by signal".into())
+        }
     }
 }
 

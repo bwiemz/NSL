@@ -351,12 +351,7 @@ fn current_cuda_context() -> Option<u64> {
 /// chunkified pointer. The result simply isn't cached — a cost only
 /// paid on the (degraded) no-context path.
 #[cfg(feature = "cuda")]
-pub(crate) fn w_chunkified_cached(
-    in_ptr: u64,
-    d_model: u64,
-    hd: u64,
-    chunk: u64,
-) -> Option<u64> {
+pub(crate) fn w_chunkified_cached(in_ptr: u64, d_model: u64, hd: u64, chunk: u64) -> Option<u64> {
     let ctx_opt = current_cuda_context();
     if let Some(ctx) = ctx_opt {
         let key = WCacheKey {
@@ -379,9 +374,7 @@ pub(crate) fn w_chunkified_cached(
     let rc = launch_w_prepass(in_ptr, scratch as u64, d_model, hd, chunk);
     if rc as u32 != 0 {
         unsafe {
-            let _ = cudarc::driver::sys::cuMemFree_v2(
-                scratch as cudarc::driver::sys::CUdeviceptr,
-            );
+            let _ = cudarc::driver::sys::cuMemFree_v2(scratch as cudarc::driver::sys::CUdeviceptr);
         }
         return None;
     }
@@ -414,7 +407,11 @@ pub(crate) fn launch_x_prepass(
     chunk: u64,
     eps: f32,
 ) -> CUresult {
-    debug_assert!(chunk.is_power_of_two(), "chunk must be a power of 2; got {}", chunk);
+    debug_assert!(
+        chunk.is_power_of_two(),
+        "chunk must be a power of 2; got {}",
+        chunk
+    );
     let log2_chunk: u32 = chunk.trailing_zeros();
     let mut x_in = x_in_ptr;
     let mut gamma = gamma_ptr;
@@ -460,7 +457,11 @@ pub(crate) fn launch_w_prepass(
     hd: u64,
     chunk: u64,
 ) -> CUresult {
-    debug_assert!(chunk.is_power_of_two(), "chunk must be a power of 2; got {}", chunk);
+    debug_assert!(
+        chunk.is_power_of_two(),
+        "chunk must be a power of 2; got {}",
+        chunk
+    );
     debug_assert!(hd.is_power_of_two(), "hd must be a power of 2; got {}", hd);
     let log2_chunk: u32 = chunk.trailing_zeros();
     let log2_hd: u32 = hd.trailing_zeros();

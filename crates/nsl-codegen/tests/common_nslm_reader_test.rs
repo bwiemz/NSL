@@ -8,9 +8,7 @@ use common::nslm_reader::read_nslm;
 use std::io::Write;
 use tempfile::NamedTempFile;
 
-fn write_nslm_bytes(
-    params: &[(&str, Vec<i64>, &str, Vec<u8>)],
-) -> NamedTempFile {
+fn write_nslm_bytes(params: &[(&str, Vec<i64>, &str, Vec<u8>)]) -> NamedTempFile {
     let mut file = NamedTempFile::new().expect("tempfile");
 
     let mut header_entries = Vec::new();
@@ -28,7 +26,8 @@ fn write_nslm_bytes(
 
     file.write_all(b"NSLM").unwrap();
     file.write_all(&1u32.to_le_bytes()).unwrap();
-    file.write_all(&(header_bytes.len() as u64).to_le_bytes()).unwrap();
+    file.write_all(&(header_bytes.len() as u64).to_le_bytes())
+        .unwrap();
     file.write_all(header_bytes).unwrap();
     // 64-byte alignment padding from file start, matching checkpoint.rs
     let header_total = 4 + 4 + 8 + header_bytes.len();
@@ -44,7 +43,10 @@ fn write_nslm_bytes(
 #[test]
 fn reads_single_f32_tensor() {
     let values: Vec<f32> = vec![0.5, -0.3, 1.25, 0.0];
-    let bytes: Vec<u8> = values.iter().flat_map(|f| f.to_le_bytes().to_vec()).collect();
+    let bytes: Vec<u8> = values
+        .iter()
+        .flat_map(|f| f.to_le_bytes().to_vec())
+        .collect();
     let file = write_nslm_bytes(&[("w", vec![4], "f32", bytes)]);
 
     let got = read_nslm(file.path()).expect("read ok");
@@ -58,7 +60,10 @@ fn reads_single_f32_tensor() {
 #[test]
 fn reads_f64_tensor_and_downcasts_to_f32() {
     let values: Vec<f64> = vec![0.5, -0.25, 1.0];
-    let bytes: Vec<u8> = values.iter().flat_map(|f| f.to_le_bytes().to_vec()).collect();
+    let bytes: Vec<u8> = values
+        .iter()
+        .flat_map(|f| f.to_le_bytes().to_vec())
+        .collect();
     let file = write_nslm_bytes(&[("b", vec![3], "f64", bytes)]);
 
     let got = read_nslm(file.path()).expect("read ok");

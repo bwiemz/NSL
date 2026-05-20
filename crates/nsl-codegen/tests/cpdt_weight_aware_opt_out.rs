@@ -70,10 +70,7 @@ fn applied_plan_blocks(n_layers: usize) -> AppliedPlan {
     }
 }
 
-fn cpdt_input<'a>(
-    applied: &AppliedPlan,
-    weights: Option<&'a WeightMap>,
-) -> CpdtInput<'a> {
+fn cpdt_input<'a>(applied: &AppliedPlan, weights: Option<&'a WeightMap>) -> CpdtInput<'a> {
     let overrides = WggoOverrides::from_applied(applied);
     CpdtInput {
         mode: CpdtMode::Full,
@@ -113,8 +110,8 @@ fn cascade_weights_some_populates_precision_plan() {
     // When CpdtInput.weights is Some(wm), cpdt::run's Full-mode branch
     // produces a non-empty precision plan. This is the behavior the
     // opt-out's "don't shadow to None" branch relies on.
-    let wm = WeightMap::load(&fixture_path("calib_small"))
-        .expect("calib_small fixture must be present");
+    let wm =
+        WeightMap::load(&fixture_path("calib_small")).expect("calib_small fixture must be present");
     let applied = applied_plan_blocks(8);
     let input = cpdt_input(&applied, Some(&wm));
     let plan = cpdt_run(input);

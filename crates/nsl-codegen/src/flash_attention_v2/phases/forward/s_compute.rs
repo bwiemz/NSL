@@ -35,7 +35,7 @@ pub fn emit(
     tier_b: Option<(u32, SegmentResidency)>,
 ) {
     let head_dim = config.head_dim as u32;
-    let slices   = head_dim / 32;
+    let slices = head_dim / 32;
     let block_kv = config.block_kv as u32;
     let fused = config.csha.as_ref().is_some_and(|c| c.fused_projections);
     let capture = config
@@ -132,24 +132,14 @@ pub fn emit(
     // parameter isn't reaching the kernel correctly (or ld.param.f32 /
     // the FFI is mis-threading the bits).
     if capture && diag_mode == "direct_scale" {
-        emit_direct_hbm_store_of_reg(
-            ptx,
-            q_tile_iter,
-            "lane-0 %scale param",
-            "%scale",
-        );
+        emit_direct_hbm_store_of_reg(ptx, q_tile_iter, "lane-0 %scale param", "%scale");
     }
 
     // J-A5 direct_q0: snapshot lane-0's Q slice-0 register before the k
     // loop. Stored to row_max HBM so the dump infrastructure can read it.
     if capture && diag_mode == "direct_q0" {
         let q0_reg = format!("%f{}", Q_BASE);
-        emit_direct_hbm_store_of_reg(
-            ptx,
-            q_tile_iter,
-            "lane-0 Q_BASE (Q slice 0)",
-            &q0_reg,
-        );
+        emit_direct_hbm_store_of_reg(ptx, q_tile_iter, "lane-0 Q_BASE (Q slice 0)", &q0_reg);
     }
 
     // Loop over k in 0..block_kv.
@@ -189,10 +179,7 @@ pub fn emit(
         // just after cvt.f32.f16 from the SMEM b16 tile.
         if i == 0 && capture && diag_mode == "direct_k00" {
             ptx.push_str("    setp.ne.u32 %p0, %r1, 0;\n");
-            ptx.push_str(&format!(
-                "    @%p0 bra V2_DIAG_K00_SKIP_{};\n",
-                q_tile_iter
-            ));
+            ptx.push_str(&format!("    @%p0 bra V2_DIAG_K00_SKIP_{};\n", q_tile_iter));
             emit_direct_hbm_store_of_reg(
                 ptx,
                 q_tile_iter,
@@ -224,10 +211,7 @@ pub fn emit(
             "per-lane partial Q*K for k=0, pre-butterfly",
             "%f0",
         );
-        ptx.push_str(&format!(
-            "V2_DIAG_QK_RAW_SKIP_{}:\n",
-            q_tile_iter
-        ));
+        ptx.push_str(&format!("V2_DIAG_QK_RAW_SKIP_{}:\n", q_tile_iter));
     }
 
     // 5-step warp butterfly: every lane ends with the full dot product.
@@ -252,10 +236,7 @@ pub fn emit(
             "lane-0 %f0 post-butterfly-sum for k=0 (pre-scale)",
             "%f0",
         );
-        ptx.push_str(&format!(
-            "V2_DIAG_POST_BFLY_SKIP_{}:\n",
-            q_tile_iter
-        ));
+        ptx.push_str(&format!("V2_DIAG_POST_BFLY_SKIP_{}:\n", q_tile_iter));
     }
     ptx.push_str("    mul.f32 %f0, %f0, %scale;                 // S *= 1/sqrt(d_k)\n");
     // J-A5 direct_post_scale capture: post-scale, pre-causal. Should be
@@ -266,16 +247,8 @@ pub fn emit(
             "    @%p0 bra V2_DIAG_POST_SCALE_SKIP_{};\n",
             q_tile_iter
         ));
-        emit_direct_hbm_store_of_reg(
-            ptx,
-            q_tile_iter,
-            "lane-0 %f0 post-scale for k=0",
-            "%f0",
-        );
-        ptx.push_str(&format!(
-            "V2_DIAG_POST_SCALE_SKIP_{}:\n",
-            q_tile_iter
-        ));
+        emit_direct_hbm_store_of_reg(ptx, q_tile_iter, "lane-0 %f0 post-scale for k=0", "%f0");
+        ptx.push_str(&format!("V2_DIAG_POST_SCALE_SKIP_{}:\n", q_tile_iter));
     }
 
     // Causal mask: if k_global > q_row_global, S = -inf.
@@ -299,11 +272,11 @@ pub fn emit(
         if config.segment_masked {
             crate::flash_attention_v2::phases::segment_mask::emit_segment_mask_predicate(
                 ptx,
-                "%rd35",   // q_pos_reg (q_row_global, u64)
-                "%rd34",   // k_pos_reg  (k_global, u64)
+                "%rd35",     // q_pos_reg (q_row_global, u64)
+                "%rd34",     // k_pos_reg  (k_global, u64)
                 "%seg_base", // SMEM base declared in prelude (u64 generic address)
                 crate::pca_segment::SegmentResidency::Shared,
-                "%p0",     // extend caller's mask predicate in place
+                "%p0", // extend caller's mask predicate in place
             );
         }
         ptx.push_str("    @%p0 mov.f32 %f0, 0fFF800000;             // -inf\n");
@@ -326,10 +299,7 @@ pub fn emit(
             "lane-0 %f0 pre-SMEM-store for k=0 (scaled post-causal S)",
             "%f0",
         );
-        ptx.push_str(&format!(
-            "V2_DIAG_S_STORE_PRE_SKIP_{}:\n",
-            q_tile_iter
-        ));
+        ptx.push_str(&format!("V2_DIAG_S_STORE_PRE_SKIP_{}:\n", q_tile_iter));
     }
 
     // Lane 0 stores full S to shmem_S[warp_id, k].

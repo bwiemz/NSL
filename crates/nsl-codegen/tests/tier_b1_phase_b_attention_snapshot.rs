@@ -11,7 +11,9 @@ use nsl_codegen::flash_attention_v2::tier_b1::attention_mma::emit_phase_b_attent
 fn phase_b_canonical_snapshot() {
     let config = canonical_test_config();
     let mut ptx = String::new();
-    emit_phase_b_attention(&mut ptx, &config, /* kv_iter = */ 0, /* slot = */ 0);
+    emit_phase_b_attention(
+        &mut ptx, &config, /* kv_iter = */ 0, /* slot = */ 0,
+    );
     insta::with_settings!({ snapshot_suffix => "kv0_slot0" }, {
         assert_snapshot!(ptx);
     });
@@ -21,7 +23,9 @@ fn phase_b_canonical_snapshot() {
 fn phase_b_kv_iter_1_snapshot() {
     let config = canonical_test_config();
     let mut ptx = String::new();
-    emit_phase_b_attention(&mut ptx, &config, /* kv_iter = */ 1, /* slot = */ 1);
+    emit_phase_b_attention(
+        &mut ptx, &config, /* kv_iter = */ 1, /* slot = */ 1,
+    );
     insta::with_settings!({ snapshot_suffix => "kv1_slot1" }, {
         assert_snapshot!(ptx);
     });
@@ -40,6 +44,10 @@ fn canonical_test_config() -> FlashAttentionConfig {
         tree_mask: false,
         gpu_sm: 120,
         segment_masked: false,
-        csha: Some(CshaExtras { level: 2, d_model: 2048, ..CshaExtras::default() }),
+        csha: Some(CshaExtras {
+            level: 2,
+            d_model: 2048,
+            ..CshaExtras::default()
+        }),
     }
 }

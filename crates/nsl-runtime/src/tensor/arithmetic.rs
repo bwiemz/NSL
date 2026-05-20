@@ -6,7 +6,9 @@ use std::sync::atomic::Ordering;
 use crate::autodiff;
 use crate::memory::{checked_alloc, checked_alloc_zeroed};
 
-use super::{get_shape_vec, nsl_tensor_contiguous, nsl_tensor_free, nsl_tensor_to_device, NslTensor};
+use super::{
+    get_shape_vec, nsl_tensor_contiguous, nsl_tensor_free, nsl_tensor_to_device, NslTensor,
+};
 
 fn tensor_elementwise_op(a_ptr: i64, b_ptr: i64, op: fn(f64, f64) -> f64) -> i64 {
     crate::cpu::tensor_elementwise_op(a_ptr, b_ptr, op)
@@ -43,7 +45,12 @@ pub extern "C" fn nsl_tensor_add(a: i64, b: i64, flags: u8) -> i64 {
             {
                 let tb = unsafe { &*(b as *const NslTensor) };
                 if relinq_a && ta.shape_eq(tb) {
-                    crate::cuda::gpu_elementwise_binary_inplace(a, b, crate::cuda::kernels::ADD_F32_PTX, "nsl_add_f32\0");
+                    crate::cuda::gpu_elementwise_binary_inplace(
+                        a,
+                        b,
+                        crate::cuda::kernels::ADD_F32_PTX,
+                        "nsl_add_f32\0",
+                    );
                     ta.refcount.fetch_add(1, Ordering::SeqCst);
                     super::fbip_record_reuse();
                     // FBIP-3: free caller's original B if relinquished.
@@ -58,7 +65,12 @@ pub extern "C" fn nsl_tensor_add(a: i64, b: i64, flags: u8) -> i64 {
                     }
                     return a;
                 }
-                let result = crate::cuda::gpu_elementwise_binary(a, b, crate::cuda::kernels::ADD_F32_PTX, "nsl_add_f32\0");
+                let result = crate::cuda::gpu_elementwise_binary(
+                    a,
+                    b,
+                    crate::cuda::kernels::ADD_F32_PTX,
+                    "nsl_add_f32\0",
+                );
                 // Out-of-place GPU fallback: honor caller relinquish flags.
                 if relinq_a {
                     nsl_tensor_free(a);
@@ -72,7 +84,9 @@ pub extern "C" fn nsl_tensor_add(a: i64, b: i64, flags: u8) -> i64 {
                 return result;
             }
             #[cfg(not(feature = "cuda"))]
-            { panic!("CUDA support not compiled"); }
+            {
+                panic!("CUDA support not compiled");
+            }
         }
     }
     // FBIP: reuse left operand when uniquely owned + same shape (no broadcast, CPU).
@@ -102,11 +116,15 @@ pub extern "C" fn nsl_tensor_add(a: i64, b: i64, flags: u8) -> i64 {
             } else if ta.dtype == 1 {
                 let da = ta.data as *mut f32;
                 let db = tb.data as *const f32;
-                for i in 0..len { unsafe { *da.add(i) += *db.add(i) }; }
+                for i in 0..len {
+                    unsafe { *da.add(i) += *db.add(i) };
+                }
             } else {
                 let da = ta.data as *mut f64;
                 let db = tb.data as *const f64;
-                for i in 0..len { unsafe { *da.add(i) += *db.add(i) }; }
+                for i in 0..len {
+                    unsafe { *da.add(i) += *db.add(i) };
+                }
             }
             ta.refcount.fetch_add(1, Ordering::SeqCst);
             super::fbip_record_reuse();
@@ -132,13 +150,28 @@ pub extern "C" fn nsl_tensor_add(a: i64, b: i64, flags: u8) -> i64 {
     nsl_tensor_free(a_c);
     nsl_tensor_free(b_c);
     if autodiff::is_recording() {
-        autodiff::maybe_record(autodiff::TapeOp::Add { a, b, out: result, a_shape, b_shape });
+        autodiff::maybe_record(autodiff::TapeOp::Add {
+            a,
+            b,
+            out: result,
+            a_shape,
+            b_shape,
+        });
     }
     #[cfg(feature = "interop")]
     if crate::trace::is_tracing() {
         let rt = NslTensor::from_ptr(result);
-        let shape: Vec<i64> = (0..rt.ndim as usize).map(|d| unsafe { *rt.shape.add(d) }).collect();
-        crate::trace::record_op(crate::trace::OpType::Add, vec![a, b], result, shape, rt.dtype, vec![]);
+        let shape: Vec<i64> = (0..rt.ndim as usize)
+            .map(|d| unsafe { *rt.shape.add(d) })
+            .collect();
+        crate::trace::record_op(
+            crate::trace::OpType::Add,
+            vec![a, b],
+            result,
+            shape,
+            rt.dtype,
+            vec![],
+        );
     }
     // FBIP-3: out-of-place fallback — honor caller relinquish flags.
     if relinq_a {
@@ -168,21 +201,43 @@ pub extern "C" fn nsl_tensor_sub(a: i64, b: i64, flags: u8) -> i64 {
             {
                 let tb = unsafe { &*(b as *const NslTensor) };
                 if relinq_a && ta.shape_eq(tb) {
-                    crate::cuda::gpu_elementwise_binary_inplace(a, b, crate::cuda::kernels::SUB_F32_PTX, "nsl_sub_f32\0");
+                    crate::cuda::gpu_elementwise_binary_inplace(
+                        a,
+                        b,
+                        crate::cuda::kernels::SUB_F32_PTX,
+                        "nsl_sub_f32\0",
+                    );
                     ta.refcount.fetch_add(1, Ordering::SeqCst);
                     super::fbip_record_reuse();
-                    if relinq_b { nsl_tensor_free(b_orig); }
-                    if b_transferred { nsl_tensor_free(b); }
+                    if relinq_b {
+                        nsl_tensor_free(b_orig);
+                    }
+                    if b_transferred {
+                        nsl_tensor_free(b);
+                    }
                     return a;
                 }
-                let result = crate::cuda::gpu_elementwise_binary(a, b, crate::cuda::kernels::SUB_F32_PTX, "nsl_sub_f32\0");
-                if relinq_a { nsl_tensor_free(a); }
-                if relinq_b { nsl_tensor_free(b_orig); }
-                if b_transferred { nsl_tensor_free(b); }
+                let result = crate::cuda::gpu_elementwise_binary(
+                    a,
+                    b,
+                    crate::cuda::kernels::SUB_F32_PTX,
+                    "nsl_sub_f32\0",
+                );
+                if relinq_a {
+                    nsl_tensor_free(a);
+                }
+                if relinq_b {
+                    nsl_tensor_free(b_orig);
+                }
+                if b_transferred {
+                    nsl_tensor_free(b);
+                }
                 return result;
             }
             #[cfg(not(feature = "cuda"))]
-            { panic!("CUDA support not compiled"); }
+            {
+                panic!("CUDA support not compiled");
+            }
         }
     }
     // FBIP: reuse left operand when uniquely owned + same shape (CPU).
@@ -211,16 +266,24 @@ pub extern "C" fn nsl_tensor_sub(a: i64, b: i64, flags: u8) -> i64 {
             } else if ta.dtype == 1 {
                 let da = ta.data as *mut f32;
                 let db = tb.data as *const f32;
-                for i in 0..len { unsafe { *da.add(i) -= *db.add(i) }; }
+                for i in 0..len {
+                    unsafe { *da.add(i) -= *db.add(i) };
+                }
             } else {
                 let da = ta.data as *mut f64;
                 let db = tb.data as *const f64;
-                for i in 0..len { unsafe { *da.add(i) -= *db.add(i) }; }
+                for i in 0..len {
+                    unsafe { *da.add(i) -= *db.add(i) };
+                }
             }
             ta.refcount.fetch_add(1, Ordering::SeqCst);
             super::fbip_record_reuse();
-            if relinq_b { nsl_tensor_free(b_orig); }
-            if b_transferred { nsl_tensor_free(b); }
+            if relinq_b {
+                nsl_tensor_free(b_orig);
+            }
+            if b_transferred {
+                nsl_tensor_free(b);
+            }
             return a;
         }
     }
@@ -233,18 +296,39 @@ pub extern "C" fn nsl_tensor_sub(a: i64, b: i64, flags: u8) -> i64 {
     nsl_tensor_free(a_c);
     nsl_tensor_free(b_c);
     if autodiff::is_recording() {
-        autodiff::maybe_record(autodiff::TapeOp::Sub { a, b, out: result, a_shape, b_shape });
+        autodiff::maybe_record(autodiff::TapeOp::Sub {
+            a,
+            b,
+            out: result,
+            a_shape,
+            b_shape,
+        });
     }
     #[cfg(feature = "interop")]
     if crate::trace::is_tracing() {
         let rt = NslTensor::from_ptr(result);
-        let shape: Vec<i64> = (0..rt.ndim as usize).map(|d| unsafe { *rt.shape.add(d) }).collect();
-        crate::trace::record_op(crate::trace::OpType::Sub, vec![a, b], result, shape, rt.dtype, vec![]);
+        let shape: Vec<i64> = (0..rt.ndim as usize)
+            .map(|d| unsafe { *rt.shape.add(d) })
+            .collect();
+        crate::trace::record_op(
+            crate::trace::OpType::Sub,
+            vec![a, b],
+            result,
+            shape,
+            rt.dtype,
+            vec![],
+        );
     }
     // FBIP-3: out-of-place fallback — honor caller relinquish flags.
-    if relinq_a { nsl_tensor_free(a); }
-    if relinq_b { nsl_tensor_free(b_orig); }
-    if b_transferred { nsl_tensor_free(b); }
+    if relinq_a {
+        nsl_tensor_free(a);
+    }
+    if relinq_b {
+        nsl_tensor_free(b_orig);
+    }
+    if b_transferred {
+        nsl_tensor_free(b);
+    }
     result
 }
 
@@ -262,21 +346,43 @@ pub extern "C" fn nsl_tensor_mul(a: i64, b: i64, flags: u8) -> i64 {
             {
                 let tb = unsafe { &*(b as *const NslTensor) };
                 if relinq_a && ta.shape_eq(tb) {
-                    crate::cuda::gpu_elementwise_binary_inplace(a, b, crate::cuda::kernels::MUL_F32_PTX, "nsl_mul_f32\0");
+                    crate::cuda::gpu_elementwise_binary_inplace(
+                        a,
+                        b,
+                        crate::cuda::kernels::MUL_F32_PTX,
+                        "nsl_mul_f32\0",
+                    );
                     ta.refcount.fetch_add(1, Ordering::SeqCst);
                     super::fbip_record_reuse();
-                    if relinq_b { nsl_tensor_free(b_orig); }
-                    if b_transferred { nsl_tensor_free(b); }
+                    if relinq_b {
+                        nsl_tensor_free(b_orig);
+                    }
+                    if b_transferred {
+                        nsl_tensor_free(b);
+                    }
                     return a;
                 }
-                let result = crate::cuda::gpu_elementwise_binary(a, b, crate::cuda::kernels::MUL_F32_PTX, "nsl_mul_f32\0");
-                if relinq_a { nsl_tensor_free(a); }
-                if relinq_b { nsl_tensor_free(b_orig); }
-                if b_transferred { nsl_tensor_free(b); }
+                let result = crate::cuda::gpu_elementwise_binary(
+                    a,
+                    b,
+                    crate::cuda::kernels::MUL_F32_PTX,
+                    "nsl_mul_f32\0",
+                );
+                if relinq_a {
+                    nsl_tensor_free(a);
+                }
+                if relinq_b {
+                    nsl_tensor_free(b_orig);
+                }
+                if b_transferred {
+                    nsl_tensor_free(b);
+                }
                 return result;
             }
             #[cfg(not(feature = "cuda"))]
-            { panic!("CUDA support not compiled"); }
+            {
+                panic!("CUDA support not compiled");
+            }
         }
     }
     // FBIP: reuse left operand when uniquely owned + same shape (CPU).
@@ -305,16 +411,24 @@ pub extern "C" fn nsl_tensor_mul(a: i64, b: i64, flags: u8) -> i64 {
             } else if ta.dtype == 1 {
                 let da = ta.data as *mut f32;
                 let db = tb.data as *const f32;
-                for i in 0..len { unsafe { *da.add(i) *= *db.add(i) }; }
+                for i in 0..len {
+                    unsafe { *da.add(i) *= *db.add(i) };
+                }
             } else {
                 let da = ta.data as *mut f64;
                 let db = tb.data as *const f64;
-                for i in 0..len { unsafe { *da.add(i) *= *db.add(i) }; }
+                for i in 0..len {
+                    unsafe { *da.add(i) *= *db.add(i) };
+                }
             }
             ta.refcount.fetch_add(1, Ordering::SeqCst);
             super::fbip_record_reuse();
-            if relinq_b { nsl_tensor_free(b_orig); }
-            if b_transferred { nsl_tensor_free(b); }
+            if relinq_b {
+                nsl_tensor_free(b_orig);
+            }
+            if b_transferred {
+                nsl_tensor_free(b);
+            }
             return a;
         }
     }
@@ -327,8 +441,12 @@ pub extern "C" fn nsl_tensor_mul(a: i64, b: i64, flags: u8) -> i64 {
     nsl_tensor_free(a_c);
     nsl_tensor_free(b_c);
     if autodiff::is_recording() {
-        NslTensor::from_ptr(a).refcount.fetch_add(1, Ordering::SeqCst);
-        NslTensor::from_ptr(b).refcount.fetch_add(1, Ordering::SeqCst);
+        NslTensor::from_ptr(a)
+            .refcount
+            .fetch_add(1, Ordering::SeqCst);
+        NslTensor::from_ptr(b)
+            .refcount
+            .fetch_add(1, Ordering::SeqCst);
         autodiff::maybe_record(autodiff::TapeOp::Mul {
             a,
             b,
@@ -342,13 +460,28 @@ pub extern "C" fn nsl_tensor_mul(a: i64, b: i64, flags: u8) -> i64 {
     #[cfg(feature = "interop")]
     if crate::trace::is_tracing() {
         let rt = NslTensor::from_ptr(result);
-        let shape: Vec<i64> = (0..rt.ndim as usize).map(|d| unsafe { *rt.shape.add(d) }).collect();
-        crate::trace::record_op(crate::trace::OpType::Mul, vec![a, b], result, shape, rt.dtype, vec![]);
+        let shape: Vec<i64> = (0..rt.ndim as usize)
+            .map(|d| unsafe { *rt.shape.add(d) })
+            .collect();
+        crate::trace::record_op(
+            crate::trace::OpType::Mul,
+            vec![a, b],
+            result,
+            shape,
+            rt.dtype,
+            vec![],
+        );
     }
     // FBIP-3: out-of-place fallback — honor caller relinquish flags.
-    if relinq_a { nsl_tensor_free(a); }
-    if relinq_b { nsl_tensor_free(b_orig); }
-    if b_transferred { nsl_tensor_free(b); }
+    if relinq_a {
+        nsl_tensor_free(a);
+    }
+    if relinq_b {
+        nsl_tensor_free(b_orig);
+    }
+    if b_transferred {
+        nsl_tensor_free(b);
+    }
     result
 }
 
@@ -366,21 +499,43 @@ pub extern "C" fn nsl_tensor_div(a: i64, b: i64, flags: u8) -> i64 {
             {
                 let tb = unsafe { &*(b as *const NslTensor) };
                 if relinq_a && ta.shape_eq(tb) {
-                    crate::cuda::gpu_elementwise_binary_inplace(a, b, crate::cuda::kernels::DIV_F32_PTX, "nsl_div_f32\0");
+                    crate::cuda::gpu_elementwise_binary_inplace(
+                        a,
+                        b,
+                        crate::cuda::kernels::DIV_F32_PTX,
+                        "nsl_div_f32\0",
+                    );
                     ta.refcount.fetch_add(1, Ordering::SeqCst);
                     super::fbip_record_reuse();
-                    if relinq_b { nsl_tensor_free(b_orig); }
-                    if b_transferred { nsl_tensor_free(b); }
+                    if relinq_b {
+                        nsl_tensor_free(b_orig);
+                    }
+                    if b_transferred {
+                        nsl_tensor_free(b);
+                    }
                     return a;
                 }
-                let result = crate::cuda::gpu_elementwise_binary(a, b, crate::cuda::kernels::DIV_F32_PTX, "nsl_div_f32\0");
-                if relinq_a { nsl_tensor_free(a); }
-                if relinq_b { nsl_tensor_free(b_orig); }
-                if b_transferred { nsl_tensor_free(b); }
+                let result = crate::cuda::gpu_elementwise_binary(
+                    a,
+                    b,
+                    crate::cuda::kernels::DIV_F32_PTX,
+                    "nsl_div_f32\0",
+                );
+                if relinq_a {
+                    nsl_tensor_free(a);
+                }
+                if relinq_b {
+                    nsl_tensor_free(b_orig);
+                }
+                if b_transferred {
+                    nsl_tensor_free(b);
+                }
                 return result;
             }
             #[cfg(not(feature = "cuda"))]
-            { panic!("CUDA support not compiled"); }
+            {
+                panic!("CUDA support not compiled");
+            }
         }
     }
     // FBIP: reuse left operand when uniquely owned + same shape (CPU).
@@ -409,16 +564,24 @@ pub extern "C" fn nsl_tensor_div(a: i64, b: i64, flags: u8) -> i64 {
             } else if ta.dtype == 1 {
                 let da = ta.data as *mut f32;
                 let db = tb.data as *const f32;
-                for i in 0..len { unsafe { *da.add(i) /= *db.add(i) }; }
+                for i in 0..len {
+                    unsafe { *da.add(i) /= *db.add(i) };
+                }
             } else {
                 let da = ta.data as *mut f64;
                 let db = tb.data as *const f64;
-                for i in 0..len { unsafe { *da.add(i) /= *db.add(i) }; }
+                for i in 0..len {
+                    unsafe { *da.add(i) /= *db.add(i) };
+                }
             }
             ta.refcount.fetch_add(1, Ordering::SeqCst);
             super::fbip_record_reuse();
-            if relinq_b { nsl_tensor_free(b_orig); }
-            if b_transferred { nsl_tensor_free(b); }
+            if relinq_b {
+                nsl_tensor_free(b_orig);
+            }
+            if b_transferred {
+                nsl_tensor_free(b);
+            }
             return a;
         }
     }
@@ -431,8 +594,12 @@ pub extern "C" fn nsl_tensor_div(a: i64, b: i64, flags: u8) -> i64 {
     nsl_tensor_free(a_c);
     nsl_tensor_free(b_c);
     if autodiff::is_recording() {
-        NslTensor::from_ptr(a).refcount.fetch_add(1, Ordering::SeqCst);
-        NslTensor::from_ptr(b).refcount.fetch_add(1, Ordering::SeqCst);
+        NslTensor::from_ptr(a)
+            .refcount
+            .fetch_add(1, Ordering::SeqCst);
+        NslTensor::from_ptr(b)
+            .refcount
+            .fetch_add(1, Ordering::SeqCst);
         autodiff::maybe_record(autodiff::TapeOp::Div {
             a,
             b,
@@ -446,13 +613,28 @@ pub extern "C" fn nsl_tensor_div(a: i64, b: i64, flags: u8) -> i64 {
     #[cfg(feature = "interop")]
     if crate::trace::is_tracing() {
         let rt = NslTensor::from_ptr(result);
-        let shape: Vec<i64> = (0..rt.ndim as usize).map(|d| unsafe { *rt.shape.add(d) }).collect();
-        crate::trace::record_op(crate::trace::OpType::Div, vec![a, b], result, shape, rt.dtype, vec![]);
+        let shape: Vec<i64> = (0..rt.ndim as usize)
+            .map(|d| unsafe { *rt.shape.add(d) })
+            .collect();
+        crate::trace::record_op(
+            crate::trace::OpType::Div,
+            vec![a, b],
+            result,
+            shape,
+            rt.dtype,
+            vec![],
+        );
     }
     // FBIP-3: out-of-place fallback — honor caller relinquish flags.
-    if relinq_a { nsl_tensor_free(a); }
-    if relinq_b { nsl_tensor_free(b_orig); }
-    if b_transferred { nsl_tensor_free(b); }
+    if relinq_a {
+        nsl_tensor_free(a);
+    }
+    if relinq_b {
+        nsl_tensor_free(b_orig);
+    }
+    if b_transferred {
+        nsl_tensor_free(b);
+    }
     result
 }
 
@@ -464,15 +646,25 @@ pub extern "C" fn nsl_tensor_neg(a_ptr: i64) -> i64 {
             #[cfg(feature = "cuda")]
             {
                 if ta.can_mutate_inplace_gpu() {
-                    crate::cuda::gpu_elementwise_unary_inplace(a_ptr, crate::cuda::kernels::NEG_F32_PTX, "nsl_neg_f32\0");
+                    crate::cuda::gpu_elementwise_unary_inplace(
+                        a_ptr,
+                        crate::cuda::kernels::NEG_F32_PTX,
+                        "nsl_neg_f32\0",
+                    );
                     ta.refcount.fetch_add(1, Ordering::SeqCst);
                     super::fbip_record_reuse();
                     return a_ptr;
                 }
-                return crate::cuda::gpu_elementwise_unary(a_ptr, crate::cuda::kernels::NEG_F32_PTX, "nsl_neg_f32\0");
+                return crate::cuda::gpu_elementwise_unary(
+                    a_ptr,
+                    crate::cuda::kernels::NEG_F32_PTX,
+                    "nsl_neg_f32\0",
+                );
             }
             #[cfg(not(feature = "cuda"))]
-            { panic!("CUDA support not compiled"); }
+            {
+                panic!("CUDA support not compiled");
+            }
         }
     }
     // FBIP: mutate in-place when uniquely owned (CPU)
@@ -494,10 +686,14 @@ pub extern "C" fn nsl_tensor_neg(a_ptr: i64) -> i64 {
                 }
             } else if t.dtype == 1 {
                 let d = t.data as *mut f32;
-                for i in 0..len { unsafe { *d.add(i) = -(*d.add(i)) }; }
+                for i in 0..len {
+                    unsafe { *d.add(i) = -(*d.add(i)) };
+                }
             } else {
                 let d = t.data as *mut f64;
-                for i in 0..len { unsafe { *d.add(i) = -(*d.add(i)) }; }
+                for i in 0..len {
+                    unsafe { *d.add(i) = -(*d.add(i)) };
+                }
             }
             t.refcount.fetch_add(1, Ordering::SeqCst);
             super::fbip_record_reuse();
@@ -543,26 +739,30 @@ pub extern "C" fn nsl_tensor_neg(a_ptr: i64) -> i64 {
     };
 
     let result = Box::new(NslTensor::new(
-        data,
-        shape,
-        strides,
-        ndim,
-        len,
-        a.device,
-        a.dtype,
-        1,
-        0,
+        data, shape, strides, ndim, len, a.device, a.dtype, 1, 0,
     ));
     let result = NslTensor::publish(result);
     nsl_tensor_free(a_c);
     if autodiff::is_recording() {
-        autodiff::maybe_record(autodiff::TapeOp::Neg { a: a_ptr, out: result });
+        autodiff::maybe_record(autodiff::TapeOp::Neg {
+            a: a_ptr,
+            out: result,
+        });
     }
     #[cfg(feature = "interop")]
     if crate::trace::is_tracing() {
         let rt = NslTensor::from_ptr(result);
-        let shape: Vec<i64> = (0..rt.ndim as usize).map(|d| unsafe { *rt.shape.add(d) }).collect();
-        crate::trace::record_op(crate::trace::OpType::Neg, vec![a_ptr], result, shape, rt.dtype, vec![]);
+        let shape: Vec<i64> = (0..rt.ndim as usize)
+            .map(|d| unsafe { *rt.shape.add(d) })
+            .collect();
+        crate::trace::record_op(
+            crate::trace::OpType::Neg,
+            vec![a_ptr],
+            result,
+            shape,
+            rt.dtype,
+            vec![],
+        );
     }
     result
 }
@@ -579,17 +779,31 @@ pub extern "C" fn nsl_tensor_add_scalar(a_ptr: i64, s: f64, flags: u8) -> i64 {
             #[cfg(feature = "cuda")]
             {
                 if relinq_a {
-                    crate::cuda::gpu_scalar_op_inplace(a_ptr, s as f32, crate::cuda::kernels::ADD_SCALAR_F32_PTX, "nsl_add_scalar_f32\0");
+                    crate::cuda::gpu_scalar_op_inplace(
+                        a_ptr,
+                        s as f32,
+                        crate::cuda::kernels::ADD_SCALAR_F32_PTX,
+                        "nsl_add_scalar_f32\0",
+                    );
                     ta.refcount.fetch_add(1, Ordering::SeqCst);
                     super::fbip_record_reuse();
                     return a_ptr;
                 }
-                let result = crate::cuda::gpu_scalar_op(a_ptr, s as f32, crate::cuda::kernels::ADD_SCALAR_F32_PTX, "nsl_add_scalar_f32\0");
-                if relinq_a { nsl_tensor_free(a_ptr); }
+                let result = crate::cuda::gpu_scalar_op(
+                    a_ptr,
+                    s as f32,
+                    crate::cuda::kernels::ADD_SCALAR_F32_PTX,
+                    "nsl_add_scalar_f32\0",
+                );
+                if relinq_a {
+                    nsl_tensor_free(a_ptr);
+                }
                 return result;
             }
             #[cfg(not(feature = "cuda"))]
-            { panic!("CUDA support not compiled"); }
+            {
+                panic!("CUDA support not compiled");
+            }
         }
     }
     // FBIP: mutate in-place when uniquely owned (CPU) or when caller relinquished.
@@ -615,10 +829,14 @@ pub extern "C" fn nsl_tensor_add_scalar(a_ptr: i64, s: f64, flags: u8) -> i64 {
             } else if t.dtype == 1 {
                 let d = t.data as *mut f32;
                 let sf = s as f32;
-                for i in 0..len { unsafe { *d.add(i) += sf }; }
+                for i in 0..len {
+                    unsafe { *d.add(i) += sf };
+                }
             } else {
                 let d = t.data as *mut f64;
-                for i in 0..len { unsafe { *d.add(i) += s }; }
+                for i in 0..len {
+                    unsafe { *d.add(i) += s };
+                }
             }
             t.refcount.fetch_add(1, Ordering::SeqCst);
             super::fbip_record_reuse();
@@ -677,22 +895,19 @@ pub extern "C" fn nsl_tensor_add_scalar(a_ptr: i64, s: f64, flags: u8) -> i64 {
     };
 
     let result = Box::new(NslTensor::new(
-        data,
-        shape,
-        strides,
-        ndim,
-        len,
-        a.device,
-        out_dtype,
-        1,
-        0,
+        data, shape, strides, ndim, len, a.device, out_dtype, 1, 0,
     ));
     let result = NslTensor::publish(result);
     nsl_tensor_free(a_c);
     if autodiff::is_recording() {
-        autodiff::maybe_record(autodiff::TapeOp::AddScalar { a: a_ptr, out: result });
+        autodiff::maybe_record(autodiff::TapeOp::AddScalar {
+            a: a_ptr,
+            out: result,
+        });
     }
-    if relinq_a { nsl_tensor_free(a_ptr); }
+    if relinq_a {
+        nsl_tensor_free(a_ptr);
+    }
     result
 }
 
@@ -706,17 +921,31 @@ pub extern "C" fn nsl_tensor_mul_scalar(a_ptr: i64, s: f64, flags: u8) -> i64 {
             #[cfg(feature = "cuda")]
             {
                 if relinq_a {
-                    crate::cuda::gpu_scalar_op_inplace(a_ptr, s as f32, crate::cuda::kernels::MUL_SCALAR_F32_PTX, "nsl_mul_scalar_f32\0");
+                    crate::cuda::gpu_scalar_op_inplace(
+                        a_ptr,
+                        s as f32,
+                        crate::cuda::kernels::MUL_SCALAR_F32_PTX,
+                        "nsl_mul_scalar_f32\0",
+                    );
                     ta.refcount.fetch_add(1, Ordering::SeqCst);
                     super::fbip_record_reuse();
                     return a_ptr;
                 }
-                let result = crate::cuda::gpu_scalar_op(a_ptr, s as f32, crate::cuda::kernels::MUL_SCALAR_F32_PTX, "nsl_mul_scalar_f32\0");
-                if relinq_a { nsl_tensor_free(a_ptr); }
+                let result = crate::cuda::gpu_scalar_op(
+                    a_ptr,
+                    s as f32,
+                    crate::cuda::kernels::MUL_SCALAR_F32_PTX,
+                    "nsl_mul_scalar_f32\0",
+                );
+                if relinq_a {
+                    nsl_tensor_free(a_ptr);
+                }
                 return result;
             }
             #[cfg(not(feature = "cuda"))]
-            { panic!("CUDA support not compiled"); }
+            {
+                panic!("CUDA support not compiled");
+            }
         }
     }
     // FBIP: mutate in-place when uniquely owned (CPU) or when caller relinquished.
@@ -742,10 +971,14 @@ pub extern "C" fn nsl_tensor_mul_scalar(a_ptr: i64, s: f64, flags: u8) -> i64 {
             } else if t.dtype == 1 {
                 let d = t.data as *mut f32;
                 let sf = s as f32;
-                for i in 0..len { unsafe { *d.add(i) *= sf }; }
+                for i in 0..len {
+                    unsafe { *d.add(i) *= sf };
+                }
             } else {
                 let d = t.data as *mut f64;
-                for i in 0..len { unsafe { *d.add(i) *= s }; }
+                for i in 0..len {
+                    unsafe { *d.add(i) *= s };
+                }
             }
             t.refcount.fetch_add(1, Ordering::SeqCst);
             super::fbip_record_reuse();
@@ -794,15 +1027,7 @@ pub extern "C" fn nsl_tensor_mul_scalar(a_ptr: i64, s: f64, flags: u8) -> i64 {
     };
 
     let result = Box::new(NslTensor::new(
-        data,
-        shape,
-        strides,
-        ndim,
-        len,
-        a.device,
-        a.dtype,
-        1,
-        0,
+        data, shape, strides, ndim, len, a.device, a.dtype, 1, 0,
     ));
     let result = NslTensor::publish(result);
     nsl_tensor_free(a_c);
@@ -813,7 +1038,9 @@ pub extern "C" fn nsl_tensor_mul_scalar(a_ptr: i64, s: f64, flags: u8) -> i64 {
             out: result,
         });
     }
-    if relinq_a { nsl_tensor_free(a_ptr); }
+    if relinq_a {
+        nsl_tensor_free(a_ptr);
+    }
     result
 }
 
@@ -841,7 +1068,9 @@ pub extern "C" fn nsl_sparse_matmul(
         if b.device > 0 {
             let last_dim = if b.ndim >= 2 {
                 unsafe { *b.shape.add(b.ndim as usize - 1) }
-            } else { 1 };
+            } else {
+                1
+            };
             let n_out = last_dim as usize;
 
             let out_total = nrows as usize * n_out;
@@ -873,19 +1102,33 @@ pub extern "C" fn nsl_sparse_matmul(
             let result = crate::cuda::inner::kernel_launch(
                 crate::cuda::fused_kernels::CSR_SPMM_F32_PTX.as_ptr(),
                 b"nsl_csr_spmm_f32\0".as_ptr(),
-                [grid_x, grid_y, 1], [block, 1, 1], &args, 0,
+                [grid_x, grid_y, 1],
+                [block, 1, 1],
+                &args,
+                0,
             );
             assert_eq!(result as u32, 0, "GPU CSR SpMM kernel failed: {:?}", result);
-            unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+            unsafe {
+                cudarc::driver::sys::cuCtxSynchronize();
+            }
 
-            let out_shape = crate::memory::checked_alloc(2 * std::mem::size_of::<i64>()) as *mut i64;
+            let out_shape =
+                crate::memory::checked_alloc(2 * std::mem::size_of::<i64>()) as *mut i64;
             unsafe {
                 *out_shape = nrows;
                 *out_shape.add(1) = n_out as i64;
             }
             let out_strides = NslTensor::compute_strides(out_shape, 2);
             let out = Box::new(NslTensor::new(
-                out_data, out_shape, out_strides, 2, out_total as i64, b.device, 1, 1, 0,
+                out_data,
+                out_shape,
+                out_strides,
+                2,
+                out_total as i64,
+                b.device,
+                1,
+                1,
+                0,
             ));
             return NslTensor::publish(out);
         }
@@ -915,13 +1158,21 @@ pub extern "C" fn nsl_tensor_matmul(a_ptr: i64, b_ptr: i64, flags: u8) -> i64 {
                 // FBIP-3: matmul always allocates fresh output; honor relinquish flags
                 // by freeing A/B here. No in-place optimization because matmul output
                 // shape differs from input in general ([M,K] @ [K,N] -> [M,N]).
-                if relinq_a { nsl_tensor_free(a_ptr); }
-                if relinq_b { nsl_tensor_free(b_orig); }
-                if b_transferred { nsl_tensor_free(b_ptr); }
+                if relinq_a {
+                    nsl_tensor_free(a_ptr);
+                }
+                if relinq_b {
+                    nsl_tensor_free(b_orig);
+                }
+                if b_transferred {
+                    nsl_tensor_free(b_ptr);
+                }
                 return result;
             }
             #[cfg(not(feature = "cuda"))]
-            { panic!("CUDA support not compiled"); }
+            {
+                panic!("CUDA support not compiled");
+            }
         }
     }
 
@@ -965,10 +1216,21 @@ pub extern "C" fn nsl_tensor_matmul(a_ptr: i64, b_ptr: i64, flags: u8) -> i64 {
     let max_batch_nd = a_batch.len().max(b_batch.len());
     let mut out_batch: Vec<i64> = Vec::with_capacity(max_batch_nd);
     for i in 0..max_batch_nd {
-        let a_dim = if i < max_batch_nd - a_batch.len() { 1 } else { a_batch[i - (max_batch_nd - a_batch.len())] };
-        let b_dim = if i < max_batch_nd - b_batch.len() { 1 } else { b_batch[i - (max_batch_nd - b_batch.len())] };
+        let a_dim = if i < max_batch_nd - a_batch.len() {
+            1
+        } else {
+            a_batch[i - (max_batch_nd - a_batch.len())]
+        };
+        let b_dim = if i < max_batch_nd - b_batch.len() {
+            1
+        } else {
+            b_batch[i - (max_batch_nd - b_batch.len())]
+        };
         if a_dim != b_dim && a_dim != 1 && b_dim != 1 {
-            eprintln!("nsl: matmul batch dimension mismatch at dim {}: {} vs {}", i, a_dim, b_dim);
+            eprintln!(
+                "nsl: matmul batch dimension mismatch at dim {}: {} vs {}",
+                i, a_dim, b_dim
+            );
             std::process::abort();
         }
         out_batch.push(a_dim.max(b_dim));
@@ -1002,8 +1264,16 @@ pub extern "C" fn nsl_tensor_matmul(a_ptr: i64, b_ptr: i64, flags: u8) -> i64 {
         for i in (0..max_batch_nd).rev() {
             let a_offset = max_batch_nd - a_batch.len();
             let b_offset = max_batch_nd - b_batch.len();
-            let a_d = if i < a_offset { 1 } else { a_batch[i - a_offset] as usize };
-            let b_d = if i < b_offset { 1 } else { b_batch[i - b_offset] as usize };
+            let a_d = if i < a_offset {
+                1
+            } else {
+                a_batch[i - a_offset] as usize
+            };
+            let b_d = if i < b_offset {
+                1
+            } else {
+                b_batch[i - b_offset] as usize
+            };
             a_batch_strides[i] = a_s;
             b_batch_strides[i] = b_s;
             a_s *= a_d;
@@ -1013,7 +1283,11 @@ pub extern "C" fn nsl_tensor_matmul(a_ptr: i64, b_ptr: i64, flags: u8) -> i64 {
 
     // Dispatch based on dtype (use f32 if either input is f32)
     let out_dtype: u16 = if a.dtype == 1 || b.dtype == 1 { 1 } else { 0 };
-    let elem_size = if out_dtype == 1 { std::mem::size_of::<f32>() } else { std::mem::size_of::<f64>() };
+    let elem_size = if out_dtype == 1 {
+        std::mem::size_of::<f32>()
+    } else {
+        std::mem::size_of::<f64>()
+    };
     let raw_data = checked_alloc_zeroed((len as usize) * elem_size);
 
     for batch_idx in 0..total_batch as usize {
@@ -1032,8 +1306,16 @@ pub extern "C" fn nsl_tensor_matmul(a_ptr: i64, b_ptr: i64, flags: u8) -> i64 {
 
             let a_offset = max_batch_nd - a_batch.len();
             let b_offset = max_batch_nd - b_batch.len();
-            let a_d = if i < a_offset { 1 } else { a_batch[i - a_offset] as usize };
-            let b_d = if i < b_offset { 1 } else { b_batch[i - b_offset] as usize };
+            let a_d = if i < a_offset {
+                1
+            } else {
+                a_batch[i - a_offset] as usize
+            };
+            let b_d = if i < b_offset {
+                1
+            } else {
+                b_batch[i - b_offset] as usize
+            };
             // Clamp coordinate to broadcast dim (size-1 dims broadcast to 0)
             a_batch_idx += coord.min(a_d - 1) * a_batch_strides[i];
             b_batch_idx += coord.min(b_d - 1) * b_batch_strides[i];
@@ -1050,21 +1332,33 @@ pub extern "C" fn nsl_tensor_matmul(a_ptr: i64, b_ptr: i64, flags: u8) -> i64 {
                 // Both f32 — call tiled kernel directly
                 let a_ptr = unsafe { a.data_f32().add(a_base) };
                 let b_ptr = unsafe { b.data_f32().add(b_base) };
-                crate::cpu::tiled_matmul_f32(a_ptr, b_ptr, c_ptr, m as usize, k as usize, n as usize);
+                crate::cpu::tiled_matmul_f32(
+                    a_ptr, b_ptr, c_ptr, m as usize, k as usize, n as usize,
+                );
             } else {
                 // Mixed dtype — fall back to element-wise conversion (rare path)
                 let read_a = |idx: usize| -> f32 {
-                    if a.dtype == 1 { unsafe { *a.data_f32().add(idx) } } else { unsafe { *a.data_f64().add(idx) as f32 } }
+                    if a.dtype == 1 {
+                        unsafe { *a.data_f32().add(idx) }
+                    } else {
+                        unsafe { *a.data_f64().add(idx) as f32 }
+                    }
                 };
                 let read_b = |idx: usize| -> f32 {
-                    if b.dtype == 1 { unsafe { *b.data_f32().add(idx) } } else { unsafe { *b.data_f64().add(idx) as f32 } }
+                    if b.dtype == 1 {
+                        unsafe { *b.data_f32().add(idx) }
+                    } else {
+                        unsafe { *b.data_f64().add(idx) as f32 }
+                    }
                 };
                 for i in 0..m as usize {
                     for j in 0..k as usize {
                         let a_val = read_a(a_base + i * k as usize + j);
                         for l in 0..n as usize {
                             let b_val = read_b(b_base + j * n as usize + l);
-                            unsafe { *c_ptr.add(i * n as usize + l) += a_val * b_val; }
+                            unsafe {
+                                *c_ptr.add(i * n as usize + l) += a_val * b_val;
+                            }
                         }
                     }
                 }
@@ -1093,8 +1387,12 @@ pub extern "C" fn nsl_tensor_matmul(a_ptr: i64, b_ptr: i64, flags: u8) -> i64 {
     nsl_tensor_free(a_c);
     nsl_tensor_free(b_c);
     if autodiff::is_recording() {
-        NslTensor::from_ptr(a_ptr).refcount.fetch_add(1, Ordering::SeqCst);
-        NslTensor::from_ptr(b_ptr).refcount.fetch_add(1, Ordering::SeqCst);
+        NslTensor::from_ptr(a_ptr)
+            .refcount
+            .fetch_add(1, Ordering::SeqCst);
+        NslTensor::from_ptr(b_ptr)
+            .refcount
+            .fetch_add(1, Ordering::SeqCst);
         autodiff::maybe_record(autodiff::TapeOp::MatMul {
             a: a_ptr,
             b: b_ptr,
@@ -1106,13 +1404,28 @@ pub extern "C" fn nsl_tensor_matmul(a_ptr: i64, b_ptr: i64, flags: u8) -> i64 {
     #[cfg(feature = "interop")]
     if crate::trace::is_tracing() {
         let rt = NslTensor::from_ptr(result);
-        let shape: Vec<i64> = (0..rt.ndim as usize).map(|d| unsafe { *rt.shape.add(d) }).collect();
-        crate::trace::record_op(crate::trace::OpType::MatMul, vec![a_ptr, b_ptr], result, shape, rt.dtype, vec![]);
+        let shape: Vec<i64> = (0..rt.ndim as usize)
+            .map(|d| unsafe { *rt.shape.add(d) })
+            .collect();
+        crate::trace::record_op(
+            crate::trace::OpType::MatMul,
+            vec![a_ptr, b_ptr],
+            result,
+            shape,
+            rt.dtype,
+            vec![],
+        );
     }
     // FBIP-3: CPU matmul always allocates fresh output; honor relinquish flags.
-    if relinq_a { nsl_tensor_free(a_ptr); }
-    if relinq_b { nsl_tensor_free(b_orig); }
-    if b_transferred { nsl_tensor_free(b_ptr); }
+    if relinq_a {
+        nsl_tensor_free(a_ptr);
+    }
+    if relinq_b {
+        nsl_tensor_free(b_orig);
+    }
+    if b_transferred {
+        nsl_tensor_free(b_ptr);
+    }
     result
 }
 
@@ -1146,14 +1459,18 @@ mod fbip_add_tests {
         // are still valid after the call.
         let a = make_tensor_f64(&[2.0, 3.0, 4.0]);
         let b = make_tensor_f64(&[1.0, 1.0, 1.0]);
-        NslTensor::from_ptr(a).refcount.fetch_add(1, Ordering::SeqCst);
+        NslTensor::from_ptr(a)
+            .refcount
+            .fetch_add(1, Ordering::SeqCst);
         let out = nsl_tensor_add(a, b, 0);
         assert_ne!(out, a, "flags=0 + shared A must allocate fresh output");
         assert_ne!(out, b, "flags=0 must not reuse B");
         assert_eq!(read_f64(a, 0), 2.0);
         assert_eq!(read_f64(b, 0), 1.0);
         assert_eq!(read_f64(out, 0), 3.0);
-        NslTensor::from_ptr(a).refcount.fetch_sub(1, Ordering::SeqCst);
+        NslTensor::from_ptr(a)
+            .refcount
+            .fetch_sub(1, Ordering::SeqCst);
         nsl_tensor_free(a);
         nsl_tensor_free(b);
         nsl_tensor_free(out);
@@ -1183,7 +1500,9 @@ mod fbip_add_tests {
     fn sub_flags_zero_leaves_inputs_alive() {
         let a = make_tensor_f64(&[10.0, 20.0, 30.0]);
         let b = make_tensor_f64(&[1.0, 2.0, 3.0]);
-        NslTensor::from_ptr(a).refcount.fetch_add(1, Ordering::SeqCst);
+        NslTensor::from_ptr(a)
+            .refcount
+            .fetch_add(1, Ordering::SeqCst);
         let out = nsl_tensor_sub(a, b, 0);
         assert_ne!(out, a, "flags=0 + shared A must allocate fresh output");
         assert_ne!(out, b, "flags=0 must not reuse B");
@@ -1191,7 +1510,9 @@ mod fbip_add_tests {
         assert_eq!(read_f64(b, 0), 1.0);
         assert_eq!(read_f64(out, 0), 9.0);
         assert_eq!(read_f64(out, 2), 27.0);
-        NslTensor::from_ptr(a).refcount.fetch_sub(1, Ordering::SeqCst);
+        NslTensor::from_ptr(a)
+            .refcount
+            .fetch_sub(1, Ordering::SeqCst);
         nsl_tensor_free(a);
         nsl_tensor_free(b);
         nsl_tensor_free(out);
@@ -1212,7 +1533,9 @@ mod fbip_add_tests {
     fn mul_flags_zero_leaves_inputs_alive() {
         let a = make_tensor_f64(&[2.0, 3.0, 4.0]);
         let b = make_tensor_f64(&[5.0, 6.0, 7.0]);
-        NslTensor::from_ptr(a).refcount.fetch_add(1, Ordering::SeqCst);
+        NslTensor::from_ptr(a)
+            .refcount
+            .fetch_add(1, Ordering::SeqCst);
         let out = nsl_tensor_mul(a, b, 0);
         assert_ne!(out, a, "flags=0 + shared A must allocate fresh output");
         assert_ne!(out, b, "flags=0 must not reuse B");
@@ -1220,7 +1543,9 @@ mod fbip_add_tests {
         assert_eq!(read_f64(b, 0), 5.0);
         assert_eq!(read_f64(out, 0), 10.0);
         assert_eq!(read_f64(out, 2), 28.0);
-        NslTensor::from_ptr(a).refcount.fetch_sub(1, Ordering::SeqCst);
+        NslTensor::from_ptr(a)
+            .refcount
+            .fetch_sub(1, Ordering::SeqCst);
         nsl_tensor_free(a);
         nsl_tensor_free(b);
         nsl_tensor_free(out);
@@ -1241,7 +1566,9 @@ mod fbip_add_tests {
     fn div_flags_zero_leaves_inputs_alive() {
         let a = make_tensor_f64(&[10.0, 20.0, 30.0]);
         let b = make_tensor_f64(&[2.0, 4.0, 5.0]);
-        NslTensor::from_ptr(a).refcount.fetch_add(1, Ordering::SeqCst);
+        NslTensor::from_ptr(a)
+            .refcount
+            .fetch_add(1, Ordering::SeqCst);
         let out = nsl_tensor_div(a, b, 0);
         assert_ne!(out, a, "flags=0 + shared A must allocate fresh output");
         assert_ne!(out, b, "flags=0 must not reuse B");
@@ -1249,7 +1576,9 @@ mod fbip_add_tests {
         assert_eq!(read_f64(b, 0), 2.0);
         assert_eq!(read_f64(out, 0), 5.0);
         assert_eq!(read_f64(out, 2), 6.0);
-        NslTensor::from_ptr(a).refcount.fetch_sub(1, Ordering::SeqCst);
+        NslTensor::from_ptr(a)
+            .refcount
+            .fetch_sub(1, Ordering::SeqCst);
         nsl_tensor_free(a);
         nsl_tensor_free(b);
         nsl_tensor_free(out);
@@ -1321,14 +1650,18 @@ mod fbip_add_tests {
     fn add_scalar_flags_zero_leaves_input_alive() {
         let a = make_tensor_f64(&[10.0, 20.0]);
         // Bump refcount to force out-of-place path
-        NslTensor::from_ptr(a).refcount.fetch_add(1, Ordering::SeqCst);
+        NslTensor::from_ptr(a)
+            .refcount
+            .fetch_add(1, Ordering::SeqCst);
         let out = nsl_tensor_add_scalar(a, 5.0, 0);
         assert_ne!(out, a, "flags=0 + shared A must allocate fresh output");
         assert_eq!(read_f64(a, 0), 10.0);
         assert_eq!(read_f64(a, 1), 20.0);
         assert_eq!(read_f64(out, 0), 15.0);
         assert_eq!(read_f64(out, 1), 25.0);
-        NslTensor::from_ptr(a).refcount.fetch_sub(1, Ordering::SeqCst);
+        NslTensor::from_ptr(a)
+            .refcount
+            .fetch_sub(1, Ordering::SeqCst);
         nsl_tensor_free(a);
         nsl_tensor_free(out);
     }
@@ -1346,14 +1679,18 @@ mod fbip_add_tests {
     #[test]
     fn mul_scalar_flags_zero_leaves_input_alive() {
         let a = make_tensor_f64(&[10.0, 20.0]);
-        NslTensor::from_ptr(a).refcount.fetch_add(1, Ordering::SeqCst);
+        NslTensor::from_ptr(a)
+            .refcount
+            .fetch_add(1, Ordering::SeqCst);
         let out = nsl_tensor_mul_scalar(a, 5.0, 0);
         assert_ne!(out, a, "flags=0 + shared A must allocate fresh output");
         assert_eq!(read_f64(a, 0), 10.0);
         assert_eq!(read_f64(a, 1), 20.0);
         assert_eq!(read_f64(out, 0), 50.0);
         assert_eq!(read_f64(out, 1), 100.0);
-        NslTensor::from_ptr(a).refcount.fetch_sub(1, Ordering::SeqCst);
+        NslTensor::from_ptr(a)
+            .refcount
+            .fetch_sub(1, Ordering::SeqCst);
         nsl_tensor_free(a);
         nsl_tensor_free(out);
     }

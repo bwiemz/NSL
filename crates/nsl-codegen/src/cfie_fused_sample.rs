@@ -104,25 +104,17 @@ pub enum FusedSampleOp {
     },
     /// Grammar DFA check — skip vocab entries not in the current
     /// state's valid-token set.
-    GrammarMaskTile {
-        tile_index: u32,
-    },
+    GrammarMaskTile { tile_index: u32 },
     /// Apply an additive logits bias vector in-tile.
-    ApplyLogitsBias {
-        tile_index: u32,
-    },
+    ApplyLogitsBias { tile_index: u32 },
     /// Update the running top-K min-heap in registers.
-    UpdateTopK {
-        tile_index: u32,
-    },
+    UpdateTopK { tile_index: u32 },
     /// Compute the running max for stable softmax in the same pass.
     UpdateRunningMax,
     /// Softmax over the retained top-k candidates only.
     SoftmaxTopK,
     /// Top-P (nucleus) filter on the top-k candidates.
-    NucleusFilter {
-        top_p: f32,
-    },
+    NucleusFilter { top_p: f32 },
     /// Greedy argmax — bypasses softmax/top-p entirely.
     Argmax,
     /// Multinomial sample from filtered candidates.
@@ -213,7 +205,9 @@ pub fn emit_program(params: SamplingParams, shape: LmHeadShape) -> FusedSamplePr
         }
         SamplingStrategy::TopKTopP => {
             ops.push(FusedSampleOp::SoftmaxTopK);
-            ops.push(FusedSampleOp::NucleusFilter { top_p: params.top_p });
+            ops.push(FusedSampleOp::NucleusFilter {
+                top_p: params.top_p,
+            });
             ops.push(FusedSampleOp::MultinomialSample);
         }
         SamplingStrategy::Multinomial => {
@@ -272,7 +266,10 @@ mod tests {
             ..Default::default()
         };
         let prog = emit_program(params, shape());
-        assert!(prog.ops.iter().any(|op| matches!(op, FusedSampleOp::Argmax)));
+        assert!(prog
+            .ops
+            .iter()
+            .any(|op| matches!(op, FusedSampleOp::Argmax)));
         assert!(!prog
             .ops
             .iter()

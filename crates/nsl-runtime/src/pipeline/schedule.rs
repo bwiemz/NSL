@@ -3,13 +3,13 @@
 /// A single step in the pipeline schedule for one stage.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ScheduleStep {
-    Forward(usize),         // micro-batch index
-    Backward(usize),        // micro-batch index
-    Idle,                   // pipeline bubble
-    SendActivation(usize),  // send to next stage
-    RecvActivation(usize),  // recv from prev stage
-    SendGradient(usize),    // send grad to prev stage
-    RecvGradient(usize),    // recv grad from next stage
+    Forward(usize),        // micro-batch index
+    Backward(usize),       // micro-batch index
+    Idle,                  // pipeline bubble
+    SendActivation(usize), // send to next stage
+    RecvActivation(usize), // recv from prev stage
+    SendGradient(usize),   // send grad to prev stage
+    RecvGradient(usize),   // recv grad from next stage
 }
 
 /// Complete pipeline schedule: steps[stage_id][time_slot].
@@ -93,7 +93,11 @@ impl PipelineSchedule {
             }
         }
 
-        PipelineSchedule { steps, num_stages, num_micro_batches }
+        PipelineSchedule {
+            steps,
+            num_stages,
+            num_micro_batches,
+        }
     }
 
     /// Generate GPipe schedule (all forwards then all backwards).
@@ -127,29 +131,43 @@ impl PipelineSchedule {
             }
         }
 
-        PipelineSchedule { steps, num_stages, num_micro_batches }
+        PipelineSchedule {
+            steps,
+            num_stages,
+            num_micro_batches,
+        }
     }
 
     /// Calculate the bubble ratio (fraction of idle time).
     pub fn bubble_ratio(&self) -> f64 {
         let total: usize = self.steps.iter().map(|s| s.len()).sum();
-        let idle: usize = self.steps.iter()
-            .map(|s| s.iter().filter(|step| matches!(step, ScheduleStep::Idle)).count())
+        let idle: usize = self
+            .steps
+            .iter()
+            .map(|s| {
+                s.iter()
+                    .filter(|step| matches!(step, ScheduleStep::Idle))
+                    .count()
+            })
             .sum();
-        if total == 0 { return 0.0; }
+        if total == 0 {
+            return 0.0;
+        }
         idle as f64 / total as f64
     }
 
     /// Count forward steps for a given stage.
     pub fn forward_count(&self, stage: usize) -> usize {
-        self.steps[stage].iter()
+        self.steps[stage]
+            .iter()
             .filter(|s| matches!(s, ScheduleStep::Forward(_)))
             .count()
     }
 
     /// Count backward steps for a given stage.
     pub fn backward_count(&self, stage: usize) -> usize {
-        self.steps[stage].iter()
+        self.steps[stage]
+            .iter()
             .filter(|s| matches!(s, ScheduleStep::Backward(_)))
             .count()
     }
@@ -164,10 +182,12 @@ mod tests {
         let sched = PipelineSchedule::generate_1f1b(4, 8);
         // Each stage should process all 8 micro-batches forward and backward
         for stage in 0..4 {
-            assert_eq!(sched.forward_count(stage), 8,
-                "stage {stage} forward count");
-            assert_eq!(sched.backward_count(stage), 8,
-                "stage {stage} backward count");
+            assert_eq!(sched.forward_count(stage), 8, "stage {stage} forward count");
+            assert_eq!(
+                sched.backward_count(stage),
+                8,
+                "stage {stage} backward count"
+            );
         }
     }
 
@@ -176,9 +196,12 @@ mod tests {
         let sched_few = PipelineSchedule::generate_1f1b(4, 4);
         let sched_many = PipelineSchedule::generate_1f1b(4, 16);
         // More micro-batches -> smaller bubble fraction
-        assert!(sched_many.bubble_ratio() <= sched_few.bubble_ratio(),
+        assert!(
+            sched_many.bubble_ratio() <= sched_few.bubble_ratio(),
             "bubble ratio should decrease: few={}, many={}",
-            sched_few.bubble_ratio(), sched_many.bubble_ratio());
+            sched_few.bubble_ratio(),
+            sched_many.bubble_ratio()
+        );
     }
 
     #[test]
@@ -210,10 +233,16 @@ mod tests {
         let sched = PipelineSchedule::generate_1f1b(1, 4);
         // Single stage: no send/recv steps
         for step in &sched.steps[0] {
-            assert!(!matches!(step,
-                ScheduleStep::SendActivation(_) | ScheduleStep::RecvActivation(_) |
-                ScheduleStep::SendGradient(_) | ScheduleStep::RecvGradient(_)
-            ), "single stage should have no communication");
+            assert!(
+                !matches!(
+                    step,
+                    ScheduleStep::SendActivation(_)
+                        | ScheduleStep::RecvActivation(_)
+                        | ScheduleStep::SendGradient(_)
+                        | ScheduleStep::RecvGradient(_)
+                ),
+                "single stage should have no communication"
+            );
         }
     }
 

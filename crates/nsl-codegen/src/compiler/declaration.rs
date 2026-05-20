@@ -81,8 +81,7 @@ impl Compiler<'_> {
                     .insert(raw_name.clone(), (impl_func_id, sig.clone()));
 
                 // 2. C-ABI wrapper: exported name + Linkage::Export + C-ABI signature.
-                let wrapper_symbol = override_name
-                    .unwrap_or_else(|| raw_name.clone());
+                let wrapper_symbol = override_name.unwrap_or_else(|| raw_name.clone());
                 let info = crate::c_header::ExportInfo::from_fn_def(
                     fn_def,
                     &raw_name,
@@ -90,8 +89,7 @@ impl Compiler<'_> {
                     self.interner,
                 );
                 let call_conv = self.module.target_config().default_call_conv;
-                let wrapper_sig =
-                    crate::c_wrapper::build_c_abi_wrapper_signature(&info, call_conv);
+                let wrapper_sig = crate::c_wrapper::build_c_abi_wrapper_signature(&info, call_conv);
                 let wrapper_func_id = self
                     .module
                     .declare_function(&wrapper_symbol, Linkage::Export, &wrapper_sig)
@@ -373,13 +371,9 @@ impl Compiler<'_> {
                             let mut impl_sig = self.module.make_signature();
                             impl_sig.call_conv = self.call_conv;
                             // weight_ptrs: i64 (pointer-to-pointer array)
-                            impl_sig
-                                .params
-                                .push(AbiParam::new(cl_types::I64));
+                            impl_sig.params.push(AbiParam::new(cl_types::I64));
                             // num_weights: i64
-                            impl_sig
-                                .params
-                                .push(AbiParam::new(cl_types::I64));
+                            impl_sig.params.push(AbiParam::new(cl_types::I64));
                             // Remaining non-self params
                             for param in &fn_def.params {
                                 let pname = self.resolve_sym(param.name).to_string();
@@ -417,8 +411,7 @@ impl Compiler<'_> {
                                 impl_sig.returns.push(AbiParam::new(cl_types::I64));
                             }
 
-                            let impl_name =
-                                format!("__nsl_export_impl_{model_name}_{method_name}");
+                            let impl_name = format!("__nsl_export_impl_{model_name}_{method_name}");
                             let impl_func_id = self
                                 .module
                                 .declare_function(&impl_name, Linkage::Local, &impl_sig)
@@ -435,9 +428,8 @@ impl Compiler<'_> {
 
                             // Build ExportInfo from the fn_def (skips "self"; that param will
                             // not appear in the C header — the model pointer is implicit).
-                            let wrapper_symbol = override_name
-                                .clone()
-                                .unwrap_or_else(|| method_name.clone());
+                            let wrapper_symbol =
+                                override_name.clone().unwrap_or_else(|| method_name.clone());
                             let info = crate::c_header::ExportInfo::from_fn_def(
                                 fn_def,
                                 &method_name,
@@ -449,11 +441,7 @@ impl Compiler<'_> {
                                 crate::c_wrapper::build_c_abi_wrapper_signature(&info, call_conv);
                             let wrapper_func_id = self
                                 .module
-                                .declare_function(
-                                    &wrapper_symbol,
-                                    Linkage::Export,
-                                    &wrapper_sig,
-                                )
+                                .declare_function(&wrapper_symbol, Linkage::Export, &wrapper_sig)
                                 .map_err(|e| {
                                     CodegenError::new(format!(
                                         "failed to declare @export wrapper '{wrapper_symbol}': {e}"
@@ -1050,7 +1038,12 @@ mod export_tests {
     #[test]
     fn extract_export_from_decorators_with_name() {
         let mut interner: nsl_lexer::Interner = StringInterner::new();
-        let decos = vec![decorator_with_name_arg("export", "name", "predict", &mut interner)];
+        let decos = vec![decorator_with_name_arg(
+            "export",
+            "name",
+            "predict",
+            &mut interner,
+        )];
         let (is_export, override_name) = extract_export_decorator(&decos, &interner);
         assert!(is_export);
         assert_eq!(override_name, Some("predict".to_string()));

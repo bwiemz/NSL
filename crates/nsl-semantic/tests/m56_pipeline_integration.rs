@@ -12,8 +12,7 @@ agent Reviewer:\n    fn review(self, draft: Tensor) -> Tensor:\n        return d
 fn pipeline(prompt: Tensor) -> Tensor:\n    let draft = drafter.draft(prompt)\n    return reviewer.review(draft)\n";
 
     let mut interner = nsl_lexer::Interner::new();
-    let (tokens, _) =
-        nsl_lexer::tokenize(src, nsl_errors::FileId(0), &mut interner);
+    let (tokens, _) = nsl_lexer::tokenize(src, nsl_errors::FileId(0), &mut interner);
     let parse_result = nsl_parser::parse(&tokens, &mut interner);
     assert!(
         parse_result.diagnostics.is_empty(),
@@ -51,8 +50,7 @@ agent B:\n    fn b_fn(self, y: Tensor) -> Tensor:\n        return y\n\
 fn loop_pipe(x: Tensor) -> Tensor:\n    let y = a.a_fn(x)\n    let z = b.b_fn(y)\n    return a.a_fn(z)\n";
 
     let mut interner = nsl_lexer::Interner::new();
-    let (tokens, _) =
-        nsl_lexer::tokenize(src, nsl_errors::FileId(0), &mut interner);
+    let (tokens, _) = nsl_lexer::tokenize(src, nsl_errors::FileId(0), &mut interner);
     let parse_result = nsl_parser::parse(&tokens, &mut interner);
 
     let result = nsl_semantic::analyze_with_imports(
@@ -63,7 +61,10 @@ fn loop_pipe(x: Tensor) -> Tensor:\n    let y = a.a_fn(x)\n    let z = b.b_fn(y)
     );
 
     assert!(
-        result.diagnostics.iter().any(|d| d.message.contains("E0603")),
+        result
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("E0603")),
         "expected E0603 from full pipeline; got: {:?}",
         result
             .diagnostics
@@ -77,8 +78,7 @@ fn loop_pipe(x: Tensor) -> Tensor:\n    let y = a.a_fn(x)\n    let z = b.b_fn(y)
 fn agent_without_linear_types_flag_produces_e0610() {
     let src = "agent X:\n    fn noop(self) -> i32:\n        return 0\n";
     let mut interner = nsl_lexer::Interner::new();
-    let (tokens, _) =
-        nsl_lexer::tokenize(src, nsl_errors::FileId(0), &mut interner);
+    let (tokens, _) = nsl_lexer::tokenize(src, nsl_errors::FileId(0), &mut interner);
     let parse_result = nsl_parser::parse(&tokens, &mut interner);
 
     let result = nsl_semantic::analyze_with_imports(
@@ -89,7 +89,10 @@ fn agent_without_linear_types_flag_produces_e0610() {
     );
 
     assert!(
-        result.diagnostics.iter().any(|d| d.message.contains("E0610")),
+        result
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("E0610")),
         "expected E0610 when --linear-types is off"
     );
 

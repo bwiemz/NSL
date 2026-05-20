@@ -17,13 +17,13 @@
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct FusedLoraConfig {
     pub site_id: String,
-    pub m: u32,         // batch
-    pub n: u32,         // d_out
-    pub k: u32,         // k_in (shared dim of x@W)
-    pub rank: u32,      // ≤ 16
+    pub m: u32,    // batch
+    pub n: u32,    // d_out
+    pub k: u32,    // k_in (shared dim of x@W)
+    pub rank: u32, // ≤ 16
     pub target_sm: u32, // 80, 86, ...
-                        // scale is intentionally NOT a field — passed at launch time as
-                        // .param .f32.  See dedup notes in B.3 spec Risk #5.
+                   // scale is intentionally NOT a field — passed at launch time as
+                   // .param .f32.  See dedup notes in B.3 spec Risk #5.
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -48,13 +48,13 @@ pub struct FusedIa3Config {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct FusedGatedLoraConfig {
     pub site_id: String,
-    pub m: u32,         // batch
-    pub n: u32,         // d_out
-    pub k: u32,         // k_in (shared dim of x@W)
-    pub rank: u32,      // ≤ 16
+    pub m: u32,    // batch
+    pub n: u32,    // d_out
+    pub k: u32,    // k_in (shared dim of x@W)
+    pub rank: u32, // ≤ 16
     pub target_sm: u32, // 80, 86, ...
-                        // scale is intentionally NOT a field — passed at launch time as
-                        // .param .f32.  See dedup notes in B.3 spec Risk #5.
+                   // scale is intentionally NOT a field — passed at launch time as
+                   // .param .f32.  See dedup notes in B.3 spec Risk #5.
 }
 
 /// Kernel cache key for dedup.  Sites with matching key share one PTX.
@@ -207,21 +207,48 @@ fn emit_fused_adapter_kernel_body(
     // 2. Param block (opens entry + `{` body).
     // Variation point A: PerColumnSigmoid appends gate_ptr.
     let mut params = vec![
-        Param { ty: ParamTy::U64, name: "x_ptr" },
-        Param { ty: ParamTy::U64, name: "w_ptr" },
-        Param { ty: ParamTy::U64, name: "a_ptr" },
-        Param { ty: ParamTy::U64, name: "b_ptr" },
-        Param { ty: ParamTy::F32, name: "scale" },
-        Param { ty: ParamTy::U64, name: "y_ptr" },
+        Param {
+            ty: ParamTy::U64,
+            name: "x_ptr",
+        },
+        Param {
+            ty: ParamTy::U64,
+            name: "w_ptr",
+        },
+        Param {
+            ty: ParamTy::U64,
+            name: "a_ptr",
+        },
+        Param {
+            ty: ParamTy::U64,
+            name: "b_ptr",
+        },
+        Param {
+            ty: ParamTy::F32,
+            name: "scale",
+        },
+        Param {
+            ty: ParamTy::U64,
+            name: "y_ptr",
+        },
         // m_rows and n_cols are passed as runtime u32 parameters so the same
         // kernel binary handles any batch size.  The compile-time m/n
         // are only used for staging (k-iteration count, rank padding) and
         // kernel naming; predication uses the runtime values.
-        Param { ty: ParamTy::U32, name: "m_rows" },
-        Param { ty: ParamTy::U32, name: "n_cols" },
+        Param {
+            ty: ParamTy::U32,
+            name: "m_rows",
+        },
+        Param {
+            ty: ParamTy::U32,
+            name: "n_cols",
+        },
     ];
     if matches!(fold, FoldKind::PerColumnSigmoid { .. }) {
-        params.push(Param { ty: ParamTy::U64, name: "gate_ptr" });
+        params.push(Param {
+            ty: ParamTy::U64,
+            name: "gate_ptr",
+        });
     }
     emit_param_block(ptx, entry_name, &params);
 
@@ -238,7 +265,9 @@ fn emit_fused_adapter_kernel_body(
         ptx.push_str("    .reg .pred %p_col0, %p_col1;\n");
     }
     // u32 tile-base shadow regs for SMEM addressing.
-    ptx.push_str("    .reg .u32 %smem_base_x_u32, %smem_base_w_u32, %smem_base_a_u32, %smem_base_b_u32;\n");
+    ptx.push_str(
+        "    .reg .u32 %smem_base_x_u32, %smem_base_w_u32, %smem_base_a_u32, %smem_base_b_u32;\n",
+    );
     // f32 and b16 scratch for tile-staging f32→f16 conversion.
     // NSL GPU tensors are f32 (dtype=1); the MMA kernel requires f16 operands in SMEM.
     // Staging loads each f32 element, converts to f16 with cvt.rn.f16.f32, and packs
@@ -251,7 +280,9 @@ fn emit_fused_adapter_kernel_body(
     // emit_load_b_fragment_smem (which only walks k-rows) lands on the right
     // column.  Without this, all threads address column 0, causing SMEM OOB
     // for threads 4..31 (mma_b_row*(row_stride=16) would exceed tile bounds).
-    ptx.push_str("    .reg .u32 %smem_base_w_lane_u32, %smem_base_a_lane_u32, %smem_base_b_lane_u32;\n");
+    ptx.push_str(
+        "    .reg .u32 %smem_base_w_lane_u32, %smem_base_a_lane_u32, %smem_base_b_lane_u32;\n",
+    );
     // packed f16x2 regs for converting epi_interm f32 -> f16x2 b32 before final MMA.
     ptx.push_str("    .reg .b32 %epi_packed0, %epi_packed1, %epi_packed2, %epi_packed3;\n");
     // runtime m/n for tile predication (avoids ILLEGAL_ADDRESS on tail rows/cols).
@@ -275,7 +306,7 @@ fn emit_fused_adapter_kernel_body(
     // All terms are multiples of 4, so ld.shared.b32 is always 4-byte aligned.
     ptx.push_str("    // Per-lane B-frag column base: (tid/4)*32 bytes (col-major stride=32)\n");
     ptx.push_str("    shr.u32 %r9, %tid_x, 2;\n");
-    ptx.push_str("    shl.b32 %r9, %r9, 5;\n");  // * 32 bytes (col stride in col-major)
+    ptx.push_str("    shl.b32 %r9, %r9, 5;\n"); // * 32 bytes (col stride in col-major)
     ptx.push_str("    add.u32 %smem_base_w_lane_u32, %smem_base_w_u32, %r9;\n");
     // a_tile is also col-major (used as B-operand in epilogue MMA: x @ a_tile).
     ptx.push_str("    add.u32 %smem_base_a_lane_u32, %smem_base_a_u32, %r9;\n");
@@ -312,46 +343,44 @@ fn emit_fused_adapter_kernel_body(
 
     // Fragment register names for matmul_mma load helpers (without % — helpers add it).
     let main_a_frag_names: [String; 4] = [
-        "main_a_frag0".into(), "main_a_frag1".into(),
-        "main_a_frag2".into(), "main_a_frag3".into(),
+        "main_a_frag0".into(),
+        "main_a_frag1".into(),
+        "main_a_frag2".into(),
+        "main_a_frag3".into(),
     ];
-    let main_b_frag_names: [String; 2] = [
-        "main_b_frag0".into(), "main_b_frag1".into(),
-    ];
+    let main_b_frag_names: [String; 2] = ["main_b_frag0".into(), "main_b_frag1".into()];
     // epi_a_frag is used as B-operand (a_tile is col-major, k=16 × rank columns).
     // m16n8k16 B-fragment requires only 2 b32 registers per thread.
-    let epi_a_frag_names: [String; 2] = [
-        "epi_a_frag0".into(), "epi_a_frag1".into(),
-    ];
-    let epi_b_frag_names: [String; 2] = [
-        "epi_b_frag0".into(), "epi_b_frag1".into(),
-    ];
+    let epi_a_frag_names: [String; 2] = ["epi_a_frag0".into(), "epi_a_frag1".into()];
+    let epi_b_frag_names: [String; 2] = ["epi_b_frag0".into(), "epi_b_frag1".into()];
 
     // MMA operand arrays (with % — emit_mma_instruction uses names as-is).
     let main_a_frag: [String; 4] = [
-        "%main_a_frag0".into(), "%main_a_frag1".into(),
-        "%main_a_frag2".into(), "%main_a_frag3".into(),
+        "%main_a_frag0".into(),
+        "%main_a_frag1".into(),
+        "%main_a_frag2".into(),
+        "%main_a_frag3".into(),
     ];
-    let main_b_frag: [String; 2] = [
-        "%main_b_frag0".into(), "%main_b_frag1".into(),
-    ];
-    let epi_a_frag: [String; 2] = [
-        "%epi_a_frag0".into(), "%epi_a_frag1".into(),
-    ];
-    let epi_b_frag: [String; 2] = [
-        "%epi_b_frag0".into(), "%epi_b_frag1".into(),
-    ];
+    let main_b_frag: [String; 2] = ["%main_b_frag0".into(), "%main_b_frag1".into()];
+    let epi_a_frag: [String; 2] = ["%epi_a_frag0".into(), "%epi_a_frag1".into()];
+    let epi_b_frag: [String; 2] = ["%epi_b_frag0".into(), "%epi_b_frag1".into()];
     let main_accum: [String; 4] = [
-        "%main_accum0".into(), "%main_accum1".into(),
-        "%main_accum2".into(), "%main_accum3".into(),
+        "%main_accum0".into(),
+        "%main_accum1".into(),
+        "%main_accum2".into(),
+        "%main_accum3".into(),
     ];
     let epi_interm: [String; 4] = [
-        "%epi_interm0".into(), "%epi_interm1".into(),
-        "%epi_interm2".into(), "%epi_interm3".into(),
+        "%epi_interm0".into(),
+        "%epi_interm1".into(),
+        "%epi_interm2".into(),
+        "%epi_interm3".into(),
     ];
     let epi_final: [String; 4] = [
-        "%epi_final0".into(), "%epi_final1".into(),
-        "%epi_final2".into(), "%epi_final3".into(),
+        "%epi_final0".into(),
+        "%epi_final1".into(),
+        "%epi_final2".into(),
+        "%epi_final3".into(),
     ];
 
     // Runtime PTX K-loop (2026-04-19): the previous Rust-side `for k_tile in
@@ -425,10 +454,7 @@ fn emit_fused_adapter_kernel_body(
         // last iter when those ops actually fire).
         ptx.push_str("    and.b32 %r5, %tid_x, 3;\n");
         ptx.push_str("    shl.b32 %r5, %r5, 1;\n");
-        crate::wrga_kernel_helpers::emit_gate_load_per_thread_maybe_guarded(
-            ptx,
-            Some("%p_last_k"),
-        );
+        crate::wrga_kernel_helpers::emit_gate_load_per_thread_maybe_guarded(ptx, Some("%p_last_k"));
         crate::wrga_kernel_helpers::emit_sigmoid_approx_fused_maybe_guarded(
             ptx,
             "%gate0",
@@ -476,8 +502,10 @@ fn emit_fused_adapter_kernel_body(
     ptx.push_str("    mov.b32 %epi_packed2, 0;\n");
     ptx.push_str("    mov.b32 %epi_packed3, 0;\n");
     let epi_packed: [String; 4] = [
-        "%epi_packed0".into(), "%epi_packed1".into(),
-        "%epi_packed2".into(), "%epi_packed3".into(),
+        "%epi_packed0".into(),
+        "%epi_packed1".into(),
+        "%epi_packed2".into(),
+        "%epi_packed3".into(),
     ];
 
     // Zero-init epi_final and compute (x@A) @ B using packed A-fragments.
@@ -580,18 +608,33 @@ pub fn synthesize_fused_ia3_ptx(config: &FusedIa3Config) -> String {
     emit_ptx_header(&mut ptx, PtxVersion::V7_0, TargetSm::Sm80);
 
     // 2. Param block.
-    let entry_name = format!(
-        "nsl_wrga_fused_ia3_m{}n{}k{}",
-        config.m, config.n, config.k,
-    );
+    let entry_name = format!("nsl_wrga_fused_ia3_m{}n{}k{}", config.m, config.n, config.k,);
     let params = [
-        Param { ty: ParamTy::U64, name: "x_ptr" },
-        Param { ty: ParamTy::U64, name: "w_ptr" },
-        Param { ty: ParamTy::U64, name: "gamma_ptr" },
-        Param { ty: ParamTy::U64, name: "y_ptr" },
+        Param {
+            ty: ParamTy::U64,
+            name: "x_ptr",
+        },
+        Param {
+            ty: ParamTy::U64,
+            name: "w_ptr",
+        },
+        Param {
+            ty: ParamTy::U64,
+            name: "gamma_ptr",
+        },
+        Param {
+            ty: ParamTy::U64,
+            name: "y_ptr",
+        },
         // Runtime m/n for tail predication (same pattern as LoRA).
-        Param { ty: ParamTy::U32, name: "m_rows" },
-        Param { ty: ParamTy::U32, name: "n_cols" },
+        Param {
+            ty: ParamTy::U32,
+            name: "m_rows",
+        },
+        Param {
+            ty: ParamTy::U32,
+            name: "n_cols",
+        },
     ];
     emit_param_block(&mut ptx, &entry_name, &params);
 
@@ -642,22 +685,24 @@ pub fn synthesize_fused_ia3_ptx(config: &FusedIa3Config) -> String {
     let k_iters = config.k.div_ceil(MMA_K_U32);
 
     let main_a_frag_names: [String; 4] = [
-        "main_a_frag0".into(), "main_a_frag1".into(),
-        "main_a_frag2".into(), "main_a_frag3".into(),
+        "main_a_frag0".into(),
+        "main_a_frag1".into(),
+        "main_a_frag2".into(),
+        "main_a_frag3".into(),
     ];
-    let main_b_frag_names: [String; 2] = [
-        "main_b_frag0".into(), "main_b_frag1".into(),
-    ];
+    let main_b_frag_names: [String; 2] = ["main_b_frag0".into(), "main_b_frag1".into()];
     let main_a_frag: [String; 4] = [
-        "%main_a_frag0".into(), "%main_a_frag1".into(),
-        "%main_a_frag2".into(), "%main_a_frag3".into(),
+        "%main_a_frag0".into(),
+        "%main_a_frag1".into(),
+        "%main_a_frag2".into(),
+        "%main_a_frag3".into(),
     ];
-    let main_b_frag: [String; 2] = [
-        "%main_b_frag0".into(), "%main_b_frag1".into(),
-    ];
+    let main_b_frag: [String; 2] = ["%main_b_frag0".into(), "%main_b_frag1".into()];
     let main_accum: [String; 4] = [
-        "%main_accum0".into(), "%main_accum1".into(),
-        "%main_accum2".into(), "%main_accum3".into(),
+        "%main_accum0".into(),
+        "%main_accum1".into(),
+        "%main_accum2".into(),
+        "%main_accum3".into(),
     ];
 
     // Runtime PTX K-loop (2026-04-19) — see emit_fused_adapter_kernel_body
@@ -689,7 +734,13 @@ pub fn synthesize_fused_ia3_ptx(config: &FusedIa3Config) -> String {
     emit_load_b_fragment_smem(&mut ptx, &main_b_frag_names, "%smem_base_w_u32", 32);
 
     // Main MMA: main_accum += x_tile @ w_tile
-    emit_mma_instruction(&mut ptx, &main_accum, &main_a_frag, &main_b_frag, &main_accum);
+    emit_mma_instruction(
+        &mut ptx,
+        &main_accum,
+        &main_a_frag,
+        &main_b_frag,
+        &main_accum,
+    );
 
     ptx.push_str("    bar.sync 0;\n");
 
@@ -802,8 +853,10 @@ mod tests {
         // so the fold loop runs 0..4 (not 0..8).
         let ptx = synthesize_fused_lora_ptx(&mk_lora_config());
         for i in 0..4 {
-            let expected =
-                format!("add.f32 %main_accum{}, %main_accum{}, %epi_final{}", i, i, i);
+            let expected = format!(
+                "add.f32 %main_accum{}, %main_accum{}, %epi_final{}",
+                i, i, i
+            );
             assert!(
                 ptx.contains(&expected),
                 "missing fold step: {expected}\nPTX:\n{ptx}"
@@ -822,7 +875,10 @@ mod tests {
             target_sm: 80,
         };
         let res = std::panic::catch_unwind(|| synthesize_fused_lora_ptx(&cfg));
-        assert!(res.is_err(), "rank > 16 must panic — caller must enforce beforehand");
+        assert!(
+            res.is_err(),
+            "rank > 16 must panic — caller must enforce beforehand"
+        );
     }
 
     #[test]

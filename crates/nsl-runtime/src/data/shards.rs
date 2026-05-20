@@ -54,7 +54,10 @@ impl ShardHeader {
         let mut magic = [0u8; 4];
         r.read_exact(&mut magic)?;
         if magic != SHARD_MAGIC {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid shard magic"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid shard magic",
+            ));
         }
         let mut buf4 = [0u8; 4];
         r.read_exact(&mut buf4)?;
@@ -66,7 +69,12 @@ impl ShardHeader {
         r.read_exact(&mut buf8)?;
         let index_offset = u64::from_le_bytes(buf8);
 
-        Ok(ShardHeader { magic, version, num_samples, index_offset })
+        Ok(ShardHeader {
+            magic,
+            version,
+            num_samples,
+            index_offset,
+        })
     }
 }
 
@@ -163,7 +171,11 @@ impl<R: Read + Seek> ShardReader<R> {
             offsets.push(u64::from_le_bytes(buf8));
         }
 
-        Ok(ShardReader { reader, header, offsets })
+        Ok(ShardReader {
+            reader,
+            header,
+            offsets,
+        })
     }
 
     /// Number of samples in this shard.
@@ -174,7 +186,10 @@ impl<R: Read + Seek> ShardReader<R> {
     /// Read sample at the given index. Returns the raw bytes.
     pub fn read_sample(&mut self, index: usize) -> io::Result<Vec<u8>> {
         if index >= self.offsets.len() {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "sample index out of bounds"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "sample index out of bounds",
+            ));
         }
         self.reader.seek(SeekFrom::Start(self.offsets[index]))?;
 
@@ -191,7 +206,10 @@ impl<R: Read + Seek> ShardReader<R> {
 
     /// Iterate over all samples sequentially (cache-friendly sequential I/O).
     pub fn iter_samples(&mut self) -> ShardIterator<'_, R> {
-        ShardIterator { reader: self, next_idx: 0 }
+        ShardIterator {
+            reader: self,
+            next_idx: 0,
+        }
     }
 }
 
@@ -235,17 +253,22 @@ pub fn assign_shards(rank: u32, world_size: u32, num_shards: u32, epoch: u64) ->
 
     // Simple deterministic shuffle using epoch as seed
     let mut shard_ids: Vec<u32> = (0..num_shards).collect();
-    let mut seed = epoch.wrapping_mul(0x517cc1b727220a95).wrapping_add(0x6c62272e07bb0142);
+    let mut seed = epoch
+        .wrapping_mul(0x517cc1b727220a95)
+        .wrapping_add(0x6c62272e07bb0142);
 
     // Fisher-Yates shuffle with deterministic PRNG
     for i in (1..shard_ids.len()).rev() {
-        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let j = (seed >> 33) as usize % (i + 1);
         shard_ids.swap(i, j);
     }
 
     // Each rank gets every world_size-th shard
-    shard_ids.into_iter()
+    shard_ids
+        .into_iter()
         .skip(rank as usize)
         .step_by(world_size as usize)
         .collect()
@@ -285,7 +308,9 @@ impl DataCheckpoint {
 
     /// Deserialize from bytes.
     pub fn from_bytes(buf: &[u8]) -> Option<Self> {
-        if buf.len() < Self::SIZE { return None; }
+        if buf.len() < Self::SIZE {
+            return None;
+        }
         Some(DataCheckpoint {
             shard_id: u32::from_le_bytes(buf[0..4].try_into().ok()?),
             sample_offset: u64::from_le_bytes(buf[4..12].try_into().ok()?),
@@ -327,7 +352,12 @@ pub extern "C" fn nsl_data_assign_shards(
     num_shards: i64,
     epoch: i64,
 ) -> i64 {
-    let shards = assign_shards(rank as u32, world_size as u32, num_shards as u32, epoch as u64);
+    let shards = assign_shards(
+        rank as u32,
+        world_size as u32,
+        num_shards as u32,
+        epoch as u64,
+    );
     let n = shards.len();
     let buf = crate::memory::checked_alloc((n + 1) * std::mem::size_of::<i64>()) as *mut i64;
     unsafe {
@@ -343,14 +373,13 @@ pub extern "C" fn nsl_data_assign_shards(
 /// `ptr`: pointer returned by nsl_data_assign_shards.
 #[no_mangle]
 pub extern "C" fn nsl_data_free_shards(ptr: i64) -> i64 {
-    if ptr == 0 { return -1; }
+    if ptr == 0 {
+        return -1;
+    }
     let buf = ptr as *mut i64;
     let n = unsafe { *buf } as usize;
     unsafe {
-        crate::memory::checked_free(
-            buf as *mut u8,
-            (n + 1) * std::mem::size_of::<i64>(),
-        );
+        crate::memory::checked_free(buf as *mut u8, (n + 1) * std::mem::size_of::<i64>());
     }
     0
 }
@@ -390,14 +419,19 @@ mod tests {
         {
             let mut writer = ShardWriter::new(&mut buf).unwrap();
             for i in 0..5 {
-                writer.write_sample(format!("sample_{i}").as_bytes()).unwrap();
+                writer
+                    .write_sample(format!("sample_{i}").as_bytes())
+                    .unwrap();
             }
             writer.finalize().unwrap();
         }
 
         buf.seek(SeekFrom::Start(0)).unwrap();
         let mut reader = ShardReader::open(&mut buf).unwrap();
-        let samples: Vec<_> = reader.iter_samples().collect::<Result<Vec<_>, _>>().unwrap();
+        let samples: Vec<_> = reader
+            .iter_samples()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
         assert_eq!(samples.len(), 5);
         assert_eq!(samples[0], b"sample_0");
         assert_eq!(samples[4], b"sample_4");
@@ -409,7 +443,10 @@ mod tests {
         let mut cursor = Cursor::new(bad_data);
         let result = ShardHeader::read_from(&mut cursor);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("invalid shard magic"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("invalid shard magic"));
     }
 
     #[test]
@@ -434,14 +471,20 @@ mod tests {
         // Every shard should appear exactly once
         all_shards.sort();
         let expected: Vec<u32> = (0..num_shards).collect();
-        assert_eq!(all_shards, expected, "all shards must be assigned exactly once");
+        assert_eq!(
+            all_shards, expected,
+            "all shards must be assigned exactly once"
+        );
     }
 
     #[test]
     fn test_assign_shards_different_epochs() {
         let a1 = assign_shards(0, 2, 10, 0);
         let a2 = assign_shards(0, 2, 10, 1);
-        assert_ne!(a1, a2, "different epochs should produce different orderings");
+        assert_ne!(
+            a1, a2,
+            "different epochs should produce different orderings"
+        );
     }
 
     #[test]

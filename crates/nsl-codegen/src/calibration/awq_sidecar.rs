@@ -15,19 +15,44 @@ pub struct AwqProjectionScales {
 
 #[derive(Debug)]
 pub enum AwqSidecarError {
-    TooSmall { need: usize, got: usize },
-    UnsupportedVersion { got: u32 },
-    Truncated { at: &'static str, offset: usize, need: usize, got: usize },
-    BadUtf8 { offset: usize },
+    TooSmall {
+        need: usize,
+        got: usize,
+    },
+    UnsupportedVersion {
+        got: u32,
+    },
+    Truncated {
+        at: &'static str,
+        offset: usize,
+        need: usize,
+        got: usize,
+    },
+    BadUtf8 {
+        offset: usize,
+    },
 }
 
 impl std::fmt::Display for AwqSidecarError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::TooSmall { need, got } => write!(f, "blob too small: need {need}, got {got}"),
-            Self::UnsupportedVersion { got } => write!(f, "unsupported AWQ sidecar version {got} (expected {AWQ_SIDECAR_VERSION})"),
-            Self::Truncated { at, offset, need, got } => write!(f, "truncated at {at} offset {offset}: need {need} bytes, got {got}"),
-            Self::BadUtf8 { offset } => write!(f, "invalid UTF-8 in projection name at offset {offset}"),
+            Self::UnsupportedVersion { got } => write!(
+                f,
+                "unsupported AWQ sidecar version {got} (expected {AWQ_SIDECAR_VERSION})"
+            ),
+            Self::Truncated {
+                at,
+                offset,
+                need,
+                got,
+            } => write!(
+                f,
+                "truncated at {at} offset {offset}: need {need} bytes, got {got}"
+            ),
+            Self::BadUtf8 { offset } => {
+                write!(f, "invalid UTF-8 in projection name at offset {offset}")
+            }
         }
     }
 }
@@ -52,7 +77,10 @@ pub fn serialize(projections: &BTreeMap<String, Vec<f32>>) -> Vec<u8> {
 
 pub fn deserialize(blob: &[u8]) -> Result<Vec<AwqProjectionScales>, AwqSidecarError> {
     if blob.len() < 8 {
-        return Err(AwqSidecarError::TooSmall { need: 8, got: blob.len() });
+        return Err(AwqSidecarError::TooSmall {
+            need: 8,
+            got: blob.len(),
+        });
     }
     let version = u32::from_le_bytes(blob[0..4].try_into().unwrap());
     if version != AWQ_SIDECAR_VERSION {
@@ -63,25 +91,46 @@ pub fn deserialize(blob: &[u8]) -> Result<Vec<AwqProjectionScales>, AwqSidecarEr
     let mut cursor = 8;
     for _ in 0..num_projections {
         if blob.len() < cursor + 4 {
-            return Err(AwqSidecarError::Truncated { at: "name_len", offset: cursor, need: 4, got: blob.len() - cursor });
+            return Err(AwqSidecarError::Truncated {
+                at: "name_len",
+                offset: cursor,
+                need: 4,
+                got: blob.len() - cursor,
+            });
         }
         let name_len = u32::from_le_bytes(blob[cursor..cursor + 4].try_into().unwrap()) as usize;
         cursor += 4;
         if blob.len() < cursor + name_len {
-            return Err(AwqSidecarError::Truncated { at: "name bytes", offset: cursor, need: name_len, got: blob.len() - cursor });
+            return Err(AwqSidecarError::Truncated {
+                at: "name bytes",
+                offset: cursor,
+                need: name_len,
+                got: blob.len() - cursor,
+            });
         }
         let name = std::str::from_utf8(&blob[cursor..cursor + name_len])
             .map_err(|_| AwqSidecarError::BadUtf8 { offset: cursor })?
             .to_string();
         cursor += name_len;
         if blob.len() < cursor + 4 {
-            return Err(AwqSidecarError::Truncated { at: "channel_count", offset: cursor, need: 4, got: blob.len() - cursor });
+            return Err(AwqSidecarError::Truncated {
+                at: "channel_count",
+                offset: cursor,
+                need: 4,
+                got: blob.len() - cursor,
+            });
         }
-        let channel_count = u32::from_le_bytes(blob[cursor..cursor + 4].try_into().unwrap()) as usize;
+        let channel_count =
+            u32::from_le_bytes(blob[cursor..cursor + 4].try_into().unwrap()) as usize;
         cursor += 4;
         let scale_bytes = channel_count * 4;
         if blob.len() < cursor + scale_bytes {
-            return Err(AwqSidecarError::Truncated { at: "scales", offset: cursor, need: scale_bytes, got: blob.len() - cursor });
+            return Err(AwqSidecarError::Truncated {
+                at: "scales",
+                offset: cursor,
+                need: scale_bytes,
+                got: blob.len() - cursor,
+            });
         }
         let mut scales = Vec::with_capacity(channel_count);
         for i in 0..channel_count {
@@ -122,7 +171,10 @@ mod tests {
         let mut blob = serialize(&sample());
         blob[0..4].copy_from_slice(&999u32.to_le_bytes());
         let err = deserialize(&blob).unwrap_err();
-        assert!(matches!(err, AwqSidecarError::UnsupportedVersion { got: 999 }));
+        assert!(matches!(
+            err,
+            AwqSidecarError::UnsupportedVersion { got: 999 }
+        ));
     }
 
     #[test]

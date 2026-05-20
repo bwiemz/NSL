@@ -128,8 +128,7 @@ pub unsafe fn copy_shard(
 
         let mut dst_offset: usize = 0;
         for outer_idx in 0..outer_count {
-            let src_byte_offset =
-                (outer_idx * full_row_elements + rank_offset_in_row) * elem_bytes;
+            let src_byte_offset = (outer_idx * full_row_elements + rank_offset_in_row) * elem_bytes;
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     src.add(src_byte_offset),

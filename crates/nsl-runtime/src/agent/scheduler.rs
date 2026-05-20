@@ -82,10 +82,8 @@ impl ReactorScheduler {
     /// After each `step()`, written values propagate from output mailbox
     /// to the downstream input mailbox at the next logical time.
     pub fn connect(&mut self, from: (AgentId, &str), to: (AgentId, &str)) {
-        self.connections.push((
-            (from.0, from.1.to_string()),
-            (to.0, to.1.to_string()),
-        ));
+        self.connections
+            .push(((from.0, from.1.to_string()), (to.0, to.1.to_string())));
     }
 
     pub fn logical_time(&self) -> u64 {

@@ -26,16 +26,31 @@ pub struct OverrideDiagnostic {
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub enum OverrideRejectReason {
     // CSHA:
-    SmemBudgetExceeded { actual_kb: u32, limit_kb: u32 },
+    SmemBudgetExceeded {
+        actual_kb: u32,
+        limit_kb: u32,
+    },
     // WRGA:
-    RankClampedToBounds { r_min: u32, r_max: u32 },
+    RankClampedToBounds {
+        r_min: u32,
+        r_max: u32,
+    },
     RankForbiddenByWggo,
-    BudgetExceededDowngraded { original_rank: u32, final_rank: u32 },
+    BudgetExceededDowngraded {
+        original_rank: u32,
+        final_rank: u32,
+    },
     // CPDT:
     /// WGGO's recommended shard factor doesn't divide world_size.
-    ShardFactorIncompatibleWithWorldSize { recommended: u32, world_size: u32 },
+    ShardFactorIncompatibleWithWorldSize {
+        recommended: u32,
+        world_size: u32,
+    },
     /// Memory budget required more aggressive sharding than WGGO recommended.
-    ShardFactorOverriddenByMemory { recommended: u32, applied: u32 },
+    ShardFactorOverriddenByMemory {
+        recommended: u32,
+        applied: u32,
+    },
     // FASE:
     /// WGGO requested Deferred mode on a layer whose global FASE plan is
     /// FullBuffer because the optimizer does not support deferred accumulation
@@ -101,9 +116,9 @@ pub struct PerLayerOverride {
 
     // Future-consumer fields (populated now so the struct shape is stable;
     // their wiring plans land later without signature churn):
-    pub adapter_rank: u64,   // WRGA
-    pub fase_fused: bool,    // FASE
-    pub packing_mode: u8,    // PCA / fusion
+    pub adapter_rank: u64, // WRGA
+    pub fase_fused: bool,  // FASE
+    pub packing_mode: u8,  // PCA / fusion
     /// CPDT: per-layer ZeRO shard factor recommendation. Aggregated to a
     /// single global recommendation via `WggoOverrides::min_shard_factor`.
     /// `0` is the uninitialized sentinel — meaning "no recommendation."
@@ -147,7 +162,13 @@ impl WggoOverrides {
     pub fn min_shard_factor(&self) -> Option<u32> {
         self.per_layer
             .iter()
-            .filter_map(|p| if p.shard_factor > 0 { Some(p.shard_factor) } else { None })
+            .filter_map(|p| {
+                if p.shard_factor > 0 {
+                    Some(p.shard_factor)
+                } else {
+                    None
+                }
+            })
             .min()
     }
 
@@ -292,7 +313,10 @@ mod tests {
         let d = OverrideDiagnostic {
             layer_index: 3,
             layer_name: "blocks.3".into(),
-            reason: OverrideRejectReason::RankClampedToBounds { r_min: 2, r_max: 16 },
+            reason: OverrideRejectReason::RankClampedToBounds {
+                r_min: 2,
+                r_max: 16,
+            },
             requested: "32".to_string(),
             applied: "16".to_string(),
         };
@@ -324,11 +348,18 @@ mod tests {
 
     #[test]
     fn override_reject_reason_covers_csha_and_wrga_variants() {
-        let _csha = OverrideRejectReason::SmemBudgetExceeded { actual_kb: 52, limit_kb: 48 };
-        let _wrga_clamp = OverrideRejectReason::RankClampedToBounds { r_min: 2, r_max: 16 };
+        let _csha = OverrideRejectReason::SmemBudgetExceeded {
+            actual_kb: 52,
+            limit_kb: 48,
+        };
+        let _wrga_clamp = OverrideRejectReason::RankClampedToBounds {
+            r_min: 2,
+            r_max: 16,
+        };
         let _wrga_forbid = OverrideRejectReason::RankForbiddenByWggo;
         let _wrga_budget = OverrideRejectReason::BudgetExceededDowngraded {
-            original_rank: 16, final_rank: 8,
+            original_rank: 16,
+            final_rank: 8,
         };
     }
 
@@ -386,7 +417,10 @@ mod tests {
         assert_eq!(diags[0].layer_name, "blocks.1");
         assert_eq!(diags[0].requested, "prune");
         assert_eq!(diags[0].applied, "keepfull");
-        assert!(matches!(diags[0].reason, OverrideRejectReason::WholeBlockPruneNotImplemented));
+        assert!(matches!(
+            diags[0].reason,
+            OverrideRejectReason::WholeBlockPruneNotImplemented
+        ));
 
         assert_eq!(diags[1].layer_index, 3);
         assert_eq!(diags[1].layer_name, "blocks.3");
@@ -400,15 +434,20 @@ mod tests {
         let plan = AppliedPlan {
             layers: vec![
                 layer("blocks.3.attn", 0, CoarseDecision::Prune),
-                layer("blocks.3.ffn",  1, CoarseDecision::Prune),
-                layer("blocks.3",      2, CoarseDecision::Prune),
+                layer("blocks.3.ffn", 1, CoarseDecision::Prune),
+                layer("blocks.3", 2, CoarseDecision::Prune),
             ],
             total_us: 30.0,
             peak_memory_bytes: 0,
         };
         let diags = collect_prune_diagnostics(&plan);
         // Only the whole-block layer (blocks.3) should appear.
-        assert_eq!(diags.len(), 1, "expected 1 diagnostic for whole-block only; got {}", diags.len());
+        assert_eq!(
+            diags.len(),
+            1,
+            "expected 1 diagnostic for whole-block only; got {}",
+            diags.len()
+        );
         assert_eq!(diags[0].layer_name, "blocks.3");
     }
 
@@ -420,7 +459,10 @@ mod tests {
         // scanners) may match against.  Pin the literal value here so
         // drift is caught as a test failure rather than a quiet parser
         // regression.
-        assert_eq!(whole_block_prune_not_implemented_reason(), "ir_rewrite_not_implemented");
+        assert_eq!(
+            whole_block_prune_not_implemented_reason(),
+            "ir_rewrite_not_implemented"
+        );
     }
 
     #[test]
@@ -464,23 +506,50 @@ mod tests {
     #[test]
     fn find_by_layer_containing_matches_projections_in_layer() {
         let over = overrides_with_layers(&[("blocks.0", 8)]);
-        assert_eq!(over.find_by_layer_containing("blocks.0.attn.wq").unwrap().adapter_rank, 8);
-        assert_eq!(over.find_by_layer_containing("blocks.0.attn.wk").unwrap().adapter_rank, 8);
-        assert_eq!(over.find_by_layer_containing("blocks.0.mlp.fc1").unwrap().adapter_rank, 8);
+        assert_eq!(
+            over.find_by_layer_containing("blocks.0.attn.wq")
+                .unwrap()
+                .adapter_rank,
+            8
+        );
+        assert_eq!(
+            over.find_by_layer_containing("blocks.0.attn.wk")
+                .unwrap()
+                .adapter_rank,
+            8
+        );
+        assert_eq!(
+            over.find_by_layer_containing("blocks.0.mlp.fc1")
+                .unwrap()
+                .adapter_rank,
+            8
+        );
     }
 
     #[test]
     fn find_by_layer_containing_respects_dot_boundary() {
         let over = overrides_with_layers(&[("blocks.1", 4)]);
-        assert!(over.find_by_layer_containing("blocks.10.attn.wq").is_none(),
-            "'blocks.1' must NOT match 'blocks.10.attn.wq' — dot boundary required");
-        assert_eq!(over.find_by_layer_containing("blocks.1.attn.wq").unwrap().adapter_rank, 4);
+        assert!(
+            over.find_by_layer_containing("blocks.10.attn.wq").is_none(),
+            "'blocks.1' must NOT match 'blocks.10.attn.wq' — dot boundary required"
+        );
+        assert_eq!(
+            over.find_by_layer_containing("blocks.1.attn.wq")
+                .unwrap()
+                .adapter_rank,
+            4
+        );
     }
 
     #[test]
     fn find_by_layer_containing_matches_bare_layer_name() {
         let over = overrides_with_layers(&[("blocks.2", 6)]);
-        assert_eq!(over.find_by_layer_containing("blocks.2").unwrap().adapter_rank, 6);
+        assert_eq!(
+            over.find_by_layer_containing("blocks.2")
+                .unwrap()
+                .adapter_rank,
+            6
+        );
     }
 
     #[test]
@@ -491,16 +560,20 @@ mod tests {
 
     fn overrides_with_shards(shards: &[u32]) -> WggoOverrides {
         WggoOverrides {
-            per_layer: shards.iter().enumerate().map(|(i, &s)| PerLayerOverride {
-                layer_index: i as u32,
-                layer_name: format!("blocks.{i}"),
-                active_heads: 8,
-                requested_csha_level: None,
-                adapter_rank: 0,
-                fase_fused: false,
-                packing_mode: 0,
-                shard_factor: s,
-            }).collect(),
+            per_layer: shards
+                .iter()
+                .enumerate()
+                .map(|(i, &s)| PerLayerOverride {
+                    layer_index: i as u32,
+                    layer_name: format!("blocks.{i}"),
+                    active_heads: 8,
+                    requested_csha_level: None,
+                    adapter_rank: 0,
+                    fase_fused: false,
+                    packing_mode: 0,
+                    shard_factor: s,
+                })
+                .collect(),
         }
     }
 
@@ -525,10 +598,12 @@ mod tests {
     #[test]
     fn shard_factor_reject_variants_construct() {
         let _incompat = OverrideRejectReason::ShardFactorIncompatibleWithWorldSize {
-            recommended: 4, world_size: 2,
+            recommended: 4,
+            world_size: 2,
         };
         let _mem = OverrideRejectReason::ShardFactorOverriddenByMemory {
-            recommended: 2, applied: 8,
+            recommended: 2,
+            applied: 8,
         };
     }
 }

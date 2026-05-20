@@ -137,9 +137,16 @@ fn record_kernel_at_uses_supplied_id() {
     let mut b = ManifestBuilder::new("h100-sxm", "bf16");
     let id = b.reserve_id();
     b.record_kernel_at(
-        id, "matmul",
-        SourceSpanJson { file: "m.nsl".into(), start_line: 10, end_line: 12 },
-        1.5, 1000, 50,
+        id,
+        "matmul",
+        SourceSpanJson {
+            file: "m.nsl".into(),
+            start_line: 10,
+            end_line: 12,
+        },
+        1.5,
+        1000,
+        50,
     );
     let m = b.finish();
     assert_eq!(m.kernels.len(), 1);
@@ -152,8 +159,29 @@ fn record_kernel_at_uses_supplied_id() {
 fn reserve_id_and_record_kernel_interoperate() {
     let mut b = ManifestBuilder::new("h100-sxm", "bf16");
     let a = b.reserve_id();
-    b.record_kernel_at(a, "x", SourceSpanJson { file: "m".into(), start_line: 1, end_line: 1 }, 0.0, 0, 0);
-    let bid = b.record_kernel("y", SourceSpanJson { file: "m".into(), start_line: 2, end_line: 2 }, 0.0, 0, 0);
+    b.record_kernel_at(
+        a,
+        "x",
+        SourceSpanJson {
+            file: "m".into(),
+            start_line: 1,
+            end_line: 1,
+        },
+        0.0,
+        0,
+        0,
+    );
+    let bid = b.record_kernel(
+        "y",
+        SourceSpanJson {
+            file: "m".into(),
+            start_line: 2,
+            end_line: 2,
+        },
+        0.0,
+        0,
+        0,
+    );
     assert_eq!(bid, 1);
     let mfst = b.finish();
     assert_eq!(mfst.kernels.len(), 2);

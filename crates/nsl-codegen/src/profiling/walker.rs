@@ -132,7 +132,12 @@ impl<'a> WalkCtx<'a> {
             StmtKind::VarDecl { value: Some(e), .. } => self.walk_expr(e),
             StmtKind::Return(Some(e)) | StmtKind::Expr(e) => self.walk_expr(e),
             StmtKind::Assign { value, .. } => self.walk_expr(value),
-            StmtKind::If { condition, then_block, elif_clauses, else_block } => {
+            StmtKind::If {
+                condition,
+                then_block,
+                elif_clauses,
+                else_block,
+            } => {
                 self.walk_expr(condition);
                 self.walk_block(then_block);
                 for (c, b) in elif_clauses {
@@ -182,13 +187,19 @@ impl<'a> WalkCtx<'a> {
                 }
             }
             ExprKind::Paren(e) | ExprKind::Await(e) => self.walk_expr(e),
-            ExprKind::IfExpr { condition, then_expr, else_expr } => {
+            ExprKind::IfExpr {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
                 self.walk_expr(condition);
                 self.walk_expr(then_expr);
                 self.walk_expr(else_expr);
             }
             ExprKind::TupleLiteral(xs) | ExprKind::ListLiteral(xs) => {
-                for e in xs { self.walk_expr(e); }
+                for e in xs {
+                    self.walk_expr(e);
+                }
             }
             _ => {}
         }
@@ -199,7 +210,11 @@ impl<'a> WalkCtx<'a> {
     /// If `expr` looks like a recognized tensor op call, push an `OpCost`.
     fn try_emit_op(&mut self, expr: &Expr) {
         match &expr.kind {
-            ExprKind::BinaryOp { left, op: BinOp::MatMul, right } => {
+            ExprKind::BinaryOp {
+                left,
+                op: BinOp::MatMul,
+                right,
+            } => {
                 self.emit_matmul(expr, Some(left), Some(right));
             }
             ExprKind::Call { callee, args } => {
@@ -293,9 +308,27 @@ impl<'a> WalkCtx<'a> {
             Some(d) if d.len() == 4 => {
                 let (b, h, s, dd) = (d[0], d[1], d[2], d[3]);
                 let (f, br, bw) = flash_attention_cost(b, h, s, dd, self.dtype_bytes);
-                self.push_op(expr, "flash_attention", f, br, bw, vec![], shape_str(Some(d)), "");
+                self.push_op(
+                    expr,
+                    "flash_attention",
+                    f,
+                    br,
+                    bw,
+                    vec![],
+                    shape_str(Some(d)),
+                    "",
+                );
             }
-            _ => self.push_op(expr, "flash_attention", 0, 0, 0, vec![], shape_str(out.as_deref()), "unresolved shape"),
+            _ => self.push_op(
+                expr,
+                "flash_attention",
+                0,
+                0,
+                0,
+                vec![],
+                shape_str(out.as_deref()),
+                "unresolved shape",
+            ),
         }
     }
 
@@ -308,7 +341,16 @@ impl<'a> WalkCtx<'a> {
                 let (f, br, bw) = softmax_cost(outer, last, self.dtype_bytes);
                 self.push_op(expr, "softmax", f, br, bw, vec![], shape_str(Some(d)), "");
             }
-            _ => self.push_op(expr, "softmax", 0, 0, 0, vec![], shape_str(out.as_deref()), "unresolved shape"),
+            _ => self.push_op(
+                expr,
+                "softmax",
+                0,
+                0,
+                0,
+                vec![],
+                shape_str(out.as_deref()),
+                "unresolved shape",
+            ),
         }
     }
 
@@ -326,7 +368,16 @@ impl<'a> WalkCtx<'a> {
                 };
                 self.push_op(expr, kind, f, br, bw, vec![], shape_str(Some(d)), "");
             }
-            _ => self.push_op(expr, kind, 0, 0, 0, vec![], shape_str(out.as_deref()), "unresolved shape"),
+            _ => self.push_op(
+                expr,
+                kind,
+                0,
+                0,
+                0,
+                vec![],
+                shape_str(out.as_deref()),
+                "unresolved shape",
+            ),
         }
     }
 
@@ -338,12 +389,30 @@ impl<'a> WalkCtx<'a> {
                 let (f, br, bw) = embedding_cost(b, s, dd, self.dtype_bytes);
                 self.push_op(expr, "embedding", f, br, bw, vec![], shape_str(Some(d)), "");
             }
-            _ => self.push_op(expr, "embedding", 0, 0, 0, vec![], shape_str(out.as_deref()), "unresolved shape"),
+            _ => self.push_op(
+                expr,
+                "embedding",
+                0,
+                0,
+                0,
+                vec![],
+                shape_str(out.as_deref()),
+                "unresolved shape",
+            ),
         }
     }
 
     fn emit_unknown(&mut self, expr: &Expr, name: &str) {
-        self.push_op(expr, &format!("unknown:{name}"), 0, 0, 0, vec![], shape_str(self.expr_shape(expr).as_deref()), "unknown op");
+        self.push_op(
+            expr,
+            &format!("unknown:{name}"),
+            0,
+            0,
+            0,
+            vec![],
+            shape_str(self.expr_shape(expr).as_deref()),
+            "unknown op",
+        );
     }
 
     fn push_op(
@@ -360,7 +429,8 @@ impl<'a> WalkCtx<'a> {
         let ai = arithmetic_intensity(flops, bytes_read, bytes_written);
         let classification = classify_op(ai, self.gpu.crossover_fp16);
         let loc = format_loc(expr.span, note);
-        let estimated_time_us = estimate_time_us(flops, bytes_read, bytes_written, self.gpu, self.dtype);
+        let estimated_time_us =
+            estimate_time_us(flops, bytes_read, bytes_written, self.gpu, self.dtype);
         self.ops.push(OpCost {
             name: name.to_string(),
             loc,
@@ -397,13 +467,20 @@ impl<'a> WalkCtx<'a> {
 
     /// Try to resolve `obj.method(...)` to a `ModelDef`'s method and walk its
     /// body. Returns true if inlined.
-    fn try_inline_model_method(&mut self, _call_expr: &Expr, callee: &Expr, method_name: &str) -> bool {
+    fn try_inline_model_method(
+        &mut self,
+        _call_expr: &Expr,
+        callee: &Expr,
+        method_name: &str,
+    ) -> bool {
         // callee should be `obj.method`. Figure out `obj`'s type → Model name.
         let obj = match &callee.kind {
             ExprKind::MemberAccess { object, .. } => object.as_ref(),
             _ => return false,
         };
-        let Some(ty) = self.type_map.get(&obj.id) else { return false; };
+        let Some(ty) = self.type_map.get(&obj.id) else {
+            return false;
+        };
         let model_name = match ty.strip_borrow() {
             Type::Model { name, .. } => sym_str(self.interner, *name),
             _ => return false,
@@ -438,7 +515,9 @@ fn dtype_to_bytes(dtype: &str) -> Result<u64, String> {
         "bf16" | "fp16" => Ok(2),
         "fp8" => Ok(1),
         "fp32" => Ok(4),
-        other => Err(format!("unsupported dtype `{other}` (expected bf16|fp16|fp8|fp32)")),
+        other => Err(format!(
+            "unsupported dtype `{other}` (expected bf16|fp16|fp8|fp32)"
+        )),
     }
 }
 
@@ -492,12 +571,18 @@ fn resolve_dim(d: &Dim, interner: &Interner, env: &ShapeEnv) -> Option<u64> {
 }
 
 fn sym_str(interner: &Interner, s: Symbol) -> String {
-    interner.resolve(s.0).map(|x| x.to_string()).unwrap_or_default()
+    interner
+        .resolve(s.0)
+        .map(|x| x.to_string())
+        .unwrap_or_default()
 }
 
 fn shape_str(v: Option<&[u64]>) -> String {
     match v {
-        Some(xs) => format!("[{}]", xs.iter().map(u64::to_string).collect::<Vec<_>>().join(", ")),
+        Some(xs) => format!(
+            "[{}]",
+            xs.iter().map(u64::to_string).collect::<Vec<_>>().join(", ")
+        ),
         None => "<?>".to_string(),
     }
 }
@@ -555,7 +640,11 @@ fn find_sole_top_fn(module: &Module) -> Option<&FnDef> {
     found
 }
 
-fn find_model_by_name<'a>(module: &'a Module, interner: &Interner, name: &str) -> Option<&'a ModelDef> {
+fn find_model_by_name<'a>(
+    module: &'a Module,
+    interner: &Interner,
+    name: &str,
+) -> Option<&'a ModelDef> {
     for s in &module.stmts {
         let st = unwrap_decorated_stmt(s);
         if let StmtKind::ModelDef(m) = &st.kind {
@@ -567,16 +656,26 @@ fn find_model_by_name<'a>(module: &'a Module, interner: &Interner, name: &str) -
     None
 }
 
-fn find_model_method<'a>(model: &'a ModelDef, interner: &Interner, name: &str) -> Option<&'a FnDef> {
+fn find_model_method<'a>(
+    model: &'a ModelDef,
+    interner: &Interner,
+    name: &str,
+) -> Option<&'a FnDef> {
     let mut forward_train = None;
     let mut forward = None;
     let mut exact = None;
     for m in &model.members {
         if let ModelMember::Method(f, _) = m {
             let n = sym_str(interner, f.name);
-            if n == name { exact = Some(f); }
-            if n == "forward_train" { forward_train = Some(f); }
-            if n == "forward" { forward = Some(f); }
+            if n == name {
+                exact = Some(f);
+            }
+            if n == "forward_train" {
+                forward_train = Some(f);
+            }
+            if n == "forward" {
+                forward = Some(f);
+            }
         }
     }
     if name == "forward" {

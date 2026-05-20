@@ -9,9 +9,19 @@ use std::path::{Path, PathBuf};
 #[derive(Debug)]
 pub enum CalibrationDataError {
     Io(std::io::Error),
-    UnsupportedExtension { path: PathBuf, extension: Option<String> },
-    Truncated { path: PathBuf, claimed_bytes: usize, actual_bytes: usize },
-    BadHeader { path: PathBuf, reason: String },
+    UnsupportedExtension {
+        path: PathBuf,
+        extension: Option<String>,
+    },
+    Truncated {
+        path: PathBuf,
+        claimed_bytes: usize,
+        actual_bytes: usize,
+    },
+    BadHeader {
+        path: PathBuf,
+        reason: String,
+    },
 }
 
 impl std::fmt::Display for CalibrationDataError {
@@ -179,7 +189,11 @@ impl CalibrationDataset {
     }
 
     pub fn sample_tokens(&self, idx: u32) -> Vec<i32> {
-        assert!(idx < self.num_samples, "sample index {idx} >= {}", self.num_samples);
+        assert!(
+            idx < self.num_samples,
+            "sample index {idx} >= {}",
+            self.num_samples
+        );
         let s = (idx as usize) * (self.seq_len as usize);
         let e = s + (self.seq_len as usize);
         self.tokens[s..e].to_vec()

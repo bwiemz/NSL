@@ -187,9 +187,7 @@ pub fn spectral_energy(entry: &WeightEntry) -> f64 {
 
     // Start with a simple deterministic seed vector (sin-based — no RNG,
     // same across runs).
-    let mut v: Vec<f64> = (0..cols)
-        .map(|i| (i as f64 * 0.123 + 0.1).sin())
-        .collect();
+    let mut v: Vec<f64> = (0..cols).map(|i| (i as f64 * 0.123 + 0.1).sin()).collect();
     let norm = v.iter().map(|x| x * x).sum::<f64>().sqrt().max(1e-30);
     for x in v.iter_mut() {
         *x /= norm;
@@ -341,7 +339,11 @@ pub fn analyse_weight_map(
         let wk = find_weight(wm, layer, &["attn.wk", "attn.W_k", "k_proj.weight", "wk"]);
         let wv = find_weight(wm, layer, &["attn.wv", "attn.W_v", "v_proj.weight", "wv"]);
         let w_in = find_weight(wm, layer, &["ffn.w_in", "mlp.fc_in", "mlp.up_proj.weight"]);
-        let w_out = find_weight(wm, layer, &["ffn.w_out", "mlp.fc_out", "mlp.down_proj.weight"]);
+        let w_out = find_weight(
+            wm,
+            layer,
+            &["ffn.w_out", "mlp.fc_out", "mlp.down_proj.weight"],
+        );
 
         let mut attn_score = 0.0_f64;
         if let (Some(q), Some(k), Some(v)) = (wq, wk, wv) {
@@ -382,7 +384,12 @@ mod tests {
     use super::*;
     use crate::weight_aware::{WeightDType, WeightEntry};
 
-    fn make_weight(name: &str, per_head_rows: usize, cols: usize, per_head_mag: &[f64]) -> WeightEntry {
+    fn make_weight(
+        name: &str,
+        per_head_rows: usize,
+        cols: usize,
+        per_head_mag: &[f64],
+    ) -> WeightEntry {
         let n_heads = per_head_mag.len();
         let rows = per_head_rows * n_heads;
         let mut data = vec![0u8; rows * cols * 4];

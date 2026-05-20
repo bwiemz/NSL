@@ -15,8 +15,7 @@
 use serde::Serialize;
 
 /// Parsed packing configuration from a `dataset` block.
-#[derive(Debug, Clone, Serialize)]
-#[derive(Default)]
+#[derive(Debug, Clone, Serialize, Default)]
 pub struct DatasetPackingConfig {
     /// Whether the dataset has `packing = true`.
     pub enabled: bool,
@@ -31,7 +30,6 @@ pub struct DatasetPackingConfig {
     /// The separator token id used to mark document boundaries.
     pub separator_token_id: Option<i64>,
 }
-
 
 /// PCA strategy the compiler should apply to the attention sublayer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -170,11 +168,11 @@ pub fn validate_config(cfg: &DatasetPackingConfig) -> Result<(), String> {
     if !cfg.enabled {
         return Ok(());
     }
-    let mean = cfg.mean_doc_length.unwrap_or(cfg.max_sequence_length.max(1));
+    let mean = cfg
+        .mean_doc_length
+        .unwrap_or(cfg.max_sequence_length.max(1));
     if mean == 0 {
-        return Err(
-            "packing.mean_doc_length must be > 0 when packing enabled".to_string(),
-        );
+        return Err("packing.mean_doc_length must be > 0 when packing enabled".to_string());
     }
     // Worst-case segments per pack = max_sequence_length / min_doc_length.
     // We approximate min_doc_length as mean/4 (conservative lower bound).
@@ -184,7 +182,10 @@ pub fn validate_config(cfg: &DatasetPackingConfig) -> Result<(), String> {
         return Err(format!(
             "packing config may exceed u16 segment ceiling: \
              max_sequence_length={}, min_doc_length≈{}, worst-case segments={} > {}",
-            cfg.max_sequence_length, min_doc, worst_case_segments, u16::MAX
+            cfg.max_sequence_length,
+            min_doc,
+            worst_case_segments,
+            u16::MAX
         ));
     }
     Ok(())

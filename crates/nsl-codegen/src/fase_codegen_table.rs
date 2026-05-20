@@ -22,16 +22,16 @@ use crate::wggo_overrides::WggoOverrides;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParamMode {
     Passthrough = 0,
-    Deferred    = 1,
-    FullBuffer  = 2,
+    Deferred = 1,
+    FullBuffer = 2,
 }
 
 impl From<FaseMode> for ParamMode {
     fn from(m: FaseMode) -> Self {
         match m {
             FaseMode::Passthrough => ParamMode::Passthrough,
-            FaseMode::Deferred    => ParamMode::Deferred,
-            FaseMode::FullBuffer  => ParamMode::FullBuffer,
+            FaseMode::Deferred => ParamMode::Deferred,
+            FaseMode::FullBuffer => ParamMode::FullBuffer,
         }
     }
 }
@@ -106,7 +106,11 @@ mod tests {
 
     fn make_overrides(names: &[&str]) -> WggoOverrides {
         let plan = AppliedPlan {
-            layers: names.iter().enumerate().map(|(i, n)| applied_layer(i as u32, n)).collect(),
+            layers: names
+                .iter()
+                .enumerate()
+                .map(|(i, n)| applied_layer(i as u32, n))
+                .collect(),
             total_us: 0.0,
             peak_memory_bytes: 0,
         };
@@ -150,14 +154,25 @@ mod tests {
         // Paths carry the `m.` model-variable prefix, as
         // enumerate_model_tensor_paths emits.
         let paths: Vec<String> = vec![
-            "m.blocks.0.wq", "m.blocks.0.wk", "m.blocks.0.wv",
-            "m.blocks.1.wq", "m.blocks.1.wk", "m.blocks.1.wv",
-            "m.blocks.2.wq", "m.blocks.2.wk", "m.blocks.2.wv",
-            "m.blocks.3.wq", "m.blocks.3.wk", "m.blocks.3.wv",
-        ].into_iter().map(String::from).collect();
+            "m.blocks.0.wq",
+            "m.blocks.0.wk",
+            "m.blocks.0.wv",
+            "m.blocks.1.wq",
+            "m.blocks.1.wk",
+            "m.blocks.1.wv",
+            "m.blocks.2.wq",
+            "m.blocks.2.wk",
+            "m.blocks.2.wv",
+            "m.blocks.3.wq",
+            "m.blocks.3.wk",
+            "m.blocks.3.wv",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
         let o = make_overrides(&["blocks.0", "blocks.1", "blocks.2", "blocks.3"]);
         let modes = build_param_mode_table(&paths, "m", &p, Some(&o)).unwrap();
-        assert_eq!(modes, vec![1,1,1, 2,2,2, 1,1,1, 2,2,2]);
+        assert_eq!(modes, vec![1, 1, 1, 2, 2, 2, 1, 1, 1, 2, 2, 2]);
     }
 
     #[test]
@@ -176,8 +191,8 @@ mod tests {
     #[test]
     fn from_fase_mode_round_trips() {
         assert_eq!(ParamMode::from(FaseMode::Passthrough) as u8, 0);
-        assert_eq!(ParamMode::from(FaseMode::Deferred)    as u8, 1);
-        assert_eq!(ParamMode::from(FaseMode::FullBuffer)  as u8, 2);
+        assert_eq!(ParamMode::from(FaseMode::Deferred) as u8, 1);
+        assert_eq!(ParamMode::from(FaseMode::FullBuffer) as u8, 2);
     }
 
     #[test]

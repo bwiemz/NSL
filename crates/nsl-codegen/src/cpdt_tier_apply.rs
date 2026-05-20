@@ -247,8 +247,11 @@ pub fn compute_tier_agreement(
         "compute_tier_agreement precondition: duplicate tensor name in `plan_nw`"
     );
 
-    let by_name_nw: HashMap<&str, &ParamPrecision> =
-        plan_nw.params.iter().map(|p| (p.name.as_str(), p)).collect();
+    let by_name_nw: HashMap<&str, &ParamPrecision> = plan_nw
+        .params
+        .iter()
+        .map(|p| (p.name.as_str(), p))
+        .collect();
     let mut agree_layers: u64 = 0;
     let mut total_layers: u64 = 0;
     let mut agree_params: u64 = 0;

@@ -102,12 +102,20 @@ pub unsafe fn time_kernel_launches(
     let mut stop_evt: sys::CUevent = std::ptr::null_mut();
     let rc = sys::cuEventCreate(&mut start_evt, 0);
     if rc != sys::CUresult::CUDA_SUCCESS {
-        return Err(format!("cuEventCreate(start) rc={:?}: {}", rc, cu_error_string(rc)));
+        return Err(format!(
+            "cuEventCreate(start) rc={:?}: {}",
+            rc,
+            cu_error_string(rc)
+        ));
     }
     let rc = sys::cuEventCreate(&mut stop_evt, 0);
     if rc != sys::CUresult::CUDA_SUCCESS {
         let _ = sys::cuEventDestroy_v2(start_evt);
-        return Err(format!("cuEventCreate(stop) rc={:?}: {}", rc, cu_error_string(rc)));
+        return Err(format!(
+            "cuEventCreate(stop) rc={:?}: {}",
+            rc,
+            cu_error_string(rc)
+        ));
     }
 
     // --- Per-iter timing loop. ---
@@ -126,8 +134,12 @@ pub unsafe fn time_kernel_launches(
         }
         let launch_rc = sys::cuLaunchKernel(
             func,
-            grid.0, grid.1, grid.2,
-            block.0, block.1, block.2,
+            grid.0,
+            grid.1,
+            grid.2,
+            block.0,
+            block.1,
+            block.2,
             shmem_bytes,
             std::ptr::null_mut(), // default stream
             args.as_mut_ptr(),
@@ -199,11 +211,7 @@ pub unsafe fn time_kernel_launches(
     // with no further infrastructure work.
     let skip_ratio = if let Some((dev_ptr, byte_len)) = skip_decisions_buf {
         let mut host = vec![0u8; byte_len];
-        let rc = sys::cuMemcpyDtoH_v2(
-            host.as_mut_ptr() as *mut c_void,
-            dev_ptr,
-            byte_len,
-        );
+        let rc = sys::cuMemcpyDtoH_v2(host.as_mut_ptr() as *mut c_void, dev_ptr, byte_len);
         if rc != sys::CUresult::CUDA_SUCCESS {
             return Err(format!(
                 "cuMemcpyDtoH(skip_decisions) rc={:?}: {}",
@@ -237,15 +245,17 @@ pub unsafe fn time_kernel_launches(
             // Dump first 128 bytes raw and the first non-zero byte's offset
             // for diagnostic verification that the kernel writeback path is
             // populating the buffer at the expected slot stride.
-            let head: Vec<String> =
-                host.iter().take(128).map(|b| format!("{:02x}", b)).collect();
+            let head: Vec<String> = host
+                .iter()
+                .take(128)
+                .map(|b| format!("{:02x}", b))
+                .collect();
             eprintln!("[bench] first 128 bytes: {}", head.join(" "));
             let first_nz = host.iter().enumerate().find(|(_, &b)| b != 0);
             match first_nz {
-                Some((i, b)) => eprintln!(
-                    "[bench] first non-zero byte at offset {} = 0x{:02x}",
-                    i, b
-                ),
+                Some((i, b)) => {
+                    eprintln!("[bench] first non-zero byte at offset {} = 0x{:02x}", i, b)
+                }
                 None => eprintln!(
                     "[bench] no non-zero bytes in entire {} byte buffer",
                     host.len()
@@ -320,7 +330,11 @@ pub unsafe fn run_fixture(
         }
         let rc = sys::cuCtxSetCurrent(ctx);
         if rc != sys::CUresult::CUDA_SUCCESS {
-            return Err(format!("cuCtxSetCurrent rc={:?}: {}", rc, cu_error_string(rc)));
+            return Err(format!(
+                "cuCtxSetCurrent rc={:?}: {}",
+                rc,
+                cu_error_string(rc)
+            ));
         }
     }
 
@@ -386,13 +400,20 @@ pub unsafe fn run_fixture(
         option_values.as_mut_ptr(),
     );
     if rc != sys::CUresult::CUDA_SUCCESS {
-        let nul = err_log.iter().position(|&b| b == 0).unwrap_or(err_log.len());
+        let nul = err_log
+            .iter()
+            .position(|&b| b == 0)
+            .unwrap_or(err_log.len());
         let log = String::from_utf8_lossy(&err_log[..nul]).trim().to_string();
         return Err(format!(
             "cuModuleLoadDataEx rc={:?}: {} | JIT log: {}",
             rc,
             cu_error_string(rc),
-            if log.is_empty() { "<empty>".into() } else { log }
+            if log.is_empty() {
+                "<empty>".into()
+            } else {
+                log
+            }
         ));
     }
 
@@ -429,28 +450,27 @@ pub unsafe fn run_fixture(
     let qkv_bytes_per = (total_elems * std::mem::size_of::<f32>()) as usize;
     // FA2 forward writes f16 to `out`; lse is f32 [B, H, S].
     let out_bytes = (total_elems * std::mem::size_of::<u16>()) as usize;
-    let lse_elems =
-        (fixture.batch as usize) * (heads as usize) * (fixture.seq_len as usize);
+    let lse_elems = (fixture.batch as usize) * (heads as usize) * (fixture.seq_len as usize);
     let lse_bytes = (lse_elems * std::mem::size_of::<f32>()) as usize;
-    let seg_bytes_per_batch =
-        (fixture.seq_len as usize) * std::mem::size_of::<u16>();
+    let seg_bytes_per_batch = (fixture.seq_len as usize) * std::mem::size_of::<u16>();
 
     let mut allocations: Vec<sys::CUdeviceptr> = Vec::new();
-    let alloc =
-        |bytes: usize, allocations: &mut Vec<sys::CUdeviceptr>| -> Result<sys::CUdeviceptr, String> {
-            let mut p: sys::CUdeviceptr = 0;
-            let rc = sys::cuMemAlloc_v2(&mut p, bytes);
-            if rc != sys::CUresult::CUDA_SUCCESS {
-                return Err(format!(
-                    "cuMemAlloc_v2({} bytes) rc={:?}: {}",
-                    bytes,
-                    rc,
-                    cu_error_string(rc)
-                ));
-            }
-            allocations.push(p);
-            Ok(p)
-        };
+    let alloc = |bytes: usize,
+                 allocations: &mut Vec<sys::CUdeviceptr>|
+     -> Result<sys::CUdeviceptr, String> {
+        let mut p: sys::CUdeviceptr = 0;
+        let rc = sys::cuMemAlloc_v2(&mut p, bytes);
+        if rc != sys::CUresult::CUDA_SUCCESS {
+            return Err(format!(
+                "cuMemAlloc_v2({} bytes) rc={:?}: {}",
+                bytes,
+                rc,
+                cu_error_string(rc)
+            ));
+        }
+        allocations.push(p);
+        Ok(p)
+    };
 
     let q_dev = alloc(qkv_bytes_per, &mut allocations)
         .map_err(|e| free_all_and(&allocations, module, e))?;
@@ -458,10 +478,10 @@ pub unsafe fn run_fixture(
         .map_err(|e| free_all_and(&allocations, module, e))?;
     let v_dev = alloc(qkv_bytes_per, &mut allocations)
         .map_err(|e| free_all_and(&allocations, module, e))?;
-    let out_dev = alloc(out_bytes, &mut allocations)
-        .map_err(|e| free_all_and(&allocations, module, e))?;
-    let lse_dev = alloc(lse_bytes, &mut allocations)
-        .map_err(|e| free_all_and(&allocations, module, e))?;
+    let out_dev =
+        alloc(out_bytes, &mut allocations).map_err(|e| free_all_and(&allocations, module, e))?;
+    let lse_dev =
+        alloc(lse_bytes, &mut allocations).map_err(|e| free_all_and(&allocations, module, e))?;
     let seg_dev = alloc(seg_bytes_per_batch, &mut allocations)
         .map_err(|e| free_all_and(&allocations, module, e))?;
 
@@ -507,8 +527,8 @@ pub unsafe fn run_fixture(
         let num_q = (fixture.seq_len).div_ceil(fixture.config.block_q as u32) as usize;
         let num_kv = (fixture.seq_len).div_ceil(fixture.config.block_kv as u32) as usize;
         let n_slots = (fixture.batch as usize) * (heads as usize) * num_q * num_kv;
-        let dev = alloc(n_slots, &mut allocations)
-            .map_err(|e| free_all_and(&allocations, module, e))?;
+        let dev =
+            alloc(n_slots, &mut allocations).map_err(|e| free_all_and(&allocations, module, e))?;
         // Zero the buffer so the readback sees 0 wherever the kernel
         // didn't write (e.g. before B1.5-3 wires the writeback).
         let rc = sys::cuMemsetD8_v2(dev, 0, n_slots);
@@ -547,24 +567,19 @@ pub unsafe fn run_fixture(
     // Compute the high-watermark of any SMEM offset the kernel touches:
     //   range_table_base + range_table_bytes  when Tier B is on
     //   forward total + seg_overhead          when Tier B is off
-    let shmem_bytes_base = shared_mem_bytes_v2_with_seqlen(
-        &fixture.config,
-        fixture.seq_len,
-        SegmentResidency::Shared,
-    );
+    let shmem_bytes_base =
+        shared_mem_bytes_v2_with_seqlen(&fixture.config, fixture.seq_len, SegmentResidency::Shared);
     let shmem_bytes = if tier_b_on
         && crate::pca_tilerange::should_emit_tier_b(
             &fixture.config,
             fixture.seq_len as u64,
             SegmentResidency::Shared,
-        )
-    {
+        ) {
         let base = crate::flash_attention_v2::smem_layout::tier_b_range_table_offset(
             &fixture.config,
             crate::flash_attention_v2::smem_layout::Direction::Forward,
         );
-        let tbl =
-            crate::pca_tilerange::tier_b_range_table_bytes(&fixture.config, fixture.seq_len);
+        let tbl = crate::pca_tilerange::tier_b_range_table_bytes(&fixture.config, fixture.seq_len);
         shmem_bytes_base.max(base + tbl)
     } else {
         shmem_bytes_base
@@ -712,11 +727,7 @@ pub unsafe fn run_fixture(
     if let Some(path) = dump_output {
         if result.is_ok() {
             let mut host_out = vec![0u8; out_bytes];
-            let rc = sys::cuMemcpyDtoH_v2(
-                host_out.as_mut_ptr() as *mut c_void,
-                out_dev,
-                out_bytes,
-            );
+            let rc = sys::cuMemcpyDtoH_v2(host_out.as_mut_ptr() as *mut c_void, out_dev, out_bytes);
             if rc != sys::CUresult::CUDA_SUCCESS {
                 let msg = format!(
                     "cuMemcpyDtoH(out for --dump-output) rc={:?}: {}",
@@ -804,7 +815,11 @@ pub unsafe fn run_fixture_backward(
         }
         let rc = sys::cuCtxSetCurrent(ctx);
         if rc != sys::CUresult::CUDA_SUCCESS {
-            return Err(format!("cuCtxSetCurrent rc={:?}: {}", rc, cu_error_string(rc)));
+            return Err(format!(
+                "cuCtxSetCurrent rc={:?}: {}",
+                rc,
+                cu_error_string(rc)
+            ));
         }
     }
 
@@ -851,7 +866,8 @@ pub unsafe fn run_fixture_backward(
         let _ = std::fs::write(&p_bwd, &bwd_ptx[..bwd_ptx.len() - 1]);
         eprintln!(
             "[bench-bwd] PTX dumped to: {} (fwd), {} (bwd)",
-            p_fwd.display(), p_bwd.display()
+            p_fwd.display(),
+            p_bwd.display()
         );
     }
 
@@ -880,13 +896,20 @@ pub unsafe fn run_fixture_backward(
             option_values.as_mut_ptr(),
         );
         if rc != sys::CUresult::CUDA_SUCCESS {
-            let nul = err_log.iter().position(|&b| b == 0).unwrap_or(err_log.len());
+            let nul = err_log
+                .iter()
+                .position(|&b| b == 0)
+                .unwrap_or(err_log.len());
             let log = String::from_utf8_lossy(&err_log[..nul]).trim().to_string();
             return Err(format!(
                 "cuModuleLoadDataEx({tag}) rc={:?}: {} | JIT log: {}",
                 rc,
                 cu_error_string(rc),
-                if log.is_empty() { "<empty>".into() } else { log }
+                if log.is_empty() {
+                    "<empty>".into()
+                } else {
+                    log
+                }
             ));
         }
         Ok(module)
@@ -960,8 +983,8 @@ pub unsafe fn run_fixture_backward(
     // but in backward the noise compounds through P/dP/dS/dK/dV accumulators
     // and produces non-zero NaN bit-pattern divergence).
     let qkv_bytes_per = total_elems * std::mem::size_of::<u16>(); // f16 storage
-    let out_bytes = total_elems * std::mem::size_of::<u16>();     // f16 forward O
-    let dq_bytes  = total_elems * std::mem::size_of::<u16>();     // f16 dQ
+    let out_bytes = total_elems * std::mem::size_of::<u16>(); // f16 forward O
+    let dq_bytes = total_elems * std::mem::size_of::<u16>(); // f16 dQ
     let dkv_scratch_bytes = total_elems * std::mem::size_of::<f32>(); // f32 dK/dV scratch
     let lse_elems = (fixture.batch as usize) * (heads as usize) * (fixture.seq_len as usize);
     let lse_bytes = lse_elems * std::mem::size_of::<f32>();
@@ -969,28 +992,31 @@ pub unsafe fn run_fixture_backward(
     let seg_bytes_per_batch = (fixture.seq_len as usize) * std::mem::size_of::<u16>();
 
     let mut allocations: Vec<sys::CUdeviceptr> = Vec::new();
-    let alloc =
-        |bytes: usize, allocations: &mut Vec<sys::CUdeviceptr>| -> Result<sys::CUdeviceptr, String> {
-            let mut p: sys::CUdeviceptr = 0;
-            let rc = sys::cuMemAlloc_v2(&mut p, bytes);
-            if rc != sys::CUresult::CUDA_SUCCESS {
-                return Err(format!(
-                    "cuMemAlloc_v2({} bytes) rc={:?}: {}",
-                    bytes,
-                    rc,
-                    cu_error_string(rc)
-                ));
-            }
-            allocations.push(p);
-            Ok(p)
-        };
+    let alloc = |bytes: usize,
+                 allocations: &mut Vec<sys::CUdeviceptr>|
+     -> Result<sys::CUdeviceptr, String> {
+        let mut p: sys::CUdeviceptr = 0;
+        let rc = sys::cuMemAlloc_v2(&mut p, bytes);
+        if rc != sys::CUresult::CUDA_SUCCESS {
+            return Err(format!(
+                "cuMemAlloc_v2({} bytes) rc={:?}: {}",
+                bytes,
+                rc,
+                cu_error_string(rc)
+            ));
+        }
+        allocations.push(p);
+        Ok(p)
+    };
 
     let free_modules = |fwd_module: sys::CUmodule, bwd_module: sys::CUmodule| unsafe {
         let _ = sys::cuModuleUnload(fwd_module);
         let _ = sys::cuModuleUnload(bwd_module);
     };
     let cleanup_and = |allocs: &[sys::CUdeviceptr], err: String| -> String {
-        for p in allocs { let _ = sys::cuMemFree_v2(*p); }
+        for p in allocs {
+            let _ = sys::cuMemFree_v2(*p);
+        }
         free_modules(fwd_module, bwd_module);
         err
     };
@@ -1000,15 +1026,20 @@ pub unsafe fn run_fixture_backward(
     let v_dev = alloc(qkv_bytes_per, &mut allocations).map_err(|e| cleanup_and(&allocations, e))?;
     let out_dev = alloc(out_bytes, &mut allocations).map_err(|e| cleanup_and(&allocations, e))?;
     let lse_dev = alloc(lse_bytes, &mut allocations).map_err(|e| cleanup_and(&allocations, e))?;
-    let seg_dev = alloc(seg_bytes_per_batch, &mut allocations).map_err(|e| cleanup_and(&allocations, e))?;
+    let seg_dev =
+        alloc(seg_bytes_per_batch, &mut allocations).map_err(|e| cleanup_and(&allocations, e))?;
 
     // Backward-specific buffers.
-    let row_max_dev = alloc(row_stats_bytes, &mut allocations).map_err(|e| cleanup_and(&allocations, e))?;
-    let row_sum_dev = alloc(row_stats_bytes, &mut allocations).map_err(|e| cleanup_and(&allocations, e))?;
+    let row_max_dev =
+        alloc(row_stats_bytes, &mut allocations).map_err(|e| cleanup_and(&allocations, e))?;
+    let row_sum_dev =
+        alloc(row_stats_bytes, &mut allocations).map_err(|e| cleanup_and(&allocations, e))?;
     let do_dev = alloc(out_bytes, &mut allocations).map_err(|e| cleanup_and(&allocations, e))?; // dO, f16
     let dq_dev = alloc(dq_bytes, &mut allocations).map_err(|e| cleanup_and(&allocations, e))?;
-    let dk_scratch_dev = alloc(dkv_scratch_bytes, &mut allocations).map_err(|e| cleanup_and(&allocations, e))?;
-    let dv_scratch_dev = alloc(dkv_scratch_bytes, &mut allocations).map_err(|e| cleanup_and(&allocations, e))?;
+    let dk_scratch_dev =
+        alloc(dkv_scratch_bytes, &mut allocations).map_err(|e| cleanup_and(&allocations, e))?;
+    let dv_scratch_dev =
+        alloc(dkv_scratch_bytes, &mut allocations).map_err(|e| cleanup_and(&allocations, e))?;
 
     // -- Step B6: Populate host inputs from seed and H2D. --
     // Q/K/V same seed scheme as forward path so the two runs (on/off) see
@@ -1046,7 +1077,9 @@ pub unsafe fn run_fixture_backward(
         if rc != sys::CUresult::CUDA_SUCCESS {
             Err(format!(
                 "cuMemcpyHtoD_v2({} bytes) rc={:?}: {}",
-                n, rc, cu_error_string(rc)
+                n,
+                rc,
+                cu_error_string(rc)
             ))
         } else {
             Ok(())
@@ -1059,14 +1092,26 @@ pub unsafe fn run_fixture_backward(
         .map_err(|e| cleanup_and(&allocations, e))?;
     h2d(v_dev, v_host_f16.as_ptr() as *const c_void, qkv_bytes_per)
         .map_err(|e| cleanup_and(&allocations, e))?;
-    h2d(seg_dev, seg_host.as_ptr() as *const c_void, seg_bytes_per_batch)
-        .map_err(|e| cleanup_and(&allocations, e))?;
+    h2d(
+        seg_dev,
+        seg_host.as_ptr() as *const c_void,
+        seg_bytes_per_batch,
+    )
+    .map_err(|e| cleanup_and(&allocations, e))?;
     h2d(do_dev, do_f16.as_ptr() as *const c_void, out_bytes)
         .map_err(|e| cleanup_and(&allocations, e))?;
-    h2d(row_max_dev, row_max_host.as_ptr() as *const c_void, row_stats_bytes)
-        .map_err(|e| cleanup_and(&allocations, e))?;
-    h2d(row_sum_dev, row_sum_host.as_ptr() as *const c_void, row_stats_bytes)
-        .map_err(|e| cleanup_and(&allocations, e))?;
+    h2d(
+        row_max_dev,
+        row_max_host.as_ptr() as *const c_void,
+        row_stats_bytes,
+    )
+    .map_err(|e| cleanup_and(&allocations, e))?;
+    h2d(
+        row_sum_dev,
+        row_sum_host.as_ptr() as *const c_void,
+        row_stats_bytes,
+    )
+    .map_err(|e| cleanup_and(&allocations, e))?;
 
     // Zero the dQ/dK/dV outputs before the backward launch (matches the
     // runtime's `memset_d8(d_q, qkv_elems * 2)` pre-launch).
@@ -1090,7 +1135,11 @@ pub unsafe fn run_fixture_backward(
         if rc != sys::CUresult::CUDA_SUCCESS {
             return Err(cleanup_and(
                 &allocations,
-                format!("cuMemsetD8_v2(skip_decisions bwd) rc={:?}: {}", rc, cu_error_string(rc)),
+                format!(
+                    "cuMemsetD8_v2(skip_decisions bwd) rc={:?}: {}",
+                    rc,
+                    cu_error_string(rc)
+                ),
             ));
         }
         Some((dev, n_slots))
@@ -1099,14 +1148,14 @@ pub unsafe fn run_fixture_backward(
     };
 
     // -- Step B7: SMEM opt-in for forward. --
-    let fwd_shmem_bytes_base = shared_mem_bytes_v2_with_seqlen(
-        &fixture.config, fixture.seq_len, SegmentResidency::Shared,
-    );
+    let fwd_shmem_bytes_base =
+        shared_mem_bytes_v2_with_seqlen(&fixture.config, fixture.seq_len, SegmentResidency::Shared);
     let fwd_shmem_bytes = if tier_b_on
         && crate::pca_tilerange::should_emit_tier_b(
-            &fixture.config, fixture.seq_len as u64, SegmentResidency::Shared,
-        )
-    {
+            &fixture.config,
+            fixture.seq_len as u64,
+            SegmentResidency::Shared,
+        ) {
         let base = crate::flash_attention_v2::smem_layout::tier_b_range_table_offset(
             &fixture.config,
             crate::flash_attention_v2::smem_layout::Direction::Forward,
@@ -1126,13 +1175,16 @@ pub unsafe fn run_fixture_backward(
 
     // -- Step B8: SMEM opt-in for backward. --
     let bwd_shmem_bytes_base = shared_mem_bytes_v2_backward_with_seqlen(
-        &fixture.config, fixture.seq_len, SegmentResidency::Shared,
+        &fixture.config,
+        fixture.seq_len,
+        SegmentResidency::Shared,
     );
     let bwd_shmem_bytes = if tier_b_on
         && crate::pca_tilerange::should_emit_tier_b(
-            &fixture.config, fixture.seq_len as u64, SegmentResidency::Shared,
-        )
-    {
+            &fixture.config,
+            fixture.seq_len as u64,
+            SegmentResidency::Shared,
+        ) {
         let base = crate::flash_attention_v2::smem_layout::tier_b_range_table_offset(
             &fixture.config,
             crate::flash_attention_v2::smem_layout::Direction::Backward,
@@ -1241,8 +1293,12 @@ pub unsafe fn run_fixture_backward(
     let fwd_grid_y = fixture.batch * heads;
     let rc = sys::cuLaunchKernel(
         fwd_func,
-        fwd_grid_x, fwd_grid_y, 1,
-        128, 1, 1,
+        fwd_grid_x,
+        fwd_grid_y,
+        1,
+        128,
+        1,
+        1,
         fwd_shmem_bytes,
         std::ptr::null_mut(),
         fwd_args.as_mut_ptr(),
@@ -1251,14 +1307,22 @@ pub unsafe fn run_fixture_backward(
     if rc != sys::CUresult::CUDA_SUCCESS {
         return Err(cleanup_and(
             &allocations,
-            format!("cuLaunchKernel(forward) rc={:?}: {}", rc, cu_error_string(rc)),
+            format!(
+                "cuLaunchKernel(forward) rc={:?}: {}",
+                rc,
+                cu_error_string(rc)
+            ),
         ));
     }
     let rc = sys::cuCtxSynchronize();
     if rc != sys::CUresult::CUDA_SUCCESS {
         return Err(cleanup_and(
             &allocations,
-            format!("cuCtxSynchronize(post-forward) rc={:?}: {}", rc, cu_error_string(rc)),
+            format!(
+                "cuCtxSynchronize(post-forward) rc={:?}: {}",
+                rc,
+                cu_error_string(rc)
+            ),
         ));
     }
 
@@ -1332,7 +1396,7 @@ pub unsafe fn run_fixture_backward(
     let mut bw_x_raw: u64 = 0;
     let mut bw_do: u64 = do_dev;
     let mut bw_dq: u64 = dq_dev;
-    let mut bw_dk: u64 = 0;  // f32 scratch path; f16 outputs unused for parity.
+    let mut bw_dk: u64 = 0; // f32 scratch path; f16 outputs unused for parity.
     let mut bw_dv: u64 = 0;
     let mut bw_dwq: u64 = 0;
     let mut bw_dwk: u64 = 0;
@@ -1437,8 +1501,12 @@ pub unsafe fn run_fixture_backward(
             let _ = std::hint::black_box(&bw_seq_lens);
             let rc = sys::cuLaunchKernel(
                 bwd_func,
-                1, bwd_grid_y, 1,
-                128, 1, 1,
+                1,
+                bwd_grid_y,
+                1,
+                128,
+                1,
+                1,
                 bwd_shmem_bytes,
                 std::ptr::null_mut(),
                 bwd_args.as_mut_ptr(),
@@ -1456,7 +1524,8 @@ pub unsafe fn run_fixture_backward(
                 &allocations,
                 format!(
                     "cuLaunchKernel(backward grid_x=1, per-q-block loop) rc={:?}: {}",
-                    launch_rc, cu_error_string(launch_rc)
+                    launch_rc,
+                    cu_error_string(launch_rc)
                 ),
             ));
         }
@@ -1472,7 +1541,11 @@ pub unsafe fn run_fixture_backward(
     if rc != sys::CUresult::CUDA_SUCCESS {
         return Err(cleanup_and(
             &allocations,
-            format!("cuCtxSynchronize(post-backward) rc={:?}: {}", rc, cu_error_string(rc)),
+            format!(
+                "cuCtxSynchronize(post-backward) rc={:?}: {}",
+                rc,
+                cu_error_string(rc)
+            ),
         ));
     }
     times_ms.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -1503,19 +1576,35 @@ pub unsafe fn run_fixture_backward(
         ));
     }
     let mut host_dk_f32_bytes = vec![0u8; dkv_scratch_bytes];
-    let rc = sys::cuMemcpyDtoH_v2(host_dk_f32_bytes.as_mut_ptr() as *mut c_void, dk_scratch_dev, dkv_scratch_bytes);
+    let rc = sys::cuMemcpyDtoH_v2(
+        host_dk_f32_bytes.as_mut_ptr() as *mut c_void,
+        dk_scratch_dev,
+        dkv_scratch_bytes,
+    );
     if rc != sys::CUresult::CUDA_SUCCESS {
         return Err(cleanup_and(
             &allocations,
-            format!("cuMemcpyDtoH(dk_scratch) rc={:?}: {}", rc, cu_error_string(rc)),
+            format!(
+                "cuMemcpyDtoH(dk_scratch) rc={:?}: {}",
+                rc,
+                cu_error_string(rc)
+            ),
         ));
     }
     let mut host_dv_f32_bytes = vec![0u8; dkv_scratch_bytes];
-    let rc = sys::cuMemcpyDtoH_v2(host_dv_f32_bytes.as_mut_ptr() as *mut c_void, dv_scratch_dev, dkv_scratch_bytes);
+    let rc = sys::cuMemcpyDtoH_v2(
+        host_dv_f32_bytes.as_mut_ptr() as *mut c_void,
+        dv_scratch_dev,
+        dkv_scratch_bytes,
+    );
     if rc != sys::CUresult::CUDA_SUCCESS {
         return Err(cleanup_and(
             &allocations,
-            format!("cuMemcpyDtoH(dv_scratch) rc={:?}: {}", rc, cu_error_string(rc)),
+            format!(
+                "cuMemcpyDtoH(dv_scratch) rc={:?}: {}",
+                rc,
+                cu_error_string(rc)
+            ),
         ));
     }
     // f32→f16 host conversion (mirrors runtime's post-kernel conversion).
@@ -1533,7 +1622,10 @@ pub unsafe fn run_fixture_backward(
     if let Err(e) = std::fs::write(dump_path, &blob) {
         return Err(cleanup_and(
             &allocations,
-            format!("failed to write --dump-backward-outputs to {:?}: {}", dump_path, e),
+            format!(
+                "failed to write --dump-backward-outputs to {:?}: {}",
+                dump_path, e
+            ),
         ));
     }
 
@@ -1544,7 +1636,11 @@ pub unsafe fn run_fixture_backward(
         if rc != sys::CUresult::CUDA_SUCCESS {
             return Err(cleanup_and(
                 &allocations,
-                format!("cuMemcpyDtoH(skip_decisions bwd) rc={:?}: {}", rc, cu_error_string(rc)),
+                format!(
+                    "cuMemcpyDtoH(skip_decisions bwd) rc={:?}: {}",
+                    rc,
+                    cu_error_string(rc)
+                ),
             ));
         }
         let n_skip = host.iter().filter(|&&b| b == 1).count();
@@ -1556,10 +1652,15 @@ pub unsafe fn run_fixture_backward(
     };
 
     // -- Step B15: Cleanup. --
-    for p in &allocations { let _ = sys::cuMemFree_v2(*p); }
+    for p in &allocations {
+        let _ = sys::cuMemFree_v2(*p);
+    }
     free_modules(fwd_module, bwd_module);
 
-    Ok(LaunchResult { median_us, skip_ratio })
+    Ok(LaunchResult {
+        median_us,
+        skip_ratio,
+    })
 }
 
 /// Convert a raw little-endian f32 byte buffer to f16-bit bytes — used to

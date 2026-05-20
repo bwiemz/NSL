@@ -70,15 +70,25 @@ fn total_elements(shape: *const i64, ndim: i64) -> i64 {
 }
 
 /// Compute number of scale/zero_point entries needed.
-fn compute_num_scales(shape: *const i64, ndim: i64, granularity: i64, gran_axis: i64, group_size: i64) -> i64 {
+fn compute_num_scales(
+    shape: *const i64,
+    ndim: i64,
+    granularity: i64,
+    gran_axis: i64,
+    group_size: i64,
+) -> i64 {
     match granularity {
         GRAN_PER_TENSOR => 1,
         GRAN_PER_CHANNEL => {
-            if ndim == 0 { return 1; }
+            if ndim == 0 {
+                return 1;
+            }
             unsafe { *shape.add(gran_axis as usize) }
         }
         GRAN_PER_GROUP => {
-            if ndim == 0 { return 1; }
+            if ndim == 0 {
+                return 1;
+            }
             let axis_size = unsafe { *shape.add(gran_axis as usize) };
             let num_groups = (axis_size + group_size - 1) / group_size;
             // outer_size = product of all dims except the axis dim
@@ -110,7 +120,10 @@ fn alloc_qtensor(
     let data_bytes = match dtype {
         DTYPE_INT4 => total.div_ceil(2),
         DTYPE_INT8 => total,
-        _ => { eprintln!("nsl: unknown quantization dtype {}", dtype); std::process::abort(); }
+        _ => {
+            eprintln!("nsl: unknown quantization dtype {}", dtype);
+            std::process::abort();
+        }
     };
 
     // MUST use zeroed alloc — int4_pack uses |= which blends with existing bits
@@ -144,35 +157,50 @@ fn alloc_qtensor(
 
 #[no_mangle]
 pub extern "C" fn nsl_qtensor_free(ptr: i64) {
-    if ptr == 0 { return; }
+    if ptr == 0 {
+        return;
+    }
     let qt = QuantizedTensor::from_ptr(ptr);
     let total = total_elements(qt.shape, qt.ndim) as usize;
 
     let data_bytes = match qt.dtype {
         DTYPE_INT4 => total.div_ceil(2),
         DTYPE_INT8 => total,
-        _ => { eprintln!("nsl: unknown quantization dtype {}", qt.dtype); std::process::abort(); }
+        _ => {
+            eprintln!("nsl: unknown quantization dtype {}", qt.dtype);
+            std::process::abort();
+        }
     };
 
     unsafe {
         checked_free(qt.data, data_bytes);
-        checked_free(qt.scale as *mut u8, (qt.num_scales as usize) * std::mem::size_of::<f32>());
+        checked_free(
+            qt.scale as *mut u8,
+            (qt.num_scales as usize) * std::mem::size_of::<f32>(),
+        );
         checked_free(qt.zero_point, qt.num_scales as usize);
-        checked_free(qt.shape as *mut u8, (qt.ndim as usize) * std::mem::size_of::<i64>());
+        checked_free(
+            qt.shape as *mut u8,
+            (qt.ndim as usize) * std::mem::size_of::<i64>(),
+        );
         drop(Box::from_raw(qt as *mut QuantizedTensor));
     }
 }
 
 #[no_mangle]
 pub extern "C" fn nsl_qtensor_addref(ptr: i64) {
-    if ptr == 0 { return; }
+    if ptr == 0 {
+        return;
+    }
     let qt = QuantizedTensor::from_ptr(ptr);
     qt.refcount.fetch_add(1, Ordering::SeqCst);
 }
 
 #[no_mangle]
 pub extern "C" fn nsl_qtensor_release(ptr: i64) {
-    if ptr == 0 { return; }
+    if ptr == 0 {
+        return;
+    }
     let qt = QuantizedTensor::from_ptr(ptr);
     let prev = qt.refcount.fetch_sub(1, Ordering::SeqCst);
     if prev <= 1 {
@@ -229,8 +257,12 @@ fn compute_scale_zp(values: &[f64], qmin: f64, qmax: f64) -> (f32, u8) {
     let mut min_val = f64::INFINITY;
     let mut max_val = f64::NEG_INFINITY;
     for &v in values {
-        if v < min_val { min_val = v; }
-        if v > max_val { max_val = v; }
+        if v < min_val {
+            min_val = v;
+        }
+        if v > max_val {
+            max_val = v;
+        }
     }
 
     // Handle zero-variance case: all values identical or nearly so
@@ -291,17 +323,29 @@ pub extern "C" fn nsl_qtensor_quantize(
     let ndim = tensor.ndim;
     let total = tensor.len as usize;
 
-    let qt = alloc_qtensor(tensor.shape, ndim, dtype, granularity, gran_axis, group_size);
+    let qt = alloc_qtensor(
+        tensor.shape,
+        ndim,
+        dtype,
+        granularity,
+        gran_axis,
+        group_size,
+    );
     let qt_ref = unsafe { &mut *qt };
 
     let (qmin, qmax) = match dtype {
         DTYPE_INT4 => (0.0_f64, 15.0_f64),
         DTYPE_INT8 => (0.0_f64, 255.0_f64),
-        _ => { eprintln!("nsl: unknown quantization dtype {}", dtype); std::process::abort(); }
+        _ => {
+            eprintln!("nsl: unknown quantization dtype {}", dtype);
+            std::process::abort();
+        }
     };
 
     // Read all source data into a Vec for easier slicing
-    let src: Vec<f64> = (0..total).map(|i| unsafe { *tensor.data_f64().add(i) }).collect();
+    let src: Vec<f64> = (0..total)
+        .map(|i| unsafe { *tensor.data_f64().add(i) })
+        .collect();
 
     match granularity {
         GRAN_PER_TENSOR => {
@@ -406,7 +450,7 @@ pub extern "C" fn nsl_qtensor_quantize(
                             match dtype {
                                 DTYPE_INT4 => int4_pack(qt_ref.data, idx, q),
                                 DTYPE_INT8 => unsafe { *qt_ref.data.add(idx) = q },
-                            _ => unreachable!(),
+                                _ => unreachable!(),
                             }
                             vi += 1;
                         }
@@ -507,7 +551,7 @@ pub extern "C" fn nsl_qtensor_dequantize(qtensor_ptr: i64) -> i64 {
                             let q = match qt.dtype {
                                 DTYPE_INT4 => int4_unpack(qt.data, idx),
                                 DTYPE_INT8 => unsafe { *qt.data.add(idx) },
-                            _ => unreachable!(),
+                                _ => unreachable!(),
                             };
                             unsafe { *data.add(idx) = dequantize_val(q, scale, zp) };
                         }
@@ -517,7 +561,10 @@ pub extern "C" fn nsl_qtensor_dequantize(qtensor_ptr: i64) -> i64 {
             }
         }
         _ => {
-            eprintln!("nsl: unknown quantization granularity {} in dequantize", qt.granularity);
+            eprintln!(
+                "nsl: unknown quantization granularity {} in dequantize",
+                qt.granularity
+            );
             std::process::abort();
         }
     }

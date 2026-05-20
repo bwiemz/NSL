@@ -2,9 +2,9 @@
 //!
 //! See docs/superpowers/specs/2026-04-15-m62-c-wrappers-design.md.
 
-use crate::c_header::{ExportDtype, ExportInfo, ExportTypeInfo};
 #[cfg(test)]
 use crate::c_header::ExportParamInfo;
+use crate::c_header::{ExportDtype, ExportInfo, ExportTypeInfo};
 use crate::error::CodegenError;
 use cranelift_codegen::ir::{types, AbiParam, Signature};
 use cranelift_codegen::isa::CallConv;
@@ -32,10 +32,7 @@ fn cranelift_type_for_scalar(dtype: ExportDtype) -> cranelift_codegen::ir::Type 
     }
 }
 
-pub fn build_c_abi_wrapper_signature(
-    export_info: &ExportInfo,
-    call_conv: CallConv,
-) -> Signature {
+pub fn build_c_abi_wrapper_signature(export_info: &ExportInfo, call_conv: CallConv) -> Signature {
     let mut sig = Signature::new(call_conv);
     sig.params.push(AbiParam::new(types::I64)); // NslModel*
 
@@ -123,8 +120,7 @@ pub fn emit_c_abi_wrapper(
         // ── If model method, extract weight_ptrs + num_weights and prepend ───
         let mut leading_args: Vec<cranelift_codegen::ir::Value> = Vec::new();
         if wrapper.is_model_method {
-            let w_ptrs =
-                call_model_get_weight_ptrs(&mut builder, &mut compiler.module, model_ptr)?;
+            let w_ptrs = call_model_get_weight_ptrs(&mut builder, &mut compiler.module, model_ptr)?;
             let n_weights =
                 call_model_get_num_weights(&mut builder, &mut compiler.module, model_ptr)?;
             leading_args.push(w_ptrs);
@@ -139,8 +135,7 @@ pub fn emit_c_abi_wrapper(
             let arg_val = params[1 + i];
             match &param.ty {
                 ExportTypeInfo::Tensor { .. } => {
-                    let tensor =
-                        call_desc_to_tensor(&mut builder, &mut compiler.module, arg_val)?;
+                    let tensor = call_desc_to_tensor(&mut builder, &mut compiler.module, arg_val)?;
                     internal_args.push(tensor);
                     tensor_inputs_to_free.push(tensor);
                 }
@@ -238,7 +233,12 @@ fn call_desc_to_tensor<M: Module + ?Sized>(
     module: &mut M,
     desc_ptr: cranelift_codegen::ir::Value,
 ) -> Result<cranelift_codegen::ir::Value, CodegenError> {
-    let fid = declare_runtime_fn(module, "nsl_desc_to_tensor", &[cw_types::I64], &[cw_types::I64])?;
+    let fid = declare_runtime_fn(
+        module,
+        "nsl_desc_to_tensor",
+        &[cw_types::I64],
+        &[cw_types::I64],
+    )?;
     let fref = module.declare_func_in_func(fid, builder.func);
     let call = builder.ins().call(fref, &[desc_ptr]);
     Ok(builder.inst_results(call)[0])
@@ -251,7 +251,12 @@ fn call_tensor_to_desc_ffi<M: Module + ?Sized>(
     tensor: cranelift_codegen::ir::Value,
     desc_ptr: cranelift_codegen::ir::Value,
 ) -> Result<(), CodegenError> {
-    let fid = declare_runtime_fn(module, "nsl_tensor_to_desc_ffi", &[cw_types::I64, cw_types::I64], &[])?;
+    let fid = declare_runtime_fn(
+        module,
+        "nsl_tensor_to_desc_ffi",
+        &[cw_types::I64, cw_types::I64],
+        &[],
+    )?;
     let fref = module.declare_func_in_func(fid, builder.func);
     builder.ins().call(fref, &[tensor, desc_ptr]);
     Ok(())

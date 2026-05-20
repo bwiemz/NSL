@@ -111,9 +111,7 @@ fn main() {
         (Some(d), _) => d,
         (None, Some(d)) => d.clone(),
         (None, None) => {
-            eprintln!(
-                "usage: cpdt_fixture_generate [--include-medium] [--output-dir DIR | DIR]"
-            );
+            eprintln!("usage: cpdt_fixture_generate [--include-medium] [--output-dir DIR | DIR]");
             std::process::exit(1);
         }
     };
@@ -248,9 +246,12 @@ fn write_fixture(out_dir: &Path, name: &str, shape: TransformerShape, dtype: DTy
     let views: HashMap<String, TensorView<'_>> = tensors
         .iter()
         .map(|(k, payload)| {
-            let view =
-                TensorView::new(payload.dtype, payload.shape.clone(), payload.bytes.as_slice())
-                    .unwrap();
+            let view = TensorView::new(
+                payload.dtype,
+                payload.shape.clone(),
+                payload.bytes.as_slice(),
+            )
+            .unwrap();
             (k.clone(), view)
         })
         .collect();
@@ -260,7 +261,12 @@ fn write_fixture(out_dir: &Path, name: &str, shape: TransformerShape, dtype: DTy
     eprintln!("wrote {} ({} bytes)", path.display(), bytes.len());
 }
 
-fn kaiming_normal_tensor(rng: &mut StdRng, shape: &[usize], dtype: DType, fan_in: usize) -> Vec<u8> {
+fn kaiming_normal_tensor(
+    rng: &mut StdRng,
+    shape: &[usize],
+    dtype: DType,
+    fan_in: usize,
+) -> Vec<u8> {
     let numel: usize = shape.iter().product();
     let stddev = (2.0_f64 / fan_in as f64).sqrt();
     let mut f32_vals = Vec::with_capacity(numel);

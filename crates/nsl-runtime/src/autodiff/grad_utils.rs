@@ -3,12 +3,8 @@ use std::ffi::c_void;
 
 use crate::memory::checked_alloc;
 use crate::tensor::{
-    nsl_tensor_add as tensor_add,
-    nsl_tensor_clone as tensor_clone,
-    nsl_tensor_free as tensor_free,
-    nsl_tensor_ones_like as nsl_tensor_ones_like,
-    nsl_tensor_sum_dim,
-    NslTensor,
+    nsl_tensor_add as tensor_add, nsl_tensor_clone as tensor_clone, nsl_tensor_free as tensor_free,
+    nsl_tensor_ones_like, nsl_tensor_sum_dim, NslTensor,
 };
 
 use super::TAPE;
@@ -57,7 +53,11 @@ pub(crate) fn create_tensor_with_shape_dtype(shape: &[i64], fill: f64, dtype: u1
     }
     let strides = NslTensor::compute_strides(shape_ptr, ndim);
 
-    let elem_size = if dtype == 1 { std::mem::size_of::<f32>() } else { std::mem::size_of::<f64>() };
+    let elem_size = if dtype == 1 {
+        std::mem::size_of::<f32>()
+    } else {
+        std::mem::size_of::<f64>()
+    };
     let data_size = (total as usize) * elem_size;
     let data_raw: *mut c_void = if fill == 0.0 {
         checked_alloc_zeroed(data_size) as *mut c_void
@@ -76,22 +76,19 @@ pub(crate) fn create_tensor_with_shape_dtype(shape: &[i64], fill: f64, dtype: u1
     };
 
     let tensor = Box::new(NslTensor::new(
-        data_raw,
-        shape_ptr,
-        strides,
-        ndim,
-        total,
-        0,
-        dtype,
-        1,
-        0,
+        data_raw, shape_ptr, strides, ndim, total, 0, dtype, 1, 0,
     ));
     Box::into_raw(tensor) as i64
 }
 
 /// Like `create_tensor_with_shape_dtype` but allocates data in device memory when device > 0.
 /// Uses memcpy_htod for initialization since device memory is not CPU-accessible.
-pub(crate) fn create_tensor_with_shape_dtype_device(shape: &[i64], fill: f64, dtype: u16, device: u8) -> i64 {
+pub(crate) fn create_tensor_with_shape_dtype_device(
+    shape: &[i64],
+    fill: f64,
+    dtype: u16,
+    device: u8,
+) -> i64 {
     use crate::memory::checked_alloc_zeroed;
 
     if device == 0 {
@@ -110,7 +107,11 @@ pub(crate) fn create_tensor_with_shape_dtype_device(shape: &[i64], fill: f64, dt
     }
     let strides = NslTensor::compute_strides(shape_ptr, ndim);
 
-    let elem_size = if dtype == 1 { std::mem::size_of::<f32>() } else { std::mem::size_of::<f64>() };
+    let elem_size = if dtype == 1 {
+        std::mem::size_of::<f32>()
+    } else {
+        std::mem::size_of::<f64>()
+    };
     let data_size = (total as usize) * elem_size;
 
     let data_raw: *mut c_void = {
@@ -135,7 +136,9 @@ pub(crate) fn create_tensor_with_shape_dtype_device(shape: &[i64], fill: f64, dt
                     }
                 }
                 crate::cuda::inner::memcpy_htod(ptr, staging as *const c_void, data_size);
-                unsafe { crate::memory::checked_free(staging, data_size); }
+                unsafe {
+                    crate::memory::checked_free(staging, data_size);
+                }
             }
             ptr
         }
@@ -160,15 +163,7 @@ pub(crate) fn create_tensor_with_shape_dtype_device(shape: &[i64], fill: f64, dt
     };
 
     let tensor = Box::new(NslTensor::new(
-        data_raw,
-        shape_ptr,
-        strides,
-        ndim,
-        total,
-        device,
-        dtype,
-        1,
-        0,
+        data_raw, shape_ptr, strides, ndim, total, device, dtype, 1, 0,
     ));
     Box::into_raw(tensor) as i64
 }
@@ -179,17 +174,25 @@ pub(crate) fn reshape_to_shape(tensor_ptr: i64, shape: &[i64]) -> i64 {
     let tensor = NslTensor::from_ptr(tensor_ptr);
     let ndim = shape.len() as i64;
     let total: i64 = shape.iter().product();
-    assert_eq!(total, tensor.len, "reshape_to_shape: size mismatch {} vs {}", total, tensor.len);
+    assert_eq!(
+        total, tensor.len,
+        "reshape_to_shape: size mismatch {} vs {}",
+        total, tensor.len
+    );
 
     let shape_ptr = crate::memory::checked_alloc(std::mem::size_of_val(shape)) as *mut i64;
     for (i, &s) in shape.iter().enumerate() {
-        unsafe { *shape_ptr.add(i) = s; }
+        unsafe {
+            *shape_ptr.add(i) = s;
+        }
     }
     let strides = NslTensor::compute_strides(shape_ptr, ndim);
 
     let data_size = (total as usize) * tensor.element_size();
     let data = crate::memory::checked_alloc(data_size);
-    unsafe { std::ptr::copy_nonoverlapping(tensor.data as *const u8, data, data_size); }
+    unsafe {
+        std::ptr::copy_nonoverlapping(tensor.data as *const u8, data, data_size);
+    }
 
     let new_tensor = Box::new(NslTensor::new(
         data as *mut std::ffi::c_void,
@@ -260,7 +263,13 @@ pub(crate) fn reduce_grad_for_broadcast(grad_ptr: i64, orig_shape: &[i64]) -> i6
         // Copy data (byte-level copy, preserves dtype)
         let elem_size = res.element_size();
         let new_data_raw = checked_alloc((total as usize) * elem_size);
-        unsafe { std::ptr::copy_nonoverlapping(res.data as *const u8, new_data_raw, (total as usize) * elem_size) };
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                res.data as *const u8,
+                new_data_raw,
+                (total as usize) * elem_size,
+            )
+        };
         let out = Box::new(NslTensor::new(
             new_data_raw as *mut c_void,
             new_shape,
@@ -334,9 +343,13 @@ pub(crate) fn broadcast_grad_along_dim(grad_ptr: i64, input_shape: &[i64], dim: 
         }
 
         if grad_dtype == 1 {
-            unsafe { *out.data_f32().add(flat_idx) = *grad.data_f32().add(grad_idx); }
+            unsafe {
+                *out.data_f32().add(flat_idx) = *grad.data_f32().add(grad_idx);
+            }
         } else {
-            unsafe { *out.data_f64().add(flat_idx) = *grad.data_f64().add(grad_idx); }
+            unsafe {
+                *out.data_f64().add(flat_idx) = *grad.data_f64().add(grad_idx);
+            }
         }
     }
 
@@ -458,7 +471,9 @@ pub(crate) fn scatter_gather_grad(
             coords[dim_usize] = idx;
             let mut flat = remaining;
             for d in (0..ndim).rev() {
-                if d == dim_usize { continue; }
+                if d == dim_usize {
+                    continue;
+                }
                 let dim_size = input_shape[d] as usize;
                 if dim_size > 0 {
                     coords[d] = flat % dim_size;

@@ -29,35 +29,49 @@ pub struct SpillRisk(pub String);
 /// shape per spec section 5.5). Zero-init is emitted after the
 /// declarations so the snapshot diff has clean structure.
 pub fn declare_registers(ptx: &mut String, config: &FlashAttentionConfig) {
-    ptx.push_str("    // === Tier B.1 accumulator + scratch register declarations (B1.6 deferral #4) ===\n");
+    ptx.push_str(
+        "    // === Tier B.1 accumulator + scratch register declarations (B1.6 deferral #4) ===\n",
+    );
 
     let tpw_q = tiles_per_warp(config);
     let tpw_kv = tiles_per_warp_kv(config);
     let tpw_qkt = tiles_per_warp_qkt(config);
     let tpw_pv = tiles_per_warp_pv(config);
 
-    ptx.push_str(&format!("    // Q projection accumulators ({} tile(s)/warp x 4 f32 lanes)\n", tpw_q));
+    ptx.push_str(&format!(
+        "    // Q projection accumulators ({} tile(s)/warp x 4 f32 lanes)\n",
+        tpw_q
+    ));
     for t in 0..tpw_q {
         for lane in 0..4 {
             ptx.push_str(&format!("    .reg .f32 %q_acc_{}_{};\n", t, lane));
         }
     }
 
-    ptx.push_str(&format!("    // K projection accumulators ({} tile(s)/warp x 4 f32 lanes)\n", tpw_kv));
+    ptx.push_str(&format!(
+        "    // K projection accumulators ({} tile(s)/warp x 4 f32 lanes)\n",
+        tpw_kv
+    ));
     for t in 0..tpw_kv {
         for lane in 0..4 {
             ptx.push_str(&format!("    .reg .f32 %k_acc_{}_{};\n", t, lane));
         }
     }
 
-    ptx.push_str(&format!("    // V projection accumulators ({} tile(s)/warp x 4 f32 lanes)\n", tpw_kv));
+    ptx.push_str(&format!(
+        "    // V projection accumulators ({} tile(s)/warp x 4 f32 lanes)\n",
+        tpw_kv
+    ));
     for t in 0..tpw_kv {
         for lane in 0..4 {
             ptx.push_str(&format!("    .reg .f32 %v_acc_{}_{};\n", t, lane));
         }
     }
 
-    ptx.push_str(&format!("    // QK^T S accumulators ({} tile(s)/warp x 4 f32 lanes)\n", tpw_qkt));
+    ptx.push_str(&format!(
+        "    // QK^T S accumulators ({} tile(s)/warp x 4 f32 lanes)\n",
+        tpw_qkt
+    ));
     for t in 0..tpw_qkt {
         for lane in 0..4 {
             ptx.push_str(&format!("    .reg .f32 %s_acc_{}_{};\n", t, lane));
@@ -71,7 +85,10 @@ pub fn declare_registers(ptx: &mut String, config: &FlashAttentionConfig) {
         }
     }
 
-    ptx.push_str(&format!("    // Softmax P-packed ({} b32 holding 2 f16 lanes each)\n", tpw_qkt));
+    ptx.push_str(&format!(
+        "    // Softmax P-packed ({} b32 holding 2 f16 lanes each)\n",
+        tpw_qkt
+    ));
     for t in 0..tpw_qkt {
         ptx.push_str(&format!("    .reg .b32 %p_packed_{};\n", t));
     }
@@ -105,7 +122,9 @@ pub fn declare_registers(ptx: &mut String, config: &FlashAttentionConfig) {
     ptx.push_str("    and.b32 %mma_a_row, %mma_laneid, 3;   // laneid % 4\n");
     ptx.push_str("    shl.b32 %mma_a_row, %mma_a_row, 1;    // * 2\n");
     ptx.push_str("    shr.u32 %mma_addr, %mma_laneid, 4;    // laneid / 16 (scratch)\n");
-    ptx.push_str("    add.u32 %mma_a_row, %mma_a_row, %mma_addr; // row = (laneid%4)*2 + laneid/16\n");
+    ptx.push_str(
+        "    add.u32 %mma_a_row, %mma_a_row, %mma_addr; // row = (laneid%4)*2 + laneid/16\n",
+    );
     ptx.push_str("    mov.u32 %mma_b_row, %mma_a_row;       // B row matches A row for k-dim\n");
 
     ptx.push_str("    // === Zero-init all f32 accumulators ===\n");
@@ -182,15 +201,16 @@ pub fn analyze(config: &FlashAttentionConfig) -> Result<u32, SpillRisk> {
     // — but register_budget is the wrong layer to enforce this; just
     // produce a conservative estimate.
     let q_resident = (bq / 16).max(1) * (hd / 8).max(1) / 8 * 4;
-    let k_inflight = 4;     // one chunk's K accumulator fragment
-    let v_inflight = 4;     // one chunk's V accumulator fragment
+    let k_inflight = 4; // one chunk's K accumulator fragment
+    let v_inflight = 4; // one chunk's V accumulator fragment
     let s_frags = (bq / 16).max(1) * (bkv / 8).max(1) / 8 * 4;
     let p_packed = 8;
     let o_acc = (bq / 16).max(1) * (hd / 8).max(1) / 8 * 4;
     let row_stats = 16;
     let addressing = 32;
 
-    let total = q_resident + k_inflight + v_inflight + s_frags + p_packed + o_acc + row_stats + addressing;
+    let total =
+        q_resident + k_inflight + v_inflight + s_frags + p_packed + o_acc + row_stats + addressing;
 
     if total + REG_HEADROOM > REG_CAP_PER_THREAD {
         return Err(SpillRisk(format!(
@@ -219,7 +239,11 @@ mod tests {
             tree_mask: false,
             gpu_sm: 120,
             segment_masked: false,
-            csha: Some(CshaExtras { level: 2, d_model: 2048, ..CshaExtras::default() }),
+            csha: Some(CshaExtras {
+                level: 2,
+                d_model: 2048,
+                ..CshaExtras::default()
+            }),
         }
     }
 
@@ -249,6 +273,10 @@ mod tests {
     fn small_config_fits_with_margin() {
         let cfg = make_config(32, 32, 32);
         let regs = analyze(&cfg).expect("small config should fit");
-        assert!(regs < 100, "small config should use way under 100 regs, got {}", regs);
+        assert!(
+            regs < 100,
+            "small config should use way under 100 regs, got {}",
+            regs
+        );
     }
 }

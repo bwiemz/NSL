@@ -1,28 +1,28 @@
 //! Tensor module — NslTensor struct, core utilities, and re-exports of all sub-modules.
 
-pub mod creation;
+pub mod activation;
+pub mod ad_ops;
 pub mod arithmetic;
+pub mod creation;
+pub mod fbip_flags;
 pub mod reduction;
 pub mod shape_ops;
-pub mod activation;
 pub mod trig;
-pub mod ad_ops;
-pub mod fbip_flags;
 
 // Re-export everything from sub-modules so the public API is unchanged.
-pub use creation::*;
+pub use activation::*;
+pub use ad_ops::*;
 pub use arithmetic::*;
+pub use creation::*;
 pub use reduction::*;
 pub use shape_ops::*;
-pub use activation::*;
 pub use trig::*;
-pub use ad_ops::*;
 
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::OnceLock;
 
 use crate::autodiff;
 use crate::list::{nsl_list_new, nsl_list_push, NslList};
@@ -123,7 +123,10 @@ pub extern "C" fn nsl_tensor_scope_end(keep: i64) {
             kept += 1;
         }
     }
-    if std::env::var("NSL_SCOPE_TRACE").map(|v| v == "1").unwrap_or(false) {
+    if std::env::var("NSL_SCOPE_TRACE")
+        .map(|v| v == "1")
+        .unwrap_or(false)
+    {
         eprintln!("[scope] tracked={total}, freed={freed}, kept={kept} (refcount>1)");
     }
 }
@@ -152,16 +155,16 @@ pub const TENSOR_FREED: u32 = 0x0000DEAD;
 
 #[repr(C)]
 pub struct NslTensor {
-    pub(crate) magic: u32,          // MUST be first — 0x4E534C54 ("NSLT") when live, 0x0000DEAD after free
-    pub(crate) data: *mut c_void,   // Opaque: CPU f64 or GPU f32
+    pub(crate) magic: u32, // MUST be first — 0x4E534C54 ("NSLT") when live, 0x0000DEAD after free
+    pub(crate) data: *mut c_void, // Opaque: CPU f64 or GPU f32
     pub(crate) shape: *mut i64,
     pub(crate) strides: *mut i64,
     pub(crate) ndim: i64,
     pub(crate) len: i64,
     pub(crate) refcount: AtomicI64,
-    pub(crate) device: u8,          // 0 = CPU, 1+ = CUDA device ID
-    pub(crate) dtype: u16,          // 0 = f64, 1 = f32; 256+ = custom user-defined dtypes
-    pub(crate) owns_data: u8,       // 1 = heap-owned (free on drop), 0 = borrowed/mmap
+    pub(crate) device: u8,    // 0 = CPU, 1+ = CUDA device ID
+    pub(crate) dtype: u16,    // 0 = f64, 1 = f32; 256+ = custom user-defined dtypes
+    pub(crate) owns_data: u8, // 1 = heap-owned (free on drop), 0 = borrowed/mmap
     /// i64 pointer to the NslTensor that owns this tensor's data buffer.
     /// 0 means this tensor owns its own data. Non-zero means this is a view.
     /// When this tensor is freed, the owner's refcount is decremented.
@@ -214,10 +217,11 @@ pub(crate) fn dtype_element_size(dtype: u16) -> usize {
         DTYPE_F64 => std::mem::size_of::<f64>(),
         DTYPE_F32 => std::mem::size_of::<f32>(),
         DTYPE_FP16 | DTYPE_BF16 | DTYPE_U16_TOKEN => std::mem::size_of::<u16>(),
-        4 => std::mem::size_of::<i32>(),  // i32 token IDs
-        id if id >= DTYPE_CUSTOM_START => {
-            get_registry().get(&id).map(|info| info.element_size).unwrap_or(1)
-        }
+        4 => std::mem::size_of::<i32>(), // i32 token IDs
+        id if id >= DTYPE_CUSTOM_START => get_registry()
+            .get(&id)
+            .map(|info| info.element_size)
+            .unwrap_or(1),
         _ => panic!("unknown dtype {}", dtype),
     }
 }
@@ -293,9 +297,9 @@ pub struct CustomDtypeInfo {
     pub id: u16,
     pub name: String,
     pub bit_width: u8,
-    pub block_size: u32,           // 0 = element-wise, >0 = block format
-    pub element_size: usize,       // bytes per packed ELEMENT (ceil(bits/8))
-    pub packed_block_size: usize,  // bytes per packed BLOCK -- 0 for element-wise
+    pub block_size: u32,          // 0 = element-wise, >0 = block format
+    pub element_size: usize,      // bytes per packed ELEMENT (ceil(bits/8))
+    pub packed_block_size: usize, // bytes per packed BLOCK -- 0 for element-wise
     pub pack_fn: Option<*const c_void>,
     pub unpack_fn: Option<*const c_void>,
 }
@@ -352,9 +356,21 @@ pub extern "C" fn nsl_register_custom_dtype(
         bit_width,
         block_size,
         element_size: (bit_width as usize).div_ceil(8),
-        packed_block_size: if block_size > 0 { packed_block_size as usize } else { 0 },
-        pack_fn: if pack_fn.is_null() { None } else { Some(pack_fn) },
-        unpack_fn: if unpack_fn.is_null() { None } else { Some(unpack_fn) },
+        packed_block_size: if block_size > 0 {
+            packed_block_size as usize
+        } else {
+            0
+        },
+        pack_fn: if pack_fn.is_null() {
+            None
+        } else {
+            Some(pack_fn)
+        },
+        unpack_fn: if unpack_fn.is_null() {
+            None
+        } else {
+            Some(unpack_fn)
+        },
     };
 
     STAGING_REGISTRY.with(|r| r.borrow_mut().insert(id, info));
@@ -437,13 +453,21 @@ impl NslTensor {
 
     #[inline]
     pub(crate) fn data_f64(&self) -> *mut f64 {
-        assert_eq!(self.dtype, 0, "data_f64() called on non-f64 tensor (dtype={})", self.dtype);
+        assert_eq!(
+            self.dtype, 0,
+            "data_f64() called on non-f64 tensor (dtype={})",
+            self.dtype
+        );
         self.data as *mut f64
     }
 
     #[inline]
     pub(crate) fn data_f32(&self) -> *mut f32 {
-        assert_eq!(self.dtype, 1, "data_f32() called on non-f32 tensor (dtype={})", self.dtype);
+        assert_eq!(
+            self.dtype, 1,
+            "data_f32() called on non-f32 tensor (dtype={})",
+            self.dtype
+        );
         self.data as *mut f32
     }
 
@@ -518,7 +542,11 @@ impl NslTensor {
     #[allow(dead_code)]
     #[inline]
     pub(crate) fn data_i32(&self) -> *mut i32 {
-        assert_eq!(self.dtype, 4, "data_i32() called on non-i32 tensor (dtype={})", self.dtype);
+        assert_eq!(
+            self.dtype, 4,
+            "data_i32() called on non-i32 tensor (dtype={})",
+            self.dtype
+        );
         self.data as *mut i32
     }
 
@@ -588,7 +616,10 @@ impl NslTensor {
             }
             1 => unsafe { *self.data_f32().add(offset) = value as f32 },
             0 => unsafe { *self.data_f64().add(offset) = value },
-            _ => panic!("write_scalar_from_f64() unsupported for dtype {}", self.dtype),
+            _ => panic!(
+                "write_scalar_from_f64() unsupported for dtype {}",
+                self.dtype
+            ),
         }
     }
 
@@ -617,8 +648,7 @@ impl NslTensor {
         if self.dtype >= DTYPE_CUSTOM_START {
             if let Some(info) = get_registry().get(&self.dtype) {
                 if info.block_size > 0 && info.packed_block_size > 0 {
-                    let num_blocks = (self.len as usize)
-                        .div_ceil(info.block_size as usize);
+                    let num_blocks = (self.len as usize).div_ceil(info.block_size as usize);
                     return num_blocks * info.packed_block_size;
                 }
             }
@@ -658,7 +688,9 @@ impl NslTensor {
             return std::ptr::null_mut();
         }
         let dst = checked_alloc(n * std::mem::size_of::<i64>()) as *mut i64;
-        unsafe { std::ptr::copy_nonoverlapping(src, dst, n); }
+        unsafe {
+            std::ptr::copy_nonoverlapping(src, dst, n);
+        }
         dst
     }
 
@@ -737,7 +769,9 @@ impl NslTensor {
         let new_data = checked_alloc(len * elem_size);
 
         let shape_vec: Vec<i64> = (0..ndim).map(|i| unsafe { *tensor.shape.add(i) }).collect();
-        let src_strides: Vec<i64> = (0..ndim).map(|i| unsafe { *tensor.strides.add(i) }).collect();
+        let src_strides: Vec<i64> = (0..ndim)
+            .map(|i| unsafe { *tensor.strides.add(i) })
+            .collect();
 
         for flat in 0..len {
             let mut remaining = flat;
@@ -912,7 +946,9 @@ pub extern "C" fn nsl_tensor_set(tensor_ptr: i64, indices_list: i64, value: f64)
 pub extern "C" fn nsl_tensor_item(tensor_ptr: i64) -> f64 {
     let tensor = NslTensor::from_ptr(tensor_ptr);
     if tensor.len != 1 {
-        let shape: Vec<i64> = (0..tensor.ndim as usize).map(|i| unsafe { *tensor.shape.add(i) }).collect();
+        let shape: Vec<i64> = (0..tensor.ndim as usize)
+            .map(|i| unsafe { *tensor.shape.add(i) })
+            .collect();
         eprintln!(
             "nsl: .item() requires a scalar tensor (got {} elements, shape={:?}, ndim={})",
             tensor.len, shape, tensor.ndim
@@ -923,7 +959,9 @@ pub extern "C" fn nsl_tensor_item(tensor_ptr: i64) -> f64 {
     if tensor.device > 0 {
         #[cfg(feature = "cuda")]
         {
-            unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+            unsafe {
+                cudarc::driver::sys::cuCtxSynchronize();
+            }
             match tensor.dtype {
                 4 => {
                     let mut val: i32 = 0;
@@ -964,7 +1002,9 @@ pub extern "C" fn nsl_tensor_item(tensor_ptr: i64) -> f64 {
             }
         }
         #[cfg(not(feature = "cuda"))]
-        { panic!("CUDA support not compiled"); }
+        {
+            panic!("CUDA support not compiled");
+        }
     }
     tensor.read_scalar_as_f64(0)
 }
@@ -995,7 +1035,14 @@ pub extern "C" fn nsl_tensor_print(tensor_ptr: i64) {
     }
 
     print!("tensor(");
-    print_tensor_recursive(tensor.data as *const u8, tensor.dtype, tensor.shape, tensor.strides, tensor.ndim, 0);
+    print_tensor_recursive(
+        tensor.data as *const u8,
+        tensor.dtype,
+        tensor.shape,
+        tensor.strides,
+        tensor.ndim,
+        0,
+    );
     println!(")");
 }
 
@@ -1022,7 +1069,9 @@ fn print_tensor_recursive(
     print!("[");
     if dim as i64 == ndim - 1 {
         for i in 0..size {
-            if i > 0 { print!(", "); }
+            if i > 0 {
+                print!(", ");
+            }
             let val = match dtype {
                 DTYPE_U16_TOKEN => unsafe { *(data as *const u16).add(i * stride) as f64 },
                 4 => unsafe { *(data as *const i32).add(i * stride) as f64 },
@@ -1041,7 +1090,9 @@ fn print_tensor_recursive(
         }
     } else {
         for i in 0..size {
-            if i > 0 { print!(", "); }
+            if i > 0 {
+                print!(", ");
+            }
             let offset_data = unsafe { data.add(i * stride * elem_size) };
             print_tensor_recursive(offset_data, dtype, shape, strides, ndim, dim + 1);
         }
@@ -1057,7 +1108,10 @@ pub extern "C" fn nsl_tensor_clone(tensor_ptr: i64) -> i64 {
         eprintln!("nsl: clone called on null tensor");
         std::process::abort();
     }
-    debug_assert!(NslTensor::from_ptr(tensor_ptr).is_valid(), "nsl_tensor_clone: invalid tensor");
+    debug_assert!(
+        NslTensor::from_ptr(tensor_ptr).is_valid(),
+        "nsl_tensor_clone: invalid tensor"
+    );
     // Note: clone always allocates to maintain memory accounting invariants.
     // (FBIP for clone is Phase 2 — requires codegen-level ownership tracking.)
     // Ensure we clone from contiguous data so non-contiguous views are handled correctly
@@ -1081,7 +1135,9 @@ pub extern "C" fn nsl_tensor_clone(tensor_ptr: i64) -> i64 {
             dst as *mut u8
         }
         #[cfg(not(feature = "cuda"))]
-        { checked_alloc(data_size) }
+        {
+            checked_alloc(data_size)
+        }
     } else {
         let dst = checked_alloc(data_size);
         unsafe { std::ptr::copy_nonoverlapping(tensor.data as *const u8, dst, data_size) };
@@ -1106,7 +1162,9 @@ pub extern "C" fn nsl_tensor_clone(tensor_ptr: i64) -> i64 {
 /// Increment refcount (used by codegen to protect multi-use variables from runtime FBIP).
 #[no_mangle]
 pub extern "C" fn nsl_tensor_retain(tensor_ptr: i64) {
-    if tensor_ptr == 0 { return; }
+    if tensor_ptr == 0 {
+        return;
+    }
     let tensor = NslTensor::from_ptr(tensor_ptr);
     tensor.refcount.fetch_add(1, Ordering::SeqCst);
 }
@@ -1114,7 +1172,9 @@ pub extern "C" fn nsl_tensor_retain(tensor_ptr: i64) {
 /// Decrement refcount without freeing (paired with nsl_tensor_retain).
 #[no_mangle]
 pub extern "C" fn nsl_tensor_release(tensor_ptr: i64) {
-    if tensor_ptr == 0 { return; }
+    if tensor_ptr == 0 {
+        return;
+    }
     let tensor = NslTensor::from_ptr(tensor_ptr);
     tensor.refcount.fetch_sub(1, Ordering::SeqCst);
 }
@@ -1124,7 +1184,18 @@ pub extern "C" fn nsl_tensor_free(tensor_ptr: i64) {
     if tensor_ptr == 0 {
         return;
     }
-    let (should_free, data_ptr, data_size, shape_ptr, strides_ptr, shape_size, device, owns_data, data_owner, slab_managed) = {
+    let (
+        should_free,
+        data_ptr,
+        data_size,
+        shape_ptr,
+        strides_ptr,
+        shape_size,
+        device,
+        owns_data,
+        data_owner,
+        slab_managed,
+    ) = {
         let tensor = NslTensor::from_ptr(tensor_ptr);
         let prev = tensor.refcount.fetch_sub(1, Ordering::SeqCst);
         if prev > 1 {
@@ -1217,9 +1288,15 @@ pub extern "C" fn nsl_tensor_free(tensor_ptr: i64) {
 /// Used for Type::Unknown variables where we can't be sure the i64 is a tensor pointer.
 #[no_mangle]
 pub extern "C" fn nsl_tensor_free_if_valid(ptr: i64) {
-    if ptr == 0 { return; }
-    if (ptr as u64) < 0x10000 { return; }
-    if !(ptr as usize).is_multiple_of(8) { return; }
+    if ptr == 0 {
+        return;
+    }
+    if (ptr as u64) < 0x10000 {
+        return;
+    }
+    if !(ptr as usize).is_multiple_of(8) {
+        return;
+    }
     let magic = unsafe { *(ptr as *const u32) };
     if magic == TENSOR_MAGIC {
         nsl_tensor_free(ptr);
@@ -1287,13 +1364,19 @@ pub extern "C" fn nsl_tensor_data_ptr(tensor_ptr: i64) -> i64 {
 #[no_mangle]
 pub extern "C" fn nsl_tensor_copy_data(dst_ptr: i64, src_ptr: i64) {
     if dst_ptr == 0 || src_ptr == 0 {
-        eprintln!("nsl: copy_data called with null ptr (dst={}, src={})", dst_ptr, src_ptr);
+        eprintln!(
+            "nsl: copy_data called with null ptr (dst={}, src={})",
+            dst_ptr, src_ptr
+        );
         return;
     }
     let dst = NslTensor::from_ptr(dst_ptr);
     let src = NslTensor::from_ptr(src_ptr);
     if dst.data.is_null() || src.data.is_null() {
-        eprintln!("nsl: copy_data null data pointer (dst.data={:?}, src.data={:?})", dst.data, src.data);
+        eprintln!(
+            "nsl: copy_data null data pointer (dst.data={:?}, src.data={:?})",
+            dst.data, src.data
+        );
         return;
     }
     debug_assert!(dst.is_contiguous(), "copy_data requires contiguous dst");
@@ -1356,17 +1439,23 @@ pub extern "C" fn nsl_tensor_add_inplace(dst_ptr: i64, src_ptr: i64) {
         let dst_cpu = nsl_tensor_to_device(dst_ptr, 0);
         let src_cpu = if src.device > 0 {
             nsl_tensor_to_device(src_ptr, 0)
-        } else { src_ptr };
+        } else {
+            src_ptr
+        };
         // CPU add
         let dc = NslTensor::from_ptr(dst_cpu);
         let sc = NslTensor::from_ptr(src_cpu);
         if dc.dtype == 1 {
             for i in 0..dc.len as usize {
-                unsafe { *dc.data_f32().add(i) += *sc.data_f32().add(i); }
+                unsafe {
+                    *dc.data_f32().add(i) += *sc.data_f32().add(i);
+                }
             }
         } else {
             for i in 0..dc.len as usize {
-                unsafe { *dc.data_f64().add(i) += *sc.data_f64().add(i); }
+                unsafe {
+                    *dc.data_f64().add(i) += *sc.data_f64().add(i);
+                }
             }
         }
         // Copy result back to GPU. The GPU buffer is f32 (canonical GPU dtype).
@@ -1384,26 +1473,36 @@ pub extern "C" fn nsl_tensor_add_inplace(dst_ptr: i64, src_ptr: i64) {
             let staging = checked_alloc(f32_bytes) as *mut f32;
             let src = dc.data as *const f64;
             for i in 0..len {
-                unsafe { *staging.add(i) = *src.add(i) as f32; }
+                unsafe {
+                    *staging.add(i) = *src.add(i) as f32;
+                }
             }
             crate::cuda::inner::memcpy_htod(
                 dst.data,
                 staging as *const std::ffi::c_void,
                 f32_bytes,
             );
-            unsafe { checked_free(staging as *mut u8, f32_bytes); }
+            unsafe {
+                checked_free(staging as *mut u8, f32_bytes);
+            }
         }
         nsl_tensor_free(dst_cpu);
-        if src_cpu != src_ptr { nsl_tensor_free(src_cpu); }
+        if src_cpu != src_ptr {
+            nsl_tensor_free(src_cpu);
+        }
         return;
     }
     if dst.dtype == 1 {
         for i in 0..dst.len as usize {
-            unsafe { *dst.data_f32().add(i) += *src.data_f32().add(i); }
+            unsafe {
+                *dst.data_f32().add(i) += *src.data_f32().add(i);
+            }
         }
     } else {
         for i in 0..dst.len as usize {
-            unsafe { *dst.data_f64().add(i) += *src.data_f64().add(i); }
+            unsafe {
+                *dst.data_f64().add(i) += *src.data_f64().add(i);
+            }
         }
     }
 }
@@ -1606,7 +1705,9 @@ pub extern "C" fn nsl_tensor_ones_like(tensor_ptr: i64) -> i64 {
     if t.device == 0 {
         let shape_list = nsl_list_new();
         for i in 0..t.ndim as usize {
-            unsafe { nsl_list_push(shape_list, *t.shape.add(i)); }
+            unsafe {
+                nsl_list_push(shape_list, *t.shape.add(i));
+            }
         }
         let result = nsl_tensor_ones(shape_list);
         crate::list::nsl_list_free(shape_list);
@@ -1616,7 +1717,9 @@ pub extern "C" fn nsl_tensor_ones_like(tensor_ptr: i64) -> i64 {
     {
         let shape_list = nsl_list_new();
         for i in 0..t.ndim as usize {
-            unsafe { nsl_list_push(shape_list, *t.shape.add(i)); }
+            unsafe {
+                nsl_list_push(shape_list, *t.shape.add(i));
+            }
         }
         let result = nsl_tensor_zeros_on(shape_list, t.device as i64);
         crate::list::nsl_list_free(shape_list);
@@ -1626,7 +1729,9 @@ pub extern "C" fn nsl_tensor_ones_like(tensor_ptr: i64) -> i64 {
         // Fill via CPU staging buffer then memcpy to device (can't write device ptr from CPU)
         let staging = crate::memory::checked_alloc(byte_size) as *mut f32;
         for i in 0..len {
-            unsafe { *staging.add(i) = 1.0f32; }
+            unsafe {
+                *staging.add(i) = 1.0f32;
+            }
         }
         if byte_size == 12_582_912 {
             eprintln!(
@@ -1642,7 +1747,9 @@ pub extern "C" fn nsl_tensor_ones_like(tensor_ptr: i64) -> i64 {
             staging as *const std::ffi::c_void,
             byte_size,
         );
-        unsafe { crate::memory::checked_free(staging as *mut u8, byte_size); }
+        unsafe {
+            crate::memory::checked_free(staging as *mut u8, byte_size);
+        }
         result
     }
     #[cfg(not(feature = "cuda"))]
@@ -1719,7 +1826,9 @@ pub extern "C" fn nsl_clip_grad_norm(grad_list_ptr: i64, max_norm: f64) {
 
     let mut sum_sq: f64 = 0.0;
     for &(ptr, _) in &cpu_grads {
-        if ptr == 0 { continue; }
+        if ptr == 0 {
+            continue;
+        }
         let tensor = NslTensor::from_ptr(ptr);
         if tensor.dtype == 1 {
             for i in 0..tensor.len as usize {
@@ -1738,7 +1847,9 @@ pub extern "C" fn nsl_clip_grad_norm(grad_list_ptr: i64, max_norm: f64) {
     if norm <= max_norm {
         // Free temporary CPU copies
         for &(ptr, was_gpu) in &cpu_grads {
-            if was_gpu && ptr != 0 { nsl_tensor_free(ptr); }
+            if was_gpu && ptr != 0 {
+                nsl_tensor_free(ptr);
+            }
         }
         return;
     }
@@ -1748,7 +1859,9 @@ pub extern "C" fn nsl_clip_grad_norm(grad_list_ptr: i64, max_norm: f64) {
     // Scale the original tensors (GPU or CPU)
     for (g, &(cpu_ptr, was_gpu)) in cpu_grads.iter().enumerate() {
         let tensor_ptr = unsafe { *list.data.add(g) };
-        if tensor_ptr == 0 || cpu_ptr == 0 { continue; }
+        if tensor_ptr == 0 || cpu_ptr == 0 {
+            continue;
+        }
         let tensor = NslTensor::from_ptr(tensor_ptr);
         if was_gpu {
             // Scale the CPU copy, then copy back to GPU
@@ -1756,11 +1869,15 @@ pub extern "C" fn nsl_clip_grad_norm(grad_list_ptr: i64, max_norm: f64) {
             if cpu_t.dtype == 1 {
                 let s = scale as f32;
                 for i in 0..cpu_t.len as usize {
-                    unsafe { *cpu_t.data_f32().add(i) *= s; }
+                    unsafe {
+                        *cpu_t.data_f32().add(i) *= s;
+                    }
                 }
             } else {
                 for i in 0..cpu_t.len as usize {
-                    unsafe { *cpu_t.data_f64().add(i) *= scale; }
+                    unsafe {
+                        *cpu_t.data_f64().add(i) *= scale;
+                    }
                 }
             }
             // Convert the scaled CPU copy back through the standard device transfer path
@@ -1771,18 +1888,24 @@ pub extern "C" fn nsl_clip_grad_norm(grad_list_ptr: i64, max_norm: f64) {
         } else if tensor.dtype == 1 {
             let scale_f32 = scale as f32;
             for i in 0..tensor.len as usize {
-                unsafe { *tensor.data_f32().add(i) *= scale_f32; }
+                unsafe {
+                    *tensor.data_f32().add(i) *= scale_f32;
+                }
             }
         } else {
             for i in 0..tensor.len as usize {
-                unsafe { *tensor.data_f64().add(i) *= scale; }
+                unsafe {
+                    *tensor.data_f64().add(i) *= scale;
+                }
             }
         }
     }
 
     // Free temporary CPU copies
     for &(ptr, was_gpu) in &cpu_grads {
-        if was_gpu && ptr != 0 { nsl_tensor_free(ptr); }
+        if was_gpu && ptr != 0 {
+            nsl_tensor_free(ptr);
+        }
     }
 }
 
@@ -1794,11 +1917,17 @@ pub extern "C" fn nsl_tensor_embedding_lookup(weight_ptr: i64, indices_ptr: i64)
     let indices = NslTensor::from_ptr(indices_ptr);
 
     if weight.ndim != 2 {
-        eprintln!("nsl: embedding_lookup requires 2D weight tensor (got {}D)", weight.ndim);
+        eprintln!(
+            "nsl: embedding_lookup requires 2D weight tensor (got {}D)",
+            weight.ndim
+        );
         std::process::abort();
     }
     if indices.ndim != 1 {
-        eprintln!("nsl: embedding_lookup requires 1D indices tensor (got {}D)", indices.ndim);
+        eprintln!(
+            "nsl: embedding_lookup requires 1D indices tensor (got {}D)",
+            indices.ndim
+        );
         std::process::abort();
     }
 
@@ -1809,7 +1938,9 @@ pub extern "C" fn nsl_tensor_embedding_lookup(weight_ptr: i64, indices_ptr: i64)
             return crate::cuda::gpu_embedding_lookup(weight_ptr, indices_ptr);
         }
         #[cfg(not(feature = "cuda"))]
-        { panic!("CUDA support not compiled"); }
+        {
+            panic!("CUDA support not compiled");
+        }
     }
 
     let vocab_size = unsafe { *weight.shape.add(0) } as usize;
@@ -1825,7 +1956,11 @@ pub extern "C" fn nsl_tensor_embedding_lookup(weight_ptr: i64, indices_ptr: i64)
     }
     let out_strides = NslTensor::compute_strides(out_shape, out_ndim);
     let out_dtype = weight.dtype;
-    let elem_size = if out_dtype == 1 { std::mem::size_of::<f32>() } else { std::mem::size_of::<f64>() };
+    let elem_size = if out_dtype == 1 {
+        std::mem::size_of::<f32>()
+    } else {
+        std::mem::size_of::<f64>()
+    };
     let out_data_raw = checked_alloc((out_len as usize) * elem_size);
 
     for i in 0..seq_len {
@@ -1857,7 +1992,7 @@ pub extern "C" fn nsl_tensor_embedding_lookup(weight_ptr: i64, indices_ptr: i64)
         out_strides,
         out_ndim,
         out_len,
-        0,  // CPU — data is in CPU heap, not CUDA unified memory
+        0, // CPU — data is in CPU heap, not CUDA unified memory
         out_dtype,
         1,
         0,
@@ -1865,8 +2000,12 @@ pub extern "C" fn nsl_tensor_embedding_lookup(weight_ptr: i64, indices_ptr: i64)
     let out_ptr = NslTensor::publish(out);
 
     if autodiff::is_recording() {
-        NslTensor::from_ptr(weight_ptr).refcount.fetch_add(1, Ordering::SeqCst);
-        NslTensor::from_ptr(indices_ptr).refcount.fetch_add(1, Ordering::SeqCst);
+        NslTensor::from_ptr(weight_ptr)
+            .refcount
+            .fetch_add(1, Ordering::SeqCst);
+        NslTensor::from_ptr(indices_ptr)
+            .refcount
+            .fetch_add(1, Ordering::SeqCst);
         autodiff::maybe_record(autodiff::TapeOp::EmbeddingLookup {
             weight: weight_ptr,
             indices: indices_ptr,
@@ -1883,7 +2022,10 @@ pub extern "C" fn nsl_tensor_embedding_lookup(weight_ptr: i64, indices_ptr: i64)
 
 #[no_mangle]
 pub extern "C" fn nsl_tensor_layernorm(
-    input_ptr: i64, weight_ptr: i64, bias_ptr: i64, eps: f64,
+    input_ptr: i64,
+    weight_ptr: i64,
+    bias_ptr: i64,
+    eps: f64,
 ) -> i64 {
     // GPU path: native fused LayerNorm kernel.
     {
@@ -1902,8 +2044,12 @@ pub extern "C" fn nsl_tensor_layernorm(
                 nsl_tensor_free(g_gpu);
                 nsl_tensor_free(b_gpu);
                 if autodiff::is_recording() {
-                    NslTensor::from_ptr(input_ptr).refcount.fetch_add(1, Ordering::SeqCst);
-                    NslTensor::from_ptr(weight_ptr).refcount.fetch_add(1, Ordering::SeqCst);
+                    NslTensor::from_ptr(input_ptr)
+                        .refcount
+                        .fetch_add(1, Ordering::SeqCst);
+                    NslTensor::from_ptr(weight_ptr)
+                        .refcount
+                        .fetch_add(1, Ordering::SeqCst);
                     // For backward, we need mean/inv_std which are computed on CPU fallback.
                     // Record the tape op with the original pointers; backward will use CPU redirect.
                     let input = NslTensor::from_ptr(input_ptr);
@@ -1913,27 +2059,39 @@ pub extern "C" fn nsl_tensor_layernorm(
                     // Compute mean/inv_std on CPU for the backward pass
                     let cpu_input = nsl_tensor_to_device(input_ptr, 0);
                     let ci = NslTensor::from_ptr(cpu_input);
-                    let mean_shape = crate::memory::checked_alloc(std::mem::size_of::<i64>()) as *mut i64;
+                    let mean_shape =
+                        crate::memory::checked_alloc(std::mem::size_of::<i64>()) as *mut i64;
                     unsafe { *mean_shape = num_rows as i64 };
                     let mean_strides = NslTensor::compute_strides(mean_shape, 1);
-                    let mean_data = crate::memory::checked_alloc(num_rows * std::mem::size_of::<f64>()) as *mut f64;
-                    let inv_std_shape = crate::memory::checked_alloc(std::mem::size_of::<i64>()) as *mut i64;
+                    let mean_data =
+                        crate::memory::checked_alloc(num_rows * std::mem::size_of::<f64>())
+                            as *mut f64;
+                    let inv_std_shape =
+                        crate::memory::checked_alloc(std::mem::size_of::<i64>()) as *mut i64;
                     unsafe { *inv_std_shape = num_rows as i64 };
                     let inv_std_strides = NslTensor::compute_strides(inv_std_shape, 1);
-                    let inv_std_data = crate::memory::checked_alloc(num_rows * std::mem::size_of::<f64>()) as *mut f64;
+                    let inv_std_data =
+                        crate::memory::checked_alloc(num_rows * std::mem::size_of::<f64>())
+                            as *mut f64;
                     for row in 0..num_rows {
                         let base = row * n;
                         let mut sum = 0.0_f64;
                         for j in 0..n {
-                            let x = if ci.dtype == 1 { unsafe { *ci.data_f32().add(base + j) as f64 } }
-                                    else { unsafe { *ci.data_f64().add(base + j) } };
+                            let x = if ci.dtype == 1 {
+                                unsafe { *ci.data_f32().add(base + j) as f64 }
+                            } else {
+                                unsafe { *ci.data_f64().add(base + j) }
+                            };
                             sum += x;
                         }
                         let mean_val = sum / n as f64;
                         let mut var = 0.0_f64;
                         for j in 0..n {
-                            let x = if ci.dtype == 1 { unsafe { *ci.data_f32().add(base + j) as f64 } }
-                                    else { unsafe { *ci.data_f64().add(base + j) } };
+                            let x = if ci.dtype == 1 {
+                                unsafe { *ci.data_f32().add(base + j) as f64 }
+                            } else {
+                                unsafe { *ci.data_f64().add(base + j) }
+                            };
                             let diff = x - mean_val;
                             var += diff * diff;
                         }
@@ -1945,28 +2103,56 @@ pub extern "C" fn nsl_tensor_layernorm(
                     }
                     nsl_tensor_free(cpu_input);
                     let mean_tensor = Box::new(NslTensor::new(
-                        mean_data as *mut c_void, mean_shape, mean_strides, 1, num_rows as i64, 0, 0, 1, 0,
+                        mean_data as *mut c_void,
+                        mean_shape,
+                        mean_strides,
+                        1,
+                        num_rows as i64,
+                        0,
+                        0,
+                        1,
+                        0,
                     ));
                     let mean_ptr = NslTensor::publish(mean_tensor);
                     let inv_std_tensor = Box::new(NslTensor::new(
-                        inv_std_data as *mut c_void, inv_std_shape, inv_std_strides, 1, num_rows as i64, 0, 0, 1, 0,
+                        inv_std_data as *mut c_void,
+                        inv_std_shape,
+                        inv_std_strides,
+                        1,
+                        num_rows as i64,
+                        0,
+                        0,
+                        1,
+                        0,
                     ));
                     let inv_std_ptr = NslTensor::publish(inv_std_tensor);
                     autodiff::maybe_record(autodiff::TapeOp::LayerNorm {
-                        input: input_ptr, weight: weight_ptr, bias: bias_ptr, out: result,
-                        saved_input: input_ptr, saved_mean: mean_ptr, saved_inv_std: inv_std_ptr, saved_weight: weight_ptr,
+                        input: input_ptr,
+                        weight: weight_ptr,
+                        bias: bias_ptr,
+                        out: result,
+                        saved_input: input_ptr,
+                        saved_mean: mean_ptr,
+                        saved_inv_std: inv_std_ptr,
+                        saved_weight: weight_ptr,
                     });
                 }
                 return result;
             }
             #[cfg(not(feature = "cuda"))]
-            { panic!("CUDA support not compiled"); }
+            {
+                panic!("CUDA support not compiled");
+            }
         }
     }
 
     let input_ref = NslTensor::from_ptr(input_ptr);
     let need_contig = !input_ref.is_contiguous();
-    let effective_input_ptr = if need_contig { NslTensor::make_contiguous(input_ptr) } else { input_ptr };
+    let effective_input_ptr = if need_contig {
+        NslTensor::make_contiguous(input_ptr)
+    } else {
+        input_ptr
+    };
 
     let input = NslTensor::from_ptr(effective_input_ptr);
     let weight = NslTensor::from_ptr(weight_ptr);
@@ -1991,22 +2177,32 @@ pub extern "C" fn nsl_tensor_layernorm(
     let inv_std_strides = NslTensor::compute_strides(inv_std_shape, 1);
     let inv_std_data = checked_alloc(num_rows * std::mem::size_of::<f64>()) as *mut f64;
 
-    let elem_size = if in_dtype == 1 { std::mem::size_of::<f32>() } else { std::mem::size_of::<f64>() };
+    let elem_size = if in_dtype == 1 {
+        std::mem::size_of::<f32>()
+    } else {
+        std::mem::size_of::<f64>()
+    };
     let out_data_raw = checked_alloc(total * elem_size);
 
     for row in 0..num_rows {
         let base = row * n;
         let mut sum = 0.0_f64;
         for j in 0..n {
-            let x = if in_dtype == 1 { unsafe { *input.data_f32().add(base + j) as f64 } }
-                    else { unsafe { *input.data_f64().add(base + j) } };
+            let x = if in_dtype == 1 {
+                unsafe { *input.data_f32().add(base + j) as f64 }
+            } else {
+                unsafe { *input.data_f64().add(base + j) }
+            };
             sum += x;
         }
         let mean_val = sum / n as f64;
         let mut var = 0.0_f64;
         for j in 0..n {
-            let x = if in_dtype == 1 { unsafe { *input.data_f32().add(base + j) as f64 } }
-                    else { unsafe { *input.data_f64().add(base + j) } };
+            let x = if in_dtype == 1 {
+                unsafe { *input.data_f32().add(base + j) as f64 }
+            } else {
+                unsafe { *input.data_f64().add(base + j) }
+            };
             let diff = x - mean_val;
             var += diff * diff;
         }
@@ -2017,13 +2213,22 @@ pub extern "C" fn nsl_tensor_layernorm(
             *inv_std_data.add(row) = inv_std_val;
         }
         for j in 0..n {
-            let x = if in_dtype == 1 { unsafe { *input.data_f32().add(base + j) as f64 } }
-                    else { unsafe { *input.data_f64().add(base + j) } };
+            let x = if in_dtype == 1 {
+                unsafe { *input.data_f32().add(base + j) as f64 }
+            } else {
+                unsafe { *input.data_f64().add(base + j) }
+            };
             let normalized = (x - mean_val) * inv_std_val;
-            let w = if weight.dtype == 1 { unsafe { *weight.data_f32().add(j) as f64 } }
-                    else { unsafe { *weight.data_f64().add(j) } };
-            let b = if bias.dtype == 1 { unsafe { *bias.data_f32().add(j) as f64 } }
-                    else { unsafe { *bias.data_f64().add(j) } };
+            let w = if weight.dtype == 1 {
+                unsafe { *weight.data_f32().add(j) as f64 }
+            } else {
+                unsafe { *weight.data_f64().add(j) }
+            };
+            let b = if bias.dtype == 1 {
+                unsafe { *bias.data_f32().add(j) as f64 }
+            } else {
+                unsafe { *bias.data_f64().add(j) }
+            };
             let result_val = normalized * w + b;
             if in_dtype == 1 {
                 unsafe { *(out_data_raw as *mut f32).add(base + j) = result_val as f32 };
@@ -2040,7 +2245,7 @@ pub extern "C" fn nsl_tensor_layernorm(
         out_strides,
         ndim as i64,
         total as i64,
-        0,  // CPU — data is in CPU heap, not CUDA memory
+        0, // CPU — data is in CPU heap, not CUDA memory
         in_dtype,
         1,
         0,
@@ -2074,18 +2279,30 @@ pub extern "C" fn nsl_tensor_layernorm(
     let inv_std_ptr = NslTensor::publish(inv_std_tensor);
 
     if autodiff::is_recording() {
-        NslTensor::from_ptr(input_ptr).refcount.fetch_add(1, Ordering::SeqCst);
-        NslTensor::from_ptr(weight_ptr).refcount.fetch_add(1, Ordering::SeqCst);
+        NslTensor::from_ptr(input_ptr)
+            .refcount
+            .fetch_add(1, Ordering::SeqCst);
+        NslTensor::from_ptr(weight_ptr)
+            .refcount
+            .fetch_add(1, Ordering::SeqCst);
         autodiff::maybe_record(autodiff::TapeOp::LayerNorm {
-            input: input_ptr, weight: weight_ptr, bias: bias_ptr, out: out_ptr,
-            saved_input: input_ptr, saved_mean: mean_ptr, saved_inv_std: inv_std_ptr, saved_weight: weight_ptr,
+            input: input_ptr,
+            weight: weight_ptr,
+            bias: bias_ptr,
+            out: out_ptr,
+            saved_input: input_ptr,
+            saved_mean: mean_ptr,
+            saved_inv_std: inv_std_ptr,
+            saved_weight: weight_ptr,
         });
     } else {
         nsl_tensor_free(mean_ptr);
         nsl_tensor_free(inv_std_ptr);
     }
 
-    if need_contig { nsl_tensor_free(effective_input_ptr); }
+    if need_contig {
+        nsl_tensor_free(effective_input_ptr);
+    }
     out_ptr
 }
 
@@ -2104,8 +2321,12 @@ pub extern "C" fn nsl_tensor_rmsnorm(input_ptr: i64, weight_ptr: i64, eps: f64) 
                 nsl_tensor_free(c_input);
                 nsl_tensor_free(g_gpu);
                 if autodiff::is_recording() {
-                    NslTensor::from_ptr(input_ptr).refcount.fetch_add(1, Ordering::SeqCst);
-                    NslTensor::from_ptr(weight_ptr).refcount.fetch_add(1, Ordering::SeqCst);
+                    NslTensor::from_ptr(input_ptr)
+                        .refcount
+                        .fetch_add(1, Ordering::SeqCst);
+                    NslTensor::from_ptr(weight_ptr)
+                        .refcount
+                        .fetch_add(1, Ordering::SeqCst);
                     // Compute rms on CPU for backward pass
                     let input = NslTensor::from_ptr(input_ptr);
                     let ndim = input.ndim as usize;
@@ -2113,40 +2334,64 @@ pub extern "C" fn nsl_tensor_rmsnorm(input_ptr: i64, weight_ptr: i64, eps: f64) 
                     let num_rows = (input.len as usize) / n;
                     let cpu_input = nsl_tensor_to_device(input_ptr, 0);
                     let ci = NslTensor::from_ptr(cpu_input);
-                    let rms_shape = crate::memory::checked_alloc(std::mem::size_of::<i64>()) as *mut i64;
+                    let rms_shape =
+                        crate::memory::checked_alloc(std::mem::size_of::<i64>()) as *mut i64;
                     unsafe { *rms_shape = num_rows as i64 };
                     let rms_strides = NslTensor::compute_strides(rms_shape, 1);
-                    let rms_data = crate::memory::checked_alloc(num_rows * std::mem::size_of::<f64>()) as *mut f64;
+                    let rms_data =
+                        crate::memory::checked_alloc(num_rows * std::mem::size_of::<f64>())
+                            as *mut f64;
                     for row in 0..num_rows {
                         let base = row * n;
                         let mut sum_sq = 0.0_f64;
                         for j in 0..n {
-                            let x = if ci.dtype == 1 { unsafe { *ci.data_f32().add(base + j) as f64 } }
-                                    else { unsafe { *ci.data_f64().add(base + j) } };
+                            let x = if ci.dtype == 1 {
+                                unsafe { *ci.data_f32().add(base + j) as f64 }
+                            } else {
+                                unsafe { *ci.data_f64().add(base + j) }
+                            };
                             sum_sq += x * x;
                         }
                         unsafe { *rms_data.add(row) = (sum_sq / n as f64 + eps).sqrt() };
                     }
                     nsl_tensor_free(cpu_input);
                     let rms_tensor = Box::new(NslTensor::new(
-                        rms_data as *mut c_void, rms_shape, rms_strides, 1, num_rows as i64, 0, 0, 1, 0,
+                        rms_data as *mut c_void,
+                        rms_shape,
+                        rms_strides,
+                        1,
+                        num_rows as i64,
+                        0,
+                        0,
+                        1,
+                        0,
                     ));
                     let rms_ptr = NslTensor::publish(rms_tensor);
                     autodiff::maybe_record(autodiff::TapeOp::RMSNorm {
-                        input: input_ptr, weight: weight_ptr, out: result,
-                        saved_input: input_ptr, saved_rms: rms_ptr, saved_weight: weight_ptr,
+                        input: input_ptr,
+                        weight: weight_ptr,
+                        out: result,
+                        saved_input: input_ptr,
+                        saved_rms: rms_ptr,
+                        saved_weight: weight_ptr,
                     });
                 }
                 return result;
             }
             #[cfg(not(feature = "cuda"))]
-            { panic!("CUDA support not compiled"); }
+            {
+                panic!("CUDA support not compiled");
+            }
         }
     }
 
     let input_ref = NslTensor::from_ptr(input_ptr);
     let need_contig = !input_ref.is_contiguous();
-    let effective_input_ptr = if need_contig { NslTensor::make_contiguous(input_ptr) } else { input_ptr };
+    let effective_input_ptr = if need_contig {
+        NslTensor::make_contiguous(input_ptr)
+    } else {
+        input_ptr
+    };
 
     let input = NslTensor::from_ptr(effective_input_ptr);
     let weight = NslTensor::from_ptr(weight_ptr);
@@ -2159,7 +2404,11 @@ pub extern "C" fn nsl_tensor_rmsnorm(input_ptr: i64, weight_ptr: i64, eps: f64) 
     let in_dtype = input.dtype;
     let out_shape = NslTensor::copy_shape(input.shape, ndim as i64);
     let out_strides = NslTensor::compute_strides(out_shape, ndim as i64);
-    let elem_size = if in_dtype == 1 { std::mem::size_of::<f32>() } else { std::mem::size_of::<f64>() };
+    let elem_size = if in_dtype == 1 {
+        std::mem::size_of::<f32>()
+    } else {
+        std::mem::size_of::<f64>()
+    };
     let out_data_raw = checked_alloc(total * elem_size);
 
     let rms_shape = checked_alloc(std::mem::size_of::<i64>()) as *mut i64;
@@ -2171,17 +2420,26 @@ pub extern "C" fn nsl_tensor_rmsnorm(input_ptr: i64, weight_ptr: i64, eps: f64) 
         let base = row * n;
         let mut sum_sq = 0.0_f64;
         for j in 0..n {
-            let x = if in_dtype == 1 { unsafe { *input.data_f32().add(base + j) as f64 } }
-                    else { unsafe { *input.data_f64().add(base + j) } };
+            let x = if in_dtype == 1 {
+                unsafe { *input.data_f32().add(base + j) as f64 }
+            } else {
+                unsafe { *input.data_f64().add(base + j) }
+            };
             sum_sq += x * x;
         }
         let rms_val = (sum_sq / n as f64 + eps).sqrt();
         unsafe { *rms_data.add(row) = rms_val };
         for j in 0..n {
-            let x = if in_dtype == 1 { unsafe { *input.data_f32().add(base + j) as f64 } }
-                    else { unsafe { *input.data_f64().add(base + j) } };
-            let w = if weight.dtype == 1 { unsafe { *weight.data_f32().add(j) as f64 } }
-                    else { unsafe { *weight.data_f64().add(j) } };
+            let x = if in_dtype == 1 {
+                unsafe { *input.data_f32().add(base + j) as f64 }
+            } else {
+                unsafe { *input.data_f64().add(base + j) }
+            };
+            let w = if weight.dtype == 1 {
+                unsafe { *weight.data_f32().add(j) as f64 }
+            } else {
+                unsafe { *weight.data_f64().add(j) }
+            };
             let val = x / rms_val * w;
             if in_dtype == 1 {
                 unsafe { *(out_data_raw as *mut f32).add(base + j) = val as f32 };
@@ -2198,7 +2456,7 @@ pub extern "C" fn nsl_tensor_rmsnorm(input_ptr: i64, weight_ptr: i64, eps: f64) 
         out_strides,
         ndim as i64,
         total as i64,
-        0,  // CPU — data is in CPU heap, not CUDA memory
+        0, // CPU — data is in CPU heap, not CUDA memory
         in_dtype,
         1,
         0,
@@ -2219,17 +2477,27 @@ pub extern "C" fn nsl_tensor_rmsnorm(input_ptr: i64, weight_ptr: i64, eps: f64) 
     let rms_ptr = NslTensor::publish(rms_tensor);
 
     if autodiff::is_recording() {
-        NslTensor::from_ptr(input_ptr).refcount.fetch_add(1, Ordering::SeqCst);
-        NslTensor::from_ptr(weight_ptr).refcount.fetch_add(1, Ordering::SeqCst);
+        NslTensor::from_ptr(input_ptr)
+            .refcount
+            .fetch_add(1, Ordering::SeqCst);
+        NslTensor::from_ptr(weight_ptr)
+            .refcount
+            .fetch_add(1, Ordering::SeqCst);
         autodiff::maybe_record(autodiff::TapeOp::RMSNorm {
-            input: input_ptr, weight: weight_ptr, out: out_ptr,
-            saved_input: input_ptr, saved_rms: rms_ptr, saved_weight: weight_ptr,
+            input: input_ptr,
+            weight: weight_ptr,
+            out: out_ptr,
+            saved_input: input_ptr,
+            saved_rms: rms_ptr,
+            saved_weight: weight_ptr,
         });
     } else {
         nsl_tensor_free(rms_ptr);
     }
 
-    if need_contig { nsl_tensor_free(effective_input_ptr); }
+    if need_contig {
+        nsl_tensor_free(effective_input_ptr);
+    }
     out_ptr
 }
 
@@ -2254,7 +2522,9 @@ pub extern "C" fn nsl_tensor_dropout(tensor_ptr: i64, p: f64, training: i8) -> i
                 if autodiff::is_recording() {
                     // No refcount bump on a — identity-only (tape_id)
                     autodiff::maybe_record(autodiff::TapeOp::Dropout {
-                        a: tensor_ptr, out: result_ptr, saved_mask: mask_ptr,
+                        a: tensor_ptr,
+                        out: result_ptr,
+                        saved_mask: mask_ptr,
                         scale: 1.0 / (1.0 - p),
                     });
                 } else {
@@ -2263,7 +2533,9 @@ pub extern "C" fn nsl_tensor_dropout(tensor_ptr: i64, p: f64, training: i8) -> i
                 return result_ptr;
             }
             #[cfg(not(feature = "cuda"))]
-            { panic!("CUDA support not compiled"); }
+            {
+                panic!("CUDA support not compiled");
+            }
         }
     }
 
@@ -2273,7 +2545,11 @@ pub extern "C" fn nsl_tensor_dropout(tensor_ptr: i64, p: f64, training: i8) -> i
     let in_dtype = a.dtype;
     let shape = NslTensor::copy_shape(a.shape, ndim);
     let strides = NslTensor::compute_strides(shape, ndim);
-    let elem_size = if in_dtype == 1 { std::mem::size_of::<f32>() } else { std::mem::size_of::<f64>() };
+    let elem_size = if in_dtype == 1 {
+        std::mem::size_of::<f32>()
+    } else {
+        std::mem::size_of::<f64>()
+    };
     let out_data_raw = checked_alloc(len * elem_size);
 
     let mask_shape = NslTensor::copy_shape(a.shape, ndim);
@@ -2332,9 +2608,14 @@ pub extern "C" fn nsl_tensor_dropout(tensor_ptr: i64, p: f64, training: i8) -> i
 
     if autodiff::is_recording() {
         // No refcount bump on a — identity-only. Mask still bumped (saved data).
-        NslTensor::from_ptr(mask_ptr).refcount.fetch_add(1, Ordering::SeqCst);
+        NslTensor::from_ptr(mask_ptr)
+            .refcount
+            .fetch_add(1, Ordering::SeqCst);
         autodiff::maybe_record(autodiff::TapeOp::Dropout {
-            a: tensor_ptr, out: result_ptr, saved_mask: mask_ptr, scale,
+            a: tensor_ptr,
+            out: result_ptr,
+            saved_mask: mask_ptr,
+            scale,
         });
     } else {
         nsl_tensor_free(mask_ptr);
@@ -2347,8 +2628,13 @@ pub extern "C" fn nsl_tensor_dropout(tensor_ptr: i64, p: f64, training: i8) -> i
 
 #[no_mangle]
 pub extern "C" fn nsl_tensor_conv2d(
-    input_ptr: i64, weight_ptr: i64, bias_ptr: i64,
-    stride_h: i64, stride_w: i64, pad_h: i64, pad_w: i64,
+    input_ptr: i64,
+    weight_ptr: i64,
+    bias_ptr: i64,
+    stride_h: i64,
+    stride_w: i64,
+    pad_h: i64,
+    pad_w: i64,
 ) -> i64 {
     let input = NslTensor::from_ptr(input_ptr);
 
@@ -2358,27 +2644,47 @@ pub extern "C" fn nsl_tensor_conv2d(
         {
             let c_input = nsl_tensor_contiguous(input_ptr);
             let result = crate::cuda::gpu_conv2d_f32(
-                c_input, weight_ptr, bias_ptr,
-                stride_h as u64, stride_w as u64, pad_h as u64, pad_w as u64,
+                c_input,
+                weight_ptr,
+                bias_ptr,
+                stride_h as u64,
+                stride_w as u64,
+                pad_h as u64,
+                pad_w as u64,
             );
             nsl_tensor_free(c_input);
             // Record tape op on the result (same as CPU path)
             if autodiff::is_recording() {
-                NslTensor::from_ptr(input_ptr).refcount.fetch_add(1, Ordering::SeqCst);
-                NslTensor::from_ptr(weight_ptr).refcount.fetch_add(1, Ordering::SeqCst);
+                NslTensor::from_ptr(input_ptr)
+                    .refcount
+                    .fetch_add(1, Ordering::SeqCst);
+                NslTensor::from_ptr(weight_ptr)
+                    .refcount
+                    .fetch_add(1, Ordering::SeqCst);
                 let w = NslTensor::from_ptr(weight_ptr);
-                let sh = stride_h as usize; let sw = stride_w as usize;
-                let ph = pad_h as usize; let pw = pad_w as usize;
+                let sh = stride_h as usize;
+                let sw = stride_w as usize;
+                let ph = pad_h as usize;
+                let pw = pad_w as usize;
                 autodiff::maybe_record(autodiff::TapeOp::Conv2d {
-                    input: input_ptr, weight: weight_ptr, bias: bias_ptr, out: result,
-                    saved_input: input_ptr, saved_weight: weight_ptr,
-                    stride_h: sh, stride_w: sw, pad_h: ph, pad_w: pw,
+                    input: input_ptr,
+                    weight: weight_ptr,
+                    bias: bias_ptr,
+                    out: result,
+                    saved_input: input_ptr,
+                    saved_weight: weight_ptr,
+                    stride_h: sh,
+                    stride_w: sw,
+                    pad_h: ph,
+                    pad_w: pw,
                 });
             }
             return result;
         }
         #[cfg(not(feature = "cuda"))]
-        { panic!("CUDA support not compiled"); }
+        {
+            panic!("CUDA support not compiled");
+        }
     }
 
     let weight = NslTensor::from_ptr(weight_ptr);
@@ -2403,7 +2709,11 @@ pub extern "C" fn nsl_tensor_conv2d(
     let w_out = (w + 2 * pw - kw) / sw + 1;
 
     let in_dtype = input.dtype;
-    let out_dtype: u16 = if in_dtype == 1 || weight.dtype == 1 { 1 } else { 0 };
+    let out_dtype: u16 = if in_dtype == 1 || weight.dtype == 1 {
+        1
+    } else {
+        0
+    };
 
     let out_len = n * c_out * h_out * w_out;
     let out_shape = checked_alloc(4 * std::mem::size_of::<i64>()) as *mut i64;
@@ -2416,15 +2726,25 @@ pub extern "C" fn nsl_tensor_conv2d(
     let out_strides = NslTensor::compute_strides(out_shape, 4);
 
     let read_input = |idx: usize| -> f64 {
-        if in_dtype == 1 { unsafe { *input.data_f32().add(idx) as f64 } }
-        else { unsafe { *input.data_f64().add(idx) } }
+        if in_dtype == 1 {
+            unsafe { *input.data_f32().add(idx) as f64 }
+        } else {
+            unsafe { *input.data_f64().add(idx) }
+        }
     };
     let read_weight = |idx: usize| -> f64 {
-        if weight.dtype == 1 { unsafe { *weight.data_f32().add(idx) as f64 } }
-        else { unsafe { *weight.data_f64().add(idx) } }
+        if weight.dtype == 1 {
+            unsafe { *weight.data_f32().add(idx) as f64 }
+        } else {
+            unsafe { *weight.data_f64().add(idx) }
+        }
     };
 
-    let elem_size = if out_dtype == 1 { std::mem::size_of::<f32>() } else { std::mem::size_of::<f64>() };
+    let elem_size = if out_dtype == 1 {
+        std::mem::size_of::<f32>()
+    } else {
+        std::mem::size_of::<f64>()
+    };
     let out_data_raw = checked_alloc_zeroed(out_len * elem_size);
 
     for ni in 0..n {
@@ -2438,8 +2758,12 @@ pub extern "C" fn nsl_tensor_conv2d(
                                 let ih = oh * sh + ky;
                                 let iw = ow * sw + kx;
                                 if ih >= ph && iw >= pw && ih - ph < h && iw - pw < w {
-                                    let input_idx = ni * (c_in * h * w) + ci * (h * w) + (ih - ph) * w + (iw - pw);
-                                    let weight_idx = co * (c_in * kh * kw) + ci * (kh * kw) + ky * kw + kx;
+                                    let input_idx = ni * (c_in * h * w)
+                                        + ci * (h * w)
+                                        + (ih - ph) * w
+                                        + (iw - pw);
+                                    let weight_idx =
+                                        co * (c_in * kh * kw) + ci * (kh * kw) + ky * kw + kx;
                                     val += read_input(input_idx) * read_weight(weight_idx);
                                 }
                             }
@@ -2447,11 +2771,15 @@ pub extern "C" fn nsl_tensor_conv2d(
                     }
                     if bias_ptr != 0 {
                         let bias = NslTensor::from_ptr(bias_ptr);
-                        let bv = if bias.dtype == 1 { unsafe { *bias.data_f32().add(co) as f64 } }
-                                 else { unsafe { *bias.data_f64().add(co) } };
+                        let bv = if bias.dtype == 1 {
+                            unsafe { *bias.data_f32().add(co) as f64 }
+                        } else {
+                            unsafe { *bias.data_f64().add(co) }
+                        };
                         val += bv;
                     }
-                    let out_idx = ni * (c_out * h_out * w_out) + co * (h_out * w_out) + oh * w_out + ow;
+                    let out_idx =
+                        ni * (c_out * h_out * w_out) + co * (h_out * w_out) + oh * w_out + ow;
                     if out_dtype == 1 {
                         unsafe { *(out_data_raw as *mut f32).add(out_idx) = val as f32 };
                     } else {
@@ -2476,12 +2804,23 @@ pub extern "C" fn nsl_tensor_conv2d(
     let result_ptr = NslTensor::publish(result);
 
     if autodiff::is_recording() {
-        NslTensor::from_ptr(input_ptr).refcount.fetch_add(1, Ordering::SeqCst);
-        NslTensor::from_ptr(weight_ptr).refcount.fetch_add(1, Ordering::SeqCst);
+        NslTensor::from_ptr(input_ptr)
+            .refcount
+            .fetch_add(1, Ordering::SeqCst);
+        NslTensor::from_ptr(weight_ptr)
+            .refcount
+            .fetch_add(1, Ordering::SeqCst);
         autodiff::maybe_record(autodiff::TapeOp::Conv2d {
-            input: input_ptr, weight: weight_ptr, bias: bias_ptr, out: result_ptr,
-            saved_input: input_ptr, saved_weight: weight_ptr,
-            stride_h: sh, stride_w: sw, pad_h: ph, pad_w: pw,
+            input: input_ptr,
+            weight: weight_ptr,
+            bias: bias_ptr,
+            out: result_ptr,
+            saved_input: input_ptr,
+            saved_weight: weight_ptr,
+            stride_h: sh,
+            stride_w: sw,
+            pad_h: ph,
+            pad_w: pw,
         });
     }
 
@@ -2492,7 +2831,11 @@ pub extern "C" fn nsl_tensor_conv2d(
 
 #[no_mangle]
 pub extern "C" fn nsl_tensor_maxpool2d(
-    input_ptr: i64, kernel_h: i64, kernel_w: i64, stride: i64, padding: i64,
+    input_ptr: i64,
+    kernel_h: i64,
+    kernel_w: i64,
+    stride: i64,
+    padding: i64,
 ) -> i64 {
     let input = NslTensor::from_ptr(input_ptr);
 
@@ -2502,26 +2845,36 @@ pub extern "C" fn nsl_tensor_maxpool2d(
         {
             let c_input = nsl_tensor_contiguous(input_ptr);
             let (result, argmax_vec) = crate::cuda::gpu_maxpool2d_f32(
-                c_input, kernel_h as u64, kernel_w as u64, stride as u64, padding as u64,
+                c_input,
+                kernel_h as u64,
+                kernel_w as u64,
+                stride as u64,
+                padding as u64,
             );
             nsl_tensor_free(c_input);
             // Record tape op with argmax indices
             if autodiff::is_recording() {
-                NslTensor::from_ptr(input_ptr).refcount.fetch_add(1, Ordering::SeqCst);
+                NslTensor::from_ptr(input_ptr)
+                    .refcount
+                    .fetch_add(1, Ordering::SeqCst);
                 let n = unsafe { *input.shape.add(0) } as i64;
                 let c = unsafe { *input.shape.add(1) } as i64;
                 let h = unsafe { *input.shape.add(2) } as i64;
                 let w = unsafe { *input.shape.add(3) } as i64;
                 let saved_argmax: Vec<usize> = argmax_vec.iter().map(|&x| x as usize).collect();
                 autodiff::maybe_record(autodiff::TapeOp::MaxPool2d {
-                    a: input_ptr, out: result, saved_argmax,
+                    a: input_ptr,
+                    out: result,
+                    saved_argmax,
                     input_shape: vec![n, c, h, w],
                 });
             }
             return result;
         }
         #[cfg(not(feature = "cuda"))]
-        { panic!("CUDA support not compiled"); }
+        {
+            panic!("CUDA support not compiled");
+        }
     }
 
     let n = unsafe { *input.shape.add(0) } as usize;
@@ -2544,18 +2897,27 @@ pub extern "C" fn nsl_tensor_maxpool2d(
     let out_len = n * c * h_out * w_out;
     let out_shape = checked_alloc(4 * std::mem::size_of::<i64>()) as *mut i64;
     unsafe {
-        *out_shape.add(0) = n as i64; *out_shape.add(1) = c as i64;
-        *out_shape.add(2) = h_out as i64; *out_shape.add(3) = w_out as i64;
+        *out_shape.add(0) = n as i64;
+        *out_shape.add(1) = c as i64;
+        *out_shape.add(2) = h_out as i64;
+        *out_shape.add(3) = w_out as i64;
     }
     let out_strides = NslTensor::compute_strides(out_shape, 4);
-    let elem_size = if in_dtype == 1 { std::mem::size_of::<f32>() } else { std::mem::size_of::<f64>() };
+    let elem_size = if in_dtype == 1 {
+        std::mem::size_of::<f32>()
+    } else {
+        std::mem::size_of::<f64>()
+    };
     let out_data_raw = checked_alloc(out_len * elem_size);
 
     let mut argmax_indices: Vec<usize> = vec![0; out_len];
 
     let read_input = |idx: usize| -> f64 {
-        if in_dtype == 1 { unsafe { *input.data_f32().add(idx) as f64 } }
-        else { unsafe { *input.data_f64().add(idx) } }
+        if in_dtype == 1 {
+            unsafe { *input.data_f32().add(idx) as f64 }
+        } else {
+            unsafe { *input.data_f64().add(idx) }
+        }
     };
 
     for ni in 0..n {
@@ -2569,9 +2931,13 @@ pub extern "C" fn nsl_tensor_maxpool2d(
                             let ih = oh * s + ky;
                             let iw = ow * s + kx;
                             if ih >= pad && iw >= pad && ih - pad < h && iw - pad < w {
-                                let input_idx = ni * (c * h * w) + ci * (h * w) + (ih - pad) * w + (iw - pad);
+                                let input_idx =
+                                    ni * (c * h * w) + ci * (h * w) + (ih - pad) * w + (iw - pad);
                                 let val = read_input(input_idx);
-                                if val > max_val { max_val = val; max_idx = input_idx; }
+                                if val > max_val {
+                                    max_val = val;
+                                    max_idx = input_idx;
+                                }
                             }
                         }
                     }
@@ -2601,9 +2967,13 @@ pub extern "C" fn nsl_tensor_maxpool2d(
     let result_ptr = NslTensor::publish(result);
 
     if autodiff::is_recording() {
-        NslTensor::from_ptr(input_ptr).refcount.fetch_add(1, Ordering::SeqCst);
+        NslTensor::from_ptr(input_ptr)
+            .refcount
+            .fetch_add(1, Ordering::SeqCst);
         autodiff::maybe_record(autodiff::TapeOp::MaxPool2d {
-            a: input_ptr, out: result_ptr, saved_argmax: argmax_indices,
+            a: input_ptr,
+            out: result_ptr,
+            saved_argmax: argmax_indices,
             input_shape: vec![n as i64, c as i64, h as i64, w as i64],
         });
     }
@@ -2617,8 +2987,14 @@ pub extern "C" fn nsl_tensor_bias_add(tensor_ptr: i64, bias_ptr: i64) -> i64 {
     let tensor = NslTensor::from_ptr(tensor_ptr);
     let bias = NslTensor::from_ptr(bias_ptr);
 
-    if tensor.ndim != 2 { eprintln!("nsl: bias_add requires 2D tensor (got {}D)", tensor.ndim); std::process::abort(); }
-    if bias.ndim != 1 { eprintln!("nsl: bias_add requires 1D bias (got {}D)", bias.ndim); std::process::abort(); }
+    if tensor.ndim != 2 {
+        eprintln!("nsl: bias_add requires 2D tensor (got {}D)", tensor.ndim);
+        std::process::abort();
+    }
+    if bias.ndim != 1 {
+        eprintln!("nsl: bias_add requires 1D bias (got {}D)", bias.ndim);
+        std::process::abort();
+    }
 
     // GPU path: launch fused bias_add kernel when tensor is on GPU.
     if tensor.device > 0 {
@@ -2627,7 +3003,9 @@ pub extern "C" fn nsl_tensor_bias_add(tensor_ptr: i64, bias_ptr: i64) -> i64 {
             return crate::cuda::gpu_bias_add(tensor_ptr, bias_ptr);
         }
         #[cfg(not(feature = "cuda"))]
-        { panic!("CUDA support not compiled"); }
+        {
+            panic!("CUDA support not compiled");
+        }
     }
 
     let rows = unsafe { *tensor.shape.add(0) } as usize;
@@ -2635,28 +3013,48 @@ pub extern "C" fn nsl_tensor_bias_add(tensor_ptr: i64, bias_ptr: i64) -> i64 {
     let bias_len = unsafe { *bias.shape.add(0) } as usize;
 
     if cols != bias_len {
-        eprintln!("nsl: bias_add shape mismatch -- tensor has {} cols but bias has {} elements", cols, bias_len);
+        eprintln!(
+            "nsl: bias_add shape mismatch -- tensor has {} cols but bias has {} elements",
+            cols, bias_len
+        );
         std::process::abort();
     }
 
     let in_dtype = tensor.dtype;
-    let out_dtype: u16 = if in_dtype == 1 || bias.dtype == 1 { 1 } else { 0 };
+    let out_dtype: u16 = if in_dtype == 1 || bias.dtype == 1 {
+        1
+    } else {
+        0
+    };
 
     let out_ndim: i64 = 2;
     let out_len = (rows * cols) as i64;
     let out_shape = checked_alloc(2 * std::mem::size_of::<i64>()) as *mut i64;
-    unsafe { *out_shape.add(0) = rows as i64; *out_shape.add(1) = cols as i64; }
+    unsafe {
+        *out_shape.add(0) = rows as i64;
+        *out_shape.add(1) = cols as i64;
+    }
     let out_strides = NslTensor::compute_strides(out_shape, out_ndim);
-    let elem_size = if out_dtype == 1 { std::mem::size_of::<f32>() } else { std::mem::size_of::<f64>() };
+    let elem_size = if out_dtype == 1 {
+        std::mem::size_of::<f32>()
+    } else {
+        std::mem::size_of::<f64>()
+    };
     let out_data_raw = checked_alloc((out_len as usize) * elem_size);
 
     let read_t = |idx: usize| -> f64 {
-        if in_dtype == 1 { unsafe { *tensor.data_f32().add(idx) as f64 } }
-        else { unsafe { *tensor.data_f64().add(idx) } }
+        if in_dtype == 1 {
+            unsafe { *tensor.data_f32().add(idx) as f64 }
+        } else {
+            unsafe { *tensor.data_f64().add(idx) }
+        }
     };
     let read_b = |idx: usize| -> f64 {
-        if bias.dtype == 1 { unsafe { *bias.data_f32().add(idx) as f64 } }
-        else { unsafe { *bias.data_f64().add(idx) } }
+        if bias.dtype == 1 {
+            unsafe { *bias.data_f32().add(idx) as f64 }
+        } else {
+            unsafe { *bias.data_f64().add(idx) }
+        }
     };
 
     for i in 0..rows {
@@ -2685,7 +3083,11 @@ pub extern "C" fn nsl_tensor_bias_add(tensor_ptr: i64, bias_ptr: i64) -> i64 {
 
     if autodiff::is_recording() {
         // No refcount bumps — identity-only fields (tape_ids after assign_ids)
-        autodiff::maybe_record(autodiff::TapeOp::BiasAdd { tensor: tensor_ptr, bias: bias_ptr, out: out_ptr });
+        autodiff::maybe_record(autodiff::TapeOp::BiasAdd {
+            tensor: tensor_ptr,
+            bias: bias_ptr,
+            out: out_ptr,
+        });
     }
 
     out_ptr
@@ -2694,7 +3096,10 @@ pub extern "C" fn nsl_tensor_bias_add(tensor_ptr: i64, bias_ptr: i64) -> i64 {
 /// Transfer a tensor to a different device.
 #[no_mangle]
 pub extern "C" fn nsl_tensor_to_device(tensor_ptr: i64, target_device: i64) -> i64 {
-    debug_assert!(NslTensor::from_ptr(tensor_ptr).is_valid(), "nsl_tensor_to_device: invalid tensor");
+    debug_assert!(
+        NslTensor::from_ptr(tensor_ptr).is_valid(),
+        "nsl_tensor_to_device: invalid tensor"
+    );
     let t = unsafe { &*(tensor_ptr as *const NslTensor) };
     let target = target_device as u8;
 
@@ -2767,10 +3172,14 @@ pub extern "C" fn nsl_tensor_to_device(tensor_ptr: i64, target_device: i64) -> i
                 let staging = checked_alloc(dst_size) as *mut i32;
                 let src = transfer_src.data as *const u16;
                 for i in 0..len {
-                    unsafe { *staging.add(i) = *src.add(i) as i32; }
+                    unsafe {
+                        *staging.add(i) = *src.add(i) as i32;
+                    }
                 }
                 crate::cuda::inner::memcpy_htod(dst, staging as *const std::ffi::c_void, dst_size);
-                unsafe { checked_free(staging as *mut u8, dst_size); }
+                unsafe {
+                    checked_free(staging as *mut u8, dst_size);
+                }
 
                 let shape = NslTensor::copy_shape(transfer_src.shape, transfer_src.ndim);
                 let strides = NslTensor::compute_strides(shape, transfer_src.ndim);
@@ -2845,15 +3254,27 @@ pub extern "C" fn nsl_tensor_to_device(tensor_ptr: i64, target_device: i64) -> i
                 let staging = checked_alloc(dst_size) as *mut f32;
                 let src = transfer_src.data_f64();
                 for i in 0..len {
-                    unsafe { *staging.add(i) = *src.add(i) as f32; }
+                    unsafe {
+                        *staging.add(i) = *src.add(i) as f32;
+                    }
                 }
                 crate::cuda::inner::memcpy_htod(dst, staging as *const std::ffi::c_void, dst_size);
-                unsafe { checked_free(staging as *mut u8, dst_size); }
+                unsafe {
+                    checked_free(staging as *mut u8, dst_size);
+                }
             }
             let shape = NslTensor::copy_shape(transfer_src.shape, transfer_src.ndim);
             let strides = NslTensor::compute_strides(shape, transfer_src.ndim);
             let new_t = Box::new(NslTensor::new(
-                dst, shape, strides, transfer_src.ndim, transfer_src.len, target, 1, 1, 0,
+                dst,
+                shape,
+                strides,
+                transfer_src.ndim,
+                transfer_src.len,
+                target,
+                1,
+                1,
+                0,
             ));
             if transfer_src_ptr != tensor_ptr {
                 nsl_tensor_free(transfer_src_ptr);
@@ -2861,13 +3282,17 @@ pub extern "C" fn nsl_tensor_to_device(tensor_ptr: i64, target_device: i64) -> i
             return NslTensor::publish(new_t);
         }
         #[cfg(not(feature = "cuda"))]
-        { panic!("CUDA support not compiled"); }
+        {
+            panic!("CUDA support not compiled");
+        }
     }
 
     if t.device > 0 && target == 0 {
         #[cfg(feature = "cuda")]
         {
-            unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
+            unsafe {
+                cudarc::driver::sys::cuCtxSynchronize();
+            }
 
             if transfer_src.dtype != 0 && transfer_src.dtype != 1 {
                 assert_elementwise_byte_copy(transfer_src.dtype, "nsl_tensor_to_device");
@@ -2908,14 +3333,25 @@ pub extern "C" fn nsl_tensor_to_device(tensor_ptr: i64, target_device: i64) -> i
             let dst_size = len * std::mem::size_of::<f64>();
             let dst = checked_alloc(dst_size) as *mut f64;
             for i in 0..len {
-                unsafe { *dst.add(i) = *staging.add(i) as f64; }
+                unsafe {
+                    *dst.add(i) = *staging.add(i) as f64;
+                }
             }
-            unsafe { checked_free(staging as *mut u8, src_size); }
+            unsafe {
+                checked_free(staging as *mut u8, src_size);
+            }
             let shape = NslTensor::copy_shape(transfer_src.shape, transfer_src.ndim);
             let strides = NslTensor::compute_strides(shape, transfer_src.ndim);
             let new_t = Box::new(NslTensor::new(
                 dst as *mut std::ffi::c_void,
-                shape, strides, transfer_src.ndim, transfer_src.len, 0, 0, 1, 0,
+                shape,
+                strides,
+                transfer_src.ndim,
+                transfer_src.len,
+                0,
+                0,
+                1,
+                0,
             ));
             if transfer_src_ptr != tensor_ptr {
                 nsl_tensor_free(transfer_src_ptr);
@@ -2923,7 +3359,9 @@ pub extern "C" fn nsl_tensor_to_device(tensor_ptr: i64, target_device: i64) -> i
             return NslTensor::publish(new_t);
         }
         #[cfg(not(feature = "cuda"))]
-        { panic!("CUDA support not compiled"); }
+        {
+            panic!("CUDA support not compiled");
+        }
     }
 
     panic!("GPU-to-GPU transfer not yet supported");
@@ -2973,11 +3411,7 @@ pub extern "C" fn nsl_tensor_prefetch(tensor_ptr: i64, device: i64) {
 /// The tensor has `owns_data = 0` — the data is never freed (it's embedded in the binary).
 /// Used by M52 weight constant folding to embed folded tensors.
 #[no_mangle]
-pub extern "C" fn nsl_tensor_from_static(
-    data_ptr: i64,
-    shape_list: i64,
-    dtype: i64,
-) -> i64 {
+pub extern "C" fn nsl_tensor_from_static(data_ptr: i64, shape_list: i64, dtype: i64) -> i64 {
     let list = crate::list::NslList::from_ptr(shape_list);
     let ndim = list.len;
     let mut len: i64 = 1;
@@ -2991,7 +3425,15 @@ pub extern "C" fn nsl_tensor_from_static(
 
     // owns_data = 0: static data, never freed
     let tensor = NslTensor::new(
-        data_ptr as *mut c_void, shape, strides, ndim, len, 0, dtype as u16, 0, 0,
+        data_ptr as *mut c_void,
+        shape,
+        strides,
+        ndim,
+        len,
+        0,
+        dtype as u16,
+        0,
+        0,
     );
     NslTensor::publish(Box::new(tensor))
 }
@@ -3018,7 +3460,15 @@ pub extern "C" fn nsl_tensor_from_slab(
     let strides = NslTensor::compute_strides(shape, ndim);
 
     let mut tensor = NslTensor::new(
-        data_ptr as *mut c_void, shape, strides, ndim, len, device as u8, dtype as u16, 1, 0,
+        data_ptr as *mut c_void,
+        shape,
+        strides,
+        ndim,
+        len,
+        device as u8,
+        dtype as u16,
+        1,
+        0,
     );
     tensor.slab_managed = 1;
     NslTensor::publish(Box::new(tensor))
@@ -3030,19 +3480,27 @@ pub extern "C" fn nsl_tensor_from_slab(
 /// Non-tensor fields (sub-models, scalars) are skipped.
 #[no_mangle]
 pub extern "C" fn nsl_model_to_device(model_ptr: i64, num_fields: i64, device: i64) {
-    if model_ptr == 0 || num_fields <= 0 { return; }
+    if model_ptr == 0 || num_fields <= 0 {
+        return;
+    }
     for i in 0..num_fields as usize {
         let field_addr = (model_ptr as usize + i * 8) as *mut i64;
         let field_val = unsafe { *field_addr };
-        if field_val == 0 { continue; }
+        if field_val == 0 {
+            continue;
+        }
         // Skip values that look like small integers (not heap pointers)
-        if (field_val as u64) < 0x10000 { continue; }
+        if (field_val as u64) < 0x10000 {
+            continue;
+        }
 
         // Probe: read the NslTensor header fields carefully
         let ptr = field_val as *const NslTensor;
         // Safety check: ensure the pointer is reasonably aligned (8-byte)
         #[allow(clippy::manual_is_multiple_of)]
-        if (field_val as usize) % 8 != 0 { continue; }
+        if (field_val as usize) % 8 != 0 {
+            continue;
+        }
 
         let t = unsafe { &*ptr };
 
@@ -3050,13 +3508,20 @@ pub extern "C" fn nsl_model_to_device(model_ptr: i64, num_fields: i64, device: i
         let is_tensor = t.magic == TENSOR_MAGIC;
 
         if is_tensor {
-            if t.device as i64 == device { continue; }
-            let new_ptr = nsl_tensor_to_device(field_val, device);
-            if new_ptr == 0 {
-                eprintln!("[nsl] WARNING: failed to transfer tensor field {} to device {}", i, device);
+            if t.device as i64 == device {
                 continue;
             }
-            unsafe { *field_addr = new_ptr; }
+            let new_ptr = nsl_tensor_to_device(field_val, device);
+            if new_ptr == 0 {
+                eprintln!(
+                    "[nsl] WARNING: failed to transfer tensor field {} to device {}",
+                    i, device
+                );
+                continue;
+            }
+            unsafe {
+                *field_addr = new_ptr;
+            }
             nsl_tensor_free(field_val);
         }
         // Non-tensor fields (sub-models, arrays) are skipped.
@@ -3070,8 +3535,10 @@ pub extern "C" fn nsl_model_to_device(model_ptr: i64, num_fields: i64, device: i
         unsafe {
             let result = cudarc::driver::sys::cuCtxSynchronize();
             if result != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
-                eprintln!("[nsl] WARNING: CUDA error after model transfer to device {}: {:?}",
-                    device, result);
+                eprintln!(
+                    "[nsl] WARNING: CUDA error after model transfer to device {}: {:?}",
+                    device, result
+                );
             }
         }
     }
@@ -3090,7 +3557,9 @@ pub extern "C" fn nsl_model_to_device(model_ptr: i64, num_fields: i64, device: i
 #[no_mangle]
 pub extern "C" fn nsl_collect_model_params(model_ptr: i64, num_fields: i64) -> i64 {
     let result = crate::list::nsl_list_new();
-    if model_ptr == 0 || num_fields <= 0 { return result; }
+    if model_ptr == 0 || num_fields <= 0 {
+        return result;
+    }
     collect_params_recursive(model_ptr as usize, num_fields as usize, result, 0);
     result
 }
@@ -3100,16 +3569,24 @@ pub extern "C" fn nsl_collect_model_params(model_ptr: i64, num_fields: i64) -> i
 const MAX_COLLECT_DEPTH: usize = 16;
 
 fn collect_params_recursive(base: usize, num_slots: usize, result: i64, depth: usize) {
-    if depth >= MAX_COLLECT_DEPTH { return; }
+    if depth >= MAX_COLLECT_DEPTH {
+        return;
+    }
     for i in 0..num_slots {
         let field_addr = (base + i * 8) as *const i64;
         let field_val = unsafe { *field_addr };
-        if field_val == 0 { continue; }
+        if field_val == 0 {
+            continue;
+        }
         // Skip values that look like small integers (not heap pointers)
-        if (field_val as u64) < 0x10000 { continue; }
+        if (field_val as u64) < 0x10000 {
+            continue;
+        }
         // Alignment check
         #[allow(clippy::manual_is_multiple_of)]
-        if (field_val as usize) % 8 != 0 { continue; }
+        if (field_val as usize) % 8 != 0 {
+            continue;
+        }
 
         let ptr = field_val as *const NslTensor;
         let t = unsafe { &*ptr };
@@ -3130,7 +3607,10 @@ fn collect_params_recursive(base: usize, num_slots: usize, result: i64, depth: u
             let mut found_tensor = false;
             // Quick probe: check if first field is a tensor
             let first_val = unsafe { *probe_ptr };
-            if first_val != 0 && (first_val as u64) >= 0x10000 && (first_val as usize).is_multiple_of(8) {
+            if first_val != 0
+                && (first_val as u64) >= 0x10000
+                && (first_val as usize).is_multiple_of(8)
+            {
                 let inner = first_val as *const NslTensor;
                 if unsafe { (*inner).magic } == TENSOR_MAGIC {
                     found_tensor = true;
@@ -3142,7 +3622,10 @@ fn collect_params_recursive(base: usize, num_slots: usize, result: i64, depth: u
                 let mut sub_slots = 0usize;
                 for j in 0..128 {
                     let sv = unsafe { *probe_ptr.add(j) };
-                    if sv == 0 { sub_slots = j; break; }
+                    if sv == 0 {
+                        sub_slots = j;
+                        break;
+                    }
                     sub_slots = j + 1;
                 }
                 if sub_slots > 0 {
@@ -3166,7 +3649,10 @@ pub struct NslSliceDim {
 
 #[no_mangle]
 pub extern "C" fn nsl_tensor_set_element(
-    tensor_ptr: i64, indices_ptr: i64, num_indices: i64, value: f64,
+    tensor_ptr: i64,
+    indices_ptr: i64,
+    num_indices: i64,
+    value: f64,
 ) {
     let tensor = NslTensor::from_ptr(tensor_ptr);
     let ndim = tensor.ndim as usize;
@@ -3183,7 +3669,10 @@ pub extern "C" fn nsl_tensor_set_element(
         let idx = unsafe { *(indices_ptr as *const i64).add(d) } as usize;
         let dim_size = unsafe { *tensor.shape.add(d) } as usize;
         if idx >= dim_size {
-            eprintln!("nsl: set_element: index {} out of bounds for dim {} (size {})", idx, d, dim_size);
+            eprintln!(
+                "nsl: set_element: index {} out of bounds for dim {} (size {})",
+                idx, d, dim_size
+            );
             std::process::abort();
         }
         offset += idx * stride;
@@ -3194,15 +3683,17 @@ pub extern "C" fn nsl_tensor_set_element(
 
 #[no_mangle]
 pub extern "C" fn nsl_tensor_slice_assign(
-    target_ptr: i64, src_ptr: i64, dims_ptr: i64, num_dims: i64,
+    target_ptr: i64,
+    src_ptr: i64,
+    dims_ptr: i64,
+    num_dims: i64,
 ) {
     let target = NslTensor::from_ptr(target_ptr);
     let ndim = num_dims as usize;
     if ndim != target.ndim as usize {
         eprintln!(
             "nsl: slice_assign: expected {} dims, got {}",
-            target.ndim,
-            ndim,
+            target.ndim, ndim,
         );
         std::process::abort();
     }
@@ -3230,8 +3721,7 @@ pub extern "C" fn nsl_tensor_slice_assign(
         if normalized < 0 || normalized > upper {
             eprintln!(
                 "nsl: slice_assign: index {} out of bounds for dim of size {}",
-                raw,
-                dim_size,
+                raw, dim_size,
             );
             std::process::abort();
         }
@@ -3251,12 +3741,14 @@ pub extern "C" fn nsl_tensor_slice_assign(
         }
     }
 
-    let selected_len: usize = ranges.iter().map(|(start, end)| end.saturating_sub(*start)).product();
+    let selected_len: usize = ranges
+        .iter()
+        .map(|(start, end)| end.saturating_sub(*start))
+        .product();
     if selected_len != src.len as usize {
         eprintln!(
             "nsl: slice_assign: source length {} does not match target slice length {}",
-            src.len,
-            selected_len,
+            src.len, selected_len,
         );
         std::process::abort();
     }
@@ -3265,9 +3757,14 @@ pub extern "C" fn nsl_tensor_slice_assign(
 
     #[allow(clippy::too_many_arguments)]
     fn recurse(
-        depth: usize, ndim: usize, ranges: &[(usize, usize)],
-        target: &NslTensor, src: &NslTensor, target_strides: &[usize],
-        target_offset: usize, src_flat: &mut usize,
+        depth: usize,
+        ndim: usize,
+        ranges: &[(usize, usize)],
+        target: &NslTensor,
+        src: &NslTensor,
+        target_strides: &[usize],
+        target_offset: usize,
+        src_flat: &mut usize,
     ) {
         if depth == ndim {
             if *src_flat < src.len as usize {
@@ -3279,11 +3776,29 @@ pub extern "C" fn nsl_tensor_slice_assign(
         }
         let (start, end) = ranges[depth];
         for i in start..end {
-            recurse(depth + 1, ndim, ranges, target, src, target_strides, target_offset + i * target_strides[depth], src_flat);
+            recurse(
+                depth + 1,
+                ndim,
+                ranges,
+                target,
+                src,
+                target_strides,
+                target_offset + i * target_strides[depth],
+                src_flat,
+            );
         }
     }
 
-    recurse(0, ndim, &ranges, target, src, &target_strides, 0, &mut src_flat);
+    recurse(
+        0,
+        ndim,
+        &ranges,
+        target,
+        src,
+        &target_strides,
+        0,
+        &mut src_flat,
+    );
 
     if src_work_ptr != src_cpu_ptr {
         nsl_tensor_free(src_work_ptr);
@@ -3303,7 +3818,9 @@ fn clone_shape(src: *mut i64, ndim: usize) -> *mut i64 {
     }
     let bytes = ndim * std::mem::size_of::<i64>();
     let dst = checked_alloc(bytes) as *mut i64;
-    unsafe { std::ptr::copy_nonoverlapping(src, dst, ndim); }
+    unsafe {
+        std::ptr::copy_nonoverlapping(src, dst, ndim);
+    }
     dst
 }
 
@@ -3315,12 +3832,18 @@ pub extern "C" fn nsl_tensor_to_custom_dtype(tensor_ptr: i64, target_dtype_id: i
 
     let info = match registry.get(&target_dtype_id) {
         Some(info) => info,
-        None => { eprintln!("nsl: unknown custom dtype id {target_dtype_id}"); return tensor_ptr; }
+        None => {
+            eprintln!("nsl: unknown custom dtype id {target_dtype_id}");
+            return tensor_ptr;
+        }
     };
 
     let pack_fn = match info.pack_fn {
         Some(f) => f,
-        None => { eprintln!("nsl: custom dtype '{}' has no pack function", info.name); return tensor_ptr; }
+        None => {
+            eprintln!("nsl: custom dtype '{}' has no pack function", info.name);
+            return tensor_ptr;
+        }
     };
 
     let num_elements = tensor.len as usize;
@@ -3340,7 +3863,11 @@ pub extern "C" fn nsl_tensor_to_custom_dtype(tensor_ptr: i64, target_dtype_id: i
             let packed_val = pack(val_bits);
             let dst = unsafe { packed_data.add(i * info.element_size) };
             unsafe {
-                std::ptr::copy_nonoverlapping(&packed_val as *const i64 as *const u8, dst, info.element_size);
+                std::ptr::copy_nonoverlapping(
+                    &packed_val as *const i64 as *const u8,
+                    dst,
+                    info.element_size,
+                );
             }
         }
 
@@ -3364,7 +3891,10 @@ pub extern "C" fn nsl_tensor_to_custom_dtype(tensor_ptr: i64, target_dtype_id: i
         let innermost = unsafe { *tensor.shape.add(tensor.ndim as usize - 1) } as usize;
 
         if !innermost.is_multiple_of(block_sz) {
-            eprintln!("nsl: tensor dim {} not divisible by block_size {}", innermost, block_sz);
+            eprintln!(
+                "nsl: tensor dim {} not divisible by block_size {}",
+                innermost, block_sz
+            );
             return tensor_ptr;
         }
 
@@ -3415,7 +3945,10 @@ pub extern "C" fn nsl_tensor_from_custom_dtype(tensor_ptr: i64) -> i64 {
 
     let unpack_fn = match info.unpack_fn {
         Some(f) => f,
-        None => { eprintln!("nsl: custom dtype '{}' has no unpack function", info.name); return tensor_ptr; }
+        None => {
+            eprintln!("nsl: custom dtype '{}' has no unpack function", info.name);
+            return tensor_ptr;
+        }
     };
 
     let num_elements = tensor.len as usize;
@@ -3434,13 +3967,16 @@ pub extern "C" fn nsl_tensor_from_custom_dtype(tensor_ptr: i64) -> i64 {
                 );
             }
             let result_bits = unpack(packed_val);
-            unsafe { *out_data.add(i) = f64::from_bits(result_bits as u64); }
+            unsafe {
+                *out_data.add(i) = f64::from_bits(result_bits as u64);
+            }
         }
     } else {
         let block_sz = info.block_size as usize;
         let num_blocks = num_elements / block_sz;
         let pbs = info.packed_block_size;
-        let unpack: extern "C" fn(*const u8, i64, *mut f64) = unsafe { std::mem::transmute(unpack_fn) };
+        let unpack: extern "C" fn(*const u8, i64, *mut f64) =
+            unsafe { std::mem::transmute(unpack_fn) };
         let src = tensor.data as *const u8;
         for b in 0..num_blocks {
             let packed_ptr = unsafe { src.add(b * pbs) };
@@ -3492,7 +4028,11 @@ pub fn test_build_tensor_2d_f32(rows: usize, cols: usize, data: &[f32]) -> i64 {
 #[cfg(feature = "test-hooks")]
 pub fn test_read_tensor_f32(ptr: i64) -> Vec<f32> {
     let t = unsafe { &*(ptr as *const NslTensor) };
-    assert_eq!(t.dtype, 1, "expected f32 tensor (dtype=1), got dtype={}", t.dtype);
+    assert_eq!(
+        t.dtype, 1,
+        "expected f32 tensor (dtype=1), got dtype={}",
+        t.dtype
+    );
     let len = t.len as usize;
     let buf = t.data as *const f32;
     (0..len).map(|i| unsafe { *buf.add(i) }).collect()
@@ -3501,7 +4041,11 @@ pub fn test_read_tensor_f32(ptr: i64) -> Vec<f32> {
 #[cfg(feature = "test-hooks")]
 pub fn test_read_tensor_f64(ptr: i64) -> Vec<f64> {
     let t = unsafe { &*(ptr as *const NslTensor) };
-    assert_eq!(t.dtype, 0, "expected f64 tensor (dtype=0), got dtype={}", t.dtype);
+    assert_eq!(
+        t.dtype, 0,
+        "expected f64 tensor (dtype=0), got dtype={}",
+        t.dtype
+    );
     let len = t.len as usize;
     let buf = t.data as *const f64;
     (0..len).map(|i| unsafe { *buf.add(i) }).collect()
@@ -3598,8 +4142,16 @@ mod tests {
         }
 
         let dims = [
-            NslSliceDim { is_scalar: 1, start: 0, end: 0 },
-            NslSliceDim { is_scalar: 0, start: 0, end: 3 },
+            NslSliceDim {
+                is_scalar: 1,
+                start: 0,
+                end: 0,
+            },
+            NslSliceDim {
+                is_scalar: 0,
+                start: 0,
+                end: 3,
+            },
         ];
         nsl_tensor_slice_assign(target, src, dims.as_ptr() as i64, 2);
 
@@ -3781,7 +4333,10 @@ mod tests {
         }
 
         // Non-contiguous
-        assert!(!trv.is_contiguous(), "transposed tensor should be non-contiguous");
+        assert!(
+            !trv.is_contiguous(),
+            "transposed tensor should be non-contiguous"
+        );
 
         nsl_tensor_free(tr);
         nsl_tensor_free(t);
@@ -3891,11 +4446,15 @@ mod tests {
         crate::list::nsl_list_push(shape_list, 6);
         let x = creation::tensor_from_shape_list_f64(shape_list, 0.0);
         let xt = NslTensor::from_ptr(x);
-        for i in 0..48 { unsafe { *xt.data_f64().add(i) = i as f64 } }
+        for i in 0..48 {
+            unsafe { *xt.data_f64().add(i) = i as f64 }
+        }
 
         // Reshape [2,4,6] -> [2,4,2,3] (zero-copy)
         let sl1 = crate::list::nsl_list_new();
-        for &d in &[2i64, 4, 2, 3] { crate::list::nsl_list_push(sl1, d); }
+        for &d in &[2i64, 4, 2, 3] {
+            crate::list::nsl_list_push(sl1, d);
+        }
         let split = nsl_tensor_reshape(x, sl1);
         let sv = NslTensor::from_ptr(split);
         assert_eq!(sv.data, xt.data); // zero-copy
@@ -3923,7 +4482,9 @@ mod tests {
         crate::list::nsl_list_push(sl, 12);
         let t = creation::tensor_from_shape_list_f64(sl, 0.0);
         let tv = NslTensor::from_ptr(t);
-        for i in 0..12 { unsafe { *tv.data_f64().add(i) = i as f64 } }
+        for i in 0..12 {
+            unsafe { *tv.data_f64().add(i) = i as f64 }
+        }
 
         // reshape [12] -> [3,4] (zero-copy)
         let sl1 = crate::list::nsl_list_new();
@@ -3974,11 +4535,17 @@ mod tests {
     fn test_fbip_can_mutate_inplace() {
         let ptr = make_f64_tensor(&[1.0, 2.0, 3.0]);
         let t = NslTensor::from_ptr(ptr);
-        assert!(t.can_mutate_inplace(), "unique owned contiguous CPU tensor should be mutable in-place");
+        assert!(
+            t.can_mutate_inplace(),
+            "unique owned contiguous CPU tensor should be mutable in-place"
+        );
 
         // Bump refcount — should no longer be mutable
         t.refcount.fetch_add(1, Ordering::SeqCst);
-        assert!(!t.can_mutate_inplace(), "refcount>1 should prevent in-place mutation");
+        assert!(
+            !t.can_mutate_inplace(),
+            "refcount>1 should prevent in-place mutation"
+        );
         t.refcount.fetch_sub(1, Ordering::SeqCst);
         nsl_tensor_free(ptr);
     }
@@ -3993,7 +4560,7 @@ mod tests {
         assert_eq!(t.refcount.load(Ordering::Relaxed), 2);
         let vals: Vec<f64> = (0..5).map(|i| unsafe { *t.data_f64().add(i) }).collect();
         assert_eq!(vals, vec![0.0, 0.0, 0.0, 1.0, 2.0]);
-        nsl_tensor_free(ptr);    // input ref
+        nsl_tensor_free(ptr); // input ref
         nsl_tensor_free(result); // output ref → frees
     }
 
@@ -4001,9 +4568,14 @@ mod tests {
     fn test_fbip_relu_alloc_when_shared() {
         let ptr = make_f64_tensor(&[-1.0, 2.0]);
         // Bump refcount to simulate shared reference
-        NslTensor::from_ptr(ptr).refcount.fetch_add(1, Ordering::SeqCst);
+        NslTensor::from_ptr(ptr)
+            .refcount
+            .fetch_add(1, Ordering::SeqCst);
         let result = activation::nsl_tensor_relu(ptr);
-        assert_ne!(result, ptr, "relu should allocate new tensor when refcount>1");
+        assert_ne!(
+            result, ptr,
+            "relu should allocate new tensor when refcount>1"
+        );
         let t = NslTensor::from_ptr(result);
         let vals: Vec<f64> = (0..2).map(|i| unsafe { *t.data_f64().add(i) }).collect();
         assert_eq!(vals, vec![0.0, 2.0]);
@@ -4011,7 +4583,9 @@ mod tests {
         let orig = NslTensor::from_ptr(ptr);
         assert_eq!(unsafe { *orig.data_f64().add(0) }, -1.0);
         nsl_tensor_free(result);
-        NslTensor::from_ptr(ptr).refcount.fetch_sub(1, Ordering::SeqCst);
+        NslTensor::from_ptr(ptr)
+            .refcount
+            .fetch_sub(1, Ordering::SeqCst);
         nsl_tensor_free(ptr);
     }
 
@@ -4023,7 +4597,7 @@ mod tests {
         let t = NslTensor::from_ptr(result);
         assert!((unsafe { *t.data_f64().add(0) } - 1.0).abs() < 1e-10);
         assert!((unsafe { *t.data_f64().add(1) } - std::f64::consts::E).abs() < 1e-10);
-        nsl_tensor_free(ptr);    // input ref
+        nsl_tensor_free(ptr); // input ref
         nsl_tensor_free(result); // output ref
     }
 
@@ -4068,11 +4642,14 @@ mod tests {
         let b = make_f64_tensor(&[10.0, 20.0, 30.0]);
         // ELTLS: in-place now requires explicit RELINQUISH_A flag.
         let result = arithmetic::nsl_tensor_add(a, b, RELINQUISH_A);
-        assert_eq!(result, a, "add should reuse left operand when RELINQUISH_A is set");
+        assert_eq!(
+            result, a,
+            "add should reuse left operand when RELINQUISH_A is set"
+        );
         let t = NslTensor::from_ptr(result);
         let vals: Vec<f64> = (0..3).map(|i| unsafe { *t.data_f64().add(i) }).collect();
         assert_eq!(vals, vec![11.0, 22.0, 33.0]);
-        nsl_tensor_free(a);      // input ref
+        nsl_tensor_free(a); // input ref
         nsl_tensor_free(result); // output ref
         nsl_tensor_free(b);
     }
@@ -4081,14 +4658,21 @@ mod tests {
     fn test_fbip_add_alloc_when_shared() {
         let a = make_f64_tensor(&[1.0, 2.0]);
         let b = make_f64_tensor(&[10.0, 20.0]);
-        NslTensor::from_ptr(a).refcount.fetch_add(1, Ordering::SeqCst);
+        NslTensor::from_ptr(a)
+            .refcount
+            .fetch_add(1, Ordering::SeqCst);
         let result = arithmetic::nsl_tensor_add(a, b, 0);
-        assert_ne!(result, a, "add should allocate new tensor when left has refcount>1");
+        assert_ne!(
+            result, a,
+            "add should allocate new tensor when left has refcount>1"
+        );
         let t = NslTensor::from_ptr(result);
         let vals: Vec<f64> = (0..2).map(|i| unsafe { *t.data_f64().add(i) }).collect();
         assert_eq!(vals, vec![11.0, 22.0]);
         nsl_tensor_free(result);
-        NslTensor::from_ptr(a).refcount.fetch_sub(1, Ordering::SeqCst);
+        NslTensor::from_ptr(a)
+            .refcount
+            .fetch_sub(1, Ordering::SeqCst);
         nsl_tensor_free(a);
         nsl_tensor_free(b);
     }
@@ -4146,7 +4730,10 @@ mod tests {
         // Clone always deep copies (FBIP clone deferred to Phase 2 — requires codegen ownership)
         let ptr = make_f64_tensor(&[1.0, 2.0, 3.0]);
         let result = nsl_tensor_clone(ptr);
-        assert_ne!(result, ptr, "clone should always deep copy at runtime level");
+        assert_ne!(
+            result, ptr,
+            "clone should always deep copy at runtime level"
+        );
         let t = NslTensor::from_ptr(result);
         let vals: Vec<f64> = (0..3).map(|i| unsafe { *t.data_f64().add(i) }).collect();
         assert_eq!(vals, vec![1.0, 2.0, 3.0]);
@@ -4193,7 +4780,7 @@ mod tests {
         let r2 = activation::nsl_tensor_exp(r1);
         assert_eq!(r2, r1, "second op should also FBIP after input freed");
         nsl_tensor_free(r1); // drop r1 ref → refcount=1
-        // Values: relu([-2, 3]) = [0, 3], exp([0, 3]) = [1, e^3]
+                             // Values: relu([-2, 3]) = [0, 3], exp([0, 3]) = [1, e^3]
         let t = NslTensor::from_ptr(r2);
         assert!((unsafe { *t.data_f64().add(0) } - 1.0).abs() < 1e-10);
         assert!((unsafe { *t.data_f64().add(1) } - (3.0_f64).exp()).abs() < 1e-10);
@@ -4208,7 +4795,10 @@ mod tests {
         crate::autodiff::nsl_tape_start(params);
         let result = activation::nsl_tensor_relu(ptr);
         crate::autodiff::nsl_tape_stop();
-        assert_ne!(result, ptr, "FBIP should not trigger during autodiff recording");
+        assert_ne!(
+            result, ptr,
+            "FBIP should not trigger during autodiff recording"
+        );
         nsl_tensor_free(result);
         nsl_tensor_free(ptr);
     }
@@ -4218,7 +4808,10 @@ mod tests {
         // CPU tensor (device=0) should NOT pass GPU check
         let ptr = make_f64_tensor(&[1.0, 2.0]);
         let t = NslTensor::from_ptr(ptr);
-        assert!(!t.can_mutate_inplace_gpu(), "CPU tensor should fail GPU inplace check");
+        assert!(
+            !t.can_mutate_inplace_gpu(),
+            "CPU tensor should fail GPU inplace check"
+        );
         nsl_tensor_free(ptr);
     }
 
@@ -4228,8 +4821,14 @@ mod tests {
         let ptr = make_f64_tensor(&[1.0]);
         let t = NslTensor::from_ptr(ptr);
         // CPU tensor: can_mutate_inplace() should be true, can_mutate_inplace_gpu() false
-        assert!(t.can_mutate_inplace(), "CPU tensor with refcount=1 should pass CPU check");
-        assert!(!t.can_mutate_inplace_gpu(), "CPU tensor should fail GPU check");
+        assert!(
+            t.can_mutate_inplace(),
+            "CPU tensor with refcount=1 should pass CPU check"
+        );
+        assert!(
+            !t.can_mutate_inplace_gpu(),
+            "CPU tensor should fail GPU check"
+        );
         nsl_tensor_free(ptr);
     }
 
@@ -4326,16 +4925,17 @@ mod tests {
 /// Called from codegen before the optimizer step loop.
 /// param_list, grads_list: NslList of tensor pointers. step: current global step.
 #[no_mangle]
-pub extern "C" fn nsl_debug_train_step(
-    param_list: i64,
-    grads_list: i64,
-    step: i64,
-) {
+pub extern "C" fn nsl_debug_train_step(param_list: i64, grads_list: i64, step: i64) {
     let n_params = crate::list::nsl_list_len(param_list);
     let n_grads = crate::list::nsl_list_len(grads_list);
-    if step != 0 { return; } // only print on first step
+    if step != 0 {
+        return;
+    } // only print on first step
 
-    eprintln!("[debug] step={} params={} grads={}", step, n_params, n_grads);
+    eprintln!(
+        "[debug] step={} params={} grads={}",
+        step, n_params, n_grads
+    );
 
     let show = n_params.min(n_grads);
     for i in 0..show {
@@ -4366,7 +4966,9 @@ pub extern "C" fn nsl_tensor_l2_norm(t: i64) -> f64 {
 }
 
 fn tensor_l2_norm(t: &NslTensor) -> f64 {
-    if t.len == 0 || t.data.is_null() { return 0.0; }
+    if t.len == 0 || t.data.is_null() {
+        return 0.0;
+    }
     let len = t.len as usize;
 
     // Must read from correct device
@@ -4381,14 +4983,16 @@ fn tensor_l2_norm(t: &NslTensor) -> f64 {
 
     let mut sum_sq = 0.0_f64;
     match t.dtype {
-        1 => { // f32
+        1 => {
+            // f32
             let data = t.data as *const f32;
             for i in 0..len {
                 let v = unsafe { *data.add(i) } as f64;
                 sum_sq += v * v;
             }
         }
-        _ => { // f64
+        _ => {
+            // f64
             let data = t.data as *const f64;
             for i in 0..len {
                 let v = unsafe { *data.add(i) };
@@ -4428,8 +5032,12 @@ pub extern "C" fn nsl_gpu_drain_cache() {
         {
             crate::cuda::inner::ensure_context();
             // Sync first to ensure all async GPU ops complete so freed blocks are actually available
-            unsafe { cudarc::driver::sys::cuCtxSynchronize(); }
-            let mut alloc = crate::cuda::caching_allocator::CACHING_ALLOCATOR.lock().unwrap();
+            unsafe {
+                cudarc::driver::sys::cuCtxSynchronize();
+            }
+            let mut alloc = crate::cuda::caching_allocator::CACHING_ALLOCATOR
+                .lock()
+                .unwrap();
             let freed = alloc.drain_all();
             if freed > 0 {
                 eprintln!("[gpu-drain] released {}MB to driver", freed / (1024 * 1024));
@@ -4458,10 +5066,14 @@ pub(crate) fn debug_track_gpu_free(bytes: usize) {
 #[no_mangle]
 pub extern "C" fn nsl_debug_gpu_alloc_summary(step: i64) {
     let all = std::env::var("NSL_DEBUG_MEM_ALL").ok().as_deref() == Some("1");
-    if !all && step > 2 { return; } // default: only first 3 steps
+    if !all && step > 2 {
+        return;
+    } // default: only first 3 steps
     #[cfg(feature = "cuda")]
     {
-        let alloc = crate::cuda::caching_allocator::CACHING_ALLOCATOR.lock().unwrap();
+        let alloc = crate::cuda::caching_allocator::CACHING_ALLOCATOR
+            .lock()
+            .unwrap();
         let summary = alloc.allocated_block_summary();
         eprintln!("[gpu-alloc-summary] step={} live blocks:", step);
         for (ctx, count, bytes) in &summary {
@@ -4471,14 +5083,18 @@ pub extern "C" fn nsl_debug_gpu_alloc_summary(step: i64) {
         }
     }
     #[cfg(not(feature = "cuda"))]
-    { let _ = step; }
+    {
+        let _ = step;
+    }
 }
 
 /// Debug: print GPU memory usage + caching allocator stats.
 #[no_mangle]
 pub extern "C" fn nsl_debug_gpu_mem(step: i64) {
     let all = std::env::var("NSL_DEBUG_MEM_ALL").ok().as_deref() == Some("1");
-    if !all && step > 5 { return; }
+    if !all && step > 5 {
+        return;
+    }
     #[cfg(feature = "cuda")]
     {
         unsafe {
@@ -4487,7 +5103,9 @@ pub extern "C" fn nsl_debug_gpu_mem(step: i64) {
             let mut total: usize = 0;
             cudarc::driver::sys::cuMemGetInfo_v2(&mut free, &mut total);
             let used_mb = (total - free) / (1024 * 1024);
-            let alloc = crate::cuda::caching_allocator::CACHING_ALLOCATOR.lock().unwrap();
+            let alloc = crate::cuda::caching_allocator::CACHING_ALLOCATOR
+                .lock()
+                .unwrap();
             let stats = alloc.stats();
             let mb = |b: usize| b / (1024 * 1024);
             eprintln!(
@@ -4508,7 +5126,9 @@ pub extern "C" fn nsl_debug_gpu_mem(step: i64) {
         }
     }
     #[cfg(not(feature = "cuda"))]
-    { let _ = step; }
+    {
+        let _ = step;
+    }
 }
 
 #[cfg(test)]

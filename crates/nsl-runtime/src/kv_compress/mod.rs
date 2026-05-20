@@ -6,10 +6,10 @@
 //! - Sliding window with attention sinks — caps token count
 //! - H2O (Heavy Hitter Oracle) — attention-score-based eviction
 
+pub mod ffi;
+pub mod h2o;
 pub mod quantize;
 pub mod sliding_window;
-pub mod h2o;
-pub mod ffi;
 
 /// Quantization scheme for KV-cache storage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -33,7 +33,7 @@ impl KvQuantScheme {
     /// Bytes per element for this scheme.
     pub fn bytes_per_element(&self) -> f64 {
         match self {
-            KvQuantScheme::None => 2.0,      // FP16
+            KvQuantScheme::None => 2.0, // FP16
             KvQuantScheme::Int8PerHead => 1.0,
             KvQuantScheme::Int8PerToken => 1.0,
             KvQuantScheme::Int4PerGroup => 0.5,
@@ -52,7 +52,6 @@ impl KvQuantScheme {
         }
     }
 }
-
 
 /// Sliding window configuration.
 #[derive(Debug, Clone)]

@@ -17,7 +17,6 @@ use serde::Serialize;
 
 use crate::csha_boundary::{scan as scan_boundaries, BoundaryScan, ProjKind};
 use crate::csha_patterns::{analyze as analyze_patterns, PatternConfig, PatternPlan};
-use crate::wggo_overrides::{OverrideDiagnostic, OverrideRejectReason};
 use crate::csha_pipeline::{
     block_smem_bytes, pipeline_smem_bytes, plan_all, plan_layer, roofline_tile_config,
     smem_budget_bytes, FusionLevel, LayerPlan, TileConfig,
@@ -27,6 +26,7 @@ use crate::gpu_specs::{default_gpu, find_gpu, GpuSpec};
 use crate::weight_aware::WeightMap;
 use crate::wengert::WengertList;
 use crate::wggo_cost::LayerShape;
+use crate::wggo_overrides::{OverrideDiagnostic, OverrideRejectReason};
 
 /// User-facing CSHA mode — maps to an initial fusion level that
 /// [`csha_pipeline::plan_layer`] may downgrade per-layer if SMEM is
@@ -99,7 +99,6 @@ pub struct CshaInput<'a> {
     /// downgrade at per-layer emission time (Task 4).
     pub wggo_overrides: Option<&'a crate::wggo_overrides::WggoOverrides>,
 }
-
 
 /// Aggregate plan emitted by the driver.
 #[derive(Debug, Clone, Serialize)]
@@ -255,11 +254,7 @@ impl CshaPlan {
         writeln!(s).unwrap();
 
         if self.per_layer.is_empty() {
-            writeln!(
-                s,
-                "No attention layers detected — CSHA has nothing to do."
-            )
-            .unwrap();
+            writeln!(s, "No attention layers detected — CSHA has nothing to do.").unwrap();
             return s;
         }
 
@@ -324,11 +319,7 @@ impl CshaPlan {
             }
             // Kernel specialisation name that downstream passes embed
             // into the compiled artefact.
-            if let Some(kspec) = self
-                .kernels
-                .iter()
-                .find(|k| k.layer == plan.layer)
-            {
+            if let Some(kspec) = self.kernels.iter().find(|k| k.layer == plan.layer) {
                 writeln!(s, "  Kernel: {}", kspec.kernel_name).unwrap();
             }
             if let Some(pat) = self.patterns.get(&plan.layer) {
@@ -361,12 +352,7 @@ impl CshaPlan {
         } else {
             writeln!(s, "Total savings: 0 MB (no CSHA-active layers).").unwrap();
         }
-        writeln!(
-            s,
-            "Solve time: {:.2} ms",
-            self.solve_us as f64 / 1000.0
-        )
-        .unwrap();
+        writeln!(s, "Solve time: {:.2} ms", self.solve_us as f64 / 1000.0).unwrap();
         s
     }
 }
@@ -383,9 +369,7 @@ impl CshaPlan {
 ///   Level1 → Boundary
 ///   Level2 → Pipeline
 ///   Level3 → Block
-fn wggo_to_pipeline_level(
-    wggo: crate::cfie_persistent::FusionLevel,
-) -> FusionLevel {
+fn wggo_to_pipeline_level(wggo: crate::cfie_persistent::FusionLevel) -> FusionLevel {
     match wggo {
         crate::cfie_persistent::FusionLevel::None => FusionLevel::None,
         crate::cfie_persistent::FusionLevel::Level1 => FusionLevel::Boundary,
@@ -396,9 +380,7 @@ fn wggo_to_pipeline_level(
 
 /// Map a `csha_pipeline::FusionLevel` back to `cfie_persistent::FusionLevel`
 /// for use in `OverrideDiagnostic.applied`.
-fn pipeline_to_wggo_level(
-    pipeline: FusionLevel,
-) -> crate::cfie_persistent::FusionLevel {
+fn pipeline_to_wggo_level(pipeline: FusionLevel) -> crate::cfie_persistent::FusionLevel {
     match pipeline {
         FusionLevel::None => crate::cfie_persistent::FusionLevel::None,
         FusionLevel::Boundary => crate::cfie_persistent::FusionLevel::Level1,
@@ -503,9 +485,7 @@ pub fn run(input: CshaInput) -> CshaPlan {
             let layer_idx = out.len() as u32;
 
             // (1) HEADS FIRST — look up override for this layer.
-            let layer_override = input
-                .wggo_overrides
-                .and_then(|o| o.find(layer_idx));
+            let layer_override = input.wggo_overrides.and_then(|o| o.find(layer_idx));
 
             // Use overridden head count when available; fall back to the
             // global n_heads.  The head count feeds into roofline_tile_config
@@ -566,12 +546,7 @@ pub fn run(input: CshaInput) -> CshaPlan {
     };
 
     // Specialization analysis (head pruning, entropy buckets, precision).
-    let mut specialization = analyze_spec(
-        &boundary,
-        input.weights,
-        input.n_heads,
-        &input.spec_cfg,
-    );
+    let mut specialization = analyze_spec(&boundary, input.weights, input.n_heads, &input.spec_cfg);
     let patterns = analyze_patterns(
         &per_layer,
         &input.shape,
@@ -610,12 +585,10 @@ pub fn run(input: CshaInput) -> CshaPlan {
         override_diagnostics: Vec::new(),
     };
     let mut diags = Vec::<String>::new();
-    let bridge = crate::csha_apply::bridge(
-        &interim,
-        input.shape.head_dim as i64,
-        &mut diags,
-    );
-    for d in diags { eprintln!("warning: {d}"); }
+    let bridge = crate::csha_apply::bridge(&interim, input.shape.head_dim as i64, &mut diags);
+    for d in diags {
+        eprintln!("warning: {d}");
+    }
 
     CshaPlan {
         mode: input.mode,
@@ -991,16 +964,20 @@ mod override_tests {
     //   cfie_persistent::FusionLevel (used by OverrideDiagnostic + PerLayerOverride)
     use crate::cfie_persistent::FusionLevel as WggoLevel;
     use crate::csha_pipeline::FusionLevel as PipelineLevel;
-    use crate::wggo_overrides::{PerLayerOverride, WggoOverrides};
     use crate::wengert::{PrimalOp, WengertOp};
+    use crate::wggo_overrides::{PerLayerOverride, WggoOverrides};
     use std::collections::HashMap;
 
     /// Minimal Wengert list with a single attention block (reuses the
     /// attn_block() pattern from the parent test module).
     fn attn_wengert() -> WengertList {
         let op = |id: u32, result: u32, o: PrimalOp, inputs: Vec<u32>| WengertOp {
-            id, result, op: o, inputs,
-            saved_for_backward: false, checkpointed: false,
+            id,
+            result,
+            op: o,
+            inputs,
+            saved_for_backward: false,
+            checkpointed: false,
         };
         let ops = vec![
             op(0, 0, PrimalOp::Input("x".into()), vec![]),
@@ -1015,7 +992,8 @@ mod override_tests {
             op(9, 9, PrimalOp::Matmul, vec![1, 8]),
         ];
         WengertList {
-            ops, output: 9,
+            ops,
+            output: 9,
             var_names: HashMap::new(),
             var_types: HashMap::new(),
         }
@@ -1024,8 +1002,12 @@ mod override_tests {
     /// Standard shape used by most tests (d_model=512 for general cases).
     fn default_shape() -> LayerShape {
         LayerShape {
-            batch: 1, seq: 1024, d_model: 512,
-            head_dim: 64, n_kv_heads: 4, dtype_bytes: 2,
+            batch: 1,
+            seq: 1024,
+            d_model: 512,
+            head_dim: 64,
+            n_kv_heads: 4,
+            dtype_bytes: 2,
         }
     }
 
@@ -1040,8 +1022,12 @@ mod override_tests {
     /// → also the right target for the downgrade test.
     fn small_shape_block_feasible() -> LayerShape {
         LayerShape {
-            batch: 1, seq: 1024, d_model: 128,
-            head_dim: 64, n_kv_heads: 4, dtype_bytes: 2,
+            batch: 1,
+            seq: 1024,
+            d_model: 128,
+            head_dim: 64,
+            n_kv_heads: 4,
+            dtype_bytes: 2,
         }
     }
 
@@ -1068,8 +1054,16 @@ mod override_tests {
         n_heads: u32,
         overrides: Option<&WggoOverrides>,
     ) -> CshaPlan {
-        run_on_wengert(wengert, target, "full", None, Some(shape), n_heads, overrides)
-            .expect("run_on_wengert must succeed for mode 'full'")
+        run_on_wengert(
+            wengert,
+            target,
+            "full",
+            None,
+            Some(shape),
+            n_heads,
+            overrides,
+        )
+        .expect("run_on_wengert must succeed for mode 'full'")
     }
 
     // -----------------------------------------------------------------------
@@ -1119,7 +1113,8 @@ mod override_tests {
 
         // Exactly one diagnostic expected.
         assert_eq!(
-            plan.override_diagnostics.len(), 1,
+            plan.override_diagnostics.len(),
+            1,
             "exactly one downgrade diagnostic must be emitted"
         );
         let diag = &plan.override_diagnostics[0];
@@ -1148,7 +1143,8 @@ mod override_tests {
         assert!(
             wggo_level_ordinal(&diag.applied) < wggo_level_ordinal(&diag.requested),
             "applied ({}) must be strictly less aggressive than requested ({})",
-            diag.applied, diag.requested
+            diag.applied,
+            diag.requested
         );
     }
 
@@ -1205,7 +1201,8 @@ mod override_tests {
         let plan = run_with(&w, "H100", default_shape(), 8, Some(&over));
 
         assert_eq!(
-            plan.specialization.total_pruned_heads(), 4,
+            plan.specialization.total_pruned_heads(),
+            4,
             "WGGO active_heads=4 of 8 must appear as 4 pruned heads in the specialization plan"
         );
 

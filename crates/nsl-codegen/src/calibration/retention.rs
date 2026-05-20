@@ -72,11 +72,17 @@ pub fn emit_splice_memcpy(
 /// land at calibration runtime.
 #[derive(Debug, Default, Clone)]
 pub struct ArenaLayout {
-    pub entries: Vec<(ProjectionRef, u32 /* byte offset */, u32 /* nbytes */)>,
+    pub entries: Vec<(
+        ProjectionRef,
+        u32, /* byte offset */
+        u32, /* nbytes */
+    )>,
 }
 
 impl ArenaLayout {
-    pub fn empty() -> Self { Self::default() }
+    pub fn empty() -> Self {
+        Self::default()
+    }
     pub fn total_bytes(&self) -> u32 {
         self.entries.last().map(|(_, off, n)| off + n).unwrap_or(0)
     }
@@ -120,7 +126,10 @@ pub fn build_grad_arena_layout(
             offset = offset.saturating_add(byte_size);
         }
     }
-    GradArenaLayout { entries, total_bytes: offset }
+    GradArenaLayout {
+        entries,
+        total_bytes: offset,
+    }
 }
 
 /// Shape of the tensor feeding into a projection.  `[batch, seq,
@@ -131,9 +140,15 @@ pub struct TensorShape {
 }
 
 impl TensorShape {
-    pub fn new(dims: Vec<u64>) -> Self { Self { dims } }
-    pub fn total_elements(&self) -> u64 { self.dims.iter().product() }
-    pub fn in_channels(&self) -> u64 { *self.dims.last().unwrap_or(&1) }
+    pub fn new(dims: Vec<u64>) -> Self {
+        Self { dims }
+    }
+    pub fn total_elements(&self) -> u64 {
+        self.dims.iter().product()
+    }
+    pub fn in_channels(&self) -> u64 {
+        *self.dims.last().unwrap_or(&1)
+    }
 }
 
 /// One retention-table entry — the scratch buffer allocated for a
@@ -158,7 +173,9 @@ pub struct RetentionTable {
 }
 
 impl RetentionTable {
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
 
     /// Register a projection for retention.  Returns the
     /// `arena_offset_bytes` that the splice-point codegen will use as
@@ -192,14 +209,20 @@ impl RetentionTable {
         self.entries.get(projection)
     }
 
-    pub fn total_arena_bytes(&self) -> u64 { self.next_offset }
+    pub fn total_arena_bytes(&self) -> u64 {
+        self.next_offset
+    }
 
     pub fn iter(&self) -> impl Iterator<Item = &RetainedProjection> {
         self.entries.values()
     }
 
-    pub fn len(&self) -> usize { self.entries.len() }
-    pub fn is_empty(&self) -> bool { self.entries.is_empty() }
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
 }
 
 #[cfg(test)]
@@ -230,7 +253,7 @@ mod grad_arena_tests {
         let layout = build_grad_arena_layout(&targets);
         // 4 projections × (4096 × 4096 × 4 bytes) = 4 × 64 MiB = 256 MiB
         assert_eq!(layout.entries.len(), 4);
-        assert_eq!(layout.entries[0].0.0, "gpt.blocks.0.attn.q_proj");
+        assert_eq!(layout.entries[0].0 .0, "gpt.blocks.0.attn.q_proj");
         assert_eq!(layout.entries[0].1, 0); // first offset is zero
         assert_eq!(layout.entries[0].2, 4096 * 4096 * 4);
         // Subsequent offsets are the cumulative sum
@@ -369,8 +392,7 @@ mod tests {
         fb.ins().return_(&[]);
         fb.finalize();
 
-        cranelift_codegen::verifier::verify_function(&func, &flags)
-            .expect("IR should verify");
+        cranelift_codegen::verifier::verify_function(&func, &flags).expect("IR should verify");
 
         let ir = format!("{}", func.display());
         assert!(

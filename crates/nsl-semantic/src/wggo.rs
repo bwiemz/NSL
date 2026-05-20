@@ -57,10 +57,8 @@ pub fn validate_wggo_decorator(
         for arg in args {
             let Some(ref name_sym) = arg.name else {
                 diagnostics.push(
-                    Diagnostic::error(
-                        "@wggo: positional arguments are not allowed".to_string(),
-                    )
-                    .with_label(arg.span, "expected `key = value`"),
+                    Diagnostic::error("@wggo: positional arguments are not allowed".to_string())
+                        .with_label(arg.span, "expected `key = value`"),
                 );
                 continue;
             };
@@ -250,7 +248,9 @@ pub fn validate_wggo_target_self_field_args(
 ) {
     let Some(ref args) = deco.args else { return };
     for arg in args {
-        let Some(arg_name_sym) = arg.name else { continue };
+        let Some(arg_name_sym) = arg.name else {
+            continue;
+        };
         let arg_name = resolve_sym(arg_name_sym);
         if !WGGO_TARGET_REQUIRED_ARGS.contains(&arg_name.as_str()) {
             continue;
@@ -352,7 +352,9 @@ pub fn validate_wggo_target_field_types(
     }
 
     for arg in args {
-        let Some(arg_name_sym) = arg.name else { continue };
+        let Some(arg_name_sym) = arg.name else {
+            continue;
+        };
         let arg_name = resolve_sym(arg_name_sym);
         if !WGGO_TARGET_REQUIRED_ARGS.contains(&arg_name.as_str()) {
             continue;

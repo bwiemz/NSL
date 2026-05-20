@@ -14,7 +14,11 @@ pub fn parse_pattern(p: &mut Parser) -> Pattern {
         while p.eat(&TokenKind::Bar) {
             patterns.push(parse_primary_pattern(p));
         }
-        let span = patterns.first().unwrap().span.merge(patterns.last().unwrap().span);
+        let span = patterns
+            .first()
+            .unwrap()
+            .span
+            .merge(patterns.last().unwrap().span);
         pat = Pattern {
             kind: PatternKind::Or(patterns),
             span,

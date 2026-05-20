@@ -55,9 +55,7 @@ impl GrammarFSM {
             let start = row_ptr[state];
             let end = row_ptr[state + 1];
             debug_assert!(
-                transitions[start..end]
-                    .windows(2)
-                    .all(|w| w[0].0 < w[1].0),
+                transitions[start..end].windows(2).all(|w| w[0].0 < w[1].0),
                 "token transitions must be sorted by token_id for binary search"
             );
         }
@@ -137,7 +135,10 @@ pub struct GrammarRequestState {
 
 impl GrammarRequestState {
     pub fn new(start_state: u32) -> Self {
-        GrammarRequestState { current_state: start_state, active: true }
+        GrammarRequestState {
+            current_state: start_state,
+            active: true,
+        }
     }
 }
 
@@ -205,9 +206,8 @@ pub extern "C" fn nsl_grammar_apply_mask(logits_ptr: i64, state: i64) -> i64 {
         return -1;
     }
 
-    let logits = unsafe {
-        std::slice::from_raw_parts_mut(logits_ptr as *mut f32, ctx.fsm.vocab_size)
-    };
+    let logits =
+        unsafe { std::slice::from_raw_parts_mut(logits_ptr as *mut f32, ctx.fsm.vocab_size) };
     ctx.fsm.apply_logit_mask(logits, state as u32);
     0
 }

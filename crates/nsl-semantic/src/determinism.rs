@@ -3,12 +3,12 @@
 //! Classifies operations as deterministic or non-deterministic,
 //! detects implicit RNG usage, and tracks explicit seed state.
 
-use std::collections::{HashMap, HashSet};
-use nsl_ast::Symbol;
 use nsl_ast::expr::{Expr, ExprKind};
 use nsl_ast::stmt::{Block, StmtKind};
+use nsl_ast::Symbol;
 use nsl_errors::Diagnostic;
 use nsl_lexer::Interner;
+use std::collections::{HashMap, HashSet};
 
 /// How strictly determinism is enforced.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -95,16 +95,17 @@ impl DeterminismChecker {
     pub fn classify_op(&self, op_name: &str) -> NonDetCategory {
         match op_name {
             // Category 1: GPU atomic reductions — auto-fixable
-            "reduce_sum" | "reduce_mean" | "scatter_add" | "embedding_backward" =>
-                NonDetCategory::GpuAtomic,
+            "reduce_sum" | "reduce_mean" | "scatter_add" | "embedding_backward" => {
+                NonDetCategory::GpuAtomic
+            }
 
             // Category 2: Algorithm selection — auto-fixable
-            "matmul" | "conv2d" =>
-                NonDetCategory::AlgorithmSelection,
+            "matmul" | "conv2d" => NonDetCategory::AlgorithmSelection,
 
             // Category 3: Implicit RNG — compile error
-            "rand" | "randn" | "dropout" | "random_normal" | "random_uniform" =>
-                NonDetCategory::ImplicitRng,
+            "rand" | "randn" | "dropout" | "random_normal" | "random_uniform" => {
+                NonDetCategory::ImplicitRng
+            }
 
             // Everything else is deterministic or external
             _ => NonDetCategory::External,
@@ -172,12 +173,19 @@ impl DeterminismChecker {
                     }
                 }
             }
-            StmtKind::VarDecl { value: Some(expr), .. }
+            StmtKind::VarDecl {
+                value: Some(expr), ..
+            }
             | StmtKind::Return(Some(expr))
             | StmtKind::Expr(expr) => {
                 self.scan_expr(expr, interner);
             }
-            StmtKind::If { condition, then_block, elif_clauses, else_block } => {
+            StmtKind::If {
+                condition,
+                then_block,
+                elif_clauses,
+                else_block,
+            } => {
                 self.scan_expr(condition, interner);
                 self.scan_block(then_block, interner);
                 for (cond, block) in elif_clauses {
@@ -249,7 +257,11 @@ impl DeterminismChecker {
             ExprKind::BlockExpr(block) => {
                 self.scan_block(block, interner);
             }
-            ExprKind::IfExpr { condition, then_expr, else_expr } => {
+            ExprKind::IfExpr {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
                 self.scan_expr(condition, interner);
                 self.scan_expr(then_expr, interner);
                 self.scan_expr(else_expr, interner);
@@ -270,7 +282,10 @@ mod tests {
     fn classify_gpu_atomic_ops() {
         let checker = DeterminismChecker::new(DeterminismMode::Global);
         assert_eq!(checker.classify_op("reduce_sum"), NonDetCategory::GpuAtomic);
-        assert_eq!(checker.classify_op("scatter_add"), NonDetCategory::GpuAtomic);
+        assert_eq!(
+            checker.classify_op("scatter_add"),
+            NonDetCategory::GpuAtomic
+        );
     }
 
     #[test]
@@ -283,8 +298,14 @@ mod tests {
     #[test]
     fn classify_algorithm_selection_ops() {
         let checker = DeterminismChecker::new(DeterminismMode::Global);
-        assert_eq!(checker.classify_op("matmul"), NonDetCategory::AlgorithmSelection);
-        assert_eq!(checker.classify_op("conv2d"), NonDetCategory::AlgorithmSelection);
+        assert_eq!(
+            checker.classify_op("matmul"),
+            NonDetCategory::AlgorithmSelection
+        );
+        assert_eq!(
+            checker.classify_op("conv2d"),
+            NonDetCategory::AlgorithmSelection
+        );
     }
 
     #[test]
@@ -321,7 +342,10 @@ mod tests {
     #[test]
     fn deterministic_variant_selection() {
         let checker = DeterminismChecker::new(DeterminismMode::Global);
-        assert_eq!(checker.deterministic_variant("reduce_sum"), Some("nsl_tensor_reduce_sum_deterministic"));
+        assert_eq!(
+            checker.deterministic_variant("reduce_sum"),
+            Some("nsl_tensor_reduce_sum_deterministic")
+        );
         assert_eq!(checker.deterministic_variant("relu"), None);
     }
 
@@ -339,6 +363,9 @@ mod tests {
         let mut interner = nsl_lexer::Interner::new();
         let sym = nsl_ast::Symbol(interner.get_or_intern("rng"));
         checker.register_rng(sym, RngState::ExplicitSeed(42));
-        assert_eq!(checker.rng_variables.get(&sym), Some(&RngState::ExplicitSeed(42)));
+        assert_eq!(
+            checker.rng_variables.get(&sym),
+            Some(&RngState::ExplicitSeed(42))
+        );
     }
 }

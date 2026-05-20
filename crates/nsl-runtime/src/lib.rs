@@ -29,34 +29,32 @@
     clippy::needless_range_loop
 )]
 
-pub mod health;
-pub mod profiler;
-pub mod print;
-pub mod power;
-pub mod memory;
-pub mod list;
-pub mod string;
-pub mod string_ops;
-pub mod io;
-pub mod dict;
-pub mod range;
-pub mod hof;
-pub mod math;
-pub mod assert;
-pub mod file_io;
 pub mod args;
-pub mod tensor;
+pub mod assert;
 pub(crate) mod cpu;
 pub(crate) mod cuda;
+pub mod dict;
+pub mod file_io;
+pub mod health;
+pub mod hof;
+pub mod io;
+pub mod list;
+pub mod math;
+pub mod memory;
+pub mod power;
+pub mod print;
+pub mod profiler;
+pub mod range;
+pub mod string;
+pub mod string_ops;
+pub mod tensor;
 
 // Doc-hidden re-exports for cross-crate integration tests
 // (see crates/nsl-codegen/tests/csha_cuda_launch_*). Keeping the cuda
 // module pub(crate) otherwise avoids leaking the driver API.
 #[doc(hidden)]
 pub use cuda::{
-    nsl_cuda_init,
-    nsl_test_cuda_alloc, nsl_test_cuda_free,
-    nsl_test_cuda_h2d, nsl_test_cuda_d2h,
+    nsl_cuda_init, nsl_test_cuda_alloc, nsl_test_cuda_d2h, nsl_test_cuda_free, nsl_test_cuda_h2d,
     nsl_test_cuda_jit_log,
 };
 
@@ -64,25 +62,23 @@ pub use cuda::{
 // tests in `tests/tier_b1_prepass_gpu.rs`; the orchestration FFI uses
 // them internally via `cuda::tier_b1_prepass::launch_*`).
 #[doc(hidden)]
-pub use cuda::tier_b1_prepass::{
-    CSHA_TIER_B1_PREPASS_W_PTX, CSHA_TIER_B1_PREPASS_X_PTX,
-};
+pub use cuda::tier_b1_prepass::{CSHA_TIER_B1_PREPASS_W_PTX, CSHA_TIER_B1_PREPASS_X_PTX};
 
 // Test-only re-export: SM version query for dispatcher tests.
 #[cfg(feature = "test-hooks")]
 pub use cuda::test_detect_sm_version;
 
 pub mod autodiff;
-pub mod checkpoint;
-pub mod inspect;
-pub mod tokenizer;
-pub mod quantize;
-pub mod fp8;
 pub mod awq;
+pub mod checkpoint;
 pub mod fase_bc;
+pub mod fp8;
+pub mod inspect;
+pub mod quantize;
+pub mod tokenizer;
 #[allow(deprecated)]
 pub use awq::{
-    nsl_awq_write_sidecar,  // deprecated; kept as the rename shim during transition
+    nsl_awq_write_sidecar, // deprecated; kept as the rename shim during transition
     nsl_calib_write_sidecar,
     AwqProjectionDescriptor,
     WggoLayerDescriptor,
@@ -92,23 +88,22 @@ pub mod gptq;
 // Calibration-data loader: .bin and .safetensors dispatch (unconditional)
 pub mod calibration_data;
 pub use calibration_data::{
-    nsl_calibration_load, nsl_calibration_batch_at,
-    nsl_calibration_count, nsl_calibration_free,
+    nsl_calibration_batch_at, nsl_calibration_count, nsl_calibration_free, nsl_calibration_load,
 };
 
 // M18b: Interop modules (feature-gated)
 #[cfg(feature = "interop")]
-pub mod safetensors_io;
-#[cfg(feature = "interop")]
 pub mod huggingface;
-#[cfg(feature = "interop")]
-pub mod weight_map;
-#[cfg(feature = "interop")]
-pub mod trace;
 #[cfg(feature = "interop")]
 pub mod onnx;
 #[cfg(feature = "interop")]
 pub mod onnx_proto;
+#[cfg(feature = "interop")]
+pub mod safetensors_io;
+#[cfg(feature = "interop")]
+pub mod trace;
+#[cfg(feature = "interop")]
+pub mod weight_map;
 
 // Stubs for interop FFI symbols when feature is disabled.
 // The codegen always declares these as external imports, so the linker
@@ -116,42 +111,42 @@ pub mod onnx_proto;
 #[cfg(not(feature = "interop"))]
 mod interop_stubs;
 
-pub mod sampling;
-pub mod data_source;
-pub mod packing;
-pub mod dataloader;
-pub mod weight_provider;
-pub mod paged_kv;
-pub mod profiling;
-pub mod kernel_profiler;
-pub mod flash_attention;
-pub mod pca_tier_b_runtime;
-pub mod pca_rope_runtime;
-pub mod serving;
-pub mod tensor_parallel;
-pub mod moe;
-pub mod speculative;
+pub mod backward_context;
+pub mod cfie;
 pub mod context_parallel;
-pub mod slab;
+pub mod cpdt;
+pub mod data;
+pub mod data_source;
+pub mod dataloader;
+pub mod deterministic_ops;
 pub mod disaggregated;
 pub mod elastic;
-pub mod kv_compress;
-pub mod grammar;
-pub mod token_alignment;
+pub mod flash_attention;
 pub mod gpu_backend;
-pub mod vmap_runtime;
-pub mod backward_context;
-pub mod pipeline;
-pub mod data;
-pub mod zero;
-pub mod tensor_trace;
-pub mod trace_diff;
-pub mod deterministic_ops;
+pub mod grammar;
+pub mod kernel_profiler;
+pub mod kv_compress;
+pub mod moe;
 pub mod multimodal;
-pub mod cfie;
-pub mod cpdt;
-pub mod sparse;
+pub mod packing;
+pub mod paged_kv;
+pub mod pca_rope_runtime;
+pub mod pca_tier_b_runtime;
 pub mod peft;
+pub mod pipeline;
+pub mod profiling;
+pub mod sampling;
+pub mod serving;
+pub mod slab;
+pub mod sparse;
+pub mod speculative;
+pub mod tensor_parallel;
+pub mod tensor_trace;
+pub mod token_alignment;
+pub mod trace_diff;
+pub mod vmap_runtime;
+pub mod weight_provider;
+pub mod zero;
 
 // WRGA B.3 Task 4: fused LoRA/IA³ adapter FFIs
 pub mod fused_adapter;
@@ -160,8 +155,8 @@ pub mod fused_adapter;
 pub mod unikernel;
 
 // M62: Legacy Interop — DLPack bridge + C API
-pub mod dlpack;
 pub mod c_api;
+pub mod dlpack;
 
 // M56: Agent runtime — mailboxes, scheduler, pool, FFI.
 pub mod agent;

@@ -190,10 +190,7 @@ mod tests {
     fn push_and_pop_roundtrip_through_ffi() {
         let _serial = cfie_serial_lock();
         assert_eq!(nsl_cfie_ring_init(16), 0);
-        assert_eq!(
-            nsl_cfie_ring_push(42, 0x1000, 8, 128, 0, 0x0032_0032),
-            1
-        );
+        assert_eq!(nsl_cfie_ring_push(42, 0x1000, 8, 128, 0, 0x0032_0032), 1);
         assert_eq!(nsl_cfie_ring_len(), 1);
 
         let mut id = 0i64;
@@ -202,9 +199,8 @@ mod tests {
         let mut mnt = 0i64;
         let mut gs = 0i64;
         let mut sp = 0i64;
-        let ok = unsafe {
-            nsl_cfie_ring_pop(&mut id, &mut ptr, &mut plen, &mut mnt, &mut gs, &mut sp)
-        };
+        let ok =
+            unsafe { nsl_cfie_ring_pop(&mut id, &mut ptr, &mut plen, &mut mnt, &mut gs, &mut sp) };
         assert_eq!(ok, 1);
         assert_eq!(id, 42);
         assert_eq!(ptr, 0x1000);
@@ -234,9 +230,7 @@ mod tests {
         let mut c = 0i64;
         let mut d = 0i64;
         let mut e = 0i64;
-        let ok = unsafe {
-            nsl_cfie_ring_pop(&mut id, &mut a, &mut b, &mut c, &mut d, &mut e)
-        };
+        let ok = unsafe { nsl_cfie_ring_pop(&mut id, &mut a, &mut b, &mut c, &mut d, &mut e) };
         assert_eq!(ok, 0);
     }
 

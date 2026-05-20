@@ -19,7 +19,12 @@ fn op(id: u32, result: u32, o: PrimalOp, inputs: Vec<u32>) -> WengertOp {
 
 /// Chain graph x → a → b → c → d — the first activation (var 1) naturally
 /// dies early (last consumed at pp 2), so pinning it should extend its death.
-fn build_chain_inputs() -> (WengertList, BTreeSet<VarId>, HashMap<VarId, u64>, BTreeSet<VarId>) {
+fn build_chain_inputs() -> (
+    WengertList,
+    BTreeSet<VarId>,
+    HashMap<VarId, u64>,
+    BTreeSet<VarId>,
+) {
     let list = WengertList {
         ops: vec![
             op(0, 0, PrimalOp::Input("x".into()), vec![]),
@@ -68,7 +73,12 @@ fn pinned_var_has_extended_death() {
     );
 
     // And it should be past the max program-point death seen in the unpinned plan.
-    let max_pp = no_pin.assignments.iter().map(|s| s.death).max().unwrap_or(0);
+    let max_pp = no_pin
+        .assignments
+        .iter()
+        .map(|s| s.death)
+        .max()
+        .unwrap_or(0);
     assert!(pin_death > max_pp);
 }
 
@@ -76,8 +86,7 @@ fn pinned_var_has_extended_death() {
 fn unpinned_plan_is_unchanged_when_set_is_empty() {
     let (list, live, sizes, extra) = build_chain_inputs();
     let no_pin = plan_memory(&list, &live, &sizes, &extra);
-    let with_empty_pin =
-        plan_memory_with_pin(&list, &live, &sizes, &extra, &BTreeSet::new());
+    let with_empty_pin = plan_memory_with_pin(&list, &live, &sizes, &extra, &BTreeSet::new());
 
     assert_eq!(no_pin.assignments.len(), with_empty_pin.assignments.len());
     for (a, b) in no_pin

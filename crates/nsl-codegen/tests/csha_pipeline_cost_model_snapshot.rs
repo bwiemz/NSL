@@ -10,9 +10,7 @@
 //! for the per-bug derivation table.
 
 use insta::assert_snapshot;
-use nsl_codegen::csha_pipeline::{
-    FusionLevel, TileConfig, fused_hbm_bytes, pipeline_smem_bytes,
-};
+use nsl_codegen::csha_pipeline::{fused_hbm_bytes, pipeline_smem_bytes, FusionLevel, TileConfig};
 use nsl_codegen::wggo_cost::LayerShape;
 
 fn small_shape() -> LayerShape {

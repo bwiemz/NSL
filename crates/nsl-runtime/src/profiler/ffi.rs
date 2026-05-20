@@ -130,4 +130,6 @@ pub unsafe extern "C" fn nsl_profile_flush(path_ptr: *const u8, path_len: usize)
 // non-cuda branch of ensure_collector).
 #[cfg(feature = "cuda")]
 #[allow(dead_code)]
-fn _nanoclock_typecheck() -> NanoClock { NanoClock }
+fn _nanoclock_typecheck() -> NanoClock {
+    NanoClock
+}

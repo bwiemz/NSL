@@ -300,7 +300,10 @@ mod tests {
         assert!(diags.is_empty(), "diags: {:?}", diags);
         let info = result.unwrap();
         assert_eq!(info.name, "CSR");
-        assert_eq!(info.levels, vec![LevelFormat::Dense, LevelFormat::Compressed]);
+        assert_eq!(
+            info.levels,
+            vec![LevelFormat::Dense, LevelFormat::Compressed]
+        );
         assert!(info.is_sparse());
         assert_eq!(info.to_sparse_format_id(), Some(1));
     }
@@ -315,7 +318,10 @@ mod tests {
         let mut diags = vec![];
         let info = validate_layout_decorator(&deco, &resolver, &mut diags).unwrap();
         assert_eq!(info.name, "CSC");
-        assert_eq!(info.levels, vec![LevelFormat::Compressed, LevelFormat::Dense]);
+        assert_eq!(
+            info.levels,
+            vec![LevelFormat::Compressed, LevelFormat::Dense]
+        );
         assert_eq!(info.to_sparse_format_id(), Some(2));
     }
 
@@ -412,7 +418,10 @@ mod tests {
         let mut diags = vec![];
         let info = validate_layout_decorator(&deco, &resolver, &mut diags).unwrap();
         assert_eq!(info.name, "CSR");
-        assert_eq!(info.levels, vec![LevelFormat::Dense, LevelFormat::Compressed]);
+        assert_eq!(
+            info.levels,
+            vec![LevelFormat::Dense, LevelFormat::Compressed]
+        );
     }
 
     #[test]

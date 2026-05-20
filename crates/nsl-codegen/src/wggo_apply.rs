@@ -132,7 +132,7 @@ pub fn apply(inter: &InterLayerPlan, ilp: &[LayerIlpSolution]) -> AppliedPlan {
 mod tests {
     use super::*;
     use crate::wggo_cost::{build_lut, LayerShape, LutAxes};
-    use crate::wggo_dp::{LayerPlan, LayerDecision as CoarseDecision};
+    use crate::wggo_dp::{LayerDecision as CoarseDecision, LayerPlan};
     use crate::wggo_ilp::{solve_layer, LayerIlpConstraints};
 
     fn toy_shape() -> LayerShape {

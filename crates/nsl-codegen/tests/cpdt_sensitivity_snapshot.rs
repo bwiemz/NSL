@@ -30,14 +30,17 @@ struct FixtureSnapshot {
 
 /// Workspace root: CARGO_MANIFEST_DIR is crates/nsl-codegen; go up two.
 fn workspace_fixture_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tests/fixtures/cpdt_calibration")
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/cpdt_calibration")
 }
 
 fn load_expected() -> Vec<FixtureSnapshot> {
     let path = workspace_fixture_dir().join("expected_weights_present.json");
-    let json = std::fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("expected_weights_present.json not found at {}: {e}", path.display()));
+    let json = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+        panic!(
+            "expected_weights_present.json not found at {}: {e}",
+            path.display()
+        )
+    });
     serde_json::from_str(&json).expect("expected_weights_present.json parse error")
 }
 

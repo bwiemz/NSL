@@ -136,17 +136,20 @@ pub fn parse_model_def_stmt(p: &mut Parser) -> Stmt {
             };
             p.expect(&TokenKind::Colon);
             let body = p.parse_block();
-            members.push(ModelMember::Method(FnDef {
-                name: mname,
-                type_params: mtype_params,
-                effect_params: vec![],
-                params: mparams,
-                return_type,
-                return_effect: None,
-                body: body.clone(),
-                is_async,
-                span: method_start.merge(body.span),
-            }, decorators));
+            members.push(ModelMember::Method(
+                FnDef {
+                    name: mname,
+                    type_params: mtype_params,
+                    effect_params: vec![],
+                    params: mparams,
+                    return_type,
+                    return_effect: None,
+                    body: body.clone(),
+                    is_async,
+                    span: method_start.merge(body.span),
+                },
+                decorators,
+            ));
         } else {
             // Layer/field declaration: name: Type = init_expr
             let member_start = p.current_span();

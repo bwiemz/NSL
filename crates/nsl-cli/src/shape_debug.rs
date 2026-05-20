@@ -144,7 +144,9 @@ fn walk_stmt(
         StmtKind::Decorated { stmt: inner, .. } => {
             walk_stmt(inner, input, out, total_flops, error_count)
         }
-        StmtKind::VarDecl { value: Some(expr), .. } => {
+        StmtKind::VarDecl {
+            value: Some(expr), ..
+        } => {
             render_expr_line(expr, stmt.span, input, out, total_flops, error_count);
         }
         StmtKind::Return(Some(expr)) | StmtKind::Expr(expr) => {
@@ -176,7 +178,9 @@ fn render_expr_line(
 ) {
     let ty = input.analysis.type_map.get(&expr.id);
     // Skip non-tensor expressions — we only want shape-carrying lines.
-    let is_tensor = ty.map(|t| t.is_tensor() || matches!(t, Type::Unknown)).unwrap_or(false);
+    let is_tensor = ty
+        .map(|t| t.is_tensor() || matches!(t, Type::Unknown))
+        .unwrap_or(false);
     if !is_tensor {
         return;
     }
@@ -355,7 +359,8 @@ fn estimate_flops_for_call(
                 let m = out_dims[out_dims.len() - 2];
                 let batch: u64 = out_dims[..out_dims.len() - 2].iter().product();
                 let batch = batch.max(1);
-                let (f, _, _) = nsl_codegen::cost_model::batched_matmul_cost(batch, m, k, n, dtype_bytes);
+                let (f, _, _) =
+                    nsl_codegen::cost_model::batched_matmul_cost(batch, m, k, n, dtype_bytes);
                 return f;
             }
             0

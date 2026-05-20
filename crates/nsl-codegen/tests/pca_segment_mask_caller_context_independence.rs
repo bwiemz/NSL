@@ -18,12 +18,12 @@ fn capture_helper_emission_in(ctx: CallerContext) -> String {
     // Caller-context-dependent prelude.  The helper's emission MUST
     // NOT change based on what came before it in the kernel.
     let mut ptx = match ctx {
-        CallerContext::ForwardScompute => String::from(
-            "// forward s_compute caller prelude — irrelevant to helper\n",
-        ),
-        CallerContext::BackwardDsCompute => String::from(
-            "// backward ds_compute caller prelude — irrelevant to helper\n",
-        ),
+        CallerContext::ForwardScompute => {
+            String::from("// forward s_compute caller prelude — irrelevant to helper\n")
+        }
+        CallerContext::BackwardDsCompute => {
+            String::from("// backward ds_compute caller prelude — irrelevant to helper\n")
+        }
     };
     let prelude_len = ptx.len();
 

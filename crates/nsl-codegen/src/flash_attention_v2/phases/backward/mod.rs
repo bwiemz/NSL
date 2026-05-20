@@ -4,11 +4,11 @@
 //! (q_load, s_recompute, ds_compute, dp_compute, softmax_backward,
 //! dqk_accum, dv_accum, dwq_dwk_dwv, dx_finalize) will land in
 //! T3.2..T3.8 as Phase 3 progresses.
-pub mod prelude;
-pub mod q_load;
-pub mod kv_load;
+pub mod csha_hooks_backward;
+pub mod dqdk_accum;
 pub mod ds_compute;
 pub mod dv_accum;
-pub mod dqdk_accum;
-pub mod csha_hooks_backward;
 pub mod finalize;
+pub mod kv_load;
+pub mod prelude;
+pub mod q_load;

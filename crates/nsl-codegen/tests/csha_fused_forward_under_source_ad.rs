@@ -117,10 +117,7 @@ fn compile_source_ad_csha_to_object(src: &str) -> Option<Vec<u8>> {
     ) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!(
-                "[csha-3a] stdlib_loader failed — skipping ({})",
-                e.message
-            );
+            eprintln!("[csha-3a] stdlib_loader failed — skipping ({})", e.message);
             return None;
         }
     };

@@ -1,6 +1,6 @@
-use serde::Serialize;
 use crate::expr::Expr;
 use crate::{NodeId, Span, Symbol};
+use serde::Serialize;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TypeExpr {
@@ -15,10 +15,7 @@ pub enum TypeExprKind {
     Named(Symbol),
 
     /// Generic type: list<int>, dict<str, float>
-    Generic {
-        name: Symbol,
-        args: Vec<TypeExpr>,
-    },
+    Generic { name: Symbol, args: Vec<TypeExpr> },
 
     /// Tensor<[shape], dtype, device>
     Tensor {
@@ -28,16 +25,10 @@ pub enum TypeExprKind {
     },
 
     /// Param<[shape], dtype>
-    Param {
-        shape: Vec<DimExpr>,
-        dtype: Symbol,
-    },
+    Param { shape: Vec<DimExpr>, dtype: Symbol },
 
     /// Buffer<[shape], dtype>
-    Buffer {
-        shape: Vec<DimExpr>,
-        dtype: Symbol,
-    },
+    Buffer { shape: Vec<DimExpr>, dtype: Symbol },
 
     /// Sparse<[shape], dtype, format>
     Sparse {

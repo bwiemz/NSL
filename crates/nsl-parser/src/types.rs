@@ -56,8 +56,10 @@ pub fn parse_primary_type(p: &mut Parser) -> TypeExpr {
         // Reject &&T — nested borrows are not supported
         if matches!(inner.kind, TypeExprKind::Borrow(_)) {
             p.diagnostics.push(
-                nsl_errors::Diagnostic::error("nested borrows (`&&T`) are not supported — use a single `&T` borrow")
-                    .with_label(start.merge(inner.span), "remove the extra `&`"),
+                nsl_errors::Diagnostic::error(
+                    "nested borrows (`&&T`) are not supported — use a single `&T` borrow",
+                )
+                .with_label(start.merge(inner.span), "remove the extra `&`"),
             );
         }
         let span = start.merge(inner.span);
@@ -121,8 +123,10 @@ pub fn parse_primary_type(p: &mut Parser) -> TypeExpr {
                 }
                 _ => {
                     p.diagnostics.push(
-                        nsl_errors::Diagnostic::error("expected integer literal in fixed array size")
-                            .with_label(p.current_span(), "expected integer"),
+                        nsl_errors::Diagnostic::error(
+                            "expected integer literal in fixed array size",
+                        )
+                        .with_label(p.current_span(), "expected integer"),
                     );
                     1
                 }
@@ -160,11 +164,15 @@ fn parse_generic_or_tensor_type(p: &mut Parser, name: Symbol, start: Span) -> Ty
     let name_str = p.resolve(name).unwrap_or("").to_string();
 
     match name_str.as_str() {
-        "Tensor" => parse_tensor_type(p, start, TypeExprKind::Tensor {
-            shape: Vec::new(),
-            dtype: name, // placeholder
-            device: None,
-        }),
+        "Tensor" => parse_tensor_type(
+            p,
+            start,
+            TypeExprKind::Tensor {
+                shape: Vec::new(),
+                dtype: name, // placeholder
+                device: None,
+            },
+        ),
         "Param" => parse_param_type(p, start),
         "Buffer" => parse_buffer_type(p, start),
         "Sparse" => parse_sparse_type(p, start),

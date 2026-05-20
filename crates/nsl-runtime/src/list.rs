@@ -32,7 +32,8 @@ pub extern "C" fn nsl_list_push(list_ptr: i64, value: i64) {
         let old_size = (list.cap as usize) * std::mem::size_of::<i64>();
         list.cap *= 2;
         let new_size = (list.cap as usize) * std::mem::size_of::<i64>();
-        list.data = unsafe { checked_realloc(list.data as *mut u8, old_size, new_size) as *mut i64 };
+        list.data =
+            unsafe { checked_realloc(list.data as *mut u8, old_size, new_size) as *mut i64 };
     }
     unsafe {
         *list.data.add(list.len as usize) = value;
@@ -104,10 +105,18 @@ pub extern "C" fn nsl_list_slice(list_ptr: i64, lo: i64, hi: i64, step_val: i64)
     if step > 0 {
         let mut low = if lo == i64::MIN { 0 } else { lo };
         let mut high = if hi == i64::MIN { len } else { hi };
-        if low < 0 { low += len; }
-        if high < 0 { high += len; }
-        if low < 0 { low = 0; }
-        if high > len { high = len; }
+        if low < 0 {
+            low += len;
+        }
+        if high < 0 {
+            high += len;
+        }
+        if low < 0 {
+            low = 0;
+        }
+        if high > len {
+            high = len;
+        }
 
         let mut i = low;
         while i < high {
@@ -118,9 +127,15 @@ pub extern "C" fn nsl_list_slice(list_ptr: i64, lo: i64, hi: i64, step_val: i64)
         let mut low = if lo == i64::MIN { len - 1 } else { lo };
         let high = if hi == i64::MIN { -(len + 1) } else { hi };
         let mut adj_high = high;
-        if low < 0 { low += len; }
-        if adj_high < 0 { adj_high += len; }
-        if low >= len { low = len - 1; }
+        if low < 0 {
+            low += len;
+        }
+        if adj_high < 0 {
+            adj_high += len;
+        }
+        if low >= len {
+            low = len - 1;
+        }
 
         let mut i = low;
         while i > adj_high {
@@ -143,6 +158,8 @@ pub extern "C" fn nsl_list_free(list_ptr: i64) {
     }
     let list = unsafe { Box::from_raw(list_ptr as *mut NslList) };
     let size = (list.cap as usize) * std::mem::size_of::<i64>();
-    unsafe { crate::memory::checked_free(list.data as *mut u8, size); }
+    unsafe {
+        crate::memory::checked_free(list.data as *mut u8, size);
+    }
     // Box drops here, freeing the NslList struct
 }

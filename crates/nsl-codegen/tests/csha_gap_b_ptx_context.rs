@@ -83,8 +83,7 @@ fn inference_program_leaves_training_ptx_unpopulated() {
 
 #[test]
 fn training_program_embeds_both_save_forward_and_backward_ptx() {
-    let (has_saves_ptx, has_bwd_ptx, training_level) =
-        flash_gap_b_context_for_source(TRAINING_SRC);
+    let (has_saves_ptx, has_bwd_ptx, training_level) = flash_gap_b_context_for_source(TRAINING_SRC);
     assert!(
         has_saves_ptx,
         "Gap B must embed CSHA with-saves forward PTX when @train is \
@@ -133,7 +132,9 @@ fn with_saves_ptx_contains_csha_save_labels() {
         rope_style: RopeStyle::HalfSplit,
         gqa_group_size: 1,
         tree_mask: false,
-        gpu_sm: 80, segment_masked: false, csha: Some(CshaExtras {
+        gpu_sm: 80,
+        segment_masked: false,
+        csha: Some(CshaExtras {
             level: 1,
             fused_rmsnorm: false,
             fused_projections: false,

@@ -54,7 +54,9 @@ struct Xorshift64 {
 #[cfg(test)]
 impl Xorshift64 {
     fn new(seed: u64) -> Self {
-        Self { state: if seed == 0 { 1 } else { seed } }
+        Self {
+            state: if seed == 0 { 1 } else { seed },
+        }
     }
 
     fn next(&mut self) -> u64 {
@@ -143,7 +145,9 @@ impl FuzzState {
                     FuzzOp::Free { idx }
                 }
             }
-            25..=29 => FuzzOp::Clone { idx: self.pick_live().unwrap() },
+            25..=29 => FuzzOp::Clone {
+                idx: self.pick_live().unwrap(),
+            },
             30..=34 => {
                 let idx = self.pick_live().unwrap();
                 let shape = &self.shapes[idx];
@@ -155,13 +159,21 @@ impl FuzzState {
                 let idx = self.pick_live().unwrap();
                 let ndim = self.shapes[idx].len() as i64;
                 if ndim >= 2 {
-                    FuzzOp::Transpose { idx, dim0: 0, dim1: ndim - 1 }
+                    FuzzOp::Transpose {
+                        idx,
+                        dim0: 0,
+                        dim1: ndim - 1,
+                    }
                 } else {
                     FuzzOp::Clone { idx }
                 }
             }
-            40..=49 => FuzzOp::Add { idx: self.pick_live().unwrap() },
-            50..=59 => FuzzOp::Mul { idx: self.pick_live().unwrap() },
+            40..=49 => FuzzOp::Add {
+                idx: self.pick_live().unwrap(),
+            },
+            50..=59 => FuzzOp::Mul {
+                idx: self.pick_live().unwrap(),
+            },
             60..=64 => {
                 let idx = self.pick_live().unwrap();
                 let shape = &self.shapes[idx];
@@ -169,18 +181,31 @@ impl FuzzState {
                     let n = self.rng.next_bounded(16) as i64 + 1;
                     FuzzOp::MatMul { idx, n }
                 } else {
-                    FuzzOp::ScalarMul { idx, scalar: self.rng.next_f64() * 10.0 }
+                    FuzzOp::ScalarMul {
+                        idx,
+                        scalar: self.rng.next_f64() * 10.0,
+                    }
                 }
             }
             65..=69 => FuzzOp::ScalarMul {
                 idx: self.pick_live().unwrap(),
                 scalar: self.rng.next_f64() * 10.0 - 5.0,
             },
-            70..=74 => FuzzOp::Sum { idx: self.pick_live().unwrap() },
-            75..=79 => FuzzOp::Mean { idx: self.pick_live().unwrap() },
-            80..=86 => FuzzOp::ReLU { idx: self.pick_live().unwrap() },
-            87..=93 => FuzzOp::Sigmoid { idx: self.pick_live().unwrap() },
-            _ => FuzzOp::Tanh { idx: self.pick_live().unwrap() },
+            70..=74 => FuzzOp::Sum {
+                idx: self.pick_live().unwrap(),
+            },
+            75..=79 => FuzzOp::Mean {
+                idx: self.pick_live().unwrap(),
+            },
+            80..=86 => FuzzOp::ReLU {
+                idx: self.pick_live().unwrap(),
+            },
+            87..=93 => FuzzOp::Sigmoid {
+                idx: self.pick_live().unwrap(),
+            },
+            _ => FuzzOp::Tanh {
+                idx: self.pick_live().unwrap(),
+            },
         }
     }
 
@@ -193,7 +218,11 @@ impl FuzzState {
             3 => FuzzOp::Randn { dims },
             _ => {
                 let stop = self.rng.next_bounded(64) as f64 + 1.0;
-                FuzzOp::Arange { start: 0.0, stop, step: 1.0 }
+                FuzzOp::Arange {
+                    start: 0.0,
+                    stop,
+                    step: 1.0,
+                }
             }
         }
     }
@@ -247,8 +276,8 @@ impl FuzzState {
     }
 
     fn execute_op(&mut self, op: FuzzOp) {
-        use crate::tensor::*;
         use crate::list::*;
+        use crate::tensor::*;
 
         match op {
             FuzzOp::Zeros { dims } => {
@@ -467,7 +496,10 @@ fn assert_counter_balance(seed: u64) {
              Leaked: {} tensors, {} bytes\n\
              Replay: cargo test -p nsl-runtime fuzz_memory_lifecycle -- (with seed {})",
             seed,
-            ac, ab, fc, fb,
+            ac,
+            ab,
+            fc,
+            fb,
             ac as isize - fc as isize,
             ab as isize - fb as isize,
             seed
@@ -485,7 +517,10 @@ fn assert_counter_balance(seed: u64) {
              CUDA: allocated {} ({} bytes), freed {} ({} bytes)\n\
              Leaked: {} tensors, {} bytes",
             seed,
-            cac, cab, cfc, cfb,
+            cac,
+            cab,
+            cfc,
+            cfb,
             cac as isize - cfc as isize,
             cab as isize - cfb as isize,
         );
@@ -518,15 +553,17 @@ mod tests {
         assert_eq!(stats::alloc_bytes(), 256);
         assert_eq!(stats::free_count(), 0);
 
-        unsafe { crate::memory::checked_free(ptr, 256); }
+        unsafe {
+            crate::memory::checked_free(ptr, 256);
+        }
         assert_eq!(stats::free_count(), 1);
         assert_eq!(stats::free_bytes(), 256);
     }
 
     #[test]
     fn test_tensor_lifecycle_counter_balance() {
-        use crate::tensor::{nsl_tensor_zeros, nsl_tensor_add, nsl_tensor_free};
-        use crate::list::{nsl_list_new, nsl_list_push, nsl_list_free};
+        use crate::list::{nsl_list_free, nsl_list_new, nsl_list_push};
+        use crate::tensor::{nsl_tensor_add, nsl_tensor_free, nsl_tensor_zeros};
 
         stats::reset();
 
@@ -558,12 +595,23 @@ mod tests {
         for _ in 0..100 {
             ops.push(state.generate_op());
         }
-        let creation_count = ops.iter().filter(|op| matches!(op,
-            super::FuzzOp::Zeros { .. } | super::FuzzOp::Ones { .. } |
-            super::FuzzOp::Rand { .. } | super::FuzzOp::Randn { .. } |
-            super::FuzzOp::Arange { .. }
-        )).count();
-        assert!(creation_count > 0, "should generate at least one creation op");
+        let creation_count = ops
+            .iter()
+            .filter(|op| {
+                matches!(
+                    op,
+                    super::FuzzOp::Zeros { .. }
+                        | super::FuzzOp::Ones { .. }
+                        | super::FuzzOp::Rand { .. }
+                        | super::FuzzOp::Randn { .. }
+                        | super::FuzzOp::Arange { .. }
+                )
+            })
+            .count();
+        assert!(
+            creation_count > 0,
+            "should generate at least one creation op"
+        );
         assert!(ops.len() == 100, "should generate exactly 100 ops");
     }
 
@@ -610,14 +658,14 @@ mod tests {
                     let op = state.generate_op();
                     match &op {
                         // Skip tape control ops — we manage the lifecycle explicitly
-                        super::FuzzOp::TapeStart |
-                        super::FuzzOp::TapeStop |
-                        super::FuzzOp::TapeBackwardAndStop => continue,
+                        super::FuzzOp::TapeStart
+                        | super::FuzzOp::TapeStop
+                        | super::FuzzOp::TapeBackwardAndStop => continue,
                         // Skip shape-altering ops — backward can't handle shape mismatches
-                        super::FuzzOp::Reshape { .. } |
-                        super::FuzzOp::Transpose { .. } |
-                        super::FuzzOp::MatMul { .. } |
-                        super::FuzzOp::Free { .. } => continue,
+                        super::FuzzOp::Reshape { .. }
+                        | super::FuzzOp::Transpose { .. }
+                        | super::FuzzOp::MatMul { .. }
+                        | super::FuzzOp::Free { .. } => continue,
                         _ => state.execute_op(op),
                     }
                 }

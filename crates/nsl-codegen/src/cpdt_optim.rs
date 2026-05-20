@@ -20,21 +20,13 @@ use crate::cpdt_tier_apply::{OptimPrecision, ParamPrecision};
 pub enum QuantizedOptimOp {
     /// Load `m` from HBM (stored in `src_precision`), dequantize to
     /// compute precision (FP32), and place in the register file.
-    DequantLoadM {
-        src_precision: OptimPrecision,
-    },
+    DequantLoadM { src_precision: OptimPrecision },
     /// Load `v` similarly.
-    DequantLoadV {
-        src_precision: OptimPrecision,
-    },
+    DequantLoadV { src_precision: OptimPrecision },
     /// `m = β₁·m + (1-β₁)·g`.
-    MomentumUpdate {
-        beta1: f64,
-    },
+    MomentumUpdate { beta1: f64 },
     /// `v = β₂·v + (1-β₂)·g²`.
-    VarianceUpdate {
-        beta2: f64,
-    },
+    VarianceUpdate { beta2: f64 },
     /// `θ ← θ - lr · (m̂ / (√v̂ + ε) + wd·θ)`.
     ParamUpdate {
         lr: f64,
@@ -110,8 +102,10 @@ impl Default for AdamWHyperparams {
 
 /// Emit the fused-step program for a single parameter.
 pub fn emit_step(precision: &ParamPrecision, hyper: &AdamWHyperparams) -> QuantizedOptimProgram {
-    let m_stochastic = precision.stochastic_rounding && precision.m_precision == OptimPrecision::Int8;
-    let v_stochastic = precision.stochastic_rounding && precision.v_precision == OptimPrecision::Int8;
+    let m_stochastic =
+        precision.stochastic_rounding && precision.m_precision == OptimPrecision::Int8;
+    let v_stochastic =
+        precision.stochastic_rounding && precision.v_precision == OptimPrecision::Int8;
     let blockwise_m = precision.m_precision == OptimPrecision::Int8;
     let blockwise_v = precision.v_precision == OptimPrecision::Int8;
 
@@ -187,7 +181,10 @@ mod tests {
         let p = param("w", OptimPrecision::Int8, OptimPrecision::Fp16, false);
         let prog = emit_step(&p, &AdamWHyperparams::default());
         assert_eq!(prog.len(), 8);
-        assert!(matches!(prog.ops.last(), Some(QuantizedOptimOp::FreeGradient)));
+        assert!(matches!(
+            prog.ops.last(),
+            Some(QuantizedOptimOp::FreeGradient)
+        ));
     }
 
     #[test]
@@ -210,8 +207,19 @@ mod tests {
             .ops
             .iter()
             .filter(|op| {
-                matches!(op, QuantizedOptimOp::QuantStoreM { stochastic: true, .. })
-                    || matches!(op, QuantizedOptimOp::QuantStoreV { stochastic: true, .. })
+                matches!(
+                    op,
+                    QuantizedOptimOp::QuantStoreM {
+                        stochastic: true,
+                        ..
+                    }
+                ) || matches!(
+                    op,
+                    QuantizedOptimOp::QuantStoreV {
+                        stochastic: true,
+                        ..
+                    }
+                )
             })
             .collect();
         assert_eq!(stoch_stores.len(), 2);
@@ -230,7 +238,12 @@ mod tests {
 
     #[test]
     fn program_carries_param_name() {
-        let p = param("blocks.4.ffn.w_gate.weight", OptimPrecision::Int8, OptimPrecision::Fp16, false);
+        let p = param(
+            "blocks.4.ffn.w_gate.weight",
+            OptimPrecision::Int8,
+            OptimPrecision::Fp16,
+            false,
+        );
         let prog = emit_step(&p, &AdamWHyperparams::default());
         assert_eq!(prog.param_name, "blocks.4.ffn.w_gate.weight");
     }

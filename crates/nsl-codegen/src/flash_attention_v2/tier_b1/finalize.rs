@@ -84,16 +84,19 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig) {
     // tiles for a given lane, so compute once.
     ptx.push_str("    mov.u32 %fin_laneid, %tid.x;\n");
     ptx.push_str("    and.b32 %fin_laneid, %fin_laneid, 31;\n");
-    ptx.push_str("    shr.u32 %fin_lo_row, %fin_laneid, 2;       // l/4 = D-fragment row within lo half\n");
+    ptx.push_str(
+        "    shr.u32 %fin_lo_row, %fin_laneid, 2;       // l/4 = D-fragment row within lo half\n",
+    );
     ptx.push_str("    and.b32 %fin_lo_col_base, %fin_laneid, 3;  // l%4\n");
-    ptx.push_str("    shl.b32 %fin_lo_col_base, %fin_lo_col_base, 1; // (l%4)*2 = D-fragment col base\n");
+    ptx.push_str(
+        "    shl.b32 %fin_lo_col_base, %fin_lo_col_base, 1; // (l%4)*2 = D-fragment col base\n",
+    );
     ptx.push_str("    and.b32 %fin_lane_mod4, %fin_laneid, 3;    // for LSE lane-0-of-quad gate\n");
 
     for t in 0..tpw {
         ptx.push_str(&format!(
             "    // ---- Output slot local_t={} (global_t = warp_id + {}*8 at runtime; N3) ----\n",
-            t,
-            t
+            t, t
         ));
 
         // global_t = warp_id + local_t * 8 (or just warp_id when local_t == 0)
@@ -143,12 +146,8 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig) {
 
             // q_row_global_u32 = m_tile*16 + row_in_tile (runtime now).
             // d_col_global_u32 = n_tile*8 + col_in_tile (runtime).
-            ptx.push_str(
-                "    add.u32 %fin_q_row_u32, %fin_row_in_tile, %fin_m_tile_x16;\n",
-            );
-            ptx.push_str(
-                "    add.u32 %fin_d_col_u32, %fin_col_in_tile, %fin_n_tile_x8;\n",
-            );
+            ptx.push_str("    add.u32 %fin_q_row_u32, %fin_row_in_tile, %fin_m_tile_x16;\n");
+            ptx.push_str("    add.u32 %fin_d_col_u32, %fin_col_in_tile, %fin_n_tile_x8;\n");
             ptx.push_str("    cvt.u64.u32 %fin_q_row, %fin_q_row_u32;\n");
             ptx.push_str("    cvt.u64.u32 %fin_d_col, %fin_d_col_u32;\n");
             ptx.push_str("    add.u64 %fin_q_row, %fin_q_row, %q_start;\n");
@@ -195,9 +194,7 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig) {
                 "    add.u32 %fin_q_row_u32, %fin_lo_row, {};\n",
                 row_offset
             ));
-            ptx.push_str(
-                "    add.u32 %fin_q_row_u32, %fin_q_row_u32, %fin_m_tile_x16;\n",
-            );
+            ptx.push_str("    add.u32 %fin_q_row_u32, %fin_q_row_u32, %fin_m_tile_x16;\n");
             ptx.push_str("    cvt.u64.u32 %fin_q_row, %fin_q_row_u32;\n");
             ptx.push_str("    add.u64 %fin_q_row, %fin_q_row, %q_start;\n");
 
@@ -280,7 +277,8 @@ mod tests {
         let mut ptx = String::new();
         emit(&mut ptx, &cfg);
         assert_eq!(
-            ptx.matches("    st.global.b16 [%fin_addr], %fin_h;\n").count(),
+            ptx.matches("    st.global.b16 [%fin_addr], %fin_h;\n")
+                .count(),
             (tpw * 4) as usize,
             "expected 4 unpredicated f16 stores per tile (D-fragment lanes 0..3)"
         );

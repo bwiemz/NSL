@@ -85,10 +85,8 @@ pub fn validate_kv_compress_decorator(
                 }
                 other => {
                     diagnostics.push(
-                        Diagnostic::error(format!(
-                            "unknown @kv_compress parameter '{other}'"
-                        ))
-                        .with_label(arg.value.span, "here"),
+                        Diagnostic::error(format!("unknown @kv_compress parameter '{other}'"))
+                            .with_label(arg.value.span, "here"),
                     );
                     return None;
                 }

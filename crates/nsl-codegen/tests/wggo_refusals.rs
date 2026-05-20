@@ -96,9 +96,8 @@ fn refuse_grad_mode_with_no_calibration_data() {
         opts.calibration_data.is_none(),
         "test must start with no calibration_data"
     );
-    let err = compile_with_options(source, &opts).expect_err(
-        "must refuse when wggo_importance=Grad and no calibration data provided",
-    );
+    let err = compile_with_options(source, &opts)
+        .expect_err("must refuse when wggo_importance=Grad and no calibration data provided");
     let msg = format!("{err}");
     assert_error_contains(&msg, "requires calibration data, but none was provided");
     assert_error_contains(&msg, "requested:");

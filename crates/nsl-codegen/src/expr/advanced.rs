@@ -124,7 +124,10 @@ impl Compiler<'_> {
                 then_result_is_temp = true;
             }
 
-            for temp in state.cleanup.tensor_temporaries[temp_base_len..].iter().copied() {
+            for temp in state.cleanup.tensor_temporaries[temp_base_len..]
+                .iter()
+                .copied()
+            {
                 if temp != then_val {
                     let _ = self.compile_call_by_name(builder, "nsl_tensor_free", &[temp]);
                 }
@@ -199,7 +202,10 @@ impl Compiler<'_> {
                 else_result_is_temp = true;
             }
 
-            for temp in state.cleanup.tensor_temporaries[temp_base_len..].iter().copied() {
+            for temp in state.cleanup.tensor_temporaries[temp_base_len..]
+                .iter()
+                .copied()
+            {
                 if temp != else_val {
                     let _ = self.compile_call_by_name(builder, "nsl_tensor_free", &[temp]);
                 }
@@ -424,15 +430,14 @@ impl Compiler<'_> {
         seen: &mut std::collections::HashSet<nsl_ast::Symbol>,
     ) {
         match &expr.kind {
-            ExprKind::Ident(sym)
-                if !param_syms.contains(sym) && !seen.contains(sym) => {
-                    if let Some((_var, cl_type)) = state.variables.get(sym) {
-                        // It's an outer-scope variable -- it's a capture
-                        seen.insert(*sym);
-                        out.push((*sym, *cl_type));
-                    }
-                    // If not in state.variables, it's a global/builtin -- not a capture
+            ExprKind::Ident(sym) if !param_syms.contains(sym) && !seen.contains(sym) => {
+                if let Some((_var, cl_type)) = state.variables.get(sym) {
+                    // It's an outer-scope variable -- it's a capture
+                    seen.insert(*sym);
+                    out.push((*sym, *cl_type));
                 }
+                // If not in state.variables, it's a global/builtin -- not a capture
+            }
             ExprKind::BinaryOp { left, right, .. } | ExprKind::Pipe { left, right } => {
                 self.collect_free_vars(left, param_syms, state, out, seen);
                 self.collect_free_vars(right, param_syms, state, out, seen);
@@ -755,12 +760,7 @@ impl Compiler<'_> {
                 if let Some(sparse_result) = self.try_sparse_matmul(builder, state, lhs, rhs)? {
                     state.cleanup.tensor_temporaries.push(sparse_result);
                     // ELTLS: nsl_sparse_matmul returns a fresh owned tensor.
-                    self.set_ownership(
-                        builder,
-                        state,
-                        sparse_result,
-                        Ownership::Owned,
-                    );
+                    self.set_ownership(builder, state, sparse_result, Ownership::Owned);
                     return Ok(sparse_result);
                 }
             }
@@ -825,25 +825,37 @@ impl Compiler<'_> {
                 rhs_for_scalar
             };
             let _ = scale_fused; // logged in try_fuse_weight_scale
-            // ELTLS: for tensor-scalar ops the scalar Value isn't an I64
-            // pointer so its ownership query returns Unknown → bit clear.
-            // The tensor operand is `lhs` (ARG A), which matches the
-            // caller's lhs, so the caller's `flags` can be passed through
-            // directly.
+                                 // ELTLS: for tensor-scalar ops the scalar Value isn't an I64
+                                 // pointer so its ownership query returns Unknown → bit clear.
+                                 // The tensor operand is `lhs` (ARG A), which matches the
+                                 // caller's lhs, so the caller's `flags` can be passed through
+                                 // directly.
             let (result, rt_name): (Value, &'static str) = match op {
                 BinOp::Add => (
-                    self.compile_traced_call(builder, "nsl_tensor_add_scalar", &[lhs, scalar, flags])?,
+                    self.compile_traced_call(
+                        builder,
+                        "nsl_tensor_add_scalar",
+                        &[lhs, scalar, flags],
+                    )?,
                     "nsl_tensor_add_scalar",
                 ),
                 BinOp::Mul => (
-                    self.compile_traced_call(builder, "nsl_tensor_mul_scalar", &[lhs, scalar, flags])?,
+                    self.compile_traced_call(
+                        builder,
+                        "nsl_tensor_mul_scalar",
+                        &[lhs, scalar, flags],
+                    )?,
                     "nsl_tensor_mul_scalar",
                 ),
                 BinOp::Sub => {
                     // tensor - scalar = tensor + (-scalar)
                     let neg = builder.ins().fneg(scalar);
                     (
-                        self.compile_traced_call(builder, "nsl_tensor_add_scalar", &[lhs, neg, flags])?,
+                        self.compile_traced_call(
+                            builder,
+                            "nsl_tensor_add_scalar",
+                            &[lhs, neg, flags],
+                        )?,
                         "nsl_tensor_add_scalar",
                     )
                 }
@@ -852,7 +864,11 @@ impl Compiler<'_> {
                     let one = builder.ins().f64const(1.0);
                     let inv = builder.ins().fdiv(one, scalar);
                     (
-                        self.compile_traced_call(builder, "nsl_tensor_mul_scalar", &[lhs, inv, flags])?,
+                        self.compile_traced_call(
+                            builder,
+                            "nsl_tensor_mul_scalar",
+                            &[lhs, inv, flags],
+                        )?,
                         "nsl_tensor_mul_scalar",
                     )
                 }
@@ -864,14 +880,7 @@ impl Compiler<'_> {
             };
             // ELTLS: only the tensor operand (lhs) is tracked for
             // ownership; the scalar value is not a tensor pointer.
-            self.set_ownership_from_op(
-                builder,
-                state,
-                result,
-                &[lhs],
-                Ownership::Owned,
-                rt_name,
-            );
+            self.set_ownership_from_op(builder, state, result, &[lhs], Ownership::Owned, rt_name);
             state.cleanup.tensor_temporaries.push(result);
             Ok(result)
         } else {
@@ -893,11 +902,19 @@ impl Compiler<'_> {
             let _ = flags; // not used until remap is active
             let (result, rt_name): (Value, &'static str) = match op {
                 BinOp::Add => (
-                    self.compile_traced_call(builder, "nsl_tensor_add_scalar", &[rhs, scalar, remapped_flags])?,
+                    self.compile_traced_call(
+                        builder,
+                        "nsl_tensor_add_scalar",
+                        &[rhs, scalar, remapped_flags],
+                    )?,
                     "nsl_tensor_add_scalar",
                 ),
                 BinOp::Mul => (
-                    self.compile_traced_call(builder, "nsl_tensor_mul_scalar", &[rhs, scalar, remapped_flags])?,
+                    self.compile_traced_call(
+                        builder,
+                        "nsl_tensor_mul_scalar",
+                        &[rhs, scalar, remapped_flags],
+                    )?,
                     "nsl_tensor_mul_scalar",
                 ),
                 BinOp::Sub => {
@@ -926,14 +943,7 @@ impl Compiler<'_> {
             };
             // ELTLS: only the tensor operand (rhs) is tracked; the scalar
             // is not a tensor pointer.
-            self.set_ownership_from_op(
-                builder,
-                state,
-                result,
-                &[rhs],
-                Ownership::Owned,
-                rt_name,
-            );
+            self.set_ownership_from_op(builder, state, result, &[rhs], Ownership::Owned, rt_name);
             state.cleanup.tensor_temporaries.push(result);
             Ok(result)
         }
@@ -971,8 +981,12 @@ impl Compiler<'_> {
         // Recurse into sub-model fields and fixed-size model arrays
         let field_types = self.models.model_field_types.get(model_name).cloned();
         for field in &layout.fields {
-            let sub_type = field_types.as_ref().and_then(|ft| ft.get(&field.name).cloned());
-            let Some(sub_type) = sub_type else { continue; };
+            let sub_type = field_types
+                .as_ref()
+                .and_then(|ft| ft.get(&field.name).cloned());
+            let Some(sub_type) = sub_type else {
+                continue;
+            };
 
             if sub_type.starts_with('[') {
                 // Fixed-size model array: [ModelType; N]
@@ -1291,10 +1305,7 @@ impl Compiler<'_> {
                 if self.resolve_sym(*sym) != candidate {
                     continue;
                 }
-                if matches!(
-                    state.variable_types.get(sym),
-                    Some(Type::Tensor { .. })
-                ) {
+                if matches!(state.variable_types.get(sym), Some(Type::Tensor { .. })) {
                     return Some(*var);
                 }
             }
@@ -1324,9 +1335,12 @@ impl Compiler<'_> {
         let is_causal = ctx.config.causal;
         let mut diags = Vec::<String>::new();
         let shmem_bytes = crate::flash_attention_selector::shared_mem_bytes_selected_with_diag(
-            &ctx.config, &mut diags,
+            &ctx.config,
+            &mut diags,
         ) as i64;
-        for d in diags { eprintln!("warning: {d}"); }
+        for d in diags {
+            eprintln!("warning: {d}");
+        }
 
         // Gap B: capture the CSHA-with-saves PTX / name / shmem triple up
         // front so the `save_activations_for_backward` branch below can
@@ -1349,10 +1363,11 @@ impl Compiler<'_> {
             .map(|c| {
                 let mut d = Vec::<String>::new();
                 let bytes =
-                    crate::flash_attention_selector::shared_mem_bytes_selected_with_diag(
-                        c, &mut d,
-                    ) as i64;
-                for s in d { eprintln!("warning: {s}"); }
+                    crate::flash_attention_selector::shared_mem_bytes_selected_with_diag(c, &mut d)
+                        as i64;
+                for s in d {
+                    eprintln!("warning: {s}");
+                }
                 bytes
             })
             .unwrap_or(shmem_bytes);
@@ -1495,9 +1510,7 @@ impl Compiler<'_> {
             let active_heads_val = builder
                 .ins()
                 .iconst(cl_types::I64, extras.active_heads as i64);
-            let d_model_val = builder
-                .ins()
-                .iconst(cl_types::I64, extras.d_model as i64);
+            let d_model_val = builder.ins().iconst(cl_types::I64, extras.d_model as i64);
 
             // A.2.1a/e: resolve bridge marks' `param_name` strings against
             // `FuncState.weights_by_name` — this gives the Cranelift
@@ -1525,8 +1538,8 @@ impl Compiler<'_> {
             if let (Some(bridge), Some(layer)) =
                 (self.last_csha_bridge.as_ref(), csha_layer.as_deref())
             {
+                use crate::csha_apply::{BridgeResult, MarkRole};
                 use crate::csha_boundary::ProjKind;
-                use crate::csha_apply::{MarkRole, BridgeResult};
                 for mark in bridge.marks_for_layer(layer) {
                     let v = match state.weights_by_name.get(&mark.param_name) {
                         Some(v) => *v,
@@ -1577,13 +1590,12 @@ impl Compiler<'_> {
             // a caller-supplied stack slot.
             if extras.save_activations_for_backward {
                 // 6 × i64 = 48 bytes, aligned to 8.
-                let saves_slot = builder.create_sized_stack_slot(
-                    cranelift_codegen::ir::StackSlotData::new(
+                let saves_slot =
+                    builder.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
                         cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
                         48,
                         8,
-                    ),
-                );
+                    ));
                 let saves_ptr = builder.ins().stack_addr(cl_types::I64, saves_slot, 0);
                 // The alloc helper sizes each buffer from (batch, heads, seq, head_dim),
                 // matching the forward kernel's launch dims.
@@ -1670,11 +1682,8 @@ impl Compiler<'_> {
                     "nsl_packing_metadata_get_segment_ids",
                     &[],
                 )?;
-                let doc_starts_v = self.compile_call_by_name(
-                    builder,
-                    "nsl_packing_metadata_get_doc_starts",
-                    &[],
-                )?;
+                let doc_starts_v =
+                    self.compile_call_by_name(builder, "nsl_packing_metadata_get_doc_starts", &[])?;
                 // PR #93 edit 4: stop silently discarding the launch rc.
                 // Previously bound to `_err` and dropped; now we emit a
                 // runtime `brif rc != 0 → trap` so an INVALID_PTX or
@@ -1686,25 +1695,45 @@ impl Compiler<'_> {
                     builder,
                     "nsl_flash_attention_csha_with_saves",
                     &[
-                        q_val, k_val, v_val, out_val,
+                        q_val,
+                        k_val,
+                        v_val,
+                        out_val,
                         lse_val,
                         scale_bits,
-                        batch, heads, seq_len, head_dim,
-                        null, null, null, null, // paged
-                        null, null,             // RoPE
-                        null, null,             // seq_ids, seq_lens
+                        batch,
+                        heads,
+                        seq_len,
+                        head_dim,
+                        null,
+                        null,
+                        null,
+                        null, // paged
+                        null,
+                        null, // RoPE
+                        null,
+                        null, // seq_ids, seq_lens
                         save_shmem_val,
-                        save_ptx_ptr, save_name_ptr,
-                        block_q_val, block_kv_val,
+                        save_ptx_ptr,
+                        save_name_ptr,
+                        block_q_val,
+                        block_kv_val,
                         causal_val,
-                        x_v, norm_w_v,
-                        wq_v, wk_v, wv_v, wo_v,
+                        x_v,
+                        norm_w_v,
+                        wq_v,
+                        wk_v,
+                        wv_v,
+                        wo_v,
                         eps_bits,
                         active_heads_val,
                         d_model_val,
                         // Tier C activation-save pointers.
-                        q_proj_v, k_proj_v, v_proj_v,
-                        row_max_v, row_sum_v,
+                        q_proj_v,
+                        k_proj_v,
+                        v_proj_v,
+                        row_max_v,
+                        row_sum_v,
                         x_raw_v,
                         // PCA Tier A: segment_ids_ptr — read from the
                         // thread-local packing registry (set by train block
@@ -1715,7 +1744,8 @@ impl Compiler<'_> {
                         // at this call site — the Tier B planner emits the
                         // dispatch decision at compile-time, not via the
                         // CSHA forward path.
-                        null, null,
+                        null,
+                        null,
                         // PCA §4.3: doc_starts_ptr — read from the same
                         // registry. 0 when uninitialized → identity path
                         // (no RoPE reset).
@@ -1724,11 +1754,9 @@ impl Compiler<'_> {
                 )?;
                 {
                     use cranelift_codegen::ir::{condcodes::IntCC, TrapCode};
-                    let ok_block   = builder.create_block();
+                    let ok_block = builder.create_block();
                     let trap_block = builder.create_block();
-                    let is_err = builder
-                        .ins()
-                        .icmp_imm(IntCC::NotEqual, launch_rc, 0);
+                    let is_err = builder.ins().icmp_imm(IntCC::NotEqual, launch_rc, 0);
                     builder.ins().brif(is_err, trap_block, &[], ok_block, &[]);
                     builder.switch_to_block(trap_block);
                     builder.seal_block(trap_block);
@@ -1763,25 +1791,35 @@ impl Compiler<'_> {
                     "nsl_packing_metadata_get_segment_ids",
                     &[],
                 )?;
-                let doc_starts_v = self.compile_call_by_name(
-                    builder,
-                    "nsl_packing_metadata_get_doc_starts",
-                    &[],
-                )?;
+                let doc_starts_v =
+                    self.compile_call_by_name(builder, "nsl_packing_metadata_get_doc_starts", &[])?;
                 let _err = self.compile_call_by_name(
                     builder,
                     "nsl_flash_attention_csha",
                     &[
-                        q_val, k_val, v_val, out_val,
+                        q_val,
+                        k_val,
+                        v_val,
+                        out_val,
                         lse_val,
                         scale_bits,
-                        batch, heads, seq_len, head_dim,
-                        null, null, null, null, // paged
-                        null, null,             // RoPE
-                        null, null,             // seq_ids, seq_lens
+                        batch,
+                        heads,
+                        seq_len,
+                        head_dim,
+                        null,
+                        null,
+                        null,
+                        null, // paged
+                        null,
+                        null, // RoPE
+                        null,
+                        null, // seq_ids, seq_lens
                         shmem_val,
-                        ptx_ptr, name_ptr,
-                        block_q_val, block_kv_val,
+                        ptx_ptr,
+                        name_ptr,
+                        block_q_val,
+                        block_kv_val,
                         causal_val,
                         // CSHA extras (A.2.1a + A.2.1e + A.2.1g):
                         //
@@ -1801,9 +1839,12 @@ impl Compiler<'_> {
                         // remains available for future callers that need
                         // to resolve x by Wengert position rather than
                         // Cranelift-parameter name.
-                        x_v,                       // A.2.1g: param probe
-                        norm_w_v,                  // resolved via conventional-name probe
-                        wq_v, wk_v, wv_v, wo_v,    // resolved via bridge marks
+                        x_v,      // A.2.1g: param probe
+                        norm_w_v, // resolved via conventional-name probe
+                        wq_v,
+                        wk_v,
+                        wv_v,
+                        wo_v, // resolved via bridge marks
                         eps_bits,
                         active_heads_val,
                         d_model_val,
@@ -1812,7 +1853,8 @@ impl Compiler<'_> {
                         seg_ids_ptr_v,
                         // Tier B extension (planner spec §4): sentinel 0
                         // pair carries the Tier-B-on PTX variant.
-                        null, null,
+                        null,
+                        null,
                         // PCA §4.3: doc_starts_ptr — read from the same
                         // registry.
                         doc_starts_v,
@@ -2489,8 +2531,11 @@ impl Compiler<'_> {
                     let dense_rhs =
                         self.compile_call_by_name(builder, "nsl_sparse_to_dense", &[rhs])?;
                     let flags_zero = builder.ins().iconst(cl_types::I8, 0);
-                    let result =
-                        self.compile_traced_call(builder, "nsl_tensor_matmul", &[lhs, dense_rhs, flags_zero])?;
+                    let result = self.compile_traced_call(
+                        builder,
+                        "nsl_tensor_matmul",
+                        &[lhs, dense_rhs, flags_zero],
+                    )?;
                     self.compile_call_by_name(builder, "nsl_tensor_free", &[dense_rhs])?;
                     result
                 } else {
@@ -2613,7 +2658,11 @@ impl Compiler<'_> {
                     }
                 };
                 let flags_zero = builder.ins().iconst(cl_types::I8, 0);
-                let result = self.compile_traced_call(builder, rt_name, &[dense_lhs, dense_rhs, flags_zero])?;
+                let result = self.compile_traced_call(
+                    builder,
+                    rt_name,
+                    &[dense_lhs, dense_rhs, flags_zero],
+                )?;
                 if free_lhs {
                     self.compile_call_by_name(builder, "nsl_tensor_free", &[dense_lhs])?;
                 }

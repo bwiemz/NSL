@@ -207,8 +207,7 @@ pub fn pipeline_smem_bytes(shape: LayerShape, tiles: TileConfig) -> u64 {
     // selection would accept; the actual chunk is selected at emission
     // time by `tier_b1::chunk_config::select`, which descends
     // {128, 64, 32, 16} and must treat `CHUNK_PLANNER_FLOOR` as its floor.
-    let chunk_staging =
-        2 * (CHUNK_PLANNER_FLOOR * head_dim * dtype)       // Wk + Wv chunk slots
+    let chunk_staging = 2 * (CHUNK_PLANNER_FLOOR * head_dim * dtype)       // Wk + Wv chunk slots
         + (block_q + block_kv) * CHUNK_PLANNER_FLOOR * dtype; // x_q + x_kv chunk slots
     q_tile + kv_tiles + o_acc + stats + chunk_staging
 }
@@ -287,7 +286,7 @@ pub fn baseline_hbm_bytes(shape: LayerShape) -> u64 {
         + bsd + 2 * bsdkv // fa read
         + bsd        // fa write
         + 2 * bsd    // o proj
-        + 2 * bsd    // residual
+        + 2 * bsd // residual
 }
 
 /// HBM traffic under a given fusion level.
@@ -457,8 +456,8 @@ pub fn plan_all(
 pub fn backward_dispatch_tier(
     config: &crate::flash_attention::FlashAttentionConfig,
 ) -> crate::flash_attention_v2::tier_b2::BackwardTier {
-    use crate::flash_attention_v2::tier_b2::BackwardTier;
     use crate::flash_attention_v2::tier_b2::dispatch::tier_b2_can_dispatch;
+    use crate::flash_attention_v2::tier_b2::BackwardTier;
     match tier_b2_can_dispatch(config) {
         Ok(tier_b2) => tier_b2,
         Err(_) => BackwardTier::Scalar,

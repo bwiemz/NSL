@@ -38,8 +38,8 @@ pub mod context;
 pub mod context_parallel;
 pub mod cost_model;
 pub mod deterministic_kernels;
-pub mod profiling;
 pub mod grammar_compiler;
+pub mod profiling;
 pub mod schema_convert;
 pub mod stdlib_loader;
 
@@ -84,10 +84,10 @@ pub mod fase_clip;
 pub mod fase_codegen_table;
 pub mod fase_memory;
 pub mod fase_optimizer;
-pub mod stmt_fase;
+pub mod ffi_ownership;
 pub mod flash_attention;
-pub mod flash_attention_v2;
 pub mod flash_attention_selector;
+pub mod flash_attention_v2;
 pub mod fp8;
 pub mod func;
 pub mod fusion;
@@ -105,7 +105,6 @@ pub mod memory_planner;
 pub mod moe;
 pub mod moe_kernels;
 pub mod multimodal;
-pub mod ffi_ownership;
 pub mod ownership;
 pub mod ownership_expr;
 pub mod pca_detect;
@@ -115,7 +114,6 @@ pub mod pca_tier_b;
 pub mod pca_tile_config;
 pub mod pca_tilerange;
 pub mod pca_tileskip;
-pub mod training_report;
 pub mod pipeline;
 pub mod ptxas_validation;
 pub mod reduction_fusion;
@@ -125,7 +123,9 @@ pub mod sparse;
 pub mod speculative;
 pub mod standalone;
 pub mod stmt;
+pub mod stmt_fase;
 pub mod tensor_parallel;
+pub mod training_report;
 pub mod types;
 pub mod unikernel;
 pub mod unikernel_boot;
@@ -143,17 +143,17 @@ pub mod wggo_dp;
 pub mod wggo_gradient_scorer;
 pub mod wggo_graph;
 pub mod wggo_ilp;
+pub mod wggo_overrides;
+pub mod wggo_prune;
 pub mod wggo_schedule;
 pub mod wggo_weight_analysis;
 pub mod wggo_weight_analysis_cache;
 pub mod wggo_weight_analysis_nslweights;
-pub mod wggo_overrides;
-pub mod wggo_prune;
 pub use wggo_overrides::{
     OverrideDiagnostic, OverrideRejectReason, PerLayerOverride, WggoOverrides,
 };
-pub mod wrga;
 pub mod matmul_mma;
+pub mod wrga;
 pub mod wrga_adapter_init;
 pub mod wrga_adapter_inject;
 pub mod wrga_adapter_rewrite;
@@ -201,12 +201,11 @@ pub mod bin {
 pub mod test_helpers;
 
 pub use compiler::{
-    compile, compile_entry, compile_module, compile_module_with_imports,
-    compile_entry_returning_plan, compile_module_with_imports_returning_plan,
-    compile_returning_plan, compile_returning_splice_count_for_tests,
-    compile_standalone, compile_standalone_returning_plan,
-    compile_test, compile_with_zk_info, compile_with_zk_info_returning_plan,
-    StandaloneConfig,
+    compile, compile_entry, compile_entry_returning_plan, compile_module,
+    compile_module_with_imports, compile_module_with_imports_returning_plan,
+    compile_returning_plan, compile_returning_splice_count_for_tests, compile_standalone,
+    compile_standalone_returning_plan, compile_test, compile_with_zk_info,
+    compile_with_zk_info_returning_plan, StandaloneConfig,
 };
 
 /// Task 4 test helper: compile a module and return any `WrgaPlan` produced
@@ -349,7 +348,11 @@ pub fn debug_bump_consume_hints_calls() {
 #[doc(hidden)]
 pub fn debug_last_consume_hints_calls() -> Option<usize> {
     let n = debug_channels::CONSUME_HINTS_CALLS.with(|c| c.get());
-    if n == 0 { None } else { Some(n) }
+    if n == 0 {
+        None
+    } else {
+        Some(n)
+    }
 }
 
 #[doc(hidden)]
@@ -403,13 +406,23 @@ pub fn debug_resolve_pre_scan_opts(source: &str, opts: CompileOptions) -> Compil
     assert!(
         !lex_diags.iter().any(|d| matches!(d.level, Level::Error)),
         "lex errors in test fixture: {:?}",
-        lex_diags.iter().map(|d| d.message.clone()).collect::<Vec<_>>()
+        lex_diags
+            .iter()
+            .map(|d| d.message.clone())
+            .collect::<Vec<_>>()
     );
     let parsed = nsl_parser::parse(&tokens, &mut interner);
     assert!(
-        !parsed.diagnostics.iter().any(|d| matches!(d.level, Level::Error)),
+        !parsed
+            .diagnostics
+            .iter()
+            .any(|d| matches!(d.level, Level::Error)),
         "parse errors in test fixture: {:?}",
-        parsed.diagnostics.iter().map(|d| d.message.clone()).collect::<Vec<_>>()
+        parsed
+            .diagnostics
+            .iter()
+            .map(|d| d.message.clone())
+            .collect::<Vec<_>>()
     );
     compiler::run_pre_scan_phase(&parsed.module, &interner, opts)
 }
@@ -597,14 +610,12 @@ pub struct CompileOptions {
     /// CPDT: shared output slot the CLI reads after compile returns.
     /// `Compiler::invoke_cpdt_if_enabled` stashes the plan here so callers
     /// can render it without extending every entry-point return type.
-    pub cpdt_plan_out:
-        Option<std::sync::Arc<std::sync::Mutex<Option<crate::cpdt::CpdtPlan>>>>,
+    pub cpdt_plan_out: Option<std::sync::Arc<std::sync::Mutex<Option<crate::cpdt::CpdtPlan>>>>,
     /// M62: shared output slot the CLI reads after compile returns so it can
     /// emit a matching C header alongside the shared library. Populated by
     /// `Compiler::finalize` from `features.export_functions`.
-    pub export_functions_out: Option<
-        std::sync::Arc<std::sync::Mutex<Option<Vec<crate::c_header::ExportInfo>>>>,
-    >,
+    pub export_functions_out:
+        Option<std::sync::Arc<std::sync::Mutex<Option<Vec<crate::c_header::ExportInfo>>>>>,
     /// Path to calibration dataset.
     pub calibration_data: Option<std::path::PathBuf>,
     /// Failure-handling mode: `"required"` or `"best-effort"`.
@@ -639,8 +650,7 @@ pub struct CompileOptions {
     /// When `Some`, codegen emits `model_backward` IR with grad-retention
     /// splices for the listed attention layers. `None` = forward-only AWQ
     /// or no calibration. Spec §4.8.
-    pub calibration_grad_retention:
-        Option<Vec<crate::calibration::discovery::WggoGradTarget>>,
+    pub calibration_grad_retention: Option<Vec<crate::calibration::discovery::WggoGradTarget>>,
 }
 
 impl Default for CompileOptions {
@@ -747,9 +757,8 @@ pub fn compile_and_calibrate(
     data_path: &std::path::Path,
     weights_path: &std::path::Path,
 ) -> Result<crate::calibration::sidecar::Sidecar, CodegenError> {
-    let source = std::fs::read_to_string(source_path).map_err(|e| {
-        CodegenError::new(format!("reading source {}: {e}", source_path.display()))
-    })?;
+    let source = std::fs::read_to_string(source_path)
+        .map_err(|e| CodegenError::new(format!("reading source {}: {e}", source_path.display())))?;
 
     // Step 1: peek at the calibration data to get (_count, seq).
     let (_count, seq) = nsl_runtime::calibration_data::peek_batch_seq(data_path)
@@ -758,27 +767,49 @@ pub fn compile_and_calibrate(
     // Step 2: lex, parse, and semantically analyse.
     let mut interner = nsl_lexer::Interner::new();
     let (tokens, lex_diags) = nsl_lexer::tokenize(&source, nsl_errors::FileId(0), &mut interner);
-    if lex_diags.iter().any(|d| matches!(d.level, nsl_errors::Level::Error)) {
+    if lex_diags
+        .iter()
+        .any(|d| matches!(d.level, nsl_errors::Level::Error))
+    {
         return Err(CodegenError::new(format!(
             "lex errors in {}: {:?}",
             source_path.display(),
-            lex_diags.iter().map(|d| d.message.clone()).collect::<Vec<_>>()
+            lex_diags
+                .iter()
+                .map(|d| d.message.clone())
+                .collect::<Vec<_>>()
         )));
     }
     let parsed = nsl_parser::parse(&tokens, &mut interner);
-    if parsed.diagnostics.iter().any(|d| matches!(d.level, nsl_errors::Level::Error)) {
+    if parsed
+        .diagnostics
+        .iter()
+        .any(|d| matches!(d.level, nsl_errors::Level::Error))
+    {
         return Err(CodegenError::new(format!(
             "parse errors in {}: {:?}",
             source_path.display(),
-            parsed.diagnostics.iter().map(|d| d.message.clone()).collect::<Vec<_>>()
+            parsed
+                .diagnostics
+                .iter()
+                .map(|d| d.message.clone())
+                .collect::<Vec<_>>()
         )));
     }
     let analysis = nsl_semantic::analyze(&parsed.module, &mut interner);
-    if analysis.diagnostics.iter().any(|d| matches!(d.level, nsl_errors::Level::Error)) {
+    if analysis
+        .diagnostics
+        .iter()
+        .any(|d| matches!(d.level, nsl_errors::Level::Error))
+    {
         return Err(CodegenError::new(format!(
             "semantic errors in {}: {:?}",
             source_path.display(),
-            analysis.diagnostics.iter().map(|d| d.message.clone()).collect::<Vec<_>>()
+            analysis
+                .diagnostics
+                .iter()
+                .map(|d| d.message.clone())
+                .collect::<Vec<_>>()
         )));
     }
 
@@ -971,17 +1002,31 @@ pub fn compile_and_calibrate(
 pub fn compile_with_options(source: &str, opts: &CompileOptions) -> Result<Vec<u8>, CodegenError> {
     let mut interner = nsl_lexer::Interner::new();
     let (tokens, lex_diags) = nsl_lexer::tokenize(source, nsl_errors::FileId(0), &mut interner);
-    if lex_diags.iter().any(|d| matches!(d.level, nsl_errors::Level::Error)) {
+    if lex_diags
+        .iter()
+        .any(|d| matches!(d.level, nsl_errors::Level::Error))
+    {
         return Err(CodegenError::new(format!(
             "lex errors: {:?}",
-            lex_diags.iter().map(|d| d.message.clone()).collect::<Vec<_>>()
+            lex_diags
+                .iter()
+                .map(|d| d.message.clone())
+                .collect::<Vec<_>>()
         )));
     }
     let parsed = nsl_parser::parse(&tokens, &mut interner);
-    if parsed.diagnostics.iter().any(|d| matches!(d.level, nsl_errors::Level::Error)) {
+    if parsed
+        .diagnostics
+        .iter()
+        .any(|d| matches!(d.level, nsl_errors::Level::Error))
+    {
         return Err(CodegenError::new(format!(
             "parse errors: {:?}",
-            parsed.diagnostics.iter().map(|d| d.message.clone()).collect::<Vec<_>>()
+            parsed
+                .diagnostics
+                .iter()
+                .map(|d| d.message.clone())
+                .collect::<Vec<_>>()
         )));
     }
     let analysis = nsl_semantic::analyze(&parsed.module, &mut interner);

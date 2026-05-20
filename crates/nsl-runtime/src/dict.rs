@@ -46,8 +46,9 @@ impl NslDict {
     }
 
     unsafe fn resize(&mut self, new_cap: i64) {
-        let new_buckets = checked_alloc((new_cap as usize) * std::mem::size_of::<*mut NslDictEntry>())
-            as *mut *mut NslDictEntry;
+        let new_buckets =
+            checked_alloc((new_cap as usize) * std::mem::size_of::<*mut NslDictEntry>())
+                as *mut *mut NslDictEntry;
         for i in 0..new_cap as usize {
             *new_buckets.add(i) = std::ptr::null_mut();
         }

@@ -36,7 +36,10 @@ fn emit_result_tier_b_off_label() {
         skip_ratio: 0.0,
         seed: 42,
     });
-    assert!(line.contains(":tier_b=off:"), "missing tier_b=off label in {line}");
+    assert!(
+        line.contains(":tier_b=off:"),
+        "missing tier_b=off label in {line}"
+    );
     // Rust's default {} formatter for `f64` prints 0.0 as "0" — both shapes
     // are acceptable per the spec, so accept either.
     assert!(
@@ -55,7 +58,10 @@ fn emit_result_seed_propagates() {
         skip_ratio: 0.5,
         seed: 1337,
     });
-    assert!(line.ends_with(":seed=1337"), "seed not at end of line: {line}");
+    assert!(
+        line.ends_with(":seed=1337"),
+        "seed not at end of line: {line}"
+    );
 }
 
 #[test]
@@ -68,5 +74,8 @@ fn emit_result_starts_with_prefix() {
         skip_ratio: 0.0,
         seed: 0,
     });
-    assert!(line.starts_with("tier_b_bench_result:"), "bad prefix: {line}");
+    assert!(
+        line.starts_with("tier_b_bench_result:"),
+        "bad prefix: {line}"
+    );
 }

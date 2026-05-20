@@ -55,7 +55,10 @@ impl InferenceRequest {
     }
 
     pub fn is_active(&self) -> bool {
-        matches!(self.state, RequestState::Prefilling { .. } | RequestState::Decoding)
+        matches!(
+            self.state,
+            RequestState::Prefilling { .. } | RequestState::Decoding
+        )
     }
 
     pub fn remaining_prefill(&self) -> usize {
@@ -89,7 +92,9 @@ mod tests {
         assert_eq!(req.state, RequestState::Waiting);
         assert!(!req.is_active());
 
-        req.state = RequestState::Prefilling { tokens_processed: 0 };
+        req.state = RequestState::Prefilling {
+            tokens_processed: 0,
+        };
         assert!(req.is_active());
         assert_eq!(req.remaining_prefill(), 3);
 

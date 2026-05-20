@@ -36,8 +36,14 @@ fn emit_cp_async_x_kv_for_slot(_ptx: &mut String, _slot: u32) {
 
 /// Phase A load: cp.async load x_kv slab into slot[curr].
 /// Inner FSM at depth=1 per spec section 4.3.
-pub fn emit_main_loop_phase_a_load(ptx: &mut String, _config: &FlashAttentionConfig, _kv_iter: u32) {
-    ptx.push_str("    // Phase A: chunk-loop body lives in projection_mma; this helper just synchronizes.\n");
+pub fn emit_main_loop_phase_a_load(
+    ptx: &mut String,
+    _config: &FlashAttentionConfig,
+    _kv_iter: u32,
+) {
+    ptx.push_str(
+        "    // Phase A: chunk-loop body lives in projection_mma; this helper just synchronizes.\n",
+    );
     ptx.push_str("    bar.sync 0;\n");
 }
 

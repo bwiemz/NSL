@@ -1,6 +1,6 @@
-use super::types::MoeRoutingResult;
-use super::router;
 use super::dispatch;
+use super::router;
+use super::types::MoeRoutingResult;
 use std::slice;
 
 /// Route tokens to experts via top-k gating.
@@ -63,12 +63,10 @@ pub extern "C" fn nsl_moe_scatter(
     let num_assigned = num_assigned as usize;
     let total_tokens_n = total_tokens as usize;
 
-    let tokens = unsafe {
-        slice::from_raw_parts(tokens_ptr as *const f32, total_tokens_n * hidden_dim)
-    };
-    let sorted_indices = unsafe {
-        slice::from_raw_parts(sorted_indices_ptr as *const i32, num_assigned)
-    };
+    let tokens =
+        unsafe { slice::from_raw_parts(tokens_ptr as *const f32, total_tokens_n * hidden_dim) };
+    let sorted_indices =
+        unsafe { slice::from_raw_parts(sorted_indices_ptr as *const i32, num_assigned) };
 
     let scattered = dispatch::scatter_tokens(tokens, sorted_indices, hidden_dim);
 
@@ -95,9 +93,8 @@ pub extern "C" fn nsl_expert_parallel_matmul(
     let hidden_dim = hidden_dim as usize;
     let intermediate_dim = intermediate_dim as usize;
 
-    let boundaries = unsafe {
-        slice::from_raw_parts(expert_boundaries_ptr as *const i32, num_experts + 1)
-    };
+    let boundaries =
+        unsafe { slice::from_raw_parts(expert_boundaries_ptr as *const i32, num_experts + 1) };
     let total_assigned = boundaries[num_experts] as usize;
 
     let sorted_tokens = unsafe {
@@ -116,7 +113,9 @@ pub extern "C" fn nsl_expert_parallel_matmul(
     for e in 0..num_experts {
         let start = boundaries[e] as usize;
         let end = boundaries[e + 1] as usize;
-        if start == end { continue; }
+        if start == end {
+            continue;
+        }
 
         let w_off = e * hidden_dim * intermediate_dim;
         for t in start..end {
@@ -157,21 +156,21 @@ pub extern "C" fn nsl_moe_gather(
     let expert_outputs = unsafe {
         slice::from_raw_parts(expert_outputs_ptr as *const f32, num_assigned * hidden_dim)
     };
-    let sorted_indices = unsafe {
-        slice::from_raw_parts(sorted_indices_ptr as *const i32, num_assigned)
-    };
-    let weights = unsafe {
-        slice::from_raw_parts(expert_weights_ptr as *const f32, num_assigned)
-    };
+    let sorted_indices =
+        unsafe { slice::from_raw_parts(sorted_indices_ptr as *const i32, num_assigned) };
+    let weights = unsafe { slice::from_raw_parts(expert_weights_ptr as *const f32, num_assigned) };
 
     let gathered = dispatch::gather_tokens(
-        expert_outputs, sorted_indices, weights,
-        total_tokens, top_k, hidden_dim,
+        expert_outputs,
+        sorted_indices,
+        weights,
+        total_tokens,
+        top_k,
+        hidden_dim,
     );
 
-    let output = unsafe {
-        slice::from_raw_parts_mut(output_ptr as *mut f32, total_tokens * hidden_dim)
-    };
+    let output =
+        unsafe { slice::from_raw_parts_mut(output_ptr as *mut f32, total_tokens * hidden_dim) };
     output.copy_from_slice(&gathered);
 
     0
@@ -192,16 +191,13 @@ pub extern "C" fn nsl_moe_aux_loss(
     let top_k = top_k as usize;
     let coeff = f32::from_bits(coeff_bits as u32);
 
-    let weights = unsafe {
-        slice::from_raw_parts(expert_weights_ptr as *const f32, total_tokens * top_k)
-    };
-    let indices = unsafe {
-        slice::from_raw_parts(expert_indices_ptr as *const i32, total_tokens * top_k)
-    };
+    let weights =
+        unsafe { slice::from_raw_parts(expert_weights_ptr as *const f32, total_tokens * top_k) };
+    let indices =
+        unsafe { slice::from_raw_parts(expert_indices_ptr as *const i32, total_tokens * top_k) };
 
-    let (imp, load) = super::aux_loss::compute_aux_losses(
-        weights, indices, total_tokens, num_experts, top_k,
-    );
+    let (imp, load) =
+        super::aux_loss::compute_aux_losses(weights, indices, total_tokens, num_experts, top_k);
     let result = coeff * (imp + load);
 
     result.to_bits() as i64
@@ -238,8 +234,8 @@ pub extern "C" fn nsl_moe_dispatch_full(
     top_k: i64,
     capacity_factor_bits: i64,
 ) -> i64 {
-    use crate::tensor::NslTensor;
     use crate::memory::checked_alloc;
+    use crate::tensor::NslTensor;
     use std::os::raw::c_void;
 
     let tokens = NslTensor::from_ptr(tokens_ptr);
@@ -263,25 +259,36 @@ pub extern "C" fn nsl_moe_dispatch_full(
 
     // Read logits data as f64 (NSL default dtype)
     let logits_f32: Vec<f32> = if logits.dtype == 0 {
-        let data = unsafe { std::slice::from_raw_parts(logits.data as *const f64, logits.len as usize) };
+        let data =
+            unsafe { std::slice::from_raw_parts(logits.data as *const f64, logits.len as usize) };
         data.iter().map(|&v| v as f32).collect()
     } else {
-        let data = unsafe { std::slice::from_raw_parts(logits.data as *const f32, logits.len as usize) };
+        let data =
+            unsafe { std::slice::from_raw_parts(logits.data as *const f32, logits.len as usize) };
         data.to_vec()
     };
 
     // Route tokens
-    let routing = router::route_topk(&logits_f32, total_tokens, num_experts, top_k, capacity_factor);
+    let routing = router::route_topk(
+        &logits_f32,
+        total_tokens,
+        num_experts,
+        top_k,
+        capacity_factor,
+    );
 
     // Read tokens data — handle both f64 (dtype=0) and f32 (dtype=1)
     let tokens_f32: Vec<f32> = if tokens.dtype == 0 {
-        let data = unsafe { std::slice::from_raw_parts(tokens.data as *const f64, tokens.len as usize) };
+        let data =
+            unsafe { std::slice::from_raw_parts(tokens.data as *const f64, tokens.len as usize) };
         data.iter().map(|&v| v as f32).collect()
     } else {
-        let data = unsafe { std::slice::from_raw_parts(tokens.data as *const f32, tokens.len as usize) };
+        let data =
+            unsafe { std::slice::from_raw_parts(tokens.data as *const f32, tokens.len as usize) };
         data.to_vec()
     };
-    let scattered = dispatch::scatter_tokens(&tokens_f32, &routing.sorted_token_indices, hidden_dim);
+    let scattered =
+        dispatch::scatter_tokens(&tokens_f32, &routing.sorted_token_indices, hidden_dim);
 
     // Identity expert transform: expert_outputs = scattered tokens
     let expert_outputs = scattered;

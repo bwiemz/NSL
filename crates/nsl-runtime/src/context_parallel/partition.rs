@@ -4,8 +4,11 @@
 /// Panics if `seq_len` is not evenly divisible by `ring_size`.
 pub fn chunk_range(seq_len: usize, ring_size: usize, rank: usize) -> (usize, usize) {
     assert_eq!(
-        seq_len % ring_size, 0,
-        "seq_len ({}) must be divisible by ring_size ({})", seq_len, ring_size
+        seq_len % ring_size,
+        0,
+        "seq_len ({}) must be divisible by ring_size ({})",
+        seq_len,
+        ring_size
     );
     let chunk_len = seq_len / ring_size;
     let start = rank * chunk_len;
@@ -28,19 +31,14 @@ pub fn partition_sequence(
     for t in 0..chunk_len {
         let src_off = (start + t) * hidden_dim;
         let dst_off = t * hidden_dim;
-        chunk[dst_off..dst_off + hidden_dim]
-            .copy_from_slice(&data[src_off..src_off + hidden_dim]);
+        chunk[dst_off..dst_off + hidden_dim].copy_from_slice(&data[src_off..src_off + hidden_dim]);
     }
     chunk
 }
 
 /// Gather chunks from all ranks into a full sequence.
 /// `chunks`: one Vec per rank, each [chunk_len, hidden_dim]
-pub fn gather_sequence(
-    chunks: &[Vec<f32>],
-    seq_len: usize,
-    hidden_dim: usize,
-) -> Vec<f32> {
+pub fn gather_sequence(chunks: &[Vec<f32>], seq_len: usize, hidden_dim: usize) -> Vec<f32> {
     let mut full = vec![0.0f32; seq_len * hidden_dim];
     let chunk_len = seq_len / chunks.len();
     for (rank, chunk) in chunks.iter().enumerate() {
@@ -59,7 +57,7 @@ mod tests {
         // 12 tokens, 4 ranks, hidden_dim=2
         let data: Vec<f32> = (0..24).map(|i| i as f32).collect();
         let chunk = partition_sequence(&data, 12, 2, 4, 1); // rank 1
-        // rank 1 gets tokens 3..6 = indices 6..12
+                                                            // rank 1 gets tokens 3..6 = indices 6..12
         assert_eq!(chunk, vec![6.0, 7.0, 8.0, 9.0, 10.0, 11.0]);
     }
 

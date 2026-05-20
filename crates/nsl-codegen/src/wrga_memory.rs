@@ -50,7 +50,8 @@ impl MemoryPlanStats {
     }
 
     pub fn byte_savings(&self) -> u64 {
-        self.naive_peak_bytes.saturating_sub(self.planned_peak_bytes)
+        self.naive_peak_bytes
+            .saturating_sub(self.planned_peak_bytes)
     }
 }
 
@@ -132,10 +133,8 @@ pub fn plan_memory(
 
     // Sort by birth; ties by longer-death first (so longer-lived intervals get
     // placed into a fresh slot earlier — reduces later fragmentation).
-    let mut ordered: Vec<(VarId, u32, u32)> = ranges
-        .iter()
-        .map(|(v, (b, d))| (*v, *b, *d))
-        .collect();
+    let mut ordered: Vec<(VarId, u32, u32)> =
+        ranges.iter().map(|(v, (b, d))| (*v, *b, *d)).collect();
     ordered.sort_by(|a, b| {
         a.1.cmp(&b.1)
             .then_with(|| b.2.cmp(&a.2))
@@ -192,10 +191,7 @@ pub fn plan_memory(
         planned_peak_bytes: planned_peak,
     };
 
-    MemoryPlan {
-        assignments,
-        stats,
-    }
+    MemoryPlan { assignments, stats }
 }
 
 /// Like [`plan_memory`] but extends the `death` point of any VarId in
@@ -219,12 +215,7 @@ pub fn plan_memory_with_pin(
     if pinned_until_inspect_sync.is_empty() {
         return plan;
     }
-    let max_pp = plan
-        .assignments
-        .iter()
-        .map(|s| s.death)
-        .max()
-        .unwrap_or(0);
+    let max_pp = plan.assignments.iter().map(|s| s.death).max().unwrap_or(0);
     let pin_target = max_pp.saturating_add(1);
     for slot in &mut plan.assignments {
         if pinned_until_inspect_sync.contains(&slot.var) {

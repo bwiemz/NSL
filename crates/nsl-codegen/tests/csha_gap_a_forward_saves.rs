@@ -88,9 +88,7 @@ fn fresh_bridge_has_saves_disabled() {
             // Not a hard failure — the test subject (the flip) is exercised
             // below via the explicit `flip_save_activations` call.  But
             // record the outcome so CI can flag a CSHA-off misconfiguration.
-            eprintln!(
-                "[gap-a] csha::run_on_wengert returned None — CSHA off for this build"
-            );
+            eprintln!("[gap-a] csha::run_on_wengert returned None — CSHA off for this build");
             return;
         }
     };
@@ -155,12 +153,10 @@ fn bridge_flip_enables_saves_on_every_extras() {
 #[test]
 fn gap_a_runtime_ffi_symbols_are_reachable() {
     let addrs: [usize; 3] = [
-        nsl_runtime::flash_attention::nsl_csha_alloc_backward_activations_into
-            as *const () as usize,
-        nsl_runtime::flash_attention::nsl_csha_free_backward_activations_from
-            as *const () as usize,
-        nsl_runtime::flash_attention::nsl_flash_attention_csha_with_saves
-            as *const () as usize,
+        nsl_runtime::flash_attention::nsl_csha_alloc_backward_activations_into as *const ()
+            as usize,
+        nsl_runtime::flash_attention::nsl_csha_free_backward_activations_from as *const () as usize,
+        nsl_runtime::flash_attention::nsl_flash_attention_csha_with_saves as *const () as usize,
     ];
     for (i, a) in addrs.iter().enumerate() {
         assert_ne!(*a, 0, "runtime FFI #{i} resolved to null address");
@@ -267,7 +263,12 @@ train(model = m, epochs = 1):
         ..Default::default()
     };
     let obj_bytes = match nsl_codegen::compile_module(
-        &parsed.module, &interner, &analysis.type_map, "", false, &opts,
+        &parsed.module,
+        &interner,
+        &analysis.type_map,
+        "",
+        false,
+        &opts,
     ) {
         Ok(b) => b,
         Err(e) => {

@@ -40,14 +40,19 @@ fn assemble_ptx(ptxas: &str, ptx: &[u8], sm: &str) -> Result<(), String> {
     let out = std::env::temp_dir().join(format!("bwd_prelude_{sm}.cubin"));
     let mut cmd = Command::new(ptxas)
         .arg(format!("--gpu-name={sm}"))
-        .arg("-o").arg(&out)
+        .arg("-o")
+        .arg(&out)
         .arg("-")
         .stdin(Stdio::piped())
         .stderr(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
         .map_err(|e| format!("spawn ptxas: {e}"))?;
-    cmd.stdin.as_mut().unwrap().write_all(ptx).map_err(|e| e.to_string())?;
+    cmd.stdin
+        .as_mut()
+        .unwrap()
+        .write_all(ptx)
+        .map_err(|e| e.to_string())?;
     let fin = cmd.wait_with_output().map_err(|e| e.to_string())?;
     if !fin.status.success() {
         return Err(String::from_utf8_lossy(&fin.stderr).into_owned());
@@ -171,10 +176,18 @@ fn backward_prelude_ptxas_clean_sm75_sm90_sm120() {
     };
 
     let base = FlashAttentionConfig {
-        block_q: 32, block_kv: 32, head_dim: 32,
-        causal: false, paged: false, rope_q: false,
+        block_q: 32,
+        block_kv: 32,
+        head_dim: 32,
+        causal: false,
+        paged: false,
+        rope_q: false,
         rope_style: RopeStyle::HalfSplit,
-        gqa_group_size: 1, tree_mask: false, gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras {
+        gqa_group_size: 1,
+        tree_mask: false,
+        gpu_sm: 75,
+        segment_masked: false,
+        csha: Some(CshaExtras {
             fused_projections: true,
             save_activations_for_backward: true,
             d_model: 32,
@@ -190,10 +203,7 @@ fn backward_prelude_ptxas_clean_sm75_sm90_sm120() {
         let dump = std::env::temp_dir().join(format!("bwd_prelude_{sm}.ptx"));
         std::fs::write(&dump, &ptx).ok();
         if let Err(err) = assemble_ptx(&ptxas, &ptx, sm) {
-            failures.push(format!(
-                "sm={sm} dump={} ptxas:\n{err}",
-                dump.display()
-            ));
+            failures.push(format!("sm={sm} dump={} ptxas:\n{err}", dump.display()));
         }
     }
     assert!(
@@ -210,10 +220,18 @@ fn backward_prelude_plus_q_load_ptxas_clean_sm75_sm90_sm120() {
         return;
     };
     let base = FlashAttentionConfig {
-        block_q: 32, block_kv: 32, head_dim: 32,
-        causal: false, paged: false, rope_q: false,
+        block_q: 32,
+        block_kv: 32,
+        head_dim: 32,
+        causal: false,
+        paged: false,
+        rope_q: false,
         rope_style: RopeStyle::HalfSplit,
-        gqa_group_size: 1, tree_mask: false, gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras {
+        gqa_group_size: 1,
+        tree_mask: false,
+        gpu_sm: 75,
+        segment_masked: false,
+        csha: Some(CshaExtras {
             fused_projections: true,
             save_activations_for_backward: true,
             d_model: 32,
@@ -229,10 +247,7 @@ fn backward_prelude_plus_q_load_ptxas_clean_sm75_sm90_sm120() {
         let dump = std::env::temp_dir().join(format!("bwd_prelude_qload_{sm}.ptx"));
         std::fs::write(&dump, &ptx).ok();
         if let Err(err) = assemble_ptx(&ptxas, &ptx, sm) {
-            failures.push(format!(
-                "sm={sm} dump={} ptxas:\n{err}",
-                dump.display()
-            ));
+            failures.push(format!("sm={sm} dump={} ptxas:\n{err}", dump.display()));
         }
     }
     assert!(
@@ -250,10 +265,18 @@ fn backward_prelude_qload_ds_compute_ptxas_clean_sm75_sm90_sm120() {
     };
     for (causal, tag) in [(false, "nocausal"), (true, "causal")] {
         let base = FlashAttentionConfig {
-            block_q: 32, block_kv: 32, head_dim: 32,
-            causal, paged: false, rope_q: false,
+            block_q: 32,
+            block_kv: 32,
+            head_dim: 32,
+            causal,
+            paged: false,
+            rope_q: false,
             rope_style: RopeStyle::HalfSplit,
-            gqa_group_size: 1, tree_mask: false, gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras {
+            gqa_group_size: 1,
+            tree_mask: false,
+            gpu_sm: 75,
+            segment_masked: false,
+            csha: Some(CshaExtras {
                 fused_projections: true,
                 save_activations_for_backward: true,
                 d_model: 32,
@@ -265,12 +288,13 @@ fn backward_prelude_qload_ds_compute_ptxas_clean_sm75_sm90_sm120() {
             let mut c = base.clone();
             c.gpu_sm = sm.trim_start_matches("sm_").parse().unwrap_or(75);
             let ptx = synth_prelude_qload_ds_with_ret(&c);
-            let dump = std::env::temp_dir()
-                .join(format!("bwd_prelude_qload_ds_{tag}_{sm}.ptx"));
+            let dump = std::env::temp_dir().join(format!("bwd_prelude_qload_ds_{tag}_{sm}.ptx"));
             std::fs::write(&dump, &ptx).ok();
             if let Err(err) = assemble_ptx(&ptxas, &ptx, sm) {
-                failures.push(format!("tag={tag} sm={sm} dump={} ptxas:\n{err}",
-                    dump.display()));
+                failures.push(format!(
+                    "tag={tag} sm={sm} dump={} ptxas:\n{err}",
+                    dump.display()
+                ));
             }
         }
         assert!(
@@ -288,10 +312,18 @@ fn backward_prelude_qload_ds_dv_ptxas_clean_sm75_sm90_sm120() {
         return;
     };
     let base = FlashAttentionConfig {
-        block_q: 32, block_kv: 32, head_dim: 32,
-        causal: false, paged: false, rope_q: false,
+        block_q: 32,
+        block_kv: 32,
+        head_dim: 32,
+        causal: false,
+        paged: false,
+        rope_q: false,
         rope_style: RopeStyle::HalfSplit,
-        gqa_group_size: 1, tree_mask: false, gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras {
+        gqa_group_size: 1,
+        tree_mask: false,
+        gpu_sm: 75,
+        segment_masked: false,
+        csha: Some(CshaExtras {
             fused_projections: true,
             save_activations_for_backward: true,
             d_model: 32,
@@ -306,8 +338,7 @@ fn backward_prelude_qload_ds_dv_ptxas_clean_sm75_sm90_sm120() {
         let dump = std::env::temp_dir().join(format!("bwd_prelude_qload_ds_dv_{sm}.ptx"));
         std::fs::write(&dump, &ptx).ok();
         if let Err(err) = assemble_ptx(&ptxas, &ptx, sm) {
-            failures.push(format!("sm={sm} dump={} ptxas:\n{err}",
-                dump.display()));
+            failures.push(format!("sm={sm} dump={} ptxas:\n{err}", dump.display()));
         }
     }
     assert!(
@@ -324,10 +355,18 @@ fn backward_through_dqdk_accum_ptxas_clean_sm75_sm90_sm120() {
         return;
     };
     let base = FlashAttentionConfig {
-        block_q: 32, block_kv: 32, head_dim: 32,
-        causal: false, paged: false, rope_q: false,
+        block_q: 32,
+        block_kv: 32,
+        head_dim: 32,
+        causal: false,
+        paged: false,
+        rope_q: false,
         rope_style: RopeStyle::HalfSplit,
-        gqa_group_size: 1, tree_mask: false, gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras {
+        gqa_group_size: 1,
+        tree_mask: false,
+        gpu_sm: 75,
+        segment_masked: false,
+        csha: Some(CshaExtras {
             fused_projections: true,
             save_activations_for_backward: true,
             d_model: 32,
@@ -342,8 +381,7 @@ fn backward_through_dqdk_accum_ptxas_clean_sm75_sm90_sm120() {
         let dump = std::env::temp_dir().join(format!("bwd_through_dqdk_{sm}.ptx"));
         std::fs::write(&dump, &ptx).ok();
         if let Err(err) = assemble_ptx(&ptxas, &ptx, sm) {
-            failures.push(format!("sm={sm} dump={} ptxas:\n{err}",
-                dump.display()));
+            failures.push(format!("sm={sm} dump={} ptxas:\n{err}", dump.display()));
         }
     }
     assert!(
@@ -361,10 +399,18 @@ fn backward_through_csha_hooks_ptxas_clean_sm75_sm90_sm120() {
     };
     // rope_q=true so dRoPE actually fires in the emitted PTX.
     let base = FlashAttentionConfig {
-        block_q: 32, block_kv: 32, head_dim: 32,
-        causal: false, paged: false, rope_q: true,
+        block_q: 32,
+        block_kv: 32,
+        head_dim: 32,
+        causal: false,
+        paged: false,
+        rope_q: true,
         rope_style: RopeStyle::Adjacent,
-        gqa_group_size: 1, tree_mask: false, gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras {
+        gqa_group_size: 1,
+        tree_mask: false,
+        gpu_sm: 75,
+        segment_masked: false,
+        csha: Some(CshaExtras {
             fused_projections: true,
             save_activations_for_backward: true,
             d_model: 32,
@@ -401,10 +447,18 @@ fn backward_full_pipeline_ptxas_clean_sm75_sm90_sm120() {
         (false, true, "rope"),
     ] {
         let base = FlashAttentionConfig {
-            block_q: 32, block_kv: 32, head_dim: 32,
-            causal, paged: false, rope_q,
+            block_q: 32,
+            block_kv: 32,
+            head_dim: 32,
+            causal,
+            paged: false,
+            rope_q,
             rope_style: RopeStyle::Adjacent,
-            gqa_group_size: 1, tree_mask: false, gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras {
+            gqa_group_size: 1,
+            tree_mask: false,
+            gpu_sm: 75,
+            segment_masked: false,
+            csha: Some(CshaExtras {
                 fused_projections: true,
                 save_activations_for_backward: true,
                 d_model: 32,
@@ -419,8 +473,10 @@ fn backward_full_pipeline_ptxas_clean_sm75_sm90_sm120() {
             let dump = std::env::temp_dir().join(format!("bwd_full_{tag}_{sm}.ptx"));
             std::fs::write(&dump, &ptx).ok();
             if let Err(err) = assemble_ptx(&ptxas, &ptx, sm) {
-                failures.push(format!("tag={tag} sm={sm} dump={} ptxas:\n{err}",
-                    dump.display()));
+                failures.push(format!(
+                    "tag={tag} sm={sm} dump={} ptxas:\n{err}",
+                    dump.display()
+                ));
             }
         }
         assert!(
@@ -444,10 +500,18 @@ fn synthesize_backward_orchestrator_ptxas_clean_sm75_sm90_sm120() {
         (false, true, "rope"),
     ] {
         let base = FlashAttentionConfig {
-            block_q: 32, block_kv: 32, head_dim: 32,
-            causal, paged: false, rope_q,
+            block_q: 32,
+            block_kv: 32,
+            head_dim: 32,
+            causal,
+            paged: false,
+            rope_q,
             rope_style: RopeStyle::Adjacent,
-            gqa_group_size: 1, tree_mask: false, gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras {
+            gqa_group_size: 1,
+            tree_mask: false,
+            gpu_sm: 75,
+            segment_masked: false,
+            csha: Some(CshaExtras {
                 fused_projections: true,
                 save_activations_for_backward: true,
                 d_model: 32,
@@ -460,14 +524,17 @@ fn synthesize_backward_orchestrator_ptxas_clean_sm75_sm90_sm120() {
             c.gpu_sm = sm.trim_start_matches("sm_").parse().unwrap_or(75);
             let mut ptx = synthesize_backward(&c).expect("synth_backward");
             // Strip trailing NUL for stdin feed (kept for cuModuleLoadData).
-            if ptx.ends_with('\0') { ptx.pop(); }
+            if ptx.ends_with('\0') {
+                ptx.pop();
+            }
             let bytes = ptx.into_bytes();
-            let dump = std::env::temp_dir()
-                .join(format!("synth_backward_{tag}_{sm}.ptx"));
+            let dump = std::env::temp_dir().join(format!("synth_backward_{tag}_{sm}.ptx"));
             std::fs::write(&dump, &bytes).ok();
             if let Err(err) = assemble_ptx(&ptxas, &bytes, sm) {
-                failures.push(format!("tag={tag} sm={sm} dump={} ptxas:\n{err}",
-                    dump.display()));
+                failures.push(format!(
+                    "tag={tag} sm={sm} dump={} ptxas:\n{err}",
+                    dump.display()
+                ));
             }
         }
         assert!(

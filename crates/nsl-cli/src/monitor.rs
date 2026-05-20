@@ -13,12 +13,8 @@ pub fn run_monitor(
     actual_path: &Path,
 ) -> Result<String, String> {
     let manifest: Manifest = serde_json::from_str(
-        &std::fs::read_to_string(manifest_path).map_err(|e| {
-            format!(
-                "cannot read manifest at {}: {e}",
-                manifest_path.display()
-            )
-        })?,
+        &std::fs::read_to_string(manifest_path)
+            .map_err(|e| format!("cannot read manifest at {}: {e}", manifest_path.display()))?,
     )
     .map_err(|e| format!("manifest JSON parse: {e}"))?;
     let actual: ActualReport = match std::fs::read_to_string(actual_path) {
@@ -28,8 +24,8 @@ pub fn run_monitor(
             ActualReport { aggregates: vec![] }
         }
     };
-    let src = std::fs::read_to_string(source_file)
-        .map_err(|e| format!("cannot read source: {e}"))?;
+    let src =
+        std::fs::read_to_string(source_file).map_err(|e| format!("cannot read source: {e}"))?;
     let mut out = String::new();
     if actual.aggregates.is_empty() {
         out.push_str("Note: no actual timings collected (codegen hooks are a Phase 2 feature).\n");
@@ -89,10 +85,7 @@ pub fn render_comparison(manifest: &Manifest, actual: &ActualReport) -> String {
                 let mean = a.sum_us / a.count as f64;
                 let d_pct = (mean - k.predicted_us) / k.predicted_us * 100.0;
                 if d_pct.abs() > 20.0 {
-                    out.push_str(&format!(
-                        "   \u{2192} likely cause: {}\n",
-                        likely_cause(k)
-                    ));
+                    out.push_str(&format!("   \u{2192} likely cause: {}\n", likely_cause(k)));
                 }
             }
         }
@@ -105,19 +98,12 @@ fn likely_cause(k: &KernelEntry) -> String {
         s if s.contains("matmul") || s.contains("proj") => {
             "tile-size misalignment; check inner dim % 128 == 0".into()
         }
-        s if s.contains("attn") => {
-            "SMEM pressure / bank conflicts; try smaller CSHA tile".into()
-        }
+        s if s.contains("attn") => "SMEM pressure / bank conflicts; try smaller CSHA tile".into(),
         _ => "cause unknown; rerun with --target-profile=detailed (Phase 2)".into(),
     }
 }
 
-pub fn render_source_view(
-    m: &Manifest,
-    actual: &ActualReport,
-    src: &str,
-    file: &str,
-) -> String {
+pub fn render_source_view(m: &Manifest, actual: &ActualReport, src: &str, file: &str) -> String {
     let mut out = String::from("\n=== Source-Mapped Kernel View ===\n\n");
     let lines: Vec<&str> = src.lines().collect();
 

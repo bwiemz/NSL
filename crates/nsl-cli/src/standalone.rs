@@ -38,7 +38,11 @@ fn f16_bits_to_f64(bits: u16) -> f64 {
     if exponent == 0x1F {
         // Inf or NaN
         if mantissa == 0 {
-            return if sign > 0 { f64::INFINITY } else { f64::NEG_INFINITY };
+            return if sign > 0 {
+                f64::INFINITY
+            } else {
+                f64::NEG_INFINITY
+            };
         } else {
             return f64::NAN;
         }
@@ -65,8 +69,8 @@ fn bf16_bits_to_f64(bits: u16) -> f64 {
 /// Read a .safetensors file and return all tensors converted to f64 LE bytes,
 /// sorted by name for deterministic ordering.
 pub fn read_safetensors(path: &Path) -> Result<Vec<WeightTensor>, String> {
-    let data =
-        std::fs::read(path).map_err(|e| format!("read_safetensors: cannot read {:?}: {}", path, e))?;
+    let data = std::fs::read(path)
+        .map_err(|e| format!("read_safetensors: cannot read {:?}: {}", path, e))?;
 
     let tensors = safetensors::SafeTensors::deserialize(&data)
         .map_err(|e| format!("read_safetensors: parse error for {:?}: {}", path, e))?;
@@ -231,6 +235,10 @@ pub fn serialize_nslweights(tensors: &[WeightTensor]) -> Vec<u8> {
 
 /// Write raw .nslweights bytes to a sidecar file at the given path.
 pub fn write_nslweights_sidecar_raw(data: &[u8], path: &Path) -> Result<(), String> {
-    std::fs::write(path, data)
-        .map_err(|e| format!("write_nslweights_sidecar_raw: cannot write {:?}: {}", path, e))
+    std::fs::write(path, data).map_err(|e| {
+        format!(
+            "write_nslweights_sidecar_raw: cannot write {:?}: {}",
+            path, e
+        )
+    })
 }

@@ -28,11 +28,7 @@ use crate::tensor::nsl_tensor_free;
 /// `tensor_ptr` must be a valid `*NslTensor` allocated by the NSL
 /// runtime, or `0`.
 #[no_mangle]
-pub extern "C" fn nsl_cpdt_allgather(
-    tensor_ptr: i64,
-    _group_size: i64,
-    _inter_node: i64,
-) -> i64 {
+pub extern "C" fn nsl_cpdt_allgather(tensor_ptr: i64, _group_size: i64, _inter_node: i64) -> i64 {
     if tensor_ptr == 0 {
         return 0;
     }

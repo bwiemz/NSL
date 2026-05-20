@@ -102,7 +102,10 @@ impl PageTable {
     /// Replace the block at `entry_index` with a new block ID.
     /// Used by Copy-on-Write to atomically update the page table entry.
     pub fn replace_block(&mut self, entry_index: usize, new_block: BlockId) {
-        assert!(entry_index < self.entries.len(), "replace_block: index out of bounds");
+        assert!(
+            entry_index < self.entries.len(),
+            "replace_block: index out of bounds"
+        );
         self.entries[entry_index] = new_block;
     }
 
@@ -191,7 +194,10 @@ mod tests {
         pt.append_token(); // token 1, offset 1
 
         // Block is now full — needs a new one before the third token.
-        assert!(pt.needs_new_block(), "after filling block, needs_new_block should be true");
+        assert!(
+            pt.needs_new_block(),
+            "after filling block, needs_new_block should be true"
+        );
 
         pt.push_block(20);
         let (bid, off) = pt.append_token();
@@ -226,6 +232,10 @@ mod tests {
         pt.append_token();
 
         let ids = pt.block_ids();
-        assert_eq!(ids, &[100u32, 200u32], "block_ids() should return [100, 200]");
+        assert_eq!(
+            ids,
+            &[100u32, 200u32],
+            "block_ids() should return [100, 200]"
+        );
     }
 }

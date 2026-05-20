@@ -1,7 +1,13 @@
 use super::*;
 
 impl<'a> TypeChecker<'a> {
-    pub(crate) fn check_binary_op(&mut self, left: &Expr, op: BinOp, right: &Expr, span: Span) -> Type {
+    pub(crate) fn check_binary_op(
+        &mut self,
+        left: &Expr,
+        op: BinOp,
+        right: &Expr,
+        span: Span,
+    ) -> Type {
         let lty = self.check_expr(left);
         let rty = self.check_expr(right);
 
@@ -14,9 +20,13 @@ impl<'a> TypeChecker<'a> {
         }
 
         match op {
-            BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::FloorDiv | BinOp::Mod | BinOp::Pow => {
-                self.check_arithmetic(&lty, &rty, op, span)
-            }
+            BinOp::Add
+            | BinOp::Sub
+            | BinOp::Mul
+            | BinOp::Div
+            | BinOp::FloorDiv
+            | BinOp::Mod
+            | BinOp::Pow => self.check_arithmetic(&lty, &rty, op, span),
             BinOp::MatMul => self.check_matmul_op(&lty, &rty, span),
             BinOp::Eq | BinOp::NotEq | BinOp::Lt | BinOp::Gt | BinOp::LtEq | BinOp::GtEq => {
                 Type::Bool
@@ -27,7 +37,13 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
-    pub(crate) fn check_arithmetic(&mut self, lty: &Type, rty: &Type, op: BinOp, span: Span) -> Type {
+    pub(crate) fn check_arithmetic(
+        &mut self,
+        lty: &Type,
+        rty: &Type,
+        op: BinOp,
+        span: Span,
+    ) -> Type {
         match (lty, rty) {
             (Type::Int, Type::Int) => {
                 if matches!(op, BinOp::Div) {
@@ -36,9 +52,9 @@ impl<'a> TypeChecker<'a> {
                     Type::Int
                 }
             }
-            (Type::Float, Type::Float)
-            | (Type::Int, Type::Float)
-            | (Type::Float, Type::Int) => Type::Float,
+            (Type::Float, Type::Float) | (Type::Int, Type::Float) | (Type::Float, Type::Int) => {
+                Type::Float
+            }
             // Tensor element-wise ops (includes Param/Buffer)
             (l, r) if l.is_tensor() && r.is_tensor() => {
                 let (ls, ld, ldev) = l.as_tensor_parts().unwrap();
@@ -49,7 +65,10 @@ impl<'a> TypeChecker<'a> {
                 {
                     self.diagnostics.push(
                         Diagnostic::error("cannot operate on tensors on different devices")
-                            .with_label(span, format!("{} vs {}", display_device(&ldev), display_device(&rdev))),
+                            .with_label(
+                                span,
+                                format!("{} vs {}", display_device(&ldev), display_device(&rdev)),
+                            ),
                     );
                 }
                 match shapes::check_elementwise(ls, rs, span) {
@@ -78,17 +97,27 @@ impl<'a> TypeChecker<'a> {
                 let (rf, rr) = dtype_rank(r);
                 if lf == rf {
                     // Same family: return the wider type
-                    if lr >= rr { l.clone() } else { r.clone() }
+                    if lr >= rr {
+                        l.clone()
+                    } else {
+                        r.clone()
+                    }
                 } else {
                     // Mixed int/float: promote to float side
-                    if lf == 2 { l.clone() } else { r.clone() }
+                    if lf == 2 {
+                        l.clone()
+                    } else {
+                        r.clone()
+                    }
                 }
             }
             _ => {
                 self.diagnostics.push(
                     Diagnostic::error(format!(
                         "unsupported operand types for {:?}: {} and {}",
-                        op, display_type(lty), display_type(rty)
+                        op,
+                        display_type(lty),
+                        display_type(rty)
                     ))
                     .with_label(span, "type error"),
                 );
@@ -105,10 +134,11 @@ impl<'a> TypeChecker<'a> {
                     && !matches!(ldev, Device::Unknown)
                     && !matches!(rdev, Device::Unknown)
                 {
-                    self.diagnostics.push(
-                        Diagnostic::error("matmul: device mismatch")
-                            .with_label(span, format!("{} vs {}", display_device(&ldev), display_device(&rdev))),
-                    );
+                    self.diagnostics
+                        .push(Diagnostic::error("matmul: device mismatch").with_label(
+                            span,
+                            format!("{} vs {}", display_device(&ldev), display_device(&rdev)),
+                        ));
                 }
                 match shapes::check_matmul(ls, rs, span) {
                     Ok(result_shape) => Type::Tensor {
@@ -206,7 +236,10 @@ impl<'a> TypeChecker<'a> {
 
             // Math builtins (exp, log, sqrt, sin, cos, abs) — when called with tensor or
             // unknown args, return the arg type (tensor) instead of Float.
-            if matches!(name.as_str(), "exp" | "log" | "sqrt" | "sin" | "cos" | "abs" | "neg" | "floor") {
+            if matches!(
+                name.as_str(),
+                "exp" | "log" | "sqrt" | "sin" | "cos" | "abs" | "neg" | "floor"
+            ) {
                 if let Some(first_arg_ty) = arg_types.first() {
                     if first_arg_ty.is_tensor() || first_arg_ty.is_indeterminate() {
                         return first_arg_ty.clone();
@@ -215,7 +248,10 @@ impl<'a> TypeChecker<'a> {
             }
 
             // Tensor reduction / manipulation builtins — always return tensor-like
-            if matches!(name.as_str(), "mean" | "sum" | "reduce_max" | "gather" | "clamp" | "neg") {
+            if matches!(
+                name.as_str(),
+                "mean" | "sum" | "reduce_max" | "gather" | "clamp" | "neg"
+            ) {
                 if let Some(first_arg_ty) = arg_types.first() {
                     if first_arg_ty.is_tensor() || first_arg_ty.is_indeterminate() {
                         return first_arg_ty.clone();
@@ -226,27 +262,37 @@ impl<'a> TypeChecker<'a> {
 
         // Tensor method shape inference (reshape, transpose)
         if let ExprKind::MemberAccess { object, member } = &callee.kind {
-            let obj_ty = self.type_map.get(&object.id).cloned().unwrap_or(Type::Unknown);
+            let obj_ty = self
+                .type_map
+                .get(&object.id)
+                .cloned()
+                .unwrap_or(Type::Unknown);
             if obj_ty.is_tensor() {
                 let method_name = self.interner.resolve(member.0).unwrap_or("").to_string();
                 if let Type::Tensor { dtype, device, .. } = &obj_ty {
                     match method_name.as_str() {
                         "reshape" => {
                             let target_shape = self.extract_shape_from_args(args);
-                            if let Type::Tensor { shape: source_shape, .. } = &obj_ty {
+                            if let Type::Tensor {
+                                shape: source_shape,
+                                ..
+                            } = &obj_ty
+                            {
                                 // M49: Prove reshape correctness via shape algebra
                                 if !source_shape.dims.is_empty() && !target_shape.dims.is_empty() {
-                                    let mut solver = crate::shape_algebra::ShapeAlgebraSolver::new();
-                                    let src_expr = Self::shape_to_product(source_shape, &mut solver);
-                                    let tgt_expr = Self::shape_to_product(&target_shape, &mut solver);
+                                    let mut solver =
+                                        crate::shape_algebra::ShapeAlgebraSolver::new();
+                                    let src_expr =
+                                        Self::shape_to_product(source_shape, &mut solver);
+                                    let tgt_expr =
+                                        Self::shape_to_product(&target_shape, &mut solver);
                                     if let (Some(src), Some(tgt)) = (src_expr, tgt_expr) {
                                         if let Err(pf) = solver.prove_eq_normalized(&src, &tgt) {
                                             // Only warn — runtime check still active as fallback
-                                            self.diagnostics.push(
-                                                Diagnostic::warning(format!(
-                                                    "reshape may be invalid: {}", pf.reason
-                                                ))
-                                            );
+                                            self.diagnostics.push(Diagnostic::warning(format!(
+                                                "reshape may be invalid: {}",
+                                                pf.reason
+                                            )));
                                         }
                                     }
                                 }
@@ -258,7 +304,12 @@ impl<'a> TypeChecker<'a> {
                             };
                         }
                         "transpose" => {
-                            if let Type::Tensor { shape, dtype, device } = &obj_ty {
+                            if let Type::Tensor {
+                                shape,
+                                dtype,
+                                device,
+                            } = &obj_ty
+                            {
                                 if shape.rank() >= 2 && args.len() >= 2 {
                                     let d0 = match &args[0].value.kind {
                                         ExprKind::IntLiteral(n) => Some(*n as usize),
@@ -295,7 +346,11 @@ impl<'a> TypeChecker<'a> {
         }
 
         match &callee_ty {
-            Type::Function { params, ret, effect } => {
+            Type::Function {
+                params,
+                ret,
+                effect,
+            } => {
                 // Check arity (allow flexible arity if params has Unknown — variadic builtins)
                 let is_variadic = params.iter().any(|p| matches!(p, Type::Unknown));
                 if arg_types.len() > params.len() && !is_variadic {
@@ -322,13 +377,13 @@ impl<'a> TypeChecker<'a> {
                 // Effect variable bindings: when a function parameter is a callable
                 // with an effect variable, bind that variable to the concrete effect
                 // of the passed argument.
-                let mut effect_bindings: std::collections::HashMap<nsl_ast::Symbol, crate::effects::EffectSet> =
-                    std::collections::HashMap::new();
+                let mut effect_bindings: std::collections::HashMap<
+                    nsl_ast::Symbol,
+                    crate::effects::EffectSet,
+                > = std::collections::HashMap::new();
 
                 // Check each arg type against param type
-                for (i, (arg_ty, param_ty)) in
-                    arg_types.iter().zip(params.iter()).enumerate()
-                {
+                for (i, (arg_ty, param_ty)) in arg_types.iter().zip(params.iter()).enumerate() {
                     if !is_assignable(arg_ty, param_ty) {
                         self.diagnostics.push(
                             Diagnostic::error(format!(
@@ -343,9 +398,15 @@ impl<'a> TypeChecker<'a> {
 
                     // Unify effect variables: if param is fn(...) | E and arg is fn(...) | {concrete}
                     if let (
-                        Type::Function { effect: Effect::Var(var_sym), .. },
-                        Type::Function { effect: arg_eff, .. },
-                    ) = (param_ty, arg_ty) {
+                        Type::Function {
+                            effect: Effect::Var(var_sym),
+                            ..
+                        },
+                        Type::Function {
+                            effect: arg_eff, ..
+                        },
+                    ) = (param_ty, arg_ty)
+                    {
                         let concrete = arg_eff.substitute(&effect_bindings);
                         effect_bindings.insert(*var_sym, concrete);
                     }
@@ -361,10 +422,11 @@ impl<'a> TypeChecker<'a> {
             Type::Error => Type::Error,
             Type::Unknown => Type::Unknown,
             _ => {
-                self.diagnostics.push(
-                    Diagnostic::error("expression is not callable")
-                        .with_label(span, format!("type {} is not callable", display_type(&callee_ty))),
-                );
+                self.diagnostics
+                    .push(Diagnostic::error("expression is not callable").with_label(
+                        span,
+                        format!("type {} is not callable", display_type(&callee_ty)),
+                    ));
                 Type::Error
             }
         }
@@ -434,9 +496,15 @@ impl<'a> TypeChecker<'a> {
                 self.check_expr(expr);
             }
             nsl_ast::expr::SubscriptKind::Slice { lower, upper, step } => {
-                if let Some(e) = lower { self.check_expr(e); }
-                if let Some(e) = upper { self.check_expr(e); }
-                if let Some(e) = step { self.check_expr(e); }
+                if let Some(e) = lower {
+                    self.check_expr(e);
+                }
+                if let Some(e) = upper {
+                    self.check_expr(e);
+                }
+                if let Some(e) = step {
+                    self.check_expr(e);
+                }
             }
             nsl_ast::expr::SubscriptKind::MultiDim(dims) => {
                 for d in dims {
@@ -446,7 +514,12 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
-    pub(crate) fn check_member_access(&mut self, object: &Expr, member: Symbol, span: Span) -> Type {
+    pub(crate) fn check_member_access(
+        &mut self,
+        object: &Expr,
+        member: Symbol,
+        span: Span,
+    ) -> Type {
         let obj_ty = self.check_expr(object);
 
         match &obj_ty {
@@ -473,7 +546,9 @@ impl<'a> TypeChecker<'a> {
                     Type::Error
                 }
             }
-            Type::Model { fields, methods, .. } => {
+            Type::Model {
+                fields, methods, ..
+            } => {
                 if let Some((_, field_ty)) = fields.iter().find(|(name, _)| *name == member) {
                     return field_ty.clone();
                 }
@@ -538,7 +613,7 @@ impl<'a> TypeChecker<'a> {
                         }),
                         effect: Effect::Inferred,
                     },
-                    _ => Type::Unknown,    // tensor methods
+                    _ => Type::Unknown, // tensor methods
                 }
             }
             Type::Str => {

@@ -78,8 +78,7 @@ mod tests {
         let (max1, sum1, w1) = partial_softmax(&[0.1, 0.2]);
         let (max2, _sum2, _w2) = partial_softmax(&[10.0, 20.0]);
 
-        let (final_max, final_sum, _) =
-            merge_partial_softmax(max1, sum1, &w1, max2, _sum2, &_w2);
+        let (final_max, final_sum, _) = merge_partial_softmax(max1, sum1, &w1, max2, _sum2, &_w2);
 
         assert!((final_max - 20.0).abs() < 1e-5);
         assert!(final_sum > 0.0);

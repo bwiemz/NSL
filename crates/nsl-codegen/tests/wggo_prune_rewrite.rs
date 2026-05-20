@@ -33,11 +33,11 @@
 //   - Layer 4 stderr diagnostic tests
 //   - Numerical (bit-exact forward) comparison to reference fixtures
 
+use nsl_codegen::weight_aware::WeightMap;
 use nsl_codegen::wengert::{PrimalOp, VarId, WengertList, WengertOp};
 use nsl_codegen::wggo_apply::{AppliedLayer, AppliedPlan};
 use nsl_codegen::wggo_dp::LayerDecision;
-use nsl_codegen::weight_aware::WeightMap;
-use nsl_codegen::wggo_prune::{PruneRefusal, run};
+use nsl_codegen::wggo_prune::{run, PruneRefusal};
 use std::collections::HashMap;
 
 // --------------------------------------------------------------------------
@@ -89,35 +89,35 @@ fn mk_toy_wengert() -> WengertList {
 
     // block 0
     const B0_ATTN_PARAM: VarId = 1;
-    const B0_ATTN_OUT: VarId   = 2;   // result of the relu (proxy for whole attn path)
-    const B0_MID: VarId        = 3;   // h after attn add = INPUT + B0_ATTN_OUT
-    const B0_FFN_PARAM: VarId  = 4;
-    const B0_FFN_OUT: VarId    = 5;
-    const B0_OUT: VarId        = 6;   // h after ffn add  = B0_MID + B0_FFN_OUT
+    const B0_ATTN_OUT: VarId = 2; // result of the relu (proxy for whole attn path)
+    const B0_MID: VarId = 3; // h after attn add = INPUT + B0_ATTN_OUT
+    const B0_FFN_PARAM: VarId = 4;
+    const B0_FFN_OUT: VarId = 5;
+    const B0_OUT: VarId = 6; // h after ffn add  = B0_MID + B0_FFN_OUT
 
     // block 1
     const B1_ATTN_PARAM: VarId = 7;
-    const B1_ATTN_OUT: VarId   = 8;
-    const B1_MID: VarId        = 9;   // B0_OUT + B1_ATTN_OUT
-    const B1_FFN_PARAM: VarId  = 10;
-    const B1_FFN_OUT: VarId    = 11;
-    const B1_OUT: VarId        = 12;  // B1_MID + B1_FFN_OUT
+    const B1_ATTN_OUT: VarId = 8;
+    const B1_MID: VarId = 9; // B0_OUT + B1_ATTN_OUT
+    const B1_FFN_PARAM: VarId = 10;
+    const B1_FFN_OUT: VarId = 11;
+    const B1_OUT: VarId = 12; // B1_MID + B1_FFN_OUT
 
     // block 2
     const B2_ATTN_PARAM: VarId = 13;
-    const B2_ATTN_OUT: VarId   = 14;
-    const B2_MID: VarId        = 15;
-    const B2_FFN_PARAM: VarId  = 16;
-    const B2_FFN_OUT: VarId    = 17;
-    const B2_OUT: VarId        = 18;
+    const B2_ATTN_OUT: VarId = 14;
+    const B2_MID: VarId = 15;
+    const B2_FFN_PARAM: VarId = 16;
+    const B2_FFN_OUT: VarId = 17;
+    const B2_OUT: VarId = 18;
 
     // block 3
     const B3_ATTN_PARAM: VarId = 19;
-    const B3_ATTN_OUT: VarId   = 20;
-    const B3_MID: VarId        = 21;
-    const B3_FFN_PARAM: VarId  = 22;
-    const B3_FFN_OUT: VarId    = 23;
-    const B3_OUT: VarId        = 24;
+    const B3_ATTN_OUT: VarId = 20;
+    const B3_MID: VarId = 21;
+    const B3_FFN_PARAM: VarId = 22;
+    const B3_FFN_OUT: VarId = 23;
+    const B3_OUT: VarId = 24;
 
     // Helper: build a WengertOp.
     let make_op = |id: u32, result: VarId, op: PrimalOp, inputs: Vec<VarId>| WengertOp {
@@ -137,72 +137,67 @@ fn mk_toy_wengert() -> WengertList {
         make_op(1, B0_ATTN_OUT, PrimalOp::Relu, vec![B0_ATTN_PARAM]),
         // attn residual add: B0_MID = INPUT + B0_ATTN_OUT
         make_op(2, B0_MID, PrimalOp::Add, vec![INPUT, B0_ATTN_OUT]),
-
         // --- block 0 ffn ---
         make_op(3, B0_FFN_PARAM, PrimalOp::Relu, vec![B0_MID]),
-        make_op(4, B0_FFN_OUT,   PrimalOp::Relu, vec![B0_FFN_PARAM]),
+        make_op(4, B0_FFN_OUT, PrimalOp::Relu, vec![B0_FFN_PARAM]),
         // ffn residual add: B0_OUT = B0_MID + B0_FFN_OUT
         make_op(5, B0_OUT, PrimalOp::Add, vec![B0_MID, B0_FFN_OUT]),
-
         // --- block 1 attn ---
-        make_op(6,  B1_ATTN_PARAM, PrimalOp::Relu, vec![B0_OUT]),
-        make_op(7,  B1_ATTN_OUT,   PrimalOp::Relu, vec![B1_ATTN_PARAM]),
+        make_op(6, B1_ATTN_PARAM, PrimalOp::Relu, vec![B0_OUT]),
+        make_op(7, B1_ATTN_OUT, PrimalOp::Relu, vec![B1_ATTN_PARAM]),
         // attn residual add: B1_MID = B0_OUT + B1_ATTN_OUT
-        make_op(8,  B1_MID, PrimalOp::Add, vec![B0_OUT, B1_ATTN_OUT]),
-
+        make_op(8, B1_MID, PrimalOp::Add, vec![B0_OUT, B1_ATTN_OUT]),
         // --- block 1 ffn ---
-        make_op(9,  B1_FFN_PARAM, PrimalOp::Relu, vec![B1_MID]),
-        make_op(10, B1_FFN_OUT,   PrimalOp::Relu, vec![B1_FFN_PARAM]),
+        make_op(9, B1_FFN_PARAM, PrimalOp::Relu, vec![B1_MID]),
+        make_op(10, B1_FFN_OUT, PrimalOp::Relu, vec![B1_FFN_PARAM]),
         // ffn residual add: B1_OUT = B1_MID + B1_FFN_OUT
         make_op(11, B1_OUT, PrimalOp::Add, vec![B1_MID, B1_FFN_OUT]),
-
         // --- block 2 attn ---
         make_op(12, B2_ATTN_PARAM, PrimalOp::Relu, vec![B1_OUT]),
-        make_op(13, B2_ATTN_OUT,   PrimalOp::Relu, vec![B2_ATTN_PARAM]),
+        make_op(13, B2_ATTN_OUT, PrimalOp::Relu, vec![B2_ATTN_PARAM]),
         make_op(14, B2_MID, PrimalOp::Add, vec![B1_OUT, B2_ATTN_OUT]),
-
         // --- block 2 ffn ---
         make_op(15, B2_FFN_PARAM, PrimalOp::Relu, vec![B2_MID]),
-        make_op(16, B2_FFN_OUT,   PrimalOp::Relu, vec![B2_FFN_PARAM]),
+        make_op(16, B2_FFN_OUT, PrimalOp::Relu, vec![B2_FFN_PARAM]),
         make_op(17, B2_OUT, PrimalOp::Add, vec![B2_MID, B2_FFN_OUT]),
-
         // --- block 3 attn ---
         make_op(18, B3_ATTN_PARAM, PrimalOp::Relu, vec![B2_OUT]),
-        make_op(19, B3_ATTN_OUT,   PrimalOp::Relu, vec![B3_ATTN_PARAM]),
+        make_op(19, B3_ATTN_OUT, PrimalOp::Relu, vec![B3_ATTN_PARAM]),
         make_op(20, B3_MID, PrimalOp::Add, vec![B2_OUT, B3_ATTN_OUT]),
-
         // --- block 3 ffn ---
         make_op(21, B3_FFN_PARAM, PrimalOp::Relu, vec![B3_MID]),
-        make_op(22, B3_FFN_OUT,   PrimalOp::Relu, vec![B3_FFN_PARAM]),
+        make_op(22, B3_FFN_OUT, PrimalOp::Relu, vec![B3_FFN_PARAM]),
         make_op(23, B3_OUT, PrimalOp::Add, vec![B3_MID, B3_FFN_OUT]),
     ];
 
     // var_names: label each param producer and key stream vars so
     // wggo_prune can identify layer closures by prefix.
     let var_names: HashMap<VarId, String> = [
-        (INPUT,         "x".to_string()),
+        (INPUT, "x".to_string()),
         // block 0
         (B0_ATTN_PARAM, "blocks.0.attn.wq".to_string()),
-        (B0_FFN_PARAM,  "blocks.0.ffn.w_ffn_up".to_string()),
+        (B0_FFN_PARAM, "blocks.0.ffn.w_ffn_up".to_string()),
         // block 1
         (B1_ATTN_PARAM, "blocks.1.attn.wq".to_string()),
-        (B1_FFN_PARAM,  "blocks.1.ffn.w_ffn_up".to_string()),
+        (B1_FFN_PARAM, "blocks.1.ffn.w_ffn_up".to_string()),
         // block 2
         (B2_ATTN_PARAM, "blocks.2.attn.wq".to_string()),
-        (B2_FFN_PARAM,  "blocks.2.ffn.w_ffn_up".to_string()),
+        (B2_FFN_PARAM, "blocks.2.ffn.w_ffn_up".to_string()),
         // block 3
         (B3_ATTN_PARAM, "blocks.3.attn.wq".to_string()),
-        (B3_FFN_PARAM,  "blocks.3.ffn.w_ffn_up".to_string()),
+        (B3_FFN_PARAM, "blocks.3.ffn.w_ffn_up".to_string()),
         // stream labels for human readability in error messages
-        (B0_MID,        "h_after_b0_attn".to_string()),
-        (B0_OUT,        "h_after_b0".to_string()),
-        (B1_MID,        "h_after_b1_attn".to_string()),
-        (B1_OUT,        "h_after_b1".to_string()),
-        (B2_MID,        "h_after_b2_attn".to_string()),
-        (B2_OUT,        "h_after_b2".to_string()),
-        (B3_MID,        "h_after_b3_attn".to_string()),
-        (B3_OUT,        "h_after_b3".to_string()),
-    ].into_iter().collect();
+        (B0_MID, "h_after_b0_attn".to_string()),
+        (B0_OUT, "h_after_b0".to_string()),
+        (B1_MID, "h_after_b1_attn".to_string()),
+        (B1_OUT, "h_after_b1".to_string()),
+        (B2_MID, "h_after_b2_attn".to_string()),
+        (B2_OUT, "h_after_b2".to_string()),
+        (B3_MID, "h_after_b3_attn".to_string()),
+        (B3_OUT, "h_after_b3".to_string()),
+    ]
+    .into_iter()
+    .collect();
 
     WengertList {
         ops,
@@ -272,7 +267,7 @@ fn blocks_1_attn_prunes_without_refusal() {
         layers: vec![
             mk_keep_layer(0, "blocks.0.attn"),
             mk_keep_layer(1, "blocks.0.ffn"),
-            mk_prune_layer(2, "blocks.1.attn"),   // <-- prune target
+            mk_prune_layer(2, "blocks.1.attn"), // <-- prune target
             mk_keep_layer(3, "blocks.1.ffn"),
             mk_keep_layer(4, "blocks.2.attn"),
             mk_keep_layer(5, "blocks.2.ffn"),
@@ -334,7 +329,11 @@ fn blocks_1_attn_rewrite_removes_correct_layer() {
 
     let result = run(&mut wengert, &applied, &weight_map);
 
-    assert!(result.refusals.is_empty(), "unexpected refusals: {:?}", result.refusals);
+    assert!(
+        result.refusals.is_empty(),
+        "unexpected refusals: {:?}",
+        result.refusals
+    );
     assert_eq!(result.rewrites.len(), 1);
 
     let rewrite = &result.rewrites[0];
@@ -378,7 +377,10 @@ fn blocks_1_attn_wengert_output_unchanged() {
 
     // Capture output before prune.
     let original_output = wengert.output;
-    assert_eq!(original_output, 24, "pre-condition: output should be B3_OUT=24");
+    assert_eq!(
+        original_output, 24,
+        "pre-condition: output should be B3_OUT=24"
+    );
 
     let applied = AppliedPlan {
         layers: vec![
@@ -445,8 +447,14 @@ fn empty_plan_no_rewrites() {
 
     let result = run(&mut wengert, &applied, &weight_map);
 
-    assert!(result.refusals.is_empty(), "no refusals expected for keep-all plan");
-    assert!(result.rewrites.is_empty(), "no rewrites expected for keep-all plan");
+    assert!(
+        result.refusals.is_empty(),
+        "no refusals expected for keep-all plan"
+    );
+    assert!(
+        result.rewrites.is_empty(),
+        "no rewrites expected for keep-all plan"
+    );
     assert_eq!(result.ops_deleted, 0);
     assert_eq!(
         wengert.ops.len(),
@@ -469,7 +477,7 @@ fn whole_block_prune_refused() {
     // "blocks.1" has role Block (inferred by wggo_graph::infer_role).
     let applied = AppliedPlan {
         layers: vec![
-            mk_prune_layer(0, "blocks.1"),  // whole-block prune — should be refused
+            mk_prune_layer(0, "blocks.1"), // whole-block prune — should be refused
         ],
         total_us: 0.0,
         peak_memory_bytes: 0,
@@ -532,7 +540,8 @@ fn mixed_plan_emits_all_refusals_in_one_pass_with_wengert_untouched() {
 
     // (b) Zero rewrites applied (dry-run-then-commit invariant).
     assert_eq!(
-        result.rewrites.len(), 0,
+        result.rewrites.len(),
+        0,
         "expected zero rewrites applied in a mixed-refusal plan (dry-run-then-commit); got {}",
         result.rewrites.len()
     );
@@ -544,9 +553,11 @@ fn mixed_plan_emits_all_refusals_in_one_pass_with_wengert_untouched() {
 
     // (c) wengert unchanged — op count and output pointer both preserved.
     assert_eq!(
-        wengert.ops.len(), baseline_op_count,
+        wengert.ops.len(),
+        baseline_op_count,
         "wengert.ops should be untouched on refusal; count changed from {} to {}",
-        baseline_op_count, wengert.ops.len()
+        baseline_op_count,
+        wengert.ops.len()
     );
     assert_eq!(
         wengert.output, baseline_output,

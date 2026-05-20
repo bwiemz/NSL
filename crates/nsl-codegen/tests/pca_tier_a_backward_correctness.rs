@@ -30,18 +30,18 @@ use std::ffi::CString;
 
 use nsl_codegen::flash_attention::{CshaExtras, FlashAttentionConfig, RopeStyle};
 use nsl_codegen::flash_attention_v2::{
-    flash_attention_kernel_name_v2, shared_mem_bytes_v2_backward, synthesize_backward,
+    flash_attention_kernel_name_v2, shared_mem_bytes_v2_backward,
     smem_layout::{self, Direction},
+    synthesize_backward,
 };
 
-use nsl_runtime::{
-    nsl_cuda_init, nsl_test_cuda_alloc, nsl_test_cuda_d2h,
-    nsl_test_cuda_free, nsl_test_cuda_h2d, nsl_test_cuda_jit_log,
-};
 use nsl_runtime::flash_attention::{
-    flash_attention_backward_cpu_gqa,
-    nsl_csha_alloc_backward_activations, nsl_csha_free_backward_activations,
-    nsl_flash_attention_csha_backward,
+    flash_attention_backward_cpu_gqa, nsl_csha_alloc_backward_activations,
+    nsl_csha_free_backward_activations, nsl_flash_attention_csha_backward,
+};
+use nsl_runtime::{
+    nsl_cuda_init, nsl_test_cuda_alloc, nsl_test_cuda_d2h, nsl_test_cuda_free, nsl_test_cuda_h2d,
+    nsl_test_cuda_jit_log,
 };
 
 // ---------------------------------------------------------------------------
@@ -50,13 +50,18 @@ use nsl_runtime::flash_attention::{
 
 fn f16_to_f32(bits: u16) -> f32 {
     let sign = (bits >> 15) as u32;
-    let exp  = ((bits >> 10) & 0x1f) as u32;
+    let exp = ((bits >> 10) & 0x1f) as u32;
     let mant = (bits & 0x3ff) as u32;
     let f32_bits = if exp == 0 {
-        if mant == 0 { sign << 31 } else {
+        if mant == 0 {
+            sign << 31
+        } else {
             let mut m = mant;
             let mut e: i32 = -1;
-            while m & 0x400 == 0 { m <<= 1; e -= 1; }
+            while m & 0x400 == 0 {
+                m <<= 1;
+                e -= 1;
+            }
             let e = (127 + e - 14) as u32;
             (sign << 31) | (e << 23) | ((m & 0x3ff) << 13)
         }
@@ -70,12 +75,16 @@ fn f16_to_f32(bits: u16) -> f32 {
 }
 
 fn f32_to_f16_bits(x: f32) -> u16 {
-    if x.is_nan() { return 0x7E00; }
+    if x.is_nan() {
+        return 0x7E00;
+    }
     let b = x.to_bits();
     let sign = (b >> 31) & 1;
-    let exp  = ((b >> 23) & 0xFF) as i32;
+    let exp = ((b >> 23) & 0xFF) as i32;
     let mant = b & 0x7FFFFF;
-    if exp == 255 { return ((sign << 15) | 0x7C00 | if mant != 0 { 0x200 } else { 0 }) as u16; }
+    if exp == 255 {
+        return ((sign << 15) | 0x7C00 | if mant != 0 { 0x200 } else { 0 }) as u16;
+    }
     let exp_f16 = exp - 127 + 15;
     if exp_f16 <= 0 {
         let shift = (1 - exp_f16).min(24) as u32;
@@ -83,7 +92,9 @@ fn f32_to_f16_bits(x: f32) -> u16 {
         let rounded = (shifted + 0x1000) >> 13;
         return ((sign << 15) | rounded) as u16;
     }
-    if exp_f16 >= 31 { return ((sign << 15) | 0x7C00) as u16; }
+    if exp_f16 >= 31 {
+        return ((sign << 15) | 0x7C00) as u16;
+    }
     let mant16 = (mant + 0x1000) >> 13;
     let overflow = (mant16 >> 10) & 1;
     let exp16 = (exp_f16 as u32 + overflow) & 0x1F;
@@ -96,14 +107,18 @@ fn f32_to_f16_bits(x: f32) -> u16 {
 
 fn fill_seeded(dst: &mut [f32], mut seed: u64) {
     for x in dst.iter_mut() {
-        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let u = (seed >> 33) as u32;
         *x = ((u as f32) / (u32::MAX as f32)) - 0.5;
     }
 }
 
 fn roundtrip_f16_vec(src: &[f32]) -> Vec<f32> {
-    src.iter().map(|&x| f16_to_f32(f32_to_f16_bits(x))).collect()
+    src.iter()
+        .map(|&x| f16_to_f32(f32_to_f16_bits(x)))
+        .collect()
 }
 
 fn rmsnorm_rows(x_host: &[f32], seq_len: usize, head_dim: usize, eps: f32) -> Vec<f32> {
@@ -114,7 +129,8 @@ fn rmsnorm_rows(x_host: &[f32], seq_len: usize, head_dim: usize, eps: f32) -> Ve
             .iter()
             .copied()
             .map(|v| v * v)
-            .sum::<f32>() / head_dim as f32;
+            .sum::<f32>()
+            / head_dim as f32;
         let inv_rms = 1.0f32 / (mean_sq + eps).sqrt();
         for d in 0..head_dim {
             x_norm[row_base + d] = x_host[row_base + d] * inv_rms;
@@ -253,8 +269,10 @@ fn flash_attention_forward_reference_with_stats(
 }
 
 fn assert_no_nan(name: &str, arr: &[f32], fixture: &str) {
-    assert!(arr.iter().all(|x| !x.is_nan()),
-        "{fixture}: {name} contains NaN values");
+    assert!(
+        arr.iter().all(|x| !x.is_nan()),
+        "{fixture}: {name} contains NaN values"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -280,7 +298,11 @@ fn cuda_available() -> bool {
 
 fn free_all(ptrs: &[i64]) {
     for &p in ptrs {
-        if p != 0 { unsafe { nsl_test_cuda_free(p); } }
+        if p != 0 {
+            unsafe {
+                nsl_test_cuda_free(p);
+            }
+        }
     }
 }
 
@@ -295,26 +317,26 @@ fn free_all(ptrs: &[i64]) {
 
 fn pca_backward_config(segment_masked: bool) -> FlashAttentionConfig {
     FlashAttentionConfig {
-        block_q:        32,
-        block_kv:       32,
-        head_dim:       32,
-        causal:         true,
-        paged:          false,
-        rope_q:         false,
-        rope_style:     RopeStyle::HalfSplit,
+        block_q: 32,
+        block_kv: 32,
+        head_dim: 32,
+        causal: true,
+        paged: false,
+        rope_q: false,
+        rope_style: RopeStyle::HalfSplit,
         gqa_group_size: 1,
-        tree_mask:      false,
-        gpu_sm:         75,
+        tree_mask: false,
+        gpu_sm: 75,
         segment_masked,
         csha: Some(CshaExtras {
-            level:                         2,
-            fused_rmsnorm:                 true,
-            fused_projections:             true,
-            fused_output_proj:             false,
+            level: 2,
+            fused_rmsnorm: true,
+            fused_projections: true,
+            fused_output_proj: false,
             save_activations_for_backward: true,
-            active_heads:                  1,
-            rmsnorm_eps:                   1e-5,
-            d_model:                       32,
+            active_heads: 1,
+            rmsnorm_eps: 1e-5,
+            d_model: 32,
         }),
     }
 }
@@ -327,7 +349,7 @@ fn backward_kernel_name(cfg: &FlashAttentionConfig) -> String {
     let fw = flash_attention_kernel_name_v2(cfg);
     match fw.strip_prefix("flash_attn_") {
         Some(rest) => format!("flash_attn_backward_{}", rest),
-        None       => format!("flash_attn_backward_{fw}"),
+        None => format!("flash_attn_backward_{fw}"),
     }
 }
 
@@ -345,21 +367,21 @@ fn backward_kernel_name(cfg: &FlashAttentionConfig) -> String {
 // ---------------------------------------------------------------------------
 
 fn launch_pca_backward(
-    x_host:       &[f32],   // [seq_len × head_dim], used as CSHA raw input
-    wq_f16:       &[u16],   // weight matrices [d_model × head_dim] f16
-    wk_f16:       &[u16],
-    wv_f16:       &[u16],
-    do_host_f16:  &[u16],   // upstream gradient [seq_len × head_dim] f16
-    seq_len:      usize,
-    head_dim:     usize,
-    seg_ids_host: &[u16],   // length seq_len; empty → unpacked
+    x_host: &[f32], // [seq_len × head_dim], used as CSHA raw input
+    wq_f16: &[u16], // weight matrices [d_model × head_dim] f16
+    wk_f16: &[u16],
+    wv_f16: &[u16],
+    do_host_f16: &[u16], // upstream gradient [seq_len × head_dim] f16
+    seq_len: usize,
+    head_dim: usize,
+    seg_ids_host: &[u16], // length seq_len; empty → unpacked
     segment_masked: bool,
 ) -> Option<(Vec<f32>, Vec<f32>, Vec<f32>)> {
     let batch = 1usize;
     let heads = 1usize;
-    let dm    = head_dim;   // d_model == head_dim for these fixtures
+    let dm = head_dim; // d_model == head_dim for these fixtures
     let norm_eps = 1e-5f32;
-    let scale    = 1.0f32 / (head_dim as f32).sqrt();
+    let scale = 1.0f32 / (head_dim as f32).sqrt();
 
     let config = pca_backward_config(segment_masked);
 
@@ -372,39 +394,38 @@ fn launch_pca_backward(
     // q/k/v/out_dev: f16 — CSHA kernel writes projected QKV as f16.
     // x_dev: f32 — raw input before RMSNorm + projection.
     let qkv_f16_bytes = (batch * heads * seq_len * head_dim * 2) as i64;
-    let lse_bytes     = (batch * heads * seq_len * 4) as i64;
-    let x_bytes       = (batch * heads * seq_len * head_dim * 4) as i64;  // f32
-    let w_bytes       = (dm * (heads * head_dim) * 2) as i64;             // f16
-    let nw_bytes      = (head_dim * 4) as i64;                             // f32 norm weight
-    let dw_bytes      = (dm * (heads * head_dim) * 2) as i64;
-    let dx_bytes      = (batch * heads * seq_len * head_dim * 4) as i64;
-    let dxn_bytes     = (batch * seq_len * dm * 4) as i64;
+    let lse_bytes = (batch * heads * seq_len * 4) as i64;
+    let x_bytes = (batch * heads * seq_len * head_dim * 4) as i64; // f32
+    let w_bytes = (dm * (heads * head_dim) * 2) as i64; // f16
+    let nw_bytes = (head_dim * 4) as i64; // f32 norm weight
+    let dw_bytes = (dm * (heads * head_dim) * 2) as i64;
+    let dx_bytes = (batch * heads * seq_len * head_dim * 4) as i64;
+    let dxn_bytes = (batch * seq_len * dm * 4) as i64;
 
     // ── Allocate device buffers ───────────────────────────────────────────────
-    let q_dev   = unsafe { nsl_test_cuda_alloc(qkv_f16_bytes) };
-    let k_dev   = unsafe { nsl_test_cuda_alloc(qkv_f16_bytes) };
-    let v_dev   = unsafe { nsl_test_cuda_alloc(qkv_f16_bytes) };
+    let q_dev = unsafe { nsl_test_cuda_alloc(qkv_f16_bytes) };
+    let k_dev = unsafe { nsl_test_cuda_alloc(qkv_f16_bytes) };
+    let v_dev = unsafe { nsl_test_cuda_alloc(qkv_f16_bytes) };
     let out_dev = unsafe { nsl_test_cuda_alloc(qkv_f16_bytes) };
     let lse_dev = unsafe { nsl_test_cuda_alloc(lse_bytes) };
-    let x_dev   = unsafe { nsl_test_cuda_alloc(x_bytes) };
-    let nw_dev  = unsafe { nsl_test_cuda_alloc(nw_bytes) };
-    let wq_dev  = unsafe { nsl_test_cuda_alloc(w_bytes) };
-    let wk_dev  = unsafe { nsl_test_cuda_alloc(w_bytes) };
-    let wv_dev  = unsafe { nsl_test_cuda_alloc(w_bytes) };
-    let do_dev  = unsafe { nsl_test_cuda_alloc(qkv_f16_bytes) };
-    let dq_dev  = unsafe { nsl_test_cuda_alloc(qkv_f16_bytes) };
-    let dk_dev  = unsafe { nsl_test_cuda_alloc(qkv_f16_bytes) };
-    let dv_dev  = unsafe { nsl_test_cuda_alloc(qkv_f16_bytes) };
+    let x_dev = unsafe { nsl_test_cuda_alloc(x_bytes) };
+    let nw_dev = unsafe { nsl_test_cuda_alloc(nw_bytes) };
+    let wq_dev = unsafe { nsl_test_cuda_alloc(w_bytes) };
+    let wk_dev = unsafe { nsl_test_cuda_alloc(w_bytes) };
+    let wv_dev = unsafe { nsl_test_cuda_alloc(w_bytes) };
+    let do_dev = unsafe { nsl_test_cuda_alloc(qkv_f16_bytes) };
+    let dq_dev = unsafe { nsl_test_cuda_alloc(qkv_f16_bytes) };
+    let dk_dev = unsafe { nsl_test_cuda_alloc(qkv_f16_bytes) };
+    let dv_dev = unsafe { nsl_test_cuda_alloc(qkv_f16_bytes) };
     let dwq_dev = unsafe { nsl_test_cuda_alloc(dw_bytes) };
     let dwk_dev = unsafe { nsl_test_cuda_alloc(dw_bytes) };
     let dwv_dev = unsafe { nsl_test_cuda_alloc(dw_bytes) };
-    let dx_dev  = unsafe { nsl_test_cuda_alloc(dx_bytes) };
+    let dx_dev = unsafe { nsl_test_cuda_alloc(dx_bytes) };
     let dxn_dev = unsafe { nsl_test_cuda_alloc(dxn_bytes) };
 
     let all_dev = [
-        q_dev, k_dev, v_dev, out_dev, lse_dev, x_dev, nw_dev,
-        wq_dev, wk_dev, wv_dev, do_dev, dq_dev, dk_dev, dv_dev,
-        dwq_dev, dwk_dev, dwv_dev, dx_dev, dxn_dev,
+        q_dev, k_dev, v_dev, out_dev, lse_dev, x_dev, nw_dev, wq_dev, wk_dev, wv_dev, do_dev,
+        dq_dev, dk_dev, dv_dev, dwq_dev, dwk_dev, dwv_dev, dx_dev, dxn_dev,
     ];
 
     // Verify all allocs succeeded.
@@ -418,7 +439,10 @@ fn launch_pca_backward(
 
     let saves = unsafe {
         nsl_csha_alloc_backward_activations(
-            batch as i64, heads as i64, seq_len as i64, head_dim as i64,
+            batch as i64,
+            heads as i64,
+            seq_len as i64,
+            head_dim as i64,
         )
     };
     let save_ptrs = [
@@ -431,7 +455,9 @@ fn launch_pca_backward(
     ];
     if save_ptrs.iter().any(|&ptr| ptr == 0) {
         eprintln!("[pca_bwd] CshaBackwardActivations alloc failed");
-        unsafe { nsl_csha_free_backward_activations(saves); }
+        unsafe {
+            nsl_csha_free_backward_activations(saves);
+        }
         free_all(&all_dev);
         return None;
     }
@@ -465,17 +491,17 @@ fn launch_pca_backward(
     // Norm weight = 1.0 (identity — keeps RMSNorm as a no-op when x is small).
     let nw_host = vec![1.0f32; head_dim];
     unsafe {
-        nsl_test_cuda_h2d(q_dev,   q_host_f16.as_ptr() as i64, qkv_f16_bytes);
-        nsl_test_cuda_h2d(k_dev,   k_host_f16.as_ptr() as i64, qkv_f16_bytes);
-        nsl_test_cuda_h2d(v_dev,   v_host_f16.as_ptr() as i64, qkv_f16_bytes);
+        nsl_test_cuda_h2d(q_dev, q_host_f16.as_ptr() as i64, qkv_f16_bytes);
+        nsl_test_cuda_h2d(k_dev, k_host_f16.as_ptr() as i64, qkv_f16_bytes);
+        nsl_test_cuda_h2d(v_dev, v_host_f16.as_ptr() as i64, qkv_f16_bytes);
         nsl_test_cuda_h2d(out_dev, out_host_f16.as_ptr() as i64, qkv_f16_bytes);
         nsl_test_cuda_h2d(lse_dev, lse_host.as_ptr() as i64, lse_bytes);
-        nsl_test_cuda_h2d(x_dev,   x_host.as_ptr()    as i64, x_bytes);
-        nsl_test_cuda_h2d(nw_dev,  nw_host.as_ptr()   as i64, nw_bytes);
-        nsl_test_cuda_h2d(wq_dev,  wq_f16.as_ptr()    as i64, w_bytes);
-        nsl_test_cuda_h2d(wk_dev,  wk_f16.as_ptr()    as i64, w_bytes);
-        nsl_test_cuda_h2d(wv_dev,  wv_f16.as_ptr()    as i64, w_bytes);
-        nsl_test_cuda_h2d(do_dev,  do_host_f16.as_ptr() as i64, qkv_f16_bytes);
+        nsl_test_cuda_h2d(x_dev, x_host.as_ptr() as i64, x_bytes);
+        nsl_test_cuda_h2d(nw_dev, nw_host.as_ptr() as i64, nw_bytes);
+        nsl_test_cuda_h2d(wq_dev, wq_f16.as_ptr() as i64, w_bytes);
+        nsl_test_cuda_h2d(wk_dev, wk_f16.as_ptr() as i64, w_bytes);
+        nsl_test_cuda_h2d(wv_dev, wv_f16.as_ptr() as i64, w_bytes);
+        nsl_test_cuda_h2d(do_dev, do_host_f16.as_ptr() as i64, qkv_f16_bytes);
         nsl_test_cuda_h2d(saves.q_proj, q_host_f16.as_ptr() as i64, qkv_f16_bytes);
         nsl_test_cuda_h2d(saves.k_proj, k_host_f16.as_ptr() as i64, qkv_f16_bytes);
         nsl_test_cuda_h2d(saves.v_proj, v_host_f16.as_ptr() as i64, qkv_f16_bytes);
@@ -490,11 +516,15 @@ fn launch_pca_backward(
         let ptr = unsafe { nsl_test_cuda_alloc(seg_bytes) };
         if ptr == 0 {
             eprintln!("[pca_bwd] segment_ids alloc failed");
-            unsafe { nsl_csha_free_backward_activations(saves); }
+            unsafe {
+                nsl_csha_free_backward_activations(saves);
+            }
             free_all(&all_dev);
             return None;
         }
-        unsafe { nsl_test_cuda_h2d(ptr, seg_ids_host.as_ptr() as i64, seg_bytes); }
+        unsafe {
+            nsl_test_cuda_h2d(ptr, seg_ids_host.as_ptr() as i64, seg_bytes);
+        }
         ptr
     } else {
         0i64
@@ -569,23 +599,32 @@ fn launch_pca_backward(
         Ok(s) => s,
         Err(e) => {
             eprintln!("[pca_bwd] synthesize_backward error: {e}");
-            unsafe { nsl_csha_free_backward_activations(saves); }
+            unsafe {
+                nsl_csha_free_backward_activations(saves);
+            }
             free_all(&all_dev);
-            if seg_dev != 0 { unsafe { nsl_test_cuda_free(seg_dev); } }
+            if seg_dev != 0 {
+                unsafe {
+                    nsl_test_cuda_free(seg_dev);
+                }
+            }
             return None;
         }
     };
-    if !bwd_ptx_str.ends_with('\0') { bwd_ptx_str.push('\0'); }
+    if !bwd_ptx_str.ends_with('\0') {
+        bwd_ptx_str.push('\0');
+    }
     // DEBUG: dump backward PTX.
     {
         let dump = std::env::temp_dir().join(format!(
             "pca_bwd_bwd_seg{}_sq{}.ptx",
-            if segment_masked { "masked" } else { "plain" }, seq_len,
+            if segment_masked { "masked" } else { "plain" },
+            seq_len,
         ));
         std::fs::write(&dump, bwd_ptx_str.as_bytes()).ok();
         eprintln!("[pca_bwd] bwd PTX dumped: {}", dump.display());
     }
-    let bwd_ptx  = bwd_ptx_str.into_bytes();
+    let bwd_ptx = bwd_ptx_str.into_bytes();
     let bwd_name = CString::new(backward_kernel_name(&config)).unwrap();
 
     // Dynamic SMEM size for the backward launch. Use the shared helper so
@@ -609,24 +648,53 @@ fn launch_pca_backward(
 
     let rc_bwd = unsafe {
         nsl_flash_attention_csha_backward(
-            q_dev, k_dev, v_dev, out_dev, lse_dev,
+            q_dev,
+            k_dev,
+            v_dev,
+            out_dev,
+            lse_dev,
             scale.to_bits() as i64,
-            batch as i64, heads as i64, seq_len as i64, head_dim as i64,
-            0, 0, 0, 0,             // paging
-            0, 0,                   // cos/sin
-            0, 0,                   // ragged
-            bwd_smem_dyn,           // dynamic SMEM bytes (0 if static is sufficient)
-            bwd_ptx.as_ptr() as i64, bwd_name.as_ptr() as i64,
-            config.block_q as i64, config.block_kv as i64,
+            batch as i64,
+            heads as i64,
+            seq_len as i64,
+            head_dim as i64,
+            0,
+            0,
+            0,
+            0, // paging
+            0,
+            0, // cos/sin
+            0,
+            0,            // ragged
+            bwd_smem_dyn, // dynamic SMEM bytes (0 if static is sufficient)
+            bwd_ptx.as_ptr() as i64,
+            bwd_name.as_ptr() as i64,
+            config.block_q as i64,
+            config.block_kv as i64,
             if config.causal { 1 } else { 0 },
-            x_dev, nw_dev, wq_dev, wk_dev, wv_dev,
-            0, norm_eps.to_bits() as i64,
-            heads as i64, dm as i64,
-            saves.q_proj, saves.k_proj, saves.v_proj,
-            saves.row_max, saves.row_sum,
+            x_dev,
+            nw_dev,
+            wq_dev,
+            wk_dev,
+            wv_dev,
+            0,
+            norm_eps.to_bits() as i64,
+            heads as i64,
+            dm as i64,
+            saves.q_proj,
+            saves.k_proj,
+            saves.v_proj,
+            saves.row_max,
+            saves.row_sum,
             saves.x_raw,
-            do_dev, dq_dev, dk_dev, dv_dev,
-            dwq_dev, dwk_dev, dwv_dev, dx_dev,
+            do_dev,
+            dq_dev,
+            dk_dev,
+            dv_dev,
+            dwq_dev,
+            dwk_dev,
+            dwv_dev,
+            dx_dev,
             dxn_dev,
             // PCA Task 4B: trailing segment_ids.
             seg_dev,
@@ -637,9 +705,15 @@ fn launch_pca_backward(
         let sync_rc = cudarc::driver::sys::cuCtxSynchronize();
         eprintln!("[pca_bwd] bwd rc={rc_bwd} sync_rc={sync_rc:?}");
         if !matches!(sync_rc, cudarc::driver::sys::CUresult::CUDA_SUCCESS) {
-            unsafe { nsl_csha_free_backward_activations(saves); }
+            unsafe {
+                nsl_csha_free_backward_activations(saves);
+            }
             free_all(&all_dev);
-            if seg_dev != 0 { unsafe { nsl_test_cuda_free(seg_dev); } }
+            if seg_dev != 0 {
+                unsafe {
+                    nsl_test_cuda_free(seg_dev);
+                }
+            }
             return None;
         }
     }
@@ -647,13 +721,23 @@ fn launch_pca_backward(
         let log = unsafe {
             let p = nsl_test_cuda_jit_log(bwd_ptx.as_ptr() as i64);
             if p != 0 {
-                std::ffi::CStr::from_ptr(p as *const i8).to_string_lossy().into_owned()
-            } else { "<no log>".into() }
+                std::ffi::CStr::from_ptr(p as *const i8)
+                    .to_string_lossy()
+                    .into_owned()
+            } else {
+                "<no log>".into()
+            }
         };
         eprintln!("[pca_bwd] backward rc={rc_bwd}\nJIT log:\n{log}");
-        unsafe { nsl_csha_free_backward_activations(saves); }
+        unsafe {
+            nsl_csha_free_backward_activations(saves);
+        }
         free_all(&all_dev);
-        if seg_dev != 0 { unsafe { nsl_test_cuda_free(seg_dev); } }
+        if seg_dev != 0 {
+            unsafe {
+                nsl_test_cuda_free(seg_dev);
+            }
+        }
         return None;
     }
 
@@ -671,18 +755,28 @@ fn launch_pca_backward(
     let dk: Vec<f32> = dk_raw.iter().map(|&b| f16_to_f32(b)).collect();
     let dv: Vec<f32> = dv_raw.iter().map(|&b| f16_to_f32(b)).collect();
 
-
     for (name, arr) in [("dq", &dq), ("dk", &dk), ("dv", &dv)] {
-        if let Some((idx, value)) = arr.iter().copied().enumerate().find(|(_, x)| !x.is_finite()) {
+        if let Some((idx, value)) = arr
+            .iter()
+            .copied()
+            .enumerate()
+            .find(|(_, x)| !x.is_finite())
+        {
             eprintln!(
                 "[pca_bwd] non-finite {} at idx={} value={:?} seq_len={} segment_masked={}",
                 name, idx, value, seq_len, segment_masked,
             );
         }
     }
-    unsafe { nsl_csha_free_backward_activations(saves); }
+    unsafe {
+        nsl_csha_free_backward_activations(saves);
+    }
     free_all(&all_dev);
-    if seg_dev != 0 { unsafe { nsl_test_cuda_free(seg_dev); } }
+    if seg_dev != 0 {
+        unsafe {
+            nsl_test_cuda_free(seg_dev);
+        }
+    }
 
     Some((dq, dk, dv))
 }
@@ -705,9 +799,7 @@ fn cpu_reference_from_forward_saves(
     let q = project_rows_f16_saved(&x_norm, wq_f16, seq_len, head_dim);
     let k = project_rows_f16_saved(&x_norm, wk_f16, seq_len, head_dim);
     let v = project_rows_f16_saved(&x_norm, wv_f16, seq_len, head_dim);
-    let (out, lse) = flash_attention_forward_reference(
-        &q, &k, &v, seq_len, head_dim, scale, true,
-    );
+    let (out, lse) = flash_attention_forward_reference(&q, &k, &v, seq_len, head_dim, scale, true);
     let dout: Vec<f32> = do_host_f16.iter().map(|&bits| f16_to_f32(bits)).collect();
 
     let qkv_elems = batch * heads * seq_len * head_dim;
@@ -715,11 +807,8 @@ fn cpu_reference_from_forward_saves(
     let mut dk = vec![0f32; qkv_elems];
     let mut dv = vec![0f32; qkv_elems];
     flash_attention_backward_cpu_gqa(
-        &q, &k, &v,
-        &out, &lse, &dout,
-        &mut dq, &mut dk, &mut dv,
-        batch, heads, heads, seq_len, head_dim,
-        scale, true, 1,
+        &q, &k, &v, &out, &lse, &dout, &mut dq, &mut dk, &mut dv, batch, heads, heads, seq_len,
+        head_dim, scale, true, 1,
     );
 
     Some((
@@ -762,8 +851,15 @@ fn padded_unpacked_gpu_reference(
     }
 
     let (dq, dk, dv) = launch_pca_backward(
-        &x_padded, &wq_f16, &wk_f16, &wv_f16, &do_padded,
-        padded_seq_len, head_dim, &[], false,
+        &x_padded,
+        &wq_f16,
+        &wk_f16,
+        &wv_f16,
+        &do_padded,
+        padded_seq_len,
+        head_dim,
+        &[],
+        false,
     )?;
     Some((
         dq[..used_elems].to_vec(),
@@ -788,7 +884,10 @@ fn max_abs_diff(a: &[f32], b: &[f32]) -> (f32, usize) {
         } else {
             (ai - bi).abs()
         };
-        if d > max_abs { max_abs = d; max_idx = i; }
+        if d > max_abs {
+            max_abs = d;
+            max_idx = i;
+        }
     }
     (max_abs, max_idx)
 }
@@ -799,8 +898,10 @@ fn max_abs_diff(a: &[f32], b: &[f32]) -> (f32, usize) {
 
 fn extract_segment_rows(
     src: &[f32],
-    seq_len: usize, head_dim: usize,
-    seg_ids: &[u16], target_id: u16,
+    seq_len: usize,
+    head_dim: usize,
+    seg_ids: &[u16],
+    target_id: u16,
 ) -> Vec<f32> {
     let positions: Vec<usize> = (0..seq_len).filter(|&i| seg_ids[i] == target_id).collect();
     let mut out = vec![0f32; positions.len() * head_dim];
@@ -815,8 +916,10 @@ fn extract_segment_rows(
 // Same but for f16 slices (dO upload buffers).
 fn extract_segment_rows_u16(
     src: &[u16],
-    seq_len: usize, head_dim: usize,
-    seg_ids: &[u16], target_id: u16,
+    seq_len: usize,
+    head_dim: usize,
+    seg_ids: &[u16],
+    target_id: u16,
 ) -> Vec<u16> {
     let positions: Vec<usize> = (0..seq_len).filter(|&i| seg_ids[i] == target_id).collect();
     let mut out = vec![0u16; positions.len() * head_dim];
@@ -835,15 +938,18 @@ fn extract_segment_rows_u16(
 fn scatter_segment_grads(
     dst: &mut [f32],
     seg_grads: &[f32],
-    seq_len: usize, head_dim: usize,
-    seg_ids: &[u16], target_id: u16,
+    seq_len: usize,
+    head_dim: usize,
+    seg_ids: &[u16],
+    target_id: u16,
 ) {
     let positions: Vec<usize> = (0..seq_len).filter(|&i| seg_ids[i] == target_id).collect();
     assert_eq!(seg_grads.len(), positions.len() * head_dim);
     for (dst_si, &src_si) in positions.iter().enumerate() {
         let src_base = dst_si * head_dim;
         let dst_base = src_si * head_dim;
-        dst[dst_base..dst_base + head_dim].copy_from_slice(&seg_grads[src_base..src_base + head_dim]);
+        dst[dst_base..dst_base + head_dim]
+            .copy_from_slice(&seg_grads[src_base..src_base + head_dim]);
     }
 }
 
@@ -857,19 +963,21 @@ fn scatter_segment_grads(
 #[test]
 #[ignore = "requires CUDA GPU"]
 fn tier_a_backward_single_segment_matches_unmasked_baseline() {
-    if !cuda_available() { return; }
+    if !cuda_available() {
+        return;
+    }
 
-    let seq_len  = 128usize;
+    let seq_len = 128usize;
     let head_dim = 32usize;
-    let total    = seq_len * head_dim;
+    let total = seq_len * head_dim;
 
-    let mut x    = vec![0f32; total];
+    let mut x = vec![0f32; total];
     let mut do_f32 = vec![0f32; total];
-    fill_seeded(&mut x,     0xA1B2_C3D4);
+    fill_seeded(&mut x, 0xA1B2_C3D4);
     fill_seeded(&mut do_f32, 0xFEED_FACE);
 
     // Shared weight matrices (same for both runs).
-    let n_weights = head_dim * head_dim;  // d_model=head_dim=32
+    let n_weights = head_dim * head_dim; // d_model=head_dim=32
     let mut wq_f32 = vec![0f32; n_weights];
     let mut wk_f32 = vec![0f32; n_weights];
     let mut wv_f32 = vec![0f32; n_weights];
@@ -885,14 +993,20 @@ fn tier_a_backward_single_segment_matches_unmasked_baseline() {
 
     eprintln!("Fixture 1 — baseline backward (segment_masked=false)");
     let baseline = launch_pca_backward(
-        &x, &wq_f16, &wk_f16, &wv_f16, &do_f16,
-        seq_len, head_dim, &[], false,
+        &x,
+        &wq_f16,
+        &wk_f16,
+        &wv_f16,
+        &do_f16,
+        seq_len,
+        head_dim,
+        &[],
+        false,
     );
 
     eprintln!("Fixture 1 — PCA backward (segment_masked=true, all-zero seg_ids)");
     let pca = launch_pca_backward(
-        &x, &wq_f16, &wk_f16, &wv_f16, &do_f16,
-        seq_len, head_dim, &seg_ids, true,
+        &x, &wq_f16, &wk_f16, &wv_f16, &do_f16, seq_len, head_dim, &seg_ids, true,
     );
 
     let ((dq_base, dk_base, dv_base), (dq_pca, dk_pca, dv_pca)) = match (baseline, pca) {
@@ -904,8 +1018,12 @@ fn tier_a_backward_single_segment_matches_unmasked_baseline() {
     };
 
     for (name, arr) in [
-        ("dq_base", &dq_base), ("dk_base", &dk_base), ("dv_base", &dv_base),
-        ("dq_pca",  &dq_pca),  ("dk_pca",  &dk_pca),  ("dv_pca",  &dv_pca),
+        ("dq_base", &dq_base),
+        ("dk_base", &dk_base),
+        ("dv_base", &dv_base),
+        ("dq_pca", &dq_pca),
+        ("dk_pca", &dk_pca),
+        ("dv_pca", &dv_pca),
     ] {
         assert_no_nan(name, arr, "Fixture 1");
     }
@@ -922,10 +1040,28 @@ fn tier_a_backward_single_segment_matches_unmasked_baseline() {
     eprintln!("  first 4 dq_base: {:?}", &dq_base[..4.min(dq_base.len())]);
 
     let tol = 5e-3f32;
-    assert!(dq_diff <= tol, "Fixture 1 FAILED: dq={:.3e} > {:.0e}", dq_diff, tol);
-    assert!(dk_diff <= tol, "Fixture 1 FAILED: dk={:.3e} > {:.0e}", dk_diff, tol);
-    assert!(dv_diff <= tol, "Fixture 1 FAILED: dv={:.3e} > {:.0e}", dv_diff, tol);
-    eprintln!("Fixture 1 PASSED: dq={:.3e} dk={:.3e} dv={:.3e} <= {:.0e}", dq_diff, dk_diff, dv_diff, tol);
+    assert!(
+        dq_diff <= tol,
+        "Fixture 1 FAILED: dq={:.3e} > {:.0e}",
+        dq_diff,
+        tol
+    );
+    assert!(
+        dk_diff <= tol,
+        "Fixture 1 FAILED: dk={:.3e} > {:.0e}",
+        dk_diff,
+        tol
+    );
+    assert!(
+        dv_diff <= tol,
+        "Fixture 1 FAILED: dv={:.3e} > {:.0e}",
+        dv_diff,
+        tol
+    );
+    eprintln!(
+        "Fixture 1 PASSED: dq={:.3e} dk={:.3e} dv={:.3e} <= {:.0e}",
+        dq_diff, dk_diff, dv_diff, tol
+    );
 }
 
 // ===========================================================================
@@ -939,18 +1075,20 @@ fn tier_a_backward_single_segment_matches_unmasked_baseline() {
 #[test]
 #[ignore = "requires CUDA GPU"]
 fn tier_a_backward_two_equal_segments_matches_unpacked_reference() {
-    if !cuda_available() { return; }
+    if !cuda_available() {
+        return;
+    }
 
-    let seq_len  = 128usize;
+    let seq_len = 128usize;
     let head_dim = 32usize;
-    let seg_a    = 64usize;
-    let seg_b    = 64usize;
+    let seg_a = 64usize;
+    let seg_b = 64usize;
     assert_eq!(seg_a + seg_b, seq_len);
     let total = seq_len * head_dim;
 
-    let mut x    = vec![0f32; total];
+    let mut x = vec![0f32; total];
     let mut do_f32 = vec![0f32; total];
-    fill_seeded(&mut x,     0xCAFE_BABE);
+    fill_seeded(&mut x, 0xCAFE_BABE);
     fill_seeded(&mut do_f32, 0x1234_ABCD);
 
     let n_weights = head_dim * head_dim;
@@ -966,44 +1104,50 @@ fn tier_a_backward_two_equal_segments_matches_unpacked_reference() {
     let do_f16: Vec<u16> = do_f32.iter().map(|&v| f32_to_f16_bits(v)).collect();
 
     let mut seg_ids = vec![0u16; seq_len];
-    for x in seg_ids[seg_a..].iter_mut() { *x = 1; }
+    for x in seg_ids[seg_a..].iter_mut() {
+        *x = 1;
+    }
 
     // ── Packed PCA run ───────────────────────────────────────────────────────
     eprintln!("Fixture 2 — PCA backward (seq=128, two segments of 64)");
     let pca = launch_pca_backward(
-        &x, &wq_f16, &wk_f16, &wv_f16, &do_f16,
-        seq_len, head_dim, &seg_ids, true,
+        &x, &wq_f16, &wk_f16, &wv_f16, &do_f16, seq_len, head_dim, &seg_ids, true,
     );
 
     // ── Unpacked reference runs ───────────────────────────────────────────────
     // Each segment uses its own slice of x and dO (extracted by position).
-    let x_a    = extract_segment_rows(&x,    seq_len, head_dim, &seg_ids, 0);
-    let do_a   = extract_segment_rows_u16(&do_f16, seq_len, head_dim, &seg_ids, 0);
-    let x_b    = extract_segment_rows(&x,    seq_len, head_dim, &seg_ids, 1);
-    let do_b   = extract_segment_rows_u16(&do_f16, seq_len, head_dim, &seg_ids, 1);
+    let x_a = extract_segment_rows(&x, seq_len, head_dim, &seg_ids, 0);
+    let do_a = extract_segment_rows_u16(&do_f16, seq_len, head_dim, &seg_ids, 0);
+    let x_b = extract_segment_rows(&x, seq_len, head_dim, &seg_ids, 1);
+    let do_b = extract_segment_rows_u16(&do_f16, seq_len, head_dim, &seg_ids, 1);
 
     eprintln!("Fixture 2 — reference backward seg A (seq=64, segment_masked=false)");
-    let ref_a = padded_unpacked_gpu_reference(
-        &x_a, &wq_f16, &wk_f16, &wv_f16, &do_a,
-        seg_a, head_dim,
-    );
+    let ref_a =
+        padded_unpacked_gpu_reference(&x_a, &wq_f16, &wk_f16, &wv_f16, &do_a, seg_a, head_dim);
     eprintln!("Fixture 2 — reference backward seg B (seq=64, segment_masked=false)");
-    let ref_b = padded_unpacked_gpu_reference(
-        &x_b, &wq_f16, &wk_f16, &wv_f16, &do_b,
-        seg_b, head_dim,
-    );
+    let ref_b =
+        padded_unpacked_gpu_reference(&x_b, &wq_f16, &wk_f16, &wv_f16, &do_b, seg_b, head_dim);
 
     let (dq_pca, dk_pca, dv_pca) = match pca {
         Some(r) => r,
-        None => { eprintln!("Fixture 2 SKIPPED: packed launch failed"); return; }
+        None => {
+            eprintln!("Fixture 2 SKIPPED: packed launch failed");
+            return;
+        }
     };
     let (dq_a, dk_a, dv_a) = match ref_a {
         Some(r) => r,
-        None => { eprintln!("Fixture 2 SKIPPED: ref-A launch failed"); return; }
+        None => {
+            eprintln!("Fixture 2 SKIPPED: ref-A launch failed");
+            return;
+        }
     };
     let (dq_b, dk_b, dv_b) = match ref_b {
         Some(r) => r,
-        None => { eprintln!("Fixture 2 SKIPPED: ref-B launch failed"); return; }
+        None => {
+            eprintln!("Fixture 2 SKIPPED: ref-B launch failed");
+            return;
+        }
     };
 
     // Scatter per-segment gradients into packed [seq_len × head_dim] layout.
@@ -1018,8 +1162,12 @@ fn tier_a_backward_two_equal_segments_matches_unpacked_reference() {
     scatter_segment_grads(&mut ref_dv, &dv_b, seq_len, head_dim, &seg_ids, 1);
 
     for (name, arr) in [
-        ("dq_pca", &dq_pca), ("dk_pca", &dk_pca), ("dv_pca", &dv_pca),
-        ("ref_dq", &ref_dq), ("ref_dk", &ref_dk), ("ref_dv", &ref_dv),
+        ("dq_pca", &dq_pca),
+        ("dk_pca", &dk_pca),
+        ("dv_pca", &dv_pca),
+        ("ref_dq", &ref_dq),
+        ("ref_dk", &ref_dk),
+        ("ref_dv", &ref_dv),
     ] {
         assert_no_nan(name, arr, "Fixture 2");
     }
@@ -1036,10 +1184,28 @@ fn tier_a_backward_two_equal_segments_matches_unpacked_reference() {
     eprintln!("  first 4 ref_dq: {:?}", &ref_dq[..4.min(ref_dq.len())]);
 
     let tol = 5e-3f32;
-    assert!(dq_diff <= tol, "Fixture 2 FAILED: dq={:.3e} > {:.0e}", dq_diff, tol);
-    assert!(dk_diff <= tol, "Fixture 2 FAILED: dk={:.3e} > {:.0e}", dk_diff, tol);
-    assert!(dv_diff <= tol, "Fixture 2 FAILED: dv={:.3e} > {:.0e}", dv_diff, tol);
-    eprintln!("Fixture 2 PASSED: dq={:.3e} dk={:.3e} dv={:.3e} <= {:.0e}", dq_diff, dk_diff, dv_diff, tol);
+    assert!(
+        dq_diff <= tol,
+        "Fixture 2 FAILED: dq={:.3e} > {:.0e}",
+        dq_diff,
+        tol
+    );
+    assert!(
+        dk_diff <= tol,
+        "Fixture 2 FAILED: dk={:.3e} > {:.0e}",
+        dk_diff,
+        tol
+    );
+    assert!(
+        dv_diff <= tol,
+        "Fixture 2 FAILED: dv={:.3e} > {:.0e}",
+        dv_diff,
+        tol
+    );
+    eprintln!(
+        "Fixture 2 PASSED: dq={:.3e} dk={:.3e} dv={:.3e} <= {:.0e}",
+        dq_diff, dk_diff, dv_diff, tol
+    );
 }
 
 // ===========================================================================
@@ -1052,17 +1218,19 @@ fn tier_a_backward_two_equal_segments_matches_unpacked_reference() {
 #[test]
 #[ignore = "requires CUDA GPU"]
 fn tier_a_backward_unequal_segments_matches_unpacked_reference() {
-    if !cuda_available() { return; }
+    if !cuda_available() {
+        return;
+    }
 
     let head_dim = 32usize;
-    let lens     = [38usize, 64usize, 26usize];
+    let lens = [38usize, 64usize, 26usize];
     let seq_len: usize = lens.iter().sum();
     assert_eq!(seq_len, 128);
     let total = seq_len * head_dim;
 
-    let mut x    = vec![0f32; total];
+    let mut x = vec![0f32; total];
     let mut do_f32 = vec![0f32; total];
-    fill_seeded(&mut x,     0xABCD_EF01);
+    fill_seeded(&mut x, 0xABCD_EF01);
     fill_seeded(&mut do_f32, 0x9876_5432);
 
     let n_weights = head_dim * head_dim;
@@ -1081,7 +1249,9 @@ fn tier_a_backward_unequal_segments_matches_unpacked_reference() {
     let mut seg_ids = vec![0u16; seq_len];
     let mut off = 0usize;
     for (sid, &slen) in lens.iter().enumerate() {
-        for x in seg_ids[off..off + slen].iter_mut() { *x = sid as u16; }
+        for x in seg_ids[off..off + slen].iter_mut() {
+            *x = sid as u16;
+        }
         off += slen;
     }
 
@@ -1097,18 +1267,31 @@ fn tier_a_backward_unequal_segments_matches_unpacked_reference() {
     // ── Packed PCA run ───────────────────────────────────────────────────────
     eprintln!("Fixture 3 — PCA backward (seq=128, segments 38+64+26)");
     let pca = launch_pca_backward(
-        &x, &wq_f16, &wk_f16, &wv_f16, &do_f16,
-        seq_len, head_dim, &seg_ids, true,
+        &x, &wq_f16, &wk_f16, &wv_f16, &do_f16, seq_len, head_dim, &seg_ids, true,
     );
     eprintln!("Fixture 3 — full unmasked baseline (for segment 0 prefix reference)");
     let baseline_full = launch_pca_backward(
-        &x, &wq_f16, &wk_f16, &wv_f16, &do_f16,
-        seq_len, head_dim, &[], false,
+        &x,
+        &wq_f16,
+        &wk_f16,
+        &wv_f16,
+        &do_f16,
+        seq_len,
+        head_dim,
+        &[],
+        false,
     );
     eprintln!("Fixture 3 — segment 0 upstream-only baseline (full seq=128, unmasked)");
     let baseline_seg0 = launch_pca_backward(
-        &x, &wq_f16, &wk_f16, &wv_f16, &do_seg0,
-        seq_len, head_dim, &[], false,
+        &x,
+        &wq_f16,
+        &wk_f16,
+        &wv_f16,
+        &do_seg0,
+        seq_len,
+        head_dim,
+        &[],
+        false,
     );
 
     // ── Per-segment reference runs ────────────────────────────────────────────
@@ -1122,15 +1305,13 @@ fn tier_a_backward_unequal_segments_matches_unpacked_reference() {
         if sid == 0 {
             continue;
         }
-        let x_s    = extract_segment_rows(&x,     seq_len, head_dim, &seg_ids, target);
-        let do_s   = extract_segment_rows_u16(&do_f16, seq_len, head_dim, &seg_ids, target);
+        let x_s = extract_segment_rows(&x, seq_len, head_dim, &seg_ids, target);
+        let do_s = extract_segment_rows_u16(&do_f16, seq_len, head_dim, &seg_ids, target);
         assert_eq!(x_s.len(), slen * head_dim);
 
         eprintln!("Fixture 3 — reference backward seg {sid} (seq={slen}, segment_masked=false)");
-        match padded_unpacked_gpu_reference(
-            &x_s, &wq_f16, &wk_f16, &wv_f16, &do_s,
-            slen, head_dim,
-        ) {
+        match padded_unpacked_gpu_reference(&x_s, &wq_f16, &wk_f16, &wv_f16, &do_s, slen, head_dim)
+        {
             Some((dq_s, dk_s, dv_s)) => {
                 scatter_segment_grads(&mut ref_dq, &dq_s, seq_len, head_dim, &seg_ids, target);
                 scatter_segment_grads(&mut ref_dk, &dk_s, seq_len, head_dim, &seg_ids, target);
@@ -1145,15 +1326,24 @@ fn tier_a_backward_unequal_segments_matches_unpacked_reference() {
 
     let (dq_pca, dk_pca, dv_pca) = match pca {
         Some(r) => r,
-        None => { eprintln!("Fixture 3 SKIPPED: packed launch failed"); return; }
+        None => {
+            eprintln!("Fixture 3 SKIPPED: packed launch failed");
+            return;
+        }
     };
     let baseline_full = match baseline_full {
         Some(r) => r,
-        None => { eprintln!("Fixture 3 SKIPPED: full unmasked baseline launch failed"); return; }
+        None => {
+            eprintln!("Fixture 3 SKIPPED: full unmasked baseline launch failed");
+            return;
+        }
     };
     let baseline_seg0 = match baseline_seg0 {
         Some(r) => r,
-        None => { eprintln!("Fixture 3 SKIPPED: segment 0 baseline launch failed"); return; }
+        None => {
+            eprintln!("Fixture 3 SKIPPED: segment 0 baseline launch failed");
+            return;
+        }
     };
     if !all_refs_ok {
         eprintln!("Fixture 3 SKIPPED: one or more reference launches failed");
@@ -1171,8 +1361,12 @@ fn tier_a_backward_unequal_segments_matches_unpacked_reference() {
     scatter_segment_grads(&mut ref_dv, &ref0_dv, seq_len, head_dim, &seg_ids, 0);
 
     for (name, arr) in [
-        ("dq_pca", &dq_pca), ("dk_pca", &dk_pca), ("dv_pca", &dv_pca),
-        ("ref_dq", &ref_dq), ("ref_dk", &ref_dk), ("ref_dv", &ref_dv),
+        ("dq_pca", &dq_pca),
+        ("dk_pca", &dk_pca),
+        ("dv_pca", &dv_pca),
+        ("ref_dq", &ref_dq),
+        ("ref_dk", &ref_dk),
+        ("ref_dv", &ref_dv),
     ] {
         assert_no_nan(name, arr, "Fixture 3");
     }
@@ -1201,16 +1395,36 @@ fn tier_a_backward_unequal_segments_matches_unpacked_reference() {
     );
 
     let tol = 5e-3f32;
-    assert!(dq_diff <= tol, "Fixture 3 FAILED: dq={:.3e} > {:.0e}", dq_diff, tol);
-    assert!(dk_diff <= tol, "Fixture 3 FAILED: dk={:.3e} > {:.0e}", dk_diff, tol);
-    assert!(dv_diff <= tol, "Fixture 3 FAILED: dv={:.3e} > {:.0e}", dv_diff, tol);
-    eprintln!("Fixture 3 PASSED: dq={:.3e} dk={:.3e} dv={:.3e} <= {:.0e}", dq_diff, dk_diff, dv_diff, tol);
+    assert!(
+        dq_diff <= tol,
+        "Fixture 3 FAILED: dq={:.3e} > {:.0e}",
+        dq_diff,
+        tol
+    );
+    assert!(
+        dk_diff <= tol,
+        "Fixture 3 FAILED: dk={:.3e} > {:.0e}",
+        dk_diff,
+        tol
+    );
+    assert!(
+        dv_diff <= tol,
+        "Fixture 3 FAILED: dv={:.3e} > {:.0e}",
+        dv_diff,
+        tol
+    );
+    eprintln!(
+        "Fixture 3 PASSED: dq={:.3e} dk={:.3e} dv={:.3e} <= {:.0e}",
+        dq_diff, dk_diff, dv_diff, tol
+    );
 }
 
 #[test]
 #[ignore = "debug helper vs full unmasked baseline"]
 fn debug_cpu_reference_matches_full_unmasked_baseline() {
-    if !cuda_available() { return; }
+    if !cuda_available() {
+        return;
+    }
 
     let seq_len = 128usize;
     let head_dim = 32usize;
@@ -1234,27 +1448,50 @@ fn debug_cpu_reference_matches_full_unmasked_baseline() {
     let do_f16: Vec<u16> = do_f32.iter().map(|&v| f32_to_f16_bits(v)).collect();
 
     let gpu = launch_pca_backward(
-        &x, &wq_f16, &wk_f16, &wv_f16, &do_f16,
-        seq_len, head_dim, &[], false,
-    ).expect("gpu baseline failed");
-    let cpu = cpu_reference_from_forward_saves(
-        &x, &wq_f16, &wk_f16, &wv_f16, &do_f16,
-        seq_len, head_dim,
-    ).expect("cpu helper failed");
+        &x,
+        &wq_f16,
+        &wk_f16,
+        &wv_f16,
+        &do_f16,
+        seq_len,
+        head_dim,
+        &[],
+        false,
+    )
+    .expect("gpu baseline failed");
+    let cpu =
+        cpu_reference_from_forward_saves(&x, &wq_f16, &wk_f16, &wv_f16, &do_f16, seq_len, head_dim)
+            .expect("cpu helper failed");
 
     let (dq_diff, dq_idx) = max_abs_diff(&gpu.0, &cpu.0);
     let (dk_diff, dk_idx) = max_abs_diff(&gpu.1, &cpu.1);
     let (dv_diff, dv_idx) = max_abs_diff(&gpu.2, &cpu.2);
-    let (gpu_dk_max, gpu_dk_max_idx) = gpu.1.iter().copied().enumerate()
-        .fold((0.0f32, 0usize), |acc, (idx, v)| {
-            let mag = v.abs();
-            if mag > acc.0 { (mag, idx) } else { acc }
-        });
-    let (cpu_dk_max, cpu_dk_max_idx) = cpu.1.iter().copied().enumerate()
-        .fold((0.0f32, 0usize), |acc, (idx, v)| {
-            let mag = v.abs();
-            if mag > acc.0 { (mag, idx) } else { acc }
-        });
+    let (gpu_dk_max, gpu_dk_max_idx) =
+        gpu.1
+            .iter()
+            .copied()
+            .enumerate()
+            .fold((0.0f32, 0usize), |acc, (idx, v)| {
+                let mag = v.abs();
+                if mag > acc.0 {
+                    (mag, idx)
+                } else {
+                    acc
+                }
+            });
+    let (cpu_dk_max, cpu_dk_max_idx) =
+        cpu.1
+            .iter()
+            .copied()
+            .enumerate()
+            .fold((0.0f32, 0usize), |acc, (idx, v)| {
+                let mag = v.abs();
+                if mag > acc.0 {
+                    (mag, idx)
+                } else {
+                    acc
+                }
+            });
     eprintln!(
         "Debug helper vs full baseline: dq={:.3e}@[{dq_idx}] dk={:.3e}@[{dk_idx}] dv={:.3e}@[{dv_idx}]",
         dq_diff, dk_diff, dv_diff,
@@ -1262,10 +1499,7 @@ fn debug_cpu_reference_matches_full_unmasked_baseline() {
     eprintln!("  first 4 gpu dq: {:?}", &gpu.0[..4.min(gpu.0.len())]);
     eprintln!("  first 4 cpu dq: {:?}", &cpu.0[..4.min(cpu.0.len())]);
     if gpu.1.len() > 1024 && cpu.1.len() > 1024 {
-        eprintln!(
-            "  dk[1024]: gpu={:?} cpu={:?}",
-            gpu.1[1024], cpu.1[1024]
-        );
+        eprintln!("  dk[1024]: gpu={:?} cpu={:?}", gpu.1[1024], cpu.1[1024]);
     }
     eprintln!(
         "  dk maxabs: gpu={:?}@[{gpu_dk_max_idx}] cpu={:?}@[{cpu_dk_max_idx}]",

@@ -93,20 +93,19 @@ impl Compiler<'_> {
         // AST rewrite pass have no type-map entry (fresh NodeId). Fall
         // back to the current model context so the Type::Model branch
         // below fires and the side-table route-through happens.
-        if matches!(obj_type, Type::Unknown)
-            && matches!(object.kind, ExprKind::SelfRef) {
-                if let Some(ref model_name) = self.current_method_model_name {
-                    if let Some(sym) = self.interner.get(model_name) {
-                        obj_type = Type::Model {
-                            name: nsl_ast::Symbol(sym),
-                            type_params: Vec::new(),
-                            type_args: Vec::new(),
-                            fields: Vec::new(),
-                            methods: Vec::new(),
-                        };
-                    }
+        if matches!(obj_type, Type::Unknown) && matches!(object.kind, ExprKind::SelfRef) {
+            if let Some(ref model_name) = self.current_method_model_name {
+                if let Some(sym) = self.interner.get(model_name) {
+                    obj_type = Type::Model {
+                        name: nsl_ast::Symbol(sym),
+                        type_params: Vec::new(),
+                        type_args: Vec::new(),
+                        fields: Vec::new(),
+                        methods: Vec::new(),
+                    };
                 }
             }
+        }
 
         if let Type::Struct { name, .. } = &obj_type {
             let struct_name = self.resolve_sym(*name).to_string();
@@ -215,12 +214,7 @@ impl Compiler<'_> {
                         // just above when the loaded field matches a known
                         // model weight.
                         if state.weight_values.contains_key(&val) {
-                            self.set_ownership(
-                                builder,
-                                state,
-                                val,
-                                Ownership::BorrowedWeight,
-                            );
+                            self.set_ownership(builder, state, val, Ownership::BorrowedWeight);
                         }
                         return Ok(val);
                     }
@@ -483,11 +477,7 @@ impl Compiler<'_> {
     /// declared on `model_name` participate. Sites whose dims failed to
     /// resolve (input_dim == 0 || output_dim == 0) are EXCLUDED from both
     /// the init pass and this index computation to keep them in sync.
-    pub(crate) fn adapter_field_index(
-        &self,
-        model_name: &str,
-        field_name: &str,
-    ) -> Option<usize> {
+    pub(crate) fn adapter_field_index(&self, model_name: &str, field_name: &str) -> Option<usize> {
         // B.2.1 Task 5.5: read directly from `adapter_sites` (set by the
         // pre-scan pass) rather than `last_wrga_plan` — the latter is
         // overwritten inside @train-block lowering with a real Wengert plan

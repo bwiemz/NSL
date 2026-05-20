@@ -48,7 +48,9 @@ pub fn absmax_scale_row(row: &[f32]) -> f32 {
         row.iter().all(|x| x.is_finite()),
         "absmax_scale_row: row contains NaN/Inf"
     );
-    row.iter().map(|x| x.abs()).fold(0.0_f32, |acc, v| acc.max(v))
+    row.iter()
+        .map(|x| x.abs())
+        .fold(0.0_f32, |acc, v| acc.max(v))
 }
 
 /// Quantize one row to int8 using its absmax scale.
@@ -74,11 +76,7 @@ pub fn quantize_row_int8(row: &[f32], scale: f32) -> Vec<i8> {
 /// `Y[r, c] = (scale[r] / 127.0) * Σ_k (X_q[r, k] * W_ternary[k, c])`
 ///
 /// The `/127.0` dequantizes from the int8 range back to FP32 magnitude.
-pub fn ternary_gemm_element(
-    quantized_acts_row: &[i8],
-    weights_col: &[i8],
-    scale: f32,
-) -> f32 {
+pub fn ternary_gemm_element(quantized_acts_row: &[i8], weights_col: &[i8], scale: f32) -> f32 {
     assert_eq!(
         quantized_acts_row.len(),
         weights_col.len(),
@@ -102,7 +100,10 @@ pub fn forward_reference(
     activations: &[Vec<f32>],
     weights: &[Vec<i8>],
 ) -> (Vec<f32>, Vec<Vec<i8>>, Vec<Vec<f32>>) {
-    assert!(!activations.is_empty(), "activations must have at least one row");
+    assert!(
+        !activations.is_empty(),
+        "activations must have at least one row"
+    );
     assert!(!weights.is_empty(), "weights must be non-empty");
     let hidden_dim = activations[0].len();
     let out_dim = weights[0].len();

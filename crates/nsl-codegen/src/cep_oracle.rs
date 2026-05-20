@@ -266,7 +266,12 @@ fn layer_profile(spec: &ModelSpec, gpu: &GpuSpec, layer: usize) -> LayerProfile 
     let ffn_w = (ffn_matmuls - 1) as u64 * g_w + down_w;
 
     // Norms × 2 + softmax.
-    let (n_f, n_r, n_w) = rmsnorm_cost(spec.batch as u64, spec.max_seq as u64, d, spec.dtype_bytes as u64);
+    let (n_f, n_r, n_w) = rmsnorm_cost(
+        spec.batch as u64,
+        spec.max_seq as u64,
+        d,
+        spec.dtype_bytes as u64,
+    );
     let (s_f, s_r, s_w) = softmax_cost(
         spec.batch as u64 * nh,
         spec.max_seq as u64 * spec.max_seq as u64,
@@ -274,7 +279,8 @@ fn layer_profile(spec: &ModelSpec, gpu: &GpuSpec, layer: usize) -> LayerProfile 
     );
 
     let flops = q_f + k_f + v_f + o_f + ffn_f + 2 * n_f + s_f;
-    let hbm = q_r + q_w + k_r + k_w + v_r + v_w + o_r + o_w + ffn_r + ffn_w + 2 * (n_r + n_w) + s_r + s_w;
+    let hbm =
+        q_r + q_w + k_r + k_w + v_r + v_w + o_r + o_w + ffn_r + ffn_w + 2 * (n_r + n_w) + s_r + s_w;
     let activation_bytes = bs * d * spec.dtype_bytes as u64 * 4; // loose upper bound
     let param_bytes = {
         let attn = d * nh * hd + 2 * d * nkv * hd + nh * hd * d;
@@ -325,7 +331,12 @@ fn embedding_profile(spec: &ModelSpec, gpu: &GpuSpec) -> LayerProfile {
 
 fn lm_head_profile(spec: &ModelSpec, gpu: &GpuSpec) -> LayerProfile {
     let bs = (spec.batch as u64) * (spec.max_seq as u64);
-    let (f, r, w) = matmul_cost(bs, spec.d_model as u64, spec.vocab as u64, spec.dtype_bytes as u64);
+    let (f, r, w) = matmul_cost(
+        bs,
+        spec.d_model as u64,
+        spec.vocab as u64,
+        spec.dtype_bytes as u64,
+    );
     let estimated_us = latency_us(f, r + w, gpu, spec.dtype_bytes as usize);
     let ai = arithmetic_intensity(f, r, w);
     let ridge = gpu.crossover(spec.dtype_bytes as usize);
@@ -375,7 +386,11 @@ pub fn evaluate(spec: &ModelSpec, gpu: &GpuSpec) -> Result<CompilationProfile, S
     let param_bytes: u64 = per_layer.iter().map(|l| l.param_bytes).sum();
     // Peak memory: max per-layer activation + all params (conservative
     // upper bound; memory planner would give a tighter number).
-    let peak_act: u64 = per_layer.iter().map(|l| l.activation_bytes).max().unwrap_or(0);
+    let peak_act: u64 = per_layer
+        .iter()
+        .map(|l| l.activation_bytes)
+        .max()
+        .unwrap_or(0);
     let peak_memory = param_bytes + peak_act;
     let estimated_latency_us: f64 = per_layer.iter().map(|l| l.estimated_us).sum();
 

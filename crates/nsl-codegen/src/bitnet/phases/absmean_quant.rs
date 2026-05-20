@@ -79,7 +79,9 @@ pub fn emit(ptx: &mut String, config: &BitNetKernelConfig) {
     ptx.push_str("mov.f32 %f_scale, %f_max;\n");
 
     // Step 3: zero-row guard.
-    ptx.push_str("// Zero-magnitude row guard: scale == 0 -> write all zeros to SMEM, scale = 0.\n");
+    ptx.push_str(
+        "// Zero-magnitude row guard: scale == 0 -> write all zeros to SMEM, scale = 0.\n",
+    );
     ptx.push_str("setp.eq.f32 %p_zero, %f_scale, 0f00000000;\n");
     ptx.push_str("@%p_zero bra ABSMAX_ZERO_ROW;\n");
 

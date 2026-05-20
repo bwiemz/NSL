@@ -37,7 +37,11 @@ pub extern "C" fn nsl_tensor_sum_dim(tensor_ptr: i64, dim: i64, keepdim: i64) ->
                     crate::cuda::gpu_global_sum_f32(c_ptr)
                 } else {
                     let ndim = tensor.ndim as usize;
-                    let d = if dim < 0 { (dim + ndim as i64) as usize } else { dim as usize };
+                    let d = if dim < 0 {
+                        (dim + ndim as i64) as usize
+                    } else {
+                        dim as usize
+                    };
                     crate::cuda::gpu_sum_dim_f32(c_ptr, d, keepdim_bool)
                 };
                 super::nsl_tensor_free(c_ptr);
@@ -99,9 +103,16 @@ pub extern "C" fn nsl_tensor_sum_dim(tensor_ptr: i64, dim: i64, keepdim: i64) ->
     }
 
     let ndim = tensor.ndim as usize;
-    let d = if dim < 0 { (dim + ndim as i64) as usize } else { dim as usize };
+    let d = if dim < 0 {
+        (dim + ndim as i64) as usize
+    } else {
+        dim as usize
+    };
     if d >= ndim {
-        eprintln!("nsl: sum_dim dimension {} out of range for {}D tensor", dim, ndim);
+        eprintln!(
+            "nsl: sum_dim dimension {} out of range for {}D tensor",
+            dim, ndim
+        );
         std::process::abort();
     }
 
@@ -109,11 +120,15 @@ pub extern "C" fn nsl_tensor_sum_dim(tensor_ptr: i64, dim: i64, keepdim: i64) ->
 
     // Compute output shape
     let out_shape: Vec<i64> = if keepdim_bool {
-        input_shape.iter().enumerate()
+        input_shape
+            .iter()
+            .enumerate()
             .map(|(i, &s)| if i == d { 1 } else { s })
             .collect()
     } else {
-        input_shape.iter().enumerate()
+        input_shape
+            .iter()
+            .enumerate()
             .filter(|&(i, _)| i != d)
             .map(|(_, &s)| s)
             .collect()
@@ -195,28 +210,50 @@ pub extern "C" fn nsl_tensor_mean_dim(tensor_ptr: i64, dim: i64, keepdim: i64) -
                     super::nsl_tensor_free(c_ptr);
                     // Divide by num_elements using scalar op
                     let inv = 1.0_f32 / num_elements as f32;
-                    crate::cuda::gpu_scalar_op_inplace(sum_ptr, inv, crate::cuda::kernels::MUL_SCALAR_F32_PTX, "nsl_mul_scalar_f32\0");
+                    crate::cuda::gpu_scalar_op_inplace(
+                        sum_ptr,
+                        inv,
+                        crate::cuda::kernels::MUL_SCALAR_F32_PTX,
+                        "nsl_mul_scalar_f32\0",
+                    );
                     if autodiff::is_recording() {
                         autodiff::maybe_record(autodiff::TapeOp::MeanReduce {
-                            a: tensor_ptr, out: sum_ptr, dim: -1, keepdim: false,
-                            num_elements, input_shape,
+                            a: tensor_ptr,
+                            out: sum_ptr,
+                            dim: -1,
+                            keepdim: false,
+                            num_elements,
+                            input_shape,
                         });
                     }
                     return sum_ptr;
                 }
 
                 let ndim = tensor.ndim as usize;
-                let d = if dim < 0 { (dim + ndim as i64) as usize } else { dim as usize };
+                let d = if dim < 0 {
+                    (dim + ndim as i64) as usize
+                } else {
+                    dim as usize
+                };
                 let dim_size = input_shape[d];
                 let sum_ptr = crate::cuda::gpu_sum_dim_f32(c_ptr, d, keepdim_bool);
                 super::nsl_tensor_free(c_ptr);
                 // Divide by dim_size using scalar op
                 let inv = 1.0_f32 / dim_size as f32;
-                crate::cuda::gpu_scalar_op_inplace(sum_ptr, inv, crate::cuda::kernels::MUL_SCALAR_F32_PTX, "nsl_mul_scalar_f32\0");
+                crate::cuda::gpu_scalar_op_inplace(
+                    sum_ptr,
+                    inv,
+                    crate::cuda::kernels::MUL_SCALAR_F32_PTX,
+                    "nsl_mul_scalar_f32\0",
+                );
                 if autodiff::is_recording() {
                     autodiff::maybe_record(autodiff::TapeOp::MeanReduce {
-                        a: tensor_ptr, out: sum_ptr, dim, keepdim: keepdim_bool,
-                        num_elements: dim_size, input_shape,
+                        a: tensor_ptr,
+                        out: sum_ptr,
+                        dim,
+                        keepdim: keepdim_bool,
+                        num_elements: dim_size,
+                        input_shape,
                     });
                 }
                 return sum_ptr;
@@ -273,9 +310,16 @@ pub extern "C" fn nsl_tensor_mean_dim(tensor_ptr: i64, dim: i64, keepdim: i64) -
     }
 
     let ndim = tensor.ndim as usize;
-    let d = if dim < 0 { (dim + ndim as i64) as usize } else { dim as usize };
+    let d = if dim < 0 {
+        (dim + ndim as i64) as usize
+    } else {
+        dim as usize
+    };
     if d >= ndim {
-        eprintln!("nsl: mean_dim dimension {} out of range for {}D tensor", dim, ndim);
+        eprintln!(
+            "nsl: mean_dim dimension {} out of range for {}D tensor",
+            dim, ndim
+        );
         std::process::abort();
     }
 
@@ -326,7 +370,11 @@ pub extern "C" fn nsl_tensor_reduce_max(tensor_ptr: i64, dim: i64, keepdim: i64)
             {
                 let keepdim_bool = keepdim != 0;
                 let ndim = tensor.ndim as usize;
-                let d = if dim < 0 { (dim + ndim as i64) as usize } else { dim as usize };
+                let d = if dim < 0 {
+                    (dim + ndim as i64) as usize
+                } else {
+                    dim as usize
+                };
                 let input_shape = get_shape_vec(tensor);
                 let c_ptr = super::nsl_tensor_contiguous(tensor_ptr);
                 let result = crate::cuda::gpu_max_dim_f32(c_ptr, d, keepdim_bool);
@@ -363,10 +411,17 @@ pub extern "C" fn nsl_tensor_reduce_max(tensor_ptr: i64, dim: i64, keepdim: i64)
     let input_shape = get_shape_vec(tensor);
     let keepdim_bool = keepdim != 0;
     let ndim = tensor.ndim as usize;
-    let d = if dim < 0 { (dim + ndim as i64) as usize } else { dim as usize };
+    let d = if dim < 0 {
+        (dim + ndim as i64) as usize
+    } else {
+        dim as usize
+    };
 
     if d >= ndim {
-        eprintln!("nsl: reduce_max dimension {} out of range for {}D tensor", dim, ndim);
+        eprintln!(
+            "nsl: reduce_max dimension {} out of range for {}D tensor",
+            dim, ndim
+        );
         std::process::abort();
     }
 
@@ -374,11 +429,15 @@ pub extern "C" fn nsl_tensor_reduce_max(tensor_ptr: i64, dim: i64, keepdim: i64)
 
     // Compute output shape
     let out_shape: Vec<i64> = if keepdim_bool {
-        input_shape.iter().enumerate()
+        input_shape
+            .iter()
+            .enumerate()
             .map(|(i, &s)| if i == d { 1 } else { s })
             .collect()
     } else {
-        input_shape.iter().enumerate()
+        input_shape
+            .iter()
+            .enumerate()
             .filter(|&(i, _)| i != d)
             .map(|(_, &s)| s)
             .collect()
@@ -497,10 +556,17 @@ pub extern "C" fn nsl_tensor_gather(tensor_ptr: i64, dim: i64, indices_ptr: i64)
     let indices = NslTensor::from_ptr(i_c);
     let input_shape = get_shape_vec(tensor);
     let ndim = tensor.ndim as usize;
-    let d = if dim < 0 { (dim + ndim as i64) as usize } else { dim as usize };
+    let d = if dim < 0 {
+        (dim + ndim as i64) as usize
+    } else {
+        dim as usize
+    };
 
     if d >= ndim {
-        eprintln!("nsl: gather dimension {} out of range for {}D tensor", dim, ndim);
+        eprintln!(
+            "nsl: gather dimension {} out of range for {}D tensor",
+            dim, ndim
+        );
         std::process::abort();
     }
 
@@ -508,15 +574,25 @@ pub extern "C" fn nsl_tensor_gather(tensor_ptr: i64, dim: i64, indices_ptr: i64)
     let gather_dim_size = input_shape[d] as usize;
 
     // Output shape: input shape with d_dim replaced by num_indices
-    let out_shape: Vec<i64> = input_shape.iter().enumerate()
+    let out_shape: Vec<i64> = input_shape
+        .iter()
+        .enumerate()
         .filter(|&(i, _)| i != d)
         .map(|(_, &s)| s)
         .collect();
 
     // Compute the number of "outer" elements (product of dims before d)
     // and "inner" elements (product of dims after d)
-    let outer: usize = input_shape[..d].iter().map(|&s| s as usize).product::<usize>().max(1);
-    let inner: usize = input_shape[d+1..].iter().map(|&s| s as usize).product::<usize>().max(1);
+    let outer: usize = input_shape[..d]
+        .iter()
+        .map(|&s| s as usize)
+        .product::<usize>()
+        .max(1);
+    let inner: usize = input_shape[d + 1..]
+        .iter()
+        .map(|&s| s as usize)
+        .product::<usize>()
+        .max(1);
 
     // indices must match outer dimension count
     if num_indices != outer {
@@ -558,7 +634,9 @@ pub extern "C" fn nsl_tensor_gather(tensor_ptr: i64, dim: i64, indices_ptr: i64)
     nsl_tensor_free(i_c);
     if autodiff::is_recording() {
         // Save indices for backward
-        NslTensor::from_ptr(indices_ptr).refcount.fetch_add(1, Ordering::SeqCst);
+        NslTensor::from_ptr(indices_ptr)
+            .refcount
+            .fetch_add(1, Ordering::SeqCst);
         autodiff::maybe_record(autodiff::TapeOp::Gather {
             a: tensor_ptr,
             out: result_ptr,
@@ -608,10 +686,18 @@ pub extern "C" fn nsl_tensor_softmax(tensor_ptr: i64, dim: i64) -> i64 {
     let strides = NslTensor::compute_strides(shape, ndim);
 
     // Normalize dim
-    let d = if dim < 0 { (ndim + dim) as usize } else { dim as usize };
+    let d = if dim < 0 {
+        (ndim + dim) as usize
+    } else {
+        dim as usize
+    };
 
-    let a_shape: Vec<i64> = (0..ndim as usize).map(|i| unsafe { *a.shape.add(i) }).collect();
-    let a_strides: Vec<i64> = (0..ndim as usize).map(|i| unsafe { *a.strides.add(i) }).collect();
+    let a_shape: Vec<i64> = (0..ndim as usize)
+        .map(|i| unsafe { *a.shape.add(i) })
+        .collect();
+    let a_strides: Vec<i64> = (0..ndim as usize)
+        .map(|i| unsafe { *a.strides.add(i) })
+        .collect();
     let dim_size = a_shape[d] as usize;
 
     let num_slices = (len as usize) / dim_size;
@@ -622,7 +708,9 @@ pub extern "C" fn nsl_tensor_softmax(tensor_ptr: i64, dim: i64) -> i64 {
             let mut remaining = slice_idx;
             let mut base_offset: usize = 0;
             for axis in (0..ndim as usize).rev() {
-                if axis == d { continue; }
+                if axis == d {
+                    continue;
+                }
                 let idx = remaining % (a_shape[axis] as usize);
                 remaining /= a_shape[axis] as usize;
                 base_offset += idx * (a_strides[axis] as usize);
@@ -631,7 +719,9 @@ pub extern "C" fn nsl_tensor_softmax(tensor_ptr: i64, dim: i64) -> i64 {
             for k in 0..dim_size {
                 let offset = base_offset + k * (a_strides[d] as usize);
                 let val = unsafe { *a.data_f32().add(offset) };
-                if val > max_val { max_val = val; }
+                if val > max_val {
+                    max_val = val;
+                }
             }
             let mut sum = 0.0_f32;
             for k in 0..dim_size {
@@ -652,7 +742,9 @@ pub extern "C" fn nsl_tensor_softmax(tensor_ptr: i64, dim: i64) -> i64 {
             let mut remaining = slice_idx;
             let mut base_offset: usize = 0;
             for axis in (0..ndim as usize).rev() {
-                if axis == d { continue; }
+                if axis == d {
+                    continue;
+                }
                 let idx = remaining % (a_shape[axis] as usize);
                 remaining /= a_shape[axis] as usize;
                 base_offset += idx * (a_strides[axis] as usize);
@@ -661,7 +753,9 @@ pub extern "C" fn nsl_tensor_softmax(tensor_ptr: i64, dim: i64) -> i64 {
             for k in 0..dim_size {
                 let offset = base_offset + k * (a_strides[d] as usize);
                 let val = unsafe { *a.data_f64().add(offset) };
-                if val > max_val { max_val = val; }
+                if val > max_val {
+                    max_val = val;
+                }
             }
             let mut sum = 0.0_f64;
             for k in 0..dim_size {
@@ -679,20 +773,14 @@ pub extern "C" fn nsl_tensor_softmax(tensor_ptr: i64, dim: i64) -> i64 {
     };
 
     let result = Box::new(NslTensor::new(
-        data,
-        shape,
-        strides,
-        ndim,
-        len,
-        a.device,
-        a.dtype,
-        1,
-        0,
+        data, shape, strides, ndim, len, a.device, a.dtype, 1, 0,
     ));
     let result = NslTensor::publish(result);
     nsl_tensor_free(a_c);
     if autodiff::is_recording() {
-        NslTensor::from_ptr(result).refcount.fetch_add(1, Ordering::SeqCst);
+        NslTensor::from_ptr(result)
+            .refcount
+            .fetch_add(1, Ordering::SeqCst);
         autodiff::maybe_record(autodiff::TapeOp::Softmax {
             a: tensor_ptr,
             out: result,
@@ -703,7 +791,9 @@ pub extern "C" fn nsl_tensor_softmax(tensor_ptr: i64, dim: i64) -> i64 {
     #[cfg(feature = "interop")]
     if crate::trace::is_tracing() {
         let rt = NslTensor::from_ptr(result);
-        let shape: Vec<i64> = (0..rt.ndim as usize).map(|d| unsafe { *rt.shape.add(d) }).collect();
+        let shape: Vec<i64> = (0..rt.ndim as usize)
+            .map(|d| unsafe { *rt.shape.add(d) })
+            .collect();
         crate::trace::record_op(
             crate::trace::OpType::Softmax,
             vec![tensor_ptr],

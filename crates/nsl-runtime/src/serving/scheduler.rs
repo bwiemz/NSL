@@ -1,7 +1,7 @@
 //! BatchScheduler: continuous batching with chunked prefill.
 
-use std::collections::VecDeque;
 use crate::serving::request::{InferenceRequest, RequestId, RequestState};
+use std::collections::VecDeque;
 
 pub struct SchedulerConfig {
     pub max_batch: usize,
@@ -68,7 +68,9 @@ impl BatchScheduler {
         // Admit waiting requests if batch has room
         while self.active.len() < self.config.max_batch {
             if let Some(mut req) = self.waiting.pop_front() {
-                req.state = RequestState::Prefilling { tokens_processed: 0 };
+                req.state = RequestState::Prefilling {
+                    tokens_processed: 0,
+                };
                 self.active.push(req);
             } else {
                 break;
@@ -87,7 +89,9 @@ impl BatchScheduler {
                     if end >= req.prompt_tokens.len() {
                         req.state = RequestState::Decoding;
                     } else {
-                        req.state = RequestState::Prefilling { tokens_processed: end };
+                        req.state = RequestState::Prefilling {
+                            tokens_processed: end,
+                        };
                     }
                 }
                 RequestState::Decoding => {
@@ -97,7 +101,10 @@ impl BatchScheduler {
             }
         }
 
-        SchedulerStep { prefill_chunks, decode_ids }
+        SchedulerStep {
+            prefill_chunks,
+            decode_ids,
+        }
     }
 
     pub fn record_token(&mut self, request_id: RequestId, token_id: i64) -> bool {
@@ -144,7 +151,11 @@ mod tests {
     #[test]
     fn scheduler_basic_lifecycle() {
         let config = SchedulerConfig {
-            max_batch: 2, max_seq_len: 100, kv_blocks: 64, prefill_chunk: 512, speculative_tokens: 0,
+            max_batch: 2,
+            max_seq_len: 100,
+            kv_blocks: 64,
+            prefill_chunk: 512,
+            speculative_tokens: 0,
         };
         let mut sched = BatchScheduler::new(config);
 
@@ -182,7 +193,11 @@ mod tests {
     #[test]
     fn scheduler_chunked_prefill() {
         let config = SchedulerConfig {
-            max_batch: 4, max_seq_len: 4096, kv_blocks: 256, prefill_chunk: 3, speculative_tokens: 0,
+            max_batch: 4,
+            max_seq_len: 4096,
+            kv_blocks: 256,
+            prefill_chunk: 3,
+            speculative_tokens: 0,
         };
         let mut sched = BatchScheduler::new(config);
 

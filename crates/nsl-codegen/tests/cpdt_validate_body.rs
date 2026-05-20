@@ -24,7 +24,12 @@ fn wm_with_names(tensor_names: &[&str]) -> (WeightMap, tempfile::TempPath) {
     }
     let views: HashMap<String, TensorView<'_>> = owned
         .iter()
-        .map(|(n, b)| (n.clone(), TensorView::new(Dtype::F32, vec![1], b.as_slice()).unwrap()))
+        .map(|(n, b)| {
+            (
+                n.clone(),
+                TensorView::new(Dtype::F32, vec![1], b.as_slice()).unwrap(),
+            )
+        })
         .collect();
     let bytes = serialize(&views, &None).unwrap();
 
@@ -84,10 +89,7 @@ fn all_layers_matched_green() {
 #[test]
 fn single_missing_layer_red() {
     // blocks.0 and blocks.2 matched; blocks.1 has no matching tensors.
-    let (wm, _tp) = wm_with_names(&[
-        "blocks.0.attn.wq.weight",
-        "blocks.2.ffn.w_down.weight",
-    ]);
+    let (wm, _tp) = wm_with_names(&["blocks.0.attn.wq.weight", "blocks.2.ffn.w_down.weight"]);
     let applied = plan_with_layers(&["blocks.0", "blocks.1", "blocks.2"]);
     let err = validate(&wm, &applied).expect_err("should fail");
     match err {

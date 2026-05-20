@@ -24,8 +24,7 @@
 //!      "falling back" [phrase synthesised by the caller]).
 
 use nsl_codegen::ad_rules::{
-    apply_ad_rule, csha_dispatch_for_op, AdjointExpr, CshaDispatchDecision,
-    InputAdjoint,
+    apply_ad_rule, csha_dispatch_for_op, AdjointExpr, CshaDispatchDecision, InputAdjoint,
 };
 use nsl_codegen::csha_apply::{FusionMark, MarkRole};
 use nsl_codegen::csha_boundary::ProjKind;
@@ -37,10 +36,18 @@ fn backward_over_budget_config() -> FlashAttentionConfig {
     // fixture: (64,64,64,8,64) — forward fits, backward's P+dQ+dK+dV
     // extra bytes push it past the 99 KB dynamic-SMEM cap.
     FlashAttentionConfig {
-        block_q: 64, block_kv: 64, head_dim: 64,
-        causal: false, paged: false, rope_q: false,
+        block_q: 64,
+        block_kv: 64,
+        head_dim: 64,
+        causal: false,
+        paged: false,
+        rope_q: false,
         rope_style: RopeStyle::HalfSplit,
-        gqa_group_size: 1, tree_mask: false, gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras {
+        gqa_group_size: 1,
+        tree_mask: false,
+        gpu_sm: 75,
+        segment_masked: false,
+        csha: Some(CshaExtras {
             fused_projections: true,
             save_activations_for_backward: true,
             d_model: 64,
@@ -54,24 +61,44 @@ fn claimed_chain_ops() -> Vec<WengertOp> {
     // exercise three distinct adjoint rules in the fallback path.
     vec![
         WengertOp {
-            id: 0, result: 0, op: PrimalOp::Input("x".into()),
-            inputs: vec![], saved_for_backward: true, checkpointed: false,
+            id: 0,
+            result: 0,
+            op: PrimalOp::Input("x".into()),
+            inputs: vec![],
+            saved_for_backward: true,
+            checkpointed: false,
         },
         WengertOp {
-            id: 1, result: 1, op: PrimalOp::RMSNorm { eps: 1e-5 },
-            inputs: vec![0], saved_for_backward: true, checkpointed: false,
+            id: 1,
+            result: 1,
+            op: PrimalOp::RMSNorm { eps: 1e-5 },
+            inputs: vec![0],
+            saved_for_backward: true,
+            checkpointed: false,
         },
         WengertOp {
-            id: 2, result: 2, op: PrimalOp::Param("blocks.0.attn.wq".into()),
-            inputs: vec![], saved_for_backward: false, checkpointed: false,
+            id: 2,
+            result: 2,
+            op: PrimalOp::Param("blocks.0.attn.wq".into()),
+            inputs: vec![],
+            saved_for_backward: false,
+            checkpointed: false,
         },
         WengertOp {
-            id: 3, result: 3, op: PrimalOp::Matmul,
-            inputs: vec![1, 2], saved_for_backward: true, checkpointed: false,
+            id: 3,
+            result: 3,
+            op: PrimalOp::Matmul,
+            inputs: vec![1, 2],
+            saved_for_backward: true,
+            checkpointed: false,
         },
         WengertOp {
-            id: 4, result: 4, op: PrimalOp::RoPE { dim: 64 },
-            inputs: vec![3], saved_for_backward: true, checkpointed: false,
+            id: 4,
+            result: 4,
+            op: PrimalOp::RoPE { dim: 64 },
+            inputs: vec![3],
+            saved_for_backward: true,
+            checkpointed: false,
         },
     ]
 }
@@ -130,9 +157,7 @@ fn simulate_reverse_walk(ops: &[WengertOp], mark: &FusionMark) -> DispatchResult
             }
             CshaDispatchDecision::Fallback { diagnostic } => {
                 if !in_fallback {
-                    diagnostics.push(format!(
-                        "{diagnostic}; falling back to unfused backward"
-                    ));
+                    diagnostics.push(format!("{diagnostic}; falling back to unfused backward"));
                     in_fallback = true;
                 }
                 // Per-op adjoint rules for the fallback path.
@@ -155,9 +180,7 @@ fn ad_dispatcher_falls_back_when_backward_validator_rejects() {
     // Sanity: confirm the config actually trips the backward validator
     // (if this fails, the T2.1 validator regressed and T7.1's harness
     // is silently testing the wrong path).
-    use nsl_codegen::flash_attention_v2::smem_layout::{
-        validate_scalar_v2_config, Direction,
-    };
+    use nsl_codegen::flash_attention_v2::smem_layout::{validate_scalar_v2_config, Direction};
     assert!(
         validate_scalar_v2_config(&cfg, Direction::Forward).is_ok(),
         "harness config must pass forward validation"
@@ -177,7 +200,8 @@ fn ad_dispatcher_falls_back_when_backward_validator_rejects() {
     assert!(
         result.emitted_op_count > 1,
         "expected per-op fallback, got fused-shape (op_count={}): {:?}",
-        result.emitted_op_count, result.emitted_adjoints
+        result.emitted_op_count,
+        result.emitted_adjoints
     );
 
     // Diagnostic surface — plan contract.
@@ -224,10 +248,18 @@ fn ad_dispatcher_stays_single_emission_on_fused_accept() {
     // per-op fallback. Without this the T7.1 regression test could pass
     // trivially if the dispatcher always fell back.
     let ok_cfg = FlashAttentionConfig {
-        block_q: 32, block_kv: 32, head_dim: 32,
-        causal: false, paged: false, rope_q: false,
+        block_q: 32,
+        block_kv: 32,
+        head_dim: 32,
+        causal: false,
+        paged: false,
+        rope_q: false,
         rope_style: RopeStyle::HalfSplit,
-        gqa_group_size: 1, tree_mask: false, gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras {
+        gqa_group_size: 1,
+        tree_mask: false,
+        gpu_sm: 75,
+        segment_masked: false,
+        csha: Some(CshaExtras {
             fused_projections: true,
             save_activations_for_backward: true,
             d_model: 32,

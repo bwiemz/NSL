@@ -56,20 +56,33 @@ mod tests {
     #[test]
     fn test_causal_num_passes() {
         let cfg = RingConfig {
-            ring_size: 4, ring_rank: 0, local_seq_len: 250,
-            num_heads: 32, num_kv_heads: 8, head_dim: 128, causal: true,
+            ring_size: 4,
+            ring_rank: 0,
+            local_seq_len: 250,
+            num_heads: 32,
+            num_kv_heads: 8,
+            head_dim: 128,
+            causal: true,
         };
         assert_eq!(cfg.num_passes(), 1); // GPU 0: local only
 
-        let cfg3 = RingConfig { ring_rank: 3, ..cfg };
+        let cfg3 = RingConfig {
+            ring_rank: 3,
+            ..cfg
+        };
         assert_eq!(cfg3.num_passes(), 4); // GPU 3: all passes
     }
 
     #[test]
     fn test_noncausal_num_passes() {
         let cfg = RingConfig {
-            ring_size: 4, ring_rank: 0, local_seq_len: 250,
-            num_heads: 32, num_kv_heads: 8, head_dim: 128, causal: false,
+            ring_size: 4,
+            ring_rank: 0,
+            local_seq_len: 250,
+            num_heads: 32,
+            num_kv_heads: 8,
+            head_dim: 128,
+            causal: false,
         };
         assert_eq!(cfg.num_passes(), 4); // all GPUs need all passes
     }
@@ -77,8 +90,13 @@ mod tests {
     #[test]
     fn test_source_rank_ring_order() {
         let cfg = RingConfig {
-            ring_size: 4, ring_rank: 2, local_seq_len: 250,
-            num_heads: 32, num_kv_heads: 8, head_dim: 128, causal: false,
+            ring_size: 4,
+            ring_rank: 2,
+            local_seq_len: 250,
+            num_heads: 32,
+            num_kv_heads: 8,
+            head_dim: 128,
+            causal: false,
         };
         assert_eq!(cfg.source_rank(0), 2);
         assert_eq!(cfg.source_rank(1), 1);

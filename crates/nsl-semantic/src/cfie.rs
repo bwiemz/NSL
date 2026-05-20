@@ -128,10 +128,8 @@ pub fn validate_cfie_decorator(
         for arg in args {
             let Some(ref name_sym) = arg.name else {
                 diagnostics.push(
-                    Diagnostic::error(
-                        "@cfie: positional arguments are not allowed".to_string(),
-                    )
-                    .with_label(arg.span, "expected `key = value`"),
+                    Diagnostic::error("@cfie: positional arguments are not allowed".to_string())
+                        .with_label(arg.span, "expected `key = value`"),
                 );
                 continue;
             };
@@ -216,7 +214,10 @@ mod tests {
         ] {
             assert_eq!(KvQuantChoice::parse(c.as_str()), Some(c));
         }
-        assert_eq!(KvQuantChoice::parse("fp16"), Some(KvQuantChoice::UniformFp16));
+        assert_eq!(
+            KvQuantChoice::parse("fp16"),
+            Some(KvQuantChoice::UniformFp16)
+        );
         assert!(KvQuantChoice::parse("nonsense").is_none());
     }
 }

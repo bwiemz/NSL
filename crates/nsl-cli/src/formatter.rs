@@ -297,7 +297,10 @@ fn fix_operator_spacing(line: &str) -> String {
             // Peek behind in out — if last non-space is !, <, >, +, -, *, /, that means we're
             // in the middle of a two-char op (shouldn't happen here, but guard anyway)
             let prev_meaningful = last_meaningful_char(&out);
-            if matches!(prev_meaningful, Some('!') | Some('<') | Some('>') | Some('+') | Some('-') | Some('*') | Some('/')) {
+            if matches!(
+                prev_meaningful,
+                Some('!') | Some('<') | Some('>') | Some('+') | Some('-') | Some('*') | Some('/')
+            ) {
                 // Part of a compound operator already emitted — just push
                 out.push(ch);
                 i += 1;
@@ -377,7 +380,10 @@ fn is_unary_context(out: &[char]) -> bool {
     let lm = last_meaningful_char(out);
     match lm {
         None => true, // start of line
-        Some(c) => matches!(c, '=' | '(' | ',' | '[' | '{' | '+' | '-' | '*' | '/' | '<' | '>' | '!'),
+        Some(c) => matches!(
+            c,
+            '=' | '(' | ',' | '[' | '{' | '+' | '-' | '*' | '/' | '<' | '>' | '!'
+        ),
     }
 }
 

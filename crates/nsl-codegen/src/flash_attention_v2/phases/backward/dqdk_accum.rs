@@ -20,9 +20,7 @@
 //!     dK[col, d] += sum_row dS[row, col] * Q[row, d] * scale
 
 use crate::flash_attention::FlashAttentionConfig;
-use crate::flash_attention_v2::smem_layout::{
-    backward_dk_offset, backward_ds_offset,
-};
+use crate::flash_attention_v2::smem_layout::{backward_dk_offset, backward_ds_offset};
 
 pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
     assert_eq!(
@@ -61,9 +59,7 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
     ptx.push_str(&format!("V2_BWD_DQ_INNER_{q_tile_iter}:\n"));
 
     // dS[warp_row, col] → %f_dS (scaled).
-    ptx.push_str(&format!(
-        "    mul.lo.u64 %rd30, %warp_row, {};\n", block_kv
-    ));
+    ptx.push_str(&format!("    mul.lo.u64 %rd30, %warp_row, {};\n", block_kv));
     ptx.push_str("    cvt.u64.u32 %rd31, %r1;\n");
     ptx.push_str("    add.u64 %rd30, %rd30, %rd31;\n");
     ptx.push_str("    shl.b64 %rd30, %rd30, 2;\n");
@@ -99,9 +95,7 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
     }
 
     ptx.push_str("    add.u32 %r1, %r1, 1;\n");
-    ptx.push_str(&format!(
-        "    setp.lt.u32 %p0, %r1, {};\n", block_kv
-    ));
+    ptx.push_str(&format!("    setp.lt.u32 %p0, %r1, {};\n", block_kv));
     ptx.push_str(&format!("    @%p0 bra V2_BWD_DQ_INNER_{q_tile_iter};\n"));
 
     // ─────────────────────────────────────────────────────────────────────
@@ -126,9 +120,7 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
 
     // dS[row_global, lane] (scaled) → %f_dS.
     ptx.push_str("    cvt.u64.u32 %rd30, %r2;\n");
-    ptx.push_str(&format!(
-        "    mul.lo.u64 %rd30, %rd30, {};\n", block_kv
-    ));
+    ptx.push_str(&format!("    mul.lo.u64 %rd30, %rd30, {};\n", block_kv));
     ptx.push_str("    cvt.u64.u32 %rd31, %lane;\n");
     ptx.push_str("    add.u64 %rd30, %rd30, %rd31;\n");
     ptx.push_str("    shl.b64 %rd30, %rd30, 2;\n");
@@ -151,20 +143,20 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
         "    mul.lo.u64 %rd34, %rd34, {};  // lane * head_dim * 4\n",
         head_dim * 4
     ));
-    ptx.push_str(&format!(
-        "    add.u64 %rd34, %rd34, {dk_offset};\n"
-    ));
+    ptx.push_str(&format!("    add.u64 %rd34, %rd34, {dk_offset};\n"));
     ptx.push_str("    add.u64 %rd34, %shmem_base, %rd34;  // &dK[lane, 0]\n");
 
     // Warp d-base byte offset in the dK row.
     ptx.push_str("    cvt.u64.u32 %rd35, %warp_id;\n");
     ptx.push_str(&format!(
-        "    mul.lo.u64 %rd35, %rd35, {};\n", d_per_warp * 4
+        "    mul.lo.u64 %rd35, %rd35, {};\n",
+        d_per_warp * 4
     ));
     // Warp d-base byte offset into the Q SMEM row (f16, stride 2).
     ptx.push_str("    cvt.u64.u32 %rd36, %warp_id;\n");
     ptx.push_str(&format!(
-        "    mul.lo.u64 %rd36, %rd36, {};\n", d_per_warp * 2
+        "    mul.lo.u64 %rd36, %rd36, {};\n",
+        d_per_warp * 2
     ));
 
     for k in 0..d_per_warp {
@@ -186,9 +178,7 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
     }
 
     ptx.push_str("    add.u32 %r1, %r1, 1;\n");
-    ptx.push_str(&format!(
-        "    setp.lt.u32 %p0, %r1, {iter_row_count};\n"
-    ));
+    ptx.push_str(&format!("    setp.lt.u32 %p0, %r1, {iter_row_count};\n"));
     ptx.push_str(&format!("    @%p0 bra V2_BWD_DK_INNER_{q_tile_iter};\n"));
 
     ptx.push_str("    bar.sync 0;  // dK updates visible across warps\n");
@@ -201,10 +191,16 @@ mod tests {
 
     fn base_cfg(hd: i64, dm: u32) -> FlashAttentionConfig {
         FlashAttentionConfig {
-            block_q: 32, block_kv: 32, head_dim: hd,
-            causal: false, paged: false, rope_q: false,
+            block_q: 32,
+            block_kv: 32,
+            head_dim: hd,
+            causal: false,
+            paged: false,
+            rope_q: false,
             rope_style: RopeStyle::HalfSplit,
-            gqa_group_size: 1, tree_mask: false, gpu_sm: 75,
+            gqa_group_size: 1,
+            tree_mask: false,
+            gpu_sm: 75,
             segment_masked: false,
             csha: Some(CshaExtras {
                 fused_projections: true,
@@ -227,13 +223,19 @@ mod tests {
         assert!(ptx.contains("%k_smem_base"));
         assert!(ptx.contains("%q_smem_base"));
         // dK uses SMEM-tile accumulation now:
-        assert!(ptx.contains("ld.shared.f32 %f0"),
-            "dK sweep must load current dK from SMEM");
-        assert!(ptx.contains("st.shared.f32 [%rd37]"),
-            "dK sweep must store updated dK back to SMEM");
+        assert!(
+            ptx.contains("ld.shared.f32 %f0"),
+            "dK sweep must load current dK from SMEM"
+        );
+        assert!(
+            ptx.contains("st.shared.f32 [%rd37]"),
+            "dK sweep must store updated dK back to SMEM"
+        );
         // Register-based dK accumulator removed:
-        assert!(!ptx.contains("%f_dk_"),
-            "dk register accumulator replaced by SMEM tile");
+        assert!(
+            !ptx.contains("%f_dk_"),
+            "dk register accumulator replaced by SMEM tile"
+        );
     }
 
     #[test]
@@ -264,8 +266,10 @@ mod tests {
         emit(&mut ptx, &cfg, 0);
         emit(&mut ptx, &cfg, 1);
         for label in [
-            "V2_BWD_DQ_ACCUM_0:", "V2_BWD_DQ_ACCUM_1:",
-            "V2_BWD_DK_ACCUM_0:", "V2_BWD_DK_ACCUM_1:",
+            "V2_BWD_DQ_ACCUM_0:",
+            "V2_BWD_DQ_ACCUM_1:",
+            "V2_BWD_DK_ACCUM_0:",
+            "V2_BWD_DK_ACCUM_1:",
         ] {
             assert!(ptx.contains(label), "missing: {label}");
         }

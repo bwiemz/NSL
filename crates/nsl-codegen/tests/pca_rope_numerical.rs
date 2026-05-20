@@ -68,7 +68,10 @@ fn single_doc_with_doc_starts_matches_no_reset_path_bit_exact() {
     let no_reset = cpu_reference_rope_single_doc(&q, seq_len, head_dim);
     let reset = cpu_reference_rope_with_doc_starts(&q, &segment_ids, &doc_starts, head_dim);
 
-    assert_eq!(reset, no_reset, "single-doc reset must be bit-exact identity");
+    assert_eq!(
+        reset, no_reset,
+        "single-doc reset must be bit-exact identity"
+    );
 }
 
 #[test]
@@ -76,7 +79,9 @@ fn three_doc_packed_matches_per_doc_reference() {
     let head_dim = 8;
     let doc_lengths = vec![5u32, 3, 4];
     let total: u32 = doc_lengths.iter().sum();
-    let q: Vec<f32> = (0..total as usize * head_dim).map(|i| (i as f32) * 0.01).collect();
+    let q: Vec<f32> = (0..total as usize * head_dim)
+        .map(|i| (i as f32) * 0.01)
+        .collect();
     let (segment_ids, doc_starts) = build_segment_ids_and_doc_starts(&doc_lengths);
 
     let packed_out = cpu_reference_rope_with_doc_starts(&q, &segment_ids, &doc_starts, head_dim);
@@ -126,18 +131,36 @@ fn per_row_doc_starts_multi_batch_cpu_parity() {
 
     // Each row's rotation matches its own per-doc reference.
     let q0: Vec<f32> = (0..6 * head_dim).map(|i| (i as f32) * 0.01).collect();
-    let q1: Vec<f32> = (100..100 + 6 * head_dim).map(|i| (i as f32) * 0.01).collect();
+    let q1: Vec<f32> = (100..100 + 6 * head_dim)
+        .map(|i| (i as f32) * 0.01)
+        .collect();
 
     let row0_out = cpu_reference_rope_with_doc_starts(&q0, &segs0, &doc_starts0, head_dim);
     let row1_out = cpu_reference_rope_with_doc_starts(&q1, &segs1, &doc_starts1, head_dim);
 
     // Reference: each row is two independent docs starting at pos 0.
     let mut row0_ref = Vec::new();
-    row0_ref.extend(cpu_reference_rope_single_doc(&q0[0..3 * head_dim], 3, head_dim));
-    row0_ref.extend(cpu_reference_rope_single_doc(&q0[3 * head_dim..6 * head_dim], 3, head_dim));
+    row0_ref.extend(cpu_reference_rope_single_doc(
+        &q0[0..3 * head_dim],
+        3,
+        head_dim,
+    ));
+    row0_ref.extend(cpu_reference_rope_single_doc(
+        &q0[3 * head_dim..6 * head_dim],
+        3,
+        head_dim,
+    ));
     let mut row1_ref = Vec::new();
-    row1_ref.extend(cpu_reference_rope_single_doc(&q1[0..5 * head_dim], 5, head_dim));
-    row1_ref.extend(cpu_reference_rope_single_doc(&q1[5 * head_dim..6 * head_dim], 1, head_dim));
+    row1_ref.extend(cpu_reference_rope_single_doc(
+        &q1[0..5 * head_dim],
+        5,
+        head_dim,
+    ));
+    row1_ref.extend(cpu_reference_rope_single_doc(
+        &q1[5 * head_dim..6 * head_dim],
+        1,
+        head_dim,
+    ));
 
     assert_eq!(row0_out, row0_ref);
     assert_eq!(row1_out, row1_ref);

@@ -68,11 +68,15 @@ static GPU_SLAB_SIZE: AtomicU64 = AtomicU64::new(0);
 /// Returns the slab base pointer as i64 (0 on failure).
 #[no_mangle]
 pub extern "C" fn nsl_gpu_slab_init(size_bytes: i64) -> i64 {
-    if size_bytes <= 0 { return 0; }
+    if size_bytes <= 0 {
+        return 0;
+    }
     #[cfg(feature = "cuda")]
     {
         let ptr = crate::cuda::inner::alloc_device(size_bytes as usize);
-        if ptr.is_null() { return 0; }
+        if ptr.is_null() {
+            return 0;
+        }
         // Zero the slab (tensors expect zero-initialized memory)
         crate::cuda::inner::memset_d8(ptr, size_bytes as usize);
         GPU_SLAB_BASE.store(ptr as u64, Ordering::SeqCst);
@@ -80,14 +84,18 @@ pub extern "C" fn nsl_gpu_slab_init(size_bytes: i64) -> i64 {
         return ptr as i64;
     }
     #[cfg(not(feature = "cuda"))]
-    { 0 }
+    {
+        0
+    }
 }
 
 /// Free the GPU memory slab. Called once at program exit.
 #[no_mangle]
 pub extern "C" fn nsl_gpu_slab_destroy() {
     let base = GPU_SLAB_BASE.swap(0, Ordering::SeqCst);
-    if base == 0 { return; }
+    if base == 0 {
+        return;
+    }
     #[cfg(feature = "cuda")]
     {
         crate::cuda::inner::free_device(base as *mut std::ffi::c_void);
@@ -98,7 +106,11 @@ pub extern "C" fn nsl_gpu_slab_destroy() {
 /// Returns 1 if a GPU slab is currently allocated, 0 otherwise.
 #[no_mangle]
 pub extern "C" fn nsl_gpu_slab_active() -> i64 {
-    if GPU_SLAB_BASE.load(Ordering::SeqCst) != 0 { 1 } else { 0 }
+    if GPU_SLAB_BASE.load(Ordering::SeqCst) != 0 {
+        1
+    } else {
+        0
+    }
 }
 
 /// Returns the GPU slab total size in bytes (for diagnostics). 0 if no slab.

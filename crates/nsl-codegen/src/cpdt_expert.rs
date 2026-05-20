@@ -153,10 +153,7 @@ pub fn router_affinities(router: &WeightEntry, n_experts: u32) -> Vec<ExpertAffi
 }
 
 /// Detect dead / near-dead experts.
-pub fn detect_dead_experts(
-    affinities: &[ExpertAffinity],
-    threshold: f64,
-) -> Vec<u32> {
+pub fn detect_dead_experts(affinities: &[ExpertAffinity], threshold: f64) -> Vec<u32> {
     affinities
         .iter()
         .filter(|a| a.affinity < threshold)
@@ -209,9 +206,14 @@ fn expert_parallel_eval(shape: &MoeLayerShape, cfg: &ExpertConfig) -> PlacementE
     let memory_per_gpu = (experts_per_gpu as u64) * shape.per_expert_bytes();
     // All-to-all volume per step: every token goes to top_k experts.
     let tokens = (shape.batch as u64) * (shape.seq as u64);
-    let comm_volume = tokens * (shape.top_k as u64) * (shape.d_model as u64) * shape.dtype_bytes as u64;
+    let comm_volume =
+        tokens * (shape.top_k as u64) * (shape.d_model as u64) * shape.dtype_bytes as u64;
     let step_time = (comm_volume as f64 / cfg.intra_bw_bps.max(1.0)) * 1e6;
-    let load_balance = if cfg.num_gpus == 0 { 0.0 } else { 1.0 / cfg.num_gpus as f64 }; // pessimistic
+    let load_balance = if cfg.num_gpus == 0 {
+        0.0
+    } else {
+        1.0 / cfg.num_gpus as f64
+    }; // pessimistic
     PlacementEvaluation {
         strategy: PlacementStrategy::ExpertParallel,
         comm_volume_bytes: comm_volume,
@@ -219,9 +221,7 @@ fn expert_parallel_eval(shape: &MoeLayerShape, cfg: &ExpertConfig) -> PlacementE
         memory_per_gpu_bytes: memory_per_gpu,
         step_time_us: step_time,
         feasible: memory_per_gpu <= cfg.per_gpu_memory_bytes,
-        rationale: format!(
-            "expert-parallel: all-to-all dispatch, {experts_per_gpu} experts/GPU"
-        ),
+        rationale: format!("expert-parallel: all-to-all dispatch, {experts_per_gpu} experts/GPU"),
     }
 }
 
@@ -286,7 +286,11 @@ pub fn plan(
     let placement = plan_placement(shape, cfg);
 
     let mut alternatives = Vec::new();
-    for eval in [balanced_eval(shape, cfg), expert_parallel_eval(shape, cfg), hybrid_eval(shape, cfg)] {
+    for eval in [
+        balanced_eval(shape, cfg),
+        expert_parallel_eval(shape, cfg),
+        hybrid_eval(shape, cfg),
+    ] {
         if eval.strategy != placement.strategy {
             alternatives.push(eval);
         }

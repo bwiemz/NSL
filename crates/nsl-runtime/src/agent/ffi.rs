@@ -38,21 +38,24 @@ pub extern "C" fn nsl_agent_pool_new(
 /// Destroy a pool created by `nsl_agent_pool_new`. No-op on null.
 #[no_mangle]
 pub extern "C" fn nsl_agent_pool_destroy(pool: *mut PipelineContextPool) {
-    if pool.is_null() { return; }
+    if pool.is_null() {
+        return;
+    }
     // SAFETY: pool was created via `Box::into_raw` and ownership is being
     // transferred back to drop.
-    unsafe { drop(Box::from_raw(pool)); }
+    unsafe {
+        drop(Box::from_raw(pool));
+    }
 }
 
 /// Acquire a lease. Returns the lease's index (>=0), or:
 /// - `-1` if the pool is exhausted.
 /// - `-2` if `pool` is null.
 #[no_mangle]
-pub extern "C" fn nsl_agent_pool_acquire(
-    pool: *mut PipelineContextPool,
-    _timeout_ms: u64,
-) -> i64 {
-    if pool.is_null() { return -2; }
+pub extern "C" fn nsl_agent_pool_acquire(pool: *mut PipelineContextPool, _timeout_ms: u64) -> i64 {
+    if pool.is_null() {
+        return -2;
+    }
     // SAFETY: pool is a valid pointer from `nsl_agent_pool_new`.
     let pool = unsafe { &mut *pool };
     match pool.acquire() {
@@ -65,11 +68,10 @@ pub extern "C" fn nsl_agent_pool_acquire(
 /// Release a lease by its index (returned from `acquire`). No-op on null
 /// or negative index.
 #[no_mangle]
-pub extern "C" fn nsl_agent_pool_release(
-    pool: *mut PipelineContextPool,
-    lease_id: i64,
-) {
-    if pool.is_null() || lease_id < 0 { return; }
+pub extern "C" fn nsl_agent_pool_release(pool: *mut PipelineContextPool, lease_id: i64) {
+    if pool.is_null() || lease_id < 0 {
+        return;
+    }
     // SAFETY: pool is a valid pointer.
     let pool = unsafe { &mut *pool };
     pool.release_by_index(lease_id as usize);
@@ -79,7 +81,9 @@ pub extern "C" fn nsl_agent_pool_release(
 /// Returns 1 if `sched` is null (sentinel for v1; codegen should never pass null).
 #[no_mangle]
 pub extern "C" fn nsl_agent_scheduler_step(sched: *mut ReactorScheduler) -> i32 {
-    if sched.is_null() { return 1; }
+    if sched.is_null() {
+        return 1;
+    }
     // SAFETY: sched is valid; the codegen owns the scheduler for the
     // pipeline function's duration.
     let sched = unsafe { &mut *sched };
@@ -98,8 +102,12 @@ pub extern "C" fn nsl_agent_mailbox_write(
     msg: *mut PortMessage,
     time: u64,
 ) -> i32 {
-    if mb.is_null() { return 1; }
-    if msg.is_null() { return 2; }
+    if mb.is_null() {
+        return 1;
+    }
+    if msg.is_null() {
+        return 2;
+    }
     // SAFETY: mb is a valid mailbox pointer; msg was produced by
     // `Box::into_raw` and ownership is now transferred here.
     let mb = unsafe { &mut *mb };
@@ -114,7 +122,9 @@ pub extern "C" fn nsl_agent_mailbox_write(
 /// `Box::from_raw`.
 #[no_mangle]
 pub extern "C" fn nsl_agent_mailbox_read(mb: *mut PortMailbox) -> *mut PortMessage {
-    if mb.is_null() { return std::ptr::null_mut(); }
+    if mb.is_null() {
+        return std::ptr::null_mut();
+    }
     // SAFETY: mb is a valid mailbox pointer.
     let mb = unsafe { &mut *mb };
     match mb.read() {
@@ -185,7 +195,9 @@ mod tests {
         let mut mb = PortMailbox::new();
         let mb_ptr: *mut PortMailbox = &mut mb;
 
-        let msg = Box::new(PortMessage::Struct(Box::new(StructPayload::new(vec![7, 8, 9]))));
+        let msg = Box::new(PortMessage::Struct(Box::new(StructPayload::new(vec![
+            7, 8, 9,
+        ]))));
         let msg_ptr = Box::into_raw(msg);
         let r = nsl_agent_mailbox_write(mb_ptr, msg_ptr, 42);
         assert_eq!(r, 0);
@@ -215,12 +227,16 @@ mod tests {
 
     #[test]
     fn ffi_mailbox_write_null_mailbox_returns_one() {
-        let msg = Box::into_raw(Box::new(PortMessage::Struct(Box::new(StructPayload::new(vec![])))));
+        let msg = Box::into_raw(Box::new(PortMessage::Struct(Box::new(StructPayload::new(
+            vec![],
+        )))));
         let r = nsl_agent_mailbox_write(std::ptr::null_mut(), msg, 0);
         assert_eq!(r, 1);
         // Free the leaked msg to avoid the leak; FFI didn't take ownership
         // because mb was null.
-        unsafe { drop(Box::from_raw(msg)); }
+        unsafe {
+            drop(Box::from_raw(msg));
+        }
     }
 
     #[test]

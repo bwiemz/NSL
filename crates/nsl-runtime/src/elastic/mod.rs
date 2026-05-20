@@ -5,6 +5,6 @@
 //! 2. **Micro-checkpointing** — three-tier GPU→CPU→NVMe→remote checkpointing
 //! 3. **Elastic resize** — shrink/grow DP dimension without stopping training
 
-pub mod heartbeat;
 pub mod checkpoint;
+pub mod heartbeat;
 pub mod resize;

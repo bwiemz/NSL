@@ -90,7 +90,12 @@ impl SharedMemPipeline {
 impl PipelineBackend for SharedMemPipeline {
     fn send(&self, data: &[u8], dst_rank: usize, tag: i64) -> i64 {
         let mut guard = self.mailboxes.lock().unwrap();
-        guard.insert((dst_rank, tag), Mailbox { data: Some(data.to_vec()) });
+        guard.insert(
+            (dst_rank, tag),
+            Mailbox {
+                data: Some(data.to_vec()),
+            },
+        );
         // Notify all waiters that new data is available
         self.data_ready.notify_all();
         0
@@ -185,7 +190,9 @@ fn serialize_tensor(tensor_ptr: i64) -> Vec<u8> {
 
 /// Deserialize a byte buffer into a new NslTensor. Returns the tensor pointer.
 fn deserialize_tensor(buf: &[u8]) -> i64 {
-    if buf.len() < 11 { return 0; } // minimum: ndim(8) + dtype(2) + device(1)
+    if buf.len() < 11 {
+        return 0;
+    } // minimum: ndim(8) + dtype(2) + device(1)
 
     // Read ndim
     let ndim = i64::from_le_bytes(buf[..8].try_into().unwrap());
@@ -206,9 +213,9 @@ fn deserialize_tensor(buf: &[u8]) -> i64 {
 
     // Use the same element_size logic as NslTensor::element_size()
     let elem_size = match dtype {
-        0 => 8,  // f64
-        1 => 4,  // f32
-        _ => 4,  // conservative default for custom dtypes
+        0 => 8, // f64
+        1 => 4, // f32
+        _ => 4, // conservative default for custom dtypes
     };
     let data_bytes = total_len as usize * elem_size;
     let data_offset = offset + 3;
@@ -273,13 +280,10 @@ pub extern "C" fn nsl_pipeline_init(
 /// `stream`: CUDA stream handle (0 for CPU).
 /// Returns 0 on success.
 #[no_mangle]
-pub extern "C" fn nsl_pipeline_send(
-    tensor_ptr: i64,
-    dst_rank: i64,
-    tag: i64,
-    _stream: i64,
-) -> i64 {
-    if tensor_ptr == 0 { return -1; }
+pub extern "C" fn nsl_pipeline_send(tensor_ptr: i64, dst_rank: i64, tag: i64, _stream: i64) -> i64 {
+    if tensor_ptr == 0 {
+        return -1;
+    }
     let guard = PIPELINE_CTX.lock().unwrap();
     let ctx = match guard.as_ref() {
         Some(c) => c,
@@ -455,9 +459,15 @@ mod tests {
             unsafe { *data.add(i) = (i as f64) * 1.5 };
         }
         let shape = checked_alloc(2 * std::mem::size_of::<i64>()) as *mut i64;
-        unsafe { *shape = 2; *shape.add(1) = 3 };
+        unsafe {
+            *shape = 2;
+            *shape.add(1) = 3
+        };
         let strides = checked_alloc(2 * std::mem::size_of::<i64>()) as *mut i64;
-        unsafe { *strides = 3; *strides.add(1) = 1 };
+        unsafe {
+            *strides = 3;
+            *strides.add(1) = 1
+        };
 
         let tensor = Box::new(NslTensor::new(
             data as *mut c_void,

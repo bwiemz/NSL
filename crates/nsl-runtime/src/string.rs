@@ -180,21 +180,33 @@ pub extern "C" fn nsl_str_find(s: i64, sub: i64) -> i64 {
 pub extern "C" fn nsl_str_startswith(s: i64, prefix: i64) -> i8 {
     let text = unsafe { as_cstr(s) }.to_str().unwrap_or("");
     let pfx = unsafe { as_cstr(prefix) }.to_str().unwrap_or("");
-    if text.starts_with(pfx) { 1 } else { 0 }
+    if text.starts_with(pfx) {
+        1
+    } else {
+        0
+    }
 }
 
 #[no_mangle]
 pub extern "C" fn nsl_str_endswith(s: i64, suffix: i64) -> i8 {
     let text = unsafe { as_cstr(s) }.to_str().unwrap_or("");
     let sfx = unsafe { as_cstr(suffix) }.to_str().unwrap_or("");
-    if text.ends_with(sfx) { 1 } else { 0 }
+    if text.ends_with(sfx) {
+        1
+    } else {
+        0
+    }
 }
 
 #[no_mangle]
 pub extern "C" fn nsl_str_contains(s: i64, sub: i64) -> i8 {
     let text = unsafe { as_cstr(s) }.to_str().unwrap_or("");
     let substr = unsafe { as_cstr(sub) }.to_str().unwrap_or("");
-    if text.contains(substr) { 1 } else { 0 }
+    if text.contains(substr) {
+        1
+    } else {
+        0
+    }
 }
 
 /// Create a NUL-terminated C string from a Rust &str. Returns pointer as i64.
@@ -211,10 +223,14 @@ pub fn nsl_str_from_rust(s: &str) -> i64 {
 /// Used for tokenizer decode return values and other dynamic strings.
 #[no_mangle]
 pub extern "C" fn nsl_string_free(ptr: i64) {
-    if ptr == 0 { return; }
+    if ptr == 0 {
+        return;
+    }
     // Strings are null-terminated C strings allocated via checked_alloc.
     // We need to find the length to free the right amount.
     let cstr = unsafe { CStr::from_ptr(ptr as *const c_char) };
     let len = cstr.to_bytes_with_nul().len();
-    unsafe { crate::memory::checked_free(ptr as *mut u8, len); }
+    unsafe {
+        crate::memory::checked_free(ptr as *mut u8, len);
+    }
 }

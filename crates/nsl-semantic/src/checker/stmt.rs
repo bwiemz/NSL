@@ -10,7 +10,13 @@ impl<'a> TypeChecker<'a> {
                 pattern,
                 type_ann,
                 value,
-            } => self.check_var_decl(*is_const, pattern, type_ann.as_ref(), value.as_ref(), stmt.span),
+            } => self.check_var_decl(
+                *is_const,
+                pattern,
+                type_ann.as_ref(),
+                value.as_ref(),
+                stmt.span,
+            ),
             StmtKind::FnDef(fn_def) => self.check_fn_def(fn_def),
             StmtKind::ModelDef(model_def) => self.check_model_def(model_def),
             StmtKind::StructDef(struct_def) => self.check_struct_def(struct_def),
@@ -46,15 +52,13 @@ impl<'a> TypeChecker<'a> {
                         // Iterating over a tuple: element type is union or first element
                         elems.first().cloned().unwrap_or(Type::Unknown)
                     }
-                    Type::FixedModelArray { element_model, .. } => {
-                        Type::Model {
-                            name: *element_model,
-                            type_params: Vec::new(),
-                            type_args: Vec::new(),
-                            fields: Vec::new(),
-                            methods: Vec::new(),
-                        }
-                    }
+                    Type::FixedModelArray { element_model, .. } => Type::Model {
+                        name: *element_model,
+                        type_params: Vec::new(),
+                        type_args: Vec::new(),
+                        fields: Vec::new(),
+                        methods: Vec::new(),
+                    },
                     _ => Type::Unknown,
                 };
                 let scope = self.scopes.push_scope(self.current_scope, ScopeKind::Loop);
@@ -119,7 +123,8 @@ impl<'a> TypeChecker<'a> {
                             self.diagnostics.push(
                                 Diagnostic::error(format!(
                                     "return type mismatch: expected {}, got {}",
-                                    display_type(expected), display_type(&ty)
+                                    display_type(expected),
+                                    display_type(&ty)
                                 ))
                                 .with_label(expr.span, "wrong type"),
                             );
@@ -174,27 +179,42 @@ impl<'a> TypeChecker<'a> {
                         self.diagnostics.push(
                             Diagnostic::error(format!(
                                 "type mismatch in assignment: expected {}, got {}",
-                                display_type(&target_ty), display_type(&value_ty)
+                                display_type(&target_ty),
+                                display_type(&value_ty)
                             ))
                             .with_label(value.span, "wrong type"),
                         );
                     }
                 } else {
                     // Compound assignment (+=, -=, *=, /=): both sides must be numeric
-                    let is_numeric = |ty: &Type| matches!(ty,
-                        Type::Int | Type::Int64 | Type::Int32 | Type::Int16 | Type::Int8
-                        | Type::Uint8 | Type::Float | Type::F64 | Type::F32
-                        | Type::Tensor { .. } | Type::Unknown
-                    );
+                    let is_numeric = |ty: &Type| {
+                        matches!(
+                            ty,
+                            Type::Int
+                                | Type::Int64
+                                | Type::Int32
+                                | Type::Int16
+                                | Type::Int8
+                                | Type::Uint8
+                                | Type::Float
+                                | Type::F64
+                                | Type::F32
+                                | Type::Tensor { .. }
+                                | Type::Unknown
+                        )
+                    };
                     if (!is_numeric(&target_ty) || !is_numeric(&value_ty))
-                        && !target_ty.is_indeterminate() && !value_ty.is_indeterminate() {
-                            self.diagnostics.push(
-                                Diagnostic::error(format!(
-                                    "invalid operand types for compound assignment: {} and {}",
-                                    display_type(&target_ty), display_type(&value_ty)
-                                ))
-                                .with_label(value.span, "invalid type for compound assignment"),
-                            );
+                        && !target_ty.is_indeterminate()
+                        && !value_ty.is_indeterminate()
+                    {
+                        self.diagnostics.push(
+                            Diagnostic::error(format!(
+                                "invalid operand types for compound assignment: {} and {}",
+                                display_type(&target_ty),
+                                display_type(&value_ty)
+                            ))
+                            .with_label(value.span, "invalid type for compound assignment"),
+                        );
                     }
                 }
             }
@@ -208,7 +228,11 @@ impl<'a> TypeChecker<'a> {
                 // Validate @test decorator constraints
                 for deco in decorators {
                     if deco.name.len() == 1 {
-                        let dname = self.interner.resolve(deco.name[0].0).unwrap_or("").to_string();
+                        let dname = self
+                            .interner
+                            .resolve(deco.name[0].0)
+                            .unwrap_or("")
+                            .to_string();
                         if dname == "test" {
                             // @test must decorate a function
                             if let StmtKind::FnDef(fn_def) = &stmt.kind {
@@ -222,14 +246,18 @@ impl<'a> TypeChecker<'a> {
                                 // @test functions must have no return type
                                 if fn_def.return_type.is_some() {
                                     self.diagnostics.push(
-                                        Diagnostic::error("@test function must not have a return type")
-                                            .with_label(fn_def.span, "has return type"),
+                                        Diagnostic::error(
+                                            "@test function must not have a return type",
+                                        )
+                                        .with_label(fn_def.span, "has return type"),
                                     );
                                 }
                             } else {
                                 self.diagnostics.push(
-                                    Diagnostic::error("@test can only decorate a function definition")
-                                        .with_label(deco.span, "invalid @test target"),
+                                    Diagnostic::error(
+                                        "@test can only decorate a function definition",
+                                    )
+                                    .with_label(deco.span, "invalid @test target"),
                                 );
                             }
                         }
@@ -253,8 +281,10 @@ impl<'a> TypeChecker<'a> {
                                 }
                                 _ => {
                                     self.diagnostics.push(
-                                        Diagnostic::error("@fuse can only be applied to fn declarations")
-                                            .with_label(deco.span, "invalid @fuse target")
+                                        Diagnostic::error(
+                                            "@fuse can only be applied to fn declarations",
+                                        )
+                                        .with_label(deco.span, "invalid @fuse target"),
                                     );
                                 }
                             }
@@ -266,7 +296,8 @@ impl<'a> TypeChecker<'a> {
                                     // Valid target — check for conflicting @fuse on the same fn
                                     let has_fuse = decorators.iter().any(|d| {
                                         d.name.len() == 1
-                                            && self.interner.resolve(d.name[0].0).unwrap_or("") == "fuse"
+                                            && self.interner.resolve(d.name[0].0).unwrap_or("")
+                                                == "fuse"
                                     });
                                     if has_fuse {
                                         self.diagnostics.push(
@@ -277,20 +308,26 @@ impl<'a> TypeChecker<'a> {
                                 }
                                 StmtKind::KernelDef(_) => {
                                     self.diagnostics.push(
-                                        Diagnostic::error("@fuse_graph cannot be applied to kernel blocks")
-                                            .with_label(deco.span, "invalid @fuse_graph target")
+                                        Diagnostic::error(
+                                            "@fuse_graph cannot be applied to kernel blocks",
+                                        )
+                                        .with_label(deco.span, "invalid @fuse_graph target"),
                                     );
                                 }
                                 StmtKind::ModelDef(_) => {
                                     self.diagnostics.push(
-                                        Diagnostic::error("@fuse_graph cannot be applied to model definitions")
-                                            .with_label(deco.span, "invalid @fuse_graph target")
+                                        Diagnostic::error(
+                                            "@fuse_graph cannot be applied to model definitions",
+                                        )
+                                        .with_label(deco.span, "invalid @fuse_graph target"),
                                     );
                                 }
                                 _ => {
                                     self.diagnostics.push(
-                                        Diagnostic::error("@fuse_graph can only be applied to fn declarations")
-                                            .with_label(deco.span, "invalid @fuse_graph target")
+                                        Diagnostic::error(
+                                            "@fuse_graph can only be applied to fn declarations",
+                                        )
+                                        .with_label(deco.span, "invalid @fuse_graph target"),
                                     );
                                 }
                             }
@@ -318,8 +355,10 @@ impl<'a> TypeChecker<'a> {
                                 }
                                 _ => {
                                     self.diagnostics.push(
-                                        Diagnostic::error("@shared can only be applied to let-bindings")
-                                            .with_label(deco.span, "invalid @shared target")
+                                        Diagnostic::error(
+                                            "@shared can only be applied to let-bindings",
+                                        )
+                                        .with_label(deco.span, "invalid @shared target"),
                                     );
                                 }
                             }
@@ -503,10 +542,7 @@ impl<'a> TypeChecker<'a> {
                         // M39: @vmap decorator validation
                         if dname == "vmap" {
                             let resolve = |s: nsl_ast::Symbol| -> String {
-                                self.interner
-                                    .resolve(s.0)
-                                    .unwrap_or("")
-                                    .to_string()
+                                self.interner.resolve(s.0).unwrap_or("").to_string()
                             };
                             crate::vmap::validate_vmap_decorator(
                                 deco,
@@ -524,7 +560,11 @@ impl<'a> TypeChecker<'a> {
                         // M46: @deterministic — register with effect checker for validation
                         if dname == "deterministic" {
                             if let StmtKind::FnDef(fn_def) = &stmt.kind {
-                                let fn_name = self.interner.resolve(fn_def.name.0).unwrap_or("?").to_string();
+                                let fn_name = self
+                                    .interner
+                                    .resolve(fn_def.name.0)
+                                    .unwrap_or("?")
+                                    .to_string();
                                 self.effect_checker.mark_deterministic(&fn_name);
                             }
                         }
@@ -532,7 +572,11 @@ impl<'a> TypeChecker<'a> {
                         // M51: @pure — register with effect checker for validation
                         if dname == "pure" {
                             if let StmtKind::FnDef(fn_def) = &stmt.kind {
-                                let fn_name = self.interner.resolve(fn_def.name.0).unwrap_or("?").to_string();
+                                let fn_name = self
+                                    .interner
+                                    .resolve(fn_def.name.0)
+                                    .unwrap_or("?")
+                                    .to_string();
                                 self.effect_checker.mark_pure(&fn_name);
                             }
                         }
@@ -540,7 +584,11 @@ impl<'a> TypeChecker<'a> {
                         // M51: @checkpoint — register with effect checker (requires @pure)
                         if dname == "checkpoint" {
                             if let StmtKind::FnDef(fn_def) = &stmt.kind {
-                                let fn_name = self.interner.resolve(fn_def.name.0).unwrap_or("?").to_string();
+                                let fn_name = self
+                                    .interner
+                                    .resolve(fn_def.name.0)
+                                    .unwrap_or("?")
+                                    .to_string();
                                 self.effect_checker.mark_checkpointed(&fn_name);
                             }
                         }
@@ -557,9 +605,16 @@ impl<'a> TypeChecker<'a> {
                                     if let Some(ref args) = deco.args {
                                         for arg in args {
                                             if let Some(ref name_sym) = arg.name {
-                                                let aname = self.interner.resolve(name_sym.0).unwrap_or("").to_string();
+                                                let aname = self
+                                                    .interner
+                                                    .resolve(name_sym.0)
+                                                    .unwrap_or("")
+                                                    .to_string();
                                                 if aname == "causal" {
-                                                    if !matches!(arg.value.kind, ExprKind::BoolLiteral(_)) {
+                                                    if !matches!(
+                                                        arg.value.kind,
+                                                        ExprKind::BoolLiteral(_)
+                                                    ) {
                                                         self.diagnostics.push(
                                                             Diagnostic::error("@flash_attention 'causal' argument must be a bool literal")
                                                                 .with_label(arg.span, "expected bool")
@@ -657,19 +712,27 @@ impl<'a> TypeChecker<'a> {
                         if dname == "rope" {
                             // @rope requires @flash_attention on the same function
                             let has_flash = decorators.iter().any(|d| {
-                                d.name.len() == 1 && self.interner.resolve(d.name[0].0).unwrap_or("") == "flash_attention"
+                                d.name.len() == 1
+                                    && self.interner.resolve(d.name[0].0).unwrap_or("")
+                                        == "flash_attention"
                             });
                             if !has_flash {
                                 self.diagnostics.push(
-                                    Diagnostic::error("@rope requires @flash_attention on the same function")
-                                        .with_label(deco.span, "missing @flash_attention")
+                                    Diagnostic::error(
+                                        "@rope requires @flash_attention on the same function",
+                                    )
+                                    .with_label(deco.span, "missing @flash_attention"),
                                 );
                             }
                             // Validate optional args
                             if let Some(ref args) = deco.args {
                                 for arg in args {
                                     if let Some(ref name_sym) = arg.name {
-                                        let aname = self.interner.resolve(name_sym.0).unwrap_or("").to_string();
+                                        let aname = self
+                                            .interner
+                                            .resolve(name_sym.0)
+                                            .unwrap_or("")
+                                            .to_string();
                                         if aname == "style" {
                                             if let ExprKind::StringLiteral(s) = &arg.value.kind {
                                                 if s != "half_split" && s != "adjacent" {
@@ -686,8 +749,11 @@ impl<'a> TypeChecker<'a> {
                                             }
                                         } else {
                                             self.diagnostics.push(
-                                                Diagnostic::error(format!("@rope unknown argument '{}'", aname))
-                                                    .with_label(arg.span, "unknown argument")
+                                                Diagnostic::error(format!(
+                                                    "@rope unknown argument '{}'",
+                                                    aname
+                                                ))
+                                                .with_label(arg.span, "unknown argument"),
                                             );
                                         }
                                     }
@@ -698,12 +764,16 @@ impl<'a> TypeChecker<'a> {
                         if dname == "gqa" {
                             // @gqa requires @flash_attention on the same function
                             let has_flash = decorators.iter().any(|d| {
-                                d.name.len() == 1 && self.interner.resolve(d.name[0].0).unwrap_or("") == "flash_attention"
+                                d.name.len() == 1
+                                    && self.interner.resolve(d.name[0].0).unwrap_or("")
+                                        == "flash_attention"
                             });
                             if !has_flash {
                                 self.diagnostics.push(
-                                    Diagnostic::error("@gqa requires @flash_attention on the same function")
-                                        .with_label(deco.span, "missing @flash_attention")
+                                    Diagnostic::error(
+                                        "@gqa requires @flash_attention on the same function",
+                                    )
+                                    .with_label(deco.span, "missing @flash_attention"),
                                 );
                             }
                             // Validate required 'groups' arg
@@ -711,7 +781,11 @@ impl<'a> TypeChecker<'a> {
                                 let mut found_groups = false;
                                 for arg in args {
                                     if let Some(ref name_sym) = arg.name {
-                                        let aname = self.interner.resolve(name_sym.0).unwrap_or("").to_string();
+                                        let aname = self
+                                            .interner
+                                            .resolve(name_sym.0)
+                                            .unwrap_or("")
+                                            .to_string();
                                         if aname == "groups" {
                                             found_groups = true;
                                             if let ExprKind::IntLiteral(n) = &arg.value.kind {
@@ -729,8 +803,11 @@ impl<'a> TypeChecker<'a> {
                                             }
                                         } else {
                                             self.diagnostics.push(
-                                                Diagnostic::error(format!("@gqa unknown argument '{}'", aname))
-                                                    .with_label(arg.span, "unknown argument")
+                                                Diagnostic::error(format!(
+                                                    "@gqa unknown argument '{}'",
+                                                    aname
+                                                ))
+                                                .with_label(arg.span, "unknown argument"),
                                             );
                                         }
                                     }
@@ -738,13 +815,13 @@ impl<'a> TypeChecker<'a> {
                                 if !found_groups {
                                     self.diagnostics.push(
                                         Diagnostic::error("@gqa requires 'groups' argument")
-                                            .with_label(deco.span, "missing 'groups'")
+                                            .with_label(deco.span, "missing 'groups'"),
                                     );
                                 }
                             } else {
                                 self.diagnostics.push(
                                     Diagnostic::error("@gqa requires 'groups' argument")
-                                        .with_label(deco.span, "missing 'groups'")
+                                        .with_label(deco.span, "missing 'groups'"),
                                 );
                             }
                         }
@@ -756,12 +833,19 @@ impl<'a> TypeChecker<'a> {
                                     if let Some(ref args) = deco.args {
                                         for arg in args {
                                             if let Some(ref name_sym) = arg.name {
-                                                let _aname = self.interner.resolve(name_sym.0).unwrap_or("").to_string();
+                                                let _aname = self
+                                                    .interner
+                                                    .resolve(name_sym.0)
+                                                    .unwrap_or("")
+                                                    .to_string();
                                                 // Each arg value must be a list literal of integers
                                                 match &arg.value.kind {
                                                     ExprKind::ListLiteral(items) => {
                                                         for item in items {
-                                                            if !matches!(item.kind, ExprKind::IntLiteral(_)) {
+                                                            if !matches!(
+                                                                item.kind,
+                                                                ExprKind::IntLiteral(_)
+                                                            ) {
                                                                 self.diagnostics.push(
                                                                     Diagnostic::error("@autotune parameter values must be integer literals")
                                                                         .with_label(item.span, "expected integer")
@@ -780,31 +864,44 @@ impl<'a> TypeChecker<'a> {
                                         }
                                     } else {
                                         self.diagnostics.push(
-                                            Diagnostic::error("@autotune requires at least one tuning parameter")
-                                                .with_label(deco.span, "missing parameters")
+                                            Diagnostic::error(
+                                                "@autotune requires at least one tuning parameter",
+                                            )
+                                            .with_label(deco.span, "missing parameters"),
                                         );
                                     }
                                 }
                                 StmtKind::FnDef(_) => {
                                     // Valid if @flash_attention is also present
                                     let has_flash = decorators.iter().any(|d| {
-                                        d.name.len() == 1 && self.interner.resolve(d.name[0].0).unwrap_or("") == "flash_attention"
+                                        d.name.len() == 1
+                                            && self.interner.resolve(d.name[0].0).unwrap_or("")
+                                                == "flash_attention"
                                     });
                                     if !has_flash {
                                         self.diagnostics.push(
-                                            Diagnostic::error("@autotune on fn requires @flash_attention")
-                                                .with_label(deco.span, "requires @flash_attention")
+                                            Diagnostic::error(
+                                                "@autotune on fn requires @flash_attention",
+                                            )
+                                            .with_label(deco.span, "requires @flash_attention"),
                                         );
                                     } else {
                                         // Validate args same as kernel blocks
                                         if let Some(ref args) = deco.args {
                                             for arg in args {
                                                 if let Some(ref name_sym) = arg.name {
-                                                    let _aname = self.interner.resolve(name_sym.0).unwrap_or("").to_string();
+                                                    let _aname = self
+                                                        .interner
+                                                        .resolve(name_sym.0)
+                                                        .unwrap_or("")
+                                                        .to_string();
                                                     match &arg.value.kind {
                                                         ExprKind::ListLiteral(items) => {
                                                             for item in items {
-                                                                if !matches!(item.kind, ExprKind::IntLiteral(_)) {
+                                                                if !matches!(
+                                                                    item.kind,
+                                                                    ExprKind::IntLiteral(_)
+                                                                ) {
                                                                     self.diagnostics.push(
                                                                         Diagnostic::error("@autotune parameter values must be integer literals")
                                                                             .with_label(item.span, "expected integer")
@@ -859,7 +956,13 @@ impl<'a> TypeChecker<'a> {
                         PatternKind::Tuple(pats) => {
                             for p in pats {
                                 if let PatternKind::Ident(sym) = &p.kind {
-                                    self.declare_symbol(*sym, unknown_tensor.clone(), p.span, false, true);
+                                    self.declare_symbol(
+                                        *sym,
+                                        unknown_tensor.clone(),
+                                        p.span,
+                                        false,
+                                        true,
+                                    );
                                 }
                             }
                         }
@@ -877,12 +980,14 @@ impl<'a> TypeChecker<'a> {
                 {
                     info.ty.clone()
                 } else {
-                    let source_name = self.interner.resolve(quant.source.0).unwrap_or("<unknown>").to_string();
+                    let source_name = self
+                        .interner
+                        .resolve(quant.source.0)
+                        .unwrap_or("<unknown>")
+                        .to_string();
                     self.diagnostics.push(
-                        Diagnostic::error(format!(
-                            "quant source '{source_name}' is not defined"
-                        ))
-                        .with_label(quant.span, "undefined source"),
+                        Diagnostic::error(format!("quant source '{source_name}' is not defined"))
+                            .with_label(quant.span, "undefined source"),
                     );
                     Type::Error
                 };
@@ -892,7 +997,11 @@ impl<'a> TypeChecker<'a> {
                     Type::Model { fields, .. } => fields.clone(),
                     Type::Error | Type::Unknown => Vec::new(),
                     _ => {
-                        let source_name = self.interner.resolve(quant.source.0).unwrap_or("<unknown>").to_string();
+                        let source_name = self
+                            .interner
+                            .resolve(quant.source.0)
+                            .unwrap_or("<unknown>")
+                            .to_string();
                         self.diagnostics.push(
                             Diagnostic::error(format!(
                                 "quant source '{source_name}' is not a model type"
@@ -907,14 +1016,15 @@ impl<'a> TypeChecker<'a> {
                 let excluded_fields: Vec<String> = if !quant.exclude.is_empty() {
                     let field_names: Vec<String> = model_fields
                         .iter()
-                        .map(|(sym, _)| {
-                            self.interner.resolve(sym.0).unwrap_or("").to_string()
-                        })
+                        .map(|(sym, _)| self.interner.resolve(sym.0).unwrap_or("").to_string())
                         .collect();
                     field_names
                         .iter()
                         .filter(|name| {
-                            quant.exclude.iter().any(|pattern| glob_match(pattern, name))
+                            quant
+                                .exclude
+                                .iter()
+                                .any(|pattern| glob_match(pattern, name))
                         })
                         .cloned()
                         .collect()
@@ -925,7 +1035,11 @@ impl<'a> TypeChecker<'a> {
                 // Validate calibration data variable if present
                 if let Some(ref cal) = quant.calibration {
                     if self.scopes.lookup(self.current_scope, cal.data).is_none() {
-                        let data_name = self.interner.resolve(cal.data.0).unwrap_or("<unknown>").to_string();
+                        let data_name = self
+                            .interner
+                            .resolve(cal.data.0)
+                            .unwrap_or("<unknown>")
+                            .to_string();
                         self.diagnostics.push(
                             Diagnostic::error(format!(
                                 "calibration data variable '{data_name}' is not defined"
@@ -969,7 +1083,9 @@ impl<'a> TypeChecker<'a> {
             StmtKind::KernelDef(kernel) => {
                 self.declare_symbol(kernel.name, Type::Unknown, kernel.span, true, false);
                 // Push kernel scope and register params (like fn_def)
-                let scope = self.scopes.push_scope(self.current_scope, ScopeKind::Function);
+                let scope = self
+                    .scopes
+                    .push_scope(self.current_scope, ScopeKind::Function);
                 let prev_scope = self.current_scope;
                 self.current_scope = scope;
                 for param in &kernel.params {
@@ -994,8 +1110,14 @@ impl<'a> TypeChecker<'a> {
                     );
                 }
 
-                let has_pack = def.methods.iter().any(|m| m.kind == DatatypeMethodKind::Pack);
-                let has_unpack = def.methods.iter().any(|m| m.kind == DatatypeMethodKind::Unpack);
+                let has_pack = def
+                    .methods
+                    .iter()
+                    .any(|m| m.kind == DatatypeMethodKind::Pack);
+                let has_unpack = def
+                    .methods
+                    .iter()
+                    .any(|m| m.kind == DatatypeMethodKind::Unpack);
                 if !has_pack {
                     self.diagnostics.push(
                         Diagnostic::error("datatype block must define @pack method")
@@ -1020,15 +1142,24 @@ impl<'a> TypeChecker<'a> {
 
                 let id = DTYPE_CUSTOM_START + self.custom_datatypes.len() as u16;
                 let name = self.interner.resolve(def.name.0).unwrap_or("?").to_string();
-                self.custom_datatypes.insert(name, CustomDtypeSemanticInfo {
-                    dtype_id: id,
-                    bit_width: def.bits.unwrap_or(8),
-                    block_size: def.block_size,
-                    has_pack,
-                    has_unpack,
-                    has_pack_ptx: def.ptx_blocks.iter().any(|b| b.kind == DatatypePtxKind::PackPtx),
-                    has_unpack_ptx: def.ptx_blocks.iter().any(|b| b.kind == DatatypePtxKind::UnpackPtx),
-                });
+                self.custom_datatypes.insert(
+                    name,
+                    CustomDtypeSemanticInfo {
+                        dtype_id: id,
+                        bit_width: def.bits.unwrap_or(8),
+                        block_size: def.block_size,
+                        has_pack,
+                        has_unpack,
+                        has_pack_ptx: def
+                            .ptx_blocks
+                            .iter()
+                            .any(|b| b.kind == DatatypePtxKind::PackPtx),
+                        has_unpack_ptx: def
+                            .ptx_blocks
+                            .iter()
+                            .any(|b| b.kind == DatatypePtxKind::UnpackPtx),
+                    },
+                );
             }
             StmtKind::ServeBlock(serve) => self.check_serve_block(serve),
             // M56: Agent body checking is deferred to Tasks 5–12.
@@ -1046,12 +1177,12 @@ impl<'a> TypeChecker<'a> {
 fn is_model_target(kind: &StmtKind) -> bool {
     match kind {
         StmtKind::ModelDef(_) => true,
-        StmtKind::VarDecl { value: Some(expr), .. } => {
+        StmtKind::VarDecl {
+            value: Some(expr), ..
+        } => {
             matches!(
                 expr.kind,
-                ExprKind::Call { .. }
-                    | ExprKind::Ident(_)
-                    | ExprKind::MemberAccess { .. }
+                ExprKind::Call { .. } | ExprKind::Ident(_) | ExprKind::MemberAccess { .. }
             )
         }
         _ => false,

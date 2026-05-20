@@ -64,7 +64,10 @@ fn save_requirements(op: &PrimalOp) -> SaveRequirements {
             needs_output: false,
         },
         ScaledDotProductAttention { .. } | FlashAttentionBackwardExtract { .. } => {
-            SaveRequirements { needs_inputs: true, needs_output: true }
+            SaveRequirements {
+                needs_inputs: true,
+                needs_output: true,
+            }
         }
         CrossEntropyLoss | MSELoss | L1Loss => SaveRequirements {
             needs_inputs: true,
@@ -187,11 +190,7 @@ fn forward_reachable_from(list: &WengertList, sources: &HashSet<VarId>) -> HashS
 ///                     seed)
 ///
 /// Returns a [`PruneResult`] with the pruned list and live sets.
-pub fn prune(
-    list: &WengertList,
-    trainable: &BTreeSet<VarId>,
-    loss_output: VarId,
-) -> PruneResult {
+pub fn prune(list: &WengertList, trainable: &BTreeSet<VarId>, loss_output: VarId) -> PruneResult {
     // 1. Backward cone: which VarIds contribute to the loss?
     //    Anything not on this set has no adjoint.  (This is the "output-cone".)
     let to_loss = reverse_reachable_from(list, loss_output);

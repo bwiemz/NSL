@@ -228,7 +228,8 @@ fn run_emit_calibration(fixture_dir: &Path, medium_dir: Option<&str>) {
         eprintln!(
             "error: calib_medium.safetensors not found at {}. \
              Run cpdt_fixture_generate --include-medium --output-dir {} first.",
-            medium_path.display(), md
+            medium_path.display(),
+            md
         );
         std::process::exit(2);
     }
@@ -250,9 +251,7 @@ fn run_emit_calibration(fixture_dir: &Path, medium_dir: Option<&str>) {
     }
 
     let (t0, t1, t2) = compute_thresholds(&records);
-    eprintln!(
-        "thresholds: T0 = {t0:.4e}  T1 = {t1:.4e}  T2 = {t2:.4e}"
-    );
+    eprintln!("thresholds: T0 = {t0:.4e}  T1 = {t1:.4e}  T2 = {t2:.4e}");
 
     const MONITORING_THRESHOLD: f64 = 0.20; // spec §5.3
 
@@ -283,7 +282,10 @@ fn run_emit_calibration(fixture_dir: &Path, medium_dir: Option<&str>) {
     for (f, d) in &plateau.per_fixture_disagreement {
         eprintln!("  {f} disagreement at K: {:.4}", d);
     }
-    eprintln!("  corpus-wide disagreement at K: {:.4}", plateau.corpus_disagreement);
+    eprintln!(
+        "  corpus-wide disagreement at K: {:.4}",
+        plateau.corpus_disagreement
+    );
 
     let k = plateau.k;
 
@@ -295,13 +297,14 @@ fn run_emit_calibration(fixture_dir: &Path, medium_dir: Option<&str>) {
     println!("| Band          | s_wp     | wp tier | s_nw     | nw tier | agree |");
     println!("| ------------- | -------- | ------- | -------- | ------- | ----- |");
     for band in &[Band::AttnQkvo, Band::FfnGateUp, Band::FfnDown] {
-        let mut midlayer_records: Vec<&TensorRecord> = records.iter()
-            .filter(|r| !r.overridden
-                && r.band == Some(*band)
-                && (r.pos - 1.0).abs() < 1e-9)
+        let mut midlayer_records: Vec<&TensorRecord> = records
+            .iter()
+            .filter(|r| !r.overridden && r.band == Some(*band) && (r.pos - 1.0).abs() < 1e-9)
             .collect();
         midlayer_records.sort_by(|a, b| a.wp_score.partial_cmp(&b.wp_score).unwrap());
-        if midlayer_records.is_empty() { continue; }
+        if midlayer_records.is_empty() {
+            continue;
+        }
         let median = midlayer_records[midlayer_records.len() / 2];
         let s_wp = median.wp_score;
         let s_nw = k * median.pos / (median.numel.max(1) as f64);
@@ -309,7 +312,12 @@ fn run_emit_calibration(fixture_dir: &Path, medium_dir: Option<&str>) {
         let t_nw = tier_label(s_nw, t0, t1, t2);
         println!(
             "| {:<13} | {:.2e} | {:<7} | {:.2e} | {:<7} | {} |",
-            band.as_str(), s_wp, t_wp, s_nw, t_nw, if t_wp == t_nw { "yes" } else { "no" }
+            band.as_str(),
+            s_wp,
+            t_wp,
+            s_nw,
+            t_nw,
+            if t_wp == t_nw { "yes" } else { "no" }
         );
     }
 
@@ -333,9 +341,21 @@ fn run_emit_calibration(fixture_dir: &Path, medium_dir: Option<&str>) {
 
 fn collect_records(committed_dir: &Path, medium_dir: &Path) -> Vec<TensorRecord> {
     let sources: Vec<(String, std::path::PathBuf, u32)> = vec![
-        ("calib_tiny".to_string(),   committed_dir.join("calib_tiny.safetensors"),   2),
-        ("calib_small".to_string(),  committed_dir.join("calib_small.safetensors"),  8),
-        ("calib_medium".to_string(), medium_dir.join("calib_medium.safetensors"),   16),
+        (
+            "calib_tiny".to_string(),
+            committed_dir.join("calib_tiny.safetensors"),
+            2,
+        ),
+        (
+            "calib_small".to_string(),
+            committed_dir.join("calib_small.safetensors"),
+            8,
+        ),
+        (
+            "calib_medium".to_string(),
+            medium_dir.join("calib_medium.safetensors"),
+            16,
+        ),
     ];
 
     let mut out = Vec::new();
@@ -371,7 +391,9 @@ fn collect_records(committed_dir: &Path, medium_dir: &Path) -> Vec<TensorRecord>
 }
 
 fn geomean(xs: &[f64]) -> f64 {
-    if xs.is_empty() { return 0.0; }
+    if xs.is_empty() {
+        return 0.0;
+    }
     let logs: f64 = xs.iter().map(|x| x.max(1e-300).ln()).sum();
     (logs / xs.len() as f64).exp()
 }
@@ -384,11 +406,15 @@ struct BandStats {
     n: usize,
 }
 
-fn band_stats_per_fixture(records: &[TensorRecord]) -> std::collections::BTreeMap<(String, Band), BandStats> {
+fn band_stats_per_fixture(
+    records: &[TensorRecord],
+) -> std::collections::BTreeMap<(String, Band), BandStats> {
     use std::collections::BTreeMap;
     let mut buckets: BTreeMap<(String, Band), Vec<f64>> = BTreeMap::new();
     for r in records {
-        if r.overridden { continue; }
+        if r.overridden {
+            continue;
+        }
         if let Some(b) = r.band {
             buckets
                 .entry((r.fixture.clone(), b))
@@ -396,12 +422,23 @@ fn band_stats_per_fixture(records: &[TensorRecord]) -> std::collections::BTreeMa
                 .push(r.wp_score);
         }
     }
-    buckets.into_iter().map(|(k, vs)| {
-        let mn = vs.iter().cloned().fold(f64::INFINITY, f64::min);
-        let mx = vs.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-        let gm = geomean(&vs);
-        (k, BandStats { min: mn, max: mx, geomean: gm, n: vs.len() })
-    }).collect()
+    buckets
+        .into_iter()
+        .map(|(k, vs)| {
+            let mn = vs.iter().cloned().fold(f64::INFINITY, f64::min);
+            let mx = vs.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            let gm = geomean(&vs);
+            (
+                k,
+                BandStats {
+                    min: mn,
+                    max: mx,
+                    geomean: gm,
+                    n: vs.len(),
+                },
+            )
+        })
+        .collect()
 }
 
 /// Enforce attn_qkvo > ffn_gate_up > ffn_down by band geomean on every fixture
@@ -416,7 +453,9 @@ fn verify_ordering(
         let a = stats.get(&(fixture.clone(), Band::AttnQkvo));
         let g = stats.get(&(fixture.clone(), Band::FfnGateUp));
         let d = stats.get(&(fixture.clone(), Band::FfnDown));
-        let (Some(a), Some(g), Some(d)) = (a, g, d) else { continue; };
+        let (Some(a), Some(g), Some(d)) = (a, g, d) else {
+            continue;
+        };
         if !(a.geomean > g.geomean && g.geomean > d.geomean) {
             return Err(format!(
                 "band ordering violated on {fixture}: \
@@ -429,15 +468,15 @@ fn verify_ordering(
     Ok(())
 }
 
-fn compute_thresholds(
-    records: &[TensorRecord],
-) -> (f64, f64, f64) {
+fn compute_thresholds(records: &[TensorRecord]) -> (f64, f64, f64) {
     // Pool generic scores across fixtures per band.
     let mut attn: Vec<f64> = Vec::new();
     let mut gate_up: Vec<f64> = Vec::new();
     let mut down: Vec<f64> = Vec::new();
     for r in records {
-        if r.overridden { continue; }
+        if r.overridden {
+            continue;
+        }
         match r.band {
             Some(Band::AttnQkvo) => attn.push(r.wp_score),
             Some(Band::FfnGateUp) => gate_up.push(r.wp_score),
@@ -460,10 +499,21 @@ fn compute_thresholds(
 /// Tier discriminator: u8 for equality comparison without depending on Tier's Hash.
 #[inline]
 fn tier_of_u8(score: f64, t0: f64, t1: f64, t2: f64) -> u8 {
-    if score > t0 { 3 }       // High
-    else if score > t1 { 2 }  // Medium
-    else if score > t2 { 1 }  // Low
-    else { 0 }                // VeryLow
+    if score > t0 {
+        3
+    }
+    // High
+    else if score > t1 {
+        2
+    }
+    // Medium
+    else if score > t2 {
+        1
+    }
+    // Low
+    else {
+        0
+    } // VeryLow
 }
 
 /// Per-fixture parameter-weighted disagreement at a given K.
@@ -481,10 +531,16 @@ fn disagreement_per_fixture(
     let mut total: u64 = 0;
     let mut disagree: u64 = 0;
     for r in records {
-        if r.fixture != fixture { continue; }
-        if r.numel == 0 { continue; }
+        if r.fixture != fixture {
+            continue;
+        }
+        if r.numel == 0 {
+            continue;
+        }
         total += r.numel as u64;
-        if r.overridden { continue; }
+        if r.overridden {
+            continue;
+        }
         let s_nw = k * r.pos / (r.numel.max(1) as f64);
         let t_wp = tier_of_u8(r.wp_score, t0, t1, t2);
         let t_nw = tier_of_u8(s_nw, t0, t1, t2);
@@ -492,7 +548,11 @@ fn disagreement_per_fixture(
             disagree += r.numel as u64;
         }
     }
-    if total == 0 { 0.0 } else { disagree as f64 / total as f64 }
+    if total == 0 {
+        0.0
+    } else {
+        disagree as f64 / total as f64
+    }
 }
 
 /// Corpus-wide disagreement (pooled across all fixtures in `records`).
@@ -500,9 +560,13 @@ fn disagreement_corpus(records: &[TensorRecord], k: f64, t0: f64, t1: f64, t2: f
     let mut total: u64 = 0;
     let mut disagree: u64 = 0;
     for r in records {
-        if r.numel == 0 { continue; }
+        if r.numel == 0 {
+            continue;
+        }
         total += r.numel as u64;
-        if r.overridden { continue; }
+        if r.overridden {
+            continue;
+        }
         let s_nw = k * r.pos / (r.numel.max(1) as f64);
         let t_wp = tier_of_u8(r.wp_score, t0, t1, t2);
         let t_nw = tier_of_u8(s_nw, t0, t1, t2);
@@ -510,7 +574,11 @@ fn disagreement_corpus(records: &[TensorRecord], k: f64, t0: f64, t1: f64, t2: f
             disagree += r.numel as u64;
         }
     }
-    if total == 0 { 0.0 } else { disagree as f64 / total as f64 }
+    if total == 0 {
+        0.0
+    } else {
+        disagree as f64 / total as f64
+    }
 }
 
 /// Plateau-midpoint-under-per-fixture-constraint selector.
@@ -545,9 +613,9 @@ fn select_calib_k_by_plateau(
         records.iter().map(|r| r.fixture.clone()).collect();
     let mut feasible: Vec<bool> = Vec::with_capacity(N_POINTS);
     for &k in &grid {
-        let ok = fixtures.iter().all(|f| {
-            disagreement_per_fixture(records, f, k, t0, t1, t2) <= monitoring_threshold
-        });
+        let ok = fixtures
+            .iter()
+            .all(|f| disagreement_per_fixture(records, f, k, t0, t1, t2) <= monitoring_threshold);
         feasible.push(ok);
     }
 
@@ -557,7 +625,9 @@ fn select_calib_k_by_plateau(
     let mut cur_lo: Option<usize> = None;
     for (i, &ok) in feasible.iter().enumerate() {
         if ok {
-            if cur_lo.is_none() { cur_lo = Some(i); }
+            if cur_lo.is_none() {
+                cur_lo = Some(i);
+            }
             let lo = cur_lo.unwrap();
             let run_len = i - lo + 1;
             let best_len = match (best_lo, best_hi) {
@@ -632,10 +702,15 @@ struct PlateauError {
 }
 
 fn tier_label(score: f64, t0: f64, t1: f64, t2: f64) -> &'static str {
-    if score > t0 { "high" }
-    else if score > t1 { "medium" }
-    else if score > t2 { "low" }
-    else { "very_low" }
+    if score > t0 {
+        "high"
+    } else if score > t1 {
+        "medium"
+    } else if score > t2 {
+        "low"
+    } else {
+        "very_low"
+    }
 }
 
 fn infer_config_from_fixture(fixture: &str) -> PrecisionConfig {

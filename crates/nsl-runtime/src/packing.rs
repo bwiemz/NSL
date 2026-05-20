@@ -5,10 +5,10 @@
 
 use std::ffi::c_void;
 
-use crate::cpu::{create_tensor_with_shape_rs_dtype};
+use crate::cpu::create_tensor_with_shape_rs_dtype;
 use crate::dict::{nsl_dict_new, nsl_dict_set_str};
 use crate::string::nsl_str_from_rust;
-use crate::tensor::{DTYPE_U16_SEGMENT, DTYPE_U16_TOKEN, NslTensor};
+use crate::tensor::{NslTensor, DTYPE_U16_SEGMENT, DTYPE_U16_TOKEN};
 
 /// Maximum number of documents per packed batch.
 ///
@@ -30,10 +30,10 @@ pub const MAX_NUM_DOCS: usize = 256;
 
 /// A packed batch of token sequences with attention mask.
 pub struct PackedBatch {
-    pub input_ids:   Vec<i64>,
-    pub labels:      Vec<i64>,
-    pub mask:        Vec<f32>,   // retained through Task 7b
-    pub segment_ids: Vec<u16>,   // spec §3.5 — new, additive
+    pub input_ids: Vec<i64>,
+    pub labels: Vec<i64>,
+    pub mask: Vec<f32>,        // retained through Task 7b
+    pub segment_ids: Vec<u16>, // spec §3.5 — new, additive
     /// PCA §4.3 RoPE position-reset table, sibling to `segment_ids`.
     ///
     /// **Per-row layout** (spec v3, commit `2b8df4e6`): flat length
@@ -49,9 +49,9 @@ pub struct PackedBatch {
     /// `doc_starts[batch_idx * 257 + segment_ids[idx]]` (handled in T6
     /// CTA prologue). A flat single-table layout would collapse all rows'
     /// document boundaries into row 0's positions.
-    pub doc_starts:  Vec<i32>,
-    pub batch_size:  usize,
-    pub seq_len:     usize,
+    pub doc_starts: Vec<i32>,
+    pub batch_size: usize,
+    pub seq_len: usize,
 }
 
 /// Pack one batch from a continuous token stream.
@@ -380,9 +380,9 @@ mod tests {
             stream.len(),
             0,
             &mut cursor,
-            2,  // batch_size
-            4,  // seq_len
-            0,  // eos_token
+            2, // batch_size
+            4, // seq_len
+            0, // eos_token
         )
         .expect("should produce a batch");
 
@@ -412,9 +412,9 @@ mod tests {
             stream.len(),
             0,
             &mut cursor,
-            1,  // batch_size
-            4,  // seq_len
-            0,  // eos_token
+            1, // batch_size
+            4, // seq_len
+            0, // eos_token
         )
         .expect("should produce a batch");
 
@@ -448,8 +448,8 @@ mod tests {
             stream.len(),
             0,
             &mut cursor,
-            1,  // batch_size
-            4,  // seq_len (needs 4 tokens, only 3 available)
+            1, // batch_size
+            4, // seq_len (needs 4 tokens, only 3 available)
             0,
         );
 
@@ -489,11 +489,11 @@ mod tests {
         let batch = pack_batch(
             stream.as_ptr() as *const c_void,
             stream.len(),
-            0,           // DTYPE_F64
+            0, // DTYPE_F64
             &mut cursor,
-            1,           // batch_size
-            8,           // seq_len
-            2,           // eos_token
+            1, // batch_size
+            8, // seq_len
+            2, // eos_token
         )
         .expect("pack_batch produced a batch");
 
@@ -512,7 +512,7 @@ mod tests {
             &mut cursor,
             1,
             8,
-            255,         // EOS token that never appears in the stream
+            255, // EOS token that never appears in the stream
         )
         .expect("pack_batch produced a batch");
 
@@ -552,11 +552,11 @@ mod tests {
         let batch = pack_batch(
             stream.as_ptr() as *const c_void,
             stream.len(),
-            0,               // DTYPE_F64
+            0, // DTYPE_F64
             &mut cursor,
-            1,               // batch_size
-            4,               // seq_len
-            2,               // eos_token
+            1, // batch_size
+            4, // seq_len
+            2, // eos_token
         )
         .expect("pack_batch produced a batch");
 
@@ -608,8 +608,8 @@ mod tests {
             stream.len(),
             0,
             &mut cursor,
-            1,  // batch_size
-            4,  // seq_len
+            1, // batch_size
+            4, // seq_len
             0,
         )
         .expect("should produce a batch");
@@ -642,19 +642,19 @@ mod tests {
         //   doc C: [30, 31, 32, 33]                 (local positions 5..9)
         // No trailing EOS — last segment runs to the end of the pack.
         let stream: Vec<f64> = vec![
-            10.0, 11.0, 2.0,       // doc A — len 3, ends with EOS at pos 2
-            20.0, 2.0,             // doc B — len 2, ends with EOS at pos 4
-            30.0, 31.0, 32.0, 33.0 // doc C — len 4, no trailing EOS
+            10.0, 11.0, 2.0, // doc A — len 3, ends with EOS at pos 2
+            20.0, 2.0, // doc B — len 2, ends with EOS at pos 4
+            30.0, 31.0, 32.0, 33.0, // doc C — len 4, no trailing EOS
         ];
         let mut cursor: usize = 0;
         let batch = pack_batch(
             stream.as_ptr() as *const c_void,
             stream.len(),
-            0,                // DTYPE_F64
+            0, // DTYPE_F64
             &mut cursor,
-            1,                // batch_size — single-row case
-            9,                // seq_len
-            2,                // eos_token
+            1, // batch_size — single-row case
+            9, // seq_len
+            2, // eos_token
         )
         .expect("pack_batch produced a batch");
 
@@ -675,13 +675,22 @@ mod tests {
         // Row 0 subtable: cumulative starts of docs 0, 1, 2 (row-local positions).
         // For batch_size=1 row-local positions coincide with the absolute pack
         // positions, so 9 == 3 + 2 + 4 still falls out cleanly.
-        assert_eq!(batch.doc_starts[0], 0,  "row 0 doc 0 begins at local position 0");
-        assert_eq!(batch.doc_starts[1], 3,  "row 0 doc 1 begins after doc A (len 3) including its EOS");
-        assert_eq!(batch.doc_starts[2], 5,  "row 0 doc 2 begins after doc A + doc B (len 3+2)");
+        assert_eq!(
+            batch.doc_starts[0], 0,
+            "row 0 doc 0 begins at local position 0"
+        );
+        assert_eq!(
+            batch.doc_starts[1], 3,
+            "row 0 doc 1 begins after doc A (len 3) including its EOS"
+        );
+        assert_eq!(
+            batch.doc_starts[2], 5,
+            "row 0 doc 2 begins after doc A + doc B (len 3+2)"
+        );
 
         // Slots 3..=256 are unused — sentinel -1 lets the kernel emit a
         // constant-size SMEM load independent of runtime num_docs.
-        assert_eq!(batch.doc_starts[3],   -1, "first unused slot");
+        assert_eq!(batch.doc_starts[3], -1, "first unused slot");
         assert_eq!(batch.doc_starts[100], -1);
         assert_eq!(batch.doc_starts[256], -1, "last slot");
 
@@ -701,7 +710,10 @@ mod tests {
         assert!(ds_ptr != 0, "doc_starts must be present in the batch dict");
 
         let ds_tensor = NslTensor::from_ptr(ds_ptr);
-        assert_eq!(ds_tensor.ndim, 2, "doc_starts is 2-D [batch_size, MAX_NUM_DOCS+1]");
+        assert_eq!(
+            ds_tensor.ndim, 2,
+            "doc_starts is 2-D [batch_size, MAX_NUM_DOCS+1]"
+        );
         unsafe {
             assert_eq!(*ds_tensor.shape.add(0), 1, "single-row batch");
             assert_eq!(*ds_tensor.shape.add(1), (MAX_NUM_DOCS + 1) as i64);
@@ -770,11 +782,11 @@ mod tests {
         let batch = pack_batch(
             stream.as_ptr() as *const c_void,
             stream.len(),
-            0,         // DTYPE_F64
+            0, // DTYPE_F64
             &mut cursor,
-            2,         // batch_size — the point of this test
-            6,         // seq_len
-            2,         // eos_token
+            2, // batch_size — the point of this test
+            6, // seq_len
+            2, // eos_token
         )
         .expect("pack_batch produced a batch");
 
@@ -783,7 +795,7 @@ mod tests {
         // Row 1: EOS at local pos 4 → segment_ids = [0,0,0,0,0,1]
         assert_eq!(
             batch.segment_ids,
-            vec![0u16, 0, 0, 1, 1, 1,  0, 0, 0, 0, 0, 1],
+            vec![0u16, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 1],
             "segment_ids must reset to 0 at each new batch row"
         );
 
@@ -792,16 +804,40 @@ mod tests {
         assert_eq!(batch.doc_starts.len(), 2 * 257);
 
         // Row 0 subtable lives at offset 0..257.
-        assert_eq!(batch.doc_starts[0 * 257 + 0], 0, "row 0 doc 0 starts at local pos 0");
-        assert_eq!(batch.doc_starts[0 * 257 + 1], 3, "row 0 doc 1 starts at local pos 3 (after EOS)");
-        assert_eq!(batch.doc_starts[0 * 257 + 2], -1, "row 0 has only 2 docs; slot 2 is sentinel");
+        assert_eq!(
+            batch.doc_starts[0 * 257 + 0],
+            0,
+            "row 0 doc 0 starts at local pos 0"
+        );
+        assert_eq!(
+            batch.doc_starts[0 * 257 + 1],
+            3,
+            "row 0 doc 1 starts at local pos 3 (after EOS)"
+        );
+        assert_eq!(
+            batch.doc_starts[0 * 257 + 2],
+            -1,
+            "row 0 has only 2 docs; slot 2 is sentinel"
+        );
         assert_eq!(batch.doc_starts[0 * 257 + 256], -1, "row 0 last sentinel");
 
         // Row 1 subtable lives at offset 257..514 — *independent* of row 0.
         // Note row 1 doc 1 starts at LOCAL pos 5, not flat pos 11.
-        assert_eq!(batch.doc_starts[1 * 257 + 0], 0, "row 1 doc 0 starts at local pos 0 (row-local!)");
-        assert_eq!(batch.doc_starts[1 * 257 + 1], 5, "row 1 doc 1 starts at local pos 5 (row-local!)");
-        assert_eq!(batch.doc_starts[1 * 257 + 2], -1, "row 1 has only 2 docs; slot 2 is sentinel");
+        assert_eq!(
+            batch.doc_starts[1 * 257 + 0],
+            0,
+            "row 1 doc 0 starts at local pos 0 (row-local!)"
+        );
+        assert_eq!(
+            batch.doc_starts[1 * 257 + 1],
+            5,
+            "row 1 doc 1 starts at local pos 5 (row-local!)"
+        );
+        assert_eq!(
+            batch.doc_starts[1 * 257 + 2],
+            -1,
+            "row 1 has only 2 docs; slot 2 is sentinel"
+        );
         assert_eq!(batch.doc_starts[1 * 257 + 256], -1, "row 1 last sentinel");
 
         // End-to-end: packed_batch_to_dict emits a [batch_size, MAX_NUM_DOCS+1]
@@ -811,10 +847,17 @@ mod tests {
         let ds_ptr = crate::dict::nsl_dict_get_str(dict, k_ds);
         crate::string::nsl_string_free(k_ds);
         let ds_tensor = NslTensor::from_ptr(ds_ptr);
-        assert_eq!(ds_tensor.ndim, 2, "doc_starts is now 2-D [batch_size, MAX_NUM_DOCS+1]");
+        assert_eq!(
+            ds_tensor.ndim, 2,
+            "doc_starts is now 2-D [batch_size, MAX_NUM_DOCS+1]"
+        );
         unsafe {
             assert_eq!(*ds_tensor.shape.add(0), 2, "batch_size dim");
-            assert_eq!(*ds_tensor.shape.add(1), (MAX_NUM_DOCS + 1) as i64, "per-row table dim");
+            assert_eq!(
+                *ds_tensor.shape.add(1),
+                (MAX_NUM_DOCS + 1) as i64,
+                "per-row table dim"
+            );
         }
         let ds_data = ds_tensor.data_f32();
         unsafe {

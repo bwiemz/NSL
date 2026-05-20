@@ -111,9 +111,7 @@ impl<'a> CalibCtx<'a> {
     ///
     /// Use `per_head_dot_call_count()` and `layout_map_build_count()` after calling
     /// `emit_per_step` to verify the hook iterated correctly.
-    pub fn stub_for_tests_with_grad_layout(
-        entries: &[(&str, u32, u32)],
-    ) -> Self {
+    pub fn stub_for_tests_with_grad_layout(entries: &[(&str, u32, u32)]) -> Self {
         use crate::calibration::retention::GradArenaLayout;
         let layout_entries = entries
             .iter()
@@ -154,7 +152,12 @@ impl<'a> CalibCtx<'a> {
         &self
             .retention
             .get(r)
-            .unwrap_or_else(|| panic!("projection {} not in retention table (missing from requires()?)", r.0))
+            .unwrap_or_else(|| {
+                panic!(
+                    "projection {} not in retention table (missing from requires()?)",
+                    r.0
+                )
+            })
             .shape
             .dims
     }
@@ -175,7 +178,10 @@ impl<'a> CalibCtx<'a> {
 
     /// Read back a running buffer's final values during emit_finalize.
     pub fn finalize_read(&self, h: BufferHandle) -> Vec<f32> {
-        self.running_buffers.get(&h).expect("unknown BufferHandle").clone()
+        self.running_buffers
+            .get(&h)
+            .expect("unknown BufferHandle")
+            .clone()
     }
 
     // ---- stub-mode helpers (test-only) ------------------------------
@@ -189,7 +195,10 @@ impl<'a> CalibCtx<'a> {
     /// Test-only: inject a buffer's final state, bypassing the
     /// reduction loop.
     pub fn stub_set_buffer(&mut self, h: BufferHandle, values: Vec<f32>) {
-        let buf = self.running_buffers.get_mut(&h).expect("unknown BufferHandle");
+        let buf = self
+            .running_buffers
+            .get_mut(&h)
+            .expect("unknown BufferHandle");
         assert_eq!(buf.len(), values.len());
         *buf = values;
     }
@@ -197,8 +206,15 @@ impl<'a> CalibCtx<'a> {
     /// Test-only: apply the running-max-abs reduction over a concrete
     /// slice.  Simulates what `running_max_abs` will do at IR level.
     pub fn stub_running_max_abs(&mut self, h: BufferHandle, src: &[f32]) {
-        let buf = self.running_buffers.get_mut(&h).expect("unknown BufferHandle");
-        assert_eq!(buf.len(), src.len(), "src length mismatch for running_max_abs");
+        let buf = self
+            .running_buffers
+            .get_mut(&h)
+            .expect("unknown BufferHandle");
+        assert_eq!(
+            buf.len(),
+            src.len(),
+            "src length mismatch for running_max_abs"
+        );
         for (b, v) in buf.iter_mut().zip(src.iter()) {
             *b = b.max(v.abs());
         }
@@ -214,7 +230,8 @@ impl<'a> CalibCtx<'a> {
     /// Named `stub_set_arena_buffer` to distinguish from the handle-based
     /// `stub_set_buffer` used for running-max buffers.
     pub fn stub_set_arena_buffer(&mut self, name: &str, values: &[f32]) {
-        self.stub_arena_data.insert(name.to_string(), values.to_vec());
+        self.stub_arena_data
+            .insert(name.to_string(), values.to_vec());
     }
 
     /// Stub-mode: read back the running-max-abs vector for a named projection.
@@ -258,10 +275,12 @@ impl<'a> CalibCtx<'a> {
     /// Returns `Some(BssGlobalEntry)` when the symbol was previously declared
     /// via [`declare_bss_global`], or `None` if it was never declared.
     pub fn lookup_bss_global(&self, symbol: &str) -> Option<BssGlobalEntry> {
-        self.bss_globals.get(symbol).map(|&size_bytes| BssGlobalEntry {
-            name: symbol.to_string(),
-            size_bytes,
-        })
+        self.bss_globals
+            .get(symbol)
+            .map(|&size_bytes| BssGlobalEntry {
+                name: symbol.to_string(),
+                size_bytes,
+            })
     }
 
     // ---- Task 21: grad-arena layout + per-step instrumentation ---------------
@@ -315,7 +334,8 @@ impl<'a> CalibCtx<'a> {
     /// populates the per-head scores via a different code path.
     #[cfg(test)]
     pub fn set_running_buffer_f64(&mut self, symbol: &str, values: &[f64]) {
-        self.running_buffers_f64.insert(symbol.to_string(), values.to_vec());
+        self.running_buffers_f64
+            .insert(symbol.to_string(), values.to_vec());
     }
 
     /// Read back a named f64 running buffer and cast each element to f32.
@@ -404,7 +424,11 @@ impl<'a> CalibCtx<'a> {
         // ── Stub path (unit tests only) ─────────────────────────────────────
         // The real IR path is in binary_codegen::emit_2d_max_abs_loop.
         {
-            let src = self.stub_arena_data.get(src_name).cloned().unwrap_or_default();
+            let src = self
+                .stub_arena_data
+                .get(src_name)
+                .cloned()
+                .unwrap_or_default();
             let buf = self
                 .running_buffers
                 .get_mut(&running)
@@ -446,7 +470,10 @@ mod tests {
     fn projection_input_shape_returns_registered_shape() {
         let table = table_with("p", vec![2, 8, 16]);
         let ctx = CalibCtx::for_tests(&table);
-        assert_eq!(ctx.projection_input_shape(&ProjectionRef::new("p")), &[2u64, 8, 16][..]);
+        assert_eq!(
+            ctx.projection_input_shape(&ProjectionRef::new("p")),
+            &[2u64, 8, 16][..]
+        );
     }
 
     #[test]
@@ -553,7 +580,9 @@ pub(crate) fn emit_running_max_abs_f32(
 #[cfg(test)]
 mod ir_tests {
     use super::emit_running_max_abs_f32;
-    use cranelift_codegen::ir::{types as cl_types, AbiParam, InstBuilder, Function, UserFuncName, Signature};
+    use cranelift_codegen::ir::{
+        types as cl_types, AbiParam, Function, InstBuilder, Signature, UserFuncName,
+    };
     use cranelift_codegen::isa::CallConv;
     use cranelift_codegen::settings;
     use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};

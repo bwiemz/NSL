@@ -75,10 +75,10 @@ fn assemble_ptx(ptxas_path: &str, ptx_bytes: &[u8], sm_arch: &str) -> Result<(),
         .args([
             "--gpu-name",
             sm_arch,
-            "-O0",      // skip optimisation — focus on syntactic validation
+            "-O0", // skip optimisation — focus on syntactic validation
             "-o",
-            "-",        // cubin to stdout (discarded via `Stdio::null`)
-            "-",        // read PTX from stdin
+            "-", // cubin to stdout (discarded via `Stdio::null`)
+            "-", // read PTX from stdin
         ])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -120,7 +120,9 @@ fn csha_l2_rope_config() -> FlashAttentionConfig {
         rope_style: RopeStyle::HalfSplit,
         gqa_group_size: 1,
         tree_mask: false,
-        gpu_sm: 120, segment_masked: false, csha: Some(CshaExtras::level2(1e-5, 32)),
+        gpu_sm: 120,
+        segment_masked: false,
+        csha: Some(CshaExtras::level2(1e-5, 32)),
     }
 }
 
@@ -135,7 +137,9 @@ fn non_csha_config() -> FlashAttentionConfig {
         rope_style: RopeStyle::HalfSplit,
         gqa_group_size: 1,
         tree_mask: false,
-        gpu_sm: 120, segment_masked: false, csha: None,
+        gpu_sm: 120,
+        segment_masked: false,
+        csha: None,
     }
 }
 
@@ -169,47 +173,68 @@ fn non_csha_ptx_assembles_on_sm120() {
 #[ignore = "requires ptxas in PATH"]
 fn v2_kernel_assembles_on_sm75_full_matrix() {
     let Some(ptxas) = find_ptxas() else {
-        eprintln!("skipping: ptxas not found"); return;
+        eprintln!("skipping: ptxas not found");
+        return;
     };
-    use nsl_codegen::flash_attention_v2::synthesize_flash_attention_ptx_v2;
     use nsl_codegen::flash_attention_v2::smem_layout::{validate_scalar_v2_config, Direction};
+    use nsl_codegen::flash_attention_v2::synthesize_flash_attention_ptx_v2;
 
     let base = FlashAttentionConfig {
-        block_q: 32, block_kv: 32, head_dim: 32,
-        causal: false, paged: false, rope_q: false,
-        rope_style: RopeStyle::HalfSplit, gqa_group_size: 1,
-        tree_mask: false, gpu_sm: 75, segment_masked: false, csha: None,
+        block_q: 32,
+        block_kv: 32,
+        head_dim: 32,
+        causal: false,
+        paged: false,
+        rope_q: false,
+        rope_style: RopeStyle::HalfSplit,
+        gqa_group_size: 1,
+        tree_mask: false,
+        gpu_sm: 75,
+        segment_masked: false,
+        csha: None,
     };
 
     // Subset of the supported matrix that exercises the corners.
     let matrix: &[(i64, i64, i64)] = &[
-        (4,   32,  32),
-        (32,  32,  32),
-        (64,  64,  128),
-        (16,  16,  64),
+        (4, 32, 32),
+        (32, 32, 32),
+        (64, 64, 128),
+        (16, 16, 64),
         (128, 128, 128),
     ];
 
     let mut failures = Vec::new();
     for &(bq, bkv, hd) in matrix {
-        let c = FlashAttentionConfig { block_q: bq, block_kv: bkv, head_dim: hd, ..base.clone() };
-        if validate_scalar_v2_config(&c, Direction::Forward).is_err() { continue; }
+        let c = FlashAttentionConfig {
+            block_q: bq,
+            block_kv: bkv,
+            head_dim: hd,
+            ..base.clone()
+        };
+        if validate_scalar_v2_config(&c, Direction::Forward).is_err() {
+            continue;
+        }
         let ptx = synthesize_flash_attention_ptx_v2(&c);
         // Drop trailing NUL for file write; ptxas wants text input.
         let text_end = ptx.iter().position(|&b| b == 0).unwrap_or(ptx.len());
-        let dump = std::env::temp_dir()
-            .join(format!("v2_{}x{}x{}.ptx", bq, bkv, hd));
+        let dump = std::env::temp_dir().join(format!("v2_{}x{}x{}.ptx", bq, bkv, hd));
         std::fs::write(&dump, &ptx[..text_end]).ok();
         if let Err(stderr) = assemble_ptx(&ptxas, &ptx[..text_end], "sm_75") {
             failures.push(format!(
                 "v2 PTX {}x{}x{} failed to assemble (dump: {}):\n{}",
-                bq, bkv, hd, dump.display(), stderr
+                bq,
+                bkv,
+                hd,
+                dump.display(),
+                stderr
             ));
         }
     }
-    assert!(failures.is_empty(),
+    assert!(
+        failures.is_empty(),
         "v2 ptxas assembly failures:\n\n{}",
-        failures.join("\n---\n"));
+        failures.join("\n---\n")
+    );
 }
 
 /// The headline Tier A validation: the CSHA L2 + RoPE kernel variant
@@ -275,18 +300,12 @@ fn csha_l2_rope_ptx_assembles_on_sm120() {
 #[test]
 fn a1_gpu_sm_matches_compile_target() {
     // (compile target string, expected gpu_sm value)
-    let cases: &[(&str, u32)] = &[
-        ("sm_75",  75),
-        ("sm_80",  80),
-        ("sm_90",  90),
-        ("sm_120", 120),
-    ];
+    let cases: &[(&str, u32)] = &[("sm_75", 75), ("sm_80", 80), ("sm_90", 90), ("sm_120", 120)];
 
     for &(sm, expected_gpu_sm) in cases {
         let gpu_sm = nsl_codegen::test_helpers::flash_sm_for_compile_target(sm);
         assert_eq!(
-            gpu_sm,
-            expected_gpu_sm,
+            gpu_sm, expected_gpu_sm,
             "a1 [{sm}]: compile_options.target should flow into gpu_sm={expected_gpu_sm}, \
              got gpu_sm={gpu_sm} — check the three parse_gpu_sm_from_target call-sites \
              in compiler/kernel.rs (~line 638, ~690, ~756)"
@@ -323,7 +342,9 @@ fn a3_v2_fused_projections_assembles_on_sm75_sm90_sm120() {
         rope_style: RopeStyle::HalfSplit,
         gqa_group_size: 1,
         tree_mask: false,
-        gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras {
+        gpu_sm: 75,
+        segment_masked: false,
+        csha: Some(CshaExtras {
             fused_projections: true,
             d_model: 128,
             ..CshaExtras::default()
@@ -392,7 +413,9 @@ fn a4_v2_rope_q_fused_projections_assembles_on_sm75_sm90_sm120() {
         rope_style: RopeStyle::Adjacent,
         gqa_group_size: 1,
         tree_mask: false,
-        gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras {
+        gpu_sm: 75,
+        segment_masked: false,
+        csha: Some(CshaExtras {
             fused_projections: true,
             d_model: 128,
             ..CshaExtras::default()
@@ -420,7 +443,10 @@ fn a4_v2_rope_q_fused_projections_assembles_on_sm75_sm90_sm120() {
                 .join("\n");
             failures.push(format!(
                 "A4 rope_q PTX failed on {} (dump: {}):\n--- ptxas ---\n{}\n--- PTX tail ---\n{}",
-                sm, dump.display(), stderr, tail
+                sm,
+                dump.display(),
+                stderr,
+                tail
             ));
         }
     }
@@ -461,7 +487,9 @@ fn a5_v2_fused_output_assembles_on_sm75_sm90_sm120() {
         rope_style: RopeStyle::Adjacent,
         gqa_group_size: 1,
         tree_mask: false,
-        gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras {
+        gpu_sm: 75,
+        segment_masked: false,
+        csha: Some(CshaExtras {
             fused_projections: true,
             fused_output_proj: true,
             d_model: 32,
@@ -511,9 +539,7 @@ fn a5_v2_fused_output_assembles_on_sm75_sm90_sm120() {
 #[test]
 fn csha_tier_c_save_activations_assembles_on_sm75_sm90_sm120() {
     let Some(ptxas) = find_ptxas() else {
-        eprintln!(
-            "skipping Tier C save_activations ptxas test: ptxas not found in PATH"
-        );
+        eprintln!("skipping Tier C save_activations ptxas test: ptxas not found in PATH");
         return;
     };
     use nsl_codegen::flash_attention_v2::synthesize_flash_attention_ptx_v2;
@@ -528,7 +554,9 @@ fn csha_tier_c_save_activations_assembles_on_sm75_sm90_sm120() {
         rope_style: RopeStyle::Adjacent,
         gqa_group_size: 1,
         tree_mask: false,
-        gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras {
+        gpu_sm: 75,
+        segment_masked: false,
+        csha: Some(CshaExtras {
             fused_projections: true,
             save_activations_for_backward: true,
             d_model: 128,
@@ -587,9 +615,7 @@ fn csha_tier_c_save_activations_assembles_on_sm75_sm90_sm120() {
 #[test]
 fn csha_tier_c_save_nonfused_assembles_on_sm75_sm90_sm120() {
     let Some(ptxas) = find_ptxas() else {
-        eprintln!(
-            "skipping Tier C save_nonfused ptxas test: ptxas not found in PATH"
-        );
+        eprintln!("skipping Tier C save_nonfused ptxas test: ptxas not found in PATH");
         return;
     };
     use nsl_codegen::flash_attention_v2::synthesize_flash_attention_ptx_v2;
@@ -604,7 +630,9 @@ fn csha_tier_c_save_nonfused_assembles_on_sm75_sm90_sm120() {
         rope_style: RopeStyle::Adjacent,
         gqa_group_size: 1,
         tree_mask: false,
-        gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras {
+        gpu_sm: 75,
+        segment_masked: false,
+        csha: Some(CshaExtras {
             // THE REGRESSION CONFIG: training dispatch sets this combo.
             fused_projections: false,
             save_activations_for_backward: true,

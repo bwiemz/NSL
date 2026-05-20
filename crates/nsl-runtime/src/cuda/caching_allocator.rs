@@ -162,7 +162,10 @@ impl DriverAlloc for CudaDriverAlloc {
         unsafe {
             let result = cuMemFree_v2(ptr as CUdeviceptr);
             if result != CUresult::CUDA_SUCCESS {
-                eprintln!("nsl: cuMemFree_v2 failed in caching allocator: {:?} for {:p}", result, ptr);
+                eprintln!(
+                    "nsl: cuMemFree_v2 failed in caching allocator: {:?} for {:p}",
+                    result, ptr
+                );
             }
         }
     }
@@ -241,7 +244,9 @@ impl<D: DriverAlloc> CachingAllocator<D> {
 
     /// Round size up to the appropriate alignment.
     fn round_size(size: usize) -> usize {
-        if size == 0 { return 0; }
+        if size == 0 {
+            return 0;
+        }
         if size <= SMALL_THRESHOLD {
             // Round up to next multiple of SMALL_ALIGNMENT, minimum SMALL_ALIGNMENT
             let s = size.max(SMALL_ALIGNMENT);
@@ -258,48 +263,77 @@ impl<D: DriverAlloc> CachingAllocator<D> {
     }
 
     fn free_set(&self, small: bool) -> &BTreeSet<FreeBlockKey> {
-        if small { &self.small_free } else { &self.large_free }
+        if small {
+            &self.small_free
+        } else {
+            &self.large_free
+        }
     }
 
     fn free_set_mut(&mut self, small: bool) -> &mut BTreeSet<FreeBlockKey> {
-        if small { &mut self.small_free } else { &mut self.large_free }
+        if small {
+            &mut self.small_free
+        } else {
+            &mut self.large_free
+        }
     }
 
     fn min_split_size(small: bool) -> usize {
-        if small { SMALL_MIN_SPLIT } else { LARGE_MIN_SPLIT }
+        if small {
+            SMALL_MIN_SPLIT
+        } else {
+            LARGE_MIN_SPLIT
+        }
     }
 
     fn segment_growth_size(small: bool) -> usize {
-        if small { SMALL_SEGMENT_SIZE } else { LARGE_SEGMENT_SIZE }
+        if small {
+            SMALL_SEGMENT_SIZE
+        } else {
+            LARGE_SEGMENT_SIZE
+        }
     }
 
     /// Try to allocate from the free-list (cache hit). Returns None on miss.
     /// Prefers blocks from the current pool to avoid mixing persistent and
     /// transient allocations in the same segment (prevents fragmentation).
     pub(crate) fn alloc_from_cache(&mut self, size_bytes: usize) -> Option<*mut c_void> {
-        if size_bytes == 0 { return None; }
+        if size_bytes == 0 {
+            return None;
+        }
         let rounded = Self::round_size(size_bytes);
         let small = Self::is_small(rounded);
         let current_pool = get_alloc_pool();
-        let search_key = FreeBlockKey { size: rounded, ptr: 0 };
+        let search_key = FreeBlockKey {
+            size: rounded,
+            ptr: 0,
+        };
 
         // Best-fit: prefer a free block from the same pool.
         // Fall back to any pool only as a last resort.
-        let found_key = self.free_set(small).range(search_key..).find(|k| {
-            self.all_blocks.get(&k.ptr)
-                .map(|&bptr| unsafe { (*bptr).pool } == current_pool)
-                .unwrap_or(false)
-        }).copied().or_else(|| {
-            // Fallback: any pool (prevents OOM when same-pool is exhausted)
-            self.free_set(small).range(search_key..).next().copied()
-        });
+        let found_key = self
+            .free_set(small)
+            .range(search_key..)
+            .find(|k| {
+                self.all_blocks
+                    .get(&k.ptr)
+                    .map(|&bptr| unsafe { (*bptr).pool } == current_pool)
+                    .unwrap_or(false)
+            })
+            .copied()
+            .or_else(|| {
+                // Fallback: any pool (prevents OOM when same-pool is exhausted)
+                self.free_set(small).range(search_key..).next().copied()
+            });
         let found_key = found_key?;
 
         // Remove from free-list
         self.free_set_mut(small).remove(&found_key);
         self.stats.num_free_blocks -= 1;
 
-        let block_ptr = *self.all_blocks.get(&found_key.ptr)
+        let block_ptr = *self
+            .all_blocks
+            .get(&found_key.ptr)
             .expect("caching_allocator: free-set entry has no matching block in all_blocks");
         let block = unsafe { &mut *block_ptr };
 
@@ -335,7 +369,9 @@ impl<D: DriverAlloc> CachingAllocator<D> {
 
     /// Allocate by growing the cache (new segment from driver). Returns None on driver OOM.
     pub(crate) fn alloc_with_grow(&mut self, size_bytes: usize) -> Option<*mut c_void> {
-        if size_bytes == 0 { return None; }
+        if size_bytes == 0 {
+            return None;
+        }
         let rounded = Self::round_size(size_bytes);
         let small = Self::is_small(rounded);
         let segment_size = rounded.max(Self::segment_growth_size(small));
@@ -430,7 +466,9 @@ impl<D: DriverAlloc> CachingAllocator<D> {
 
         // Update next block's prev pointer
         if !block.next.is_null() {
-            unsafe { (*block.next).prev = remainder; }
+            unsafe {
+                (*block.next).prev = remainder;
+            }
         }
 
         block.next = remainder;
@@ -450,7 +488,9 @@ impl<D: DriverAlloc> CachingAllocator<D> {
 
     /// Free a block and coalesce with neighbors.
     pub(crate) fn free_block(&mut self, ptr: *mut c_void) -> bool {
-        if ptr.is_null() { return false; }
+        if ptr.is_null() {
+            return false;
+        }
 
         let block_ptr = match self.allocated_blocks.remove(&(ptr as usize)) {
             Some(b) => b,
@@ -474,7 +514,9 @@ impl<D: DriverAlloc> CachingAllocator<D> {
         self.total_allocated -= old_size;
         self.stats.num_allocs -= 1;
         self.stats.allocated_bytes = self.total_allocated;
-        self.stats.internal_fragmentation_bytes = self.stats.internal_fragmentation_bytes
+        self.stats.internal_fragmentation_bytes = self
+            .stats
+            .internal_fragmentation_bytes
             .saturating_sub(old_size - old_requested);
 
         // Coalesce with next
@@ -501,12 +543,16 @@ impl<D: DriverAlloc> CachingAllocator<D> {
                 block.size += next_size;
                 block.next = next_next;
                 if !next_next.is_null() {
-                    unsafe { (*next_next).prev = block_ptr; }
+                    unsafe {
+                        (*next_next).prev = block_ptr;
+                    }
                 }
 
                 // Remove next from tracking and deallocate
                 self.all_blocks.remove(&next_ptr_addr);
-                unsafe { drop(Box::from_raw(next)); }
+                unsafe {
+                    drop(Box::from_raw(next));
+                }
                 self.stats.num_coalesces += 1;
             }
         }
@@ -534,12 +580,16 @@ impl<D: DriverAlloc> CachingAllocator<D> {
                 prev_block.size = merged_size;
                 prev_block.next = block_next;
                 if !block_next.is_null() {
-                    unsafe { (*block_next).prev = prev; }
+                    unsafe {
+                        (*block_next).prev = prev;
+                    }
                 }
 
                 // Remove current block from tracking and deallocate
                 self.all_blocks.remove(&(ptr as usize));
-                unsafe { drop(Box::from_raw(block_ptr)); }
+                unsafe {
+                    drop(Box::from_raw(block_ptr));
+                }
                 self.stats.num_coalesces += 1;
 
                 // Insert prev (the coalesced block) into free-list
@@ -606,7 +656,9 @@ impl<D: DriverAlloc> CachingAllocator<D> {
                 self.all_blocks.remove(&blk_ptr);
 
                 // Deallocate the Block node
-                unsafe { drop(Box::from_raw(bptr)); }
+                unsafe {
+                    drop(Box::from_raw(bptr));
+                }
                 bptr = next;
             }
 
@@ -656,8 +708,14 @@ impl<D: DriverAlloc> CachingAllocator<D> {
         let mut t_segs = 0usize;
         for seg in &self.segments {
             match seg.pool {
-                AllocPool::Persistent => { p_bytes += seg.total_size; p_segs += 1; }
-                AllocPool::Transient  => { t_bytes += seg.total_size; t_segs += 1; }
+                AllocPool::Persistent => {
+                    p_bytes += seg.total_size;
+                    p_segs += 1;
+                }
+                AllocPool::Transient => {
+                    t_bytes += seg.total_size;
+                    t_segs += 1;
+                }
             }
         }
         (p_bytes, p_segs, t_bytes, t_segs)
@@ -669,12 +727,17 @@ impl<D: DriverAlloc> CachingAllocator<D> {
         let mut by_context: HashMap<String, (usize, usize)> = HashMap::new();
         for (_, &block_ptr) in &self.allocated_blocks {
             let block = unsafe { &*block_ptr };
-            let ctx = if block.context.is_empty() { "(no context)" } else { &block.context };
+            let ctx = if block.context.is_empty() {
+                "(no context)"
+            } else {
+                &block.context
+            };
             let entry = by_context.entry(ctx.to_string()).or_insert((0, 0));
             entry.0 += 1;
             entry.1 += block.size;
         }
-        let mut result: Vec<_> = by_context.into_iter()
+        let mut result: Vec<_> = by_context
+            .into_iter()
             .map(|(ctx, (count, bytes))| (ctx, count, bytes))
             .collect();
         result.sort_by(|a, b| b.2.cmp(&a.2));
@@ -716,22 +779,25 @@ fn parse_mem_limit() -> usize {
         _ => return 0,
     };
     let val = val.trim();
-    let (num_str, multiplier) = if let Some(n) = val.strip_suffix('G').or_else(|| val.strip_suffix('g')) {
-        (n, 1024 * 1024 * 1024)
-    } else if let Some(n) = val.strip_suffix('M').or_else(|| val.strip_suffix('m')) {
-        (n, 1024 * 1024)
-    } else if let Some(n) = val.strip_suffix('K').or_else(|| val.strip_suffix('k')) {
-        (n, 1024)
-    } else {
-        (val, 1)
-    };
+    let (num_str, multiplier) =
+        if let Some(n) = val.strip_suffix('G').or_else(|| val.strip_suffix('g')) {
+            (n, 1024 * 1024 * 1024)
+        } else if let Some(n) = val.strip_suffix('M').or_else(|| val.strip_suffix('m')) {
+            (n, 1024 * 1024)
+        } else if let Some(n) = val.strip_suffix('K').or_else(|| val.strip_suffix('k')) {
+            (n, 1024)
+        } else {
+            (val, 1)
+        };
     num_str.trim().parse::<usize>().unwrap_or(0) * multiplier
 }
 
 /// Check if memory stats printing is enabled.
 pub(crate) fn memstats_enabled() -> bool {
     static ENABLED: LazyLock<bool> = LazyLock::new(|| {
-        std::env::var("NSL_MEMSTATS").map(|v| v == "1").unwrap_or(false)
+        std::env::var("NSL_MEMSTATS")
+            .map(|v| v == "1")
+            .unwrap_or(false)
     });
     *ENABLED
 }
@@ -790,9 +856,12 @@ pub(crate) fn print_memory_summary() {
          Block coalesces:  {}\n\
          Fragmentation:    {}\n\
          Top contexts:\n{}",
-        fmt(s.allocated_bytes), s.num_allocs,
-        fmt(s.reserved_bytes), alloc.segments.len(),
-        fmt(s.reserved_bytes.saturating_sub(s.allocated_bytes)), s.num_free_blocks,
+        fmt(s.allocated_bytes),
+        s.num_allocs,
+        fmt(s.reserved_bytes),
+        alloc.segments.len(),
+        fmt(s.reserved_bytes.saturating_sub(s.allocated_bytes)),
+        s.num_free_blocks,
         fmt(s.peak_allocated_bytes),
         fmt(s.peak_reserved_bytes),
         s.num_driver_allocs,
@@ -868,7 +937,10 @@ mod tests {
         let p2 = a.alloc_from_cache(1024).unwrap();
         let driver_allocs_after = a.driver.alloc_count.load(Ordering::Relaxed);
 
-        assert_eq!(driver_allocs_before, driver_allocs_after, "should reuse cached block");
+        assert_eq!(
+            driver_allocs_before, driver_allocs_after,
+            "should reuse cached block"
+        );
         assert_eq!(p1, p2, "should return same pointer");
     }
 
@@ -878,7 +950,10 @@ mod tests {
         // Allocate a small amount from a 2MB segment — should split
         let p1 = a.alloc_with_grow(512).unwrap();
         assert_eq!(a.stats.num_splits, 1, "should have split the segment");
-        assert_eq!(a.stats.num_free_blocks, 1, "remainder should be in free-list");
+        assert_eq!(
+            a.stats.num_free_blocks, 1,
+            "remainder should be in free-list"
+        );
 
         // The remainder should be usable
         let p2 = a.alloc_from_cache(1024).unwrap();
@@ -911,7 +986,10 @@ mod tests {
         a.free_block(p3);
         let coalesces_before = a.stats.num_coalesces;
         a.free_block(p2);
-        assert!(a.stats.num_coalesces > coalesces_before, "middle free should coalesce with both neighbors");
+        assert!(
+            a.stats.num_coalesces > coalesces_before,
+            "middle free should coalesce with both neighbors"
+        );
     }
 
     #[test]
@@ -929,7 +1007,10 @@ mod tests {
         // Request for 1024 should pick the 2048 block (best fit), not the 8192
         let p = a.alloc_from_cache(1024).unwrap();
         // The returned pointer should be the 2048 block (smallest that fits)
-        assert_eq!(p, p_med, "best-fit should choose the smallest sufficient block");
+        assert_eq!(
+            p, p_med,
+            "best-fit should choose the smallest sufficient block"
+        );
     }
 
     #[test]
@@ -1018,7 +1099,10 @@ mod tests {
     #[test]
     fn test_round_size() {
         assert_eq!(CachingAllocator::<MockDriver>::round_size(0), 0);
-        assert_eq!(CachingAllocator::<MockDriver>::round_size(1), SMALL_ALIGNMENT);
+        assert_eq!(
+            CachingAllocator::<MockDriver>::round_size(1),
+            SMALL_ALIGNMENT
+        );
         assert_eq!(CachingAllocator::<MockDriver>::round_size(512), 512);
         assert_eq!(CachingAllocator::<MockDriver>::round_size(513), 1024);
         // Large
@@ -1033,11 +1117,17 @@ mod tests {
         let mut a = make_alloc();
         // Simulate training loop: same-sized allocs repeated
         for _ in 0..100 {
-            let p = a.alloc_with_grow(4096).or_else(|| a.alloc_from_cache(4096)).unwrap();
+            let p = a
+                .alloc_with_grow(4096)
+                .or_else(|| a.alloc_from_cache(4096))
+                .unwrap();
             a.free_block(p);
         }
         // Should only have 1 driver allocation (the initial segment)
-        assert_eq!(a.driver.alloc_count.load(Ordering::Relaxed), 1,
-                   "repeated same-size alloc/free should reuse, not grow");
+        assert_eq!(
+            a.driver.alloc_count.load(Ordering::Relaxed),
+            1,
+            "repeated same-size alloc/free should reuse, not grow"
+        );
     }
 }

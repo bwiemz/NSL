@@ -312,16 +312,13 @@ fn toy_pretrain_hd32_compile_emits_fused_backward_ffi() {
         .iter()
         .filter(|n| n.contains("nsl_csha") || n.contains("nsl_flash_attention_csha"))
         .collect();
-    eprintln!(
-        "[gap-f] CSHA-related symbols referenced by relocations: {csha_related:?}"
-    );
+    eprintln!("[gap-f] CSHA-related symbols referenced by relocations: {csha_related:?}");
 
     // Diagnostic: show every `nsl_` FFI reloc so a human reviewer can
     // see what fired.  If the train block compiled at all we expect
     // to see `nsl_tensor_rmsnorm`, `nsl_tensor_matmul`, optimizer
     // FFIs, etc.
-    let nsl_related: Vec<&String> =
-        called.iter().filter(|n| n.starts_with("nsl_")).collect();
+    let nsl_related: Vec<&String> = called.iter().filter(|n| n.starts_with("nsl_")).collect();
     eprintln!(
         "[gap-f] ALL nsl_* relocation targets ({} total): {:?}",
         nsl_related.len(),

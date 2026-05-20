@@ -312,7 +312,11 @@ fn emit_fused_forward_under_claim(
             ))
         })?;
     let (block_q_i64, block_kv_i64, is_causal, d_model_i64, eps_bits_i64) = {
-        let dm = training_cfg.csha.as_ref().map(|c| c.d_model as i64).unwrap_or(0);
+        let dm = training_cfg
+            .csha
+            .as_ref()
+            .map(|c| c.d_model as i64)
+            .unwrap_or(0);
         let eps = training_cfg
             .csha
             .as_ref()
@@ -329,7 +333,8 @@ fn emit_fused_forward_under_claim(
     let shmem_bytes_i64 = {
         let mut diags = Vec::<String>::new();
         let bytes = crate::flash_attention_selector::shared_mem_bytes_selected_with_diag(
-            &training_cfg, &mut diags,
+            &training_cfg,
+            &mut diags,
         ) as i64;
         for s in diags {
             eprintln!("warning: {s}");
@@ -423,7 +428,9 @@ fn emit_fused_forward_under_claim(
     call(compiler, builder, "nsl_list_push", &[out_shape, seq_len])?;
     call(compiler, builder, "nsl_list_push", &[out_shape, head_dim])?;
     let out_val = call(
-        compiler, builder, "nsl_tensor_zeros_on",
+        compiler,
+        builder,
+        "nsl_tensor_zeros_on",
         &[out_shape, cuda_device_for_out],
     )?;
     call(compiler, builder, "nsl_list_free", &[out_shape])?;
@@ -443,13 +450,11 @@ fn emit_fused_forward_under_claim(
 
     // --- 4. Allocate the six save buffers.  Same values populate
     //        `csha_forward_saves[layer]` below. ---
-    let saves_slot = builder.create_sized_stack_slot(
-        cranelift_codegen::ir::StackSlotData::new(
-            cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
-            48,
-            8,
-        ),
-    );
+    let saves_slot = builder.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
+        cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+        48,
+        8,
+    ));
     let saves_ptr = builder.ins().stack_addr(cl_types::I64, saves_slot, 0);
     let _alloc_rc = call(
         compiler,
@@ -466,8 +471,7 @@ fn emit_fused_forward_under_claim(
 
     // --- 5. Resolve chain-side VarIds via `var_map`. ---
     let null = builder.ins().iconst(cl_types::I64, 0);
-    let (mut x_v, mut norm_w_v, mut wq_v, mut wk_v, mut wv_v) =
-        (null, null, null, null, null);
+    let (mut x_v, mut norm_w_v, mut wq_v, mut wk_v, mut wv_v) = (null, null, null, null, null);
     if let Some(claims) = compiler.csha_backward_claims.as_ref() {
         if let Some(&chain_idx) = claims.op_to_chain.get(&op.id) {
             if let Some(mark) = claims.chain_marks.get(chain_idx) {
@@ -531,7 +535,9 @@ fn emit_fused_forward_under_claim(
     let block_q_val = builder.ins().iconst(cl_types::I64, block_q_i64);
     let block_kv_val = builder.ins().iconst(cl_types::I64, block_kv_i64);
     let shmem_val = builder.ins().iconst(cl_types::I64, shmem_bytes_i64);
-    let causal_val = builder.ins().iconst(cl_types::I64, if is_causal { 1 } else { 0 });
+    let causal_val = builder
+        .ins()
+        .iconst(cl_types::I64, if is_causal { 1 } else { 0 });
     let eps_bits_val = builder.ins().iconst(cl_types::I64, eps_bits_i64);
     let active_heads_val = builder.ins().iconst(cl_types::I64, active_heads_i64);
     let d_model_val = builder.ins().iconst(cl_types::I64, d_model_i64);
@@ -566,24 +572,44 @@ fn emit_fused_forward_under_claim(
         builder,
         "nsl_flash_attention_csha_with_saves",
         &[
-            q_val, k_val, v_val, out_val,
+            q_val,
+            k_val,
+            v_val,
+            out_val,
             lse_val,
             scale_bits,
-            batch, heads, seq_len, head_dim,
-            null, null, null, null, // paged
-            null, null,             // RoPE
-            null, null,             // seq_ids, seq_lens
+            batch,
+            heads,
+            seq_len,
+            head_dim,
+            null,
+            null,
+            null,
+            null, // paged
+            null,
+            null, // RoPE
+            null,
+            null, // seq_ids, seq_lens
             shmem_val,
-            ptx_ptr, name_ptr,
-            block_q_val, block_kv_val,
+            ptx_ptr,
+            name_ptr,
+            block_q_val,
+            block_kv_val,
             causal_val,
-            x_v, norm_w_v,
-            wq_v, wk_v, wv_v, wo_v,
+            x_v,
+            norm_w_v,
+            wq_v,
+            wk_v,
+            wv_v,
+            wo_v,
             eps_bits_val,
             active_heads_val,
             d_model_val,
-            q_proj_v, k_proj_v, v_proj_v,
-            row_max_v, row_sum_v,
+            q_proj_v,
+            k_proj_v,
+            v_proj_v,
+            row_max_v,
+            row_sum_v,
             x_raw_v,
             // PCA Tier A: segment_ids_ptr — read from the thread-local
             // packing registry (set by train block per step).
@@ -592,18 +618,17 @@ fn emit_fused_forward_under_claim(
             // the Tier-B-on PTX variant.  Inactive in this @train fused
             // forward path — the planner's dispatch decision is emitted
             // at compile time, not via this CSHA forward launcher.
-            null, null,
+            null,
+            null,
             // PCA §4.3: doc_starts_ptr — read from the same registry.
             doc_starts_v,
         ],
     )?;
     {
         use cranelift_codegen::ir::{condcodes::IntCC, TrapCode};
-        let ok_block   = builder.create_block();
+        let ok_block = builder.create_block();
         let trap_block = builder.create_block();
-        let is_err = builder
-            .ins()
-            .icmp_imm(IntCC::NotEqual, launch_rc, 0);
+        let is_err = builder.ins().icmp_imm(IntCC::NotEqual, launch_rc, 0);
         builder.ins().brif(is_err, trap_block, &[], ok_block, &[]);
         builder.switch_to_block(trap_block);
         builder.seal_block(trap_block);
@@ -874,20 +899,28 @@ fn lower_single_op(
         // WRGA B.3.2 Option 3: fused GatedLoRA forward FFI call.
         //
         //   nsl_adapter_fused_gatedlora_matmul(x, W, A, B, scale: f64, gate, kh: i64) -> i64
-        PrimalOp::FusedGatedLoraMatmul { scale, kernel_handle } => {
+        PrimalOp::FusedGatedLoraMatmul {
+            scale,
+            kernel_handle,
+        } => {
             let scale_v = builder.ins().f64const(*scale as f64);
             let kh = builder.ins().iconst(cl_types::I64, *kernel_handle);
             call(
                 compiler,
                 builder,
                 "nsl_adapter_fused_gatedlora_matmul",
-                &[inputs[0], inputs[1], inputs[2], inputs[3], scale_v, inputs[4], kh],
+                &[
+                    inputs[0], inputs[1], inputs[2], inputs[3], scale_v, inputs[4], kh,
+                ],
             )
         }
         // WRGA B.3 fused LoRA forward FFI call.
         //
         //   nsl_adapter_fused_lora_matmul(x, W, A, B, scale: f64, kh: i64) -> i64
-        PrimalOp::FusedLoraMatmul { scale, kernel_handle } => {
+        PrimalOp::FusedLoraMatmul {
+            scale,
+            kernel_handle,
+        } => {
             let scale_v = builder.ins().f64const(*scale as f64);
             let kh = builder.ins().iconst(cl_types::I64, *kernel_handle);
             call(
@@ -1242,7 +1275,12 @@ fn lower_single_op(
             )?;
             // ELTLS (FBIP-3): nsl_tensor_mul takes a flags byte.
             let flags0_nll = builder.ins().iconst(cl_types::I8, 0);
-            let masked_nll = call(compiler, builder, "nsl_tensor_mul", &[nll, valid_mask, flags0_nll])?;
+            let masked_nll = call(
+                compiler,
+                builder,
+                "nsl_tensor_mul",
+                &[nll, valid_mask, flags0_nll],
+            )?;
             let num_valid = call(compiler, builder, "nsl_tensor_sum", &[valid_mask])?;
             let wl_flags0_addsc2 = builder.ins().iconst(cl_types::I8, 0);
             let num_valid_eps = call(
@@ -1254,7 +1292,12 @@ fn lower_single_op(
             let total = call(compiler, builder, "nsl_tensor_sum", &[masked_nll])?;
             // ELTLS (FBIP-3): nsl_tensor_div takes a flags byte.
             let flags0_div = builder.ins().iconst(cl_types::I8, 0);
-            let result = call(compiler, builder, "nsl_tensor_div", &[total, num_valid_eps, flags0_div])?;
+            let result = call(
+                compiler,
+                builder,
+                "nsl_tensor_div",
+                &[total, num_valid_eps, flags0_div],
+            )?;
             for temp in [
                 safe_targets,
                 log_probs,
@@ -1275,9 +1318,19 @@ fn lower_single_op(
             // mse_loss(pred, target) = mean((pred - target)^2)
             // ELTLS (FBIP-3): tensor-tensor ops take a flags byte.
             let mse_flags0_sub = builder.ins().iconst(cl_types::I8, 0);
-            let diff = call(compiler, builder, "nsl_tensor_sub", &[inputs[0], inputs[1], mse_flags0_sub])?;
+            let diff = call(
+                compiler,
+                builder,
+                "nsl_tensor_sub",
+                &[inputs[0], inputs[1], mse_flags0_sub],
+            )?;
             let mse_flags0_mul = builder.ins().iconst(cl_types::I8, 0);
-            let sq = call(compiler, builder, "nsl_tensor_mul", &[diff, diff, mse_flags0_mul])?;
+            let sq = call(
+                compiler,
+                builder,
+                "nsl_tensor_mul",
+                &[diff, diff, mse_flags0_mul],
+            )?;
             let d = builder.ins().iconst(cl_types::I64, -1);
             let keepdim = builder.ins().iconst(cl_types::I64, 0);
             let result = call(compiler, builder, "nsl_tensor_mean_dim", &[sq, d, keepdim])?;
@@ -1289,7 +1342,12 @@ fn lower_single_op(
             // l1_loss(pred, target) = mean(|pred - target|)
             // ELTLS (FBIP-3): nsl_tensor_sub takes a flags byte.
             let l1_flags0 = builder.ins().iconst(cl_types::I8, 0);
-            let diff = call(compiler, builder, "nsl_tensor_sub", &[inputs[0], inputs[1], l1_flags0])?;
+            let diff = call(
+                compiler,
+                builder,
+                "nsl_tensor_sub",
+                &[inputs[0], inputs[1], l1_flags0],
+            )?;
             let abs_diff = call(compiler, builder, "nsl_tensor_abs", &[diff])?;
             let d = builder.ins().iconst(cl_types::I64, -1);
             let keepdim = builder.ins().iconst(cl_types::I64, 0);
@@ -1325,17 +1383,14 @@ fn lower_single_op(
             // a claimed chain, that's a bug to fix.  We never silently
             // fall back to decomposition — that would reintroduce the
             // dual-path drift class the user explicitly rejected.
-            let claim_layer = compiler
-                .csha_backward_claims
-                .as_ref()
-                .and_then(|claims| {
-                    claims
-                        .op_to_chain
-                        .get(&op.id)
-                        .copied()
-                        .and_then(|idx| claims.chain_marks.get(idx))
-                        .map(|m| m.layer.clone())
-                });
+            let claim_layer = compiler.csha_backward_claims.as_ref().and_then(|claims| {
+                claims
+                    .op_to_chain
+                    .get(&op.id)
+                    .copied()
+                    .and_then(|idx| claims.chain_marks.get(idx))
+                    .map(|m| m.layer.clone())
+            });
             if let Some(layer) = claim_layer {
                 let needs_saves = compiler
                     .last_csha_bridge
@@ -1393,7 +1448,12 @@ fn lower_single_op(
             // scores = Q @ K_T
             // ELTLS (FBIP-3): nsl_tensor_matmul takes a flags byte.
             let attn_flags0_qk = builder.ins().iconst(cl_types::I8, 0);
-            let scores = call(compiler, builder, "nsl_tensor_matmul", &[q, k_t, attn_flags0_qk])?;
+            let scores = call(
+                compiler,
+                builder,
+                "nsl_tensor_matmul",
+                &[q, k_t, attn_flags0_qk],
+            )?;
             // scaled = scores * scale
             let scale_item = call(compiler, builder, "nsl_tensor_item", &[scale])?;
             let wl_flags0_mulsc = builder.ins().iconst(cl_types::I8, 0);
@@ -1412,7 +1472,12 @@ fn lower_single_op(
                 let mask = call(compiler, builder, "nsl_tensor_causal_mask", &[seq_len])?;
                 // ELTLS (FBIP-3): nsl_tensor_add takes a flags byte (flags=0 here).
                 let flags_zero_add = builder.ins().iconst(cl_types::I8, 0);
-                let masked = call(compiler, builder, "nsl_tensor_add", &[scaled, mask, flags_zero_add])?;
+                let masked = call(
+                    compiler,
+                    builder,
+                    "nsl_tensor_add",
+                    &[scaled, mask, flags_zero_add],
+                )?;
                 free_tensor_value(compiler, builder, mask)?;
                 masked
             } else {
@@ -1424,7 +1489,12 @@ fn lower_single_op(
             // output = attn_weights @ V
             // ELTLS (FBIP-3): nsl_tensor_matmul takes a flags byte.
             let attn_flags0_av = builder.ins().iconst(cl_types::I8, 0);
-            let result = call(compiler, builder, "nsl_tensor_matmul", &[attn_weights, v, attn_flags0_av])?;
+            let result = call(
+                compiler,
+                builder,
+                "nsl_tensor_matmul",
+                &[attn_weights, v, attn_flags0_av],
+            )?;
             free_tensor_value(compiler, builder, k_t)?;
             free_tensor_value(compiler, builder, scores)?;
             if *causal {
@@ -1483,7 +1553,11 @@ fn lower_single_op(
                 let scale_f64 = builder.ins().fdiv(one_f64, hd_sqrt);
                 // Convert to f32 then reinterpret as i32 bits for scale_bits param
                 let scale_f32 = builder.ins().fdemote(cl_types::F32, scale_f64);
-                let scale_bits_i32 = builder.ins().bitcast(cl_types::I32, cranelift_codegen::ir::MemFlags::new(), scale_f32);
+                let scale_bits_i32 = builder.ins().bitcast(
+                    cl_types::I32,
+                    cranelift_codegen::ir::MemFlags::new(),
+                    scale_f32,
+                );
                 let scale_bits = builder.ins().sextend(cl_types::I64, scale_bits_i32);
 
                 // Extract batch, heads, seq_len, head_dim from Q shape
@@ -1497,7 +1571,9 @@ fn lower_single_op(
                 // Logsumexp: pass 0 to signal "auto-compute in the runtime"
                 let lse_null = builder.ins().iconst(cl_types::I64, 0);
 
-                let causal_val = builder.ins().iconst(cl_types::I64, if *causal { 1 } else { 0 });
+                let causal_val = builder
+                    .ins()
+                    .iconst(cl_types::I64, if *causal { 1 } else { 0 });
 
                 // Load backward PTX data pointers from .rodata (if available)
                 let (p1_ptx, p1_name, p2_ptx, p2_name) = {
@@ -1510,7 +1586,7 @@ fn lower_single_op(
                     let load_data_ptr = |did: Option<cranelift_module::DataId>,
                                          builder: &mut FunctionBuilder,
                                          module: &mut cranelift_object::ObjectModule|
-                                         -> Value {
+                     -> Value {
                         if let Some(id) = did {
                             let gv = module.declare_data_in_func(id, builder.func);
                             builder.ins().symbol_value(cl_types::I64, gv)
@@ -1530,9 +1606,10 @@ fn lower_single_op(
                     compiler,
                     builder,
                     "nsl_flash_attention_backward",
-                    &[dout, q, k, v, fwd_out, lse_null,
-                      scale_bits, batch, heads, seq_len, head_dim,
-                      causal_val, p1_ptx, p1_name, p2_ptx, p2_name],
+                    &[
+                        dout, q, k, v, fwd_out, lse_null, scale_bits, batch, heads, seq_len,
+                        head_dim, causal_val, p1_ptx, p1_name, p2_ptx, p2_name,
+                    ],
                 )?;
                 compiler.flash_attn_bwd_cache.insert(fwd_out, list);
                 list
@@ -1698,15 +1775,22 @@ fn lower_single_op(
                         // backward config needs the extern .shared path,
                         // corrupting gradients at runtime.
                         let bytes =
-                            crate::flash_attention_v2::shared_mem_bytes_v2_backward(&cfg)
-                                as i64;
+                            crate::flash_attention_v2::shared_mem_bytes_v2_backward(&cfg) as i64;
                         let dm = cfg.csha.as_ref().map(|c| c.d_model as i64).unwrap_or(0);
                         let eps = cfg
                             .csha
                             .as_ref()
                             .map(|c| c.rmsnorm_eps.to_bits() as i64)
                             .unwrap_or(1e-5f32.to_bits() as i64);
-                        (cfg.block_q, cfg.block_kv, cfg.head_dim, cfg.causal, dm, eps, bytes)
+                        (
+                            cfg.block_q,
+                            cfg.block_kv,
+                            cfg.head_dim,
+                            cfg.causal,
+                            dm,
+                            eps,
+                            bytes,
+                        )
                     }
                     None => {
                         // No training config — the backward launch cannot
@@ -1742,12 +1826,24 @@ fn lower_single_op(
             let dim0 = builder.ins().iconst(cl_types::I64, 0);
             let dim1 = builder.ins().iconst(cl_types::I64, 1);
             let dim2 = builder.ins().iconst(cl_types::I64, 2);
-            let batch =
-                call(compiler, builder, "nsl_tensor_shape_dim", &[shape_src, dim0])?;
-            let heads =
-                call(compiler, builder, "nsl_tensor_shape_dim", &[shape_src, dim1])?;
-            let seq_len =
-                call(compiler, builder, "nsl_tensor_shape_dim", &[shape_src, dim2])?;
+            let batch = call(
+                compiler,
+                builder,
+                "nsl_tensor_shape_dim",
+                &[shape_src, dim0],
+            )?;
+            let heads = call(
+                compiler,
+                builder,
+                "nsl_tensor_shape_dim",
+                &[shape_src, dim1],
+            )?;
+            let seq_len = call(
+                compiler,
+                builder,
+                "nsl_tensor_shape_dim",
+                &[shape_src, dim2],
+            )?;
             let hd_val = builder.ins().iconst(cl_types::I64, head_dim);
             let block_q_val = builder.ins().iconst(cl_types::I64, block_q);
             let block_kv_val = builder.ins().iconst(cl_types::I64, block_kv);
@@ -1827,34 +1923,55 @@ fn lower_single_op(
 
             // f16 outputs — the 6 kernel-side st.global.u16 sinks.
             let dq_dev = alloc_shape_on(
-                compiler, builder, "nsl_tensor_zeros_f16_on",
-                &[batch, heads, seq_len, hd_val], cuda_device,
+                compiler,
+                builder,
+                "nsl_tensor_zeros_f16_on",
+                &[batch, heads, seq_len, hd_val],
+                cuda_device,
             )?;
             let dk_dev = alloc_shape_on(
-                compiler, builder, "nsl_tensor_zeros_f16_on",
-                &[batch, heads, seq_len, hd_val], cuda_device,
+                compiler,
+                builder,
+                "nsl_tensor_zeros_f16_on",
+                &[batch, heads, seq_len, hd_val],
+                cuda_device,
             )?;
             let dv_dev = alloc_shape_on(
-                compiler, builder, "nsl_tensor_zeros_f16_on",
-                &[batch, heads, seq_len, hd_val], cuda_device,
+                compiler,
+                builder,
+                "nsl_tensor_zeros_f16_on",
+                &[batch, heads, seq_len, hd_val],
+                cuda_device,
             )?;
             let dwq_dev = alloc_shape_on(
-                compiler, builder, "nsl_tensor_zeros_f16_on",
-                &[d_model_val, heads_hd], cuda_device,
+                compiler,
+                builder,
+                "nsl_tensor_zeros_f16_on",
+                &[d_model_val, heads_hd],
+                cuda_device,
             )?;
             let dwk_dev = alloc_shape_on(
-                compiler, builder, "nsl_tensor_zeros_f16_on",
-                &[d_model_val, heads_hd], cuda_device,
+                compiler,
+                builder,
+                "nsl_tensor_zeros_f16_on",
+                &[d_model_val, heads_hd],
+                cuda_device,
             )?;
             let dwv_dev = alloc_shape_on(
-                compiler, builder, "nsl_tensor_zeros_f16_on",
-                &[d_model_val, heads_hd], cuda_device,
+                compiler,
+                builder,
+                "nsl_tensor_zeros_f16_on",
+                &[d_model_val, heads_hd],
+                cuda_device,
             )?;
 
             // dx stays on the f32 allocator — the kernel writes it as f32.
             let dx_dev = alloc_shape_on(
-                compiler, builder, "nsl_tensor_zeros_on",
-                &[batch, seq_len, d_model_val], cuda_device,
+                compiler,
+                builder,
+                "nsl_tensor_zeros_on",
+                &[batch, seq_len, d_model_val],
+                cuda_device,
             )?;
 
             // Gap I.5 Option-A: 8th output `dx_norm`, gradient w.r.t. the
@@ -1863,8 +1980,11 @@ fn lower_single_op(
             // `extract_results[7]` for correct dgamma under the fused CSHA
             // dispatch path.
             let dxn_dev = alloc_shape_on(
-                compiler, builder, "nsl_tensor_zeros_on",
-                &[batch, seq_len, d_model_val], cuda_device,
+                compiler,
+                builder,
+                "nsl_tensor_zeros_on",
+                &[batch, seq_len, d_model_val],
+                cuda_device,
             )?;
 
             // Launch the 44-arg backward kernel.
@@ -1897,32 +2017,55 @@ fn lower_single_op(
                 "nsl_flash_attention_csha_backward",
                 &[
                     // Forward-side 36 args (mirrors _with_saves order).
-                    q_ptr, k_ptr, v_ptr,
-                    null,                 // out_ptr
-                    null,                 // logsumexp_ptr
+                    q_ptr,
+                    k_ptr,
+                    v_ptr,
+                    null, // out_ptr
+                    null, // logsumexp_ptr
                     scale_bits,
-                    batch, heads, seq_len, hd_val,
-                    null, null, null, null,    // paged (block_table, k_pool, v_pool, block_size)
-                    null, null,                 // RoPE cos/sin
-                    null, null,                 // seq_ids, seq_lens
+                    batch,
+                    heads,
+                    seq_len,
+                    hd_val,
+                    null,
+                    null,
+                    null,
+                    null, // paged (block_table, k_pool, v_pool, block_size)
+                    null,
+                    null, // RoPE cos/sin
+                    null,
+                    null, // seq_ids, seq_lens
                     shmem_val,
-                    bwd_ptx_ptr, bwd_name_ptr,
-                    block_q_val, block_kv_val,
+                    bwd_ptx_ptr,
+                    bwd_name_ptr,
+                    block_q_val,
+                    block_kv_val,
                     causal_val,
-                    x_ptr, norm_weight_ptr,
-                    wq_ptr, wk_ptr, wv_ptr,
-                    null,                 // wo_ptr
+                    x_ptr,
+                    norm_weight_ptr,
+                    wq_ptr,
+                    wk_ptr,
+                    wv_ptr,
+                    null, // wo_ptr
                     eps_bits_val,
-                    active_heads_val, d_model_val,
+                    active_heads_val,
+                    d_model_val,
                     // Forward-saved activations (Gap A).
-                    saves.q_proj, saves.k_proj, saves.v_proj,
-                    saves.row_max, saves.row_sum,
+                    saves.q_proj,
+                    saves.k_proj,
+                    saves.v_proj,
+                    saves.row_max,
+                    saves.row_sum,
                     saves.x_raw,
                     // Tier C backward-specific: dO input + 8 gradient outputs.
                     // 8th output (dxn_dev) added by Gap I.5 Option-A fix.
                     do_ptr,
-                    dq_dev, dk_dev, dv_dev,
-                    dwq_dev, dwk_dev, dwv_dev,
+                    dq_dev,
+                    dk_dev,
+                    dv_dev,
+                    dwq_dev,
+                    dwk_dev,
+                    dwv_dev,
                     dx_dev,
                     dxn_dev,
                     // PCA Tier A: segment_ids_ptr — read from the
@@ -1933,7 +2076,8 @@ fn lower_single_op(
                     // matches the forward call above. Backward never
                     // re-decides Tier B dispatch — it just consumes the
                     // forward's saves, so sentinels here are correct.
-                    null, null,
+                    null,
+                    null,
                     // PCA §4.3: doc_starts_ptr — read from the same
                     // registry; matches the forward's effective_pos.
                     doc_starts_v,
@@ -1942,9 +2086,12 @@ fn lower_single_op(
 
             // Populate Gap C cache so extract ops can read outputs.
             // Slot 7 (dxn_dev) added by the Gap I.5 Option-A fix.
-            compiler
-                .csha_fused_bwd_cache
-                .insert(key_val, [dq_dev, dk_dev, dv_dev, dwq_dev, dwk_dev, dwv_dev, dx_dev, dxn_dev]);
+            compiler.csha_fused_bwd_cache.insert(
+                key_val,
+                [
+                    dq_dev, dk_dev, dv_dev, dwq_dev, dwk_dev, dwv_dev, dx_dev, dxn_dev,
+                ],
+            );
 
             // Gap A cleanup: now that the backward has consumed the save
             // pointers, free them.  (Moved here from the forward site in
@@ -1955,8 +2102,12 @@ fn lower_single_op(
                 builder,
                 "nsl_csha_free_backward_activations_from",
                 &[
-                    saves.q_proj, saves.k_proj, saves.v_proj,
-                    saves.row_max, saves.row_sum, saves.x_raw,
+                    saves.q_proj,
+                    saves.k_proj,
+                    saves.v_proj,
+                    saves.row_max,
+                    saves.row_sum,
+                    saves.x_raw,
                 ],
             )?;
             compiler.csha_forward_saves.remove(layer);
@@ -2128,8 +2279,7 @@ fn lower_single_op(
                     // Mean along the LAST dimension with keepdim=true.
                     // Used by LayerNorm/RMSNorm backward to compute
                     // mean/variance reductions that broadcast correctly.
-                    let ndim_val =
-                        call(compiler, builder, "nsl_tensor_ndim", &[inputs[0]])?;
+                    let ndim_val = call(compiler, builder, "nsl_tensor_ndim", &[inputs[0]])?;
                     let one = builder.ins().iconst(cl_types::I64, 1);
                     let last_dim = builder.ins().isub(ndim_val, one);
                     let keepdim = builder.ins().iconst(cl_types::I64, 1);
@@ -2149,8 +2299,7 @@ fn lower_single_op(
                     //
                     // Resolves "last dim" at runtime via nsl_tensor_ndim
                     // to avoid the dim=-1 → global-sum ambiguity.
-                    let ndim_val =
-                        call(compiler, builder, "nsl_tensor_ndim", &[inputs[0]])?;
+                    let ndim_val = call(compiler, builder, "nsl_tensor_ndim", &[inputs[0]])?;
                     let one = builder.ins().iconst(cl_types::I64, 1);
                     let last_dim = builder.ins().isub(ndim_val, one);
                     let keepdim = builder.ins().iconst(cl_types::I64, 1);

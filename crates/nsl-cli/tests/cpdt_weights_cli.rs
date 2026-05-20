@@ -221,7 +221,9 @@ fn neither_present_cpdt_full_errors_with_three_options() {
         .stderr(predicate::str::contains("requires weights"))
         .stderr(predicate::str::contains("1. Add --weights"))
         .stderr(predicate::str::contains("2. Add `let w = load_safetensors"))
-        .stderr(predicate::str::contains("3. Add `@cpdt(weight_aware=false)"));
+        .stderr(predicate::str::contains(
+            "3. Add `@cpdt(weight_aware=false)",
+        ));
 }
 
 /// Case 5: neither present; CPDT enabled; `@cpdt(weight_aware=false)`
@@ -237,11 +239,7 @@ fn neither_present_cpdt_full_with_opt_out_succeeds() {
     // flag `--cpdt-num-gpus`, not from the decorator directly (which would
     // take `cluster={num_gpus=...}` if configured there). Use the bare
     // `@cpdt(weight_aware=false)` form here.
-    fs::write(
-        &src_path,
-        render_source("", "@cpdt(weight_aware=false)"),
-    )
-    .unwrap();
+    fs::write(&src_path, render_source("", "@cpdt(weight_aware=false)")).unwrap();
 
     // The @cpdt decorator changes downstream codegen in ways unrelated to
     // the decision-table opt-out (the fixture's minimal SGD step relies on

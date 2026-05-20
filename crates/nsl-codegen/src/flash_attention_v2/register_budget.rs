@@ -20,12 +20,12 @@ pub const SM75_REGISTER_CAP: u32 = 255;
 ///   PCA segment (if segment_masked): 3 GPR scratch regs + 1 pred
 ///                                    reg (ptxas-tallied separately)
 pub fn count_registers(config: &FlashAttentionConfig) -> u32 {
-    let q_row         = (config.head_dim / 32) as u32;
-    let s_scratch     = 1;
-    let o_acc         = (config.head_dim / 32) as u32;
-    let softmax       = 5;
-    let scratch       = 10;
-    let rope_extra    = if config.rope_q { 4 } else { 0 };
+    let q_row = (config.head_dim / 32) as u32;
+    let s_scratch = 1;
+    let o_acc = (config.head_dim / 32) as u32;
+    let softmax = 5;
+    let scratch = 10;
+    let rope_extra = if config.rope_q { 4 } else { 0 };
     // PCA Tier A (spec §6.4): helper adds 3 scratch GPRs + 1 pred
     // chain. Predicate regs are tallied separately by ptxas; here
     // we only count GPR pressure.

@@ -30,6 +30,10 @@ fn canonical_test_config() -> FlashAttentionConfig {
         tree_mask: false,
         gpu_sm: 120,
         segment_masked: false,
-        csha: Some(CshaExtras { level: 2, d_model: 2048, ..CshaExtras::default() }),
+        csha: Some(CshaExtras {
+            level: 2,
+            d_model: 2048,
+            ..CshaExtras::default()
+        }),
     }
 }

@@ -135,9 +135,11 @@ fn m56_speculative_decoding_compiles_clean() {
     let out = run_check("m56_speculative_decoding");
     let stderr = String::from_utf8_lossy(&out.stderr);
     // Three-agent linear pipeline — no E060x codes should fire.
-    assert!(!stderr.contains("E060") && !stderr.contains("E0610"),
+    assert!(
+        !stderr.contains("E060") && !stderr.contains("E0610"),
         "expected clean check for speculative decoding pipeline; stderr:\n{}",
-        stderr);
+        stderr
+    );
 }
 
 /// @shared embedding table — v2-pending runtime, but semantic check (Task 8)

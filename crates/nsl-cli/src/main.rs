@@ -812,7 +812,8 @@ fn main_inner() {
                 let source = std::fs::read_to_string(&file).unwrap_or_default();
                 let mut nan_interner = Interner::new();
                 let mut nan_source_map = SourceMap::new();
-                let nan_file_id = nan_source_map.add_file(file.display().to_string(), source.clone());
+                let nan_file_id =
+                    nan_source_map.add_file(file.display().to_string(), source.clone());
                 let (tokens, _) = nsl_lexer::tokenize(&source, nan_file_id, &mut nan_interner);
                 let parse_result = nsl_parser::parse(&tokens, &mut nan_interner);
 
@@ -837,7 +838,8 @@ fn main_inner() {
                 let source = std::fs::read_to_string(&file).unwrap_or_default();
                 let mut det_interner = Interner::new();
                 let mut det_source_map = SourceMap::new();
-                let det_file_id = det_source_map.add_file(file.display().to_string(), source.clone());
+                let det_file_id =
+                    det_source_map.add_file(file.display().to_string(), source.clone());
                 let (tokens, _) = nsl_lexer::tokenize(&source, det_file_id, &mut det_interner);
                 let parse_result = nsl_parser::parse(&tokens, &mut det_interner);
 
@@ -846,10 +848,14 @@ fn main_inner() {
                 );
                 checker.scan_module(&parse_result.module, &det_interner);
 
-                let errors: Vec<_> = checker.diagnostics.iter()
+                let errors: Vec<_> = checker
+                    .diagnostics
+                    .iter()
                     .filter(|d| d.level == nsl_errors::Level::Error)
                     .collect();
-                let warnings: Vec<_> = checker.diagnostics.iter()
+                let warnings: Vec<_> = checker
+                    .diagnostics
+                    .iter()
                     .filter(|d| d.level == nsl_errors::Level::Warning)
                     .collect();
 
@@ -1047,10 +1053,16 @@ fn main_inner() {
             }
             if let Some(ref p) = calibration_data {
                 if !p.exists() {
-                    eprintln!("error: --calibration-data path does not exist: {}", p.display());
+                    eprintln!(
+                        "error: --calibration-data path does not exist: {}",
+                        p.display()
+                    );
                     process::exit(1);
                 }
-                let ext = p.extension().and_then(|e| e.to_str()).map(|s| s.to_ascii_lowercase());
+                let ext = p
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .map(|s| s.to_ascii_lowercase());
                 match ext.as_deref() {
                     Some("bin") | Some("safetensors") => {}
                     other => {
@@ -1182,7 +1194,8 @@ fn main_inner() {
                 autotune_fresh,
                 world_size: 1, // Build cmd doesn't use --devices; TP world_size is always 1
                 fusion_report,
-                vram_budget: vram_budget.as_deref()
+                vram_budget: vram_budget
+                    .as_deref()
                     .and_then(nsl_codegen::memory_planner::parse_vram_budget),
                 memory_report,
                 target,
@@ -1195,7 +1208,11 @@ fn main_inner() {
                 // M52: When --standalone, weights are handled by standalone pipeline;
                 // otherwise pass through the four-case-resolved weight file from
                 // above (AST auto-detect + --weights flag decision table).
-                weight_file: if standalone { None } else { resolved_weight_file.clone() },
+                weight_file: if standalone {
+                    None
+                } else {
+                    resolved_weight_file.clone()
+                },
                 weight_config: nsl_codegen::weight_aware::WeightAwareConfig {
                     dead_weight_threshold,
                     sparse_threshold,
@@ -1295,10 +1312,7 @@ fn main_inner() {
             }
             if let Some(ref p) = wggo_weights {
                 if !p.exists() {
-                    eprintln!(
-                        "error: --wggo-weights path does not exist: {}",
-                        p.display()
-                    );
+                    eprintln!("error: --wggo-weights path does not exist: {}", p.display());
                     process::exit(1);
                 }
             }
@@ -1341,7 +1355,13 @@ fn main_inner() {
                     wrga_report.as_deref(),
                 );
             } else if shared_lib {
-                run_build_shared(&file, output, dump_ir, &compile_opts, wrga_report.as_deref());
+                run_build_shared(
+                    &file,
+                    output,
+                    dump_ir,
+                    &compile_opts,
+                    wrga_report.as_deref(),
+                );
             } else if zk_circuit {
                 run_build_zk(
                     &file,
@@ -1353,7 +1373,14 @@ fn main_inner() {
                     wrga_report.as_deref(),
                 );
             } else {
-                run_build(&file, output, emit_obj, dump_ir, &compile_opts, wrga_report.as_deref());
+                run_build(
+                    &file,
+                    output,
+                    emit_obj,
+                    dump_ir,
+                    &compile_opts,
+                    wrga_report.as_deref(),
+                );
             }
 
             // CPDT: post-compile rendering. Stderr diagnostics always fire
@@ -1476,14 +1503,13 @@ fn main_inner() {
                             process::exit(1);
                         }
                     };
-                let manifest_path =
-                    match nsl_cli::monitor::write_manifest_beside(&file, &report) {
-                        Ok(p) => p,
-                        Err(e) => {
-                            eprintln!("error: {e}");
-                            process::exit(1);
-                        }
-                    };
+                let manifest_path = match nsl_cli::monitor::write_manifest_beside(&file, &report) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        process::exit(1);
+                    }
+                };
                 let actual_path = file.with_extension("nsl-profile-actual.json");
                 match nsl_cli::monitor::run_monitor(&file, &manifest_path, &actual_path) {
                     Ok(rendered) => {
@@ -1612,7 +1638,15 @@ fn main_inner() {
                 let binary_path = temp_dir.join(&exe_name);
 
                 // Build the binary
-                run_build_inner(&file, Some(binary_path.clone()), false, false, true, &compile_opts, None);
+                run_build_inner(
+                    &file,
+                    Some(binary_path.clone()),
+                    false,
+                    false,
+                    true,
+                    &compile_opts,
+                    None,
+                );
 
                 let mut children: Vec<(&str, std::process::Child)> = Vec::new();
                 let total_workers = 1 + prefill_workers + decode_workers;
@@ -1800,7 +1834,16 @@ fn main_inner() {
                     std::process::exit(1);
                 }
             } else {
-                run_run(&file, &args, profile_memory, profile_kernels, profile, cuda_sync, gpu_mem_report, &compile_opts);
+                run_run(
+                    &file,
+                    &args,
+                    profile_memory,
+                    profile_kernels,
+                    profile,
+                    cuda_sync,
+                    gpu_mem_report,
+                    &compile_opts,
+                );
                 // Phase 4 Task 6: after the child process exits, load and
                 // render the health snapshot written by the runtime flush
                 // hook.  Only runs when `--monitor` + train-block detection
@@ -1887,12 +1930,7 @@ fn main_inner() {
             diff,
             export_chrome,
         } => {
-            debug::run_debug(
-                &file,
-                find_nan,
-                diff.as_deref(),
-                export_chrome.as_deref(),
-            );
+            debug::run_debug(&file, find_nan, diff.as_deref(), export_chrome.as_deref());
         }
         Cli::Zk { cmd } => {
             run_zk_cmd(cmd);
@@ -1931,20 +1969,36 @@ fn main_inner() {
                 }
             }
         }
-        Cli::Tokenize { dirs, output, vocab_size, min_freq, ext } => {
+        Cli::Tokenize {
+            dirs,
+            output,
+            vocab_size,
+            min_freq,
+            ext,
+        } => {
             run_tokenize(&dirs, &output, vocab_size, min_freq, &ext);
         }
     }
 }
 
-fn frontend(file: &PathBuf) -> (Interner, nsl_parser::ParseResult, nsl_semantic::AnalysisResult) {
+fn frontend(
+    file: &PathBuf,
+) -> (
+    Interner,
+    nsl_parser::ParseResult,
+    nsl_semantic::AnalysisResult,
+) {
     frontend_with_flags(file, false)
 }
 
 fn frontend_with_flags(
     file: &PathBuf,
     linear_types: bool,
-) -> (Interner, nsl_parser::ParseResult, nsl_semantic::AnalysisResult) {
+) -> (
+    Interner,
+    nsl_parser::ParseResult,
+    nsl_semantic::AnalysisResult,
+) {
     let source = match std::fs::read_to_string(file) {
         Ok(s) => s,
         Err(e) => {
@@ -2004,8 +2058,7 @@ fn frontend_with_flags(
 /// direct dependency on nsl-semantic.
 fn module_data_to_wrga_inputs(m: &crate::loader::ModuleData) -> nsl_codegen::WrgaInputs {
     use nsl_codegen::{
-        AdapterDecoratorConfig, AdapterKind, FreezeDecoratorConfig, WrgaDecoratorConfig,
-        WrgaInputs,
+        AdapterDecoratorConfig, AdapterKind, FreezeDecoratorConfig, WrgaDecoratorConfig, WrgaInputs,
     };
     WrgaInputs {
         wrga: m
@@ -2045,8 +2098,7 @@ fn module_data_to_wrga_inputs(m: &crate::loader::ModuleData) -> nsl_codegen::Wrg
 
 fn analysis_to_wrga_inputs(a: &nsl_semantic::AnalysisResult) -> nsl_codegen::WrgaInputs {
     use nsl_codegen::{
-        AdapterDecoratorConfig, AdapterKind, FreezeDecoratorConfig, WrgaDecoratorConfig,
-        WrgaInputs,
+        AdapterDecoratorConfig, AdapterKind, FreezeDecoratorConfig, WrgaDecoratorConfig, WrgaInputs,
     };
     WrgaInputs {
         wrga: a
@@ -2084,7 +2136,13 @@ fn analysis_to_wrga_inputs(a: &nsl_semantic::AnalysisResult) -> nsl_codegen::Wrg
     }
 }
 
-fn run_check(file: &PathBuf, dump_tokens: bool, dump_ast: bool, dump_types: bool, linear_types: bool) {
+fn run_check(
+    file: &PathBuf,
+    dump_tokens: bool,
+    dump_ast: bool,
+    dump_types: bool,
+    linear_types: bool,
+) {
     let source = match std::fs::read_to_string(file) {
         Ok(s) => s,
         Err(e) => {
@@ -2127,7 +2185,10 @@ fn run_check(file: &PathBuf, dump_tokens: bool, dump_ast: bool, dump_types: bool
 
     // Semantic analysis (with ownership checking when --linear-types is active)
     let analysis = nsl_semantic::analyze_with_imports(
-        &parse_result.module, &mut interner, &std::collections::HashMap::new(), linear_types,
+        &parse_result.module,
+        &mut interner,
+        &std::collections::HashMap::new(),
+        linear_types,
     );
 
     for diag in &analysis.diagnostics {
@@ -2222,7 +2283,9 @@ fn emit_wrga_report(
     wrga_plan: &Option<nsl_codegen::wrga::WrgaPlan>,
     wrga_report: Option<&std::path::Path>,
 ) {
-    let Some(report_path) = wrga_report else { return; };
+    let Some(report_path) = wrga_report else {
+        return;
+    };
     match wrga_plan {
         Some(p) => {
             let report = p.render_report();
@@ -2264,7 +2327,8 @@ fn run_build_shared_single(
     options: &nsl_codegen::CompileOptions,
     wrga_report: Option<&std::path::Path>,
 ) {
-    let (interner, parse_result, analysis) = frontend_with_flags(file, options.linear_types_enabled);
+    let (interner, parse_result, analysis) =
+        frontend_with_flags(file, options.linear_types_enabled);
 
     // Task 3 (B.1): forward WRGA decorator configs so they take effect on the
     // shared-library build path, and fail fast if --wrga-report is combined
@@ -2324,7 +2388,10 @@ fn run_build_shared_single(
     let export_symbols: Vec<String> = exports_slot
         .lock()
         .ok()
-        .and_then(|g| g.as_ref().map(|v| v.iter().map(|e| e.symbol_name.clone()).collect()))
+        .and_then(|g| {
+            g.as_ref()
+                .map(|v| v.iter().map(|e| e.symbol_name.clone()).collect())
+        })
         .unwrap_or_default();
     // M62 Task 9: also re-export the runtime lifecycle symbols so that ctypes
     // callers can call nsl_model_create / nsl_model_destroy / nsl_get_last_error
@@ -2365,9 +2432,7 @@ fn run_build_shared_single(
 /// M62: Write a matching C header next to the shared library when the
 /// compile published one or more `@export` functions. No-op otherwise.
 fn emit_c_header_if_any(
-    exports_slot: &std::sync::Arc<
-        std::sync::Mutex<Option<Vec<nsl_codegen::c_header::ExportInfo>>>,
-    >,
+    exports_slot: &std::sync::Arc<std::sync::Mutex<Option<Vec<nsl_codegen::c_header::ExportInfo>>>>,
     lib_path: &std::path::Path,
 ) {
     let exports = match exports_slot.lock() {
@@ -2385,7 +2450,10 @@ fn emit_c_header_if_any(
     let header_path = lib_path.with_extension("h");
     match std::fs::write(&header_path, header) {
         Ok(()) => println!("Wrote C header {}", header_path.display()),
-        Err(e) => eprintln!("warning: failed to write header '{}': {e}", header_path.display()),
+        Err(e) => eprintln!(
+            "warning: failed to write header '{}': {e}",
+            header_path.display()
+        ),
     }
 }
 
@@ -2429,12 +2497,17 @@ fn run_build_shared_multi(
 
         let obj_bytes = if is_entry {
             let mut imported_fns = Vec::new();
-            let mut imported_struct_layouts: HashMap<String, nsl_codegen::context::StructLayout> = HashMap::new();
+            let mut imported_struct_layouts: HashMap<String, nsl_codegen::context::StructLayout> =
+                HashMap::new();
             let mut imported_model_names = std::collections::HashSet::new();
             let mut imported_enum_variants = HashMap::new();
             let mut imported_enum_defs = HashMap::new();
-            let mut imported_model_method_bodies: HashMap<String, HashMap<String, nsl_ast::decl::FnDef>> = HashMap::new();
-            let mut imported_model_field_types: HashMap<String, HashMap<String, String>> = HashMap::new();
+            let mut imported_model_method_bodies: HashMap<
+                String,
+                HashMap<String, nsl_ast::decl::FnDef>,
+            > = HashMap::new();
+            let mut imported_model_field_types: HashMap<String, HashMap<String, String>> =
+                HashMap::new();
 
             for dep_path in &graph.dep_order {
                 if dep_path == &graph.entry {
@@ -2456,8 +2529,12 @@ fn run_build_shared_multi(
 
                 for stmt in &dep_data.ast.stmts {
                     if let nsl_ast::stmt::StmtKind::FnDef(fn_def) = &stmt.kind {
-                        let raw_name = interner.resolve(fn_def.name.0).unwrap_or("<unknown>").to_string();
-                        let mangled_name = crate::mangling::mangle(&dep_data.module_prefix, &raw_name);
+                        let raw_name = interner
+                            .resolve(fn_def.name.0)
+                            .unwrap_or("<unknown>")
+                            .to_string();
+                        let mangled_name =
+                            crate::mangling::mangle(&dep_data.module_prefix, &raw_name);
                         let sig = temp_compiler.build_fn_signature(fn_def);
                         imported_fns.push((raw_name, mangled_name, sig));
                     }
@@ -2465,7 +2542,10 @@ fn run_build_shared_multi(
 
                 // Inject previously-collected struct layouts from earlier deps
                 for (name, layout) in &imported_struct_layouts {
-                    temp_compiler.types.struct_layouts.insert(name.clone(), layout.clone());
+                    temp_compiler
+                        .types
+                        .struct_layouts
+                        .insert(name.clone(), layout.clone());
                 }
 
                 if let Err(e) = temp_compiler.collect_structs(&dep_data.ast.stmts) {
@@ -2482,7 +2562,10 @@ fn run_build_shared_multi(
 
                 for stmt in &dep_data.ast.stmts {
                     if let nsl_ast::stmt::StmtKind::ModelDef(md) = &stmt.kind {
-                        let model_name = interner.resolve(md.name.0).unwrap_or("<unknown>").to_string();
+                        let model_name = interner
+                            .resolve(md.name.0)
+                            .unwrap_or("<unknown>")
+                            .to_string();
                         imported_model_names.insert(model_name);
                     }
                 }
@@ -2499,16 +2582,24 @@ fn run_build_shared_multi(
                 // Extract model method bodies directly from AST
                 for stmt in &dep_data.ast.stmts {
                     if let nsl_ast::stmt::StmtKind::ModelDef(md) = &stmt.kind {
-                        let model_name = interner.resolve(md.name.0).unwrap_or("<unknown>").to_string();
+                        let model_name = interner
+                            .resolve(md.name.0)
+                            .unwrap_or("<unknown>")
+                            .to_string();
                         let mut body_map = HashMap::new();
                         for member in &md.members {
                             if let nsl_ast::decl::ModelMember::Method(fn_def, _) = member {
-                                let method_name = interner.resolve(fn_def.name.0).unwrap_or("<unknown>").to_string();
+                                let method_name = interner
+                                    .resolve(fn_def.name.0)
+                                    .unwrap_or("<unknown>")
+                                    .to_string();
                                 body_map.insert(method_name, fn_def.clone());
                             }
                         }
                         if !body_map.is_empty() {
-                            imported_model_method_bodies.entry(model_name).or_insert(body_map);
+                            imported_model_method_bodies
+                                .entry(model_name)
+                                .or_insert(body_map);
                         }
                     }
                 }
@@ -2582,7 +2673,10 @@ fn run_build_shared_multi(
         let obj_path = temp_dir.join(format!("{stem}_{}.o", obj_files.len()));
 
         if let Err(e) = std::fs::write(&obj_path, &obj_bytes) {
-            eprintln!("error: could not write object file '{}': {e}", obj_path.display());
+            eprintln!(
+                "error: could not write object file '{}': {e}",
+                obj_path.display()
+            );
             process::exit(1);
         }
 
@@ -2601,7 +2695,10 @@ fn run_build_shared_multi(
     let export_symbols: Vec<String> = exports_slot
         .lock()
         .ok()
-        .and_then(|g| g.as_ref().map(|v| v.iter().map(|e| e.symbol_name.clone()).collect()))
+        .and_then(|g| {
+            g.as_ref()
+                .map(|v| v.iter().map(|e| e.symbol_name.clone()).collect())
+        })
         .unwrap_or_default();
     // M62 Task 9: mirror the single-file path and re-export runtime lifecycle
     // symbols so ctypes callers can load weights + call exports through the
@@ -2648,7 +2745,8 @@ fn run_build_zk(
     options: &nsl_codegen::CompileOptions,
     wrga_report: Option<&std::path::Path>,
 ) {
-    let (interner, parse_result, analysis) = frontend_with_flags(file, options.linear_types_enabled);
+    let (interner, parse_result, analysis) =
+        frontend_with_flags(file, options.linear_types_enabled);
 
     // Task 3 (B.1): forward WRGA decorator configs so `@freeze`/`@adapter`/`@wrga`
     // take effect in codegen on the ZK build path.
@@ -2706,18 +2804,25 @@ fn run_build_zk(
                 if let Err(e) = std::fs::write(&proof_path, &proof.data) {
                     eprintln!("[nsl/zk] error writing proof: {e}");
                 } else {
-                    eprintln!("[nsl/zk]   proof: {} ({} bytes, {} folds)",
-                        proof_path.display(), proof.data.len(), proof.num_folds);
+                    eprintln!(
+                        "[nsl/zk]   proof: {} ({} bytes, {} folds)",
+                        proof_path.display(),
+                        proof.data.len(),
+                        proof.num_folds
+                    );
                 }
 
                 // Write public inputs as JSON
                 let pi_path = file.with_extension(format!("{}.public.json", fn_name));
-                let pi_entries: Vec<String> = proof.public_inputs.iter()
+                let pi_entries: Vec<String> = proof
+                    .public_inputs
+                    .iter()
                     .map(|v| format!("{:?}", v))
                     .collect();
                 let pi_json = format!(
                     "{{\"public_inputs\":[{}],\"num_folds\":{}}}",
-                    pi_entries.join(","), proof.num_folds
+                    pi_entries.join(","),
+                    proof.num_folds
                 );
                 if let Err(e) = std::fs::write(&pi_path, &pi_json) {
                     eprintln!("[nsl/zk] error writing public inputs: {e}");
@@ -2769,39 +2874,54 @@ fn run_build_zk(
 /// M55c: Handle `nsl zk <subcommand>`.
 fn run_zk_cmd(cmd: ZkCmd) {
     match cmd {
-        ZkCmd::Stats { file } => {
-            match std::fs::read(&file) {
-                Ok(data) => {
-                    if data.len() < 12 {
-                        eprintln!("[nsl/zk] invalid proof file: too short ({} bytes)", data.len());
-                        process::exit(1);
-                    }
-                    let num_folds = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
-                    let instance_len = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
-                    let num_rounds = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
-                    println!("Proof stats:");
-                    println!("  File:        {}", file.display());
-                    println!("  Size:        {} bytes", data.len());
-                    println!("  Folds:       {}", num_folds);
-                    println!("  Instance:    {} elements", instance_len);
-                    println!("  SC rounds:   {}", num_rounds);
-                }
-                Err(e) => {
-                    eprintln!("error reading {}: {e}", file.display());
+        ZkCmd::Stats { file } => match std::fs::read(&file) {
+            Ok(data) => {
+                if data.len() < 12 {
+                    eprintln!(
+                        "[nsl/zk] invalid proof file: too short ({} bytes)",
+                        data.len()
+                    );
                     process::exit(1);
                 }
+                let num_folds = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
+                let instance_len = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
+                let num_rounds = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
+                println!("Proof stats:");
+                println!("  File:        {}", file.display());
+                println!("  Size:        {} bytes", data.len());
+                println!("  Folds:       {}", num_folds);
+                println!("  Instance:    {} elements", instance_len);
+                println!("  SC rounds:   {}", num_rounds);
             }
-        }
-        ZkCmd::Prove { file, pk: _, input: _, output } => {
+            Err(e) => {
+                eprintln!("error reading {}: {e}", file.display());
+                process::exit(1);
+            }
+        },
+        ZkCmd::Prove {
+            file,
+            pk: _,
+            input: _,
+            output,
+        } => {
             // For the folding backend, proofs are generated during compilation.
             eprintln!("[nsl/zk] For the folding backend, proofs are generated during `nsl build --zk-circuit`.");
-            eprintln!("[nsl/zk] The proof file is written alongside the binary as <file>.<fn_name>.proof");
+            eprintln!(
+                "[nsl/zk] The proof file is written alongside the binary as <file>.<fn_name>.proof"
+            );
             if let Some(ref out) = output {
                 eprintln!("[nsl/zk] Requested output: {}", out.display());
             }
-            eprintln!("[nsl/zk] To generate a proof, run: nsl build --zk-circuit {}", file.display());
+            eprintln!(
+                "[nsl/zk] To generate a proof, run: nsl build --zk-circuit {}",
+                file.display()
+            );
         }
-        ZkCmd::Verify { vk: _, proof, public: _ } => {
+        ZkCmd::Verify {
+            vk: _,
+            proof,
+            public: _,
+        } => {
             match std::fs::read(&proof) {
                 Ok(data) => {
                     if data.len() < 12 {
@@ -2810,7 +2930,8 @@ fn run_zk_cmd(cmd: ZkCmd) {
                     }
 
                     let num_folds = u32::from_le_bytes([data[0], data[1], data[2], data[3]]);
-                    let instance_len = u32::from_le_bytes([data[4], data[5], data[6], data[7]]) as usize;
+                    let instance_len =
+                        u32::from_le_bytes([data[4], data[5], data[6], data[7]]) as usize;
                     let num_rounds = u32::from_le_bytes([data[8], data[9], data[10], data[11]]);
 
                     // Reconstruct ZkProof for verification
@@ -2822,12 +2943,16 @@ fn run_zk_cmd(cmd: ZkCmd) {
                     };
 
                     use nsl_codegen::zk::backend::FoldingBackend;
-                    type M31Prover = nsl_codegen::zk::folding::FoldingProver<nsl_codegen::zk::field_m31::Mersenne31Field>;
+                    type M31Prover = nsl_codegen::zk::folding::FoldingProver<
+                        nsl_codegen::zk::field_m31::Mersenne31Field,
+                    >;
 
                     match M31Prover::verify(&zk_proof, &[]) {
                         Ok(true) => {
-                            println!("VERIFIED: proof is valid ({} folds, {} sumcheck rounds)",
-                                num_folds, num_rounds);
+                            println!(
+                                "VERIFIED: proof is valid ({} folds, {} sumcheck rounds)",
+                                num_folds, num_rounds
+                            );
                         }
                         Ok(false) => {
                             println!("INVALID: proof verification failed");
@@ -2875,7 +3000,8 @@ fn run_build_standalone(
 
     // 4. Run frontend (lex, parse, semantic analysis)
     let file_pb = file.to_path_buf();
-    let (interner, parse_result, analysis) = frontend_with_flags(&file_pb, options.linear_types_enabled);
+    let (interner, parse_result, analysis) =
+        frontend_with_flags(&file_pb, options.linear_types_enabled);
 
     // Task 3 (B.1): forward WRGA decorator configs so `@freeze`/`@adapter`/`@wrga`
     // take effect in codegen on the standalone build path.
@@ -2945,10 +3071,11 @@ fn run_build_standalone(
     // 8. Handle embedded weights or sidecar
     if embedded {
         // Create weight object containing the nslweights data
-        let weight_obj_bytes = nsl_codegen::create_weight_object(&nslweights_data).unwrap_or_else(|e| {
-            eprintln!("error: could not create weight object: {e}");
-            process::exit(1);
-        });
+        let weight_obj_bytes =
+            nsl_codegen::create_weight_object(&nslweights_data).unwrap_or_else(|e| {
+                eprintln!("error: could not create weight object: {e}");
+                process::exit(1);
+            });
         let weight_obj_path = temp_dir.join("weights.o");
         if let Err(e) = std::fs::write(&weight_obj_path, &weight_obj_bytes) {
             eprintln!("error: could not write weight object file: {e}");
@@ -2957,10 +3084,12 @@ fn run_build_standalone(
         obj_paths.push(weight_obj_path);
     } else {
         // Write sidecar .nslweights file
-        standalone::write_nslweights_sidecar_raw(&nslweights_data, &sidecar_path).unwrap_or_else(|e| {
-            eprintln!("error: {e}");
-            process::exit(1);
-        });
+        standalone::write_nslweights_sidecar_raw(&nslweights_data, &sidecar_path).unwrap_or_else(
+            |e| {
+                eprintln!("error: {e}");
+                process::exit(1);
+            },
+        );
     }
 
     // 9. Link all objects
@@ -2972,8 +3101,15 @@ fn run_build_standalone(
             }
             let _ = std::fs::remove_dir(&temp_dir);
 
-            println!("Built {} (standalone{})", output_path.display(),
-                if embedded { ", weights embedded" } else { ", sidecar weights" });
+            println!(
+                "Built {} (standalone{})",
+                output_path.display(),
+                if embedded {
+                    ", weights embedded"
+                } else {
+                    ", sidecar weights"
+                }
+            );
             if !embedded {
                 println!("  Sidecar: {}", sidecar_path.display());
             }
@@ -3011,7 +3147,8 @@ fn run_build_single(
     options: &nsl_codegen::CompileOptions,
     wrga_report: Option<&std::path::Path>,
 ) {
-    let (interner, parse_result, analysis) = frontend_with_flags(file, options.linear_types_enabled);
+    let (interner, parse_result, analysis) =
+        frontend_with_flags(file, options.linear_types_enabled);
 
     // Task 3 (B.1): fail fast if --wrga-report is used without --source-ad
     // when decorators are present — the old silent-notice behaviour was
@@ -3098,7 +3235,9 @@ fn run_build_single(
     }
 
     if emit_obj {
-        if !quiet { println!("Wrote {}", obj_path.display()); }
+        if !quiet {
+            println!("Wrote {}", obj_path.display());
+        }
         return;
     }
 
@@ -3113,7 +3252,9 @@ fn run_build_single(
         Ok(()) => {
             // Clean up .o file after successful link
             let _ = std::fs::remove_file(&obj_path);
-            if !quiet { println!("Built {}", exe_path.display()); }
+            if !quiet {
+                println!("Built {}", exe_path.display());
+            }
         }
         Err(e) => {
             eprintln!("link error: {e}");
@@ -3161,12 +3302,17 @@ fn run_build_multi(
         let obj_bytes = if is_entry {
             // Entry module: import functions from all dependencies
             let mut imported_fns = Vec::new();
-            let mut imported_struct_layouts: HashMap<String, nsl_codegen::context::StructLayout> = HashMap::new();
+            let mut imported_struct_layouts: HashMap<String, nsl_codegen::context::StructLayout> =
+                HashMap::new();
             let mut imported_model_names = std::collections::HashSet::new();
             let mut imported_enum_variants = HashMap::new();
             let mut imported_enum_defs = HashMap::new();
-            let mut imported_model_method_bodies: HashMap<String, HashMap<String, nsl_ast::decl::FnDef>> = HashMap::new();
-            let mut imported_model_field_types: HashMap<String, HashMap<String, String>> = HashMap::new();
+            let mut imported_model_method_bodies: HashMap<
+                String,
+                HashMap<String, nsl_ast::decl::FnDef>,
+            > = HashMap::new();
+            let mut imported_model_field_types: HashMap<String, HashMap<String, String>> =
+                HashMap::new();
 
             // Collect imports from ALL dependency modules (not just direct deps)
             for dep_path in &graph.dep_order {
@@ -3176,7 +3322,11 @@ fn run_build_multi(
                 let dep_data = &graph.modules[dep_path];
 
                 // Build function signatures and struct layouts using a temporary compiler
-                let mut temp_compiler = match nsl_codegen::compiler::Compiler::new(&interner, &dep_data.type_map, &nsl_codegen::CompileOptions::default()) {
+                let mut temp_compiler = match nsl_codegen::compiler::Compiler::new(
+                    &interner,
+                    &dep_data.type_map,
+                    &nsl_codegen::CompileOptions::default(),
+                ) {
                     Ok(c) => c,
                     Err(e) => {
                         eprintln!("codegen error: {e}");
@@ -3186,8 +3336,12 @@ fn run_build_multi(
 
                 for stmt in &dep_data.ast.stmts {
                     if let nsl_ast::stmt::StmtKind::FnDef(fn_def) = &stmt.kind {
-                        let raw_name = interner.resolve(fn_def.name.0).unwrap_or("<unknown>").to_string();
-                        let mangled_name = crate::mangling::mangle(&dep_data.module_prefix, &raw_name);
+                        let raw_name = interner
+                            .resolve(fn_def.name.0)
+                            .unwrap_or("<unknown>")
+                            .to_string();
+                        let mangled_name =
+                            crate::mangling::mangle(&dep_data.module_prefix, &raw_name);
                         let sig = temp_compiler.build_fn_signature(fn_def);
                         imported_fns.push((raw_name, mangled_name, sig));
                     }
@@ -3197,16 +3351,25 @@ fn run_build_multi(
                 // collect_models can resolve sub-model field types (e.g., GQA referencing
                 // RotaryEmbedding which was collected from the rope module earlier).
                 for (name, layout) in &imported_struct_layouts {
-                    temp_compiler.types.struct_layouts.insert(name.clone(), layout.clone());
+                    temp_compiler
+                        .types
+                        .struct_layouts
+                        .insert(name.clone(), layout.clone());
                 }
 
                 // Extract struct layouts from dependency (structs first, then models which may reference structs)
                 if let Err(e) = temp_compiler.collect_structs(&dep_data.ast.stmts) {
-                    eprintln!("codegen error collecting structs from '{}': {e}", dep_path.display());
+                    eprintln!(
+                        "codegen error collecting structs from '{}': {e}",
+                        dep_path.display()
+                    );
                     process::exit(1);
                 }
                 if let Err(e) = temp_compiler.collect_models(&dep_data.ast.stmts) {
-                    eprintln!("codegen error collecting models from '{}': {e}", dep_path.display());
+                    eprintln!(
+                        "codegen error collecting models from '{}': {e}",
+                        dep_path.display()
+                    );
                     process::exit(1);
                 }
 
@@ -3217,7 +3380,10 @@ fn run_build_multi(
                 // Collect model names from dep (so entry module won't generate struct ctors for them)
                 for stmt in &dep_data.ast.stmts {
                     if let nsl_ast::stmt::StmtKind::ModelDef(md) = &stmt.kind {
-                        let model_name = interner.resolve(md.name.0).unwrap_or("<unknown>").to_string();
+                        let model_name = interner
+                            .resolve(md.name.0)
+                            .unwrap_or("<unknown>")
+                            .to_string();
                         imported_model_names.insert(model_name);
                     }
                 }
@@ -3236,16 +3402,24 @@ fn run_build_multi(
                 // which is not called on temp compilers).
                 for stmt in &dep_data.ast.stmts {
                     if let nsl_ast::stmt::StmtKind::ModelDef(md) = &stmt.kind {
-                        let model_name = interner.resolve(md.name.0).unwrap_or("<unknown>").to_string();
+                        let model_name = interner
+                            .resolve(md.name.0)
+                            .unwrap_or("<unknown>")
+                            .to_string();
                         let mut body_map = HashMap::new();
                         for member in &md.members {
                             if let nsl_ast::decl::ModelMember::Method(fn_def, _) = member {
-                                let method_name = interner.resolve(fn_def.name.0).unwrap_or("<unknown>").to_string();
+                                let method_name = interner
+                                    .resolve(fn_def.name.0)
+                                    .unwrap_or("<unknown>")
+                                    .to_string();
                                 body_map.insert(method_name, fn_def.clone());
                             }
                         }
                         if !body_map.is_empty() {
-                            imported_model_method_bodies.entry(model_name).or_insert(body_map);
+                            imported_model_method_bodies
+                                .entry(model_name)
+                                .or_insert(body_map);
                         }
                     }
                 }
@@ -3299,12 +3473,16 @@ fn run_build_multi(
             // Library module: export all functions.
             // If this module has dependencies (imports from other modules), inject their symbols.
             let mut lib_imported_fns = Vec::new();
-            let mut lib_struct_layouts: HashMap<String, nsl_codegen::context::StructLayout> = HashMap::new();
+            let mut lib_struct_layouts: HashMap<String, nsl_codegen::context::StructLayout> =
+                HashMap::new();
             let mut lib_model_names = std::collections::HashSet::new();
 
             // Check if this module has any imports
             let has_imports = mod_data.ast.stmts.iter().any(|s| {
-                matches!(s.kind, nsl_ast::stmt::StmtKind::FromImport(_) | nsl_ast::stmt::StmtKind::Import(_))
+                matches!(
+                    s.kind,
+                    nsl_ast::stmt::StmtKind::FromImport(_) | nsl_ast::stmt::StmtKind::Import(_)
+                )
             });
 
             if has_imports {
@@ -3315,14 +3493,26 @@ fn run_build_multi(
                     }
                     // Only include deps that are before this module in dep_order
                     // (i.e., deps of this module, not modules that depend on it)
-                    let dep_idx = graph.dep_order.iter().position(|p| p == dep_path).unwrap_or(usize::MAX);
-                    let cur_idx = graph.dep_order.iter().position(|p| p == path).unwrap_or(usize::MAX);
+                    let dep_idx = graph
+                        .dep_order
+                        .iter()
+                        .position(|p| p == dep_path)
+                        .unwrap_or(usize::MAX);
+                    let cur_idx = graph
+                        .dep_order
+                        .iter()
+                        .position(|p| p == path)
+                        .unwrap_or(usize::MAX);
                     if dep_idx >= cur_idx {
                         continue;
                     }
 
                     let dep_data = &graph.modules[dep_path];
-                    let mut temp_compiler = match nsl_codegen::compiler::Compiler::new(&interner, &dep_data.type_map, &nsl_codegen::CompileOptions::default()) {
+                    let mut temp_compiler = match nsl_codegen::compiler::Compiler::new(
+                        &interner,
+                        &dep_data.type_map,
+                        &nsl_codegen::CompileOptions::default(),
+                    ) {
                         Ok(c) => c,
                         Err(e) => {
                             eprintln!("codegen error: {e}");
@@ -3332,8 +3522,12 @@ fn run_build_multi(
 
                     for stmt in &dep_data.ast.stmts {
                         if let nsl_ast::stmt::StmtKind::FnDef(fn_def) = &stmt.kind {
-                            let raw_name = interner.resolve(fn_def.name.0).unwrap_or("<unknown>").to_string();
-                            let mangled_name = crate::mangling::mangle(&dep_data.module_prefix, &raw_name);
+                            let raw_name = interner
+                                .resolve(fn_def.name.0)
+                                .unwrap_or("<unknown>")
+                                .to_string();
+                            let mangled_name =
+                                crate::mangling::mangle(&dep_data.module_prefix, &raw_name);
                             let sig = temp_compiler.build_fn_signature(fn_def);
                             lib_imported_fns.push((raw_name, mangled_name, sig));
                         }
@@ -3341,7 +3535,10 @@ fn run_build_multi(
 
                     // Inject previously-collected struct layouts from earlier deps
                     for (name, layout) in &lib_struct_layouts {
-                        temp_compiler.types.struct_layouts.insert(name.clone(), layout.clone());
+                        temp_compiler
+                            .types
+                            .struct_layouts
+                            .insert(name.clone(), layout.clone());
                     }
 
                     if let Err(e) = temp_compiler.collect_structs(&dep_data.ast.stmts) {
@@ -3358,7 +3555,10 @@ fn run_build_multi(
 
                     for stmt in &dep_data.ast.stmts {
                         if let nsl_ast::stmt::StmtKind::ModelDef(md) = &stmt.kind {
-                            let model_name = interner.resolve(md.name.0).unwrap_or("<unknown>").to_string();
+                            let model_name = interner
+                                .resolve(md.name.0)
+                                .unwrap_or("<unknown>")
+                                .to_string();
                             lib_model_names.insert(model_name);
                         }
                     }
@@ -3393,7 +3593,10 @@ fn run_build_multi(
         let obj_path = temp_dir.join(format!("{stem}_{}.o", obj_files.len()));
 
         if let Err(e) = std::fs::write(&obj_path, &obj_bytes) {
-            eprintln!("error: could not write object file '{}': {e}", obj_path.display());
+            eprintln!(
+                "error: could not write object file '{}': {e}",
+                obj_path.display()
+            );
             process::exit(1);
         }
 
@@ -3442,7 +3645,9 @@ fn run_build_multi(
             for obj in &obj_files {
                 let _ = std::fs::remove_file(obj);
             }
-            if !quiet { println!("Built {}", exe_path.display()); }
+            if !quiet {
+                println!("Built {}", exe_path.display());
+            }
         }
         Err(e) => {
             eprintln!("link error: {e}");
@@ -3452,7 +3657,16 @@ fn run_build_multi(
 }
 
 #[allow(clippy::too_many_arguments)] // CLI dispatcher, not a library API
-fn run_run(file: &PathBuf, program_args: &[String], profile_memory: bool, profile_kernels: bool, profile: bool, cuda_sync: bool, gpu_mem_report: bool, options: &nsl_codegen::CompileOptions) {
+fn run_run(
+    file: &PathBuf,
+    program_args: &[String],
+    profile_memory: bool,
+    profile_kernels: bool,
+    profile: bool,
+    cuda_sync: bool,
+    gpu_mem_report: bool,
+    options: &nsl_codegen::CompileOptions,
+) {
     let temp_dir = std::env::temp_dir().join(format!("nsl_run_{}", std::process::id()));
     if let Err(e) = std::fs::create_dir_all(&temp_dir) {
         eprintln!("error: could not create temp dir: {e}");
@@ -3471,7 +3685,15 @@ fn run_run(file: &PathBuf, program_args: &[String], profile_memory: bool, profil
     let exe_path = temp_dir.join(&exe_name);
 
     // Build to temp dir (reuse existing build logic, quiet mode)
-    run_build_inner(file, Some(exe_path.clone()), false, false, true, options, None);
+    run_build_inner(
+        file,
+        Some(exe_path.clone()),
+        false,
+        false,
+        true,
+        options,
+        None,
+    );
 
     // Execute the compiled program
     let mut cmd = std::process::Command::new(&exe_path);
@@ -3490,12 +3712,10 @@ fn run_run(file: &PathBuf, program_args: &[String], profile_memory: bool, profil
         // to print the GPU memory report after the compiled main returns.
         cmd.env("NSL_GPU_MEM_REPORT", "1");
     }
-    let status = cmd
-        .status()
-        .unwrap_or_else(|e| {
-            eprintln!("error: could not execute '{}': {e}", exe_path.display());
-            process::exit(1);
-        });
+    let status = cmd.status().unwrap_or_else(|e| {
+        eprintln!("error: could not execute '{}': {e}", exe_path.display());
+        process::exit(1);
+    });
 
     // Merge profile traces before exiting (process::exit won't return)
     if profile {
@@ -3551,10 +3771,7 @@ fn run_test(file: &PathBuf, filter: Option<&str>) {
         process::exit(1);
     }
 
-    let stem = file
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("test");
+    let stem = file.file_stem().and_then(|s| s.to_str()).unwrap_or("test");
     let obj_path = temp_dir.join(format!("{stem}.o"));
     let exe_name = if cfg!(target_os = "windows") {
         format!("{stem}.exe")
@@ -3629,7 +3846,10 @@ fn run_test(file: &PathBuf, filter: Option<&str>) {
 ///   [16 .. 16+header_size]  JSON: {"params":[{"name":...,"shape":[...],"dtype":"f32"|"f64","offset":N,"nbytes":N}]}
 ///   padding to next 64-byte boundary (from offset 16+header_size)
 ///   raw little-endian tensor data concatenated in params order
-fn convert_nslm_to_safetensors(input_path: &std::path::Path, output_path: &std::path::Path) -> Result<(), String> {
+fn convert_nslm_to_safetensors(
+    input_path: &std::path::Path,
+    output_path: &std::path::Path,
+) -> Result<(), String> {
     use std::collections::HashMap;
 
     let data = std::fs::read(input_path)
@@ -3638,24 +3858,30 @@ fn convert_nslm_to_safetensors(input_path: &std::path::Path, output_path: &std::
     if data.len() < 16 {
         return Err(format!(
             "'{}' is too small to be a valid NSLM file ({} bytes)",
-            input_path.display(), data.len()
+            input_path.display(),
+            data.len()
         ));
     }
     if &data[0..4] != b"NSLM" {
-        return Err(format!("'{}' is not a valid NSLM file (bad magic)", input_path.display()));
+        return Err(format!(
+            "'{}' is not a valid NSLM file (bad magic)",
+            input_path.display()
+        ));
     }
     let version = u32::from_le_bytes(data[4..8].try_into().unwrap());
     if version != 1 {
         return Err(format!(
             "unsupported NSLM version {} in '{}' (expected 1)",
-            version, input_path.display()
+            version,
+            input_path.display()
         ));
     }
     let header_size = u64::from_le_bytes(data[8..16].try_into().unwrap()) as usize;
     if 16 + header_size > data.len() {
         return Err(format!(
             "NSLM header claims {} bytes but file is only {} bytes",
-            header_size, data.len()
+            header_size,
+            data.len()
         ));
     }
     let header_json: serde_json::Value = serde_json::from_slice(&data[16..16 + header_size])
@@ -3683,10 +3909,12 @@ fn convert_nslm_to_safetensors(input_path: &std::path::Path, output_path: &std::
             .ok_or_else(|| format!("NSLM param '{}' missing 'dtype'", name))?;
         let offset = param["offset"]
             .as_u64()
-            .ok_or_else(|| format!("NSLM param '{}' missing 'offset'", name))? as usize;
+            .ok_or_else(|| format!("NSLM param '{}' missing 'offset'", name))?
+            as usize;
         let nbytes = param["nbytes"]
             .as_u64()
-            .ok_or_else(|| format!("NSLM param '{}' missing 'nbytes'", name))? as usize;
+            .ok_or_else(|| format!("NSLM param '{}' missing 'nbytes'", name))?
+            as usize;
         let shape: Vec<usize> = param["shape"]
             .as_array()
             .ok_or_else(|| format!("NSLM param '{}' missing 'shape'", name))?
@@ -3699,7 +3927,10 @@ fn convert_nslm_to_safetensors(input_path: &std::path::Path, output_path: &std::
         if abs_end > data.len() {
             return Err(format!(
                 "NSLM tensor '{}' data [{}..{}] exceeds file size {}",
-                name, abs_start, abs_end, data.len()
+                name,
+                abs_start,
+                abs_end,
+                data.len()
             ));
         }
         let raw = &data[abs_start..abs_end];
@@ -3718,7 +3949,10 @@ fn convert_nslm_to_safetensors(input_path: &std::path::Path, output_path: &std::
             }
             "f32" => raw.to_vec(),
             other => {
-                return Err(format!("NSLM tensor '{}' has unsupported dtype '{}'", name, other));
+                return Err(format!(
+                    "NSLM tensor '{}' has unsupported dtype '{}'",
+                    name, other
+                ));
             }
         };
 
@@ -3758,14 +3992,22 @@ struct NslmParamMeta {
     nbytes: u64,
 }
 
-fn convert_safetensors_to_nslm(input_path: &std::path::Path, output_path: &std::path::Path) -> Result<(), String> {
+fn convert_safetensors_to_nslm(
+    input_path: &std::path::Path,
+    output_path: &std::path::Path,
+) -> Result<(), String> {
     use std::io::Write;
 
     let bytes = std::fs::read(input_path)
         .map_err(|e| format!("cannot read '{}': {}", input_path.display(), e))?;
 
-    let st = safetensors::SafeTensors::deserialize(&bytes)
-        .map_err(|e| format!("safetensors parse error in '{}': {}", input_path.display(), e))?;
+    let st = safetensors::SafeTensors::deserialize(&bytes).map_err(|e| {
+        format!(
+            "safetensors parse error in '{}': {}",
+            input_path.display(),
+            e
+        )
+    })?;
 
     // Collect tensors in iteration order
     let mut metas: Vec<NslmParamMeta> = Vec::new();
@@ -3900,33 +4142,40 @@ fn convert_safetensors_to_nslm(input_path: &std::path::Path, output_path: &std::
 }
 
 fn run_convert(input: &std::path::Path, output: &std::path::Path) {
-    let in_ext = input.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
-    let out_ext = output.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+    let in_ext = input
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    let out_ext = output
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
 
     match (in_ext.as_str(), out_ext.as_str()) {
-        ("nslm", "safetensors") => {
-            match convert_nslm_to_safetensors(input, output) {
-                Ok(()) => println!("Converted {} → {}", input.display(), output.display()),
-                Err(e) => {
-                    eprintln!("error: {}", e);
-                    process::exit(1);
-                }
+        ("nslm", "safetensors") => match convert_nslm_to_safetensors(input, output) {
+            Ok(()) => println!("Converted {} → {}", input.display(), output.display()),
+            Err(e) => {
+                eprintln!("error: {}", e);
+                process::exit(1);
             }
-        }
-        ("safetensors", "nslm") => {
-            match convert_safetensors_to_nslm(input, output) {
-                Ok(()) => println!("Converted {} → {}", input.display(), output.display()),
-                Err(e) => {
-                    eprintln!("error: {}", e);
-                    process::exit(1);
-                }
+        },
+        ("safetensors", "nslm") => match convert_safetensors_to_nslm(input, output) {
+            Ok(()) => println!("Converted {} → {}", input.display(), output.display()),
+            Err(e) => {
+                eprintln!("error: {}", e);
+                process::exit(1);
             }
-        }
+        },
         _ => {
             eprintln!(
                 "error: unsupported conversion '{}.{}' → '{}.{}'.\n\
                  Supported: .nslm → .safetensors, .safetensors → .nslm",
-                input.display(), in_ext, output.display(), out_ext
+                input.display(),
+                in_ext,
+                output.display(),
+                out_ext
             );
             process::exit(1);
         }
@@ -3934,10 +4183,7 @@ fn run_convert(input: &std::path::Path, output: &std::path::Path) {
 }
 
 fn run_export(file: &PathBuf, output: Option<&std::path::Path>, format: Option<&str>) {
-    let ext = file
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("");
+    let ext = file.extension().and_then(|e| e.to_str()).unwrap_or("");
 
     // Determine export mode from format flag, output extension, or input extension
     let mode = if let Some(fmt) = format {
@@ -3974,7 +4220,16 @@ fn run_export(file: &PathBuf, output: Option<&std::path::Path>, format: Option<&
             // The NSL file should contain an export_model() function (or similar)
             // that calls to_onnx() internally. We just compile and run it.
             println!("Exporting ONNX from {}", file.display());
-            run_run(file, &[], false, false, false, false, false, &nsl_codegen::CompileOptions::default());
+            run_run(
+                file,
+                &[],
+                false,
+                false,
+                false,
+                false,
+                false,
+                &nsl_codegen::CompileOptions::default(),
+            );
         }
         "safetensors" => {
             if ext != "nslm" {
@@ -4044,7 +4299,10 @@ fn run_fmt(files: &[String], check: bool) {
     }
 
     if total > 0 || errors > 0 {
-        println!("{} file(s) checked, {} changed, {} error(s)", total, changed, errors);
+        println!(
+            "{} file(s) checked, {} changed, {} error(s)",
+            total, changed, errors
+        );
     }
 
     if check && changed > 0 {
@@ -4065,7 +4323,11 @@ fn merge_profile_traces(memory_path: &str, kernel_path: &str, output_path: &str)
     let merged = format!(
         r#"{{"traceEvents":[{}{}{}],"metadata":{{"merged":true}}}}"#,
         mem_events,
-        if !mem_events.is_empty() && !kern_events.is_empty() { "," } else { "" },
+        if !mem_events.is_empty() && !kern_events.is_empty() {
+            ","
+        } else {
+            ""
+        },
         kern_events,
     );
 
@@ -4170,12 +4432,23 @@ entry = \"main.nsl\"
     println!("Created project '{name}'. Run: cd {name} && nsl run main.nsl");
 }
 
-fn run_tokenize(dirs: &[String], output: &std::path::Path, vocab_size: usize, min_freq: u64, ext: &str) {
+fn run_tokenize(
+    dirs: &[String],
+    output: &std::path::Path,
+    vocab_size: usize,
+    min_freq: u64,
+    ext: &str,
+) {
     use std::io::Write;
 
     // Default directories if none specified
     let search_dirs: Vec<String> = if dirs.is_empty() {
-        vec!["stdlib".into(), "examples".into(), "tests".into(), "models".into()]
+        vec![
+            "stdlib".into(),
+            "examples".into(),
+            "tests".into(),
+            "models".into(),
+        ]
     } else {
         dirs.to_vec()
     };
@@ -4197,7 +4470,12 @@ fn run_tokenize(dirs: &[String], output: &std::path::Path, vocab_size: usize, mi
         process::exit(1);
     }
 
-    eprintln!("[tokenize] Found {} .{} files across {} directories", source_files.len(), ext, search_dirs.len());
+    eprintln!(
+        "[tokenize] Found {} .{} files across {} directories",
+        source_files.len(),
+        ext,
+        search_dirs.len()
+    );
 
     // Concatenate all source text into a temporary corpus file
     let corpus_path = std::env::temp_dir().join("nsl_tokenizer_corpus.txt");
@@ -4219,14 +4497,21 @@ fn run_tokenize(dirs: &[String], output: &std::path::Path, vocab_size: usize, mi
                 }
             }
         }
-        eprintln!("[tokenize] Corpus: {} bytes from {} files", total_bytes, source_files.len());
+        eprintln!(
+            "[tokenize] Corpus: {} bytes from {} files",
+            total_bytes,
+            source_files.len()
+        );
     }
 
     // Train BPE tokenizer using the runtime's nsl_bpe_train
-    eprintln!("[tokenize] Training BPE tokenizer (vocab_size={}, min_freq={})...", vocab_size, min_freq);
+    eprintln!(
+        "[tokenize] Training BPE tokenizer (vocab_size={}, min_freq={})...",
+        vocab_size, min_freq
+    );
 
     // We call the runtime's BPE trainer directly via Rust (not through FFI)
-    use tokenizers::models::bpe::{BPE, BpeTrainer};
+    use tokenizers::models::bpe::{BpeTrainer, BPE};
     use tokenizers::pre_tokenizers::byte_level::ByteLevel;
     use tokenizers::Tokenizer;
 
@@ -4243,12 +4528,15 @@ fn run_tokenize(dirs: &[String], output: &std::path::Path, vocab_size: usize, mi
         .build();
 
     let mut tokenizer = Tokenizer::new(BPE::default());
-    tokenizer.with_pre_tokenizer(Some(
-        tokenizers::PreTokenizerWrapper::ByteLevel(ByteLevel::default()),
-    ));
+    tokenizer.with_pre_tokenizer(Some(tokenizers::PreTokenizerWrapper::ByteLevel(
+        ByteLevel::default(),
+    )));
 
     let mut trainer_wrapper = tokenizers::models::TrainerWrapper::BpeTrainer(trainer);
-    match tokenizer.train_from_files(&mut trainer_wrapper, vec![corpus_path.to_string_lossy().to_string()]) {
+    match tokenizer.train_from_files(
+        &mut trainer_wrapper,
+        vec![corpus_path.to_string_lossy().to_string()],
+    ) {
         Ok(_) => {}
         Err(e) => {
             eprintln!("error: BPE training failed: {e}");
@@ -4267,13 +4555,20 @@ fn run_tokenize(dirs: &[String], output: &std::path::Path, vocab_size: usize, mi
     match tokenizer.save(output.to_string_lossy().as_ref(), true) {
         Ok(_) => {}
         Err(e) => {
-            eprintln!("error: could not save tokenizer to '{}': {e}", output.display());
+            eprintln!(
+                "error: could not save tokenizer to '{}': {e}",
+                output.display()
+            );
             process::exit(1);
         }
     }
 
     let final_vocab = tokenizer.get_vocab_size(true);
-    eprintln!("[tokenize] Saved tokenizer to '{}' (vocab_size={})", output.display(), final_vocab);
+    eprintln!(
+        "[tokenize] Saved tokenizer to '{}' (vocab_size={})",
+        output.display(),
+        final_vocab
+    );
 
     // Clean up corpus
     let _ = std::fs::remove_file(&corpus_path);
@@ -4282,7 +4577,12 @@ fn run_tokenize(dirs: &[String], output: &std::path::Path, vocab_size: usize, mi
     let sample = "fn forward(self, x: Tensor) -> Tensor:";
     if let Ok(encoding) = tokenizer.encode(sample, false) {
         let tokens = encoding.get_tokens();
-        eprintln!("[tokenize] Sample: \"{}\" -> {} tokens: {:?}", sample, tokens.len(), &tokens[..tokens.len().min(10)]);
+        eprintln!(
+            "[tokenize] Sample: \"{}\" -> {} tokens: {:?}",
+            sample,
+            tokens.len(),
+            &tokens[..tokens.len().min(10)]
+        );
     }
 }
 

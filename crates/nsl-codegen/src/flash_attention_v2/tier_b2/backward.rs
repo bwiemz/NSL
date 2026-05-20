@@ -46,12 +46,21 @@ mod tests {
 
     fn canonical_cfg() -> FlashAttentionConfig {
         FlashAttentionConfig {
-            block_q: 64, block_kv: 64, head_dim: 128,
-            causal: true, paged: false,
-            rope_q: false, rope_style: RopeStyle::HalfSplit,
-            gqa_group_size: 1, tree_mask: false,
-            gpu_sm: 80, segment_masked: false,
-            csha: Some(CshaExtras { level: 2, ..Default::default() }),
+            block_q: 64,
+            block_kv: 64,
+            head_dim: 128,
+            causal: true,
+            paged: false,
+            rope_q: false,
+            rope_style: RopeStyle::HalfSplit,
+            gqa_group_size: 1,
+            tree_mask: false,
+            gpu_sm: 80,
+            segment_masked: false,
+            csha: Some(CshaExtras {
+                level: 2,
+                ..Default::default()
+            }),
         }
     }
 

@@ -31,11 +31,7 @@ pub enum DiffResult {
 ///
 /// Compares entry-by-entry: first checks op_type match, then checks whether
 /// the output stats (mean, max) diverge beyond `threshold`.
-pub fn find_first_divergence(
-    a: &[TraceEntry],
-    b: &[TraceEntry],
-    threshold: f32,
-) -> DiffResult {
+pub fn find_first_divergence(a: &[TraceEntry], b: &[TraceEntry], threshold: f32) -> DiffResult {
     if a.len() != b.len() {
         return DiffResult::LengthMismatch {
             len_a: a.len(),
@@ -44,10 +40,7 @@ pub fn find_first_divergence(
     }
     for i in 0..a.len() {
         if a[i].get_op_type() != b[i].get_op_type() {
-            return DiffResult::OpMismatch {
-                pos_a: i,
-                pos_b: i,
-            };
+            return DiffResult::OpMismatch { pos_a: i, pos_b: i };
         }
         let delta_mean = (a[i].get_out_mean() - b[i].get_out_mean()).abs();
         let delta_max = (a[i].get_out_max() - b[i].get_out_max()).abs();
@@ -176,9 +169,7 @@ mod tests {
         let b = vec![make_entry(0, 1, 5.0, 2.0)]; // mean differs by 4.0
         match find_first_divergence(&a, &b, 0.5) {
             DiffResult::StatsDiverge {
-                op_id,
-                delta_mean,
-                ..
+                op_id, delta_mean, ..
             } => {
                 assert_eq!(op_id, 0);
                 assert!((delta_mean - 4.0).abs() < 0.01);

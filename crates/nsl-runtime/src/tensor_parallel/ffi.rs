@@ -37,9 +37,7 @@ fn open_shm(path: &str) -> (*mut u8, usize) {
         .write(true)
         .open(path)
         .expect("failed to open shared memory file");
-    let mmap = unsafe {
-        memmap2::MmapMut::map_mut(&file).expect("failed to mmap")
-    };
+    let mmap = unsafe { memmap2::MmapMut::map_mut(&file).expect("failed to mmap") };
     let ptr = mmap.as_ptr() as *mut u8;
     let len = mmap.len();
     std::mem::forget(mmap); // keep mapped for process lifetime

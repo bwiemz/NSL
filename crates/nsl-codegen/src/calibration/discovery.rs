@@ -132,11 +132,7 @@ fn dedup_preserving_first_seen(projections: &mut Vec<DiscoveredProjection>) {
 pub fn glob_matches(glob: &str, path: &str) -> bool {
     let gs: Vec<&str> = glob.split('.').collect();
     let ps: Vec<&str> = path.split('.').collect();
-    gs.len() == ps.len()
-        && gs
-            .iter()
-            .zip(ps.iter())
-            .all(|(g, p)| *g == "*" || g == p)
+    gs.len() == ps.len() && gs.iter().zip(ps.iter()).all(|(g, p)| *g == "*" || g == p)
 }
 
 // ── shape string parser ───────────────────────────────────────────────────────
@@ -203,7 +199,10 @@ fn resolve_field_shape_via_evaluator(
     Some([dims[0] as u32, dims[1] as u32])
 }
 
-fn extract_shape_from_tensor_init(expr: &nsl_ast::expr::Expr, interner: &Interner) -> Option<[u32; 2]> {
+fn extract_shape_from_tensor_init(
+    expr: &nsl_ast::expr::Expr,
+    interner: &Interner,
+) -> Option<[u32; 2]> {
     let ExprKind::Call { callee, args } = &expr.kind else {
         return None;
     };
@@ -211,7 +210,10 @@ fn extract_shape_from_tensor_init(expr: &nsl_ast::expr::Expr, interner: &Interne
         return None;
     };
     let fname = interner.resolve(sym.0).unwrap_or("");
-    if !matches!(fname, "zeros" | "ones" | "randn" | "rand" | "full" | "arange") {
+    if !matches!(
+        fname,
+        "zeros" | "ones" | "randn" | "rand" | "full" | "arange"
+    ) {
         return None;
     }
     let first = args.first()?;
@@ -347,7 +349,9 @@ fn collect_rhs_expr(expr: &nsl_ast::expr::Expr, interner: &Interner, out: &mut V
 
 fn model_has_awq_quantize_decorator(decorators: &[Decorator], interner: &Interner) -> bool {
     decorators.iter().any(|decorator| {
-        if decorator.name.len() != 1 || interner.resolve(decorator.name[0].0).unwrap_or("") != "quantize" {
+        if decorator.name.len() != 1
+            || interner.resolve(decorator.name[0].0).unwrap_or("") != "quantize"
+        {
             return false;
         }
         let mut dtype = "awq4";
@@ -390,7 +394,8 @@ fn collect_model_layer_metadata(
             type_ann,
             init,
             ..
-        } = member else {
+        } = member
+        else {
             continue;
         };
 
@@ -408,19 +413,18 @@ fn collect_model_layer_metadata(
             field_types.insert(field_name.clone(), type_name);
         }
 
-        let shape = parse_tensor_shape_from_type_expr(type_ann)
-            .or_else(|| {
-                let init_expr = init.as_ref()?;
-                // Try evaluator-backed resolution first when a scope is available
-                // (handles `zeros([param, param])` patterns).
-                if let Some(s) = scope {
-                    if let Some(shape) = resolve_field_shape_via_evaluator(init_expr, s, interner) {
-                        return Some(shape);
-                    }
+        let shape = parse_tensor_shape_from_type_expr(type_ann).or_else(|| {
+            let init_expr = init.as_ref()?;
+            // Try evaluator-backed resolution first when a scope is available
+            // (handles `zeros([param, param])` patterns).
+            if let Some(s) = scope {
+                if let Some(shape) = resolve_field_shape_via_evaluator(init_expr, s, interner) {
+                    return Some(shape);
                 }
-                // Fall through to literal-only path (back-compat for plain literals).
-                extract_shape_from_tensor_init(init_expr, interner)
-            });
+            }
+            // Fall through to literal-only path (back-compat for plain literals).
+            extract_shape_from_tensor_init(init_expr, interner)
+        });
         if let Some([out_features, in_features]) = shape {
             tensor_shapes.insert(
                 field_name,
@@ -445,7 +449,9 @@ fn find_first_instantiation_args(
 ) -> Option<&[nsl_ast::expr::Arg]> {
     for stmt in stmts {
         match &stmt.kind {
-            StmtKind::VarDecl { value: Some(init), .. } => {
+            StmtKind::VarDecl {
+                value: Some(init), ..
+            } => {
                 if let ExprKind::Call { callee, args } = &init.kind {
                     if let ExprKind::Ident(sym) = &callee.kind {
                         if *sym == model_sym {
@@ -455,9 +461,7 @@ fn find_first_instantiation_args(
                 }
             }
             StmtKind::FnDef(fn_def) => {
-                if let Some(result) =
-                    find_first_instantiation_args(&fn_def.body.stmts, model_sym)
-                {
+                if let Some(result) = find_first_instantiation_args(&fn_def.body.stmts, model_sym) {
                     return Some(result);
                 }
             }
@@ -467,22 +471,16 @@ fn find_first_instantiation_args(
                 else_block,
                 ..
             } => {
-                if let Some(r) =
-                    find_first_instantiation_args(&then_block.stmts, model_sym)
-                {
+                if let Some(r) = find_first_instantiation_args(&then_block.stmts, model_sym) {
                     return Some(r);
                 }
                 for (_, blk) in elif_clauses {
-                    if let Some(r) =
-                        find_first_instantiation_args(&blk.stmts, model_sym)
-                    {
+                    if let Some(r) = find_first_instantiation_args(&blk.stmts, model_sym) {
                         return Some(r);
                     }
                 }
                 if let Some(blk) = else_block {
-                    if let Some(r) =
-                        find_first_instantiation_args(&blk.stmts, model_sym)
-                    {
+                    if let Some(r) = find_first_instantiation_args(&blk.stmts, model_sym) {
                         return Some(r);
                     }
                 }
@@ -490,17 +488,14 @@ fn find_first_instantiation_args(
             StmtKind::For { body, .. }
             | StmtKind::While { body, .. }
             | StmtKind::WhileLet { body, .. } => {
-                if let Some(r) =
-                    find_first_instantiation_args(&body.stmts, model_sym)
-                {
+                if let Some(r) = find_first_instantiation_args(&body.stmts, model_sym) {
                     return Some(r);
                 }
             }
             StmtKind::Decorated { stmt: inner, .. } => {
-                if let Some(r) = find_first_instantiation_args(
-                    std::slice::from_ref(inner.as_ref()),
-                    model_sym,
-                ) {
+                if let Some(r) =
+                    find_first_instantiation_args(std::slice::from_ref(inner.as_ref()), model_sym)
+                {
                     return Some(r);
                 }
             }
@@ -521,7 +516,11 @@ pub fn pre_scan_awq_projections_from_ast(
     let mut all_projections = Vec::new();
 
     for stmt in &ast.stmts {
-        let StmtKind::Decorated { decorators, stmt: inner } = &stmt.kind else {
+        let StmtKind::Decorated {
+            decorators,
+            stmt: inner,
+        } = &stmt.kind
+        else {
             continue;
         };
         let StmtKind::ModelDef(model_def) = &inner.kind else {
@@ -541,9 +540,7 @@ pub fn pre_scan_awq_projections_from_ast(
         // loaded models), fall through to the literal-only path with no scope.
         let scope_opt: Option<crate::calibration::ast_evaluator::Scope> =
             find_first_instantiation_args(&ast.stmts, model_def.name)
-                .and_then(|args| {
-                    bind_constructor_args(&model_def.params, args, interner).ok()
-                });
+                .and_then(|args| bind_constructor_args(&model_def.params, args, interner).ok());
 
         let forward_body = find_forward_body(model_def, interner);
         let (field_types, tensor_shapes) =
@@ -570,7 +567,11 @@ pub fn first_awq_quantized_model_name(
     interner: &Interner,
 ) -> Option<String> {
     ast.stmts.iter().find_map(|stmt| {
-        let StmtKind::Decorated { decorators, stmt: inner } = &stmt.kind else {
+        let StmtKind::Decorated {
+            decorators,
+            stmt: inner,
+        } = &stmt.kind
+        else {
             return None;
         };
         let StmtKind::ModelDef(model_def) = &inner.kind else {
@@ -700,7 +701,9 @@ fn collect_layer_init_exprs<'a>(
     let mut out = std::collections::HashMap::new();
     for member in &model_def.members {
         let ModelMember::LayerDecl {
-            name, init: Some(init), ..
+            name,
+            init: Some(init),
+            ..
         } = member
         else {
             continue;
@@ -890,8 +893,7 @@ fn walk_for_wggo_instantiations(
                 if let PatternKind::Ident(name_sym) = &pattern.kind {
                     let var_name = interner.resolve(name_sym.0).unwrap_or("").to_string();
                     if !var_name.is_empty() {
-                        if let Some(t) =
-                            try_build_wggo_target(&var_name, init, decorated, interner)
+                        if let Some(t) = try_build_wggo_target(&var_name, init, decorated, interner)
                         {
                             targets.push(t);
                         }
@@ -940,14 +942,8 @@ fn walk_for_wggo_instantiations(
             SK::TrainBlock(train) => {
                 for section in &train.sections {
                     match section {
-                        TrainSection::Step { body, .. }
-                        | TrainSection::Eval { body, .. } => {
-                            walk_for_wggo_instantiations(
-                                &body.stmts,
-                                decorated,
-                                interner,
-                                targets,
-                            );
+                        TrainSection::Step { body, .. } | TrainSection::Eval { body, .. } => {
+                            walk_for_wggo_instantiations(&body.stmts, decorated, interner, targets);
                         }
                         TrainSection::Data(stmts) => {
                             walk_for_wggo_instantiations(stmts, decorated, interner, targets);
@@ -1216,8 +1212,7 @@ pub fn discover_awq_projections(
         if is_builtin_fn(&field_name) {
             continue; // skip activation functions
         }
-        if !model_field_types.contains_key(&field_name)
-            && !tensor_shapes.contains_key(&field_name)
+        if !model_field_types.contains_key(&field_name) && !tensor_shapes.contains_key(&field_name)
         {
             let qualified = format!("{}.{}", model_name, field_name);
             return Err(DiscoveryError::NonStaticWeight { path: qualified });
@@ -1240,8 +1235,7 @@ pub fn discover_awq_projections(
             if !glob_matches(&synthetic_glob, &qualified) {
                 return None;
             }
-            if exclude_set.contains(qualified.as_str())
-                || exclude_set.contains(field_name.as_str())
+            if exclude_set.contains(qualified.as_str()) || exclude_set.contains(field_name.as_str())
             {
                 return None;
             }
@@ -1311,8 +1305,7 @@ pub fn discover_awq_projections_from_state(
         if is_builtin_fn(&field_name) {
             continue;
         }
-        if !model_field_types.contains_key(&field_name)
-            && !tensor_shapes.contains_key(&field_name)
+        if !model_field_types.contains_key(&field_name) && !tensor_shapes.contains_key(&field_name)
         {
             let qualified = format!("{}.{}", model_name, field_name);
             return Err(DiscoveryError::NonStaticWeight { path: qualified });
@@ -1325,8 +1318,7 @@ pub fn discover_awq_projections_from_state(
     }
 
     // Apply glob + exclusion list.
-    let exclude_set: std::collections::HashSet<&str> =
-        exclude.iter().map(String::as_str).collect();
+    let exclude_set: std::collections::HashSet<&str> = exclude.iter().map(String::as_str).collect();
 
     let mut matched: Vec<DiscoveredProjection> = sites
         .into_iter()
@@ -1335,8 +1327,7 @@ pub fn discover_awq_projections_from_state(
             if !glob_matches(&synthetic_glob, &qualified) {
                 return None;
             }
-            if exclude_set.contains(qualified.as_str())
-                || exclude_set.contains(field_name.as_str())
+            if exclude_set.contains(qualified.as_str()) || exclude_set.contains(field_name.as_str())
             {
                 return None;
             }
@@ -1381,8 +1372,7 @@ mod tests {
 
     fn parse_module(source: &str) -> (nsl_ast::Module, Interner) {
         let mut interner = Interner::new();
-        let (tokens, lex_diags) =
-            nsl_lexer::tokenize(source, nsl_errors::FileId(0), &mut interner);
+        let (tokens, lex_diags) = nsl_lexer::tokenize(source, nsl_errors::FileId(0), &mut interner);
         assert!(
             lex_diags
                 .iter()
@@ -1409,8 +1399,12 @@ mod tests {
         let discovered = pre_scan_awq_projections_from_ast(&ast, &interner);
 
         assert_eq!(discovered.len(), 2, "TinyMLP has up_proj + down_proj");
-        assert!(discovered.iter().any(|d| d.projection.0 == "TinyMLP.up_proj"));
-        assert!(discovered.iter().any(|d| d.projection.0 == "TinyMLP.down_proj"));
+        assert!(discovered
+            .iter()
+            .any(|d| d.projection.0 == "TinyMLP.up_proj"));
+        assert!(discovered
+            .iter()
+            .any(|d| d.projection.0 == "TinyMLP.down_proj"));
 
         let up = discovered
             .iter()
@@ -1603,7 +1597,10 @@ mod tests {
 
         let mut tensor_shapes = std::collections::HashMap::new();
         tensor_shapes.insert("up_proj".to_string(), "Tensor<[64, 128], f32>".to_string());
-        tensor_shapes.insert("down_proj".to_string(), "Tensor<[128, 64], f32>".to_string());
+        tensor_shapes.insert(
+            "down_proj".to_string(),
+            "Tensor<[128, 64], f32>".to_string(),
+        );
 
         (model_def, quant_block, interner, field_types, tensor_shapes)
     }
@@ -1726,8 +1723,14 @@ mod tests {
 
     #[test]
     fn parse_tensor_shape_string_cases() {
-        assert_eq!(parse_tensor_shape_string("Tensor<[64, 128], f32>"), [64, 128]);
-        assert_eq!(parse_tensor_shape_string("Tensor<[128, 64], f32>"), [128, 64]);
+        assert_eq!(
+            parse_tensor_shape_string("Tensor<[64, 128], f32>"),
+            [64, 128]
+        );
+        assert_eq!(
+            parse_tensor_shape_string("Tensor<[128, 64], f32>"),
+            [128, 64]
+        );
         assert_eq!(parse_tensor_shape_string(""), [0, 0]);
         assert_eq!(parse_tensor_shape_string("Tensor<[99], f32>"), [0, 0]);
     }
@@ -1886,9 +1889,8 @@ fn main():
 
     #[test]
     fn pre_scan_awq_resolves_parameterized_shapes() {
-        let source = std::fs::read_to_string(
-            repo_fixture("awq_calibration_parameterized.nsl")
-        ).unwrap();
+        let source =
+            std::fs::read_to_string(repo_fixture("awq_calibration_parameterized.nsl")).unwrap();
         let (ast, interner) = parse_module(&source);
         let discovered = pre_scan_awq_projections_from_ast(&ast, &interner);
         assert_eq!(discovered.len(), 2);
@@ -2002,7 +2004,11 @@ fn main():
         let t = &targets[0];
         assert_eq!(t.layer_key, "m");
         assert_eq!(t.head_dim, 128, "default 4096 // 32 = 128");
-        assert_eq!(t.w_q_shape, [4096, 4096], "default dim=4096 propagates to projections");
+        assert_eq!(
+            t.w_q_shape,
+            [4096, 4096],
+            "default dim=4096 propagates to projections"
+        );
     }
 
     /// Walker contract: a non-`Call` initializer (here a parenthesized
@@ -2096,8 +2102,14 @@ fn main():
         assert_eq!(targets.len(), 1);
         let t = &targets[0];
         assert_eq!(t.w_q_index, 0, "q_proj is the first tensor field → index 0");
-        assert_eq!(t.w_k_index, 1, "k_proj is the second tensor field → index 1");
+        assert_eq!(
+            t.w_k_index, 1,
+            "k_proj is the second tensor field → index 1"
+        );
         assert_eq!(t.w_v_index, 2, "v_proj is the third tensor field → index 2");
-        assert_eq!(t.w_o_index, 3, "o_proj is the fourth tensor field → index 3");
+        assert_eq!(
+            t.w_o_index, 3,
+            "o_proj is the fourth tensor field → index 3"
+        );
     }
 }

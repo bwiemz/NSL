@@ -104,9 +104,7 @@ pub fn plan_kernel(
 mod tests {
     use super::*;
     use crate::flash_attention::{FlashAttentionConfig, RopeStyle};
-    use crate::pca_detect::{
-        detect, DatasetPackingConfig, PcaDetectConfig,
-    };
+    use crate::pca_detect::{detect, DatasetPackingConfig, PcaDetectConfig};
 
     fn fa_base() -> FlashAttentionConfig {
         FlashAttentionConfig {
@@ -120,8 +118,8 @@ mod tests {
             gqa_group_size: 2,
             tree_mask: false,
             gpu_sm: 90,
-        segment_masked: false,
-        csha: None,
+            segment_masked: false,
+            csha: None,
         }
     }
 

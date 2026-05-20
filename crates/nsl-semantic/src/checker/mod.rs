@@ -128,7 +128,8 @@ impl<'a> TypeChecker<'a> {
         // M51: Propagate effects through call graph and validate assertions.
         self.effect_checker.propagate();
         self.effect_checker.validate();
-        self.diagnostics.append(&mut self.effect_checker.diagnostics);
+        self.diagnostics
+            .append(&mut self.effect_checker.diagnostics);
     }
 
     /// Pre-declare top-level names so forward references work.
@@ -310,7 +311,11 @@ impl<'a> TypeChecker<'a> {
             is_param,
             is_used: false,
         };
-        if self.scopes.declare(self.current_scope, name, info.clone()).is_err() {
+        if self
+            .scopes
+            .declare(self.current_scope, name, info.clone())
+            .is_err()
+        {
             // NSL allows rebinding (Python-like semantics), so update the existing binding
             if let Some(existing) = self.scopes.lookup_mut(self.current_scope, name) {
                 existing.ty = info.ty;
@@ -387,7 +392,8 @@ impl<'a> TypeChecker<'a> {
                             }
                             PatternKind::Rest(None) => {}
                             _ => {
-                                let elem_ty = self.pattern_element_type(ty, i, rest_index, pats.len());
+                                let elem_ty =
+                                    self.pattern_element_type(ty, i, rest_index, pats.len());
                                 self.declare_pattern_with_const(p, &elem_ty, is_const);
                             }
                         }

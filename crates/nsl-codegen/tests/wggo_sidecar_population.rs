@@ -22,13 +22,9 @@
 //! The production `emit_finalize` still returns valid JSON (zeros) in the
 //! stub path, which is sufficient to prove the routing is wired.
 
-use nsl_codegen::calibration::{
-    run_harness_stub,
-    WggoGradientHook,
-    HookRegistry,
-};
 use nsl_codegen::calibration::discovery::WggoGradTarget;
 use nsl_codegen::calibration::observation::ProjectionRef;
+use nsl_codegen::calibration::{run_harness_stub, HookRegistry, WggoGradientHook};
 
 fn proj(name: &str) -> ProjectionRef {
     ProjectionRef(name.to_string())
@@ -95,8 +91,8 @@ fn run_harness_stub_with_wggo_hook_populates_wggo_head_gradients() {
     let mut registry = HookRegistry::new();
     registry.register(Box::new(WggoGradientHook::new(two_layer_targets())));
 
-    let out = run_harness_stub(&registry, b"ckpt", b"data", 1)
-        .expect("run_harness_stub must succeed");
+    let out =
+        run_harness_stub(&registry, b"ckpt", b"data", 1).expect("run_harness_stub must succeed");
 
     let grads = out
         .sidecar
@@ -140,8 +136,8 @@ fn run_harness_stub_without_wggo_hook_leaves_field_none() {
     let mut registry = HookRegistry::new();
     registry.register(Box::new(IdentityHook::new(vec![0x42])));
 
-    let out = run_harness_stub(&registry, b"ckpt", b"data", 1)
-        .expect("run_harness_stub must succeed");
+    let out =
+        run_harness_stub(&registry, b"ckpt", b"data", 1).expect("run_harness_stub must succeed");
 
     assert!(
         out.sidecar.wggo_head_gradients.is_none(),
@@ -157,8 +153,8 @@ fn wggo_hook_with_empty_targets_populates_some_with_empty_by_layer() {
     let mut registry = HookRegistry::new();
     registry.register(Box::new(WggoGradientHook::new(vec![])));
 
-    let out = run_harness_stub(&registry, b"ckpt", b"data", 1)
-        .expect("run_harness_stub must succeed");
+    let out =
+        run_harness_stub(&registry, b"ckpt", b"data", 1).expect("run_harness_stub must succeed");
 
     let grads = out
         .sidecar

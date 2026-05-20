@@ -263,8 +263,7 @@ fn compile_time_emits_fused_dgamma_for_csha_chain() {
     // extract_results[7], x_raw_var, eps, gamma_var))`. It is the
     // direct observable of PR #74's fix being on the live code path.
     let dgamma_line = stderr.lines().find(|l| {
-        l.contains("CSHA fused backward: emitted dgamma")
-            && l.contains("NormGammaBackward")
+        l.contains("CSHA fused backward: emitted dgamma") && l.contains("NormGammaBackward")
     });
     assert!(
         dgamma_line.is_some(),
@@ -281,9 +280,9 @@ fn compile_time_emits_fused_dgamma_for_csha_chain() {
     );
 
     // -- Assertion 3: emit launch line confirms the fused kernel was wired. ------
-    let launch_line = stderr.lines().find(|l| {
-        l.contains("CSHA fused backward: emitting fused launch for layer")
-    });
+    let launch_line = stderr
+        .lines()
+        .find(|l| l.contains("CSHA fused backward: emitting fused launch for layer"));
     assert!(
         launch_line.is_some(),
         "[csha-fused-dgamma] missing `CSHA fused backward: emitting fused launch` line. \
@@ -376,8 +375,8 @@ fn runtime_executes_fused_dgamma() {
         // `resolve_csha_d_model_from_stmts`; if it ever re-appears the
         // d_model resolution lost its grip on the layer's RMSNorm
         // gamma / projection shapes and we want to fail loud.
-        let dmodel_zero_signature = run_stderr.contains("dim 3: 0 vs 32")
-            || run_stderr.contains("a_shape=[1, 1, 32, 0]");
+        let dmodel_zero_signature =
+            run_stderr.contains("dim 3: 0 vs 32") || run_stderr.contains("a_shape=[1, 1, 32, 0]");
         assert!(
             !dmodel_zero_signature,
             "[csha-fused-dgamma-runtime] REGRESSION — the d_model=0 crash \
@@ -417,9 +416,8 @@ fn runtime_executes_fused_dgamma() {
         // inputs to device" design fix is outstanding. Once the device-
         // placement fix lands the skip branch should be removed and the
         // delta asserts below take over as the hard gate.
-        let device_placement_signature =
-            run_stderr.contains("cuMemcpyHtoD_v2")
-                && run_stderr.contains("CUDA_ERROR_ILLEGAL_ADDRESS");
+        let device_placement_signature = run_stderr.contains("cuMemcpyHtoD_v2")
+            && run_stderr.contains("CUDA_ERROR_ILLEGAL_ADDRESS");
         if device_placement_signature {
             eprintln!(
                 "[csha-fused-dgamma-runtime] SKIP — known blocker: \
@@ -457,9 +455,7 @@ fn runtime_executes_fused_dgamma() {
     let after_w_norm: Option<f64> = parse_first_float_after(&run_stdout, "AFTER_w_norm");
     if let (Some(b), Some(a)) = (before_w_norm, after_w_norm) {
         let delta = a - b;
-        eprintln!(
-            "[csha-fused-dgamma-runtime] w_norm delta = {delta:+.6} (before={b}, after={a})"
-        );
+        eprintln!("[csha-fused-dgamma-runtime] w_norm delta = {delta:+.6} (before={b}, after={a})");
         assert!(
             b.is_finite() && a.is_finite(),
             "[csha-fused-dgamma-runtime] w_norm sums must be finite (before={b}, after={a})"

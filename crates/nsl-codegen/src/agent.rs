@@ -29,8 +29,7 @@
 use std::collections::HashMap;
 
 use cranelift_codegen::ir::{
-    types as cl_types, AbiParam, Function, InstBuilder, StackSlotData, StackSlotKind,
-    UserFuncName,
+    types as cl_types, AbiParam, Function, InstBuilder, StackSlotData, StackSlotKind, UserFuncName,
 };
 use cranelift_codegen::Context;
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
@@ -85,10 +84,7 @@ where
     let mut offset = 0usize;
 
     for member in &agent.members {
-        if let AgentMember::FieldDecl {
-            name, type_ann, ..
-        } = member
-        {
+        if let AgentMember::FieldDecl { name, type_ann, .. } = member {
             let (field_name, cl_type) = resolve_field(*name, type_ann);
             let size = cl_type.bytes() as usize;
             let align = size.max(1);
@@ -179,8 +175,7 @@ impl Compiler<'_> {
             for member in &agent.members {
                 if let AgentMember::Method(fn_def, decorators) = member {
                     let has_adt = decorators.iter().any(|d| {
-                        d.name.len() == 1
-                            && self.resolve_sym(d.name[0]) == "auto_device_transfer"
+                        d.name.len() == 1 && self.resolve_sym(d.name[0]) == "auto_device_transfer"
                     });
                     if !has_adt {
                         continue;
@@ -286,9 +281,8 @@ impl Compiler<'_> {
                             TypeExprKind::Named(sym) => {
                                 let name = self.resolve_sym(*sym);
                                 if name != "void" {
-                                    sig.returns.push(AbiParam::new(
-                                        self.resolve_type_name_to_cl(*sym),
-                                    ));
+                                    sig.returns
+                                        .push(AbiParam::new(self.resolve_type_name_to_cl(*sym)));
                                 }
                             }
                             _ => {
@@ -368,8 +362,7 @@ impl Compiler<'_> {
                     let mut fn_builder_ctx = FunctionBuilderContext::new();
 
                     {
-                        let mut builder =
-                            FunctionBuilder::new(&mut ctx.func, &mut fn_builder_ctx);
+                        let mut builder = FunctionBuilder::new(&mut ctx.func, &mut fn_builder_ctx);
                         let mut state = FuncState::new();
 
                         let entry = builder.create_block();
@@ -426,9 +419,7 @@ impl Compiler<'_> {
                         // Compile the method body.
                         let mut body_err: Option<CodegenError> = None;
                         for stmt in &fn_def.body.stmts {
-                            if let Err(e) =
-                                self.compile_stmt(&mut builder, &mut state, stmt)
-                            {
+                            if let Err(e) = self.compile_stmt(&mut builder, &mut state, stmt) {
                                 body_err = Some(e);
                                 break;
                             }
@@ -582,10 +573,7 @@ impl Compiler<'_> {
                 // `interner.get(s)` does a read-only lookup; if the string was
                 // parsed in the pipeline fn body (e.g. `drafter.draft(...)`), it
                 // is already interned and `get` returns `Some`.
-                let binding_sym_opt = self
-                    .interner
-                    .get(lowercase.as_str())
-                    .map(Symbol);
+                let binding_sym_opt = self.interner.get(lowercase.as_str()).map(Symbol);
 
                 if let Some(binding_sym) = binding_sym_opt {
                     let var = state.new_variable();
@@ -684,7 +672,11 @@ fn find_pipeline_agent_decorator_args(
     fn_def: &nsl_ast::decl::FnDef,
 ) -> Vec<Symbol> {
     for stmt in all_stmts {
-        if let StmtKind::Decorated { decorators, stmt: inner } = &stmt.kind {
+        if let StmtKind::Decorated {
+            decorators,
+            stmt: inner,
+        } = &stmt.kind
+        {
             if let StmtKind::FnDef(fd) = &inner.kind {
                 if fd.name == fn_def.name {
                     return extract_agents_from_decorators(compiler, decorators);

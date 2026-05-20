@@ -156,9 +156,7 @@ pub fn walk_stmt(v: &mut impl Visitor, stmt: &Stmt) {
                 v.visit_block(block);
             }
         }
-        StmtKind::For {
-            iterable, body, ..
-        } => {
+        StmtKind::For { iterable, body, .. } => {
             v.visit_expr(iterable);
             v.visit_block(body);
         }
@@ -166,7 +164,12 @@ pub fn walk_stmt(v: &mut impl Visitor, stmt: &Stmt) {
             v.visit_expr(condition);
             v.visit_block(body);
         }
-        StmtKind::WhileLet { expr, body, pattern, .. } => {
+        StmtKind::WhileLet {
+            expr,
+            body,
+            pattern,
+            ..
+        } => {
             v.visit_pattern(pattern);
             v.visit_expr(expr);
             v.visit_block(body);
@@ -364,7 +367,10 @@ pub fn walk_expr(v: &mut impl Visitor, expr: &Expr) {
                 v.visit_block(&arm.body);
             }
         }
-        ExprKind::ListComp { element, generators } => {
+        ExprKind::ListComp {
+            element,
+            generators,
+        } => {
             v.visit_expr(element);
             for gen in generators {
                 v.visit_pattern(&gen.pattern);

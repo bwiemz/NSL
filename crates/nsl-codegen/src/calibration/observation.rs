@@ -152,9 +152,15 @@ mod tests {
         ]);
         let plan = ObservationPlan::union_of(&[a, b]);
         assert_eq!(plan.forward_activations.len(), 3);
-        assert!(plan.forward_activations.contains(&LayerRef::new("blocks.0")));
-        assert!(plan.forward_activations.contains(&LayerRef::new("blocks.1")));
-        assert!(plan.forward_activations.contains(&LayerRef::new("blocks.2")));
+        assert!(plan
+            .forward_activations
+            .contains(&LayerRef::new("blocks.0")));
+        assert!(plan
+            .forward_activations
+            .contains(&LayerRef::new("blocks.1")));
+        assert!(plan
+            .forward_activations
+            .contains(&LayerRef::new("blocks.2")));
     }
 
     #[test]
@@ -201,9 +207,15 @@ mod tests {
         ]);
         let plan = ObservationPlan::union_of(&[a, b]);
         assert_eq!(plan.linear_input_activations.len(), 3);
-        assert!(plan.linear_input_activations.contains(&ProjectionRef::new("blocks.0.attn.wq")));
-        assert!(plan.linear_input_activations.contains(&ProjectionRef::new("blocks.0.attn.wk")));
-        assert!(plan.linear_input_activations.contains(&ProjectionRef::new("blocks.0.attn.wv")));
+        assert!(plan
+            .linear_input_activations
+            .contains(&ProjectionRef::new("blocks.0.attn.wq")));
+        assert!(plan
+            .linear_input_activations
+            .contains(&ProjectionRef::new("blocks.0.attn.wk")));
+        assert!(plan
+            .linear_input_activations
+            .contains(&ProjectionRef::new("blocks.0.attn.wv")));
     }
 
     #[test]
@@ -226,23 +238,29 @@ mod tests {
         assert!(!ObservationSet::ForwardActivations(vec![]).needs_forward_pass());
         assert!(ObservationSet::ForwardActivations(vec![LayerRef::new("l")]).needs_forward_pass());
         assert!(!ObservationSet::LinearInputActivations(vec![]).needs_forward_pass());
-        assert!(ObservationSet::LinearInputActivations(vec![ProjectionRef::new("p")]).needs_forward_pass());
+        assert!(
+            ObservationSet::LinearInputActivations(vec![ProjectionRef::new("p")])
+                .needs_forward_pass()
+        );
         // Union: true if any child needs it
         assert!(ObservationSet::Union(vec![
             ObservationSet::Weights(vec![ParamRef::new("w")]),
             ObservationSet::LinearInputActivations(vec![ProjectionRef::new("p")]),
-        ]).needs_forward_pass());
+        ])
+        .needs_forward_pass());
         // Union with BackwardGradients: now true (was false before the
         // semantics fix — backward needs forward to compute activations).
         assert!(ObservationSet::Union(vec![
             ObservationSet::Empty,
             ObservationSet::BackwardGradients(vec![LayerRef::new("x")]),
-        ]).needs_forward_pass());
+        ])
+        .needs_forward_pass());
         // Union of weight-only + empty is still false (no forward dependency).
         assert!(!ObservationSet::Union(vec![
             ObservationSet::Empty,
             ObservationSet::Weights(vec![ParamRef::new("w")]),
-        ]).needs_forward_pass());
+        ])
+        .needs_forward_pass());
     }
 
     #[test]

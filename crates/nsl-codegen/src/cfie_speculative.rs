@@ -237,7 +237,10 @@ pub fn emit_program(config: SpeculativeConfig, expected_acceptance: f32) -> Spec
 
     // Phase 2: target verification.
     let num_positions = match config.method {
-        DraftMethod::Tree => tree_mask.as_ref().map(|m| m.num_nodes).unwrap_or(config.k_tokens + 1),
+        DraftMethod::Tree => tree_mask
+            .as_ref()
+            .map(|m| m.num_nodes)
+            .unwrap_or(config.k_tokens + 1),
         _ => config.k_tokens + 1,
     };
     ops.push(SpeculativeOp::TargetForward { num_positions });
@@ -370,7 +373,10 @@ mod tests {
     #[test]
     fn program_ends_with_kv_advance() {
         let prog = emit_program(SpeculativeConfig::default(), 0.7);
-        assert!(matches!(prog.ops.last(), Some(SpeculativeOp::KvCacheAdvance)));
+        assert!(matches!(
+            prog.ops.last(),
+            Some(SpeculativeOp::KvCacheAdvance)
+        ));
     }
 
     #[test]

@@ -163,8 +163,8 @@ fn quantize_fp16_to_ternary(
 /// the inference harness handles them as FP16 directly.
 pub fn load_bitnet_b158_safetensors(path: &Path) -> Result<Vec<LoadedTernaryWeight>, LoaderError> {
     let bytes = std::fs::read(path)?;
-    let tensors = SafeTensors::deserialize(&bytes)
-        .map_err(|e| LoaderError::Safetensors(format!("{e}")))?;
+    let tensors =
+        SafeTensors::deserialize(&bytes).map_err(|e| LoaderError::Safetensors(format!("{e}")))?;
 
     let mut out = Vec::new();
     for (name, view) in tensors.tensors() {

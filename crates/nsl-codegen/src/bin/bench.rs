@@ -61,13 +61,7 @@ fn main() {
     let tier_b_on = args.tier_b == cli::TierB::On;
     let result = if let Some(bwd_path) = args.dump_backward_outputs.as_deref() {
         unsafe {
-            launch::run_fixture_backward(
-                &fixture,
-                tier_b_on,
-                args.seed,
-                args.iterations,
-                bwd_path,
-            )
+            launch::run_fixture_backward(&fixture, tier_b_on, args.seed, args.iterations, bwd_path)
         }
     } else {
         unsafe {

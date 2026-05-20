@@ -56,8 +56,7 @@ pub fn write_stats(path: &Path, step: u64, name: &str, stats: &[f64]) -> std::io
         nan_count: stats[4] as u64,
         inf_count: stats[5] as u64,
     };
-    let json = serde_json::to_vec(&header)
-        .map_err(std::io::Error::other)?;
+    let json = serde_json::to_vec(&header).map_err(std::io::Error::other)?;
     let mut f = std::fs::File::create(path)?;
     f.write_all(MAGIC)?;
     f.write_all(&VERSION.to_le_bytes())?;
@@ -67,8 +66,7 @@ pub fn write_stats(path: &Path, step: u64, name: &str, stats: &[f64]) -> std::io
 }
 
 pub fn write_full(path: &Path, header: &FullHeader, data: &[u8]) -> std::io::Result<()> {
-    let json = serde_json::to_vec(header)
-        .map_err(std::io::Error::other)?;
+    let json = serde_json::to_vec(header).map_err(std::io::Error::other)?;
     let header_len = json.len() as u64;
     let aligned = (16 + header_len).div_ceil(ALIGN) * ALIGN;
     let pad = aligned - (16 + header_len);

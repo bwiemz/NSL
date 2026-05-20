@@ -281,7 +281,13 @@ pub extern "C" fn nsl_unikernel_gpu_init(strategy: i64) -> i64 {
         _ => init_gpu_vfio(), // default to VFIO
     };
 
-    let rc = if result.success { 0 } else if result.device.is_none() { -1 } else { -2 };
+    let rc = if result.success {
+        0
+    } else if result.device.is_none() {
+        -1
+    } else {
+        -2
+    };
 
     if let Ok(mut guard) = GPU_STATE.lock() {
         *guard = Some(result);
@@ -297,7 +303,9 @@ pub extern "C" fn nsl_unikernel_gpu_init(strategy: i64) -> i64 {
 pub extern "C" fn nsl_unikernel_gpu_ready() -> i64 {
     if let Ok(guard) = GPU_STATE.lock() {
         if let Some(ref result) = *guard {
-            if result.success { return 1; }
+            if result.success {
+                return 1;
+            }
         }
     }
     0
@@ -329,10 +337,12 @@ mod tests {
     #[test]
     fn test_pci_device_is_nvidia_gpu() {
         let dev = PciDevice {
-            bus: 0, device: 1, function: 0,
+            bus: 0,
+            device: 1,
+            function: 0,
             vendor_id: NVIDIA_VENDOR_ID,
             device_id: 0x2684, // RTX 4090
-            class_code: 0x03, // Display controller
+            class_code: 0x03,  // Display controller
             subclass: 0x00,
             bars: [0xFB00_0000, 0xE000_0000, 0, 0, 0, 0],
             bar_sizes: [0; 6],
@@ -345,7 +355,9 @@ mod tests {
     #[test]
     fn test_pci_device_not_nvidia() {
         let dev = PciDevice {
-            bus: 0, device: 0, function: 0,
+            bus: 0,
+            device: 0,
+            function: 0,
             vendor_id: 0x8086, // Intel
             device_id: 0x1234,
             class_code: 0x06, // Bridge

@@ -106,8 +106,7 @@ fn validate_via_nvcc(ptx: &str) -> Result<(), String> {
     let tmp_ptx = std::env::temp_dir().join(format!("nsl_ptxval_{pid}_{seq}.ptx"));
     let tmp_cubin = std::env::temp_dir().join(format!("nsl_ptxval_{pid}_{seq}.cubin"));
     {
-        let mut f =
-            std::fs::File::create(&tmp_ptx).map_err(|e| format!("tmp create: {e}"))?;
+        let mut f = std::fs::File::create(&tmp_ptx).map_err(|e| format!("tmp create: {e}"))?;
         f.write_all(ptx.as_bytes())
             .map_err(|e| format!("tmp write: {e}"))?;
     }
@@ -161,9 +160,7 @@ mod tests {
         match validate_ptx(ptx) {
             Ok(()) => {}
             Err(msg) if msg.contains("nvcc not available") => {
-                eprintln!(
-                    "[skip] validates_trivial_valid_ptx: no validator available: {msg}"
-                );
+                eprintln!("[skip] validates_trivial_valid_ptx: no validator available: {msg}");
             }
             Err(msg) => panic!("expected trivial PTX to validate; got: {msg}"),
         }

@@ -24,7 +24,9 @@ pub fn is_gds_available() -> bool {
         std::env::var("NSL_GDS_ENABLED").map_or(false, |v| v == "1")
     }
     #[cfg(not(feature = "cuda"))]
-    { false }
+    {
+        false
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -69,7 +71,10 @@ fn gds_read_cufile(
     // cuFileHandleRegister(path)
     // cuFileBufRegister(gpu_buf, size)
     // cuFileReadAsync(handle, gpu_buf, size, offset, stream)
-    Err(io::Error::new(io::ErrorKind::Unsupported, "cuFile not linked — use mmap fallback"))
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "cuFile not linked — use mmap fallback",
+    ))
 }
 
 /// Fallback path: read file → host buffer → cudaMemcpyAsync to GPU.
@@ -144,7 +149,9 @@ pub extern "C" fn nsl_data_gds_read(
     size: i64,
     stream: i64,
 ) -> i64 {
-    if path_ptr == 0 || buf_ptr == 0 { return -1; }
+    if path_ptr == 0 || buf_ptr == 0 {
+        return -1;
+    }
 
     let path_cstr = unsafe { std::ffi::CStr::from_ptr(path_ptr as *const std::os::raw::c_char) };
     let path = match path_cstr.to_str() {
@@ -152,7 +159,13 @@ pub extern "C" fn nsl_data_gds_read(
         Err(_) => return -1,
     };
 
-    match gds_read(path, buf_ptr as *mut c_void, offset as u64, size as u64, stream) {
+    match gds_read(
+        path,
+        buf_ptr as *mut c_void,
+        offset as u64,
+        size as u64,
+        stream,
+    ) {
         Ok(()) => 0,
         Err(_) => -1,
     }
@@ -161,7 +174,11 @@ pub extern "C" fn nsl_data_gds_read(
 /// Check if GDS is available. Returns 1 if available, 0 if not.
 #[no_mangle]
 pub extern "C" fn nsl_data_gds_available() -> i64 {
-    if is_gds_available() { 1 } else { 0 }
+    if is_gds_available() {
+        1
+    } else {
+        0
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -204,7 +221,9 @@ mod tests {
         let result = gds_read(
             Path::new("/nonexistent/file.bin"),
             std::ptr::null_mut(),
-            0, 100, 0,
+            0,
+            100,
+            0,
         );
         assert!(result.is_err());
     }

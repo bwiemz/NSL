@@ -57,7 +57,8 @@ impl H2OManager {
         };
 
         // Collect non-sink positions with their scores
-        let mut candidates: Vec<(usize, f32)> = scores.iter()
+        let mut candidates: Vec<(usize, f32)> = scores
+            .iter()
             .enumerate()
             .filter(|(pos, _)| *pos >= self.num_sinks && *pos < current_len)
             .map(|(pos, &score)| (pos, score))
@@ -67,7 +68,8 @@ impl H2OManager {
         candidates.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
         let num_to_evict = current_len - self.budget;
-        let evict_set: std::collections::HashSet<usize> = candidates.iter()
+        let evict_set: std::collections::HashSet<usize> = candidates
+            .iter()
             .take(num_to_evict)
             .map(|(pos, _)| *pos)
             .collect();
@@ -175,9 +177,15 @@ mod tests {
         let mut mgr = H2OManager::new(8, 0, 4);
 
         // 16 tokens: tokens 0-3 low scores, 4-7 high, 8-11 low, 12-15 high
-        let scores: Vec<f32> = (0..16).map(|i| {
-            if i < 4 || (8..12).contains(&i) { 0.1 } else { 10.0 }
-        }).collect();
+        let scores: Vec<f32> = (0..16)
+            .map(|i| {
+                if i < 4 || (8..12).contains(&i) {
+                    0.1
+                } else {
+                    10.0
+                }
+            })
+            .collect();
         mgr.accumulate_scores(0, &scores);
 
         let evicted = mgr.check_eviction(0, 16);

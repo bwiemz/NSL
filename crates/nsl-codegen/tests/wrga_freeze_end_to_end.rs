@@ -99,7 +99,6 @@ fn freeze_eliminates_frozen_param_from_backward_live() {
     );
 }
 
-
 /// B.1 Task 5: Sanity counterpart to `freeze_eliminates_frozen_param_from_backward_live`.
 ///
 /// When `WrgaInputs` is empty, `invoke_wrga_if_enabled` must return None and

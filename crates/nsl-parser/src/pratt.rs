@@ -38,10 +38,9 @@ pub fn infix_binding_power(op: &TokenKind) -> Option<(u8, u8)> {
         TokenKind::Plus | TokenKind::Minus => Some((18, 19)),
 
         // Multiplication/division/modulo/floor-div
-        TokenKind::Star
-        | TokenKind::Slash
-        | TokenKind::DoubleSlash
-        | TokenKind::Percent => Some((20, 21)),
+        TokenKind::Star | TokenKind::Slash | TokenKind::DoubleSlash | TokenKind::Percent => {
+            Some((20, 21))
+        }
 
         // Matrix multiply
         TokenKind::At => Some((22, 23)),

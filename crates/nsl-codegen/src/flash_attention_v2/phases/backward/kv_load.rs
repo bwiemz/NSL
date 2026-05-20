@@ -41,7 +41,9 @@ fn emit_one(
     ptx.push_str(&format!("V2_BWD_{tag}_LOAD_{label_suffix}:\n"));
     // Null-guard.
     ptx.push_str(&format!("    setp.eq.u64 %p0, {ptr_reg}, 0;\n"));
-    ptx.push_str(&format!("    @%p0 bra V2_BWD_{tag}_LOAD_SKIP_{label_suffix};\n"));
+    ptx.push_str(&format!(
+        "    @%p0 bra V2_BWD_{tag}_LOAD_SKIP_{label_suffix};\n"
+    ));
 
     for r in 0..rows_per_warp {
         // kv_row = warp_id + r*4
@@ -79,10 +81,7 @@ fn emit_one(
             ptx.push_str("    @%p1 mov.b16 %h0, 0;\n");
             ptx.push_str("    @!%p1 ld.global.b16 %h0, [%rd33];\n");
             // SMEM addr = smem_base + kv_row*(head_dim*2) + col*2
-            ptx.push_str(&format!(
-                "    mul.lo.u64 %rd34, %rd30, {};\n",
-                head_dim * 2
-            ));
+            ptx.push_str(&format!("    mul.lo.u64 %rd34, %rd30, {};\n", head_dim * 2));
             ptx.push_str("    add.u64 %rd34, %rd34, %rd32;\n");
             ptx.push_str(&format!("    add.u64 %rd34, {smem_base}, %rd34;\n"));
             ptx.push_str("    st.shared.b16 [%rd34], %h0;\n");
@@ -95,7 +94,14 @@ fn emit_one(
 
 /// Load saved K_proj from HBM into the K SMEM tile.
 pub fn emit_k_suffixed(ptx: &mut String, config: &FlashAttentionConfig, label_suffix: &str) {
-    emit_one(ptx, config, "K", label_suffix, "%rd_bwd_k_proj", "%k_smem_base");
+    emit_one(
+        ptx,
+        config,
+        "K",
+        label_suffix,
+        "%rd_bwd_k_proj",
+        "%k_smem_base",
+    );
 }
 
 pub fn emit_k(ptx: &mut String, config: &FlashAttentionConfig) {
@@ -104,7 +110,14 @@ pub fn emit_k(ptx: &mut String, config: &FlashAttentionConfig) {
 
 /// Load saved V_proj from HBM into the V SMEM tile.
 pub fn emit_v_suffixed(ptx: &mut String, config: &FlashAttentionConfig, label_suffix: &str) {
-    emit_one(ptx, config, "V", label_suffix, "%rd_bwd_v_proj", "%v_smem_base");
+    emit_one(
+        ptx,
+        config,
+        "V",
+        label_suffix,
+        "%rd_bwd_v_proj",
+        "%v_smem_base",
+    );
 }
 
 pub fn emit_v(ptx: &mut String, config: &FlashAttentionConfig) {
@@ -118,10 +131,16 @@ mod tests {
 
     fn base_cfg() -> FlashAttentionConfig {
         FlashAttentionConfig {
-            block_q: 32, block_kv: 32, head_dim: 32,
-            causal: false, paged: false, rope_q: false,
+            block_q: 32,
+            block_kv: 32,
+            head_dim: 32,
+            causal: false,
+            paged: false,
+            rope_q: false,
             rope_style: RopeStyle::HalfSplit,
-            gqa_group_size: 1, tree_mask: false, gpu_sm: 75,
+            gqa_group_size: 1,
+            tree_mask: false,
+            gpu_sm: 75,
             segment_masked: false,
             csha: Some(CshaExtras {
                 fused_projections: true,
@@ -142,8 +161,10 @@ mod tests {
         assert!(ptx.contains("st.shared.b16"));
         assert!(ptx.contains("V2_BWD_K_LOAD_0:"));
         assert!(ptx.contains("V2_BWD_K_LOAD_SKIP_0:"));
-        assert!(!ptx.contains("cos_ptr"),
-            "backward k_load must use saved post-RoPE K");
+        assert!(
+            !ptx.contains("cos_ptr"),
+            "backward k_load must use saved post-RoPE K"
+        );
     }
 
     #[test]

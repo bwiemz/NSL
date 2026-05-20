@@ -11,10 +11,18 @@ use nsl_codegen::pca_tilerange::emit_range_table_preamble;
 
 fn fa_4k_block64_seg_masked() -> FlashAttentionConfig {
     FlashAttentionConfig {
-        block_q: 64, block_kv: 64, head_dim: 64,
-        causal: true, paged: false, rope_q: true,
-        rope_style: RopeStyle::HalfSplit, gqa_group_size: 2,
-        tree_mask: false, gpu_sm: 120, segment_masked: true, csha: None,
+        block_q: 64,
+        block_kv: 64,
+        head_dim: 64,
+        causal: true,
+        paged: false,
+        rope_q: true,
+        rope_style: RopeStyle::HalfSplit,
+        gqa_group_size: 2,
+        tree_mask: false,
+        gpu_sm: 120,
+        segment_masked: true,
+        csha: None,
     }
 }
 
@@ -99,7 +107,9 @@ fn preamble_loop_counter_register_class_correct() {
     );
     // %r_tile_* must be .reg .u32 per warp-uniformity discipline.
     assert!(
-        ptx.contains(".reg .u32") && ptx.contains("r_tile_q_TILERANGE") && ptx.contains("r_tile_kv_TILERANGE"),
+        ptx.contains(".reg .u32")
+            && ptx.contains("r_tile_q_TILERANGE")
+            && ptx.contains("r_tile_kv_TILERANGE"),
         "r_tile must be .reg .u32; emitted preamble:\n{ptx}"
     );
     // Init via mov.u32 from literal 0 (uniformity-through-load anti-pattern check).

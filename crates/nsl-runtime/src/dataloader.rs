@@ -16,7 +16,7 @@ use crate::cpu::create_tensor_with_shape_rs_dtype;
 use crate::dict::{nsl_dict_free_tensor_values, nsl_dict_new, nsl_dict_set_str};
 use crate::packing::{pack_batch, packed_batch_to_dict};
 use crate::string::nsl_str_from_rust;
-use crate::tensor::{DTYPE_U16_TOKEN, NslTensor};
+use crate::tensor::{NslTensor, DTYPE_U16_TOKEN};
 
 #[inline]
 fn supports_flat_value_dtype(dtype: u16) -> bool {
@@ -46,8 +46,7 @@ impl DataLoaderConfig {
     fn from_json(json_ptr: *const u8, json_len: usize) -> Self {
         let slice = unsafe { std::slice::from_raw_parts(json_ptr, json_len) };
         let text = std::str::from_utf8(slice).expect("config JSON must be valid UTF-8");
-        let v: serde_json::Value =
-            serde_json::from_str(text).expect("config must be valid JSON");
+        let v: serde_json::Value = serde_json::from_str(text).expect("config must be valid JSON");
 
         DataLoaderConfig {
             batch_size: v["batch_size"].as_u64().unwrap_or(1) as usize,
@@ -93,11 +92,7 @@ unsafe impl Send for DataLoader {}
 unsafe impl Sync for DataLoader {}
 
 impl DataLoader {
-    fn new(
-        data_tensor_ptr: i64,
-        labels_tensor_ptr: i64,
-        config: DataLoaderConfig,
-    ) -> Self {
+    fn new(data_tensor_ptr: i64, labels_tensor_ptr: i64, config: DataLoaderConfig) -> Self {
         if data_tensor_ptr == 0 {
             eprintln!("nsl: DataLoader requires a data tensor");
             std::process::abort();
@@ -117,7 +112,10 @@ impl DataLoader {
         let data_len = data_tensor.len as usize;
         let data_dtype = data_tensor.dtype;
         if !supports_flat_value_dtype(data_dtype) {
-            eprintln!("nsl: DataLoader does not support source dtype {}", data_dtype);
+            eprintln!(
+                "nsl: DataLoader does not support source dtype {}",
+                data_dtype
+            );
             std::process::abort();
         }
 
@@ -142,7 +140,10 @@ impl DataLoader {
 
         let has_labels = !labels.is_null() && labels_len > 0;
         if has_labels && !supports_flat_value_dtype(labels_dtype) {
-            eprintln!("nsl: DataLoader does not support label dtype {}", labels_dtype);
+            eprintln!(
+                "nsl: DataLoader does not support label dtype {}",
+                labels_dtype
+            );
             std::process::abort();
         }
         if has_labels && labels_len != data_len {
@@ -428,8 +429,7 @@ pub extern "C" fn nsl_dataloader_create(
     config_ptr: i64,
     config_len: i64,
 ) -> i64 {
-    let config =
-        DataLoaderConfig::from_json(config_ptr as *const u8, config_len as usize);
+    let config = DataLoaderConfig::from_json(config_ptr as *const u8, config_len as usize);
     let dl = DataLoader::new(data_tensor_ptr, labels_tensor_ptr, config);
     Box::into_raw(Box::new(dl)) as i64
 }
@@ -546,7 +546,9 @@ mod tests {
         let tensor = NslTensor::from_ptr(tensor_ptr);
         let data = tensor.data_f64();
         for (index, value) in values.iter().enumerate() {
-            unsafe { *data.add(index) = *value; }
+            unsafe {
+                *data.add(index) = *value;
+            }
         }
         tensor_ptr
     }
@@ -667,7 +669,11 @@ mod tests {
         let expected = [11, -100, -100, -100];
         for (i, value) in expected.iter().enumerate() {
             let actual = unsafe { *labels_data.add(i) };
-            assert_eq!(actual, *value, "label at position {} should match precomputed label", i);
+            assert_eq!(
+                actual, *value,
+                "label at position {} should match precomputed label",
+                i
+            );
         }
 
         nsl_dict_free(batch);
@@ -692,11 +698,8 @@ mod tests {
         }
 
         let path_str = path.to_str().unwrap();
-        let data_tensor = crate::data_source::nsl_load_mmap(
-            path_str.as_ptr() as i64,
-            path_str.len() as i64,
-            3,
-        );
+        let data_tensor =
+            crate::data_source::nsl_load_mmap(path_str.as_ptr() as i64, path_str.len() as i64, 3);
 
         let config_json = format!(
             r#"{{"batch_size":1,"seq_len":4,"num_workers":1,"packing":false,"shuffle":false,"prefetch":1,"pin_memory":false,"drop_last":true,"pack_separator":0}}"#
@@ -717,7 +720,10 @@ mod tests {
         let k_ids = nsl_str_from_rust("input_ids");
         let ids_ptr = crate::dict::nsl_dict_get_str(batch, k_ids);
         let ids_tensor = NslTensor::from_ptr(ids_ptr);
-        assert_eq!(ids_tensor.dtype, 4, "input_ids should be materialized as i32 tokens");
+        assert_eq!(
+            ids_tensor.dtype, 4,
+            "input_ids should be materialized as i32 tokens"
+        );
 
         let ids_data = ids_tensor.data as *const i32;
         let expected_ids = [100, 200, 50256, 42];
@@ -733,7 +739,11 @@ mod tests {
         let expected_labels = [200, 50256, 42, -100];
         for (i, value) in expected_labels.iter().enumerate() {
             let actual = unsafe { *lbl_data.add(i) };
-            assert_eq!(actual, *value, "label {} should match shifted token data", i);
+            assert_eq!(
+                actual, *value,
+                "label {} should match shifted token data",
+                i
+            );
         }
 
         nsl_dict_free(batch);
@@ -772,7 +782,10 @@ mod tests {
 
         // Batch 3: tokens 8-9 + padding
         let batch3 = nsl_dataloader_next_batch(dl_ptr);
-        assert!(batch3 != 0, "partial tail batch should exist with drop_last=false");
+        assert!(
+            batch3 != 0,
+            "partial tail batch should exist with drop_last=false"
+        );
 
         // Check that padded positions have 0 for input_ids
         let k_ids = nsl_str_from_rust("input_ids");
@@ -781,18 +794,42 @@ mod tests {
         let ids_data = ids_tensor.data as *const i32;
         assert_eq!(unsafe { *ids_data.add(0) }, 8, "first token should be 8");
         assert_eq!(unsafe { *ids_data.add(1) }, 9, "second token should be 9");
-        assert_eq!(unsafe { *ids_data.add(2) }, 0, "third position should be padded with 0");
-        assert_eq!(unsafe { *ids_data.add(3) }, 0, "fourth position should be padded with 0");
+        assert_eq!(
+            unsafe { *ids_data.add(2) },
+            0,
+            "third position should be padded with 0"
+        );
+        assert_eq!(
+            unsafe { *ids_data.add(3) },
+            0,
+            "fourth position should be padded with 0"
+        );
 
         // Check that padded label positions have -100
         let k_lbl = nsl_str_from_rust("labels");
         let lbl_ptr = crate::dict::nsl_dict_get_str(batch3, k_lbl);
         let lbl_tensor = NslTensor::from_ptr(lbl_ptr);
         let lbl_data = lbl_tensor.data as *const i32;
-        assert_eq!(unsafe { *lbl_data.add(0) }, 9, "label for position 0 should be next token (9)");
-        assert_eq!(unsafe { *lbl_data.add(1) }, -100, "label at position 1 should be -100 (last real token)");
-        assert_eq!(unsafe { *lbl_data.add(2) }, -100, "label at padded position should be -100");
-        assert_eq!(unsafe { *lbl_data.add(3) }, -100, "label at padded position should be -100");
+        assert_eq!(
+            unsafe { *lbl_data.add(0) },
+            9,
+            "label for position 0 should be next token (9)"
+        );
+        assert_eq!(
+            unsafe { *lbl_data.add(1) },
+            -100,
+            "label at position 1 should be -100 (last real token)"
+        );
+        assert_eq!(
+            unsafe { *lbl_data.add(2) },
+            -100,
+            "label at padded position should be -100"
+        );
+        assert_eq!(
+            unsafe { *lbl_data.add(3) },
+            -100,
+            "label at padded position should be -100"
+        );
 
         nsl_dict_free(batch3);
 

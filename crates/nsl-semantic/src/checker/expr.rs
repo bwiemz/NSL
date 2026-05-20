@@ -61,7 +61,8 @@ impl<'a> TypeChecker<'a> {
                     Type::Tuple(elems) => {
                         if elems.is_empty() {
                             Type::Unknown
-                        } else if let nsl_ast::expr::SubscriptKind::Index(idx_expr) = index.as_ref() {
+                        } else if let nsl_ast::expr::SubscriptKind::Index(idx_expr) = index.as_ref()
+                        {
                             if let ExprKind::IntLiteral(i) = &idx_expr.kind {
                                 let idx = if *i < 0 {
                                     (*i + elems.len() as i64) as usize
@@ -137,7 +138,9 @@ impl<'a> TypeChecker<'a> {
                 }
             }
             ExprKind::Lambda { params, body } => {
-                let scope = self.scopes.push_scope(self.current_scope, ScopeKind::Lambda);
+                let scope = self
+                    .scopes
+                    .push_scope(self.current_scope, ScopeKind::Lambda);
                 let prev = self.current_scope;
                 self.current_scope = scope;
                 let param_types: Vec<Type> = params
@@ -210,8 +213,10 @@ impl<'a> TypeChecker<'a> {
 
                 if is_parser_placeholder(else_expr) {
                     self.diagnostics.push(
-                        Diagnostic::error("if-expression requires an else branch that yields a value")
-                            .with_label(expr.span, "add an else branch with a value"),
+                        Diagnostic::error(
+                            "if-expression requires an else branch that yields a value",
+                        )
+                        .with_label(expr.span, "add an else branch with a value"),
                     );
                 }
 
@@ -311,7 +316,8 @@ impl<'a> TypeChecker<'a> {
                     if matches!(result_ty, Type::Unknown) {
                         if let Some(last) = arm.body.stmts.last() {
                             if let StmtKind::Expr(e) = &last.kind {
-                                result_ty = self.type_map.get(&e.id).cloned().unwrap_or(Type::Unknown);
+                                result_ty =
+                                    self.type_map.get(&e.id).cloned().unwrap_or(Type::Unknown);
                             }
                         }
                     }
@@ -339,9 +345,15 @@ impl<'a> TypeChecker<'a> {
         }
 
         let result_ty = if Self::block_expr_has_reachable_value(block) {
-            let last = block.stmts.last().expect("reachable block expression must have a tail statement");
+            let last = block
+                .stmts
+                .last()
+                .expect("reachable block expression must have a tail statement");
             if let StmtKind::Expr(expr) = &last.kind {
-                self.type_map.get(&expr.id).cloned().unwrap_or(Type::Unknown)
+                self.type_map
+                    .get(&expr.id)
+                    .cloned()
+                    .unwrap_or(Type::Unknown)
             } else {
                 Type::Unknown
             }
@@ -369,9 +381,7 @@ impl<'a> TypeChecker<'a> {
 
     fn stmt_terminates_control_flow(stmt: &Stmt) -> bool {
         match &stmt.kind {
-            StmtKind::Return(_) | StmtKind::Yield(_) | StmtKind::Break | StmtKind::Continue => {
-                true
-            }
+            StmtKind::Return(_) | StmtKind::Yield(_) | StmtKind::Break | StmtKind::Continue => true,
             StmtKind::If {
                 then_block,
                 elif_clauses,
@@ -397,7 +407,8 @@ impl<'a> TypeChecker<'a> {
     }
 
     fn block_terminates_control_flow(block: &Block) -> bool {
-        block.stmts
+        block
+            .stmts
             .last()
             .is_some_and(Self::stmt_terminates_control_flow)
     }
@@ -426,14 +437,26 @@ impl<'a> TypeChecker<'a> {
                 ..
             } => {
                 let mut then_visible = visible.clone();
-                self.check_block_expr_shadowing_with_visible(then_block, outer_scope, &mut then_visible);
+                self.check_block_expr_shadowing_with_visible(
+                    then_block,
+                    outer_scope,
+                    &mut then_visible,
+                );
                 for (_, block) in elif_clauses {
                     let mut elif_visible = visible.clone();
-                    self.check_block_expr_shadowing_with_visible(block, outer_scope, &mut elif_visible);
+                    self.check_block_expr_shadowing_with_visible(
+                        block,
+                        outer_scope,
+                        &mut elif_visible,
+                    );
                 }
                 if let Some(block) = else_block {
                     let mut else_visible = visible.clone();
-                    self.check_block_expr_shadowing_with_visible(block, outer_scope, &mut else_visible);
+                    self.check_block_expr_shadowing_with_visible(
+                        block,
+                        outer_scope,
+                        &mut else_visible,
+                    );
                 }
             }
             StmtKind::For { pattern, body, .. } => {
@@ -453,8 +476,16 @@ impl<'a> TypeChecker<'a> {
             StmtKind::Match { arms, .. } => {
                 for arm in arms {
                     let mut arm_visible = visible.clone();
-                    self.check_block_expr_pattern_shadowing(&arm.pattern, outer_scope, &mut arm_visible);
-                    self.check_block_expr_shadowing_with_visible(&arm.body, outer_scope, &mut arm_visible);
+                    self.check_block_expr_pattern_shadowing(
+                        &arm.pattern,
+                        outer_scope,
+                        &mut arm_visible,
+                    );
+                    self.check_block_expr_shadowing_with_visible(
+                        &arm.body,
+                        outer_scope,
+                        &mut arm_visible,
+                    );
                 }
             }
             _ => {}

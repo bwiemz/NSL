@@ -23,15 +23,14 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use nsl_codegen::calibration::{
-    CalibCtx, CalibrationHook, CalibrationResult,
     awq_hook::AwqCalibrationHook,
-    discovery::DiscoveredProjection,
     binary_codegen::real_subprocess_entry,
+    discovery::DiscoveredProjection,
     observation::ProjectionRef,
-    HarnessConfig, HarnessMode, HookRegistry,
     retention::{ArenaLayout, RetentionTable, TensorShape},
     retention_pass::build_arena_layout,
     sidecar::{Sidecar, SIDECAR_VERSION},
+    CalibCtx, CalibrationHook, CalibrationResult, HarnessConfig, HarnessMode, HookRegistry,
 };
 
 /// Absolute path to the repo root (parent of `crates/`).
@@ -74,13 +73,12 @@ fn build_awq_sidecar(projections: &[(&str, Vec<f32>)]) -> Sidecar {
     }
 }
 
-fn awq_fixture_compile_bundle(
-) -> (
+fn awq_fixture_compile_bundle() -> (
     Vec<DiscoveredProjection>,
     std::sync::Arc<nsl_codegen::calibration::CalibrationCompileBundle>,
 ) {
-    let source = std::fs::read_to_string(fixture("awq_calibration_mlp.nsl"))
-        .expect("awq fixture readable");
+    let source =
+        std::fs::read_to_string(fixture("awq_calibration_mlp.nsl")).expect("awq fixture readable");
     let mut interner = nsl_lexer::Interner::new();
     let (tokens, lex_diags) = nsl_lexer::tokenize(&source, nsl_errors::FileId(0), &mut interner);
     assert!(
@@ -100,10 +98,8 @@ fn awq_fixture_compile_bundle(
         parsed.diagnostics
     );
 
-    let projections = nsl_codegen::calibration::pre_scan_awq_projections_from_ast(
-        &parsed.module,
-        &interner,
-    );
+    let projections =
+        nsl_codegen::calibration::pre_scan_awq_projections_from_ast(&parsed.module, &interner);
     let mut analysis_interner = interner.clone();
     let analysis = nsl_semantic::analyze(&parsed.module, &mut analysis_interner);
     assert!(
@@ -125,8 +121,7 @@ fn awq_fixture_compile_bundle(
 }
 
 fn read_safetensors_flat(path: &Path, tensor_name: &str) -> Vec<f32> {
-    let bytes = std::fs::read(path)
-        .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
+    let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
     let tensors = safetensors::SafeTensors::deserialize(&bytes)
         .unwrap_or_else(|e| panic!("deserializing {}: {e}", path.display()));
     let tensor = tensors
@@ -191,8 +186,7 @@ fn awq_scales(sidecar: &Sidecar, projection: &str) -> Vec<f32> {
         .hooks
         .get("awq_activation_scales")
         .expect("awq_activation_scales hook blob missing from sidecar");
-    let parsed = nsl_runtime::awq::AwqScales::from_blob(blob)
-        .expect("AWQ sidecar blob must parse");
+    let parsed = nsl_runtime::awq::AwqScales::from_blob(blob).expect("AWQ sidecar blob must parse");
     parsed
         .by_projection
         .get(projection)
@@ -209,11 +203,9 @@ fn assert_close(actual: &[f32], expected: &[f32], rtol: f32, label: &str) {
         expected.len()
     );
 
-    for (index, (&actual_value, &expected_value)) in actual.iter().zip(expected.iter()).enumerate() {
-        let scale = actual_value
-            .abs()
-            .max(expected_value.abs())
-            .max(1.0);
+    for (index, (&actual_value, &expected_value)) in actual.iter().zip(expected.iter()).enumerate()
+    {
+        let scale = actual_value.abs().max(expected_value.abs()).max(1.0);
         let diff = (actual_value - expected_value).abs();
         assert!(
             diff <= rtol * scale,
@@ -225,10 +217,7 @@ fn assert_close(actual: &[f32], expected: &[f32], rtol: f32, label: &str) {
 
 /// Parse + semantic-check + compile a source string with options.
 /// Returns Err as a formatted string on failure.
-fn try_compile(
-    src: &str,
-    opts: &nsl_codegen::CompileOptions,
-) -> Result<Vec<u8>, String> {
+fn try_compile(src: &str, opts: &nsl_codegen::CompileOptions) -> Result<Vec<u8>, String> {
     nsl_codegen::compile_with_options(src, opts).map_err(|e| format!("{e:?}"))
 }
 
@@ -271,40 +260,50 @@ fn discovery_from_fixture_nsl_finds_both_projections() {
         .expect("awq_calibration_mlp.nsl must exist");
 
     let mut interner = nsl_lexer::Interner::new();
-    let (tokens, lex_diags) =
-        nsl_lexer::tokenize(&source, nsl_errors::FileId(0), &mut interner);
+    let (tokens, lex_diags) = nsl_lexer::tokenize(&source, nsl_errors::FileId(0), &mut interner);
     assert!(
-        lex_diags.iter().all(|d| !matches!(d.level, nsl_errors::Level::Error)),
+        lex_diags
+            .iter()
+            .all(|d| !matches!(d.level, nsl_errors::Level::Error)),
         "fixture must lex cleanly: {lex_diags:?}"
     );
     let parsed = nsl_parser::parse(&tokens, &mut interner);
     assert!(
-        parsed.diagnostics.iter().all(|d| !matches!(d.level, nsl_errors::Level::Error)),
-        "fixture must parse cleanly: {:?}", parsed.diagnostics
+        parsed
+            .diagnostics
+            .iter()
+            .all(|d| !matches!(d.level, nsl_errors::Level::Error)),
+        "fixture must parse cleanly: {:?}",
+        parsed.diagnostics
     );
 
     // Walk the AST to find the TinyMLP model definition.
-    let model_def_ref = parsed.module.stmts.iter().find_map(|s| {
-        use nsl_ast::stmt::StmtKind;
-        match &s.kind {
-            StmtKind::Decorated { stmt: inner, .. } => {
-                if let StmtKind::ModelDef(md) = &inner.kind {
-                    if interner.resolve(md.name.0).unwrap_or("") == "TinyMLP" {
-                        return Some(md);
+    let model_def_ref = parsed
+        .module
+        .stmts
+        .iter()
+        .find_map(|s| {
+            use nsl_ast::stmt::StmtKind;
+            match &s.kind {
+                StmtKind::Decorated { stmt: inner, .. } => {
+                    if let StmtKind::ModelDef(md) = &inner.kind {
+                        if interner.resolve(md.name.0).unwrap_or("") == "TinyMLP" {
+                            return Some(md);
+                        }
                     }
-                }
-                None
-            }
-            StmtKind::ModelDef(md) => {
-                if interner.resolve(md.name.0).unwrap_or("") == "TinyMLP" {
-                    Some(md)
-                } else {
                     None
                 }
+                StmtKind::ModelDef(md) => {
+                    if interner.resolve(md.name.0).unwrap_or("") == "TinyMLP" {
+                        Some(md)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
             }
-            _ => None,
-        }
-    }).expect("TinyMLP model must be present in the fixture");
+        })
+        .expect("TinyMLP model must be present in the fixture");
 
     // Build field_types and tensor_shapes matching what collect_models would produce.
     let mut field_types = std::collections::HashMap::new();
@@ -313,7 +312,10 @@ fn discovery_from_fixture_nsl_finds_both_projections() {
 
     let mut tensor_shapes = std::collections::HashMap::new();
     tensor_shapes.insert("up_proj".to_string(), "Tensor<[128, 64], f32>".to_string());
-    tensor_shapes.insert("down_proj".to_string(), "Tensor<[64, 128], f32>".to_string());
+    tensor_shapes.insert(
+        "down_proj".to_string(),
+        "Tensor<[64, 128], f32>".to_string(),
+    );
 
     // Find the forward body.
     let forward_body = model_def_ref.members.iter().find_map(|m| {
@@ -333,19 +335,29 @@ fn discovery_from_fixture_nsl_finds_both_projections() {
         &tensor_shapes,
         &[],
         &interner,
-    ).expect("discovery must succeed on the fixture");
+    )
+    .expect("discovery must succeed on the fixture");
 
     let mut names: Vec<_> = projections.iter().map(|p| p.projection.0.clone()).collect();
     names.sort();
     assert_eq!(
         names,
-        vec!["TinyMLP.down_proj".to_string(), "TinyMLP.up_proj".to_string()],
+        vec![
+            "TinyMLP.down_proj".to_string(),
+            "TinyMLP.up_proj".to_string()
+        ],
         "discovery must find both TinyMLP projections"
     );
 
     // Channel count: up_proj in_features=64, down_proj in_features=128.
-    let up = projections.iter().find(|p| p.projection.0 == "TinyMLP.up_proj").unwrap();
-    let dn = projections.iter().find(|p| p.projection.0 == "TinyMLP.down_proj").unwrap();
+    let up = projections
+        .iter()
+        .find(|p| p.projection.0 == "TinyMLP.up_proj")
+        .unwrap();
+    let dn = projections
+        .iter()
+        .find(|p| p.projection.0 == "TinyMLP.down_proj")
+        .unwrap();
     assert_eq!(up.weight_shape, [128, 64], "up_proj shape");
     assert_eq!(dn.weight_shape, [64, 128], "down_proj shape");
 }
@@ -362,21 +374,22 @@ fn discovery_from_fixture_nsl_finds_both_projections() {
 #[test]
 fn awq_observation_with_real_calib_data_produces_nonuniform_scales() {
     let data_path = fixture("awq_calib_data.safetensors");
-    assert!(data_path.exists(), "awq_calib_data.safetensors fixture missing — run gen_awq_fixtures.py");
+    assert!(
+        data_path.exists(),
+        "awq_calib_data.safetensors fixture missing — run gen_awq_fixtures.py"
+    );
 
     // Load calibration batches: shape [8, 4, 64] → 8 batches, seq=4, hidden=64.
-    let batches = nsl_runtime::calibration_data::load(&data_path)
-        .expect("calibration data must load");
+    let batches =
+        nsl_runtime::calibration_data::load(&data_path).expect("calibration data must load");
     assert_eq!(batches.count, 8, "expected 8 calibration batches");
 
     // Two projections: up_proj (in_features=64), down_proj (in_features=128).
     // For this test only up_proj matches the activation dimension (64).
-    let discovered = vec![
-        DiscoveredProjection {
-            projection: ProjectionRef::new("TinyMLP.up_proj"),
-            weight_shape: [128, 64],
-        },
-    ];
+    let discovered = vec![DiscoveredProjection {
+        projection: ProjectionRef::new("TinyMLP.up_proj"),
+        weight_shape: [128, 64],
+    }];
     let hook: Box<dyn CalibrationHook> = Box::new(AwqCalibrationHook::from_discovered(&discovered));
 
     // Build retention table: shape [8, 4, 64].
@@ -418,9 +431,9 @@ fn awq_observation_with_real_calib_data_produces_nonuniform_scales() {
     };
 
     // Parse scales via nsl-runtime's AwqScales.
-    let awq_scales = nsl_runtime::awq::AwqScales::from_blob(&blob)
-        .expect("scales blob must parse");
-    let up_scales = awq_scales.by_projection
+    let awq_scales = nsl_runtime::awq::AwqScales::from_blob(&blob).expect("scales blob must parse");
+    let up_scales = awq_scales
+        .by_projection
         .get("TinyMLP.up_proj")
         .expect("TinyMLP.up_proj scales must be present");
 
@@ -488,7 +501,11 @@ fn end_to_end_discovers_enumerates_calibrates_and_quantizes() {
     let layout = ArenaLayout {
         entries: vec![
             (ProjectionRef::new("TinyMLP.up_proj"), 0, 8 * 4 * 64 * 4),
-            (ProjectionRef::new("TinyMLP.down_proj"), 8 * 4 * 64 * 4, 8 * 4 * 128 * 4),
+            (
+                ProjectionRef::new("TinyMLP.down_proj"),
+                8 * 4 * 64 * 4,
+                8 * 4 * 128 * 4,
+            ),
         ],
     };
 
@@ -496,8 +513,7 @@ fn end_to_end_discovers_enumerates_calibrates_and_quantizes() {
     hook.emit_init(&mut ctx);
 
     // Load calibration data and run observation.
-    let batches = nsl_runtime::calibration_data::load(&data_path)
-        .expect("calib data must load");
+    let batches = nsl_runtime::calibration_data::load(&data_path).expect("calib data must load");
 
     for batch_idx in 0..batches.count {
         ctx.sample_idx = batch_idx as u32;
@@ -540,15 +556,18 @@ fn end_to_end_discovers_enumerates_calibrates_and_quantizes() {
     };
 
     // Parse via AwqScales.
-    let awq_scales = nsl_runtime::awq::AwqScales::from_blob(&blob)
-        .expect("sidecar blob must parse");
+    let awq_scales =
+        nsl_runtime::awq::AwqScales::from_blob(&blob).expect("sidecar blob must parse");
 
     // Assertion 1: discovery produced both projections.
     let mut names: Vec<_> = awq_scales.by_projection.keys().cloned().collect();
     names.sort();
     assert_eq!(
         names,
-        vec!["TinyMLP.down_proj".to_string(), "TinyMLP.up_proj".to_string()],
+        vec![
+            "TinyMLP.down_proj".to_string(),
+            "TinyMLP.up_proj".to_string()
+        ],
         "both projections must appear in AWQ scales"
     );
 
@@ -556,7 +575,11 @@ fn end_to_end_discovers_enumerates_calibrates_and_quantizes() {
     let up = awq_scales.by_projection.get("TinyMLP.up_proj").unwrap();
     let dn = awq_scales.by_projection.get("TinyMLP.down_proj").unwrap();
     assert_eq!(up.len(), 64, "TinyMLP.up_proj must have 64 channel scales");
-    assert_eq!(dn.len(), 128, "TinyMLP.down_proj must have 128 channel scales");
+    assert_eq!(
+        dn.len(),
+        128,
+        "TinyMLP.down_proj must have 128 channel scales"
+    );
 
     // Assertion 3: scales aren't all-equal (proves observation ran with real data).
     assert!(
@@ -648,8 +671,7 @@ fn end_to_end_real_subprocess_matches_analytical_reference() {
     // canonical sidecar JSON between sentinel lines so
     // scripts/verify-awq-determinism.sh can extract and compare across runs.
     if std::env::var("SIDECAR_DUMP").is_ok() {
-        let canonical = serde_json::to_string_pretty(&sidecar)
-            .expect("Sidecar serializes to JSON");
+        let canonical = serde_json::to_string_pretty(&sidecar).expect("Sidecar serializes to JSON");
         eprintln!("SIDECAR_JSON_START");
         eprintln!("{canonical}");
         eprintln!("SIDECAR_JSON_END");
@@ -704,8 +726,7 @@ fn snapshot_awq_sidecar_baseline() {
     // Serialize to a canonical pretty-printed JSON. serde_json sorts BTreeMap
     // keys by construction; Sidecar.hooks is BTreeMap<String, Vec<u8>>. Float
     // fields use default serde_json formatting (deterministic per Rust toolchain).
-    let canonical = serde_json::to_string_pretty(&sidecar)
-        .expect("Sidecar serializes to JSON");
+    let canonical = serde_json::to_string_pretty(&sidecar).expect("Sidecar serializes to JSON");
 
     // #134 §6.1 determinism verification: when SIDECAR_DUMP=1, print the
     // canonical sidecar JSON between sentinel lines so

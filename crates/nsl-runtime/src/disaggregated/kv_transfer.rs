@@ -4,8 +4,8 @@
 //! the KvTransferBackend trait, and a SharedMemBackend for single-node testing.
 
 use std::ffi::c_void;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Mutex;
 
 // ---------------------------------------------------------------------------
 // Transfer header (matches spec Section 3)
@@ -23,12 +23,12 @@ pub struct KvTransferHeader {
     pub num_layers: u32,
     pub num_kv_heads: u32,
     pub head_dim: u32,
-    pub block_size: u32,      // tokens per block
-    pub num_blocks: u32,      // total blocks being transferred
-    pub dtype: u16,           // 0=f64, 1=f32, 2=fp16, etc.
-    pub compressed: u8,       // 0 = raw, 1 = quantized (M42 future)
+    pub block_size: u32, // tokens per block
+    pub num_blocks: u32, // total blocks being transferred
+    pub dtype: u16,      // 0=f64, 1=f32, 2=fp16, etc.
+    pub compressed: u8,  // 0 = raw, 1 = quantized (M42 future)
     pub _padding: u8,
-    pub total_bytes: u64,     // total payload size after header + entries
+    pub total_bytes: u64, // total payload size after header + entries
 }
 
 impl KvTransferHeader {
@@ -60,21 +60,21 @@ impl KvTransferHeader {
 #[derive(Clone, Debug)]
 #[repr(C)]
 pub struct KvBlockTransferEntry {
-    pub logical_block_id: u32,    // position in sequence
-    pub num_valid_tokens: u32,    // how many tokens are valid (last block may be partial)
+    pub logical_block_id: u32, // position in sequence
+    pub num_valid_tokens: u32, // how many tokens are valid (last block may be partial)
 }
 
 /// Return the byte size for a given dtype code.
 fn dtype_size(dtype: u16) -> usize {
     match dtype {
-        0 => 8,  // f64
-        1 => 4,  // f32
-        2 => 2,  // fp16
-        3 => 2,  // bf16
-        4 => 1,  // int8
-        5 => 1,  // fp8e4m3
-        6 => 1,  // fp8e5m2
-        _ => 4,  // default to f32 for unknown
+        0 => 8, // f64
+        1 => 4, // f32
+        2 => 2, // fp16
+        3 => 2, // bf16
+        4 => 1, // int8
+        5 => 1, // fp8e4m3
+        6 => 1, // fp8e5m2
+        _ => 4, // default to f32 for unknown
     }
 }
 
@@ -165,8 +165,14 @@ impl SharedMemBackend {
     pub fn new_pair(rank_a: i32, rank_b: i32) -> (Self, Self) {
         let shared = std::sync::Arc::new(Mutex::new(Vec::new()));
         (
-            SharedMemBackend { rank: rank_a, buffers: shared.clone() },
-            SharedMemBackend { rank: rank_b, buffers: shared },
+            SharedMemBackend {
+                rank: rank_a,
+                buffers: shared.clone(),
+            },
+            SharedMemBackend {
+                rank: rank_b,
+                buffers: shared,
+            },
         )
     }
 }
@@ -225,7 +231,10 @@ impl KvTransferBackend for SharedMemBackend {
                 Ok(g) => g,
                 Err(_) => return -1, // mutex poisoned
             };
-            if let Some(pos) = guard.iter().position(|t| t.source_rank == source_rank && t.target_rank == self.rank) {
+            if let Some(pos) = guard
+                .iter()
+                .position(|t| t.source_rank == source_rank && t.target_rank == self.rank)
+            {
                 let transfer = guard.remove(pos);
                 *header = transfer.header;
                 *block_entries = transfer.block_entries;
@@ -354,7 +363,12 @@ impl TcpBackend {
     /// Create a TCP backend with explicit peer addresses for multi-node deployment.
     ///
     /// `peers`: mapping of rank → "host:port" strings
-    pub fn with_peers(rank: i32, base_port: u16, bind_addr: String, peers: std::collections::HashMap<i32, String>) -> Self {
+    pub fn with_peers(
+        rank: i32,
+        base_port: u16,
+        bind_addr: String,
+        peers: std::collections::HashMap<i32, String>,
+    ) -> Self {
         TcpBackend {
             rank,
             base_port,
@@ -430,9 +444,8 @@ impl TcpBackend {
         if stream.read_exact(&mut header_bytes).is_err() {
             return None;
         }
-        let header: KvTransferHeader = unsafe {
-            std::ptr::read_unaligned(header_bytes.as_ptr() as *const KvTransferHeader)
-        };
+        let header: KvTransferHeader =
+            unsafe { std::ptr::read_unaligned(header_bytes.as_ptr() as *const KvTransferHeader) };
         if !header.is_valid() {
             return None;
         }
@@ -447,7 +460,7 @@ impl TcpBackend {
             .map(|i| unsafe {
                 let entry_size = std::mem::size_of::<KvBlockTransferEntry>();
                 std::ptr::read_unaligned(
-                    entries_bytes.as_ptr().add(i * entry_size) as *const KvBlockTransferEntry,
+                    entries_bytes.as_ptr().add(i * entry_size) as *const KvBlockTransferEntry
                 )
             })
             .collect();
@@ -518,7 +531,8 @@ impl TcpBackend {
 
 impl Drop for TcpBackend {
     fn drop(&mut self) {
-        self.shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.shutdown
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -558,7 +572,10 @@ impl KvTransferBackend for TcpBackend {
         let mut stream = match stream {
             Some(s) => s,
             None => {
-                eprintln!("[nsl-tcp] Failed to connect to rank {} at {}", target_rank, addr);
+                eprintln!(
+                    "[nsl-tcp] Failed to connect to rank {} at {}",
+                    target_rank, addr
+                );
                 return -1;
             }
         };
@@ -747,8 +764,16 @@ impl NvlinkBackend {
         let shared = std::sync::Arc::new(Mutex::new(Vec::new()));
         let ipc = Self::probe_cuda_ipc();
         (
-            NvlinkBackend { rank: rank_a, handle_exchange: shared.clone(), cuda_ipc_available: ipc },
-            NvlinkBackend { rank: rank_b, handle_exchange: shared, cuda_ipc_available: ipc },
+            NvlinkBackend {
+                rank: rank_a,
+                handle_exchange: shared.clone(),
+                cuda_ipc_available: ipc,
+            },
+            NvlinkBackend {
+                rank: rank_b,
+                handle_exchange: shared,
+                cuda_ipc_available: ipc,
+            },
         )
     }
 
@@ -825,7 +850,9 @@ impl NvlinkBackend {
         extern "C" {
             fn cuIpcCloseMemHandle(dptr: u64) -> u32;
         }
-        unsafe { cuIpcCloseMemHandle(ptr as u64); }
+        unsafe {
+            cuIpcCloseMemHandle(ptr as u64);
+        }
     }
 }
 
@@ -854,14 +881,22 @@ impl KvTransferBackend for NvlinkBackend {
                 v_handle = [0u8; 64];
                 k_cpu = if kv_bytes_each > 0 && !k_data.is_null() {
                     let mut buf = vec![0u8; kv_bytes_each];
-                    crate::cuda::inner::memcpy_dtoh(buf.as_mut_ptr() as *mut c_void, k_data, kv_bytes_each);
+                    crate::cuda::inner::memcpy_dtoh(
+                        buf.as_mut_ptr() as *mut c_void,
+                        k_data,
+                        kv_bytes_each,
+                    );
                     buf
                 } else {
                     Vec::new()
                 };
                 v_cpu = if kv_bytes_each > 0 && !v_data.is_null() {
                     let mut buf = vec![0u8; kv_bytes_each];
-                    crate::cuda::inner::memcpy_dtoh(buf.as_mut_ptr() as *mut c_void, v_data, kv_bytes_each);
+                    crate::cuda::inner::memcpy_dtoh(
+                        buf.as_mut_ptr() as *mut c_void,
+                        v_data,
+                        kv_bytes_each,
+                    );
                     buf
                 } else {
                     Vec::new()
@@ -920,7 +955,10 @@ impl KvTransferBackend for NvlinkBackend {
                 Ok(g) => g,
                 Err(_) => return -1,
             };
-            if let Some(pos) = guard.iter().position(|t| t.source_rank == source_rank && t.target_rank == self.rank) {
+            if let Some(pos) = guard
+                .iter()
+                .position(|t| t.source_rank == source_rank && t.target_rank == self.rank)
+            {
                 let transfer = guard.remove(pos);
                 *header = transfer.header;
                 *block_entries = transfer.block_entries;
@@ -938,15 +976,27 @@ impl KvTransferBackend for NvlinkBackend {
                         let remote_v = Self::import_ipc_handle(&transfer.v_ipc_handle);
                         if !remote_k.is_null() && !remote_v.is_null() {
                             // GPU→GPU copy (goes over NVLink/PCIe)
-                            crate::cuda::inner::memcpy_dtod(k_data, remote_k as *const c_void, transfer.k_size);
-                            crate::cuda::inner::memcpy_dtod(v_data, remote_v as *const c_void, transfer.v_size);
+                            crate::cuda::inner::memcpy_dtod(
+                                k_data,
+                                remote_k as *const c_void,
+                                transfer.k_size,
+                            );
+                            crate::cuda::inner::memcpy_dtod(
+                                v_data,
+                                remote_v as *const c_void,
+                                transfer.v_size,
+                            );
                             Self::close_ipc_handle(remote_k);
                             Self::close_ipc_handle(remote_v);
                             return 0;
                         }
                         // IPC import failed — fall through to CPU path
-                        if !remote_k.is_null() { Self::close_ipc_handle(remote_k); }
-                        if !remote_v.is_null() { Self::close_ipc_handle(remote_v); }
+                        if !remote_k.is_null() {
+                            Self::close_ipc_handle(remote_k);
+                        }
+                        if !remote_v.is_null() {
+                            Self::close_ipc_handle(remote_v);
+                        }
                     }
                 }
 
@@ -1007,14 +1057,26 @@ impl KvTransferBackend for NvlinkBackend {
                     let remote_k = Self::import_ipc_handle(&transfer.k_ipc_handle);
                     let remote_v = Self::import_ipc_handle(&transfer.v_ipc_handle);
                     if !remote_k.is_null() && !remote_v.is_null() {
-                        crate::cuda::inner::memcpy_dtod(k_data, remote_k as *const c_void, transfer.k_size);
-                        crate::cuda::inner::memcpy_dtod(v_data, remote_v as *const c_void, transfer.v_size);
+                        crate::cuda::inner::memcpy_dtod(
+                            k_data,
+                            remote_k as *const c_void,
+                            transfer.k_size,
+                        );
+                        crate::cuda::inner::memcpy_dtod(
+                            v_data,
+                            remote_v as *const c_void,
+                            transfer.v_size,
+                        );
                         Self::close_ipc_handle(remote_k);
                         Self::close_ipc_handle(remote_v);
                         return 0;
                     }
-                    if !remote_k.is_null() { Self::close_ipc_handle(remote_k); }
-                    if !remote_v.is_null() { Self::close_ipc_handle(remote_v); }
+                    if !remote_k.is_null() {
+                        Self::close_ipc_handle(remote_k);
+                    }
+                    if !remote_v.is_null() {
+                        Self::close_ipc_handle(remote_v);
+                    }
                 }
             }
 
@@ -1127,7 +1189,9 @@ impl RdmaBackend {
         // always fall back to TCP until real ibv_reg_mr/ibv_post_send is implemented.
         let rdma_available = false;
         if Self::probe_rdma() {
-            eprintln!("[nsl-rdma] RDMA NIC detected but ibverbs not yet wired — using TCP fallback");
+            eprintln!(
+                "[nsl-rdma] RDMA NIC detected but ibverbs not yet wired — using TCP fallback"
+            );
         } else {
             eprintln!("[nsl-rdma] No RDMA NIC detected, falling back to TCP");
         }
@@ -1144,7 +1208,10 @@ impl RdmaBackend {
     pub fn new_pair(rank_a: i32, rank_b: i32) -> (Self, Self) {
         let shared = std::sync::Arc::new(Mutex::new(Vec::new()));
         let rdma = Self::probe_rdma();
-        let (tcp_a, tcp_b) = (TcpBackend::new(rank_a, 18500), TcpBackend::new(rank_b, 18500));
+        let (tcp_a, tcp_b) = (
+            TcpBackend::new(rank_a, 18500),
+            TcpBackend::new(rank_b, 18500),
+        );
         (
             RdmaBackend {
                 rank: rank_a,
@@ -1201,7 +1268,12 @@ impl RdmaBackend {
         let rkey = key_base | 0x80000000; // high bit distinguishes remote keys
 
         let mut regions = self.registered_regions.lock().unwrap();
-        regions.push(RdmaMemoryRegion { addr, len, lkey, rkey });
+        regions.push(RdmaMemoryRegion {
+            addr,
+            len,
+            lkey,
+            rkey,
+        });
         Some((lkey, rkey))
     }
 
@@ -1223,7 +1295,9 @@ impl KvTransferBackend for RdmaBackend {
         v_data: *const c_void,
     ) -> i32 {
         if !self.rdma_available {
-            return self.tcp_fallback.send_kv(target_rank, header, block_entries, k_data, v_data);
+            return self
+                .tcp_fallback
+                .send_kv(target_rank, header, block_entries, k_data, v_data);
         }
 
         let kv_bytes_each = header.compute_kv_bytes() as usize / 2;
@@ -1293,7 +1367,9 @@ impl KvTransferBackend for RdmaBackend {
         v_data: *mut c_void,
     ) -> i32 {
         if !self.rdma_available {
-            return self.tcp_fallback.recv_kv(source_rank, header, block_entries, k_data, v_data);
+            return self
+                .tcp_fallback
+                .recv_kv(source_rank, header, block_entries, k_data, v_data);
         }
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(5000);
@@ -1302,7 +1378,10 @@ impl KvTransferBackend for RdmaBackend {
                 Ok(g) => g,
                 Err(_) => return -1,
             };
-            if let Some(pos) = guard.iter().position(|t| t.source_rank == source_rank && t.target_rank == self.rank) {
+            if let Some(pos) = guard
+                .iter()
+                .position(|t| t.source_rank == source_rank && t.target_rank == self.rank)
+            {
                 let transfer = guard.remove(pos);
                 *header = transfer.header;
                 *block_entries = transfer.block_entries;
@@ -1364,7 +1443,9 @@ impl KvTransferBackend for RdmaBackend {
         v_data: *mut c_void,
     ) -> i32 {
         if !self.rdma_available {
-            return self.tcp_fallback.try_recv_kv(header, block_entries, k_data, v_data);
+            return self
+                .tcp_fallback
+                .try_recv_kv(header, block_entries, k_data, v_data);
         }
 
         let mut guard = match self.pending.lock() {
@@ -1437,7 +1518,9 @@ pub fn auto_select_backend() -> i64 {
 
     // Check for multi-node deployment (multiple hosts)
     let is_multi_node = std::env::var("NSL_REMOTE_HOSTS").is_ok()
-        || std::env::var("SLURM_NNODES").map(|n| n.parse::<i32>().unwrap_or(1) > 1).unwrap_or(false);
+        || std::env::var("SLURM_NNODES")
+            .map(|n| n.parse::<i32>().unwrap_or(1) > 1)
+            .unwrap_or(false);
 
     if is_multi_node {
         // Multi-node: prefer RDMA, fall back to TCP
@@ -1495,7 +1578,11 @@ pub extern "C" fn nsl_kv_transfer_init(backend_id: i64, rank: i64) -> i64 {
     if guard.is_some() {
         return -1;
     }
-    let effective_id = if backend_id < 0 { auto_select_backend() } else { backend_id };
+    let effective_id = if backend_id < 0 {
+        auto_select_backend()
+    } else {
+        backend_id
+    };
     let backend: Box<dyn KvTransferBackend> = match effective_id {
         0 => Box::new(SharedMemBackend::new(rank as i32)),
         1 => Box::new(NvlinkBackend::new(rank as i32)),
@@ -1633,7 +1720,9 @@ pub extern "C" fn nsl_kv_serialize(
     }
 
     // Recover the KvCacheManager from the opaque handle
-    let manager_mutex = unsafe { &*(kv_cache_handle as *const std::sync::Mutex<crate::paged_kv::manager::KvCacheManager>) };
+    let manager_mutex = unsafe {
+        &*(kv_cache_handle as *const std::sync::Mutex<crate::paged_kv::manager::KvCacheManager>)
+    };
     let manager = match manager_mutex.lock() {
         Ok(g) => g,
         Err(_) => return -1,
@@ -1695,7 +1784,9 @@ pub extern "C" fn nsl_kv_deserialize(
     }
 
     // Recover the KvCacheManager from the opaque handle
-    let manager_mutex = unsafe { &*(kv_cache_handle as *const std::sync::Mutex<crate::paged_kv::manager::KvCacheManager>) };
+    let manager_mutex = unsafe {
+        &*(kv_cache_handle as *const std::sync::Mutex<crate::paged_kv::manager::KvCacheManager>)
+    };
     let mut manager = match manager_mutex.lock() {
         Ok(g) => g,
         Err(_) => return -1,
@@ -1792,7 +1883,10 @@ mod tests {
             total_bytes: 0,
         };
 
-        let entries = vec![KvBlockTransferEntry { logical_block_id: 0, num_valid_tokens: 2 }];
+        let entries = vec![KvBlockTransferEntry {
+            logical_block_id: 0,
+            num_valid_tokens: 2,
+        }];
 
         // K data: 1 * 1 * 2 * 4 = 8 f32 elements = 32 bytes
         let k_data: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
@@ -1810,9 +1904,17 @@ mod tests {
 
         // Receive on rank 1 from rank 0
         let mut recv_header = KvTransferHeader {
-            magic: 0, request_id: 0, num_layers: 0, num_kv_heads: 0,
-            head_dim: 0, block_size: 0, num_blocks: 0, dtype: 0,
-            compressed: 0, _padding: 0, total_bytes: 0,
+            magic: 0,
+            request_id: 0,
+            num_layers: 0,
+            num_kv_heads: 0,
+            head_dim: 0,
+            block_size: 0,
+            num_blocks: 0,
+            dtype: 0,
+            compressed: 0,
+            _padding: 0,
+            total_bytes: 0,
         };
         let mut recv_entries = Vec::new();
         let mut recv_k: Vec<f32> = vec![0.0; 8];
@@ -1838,9 +1940,17 @@ mod tests {
     fn shared_mem_backend_try_recv_empty() {
         let backend = SharedMemBackend::new(0);
         let mut header = KvTransferHeader {
-            magic: 0, request_id: 0, num_layers: 0, num_kv_heads: 0,
-            head_dim: 0, block_size: 0, num_blocks: 0, dtype: 0,
-            compressed: 0, _padding: 0, total_bytes: 0,
+            magic: 0,
+            request_id: 0,
+            num_layers: 0,
+            num_kv_heads: 0,
+            head_dim: 0,
+            block_size: 0,
+            num_blocks: 0,
+            dtype: 0,
+            compressed: 0,
+            _padding: 0,
+            total_bytes: 0,
         };
         let mut entries = Vec::new();
         let rc = backend.try_recv_kv(
@@ -1854,13 +1964,13 @@ mod tests {
 
     #[test]
     fn dtype_size_table() {
-        assert_eq!(dtype_size(0), 8);  // f64
-        assert_eq!(dtype_size(1), 4);  // f32
-        assert_eq!(dtype_size(2), 2);  // fp16
-        assert_eq!(dtype_size(3), 2);  // bf16
-        assert_eq!(dtype_size(4), 1);  // int8
-        assert_eq!(dtype_size(5), 1);  // fp8e4m3
-        assert_eq!(dtype_size(6), 1);  // fp8e5m2
+        assert_eq!(dtype_size(0), 8); // f64
+        assert_eq!(dtype_size(1), 4); // f32
+        assert_eq!(dtype_size(2), 2); // fp16
+        assert_eq!(dtype_size(3), 2); // bf16
+        assert_eq!(dtype_size(4), 1); // int8
+        assert_eq!(dtype_size(5), 1); // fp8e4m3
+        assert_eq!(dtype_size(6), 1); // fp8e5m2
         assert_eq!(dtype_size(99), 4); // unknown → default f32
     }
 
@@ -1883,9 +1993,17 @@ mod tests {
         nsl_kv_transfer_destroy();
 
         let mut header = KvTransferHeader {
-            magic: 0, request_id: 0, num_layers: 0, num_kv_heads: 0,
-            head_dim: 0, block_size: 0, num_blocks: 0, dtype: 0,
-            compressed: 0, _padding: 0, total_bytes: 0,
+            magic: 0,
+            request_id: 0,
+            num_layers: 0,
+            num_kv_heads: 0,
+            head_dim: 0,
+            block_size: 0,
+            num_blocks: 0,
+            dtype: 0,
+            compressed: 0,
+            _padding: 0,
+            total_bytes: 0,
         };
         let rc = nsl_kv_serialize(0, 0, 99, &mut header as *mut _ as i64, 0, 0);
         assert_eq!(rc, 0);
@@ -1899,9 +2017,17 @@ mod tests {
 
         // Invalid header
         let mut header = KvTransferHeader {
-            magic: 0, request_id: 0, num_layers: 0, num_kv_heads: 0,
-            head_dim: 0, block_size: 0, num_blocks: 0, dtype: 0,
-            compressed: 0, _padding: 0, total_bytes: 0,
+            magic: 0,
+            request_id: 0,
+            num_layers: 0,
+            num_kv_heads: 0,
+            head_dim: 0,
+            block_size: 0,
+            num_blocks: 0,
+            dtype: 0,
+            compressed: 0,
+            _padding: 0,
+            total_bytes: 0,
         };
         assert_eq!(nsl_kv_deserialize(0, &header as *const _ as i64, 0, 0), -1);
 
@@ -1932,9 +2058,17 @@ mod tests {
 
     fn make_empty_header() -> KvTransferHeader {
         KvTransferHeader {
-            magic: 0, request_id: 0, num_layers: 0, num_kv_heads: 0,
-            head_dim: 0, block_size: 0, num_blocks: 0, dtype: 0,
-            compressed: 0, _padding: 0, total_bytes: 0,
+            magic: 0,
+            request_id: 0,
+            num_layers: 0,
+            num_kv_heads: 0,
+            head_dim: 0,
+            block_size: 0,
+            num_blocks: 0,
+            dtype: 0,
+            compressed: 0,
+            _padding: 0,
+            total_bytes: 0,
         }
     }
 
@@ -1947,7 +2081,10 @@ mod tests {
 
         let sender = TcpBackend::new(0, port);
         let header = make_test_header(77);
-        let entries = vec![KvBlockTransferEntry { logical_block_id: 0, num_valid_tokens: 2 }];
+        let entries = vec![KvBlockTransferEntry {
+            logical_block_id: 0,
+            num_valid_tokens: 2,
+        }];
         let k_data: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
         let v_data: Vec<f32> = vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0];
 
@@ -1956,7 +2093,9 @@ mod tests {
         let v_clone = v_data.clone();
         let send_thread = std::thread::spawn(move || {
             sender.send_kv(
-                1, &header, &entries,
+                1,
+                &header,
+                &entries,
                 k_clone.as_ptr() as *const c_void,
                 v_clone.as_ptr() as *const c_void,
             )
@@ -1993,8 +2132,10 @@ mod tests {
         let mut header = make_empty_header();
         let mut entries = Vec::new();
         let rc = backend.try_recv_kv(
-            &mut header, &mut entries,
-            std::ptr::null_mut(), std::ptr::null_mut(),
+            &mut header,
+            &mut entries,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
         );
         assert_eq!(rc, 1); // no data available
     }
@@ -2015,12 +2156,17 @@ mod tests {
     fn nvlink_backend_cpu_fallback_send_recv() {
         let (sender, receiver) = NvlinkBackend::new_pair(0, 1);
         let header = make_test_header(88);
-        let entries = vec![KvBlockTransferEntry { logical_block_id: 0, num_valid_tokens: 2 }];
+        let entries = vec![KvBlockTransferEntry {
+            logical_block_id: 0,
+            num_valid_tokens: 2,
+        }];
         let k_data: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
         let v_data: Vec<f32> = vec![10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0];
 
         let rc = sender.send_kv(
-            1, &header, &entries,
+            1,
+            &header,
+            &entries,
             k_data.as_ptr() as *const c_void,
             v_data.as_ptr() as *const c_void,
         );
@@ -2032,7 +2178,9 @@ mod tests {
         let mut recv_v: Vec<f32> = vec![0.0; 8];
 
         let rc = receiver.recv_kv(
-            0, &mut recv_header, &mut recv_entries,
+            0,
+            &mut recv_header,
+            &mut recv_entries,
             recv_k.as_mut_ptr() as *mut c_void,
             recv_v.as_mut_ptr() as *mut c_void,
         );
@@ -2049,8 +2197,10 @@ mod tests {
         let mut header = make_empty_header();
         let mut entries = Vec::new();
         let rc = backend.try_recv_kv(
-            &mut header, &mut entries,
-            std::ptr::null_mut(), std::ptr::null_mut(),
+            &mut header,
+            &mut entries,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
         );
         assert_eq!(rc, 1);
     }
@@ -2082,7 +2232,10 @@ mod tests {
             std::env::set_var("NSL_RDMA_DEVICE", "");
         }
         let (sender, _receiver) = RdmaBackend::new_pair(0, 1);
-        assert!(!sender.rdma_available, "RDMA should not be available in test env");
+        assert!(
+            !sender.rdma_available,
+            "RDMA should not be available in test env"
+        );
     }
 
     #[test]
@@ -2139,7 +2292,10 @@ mod tests {
         // Should default to SharedMem (0) unless env vars are set
         let id = auto_select_backend();
         // Accept 0 (shared_mem) or whatever the env probes return
-        assert!(id >= 0 && id <= 3, "auto_select should return valid backend_id");
+        assert!(
+            id >= 0 && id <= 3,
+            "auto_select should return valid backend_id"
+        );
     }
 
     #[test]

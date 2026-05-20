@@ -9,12 +9,12 @@
 //!   * `chunk_config`    - d_model_chunk selection per variant
 //!   * `register_budget` - static spill analysis pre-emission
 
-pub mod pipeline;
-pub mod projection_mma;
 pub mod attention_mma;
 pub mod chunk_config;
-pub mod register_budget;
 pub mod finalize;
+pub mod pipeline;
+pub mod projection_mma;
+pub mod register_budget;
 
 use crate::flash_attention::FlashAttentionConfig;
 
@@ -82,9 +82,8 @@ pub fn synthesize(config: &FlashAttentionConfig, chunk: u32) -> Vec<u8> {
     // staging actually writes to offsets past 36 KB; the OOB writes
     // silently stomp neighbouring GPU state at launch (ptxas can't catch
     // this because SMEM addresses are computed dynamically).
-    let smem_bytes = crate::flash_attention_v2::smem_layout::tier_b1_total_smem_bytes(
-        config, chunk,
-    );
+    let smem_bytes =
+        crate::flash_attention_v2::smem_layout::tier_b1_total_smem_bytes(config, chunk);
     // Tier B.1 doesn't compose with PCA Tier B — pass `None` here.
     crate::flash_attention_v2::phases::forward::prelude::emit_with_smem_override(
         &mut ptx, config, smem_bytes, None,
@@ -139,9 +138,7 @@ pub fn synthesize(config: &FlashAttentionConfig, chunk: u32) -> Vec<u8> {
             );
         }
     } else {
-        ptx.push_str(
-            "    // RMSNorm prologue skipped (csha.skip_rmsnorm_prologue=true)\n",
-        );
+        ptx.push_str("    // RMSNorm prologue skipped (csha.skip_rmsnorm_prologue=true)\n");
         ptx.push_str(
             "    // -- caller provides csha_x_ptr in pre-normalised + pre-chunkified f16 layout\n",
         );
@@ -182,7 +179,9 @@ pub fn synthesize(config: &FlashAttentionConfig, chunk: u32) -> Vec<u8> {
 
     // 9. Sentinel comment + return. The sentinel is load-bearing for
     // the dispatch test (replaces the prior "Tier B.1 stub" marker).
-    ptx.push_str("    // Tier B.1 single-iter scaffold complete (B1.5 Task 5.3); multi-iter loop B1.6\n");
+    ptx.push_str(
+        "    // Tier B.1 single-iter scaffold complete (B1.5 Task 5.3); multi-iter loop B1.6\n",
+    );
     ptx.push_str("    ret;\n");
     ptx.push_str("}\n");
 

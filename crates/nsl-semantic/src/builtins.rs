@@ -3,7 +3,7 @@ use nsl_errors::Span;
 use nsl_lexer::Interner;
 
 use crate::scope::{ScopeId, ScopeMap, SymbolInfo};
-use crate::types::{Type, Shape, DType, Device, Effect};
+use crate::types::{DType, Device, Effect, Shape, Type};
 
 /// Register all built-in symbols in the root scope.
 pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
@@ -144,7 +144,16 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
     );
 
     // Activation functions, tensor trig, and rotate_half (take tensor, return tensor)
-    for name in &["relu", "gelu", "silu", "sigmoid", "tanh", "tensor_sin", "tensor_cos", "rotate_half"] {
+    for name in &[
+        "relu",
+        "gelu",
+        "silu",
+        "sigmoid",
+        "tanh",
+        "tensor_sin",
+        "tensor_cos",
+        "rotate_half",
+    ] {
         def(
             name,
             Type::Function {
@@ -233,8 +242,16 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         "assert_close",
         Type::Function {
             params: vec![
-                Type::Tensor { shape: Shape::unknown(), dtype: DType::Unknown, device: Device::Unknown },
-                Type::Tensor { shape: Shape::unknown(), dtype: DType::Unknown, device: Device::Unknown },
+                Type::Tensor {
+                    shape: Shape::unknown(),
+                    dtype: DType::Unknown,
+                    device: Device::Unknown,
+                },
+                Type::Tensor {
+                    shape: Shape::unknown(),
+                    dtype: DType::Unknown,
+                    device: Device::Unknown,
+                },
                 Type::Float,
                 Type::Float,
             ],
@@ -335,7 +352,12 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
     def(
         "layernorm",
         Type::Function {
-            params: vec![tensor_ret.clone(), tensor_ret.clone(), tensor_ret.clone(), Type::Float],
+            params: vec![
+                tensor_ret.clone(),
+                tensor_ret.clone(),
+                tensor_ret.clone(),
+                Type::Float,
+            ],
             ret: Box::new(tensor_ret.clone()),
             effect: Effect::Inferred,
         },
@@ -363,7 +385,15 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
     def(
         "conv2d",
         Type::Function {
-            params: vec![tensor_ret.clone(), tensor_ret.clone(), tensor_ret.clone(), Type::Int, Type::Int, Type::Int, Type::Int],
+            params: vec![
+                tensor_ret.clone(),
+                tensor_ret.clone(),
+                tensor_ret.clone(),
+                Type::Int,
+                Type::Int,
+                Type::Int,
+                Type::Int,
+            ],
             ret: Box::new(tensor_ret.clone()),
             effect: Effect::Inferred,
         },
@@ -372,7 +402,13 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
     def(
         "maxpool2d",
         Type::Function {
-            params: vec![tensor_ret.clone(), Type::Int, Type::Int, Type::Int, Type::Int],
+            params: vec![
+                tensor_ret.clone(),
+                Type::Int,
+                Type::Int,
+                Type::Int,
+                Type::Int,
+            ],
             ret: Box::new(tensor_ret.clone()),
             effect: Effect::Inferred,
         },
@@ -464,11 +500,11 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         "scaled_dot_product_attention",
         Type::Function {
             params: vec![
-                tensor_ret.clone(),  // Q
-                tensor_ret.clone(),  // K
-                tensor_ret.clone(),  // V
-                Type::Float,         // scale
-                Type::Unknown,       // causal (optional, makes it variadic)
+                tensor_ret.clone(), // Q
+                tensor_ret.clone(), // K
+                tensor_ret.clone(), // V
+                Type::Float,        // scale
+                Type::Unknown,      // causal (optional, makes it variadic)
             ],
             ret: Box::new(tensor_ret.clone()),
             effect: Effect::Inferred,
@@ -487,7 +523,12 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
     def(
         "bpe_train",
         Type::Function {
-            params: vec![Type::Str, Type::Int, Type::Int, Type::List(Box::new(Type::Str))],
+            params: vec![
+                Type::Str,
+                Type::Int,
+                Type::Int,
+                Type::List(Box::new(Type::Str)),
+            ],
             ret: Box::new(Type::Int),
             effect: Effect::Inferred,
         },
@@ -535,7 +576,13 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
     def(
         "tokenizer_encode_batch",
         Type::Function {
-            params: vec![Type::Int, Type::List(Box::new(Type::Str)), Type::Int, Type::Int, Type::Int],
+            params: vec![
+                Type::Int,
+                Type::List(Box::new(Type::Str)),
+                Type::Int,
+                Type::Int,
+                Type::Int,
+            ],
             ret: Box::new(Type::List(Box::new(tensor_ret.clone()))),
             effect: Effect::Inferred,
         },
@@ -636,7 +683,13 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
     def("void", Type::Void);
 
     // GPU kernel intrinsics (M17)
-    for name in &["thread_id", "thread_id_y", "block_id", "block_id_y", "block_dim"] {
+    for name in &[
+        "thread_id",
+        "thread_id_y",
+        "block_id",
+        "block_id_y",
+        "block_dim",
+    ] {
         def(
             name,
             Type::Function {
@@ -718,7 +771,10 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         "load_safetensors",
         Type::Function {
             params: vec![Type::Unknown],
-            ret: Box::new(Type::Dict(Box::new(Type::Str), Box::new(tensor_ret.clone()))),
+            ret: Box::new(Type::Dict(
+                Box::new(Type::Str),
+                Box::new(tensor_ret.clone()),
+            )),
             effect: Effect::Inferred,
         },
     );
@@ -793,7 +849,10 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         "topk",
         Type::Function {
             params: vec![Type::Unknown, Type::Unknown],
-            ret: Box::new(Type::Dict(Box::new(Type::Str), Box::new(tensor_ret.clone()))),
+            ret: Box::new(Type::Dict(
+                Box::new(Type::Str),
+                Box::new(tensor_ret.clone()),
+            )),
             effect: Effect::Inferred,
         },
     );
@@ -994,10 +1053,10 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         "speculative_decode",
         Type::Function {
             params: vec![
-                tensor_ret.clone(),  // draft_tokens
-                tensor_ret.clone(),  // draft_logits
-                tensor_ret.clone(),  // verifier_logits
-                Type::Int,           // vocab_size
+                tensor_ret.clone(), // draft_tokens
+                tensor_ret.clone(), // draft_logits
+                tensor_ret.clone(), // verifier_logits
+                Type::Int,          // vocab_size
             ],
             ret: Box::new(tensor_ret.clone()),
             effect: Effect::Inferred,

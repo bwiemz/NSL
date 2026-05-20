@@ -26,12 +26,8 @@ fn make_module() -> ObjectModule {
     let flag_builder = builder();
     let flags = Flags::new(flag_builder);
     let isa = isa_builder.finish(flags).expect("finish isa");
-    let obj_builder = ObjectBuilder::new(
-        isa,
-        "pca_rope_ffi_decls_test",
-        default_libcall_names(),
-    )
-    .expect("ObjectBuilder::new");
+    let obj_builder = ObjectBuilder::new(isa, "pca_rope_ffi_decls_test", default_libcall_names())
+        .expect("ObjectBuilder::new");
     ObjectModule::new(obj_builder)
 }
 

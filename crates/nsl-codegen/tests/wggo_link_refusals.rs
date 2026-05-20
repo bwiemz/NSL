@@ -383,9 +383,9 @@ fn backward_batch_shape_mismatch_subprocess_returns_3() {
 /// `"wggo_gradient"`). The assert below uses the actual value.
 #[test]
 fn wggo_gradient_hook_registered_when_grad_retention_is_some() {
+    use nsl_codegen::calibration::discovery::WggoGradTarget;
     use nsl_codegen::calibration::registry::HookRegistry;
     use nsl_codegen::calibration::wggo_gradient_hook::WggoGradientHook;
-    use nsl_codegen::calibration::discovery::WggoGradTarget;
 
     // Build a non-empty WggoGradTarget vec.
     let targets = vec![WggoGradTarget {
@@ -422,8 +422,8 @@ fn wggo_gradient_hook_registered_when_grad_retention_is_some() {
 
 #[test]
 fn wggo_gradient_hook_not_registered_when_targets_empty() {
-    use nsl_codegen::calibration::registry::HookRegistry;
     use nsl_codegen::calibration::discovery::WggoGradTarget;
+    use nsl_codegen::calibration::registry::HookRegistry;
 
     // Empty targets: pre-scan returned Some(vec![]) — the gating must
     // skip registration to avoid an empty-buffer sidecar entry.

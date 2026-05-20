@@ -66,7 +66,7 @@ pub(crate) fn generate_flash_attention_3_ptx(
          \t.param .u64 param_seq_len,\n\
          \t.param .u64 param_head_dim,\n\
          \t.param .u64 param_num_kv_tiles\n\
-         ) {\n"
+         ) {\n",
     );
 
     // Register declarations
@@ -94,9 +94,7 @@ pub(crate) fn generate_flash_attention_3_ptx(
     // Threads 0-31: producer warp (TMA loads)
     // Threads 32-159: consumer warpgroup 0 (wgmma)
     // Threads 160-287: consumer warpgroup 1 (wgmma, ping-pong)
-    ptx.push_str(
-        "\t// Warp specialization: producer (0-31) vs consumer (32-287)\n",
-    );
+    ptx.push_str("\t// Warp specialization: producer (0-31) vs consumer (32-287)\n");
     ptx.push_str("\tmov.u32 %r0, %tid.x;\n");
     ptx.push_str("\tsetp.lt.u32 %p0, %r0, 32;\n");
     ptx.push_str("\t@%p0 bra PRODUCER;\n");
@@ -104,9 +102,7 @@ pub(crate) fn generate_flash_attention_3_ptx(
 
     // ============ PRODUCER WARP ============
     ptx.push_str("PRODUCER:\n");
-    ptx.push_str(
-        "\t// Producer: reduce register allocation to give consumers more registers\n",
-    );
+    ptx.push_str("\t// Producer: reduce register allocation to give consumers more registers\n");
     ptx.push_str("\tsetmaxnreg.dec.sync.aligned.u32 24;\n\n");
 
     // Producer loop: load Q tile once, then iterate over KV tiles
@@ -125,9 +121,7 @@ pub(crate) fn generate_flash_attention_3_ptx(
 
     // Emit TMA-style loads (simplified -- actual TMA requires tensor map descriptors)
     // For this implementation we use cp.async.bulk for the load pattern
-    ptx.push_str(
-        "\t// Load K[kv_tile] and V[kv_tile] into shared memory\n",
-    );
+    ptx.push_str("\t// Load K[kv_tile] and V[kv_tile] into shared memory\n");
     ptx.push_str(
         "\t// (Using standard global loads -- real TMA requires cuTensorMapEncodeTiled)\n",
     );
@@ -142,15 +136,11 @@ pub(crate) fn generate_flash_attention_3_ptx(
 
     // ============ CONSUMER WARPS ============
     ptx.push_str("CONSUMER:\n");
-    ptx.push_str(
-        "\t// Consumer: increase register allocation for wgmma accumulators\n",
-    );
+    ptx.push_str("\t// Consumer: increase register allocation for wgmma accumulators\n");
     ptx.push_str("\tsetmaxnreg.inc.sync.aligned.u32 232;\n\n");
 
     // Initialize accumulators for online softmax
-    ptx.push_str(
-        "\t// Initialize row_max = -inf, row_sum = 0, O_acc = 0\n",
-    );
+    ptx.push_str("\t// Initialize row_max = -inf, row_sum = 0, O_acc = 0\n");
     ptx.push_str("\tmov.f32 %f1, 0fFF800000;\n"); // row_max = -inf
     ptx.push_str("\tmov.f32 %f2, 0f00000000;\n"); // row_sum = 0
 
@@ -177,9 +167,7 @@ pub(crate) fn generate_flash_attention_3_ptx(
         dtype,
         dtype
     ));
-    ptx.push_str(
-        "\t// (Placeholder: actual wgmma requires SMEM descriptors)\n",
-    );
+    ptx.push_str("\t// (Placeholder: actual wgmma requires SMEM descriptors)\n");
     ptx.push_str("\twgmma.fence.sync.aligned;\n");
     ptx.push_str("\twgmma.commit_group.sync.aligned;\n");
     ptx.push_str("\twgmma.wait_group.sync.aligned 0;\n\n");
@@ -189,15 +177,11 @@ pub(crate) fn generate_flash_attention_3_ptx(
 
     // Causal mask
     if causal {
-        ptx.push_str(
-            "\t// Apply causal mask: S[i,j] = -inf where j > q_offset + i\n\n",
-        );
+        ptx.push_str("\t// Apply causal mask: S[i,j] = -inf where j > q_offset + i\n\n");
     }
 
     // Online softmax update
-    ptx.push_str(
-        "\t// Online softmax: update row_max, rescale, accumulate exp(S - max)\n",
-    );
+    ptx.push_str("\t// Online softmax: update row_max, rescale, accumulate exp(S - max)\n");
     ptx.push_str("\t// new_max = max(old_max, tile_max)\n");
     ptx.push_str("\t// correction = exp(old_max - new_max)\n");
     ptx.push_str("\t// O_acc = O_acc * correction + P @ V\n");
@@ -224,9 +208,7 @@ pub(crate) fn generate_flash_attention_3_ptx(
     ptx.push_str("\t// Finalize: O = O_acc * rcp(row_sum)\n");
     ptx.push_str("\trcp.approx.f32 %f3, %f2;\n"); // 1/row_sum
     ptx.push_str("\t// Store O to global memory\n");
-    ptx.push_str(
-        "\t// Store L = row_max + log(row_sum) to logsumexp buffer\n",
-    );
+    ptx.push_str("\t// Store L = row_max + log(row_sum) to logsumexp buffer\n");
     ptx.push_str("\tret;\n");
 
     ptx.push_str("}\n");
@@ -399,7 +381,10 @@ mod tests {
             fp8: false,
             scale: 0.125,
         };
-        assert_eq!(cfg.shared_mem_bytes(), fa3_shared_mem_bytes(128, 128, 64, false));
+        assert_eq!(
+            cfg.shared_mem_bytes(),
+            fa3_shared_mem_bytes(128, 128, 64, false)
+        );
     }
 
     #[test]
@@ -425,6 +410,10 @@ mod tests {
         let ptx = generate_flash_attention_3_ptx(block_q, block_kv, head_dim, false, fp8);
         let expected_smem = fa3_shared_mem_bytes(block_q, block_kv, head_dim, fp8);
         let smem_decl = format!("smem[{}]", expected_smem);
-        assert!(ptx.contains(&smem_decl), "PTX should declare smem[{}]", expected_smem);
+        assert!(
+            ptx.contains(&smem_decl),
+            "PTX should declare smem[{}]",
+            expected_smem
+        );
     }
 }

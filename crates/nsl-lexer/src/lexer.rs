@@ -7,7 +7,8 @@ use crate::token::{Token, TokenKind};
 use nsl_errors::{BytePos, Diagnostic, FileId, Span};
 use string_interner::StringInterner;
 
-type Interner = StringInterner<string_interner::backend::BucketBackend<string_interner::DefaultSymbol>>;
+type Interner =
+    StringInterner<string_interner::backend::BucketBackend<string_interner::DefaultSymbol>>;
 
 /// The main lexer. Tokenizes NSL source code into a stream of tokens.
 pub struct Lexer<'a> {
@@ -157,7 +158,7 @@ impl<'a> Lexer<'a> {
                     // Doc comment
                     self.cursor.advance(); // first #
                     self.cursor.advance(); // second #
-                    // Skip optional space after ##
+                                           // Skip optional space after ##
                     if self.cursor.peek() == Some(' ') {
                         self.cursor.advance();
                     }
@@ -202,8 +203,8 @@ impl<'a> Lexer<'a> {
                     self.cursor.advance(); // consume 'f'
                     let quote = self.cursor.peek().unwrap();
                     self.cursor.advance(); // consume opening quote
-                    let is_triple = self.cursor.peek() == Some(quote)
-                        && self.cursor.peek_at(1) == Some(quote);
+                    let is_triple =
+                        self.cursor.peek() == Some(quote) && self.cursor.peek_at(1) == Some(quote);
                     if is_triple {
                         self.cursor.advance();
                         self.cursor.advance();
@@ -425,9 +426,8 @@ impl<'a> Lexer<'a> {
         match self.indent.process_indent(level, span) {
             Ok(tokens) => self.tokens.extend(tokens),
             Err(msg) => {
-                self.diagnostics.push(
-                    Diagnostic::error(msg).with_label(span, "invalid indentation"),
-                );
+                self.diagnostics
+                    .push(Diagnostic::error(msg).with_label(span, "invalid indentation"));
             }
         }
     }
@@ -531,12 +531,30 @@ impl<'a> Lexer<'a> {
                 Some('\\') => {
                     self.cursor.advance();
                     match self.cursor.peek() {
-                        Some('n') => { self.cursor.advance(); text.push('\n'); }
-                        Some('t') => { self.cursor.advance(); text.push('\t'); }
-                        Some('\\') => { self.cursor.advance(); text.push('\\'); }
-                        Some(c) if c == quote => { self.cursor.advance(); text.push(c); }
-                        Some(c) => { self.cursor.advance(); text.push('\\'); text.push(c); }
-                        None => { text.push('\\'); }
+                        Some('n') => {
+                            self.cursor.advance();
+                            text.push('\n');
+                        }
+                        Some('t') => {
+                            self.cursor.advance();
+                            text.push('\t');
+                        }
+                        Some('\\') => {
+                            self.cursor.advance();
+                            text.push('\\');
+                        }
+                        Some(c) if c == quote => {
+                            self.cursor.advance();
+                            text.push(c);
+                        }
+                        Some(c) => {
+                            self.cursor.advance();
+                            text.push('\\');
+                            text.push(c);
+                        }
+                        None => {
+                            text.push('\\');
+                        }
                     }
                 }
                 Some(c) => {
@@ -565,7 +583,11 @@ mod tests {
             &mut interner,
         );
         assert!(diags.is_empty(), "unexpected diagnostics: {:?}", diags);
-        assert_eq!(tokens[0].kind, crate::TokenKind::Agent,
-            "first token should be Agent, was {:?}", tokens[0].kind);
+        assert_eq!(
+            tokens[0].kind,
+            crate::TokenKind::Agent,
+            "first token should be Agent, was {:?}",
+            tokens[0].kind
+        );
     }
 }

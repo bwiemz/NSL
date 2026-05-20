@@ -3,23 +3,41 @@
 //! snapshot. Use `cargo insta review` to accept snapshot changes.
 
 use nsl_codegen::flash_attention::{CshaExtras, FlashAttentionConfig, RopeStyle};
-use nsl_codegen::flash_attention_v2::phases::{prelude, q_load, s_compute, softmax, pv_accum, finalize, csha_hooks};
+use nsl_codegen::flash_attention_v2::phases::{
+    csha_hooks, finalize, prelude, pv_accum, q_load, s_compute, softmax,
+};
 
 fn csha_canonical() -> FlashAttentionConfig {
     FlashAttentionConfig {
-        block_q: 32, block_kv: 32, head_dim: 32,
-        causal: true, paged: false, rope_q: false,
-        rope_style: RopeStyle::HalfSplit, gqa_group_size: 1,
-        tree_mask: false, gpu_sm: 75, segment_masked: false, csha: None,
+        block_q: 32,
+        block_kv: 32,
+        head_dim: 32,
+        causal: true,
+        paged: false,
+        rope_q: false,
+        rope_style: RopeStyle::HalfSplit,
+        gqa_group_size: 1,
+        tree_mask: false,
+        gpu_sm: 75,
+        segment_masked: false,
+        csha: None,
     }
 }
 
 fn non_csha_canonical() -> FlashAttentionConfig {
     FlashAttentionConfig {
-        block_q: 64, block_kv: 64, head_dim: 128,
-        causal: true, paged: false, rope_q: false,
-        rope_style: RopeStyle::HalfSplit, gqa_group_size: 1,
-        tree_mask: false, gpu_sm: 75, segment_masked: false, csha: None,
+        block_q: 64,
+        block_kv: 64,
+        head_dim: 128,
+        causal: true,
+        paged: false,
+        rope_q: false,
+        rope_style: RopeStyle::HalfSplit,
+        gqa_group_size: 1,
+        tree_mask: false,
+        gpu_sm: 75,
+        segment_masked: false,
+        csha: None,
     }
 }
 
@@ -77,8 +95,14 @@ fn phase_s_compute__label_uniqueness_across_iters() {
     s_compute::emit(&mut ptx1, &csha_canonical(), 1, None);
     assert!(ptx0.contains("V2_LOOP_S_OVER_K_0:"), "iter 0 label missing");
     assert!(ptx1.contains("V2_LOOP_S_OVER_K_1:"), "iter 1 label missing");
-    assert!(!ptx0.contains("V2_LOOP_S_OVER_K_1"), "iter 0 leaks iter 1 label");
-    assert!(!ptx1.contains("V2_LOOP_S_OVER_K_0"), "iter 1 leaks iter 0 label");
+    assert!(
+        !ptx0.contains("V2_LOOP_S_OVER_K_1"),
+        "iter 0 leaks iter 1 label"
+    );
+    assert!(
+        !ptx1.contains("V2_LOOP_S_OVER_K_0"),
+        "iter 1 leaks iter 0 label"
+    );
 }
 
 #[test]
@@ -133,10 +157,22 @@ fn phase_pv_accum__label_uniqueness_across_iters() {
     let mut ptx1 = String::new();
     pv_accum::emit(&mut ptx0, &csha_canonical(), 0);
     pv_accum::emit(&mut ptx1, &csha_canonical(), 1);
-    assert!(ptx0.contains("V2_LOOP_PV_OVER_K_0:"), "iter 0 label missing");
-    assert!(ptx1.contains("V2_LOOP_PV_OVER_K_1:"), "iter 1 label missing");
-    assert!(!ptx0.contains("V2_LOOP_PV_OVER_K_1"), "iter 0 leaks iter 1 label");
-    assert!(!ptx1.contains("V2_LOOP_PV_OVER_K_0"), "iter 1 leaks iter 0 label");
+    assert!(
+        ptx0.contains("V2_LOOP_PV_OVER_K_0:"),
+        "iter 0 label missing"
+    );
+    assert!(
+        ptx1.contains("V2_LOOP_PV_OVER_K_1:"),
+        "iter 1 label missing"
+    );
+    assert!(
+        !ptx0.contains("V2_LOOP_PV_OVER_K_1"),
+        "iter 0 leaks iter 1 label"
+    );
+    assert!(
+        !ptx1.contains("V2_LOOP_PV_OVER_K_0"),
+        "iter 1 leaks iter 0 label"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -145,10 +181,18 @@ fn phase_pv_accum__label_uniqueness_across_iters() {
 
 fn csha_l2_rope_config() -> FlashAttentionConfig {
     FlashAttentionConfig {
-        block_q: 32, block_kv: 32, head_dim: 32,
-        causal: true, paged: false, rope_q: true,
-        rope_style: RopeStyle::Adjacent, gqa_group_size: 1,  // emit_rope_pair_sweep implements Adjacent
-        tree_mask: false, gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras::level2(1e-5, 32)),
+        block_q: 32,
+        block_kv: 32,
+        head_dim: 32,
+        causal: true,
+        paged: false,
+        rope_q: true,
+        rope_style: RopeStyle::Adjacent,
+        gqa_group_size: 1, // emit_rope_pair_sweep implements Adjacent
+        tree_mask: false,
+        gpu_sm: 75,
+        segment_masked: false,
+        csha: Some(CshaExtras::level2(1e-5, 32)),
     }
 }
 
@@ -198,26 +242,53 @@ fn phase_csha_hooks__label_uniqueness_across_iters() {
     let mut prologue1 = String::new();
     csha_hooks::emit_prologue(&mut prologue0, &cfg, 0);
     csha_hooks::emit_prologue(&mut prologue1, &cfg, 1);
-    assert!(prologue0.contains("V2_CSHA_PROLOGUE_SKIP_0"), "prologue iter 0 label missing");
-    assert!(prologue1.contains("V2_CSHA_PROLOGUE_SKIP_1"), "prologue iter 1 label missing");
-    assert!(!prologue0.contains("V2_CSHA_PROLOGUE_SKIP_1"), "prologue iter 0 leaks iter 1");
+    assert!(
+        prologue0.contains("V2_CSHA_PROLOGUE_SKIP_0"),
+        "prologue iter 0 label missing"
+    );
+    assert!(
+        prologue1.contains("V2_CSHA_PROLOGUE_SKIP_1"),
+        "prologue iter 1 label missing"
+    );
+    assert!(
+        !prologue0.contains("V2_CSHA_PROLOGUE_SKIP_1"),
+        "prologue iter 0 leaks iter 1"
+    );
 
     let mut proj0 = String::new();
     let mut proj1 = String::new();
     csha_hooks::emit_matmul_projection(&mut proj0, &cfg, 0);
     csha_hooks::emit_matmul_projection(&mut proj1, &cfg, 1);
-    assert!(proj0.contains("V2_CSHA_PROJECTION_SKIP_0"), "projection iter 0 label missing");
-    assert!(proj1.contains("V2_CSHA_PROJECTION_SKIP_1"), "projection iter 1 label missing");
-    assert!(!proj0.contains("V2_CSHA_PROJECTION_SKIP_1"), "projection iter 0 leaks iter 1");
+    assert!(
+        proj0.contains("V2_CSHA_PROJECTION_SKIP_0"),
+        "projection iter 0 label missing"
+    );
+    assert!(
+        proj1.contains("V2_CSHA_PROJECTION_SKIP_1"),
+        "projection iter 1 label missing"
+    );
+    assert!(
+        !proj0.contains("V2_CSHA_PROJECTION_SKIP_1"),
+        "projection iter 0 leaks iter 1"
+    );
 
     let mut epi0 = String::new();
     let mut epi1 = String::new();
     csha_hooks::emit_rope_epilogue(&mut epi0, &cfg, 0);
     csha_hooks::emit_rope_epilogue(&mut epi1, &cfg, 1);
     // emit_rope_epilogue uses V2_CSHA_ROPE_SKIP_* (not V2_CSHA_EPILOGUE_SKIP_*).
-    assert!(epi0.contains("V2_CSHA_ROPE_SKIP_0"), "epilogue iter 0 label missing");
-    assert!(epi1.contains("V2_CSHA_ROPE_SKIP_1"), "epilogue iter 1 label missing");
-    assert!(!epi0.contains("V2_CSHA_ROPE_SKIP_1"), "epilogue iter 0 leaks iter 1");
+    assert!(
+        epi0.contains("V2_CSHA_ROPE_SKIP_0"),
+        "epilogue iter 0 label missing"
+    );
+    assert!(
+        epi1.contains("V2_CSHA_ROPE_SKIP_1"),
+        "epilogue iter 1 label missing"
+    );
+    assert!(
+        !epi0.contains("V2_CSHA_ROPE_SKIP_1"),
+        "epilogue iter 0 leaks iter 1"
+    );
 }
 
 // ---------------------------------------------------------------------------

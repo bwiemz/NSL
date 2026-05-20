@@ -46,8 +46,8 @@
 
 use nsl_codegen::flash_attention::{FlashAttentionConfig, RopeStyle};
 use nsl_codegen::flash_attention_selector::{
-    flash_attention_kernel_name_selected, shared_mem_bytes_selected,
-    synthesize_flash_attention_ptx_selected, Emitter, select_emitter,
+    flash_attention_kernel_name_selected, select_emitter, shared_mem_bytes_selected,
+    synthesize_flash_attention_ptx_selected, Emitter,
 };
 use std::ffi::{c_void, CString};
 
@@ -57,11 +57,11 @@ use std::ffi::{c_void, CString};
 // signatures here because the runtime's inner cuda helpers are pub(crate);
 // the `nsl_test_cuda_*` surface is the stable test-only seam.
 
-use nsl_runtime::{
-    nsl_cuda_init, nsl_test_cuda_alloc, nsl_test_cuda_free,
-    nsl_test_cuda_h2d, nsl_test_cuda_d2h, nsl_test_cuda_jit_log,
-};
 use nsl_runtime::flash_attention::nsl_flash_attention_csha;
+use nsl_runtime::{
+    nsl_cuda_init, nsl_test_cuda_alloc, nsl_test_cuda_d2h, nsl_test_cuda_free, nsl_test_cuda_h2d,
+    nsl_test_cuda_jit_log,
+};
 
 // C5: NSL_FA_EMITTER env-var removed — no env serialisation needed.
 
@@ -78,7 +78,10 @@ fn f16_to_f32(bits: u16) -> f32 {
             // Subnormal -> normalize.
             let mut m = mant;
             let mut e: i32 = -1;
-            while m & 0x400 == 0 { m <<= 1; e -= 1; }
+            while m & 0x400 == 0 {
+                m <<= 1;
+                e -= 1;
+            }
             let e = (127 + e - 14) as u32;
             (sign << 31) | (e << 23) | ((m & 0x3ff) << 13)
         }
@@ -94,7 +97,9 @@ fn f16_to_f32(bits: u16) -> f32 {
 /// Deterministic PRNG -- keeps the reference easy to regenerate.
 fn fill_seeded(dst: &mut [f32], mut seed: u64) {
     for x in dst.iter_mut() {
-        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let u = (seed >> 33) as u32;
         // Map to [-0.5, 0.5) -- small magnitudes keep softmax numerics calm.
         *x = ((u as f32) / (u32::MAX as f32)) - 0.5;
@@ -104,13 +109,26 @@ fn fill_seeded(dst: &mut [f32], mut seed: u64) {
 /// Naive attention: out = softmax(Q K^T * scale [+ causal_mask]) V.
 /// Layout: Q/K/V/out are [B, H, S, D] row-major.
 fn naive_attention(
-    q: &[f32], k: &[f32], v: &[f32],
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
     out: &mut [f32],
-    b: usize, h: usize, s: usize, d: usize,
+    b: usize,
+    h: usize,
+    s: usize,
+    d: usize,
     scale: f32,
     causal: bool,
 ) {
-    fn row<'a>(t: &'a [f32], bi: usize, hi: usize, si: usize, h: usize, s: usize, d: usize) -> &'a [f32] {
+    fn row<'a>(
+        t: &'a [f32],
+        bi: usize,
+        hi: usize,
+        si: usize,
+        h: usize,
+        s: usize,
+        d: usize,
+    ) -> &'a [f32] {
         let base = ((bi * h + hi) * s + si) * d;
         &t[base..base + d]
     }
@@ -129,7 +147,9 @@ fn naive_attention(
                     }
                     s_val *= scale;
                     scores[kj] = s_val;
-                    if s_val > max_s { max_s = s_val; }
+                    if s_val > max_s {
+                        max_s = s_val;
+                    }
                 }
                 let mut sum_exp = 0f32;
                 for kj in 0..=k_last {
@@ -223,8 +243,10 @@ fn run_flash_attention_and_measure(
     let lse_bytes = (lse_total * std::mem::size_of::<f32>()) as i64;
     let lse_dev = nsl_test_cuda_alloc(lse_bytes);
 
-    assert!(q_dev != 0 && k_dev != 0 && v_dev != 0 && out_dev != 0 && lse_dev != 0,
-        "device alloc returned null -- CUDA init appeared to succeed but allocation failed");
+    assert!(
+        q_dev != 0 && k_dev != 0 && v_dev != 0 && out_dev != 0 && lse_dev != 0,
+        "device alloc returned null -- CUDA init appeared to succeed but allocation failed"
+    );
 
     nsl_test_cuda_h2d(q_dev, q_host.as_ptr() as i64, bytes);
     nsl_test_cuda_h2d(k_dev, k_host.as_ptr() as i64, bytes);
@@ -243,14 +265,15 @@ fn run_flash_attention_and_measure(
         rope_style: RopeStyle::HalfSplit,
         gqa_group_size: 1,
         tree_mask: false,
-        gpu_sm: 75, segment_masked: false, csha: None,
+        gpu_sm: 75,
+        segment_masked: false,
+        csha: None,
     };
 
     // Use std::panic::catch_unwind so an emitter panic (e.g., SMEM budget assert)
     // is captured as LaunchResult::EmitterPanic rather than killing the test.
-    let synth_result = std::panic::catch_unwind(|| {
-        synthesize_flash_attention_ptx_selected(&config)
-    });
+    let synth_result =
+        std::panic::catch_unwind(|| synthesize_flash_attention_ptx_selected(&config));
     let mut ptx = match synth_result {
         Ok(p) => p,
         Err(e) => {
@@ -260,7 +283,8 @@ fn run_flash_attention_and_measure(
             nsl_test_cuda_free(v_dev);
             nsl_test_cuda_free(out_dev);
             nsl_test_cuda_free(lse_dev);
-            let msg = e.downcast_ref::<String>()
+            let msg = e
+                .downcast_ref::<String>()
                 .map(|s| s.clone())
                 .or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()))
                 .unwrap_or_else(|| "<non-string panic>".into());
@@ -269,8 +293,12 @@ fn run_flash_attention_and_measure(
     };
 
     // Defensive: ensure exactly one trailing newline + single NUL.
-    while ptx.last() == Some(&0) { ptx.pop(); }
-    if ptx.last() != Some(&b'\n') { ptx.push(b'\n'); }
+    while ptx.last() == Some(&0) {
+        ptx.pop();
+    }
+    if ptx.last() != Some(&b'\n') {
+        ptx.push(b'\n');
+    }
     let dump = std::env::temp_dir().join(format!(
         "csha_launch_bq{}kv{}d{}c{}.ptx",
         block_q, block_kv, head_dim, causal as u8
@@ -283,20 +311,40 @@ fn run_flash_attention_and_measure(
 
     // -- Launch --------------------------------------------------------
     let rc = nsl_flash_attention_csha(
-            q_dev, k_dev, v_dev, out_dev, lse_dev,
-            scale.to_bits() as i64,
-            batch as i64, heads as i64, seq_len as i64, head_dim as i64,
-            0, 0, 0, 0,             // paging
-            0, 0, 0, 0,             // rope + ragged
-            smem,
-            ptx.as_ptr() as i64,
-            kernel_name.as_ptr() as i64,
-            config.block_q as i64, config.block_kv as i64,
-            if causal { 1 } else { 0 },
-            // CSHA extras -- all null / zero.
-            0, 0, 0, 0, 0, 0,
-            1e-5f32.to_bits() as i64,
-            0, 0,
+        q_dev,
+        k_dev,
+        v_dev,
+        out_dev,
+        lse_dev,
+        scale.to_bits() as i64,
+        batch as i64,
+        heads as i64,
+        seq_len as i64,
+        head_dim as i64,
+        0,
+        0,
+        0,
+        0, // paging
+        0,
+        0,
+        0,
+        0, // rope + ragged
+        smem,
+        ptx.as_ptr() as i64,
+        kernel_name.as_ptr() as i64,
+        config.block_q as i64,
+        config.block_kv as i64,
+        if causal { 1 } else { 0 },
+        // CSHA extras -- all null / zero.
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        1e-5f32.to_bits() as i64,
+        0,
+        0,
     );
     if rc != 0 {
         let log_ptr = nsl_test_cuda_jit_log(ptx.as_ptr() as i64);
@@ -308,8 +356,10 @@ fn run_flash_attention_and_measure(
         } else {
             "<no log>".into()
         };
-        eprintln!("launch failed rc={} for bq={} kv={} d={} causal={}\nJIT log:\n{}",
-            rc, block_q, block_kv, head_dim, causal, log);
+        eprintln!(
+            "launch failed rc={} for bq={} kv={} d={} causal={}\nJIT log:\n{}",
+            rc, block_q, block_kv, head_dim, causal, log
+        );
         nsl_test_cuda_free(q_dev);
         nsl_test_cuda_free(k_dev);
         nsl_test_cuda_free(v_dev);
@@ -325,8 +375,16 @@ fn run_flash_attention_and_measure(
 
     let mut ref_out = vec![0f32; total];
     naive_attention(
-        &q_host, &k_host, &v_host, &mut ref_out,
-        batch, heads, seq_len, head_dim, scale, causal,
+        &q_host,
+        &k_host,
+        &v_host,
+        &mut ref_out,
+        batch,
+        heads,
+        seq_len,
+        head_dim,
+        scale,
+        causal,
     );
 
     let mut max_abs = 0f32;
@@ -335,13 +393,25 @@ fn run_flash_attention_and_measure(
     for (i, (&a, &b)) in out_host.iter().zip(ref_out.iter()).enumerate() {
         let abs = (a - b).abs();
         let rel = abs / b.abs().max(1e-6);
-        if abs > max_abs { max_abs = abs; max_idx = i; }
-        if rel > max_rel { max_rel = rel; }
+        if abs > max_abs {
+            max_abs = abs;
+            max_idx = i;
+        }
+        if rel > max_rel {
+            max_rel = rel;
+        }
     }
     eprintln!(
         "[bq={} kv={} d={} causal={}] max_abs={} rel={} at idx={} gpu={} cpu={}",
-        block_q, block_kv, head_dim, causal,
-        max_abs, max_rel, max_idx, out_host[max_idx], ref_out[max_idx]
+        block_q,
+        block_kv,
+        head_dim,
+        causal,
+        max_abs,
+        max_rel,
+        max_idx,
+        out_host[max_idx],
+        ref_out[max_idx]
     );
     let diag_len = 4.min(out_host.len());
     eprintln!("  first 4 GPU: {:?}", &out_host[..diag_len]);
@@ -356,9 +426,11 @@ fn run_flash_attention_and_measure(
     // Plumbing assertions -- finite + non-empty output.
     let all_finite = out_host.iter().all(|x| x.is_finite());
     let nonzero_count = out_host.iter().filter(|x| x.abs() > 1e-6).count();
-    assert!(all_finite,
+    assert!(
+        all_finite,
         "kernel produced non-finite outputs for block_q={} block_kv={} head_dim={} causal={}",
-        block_q, block_kv, head_dim, causal);
+        block_q, block_kv, head_dim, causal
+    );
     assert!(nonzero_count > total / 4,
         "kernel output looks empty: only {}/{} elements non-zero for block_q={} block_kv={} head_dim={} causal={}",
         nonzero_count, total, block_q, block_kv, head_dim, causal);
@@ -369,7 +441,9 @@ fn run_flash_attention_and_measure(
 /// Parametrized v2 sweep entry point. Confirms routing, runs the launch,
 /// then asserts max_abs <= 5e-3.
 fn run_classic_numerical_case(block_q: usize, block_kv: usize, head_dim: usize, causal: bool) {
-    if !cuda_available() { return; }
+    if !cuda_available() {
+        return;
+    }
 
     // Sanity: confirm the selector routes to v2 (only emitter since C5).
     let probe_config = FlashAttentionConfig {
@@ -382,7 +456,9 @@ fn run_classic_numerical_case(block_q: usize, block_kv: usize, head_dim: usize, 
         rope_style: RopeStyle::HalfSplit,
         gqa_group_size: 1,
         tree_mask: false,
-        gpu_sm: 75, segment_masked: false, csha: None,
+        gpu_sm: 75,
+        segment_masked: false,
+        csha: None,
     };
     assert_eq!(
         select_emitter(&probe_config),
@@ -398,7 +474,11 @@ fn run_classic_numerical_case(block_q: usize, block_kv: usize, head_dim: usize, 
             assert!(
                 max_abs <= 5e-3,
                 "v2 numerical gate FAILED: block_q={} block_kv={} head_dim={} causal={} max_abs={}",
-                block_q, block_kv, head_dim, causal, max_abs,
+                block_q,
+                block_kv,
+                head_dim,
+                causal,
+                max_abs,
             );
         }
         LaunchResult::LaunchFailed(rc, log) => {
@@ -440,22 +520,30 @@ fn run_classic_numerical_case(block_q: usize, block_kv: usize, head_dim: usize, 
 /// full K row set -- no masking corner cases.
 #[test]
 #[ignore = "requires CUDA GPU"]
-fn classic_4x32x32_nocausal() { run_classic_numerical_case(4, 32, 32, false); }
+fn classic_4x32x32_nocausal() {
+    run_classic_numerical_case(4, 32, 32, false);
+}
 
 /// CSHA canonical non-causal.
 #[test]
 #[ignore = "requires CUDA GPU"]
-fn classic_32x32x32_nocausal() { run_classic_numerical_case(32, 32, 32, false); }
+fn classic_32x32x32_nocausal() {
+    run_classic_numerical_case(32, 32, 32, false);
+}
 
 /// CSHA canonical causal.
 #[test]
 #[ignore = "requires CUDA GPU"]
-fn classic_32x32x32_causal() { run_classic_numerical_case(32, 32, 32, true); }
+fn classic_32x32x32_causal() {
+    run_classic_numerical_case(32, 32, 32, true);
+}
 
 /// Small config, causal.
 #[test]
 #[ignore = "requires CUDA GPU"]
-fn classic_16x16x64_causal() { run_classic_numerical_case(16, 16, 64, true); }
+fn classic_16x16x64_causal() {
+    run_classic_numerical_case(16, 16, 64, true);
+}
 
 // TODO(fa-v2-head_dim-128): restore
 //   fn classic_64x64x128_nocausal() { run_classic_numerical_case(64, 64, 128, false); }
@@ -473,4 +561,6 @@ fn classic_16x16x64_causal() { run_classic_numerical_case(16, 16, 64, true); }
 
 // Guard against unused-import on non-cuda builds (even though the file
 // is cfg-gated, keep c_void wired so the FFI signatures validate).
-const _: () = { let _ = std::ptr::null::<c_void>(); };
+const _: () = {
+    let _ = std::ptr::null::<c_void>();
+};

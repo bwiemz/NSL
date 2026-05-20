@@ -21,7 +21,11 @@ fn two_phase_clip_mixed_produces_conflict_diagnostics() {
 
     // Two diagnostics (layers 1 and 2 — the false inputs).
     assert_eq!(p.override_diagnostics.len(), 2);
-    let layer_indices: Vec<u32> = p.override_diagnostics.iter().map(|d| d.layer_index).collect();
+    let layer_indices: Vec<u32> = p
+        .override_diagnostics
+        .iter()
+        .map(|d| d.layer_index)
+        .collect();
     assert_eq!(layer_indices, vec![1, 2]);
     for d in &p.override_diagnostics {
         assert!(matches!(
@@ -48,7 +52,12 @@ fn no_clip_preserves_mixed_modes_for_unified_dispatch() {
     // these at runtime via the .rodata mode table.
     assert_eq!(
         p.per_layer_mode,
-        Some(vec![FaseMode::Deferred, FaseMode::FullBuffer, FaseMode::Deferred, FaseMode::FullBuffer])
+        Some(vec![
+            FaseMode::Deferred,
+            FaseMode::FullBuffer,
+            FaseMode::Deferred,
+            FaseMode::FullBuffer
+        ])
     );
     assert!(p.override_diagnostics.is_empty());
 }

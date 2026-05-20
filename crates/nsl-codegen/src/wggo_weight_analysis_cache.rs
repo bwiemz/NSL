@@ -185,7 +185,10 @@ mod tests {
         store(&p, &rep).unwrap();
         let loaded = try_load(&p).expect("cache should load");
         assert_eq!(loaded.per_layer.len(), rep.per_layer.len());
-        assert_eq!(loaded.per_layer[0].head_scores, rep.per_layer[0].head_scores);
+        assert_eq!(
+            loaded.per_layer[0].head_scores,
+            rep.per_layer[0].head_scores
+        );
         assert_eq!(
             loaded.per_layer[0].default_min_retained,
             rep.per_layer[0].default_min_retained
@@ -217,7 +220,8 @@ mod tests {
         let p = temp_path("badver");
         write_bytes(&p, b"v");
         let sidecar = sidecar_path(&p);
-        let json = r#"{"version":0,"checkpoint_sha256":"x","per_layer":[],"layers_without_weights":0}"#;
+        let json =
+            r#"{"version":0,"checkpoint_sha256":"x","per_layer":[],"layers_without_weights":0}"#;
         fs::write(&sidecar, json).unwrap();
         assert!(try_load(&p).is_none());
         cleanup(&p);

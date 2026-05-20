@@ -90,8 +90,7 @@ fn dispatch_branch_picks_base_ptx_when_runtime_gate_false() {
     };
 
     // Replicate the dispatcher's 2-line branch logic from nsl_flash_attention_csha.
-    let gate_result =
-        should_dispatch_tier_b_at_runtime(tier_b_ptx_ptr, segment_ids_ptr, seq_len);
+    let gate_result = should_dispatch_tier_b_at_runtime(tier_b_ptx_ptr, segment_ids_ptr, seq_len);
     let (effective_ptx_ptr, effective_name_ptr) = if gate_result {
         (tier_b_ptx_ptr, tier_b_name_ptr)
     } else {
@@ -99,7 +98,10 @@ fn dispatch_branch_picks_base_ptx_when_runtime_gate_false() {
     };
 
     // Below-floor seq_len should select base PTX, not Tier-B-on.
-    assert!(!gate_result, "Below-floor seq_len should produce false gate result");
+    assert!(
+        !gate_result,
+        "Below-floor seq_len should produce false gate result"
+    );
     assert_eq!(
         effective_ptx_ptr, base_ptx_ptr,
         "Gate OFF should select base PTX, not Tier-B-on (inverted-branch regression?)"

@@ -4,7 +4,7 @@
 use insta::assert_snapshot;
 use nsl_codegen::flash_attention::{CshaExtras, FlashAttentionConfig, RopeStyle};
 use nsl_codegen::flash_attention_v2::tier_b1::pipeline::{
-    emit_prologue_kicks, emit_main_loop_phase_a_load, emit_main_loop_phase_c_swap,
+    emit_main_loop_phase_a_load, emit_main_loop_phase_c_swap, emit_prologue_kicks,
 };
 
 #[test]

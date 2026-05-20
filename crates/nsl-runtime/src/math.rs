@@ -1,20 +1,32 @@
 #[no_mangle]
-pub extern "C" fn nsl_sqrt(x: f64) -> f64 { x.sqrt() }
+pub extern "C" fn nsl_sqrt(x: f64) -> f64 {
+    x.sqrt()
+}
 
 #[no_mangle]
-pub extern "C" fn nsl_log(x: f64) -> f64 { x.ln() }
+pub extern "C" fn nsl_log(x: f64) -> f64 {
+    x.ln()
+}
 
 #[no_mangle]
-pub extern "C" fn nsl_exp(x: f64) -> f64 { x.exp() }
+pub extern "C" fn nsl_exp(x: f64) -> f64 {
+    x.exp()
+}
 
 #[no_mangle]
-pub extern "C" fn nsl_sin(x: f64) -> f64 { x.sin() }
+pub extern "C" fn nsl_sin(x: f64) -> f64 {
+    x.sin()
+}
 
 #[no_mangle]
-pub extern "C" fn nsl_cos(x: f64) -> f64 { x.cos() }
+pub extern "C" fn nsl_cos(x: f64) -> f64 {
+    x.cos()
+}
 
 #[no_mangle]
-pub extern "C" fn nsl_abs_float(x: f64) -> f64 { x.abs() }
+pub extern "C" fn nsl_abs_float(x: f64) -> f64 {
+    x.abs()
+}
 
 #[no_mangle]
 pub extern "C" fn nsl_abs_int(x: i64) -> i64 {
@@ -25,25 +37,35 @@ pub extern "C" fn nsl_abs_int(x: i64) -> i64 {
 }
 
 #[no_mangle]
-pub extern "C" fn nsl_min_int(a: i64, b: i64) -> i64 { a.min(b) }
+pub extern "C" fn nsl_min_int(a: i64, b: i64) -> i64 {
+    a.min(b)
+}
 
 #[no_mangle]
-pub extern "C" fn nsl_max_int(a: i64, b: i64) -> i64 { a.max(b) }
+pub extern "C" fn nsl_max_int(a: i64, b: i64) -> i64 {
+    a.max(b)
+}
 
 #[no_mangle]
-pub extern "C" fn nsl_min_float(a: f64, b: f64) -> f64 { a.min(b) }
+pub extern "C" fn nsl_min_float(a: f64, b: f64) -> f64 {
+    a.min(b)
+}
 
 #[no_mangle]
-pub extern "C" fn nsl_max_float(a: f64, b: f64) -> f64 { a.max(b) }
+pub extern "C" fn nsl_max_float(a: f64, b: f64) -> f64 {
+    a.max(b)
+}
 
 #[no_mangle]
-pub extern "C" fn nsl_floor(x: f64) -> f64 { x.floor() }
+pub extern "C" fn nsl_floor(x: f64) -> f64 {
+    x.floor()
+}
 
 /// High-resolution wall clock in seconds (monotonic).
 #[no_mangle]
 pub extern "C" fn nsl_clock() -> f64 {
-    use std::time::Instant;
     use std::sync::OnceLock;
+    use std::time::Instant;
     static EPOCH: OnceLock<Instant> = OnceLock::new();
     let epoch = EPOCH.get_or_init(Instant::now);
     epoch.elapsed().as_secs_f64()

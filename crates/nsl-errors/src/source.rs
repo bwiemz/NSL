@@ -28,14 +28,10 @@ impl SourceMap {
             Level::Info => codespan_reporting::diagnostic::Severity::Note,
         };
 
-        let mut cs_diag = codespan_reporting::diagnostic::Diagnostic::new(severity)
-            .with_message(&diag.message);
+        let mut cs_diag =
+            codespan_reporting::diagnostic::Diagnostic::new(severity).with_message(&diag.message);
 
-        let labels: Vec<_> = diag
-            .labels
-            .iter()
-            .map(convert_label)
-            .collect();
+        let labels: Vec<_> = diag.labels.iter().map(convert_label).collect();
         cs_diag = cs_diag.with_labels(labels);
 
         if !diag.notes.is_empty() {

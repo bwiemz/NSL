@@ -159,18 +159,14 @@ fn emit_scatter_p_to_smem(ptx: &mut String, config: &FlashAttentionConfig) {
     for t in 0..tpw {
         ptx.push_str(&format!(
             "    // P scatter slot local_t={} (global_t = warp_id + {}*8 at runtime; N3)\n",
-            t,
-            t
+            t, t
         ));
 
         // global_t = warp_id + local_t * 8
         if t == 0 {
             ptx.push_str("    mov.u32 %sp_global_t, %warp_id;\n");
         } else {
-            ptx.push_str(&format!(
-                "    add.u32 %sp_global_t, %warp_id, {};\n",
-                t * 8
-            ));
+            ptx.push_str(&format!("    add.u32 %sp_global_t, %warp_id, {};\n", t * 8));
         }
         // (m_tile, n_tile) from global_t.
         ptx.push_str(&format!(
@@ -220,10 +216,7 @@ fn emit_scatter_p_to_smem(ptx: &mut String, config: &FlashAttentionConfig) {
             } else {
                 ptx.push_str("    mov.u32 %sp_addr_i, %sp_addr_u32;\n");
             }
-            ptx.push_str(&format!(
-                "    cvt.rn.f16.f32 %sp_h, %s_acc_{}_{};\n",
-                t, i
-            ));
+            ptx.push_str(&format!("    cvt.rn.f16.f32 %sp_h, %s_acc_{}_{};\n", t, i));
             // N3: no warp gate — each warp writes to a distinct P_smem
             // region for its own (m_tile, n_tile).
             ptx.push_str("    st.shared.b16 [%sp_addr_i], %sp_h;\n");
@@ -402,22 +395,9 @@ fn emit_qkt_mma(ptx: &mut String, config: &FlashAttentionConfig, slot: u32) {
                 format!("tb1_qkt_a_{}_2", t),
                 format!("tb1_qkt_a_{}_3", t),
             ];
-            emit_load_a_fragment_smem(
-                ptx,
-                &a_fragment_regs,
-                &a_base_expr,
-                (hd * 2) as usize,
-            );
-            let b_fragment_regs = [
-                format!("tb1_qkt_b_{}_0", t),
-                format!("tb1_qkt_b_{}_1", t),
-            ];
-            emit_load_b_fragment_smem(
-                ptx,
-                &b_fragment_regs,
-                &b_base_expr,
-                (hd * 2) as usize,
-            );
+            emit_load_a_fragment_smem(ptx, &a_fragment_regs, &a_base_expr, (hd * 2) as usize);
+            let b_fragment_regs = [format!("tb1_qkt_b_{}_0", t), format!("tb1_qkt_b_{}_1", t)];
+            emit_load_b_fragment_smem(ptx, &b_fragment_regs, &b_base_expr, (hd * 2) as usize);
             let d_regs = [
                 format!("%s_acc_{}_0", t),
                 format!("%s_acc_{}_1", t),
@@ -430,10 +410,7 @@ fn emit_qkt_mma(ptx: &mut String, config: &FlashAttentionConfig, slot: u32) {
                 format!("%tb1_qkt_a_{}_2", t),
                 format!("%tb1_qkt_a_{}_3", t),
             ];
-            let b_regs = [
-                format!("%tb1_qkt_b_{}_0", t),
-                format!("%tb1_qkt_b_{}_1", t),
-            ];
+            let b_regs = [format!("%tb1_qkt_b_{}_0", t), format!("%tb1_qkt_b_{}_1", t)];
             let c_regs = d_regs.clone();
             // N1b: accumulate into same %s_acc_<t>_* across K-iters.
             // N3: unconditional MMA — each warp writes its OWN slot.
@@ -519,24 +496,18 @@ fn emit_qkt_mma(ptx: &mut String, config: &FlashAttentionConfig, slot: u32) {
                 let row_offset = if d_idx < 2 { 0u32 } else { 8 };
                 let col_offset = d_idx % 2;
                 // q_global = q_start_low_u32 + m_tile*16 + lo_row + row_offset
-                ptx.push_str(
-                    "    add.u32 %cm_q_global, %qkt_q_warp_off, %cm_lo_row;\n",
-                );
+                ptx.push_str("    add.u32 %cm_q_global, %qkt_q_warp_off, %cm_lo_row;\n");
                 if row_offset > 0 {
                     ptx.push_str(&format!(
                         "    add.u32 %cm_q_global, %cm_q_global, {};\n",
                         row_offset
                     ));
                 }
-                ptx.push_str(
-                    "    cvt.u32.u64 %cm_k_global, %q_start;  // q_start (low 32 bits)\n",
-                );
+                ptx.push_str("    cvt.u32.u64 %cm_k_global, %q_start;  // q_start (low 32 bits)\n");
                 ptx.push_str("    add.u32 %cm_q_global, %cm_q_global, %cm_k_global;\n");
                 // k_global = n_tile*8 + lo_col_base + col_offset
                 // (single-iter kv_iter=0; kv_start = 0).
-                ptx.push_str(
-                    "    add.u32 %cm_k_global, %qkt_k_warp_off, %cm_lo_col_base;\n",
-                );
+                ptx.push_str("    add.u32 %cm_k_global, %qkt_k_warp_off, %cm_lo_col_base;\n");
                 if col_offset > 0 {
                     ptx.push_str(&format!(
                         "    add.u32 %cm_k_global, %cm_k_global, {};\n",
@@ -582,9 +553,9 @@ fn emit_online_softmax(ptx: &mut String, config: &FlashAttentionConfig, kv_iter:
     let n_tiles_kv = tier_b1_n_tiles_kv(config);
     let softmax_off = tier_b1_softmax_scratch_offset(config);
     let scratch_max_size = bq * n_tiles_kv * 4; // first half of scratch holds maxes
-    // The sum region lives at +scratch_max_size from the softmax base; that
-    // offset is added inline at the SMEM addressing site below.
-    // sanity: total reserved must match smem_layout helper
+                                                // The sum region lives at +scratch_max_size from the softmax base; that
+                                                // offset is added inline at the SMEM addressing site below.
+                                                // sanity: total reserved must match smem_layout helper
     assert_eq!(
         scratch_max_size + scratch_max_size,
         tier_b1_softmax_scratch_bytes(config),
@@ -957,14 +928,8 @@ fn emit_online_softmax(ptx: &mut String, config: &FlashAttentionConfig, kv_iter:
     // SMEM-bridge refactor. Kept until the next pass cleans it up; ptxas
     // prunes dead registers so this is free at runtime.)
     for t in 0..tpw {
-        ptx.push_str(&format!(
-            "    cvt.rn.f16.f32 %mma_h0, %s_acc_{}_0;\n",
-            t
-        ));
-        ptx.push_str(&format!(
-            "    cvt.rn.f16.f32 %mma_h1, %s_acc_{}_1;\n",
-            t
-        ));
+        ptx.push_str(&format!("    cvt.rn.f16.f32 %mma_h0, %s_acc_{}_0;\n", t));
+        ptx.push_str(&format!("    cvt.rn.f16.f32 %mma_h1, %s_acc_{}_1;\n", t));
         ptx.push_str(&format!(
             "    mov.b32 %p_packed_{}, {{%mma_h0, %mma_h1}};\n",
             t
@@ -1064,10 +1029,7 @@ fn emit_pv_mma(ptx: &mut String, config: &FlashAttentionConfig, slot: u32) {
         if t == 0 {
             ptx.push_str("    mov.u32 %pv_global_t, %warp_id;\n");
         } else {
-            ptx.push_str(&format!(
-                "    add.u32 %pv_global_t, %warp_id, {};\n",
-                t * 8
-            ));
+            ptx.push_str(&format!("    add.u32 %pv_global_t, %warp_id, {};\n", t * 8));
         }
         ptx.push_str(&format!(
             "    shr.u32 %pv_m_tile, %pv_global_t, {};\n",
@@ -1082,9 +1044,7 @@ fn emit_pv_mma(ptx: &mut String, config: &FlashAttentionConfig, slot: u32) {
             "    shl.b32 %pv_p_warp_off, %pv_m_tile, {};\n",
             log2_p_m_stride
         ));
-        ptx.push_str(
-            "    add.u32 %pv_a_base, %tb1_phase_b_smem_p_u32, %pv_p_warp_off;\n",
-        );
+        ptx.push_str("    add.u32 %pv_a_base, %tb1_phase_b_smem_p_u32, %pv_p_warp_off;\n");
         // B-fragment base = V_smem + n_tile_pv * 8 * (bkv*2) bytes. V is
         // stored COL-MAJOR [bkv × hd] so n_tile advance = 8 cols ×
         // bkv*2 byte-stride per col.
@@ -1092,9 +1052,7 @@ fn emit_pv_mma(ptx: &mut String, config: &FlashAttentionConfig, slot: u32) {
             "    mul.lo.u32 %pv_v_warp_off, %pv_n_tile, {};\n",
             8 * bkv * 2
         ));
-        ptx.push_str(
-            "    add.u32 %pv_b_base, %tb1_phase_b_smem_v_u32, %pv_v_warp_off;\n",
-        );
+        ptx.push_str("    add.u32 %pv_b_base, %tb1_phase_b_smem_v_u32, %pv_v_warp_off;\n");
 
         // N1a: PV K-loop. m16n8k16 K-dim = 16; for block_kv > 16 we need
         // ceil(block_kv / 16) K-iters per output tile, accumulating into
@@ -1146,12 +1104,7 @@ fn emit_pv_mma(ptx: &mut String, config: &FlashAttentionConfig, slot: u32) {
                 format!("tb1_pv_a_{}_2", t),
                 format!("tb1_pv_a_{}_3", t),
             ];
-            emit_load_a_fragment_smem(
-                ptx,
-                &a_fragment_regs,
-                &a_base_expr,
-                (bkv * 2) as usize,
-            );
+            emit_load_a_fragment_smem(ptx, &a_fragment_regs, &a_base_expr, (bkv * 2) as usize);
 
             // B1.6 deferral #1 (PV B-fragment): per-lane V load via helper.
             // V is stored COL-MAJOR [bkv × hd] f16 in SMEM (the V-scatter
@@ -1163,16 +1116,8 @@ fn emit_pv_mma(ptx: &mut String, config: &FlashAttentionConfig, slot: u32) {
             // effectively P @ scrambled-V (helper read V at byte
             // n*(hd*2) + k*2 — that byte position in row-major-stored V
             // resolved to V[n, k] not V[k, n]).
-            let b_fragment_regs = [
-                format!("tb1_pv_b_{}_0", t),
-                format!("tb1_pv_b_{}_1", t),
-            ];
-            emit_load_b_fragment_smem(
-                ptx,
-                &b_fragment_regs,
-                &b_base_expr,
-                (bkv * 2) as usize,
-            );
+            let b_fragment_regs = [format!("tb1_pv_b_{}_0", t), format!("tb1_pv_b_{}_1", t)];
+            emit_load_b_fragment_smem(ptx, &b_fragment_regs, &b_base_expr, (bkv * 2) as usize);
             let d_regs = [
                 format!("%o_acc_{}_0", t),
                 format!("%o_acc_{}_1", t),
@@ -1185,10 +1130,7 @@ fn emit_pv_mma(ptx: &mut String, config: &FlashAttentionConfig, slot: u32) {
                 format!("%tb1_pv_a_{}_2", t),
                 format!("%tb1_pv_a_{}_3", t),
             ];
-            let b_regs = [
-                format!("%tb1_pv_b_{}_0", t),
-                format!("%tb1_pv_b_{}_1", t),
-            ];
+            let b_regs = [format!("%tb1_pv_b_{}_0", t), format!("%tb1_pv_b_{}_1", t)];
             let c_regs = d_regs.clone();
             // N1a: accumulate into same %o_acc_<t>_* across K-iters.
             // N3: unconditional MMA — each warp writes its OWN slot.
@@ -1264,7 +1206,10 @@ mod tests {
             "emit_phase_b_attention must NOT declare %o_acc post-hoist; declaration belongs to register_budget::declare_registers"
         );
         let mut prelude_ptx = String::new();
-        crate::flash_attention_v2::tier_b1::register_budget::declare_registers(&mut prelude_ptx, &cfg);
+        crate::flash_attention_v2::tier_b1::register_budget::declare_registers(
+            &mut prelude_ptx,
+            &cfg,
+        );
         assert!(
             prelude_ptx.contains(".reg .f32 %o_acc_0_0"),
             "register_budget::declare_registers must emit the %o_acc declaration"
@@ -1285,9 +1230,7 @@ mod tests {
         let qkt_scale_marker = format!("0f{:08X}", qkt_scale_bits);
         // Match `mul.f32 ..., 0f<bits>` to exclude the diagnostic comment
         // header that also prints the hex literal.
-        let scale_count = ptx
-            .matches(&format!(", {};", qkt_scale_marker)[..])
-            .count();
+        let scale_count = ptx.matches(&format!(", {};", qkt_scale_marker)[..]).count();
         assert_eq!(
             scale_count,
             (tpw * 4) as usize,

@@ -60,9 +60,7 @@ impl ScopeMap {
             symbols: HashMap::new(),
             kind: ScopeKind::Module,
         };
-        ScopeMap {
-            scopes: vec![root],
-        }
+        ScopeMap { scopes: vec![root] }
     }
 
     /// Create a new child scope, returning its ID.
@@ -208,9 +206,7 @@ mod tests {
             .declare(ScopeId::ROOT, sym, dummy_info(Type::Int))
             .unwrap();
         let child = scopes.push_scope(ScopeId::ROOT, ScopeKind::Block);
-        scopes
-            .declare(child, sym, dummy_info(Type::Str))
-            .unwrap();
+        scopes.declare(child, sym, dummy_info(Type::Str)).unwrap();
         let (sid, info) = scopes.lookup(child, sym).unwrap();
         assert_eq!(sid, child);
         assert_eq!(info.ty, Type::Str);

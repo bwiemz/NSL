@@ -46,7 +46,9 @@ fn test_fuse_graph_decorator_invalid_on_model() {
     let src = "@fuse_graph\nmodel MyModel:\n    let x: Tensor<[4], f32>\n";
     let diags = check_source(src);
     assert!(
-        diags.iter().any(|d| format!("{:?}", d).contains("fuse_graph")),
+        diags
+            .iter()
+            .any(|d| format!("{:?}", d).contains("fuse_graph")),
         "@fuse_graph on model should produce a fuse_graph diagnostic, got: {:?}",
         diags
     );
@@ -517,7 +519,9 @@ trait Comparable<T>:
         .iter()
         .filter(|d| {
             let s = format!("{:?}", d);
-            s.contains("duplicate trait method") || s.contains("bound must reference a trait") || s.contains("undefined type")
+            s.contains("duplicate trait method")
+                || s.contains("bound must reference a trait")
+                || s.contains("undefined type")
         })
         .collect();
     assert!(
@@ -538,7 +542,8 @@ trait Duplicate:
     assert!(
         diags
             .iter()
-            .any(|d| format!("{:?}", d).contains("duplicate trait method 'render' in trait 'Duplicate'")),
+            .any(|d| format!("{:?}", d)
+                .contains("duplicate trait method 'render' in trait 'Duplicate'")),
         "expected duplicate trait method error, got: {:?}",
         diags
     );
@@ -577,7 +582,9 @@ fn read_value(wrapper: Wrapper<int>) -> int:
         .iter()
         .filter(|d| {
             let s = format!("{:?}", d);
-            s.contains("undefined type") || s.contains("wrong number of type arguments") || s.contains("type mismatch")
+            s.contains("undefined type")
+                || s.contains("wrong number of type arguments")
+                || s.contains("type mismatch")
         })
         .collect();
     assert!(
@@ -604,7 +611,9 @@ fn read_holder(holder: Holder<int>) -> int:
         .iter()
         .filter(|d| {
             let s = format!("{:?}", d);
-            s.contains("undefined type") || s.contains("wrong number of type arguments") || s.contains("type mismatch")
+            s.contains("undefined type")
+                || s.contains("wrong number of type arguments")
+                || s.contains("type mismatch")
         })
         .collect();
     assert!(
@@ -653,7 +662,9 @@ fn read_deep(deep: Deep<int>) -> int:
         .iter()
         .filter(|d| {
             let s = format!("{:?}", d);
-            s.contains("undefined type") || s.contains("wrong number of type arguments") || s.contains("type mismatch")
+            s.contains("undefined type")
+                || s.contains("wrong number of type arguments")
+                || s.contains("type mismatch")
         })
         .collect();
     assert!(
@@ -729,7 +740,10 @@ let coder = load_model()
     let res = analyze_source(src);
     assert_eq!(res.freeze_configs.len(), 1);
     let cfg = &res.freeze_configs[0];
-    assert_eq!(cfg.exclude, vec!["blocks.6.*".to_string(), "blocks.7.*".to_string()]);
+    assert_eq!(
+        cfg.exclude,
+        vec!["blocks.6.*".to_string(), "blocks.7.*".to_string()]
+    );
     assert!(cfg.include.is_empty());
 }
 
@@ -768,7 +782,10 @@ let m = MyModel()
 "#;
     let res = analyze_source(src);
     let cfg = &res.adapter_configs[0];
-    assert_eq!(cfg.alpha, None, "absent alpha stays None; codegen defaults to rank");
+    assert_eq!(
+        cfg.alpha, None,
+        "absent alpha stays None; codegen defaults to rank"
+    );
 }
 
 #[test]
@@ -821,7 +838,10 @@ let coder = load_model()
         "expected missing-type error, got: {:?}",
         res.diagnostics
     );
-    assert!(res.adapter_configs.is_empty(), "invalid adapter should not be captured");
+    assert!(
+        res.adapter_configs.is_empty(),
+        "invalid adapter should not be captured"
+    );
 }
 
 #[test]
@@ -1051,8 +1071,7 @@ model Attention:
     let arg_errs: Vec<_> = diags
         .iter()
         .filter(|d| {
-            d.message.contains("@wggo_target requires arguments")
-                && d.message.contains("head_dim")
+            d.message.contains("@wggo_target requires arguments") && d.message.contains("head_dim")
         })
         .collect();
     assert!(
@@ -1480,13 +1499,17 @@ model Attention:
 "#;
     let diags = check_source(src);
     assert!(
-        !diags.iter().any(|d| d.message.contains("not found in model")),
+        !diags
+            .iter()
+            .any(|d| d.message.contains("not found in model")),
         "happy path must not emit `not found in model` diagnostics; got: {:?}",
         diags
     );
     assert!(
-        !diags.iter().any(|d| d.message.contains("must reference a Tensor field")
-            || d.message.contains("must reference an int field")),
+        !diags
+            .iter()
+            .any(|d| d.message.contains("must reference a Tensor field")
+                || d.message.contains("must reference an int field")),
         "happy path must not emit field-type diagnostics; got: {:?}",
         diags
     );

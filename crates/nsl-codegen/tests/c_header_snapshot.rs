@@ -49,34 +49,76 @@ fn header_contains_expected_prototypes() {
     let header = emit(&exports, "model");
 
     // Header guard
-    assert!(header.contains("#ifndef NSL_MODEL_H"), "missing header guard open: {header}");
-    assert!(header.contains("#define NSL_MODEL_H"), "missing header guard define: {header}");
-    assert!(header.contains("#endif"), "missing header guard close: {header}");
+    assert!(
+        header.contains("#ifndef NSL_MODEL_H"),
+        "missing header guard open: {header}"
+    );
+    assert!(
+        header.contains("#define NSL_MODEL_H"),
+        "missing header guard define: {header}"
+    );
+    assert!(
+        header.contains("#endif"),
+        "missing header guard close: {header}"
+    );
 
     // Required types
-    assert!(header.contains("typedef struct NslModel NslModel"), "missing NslModel typedef: {header}");
-    assert!(header.contains("NslTensorDesc"), "missing NslTensorDesc: {header}");
+    assert!(
+        header.contains("typedef struct NslModel NslModel"),
+        "missing NslModel typedef: {header}"
+    );
+    assert!(
+        header.contains("NslTensorDesc"),
+        "missing NslTensorDesc: {header}"
+    );
 
     // Lifecycle
-    assert!(header.contains("nsl_model_create"), "missing nsl_model_create proto: {header}");
-    assert!(header.contains("nsl_model_destroy"), "missing nsl_model_destroy proto: {header}");
+    assert!(
+        header.contains("nsl_model_create"),
+        "missing nsl_model_create proto: {header}"
+    );
+    assert!(
+        header.contains("nsl_model_destroy"),
+        "missing nsl_model_destroy proto: {header}"
+    );
 
     // Export functions — prototypes
-    assert!(header.contains("int forward(NslModel"), "missing forward prototype: {header}");
-    assert!(header.contains("const NslTensorDesc*"), "missing const NslTensorDesc param type: {header}");
-    assert!(header.contains("NslTensorDesc* __ret"), "missing __ret out-param: {header}");
+    assert!(
+        header.contains("int forward(NslModel"),
+        "missing forward prototype: {header}"
+    );
+    assert!(
+        header.contains("const NslTensorDesc*"),
+        "missing const NslTensorDesc param type: {header}"
+    );
+    assert!(
+        header.contains("NslTensorDesc* __ret"),
+        "missing __ret out-param: {header}"
+    );
 
     // Renamed symbol
-    assert!(header.contains("int predict(NslModel"), "missing predict prototype: {header}");
+    assert!(
+        header.contains("int predict(NslModel"),
+        "missing predict prototype: {header}"
+    );
 
     // The raw NSL name should NOT appear as a prototype (predict replaces it)
-    assert!(!header.contains("int inference_forward("), "raw name leaked into header: {header}");
+    assert!(
+        !header.contains("int inference_forward("),
+        "raw name leaked into header: {header}"
+    );
 }
 
 #[test]
 fn header_has_extern_c_guards() {
     let exports = sample_export_functions();
     let header = emit(&exports, "model");
-    assert!(header.contains("#ifdef __cplusplus"), "missing extern C guard: {header}");
-    assert!(header.contains("extern \"C\""), "missing extern C block: {header}");
+    assert!(
+        header.contains("#ifdef __cplusplus"),
+        "missing extern C guard: {header}"
+    );
+    assert!(
+        header.contains("extern \"C\""),
+        "missing extern C block: {header}"
+    );
 }

@@ -128,8 +128,7 @@ impl PersistentPlan {
         if self.baseline_launches_per_layer == 0 {
             return 0.0;
         }
-        1.0 - (self.persistent_launches_per_layer as f64
-            / self.baseline_launches_per_layer as f64)
+        1.0 - (self.persistent_launches_per_layer as f64 / self.baseline_launches_per_layer as f64)
     }
 
     /// Bytes fitting ratio — useful when debugging SMEM budgets.

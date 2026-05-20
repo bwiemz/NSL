@@ -36,9 +36,8 @@
 
 use crate::flash_attention::FlashAttentionConfig;
 use crate::flash_attention_v2::smem_layout::{
-    backward_dk_offset, backward_dq_offset, backward_dv_offset,
-    backward_dx_norm_offset, backward_rms_strip_offset,
-    backward_x_norm_offset,
+    backward_dk_offset, backward_dq_offset, backward_dv_offset, backward_dx_norm_offset,
+    backward_rms_strip_offset, backward_x_norm_offset,
 };
 
 // ────────────────────────────────────────────────────────────────────────
@@ -105,7 +104,8 @@ pub fn emit_xnorm_recompute(ptx: &mut String, config: &FlashAttentionConfig) {
     ptx.push_str("    mov.f32 %f_ms, 0f00000000;\n");
     for d in 0..d_model {
         ptx.push_str(&format!(
-            "    ld.global.f32 %f_xraw, [%rd_c0 + {}];\n", d * 4
+            "    ld.global.f32 %f_xraw, [%rd_c0 + {}];\n",
+            d * 4
         ));
         ptx.push_str("    fma.rn.f32 %f_ms, %f_xraw, %f_xraw, %f_ms;\n");
     }
@@ -133,25 +133,23 @@ pub fn emit_xnorm_recompute(ptx: &mut String, config: &FlashAttentionConfig) {
     // x_norm tile row base = x_off + tid_x * d_model * 4
     ptx.push_str("    cvt.u64.u32 %rd_c5, %tid_x;\n");
     ptx.push_str(&format!(
-        "    mul.lo.u64 %rd_c5, %rd_c5, {};\n", d_model * 4
+        "    mul.lo.u64 %rd_c5, %rd_c5, {};\n",
+        d_model * 4
     ));
     ptx.push_str(&format!("    add.u64 %rd_c5, %rd_c5, {x_off};\n"));
     ptx.push_str("    add.u64 %rd_c5, %shmem_base, %rd_c5;\n");
     for d in 0..d_model {
         // load x[s,d]
         ptx.push_str(&format!(
-            "    ld.global.f32 %f_xraw, [%rd_c0 + {}];\n", d * 4
+            "    ld.global.f32 %f_xraw, [%rd_c0 + {}];\n",
+            d * 4
         ));
         // load norm_weight[d]
-        ptx.push_str(&format!(
-            "    ld.global.f32 %f_nw, [%rd_c4 + {}];\n", d * 4
-        ));
+        ptx.push_str(&format!("    ld.global.f32 %f_nw, [%rd_c4 + {}];\n", d * 4));
         // xn = x * rms_inv * nw
         ptx.push_str("    mul.f32 %f_xn, %f_xraw, %f_rms_inv;\n");
         ptx.push_str("    mul.f32 %f_xn, %f_xn, %f_nw;\n");
-        ptx.push_str(&format!(
-            "    st.shared.f32 [%rd_c5 + {}], %f_xn;\n", d * 4
-        ));
+        ptx.push_str(&format!("    st.shared.f32 [%rd_c5 + {}], %f_xn;\n", d * 4));
     }
 
     ptx.push_str("V2_BWD_XNORM_DONE:\n");
@@ -222,10 +220,7 @@ pub fn emit_drope(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: 
     // cos/sin rows are indexed by absolute row = q_start + row_local
     // (same stride `half * 4` bytes f32). For the smoke scope q_start=0,
     // but we compute it honestly so wider configs land safely.
-    for (label, tile_off, rows) in [
-        ("Q", dq_off, block_q),
-        ("K", dk_off, block_kv),
-    ] {
+    for (label, tile_off, rows) in [("Q", dq_off, block_q), ("K", dk_off, block_kv)] {
         let total_pairs = rows * half;
         let pairs_per_lane = total_pairs.div_ceil(128).max(1);
         ptx.push_str(&format!(
@@ -236,23 +231,18 @@ pub fn emit_drope(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: 
             let thread_pair = k * 128;
             ptx.push_str("    cvt.u64.u32 %rd32, %tid_x;\n");
             if thread_pair > 0 {
-                ptx.push_str(&format!(
-                    "    add.u64 %rd32, %rd32, {};\n", thread_pair
-                ));
+                ptx.push_str(&format!("    add.u64 %rd32, %rd32, {};\n", thread_pair));
             }
-            ptx.push_str(&format!(
-                "    setp.lt.u64 %p0, %rd32, {};\n", total_pairs
-            ));
+            ptx.push_str(&format!("    setp.lt.u64 %p0, %rd32, {};\n", total_pairs));
             ptx.push_str(&format!(
                 "    @!%p0 bra V2_BWD_DROPE_{label}_SKIP_{q_tile_iter}_{k};\n"
             ));
 
             // row = pair_idx / half; pair_in_row = pair_idx % half
+            ptx.push_str(&format!("    div.u64 %rd33, %rd32, {};  // row\n", half));
             ptx.push_str(&format!(
-                "    div.u64 %rd33, %rd32, {};  // row\n", half
-            ));
-            ptx.push_str(&format!(
-                "    rem.u64 %rd34, %rd32, {};  // pair_in_row\n", half
+                "    rem.u64 %rd34, %rd32, {};  // pair_in_row\n",
+                half
             ));
 
             // cos/sin addr: cos_ptr + ((q_start + row) * half + pair_in_row)*2
@@ -279,7 +269,9 @@ pub fn emit_drope(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: 
                 ));
                 // abs_row = (row narrowed to u32) + (base narrowed to u32).
                 ptx.push_str("    cvt.u32.u64 %r_abs_pos, %rd33;\n");
-                ptx.push_str(&format!("    cvt.u32.u64 %r_doc_starts_byte_off, {base_reg};\n"));
+                ptx.push_str(&format!(
+                    "    cvt.u32.u64 %r_doc_starts_byte_off, {base_reg};\n"
+                ));
                 ptx.push_str("    add.u32 %r_abs_pos, %r_abs_pos, %r_doc_starts_byte_off;\n");
                 // sid = segment_ids[abs_row] from %seg_base (u16 entries; backward
                 // embeds seg_smem at the tail of the extern shmem region, so
@@ -294,7 +286,9 @@ pub fn emit_drope(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: 
                 ptx.push_str("    mul.lo.u32 %r_doc_starts_byte_off, %r_doc_starts_idx, 4;\n");
                 ptx.push_str("    cvta.shared.u64 %r_doc_smem_base, smem_doc_starts;\n");
                 ptx.push_str("    cvt.u64.u32 %rd_doc_smem_addr, %r_doc_starts_byte_off;\n");
-                ptx.push_str("    add.u64 %rd_doc_smem_addr, %r_doc_smem_base, %rd_doc_smem_addr;\n");
+                ptx.push_str(
+                    "    add.u64 %rd_doc_smem_addr, %r_doc_smem_base, %rd_doc_smem_addr;\n",
+                );
                 ptx.push_str("    ld.shared.s32 %r_doc_start, [%rd_doc_smem_addr];\n");
                 // effective_pos = abs_row - doc_start (s32; non-negative under packing invariants).
                 ptx.push_str(&format!(
@@ -303,9 +297,7 @@ pub fn emit_drope(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: 
                 // Zero-extend effective_pos into %rd35 (cs row register).
                 // effective_pos is non-negative under the packing invariants
                 // (see pca_rope::plan), so a u32→u64 cvt is sufficient.
-                ptx.push_str(&format!(
-                    "    cvt.u64.u32 %rd35, {eff_pos_reg};\n"
-                ));
+                ptx.push_str(&format!("    cvt.u64.u32 %rd35, {eff_pos_reg};\n"));
             } else if label == "Q" {
                 ptx.push_str("    add.u64 %rd35, %rd33, %q_start;\n");
             } else {
@@ -314,9 +306,7 @@ pub fn emit_drope(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: 
                 // config where K streams over q_start is correct.
                 ptx.push_str("    mov.u64 %rd35, %rd33;\n");
             }
-            ptx.push_str(&format!(
-                "    mul.lo.u64 %rd35, %rd35, {};\n", half
-            ));
+            ptx.push_str(&format!("    mul.lo.u64 %rd35, %rd35, {};\n", half));
             ptx.push_str("    add.u64 %rd35, %rd35, %rd34;\n");
             ptx.push_str("    shl.b64 %rd35, %rd35, 1;  // *2 (f16 cos/sin)\n");
 
@@ -329,14 +319,13 @@ pub fn emit_drope(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: 
 
             // dY addr: tile_off + (row*head_dim + 2*pair_in_row)*4 (f32 tile)
             ptx.push_str(&format!(
-                "    mul.lo.u64 %rd36, %rd33, {};  // row * head_dim\n", head_dim
+                "    mul.lo.u64 %rd36, %rd33, {};  // row * head_dim\n",
+                head_dim
             ));
             ptx.push_str("    shl.b64 %rd37, %rd34, 1;  // 2 * pair_in_row\n");
             ptx.push_str("    add.u64 %rd36, %rd36, %rd37;\n");
             ptx.push_str("    shl.b64 %rd36, %rd36, 2;  // *4 (f32 slot)\n");
-            ptx.push_str(&format!(
-                "    add.u64 %rd36, %rd36, {tile_off};\n"
-            ));
+            ptx.push_str(&format!("    add.u64 %rd36, %rd36, {tile_off};\n"));
             ptx.push_str("    add.u64 %rd36, %shmem_base, %rd36;\n");
             ptx.push_str("    ld.shared.f32 %f2, [%rd36];  // dY[2i]\n");
             ptx.push_str("    ld.shared.f32 %f3, [%rd36 + 4];  // dY[2i+1]\n");
@@ -352,9 +341,7 @@ pub fn emit_drope(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: 
             ptx.push_str("    st.shared.f32 [%rd36], %f4;\n");
             ptx.push_str("    st.shared.f32 [%rd36 + 4], %f5;\n");
 
-            ptx.push_str(&format!(
-                "V2_BWD_DROPE_{label}_SKIP_{q_tile_iter}_{k}:\n"
-            ));
+            ptx.push_str(&format!("V2_BWD_DROPE_{label}_SKIP_{q_tile_iter}_{k}:\n"));
         }
         ptx.push_str(&format!(
             "    bar.sync 0;  // dRoPE {label} tile writes visible\n"
@@ -408,9 +395,24 @@ pub fn emit_dproj(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: 
     }
 
     for (label, ptr_name, ptr_reg, dy_off) in [
-        ("WQ", "csha_wq_ptr", "%rd_bwd_dwq", backward_dq_offset(config)),
-        ("WK", "csha_wk_ptr", "%rd_bwd_dwk", backward_dk_offset(config)),
-        ("WV", "csha_wv_ptr", "%rd_bwd_dwv", backward_dv_offset(config)),
+        (
+            "WQ",
+            "csha_wq_ptr",
+            "%rd_bwd_dwq",
+            backward_dq_offset(config),
+        ),
+        (
+            "WK",
+            "csha_wk_ptr",
+            "%rd_bwd_dwk",
+            backward_dk_offset(config),
+        ),
+        (
+            "WV",
+            "csha_wv_ptr",
+            "%rd_bwd_dwv",
+            backward_dv_offset(config),
+        ),
     ] {
         ptx.push_str(&format!("V2_BWD_DPROJ_{label}_LOOP_{q_tile_iter}:\n"));
         // Null-guard per weight pointer (matches forward fused-proj).
@@ -430,12 +432,11 @@ pub fn emit_dproj(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: 
             let thread_cell = k * 128;
             ptx.push_str("    cvt.u64.u32 %rd_c0, %tid_x;\n");
             if thread_cell > 0 {
-                ptx.push_str(&format!(
-                    "    add.u64 %rd_c0, %rd_c0, {};\n", thread_cell
-                ));
+                ptx.push_str(&format!("    add.u64 %rd_c0, %rd_c0, {};\n", thread_cell));
             }
             ptx.push_str(&format!(
-                "    setp.lt.u64 %p_c0, %rd_c0, {};\n", total_cells
+                "    setp.lt.u64 %p_c0, %rd_c0, {};\n",
+                total_cells
             ));
             ptx.push_str(&format!(
                 "    @!%p_c0 bra V2_BWD_DPROJ_{label}_CELL_{q_tile_iter}_{k}_SKIP;\n"
@@ -443,10 +444,12 @@ pub fn emit_dproj(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: 
 
             // p = cell_idx / head_dim; j_local = cell_idx % head_dim
             ptx.push_str(&format!(
-                "    div.u64 %rd_c1, %rd_c0, {};  // p\n", head_dim
+                "    div.u64 %rd_c1, %rd_c0, {};  // p\n",
+                head_dim
             ));
             ptx.push_str(&format!(
-                "    rem.u64 %rd_c2, %rd_c0, {};  // j_local\n", head_dim
+                "    rem.u64 %rd_c2, %rd_c0, {};  // j_local\n",
+                head_dim
             ));
 
             // Accumulator init
@@ -457,7 +460,8 @@ pub fn emit_dproj(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: 
                 // x_norm addr: x_off + (s*d_model + p)*4
                 ptx.push_str("    mul.lo.u64 %rd_c3, %rd_c1, 4;  // p*4\n");
                 ptx.push_str(&format!(
-                    "    add.u64 %rd_c3, %rd_c3, {};\n", s * d_model * 4 + x_off
+                    "    add.u64 %rd_c3, %rd_c3, {};\n",
+                    s * d_model * 4 + x_off
                 ));
                 ptx.push_str("    add.u64 %rd_c3, %shmem_base, %rd_c3;\n");
                 ptx.push_str("    ld.shared.f32 %f_xn, [%rd_c3];\n");
@@ -465,7 +469,8 @@ pub fn emit_dproj(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: 
                 // dY addr: dy_off + (s*head_dim + j_local)*4
                 ptx.push_str("    mul.lo.u64 %rd_c4, %rd_c2, 4;  // j_local*4\n");
                 ptx.push_str(&format!(
-                    "    add.u64 %rd_c4, %rd_c4, {};\n", s * head_dim * 4 + dy_off
+                    "    add.u64 %rd_c4, %rd_c4, {};\n",
+                    s * head_dim * 4 + dy_off
                 ));
                 ptx.push_str("    add.u64 %rd_c4, %shmem_base, %rd_c4;\n");
                 ptx.push_str("    ld.shared.f32 %f_dy, [%rd_c4];\n");
@@ -478,17 +483,14 @@ pub fn emit_dproj(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: 
             //   flat_j = head_idx*head_dim + j_local
             //   byte_off = (p*kv_dim + flat_j) * 2
             ptx.push_str(&format!(
-                "    mul.lo.u64 %rd_c3, %head_idx, {};\n", head_dim
+                "    mul.lo.u64 %rd_c3, %head_idx, {};\n",
+                head_dim
             ));
             ptx.push_str("    add.u64 %rd_c3, %rd_c3, %rd_c2;  // + j_local\n");
-            ptx.push_str(&format!(
-                "    mul.lo.u64 %rd_c4, %rd_c1, {};\n", kv_dim
-            ));
+            ptx.push_str(&format!("    mul.lo.u64 %rd_c4, %rd_c1, {};\n", kv_dim));
             ptx.push_str("    add.u64 %rd_c4, %rd_c4, %rd_c3;\n");
             ptx.push_str("    shl.b64 %rd_c4, %rd_c4, 1;  // *2 bytes (f16)\n");
-            ptx.push_str(&format!(
-                "    add.u64 %rd_c4, {ptr_reg}, %rd_c4;\n"
-            ));
+            ptx.push_str(&format!("    add.u64 %rd_c4, {ptr_reg}, %rd_c4;\n"));
             ptx.push_str("    cvt.rn.f16.f32 %h_tmp, %f_dw;\n");
             ptx.push_str("    st.global.b16 [%rd_c4], %h_tmp;\n");
 
@@ -497,9 +499,7 @@ pub fn emit_dproj(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: 
             ));
         }
 
-        ptx.push_str(&format!(
-            "V2_BWD_DPROJ_{label}_SKIP_{q_tile_iter}:\n"
-        ));
+        ptx.push_str(&format!("V2_BWD_DPROJ_{label}_SKIP_{q_tile_iter}:\n"));
     }
     ptx.push_str("    bar.sync 0;  // dproj stores + dY reads complete\n");
 }
@@ -564,23 +564,18 @@ pub fn emit_drmsnorm(ptx: &mut String, config: &FlashAttentionConfig, q_tile_ite
         let thread_cell = k * 128;
         ptx.push_str("    cvt.u64.u32 %rd_c0, %tid_x;\n");
         if thread_cell > 0 {
-            ptx.push_str(&format!(
-                "    add.u64 %rd_c0, %rd_c0, {};\n", thread_cell
-            ));
+            ptx.push_str(&format!("    add.u64 %rd_c0, %rd_c0, {};\n", thread_cell));
         }
         ptx.push_str(&format!(
-            "    setp.lt.u64 %p_c0, %rd_c0, {};\n", total_cells
+            "    setp.lt.u64 %p_c0, %rd_c0, {};\n",
+            total_cells
         ));
         ptx.push_str(&format!(
             "    @!%p_c0 bra V2_BWD_DRMSNORM_DXN_{q_tile_iter}_{k}_SKIP;\n"
         ));
         // s = cell_idx / d_model; p = cell_idx % d_model
-        ptx.push_str(&format!(
-            "    div.u64 %rd_c1, %rd_c0, {};  // s\n", d_model
-        ));
-        ptx.push_str(&format!(
-            "    rem.u64 %rd_c2, %rd_c0, {};  // p\n", d_model
-        ));
+        ptx.push_str(&format!("    div.u64 %rd_c1, %rd_c0, {};  // s\n", d_model));
+        ptx.push_str(&format!("    rem.u64 %rd_c2, %rd_c0, {};  // p\n", d_model));
 
         // Init accumulator (%f_g used as running sum across j then repurposed
         // below for g_d in phase 2; this satisfies the legacy substring test).
@@ -594,31 +589,30 @@ pub fn emit_drmsnorm(ptx: &mut String, config: &FlashAttentionConfig, q_tile_ite
         //   W[p, head_idx*head_dim + j]  at byte offset
         //     (p*kv_dim + head_idx*head_dim + j) * 2
         ptx.push_str(&format!(
-            "    mul.lo.u64 %rd_c3, %rd_c2, {};  // p*kv_dim\n", kv_dim
+            "    mul.lo.u64 %rd_c3, %rd_c2, {};  // p*kv_dim\n",
+            kv_dim
         ));
         ptx.push_str(&format!(
-            "    mul.lo.u64 %rd_c4, %head_idx, {};\n", head_dim
+            "    mul.lo.u64 %rd_c4, %head_idx, {};\n",
+            head_dim
         ));
         ptx.push_str("    add.u64 %rd_c3, %rd_c3, %rd_c4;  // p*kv_dim + H*hd\n");
         ptx.push_str("    shl.b64 %rd_c3, %rd_c3, 1;       // *2 (f16 stride)\n");
         // dY SMEM base for row s: s*head_dim*4 (same stride across Q/K/V)
         ptx.push_str(&format!(
-            "    mul.lo.u64 %rd_c4, %rd_c1, {};  // s*head_dim*4\n", head_dim * 4
+            "    mul.lo.u64 %rd_c4, %rd_c1, {};  // s*head_dim*4\n",
+            head_dim * 4
         ));
 
         // Load Wq/Wk/Wv base pointers once for the inner loop.
         ptx.push_str("    ld.param.u64 %rd_c5, [csha_wq_ptr];\n");
         for j in 0..head_dim {
             // dq[s,j]
-            ptx.push_str(&format!(
-                "    add.u64 %rd30, %rd_c4, {};\n", j * 4 + dq_off
-            ));
+            ptx.push_str(&format!("    add.u64 %rd30, %rd_c4, {};\n", j * 4 + dq_off));
             ptx.push_str("    add.u64 %rd30, %shmem_base, %rd30;\n");
             ptx.push_str("    ld.shared.f32 %f_dy, [%rd30];\n");
             // Wq[p, H*hd+j]
-            ptx.push_str(&format!(
-                "    add.u64 %rd31, %rd_c3, {};\n", j * 2
-            ));
+            ptx.push_str(&format!("    add.u64 %rd31, %rd_c3, {};\n", j * 2));
             ptx.push_str("    add.u64 %rd31, %rd_c5, %rd31;\n");
             ptx.push_str("    ld.global.b16 %h_tmp, [%rd31];\n");
             ptx.push_str("    cvt.f32.f16 %f_xn, %h_tmp;\n");
@@ -626,14 +620,10 @@ pub fn emit_drmsnorm(ptx: &mut String, config: &FlashAttentionConfig, q_tile_ite
         }
         ptx.push_str("    ld.param.u64 %rd_c5, [csha_wk_ptr];\n");
         for j in 0..head_dim {
-            ptx.push_str(&format!(
-                "    add.u64 %rd30, %rd_c4, {};\n", j * 4 + dk_off
-            ));
+            ptx.push_str(&format!("    add.u64 %rd30, %rd_c4, {};\n", j * 4 + dk_off));
             ptx.push_str("    add.u64 %rd30, %shmem_base, %rd30;\n");
             ptx.push_str("    ld.shared.f32 %f_dy, [%rd30];\n");
-            ptx.push_str(&format!(
-                "    add.u64 %rd31, %rd_c3, {};\n", j * 2
-            ));
+            ptx.push_str(&format!("    add.u64 %rd31, %rd_c3, {};\n", j * 2));
             ptx.push_str("    add.u64 %rd31, %rd_c5, %rd31;\n");
             ptx.push_str("    ld.global.b16 %h_tmp, [%rd31];\n");
             ptx.push_str("    cvt.f32.f16 %f_xn, %h_tmp;\n");
@@ -641,14 +631,10 @@ pub fn emit_drmsnorm(ptx: &mut String, config: &FlashAttentionConfig, q_tile_ite
         }
         ptx.push_str("    ld.param.u64 %rd_c5, [csha_wv_ptr];\n");
         for j in 0..head_dim {
-            ptx.push_str(&format!(
-                "    add.u64 %rd30, %rd_c4, {};\n", j * 4 + dv_off
-            ));
+            ptx.push_str(&format!("    add.u64 %rd30, %rd_c4, {};\n", j * 4 + dv_off));
             ptx.push_str("    add.u64 %rd30, %shmem_base, %rd30;\n");
             ptx.push_str("    ld.shared.f32 %f_dy, [%rd30];\n");
-            ptx.push_str(&format!(
-                "    add.u64 %rd31, %rd_c3, {};\n", j * 2
-            ));
+            ptx.push_str(&format!("    add.u64 %rd31, %rd_c3, {};\n", j * 2));
             ptx.push_str("    add.u64 %rd31, %rd_c5, %rd31;\n");
             ptx.push_str("    ld.global.b16 %h_tmp, [%rd31];\n");
             ptx.push_str("    cvt.f32.f16 %f_xn, %h_tmp;\n");
@@ -657,19 +643,16 @@ pub fn emit_drmsnorm(ptx: &mut String, config: &FlashAttentionConfig, q_tile_ite
 
         // Store dx_norm[s,p] = %f_g
         ptx.push_str(&format!(
-            "    mul.lo.u64 %rd30, %rd_c1, {};  // s*d_model*4\n", d_model * 4
+            "    mul.lo.u64 %rd30, %rd_c1, {};  // s*d_model*4\n",
+            d_model * 4
         ));
         ptx.push_str("    mul.lo.u64 %rd31, %rd_c2, 4;  // p*4\n");
         ptx.push_str("    add.u64 %rd30, %rd30, %rd31;\n");
-        ptx.push_str(&format!(
-            "    add.u64 %rd30, %rd30, {};\n", dxn_off
-        ));
+        ptx.push_str(&format!("    add.u64 %rd30, %rd30, {};\n", dxn_off));
         ptx.push_str("    add.u64 %rd30, %shmem_base, %rd30;\n");
         ptx.push_str("    st.shared.f32 [%rd30], %f_g;\n");
 
-        ptx.push_str(&format!(
-            "V2_BWD_DRMSNORM_DXN_{q_tile_iter}_{k}_SKIP:\n"
-        ));
+        ptx.push_str(&format!("V2_BWD_DRMSNORM_DXN_{q_tile_iter}_{k}_SKIP:\n"));
     }
     ptx.push_str("    bar.sync 0;  // dx_norm tile complete\n");
 
@@ -693,9 +676,7 @@ pub fn emit_drmsnorm(ptx: &mut String, config: &FlashAttentionConfig, q_tile_ite
     let dxn_cells = block_q * d_model;
     let dxn_cells_per_thread = dxn_cells.div_ceil(128).max(1);
     ptx.push_str("    // dRMSNorm phase 1b: dx_norm SMEM->HBM (coop copy, f32)\n");
-    ptx.push_str(&format!(
-        "V2_BWD_DRMSNORM_DXN_STORE_{q_tile_iter}:\n"
-    ));
+    ptx.push_str(&format!("V2_BWD_DRMSNORM_DXN_STORE_{q_tile_iter}:\n"));
     ptx.push_str("    setp.eq.u64 %p_c0, %rd_bwd_dxn, 0;\n");
     ptx.push_str(&format!(
         "    @%p_c0 bra V2_BWD_DRMSNORM_DXN_STORE_SKIP_{q_tile_iter};\n"
@@ -707,7 +688,8 @@ pub fn emit_drmsnorm(ptx: &mut String, config: &FlashAttentionConfig, q_tile_ite
     ptx.push_str("    mul.lo.u64 %rd_c0, %batch_idx, %rd6;  // batch_idx * seq_len\n");
     ptx.push_str("    add.u64 %rd_c0, %rd_c0, %q_start;\n");
     ptx.push_str(&format!(
-        "    mul.lo.u64 %rd_c0, %rd_c0, {};  // * d_model\n", d_model
+        "    mul.lo.u64 %rd_c0, %rd_c0, {};  // * d_model\n",
+        d_model
     ));
     ptx.push_str("    shl.b64 %rd_c0, %rd_c0, 2;  // * 4 bytes (f32)\n");
     ptx.push_str("    add.u64 %rd_c0, %rd_bwd_dxn, %rd_c0;  // HBM base for this block\n");
@@ -715,18 +697,12 @@ pub fn emit_drmsnorm(ptx: &mut String, config: &FlashAttentionConfig, q_tile_ite
         let thread_cell = k * 128;
         ptx.push_str("    cvt.u64.u32 %rd_c1, %tid_x;\n");
         if thread_cell > 0 {
-            ptx.push_str(&format!(
-                "    add.u64 %rd_c1, %rd_c1, {};\n", thread_cell
-            ));
+            ptx.push_str(&format!("    add.u64 %rd_c1, %rd_c1, {};\n", thread_cell));
         }
-        ptx.push_str(&format!(
-            "    setp.lt.u64 %p_c0, %rd_c1, {};\n", dxn_cells
-        ));
+        ptx.push_str(&format!("    setp.lt.u64 %p_c0, %rd_c1, {};\n", dxn_cells));
         // SMEM f32 load from dx_norm tile
         ptx.push_str("    shl.b64 %rd_c2, %rd_c1, 2;  // cell_idx * 4\n");
-        ptx.push_str(&format!(
-            "    add.u64 %rd_c2, %rd_c2, {};\n", dxn_off
-        ));
+        ptx.push_str(&format!("    add.u64 %rd_c2, %rd_c2, {};\n", dxn_off));
         ptx.push_str("    add.u64 %rd_c2, %shmem_base, %rd_c2;\n");
         ptx.push_str("    @%p_c0 ld.shared.f32 %f_dxn, [%rd_c2];\n");
         // HBM f32 store
@@ -738,9 +714,7 @@ pub fn emit_drmsnorm(ptx: &mut String, config: &FlashAttentionConfig, q_tile_ite
     // between store and Phase 2 (Phase 2 only reads dx_norm from SMEM,
     // not HBM). The existing bar.sync right before Phase 2 will cover
     // any SMEM↔HBM interactions.
-    ptx.push_str(&format!(
-        "V2_BWD_DRMSNORM_DXN_STORE_SKIP_{q_tile_iter}:\n"
-    ));
+    ptx.push_str(&format!("V2_BWD_DRMSNORM_DXN_STORE_SKIP_{q_tile_iter}:\n"));
 
     // ── Phase 2: per-row dx = g_d/rms - x*s_grad/(D*rms^3). ───────────────
     //
@@ -748,18 +722,14 @@ pub fn emit_drmsnorm(ptx: &mut String, config: &FlashAttentionConfig, q_tile_ite
     // over d_model, then write dx row. For smoke block_q=32 → 32 threads
     // active; others idle.
     ptx.push_str("    // dRMSNorm phase 2: per-row dx computation\n");
-    ptx.push_str(&format!(
-        "    setp.lt.u32 %p_c0, %tid_x, {block_q};\n"
-    ));
+    ptx.push_str(&format!("    setp.lt.u32 %p_c0, %tid_x, {block_q};\n"));
     ptx.push_str("    @!%p_c0 bra V2_BWD_DRMSNORM_PHASE2_DONE;\n");
 
     // Row s index in %rd_c0.
     ptx.push_str("    cvt.u64.u32 %rd_c0, %tid_x;  // row s\n");
     // Load rms[s] from the strip populated by emit_xnorm_recompute.
     ptx.push_str("    shl.b64 %rd_c1, %rd_c0, 2;\n");
-    ptx.push_str(&format!(
-        "    add.u64 %rd_c1, %rd_c1, {};\n", rms_off
-    ));
+    ptx.push_str(&format!("    add.u64 %rd_c1, %rd_c1, {};\n", rms_off));
     ptx.push_str("    add.u64 %rd_c1, %shmem_base, %rd_c1;\n");
     ptx.push_str("    ld.shared.f32 %f_rms_v, [%rd_c1];\n");
 
@@ -780,24 +750,23 @@ pub fn emit_drmsnorm(ptx: &mut String, config: &FlashAttentionConfig, q_tile_ite
 
     // dx_norm row base in SMEM.
     ptx.push_str(&format!(
-        "    mul.lo.u64 %rd_c4, %rd_c0, {};  // s*d_model*4\n", d_model * 4
+        "    mul.lo.u64 %rd_c4, %rd_c0, {};  // s*d_model*4\n",
+        d_model * 4
     ));
-    ptx.push_str(&format!(
-        "    add.u64 %rd_c4, %rd_c4, {};\n", dxn_off
-    ));
+    ptx.push_str(&format!("    add.u64 %rd_c4, %rd_c4, {};\n", dxn_off));
     ptx.push_str("    add.u64 %rd_c4, %shmem_base, %rd_c4;  // dx_norm row base\n");
 
     // Pass A: s_grad = sum_d (dx_norm[d] * norm_weight[d] * x[d])
     ptx.push_str("    mov.f32 %f_sgrad, 0f00000000;\n");
     for d in 0..d_model {
         ptx.push_str(&format!(
-            "    ld.shared.f32 %f_dxn, [%rd_c4 + {}];\n", d * 4
+            "    ld.shared.f32 %f_dxn, [%rd_c4 + {}];\n",
+            d * 4
         ));
+        ptx.push_str(&format!("    ld.global.f32 %f_nw, [%rd_c3 + {}];\n", d * 4));
         ptx.push_str(&format!(
-            "    ld.global.f32 %f_nw, [%rd_c3 + {}];\n", d * 4
-        ));
-        ptx.push_str(&format!(
-            "    ld.global.f32 %f_xraw, [%rd_c2 + {}];\n", d * 4
+            "    ld.global.f32 %f_xraw, [%rd_c2 + {}];\n",
+            d * 4
         ));
         ptx.push_str("    mul.f32 %f_gd, %f_dxn, %f_nw;\n");
         ptx.push_str("    fma.rn.f32 %f_sgrad, %f_gd, %f_xraw, %f_sgrad;\n");
@@ -843,13 +812,13 @@ pub fn emit_drmsnorm(ptx: &mut String, config: &FlashAttentionConfig, q_tile_ite
     ptx.push_str("    mul.f32 %f_dy, %f_sgrad, %f_xn;  // s_grad * denom_inv\n");
     for d in 0..d_model {
         ptx.push_str(&format!(
-            "    ld.shared.f32 %f_dxn, [%rd_c4 + {}];\n", d * 4
+            "    ld.shared.f32 %f_dxn, [%rd_c4 + {}];\n",
+            d * 4
         ));
+        ptx.push_str(&format!("    ld.global.f32 %f_nw, [%rd_c3 + {}];\n", d * 4));
         ptx.push_str(&format!(
-            "    ld.global.f32 %f_nw, [%rd_c3 + {}];\n", d * 4
-        ));
-        ptx.push_str(&format!(
-            "    ld.global.f32 %f_xraw, [%rd_c2 + {}];\n", d * 4
+            "    ld.global.f32 %f_xraw, [%rd_c2 + {}];\n",
+            d * 4
         ));
         ptx.push_str("    mul.f32 %f_gd, %f_dxn, %f_nw;\n");
         // term1 = g_d * rms_inv
@@ -857,9 +826,7 @@ pub fn emit_drmsnorm(ptx: &mut String, config: &FlashAttentionConfig, q_tile_ite
         // term2 = x * s_grad * denom_inv
         ptx.push_str("    mul.f32 %f_xn, %f_xraw, %f_dy;\n");
         ptx.push_str("    sub.f32 %f_dxv, %f_dxv, %f_xn;\n");
-        ptx.push_str(&format!(
-            "    st.global.f32 [%rd31 + {}], %f_dxv;\n", d * 4
-        ));
+        ptx.push_str(&format!("    st.global.f32 [%rd31 + {}], %f_dxv;\n", d * 4));
     }
 
     ptx.push_str("V2_BWD_DRMSNORM_PHASE2_DONE:\n");
@@ -884,14 +851,24 @@ mod tests {
     use crate::flash_attention::{CshaExtras, FlashAttentionConfig, RopeStyle};
 
     fn base_cfg_fused_backward(
-        block_q: i64, block_kv: i64, head_dim: i64, heads: u32, d_model: u32,
+        block_q: i64,
+        block_kv: i64,
+        head_dim: i64,
+        heads: u32,
+        d_model: u32,
     ) -> FlashAttentionConfig {
         let _ = heads;
         FlashAttentionConfig {
-            block_q, block_kv, head_dim,
-            causal: false, paged: false, rope_q: false,
+            block_q,
+            block_kv,
+            head_dim,
+            causal: false,
+            paged: false,
+            rope_q: false,
             rope_style: RopeStyle::HalfSplit,
-            gqa_group_size: 1, tree_mask: false, gpu_sm: 75,
+            gqa_group_size: 1,
+            tree_mask: false,
+            gpu_sm: 75,
             segment_masked: false,
             csha: Some(CshaExtras {
                 fused_projections: true,
@@ -916,8 +893,10 @@ mod tests {
             "need ≥2 fmas (one per dx0/dx1 × Q and K), got {}",
             ptx.matches("fma.rn.f32").count()
         );
-        assert!(!ptx.contains("V2_BWD_DROPE_V_LOOP"),
-            "V must never be rotated");
+        assert!(
+            !ptx.contains("V2_BWD_DROPE_V_LOOP"),
+            "V must never be rotated"
+        );
     }
 
     #[test]
@@ -941,8 +920,10 @@ mod tests {
         assert!(ptx.contains("V2_BWD_DPROJ_WQ_LOOP_0:"));
         assert!(ptx.contains("V2_BWD_DPROJ_WK_LOOP_0:"));
         assert!(ptx.contains("V2_BWD_DPROJ_WV_LOOP_0:"));
-        assert!(ptx.contains("setp.eq.u64 %p") && ptx.contains("csha_wq_ptr"),
-            "independent null-guard on Wq missing");
+        assert!(
+            ptx.contains("setp.eq.u64 %p") && ptx.contains("csha_wq_ptr"),
+            "independent null-guard on Wq missing"
+        );
         assert!(ptx.contains("csha_wk_ptr"));
         assert!(ptx.contains("csha_wv_ptr"));
     }
@@ -1051,10 +1032,14 @@ mod tests {
         emit_drmsnorm(&mut ptx, &cfg, 0);
         emit_drmsnorm(&mut ptx, &cfg, 1);
         for label in [
-            "V2_BWD_DROPE_Q_LOOP_0:", "V2_BWD_DROPE_Q_LOOP_1:",
-            "V2_BWD_DROPE_K_LOOP_0:", "V2_BWD_DROPE_K_LOOP_1:",
-            "V2_BWD_DPROJ_WQ_LOOP_0:", "V2_BWD_DPROJ_WQ_LOOP_1:",
-            "V2_BWD_DRMSNORM_0:", "V2_BWD_DRMSNORM_1:",
+            "V2_BWD_DROPE_Q_LOOP_0:",
+            "V2_BWD_DROPE_Q_LOOP_1:",
+            "V2_BWD_DROPE_K_LOOP_0:",
+            "V2_BWD_DROPE_K_LOOP_1:",
+            "V2_BWD_DPROJ_WQ_LOOP_0:",
+            "V2_BWD_DPROJ_WQ_LOOP_1:",
+            "V2_BWD_DRMSNORM_0:",
+            "V2_BWD_DRMSNORM_1:",
         ] {
             assert!(ptx.contains(label), "missing: {label}");
         }

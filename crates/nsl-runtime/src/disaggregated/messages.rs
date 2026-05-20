@@ -36,23 +36,20 @@ pub enum RouterMessage {
     /// Router → Prefill: start processing this request's prompt.
     StartPrefill {
         request_id: u64,
-        token_ids_ptr: i64,    // pointer to token array (in shared memory)
+        token_ids_ptr: i64, // pointer to token array (in shared memory)
         num_tokens: u32,
         target_decode_rank: i32,
     },
 
     /// Prefill → Router: prefill complete, KV transferred to decode worker.
-    PrefillComplete {
-        request_id: u64,
-        num_kv_blocks: u32,
-    },
+    PrefillComplete { request_id: u64, num_kv_blocks: u32 },
 
     /// Router → Decode: KV pages incoming, begin autoregressive generation.
     StartDecode {
         request_id: u64,
         prompt_len: u32,
         max_tokens: u32,
-        temperature_bits: u64,  // f64 transmuted to u64 for C repr
+        temperature_bits: u64, // f64 transmuted to u64 for C repr
         top_p_bits: u64,
     },
 
@@ -60,24 +57,31 @@ pub enum RouterMessage {
     TokenGenerated {
         request_id: u64,
         token_id: i64,
-        is_eos: u8,  // 0 = no, 1 = yes
+        is_eos: u8, // 0 = no, 1 = yes
     },
 
     /// Decode → Router: sequence complete, all resources freed.
-    DecodeComplete {
-        request_id: u64,
-        total_tokens: u32,
-    },
+    DecodeComplete { request_id: u64, total_tokens: u32 },
 }
 
 /// Request lifecycle state tracked by the router.
 #[derive(Clone, Debug, PartialEq)]
 pub enum DisaggRequestState {
     Queued,
-    Prefilling { prefill_rank: i32 },
-    Transferring { from_rank: i32, to_rank: i32 },
-    Decoding { decode_rank: i32, tokens_generated: u32 },
-    Complete { total_tokens: u32 },
+    Prefilling {
+        prefill_rank: i32,
+    },
+    Transferring {
+        from_rank: i32,
+        to_rank: i32,
+    },
+    Decoding {
+        decode_rank: i32,
+        tokens_generated: u32,
+    },
+    Complete {
+        total_tokens: u32,
+    },
 }
 
 /// Per-worker metadata tracked by the router.
@@ -106,19 +110,33 @@ impl WorkerHandle {
 pub fn serialize_message(msg: &RouterMessage) -> Vec<u8> {
     let mut buf = Vec::with_capacity(64);
     match msg {
-        RouterMessage::StartPrefill { request_id, token_ids_ptr, num_tokens, target_decode_rank } => {
+        RouterMessage::StartPrefill {
+            request_id,
+            token_ids_ptr,
+            num_tokens,
+            target_decode_rank,
+        } => {
             buf.extend_from_slice(&0u32.to_le_bytes());
             buf.extend_from_slice(&request_id.to_le_bytes());
             buf.extend_from_slice(&token_ids_ptr.to_le_bytes());
             buf.extend_from_slice(&num_tokens.to_le_bytes());
             buf.extend_from_slice(&target_decode_rank.to_le_bytes());
         }
-        RouterMessage::PrefillComplete { request_id, num_kv_blocks } => {
+        RouterMessage::PrefillComplete {
+            request_id,
+            num_kv_blocks,
+        } => {
             buf.extend_from_slice(&1u32.to_le_bytes());
             buf.extend_from_slice(&request_id.to_le_bytes());
             buf.extend_from_slice(&num_kv_blocks.to_le_bytes());
         }
-        RouterMessage::StartDecode { request_id, prompt_len, max_tokens, temperature_bits, top_p_bits } => {
+        RouterMessage::StartDecode {
+            request_id,
+            prompt_len,
+            max_tokens,
+            temperature_bits,
+            top_p_bits,
+        } => {
             buf.extend_from_slice(&2u32.to_le_bytes());
             buf.extend_from_slice(&request_id.to_le_bytes());
             buf.extend_from_slice(&prompt_len.to_le_bytes());
@@ -126,13 +144,20 @@ pub fn serialize_message(msg: &RouterMessage) -> Vec<u8> {
             buf.extend_from_slice(&temperature_bits.to_le_bytes());
             buf.extend_from_slice(&top_p_bits.to_le_bytes());
         }
-        RouterMessage::TokenGenerated { request_id, token_id, is_eos } => {
+        RouterMessage::TokenGenerated {
+            request_id,
+            token_id,
+            is_eos,
+        } => {
             buf.extend_from_slice(&3u32.to_le_bytes());
             buf.extend_from_slice(&request_id.to_le_bytes());
             buf.extend_from_slice(&token_id.to_le_bytes());
             buf.extend_from_slice(&[*is_eos, 0, 0, 0]); // pad to 4 bytes
         }
-        RouterMessage::DecodeComplete { request_id, total_tokens } => {
+        RouterMessage::DecodeComplete {
+            request_id,
+            total_tokens,
+        } => {
             buf.extend_from_slice(&4u32.to_le_bytes());
             buf.extend_from_slice(&request_id.to_le_bytes());
             buf.extend_from_slice(&total_tokens.to_le_bytes());
@@ -156,12 +181,20 @@ pub fn deserialize_message(buf: &[u8]) -> Option<RouterMessage> {
             let token_ids_ptr = i64::from_le_bytes(payload[8..16].try_into().ok()?);
             let num_tokens = u32::from_le_bytes(payload[16..20].try_into().ok()?);
             let target_decode_rank = i32::from_le_bytes(payload[20..24].try_into().ok()?);
-            Some(RouterMessage::StartPrefill { request_id, token_ids_ptr, num_tokens, target_decode_rank })
+            Some(RouterMessage::StartPrefill {
+                request_id,
+                token_ids_ptr,
+                num_tokens,
+                target_decode_rank,
+            })
         }
         1 if payload.len() >= 12 => {
             let request_id = u64::from_le_bytes(payload[0..8].try_into().ok()?);
             let num_kv_blocks = u32::from_le_bytes(payload[8..12].try_into().ok()?);
-            Some(RouterMessage::PrefillComplete { request_id, num_kv_blocks })
+            Some(RouterMessage::PrefillComplete {
+                request_id,
+                num_kv_blocks,
+            })
         }
         2 if payload.len() >= 32 => {
             let request_id = u64::from_le_bytes(payload[0..8].try_into().ok()?);
@@ -169,18 +202,31 @@ pub fn deserialize_message(buf: &[u8]) -> Option<RouterMessage> {
             let max_tokens = u32::from_le_bytes(payload[12..16].try_into().ok()?);
             let temperature_bits = u64::from_le_bytes(payload[16..24].try_into().ok()?);
             let top_p_bits = u64::from_le_bytes(payload[24..32].try_into().ok()?);
-            Some(RouterMessage::StartDecode { request_id, prompt_len, max_tokens, temperature_bits, top_p_bits })
+            Some(RouterMessage::StartDecode {
+                request_id,
+                prompt_len,
+                max_tokens,
+                temperature_bits,
+                top_p_bits,
+            })
         }
         3 if payload.len() >= 17 => {
             let request_id = u64::from_le_bytes(payload[0..8].try_into().ok()?);
             let token_id = i64::from_le_bytes(payload[8..16].try_into().ok()?);
             let is_eos = payload[16];
-            Some(RouterMessage::TokenGenerated { request_id, token_id, is_eos })
+            Some(RouterMessage::TokenGenerated {
+                request_id,
+                token_id,
+                is_eos,
+            })
         }
         4 if payload.len() >= 12 => {
             let request_id = u64::from_le_bytes(payload[0..8].try_into().ok()?);
             let total_tokens = u32::from_le_bytes(payload[8..12].try_into().ok()?);
-            Some(RouterMessage::DecodeComplete { request_id, total_tokens })
+            Some(RouterMessage::DecodeComplete {
+                request_id,
+                total_tokens,
+            })
         }
         _ => None,
     }
@@ -208,7 +254,12 @@ mod tests {
         let bytes = serialize_message(&msg);
         let decoded = deserialize_message(&bytes).unwrap();
         match decoded {
-            RouterMessage::StartPrefill { request_id, token_ids_ptr, num_tokens, target_decode_rank } => {
+            RouterMessage::StartPrefill {
+                request_id,
+                token_ids_ptr,
+                num_tokens,
+                target_decode_rank,
+            } => {
                 assert_eq!(request_id, 42);
                 assert_eq!(token_ids_ptr, 0x1234_5678);
                 assert_eq!(num_tokens, 128);
@@ -220,11 +271,17 @@ mod tests {
 
     #[test]
     fn message_roundtrip_prefill_complete() {
-        let msg = RouterMessage::PrefillComplete { request_id: 7, num_kv_blocks: 16 };
+        let msg = RouterMessage::PrefillComplete {
+            request_id: 7,
+            num_kv_blocks: 16,
+        };
         let bytes = serialize_message(&msg);
         let decoded = deserialize_message(&bytes).unwrap();
         match decoded {
-            RouterMessage::PrefillComplete { request_id, num_kv_blocks } => {
+            RouterMessage::PrefillComplete {
+                request_id,
+                num_kv_blocks,
+            } => {
                 assert_eq!(request_id, 7);
                 assert_eq!(num_kv_blocks, 16);
             }
@@ -246,7 +303,13 @@ mod tests {
         let bytes = serialize_message(&msg);
         let decoded = deserialize_message(&bytes).unwrap();
         match decoded {
-            RouterMessage::StartDecode { request_id, prompt_len, max_tokens, temperature_bits, top_p_bits } => {
+            RouterMessage::StartDecode {
+                request_id,
+                prompt_len,
+                max_tokens,
+                temperature_bits,
+                top_p_bits,
+            } => {
                 assert_eq!(request_id, 99);
                 assert_eq!(prompt_len, 512);
                 assert_eq!(max_tokens, 256);
@@ -259,11 +322,19 @@ mod tests {
 
     #[test]
     fn message_roundtrip_token_generated() {
-        let msg = RouterMessage::TokenGenerated { request_id: 5, token_id: 42, is_eos: 1 };
+        let msg = RouterMessage::TokenGenerated {
+            request_id: 5,
+            token_id: 42,
+            is_eos: 1,
+        };
         let bytes = serialize_message(&msg);
         let decoded = deserialize_message(&bytes).unwrap();
         match decoded {
-            RouterMessage::TokenGenerated { request_id, token_id, is_eos } => {
+            RouterMessage::TokenGenerated {
+                request_id,
+                token_id,
+                is_eos,
+            } => {
                 assert_eq!(request_id, 5);
                 assert_eq!(token_id, 42);
                 assert_eq!(is_eos, 1);
@@ -274,11 +345,17 @@ mod tests {
 
     #[test]
     fn message_roundtrip_decode_complete() {
-        let msg = RouterMessage::DecodeComplete { request_id: 10, total_tokens: 200 };
+        let msg = RouterMessage::DecodeComplete {
+            request_id: 10,
+            total_tokens: 200,
+        };
         let bytes = serialize_message(&msg);
         let decoded = deserialize_message(&bytes).unwrap();
         match decoded {
-            RouterMessage::DecodeComplete { request_id, total_tokens } => {
+            RouterMessage::DecodeComplete {
+                request_id,
+                total_tokens,
+            } => {
                 assert_eq!(request_id, 10);
                 assert_eq!(total_tokens, 200);
             }
@@ -316,10 +393,16 @@ mod tests {
         state = DisaggRequestState::Prefilling { prefill_rank: 0 };
         assert!(matches!(state, DisaggRequestState::Prefilling { .. }));
 
-        state = DisaggRequestState::Transferring { from_rank: 0, to_rank: 2 };
+        state = DisaggRequestState::Transferring {
+            from_rank: 0,
+            to_rank: 2,
+        };
         assert!(matches!(state, DisaggRequestState::Transferring { .. }));
 
-        state = DisaggRequestState::Decoding { decode_rank: 2, tokens_generated: 0 };
+        state = DisaggRequestState::Decoding {
+            decode_rank: 2,
+            tokens_generated: 0,
+        };
         assert!(matches!(state, DisaggRequestState::Decoding { .. }));
 
         state = DisaggRequestState::Complete { total_tokens: 50 };

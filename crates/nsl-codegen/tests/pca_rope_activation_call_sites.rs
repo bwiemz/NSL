@@ -44,9 +44,9 @@ fn registry_getters_are_declared_with_no_params_returning_i64() {
         "nsl_packing_metadata_get_segment_ids",
         "nsl_packing_metadata_get_doc_starts",
     ] {
-        let (_, sig) = fns
-            .get(*getter)
-            .unwrap_or_else(|| panic!("{getter} must be registered in builtins.rs::RUNTIME_FUNCTIONS"));
+        let (_, sig) = fns.get(*getter).unwrap_or_else(|| {
+            panic!("{getter} must be registered in builtins.rs::RUNTIME_FUNCTIONS")
+        });
         assert_eq!(
             sig.params.len(),
             0,
@@ -100,12 +100,11 @@ fn dict_contains_returns_i8_for_runtime_probe() {
     let (_, sig) = fns
         .get("nsl_dict_contains")
         .expect("nsl_dict_contains must be registered for activation probe");
-    assert_eq!(
-        sig.params.len(),
-        2,
-        "(dict_ptr: i64, key_cstr: i64)"
-    );
-    let ret = sig.returns.first().expect("nsl_dict_contains must return i8");
+    assert_eq!(sig.params.len(), 2, "(dict_ptr: i64, key_cstr: i64)");
+    let ret = sig
+        .returns
+        .first()
+        .expect("nsl_dict_contains must return i8");
     assert_eq!(
         ret.value_type.to_string(),
         "i8",

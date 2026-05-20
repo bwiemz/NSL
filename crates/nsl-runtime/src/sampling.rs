@@ -6,7 +6,9 @@ use rand::rngs::StdRng;
 use rand::Rng;
 use rand::SeedableRng;
 
-use crate::cpu::{create_tensor_with_shape_rs, create_tensor_with_shape_rs_dtype, get_shape_vec, get_strides_vec};
+use crate::cpu::{
+    create_tensor_with_shape_rs, create_tensor_with_shape_rs_dtype, get_shape_vec, get_strides_vec,
+};
 use crate::dict::{nsl_dict_new, nsl_dict_set_str};
 use crate::string::nsl_str_from_rust;
 use crate::tensor::NslTensor;
@@ -48,12 +50,19 @@ pub extern "C" fn nsl_tensor_topk(tensor_ptr: i64, k: i64, dim: i64) -> i64 {
 
     // Helper: read tensor element as f64 regardless of dtype
     let read_val = |idx: usize| -> f64 {
-        if in_dtype == 1 { unsafe { *tensor.data_f32().add(idx) as f64 } }
-        else { unsafe { *tensor.data_f64().add(idx) } }
+        if in_dtype == 1 {
+            unsafe { *tensor.data_f32().add(idx) as f64 }
+        } else {
+            unsafe { *tensor.data_f64().add(idx) }
+        }
     };
 
     // Resolve negative dim
-    let d = if dim < 0 { (ndim as i64 + dim) as usize } else { dim as usize };
+    let d = if dim < 0 {
+        (ndim as i64 + dim) as usize
+    } else {
+        dim as usize
+    };
     assert!(d < ndim, "topk: dim {} out of range for ndim {}", dim, ndim);
     let dim_size = shape[d] as usize;
     let k = k as usize;
@@ -80,20 +89,22 @@ pub extern "C" fn nsl_tensor_topk(tensor_ptr: i64, k: i64, dim: i64) -> i64 {
     };
 
     // Number of slices = product of all dims except d
-    let num_slices: usize = shape.iter().enumerate()
+    let num_slices: usize = shape
+        .iter()
+        .enumerate()
         .filter(|&(i, _)| i != d)
         .map(|(_, &s)| s as usize)
         .product();
 
     if ndim == 1 {
         // Simple 1D case
-        let mut pairs: Vec<(f64, usize)> = (0..dim_size)
-            .map(|i| (read_val(i), i))
-            .collect();
+        let mut pairs: Vec<(f64, usize)> = (0..dim_size).map(|i| (read_val(i), i)).collect();
         pairs.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
         for (j, &(val, orig_idx)) in pairs.iter().enumerate().take(k) {
             write_val(j, val);
-            unsafe { *idx_data.add(j) = orig_idx as f64; }
+            unsafe {
+                *idx_data.add(j) = orig_idx as f64;
+            }
         }
     } else {
         // nD case: iterate over slices perpendicular to dim d
@@ -130,7 +141,9 @@ pub extern "C" fn nsl_tensor_topk(tensor_ptr: i64, k: i64, dim: i64) -> i64 {
             for (j, &(val, orig_idx)) in pairs.iter().enumerate().take(k) {
                 let out_offset = out_base + j * out_dim_stride;
                 write_val(out_offset, val);
-                unsafe { *idx_data.add(out_offset) = orig_idx as f64; }
+                unsafe {
+                    *idx_data.add(out_offset) = orig_idx as f64;
+                }
             }
         }
     }
@@ -160,11 +173,17 @@ pub extern "C" fn nsl_tensor_multinomial(tensor_ptr: i64, num_samples: i64) -> i
     let ndim = shape.len();
 
     let read_val = |idx: usize| -> f64 {
-        if in_dtype == 1 { unsafe { *tensor.data_f32().add(idx) as f64 } }
-        else { unsafe { *tensor.data_f64().add(idx) } }
+        if in_dtype == 1 {
+            unsafe { *tensor.data_f32().add(idx) as f64 }
+        } else {
+            unsafe { *tensor.data_f64().add(idx) }
+        }
     };
 
-    assert!(ndim == 1 || ndim == 2, "multinomial: input must be 1D or 2D");
+    assert!(
+        ndim == 1 || ndim == 2,
+        "multinomial: input must be 1D or 2D"
+    );
     let num_samples = num_samples as usize;
 
     let (batch_size, num_categories) = if ndim == 1 {
@@ -242,19 +261,33 @@ pub extern "C" fn nsl_tensor_argmax(tensor_ptr: i64, dim: i64) -> i64 {
     let in_dtype = tensor.dtype;
 
     let read_val = |idx: usize| -> f64 {
-        if in_dtype == 1 { unsafe { *tensor.data_f32().add(idx) as f64 } }
-        else { unsafe { *tensor.data_f64().add(idx) } }
+        if in_dtype == 1 {
+            unsafe { *tensor.data_f32().add(idx) as f64 }
+        } else {
+            unsafe { *tensor.data_f64().add(idx) }
+        }
     };
 
-    let d = if dim < 0 { (ndim as i64 + dim) as usize } else { dim as usize };
-    assert!(d < ndim, "argmax: dim {} out of range for ndim {}", dim, ndim);
+    let d = if dim < 0 {
+        (ndim as i64 + dim) as usize
+    } else {
+        dim as usize
+    };
+    assert!(
+        d < ndim,
+        "argmax: dim {} out of range for ndim {}",
+        dim,
+        ndim
+    );
     let dim_size = shape[d] as usize;
 
     // Output shape: input shape with dim d removed (always f64 — index tensor)
     let out_shape: Vec<i64> = if ndim == 1 {
         vec![1]
     } else {
-        shape.iter().enumerate()
+        shape
+            .iter()
+            .enumerate()
             .filter(|&(i, _)| i != d)
             .map(|(_, &s)| s)
             .collect()
@@ -274,7 +307,9 @@ pub extern "C" fn nsl_tensor_argmax(tensor_ptr: i64, dim: i64) -> i64 {
                 best_idx = i;
             }
         }
-        unsafe { *result_data = best_idx as f64; }
+        unsafe {
+            *result_data = best_idx as f64;
+        }
     } else {
         let outer_dims: Vec<usize> = (0..ndim).filter(|&i| i != d).collect();
         let outer_sizes: Vec<usize> = outer_dims.iter().map(|&i| shape[i] as usize).collect();
@@ -303,7 +338,9 @@ pub extern "C" fn nsl_tensor_argmax(tensor_ptr: i64, dim: i64) -> i64 {
                     best_idx = i;
                 }
             }
-            unsafe { *result_data.add(slice_idx) = best_idx as f64; }
+            unsafe {
+                *result_data.add(slice_idx) = best_idx as f64;
+            }
         }
     }
 
@@ -324,12 +361,24 @@ pub extern "C" fn nsl_tensor_cumsum(tensor_ptr: i64, dim: i64) -> i64 {
     let in_dtype = tensor.dtype;
 
     let read_val = |idx: usize| -> f64 {
-        if in_dtype == 1 { unsafe { *tensor.data_f32().add(idx) as f64 } }
-        else { unsafe { *tensor.data_f64().add(idx) } }
+        if in_dtype == 1 {
+            unsafe { *tensor.data_f32().add(idx) as f64 }
+        } else {
+            unsafe { *tensor.data_f64().add(idx) }
+        }
     };
 
-    let d = if dim < 0 { (ndim as i64 + dim) as usize } else { dim as usize };
-    assert!(d < ndim, "cumsum: dim {} out of range for ndim {}", dim, ndim);
+    let d = if dim < 0 {
+        (ndim as i64 + dim) as usize
+    } else {
+        dim as usize
+    };
+    assert!(
+        d < ndim,
+        "cumsum: dim {} out of range for ndim {}",
+        dim,
+        ndim
+    );
     let dim_size = shape[d] as usize;
 
     let result_ptr = create_tensor_with_shape_rs_dtype(&shape, in_dtype);
@@ -440,7 +489,9 @@ mod tests {
         let t = NslTensor::from_ptr(ptr);
         let data = t.data_f64();
         for (i, &v) in values.iter().enumerate() {
-            unsafe { *data.add(i) = v; }
+            unsafe {
+                *data.add(i) = v;
+            }
         }
         ptr
     }

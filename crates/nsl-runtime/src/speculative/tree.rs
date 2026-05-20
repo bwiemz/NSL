@@ -147,18 +147,28 @@ pub fn build_dynamic_tree(
     expansion_k: usize,
 ) -> SpeculativeTree {
     let mut nodes = vec![TreeNode {
-        parent: -1, depth: 0, token_id: -1,
-        log_prob: 0.0, value: 0.0, accepted: false, is_leaf: true,
+        parent: -1,
+        depth: 0,
+        token_id: -1,
+        log_prob: 0.0,
+        value: 0.0,
+        accepted: false,
+        is_leaf: true,
     }];
     let mut children: Vec<Vec<usize>> = vec![vec![]];
     let mut remaining = token_budget;
 
     while remaining > 0 {
         // Find leaf with highest cumulative value
-        let best_leaf = match nodes.iter().enumerate()
+        let best_leaf = match nodes
+            .iter()
+            .enumerate()
             .filter(|(_, n)| n.is_leaf)
-            .max_by(|a, b| a.1.value.partial_cmp(&b.1.value).unwrap_or(std::cmp::Ordering::Equal))
-        {
+            .max_by(|a, b| {
+                a.1.value
+                    .partial_cmp(&b.1.value)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            }) {
             Some((idx, _)) => idx,
             None => break, // no more leaves
         };
@@ -304,9 +314,8 @@ mod tests {
     #[test]
     fn test_dynamic_tree_budget_respected() {
         // candidates_fn always returns 3 candidates
-        let candidates = |_ctx: &[i64]| -> Vec<(i64, f32)> {
-            vec![(100, -0.1), (101, -0.5), (102, -0.9)]
-        };
+        let candidates =
+            |_ctx: &[i64]| -> Vec<(i64, f32)> { vec![(100, -0.1), (101, -0.5), (102, -0.9)] };
         let tree = build_dynamic_tree(&candidates, 5, 3);
         // Budget=5: should have root + 5 nodes = 6 total
         assert_eq!(tree.nodes.len(), 6);
@@ -330,7 +339,7 @@ mod tests {
         let tree = build_dynamic_tree(&candidates, 3, 2);
         // Should have: root → {10(-0.1), 11(-2.0)} → 10→{20(-0.2)}
         assert_eq!(tree.nodes.len(), 4); // root + 3 nodes
-        // Node 3 (token 20) should be child of node 1 (token 10), not node 2 (token 11)
+                                         // Node 3 (token 20) should be child of node 1 (token 10), not node 2 (token 11)
         assert_eq!(tree.nodes[3].token_id, 20);
         assert_eq!(tree.nodes[3].parent, 1); // parent is token 10
     }
@@ -347,7 +356,7 @@ mod tests {
         assert!(mask[1][0]);
         assert!(mask[1][1]);
         assert!(!mask[1][2]); // A does NOT attend to B
-        // B attends to root, A, and itself
+                              // B attends to root, A, and itself
         assert!(mask[2][0]);
         assert!(mask[2][1]);
         assert!(mask[2][2]);

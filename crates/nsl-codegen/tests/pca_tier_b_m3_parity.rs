@@ -70,7 +70,10 @@ fn tail_padding_has_padding_sentinel() {
 fn single_doc_all_same_segment() {
     let f = &fixture_matrix()[4];
     let ids = segment_ids_from_fixture(f);
-    assert!(ids.iter().all(|&id| id == 0), "single_doc should be entirely doc 0");
+    assert!(
+        ids.iter().all(|&id| id == 0),
+        "single_doc should be entirely doc 0"
+    );
 }
 
 // ── Bit-identical assertion harness (spec §6.1) ──────────────────────────
@@ -83,8 +86,8 @@ fn single_doc_all_same_segment() {
 
 #[cfg(all(feature = "cuda", feature = "debug_kernel_instrumentation"))]
 fn run_bench_capture_output_tensor(fixture: &str, tier_b: &str, seed: u64) -> Vec<u8> {
-    let output_path = std::env::temp_dir()
-        .join(format!("nsl_bench_out_{}_{}_{}.bin", fixture, tier_b, seed));
+    let output_path =
+        std::env::temp_dir().join(format!("nsl_bench_out_{}_{}_{}.bin", fixture, tier_b, seed));
     let bench_bin = env!("CARGO_BIN_EXE_bench");
     let status = std::process::Command::new(bench_bin)
         .args([
@@ -106,9 +109,8 @@ fn run_bench_capture_output_tensor(fixture: &str, tier_b: &str, seed: u64) -> Ve
         "bench failed for fixture={fixture} tier_b={tier_b} (exit code = {:?})",
         status.code()
     );
-    std::fs::read(&output_path).unwrap_or_else(|e| {
-        panic!("failed to read --dump-output file {:?}: {e}", output_path)
-    })
+    std::fs::read(&output_path)
+        .unwrap_or_else(|e| panic!("failed to read --dump-output file {:?}: {e}", output_path))
 }
 
 #[cfg(all(feature = "cuda", feature = "debug_kernel_instrumentation"))]
@@ -211,8 +213,8 @@ fn run_bench_capture_backward_outputs(
     tier_b: &str,
     seed: u64,
 ) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
-    let output_path = std::env::temp_dir()
-        .join(format!("nsl_bench_bwd_{}_{}_{}.bin", fixture, tier_b, seed));
+    let output_path =
+        std::env::temp_dir().join(format!("nsl_bench_bwd_{}_{}_{}.bin", fixture, tier_b, seed));
     let bench_bin = env!("CARGO_BIN_EXE_bench");
     let status = std::process::Command::new(bench_bin)
         .args([
