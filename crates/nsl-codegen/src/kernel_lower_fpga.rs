@@ -50,6 +50,22 @@ use nsl_ast::types::{DimExpr, TypeExpr, TypeExprKind};
 use nsl_ast::Module;
 use nsl_lexer::Interner;
 
+/// Repeated diagnostic strings — promoted to consts so refactors stay in sync
+/// across the multiple error sites that reference the v1 field-naming rule.
+const EXPECTED_FIELD_NAMING: &str = "fields named W1, b1, W2, b2, ... per layer";
+
+/// Parse a `W<i>` or `b<i>` field name into its 1-based layer index.
+/// Returns `None` if the suffix after the prefix char is not a non-empty
+/// run of ASCII digits parseable as `usize`. Rejects `Wfoo` / `bias_alpha`
+/// (silent classification under the old `starts_with` predicate).
+fn parse_layer_index(name: &str, prefix: char) -> Option<usize> {
+    let suffix = name.strip_prefix(prefix)?;
+    if suffix.is_empty() || !suffix.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    suffix.parse::<usize>().ok()
+}
+
 /// Entry point — invoked when the AST→KIR pipeline dispatches on
 /// `target == GpuTarget::Fpga`.
 ///
@@ -80,8 +96,11 @@ pub fn lower(ast: &Module, interner: &Interner) -> Result<KernelIR, FpgaLowering
     }
 
     // ── Classify members into (weights, biases, forward-method) ─────────────
-    let mut weights: Vec<(String, &TypeExpr)> = Vec::new();
-    let mut biases: Vec<(String, &TypeExpr)> = Vec::new();
+    // Tuple shape: (layer_idx, field_name, type_ann). `layer_idx` is parsed
+    // numerically from the `W<i>` / `b<i>` suffix so that W10 sorts after W2,
+    // not before (lexicographic sort silently misorders at >= 10 layers).
+    let mut weights: Vec<(usize, String, &TypeExpr)> = Vec::new();
+    let mut biases: Vec<(usize, String, &TypeExpr)> = Vec::new();
     let mut forward: Option<&FnDef> = None;
 
     for member in &model.members {
@@ -91,18 +110,18 @@ pub fn lower(ast: &Module, interner: &Interner) -> Result<KernelIR, FpgaLowering
                     .resolve(name.0)
                     .ok_or_else(|| FpgaLoweringError::UnsupportedV1Shape {
                         found: "unresolved field symbol".to_string(),
-                        expected: "fields named W1, b1, W2, b2, ... per layer",
+                        expected: EXPECTED_FIELD_NAMING,
                     })?;
-                if field_name.starts_with('W') && field_name.len() > 1 {
-                    weights.push((field_name.to_string(), type_ann));
-                } else if field_name.starts_with('b') && field_name.len() > 1 {
-                    biases.push((field_name.to_string(), type_ann));
+                if let Some(idx) = parse_layer_index(field_name, 'W') {
+                    weights.push((idx, field_name.to_string(), type_ann));
+                } else if let Some(idx) = parse_layer_index(field_name, 'b') {
+                    biases.push((idx, field_name.to_string(), type_ann));
                 } else {
                     return Err(FpgaLoweringError::UnsupportedV1Shape {
                         found: format!(
-                            "model field `{field_name}` (expected W<i> or b<i> only)"
+                            "model field `{field_name}` (expected W<i> or b<i> with digit suffix)"
                         ),
-                        expected: "fields named W1, b1, W2, b2, ... per layer",
+                        expected: EXPECTED_FIELD_NAMING,
                     });
                 }
             }
@@ -128,8 +147,9 @@ pub fn lower(ast: &Module, interner: &Interner) -> Result<KernelIR, FpgaLowering
         }
     }
 
-    weights.sort_by(|(a, _), (b, _)| a.cmp(b));
-    biases.sort_by(|(a, _), (b, _)| a.cmp(b));
+    // Numerical sort by parsed layer index — `W10` correctly follows `W2`.
+    weights.sort_by_key(|(idx, _, _)| *idx);
+    biases.sort_by_key(|(idx, _, _)| *idx);
 
     if weights.is_empty() {
         return Err(FpgaLoweringError::UnsupportedV1Shape {
@@ -142,6 +162,33 @@ pub fn lower(ast: &Module, interner: &Interner) -> Result<KernelIR, FpgaLowering
             found: format!("{} weights, {} biases", weights.len(), biases.len()),
             expected: "equal non-zero counts of W and b fields (one per layer)",
         });
+    }
+
+    // Verify the indices form a contiguous run 1..=N so `W1, W3` without `W2`
+    // errors instead of silently treating them as layers 1 and 2.
+    for (expected, (got, _, _)) in (1..=weights.len()).zip(weights.iter()) {
+        if *got != expected {
+            return Err(FpgaLoweringError::UnsupportedV1Shape {
+                found: format!(
+                    "weight layer indices: {:?}, expected contiguous 1..={}",
+                    weights.iter().map(|(i, _, _)| *i).collect::<Vec<_>>(),
+                    weights.len()
+                ),
+                expected: "weight fields W1, W2, ..., WN with contiguous 1-based indices",
+            });
+        }
+    }
+    for (expected, (got, _, _)) in (1..=biases.len()).zip(biases.iter()) {
+        if *got != expected {
+            return Err(FpgaLoweringError::UnsupportedV1Shape {
+                found: format!(
+                    "bias layer indices: {:?}, expected contiguous 1..={}",
+                    biases.iter().map(|(i, _, _)| *i).collect::<Vec<_>>(),
+                    biases.len()
+                ),
+                expected: "bias fields b1, b2, ..., bN with contiguous 1-based indices",
+            });
+        }
     }
 
     let forward = forward.ok_or_else(|| FpgaLoweringError::UnsupportedV1Shape {
@@ -257,8 +304,8 @@ fn split_return(stmts: &[Stmt]) -> Result<(&[Stmt], &Expr), FpgaLoweringError> {
 fn emit_layer(
     builder: &mut KirBuilder,
     stmt: &Stmt,
-    weight: &(String, &TypeExpr),
-    bias: &(String, &TypeExpr),
+    weight: &(usize, String, &TypeExpr),
+    bias: &(usize, String, &TypeExpr),
     input_var: VarId,
     interner: &Interner,
 ) -> Result<VarId, FpgaLoweringError> {
@@ -282,8 +329,8 @@ fn emit_layer(
 fn emit_return_layer(
     builder: &mut KirBuilder,
     return_expr: &Expr,
-    weight: &(String, &TypeExpr),
-    bias: &(String, &TypeExpr),
+    weight: &(usize, String, &TypeExpr),
+    bias: &(usize, String, &TypeExpr),
     input_var: VarId,
     interner: &Interner,
 ) -> Result<VarId, FpgaLoweringError> {
@@ -296,8 +343,8 @@ fn emit_return_layer(
 fn extract_relu_matmul_bias(
     builder: &mut KirBuilder,
     expr: &Expr,
-    weight: &(String, &TypeExpr),
-    bias: &(String, &TypeExpr),
+    weight: &(usize, String, &TypeExpr),
+    bias: &(usize, String, &TypeExpr),
     input_var: VarId,
     interner: &Interner,
 ) -> Result<VarId, FpgaLoweringError> {
@@ -354,17 +401,17 @@ fn extract_relu_matmul_bias(
 
     // Confirm matmul_w references `self.<weight-name>` and bias_ref references
     // `self.<bias-name>`.
-    confirm_self_field(matmul_w, &weight.0, interner)?;
-    confirm_self_field(bias_ref, &bias.0, interner)?;
+    confirm_self_field(matmul_w, &weight.1, interner)?;
+    confirm_self_field(bias_ref, &bias.1, interner)?;
 
     // Extract weight shape [K, N] and dtypes from the type annotations.
-    let w_shape = tensor_shape_rank2(weight.1, &weight.0)?;
-    let bias_shape = tensor_shape_rank1(bias.1, &bias.0)?;
+    let w_shape = tensor_shape_rank2(weight.2, &weight.1)?;
+    let bias_shape = tensor_shape_rank1(bias.2, &bias.1)?;
     if bias_shape != w_shape[1] {
         return Err(FpgaLoweringError::UnsupportedV1Shape {
             found: format!(
                 "bias `{}` has shape [{}] but weight `{}` has output dim {}",
-                bias.0, bias_shape, weight.0, w_shape[1]
+                bias.1, bias_shape, weight.1, w_shape[1]
             ),
             expected: "bias rank-1 shape [N] matching weight rank-2 shape [K, N]",
         });
@@ -373,8 +420,8 @@ fn extract_relu_matmul_bias(
     let a_kir_dtype = builder
         .var_type(input_var)
         .expect("input_var must have a recorded type");
-    let b_kir_dtype = kir_type_from_tensor(weight.1, interner)?;
-    let out_kir_dtype = kir_type_from_tensor(bias.1, interner)?;
+    let b_kir_dtype = kir_type_from_tensor(weight.2, interner)?;
+    let out_kir_dtype = kir_type_from_tensor(bias.2, interner)?;
 
     let matmul_out = builder.new_typed_var(out_kir_dtype.clone());
     let bias_out = builder.new_typed_var(out_kir_dtype.clone());
@@ -552,6 +599,57 @@ mod tests {
         // Smoke-test only — Task 2.4 ships comprehensive fixture coverage.
         let (ast, interner) = parse_source("");
         let err = lower(&ast, &interner).expect_err("empty module must error");
+        assert!(matches!(err, FpgaLoweringError::UnsupportedV1Shape { .. }));
+    }
+
+    #[test]
+    fn parse_layer_index_rejects_non_digit_suffix() {
+        // Unit-level coverage of the helper itself.
+        assert_eq!(parse_layer_index("W1", 'W'), Some(1));
+        assert_eq!(parse_layer_index("W10", 'W'), Some(10));
+        assert_eq!(parse_layer_index("b3", 'b'), Some(3));
+        assert_eq!(parse_layer_index("Wfoo", 'W'), None);
+        assert_eq!(parse_layer_index("bias_alpha", 'b'), None);
+        assert_eq!(parse_layer_index("W", 'W'), None); // empty suffix
+        assert_eq!(parse_layer_index("W1a", 'W'), None); // mixed
+        assert_eq!(parse_layer_index("b", 'W'), None); // wrong prefix
+    }
+
+    #[test]
+    fn rejects_non_digit_suffix_field_names() {
+        // `Wfoo` is not `W<digits>` — must error, not silently classify as a
+        // weight (the old `starts_with('W')` predicate would have accepted it
+        // and produced a confusing downstream shape error).
+        let src = "\
+model TinyMlp:
+    Wfoo: Tensor<[784, 128], i8>
+    b1: Tensor<[128], i32>
+
+    fn forward(self, x: Tensor<[1, 784], i8>) -> Tensor<[1, 128], i32>:
+        return relu(matmul(x, self.Wfoo) + self.b1)
+";
+        let (ast, interner) = parse_source(src);
+        let err = lower(&ast, &interner).expect_err("Wfoo must reject");
+        assert!(matches!(err, FpgaLoweringError::UnsupportedV1Shape { .. }));
+    }
+
+    #[test]
+    fn rejects_skipped_layer_index() {
+        // W1 + W3 without W2 — must error, not silently re-index as layers
+        // 1 and 2 (lexicographic sort + position-based indexing combo bug).
+        let src = "\
+model TinyMlp:
+    W1: Tensor<[784, 128], i8>
+    b1: Tensor<[128], i32>
+    W3: Tensor<[128, 10], i32>
+    b3: Tensor<[10], i64>
+
+    fn forward(self, x: Tensor<[1, 784], i8>) -> Tensor<[1, 10], i64>:
+        let h = relu(matmul(x, self.W1) + self.b1)
+        return relu(matmul(h, self.W3) + self.b3)
+";
+        let (ast, interner) = parse_source(src);
+        let err = lower(&ast, &interner).expect_err("skipped index must reject");
         assert!(matches!(err, FpgaLoweringError::UnsupportedV1Shape { .. }));
     }
 
