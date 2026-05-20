@@ -32,12 +32,20 @@ libc = "0.2"
 [dev-dependencies]
 tempfile = "3"
 assert_cmd = "2"
+# Used by tools/verify-ort-vendoring.sh to diff vendored ORT struct
+# definitions against upstream headers.
+bindgen = "0.69"
 
 [features]
 default = []
 cuda = ["dep:cudarc"]
 interop = ["dep:hf-hub", "dep:prost", "dep:half", "dep:regex-lite"]
 test-hooks = []
+# M62b Spec C — ONNX Runtime custom op integration. Off by default.
+# When enabled, the .so/.dll exports RegisterCustomOps so ONNX Runtime
+# can load it via SessionOptions::register_custom_ops_library.
+# Vendored against ORT 1.22.x (ORT_API_VERSION=22).
+onnx-rt-op = []
 # Opt-in feature for internal-only benchmark/test surfaces that touch the
 # `assert_tier_b_sentinels` discipline (planner spec §8.5). The associated
 # tests are #![cfg(feature = "bench-internal")]-gated so they don't run in
