@@ -173,12 +173,10 @@ fn c4_placeholder_comment_removed() {
 /// Optional ptxas smoke test — catches assembler errors at lib-test time.
 /// Skipped gracefully when ptxas is not on PATH.
 ///
-/// NOTE: Currently #[ignore] because emit_inner_loop_body uses MMA register names
-/// without the `%` prefix (e.g. `{s_d0, s_d1, ...}` instead of `{%s_d0, %s_d1, ...}`),
-/// which is a pre-existing bug in emit_mma_instruction callers — NOT caused by C4.
-/// Remove #[ignore] when that pre-existing bug is fixed.
+/// The MMA `%` prefix bug (emit_inner_loop_body passing un-prefixed register
+/// names to emit_mma_instruction) was fixed in E1 of Phase 2.5. This test is
+/// now active and should pass on any machine with ptxas on PATH.
 #[test]
-#[ignore = "pre-existing MMA register naming bug (no % prefix) causes ptxas failure unrelated to C4"]
 fn c4_emitted_ptx_ptxas_clean() {
     use std::process::Command;
     let ptx = synthesize_dq_kernel(&canonical_cfg()).unwrap();

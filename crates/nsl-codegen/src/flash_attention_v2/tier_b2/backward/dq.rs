@@ -653,6 +653,20 @@ fn emit_inner_loop_body(ptx: &mut String, config: &FlashAttentionConfig) {
         tier_b2_dq_q_offset, tier_b2_dq_k_offset, tier_b2_dq_dO_offset, tier_b2_dq_v_offset,
     };
 
+    // Convention: emit_load_{a,b}_fragment_smem take register names WITHOUT `%`
+    // prefix (they prepend `%` internally in `ld.shared` instructions).
+    // emit_mma_instruction uses names verbatim — callers MUST supply `%` prefix.
+    // Use pct4/pct2 to build the prefixed variants right before each MMA call.
+    let pct4 = |rs: &[String; 4]| -> [String; 4] {
+        [
+            format!("%{}", rs[0]), format!("%{}", rs[1]),
+            format!("%{}", rs[2]), format!("%{}", rs[3]),
+        ]
+    };
+    let pct2 = |rs: &[String; 2]| -> [String; 2] {
+        [format!("%{}", rs[0]), format!("%{}", rs[1])]
+    };
+
     let hd = config.head_dim as u32;
     // f16 row stride = head_dim * 2 bytes (tightly-packed row-major f16).
     let row_stride_bytes = (hd * 2) as usize;
@@ -718,7 +732,8 @@ fn emit_inner_loop_body(ptx: &mut String, config: &FlashAttentionConfig) {
     // Load K tile as B-fragment — row-major K[bkv, hd] with col_stride = hd * 2
     // byte-aliases to col-major K^T[hd, bkv], producing Q @ K^T in the MMA.
     emit_load_b_fragment_smem(ptx, &b_regs, &k_smem_base, row_stride_bytes);
-    emit_mma_instruction(ptx, &d_regs, &a_regs, &b_regs, &c_regs);
+    // emit_mma_instruction uses names verbatim — pass %-prefixed variants.
+    emit_mma_instruction(ptx, &pct4(&d_regs), &pct4(&a_regs), &pct2(&b_regs), &pct4(&c_regs));
 
     // === P recompute (lane-by-lane, no SMEM) per spec §4.3 step 4 ===
     ptx.push_str("    // === P recompute: P[q,k] = exp(S[q,k] - row_max[q]) * row_sum_recip[q] ===\n");
@@ -760,7 +775,8 @@ fn emit_inner_loop_body(ptx: &mut String, config: &FlashAttentionConfig) {
 
     emit_load_a_fragment_smem(ptx, &dp_a_regs, &do_off_expr, row_stride_bytes);
     emit_load_b_fragment_smem(ptx, &dp_b_regs, &v_off_expr, row_stride_bytes);
-    emit_mma_instruction(ptx, &dp_d_regs, &dp_a_regs, &dp_b_regs, &dp_c_regs);
+    // emit_mma_instruction uses names verbatim — pass %-prefixed variants.
+    emit_mma_instruction(ptx, &pct4(&dp_d_regs), &pct4(&dp_a_regs), &pct2(&dp_b_regs), &pct4(&dp_c_regs));
     ptx.push('\n');
 
     // === dS = P * (dP - D) (lane-by-lane, no SMEM stage yet) ===
@@ -865,9 +881,12 @@ fn emit_inner_loop_body(ptx: &mut String, config: &FlashAttentionConfig) {
     emit_load_b_fragment_smem(ptx, &dq_b_regs, &k_col_off_expr, bkv_eff_col_stride);
 
     // Accumulate into %dq_acc_0_{0..3} (D and C both = dq_acc → MAC).
-    let dq_d_regs: [String; 4] = ["dq_acc_0_0", "dq_acc_0_1", "dq_acc_0_2", "dq_acc_0_3"]
-        .iter().map(|s| s.to_string()).collect::<Vec<_>>().try_into().unwrap();
-    emit_mma_instruction(ptx, &dq_d_regs, &dq_a_regs, &dq_b_regs, &dq_d_regs);
+    // emit_mma_instruction uses names verbatim — build %-prefixed dq_acc array.
+    let dq_d_regs: [String; 4] = [
+        "%dq_acc_0_0".into(), "%dq_acc_0_1".into(),
+        "%dq_acc_0_2".into(), "%dq_acc_0_3".into(),
+    ];
+    emit_mma_instruction(ptx, &dq_d_regs, &pct4(&dq_a_regs), &pct2(&dq_b_regs), &dq_d_regs);
     ptx.push('\n');
 
     ptx.push_str("DS_SKIP_LABEL:\n");
@@ -1112,8 +1131,8 @@ mod tests {
         // The dQ-update MMA must accumulate into %dq_acc_*, not new scratch regs.
         // Specifically: dq_acc_0_0 must appear as both an A/D MMA operand
         // (i.e., inside an mma.sync braced operand list).
-        assert!(ptx.contains("{dq_acc_0_0, dq_acc_0_1, dq_acc_0_2, dq_acc_0_3}"),
-            "expected dq_acc_0_{{0..3}} to be used as MMA D/C operand list, got:\n{ptx}");
+        assert!(ptx.contains("{%dq_acc_0_0, %dq_acc_0_1, %dq_acc_0_2, %dq_acc_0_3}"),
+            "expected %dq_acc_0_{{0..3}} (with %% prefix) to be used as MMA D/C operand list, got:\n{ptx}");
     }
 
     #[test]
