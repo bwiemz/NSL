@@ -90,9 +90,8 @@ impl GpuTarget {
             GpuTarget::WebGpu => FeatureSet::SHARED_MEMORY | FeatureSet::F16_ARITHMETIC,
             GpuTarget::Fpga => {
                 // FPGA target uses the HIR pipeline (kernel_ir → hir::lower →
-                // backend_verilog), not the SIMT FeatureSet model. M57.1 wires
-                // up parse_target to return GpuTarget::Fpga; until then this
-                // arm is unreachable from CLI but defined for exhaustiveness.
+                // backend_verilog), not the SIMT FeatureSet model — return NONE
+                // because no SIMT feature flags apply to dataflow hardware.
                 FeatureSet::NONE
             }
         }
