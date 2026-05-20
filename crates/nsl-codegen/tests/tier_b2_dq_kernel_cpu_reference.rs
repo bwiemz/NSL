@@ -14,13 +14,13 @@
 //!
 //! Tests 2 + 3: `run_b1_forward_for_test` is now wired (H2, Phase 2.5) to the
 //! CPU-naive forward (`nsl_test::cpu_naive_forward`), providing row_max / row_sum /
-//! O as primary reference. `run_dq_kernel_on_gpu` remains unimplemented (H3+H4):
-//! the dQ-kernel emitter is currently a *structural scaffold* (sections, register
-//! decls, MMA chain shape, labels all verified by ~20 ptxas/structural tests) but
-//! is **not data-mobile** — cp.async loads, HBM address derivation, dS SMEM
-//! scatter, col-major K re-stage, tile_skip predicate loads, MMA fragment row/col
-//! setup, and loop back-edges are placeholder comments. H3 wires the GPU launcher
-//! and H4 runs the first GPU parity check.
+//! O as primary reference. `run_dq_kernel_on_gpu` is now wired (H3, Phase 2.5) to
+//! the real `nsl_kernel_launch` FFI — the dQ-kernel emitter is currently a *structural
+//! scaffold* (sections, register decls, MMA chain shape, labels all verified by ~20
+//! ptxas/structural tests) but is **not data-mobile** — cp.async loads, HBM address
+//! derivation, dS SMEM scatter, col-major K re-stage, tile_skip predicate loads, MMA
+//! fragment row/col setup, and loop back-edges are placeholder comments. H4 runs the
+//! first GPU parity check to determine numerical output from the scaffold.
 //!
 //! Spec: docs/superpowers/specs/2026-05-19-csha-tier-b2-phase2-design.md §6.1
 
@@ -29,6 +29,9 @@
 use std::ffi::{c_void, CString};
 
 use nsl_codegen::flash_attention::{CshaExtras, FlashAttentionConfig, RopeStyle};
+use nsl_codegen::flash_attention_v2::smem_layout::{
+    tier_b2_dq_total_smem_bytes, tier_b2_effective_bq,
+};
 use nsl_codegen::flash_attention_v2::tier_b2::backward::d_prepass::synthesize_d_prepass;
 use nsl_codegen::flash_attention_v2::tier_b2::backward::dq::synthesize_dq_kernel;
 use nsl_runtime::{
@@ -285,6 +288,11 @@ fn tier_b2_dq_smoke_canonical() {
     let cfg_c = cfg(32, 32);
     let max_abs = run_dq_kernel_parity(&cfg_c, /*batch=*/ 1, /*heads=*/ 1, /*seq=*/ 32);
     let tol = tol_for_head_dim(cfg_c.head_dim as u32);
+    eprintln!(
+        "[tier_b2_dq_smoke_canonical] bq=32 hd=32 seq=32 batch=1 heads=1 \
+         max_abs={:.6e} tol={:.6e}",
+        max_abs, tol
+    );
     assert!(
         max_abs <= tol,
         "dQ smoke canonical: max_abs {} > tol {} for hd={}",
@@ -300,11 +308,19 @@ fn tier_b2_dq_smoke_canonical() {
 #[ignore]
 fn tier_b2_dq_head_dim_sweep() {
     for &hd in &[32i64, 64, 128] {
-        let bq = if hd >= 128 { 64 } else { 32 };
+        // Path-A schedule per spec §5.2: hd=128 uses bq=32 (SMEM-pressure fallback);
+        // hd=32 and hd=64 use bq=64 (no fallback needed).
+        // Old pre-Path-A code was `if hd >= 128 { 64 } else { 32 }` which hit the
+        // 99 KB SMEM cap at hd=128 — the exact failure mode Path-A's fallback avoids.
+        let bq = if hd == 128 { 32 } else { 64 };
         let cfg_c = cfg(bq, hd);
         let seq = if hd >= 128 { 128 } else { 64 };
         let max_abs = run_dq_kernel_parity(&cfg_c, 1, 1, seq);
         let tol = tol_for_head_dim(hd as u32);
+        eprintln!(
+            "[tier_b2_dq_head_dim_sweep] hd={} bq={} seq={} max_abs={:.6e} tol={:.6e}",
+            hd, bq, seq, max_abs, tol
+        );
         assert!(
             max_abs <= tol,
             "dQ sweep hd={}: max_abs {} > tol {}",
@@ -318,9 +334,9 @@ fn tier_b2_dq_head_dim_sweep() {
 // === Test orchestrator ===
 
 /// Returns max_abs(dQ_gpu - dQ_cpu_reference) over all elements.
-/// Calls into the GPU launcher stubs; the stubs panic via unimplemented!() when
-/// invoked, which means these tests fail loudly until the launchers are wired
-/// during PR-prep / GPU validation.
+/// Calls into the wired GPU launcher (H3, Phase 2.5); H4 will run the first real
+/// GPU parity check to determine whether the structural scaffold produces correct
+/// numerical output.
 fn run_dq_kernel_parity(
     cfg: &FlashAttentionConfig,
     batch: usize,
@@ -346,7 +362,7 @@ fn run_dq_kernel_parity(
     let d = run_d_prepass_on_gpu(&d_prepass_ptx, &d_o, &o, batch, heads, seq, hd);
     let dq_ptx = synthesize_dq_kernel(cfg).expect("dq_kernel synth");
     let dq_gpu = run_dq_kernel_on_gpu(
-        &dq_ptx, &q, &k, &v, &d_o, &row_max, &row_sum, &d, batch, heads, seq, hd,
+        &dq_ptx, cfg, &q, &k, &v, &d_o, &row_max, &row_sum, &d, batch, heads, seq, hd,
     );
     let dq_ref =
         cpu_naive_dq(&q, &k, &v, &d_o, &row_max, &row_sum, &d, batch, heads, seq, hd);
@@ -432,13 +448,13 @@ fn cpu_naive_dq(
 // against H1 outputs without requiring the full B.1 forward FFI stack. The
 // CPU-naive forward also serves as the diagnostic-mode swap target in Phase 2.6.
 //
-// `run_dq_kernel_on_gpu` remains unimplemented: **gated on Phase 2.5 H3+H4**.
+// `run_dq_kernel_on_gpu` is now wired (H3, Phase 2.5) against the real
+// `nsl_kernel_launch` FFI with the dQ-kernel's 12-param entry signature.
 // The dQ-kernel emitter is currently a structural scaffold (sections + register
 // decls + MMA chain + labels) with cp.async loads, HBM address derivation, dS
 // SMEM scatter, col-major K re-stage, tile_skip predicate, MMA fragment row/col
 // setup, and loop back-edges shipped as PTX comments rather than emitted
-// instructions. A launched dQ-kernel would read uninitialized SMEM. H3 wires
-// the GPU launcher and H4 runs the first GPU parity check.
+// instructions. H4 runs the first GPU parity check on the wired scaffold.
 
 /// Phase-2.5 H2: primary-reference forward producing (row_max, row_sum, O) via
 /// the CPU-naive forward (`nsl_test::cpu_naive_forward::cpu_naive_forward`).
@@ -470,31 +486,143 @@ fn run_b1_forward_for_test(
     (out.row_max, out.row_sum, out.o)
 }
 
-/// Phase-2.5-gated stub for the dQ-kernel GPU launcher.
+/// Phase-2.5 H3: dQ-kernel GPU launcher wired against the real `nsl_kernel_launch` FFI.
+///
+/// Mirrors `run_d_prepass_on_gpu` but extended for the dQ-kernel's 12-param entry
+/// signature (Q, K, V, dO, row_max, row_sum, D, segment_ids, dQ_out, seq, heads, batch).
+/// Takes `cfg` so it can derive effective_bq (Path-A schedule) and total SMEM bytes.
+///
+/// HBM layout:
+///   - Q/K/V/dO: [batch, heads, seq, hd] f16 → 2 bytes/element
+///   - row_max/row_sum/D: [batch, heads, seq] f32 → 4 bytes/element
+///   - dQ_out: [batch, heads, seq, hd] f32 → 4 bytes/element
+///   - segment_ids: null (0) — no segment masking in Phase 2.5
+///
+/// Grid: (ceil(seq / effective_bq), heads, batch). Block: (128, 1, 1) (4 warps).
+/// Dynamic SMEM: tier_b2_dq_total_smem_bytes(cfg).
 fn run_dq_kernel_on_gpu(
-    _ptx: &str,
-    _q: &[half::f16],
-    _k: &[half::f16],
-    _v: &[half::f16],
-    _d_o: &[half::f16],
-    _row_max: &[f32],
-    _row_sum: &[f32],
-    _d: &[f32],
+    ptx: &str,
+    cfg: &FlashAttentionConfig,
+    q: &[half::f16],
+    k: &[half::f16],
+    v: &[half::f16],
+    d_o: &[half::f16],
+    row_max: &[f32],
+    row_sum: &[f32],
+    d: &[f32],
     batch: usize,
     heads: usize,
     seq: usize,
     hd: usize,
 ) -> Vec<f32> {
-    let _ = (batch, heads, seq, hd);
-    unimplemented!(
-        "run_dq_kernel_on_gpu: gated on Phase 2.5 (dQ-kernel data-mobility). \
-         The current emitter ships a structural scaffold; launching it would \
-         read uninitialized SMEM. See dq.rs — cp.async / HBM addressing / dS \
-         scatter / K re-stage / tile_skip / MMA-fragment-setup / loop \
-         back-edges are placeholder comments."
+    let in_4d_bytes = (batch * heads * seq * hd * 2) as i64; // f16
+    let in_3d_bytes = (batch * heads * seq * 4) as i64;       // f32
+    let out_bytes   = (batch * heads * seq * hd * 4) as i64;  // f32
+
+    let q_dev    = nsl_test_cuda_alloc(in_4d_bytes);
+    let k_dev    = nsl_test_cuda_alloc(in_4d_bytes);
+    let v_dev    = nsl_test_cuda_alloc(in_4d_bytes);
+    let do_dev   = nsl_test_cuda_alloc(in_4d_bytes);
+    let rmax_dev = nsl_test_cuda_alloc(in_3d_bytes);
+    let rsum_dev = nsl_test_cuda_alloc(in_3d_bytes);
+    let d_dev    = nsl_test_cuda_alloc(in_3d_bytes);
+    let dq_dev   = nsl_test_cuda_alloc(out_bytes);
+    assert!(
+        q_dev != 0 && k_dev != 0 && v_dev != 0 && do_dev != 0
+            && rmax_dev != 0 && rsum_dev != 0 && d_dev != 0 && dq_dev != 0,
+        "dQ-kernel device alloc failed"
     );
-    #[allow(unreachable_code)]
-    vec![0.0f32; batch * heads * seq * hd]
+
+    nsl_test_cuda_h2d(q_dev,    q.as_ptr()       as i64, in_4d_bytes);
+    nsl_test_cuda_h2d(k_dev,    k.as_ptr()       as i64, in_4d_bytes);
+    nsl_test_cuda_h2d(v_dev,    v.as_ptr()       as i64, in_4d_bytes);
+    nsl_test_cuda_h2d(do_dev,   d_o.as_ptr()     as i64, in_4d_bytes);
+    nsl_test_cuda_h2d(rmax_dev, row_max.as_ptr() as i64, in_3d_bytes);
+    nsl_test_cuda_h2d(rsum_dev, row_sum.as_ptr() as i64, in_3d_bytes);
+    nsl_test_cuda_h2d(d_dev,    d.as_ptr()       as i64, in_3d_bytes);
+
+    let ptx_bytes   = ptx_to_cstr_bytes(ptx);
+    let kernel_name = CString::new("tier_b2_dq_kernel").unwrap();
+
+    let mut q_p    = q_dev    as u64;
+    let mut k_p    = k_dev    as u64;
+    let mut v_p    = v_dev    as u64;
+    let mut do_p   = do_dev   as u64;
+    let mut rmax_p = rmax_dev as u64;
+    let mut rsum_p = rsum_dev as u64;
+    let mut d_p    = d_dev    as u64;
+    let mut seg_p  = 0u64; // null — no segment masking in Phase 2.5
+    let mut dq_p   = dq_dev   as u64;
+    let mut seq_u32   = seq   as u32;
+    let mut heads_u32 = heads as u32;
+    let mut batch_u32 = batch as u32;
+
+    let args: [*mut c_void; 12] = [
+        &mut q_p    as *mut _ as *mut c_void,
+        &mut k_p    as *mut _ as *mut c_void,
+        &mut v_p    as *mut _ as *mut c_void,
+        &mut do_p   as *mut _ as *mut c_void,
+        &mut rmax_p as *mut _ as *mut c_void,
+        &mut rsum_p as *mut _ as *mut c_void,
+        &mut d_p    as *mut _ as *mut c_void,
+        &mut seg_p  as *mut _ as *mut c_void,
+        &mut dq_p   as *mut _ as *mut c_void,
+        &mut seq_u32   as *mut _ as *mut c_void,
+        &mut heads_u32 as *mut _ as *mut c_void,
+        &mut batch_u32 as *mut _ as *mut c_void,
+    ];
+
+    let bq         = tier_b2_effective_bq(cfg) as i64;
+    let grid_x     = ((seq as i64) + bq - 1) / bq;
+    let smem_bytes = tier_b2_dq_total_smem_bytes(cfg) as i64;
+
+    let rc = unsafe {
+        nsl_kernel_launch(
+            ptx_bytes.as_ptr() as i64,
+            kernel_name.as_ptr() as i64,
+            grid_x,
+            heads as i64,
+            batch as i64,
+            128, 1, 1,
+            args.as_ptr() as i64,
+            args.len() as i64,
+            smem_bytes,
+        )
+    };
+
+    if rc != 0 {
+        let log_ptr = nsl_test_cuda_jit_log(ptx_bytes.as_ptr() as i64);
+        let log = if log_ptr != 0 {
+            unsafe {
+                std::ffi::CStr::from_ptr(log_ptr as *const i8)
+                    .to_string_lossy()
+                    .into_owned()
+            }
+        } else {
+            "<no JIT log>".into()
+        };
+        nsl_test_cuda_free(q_dev);
+        nsl_test_cuda_free(k_dev);
+        nsl_test_cuda_free(v_dev);
+        nsl_test_cuda_free(do_dev);
+        nsl_test_cuda_free(rmax_dev);
+        nsl_test_cuda_free(rsum_dev);
+        nsl_test_cuda_free(d_dev);
+        nsl_test_cuda_free(dq_dev);
+        panic!("dQ-kernel launch failed rc={rc}\nJIT log:\n{log}");
+    }
+
+    let mut dq_host = vec![0.0f32; batch * heads * seq * hd];
+    nsl_test_cuda_d2h(dq_host.as_mut_ptr() as i64, dq_dev, out_bytes);
+    nsl_test_cuda_free(q_dev);
+    nsl_test_cuda_free(k_dev);
+    nsl_test_cuda_free(v_dev);
+    nsl_test_cuda_free(do_dev);
+    nsl_test_cuda_free(rmax_dev);
+    nsl_test_cuda_free(rsum_dev);
+    nsl_test_cuda_free(d_dev);
+    nsl_test_cuda_free(dq_dev);
+    dq_host
 }
 
 /// D pre-pass GPU launcher.
