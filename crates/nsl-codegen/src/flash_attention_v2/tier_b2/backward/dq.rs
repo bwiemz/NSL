@@ -121,6 +121,10 @@ fn emit_register_decls(ptx: &mut String, _config: &FlashAttentionConfig) {
     // Prefixed %c1_* to avoid clashes with C2/C3/C4 register namespaces.
     ptx.push_str("    .reg .u32 %c1_q_tile_start, %c1_lane_byte_off, %c1_smem_base32, %c1_smem_dst;\n");
     ptx.push_str("    .reg .u64 %c1_q_hbm_off, %c1_q_hbm_base, %c1_lane_hbm_addr, %c1_smem_base64;\n");
+    // C2 cp.async dO-tile registers. Prefixed %c2_* to avoid clashes with C1/C3/C4 namespaces.
+    // dO tile is [effective_bq, hd] f16, same shape as Q. Resident across kv_iter (loaded once).
+    ptx.push_str("    .reg .u32 %c2_do_tile_start, %c2_lane_byte_off, %c2_smem_base32, %c2_smem_dst;\n");
+    ptx.push_str("    .reg .u64 %c2_do_hbm_off, %c2_do_hbm_base, %c2_lane_hbm_addr, %c2_smem_base64;\n");
     ptx.push('\n');
 }
 
@@ -185,8 +189,7 @@ fn emit_q_dO_producer_load(ptx: &mut String, config: &FlashAttentionConfig) {
     ptx.push_str("    // Warp 0 (producer): issue cp.async for Q + dO tiles.\n");
     ptx.push_str("    // Warps 1-3 (consumers): wait on cp.async.wait_group.\n");
     emit_q_producer_load(ptx, config);
-    // dO half deferred to C2 — keep the existing comment placeholder.
-    ptx.push_str("    // cp.async dO tile -> shmem[+dO_offset]  (C2 will replace)\n");
+    emit_dO_producer_load(ptx, config);
     ptx.push_str("    cp.async.commit_group;\n");
     ptx.push_str("DQ_PROD_LOAD_DONE:\n");
     ptx.push_str("    cp.async.wait_group 0;\n");
@@ -289,6 +292,98 @@ fn emit_q_producer_load(ptx: &mut String, config: &FlashAttentionConfig) {
         ));
     }
     // commit_group emitted by caller (emit_q_dO_producer_load) after dO part lands (C2).
+}
+
+/// C2: emit the cp.async load for the dO tile [effective_bq, hd] f16 into SMEM.
+///
+/// dO is **resident across kv_iter** (spec §1.3) — loaded once at q_iter open,
+/// not per-kv-block.  Same tile shape as Q.  HBM source: `d_o_ptr` param.
+/// SMEM destination: `tier_b2_dq_dO_offset(config)` bytes from shmem base.
+///
+/// Uses A1's `emit_4d_byte_offset` for HBM addressing (same as C1).  Register
+/// naming prefix `%c2_` prevents clashes with C1/C3/C4 register namespaces.
+///
+/// The warp-0 gate (`@!%p_producer bra DQ_PROD_LOAD_DONE`) is emitted by the
+/// caller (`emit_q_dO_producer_load`) — shared with C1, no duplicate branch here.
+#[allow(non_snake_case)]
+fn emit_dO_producer_load(ptx: &mut String, config: &FlashAttentionConfig) {
+    use crate::flash_attention_v2::smem_layout::{tier_b2_effective_bq, tier_b2_dq_dO_offset};
+
+    let bq = tier_b2_effective_bq(config);
+    let hd = config.head_dim as u32;
+    let do_smem_off = tier_b2_dq_dO_offset(config);
+
+    // Total dO tile bytes = bq * hd * 2 (f16).  Distributed across 32 lanes:
+    //   bytes_per_lane = (bq * hd * 2) / 32
+    //   chunks_per_lane = bytes_per_lane / 4  (each cp.async.ca issues b32 = 4 bytes)
+    let total_bytes = bq * hd * 2;
+    let bytes_per_lane = total_bytes / 32;
+    let chunks_per_lane = bytes_per_lane / 4;
+    debug_assert!(
+        chunks_per_lane >= 1,
+        "dO tile must have at least one b32 chunk per lane (bq={}, hd={})",
+        bq, hd
+    );
+
+    ptx.push_str(&format!(
+        "    // === C2: cp.async dO tile [bq={bq}, hd={hd}] f16 -> SMEM[+dO_offset={do_smem_off}] ===\n"
+    ));
+    // All %c2_* registers declared in emit_register_decls (PTX ISA: decls before exec instrs).
+
+    // do_tile_start = q_iter * bq (first sequence position of this dO tile — same as Q).
+    ptx.push_str(&format!(
+        "    // do_tile_start = q_iter * {bq} (dO tile rows are Q-aligned; resident across kv_iter)\n"
+    ));
+    ptx.push_str(&format!(
+        "    mul.lo.u32 %c2_do_tile_start, %q_iter, {bq};\n"
+    ));
+
+    // HBM byte offset for dO[batch_idx, head, do_tile_start, 0] using A1's helper.
+    // emit_4d_byte_offset uses %row_index_tmp as scratch (declared in emit_register_decls).
+    crate::flash_attention_v2::tier_b2::backward::dq::hbm_addr::emit_4d_byte_offset(
+        ptx,
+        "%c2_do_hbm_off",
+        "%batch_idx",
+        "%head",
+        "%c2_do_tile_start",
+        "0",         // d=0: column index within the row (full row loaded via multi-chunk loop)
+        "%heads_r",
+        "%seq_len_r",
+        hd,          // D = head_dim
+        2,           // sizeof(f16) = 2
+    );
+
+    // HBM source base: load d_o_ptr from param space.
+    ptx.push_str("    ld.param.u64 %c2_do_hbm_base, [d_o_ptr];\n");
+    ptx.push_str("    add.u64 %c2_do_hbm_base, %c2_do_hbm_base, %c2_do_hbm_off;\n");
+
+    // Per-lane byte offset within the tile: lane_id * 4 bytes.
+    ptx.push_str("    shl.b32 %c2_lane_byte_off, %lane_id, 2;  // lane_id * 4 bytes\n");
+
+    // HBM address for this lane = base + lane_byte_off.
+    ptx.push_str("    cvt.u64.u32 %c2_lane_hbm_addr, %c2_lane_byte_off;\n");
+    ptx.push_str("    add.u64 %c2_lane_hbm_addr, %c2_lane_hbm_addr, %c2_do_hbm_base;\n");
+
+    // SMEM destination: u32 shared-space address via cvta.shared.u64 + cvt.u32.u64 + dO_offset.
+    ptx.push_str("    cvta.shared.u64 %c2_smem_base64, shmem;\n");
+    ptx.push_str("    cvt.u32.u64 %c2_smem_base32, %c2_smem_base64;\n");
+    // dO_offset > 0 (dO follows Q, K, V tiles), so always add the offset.
+    ptx.push_str(&format!(
+        "    add.u32 %c2_smem_base32, %c2_smem_base32, {do_smem_off};  // +dO_offset\n"
+    ));
+    // Add per-lane byte offset to SMEM destination.
+    ptx.push_str("    add.u32 %c2_smem_dst, %c2_smem_base32, %c2_lane_byte_off;\n");
+
+    // Emit cp.async.ca.shared.global for each chunk per lane.
+    // Chunk stride across lanes = 32 * 4 = 128 bytes per chunk iteration.
+    let chunk_stride = 32 * 4u32; // 32 lanes * 4 bytes each
+    for chunk_idx in 0..chunks_per_lane {
+        let chunk_off = chunk_idx * chunk_stride;
+        ptx.push_str(&format!(
+            "    cp.async.ca.shared.global [%c2_smem_dst + {chunk_off}], [%c2_lane_hbm_addr + {chunk_off}], 4;\n"
+        ));
+    }
+    // commit_group emitted by caller (emit_q_dO_producer_load) after both C1 and C2 land.
 }
 
 fn emit_dq_acc_init(ptx: &mut String, config: &FlashAttentionConfig) {
