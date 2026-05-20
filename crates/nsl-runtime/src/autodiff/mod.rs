@@ -251,22 +251,41 @@ pub fn is_recording() -> bool {
 
 /// Debug-only invariant check for `desc_to_nsl_tensor`'s tape_id import path.
 ///
+/// # Same-thread precondition (load-bearing)
+///
+/// This function is **only sound when called on the same thread that wrote
+/// the desc**. Currently enforced by call-site discipline:
+///   - `desc_to_nsl_tensor` is invoked from `nsl_model_forward_grad`
+///     (grad_context.rs:283, 322) and from the codegen-emitted typed
+///     wrappers. Both run on the thread that just executed the forward
+///     pass, which is the thread whose `TAPE.next_id` advanced past
+///     `desc.tape_id`. `nsl_model_backward(ctx)` never calls
+///     `desc_to_nsl_tensor` — it consumes `ctx.output_ptrs` directly.
+///   - `GradContext` is `Send + !Sync`, so it can be moved across threads
+///     after construction, but the desc round-trip has already happened
+///     before the move.
+///
+/// **If a future caller invokes `desc_to_nsl_tensor` from a different
+/// thread than the producer**, this assert will fire (in debug) because
+/// the consumer thread's `next_id` starts at 1 and any non-zero
+/// `desc.tape_id` would trip `tape_id < next_id`. In release builds the
+/// assertion is elided, so the consumer would silently misattribute the
+/// loss seed — same failure class as the original bug. Audit any new
+/// `desc_to_nsl_tensor` call site for this precondition.
+///
+/// # Monotonicity invariant
+///
 /// `Tape::next_id` is monotonic for the lifetime of the thread (initialized
 /// to 1 by `Tape::new`, only mutated by `get_or_assign_id`'s `+= 1`, never
 /// reset — both `nsl_tape_start` and `nsl_tape_stop` have explicit
 /// "Do NOT reset next_id" comments). So any tape_id observed in a desc on
-/// this thread was assigned at a moment when `next_id` was at most
+/// the producing thread was assigned at a moment when `next_id` was at most
 /// `tape_id`, and `next_id` has only grown since.
 ///
-/// A violation of `tape_id < next_id` would mean either:
-///   - a future change introduced a `next_id` reset, silently re-using ids
-///     across forwards (Case A: cross-generation misattribution), or
-///   - a desc was constructed on a different thread (cross-thread import
-///     is not currently a supported path; `GradContext` is `Send + !Sync`
-///     but its output_ptrs are constructed on the producing thread).
-///
-/// Either case would produce wrong-but-plausible backward grads. The
-/// assertion fires loudly at the import boundary instead.
+/// A violation of `tape_id < next_id` (on a same-thread call) would mean
+/// a future change introduced a `next_id` reset, silently re-using ids
+/// across forwards. The assertion fires loudly at the import boundary
+/// instead of producing wrong-but-plausible backward grads.
 ///
 /// Threshold note: in the special case that the assert runs on a thread
 /// whose tape has never recorded (e.g., a Python helper thread that

@@ -264,8 +264,7 @@ def _numpy_to_dlpack(array: Any, lib: ctypes.CDLL) -> int:
     if not array.flags.c_contiguous:
         array = np.ascontiguousarray(array)
 
-    # Create NslTensor from numpy via the C API
-    from nslpy._core import _check_error
+    # Create NslTensor from numpy via the C API.
     # For now, use a simple approach: convert to torch first if available
     try:
         import torch
