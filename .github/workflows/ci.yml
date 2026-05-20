@@ -140,3 +140,74 @@ jobs:
               issue_number: context.issue.number,
               body: '## merge-gate-preview output\n\n```\n' + truncated + '\n```\n\n_Reviewer: evaluate this output before approving the `#[ignore]` flip in commit 2. Failure does not block merge of commit 1._',
             });
+
+  # M62b Spec C — ONNX Runtime custom op integration tests.
+  # Always runs on PRs and pushes to main. The job is cheap (~5 min) and
+  # the Rust-side gated tests don't require an ORT install; only the Python
+  # E2E step does. Spec §3.4 (separate CI job; default loop stays ORT-free)
+  # is honored because the steps that touch ORT runtime are isolated here —
+  # the main `build-and-test` job above does NOT compile the onnx-rt-op
+  # feature.
+  test-onnx-rt:
+    name: M62b Spec C — ONNX RT integration
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust 1.95.0
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+          components: clippy
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-onnxrt-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Install bindgen-cli
+        run: cargo install bindgen-cli --locked
+
+      - name: Install ONNX Runtime 1.22.0
+        run: |
+          wget -q https://github.com/microsoft/onnxruntime/releases/download/v1.22.0/onnxruntime-linux-x64-1.22.0.tgz
+          tar -xzf onnxruntime-linux-x64-1.22.0.tgz
+          echo "$PWD/onnxruntime-linux-x64-1.22.0/lib" >> $GITHUB_PATH
+          echo "ORT_HOME=$PWD/onnxruntime-linux-x64-1.22.0" >> $GITHUB_ENV
+          echo "LD_LIBRARY_PATH=$PWD/onnxruntime-linux-x64-1.22.0/lib:${LD_LIBRARY_PATH:-}" >> $GITHUB_ENV
+
+      - name: Verify vendoring matches upstream
+        run: bash tools/verify-ort-vendoring.sh
+
+      - name: Build with onnx-rt-op feature
+        run: cargo build --workspace --features onnx-rt-op
+
+      - name: Cargo test (onnx-rt-op feature)
+        # Only run the Spec C integration tests; the rest of the workspace
+        # is already covered by `build-and-test` above without the feature.
+        run: |
+          cargo test -p nsl-runtime --features onnx-rt-op \
+            --test onnx_rt_compute_bridge \
+            --test onnx_rt_register_custom_ops
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python deps for E2E
+        run: pip install onnxruntime==1.22.0 onnx pytest numpy
+
+      - name: Build nsl-cli with onnx-rt-op
+        run: cargo build -p nsl-cli --features onnx-rt-op
+
+      - name: Python E2E (gated)
+        env:
+          NSL_TEST_ONNX_RT: "1"
+          NSL_BIN: ${{ github.workspace }}/target/debug/nsl
+        working-directory: python
+        run: python -m pytest tests/test_m62_onnx_op.py -v
