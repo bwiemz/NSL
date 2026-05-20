@@ -10,25 +10,35 @@ pub fn emit_signal_ref(s: &SignalRef) -> String {
         SignalRef::Register(r) => format!("_r{}", r.0),
         SignalRef::Port(name) => name.clone(),
         SignalRef::LocalParam(name) => name.clone(),
-        // M57.1 wire-array realization: variant added in Task W1 (HIR
-        // primitive). Verilog emission for indexed wire-array reads lands
-        // in a subsequent W-task (templates extension). Until then, no
-        // codegen pass should produce this variant; reaching here means a
-        // pass started emitting wire-array refs before the templates were
-        // taught how.
-        SignalRef::WireArrayElement { .. } => {
-            unreachable!(
-                "SignalRef::WireArrayElement emission not yet implemented \
-                 (M57.1 wire-array realization Task W1 added the HIR \
-                 primitive; Verilog template support arrives in a follow-up \
-                 W-task)"
-            )
+        // M57.1 wire-array realization (Task W2): indexed wire-array read.
+        // Mechanical lowering — each IndexExpr variant has one fixed Verilog
+        // form. Construction-time invariant (`indices.len() == dims.len()`)
+        // is enforced by callers; emitter assumes well-formed HIR.
+        SignalRef::WireArrayElement { array_name, indices } => {
+            let idx_str: String = indices.iter()
+                .map(|ix| match ix {
+                    IndexExpr::Literal(n) => format!("[{}]", n),
+                    IndexExpr::Genvar(name) => format!("[{}]", name),
+                    IndexExpr::GenvarPlus(name, k) => format!("[({} + {})]", name, k),
+                })
+                .collect();
+            format!("{}{}", array_name, idx_str)
         }
     }
 }
 
 pub fn emit_wire(w: &Wire) -> String {
     format!("wire signed [{}:0] _w{};", w.width - 1, w.id.0)
+}
+
+/// M57.1 wire-array realization (Task W2): module-scope multi-dim wire decl.
+/// Mechanical lowering — emits `wire signed [W-1:0] name [0:dims[0]-1]...;`
+/// (single space after name, no separator between dim brackets).
+pub fn emit_wire_array(wa: &WireArray) -> String {
+    let dims_str: String = wa.dims.iter()
+        .map(|d| format!("[0:{}]", d - 1))
+        .collect();
+    format!("wire signed [{}:0] {} {};", wa.width - 1, wa.name, dims_str)
 }
 
 pub fn emit_local_param(lp: &LocalParam) -> String {
@@ -202,20 +212,9 @@ pub fn emit_node(
         HirNode::SignExtend(s) => format!("{pad}{}", emit_sign_extend(s)),
         HirNode::GenerateFor(g) => emit_generate_for(g, indent, clock_domains, reset_signals),
         HirNode::GenerateIf(g) => emit_generate_if(g, indent, clock_domains, reset_signals),
-        // M57.1 wire-array realization: variant added in Task W1 (HIR
-        // primitive). Verilog emission for `wire signed [W-1:0] name [..][..];`
-        // declarations lands in a subsequent W-task (templates extension).
-        // Until then, no codegen pass should produce this node; reaching here
-        // means a pass started emitting wire-array decls before the templates
-        // were taught how.
-        HirNode::WireArray(_) => {
-            unreachable!(
-                "HirNode::WireArray emission not yet implemented \
-                 (M57.1 wire-array realization Task W1 added the HIR \
-                 primitive; Verilog template support arrives in a follow-up \
-                 W-task)"
-            )
-        }
+        // M57.1 wire-array realization (Task W2): module-scope multi-dim
+        // wire-array declaration. Indented at the same level as plain Wire.
+        HirNode::WireArray(wa) => format!("{pad}{}", emit_wire_array(wa)),
     }
 }
 
@@ -280,6 +279,61 @@ mod tests {
         let w = Wire { id: WireId(9), width: 32 };
         let v = emit_wire(&w);
         assert_eq!(v, "wire signed [31:0] _w9;");
+    }
+
+    // --- M57.1 wire-array realization: emitter lowering (Task W2) ---
+
+    #[test]
+    fn emit_signal_ref_wire_array_element_literal_index() {
+        let s = SignalRef::wire_array_element("acc_l1", vec![
+            IndexExpr::Literal(5),
+            IndexExpr::Literal(10),
+        ]);
+        assert_eq!(emit_signal_ref(&s), "acc_l1[5][10]");
+    }
+
+    #[test]
+    fn emit_signal_ref_wire_array_element_genvar_index() {
+        let s = SignalRef::wire_array_element("acc_l1", vec![
+            IndexExpr::Genvar("_gv_o".to_string()),
+            IndexExpr::Genvar("_gv_k".to_string()),
+        ]);
+        assert_eq!(emit_signal_ref(&s), "acc_l1[_gv_o][_gv_k]");
+    }
+
+    #[test]
+    fn emit_signal_ref_wire_array_element_genvar_plus_index() {
+        let s = SignalRef::wire_array_element("acc_l1", vec![
+            IndexExpr::Genvar("_gv_o".to_string()),
+            IndexExpr::GenvarPlus("_gv_k".to_string(), 1),
+        ]);
+        assert_eq!(emit_signal_ref(&s), "acc_l1[_gv_o][(_gv_k + 1)]");
+    }
+
+    #[test]
+    fn emit_wire_array_2d() {
+        let wa = WireArray {
+            name: "acc_l1".to_string(),
+            dims: vec![128, 785],
+            width: 32,
+        };
+        assert_eq!(
+            emit_wire_array(&wa),
+            "wire signed [31:0] acc_l1 [0:127][0:784];"
+        );
+    }
+
+    #[test]
+    fn emit_wire_array_1d() {
+        let wa = WireArray {
+            name: "relu_l1".to_string(),
+            dims: vec![128],
+            width: 32,
+        };
+        assert_eq!(
+            emit_wire_array(&wa),
+            "wire signed [31:0] relu_l1 [0:127];"
+        );
     }
 }
 
