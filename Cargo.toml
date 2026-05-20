@@ -9,6 +9,7 @@ members = [
     "crates/nsl-codegen",
     "crates/nsl-runtime",
     "crates/nsl-cli",
+    "crates/nsl-test",
 ]
 
 [workspace.package]

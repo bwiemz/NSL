@@ -190,12 +190,11 @@ pub fn emit_load_a_fragment_smem(
     ));
 }
 
-/// Emit PTX to load an m16n8k16 B-fragment (col-major f16 16×8) from SMEM,
-/// matching the NVIDIA PTX ISA §9.7.13.4 lane mapping for
-/// `mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32`.
+/// Emit PTX to load an m16n8k16 B-fragment (col-major presentation) from SMEM.
+/// Each thread holds 2 .b32 registers covering 4 pairs of f16 values.
 ///
-/// Each warp lane (32 lanes per warp) holds 2 `.b32` registers = 4 packed
-/// f16 values laid out at a single col × 2 k-row pair positions:
+/// Matches NVIDIA PTX ISA §9.7.13.4 lane mapping for
+/// `mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32`:
 ///
 /// ```text
 ///   reg 0: B[k_lo,     n] .. B[k_lo + 1, n]   (2 f16 packed, contiguous in col-major)
@@ -205,64 +204,60 @@ pub fn emit_load_a_fragment_smem(
 ///          n    = lane / 4
 /// ```
 ///
-/// The two f16 values per `.b32` are at adjacent K rows of the SAME
-/// column — which IS contiguous in col-major storage (one b32 read =
-/// 4 bytes = 2 consecutive f16 in the K direction).
+/// `col_stride_bytes` is the SMEM byte stride between adjacent columns (the n-axis
+/// in the MMA's perspective).  For row-major K stored as `[bkv × head_dim]` with
+/// `col_stride_bytes = head_dim * 2`, the helper reads K's bytes as if K^T were
+/// col-major-staged — producing `Q @ K^T` in the MMA output.  This byte-aliasing
+/// trick is what B.1 forward's S=QK^T uses; it does NOT produce `Q @ K`.
 ///
-/// **SMEM layout assumption**: B must be stored col-major in SMEM —
-/// i.e., consecutive bytes step through the K dimension first, then N.
-/// In row-major storage of an `[K, N]` tile, two K-adjacent values
-/// live `N * 2` bytes apart (NOT contiguous), so the b32 read would
-/// fetch B[k, n] and B[k, n+1] (wrong fragment). Callers staging
-/// row-major-from-HBM weight tiles into SMEM must transpose during
-/// the cp.async path, or refactor the SMEM layout. WRGA already
-/// stores its B tiles col-major; Tier B.1's `Wq`/`Wk`/`Wv` tiles
-/// currently stage row-major from HBM and need a separate fix to
-/// realize correct B-frag loads.
+/// See `docs/superpowers/specs/2026-05-19-tier-b2-v5-mma-lane-mapping-resolution.md`
+/// (LOCAL-ONLY) for the lane-mapping derivation and the architectural analysis of
+/// why a `load_transposed` extension cannot substitute for a dedicated col-major
+/// K re-stage when computing `dQ_acc += dS @ K`.
 ///
-/// `row_stride_bytes` is the BYTE stride between adjacent COLUMNS in
-/// col-major storage (= `k_dim * 2` for tightly packed f16; typically
-/// 32 bytes for k=16). The parameter name is preserved from the old
-/// signature for source compatibility, but semantically it's a column
-/// stride.
+/// `smem_base_expr` is a u32 PTX expression evaluating to the byte address of
+/// B[0, 0] in SMEM.
 ///
-/// `smem_base_expr` is a u32 PTX expression evaluating to the byte
-/// address of B[0, 0] in SMEM.
-///
-/// As with `emit_load_a_fragment_smem`, the helper computes the
-/// per-lane mapping internally from `%tid.x` and uses `%mma_addr` +
-/// `%mma_b_row` as scratch — no caller setup of `%mma_b_row` is
-/// required (whatever the caller stored in it before the call is
-/// overwritten).
+/// As with `emit_load_a_fragment_smem`, the helper computes the per-lane mapping
+/// internally from `%tid.x` and uses `%mma_addr` + `%mma_b_row` as scratch — no
+/// caller setup of `%mma_b_row` is required (whatever the caller stored in it
+/// before the call is overwritten).
 ///
 /// ### Lane-mapping bug history
 ///
-/// Prior to this commit, the helper read 2 b32 from
-/// `[smem_base + %mma_b_row * stride + {0, 16}]`. Whether this matched
-/// PTX spec depended ENTIRELY on the caller's `%mma_b_row` setup AND
-/// whether the caller had pre-baked the per-lane column offset into
-/// `smem_base_expr`. WRGA happened to do both correctly (so the
-/// effective addressing matched spec); Tier B.1 did neither, so its
-/// B-frag loads put 31/32 lanes at wrong (k, n) positions. The probe
-/// `tier_b1_n4_b_helper_probe.rs` confirmed 1/32 lanes matched spec
-/// before this rewrite. Making the helper self-contained eliminates
-/// the dependency on caller convention.
+/// Prior to the N4-rewrite commit, the helper read 2 b32 from
+/// `[smem_base + %mma_b_row * stride + {0, 16}]`. Whether this matched PTX spec
+/// depended ENTIRELY on the caller's `%mma_b_row` setup AND whether the caller had
+/// pre-baked the per-lane column offset into `smem_base_expr`. WRGA happened to do
+/// both correctly (so the effective addressing matched spec); Tier B.1 did neither,
+/// so its B-frag loads put 31/32 lanes at wrong (k, n) positions. The probe
+/// `tier_b1_n4_b_helper_probe.rs` confirmed 1/32 lanes matched spec before this
+/// rewrite. Making the helper self-contained eliminates the dependency on caller
+/// convention.
+///
+/// Task 2 of CSHA Tier B.2 Phase 2 added a `load_transposed: bool` parameter that
+/// was subsequently reverted after V-B2-5 verification found: (1) the transposed
+/// branch had a lane-mapping bug (32 lanes all read col=0), and (2) the premise
+/// was factually wrong — B.1 forward stages K row-major, not col-major; no
+/// single-.b32-load reformulation can produce `dS @ K` from row-major K. The
+/// dQ-kernel instead uses a dedicated col-major K re-stage band in SMEM (Path A,
+/// Task 11). The `load_transposed` extension is deferred to M59+ (Path B).
 pub fn emit_load_b_fragment_smem(
     ptx: &mut String,
     frag_regs: &[String; 2],
     smem_base_expr: &str,
-    row_stride_bytes: usize,
+    col_stride_bytes: usize,
 ) {
     ptx.push_str("    // Load B-fragment (k16xn8 col-major f16) per PTX m16n8k16 spec\n");
     ptx.push_str("    // Lane t holds: reg0=B[(t%4)*2 .. +1, t/4], reg1=B[(t%4)*2+8 .. +9, t/4]\n");
     // Self-contained lane derivation from %tid.x.
     ptx.push_str("    mov.u32 %mma_addr, %tid.x;              // load tid\n");
     ptx.push_str("    and.b32 %mma_addr, %mma_addr, 31;       // lane = tid & 31\n");
-    // %mma_b_row = (lane / 4) * row_stride_bytes  (byte offset of column n_col).
+    // %mma_b_row = (lane / 4) * col_stride_bytes  (byte offset of column n_col).
     ptx.push_str("    shr.u32 %mma_b_row, %mma_addr, 2;       // n_col = lane / 4\n");
     ptx.push_str(&format!(
         "    mul.lo.u32 %mma_b_row, %mma_b_row, {};  // n_col * col_stride\n",
-        row_stride_bytes
+        col_stride_bytes
     ));
     // Add k_lo bytes = (lane % 4) * 4 bytes (2 f16 packed = 4 bytes wide).
     ptx.push_str("    and.b32 %mma_addr, %mma_addr, 3;        // lane % 4\n");
