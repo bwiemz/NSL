@@ -2337,7 +2337,9 @@ fn run_build_shared_single(
     // M62 Task 9: also re-export the runtime lifecycle symbols so that ctypes
     // callers can call nsl_model_create / nsl_model_destroy / nsl_get_last_error
     // directly from the generated shared lib without loading a separate runtime DLL.
-    let runtime_exports = [
+    // `mut` is only used when --features onnx-rt-op is on; harmless otherwise.
+    #[allow(unused_mut)]
+    let mut runtime_exports: Vec<&'static str> = vec![
         "nsl_model_create",
         "nsl_model_create_with_lib",
         "nsl_model_destroy",
@@ -2364,6 +2366,12 @@ fn run_build_shared_single(
         "nsl_dl_path_for_fn_addr",
         "nsl_free_cstr",
     ];
+    // M62b Spec C — when nsl-cli is built with --features onnx-rt-op the nsl-runtime
+    // crate compiles in `RegisterCustomOps` (the ORT custom-op registration entry
+    // point). MSVC requires the symbol to be in the explicit export list to survive
+    // linking into the .dll; on other platforms the extra entry is harmless.
+    #[cfg(feature = "onnx-rt-op")]
+    runtime_exports.push("RegisterCustomOps");
     let mut export_refs: Vec<&str> = export_symbols.iter().map(|s| s.as_str()).collect();
     export_refs.extend(dispatch_symbols.iter().map(|s| s.as_str()));
     export_refs.extend_from_slice(&runtime_exports);
@@ -2636,7 +2644,9 @@ fn run_build_shared_multi(
     // M62 Task 9: mirror the single-file path and re-export runtime lifecycle
     // symbols so ctypes callers can load weights + call exports through the
     // generated DLL without loading a separate runtime DLL.
-    let runtime_exports = [
+    // `mut` is only used when --features onnx-rt-op is on; harmless otherwise.
+    #[allow(unused_mut)]
+    let mut runtime_exports: Vec<&'static str> = vec![
         "nsl_model_create",
         "nsl_model_create_with_lib",
         "nsl_model_destroy",
@@ -2663,6 +2673,10 @@ fn run_build_shared_multi(
         "nsl_dl_path_for_fn_addr",
         "nsl_free_cstr",
     ];
+    // M62b Spec C — mirror single-file path: surface `RegisterCustomOps` for the
+    // MSVC linker when nsl-cli is built with --features onnx-rt-op.
+    #[cfg(feature = "onnx-rt-op")]
+    runtime_exports.push("RegisterCustomOps");
     let mut export_refs: Vec<&str> = export_symbols.iter().map(|s| s.as_str()).collect();
     export_refs.extend(dispatch_symbols.iter().map(|s| s.as_str()));
     export_refs.extend_from_slice(&runtime_exports);

@@ -1,0 +1,21 @@
+# M62b Spec C example: a minimal NSL @export usable as an ONNX Runtime custom op.
+#
+# Prerequisites:
+#   1. Build nsl-cli with the ONNX-RT feature flag (only needed once per checkout):
+#        cargo build --release -p nsl-cli --features onnx-rt-op
+#   2. Compile this file to a shared library that exposes both `add` and the
+#      runtime's `RegisterCustomOps` entry point:
+#        ./target/release/nsl build --shared-lib examples/m62_onnx_op.nsl \
+#            -o /tmp/m62_onnx.so          (Linux/macOS)
+#        ./target/release/nsl build --shared-lib examples/m62_onnx_op.nsl \
+#            -o C:/tmp/m62_onnx.dll       (Windows)
+#   3. Run the harness:
+#        python examples/m62_onnx_op.py /tmp/m62_onnx.so
+#
+# The Python harness (m62_onnx_op.py) registers the produced .so/.dll with
+# `SessionOptions.register_custom_ops_library`, builds a 1-node ONNX graph that
+# calls `com.nsl::add`, and verifies the output matches NumPy elementwise add.
+
+@export
+fn add(a: Tensor<[4], f32>, b: Tensor<[4], f32>) -> Tensor<[4], f32>:
+    return a + b
