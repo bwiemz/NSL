@@ -10,6 +10,8 @@
 //!
 //! Spec: docs/superpowers/specs/2026-05-19-csha-tier-b2-phase2-design.md §4 + §5.2
 
+pub mod hbm_addr;
+
 use crate::flash_attention::FlashAttentionConfig;
 use crate::flash_attention_v2::smem_layout::{
     tier_b2_dq_total_smem_bytes, tier_b2_effective_bq,
