@@ -485,7 +485,10 @@ pub(crate) fn lower_v1_mlp_single_layer(
     module: &mut HirModule,
 ) -> Result<(), FpgaLoweringError> {
     use crate::hir::module::HirNode;
-    use crate::hir::nodes::{LocalParam, Port, WireArray};
+    use crate::hir::nodes::{
+        AssignWireArrayElement, IndexExpr, LocalParam, Port, WireArray,
+    };
+    use crate::hir::signals::SignalRef;
 
     // ── Extract Matmul shapes + dtypes ─────────────────────────────────
     let (a_dtype, b_dtype, out_dtype, a_shape, b_shape) = match matmul {
@@ -527,8 +530,8 @@ pub(crate) fn lower_v1_mlp_single_layer(
     let x_port_name = format!("x_l{}", layer_idx);
     let w_lp_prefix = format!("W{}", layer_idx);
     let b_lp_prefix = format!("b{}", layer_idx);
-    let acc_array = format!("acc_l{}", layer_idx);
-    let relu_array = format!("relu_l{}", layer_idx);
+    let acc_array_name = format!("acc_l{}", layer_idx);
+    let relu_array_name = format!("relu_l{}", layer_idx);
 
     // ── Layer 1: declare Port::Input(x_l1). Layers 2+: skip (read from
     //    prev_relu_array_name in W5). ────────────────────────────────────
@@ -560,21 +563,56 @@ pub(crate) fn lower_v1_mlp_single_layer(
 
     // ── WireArrays: acc_l<i> [n_outputs][k_dim+1] + relu_l<i> [n_outputs] ─
     module.add_node(HirNode::WireArray(WireArray {
-        name: acc_array,
+        name: acc_array_name.clone(),
         dims: vec![n_outputs, k_dim + 1],
         width: acc_width,
     }))?;
 
     module.add_node(HirNode::WireArray(WireArray {
-        name: relu_array,
+        name: relu_array_name.clone(),
         dims: vec![n_outputs],
         width: acc_width,
     }))?;
 
-    // W3 scope: declarations only. Generate-for body + relu final column
-    // + tap outputs + final-layer Port::Output all land in W4/W5.
+    // ── Bias-seed assigns: acc[o][0] = b<i>_<o> (or zero LocalParam) ──────
+    //
+    // M57.1 wire-array mini §3.2 + §4: per-element bias-seed assigns emitted
+    // at module top-level (NOT inside the GenerateFor body, because LocalParam
+    // access by genvar isn't directly supported in standard Verilog). W5's
+    // ripple body uses Genvar-indexed `acc[o][k+1]` writes via a separate
+    // LocalParamArray + IndexedLocalParam mechanism.
+    //
+    // No-bias defensive path: declare a single `zero_w<acc_width>` LocalParam
+    // and use it as the seed. Idempotent — only declared once even if the
+    // function is called for multiple layers without bias.
+    let zero_lp_name = format!("zero_w{}", acc_width);
+    if !has_bias
+        && !module
+            .local_params()
+            .iter()
+            .any(|lp| lp.name == zero_lp_name)
+    {
+        module.add_local_param(LocalParam::new(&zero_lp_name, acc_width, 0));
+    }
+
+    for o in 0..n_outputs {
+        let src = if has_bias {
+            SignalRef::local_param(format!("{}_{}", b_lp_prefix, o))
+        } else {
+            SignalRef::local_param(&zero_lp_name)
+        };
+        module.add_node(HirNode::AssignWireArrayElement(AssignWireArrayElement {
+            array_name: acc_array_name.clone(),
+            indices: vec![IndexExpr::Literal(o), IndexExpr::Literal(0)],
+            src,
+        }))?;
+    }
+
+    // W4 scope: bias-seed assigns now emitted. Generate-for ripple body
+    // + relu final column + tap outputs + final-layer Port::Output land in W5.
     let _ = is_final_layer;
     let _ = prev_relu_array_name;
+    let _ = relu_array_name;
 
     Ok(())
 }
@@ -733,5 +771,123 @@ mod tests {
         assert_eq!(wire_arrays.len(), 2);
         assert_eq!(wire_arrays[0].name, "acc_l2");
         assert_eq!(wire_arrays[1].name, "relu_l2");
+    }
+
+    /// M57.1 wire-array mini §3.2 + §4 / Task W4: with-bias layer must emit
+    /// `n_outputs` per-element bias-seed `AssignWireArrayElement` nodes that
+    /// drive `acc_l<i>[o][0]` from the matching `b<i>_<o>` LocalParam.
+    #[test]
+    fn lower_v1_mlp_single_layer_w4_emits_bias_seed_assigns() {
+        use crate::hir::nodes::{AssignWireArrayElement, IndexExpr};
+        use crate::hir::signals::SignalRef;
+
+        let matmul = KirOp::Matmul {
+            a: 0, b: 1, out: 2,
+            a_dtype: KirType::I8, b_dtype: KirType::I8, out_dtype: KirType::I32,
+            a_shape: [1, 2], b_shape: [2, 3],
+        };
+        let eltadd = KirOp::ElementwiseAdd {
+            a: 2, b: 3, out: 4,
+            dtype: KirType::I32, shape: [3],
+        };
+        let relu = KirOp::Relu {
+            a: 4, out: 5,
+            dtype: KirType::I32, shape: [3],
+        };
+
+        let mut module = HirModule::new("test");
+        lower_v1_mlp_single_layer(
+            &matmul, Some(&eltadd), &relu,
+            None, 1, true, &mut module,
+        ).expect("scaffold lowers");
+
+        // n_outputs (3) per-element bias-seed AssignWireArrayElement nodes —
+        // each at acc_l1[o][0] reading from b1_<o> LocalParam.
+        let bias_assigns: Vec<&AssignWireArrayElement> = module.nodes().iter().filter_map(|n| match n {
+            HirNode::AssignWireArrayElement(a)
+                if a.array_name == "acc_l1"
+                    && a.indices.len() == 2
+                    && matches!(&a.indices[1], IndexExpr::Literal(0)) =>
+            {
+                Some(a)
+            }
+            _ => None,
+        }).collect();
+        assert_eq!(
+            bias_assigns.len(),
+            3,
+            "should emit 3 bias-seed assigns (one per output)"
+        );
+
+        // Each bias_assign reads from b1_<o>; indices[0] is Literal(o).
+        for (idx, a) in bias_assigns.iter().enumerate() {
+            match &a.indices[0] {
+                IndexExpr::Literal(n) => assert_eq!(*n, idx),
+                _ => panic!("expected Literal(o) at indices[0]"),
+            }
+            match &a.src {
+                SignalRef::LocalParam(name) => {
+                    assert_eq!(name, &format!("b1_{}", idx));
+                }
+                _ => panic!("expected LocalParam src, got {:?}", a.src),
+            }
+        }
+
+        // With bias present, no zero_w<acc_width> LocalParam should be emitted.
+        assert!(
+            !module.local_params().iter().any(|lp| lp.name == "zero_w32"),
+            "with-bias layer must NOT declare zero_w32 LocalParam"
+        );
+    }
+
+    /// M57.1 wire-array mini §3.2 + §4 / Task W4: no-bias defensive path
+    /// declares a single `zero_w<acc_width>` LocalParam and uses it as the
+    /// accumulator seed.
+    #[test]
+    fn lower_v1_mlp_single_layer_w4_no_bias_uses_zero_localparam() {
+        use crate::hir::nodes::{AssignWireArrayElement, IndexExpr};
+        use crate::hir::signals::SignalRef;
+
+        let matmul = KirOp::Matmul {
+            a: 0, b: 1, out: 2,
+            a_dtype: KirType::I8, b_dtype: KirType::I8, out_dtype: KirType::I32,
+            a_shape: [1, 2], b_shape: [2, 3],
+        };
+        let relu = KirOp::Relu {
+            a: 2, out: 3,
+            dtype: KirType::I32, shape: [3],
+        };
+
+        let mut module = HirModule::new("test_no_bias");
+        lower_v1_mlp_single_layer(
+            &matmul, None, &relu,
+            None, 1, true, &mut module,
+        ).expect("scaffold lowers no-bias");
+
+        // Zero LocalParam declared exactly once.
+        let zero_count = module
+            .local_params()
+            .iter()
+            .filter(|lp| lp.name == "zero_w32")
+            .count();
+        assert_eq!(zero_count, 1, "zero_w32 LocalParam must be declared once");
+
+        // Bias-seed assigns reference zero_w32.
+        let bias_assigns: Vec<&AssignWireArrayElement> = module.nodes().iter().filter_map(|n| match n {
+            HirNode::AssignWireArrayElement(a)
+                if a.array_name == "acc_l1"
+                    && matches!(&a.indices[1], IndexExpr::Literal(0)) =>
+            {
+                Some(a)
+            }
+            _ => None,
+        }).collect();
+        assert_eq!(bias_assigns.len(), 3);
+        for a in bias_assigns.iter() {
+            match &a.src {
+                SignalRef::LocalParam(name) => assert_eq!(name, "zero_w32"),
+                _ => panic!("expected zero_w32 LocalParam, got {:?}", a.src),
+            }
+        }
     }
 }

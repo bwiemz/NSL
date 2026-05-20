@@ -157,7 +157,36 @@ fn summarize_node(out: &mut String, node: &HirNode, idx: usize, depth: usize) {
         HirNode::GenerateIf(g) => {
             out.push_str(&format!("{indent}[{idx}] GenerateIf cond={:?}\n", g.cond));
         }
+        // M57.1 wire-array realization (Task W1/W2): module-scope multi-dim
+        // wire array. Names + dims + width are deterministic; no IDs.
+        HirNode::WireArray(wa) => {
+            out.push_str(&format!(
+                "{indent}[{idx}] WireArray {} dims={:?} width={}\n",
+                wa.name, wa.dims, wa.width,
+            ));
+        }
+        // M57.1 wire-array realization (Task W4): drives one element of a
+        // WireArray. Render index shape + src kind without leaking WireIds.
+        HirNode::AssignWireArrayElement(a) => {
+            let idx_str = format_index_exprs(&a.indices);
+            out.push_str(&format!(
+                "{indent}[{idx}] AssignWireArrayElement {}{} = {}\n",
+                a.array_name, idx_str, format_sigref(&a.src),
+            ));
+        }
     }
+}
+
+fn format_index_exprs(indices: &[nsl_codegen::hir::nodes::IndexExpr]) -> String {
+    use nsl_codegen::hir::nodes::IndexExpr;
+    indices
+        .iter()
+        .map(|ix| match ix {
+            IndexExpr::Literal(n) => format!("[{}]", n),
+            IndexExpr::Genvar(name) => format!("[{}]", name),
+            IndexExpr::GenvarPlus(name, k) => format!("[({} + {})]", name, k),
+        })
+        .collect()
 }
 
 fn format_sigref(s: &nsl_codegen::hir::SignalRef) -> String {
@@ -166,6 +195,11 @@ fn format_sigref(s: &nsl_codegen::hir::SignalRef) -> String {
         nsl_codegen::hir::SignalRef::Wire(_) => "Wire(<id>)".to_string(),
         nsl_codegen::hir::SignalRef::Register(_) => "Register(<id>)".to_string(),
         nsl_codegen::hir::SignalRef::LocalParam(name) => format!("LocalParam({name})"),
+        // M57.1 wire-array realization (Task W2): read of one element of a
+        // module-scope wire array. Indices are deterministic; included verbatim.
+        nsl_codegen::hir::SignalRef::WireArrayElement { array_name, indices } => {
+            format!("WireArrayElement({array_name}{})", format_index_exprs(indices))
+        }
     }
 }
 

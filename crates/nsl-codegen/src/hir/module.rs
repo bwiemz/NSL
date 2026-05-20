@@ -25,6 +25,12 @@ pub enum HirNode {
     /// (it declares an N-dimensional family of wires whose drivers are
     /// `assign`s inside generate blocks).
     WireArray(WireArray),
+    /// M57.1 wire-array realization (Task W4): driver for one element of a
+    /// WireArray. Inside a GenerateFor body, indices typically include Genvar
+    /// refs; at module top level, indices are typically Literals. Does NOT
+    /// produce a single WireId — it drives a single element of an
+    /// N-dimensional wire family declared by `WireArray`.
+    AssignWireArrayElement(AssignWireArrayElement),
 }
 
 impl HirNode {
@@ -37,8 +43,9 @@ impl HirNode {
             HirNode::Add(a) => Some(a.out),
             HirNode::Max0(m) => Some(m.out),
             HirNode::SignExtend(s) => Some(s.dst),
-            // Register, GenerateFor, GenerateIf, WireArray don't produce a
-            // single WireId. (WireArray declares multi-element wire family;
+            // Register, GenerateFor, GenerateIf, WireArray, AssignWireArrayElement
+            // don't produce a single WireId. (WireArray declares multi-element
+            // wire family; AssignWireArrayElement drives ONE element of one;
             // single-driver invariant for each element is the caller's
             // responsibility, same as GenerateFor body uniqueness.)
             _ => None,

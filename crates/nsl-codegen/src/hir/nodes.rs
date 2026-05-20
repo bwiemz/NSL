@@ -39,6 +39,23 @@ pub struct WireArray {
     pub width: usize,
 }
 
+/// Drives one element of a `WireArray` from a `SignalRef`.
+///
+/// Emits `assign {array_name}[{idx0}]...[{idxN}] = {src};` at the position
+/// where it appears in the HIR node list. Inside a GenerateFor body, indices
+/// typically include `Genvar` / `GenvarPlus` refs; at module top level, indices
+/// are typically `Literal`.
+///
+/// Construction-time invariant: `indices.len()` matches the corresponding
+/// `WireArray.dims.len()` for the array being driven. The emitter does not
+/// validate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssignWireArrayElement {
+    pub array_name: String,
+    pub indices: Vec<IndexExpr>,
+    pub src: crate::hir::signals::SignalRef,
+}
+
 // --- Module-boundary nodes ---
 
 #[derive(Debug, Clone, PartialEq, Eq)]

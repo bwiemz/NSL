@@ -41,6 +41,21 @@ pub fn emit_wire_array(wa: &WireArray) -> String {
     format!("wire signed [{}:0] {} {};", wa.width - 1, wa.name, dims_str)
 }
 
+/// M57.1 wire-array realization (Task W4): drives one element of a WireArray.
+/// Mechanical lowering — emits `assign {array_name}[idx0]...[idxN] = {src};`.
+/// Each `IndexExpr` variant has one fixed Verilog form (same shape as the
+/// read path in `emit_signal_ref` for `WireArrayElement`).
+pub fn emit_assign_wire_array_element(a: &AssignWireArrayElement) -> String {
+    let idx_str: String = a.indices.iter()
+        .map(|ix| match ix {
+            IndexExpr::Literal(n) => format!("[{}]", n),
+            IndexExpr::Genvar(name) => format!("[{}]", name),
+            IndexExpr::GenvarPlus(name, k) => format!("[({} + {})]", name, k),
+        })
+        .collect();
+    format!("assign {}{} = {};", a.array_name, idx_str, emit_signal_ref(&a.src))
+}
+
 pub fn emit_local_param(lp: &LocalParam) -> String {
     format!(
         "localparam signed [{}:0] {} = {}'sd{};",
@@ -215,6 +230,12 @@ pub fn emit_node(
         // M57.1 wire-array realization (Task W2): module-scope multi-dim
         // wire-array declaration. Indented at the same level as plain Wire.
         HirNode::WireArray(wa) => format!("{pad}{}", emit_wire_array(wa)),
+        // M57.1 wire-array realization (Task W4): drives one element of a
+        // WireArray. Indented at the same level as plain `assign` ops (Mul,
+        // Add, etc.).
+        HirNode::AssignWireArrayElement(a) => {
+            format!("{pad}{}", emit_assign_wire_array_element(a))
+        }
     }
 }
 
@@ -333,6 +354,37 @@ mod tests {
         assert_eq!(
             emit_wire_array(&wa),
             "wire signed [31:0] relu_l1 [0:127];"
+        );
+    }
+
+    // --- M57.1 wire-array realization: AssignWireArrayElement emit (Task W4) ---
+
+    #[test]
+    fn emit_assign_wire_array_element_from_wire() {
+        let a = AssignWireArrayElement {
+            array_name: "acc_l1".to_string(),
+            indices: vec![
+                IndexExpr::Genvar("_gv_o".to_string()),
+                IndexExpr::GenvarPlus("_gv_k".to_string(), 1),
+            ],
+            src: SignalRef::wire(WireId(42)),
+        };
+        assert_eq!(
+            emit_assign_wire_array_element(&a),
+            "assign acc_l1[_gv_o][(_gv_k + 1)] = _w42;"
+        );
+    }
+
+    #[test]
+    fn emit_assign_wire_array_element_from_local_param_literal_indices() {
+        let a = AssignWireArrayElement {
+            array_name: "acc_l1".to_string(),
+            indices: vec![IndexExpr::Literal(5), IndexExpr::Literal(0)],
+            src: SignalRef::local_param("b1_5"),
+        };
+        assert_eq!(
+            emit_assign_wire_array_element(&a),
+            "assign acc_l1[5][0] = b1_5;"
         );
     }
 }
