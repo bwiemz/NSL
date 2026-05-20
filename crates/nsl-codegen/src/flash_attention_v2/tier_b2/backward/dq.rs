@@ -66,7 +66,8 @@ fn emit_prelude(ptx: &mut String) {
 /// the col-major K re-stage band (Path A, spec §5.2).
 fn emit_smem_extern_module_scope(ptx: &mut String, config: &FlashAttentionConfig) {
     let total_smem = tier_b2_dq_total_smem_bytes(config);
-    ptx.push_str(&format!(".extern .shared .align 16 .b8 shmem[{}];\n\n", total_smem));
+    ptx.push_str(".extern .shared .align 16 .b8 shmem[];\n\n");
+    let _ = total_smem; // Size is communicated via cuFuncSetAttribute at launch time, not baked into the extern declaration.
 }
 
 fn emit_entry_signature(ptx: &mut String) {
@@ -1068,7 +1069,7 @@ fn emit_inner_loop_body(ptx: &mut String, config: &FlashAttentionConfig) {
     let k_col_off = tier_b2_dq_k_colmajor_offset(config);
     let ds_off_expr = format!("{}", tier_b2_dq_ds_offset(config));
     let k_col_off_expr = format!("{}", k_col_off);
-    let ds_row_stride = (config.block_kv * 4) as usize; // dS is f32 row-major
+    let ds_row_stride = (tier_b2_effective_bkv(config) * 4) as usize; // dS is f32 row-major; use effective_bkv (post Path-A fallback), not raw block_kv
     let bkv_eff_col_stride = (bkv_eff * 2) as usize;    // col stride of col-major K band
 
     emit_load_a_fragment_smem(ptx, &dq_a_regs, &ds_off_expr, ds_row_stride);
@@ -1233,15 +1234,31 @@ mod tests {
 
     #[test]
     fn synthesize_dq_kernel_extern_smem_sized_from_total_bytes() {
-        // Per SPEC AMENDMENT: SMEM extern declaration uses tier_b2_dq_total_smem_bytes
-        // which INCLUDES the col-major K re-stage band.
-        use crate::flash_attention_v2::smem_layout::tier_b2_dq_total_smem_bytes;
-        let cfg = canonical_cfg();
-        let expected_total = tier_b2_dq_total_smem_bytes(&cfg);
-        let ptx = synthesize_dq_kernel(&cfg).unwrap();
-        // Must declare shmem[<total>] not shmem[] (unsized) and not mixed with .shared
-        assert!(ptx.contains(&format!(".extern .shared .align 16 .b8 shmem[{}]", expected_total)),
-            "expected explicit shmem[{}] sizing, got:\n{ptx}", expected_total);
+        // Fix 1 (H4): the SMEM extern must use the UNSIZED form `shmem[]` (canonical dynamic
+        // SMEM pattern used by every other dynamic-SMEM kernel in the codebase).  The sized
+        // form `shmem[N]` is treated by the CUDA driver as a STATIC allocation; the launcher
+        // then ALSO requests N bytes of dynamic SMEM, doubling the per-block budget to 2N and
+        // causing CUDA_ERROR_INVALID_VALUE at bq=64 (N=38400, 2N=76800 > 48 KB cap).
+        //
+        // The actual SMEM size is communicated at launch time via cuFuncSetAttribute
+        // (CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, N).  tier_b2_dq_total_smem_bytes
+        // is still authoritative — it's just passed to the launcher, not baked into PTX.
+        let ptx = synthesize_dq_kernel(&canonical_cfg()).unwrap();
+        // Must use canonical dynamic form (empty brackets), NOT a sized extern.
+        assert!(ptx.contains(".extern .shared .align 16 .b8 shmem[]"),
+            "expected unsized dynamic shmem[] extern, got:\n{ptx}");
+        // Verify no digit follows the opening bracket (i.e., no sized form shmem[N]).
+        assert!(!ptx.contains(".extern .shared .align 16 .b8 shmem[0")
+            && !ptx.contains(".extern .shared .align 16 .b8 shmem[1")
+            && !ptx.contains(".extern .shared .align 16 .b8 shmem[2")
+            && !ptx.contains(".extern .shared .align 16 .b8 shmem[3")
+            && !ptx.contains(".extern .shared .align 16 .b8 shmem[4")
+            && !ptx.contains(".extern .shared .align 16 .b8 shmem[5")
+            && !ptx.contains(".extern .shared .align 16 .b8 shmem[6")
+            && !ptx.contains(".extern .shared .align 16 .b8 shmem[7")
+            && !ptx.contains(".extern .shared .align 16 .b8 shmem[8")
+            && !ptx.contains(".extern .shared .align 16 .b8 shmem[9"),
+            "must NOT emit sized shmem[N] extern (driver treats it as static, doubling budget)");
         assert!(!ptx.contains(".shared .align 16 .b8 dq_static"),
             "must NOT mix static .shared with extern");
     }
