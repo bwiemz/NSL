@@ -23,12 +23,40 @@ impl KirToHirPass {
         let mut module = HirModule::new(module_name);
         module.test_taps = self.test_taps;
 
-        // Iterate KIR ops in order (single-block KIR at v1 — multi-block deferred).
-        for op in kir.ops() {
-            match op {
-                KirOp::Matmul { .. } => self.lower_matmul(op, &mut module)?,
-                KirOp::ElementwiseAdd { .. } => self.lower_elementwise_add(op, &mut module)?,
-                KirOp::Relu { .. } => self.lower_relu(op, &mut module)?,
+        // M57.1 §3.5: peekable layer-aware iteration. Index-based loop so that
+        // when we see a Matmul, we can peek at the next op for an
+        // ElementwiseAdd(bias) and fuse the pair for the bias-as-seed fold
+        // (Task 3.4 fills in the bias-fold logic; Task 3.1 is no-op delegation).
+        let ops: Vec<&KirOp> = kir.ops().collect();
+        let mut i = 0;
+        while i < ops.len() {
+            match ops[i] {
+                KirOp::Matmul { out: matmul_out, .. } => {
+                    // Peek at the adjacent op. The bias-fold (Task 3.4) requires
+                    // the ElementwiseAdd's `a` to reference this Matmul's `out`
+                    // (i.e., bias is added to the matmul result, not the other
+                    // way around). The v1 MLP recognizer emits ops in that order.
+                    let bias_op = ops.get(i + 1).copied().filter(|next| {
+                        matches!(
+                            next,
+                            KirOp::ElementwiseAdd { a, .. } if *a == *matmul_out
+                        )
+                    });
+                    self.lower_matmul_with_optional_bias(ops[i], bias_op, &mut module)?;
+                    i += if bias_op.is_some() { 2 } else { 1 };
+                }
+                KirOp::ElementwiseAdd { .. } => {
+                    // Standalone ElementwiseAdd (not absorbed by a preceding
+                    // Matmul). The v1 MLP path doesn't emit standalone Adds
+                    // (every Add follows a Matmul), but the lowering remains
+                    // correct if they appear.
+                    self.lower_elementwise_add(ops[i], &mut module)?;
+                    i += 1;
+                }
+                KirOp::Relu { .. } => {
+                    self.lower_relu(ops[i], &mut module)?;
+                    i += 1;
+                }
 
                 // Unsupported in v1: error at first unrecognized op with localized
                 // op-kind name + the supported list (spec §2.5).
@@ -42,6 +70,31 @@ impl KirToHirPass {
         }
 
         Ok(module)
+    }
+
+    /// M57.1 §3.5: wrapper that consumes an optional adjacent ElementwiseAdd(bias)
+    /// for the ripple-chain bias-as-seed fold.
+    ///
+    /// Task 3.1: behavior-preserving delegation. When `bias_op` is `Some`, the
+    /// caller has consumed the next KIR op (i += 2); to keep M57's HIR output
+    /// byte-identical we still emit a standalone ElementwiseAdd GenerateFor
+    /// here. Task 3.4 replaces that with a bias-as-seed fold (seeds the MAC
+    /// accumulator from `bias[o]` instead of zero, dropping the separate Add
+    /// block). When `bias_op` is `None`, the accumulator seeds from zero
+    /// (current M57 behavior).
+    fn lower_matmul_with_optional_bias(
+        &self,
+        matmul_op: &KirOp,
+        bias_op: Option<&KirOp>,
+        module: &mut HirModule,
+    ) -> Result<(), FpgaLoweringError> {
+        self.lower_matmul(matmul_op, module)?;
+        // Task 3.4 will fold this into the Matmul's accumulator seed; for now
+        // we re-emit the standalone Add so HIR snapshots stay byte-identical.
+        if let Some(bias) = bias_op {
+            self.lower_elementwise_add(bias, module)?;
+        }
+        Ok(())
     }
 
     fn lower_matmul(
