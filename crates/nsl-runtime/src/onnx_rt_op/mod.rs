@@ -24,11 +24,7 @@
 
 pub mod vendored;
 
-pub mod kernel {
-    //! Placeholder — populated in Task 3 with the
-    //! `OrtCustomOpKernel`-side compute machinery that bridges ORT
-    //! tensors to NSL exports.
-}
+pub mod kernel;
 
 pub mod registry {
     //! Placeholder — populated in Task 4 with `make_custom_op_for_export`
