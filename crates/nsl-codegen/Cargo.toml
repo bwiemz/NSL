@@ -46,6 +46,7 @@ insta = { version = "1.40", features = ["yaml"] }
 tempfile = "3"
 libloading = "0.8"
 assert_cmd = "2"
+nsl-test = { path = "../nsl-test" }
 
 [[bin]]
 name = "cpdt_calibrate"

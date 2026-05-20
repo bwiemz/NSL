@@ -1292,6 +1292,7 @@ dependencies = [
  "nsl-parser",
  "nsl-runtime",
  "nsl-semantic",
+ "nsl-test",
  "object",
  "rand 0.9.2",
  "regex",

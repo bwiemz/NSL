@@ -5,21 +5,22 @@
 //!         --features cuda -- --ignored --nocapture
 //!
 //! - Test 1: D pre-pass standalone vs CPU rowsum (Task 7) — **WIRED + launchable**
-//! - Test 2: dQ smoke at canonical (Task 14) — **gated on Phase 2.5**
-//! - Test 3: dQ head_dim sweep (Task 14) — **gated on Phase 2.5**
+//! - Test 2: dQ smoke at canonical (Task 14) — **gated on Phase 2.5 H3+H4**
+//! - Test 3: dQ head_dim sweep (Task 14) — **gated on Phase 2.5 H3+H4**
 //!
 //! Test 1 wires through `run_d_prepass_on_gpu` against the real `nsl_kernel_launch`
 //! FFI; the D pre-pass kernel is data-mobile (real ld.global / fma / shfl /
 //! st.global) and can be GPU-validated today.
 //!
-//! Tests 2 + 3 are gated on **Phase 2.5** — the dQ-kernel emitter is currently
-//! a *structural scaffold* (sections, register decls, MMA chain shape, labels
-//! all verified by ~20 ptxas/structural tests) but is **not data-mobile**:
-//! cp.async loads, HBM address derivation, dS SMEM scatter, col-major K
-//! re-stage, tile_skip predicate loads, MMA fragment row/col setup, and loop
-//! back-edges are placeholder comments rather than emitted instructions. A
-//! launched dQ-kernel would read uninitialized SMEM. Phase 2.5 fills the
-//! data-mobility gap and is the gate to dQ GPU validation.
+//! Tests 2 + 3: `run_b1_forward_for_test` is now wired (H2, Phase 2.5) to the
+//! CPU-naive forward (`nsl_test::cpu_naive_forward`), providing row_max / row_sum /
+//! O as primary reference. `run_dq_kernel_on_gpu` remains unimplemented (H3+H4):
+//! the dQ-kernel emitter is currently a *structural scaffold* (sections, register
+//! decls, MMA chain shape, labels all verified by ~20 ptxas/structural tests) but
+//! is **not data-mobile** — cp.async loads, HBM address derivation, dS SMEM
+//! scatter, col-major K re-stage, tile_skip predicate loads, MMA fragment row/col
+//! setup, and loop back-edges are placeholder comments. H3 wires the GPU launcher
+//! and H4 runs the first GPU parity check.
 //!
 //! Spec: docs/superpowers/specs/2026-05-19-csha-tier-b2-phase2-design.md §6.1
 
@@ -424,42 +425,49 @@ fn cpu_naive_dq(
 // D pre-pass kernel is data-mobile and validates against the CPU reference
 // today.
 //
-// `run_b1_forward_for_test` and `run_dq_kernel_on_gpu` remain unimplemented:
-// **gated on Phase 2.5**. The dQ-kernel emitter is currently a structural
-// scaffold (sections + register decls + MMA chain + labels) with cp.async
-// loads, HBM address derivation, dS SMEM scatter, col-major K re-stage,
-// tile_skip predicate, MMA fragment row/col setup, and loop back-edges all
-// shipped as PTX comments rather than emitted instructions. A launched
-// dQ-kernel would read uninitialized SMEM. Wiring these two launchers before
-// Phase 2.5 fills the data-mobility gap would produce false-green smoke
-// tests against garbage output — exactly the failure mode the lane-mapping
-// test discipline (spec §5.5) was institutionally pinned to prevent.
+// `run_b1_forward_for_test` is wired (H2, Phase 2.5) to call the CPU-naive
+// forward (H1) from `nsl_test::cpu_naive_forward`, producing row_max / row_sum
+// / O as primary reference inputs for the dQ-kernel. This severs the Phase 2.6
+// B.1-GPU-integration dependency: tests can validate the dQ-kernel's output
+// against H1 outputs without requiring the full B.1 forward FFI stack. The
+// CPU-naive forward also serves as the diagnostic-mode swap target in Phase 2.6.
+//
+// `run_dq_kernel_on_gpu` remains unimplemented: **gated on Phase 2.5 H3+H4**.
+// The dQ-kernel emitter is currently a structural scaffold (sections + register
+// decls + MMA chain + labels) with cp.async loads, HBM address derivation, dS
+// SMEM scatter, col-major K re-stage, tile_skip predicate, MMA fragment row/col
+// setup, and loop back-edges shipped as PTX comments rather than emitted
+// instructions. A launched dQ-kernel would read uninitialized SMEM. H3 wires
+// the GPU launcher and H4 runs the first GPU parity check.
 
-/// Phase-2.5-gated stub for the B.1 forward FFI; would return (row_max, row_sum, O).
-/// Real impl will call nsl_runtime's `nsl_flash_attention_csha_with_saves` once
-/// the dQ-kernel is data-mobile (Phase 2.5) and its smoke + sweep tests are
-/// ready to consume B.1 saves.
+/// Phase-2.5 H2: primary-reference forward producing (row_max, row_sum, O) via
+/// the CPU-naive forward (`nsl_test::cpu_naive_forward::cpu_naive_forward`).
+///
+/// This wiring severs the Phase 2.6 B.1-GPU-integration dependency: the dQ-kernel
+/// tests can validate against H1 CPU-reference outputs without requiring the full
+/// `nsl_flash_attention_csha_with_saves` FFI stack. Phase 2.6 will replace this with
+/// B.1's actual GPU forward + adapter; the CPU-naive forward persists as the
+/// diagnostic-mode swap target per spec §2.2 + §5.3.
+///
+/// Tests are non-causal at the dQ-kernel level — causal masking is handled by the
+/// dQ-kernel's `tile_skip` predicate per spec §9.2.
 fn run_b1_forward_for_test(
-    _q: &[half::f16],
-    _k: &[half::f16],
-    _v: &[half::f16],
+    q: &[half::f16],
+    k: &[half::f16],
+    v: &[half::f16],
     batch: usize,
     heads: usize,
     seq: usize,
     hd: usize,
 ) -> (Vec<f32>, Vec<f32>, Vec<half::f16>) {
-    let total_rows = batch * heads * seq;
-    let _total_o = total_rows * hd;
-    unimplemented!(
-        "run_b1_forward_for_test: gated on Phase 2.5 (dQ-kernel data-mobility). \
-         Wires only after the dQ-kernel emits real cp.async + HBM addressing."
+    // Phase 2.5: standalone validation uses CPU-naive forward (H1) to produce
+    // row_max / row_sum / O, severing the Phase 2.6 B.1-integration dependency.
+    // Tests are non-causal at the dQ-kernel level (causal masking is handled by
+    // the dQ-kernel's tile_skip predicate per spec §9.2).
+    let out = nsl_test::cpu_naive_forward::cpu_naive_forward(
+        q, k, v, batch, heads, seq, hd, /*causal=*/false,
     );
-    #[allow(unreachable_code)]
-    (
-        vec![0.0f32; total_rows],
-        vec![1.0f32; total_rows],
-        vec![half::f16::ZERO; _total_o],
-    )
+    (out.row_max, out.row_sum, out.o)
 }
 
 /// Phase-2.5-gated stub for the dQ-kernel GPU launcher.
