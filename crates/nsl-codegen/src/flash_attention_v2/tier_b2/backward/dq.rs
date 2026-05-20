@@ -73,6 +73,7 @@ fn emit_register_decls(ptx: &mut String, config: &FlashAttentionConfig) {
     ptx.push_str("    .reg .u32 %q_tile, %kv_tile, %head, %batch_idx;\n");
     ptx.push_str("    .reg .pred %p_tile_active, %p_producer, %p_consumer;\n");
     ptx.push_str("    .reg .u32 %addr_lo, %tile_skip_predicate;\n");
+    ptx.push_str("    .reg .u32 %row_index_tmp;\n");
     ptx.push_str("    .reg .u64 %addr;\n");
     // Scratch registers used by matmul_mma helpers (emit_load_a/b_fragment_smem).
     ptx.push_str("    .reg .u32 %mma_addr, %mma_a_row, %mma_b_row;\n");
@@ -637,5 +638,18 @@ mod tests {
         assert!(ptx.contains(&format!("{} (row, col) pairs per lane", per_lane_pairs)),
             "expected per-lane scatter bound = {} (row,col) pairs to appear, got:\n{ptx}",
             per_lane_pairs);
+    }
+
+    #[test]
+    fn dq_kernel_declares_row_index_tmp_scratch_for_hbm_addr_helpers() {
+        // emit_4d_byte_offset / emit_3d_byte_offset (dq::hbm_addr) require a caller-declared
+        // %row_index_tmp scratch; the synthesizer must include the declaration in
+        // emit_register_decls so future cp.async / HBM-finalize sites can call the helpers
+        // without producing undeclared-register ptxas errors.
+        let ptx = synthesize_dq_kernel(&canonical_cfg()).unwrap();
+        assert!(
+            ptx.contains(".reg .u32 %row_index_tmp"),
+            "synthesize_dq_kernel must declare %row_index_tmp scratch (caller contract for dq::hbm_addr helpers)"
+        );
     }
 }
