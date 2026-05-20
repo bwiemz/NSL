@@ -81,8 +81,18 @@ use cranelift_module::{DataDescription, Linkage as ModuleLinkage, Module};
 ///   dtype: i32         (4)
 ///   device_type: i32   (4)
 ///   device_id: i32     (4)
-/// Total = 40 bytes, 8-byte aligned.
-pub(crate) const NSL_TENSOR_DESC_SIZE: i64 = 40;
+///   tape_id: i64       (8)
+/// Total = 48 bytes, 8-byte aligned.
+///
+/// Bumped from 40 → 48 to carry the autodiff `tape_id` across desc
+/// round-trips (Spec B per-call grad context: backward keys the loss
+/// seed on `t.tape_id` and would fall through to the raw-pointer
+/// fallback if the desc dropped the id). The c_header_snapshot test
+/// pins the emitted C header to this layout. Two literal-`40`
+/// stack-slot allocations in `calibration/binary_codegen.rs` are
+/// updated in lockstep — they live outside this crate so cannot
+/// reference this constant directly.
+pub(crate) const NSL_TENSOR_DESC_SIZE: i64 = 48;
 
 pub fn emit_c_abi_wrapper(
     compiler: &mut Compiler,

@@ -310,6 +310,19 @@ pub extern "C" fn nsl_model_forward_grad(
     // Snapshot output tensor pointers from the (now-populated) output
     // descs. The first output is treated as the loss seed by backward
     // (scalar-loss convention from `nsl_tape_backward`).
+    //
+    // Load-bearing ordering: this runs AFTER `nsl_model_call` returns,
+    // which transitively invokes the codegen-emitted dispatch wrapper.
+    // The wrapper calls `nsl_tensor_to_desc_ffi(impl_tensor, scratch)`
+    // (copies the impl tensor's tape_id into the scratch desc), then
+    // `nsl_dispatch_apply_result(scratch, caller_output_desc)` mirrors
+    // `scratch.tape_id` onto the caller's output desc. So by the time
+    // `desc_to_nsl_tensor` reads `outputs_ptr` below, the desc's
+    // `tape_id` field carries the impl tensor's autodiff identity, and
+    // the resulting wrapper inherits it — which is what makes the loss
+    // seed in `run_backward_core` match a `TapeOp::*.out` tape_id
+    // instead of falling back to the raw-pointer keying that produced
+    // the original empty-grads bug.
     let output_ptrs: Vec<i64> = if num_outputs > 0 && outputs_ptr != 0 {
         let descs = unsafe {
             std::slice::from_raw_parts(

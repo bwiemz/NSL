@@ -34,6 +34,11 @@ class NslTensorDesc(ctypes.Structure):
         ("dtype", ctypes.c_int32),
         ("device_type", ctypes.c_int32),
         ("device_id", ctypes.c_int32),
+        # Autodiff tape id, copied verbatim across desc round-trips.
+        # Python-supplied input tensors have no tape history → 0 (ctypes
+        # auto-zeroes unset fields, but listing it explicitly here
+        # keeps the C ABI mirror byte-exact at 48 bytes).
+        ("tape_id", ctypes.c_int64),
     ]
 
 
@@ -259,8 +264,7 @@ def _numpy_to_dlpack(array: Any, lib: ctypes.CDLL) -> int:
     if not array.flags.c_contiguous:
         array = np.ascontiguousarray(array)
 
-    # Create NslTensor from numpy via the C API
-    from nslpy._core import _check_error
+    # Create NslTensor from numpy via the C API.
     # For now, use a simple approach: convert to torch first if available
     try:
         import torch

@@ -1053,9 +1053,14 @@ fn emit_calibration_forward_wrapper(
         b.switch_to_block(shape_ok);
         b.seal_block(shape_ok);
 
+        // NslTensorDesc is 48 bytes (8-byte aligned) — see
+        // `nsl_runtime::c_api::NslTensorDesc`. Field at offset 40 is
+        // `tape_id: i64` (added in the tape_id round-trip fix); the
+        // calibration forward wrapper has no autodiff context, so we
+        // zero it.
         let desc_slot = b.create_sized_stack_slot(StackSlotData::new(
             StackSlotKind::ExplicitSlot,
-            40,
+            48,
             3,
         ));
         let desc_addr = b.ins().stack_addr(cl_types::I64, desc_slot, 0);
@@ -1073,6 +1078,7 @@ fn emit_calibration_forward_wrapper(
         b.ins().store(MemFlags::trusted(), zero_i32, desc_addr, 28);
         b.ins().store(MemFlags::trusted(), zero_i32, desc_addr, 32);
         b.ins().store(MemFlags::trusted(), zero_i32, desc_addr, 36);
+        b.ins().store(MemFlags::trusted(), zero_i64, desc_addr, 40);
 
         let desc_to_tensor_ref = compiler.module.declare_func_in_func(desc_to_tensor_id, b.func);
         let desc_call = b.ins().call(desc_to_tensor_ref, &[desc_addr]);
@@ -1712,18 +1718,19 @@ fn emit_calibration_backward_wrapper(
 
         // ── Step 1: build NslTensorDesc for the input batch (mirrors forward wrapper). ──
         //
-        // NslTensorDesc layout (40 bytes, 8-byte aligned):
+        // NslTensorDesc layout (48 bytes, 8-byte aligned):
         //   offset  0: data_ptr (i64)
         //   offset  8: shape_ptr (i64)
         //   offset 16: strides_ptr (i64, 0 = row-major default)
         //   offset 24: ndim (i32)
         //   offset 28: dtype (i32) — C API convention: 0=f32, 1=f64 (opposite of NSL internal!)
         //                            calibration batches are f32, so dtype=0 here.
-        //   offset 32: device (i32, 0 = CPU)
-        //   offset 36: pad (i32)
+        //   offset 32: device_type (i32, 0 = CPU)
+        //   offset 36: device_id   (i32, 0 for CPU)
+        //   offset 40: tape_id     (i64, 0 — calibration has no autodiff context)
         let desc_slot = b.create_sized_stack_slot(StackSlotData::new(
             StackSlotKind::ExplicitSlot,
-            40,
+            48,
             3,
         ));
         let desc_addr = b.ins().stack_addr(cl_types::I64, desc_slot, 0);
@@ -1746,6 +1753,7 @@ fn emit_calibration_backward_wrapper(
         b.ins().store(MemFlags::trusted(), dtype_f32, desc_addr, 28);
         b.ins().store(MemFlags::trusted(), zero_i32, desc_addr, 32);
         b.ins().store(MemFlags::trusted(), zero_i32, desc_addr, 36);
+        b.ins().store(MemFlags::trusted(), zero_i64, desc_addr, 40);
 
         let desc_to_tensor_ref =
             compiler.module.declare_func_in_func(desc_to_tensor_id, b.func);

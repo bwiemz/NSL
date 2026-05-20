@@ -3507,6 +3507,18 @@ pub fn test_read_tensor_f64(ptr: i64) -> Vec<f64> {
     (0..len).map(|i| unsafe { *buf.add(i) }).collect()
 }
 
+/// Read `tape_id` from an `NslTensor` pointer.
+///
+/// Used by `tests/desc_tape_id_roundtrip.rs` to verify that the
+/// `NslTensorDesc::tape_id` field is carried verbatim across
+/// `nsl_tensor_to_desc_ffi` → `nsl_desc_to_tensor`. Returns the
+/// `tape_id` field as-is — `0` means "untracked".
+#[cfg(feature = "test-hooks")]
+pub fn test_tensor_tape_id(ptr: i64) -> i64 {
+    let t = unsafe { &*(ptr as *const NslTensor) };
+    t.tape_id
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------

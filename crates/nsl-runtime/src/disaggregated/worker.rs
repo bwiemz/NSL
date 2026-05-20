@@ -215,6 +215,7 @@ fn call_model_forward(model_ptr: i64, input_tensor_ptr: i64) -> Vec<i64> {
         dtype: crate::c_api::nsl_dtype_to_capi(tensor.dtype),
         device_type: if tensor.device > 0 { 1 } else { 0 },
         device_id: if tensor.device > 0 { (tensor.device - 1) as i32 } else { 0 },
+        tape_id: tensor.tape_id,
     };
 
     // Prepare output descriptor
@@ -226,6 +227,7 @@ fn call_model_forward(model_ptr: i64, input_tensor_ptr: i64) -> Vec<i64> {
         dtype: 0,
         device_type: 0,
         device_id: 0,
+        tape_id: 0,
     };
 
     let rc = crate::c_api::nsl_model_forward(
