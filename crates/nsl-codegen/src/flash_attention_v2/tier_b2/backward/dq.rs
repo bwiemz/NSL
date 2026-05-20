@@ -153,6 +153,16 @@ fn emit_register_decls(ptx: &mut String, _config: &FlashAttentionConfig) {
     ptx.push_str("    .reg .u64 %f2_smem_base64;\n");
     ptx.push_str("    .reg .u32 %f2_smem_base32;\n");
     ptx.push_str("    .reg .b16 %f2_val;\n");
+    // G1 dQ HBM finalize registers. Prefixed %g1_* to avoid clashes.
+    // Per PTX ISA all .reg decls must precede executable instructions -- declared here,
+    // used in emit_dq_finalize (after the outer loop closes).
+    // Per-lane row/col scratch computed once; reused across all fragments.
+    ptx.push_str("    .reg .u32 %g1_lane_mod4, %g1_lane_div4;\n");
+    ptx.push_str("    .reg .u32 %g1_q_tile_start, %g1_row_lo, %g1_row_hi;\n");
+    ptx.push_str("    .reg .u32 %g1_col_lo, %g1_col_hi;\n");
+    ptx.push_str("    .reg .u32 %g1_d_tmp;\n");
+    ptx.push_str("    .reg .u64 %g1_dq_byte_off, %g1_dq_addr;\n");
+    ptx.push_str("    .reg .u64 %g1_dq_base;\n");
     ptx.push('\n');
 }
 
@@ -1093,24 +1103,98 @@ fn emit_outer_loop_close(ptx: &mut String) {
     ptx.push_str("DQ_Q_ITER_DONE:\n");
 }
 
+/// G1: dQ HBM finalize addressing.
+///
+/// Scatter dQ_acc registers to row-major [B, H, S, D] f32 HBM output per spec §2.1.
+///
+/// Per-lane accumulator layout (m16n8 PTX spec, lane t):
+///   dq_acc_f_0: (row = t/4,     col = f*32 + (t%4)*2)
+///   dq_acc_f_1: (row = t/4,     col = f*32 + (t%4)*2 + 1)
+///   dq_acc_f_2: (row = t/4 + 8, col = f*32 + (t%4)*2)
+///   dq_acc_f_3: (row = t/4 + 8, col = f*32 + (t%4)*2 + 1)
+///
+/// HBM byte_offset = (((batch_idx * H + head) * S + (q_tile_start + row)) * D + col) * 4
+/// computed via A1's emit_4d_byte_offset (sizeof_dtype=4 for f32).
+///
+/// All registers (%g1_*) are declared in emit_register_decls to satisfy the PTX ISA
+/// constraint that all .reg directives precede executable instructions.
 fn emit_dq_finalize(ptx: &mut String, config: &FlashAttentionConfig) {
-    let accumulator_fragments = (config.head_dim / 32) as u32;
-    ptx.push_str("    // === dQ HBM finalize ===\n");
-    ptx.push_str("    // Scatter dQ_acc registers to HBM dQ[B, H, q_tile, hd].\n");
-    ptx.push_str("    // Each warp owns a 32-col strip of the bq x hd output tile.\n");
-    ptx.push_str("    // Address: dq_base + (batch*H + head)*S*hd*4 + q_tile_start*hd*4 + lane_offset\n");
+    use hbm_addr::emit_4d_byte_offset;
+
+    let bq = tier_b2_effective_bq(config);
+    let hd = config.head_dim as u32;
+    let accumulator_fragments = hd / 32;
+
+    ptx.push_str("    // === G1: dQ HBM finalize addressing ===\n");
+    ptx.push_str("    // Scatter dQ_acc registers to HBM dQ[B,H,S,D] row-major f32.\n");
+    ptx.push_str("    // Per spec s2.1: byte_offset = (((b*H+h)*S+s)*D+d)*4.\n");
+    ptx.push_str("    // Per-lane row/col scratch is computed once, reused across all fragments.\n");
+
+    // Per-lane scratch: lane%4 and lane/4
+    ptx.push_str("    and.b32 %g1_lane_mod4, %lane_id, 3;\n");
+    ptx.push_str("    shr.u32 %g1_lane_div4, %lane_id, 2;\n");
+
+    // q_tile_start = q_iter * bq
+    ptx.push_str(&format!("    mul.lo.u32 %g1_q_tile_start, %q_iter, {bq};\n"));
+
+    // row_lo = q_tile_start + lane/4      (the "lo" MMA row)
+    // row_hi = q_tile_start + lane/4 + 8  (the "hi" MMA row)
+    ptx.push_str("    add.u32 %g1_row_lo, %g1_q_tile_start, %g1_lane_div4;\n");
+    ptx.push_str("    add.u32 %g1_row_hi, %g1_row_lo, 8;\n");
+
+    // col_lo = (lane%4) * 2
+    // col_hi = col_lo + 1
+    ptx.push_str("    shl.b32 %g1_col_lo, %g1_lane_mod4, 1;\n");
+    ptx.push_str("    add.u32 %g1_col_hi, %g1_col_lo, 1;\n");
+
+    // Load the dQ HBM base pointer once.
+    ptx.push_str("    ld.param.u64 %g1_dq_base, [d_q_out_ptr];\n");
+
     for f in 0..accumulator_fragments {
-        for r in 0..4 {
-            ptx.push_str(&format!(
-                "    // Fragment {} reg {} -> HBM dQ[batch, head, q_local, hd_slice]\n",
-                f, r,
-            ));
-            ptx.push_str(&format!(
-                "    st.global.f32 [%addr], %dq_acc_{}_{};\n",
-                f, r,
-            ));
+        let frag_col_base = f * 32;
+
+        // For each of the 4 dq_acc registers in fragment f:
+        //   r=0: (row_lo, col_lo + frag_col_base)
+        //   r=1: (row_lo, col_hi + frag_col_base)
+        //   r=2: (row_hi, col_lo + frag_col_base)
+        //   r=3: (row_hi, col_hi + frag_col_base)
+        let stores: [(u32, &str, &str); 4] = [
+            (0, "%g1_row_lo", "%g1_col_lo"),
+            (1, "%g1_row_lo", "%g1_col_hi"),
+            (2, "%g1_row_hi", "%g1_col_lo"),
+            (3, "%g1_row_hi", "%g1_col_hi"),
+        ];
+
+        for (r, row_reg, col_reg) in stores {
+            // Compute final d_col = col_reg + frag_col_base.
+            // If frag_col_base == 0, col_reg is already correct; reuse it directly.
+            // Otherwise compute into %g1_d_tmp (single scratch; written before each use).
+            let d_reg: String = if frag_col_base == 0 {
+                col_reg.to_string()
+            } else {
+                ptx.push_str(&format!(
+                    "    add.u32 %g1_d_tmp, {col_reg}, {frag_col_base};\n"
+                ));
+                "%g1_d_tmp".to_string()
+            };
+
+            emit_4d_byte_offset(
+                ptx,
+                "%g1_dq_byte_off",
+                "%batch_idx",
+                "%head",
+                row_reg,
+                &d_reg,
+                "%heads_r",
+                "%seq_len_r",
+                hd,
+                4, // f32 sizeof
+            );
+            ptx.push_str("    add.u64 %g1_dq_addr, %g1_dq_base, %g1_dq_byte_off;\n");
+            ptx.push_str(&format!("    st.global.f32 [%g1_dq_addr], %dq_acc_{f}_{r};\n"));
         }
     }
+
     ptx.push_str("    bar.sync 0;\n");
 }
 
@@ -1322,10 +1406,10 @@ mod tests {
     #[test]
     fn synthesize_dq_kernel_scatters_dq_acc_to_hbm() {
         let ptx = synthesize_dq_kernel(&canonical_cfg()).unwrap();
-        assert!(ptx.contains("// === dQ HBM finalize ==="),
-            "expected dQ finalize section");
-        assert!(ptx.contains("st.global"),
-            "expected st.global for dQ scatter");
+        assert!(ptx.contains("// === G1: dQ HBM finalize addressing ==="),
+            "expected G1 dQ finalize section");
+        assert!(ptx.contains("st.global.f32"),
+            "expected st.global.f32 for dQ scatter via real HBM addressing");
     }
 
     #[test]
