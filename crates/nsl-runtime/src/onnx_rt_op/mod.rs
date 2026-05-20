@@ -22,52 +22,7 @@
 #![allow(non_camel_case_types)]
 #![allow(dead_code)]
 
-pub mod vendored {
-    //! Placeholder — populated in Task 2 with vendored ORT C-API struct
-    //! definitions extracted from ORT 1.22.x `onnxruntime_c_api.h`.
-
-    /// Expected `ORT_API_VERSION` for ORT 1.22.x. Asserted at the FFI
-    /// boundary in `RegisterCustomOps` to refuse loads from mismatched
-    /// ORT runtimes.
-    pub const EXPECTED_ORT_API_VERSION: u32 = 22;
-
-    #[repr(C)]
-    pub struct OrtSessionOptions(pub *mut std::ffi::c_void);
-
-    #[repr(C)]
-    pub struct OrtApiBase {
-        pub GetApi: unsafe extern "C" fn(version: u32) -> *const OrtApi,
-        pub _rest: [*mut std::ffi::c_void; 1],
-    }
-
-    #[repr(C)]
-    pub struct OrtApi {
-        pub _placeholder: [*mut std::ffi::c_void; 64],
-    }
-
-    #[repr(C)]
-    pub struct OrtStatus {
-        pub _placeholder: *mut std::ffi::c_void,
-    }
-
-    #[repr(C)]
-    pub struct OrtCustomOp {
-        pub _placeholder: [*mut std::ffi::c_void; 16],
-    }
-
-    #[repr(C)]
-    pub struct OrtCustomOpDomain(pub *mut std::ffi::c_void);
-
-    /// Placeholder for `OrtErrorCode` — full enum lands in Task 2.
-    /// Per spec blocker guidance, simplified to a `u32` newtype to avoid
-    /// `#[repr(C, u32)]` conflicting-repr-hints error on current Rust.
-    #[repr(transparent)]
-    pub struct OrtErrorCode(pub u32);
-
-    impl OrtErrorCode {
-        pub const ORT_RUNTIME_EXCEPTION: OrtErrorCode = OrtErrorCode(6);
-    }
-}
+pub mod vendored;
 
 pub mod kernel {
     //! Placeholder — populated in Task 3 with the
