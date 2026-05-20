@@ -19,6 +19,12 @@ pub enum HirNode {
     SignExtend(SignExtend),
     GenerateFor(GenerateFor),
     GenerateIf(GenerateIf),
+    /// M57.1 wire-array realization: module-scope multi-dimensional wire
+    /// array. Declared once per array; referenced by element via
+    /// `SignalRef::WireArrayElement`. Does not produce a single WireId
+    /// (it declares an N-dimensional family of wires whose drivers are
+    /// `assign`s inside generate blocks).
+    WireArray(WireArray),
 }
 
 impl HirNode {
@@ -31,7 +37,10 @@ impl HirNode {
             HirNode::Add(a) => Some(a.out),
             HirNode::Max0(m) => Some(m.out),
             HirNode::SignExtend(s) => Some(s.dst),
-            // Register, GenerateFor, GenerateIf don't produce a single WireId.
+            // Register, GenerateFor, GenerateIf, WireArray don't produce a
+            // single WireId. (WireArray declares multi-element wire family;
+            // single-driver invariant for each element is the caller's
+            // responsibility, same as GenerateFor body uniqueness.)
             _ => None,
         }
     }

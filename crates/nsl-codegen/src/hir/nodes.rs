@@ -4,6 +4,41 @@ use crate::hir::clock_reset::{ClkRef, ResetRef};
 use crate::hir::ids::{RegisterId, WireId};
 use crate::hir::signals::SignalRef;
 
+// --- Wire-array primitives (M57.1 wire-array realization §2) ---
+
+/// Index expression for `SignalRef::WireArrayElement` — resolves to a Verilog
+/// expression at emit time.
+///
+/// M57.1 wire-array realization: the fused MLP emitter declares wire arrays
+/// like `acc_l1 [0:127][0:784]` and references their elements with mixed
+/// literal / genvar / genvar-plus-constant indices (e.g. `acc_l1[_gv_o][_gv_k]`
+/// for reads, `acc_l1[_gv_o][_gv_k + 1]` for ripple writes).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum IndexExpr {
+    /// Compile-time literal. Emits `n`.
+    Literal(usize),
+    /// Reference to a genvar declared by an enclosing `GenerateFor`.
+    /// Emits the literal genvar name (e.g. `_gv_o`).
+    Genvar(String),
+    /// Genvar plus a non-negative constant offset. Emits `(name + k)`.
+    /// Used for ripple-write targets like `acc[o][k + 1]`.
+    GenvarPlus(String, i64),
+}
+
+/// Module-scope multi-dimensional wire array declaration.
+///
+/// Emits `wire signed [width-1:0] {name} [0:{dims[0]-1}][0:{dims[1]-1}]...;`
+/// at the module level (before any generate blocks). Construction-time
+/// invariant: every `SignalRef::WireArrayElement { array_name: <name>, indices }`
+/// reference must have `indices.len() == dims.len()`. The emitter assumes
+/// well-formed HIR and does not validate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WireArray {
+    pub name: String,
+    pub dims: Vec<usize>,
+    pub width: usize,
+}
+
 // --- Module-boundary nodes ---
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -321,5 +356,44 @@ mod tests {
         assert_eq!(async_hi.reset.sync, ResetSync::Async);
         assert_eq!(async_lo.reset.sync, ResetSync::Async);
         assert_eq!(async_lo.reset.polarity, ResetPolarity::Low);
+    }
+
+    #[test]
+    fn index_expr_literal_constructs() {
+        let e = IndexExpr::Literal(5);
+        assert!(matches!(e, IndexExpr::Literal(5)));
+    }
+
+    #[test]
+    fn index_expr_genvar_constructs() {
+        let e = IndexExpr::Genvar("_gv_o".to_string());
+        match e {
+            IndexExpr::Genvar(name) => assert_eq!(name, "_gv_o"),
+            _ => panic!("expected Genvar"),
+        }
+    }
+
+    #[test]
+    fn index_expr_genvar_plus_constructs() {
+        let e = IndexExpr::GenvarPlus("_gv_k".to_string(), 1);
+        match e {
+            IndexExpr::GenvarPlus(name, k) => {
+                assert_eq!(name, "_gv_k");
+                assert_eq!(k, 1);
+            }
+            _ => panic!("expected GenvarPlus"),
+        }
+    }
+
+    #[test]
+    fn wire_array_constructs_with_dims_and_width() {
+        let wa = WireArray {
+            name: "acc_l1".to_string(),
+            dims: vec![128, 785],
+            width: 32,
+        };
+        assert_eq!(wa.name, "acc_l1");
+        assert_eq!(wa.dims, vec![128, 785]);
+        assert_eq!(wa.width, 32);
     }
 }

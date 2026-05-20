@@ -10,6 +10,20 @@ pub fn emit_signal_ref(s: &SignalRef) -> String {
         SignalRef::Register(r) => format!("_r{}", r.0),
         SignalRef::Port(name) => name.clone(),
         SignalRef::LocalParam(name) => name.clone(),
+        // M57.1 wire-array realization: variant added in Task W1 (HIR
+        // primitive). Verilog emission for indexed wire-array reads lands
+        // in a subsequent W-task (templates extension). Until then, no
+        // codegen pass should produce this variant; reaching here means a
+        // pass started emitting wire-array refs before the templates were
+        // taught how.
+        SignalRef::WireArrayElement { .. } => {
+            unreachable!(
+                "SignalRef::WireArrayElement emission not yet implemented \
+                 (M57.1 wire-array realization Task W1 added the HIR \
+                 primitive; Verilog template support arrives in a follow-up \
+                 W-task)"
+            )
+        }
     }
 }
 
@@ -188,6 +202,20 @@ pub fn emit_node(
         HirNode::SignExtend(s) => format!("{pad}{}", emit_sign_extend(s)),
         HirNode::GenerateFor(g) => emit_generate_for(g, indent, clock_domains, reset_signals),
         HirNode::GenerateIf(g) => emit_generate_if(g, indent, clock_domains, reset_signals),
+        // M57.1 wire-array realization: variant added in Task W1 (HIR
+        // primitive). Verilog emission for `wire signed [W-1:0] name [..][..];`
+        // declarations lands in a subsequent W-task (templates extension).
+        // Until then, no codegen pass should produce this node; reaching here
+        // means a pass started emitting wire-array decls before the templates
+        // were taught how.
+        HirNode::WireArray(_) => {
+            unreachable!(
+                "HirNode::WireArray emission not yet implemented \
+                 (M57.1 wire-array realization Task W1 added the HIR \
+                 primitive; Verilog template support arrives in a follow-up \
+                 W-task)"
+            )
+        }
     }
 }
 
