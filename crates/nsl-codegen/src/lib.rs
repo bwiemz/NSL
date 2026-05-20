@@ -213,6 +213,11 @@ pub use compiler::{
     StandaloneConfig,
 };
 
+/// M57.1 §3.2: re-exported from the (private) `compiler::kernel` module so that
+/// integration tests can pin the production redirect message without copying
+/// the literal. See `tests/fpga_target_redirect.rs`.
+pub use crate::compiler::kernel::FPGA_TARGET_REDIRECT_MSG;
+
 /// Task 4 test helper: compile a module and return any `WrgaPlan` produced
 /// during `@train` block lowering.  The plan is returned even when codegen
 /// fails *after* `wrga::run` has fired — this is deliberate: WRGA's observable

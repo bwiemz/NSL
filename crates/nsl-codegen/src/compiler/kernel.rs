@@ -9,6 +9,13 @@ use nsl_ast::stmt::{Stmt, StmtKind};
 use super::{Compiler, FlashAttentionCompileContext};
 use crate::error::CodegenError;
 
+/// M57.1 §3.2: v1-permanent redirect error message for `nsl build --target fpga`
+/// invocations on non-model kernels. The test `tests/fpga_target_redirect.rs`
+/// pins this exact text — keep them in sync.
+pub const FPGA_TARGET_REDIRECT_MSG: &str =
+    "`--target fpga` for general kernels is not supported in v1. \
+     Use `nsl fpga-compile <source>` for model-block FPGA compilation.";
+
 /// Parse the numeric SM version from a target string like `"sm_90"` → `90`.
 ///
 /// Accepts the generic `"cuda"` alias (used as `CompileOptions::default()`)
@@ -172,10 +179,7 @@ impl Compiler<'_> {
                 // recognizes "fpga"), but general-kernel FPGA compilation is not in v1's
                 // scope. Model-block compilation routes through `nsl fpga-compile`; this
                 // arm rejects non-model invocations with a redirecting error.
-                return Err(crate::error::CodegenError::new(
-                    "`--target fpga` for general kernels is not supported in v1. \
-                     Use `nsl fpga-compile <source>` for model-block FPGA compilation."
-                ));
+                return Err(crate::error::CodegenError::new(FPGA_TARGET_REDIRECT_MSG));
             }
             GpuTarget::Rocm | GpuTarget::Metal | GpuTarget::WebGpu => {
                 // M47b: AST -> KIR -> backend-specific lowerer
