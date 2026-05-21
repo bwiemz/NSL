@@ -73,6 +73,53 @@ pub fn compute_d_for_test(
     }
 }
 
+// ===== Phase 2.6 — FSource diagnostic surface + ForwardInputs carrier =====
+
+/// Sources the forward outputs for a dQ-kernel parity test. Independent of DSource.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FSource {
+    CpuNaive,
+    B1Forward,
+}
+
+/// Path-keyed forward inputs. Variant must match the FSource passed to compute_forward_for_test.
+pub enum ForwardInputs {
+    CpuNaive {
+        q: Vec<half::f16>,
+        k: Vec<half::f16>,
+        v: Vec<half::f16>,
+    },
+    B1Forward {
+        x: Vec<half::f16>,
+        wq: Vec<half::f16>,
+        wk: Vec<half::f16>,
+        wv: Vec<half::f16>,
+        norm_weight: Vec<half::f16>,
+    },
+}
+
+/// dO backward input -- path-independent, row-major [B,H,S,D] f16. Impl in T8.
+pub fn generate_d_o(_cfg: &nsl_codegen::flash_attention::FlashAttentionConfig) -> Vec<half::f16> {
+    unimplemented!("generate_d_o: implemented in Phase 2.6 Task 8")
+}
+
+/// Generate path-appropriate random forward inputs for `source`. Impl in T8.
+pub fn generate_forward_inputs(
+    _cfg: &nsl_codegen::flash_attention::FlashAttentionConfig,
+    _source: FSource,
+) -> ForwardInputs {
+    unimplemented!("generate_forward_inputs: implemented in Phase 2.6 Task 8")
+}
+
+/// Source the forward outputs. CpuNaive -> cpu_naive_forward; B1Forward -> adapter (cuda). Impl in T10.
+pub fn compute_forward_for_test(
+    _inputs: &ForwardInputs,
+    _cfg: &nsl_codegen::flash_attention::FlashAttentionConfig,
+    _source: FSource,
+) -> crate::cpu_naive_forward::ForwardOutputs {
+    unimplemented!("compute_forward_for_test: implemented in Phase 2.6 Task 10")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

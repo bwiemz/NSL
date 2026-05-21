@@ -63,3 +63,43 @@ fn diagnostic_mode_swap_localizes_d_bug() {
     println!("  corrupted D: max_abs = {:.3} (FAIL)", b2_max_abs);
     println!("  CPU-naive D: max_abs = {:.3e} (PASS)", cpu_max_abs);
 }
+
+#[test]
+fn fsource_enum_variants_and_copy() {
+    use nsl_test::diagnostic_mode::FSource;
+    let a = FSource::CpuNaive;
+    let b = a;
+    assert_eq!(a, b);
+    assert_ne!(FSource::CpuNaive, FSource::B1Forward);
+}
+
+#[test]
+fn forward_inputs_cpu_naive_variant_carries_q_k_v() {
+    use half::f16;
+    use nsl_test::diagnostic_mode::ForwardInputs;
+    let inputs = ForwardInputs::CpuNaive {
+        q: vec![f16::from_f32(1.0); 8], k: vec![f16::from_f32(2.0); 8], v: vec![f16::from_f32(3.0); 8],
+    };
+    match inputs {
+        ForwardInputs::CpuNaive { q, k, v } => { assert_eq!(q.len(), 8); assert_eq!(k.len(), 8); assert_eq!(v.len(), 8); }
+        _ => panic!("expected CpuNaive"),
+    }
+}
+
+#[test]
+fn forward_inputs_b1_forward_variant_carries_x_w_norm() {
+    use half::f16;
+    use nsl_test::diagnostic_mode::ForwardInputs;
+    let inputs = ForwardInputs::B1Forward {
+        x: vec![f16::from_f32(1.0); 16], wq: vec![f16::from_f32(2.0); 16],
+        wk: vec![f16::from_f32(3.0); 16], wv: vec![f16::from_f32(4.0); 16],
+        norm_weight: vec![f16::from_f32(1.0); 4],
+    };
+    match inputs {
+        ForwardInputs::B1Forward { x, wq, wk, wv, norm_weight } => {
+            assert_eq!(x.len(), 16); assert_eq!(wq.len(), 16); assert_eq!(wk.len(), 16);
+            assert_eq!(wv.len(), 16); assert_eq!(norm_weight.len(), 4);
+        }
+        _ => panic!("expected B1Forward"),
+    }
+}
