@@ -20,6 +20,11 @@ use half::f16;
 /// - `row_sum`: f32 [B, H, S] — sum of exp(S - row_max) over attended keys (NOT reciprocal)
 /// - `o`:       f16 [B, H, S, D] row-major — attention output
 pub struct ForwardOutputs {
+    /// Forward inputs as the kernel sees them, row-major [B,H,S,D] f16.
+    /// CPU-naive path: direct copies of test inputs. B.1 path: adapter reshape.
+    pub q_saved: Vec<f16>,
+    pub k_saved: Vec<f16>,
+    pub v_saved: Vec<f16>,
     pub row_max: Vec<f32>,
     pub row_sum: Vec<f32>,
     pub o:       Vec<f16>,
@@ -104,5 +109,12 @@ pub fn cpu_naive_forward(
         }
     }
 
-    ForwardOutputs { row_max, row_sum, o }
+    ForwardOutputs {
+        q_saved: q.to_vec(),
+        k_saved: k.to_vec(),
+        v_saved: v.to_vec(),
+        row_max,
+        row_sum,
+        o,
+    }
 }

@@ -35,10 +35,31 @@ fn canonical_config() -> FlashAttentionConfig {
     }
 }
 
+/// Canonical config + Phase 2.6 (T2.5) backward-activation saves enabled.
+fn save_config() -> FlashAttentionConfig {
+    let mut c = canonical_config();
+    if let Some(e) = c.csha.as_mut() {
+        e.save_activations_for_backward = true;
+    }
+    c
+}
+
 #[test]
 #[ignore = "requires ptxas + cuobjdump on PATH; lift in CI with CUDA toolchain"]
 fn tier_b1_canonical_no_register_spills() {
-    let config = canonical_config();
+    assert_no_spills(&canonical_config(), "canonical");
+}
+
+#[test]
+#[ignore = "requires ptxas + cuobjdump on PATH; lift in CI with CUDA toolchain"]
+fn tier_b1_save_activations_no_register_spills() {
+    // The Phase 2.6 (T2.5) save sweep adds %psv_* scratch + SMEM->HBM
+    // scatters; verify it does not introduce register spills.
+    assert_no_spills(&save_config(), "save_activations");
+}
+
+fn assert_no_spills(config: &FlashAttentionConfig, label: &str) {
+    let config = config.clone();
     let chunk: u32 = 128;
     let mut ptx_bytes = synthesize(&config, chunk);
     // synthesize appends a NUL terminator; strip it so the file is valid text.
@@ -48,7 +69,7 @@ fn tier_b1_canonical_no_register_spills() {
 
     let pid = std::process::id();
     let mut ptx_path = std::env::temp_dir();
-    ptx_path.push(format!("tier_b1_sass_check_{}.ptx", pid));
+    ptx_path.push(format!("tier_b1_sass_check_{}_{}.ptx", label, pid));
     std::fs::write(&ptx_path, &ptx_bytes).expect("write ptx temp");
 
     let mut cubin_path = ptx_path.clone();
@@ -105,22 +126,20 @@ fn tier_b1_canonical_no_register_spills() {
     // Print summary regardless so --nocapture shows the SASS line counts.
     let total_sass_lines = sass.lines().count();
     println!(
-        "SASS summary: {} total lines, {} LDL (spill loads), {} STL (spill stores)",
-        total_sass_lines, ldl_count, stl_count
+        "SASS summary [{}]: {} total lines, {} LDL (spill loads), {} STL (spill stores)",
+        label, total_sass_lines, ldl_count, stl_count
     );
 
     assert_eq!(
-        ldl_count,
-        0,
-        "tier_b1 canonical config emitted {} LDL (register spill loads); \
+        ldl_count, 0,
+        "tier_b1 {} config emitted {} LDL (register spill loads); \
          spec section 11 requires 0 for admitted V3 supported-matrix configs",
-        ldl_count
+        label, ldl_count
     );
     assert_eq!(
-        stl_count,
-        0,
-        "tier_b1 canonical config emitted {} STL (register spill stores); \
+        stl_count, 0,
+        "tier_b1 {} config emitted {} STL (register spill stores); \
          spec section 11 requires 0 for admitted V3 supported-matrix configs",
-        stl_count
+        label, stl_count
     );
 }

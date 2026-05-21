@@ -65,7 +65,7 @@ expression: ptx
     and.b32 %qmma_n_tile, %qmma_global_t, 3;
     shl.b32 %qmma_x_warp_off, %qmma_m_tile, 12;
     add.u32 %qmma_a_base, %tb1_q_smem_x_u32, %qmma_x_warp_off;
-    shl.b32 %qmma_w_warp_off, %qmma_n_tile, 4;
+    shl.b32 %qmma_w_warp_off, %qmma_n_tile, 11;
     add.u32 %qmma_b_base, %tb1_q_smem_w_u32, %qmma_w_warp_off;
     .reg .b32 %tb1_q_a_0_0_0, %tb1_q_a_0_0_1, %tb1_q_a_0_0_2, %tb1_q_a_0_0_3;
     .reg .b32 %tb1_q_b_0_0_0, %tb1_q_b_0_0_1;
@@ -384,7 +384,7 @@ expression: ptx
     and.b32 %qmma_n_tile, %qmma_global_t, 3;
     shl.b32 %qmma_x_warp_off, %qmma_m_tile, 12;
     add.u32 %qmma_a_base, %tb1_q_smem_x_u32, %qmma_x_warp_off;
-    shl.b32 %qmma_w_warp_off, %qmma_n_tile, 4;
+    shl.b32 %qmma_w_warp_off, %qmma_n_tile, 11;
     add.u32 %qmma_b_base, %tb1_q_smem_w_u32, %qmma_w_warp_off;
     .reg .b32 %tb1_q_a_1_0_0, %tb1_q_a_1_0_1, %tb1_q_a_1_0_2, %tb1_q_a_1_0_3;
     .reg .b32 %tb1_q_b_1_0_0, %tb1_q_b_1_0_1;
@@ -703,7 +703,7 @@ expression: ptx
     and.b32 %qmma_n_tile, %qmma_global_t, 3;
     shl.b32 %qmma_x_warp_off, %qmma_m_tile, 12;
     add.u32 %qmma_a_base, %tb1_q_smem_x_u32, %qmma_x_warp_off;
-    shl.b32 %qmma_w_warp_off, %qmma_n_tile, 4;
+    shl.b32 %qmma_w_warp_off, %qmma_n_tile, 11;
     add.u32 %qmma_b_base, %tb1_q_smem_w_u32, %qmma_w_warp_off;
     .reg .b32 %tb1_q_a_2_0_0, %tb1_q_a_2_0_1, %tb1_q_a_2_0_2, %tb1_q_a_2_0_3;
     .reg .b32 %tb1_q_b_2_0_0, %tb1_q_b_2_0_1;
@@ -1022,7 +1022,7 @@ expression: ptx
     and.b32 %qmma_n_tile, %qmma_global_t, 3;
     shl.b32 %qmma_x_warp_off, %qmma_m_tile, 12;
     add.u32 %qmma_a_base, %tb1_q_smem_x_u32, %qmma_x_warp_off;
-    shl.b32 %qmma_w_warp_off, %qmma_n_tile, 4;
+    shl.b32 %qmma_w_warp_off, %qmma_n_tile, 11;
     add.u32 %qmma_b_base, %tb1_q_smem_w_u32, %qmma_w_warp_off;
     .reg .b32 %tb1_q_a_3_0_0, %tb1_q_a_3_0_1, %tb1_q_a_3_0_2, %tb1_q_a_3_0_3;
     .reg .b32 %tb1_q_b_3_0_0, %tb1_q_b_3_0_1;
@@ -1341,7 +1341,7 @@ expression: ptx
     and.b32 %qmma_n_tile, %qmma_global_t, 3;
     shl.b32 %qmma_x_warp_off, %qmma_m_tile, 12;
     add.u32 %qmma_a_base, %tb1_q_smem_x_u32, %qmma_x_warp_off;
-    shl.b32 %qmma_w_warp_off, %qmma_n_tile, 4;
+    shl.b32 %qmma_w_warp_off, %qmma_n_tile, 11;
     add.u32 %qmma_b_base, %tb1_q_smem_w_u32, %qmma_w_warp_off;
     .reg .b32 %tb1_q_a_4_0_0, %tb1_q_a_4_0_1, %tb1_q_a_4_0_2, %tb1_q_a_4_0_3;
     .reg .b32 %tb1_q_b_4_0_0, %tb1_q_b_4_0_1;
@@ -1660,7 +1660,7 @@ expression: ptx
     and.b32 %qmma_n_tile, %qmma_global_t, 3;
     shl.b32 %qmma_x_warp_off, %qmma_m_tile, 12;
     add.u32 %qmma_a_base, %tb1_q_smem_x_u32, %qmma_x_warp_off;
-    shl.b32 %qmma_w_warp_off, %qmma_n_tile, 4;
+    shl.b32 %qmma_w_warp_off, %qmma_n_tile, 11;
     add.u32 %qmma_b_base, %tb1_q_smem_w_u32, %qmma_w_warp_off;
     .reg .b32 %tb1_q_a_5_0_0, %tb1_q_a_5_0_1, %tb1_q_a_5_0_2, %tb1_q_a_5_0_3;
     .reg .b32 %tb1_q_b_5_0_0, %tb1_q_b_5_0_1;
@@ -1979,7 +1979,7 @@ expression: ptx
     and.b32 %qmma_n_tile, %qmma_global_t, 3;
     shl.b32 %qmma_x_warp_off, %qmma_m_tile, 12;
     add.u32 %qmma_a_base, %tb1_q_smem_x_u32, %qmma_x_warp_off;
-    shl.b32 %qmma_w_warp_off, %qmma_n_tile, 4;
+    shl.b32 %qmma_w_warp_off, %qmma_n_tile, 11;
     add.u32 %qmma_b_base, %tb1_q_smem_w_u32, %qmma_w_warp_off;
     .reg .b32 %tb1_q_a_6_0_0, %tb1_q_a_6_0_1, %tb1_q_a_6_0_2, %tb1_q_a_6_0_3;
     .reg .b32 %tb1_q_b_6_0_0, %tb1_q_b_6_0_1;
@@ -2298,7 +2298,7 @@ expression: ptx
     and.b32 %qmma_n_tile, %qmma_global_t, 3;
     shl.b32 %qmma_x_warp_off, %qmma_m_tile, 12;
     add.u32 %qmma_a_base, %tb1_q_smem_x_u32, %qmma_x_warp_off;
-    shl.b32 %qmma_w_warp_off, %qmma_n_tile, 4;
+    shl.b32 %qmma_w_warp_off, %qmma_n_tile, 11;
     add.u32 %qmma_b_base, %tb1_q_smem_w_u32, %qmma_w_warp_off;
     .reg .b32 %tb1_q_a_7_0_0, %tb1_q_a_7_0_1, %tb1_q_a_7_0_2, %tb1_q_a_7_0_3;
     .reg .b32 %tb1_q_b_7_0_0, %tb1_q_b_7_0_1;
@@ -2617,7 +2617,7 @@ expression: ptx
     and.b32 %qmma_n_tile, %qmma_global_t, 3;
     shl.b32 %qmma_x_warp_off, %qmma_m_tile, 12;
     add.u32 %qmma_a_base, %tb1_q_smem_x_u32, %qmma_x_warp_off;
-    shl.b32 %qmma_w_warp_off, %qmma_n_tile, 4;
+    shl.b32 %qmma_w_warp_off, %qmma_n_tile, 11;
     add.u32 %qmma_b_base, %tb1_q_smem_w_u32, %qmma_w_warp_off;
     .reg .b32 %tb1_q_a_8_0_0, %tb1_q_a_8_0_1, %tb1_q_a_8_0_2, %tb1_q_a_8_0_3;
     .reg .b32 %tb1_q_b_8_0_0, %tb1_q_b_8_0_1;
@@ -2936,7 +2936,7 @@ expression: ptx
     and.b32 %qmma_n_tile, %qmma_global_t, 3;
     shl.b32 %qmma_x_warp_off, %qmma_m_tile, 12;
     add.u32 %qmma_a_base, %tb1_q_smem_x_u32, %qmma_x_warp_off;
-    shl.b32 %qmma_w_warp_off, %qmma_n_tile, 4;
+    shl.b32 %qmma_w_warp_off, %qmma_n_tile, 11;
     add.u32 %qmma_b_base, %tb1_q_smem_w_u32, %qmma_w_warp_off;
     .reg .b32 %tb1_q_a_9_0_0, %tb1_q_a_9_0_1, %tb1_q_a_9_0_2, %tb1_q_a_9_0_3;
     .reg .b32 %tb1_q_b_9_0_0, %tb1_q_b_9_0_1;
@@ -3255,7 +3255,7 @@ expression: ptx
     and.b32 %qmma_n_tile, %qmma_global_t, 3;
     shl.b32 %qmma_x_warp_off, %qmma_m_tile, 12;
     add.u32 %qmma_a_base, %tb1_q_smem_x_u32, %qmma_x_warp_off;
-    shl.b32 %qmma_w_warp_off, %qmma_n_tile, 4;
+    shl.b32 %qmma_w_warp_off, %qmma_n_tile, 11;
     add.u32 %qmma_b_base, %tb1_q_smem_w_u32, %qmma_w_warp_off;
     .reg .b32 %tb1_q_a_10_0_0, %tb1_q_a_10_0_1, %tb1_q_a_10_0_2, %tb1_q_a_10_0_3;
     .reg .b32 %tb1_q_b_10_0_0, %tb1_q_b_10_0_1;
@@ -3574,7 +3574,7 @@ expression: ptx
     and.b32 %qmma_n_tile, %qmma_global_t, 3;
     shl.b32 %qmma_x_warp_off, %qmma_m_tile, 12;
     add.u32 %qmma_a_base, %tb1_q_smem_x_u32, %qmma_x_warp_off;
-    shl.b32 %qmma_w_warp_off, %qmma_n_tile, 4;
+    shl.b32 %qmma_w_warp_off, %qmma_n_tile, 11;
     add.u32 %qmma_b_base, %tb1_q_smem_w_u32, %qmma_w_warp_off;
     .reg .b32 %tb1_q_a_11_0_0, %tb1_q_a_11_0_1, %tb1_q_a_11_0_2, %tb1_q_a_11_0_3;
     .reg .b32 %tb1_q_b_11_0_0, %tb1_q_b_11_0_1;
@@ -3893,7 +3893,7 @@ expression: ptx
     and.b32 %qmma_n_tile, %qmma_global_t, 3;
     shl.b32 %qmma_x_warp_off, %qmma_m_tile, 12;
     add.u32 %qmma_a_base, %tb1_q_smem_x_u32, %qmma_x_warp_off;
-    shl.b32 %qmma_w_warp_off, %qmma_n_tile, 4;
+    shl.b32 %qmma_w_warp_off, %qmma_n_tile, 11;
     add.u32 %qmma_b_base, %tb1_q_smem_w_u32, %qmma_w_warp_off;
     .reg .b32 %tb1_q_a_12_0_0, %tb1_q_a_12_0_1, %tb1_q_a_12_0_2, %tb1_q_a_12_0_3;
     .reg .b32 %tb1_q_b_12_0_0, %tb1_q_b_12_0_1;
@@ -4212,7 +4212,7 @@ expression: ptx
     and.b32 %qmma_n_tile, %qmma_global_t, 3;
     shl.b32 %qmma_x_warp_off, %qmma_m_tile, 12;
     add.u32 %qmma_a_base, %tb1_q_smem_x_u32, %qmma_x_warp_off;
-    shl.b32 %qmma_w_warp_off, %qmma_n_tile, 4;
+    shl.b32 %qmma_w_warp_off, %qmma_n_tile, 11;
     add.u32 %qmma_b_base, %tb1_q_smem_w_u32, %qmma_w_warp_off;
     .reg .b32 %tb1_q_a_13_0_0, %tb1_q_a_13_0_1, %tb1_q_a_13_0_2, %tb1_q_a_13_0_3;
     .reg .b32 %tb1_q_b_13_0_0, %tb1_q_b_13_0_1;
@@ -4531,7 +4531,7 @@ expression: ptx
     and.b32 %qmma_n_tile, %qmma_global_t, 3;
     shl.b32 %qmma_x_warp_off, %qmma_m_tile, 12;
     add.u32 %qmma_a_base, %tb1_q_smem_x_u32, %qmma_x_warp_off;
-    shl.b32 %qmma_w_warp_off, %qmma_n_tile, 4;
+    shl.b32 %qmma_w_warp_off, %qmma_n_tile, 11;
     add.u32 %qmma_b_base, %tb1_q_smem_w_u32, %qmma_w_warp_off;
     .reg .b32 %tb1_q_a_14_0_0, %tb1_q_a_14_0_1, %tb1_q_a_14_0_2, %tb1_q_a_14_0_3;
     .reg .b32 %tb1_q_b_14_0_0, %tb1_q_b_14_0_1;
@@ -4850,7 +4850,7 @@ expression: ptx
     and.b32 %qmma_n_tile, %qmma_global_t, 3;
     shl.b32 %qmma_x_warp_off, %qmma_m_tile, 12;
     add.u32 %qmma_a_base, %tb1_q_smem_x_u32, %qmma_x_warp_off;
-    shl.b32 %qmma_w_warp_off, %qmma_n_tile, 4;
+    shl.b32 %qmma_w_warp_off, %qmma_n_tile, 11;
     add.u32 %qmma_b_base, %tb1_q_smem_w_u32, %qmma_w_warp_off;
     .reg .b32 %tb1_q_a_15_0_0, %tb1_q_a_15_0_1, %tb1_q_a_15_0_2, %tb1_q_a_15_0_3;
     .reg .b32 %tb1_q_b_15_0_0, %tb1_q_b_15_0_1;

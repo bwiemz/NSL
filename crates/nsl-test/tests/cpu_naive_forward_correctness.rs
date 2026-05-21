@@ -84,3 +84,18 @@ fn cpu_naive_forward_no_nan_in_outputs_for_finite_inputs() {
     for &r in &out.row_sum { assert!(r.is_finite()); }
     for &o in &out.o { assert!(o.to_f32().is_finite()); }
 }
+
+#[test]
+fn cpu_naive_forward_populates_q_saved_k_saved_v_saved_as_test_input_copies() {
+    use half::f16;
+    use nsl_test::cpu_naive_forward::cpu_naive_forward;
+    let b = 1usize; let h = 1usize; let s = 4usize; let d = 4usize;
+    let q: Vec<f16> = (0..b*h*s*d).map(|i| f16::from_f32(i as f32 * 0.01)).collect();
+    let k: Vec<f16> = (0..b*h*s*d).map(|i| f16::from_f32(i as f32 * 0.02)).collect();
+    let v: Vec<f16> = (0..b*h*s*d).map(|i| f16::from_f32(i as f32 * 0.03)).collect();
+    let out = cpu_naive_forward(&q, &k, &v, b, h, s, d, false);
+    assert_eq!(out.q_saved, q, "q_saved must equal test input q");
+    assert_eq!(out.k_saved, k, "k_saved must equal test input k");
+    assert_eq!(out.v_saved, v, "v_saved must equal test input v");
+    assert_eq!(out.q_saved.len(), b*h*s*d);
+}

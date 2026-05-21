@@ -73,6 +73,157 @@ pub fn compute_d_for_test(
     }
 }
 
+// ===== Phase 2.6 — FSource diagnostic surface + ForwardInputs carrier =====
+
+/// Test-default tensor dimensions for the forward-path generators + dispatch.
+/// Match the dQ-kernel test conventions (batch=1, heads=1). `seq` is threaded
+/// as an explicit parameter (CpuNaive uses 64/128 for multi-q-tile coverage;
+/// B1Forward is pinned to 32 by the single-block forward precondition). `D` and
+/// `d_model` come from the config (`head_dim` / `csha.d_model`).
+const TEST_DEFAULT_BATCH: usize = 1;
+const TEST_DEFAULT_HEADS: usize = 1;
+
+/// Sources the forward outputs for a dQ-kernel parity test. Independent of DSource.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FSource {
+    CpuNaive,
+    B1Forward,
+}
+
+/// Path-keyed forward inputs. Variant must match the FSource passed to compute_forward_for_test.
+pub enum ForwardInputs {
+    CpuNaive {
+        q: Vec<half::f16>,
+        k: Vec<half::f16>,
+        v: Vec<half::f16>,
+    },
+    B1Forward {
+        x: Vec<half::f16>,
+        wq: Vec<half::f16>,
+        wk: Vec<half::f16>,
+        wv: Vec<half::f16>,
+        norm_weight: Vec<half::f16>,
+    },
+}
+
+/// dO backward input -- path-independent, row-major [B,H,S,D] f16.
+///
+/// Deterministic (cosine-of-index) so parity tests are reproducible across
+/// the CpuNaive and B1Forward forward paths. `D = cfg.head_dim`; `seq` is
+/// passed explicitly so the CpuNaive sweep can use 64/128 while B1Forward uses 32.
+pub fn generate_d_o(
+    cfg: &nsl_codegen::flash_attention::FlashAttentionConfig,
+    seq: usize,
+) -> Vec<half::f16> {
+    let (b, h, s, d) = (
+        TEST_DEFAULT_BATCH,
+        TEST_DEFAULT_HEADS,
+        seq,
+        cfg.head_dim as usize,
+    );
+    (0..b * h * s * d)
+        .map(|i| half::f16::from_f32((i as f32 * 0.419).cos() * 0.1))
+        .collect()
+}
+
+/// Generate path-appropriate deterministic forward inputs for `source`.
+///
+/// - `CpuNaive`: raw row-major `[B,H,S,D]` q/k/v consumed directly by
+///   `cpu_naive_forward`.
+/// - `B1Forward`: raw (un-normalized, un-chunkified) row-major inputs —
+///   `x` is `[B,S,d_model]`, `wq/wk/wv` are `[d_model, H*D]`, `norm_weight`
+///   is `[d_model]`. The launcher (`run_b1_forward_and_adapt`) performs
+///   RMSNorm + narrow + chunkify before the GPU launch.
+///
+/// `seq` is passed explicitly: CpuNaive uses 64/128 for multi-q-tile coverage,
+/// B1Forward is pinned to 32 by the single-block forward precondition.
+pub fn generate_forward_inputs(
+    cfg: &nsl_codegen::flash_attention::FlashAttentionConfig,
+    source: FSource,
+    seq: usize,
+) -> ForwardInputs {
+    let (b, h, s, d) = (
+        TEST_DEFAULT_BATCH,
+        TEST_DEFAULT_HEADS,
+        seq,
+        cfg.head_dim as usize,
+    );
+    match source {
+        FSource::CpuNaive => {
+            let q = (0..b * h * s * d)
+                .map(|i| half::f16::from_f32((i as f32 * 0.137).sin() * 0.1))
+                .collect();
+            let k = (0..b * h * s * d)
+                .map(|i| half::f16::from_f32((i as f32 * 0.211).cos() * 0.1))
+                .collect();
+            let v = (0..b * h * s * d)
+                .map(|i| half::f16::from_f32((i as f32 * 0.317).sin() * 0.1))
+                .collect();
+            ForwardInputs::CpuNaive { q, k, v }
+        }
+        FSource::B1Forward => {
+            let d_model = cfg.csha.as_ref().map(|c| c.d_model as usize).unwrap_or(128);
+            // Raw (un-normalized, un-chunkified) row-major inputs; the launcher
+            // (run_b1_forward_and_adapt) does RMSNorm + chunkify before launch.
+            let x = (0..b * s * d_model)
+                .map(|i| half::f16::from_f32((i as f32 * 0.077).sin() * 0.05))
+                .collect();
+            let wq = (0..d_model * h * d)
+                .map(|i| half::f16::from_f32((i as f32 * 0.091).cos() * 0.05))
+                .collect();
+            let wk = (0..d_model * h * d)
+                .map(|i| half::f16::from_f32((i as f32 * 0.113).sin() * 0.05))
+                .collect();
+            let wv = (0..d_model * h * d)
+                .map(|i| half::f16::from_f32((i as f32 * 0.127).cos() * 0.05))
+                .collect();
+            let norm_weight = vec![half::f16::from_f32(1.0); d_model];
+            ForwardInputs::B1Forward { x, wq, wk, wv, norm_weight }
+        }
+    }
+}
+
+/// Source the forward outputs. CpuNaive -> cpu_naive_forward; B1Forward ->
+/// adapter (cuda). The `inputs` variant must match `source` or this panics.
+///
+/// `seq` must match the value passed to `generate_forward_inputs`. B1Forward is
+/// limited to seq <= the launcher's single-block max (32 for the closure gate).
+pub fn compute_forward_for_test(
+    inputs: &ForwardInputs,
+    cfg: &nsl_codegen::flash_attention::FlashAttentionConfig,
+    source: FSource,
+    seq: usize,
+) -> crate::cpu_naive_forward::ForwardOutputs {
+    match (inputs, source) {
+        (ForwardInputs::CpuNaive { .. }, FSource::CpuNaive) => {}
+        (ForwardInputs::B1Forward { .. }, FSource::B1Forward) => {}
+        _ => panic!("ForwardInputs variant must match source FSource"),
+    }
+    let (b, h, s, d) = (
+        TEST_DEFAULT_BATCH,
+        TEST_DEFAULT_HEADS,
+        seq,
+        cfg.head_dim as usize,
+    );
+    match (inputs, source) {
+        (ForwardInputs::CpuNaive { q, k, v }, FSource::CpuNaive) => {
+            crate::cpu_naive_forward::cpu_naive_forward(q, k, v, b, h, s, d, cfg.causal)
+        }
+        (ForwardInputs::B1Forward { x, wq, wk, wv, norm_weight }, FSource::B1Forward) => {
+            #[cfg(feature = "cuda")]
+            {
+                crate::b1_adapter::run_b1_forward_and_adapt(x, wq, wk, wv, norm_weight, cfg, seq)
+            }
+            #[cfg(not(feature = "cuda"))]
+            {
+                let _ = (x, wq, wk, wv, norm_weight, cfg, seq);
+                panic!("FSource::B1Forward requires feature='cuda'")
+            }
+        }
+        _ => unreachable!(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

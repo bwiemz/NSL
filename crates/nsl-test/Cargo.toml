@@ -12,6 +12,11 @@ repository.workspace = true
 half = { version = "2.4", features = ["std"] }
 # M57 FPGA test infrastructure (this branch)
 nsl-codegen.workspace = true
+# Phase 2.6 B1Forward GPU launcher (cuda-gated): FFIs nsl_cuda_init /
+# nsl_test_cuda_* + nsl_kernel_launch. nsl-runtime is not in
+# [workspace.dependencies], so reference it by path. Optional + cuda-gated so
+# the default build stays CUDA-free.
+nsl-runtime = { path = "../nsl-runtime", optional = true }
 rand.workspace = true
 rand_chacha.workspace = true
 sha2 = "0.10"
@@ -23,7 +28,7 @@ thiserror = "1"
 
 [features]
 default = []
-cuda = []
+cuda = ["dep:nsl-runtime", "nsl-runtime/cuda"]
 
 [[bin]]
 name = "generate_mlp_int8_weights_v1"
