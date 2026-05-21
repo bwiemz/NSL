@@ -9,6 +9,13 @@ use nsl_ast::stmt::{Stmt, StmtKind};
 use super::{Compiler, FlashAttentionCompileContext};
 use crate::error::CodegenError;
 
+/// M57.1 §3.2: v1-permanent redirect error message for `nsl build --target fpga`
+/// invocations on non-model kernels. The test `tests/fpga_target_redirect.rs`
+/// pins this exact text — keep them in sync.
+pub const FPGA_TARGET_REDIRECT_MSG: &str =
+    "`--target fpga` for general kernels is not supported in v1. \
+     Use `nsl fpga-compile <source>` for model-block FPGA compilation.";
+
 /// Parse the numeric SM version from a target string like `"sm_90"` → `90`.
 ///
 /// Accepts the generic `"cuda"` alias (used as `CompileOptions::default()`)
@@ -168,17 +175,11 @@ impl Compiler<'_> {
                 crate::kernel::KernelCompiler::compile(kernel, self.interner)
             }
             GpuTarget::Fpga => {
-                // M57.1 prerequisite: AST → structured KIR (Matmul/
-                // ElementwiseAdd/Relu) → KirToHirPass → VerilogEmitter +
-                // HIR port/wire generation. Currently unreachable because
-                // parse_target doesn't yet return GpuTarget::Fpga.
-                // See docs/superpowers/specs/2026-05-18-m57-fpga-verilog-design.md §1.5.
-                return Err(crate::error::CodegenError::new(
-                    "M57.1 prerequisite: AST → structured KIR dispatch + HIR \
-                     port/wire generation. Use `nsl fpga-compile` for the \
-                     intended workflow (currently also deferred — see CLI \
-                     error message)."
-                ));
+                // M57.1 §3.2: `nsl build --target fpga` parses successfully (parse_target
+                // recognizes "fpga"), but general-kernel FPGA compilation is not in v1's
+                // scope. Model-block compilation routes through `nsl fpga-compile`; this
+                // arm rejects non-model invocations with a redirecting error.
+                return Err(crate::error::CodegenError::new(FPGA_TARGET_REDIRECT_MSG));
             }
             GpuTarget::Rocm | GpuTarget::Metal | GpuTarget::WebGpu => {
                 // M47b: AST -> KIR -> backend-specific lowerer

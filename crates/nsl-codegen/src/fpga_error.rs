@@ -19,6 +19,17 @@ pub enum FpgaLoweringError {
 
     #[error("HIR builder error: {0}")]
     HirBuilder(#[from] crate::hir::module::HirBuilderError),
+
+    #[error(
+        "Unsupported v1 MLP shape: {found}\n\
+         Expected: {expected}\n\
+         v1's kernel_lower_fpga recognizes the v1 MLP pattern only; arbitrary \
+         model shapes are deferred to a future milestone (M57.1 §3.3, M57 §2.5)."
+    )]
+    UnsupportedV1Shape {
+        found: String,
+        expected: &'static str,
+    },
 }
 
 /// v1 supported KIR ops for the UnsupportedKirOp::supported field.

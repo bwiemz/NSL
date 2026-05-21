@@ -10,17 +10,125 @@ pub fn emit_signal_ref(s: &SignalRef) -> String {
         SignalRef::Register(r) => format!("_r{}", r.0),
         SignalRef::Port(name) => name.clone(),
         SignalRef::LocalParam(name) => name.clone(),
+        // M57.1 wire-array realization (Task W2): indexed wire-array read.
+        // Mechanical lowering — each IndexExpr variant has one fixed Verilog
+        // form. Construction-time invariant (`indices.len() == dims.len()`)
+        // is enforced by callers; emitter assumes well-formed HIR.
+        SignalRef::WireArrayElement { array_name, indices } => {
+            let idx_str = emit_index_exprs(indices);
+            format!("{}{}", array_name, idx_str)
+        }
+        // M57.1 wire-array realization (Task W5): identical render shape to
+        // WireArrayElement — both lower to `name[idx0][idx1]...`. The HIR
+        // distinction (wire family vs const family) is preserved structurally
+        // for declaration emission and snapshot fidelity.
+        SignalRef::IndexedLocalParam { array_name, indices } => {
+            let idx_str = emit_index_exprs(indices);
+            format!("{}{}", array_name, idx_str)
+        }
+        // M57.1 wire-array realization (Task W5): Verilog indexed part-select.
+        // Used to slice the `Port::Input("x_l<i>")` flat bus into per-element
+        // WireArray cells via `assign x_l<i>_a[k] = x_l<i>[k*W +: W]`.
+        SignalRef::PortBitSlice { name, base_bit, width } => {
+            format!("{}[{} +: {}]", name, base_bit, width)
+        }
+        // M57.1 wire-array realization (Task W5): Verilog concat over an
+        // array's elements (high-order first per packed-bus convention).
+        // Used to drive tap ports and the final-layer `out` port.
+        SignalRef::WireArrayConcat { array_name, n, fixed_index } => {
+            let elems: Vec<String> = (0..*n).rev().map(|i| match fixed_index {
+                Some(fix) => format!("{}[{}][{}]", array_name, i, fix),
+                None => format!("{}[{}]", array_name, i),
+            }).collect();
+            format!("{{{}}}", elems.join(", "))
+        }
     }
+}
+
+/// M57.1 wire-array realization helper: render an `IndexExpr` chain into
+/// concatenated Verilog `[...]` subscripts. Shared between `WireArrayElement`,
+/// `IndexedLocalParam`, and `AssignWireArrayElement`.
+pub(crate) fn emit_index_exprs(indices: &[IndexExpr]) -> String {
+    indices.iter()
+        .map(|ix| match ix {
+            IndexExpr::Literal(n) => format!("[{}]", n),
+            IndexExpr::Genvar(name) => format!("[{}]", name),
+            IndexExpr::GenvarPlus(name, k) => format!("[({} + {})]", name, k),
+        })
+        .collect()
 }
 
 pub fn emit_wire(w: &Wire) -> String {
     format!("wire signed [{}:0] _w{};", w.width - 1, w.id.0)
 }
 
+/// M57.1 wire-array realization (Task W2): module-scope multi-dim wire decl.
+/// Mechanical lowering — emits `wire signed [W-1:0] name [0:dims[0]-1]...;`
+/// (single space after name, no separator between dim brackets).
+pub fn emit_wire_array(wa: &WireArray) -> String {
+    let dims_str: String = wa.dims.iter()
+        .map(|d| format!("[0:{}]", d - 1))
+        .collect();
+    format!("wire signed [{}:0] {} {};", wa.width - 1, wa.name, dims_str)
+}
+
+/// M57.1 wire-array realization (Task W4): drives one element of a WireArray.
+/// Mechanical lowering — emits `assign {array_name}[idx0]...[idxN] = {src};`.
+/// Each `IndexExpr` variant has one fixed Verilog form (same shape as the
+/// read path in `emit_signal_ref` for `WireArrayElement`).
+pub fn emit_assign_wire_array_element(a: &AssignWireArrayElement) -> String {
+    let idx_str = emit_index_exprs(&a.indices);
+    format!("assign {}{} = {};", a.array_name, idx_str, emit_signal_ref(&a.src))
+}
+
 pub fn emit_local_param(lp: &LocalParam) -> String {
     format!(
         "localparam signed [{}:0] {} = {}'sd{};",
         lp.width - 1, lp.name, lp.width, lp.value
+    )
+}
+
+/// M57.1 wire-array realization (Task W5): emit a module-scope multi-dim
+/// const array as `localparam signed [W-1:0] name [0:dim0-1]... = '{...};`.
+/// For 2D arrays the literal renders as a nested SystemVerilog `'{ }`. For
+/// 1D as a flat `'{ }`. Higher ranks panic (not exercised by v1 MLP).
+///
+/// Mechanical lowering — values flow verbatim through `{width}'sd{value}`,
+/// matching `emit_local_param`'s signed-decimal encoding. Snapshot tests
+/// elide localparam lines (`elide_localparams`) so the bulk of the W matrix
+/// content doesn't dominate the structural-skeleton snapshot.
+pub fn emit_local_param_array(lpa: &LocalParamArray) -> String {
+    let dims_str: String = lpa.dims.iter()
+        .map(|d| format!(" [0:{}]", d - 1))
+        .collect();
+    let values_str = match lpa.dims.len() {
+        2 => {
+            let (rows, cols) = (lpa.dims[0], lpa.dims[1]);
+            assert_eq!(lpa.values.len(), rows * cols,
+                "LocalParamArray.values len {} != rows({}) * cols({})",
+                lpa.values.len(), rows, cols);
+            let row_strs: Vec<String> = (0..rows).map(|r| {
+                let cells: Vec<String> = (0..cols).map(|c| {
+                    format!("{}'sd{}", lpa.width, lpa.values[r * cols + c])
+                }).collect();
+                format!("'{{{}}}", cells.join(", "))
+            }).collect();
+            format!("'{{{}}}", row_strs.join(", "))
+        }
+        1 => {
+            assert_eq!(lpa.values.len(), lpa.dims[0],
+                "LocalParamArray.values len {} != dim {}",
+                lpa.values.len(), lpa.dims[0]);
+            let cells: Vec<String> = lpa.values.iter()
+                .map(|v| format!("{}'sd{}", lpa.width, v))
+                .collect();
+            format!("'{{{}}}", cells.join(", "))
+        }
+        n => panic!("emit_local_param_array: rank {} not supported in v1", n),
+    };
+    format!(
+        "localparam signed [{}:0] {}{} = {};",
+        lpa.width - 1, lpa.name, dims_str, values_str
     )
 }
 
@@ -188,6 +296,15 @@ pub fn emit_node(
         HirNode::SignExtend(s) => format!("{pad}{}", emit_sign_extend(s)),
         HirNode::GenerateFor(g) => emit_generate_for(g, indent, clock_domains, reset_signals),
         HirNode::GenerateIf(g) => emit_generate_if(g, indent, clock_domains, reset_signals),
+        // M57.1 wire-array realization (Task W2): module-scope multi-dim
+        // wire-array declaration. Indented at the same level as plain Wire.
+        HirNode::WireArray(wa) => format!("{pad}{}", emit_wire_array(wa)),
+        // M57.1 wire-array realization (Task W4): drives one element of a
+        // WireArray. Indented at the same level as plain `assign` ops (Mul,
+        // Add, etc.).
+        HirNode::AssignWireArrayElement(a) => {
+            format!("{pad}{}", emit_assign_wire_array_element(a))
+        }
     }
 }
 
@@ -252,6 +369,92 @@ mod tests {
         let w = Wire { id: WireId(9), width: 32 };
         let v = emit_wire(&w);
         assert_eq!(v, "wire signed [31:0] _w9;");
+    }
+
+    // --- M57.1 wire-array realization: emitter lowering (Task W2) ---
+
+    #[test]
+    fn emit_signal_ref_wire_array_element_literal_index() {
+        let s = SignalRef::wire_array_element("acc_l1", vec![
+            IndexExpr::Literal(5),
+            IndexExpr::Literal(10),
+        ]);
+        assert_eq!(emit_signal_ref(&s), "acc_l1[5][10]");
+    }
+
+    #[test]
+    fn emit_signal_ref_wire_array_element_genvar_index() {
+        let s = SignalRef::wire_array_element("acc_l1", vec![
+            IndexExpr::Genvar("_gv_o".to_string()),
+            IndexExpr::Genvar("_gv_k".to_string()),
+        ]);
+        assert_eq!(emit_signal_ref(&s), "acc_l1[_gv_o][_gv_k]");
+    }
+
+    #[test]
+    fn emit_signal_ref_wire_array_element_genvar_plus_index() {
+        let s = SignalRef::wire_array_element("acc_l1", vec![
+            IndexExpr::Genvar("_gv_o".to_string()),
+            IndexExpr::GenvarPlus("_gv_k".to_string(), 1),
+        ]);
+        assert_eq!(emit_signal_ref(&s), "acc_l1[_gv_o][(_gv_k + 1)]");
+    }
+
+    #[test]
+    fn emit_wire_array_2d() {
+        let wa = WireArray {
+            name: "acc_l1".to_string(),
+            dims: vec![128, 785],
+            width: 32,
+        };
+        assert_eq!(
+            emit_wire_array(&wa),
+            "wire signed [31:0] acc_l1 [0:127][0:784];"
+        );
+    }
+
+    #[test]
+    fn emit_wire_array_1d() {
+        let wa = WireArray {
+            name: "relu_l1".to_string(),
+            dims: vec![128],
+            width: 32,
+        };
+        assert_eq!(
+            emit_wire_array(&wa),
+            "wire signed [31:0] relu_l1 [0:127];"
+        );
+    }
+
+    // --- M57.1 wire-array realization: AssignWireArrayElement emit (Task W4) ---
+
+    #[test]
+    fn emit_assign_wire_array_element_from_wire() {
+        let a = AssignWireArrayElement {
+            array_name: "acc_l1".to_string(),
+            indices: vec![
+                IndexExpr::Genvar("_gv_o".to_string()),
+                IndexExpr::GenvarPlus("_gv_k".to_string(), 1),
+            ],
+            src: SignalRef::wire(WireId(42)),
+        };
+        assert_eq!(
+            emit_assign_wire_array_element(&a),
+            "assign acc_l1[_gv_o][(_gv_k + 1)] = _w42;"
+        );
+    }
+
+    #[test]
+    fn emit_assign_wire_array_element_from_local_param_literal_indices() {
+        let a = AssignWireArrayElement {
+            array_name: "acc_l1".to_string(),
+            indices: vec![IndexExpr::Literal(5), IndexExpr::Literal(0)],
+            src: SignalRef::local_param("b1_5"),
+        };
+        assert_eq!(
+            emit_assign_wire_array_element(&a),
+            "assign acc_l1[5][0] = b1_5;"
+        );
     }
 }
 

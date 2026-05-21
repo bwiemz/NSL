@@ -4,11 +4,17 @@ expression: structural_summary(&module)
 ---
 module: matmul_i32_test
 test_taps: true
-ports: 0
+ports: 1
+  Port::Input x_l1 width=4096
+local_params: 1280
+  LocalParam W1_0_0 width=32
+  …(prefix="W1", 1278 elided)…
+  LocalParam W1_127_9 width=32
 nodes: 1
 [0] GenerateFor lo=0 hi=10 body={
-  [0] GenerateFor lo=0 hi=128 body={
-    [0] Mul a_width=32 b_width=32 out_width=64 a="Port(__matmul_a)" b="Port(__matmul_b)"
-    [1] Add width=64 a="Port(__matmul_acc_prev)" b="Wire(<id>)"
+  [0] Wire width=64
+  [1] GenerateFor lo=0 hi=128 body={
+    [0] Mul a_width=32 b_width=32 out_width=64 a="Port(x_l1)" b="LocalParam(W1)"
+    [1] Add width=64 a="Port(acc_l1_prev)" b="Wire(<id>)"
   }
 }

@@ -19,6 +19,18 @@ pub enum HirNode {
     SignExtend(SignExtend),
     GenerateFor(GenerateFor),
     GenerateIf(GenerateIf),
+    /// M57.1 wire-array realization: module-scope multi-dimensional wire
+    /// array. Declared once per array; referenced by element via
+    /// `SignalRef::WireArrayElement`. Does not produce a single WireId
+    /// (it declares an N-dimensional family of wires whose drivers are
+    /// `assign`s inside generate blocks).
+    WireArray(WireArray),
+    /// M57.1 wire-array realization (Task W4): driver for one element of a
+    /// WireArray. Inside a GenerateFor body, indices typically include Genvar
+    /// refs; at module top level, indices are typically Literals. Does NOT
+    /// produce a single WireId — it drives a single element of an
+    /// N-dimensional wire family declared by `WireArray`.
+    AssignWireArrayElement(AssignWireArrayElement),
 }
 
 impl HirNode {
@@ -31,7 +43,11 @@ impl HirNode {
             HirNode::Add(a) => Some(a.out),
             HirNode::Max0(m) => Some(m.out),
             HirNode::SignExtend(s) => Some(s.dst),
-            // Register, GenerateFor, GenerateIf don't produce a single WireId.
+            // Register, GenerateFor, GenerateIf, WireArray, AssignWireArrayElement
+            // don't produce a single WireId. (WireArray declares multi-element
+            // wire family; AssignWireArrayElement drives ONE element of one;
+            // single-driver invariant for each element is the caller's
+            // responsibility, same as GenerateFor body uniqueness.)
             _ => None,
         }
     }
@@ -44,7 +60,16 @@ pub struct HirModule {
     /// pub(crate) — readers access via `nodes()`; writers MUST use `add_node`
     /// so the single-driver invariant (spec §3.4 invariant 1) is enforced.
     pub(crate) bodies: Vec<HirNode>,
-    pub local_params: Vec<LocalParam>,
+    /// pub(crate) — readers access via `local_params()`; writers go through
+    /// `add_local_param`. Task 4.1's CLI-time bake_fixture_into_localparams
+    /// will need mutable access — added then via a dedicated accessor.
+    /// (M57.1 Task 3.2 review follow-up.)
+    pub(crate) local_params: Vec<LocalParam>,
+    /// M57.1 wire-array mini §3.2 / Task W5: module-scope multi-dimensional
+    /// const arrays (`W<i>`, `b<i>`). Accessed via `local_param_arrays()`
+    /// (read) / `local_param_arrays_mut()` (Task W6 CLI baking) /
+    /// `add_local_param_array` (construction).
+    pub(crate) local_param_arrays: Vec<LocalParamArray>,
     /// BTreeMap (not HashMap) for deterministic iteration order across Rust
     /// versions and platforms — Layer 1 Verilog emission snapshots depend on
     /// reproducible output (spec §3.5 / §3 issue 5).
@@ -75,6 +100,7 @@ impl HirModule {
             ports: Vec::new(),
             bodies: Vec::new(),
             local_params: Vec::new(),
+            local_param_arrays: Vec::new(),
             clock_domains,
             reset_signals,
             test_taps: true,    // v1 default
@@ -110,6 +136,47 @@ impl HirModule {
     /// `add_node` so the single-driver invariant holds.
     pub fn nodes(&self) -> &[HirNode] {
         &self.bodies
+    }
+
+    /// Read-only access to declared LocalParams. Construction must go through
+    /// `add_local_param`. (M57.1 Task 3.2 review follow-up: field tightened
+    /// to `pub(crate)`; this is the public reader.)
+    pub fn local_params(&self) -> &[LocalParam] {
+        &self.local_params
+    }
+
+    /// Mutable access to declared LocalParams for CLI-time value baking.
+    ///
+    /// Task 4.1 (`nsl fpga-compile`) walks the FixtureFile's blocks and writes
+    /// the parsed weight/bias values into the matching `W<i>_<k>_<o>` and
+    /// `b<i>_<o>` LocalParams by name. This is the only sanctioned mutator —
+    /// `add_local_param` is the construction-time entry point and is preserved
+    /// for the KirToHirPass; this accessor is for post-construction value
+    /// substitution only. Callers must not push/remove entries through it.
+    pub fn local_params_mut(&mut self) -> &mut Vec<LocalParam> {
+        &mut self.local_params
+    }
+
+    /// M57.1 wire-array mini §3.2 / Task W5: register a LocalParamArray
+    /// (the fused-emitter shape for `W<i>` / `b<i>`). The fused matmul
+    /// ripple body reads it via `SignalRef::IndexedLocalParam`.
+    pub fn add_local_param_array(&mut self, lpa: LocalParamArray) {
+        self.local_param_arrays.push(lpa);
+    }
+
+    /// Read-only access to declared LocalParamArrays. Construction via
+    /// `add_local_param_array`. Renders in the LocalParam preamble block of
+    /// the emitted Verilog.
+    pub fn local_param_arrays(&self) -> &[LocalParamArray] {
+        &self.local_param_arrays
+    }
+
+    /// Mutable access to declared LocalParamArrays for CLI-time value baking
+    /// (Task W6). The fixture loader writes parsed weight/bias values into
+    /// the `values` field by `[k][o]` (or `[o]`) index. Callers must not
+    /// push/remove entries through it.
+    pub fn local_param_arrays_mut(&mut self) -> &mut Vec<LocalParamArray> {
+        &mut self.local_param_arrays
     }
 }
 

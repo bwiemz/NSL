@@ -4,6 +4,82 @@ use crate::hir::clock_reset::{ClkRef, ResetRef};
 use crate::hir::ids::{RegisterId, WireId};
 use crate::hir::signals::SignalRef;
 
+// --- Wire-array primitives (M57.1 wire-array realization §2) ---
+
+/// Index expression for `SignalRef::WireArrayElement` — resolves to a Verilog
+/// expression at emit time.
+///
+/// M57.1 wire-array realization: the fused MLP emitter declares wire arrays
+/// like `acc_l1 [0:127][0:784]` and references their elements with mixed
+/// literal / genvar / genvar-plus-constant indices (e.g. `acc_l1[_gv_o][_gv_k]`
+/// for reads, `acc_l1[_gv_o][_gv_k + 1]` for ripple writes).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum IndexExpr {
+    /// Compile-time literal. Emits `n`.
+    Literal(usize),
+    /// Reference to a genvar declared by an enclosing `GenerateFor`.
+    /// Emits the literal genvar name (e.g. `_gv_o`).
+    Genvar(String),
+    /// Genvar plus a non-negative constant offset. Emits `(name + k)`.
+    /// Used for ripple-write targets like `acc[o][k + 1]`.
+    GenvarPlus(String, i64),
+}
+
+/// Module-scope multi-dimensional wire array declaration.
+///
+/// Emits `wire signed [width-1:0] {name} [0:{dims[0]-1}][0:{dims[1]-1}]...;`
+/// at the module level (before any generate blocks). Construction-time
+/// invariant: every `SignalRef::WireArrayElement { array_name: <name>, indices }`
+/// reference must have `indices.len() == dims.len()`. The emitter assumes
+/// well-formed HIR and does not validate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WireArray {
+    pub name: String,
+    pub dims: Vec<usize>,
+    pub width: usize,
+}
+
+/// Drives one element of a `WireArray` from a `SignalRef`.
+///
+/// Emits `assign {array_name}[{idx0}]...[{idxN}] = {src};` at the position
+/// where it appears in the HIR node list. Inside a GenerateFor body, indices
+/// typically include `Genvar` / `GenvarPlus` refs; at module top level, indices
+/// are typically `Literal`.
+///
+/// Construction-time invariant: `indices.len()` matches the corresponding
+/// `WireArray.dims.len()` for the array being driven. The emitter does not
+/// validate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AssignWireArrayElement {
+    pub array_name: String,
+    pub indices: Vec<IndexExpr>,
+    pub src: crate::hir::signals::SignalRef,
+}
+
+/// Module-scope multi-dimensional const array per M57.1 wire-array mini §3.2 +
+/// §4 (Task W5).
+///
+/// Emits
+/// `localparam signed [width-1:0] {name} [0:dims[0]-1][0:dims[1]-1] = '{...values...};`
+/// at the module level (in the LocalParam preamble block). For `dims.len() == 2`
+/// the literal renders as `'{ '{row0}, '{row1}, ... }`; for `dims.len() == 1`
+/// as `'{ cell, cell, ... }`. Higher ranks are not yet supported by the v1
+/// emitter (panics).
+///
+/// Used to lower `W<i>` (`[k_dim, n_outputs]`) and `b<i>` (`[n_outputs]`)
+/// into Verilog arrays indexable by genvar inside the matmul ripple body.
+/// Values are baked at CLI time (Task W6) by the fixture loader.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalParamArray {
+    pub name: String,
+    pub dims: Vec<usize>,
+    pub width: usize,
+    /// Flat values in row-major order. For 2D arrays:
+    /// `values[r * dims[1] + c]` is the cell at `[r][c]`. For 1D, indexed
+    /// linearly. Length must equal `dims.iter().product()`.
+    pub values: Vec<i128>,
+}
+
 // --- Module-boundary nodes ---
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -321,5 +397,44 @@ mod tests {
         assert_eq!(async_hi.reset.sync, ResetSync::Async);
         assert_eq!(async_lo.reset.sync, ResetSync::Async);
         assert_eq!(async_lo.reset.polarity, ResetPolarity::Low);
+    }
+
+    #[test]
+    fn index_expr_literal_constructs() {
+        let e = IndexExpr::Literal(5);
+        assert!(matches!(e, IndexExpr::Literal(5)));
+    }
+
+    #[test]
+    fn index_expr_genvar_constructs() {
+        let e = IndexExpr::Genvar("_gv_o".to_string());
+        match e {
+            IndexExpr::Genvar(name) => assert_eq!(name, "_gv_o"),
+            _ => panic!("expected Genvar"),
+        }
+    }
+
+    #[test]
+    fn index_expr_genvar_plus_constructs() {
+        let e = IndexExpr::GenvarPlus("_gv_k".to_string(), 1);
+        match e {
+            IndexExpr::GenvarPlus(name, k) => {
+                assert_eq!(name, "_gv_k");
+                assert_eq!(k, 1);
+            }
+            _ => panic!("expected GenvarPlus"),
+        }
+    }
+
+    #[test]
+    fn wire_array_constructs_with_dims_and_width() {
+        let wa = WireArray {
+            name: "acc_l1".to_string(),
+            dims: vec![128, 785],
+            width: 32,
+        };
+        assert_eq!(wa.name, "acc_l1");
+        assert_eq!(wa.dims, vec![128, 785]);
+        assert_eq!(wa.width, 32);
     }
 }

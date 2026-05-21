@@ -156,6 +156,7 @@ pub use wggo_overrides::{
 pub mod fpga_error;
 pub mod hir;
 pub mod backend_verilog;
+pub mod kernel_lower_fpga;  // M57.1 §3.3
 pub mod wrga;
 pub mod matmul_mma;
 pub mod wrga_adapter_init;
@@ -212,6 +213,11 @@ pub use compiler::{
     compile_test, compile_with_zk_info, compile_with_zk_info_returning_plan,
     StandaloneConfig,
 };
+
+/// M57.1 §3.2: re-exported from the (private) `compiler::kernel` module so that
+/// integration tests can pin the production redirect message without copying
+/// the literal. See `tests/fpga_target_redirect.rs`.
+pub use crate::compiler::kernel::FPGA_TARGET_REDIRECT_MSG;
 
 /// Task 4 test helper: compile a module and return any `WrgaPlan` produced
 /// during `@train` block lowering.  The plan is returned even when codegen

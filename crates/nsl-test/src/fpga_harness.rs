@@ -67,13 +67,18 @@ impl TapDescriptor {
     /// Per spec §2.7: test-tap ports expose every per-op intermediate signal
     /// when `--test-taps` is passed at codegen time.
     pub fn v1_mlp() -> Self {
+        // M57.1 Concern #4: the bias-as-seed fold (§3.5) eliminates the
+        // post-MAC bias-add hardware signal. tap_l<i>_bias_out removed; bias
+        // contribution is verified within tap_l<i>_matmul_out (which now
+        // holds the post-bias accumulator). Names tap_l<i>_matmul_out
+        // preserved per §3 Concern #1 (rename to tap_l<i>_accum_out
+        // deferred to cleanup PR).
         Self {
             taps: vec![
-                ("tap_l1_matmul_out".into(), 128 * 32), // 128 × i32
-                ("tap_l1_bias_out".into(), 128 * 32),
+                ("tap_l1_matmul_out".into(), 128 * 32), // post-bias accumulator (semantics shift; name preserved)
                 ("tap_l1_relu_out".into(), 128 * 32),
-                ("tap_l2_matmul_out".into(), 10 * 64), // 10 × i64
-                ("tap_l2_bias_out".into(), 10 * 64),
+                ("tap_l2_matmul_out".into(), 10 * 64), // post-bias accumulator
+                ("tap_l2_relu_out".into(), 10 * 64),
                 ("out".into(), 10 * 64),
             ],
         }
@@ -259,11 +264,17 @@ mod tests {
     #[test]
     fn tap_descriptor_v1_mlp_shape() {
         let desc = TapDescriptor::v1_mlp();
-        assert_eq!(desc.taps.len(), 6);
+        // M57.1 Concern #4: bias-as-seed fold removes tap_l{1,2}_bias_out;
+        // 6 taps → 5 taps (tap_l1_matmul_out, tap_l1_relu_out,
+        // tap_l2_matmul_out, tap_l2_relu_out, out). See `TapDescriptor::v1_mlp`
+        // for the semantics shift on tap_l<i>_matmul_out.
+        assert_eq!(desc.taps.len(), 5);
         assert_eq!(desc.taps[0].0, "tap_l1_matmul_out");
         assert_eq!(desc.taps[0].1, 128 * 32);
-        assert_eq!(desc.taps[5].0, "out");
-        assert_eq!(desc.taps[5].1, 10 * 64);
+        assert_eq!(desc.taps[3].0, "tap_l2_relu_out");
+        assert_eq!(desc.taps[3].1, 10 * 64);
+        assert_eq!(desc.taps[4].0, "out");
+        assert_eq!(desc.taps[4].1, 10 * 64);
     }
 
     #[test]

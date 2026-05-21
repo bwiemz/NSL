@@ -2,7 +2,7 @@ mod collection;
 mod declaration;
 mod entry_points;
 mod functions;
-mod kernel;
+pub(crate) mod kernel;
 mod main_entry;
 mod ownership_api;
 
