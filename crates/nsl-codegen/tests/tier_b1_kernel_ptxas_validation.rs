@@ -31,8 +31,23 @@ fn canonical_config() -> FlashAttentionConfig {
     }
 }
 
+/// Canonical config + Phase 2.6 (T2.5) backward-activation saves enabled.
+/// Exercises the q/k/v_proj + row_max/row_sum scatter emission in
+/// `tier_b1::finalize::emit`.
+fn save_config() -> FlashAttentionConfig {
+    let mut c = canonical_config();
+    if let Some(e) = c.csha.as_mut() {
+        e.save_activations_for_backward = true;
+    }
+    c
+}
+
 fn run_ptxas_for_sm(sm: u32) {
-    let config = canonical_config();
+    run_ptxas_for_sm_with_config(sm, &canonical_config());
+}
+
+fn run_ptxas_for_sm_with_config(sm: u32, config: &FlashAttentionConfig) {
+    let config = config.clone();
     let chunk: u32 = 128; // chunk_config::select picks 128 for this 32x32x32 cfg.
     let mut ptx_bytes = synthesize(&config, chunk);
     // synthesize appends a NUL terminator; strip it so the file is valid text.
@@ -76,4 +91,16 @@ fn tier_b1_full_kernel_assembles_on_sm_80() {
 #[ignore = "requires ptxas on PATH; lift in CI with CUDA toolchain"]
 fn tier_b1_full_kernel_assembles_on_sm_120() {
     run_ptxas_for_sm(120);
+}
+
+#[test]
+#[ignore = "requires ptxas on PATH; lift in CI with CUDA toolchain"]
+fn tier_b1_save_activations_kernel_assembles_on_sm_80() {
+    run_ptxas_for_sm_with_config(80, &save_config());
+}
+
+#[test]
+#[ignore = "requires ptxas on PATH; lift in CI with CUDA toolchain"]
+fn tier_b1_save_activations_kernel_assembles_on_sm_120() {
+    run_ptxas_for_sm_with_config(120, &save_config());
 }
