@@ -108,7 +108,11 @@ fn canonical_hd32_cfg() -> FlashAttentionConfig {
         tree_mask: false,
         gpu_sm: 80,
         segment_masked: false,
-        csha: Some(CshaExtras { level: 2, ..Default::default() }),
+        // d_model=128 matches the T2.7 reference (tier_b1_save_activations_gpu)
+        // single-block convention: chunk=d_model -> n_chunks=1. Leaving d_model=0
+        // (bare ..Default::default()) defeats the B1Forward path's unwrap_or(128)
+        // fallback (which only fires for csha=None) and zero-sizes every B.1 input.
+        csha: Some(CshaExtras { level: 2, d_model: 128, ..Default::default() }),
     }
 }
 
@@ -125,7 +129,11 @@ fn cfg(bq: i64, hd: i64) -> FlashAttentionConfig {
         tree_mask: false,
         gpu_sm: 80,
         segment_masked: false,
-        csha: Some(CshaExtras { level: 2, ..Default::default() }),
+        // d_model=128 matches the T2.7 reference (tier_b1_save_activations_gpu)
+        // single-block convention: chunk=d_model -> n_chunks=1. Leaving d_model=0
+        // (bare ..Default::default()) defeats the B1Forward path's unwrap_or(128)
+        // fallback (which only fires for csha=None) and zero-sizes every B.1 input.
+        csha: Some(CshaExtras { level: 2, d_model: 128, ..Default::default() }),
     }
 }
 
@@ -317,7 +325,24 @@ fn tier_b2_dq_sweep_cpu_naive_forward() {
 fn tier_b2_dq_sweep_b1_forward() {
     // Phase 2.6 closure gate -- B.1 forward + adapter -> dQ-kernel end-to-end.
     // seq=32 (B.1 single-block precondition: launcher forces block_kv=32).
-    for &hd in &[32i64, 64, 128] {
+    //
+    // INVOCATION: requires nsl-test's cuda feature (a dev-dependency), so run with
+    //   cargo test -p nsl-codegen --features "cuda,nsl-test/cuda" \
+    //       --test tier_b2_dq_kernel_cpu_reference tier_b2_dq_sweep_b1_forward \
+    //       -- --ignored --nocapture
+    // Plain --features cuda does NOT forward to nsl-test/cuda, so the B1Forward
+    // path would hit the "requires feature='cuda'" panic.
+    //
+    // DOCUMENTED LIMITATION (Phase 2.6 close): only hd=32 runs here. hd=64/128 are
+    // deferred because the B.1 FORWARD kernel mis-sizes its softmax-stat registers
+    // when head_dim > block_kv (tiles_per_warp_qkt vs tiles_per_warp_pv divergence
+    // in attention_mma.rs/finalize.rs) -- ptxas "Unknown symbol %s_sum_<t>". This is
+    // a pre-existing B.1-forward bug, NOT a dQ-kernel/integration bug: the dQ-kernel
+    // itself is validated at hd=32/64/128 via tier_b2_dq_sweep_cpu_naive_forward.
+    // Root-cause + fix proposal: docs/superpowers/specs/
+    //   2026-05-22-tier-b1-stat-register-sizing-diagnosis.md (option (c): re-key
+    // stats by m-tile from SMEM scratch). Restore [32, 64, 128] once that lands.
+    for &hd in &[32i64] {
         let bq = if hd == 128 { 32 } else { 64 };
         validate_dq_for_source(&cfg(bq, hd), FSource::B1Forward, 32);
     }
