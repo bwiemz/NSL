@@ -111,6 +111,7 @@ int main(int argc, char** argv) {
 
     // Layer 2: 10 × i64 = 640 bits = 20 uint32_t words
     dump32("tap_l2_matmul_out", dut->tap_l2_matmul_out, 20);
+    dump32("tap_l2_relu_out",   dut->tap_l2_relu_out,   20);
 
     // Final output: 10 × i64 = 640 bits = 20 uint32_t words
     dump32("out", dut->out, 20);

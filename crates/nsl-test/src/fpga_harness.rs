@@ -78,6 +78,7 @@ impl TapDescriptor {
                 ("tap_l1_matmul_out".into(), 128 * 32), // post-bias accumulator (semantics shift; name preserved)
                 ("tap_l1_relu_out".into(), 128 * 32),
                 ("tap_l2_matmul_out".into(), 10 * 64), // post-bias accumulator
+                ("tap_l2_relu_out".into(), 10 * 64),
                 ("out".into(), 10 * 64),
             ],
         }
@@ -264,13 +265,16 @@ mod tests {
     fn tap_descriptor_v1_mlp_shape() {
         let desc = TapDescriptor::v1_mlp();
         // M57.1 Concern #4: bias-as-seed fold removes tap_l{1,2}_bias_out;
-        // 6 taps → 4 taps. See `TapDescriptor::v1_mlp` for the semantics
-        // shift on tap_l<i>_matmul_out.
-        assert_eq!(desc.taps.len(), 4);
+        // 6 taps → 5 taps (tap_l1_matmul_out, tap_l1_relu_out,
+        // tap_l2_matmul_out, tap_l2_relu_out, out). See `TapDescriptor::v1_mlp`
+        // for the semantics shift on tap_l<i>_matmul_out.
+        assert_eq!(desc.taps.len(), 5);
         assert_eq!(desc.taps[0].0, "tap_l1_matmul_out");
         assert_eq!(desc.taps[0].1, 128 * 32);
-        assert_eq!(desc.taps[3].0, "out");
+        assert_eq!(desc.taps[3].0, "tap_l2_relu_out");
         assert_eq!(desc.taps[3].1, 10 * 64);
+        assert_eq!(desc.taps[4].0, "out");
+        assert_eq!(desc.taps[4].1, 10 * 64);
     }
 
     #[test]
