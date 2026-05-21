@@ -696,6 +696,19 @@ pub fn emit_q_projection(ptx: &mut String, config: &FlashAttentionConfig, chunk:
         x_m_stride_bytes
     );
     let log2_x_m_stride = x_m_stride_bytes.trailing_zeros();
+    // B-frag (Wq) n_tile band stride. W is stored COL-MAJOR within each
+    // chunk band as [hd, chunk] f16, so one output column spans `chunk`
+    // contiguous f16 = chunk*2 bytes, and an 8-column n_tile band spans
+    // 8*chunk*2 bytes. (The prior emission used a hardcoded shift of 4 =
+    // n_tile*16 bytes, which only advanced 8 f16 within column 0's chunk
+    // run, so n_tile>0 warps read column-0 weights -> garbage.)
+    let w_n_band_bytes = 8 * chunk * 2;
+    assert!(
+        w_n_band_bytes.is_power_of_two(),
+        "N3: Q projection requires 8*chunk*2 (W n_tile band stride) to be a power of 2; got {}",
+        w_n_band_bytes
+    );
+    let log2_w_n_band = w_n_band_bytes.trailing_zeros();
     // N1c: Q-projection K-loop count = chunk / 16.
     assert!(
         chunk.is_multiple_of(16),
@@ -882,8 +895,12 @@ pub fn emit_q_projection(ptx: &mut String, config: &FlashAttentionConfig, chunk:
             ptx.push_str(
                 "    add.u32 %qmma_a_base, %tb1_q_smem_x_u32, %qmma_x_warp_off;\n",
             );
-            // B-frag Wq base = Wq_smem + n_tile * 8 * 2 = n_tile * 16 bytes.
-            ptx.push_str("    shl.b32 %qmma_w_warp_off, %qmma_n_tile, 4;\n");
+            // B-frag Wq base = Wq_smem + n_tile * 8 * chunk * 2 bytes
+            // (W is col-major [hd, chunk] f16, so an 8-col band = 8*chunk*2).
+            ptx.push_str(&format!(
+                "    shl.b32 %qmma_w_warp_off, %qmma_n_tile, {};\n",
+                log2_w_n_band
+            ));
             ptx.push_str(
                 "    add.u32 %qmma_b_base, %tb1_q_smem_w_u32, %qmma_w_warp_off;\n",
             );
@@ -1127,6 +1144,20 @@ pub fn emit_kv_projection_chunk_loop(
         x_m_stride_kv_bytes
     );
     let log2_x_m_stride_kv = x_m_stride_kv_bytes.trailing_zeros();
+    // B-frag (Wk/Wv) n_tile band stride. W is stored COL-MAJOR within each
+    // chunk band as [hd, chunk] f16, so one output column spans `chunk`
+    // contiguous f16 = chunk*2 bytes, and an 8-column n_tile band spans
+    // 8*chunk*2 bytes. (The prior emission used a hardcoded shift of 4 =
+    // n_tile*16 bytes, which only advanced 8 f16 within column 0's chunk
+    // run, so n_tile>0 warps read column-0 weights -> garbage. One band
+    // stride feeds both the Wk and Wv B-frag bases.)
+    let w_n_band_bytes_kv = 8 * chunk * 2;
+    assert!(
+        w_n_band_bytes_kv.is_power_of_two(),
+        "N3: KV projection requires 8*chunk*2 (W n_tile band stride) to be a power of 2; got {}",
+        w_n_band_bytes_kv
+    );
+    let log2_w_n_band_kv = w_n_band_bytes_kv.trailing_zeros();
     // N1d: K/V-projection K-loop count = chunk / 16.
     assert!(
         chunk.is_multiple_of(16),
@@ -1388,8 +1419,12 @@ pub fn emit_kv_projection_chunk_loop(
             ptx.push_str(
                 "    add.u32 %kvmma_a_base, %tb1_kv_smem_x_u32, %kvmma_x_warp_off;\n",
             );
-            // B-frag Wk/Wv bases = W_smem + n_tile * 8 * 2 bytes.
-            ptx.push_str("    shl.b32 %kvmma_w_warp_off, %kvmma_n_tile, 4;\n");
+            // B-frag Wk/Wv bases = W_smem + n_tile * 8 * chunk * 2 bytes
+            // (W is col-major [hd, chunk] f16, so an 8-col band = 8*chunk*2).
+            ptx.push_str(&format!(
+                "    shl.b32 %kvmma_w_warp_off, %kvmma_n_tile, {};\n",
+                log2_w_n_band_kv
+            ));
             ptx.push_str(
                 "    add.u32 %kvmma_bk_base, %tb1_kv_smem_wk_u32, %kvmma_w_warp_off;\n",
             );

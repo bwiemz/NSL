@@ -90,7 +90,7 @@ expression: ptx
     and.b32 %kvmma_n_tile, %kvmma_global_t, 3;
     shl.b32 %kvmma_x_warp_off, %kvmma_m_tile, 12;
     add.u32 %kvmma_a_base, %tb1_kv_smem_x_u32, %kvmma_x_warp_off;
-    shl.b32 %kvmma_w_warp_off, %kvmma_n_tile, 4;
+    shl.b32 %kvmma_w_warp_off, %kvmma_n_tile, 11;
     add.u32 %kvmma_bk_base, %tb1_kv_smem_wk_u32, %kvmma_w_warp_off;
     add.u32 %kvmma_bv_base, %tb1_kv_smem_wv_u32, %kvmma_w_warp_off;
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
@@ -568,7 +568,7 @@ expression: ptx
     and.b32 %kvmma_n_tile, %kvmma_global_t, 3;
     shl.b32 %kvmma_x_warp_off, %kvmma_m_tile, 12;
     add.u32 %kvmma_a_base, %tb1_kv_smem_x_u32, %kvmma_x_warp_off;
-    shl.b32 %kvmma_w_warp_off, %kvmma_n_tile, 4;
+    shl.b32 %kvmma_w_warp_off, %kvmma_n_tile, 11;
     add.u32 %kvmma_bk_base, %tb1_kv_smem_wk_u32, %kvmma_w_warp_off;
     add.u32 %kvmma_bv_base, %tb1_kv_smem_wv_u32, %kvmma_w_warp_off;
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
@@ -1046,7 +1046,7 @@ expression: ptx
     and.b32 %kvmma_n_tile, %kvmma_global_t, 3;
     shl.b32 %kvmma_x_warp_off, %kvmma_m_tile, 12;
     add.u32 %kvmma_a_base, %tb1_kv_smem_x_u32, %kvmma_x_warp_off;
-    shl.b32 %kvmma_w_warp_off, %kvmma_n_tile, 4;
+    shl.b32 %kvmma_w_warp_off, %kvmma_n_tile, 11;
     add.u32 %kvmma_bk_base, %tb1_kv_smem_wk_u32, %kvmma_w_warp_off;
     add.u32 %kvmma_bv_base, %tb1_kv_smem_wv_u32, %kvmma_w_warp_off;
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
@@ -1524,7 +1524,7 @@ expression: ptx
     and.b32 %kvmma_n_tile, %kvmma_global_t, 3;
     shl.b32 %kvmma_x_warp_off, %kvmma_m_tile, 12;
     add.u32 %kvmma_a_base, %tb1_kv_smem_x_u32, %kvmma_x_warp_off;
-    shl.b32 %kvmma_w_warp_off, %kvmma_n_tile, 4;
+    shl.b32 %kvmma_w_warp_off, %kvmma_n_tile, 11;
     add.u32 %kvmma_bk_base, %tb1_kv_smem_wk_u32, %kvmma_w_warp_off;
     add.u32 %kvmma_bv_base, %tb1_kv_smem_wv_u32, %kvmma_w_warp_off;
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
@@ -2002,7 +2002,7 @@ expression: ptx
     and.b32 %kvmma_n_tile, %kvmma_global_t, 3;
     shl.b32 %kvmma_x_warp_off, %kvmma_m_tile, 12;
     add.u32 %kvmma_a_base, %tb1_kv_smem_x_u32, %kvmma_x_warp_off;
-    shl.b32 %kvmma_w_warp_off, %kvmma_n_tile, 4;
+    shl.b32 %kvmma_w_warp_off, %kvmma_n_tile, 11;
     add.u32 %kvmma_bk_base, %tb1_kv_smem_wk_u32, %kvmma_w_warp_off;
     add.u32 %kvmma_bv_base, %tb1_kv_smem_wv_u32, %kvmma_w_warp_off;
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
@@ -2480,7 +2480,7 @@ expression: ptx
     and.b32 %kvmma_n_tile, %kvmma_global_t, 3;
     shl.b32 %kvmma_x_warp_off, %kvmma_m_tile, 12;
     add.u32 %kvmma_a_base, %tb1_kv_smem_x_u32, %kvmma_x_warp_off;
-    shl.b32 %kvmma_w_warp_off, %kvmma_n_tile, 4;
+    shl.b32 %kvmma_w_warp_off, %kvmma_n_tile, 11;
     add.u32 %kvmma_bk_base, %tb1_kv_smem_wk_u32, %kvmma_w_warp_off;
     add.u32 %kvmma_bv_base, %tb1_kv_smem_wv_u32, %kvmma_w_warp_off;
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
@@ -2958,7 +2958,7 @@ expression: ptx
     and.b32 %kvmma_n_tile, %kvmma_global_t, 3;
     shl.b32 %kvmma_x_warp_off, %kvmma_m_tile, 12;
     add.u32 %kvmma_a_base, %tb1_kv_smem_x_u32, %kvmma_x_warp_off;
-    shl.b32 %kvmma_w_warp_off, %kvmma_n_tile, 4;
+    shl.b32 %kvmma_w_warp_off, %kvmma_n_tile, 11;
     add.u32 %kvmma_bk_base, %tb1_kv_smem_wk_u32, %kvmma_w_warp_off;
     add.u32 %kvmma_bv_base, %tb1_kv_smem_wv_u32, %kvmma_w_warp_off;
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
@@ -3436,7 +3436,7 @@ expression: ptx
     and.b32 %kvmma_n_tile, %kvmma_global_t, 3;
     shl.b32 %kvmma_x_warp_off, %kvmma_m_tile, 12;
     add.u32 %kvmma_a_base, %tb1_kv_smem_x_u32, %kvmma_x_warp_off;
-    shl.b32 %kvmma_w_warp_off, %kvmma_n_tile, 4;
+    shl.b32 %kvmma_w_warp_off, %kvmma_n_tile, 11;
     add.u32 %kvmma_bk_base, %tb1_kv_smem_wk_u32, %kvmma_w_warp_off;
     add.u32 %kvmma_bv_base, %tb1_kv_smem_wv_u32, %kvmma_w_warp_off;
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
@@ -3914,7 +3914,7 @@ expression: ptx
     and.b32 %kvmma_n_tile, %kvmma_global_t, 3;
     shl.b32 %kvmma_x_warp_off, %kvmma_m_tile, 12;
     add.u32 %kvmma_a_base, %tb1_kv_smem_x_u32, %kvmma_x_warp_off;
-    shl.b32 %kvmma_w_warp_off, %kvmma_n_tile, 4;
+    shl.b32 %kvmma_w_warp_off, %kvmma_n_tile, 11;
     add.u32 %kvmma_bk_base, %tb1_kv_smem_wk_u32, %kvmma_w_warp_off;
     add.u32 %kvmma_bv_base, %tb1_kv_smem_wv_u32, %kvmma_w_warp_off;
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
@@ -4392,7 +4392,7 @@ expression: ptx
     and.b32 %kvmma_n_tile, %kvmma_global_t, 3;
     shl.b32 %kvmma_x_warp_off, %kvmma_m_tile, 12;
     add.u32 %kvmma_a_base, %tb1_kv_smem_x_u32, %kvmma_x_warp_off;
-    shl.b32 %kvmma_w_warp_off, %kvmma_n_tile, 4;
+    shl.b32 %kvmma_w_warp_off, %kvmma_n_tile, 11;
     add.u32 %kvmma_bk_base, %tb1_kv_smem_wk_u32, %kvmma_w_warp_off;
     add.u32 %kvmma_bv_base, %tb1_kv_smem_wv_u32, %kvmma_w_warp_off;
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
@@ -4870,7 +4870,7 @@ expression: ptx
     and.b32 %kvmma_n_tile, %kvmma_global_t, 3;
     shl.b32 %kvmma_x_warp_off, %kvmma_m_tile, 12;
     add.u32 %kvmma_a_base, %tb1_kv_smem_x_u32, %kvmma_x_warp_off;
-    shl.b32 %kvmma_w_warp_off, %kvmma_n_tile, 4;
+    shl.b32 %kvmma_w_warp_off, %kvmma_n_tile, 11;
     add.u32 %kvmma_bk_base, %tb1_kv_smem_wk_u32, %kvmma_w_warp_off;
     add.u32 %kvmma_bv_base, %tb1_kv_smem_wv_u32, %kvmma_w_warp_off;
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
@@ -5348,7 +5348,7 @@ expression: ptx
     and.b32 %kvmma_n_tile, %kvmma_global_t, 3;
     shl.b32 %kvmma_x_warp_off, %kvmma_m_tile, 12;
     add.u32 %kvmma_a_base, %tb1_kv_smem_x_u32, %kvmma_x_warp_off;
-    shl.b32 %kvmma_w_warp_off, %kvmma_n_tile, 4;
+    shl.b32 %kvmma_w_warp_off, %kvmma_n_tile, 11;
     add.u32 %kvmma_bk_base, %tb1_kv_smem_wk_u32, %kvmma_w_warp_off;
     add.u32 %kvmma_bv_base, %tb1_kv_smem_wv_u32, %kvmma_w_warp_off;
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
@@ -5826,7 +5826,7 @@ expression: ptx
     and.b32 %kvmma_n_tile, %kvmma_global_t, 3;
     shl.b32 %kvmma_x_warp_off, %kvmma_m_tile, 12;
     add.u32 %kvmma_a_base, %tb1_kv_smem_x_u32, %kvmma_x_warp_off;
-    shl.b32 %kvmma_w_warp_off, %kvmma_n_tile, 4;
+    shl.b32 %kvmma_w_warp_off, %kvmma_n_tile, 11;
     add.u32 %kvmma_bk_base, %tb1_kv_smem_wk_u32, %kvmma_w_warp_off;
     add.u32 %kvmma_bv_base, %tb1_kv_smem_wv_u32, %kvmma_w_warp_off;
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
@@ -6304,7 +6304,7 @@ expression: ptx
     and.b32 %kvmma_n_tile, %kvmma_global_t, 3;
     shl.b32 %kvmma_x_warp_off, %kvmma_m_tile, 12;
     add.u32 %kvmma_a_base, %tb1_kv_smem_x_u32, %kvmma_x_warp_off;
-    shl.b32 %kvmma_w_warp_off, %kvmma_n_tile, 4;
+    shl.b32 %kvmma_w_warp_off, %kvmma_n_tile, 11;
     add.u32 %kvmma_bk_base, %tb1_kv_smem_wk_u32, %kvmma_w_warp_off;
     add.u32 %kvmma_bv_base, %tb1_kv_smem_wv_u32, %kvmma_w_warp_off;
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
@@ -6782,7 +6782,7 @@ expression: ptx
     and.b32 %kvmma_n_tile, %kvmma_global_t, 3;
     shl.b32 %kvmma_x_warp_off, %kvmma_m_tile, 12;
     add.u32 %kvmma_a_base, %tb1_kv_smem_x_u32, %kvmma_x_warp_off;
-    shl.b32 %kvmma_w_warp_off, %kvmma_n_tile, 4;
+    shl.b32 %kvmma_w_warp_off, %kvmma_n_tile, 11;
     add.u32 %kvmma_bk_base, %tb1_kv_smem_wk_u32, %kvmma_w_warp_off;
     add.u32 %kvmma_bv_base, %tb1_kv_smem_wv_u32, %kvmma_w_warp_off;
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
@@ -7260,7 +7260,7 @@ expression: ptx
     and.b32 %kvmma_n_tile, %kvmma_global_t, 3;
     shl.b32 %kvmma_x_warp_off, %kvmma_m_tile, 12;
     add.u32 %kvmma_a_base, %tb1_kv_smem_x_u32, %kvmma_x_warp_off;
-    shl.b32 %kvmma_w_warp_off, %kvmma_n_tile, 4;
+    shl.b32 %kvmma_w_warp_off, %kvmma_n_tile, 11;
     add.u32 %kvmma_bk_base, %tb1_kv_smem_wk_u32, %kvmma_w_warp_off;
     add.u32 %kvmma_bv_base, %tb1_kv_smem_wv_u32, %kvmma_w_warp_off;
     // Load A-fragment (m16xk16 f16 row-major) per PTX m16n8k16 spec
