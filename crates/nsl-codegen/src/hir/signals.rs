@@ -16,6 +16,38 @@ pub enum SignalRef {
         array_name: String,
         indices: Vec<IndexExpr>,
     },
+    /// M57.1 wire-array realization (Task W5): reads one element of a
+    /// `LocalParamArray` declared at module scope. Identical shape to
+    /// `WireArrayElement` but lowers as a Verilog localparam read.
+    /// `array_name` matches a `LocalParamArray`'s `name`; `indices` must
+    /// be `dims.len()` long.
+    IndexedLocalParam {
+        array_name: String,
+        indices: Vec<IndexExpr>,
+    },
+    /// M57.1 wire-array realization (Task W5): Verilog indexed part select on
+    /// a Port (or wire) — emits `{name}[{base_bit} +: {width}]`. Used to
+    /// slice the layer-1 `Port::Input("x_l1")` flat bus into per-element
+    /// `x_l1_a[k]` WireArray cells.
+    PortBitSlice {
+        name: String,
+        base_bit: usize,
+        width: usize,
+    },
+    /// M57.1 wire-array realization (Task W5): concatenation across an
+    /// array's elements — emits Verilog `{name[n-1], ..., name[0]}` (1D) or
+    /// `{name[n-1][fix], ..., name[0][fix]}` (2D with a fixed inner index).
+    /// Used to drive tap ports + the final-layer `out` port from a WireArray.
+    ///
+    /// `n` is the number of elements (the outer dim of the array). When
+    /// `fixed_index` is `Some(fix)`, the inner index is held at `fix` for
+    /// every concat element (used for `acc[*][k_dim]`-style fixed-column
+    /// reads).
+    WireArrayConcat {
+        array_name: String,
+        n: usize,
+        fixed_index: Option<usize>,
+    },
 }
 
 impl SignalRef {
@@ -25,6 +57,17 @@ impl SignalRef {
     pub fn local_param(name: impl Into<String>) -> Self { Self::LocalParam(name.into()) }
     pub fn wire_array_element(name: impl Into<String>, indices: Vec<IndexExpr>) -> Self {
         Self::WireArrayElement { array_name: name.into(), indices }
+    }
+    pub fn indexed_local_param(name: impl Into<String>, indices: Vec<IndexExpr>) -> Self {
+        Self::IndexedLocalParam { array_name: name.into(), indices }
+    }
+    pub fn port_bit_slice(name: impl Into<String>, base_bit: usize, width: usize) -> Self {
+        Self::PortBitSlice { name: name.into(), base_bit, width }
+    }
+    pub fn wire_array_concat(
+        name: impl Into<String>, n: usize, fixed_index: Option<usize>,
+    ) -> Self {
+        Self::WireArrayConcat { array_name: name.into(), n, fixed_index }
     }
 }
 

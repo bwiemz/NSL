@@ -3,7 +3,7 @@
 
 use crate::fpga_error::{FpgaLoweringError, V1_SUPPORTED_OPS};
 use crate::hir::module::HirModule;
-use crate::kernel_ir::{KirOp, KirType, KernelIR};
+use crate::kernel_ir::{KernelIR, KirOp, KirType, VarId};
 
 pub struct KirToHirPass {
     pub test_taps: bool,
@@ -23,19 +23,29 @@ impl KirToHirPass {
         let mut module = HirModule::new(module_name);
         module.test_taps = self.test_taps;
 
-        // M57.1 §3.5: peekable layer-aware iteration. Index-based loop so that
-        // when we see a Matmul, we can peek at the next op for an
-        // ElementwiseAdd(bias) and fuse the pair for the bias-as-seed fold
-        // (Task 3.4 fills in the bias-fold logic; Task 3.1 is no-op delegation).
+        // M57.1 §3.5 + wire-array mini §3.1: peekable layer-aware iteration.
+        // The dispatch prefers the fused v1 MLP chain emitter when a contiguous
+        // Matmul → ElementwiseAdd → Relu pattern is recognized; otherwise it
+        // falls through to the standalone lowerers (preserving M57 snapshots,
+        // Pin 2).
         let ops: Vec<&KirOp> = kir.ops().collect();
         let mut i = 0;
         while i < ops.len() {
             match ops[i] {
                 KirOp::Matmul { out: matmul_out, .. } => {
-                    // Peek at the adjacent op. The bias-fold (Task 3.4) requires
-                    // the ElementwiseAdd's `a` to reference this Matmul's `out`
-                    // (i.e., bias is added to the matmul result, not the other
-                    // way around). The v1 MLP recognizer emits ops in that order.
+                    // M57.1 wire-array mini §3.1: try the multi-layer chain
+                    // first. Recognizer verifies SSA + dimensional handoff
+                    // (Pin 1) before fusing; errors loudly on dimensional
+                    // mismatch.
+                    if let Some(chain_len) = try_recognize_v1_mlp_chain(&ops, i)? {
+                        lower_v1_mlp_layer_chain(
+                            &ops[i..i + chain_len],
+                            &mut module,
+                        )?;
+                        i += chain_len;
+                        continue;
+                    }
+                    // Single Matmul → optional ElementwiseAdd standalone path.
                     let bias_op = ops.get(i + 1).copied().filter(|next| {
                         matches!(
                             next,
@@ -444,37 +454,157 @@ fn next_port_layer_index(module: &HirModule, prefix: &str) -> usize {
     max_seen + 1
 }
 
-/// M57.1 wire-array mini §3.2: fused emitter for a single v1 MLP layer.
-/// Emits acc_l<i> + relu_l<i> WireArrays at module scope, generate-for
-/// bodies driving bias-as-seed ripple + final-column ReLU.
+/// M57.1 wire-array mini §3.1: scan forward from `start` for a contiguous
+/// v1 MLP chain (Matmul → ElementwiseAdd → Relu triples with verified SSA +
+/// dimensional handoffs across layers).
 ///
-/// **W3 scope (this task)**: declarations only — `Port::Input(x_l<i>)`,
-/// `LocalParam`s (`W<i>_<k>_<o>`, `b<i>_<o>`), `HirNode::WireArray(acc_l<i>)`,
-/// `HirNode::WireArray(relu_l<i>)`. The generate-for ripple body,
-/// final-column relu, tap outputs, and `is_final_layer` output port all
-/// land in subsequent W-tasks (W4 = AssignWireArrayElement body; W5 =
-/// full multi-layer dispatch).
+/// Returns `Some(chain_len)` where `chain_len = layers_matched * 3` if at
+/// least one layer matches the pattern. Returns `None` if the very first
+/// triple at `start` isn't a complete Matmul/ElementwiseAdd/Relu pattern —
+/// the dispatch then falls through to the standalone lowerers.
+///
+/// Errors with `FpgaLoweringError::UnsupportedV1Shape` if a multi-layer
+/// chain is recognized but the dimensional handoff fails
+/// (`prev_layer.n_outputs != this_layer.k_dim`). This is intentional fail-
+/// loud per spec Pin 1 — silently emitting a mis-wired chain would produce
+/// out-of-bounds WireArrayElement reads.
+fn try_recognize_v1_mlp_chain(
+    ops: &[&KirOp],
+    start: usize,
+) -> Result<Option<usize>, FpgaLoweringError> {
+    let mut i = start;
+    let mut prev_relu_out: Option<VarId> = None;
+    let mut prev_n_outputs: Option<usize> = None;
+    let mut layers_matched: usize = 0;
+
+    while i + 2 < ops.len() {
+        let matmul = ops[i];
+        let eltadd = ops[i + 1];
+        let relu = ops[i + 2];
+
+        // Layer's matmul: extract a, out, a_shape, b_shape.
+        let (m_a, m_out, m_a_shape, m_b_shape) = match matmul {
+            KirOp::Matmul { a, out, a_shape, b_shape, .. } =>
+                (*a, *out, *a_shape, *b_shape),
+            _ => break,
+        };
+
+        // Inter-layer checks (Pin 1): SSA + dimensional handoff. The chain's
+        // first layer has no prev; subsequent layers must connect cleanly.
+        if let Some(prev_out) = prev_relu_out {
+            if prev_out != m_a {
+                break;
+            }
+            if let Some(prev_no) = prev_n_outputs {
+                if prev_no != m_a_shape[1] {
+                    return Err(FpgaLoweringError::UnsupportedV1Shape {
+                        found: format!(
+                            "layer {} k_dim={} != layer {} n_outputs={}",
+                            layers_matched + 1,
+                            m_a_shape[1],
+                            layers_matched,
+                            prev_no,
+                        ),
+                        expected: "prev_layer.n_outputs == this_layer.k_dim",
+                    });
+                }
+            }
+        }
+
+        // Layer's ElementwiseAdd: SSA chain m_out -> e_a, capture e_out.
+        let (e_a, e_out) = match eltadd {
+            KirOp::ElementwiseAdd { a, out, .. } => (*a, *out),
+            _ => break,
+        };
+        if e_a != m_out {
+            break;
+        }
+
+        // Layer's Relu: SSA chain e_out -> r_a, capture r_out.
+        let (r_a, r_out) = match relu {
+            KirOp::Relu { a, out, .. } => (*a, *out),
+            _ => break,
+        };
+        if r_a != e_out {
+            break;
+        }
+
+        prev_relu_out = Some(r_out);
+        prev_n_outputs = Some(m_b_shape[1]);
+        layers_matched += 1;
+        i += 3;
+    }
+
+    if layers_matched >= 1 {
+        Ok(Some(layers_matched * 3))
+    } else {
+        Ok(None)
+    }
+}
+
+/// M57.1 wire-array mini §3.2: emit a chain of v1 MLP layers as a unit.
+/// Each layer except the first reads from the previous layer's `relu_l<i-1>`
+/// WireArray directly (no inter-layer Port::Input). The final layer carries
+/// the `Port::Output("out")` driven by `WireArrayConcat(relu_l<N>)`.
+fn lower_v1_mlp_layer_chain(
+    ops: &[&KirOp],
+    module: &mut HirModule,
+) -> Result<(), FpgaLoweringError> {
+    assert_eq!(ops.len() % 3, 0, "v1 MLP chain ops must come in triples");
+    let n_layers = ops.len() / 3;
+    let mut prev_relu_array: Option<String> = None;
+    for layer_idx in 1..=n_layers {
+        let base = (layer_idx - 1) * 3;
+        let matmul = ops[base];
+        let eltadd = ops[base + 1];
+        let relu = ops[base + 2];
+        let is_final = layer_idx == n_layers;
+        let prev_ref = prev_relu_array.as_deref();
+        lower_v1_mlp_single_layer(
+            matmul,
+            Some(eltadd),
+            relu,
+            prev_ref,
+            layer_idx,
+            is_final,
+            module,
+        )?;
+        prev_relu_array = Some(format!("relu_l{}", layer_idx));
+    }
+    Ok(())
+}
+
+/// M57.1 wire-array mini §3.2: fused emitter for a single v1 MLP layer.
+/// Emits the full HIR shape for one layer of the v1 MLP chain:
+///   - Layer 1 only: `Port::Input(x_l1)` + per-element fan-out into a
+///     `x_l1_a` WireArray cell via `PortBitSlice`. Layers > 1: read from
+///     `prev_relu_array_name` directly (no Port::Input).
+///   - `LocalParamArray("W<i>", [k_dim, n_outputs])` (Task W5; replaces
+///     per-element `W<i>_<k>_<o>` LocalParams) and
+///     `LocalParamArray("b<i>", [n_outputs])` when bias is present.
+///   - `WireArray(acc_l<i>, [n_outputs, k_dim+1])` +
+///     `WireArray(relu_l<i>, [n_outputs])` declarations.
+///   - n_outputs bias-seed assigns `acc[o][0] = b<i>[o]` (or zero LocalParam
+///     when has_bias=false; defensive path).
+///   - Outer `GenerateFor` over `_gv_o` containing inner `GenerateFor` over
+///     `_gv_k`: Mul(x_l<i>_a[_gv_k] * W<i>[_gv_k][_gv_o]) → optional
+///     SignExtend → Add(acc[_gv_o][_gv_k] + sext_prod) → AssignWireArrayElement
+///     writing into `acc[_gv_o][_gv_k + 1]`.
+///   - Final-column relu GenerateFor over `_gv_o`: max0(acc[_gv_o][k_dim]) →
+///     relu_l<i>[_gv_o].
+///   - Tap ports `tap_l<i>_matmul_out` (post-bias accumulator, fixed col
+///     `k_dim`) and `tap_l<i>_relu_out` when `module.test_taps`.
+///   - When `is_final_layer`: `Port::Output("out", ...)` driven by
+///     `WireArrayConcat(relu_l<i>, n_outputs, None)`.
 ///
 /// Inputs:
-/// - `matmul`: the `KirOp::Matmul` for this layer.
-/// - `eltadd`: optional `KirOp::ElementwiseAdd` (bias). When `None`, no
-///   bias LocalParams are emitted; the accumulator will seed from zero in
-///   W4 (defensive path not exercised by v1 MLP).
-/// - `relu`: the `KirOp::Relu` for this layer (used in W4/W5 for the
-///   final-column max0; in W3 only consumed for type-checking).
-/// - `prev_relu_array_name`: when `Some`, this is layer i > 1 — reads
-///   from the previous layer's relu WireArray instead of declaring
-///   `Port::Input`. When `None`, declares `Port::Input("x_l<i>", …)`.
+/// - `matmul` / `eltadd` / `relu`: the layer's three KIR ops. `eltadd=None`
+///   triggers the zero-seed defensive path.
+/// - `prev_relu_array_name`: when `Some`, this is layer i > 1 — reads from
+///   the previous layer's relu WireArray instead of declaring `Port::Input`.
 /// - `layer_idx`: 1-based layer index for naming.
-/// - `is_final_layer`: when true, future tasks will declare
-///   `Port::Output("out")`. In W3 it is stored only for the signature
-///   contract.
+/// - `is_final_layer`: when true, declares `Port::Output("out")`.
 /// - `module`: HirModule to mutate.
-//
-// W3 lands the scaffold; production dispatch from `KirToHirPass::lower` is
-// wired in W5 (multi-layer dispatch). Allow dead_code until then so the
-// scaffold compiles clippy-clean.
-#[allow(dead_code)]
 pub(crate) fn lower_v1_mlp_single_layer(
     matmul: &KirOp,
     eltadd: Option<&KirOp>,
@@ -484,9 +614,12 @@ pub(crate) fn lower_v1_mlp_single_layer(
     is_final_layer: bool,
     module: &mut HirModule,
 ) -> Result<(), FpgaLoweringError> {
+    use crate::hir::control::GenerateFor as Gf;
+    use crate::hir::ids::GenvarId;
     use crate::hir::module::HirNode;
     use crate::hir::nodes::{
-        AssignWireArrayElement, IndexExpr, LocalParam, Port, WireArray,
+        Add, AssignWireArrayElement, IndexExpr, LocalParam, LocalParamArray,
+        Max0, Mul, Port, SignExtend, WireArray,
     };
     use crate::hir::signals::SignalRef;
 
@@ -509,8 +642,7 @@ pub(crate) fn lower_v1_mlp_single_layer(
         _ => unreachable!("lower_v1_mlp_single_layer called with non-Matmul matmul"),
     };
 
-    // Type-check relu (W3 scope: just confirm it is a Relu op; the Max0
-    // body lands in W4).
+    // Type-check relu — only ReLU is supported as the layer's activation.
     if !matches!(relu, KirOp::Relu { .. }) {
         unreachable!("lower_v1_mlp_single_layer called with non-Relu relu");
     }
@@ -525,40 +657,61 @@ pub(crate) fn lower_v1_mlp_single_layer(
     let a_width = kir_dtype_width(a_dtype);
     let b_width = kir_dtype_width(b_dtype);
     let acc_width = kir_dtype_width(out_dtype);
+    let prod_width = a_width + b_width;
 
     let has_bias = eltadd.is_some();
     let x_port_name = format!("x_l{}", layer_idx);
-    let w_lp_prefix = format!("W{}", layer_idx);
-    let b_lp_prefix = format!("b{}", layer_idx);
+    let w_arr_name = format!("W{}", layer_idx);
+    let b_arr_name = format!("b{}", layer_idx);
     let acc_array_name = format!("acc_l{}", layer_idx);
     let relu_array_name = format!("relu_l{}", layer_idx);
+    let test_taps = module.test_taps;
 
-    // ── Layer 1: declare Port::Input(x_l1). Layers 2+: skip (read from
-    //    prev_relu_array_name in W5). ────────────────────────────────────
-    if prev_relu_array_name.is_none() {
-        module.add_port(Port::input(&x_port_name, k_dim * a_width));
-    }
-
-    // ── LocalParams: W<i>_<k>_<o> ──────────────────────────────────────
-    for o in 0..n_outputs {
-        for k in 0..k_dim {
-            module.add_local_param(LocalParam::new(
-                format!("{}_{}_{}", w_lp_prefix, k, o),
-                b_width,
-                0,
-            ));
+    // ── Layer 1: declare Port::Input(x_l1) + x_l1_a WireArray fan-out.
+    //    Layers 2+: skip — read from prev_relu_array_name directly. ────────
+    let x_array_name: String = match prev_relu_array_name {
+        Some(prev) => prev.to_string(),
+        None => {
+            // Layer 1: external stimulus port + per-element fan-out into a
+            // `x_l<i>_a` WireArray (unified matmul-body read path — see §3.2).
+            module.add_port(Port::input(&x_port_name, k_dim * a_width));
+            let name = format!("x_l{}_a", layer_idx);
+            module.add_node(HirNode::WireArray(WireArray {
+                name: name.clone(),
+                dims: vec![k_dim],
+                width: a_width,
+            }))?;
+            for k in 0..k_dim {
+                module.add_node(HirNode::AssignWireArrayElement(AssignWireArrayElement {
+                    array_name: name.clone(),
+                    indices: vec![IndexExpr::Literal(k)],
+                    src: SignalRef::port_bit_slice(
+                        x_port_name.clone(),
+                        k * a_width,
+                        a_width,
+                    ),
+                }))?;
+            }
+            name
         }
-    }
+    };
 
-    // ── LocalParams: b<i>_<o> (only when bias is present) ─────────────
+    // ── LocalParamArrays: W<i>[k_dim][n_outputs] + b<i>[n_outputs] ────────
+    // Values are zero-initialized; baked at CLI time (Task W6) by the
+    // fixture loader walking `module.local_param_arrays_mut()`.
+    module.add_local_param_array(LocalParamArray {
+        name: w_arr_name.clone(),
+        dims: vec![k_dim, n_outputs],
+        width: b_width,
+        values: vec![0; k_dim * n_outputs],
+    });
     if has_bias {
-        for o in 0..n_outputs {
-            module.add_local_param(LocalParam::new(
-                format!("{}_{}", b_lp_prefix, o),
-                acc_width,
-                0,
-            ));
-        }
+        module.add_local_param_array(LocalParamArray {
+            name: b_arr_name.clone(),
+            dims: vec![n_outputs],
+            width: acc_width,
+            values: vec![0; n_outputs],
+        });
     }
 
     // ── WireArrays: acc_l<i> [n_outputs][k_dim+1] + relu_l<i> [n_outputs] ─
@@ -567,24 +720,23 @@ pub(crate) fn lower_v1_mlp_single_layer(
         dims: vec![n_outputs, k_dim + 1],
         width: acc_width,
     }))?;
-
     module.add_node(HirNode::WireArray(WireArray {
         name: relu_array_name.clone(),
         dims: vec![n_outputs],
         width: acc_width,
     }))?;
 
-    // ── Bias-seed assigns: acc[o][0] = b<i>_<o> (or zero LocalParam) ──────
+    // ── Bias-seed assigns: acc[o][0] = b<i>[o] (or zero LocalParam) ──────
     //
-    // M57.1 wire-array mini §3.2 + §4: per-element bias-seed assigns emitted
-    // at module top-level (NOT inside the GenerateFor body, because LocalParam
-    // access by genvar isn't directly supported in standard Verilog). W5's
-    // ripple body uses Genvar-indexed `acc[o][k+1]` writes via a separate
-    // LocalParamArray + IndexedLocalParam mechanism.
+    // Per-element assigns at module top — LocalParam access by genvar isn't
+    // directly supported in standard Verilog generate blocks. (The W<i>
+    // matrix uses LocalParamArray + IndexedLocalParam inside the ripple
+    // body because Verilog DOES allow indexing into a `localparam ARRAY`
+    // by genvar, just not into a family of scalars-by-name.)
     //
-    // No-bias defensive path: declare a single `zero_w<acc_width>` LocalParam
-    // and use it as the seed. Idempotent — only declared once even if the
-    // function is called for multiple layers without bias.
+    // Defensive no-bias path: declare a single `zero_w<acc_width>` scalar
+    // LocalParam (idempotent across multiple no-bias calls within a module)
+    // and reference it as the seed source.
     let zero_lp_name = format!("zero_w{}", acc_width);
     if !has_bias
         && !module
@@ -594,10 +746,13 @@ pub(crate) fn lower_v1_mlp_single_layer(
     {
         module.add_local_param(LocalParam::new(&zero_lp_name, acc_width, 0));
     }
-
     for o in 0..n_outputs {
         let src = if has_bias {
-            SignalRef::local_param(format!("{}_{}", b_lp_prefix, o))
+            // Per-element b<i>[o] read via IndexedLocalParam (literal index).
+            SignalRef::indexed_local_param(
+                b_arr_name.clone(),
+                vec![IndexExpr::Literal(o)],
+            )
         } else {
             SignalRef::local_param(&zero_lp_name)
         };
@@ -608,11 +763,150 @@ pub(crate) fn lower_v1_mlp_single_layer(
         }))?;
     }
 
-    // W4 scope: bias-seed assigns now emitted. Generate-for ripple body
-    // + relu final column + tap outputs + final-layer Port::Output land in W5.
-    let _ = is_final_layer;
-    let _ = prev_relu_array_name;
-    let _ = relu_array_name;
+    // ── Outer GenerateFor over _gv_o, inner GenerateFor over _gv_k ──────
+    let gv_o = GenvarId::fresh();
+    let gv_o_name = format!("_gv{}", gv_o.0);
+    let gv_k = GenvarId::fresh();
+    let gv_k_name = format!("_gv{}", gv_k.0);
+
+    // Inner-body construction: Mul → optional SignExtend → Add →
+    // AssignWireArrayElement (writing into acc[_gv_o][_gv_k + 1]).
+    let mut inner_body: Vec<HirNode> = Vec::new();
+
+    // product = x[_gv_k] * W<i>[_gv_k][_gv_o]
+    let prod = Mul::new(
+        SignalRef::wire_array_element(
+            x_array_name.clone(),
+            vec![IndexExpr::Genvar(gv_k_name.clone())],
+        ),
+        SignalRef::indexed_local_param(
+            w_arr_name.clone(),
+            vec![
+                IndexExpr::Genvar(gv_k_name.clone()),
+                IndexExpr::Genvar(gv_o_name.clone()),
+            ],
+        ),
+        a_width,
+        b_width,
+        prod_width,
+    );
+    let prod_id = prod.out;
+    inner_body.push(HirNode::Mul(prod));
+
+    // Optional SignExtend if prod_width < acc_width.
+    let extended_src = if prod_width < acc_width {
+        let se = SignExtend::new(SignalRef::wire(prod_id), prod_width, acc_width);
+        let se_id = se.dst;
+        inner_body.push(HirNode::SignExtend(se));
+        SignalRef::wire(se_id)
+    } else {
+        SignalRef::wire(prod_id)
+    };
+
+    // acc[_gv_o][_gv_k + 1] = acc[_gv_o][_gv_k] + extended
+    // Model: fresh Wire(sum) + Add(...) targeting sum + AssignWireArrayElement.
+    let add = Add::new(
+        SignalRef::wire_array_element(
+            acc_array_name.clone(),
+            vec![
+                IndexExpr::Genvar(gv_o_name.clone()),
+                IndexExpr::Genvar(gv_k_name.clone()),
+            ],
+        ),
+        extended_src,
+        acc_width,
+    );
+    let sum_id = add.out;
+    inner_body.push(HirNode::Add(add));
+    inner_body.push(HirNode::AssignWireArrayElement(AssignWireArrayElement {
+        array_name: acc_array_name.clone(),
+        indices: vec![
+            IndexExpr::Genvar(gv_o_name.clone()),
+            IndexExpr::GenvarPlus(gv_k_name.clone(), 1),
+        ],
+        src: SignalRef::wire(sum_id),
+    }));
+
+    let inner_gf = Gf {
+        var: gv_k,
+        lo: 0,
+        hi: k_dim as i64,
+        body: inner_body,
+    };
+    let outer_body = vec![HirNode::GenerateFor(inner_gf)];
+    module.add_node(HirNode::GenerateFor(Gf {
+        var: gv_o,
+        lo: 0,
+        hi: n_outputs as i64,
+        body: outer_body,
+    }))?;
+
+    // ── Final-column relu GenerateFor: relu[_gv_o] = max0(acc[_gv_o][k_dim]) ─
+    let gv_relu = GenvarId::fresh();
+    let gv_relu_name = format!("_gv{}", gv_relu.0);
+    let relu_max0 = Max0::new(
+        SignalRef::wire_array_element(
+            acc_array_name.clone(),
+            vec![
+                IndexExpr::Genvar(gv_relu_name.clone()),
+                IndexExpr::Literal(k_dim),
+            ],
+        ),
+        acc_width,
+    );
+    let relu_max0_id = relu_max0.out;
+    let relu_body = vec![
+        HirNode::Max0(relu_max0),
+        HirNode::AssignWireArrayElement(AssignWireArrayElement {
+            array_name: relu_array_name.clone(),
+            indices: vec![IndexExpr::Genvar(gv_relu_name.clone())],
+            src: SignalRef::wire(relu_max0_id),
+        }),
+    ];
+    module.add_node(HirNode::GenerateFor(Gf {
+        var: gv_relu,
+        lo: 0,
+        hi: n_outputs as i64,
+        body: relu_body,
+    }))?;
+
+    // ── Tap ports (when test_taps) ──────────────────────────────────────
+    // `tap_l<i>_matmul_out`: post-bias accumulator (concat of acc[o][k_dim]
+    // over o ∈ [0, n_outputs)).
+    // `tap_l<i>_relu_out`: layer output (concat of relu_l<i>[o]).
+    if test_taps {
+        module.add_port(Port::output(
+            format!("tap_l{}_matmul_out", layer_idx),
+            n_outputs * acc_width,
+            SignalRef::wire_array_concat(
+                acc_array_name.clone(),
+                n_outputs,
+                Some(k_dim),
+            ),
+        ));
+        module.add_port(Port::output(
+            format!("tap_l{}_relu_out", layer_idx),
+            n_outputs * acc_width,
+            SignalRef::wire_array_concat(
+                relu_array_name.clone(),
+                n_outputs,
+                None,
+            ),
+        ));
+    }
+
+    // ── Final-layer output port ────────────────────────────────────────
+    if is_final_layer {
+        module.add_port(Port::output(
+            "out",
+            n_outputs * acc_width,
+            SignalRef::wire_array_concat(relu_array_name, n_outputs, None),
+        ));
+    }
+
+    // Silence unused-variable warning when neither relu's max0 nor sum_id
+    // are referenced under specific cfg paths.
+    let _ = relu;
 
     Ok(())
 }
@@ -675,11 +969,11 @@ mod tests {
     use crate::hir::module::HirNode;
     use crate::hir::nodes::{Port, WireArray};
 
-    /// M57.1 wire-array mini §3.2 / Task W3: smallest single-layer case
-    /// (layer 1, with bias). Verifies the scaffold emits the expected
-    /// Port::Input + LocalParams + WireArray declarations.
+    /// M57.1 wire-array mini §3.2 / Task W5: smallest single-layer case
+    /// (layer 1, with bias). Verifies the fused emitter shape:
+    /// Port::Input + x_l1_a fan-out + LocalParamArrays + WireArrays.
     #[test]
-    fn lower_v1_mlp_single_layer_w3_scaffold_emits_decls() {
+    fn lower_v1_mlp_single_layer_w5_emits_full_shape() {
         // Smallest possible MLP layer: 2 inputs → 3 outputs, i8 × i8 → i32.
         let matmul = KirOp::Matmul {
             a: 0, b: 1, out: 2,
@@ -701,18 +995,18 @@ mod tests {
             None, 1, true, &mut module,
         ).expect("single-layer scaffold lowers");
 
-        // Verify the two WireArrays were declared.
+        // Verify the WireArrays were declared. Layer 1 with full ripple
+        // body declares: x_l1_a (k_dim=2), acc_l1 (n_outputs × k_dim+1),
+        // and relu_l1 (n_outputs).
         let wire_arrays: Vec<&WireArray> = module.nodes().iter().filter_map(|n| match n {
             HirNode::WireArray(wa) => Some(wa),
             _ => None,
         }).collect();
-        assert_eq!(wire_arrays.len(), 2, "should declare acc_l1 + relu_l1");
-        assert_eq!(wire_arrays[0].name, "acc_l1");
-        assert_eq!(wire_arrays[0].dims, vec![3, 3]); // n_outputs=3, k_dim+1=3
-        assert_eq!(wire_arrays[0].width, 32);
-        assert_eq!(wire_arrays[1].name, "relu_l1");
-        assert_eq!(wire_arrays[1].dims, vec![3]);
-        assert_eq!(wire_arrays[1].width, 32);
+        assert_eq!(wire_arrays.len(), 3, "x_l1_a + acc_l1 + relu_l1");
+        let names: Vec<&str> = wire_arrays.iter().map(|wa| wa.name.as_str()).collect();
+        assert!(names.contains(&"x_l1_a"));
+        assert!(names.contains(&"acc_l1"));
+        assert!(names.contains(&"relu_l1"));
 
         // Verify Port::Input(x_l1) declared (layer 1, prev_relu_array_name is None).
         let inputs: Vec<&str> = module.ports.iter().filter_map(|p| match p {
@@ -721,16 +1015,23 @@ mod tests {
         }).collect();
         assert!(inputs.contains(&"x_l1"), "x_l1 Port::Input must be declared");
 
-        // LocalParams: 2*3 W + 3 b = 9
-        assert_eq!(module.local_params().len(), 9, "expected 6 W + 3 b LocalParams");
+        // LocalParamArrays: W1 [2,3] + b1 [3].
+        assert_eq!(module.local_param_arrays().len(), 2, "W1 + b1");
+        let w1 = &module.local_param_arrays()[0];
+        assert_eq!(w1.name, "W1");
+        assert_eq!(w1.dims, vec![2, 3]);
+        assert_eq!(w1.width, 8);
+        let b1 = &module.local_param_arrays()[1];
+        assert_eq!(b1.name, "b1");
+        assert_eq!(b1.dims, vec![3]);
+        assert_eq!(b1.width, 32);
     }
 
-    /// M57.1 wire-array mini §3.2 / Task W3: layer 2+ must NOT declare a
+    /// M57.1 wire-array mini §3.2 / Task W5: layer 2+ must NOT declare a
     /// Port::Input — its `x` is read from the previous layer's relu
     /// WireArray (`prev_relu_array_name`).
     #[test]
-    fn lower_v1_mlp_single_layer_w3_layer_2_skips_port_input() {
-        // Layer 2: prev_relu_array_name is Some — no Port::Input declared.
+    fn lower_v1_mlp_single_layer_w5_layer_2_skips_port_input() {
         let matmul = KirOp::Matmul {
             a: 0, b: 1, out: 2,
             a_dtype: KirType::I32, b_dtype: KirType::I8, out_dtype: KirType::I64,
@@ -749,9 +1050,12 @@ mod tests {
         lower_v1_mlp_single_layer(
             &matmul, Some(&eltadd), &relu,
             Some("relu_l1"), 2, true, &mut module,
-        ).expect("single-layer scaffold lowers");
+        ).expect("layer 2 lowers");
 
-        // Layer 2 must NOT declare any Port::Input.
+        // Layer 2 must NOT declare any Port::Input (taps + final out are
+        // Port::Output; this test pre-asserts no Port::Input). Also: with
+        // is_final_layer=true and test_taps=true, expect 3 Port::Output:
+        // tap_l2_matmul_out, tap_l2_relu_out, out.
         let inputs: Vec<&str> = module.ports.iter().filter_map(|p| match p {
             Port::Input { name, .. } => Some(name.as_str()),
             _ => None,
@@ -761,23 +1065,22 @@ mod tests {
             "layer 2 must not declare Port::Input (reads from prev_relu_array)"
         );
 
-        // But layer 2 still declares its own LocalParams + WireArrays.
-        // 3*2 W + 2 b = 8 LocalParams.
-        assert_eq!(module.local_params().len(), 3 * 2 + 2, "3*2 W + 2 b LocalParams");
+        // Layer 2 declares acc_l2 + relu_l2 only (no x_l2_a — it reads
+        // relu_l1 directly).
         let wire_arrays: Vec<&WireArray> = module.nodes().iter().filter_map(|n| match n {
             HirNode::WireArray(wa) => Some(wa),
             _ => None,
         }).collect();
-        assert_eq!(wire_arrays.len(), 2);
+        assert_eq!(wire_arrays.len(), 2, "acc_l2 + relu_l2 only (no x_l2_a)");
         assert_eq!(wire_arrays[0].name, "acc_l2");
         assert_eq!(wire_arrays[1].name, "relu_l2");
     }
 
-    /// M57.1 wire-array mini §3.2 + §4 / Task W4: with-bias layer must emit
-    /// `n_outputs` per-element bias-seed `AssignWireArrayElement` nodes that
-    /// drive `acc_l<i>[o][0]` from the matching `b<i>_<o>` LocalParam.
+    /// M57.1 wire-array mini §3.2 / Task W5: with-bias layer emits
+    /// `n_outputs` per-element bias-seed `AssignWireArrayElement` nodes
+    /// indexed via `IndexedLocalParam(b<i>[o])`.
     #[test]
-    fn lower_v1_mlp_single_layer_w4_emits_bias_seed_assigns() {
+    fn lower_v1_mlp_single_layer_w5_emits_bias_seed_assigns() {
         use crate::hir::nodes::{AssignWireArrayElement, IndexExpr};
         use crate::hir::signals::SignalRef;
 
@@ -801,8 +1104,8 @@ mod tests {
             None, 1, true, &mut module,
         ).expect("scaffold lowers");
 
-        // n_outputs (3) per-element bias-seed AssignWireArrayElement nodes —
-        // each at acc_l1[o][0] reading from b1_<o> LocalParam.
+        // 3 bias-seed AssignWireArrayElement nodes — each at acc_l1[o][0]
+        // reading from b1[o] via IndexedLocalParam.
         let bias_assigns: Vec<&AssignWireArrayElement> = module.nodes().iter().filter_map(|n| match n {
             HirNode::AssignWireArrayElement(a)
                 if a.array_name == "acc_l1"
@@ -813,38 +1116,37 @@ mod tests {
             }
             _ => None,
         }).collect();
-        assert_eq!(
-            bias_assigns.len(),
-            3,
-            "should emit 3 bias-seed assigns (one per output)"
-        );
-
-        // Each bias_assign reads from b1_<o>; indices[0] is Literal(o).
+        assert_eq!(bias_assigns.len(), 3, "3 bias-seed assigns");
         for (idx, a) in bias_assigns.iter().enumerate() {
             match &a.indices[0] {
                 IndexExpr::Literal(n) => assert_eq!(*n, idx),
                 _ => panic!("expected Literal(o) at indices[0]"),
             }
             match &a.src {
-                SignalRef::LocalParam(name) => {
-                    assert_eq!(name, &format!("b1_{}", idx));
+                SignalRef::IndexedLocalParam { array_name, indices } => {
+                    assert_eq!(array_name, "b1");
+                    assert_eq!(indices.len(), 1);
+                    match &indices[0] {
+                        IndexExpr::Literal(n) => assert_eq!(*n, idx),
+                        _ => panic!("expected Literal index into b1"),
+                    }
                 }
-                _ => panic!("expected LocalParam src, got {:?}", a.src),
+                _ => panic!("expected IndexedLocalParam src, got {:?}", a.src),
             }
         }
 
-        // With bias present, no zero_w<acc_width> LocalParam should be emitted.
+        // With bias present, no zero_w<acc_width> scalar LocalParam.
         assert!(
             !module.local_params().iter().any(|lp| lp.name == "zero_w32"),
             "with-bias layer must NOT declare zero_w32 LocalParam"
         );
     }
 
-    /// M57.1 wire-array mini §3.2 + §4 / Task W4: no-bias defensive path
+    /// M57.1 wire-array mini §3.2 / Task W5: no-bias defensive path
     /// declares a single `zero_w<acc_width>` LocalParam and uses it as the
     /// accumulator seed.
     #[test]
-    fn lower_v1_mlp_single_layer_w4_no_bias_uses_zero_localparam() {
+    fn lower_v1_mlp_single_layer_w5_no_bias_uses_zero_localparam() {
         use crate::hir::nodes::{AssignWireArrayElement, IndexExpr};
         use crate::hir::signals::SignalRef;
 
@@ -864,7 +1166,6 @@ mod tests {
             None, 1, true, &mut module,
         ).expect("scaffold lowers no-bias");
 
-        // Zero LocalParam declared exactly once.
         let zero_count = module
             .local_params()
             .iter()
@@ -872,10 +1173,10 @@ mod tests {
             .count();
         assert_eq!(zero_count, 1, "zero_w32 LocalParam must be declared once");
 
-        // Bias-seed assigns reference zero_w32.
         let bias_assigns: Vec<&AssignWireArrayElement> = module.nodes().iter().filter_map(|n| match n {
             HirNode::AssignWireArrayElement(a)
                 if a.array_name == "acc_l1"
+                    && a.indices.len() == 2
                     && matches!(&a.indices[1], IndexExpr::Literal(0)) =>
             {
                 Some(a)
@@ -889,5 +1190,9 @@ mod tests {
                 _ => panic!("expected zero_w32 LocalParam, got {:?}", a.src),
             }
         }
+
+        // No-bias still emits W1 LocalParamArray but no b1.
+        assert_eq!(module.local_param_arrays().len(), 1, "W1 only (no b1)");
+        assert_eq!(module.local_param_arrays()[0].name, "W1");
     }
 }

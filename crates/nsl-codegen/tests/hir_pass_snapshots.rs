@@ -51,11 +51,112 @@ fn structural_summary(module: &HirModule) -> String {
     // primary correctness signal) is still asserted exactly.
     out.push_str(&format!("local_params: {}\n", module.local_params().len()));
     summarize_local_params(&mut out, module.local_params());
-    out.push_str(&format!("nodes: {}\n", module.nodes().len()));
-    for (i, node) in module.nodes().iter().enumerate() {
-        summarize_node(&mut out, node, i, 0);
+    // M57.1 wire-array mini §3.2 (Task W5): also enumerate LocalParamArrays
+    // (the fused-emitter shape for W<i>/b<i>). Names + dims + width are
+    // deterministic; the bulk `values` field is elided to keep the snapshot
+    // human-auditable. Emitted only when non-zero — standalone lowerer
+    // snapshots stay byte-identical (Pin 2: M57 snapshot preservation).
+    if !module.local_param_arrays().is_empty() {
+        out.push_str(&format!("local_param_arrays: {}\n", module.local_param_arrays().len()));
+        for lpa in module.local_param_arrays() {
+            out.push_str(&format!(
+                "  LocalParamArray {} dims={:?} width={}\n",
+                lpa.name, lpa.dims, lpa.width,
+            ));
+        }
     }
+    out.push_str(&format!("nodes: {}\n", module.nodes().len()));
+    summarize_node_list(&mut out, module.nodes(), 0);
     out
+}
+
+/// Summarize a list of HIR nodes with run-length collapse for the
+/// bias-seed and x-bus fan-out repetition patterns. M57.1 wire-array
+/// realization's per-element AssignWireArrayElement runs (`acc_l<i>[o][0] =
+/// IndexedLocalParam(b<i>[o])` for o ∈ [0, n_outputs) and `x_l<i>_a[k] =
+/// PortBitSlice(x_l<i>[k*W +: W])` for k ∈ [0, k_dim)) would otherwise
+/// dwarf the structural skeleton. Collapsing to first + last + count keeps
+/// the snapshot human-auditable while still asserting per-element cardinality
+/// exactly via the `nodes:` total.
+fn summarize_node_list(out: &mut String, nodes: &[HirNode], depth: usize) {
+    let mut i = 0;
+    while i < nodes.len() {
+        // Try to find a run of consecutive AssignWireArrayElement nodes that
+        // form a "fan-out" or "bias-seed" pattern. The run extends as long
+        // as the same array_name is being driven AND each consecutive entry
+        // uses a Literal(o) at position 0 differing by exactly +1.
+        let run_len = elidable_assign_run(nodes, i);
+        if run_len >= 3 {
+            summarize_node(out, &nodes[i], i, depth);
+            let indent = "  ".repeat(depth);
+            out.push_str(&format!(
+                "{indent}…({} consecutive AssignWireArrayElement entries elided)…\n",
+                run_len - 2,
+            ));
+            summarize_node(out, &nodes[i + run_len - 1], i + run_len - 1, depth);
+            i += run_len;
+        } else {
+            summarize_node(out, &nodes[i], i, depth);
+            i += 1;
+        }
+    }
+}
+
+/// Return the number of consecutive `AssignWireArrayElement` nodes starting
+/// at `start` that drive the same array with sequentially-incrementing
+/// Literal-only indices (i.e. the v1 MLP bias-seed / x-bus fan-out pattern).
+/// Returns 0 when the run is empty or doesn't form a pattern.
+fn elidable_assign_run(nodes: &[HirNode], start: usize) -> usize {
+    use nsl_codegen::hir::nodes::IndexExpr;
+    fn key(n: &HirNode) -> Option<(&str, &Vec<IndexExpr>)> {
+        match n {
+            HirNode::AssignWireArrayElement(a) => Some((a.array_name.as_str(), &a.indices)),
+            _ => None,
+        }
+    }
+    let (first_name, first_idx) = match key(&nodes[start]) {
+        Some(k) => k,
+        None => return 0,
+    };
+    // All indices must be Literal — fan-out / bias-seed patterns use only
+    // compile-time integer indices.
+    if first_idx.iter().any(|ix| !matches!(ix, IndexExpr::Literal(_))) {
+        return 0;
+    }
+    let mut len = 1;
+    let mut prev_idx0 = match &first_idx[0] {
+        IndexExpr::Literal(n) => *n,
+        _ => unreachable!(),
+    };
+    while start + len < nodes.len() {
+        let next = match key(&nodes[start + len]) {
+            Some(k) => k,
+            None => break,
+        };
+        if next.0 != first_name { break; }
+        if next.1.len() != first_idx.len() { break; }
+        // All non-leading indices must match exactly; the leading index
+        // must be Literal(prev + 1).
+        let mut ok = true;
+        for (k, ix) in next.1.iter().enumerate() {
+            match (k, ix) {
+                (0, IndexExpr::Literal(n)) => {
+                    if *n != prev_idx0 + 1 { ok = false; break; }
+                }
+                (_, IndexExpr::Literal(n)) => {
+                    match &first_idx[k] {
+                        IndexExpr::Literal(f) if *n == *f => {}
+                        _ => { ok = false; break; }
+                    }
+                }
+                _ => { ok = false; break; }
+            }
+        }
+        if !ok { break; }
+        prev_idx0 += 1;
+        len += 1;
+    }
+    if len >= 3 { len } else { 0 }
 }
 
 /// Group LocalParams by the prefix that precedes the first `_<digit>` segment
@@ -200,6 +301,21 @@ fn format_sigref(s: &nsl_codegen::hir::SignalRef) -> String {
         nsl_codegen::hir::SignalRef::WireArrayElement { array_name, indices } => {
             format!("WireArrayElement({array_name}{})", format_index_exprs(indices))
         }
+        // M57.1 wire-array realization (Task W5): indexed LocalParamArray read.
+        nsl_codegen::hir::SignalRef::IndexedLocalParam { array_name, indices } => {
+            format!("IndexedLocalParam({array_name}{})", format_index_exprs(indices))
+        }
+        // M57.1 wire-array realization (Task W5): Verilog `name[base +: width]`.
+        nsl_codegen::hir::SignalRef::PortBitSlice { name, base_bit, width } => {
+            format!("PortBitSlice({name}[{base_bit} +: {width}])")
+        }
+        // M57.1 wire-array realization (Task W5): concat across array.
+        nsl_codegen::hir::SignalRef::WireArrayConcat { array_name, n, fixed_index } => {
+            match fixed_index {
+                Some(fix) => format!("WireArrayConcat({array_name}, n={n}, fix={fix})"),
+                None => format!("WireArrayConcat({array_name}, n={n})"),
+            }
+        }
     }
 }
 
@@ -335,11 +451,39 @@ fn full_v1_mlp_composition() {
     let module = pass.lower(&kir, "tiny_mlp").unwrap();
     assert_snapshot!(structural_summary(&module));
 
-    // Sanity: module has 4 GenerateFor bodies — M57.1 §3.5 folds the
-    // adjacent ElementwiseAdd(bias) into the matmul's accumulator seed,
-    // so the post-MAC eltadd nodes are no longer emitted. Per-layer
-    // ordering: matmul-l1, relu-l1, matmul-l2, relu-l2.
-    assert_eq!(module.nodes().len(), 4);
+    // M57.1 wire-array mini §3.1 + §3.2 (Task W5): module now contains the
+    // fused wire-array shape. We just sanity-check the module identity +
+    // tap flag; the bulk audit is in the snapshot.
     assert_eq!(module.name, "tiny_mlp");
     assert!(module.test_taps);
+
+    // 2 LocalParamArrays per layer (W<i> + b<i>) × 2 layers = 4.
+    assert_eq!(module.local_param_arrays().len(), 4);
+    let lpa_names: Vec<&str> = module
+        .local_param_arrays()
+        .iter()
+        .map(|lpa| lpa.name.as_str())
+        .collect();
+    assert!(lpa_names.contains(&"W1"));
+    assert!(lpa_names.contains(&"b1"));
+    assert!(lpa_names.contains(&"W2"));
+    assert!(lpa_names.contains(&"b2"));
+
+    // No `relu_in_l<i>` Port::Input anywhere — the fused emitter reads
+    // directly from acc_l<i>[*][k_dim] via WireArrayElement.
+    use nsl_codegen::hir::Port;
+    let has_relu_in_port = module.ports.iter().any(|p| match p {
+        Port::Input { name, .. } => name.starts_with("relu_in_l"),
+        _ => false,
+    });
+    assert!(
+        !has_relu_in_port,
+        "fused v1 MLP must not declare relu_in_l<i> Port::Input"
+    );
+
+    // The final-layer Port::Output("out") is present.
+    let has_out_port = module.ports.iter().any(|p| matches!(
+        p, Port::Output { name, .. } if name == "out"
+    ));
+    assert!(has_out_port, "final layer must declare Port::Output(\"out\")");
 }

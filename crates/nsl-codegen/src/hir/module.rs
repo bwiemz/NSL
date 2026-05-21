@@ -65,6 +65,11 @@ pub struct HirModule {
     /// will need mutable access — added then via a dedicated accessor.
     /// (M57.1 Task 3.2 review follow-up.)
     pub(crate) local_params: Vec<LocalParam>,
+    /// M57.1 wire-array mini §3.2 / Task W5: module-scope multi-dimensional
+    /// const arrays (`W<i>`, `b<i>`). Accessed via `local_param_arrays()`
+    /// (read) / `local_param_arrays_mut()` (Task W6 CLI baking) /
+    /// `add_local_param_array` (construction).
+    pub(crate) local_param_arrays: Vec<LocalParamArray>,
     /// BTreeMap (not HashMap) for deterministic iteration order across Rust
     /// versions and platforms — Layer 1 Verilog emission snapshots depend on
     /// reproducible output (spec §3.5 / §3 issue 5).
@@ -95,6 +100,7 @@ impl HirModule {
             ports: Vec::new(),
             bodies: Vec::new(),
             local_params: Vec::new(),
+            local_param_arrays: Vec::new(),
             clock_domains,
             reset_signals,
             test_taps: true,    // v1 default
@@ -149,6 +155,28 @@ impl HirModule {
     /// substitution only. Callers must not push/remove entries through it.
     pub fn local_params_mut(&mut self) -> &mut Vec<LocalParam> {
         &mut self.local_params
+    }
+
+    /// M57.1 wire-array mini §3.2 / Task W5: register a LocalParamArray
+    /// (the fused-emitter shape for `W<i>` / `b<i>`). The fused matmul
+    /// ripple body reads it via `SignalRef::IndexedLocalParam`.
+    pub fn add_local_param_array(&mut self, lpa: LocalParamArray) {
+        self.local_param_arrays.push(lpa);
+    }
+
+    /// Read-only access to declared LocalParamArrays. Construction via
+    /// `add_local_param_array`. Renders in the LocalParam preamble block of
+    /// the emitted Verilog.
+    pub fn local_param_arrays(&self) -> &[LocalParamArray] {
+        &self.local_param_arrays
+    }
+
+    /// Mutable access to declared LocalParamArrays for CLI-time value baking
+    /// (Task W6). The fixture loader writes parsed weight/bias values into
+    /// the `values` field by `[k][o]` (or `[o]`) index. Callers must not
+    /// push/remove entries through it.
+    pub fn local_param_arrays_mut(&mut self) -> &mut Vec<LocalParamArray> {
+        &mut self.local_param_arrays
     }
 }
 

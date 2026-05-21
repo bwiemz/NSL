@@ -56,6 +56,30 @@ pub struct AssignWireArrayElement {
     pub src: crate::hir::signals::SignalRef,
 }
 
+/// Module-scope multi-dimensional const array per M57.1 wire-array mini §3.2 +
+/// §4 (Task W5).
+///
+/// Emits
+/// `localparam signed [width-1:0] {name} [0:dims[0]-1][0:dims[1]-1] = '{...values...};`
+/// at the module level (in the LocalParam preamble block). For `dims.len() == 2`
+/// the literal renders as `'{ '{row0}, '{row1}, ... }`; for `dims.len() == 1`
+/// as `'{ cell, cell, ... }`. Higher ranks are not yet supported by the v1
+/// emitter (panics).
+///
+/// Used to lower `W<i>` (`[k_dim, n_outputs]`) and `b<i>` (`[n_outputs]`)
+/// into Verilog arrays indexable by genvar inside the matmul ripple body.
+/// Values are baked at CLI time (Task W6) by the fixture loader.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalParamArray {
+    pub name: String,
+    pub dims: Vec<usize>,
+    pub width: usize,
+    /// Flat values in row-major order. For 2D arrays:
+    /// `values[r * dims[1] + c]` is the cell at `[r][c]`. For 1D, indexed
+    /// linearly. Length must equal `dims.iter().product()`.
+    pub values: Vec<i128>,
+}
+
 // --- Module-boundary nodes ---
 
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -34,6 +34,12 @@ impl VerilogEmitter {
         for lp in module.local_params() {
             out.push_str(&format!("    {}\n", emit_local_param(lp)));
         }
+        // M57.1 wire-array realization (Task W5): multi-dim const arrays
+        // (`W<i>`, `b<i>`) emitted in the same preamble. Rendered after the
+        // scalar LocalParams so existing snapshots are extensionally additive.
+        for lpa in module.local_param_arrays() {
+            out.push_str(&format!("    {}\n", emit_local_param_array(lpa)));
+        }
         out.push('\n');
 
         // Body — nodes in SSA order
