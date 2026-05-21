@@ -103,3 +103,59 @@ fn forward_inputs_b1_forward_variant_carries_x_w_norm() {
         _ => panic!("expected B1Forward"),
     }
 }
+
+// ===== Phase 2.6 T8 + T10 — generators + dispatch =====
+
+fn t_cfg(hd: i64) -> nsl_codegen::flash_attention::FlashAttentionConfig {
+    use nsl_codegen::flash_attention::{CshaExtras, FlashAttentionConfig, RopeStyle};
+    FlashAttentionConfig { block_q: 32, block_kv: 32, head_dim: hd, causal: false, paged: false,
+        rope_q: false, rope_style: RopeStyle::HalfSplit, gqa_group_size: 1, tree_mask: false,
+        gpu_sm: 80, segment_masked: false,
+        csha: Some(CshaExtras { level: 2, d_model: 128, ..Default::default() }) }
+}
+
+#[test]
+fn generate_forward_inputs_cpu_naive_shapes() {
+    use nsl_test::diagnostic_mode::{FSource, ForwardInputs, generate_forward_inputs};
+    match generate_forward_inputs(&t_cfg(32), FSource::CpuNaive) {
+        ForwardInputs::CpuNaive { q, k, v } => { assert_eq!(q.len(), 1*1*32*32); assert_eq!(k.len(), 1024); assert_eq!(v.len(), 1024); }
+        _ => panic!("variant"),
+    }
+}
+
+#[test]
+fn generate_forward_inputs_b1_shapes() {
+    use nsl_test::diagnostic_mode::{FSource, ForwardInputs, generate_forward_inputs};
+    match generate_forward_inputs(&t_cfg(32), FSource::B1Forward) {
+        ForwardInputs::B1Forward { x, wq, wk, wv, norm_weight } => {
+            assert_eq!(x.len(), 1*32*128); assert_eq!(wq.len(), 128*1*32);
+            assert_eq!(wk.len(), 4096); assert_eq!(wv.len(), 4096); assert_eq!(norm_weight.len(), 128);
+        }
+        _ => panic!("variant"),
+    }
+}
+
+#[test]
+fn generate_d_o_shape() {
+    use nsl_test::diagnostic_mode::generate_d_o;
+    assert_eq!(generate_d_o(&t_cfg(64)).len(), 1*1*32*64);
+}
+
+#[test]
+fn compute_forward_cpu_naive_dispatches() {
+    use nsl_test::diagnostic_mode::{FSource, ForwardInputs, compute_forward_for_test};
+    let inputs = ForwardInputs::CpuNaive {
+        q: vec![half::f16::from_f32(0.1); 1024], k: vec![half::f16::from_f32(0.2); 1024], v: vec![half::f16::from_f32(0.3); 1024],
+    };
+    let fwd = compute_forward_for_test(&inputs, &t_cfg(32), FSource::CpuNaive);
+    assert_eq!(fwd.q_saved.len(), 1024);
+    assert_eq!(fwd.q_saved[0], half::f16::from_f32(0.1));
+}
+
+#[test]
+#[should_panic(expected = "must match source")]
+fn compute_forward_variant_mismatch_panics() {
+    use nsl_test::diagnostic_mode::{FSource, ForwardInputs, compute_forward_for_test};
+    let inputs = ForwardInputs::CpuNaive { q: vec![half::f16::ZERO; 1024], k: vec![half::f16::ZERO; 1024], v: vec![half::f16::ZERO; 1024] };
+    let _ = compute_forward_for_test(&inputs, &t_cfg(32), FSource::B1Forward);
+}
