@@ -420,8 +420,8 @@ fn emit_proj_save(
     // inside the loops, which would redeclare them and trip ptxas's
     // duplicate-.reg rejection). For canonical 32x32x32 / 64x64x64 configs
     // both are exact and no guard is emitted.
-    let row_guarded = (row_count % 8) != 0;
-    let col_guarded = (hd % 32) != 0;
+    let row_guarded = !row_count.is_multiple_of(8);
+    let col_guarded = !hd.is_multiple_of(32);
     if row_guarded {
         ptx.push_str(&format!(
             "    .reg .pred %psv_{label}_rok;\n"
@@ -561,9 +561,9 @@ fn emit_proj_save(
                     "    add.u64 %psv_{label}_seq, %psv_{label}_seq, %q_start;  // R1: Q seq = q_start + r\n"
                 ));
             } else {
-                ptx.push_str(&format!(
+                ptx.push_str(
                     "    // R1: K/V seq = r (absolute K position, NOT q_start+r)\n"
-                ));
+                );
             }
             // hbm_elem = (((batch*heads + head)*seq + s)*hd + c)
             // hbm_byte = hbm_elem * 2  (f16)
