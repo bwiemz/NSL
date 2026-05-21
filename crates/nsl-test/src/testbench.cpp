@@ -101,14 +101,16 @@ int main(int argc, char** argv) {
         std::cout << std::dec << "\n";
     };
 
-    // Layer 1: 128 × i32 = 4096 bits = 128 uint32_t words
+    // Layer 1: 128 × i32 = 4096 bits = 128 uint32_t words.
+    // Note: tap_l1_bias_out / tap_l2_bias_out were removed by M57.1 §3.5
+    // bias-as-seed fold (wire-array mini §5) — bias is now folded into the
+    // MAC accumulator seed, so the post-MAC bias-add wire no longer exists
+    // in the generated DUT. matmul / relu / out taps remain.
     dump32("tap_l1_matmul_out", dut->tap_l1_matmul_out, 128);
-    dump32("tap_l1_bias_out",   dut->tap_l1_bias_out,   128);
     dump32("tap_l1_relu_out",   dut->tap_l1_relu_out,   128);
 
     // Layer 2: 10 × i64 = 640 bits = 20 uint32_t words
     dump32("tap_l2_matmul_out", dut->tap_l2_matmul_out, 20);
-    dump32("tap_l2_bias_out",   dut->tap_l2_bias_out,   20);
 
     // Final output: 10 × i64 = 640 bits = 20 uint32_t words
     dump32("out", dut->out, 20);

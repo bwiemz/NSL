@@ -20,6 +20,17 @@ impl KirToHirPass {
         kir: &KernelIR,
         module_name: &str,
     ) -> Result<HirModule, FpgaLoweringError> {
+        // M57.1 wire-array mini §6 (snapshot stability): WireId / RegisterId /
+        // GenvarId counters are process-global atomics. Without this reset, the
+        // `_gv<N>` numbering in HIR snapshots depends on test discovery order
+        // — running `full_v1_mlp_composition` alone produces different IDs
+        // than running it as part of the full suite. Resetting at the entry
+        // to `lower` makes per-module snapshots deterministic without coupling
+        // to test ordering.
+        crate::hir::ids::WireId::reset();
+        crate::hir::ids::RegisterId::reset();
+        crate::hir::ids::GenvarId::reset();
+
         let mut module = HirModule::new(module_name);
         module.test_taps = self.test_taps;
 
