@@ -22,9 +22,6 @@ use nsl_codegen::backend_verilog::yosys::YosysGate;
 /// Runs `yosys -p "read_verilog ...; synth -noabc -flatten; check"` with
 /// warnings-as-errors per spec §5.
 #[test]
-#[ignore = "M57.1 v1 closure prerequisite: AST->KIR dispatch, HIR port/wire generation, \
-            end-to-end CLI wiring (nsl fpga-compile), and Verilog synthesizability. \
-            See spec §1.5 deferred-roadmap / crates/nsl-test/tests/fpga_mlp_v1_synth.rs header."]
 fn fpga_mlp_v1_yosys_clean() {
     if !YosysGate::is_available() {
         eprintln!("SKIPPED: yosys not installed");
