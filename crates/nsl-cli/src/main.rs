@@ -2009,14 +2009,21 @@ fn derive_toml_path(fixture: &std::path::Path) -> Option<PathBuf> {
 }
 
 /// Walks the fixture's blocks and writes element values into the matching
-/// `W<i>_<k>_<o>` (weight) and `b<i>_<o>` (bias) LocalParams declared by the
-/// KIR→HIR pass (spec §3.4 + §3.5 naming convention).
+/// `W<i>` (weight) and `b<i>` (bias) `LocalParamArray`s declared by the
+/// KIR→HIR pass (spec §3.2 / Task W6).
 ///
-/// Weights are row-major `[K, N]` (K=input dim, N=output dim per the
-/// `model TinyMlp` recognizer's W<i> shape). Bias rank is 1.
+/// Pre-W5 (commit `94a05f8e`) the KIR→HIR pass emitted per-element scalar
+/// `LocalParam`s named `W<i>_<k>_<o>` and `b<i>_<o>`; W5 collapsed those into
+/// `LocalParamArray { name: "W<i>", dims: [k_dim, n_outputs], values: <flat> }`
+/// and `LocalParamArray { name: "b<i>", dims: [n_outputs], values: <flat> }`
+/// to feed the genvar-indexed ripple body (`SignalRef::IndexedLocalParam`).
+/// The bake helper now writes directly into `LocalParamArray.values`, which is
+/// row-major flat: for a 2-D W of shape `[K, N]`, `values[k * N + o]` is the
+/// `[k][o]` cell (matching the fixture's on-disk layout — see
+/// `nsl_test::fixture::FixtureBlock::shape_used`).
 ///
-/// Missing LocalParams are not silently tolerated: a mismatch between the
-/// fixture's declared block shape and the HIR's declared LocalParams indicates
+/// Missing `LocalParamArray`s are not silently tolerated: a mismatch between
+/// the fixture's declared block shape and the HIR's declared arrays indicates
 /// a divergence between the .nsl source (which the KIR→HIR pass walks) and the
 /// fixture file the CLI was pointed at. We surface this as an error string so
 /// the caller's `eprintln!("error: {e}")` reaches the user.
@@ -2026,28 +2033,8 @@ fn bake_fixture_into_localparams(
 ) -> Result<(), String> {
     use nsl_test::fixture::{BlockDtype, BlockKind};
 
-    // Build a name → index map up front so we can borrow LocalParam slots
-    // mutably one at a time inside the inner loop without fighting the borrow
-    // checker (HashMap<&str, &mut LocalParam> would require either unsafe or
-    // splitting borrows).
-    let name_to_idx: std::collections::HashMap<String, usize> = module
-        .local_params()
-        .iter()
-        .enumerate()
-        .map(|(i, lp)| (lp.name.clone(), i))
-        .collect();
-
-    let lookup = |elem_name: &str| -> Result<usize, String> {
-        name_to_idx.get(elem_name).copied().ok_or_else(|| {
-            format!(
-                "fixture references LocalParam `{elem_name}` not declared by the \
-                 KIR→HIR pass (source/.nsl and fixture/.bin out of sync — \
-                 regenerate the fixture or update the .nsl source)"
-            )
-        })
-    };
-
-    // Decode block values to a uniform i128 representation up front.
+    // Decode block values to a uniform i128 representation up front. (The
+    // `LocalParamArray.values` field is `Vec<i128>` so any v1 dtype fits.)
     let decode_values = |block: &nsl_test::fixture::FixtureBlock| -> Result<Vec<i128>, String> {
         Ok(match block.dtype {
             BlockDtype::I8 => block.as_i8().into_iter().map(|v| v as i128).collect(),
@@ -2060,6 +2047,27 @@ fn bake_fixture_into_localparams(
             BlockDtype::I32 => block.as_i32().into_iter().map(|v| v as i128).collect(),
             BlockDtype::I64 => block.as_i64().into_iter().map(|v| v as i128).collect(),
         })
+    };
+
+    // Helper: locate a `LocalParamArray` by name and return its index in
+    // `module.local_param_arrays_mut()`. Errors fail-loud with a structural
+    // message — the KIR→HIR pass either declared it (under exactly the
+    // `W<i>` / `b<i>` convention) or the .nsl source is structurally
+    // incompatible with this fixture.
+    let find_lpa_idx = |module: &nsl_codegen::hir::HirModule,
+                        name: &str|
+     -> Result<usize, String> {
+        module
+            .local_param_arrays()
+            .iter()
+            .position(|lpa| lpa.name == name)
+            .ok_or_else(|| {
+                format!(
+                    "fixture references LocalParamArray `{name}` not declared by the \
+                     KIR→HIR pass (source/.nsl and fixture/.bin out of sync — \
+                     regenerate the fixture or update the .nsl source)"
+                )
+            })
     };
 
     for block in &fixture.blocks {
@@ -2086,14 +2094,26 @@ fn bake_fixture_into_localparams(
                         k_dim * n_outputs
                     ));
                 }
-                // Row-major [K, N]: index = k * n_outputs + o
-                for k in 0..k_dim {
-                    for o in 0..n_outputs {
-                        let elem_name = format!("W{}_{}_{}", block.layer, k, o);
-                        let idx = lookup(&elem_name)?;
-                        module.local_params_mut()[idx].value = values[k * n_outputs + o];
+                let arr_name = format!("W{}", block.layer);
+                let idx = find_lpa_idx(module, &arr_name)?;
+                {
+                    // Shape-check against the HIR's declared dims. The
+                    // KIR→HIR pass derived these from the .nsl source's
+                    // `const W<i>: Tensor<[K, N], i8>` declaration; the
+                    // fixture must match exactly (row-major [K, N]).
+                    let lpa = &module.local_param_arrays()[idx];
+                    if lpa.dims != vec![k_dim, n_outputs] {
+                        return Err(format!(
+                            "LocalParamArray `{}` dims mismatch: HIR declares {:?} \
+                             but fixture provides [{}, {}]",
+                            arr_name, lpa.dims, k_dim, n_outputs
+                        ));
                     }
                 }
+                // Row-major [K, N]: index = k * n_outputs + o — same layout
+                // as `LocalParamArray.values` (`values[r * dims[1] + c]`
+                // per nodes.rs:77-79).
+                module.local_param_arrays_mut()[idx].values = values;
             }
             BlockKind::Bias => {
                 let used = block.shape_used();
@@ -2114,11 +2134,19 @@ fn bake_fixture_into_localparams(
                         n_outputs
                     ));
                 }
-                for (o, &v) in values.iter().enumerate() {
-                    let elem_name = format!("b{}_{}", block.layer, o);
-                    let idx = lookup(&elem_name)?;
-                    module.local_params_mut()[idx].value = v;
+                let arr_name = format!("b{}", block.layer);
+                let idx = find_lpa_idx(module, &arr_name)?;
+                {
+                    let lpa = &module.local_param_arrays()[idx];
+                    if lpa.dims != vec![n_outputs] {
+                        return Err(format!(
+                            "LocalParamArray `{}` dims mismatch: HIR declares {:?} \
+                             but fixture provides [{}]",
+                            arr_name, lpa.dims, n_outputs
+                        ));
+                    }
                 }
+                module.local_param_arrays_mut()[idx].values = values;
             }
         }
     }
