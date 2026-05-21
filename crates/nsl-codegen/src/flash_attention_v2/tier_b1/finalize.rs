@@ -107,6 +107,17 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig) {
         ptx.push_str("    setp.ne.u64 %psv_has_row_sum, %psv_row_sum_base, 0;\n");
     }
 
+    // Initialize the LSE null-guard predicate. %p_has_lse is DECLARED by the
+    // shared prelude (prelude.rs:200) but only SET by Tier A's finalize
+    // (phases/forward/finalize.rs:68). Tier B.1 has its own native finalize
+    // and never invokes Tier A's, so without this setp the predicate is left
+    // UNDEFINED -- on the GPU it reads false, gating off every LSE / row_max /
+    // row_sum store (all three buffers came back all-zero in T2.7). Mirror
+    // Tier A's guard so the LSE store fires whenever logsumexp_ptr is non-null.
+    ptx.push_str(
+        "    setp.ne.u64 %p_has_lse, %logsumexp_base, 0;  // B.1: set LSE null-guard (Tier A sets it; B.1 native finalize must too)\n",
+    );
+
     // Per-lane D-fragment row/col base. These are constant across all
     // tiles for a given lane, so compute once.
     ptx.push_str("    mov.u32 %fin_laneid, %tid.x;\n");
