@@ -6,6 +6,7 @@
 //! - `fpga_harness` — M57 Verilator external-process invocation
 //! - `stimuli` — M57 deterministic ChaCha20Rng-based test stimuli
 
+pub mod b1_adapter;
 pub mod cpu_naive_backward;
 pub mod cpu_naive_forward;
 pub mod diagnostic_mode;
