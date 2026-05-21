@@ -117,8 +117,18 @@ fn t_cfg(hd: i64) -> nsl_codegen::flash_attention::FlashAttentionConfig {
 #[test]
 fn generate_forward_inputs_cpu_naive_shapes() {
     use nsl_test::diagnostic_mode::{FSource, ForwardInputs, generate_forward_inputs};
-    match generate_forward_inputs(&t_cfg(32), FSource::CpuNaive) {
+    match generate_forward_inputs(&t_cfg(32), FSource::CpuNaive, 32) {
         ForwardInputs::CpuNaive { q, k, v } => { assert_eq!(q.len(), 1*1*32*32); assert_eq!(k.len(), 1024); assert_eq!(v.len(), 1024); }
+        _ => panic!("variant"),
+    }
+}
+
+#[test]
+fn generate_forward_inputs_cpu_naive_seq64_shapes() {
+    use nsl_test::diagnostic_mode::{FSource, ForwardInputs, generate_forward_inputs};
+    // Threaded seq lets the CpuNaive sweep run multi-q-tile (seq=64).
+    match generate_forward_inputs(&t_cfg(32), FSource::CpuNaive, 64) {
+        ForwardInputs::CpuNaive { q, k, v } => { assert_eq!(q.len(), 1*1*64*32); assert_eq!(k.len(), 2048); assert_eq!(v.len(), 2048); }
         _ => panic!("variant"),
     }
 }
@@ -126,7 +136,7 @@ fn generate_forward_inputs_cpu_naive_shapes() {
 #[test]
 fn generate_forward_inputs_b1_shapes() {
     use nsl_test::diagnostic_mode::{FSource, ForwardInputs, generate_forward_inputs};
-    match generate_forward_inputs(&t_cfg(32), FSource::B1Forward) {
+    match generate_forward_inputs(&t_cfg(32), FSource::B1Forward, 32) {
         ForwardInputs::B1Forward { x, wq, wk, wv, norm_weight } => {
             assert_eq!(x.len(), 1*32*128); assert_eq!(wq.len(), 128*1*32);
             assert_eq!(wk.len(), 4096); assert_eq!(wv.len(), 4096); assert_eq!(norm_weight.len(), 128);
@@ -138,7 +148,9 @@ fn generate_forward_inputs_b1_shapes() {
 #[test]
 fn generate_d_o_shape() {
     use nsl_test::diagnostic_mode::generate_d_o;
-    assert_eq!(generate_d_o(&t_cfg(64)).len(), 1*1*32*64);
+    assert_eq!(generate_d_o(&t_cfg(64), 32).len(), 1*1*32*64);
+    // seq is threaded: seq=128 produces a longer dO.
+    assert_eq!(generate_d_o(&t_cfg(64), 128).len(), 1*1*128*64);
 }
 
 #[test]
@@ -147,7 +159,7 @@ fn compute_forward_cpu_naive_dispatches() {
     let inputs = ForwardInputs::CpuNaive {
         q: vec![half::f16::from_f32(0.1); 1024], k: vec![half::f16::from_f32(0.2); 1024], v: vec![half::f16::from_f32(0.3); 1024],
     };
-    let fwd = compute_forward_for_test(&inputs, &t_cfg(32), FSource::CpuNaive);
+    let fwd = compute_forward_for_test(&inputs, &t_cfg(32), FSource::CpuNaive, 32);
     assert_eq!(fwd.q_saved.len(), 1024);
     assert_eq!(fwd.q_saved[0], half::f16::from_f32(0.1));
 }
@@ -157,5 +169,5 @@ fn compute_forward_cpu_naive_dispatches() {
 fn compute_forward_variant_mismatch_panics() {
     use nsl_test::diagnostic_mode::{FSource, ForwardInputs, compute_forward_for_test};
     let inputs = ForwardInputs::CpuNaive { q: vec![half::f16::ZERO; 1024], k: vec![half::f16::ZERO; 1024], v: vec![half::f16::ZERO; 1024] };
-    let _ = compute_forward_for_test(&inputs, &t_cfg(32), FSource::B1Forward);
+    let _ = compute_forward_for_test(&inputs, &t_cfg(32), FSource::B1Forward, 32);
 }

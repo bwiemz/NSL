@@ -76,11 +76,12 @@ pub fn compute_d_for_test(
 // ===== Phase 2.6 — FSource diagnostic surface + ForwardInputs carrier =====
 
 /// Test-default tensor dimensions for the forward-path generators + dispatch.
-/// Match the dQ-kernel test conventions (batch=1, heads=1, seq=32). `D` and
+/// Match the dQ-kernel test conventions (batch=1, heads=1). `seq` is threaded
+/// as an explicit parameter (CpuNaive uses 64/128 for multi-q-tile coverage;
+/// B1Forward is pinned to 32 by the single-block forward precondition). `D` and
 /// `d_model` come from the config (`head_dim` / `csha.d_model`).
 const TEST_DEFAULT_BATCH: usize = 1;
 const TEST_DEFAULT_HEADS: usize = 1;
-const TEST_DEFAULT_SEQ: usize = 32;
 
 /// Sources the forward outputs for a dQ-kernel parity test. Independent of DSource.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,12 +109,16 @@ pub enum ForwardInputs {
 /// dO backward input -- path-independent, row-major [B,H,S,D] f16.
 ///
 /// Deterministic (cosine-of-index) so parity tests are reproducible across
-/// the CpuNaive and B1Forward forward paths. `D = cfg.head_dim`.
-pub fn generate_d_o(cfg: &nsl_codegen::flash_attention::FlashAttentionConfig) -> Vec<half::f16> {
+/// the CpuNaive and B1Forward forward paths. `D = cfg.head_dim`; `seq` is
+/// passed explicitly so the CpuNaive sweep can use 64/128 while B1Forward uses 32.
+pub fn generate_d_o(
+    cfg: &nsl_codegen::flash_attention::FlashAttentionConfig,
+    seq: usize,
+) -> Vec<half::f16> {
     let (b, h, s, d) = (
         TEST_DEFAULT_BATCH,
         TEST_DEFAULT_HEADS,
-        TEST_DEFAULT_SEQ,
+        seq,
         cfg.head_dim as usize,
     );
     (0..b * h * s * d)
@@ -129,14 +134,18 @@ pub fn generate_d_o(cfg: &nsl_codegen::flash_attention::FlashAttentionConfig) ->
 ///   `x` is `[B,S,d_model]`, `wq/wk/wv` are `[d_model, H*D]`, `norm_weight`
 ///   is `[d_model]`. The launcher (`run_b1_forward_and_adapt`) performs
 ///   RMSNorm + narrow + chunkify before the GPU launch.
+///
+/// `seq` is passed explicitly: CpuNaive uses 64/128 for multi-q-tile coverage,
+/// B1Forward is pinned to 32 by the single-block forward precondition.
 pub fn generate_forward_inputs(
     cfg: &nsl_codegen::flash_attention::FlashAttentionConfig,
     source: FSource,
+    seq: usize,
 ) -> ForwardInputs {
     let (b, h, s, d) = (
         TEST_DEFAULT_BATCH,
         TEST_DEFAULT_HEADS,
-        TEST_DEFAULT_SEQ,
+        seq,
         cfg.head_dim as usize,
     );
     match source {
@@ -176,10 +185,14 @@ pub fn generate_forward_inputs(
 
 /// Source the forward outputs. CpuNaive -> cpu_naive_forward; B1Forward ->
 /// adapter (cuda). The `inputs` variant must match `source` or this panics.
+///
+/// `seq` must match the value passed to `generate_forward_inputs`. B1Forward is
+/// limited to seq <= the launcher's single-block max (32 for the closure gate).
 pub fn compute_forward_for_test(
     inputs: &ForwardInputs,
     cfg: &nsl_codegen::flash_attention::FlashAttentionConfig,
     source: FSource,
+    seq: usize,
 ) -> crate::cpu_naive_forward::ForwardOutputs {
     match (inputs, source) {
         (ForwardInputs::CpuNaive { .. }, FSource::CpuNaive) => {}
@@ -189,7 +202,7 @@ pub fn compute_forward_for_test(
     let (b, h, s, d) = (
         TEST_DEFAULT_BATCH,
         TEST_DEFAULT_HEADS,
-        TEST_DEFAULT_SEQ,
+        seq,
         cfg.head_dim as usize,
     );
     match (inputs, source) {
@@ -199,11 +212,11 @@ pub fn compute_forward_for_test(
         (ForwardInputs::B1Forward { x, wq, wk, wv, norm_weight }, FSource::B1Forward) => {
             #[cfg(feature = "cuda")]
             {
-                crate::b1_adapter::run_b1_forward_and_adapt(x, wq, wk, wv, norm_weight, cfg)
+                crate::b1_adapter::run_b1_forward_and_adapt(x, wq, wk, wv, norm_weight, cfg, seq)
             }
             #[cfg(not(feature = "cuda"))]
             {
-                let _ = (x, wq, wk, wv, norm_weight, cfg);
+                let _ = (x, wq, wk, wv, norm_weight, cfg, seq);
                 panic!("FSource::B1Forward requires feature='cuda'")
             }
         }

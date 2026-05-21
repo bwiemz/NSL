@@ -192,7 +192,11 @@ extern "C" {
 /// row-major f16; `norm_weight` is `[d_model]` f16. This fn RMSNorms x in f32,
 /// narrows + chunkifies (x to chunks-major, W to col-major-chunked), launches
 /// the kernel, then d2h's q_proj/k_proj/v_proj (f16), row_max/row_sum (f32),
-/// and O (f16). Test defaults: B=1, H=1, S=32.
+/// and O (f16). Test defaults: B=1, H=1.
+///
+/// `seq` is passed explicitly. B.1 forward is numerically complete only for a
+/// single kv_iter (block_kv >= seq), so the launcher sets block_q=block_kv=seq
+/// and asserts seq <= 32 (the SMEM-safe single-block max for this test config).
 #[cfg(feature = "cuda")]
 pub fn run_b1_forward_and_adapt(
     x: &[f16],
@@ -201,6 +205,7 @@ pub fn run_b1_forward_and_adapt(
     wv: &[f16],
     norm_weight: &[f16],
     cfg: &nsl_codegen::flash_attention::FlashAttentionConfig,
+    seq: usize,
 ) -> ForwardOutputs {
     use nsl_codegen::flash_attention::{CshaExtras, FlashAttentionConfig};
     use nsl_codegen::flash_attention_v2::{
@@ -215,7 +220,12 @@ pub fn run_b1_forward_and_adapt(
     // ---- 1. Dimensions (test defaults) ------------------------------------
     let batch = 1usize;
     let heads = 1usize;
-    let seq = 32usize;
+    // B.1 single-block precondition: block_kv must cover the whole sequence in
+    // one kv_iter. The closure gate runs at seq=32.
+    assert!(
+        seq <= 32,
+        "run_b1_forward_and_adapt: seq {seq} exceeds the single-block max (32)"
+    );
     let hd = cfg.head_dim as usize;
     let d_model = cfg.csha.as_ref().map(|c| c.d_model as usize).unwrap_or(128);
     let kv_dim = hd; // single-head projection: W is [d_model, hd]
@@ -232,9 +242,9 @@ pub fn run_b1_forward_and_adapt(
 
     // ---- 2. B.1-forward launch config (single-block: block_kv >= seq) -----
     // B.1 forward is numerically complete only when block_kv >= seq_len (single
-    // kv_iter). seq=32, so force block_q=block_kv=32. This is a DIFFERENT kernel
-    // launch from the dQ-kernel's cfg (which may carry bq=64) — clone cfg and
-    // override the tiling + save flags.
+    // kv_iter), so force block_q=block_kv=seq. This is a DIFFERENT kernel launch
+    // from the dQ-kernel's cfg (which may carry bq=64) — clone cfg and override
+    // the tiling + save flags.
     let mut b1_csha = cfg.csha.clone().unwrap_or_else(|| CshaExtras {
         level: 2,
         d_model: d_model as u32,
@@ -246,8 +256,8 @@ pub fn run_b1_forward_and_adapt(
         b1_csha.d_model = d_model as u32;
     }
     let b1_cfg = FlashAttentionConfig {
-        block_q: 32,
-        block_kv: 32,
+        block_q: seq as i64,
+        block_kv: seq as i64,
         head_dim: hd as i64,
         causal: cfg.causal,
         paged: false,
@@ -495,6 +505,7 @@ pub fn run_b1_forward_and_adapt(
     _wv: &[f16],
     _norm_weight: &[f16],
     _cfg: &nsl_codegen::flash_attention::FlashAttentionConfig,
+    _seq: usize,
 ) -> ForwardOutputs {
     panic!("run_b1_forward_and_adapt requires feature='cuda'")
 }
