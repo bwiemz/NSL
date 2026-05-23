@@ -718,6 +718,11 @@ enum Cli {
         /// Only valid with --target fpga.
         #[arg(long)]
         test_taps: bool,
+
+        /// M57.2: emit the clocked sequential FSM instead of the combinational netlist.
+        /// Prints `total_cycles=<N>` to stdout after writing the .v file.
+        #[arg(long)]
+        seq: bool,
     },
 }
 
@@ -1962,8 +1967,9 @@ fn main_inner() {
             run_tokenize(&dirs, &output, vocab_size, min_freq, &ext);
         }
 
-        Cli::FpgaCompile { file, output_dir, fixture, test_taps } => {
-            if let Err(e) = run_fpga_compile(&file, fixture.as_ref(), output_dir.as_ref(), test_taps)
+        Cli::FpgaCompile { file, output_dir, fixture, test_taps, seq } => {
+            if let Err(e) =
+                run_fpga_compile(&file, fixture.as_ref(), output_dir.as_ref(), test_taps, seq)
             {
                 eprintln!("error: {e}");
                 process::exit(1);
@@ -2161,6 +2167,7 @@ fn run_fpga_compile(
     fixture_arg: Option<&PathBuf>,
     output_dir_arg: Option<&PathBuf>,
     test_taps: bool,
+    seq: bool,
 ) -> Result<(), String> {
     // ── 1. Read NSL source ──────────────────────────────────────────────────
     let source_text = std::fs::read_to_string(source_path)
@@ -2211,9 +2218,17 @@ fn run_fpga_compile(
         .map_err(|e| format!("AST→KIR (FPGA target): {e}"))?;
 
     // ── 4. KIR → HIR ────────────────────────────────────────────────────────
-    let mut hir = nsl_codegen::hir::KirToHirPass::new(test_taps)
+    // M57.2: `seq` selects the sequential clocked FSM lowering; combinational
+    // is the default (`sequential: false`).  Use the struct literal directly so
+    // we don't need to touch `KirToHirPass::new`'s other callers.
+    let mut hir = nsl_codegen::hir::KirToHirPass { test_taps, sequential: seq }
         .lower(&kir, FPGA_V1_MODULE_NAME)
         .map_err(|e| format!("KIR→HIR: {e}"))?;
+
+    // Stash cycle_count before hir is borrowed by bake_fixture_into_localparams
+    // and emit_module (both take &/&mut HirModule); reading it here lets us print
+    // after emit without keeping an extra borrow alive.
+    let cycle_count = hir.cycle_count;
 
     // ── 5. Bake fixture into LocalParams ────────────────────────────────────
     let fixture_path: PathBuf = match fixture_arg {
@@ -2274,6 +2289,14 @@ fn run_fpga_compile(
     std::fs::write(&out_path, &verilog)
         .map_err(|e| format!("write `{}`: {e}", out_path.display()))?;
     println!("Wrote {}", out_path.display());
+
+    // M57.2: print the deterministic cycle count when --seq was requested.
+    if seq {
+        if let Some(cycles) = cycle_count {
+            println!("total_cycles={cycles}");
+        }
+    }
+
     Ok(())
 }
 
