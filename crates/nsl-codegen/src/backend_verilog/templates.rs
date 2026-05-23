@@ -186,6 +186,14 @@ pub fn emit_reg_decl(d: &RegDecl) -> String {
     format!("reg signed [{}:0] _r{};", d.width - 1, d.id.0)
 }
 
+/// M57.2: declaration-only combinational wire.
+/// Emits `wire signed [w-1:0] _w{id};` — no `assign`. The driving `assign`
+/// comes from the companion combinational node (Mul/Add/Max0/SignExtend/
+/// CmpEq/AddConst) pushed immediately after this declaration in the module body.
+pub fn emit_wire_decl(d: &WireDecl) -> String {
+    format!("wire signed [{}:0] _w{};", d.width - 1, d.id.0)
+}
+
 /// M57.2 (Task 6): module-scope clocked register array — sequential sibling
 /// of `WireArray`. Emits `reg signed [w-1:0] {name} [0:dims[0]-1]...;`.
 pub fn emit_reg_array(ra: &RegArray) -> String {
@@ -445,6 +453,8 @@ pub fn emit_node(
         // M57.2 (Task 9): clocked sequential process. emit_seq_process already
         // applies indent internally — do NOT wrap with {pad}{}.
         HirNode::SeqProcess(sp) => emit_seq_process(sp, indent, clock_domains, reset_signals),
+        // M57.2: declaration-only combinational wire — emitted as a plain wire decl.
+        HirNode::WireDecl(d) => format!("{pad}{}", emit_wire_decl(d)),
     }
 }
 
@@ -630,6 +640,15 @@ mod tests {
         use crate::hir::ids::{RegisterId, WireId};
         let a = AddConst { src: SignalRef::Register(RegisterId(4)), k: 1, out: WireId(12), width: 10 };
         assert_eq!(emit_add_const(&a), "assign _w12 = $signed(_r4) + 1;");
+    }
+
+    // --- M57.2: WireDecl declaration-only combinational wire ---
+
+    #[test]
+    fn wire_decl_emits_declaration_only() {
+        use crate::hir::ids::WireId;
+        let d = WireDecl { id: WireId(9), width: 64 };
+        assert_eq!(emit_wire_decl(&d), "wire signed [63:0] _w9;");
     }
 
     // --- M57.2 (Task 5): RegDecl declaration-only register ---

@@ -895,7 +895,7 @@ fn build_datapath(
     module: &mut HirModule,
 ) -> Result<(), FpgaLoweringError> {
     use crate::hir::module::HirNode;
-    use crate::hir::nodes::{Add, AddConst, CmpEq, IndexExpr, Max0, Mul, SignExtend};
+    use crate::hir::nodes::{Add, AddConst, CmpEq, IndexExpr, Max0, Mul, SignExtend, WireDecl};
     use crate::hir::signals::SignalRef;
 
     let acc_width_max = ctx.acc_width_max;
@@ -926,12 +926,16 @@ fn build_datapath(
         // prod = x_src[k] * W{i}[k][o]
         let prod = Mul::new(x_elem, w_elem, a_width, b_width, prod_width);
         let prod_id = prod.out;
+        // M57.2: declare before driving assign to avoid implicit 1-bit net.
+        module.add_node(HirNode::WireDecl(WireDecl { id: prod_id, width: prod.out_width }))?;
         module.add_node(HirNode::Mul(prod))?;
 
         // Optional SignExtend prod → acc_width_max (shared 64-bit acc).
         let prod_ext = if prod_width < acc_width_max {
             let se = SignExtend::new(SignalRef::wire(prod_id), prod_width, acc_width_max);
             let se_id = se.dst;
+            // M57.2: declare before driving assign.
+            module.add_node(HirNode::WireDecl(WireDecl { id: se_id, width: se.dst_width }))?;
             module.add_node(HirNode::SignExtend(se))?;
             SignalRef::wire(se_id)
         } else {
@@ -941,27 +945,39 @@ fn build_datapath(
         // acc_next = acc + prod_ext   (acc register read; §3.5).
         let acc_next = Add::new(SignalRef::register(acc_reg), prod_ext, acc_width_max);
         let acc_next_id = acc_next.out;
+        // M57.2: declare before driving assign.
+        module.add_node(HirNode::WireDecl(WireDecl { id: acc_next_id, width: acc_next.width }))?;
         module.add_node(HirNode::Add(acc_next))?;
 
         // relu = max0(acc_next)  (inline relu reads the combinational wire).
         let relu = Max0::new(SignalRef::wire(acc_next_id), acc_width_max);
         let relu_id = relu.out;
+        // M57.2: declare before driving assign.
+        module.add_node(HirNode::WireDecl(WireDecl { id: relu_id, width: relu.width }))?;
         module.add_node(HirNode::Max0(relu))?;
 
         // k_next = k + 1 ; o_next = o + 1.
         let k_next = AddConst::new(SignalRef::register(k_reg), 1, k_width);
         let k_next_id = k_next.out;
+        // M57.2: declare before driving assign.
+        module.add_node(HirNode::WireDecl(WireDecl { id: k_next_id, width: k_next.width }))?;
         module.add_node(HirNode::AddConst(k_next))?;
         let o_next = AddConst::new(SignalRef::register(o_reg), 1, o_width);
         let o_next_id = o_next.out;
+        // M57.2: declare before driving assign.
+        module.add_node(HirNode::WireDecl(WireDecl { id: o_next_id, width: o_next.width }))?;
         module.add_node(HirNode::AddConst(o_next))?;
 
         // k_is_last = (k == K_i-1) ; o_is_last = (o == N_i-1).
         let k_is_last = CmpEq::new(SignalRef::register(k_reg), (k_i - 1) as u64);
         let k_is_last_id = k_is_last.out;
+        // M57.2: CmpEq is 1-bit.
+        module.add_node(HirNode::WireDecl(WireDecl { id: k_is_last_id, width: 1 }))?;
         module.add_node(HirNode::CmpEq(k_is_last))?;
         let o_is_last = CmpEq::new(SignalRef::register(o_reg), (n_i - 1) as u64);
         let o_is_last_id = o_is_last.out;
+        // M57.2: CmpEq is 1-bit.
+        module.add_node(HirNode::WireDecl(WireDecl { id: o_is_last_id, width: 1 }))?;
         module.add_node(HirNode::CmpEq(o_is_last))?;
 
         // Record wire ids back into the LayerDims for build_fsm (Task 12).
@@ -1717,6 +1733,66 @@ mod tests {
             .lower(&kir, "tiny_mlp_seq").unwrap();
         assert!(seq.nodes().iter().any(|n| matches!(n, HirNode::SeqProcess(_))));
         assert!(seq.cycle_count.is_some());
+    }
+
+    /// M57.2: every `assign _wN =` in the sequential datapath must have a
+    /// matching `wire signed [...:0] _wN;` declaration (no implicit 1-bit nets).
+    #[test]
+    fn sequential_datapath_wires_are_all_declared() {
+        use crate::backend_verilog::lower::VerilogEmitter;
+        use std::collections::HashSet;
+
+        let kir = two_layer_mlp_kir();
+        let module = KirToHirPass { test_taps: false, sequential: true }
+            .lower(&kir, "tiny_mlp_seq")
+            .unwrap();
+        let v = VerilogEmitter::emit_module(&module);
+
+        // Collect declared wire ids from lines matching `wire signed [..:0] _wN;`
+        let mut declared: HashSet<u64> = HashSet::new();
+        for line in v.lines() {
+            let trimmed = line.trim();
+            // Match: "wire signed [<bits>:0] _w<N>;"
+            if let Some(rest) = trimmed.strip_prefix("wire signed [") {
+                if let Some(id_part) = rest.find("] _w").map(|pos| &rest[pos + 4..]) {
+                    if let Some(id_str) = id_part.strip_suffix(';') {
+                        if let Ok(id) = id_str.parse::<u64>() {
+                            declared.insert(id);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Collect assigned wire ids from lines matching `assign _wN = `
+        let mut assigned: HashSet<u64> = HashSet::new();
+        for line in v.lines() {
+            let trimmed = line.trim();
+            if let Some(rest) = trimmed.strip_prefix("assign _w") {
+                if let Some(eq_pos) = rest.find(" = ") {
+                    if let Ok(id) = rest[..eq_pos].parse::<u64>() {
+                        assigned.insert(id);
+                    }
+                }
+            }
+        }
+
+        // Every assigned wire must be declared.
+        let undeclared: Vec<u64> = assigned.difference(&declared).copied().collect();
+        assert!(
+            undeclared.is_empty(),
+            "sequential datapath has undeclared wires (implicit 1-bit nets): {:?}",
+            undeclared,
+        );
+
+        // Specifically assert the 64-bit acc_next wire is declared as [63:0].
+        assert!(
+            v.contains("wire signed [63:0]"),
+            "expected at least one 64-bit wire declaration (acc_next) in sequential Verilog",
+        );
+
+        // Sanity: there are assigned wires at all (guards against a vacuously-passing test).
+        assert!(!assigned.is_empty(), "no assigned wires found — datapath may be empty");
     }
 
     /// M57.1 wire-array mini §3.2 / Task W5: smallest single-layer case

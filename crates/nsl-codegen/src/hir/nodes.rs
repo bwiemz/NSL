@@ -262,6 +262,19 @@ impl SignExtend {
     }
 }
 
+// --- M57.2: declaration-only combinational wire ---
+
+/// M57.2: declaration-only combinational wire. Emits `wire signed [w-1:0] _w{id};`.
+/// Unlike `Wire` (whose `produces_wire` registers the id as a driver), `WireDecl`
+/// only declares — the driving `assign` comes from a separate combinational node
+/// (`Mul`/`Add`/`Max0`/`SignExtend`/`CmpEq`/`AddConst`) with the same id. Used by
+/// the sequential datapath so its wires are explicitly sized (no implicit 1-bit nets).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WireDecl {
+    pub id: crate::hir::ids::WireId,
+    pub width: usize,
+}
+
 // --- Sequential / clocked nodes ---
 
 /// M57.2: LValue for a `SeqStmt::RegAssign` — a scalar register or one element

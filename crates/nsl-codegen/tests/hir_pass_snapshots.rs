@@ -310,6 +310,13 @@ fn summarize_node(out: &mut String, node: &HirNode, idx: usize, depth: usize) {
                 sp.reset_arrays.len(), sp.body.len(),
             ));
         }
+        // M57.2: declaration-only combinational wire (no driver).
+        HirNode::WireDecl(d) => {
+            out.push_str(&format!(
+                "{indent}[{idx}] WireDecl width={}\n",
+                d.width,
+            ));
+        }
     }
 }
 

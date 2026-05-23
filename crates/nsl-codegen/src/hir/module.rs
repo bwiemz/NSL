@@ -48,6 +48,12 @@ pub enum HirNode {
     /// Does not produce a single WireId — the process drives registers
     /// declared by `RegDecl` and elements of arrays declared by `RegArray`.
     SeqProcess(crate::hir::nodes::SeqProcess),
+    /// M57.2: declaration-only combinational wire. Emits `wire signed [w-1:0] _w{id};`
+    /// with no `assign` — the driving assignment comes from a separate combinational
+    /// node (Mul/Add/Max0/SignExtend/CmpEq/AddConst) with the same WireId.
+    /// `produces_wire` returns `None` so the single-driver invariant in `add_node`
+    /// is not tripped by the companion combinational node.
+    WireDecl(crate::hir::nodes::WireDecl),
 }
 
 impl HirNode {
@@ -81,6 +87,11 @@ impl HirNode {
             HirNode::AssignWireArrayElement(_) => None,
             // M57.2 (Task 9): SeqProcess drives registers in-place — no WireId.
             HirNode::SeqProcess(_) => None,
+            // M57.2: WireDecl is declaration-only — no WireId driver registered.
+            // The companion combinational node (Mul/Add/etc.) with the same id
+            // registers its own driver; WireDecl must NOT also register to avoid
+            // tripping the single-driver invariant.
+            HirNode::WireDecl(_) => None,
         }
     }
 }
