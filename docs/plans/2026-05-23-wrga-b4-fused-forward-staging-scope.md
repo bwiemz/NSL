@@ -1,187 +1,154 @@
-# WRGA B.4 -- Fused-Forward Staging Parallelization (SCOPE)
+# WRGA B.4 -- Fused-Forward Staging (RESOLVED 2026-05-23: fused stays opt-in, unfused is the default everywhere, staging rewrite NOT pursued)
 
-**Status:** scoping document. Surfaced 2026-05-23 by the B.3.2 per-op breakdown
-(`crates/nsl-cli/tests/wrga_b32_per_op_breakdown.rs`). Not yet a plan -- this
-document frames the problem, options, and recommendation for review before any
-implementation work begins.
+**Status: RESOLVED 2026-05-23 by measurement. The fused GatedLoRA forward kernel
+loses to unfused cuBLAS at every measured m -- there is no regime where it wins,
+so there is no niche to optimize the staging for.** The scoping framing below
+(options A-D, "is the staging rewrite worth doing") is preserved for the record,
+but the answer is: the staging rewrite (option A) is NOT pursued, because even if
+it eliminated the lane-0 tax it would only *maybe* reach parity in a regime
+(small-m) that measurement shows fused does not actually win.
 
-**Supersedes the B.3.2 scheduling decision.** See
-`docs/plans/2026-04-18-wrga-b32-fused-backward-STUB.md` (resolved: B.3.2 deferred)
-and `project_wrga_b32_measurement.md` (⭐ BOTTOM LINE).
+This supersedes the initial scoping recommendation in this same document (which
+leaned "ship D + do A"). The measurement overturned the premise that motivated A.
 
 ---
 
-## 1. Problem
+## The measurement that resolved it
 
-The fused GatedLoRA **forward** kernel is the dominant GPU cost in a training step,
-by a wide margin. Per-op breakdown on current `main` (RTX 5070 Ti, CUDA 13.2,
-prescribed shape b=32 / seq=2048 / dim=4096 / r=16, `--source-ad --target cuda_sm80`,
-`NSL_WRGA_FUSED_CUDA=1`):
+`C:\tmp\wrga_msweep2.py` (forward-only fused crashes -- see segfault below -- so
+the fused forward kernel was timed via the working train-block path reading
+`adapter_fused`; cuBLAS x@W was timed via a no-adapter forward). RTX 5070 Ti,
+CUDA 13.2, dim=4096, rank=16:
 
-| category | ms/iter | % GPU | fwd/bwd |
+| m | fused fwd kernel | cuBLAS x@W | fused / cuBLAS |
 |---|---|---|---|
-| **adapter_fused** | **4,156** | **73.4%** | forward fused GatedLoRA kernel |
-| matmul | 852 | 15.1% | backward (cuBLAS) |
-| reduction | 460 | 8.1% | backward |
-| elementwise_arith | 154 | 2.7% | backward |
-| copy_layout | 53 | 0.9% | backward |
+| 1 | 1,285 us | 84 us | **15.2x slower** |
+| 16 | 3,554 us | 92 us | 38.6x slower |
+| 64 | 6,222 us | 97 us | 64.1x slower |
+| 256 | 17,828 us | 276 us | 64.5x slower |
+| 1024 | 66,586 us | 985 us | 67.6x slower |
 
-GPU is 86.3% of wall (5,662 / 6,558 ms). One fused-forward kernel launch takes
-~4.2 s. For comparison, the entire backward (matmul+reduction+elementwise+copy) is
-~1.5 s. **The forward kernel costs ~2.7x the whole backward.**
+The comparison is **unfair in fused's favor**: it pits the fused *full* GatedLoRA
+forward (x@W + adapter + gate) against cuBLAS doing **x@W alone**. Even doing less
+work, cuBLAS wins 15x at m=1. Against the *full* unfused forward (x@W + two tiny
+adapter GEMVs + sigmoid + gate ~= ~300 us at m=1), fused (1,285 us) still loses
+~4x. **There is no crossover at any measured m.**
 
-This is the known single-threaded-staging pathology, previously filed as B.4 /
-follow-up #7 in `project_wrga_b32_measurement.md` and measured there as the fused
-forward being ~9-10x slower than the unfused cuBLAS path (3.6 s vs 0.4 s).
+## The overturned premise (why this matters for the record)
 
-## 2. Root cause (confirmed against current code)
+The B.3.2 resolution scheduled a hypothetical small-m niche for the fused kernel,
+reasoned structurally: "at small-m, fusion's savings (per-matmul cuBLAS launch
+overhead + 3-matmul HBM round-trip elimination) dominate, so fusion wins." That
+argument was **structurally coherent but rested on an unmeasured quantity: the
+fused kernel's own cost.**
 
-The fused adapter kernel is **single-warp-per-tile** (module header,
-`crates/nsl-codegen/src/wrga_kernel_helpers.rs:5`: "single-warp-per-tile,
-m16n8k16 fixed, fp32 output"). All four tile-staging helpers gate their entire
-global->SMEM load sequence on lane 0:
+The measurement shows the fused kernel costs 1,285 us at m=1 -- an order of
+magnitude more than the ~200 us of launch/round-trip savings fusion offers there.
+The specific error: the lane-0 staging tax scales with the number of blocks, which
+is `m_tiles x n_tiles`. At small-m the *m-tile* count drops, but the *n-tile*
+count stays large (n=4096 -> 512 n-blocks even at m=1). So the staging tax does
+**not** scale down with m the way "small-m -> few blocks -> cheap" assumed; it
+scales with n, which stays large. The fused kernel's own overhead dwarfs the
+fusion savings at every m.
 
-- `emit_lora_stage_x_tile` -- `wrga_kernel_helpers.rs:202`
-- `emit_lora_stage_w_tile` -- `wrga_kernel_helpers.rs:284`
-- `emit_lora_stage_a_tile` -- ~`wrga_kernel_helpers.rs:360`
-- `emit_lora_stage_b_tile` -- ~`wrga_kernel_helpers.rs:420`
+This is the same failure mode as the 106x B.3.2 trigger (a confident claim resting
+on an unmeasured/broken substrate, overturned by measurement) -- applied one level
+up, to the structural argument for the small-m niche itself. Recorded as a
+re-proposal gate below.
 
-Each begins:
+## Resolution (the decision)
 
-```ptx
-setp.eq.u32 %p0, %tid_x, 0;
-@!%p0 bra lora_<tile>_stage_done;
-... 16 rows x 8 col_pairs of ld.global.f32 + cvt.rn.f16 + st.shared.b32 ...
-lora_<tile>_stage_done:
-```
+1. **Fused stays opt-in (`NSL_WRGA_FUSED_CUDA=1`); unfused cuBLAS is the default
+   everywhere.** There is no crossover, so there is no m-threshold to set -- the
+   "D" dispatch stopgap collapses to "always unfused." Just don't put the fused
+   path on any default code path.
+2. **The staging rewrite (option A) is NOT pursued.** It is a speculative bet: it
+   *might* bring m=1 fused from 1,285 us toward ~40 us and finally beat unfused at
+   small-m, but that is unproven, requires the full staging rewrite, and the win
+   would be marginal against an unfused path that already works at all m. Do not
+   invest in it on the strength of a structural argument.
+3. **B.3.2 (fused backward) stays deferred** -- and now the fused *forward* does
+   not justify itself either, so the entire fused-adapter-kernel approach is
+   questionable without a much deeper rewrite (multi-warp + tensor cores), which
+   is a different, larger project not justified by any measured need.
+4. **Forward-only @adapter segfault is fixed separately** (robustness, stands
+   alone -- see below).
 
-So 31 of 32 warp lanes idle during staging. Each tile is 16 rows x 8 col_pairs =
-128 `st.shared.b32` (≈256 `ld.global.f32`), all serialized on lane 0. At k=4096
-the runtime K-loop runs `k_iters = k/16 = 256` times, staging 4 tiles per iter:
+## A-gate (the only condition under which the staging rewrite is revisited)
 
-```
-256 K-iters x 4 tiles x ~256 f32 loads ≈ 131,000 serialized global loads on lane 0
-```
+Option A is revisited ONLY if BOTH hold:
+- a concrete deployment need for small-m adapter inference emerges with a perf bar
+  the unfused cuBLAS path cannot meet, AND
+- a prototype of A is built and **re-measured** to actually beat unfused at the
+  target m before any further investment.
 
-That is the ~4.2 s. The MMA itself (`matmul_mma` m16n8k16, invariants #1-#12) is
-correct and fast; only the staging is the bottleneck.
+Never pursue A on a structural argument alone. The structural argument for the
+small-m niche has already been measured and falsified once.
 
-## 3. The real question B.4 answers
+## Re-proposal gate (institutional -- read before re-proposing the fused niche)
 
-The fused-forward kernel exists to beat the unfused path (x@W cuBLAS + adapter
-triple) by eliminating HBM round-trips. It currently **loses by ~10x** because of
-single-threaded staging. So B.4's goal is sharper than "make it faster":
+A future "let's pursue the fused small-m niche / it obviously wins at small-m"
+proposal MUST engage the measurement above, not re-derive the structural premise.
+The premise ("fusion wins at small-m because launch/round-trip savings dominate")
+is **measured false**: the fused kernel's own cost (lane-0 staging x n-block count,
+which scales with n not m, so stays large at small-m) dwarfs the savings by ~10x
+at m=1. To reopen this, overturn the measurement (e.g., with a different kernel
+design -- multi-warp + tensor cores -- prototyped and re-measured), do not
+re-derive the Option-1 argument.
 
-> **Can the fused-forward kernel be made faster than the unfused cuBLAS path on the
-> training-scale regime? If yes, it justifies its existence. If no even after
-> parallel staging, the fused-forward kernel is the wrong tool for this regime and
-> the dispatch should always pick unfused at scale.**
+---
 
-## 4. Options
+## The forward-only @adapter segfault (separate robustness bug)
 
-### Option A -- Lane-distributed staging (within the existing single warp) [RECOMMENDED first real fix]
+**Symptom:** a forward-only program using `@adapter(...)` on a CUDA target
+(`--target cuda_sm80`) segfaults at runtime (Windows access violation
+0xC0000005 / exit 139). Reproduced at all m, with and without
+`NSL_WRGA_FUSED_CUDA=1`.
 
-Remove the `tid_x == 0` guard. Distribute each tile's 128 b32 elements across the
-32 warp lanes: lane `L` stages elements `L, L+32, L+64, L+96` (4 per lane instead
-of lane 0 doing all 128). ~32x fewer serialized ops per tile.
+**Root cause:** the adapter side-table is materialized by
+`emit_adapter_init_sidetable`, which is called **only inside train-block
+compilation** (`crates/nsl-codegen/src/stmt.rs:4417`). A forward-only program has
+no train block, so the side-table base pointer stays null (constructor zero-init,
+`wrga_adapter_init.rs:16`). The adapter rewrite (fired on sm>=80,
+`wrga_adapter_rewrite.rs`) then emits field accesses to `self.lora_A_<site>` etc.,
+which dereference the null side-table base **before** reaching the fused FFI's
+null-guard (`fused_adapter.rs:744`). So the existing null-guard never sees these
+pointers; the crash is upstream in the field-access read of a null side-table.
 
-- **Scope:** index-math change inside the 4 stagers + their register pool. No change
-  to the MMA, the K-loop structure (invariant #19), the output store, or the
-  single-warp assumption. The m-tail (`%m_param`) and k-tail predicates carry over
-  per-lane.
-- **Risk:** low-moderate. Preserves invariants #1-#20. Must keep the `bar.sync 0`
-  discipline (#3): one barrier after staging completes (now across all lanes) before
-  fragment loads.
-- **Expected win:** large -- moves the 4.2 s staging toward memory-bandwidth-bound
-  rather than single-lane-bound.
+**Note:** this is broader than the fused path -- it is any forward-only @adapter
+on sm>=80, because the rewrite fires on the target SM regardless of the fused env
+var. It also confirms there is **no inference-only adapter materialization path**
+today: adapters only materialize inside a train block (B.2.1 side-table). Building
+one is explicitly out of scope under this resolution (we are not investing in the
+small-m inference niche).
 
-### Option B -- cp.async double-buffering [follow-on, only if A leaves staging dominant]
+**Fix (robustness, minimal):** guard the side-table-base read so an unmaterialized
+(null-base) adapter field load yields a null tensor (0) instead of dereferencing
+the null base, and make the adapter FFI return the base `x @ W` forward (with a
+one-time stderr warning) when adapter pointers are null -- "fall back to base
+forward, warn, don't crash." This converts a hard crash into a correct-base-forward
++ diagnostic, independent of the optimization decision.
 
-`cp.async.ca.shared.global` to overlap iter N+1 staging with iter N MMA.
+---
 
-- **Scope:** requires A first (cp.async is still per-lane). Adds a double-buffered
-  SMEM allocation (2x tile SMEM), changes barrier discipline, sm_80+ only (already
-  targeted).
-- **Risk:** higher -- touches SMEM budget and barrier correctness (#3).
-- **Expected win:** hides remaining HBM latency. Pursue only if a post-A
-  re-measurement shows staging still dominates.
+## Considered options (preserved for the record -- A/B/C not pursued; D collapsed)
 
-### Option C -- Multi-warp-per-tile + larger tiles [v2/v3, largest restructure]
+The fused kernel is **single-warp-per-tile** (`wrga_kernel_helpers.rs:5`); all four
+tile-staging helpers gate global->SMEM loads on lane 0 (`%tid_x == 0` at
+`wrga_kernel_helpers.rs:211/299/366/427`), leaving 31/32 lanes idle -- ~131k
+serialized lane-0 loads at k=4096. The options considered:
 
-Multiple warps per output tile: more lanes stage in parallel AND multiple MMAs run
-concurrently.
+- **A -- lane-distributed staging** (distribute each tile's 128 b32 elements across
+  the 32 lanes). NOT pursued: even if it removed the lane-0 tax, measurement shows
+  fused has no winning regime to optimize for.
+- **B -- cp.async double-buffering.** NOT pursued (follow-on to A, which is not
+  pursued).
+- **C -- multi-warp-per-tile + tensor cores.** This is the only design that could
+  plausibly beat cuBLAS, but it is a near-rewrite and a different project, not
+  justified by any measured need.
+- **D -- m-aware dispatch stopgap.** Collapsed to "always unfused" (no crossover).
 
-- **Scope:** breaks the single-warp assumption baked throughout the module --
-  register pool, output-tile coords, MMA lane init (#5, #10), kernel launch geometry.
-- **Risk:** highest. A near-rewrite.
-- **Verdict:** out of scope for B.4; revisit only if A+B prove insufficient.
-
-### Option D -- m-aware dispatch stopgap [SHIP IMMEDIATELY, parallel track]
-
-The fused forward is opt-in (`NSL_WRGA_FUSED_CUDA=1` + `--target cuda_sm80`). Make the
-fused-dispatch gate **m-aware**: when runtime `m` (tokens) exceeds a threshold (e.g.
-m > 256), dispatch the unfused cuBLAS path even when fused is requested -- because at
-large m the fused kernel is a ~10x pessimization.
-
-- **Scope:** a threshold check in the fused-dispatch decision
-  (`try_cuda_launch_fused_gatedlora` in `crates/nsl-runtime/src/fused_adapter.rs`,
-  and/or the AST-rewrite gate in `wrga_adapter_rewrite.rs`). Roughly one decision +
-  one constant.
-- **Risk:** near-zero. Falls back to the already-correct, already-faster unfused path.
-- **Verdict:** ship first. Removes the footgun for anyone who opts into fused at
-  training scale, independent of whether A ever lands. Lower urgency than if fused
-  were default-on, but cheap insurance.
-
-## 5. Recommendation
-
-1. **D (stopgap) now** -- m-aware dispatch so opting into fused doesn't pessimize at
-   scale.
-2. **A (real fix)** -- lane-distributed staging. Then **re-measure** with the per-op
-   breakdown bench (B.6 discipline: re-validate on the post-fix substrate).
-3. Decide from the re-measurement:
-   - fused-with-A < unfused -> the kernel justifies itself; keep it, relax D's
-     threshold or remove D.
-   - fused-with-A still >= unfused -> pursue **B** (cp.async) once, re-measure again.
-   - fused-with-A+B still loses -> the fused-forward approach is wrong for this
-     regime; make D permanent and close the fused-forward kernel as a dead end for
-     large-m. (It may still win for small-m inference, where staging serialization is
-     cheap -- preserve it there.)
-
-## 6. Test discipline inheritance (mandatory at milestone close)
-
-Per the WRGA paper Appendix B rules, B.4 inherits:
-
-- **B.2 (numerical):** any change to staging must keep the existing integration
-  fixtures green at 1e-4 (LoRA/IA3) / 1e-3 (GatedLoRA). Lane-distributed staging must
-  produce bit-equivalent SMEM contents to the lane-0 version.
-- **B.3 (scale-regime ptxas):** the `wrga_fused_ptx_ptxas.rs::scale__*` gates at
-  n in {1024, 2048, 4096} must stay green. Add SASS no-spill checks if the per-lane
-  register pressure changes.
-- **B.5 (code-path verification):** verify the parallel-staging path actually fires
-  at the prescribed shape (not a small-m proxy) via the launch-counter +
-  `4/4 trainable params connected` probe.
-- **B.6 (re-measure on clean substrate):** the post-A re-measurement IS the
-  acceptance signal. Do not declare B.4 a win on PTX structure alone -- run the
-  per-op breakdown bench and compare adapter_fused ms/iter before/after.
-- **ptxas-in-first-commit:** the commit that changes a stager emits its ptxas sweep
-  in the same commit (the non-negotiable WRGA retrospective rule).
-
-## 7. Scope boundary
-
-B.4 covers staging parallelization for the **GatedLoRA** fused forward (the measured
-hot path). LoRA and IA3 share the same stagers (`emit_lora_stage_*` are
-adapter-agnostic), so they benefit automatically -- but their numerical fixtures must
-be re-confirmed, not assumed. Backward is explicitly out of scope (B.3.2 deferred).
-
-## 8. Open questions for review
-
-1. **Threshold for D:** m > 256? m > 512? Pick from a small m-sweep micro-bench, or
-   start conservative (m > 64) and tune.
-2. **Is fused-forward ever default-on planned?** If yes, D's urgency rises from
-   "footgun guard" to "correctness-of-default." Confirm the intended dispatch policy.
-3. **Per-lane register budget:** does distributing staging across lanes change the
-   `.reg` pressure enough to risk SASS spills at n=4096? Verify with the existing
-   no-spill SASS check pattern.
-4. **Small-m inference regime:** confirm the lane-0 staging is actually fine (or even
-   preferable) at m=1 inference before making D unconditional at large m -- the fused
-   kernel may still be the right call for the decode path.
+The institutional principle still holds: scope a mechanism to where it has a
+structural advantage and concede where it can't compete. The measurement moved the
+boundary to "fused wins nowhere," so the principle yields: keep it opt-in, default
+unfused everywhere, do not invest in making it competitive.
