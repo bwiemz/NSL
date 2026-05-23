@@ -629,9 +629,6 @@ fn bits_to_hold(v: usize) -> usize {
 /// from the layer's dtypes (mirroring `lower_v1_mlp_single_layer`). The
 /// `*_id` fields are populated by `build_datapath` (Task 11) and read by
 /// `build_fsm` (Task 12).
-// Skeleton (Task 10) populates geometry; datapath wire ids + several sizing
-// fields are consumed by Tasks 11/12 — allow until then.
-#[allow(dead_code)]
 struct LayerDims {
     k: usize,
     n: usize,
@@ -660,8 +657,6 @@ struct LayerDims {
 
 /// M57.2: shared lowering context threaded through `build_datapath` (Task 11)
 /// and `build_fsm` (Task 12). Built by `lower_v1_mlp_sequential` (Task 10).
-// Several fields are consumed only by Tasks 11/12 — allow until then.
-#[allow(dead_code)]
 struct SeqLoweringCtx {
     // ── FSM scalar registers ────────────────────────────────────────────
     state_reg: RegisterId,
@@ -689,7 +684,6 @@ impl SeqLoweringCtx {
     /// Look up a state code by name (panics if absent — names are
     /// constructed and consumed within this module). Consumed by `build_fsm`
     /// (Task 12).
-    #[allow(dead_code)]
     fn state_code(&self, name: &str) -> u64 {
         self.state_codes
             .iter()
@@ -983,12 +977,240 @@ fn build_datapath(
     Ok(())
 }
 
-/// M57.2 (Task 12): the FSM `SeqProcess` (state Case, bias-as-seed, inline
-/// relu, handshake). Populated in Sub-task 12.
-fn build_fsm(
-    _ctx: &SeqLoweringCtx,
-    _module: &mut HirModule,
-) -> Result<(), FpgaLoweringError> {
+/// M57.2 (Task 12): the FSM `SeqProcess` — one `always_ff` whose `body` is a
+/// state `Case` (IDLE → {L{i}_MAC} → DONE) with bias-as-seed accumulation
+/// (SQ-5, three cases) and inline relu (SQ-6/8). Reads the datapath wire ids
+/// recorded by `build_datapath` (Task 11).
+///
+/// Bias-seed (SQ-5) three cases:
+///   1. Phase-entry seed `b{i}[0]` — set on the transition INTO the phase:
+///      layer 1 on `start` in IDLE; layer i>1 at the prev layer's o-boundary
+///      (so S_L{i}_MAC's non-final o_is_last arm seeds `b{i+1}[0]`).
+///   2. Intra-layer advance `acc <= b{i}[(o+1)]` via RegPlus — **reads old o**,
+///      concurrent with `o <= o_next`.
+///   3. Final layer's o-boundary → S_DONE with **no seed**.
+///
+/// Inline relu (SQ-6/8): on the `k_is_last` arm, `h_buf[o] <= relu` reads the
+/// combinational `relu` wire (from acc_next); `acc <=` takes the bias-seed,
+/// NOT acc_next. On the else (k<K-1) arm: `acc <= acc_next; k <= k_next`.
+///
+/// The FSM does NOT write `out` — the `out` port is driven combinationally by
+/// `RegArrayConcat("h_buf", N_last)`. v2 sequential output is just the `out`
+/// port (per-layer test_taps are dropped: the shared h_buf aliases them).
+fn build_fsm(ctx: &SeqLoweringCtx, module: &mut HirModule) -> Result<(), FpgaLoweringError> {
+    use crate::hir::clock_reset::{ClkRef, ResetPolarity, ResetRef, ResetSync};
+    use crate::hir::ids::{ClockDomainId, ResetSignalId};
+    use crate::hir::module::HirNode;
+    use crate::hir::nodes::{IndexExpr, SeqLValue, SeqProcess, SeqStmt};
+    use crate::hir::signals::SignalRef;
+
+    let state_reg = ctx.state_reg;
+    let o_reg = ctx.o_reg;
+    let k_reg = ctx.k_reg;
+    let acc_reg = ctx.acc_reg;
+    let done_reg = ctx.done_reg;
+    let valid_reg = ctx.valid_reg;
+    let n_layers = ctx.layers.len();
+
+    // Constant-source SignalRefs (RegAssign.value is a SignalRef — no integer
+    // literal variant). ZERO covers all `<= '0`; ONE covers `done/valid <= 1`.
+    let zero = || SignalRef::local_param("ZERO");
+    let one = || SignalRef::local_param("ONE");
+    let reg = |r| SignalRef::register(r);
+
+    // ── S_IDLE arm ──────────────────────────────────────────────────────
+    // done/valid cleared every cycle in IDLE; on `start`, latch x → x_buf,
+    // seed acc with b1[0], zero o/k, advance to S_L1_MAC.
+    let k1 = ctx.layers[0].k;
+    let a_width_1 = ctx.layers[0].a_width;
+    let b1_name = ctx.layers[0].b_name.clone();
+    let mut start_body: Vec<SeqStmt> = Vec::with_capacity(k1 + 4);
+    for k in 0..k1 {
+        // x_buf[k] <= x[k*a_width +: a_width]
+        start_body.push(SeqStmt::RegAssign {
+            target: SeqLValue::RegArrayElement {
+                array_name: "x_buf".into(),
+                indices: vec![IndexExpr::Literal(k)],
+            },
+            value: SignalRef::port_bit_slice("x", k * a_width_1, a_width_1),
+        });
+    }
+    // acc <= b1[0]; o <= '0; k <= '0; state <= S_L1_MAC.
+    start_body.push(SeqStmt::RegAssign {
+        target: SeqLValue::Register(acc_reg),
+        value: SignalRef::indexed_local_param(b1_name, vec![IndexExpr::Literal(0)]),
+    });
+    start_body.push(SeqStmt::RegAssign { target: SeqLValue::Register(o_reg), value: zero() });
+    start_body.push(SeqStmt::RegAssign { target: SeqLValue::Register(k_reg), value: zero() });
+    start_body.push(SeqStmt::RegAssign {
+        target: SeqLValue::Register(state_reg),
+        value: SignalRef::local_param("S_L1_MAC"),
+    });
+    let idle_arm = vec![
+        SeqStmt::RegAssign { target: SeqLValue::Register(done_reg), value: zero() },
+        SeqStmt::RegAssign { target: SeqLValue::Register(valid_reg), value: zero() },
+        SeqStmt::If {
+            cond: SignalRef::port("start"),
+            then_body: start_body,
+            else_body: vec![],
+        },
+    ];
+
+    // ── Case arms: IDLE + per-layer MAC + DONE ──────────────────────────
+    let mut arms: Vec<(u64, Vec<SeqStmt>)> = Vec::with_capacity(n_layers + 2);
+    arms.push((ctx.state_code("S_IDLE"), idle_arm));
+
+    for layer_idx in 1..=n_layers {
+        let layer = &ctx.layers[layer_idx - 1];
+        let is_final = layer_idx == n_layers;
+        let relu_id = layer.relu_id.expect("build_datapath must run before build_fsm");
+        let acc_next_id = layer.acc_next_id.unwrap();
+        let k_next_id = layer.k_next_id.unwrap();
+        let o_next_id = layer.o_next_id.unwrap();
+        let k_is_last_id = layer.k_is_last_id.unwrap();
+        let o_is_last_id = layer.o_is_last_id.unwrap();
+        let b_name = layer.b_name.clone();
+
+        // o_is_last arm (last k of last o of this layer): advance the phase.
+        let o_is_last_then: Vec<SeqStmt> = if is_final {
+            // Final layer → S_DONE, NO seed (case 3).
+            vec![SeqStmt::RegAssign {
+                target: SeqLValue::Register(state_reg),
+                value: SignalRef::local_param("S_DONE"),
+            }]
+        } else {
+            // Intermediate layer → seed NEXT layer's b{i+1}[0] (case 1),
+            // zero o, advance to S_L{i+1}_MAC.
+            let next_b_name = ctx.layers[layer_idx].b_name.clone();
+            let next_state = format!("S_L{}_MAC", layer_idx + 1);
+            vec![
+                SeqStmt::RegAssign {
+                    target: SeqLValue::Register(acc_reg),
+                    value: SignalRef::indexed_local_param(
+                        next_b_name,
+                        vec![IndexExpr::Literal(0)],
+                    ),
+                },
+                SeqStmt::RegAssign { target: SeqLValue::Register(o_reg), value: zero() },
+                SeqStmt::RegAssign {
+                    target: SeqLValue::Register(state_reg),
+                    value: SignalRef::local_param(next_state),
+                },
+            ]
+        };
+        // intra-layer o-advance (k_is_last but not o_is_last): seed b{i}[o+1]
+        // (case 2 — RegPlus reads OLD o, concurrent with o <= o_next).
+        let o_advance: Vec<SeqStmt> = vec![
+            SeqStmt::RegAssign {
+                target: SeqLValue::Register(acc_reg),
+                value: SignalRef::indexed_local_param(
+                    b_name,
+                    vec![IndexExpr::RegPlus(o_reg, 1)],
+                ),
+            },
+            SeqStmt::RegAssign {
+                target: SeqLValue::Register(o_reg),
+                value: SignalRef::wire(o_next_id),
+            },
+        ];
+
+        // k_is_last arm: write inline-relu result to h_buf[o], reset k, then
+        // branch on o_is_last (phase advance vs intra-layer o-advance).
+        let mut k_is_last_then: Vec<SeqStmt> = vec![
+            SeqStmt::RegAssign {
+                target: SeqLValue::RegArrayElement {
+                    array_name: "h_buf".into(),
+                    indices: vec![IndexExpr::Reg(o_reg)],
+                },
+                value: SignalRef::wire(relu_id),
+            },
+            SeqStmt::RegAssign { target: SeqLValue::Register(k_reg), value: zero() },
+        ];
+        k_is_last_then.push(SeqStmt::If {
+            cond: SignalRef::wire(o_is_last_id),
+            then_body: o_is_last_then,
+            else_body: o_advance,
+        });
+
+        // else (k < K-1): ordinary accumulate — acc <= acc_next; k <= k_next.
+        let k_advance: Vec<SeqStmt> = vec![
+            SeqStmt::RegAssign {
+                target: SeqLValue::Register(acc_reg),
+                value: SignalRef::wire(acc_next_id),
+            },
+            SeqStmt::RegAssign {
+                target: SeqLValue::Register(k_reg),
+                value: SignalRef::wire(k_next_id),
+            },
+        ];
+
+        let mac_arm = vec![SeqStmt::If {
+            cond: SignalRef::wire(k_is_last_id),
+            then_body: k_is_last_then,
+            else_body: k_advance,
+        }];
+        arms.push((ctx.state_code(&format!("S_L{}_MAC", layer_idx)), mac_arm));
+    }
+
+    // ── S_DONE arm ──────────────────────────────────────────────────────
+    let done_arm = vec![
+        SeqStmt::RegAssign { target: SeqLValue::Register(done_reg), value: one() },
+        SeqStmt::RegAssign { target: SeqLValue::Register(valid_reg), value: one() },
+        SeqStmt::If {
+            cond: SignalRef::port("start"),
+            then_body: vec![],
+            // !start handled by the else: return to IDLE. We model `if (!start)`
+            // by swapping then/else — there is no NotPort SignalRef, and the
+            // emitter renders `if (start) begin end else begin <return> end`,
+            // which is logically `if (!start)`.
+            else_body: vec![SeqStmt::RegAssign {
+                target: SeqLValue::Register(state_reg),
+                value: SignalRef::local_param("S_IDLE"),
+            }],
+        },
+    ];
+    arms.push((ctx.state_code("S_DONE"), done_arm));
+
+    // ── default arm: return to IDLE ─────────────────────────────────────
+    let default_arm = vec![SeqStmt::RegAssign {
+        target: SeqLValue::Register(state_reg),
+        value: SignalRef::local_param("S_IDLE"),
+    }];
+
+    // ── reset_body: scalar resets (state <= S_IDLE; o/k/acc/done/valid <= 0)
+    let reset_body = vec![
+        SeqStmt::RegAssign {
+            target: SeqLValue::Register(state_reg),
+            value: SignalRef::local_param("S_IDLE"),
+        },
+        SeqStmt::RegAssign { target: SeqLValue::Register(o_reg), value: zero() },
+        SeqStmt::RegAssign { target: SeqLValue::Register(k_reg), value: zero() },
+        SeqStmt::RegAssign { target: SeqLValue::Register(acc_reg), value: zero() },
+        SeqStmt::RegAssign { target: SeqLValue::Register(done_reg), value: zero() },
+        SeqStmt::RegAssign { target: SeqLValue::Register(valid_reg), value: zero() },
+    ];
+
+    // reset_arrays: x_buf[K_1] + shared h_buf[max_N].
+    let max_n = ctx.layers.iter().map(|l| l.n).max().unwrap();
+    let reset_arrays = vec![("x_buf".into(), k1), ("h_buf".into(), max_n)];
+
+    let sp = SeqProcess {
+        clock: ClkRef { domain_id: ClockDomainId::DEFAULT },
+        reset: ResetRef {
+            signal_id: ResetSignalId::DEFAULT,
+            polarity: ResetPolarity::Low,
+            sync: ResetSync::Async,
+        },
+        reset_body,
+        reset_arrays,
+        body: vec![SeqStmt::Case {
+            selector: reg(state_reg),
+            arms,
+            default: default_arm,
+        }],
+    };
+    module.add_node(HirNode::SeqProcess(sp))?;
+
     Ok(())
 }
 
@@ -1465,6 +1687,22 @@ mod tests {
         assert!(n_addc >= 4, "expected k/o increments per layer, got {n_addc}");
         assert!(n_mul >= 2, "expected one MAC product per layer, got {n_mul}");
         assert!(n_max0 >= 2, "expected inline relu per layer, got {n_max0}");
+    }
+
+    #[test]
+    fn fsm_seq_process_present_with_state_case() {
+        use crate::hir::nodes::SeqStmt;
+        let kir = two_layer_mlp_kir();
+        let module = KirToHirPass { test_taps: false, sequential: true }
+            .lower(&kir, "tiny_mlp_seq").unwrap();
+        let sp = module.nodes().iter().find_map(|n| match n {
+            HirNode::SeqProcess(sp) => Some(sp), _ => None });
+        let sp = sp.expect("expected one SeqProcess");
+        // body is a single state Case
+        assert!(matches!(sp.body.as_slice(), [SeqStmt::Case { .. }]));
+        // reset_arrays cover x_buf + h_buf
+        let names: Vec<&str> = sp.reset_arrays.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(names.contains(&"x_buf") && names.contains(&"h_buf"));
     }
 
     /// M57.1 wire-array mini §3.2 / Task W5: smallest single-layer case
