@@ -47,6 +47,9 @@
 //! computed from `%s_max_<t>_<half>` and `%s_sum_<t>_<half>`.
 
 use crate::flash_attention::FlashAttentionConfig;
+use crate::flash_attention_v2::smem_layout::{
+    tier_b1_reduced_stats_offset, tier_b1_reduced_stats_sum_offset,
+};
 use crate::flash_attention_v2::tier_b1::attention_mma::tiles_per_warp_pv;
 
 pub fn emit(ptx: &mut String, config: &FlashAttentionConfig) {
@@ -88,6 +91,31 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig) {
     ptx.push_str("    .reg .u64 %fin_addr;\n");
     ptx.push_str("    .reg .b16 %fin_h;\n");
     ptx.push_str("    .reg .pred %fin_lane0_pred;\n");
+
+    // Reduced softmax-stats SMEM reads (hd > block_kv fix). The row-max/row-sum
+    // are sourced from a dedicated SMEM region keyed by ABSOLUTE global query
+    // row, NOT from the QK^T-slot-keyed %s_max_<t>/%s_sum_<t> registers. This
+    // makes finalize independent of the QK^T-vs-PV slot->m_tile divergence that
+    // breaks at head_dim > block_kv (see attention_mma.rs STEP 4.5 + smem_layout
+    // ::tier_b1_reduced_stats_offset). %rstat_row is the LOCAL global_row
+    // (pre-q_start); %rstat_addr is the byte address; %rstat_max/%rstat_sum hold
+    // the loaded values for the LSE / save sites.
+    ptx.push_str("    .reg .u32 %rstat_max_base, %rstat_sum_base, %rstat_row, %rstat_addr;\n");
+    ptx.push_str("    .reg .f32 %rstat_max, %rstat_sum;\n");
+    ptx.push_str("    .reg .u64 %rstat_base_u64;\n");
+    // Compute the reduced-stats SMEM base addresses once (u32 for st/ld.shared).
+    let reduced_max_base = tier_b1_reduced_stats_offset(config);
+    let reduced_sum_base = tier_b1_reduced_stats_sum_offset(config);
+    ptx.push_str(&format!(
+        "    add.u64 %rstat_base_u64, %shmem_base, {}; // reduced row-max base\n",
+        reduced_max_base
+    ));
+    ptx.push_str("    cvt.u32.u64 %rstat_max_base, %rstat_base_u64;\n");
+    ptx.push_str(&format!(
+        "    add.u64 %rstat_base_u64, %shmem_base, {}; // reduced row-sum base\n",
+        reduced_sum_base
+    ));
+    ptx.push_str("    cvt.u32.u64 %rstat_sum_base, %rstat_base_u64;\n");
 
     // Phase 2.6 (T2.5): row_max/row_sum HBM save scratch. These reuse the
     // %fin_idx2-derived row-major [B,H,S] index that the LSE store builds;
@@ -162,11 +190,23 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig) {
             let row_offset = if i < 2 { 0u32 } else { 8 };
             let col_offset = i % 2;
 
-            // Normalize: o_acc_t_i / s_sum_t_<half>. Each warp's slot t
-            // holds its OWN global tile's accumulator — no gate needed.
+            // Normalize: o_acc_t_i / row_sum[global_row]. The row_sum is read
+            // from the reduced-stats SMEM by ABSOLUTE global query row (hd>bkv
+            // fix), NOT from the QK^T-slot-keyed %s_sum_<t> register.
+            // local global_row = m_tile*16 + lo_row + row_offset(i).
+            let _ = half; // half no longer selects a register; row_offset does.
             ptx.push_str(&format!(
-                "    div.approx.f32 %fin_norm, %o_acc_{}_{}, %s_sum_{}_{};\n",
-                t, i, t, half
+                "    add.u32 %rstat_row, %fin_lo_row, {};\n",
+                row_offset
+            ));
+            ptx.push_str("    add.u32 %rstat_row, %rstat_row, %fin_m_tile_x16;\n");
+            ptx.push_str("    shl.b32 %rstat_addr, %rstat_row, 2; // global_row * 4 (f32)\n");
+            ptx.push_str("    add.u32 %rstat_addr, %rstat_addr, %rstat_sum_base;\n");
+            ptx.push_str("    ld.shared.f32 %rstat_sum, [%rstat_addr];\n");
+            // Each warp's slot t holds its OWN global tile's accumulator — no gate needed.
+            ptx.push_str(&format!(
+                "    div.approx.f32 %fin_norm, %o_acc_{}_{}, %rstat_sum;\n",
+                t, i
             ));
 
             // Compute (row_in_tile, col_in_tile).
@@ -214,28 +254,34 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig) {
         ptx.push_str("    and.pred %fin_lane0_pred, %fin_lane0_pred, %p_has_lse;\n");
 
         for half_idx in 0..2u32 {
-            let half = if half_idx == 0 { "lo" } else { "hi" };
             let row_offset = half_idx * 8;
 
-            // lse = row_max + log2(row_sum) * ln(2).
+            // local global_row = m_tile*16 + lo_row + row_offset (pre-q_start).
+            // This indexes the reduced-stats SMEM written by the producer's
+            // STEP 4.5, keyed by absolute query row (hd>bkv fix). The SAME
+            // value (before adding q_start) is the LSE/save HBM seq index below.
             ptx.push_str(&format!(
-                "    lg2.approx.f32 %log_sum, %s_sum_{}_{};\n",
-                t, half
-            ));
-            ptx.push_str("    mul.f32 %log_sum, %log_sum, 0f3F317218; // * ln(2)\n");
-            ptx.push_str(&format!(
-                "    add.f32 %lse, %s_max_{}_{}, %log_sum;\n",
-                t, half
-            ));
-
-            // q_row_global_u32 = m_tile*16 + row_offset + lo_row (runtime).
-            ptx.push_str(&format!(
-                "    add.u32 %fin_q_row_u32, %fin_lo_row, {};\n",
+                "    add.u32 %rstat_row, %fin_lo_row, {};\n",
                 row_offset
             ));
-            ptx.push_str(
-                "    add.u32 %fin_q_row_u32, %fin_q_row_u32, %fin_m_tile_x16;\n",
-            );
+            ptx.push_str("    add.u32 %rstat_row, %rstat_row, %fin_m_tile_x16;\n");
+            ptx.push_str("    shl.b32 %rstat_addr, %rstat_row, 2; // global_row * 4 (f32)\n");
+            // row_max[global_row].
+            ptx.push_str("    add.u32 %rstat_addr, %rstat_addr, %rstat_max_base;\n");
+            ptx.push_str("    ld.shared.f32 %rstat_max, [%rstat_addr];\n");
+            // row_sum[global_row].
+            ptx.push_str("    shl.b32 %rstat_addr, %rstat_row, 2;\n");
+            ptx.push_str("    add.u32 %rstat_addr, %rstat_addr, %rstat_sum_base;\n");
+            ptx.push_str("    ld.shared.f32 %rstat_sum, [%rstat_addr];\n");
+
+            // lse = row_max + log2(row_sum) * ln(2).
+            ptx.push_str("    lg2.approx.f32 %log_sum, %rstat_sum;\n");
+            ptx.push_str("    mul.f32 %log_sum, %log_sum, 0f3F317218; // * ln(2)\n");
+            ptx.push_str("    add.f32 %lse, %rstat_max, %log_sum;\n");
+
+            // q_row_global_u32 = local global_row (== m_tile*16 + row_offset
+            // + lo_row); reuse %rstat_row computed above for the SMEM read.
+            ptx.push_str("    mov.u32 %fin_q_row_u32, %rstat_row;\n");
             ptx.push_str("    cvt.u64.u32 %fin_q_row, %fin_q_row_u32;\n");
             ptx.push_str("    add.u64 %fin_q_row, %fin_q_row, %q_start;\n");
 
@@ -271,14 +317,16 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig) {
                 ptx.push_str(
                     "    and.pred %psv_row_sum_gate, %fin_lane0_pred, %psv_has_row_sum;\n",
                 );
-                ptx.push_str(&format!(
-                    "    @%psv_row_max_gate st.global.f32 [%psv_row_max_addr], %s_max_{}_{};  // row_max_ptr write\n",
-                    t, half
-                ));
-                ptx.push_str(&format!(
-                    "    @%psv_row_sum_gate st.global.f32 [%psv_row_sum_addr], %s_sum_{}_{};  // row_sum_ptr write\n",
-                    t, half
-                ));
+                // Store the SMEM-sourced (m-tile-keyed) reduced stats — NOT the
+                // raw %s_max_<t>/%s_sum_<t> registers, which alias the wrong
+                // m-tile at hd>bkv. %rstat_max / %rstat_sum were loaded for THIS
+                // half's global_row above (hd>bkv fix; must move in lockstep).
+                ptx.push_str(
+                    "    @%psv_row_max_gate st.global.f32 [%psv_row_max_addr], %rstat_max;  // row_max_ptr write\n",
+                );
+                ptx.push_str(
+                    "    @%psv_row_sum_gate st.global.f32 [%psv_row_sum_addr], %rstat_sum;  // row_sum_ptr write\n",
+                );
             }
         }
     }
@@ -848,14 +896,67 @@ mod tests {
             (tpw * 2) as usize,
             "expected 2 row_sum stores per tile"
         );
-        // Stored value must be the RAW global max/sum, not the LSE combo.
+        // Stored value must be the reduced-stats SMEM-sourced (m-tile-keyed)
+        // %rstat_max / %rstat_sum, NOT the QK^T-slot-keyed %s_max_<t>/%s_sum_<t>
+        // registers (which alias the wrong m-tile at hd>bkv). The value is the
+        // RAW global max/sum (not the LSE = max + ln(sum) combo).
         assert!(
-            ptx.contains("@%psv_row_max_gate st.global.f32 [%psv_row_max_addr], %s_max_"),
-            "row_max store must write raw %s_max_<t>_<half>"
+            ptx.contains("@%psv_row_max_gate st.global.f32 [%psv_row_max_addr], %rstat_max;"),
+            "row_max store must write the SMEM-sourced %rstat_max (hd>bkv fix)"
         );
         assert!(
-            ptx.contains("@%psv_row_sum_gate st.global.f32 [%psv_row_sum_addr], %s_sum_"),
-            "row_sum store must write raw %s_sum_<t>_<half>"
+            ptx.contains("@%psv_row_sum_gate st.global.f32 [%psv_row_sum_addr], %rstat_sum;"),
+            "row_sum store must write the SMEM-sourced %rstat_sum (hd>bkv fix)"
+        );
+        // The stores must NO LONGER reference the slot-keyed registers directly.
+        assert!(
+            !ptx.contains("[%psv_row_max_addr], %s_max_"),
+            "row_max store must not source the QK^T-slot-keyed %s_max_<t> register"
+        );
+        assert!(
+            !ptx.contains("[%psv_row_sum_addr], %s_sum_"),
+            "row_sum store must not source the QK^T-slot-keyed %s_sum_<t> register"
+        );
+        // The reduced-stats SMEM reads that feed the stores must be present.
+        assert!(
+            ptx.contains("ld.shared.f32 %rstat_max, [%rstat_addr];")
+                && ptx.contains("ld.shared.f32 %rstat_sum, [%rstat_addr];"),
+            "finalize must read row_max/row_sum from the reduced-stats SMEM region"
+        );
+    }
+
+    #[test]
+    fn finalize_reads_softmax_stats_from_smem_not_slot_registers() {
+        // hd > block_kv fix: finalize must source row_max/row_sum from the
+        // reduced-stats SMEM region keyed by absolute global_row, NOT from the
+        // QK^T-slot-keyed %s_max_<t>/%s_sum_<t> registers (which the producer
+        // only declares over tiles_per_warp_qkt, and which map slot->wrong
+        // m_tile at hd>bkv). Exercise an hd>bkv config (32x32x64) where the
+        // old code path would have referenced undeclared %s_*_1_* registers.
+        let cfg = make_save_config(32, 32, 64);
+        let mut ptx = String::new();
+        emit(&mut ptx, &cfg);
+        // The divide must consume the SMEM-loaded %rstat_sum, not %s_sum_<t>.
+        assert!(
+            ptx.contains("div.approx.f32 %fin_norm, %o_acc_0_0, %rstat_sum;"),
+            "divide must normalize by the SMEM-sourced %rstat_sum"
+        );
+        // No emitted instruction may read a %s_sum_<t>/%s_max_<t> register
+        // (comments are allowed; instruction operands are not). Check the
+        // operand forms the old code used.
+        assert!(
+            !ptx.contains(", %s_sum_0_") && !ptx.contains(", %s_sum_1_"),
+            "finalize must not read %s_sum_<t>_<half> registers (hd>bkv fix)"
+        );
+        assert!(
+            !ptx.contains(", %s_max_0_") && !ptx.contains(", %s_max_1_"),
+            "finalize must not read %s_max_<t>_<half> registers (hd>bkv fix)"
+        );
+        // Reduced-stats SMEM base addresses must be set up.
+        assert!(
+            ptx.contains("cvt.u32.u64 %rstat_max_base, %rstat_base_u64;")
+                && ptx.contains("cvt.u32.u64 %rstat_sum_base, %rstat_base_u64;"),
+            "finalize must compute the reduced-stats SMEM base addresses"
         );
     }
 

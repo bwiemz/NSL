@@ -45,7 +45,7 @@ expression: ptx_str.into_owned()
     .param .u64 x_raw_ptr
 )
 {
-    .shared .align 16 .b8 shmem[46080];
+    .shared .align 16 .b8 shmem[46336];
     .reg .u32 %tid_x, %warp_id, %lane, %bid_x, %bid_y;
     .reg .u64 %rd<64>;
     .reg .f32 %f<49>;
@@ -698,8 +698,8 @@ V2_CSHA_PROLOGUE_SKIP_7:
     ld.param.u64 %tb1_q_wq_ptr, [csha_wq_ptr];
     setp.eq.u64 %tb1_q_wqnull, %tb1_q_wq_ptr, 0;
     @%tb1_q_wqnull bra V2_TIER_B1_Q_PROJ_SKIP;
-    add.u64 %tb1_q_smem_w, %shmem_base, 13312; // Wq chunk slot (w_chunk_off)
-    add.u64 %tb1_q_smem_x, %shmem_base, 29696; // x_q chunk slot
+    add.u64 %tb1_q_smem_w, %shmem_base, 13568; // Wq chunk slot (w_chunk_off)
+    add.u64 %tb1_q_smem_x, %shmem_base, 29952; // x_q chunk slot
     add.u64 %tb1_q_smem_q, %shmem_base, 0; // Q output tile (tier_b1_q_offset)
     cvt.u32.u64 %tb1_q_smem_w_u32, %tb1_q_smem_w;
     cvt.u32.u64 %tb1_q_smem_x_u32, %tb1_q_smem_x;
@@ -5883,9 +5883,9 @@ V2_TIER_B1_Q_PROJ_SKIP:
     ld.param.u64 %tb1_kv_wv_ptr, [csha_wv_ptr];
     setp.eq.u64 %tb1_kv_wvnull, %tb1_kv_wv_ptr, 0;
     @%tb1_kv_wvnull bra V2_TIER_B1_KV_PROJ_SKIP_0;
-    add.u64 %tb1_kv_smem_wk, %shmem_base, 13312; // Wk chunk slot (w_chunk_off slot 0)
-    add.u64 %tb1_kv_smem_wv, %shmem_base, 21504; // Wv chunk slot (w_chunk_off slot 1)
-    add.u64 %tb1_kv_smem_x, %shmem_base, 37888; // x_kv chunk slot (will be narrowed to u32 below)
+    add.u64 %tb1_kv_smem_wk, %shmem_base, 13568; // Wk chunk slot (w_chunk_off slot 0)
+    add.u64 %tb1_kv_smem_wv, %shmem_base, 21760; // Wv chunk slot (w_chunk_off slot 1)
+    add.u64 %tb1_kv_smem_x, %shmem_base, 38144; // x_kv chunk slot (will be narrowed to u32 below)
     cvt.u32.u64 %tb1_kv_smem_wk_u32, %tb1_kv_smem_wk;
     cvt.u32.u64 %tb1_kv_smem_wv_u32, %tb1_kv_smem_wv;
     cvt.u32.u64 %tb1_kv_smem_x_u32, %tb1_kv_smem_x;
@@ -13884,6 +13884,29 @@ V2_TIER_B1_KV_PROJ_SKIP_0:
     ld.shared.f32 %sm_part_sum, [%sm_addr + 12];   // n=3
     add.f32 %sm_global_sum_hi, %sm_global_sum_hi, %sm_part_sum;
     mov.f32 %s_sum_0_hi, %sm_global_sum_hi;
+    // === STEP 4.5: persist reduced row-max/row-sum to SMEM by absolute global_row ===
+    .reg .u32 %rstp_max_base, %rstp_sum_base, %rstp_addr;
+    .reg .u64 %rstp_base_u64;
+    add.u64 %rstp_base_u64, %shmem_base, 13312; // reduced row-max base
+    cvt.u32.u64 %rstp_max_base, %rstp_base_u64;
+    add.u64 %rstp_base_u64, %shmem_base, 13440; // reduced row-sum base
+    cvt.u32.u64 %rstp_sum_base, %rstp_base_u64;
+    mov.u32 %qkt_global_t, %warp_id;
+    shr.u32 %qkt_m_tile, %qkt_global_t, 2;
+    shl.b32 %qkt_q_warp_off, %qkt_m_tile, 4; // m_tile * 16
+    add.u32 %sm_global_row, %qkt_q_warp_off, %sm_lo_row;
+    shl.b32 %rstp_addr, %sm_global_row, 2;
+    add.u32 %sm_addr, %rstp_max_base, %rstp_addr;
+    @%sm_writer_pred st.shared.f32 [%sm_addr], %s_max_0_lo;
+    add.u32 %sm_addr, %rstp_sum_base, %rstp_addr;
+    @%sm_writer_pred st.shared.f32 [%sm_addr], %s_sum_0_lo;
+    add.u32 %sm_global_row, %qkt_q_warp_off, %sm_lo_row;
+    add.u32 %sm_global_row, %sm_global_row, 8;
+    shl.b32 %rstp_addr, %sm_global_row, 2;
+    add.u32 %sm_addr, %rstp_max_base, %rstp_addr;
+    @%sm_writer_pred st.shared.f32 [%sm_addr], %s_max_0_hi;
+    add.u32 %sm_addr, %rstp_sum_base, %rstp_addr;
+    @%sm_writer_pred st.shared.f32 [%sm_addr], %s_sum_0_hi;
     cvt.rn.f16.f32 %mma_h0, %s_acc_0_0;
     cvt.rn.f16.f32 %mma_h1, %s_acc_0_1;
     mov.b32 %p_packed_0, {%mma_h0, %mma_h1};
@@ -14040,6 +14063,14 @@ V2_TIER_B1_PHASE_C_AFTER_PREFETCH:
     .reg .u64 %fin_addr;
     .reg .b16 %fin_h;
     .reg .pred %fin_lane0_pred;
+    .reg .u32 %rstat_max_base, %rstat_sum_base, %rstat_row, %rstat_addr;
+    .reg .f32 %rstat_max, %rstat_sum;
+    .reg .u64 %rstat_base_u64;
+    add.u64 %rstat_base_u64, %shmem_base, 13312; // reduced row-max base
+    cvt.u32.u64 %rstat_max_base, %rstat_base_u64;
+    add.u64 %rstat_base_u64, %shmem_base, 13440; // reduced row-sum base
+    cvt.u32.u64 %rstat_sum_base, %rstat_base_u64;
+    setp.ne.u64 %p_has_lse, %logsumexp_base, 0;  // B.1: set LSE null-guard (Tier A sets it; B.1 native finalize must too)
     mov.u32 %fin_laneid, %tid.x;
     and.b32 %fin_laneid, %fin_laneid, 31;
     shr.u32 %fin_lo_row, %fin_laneid, 2;       // l/4 = D-fragment row within lo half
@@ -14052,7 +14083,12 @@ V2_TIER_B1_PHASE_C_AFTER_PREFETCH:
     and.b32 %fin_n_tile, %fin_global_t, 3;
     shl.b32 %fin_m_tile_x16, %fin_m_tile, 4;   // m_tile * 16
     shl.b32 %fin_n_tile_x8, %fin_n_tile, 3;    // n_tile * 8
-    div.approx.f32 %fin_norm, %o_acc_0_0, %s_sum_0_lo;
+    add.u32 %rstat_row, %fin_lo_row, 0;
+    add.u32 %rstat_row, %rstat_row, %fin_m_tile_x16;
+    shl.b32 %rstat_addr, %rstat_row, 2; // global_row * 4 (f32)
+    add.u32 %rstat_addr, %rstat_addr, %rstat_sum_base;
+    ld.shared.f32 %rstat_sum, [%rstat_addr];
+    div.approx.f32 %fin_norm, %o_acc_0_0, %rstat_sum;
     add.u32 %fin_row_in_tile, %fin_lo_row, 0;
     add.u32 %fin_col_in_tile, %fin_lo_col_base, 0;
     add.u32 %fin_q_row_u32, %fin_row_in_tile, %fin_m_tile_x16;
@@ -14070,7 +14106,12 @@ V2_TIER_B1_PHASE_C_AFTER_PREFETCH:
     add.u64 %fin_addr, %rd3, %fin_idx;
     cvt.rn.f16.f32 %fin_h, %fin_norm;
     st.global.b16 [%fin_addr], %fin_h;
-    div.approx.f32 %fin_norm, %o_acc_0_1, %s_sum_0_lo;
+    add.u32 %rstat_row, %fin_lo_row, 0;
+    add.u32 %rstat_row, %rstat_row, %fin_m_tile_x16;
+    shl.b32 %rstat_addr, %rstat_row, 2; // global_row * 4 (f32)
+    add.u32 %rstat_addr, %rstat_addr, %rstat_sum_base;
+    ld.shared.f32 %rstat_sum, [%rstat_addr];
+    div.approx.f32 %fin_norm, %o_acc_0_1, %rstat_sum;
     add.u32 %fin_row_in_tile, %fin_lo_row, 0;
     add.u32 %fin_col_in_tile, %fin_lo_col_base, 1;
     add.u32 %fin_q_row_u32, %fin_row_in_tile, %fin_m_tile_x16;
@@ -14088,7 +14129,12 @@ V2_TIER_B1_PHASE_C_AFTER_PREFETCH:
     add.u64 %fin_addr, %rd3, %fin_idx;
     cvt.rn.f16.f32 %fin_h, %fin_norm;
     st.global.b16 [%fin_addr], %fin_h;
-    div.approx.f32 %fin_norm, %o_acc_0_2, %s_sum_0_hi;
+    add.u32 %rstat_row, %fin_lo_row, 8;
+    add.u32 %rstat_row, %rstat_row, %fin_m_tile_x16;
+    shl.b32 %rstat_addr, %rstat_row, 2; // global_row * 4 (f32)
+    add.u32 %rstat_addr, %rstat_addr, %rstat_sum_base;
+    ld.shared.f32 %rstat_sum, [%rstat_addr];
+    div.approx.f32 %fin_norm, %o_acc_0_2, %rstat_sum;
     add.u32 %fin_row_in_tile, %fin_lo_row, 8;
     add.u32 %fin_col_in_tile, %fin_lo_col_base, 0;
     add.u32 %fin_q_row_u32, %fin_row_in_tile, %fin_m_tile_x16;
@@ -14106,7 +14152,12 @@ V2_TIER_B1_PHASE_C_AFTER_PREFETCH:
     add.u64 %fin_addr, %rd3, %fin_idx;
     cvt.rn.f16.f32 %fin_h, %fin_norm;
     st.global.b16 [%fin_addr], %fin_h;
-    div.approx.f32 %fin_norm, %o_acc_0_3, %s_sum_0_hi;
+    add.u32 %rstat_row, %fin_lo_row, 8;
+    add.u32 %rstat_row, %rstat_row, %fin_m_tile_x16;
+    shl.b32 %rstat_addr, %rstat_row, 2; // global_row * 4 (f32)
+    add.u32 %rstat_addr, %rstat_addr, %rstat_sum_base;
+    ld.shared.f32 %rstat_sum, [%rstat_addr];
+    div.approx.f32 %fin_norm, %o_acc_0_3, %rstat_sum;
     add.u32 %fin_row_in_tile, %fin_lo_row, 8;
     add.u32 %fin_col_in_tile, %fin_lo_col_base, 1;
     add.u32 %fin_q_row_u32, %fin_row_in_tile, %fin_m_tile_x16;
@@ -14126,11 +14177,18 @@ V2_TIER_B1_PHASE_C_AFTER_PREFETCH:
     st.global.b16 [%fin_addr], %fin_h;
     setp.eq.u32 %fin_lane0_pred, %fin_lane_mod4, 0;
     and.pred %fin_lane0_pred, %fin_lane0_pred, %p_has_lse;
-    lg2.approx.f32 %log_sum, %s_sum_0_lo;
+    add.u32 %rstat_row, %fin_lo_row, 0;
+    add.u32 %rstat_row, %rstat_row, %fin_m_tile_x16;
+    shl.b32 %rstat_addr, %rstat_row, 2; // global_row * 4 (f32)
+    add.u32 %rstat_addr, %rstat_addr, %rstat_max_base;
+    ld.shared.f32 %rstat_max, [%rstat_addr];
+    shl.b32 %rstat_addr, %rstat_row, 2;
+    add.u32 %rstat_addr, %rstat_addr, %rstat_sum_base;
+    ld.shared.f32 %rstat_sum, [%rstat_addr];
+    lg2.approx.f32 %log_sum, %rstat_sum;
     mul.f32 %log_sum, %log_sum, 0f3F317218; // * ln(2)
-    add.f32 %lse, %s_max_0_lo, %log_sum;
-    add.u32 %fin_q_row_u32, %fin_lo_row, 0;
-    add.u32 %fin_q_row_u32, %fin_q_row_u32, %fin_m_tile_x16;
+    add.f32 %lse, %rstat_max, %log_sum;
+    mov.u32 %fin_q_row_u32, %rstat_row;
     cvt.u64.u32 %fin_q_row, %fin_q_row_u32;
     add.u64 %fin_q_row, %fin_q_row, %q_start;
     mul.lo.u64 %fin_idx2, %batch_idx, %rd5;
@@ -14140,11 +14198,18 @@ V2_TIER_B1_PHASE_C_AFTER_PREFETCH:
     shl.b64 %fin_idx2, %fin_idx2, 2;  // f32 = 4 bytes
     add.u64 %fin_addr, %logsumexp_base, %fin_idx2;
     @%fin_lane0_pred st.global.f32 [%fin_addr], %lse;
-    lg2.approx.f32 %log_sum, %s_sum_0_hi;
+    add.u32 %rstat_row, %fin_lo_row, 8;
+    add.u32 %rstat_row, %rstat_row, %fin_m_tile_x16;
+    shl.b32 %rstat_addr, %rstat_row, 2; // global_row * 4 (f32)
+    add.u32 %rstat_addr, %rstat_addr, %rstat_max_base;
+    ld.shared.f32 %rstat_max, [%rstat_addr];
+    shl.b32 %rstat_addr, %rstat_row, 2;
+    add.u32 %rstat_addr, %rstat_addr, %rstat_sum_base;
+    ld.shared.f32 %rstat_sum, [%rstat_addr];
+    lg2.approx.f32 %log_sum, %rstat_sum;
     mul.f32 %log_sum, %log_sum, 0f3F317218; // * ln(2)
-    add.f32 %lse, %s_max_0_hi, %log_sum;
-    add.u32 %fin_q_row_u32, %fin_lo_row, 8;
-    add.u32 %fin_q_row_u32, %fin_q_row_u32, %fin_m_tile_x16;
+    add.f32 %lse, %rstat_max, %log_sum;
+    mov.u32 %fin_q_row_u32, %rstat_row;
     cvt.u64.u32 %fin_q_row, %fin_q_row_u32;
     add.u64 %fin_q_row, %fin_q_row, %q_start;
     mul.lo.u64 %fin_idx2, %batch_idx, %rd5;

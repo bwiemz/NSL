@@ -19,8 +19,9 @@
 use crate::flash_attention::FlashAttentionConfig;
 use crate::flash_attention_v2::smem_layout::{
     tier_b1_k_offset_ping, tier_b1_k_offset_pong, tier_b1_n_tiles_kv, tier_b1_p_offset,
-    tier_b1_q_offset, tier_b1_softmax_scratch_bytes, tier_b1_softmax_scratch_offset,
-    tier_b1_v_offset_ping, tier_b1_v_offset_pong,
+    tier_b1_q_offset, tier_b1_reduced_stats_offset, tier_b1_reduced_stats_sum_offset,
+    tier_b1_softmax_scratch_bytes, tier_b1_softmax_scratch_offset, tier_b1_v_offset_ping,
+    tier_b1_v_offset_pong,
 };
 use crate::matmul_mma::{
     emit_load_a_fragment_smem, emit_load_b_fragment_smem, emit_mma_instruction,
@@ -942,6 +943,95 @@ fn emit_online_softmax(ptx: &mut String, config: &FlashAttentionConfig, kv_iter:
                 t, half_name, half_name
             ));
         }
+    }
+
+    // ============================================================
+    // STEP 4.5: persist reduced row-max/row-sum to SMEM keyed by ABSOLUTE
+    // global query row (hd > block_kv fix).
+    //
+    // %s_max_<t>_<half> / %s_sum_<t>_<half> are per-query-ROW reduced stats,
+    // but their register index <t> is a per-warp QK^T output-tile SLOT
+    // (m_tile = global_t / (block_kv/8)). finalize re-derives a DIFFERENT
+    // m_tile from the same slot under the PV decomposition
+    // (m_tile = global_t / (head_dim/8)); the two agree only when
+    // head_dim == block_kv. To make finalize basis-independent, persist each
+    // reduced stat here keyed by its ABSOLUTE global_row so finalize can read
+    // it back by its PV m-tile's global_row.
+    //
+    // Gating: one lane per 4-lane row quad (lane%4 == 0) owns the row, so each
+    // (global_row, stat) is written exactly once per (warp, slot). Across all
+    // warps + QK^T slots the m-tiles tile the full bq row range, so every row
+    // 0..bq is written exactly once. Visibility to finalize is guaranteed by
+    // the P-scatter / Phase-C / projection-save bar.sync fences that follow.
+    // ============================================================
+    {
+        let reduced_max_base = tier_b1_reduced_stats_offset(config);
+        let reduced_sum_base = tier_b1_reduced_stats_sum_offset(config);
+        let log2_n_tiles_kv = n_tiles_kv.trailing_zeros();
+        ptx.push_str(
+            "    // === STEP 4.5: persist reduced row-max/row-sum to SMEM by absolute global_row ===\n",
+        );
+        // Producer-side namespace (%rstp_*) is DISTINCT from finalize's reader
+        // namespace (%rstat_*): both live in the SAME PTX function scope, so a
+        // shared register name would be a duplicate `.reg` definition (ptxas
+        // rejects "Duplicate definition of variable").
+        ptx.push_str("    .reg .u32 %rstp_max_base, %rstp_sum_base, %rstp_addr;\n");
+        ptx.push_str("    .reg .u64 %rstp_base_u64;\n");
+        // reduced_max_base / reduced_sum_base as u32 SMEM addresses (once).
+        ptx.push_str(&format!(
+            "    add.u64 %rstp_base_u64, %shmem_base, {}; // reduced row-max base\n",
+            reduced_max_base
+        ));
+        ptx.push_str("    cvt.u32.u64 %rstp_max_base, %rstp_base_u64;\n");
+        ptx.push_str(&format!(
+            "    add.u64 %rstp_base_u64, %shmem_base, {}; // reduced row-sum base\n",
+            reduced_sum_base
+        ));
+        ptx.push_str("    cvt.u32.u64 %rstp_sum_base, %rstp_base_u64;\n");
+        for t in 0..tpw {
+            // Recompute qkt m_tile for this slot (same N3 formula as Step 5).
+            if t == 0 {
+                ptx.push_str("    mov.u32 %qkt_global_t, %warp_id;\n");
+            } else {
+                ptx.push_str(&format!(
+                    "    add.u32 %qkt_global_t, %warp_id, {};\n",
+                    t * 8
+                ));
+            }
+            ptx.push_str(&format!(
+                "    shr.u32 %qkt_m_tile, %qkt_global_t, {};\n",
+                log2_n_tiles_kv
+            ));
+            ptx.push_str("    shl.b32 %qkt_q_warp_off, %qkt_m_tile, 4; // m_tile * 16\n");
+            for (half_name, row_offset) in [("lo", 0u32), ("hi", 8u32)].iter() {
+                // global_row = m_tile*16 + lo_row + row_offset.
+                ptx.push_str("    add.u32 %sm_global_row, %qkt_q_warp_off, %sm_lo_row;\n");
+                if *row_offset > 0 {
+                    ptx.push_str(&format!(
+                        "    add.u32 %sm_global_row, %sm_global_row, {};\n",
+                        row_offset
+                    ));
+                }
+                // addr offset = global_row * 4 bytes (f32).
+                ptx.push_str("    shl.b32 %rstp_addr, %sm_global_row, 2;\n");
+                // row-max store: [reduced_max_base + global_row*4] = %s_max.
+                ptx.push_str("    add.u32 %sm_addr, %rstp_max_base, %rstp_addr;\n");
+                ptx.push_str(&format!(
+                    "    @%sm_writer_pred st.shared.f32 [%sm_addr], %s_max_{}_{};\n",
+                    t, half_name
+                ));
+                // row-sum store: [reduced_sum_base + global_row*4] = %s_sum.
+                ptx.push_str("    add.u32 %sm_addr, %rstp_sum_base, %rstp_addr;\n");
+                ptx.push_str(&format!(
+                    "    @%sm_writer_pred st.shared.f32 [%sm_addr], %s_sum_{}_{};\n",
+                    t, half_name
+                ));
+            }
+        }
+        // The subsequent P-scatter (emit_scatter_p_to_smem) issues a `bar.sync 0`
+        // before the PV MMA, and the Phase-C swap issues another before finalize.
+        // Either fence makes these reduced-stat writes visible CTA-wide before
+        // finalize reads them; no extra bar.sync is needed here.
     }
 
     // NO per-warp divide here. P (=exp(S - global_max)) is left in
