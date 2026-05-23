@@ -48,6 +48,13 @@ pub enum SignalRef {
         n: usize,
         fixed_index: Option<usize>,
     },
+    /// M57.2: combinational read of one element of a `RegArray` (the clocked
+    /// sibling of `WireArrayElement`). Used for MAC inputs `x_buf[k]` /
+    /// `h_buf[o]`. Renders identically to `WireArrayElement`: `name[idx...]`.
+    RegArrayElement {
+        array_name: String,
+        indices: Vec<IndexExpr>,
+    },
 }
 
 impl SignalRef {
@@ -68,6 +75,9 @@ impl SignalRef {
         name: impl Into<String>, n: usize, fixed_index: Option<usize>,
     ) -> Self {
         Self::WireArrayConcat { array_name: name.into(), n, fixed_index }
+    }
+    pub fn reg_array_element(name: impl Into<String>, indices: Vec<IndexExpr>) -> Self {
+        Self::RegArrayElement { array_name: name.into(), indices }
     }
 }
 
@@ -94,6 +104,19 @@ mod tests {
                 assert_eq!(indices.len(), 2);
             }
             _ => panic!("expected WireArrayElement"),
+        }
+    }
+
+    #[test]
+    fn signal_ref_reg_array_element_constructs() {
+        use crate::hir::ids::RegisterId;
+        let s = SignalRef::reg_array_element("x_buf", vec![IndexExpr::Reg(RegisterId(3))]);
+        match s {
+            SignalRef::RegArrayElement { array_name, indices } => {
+                assert_eq!(array_name, "x_buf");
+                assert_eq!(indices.len(), 1);
+            }
+            _ => panic!("expected RegArrayElement"),
         }
     }
 }

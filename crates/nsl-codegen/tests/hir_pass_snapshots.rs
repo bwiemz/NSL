@@ -318,6 +318,11 @@ fn format_sigref(s: &nsl_codegen::hir::SignalRef) -> String {
                 None => format!("WireArrayConcat({array_name}, n={n})"),
             }
         }
+        // M57.2: combinational reg-array element read — identical render shape to
+        // WireArrayElement.
+        nsl_codegen::hir::SignalRef::RegArrayElement { array_name, indices } => {
+            format!("RegArrayElement({array_name}{})", format_index_exprs(indices))
+        }
     }
 }
 

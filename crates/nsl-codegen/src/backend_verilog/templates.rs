@@ -42,6 +42,11 @@ pub fn emit_signal_ref(s: &SignalRef) -> String {
             }).collect();
             format!("{{{}}}", elems.join(", "))
         }
+        // M57.2: combinational read of a `RegArray` element. Renders
+        // identically to `WireArrayElement` — `name[idx...]`.
+        SignalRef::RegArrayElement { array_name, indices } => {
+            format!("{}{}", array_name, emit_index_exprs(indices))
+        }
     }
 }
 
@@ -467,6 +472,13 @@ mod tests {
         assert_eq!(s, "[_r7]");
         let s2 = emit_index_exprs(&[IndexExpr::RegPlus(r, 1)]);
         assert_eq!(s2, "[(_r7 + 1)]");
+    }
+
+    #[test]
+    fn signal_ref_reg_array_element_emits() {
+        use crate::hir::ids::RegisterId;
+        let s = SignalRef::reg_array_element("h_buf", vec![IndexExpr::Reg(RegisterId(2))]);
+        assert_eq!(emit_signal_ref(&s), "h_buf[_r2]");
     }
 }
 
