@@ -153,6 +153,23 @@ impl CmpEq {
     }
 }
 
+/// M57.2: combinational add of a compile-time constant. Emits
+/// `assign _w{out} = $signed({src}) + {k};` (result width = `width`).
+/// Realizes §3.3 counter increments (`k+1`, `o+1`) as Wires read by RegAssign.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddConst {
+    pub src: SignalRef,
+    pub k: i64,
+    pub out: WireId,
+    pub width: usize,
+}
+
+impl AddConst {
+    pub fn new(src: SignalRef, k: i64, width: usize) -> Self {
+        Self { src, k, out: WireId::fresh(), width }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Mul {
     pub a: SignalRef,

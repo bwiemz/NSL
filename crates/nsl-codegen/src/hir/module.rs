@@ -34,6 +34,9 @@ pub enum HirNode {
     /// M57.2: combinational equality against a compile-time constant (Task 3).
     /// Produces a 1-bit wire: `assign _w{out} = ($signed({lhs}) == {rhs});`.
     CmpEq(CmpEq),
+    /// M57.2: combinational add of a compile-time constant (Task 4).
+    /// Produces a wire: `assign _w{out} = $signed({src}) + {k};`.
+    AddConst(AddConst),
 }
 
 impl HirNode {
@@ -48,6 +51,8 @@ impl HirNode {
             HirNode::SignExtend(s) => Some(s.dst),
             // M57.2 (Task 3): combinational equality drives one wire.
             HirNode::CmpEq(c) => Some(c.out),
+            // M57.2 (Task 4): combinational add-constant drives one wire.
+            HirNode::AddConst(a) => Some(a.out),
             // Register, GenerateFor, GenerateIf, WireArray, AssignWireArrayElement
             // don't produce a single WireId. (WireArray declares multi-element
             // wire family; AssignWireArrayElement drives ONE element of one;

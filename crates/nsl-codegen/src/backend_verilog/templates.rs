@@ -166,6 +166,12 @@ pub fn emit_cmp_eq(c: &CmpEq) -> String {
     format!("assign _w{} = ($signed({}) == {});", c.out.0, emit_signal_ref(&c.lhs), c.rhs)
 }
 
+/// M57.2 (Task 4): combinational add of a compile-time constant.
+/// Emits `assign _w{out} = $signed({src}) + {k};`.
+pub fn emit_add_const(a: &AddConst) -> String {
+    format!("assign _w{} = $signed({}) + {};", a.out.0, emit_signal_ref(&a.src), a.k)
+}
+
 pub fn emit_sign_extend(s: &SignExtend) -> String {
     let pad = s.dst_width - s.src_width;
     let src = emit_signal_ref(&s.src);
@@ -320,6 +326,8 @@ pub fn emit_node(
         }
         // M57.2 (Task 3): combinational equality against a compile-time constant.
         HirNode::CmpEq(c) => format!("{pad}{}", emit_cmp_eq(c)),
+        // M57.2 (Task 4): combinational add of a compile-time constant.
+        HirNode::AddConst(a) => format!("{pad}{}", emit_add_const(a)),
     }
 }
 
@@ -496,6 +504,15 @@ mod tests {
         use crate::hir::ids::{RegisterId, WireId};
         let c = CmpEq { lhs: SignalRef::Register(RegisterId(4)), rhs: 783, out: WireId(9) };
         assert_eq!(emit_cmp_eq(&c), "assign _w9 = ($signed(_r4) == 783);");
+    }
+
+    // --- M57.2 (Task 4): AddConst combinational node ---
+
+    #[test]
+    fn add_const_emits_increment() {
+        use crate::hir::ids::{RegisterId, WireId};
+        let a = AddConst { src: SignalRef::Register(RegisterId(4)), k: 1, out: WireId(12), width: 10 };
+        assert_eq!(emit_add_const(&a), "assign _w12 = $signed(_r4) + 1;");
     }
 }
 

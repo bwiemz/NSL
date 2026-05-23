@@ -282,6 +282,13 @@ fn summarize_node(out: &mut String, node: &HirNode, idx: usize, depth: usize) {
                 format_sigref(&c.lhs), c.rhs,
             ));
         }
+        // M57.2 (Task 4): combinational add-constant.
+        HirNode::AddConst(a) => {
+            out.push_str(&format!(
+                "{indent}[{idx}] AddConst width={} k={} src={}\n",
+                a.width, a.k, format_sigref(&a.src),
+            ));
+        }
     }
 }
 
