@@ -1705,6 +1705,20 @@ mod tests {
         assert!(names.contains(&"x_buf") && names.contains(&"h_buf"));
     }
 
+    #[test]
+    fn sequential_false_keeps_combinational_path() {
+        let kir = two_layer_mlp_kir();
+        let comb = KirToHirPass { test_taps: true, sequential: false }
+            .lower(&kir, "tiny_mlp").unwrap();
+        // combinational path has NO SeqProcess and cycle_count is None
+        assert!(!comb.nodes().iter().any(|n| matches!(n, HirNode::SeqProcess(_))));
+        assert_eq!(comb.cycle_count, None);
+        let seq = KirToHirPass { test_taps: true, sequential: true }
+            .lower(&kir, "tiny_mlp_seq").unwrap();
+        assert!(seq.nodes().iter().any(|n| matches!(n, HirNode::SeqProcess(_))));
+        assert!(seq.cycle_count.is_some());
+    }
+
     /// M57.1 wire-array mini §3.2 / Task W5: smallest single-layer case
     /// (layer 1, with bias). Verifies the fused emitter shape:
     /// Port::Input + x_l1_a fan-out + LocalParamArrays + WireArrays.
