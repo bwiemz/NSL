@@ -10,6 +10,11 @@ impl VerilogEmitter {
     pub fn emit_module(module: &HirModule) -> String {
         let mut out = String::new();
 
+        // M57.2 (Task 14): prepend a deterministic-latency comment for sequential modules.
+        if let Some(n) = module.cycle_count {
+            out.push_str(&format!("// M57.2 sequential FSM — deterministic latency: {n} cycles\n"));
+        }
+
         // Module header with port list
         out.push_str(&format!("module {}(\n", module.name));
         let inputs: Vec<String> = module.ports.iter()
@@ -80,5 +85,25 @@ mod tests {
         m.add_port(Port::input("x", 8));
         let v = VerilogEmitter::emit_module(&m);
         assert!(v.contains("input  wire signed [7:0] x"));
+    }
+
+    /// M57.2 (Task 14): sequential modules prepend the cycle-count comment;
+    /// combinational modules (cycle_count None) start directly with `module`.
+    #[test]
+    fn emit_module_prepends_cycle_count_comment_when_present() {
+        let mut m = HirModule::new("seqmod");
+        m.cycle_count = Some(101_634);
+        let v = VerilogEmitter::emit_module(&m);
+        assert!(
+            v.starts_with("// M57.2 sequential FSM \u{2014} deterministic latency: 101634 cycles\n"),
+            "sequential module must start with cycle-count comment; got: {v:?}",
+        );
+        // Combinational module (cycle_count None) starts with `module <name>(`
+        let c = HirModule::new("combmod");
+        let vc = VerilogEmitter::emit_module(&c);
+        assert!(
+            vc.starts_with("module combmod("),
+            "combinational module must start with module header; got: {vc:?}",
+        );
     }
 }
