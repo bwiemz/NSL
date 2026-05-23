@@ -760,14 +760,14 @@ pub(crate) fn lower_v1_mlp_sequential(
     module.reset_signals.insert(ResetSignalId::DEFAULT, "rst_n".into());
 
     // ── 3. FSM state localparams + ordered code table ───────────────────
-    //   IDLE=0, LOAD=1, L1_MAC=2, …, L{n}_MAC=n+1, DONE=last.
-    let n_states = 2 + n_layers + 1; // IDLE + LOAD + per-layer MAC + DONE
+    //   IDLE=0, L1_MAC=1, …, L{n}_MAC=n, DONE=n+1.
+    // states: IDLE + per-layer MAC + DONE = n_layers + 2
+    let n_states = n_layers + 2; // IDLE + per-layer MAC + DONE
     let sw = bits_to_hold(n_states - 1);
     let mut state_codes: Vec<(String, u64)> = Vec::with_capacity(n_states);
     state_codes.push(("S_IDLE".into(), 0));
-    state_codes.push(("S_LOAD".into(), 1));
     for layer_idx in 1..=n_layers {
-        state_codes.push((format!("S_L{}_MAC", layer_idx), (layer_idx + 1) as u64));
+        state_codes.push((format!("S_L{}_MAC", layer_idx), layer_idx as u64));
     }
     state_codes.push(("S_DONE".into(), (n_states - 1) as u64));
     for (name, code) in &state_codes {
@@ -844,7 +844,7 @@ pub(crate) fn lower_v1_mlp_sequential(
         SignalRef::reg_array_concat("h_buf", n_last),
     ));
 
-    // ── 8. Deterministic cycle count (§5.1: overhead = LOAD + DONE = 2) ──
+    // ── 8. Deterministic cycle count (§5.1: overhead = IDLE (start/latch) + DONE = 2) ──
     let total: usize = 2 + layers.iter().map(|l| l.n * l.k).sum::<usize>();
     module.cycle_count = Some(total as u64);
 
@@ -1032,7 +1032,6 @@ fn build_fsm(ctx: &SeqLoweringCtx, module: &mut HirModule) -> Result<(), FpgaLow
     // literal variant). ZERO covers all `<= '0`; ONE covers `done/valid <= 1`.
     let zero = || SignalRef::local_param("ZERO");
     let one = || SignalRef::local_param("ONE");
-    let reg = |r| SignalRef::register(r);
 
     // ── S_IDLE arm ──────────────────────────────────────────────────────
     // done/valid cleared every cycle in IDLE; on `start`, latch x → x_buf,
@@ -1080,11 +1079,11 @@ fn build_fsm(ctx: &SeqLoweringCtx, module: &mut HirModule) -> Result<(), FpgaLow
         let layer = &ctx.layers[layer_idx - 1];
         let is_final = layer_idx == n_layers;
         let relu_id = layer.relu_id.expect("build_datapath must run before build_fsm");
-        let acc_next_id = layer.acc_next_id.unwrap();
-        let k_next_id = layer.k_next_id.unwrap();
-        let o_next_id = layer.o_next_id.unwrap();
-        let k_is_last_id = layer.k_is_last_id.unwrap();
-        let o_is_last_id = layer.o_is_last_id.unwrap();
+        let acc_next_id = layer.acc_next_id.expect("build_datapath must run before build_fsm");
+        let k_next_id = layer.k_next_id.expect("build_datapath must run before build_fsm");
+        let o_next_id = layer.o_next_id.expect("build_datapath must run before build_fsm");
+        let k_is_last_id = layer.k_is_last_id.expect("build_datapath must run before build_fsm");
+        let o_is_last_id = layer.o_is_last_id.expect("build_datapath must run before build_fsm");
         let b_name = layer.b_name.clone();
 
         // o_is_last arm (last k of last o of this layer): advance the phase.
@@ -1220,7 +1219,7 @@ fn build_fsm(ctx: &SeqLoweringCtx, module: &mut HirModule) -> Result<(), FpgaLow
         reset_body,
         reset_arrays,
         body: vec![SeqStmt::Case {
-            selector: reg(state_reg),
+            selector: SignalRef::register(state_reg),
             arms,
             default: default_arm,
         }],
@@ -1793,6 +1792,24 @@ mod tests {
 
         // Sanity: there are assigned wires at all (guards against a vacuously-passing test).
         assert!(!assigned.is_empty(), "no assigned wires found — datapath may be empty");
+    }
+
+    /// M57.2: the FSM must have exactly n_layers + 2 states (IDLE + per-layer MAC
+    /// + DONE) and must NOT contain the phantom S_LOAD state that was declared but
+    /// never entered.
+    #[test]
+    fn sequential_fsm_has_no_phantom_state() {
+        let kir = two_layer_mlp_kir();
+        let module = KirToHirPass { test_taps: false, sequential: true }
+            .lower(&kir, "tiny_mlp_seq").unwrap();
+        // No "S_LOAD" localparam in the module.
+        assert!(
+            !module.local_params().iter().any(|lp| lp.name == "S_LOAD"),
+            "S_LOAD phantom state must not be emitted"
+        );
+        // State localparams = IDLE + 2 MAC + DONE = 4 (n_layers=2 → n_layers+2=4).
+        let n_state_lps = module.local_params().iter().filter(|lp| lp.name.starts_with("S_")).count();
+        assert_eq!(n_state_lps, 4, "expected IDLE + 2 layer-MAC + DONE = 4 states, got {n_state_lps}");
     }
 
     /// M57.1 wire-array mini §3.2 / Task W5: smallest single-layer case
