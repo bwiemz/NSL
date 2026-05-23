@@ -262,6 +262,16 @@ impl SignExtend {
     }
 }
 
+// --- Sequential / clocked nodes ---
+
+/// M57.2: LValue for a `SeqStmt::RegAssign` — a scalar register or one element
+/// of a `RegArray`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SeqLValue {
+    Register(crate::hir::ids::RegisterId),
+    RegArrayElement { array_name: String, indices: Vec<IndexExpr> },
+}
+
 // --- Sequential nodes ---
 
 /// M57.2: declaration-only scalar register. Emits just `reg signed [w-1:0] _r{id};`.

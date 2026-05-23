@@ -194,6 +194,20 @@ pub fn emit_sign_extend(s: &SignExtend) -> String {
     )
 }
 
+// --- Sequential / clocked node emitters ---
+
+/// M57.2 (Task 7): render a `SeqLValue` to a Verilog lvalue string.
+/// Scalar register → `_r{id}`; array element → `name[idx...]`.
+pub(crate) fn emit_seq_lvalue(lv: &crate::hir::nodes::SeqLValue) -> String {
+    use crate::hir::nodes::SeqLValue;
+    match lv {
+        SeqLValue::Register(r) => format!("_r{}", r.0),
+        SeqLValue::RegArrayElement { array_name, indices } => {
+            format!("{}{}", array_name, emit_index_exprs(indices))
+        }
+    }
+}
+
 // --- Register lowering — all 4 dialect combinations ---
 
 use crate::hir::clock_reset::{ResetPolarity, ResetSync};
@@ -547,6 +561,20 @@ mod tests {
     fn reg_array_emits_declaration() {
         let ra = RegArray { name: "x_buf".into(), dims: vec![784], width: 8 };
         assert_eq!(emit_reg_array(&ra), "reg signed [7:0] x_buf [0:783];");
+    }
+
+    // --- M57.2 (Task 7): SeqLValue ---
+
+    #[test]
+    fn seq_lvalue_emits() {
+        use crate::hir::ids::RegisterId;
+        use crate::hir::nodes::SeqLValue;
+        assert_eq!(emit_seq_lvalue(&SeqLValue::Register(RegisterId(3))), "_r3");
+        let e = SeqLValue::RegArrayElement {
+            array_name: "h_buf".into(),
+            indices: vec![IndexExpr::Reg(RegisterId(2))],
+        };
+        assert_eq!(emit_seq_lvalue(&e), "h_buf[_r2]");
     }
 }
 
