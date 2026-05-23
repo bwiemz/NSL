@@ -20,5 +20,6 @@ pub use control::{ConstExpr, GenerateFor, GenerateIf};
 pub use ids::{ClockDomainId, GenvarId, RegisterId, ResetSignalId, WireId};
 pub use lower::KirToHirPass;
 pub use module::{HirModule, HirNode};
-pub use nodes::{Add, LocalParam, LocalParamArray, Max0, Mul, Port, Register, SignExtend, Wire};
+pub use nodes::{Add, LocalParam, LocalParamArray, Max0, Mul, Port, Register, SignExtend, Wire,
+                SeqLValue, SeqStmt, SeqProcess};
 pub use signals::SignalRef;

@@ -253,6 +253,42 @@ use crate::hir::clock_reset::{ResetPolarity, ResetSync};
 use std::collections::BTreeMap;
 use crate::hir::ids::{ClockDomainId, ResetSignalId};
 
+pub fn emit_seq_process(
+    sp: &crate::hir::nodes::SeqProcess,
+    indent: usize,
+    clock_domains: &BTreeMap<ClockDomainId, String>,
+    reset_signals: &BTreeMap<ResetSignalId, String>,
+) -> String {
+    use crate::hir::nodes::SeqStmt;
+    let pad = " ".repeat(indent);
+    let clk = clock_domains.get(&sp.clock.domain_id).expect("clock domain name not registered");
+    let rst = reset_signals.get(&sp.reset.signal_id).expect("reset signal name not registered");
+    let rst_check = match sp.reset.polarity {
+        ResetPolarity::High => rst.clone(),
+        ResetPolarity::Low => format!("!{}", rst),
+    };
+    let sensitivity = match sp.reset.sync {
+        ResetSync::Sync => format!("@(posedge {})", clk),
+        ResetSync::Async => match sp.reset.polarity {
+            ResetPolarity::High => format!("@(posedge {} or posedge {})", clk, rst),
+            ResetPolarity::Low  => format!("@(posedge {} or negedge {})", clk, rst),
+        },
+    };
+    let mut resets = sp.reset_body.iter().map(|st| emit_seq_stmt(st, indent + 4))
+        .collect::<Vec<_>>().join("\n");
+    for (name, count) in &sp.reset_arrays {
+        resets.push_str(&format!(
+            "\n{}for (int _i = 0; _i < {}; _i = _i + 1) {}[_i] <= '0;",
+            " ".repeat(indent + 4), count, name));
+    }
+    let body = sp.body.iter().map(|st: &SeqStmt| emit_seq_stmt(st, indent + 4))
+        .collect::<Vec<_>>().join("\n");
+    format!(
+        "{pad}always_ff {sensitivity} begin\n\
+         {pad}  if ({rst_check}) begin\n{resets}\n{pad}  end else begin\n{body}\n{pad}  end\n\
+         {pad}end")
+}
+
 pub fn emit_register(
     r: &Register,
     clock_domains: &BTreeMap<ClockDomainId, String>,
@@ -398,6 +434,9 @@ pub fn emit_node(
         HirNode::RegDecl(d) => format!("{pad}{}", emit_reg_decl(d)),
         // M57.2 (Task 6): module-scope clocked register array.
         HirNode::RegArray(ra) => format!("{pad}{}", emit_reg_array(ra)),
+        // M57.2 (Task 9): clocked sequential process. emit_seq_process already
+        // applies indent internally — do NOT wrap with {pad}{}.
+        HirNode::SeqProcess(sp) => emit_seq_process(sp, indent, clock_domains, reset_signals),
     }
 }
 
@@ -655,7 +694,7 @@ mod tests {
     #[test]
     fn seq_stmt_case_emits_arms_and_default() {
         use crate::hir::ids::RegisterId;
-        use crate::hir::nodes::{SeqStmt};
+        use crate::hir::nodes::SeqStmt;
         let s = SeqStmt::Case {
             selector: SignalRef::Register(RegisterId(0)),
             arms: vec![(0u64, vec![SeqStmt::Block(vec![])])],
@@ -666,6 +705,39 @@ mod tests {
         assert!(out.contains("0: begin"));
         assert!(out.contains("default: begin"));
         assert!(out.trim_end().ends_with("endcase"));
+    }
+
+    // --- M57.2 (Task 9): SeqProcess ---
+
+    #[test]
+    fn seq_process_emits_always_ff_with_reset_branch() {
+        use crate::hir::ids::{ClockDomainId, RegisterId, ResetSignalId};
+        use crate::hir::clock_reset::{ClkRef, ResetRef, ResetPolarity, ResetSync};
+        use crate::hir::nodes::{SeqLValue, SeqProcess, SeqStmt};
+        let mut cd = BTreeMap::new();
+        cd.insert(ClockDomainId::DEFAULT, "clk".to_string());
+        let mut rs = BTreeMap::new();
+        rs.insert(ResetSignalId::DEFAULT, "rst_n".to_string());
+        let sp = SeqProcess {
+            clock: ClkRef { domain_id: ClockDomainId::DEFAULT },
+            reset: ResetRef {
+                signal_id: ResetSignalId::DEFAULT,
+                polarity: ResetPolarity::Low,
+                sync: ResetSync::Async,
+            },
+            reset_body: vec![SeqStmt::RegAssign {
+                target: SeqLValue::Register(RegisterId(0)),
+                value: SignalRef::LocalParam("S_IDLE".into()),
+            }],
+            reset_arrays: vec![("x_buf".into(), 784)],
+            body: vec![SeqStmt::Block(vec![])],
+        };
+        let out = emit_seq_process(&sp, 4, &cd, &rs);
+        assert!(out.contains("always_ff @(posedge clk or negedge rst_n) begin"));
+        assert!(out.contains("if (!rst_n) begin"));
+        assert!(out.contains("_r0 <= S_IDLE;"));
+        assert!(out.contains("for (int _i = 0; _i < 784; _i = _i + 1) x_buf[_i] <= '0;"));
+        assert!(out.contains("end else begin"));
     }
 }
 

@@ -303,6 +303,13 @@ fn summarize_node(out: &mut String, node: &HirNode, idx: usize, depth: usize) {
                 ra.name, ra.dims, ra.width,
             ));
         }
+        // M57.2 (Task 9): clocked sequential process.
+        HirNode::SeqProcess(sp) => {
+            out.push_str(&format!(
+                "{indent}[{idx}] SeqProcess (reset_arrays={}, body={} stmts)\n",
+                sp.reset_arrays.len(), sp.body.len(),
+            ));
+        }
     }
 }
 

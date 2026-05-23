@@ -283,6 +283,19 @@ pub enum SeqStmt {
     Block(Vec<SeqStmt>),
 }
 
+/// M57.2: clocked process → `always_ff @(posedge clk or negedge rst_n)`.
+/// `reset_body` = scalar register resets; `reset_arrays` = (RegArray name,
+/// element count) for per-element reset for-loops (§4); `body` = the FSM
+/// (a state `Case`). Realizes §4's reset branch fully.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeqProcess {
+    pub clock: crate::hir::clock_reset::ClkRef,
+    pub reset: crate::hir::clock_reset::ResetRef,
+    pub reset_body: Vec<SeqStmt>,
+    pub reset_arrays: Vec<(String, usize)>,
+    pub body: Vec<SeqStmt>,
+}
+
 // --- Sequential nodes ---
 
 /// M57.2: declaration-only scalar register. Emits just `reg signed [w-1:0] _r{id};`.

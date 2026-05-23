@@ -43,6 +43,11 @@ pub enum HirNode {
     /// M57.2: module-scope clocked register array (Task 6).
     /// Emits `reg signed [w-1:0] {name} [0:dims[0]-1]...;` with no always_ff.
     RegArray(RegArray),
+    /// M57.2: clocked process (Task 9). Emits a single `always_ff` block
+    /// covering the FSM state machine, reset branch, and RegArray reset loops.
+    /// Does not produce a single WireId — the process drives registers
+    /// declared by `RegDecl` and elements of arrays declared by `RegArray`.
+    SeqProcess(crate::hir::nodes::SeqProcess),
 }
 
 impl HirNode {
@@ -74,6 +79,8 @@ impl HirNode {
             HirNode::GenerateIf(_) => None,
             HirNode::WireArray(_) => None,
             HirNode::AssignWireArrayElement(_) => None,
+            // M57.2 (Task 9): SeqProcess drives registers in-place — no WireId.
+            HirNode::SeqProcess(_) => None,
         }
     }
 }
