@@ -34,6 +34,12 @@ fn structural_summary(module: &HirModule) -> String {
     let mut out = String::new();
     out.push_str(&format!("module: {}\n", module.name));
     out.push_str(&format!("test_taps: {}\n", module.test_taps));
+    // M57.2 (Task 18): include cycle_count for sequential modules only; omit
+    // for combinational (None) so existing combinational snapshots are
+    // byte-identical (Pin 2 preservation).
+    if let Some(n) = module.cycle_count {
+        out.push_str(&format!("cycle_count: {n}\n"));
+    }
     out.push_str(&format!("ports: {}\n", module.ports.len()));
     for port in &module.ports {
         match port {
@@ -539,4 +545,57 @@ fn full_v1_mlp_composition() {
         p, Port::Output { name, .. } if name == "out"
     ));
     assert!(has_out_port, "final layer must declare Port::Output(\"out\")");
+}
+
+// ---------------------------------------------------------------------------
+// Task 18 (M57.2): structural HIR snapshot of the sequential FSM lowering
+// ---------------------------------------------------------------------------
+
+/// Snapshot the structural HIR summary for the sequential v1 MLP FSM.
+/// Reuses the same two-layer KIR fixture as `full_v1_mlp_composition`.
+/// Key things audited in the snapshot:
+///   - cycle_count: 101634
+///   - ports: clk/rst_n/start/x/done/valid/out
+///   - RegArray x_buf + h_buf
+///   - RegDecl scalars (state/o/k/acc/done/valid)
+///   - CmpEq/AddConst/Mul/Add/Max0/WireDecl datapath per layer
+///   - SeqProcess (single always_ff FSM)
+#[test]
+fn sequential_v1_mlp_fsm() {
+    let kir = kir_with_ops(
+        "tiny_mlp",
+        vec![
+            // Layer 1: 784 → 128 (i8×i8→i32)
+            KirOp::Matmul {
+                a: 1, b: 2, out: 3,
+                a_dtype: KirType::I8, b_dtype: KirType::I8, out_dtype: KirType::I32,
+                a_shape: [1, 784], b_shape: [784, 128],
+            },
+            KirOp::ElementwiseAdd {
+                a: 3, b: 4, out: 5,
+                dtype: KirType::I32, shape: [128],
+            },
+            KirOp::Relu {
+                a: 5, out: 6,
+                dtype: KirType::I32, shape: [128],
+            },
+            // Layer 2: 128 → 10 (i32×i32→i64)
+            KirOp::Matmul {
+                a: 6, b: 7, out: 8,
+                a_dtype: KirType::I32, b_dtype: KirType::I32, out_dtype: KirType::I64,
+                a_shape: [1, 128], b_shape: [128, 10],
+            },
+            KirOp::ElementwiseAdd {
+                a: 8, b: 9, out: 10,
+                dtype: KirType::I64, shape: [10],
+            },
+            KirOp::Relu {
+                a: 10, out: 11,
+                dtype: KirType::I64, shape: [10],
+            },
+        ],
+    );
+    let module = KirToHirPass { test_taps: false, sequential: true }
+        .lower(&kir, "tiny_mlp_seq").unwrap();
+    assert_snapshot!(structural_summary(&module));
 }
