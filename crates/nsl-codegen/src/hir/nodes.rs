@@ -45,6 +45,18 @@ pub struct WireArray {
     pub width: usize,
 }
 
+/// M57.2: module-scope clocked register array — the sequential sibling of
+/// `WireArray`. Holds activation buffers (`x_buf`, `h_buf`). Declared by
+/// `emit_reg_array`; elements updated by non-blocking `SeqStmt::RegAssign`
+/// inside a `SeqProcess`, and reset per-element in the `negedge rst_n` branch
+/// (see `SeqProcess.reset_arrays`). v1 uses 1D arrays only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegArray {
+    pub name: String,
+    pub dims: Vec<usize>,
+    pub width: usize,
+}
+
 /// Drives one element of a `WireArray` from a `SignalRef`.
 ///
 /// Emits `assign {array_name}[{idx0}]...[{idxN}] = {src};` at the position

@@ -178,6 +178,13 @@ pub fn emit_reg_decl(d: &RegDecl) -> String {
     format!("reg signed [{}:0] _r{};", d.width - 1, d.id.0)
 }
 
+/// M57.2 (Task 6): module-scope clocked register array — sequential sibling
+/// of `WireArray`. Emits `reg signed [w-1:0] {name} [0:dims[0]-1]...;`.
+pub fn emit_reg_array(ra: &RegArray) -> String {
+    let dims_str: String = ra.dims.iter().map(|d| format!("[0:{}]", d - 1)).collect();
+    format!("reg signed [{}:0] {} {};", ra.width - 1, ra.name, dims_str)
+}
+
 pub fn emit_sign_extend(s: &SignExtend) -> String {
     let pad = s.dst_width - s.src_width;
     let src = emit_signal_ref(&s.src);
@@ -336,6 +343,8 @@ pub fn emit_node(
         HirNode::AddConst(a) => format!("{pad}{}", emit_add_const(a)),
         // M57.2 (Task 5): declaration-only scalar register.
         HirNode::RegDecl(d) => format!("{pad}{}", emit_reg_decl(d)),
+        // M57.2 (Task 6): module-scope clocked register array.
+        HirNode::RegArray(ra) => format!("{pad}{}", emit_reg_array(ra)),
     }
 }
 
@@ -530,6 +539,14 @@ mod tests {
         use crate::hir::ids::RegisterId;
         let d = RegDecl { id: RegisterId(5), width: 64 };
         assert_eq!(emit_reg_decl(&d), "reg signed [63:0] _r5;");
+    }
+
+    // --- M57.2 (Task 6): RegArray clocked register array ---
+
+    #[test]
+    fn reg_array_emits_declaration() {
+        let ra = RegArray { name: "x_buf".into(), dims: vec![784], width: 8 };
+        assert_eq!(emit_reg_array(&ra), "reg signed [7:0] x_buf [0:783];");
     }
 }
 

@@ -296,6 +296,13 @@ fn summarize_node(out: &mut String, node: &HirNode, idx: usize, depth: usize) {
                 d.width,
             ));
         }
+        // M57.2 (Task 6): module-scope clocked register array.
+        HirNode::RegArray(ra) => {
+            out.push_str(&format!(
+                "{indent}[{idx}] RegArray {} dims={:?} width={}\n",
+                ra.name, ra.dims, ra.width,
+            ));
+        }
     }
 }
 

@@ -40,6 +40,9 @@ pub enum HirNode {
     /// M57.2: declaration-only scalar register (Task 5).
     /// Emits `reg signed [w-1:0] _r{id};` with no bundled always_ff.
     RegDecl(RegDecl),
+    /// M57.2: module-scope clocked register array (Task 6).
+    /// Emits `reg signed [w-1:0] {name} [0:dims[0]-1]...;` with no always_ff.
+    RegArray(RegArray),
 }
 
 impl HirNode {
@@ -65,6 +68,8 @@ impl HirNode {
             HirNode::Register(_) => None,
             // M57.2 (Task 5): RegDecl is declaration-only — no WireId.
             HirNode::RegDecl(_) => None,
+            // M57.2 (Task 6): RegArray declares an array family — no single WireId.
+            HirNode::RegArray(_) => None,
             HirNode::GenerateFor(_) => None,
             HirNode::GenerateIf(_) => None,
             HirNode::WireArray(_) => None,
