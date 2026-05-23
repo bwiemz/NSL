@@ -333,16 +333,13 @@ fn tier_b2_dq_sweep_b1_forward() {
     // Plain --features cuda does NOT forward to nsl-test/cuda, so the B1Forward
     // path would hit the "requires feature='cuda'" panic.
     //
-    // DOCUMENTED LIMITATION (Phase 2.6 close): only hd=32 runs here. hd=64/128 are
-    // deferred because the B.1 FORWARD kernel mis-sizes its softmax-stat registers
-    // when head_dim > block_kv (tiles_per_warp_qkt vs tiles_per_warp_pv divergence
-    // in attention_mma.rs/finalize.rs) -- ptxas "Unknown symbol %s_sum_<t>". This is
-    // a pre-existing B.1-forward bug, NOT a dQ-kernel/integration bug: the dQ-kernel
-    // itself is validated at hd=32/64/128 via tier_b2_dq_sweep_cpu_naive_forward.
-    // Root-cause + fix proposal: docs/superpowers/specs/
-    //   2026-05-22-tier-b1-stat-register-sizing-diagnosis.md (option (c): re-key
-    // stats by m-tile from SMEM scratch). Restore [32, 64, 128] once that lands.
-    for &hd in &[32i64] {
+    // Full hd sweep restored: the B.1-forward hd>bkv softmax-stat-register bug
+    // (tiles_per_warp_qkt vs tiles_per_warp_pv divergence) is FIXED -- the stats
+    // are now re-keyed by absolute query row via a dedicated SMEM region
+    // (commit e854bad8), GPU-validated at hd=32/64/128 in
+    // tier_b1_save_activations_gpu. seq=32 (B.1 single-block: launcher forces
+    // block_kv=32). bq follows the dQ-kernel Path-A schedule.
+    for &hd in &[32i64, 64, 128] {
         let bq = if hd == 128 { 32 } else { 64 };
         validate_dq_for_source(&cfg(bq, hd), FSource::B1Forward, 32);
     }

@@ -274,8 +274,13 @@ pub fn run_b1_forward_and_adapt(
         "B.1 single-block precondition violated: seq {seq} > block_kv {}",
         b1_cfg.block_kv
     );
-    // chunk = d_model -> n_chunks=1 (matches the T2.7 setup with d_model=128).
-    let chunk = d_model;
+    // chunk MUST match what the kernel resolves via chunk_config::select for
+    // b1_cfg. At hd=128, chunk downgrades from d_model (SMEM budget), so
+    // hardcoding chunk=d_model would scramble the chunkified HBM layout the
+    // kernel reads (the exact hd=128 mismatch found in tier_b1_save_activations_gpu).
+    let chunk = nsl_codegen::flash_attention_v2::tier_b1::chunk_config::select(&b1_cfg)
+        .expect("chunk_config::select must admit the B.1-forward single-block config")
+        as usize;
 
     // ---- 3. f16 -> f32, RMSNorm, narrow + chunkify ------------------------
     let x_f32: Vec<f32> = x.iter().map(|v| v.to_f32()).collect();

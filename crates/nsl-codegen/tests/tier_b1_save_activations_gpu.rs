@@ -316,11 +316,11 @@ fn cpu_reference_saves(
 // (chunk=128 -> n_chunks=1). gpu_sm=120. save_activations_for_backward=true.
 // ---------------------------------------------------------------------------
 
-fn save_config() -> FlashAttentionConfig {
+fn save_config(head_dim: i64) -> FlashAttentionConfig {
     FlashAttentionConfig {
         block_q: 32,
         block_kv: 32,
-        head_dim: 32,
+        head_dim,
         causal: false, // single-block, no causal mask (every key participates)
         paged: false,
         rope_q: false,
@@ -354,12 +354,33 @@ fn max_abs(a: &[f32], b: &[f32]) -> (f32, usize) {
 
 #[test]
 #[ignore = "requires CUDA GPU"]
-fn tier_b1_save_activations_match_cpu_reference() {
+fn tier_b1_save_activations_match_cpu_reference_hd32() {
+    run_save_validation(32);
+}
+
+/// hd=64 > block_kv=32 — exercises the softmax stat-register re-key fix
+/// (tier_b1_reduced_stats SMEM region). Pre-fix this config failed ptxas with
+/// `Unknown symbol %s_sum_1_lo` (tpw_pv=2 > tpw_qkt=1).
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn tier_b1_save_activations_match_cpu_reference_hd64() {
+    run_save_validation(64);
+}
+
+/// hd=128 > block_kv=32 — exercises the deepest divergence (tpw_pv=4 >
+/// tpw_qkt=1; pre-fix `Unknown symbol %s_*_{1,2,3}_*`).
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn tier_b1_save_activations_match_cpu_reference_hd128() {
+    run_save_validation(128);
+}
+
+fn run_save_validation(head_dim: i64) {
     if !cuda_available() {
         return;
     }
 
-    let config = save_config();
+    let config = save_config(head_dim);
     let batch = 2usize;
     let heads = 2usize;
     let seq = config.block_q as usize; // single q-tile = single block
@@ -368,7 +389,16 @@ fn tier_b1_save_activations_match_cpu_reference() {
     // treats head_dim as the output width and ignores head_idx in the load).
     let kv_dim = hd;
     let d_model = config.csha.as_ref().unwrap().d_model as usize;
-    let chunk = d_model; // d_model=128 -> chunk=128 -> n_chunks=1
+    // Use the chunk the kernel was actually synthesized with. `synthesize_*`
+    // resolves the chunk internally via `chunk_config::select` (largest chunk
+    // in {128,64,32,FLOOR} that fits the 99 KB SMEM budget). At hd<=64 this is
+    // 128 (n_chunks=1); at hd=128 chunk=128 overflows so it downgrades to 64
+    // (n_chunks=2). The host x/W chunkification MUST match the kernel's chunk
+    // or the projection reads scrambled HBM (the projection math is otherwise
+    // chunk-independent: it sums over the full d_model either way).
+    let chunk = nsl_codegen::flash_attention_v2::tier_b1::chunk_config::select(&config)
+        .expect("chunk_config::select must admit the save-activation config") as usize;
+    eprintln!("[B1-save][hd{hd}] kernel chunk = {chunk} (d_model={d_model}, n_chunks={})", d_model / chunk);
     let norm_eps = 1e-5f32;
     let scale = 1.0f32 / (hd as f32).sqrt();
     let bh = batch * heads;
@@ -460,9 +490,9 @@ fn tier_b1_save_activations_match_cpu_reference() {
     if ptx.last() != Some(&b'\n') {
         ptx.push(b'\n');
     }
-    let dump = std::env::temp_dir().join("tier_b1_save_activations.ptx");
+    let dump = std::env::temp_dir().join(format!("tier_b1_save_activations_hd{hd}.ptx"));
     std::fs::write(&dump, &ptx).ok();
-    eprintln!("[B1-save] PTX dumped to: {}", dump.display());
+    eprintln!("[B1-save][hd{hd}] PTX dumped to: {}", dump.display());
     ptx.push(0);
 
     let kernel_name = CString::new(flash_attention_kernel_name_v2(&config)).unwrap();
@@ -733,5 +763,5 @@ fn tier_b1_save_activations_match_cpu_reference() {
          -- row_max/row_sum or LSE addressing transposed (or %p_has_lse unset)"
     );
 
-    eprintln!("\n[B1-save] PASS: all 5 saves match CPU reference; LSE consistent.");
+    eprintln!("\n[B1-save][hd{hd}] PASS: all 5 saves match CPU reference; LSE consistent.");
 }

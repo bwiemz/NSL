@@ -545,11 +545,57 @@ pub fn tier_b1_softmax_scratch_bytes(config: &FlashAttentionConfig) -> u32 {
     bq * n_tiles_kv * 2 * 4
 }
 
-/// W chunk staging region offset. Lives immediately after the softmax
-/// cross-warp scratch. Size is chunk-dependent and sized at emission
+/// Reduced softmax-stats region offset. Lives immediately after the softmax
+/// cross-warp scratch. Holds the FULLY-REDUCED per-query-row max/sum keyed by
+/// ABSOLUTE global query row (`bq` f32 maxes followed by `bq` f32 sums).
+///
+/// ## Why this region exists (hd > block_kv fix)
+///
+/// The softmax row-max/row-sum stats are per-query-ROW values, but the
+/// producer (`attention_mma.rs`) historically kept them in registers
+/// `%s_max_<t>_<half>` / `%s_sum_<t>_<half>` whose index `<t>` is a per-warp
+/// QK^T output-tile SLOT (`m_tile = global_t / (block_kv/8)`). The consumer
+/// (`finalize.rs`) reads them under the PV slot decomposition
+/// (`m_tile = global_t / (head_dim/8)`). The two slot->m_tile maps agree ONLY
+/// when `head_dim == block_kv`; at `head_dim > block_kv` finalize references
+/// slots the producer never declared (ptxas "Unknown symbol %s_sum_1_lo") AND
+/// maps slot 0 to the wrong m-tile in half the warps.
+///
+/// The fix re-keys the stats by ABSOLUTE global query row via this dedicated
+/// SMEM region. The producer persists each reduced row-max/row-sum here keyed
+/// by `global_row`; finalize reads back by its PV m-tile's `global_row`,
+/// making finalize independent of the QK^T-vs-PV slot basis.
+///
+/// Survival argument: this region is written at the END of the online-softmax
+/// phase (after the cross-warp max+sum combine) and read in finalize. The only
+/// `bar.sync`s between the two points (P-scatter sync, Phase-C swap sync, and
+/// the projection-save fence) are all visibility fences — none reuse this byte
+/// range. It is disjoint from the P scratch, the V slabs, the softmax
+/// cross-warp scratch, and the projection-save SMEM (which all live at LOWER
+/// offsets), and from the W/x chunk staging (which lives at a HIGHER offset and
+/// is only live during the projection pre-pass, before softmax runs).
+pub fn tier_b1_reduced_stats_offset(config: &FlashAttentionConfig) -> u32 {
+    tier_b1_softmax_scratch_offset(config) + tier_b1_softmax_scratch_bytes(config)
+}
+
+/// Size of the reduced softmax-stats region in bytes: `block_q` f32 maxes +
+/// `block_q` f32 sums = `block_q * 2 * 4` bytes (256 B for bq=32).
+pub fn tier_b1_reduced_stats_bytes(config: &FlashAttentionConfig) -> u32 {
+    (config.block_q as u32) * 2 * 4
+}
+
+/// Byte offset of the reduced row-SUM sub-region within the reduced-stats
+/// region (the row-MAX sub-region is at `tier_b1_reduced_stats_offset`).
+/// Sum-base = max-base + `block_q * 4`.
+pub fn tier_b1_reduced_stats_sum_offset(config: &FlashAttentionConfig) -> u32 {
+    tier_b1_reduced_stats_offset(config) + (config.block_q as u32) * 4
+}
+
+/// W chunk staging region offset. Lives immediately after the reduced
+/// softmax-stats region. Size is chunk-dependent and sized at emission
 /// time (B1.3+) from the chunk selected by `tier_b1::chunk_config::select`.
 pub fn tier_b1_w_chunk_offset(config: &FlashAttentionConfig) -> u32 {
-    tier_b1_softmax_scratch_offset(config) + tier_b1_softmax_scratch_bytes(config)
+    tier_b1_reduced_stats_offset(config) + tier_b1_reduced_stats_bytes(config)
 }
 
 /// Total SMEM bytes for a Tier B.1 kernel at the given chunk.
@@ -576,9 +622,10 @@ pub fn tier_b1_total_smem_bytes(config: &FlashAttentionConfig, chunk: u32) -> u3
     let kv_ping_pong = 2 * (bkv * hd * 2) + 2 * (bkv * hd * 2);
     let p_scratch = tier_b1_p_scratch_bytes(config);
     let softmax_scratch = tier_b1_softmax_scratch_bytes(config);
+    let reduced_stats = tier_b1_reduced_stats_bytes(config);
     let chunk_staging = chunk * hd * 2 * 2          // Wk + Wv chunk slots
                       + (bq + bkv) * chunk * 2;     // x_q + x_kv chunk slots
-    q_tile + kv_ping_pong + p_scratch + softmax_scratch + chunk_staging
+    q_tile + kv_ping_pong + p_scratch + softmax_scratch + reduced_stats + chunk_staging
 }
 
 /// Validate config against Tier B.1's SMEM budget (per spec section 3.4).
@@ -603,7 +650,11 @@ pub fn validate_tier_b1_config(
     let p_scratch = tier_b1_p_scratch_bytes(config);
     // Softmax cross-warp scratch: per-(global_q_row, n_tile_kv) f32 (max, sum).
     let softmax_scratch = tier_b1_softmax_scratch_bytes(config);
-    let fixed_bytes = q_tile + kv_ping_pong + p_scratch + softmax_scratch;
+    // Reduced softmax-stats: per-absolute-row f32 (max, sum) — re-keys the
+    // softmax stats so finalize can read them by absolute query row,
+    // independent of the QK^T-vs-PV slot basis (hd>bkv fix).
+    let reduced_stats = tier_b1_reduced_stats_bytes(config);
+    let fixed_bytes = q_tile + kv_ping_pong + p_scratch + softmax_scratch + reduced_stats;
 
     let chunk_staging = chunk * hd * 2 * 2          // Wk + Wv chunk slots
                       + (bq + bkv) * chunk * 2;     // x_q + x_kv chunk slots
@@ -870,19 +921,33 @@ mod tests {
             "v_offset_pong must precede p_offset");
         assert!(tier_b1_p_offset(&config) < tier_b1_softmax_scratch_offset(&config),
             "p_offset must precede softmax_scratch_offset");
-        assert!(tier_b1_softmax_scratch_offset(&config) < tier_b1_w_chunk_offset(&config),
-            "softmax_scratch_offset must precede w_chunk_offset");
+        assert!(tier_b1_softmax_scratch_offset(&config) < tier_b1_reduced_stats_offset(&config),
+            "softmax_scratch_offset must precede reduced_stats_offset");
+        assert!(tier_b1_reduced_stats_offset(&config) < tier_b1_w_chunk_offset(&config),
+            "reduced_stats_offset must precede w_chunk_offset");
         // P scratch is block_q × block_kv f16.
         assert_eq!(
             tier_b1_softmax_scratch_offset(&config) - tier_b1_p_offset(&config),
             tier_b1_p_scratch_bytes(&config),
             "p_scratch region between p_offset and softmax_scratch_offset must equal block_q × block_kv × 2"
         );
-        // Softmax cross-warp scratch sits between p_scratch and w_chunk_off.
+        // Softmax cross-warp scratch sits between p_scratch and reduced_stats.
         assert_eq!(
-            tier_b1_w_chunk_offset(&config) - tier_b1_softmax_scratch_offset(&config),
+            tier_b1_reduced_stats_offset(&config) - tier_b1_softmax_scratch_offset(&config),
             tier_b1_softmax_scratch_bytes(&config),
             "softmax scratch region size mismatch"
+        );
+        // Reduced softmax-stats region sits between softmax_scratch and w_chunk.
+        assert_eq!(
+            tier_b1_w_chunk_offset(&config) - tier_b1_reduced_stats_offset(&config),
+            tier_b1_reduced_stats_bytes(&config),
+            "reduced softmax-stats region size mismatch"
+        );
+        // Sum sub-region base = max base + block_q * 4.
+        assert_eq!(
+            tier_b1_reduced_stats_sum_offset(&config) - tier_b1_reduced_stats_offset(&config),
+            (config.block_q as u32) * 4,
+            "reduced-stats sum sub-region must follow the bq f32 maxes"
         );
     }
 
