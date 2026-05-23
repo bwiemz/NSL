@@ -286,6 +286,8 @@ fn format_index_exprs(indices: &[nsl_codegen::hir::nodes::IndexExpr]) -> String 
             IndexExpr::Literal(n) => format!("[{}]", n),
             IndexExpr::Genvar(name) => format!("[{}]", name),
             IndexExpr::GenvarPlus(name, k) => format!("[({} + {})]", name, k),
+            IndexExpr::Reg(r) => format!("[_r{}]", r.0),
+            IndexExpr::RegPlus(r, k) => format!("[(_r{} + {})]", r.0, k),
         })
         .collect()
 }

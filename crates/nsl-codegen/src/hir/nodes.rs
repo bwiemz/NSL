@@ -23,6 +23,12 @@ pub enum IndexExpr {
     /// Genvar plus a non-negative constant offset. Emits `(name + k)`.
     /// Used for ripple-write targets like `acc[o][k + 1]`.
     GenvarPlus(String, i64),
+    /// M57.2: runtime register-valued index. Emits `_r{id}` (e.g. `acc[_r5]`).
+    /// Used for `x_buf[k]`, `W{i}[k][o]`, `h_buf[o]` indexing by FSM counters.
+    Reg(crate::hir::ids::RegisterId),
+    /// M57.2: register plus a constant offset. Emits `(_r{id} + k)`.
+    /// Used for the §3.4 intra-layer bias-seed `b{i}[o+1]`.
+    RegPlus(crate::hir::ids::RegisterId, i64),
 }
 
 /// Module-scope multi-dimensional wire array declaration.

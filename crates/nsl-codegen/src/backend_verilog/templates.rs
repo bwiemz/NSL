@@ -54,6 +54,8 @@ pub(crate) fn emit_index_exprs(indices: &[IndexExpr]) -> String {
             IndexExpr::Literal(n) => format!("[{}]", n),
             IndexExpr::Genvar(name) => format!("[{}]", name),
             IndexExpr::GenvarPlus(name, k) => format!("[({} + {})]", name, k),
+            IndexExpr::Reg(r) => format!("[_r{}]", r.0),
+            IndexExpr::RegPlus(r, k) => format!("[(_r{} + {})]", r.0, k),
         })
         .collect()
 }
@@ -455,6 +457,16 @@ mod tests {
             emit_assign_wire_array_element(&a),
             "assign acc_l1[5][0] = b1_5;"
         );
+    }
+
+    #[test]
+    fn index_expr_reg_and_regplus_emit() {
+        use crate::hir::ids::RegisterId;
+        let r = RegisterId(7);
+        let s = emit_index_exprs(&[IndexExpr::Reg(r)]);
+        assert_eq!(s, "[_r7]");
+        let s2 = emit_index_exprs(&[IndexExpr::RegPlus(r, 1)]);
+        assert_eq!(s2, "[(_r7 + 1)]");
     }
 }
 
