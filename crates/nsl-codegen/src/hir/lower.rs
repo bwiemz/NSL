@@ -876,11 +876,110 @@ pub(crate) fn lower_v1_mlp_sequential(
 }
 
 /// M57.2 (Task 11): per-layer combinational MAC-step + control wires the FSM
-/// reads. Populated in Sub-task 11.
+/// reads, indexed by the runtime `k`/`o` registers (vs the combinational
+/// path's genvars). One inner MAC iteration per layer:
+///
+/// ```text
+///   prod      = x_src[k] * W{i}[k][o]              (a_width × b_width → prod_width)
+///   prod_ext  = sext(prod) → acc_width_max         (when prod_width < acc_width_max)
+///   acc_next  = acc + prod_ext                     (§3.5; acc register read)
+///   relu      = max0(acc_next)                     (inline relu, §3.5)
+///   k_next    = k + 1 ;  o_next = o + 1
+///   k_is_last = (k == K_i-1) ; o_is_last = (o == N_i-1)
+/// ```
+///
+/// `x_src` = `x_buf` (layer 1) or the shared `h_buf` (layer i>1). A single
+/// shared 64-bit `acc` register serves all phases, so `Add`/`Max0`/`SignExtend`
+/// targets use `acc_width_max` uniformly (Add requires equal operand widths);
+/// per-layer sign-extended values sit in the 64-bit acc and the 64-bit
+/// relu/compare is value-correct. Per-layer wires are distinct (fresh ids) and
+/// coexist at module scope — only the active phase's `acc`/`k`/`o` drive
+/// meaningful values. Wire ids are recorded back into each `LayerDims` for
+/// `build_fsm` (Task 12).
 fn build_datapath(
-    _ctx: &mut SeqLoweringCtx,
-    _module: &mut HirModule,
+    ctx: &mut SeqLoweringCtx,
+    module: &mut HirModule,
 ) -> Result<(), FpgaLoweringError> {
+    use crate::hir::module::HirNode;
+    use crate::hir::nodes::{Add, AddConst, CmpEq, IndexExpr, Max0, Mul, SignExtend};
+    use crate::hir::signals::SignalRef;
+
+    let acc_width_max = ctx.acc_width_max;
+    let k_width = ctx.k_width;
+    let o_width = ctx.o_width;
+    let k_reg = ctx.k_reg;
+    let o_reg = ctx.o_reg;
+    let acc_reg = ctx.acc_reg;
+
+    let n_layers = ctx.layers.len();
+    for layer_idx in 1..=n_layers {
+        let layer = &ctx.layers[layer_idx - 1];
+        let k_i = layer.k;
+        let n_i = layer.n;
+        let a_width = layer.a_width;
+        let b_width = layer.b_width;
+        let prod_width = layer.prod_width;
+        let w_name = layer.w_name.clone();
+
+        // x_src[k]: layer 1 reads the latched x_buf; layers > 1 read shared h_buf.
+        let x_src_name = if layer_idx == 1 { "x_buf" } else { "h_buf" };
+        let x_elem = SignalRef::reg_array_element(x_src_name, vec![IndexExpr::Reg(k_reg)]);
+        // W{i}[k][o] read at runtime k,o.
+        let w_elem = SignalRef::indexed_local_param(
+            w_name,
+            vec![IndexExpr::Reg(k_reg), IndexExpr::Reg(o_reg)],
+        );
+        // prod = x_src[k] * W{i}[k][o]
+        let prod = Mul::new(x_elem, w_elem, a_width, b_width, prod_width);
+        let prod_id = prod.out;
+        module.add_node(HirNode::Mul(prod))?;
+
+        // Optional SignExtend prod → acc_width_max (shared 64-bit acc).
+        let prod_ext = if prod_width < acc_width_max {
+            let se = SignExtend::new(SignalRef::wire(prod_id), prod_width, acc_width_max);
+            let se_id = se.dst;
+            module.add_node(HirNode::SignExtend(se))?;
+            SignalRef::wire(se_id)
+        } else {
+            SignalRef::wire(prod_id)
+        };
+
+        // acc_next = acc + prod_ext   (acc register read; §3.5).
+        let acc_next = Add::new(SignalRef::register(acc_reg), prod_ext, acc_width_max);
+        let acc_next_id = acc_next.out;
+        module.add_node(HirNode::Add(acc_next))?;
+
+        // relu = max0(acc_next)  (inline relu reads the combinational wire).
+        let relu = Max0::new(SignalRef::wire(acc_next_id), acc_width_max);
+        let relu_id = relu.out;
+        module.add_node(HirNode::Max0(relu))?;
+
+        // k_next = k + 1 ; o_next = o + 1.
+        let k_next = AddConst::new(SignalRef::register(k_reg), 1, k_width);
+        let k_next_id = k_next.out;
+        module.add_node(HirNode::AddConst(k_next))?;
+        let o_next = AddConst::new(SignalRef::register(o_reg), 1, o_width);
+        let o_next_id = o_next.out;
+        module.add_node(HirNode::AddConst(o_next))?;
+
+        // k_is_last = (k == K_i-1) ; o_is_last = (o == N_i-1).
+        let k_is_last = CmpEq::new(SignalRef::register(k_reg), (k_i - 1) as u64);
+        let k_is_last_id = k_is_last.out;
+        module.add_node(HirNode::CmpEq(k_is_last))?;
+        let o_is_last = CmpEq::new(SignalRef::register(o_reg), (n_i - 1) as u64);
+        let o_is_last_id = o_is_last.out;
+        module.add_node(HirNode::CmpEq(o_is_last))?;
+
+        // Record wire ids back into the LayerDims for build_fsm (Task 12).
+        let layer_mut = &mut ctx.layers[layer_idx - 1];
+        layer_mut.acc_next_id = Some(acc_next_id);
+        layer_mut.relu_id = Some(relu_id);
+        layer_mut.k_next_id = Some(k_next_id);
+        layer_mut.o_next_id = Some(o_next_id);
+        layer_mut.k_is_last_id = Some(k_is_last_id);
+        layer_mut.o_is_last_id = Some(o_is_last_id);
+    }
+
     Ok(())
 }
 
@@ -1348,6 +1447,24 @@ mod tests {
         assert!(reg_arrays.contains(&"h_buf"));
         // cycle count populated: 2 + N1*K1 + N2*K2 = 2 + 128*784 + 10*128
         assert_eq!(module.cycle_count, Some(2 + 128 * 784 + 10 * 128));
+    }
+
+    #[test]
+    fn datapath_has_acc_next_and_guards_per_layer() {
+        let kir = two_layer_mlp_kir();
+        let module = KirToHirPass { test_taps: true, sequential: true }
+            .lower(&kir, "tiny_mlp_seq").unwrap();
+        // Two layers → two CmpEq for k_is_last + two for o_is_last (>= 4 total),
+        // two AddConst for k_next/o_next per layer (>= 4 total), and Mul/Add/Max0
+        // present for the MAC step.
+        let n_cmp = module.nodes().iter().filter(|n| matches!(n, HirNode::CmpEq(_))).count();
+        let n_addc = module.nodes().iter().filter(|n| matches!(n, HirNode::AddConst(_))).count();
+        let n_mul = module.nodes().iter().filter(|n| matches!(n, HirNode::Mul(_))).count();
+        let n_max0 = module.nodes().iter().filter(|n| matches!(n, HirNode::Max0(_))).count();
+        assert!(n_cmp >= 4, "expected k/o guards per layer, got {n_cmp}");
+        assert!(n_addc >= 4, "expected k/o increments per layer, got {n_addc}");
+        assert!(n_mul >= 2, "expected one MAC product per layer, got {n_mul}");
+        assert!(n_max0 >= 2, "expected inline relu per layer, got {n_max0}");
     }
 
     /// M57.1 wire-array mini §3.2 / Task W5: smallest single-layer case
