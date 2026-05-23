@@ -136,6 +136,23 @@ impl LocalParam {
 
 // --- Combinational nodes ---
 
+/// M57.2: combinational equality against a compile-time constant.
+/// Emits `assign _w{out} = ($signed({lhs}) == {rhs});` (1-bit result).
+/// Realizes §3.3 within-state guards (`k == K-1`, `o == N-1`) as Wires so
+/// `SeqStmt::If.cond` stays a `SignalRef::Wire`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CmpEq {
+    pub lhs: SignalRef,
+    pub rhs: u64,
+    pub out: WireId,
+}
+
+impl CmpEq {
+    pub fn new(lhs: SignalRef, rhs: u64) -> Self {
+        Self { lhs, rhs, out: WireId::fresh() }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Mul {
     pub a: SignalRef,

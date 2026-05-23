@@ -275,6 +275,13 @@ fn summarize_node(out: &mut String, node: &HirNode, idx: usize, depth: usize) {
                 a.array_name, idx_str, format_sigref(&a.src),
             ));
         }
+        // M57.2 (Task 3): combinational equality guard.
+        HirNode::CmpEq(c) => {
+            out.push_str(&format!(
+                "{indent}[{idx}] CmpEq lhs={} rhs={}\n",
+                format_sigref(&c.lhs), c.rhs,
+            ));
+        }
     }
 }
 

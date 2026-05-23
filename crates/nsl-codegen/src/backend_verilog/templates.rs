@@ -160,6 +160,12 @@ pub fn emit_max0(m: &Max0) -> String {
     )
 }
 
+/// M57.2 (Task 3): combinational equality against a compile-time constant.
+/// Emits `assign _w{out} = ($signed({lhs}) == {rhs});` (1-bit result).
+pub fn emit_cmp_eq(c: &CmpEq) -> String {
+    format!("assign _w{} = ($signed({}) == {});", c.out.0, emit_signal_ref(&c.lhs), c.rhs)
+}
+
 pub fn emit_sign_extend(s: &SignExtend) -> String {
     let pad = s.dst_width - s.src_width;
     let src = emit_signal_ref(&s.src);
@@ -312,6 +318,8 @@ pub fn emit_node(
         HirNode::AssignWireArrayElement(a) => {
             format!("{pad}{}", emit_assign_wire_array_element(a))
         }
+        // M57.2 (Task 3): combinational equality against a compile-time constant.
+        HirNode::CmpEq(c) => format!("{pad}{}", emit_cmp_eq(c)),
     }
 }
 
@@ -479,6 +487,15 @@ mod tests {
         use crate::hir::ids::RegisterId;
         let s = SignalRef::reg_array_element("h_buf", vec![IndexExpr::Reg(RegisterId(2))]);
         assert_eq!(emit_signal_ref(&s), "h_buf[_r2]");
+    }
+
+    // --- M57.2 (Task 3): CmpEq combinational node ---
+
+    #[test]
+    fn cmp_eq_emits_equality() {
+        use crate::hir::ids::{RegisterId, WireId};
+        let c = CmpEq { lhs: SignalRef::Register(RegisterId(4)), rhs: 783, out: WireId(9) };
+        assert_eq!(emit_cmp_eq(&c), "assign _w9 = ($signed(_r4) == 783);");
     }
 }
 

@@ -31,6 +31,9 @@ pub enum HirNode {
     /// produce a single WireId — it drives a single element of an
     /// N-dimensional wire family declared by `WireArray`.
     AssignWireArrayElement(AssignWireArrayElement),
+    /// M57.2: combinational equality against a compile-time constant (Task 3).
+    /// Produces a 1-bit wire: `assign _w{out} = ($signed({lhs}) == {rhs});`.
+    CmpEq(CmpEq),
 }
 
 impl HirNode {
@@ -43,12 +46,18 @@ impl HirNode {
             HirNode::Add(a) => Some(a.out),
             HirNode::Max0(m) => Some(m.out),
             HirNode::SignExtend(s) => Some(s.dst),
+            // M57.2 (Task 3): combinational equality drives one wire.
+            HirNode::CmpEq(c) => Some(c.out),
             // Register, GenerateFor, GenerateIf, WireArray, AssignWireArrayElement
             // don't produce a single WireId. (WireArray declares multi-element
             // wire family; AssignWireArrayElement drives ONE element of one;
             // single-driver invariant for each element is the caller's
             // responsibility, same as GenerateFor body uniqueness.)
-            _ => None,
+            HirNode::Register(_) => None,
+            HirNode::GenerateFor(_) => None,
+            HirNode::GenerateIf(_) => None,
+            HirNode::WireArray(_) => None,
+            HirNode::AssignWireArrayElement(_) => None,
         }
     }
 }
