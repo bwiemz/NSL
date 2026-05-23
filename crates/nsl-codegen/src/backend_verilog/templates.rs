@@ -47,6 +47,14 @@ pub fn emit_signal_ref(s: &SignalRef) -> String {
         SignalRef::RegArrayElement { array_name, indices } => {
             format!("{}{}", array_name, emit_index_exprs(indices))
         }
+        // M57.2: concat over a `RegArray`'s elements (high-order first).
+        // Clocked sibling of `WireArrayConcat`; 1D only (no fixed_index).
+        // Drives the final-layer `out` port from `h_buf`.
+        SignalRef::RegArrayConcat { array_name, n } => {
+            let elems: Vec<String> =
+                (0..*n).rev().map(|i| format!("{}[{}]", array_name, i)).collect();
+            format!("{{{}}}", elems.join(", "))
+        }
     }
 }
 

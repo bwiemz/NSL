@@ -108,6 +108,11 @@ pub struct HirModule {
     pub clock_domains: BTreeMap<ClockDomainId, String>,
     pub reset_signals: BTreeMap<ResetSignalId, String>,
     pub test_taps: bool,
+    /// M57.2 (R6): deterministic total latency (in clock cycles) of the
+    /// sequential FSM lowering — carried from `lower_v1_mlp_sequential` to the
+    /// Verilog emitter's header comment. `None` on the combinational path so
+    /// its snapshot/output stays byte-identical.
+    pub cycle_count: Option<u64>,
 
     // Builder state — used by add_node to enforce single-driver invariant.
     driven_wires: HashSet<WireId>,
@@ -136,6 +141,7 @@ impl HirModule {
             clock_domains,
             reset_signals,
             test_taps: true,    // v1 default
+            cycle_count: None,  // M57.2: combinational path leaves this None
             driven_wires: HashSet::new(),
         }
     }

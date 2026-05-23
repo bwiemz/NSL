@@ -358,6 +358,10 @@ fn format_sigref(s: &nsl_codegen::hir::SignalRef) -> String {
         nsl_codegen::hir::SignalRef::RegArrayElement { array_name, indices } => {
             format!("RegArrayElement({array_name}{})", format_index_exprs(indices))
         }
+        // M57.2: concat across a reg-array (1D; no fixed_index) — drives `out`.
+        nsl_codegen::hir::SignalRef::RegArrayConcat { array_name, n } => {
+            format!("RegArrayConcat({array_name}, n={n})")
+        }
     }
 }
 

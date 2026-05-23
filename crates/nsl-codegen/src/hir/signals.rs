@@ -55,6 +55,14 @@ pub enum SignalRef {
         array_name: String,
         indices: Vec<IndexExpr>,
     },
+    /// M57.2: concatenation across a `RegArray`'s elements — the clocked
+    /// sibling of `WireArrayConcat` (no `fixed_index`; 1D arrays only). Emits
+    /// `{name[n-1], …, name[0]}` (high-order first per packed-bus convention).
+    /// Used to drive the final-layer `out` port from `h_buf`.
+    RegArrayConcat {
+        array_name: String,
+        n: usize,
+    },
 }
 
 impl SignalRef {
@@ -78,6 +86,9 @@ impl SignalRef {
     }
     pub fn reg_array_element(name: impl Into<String>, indices: Vec<IndexExpr>) -> Self {
         Self::RegArrayElement { array_name: name.into(), indices }
+    }
+    pub fn reg_array_concat(name: impl Into<String>, n: usize) -> Self {
+        Self::RegArrayConcat { array_name: name.into(), n }
     }
 }
 
