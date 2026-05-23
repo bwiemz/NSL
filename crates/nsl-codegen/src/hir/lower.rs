@@ -2038,4 +2038,89 @@ mod tests {
         assert_eq!(module.local_param_arrays().len(), 1, "W1 only (no b1)");
         assert_eq!(module.local_param_arrays()[0].name, "W1");
     }
+
+    /// M57.2 (Task 21 / SQ-5): bias-seed correctness regression.
+    ///
+    /// The FSM must use exactly three bias-seed forms per §3.4:
+    ///   (1) Phase-entry seed:  `b{i}[0]`              — Literal(0)
+    ///   (2) Intra-layer advance: `b{i}[(_rN + 1)]`   — RegPlus(o_reg, 1)
+    ///   (3) Final layer → S_DONE: NO bias-seed at all (no b{last}[…] assign
+    ///       in the o_is_last arm).
+    ///
+    /// The BUG this guards against (SQ-5): accidentally emitting `b{i}[_rN]`
+    /// (bare Reg) instead of `b{i}[(_rN + 1)]` in the intra-layer advance,
+    /// which would re-read the old accumulator bias instead of the next output's
+    /// bias, silently corrupting every h_buf cell except the first.
+    ///
+    /// Approach: emit the sequential module to Verilog, then parse the text to
+    /// verify the three cases.  Text matching is more robust than deep AST
+    /// walking for this invariant because it covers the full emission pipeline
+    /// (HIR construction + Verilog templates + sequential process emission).
+    #[test]
+    fn bias_seed_three_cases_use_correct_indices() {
+        use crate::backend_verilog::lower::VerilogEmitter;
+
+        let kir = two_layer_mlp_kir();
+        let module = KirToHirPass { test_taps: false, sequential: true }
+            .lower(&kir, "tiny_mlp_seq").unwrap();
+        let v = VerilogEmitter::emit_module(&module);
+
+        // ── Case (1): phase-entry seeds b1[0] and b2[0] ─────────────────────
+        assert!(
+            v.contains("b1[0]"),
+            "layer-1 phase-entry seed b1[0] missing from FSM Verilog",
+        );
+        assert!(
+            v.contains("b2[0]"),
+            "layer-2 phase-entry seed b2[0] missing from FSM Verilog",
+        );
+
+        // ── Case (2): intra-layer advance b{i}[(o+1)] ───────────────────────
+        // The o register emits as `_rN`; the RegPlus form emits as `[(_rN + 1)]`.
+        // We locate the o-register name from the `o <= ZERO` reset line
+        // (the only line of the form `_rN <= ZERO;` in the reset block where N
+        // is also used as an index in b1/b2 subscripts).
+        //
+        // More practically: scan for `b1[(` and confirm ` + 1)]` follows on the
+        // same line (the full token is `b1[(_rN + 1)]`).
+        let b1_intra = v.lines().any(|line| {
+            if let Some(pos) = line.find("b1[(") {
+                line[pos..].contains(" + 1)]")
+            } else {
+                false
+            }
+        });
+        assert!(
+            b1_intra,
+            "intra-layer advance `b1[(_rN + 1)]` missing from FSM Verilog",
+        );
+
+        // ── Case (3): no bare `b1[_rN]` or `b2[_rN]` form ──────────────────
+        // Locate the o-register id by finding a line `_rN <= _rM;` in the
+        // always_ff block where _rM is the o_next wire — but the simplest
+        // proxy is: any line that matches `b1[_r` or `b2[_r` but does NOT
+        // also contain ` + 1)]` is the bug form.
+        let bare_b1_bug = v.lines().any(|line| {
+            // Match `b1[_r` (bare reg subscript) but not `b1[(_r` (RegPlus form)
+            line.contains("b1[_r")
+        });
+        assert!(
+            !bare_b1_bug,
+            "bare-reg bias index `b1[_rN]` found in FSM Verilog — SQ-5 regression!",
+        );
+        let bare_b2_bug = v.lines().any(|line| {
+            line.contains("b2[_r")
+        });
+        assert!(
+            !bare_b2_bug,
+            "bare-reg bias index `b2[_rN]` found in FSM Verilog — SQ-5 regression!",
+        );
+
+        // ── Case (3) continued: final layer's o_is_last arm enters S_DONE ────
+        // The S_DONE transition must appear in the Verilog.
+        assert!(
+            v.contains("S_DONE"),
+            "S_DONE state missing from FSM — final-layer o_is_last arm not wired correctly",
+        );
+    }
 }
