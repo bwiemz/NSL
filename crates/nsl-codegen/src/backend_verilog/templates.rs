@@ -208,6 +208,45 @@ pub(crate) fn emit_seq_lvalue(lv: &crate::hir::nodes::SeqLValue) -> String {
     }
 }
 
+/// Render a `SeqStmt` at `indent` columns. Recursive; newline-joins nested
+/// statements. Used inside `emit_seq_process`'s reset/else branches.
+pub(crate) fn emit_seq_stmt(s: &crate::hir::nodes::SeqStmt, indent: usize) -> String {
+    use crate::hir::nodes::SeqStmt;
+    let pad = " ".repeat(indent);
+    match s {
+        SeqStmt::RegAssign { target, value } => {
+            format!("{pad}{} <= {};", emit_seq_lvalue(target), emit_signal_ref(value))
+        }
+        SeqStmt::If { cond, then_body, else_body } => {
+            let then_s = then_body.iter().map(|st| emit_seq_stmt(st, indent + 2))
+                .collect::<Vec<_>>().join("\n");
+            let head = format!("{pad}if ({}) begin\n{then_s}\n{pad}end", emit_signal_ref(cond));
+            if else_body.is_empty() {
+                head
+            } else {
+                let else_s = else_body.iter().map(|st| emit_seq_stmt(st, indent + 2))
+                    .collect::<Vec<_>>().join("\n");
+                format!("{head} else begin\n{else_s}\n{pad}end")
+            }
+        }
+        SeqStmt::Case { selector, arms, default } => {
+            let mut body = String::new();
+            for (val, stmts) in arms {
+                let inner = stmts.iter().map(|st| emit_seq_stmt(st, indent + 4))
+                    .collect::<Vec<_>>().join("\n");
+                body.push_str(&format!("{pad}  {}: begin\n{inner}\n{pad}  end\n", val));
+            }
+            let def = default.iter().map(|st| emit_seq_stmt(st, indent + 4))
+                .collect::<Vec<_>>().join("\n");
+            format!("{pad}case ({})\n{body}{pad}  default: begin\n{def}\n{pad}  end\n{pad}endcase",
+                    emit_signal_ref(selector))
+        }
+        SeqStmt::Block(stmts) => {
+            stmts.iter().map(|st| emit_seq_stmt(st, indent)).collect::<Vec<_>>().join("\n")
+        }
+    }
+}
+
 // --- Register lowering — all 4 dialect combinations ---
 
 use crate::hir::clock_reset::{ResetPolarity, ResetSync};
@@ -575,6 +614,58 @@ mod tests {
             indices: vec![IndexExpr::Reg(RegisterId(2))],
         };
         assert_eq!(emit_seq_lvalue(&e), "h_buf[_r2]");
+    }
+
+    // --- M57.2 (Task 8): SeqStmt ---
+
+    #[test]
+    fn seq_stmt_reg_assign_emits_nonblocking() {
+        use crate::hir::ids::{RegisterId, WireId};
+        use crate::hir::nodes::{SeqLValue, SeqStmt};
+        let s = SeqStmt::RegAssign {
+            target: SeqLValue::Register(RegisterId(1)),
+            value: SignalRef::Wire(WireId(8)),
+        };
+        assert_eq!(emit_seq_stmt(&s, 0), "_r1 <= _w8;");
+    }
+
+    #[test]
+    fn seq_stmt_if_emits_then_else() {
+        use crate::hir::ids::{RegisterId, WireId};
+        use crate::hir::nodes::{SeqLValue, SeqStmt};
+        let s = SeqStmt::If {
+            cond: SignalRef::Wire(WireId(2)),
+            then_body: vec![SeqStmt::RegAssign {
+                target: SeqLValue::Register(RegisterId(1)),
+                value: SignalRef::Wire(WireId(3)),
+            }],
+            else_body: vec![SeqStmt::RegAssign {
+                target: SeqLValue::Register(RegisterId(1)),
+                value: SignalRef::Wire(WireId(4)),
+            }],
+        };
+        let out = emit_seq_stmt(&s, 0);
+        assert!(out.starts_with("if (_w2) begin"));
+        assert!(out.contains("_r1 <= _w3;"));
+        assert!(out.contains("end else begin"));
+        assert!(out.contains("_r1 <= _w4;"));
+        assert!(out.trim_end().ends_with("end"));
+    }
+
+    #[test]
+    fn seq_stmt_case_emits_arms_and_default() {
+        use crate::hir::ids::RegisterId;
+        use crate::hir::nodes::{SeqStmt};
+        let s = SeqStmt::Case {
+            selector: SignalRef::Register(RegisterId(0)),
+            arms: vec![(0u64, vec![SeqStmt::Block(vec![])])],
+            default: vec![SeqStmt::Block(vec![])],
+        };
+        let out = emit_seq_stmt(&s, 0);
+        assert!(out.starts_with("case (_r0)"));
+        assert!(out.contains("0: begin"));
+        assert!(out.contains("default: begin"));
+        assert!(out.trim_end().ends_with("endcase"));
     }
 }
 

@@ -272,6 +272,17 @@ pub enum SeqLValue {
     RegArrayElement { array_name: String, indices: Vec<IndexExpr> },
 }
 
+/// M57.2: minimal sequential statement language (§2.2). `If` carries boolean
+/// within-state guards (`k==K-1`/`o==N-1`); `Case` carries the multi-way state
+/// selector — kept distinct (§2.2). All assignments are non-blocking.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SeqStmt {
+    RegAssign { target: SeqLValue, value: SignalRef },
+    If { cond: SignalRef, then_body: Vec<SeqStmt>, else_body: Vec<SeqStmt> },
+    Case { selector: SignalRef, arms: Vec<(u64, Vec<SeqStmt>)>, default: Vec<SeqStmt> },
+    Block(Vec<SeqStmt>),
+}
+
 // --- Sequential nodes ---
 
 /// M57.2: declaration-only scalar register. Emits just `reg signed [w-1:0] _r{id};`.
