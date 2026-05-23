@@ -172,6 +172,12 @@ pub fn emit_add_const(a: &AddConst) -> String {
     format!("assign _w{} = $signed({}) + {};", a.out.0, emit_signal_ref(&a.src), a.k)
 }
 
+/// M57.2 (Task 5): declaration-only scalar register.
+/// Emits `reg signed [w-1:0] _r{id};` — no always_ff block.
+pub fn emit_reg_decl(d: &RegDecl) -> String {
+    format!("reg signed [{}:0] _r{};", d.width - 1, d.id.0)
+}
+
 pub fn emit_sign_extend(s: &SignExtend) -> String {
     let pad = s.dst_width - s.src_width;
     let src = emit_signal_ref(&s.src);
@@ -328,6 +334,8 @@ pub fn emit_node(
         HirNode::CmpEq(c) => format!("{pad}{}", emit_cmp_eq(c)),
         // M57.2 (Task 4): combinational add of a compile-time constant.
         HirNode::AddConst(a) => format!("{pad}{}", emit_add_const(a)),
+        // M57.2 (Task 5): declaration-only scalar register.
+        HirNode::RegDecl(d) => format!("{pad}{}", emit_reg_decl(d)),
     }
 }
 
@@ -513,6 +521,15 @@ mod tests {
         use crate::hir::ids::{RegisterId, WireId};
         let a = AddConst { src: SignalRef::Register(RegisterId(4)), k: 1, out: WireId(12), width: 10 };
         assert_eq!(emit_add_const(&a), "assign _w12 = $signed(_r4) + 1;");
+    }
+
+    // --- M57.2 (Task 5): RegDecl declaration-only register ---
+
+    #[test]
+    fn reg_decl_emits_declaration_only() {
+        use crate::hir::ids::RegisterId;
+        let d = RegDecl { id: RegisterId(5), width: 64 };
+        assert_eq!(emit_reg_decl(&d), "reg signed [63:0] _r5;");
     }
 }
 

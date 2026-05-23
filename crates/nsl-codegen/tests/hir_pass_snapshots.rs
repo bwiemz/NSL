@@ -289,6 +289,13 @@ fn summarize_node(out: &mut String, node: &HirNode, idx: usize, depth: usize) {
                 a.width, a.k, format_sigref(&a.src),
             ));
         }
+        // M57.2 (Task 5): declaration-only scalar register.
+        HirNode::RegDecl(d) => {
+            out.push_str(&format!(
+                "{indent}[{idx}] RegDecl width={}\n",
+                d.width,
+            ));
+        }
     }
 }
 

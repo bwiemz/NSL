@@ -37,6 +37,9 @@ pub enum HirNode {
     /// M57.2: combinational add of a compile-time constant (Task 4).
     /// Produces a wire: `assign _w{out} = $signed({src}) + {k};`.
     AddConst(AddConst),
+    /// M57.2: declaration-only scalar register (Task 5).
+    /// Emits `reg signed [w-1:0] _r{id};` with no bundled always_ff.
+    RegDecl(RegDecl),
 }
 
 impl HirNode {
@@ -53,12 +56,15 @@ impl HirNode {
             HirNode::CmpEq(c) => Some(c.out),
             // M57.2 (Task 4): combinational add-constant drives one wire.
             HirNode::AddConst(a) => Some(a.out),
-            // Register, GenerateFor, GenerateIf, WireArray, AssignWireArrayElement
-            // don't produce a single WireId. (WireArray declares multi-element
-            // wire family; AssignWireArrayElement drives ONE element of one;
-            // single-driver invariant for each element is the caller's
-            // responsibility, same as GenerateFor body uniqueness.)
+            // Register, RegDecl, GenerateFor, GenerateIf, WireArray,
+            // AssignWireArrayElement don't produce a single WireId.
+            // (WireArray declares multi-element wire family;
+            // AssignWireArrayElement drives ONE element of one; single-driver
+            // invariant for each element is the caller's responsibility, same
+            // as GenerateFor body uniqueness.)
             HirNode::Register(_) => None,
+            // M57.2 (Task 5): RegDecl is declaration-only — no WireId.
+            HirNode::RegDecl(_) => None,
             HirNode::GenerateFor(_) => None,
             HirNode::GenerateIf(_) => None,
             HirNode::WireArray(_) => None,

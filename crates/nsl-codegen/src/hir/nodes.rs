@@ -250,7 +250,23 @@ impl SignExtend {
     }
 }
 
-// --- Sequential node ---
+// --- Sequential nodes ---
+
+/// M57.2: declaration-only scalar register. Emits just `reg signed [w-1:0] _r{id};`.
+/// Unlike `Register` (which bundles its own `always_ff`), an FSM scalar
+/// (`state`/`o`/`k`/`acc`/`out`) is declared by `RegDecl` and driven by the
+/// single `SeqProcess` always_ff. Read via `SignalRef::Register(id)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegDecl {
+    pub id: RegisterId,
+    pub width: usize,
+}
+
+impl RegDecl {
+    pub fn new(width: usize) -> Self {
+        Self { id: RegisterId::fresh(), width }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Register {
