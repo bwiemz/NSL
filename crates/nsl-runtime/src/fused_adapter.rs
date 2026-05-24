@@ -407,8 +407,17 @@ fn try_cuda_launch_fused_ia3(
         let _ = kernel_handle;
         return None;
     }
-    unsafe {
-        cudarc::driver::sys::cuCtxSynchronize();
+    let sync_result = unsafe { cudarc::driver::sys::cuCtxSynchronize() };
+    if sync_result as u32 != 0 {
+        eprintln!(
+            "[nsl-wrga] fused IA3 kernel caused GPU error ({:?}) — falling back to CPU math",
+            sync_result
+        );
+        unsafe {
+            let _ = Box::from_raw(out_ptr);
+        }
+        inner::free_managed(out_data);
+        return None;
     }
     record_fused_gpu_launch();
     Some(out_ptr as i64)
