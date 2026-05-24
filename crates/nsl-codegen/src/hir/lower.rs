@@ -150,7 +150,7 @@ impl KirToHirPass {
     ) -> Result<(), FpgaLoweringError> {
         use crate::hir::control::GenerateFor;
         use crate::hir::module::HirNode;
-        use crate::hir::nodes::{Add, LocalParam, Mul, Port, SignExtend, Wire};
+        use crate::hir::nodes::{Add, LocalParam, Mul, Port, SignExtend, Wire, WireDecl};
         use crate::hir::signals::SignalRef;
 
         let (a_dtype, b_dtype, out_dtype, a_shape, b_shape) = match matmul_op {
@@ -264,12 +264,16 @@ impl KirToHirPass {
             prod_width,
         );
         let prod_id = mul.out;
+        // M57.1 fix: declare before driving assign — avoids implicit 1-bit net.
+        inner_body.push(HirNode::WireDecl(WireDecl { id: prod_id, width: prod_width }));
         inner_body.push(HirNode::Mul(mul));
 
         // SignExtend prod → acc_width if needed (3-node MAC chain when prod < acc)
         let add_input = if prod_width < acc_width {
             let se = SignExtend::new(SignalRef::wire(prod_id), prod_width, acc_width);
             let se_id = se.dst;
+            // M57.1 fix: declare before driving assign.
+            inner_body.push(HirNode::WireDecl(WireDecl { id: se_id, width: acc_width }));
             inner_body.push(HirNode::SignExtend(se));
             SignalRef::wire(se_id)
         } else {
@@ -292,6 +296,9 @@ impl KirToHirPass {
             add_input,
             acc_width,
         );
+        let add_id = add.out;
+        // M57.1 fix: declare before driving assign.
+        inner_body.push(HirNode::WireDecl(WireDecl { id: add_id, width: acc_width }));
         inner_body.push(HirNode::Add(add));
 
         outer_body.push(HirNode::GenerateFor(GenerateFor::new(
@@ -322,7 +329,7 @@ impl KirToHirPass {
     ) -> Result<(), FpgaLoweringError> {
         use crate::hir::control::GenerateFor;
         use crate::hir::module::HirNode;
-        use crate::hir::nodes::{Add, Port};
+        use crate::hir::nodes::{Add, Port, WireDecl};
         use crate::hir::signals::SignalRef;
 
         let (dtype, shape) = match op {
@@ -349,11 +356,17 @@ impl KirToHirPass {
         module.add_port(Port::input(&a_name, n * width));
         module.add_port(Port::input(&b_name, n * width));
 
-        let body = vec![HirNode::Add(Add::new(
+        let add = Add::new(
             SignalRef::port(&a_name),
             SignalRef::port(&b_name),
             width,
-        ))];
+        );
+        let add_id = add.out;
+        // M57.1 fix: declare before driving assign — avoids implicit 1-bit net.
+        let body = vec![
+            HirNode::WireDecl(WireDecl { id: add_id, width }),
+            HirNode::Add(add),
+        ];
 
         module.add_node(HirNode::GenerateFor(GenerateFor::new(0, n as i64, body)))?;
 
@@ -367,7 +380,7 @@ impl KirToHirPass {
     ) -> Result<(), FpgaLoweringError> {
         use crate::hir::control::GenerateFor;
         use crate::hir::module::HirNode;
-        use crate::hir::nodes::{Max0, Port};
+        use crate::hir::nodes::{Max0, Port, WireDecl};
         use crate::hir::signals::SignalRef;
 
         let (dtype, shape) = match op {
@@ -396,7 +409,11 @@ impl KirToHirPass {
         let max0 = Max0::new(SignalRef::port(&in_name), width);
         let max0_out_id = max0.out;
 
-        let body = vec![HirNode::Max0(max0)];
+        // M57.1 fix: declare before driving assign — avoids implicit 1-bit net.
+        let body = vec![
+            HirNode::WireDecl(WireDecl { id: max0_out_id, width }),
+            HirNode::Max0(max0),
+        ];
 
         module.add_node(HirNode::GenerateFor(GenerateFor::new(0, n as i64, body)))?;
 
@@ -1274,7 +1291,7 @@ pub(crate) fn lower_v1_mlp_single_layer(
     use crate::hir::module::HirNode;
     use crate::hir::nodes::{
         Add, AssignWireArrayElement, IndexExpr, LocalParam, LocalParamArray,
-        Max0, Mul, Port, SignExtend, WireArray,
+        Max0, Mul, Port, SignExtend, WireArray, WireDecl,
     };
     use crate::hir::signals::SignalRef;
 
@@ -1446,12 +1463,16 @@ pub(crate) fn lower_v1_mlp_single_layer(
         prod_width,
     );
     let prod_id = prod.out;
+    // M57.1 fix: declare before driving assign — avoids implicit 1-bit net.
+    inner_body.push(HirNode::WireDecl(WireDecl { id: prod_id, width: prod_width }));
     inner_body.push(HirNode::Mul(prod));
 
     // Optional SignExtend if prod_width < acc_width.
     let extended_src = if prod_width < acc_width {
         let se = SignExtend::new(SignalRef::wire(prod_id), prod_width, acc_width);
         let se_id = se.dst;
+        // M57.1 fix: declare before driving assign.
+        inner_body.push(HirNode::WireDecl(WireDecl { id: se_id, width: acc_width }));
         inner_body.push(HirNode::SignExtend(se));
         SignalRef::wire(se_id)
     } else {
@@ -1472,6 +1493,8 @@ pub(crate) fn lower_v1_mlp_single_layer(
         acc_width,
     );
     let sum_id = add.out;
+    // M57.1 fix: declare before driving assign.
+    inner_body.push(HirNode::WireDecl(WireDecl { id: sum_id, width: acc_width }));
     inner_body.push(HirNode::Add(add));
     inner_body.push(HirNode::AssignWireArrayElement(AssignWireArrayElement {
         array_name: acc_array_name.clone(),
@@ -1510,7 +1533,9 @@ pub(crate) fn lower_v1_mlp_single_layer(
         acc_width,
     );
     let relu_max0_id = relu_max0.out;
+    // M57.1 fix: declare before driving assign.
     let relu_body = vec![
+        HirNode::WireDecl(WireDecl { id: relu_max0_id, width: acc_width }),
         HirNode::Max0(relu_max0),
         HirNode::AssignWireArrayElement(AssignWireArrayElement {
             array_name: relu_array_name.clone(),
@@ -1792,6 +1817,65 @@ mod tests {
 
         // Sanity: there are assigned wires at all (guards against a vacuously-passing test).
         assert!(!assigned.is_empty(), "no assigned wires found — datapath may be empty");
+    }
+
+    /// M57.1 fix: every `assign _wN =` in the **combinational** v1 MLP datapath
+    /// must have a matching `wire signed [...:0] _wN;` declaration so Verilog
+    /// simulators see explicitly-sized wires instead of implicit 1-bit nets.
+    ///
+    /// Mirrors `sequential_datapath_wires_are_all_declared` (M57.2) for the
+    /// combinational path. Must fail before the fix and pass after.
+    #[test]
+    fn combinational_datapath_wires_are_all_declared() {
+        use crate::backend_verilog::lower::VerilogEmitter;
+        use std::collections::HashSet;
+
+        let kir = two_layer_mlp_kir();
+        let module = KirToHirPass { test_taps: false, sequential: false }
+            .lower(&kir, "tiny_mlp")
+            .unwrap();
+        let v = VerilogEmitter::emit_module(&module);
+
+        // Collect declared wire ids from lines matching `wire signed [..:0] _wN;`
+        let mut declared: HashSet<u64> = HashSet::new();
+        for line in v.lines() {
+            let trimmed = line.trim();
+            // Match: "wire signed [<bits>:0] _w<N>;"
+            if let Some(rest) = trimmed.strip_prefix("wire signed [") {
+                if let Some(id_part) = rest.find("] _w").map(|pos| &rest[pos + 4..]) {
+                    if let Some(id_str) = id_part.strip_suffix(';') {
+                        if let Ok(id) = id_str.parse::<u64>() {
+                            declared.insert(id);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Collect assigned wire ids from lines matching `assign _wN = `
+        let mut assigned: HashSet<u64> = HashSet::new();
+        for line in v.lines() {
+            let trimmed = line.trim();
+            if let Some(rest) = trimmed.strip_prefix("assign _w") {
+                if let Some(eq_pos) = rest.find(" = ") {
+                    if let Ok(id) = rest[..eq_pos].parse::<u64>() {
+                        assigned.insert(id);
+                    }
+                }
+            }
+        }
+
+        // Every assigned wire must be declared (assigned ⊆ declared).
+        let mut undeclared: Vec<u64> = assigned.difference(&declared).copied().collect();
+        undeclared.sort_unstable();
+        assert!(
+            undeclared.is_empty(),
+            "combinational datapath has undeclared wires (implicit 1-bit nets): {:?}",
+            undeclared,
+        );
+
+        // Sanity: there are assigned wires at all (guards against a vacuously-passing test).
+        assert!(!assigned.is_empty(), "no assigned wires found — combinational datapath may be empty");
     }
 
     /// M57.2: the FSM must have exactly n_layers + 2 states (IDLE + per-layer MAC

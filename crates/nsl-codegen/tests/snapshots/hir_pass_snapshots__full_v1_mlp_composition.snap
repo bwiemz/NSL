@@ -29,15 +29,19 @@ nodes: 931
 [914] AssignWireArrayElement acc_l1[127][0] = IndexedLocalParam(b1[127])
 [915] GenerateFor lo=0 hi=128 body={
   [0] GenerateFor lo=0 hi=784 body={
-    [0] Mul a_width=8 b_width=8 out_width=16 a="WireArrayElement(x_l1_a[_gv2])" b="IndexedLocalParam(W1[_gv2][_gv1])"
-    [1] SignExtend src_width=16 dst_width=32
-    [2] Add width=32 a="WireArrayElement(acc_l1[_gv1][_gv2])" b="Wire(<id>)"
-    [3] AssignWireArrayElement acc_l1[_gv1][(_gv2 + 1)] = Wire(<id>)
+    [0] WireDecl width=16
+    [1] Mul a_width=8 b_width=8 out_width=16 a="WireArrayElement(x_l1_a[_gv2])" b="IndexedLocalParam(W1[_gv2][_gv1])"
+    [2] WireDecl width=32
+    [3] SignExtend src_width=16 dst_width=32
+    [4] WireDecl width=32
+    [5] Add width=32 a="WireArrayElement(acc_l1[_gv1][_gv2])" b="Wire(<id>)"
+    [6] AssignWireArrayElement acc_l1[_gv1][(_gv2 + 1)] = Wire(<id>)
   }
 }
 [916] GenerateFor lo=0 hi=128 body={
-  [0] Max0 width=32 a="WireArrayElement(acc_l1[_gv3][784])"
-  [1] AssignWireArrayElement relu_l1[_gv3] = Wire(<id>)
+  [0] WireDecl width=32
+  [1] Max0 width=32 a="WireArrayElement(acc_l1[_gv3][784])"
+  [2] AssignWireArrayElement relu_l1[_gv3] = Wire(<id>)
 }
 [917] WireArray acc_l2 dims=[10, 129] width=64
 [918] WireArray relu_l2 dims=[10] width=64
@@ -46,12 +50,15 @@ nodes: 931
 [928] AssignWireArrayElement acc_l2[9][0] = IndexedLocalParam(b2[9])
 [929] GenerateFor lo=0 hi=10 body={
   [0] GenerateFor lo=0 hi=128 body={
-    [0] Mul a_width=32 b_width=32 out_width=64 a="WireArrayElement(relu_l1[_gv5])" b="IndexedLocalParam(W2[_gv5][_gv4])"
-    [1] Add width=64 a="WireArrayElement(acc_l2[_gv4][_gv5])" b="Wire(<id>)"
-    [2] AssignWireArrayElement acc_l2[_gv4][(_gv5 + 1)] = Wire(<id>)
+    [0] WireDecl width=64
+    [1] Mul a_width=32 b_width=32 out_width=64 a="WireArrayElement(relu_l1[_gv5])" b="IndexedLocalParam(W2[_gv5][_gv4])"
+    [2] WireDecl width=64
+    [3] Add width=64 a="WireArrayElement(acc_l2[_gv4][_gv5])" b="Wire(<id>)"
+    [4] AssignWireArrayElement acc_l2[_gv4][(_gv5 + 1)] = Wire(<id>)
   }
 }
 [930] GenerateFor lo=0 hi=10 body={
-  [0] Max0 width=64 a="WireArrayElement(acc_l2[_gv6][128])"
-  [1] AssignWireArrayElement relu_l2[_gv6] = Wire(<id>)
+  [0] WireDecl width=64
+  [1] Max0 width=64 a="WireArrayElement(acc_l2[_gv6][128])"
+  [2] AssignWireArrayElement relu_l2[_gv6] = Wire(<id>)
 }
