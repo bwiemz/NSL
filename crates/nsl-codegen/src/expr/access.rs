@@ -177,12 +177,54 @@ impl Compiler<'_> {
                             slot_off as i32,
                         );
                         let byte_off = (index * 8) as i32;
-                        let tensor_ptr = builder.ins().load(
+                        // Guard the side-table base for null. The table is
+                        // materialized by `emit_adapter_init_sidetable`, which
+                        // runs ONLY inside a train block (`stmt.rs`). A
+                        // forward-only program that uses `@adapter` never
+                        // materializes it, so this slot is still 0 from
+                        // constructor zero-init — dereferencing it segfaults
+                        // (0xC0000005). Return a null tensor pointer (0) for the
+                        // unmaterialized case; the adapter FFI
+                        // (`nsl_adapter_fused_*_matmul`) detects null adapters
+                        // and falls back to the base `x @ W` forward. See
+                        // docs/plans/2026-05-23-wrga-b4-fused-forward-staging-scope.md.
+                        let deref_blk = builder.create_block();
+                        let null_blk = builder.create_block();
+                        let merge_blk = builder.create_block();
+                        builder.append_block_param(merge_blk, cl_types::I64);
+                        let base_is_null =
+                            builder.ins().icmp_imm(IntCC::Equal, table_ptr, 0);
+                        builder
+                            .ins()
+                            .brif(base_is_null, null_blk, &[], deref_blk, &[]);
+
+                        builder.switch_to_block(null_blk);
+                        builder.seal_block(null_blk);
+                        state.current_block = Some(null_blk);
+                        let null_tensor = builder.ins().iconst(cl_types::I64, 0);
+                        builder.ins().jump(merge_blk, &[null_tensor]);
+
+                        builder.switch_to_block(deref_blk);
+                        builder.seal_block(deref_blk);
+                        state.current_block = Some(deref_blk);
+                        let loaded = builder.ins().load(
                             cl_types::I64,
                             MemFlags::trusted(),
                             table_ptr,
                             byte_off,
                         );
+                        builder.ins().jump(merge_blk, &[loaded]);
+
+                        builder.switch_to_block(merge_blk);
+                        builder.seal_block(merge_blk);
+                        // Keep `state.current_block` in sync with the builder's
+                        // insertion point so downstream tensor-cleanup emitters
+                        // (which gate on `current_block` + `is_block_filled`)
+                        // operate on the live merge block, not the now-filled
+                        // pre-branch block. Mirrors `compile_short_circuit` in
+                        // binary_ops.rs.
+                        state.current_block = Some(merge_blk);
+                        let tensor_ptr = builder.block_params(merge_blk)[0];
                         return Ok(tensor_ptr);
                     }
                 }

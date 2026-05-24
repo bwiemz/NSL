@@ -153,3 +153,41 @@ As of 2026-04-19 this is the third occurrence of the same failure mode in two da
 3. **Revised Option 3's precondition claim** (Task 0) verified via inference-path placement probe.
 
 The recurrence suggests the rule is being applied in retrospect (when a blocker surfaces the violation), not proactively during spec/verification prep. The rule is correct; the *timing* of its application is the gap. Whether this warrants codifying a separate discipline ("always ask B.5's three questions during verification prep, not after") is an open question — two more instances would confirm; one occurrence doesn't yet.
+
+---
+
+## B.6 -- Re-validate a measurement-gated trigger against a clean baseline before scheduling the milestone
+
+**Discovered during WRGA B.3.2 resolution (2026-05-23); composes B.3 ("test the scale you target") with a temporal corollary.**
+
+A measurement-gated milestone trigger fires on a *number*. If that number was produced on a substrate the measurement depends on — and that substrate has known defects or has changed since — the trigger fired on an artifact, not on the phenomenon it was designed to detect. Before scheduling the milestone, **re-take the measurement on a clean substrate and re-evaluate the trigger.**
+
+### Concrete B.3.2 instantiation
+
+The B.3.2 trigger condition was `backward_time > 2.5x forward_time`. It "fired" at **106x** on 2026-04-19. But that reading was taken before three substrate fixes the measurement depended on:
+
+1. **The matmul primitive** was the naive `nsl_matmul_f32` (~1-2 TFLOPs/s, ~15-30x below peak); the cuBLAS swap landed afterward.
+2. **The backward path** was suspected of CPU-falling-back on some ops (the file's own follow-up #6: "50s/iter suggests CPU fallback or allocator thrash").
+3. **The kernel profiler** reported zero durations (`cuEventCreate` before context init) — so the only available signal was wall-clock with overhead baked in, not per-kernel GPU time.
+
+After all three were fixed, the clean per-op breakdown (2026-05-23) measured **backward = 0.37x forward** — the trigger does not fire. The milestone that the 106x reading "scheduled" would have optimized a 15%-of-GPU slice while the real bottleneck (the fused *forward* kernel, 73% of GPU) sat untouched. **The trigger fired on noise from a broken substrate.**
+
+### The diagnostic
+
+The 2026-04-21 addendum already sensed this — it qualified "schedule B.3.2" with "after per-op-profiling scoping," and noted twice that "optimizing the top-of-stack bottleneck surfaces the next layer." B.6 names the underlying rule: **a trigger's number inherits the validity of the substrate it was measured on.** When the substrate is known-defective or has changed, the number is provisional until re-measured. The "two-instances observation" in that addendum (each intervention surfacing a layer-below bottleneck) is the same phenomenon viewed from the measurement side.
+
+### Generalization
+
+The rule applies to any measurement-gated milestone trigger (CPDT Phase 2's 20%-disagreement gate, CSHA tier promotion thresholds, any "schedule X when metric Y crosses Z"):
+
+- Enumerate the substrate the metric depends on (primitives, fallback paths, profiler/timer validity, shapes, device placement).
+- If any substrate element is known-defective or has changed since the reading, the trigger is **provisional** — re-measure before acting.
+- Bake the substrate dependencies into the trigger spec itself, so a future reader knows which fixes invalidate an old reading.
+
+### Composition with B.3 and B.5
+
+- B.3: test the *scale* you target.
+- B.5: verify the *code path* you target, not a proxy.
+- B.6: re-measure the *trigger* on a clean substrate before you act on it.
+
+All three target the same institutional failure: **a number that passes its own test for reasons unrelated to the phenomenon the number was meant to capture.** B.3 catches it in shape coverage, B.5 in code-path attribution, B.6 in substrate validity over time.

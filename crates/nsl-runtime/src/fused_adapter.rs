@@ -44,8 +44,32 @@ use crate::tensor::arithmetic::{
 use crate::tensor::activation::nsl_tensor_sigmoid;
 use crate::tensor::fbip_flags::{RELINQUISH_A, RELINQUISH_B};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
+
+/// One-time warning latch for the unmaterialized-adapter fallback.
+static WARNED_UNMATERIALIZED_ADAPTER: AtomicBool = AtomicBool::new(false);
+
+/// Emit a one-time stderr warning when a fused-adapter FFI is called with
+/// null adapter tensors. This happens when `@adapter` is used in a
+/// forward-only / inference-only program: the side-table is materialized
+/// only inside a `train` block (`emit_adapter_init_sidetable`), so a
+/// forward-only program leaves the slots null. `expr/access.rs`'s null-base
+/// guard yields 0 for those fields, and the FFIs below fall back to the base
+/// `x @ W` forward rather than dereferencing null adapter tensors (which used
+/// to segfault). See
+/// docs/plans/2026-05-23-wrga-b4-fused-forward-staging-scope.md.
+fn warn_unmaterialized_adapter_once() {
+    if !WARNED_UNMATERIALIZED_ADAPTER.swap(true, Ordering::Relaxed) {
+        eprintln!(
+            "[nsl-wrga] @adapter field accessed before materialization (adapter \
+             tensors are null) - running base `x @ W` forward WITHOUT the adapter. \
+             Adapters materialize only inside a `train` block; there is no \
+             inference-only materialization path today. See \
+             docs/plans/2026-05-23-wrga-b4-fused-forward-staging-scope.md."
+        );
+    }
+}
 
 /// B.3 Task 5: side-channel counter for fused-adapter kernel launches.
 /// Increments once per call to a fused FFI (per call site, per invocation).
@@ -466,8 +490,15 @@ pub extern "C" fn nsl_adapter_fused_lora_matmul(
     scale: f64,
     kernel_handle: i64,
 ) -> i64 {
-    if x == 0 || w == 0 || lora_a == 0 || lora_b == 0 {
+    if x == 0 || w == 0 {
         return 0;
+    }
+    // Unmaterialized adapter (forward-only `@adapter`, no train block) — see
+    // the GatedLoRA path and access.rs null-base guard. Fall back to base
+    // `x @ W` instead of dereferencing null adapter tensors.
+    if lora_a == 0 || lora_b == 0 {
+        warn_unmaterialized_adapter_once();
+        return nsl_tensor_matmul(x, w, 0);
     }
     record_fused_launch();
 
@@ -497,8 +528,15 @@ pub extern "C" fn nsl_adapter_fused_ia3_matmul(
     ia3_scale: i64,
     kernel_handle: i64,
 ) -> i64 {
-    if x == 0 || w == 0 || ia3_scale == 0 {
+    if x == 0 || w == 0 {
         return 0;
+    }
+    // Unmaterialized adapter (forward-only `@adapter`, no train block) — see
+    // the GatedLoRA path and access.rs null-base guard. The IA3 scale
+    // multiplies the result, so the base forward without it is just `x @ W`.
+    if ia3_scale == 0 {
+        warn_unmaterialized_adapter_once();
+        return nsl_tensor_matmul(x, w, 0);
     }
     record_fused_launch();
 
@@ -741,8 +779,16 @@ pub extern "C" fn nsl_adapter_fused_gatedlora_matmul(
     gate: i64,
     kernel_handle: i64,
 ) -> i64 {
-    if x == 0 || w == 0 || lora_a == 0 || lora_b == 0 || gate == 0 {
+    if x == 0 || w == 0 {
         return 0;
+    }
+    // Unmaterialized adapter (forward-only `@adapter`, no train block) — the
+    // side-table base is null so `access.rs` yielded 0 for these fields.
+    // Fall back to the base `x @ W` forward instead of dereferencing null
+    // adapter tensors (which segfaulted).
+    if lora_a == 0 || lora_b == 0 || gate == 0 {
+        warn_unmaterialized_adapter_once();
+        return nsl_tensor_matmul(x, w, 0);
     }
     record_fused_launch();
 
