@@ -1068,8 +1068,12 @@ fn emit_dq_matmul_tiled(ptx: &mut String, config: &FlashAttentionConfig,
     let hd  = config.head_dim as u32;
     let ds_off = tier_b2_dq_ds_offset(config);
     let kcol_off = tier_b2_dq_k_colmajor_offset(config);
-    let ds_row_stride = (bkv * 2) as usize;    // dS f16 row-major
-    let kcol_col_stride = (bkv * 2) as usize;  // K_col f16 col-major
+    // Both equal bkv*2: dS is [bq_band, bkv] f16 (row pitch = bkv*2) and K_col is
+    // [hd_col, bkv] f16 (col pitch = bkv*2). They track DIFFERENT strides that happen
+    // to be numerically equal — keep them separate so a future SMEM-layout change to
+    // one does not silently corrupt the other.
+    let ds_row_stride = (bkv * 2) as usize;    // dS f16 row-major (kv columns per row)
+    let kcol_col_stride = (bkv * 2) as usize;  // K_col f16 col-major (kv rows per column)
     let n_n_tiles = hd / 8;
     let n_k_tiles = bkv / 16;
     let pct4 = |r: &[String;4]| [format!("%{}",r[0]),format!("%{}",r[1]),format!("%{}",r[2]),format!("%{}",r[3])];
@@ -1312,6 +1316,13 @@ fn emit_dq_finalize(ptx: &mut String, config: &FlashAttentionConfig) {
 
     let bq = tier_b2_effective_bq(config);
     let hd = config.head_dim as u32;
+    // KNOWN INTERMEDIATE STATE (Task 9 fixes this): emit_dq_acc_init and
+    // emit_dq_matmul_tiled now use hd/8 CONTIGUOUS n-tiles, but this finalize still
+    // uses the old hd/32 sparse-fragment indexing (frag_col_base = f*32). It therefore
+    // writes only n-tiles 0..hd/32-1 (cols {0-7, 32-39, ...}); cols 32..hd-1 of the
+    // accumulator are computed but not yet stored. Task 9 rewrites this to hd/8
+    // contiguous coverage. Not a bug — a deliberate bite-sized intermediate; no GPU
+    // run occurs until Task 11, after Task 9 lands.
     let accumulator_fragments = hd / 32;
 
     ptx.push_str("    // === G1: dQ HBM finalize addressing ===\n");
@@ -1486,11 +1497,9 @@ mod tests {
         // Per SPEC AMENDMENT: emit_dq_acc_init must respect effective_bq.
         // At hd=128 with raw block_q=64, effective_bq = 32 (SMEM-pressure fallback).
         let ptx = synthesize_dq_kernel(&canonical_cfg()).unwrap();
-        // The dQ accumulator init must use effective_bq for sizing.
-        // Concrete check: the accumulator register count should match
-        // hd/32 = 4 fragments x 4 f32/lane (independent of bq, but the scaffold
-        // should reference effective_bq for warp tiling).
-        // Loose check: must reference accumulators (e.g., %dq_acc_*)
+        // The dQ accumulator now has hd/8 contiguous n-tiles (see the dedicated
+        // synthesize_dq_kernel_dq_acc_is_hd_over_8_contiguous test for exact sizing).
+        // Loose check here: must reference accumulators (e.g., %dq_acc_*)
         assert!(ptx.contains("dq_acc"),
             "expected dQ accumulator register decls");
     }
