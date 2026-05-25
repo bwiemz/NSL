@@ -1443,27 +1443,34 @@ mod tests {
         // every bar.sync (a conditionally-skipped barrier deadlocks). Assert (a) compute
         // is gated by %p_warp_active, and (b) NO bar.sync sits between a
         // `@!%p_warp_active bra L` and its reconvergence label `L:`.
-        let ptx = synthesize_dq_kernel(&canonical_cfg()).unwrap();
-        assert!(ptx.contains("@!%p_warp_active bra"),
-            "compute must be gated by the warp-active predicate");
-        let lines: Vec<&str> = ptx.lines().collect();
-        let mut i = 0;
-        while i < lines.len() {
-            let t = lines[i].trim();
-            if let Some(rest) = t.strip_prefix("@!%p_warp_active bra ") {
-                let label = rest.trim_end_matches(';').trim().to_string();
-                let mut j = i + 1;
-                let mut found = false;
-                while j < lines.len() {
-                    let u = lines[j].trim();
-                    if u == format!("{label}:") { found = true; break; }
-                    assert!(!u.starts_with("bar.sync"),
-                        "bar.sync inside warp-active gate (deadlock at bq=32): line {j}: {u}");
-                    j += 1;
+        // The gates are emitted UNCONDITIONALLY for every config (idle warps only
+        // actually diverge at bq=32, the worst case). The loop also checks hd=64 so a
+        // future refactor cannot silently make the gate config-conditional.
+        for cfg in [canonical_cfg(), FlashAttentionConfig { head_dim: 64, ..canonical_cfg() }] {
+            let ptx = synthesize_dq_kernel(&cfg).unwrap();
+            assert!(ptx.contains("@!%p_warp_active bra"),
+                "compute must be gated by the warp-active predicate (hd={})", cfg.head_dim);
+            let lines: Vec<&str> = ptx.lines().collect();
+            let mut i = 0;
+            while i < lines.len() {
+                let t = lines[i].trim();
+                if let Some(rest) = t.strip_prefix("@!%p_warp_active bra ") {
+                    let label = rest.trim_end_matches(';').trim().to_string();
+                    let label_def = format!("{label}:");
+                    let mut j = i + 1;
+                    let mut found = false;
+                    while j < lines.len() {
+                        let u = lines[j].trim();
+                        // starts_with (not ==) tolerates a trailing comment on the label line.
+                        if u.starts_with(&label_def) { found = true; break; }
+                        assert!(!u.starts_with("bar.sync"),
+                            "bar.sync inside warp-active gate (deadlock at bq=32): line {j}: {u}");
+                        j += 1;
+                    }
+                    assert!(found, "reconvergence label {label}: not found after gate {i}");
                 }
-                assert!(found, "reconvergence label {label}: not found after gate {i}");
+                i += 1;
             }
-            i += 1;
         }
     }
 
