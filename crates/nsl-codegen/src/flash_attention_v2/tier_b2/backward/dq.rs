@@ -147,10 +147,12 @@ fn emit_register_decls(ptx: &mut String, _config: &FlashAttentionConfig) {
     // used in emit_ds_scatter_to_smem (called from emit_inner_loop_body).
     ptx.push_str("    .reg .u32 %f1_lane_mod4, %f1_lane_div4;\n");
     ptx.push_str("    .reg .u32 %f1_col_lo, %f1_col_hi, %f1_col_lo_b, %f1_col_hi_b;\n");
+    ptx.push_str("    .reg .u32 %f1_ntile_col;\n");
     ptx.push_str("    .reg .u32 %f1_row_lo_off, %f1_row_hi_off;\n");
     ptx.push_str("    .reg .u32 %f1_addr_lolo, %f1_addr_lohi, %f1_addr_hilo, %f1_addr_hihi;\n");
     ptx.push_str("    .reg .u64 %f1_smem_base64;\n");
     ptx.push_str("    .reg .u32 %f1_smem_base32;\n");
+    ptx.push_str("    .reg .b16 %ds_h0, %ds_h1, %ds_h2, %ds_h3;\n");
     // F2 col-major K re-stage scatter registers. Prefixed %f2_* to avoid clashes.
     // Per PTX ISA all .reg decls must precede executable instructions -- declared here,
     // used in emit_kcol_restage_scatter (called from emit_inner_loop_body).
@@ -742,8 +744,14 @@ fn emit_tile_skip_predicate(ptx: &mut String, config: &FlashAttentionConfig) {
 ///   ds_2 -> (row=t/4 + 8, col=(t%4)*2)
 ///   ds_3 -> (row=t/4 + 8, col=(t%4)*2 + 1)
 ///
-/// Row stride of the f32 dS tile: `effective_bkv * 4` bytes.
+/// Row stride of the f16 dS tile: `effective_bkv * 2` bytes (spec bug #2 fix:
+/// the dQ A-fragment reads dS as packed f16 via `emit_load_a_fragment_smem`, so
+/// dS is stored f16, not f32; Task 1 re-sized the dS band to `bq*bkv*2`).
 /// Destination: SMEM at `tier_b2_dq_ds_offset(config)`.
+///
+/// Absolute row = `band_row_base + lane/4` (lo) / `+8` (hi); absolute column =
+/// `n_tile*8 + (lane%4)*2` (lo) / `+1` (hi), so each warp band scatters into its
+/// own 16 Q-rows and each n-tile into its own 8 kv-columns.
 ///
 /// All `%f1_*` scratch registers are declared in `emit_register_decls` (PTX ISA
 /// requires all `.reg` declarations to precede executable instructions).
@@ -754,19 +762,19 @@ fn emit_ds_scatter_to_smem(ptx: &mut String, config: &FlashAttentionConfig) {
 
     let ds_off = tier_b2_dq_ds_offset(config);
     let bkv = tier_b2_effective_bkv(config);
-    let row_stride = bkv * 4; // f32 row-major dS tile row stride in bytes
+    let row_stride = bkv * 2; // f16 row-major dS tile row stride in bytes
 
-    ptx.push_str("    // === F1: Scatter dS to SMEM (row-major f32 tile at ds_offset) ===\n");
-    ptx.push_str("    // Per PTX m16n8 D-frag layout per lane t:\n");
-    ptx.push_str("    //   ds_0 -> (row=t/4,   col=(t%4)*2)\n");
-    ptx.push_str("    //   ds_1 -> (row=t/4,   col=(t%4)*2+1)\n");
-    ptx.push_str("    //   ds_2 -> (row=t/4+8, col=(t%4)*2)\n");
-    ptx.push_str("    //   ds_3 -> (row=t/4+8, col=(t%4)*2+1)\n");
+    ptx.push_str("    // === F1: Scatter dS to SMEM (row-major f16 tile at ds_offset) ===\n");
+    ptx.push_str("    // Per PTX m16n8 D-frag layout per lane t (band b = warp band, n = n_tile):\n");
+    ptx.push_str("    //   ds_0 -> (row=band_row_base+t/4,   col=n_tile*8+(t%4)*2)\n");
+    ptx.push_str("    //   ds_1 -> (row=band_row_base+t/4,   col=n_tile*8+(t%4)*2+1)\n");
+    ptx.push_str("    //   ds_2 -> (row=band_row_base+t/4+8, col=n_tile*8+(t%4)*2)\n");
+    ptx.push_str("    //   ds_3 -> (row=band_row_base+t/4+8, col=n_tile*8+(t%4)*2+1)\n");
 
     // Obtain SMEM base as u32 shared-space address.
     // cvta.shared.u64 converts the shmem symbol to a 64-bit generic address;
     // cvt.u32.u64 truncates to the 32-bit shared-space address form used by
-    // st.shared.f32 [%u32_addr].
+    // st.shared.b16 [%u32_addr].
     ptx.push_str("    cvta.shared.u64 %f1_smem_base64, shmem;\n");
     ptx.push_str("    cvt.u32.u64 %f1_smem_base32, %f1_smem_base64;\n");
 
@@ -774,19 +782,19 @@ fn emit_ds_scatter_to_smem(ptx: &mut String, config: &FlashAttentionConfig) {
     ptx.push_str("    and.b32 %f1_lane_mod4, %lane_id, 3;  // lane%4\n");
     ptx.push_str("    shr.u32 %f1_lane_div4, %lane_id, 2;\n");
 
-    // col_lo = (t%4)*2  (f32 column index of ds_0/ds_2)
-    ptx.push_str("    shl.b32 %f1_col_lo, %f1_lane_mod4, 1;       // col_lo = (t%4)*2\n");
-    // col_hi = col_lo + 1  (f32 column index of ds_1/ds_3)
+    // abs col_lo = n_tile*8 + (lane%4)*2 ; col_hi = +1   (mul+add, NOT mad.lo per ISA 7.0)
+    ptx.push_str("    shl.b32 %f1_col_lo, %f1_lane_mod4, 1;          // (lane%4)*2\n");
+    ptx.push_str("    mul.lo.u32 %f1_ntile_col, %n_tile, 8;\n");
+    ptx.push_str("    add.u32 %f1_col_lo, %f1_col_lo, %f1_ntile_col;  // + n_tile*8\n");
     ptx.push_str("    add.u32 %f1_col_hi, %f1_col_lo, 1;\n");
-    // Convert column indices to byte offsets within row (f32 = 4 bytes each).
-    ptx.push_str("    shl.b32 %f1_col_lo_b, %f1_col_lo, 2;        // col_lo * 4 bytes\n");
-    ptx.push_str("    shl.b32 %f1_col_hi_b, %f1_col_hi, 2;        // col_hi * 4 bytes\n");
+    ptx.push_str("    shl.b32 %f1_col_lo_b, %f1_col_lo, 1;            // col_lo * 2 bytes (f16)\n");
+    ptx.push_str("    shl.b32 %f1_col_hi_b, %f1_col_hi, 1;            // col_hi * 2 bytes (f16)\n");
 
-    // Row byte offsets: row_lo = t/4, row_hi = t/4 + 8.
-    ptx.push_str(&format!("    mul.lo.u32 %f1_row_lo_off, %f1_lane_div4, {row_stride};  // (t/4) * row_stride\n"));
-    // row_hi_off = (t/4 + 8) * row_stride = row_lo_off + 8*row_stride
-    ptx.push_str(&format!("    add.u32 %f1_row_hi_off, %f1_row_lo_off, {};              // + 8 * row_stride\n",
-        8 * row_stride));
+    // abs row_lo = band_row_base + lane/4 ; row_hi = +8.
+    ptx.push_str("    add.u32 %f1_lane_div4, %f1_lane_div4, %band_row_base;\n");
+    ptx.push_str(&format!("    mul.lo.u32 %f1_row_lo_off, %f1_lane_div4, {row_stride};\n"));
+    // row_hi_off = (row_lo + 8) * row_stride = row_lo_off + 8*row_stride
+    ptx.push_str(&format!("    add.u32 %f1_row_hi_off, %f1_row_lo_off, {};\n", 8 * row_stride));
 
     // 4 SMEM destination addresses: f1_smem_base32 + ds_off + row_off + col_off_b.
     // addr_lolo: ds_0 -> (row_lo, col_lo)
@@ -806,12 +814,17 @@ fn emit_ds_scatter_to_smem(ptx: &mut String, config: &FlashAttentionConfig) {
     ptx.push_str("    add.u32 %f1_addr_hihi, %f1_addr_hihi, %f1_row_hi_off;\n");
     ptx.push_str("    add.u32 %f1_addr_hihi, %f1_addr_hihi, %f1_col_hi_b;\n");
 
-    // 4 stores: scatter dS values into the row-major dS tile in SMEM.
-    ptx.push_str("    st.shared.f32 [%f1_addr_lolo], %ds_0;\n");
-    ptx.push_str("    st.shared.f32 [%f1_addr_lohi], %ds_1;\n");
-    ptx.push_str("    st.shared.f32 [%f1_addr_hilo], %ds_2;\n");
-    ptx.push_str("    st.shared.f32 [%f1_addr_hihi], %ds_3;\n");
-    ptx.push_str("    bar.sync 0;  // dS scatter visible to all warps\n");
+    // 4 stores: convert each f32 dS value to f16, scatter into the row-major dS
+    // tile in SMEM (the dQ A-fragment reads it as packed f16).
+    ptx.push_str("    cvt.rn.f16.f32 %ds_h0, %ds_0;\n");
+    ptx.push_str("    st.shared.b16 [%f1_addr_lolo], %ds_h0;\n");
+    ptx.push_str("    cvt.rn.f16.f32 %ds_h1, %ds_1;\n");
+    ptx.push_str("    st.shared.b16 [%f1_addr_lohi], %ds_h1;\n");
+    ptx.push_str("    cvt.rn.f16.f32 %ds_h2, %ds_2;\n");
+    ptx.push_str("    st.shared.b16 [%f1_addr_hilo], %ds_h2;\n");
+    ptx.push_str("    cvt.rn.f16.f32 %ds_h3, %ds_3;\n");
+    ptx.push_str("    st.shared.b16 [%f1_addr_hihi], %ds_h3;\n");
+    // NOTE: no bar.sync here — Task 8's single block barrier before the dQ matmul orders this scatter.
 }
 
 /// F2: Emit the col-major K re-stage scatter (Path A, strongest treatment).
@@ -1169,11 +1182,12 @@ fn emit_inner_loop_body(ptx: &mut String, config: &FlashAttentionConfig) {
     }
     ptx.push('\n');
 
-    // === Scatter dS to SMEM at tier_b2_dq_ds_offset (row-major f32) ===
+    // === Scatter dS to SMEM at tier_b2_dq_ds_offset (row-major f16) ===
     //
-    // The dQ-update MMA's A-fragment reads dS from SMEM, so each lane writes its
-    // 4 dS values to the row-major dS band at tier_b2_dq_ds_offset.
-    // F1: real per-lane st.shared.f32 emission (bar.sync included inside helper).
+    // The dQ-update MMA's A-fragment reads dS from SMEM as packed f16, so each
+    // lane converts and writes its 4 dS values (cvt.rn.f16.f32 + st.shared.b16)
+    // into its warp band / n-tile slot of the dS band at tier_b2_dq_ds_offset.
+    // No bar.sync here — Task 8's single block barrier orders the scatter.
     use crate::flash_attention_v2::smem_layout::{
         tier_b2_dq_ds_offset, tier_b2_dq_k_colmajor_offset,
     };
@@ -1772,5 +1786,22 @@ mod tests {
         // The stub single-stat regs must be gone.
         assert!(!ptx.contains("%f_rmax") && !ptx.contains("%f_d_q"),
             "stub single-stat regs must be removed");
+    }
+
+    #[test]
+    fn synthesize_dq_kernel_scatters_ds_as_f16() {
+        let ptx = synthesize_dq_kernel(&canonical_cfg()).unwrap();
+        // dtype: dS must be converted f32->f16 and stored as b16 (NOT f32).
+        assert_eq!(ptx.matches("cvt.rn.f16.f32").count() >= 4, true,
+            "dS scatter must convert all 4 fragment values f32->f16");
+        assert!(ptx.contains("st.shared.b16"), "dS scatter must store f16 (b16)");
+        assert!(!ptx.contains("st.shared.f32 [%f1_addr"),
+            "dS scatter must no longer store f32");
+        // address must fold the warp-band row and the per-n-tile column.
+        assert!(ptx.contains("%band_row_base"), "dS scatter row must add band_row_base");
+        assert!(ptx.contains("mul.lo.u32") && ptx.contains("%n_tile"),
+            "dS scatter col must add n_tile*8 (mul.lo.u32 + add, NOT mad.lo)");
+        // ISA 7.0: no mad.lo anywhere in the kernel.
+        assert!(!ptx.contains("mad.lo"), "mad.lo is invalid in PTX ISA 7.0");
     }
 }
