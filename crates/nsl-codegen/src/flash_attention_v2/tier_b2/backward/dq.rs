@@ -677,19 +677,21 @@ fn emit_v_producer_load(ptx: &mut String, config: &FlashAttentionConfig) {
 }
 
 fn emit_dq_acc_init(ptx: &mut String, config: &FlashAttentionConfig) {
-    // Per SPEC AMENDMENT: use tier_b2_effective_bq for any block_q-dependent
-    // sizing. accumulator_fragments = head_dim / 32 (independent of bq, but
-    // we reference effective_bq to honor the per-hd fallback for warp tiling).
+    // dQ_acc is indexed by hd/8 CONTIGUOUS n-tiles (was the old sparse hd/32
+    // scheme). Each n-tile is an 8-wide head-dim output column owning 4 f32/lane.
+    // The tiled dQ matmul (emit_dq_matmul_tiled) accumulates into all hd/8 n-tiles
+    // across both k and kv_iter, so these are zeroed ONCE here (before the kv loop).
+    // effective_bq referenced only for the comment's per-hd warp-tiling note.
     let effective_bq = tier_b2_effective_bq(config);
-    let accumulator_fragments = (config.head_dim / 32) as u32;
+    let n_acc = (config.head_dim / 8) as u32;
     ptx.push_str(&format!(
-        "    // Zero dQ accumulator regs ({} fragments x 4 f32/lane; effective_bq={})\n",
-        accumulator_fragments, effective_bq,
+        "    // Zero dQ accumulator regs (hd/8={} contiguous n-tiles x 4 f32/lane; effective_bq={})\n",
+        n_acc, effective_bq,
     ));
-    for f in 0..accumulator_fragments {
+    for n in 0..n_acc {
         for r in 0..4 {
-            ptx.push_str(&format!("    .reg .f32 %dq_acc_{}_{};\n", f, r));
-            ptx.push_str(&format!("    mov.f32 %dq_acc_{}_{}, 0.0;\n", f, r));
+            ptx.push_str(&format!("    .reg .f32 %dq_acc_{}_{};\n", n, r));
+            ptx.push_str(&format!("    mov.f32 %dq_acc_{}_{}, 0.0;\n", n, r));
         }
     }
 }
@@ -1042,25 +1044,58 @@ fn emit_dp_matmul_tiled(
     }
 }
 
+/// Emit the fully codegen-unrolled tiled dQ += dS @ K matmul.
+///
+/// Output is tiled over `hd/8` n-tiles (head-dim output columns) x `bkv/16`
+/// k-tiles (contraction over the kv axis). Each (n, k) pair issues one
+/// m16n8k16 MMA whose:
+///   - A-fragment is dS (f16, row-major) at `tier_b2_dq_ds_offset`, with the
+///     warp-band row offset folded in via the runtime `%band_row_base`;
+///   - B-fragment is K re-staged col-major at `tier_b2_dq_k_colmajor_offset`,
+///     so the MMA computes A @ B = dS @ K (NOT dS @ K^T);
+///   - C = D = `%dq_acc_{n}_*` (MAC) — the accumulator is register-resident and
+///     zeroed ONCE by emit_dq_acc_init before the kv loop, so this function does
+///     NOT re-zero it (it accumulates across both k AND the kv_iter loop).
+///
+/// The A-base uses the runtime `%band_row_base` (mul+add into `%a_base`); the
+/// B-base is a compile-time constant passed directly as the base string.
+fn emit_dq_matmul_tiled(ptx: &mut String, config: &FlashAttentionConfig,
+                        a_regs: &[String;4], b_regs: &[String;2]) {
+    use crate::matmul_mma::{emit_load_a_fragment_smem, emit_load_b_fragment_smem, emit_mma_instruction};
+    use crate::flash_attention_v2::smem_layout::{
+        tier_b2_dq_ds_offset, tier_b2_dq_k_colmajor_offset, tier_b2_effective_bkv};
+    let bkv = tier_b2_effective_bkv(config);
+    let hd  = config.head_dim as u32;
+    let ds_off = tier_b2_dq_ds_offset(config);
+    let kcol_off = tier_b2_dq_k_colmajor_offset(config);
+    let ds_row_stride = (bkv * 2) as usize;    // dS f16 row-major
+    let kcol_col_stride = (bkv * 2) as usize;  // K_col f16 col-major
+    let n_n_tiles = hd / 8;
+    let n_k_tiles = bkv / 16;
+    let pct4 = |r: &[String;4]| [format!("%{}",r[0]),format!("%{}",r[1]),format!("%{}",r[2]),format!("%{}",r[3])];
+    let pct2 = |r: &[String;2]| [format!("%{}",r[0]),format!("%{}",r[1])];
+    for n in 0..n_n_tiles {
+        let dq = [format!("%dq_acc_{n}_0"), format!("%dq_acc_{n}_1"),
+                  format!("%dq_acc_{n}_2"), format!("%dq_acc_{n}_3")];
+        for k in 0..n_k_tiles {
+            // A base = ds_off + band_row_base*bkv*2 + k*16*2  (runtime band_row_base)
+            ptx.push_str(&format!("    mul.lo.u32 %a_base, %band_row_base, {};\n", bkv * 2));
+            ptx.push_str(&format!("    add.u32 %a_base, %a_base, {};\n", ds_off + k * 16 * 2));
+            // B base = kcol_off + n*8*bkv*2 + k*16*2  (compile-time constant; pass directly)
+            let b_base = kcol_off + n * 8 * bkv * 2 + k * 16 * 2;
+            emit_load_a_fragment_smem(ptx, a_regs, "%a_base", ds_row_stride);
+            emit_load_b_fragment_smem(ptx, b_regs, &format!("{}", b_base), kcol_col_stride);
+            emit_mma_instruction(ptx, &dq, &pct4(a_regs), &pct2(b_regs), &dq); // C=D=dq_acc (MAC, no zeroing)
+        }
+    }
+}
+
 fn emit_inner_loop_body(ptx: &mut String, config: &FlashAttentionConfig) {
-    use crate::matmul_mma::{
-        emit_load_a_fragment_smem, emit_load_b_fragment_smem, emit_mma_instruction,
-    };
     use crate::flash_attention_v2::smem_layout::tier_b2_effective_bkv;
 
-    // Convention: emit_load_{a,b}_fragment_smem take register names WITHOUT `%`
-    // prefix (they prepend `%` internally in `ld.shared` instructions).
-    // emit_mma_instruction uses names verbatim — callers MUST supply `%` prefix.
-    // Use pct4/pct2 to build the prefixed variants right before each MMA call.
-    let pct4 = |rs: &[String; 4]| -> [String; 4] {
-        [
-            format!("%{}", rs[0]), format!("%{}", rs[1]),
-            format!("%{}", rs[2]), format!("%{}", rs[3]),
-        ]
-    };
-    let pct2 = |rs: &[String; 2]| -> [String; 2] {
-        [format!("%{}", rs[0]), format!("%{}", rs[1])]
-    };
+    // Note: the S and dP MMA chains are emitted by emit_s_matmul_tiled /
+    // emit_dp_matmul_tiled, and the dQ matmul by emit_dq_matmul_tiled — each of
+    // those helpers owns its own `%`-prefixing closures, so none are needed here.
 
     let hd = config.head_dim as u32;
     let _ = hd; // hd used indirectly via emit_s_matmul_tiled / emit_dp_matmul_tiled
@@ -1188,9 +1223,6 @@ fn emit_inner_loop_body(ptx: &mut String, config: &FlashAttentionConfig) {
     // lane converts and writes its 4 dS values (cvt.rn.f16.f32 + st.shared.b16)
     // into its warp band / n-tile slot of the dS band at tier_b2_dq_ds_offset.
     // No bar.sync here — Task 8's single block barrier orders the scatter.
-    use crate::flash_attention_v2::smem_layout::{
-        tier_b2_dq_ds_offset, tier_b2_dq_k_colmajor_offset,
-    };
     ptx.push_str("    // === Scatter dS to SMEM ===\n");
     emit_ds_scatter_to_smem(ptx, config);
     ptx.push('\n');
@@ -1215,46 +1247,29 @@ fn emit_inner_loop_body(ptx: &mut String, config: &FlashAttentionConfig) {
     emit_kcol_restage_scatter(ptx, config);
     ptx.push('\n');
 
-    // === dQ_acc += dS @ K (m16n8k16, B-frag from col-major K re-stage) ===
+    // === dQ_acc += dS @ K (tiled m16n8k16, B-frag from col-major K re-stage) ===
     //
-    // A-frag: dS, row-major in SMEM at tier_b2_dq_ds_offset.
+    // A-frag: dS, f16 row-major in SMEM at tier_b2_dq_ds_offset (band_row_base base).
     // B-frag: K, col-major-staged in SMEM at tier_b2_dq_k_colmajor_offset.
-    //         col_stride_bytes = effective_bkv * 2 (f16 between adjacent
-    //         head-dim columns in the col-major band).
-    // The post-revert 4-arg emit_load_b_fragment_smem reads col-major SMEM
-    // → col-major B-frag → the MMA computes A @ B = dS @ K (NOT dS @ K^T).
-    // Output accumulates into %dq_acc_0_{0..3} (the existing dQ accumulator
-    // register family from emit_dq_acc_init).
-    ptx.push_str("    // === dQ_acc += dS @ K (m16n8k16, B-frag from col-major K re-stage) ===\n");
+    //         The 4-arg emit_load_b_fragment_smem reads col-major SMEM → col-major
+    //         B-frag → the MMA computes A @ B = dS @ K (NOT dS @ K^T).
+    // Fully codegen-unrolled over hd/8 output n-tiles x bkv/16 k-tiles, accumulating
+    // into %dq_acc_{n}_{0..3} (C=D=dq_acc → MAC, across both k and the kv_iter loop;
+    // NOT re-zeroed here — zeroed once by emit_dq_acc_init before the kv loop).
+    // The K re-stage's trailing bar.sync (DQ_KCOL_RESTAGE_DONE) is the block barrier
+    // that orders K_col before this matmul — no new bar.sync is added.
+    ptx.push_str("    // === dQ_acc += dS @ K (tiled m16n8k16, B-frag from col-major K re-stage) ===\n");
 
-    let dq_a_regs: [String; 4] = ["dq_a0", "dq_a1", "dq_a2", "dq_a3"]
-        .iter().map(|s| s.to_string()).collect::<Vec<_>>().try_into().unwrap();
-    let dq_b_regs: [String; 2] = ["dq_b0", "dq_b1"]
-        .iter().map(|s| s.to_string()).collect::<Vec<_>>().try_into().unwrap();
-    for r in &dq_a_regs {
-        ptx.push_str(&format!("    .reg .b32 %{};\n", r));
-    }
-    for r in &dq_b_regs {
-        ptx.push_str(&format!("    .reg .b32 %{};\n", r));
-    }
+    ptx.push_str("    .reg .b32 %dq_a0;\n");
+    ptx.push_str("    .reg .b32 %dq_a1;\n");
+    ptx.push_str("    .reg .b32 %dq_a2;\n");
+    ptx.push_str("    .reg .b32 %dq_a3;\n");
+    ptx.push_str("    .reg .b32 %dq_b0;\n");
+    ptx.push_str("    .reg .b32 %dq_b1;\n");
 
-    let bkv_eff = tier_b2_effective_bkv(config);
-    let k_col_off = tier_b2_dq_k_colmajor_offset(config);
-    let ds_off_expr = format!("{}", tier_b2_dq_ds_offset(config));
-    let k_col_off_expr = format!("{}", k_col_off);
-    let ds_row_stride = (tier_b2_effective_bkv(config) * 4) as usize; // dS is f32 row-major; use effective_bkv (post Path-A fallback), not raw block_kv
-    let bkv_eff_col_stride = (bkv_eff * 2) as usize;    // col stride of col-major K band
-
-    emit_load_a_fragment_smem(ptx, &dq_a_regs, &ds_off_expr, ds_row_stride);
-    emit_load_b_fragment_smem(ptx, &dq_b_regs, &k_col_off_expr, bkv_eff_col_stride);
-
-    // Accumulate into %dq_acc_0_{0..3} (D and C both = dq_acc → MAC).
-    // emit_mma_instruction uses names verbatim — build %-prefixed dq_acc array.
-    let dq_d_regs: [String; 4] = [
-        "%dq_acc_0_0".into(), "%dq_acc_0_1".into(),
-        "%dq_acc_0_2".into(), "%dq_acc_0_3".into(),
-    ];
-    emit_mma_instruction(ptx, &dq_d_regs, &pct4(&dq_a_regs), &pct2(&dq_b_regs), &dq_d_regs);
+    let dq_a = ["dq_a0","dq_a1","dq_a2","dq_a3"].map(String::from);
+    let dq_b = ["dq_b0","dq_b1"].map(String::from);
+    emit_dq_matmul_tiled(ptx, config, &dq_a, &dq_b);
     ptx.push('\n');
 
     ptx.push_str("DS_SKIP_LABEL:\n");
@@ -1581,19 +1596,40 @@ mod tests {
     }
 
     #[test]
+    fn synthesize_dq_kernel_dq_acc_is_hd_over_8_contiguous() {
+        // hd=128 -> bq=bkv=32. dQ_acc has hd/8 = 16 contiguous n-tiles (indices 0..15),
+        // replacing the old sparse hd/32 = 4 scheme. The tiled dQ matmul accumulates
+        // into ALL 16 n-tiles (the old single-tile version wrote only %dq_acc_0_*).
+        let cfg = FlashAttentionConfig { head_dim: 128, ..canonical_cfg() };
+        let ptx = synthesize_dq_kernel(&cfg).unwrap();
+        assert!(ptx.contains("%dq_acc_15_3"),
+            "expected hd/8=16 dQ accumulator n-tiles (last index 15)");
+        assert!(ptx.contains("%dq_acc_15_0"),
+            "tiled dQ matmul must accumulate into the last n-tile (not just n-tile 0)");
+        // single block barrier (from the K re-stage) precedes the dQ matmul:
+        assert!(ptx.contains("bar.sync 0"), "expected block barrier before dQ matmul");
+        // emitted MMA count: S(hd/16=8, runtime-looped) + dP(hd/16=8) + dQ((hd/8)*(bkv/16)=16*2=32,
+        // codegen-unrolled) = 48. bkv=32 effective at hd=128.
+        let mma = ptx.matches("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32").count();
+        assert_eq!(mma, 8 + 8 + 32, "S(8)+dP(8)+dQ(32)=48 emitted MMAs at hd=128, got {mma}");
+    }
+
+    #[test]
     fn synthesize_dq_kernel_emits_expected_mma_count() {
-        // Formula (post-Task-6): 2*(hd/16) + 1
+        // Formula (post-Task-8): hd/16 + hd/16 + (hd/8)*(bkv/16)
         //   S = Q@K^T:  hd/16 k-tiles (codegen-unrolled inside DQ_NTILE_LOOP)
-        //   dP = dO@V^T: hd/16 k-tiles (codegen-unrolled, same pattern — Task 6)
-        //   dQ-update:   1 single-tile MMA (dS @ K col-major)
-        // At canonical_cfg hd=128: 2*(128/16)+1 = 17.
+        //   dP = dO@V^T: hd/16 k-tiles (codegen-unrolled, same pattern)
+        //   dQ-update:   (hd/8) output n-tiles x (bkv/16) k-tiles, fully codegen-unrolled
+        // At canonical_cfg hd=128: bkv_eff=32, so 8 + 8 + 16*2 = 48.
+        use crate::flash_attention_v2::smem_layout::tier_b2_effective_bkv;
         let cfg = canonical_cfg();
         let ptx = synthesize_dq_kernel(&cfg).unwrap();
         let hd = cfg.head_dim as usize;
-        let expected = 2 * (hd / 16) + 1;
+        let bkv = tier_b2_effective_bkv(&cfg) as usize;
+        let expected = hd / 16 + hd / 16 + (hd / 8) * (bkv / 16);
         let mma_count = ptx.matches("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32").count();
         assert_eq!(mma_count, expected,
-            "expected 2*(hd/16) (S+dP tiled) + dQ-update = {expected} MMAs, got {mma_count}");
+            "expected S(hd/16) + dP(hd/16) + dQ((hd/8)*(bkv/16)) = {expected} MMAs, got {mma_count}");
     }
 
     #[test]
@@ -1758,11 +1794,12 @@ mod tests {
 
     #[test]
     fn synthesize_dq_kernel_tiles_dp_matmul() {
-        // hd=64: S unrolled hd/16=4 + dP unrolled hd/16=4 + dQ single 1 = 9 emitted MMAs.
+        // hd=64: bkv_eff=64. S unrolled hd/16=4 + dP unrolled hd/16=4 +
+        // dQ tiled (hd/8=8)*(bkv/16=4)=32 = 40 emitted MMAs (Task 8 tiled the dQ matmul).
         let cfg = FlashAttentionConfig { head_dim: 64, ..canonical_cfg() };
         let ptx = synthesize_dq_kernel(&cfg).unwrap();
         let mma = ptx.matches("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32").count();
-        assert_eq!(mma, 2 * (64 / 16) + 1, "S(4)+dP(4)+dQ(1)=9 emitted MMAs, got {mma}");
+        assert_eq!(mma, 4 + 4 + 8 * 4, "S(4)+dP(4)+dQ(32)=40 emitted MMAs, got {mma}");
         // dP B-frag base must derive from the runtime %n_tile (the load-bearing
         // tiled-vs-single-tile invariant), like S — assert the structure, not a comment.
         assert!(ptx.matches("mul.lo.u32 %b_base, %n_tile,").count() >= 2,

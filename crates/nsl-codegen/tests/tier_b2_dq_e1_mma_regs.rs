@@ -63,12 +63,14 @@ fn canonical_cfg() -> FlashAttentionConfig {
 /// like `{s_d0, ...}`.  Regression test: assert each MMA operand list uses `%`
 /// on every register.
 ///
-/// Post-Task-6: S=Q@K^T and dP=dO@V^T are both codegen-unrolled to hd/16 MMAs
-/// each (inside the runtime DQ_NTILE_LOOP); dQ-update stays single-tile.
-/// So emitted MMA headers = hd/16 (S) + hd/16 (dP) + 1 (dQ) = 2*(hd/16)+1.
-/// At hd=128: 2*(128/16)+1 = 17.
+/// Post-Task-8: S=Q@K^T and dP=dO@V^T are both codegen-unrolled to hd/16 MMAs
+/// each (inside the runtime DQ_NTILE_LOOP); the dQ-update is now ALSO fully
+/// codegen-unrolled over (hd/8) output n-tiles x (bkv/16) k-tiles.
+/// So emitted MMA headers = hd/16 (S) + hd/16 (dP) + (hd/8)*(bkv/16) (dQ).
+/// At hd=128 (bkv_eff=32): 8 + 8 + 16*2 = 48.
 #[test]
 fn mma_operand_lists_contain_percent_prefix() {
+    use nsl_codegen::flash_attention_v2::smem_layout::tier_b2_effective_bkv;
     let cfg = canonical_cfg();
     let ptx = synthesize_dq_kernel(&cfg).unwrap();
     // Collect every line that contains "mma.sync.aligned.m16n8k16" (the MMA header)
@@ -80,10 +82,12 @@ fn mma_operand_lists_contain_percent_prefix() {
         .filter(|(_, l)| l.contains("mma.sync.aligned.m16n8k16"))
         .map(|(i, _)| i)
         .collect();
-    let expected = 2 * (cfg.head_dim as usize / 16) + 1;
+    let hd = cfg.head_dim as usize;
+    let bkv = tier_b2_effective_bkv(&cfg) as usize;
+    let expected = hd / 16 + hd / 16 + (hd / 8) * (bkv / 16);
     assert_eq!(
         mma_header_indices.len(), expected,
-        "expected 2*(hd/16) (S+dP tiled) + dQ-update = {expected} MMA instructions; got {}: full PTX:\n{ptx}",
+        "expected S(hd/16) + dP(hd/16) + dQ((hd/8)*(bkv/16)) = {expected} MMA instructions; got {}: full PTX:\n{ptx}",
         mma_header_indices.len()
     );
     for &idx in &mma_header_indices {
