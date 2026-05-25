@@ -58,14 +58,15 @@ fn canonical_cfg() -> FlashAttentionConfig {
 
 // ── Issue 1: MMA operand % prefix ─────────────────────────────────────────────
 
-/// Every MMA instruction (S's hd/16 tiled k-tiles, dP, dQ-update) must emit
-/// operand lists with `%`-prefixed register names.  ptxas rejects bare names
+/// Every MMA instruction (S's hd/16 tiled k-tiles, dP's hd/16 tiled k-tiles, dQ-update)
+/// must emit operand lists with `%`-prefixed register names.  ptxas rejects bare names
 /// like `{s_d0, ...}`.  Regression test: assert each MMA operand list uses `%`
 /// on every register.
 ///
-/// Post-Task-5: S=Q@K^T's k-tile contraction is codegen-unrolled to hd/16 MMAs
-/// (emitted once inside the runtime DQ_NTILE_LOOP); dP + dQ-update stay
-/// single-tile (Tasks 6/7/8).  So emitted MMA headers = hd/16 (S) + 1 + 1.
+/// Post-Task-6: S=Q@K^T and dP=dO@V^T are both codegen-unrolled to hd/16 MMAs
+/// each (inside the runtime DQ_NTILE_LOOP); dQ-update stays single-tile.
+/// So emitted MMA headers = hd/16 (S) + hd/16 (dP) + 1 (dQ) = 2*(hd/16)+1.
+/// At hd=128: 2*(128/16)+1 = 17.
 #[test]
 fn mma_operand_lists_contain_percent_prefix() {
     let cfg = canonical_cfg();
@@ -79,10 +80,10 @@ fn mma_operand_lists_contain_percent_prefix() {
         .filter(|(_, l)| l.contains("mma.sync.aligned.m16n8k16"))
         .map(|(i, _)| i)
         .collect();
-    let expected = cfg.head_dim as usize / 16 + 2;
+    let expected = 2 * (cfg.head_dim as usize / 16) + 1;
     assert_eq!(
         mma_header_indices.len(), expected,
-        "expected hd/16 (S, tiled) + dP + dQ-update = {expected} MMA instructions; got {}: full PTX:\n{ptx}",
+        "expected 2*(hd/16) (S+dP tiled) + dQ-update = {expected} MMA instructions; got {}: full PTX:\n{ptx}",
         mma_header_indices.len()
     );
     for &idx in &mma_header_indices {
