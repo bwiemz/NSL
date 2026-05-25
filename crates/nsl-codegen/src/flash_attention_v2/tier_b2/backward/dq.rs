@@ -1316,14 +1316,7 @@ fn emit_dq_finalize(ptx: &mut String, config: &FlashAttentionConfig) {
 
     let bq = tier_b2_effective_bq(config);
     let hd = config.head_dim as u32;
-    // KNOWN INTERMEDIATE STATE (Task 9 fixes this): emit_dq_acc_init and
-    // emit_dq_matmul_tiled now use hd/8 CONTIGUOUS n-tiles, but this finalize still
-    // uses the old hd/32 sparse-fragment indexing (frag_col_base = f*32). It therefore
-    // writes only n-tiles 0..hd/32-1 (cols {0-7, 32-39, ...}); cols 32..hd-1 of the
-    // accumulator are computed but not yet stored. Task 9 rewrites this to hd/8
-    // contiguous coverage. Not a bug — a deliberate bite-sized intermediate; no GPU
-    // run occurs until Task 11, after Task 9 lands.
-    let accumulator_fragments = hd / 32;
+    let n_n_tiles = hd / 8;
 
     ptx.push_str("    // === G1: dQ HBM finalize addressing ===\n");
     ptx.push_str("    // Scatter dQ_acc registers to HBM dQ[B,H,S,D] row-major f32.\n");
@@ -1337,9 +1330,10 @@ fn emit_dq_finalize(ptx: &mut String, config: &FlashAttentionConfig) {
     // q_tile_start = q_iter * bq
     ptx.push_str(&format!("    mul.lo.u32 %g1_q_tile_start, %q_iter, {bq};\n"));
 
-    // row_lo = q_tile_start + lane/4      (the "lo" MMA row)
-    // row_hi = q_tile_start + lane/4 + 8  (the "hi" MMA row)
-    ptx.push_str("    add.u32 %g1_row_lo, %g1_q_tile_start, %g1_lane_div4;\n");
+    // row_lo = q_tile_start + band_row_base + lane/4      (the "lo" MMA row)
+    // row_hi = q_tile_start + band_row_base + lane/4 + 8  (the "hi" MMA row)
+    ptx.push_str("    add.u32 %g1_row_lo, %g1_q_tile_start, %band_row_base;\n");
+    ptx.push_str("    add.u32 %g1_row_lo, %g1_row_lo, %g1_lane_div4;\n");
     ptx.push_str("    add.u32 %g1_row_hi, %g1_row_lo, 8;\n");
 
     // col_lo = (lane%4) * 2
@@ -1350,10 +1344,10 @@ fn emit_dq_finalize(ptx: &mut String, config: &FlashAttentionConfig) {
     // Load the dQ HBM base pointer once.
     ptx.push_str("    ld.param.u64 %g1_dq_base, [d_q_out_ptr];\n");
 
-    for f in 0..accumulator_fragments {
-        let frag_col_base = f * 32;
+    for n in 0..n_n_tiles {
+        let frag_col_base = n * 8;
 
-        // For each of the 4 dq_acc registers in fragment f:
+        // For each of the 4 dq_acc registers in n-tile n:
         //   r=0: (row_lo, col_lo + frag_col_base)
         //   r=1: (row_lo, col_hi + frag_col_base)
         //   r=2: (row_hi, col_lo + frag_col_base)
@@ -1391,7 +1385,7 @@ fn emit_dq_finalize(ptx: &mut String, config: &FlashAttentionConfig) {
                 4, // f32 sizeof
             );
             ptx.push_str("    add.u64 %g1_dq_addr, %g1_dq_base, %g1_dq_byte_off;\n");
-            ptx.push_str(&format!("    st.global.f32 [%g1_dq_addr], %dq_acc_{f}_{r};\n"));
+            ptx.push_str(&format!("    st.global.f32 [%g1_dq_addr], %dq_acc_{n}_{r};\n"));
         }
     }
 
@@ -1849,5 +1843,21 @@ mod tests {
             "dS scatter col must add n_tile*8 (mul.lo.u32 + add, NOT mad.lo)");
         // ISA 7.0: no mad.lo anywhere in the kernel.
         assert!(!ptx.contains("mad.lo"), "mad.lo is invalid in PTX ISA 7.0");
+    }
+
+    #[test]
+    fn synthesize_dq_kernel_finalize_covers_full_band_probe2() {
+        // Probe 2 (structural): finalize must write the full 16xhd band, not the old
+        // sparse hd/32-at-32-col scheme. hd=128: hd/8=16 n-tiles x 4 stores = 64 st.global.f32.
+        let cfg = FlashAttentionConfig { head_dim: 128, ..canonical_cfg() };
+        let ptx = synthesize_dq_kernel(&cfg).unwrap();
+        let st = ptx.matches("st.global.f32").count();
+        assert_eq!(st, (128 / 8) * 4, "finalize must emit hd/8=16 n-tiles x 4 = 64 stores, got {st}");
+        // row must fold the warp-band base (else every warp writes warp-0's rows).
+        assert!(ptx.contains("add.u32 %g1_row_lo, %g1_q_tile_start, %band_row_base"),
+            "finalize row must add %band_row_base before lane/4");
+        // the last n-tile accumulator must reach finalize (proves all 16 n-tiles stored).
+        assert!(ptx.contains("%dq_acc_15_0") && ptx.contains("%dq_acc_15_3"),
+            "finalize must store the last n-tile (n=15)");
     }
 }
