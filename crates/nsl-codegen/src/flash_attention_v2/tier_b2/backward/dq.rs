@@ -119,6 +119,10 @@ fn emit_register_decls(ptx: &mut String, _config: &FlashAttentionConfig) {
     ptx.push_str("    .reg .pred %p_kv_iter_more;\n");
     // Scratch registers used by matmul_mma helpers (emit_load_a/b_fragment_smem).
     ptx.push_str("    .reg .u32 %mma_addr, %mma_a_row, %mma_b_row;\n");
+    // Runtime n-tile streaming loop (DQ_NTILE_LOOP) for the tiled S=Q@K^T matmul.
+    // %a_base/%b_base are the per-k-tile SMEM fragment bases recomputed each iter.
+    ptx.push_str("    .reg .u32 %n_tile, %num_n_tiles, %a_base, %b_base;\n");
+    ptx.push_str("    .reg .pred %p_ntile_more;\n");
     // D1 tile_skip predicate registers (causal: used; non-causal: declared but unused — ptxas tolerates).
     ptx.push_str("    .reg .u32 %q_tile_end, %kv_tile_start;\n");
     ptx.push_str("    .reg .pred %p_causal_active;\n");
@@ -921,12 +925,66 @@ fn emit_kcol_restage_scatter(ptx: &mut String, config: &FlashAttentionConfig) {
     ptx.push_str("    bar.sync 0;\n");
 }
 
+/// Emit the codegen-unrolled k-tile contraction for S = Q @ K^T for ONE runtime
+/// n_tile (the kv-column tile selected by the live `%n_tile` register).
+///
+/// The k-tile loop (`hd / 16` iterations) is UNROLLED at codegen time into a
+/// chain of m16n8k16 MMAs accumulating into `c_regs` (MAC: each iter's D feeds
+/// the next iter's C). The A-fragment base folds in the warp-band row offset
+/// (`%band_row_base`) so each warp reads its own 16-row Q band; the B-fragment
+/// base derives from the runtime `%n_tile` (each n-tile is 8 kv columns).
+///
+/// Row-major K[bkv, hd] byte-aliases to col-major K^T[hd, bkv] with
+/// col_stride = hd*2 (the 4-arg B-frag helper reads it correctly → Q @ K^T).
+fn emit_s_matmul_tiled(
+    ptx: &mut String,
+    config: &FlashAttentionConfig,
+    a_regs: &[String; 4],
+    b_regs: &[String; 2],
+    c_regs: &[String; 4],
+    d_regs: &[String; 4],
+) {
+    use crate::matmul_mma::{
+        emit_load_a_fragment_smem, emit_load_b_fragment_smem, emit_mma_instruction,
+    };
+    use crate::flash_attention_v2::smem_layout::{tier_b2_dq_q_offset, tier_b2_dq_k_offset};
+    let hd = config.head_dim as u32;
+    let row_stride = (hd * 2) as usize;
+    let q_off = tier_b2_dq_q_offset(config);
+    let k_off = tier_b2_dq_k_offset(config);
+    let n_k_tiles = hd / 16;
+    let pct4 = |r: &[String; 4]| {
+        [
+            format!("%{}", r[0]), format!("%{}", r[1]),
+            format!("%{}", r[2]), format!("%{}", r[3]),
+        ]
+    };
+    let pct2 = |r: &[String; 2]| [format!("%{}", r[0]), format!("%{}", r[1])];
+    for r in c_regs {
+        ptx.push_str(&format!("    mov.f32 %{r}, 0.0;\n"));
+    }
+    for k in 0..n_k_tiles {
+        // A base = q_off + band_row_base*hd*2 + k*16*2  (Q-band rows, k-tile cols)
+        ptx.push_str(&format!("    mul.lo.u32 %a_base, %band_row_base, {};\n", hd * 2));
+        ptx.push_str(&format!("    add.u32 %a_base, %a_base, {};\n", q_off + k * 16 * 2));
+        // B base = k_off + n_tile*8*hd*2 + k*16*2  (Kᵀ: kv columns via runtime %n_tile, hd k)
+        ptx.push_str(&format!("    mul.lo.u32 %b_base, %n_tile, {};\n", 8 * hd * 2));
+        ptx.push_str(&format!("    add.u32 %b_base, %b_base, {};\n", k_off + k * 16 * 2));
+        emit_load_a_fragment_smem(ptx, a_regs, "%a_base", row_stride);
+        emit_load_b_fragment_smem(ptx, b_regs, "%b_base", row_stride); // col_stride = hd*2 (row-major K byte-aliases Kᵀ)
+        emit_mma_instruction(ptx, &pct4(d_regs), &pct4(a_regs), &pct2(b_regs), &pct4(c_regs));
+        for (c, d) in c_regs.iter().zip(d_regs.iter()) {
+            ptx.push_str(&format!("    mov.f32 %{c}, %{d};\n")); // MAC: next k accumulates onto this D
+        }
+    }
+}
+
 fn emit_inner_loop_body(ptx: &mut String, config: &FlashAttentionConfig) {
     use crate::matmul_mma::{
         emit_load_a_fragment_smem, emit_load_b_fragment_smem, emit_mma_instruction,
     };
     use crate::flash_attention_v2::smem_layout::{
-        tier_b2_dq_q_offset, tier_b2_dq_k_offset, tier_b2_dq_dO_offset, tier_b2_dq_v_offset,
+        tier_b2_dq_dO_offset, tier_b2_dq_v_offset, tier_b2_effective_bkv,
     };
 
     // Convention: emit_load_{a,b}_fragment_smem take register names WITHOUT `%`
@@ -953,15 +1011,8 @@ fn emit_inner_loop_body(ptx: &mut String, config: &FlashAttentionConfig) {
     ptx.push_str("    @!%p_tile_active bra DS_SKIP_LABEL;\n");
     ptx.push('\n');
 
-    // === S = Q @ K^T (m16n8k16, B-frag col-major-presenting-as-K^T) ===
-    // Row-major K[bkv, hd] byte-aliases to col-major K^T[hd, bkv] with
-    // col_stride_bytes = hd * 2.  The existing 4-arg helper reads it correctly
-    // and produces Q @ K^T in the MMA output.
-    ptx.push_str("    // === S = Q @ K^T (m16n8k16, B-frag col-major byte-alias) ===\n");
-
-    let q_smem_base = format!("{}", tier_b2_dq_q_offset(config));
-    let k_smem_base = format!("{}", tier_b2_dq_k_offset(config));
-
+    // === S register family (declared ONCE, above the n-tile loop) ===
+    // %s_d0..3 stays the S result so the P-recompute (which reads %s_d0..3) is unchanged.
     let a_regs: [String; 4] = ["s_a0", "s_a1", "s_a2", "s_a3"]
         .iter()
         .map(|s| s.to_string())
@@ -999,17 +1050,22 @@ fn emit_inner_loop_body(ptx: &mut String, config: &FlashAttentionConfig) {
     for r in &d_regs {
         ptx.push_str(&format!("    .reg .f32 %{};\n", r));
     }
-    for r in &c_regs {
-        ptx.push_str(&format!("    mov.f32 %{}, 0.0;\n", r));
-    }
 
-    // Load Q tile as A-fragment (row-major, row_stride = hd * 2 bytes).
-    emit_load_a_fragment_smem(ptx, &a_regs, &q_smem_base, row_stride_bytes);
-    // Load K tile as B-fragment — row-major K[bkv, hd] with col_stride = hd * 2
-    // byte-aliases to col-major K^T[hd, bkv], producing Q @ K^T in the MMA.
-    emit_load_b_fragment_smem(ptx, &b_regs, &k_smem_base, row_stride_bytes);
-    // emit_mma_instruction uses names verbatim — pass %-prefixed variants.
-    emit_mma_instruction(ptx, &pct4(&d_regs), &pct4(&a_regs), &pct2(&b_regs), &pct4(&c_regs));
+    // === Open runtime n-tile streaming loop (DQ_NTILE_LOOP) ===
+    // One iteration per 8-column kv n-tile (bkv/8 iterations at runtime). The body
+    // computes S(tiled) → P-recompute → dP(single-tile) → dS → dS-scatter for the
+    // current %n_tile. dP/dS/scatter stay single-tile this task (Tasks 6/7/8 tile them).
+    let num_n_tiles = tier_b2_effective_bkv(config) / 8;
+    ptx.push_str(&format!("    mov.u32 %num_n_tiles, {num_n_tiles};\n"));
+    ptx.push_str("    mov.u32 %n_tile, 0;\n");
+    ptx.push_str("DQ_NTILE_LOOP:\n");
+
+    // === S = Q @ K^T (m16n8k16, k-tile contraction codegen-unrolled per n_tile) ===
+    // Row-major K[bkv, hd] byte-aliases to col-major K^T[hd, bkv] with
+    // col_stride_bytes = hd * 2.  The 4-arg B-frag helper reads it correctly and
+    // produces Q @ K^T.  A-frag base folds %band_row_base; B-frag base from %n_tile.
+    ptx.push_str("    // === S = Q @ K^T (tiled m16n8k16, k-tiles unrolled, per runtime n_tile) ===\n");
+    emit_s_matmul_tiled(ptx, config, &a_regs, &b_regs, &c_regs, &d_regs);
 
     // === P recompute (lane-by-lane, no SMEM) per spec §4.3 step 4 ===
     ptx.push_str("    // === P recompute: P[q,k] = exp(S[q,k] - row_max[q]) * row_sum_recip[q] ===\n");
@@ -1078,10 +1134,17 @@ fn emit_inner_loop_body(ptx: &mut String, config: &FlashAttentionConfig) {
     // 4 dS values to the row-major dS band at tier_b2_dq_ds_offset.
     // F1: real per-lane st.shared.f32 emission (bar.sync included inside helper).
     use crate::flash_attention_v2::smem_layout::{
-        tier_b2_dq_ds_offset, tier_b2_dq_k_colmajor_offset, tier_b2_effective_bkv,
+        tier_b2_dq_ds_offset, tier_b2_dq_k_colmajor_offset,
     };
     ptx.push_str("    // === Scatter dS to SMEM ===\n");
     emit_ds_scatter_to_smem(ptx, config);
+    ptx.push('\n');
+
+    // === Close runtime n-tile streaming loop (DQ_NTILE_LOOP) ===
+    // S → P → dP → dS → dS-scatter ran for this %n_tile; advance and branch back.
+    ptx.push_str("    add.u32 %n_tile, %n_tile, 1;\n");
+    ptx.push_str("    setp.lt.u32 %p_ntile_more, %n_tile, %num_n_tiles;\n");
+    ptx.push_str("    @%p_ntile_more bra DQ_NTILE_LOOP;\n");
     ptx.push('\n');
 
     // === F2: Col-major K re-stage (Path A, strongest treatment per spec §5.2-5.3 + §4.4) ===
@@ -1387,6 +1450,23 @@ mod tests {
     }
 
     #[test]
+    fn synthesize_dq_kernel_tiles_s_matmul() {
+        // hd=64: S's k-tile contraction is codegen-unrolled to hd/16=4 MMAs, emitted
+        // once inside the runtime n-tile loop (DQ_NTILE_LOOP iterates bkv/8 at runtime).
+        let cfg = FlashAttentionConfig { head_dim: 64, ..canonical_cfg() };
+        let ptx = synthesize_dq_kernel(&cfg).unwrap();
+        let mma = ptx.matches("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32").count();
+        // S contributes hd/16=4 unrolled k-tile MMAs; dP (still single-tile) + dQ (single)
+        // contribute a few more. Assert S alone raised the count to >= 4 emitted MMAs in
+        // the S section AND the n-tile loop + band offset exist.
+        assert!(mma >= 4, "S k-tile contraction must emit hd/16 MMAs, got {mma}");
+        assert!(ptx.contains("DQ_NTILE_LOOP"), "expected runtime n-tile streaming loop label");
+        assert!(ptx.contains("mul.lo.u32 %b_base, %n_tile,"),
+            "S K^T B-frag base must be computed from the runtime %n_tile");
+        assert!(ptx.contains("%band_row_base"), "S A-frag base must include warp-band offset");
+    }
+
+    #[test]
     fn synthesize_dq_kernel_emits_p_recompute() {
         let ptx = synthesize_dq_kernel(&canonical_cfg()).unwrap();
         // P = exp(S - row_max) * row_sum_recip — uses ex2.approx.f32 or exp
@@ -1447,10 +1527,16 @@ mod tests {
 
     #[test]
     fn synthesize_dq_kernel_emits_three_mmas_after_task_11() {
-        let ptx = synthesize_dq_kernel(&canonical_cfg()).unwrap();
-        // S + dP + dQ-update = 3 MMAs
+        let cfg = canonical_cfg();
+        let ptx = synthesize_dq_kernel(&cfg).unwrap();
+        // Post-Task-5: S=Q@K^T's k-tile contraction is codegen-unrolled to hd/16
+        // emitted MMAs (inside the runtime DQ_NTILE_LOOP); dP and dQ-update stay
+        // single-tile (Tasks 6/7/8 tile them). So emitted MMAs = hd/16 (S) + 1 (dP) + 1 (dQ).
+        let hd = cfg.head_dim as usize;
+        let expected = hd / 16 + 2;
         let mma_count = ptx.matches("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32").count();
-        assert_eq!(mma_count, 3, "expected exactly 3 MMAs (S + dP + dQ-update), got {}", mma_count);
+        assert_eq!(mma_count, expected,
+            "expected hd/16 (S, tiled) + dP + dQ-update = {expected} MMAs, got {mma_count}");
     }
 
     #[test]
