@@ -1155,6 +1155,11 @@ fn emit_inner_loop_body(ptx: &mut String, config: &FlashAttentionConfig) {
     // computes S(tiled) → P-recompute → dP(tiled) → dS → dS-scatter for the
     // current %n_tile. dS-scatter stays single-tile this task (Task 7 tiles it).
     let num_n_tiles = tier_b2_effective_bkv(config) / 8;
+    // Idle-warp gate (A): warps with warp_id >= bq/16 (warps 2-3 at bq=32, hd=128)
+    // skip the n-tile loop entirely. The loop has NO bar.sync inside, so skipping
+    // it is deadlock-safe; idle warps reconverge at DQ_IDLE_SKIP_NTILE and still
+    // fall through to the K-restage's trailing bar.sync (which sits AFTER the label).
+    ptx.push_str("    @!%p_warp_active bra DQ_IDLE_SKIP_NTILE;\n");
     ptx.push_str(&format!("    mov.u32 %num_n_tiles, {num_n_tiles};\n"));
     ptx.push_str("    mov.u32 %n_tile, 0;\n");
     ptx.push_str("DQ_NTILE_LOOP:\n");
@@ -1236,6 +1241,9 @@ fn emit_inner_loop_body(ptx: &mut String, config: &FlashAttentionConfig) {
     ptx.push_str("    add.u32 %n_tile, %n_tile, 1;\n");
     ptx.push_str("    setp.lt.u32 %p_ntile_more, %n_tile, %num_n_tiles;\n");
     ptx.push_str("    @%p_ntile_more bra DQ_NTILE_LOOP;\n");
+    // Idle-warp reconvergence (gate A). The K-restage's trailing bar.sync now sits
+    // AFTER this label, so all warps (including idle 2-3) reach it.
+    ptx.push_str("DQ_IDLE_SKIP_NTILE:\n");
     ptx.push('\n');
 
     // === F2: Col-major K re-stage (Path A, strongest treatment per spec §5.2-5.3 + §4.4) ===
@@ -1273,7 +1281,13 @@ fn emit_inner_loop_body(ptx: &mut String, config: &FlashAttentionConfig) {
 
     let dq_a = ["dq_a0","dq_a1","dq_a2","dq_a3"].map(String::from);
     let dq_b = ["dq_b0","dq_b1"].map(String::from);
+    // Idle-warp gate (B): warps 2-3 (bq=32) skip the dQ matmul. emit_dq_matmul_tiled
+    // has NO bar.sync, so skipping it is deadlock-safe; idle warps reconverge at
+    // DQ_IDLE_SKIP_DQ (placed before DS_SKIP_LABEL). They would otherwise compute
+    // garbage into %dq_acc_* for non-existent rows.
+    ptx.push_str("    @!%p_warp_active bra DQ_IDLE_SKIP_DQ;\n");
     emit_dq_matmul_tiled(ptx, config, &dq_a, &dq_b);
+    ptx.push_str("DQ_IDLE_SKIP_DQ:\n");
     ptx.push('\n');
 
     ptx.push_str("DS_SKIP_LABEL:\n");
@@ -1322,6 +1336,13 @@ fn emit_dq_finalize(ptx: &mut String, config: &FlashAttentionConfig) {
     ptx.push_str("    // Scatter dQ_acc registers to HBM dQ[B,H,S,D] row-major f32.\n");
     ptx.push_str("    // Per spec s2.1: byte_offset = (((b*H+h)*S+s)*D+d)*4.\n");
     ptx.push_str("    // Per-lane row/col scratch is computed once, reused across all fragments.\n");
+
+    // Idle-warp gate (C): warps 2-3 (bq=32, hd=128) own no live q-rows. They MUST
+    // skip the finalize stores or they would write OUT-OF-BOUNDS to HBM rows 32-63.
+    // There is no bar.sync between this gate and DQ_IDLE_SKIP_FINAL (the kernel ret's
+    // right after finalize — the former trailing bar.sync was removed as unnecessary),
+    // so the skip is deadlock-safe.
+    ptx.push_str("    @!%p_warp_active bra DQ_IDLE_SKIP_FINAL;\n");
 
     // Per-lane scratch: lane%4 and lane/4
     ptx.push_str("    and.b32 %g1_lane_mod4, %lane_id, 3;\n");
@@ -1389,7 +1410,10 @@ fn emit_dq_finalize(ptx: &mut String, config: &FlashAttentionConfig) {
         }
     }
 
-    ptx.push_str("    bar.sync 0;\n");
+    // Idle-warp reconvergence (gate C). No trailing bar.sync: the kernel ret's
+    // immediately after finalize, so a barrier here is unnecessary AND would
+    // deadlock if it sat inside the gate (idle warps 2-3 branch past the stores).
+    ptx.push_str("DQ_IDLE_SKIP_FINAL:\n");
 }
 
 fn emit_entry_close(ptx: &mut String) {
@@ -1410,6 +1434,36 @@ mod tests {
             gqa_group_size: 1, tree_mask: false,
             gpu_sm: 80, segment_masked: false,
             csha: Some(CshaExtras { level: 2, ..Default::default() }),
+        }
+    }
+
+    #[test]
+    fn synthesize_dq_kernel_gates_idle_warps_without_skipping_barriers() {
+        // bq=32 (hd=128): warps 2-3 idle. They must skip compute/stores but still hit
+        // every bar.sync (a conditionally-skipped barrier deadlocks). Assert (a) compute
+        // is gated by %p_warp_active, and (b) NO bar.sync sits between a
+        // `@!%p_warp_active bra L` and its reconvergence label `L:`.
+        let ptx = synthesize_dq_kernel(&canonical_cfg()).unwrap();
+        assert!(ptx.contains("@!%p_warp_active bra"),
+            "compute must be gated by the warp-active predicate");
+        let lines: Vec<&str> = ptx.lines().collect();
+        let mut i = 0;
+        while i < lines.len() {
+            let t = lines[i].trim();
+            if let Some(rest) = t.strip_prefix("@!%p_warp_active bra ") {
+                let label = rest.trim_end_matches(';').trim().to_string();
+                let mut j = i + 1;
+                let mut found = false;
+                while j < lines.len() {
+                    let u = lines[j].trim();
+                    if u == format!("{label}:") { found = true; break; }
+                    assert!(!u.starts_with("bar.sync"),
+                        "bar.sync inside warp-active gate (deadlock at bq=32): line {j}: {u}");
+                    j += 1;
+                }
+                assert!(found, "reconvergence label {label}: not found after gate {i}");
+            }
+            i += 1;
         }
     }
 
