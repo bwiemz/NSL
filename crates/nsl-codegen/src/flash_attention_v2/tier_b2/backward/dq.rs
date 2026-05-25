@@ -34,6 +34,7 @@ pub fn synthesize_dq_kernel(
     emit_entry_signature(&mut ptx);
     emit_register_decls(&mut ptx, config);
     emit_grid_id_setup(&mut ptx);
+    emit_warp_band_setup(&mut ptx, config);
     emit_q_iter_count_setup(&mut ptx, config);
     emit_kv_iter_count_setup(&mut ptx, config);
     emit_outer_loop_open(&mut ptx);
@@ -96,6 +97,8 @@ fn emit_register_decls(ptx: &mut String, _config: &FlashAttentionConfig) {
     // NOTE: user register named %r_tid (not %tid) to avoid shadowing the PTX special register
     // %tid (a vector); ptxas rejects %tid.x when %tid is declared as a user u32.
     ptx.push_str("    .reg .u32 %r_tid, %lane_id, %warp_id;\n");
+    ptx.push_str("    .reg .u32 %band_row_base;\n");
+    ptx.push_str("    .reg .pred %p_warp_active;\n");
     ptx.push_str("    .reg .u32 %q_tile, %kv_tile, %head, %batch_idx;\n");
     ptx.push_str("    .reg .pred %p_tile_active, %p_producer, %p_consumer;\n");
     ptx.push_str("    .reg .u32 %addr_lo, %tile_skip_predicate;\n");
@@ -180,6 +183,16 @@ fn emit_grid_id_setup(ptx: &mut String) {
     ptx.push_str("    setp.eq.u32 %p_producer, %warp_id, 0;\n");
     // Load heads param for use by HBM address helpers (emit_4d_byte_offset).
     ptx.push_str("    ld.param.u32 %heads_r, [heads];\n");
+    ptx.push('\n');
+}
+
+fn emit_warp_band_setup(ptx: &mut String, config: &FlashAttentionConfig) {
+    let active_warps = tier_b2_effective_bq(config) / 16; // 4 at bq=64, 2 at bq=32
+    ptx.push_str("    // Warp-per-m16-band: warp w owns q-rows [w*16, w*16+16).\n");
+    ptx.push_str("    mul.lo.u32 %band_row_base, %warp_id, 16;\n");
+    ptx.push_str(&format!(
+        "    setp.lt.u32 %p_warp_active, %warp_id, {active_warps};  // active = warp_id < bq/16\n"
+    ));
     ptx.push('\n');
 }
 
@@ -1516,5 +1529,16 @@ mod tests {
         let ptx = synthesize_dq_kernel(&cfg).unwrap();
         assert!(ptx.contains("mov.u32 %tile_skip_predicate, 1"),
             "expected non-causal predicate = constant 1");
+    }
+
+    #[test]
+    fn synthesize_dq_kernel_computes_warp_band_base_and_active() {
+        // hd=32 -> bq=64 -> active warps = 64/16 = 4.
+        let cfg = FlashAttentionConfig { head_dim: 32, ..canonical_cfg() };
+        let ptx = synthesize_dq_kernel(&cfg).unwrap();
+        assert!(ptx.contains("mul.lo.u32 %band_row_base, %warp_id, 16"),
+            "expected warp-band row base = warp_id*16");
+        assert!(ptx.contains("setp.lt.u32 %p_warp_active, %warp_id, 4"),
+            "expected warp-active predicate warp_id < bq/16 (=4 at bq=64)");
     }
 }
