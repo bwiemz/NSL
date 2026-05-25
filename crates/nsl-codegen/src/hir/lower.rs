@@ -7,11 +7,16 @@ use crate::kernel_ir::{KernelIR, KirOp, KirType, VarId};
 
 pub struct KirToHirPass {
     pub test_taps: bool,
+    /// M57.2: select the sequential clocked FSM lowering for recognized v1 MLP
+    /// chains instead of the combinational `lower_v1_mlp_layer_chain`. The
+    /// `new` constructor defaults this to `false` (combinational path) so all
+    /// existing callers stay on the untouched golden-equivalence reference.
+    pub sequential: bool,
 }
 
 impl KirToHirPass {
     pub fn new(test_taps: bool) -> Self {
-        Self { test_taps }
+        Self { test_taps, sequential: false }
     }
 
     /// Lower a KernelIR (representing one NSL `model` block) to a single HirModule.
@@ -49,10 +54,23 @@ impl KirToHirPass {
                     // (Pin 1) before fusing; errors loudly on dimensional
                     // mismatch.
                     if let Some(chain_len) = try_recognize_v1_mlp_chain(&ops, i)? {
-                        lower_v1_mlp_layer_chain(
-                            &ops[i..i + chain_len],
-                            &mut module,
-                        )?;
+                        // M57.2 dispatch: a recognized v1 MLP chain lowers via
+                        // the clocked sequential FSM when `sequential` is set;
+                        // otherwise via the untouched combinational chain. Both
+                        // consume the same `&[&KirOp]` triple slice. Standalone
+                        // fallbacks below remain combinational regardless — the
+                        // v1 MLP chain is the only sequential target.
+                        if self.sequential {
+                            lower_v1_mlp_sequential(
+                                &ops[i..i + chain_len],
+                                &mut module,
+                            )?;
+                        } else {
+                            lower_v1_mlp_layer_chain(
+                                &ops[i..i + chain_len],
+                                &mut module,
+                            )?;
+                        }
                         i += chain_len;
                         continue;
                     }
@@ -132,7 +150,7 @@ impl KirToHirPass {
     ) -> Result<(), FpgaLoweringError> {
         use crate::hir::control::GenerateFor;
         use crate::hir::module::HirNode;
-        use crate::hir::nodes::{Add, LocalParam, Mul, Port, SignExtend, Wire};
+        use crate::hir::nodes::{Add, LocalParam, Mul, Port, SignExtend, Wire, WireDecl};
         use crate::hir::signals::SignalRef;
 
         let (a_dtype, b_dtype, out_dtype, a_shape, b_shape) = match matmul_op {
@@ -246,12 +264,16 @@ impl KirToHirPass {
             prod_width,
         );
         let prod_id = mul.out;
+        // M57.1 fix: declare before driving assign — avoids implicit 1-bit net.
+        inner_body.push(HirNode::WireDecl(WireDecl { id: prod_id, width: prod_width }));
         inner_body.push(HirNode::Mul(mul));
 
         // SignExtend prod → acc_width if needed (3-node MAC chain when prod < acc)
         let add_input = if prod_width < acc_width {
             let se = SignExtend::new(SignalRef::wire(prod_id), prod_width, acc_width);
             let se_id = se.dst;
+            // M57.1 fix: declare before driving assign.
+            inner_body.push(HirNode::WireDecl(WireDecl { id: se_id, width: acc_width }));
             inner_body.push(HirNode::SignExtend(se));
             SignalRef::wire(se_id)
         } else {
@@ -274,6 +296,9 @@ impl KirToHirPass {
             add_input,
             acc_width,
         );
+        let add_id = add.out;
+        // M57.1 fix: declare before driving assign.
+        inner_body.push(HirNode::WireDecl(WireDecl { id: add_id, width: acc_width }));
         inner_body.push(HirNode::Add(add));
 
         outer_body.push(HirNode::GenerateFor(GenerateFor::new(
@@ -304,7 +329,7 @@ impl KirToHirPass {
     ) -> Result<(), FpgaLoweringError> {
         use crate::hir::control::GenerateFor;
         use crate::hir::module::HirNode;
-        use crate::hir::nodes::{Add, Port};
+        use crate::hir::nodes::{Add, Port, WireDecl};
         use crate::hir::signals::SignalRef;
 
         let (dtype, shape) = match op {
@@ -331,11 +356,17 @@ impl KirToHirPass {
         module.add_port(Port::input(&a_name, n * width));
         module.add_port(Port::input(&b_name, n * width));
 
-        let body = vec![HirNode::Add(Add::new(
+        let add = Add::new(
             SignalRef::port(&a_name),
             SignalRef::port(&b_name),
             width,
-        ))];
+        );
+        let add_id = add.out;
+        // M57.1 fix: declare before driving assign — avoids implicit 1-bit net.
+        let body = vec![
+            HirNode::WireDecl(WireDecl { id: add_id, width }),
+            HirNode::Add(add),
+        ];
 
         module.add_node(HirNode::GenerateFor(GenerateFor::new(0, n as i64, body)))?;
 
@@ -349,7 +380,7 @@ impl KirToHirPass {
     ) -> Result<(), FpgaLoweringError> {
         use crate::hir::control::GenerateFor;
         use crate::hir::module::HirNode;
-        use crate::hir::nodes::{Max0, Port};
+        use crate::hir::nodes::{Max0, Port, WireDecl};
         use crate::hir::signals::SignalRef;
 
         let (dtype, shape) = match op {
@@ -378,7 +409,11 @@ impl KirToHirPass {
         let max0 = Max0::new(SignalRef::port(&in_name), width);
         let max0_out_id = max0.out;
 
-        let body = vec![HirNode::Max0(max0)];
+        // M57.1 fix: declare before driving assign — avoids implicit 1-bit net.
+        let body = vec![
+            HirNode::WireDecl(WireDecl { id: max0_out_id, width }),
+            HirNode::Max0(max0),
+        ];
 
         module.add_node(HirNode::GenerateFor(GenerateFor::new(0, n as i64, body)))?;
 
@@ -585,6 +620,632 @@ fn lower_v1_mlp_layer_chain(
     Ok(())
 }
 
+// ════════════════════════════════════════════════════════════════════════
+//  M57.2 — sequential clocked FSM lowering (parallel to the combinational
+//  `lower_v1_mlp_layer_chain` above). Builds an IDLE → {L{i}_MAC} → DONE
+//  state machine with bias-as-seed accumulation and inline relu, one
+//  MAC/cycle. The combinational path stays untouched as the golden
+//  equivalence reference.
+// ════════════════════════════════════════════════════════════════════════
+
+use crate::hir::ids::{RegisterId, WireId};
+
+/// Minimum number of bits required to represent the unsigned value `v`
+/// (so a `[width-1:0]` register holds `0..=v`). `bits_to_hold(0) == 1`,
+/// `bits_to_hold(4) == 3`, `bits_to_hold(127) == 7`, `bits_to_hold(783) == 10`.
+fn bits_to_hold(v: usize) -> usize {
+    if v == 0 {
+        1
+    } else {
+        (usize::BITS - v.leading_zeros()) as usize
+    }
+}
+
+/// M57.2: per-layer geometry + datapath wire ids gathered during sequential
+/// lowering. `k`/`n` are the layer's matmul inner/output dims; widths come
+/// from the layer's dtypes (mirroring `lower_v1_mlp_single_layer`). The
+/// `*_id` fields are populated by `build_datapath` (Task 11) and read by
+/// `build_fsm` (Task 12).
+struct LayerDims {
+    k: usize,
+    n: usize,
+    a_width: usize,
+    b_width: usize,
+    acc_width: usize,
+    prod_width: usize,
+    /// `W{i}` LocalParamArray name (weights, `[k][n]`).
+    w_name: String,
+    /// `b{i}` LocalParamArray name (bias, `[n]`).
+    b_name: String,
+    // ── Datapath wires (Task 11) ────────────────────────────────────────
+    /// `acc_next = acc + sext(prod)` (width `acc_width_max`).
+    acc_next_id: Option<WireId>,
+    /// `relu = max0(acc_next)` (width `acc_width_max`).
+    relu_id: Option<WireId>,
+    /// `k_next = k + 1`.
+    k_next_id: Option<WireId>,
+    /// `o_next = o + 1`.
+    o_next_id: Option<WireId>,
+    /// `k_is_last = (k == K_i - 1)`.
+    k_is_last_id: Option<WireId>,
+    /// `o_is_last = (o == N_i - 1)`.
+    o_is_last_id: Option<WireId>,
+}
+
+/// M57.2: shared lowering context threaded through `build_datapath` (Task 11)
+/// and `build_fsm` (Task 12). Built by `lower_v1_mlp_sequential` (Task 10).
+struct SeqLoweringCtx {
+    // ── FSM scalar registers ────────────────────────────────────────────
+    state_reg: RegisterId,
+    o_reg: RegisterId,
+    k_reg: RegisterId,
+    acc_reg: RegisterId,
+    done_reg: RegisterId,
+    valid_reg: RegisterId,
+    // ── State codes, ordered (name, code) ───────────────────────────────
+    /// `[("S_IDLE",0), ("S_LOAD",1), ("S_L1_MAC",2), …, ("S_DONE",last)]`.
+    state_codes: Vec<(String, u64)>,
+    // ── Per-layer geometry + datapath wires ─────────────────────────────
+    layers: Vec<LayerDims>,
+    // ── Shared sizing ───────────────────────────────────────────────────
+    /// Single shared accumulator width (max acc_width across layers; 64 for
+    /// the v1 fixture). All `Add`/`Max0`/`SignExtend` targets use this.
+    acc_width_max: usize,
+    /// `k` counter width (holds `max_i K_i`).
+    k_width: usize,
+    /// `o` counter width (holds `max_i N_i`).
+    o_width: usize,
+}
+
+impl SeqLoweringCtx {
+    /// Look up a state code by name (panics if absent — names are
+    /// constructed and consumed within this module). Consumed by `build_fsm`
+    /// (Task 12).
+    fn state_code(&self, name: &str) -> u64 {
+        self.state_codes
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, c)| *c)
+            .unwrap_or_else(|| panic!("state {name} not registered in SeqLoweringCtx"))
+    }
+}
+
+/// M57.2: lower a recognized v1 MLP chain (same `&[&KirOp]` triple slice as
+/// `lower_v1_mlp_layer_chain`) to a clocked sequential FSM. Builds the
+/// declarations + lowering context, then the combinational datapath
+/// (`build_datapath`) and the FSM body (`build_fsm`).
+pub(crate) fn lower_v1_mlp_sequential(
+    ops: &[&KirOp],
+    module: &mut HirModule,
+) -> Result<(), FpgaLoweringError> {
+    use crate::hir::ids::ResetSignalId;
+    use crate::hir::module::HirNode;
+    use crate::hir::nodes::{LocalParam, LocalParamArray, Port, RegArray, RegDecl};
+    use crate::hir::signals::SignalRef;
+
+    assert_eq!(ops.len() % 3, 0, "v1 MLP chain ops must come in triples");
+    let n_layers = ops.len() / 3;
+    assert!(n_layers >= 1, "sequential lowering requires >= 1 layer");
+
+    // ── 1. Extract per-layer geometry from the matmul triples ───────────
+    let mut layers: Vec<LayerDims> = Vec::with_capacity(n_layers);
+    for layer_idx in 1..=n_layers {
+        let matmul = ops[(layer_idx - 1) * 3];
+        let (a_dtype, b_dtype, out_dtype, a_shape, b_shape) = match matmul {
+            KirOp::Matmul {
+                a_dtype, b_dtype, out_dtype, a_shape, b_shape, ..
+            } => (
+                a_dtype.clone(), b_dtype.clone(), out_dtype.clone(), *a_shape, *b_shape,
+            ),
+            _ => unreachable!("lower_v1_mlp_sequential called with non-Matmul matmul"),
+        };
+        let k = a_shape[1];
+        let n = b_shape[1];
+        assert_eq!(a_shape[1], b_shape[0], "Matmul inner dimensions must match");
+        let a_width = kir_dtype_width(a_dtype);
+        let b_width = kir_dtype_width(b_dtype);
+        let acc_width = kir_dtype_width(out_dtype);
+        layers.push(LayerDims {
+            k,
+            n,
+            a_width,
+            b_width,
+            acc_width,
+            prod_width: a_width + b_width,
+            w_name: format!("W{}", layer_idx),
+            b_name: format!("b{}", layer_idx),
+            acc_next_id: None,
+            relu_id: None,
+            k_next_id: None,
+            o_next_id: None,
+            k_is_last_id: None,
+            o_is_last_id: None,
+        });
+    }
+
+    // ── Shared sizing ───────────────────────────────────────────────────
+    let k1 = layers[0].k;
+    let a_width_1 = layers[0].a_width;
+    let max_k = layers.iter().map(|l| l.k).max().unwrap();
+    let max_n = layers.iter().map(|l| l.n).max().unwrap();
+    let acc_width_max = layers.iter().map(|l| l.acc_width).max().unwrap();
+    let n_last = layers[n_layers - 1].n;
+    let k_width = bits_to_hold(max_k);
+    let o_width = bits_to_hold(max_n);
+
+    // ── 2. Sequential reset name: rst_n (active-low) per spec §1.2 ───────
+    module.reset_signals.insert(ResetSignalId::DEFAULT, "rst_n".into());
+
+    // ── 3. FSM state localparams + ordered code table ───────────────────
+    //   IDLE=0, L1_MAC=1, …, L{n}_MAC=n, DONE=n+1.
+    // states: IDLE + per-layer MAC + DONE = n_layers + 2
+    let n_states = n_layers + 2; // IDLE + per-layer MAC + DONE
+    let sw = bits_to_hold(n_states - 1);
+    let mut state_codes: Vec<(String, u64)> = Vec::with_capacity(n_states);
+    state_codes.push(("S_IDLE".into(), 0));
+    for layer_idx in 1..=n_layers {
+        state_codes.push((format!("S_L{}_MAC", layer_idx), layer_idx as u64));
+    }
+    state_codes.push(("S_DONE".into(), (n_states - 1) as u64));
+    for (name, code) in &state_codes {
+        module.add_local_param(LocalParam::new(name, sw, *code as i128));
+    }
+    // Constant-assignment helpers (RegAssign.value is a SignalRef with no
+    // integer-literal variant): ZERO (acc-width) covers all `<= '0` resets and
+    // counter zeroing; ONE (1-bit) covers `done/valid <= 1` in S_DONE.
+    module.add_local_param(LocalParam::new("ZERO", acc_width_max, 0));
+    module.add_local_param(LocalParam::new("ONE", 1, 1));
+
+    // ── 4. Scalar RegDecls (declaration-only; driven by the SeqProcess) ──
+    let state_decl = RegDecl::new(sw);
+    let state_reg = state_decl.id;
+    module.add_node(HirNode::RegDecl(state_decl))?;
+    let o_decl = RegDecl::new(o_width);
+    let o_reg = o_decl.id;
+    module.add_node(HirNode::RegDecl(o_decl))?;
+    let k_decl = RegDecl::new(k_width);
+    let k_reg = k_decl.id;
+    module.add_node(HirNode::RegDecl(k_decl))?;
+    let acc_decl = RegDecl::new(acc_width_max);
+    let acc_reg = acc_decl.id;
+    module.add_node(HirNode::RegDecl(acc_decl))?;
+    let done_decl = RegDecl::new(1);
+    let done_reg = done_decl.id;
+    module.add_node(HirNode::RegDecl(done_decl))?;
+    let valid_decl = RegDecl::new(1);
+    let valid_reg = valid_decl.id;
+    module.add_node(HirNode::RegDecl(valid_decl))?;
+
+    // ── 5. RegArray buffers: x_buf[K_1] + shared h_buf[max_N] ───────────
+    module.add_node(HirNode::RegArray(RegArray {
+        name: "x_buf".into(),
+        dims: vec![k1],
+        width: a_width_1,
+    }))?;
+    module.add_node(HirNode::RegArray(RegArray {
+        name: "h_buf".into(),
+        dims: vec![max_n],
+        width: acc_width_max,
+    }))?;
+
+    // ── 6. Weight LocalParamArrays per layer (mirror M57.1 idiom) ───────
+    for layer in &layers {
+        module.add_local_param_array(LocalParamArray {
+            name: layer.w_name.clone(),
+            dims: vec![layer.k, layer.n],
+            width: layer.b_width,
+            values: vec![0; layer.k * layer.n],
+        });
+        module.add_local_param_array(LocalParamArray {
+            name: layer.b_name.clone(),
+            dims: vec![layer.n],
+            width: layer.acc_width,
+            values: vec![0; layer.n],
+        });
+    }
+
+    // ── 7. Handshake ports ──────────────────────────────────────────────
+    module.add_port(Port::input("clk", 1));
+    module.add_port(Port::input("rst_n", 1));
+    module.add_port(Port::input("start", 1));
+    module.add_port(Port::input("x", k1 * a_width_1));
+    // done/valid outputs driven by the 1-bit RegDecls (FSM drives them).
+    module.add_port(Port::output("done", 1, SignalRef::register(done_reg)));
+    module.add_port(Port::output("valid", 1, SignalRef::register(valid_reg)));
+    // `out` is driven combinationally by concatenating h_buf's last-layer
+    // cells via RegArrayConcat (Task 12 adds the SignalRef variant); the FSM
+    // does NOT write `out`. done/valid signal validity.
+    module.add_port(Port::output(
+        "out",
+        n_last * acc_width_max,
+        SignalRef::reg_array_concat("h_buf", n_last),
+    ));
+
+    // ── 8. Deterministic cycle count (§5.1: overhead = IDLE (start/latch) + DONE = 2) ──
+    let total: usize = 2 + layers.iter().map(|l| l.n * l.k).sum::<usize>();
+    module.cycle_count = Some(total as u64);
+
+    // ── 9. Assemble ctx + build datapath (Task 11) + FSM (Task 12) ──────
+    let mut ctx = SeqLoweringCtx {
+        state_reg,
+        o_reg,
+        k_reg,
+        acc_reg,
+        done_reg,
+        valid_reg,
+        state_codes,
+        layers,
+        acc_width_max,
+        k_width,
+        o_width,
+    };
+
+    build_datapath(&mut ctx, module)?;
+    build_fsm(&ctx, module)?;
+
+    Ok(())
+}
+
+/// M57.2 (Task 11): per-layer combinational MAC-step + control wires the FSM
+/// reads, indexed by the runtime `k`/`o` registers (vs the combinational
+/// path's genvars). One inner MAC iteration per layer:
+///
+/// ```text
+///   prod      = x_src[k] * W{i}[k][o]              (a_width × b_width → prod_width)
+///   prod_ext  = sext(prod) → acc_width_max         (when prod_width < acc_width_max)
+///   acc_next  = acc + prod_ext                     (§3.5; acc register read)
+///   relu      = max0(acc_next)                     (inline relu, §3.5)
+///   k_next    = k + 1 ;  o_next = o + 1
+///   k_is_last = (k == K_i-1) ; o_is_last = (o == N_i-1)
+/// ```
+///
+/// `x_src` = `x_buf` (layer 1) or the shared `h_buf` (layer i>1). A single
+/// shared 64-bit `acc` register serves all phases, so `Add`/`Max0`/`SignExtend`
+/// targets use `acc_width_max` uniformly (Add requires equal operand widths);
+/// per-layer sign-extended values sit in the 64-bit acc and the 64-bit
+/// relu/compare is value-correct. Per-layer wires are distinct (fresh ids) and
+/// coexist at module scope — only the active phase's `acc`/`k`/`o` drive
+/// meaningful values. Wire ids are recorded back into each `LayerDims` for
+/// `build_fsm` (Task 12).
+fn build_datapath(
+    ctx: &mut SeqLoweringCtx,
+    module: &mut HirModule,
+) -> Result<(), FpgaLoweringError> {
+    use crate::hir::module::HirNode;
+    use crate::hir::nodes::{Add, AddConst, CmpEq, IndexExpr, Max0, Mul, SignExtend, WireDecl};
+    use crate::hir::signals::SignalRef;
+
+    let acc_width_max = ctx.acc_width_max;
+    let k_width = ctx.k_width;
+    let o_width = ctx.o_width;
+    let k_reg = ctx.k_reg;
+    let o_reg = ctx.o_reg;
+    let acc_reg = ctx.acc_reg;
+
+    let n_layers = ctx.layers.len();
+    for layer_idx in 1..=n_layers {
+        let layer = &ctx.layers[layer_idx - 1];
+        let k_i = layer.k;
+        let n_i = layer.n;
+        let a_width = layer.a_width;
+        let b_width = layer.b_width;
+        let prod_width = layer.prod_width;
+        let w_name = layer.w_name.clone();
+
+        // x_src[k]: layer 1 reads the latched x_buf; layers > 1 read shared h_buf.
+        let x_src_name = if layer_idx == 1 { "x_buf" } else { "h_buf" };
+        let x_elem = SignalRef::reg_array_element(x_src_name, vec![IndexExpr::Reg(k_reg)]);
+        // W{i}[k][o] read at runtime k,o.
+        let w_elem = SignalRef::indexed_local_param(
+            w_name,
+            vec![IndexExpr::Reg(k_reg), IndexExpr::Reg(o_reg)],
+        );
+        // prod = x_src[k] * W{i}[k][o]
+        let prod = Mul::new(x_elem, w_elem, a_width, b_width, prod_width);
+        let prod_id = prod.out;
+        // M57.2: declare before driving assign to avoid implicit 1-bit net.
+        module.add_node(HirNode::WireDecl(WireDecl { id: prod_id, width: prod.out_width }))?;
+        module.add_node(HirNode::Mul(prod))?;
+
+        // Optional SignExtend prod → acc_width_max (shared 64-bit acc).
+        let prod_ext = if prod_width < acc_width_max {
+            let se = SignExtend::new(SignalRef::wire(prod_id), prod_width, acc_width_max);
+            let se_id = se.dst;
+            // M57.2: declare before driving assign.
+            module.add_node(HirNode::WireDecl(WireDecl { id: se_id, width: se.dst_width }))?;
+            module.add_node(HirNode::SignExtend(se))?;
+            SignalRef::wire(se_id)
+        } else {
+            SignalRef::wire(prod_id)
+        };
+
+        // acc_next = acc + prod_ext   (acc register read; §3.5).
+        let acc_next = Add::new(SignalRef::register(acc_reg), prod_ext, acc_width_max);
+        let acc_next_id = acc_next.out;
+        // M57.2: declare before driving assign.
+        module.add_node(HirNode::WireDecl(WireDecl { id: acc_next_id, width: acc_next.width }))?;
+        module.add_node(HirNode::Add(acc_next))?;
+
+        // relu = max0(acc_next)  (inline relu reads the combinational wire).
+        let relu = Max0::new(SignalRef::wire(acc_next_id), acc_width_max);
+        let relu_id = relu.out;
+        // M57.2: declare before driving assign.
+        module.add_node(HirNode::WireDecl(WireDecl { id: relu_id, width: relu.width }))?;
+        module.add_node(HirNode::Max0(relu))?;
+
+        // k_next = k + 1 ; o_next = o + 1.
+        let k_next = AddConst::new(SignalRef::register(k_reg), 1, k_width);
+        let k_next_id = k_next.out;
+        // M57.2: declare before driving assign.
+        module.add_node(HirNode::WireDecl(WireDecl { id: k_next_id, width: k_next.width }))?;
+        module.add_node(HirNode::AddConst(k_next))?;
+        let o_next = AddConst::new(SignalRef::register(o_reg), 1, o_width);
+        let o_next_id = o_next.out;
+        // M57.2: declare before driving assign.
+        module.add_node(HirNode::WireDecl(WireDecl { id: o_next_id, width: o_next.width }))?;
+        module.add_node(HirNode::AddConst(o_next))?;
+
+        // k_is_last = (k == K_i-1) ; o_is_last = (o == N_i-1).
+        let k_is_last = CmpEq::new(SignalRef::register(k_reg), (k_i - 1) as u64);
+        let k_is_last_id = k_is_last.out;
+        // M57.2: CmpEq is 1-bit.
+        module.add_node(HirNode::WireDecl(WireDecl { id: k_is_last_id, width: 1 }))?;
+        module.add_node(HirNode::CmpEq(k_is_last))?;
+        let o_is_last = CmpEq::new(SignalRef::register(o_reg), (n_i - 1) as u64);
+        let o_is_last_id = o_is_last.out;
+        // M57.2: CmpEq is 1-bit.
+        module.add_node(HirNode::WireDecl(WireDecl { id: o_is_last_id, width: 1 }))?;
+        module.add_node(HirNode::CmpEq(o_is_last))?;
+
+        // Record wire ids back into the LayerDims for build_fsm (Task 12).
+        let layer_mut = &mut ctx.layers[layer_idx - 1];
+        layer_mut.acc_next_id = Some(acc_next_id);
+        layer_mut.relu_id = Some(relu_id);
+        layer_mut.k_next_id = Some(k_next_id);
+        layer_mut.o_next_id = Some(o_next_id);
+        layer_mut.k_is_last_id = Some(k_is_last_id);
+        layer_mut.o_is_last_id = Some(o_is_last_id);
+    }
+
+    Ok(())
+}
+
+/// M57.2 (Task 12): the FSM `SeqProcess` — one `always_ff` whose `body` is a
+/// state `Case` (IDLE → {L{i}_MAC} → DONE) with bias-as-seed accumulation
+/// (SQ-5, three cases) and inline relu (SQ-6/8). Reads the datapath wire ids
+/// recorded by `build_datapath` (Task 11).
+///
+/// Bias-seed (SQ-5) three cases:
+///   1. Phase-entry seed `b{i}[0]` — set on the transition INTO the phase:
+///      layer 1 on `start` in IDLE; layer i>1 at the prev layer's o-boundary
+///      (so S_L{i}_MAC's non-final o_is_last arm seeds `b{i+1}[0]`).
+///   2. Intra-layer advance `acc <= b{i}[(o+1)]` via RegPlus — **reads old o**,
+///      concurrent with `o <= o_next`.
+///   3. Final layer's o-boundary → S_DONE with **no seed**.
+///
+/// Inline relu (SQ-6/8): on the `k_is_last` arm, `h_buf[o] <= relu` reads the
+/// combinational `relu` wire (from acc_next); `acc <=` takes the bias-seed,
+/// NOT acc_next. On the else (k<K-1) arm: `acc <= acc_next; k <= k_next`.
+///
+/// The FSM does NOT write `out` — the `out` port is driven combinationally by
+/// `RegArrayConcat("h_buf", N_last)`. v2 sequential output is just the `out`
+/// port (per-layer test_taps are dropped: the shared h_buf aliases them).
+fn build_fsm(ctx: &SeqLoweringCtx, module: &mut HirModule) -> Result<(), FpgaLoweringError> {
+    use crate::hir::clock_reset::{ClkRef, ResetPolarity, ResetRef, ResetSync};
+    use crate::hir::ids::{ClockDomainId, ResetSignalId};
+    use crate::hir::module::HirNode;
+    use crate::hir::nodes::{IndexExpr, SeqLValue, SeqProcess, SeqStmt};
+    use crate::hir::signals::SignalRef;
+
+    let state_reg = ctx.state_reg;
+    let o_reg = ctx.o_reg;
+    let k_reg = ctx.k_reg;
+    let acc_reg = ctx.acc_reg;
+    let done_reg = ctx.done_reg;
+    let valid_reg = ctx.valid_reg;
+    let n_layers = ctx.layers.len();
+
+    // Constant-source SignalRefs (RegAssign.value is a SignalRef — no integer
+    // literal variant). ZERO covers all `<= '0`; ONE covers `done/valid <= 1`.
+    let zero = || SignalRef::local_param("ZERO");
+    let one = || SignalRef::local_param("ONE");
+
+    // ── S_IDLE arm ──────────────────────────────────────────────────────
+    // done/valid cleared every cycle in IDLE; on `start`, latch x → x_buf,
+    // seed acc with b1[0], zero o/k, advance to S_L1_MAC.
+    let k1 = ctx.layers[0].k;
+    let a_width_1 = ctx.layers[0].a_width;
+    let b1_name = ctx.layers[0].b_name.clone();
+    let mut start_body: Vec<SeqStmt> = Vec::with_capacity(k1 + 4);
+    for k in 0..k1 {
+        // x_buf[k] <= x[k*a_width +: a_width]
+        start_body.push(SeqStmt::RegAssign {
+            target: SeqLValue::RegArrayElement {
+                array_name: "x_buf".into(),
+                indices: vec![IndexExpr::Literal(k)],
+            },
+            value: SignalRef::port_bit_slice("x", k * a_width_1, a_width_1),
+        });
+    }
+    // acc <= b1[0]; o <= '0; k <= '0; state <= S_L1_MAC.
+    start_body.push(SeqStmt::RegAssign {
+        target: SeqLValue::Register(acc_reg),
+        value: SignalRef::indexed_local_param(b1_name, vec![IndexExpr::Literal(0)]),
+    });
+    start_body.push(SeqStmt::RegAssign { target: SeqLValue::Register(o_reg), value: zero() });
+    start_body.push(SeqStmt::RegAssign { target: SeqLValue::Register(k_reg), value: zero() });
+    start_body.push(SeqStmt::RegAssign {
+        target: SeqLValue::Register(state_reg),
+        value: SignalRef::local_param("S_L1_MAC"),
+    });
+    let idle_arm = vec![
+        SeqStmt::RegAssign { target: SeqLValue::Register(done_reg), value: zero() },
+        SeqStmt::RegAssign { target: SeqLValue::Register(valid_reg), value: zero() },
+        SeqStmt::If {
+            cond: SignalRef::port("start"),
+            then_body: start_body,
+            else_body: vec![],
+        },
+    ];
+
+    // ── Case arms: IDLE + per-layer MAC + DONE ──────────────────────────
+    let mut arms: Vec<(u64, Vec<SeqStmt>)> = Vec::with_capacity(n_layers + 2);
+    arms.push((ctx.state_code("S_IDLE"), idle_arm));
+
+    for layer_idx in 1..=n_layers {
+        let layer = &ctx.layers[layer_idx - 1];
+        let is_final = layer_idx == n_layers;
+        let relu_id = layer.relu_id.expect("build_datapath must run before build_fsm");
+        let acc_next_id = layer.acc_next_id.expect("build_datapath must run before build_fsm");
+        let k_next_id = layer.k_next_id.expect("build_datapath must run before build_fsm");
+        let o_next_id = layer.o_next_id.expect("build_datapath must run before build_fsm");
+        let k_is_last_id = layer.k_is_last_id.expect("build_datapath must run before build_fsm");
+        let o_is_last_id = layer.o_is_last_id.expect("build_datapath must run before build_fsm");
+        let b_name = layer.b_name.clone();
+
+        // o_is_last arm (last k of last o of this layer): advance the phase.
+        let o_is_last_then: Vec<SeqStmt> = if is_final {
+            // Final layer → S_DONE, NO seed (case 3).
+            vec![SeqStmt::RegAssign {
+                target: SeqLValue::Register(state_reg),
+                value: SignalRef::local_param("S_DONE"),
+            }]
+        } else {
+            // Intermediate layer → seed NEXT layer's b{i+1}[0] (case 1),
+            // zero o, advance to S_L{i+1}_MAC.
+            let next_b_name = ctx.layers[layer_idx].b_name.clone();
+            let next_state = format!("S_L{}_MAC", layer_idx + 1);
+            vec![
+                SeqStmt::RegAssign {
+                    target: SeqLValue::Register(acc_reg),
+                    value: SignalRef::indexed_local_param(
+                        next_b_name,
+                        vec![IndexExpr::Literal(0)],
+                    ),
+                },
+                SeqStmt::RegAssign { target: SeqLValue::Register(o_reg), value: zero() },
+                SeqStmt::RegAssign {
+                    target: SeqLValue::Register(state_reg),
+                    value: SignalRef::local_param(next_state),
+                },
+            ]
+        };
+        // intra-layer o-advance (k_is_last but not o_is_last): seed b{i}[o+1]
+        // (case 2 — RegPlus reads OLD o, concurrent with o <= o_next).
+        let o_advance: Vec<SeqStmt> = vec![
+            SeqStmt::RegAssign {
+                target: SeqLValue::Register(acc_reg),
+                value: SignalRef::indexed_local_param(
+                    b_name,
+                    vec![IndexExpr::RegPlus(o_reg, 1)],
+                ),
+            },
+            SeqStmt::RegAssign {
+                target: SeqLValue::Register(o_reg),
+                value: SignalRef::wire(o_next_id),
+            },
+        ];
+
+        // k_is_last arm: write inline-relu result to h_buf[o], reset k, then
+        // branch on o_is_last (phase advance vs intra-layer o-advance).
+        let mut k_is_last_then: Vec<SeqStmt> = vec![
+            SeqStmt::RegAssign {
+                target: SeqLValue::RegArrayElement {
+                    array_name: "h_buf".into(),
+                    indices: vec![IndexExpr::Reg(o_reg)],
+                },
+                value: SignalRef::wire(relu_id),
+            },
+            SeqStmt::RegAssign { target: SeqLValue::Register(k_reg), value: zero() },
+        ];
+        k_is_last_then.push(SeqStmt::If {
+            cond: SignalRef::wire(o_is_last_id),
+            then_body: o_is_last_then,
+            else_body: o_advance,
+        });
+
+        // else (k < K-1): ordinary accumulate — acc <= acc_next; k <= k_next.
+        let k_advance: Vec<SeqStmt> = vec![
+            SeqStmt::RegAssign {
+                target: SeqLValue::Register(acc_reg),
+                value: SignalRef::wire(acc_next_id),
+            },
+            SeqStmt::RegAssign {
+                target: SeqLValue::Register(k_reg),
+                value: SignalRef::wire(k_next_id),
+            },
+        ];
+
+        let mac_arm = vec![SeqStmt::If {
+            cond: SignalRef::wire(k_is_last_id),
+            then_body: k_is_last_then,
+            else_body: k_advance,
+        }];
+        arms.push((ctx.state_code(&format!("S_L{}_MAC", layer_idx)), mac_arm));
+    }
+
+    // ── S_DONE arm ──────────────────────────────────────────────────────
+    let done_arm = vec![
+        SeqStmt::RegAssign { target: SeqLValue::Register(done_reg), value: one() },
+        SeqStmt::RegAssign { target: SeqLValue::Register(valid_reg), value: one() },
+        SeqStmt::If {
+            cond: SignalRef::port("start"),
+            then_body: vec![],
+            // !start handled by the else: return to IDLE. We model `if (!start)`
+            // by swapping then/else — there is no NotPort SignalRef, and the
+            // emitter renders `if (start) begin end else begin <return> end`,
+            // which is logically `if (!start)`.
+            else_body: vec![SeqStmt::RegAssign {
+                target: SeqLValue::Register(state_reg),
+                value: SignalRef::local_param("S_IDLE"),
+            }],
+        },
+    ];
+    arms.push((ctx.state_code("S_DONE"), done_arm));
+
+    // ── default arm: return to IDLE ─────────────────────────────────────
+    let default_arm = vec![SeqStmt::RegAssign {
+        target: SeqLValue::Register(state_reg),
+        value: SignalRef::local_param("S_IDLE"),
+    }];
+
+    // ── reset_body: scalar resets (state <= S_IDLE; o/k/acc/done/valid <= 0)
+    let reset_body = vec![
+        SeqStmt::RegAssign {
+            target: SeqLValue::Register(state_reg),
+            value: SignalRef::local_param("S_IDLE"),
+        },
+        SeqStmt::RegAssign { target: SeqLValue::Register(o_reg), value: zero() },
+        SeqStmt::RegAssign { target: SeqLValue::Register(k_reg), value: zero() },
+        SeqStmt::RegAssign { target: SeqLValue::Register(acc_reg), value: zero() },
+        SeqStmt::RegAssign { target: SeqLValue::Register(done_reg), value: zero() },
+        SeqStmt::RegAssign { target: SeqLValue::Register(valid_reg), value: zero() },
+    ];
+
+    // reset_arrays: x_buf[K_1] + shared h_buf[max_N].
+    let max_n = ctx.layers.iter().map(|l| l.n).max().unwrap();
+    let reset_arrays = vec![("x_buf".into(), k1), ("h_buf".into(), max_n)];
+
+    let sp = SeqProcess {
+        clock: ClkRef { domain_id: ClockDomainId::DEFAULT },
+        reset: ResetRef {
+            signal_id: ResetSignalId::DEFAULT,
+            polarity: ResetPolarity::Low,
+            sync: ResetSync::Async,
+        },
+        reset_body,
+        reset_arrays,
+        body: vec![SeqStmt::Case {
+            selector: SignalRef::register(state_reg),
+            arms,
+            default: default_arm,
+        }],
+    };
+    module.add_node(HirNode::SeqProcess(sp))?;
+
+    Ok(())
+}
+
 /// M57.1 wire-array mini §3.2: fused emitter for a single v1 MLP layer.
 /// Emits the full HIR shape for one layer of the v1 MLP chain:
 ///   - Layer 1 only: `Port::Input(x_l1)` + per-element fan-out into a
@@ -630,7 +1291,7 @@ pub(crate) fn lower_v1_mlp_single_layer(
     use crate::hir::module::HirNode;
     use crate::hir::nodes::{
         Add, AssignWireArrayElement, IndexExpr, LocalParam, LocalParamArray,
-        Max0, Mul, Port, SignExtend, WireArray,
+        Max0, Mul, Port, SignExtend, WireArray, WireDecl,
     };
     use crate::hir::signals::SignalRef;
 
@@ -802,12 +1463,16 @@ pub(crate) fn lower_v1_mlp_single_layer(
         prod_width,
     );
     let prod_id = prod.out;
+    // M57.1 fix: declare before driving assign — avoids implicit 1-bit net.
+    inner_body.push(HirNode::WireDecl(WireDecl { id: prod_id, width: prod_width }));
     inner_body.push(HirNode::Mul(prod));
 
     // Optional SignExtend if prod_width < acc_width.
     let extended_src = if prod_width < acc_width {
         let se = SignExtend::new(SignalRef::wire(prod_id), prod_width, acc_width);
         let se_id = se.dst;
+        // M57.1 fix: declare before driving assign.
+        inner_body.push(HirNode::WireDecl(WireDecl { id: se_id, width: acc_width }));
         inner_body.push(HirNode::SignExtend(se));
         SignalRef::wire(se_id)
     } else {
@@ -828,6 +1493,8 @@ pub(crate) fn lower_v1_mlp_single_layer(
         acc_width,
     );
     let sum_id = add.out;
+    // M57.1 fix: declare before driving assign.
+    inner_body.push(HirNode::WireDecl(WireDecl { id: sum_id, width: acc_width }));
     inner_body.push(HirNode::Add(add));
     inner_body.push(HirNode::AssignWireArrayElement(AssignWireArrayElement {
         array_name: acc_array_name.clone(),
@@ -866,7 +1533,9 @@ pub(crate) fn lower_v1_mlp_single_layer(
         acc_width,
     );
     let relu_max0_id = relu_max0.out;
+    // M57.1 fix: declare before driving assign.
     let relu_body = vec![
+        HirNode::WireDecl(WireDecl { id: relu_max0_id, width: acc_width }),
         HirNode::Max0(relu_max0),
         HirNode::AssignWireArrayElement(AssignWireArrayElement {
             array_name: relu_array_name.clone(),
@@ -979,6 +1648,253 @@ mod tests {
     use super::*;
     use crate::hir::module::HirNode;
     use crate::hir::nodes::{Port, WireArray};
+    use crate::kernel_ir::{KirBuilder, KirTerminator};
+
+    /// M57.2: build the canonical two-layer v1 MLP KernelIR (784 → 128 → 10),
+    /// matching the combinational snapshot test's `full_v1_mlp_composition`
+    /// fixture (`tests/hir_pass_snapshots.rs`). Layer 1: i8×i8→i32; layer 2:
+    /// i32×i32→i64. Used by the sequential-lowering structural tests.
+    fn two_layer_mlp_kir() -> KernelIR {
+        let mut b = KirBuilder::new("tiny_mlp");
+        let blk = b.new_block();
+        b.set_block(blk);
+        // Layer 1: 784 → 128 (i8×i8→i32)
+        b.emit(KirOp::Matmul {
+            a: 1, b: 2, out: 3,
+            a_dtype: KirType::I8, b_dtype: KirType::I8, out_dtype: KirType::I32,
+            a_shape: [1, 784], b_shape: [784, 128],
+        });
+        b.emit(KirOp::ElementwiseAdd {
+            a: 3, b: 4, out: 5,
+            dtype: KirType::I32, shape: [128],
+        });
+        b.emit(KirOp::Relu {
+            a: 5, out: 6,
+            dtype: KirType::I32, shape: [128],
+        });
+        // Layer 2: 128 → 10 (i32×i32→i64)
+        b.emit(KirOp::Matmul {
+            a: 6, b: 7, out: 8,
+            a_dtype: KirType::I32, b_dtype: KirType::I32, out_dtype: KirType::I64,
+            a_shape: [1, 128], b_shape: [128, 10],
+        });
+        b.emit(KirOp::ElementwiseAdd {
+            a: 8, b: 9, out: 10,
+            dtype: KirType::I64, shape: [10],
+        });
+        b.emit(KirOp::Relu {
+            a: 10, out: 11,
+            dtype: KirType::I64, shape: [10],
+        });
+        b.terminate(KirTerminator::Return);
+        b.finalize()
+    }
+
+    #[test]
+    fn sequential_skeleton_has_handshake_ports_and_buffers() {
+        let kir = two_layer_mlp_kir();
+        let module = KirToHirPass { test_taps: true, sequential: true }
+            .lower(&kir, "tiny_mlp_seq").unwrap();
+        let port_names: Vec<&str> = module.ports.iter().map(|p| match p {
+            Port::Input { name, .. } | Port::Output { name, .. } => name.as_str(),
+        }).collect();
+        for required in ["clk", "rst_n", "start", "done", "valid", "x", "out"] {
+            assert!(port_names.contains(&required), "missing port {required}");
+        }
+        // x_buf[784] + h_buf RegArrays present
+        let reg_arrays: Vec<&str> = module.nodes().iter().filter_map(|n| match n {
+            HirNode::RegArray(ra) => Some(ra.name.as_str()), _ => None,
+        }).collect();
+        assert!(reg_arrays.contains(&"x_buf"));
+        assert!(reg_arrays.contains(&"h_buf"));
+        // cycle count populated: 2 + N1*K1 + N2*K2 = 2 + 128*784 + 10*128
+        assert_eq!(module.cycle_count, Some(2 + 128 * 784 + 10 * 128));
+    }
+
+    #[test]
+    fn datapath_has_acc_next_and_guards_per_layer() {
+        let kir = two_layer_mlp_kir();
+        let module = KirToHirPass { test_taps: true, sequential: true }
+            .lower(&kir, "tiny_mlp_seq").unwrap();
+        // Two layers → two CmpEq for k_is_last + two for o_is_last (>= 4 total),
+        // two AddConst for k_next/o_next per layer (>= 4 total), and Mul/Add/Max0
+        // present for the MAC step.
+        let n_cmp = module.nodes().iter().filter(|n| matches!(n, HirNode::CmpEq(_))).count();
+        let n_addc = module.nodes().iter().filter(|n| matches!(n, HirNode::AddConst(_))).count();
+        let n_mul = module.nodes().iter().filter(|n| matches!(n, HirNode::Mul(_))).count();
+        let n_max0 = module.nodes().iter().filter(|n| matches!(n, HirNode::Max0(_))).count();
+        assert!(n_cmp >= 4, "expected k/o guards per layer, got {n_cmp}");
+        assert!(n_addc >= 4, "expected k/o increments per layer, got {n_addc}");
+        assert!(n_mul >= 2, "expected one MAC product per layer, got {n_mul}");
+        assert!(n_max0 >= 2, "expected inline relu per layer, got {n_max0}");
+    }
+
+    #[test]
+    fn fsm_seq_process_present_with_state_case() {
+        use crate::hir::nodes::SeqStmt;
+        let kir = two_layer_mlp_kir();
+        let module = KirToHirPass { test_taps: false, sequential: true }
+            .lower(&kir, "tiny_mlp_seq").unwrap();
+        let sp = module.nodes().iter().find_map(|n| match n {
+            HirNode::SeqProcess(sp) => Some(sp), _ => None });
+        let sp = sp.expect("expected one SeqProcess");
+        // body is a single state Case
+        assert!(matches!(sp.body.as_slice(), [SeqStmt::Case { .. }]));
+        // reset_arrays cover x_buf + h_buf
+        let names: Vec<&str> = sp.reset_arrays.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(names.contains(&"x_buf") && names.contains(&"h_buf"));
+    }
+
+    #[test]
+    fn sequential_false_keeps_combinational_path() {
+        let kir = two_layer_mlp_kir();
+        let comb = KirToHirPass { test_taps: true, sequential: false }
+            .lower(&kir, "tiny_mlp").unwrap();
+        // combinational path has NO SeqProcess and cycle_count is None
+        assert!(!comb.nodes().iter().any(|n| matches!(n, HirNode::SeqProcess(_))));
+        assert_eq!(comb.cycle_count, None);
+        let seq = KirToHirPass { test_taps: true, sequential: true }
+            .lower(&kir, "tiny_mlp_seq").unwrap();
+        assert!(seq.nodes().iter().any(|n| matches!(n, HirNode::SeqProcess(_))));
+        assert!(seq.cycle_count.is_some());
+    }
+
+    /// M57.2: every `assign _wN =` in the sequential datapath must have a
+    /// matching `wire signed [...:0] _wN;` declaration (no implicit 1-bit nets).
+    #[test]
+    fn sequential_datapath_wires_are_all_declared() {
+        use crate::backend_verilog::lower::VerilogEmitter;
+        use std::collections::HashSet;
+
+        let kir = two_layer_mlp_kir();
+        let module = KirToHirPass { test_taps: false, sequential: true }
+            .lower(&kir, "tiny_mlp_seq")
+            .unwrap();
+        let v = VerilogEmitter::emit_module(&module);
+
+        // Collect declared wire ids from lines matching `wire signed [..:0] _wN;`
+        let mut declared: HashSet<u64> = HashSet::new();
+        for line in v.lines() {
+            let trimmed = line.trim();
+            // Match: "wire signed [<bits>:0] _w<N>;"
+            if let Some(rest) = trimmed.strip_prefix("wire signed [") {
+                if let Some(id_part) = rest.find("] _w").map(|pos| &rest[pos + 4..]) {
+                    if let Some(id_str) = id_part.strip_suffix(';') {
+                        if let Ok(id) = id_str.parse::<u64>() {
+                            declared.insert(id);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Collect assigned wire ids from lines matching `assign _wN = `
+        let mut assigned: HashSet<u64> = HashSet::new();
+        for line in v.lines() {
+            let trimmed = line.trim();
+            if let Some(rest) = trimmed.strip_prefix("assign _w") {
+                if let Some(eq_pos) = rest.find(" = ") {
+                    if let Ok(id) = rest[..eq_pos].parse::<u64>() {
+                        assigned.insert(id);
+                    }
+                }
+            }
+        }
+
+        // Every assigned wire must be declared.
+        let undeclared: Vec<u64> = assigned.difference(&declared).copied().collect();
+        assert!(
+            undeclared.is_empty(),
+            "sequential datapath has undeclared wires (implicit 1-bit nets): {:?}",
+            undeclared,
+        );
+
+        // Specifically assert the 64-bit acc_next wire is declared as [63:0].
+        assert!(
+            v.contains("wire signed [63:0]"),
+            "expected at least one 64-bit wire declaration (acc_next) in sequential Verilog",
+        );
+
+        // Sanity: there are assigned wires at all (guards against a vacuously-passing test).
+        assert!(!assigned.is_empty(), "no assigned wires found — datapath may be empty");
+    }
+
+    /// M57.1 fix: every `assign _wN =` in the **combinational** v1 MLP datapath
+    /// must have a matching `wire signed [...:0] _wN;` declaration so Verilog
+    /// simulators see explicitly-sized wires instead of implicit 1-bit nets.
+    ///
+    /// Mirrors `sequential_datapath_wires_are_all_declared` (M57.2) for the
+    /// combinational path. Must fail before the fix and pass after.
+    #[test]
+    fn combinational_datapath_wires_are_all_declared() {
+        use crate::backend_verilog::lower::VerilogEmitter;
+        use std::collections::HashSet;
+
+        let kir = two_layer_mlp_kir();
+        let module = KirToHirPass { test_taps: false, sequential: false }
+            .lower(&kir, "tiny_mlp")
+            .unwrap();
+        let v = VerilogEmitter::emit_module(&module);
+
+        // Collect declared wire ids from lines matching `wire signed [..:0] _wN;`
+        let mut declared: HashSet<u64> = HashSet::new();
+        for line in v.lines() {
+            let trimmed = line.trim();
+            // Match: "wire signed [<bits>:0] _w<N>;"
+            if let Some(rest) = trimmed.strip_prefix("wire signed [") {
+                if let Some(id_part) = rest.find("] _w").map(|pos| &rest[pos + 4..]) {
+                    if let Some(id_str) = id_part.strip_suffix(';') {
+                        if let Ok(id) = id_str.parse::<u64>() {
+                            declared.insert(id);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Collect assigned wire ids from lines matching `assign _wN = `
+        let mut assigned: HashSet<u64> = HashSet::new();
+        for line in v.lines() {
+            let trimmed = line.trim();
+            if let Some(rest) = trimmed.strip_prefix("assign _w") {
+                if let Some(eq_pos) = rest.find(" = ") {
+                    if let Ok(id) = rest[..eq_pos].parse::<u64>() {
+                        assigned.insert(id);
+                    }
+                }
+            }
+        }
+
+        // Every assigned wire must be declared (assigned ⊆ declared).
+        let mut undeclared: Vec<u64> = assigned.difference(&declared).copied().collect();
+        undeclared.sort_unstable();
+        assert!(
+            undeclared.is_empty(),
+            "combinational datapath has undeclared wires (implicit 1-bit nets): {:?}",
+            undeclared,
+        );
+
+        // Sanity: there are assigned wires at all (guards against a vacuously-passing test).
+        assert!(!assigned.is_empty(), "no assigned wires found — combinational datapath may be empty");
+    }
+
+    /// M57.2: the FSM must have exactly n_layers + 2 states (IDLE + per-layer MAC
+    /// + DONE) and must NOT contain the phantom S_LOAD state that was declared but
+    /// never entered.
+    #[test]
+    fn sequential_fsm_has_no_phantom_state() {
+        let kir = two_layer_mlp_kir();
+        let module = KirToHirPass { test_taps: false, sequential: true }
+            .lower(&kir, "tiny_mlp_seq").unwrap();
+        // No "S_LOAD" localparam in the module.
+        assert!(
+            !module.local_params().iter().any(|lp| lp.name == "S_LOAD"),
+            "S_LOAD phantom state must not be emitted"
+        );
+        // State localparams = IDLE + 2 MAC + DONE = 4 (n_layers=2 → n_layers+2=4).
+        let n_state_lps = module.local_params().iter().filter(|lp| lp.name.starts_with("S_")).count();
+        assert_eq!(n_state_lps, 4, "expected IDLE + 2 layer-MAC + DONE = 4 states, got {n_state_lps}");
+    }
 
     /// M57.1 wire-array mini §3.2 / Task W5: smallest single-layer case
     /// (layer 1, with bias). Verifies the fused emitter shape:
@@ -1205,5 +2121,90 @@ mod tests {
         // No-bias still emits W1 LocalParamArray but no b1.
         assert_eq!(module.local_param_arrays().len(), 1, "W1 only (no b1)");
         assert_eq!(module.local_param_arrays()[0].name, "W1");
+    }
+
+    /// M57.2 (Task 21 / SQ-5): bias-seed correctness regression.
+    ///
+    /// The FSM must use exactly three bias-seed forms per §3.4:
+    ///   (1) Phase-entry seed:  `b{i}[0]`              — Literal(0)
+    ///   (2) Intra-layer advance: `b{i}[(_rN + 1)]`   — RegPlus(o_reg, 1)
+    ///   (3) Final layer → S_DONE: NO bias-seed at all (no b{last}[…] assign
+    ///       in the o_is_last arm).
+    ///
+    /// The BUG this guards against (SQ-5): accidentally emitting `b{i}[_rN]`
+    /// (bare Reg) instead of `b{i}[(_rN + 1)]` in the intra-layer advance,
+    /// which would re-read the old accumulator bias instead of the next output's
+    /// bias, silently corrupting every h_buf cell except the first.
+    ///
+    /// Approach: emit the sequential module to Verilog, then parse the text to
+    /// verify the three cases.  Text matching is more robust than deep AST
+    /// walking for this invariant because it covers the full emission pipeline
+    /// (HIR construction + Verilog templates + sequential process emission).
+    #[test]
+    fn bias_seed_three_cases_use_correct_indices() {
+        use crate::backend_verilog::lower::VerilogEmitter;
+
+        let kir = two_layer_mlp_kir();
+        let module = KirToHirPass { test_taps: false, sequential: true }
+            .lower(&kir, "tiny_mlp_seq").unwrap();
+        let v = VerilogEmitter::emit_module(&module);
+
+        // ── Case (1): phase-entry seeds b1[0] and b2[0] ─────────────────────
+        assert!(
+            v.contains("b1[0]"),
+            "layer-1 phase-entry seed b1[0] missing from FSM Verilog",
+        );
+        assert!(
+            v.contains("b2[0]"),
+            "layer-2 phase-entry seed b2[0] missing from FSM Verilog",
+        );
+
+        // ── Case (2): intra-layer advance b{i}[(o+1)] ───────────────────────
+        // The o register emits as `_rN`; the RegPlus form emits as `[(_rN + 1)]`.
+        // We locate the o-register name from the `o <= ZERO` reset line
+        // (the only line of the form `_rN <= ZERO;` in the reset block where N
+        // is also used as an index in b1/b2 subscripts).
+        //
+        // More practically: scan for `b1[(` and confirm ` + 1)]` follows on the
+        // same line (the full token is `b1[(_rN + 1)]`).
+        let b1_intra = v.lines().any(|line| {
+            if let Some(pos) = line.find("b1[(") {
+                line[pos..].contains(" + 1)]")
+            } else {
+                false
+            }
+        });
+        assert!(
+            b1_intra,
+            "intra-layer advance `b1[(_rN + 1)]` missing from FSM Verilog",
+        );
+
+        // ── Case (3): no bare `b1[_rN]` or `b2[_rN]` form ──────────────────
+        // Locate the o-register id by finding a line `_rN <= _rM;` in the
+        // always_ff block where _rM is the o_next wire — but the simplest
+        // proxy is: any line that matches `b1[_r` or `b2[_r` but does NOT
+        // also contain ` + 1)]` is the bug form.
+        let bare_b1_bug = v.lines().any(|line| {
+            // Match `b1[_r` (bare reg subscript) but not `b1[(_r` (RegPlus form)
+            line.contains("b1[_r")
+        });
+        assert!(
+            !bare_b1_bug,
+            "bare-reg bias index `b1[_rN]` found in FSM Verilog — SQ-5 regression!",
+        );
+        let bare_b2_bug = v.lines().any(|line| {
+            line.contains("b2[_r")
+        });
+        assert!(
+            !bare_b2_bug,
+            "bare-reg bias index `b2[_rN]` found in FSM Verilog — SQ-5 regression!",
+        );
+
+        // ── Case (3) continued: final layer's o_is_last arm enters S_DONE ────
+        // The S_DONE transition must appear in the Verilog.
+        assert!(
+            v.contains("S_DONE"),
+            "S_DONE state missing from FSM — final-layer o_is_last arm not wired correctly",
+        );
     }
 }

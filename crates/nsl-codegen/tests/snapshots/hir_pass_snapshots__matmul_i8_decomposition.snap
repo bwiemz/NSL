@@ -14,8 +14,11 @@ nodes: 1
 [0] GenerateFor lo=0 hi=128 body={
   [0] Wire width=32
   [1] GenerateFor lo=0 hi=784 body={
-    [0] Mul a_width=8 b_width=8 out_width=16 a="Port(x_l1)" b="LocalParam(W1)"
-    [1] SignExtend src_width=16 dst_width=32
-    [2] Add width=32 a="Port(acc_l1_prev)" b="Wire(<id>)"
+    [0] WireDecl width=16
+    [1] Mul a_width=8 b_width=8 out_width=16 a="Port(x_l1)" b="LocalParam(W1)"
+    [2] WireDecl width=32
+    [3] SignExtend src_width=16 dst_width=32
+    [4] WireDecl width=32
+    [5] Add width=32 a="Port(acc_l1_prev)" b="Wire(<id>)"
   }
 }

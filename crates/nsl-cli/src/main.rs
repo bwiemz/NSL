@@ -718,6 +718,11 @@ enum Cli {
         /// Only valid with --target fpga.
         #[arg(long)]
         test_taps: bool,
+
+        /// M57.2: emit the clocked sequential FSM instead of the combinational netlist.
+        /// Prints `total_cycles=<N>` to stdout after writing the .v file.
+        #[arg(long)]
+        seq: bool,
     },
 }
 
@@ -1962,8 +1967,9 @@ fn main_inner() {
             run_tokenize(&dirs, &output, vocab_size, min_freq, &ext);
         }
 
-        Cli::FpgaCompile { file, output_dir, fixture, test_taps } => {
-            if let Err(e) = run_fpga_compile(&file, fixture.as_ref(), output_dir.as_ref(), test_taps)
+        Cli::FpgaCompile { file, output_dir, fixture, test_taps, seq } => {
+            if let Err(e) =
+                run_fpga_compile(&file, fixture.as_ref(), output_dir.as_ref(), test_taps, seq)
             {
                 eprintln!("error: {e}");
                 process::exit(1);
@@ -1992,6 +1998,12 @@ fn main_inner() {
 /// The fixed top-level module name emitted by the v1 KIR→HIR pass.
 /// Mirrors `KirToHirPass::lower(&kir, "tiny_mlp")` below.
 const FPGA_V1_MODULE_NAME: &str = "tiny_mlp";
+
+/// Sequential variant module name — distinct from the combinational `tiny_mlp`
+/// so a single Verilator testbench can instantiate BOTH for the v1↔v2
+/// cross-check.  Matches `Vtiny_mlp_seq.h` (clocked testbench) and the
+/// `sequential_v1_mlp_skeleton` snapshot.
+const FPGA_V1_SEQ_MODULE_NAME: &str = "tiny_mlp_seq";
 
 /// Derive `<dir>/<stem>_weights.bin` from the .nsl path (sidecar convention,
 /// spec §6.1). Returns `None` when the source path has no stem.
@@ -2161,6 +2173,7 @@ fn run_fpga_compile(
     fixture_arg: Option<&PathBuf>,
     output_dir_arg: Option<&PathBuf>,
     test_taps: bool,
+    seq: bool,
 ) -> Result<(), String> {
     // ── 1. Read NSL source ──────────────────────────────────────────────────
     let source_text = std::fs::read_to_string(source_path)
@@ -2211,9 +2224,21 @@ fn run_fpga_compile(
         .map_err(|e| format!("AST→KIR (FPGA target): {e}"))?;
 
     // ── 4. KIR → HIR ────────────────────────────────────────────────────────
-    let mut hir = nsl_codegen::hir::KirToHirPass::new(test_taps)
-        .lower(&kir, FPGA_V1_MODULE_NAME)
+    // M57.2: `seq` selects the sequential clocked FSM lowering; combinational
+    // is the default (`sequential: false`).  Use the struct literal directly so
+    // we don't need to touch `KirToHirPass::new`'s other callers.
+    // The sequential module uses a distinct name (`tiny_mlp_seq`) so that a
+    // single Verilator testbench can instantiate both variants simultaneously
+    // for the v1↔v2 cross-check (Vtiny_mlp_seq.h / Vtiny_mlp.h).
+    let module_name = if seq { FPGA_V1_SEQ_MODULE_NAME } else { FPGA_V1_MODULE_NAME };
+    let mut hir = nsl_codegen::hir::KirToHirPass { test_taps, sequential: seq }
+        .lower(&kir, module_name)
         .map_err(|e| format!("KIR→HIR: {e}"))?;
+
+    // Stash cycle_count before hir is borrowed by bake_fixture_into_localparams
+    // and emit_module (both take &/&mut HirModule); reading it here lets us print
+    // after emit without keeping an extra borrow alive.
+    let cycle_count = hir.cycle_count;
 
     // ── 5. Bake fixture into LocalParams ────────────────────────────────────
     let fixture_path: PathBuf = match fixture_arg {
@@ -2264,16 +2289,25 @@ fn run_fpga_compile(
     // ── 6. HIR → Verilog ────────────────────────────────────────────────────
     let verilog = nsl_codegen::backend_verilog::VerilogEmitter::emit_module(&hir);
 
-    // ── 7. Write <output-dir>/tiny_mlp.v ────────────────────────────────────
+    // ── 7. Write <output-dir>/<module_name>.v ───────────────────────────────
+    // Combinational → tiny_mlp.v; sequential → tiny_mlp_seq.v.
     let out_dir = output_dir_arg
         .cloned()
         .unwrap_or_else(|| PathBuf::from("target/fpga"));
     std::fs::create_dir_all(&out_dir)
         .map_err(|e| format!("create output dir `{}`: {e}", out_dir.display()))?;
-    let out_path = out_dir.join(format!("{FPGA_V1_MODULE_NAME}.v"));
+    let out_path = out_dir.join(format!("{module_name}.v"));
     std::fs::write(&out_path, &verilog)
         .map_err(|e| format!("write `{}`: {e}", out_path.display()))?;
     println!("Wrote {}", out_path.display());
+
+    // M57.2: print the deterministic cycle count when --seq was requested.
+    if seq {
+        if let Some(cycles) = cycle_count {
+            println!("total_cycles={cycles}");
+        }
+    }
+
     Ok(())
 }
 

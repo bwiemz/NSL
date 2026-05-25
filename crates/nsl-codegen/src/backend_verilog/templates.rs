@@ -42,6 +42,19 @@ pub fn emit_signal_ref(s: &SignalRef) -> String {
             }).collect();
             format!("{{{}}}", elems.join(", "))
         }
+        // M57.2: combinational read of a `RegArray` element. Renders
+        // identically to `WireArrayElement` — `name[idx...]`.
+        SignalRef::RegArrayElement { array_name, indices } => {
+            format!("{}{}", array_name, emit_index_exprs(indices))
+        }
+        // M57.2: concat over a `RegArray`'s elements (high-order first).
+        // Clocked sibling of `WireArrayConcat`; 1D only (no fixed_index).
+        // Drives the final-layer `out` port from `h_buf`.
+        SignalRef::RegArrayConcat { array_name, n } => {
+            let elems: Vec<String> =
+                (0..*n).rev().map(|i| format!("{}[{}]", array_name, i)).collect();
+            format!("{{{}}}", elems.join(", "))
+        }
     }
 }
 
@@ -54,6 +67,8 @@ pub(crate) fn emit_index_exprs(indices: &[IndexExpr]) -> String {
             IndexExpr::Literal(n) => format!("[{}]", n),
             IndexExpr::Genvar(name) => format!("[{}]", name),
             IndexExpr::GenvarPlus(name, k) => format!("[({} + {})]", name, k),
+            IndexExpr::Reg(r) => format!("[_r{}]", r.0),
+            IndexExpr::RegPlus(r, k) => format!("[(_r{} + {})]", r.0, k),
         })
         .collect()
 }
@@ -153,6 +168,39 @@ pub fn emit_max0(m: &Max0) -> String {
     )
 }
 
+/// M57.2 (Task 3): combinational equality against a compile-time constant.
+/// Emits `assign _w{out} = ($signed({lhs}) == {rhs});` (1-bit result).
+pub fn emit_cmp_eq(c: &CmpEq) -> String {
+    format!("assign _w{} = ($signed({}) == {});", c.out.0, emit_signal_ref(&c.lhs), c.rhs)
+}
+
+/// M57.2 (Task 4): combinational add of a compile-time constant.
+/// Emits `assign _w{out} = $signed({src}) + {k};`.
+pub fn emit_add_const(a: &AddConst) -> String {
+    format!("assign _w{} = $signed({}) + {};", a.out.0, emit_signal_ref(&a.src), a.k)
+}
+
+/// M57.2 (Task 5): declaration-only scalar register.
+/// Emits `reg signed [w-1:0] _r{id};` — no always_ff block.
+pub fn emit_reg_decl(d: &RegDecl) -> String {
+    format!("reg signed [{}:0] _r{};", d.width - 1, d.id.0)
+}
+
+/// M57.2: declaration-only combinational wire.
+/// Emits `wire signed [w-1:0] _w{id};` — no `assign`. The driving `assign`
+/// comes from the companion combinational node (Mul/Add/Max0/SignExtend/
+/// CmpEq/AddConst) pushed immediately after this declaration in the module body.
+pub fn emit_wire_decl(d: &WireDecl) -> String {
+    format!("wire signed [{}:0] _w{};", d.width - 1, d.id.0)
+}
+
+/// M57.2 (Task 6): module-scope clocked register array — sequential sibling
+/// of `WireArray`. Emits `reg signed [w-1:0] {name} [0:dims[0]-1]...;`.
+pub fn emit_reg_array(ra: &RegArray) -> String {
+    let dims_str: String = ra.dims.iter().map(|d| format!("[0:{}]", d - 1)).collect();
+    format!("reg signed [{}:0] {} {};", ra.width - 1, ra.name, dims_str)
+}
+
 pub fn emit_sign_extend(s: &SignExtend) -> String {
     let pad = s.dst_width - s.src_width;
     let src = emit_signal_ref(&s.src);
@@ -162,11 +210,100 @@ pub fn emit_sign_extend(s: &SignExtend) -> String {
     )
 }
 
+// --- Sequential / clocked node emitters ---
+
+/// M57.2 (Task 7): render a `SeqLValue` to a Verilog lvalue string.
+/// Scalar register → `_r{id}`; array element → `name[idx...]`.
+pub(crate) fn emit_seq_lvalue(lv: &crate::hir::nodes::SeqLValue) -> String {
+    use crate::hir::nodes::SeqLValue;
+    match lv {
+        SeqLValue::Register(r) => format!("_r{}", r.0),
+        SeqLValue::RegArrayElement { array_name, indices } => {
+            format!("{}{}", array_name, emit_index_exprs(indices))
+        }
+    }
+}
+
+/// Render a `SeqStmt` at `indent` columns. Recursive; newline-joins nested
+/// statements. Used inside `emit_seq_process`'s reset/else branches.
+pub(crate) fn emit_seq_stmt(s: &crate::hir::nodes::SeqStmt, indent: usize) -> String {
+    use crate::hir::nodes::SeqStmt;
+    let pad = " ".repeat(indent);
+    match s {
+        SeqStmt::RegAssign { target, value } => {
+            format!("{pad}{} <= {};", emit_seq_lvalue(target), emit_signal_ref(value))
+        }
+        SeqStmt::If { cond, then_body, else_body } => {
+            let then_s = then_body.iter().map(|st| emit_seq_stmt(st, indent + 2))
+                .collect::<Vec<_>>().join("\n");
+            let head = format!("{pad}if ({}) begin\n{then_s}\n{pad}end", emit_signal_ref(cond));
+            if else_body.is_empty() {
+                head
+            } else {
+                let else_s = else_body.iter().map(|st| emit_seq_stmt(st, indent + 2))
+                    .collect::<Vec<_>>().join("\n");
+                format!("{head} else begin\n{else_s}\n{pad}end")
+            }
+        }
+        SeqStmt::Case { selector, arms, default } => {
+            let mut body = String::new();
+            for (val, stmts) in arms {
+                let inner = stmts.iter().map(|st| emit_seq_stmt(st, indent + 4))
+                    .collect::<Vec<_>>().join("\n");
+                body.push_str(&format!("{pad}  {}: begin\n{inner}\n{pad}  end\n", val));
+            }
+            let def = default.iter().map(|st| emit_seq_stmt(st, indent + 4))
+                .collect::<Vec<_>>().join("\n");
+            format!("{pad}case ({})\n{body}{pad}  default: begin\n{def}\n{pad}  end\n{pad}endcase",
+                    emit_signal_ref(selector))
+        }
+        SeqStmt::Block(stmts) => {
+            stmts.iter().map(|st| emit_seq_stmt(st, indent)).collect::<Vec<_>>().join("\n")
+        }
+    }
+}
+
 // --- Register lowering — all 4 dialect combinations ---
 
 use crate::hir::clock_reset::{ResetPolarity, ResetSync};
 use std::collections::BTreeMap;
 use crate::hir::ids::{ClockDomainId, ResetSignalId};
+
+pub fn emit_seq_process(
+    sp: &crate::hir::nodes::SeqProcess,
+    indent: usize,
+    clock_domains: &BTreeMap<ClockDomainId, String>,
+    reset_signals: &BTreeMap<ResetSignalId, String>,
+) -> String {
+    use crate::hir::nodes::SeqStmt;
+    let pad = " ".repeat(indent);
+    let clk = clock_domains.get(&sp.clock.domain_id).expect("clock domain name not registered");
+    let rst = reset_signals.get(&sp.reset.signal_id).expect("reset signal name not registered");
+    let rst_check = match sp.reset.polarity {
+        ResetPolarity::High => rst.clone(),
+        ResetPolarity::Low => format!("!{}", rst),
+    };
+    let sensitivity = match sp.reset.sync {
+        ResetSync::Sync => format!("@(posedge {})", clk),
+        ResetSync::Async => match sp.reset.polarity {
+            ResetPolarity::High => format!("@(posedge {} or posedge {})", clk, rst),
+            ResetPolarity::Low  => format!("@(posedge {} or negedge {})", clk, rst),
+        },
+    };
+    let mut resets = sp.reset_body.iter().map(|st| emit_seq_stmt(st, indent + 4))
+        .collect::<Vec<_>>().join("\n");
+    for (name, count) in &sp.reset_arrays {
+        resets.push_str(&format!(
+            "\n{}for (int _i = 0; _i < {}; _i = _i + 1) {}[_i] <= '0;",
+            " ".repeat(indent + 4), count, name));
+    }
+    let body = sp.body.iter().map(|st: &SeqStmt| emit_seq_stmt(st, indent + 4))
+        .collect::<Vec<_>>().join("\n");
+    format!(
+        "{pad}always_ff {sensitivity} begin\n\
+         {pad}  if ({rst_check}) begin\n{resets}\n{pad}  end else begin\n{body}\n{pad}  end\n\
+         {pad}end")
+}
 
 pub fn emit_register(
     r: &Register,
@@ -305,6 +442,19 @@ pub fn emit_node(
         HirNode::AssignWireArrayElement(a) => {
             format!("{pad}{}", emit_assign_wire_array_element(a))
         }
+        // M57.2 (Task 3): combinational equality against a compile-time constant.
+        HirNode::CmpEq(c) => format!("{pad}{}", emit_cmp_eq(c)),
+        // M57.2 (Task 4): combinational add of a compile-time constant.
+        HirNode::AddConst(a) => format!("{pad}{}", emit_add_const(a)),
+        // M57.2 (Task 5): declaration-only scalar register.
+        HirNode::RegDecl(d) => format!("{pad}{}", emit_reg_decl(d)),
+        // M57.2 (Task 6): module-scope clocked register array.
+        HirNode::RegArray(ra) => format!("{pad}{}", emit_reg_array(ra)),
+        // M57.2 (Task 9): clocked sequential process. emit_seq_process already
+        // applies indent internally — do NOT wrap with {pad}{}.
+        HirNode::SeqProcess(sp) => emit_seq_process(sp, indent, clock_domains, reset_signals),
+        // M57.2: declaration-only combinational wire — emitted as a plain wire decl.
+        HirNode::WireDecl(d) => format!("{pad}{}", emit_wire_decl(d)),
     }
 }
 
@@ -455,6 +605,166 @@ mod tests {
             emit_assign_wire_array_element(&a),
             "assign acc_l1[5][0] = b1_5;"
         );
+    }
+
+    #[test]
+    fn index_expr_reg_and_regplus_emit() {
+        use crate::hir::ids::RegisterId;
+        let r = RegisterId(7);
+        let s = emit_index_exprs(&[IndexExpr::Reg(r)]);
+        assert_eq!(s, "[_r7]");
+        let s2 = emit_index_exprs(&[IndexExpr::RegPlus(r, 1)]);
+        assert_eq!(s2, "[(_r7 + 1)]");
+    }
+
+    #[test]
+    fn signal_ref_reg_array_element_emits() {
+        use crate::hir::ids::RegisterId;
+        let s = SignalRef::reg_array_element("h_buf", vec![IndexExpr::Reg(RegisterId(2))]);
+        assert_eq!(emit_signal_ref(&s), "h_buf[_r2]");
+    }
+
+    // --- M57.2 (Task 3): CmpEq combinational node ---
+
+    #[test]
+    fn cmp_eq_emits_equality() {
+        use crate::hir::ids::{RegisterId, WireId};
+        let c = CmpEq { lhs: SignalRef::Register(RegisterId(4)), rhs: 783, out: WireId(9) };
+        assert_eq!(emit_cmp_eq(&c), "assign _w9 = ($signed(_r4) == 783);");
+    }
+
+    // --- M57.2 (Task 4): AddConst combinational node ---
+
+    #[test]
+    fn add_const_emits_increment() {
+        use crate::hir::ids::{RegisterId, WireId};
+        let a = AddConst { src: SignalRef::Register(RegisterId(4)), k: 1, out: WireId(12), width: 10 };
+        assert_eq!(emit_add_const(&a), "assign _w12 = $signed(_r4) + 1;");
+    }
+
+    // --- M57.2: WireDecl declaration-only combinational wire ---
+
+    #[test]
+    fn wire_decl_emits_declaration_only() {
+        use crate::hir::ids::WireId;
+        let d = WireDecl { id: WireId(9), width: 64 };
+        assert_eq!(emit_wire_decl(&d), "wire signed [63:0] _w9;");
+    }
+
+    // --- M57.2 (Task 5): RegDecl declaration-only register ---
+
+    #[test]
+    fn reg_decl_emits_declaration_only() {
+        use crate::hir::ids::RegisterId;
+        let d = RegDecl { id: RegisterId(5), width: 64 };
+        assert_eq!(emit_reg_decl(&d), "reg signed [63:0] _r5;");
+    }
+
+    // --- M57.2 (Task 6): RegArray clocked register array ---
+
+    #[test]
+    fn reg_array_emits_declaration() {
+        let ra = RegArray { name: "x_buf".into(), dims: vec![784], width: 8 };
+        assert_eq!(emit_reg_array(&ra), "reg signed [7:0] x_buf [0:783];");
+    }
+
+    // --- M57.2 (Task 7): SeqLValue ---
+
+    #[test]
+    fn seq_lvalue_emits() {
+        use crate::hir::ids::RegisterId;
+        use crate::hir::nodes::SeqLValue;
+        assert_eq!(emit_seq_lvalue(&SeqLValue::Register(RegisterId(3))), "_r3");
+        let e = SeqLValue::RegArrayElement {
+            array_name: "h_buf".into(),
+            indices: vec![IndexExpr::Reg(RegisterId(2))],
+        };
+        assert_eq!(emit_seq_lvalue(&e), "h_buf[_r2]");
+    }
+
+    // --- M57.2 (Task 8): SeqStmt ---
+
+    #[test]
+    fn seq_stmt_reg_assign_emits_nonblocking() {
+        use crate::hir::ids::{RegisterId, WireId};
+        use crate::hir::nodes::{SeqLValue, SeqStmt};
+        let s = SeqStmt::RegAssign {
+            target: SeqLValue::Register(RegisterId(1)),
+            value: SignalRef::Wire(WireId(8)),
+        };
+        assert_eq!(emit_seq_stmt(&s, 0), "_r1 <= _w8;");
+    }
+
+    #[test]
+    fn seq_stmt_if_emits_then_else() {
+        use crate::hir::ids::{RegisterId, WireId};
+        use crate::hir::nodes::{SeqLValue, SeqStmt};
+        let s = SeqStmt::If {
+            cond: SignalRef::Wire(WireId(2)),
+            then_body: vec![SeqStmt::RegAssign {
+                target: SeqLValue::Register(RegisterId(1)),
+                value: SignalRef::Wire(WireId(3)),
+            }],
+            else_body: vec![SeqStmt::RegAssign {
+                target: SeqLValue::Register(RegisterId(1)),
+                value: SignalRef::Wire(WireId(4)),
+            }],
+        };
+        let out = emit_seq_stmt(&s, 0);
+        assert!(out.starts_with("if (_w2) begin"));
+        assert!(out.contains("_r1 <= _w3;"));
+        assert!(out.contains("end else begin"));
+        assert!(out.contains("_r1 <= _w4;"));
+        assert!(out.trim_end().ends_with("end"));
+    }
+
+    #[test]
+    fn seq_stmt_case_emits_arms_and_default() {
+        use crate::hir::ids::RegisterId;
+        use crate::hir::nodes::SeqStmt;
+        let s = SeqStmt::Case {
+            selector: SignalRef::Register(RegisterId(0)),
+            arms: vec![(0u64, vec![SeqStmt::Block(vec![])])],
+            default: vec![SeqStmt::Block(vec![])],
+        };
+        let out = emit_seq_stmt(&s, 0);
+        assert!(out.starts_with("case (_r0)"));
+        assert!(out.contains("0: begin"));
+        assert!(out.contains("default: begin"));
+        assert!(out.trim_end().ends_with("endcase"));
+    }
+
+    // --- M57.2 (Task 9): SeqProcess ---
+
+    #[test]
+    fn seq_process_emits_always_ff_with_reset_branch() {
+        use crate::hir::ids::{ClockDomainId, RegisterId, ResetSignalId};
+        use crate::hir::clock_reset::{ClkRef, ResetRef, ResetPolarity, ResetSync};
+        use crate::hir::nodes::{SeqLValue, SeqProcess, SeqStmt};
+        let mut cd = BTreeMap::new();
+        cd.insert(ClockDomainId::DEFAULT, "clk".to_string());
+        let mut rs = BTreeMap::new();
+        rs.insert(ResetSignalId::DEFAULT, "rst_n".to_string());
+        let sp = SeqProcess {
+            clock: ClkRef { domain_id: ClockDomainId::DEFAULT },
+            reset: ResetRef {
+                signal_id: ResetSignalId::DEFAULT,
+                polarity: ResetPolarity::Low,
+                sync: ResetSync::Async,
+            },
+            reset_body: vec![SeqStmt::RegAssign {
+                target: SeqLValue::Register(RegisterId(0)),
+                value: SignalRef::LocalParam("S_IDLE".into()),
+            }],
+            reset_arrays: vec![("x_buf".into(), 784)],
+            body: vec![SeqStmt::Block(vec![])],
+        };
+        let out = emit_seq_process(&sp, 4, &cd, &rs);
+        assert!(out.contains("always_ff @(posedge clk or negedge rst_n) begin"));
+        assert!(out.contains("if (!rst_n) begin"));
+        assert!(out.contains("_r0 <= S_IDLE;"));
+        assert!(out.contains("for (int _i = 0; _i < 784; _i = _i + 1) x_buf[_i] <= '0;"));
+        assert!(out.contains("end else begin"));
     }
 }
 

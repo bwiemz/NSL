@@ -23,6 +23,12 @@ pub enum IndexExpr {
     /// Genvar plus a non-negative constant offset. Emits `(name + k)`.
     /// Used for ripple-write targets like `acc[o][k + 1]`.
     GenvarPlus(String, i64),
+    /// M57.2: runtime register-valued index. Emits `_r{id}` (e.g. `acc[_r5]`).
+    /// Used for `x_buf[k]`, `W{i}[k][o]`, `h_buf[o]` indexing by FSM counters.
+    Reg(crate::hir::ids::RegisterId),
+    /// M57.2: register plus a constant offset. Emits `(_r{id} + k)`.
+    /// Used for the §3.4 intra-layer bias-seed `b{i}[o+1]`.
+    RegPlus(crate::hir::ids::RegisterId, i64),
 }
 
 /// Module-scope multi-dimensional wire array declaration.
@@ -34,6 +40,18 @@ pub enum IndexExpr {
 /// well-formed HIR and does not validate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WireArray {
+    pub name: String,
+    pub dims: Vec<usize>,
+    pub width: usize,
+}
+
+/// M57.2: module-scope clocked register array — the sequential sibling of
+/// `WireArray`. Holds activation buffers (`x_buf`, `h_buf`). Declared by
+/// `emit_reg_array`; elements updated by non-blocking `SeqStmt::RegAssign`
+/// inside a `SeqProcess`, and reset per-element in the `negedge rst_n` branch
+/// (see `SeqProcess.reset_arrays`). v1 uses 1D arrays only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegArray {
     pub name: String,
     pub dims: Vec<usize>,
     pub width: usize,
@@ -130,6 +148,40 @@ impl LocalParam {
 
 // --- Combinational nodes ---
 
+/// M57.2: combinational equality against a compile-time constant.
+/// Emits `assign _w{out} = ($signed({lhs}) == {rhs});` (1-bit result).
+/// Realizes §3.3 within-state guards (`k == K-1`, `o == N-1`) as Wires so
+/// `SeqStmt::If.cond` stays a `SignalRef::Wire`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CmpEq {
+    pub lhs: SignalRef,
+    pub rhs: u64,
+    pub out: WireId,
+}
+
+impl CmpEq {
+    pub fn new(lhs: SignalRef, rhs: u64) -> Self {
+        Self { lhs, rhs, out: WireId::fresh() }
+    }
+}
+
+/// M57.2: combinational add of a compile-time constant. Emits
+/// `assign _w{out} = $signed({src}) + {k};` (result width = `width`).
+/// Realizes §3.3 counter increments (`k+1`, `o+1`) as Wires read by RegAssign.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddConst {
+    pub src: SignalRef,
+    pub k: i64,
+    pub out: WireId,
+    pub width: usize,
+}
+
+impl AddConst {
+    pub fn new(src: SignalRef, k: i64, width: usize) -> Self {
+        Self { src, k, out: WireId::fresh(), width }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Mul {
     pub a: SignalRef,
@@ -210,7 +262,70 @@ impl SignExtend {
     }
 }
 
-// --- Sequential node ---
+// --- M57.2: declaration-only combinational wire ---
+
+/// M57.2: declaration-only combinational wire. Emits `wire signed [w-1:0] _w{id};`.
+/// Unlike `Wire` (whose `produces_wire` registers the id as a driver), `WireDecl`
+/// only declares — the driving `assign` comes from a separate combinational node
+/// (`Mul`/`Add`/`Max0`/`SignExtend`/`CmpEq`/`AddConst`) with the same id. Used by
+/// the sequential datapath so its wires are explicitly sized (no implicit 1-bit nets).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WireDecl {
+    pub id: crate::hir::ids::WireId,
+    pub width: usize,
+}
+
+// --- Sequential / clocked nodes ---
+
+/// M57.2: LValue for a `SeqStmt::RegAssign` — a scalar register or one element
+/// of a `RegArray`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SeqLValue {
+    Register(crate::hir::ids::RegisterId),
+    RegArrayElement { array_name: String, indices: Vec<IndexExpr> },
+}
+
+/// M57.2: minimal sequential statement language (§2.2). `If` carries boolean
+/// within-state guards (`k==K-1`/`o==N-1`); `Case` carries the multi-way state
+/// selector — kept distinct (§2.2). All assignments are non-blocking.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SeqStmt {
+    RegAssign { target: SeqLValue, value: SignalRef },
+    If { cond: SignalRef, then_body: Vec<SeqStmt>, else_body: Vec<SeqStmt> },
+    Case { selector: SignalRef, arms: Vec<(u64, Vec<SeqStmt>)>, default: Vec<SeqStmt> },
+    Block(Vec<SeqStmt>),
+}
+
+/// M57.2: clocked process → `always_ff @(posedge clk or negedge rst_n)`.
+/// `reset_body` = scalar register resets; `reset_arrays` = (RegArray name,
+/// element count) for per-element reset for-loops (§4); `body` = the FSM
+/// (a state `Case`). Realizes §4's reset branch fully.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeqProcess {
+    pub clock: crate::hir::clock_reset::ClkRef,
+    pub reset: crate::hir::clock_reset::ResetRef,
+    pub reset_body: Vec<SeqStmt>,
+    pub reset_arrays: Vec<(String, usize)>,
+    pub body: Vec<SeqStmt>,
+}
+
+// --- Sequential nodes ---
+
+/// M57.2: declaration-only scalar register. Emits just `reg signed [w-1:0] _r{id};`.
+/// Unlike `Register` (which bundles its own `always_ff`), an FSM scalar
+/// (`state`/`o`/`k`/`acc`/`out`) is declared by `RegDecl` and driven by the
+/// single `SeqProcess` always_ff. Read via `SignalRef::Register(id)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RegDecl {
+    pub id: RegisterId,
+    pub width: usize,
+}
+
+impl RegDecl {
+    pub fn new(width: usize) -> Self {
+        Self { id: RegisterId::fresh(), width }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Register {

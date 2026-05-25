@@ -34,6 +34,12 @@ fn structural_summary(module: &HirModule) -> String {
     let mut out = String::new();
     out.push_str(&format!("module: {}\n", module.name));
     out.push_str(&format!("test_taps: {}\n", module.test_taps));
+    // M57.2 (Task 18): include cycle_count for sequential modules only; omit
+    // for combinational (None) so existing combinational snapshots are
+    // byte-identical (Pin 2 preservation).
+    if let Some(n) = module.cycle_count {
+        out.push_str(&format!("cycle_count: {n}\n"));
+    }
     out.push_str(&format!("ports: {}\n", module.ports.len()));
     for port in &module.ports {
         match port {
@@ -275,6 +281,48 @@ fn summarize_node(out: &mut String, node: &HirNode, idx: usize, depth: usize) {
                 a.array_name, idx_str, format_sigref(&a.src),
             ));
         }
+        // M57.2 (Task 3): combinational equality guard.
+        HirNode::CmpEq(c) => {
+            out.push_str(&format!(
+                "{indent}[{idx}] CmpEq lhs={} rhs={}\n",
+                format_sigref(&c.lhs), c.rhs,
+            ));
+        }
+        // M57.2 (Task 4): combinational add-constant.
+        HirNode::AddConst(a) => {
+            out.push_str(&format!(
+                "{indent}[{idx}] AddConst width={} k={} src={}\n",
+                a.width, a.k, format_sigref(&a.src),
+            ));
+        }
+        // M57.2 (Task 5): declaration-only scalar register.
+        HirNode::RegDecl(d) => {
+            out.push_str(&format!(
+                "{indent}[{idx}] RegDecl width={}\n",
+                d.width,
+            ));
+        }
+        // M57.2 (Task 6): module-scope clocked register array.
+        HirNode::RegArray(ra) => {
+            out.push_str(&format!(
+                "{indent}[{idx}] RegArray {} dims={:?} width={}\n",
+                ra.name, ra.dims, ra.width,
+            ));
+        }
+        // M57.2 (Task 9): clocked sequential process.
+        HirNode::SeqProcess(sp) => {
+            out.push_str(&format!(
+                "{indent}[{idx}] SeqProcess (reset_arrays={}, body={} stmts)\n",
+                sp.reset_arrays.len(), sp.body.len(),
+            ));
+        }
+        // M57.2: declaration-only combinational wire (no driver).
+        HirNode::WireDecl(d) => {
+            out.push_str(&format!(
+                "{indent}[{idx}] WireDecl width={}\n",
+                d.width,
+            ));
+        }
     }
 }
 
@@ -286,6 +334,8 @@ fn format_index_exprs(indices: &[nsl_codegen::hir::nodes::IndexExpr]) -> String 
             IndexExpr::Literal(n) => format!("[{}]", n),
             IndexExpr::Genvar(name) => format!("[{}]", name),
             IndexExpr::GenvarPlus(name, k) => format!("[({} + {})]", name, k),
+            IndexExpr::Reg(r) => format!("[_r{}]", r.0),
+            IndexExpr::RegPlus(r, k) => format!("[(_r{} + {})]", r.0, k),
         })
         .collect()
 }
@@ -315,6 +365,15 @@ fn format_sigref(s: &nsl_codegen::hir::SignalRef) -> String {
                 Some(fix) => format!("WireArrayConcat({array_name}, n={n}, fix={fix})"),
                 None => format!("WireArrayConcat({array_name}, n={n})"),
             }
+        }
+        // M57.2: combinational reg-array element read — identical render shape to
+        // WireArrayElement.
+        nsl_codegen::hir::SignalRef::RegArrayElement { array_name, indices } => {
+            format!("RegArrayElement({array_name}{})", format_index_exprs(indices))
+        }
+        // M57.2: concat across a reg-array (1D; no fixed_index) — drives `out`.
+        nsl_codegen::hir::SignalRef::RegArrayConcat { array_name, n } => {
+            format!("RegArrayConcat({array_name}, n={n})")
         }
     }
 }
@@ -486,4 +545,57 @@ fn full_v1_mlp_composition() {
         p, Port::Output { name, .. } if name == "out"
     ));
     assert!(has_out_port, "final layer must declare Port::Output(\"out\")");
+}
+
+// ---------------------------------------------------------------------------
+// Task 18 (M57.2): structural HIR snapshot of the sequential FSM lowering
+// ---------------------------------------------------------------------------
+
+/// Snapshot the structural HIR summary for the sequential v1 MLP FSM.
+/// Reuses the same two-layer KIR fixture as `full_v1_mlp_composition`.
+/// Key things audited in the snapshot:
+///   - cycle_count: 101634
+///   - ports: clk/rst_n/start/x/done/valid/out
+///   - RegArray x_buf + h_buf
+///   - RegDecl scalars (state/o/k/acc/done/valid)
+///   - CmpEq/AddConst/Mul/Add/Max0/WireDecl datapath per layer
+///   - SeqProcess (single always_ff FSM)
+#[test]
+fn sequential_v1_mlp_fsm() {
+    let kir = kir_with_ops(
+        "tiny_mlp",
+        vec![
+            // Layer 1: 784 → 128 (i8×i8→i32)
+            KirOp::Matmul {
+                a: 1, b: 2, out: 3,
+                a_dtype: KirType::I8, b_dtype: KirType::I8, out_dtype: KirType::I32,
+                a_shape: [1, 784], b_shape: [784, 128],
+            },
+            KirOp::ElementwiseAdd {
+                a: 3, b: 4, out: 5,
+                dtype: KirType::I32, shape: [128],
+            },
+            KirOp::Relu {
+                a: 5, out: 6,
+                dtype: KirType::I32, shape: [128],
+            },
+            // Layer 2: 128 → 10 (i32×i32→i64)
+            KirOp::Matmul {
+                a: 6, b: 7, out: 8,
+                a_dtype: KirType::I32, b_dtype: KirType::I32, out_dtype: KirType::I64,
+                a_shape: [1, 128], b_shape: [128, 10],
+            },
+            KirOp::ElementwiseAdd {
+                a: 8, b: 9, out: 10,
+                dtype: KirType::I64, shape: [10],
+            },
+            KirOp::Relu {
+                a: 10, out: 11,
+                dtype: KirType::I64, shape: [10],
+            },
+        ],
+    );
+    let module = KirToHirPass { test_taps: false, sequential: true }
+        .lower(&kir, "tiny_mlp_seq").unwrap();
+    assert_snapshot!(structural_summary(&module));
 }

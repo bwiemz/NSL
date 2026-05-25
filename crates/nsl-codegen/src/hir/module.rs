@@ -31,6 +31,29 @@ pub enum HirNode {
     /// produce a single WireId — it drives a single element of an
     /// N-dimensional wire family declared by `WireArray`.
     AssignWireArrayElement(AssignWireArrayElement),
+    /// M57.2: combinational equality against a compile-time constant (Task 3).
+    /// Produces a 1-bit wire: `assign _w{out} = ($signed({lhs}) == {rhs});`.
+    CmpEq(CmpEq),
+    /// M57.2: combinational add of a compile-time constant (Task 4).
+    /// Produces a wire: `assign _w{out} = $signed({src}) + {k};`.
+    AddConst(AddConst),
+    /// M57.2: declaration-only scalar register (Task 5).
+    /// Emits `reg signed [w-1:0] _r{id};` with no bundled always_ff.
+    RegDecl(RegDecl),
+    /// M57.2: module-scope clocked register array (Task 6).
+    /// Emits `reg signed [w-1:0] {name} [0:dims[0]-1]...;` with no always_ff.
+    RegArray(RegArray),
+    /// M57.2: clocked process (Task 9). Emits a single `always_ff` block
+    /// covering the FSM state machine, reset branch, and RegArray reset loops.
+    /// Does not produce a single WireId — the process drives registers
+    /// declared by `RegDecl` and elements of arrays declared by `RegArray`.
+    SeqProcess(crate::hir::nodes::SeqProcess),
+    /// M57.2: declaration-only combinational wire. Emits `wire signed [w-1:0] _w{id};`
+    /// with no `assign` — the driving assignment comes from a separate combinational
+    /// node (Mul/Add/Max0/SignExtend/CmpEq/AddConst) with the same WireId.
+    /// `produces_wire` returns `None` so the single-driver invariant in `add_node`
+    /// is not tripped by the companion combinational node.
+    WireDecl(crate::hir::nodes::WireDecl),
 }
 
 impl HirNode {
@@ -43,12 +66,32 @@ impl HirNode {
             HirNode::Add(a) => Some(a.out),
             HirNode::Max0(m) => Some(m.out),
             HirNode::SignExtend(s) => Some(s.dst),
-            // Register, GenerateFor, GenerateIf, WireArray, AssignWireArrayElement
-            // don't produce a single WireId. (WireArray declares multi-element
-            // wire family; AssignWireArrayElement drives ONE element of one;
-            // single-driver invariant for each element is the caller's
-            // responsibility, same as GenerateFor body uniqueness.)
-            _ => None,
+            // M57.2 (Task 3): combinational equality drives one wire.
+            HirNode::CmpEq(c) => Some(c.out),
+            // M57.2 (Task 4): combinational add-constant drives one wire.
+            HirNode::AddConst(a) => Some(a.out),
+            // Register, RegDecl, GenerateFor, GenerateIf, WireArray,
+            // AssignWireArrayElement don't produce a single WireId.
+            // (WireArray declares multi-element wire family;
+            // AssignWireArrayElement drives ONE element of one; single-driver
+            // invariant for each element is the caller's responsibility, same
+            // as GenerateFor body uniqueness.)
+            HirNode::Register(_) => None,
+            // M57.2 (Task 5): RegDecl is declaration-only — no WireId.
+            HirNode::RegDecl(_) => None,
+            // M57.2 (Task 6): RegArray declares an array family — no single WireId.
+            HirNode::RegArray(_) => None,
+            HirNode::GenerateFor(_) => None,
+            HirNode::GenerateIf(_) => None,
+            HirNode::WireArray(_) => None,
+            HirNode::AssignWireArrayElement(_) => None,
+            // M57.2 (Task 9): SeqProcess drives registers in-place — no WireId.
+            HirNode::SeqProcess(_) => None,
+            // M57.2: WireDecl is declaration-only — no WireId driver registered.
+            // The companion combinational node (Mul/Add/etc.) with the same id
+            // registers its own driver; WireDecl must NOT also register to avoid
+            // tripping the single-driver invariant.
+            HirNode::WireDecl(_) => None,
         }
     }
 }
@@ -76,6 +119,11 @@ pub struct HirModule {
     pub clock_domains: BTreeMap<ClockDomainId, String>,
     pub reset_signals: BTreeMap<ResetSignalId, String>,
     pub test_taps: bool,
+    /// M57.2 (R6): deterministic total latency (in clock cycles) of the
+    /// sequential FSM lowering — carried from `lower_v1_mlp_sequential` to the
+    /// Verilog emitter's header comment. `None` on the combinational path so
+    /// its snapshot/output stays byte-identical.
+    pub cycle_count: Option<u64>,
 
     // Builder state — used by add_node to enforce single-driver invariant.
     driven_wires: HashSet<WireId>,
@@ -104,6 +152,7 @@ impl HirModule {
             clock_domains,
             reset_signals,
             test_taps: true,    // v1 default
+            cycle_count: None,  // M57.2: combinational path leaves this None
             driven_wires: HashSet::new(),
         }
     }

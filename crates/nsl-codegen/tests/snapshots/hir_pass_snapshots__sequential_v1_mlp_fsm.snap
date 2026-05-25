@@ -1,0 +1,67 @@
+---
+source: crates/nsl-codegen/tests/hir_pass_snapshots.rs
+expression: structural_summary(&module)
+---
+module: tiny_mlp_seq
+test_taps: false
+cycle_count: 101634
+ports: 7
+  Port::Input clk width=1
+  Port::Input rst_n width=1
+  Port::Input start width=1
+  Port::Input x width=6272
+  Port::Output done width=1
+  Port::Output valid width=1
+  Port::Output out width=640
+local_params: 6
+  LocalParam S_IDLE width=2
+  LocalParam S_L1_MAC width=2
+  LocalParam S_L2_MAC width=2
+  LocalParam S_DONE width=2
+  LocalParam ZERO width=64
+  LocalParam ONE width=1
+local_param_arrays: 4
+  LocalParamArray W1 dims=[784, 128] width=8
+  LocalParamArray b1 dims=[128] width=32
+  LocalParamArray W2 dims=[128, 10] width=32
+  LocalParamArray b2 dims=[10] width=64
+nodes: 39
+[0] RegDecl width=2
+[1] RegDecl width=8
+[2] RegDecl width=10
+[3] RegDecl width=64
+[4] RegDecl width=1
+[5] RegDecl width=1
+[6] RegArray x_buf dims=[784] width=8
+[7] RegArray h_buf dims=[128] width=64
+[8] WireDecl width=16
+[9] Mul a_width=8 b_width=8 out_width=16 a="RegArrayElement(x_buf[_r3])" b="IndexedLocalParam(W1[_r3][_r2])"
+[10] WireDecl width=64
+[11] SignExtend src_width=16 dst_width=64
+[12] WireDecl width=64
+[13] Add width=64 a="Register(<id>)" b="Wire(<id>)"
+[14] WireDecl width=64
+[15] Max0 width=64 a="Wire(<id>)"
+[16] WireDecl width=10
+[17] AddConst width=10 k=1 src=Register(<id>)
+[18] WireDecl width=8
+[19] AddConst width=8 k=1 src=Register(<id>)
+[20] WireDecl width=1
+[21] CmpEq lhs=Register(<id>) rhs=783
+[22] WireDecl width=1
+[23] CmpEq lhs=Register(<id>) rhs=127
+[24] WireDecl width=64
+[25] Mul a_width=32 b_width=32 out_width=64 a="RegArrayElement(h_buf[_r3])" b="IndexedLocalParam(W2[_r3][_r2])"
+[26] WireDecl width=64
+[27] Add width=64 a="Register(<id>)" b="Wire(<id>)"
+[28] WireDecl width=64
+[29] Max0 width=64 a="Wire(<id>)"
+[30] WireDecl width=10
+[31] AddConst width=10 k=1 src=Register(<id>)
+[32] WireDecl width=8
+[33] AddConst width=8 k=1 src=Register(<id>)
+[34] WireDecl width=1
+[35] CmpEq lhs=Register(<id>) rhs=127
+[36] WireDecl width=1
+[37] CmpEq lhs=Register(<id>) rhs=9
+[38] SeqProcess (reset_arrays=2, body=1 stmts)

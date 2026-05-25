@@ -19,13 +19,17 @@ module tiny_mlp(
     // (128 per-element assigns elided)
     generate for (genvar _gv1 = 0; _gv1 < 128; _gv1++) begin : gen_1
         generate for (genvar _gv2 = 0; _gv2 < 784; _gv2++) begin : gen_2
+            wire signed [15:0] _w1;
             assign _w1 = $signed(x_l1_a[_gv2]) * $signed(W1[_gv2][_gv1]);
+            wire signed [31:0] _w2;
             assign _w2 = {{16{_w1[15]}}, _w1};
+            wire signed [31:0] _w3;
             assign _w3 = $signed(acc_l1[_gv1][_gv2]) + $signed(_w2);
             assign acc_l1[_gv1][(_gv2 + 1)] = _w3;
         end endgenerate
     end endgenerate
     generate for (genvar _gv3 = 0; _gv3 < 128; _gv3++) begin : gen_3
+        wire signed [31:0] _w4;
         assign _w4 = ($signed(acc_l1[_gv3][784]) > 0) ? acc_l1[_gv3][784] : '0;
         assign relu_l1[_gv3] = _w4;
     end endgenerate
@@ -34,12 +38,15 @@ module tiny_mlp(
     // (10 per-element assigns elided)
     generate for (genvar _gv4 = 0; _gv4 < 10; _gv4++) begin : gen_4
         generate for (genvar _gv5 = 0; _gv5 < 128; _gv5++) begin : gen_5
+            wire signed [63:0] _w5;
             assign _w5 = $signed(relu_l1[_gv5]) * $signed(W2[_gv5][_gv4]);
+            wire signed [63:0] _w6;
             assign _w6 = $signed(acc_l2[_gv4][_gv5]) + $signed(_w5);
             assign acc_l2[_gv4][(_gv5 + 1)] = _w6;
         end endgenerate
     end endgenerate
     generate for (genvar _gv6 = 0; _gv6 < 10; _gv6++) begin : gen_6
+        wire signed [63:0] _w7;
         assign _w7 = ($signed(acc_l2[_gv6][128]) > 0) ? acc_l2[_gv6][128] : '0;
         assign relu_l2[_gv6] = _w7;
     end endgenerate
