@@ -1100,8 +1100,8 @@ fn emit_inner_loop_body(ptx: &mut String, config: &FlashAttentionConfig) {
 
     // === Open runtime n-tile streaming loop (DQ_NTILE_LOOP) ===
     // One iteration per 8-column kv n-tile (bkv/8 iterations at runtime). The body
-    // computes S(tiled) → P-recompute → dP(single-tile) → dS → dS-scatter for the
-    // current %n_tile. dP/dS/scatter stay single-tile this task (Tasks 6/7/8 tile them).
+    // computes S(tiled) → P-recompute → dP(tiled) → dS → dS-scatter for the
+    // current %n_tile. dS-scatter stays single-tile this task (Task 7 tiles it).
     let num_n_tiles = tier_b2_effective_bkv(config) / 8;
     ptx.push_str(&format!("    mov.u32 %num_n_tiles, {num_n_tiles};\n"));
     ptx.push_str("    mov.u32 %n_tile, 0;\n");
@@ -1497,9 +1497,9 @@ mod tests {
         let cfg = FlashAttentionConfig { head_dim: 64, ..canonical_cfg() };
         let ptx = synthesize_dq_kernel(&cfg).unwrap();
         let mma = ptx.matches("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32").count();
-        // S contributes hd/16=4 unrolled k-tile MMAs; dP (still single-tile) + dQ (single)
-        // contribute a few more. Assert S alone raised the count to >= 4 emitted MMAs in
-        // the S section AND the n-tile loop + band offset exist.
+        // S contributes hd/16=4 unrolled k-tile MMAs, emitted once inside the runtime
+        // n-tile loop. Assert the S k-tile contraction emits >= 4 MMAs AND the n-tile
+        // loop + band offset exist (lower bound stays valid as later tasks add MMAs).
         assert!(mma >= 4, "S k-tile contraction must emit hd/16 MMAs, got {mma}");
         assert!(ptx.contains("DQ_NTILE_LOOP"), "expected runtime n-tile streaming loop label");
         assert!(ptx.contains("mul.lo.u32 %b_base, %n_tile,"),
@@ -1749,9 +1749,10 @@ mod tests {
         let ptx = synthesize_dq_kernel(&cfg).unwrap();
         let mma = ptx.matches("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32").count();
         assert_eq!(mma, 2 * (64 / 16) + 1, "S(4)+dP(4)+dQ(1)=9 emitted MMAs, got {mma}");
-        // dP B-frag base must derive from %n_tile and reference the V offset region.
-        assert!(ptx.contains("// === dP = dO @ V^T") || ptx.contains("dP = dO @ V^T"),
-            "expected dP section");
+        // dP B-frag base must derive from the runtime %n_tile (the load-bearing
+        // tiled-vs-single-tile invariant), like S — assert the structure, not a comment.
+        assert!(ptx.matches("mul.lo.u32 %b_base, %n_tile,").count() >= 2,
+            "dP (like S) must compute its B-frag base from %n_tile per k-tile");
     }
 
     #[test]
