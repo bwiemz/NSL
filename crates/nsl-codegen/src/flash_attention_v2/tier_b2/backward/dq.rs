@@ -1014,17 +1014,18 @@ fn emit_inner_loop_body(ptx: &mut String, config: &FlashAttentionConfig) {
     // === P recompute (lane-by-lane, no SMEM) per spec §4.3 step 4 ===
     ptx.push_str("    // === P recompute: P[q,k] = exp(S[q,k] - row_max[q]) * row_sum_recip[q] ===\n");
     ptx.push_str("    // (Lane-by-lane on the f32 S-fragment values held in %s_d0..3.)\n");
-    ptx.push_str("    // row_max and row_sum_recip are loaded from HBM into %f_rmax and %f_rsum_recip\n");
-    ptx.push_str("    // (HBM load emission omitted; consumed in Task 11's dS compute too).\n");
-    ptx.push_str("    .reg .f32 %f_rmax, %f_rsum_recip;\n");
+    ptx.push_str("    // Elements {0,1} belong to row lane/4 (lo), elements {2,3} to row lane/4+8 (hi).\n");
+    ptx.push_str("    // Stats loaded by emit_stats_addr_load: %rmax_lo/%rmax_hi, %rsum_recip_lo/%rsum_recip_hi.\n");
     ptx.push_str("    .reg .f32 %p_recip_log2e;\n");
     ptx.push_str("    mov.f32 %p_recip_log2e, 0F3FB8AA3B;  // 1/ln(2) = 1.4426950408889634\n");
     for i in 0..4 {
-        ptx.push_str(&format!("    .reg .f32 %p_{};\n", i));
-        ptx.push_str(&format!("    sub.f32 %p_{}, %s_d{}, %f_rmax;\n", i, i));
-        ptx.push_str(&format!("    mul.f32 %p_{}, %p_{}, %p_recip_log2e;\n", i, i)); // x * log2(e)
-        ptx.push_str(&format!("    ex2.approx.f32 %p_{}, %p_{};\n", i, i));          // 2^(x*log2(e)) = exp(x)
-        ptx.push_str(&format!("    mul.f32 %p_{}, %p_{}, %f_rsum_recip;\n", i, i));
+        let (rmax, rrecip) = if i < 2 { ("%rmax_lo", "%rsum_recip_lo") }
+                              else      { ("%rmax_hi", "%rsum_recip_hi") };
+        ptx.push_str(&format!("    .reg .f32 %p_{i};\n"));
+        ptx.push_str(&format!("    sub.f32 %p_{i}, %s_d{i}, {rmax};\n"));
+        ptx.push_str(&format!("    mul.f32 %p_{i}, %p_{i}, %p_recip_log2e;\n"));
+        ptx.push_str(&format!("    ex2.approx.f32 %p_{i}, %p_{i};\n"));
+        ptx.push_str(&format!("    mul.f32 %p_{i}, %p_{i}, {rrecip};\n"));
     }
     ptx.push('\n');
 
@@ -1060,14 +1061,14 @@ fn emit_inner_loop_body(ptx: &mut String, config: &FlashAttentionConfig) {
     // dS[q,k] = P[q,k] * (dP[q,k] - D[q]).  Computed on the f32 fragment values
     // held in %dp_d0..3 and %p_0..3 produced above.
     //
-    // D[q] is loaded from HBM into %f_d_q (load emission omitted in scaffold; the
-    // address derivation reuses the same row indexing as row_max/row_sum_recip).
+    // D[q] is loaded from HBM per row: %d_lo for elements {0,1} (row lane/4),
+    // %d_hi for elements {2,3} (row lane/4+8) — loaded by emit_stats_addr_load.
     ptx.push_str("    // === dS = P * (dP - D) ===\n");
-    ptx.push_str("    .reg .f32 %f_d_q;\n");
     for i in 0..4 {
-        ptx.push_str(&format!("    .reg .f32 %ds_{};\n", i));
-        ptx.push_str(&format!("    sub.f32 %ds_{}, %dp_d{}, %f_d_q;\n", i, i));
-        ptx.push_str(&format!("    mul.f32 %ds_{}, %ds_{}, %p_{};\n", i, i, i));
+        let d_row = if i < 2 { "%d_lo" } else { "%d_hi" };
+        ptx.push_str(&format!("    .reg .f32 %ds_{i};\n"));
+        ptx.push_str(&format!("    sub.f32 %ds_{i}, %dp_d{i}, {d_row};\n"));
+        ptx.push_str(&format!("    mul.f32 %ds_{i}, %ds_{i}, %p_{i};\n"));
     }
     ptx.push('\n');
 
@@ -1610,5 +1611,24 @@ mod tests {
         let ptx128 = synthesize_dq_kernel(&cfg128).unwrap();
         assert!(ptx128.contains("setp.lt.u32 %p_warp_active, %warp_id, 2"),
             "expected warp-active predicate warp_id < bq/16 (=2 at bq=32, hd=128)");
+    }
+
+    #[test]
+    fn synthesize_dq_kernel_applies_per_row_stats() {
+        let ptx = synthesize_dq_kernel(&canonical_cfg()).unwrap();
+        // P recompute must subtract the ROW-CORRECT max: lo for elems 0/1, hi for 2/3.
+        assert!(ptx.contains("sub.f32 %p_0, %s_d0, %rmax_lo")
+            && ptx.contains("sub.f32 %p_2, %s_d2, %rmax_hi"),
+            "P recompute must use rmax_lo for elem0 and rmax_hi for elem2");
+        assert!(ptx.contains("mul.f32 %p_0, %p_0, %rsum_recip_lo")
+            && ptx.contains("mul.f32 %p_2, %p_2, %rsum_recip_hi"),
+            "P recompute must scale by row_sum_recip_lo/hi per row");
+        // dS must subtract D per row: d_lo for elems 0/1, d_hi for 2/3.
+        assert!(ptx.contains("sub.f32 %ds_0, %dp_d0, %d_lo")
+            && ptx.contains("sub.f32 %ds_2, %dp_d2, %d_hi"),
+            "dS must use d_lo for elem0 and d_hi for elem2");
+        // The stub single-stat regs must be gone.
+        assert!(!ptx.contains("%f_rmax") && !ptx.contains("%f_d_q"),
+            "stub single-stat regs must be removed");
     }
 }
