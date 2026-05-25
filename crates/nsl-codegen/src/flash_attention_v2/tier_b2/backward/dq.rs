@@ -39,6 +39,7 @@ pub fn synthesize_dq_kernel(
     emit_kv_iter_count_setup(&mut ptx, config);
     emit_outer_loop_open(&mut ptx);
     emit_q_dO_producer_load(&mut ptx, config);
+    emit_stats_addr_load(&mut ptx, config);
     emit_dq_acc_init(&mut ptx, config);
     emit_inner_loop_open(&mut ptx, config);
     emit_tile_skip_predicate(&mut ptx, config);
@@ -167,6 +168,13 @@ fn emit_register_decls(ptx: &mut String, _config: &FlashAttentionConfig) {
     ptx.push_str("    .reg .u32 %g1_d_tmp;\n");
     ptx.push_str("    .reg .u64 %g1_dq_byte_off, %g1_dq_addr;\n");
     ptx.push_str("    .reg .u64 %g1_dq_base;\n");
+    // Stats-load registers (emit_stats_addr_load). Declared here per PTX ISA rule
+    // that all .reg directives must precede executable instructions.
+    ptx.push_str("    .reg .u64 %stats_rmax_base, %stats_rsum_base, %stats_d_base;\n");
+    ptx.push_str("    .reg .u64 %stats_off_lo, %stats_off_hi, %stats_addr;\n");
+    ptx.push_str("    .reg .u32 %s_lo, %s_hi, %stat_lane_div4;\n");
+    ptx.push_str("    .reg .f32 %rmax_lo, %rmax_hi, %rsum_lo, %rsum_hi;\n");
+    ptx.push_str("    .reg .f32 %rsum_recip_lo, %rsum_recip_hi, %d_lo, %d_hi;\n");
     ptx.push('\n');
 }
 
@@ -235,6 +243,38 @@ fn emit_outer_loop_open(ptx: &mut String) {
     // Initialize induction variable. %num_q_iters computed in emit_q_iter_count_setup.
     ptx.push_str("    mov.u32 %q_iter, 0;\n");
     ptx.push_str("DQ_Q_ITER_LOOP:\n");
+}
+
+/// Load each lane's two owned q-rows' softmax stats. Hoisted once per q_iter;
+/// held in registers across the kv sweep. s_lo = q_iter*bq + warp_id*16 + lane/4;
+/// s_hi = s_lo + 8. C-frag elements {0,1} use *_lo, {2,3} use *_hi (applied in Task 4).
+fn emit_stats_addr_load(ptx: &mut String, config: &FlashAttentionConfig) {
+    use hbm_addr::emit_3d_byte_offset;
+    let bq = tier_b2_effective_bq(config);
+    ptx.push_str("    // === Per-row stats load (s_lo/s_hi = q_iter*bq + warp_id*16 + lane/4 [+8]) ===\n");
+    ptx.push_str("    ld.param.u64 %stats_rmax_base, [row_max_ptr];\n");
+    ptx.push_str("    ld.param.u64 %stats_rsum_base, [row_sum_ptr];\n");
+    ptx.push_str("    ld.param.u64 %stats_d_base, [d_ptr];\n");
+    ptx.push_str("    shr.u32 %stat_lane_div4, %lane_id, 2;\n");
+    ptx.push_str(&format!("    mul.lo.u32 %s_lo, %q_iter, {bq};\n"));
+    ptx.push_str("    add.u32 %s_lo, %s_lo, %band_row_base;\n");
+    ptx.push_str("    add.u32 %s_lo, %s_lo, %stat_lane_div4;\n");
+    ptx.push_str("    add.u32 %s_hi, %s_lo, 8;\n");
+    emit_3d_byte_offset(ptx, "%stats_off_lo", "%batch_idx", "%head", "%s_lo", "%heads_r", "%seq_len_r", 4);
+    emit_3d_byte_offset(ptx, "%stats_off_hi", "%batch_idx", "%head", "%s_hi", "%heads_r", "%seq_len_r", 4);
+    for (base, reg, off) in [
+        ("%stats_rmax_base", "%rmax_lo", "%stats_off_lo"),
+        ("%stats_rmax_base", "%rmax_hi", "%stats_off_hi"),
+        ("%stats_rsum_base", "%rsum_lo", "%stats_off_lo"),
+        ("%stats_rsum_base", "%rsum_hi", "%stats_off_hi"),
+        ("%stats_d_base",    "%d_lo",    "%stats_off_lo"),
+        ("%stats_d_base",    "%d_hi",    "%stats_off_hi"),
+    ] {
+        ptx.push_str(&format!("    add.u64 %stats_addr, {base}, {off};\n"));
+        ptx.push_str(&format!("    ld.global.f32 {reg}, [%stats_addr];\n"));
+    }
+    ptx.push_str("    rcp.approx.f32 %rsum_recip_lo, %rsum_lo;\n");
+    ptx.push_str("    rcp.approx.f32 %rsum_recip_hi, %rsum_hi;\n");
 }
 
 #[allow(non_snake_case)]
@@ -1530,6 +1570,28 @@ mod tests {
         let ptx = synthesize_dq_kernel(&cfg).unwrap();
         assert!(ptx.contains("mov.u32 %tile_skip_predicate, 1"),
             "expected non-causal predicate = constant 1");
+    }
+
+    #[test]
+    fn synthesize_dq_kernel_loads_per_row_stats_probe1() {
+        // Probe 1 (structural): exact per-lane stats lane-mapping vs independent
+        // spec-derived pattern. s_lo = q_iter*bq + warp_id*16 + lane/4 ; s_hi = +8.
+        let cfg = FlashAttentionConfig { head_dim: 32, ..canonical_cfg() }; // eff bq = 64
+        let ptx = synthesize_dq_kernel(&cfg).unwrap();
+        // bug #1: the three stats params must be consumed (loaded), not declared-unused.
+        assert!(ptx.contains("ld.param.u64 %stats_rmax_base, [row_max_ptr]"), "row_max_ptr must be loaded");
+        assert!(ptx.contains("ld.param.u64 %stats_rsum_base, [row_sum_ptr]"), "row_sum_ptr must be loaded");
+        assert!(ptx.contains("ld.param.u64 %stats_d_base, [d_ptr]"), "d_ptr must be loaded");
+        // exact s_lo derivation (the lane/4 term is the bug-class term):
+        assert!(ptx.contains("shr.u32 %stat_lane_div4, %lane_id, 2"), "s_lo must include lane/4");
+        assert!(ptx.contains("mul.lo.u32 %s_lo, %q_iter, 64"), "s_lo must include q_iter*bq (bq=64 at hd=32)");
+        assert!(ptx.contains("add.u32 %s_lo, %s_lo, %band_row_base"), "s_lo must include warp band base");
+        assert!(ptx.contains("add.u32 %s_lo, %s_lo, %stat_lane_div4"), "s_lo must add lane/4");
+        assert!(ptx.contains("add.u32 %s_hi, %s_lo, 8"), "s_hi = s_lo + 8");
+        // 6 stat loads (rmax/rsum/d x lo/hi) and per-row reciprocal:
+        assert!(ptx.matches("ld.global.f32").count() >= 6, "expected >=6 stat loads");
+        assert!(ptx.contains("rcp.approx.f32 %rsum_recip_lo") && ptx.contains("rcp.approx.f32 %rsum_recip_hi"),
+            "row_sum must be reciprocated per row");
     }
 
     #[test]
