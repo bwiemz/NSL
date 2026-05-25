@@ -186,6 +186,7 @@ fn emit_grid_id_setup(ptx: &mut String) {
     ptx.push('\n');
 }
 
+/// Emit warp-band ownership base and the idle-warp predicate from %warp_id.
 fn emit_warp_band_setup(ptx: &mut String, config: &FlashAttentionConfig) {
     let active_warps = tier_b2_effective_bq(config) / 16; // 4 at bq=64, 2 at bq=32
     ptx.push_str("    // Warp-per-m16-band: warp w owns q-rows [w*16, w*16+16).\n");
@@ -1540,5 +1541,12 @@ mod tests {
             "expected warp-band row base = warp_id*16");
         assert!(ptx.contains("setp.lt.u32 %p_warp_active, %warp_id, 4"),
             "expected warp-active predicate warp_id < bq/16 (=4 at bq=64)");
+
+        // hd=128 -> effective bq=32 -> active warps = 32/16 = 2 (warps 2-3 idle).
+        // This is the deadlock-critical value Task 10's idle-warp gating depends on.
+        let cfg128 = FlashAttentionConfig { head_dim: 128, ..canonical_cfg() };
+        let ptx128 = synthesize_dq_kernel(&cfg128).unwrap();
+        assert!(ptx128.contains("setp.lt.u32 %p_warp_active, %warp_id, 2"),
+            "expected warp-active predicate warp_id < bq/16 (=2 at bq=32, hd=128)");
     }
 }
