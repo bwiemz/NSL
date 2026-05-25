@@ -1057,7 +1057,7 @@ pub fn tier_b2_dq_dO_offset(config: &FlashAttentionConfig) -> u32 {
     tier_b2_dq_v_offset(config) + bkv * hd * 2
 }
 
-/// dS scratch tile offset. f32 `[effective_bq, effective_bkv]`.
+/// dS scratch tile offset. f16 `[effective_bq, effective_bkv]`.
 /// Written by the `dP = dO @ V^T` + softmax-backward combine.
 /// Lives immediately after the dO tile.
 pub fn tier_b2_dq_ds_offset(config: &FlashAttentionConfig) -> u32 {
@@ -1072,7 +1072,7 @@ pub fn tier_b2_dq_ds_offset(config: &FlashAttentionConfig) -> u32 {
 pub fn tier_b2_dq_wk_chunk_offset(config: &FlashAttentionConfig) -> u32 {
     let bq = tier_b2_effective_bq(config);
     let bkv = tier_b2_effective_bkv(config);
-    tier_b2_dq_ds_offset(config) + bq * bkv * 4
+    tier_b2_dq_ds_offset(config) + bq * bkv * 2
 }
 
 /// Wv chunk staging region offset. f16 `[TIER_B2_RMSNORM_CHUNK, head_dim]`.
@@ -1262,5 +1262,21 @@ mod tier_b2_dq_offset_tests {
         let last_band_size = tier_b2_dq_k_colmajor_bytes(&cfg);
         assert_eq!(total_with, last_band_start + last_band_size,
             "total must equal K-colmajor offset + K-colmajor bytes");
+    }
+
+    #[test]
+    fn tier_b2_dq_ds_band_is_f16_sized() {
+        // Spec bug #2: dS staged f16 (bq*bkv*2), not f32. The dS band size is
+        // the gap between ds_offset and the next band (wk_chunk).
+        for &hd in &[32u32, 64, 128] {
+            let cfg = FlashAttentionConfig { head_dim: hd as i64, ..canonical_hd128_cfg() };
+            let bq = tier_b2_effective_bq(&cfg);
+            let bkv = tier_b2_effective_bkv(&cfg);
+            let ds_band = tier_b2_dq_wk_chunk_offset(&cfg) - tier_b2_dq_ds_offset(&cfg);
+            assert_eq!(ds_band, bq * bkv * 2,
+                "hd={hd}: dS band must be f16-sized (bq*bkv*2={}), got {ds_band}", bq * bkv * 2);
+            assert!(tier_b2_dq_total_smem_bytes(&cfg) <= SMEM_DYNAMIC_BUDGET_BYTES,
+                "hd={hd}: total SMEM exceeds 99 KB budget");
+        }
     }
 }
