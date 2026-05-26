@@ -60,7 +60,7 @@ pub fn synthesize_dkdv_kernel(
     // kv_iter*bkv + band_row_base + lane/4. Placing it after the kv-outer close would
     // use the post-loop %kv_iter (= num_kv_iters), writing OOB rows. Run it per kv_iter
     // before the increment so each kv-tile's dK/dV is written with the correct in-range row.
-    emit_dkdv_finalize_stub(&mut ptx);
+    emit_dkdv_finalize(&mut ptx, config);
     emit_outer_loop_close(&mut ptx);
     emit_entry_close(&mut ptx);
     Ok(ptx)
@@ -205,6 +205,9 @@ fn emit_register_decls(ptx: &mut String, config: &FlashAttentionConfig) {
     ptx.push_str("    .reg .u64 %ar_smem_base64;\n");
     ptx.push_str("    .reg .u32 %ar_smem_base32;\n");
     ptx.push_str("    .reg .b16 %ar_val;\n");
+    // Task 8 MMA-3 (dV += P^T @ dO) + MMA-4 (dK += dS^T @ Q) fragment registers.
+    // Prefix %dkv_ to avoid collision with %s_*, %dp_*, %dq_* namespaces.
+    ptx.push_str("    .reg .b32 %dkv_a0, %dkv_a1, %dkv_a2, %dkv_a3, %dkv_b0, %dkv_b1;\n");
     // Task 7 scratch registers for P-col and dS-col C-fragment scatter (col-major transpose).
     // Prefix %bs_* to avoid collision with all other register namespaces.
     // emit_pcol_scatter and emit_dscol_scatter reuse these sequentially.
@@ -1064,6 +1067,23 @@ fn emit_inner_loop_body(ptx: &mut String, config: &FlashAttentionConfig) {
     emit_qcol_restage_scatter(ptx, config);
     emit_dOcol_restage_scatter(ptx, config);
 
+    // === Task 8: MMA-3 (dV += P^T @ dO) + MMA-4 (dK += dS^T @ Q) ===
+    // The Q-col and dO-col re-stages above (each bar.sync'd) ordered both the P/dS
+    // col-major scatter (Task 7) and the Q/dO col-major re-stage (Task 6) before the
+    // MMA reads. The idle-warp gate is deadlock-safe: no bar.sync inside emit_dkdv_matmul.
+    let pcol_off  = tier_b2_dkdv_p_colmajor_offset(config);
+    let docol_off = tier_b2_dkdv_dO_colmajor_offset(config);
+    let dscol_off = tier_b2_dkdv_ds_colmajor_offset(config);
+    let qcol_off  = tier_b2_dkdv_q_colmajor_offset(config);
+    let dkv_a: [String; 4] = ["dkv_a0", "dkv_a1", "dkv_a2", "dkv_a3"].map(String::from);
+    let dkv_b: [String; 2] = ["dkv_b0", "dkv_b1"].map(String::from);
+    ptx.push_str("    // === MMA-3: dV += P^T @ dO ; MMA-4: dK += dS^T @ Q ===\n");
+    ptx.push_str("    @!%p_warp_active bra DKDV_IDLE_SKIP_DKDV;\n");
+    emit_dkdv_matmul(ptx, config, pcol_off, docol_off, "dv_acc", &dkv_a, &dkv_b);
+    emit_dkdv_matmul(ptx, config, dscol_off, qcol_off, "dk_acc", &dkv_a, &dkv_b);
+    ptx.push_str("DKDV_IDLE_SKIP_DKDV:\n");
+    ptx.push('\n');
+
     ptx.push_str("DKDV_DS_SKIP_LABEL:\n");
 }
 
@@ -1370,16 +1390,251 @@ fn emit_inner_loop_close(ptx: &mut String) {
     ptx.push_str("DKDV_Q_ITER_DONE:\n");
 }
 
-/// Finalize stub: placeholder for dV + dK HBM scatter (Task 8 fills this).
+/// Task 8 helper: emit the codegen-unrolled k-outer/n-inner tiled MMA for one of
+/// the two dK/dV accumulations.
+///
+/// This mirrors `emit_dq_matmul_tiled` from dq.rs but contracts over the **q** axis
+/// (bq k-tiles of 16) instead of the kv axis.
+///
+/// Arguments:
+///   - `a_off` : SMEM byte offset of the A col-major band `[kv, bq]` f16.
+///               Each kv-row is a row of bq f16 values; row_stride = bq*2.
+///               The warp's 16 kv-rows start at `band_row_base`.
+///   - `b_off` : SMEM byte offset of the B col-major band `[hd, bq]` f16.
+///               Organised as `[n_tile*8 .. n_tile*8+8, bq]`; col_stride = bq*2.
+///   - `acc_prefix`: register prefix for the accumulator, e.g. `"dv_acc"` or `"dk_acc"`.
+///               The registers `%{acc_prefix}_{n}_{0..3}` must already exist (zeroed
+///               at kv-outer open by `emit_dkdv_acc_init`).
+///
+/// Invariant (preserved from dq): both `%a_base` and `%b_base` receive
+/// `add.u32 ..., %mma_smem_base;` so they are valid SMEM addresses, not raw offsets.
+///
+/// Operand correctness:
+///   MMA-3 dV[kv,d] += Σ_q P[q,kv] · dO[q,d]
+///     A = P^T[kv,q]  (p_colmajor band, row_stride = bq*2)
+///     B = dO[hd,q]   (dO_colmajor band, col_stride = bq*2)
+///
+///   MMA-4 dK[kv,d] += Σ_q dS[q,kv] · Q[q,d]
+///     A = dS^T[kv,q] (ds_colmajor band, row_stride = bq*2)
+///     B = Q[hd,q]    (q_colmajor band, col_stride = bq*2)
+fn emit_dkdv_matmul(
+    ptx: &mut String,
+    config: &FlashAttentionConfig,
+    a_off: u32,
+    b_off: u32,
+    acc_prefix: &str,
+    a_regs: &[String; 4],
+    b_regs: &[String; 2],
+) {
+    use crate::matmul_mma::{emit_load_a_fragment_smem, emit_load_b_fragment_smem, emit_mma_instruction};
+
+    let bq  = tier_b2_effective_bq(config);
+    let hd  = config.head_dim as u32;
+
+    // Contraction is over q: n_k_tiles = bq/16 (each k-tile is 16 q-columns).
+    let n_k_tiles = bq / 16;
+    // Output n-tiles: hd/8 (8 head-dim columns per n-tile).
+    let n_n_tiles = hd / 8;
+
+    // Both A and B have col-major layout with the q-axis as the "column" axis.
+    // Each "row" of A (a kv row) spans bq f16 values → row_stride = bq*2 bytes.
+    // Each "column" of B (an hd column) spans bq f16 values → col_stride = bq*2 bytes.
+    let a_row_stride = (bq * 2) as usize;
+    let b_col_stride = (bq * 2) as usize;
+
+    let pct4 = |r: &[String; 4]| {
+        [
+            format!("%{}", r[0]),
+            format!("%{}", r[1]),
+            format!("%{}", r[2]),
+            format!("%{}", r[3]),
+        ]
+    };
+    let pct2 = |r: &[String; 2]| [format!("%{}", r[0]), format!("%{}", r[1])];
+
+    // k OUTER / n INNER: load A once per k-tile, reuse across all hd/8 n-tiles.
+    for k in 0..n_k_tiles {
+        // A base = cvta(shmem) + a_off + band_row_base*(bq*2) + k*16*2
+        // band_row_base is the warp's 16 kv-row base (kv-dimension of A).
+        ptx.push_str(&format!(
+            "    mul.lo.u32 %a_base, %band_row_base, {};\n",
+            bq * 2
+        ));
+        ptx.push_str(&format!(
+            "    add.u32 %a_base, %a_base, {};\n",
+            a_off + k * 16 * 2
+        ));
+        ptx.push_str("    add.u32 %a_base, %a_base, %mma_smem_base;  // + cvta(shmem) base\n");
+        emit_load_a_fragment_smem(ptx, a_regs, "%a_base", a_row_stride);
+
+        for n in 0..n_n_tiles {
+            let acc: [String; 4] = [
+                format!("%{acc_prefix}_{n}_0"),
+                format!("%{acc_prefix}_{n}_1"),
+                format!("%{acc_prefix}_{n}_2"),
+                format!("%{acc_prefix}_{n}_3"),
+            ];
+            // B base = cvta(shmem) + b_off + n*8*(bq*2) + k*16*2
+            let b_base_val = b_off + n * 8 * bq * 2 + k * 16 * 2;
+            ptx.push_str(&format!("    mov.u32 %b_base, {b_base_val};\n"));
+            ptx.push_str("    add.u32 %b_base, %b_base, %mma_smem_base;  // + cvta(shmem) base\n");
+            emit_load_b_fragment_smem(ptx, b_regs, "%b_base", b_col_stride);
+            // MAC: C=D=acc_prefix (not re-zeroed; accumulates across k and q sweep).
+            emit_mma_instruction(ptx, &acc, &pct4(a_regs), &pct2(b_regs), &acc);
+        }
+    }
+}
+
+/// G1/G2: dV + dK HBM finalize — scatter dV_acc and dK_acc to HBM.
+///
+/// Clones `emit_dq_finalize` from dq.rs TWICE, adapted for the kv-based output row:
+///   row = kv_iter*bkv + band_row_base + lane/4   (not q_iter*bq as in dQ)
 ///
 /// Placed INSIDE the kv-outer loop (after q-inner loop closes, before the
 /// kv-outer back-edge), so each kv tile's accumulated dK/dV is written with
 /// the correct, in-range kv row index.
-fn emit_dkdv_finalize_stub(ptx: &mut String) {
-    ptx.push_str("    // === Finalize dV (stub: HBM scatter of dV_acc -- Task 8) ===\n");
-    ptx.push_str("DKDV_FINALIZE_DV:\n");
-    ptx.push_str("    // === Finalize dK (stub: HBM scatter of dK_acc -- Task 8) ===\n");
-    ptx.push_str("DKDV_FINALIZE_DK:\n");
+///
+/// HBM byte_offset = (((batch_idx * H + head) * S + row) * D + col) * 4
+/// via emit_4d_byte_offset (sizeof_dtype = 4 for f32).
+///
+/// Idle-warp gate: both blocks are wrapped in a single `@!%p_warp_active bra DKDV_IDLE_SKIP_FINAL`.
+/// Deadlock-safe: the only code after finalize is the kv-outer back-edge (no bar.sync).
+fn emit_dkdv_finalize(ptx: &mut String, config: &FlashAttentionConfig) {
+    use super::hbm_addr::emit_4d_byte_offset;
+
+    let bkv      = tier_b2_effective_bkv(config);
+    let hd       = config.head_dim as u32;
+    let n_n_tiles = hd / 8;
+
+    // Idle-warp gate: warps with warp_id >= bkv/16 own no kv-rows and must skip
+    // the HBM stores or they would write OOB rows.
+    // DKDV_IDLE_SKIP_FINAL is placed after both dV and dK blocks; no bar.sync in between.
+    ptx.push_str("    @!%p_warp_active bra DKDV_IDLE_SKIP_FINAL;\n");
+
+    // --- dV block ---
+    ptx.push_str("    // === Finalize dV ===\n");
+    ptx.push_str("    // Scatter dV_acc registers to HBM d_v_out[B,H,S,D] row-major f32.\n");
+
+    // Per-lane scratch: lane%4 and lane/4
+    ptx.push_str("    and.b32 %g1_lane_mod4, %lane_id, 3;\n");
+    ptx.push_str("    shr.u32 %g1_lane_div4, %lane_id, 2;\n");
+
+    // kv_tile_start = kv_iter * bkv
+    ptx.push_str(&format!("    mul.lo.u32 %g1_kv_tile_start, %kv_iter, {bkv};\n"));
+
+    // row_lo = kv_tile_start + band_row_base + lane/4
+    // row_hi = row_lo + 8
+    ptx.push_str("    add.u32 %g1_row_lo, %g1_kv_tile_start, %band_row_base;\n");
+    ptx.push_str("    add.u32 %g1_row_lo, %g1_row_lo, %g1_lane_div4;\n");
+    ptx.push_str("    add.u32 %g1_row_hi, %g1_row_lo, 8;\n");
+
+    // col_lo = (lane%4) * 2 ;  col_hi = col_lo + 1
+    ptx.push_str("    shl.b32 %g1_col_lo, %g1_lane_mod4, 1;\n");
+    ptx.push_str("    add.u32 %g1_col_hi, %g1_col_lo, 1;\n");
+
+    // Load dV HBM base pointer once.
+    ptx.push_str("    ld.param.u64 %g1_dv_base, [d_v_out_ptr];\n");
+
+    for n in 0..n_n_tiles {
+        let frag_col_base = n * 8;
+
+        let stores: [(u32, &str, &str); 4] = [
+            (0, "%g1_row_lo", "%g1_col_lo"),
+            (1, "%g1_row_lo", "%g1_col_hi"),
+            (2, "%g1_row_hi", "%g1_col_lo"),
+            (3, "%g1_row_hi", "%g1_col_hi"),
+        ];
+
+        for (r, row_reg, col_reg) in stores {
+            let d_reg: String = if frag_col_base == 0 {
+                col_reg.to_string()
+            } else {
+                ptx.push_str(&format!(
+                    "    add.u32 %g1_d_tmp, {col_reg}, {frag_col_base};\n"
+                ));
+                "%g1_d_tmp".to_string()
+            };
+
+            emit_4d_byte_offset(
+                ptx,
+                "%g1_dv_byte_off",
+                "%batch_idx",
+                "%head",
+                row_reg,
+                &d_reg,
+                "%heads_r",
+                "%seq_len_r",
+                hd,
+                4, // f32 sizeof
+            );
+            ptx.push_str("    add.u64 %g1_dv_addr, %g1_dv_base, %g1_dv_byte_off;\n");
+            ptx.push_str(&format!("    st.global.f32 [%g1_dv_addr], %dv_acc_{n}_{r};\n"));
+        }
+    }
+
+    // --- dK block ---
+    ptx.push_str("    // === Finalize dK ===\n");
+    ptx.push_str("    // Scatter dK_acc registers to HBM d_k_out[B,H,S,D] row-major f32.\n");
+
+    // Per-lane scratch for dK (use %g2_* to avoid clobbering dV mid-sequence).
+    ptx.push_str("    and.b32 %g2_lane_mod4, %lane_id, 3;\n");
+    ptx.push_str("    shr.u32 %g2_lane_div4, %lane_id, 2;\n");
+
+    // kv_tile_start = kv_iter * bkv
+    ptx.push_str(&format!("    mul.lo.u32 %g2_kv_tile_start, %kv_iter, {bkv};\n"));
+
+    // row_lo = kv_tile_start + band_row_base + lane/4
+    // row_hi = row_lo + 8
+    ptx.push_str("    add.u32 %g2_row_lo, %g2_kv_tile_start, %band_row_base;\n");
+    ptx.push_str("    add.u32 %g2_row_lo, %g2_row_lo, %g2_lane_div4;\n");
+    ptx.push_str("    add.u32 %g2_row_hi, %g2_row_lo, 8;\n");
+
+    // col_lo = (lane%4) * 2 ;  col_hi = col_lo + 1
+    ptx.push_str("    shl.b32 %g2_col_lo, %g2_lane_mod4, 1;\n");
+    ptx.push_str("    add.u32 %g2_col_hi, %g2_col_lo, 1;\n");
+
+    // Load dK HBM base pointer once.
+    ptx.push_str("    ld.param.u64 %g2_dk_base, [d_k_out_ptr];\n");
+
+    for n in 0..n_n_tiles {
+        let frag_col_base = n * 8;
+
+        let stores: [(u32, &str, &str); 4] = [
+            (0, "%g2_row_lo", "%g2_col_lo"),
+            (1, "%g2_row_lo", "%g2_col_hi"),
+            (2, "%g2_row_hi", "%g2_col_lo"),
+            (3, "%g2_row_hi", "%g2_col_hi"),
+        ];
+
+        for (r, row_reg, col_reg) in stores {
+            let d_reg: String = if frag_col_base == 0 {
+                col_reg.to_string()
+            } else {
+                ptx.push_str(&format!(
+                    "    add.u32 %g2_d_tmp, {col_reg}, {frag_col_base};\n"
+                ));
+                "%g2_d_tmp".to_string()
+            };
+
+            emit_4d_byte_offset(
+                ptx,
+                "%g2_dk_byte_off",
+                "%batch_idx",
+                "%head",
+                row_reg,
+                &d_reg,
+                "%heads_r",
+                "%seq_len_r",
+                hd,
+                4, // f32 sizeof
+            );
+            ptx.push_str("    add.u64 %g2_dk_addr, %g2_dk_base, %g2_dk_byte_off;\n");
+            ptx.push_str(&format!("    st.global.f32 [%g2_dk_addr], %dk_acc_{n}_{r};\n"));
+        }
+    }
+
+    // Idle-warp reconvergence. No trailing bar.sync: kv-outer back-edge follows immediately.
+    ptx.push_str("DKDV_IDLE_SKIP_FINAL:\n");
 }
 
 fn emit_outer_loop_close(ptx: &mut String) {

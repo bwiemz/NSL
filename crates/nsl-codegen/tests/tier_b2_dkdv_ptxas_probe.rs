@@ -132,3 +132,17 @@ fn dkdv_kernel_ptxas_clean_sm80() {
         "ptxas sm_80 register spills:\n{stats}"
     );
 }
+
+#[test]
+fn dkdv_kernel_has_four_mmas_and_dual_finalize() {
+    let ptx = synthesize_dkdv_kernel(&cfg(64, 64)).expect("synth ok");
+    let mma = ptx.matches("mma.sync.aligned.m16n8k16").count();
+    // S(bq/16... actually hd/16 k-tiles) + dP(hd/16) inside n-tile loop, then
+    // dV((hd/8)*(bq/16)) + dK((hd/8)*(bq/16)) codegen-unrolled. Just assert >= 4 distinct MMA sites.
+    assert!(mma >= 4, "expected >=4 MMA sites (S,dP,dV,dK), got {mma}");
+    assert!(ptx.contains("// === Finalize dV"), "dV finalize present");
+    assert!(ptx.contains("// === Finalize dK"), "dK finalize present");
+    assert!(ptx.contains("st.global.f32"), "HBM f32 stores present");
+    assert!(ptx.contains("d_v_out_ptr") && ptx.contains("d_k_out_ptr"),
+        "both dV and dK output pointers used");
+}
