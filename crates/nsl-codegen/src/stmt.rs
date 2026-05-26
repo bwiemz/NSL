@@ -3641,11 +3641,33 @@ impl Compiler<'_> {
             state.current_block = Some(init_body);
 
             let param_i = self.compile_call_by_name(builder, "nsl_list_get", &[param_list, idx])?;
-            let buf1 = self.compile_call_by_name(builder, "nsl_tensor_zeros_like", &[param_i])?;
+            // CPDT precision-adaptive: allocate optimizer state at the planned
+            // storage dtype when active; otherwise use the verbatim FP32 path.
+            // `cpdt_precision_dtypes` is `Option<(Value, Value)>` and `Value:
+            // Copy`, so matching by value inside the loop is fine.
+            let buf1 = if let Some((m_list, _)) = cpdt_precision_dtypes {
+                let m_code = self.compile_call_by_name(builder, "nsl_list_get", &[m_list, idx])?;
+                self.compile_call_by_name(
+                    builder,
+                    "nsl_tensor_zeros_like_dtype",
+                    &[param_i, m_code],
+                )?
+            } else {
+                self.compile_call_by_name(builder, "nsl_tensor_zeros_like", &[param_i])?
+            };
             self.compile_call_by_name(builder, "nsl_list_push", &[state_list_1, buf1])?;
             if num_state_buffers >= 2 {
-                let buf2 =
-                    self.compile_call_by_name(builder, "nsl_tensor_zeros_like", &[param_i])?;
+                let buf2 = if let Some((_, v_list)) = cpdt_precision_dtypes {
+                    let v_code =
+                        self.compile_call_by_name(builder, "nsl_list_get", &[v_list, idx])?;
+                    self.compile_call_by_name(
+                        builder,
+                        "nsl_tensor_zeros_like_dtype",
+                        &[param_i, v_code],
+                    )?
+                } else {
+                    self.compile_call_by_name(builder, "nsl_tensor_zeros_like", &[param_i])?
+                };
                 self.compile_call_by_name(builder, "nsl_list_push", &[state_list_2, buf2])?;
             }
 
