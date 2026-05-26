@@ -253,9 +253,17 @@ fn validate_dkdv_for_source(cfg: &FlashAttentionConfig, source: FSource, seq: us
          dK: max|gpu|={:.6e} max|ref|={:.6e} max_abs={:.6e} rel={:.4e} rel_tol={:.4e}",
         source, hd, cfg.block_q, seq, dk_max_gpu, dk_max_ref, dk_max_abs, dk_rel, rel_tol
     );
+    // dK is intrinsically ~3 orders of magnitude smaller than dV: dK = dS @ Q with
+    // dS = (1/sqrt(d)) * P * (dP - D), so the 1/sqrt(d) factor AND the (dP - D)
+    // difference shrink dK relative to dV (= P @ dO, no such factors). The dV-calibrated
+    // 1e-3 floor is therefore wrong for dK — at B1Forward hd=128 the *true* |dK| is
+    // ~4.4e-4 (1/sqrt(128) compounding with B.1's small inputs), a correct value the
+    // GPU matches to rel 2.9e-3. Use a dK-appropriate 1e-4 floor; the zero-output guard
+    // below (0.25x ratio) is the real anti-zero check and still bites hard.
     assert!(
-        dk_max_ref > 1e-3,
-        "FSource={:?} hd={}: dK reference |dK|={:.3e} too small (raise DQ_GATE_DO_SCALE)",
+        dk_max_ref > 1e-4,
+        "FSource={:?} hd={}: dK reference |dK|={:.3e} too small for a meaningful gate \
+         (below the 1e-4 dK floor) — raise DQ_GATE_DO_SCALE",
         source, hd, dk_max_ref
     );
     assert!(
