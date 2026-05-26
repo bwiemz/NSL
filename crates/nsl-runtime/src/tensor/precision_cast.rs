@@ -11,7 +11,7 @@
 
 use std::ffi::c_void;
 
-use crate::memory::checked_alloc;
+use crate::memory::{checked_alloc, checked_alloc_zeroed};
 
 use super::{
     f16_bits_to_f32, f32_to_f16_bits, NslTensor, DTYPE_F32, DTYPE_FP16,
@@ -118,6 +118,63 @@ pub extern "C" fn nsl_tensor_cast_into(dst_ptr: i64, src_ptr: i64) {
         }
         other => panic!("nsl_tensor_cast_into: unsupported dst dtype {other} (v1: F32/FP16)"),
     }
+}
+
+/// Allocate a new zero-filled tensor with the same shape/device as
+/// `template_ptr` but the given `dtype` (v1: F32=1 or FP16=2). Mirrors
+/// `nsl_tensor_zeros_like`'s allocation/ownership; the result is a persistent
+/// optimizer-state buffer (same lifecycle as the FP32 zeros_like output).
+///
+/// Ownership pattern: `NslTensor::publish` — identical to the path
+/// `nsl_tensor_zeros_like` → `nsl_tensor_zeros_on` → `nsl_tensor_zeros` →
+/// `tensor_from_shape_list` (see `crates/nsl-runtime/src/tensor/creation.rs:46`).
+/// `publish` calls `scope_track` so the tensor participates in the scope sweep
+/// (freed on function-scope exit or by an explicit `nsl_tensor_free`). Using
+/// bare `Box::into_raw` here instead would break parity: the scope sweep
+/// would never reclaim an optimizer-state buffer allocated mid-training-loop.
+///
+/// Zeroing: uses `checked_alloc_zeroed` (OS-guaranteed zero fill via
+/// `alloc_zeroed`). 0-bits == 0.0 for both f32 and IEEE-754 f16, so the
+/// buffer is numerically zero for both dtypes without an explicit memset.
+///
+/// Device: mirrors `tensor_from_shape_list` — CPU only (device=0). GPU
+/// template support requires a CUDA codepath (deferred to v2; only shape
+/// and device are needed from the template, not its data, so a GPU template
+/// whose shape is host-readable in principle could be supported, but parity
+/// with the existing CPU-only creation helpers is the v1 constraint).
+#[no_mangle]
+pub extern "C" fn nsl_tensor_zeros_like_dtype(template_ptr: i64, dtype: i64) -> i64 {
+    let t = unsafe { &*(template_ptr as *const NslTensor) };
+    let dtype = dtype as u16;
+    let elem_size: usize = match dtype {
+        DTYPE_F32 => 4,
+        DTYPE_FP16 => 2,
+        other => panic!("nsl_tensor_zeros_like_dtype: unsupported dtype {other} (v1: F32=1, FP16=2)"),
+    };
+
+    let ndim = t.ndim;
+    let len = t.len;
+
+    // Copy shape from template (same pattern as tensor_from_shape_list).
+    let shape = NslTensor::copy_shape(t.shape, ndim);
+    let strides = NslTensor::compute_strides(shape, ndim);
+
+    // Zero-fill: 0-bits == 0.0 for both f32 and FP16.
+    let data_size = (len as usize) * elem_size;
+    let data = checked_alloc_zeroed(data_size) as *mut std::ffi::c_void;
+
+    let tensor = Box::new(NslTensor::new(
+        data, shape, strides, ndim, len,
+        t.device, // preserve template's device
+        dtype,
+        1, // owns_data
+        0, // data_owner
+    ));
+    // Use NslTensor::publish — NOT bare Box::into_raw — to mirror
+    // nsl_tensor_zeros_like's lifecycle (scope_track participation).
+    // Persistent optimizer-state buffers must have the same lifecycle as
+    // the FP32 zeros_like output; publish ensures they do.
+    NslTensor::publish(tensor)
 }
 
 #[cfg(test)]
@@ -277,5 +334,28 @@ mod tests {
         assert_eq!(got, vec![1.5_f32, -2.5]);
         crate::tensor::nsl_tensor_free(dst);
         crate::tensor::nsl_tensor_free(src);
+    }
+
+    #[test]
+    fn zeros_like_dtype_matches_shape_sets_dtype_and_zeroes() {
+        let template = f32_tensor(&[5.0, 6.0, 7.0, 8.0]); // shape [4]
+        let z = nsl_tensor_zeros_like_dtype(template, DTYPE_FP16 as i64);
+        let t = unsafe { &*(z as *const NslTensor) };
+        assert_eq!(t.len, 4, "len matches template");
+        assert_eq!(t.dtype, DTYPE_FP16, "dtype is FP16");
+        let bits = unsafe { std::slice::from_raw_parts(t.data as *const u16, 4) };
+        assert!(bits.iter().all(|&b| f16_bits_to_f32(b) == 0.0), "all zero");
+        crate::tensor::nsl_tensor_free(template);
+        crate::tensor::nsl_tensor_free(z);
+    }
+
+    #[test]
+    fn zeros_like_dtype_f32_is_f32_zeros() {
+        let template = f32_tensor(&[5.0, 6.0]);
+        let z = nsl_tensor_zeros_like_dtype(template, DTYPE_F32 as i64);
+        let got = read_f32(z);
+        assert_eq!(got, vec![0.0_f32, 0.0]);
+        crate::tensor::nsl_tensor_free(template);
+        crate::tensor::nsl_tensor_free(z);
     }
 }
