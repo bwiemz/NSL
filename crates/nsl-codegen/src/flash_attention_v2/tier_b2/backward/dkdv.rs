@@ -45,7 +45,8 @@ pub fn synthesize_dkdv_kernel(
     emit_outer_loop_open(&mut ptx, config);
     // q-inner loop open: load Q+dO per iteration + stats.
     emit_inner_loop_open(&mut ptx, config);
-    // (Task 4+: tile-skip predicate, S/dP/dS/dV/dK MMA body here)
+    emit_tile_skip_predicate(&mut ptx, config);
+    emit_inner_loop_body(&mut ptx, config);
     emit_inner_loop_close(&mut ptx);
     // Finalize MUST run INSIDE the kv-outer loop: dK/dV accumulators are per-kv-tile
     // (zeroed at kv-outer open, accumulated over the q sweep). Finalize's HBM row =
@@ -127,6 +128,13 @@ fn emit_register_decls(ptx: &mut String, config: &FlashAttentionConfig) {
     // D1 tile_skip predicate registers (causal; declared but unused in scaffold).
     ptx.push_str("    .reg .u32 %q_tile_end, %kv_tile_start;\n");
     ptx.push_str("    .reg .pred %p_causal_active;\n");
+    // E1 S=Q@K^T + P-recompute MMA fragment registers (Task 4).
+    // Per PTX ISA all .reg directives must precede executable instructions.
+    // S = Q@K^T fragment family (A: k16 rows b32-packed; B: n8 cols; C/D: f32 acc).
+    ptx.push_str("    .reg .b32 %s_a0, %s_a1, %s_a2, %s_a3, %s_b0, %s_b1;\n");
+    ptx.push_str("    .reg .f32 %s_c0, %s_c1, %s_c2, %s_c3, %s_d0, %s_d1, %s_d2, %s_d3;\n");
+    // P recompute scalars + per-lane P values.
+    ptx.push_str("    .reg .f32 %p_recip_log2e, %f_scale, %p_0, %p_1, %p_2, %p_3;\n");
     // C1 cp.async K-tile registers (kv-outer resident; prefixed %c1_*).
     ptx.push_str("    .reg .u32 %c1_kv_tile_start, %c1_lane_byte_off, %c1_smem_base32, %c1_smem_dst;\n");
     ptx.push_str("    .reg .u64 %c1_k_hbm_off, %c1_k_hbm_base, %c1_lane_hbm_addr, %c1_smem_base64;\n");
@@ -662,6 +670,232 @@ fn emit_stats_addr_load(ptx: &mut String, config: &FlashAttentionConfig) {
     }
     ptx.push_str("    rcp.approx.f32 %rsum_recip_lo, %rsum_lo;\n");
     ptx.push_str("    rcp.approx.f32 %rsum_recip_hi, %rsum_hi;\n");
+}
+
+/// D1: emit the tile_skip predicate (causal masking) per Phase 1 spec ss9.2.
+///
+/// Produces `%tile_skip_predicate` (u32, 0=skip, 1=active) used by the
+/// `setp.eq + @!bra DKDV_DS_SKIP_LABEL` consumer at the top of emit_inner_loop_body.
+///
+/// For dK/dV the loop nesting is kv-outer / q-inner, but the causal predicate
+/// is structurally identical to dq: kv_tile_start <= q_tile_end means the current
+/// kv-tile can interact with the current q-tile (they overlap in the causal mask).
+/// Both %q_iter and %kv_iter exist in the dkdv inner loop context.
+fn emit_tile_skip_predicate(ptx: &mut String, config: &FlashAttentionConfig) {
+    use crate::flash_attention_v2::smem_layout::{tier_b2_effective_bkv, tier_b2_effective_bq};
+    let bq = tier_b2_effective_bq(config);
+    let bkv = tier_b2_effective_bkv(config);
+    if config.causal {
+        // q_tile_end = q_iter * bq + (bq - 1)
+        // kv_tile_start = kv_iter * bkv
+        // predicate (1=active, 0=skip) = (kv_tile_start <= q_tile_end)
+        ptx.push_str("    // === D1: tile_skip predicate (causal) ===\n");
+        ptx.push_str(&format!("    mul.lo.u32 %q_tile_end, %q_iter, {bq};\n"));
+        ptx.push_str(&format!("    add.u32 %q_tile_end, %q_tile_end, {};\n", bq - 1));
+        ptx.push_str(&format!("    mul.lo.u32 %kv_tile_start, %kv_iter, {bkv};\n"));
+        ptx.push_str("    setp.le.u32 %p_causal_active, %kv_tile_start, %q_tile_end;\n");
+        ptx.push_str("    selp.u32 %tile_skip_predicate, 1, 0, %p_causal_active;\n");
+    } else {
+        ptx.push_str("    // === D1: tile_skip predicate (non-causal, always active) ===\n");
+        ptx.push_str("    mov.u32 %tile_skip_predicate, 1;\n");
+    }
+}
+
+/// E1: emit the tiled S = Q @ K^T m16n8k16 matmul for ONE runtime n_tile.
+///
+/// Mirrors dq.rs::emit_s_matmul_tiled exactly, with SMEM offsets swapped to
+/// the dK/dV layout (tier_b2_dkdv_q_offset for Q, tier_b2_dkdv_k_offset for K).
+///
+/// Bug-fix invariants preserved from dq (the whole reason for this fresh branch):
+///   1. `%a_base`/`%b_base` each get `add.u32 ..., %mma_smem_base;` — the
+///      cvta'd shared base computed once in grid setup. A raw byte offset would
+///      read uninitialized SMEM.
+///   2. row_stride = hd*2 for both A (Q rows) and B (K^T cols).
+///   3. n_k_tiles = hd/16 (contraction over head_dim in 16-wide k-tiles).
+fn emit_s_matmul_tiled(
+    ptx: &mut String,
+    config: &FlashAttentionConfig,
+    a_regs: &[String; 4],
+    b_regs: &[String; 2],
+    c_regs: &[String; 4],
+    d_regs: &[String; 4],
+) {
+    use crate::flash_attention_v2::smem_layout::{
+        tier_b2_dkdv_k_offset, tier_b2_dkdv_q_offset,
+    };
+    use crate::matmul_mma::{
+        emit_load_a_fragment_smem, emit_load_b_fragment_smem, emit_mma_instruction,
+    };
+    let hd = config.head_dim as u32;
+    let row_stride = (hd * 2) as usize;
+    let q_off = tier_b2_dkdv_q_offset(config);
+    let k_off = tier_b2_dkdv_k_offset(config);
+    let n_k_tiles = hd / 16;
+    let pct4 = |r: &[String; 4]| {
+        [
+            format!("%{}", r[0]),
+            format!("%{}", r[1]),
+            format!("%{}", r[2]),
+            format!("%{}", r[3]),
+        ]
+    };
+    let pct2 = |r: &[String; 2]| [format!("%{}", r[0]), format!("%{}", r[1])];
+    for r in c_regs {
+        ptx.push_str(&format!("    mov.f32 %{r}, 0.0;\n"));
+    }
+    for k in 0..n_k_tiles {
+        // A base = cvta(shmem) + q_off + band_row_base*hd*2 + k*16*2 (Q-band rows, k-tile cols)
+        ptx.push_str(&format!(
+            "    mul.lo.u32 %a_base, %band_row_base, {};\n",
+            hd * 2
+        ));
+        ptx.push_str(&format!(
+            "    add.u32 %a_base, %a_base, {};\n",
+            q_off + k * 16 * 2
+        ));
+        ptx.push_str("    add.u32 %a_base, %a_base, %mma_smem_base;  // + cvta(shmem) base\n");
+        // B base = cvta(shmem) + k_off + n_tile*8*hd*2 + k*16*2 (K^T: kv cols via %n_tile, hd k)
+        ptx.push_str(&format!(
+            "    mul.lo.u32 %b_base, %n_tile, {};\n",
+            8 * hd * 2
+        ));
+        ptx.push_str(&format!(
+            "    add.u32 %b_base, %b_base, {};\n",
+            k_off + k * 16 * 2
+        ));
+        ptx.push_str("    add.u32 %b_base, %b_base, %mma_smem_base;  // + cvta(shmem) base\n");
+        emit_load_a_fragment_smem(ptx, a_regs, "%a_base", row_stride);
+        // col_stride = hd*2 (row-major K byte-aliases K^T)
+        emit_load_b_fragment_smem(ptx, b_regs, "%b_base", row_stride);
+        emit_mma_instruction(ptx, &pct4(d_regs), &pct4(a_regs), &pct2(b_regs), &pct4(c_regs));
+        for (c, d) in c_regs.iter().zip(d_regs.iter()) {
+            // MAC: next k accumulates onto this D
+            ptx.push_str(&format!("    mov.f32 %{c}, %{d};\n"));
+        }
+    }
+}
+
+/// Emit the dK/dV inner-loop body: tile-skip gate, S=Q@K^T MMA, P-recompute.
+///
+/// This is Task 4. The structure mirrors dq.rs::emit_inner_loop_body (top portion
+/// only: S + P-recompute). The dP/dS/scatter/restage/MMA-3/4 are Tasks 5-8.
+///
+/// Key differences vs dq:
+///   - Labels use the DKDV_ prefix (both kernels concatenate into one PTX module).
+///   - SMEM offsets use tier_b2_dkdv_q_offset / tier_b2_dkdv_k_offset.
+///   - num_n_tiles = bkv/8 (contraction over the kv axis, one 8-col n-tile at a time).
+///   - %band_row_base maps to q-rows (per emit_warp_band_setup: warp_id*16 q-rows).
+///   - Per-row stats (%rmax_lo/hi, %rsum_recip_lo/hi) are loaded by emit_stats_addr_load
+///     inside the q-inner loop (indexed by %q_iter), so they are fresh here.
+fn emit_inner_loop_body(ptx: &mut String, config: &FlashAttentionConfig) {
+    use crate::flash_attention_v2::smem_layout::tier_b2_effective_bkv;
+
+    let hd = config.head_dim as u32;
+    let _ = hd; // used indirectly via emit_s_matmul_tiled
+
+    // === Tile-skip gate (spec ss9.2) ===
+    ptx.push_str("    // Tile-skip gate: skip S/P/dP/dS/dK/dV-update when tile is masked.\n");
+    ptx.push_str("    setp.eq.u32 %p_tile_active, %tile_skip_predicate, 1;\n");
+    ptx.push_str("    @!%p_tile_active bra DKDV_DS_SKIP_LABEL;\n");
+    ptx.push('\n');
+
+    // === S register family ===
+    // %s_d0..3 holds the raw S result; P-recompute reads it directly.
+    // .reg decls are hoisted to emit_register_decls (PTX ISA requires all .reg
+    // directives to precede executable instructions). These arrays only name the regs.
+    let a_regs: [String; 4] = ["s_a0", "s_a1", "s_a2", "s_a3"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect::<Vec<_>>()
+        .try_into()
+        .unwrap();
+    let b_regs: [String; 2] = ["s_b0", "s_b1"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect::<Vec<_>>()
+        .try_into()
+        .unwrap();
+    let c_regs: [String; 4] = ["s_c0", "s_c1", "s_c2", "s_c3"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect::<Vec<_>>()
+        .try_into()
+        .unwrap();
+    let d_regs: [String; 4] = ["s_d0", "s_d1", "s_d2", "s_d3"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect::<Vec<_>>()
+        .try_into()
+        .unwrap();
+
+    // === Open runtime n-tile streaming loop (DKDV_NTILE_LOOP) ===
+    // One iteration per 8-column kv n-tile (bkv/8 iterations at runtime). The body
+    // computes S(tiled) -> P-recompute for this %n_tile.
+    // Tasks 5-8 will add dP/dS/scatter/MMA-3/4 inside the n-tile loop.
+    let num_n_tiles = tier_b2_effective_bkv(config) / 8;
+    // Idle-warp gate: warps with warp_id >= bkv/16 skip the n-tile loop entirely.
+    // The loop has NO bar.sync inside, so skipping is deadlock-safe; idle warps
+    // reconverge at DKDV_IDLE_SKIP_NTILE.
+    ptx.push_str("    @!%p_warp_active bra DKDV_IDLE_SKIP_NTILE;\n");
+    ptx.push_str(&format!("    mov.u32 %num_n_tiles, {num_n_tiles};\n"));
+    ptx.push_str("    mov.u32 %n_tile, 0;\n");
+    ptx.push_str("DKDV_NTILE_LOOP:\n");
+
+    // === S = Q @ K^T (m16n8k16, k-tile contraction codegen-unrolled per n_tile) ===
+    // Row-major K[bkv, hd] byte-aliases to col-major K^T[hd, bkv] with
+    // col_stride_bytes = hd*2. A-frag base folds %band_row_base (q-rows);
+    // B-frag base derives from runtime %n_tile (kv columns).
+    ptx.push_str("    // === E1: S = Q @ K^T (tiled m16n8k16, k-tiles unrolled, per runtime n_tile) ===\n");
+    emit_s_matmul_tiled(ptx, config, &a_regs, &b_regs, &c_regs, &d_regs);
+
+    // === P recompute (lane-by-lane, no SMEM) per spec ss4.3 step 4 ===
+    // P[q,k] = softmax(scale * S[q,k]) = exp(scale*S[q,k] - row_max[q]) * row_sum_recip[q].
+    // The forward computed row_max/row_sum on SCALED scores, so we must scale
+    // the raw MMA S before exp. Omitting the scale leaves P ~sqrt(D)x too large.
+    // Stats loaded by emit_stats_addr_load: %rmax_lo/%rmax_hi, %rsum_recip_lo/%rsum_recip_hi.
+    ptx.push_str("    // === P recompute: P[q,k] = exp(scale*S[q,k] - row_max[q]) * row_sum_recip[q] ===\n");
+    ptx.push_str("    // Lane-by-lane on f32 S-fragment values in %s_d0..3.\n");
+    ptx.push_str("    // Elements {0,1} -> row lane/4 (lo); elements {2,3} -> row lane/4+8 (hi).\n");
+    // %p_recip_log2e/%f_scale/%p_0..3 declared in emit_register_decls (hoisted).
+    ptx.push_str("    mov.f32 %p_recip_log2e, 0F3FB8AA3B;  // 1/ln(2) = 1.4426950408889634\n");
+    // Attention scale = 1/sqrt(head_dim).
+    let scale_bits = (1.0f32 / (config.head_dim as f32).sqrt()).to_bits();
+    ptx.push_str(&format!(
+        "    mov.f32 %f_scale, 0F{scale_bits:08X};  // 1/sqrt(head_dim)\n"
+    ));
+    for i in 0..4 {
+        let (rmax, rrecip) = if i < 2 {
+            ("%rmax_lo", "%rsum_recip_lo")
+        } else {
+            ("%rmax_hi", "%rsum_recip_hi")
+        };
+        // Bug fix 2: multiply by %f_scale BEFORE subtracting %rmax (match forward's scaled stats).
+        ptx.push_str(&format!(
+            "    mul.f32 %p_{i}, %s_d{i}, %f_scale;  // scale * S (match forward scaled stats)\n"
+        ));
+        ptx.push_str(&format!("    sub.f32 %p_{i}, %p_{i}, {rmax};\n"));
+        ptx.push_str(&format!(
+            "    mul.f32 %p_{i}, %p_{i}, %p_recip_log2e;\n"
+        ));
+        ptx.push_str(&format!("    ex2.approx.f32 %p_{i}, %p_{i};\n"));
+        ptx.push_str(&format!("    mul.f32 %p_{i}, %p_{i}, {rrecip};\n"));
+    }
+    ptx.push('\n');
+
+    // (Task 5: dP = dO@V^T + dS = P*(dP-D) inside the n-tile loop)
+    // (Task 6: Q/dO re-stage for MMA-3/4)
+    // (Task 7: P/dS col scatter for dV/dK MMA inputs)
+    // (Task 8: MMA-3 dV_acc += P^T @ dO + MMA-4 dK_acc += dS^T @ Q, after the loop)
+
+    // === Close runtime n-tile streaming loop (DKDV_NTILE_LOOP) ===
+    ptx.push_str("    add.u32 %n_tile, %n_tile, 1;\n");
+    ptx.push_str("    setp.lt.u32 %p_ntile_more, %n_tile, %num_n_tiles;\n");
+    ptx.push_str("    @%p_ntile_more bra DKDV_NTILE_LOOP;\n");
+    // Idle-warp reconvergence. No bar.sync inside the n-tile loop, so deadlock-safe.
+    ptx.push_str("DKDV_IDLE_SKIP_NTILE:\n");
+    ptx.push('\n');
+
+    ptx.push_str("DKDV_DS_SKIP_LABEL:\n");
 }
 
 fn emit_inner_loop_close(ptx: &mut String) {
