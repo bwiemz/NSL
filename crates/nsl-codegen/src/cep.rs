@@ -386,6 +386,9 @@ pub fn write_prune_delta(plan: &CepPlan, baseline: &ModelSpec, path: &Path) -> s
             layer: l,
             pruned_heads: Vec::new(),
             new_d_ff: None,
+            // Always false in v1: the greedy prune driver removes heads + FFN
+            // width but never whole layers. Reserved for a future layer-drop
+            // (Option 2) path; cep_rewrite::LayerDelta already supports it.
             drop_layer: false,
         })
         .collect();
