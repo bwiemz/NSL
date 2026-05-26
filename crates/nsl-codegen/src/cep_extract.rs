@@ -10,6 +10,7 @@ use nsl_ast::types::TypeExprKind;
 use nsl_ast::{Module, Symbol};
 
 use crate::cep_oracle::{Activation, ModelSpec, NormType};
+use crate::cep_rewrite::SearchAxes;
 
 /// Recognizer refusals — each names what was expected vs. what was found.
 #[derive(Debug, Clone, PartialEq)]
@@ -437,6 +438,62 @@ pub fn extract_model_spec(module: &Module, resolve: Resolve) -> Result<ModelSpec
     Ok(spec)
 }
 
+/// Collect every `@search(axis, [values])` decorator in the module.
+fn collect_search_axes(module: &Module, resolve: Resolve) -> Vec<(String, Vec<u32>)> {
+    let mut out = Vec::new();
+    for stmt in &module.stmts {
+        let StmtKind::Decorated { decorators, .. } = &stmt.kind else { continue };
+        for deco in decorators {
+            if deco.name.len() != 1 || resolve(deco.name[0]) != "search" {
+                continue;
+            }
+            let Some(args) = &deco.args else { continue };
+            let (Some(a0), Some(a1)) = (args.first(), args.get(1)) else { continue };
+            let ExprKind::Ident(axis_sym) = &a0.value.kind else { continue };
+            let ExprKind::ListLiteral(items) = &a1.value.kind else { continue };
+            let mut values = Vec::new();
+            for it in items {
+                if let ExprKind::IntLiteral(n) = &it.kind {
+                    values.push(*n as u32);
+                }
+            }
+            if !values.is_empty() {
+                out.push((resolve(*axis_sym), values));
+            }
+        }
+    }
+    out
+}
+
+pub fn extract_search_axes(module: &Module, resolve: Resolve) -> Result<SearchAxes, CepExtractError> {
+    let base = extract_model_spec(module, resolve)?;
+    let mut axes = SearchAxes {
+        d_model: vec![base.d_model],
+        n_layers: vec![base.n_layers],
+        n_heads: vec![base.n_heads[0]],
+        n_kv_heads: vec![base.n_kv_heads[0]],
+        d_ff: vec![base.d_ff[0]],
+        activation: vec![base.activation],
+        norm: vec![base.norm],
+        vocab: base.vocab,
+        head_dim: base.head_dim[0],
+        max_seq: base.max_seq,
+        batch: base.batch,
+        dtype_bytes: base.dtype_bytes,
+    };
+    for (axis, values) in collect_search_axes(module, resolve) {
+        match axis.as_str() {
+            "d_model" => axes.d_model = values,
+            "n_layers" => axes.n_layers = values,
+            "n_heads" => axes.n_heads = values,
+            "n_kv_heads" => axes.n_kv_heads = values,
+            "d_ff" => axes.d_ff = values,
+            other => return Err(CepExtractError::UnknownSearchAxis { axis: other.to_string() }),
+        }
+    }
+    Ok(axes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -569,5 +626,36 @@ model BadNet:
         let resolve = |s: nsl_ast::Symbol| interner.resolve(s.0).unwrap_or("").to_string();
         let err = extract_model_spec(&module, &resolve).unwrap_err();
         assert!(matches!(err, CepExtractError::UnresolvableBinding { .. }), "got: {err}");
+    }
+
+    const SEARCHABLE: &str = r#"
+@cep_search(target = h100, objective = param_efficiency)
+@search(d_model, [256, 384, 512])
+@search(n_heads, [4, 6, 8])
+model GroupedQueryAttention(d_model: int, n_heads: int, n_kv_heads: int, dropout_p: float):
+    wq: Tensor = randn([d_model, d_model])
+model SwiGLUFFN(d_model: int, d_ff: int, dropout_p: float):
+    w_gate: Tensor = randn([d_model, d_ff])
+model TransformerBlock(d_model: int, n_heads: int, n_kv_heads: int, d_ff: int, dropout_p: float):
+    attn: GroupedQueryAttention = GroupedQueryAttention(d_model, n_heads, n_kv_heads, dropout_p)
+    ffn: SwiGLUFFN = SwiGLUFFN(d_model, d_ff, dropout_p)
+    norm: RMSNorm = RMSNorm(d_model)
+model SearchNet:
+    embed: Tensor = randn([4096, 384]) * full([1], 0.02)
+    blocks: [TransformerBlock; 6] = TransformerBlock(384, 6, 3, 1024, 0.1)
+"#;
+
+    #[test]
+    fn extracts_search_axes() {
+        let (module, interner) = parse(SEARCHABLE);
+        let resolve = |s: nsl_ast::Symbol| interner.resolve(s.0).unwrap_or("").to_string();
+        let axes = extract_search_axes(&module, &resolve).expect("axes");
+        assert_eq!(axes.d_model, vec![256, 384, 512]);
+        assert_eq!(axes.n_heads, vec![4, 6, 8]);
+        // Un-searched axes default to the base spec's single value.
+        assert_eq!(axes.n_kv_heads, vec![3]);
+        assert_eq!(axes.d_ff, vec![1024]);
+        assert_eq!(axes.n_layers, vec![6]);
+        assert_eq!(axes.vocab, 4096);
     }
 }
