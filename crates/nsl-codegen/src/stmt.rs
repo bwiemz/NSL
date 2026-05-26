@@ -3516,6 +3516,54 @@ impl Compiler<'_> {
             .ins()
             .iconst(cl_types::I64, param_paths.len() as i64);
 
+        // CPDT precision-adaptive optimizer execution (v1): build per-param
+        // storage dtype lists aligned with param_list, when active. Inactive ->
+        // None (the existing FP32 path runs verbatim, zero behavior change).
+        //
+        // Borrow discipline: extract the owned dtype Vecs (and the activation
+        // decision) into a local FIRST, which ends the `self.cpdt_plan` borrow.
+        // Only then do the `compile_call_by_name` loop (which borrows `self`
+        // mutably) run. No `unsafe`, no tensor clones.
+        let cpdt_precision_dtypes: Option<(Value, Value)> = {
+            let dtype_data: Option<(Vec<u16>, Vec<u16>)> = {
+                let plan = self.cpdt_plan.as_ref();
+                let active = plan
+                    .map(|p| {
+                        crate::cpdt_precision_exec::precision_active(
+                            matches!(p.mode, crate::cpdt::CpdtMode::Full),
+                            !p.precision.params.is_empty(),
+                            true, // weights_present is implied by a non-empty precision plan
+                            fase_deferred,
+                        )
+                    })
+                    .unwrap_or(false);
+                if active {
+                    let plan = plan.unwrap();
+                    Some(crate::cpdt_precision_exec::build_dtype_lists(
+                        &plan.precision,
+                        &param_paths,
+                    ))
+                } else {
+                    None
+                }
+            };
+            if let Some((m_codes, v_codes)) = dtype_data {
+                let m_list = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
+                let v_list = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
+                for &code in &m_codes {
+                    let c = builder.ins().iconst(cl_types::I64, code as i64);
+                    self.compile_call_by_name(builder, "nsl_list_push", &[m_list, c])?;
+                }
+                for &code in &v_codes {
+                    let c = builder.ins().iconst(cl_types::I64, code as i64);
+                    self.compile_call_by_name(builder, "nsl_list_push", &[v_list, c])?;
+                }
+                Some((m_list, v_list))
+            } else {
+                None
+            }
+        };
+
         // FASE Codegen Phase 2: build per-parameter mode table from WGGO's
         // per-layer decisions and emit it as a .rodata byte array. The
         // backward loop below loads `modes[gai]` to choose Deferred vs
