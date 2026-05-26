@@ -3516,6 +3516,60 @@ impl Compiler<'_> {
             .ins()
             .iconst(cl_types::I64, param_paths.len() as i64);
 
+        // CPDT precision-adaptive optimizer execution (v1): build per-param
+        // storage dtype lists aligned with param_list, when active. Inactive ->
+        // None (the existing FP32 path runs verbatim, zero behavior change).
+        //
+        // Borrow discipline: extract the owned dtype Vecs (and the activation
+        // decision) into a local FIRST, which ends the `self.cpdt_plan` borrow.
+        // Only then do the `compile_call_by_name` loop (which borrows `self`
+        // mutably) run. No `unsafe`, no tensor clones.
+        let cpdt_precision_dtypes: Option<(Value, Value)> = {
+            let dtype_data: Option<(Vec<u16>, Vec<u16>)> = {
+                // The FASE cast wrapping is emitted only on the non-unified-dispatch
+                // Deferred branch, which runs iff WGGO is inactive. Allocating FP16
+                // m/v on the unified-dispatch (WGGO) path would feed FP16 buffers to
+                // an unwrapped FP32 update → silent corruption. Gate on it.
+                let wrapped_path_active = self.wggo_overrides.is_none();
+                let plan = self.cpdt_plan.as_ref();
+                let active = plan
+                    .map(|p| {
+                        crate::cpdt_precision_exec::precision_active(
+                            matches!(p.mode, crate::cpdt::CpdtMode::Full),
+                            !p.precision.params.is_empty(),
+                            true, // weights_present is implied by a non-empty precision plan
+                            fase_deferred,
+                            wrapped_path_active,
+                        )
+                    })
+                    .unwrap_or(false);
+                if active {
+                    let plan = plan.unwrap();
+                    Some(crate::cpdt_precision_exec::build_dtype_lists(
+                        &plan.precision,
+                        &param_paths,
+                    ))
+                } else {
+                    None
+                }
+            };
+            if let Some((m_codes, v_codes)) = dtype_data {
+                let m_list = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
+                let v_list = self.compile_call_by_name(builder, "nsl_list_new", &[])?;
+                for &code in &m_codes {
+                    let c = builder.ins().iconst(cl_types::I64, code as i64);
+                    self.compile_call_by_name(builder, "nsl_list_push", &[m_list, c])?;
+                }
+                for &code in &v_codes {
+                    let c = builder.ins().iconst(cl_types::I64, code as i64);
+                    self.compile_call_by_name(builder, "nsl_list_push", &[v_list, c])?;
+                }
+                Some((m_list, v_list))
+            } else {
+                None
+            }
+        };
+
         // FASE Codegen Phase 2: build per-parameter mode table from WGGO's
         // per-layer decisions and emit it as a .rodata byte array. The
         // backward loop below loads `modes[gai]` to choose Deferred vs
@@ -3593,11 +3647,33 @@ impl Compiler<'_> {
             state.current_block = Some(init_body);
 
             let param_i = self.compile_call_by_name(builder, "nsl_list_get", &[param_list, idx])?;
-            let buf1 = self.compile_call_by_name(builder, "nsl_tensor_zeros_like", &[param_i])?;
+            // CPDT precision-adaptive: allocate optimizer state at the planned
+            // storage dtype when active; otherwise use the verbatim FP32 path.
+            // `cpdt_precision_dtypes` is `Option<(Value, Value)>` and `Value:
+            // Copy`, so matching by value inside the loop is fine.
+            let buf1 = if let Some((m_list, _)) = cpdt_precision_dtypes {
+                let m_code = self.compile_call_by_name(builder, "nsl_list_get", &[m_list, idx])?;
+                self.compile_call_by_name(
+                    builder,
+                    "nsl_tensor_zeros_like_dtype",
+                    &[param_i, m_code],
+                )?
+            } else {
+                self.compile_call_by_name(builder, "nsl_tensor_zeros_like", &[param_i])?
+            };
             self.compile_call_by_name(builder, "nsl_list_push", &[state_list_1, buf1])?;
             if num_state_buffers >= 2 {
-                let buf2 =
-                    self.compile_call_by_name(builder, "nsl_tensor_zeros_like", &[param_i])?;
+                let buf2 = if let Some((_, v_list)) = cpdt_precision_dtypes {
+                    let v_code =
+                        self.compile_call_by_name(builder, "nsl_list_get", &[v_list, idx])?;
+                    self.compile_call_by_name(
+                        builder,
+                        "nsl_tensor_zeros_like_dtype",
+                        &[param_i, v_code],
+                    )?
+                } else {
+                    self.compile_call_by_name(builder, "nsl_tensor_zeros_like", &[param_i])?
+                };
                 self.compile_call_by_name(builder, "nsl_list_push", &[state_list_2, buf2])?;
             }
 
@@ -5703,6 +5779,7 @@ impl Compiler<'_> {
                     } else {
                         pb_m
                     };
+                    let wrap_precision = cpdt_precision_dtypes.is_some();
                     self.fase_emit_final_step(
                         builder,
                         pb_theta,
@@ -5711,6 +5788,7 @@ impl Compiler<'_> {
                         pb_v,
                         &fase_plan.recipe,
                         Some((bc1_inv, bc2_inv)),
+                        wrap_precision,
                     )?;
                     let pb_i_next = builder.ins().iadd_imm(pb_i, 1);
                     builder.def_var(pb_i_var, pb_i_next);
@@ -5750,6 +5828,7 @@ impl Compiler<'_> {
                         // SGD has no v state — pass m as a placeholder (not used by SgdUpdate recipe)
                         m
                     };
+                    let wrap_precision = cpdt_precision_dtypes.is_some();
                     self.fase_emit_final_step(
                         builder,
                         theta,
@@ -5758,6 +5837,7 @@ impl Compiler<'_> {
                         v,
                         &fase_plan.recipe,
                         Some((bc1_inv, bc2_inv)),
+                        wrap_precision,
                     )?;
                     // fase_emit_final_step zeroed m_partial already — no Site E needed.
                     let fs_one = builder.ins().iconst(cl_types::I64, 1);

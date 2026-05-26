@@ -70,6 +70,7 @@ pub mod cpdt_joint;
 pub mod cpdt_optim;
 pub mod cpdt_sensitivity;
 pub mod cpdt_tier_apply;
+pub mod cpdt_precision_exec;
 pub mod cpdt_zero;
 pub mod csha;
 pub mod csha_apply;
