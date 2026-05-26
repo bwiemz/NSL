@@ -81,6 +81,45 @@ pub extern "C" fn nsl_tensor_cast(src_ptr: i64, target_dtype: i64) -> i64 {
     Box::into_raw(out) as i64
 }
 
+/// Convert `src` (read as f32) into `dst`'s dtype and write it IN PLACE into
+/// `dst`'s existing buffer. `dst` keeps its identity (pointer/buffer), which
+/// preserves persistent optimizer-state identity across steps. `len` must
+/// match. Neither tensor is freed. v1: F32/FP16 only, CPU only.
+#[no_mangle]
+pub extern "C" fn nsl_tensor_cast_into(dst_ptr: i64, src_ptr: i64) {
+    let dst = unsafe { &*(dst_ptr as *const NslTensor) };
+    let src = unsafe { &*(src_ptr as *const NslTensor) };
+    assert_eq!(dst.device, 0, "nsl_tensor_cast_into: GPU dst not supported in v1 (device={})", dst.device);
+    assert_eq!(src.device, 0, "nsl_tensor_cast_into: GPU src not supported in v1 (device={})", src.device);
+    let len = dst.len as usize;
+    assert_eq!(dst.len, src.len, "nsl_tensor_cast_into: length mismatch (dst={}, src={})", dst.len, src.len);
+
+    let src_f32: Vec<f32> = match src.dtype {
+        DTYPE_F32 => unsafe { std::slice::from_raw_parts(src.data as *const f32, len) }.to_vec(),
+        DTYPE_FP16 => {
+            let d = unsafe { std::slice::from_raw_parts(src.data as *const u16, len) };
+            d.iter().map(|&b| f16_bits_to_f32(b)).collect()
+        }
+        other => panic!("nsl_tensor_cast_into: unsupported src dtype {other} (v1: F32/FP16)"),
+    };
+
+    match dst.dtype {
+        DTYPE_F32 => {
+            let p = dst.data as *mut f32;
+            for (i, &v) in src_f32.iter().enumerate() {
+                unsafe { *p.add(i) = v };
+            }
+        }
+        DTYPE_FP16 => {
+            let p = dst.data as *mut u16;
+            for (i, &v) in src_f32.iter().enumerate() {
+                unsafe { *p.add(i) = f32_to_f16_bits(v) };
+            }
+        }
+        other => panic!("nsl_tensor_cast_into: unsupported dst dtype {other} (v1: F32/FP16)"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -96,6 +135,20 @@ mod tests {
         let strides = NslTensor::compute_strides(shape, 1);
         let t = Box::new(NslTensor::new(
             data as *mut c_void, shape, strides, 1, len as i64, 0, DTYPE_F32, 1, 0,
+        ));
+        Box::into_raw(t) as i64
+    }
+
+    fn fp16_tensor(vals: &[f32]) -> i64 {
+        let len = vals.len();
+        let data = checked_alloc(len * std::mem::size_of::<u16>()) as *mut u16;
+        for (i, &v) in vals.iter().enumerate() {
+            unsafe { *data.add(i) = f32_to_f16_bits(v) };
+        }
+        let shape = NslTensor::copy_shape([len as i64].as_ptr() as *mut i64, 1);
+        let strides = NslTensor::compute_strides(shape, 1);
+        let t = Box::new(NslTensor::new(
+            data as *mut c_void, shape, strides, 1, len as i64, 0, DTYPE_FP16, 1, 0,
         ));
         Box::into_raw(t) as i64
     }
@@ -193,5 +246,36 @@ mod tests {
         crate::tensor::nsl_tensor_free(src_hi);
         crate::tensor::nsl_tensor_free(fp16_lo);
         crate::tensor::nsl_tensor_free(fp16_hi);
+    }
+
+    #[test]
+    fn cast_into_quantizes_f32_into_existing_fp16_buffer() {
+        let dst = fp16_tensor(&[0.0, 0.0, 0.0]);
+        let dst_data_before = unsafe { (*(dst as *const NslTensor)).data };
+        let src = f32_tensor(&[1.0001, 3.14159, -2.5]);
+
+        nsl_tensor_cast_into(dst, src);
+
+        let dst_data_after = unsafe { (*(dst as *const NslTensor)).data };
+        assert_eq!(dst_data_before, dst_data_after, "dst buffer must not be reallocated");
+
+        let t = unsafe { &*(dst as *const NslTensor) };
+        let bits = unsafe { std::slice::from_raw_parts(t.data as *const u16, 3) };
+        for (i, &v) in [1.0001_f32, 3.14159, -2.5].iter().enumerate() {
+            assert_eq!(bits[i], f32_to_f16_bits(v), "elem {i} not quantized to match the primitive");
+        }
+        crate::tensor::nsl_tensor_free(dst);
+        crate::tensor::nsl_tensor_free(src);
+    }
+
+    #[test]
+    fn cast_into_f32_dst_is_copy() {
+        let dst = f32_tensor(&[9.0, 9.0]);
+        let src = f32_tensor(&[1.5, -2.5]);
+        nsl_tensor_cast_into(dst, src);
+        let got = read_f32(dst);
+        assert_eq!(got, vec![1.5_f32, -2.5]);
+        crate::tensor::nsl_tensor_free(dst);
+        crate::tensor::nsl_tensor_free(src);
     }
 }
