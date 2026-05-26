@@ -10,6 +10,7 @@
 //! will extend with dK/dV-kernel synthesis.
 
 pub mod d_prepass;
+pub mod dkdv;
 pub mod dq;
 pub mod hbm_addr;
 
@@ -42,16 +43,17 @@ impl std::fmt::Display for BackwardSynthError {
 
 impl std::error::Error for BackwardSynthError {}
 
-/// Phase 2 emitter: synthesize D pre-pass + dQ-kernel PTX.
+/// Phase 3a emitter: synthesize D pre-pass + dQ-kernel + dK/dV-kernel PTX.
 ///
-/// Phase 3 will extend with dK/dV-kernel synthesis (separate kernel,
-/// concatenated into the output).
+/// Phase 3a adds the dK/dV-kernel scaffold (kv-outer/q-inner loop structure,
+/// cp.async data loads, finalize stub). Tasks 4-8 add the MMA math.
 pub fn synthesize_tier_b2_backward(
     config: &FlashAttentionConfig,
 ) -> Result<String, BackwardSynthError> {
     let d_prepass_ptx = d_prepass::synthesize_d_prepass(config)?;
     let dq_ptx = dq::synthesize_dq_kernel(config)?;
-    Ok(format!("{}\n\n{}", d_prepass_ptx, dq_ptx))
+    let dkdv_ptx = dkdv::synthesize_dkdv_kernel(config)?;
+    Ok(format!("{}\n\n{}\n\n{}", d_prepass_ptx, dq_ptx, dkdv_ptx))
 }
 
 #[cfg(test)]
@@ -68,6 +70,13 @@ mod tests {
             gpu_sm: 80, segment_masked: false,
             csha: Some(CshaExtras { level: 2, ..Default::default() }),
         }
+    }
+
+    #[test]
+    fn phase3a_synthesize_includes_dkdv_kernel() {
+        let ptx = synthesize_tier_b2_backward(&canonical_cfg()).expect("synth ok");
+        assert!(ptx.contains("tier_b2_dkdv_kernel"),
+            "expected dK/dV kernel entry, got:\n{ptx}");
     }
 
     #[test]

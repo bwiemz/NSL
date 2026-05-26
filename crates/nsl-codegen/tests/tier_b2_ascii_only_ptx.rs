@@ -14,6 +14,7 @@
 
 use nsl_codegen::flash_attention::{CshaExtras, FlashAttentionConfig, RopeStyle};
 use nsl_codegen::flash_attention_v2::tier_b2::backward::d_prepass::synthesize_d_prepass;
+use nsl_codegen::flash_attention_v2::tier_b2::backward::dkdv::synthesize_dkdv_kernel;
 use nsl_codegen::flash_attention_v2::tier_b2::backward::dq::synthesize_dq_kernel;
 
 fn cfg(hd: i64) -> FlashAttentionConfig {
@@ -60,5 +61,13 @@ fn tier_b2_dq_kernel_emits_ascii_only_ptx() {
     for hd in [32, 64, 128, 256] {
         let ptx = synthesize_dq_kernel(&cfg(hd)).unwrap();
         assert_ascii_only(&format!("dq_kernel hd={hd}"), &ptx);
+    }
+}
+
+#[test]
+fn tier_b2_dkdv_kernel_emits_ascii_only_ptx() {
+    for hd in [32, 64, 128, 256] {
+        let ptx = synthesize_dkdv_kernel(&cfg(hd)).unwrap();
+        assert_ascii_only(&format!("dkdv_kernel hd={hd}"), &ptx);
     }
 }
