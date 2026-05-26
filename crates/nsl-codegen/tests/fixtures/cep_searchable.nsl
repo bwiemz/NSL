@@ -1,0 +1,16 @@
+from nsl.nn.norms import RMSNorm
+
+@cep_search(target = h100, objective = param_efficiency)
+@search(d_model, [256, 384, 512])
+@search(n_heads, [4, 6, 8])
+model GroupedQueryAttention(d_model: int, n_heads: int, n_kv_heads: int, dropout_p: float):
+    wq: Tensor = randn([d_model, d_model])
+model SwiGLUFFN(d_model: int, d_ff: int, dropout_p: float):
+    w_gate: Tensor = randn([d_model, d_ff])
+model TransformerBlock(d_model: int, n_heads: int, n_kv_heads: int, d_ff: int, dropout_p: float):
+    attn: GroupedQueryAttention = GroupedQueryAttention(d_model, n_heads, n_kv_heads, dropout_p)
+    ffn: SwiGLUFFN = SwiGLUFFN(d_model, d_ff, dropout_p)
+    norm: RMSNorm = RMSNorm(d_model)
+model SearchNet:
+    embed: Tensor = randn([4096, 384]) * full([1], 0.02)
+    blocks: [TransformerBlock; 6] = TransformerBlock(384, 6, 3, 1024, 0.1)

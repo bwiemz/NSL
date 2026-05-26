@@ -11,6 +11,8 @@
 //! The driver is pure and deterministic — every invocation with the same
 //! inputs produces an identical report.
 
+use std::path::Path;
+
 use serde::Serialize;
 
 use crate::cep_importance::{analyse_weight_map, ImportanceTable, RooflineSlackTable};
@@ -19,11 +21,11 @@ use crate::cep_rewrite::SearchAxes;
 use crate::cep_search::{
     architecture_search, prune_greedy, Constraints, Granularity, NasObjective, SearchOutcome,
 };
-use crate::gpu_specs::{default_gpu, find_gpu};
+use crate::gpu_specs::{default_gpu, find_gpu, GPU_DATABASE};
 use crate::weight_aware::WeightMap;
 
 /// Input for [`run_prune`].
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct CepPruneInput<'a> {
     pub spec: ModelSpec,
     pub weights: Option<&'a WeightMap>,
@@ -274,6 +276,337 @@ fn synthetic_importance(spec: &ModelSpec, slacks: &RooflineSlackTable) -> Import
 }
 
 // ---------------------------------------------------------------------------
+// Delta-JSON writers — serialise a CepPlan to a versioned *.cep.json file.
+// These DTOs pin the on-disk schema independently of the core layout.
+// ---------------------------------------------------------------------------
+
+const CEP_DELTA_VERSION: u32 = 1;
+
+// NOTE: these emit the delta-JSON contract spelling (lowercase, no underscore),
+// intentionally distinct from cep_oracle's `as_str()` ("rms_norm"). Do not merge.
+fn activation_str(a: crate::cep_oracle::Activation) -> &'static str {
+    use crate::cep_oracle::Activation::*;
+    match a {
+        Relu => "relu",
+        Gelu => "gelu",
+        SiLU => "silu",
+        SwiGlu => "swiglu",
+    }
+}
+
+fn norm_str(n: crate::cep_oracle::NormType) -> &'static str {
+    use crate::cep_oracle::NormType::*;
+    match n {
+        LayerNorm => "layernorm",
+        RmsNorm => "rmsnorm",
+    }
+}
+
+#[derive(Serialize)]
+struct SpecDto {
+    d_model: u32,
+    n_layers: u32,
+    n_heads: Vec<u32>,
+    n_kv_heads: Vec<u32>,
+    head_dim: u32,
+    d_ff: Vec<u32>,
+    activation: &'static str,
+    norm: &'static str,
+    vocab: u32,
+}
+
+impl SpecDto {
+    fn from_spec(s: &ModelSpec) -> Self {
+        SpecDto {
+            d_model: s.d_model,
+            n_layers: s.n_layers,
+            n_heads: s.n_heads.clone(),
+            n_kv_heads: s.n_kv_heads.clone(),
+            head_dim: s.head_dim.first().copied().unwrap_or(0),
+            d_ff: s.d_ff.clone(),
+            activation: activation_str(s.activation),
+            norm: norm_str(s.norm),
+            vocab: s.vocab,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct BaselineProfileDto {
+    total_flops: u64,
+    param_bytes: u64,
+    peak_memory_bytes: u64,
+    estimated_latency_us: f64,
+}
+
+#[derive(Serialize)]
+struct ChosenProfileDto {
+    param_bytes: u64,
+    peak_memory_bytes: u64,
+    estimated_latency_us: f64,
+    roofline_utilization: f64,
+}
+
+#[derive(Serialize)]
+struct LayerDeltaDto {
+    layer: u32,
+    pruned_heads: Vec<u32>,
+    new_d_ff: Option<u32>,
+    drop_layer: bool,
+}
+
+#[derive(Serialize)]
+struct ChosenDto {
+    spec: SpecDto,
+    profile: ChosenProfileDto,
+}
+
+#[derive(Serialize)]
+struct PruneDeltaBody {
+    per_layer: Vec<LayerDeltaDto>,
+}
+
+#[derive(Serialize)]
+struct PruneDeltaDoc {
+    cep_version: u32,
+    mode: &'static str,
+    target: String,
+    baseline_profile: BaselineProfileDto,
+    chosen: ChosenDto,
+    delta: PruneDeltaBody,
+}
+
+/// Serialize the prune delta — the Option-2 input contract.
+pub fn write_prune_delta(plan: &CepPlan, baseline: &ModelSpec, path: &Path) -> std::io::Result<()> {
+    let chosen = plan.outcome.chosen.as_ref();
+    let chosen_spec = chosen.map(|c| &c.spec);
+
+    let mut per_layer: Vec<LayerDeltaDto> = (0..baseline.n_layers)
+        .map(|l| LayerDeltaDto {
+            layer: l,
+            pruned_heads: Vec::new(),
+            new_d_ff: None,
+            // Always false in v1: the greedy prune driver removes heads + FFN
+            // width but never whole layers. Reserved for a future layer-drop
+            // (Option 2) path; cep_rewrite::LayerDelta already supports it.
+            drop_layer: false,
+        })
+        .collect();
+    for step in &plan.outcome.prune_log {
+        if step.accepted && step.kind == "head" {
+            if let (Some(h), Some(slot)) = (step.head, per_layer.get_mut(step.layer as usize)) {
+                slot.pruned_heads.push(h);
+            }
+        }
+    }
+    if let Some(cs) = chosen_spec {
+        for l in 0..baseline.n_layers as usize {
+            if let Some(&w) = cs.d_ff.get(l) {
+                if w < baseline.d_ff[l] {
+                    per_layer[l].new_d_ff = Some(w);
+                }
+            }
+        }
+    }
+
+    let bp = plan.outcome.baseline.as_ref();
+    let doc = PruneDeltaDoc {
+        cep_version: CEP_DELTA_VERSION,
+        mode: "prune",
+        target: plan.target_gpu.clone(),
+        baseline_profile: BaselineProfileDto {
+            total_flops: bp.map(|p| p.total_flops).unwrap_or(0),
+            param_bytes: bp.map(|p| p.param_bytes).unwrap_or(0),
+            peak_memory_bytes: bp.map(|p| p.peak_memory_bytes).unwrap_or(0),
+            estimated_latency_us: bp.map(|p| p.estimated_latency_us).unwrap_or(0.0),
+        },
+        chosen: ChosenDto {
+            spec: SpecDto::from_spec(chosen_spec.unwrap_or(baseline)),
+            profile: ChosenProfileDto {
+                param_bytes: chosen.map(|c| c.profile.param_bytes).unwrap_or(0),
+                peak_memory_bytes: chosen.map(|c| c.profile.peak_memory_bytes).unwrap_or(0),
+                estimated_latency_us: chosen.map(|c| c.profile.estimated_latency_us).unwrap_or(0.0),
+                roofline_utilization: chosen.map(|c| c.profile.roofline_utilization).unwrap_or(0.0),
+            },
+        },
+        delta: PruneDeltaBody { per_layer },
+    };
+    let json = serde_json::to_string_pretty(&doc)?;
+    std::fs::write(path, json)
+}
+
+#[derive(Serialize)]
+struct CandidateDto {
+    spec: SpecDto,
+    profile: ChosenProfileDto,
+    score: f64,
+    feasible: bool,
+}
+
+#[derive(Serialize)]
+struct SearchDoc {
+    cep_version: u32,
+    mode: &'static str,
+    target: String,
+    baseline_profile: Option<BaselineProfileDto>,
+    ranked_candidates: Vec<CandidateDto>,
+}
+
+/// Serialize the search result (mode "search" with ranked_candidates).
+pub fn write_search_delta(plan: &CepPlan, path: &Path) -> std::io::Result<()> {
+    let ranked = plan
+        .outcome
+        .ranked_candidates
+        .iter()
+        .take(10)
+        .map(|c| CandidateDto {
+            spec: SpecDto::from_spec(&c.spec),
+            profile: ChosenProfileDto {
+                param_bytes: c.profile.param_bytes,
+                peak_memory_bytes: c.profile.peak_memory_bytes,
+                estimated_latency_us: c.profile.estimated_latency_us,
+                roofline_utilization: c.profile.roofline_utilization,
+            },
+            score: c.score,
+            feasible: c.feasible,
+        })
+        .collect();
+    let doc = SearchDoc {
+        cep_version: CEP_DELTA_VERSION,
+        mode: "search",
+        target: plan.target_gpu.clone(),
+        baseline_profile: plan.outcome.baseline.as_ref().map(|p| BaselineProfileDto {
+            total_flops: p.total_flops,
+            param_bytes: p.param_bytes,
+            peak_memory_bytes: p.peak_memory_bytes,
+            estimated_latency_us: p.estimated_latency_us,
+        }),
+        ranked_candidates: ranked,
+    };
+    let json = serde_json::to_string_pretty(&doc)?;
+    std::fs::write(path, json)
+}
+
+// ---------------------------------------------------------------------------
+// Config bridge — semantic config + CLI overrides → driver input structs
+// ---------------------------------------------------------------------------
+
+/// CLI scalar overrides; decorator-primary, these win when present.
+#[derive(Debug, Clone, Default)]
+pub struct CliOverrides {
+    pub target: Option<String>,
+    pub sparsity: Option<f64>,
+    pub cep_out: Option<std::path::PathBuf>,
+}
+
+#[derive(Debug)]
+pub enum CepBridgeError {
+    UnknownTarget { target: String, supported: String },
+    BadPreserve(String),
+}
+
+impl std::fmt::Display for CepBridgeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CepBridgeError::UnknownTarget { target, supported } => {
+                write!(f, "CEP: unknown --cep-target '{target}'. Supported GPUs: {supported}")
+            }
+            CepBridgeError::BadPreserve(s) => write!(
+                f,
+                "CEP: preserve entry '{s}' must be a layer-index integer in v1 (glob preserve is v2)"
+            ),
+        }
+    }
+}
+
+fn supported_gpus() -> String {
+    GPU_DATABASE.iter().map(|g| g.name).collect::<Vec<_>>().join(", ")
+}
+
+fn parse_preserve_layers(preserve: &[String]) -> Result<Vec<u32>, CepBridgeError> {
+    preserve
+        .iter()
+        .map(|p| p.parse::<u32>().map_err(|_| CepBridgeError::BadPreserve(p.clone())))
+        .collect()
+}
+
+fn map_granularity(g: nsl_semantic::cep::Granularity) -> Granularity {
+    match g {
+        nsl_semantic::cep::Granularity::Head => Granularity::Head,
+        nsl_semantic::cep::Granularity::Ffn => Granularity::Ffn,
+        nsl_semantic::cep::Granularity::HeadAndFfn => Granularity::HeadAndFfn,
+    }
+}
+
+fn map_objective(o: nsl_semantic::cep::NasObjective) -> NasObjective {
+    match o {
+        nsl_semantic::cep::NasObjective::ParamEfficiency => NasObjective::ParamEfficiency,
+        nsl_semantic::cep::NasObjective::MinLatency => NasObjective::MinLatency,
+        nsl_semantic::cep::NasObjective::MinMemory => NasObjective::MinMemory,
+        nsl_semantic::cep::NasObjective::MinParams => NasObjective::MinParams,
+    }
+}
+
+/// Build `CepPruneInput` from semantic config + extracted spec + overrides.
+/// `target` is the pre-resolved effective target string, owned by the caller.
+pub fn build_prune_input<'a>(
+    cfg: &nsl_semantic::cep::CepPruneConfig,
+    spec: ModelSpec,
+    weights: Option<&'a WeightMap>,
+    target: &'a str,
+    sparsity_override: Option<f64>,
+) -> Result<CepPruneInput<'a>, CepBridgeError> {
+    if find_gpu(target).is_none() {
+        return Err(CepBridgeError::UnknownTarget {
+            target: target.to_string(),
+            supported: supported_gpus(),
+        });
+    }
+    let target_sparsity = sparsity_override.unwrap_or(cfg.sparsity);
+    let preserve_layers = parse_preserve_layers(&cfg.preserve)?;
+    let constraints = Constraints {
+        peak_memory_bytes: cfg.constraints.peak_memory_bytes.unwrap_or(u64::MAX),
+        latency_us: cfg.constraints.latency_us.unwrap_or(f64::INFINITY),
+        target_sparsity,
+        preserve_layers,
+    };
+    Ok(CepPruneInput {
+        spec,
+        weights,
+        target,
+        constraints,
+        granularity: map_granularity(cfg.granularity),
+        roofline_slack: RooflineSlackTable { per_layer: Vec::new() },
+    })
+}
+
+/// Build `CepSearchInput` from semantic config + extracted axes + target.
+pub fn build_search_input<'a>(
+    cfg: &nsl_semantic::cep::CepSearchConfig,
+    axes: SearchAxes,
+    target: &'a str,
+) -> Result<CepSearchInput<'a>, CepBridgeError> {
+    if find_gpu(target).is_none() {
+        return Err(CepBridgeError::UnknownTarget {
+            target: target.to_string(),
+            supported: supported_gpus(),
+        });
+    }
+    let constraints = Constraints {
+        peak_memory_bytes: cfg.constraints.peak_memory_bytes.unwrap_or(u64::MAX),
+        latency_us: cfg.constraints.latency_us.unwrap_or(f64::INFINITY),
+        target_sparsity: 0.0,
+        preserve_layers: Vec::new(),
+    };
+    Ok(CepSearchInput {
+        axes,
+        target,
+        constraints,
+        objective: map_objective(cfg.objective),
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -387,5 +720,128 @@ mod tests {
             importance: ImportanceTable::default(),
         };
         assert_eq!(plan.param_reduction(), 0.0);
+    }
+}
+
+#[cfg(test)]
+mod bridge_tests {
+    use super::*;
+    use crate::cep_oracle::{Activation, ModelSpec, NormType};
+
+    fn spec() -> ModelSpec {
+        ModelSpec {
+            d_model: 384,
+            n_layers: 6,
+            n_heads: vec![6; 6],
+            n_kv_heads: vec![3; 6],
+            head_dim: vec![64; 6],
+            d_ff: vec![1024; 6],
+            vocab: 4096,
+            max_seq: 2048,
+            batch: 1,
+            activation: Activation::SwiGlu,
+            norm: NormType::RmsNorm,
+            dtype_bytes: 4,
+        }
+    }
+
+    fn prune_cfg() -> nsl_semantic::cep::CepPruneConfig {
+        nsl_semantic::cep::CepPruneConfig {
+            target: None,
+            sparsity: 0.3,
+            granularity: nsl_semantic::cep::Granularity::HeadAndFfn,
+            preserve: vec!["0".to_string(), "5".to_string()],
+            constraints: nsl_semantic::cep::CepConstraints {
+                peak_memory_bytes: Some(6_000_000_000),
+                latency_us: Some(3000.0),
+            },
+            span: nsl_errors::Span::DUMMY,
+        }
+    }
+
+    #[test]
+    fn build_prune_input_maps_constraints_and_overrides() {
+        let cfg = prune_cfg();
+        let input = build_prune_input(&cfg, spec(), None, "H100-SXM", Some(0.5)).expect("input");
+        assert_eq!(input.target, "H100-SXM");
+        assert_eq!(input.constraints.peak_memory_bytes, 6_000_000_000);
+        assert_eq!(input.constraints.latency_us, 3000.0);
+        assert_eq!(input.constraints.target_sparsity, 0.5); // override beats cfg.sparsity (0.3)
+        assert_eq!(input.constraints.preserve_layers, vec![0, 5]);
+        assert!(matches!(input.granularity, Granularity::HeadAndFfn));
+    }
+
+    #[test]
+    fn build_prune_input_unknown_target_errors() {
+        let cfg = prune_cfg();
+        let err = build_prune_input(&cfg, spec(), None, "NoSuchGPU", None).unwrap_err();
+        match err {
+            CepBridgeError::UnknownTarget { target, supported } => {
+                assert_eq!(target, "NoSuchGPU");
+                assert!(supported.contains("H100-SXM"));
+            }
+            other => panic!("expected UnknownTarget, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_prune_input_bad_preserve_errors() {
+        let mut cfg = prune_cfg();
+        cfg.preserve = vec!["blocks.0.attn".to_string()];
+        let err = build_prune_input(&cfg, spec(), None, "H100-SXM", None).unwrap_err();
+        assert!(matches!(err, CepBridgeError::BadPreserve(_)));
+    }
+
+    use std::io::Read;
+
+    #[test]
+    fn write_prune_delta_emits_versioned_json() {
+        let baseline = spec();
+        let cfg = prune_cfg();
+        let input = build_prune_input(&cfg, baseline.clone(), None, "H100-SXM", Some(0.2)).expect("input");
+        let plan = run_prune(input);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("model.cep.json");
+        write_prune_delta(&plan, &baseline, &path).expect("write");
+
+        let mut s = String::new();
+        std::fs::File::open(&path).unwrap().read_to_string(&mut s).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["cep_version"], 1);
+        assert_eq!(v["mode"], "prune");
+        assert_eq!(v["target"], "H100-SXM");
+        assert!(v["baseline_profile"]["param_bytes"].is_number());
+        assert!(v["chosen"]["spec"]["d_model"].is_number());
+        assert!(v["chosen"]["spec"]["activation"].is_string());
+        assert!(v["delta"]["per_layer"].is_array());
+        assert_eq!(v["delta"]["per_layer"].as_array().unwrap().len(), baseline.n_layers as usize);
+    }
+
+    #[test]
+    fn write_search_delta_emits_ranked_candidates() {
+        use crate::cep_rewrite::SearchAxes;
+        let axes = SearchAxes {
+            d_model: vec![256, 384], n_layers: vec![4], n_heads: vec![4, 8],
+            n_kv_heads: vec![2], d_ff: vec![512, 1024],
+            activation: vec![crate::cep_oracle::Activation::SwiGlu],
+            norm: vec![crate::cep_oracle::NormType::RmsNorm],
+            vocab: 4096, head_dim: 64, max_seq: 2048, batch: 1, dtype_bytes: 4,
+        };
+        let scfg = nsl_semantic::cep::CepSearchConfig {
+            target: None,
+            objective: nsl_semantic::cep::NasObjective::ParamEfficiency,
+            constraints: Default::default(),
+            span: nsl_errors::Span::DUMMY,
+        };
+        let input = build_search_input(&scfg, axes, "H100-SXM").expect("input");
+        let plan = run_search(input);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.cep.json");
+        write_search_delta(&plan, &path).expect("write");
+        let s = std::fs::read_to_string(&path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["mode"], "search");
+        assert!(v["ranked_candidates"].is_array());
     }
 }
