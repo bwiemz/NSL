@@ -278,6 +278,34 @@ enum Cli {
         #[arg(long)]
         linear_types: bool,
 
+        /// CPDT: planner mode ("full", "zero_only", or "off").
+        /// Passing `--cpdt` without a value enables full mode.
+        /// Mirrors `nsl build --cpdt` so precision-adaptive training
+        /// executes end-to-end via `nsl run`.
+        #[arg(long, value_name = "MODE", num_args = 0..=1, default_missing_value = "full")]
+        cpdt: Option<String>,
+
+        /// CPDT: number of GPUs in the target cluster. Required when `--cpdt` is set.
+        #[arg(long, value_name = "N")]
+        cpdt_num_gpus: Option<u32>,
+
+        /// CPDT: intra-node bandwidth in bytes/sec (default 9e11 = 900 GB/s).
+        #[arg(long, value_name = "BPS", default_value_t = 9e11)]
+        cpdt_intra_bw: f64,
+
+        /// CPDT: inter-node bandwidth in bytes/sec (default 1e11 = 100 GB/s).
+        #[arg(long, value_name = "BPS", default_value_t = 1e11)]
+        cpdt_inter_bw: f64,
+
+        /// CPDT: emit the full plan to stdout. Implies `--cpdt` (full mode).
+        #[arg(long, default_value_t = false)]
+        cpdt_report: bool,
+
+        /// Path to the model weights file (.safetensors) for the
+        /// weight-aware CPDT path. Mirrors `nsl build -w/--weights`.
+        #[arg(short = 'w', long)]
+        weights: Option<PathBuf>,
+
         /// Arguments to pass to the compiled program
         #[arg(last = true)]
         args: Vec<String>,
@@ -1448,6 +1476,12 @@ fn main_inner() {
             csha,
             csha_report,
             linear_types,
+            cpdt,
+            cpdt_num_gpus,
+            cpdt_intra_bw,
+            cpdt_inter_bw,
+            cpdt_report,
+            weights,
         } => {
             // CSHA: validate the same way `nsl build --csha` does so an
             // unrecognised mode fails fast rather than silently disabling
@@ -1461,6 +1495,111 @@ fn main_inner() {
                     process::exit(1);
                 }
             }
+
+            // CPDT: mirror the `nsl build` setup so precision-adaptive
+            // training executes end-to-end via `nsl run`. The cpdt_mode,
+            // cpdt_cluster and cpdt_plan_out are threaded into the compile
+            // call via CompileOptions fields below (the compiler copies
+            // options.cpdt_cluster into Compiler::cpdt_cluster and reads
+            // compile_options.cpdt_plan_out during train-block codegen).
+            //
+            // --cpdt-report implies --cpdt (full mode unless explicit).
+            let cpdt_mode_str: Option<String> = match (cpdt.as_deref(), cpdt_report) {
+                (Some(s), _) => Some(s.to_string()),
+                (None, true) => Some("full".to_string()),
+                (None, false) => None,
+            };
+            let cpdt_mode = match cpdt_mode_str.as_deref() {
+                None => nsl_codegen::cpdt::CpdtMode::Off,
+                Some(s) => match nsl_codegen::cpdt::CpdtMode::parse(s) {
+                    Some(m) => m,
+                    None => {
+                        eprintln!(
+                            "error: --cpdt value '{}' is not one of full|zero_only|off",
+                            s
+                        );
+                        process::exit(2);
+                    }
+                },
+            };
+            let cpdt_cluster = if cpdt_mode != nsl_codegen::cpdt::CpdtMode::Off {
+                let n = match cpdt_num_gpus {
+                    Some(n) if n >= 1 => n,
+                    Some(_) => {
+                        eprintln!("nsl: --cpdt-num-gpus must be >= 1");
+                        process::exit(2);
+                    }
+                    None => {
+                        eprintln!("nsl: --cpdt requires --cpdt-num-gpus N");
+                        process::exit(2);
+                    }
+                };
+                Some(nsl_codegen::cpdt_zero::ClusterSpec {
+                    num_gpus: n,
+                    memory_budget_bytes: 80u64 * 1024 * 1024 * 1024,
+                    intra_bw_bps: cpdt_intra_bw,
+                    inter_bw_bps: cpdt_inter_bw,
+                    gpus_per_node: n.min(8),
+                })
+            } else {
+                None
+            };
+            let cpdt_plan_out: Option<
+                std::sync::Arc<std::sync::Mutex<Option<nsl_codegen::cpdt::CpdtPlan>>>,
+            > = if cpdt_mode != nsl_codegen::cpdt::CpdtMode::Off {
+                Some(std::sync::Arc::new(std::sync::Mutex::new(None)))
+            } else {
+                None
+            };
+
+            // Phase 1 CPDT: AST-scan for load_safetensors(...) + @cpdt(weight_aware=...).
+            // Resolve the effective weight file via the four-case decision
+            // table from the Phase 1 spec §2.1 (identical to the build path).
+            // `nsl run` has no --standalone flag, so the build path's
+            // `!standalone` guard is always satisfied here.
+            let resolved_weight_file: Option<PathBuf> = {
+                let ast_source = std::fs::read_to_string(&file).unwrap_or_default();
+                let mut ast_interner = Interner::new();
+                let ast_file_id = nsl_errors::FileId(0);
+                let (ast_tokens, _) =
+                    nsl_lexer::tokenize(&ast_source, ast_file_id, &mut ast_interner);
+                let ast_parse = nsl_parser::parse(&ast_tokens, &mut ast_interner);
+                let ast_weight_ref =
+                    ast_scan::find_ast_weight_ref(&ast_parse.module, &ast_interner);
+                let ast_weight_aware =
+                    ast_scan::find_ast_cpdt_weight_aware(&ast_parse.module, &ast_interner);
+
+                match (&weights, &ast_weight_ref) {
+                    (Some(flag_path), Some(ast_path)) => {
+                        eprintln!(
+                            "warning: --weights {} overrides AST-declared load_safetensors({:?}).",
+                            flag_path.display(),
+                            ast_path.display(),
+                        );
+                        Some(flag_path.clone())
+                    }
+                    (Some(flag_path), None) => Some(flag_path.clone()),
+                    (None, Some(ast_path)) => Some(ast_path.clone()),
+                    (None, None) => {
+                        let cpdt_enabled = cpdt_mode != nsl_codegen::cpdt::CpdtMode::Off;
+                        let weight_aware = ast_weight_aware.unwrap_or(true);
+                        if cpdt_enabled && weight_aware {
+                            eprintln!(
+                                "error: --cpdt {} requires weights. Resolve by ONE of:\n\
+                                 \n\
+                                 1. Add --weights <path.safetensors> to this invocation.\n\
+                                 2. Add `let w = load_safetensors(\"<path>\")` to your NSL source.\n\
+                                 3. Add `@cpdt(weight_aware=false)` to opt out of the weight-aware path\n\
+                                    (produces a CPDT plan without weight-derived tier assignments).",
+                                cpdt_mode.as_str(),
+                            );
+                            process::exit(1);
+                        }
+                        None
+                    }
+                }
+            };
+
             // Dev Tools Phase 4 Task 6: when --monitor is set, auto-detect
             // whether this program has a `train { }` block.  If so, enable
             // the health monitor and skip the Phase 1/2 kernel-timing path
@@ -1542,7 +1681,9 @@ fn main_inner() {
                 trace_ops,
                 nan_analysis: false,
                 deterministic,
-                weight_file: None,
+                // CPDT: pass through the four-case-resolved weight file so the
+                // weight-aware tier assignment runs during train-block codegen.
+                weight_file: resolved_weight_file.clone(),
                 weight_config: Default::default(),
                 weight_analysis: false,
                 unikernel_config: None,
@@ -1598,10 +1739,15 @@ fn main_inner() {
                 wggo_prune_fraction: None,
                 csha_mode: csha.clone(),
                 csha_report,
-                cpdt_mode: nsl_codegen::cpdt::CpdtMode::Off,
-                cpdt_cluster: None,
-                cpdt_report_requested: false,
-                cpdt_plan_out: None,
+                // CPDT: thread the planner mode + cluster + plan-out slot into
+                // codegen exactly as `nsl build` does — the compiler copies
+                // cpdt_cluster into Compiler::cpdt_cluster and reads
+                // cpdt_plan_out during train-block codegen via
+                // invoke_cpdt_if_enabled.
+                cpdt_mode,
+                cpdt_cluster: cpdt_cluster.clone(),
+                cpdt_report_requested: cpdt_report,
+                cpdt_plan_out: cpdt_plan_out.clone(),
                 export_functions_out: None,
                 calibration_data: None,
                 calibration_mode: Some("required".to_string()),
@@ -3906,6 +4052,35 @@ fn run_run(file: &PathBuf, program_args: &[String], profile_memory: bool, profil
 
     // Build to temp dir (reuse existing build logic, quiet mode)
     run_build_inner(file, Some(exe_path.clone()), false, false, true, options, None);
+
+    // CPDT: post-compile rendering, mirroring the `nsl build` path. Stderr
+    // diagnostics always fire when CPDT ran; the stdout plan only with
+    // --cpdt-report. The plan slot was populated during the compile above.
+    if let Some(slot) = options.cpdt_plan_out.as_ref() {
+        if let Some(plan) = slot.lock().ok().and_then(|g| g.clone()) {
+            for diag in &plan.override_diagnostics {
+                eprintln!(
+                    "[cpdt] scope:global wggo-override-rejected requested={} applied={} reason={:?}",
+                    diag.requested, diag.applied, diag.reason
+                );
+            }
+            if options.cpdt_report_requested {
+                print!("{}", plan.render_report());
+                println!();
+                println!("=== Defaults Assumed ===");
+                println!("precision_cfg: BF16-mixed (override: --cpdt-precision, future)");
+                let jc = nsl_codegen::cpdt_joint::JointConfig::default();
+                println!("joint_cfg:     {:?} (override: --cpdt-budget, future)", jc);
+                println!("expert_cfg:    none (no MoE block detected)");
+                match &options.weight_file {
+                    Some(p) => println!("weights:       {}", p.display()),
+                    None => println!(
+                        "weights:       none (no --weights flag and no AST load_safetensors)"
+                    ),
+                }
+            }
+        }
+    }
 
     // Execute the compiled program
     let mut cmd = std::process::Command::new(&exe_path);
