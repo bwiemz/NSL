@@ -1,3 +1,5 @@
+from nsl.nn.norms import RMSNorm
+
 @cep_search(target = h100, objective = param_efficiency)
 @search(d_model, [256, 384, 512])
 @search(n_heads, [4, 6, 8])
