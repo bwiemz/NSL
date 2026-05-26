@@ -23,6 +23,11 @@ pub enum BackwardSynthError {
     NotImplemented,
     /// head_dim must be divisible by 32 for the warp-shfl reduction.
     UnsupportedHeadDim(u32),
+    /// A config invariant the emitter relies on is violated (e.g. the dK/dV
+    /// kernel requires effective_bq == effective_bkv so the warp-band register
+    /// is a valid base for BOTH the q-indexed inner work and the kv-indexed
+    /// accumulator). Carries a human-readable explanation.
+    UnsupportedConfig(String),
 }
 
 impl std::fmt::Display for BackwardSynthError {
@@ -37,6 +42,7 @@ impl std::fmt::Display for BackwardSynthError {
                 "Tier B.2 backward requires head_dim divisible by 32, got {}",
                 hd
             ),
+            Self::UnsupportedConfig(msg) => write!(f, "Tier B.2 backward unsupported config: {}", msg),
         }
     }
 }

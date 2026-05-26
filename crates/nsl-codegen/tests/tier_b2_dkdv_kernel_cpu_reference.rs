@@ -106,37 +106,10 @@ fn cfg(bq: i64, hd: i64) -> FlashAttentionConfig {
     }
 }
 
-// ============================================================================
-// Test 0: CPU-only analytic s=1 case (no GPU, runs everywhere)
-// ============================================================================
-
-/// s=1: P = [[1]], O = V, so d_local = dO·V = dP[0], hence dS = 0.
-/// Therefore dV[0,:] = dO[0,:] and dK[0,:] = 0 exactly.
-#[test]
-fn cpu_naive_dkdv_s1_collapses_to_dv_eq_do_and_dk_zero() {
-    use half::f16;
-    let hd = 4usize;
-    let to16 = |xs: &[f32]| xs.iter().map(|&x| f16::from_f32(x)).collect::<Vec<_>>();
-    let q   = to16(&[0.1, 0.2, 0.3, 0.4]);
-    let k   = to16(&[0.5, 0.6, 0.7, 0.8]);
-    let v   = to16(&[1.0, 2.0, 3.0, 4.0]);
-    let o   = v.clone();               // s=1: O = P@V = V
-    let d_o = to16(&[0.9, 0.8, 0.7, 0.6]);
-    let cfg_val = cfg(32, hd as i64);  // causal flag irrelevant at s=1
-    let (dv, dk) = cpu_naive_backward_dkdv(&q, &k, &v, &o, &d_o, 1, 1, 1, &cfg_val);
-    for di in 0..hd {
-        assert!(
-            (dv[di] - d_o[di].to_f32()).abs() < 1e-6,
-            "s=1: dV must equal dO at d={di}: got dv[{di}]={} expected {}",
-            dv[di], d_o[di].to_f32()
-        );
-        assert!(
-            dk[di].abs() < 1e-6,
-            "s=1: dK must be 0 at d={di}: got dk[{di}]={}",
-            dk[di]
-        );
-    }
-}
+// Test 0 (CPU-only analytic s=1 case) lives in the NON-cuda-gated integration test
+// `crates/nsl-test/tests/cpu_naive_backward_dkdv_analytic.rs` so the CPU reference
+// math is regression-tested in a standard `cargo test` (no GPU/cuda feature). This
+// file (#![cfg(feature="cuda")]) holds only the GPU parity sweeps below.
 
 // ============================================================================
 // GPU sweeps

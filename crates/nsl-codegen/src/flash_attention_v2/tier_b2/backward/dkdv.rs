@@ -37,6 +37,22 @@ pub fn synthesize_dkdv_kernel(
     if !hd.is_multiple_of(32) {
         return Err(BackwardSynthError::UnsupportedHeadDim(hd));
     }
+    // Precondition: effective_bq == effective_bkv. The single warp-band register
+    // %band_row_base = warp_id*16 is used BOTH as a q-row base (inner-loop S/dP MMA,
+    // stats load, P/dS col scatter) AND as a kv-row base (outer-loop dV/dK accumulator
+    // MMA + HBM finalize). Those interpretations coincide only when bq==bkv (so
+    // active_warps = bq/16 = bkv/16 and each warp owns the same 16 rows in both axes).
+    // A bq!=bkv config would silently corrupt dK/dV; fail loudly instead.
+    {
+        use crate::flash_attention_v2::smem_layout::{tier_b2_effective_bkv, tier_b2_effective_bq};
+        let ebq = tier_b2_effective_bq(config);
+        let ebkv = tier_b2_effective_bkv(config);
+        if ebq != ebkv {
+            return Err(BackwardSynthError::UnsupportedConfig(format!(
+                "dK/dV kernel requires effective_bq == effective_bkv (warp-band dual-use), got bq={ebq} bkv={ebkv}"
+            )));
+        }
+    }
 
     let mut ptx = String::new();
     emit_prelude(&mut ptx);
@@ -91,6 +107,9 @@ fn emit_entry_signature(ptx: &mut String) {
     ptx.push_str("    .param .u64 row_max_ptr,\n");
     ptx.push_str("    .param .u64 row_sum_ptr,\n");
     ptx.push_str("    .param .u64 d_ptr,\n");
+    // RESERVED for a future segment-masked dK/dV backward: the kernel does NOT load
+    // or honor segment_ids_ptr yet (callers pass null). Mirrors the dQ kernel's
+    // not-yet-wired segment param; a non-null pointer is silently ignored (no masking).
     ptx.push_str("    .param .u64 segment_ids_ptr,\n");
     ptx.push_str("    .param .u64 d_k_out_ptr,\n");
     ptx.push_str("    .param .u64 d_v_out_ptr,\n");
@@ -228,8 +247,15 @@ fn emit_grid_id_setup(ptx: &mut String) {
     ptx.push_str("    mov.u32 %r_tid, %tid.x;\n");
     ptx.push_str("    and.b32 %lane_id, %r_tid, 31;\n");
     ptx.push_str("    shr.u32 %warp_id, %r_tid, 5;\n");
-    // For dK/dV the grid is launched with ctaid.x = kv_tile, ctaid.y = head, ctaid.z = batch.
-    ptx.push_str("    mov.u32 %kv_tile,   %ctaid.x;\n");
+    // ctaid.y = head, ctaid.z = batch. NOTE: %kv_tile (= ctaid.x) is currently
+    // VESTIGIAL — this kernel is single-CTA-complete per (head, batch): it sweeps ALL
+    // kv-tiles via the internal %kv_iter software loop (0..num_kv_iters) and ALL q-tiles
+    // via %q_iter, so every CTA computes the full dK/dV. A launch with grid_x>1 (e.g.
+    // ceil(seq/bq), mirroring the dQ launcher) therefore has each CTA redundantly compute
+    // and write the SAME full result — idempotent (correct), just wasteful. Promoting
+    // ctaid.x to a real per-kv-tile partition (dropping the %kv_iter loop) is a deferred
+    // perf optimization; the dQ kernel carries the same vestigial pattern today.
+    ptx.push_str("    mov.u32 %kv_tile,   %ctaid.x;  // vestigial: kv sweep is the internal %kv_iter loop\n");
     ptx.push_str("    mov.u32 %head,      %ctaid.y;\n");
     ptx.push_str("    mov.u32 %batch_idx, %ctaid.z;\n");
     ptx.push_str("    setp.eq.u32 %p_producer, %warp_id, 0;\n");
@@ -243,11 +269,21 @@ fn emit_grid_id_setup(ptx: &mut String) {
 
 /// Emit warp-band ownership base and the idle-warp predicate from %warp_id.
 ///
-/// For dK/dV the band covers kv rows (not q rows). The bkv/16 active warps each
-/// own a 16-row kv band: warp w owns kv rows [w*16, w*16+16).
+/// `%band_row_base = warp_id*16` is DUAL-USE (valid only under the kernel's
+/// `effective_bq == effective_bkv` precondition): a q-row base for the inner-loop
+/// S/dP MMA + stats + P/dS scatter, and a kv-row base for the outer-loop dV/dK
+/// accumulator MMA + finalize. With bq==bkv, `active_warps = bkv/16 = bq/16` and the
+/// 16-row band is identical in both axes. See the inline comment + the precondition
+/// in `synthesize_dkdv_kernel`.
 fn emit_warp_band_setup(ptx: &mut String, config: &FlashAttentionConfig) {
     let active_warps = tier_b2_effective_bkv(config) / 16; // 4 at bkv=64, 2 at bkv=32
-    ptx.push_str("    // Warp-per-m16-band: warp w owns kv-rows [w*16, w*16+16).\n");
+    // %band_row_base = warp_id*16 is dual-use: under the synthesize_dkdv_kernel
+    // precondition effective_bq == effective_bkv, it is simultaneously a valid q-row
+    // base (inner-loop S/dP MMA, stats load, P/dS col scatter — bq-tall tiles) AND a
+    // valid kv-row base (outer-loop dV/dK accumulator MMA + HBM finalize — bkv-tall
+    // tiles). active_warps = bkv/16 = bq/16, so each warp owns the same 16 rows in both
+    // interpretations. (The bq!=bkv case is rejected up front; see the precondition.)
+    ptx.push_str("    // Warp-per-m16-band: warp w owns row band [w*16, w*16+16) (q-rows inner / kv-rows outer; bq==bkv).\n");
     ptx.push_str("    mul.lo.u32 %band_row_base, %warp_id, 16;\n");
     ptx.push_str(&format!(
         "    setp.lt.u32 %p_warp_active, %warp_id, {active_warps};  // active = warp_id < bkv/16\n"
