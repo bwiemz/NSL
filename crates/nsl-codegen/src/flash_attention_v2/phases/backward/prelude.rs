@@ -285,7 +285,7 @@ pub fn emit(
         // %rs_doc_seg: u16 scratch for ld.shared.u16 of segment_ids[abs_row].
         ptx.push_str("    .reg .b16 %rs_doc_seg;\n");
         ptx.push_str("    .reg .s32 %r_doc_start, %r_effective_pos_q, %r_effective_pos_k;\n");
-        ptx.push_str("    .reg .pred %p_doc_load_done;\n");
+        ptx.push_str("    .reg .pred %p_doc_load_done, %p_doc_null;\n");
     }
 
     // PCA Tier A backward: segment-mask helper scratch registers + SMEM buffer.
@@ -314,7 +314,7 @@ pub fn emit(
         ptx.push_str("    .reg .u32 %r_pca_i, %r_pca_seq;\n");
         ptx.push_str("    .reg .u64 %rd_pca_off;\n");
         ptx.push_str("    .reg .b16 %rs_pca;\n");
-        ptx.push_str("    .reg .pred %p_pca_load, %p_pca_done;\n");
+        ptx.push_str("    .reg .pred %p_pca_load, %p_pca_done, %p_seg_null;\n");
         // Backward-specific: scratch u64 for synthesizing q_global and k_global
         // from within-tile indices for the helper call in ds_compute.
         // %warp_row (u64) and %k_start (u64) are live at ds_compute call sites;
@@ -409,6 +409,10 @@ pub fn emit(
     if config.segment_masked {
         ptx.push_str("\n    // --- PCA Tier A: load segment_ids from global to shared ---\n");
         ptx.push_str("    ld.param.u64 %rd_seg_global, [segment_ids_ptr];\n");
+        // PCA Tier A null-guard (spec §4.2): null segment_ids_ptr → write the
+        // all-zero sentinel (uniform segment 0 → no masking). Mirrors the
+        // forward prelude guard; BW_ labels keep this kernel's symbols unique.
+        ptx.push_str("    setp.eq.u64 %p_seg_null, %rd_seg_global, 0;\n");
         // seg_base = shmem_base + backward_total_bytes — embed seg_smem at
         // the tail of the extern shmem region (see prelude register-decl
         // comment for the Blackwell illegal-address rationale). The launcher
@@ -431,7 +435,12 @@ pub fn emit(
         ptx.push_str("    cvt.u64.u32 %rd_pca_off, %r_pca_i;\n");
         ptx.push_str("    shl.b64 %rd_pca_off, %rd_pca_off, 1;\n");
         ptx.push_str("    add.u64 %rd_pca_off, %rd_pca_off, %rd_seg_global;\n");
+        ptx.push_str("    @%p_seg_null bra BW_PCA_SEG_NULL_LD;\n");
         ptx.push_str("    ld.global.u16 %rs_pca, [%rd_pca_off];\n");
+        ptx.push_str("    bra BW_PCA_SEG_LD_DONE;\n");
+        ptx.push_str("BW_PCA_SEG_NULL_LD:\n");
+        ptx.push_str("    mov.u16 %rs_pca, 0;\n");
+        ptx.push_str("BW_PCA_SEG_LD_DONE:\n");
         // Shared address = seg_base + i * 2  (u64 throughout — no truncation)
         ptx.push_str("    cvt.u64.u32 %rd_pca_off, %r_pca_i;\n");
         ptx.push_str("    shl.b64 %rd_pca_off, %rd_pca_off, 1;\n");

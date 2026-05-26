@@ -68,7 +68,7 @@ expression: ptx
     .reg .u32 %r_pca_i, %r_pca_seq;
     .reg .u64 %rd_pca_off;
     .reg .b16 %rs_pca;
-    .reg .pred %p_pca_load, %p_pca_done;
+    .reg .pred %p_pca_load, %p_pca_done, %p_seg_null;
     .shared .align 4 .b8 seg_smem[32768];
     cvta.shared.u64 %shmem_base, shmem;
     mov.f32 %log2e, 0f3FB8AA3B;  // 1.4426950408 (log2(e))
@@ -95,6 +95,7 @@ expression: ptx
 
     // --- PCA Tier A: load segment_ids from global to shared ---
     ld.param.u64 %rd_seg_global, [segment_ids_ptr];
+    setp.eq.u64 %p_seg_null, %rd_seg_global, 0;
     cvta.shared.u64 %seg_base, seg_smem;
     setp.lt.u32 %p_pca_load, %tid_x, 32;
     @!%p_pca_load bra PCA_LOAD_DONE;
@@ -106,7 +107,12 @@ PCA_LOAD_LOOP:
     cvt.u64.u32 %rd_seg_smem, %r_pca_i;
     shl.b64 %rd_seg_smem, %rd_seg_smem, 1;
     add.u64 %rd_seg_smem, %rd_seg_smem, %rd_seg_global;
+    @%p_seg_null bra PCA_SEG_NULL_LD;
     ld.global.u16 %rs_pca, [%rd_seg_smem];
+    bra PCA_SEG_LD_DONE;
+PCA_SEG_NULL_LD:
+    mov.u16 %rs_pca, 0;
+PCA_SEG_LD_DONE:
     cvt.u64.u32 %rd_pca_off, %r_pca_i;
     shl.b64 %rd_pca_off, %rd_pca_off, 1;
     add.u64 %rd_pca_off, %rd_pca_off, %seg_base;
