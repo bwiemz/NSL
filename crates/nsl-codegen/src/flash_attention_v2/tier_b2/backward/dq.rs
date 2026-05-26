@@ -105,7 +105,7 @@ fn emit_entry_signature(ptx: &mut String) {
     ptx.push_str("{\n");
 }
 
-fn emit_register_decls(ptx: &mut String, _config: &FlashAttentionConfig) {
+fn emit_register_decls(ptx: &mut String, config: &FlashAttentionConfig) {
     // NOTE: .extern .shared shmem[N] is emitted at module scope by emit_smem_extern_module_scope
     // before the .visible .entry. PTX ISA disallows .extern .shared inside a function body.
     //
@@ -221,6 +221,14 @@ fn emit_register_decls(ptx: &mut String, _config: &FlashAttentionConfig) {
     ptx.push_str("    .reg .f32 %ds_0, %ds_1, %ds_2, %ds_3;\n");
     // dQ += dS@K fragment A/B regs (b32-packed f16 fragments; accumulators are %dq_acc_*).
     ptx.push_str("    .reg .b32 %dq_a0, %dq_a1, %dq_a2, %dq_a3, %dq_b0, %dq_b1;\n");
+    // dQ accumulators: hd/8 contiguous n-tiles x 4 f32/lane. Config-dependent count.
+    // Declared here (hoisted); zeroed once by emit_dq_acc_init before the kv loop.
+    let n_acc = (config.head_dim / 8) as u32;
+    for n in 0..n_acc {
+        ptx.push_str(&format!(
+            "    .reg .f32 %dq_acc_{n}_0, %dq_acc_{n}_1, %dq_acc_{n}_2, %dq_acc_{n}_3;\n"
+        ));
+    }
     ptx.push('\n');
 }
 
@@ -734,9 +742,9 @@ fn emit_dq_acc_init(ptx: &mut String, config: &FlashAttentionConfig) {
         "    // Zero dQ accumulator regs (hd/8={} contiguous n-tiles x 4 f32/lane; effective_bq={})\n",
         n_acc, effective_bq,
     ));
+    // .reg decls for %dq_acc_* are hoisted to emit_register_decls; only zero here.
     for n in 0..n_acc {
         for r in 0..4 {
-            ptx.push_str(&format!("    .reg .f32 %dq_acc_{}_{};\n", n, r));
             ptx.push_str(&format!("    mov.f32 %dq_acc_{}_{}, 0.0;\n", n, r));
         }
     }
