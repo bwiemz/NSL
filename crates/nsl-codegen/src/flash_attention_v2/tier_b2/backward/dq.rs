@@ -45,8 +45,14 @@ pub fn synthesize_dq_kernel(
     emit_tile_skip_predicate(&mut ptx, config);
     emit_inner_loop_body(&mut ptx, config);
     emit_inner_loop_close(&mut ptx);
-    emit_outer_loop_close(&mut ptx);
+    // Finalize MUST run INSIDE the outer q_iter loop: the dQ accumulator is per-q-tile
+    // (zeroed by emit_dq_acc_init each q_iter, accumulated over the kv sweep), and the
+    // finalize's HBM row = q_iter*bq + band_row_base + lane/4. Placing it after
+    // emit_outer_loop_close used the post-loop %q_iter (= num_q_iters), writing OOB rows
+    // (silently dropped → zero output) and only ever the last q-tile. Run it per q_iter
+    // before the increment so each q-tile's dQ is written with the correct, in-range row.
     emit_dq_finalize(&mut ptx, config);
+    emit_outer_loop_close(&mut ptx);
     emit_entry_close(&mut ptx);
     Ok(ptx)
 }
@@ -119,6 +125,14 @@ fn emit_register_decls(ptx: &mut String, _config: &FlashAttentionConfig) {
     ptx.push_str("    .reg .pred %p_kv_iter_more;\n");
     // Scratch registers used by matmul_mma helpers (emit_load_a/b_fragment_smem).
     ptx.push_str("    .reg .u32 %mma_addr, %mma_a_row, %mma_b_row;\n");
+    // Converted shared-memory base for MMA fragment addressing. The matmul_mma
+    // helpers add `smem_base_expr` (a SHARED-space byte address) directly to the
+    // per-lane offset, so callers MUST pass cvta(shmem)+band_offset — NOT a raw
+    // byte offset. The cp.async loaders, dS scatter, and K re-stage all write at
+    // cvta(shmem)+offset; %mma_smem_base lets the matmul reads use the SAME base
+    // (computed once in emit_grid_id_setup; cvta(shmem) is loop-invariant).
+    ptx.push_str("    .reg .u64 %mma_smem_base64;\n");
+    ptx.push_str("    .reg .u32 %mma_smem_base;\n");
     // Runtime n-tile streaming loop (DQ_NTILE_LOOP) for the tiled S=Q@K^T matmul.
     // %a_base/%b_base are the per-k-tile SMEM fragment bases recomputed each iter.
     ptx.push_str("    .reg .u32 %n_tile, %num_n_tiles, %a_base, %b_base;\n");
@@ -197,6 +211,12 @@ fn emit_grid_id_setup(ptx: &mut String) {
     ptx.push_str("    setp.eq.u32 %p_producer, %warp_id, 0;\n");
     // Load heads param for use by HBM address helpers (emit_4d_byte_offset).
     ptx.push_str("    ld.param.u32 %heads_r, [heads];\n");
+    // Converted SMEM base for the MMA fragment-load helpers (loop-invariant). The
+    // helpers add their `smem_base_expr` straight to the per-lane offset, so the
+    // matmul reads must use the SAME cvta(shmem)+offset base the cp.async loaders /
+    // dS scatter / K re-stage write to. Computed once here.
+    ptx.push_str("    cvta.shared.u64 %mma_smem_base64, shmem;\n");
+    ptx.push_str("    cvt.u32.u64 %mma_smem_base, %mma_smem_base64;\n");
     ptx.push('\n');
 }
 
@@ -979,12 +999,14 @@ fn emit_s_matmul_tiled(
         ptx.push_str(&format!("    mov.f32 %{r}, 0.0;\n"));
     }
     for k in 0..n_k_tiles {
-        // A base = q_off + band_row_base*hd*2 + k*16*2  (Q-band rows, k-tile cols)
+        // A base = cvta(shmem) + q_off + band_row_base*hd*2 + k*16*2  (Q-band rows, k-tile cols)
         ptx.push_str(&format!("    mul.lo.u32 %a_base, %band_row_base, {};\n", hd * 2));
         ptx.push_str(&format!("    add.u32 %a_base, %a_base, {};\n", q_off + k * 16 * 2));
-        // B base = k_off + n_tile*8*hd*2 + k*16*2  (Kᵀ: kv columns via runtime %n_tile, hd k)
+        ptx.push_str("    add.u32 %a_base, %a_base, %mma_smem_base;  // + cvta(shmem) base\n");
+        // B base = cvta(shmem) + k_off + n_tile*8*hd*2 + k*16*2  (Kᵀ: kv columns via runtime %n_tile, hd k)
         ptx.push_str(&format!("    mul.lo.u32 %b_base, %n_tile, {};\n", 8 * hd * 2));
         ptx.push_str(&format!("    add.u32 %b_base, %b_base, {};\n", k_off + k * 16 * 2));
+        ptx.push_str("    add.u32 %b_base, %b_base, %mma_smem_base;  // + cvta(shmem) base\n");
         emit_load_a_fragment_smem(ptx, a_regs, "%a_base", row_stride);
         emit_load_b_fragment_smem(ptx, b_regs, "%b_base", row_stride); // col_stride = hd*2 (row-major K byte-aliases Kᵀ)
         emit_mma_instruction(ptx, &pct4(d_regs), &pct4(a_regs), &pct2(b_regs), &pct4(c_regs));
@@ -1029,12 +1051,14 @@ fn emit_dp_matmul_tiled(
         ptx.push_str(&format!("    mov.f32 %{r}, 0.0;\n"));
     }
     for k in 0..n_k_tiles {
-        // A base = do_off + band_row_base*hd*2 + k*16*2  (dO-band rows, k-tile cols)
+        // A base = cvta(shmem) + do_off + band_row_base*hd*2 + k*16*2  (dO-band rows, k-tile cols)
         ptx.push_str(&format!("    mul.lo.u32 %a_base, %band_row_base, {};\n", hd * 2));
         ptx.push_str(&format!("    add.u32 %a_base, %a_base, {};\n", do_off + k * 16 * 2));
-        // B base = v_off + n_tile*8*hd*2 + k*16*2  (Vᵀ: kv columns via runtime %n_tile, hd k)
+        ptx.push_str("    add.u32 %a_base, %a_base, %mma_smem_base;  // + cvta(shmem) base\n");
+        // B base = cvta(shmem) + v_off + n_tile*8*hd*2 + k*16*2  (Vᵀ: kv columns via runtime %n_tile, hd k)
         ptx.push_str(&format!("    mul.lo.u32 %b_base, %n_tile, {};\n", 8 * hd * 2));
         ptx.push_str(&format!("    add.u32 %b_base, %b_base, {};\n", v_off + k * 16 * 2));
+        ptx.push_str("    add.u32 %b_base, %b_base, %mma_smem_base;  // + cvta(shmem) base\n");
         emit_load_a_fragment_smem(ptx, a_regs, "%a_base", row_stride);
         emit_load_b_fragment_smem(ptx, b_regs, "%b_base", row_stride); // col_stride = hd*2 (row-major V byte-aliases Vᵀ)
         emit_mma_instruction(ptx, &pct4(d_regs), &pct4(a_regs), &pct2(b_regs), &pct4(c_regs));
@@ -1082,13 +1106,16 @@ fn emit_dq_matmul_tiled(ptx: &mut String, config: &FlashAttentionConfig,
         let dq = [format!("%dq_acc_{n}_0"), format!("%dq_acc_{n}_1"),
                   format!("%dq_acc_{n}_2"), format!("%dq_acc_{n}_3")];
         for k in 0..n_k_tiles {
-            // A base = ds_off + band_row_base*bkv*2 + k*16*2  (runtime band_row_base)
+            // A base = cvta(shmem) + ds_off + band_row_base*bkv*2 + k*16*2  (runtime band_row_base)
             ptx.push_str(&format!("    mul.lo.u32 %a_base, %band_row_base, {};\n", bkv * 2));
             ptx.push_str(&format!("    add.u32 %a_base, %a_base, {};\n", ds_off + k * 16 * 2));
-            // B base = kcol_off + n*8*bkv*2 + k*16*2  (compile-time constant; pass directly)
+            ptx.push_str("    add.u32 %a_base, %a_base, %mma_smem_base;  // + cvta(shmem) base\n");
+            // B base = cvta(shmem) + kcol_off + n*8*bkv*2 + k*16*2  (compile-time offset into %b_base reg)
             let b_base = kcol_off + n * 8 * bkv * 2 + k * 16 * 2;
+            ptx.push_str(&format!("    mov.u32 %b_base, {b_base};\n"));
+            ptx.push_str("    add.u32 %b_base, %b_base, %mma_smem_base;  // + cvta(shmem) base\n");
             emit_load_a_fragment_smem(ptx, a_regs, "%a_base", ds_row_stride);
-            emit_load_b_fragment_smem(ptx, b_regs, &format!("{}", b_base), kcol_col_stride);
+            emit_load_b_fragment_smem(ptx, b_regs, "%b_base", kcol_col_stride);
             emit_mma_instruction(ptx, &dq, &pct4(a_regs), &pct2(b_regs), &dq); // C=D=dq_acc (MAC, no zeroing)
         }
     }
@@ -1178,11 +1205,19 @@ fn emit_inner_loop_body(ptx: &mut String, config: &FlashAttentionConfig) {
     ptx.push_str("    // Stats loaded by emit_stats_addr_load: %rmax_lo/%rmax_hi, %rsum_recip_lo/%rsum_recip_hi.\n");
     ptx.push_str("    .reg .f32 %p_recip_log2e;\n");
     ptx.push_str("    mov.f32 %p_recip_log2e, 0F3FB8AA3B;  // 1/ln(2) = 1.4426950408889634\n");
+    // Attention scale = 1/sqrt(head_dim). The forward computed row_max/row_sum on the
+    // SCALED scores (scale * Q@K^T), so the recompute must scale the raw MMA S the same
+    // way before exp — and dS carries the same 1/sqrt(D) factor (see reference math in
+    // cpu_naive_backward.rs). Omitting it left dQ ~sqrt(D)x too large.
+    let scale_bits = (1.0f32 / (config.head_dim as f32).sqrt()).to_bits();
+    ptx.push_str("    .reg .f32 %f_scale;\n");
+    ptx.push_str(&format!("    mov.f32 %f_scale, 0F{scale_bits:08X};  // 1/sqrt(head_dim)\n"));
     for i in 0..4 {
         let (rmax, rrecip) = if i < 2 { ("%rmax_lo", "%rsum_recip_lo") }
                               else      { ("%rmax_hi", "%rsum_recip_hi") };
         ptx.push_str(&format!("    .reg .f32 %p_{i};\n"));
-        ptx.push_str(&format!("    sub.f32 %p_{i}, %s_d{i}, {rmax};\n"));
+        ptx.push_str(&format!("    mul.f32 %p_{i}, %s_d{i}, %f_scale;  // scale * S (match forward's scaled stats)\n"));
+        ptx.push_str(&format!("    sub.f32 %p_{i}, %p_{i}, {rmax};\n"));
         ptx.push_str(&format!("    mul.f32 %p_{i}, %p_{i}, %p_recip_log2e;\n"));
         ptx.push_str(&format!("    ex2.approx.f32 %p_{i}, %p_{i};\n"));
         ptx.push_str(&format!("    mul.f32 %p_{i}, %p_{i}, {rrecip};\n"));
@@ -1223,6 +1258,7 @@ fn emit_inner_loop_body(ptx: &mut String, config: &FlashAttentionConfig) {
         ptx.push_str(&format!("    .reg .f32 %ds_{i};\n"));
         ptx.push_str(&format!("    sub.f32 %ds_{i}, %dp_d{i}, {d_row};\n"));
         ptx.push_str(&format!("    mul.f32 %ds_{i}, %ds_{i}, %p_{i};\n"));
+        ptx.push_str(&format!("    mul.f32 %ds_{i}, %ds_{i}, %f_scale;  // dS = (1/sqrt(D)) * P * (dP - D)\n"));
     }
     ptx.push('\n');
 
@@ -1873,10 +1909,17 @@ mod tests {
     #[test]
     fn synthesize_dq_kernel_applies_per_row_stats() {
         let ptx = synthesize_dq_kernel(&canonical_cfg()).unwrap();
-        // P recompute must subtract the ROW-CORRECT max: lo for elems 0/1, hi for 2/3.
-        assert!(ptx.contains("sub.f32 %p_0, %s_d0, %rmax_lo")
-            && ptx.contains("sub.f32 %p_2, %s_d2, %rmax_hi"),
-            "P recompute must use rmax_lo for elem0 and rmax_hi for elem2");
+        // P recompute must apply the 1/sqrt(D) attention scale to S (matching the
+        // forward's scaled row_max/row_sum), THEN subtract the ROW-CORRECT max:
+        // lo for elems 0/1, hi for 2/3.
+        assert!(ptx.contains("mul.f32 %p_0, %s_d0, %f_scale")
+            && ptx.contains("sub.f32 %p_0, %p_0, %rmax_lo")
+            && ptx.contains("mul.f32 %p_2, %s_d2, %f_scale")
+            && ptx.contains("sub.f32 %p_2, %p_2, %rmax_hi"),
+            "P recompute must scale S by 1/sqrt(D) then subtract rmax_lo (elem0) / rmax_hi (elem2)");
+        // dS must also carry the 1/sqrt(D) factor (dS = scale * P * (dP - D)).
+        assert!(ptx.contains("mul.f32 %ds_0, %ds_0, %f_scale"),
+            "dS must apply the 1/sqrt(D) attention scale");
         assert!(ptx.contains("mul.f32 %p_0, %p_0, %rsum_recip_lo")
             && ptx.contains("mul.f32 %p_2, %p_2, %rsum_recip_hi"),
             "P recompute must scale by row_sum_recip_lo/hi per row");
