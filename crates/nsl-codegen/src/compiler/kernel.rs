@@ -680,6 +680,12 @@ impl Compiler<'_> {
             None => return Ok(()),
         };
 
+        // PCA Tier A activation (spec 2026-05-25): emit segment-masked + RoPE-reset
+        // training kernels when the train block's dataset is packed. RoPE-reset rides
+        // on the existing `segment_masked && rope_q` gate (forward/prelude.rs:113); no
+        // separate flag. Inference (`base_config`) stays unmasked → byte-identical.
+        let segment_masked = crate::pca_activation::detect_packing_for_stmts(stmts, self.interner);
+
         // Resolve `d_model` from the layer's RMSNorm gamma / Q/K/V
         // projection shapes.  Without this the AD emitter allocates
         // `dx_dev`/`dxn_dev` as `[batch, seq, 0]` and the first
@@ -756,6 +762,7 @@ impl Compiler<'_> {
             csha: Some(csha_extras),
             block_q: backward_block_q,
             block_kv: backward_block_kv,
+            segment_masked,
             ..base_config
         };
 
