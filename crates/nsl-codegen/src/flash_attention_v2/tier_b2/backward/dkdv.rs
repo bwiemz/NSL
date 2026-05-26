@@ -23,10 +23,11 @@ use crate::flash_attention_v2::smem_layout::{
 };
 use crate::flash_attention_v2::tier_b2::backward::BackwardSynthError;
 
-// Bring in smem offset helpers used by the re-stage emitters (Task 6).
+// Bring in smem offset helpers used by the re-stage emitters (Task 6) and scatter emitters (Task 7).
 use crate::flash_attention_v2::smem_layout::{
     tier_b2_dkdv_q_offset, tier_b2_dkdv_q_colmajor_offset,
     tier_b2_dkdv_dO_offset, tier_b2_dkdv_dO_colmajor_offset,
+    tier_b2_dkdv_p_colmajor_offset, tier_b2_dkdv_ds_colmajor_offset,
 };
 
 pub fn synthesize_dkdv_kernel(
@@ -204,6 +205,18 @@ fn emit_register_decls(ptx: &mut String, config: &FlashAttentionConfig) {
     ptx.push_str("    .reg .u64 %ar_smem_base64;\n");
     ptx.push_str("    .reg .u32 %ar_smem_base32;\n");
     ptx.push_str("    .reg .b16 %ar_val;\n");
+    // Task 7 scratch registers for P-col and dS-col C-fragment scatter (col-major transpose).
+    // Prefix %bs_* to avoid collision with all other register namespaces.
+    // emit_pcol_scatter and emit_dscol_scatter reuse these sequentially.
+    ptx.push_str("    .reg .u32 %bs_lane_mod4, %bs_lane_div4;\n");
+    ptx.push_str("    .reg .u32 %bs_q_lo, %bs_q_hi;\n");
+    ptx.push_str("    .reg .u32 %bs_kv_lo, %bs_kv_hi;\n");
+    ptx.push_str("    .reg .u32 %bs_q_lo_b, %bs_q_hi_b;\n");       // q_lo/hi * 2 bytes
+    ptx.push_str("    .reg .u32 %bs_kvlo_off, %bs_kvhi_off;\n");    // kv_lo/hi * bq*2 bytes
+    ptx.push_str("    .reg .u32 %bs_addr0, %bs_addr1, %bs_addr2, %bs_addr3;\n");
+    ptx.push_str("    .reg .u64 %bs_smem_base64;\n");
+    ptx.push_str("    .reg .u32 %bs_smem_base32;\n");
+    ptx.push_str("    .reg .b16 %bs_h0, %bs_h1, %bs_h2, %bs_h3;\n");
     ptx.push('\n');
 }
 
@@ -1028,8 +1041,12 @@ fn emit_inner_loop_body(ptx: &mut String, config: &FlashAttentionConfig) {
     }
     ptx.push('\n');
 
-    // (Task 7: P/dS col scatter for dV/dK MMA inputs)
-    // (Task 8: MMA-3 dV_acc += P^T @ dO + MMA-4 dK_acc += dS^T @ Q, after the loop)
+    // === Task 7: P-col + dS-col C-fragment scatter (col-major transpose) ===
+    // Placed inside the n-tile loop, after the dS combine. Over all n-tiles,
+    // the full P^T/dS^T [kv, bq] bands fill in. No bar.sync here; Task 8's
+    // barrier before the MMAs orders these (mirrors F1's note in dq.rs).
+    emit_pcol_scatter(ptx, config);
+    emit_dscol_scatter(ptx, config);
 
     // === Close runtime n-tile streaming loop (DKDV_NTILE_LOOP) ===
     ptx.push_str("    add.u32 %n_tile, %n_tile, 1;\n");
@@ -1048,6 +1065,155 @@ fn emit_inner_loop_body(ptx: &mut String, config: &FlashAttentionConfig) {
     emit_dOcol_restage_scatter(ptx, config);
 
     ptx.push_str("DKDV_DS_SKIP_LABEL:\n");
+}
+
+/// Task 7 (b): Scatter P C-fragment values to col-major `[kv, bq]` f16 SMEM band.
+///
+/// The per-lane PTX m16n8 D-fragment layout (same element→(q,kv) mapping as F1 in dq.rs):
+///   p_0 -> (q_lo = band_row_base + lane/4,     kv_lo = n_tile*8 + (lane%4)*2    )
+///   p_1 -> (q_lo,                              kv_hi = kv_lo + 1)
+///   p_2 -> (q_hi = q_lo + 8,                  kv_lo)
+///   p_3 -> (q_hi,                              kv_hi)
+///
+/// Destination is COL-MAJOR in the (q, kv) sense (kv is the major/row index):
+///   addr = p_col_off + kv_col*(bq*2) + q_row*2
+///
+/// The "bq*2" stride on kv_col is the transpose (F1 uses "bkv*2" on q_row).
+/// All `%bs_*` scratch registers are declared in `emit_register_decls`.
+/// No bar.sync — Task 8's barrier orders this into the MMA reads.
+fn emit_pcol_scatter(ptx: &mut String, config: &FlashAttentionConfig) {
+    let p_col_off = tier_b2_dkdv_p_colmajor_offset(config);
+    let bq        = tier_b2_effective_bq(config);
+    let bq_stride = bq * 2; // transposed row stride: each kv row holds bq q-values, f16
+
+    ptx.push_str("    // === P col-major scatter (Task 7b): P C-frag -> [kv, bq] f16 SMEM band ===\n");
+    ptx.push_str("    // Per-lane element -> (q_row, kv_col) same as F1; address uses col-major:\n");
+    ptx.push_str("    //   addr = p_col_off + kv_col*(bq*2) + q_row*2   (kv gets big stride, q gets *2)\n");
+
+    // Derive SMEM base.
+    ptx.push_str("    cvta.shared.u64 %bs_smem_base64, shmem;\n");
+    ptx.push_str("    cvt.u32.u64 %bs_smem_base32, %bs_smem_base64;\n");
+
+    // Derive per-lane row/col indices (same arithmetic as F1 in dq.rs emit_ds_scatter_to_smem).
+    ptx.push_str("    and.b32 %bs_lane_mod4, %lane_id, 3;    // lane % 4\n");
+    ptx.push_str("    shr.u32 %bs_lane_div4, %lane_id, 2;    // lane / 4\n");
+
+    // q_lo = band_row_base + lane/4 ;  q_hi = q_lo + 8
+    ptx.push_str("    add.u32 %bs_q_lo, %band_row_base, %bs_lane_div4;\n");
+    ptx.push_str("    add.u32 %bs_q_hi, %bs_q_lo, 8;\n");
+
+    // kv_lo = n_tile*8 + (lane%4)*2 ;  kv_hi = kv_lo + 1
+    ptx.push_str("    shl.b32 %bs_kv_lo, %bs_lane_mod4, 1;          // (lane%4)*2\n");
+    ptx.push_str("    mul.lo.u32 %bs_kv_hi, %n_tile, 8;\n");         // reuse %bs_kv_hi as scratch for n_tile*8
+    ptx.push_str("    add.u32 %bs_kv_lo, %bs_kv_lo, %bs_kv_hi;      // kv_lo = n_tile*8 + (lane%4)*2\n");
+    ptx.push_str("    add.u32 %bs_kv_hi, %bs_kv_lo, 1;              // kv_hi = kv_lo + 1\n");
+
+    // Precompute the four address components to avoid clobbering indices.
+    // kvlo_off = kv_lo * bq_stride ;  kvhi_off = kv_hi * bq_stride
+    ptx.push_str(&format!("    mul.lo.u32 %bs_kvlo_off, %bs_kv_lo, {bq_stride};  // kv_lo*(bq*2)\n"));
+    ptx.push_str(&format!("    mul.lo.u32 %bs_kvhi_off, %bs_kv_hi, {bq_stride};  // kv_hi*(bq*2)\n"));
+    // q_lo_b = q_lo * 2 ;  q_hi_b = q_hi * 2
+    ptx.push_str("    shl.b32 %bs_q_lo_b, %bs_q_lo, 1;              // q_lo*2 bytes (f16)\n");
+    ptx.push_str("    shl.b32 %bs_q_hi_b, %bs_q_hi, 1;              // q_hi*2 bytes (f16)\n");
+
+    // Compose 4 addresses: smem_base32 + p_col_off + kvXX_off + qXX_b
+    // addr0: elem0 (q_lo, kv_lo)
+    ptx.push_str(&format!("    add.u32 %bs_addr0, %bs_smem_base32, {p_col_off};\n"));
+    ptx.push_str("    add.u32 %bs_addr0, %bs_addr0, %bs_kvlo_off;\n");
+    ptx.push_str("    add.u32 %bs_addr0, %bs_addr0, %bs_q_lo_b;\n");
+    // addr1: elem1 (q_lo, kv_hi)
+    ptx.push_str(&format!("    add.u32 %bs_addr1, %bs_smem_base32, {p_col_off};\n"));
+    ptx.push_str("    add.u32 %bs_addr1, %bs_addr1, %bs_kvhi_off;\n");
+    ptx.push_str("    add.u32 %bs_addr1, %bs_addr1, %bs_q_lo_b;\n");
+    // addr2: elem2 (q_hi, kv_lo)
+    ptx.push_str(&format!("    add.u32 %bs_addr2, %bs_smem_base32, {p_col_off};\n"));
+    ptx.push_str("    add.u32 %bs_addr2, %bs_addr2, %bs_kvlo_off;\n");
+    ptx.push_str("    add.u32 %bs_addr2, %bs_addr2, %bs_q_hi_b;\n");
+    // addr3: elem3 (q_hi, kv_hi)
+    ptx.push_str(&format!("    add.u32 %bs_addr3, %bs_smem_base32, {p_col_off};\n"));
+    ptx.push_str("    add.u32 %bs_addr3, %bs_addr3, %bs_kvhi_off;\n");
+    ptx.push_str("    add.u32 %bs_addr3, %bs_addr3, %bs_q_hi_b;\n");
+
+    // Convert f32 P values to f16 and scatter to col-major SMEM.
+    ptx.push_str("    cvt.rn.f16.f32 %bs_h0, %p_0;\n");
+    ptx.push_str("    st.shared.b16 [%bs_addr0], %bs_h0;\n");
+    ptx.push_str("    cvt.rn.f16.f32 %bs_h1, %p_1;\n");
+    ptx.push_str("    st.shared.b16 [%bs_addr1], %bs_h1;\n");
+    ptx.push_str("    cvt.rn.f16.f32 %bs_h2, %p_2;\n");
+    ptx.push_str("    st.shared.b16 [%bs_addr2], %bs_h2;\n");
+    ptx.push_str("    cvt.rn.f16.f32 %bs_h3, %p_3;\n");
+    ptx.push_str("    st.shared.b16 [%bs_addr3], %bs_h3;\n");
+    // NOTE: no bar.sync here -- Task 8's barrier before the dV/dK MMAs orders these scatters.
+}
+
+/// Task 7 (b): Scatter dS C-fragment values to col-major `[kv, bq]` f16 SMEM band.
+///
+/// Structurally identical to `emit_pcol_scatter`; targets the dS col-major band
+/// (`tier_b2_dkdv_ds_colmajor_offset`) and reads `%ds_0..%ds_3` instead of `%p_0..%p_3`.
+///
+/// The same per-lane (q_row, kv_col) derivation applies; only the SMEM offset differs.
+/// `%bs_*` scratch registers are reused from `emit_pcol_scatter` (sequential runs).
+fn emit_dscol_scatter(ptx: &mut String, config: &FlashAttentionConfig) {
+    let ds_col_off = tier_b2_dkdv_ds_colmajor_offset(config);
+    let bq         = tier_b2_effective_bq(config);
+    let bq_stride  = bq * 2; // transposed row stride: each kv row holds bq q-values, f16
+
+    ptx.push_str("    // === dS col-major scatter (Task 7b): dS C-frag -> [kv, bq] f16 SMEM band ===\n");
+    ptx.push_str("    // Per-lane element -> (q_row, kv_col) same as F1; address uses col-major:\n");
+    ptx.push_str("    //   addr = ds_col_off + kv_col*(bq*2) + q_row*2   (kv gets big stride, q gets *2)\n");
+
+    // Derive SMEM base (recompute; %bs_smem_base32 may have been clobbered by addr compositions).
+    ptx.push_str("    cvta.shared.u64 %bs_smem_base64, shmem;\n");
+    ptx.push_str("    cvt.u32.u64 %bs_smem_base32, %bs_smem_base64;\n");
+
+    // Derive per-lane row/col indices (same arithmetic each time; recomputing is clearer).
+    ptx.push_str("    and.b32 %bs_lane_mod4, %lane_id, 3;    // lane % 4\n");
+    ptx.push_str("    shr.u32 %bs_lane_div4, %lane_id, 2;    // lane / 4\n");
+
+    // q_lo = band_row_base + lane/4 ;  q_hi = q_lo + 8
+    ptx.push_str("    add.u32 %bs_q_lo, %band_row_base, %bs_lane_div4;\n");
+    ptx.push_str("    add.u32 %bs_q_hi, %bs_q_lo, 8;\n");
+
+    // kv_lo = n_tile*8 + (lane%4)*2 ;  kv_hi = kv_lo + 1
+    ptx.push_str("    shl.b32 %bs_kv_lo, %bs_lane_mod4, 1;          // (lane%4)*2\n");
+    ptx.push_str("    mul.lo.u32 %bs_kv_hi, %n_tile, 8;\n");         // reuse %bs_kv_hi as scratch for n_tile*8
+    ptx.push_str("    add.u32 %bs_kv_lo, %bs_kv_lo, %bs_kv_hi;      // kv_lo = n_tile*8 + (lane%4)*2\n");
+    ptx.push_str("    add.u32 %bs_kv_hi, %bs_kv_lo, 1;              // kv_hi = kv_lo + 1\n");
+
+    // Precompute address components.
+    ptx.push_str(&format!("    mul.lo.u32 %bs_kvlo_off, %bs_kv_lo, {bq_stride};  // kv_lo*(bq*2)\n"));
+    ptx.push_str(&format!("    mul.lo.u32 %bs_kvhi_off, %bs_kv_hi, {bq_stride};  // kv_hi*(bq*2)\n"));
+    ptx.push_str("    shl.b32 %bs_q_lo_b, %bs_q_lo, 1;              // q_lo*2 bytes (f16)\n");
+    ptx.push_str("    shl.b32 %bs_q_hi_b, %bs_q_hi, 1;              // q_hi*2 bytes (f16)\n");
+
+    // Compose 4 addresses: smem_base32 + ds_col_off + kvXX_off + qXX_b
+    // addr0: elem0 (q_lo, kv_lo)
+    ptx.push_str(&format!("    add.u32 %bs_addr0, %bs_smem_base32, {ds_col_off};\n"));
+    ptx.push_str("    add.u32 %bs_addr0, %bs_addr0, %bs_kvlo_off;\n");
+    ptx.push_str("    add.u32 %bs_addr0, %bs_addr0, %bs_q_lo_b;\n");
+    // addr1: elem1 (q_lo, kv_hi)
+    ptx.push_str(&format!("    add.u32 %bs_addr1, %bs_smem_base32, {ds_col_off};\n"));
+    ptx.push_str("    add.u32 %bs_addr1, %bs_addr1, %bs_kvhi_off;\n");
+    ptx.push_str("    add.u32 %bs_addr1, %bs_addr1, %bs_q_lo_b;\n");
+    // addr2: elem2 (q_hi, kv_lo)
+    ptx.push_str(&format!("    add.u32 %bs_addr2, %bs_smem_base32, {ds_col_off};\n"));
+    ptx.push_str("    add.u32 %bs_addr2, %bs_addr2, %bs_kvlo_off;\n");
+    ptx.push_str("    add.u32 %bs_addr2, %bs_addr2, %bs_q_hi_b;\n");
+    // addr3: elem3 (q_hi, kv_hi)
+    ptx.push_str(&format!("    add.u32 %bs_addr3, %bs_smem_base32, {ds_col_off};\n"));
+    ptx.push_str("    add.u32 %bs_addr3, %bs_addr3, %bs_kvhi_off;\n");
+    ptx.push_str("    add.u32 %bs_addr3, %bs_addr3, %bs_q_hi_b;\n");
+
+    // Convert f32 dS values to f16 and scatter to col-major SMEM.
+    ptx.push_str("    cvt.rn.f16.f32 %bs_h0, %ds_0;\n");
+    ptx.push_str("    st.shared.b16 [%bs_addr0], %bs_h0;\n");
+    ptx.push_str("    cvt.rn.f16.f32 %bs_h1, %ds_1;\n");
+    ptx.push_str("    st.shared.b16 [%bs_addr1], %bs_h1;\n");
+    ptx.push_str("    cvt.rn.f16.f32 %bs_h2, %ds_2;\n");
+    ptx.push_str("    st.shared.b16 [%bs_addr2], %bs_h2;\n");
+    ptx.push_str("    cvt.rn.f16.f32 %bs_h3, %ds_3;\n");
+    ptx.push_str("    st.shared.b16 [%bs_addr3], %bs_h3;\n");
+    // NOTE: no bar.sync here -- Task 8's barrier before the dK MMA orders these scatters.
 }
 
 /// Re-stage row-major Q[bq, hd] -> col-major Q[hd, bq] in SMEM (Task 6, mapping (a)).
