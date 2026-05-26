@@ -4,6 +4,7 @@ use std::collections::HashMap;
 
 use nsl_ast::decl::{Decorator, ModelDef, ModelMember};
 use nsl_ast::expr::{Arg, Expr, ExprKind};
+use nsl_ast::pattern::PatternKind;
 use nsl_ast::stmt::StmtKind;
 use nsl_ast::types::TypeExprKind;
 use nsl_ast::{Module, Symbol};
@@ -105,12 +106,29 @@ fn collect_models<'a>(
     out
 }
 
+/// Extract `(name, &init.kind)` from a top-level const/let `VarDecl` whose
+/// binding is a single identifier. Returns `None` for destructuring binds or
+/// declarations with no value.
+fn var_decl_name_and_init<'a>(kind: &'a StmtKind, resolve: Resolve) -> Option<(String, &'a ExprKind)> {
+    if let StmtKind::VarDecl { pattern, value, .. } = kind {
+        if let PatternKind::Ident(sym) = &pattern.kind {
+            if let Some(init_expr) = value {
+                return Some((resolve(*sym), &init_expr.kind));
+            }
+        }
+    }
+    None
+}
+
 /// Collect top-level `const NAME = <int>` declarations.
-fn collect_int_consts(_module: &Module, _resolve: Resolve) -> HashMap<String, i64> {
-    // TODO(Task 3): parse const NAME = <int>
-    // Task 2 happy path uses integer literals; const parsing lands in Task 3.
-    // Stub returns empty; do NOT block the happy path on it.
-    HashMap::new()
+fn collect_int_consts(module: &Module, resolve: Resolve) -> HashMap<String, i64> {
+    let mut consts = HashMap::new();
+    for stmt in &module.stmts {
+        if let Some((name, ExprKind::IntLiteral(n))) = var_decl_name_and_init(&stmt.kind, resolve) {
+            consts.insert(name, *n);
+        }
+    }
+    consts
 }
 
 /// Read the simple named-type name from a TypeExpr.
@@ -259,14 +277,13 @@ pub fn extract_model_spec(module: &Module, resolve: Resolve) -> Result<ModelSpec
         ))
     })?;
     let mut params = HashMap::new();
-    let empty_consts: HashMap<String, i64> = HashMap::new();
     for (i, param) in block_md.params.iter().enumerate() {
         if let Some(arg) = block_args.get(i) {
             if let Ok(v) = resolve_binding(
                 &arg.value,
                 &BindingCtx {
                     params: HashMap::new(),
-                    consts: empty_consts.clone(),
+                    consts: consts.clone(),
                 },
                 resolve,
                 "block-param",
@@ -463,5 +480,94 @@ model TinyCoder:
         assert_eq!(spec.vocab, 4096);
         assert_eq!(spec.activation, Activation::SwiGlu);
         assert_eq!(spec.norm, NormType::RmsNorm);
+    }
+
+    const HAND_ROLLED: &str = r#"
+model ToyAttention:
+    wq: Tensor = ones([32, 32])
+    fn forward(self, x: Tensor) -> Tensor:
+        return softmax(x @ self.wq)
+model ToyNet:
+    blocks: [ToyAttention; 4] = ToyAttention()
+    embed: Tensor = randn([100, 32])
+"#;
+
+    const FUSED_QKV: &str = r#"
+model GPT2Block(d_model: int, n_heads: int, d_ff: int):
+    c_attn: Linear = Linear(d_model, 3 * d_model)
+    ln1: LayerNorm = LayerNorm(d_model)
+model GPT2:
+    blocks: [GPT2Block; 4] = GPT2Block(768, 12, 3072)
+    embed: Tensor = randn([50257, 768])
+"#;
+
+    const CONST_BOUND: &str = r#"
+const D_MODEL = 256
+const N_HEADS = 8
+const N_KV_HEADS = 4
+const D_FF = 512
+model GroupedQueryAttention(d_model: int, n_heads: int, n_kv_heads: int, dropout_p: float):
+    wq: Tensor = randn([d_model, d_model])
+model SwiGLUFFN(d_model: int, d_ff: int, dropout_p: float):
+    w_gate: Tensor = randn([d_model, d_ff])
+model TransformerBlock(d_model: int, n_heads: int, n_kv_heads: int, d_ff: int, dropout_p: float):
+    attn: GroupedQueryAttention = GroupedQueryAttention(d_model, n_heads, n_kv_heads, dropout_p)
+    ffn: SwiGLUFFN = SwiGLUFFN(d_model, d_ff, dropout_p)
+    norm: RMSNorm = RMSNorm(d_model)
+model ConstNet:
+    embed: Tensor = randn([1000, 256])
+    blocks: [TransformerBlock; 2] = TransformerBlock(D_MODEL, N_HEADS, N_KV_HEADS, D_FF, 0.1)
+"#;
+
+    const UNRESOLVABLE: &str = r#"
+model GroupedQueryAttention(d_model: int, n_heads: int, n_kv_heads: int, dropout_p: float):
+    wq: Tensor = randn([d_model, d_model])
+model SwiGLUFFN(d_model: int, d_ff: int, dropout_p: float):
+    w_gate: Tensor = randn([d_model, d_ff])
+model TransformerBlock(d_model: int, n_heads: int, n_kv_heads: int, d_ff: int, dropout_p: float):
+    attn: GroupedQueryAttention = GroupedQueryAttention(d_model, mystery, n_kv_heads, dropout_p)
+    ffn: SwiGLUFFN = SwiGLUFFN(d_model, d_ff, dropout_p)
+    norm: RMSNorm = RMSNorm(d_model)
+model BadNet:
+    embed: Tensor = randn([1000, 256])
+    blocks: [TransformerBlock; 2] = TransformerBlock(256, 8, 4, 512, 0.1)
+"#;
+
+    #[test]
+    fn refuses_hand_rolled_attention() {
+        let (module, interner) = parse(HAND_ROLLED);
+        let resolve = |s: nsl_ast::Symbol| interner.resolve(s.0).unwrap_or("").to_string();
+        let err = extract_model_spec(&module, &resolve).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("GroupedQueryAttention") || msg.contains("FFN"), "got: {msg}");
+    }
+
+    #[test]
+    fn refuses_fused_qkv() {
+        let (module, interner) = parse(FUSED_QKV);
+        let resolve = |s: nsl_ast::Symbol| interner.resolve(s.0).unwrap_or("").to_string();
+        let err = extract_model_spec(&module, &resolve).unwrap_err();
+        assert!(matches!(err, CepExtractError::UnrecognizedAttention { .. } | CepExtractError::MissingStructure(_)));
+        assert!(err.to_string().contains("GroupedQueryAttention"));
+    }
+
+    #[test]
+    fn resolves_const_bound_dims() {
+        let (module, interner) = parse(CONST_BOUND);
+        let resolve = |s: nsl_ast::Symbol| interner.resolve(s.0).unwrap_or("").to_string();
+        let spec = extract_model_spec(&module, &resolve).expect("recognized");
+        assert_eq!(spec.d_model, 256);
+        assert_eq!(spec.n_heads, vec![8; 2]);
+        assert_eq!(spec.n_kv_heads, vec![4; 2]);
+        assert_eq!(spec.d_ff, vec![512; 2]);
+        assert_eq!(spec.n_layers, 2);
+    }
+
+    #[test]
+    fn refuses_unresolvable_binding() {
+        let (module, interner) = parse(UNRESOLVABLE);
+        let resolve = |s: nsl_ast::Symbol| interner.resolve(s.0).unwrap_or("").to_string();
+        let err = extract_model_spec(&module, &resolve).unwrap_err();
+        assert!(matches!(err, CepExtractError::UnresolvableBinding { .. }), "got: {err}");
     }
 }
