@@ -109,6 +109,7 @@ pub mod multimodal;
 pub mod ffi_ownership;
 pub mod ownership;
 pub mod ownership_expr;
+pub mod pca_activation;
 pub mod pca_detect;
 pub mod pca_rope;
 pub mod pca_segment;
