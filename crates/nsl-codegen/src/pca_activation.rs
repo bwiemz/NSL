@@ -3,6 +3,14 @@
 //! Used by BOTH the training-report path and the kernel-synthesis path so
 //! the synthesis `segment_masked` flag and the runtime registry setter can
 //! never compute divergent packing decisions (spec §2.4).
+//!
+//! Institutional note (2026-05-17 §5 correction): the FA-2 entry points were
+//! claimed to null-check segment_ids_ptr/doc_starts_ptr; they did NOT — the
+//! masked kernel dereferenced null. The guards were added in this Tier A
+//! activation (forward/backward seg_ids preludes + emit_doc_starts_smem_load)
+//! and are verified by the identity-equals-unmasked GPU tests
+//! (masked_null_seg_ptr_equals_unmasked_{forward,backward}: masked+null ==
+//! unmasked, max_abs 0.0).
 
 use std::collections::HashMap;
 
