@@ -175,30 +175,76 @@ fn arg_missing(what: &'static str) -> impl Fn() -> CepExtractError {
     move || CepExtractError::MissingStructure(format!("missing constructor argument: {what}"))
 }
 
+/// Find the top-level model in source order: the first model that has a
+/// `FixedArray`-typed `LayerDecl` field with a concrete initializer.
+/// Within a model, a field named `"blocks"` is preferred; otherwise the
+/// first such field is taken.  Returns `(model_def, element_type_name,
+/// array_size, init_expr)`.
+fn find_top_model<'a>(
+    module: &'a Module,
+    resolve: Resolve,
+) -> Option<(&'a ModelDef, String, i64, &'a Expr)> {
+    for stmt in &module.stmts {
+        let md: &ModelDef = match &stmt.kind {
+            StmtKind::ModelDef(md) => md,
+            StmtKind::Decorated { stmt, .. } => match &stmt.kind {
+                StmtKind::ModelDef(md) => md,
+                _ => continue,
+            },
+            _ => continue,
+        };
+
+        // Scan fields: collect FixedArray candidates, preferring "blocks".
+        let mut preferred: Option<(String, i64, &Expr)> = None; // field named "blocks"
+        let mut fallback: Option<(String, i64, &Expr)> = None; // first FixedArray field
+
+        for member in &md.members {
+            let ModelMember::LayerDecl { name, type_ann, init, .. } = member else {
+                continue;
+            };
+            let TypeExprKind::FixedArray { element_type, size } = &type_ann.kind else {
+                continue;
+            };
+            let (Some(elem_name), Some(init_expr)) =
+                (named_type(element_type, resolve), init.as_ref())
+            else {
+                continue;
+            };
+            if resolve(*name) == "blocks" {
+                // Preferred field — take it immediately and stop scanning this model.
+                preferred = Some((elem_name, *size, init_expr));
+                break;
+            } else if fallback.is_none() {
+                fallback = Some((elem_name, *size, init_expr));
+            }
+        }
+
+        if let Some((elem, size, init_expr)) = preferred.or(fallback) {
+            return Some((md, elem, size, init_expr));
+        }
+    }
+    None
+}
+
 pub fn extract_model_spec(module: &Module, resolve: Resolve) -> Result<ModelSpec, CepExtractError> {
     let models = collect_models(module, resolve);
     let consts = collect_int_consts(module, resolve);
 
-    // 1. Find the top-level model: the one with a `blocks: [Block; N]` field.
-    let mut top = None;
-    for (md, _decos) in models.values() {
-        for member in &md.members {
-            if let ModelMember::LayerDecl { type_ann, init, .. } = member {
-                if let TypeExprKind::FixedArray { element_type, size } = &type_ann.kind {
-                    if let (Some(block_name), Some(init_expr)) =
-                        (named_type(element_type, resolve), init.as_ref())
-                    {
-                        top = Some((*md, block_name, *size, init_expr));
-                    }
-                }
-            }
-        }
+    // 1. Find the top-level model: the first (in source order) model with a
+    //    `blocks: [Block; N]`-style field, preferring a field named "blocks".
+    let (top_md, block_type, n_layers_i, block_init) =
+        find_top_model(module, resolve).ok_or_else(|| {
+            CepExtractError::MissingStructure(
+                "no top-level model with a `blocks: [Block; N]` field".to_string(),
+            )
+        })?;
+
+    // Fix 2: guard non-positive n_layers before casting to u32.
+    if n_layers_i <= 0 {
+        return Err(CepExtractError::InvalidSpec(
+            "n_layers must be positive".to_string(),
+        ));
     }
-    let (top_md, block_type, n_layers_i, block_init) = top.ok_or_else(|| {
-        CepExtractError::MissingStructure(
-            "no top-level model with a `blocks: [Block; N]` field".to_string(),
-        )
-    })?;
     let n_layers = n_layers_i as u32;
 
     // 2. Resolve the block constructor's positional args into a BindingCtx.
