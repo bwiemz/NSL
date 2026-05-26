@@ -87,6 +87,19 @@ pub fn doc_starts_disabled_sentinel(builder: &mut FunctionBuilder<'_>) -> Value 
 /// `flash_attention_v2/phases/forward/prelude.rs` (gated on
 /// `segment_masked && rope_q`).
 pub fn emit_doc_starts_smem_load(ptx: &mut String) {
+    // KNOWN LIMITATION (PCA Tier A activation review, 2026-05-26 — track with
+    // the deferred Test 4 / T11 doc_starts GPU validation): this 1028-byte
+    // `smem_doc_starts` region is NOT counted in `fwd_needs_dynamic_smem` /
+    // `backward_needs_dynamic_smem` (which only budget `seg_smem` via
+    // DEFAULT_SMEM_SEGMENT_BUDGET). For large `segment_masked && rope_q`
+    // configs on sm_120 this can (a) under-count static SMEM and (b) leave a
+    // static `.shared smem_doc_starts` alongside an `extern .shared shmem[]`
+    // (the mixed-layout Blackwell illegal-address pattern that seg_smem was
+    // moved into the shmem[] tail to avoid). Pre-dates this activation (the
+    // alloc came with RoPE-reset); reachable only now that segment_masked can
+    // be true. No current fixture is rope_q=true, so it is unexercised; the
+    // fix (budget the 1028 bytes and/or embed it in the shmem[] tail) belongs
+    // with the rope_q=true launch harness the deferred Test 4 introduces.
     ptx.push_str("    // PCA §4.3 — CTA prologue: load this row's doc_starts to SMEM\n");
     ptx.push_str("    .shared .align 4 .b8 smem_doc_starts[1028];\n");
     ptx.push_str("    ld.param.u64 %rd_doc_starts_ptr, [doc_starts_ptr];\n");
