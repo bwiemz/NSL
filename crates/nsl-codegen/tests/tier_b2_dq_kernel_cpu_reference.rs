@@ -363,11 +363,16 @@ fn tier_b2_dq_sweep_b1_forward() {
     // (tiles_per_warp_qkt vs tiles_per_warp_pv divergence) is FIXED -- the stats
     // are now re-keyed by absolute query row via a dedicated SMEM region
     // (commit e854bad8), GPU-validated at hd=32/64/128 in
-    // tier_b1_save_activations_gpu. seq=32 (B.1 single-block: launcher forces
-    // block_kv=32). bq follows the dQ-kernel Path-A schedule.
+    // tier_b1_save_activations_gpu.
+    //
+    // bq = bkv = 32 for ALL hd here: the B.1 single-block forward processes seq=32
+    // as ONE block of block_kv=32, so the dQ kernel must use a matching bkv (a full
+    // tile, bkv == seq). The dQ kernel has NO seq-boundary masking yet, so bkv > seq
+    // (e.g. the old bq=64 with seq=32) sums OOB kv positions into dQ and yields
+    // garbage -- the partial-tile / arbitrary-seq case is a documented Phase-4
+    // follow-on (see dq.rs module doc). A realistic planner never picks bkv > seq.
     for &hd in &[32i64, 64, 128] {
-        let bq = if hd == 128 { 32 } else { 64 };
-        validate_dq_for_source(&cfg(bq, hd), FSource::B1Forward, 32);
+        validate_dq_for_source(&cfg(32, hd), FSource::B1Forward, 32);
     }
 }
 

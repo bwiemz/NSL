@@ -1,8 +1,16 @@
-//! dQ-kernel emitter for Tier B.2 backward (scaffold; inner-loop body in Tasks 9-12).
+//! dQ-kernel emitter for Tier B.2 backward.
 //!
 //! Q-outer, kv-inner. dQ accumulator register-resident across kv_iter.
 //! Producer warp (warp 0) issues cp.async for Q, dO, K, V; consumer warps
 //! (1-3) execute MMA chain. No atomicAdd.
+//!
+//! PRECONDITION (full tiles only): seq_len must be a multiple of block_kv AND
+//! >= block_kv. The kernel has NO seq-boundary masking — it sums the full bkv kv
+//! positions per tile, so bkv > seq (or a partial last tile) reads/accumulates
+//! out-of-bounds kv and yields garbage dQ. GPU-validated for full tiles at
+//! hd=32/64/128 (CpuNaive seq=64/128) and the B.1 single-block (seq=bkv=32).
+//! Partial-tile / arbitrary-seq masking is a Phase-4 (production training) follow-on;
+//! a realistic planner picks bkv <= seq, so this is not a canonical-config gap.
 //!
 //! Per spec §5.2 amendment: SMEM is sized via tier_b2_dq_total_smem_bytes
 //! (includes col-major K re-stage band). emit_dq_acc_init uses
