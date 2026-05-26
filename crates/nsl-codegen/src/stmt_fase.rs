@@ -66,10 +66,38 @@ impl Compiler<'_> {
         v_ptr: Value,
         recipe: &crate::fase::UpdateRecipe,
         bc_params: Option<(Value, Value)>,  // (bc1_inv, bc2_inv) — None for non-AdamW
+        wrap_precision: bool,  // CPDT precision-adaptive: wrap m/v in F32 cast/uncast
     ) -> Result<(), crate::error::CodegenError> {
         use crate::fase_optimizer::{emit_final_step, Register, UpdateOp};
 
         let program = emit_final_step(recipe);
+
+        // CPDT precision wrapping: dequant m/v (FP16->F32) to working tensors,
+        // run the unchanged FP32 update on those, then quant-store back into the
+        // original (possibly FP16) buffers. F32 storage casts are identity copies,
+        // so FP32-tier params are value-bit-identical. theta/m_partial unwrapped.
+        //
+        // Defensive guard: only wrap when m_ptr and v_ptr are DISTINCT buffers.
+        // The SGD path passes v == m as a placeholder (no v state); wrapping it
+        // would double-cast the same pointer. The activation gate already
+        // restricts wrap_precision=true to AdamW (2 distinct state buffers), so
+        // this guard is belt-and-suspenders, never expected to fire for SGD.
+        let wrap_precision = wrap_precision && m_ptr != v_ptr;
+        let orig_m_ptr = m_ptr;
+        let orig_v_ptr = v_ptr;
+        // Note: emit the f32_code iconst and the cast calls ONLY inside the
+        // wrap branch so the wrap_precision==false path emits zero new IR
+        // (byte-for-byte identical to before this change).
+        let (work_m, work_v) = if wrap_precision {
+            let f32_code = builder.ins().iconst(cl_types::I64, 1); // DTYPE_F32
+            let wm = self.compile_call_by_name(builder, "nsl_tensor_cast", &[m_ptr, f32_code])?;
+            let wv = self.compile_call_by_name(builder, "nsl_tensor_cast", &[v_ptr, f32_code])?;
+            (wm, wv)
+        } else {
+            (m_ptr, v_ptr)
+        };
+        let m_ptr = work_m;
+        let v_ptr = work_v;
 
         // Lazily-allocated scratch tensor for the `Tmp` register.  Allocated
         // on first write, freed at end.
@@ -468,6 +496,18 @@ impl Compiler<'_> {
             self.compile_call_by_name(builder, "nsl_tensor_free", &[p])?;
         }
 
+        // CPDT precision wrapping (quant-store): copy the updated working
+        // tensors back into the original (possibly FP16) m/v buffers, then free
+        // the F32 working tensors. nsl_tensor_cast_into returns void — match the
+        // existing void-call form (return value ignored). When wrap_precision is
+        // false, m_ptr/v_ptr == orig_m_ptr/orig_v_ptr and nothing is emitted.
+        if wrap_precision {
+            self.compile_call_by_name(builder, "nsl_tensor_cast_into", &[orig_m_ptr, m_ptr])?;
+            self.compile_call_by_name(builder, "nsl_tensor_cast_into", &[orig_v_ptr, v_ptr])?;
+            self.compile_call_by_name(builder, "nsl_tensor_free", &[m_ptr])?;
+            self.compile_call_by_name(builder, "nsl_tensor_free", &[v_ptr])?;
+        }
+
         Ok(())
     }
 
@@ -821,6 +861,9 @@ impl Compiler<'_> {
                     &[m_partial, cf],
                 )?;
             }
+            // CPDT precision wrapping is driven by the train-block dispatcher
+            // (which owns `cpdt_precision_dtypes`); this unified-dispatch helper
+            // is dead_code and not yet wired to it, so wrap_precision=false.
             self.fase_emit_final_step(
                 builder,
                 theta,
@@ -829,6 +872,7 @@ impl Compiler<'_> {
                 s2,
                 &fase_plan.recipe,
                 Some((bc1_inv, bc2_inv)),
+                false,
             )?;
         }
         builder.ins().jump(iter_join, &[]);

@@ -5752,6 +5752,7 @@ impl Compiler<'_> {
                     } else {
                         pb_m
                     };
+                    let wrap_precision = cpdt_precision_dtypes.is_some();
                     self.fase_emit_final_step(
                         builder,
                         pb_theta,
@@ -5760,6 +5761,7 @@ impl Compiler<'_> {
                         pb_v,
                         &fase_plan.recipe,
                         Some((bc1_inv, bc2_inv)),
+                        wrap_precision,
                     )?;
                     let pb_i_next = builder.ins().iadd_imm(pb_i, 1);
                     builder.def_var(pb_i_var, pb_i_next);
@@ -5799,6 +5801,7 @@ impl Compiler<'_> {
                         // SGD has no v state — pass m as a placeholder (not used by SgdUpdate recipe)
                         m
                     };
+                    let wrap_precision = cpdt_precision_dtypes.is_some();
                     self.fase_emit_final_step(
                         builder,
                         theta,
@@ -5807,6 +5810,7 @@ impl Compiler<'_> {
                         v,
                         &fase_plan.recipe,
                         Some((bc1_inv, bc2_inv)),
+                        wrap_precision,
                     )?;
                     // fase_emit_final_step zeroed m_partial already — no Site E needed.
                     let fs_one = builder.ins().iconst(cl_types::I64, 1);
