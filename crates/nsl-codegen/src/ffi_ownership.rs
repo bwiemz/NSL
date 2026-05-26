@@ -56,6 +56,7 @@ fn build_table() -> HashMap<&'static str, FfiOwnershipKind> {
     m.insert("nsl_tensor_to_device", OwnedNewResult);
     m.insert("nsl_tensor_cast", OwnedNewResult);
     m.insert("nsl_tensor_zeros_like", OwnedNewResult);
+    m.insert("nsl_tensor_zeros_like_dtype", OwnedNewResult);
     m.insert("nsl_tensor_ones_like", OwnedNewResult);
     // Shape ops that produce new storage
     m.insert("nsl_tensor_reshape", OwnedNewResult);

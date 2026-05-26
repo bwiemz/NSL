@@ -484,6 +484,10 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_tensor_add_inplace", &[types::I64, types::I64], None),
     ("nsl_tensor_zero_inplace", &[types::I64], None),
     ("nsl_tensor_zeros_like", &[types::I64], Some(types::I64)),
+    // CPDT precision-adaptive optimizer: cast / zeros helpers
+    ("nsl_tensor_cast", &[types::I64, types::I64], Some(types::I64)),
+    ("nsl_tensor_cast_into", &[types::I64, types::I64], None),
+    ("nsl_tensor_zeros_like_dtype", &[types::I64, types::I64], Some(types::I64)),
     // Gradient clipping (M14)
     ("nsl_clip_grad_norm", &[types::I64, types::F64], None),
     // Collect all tensor params from a model struct (recursive, magic-probed)
@@ -2121,4 +2125,20 @@ pub fn declare_runtime_functions(
     }
 
     Ok(fns)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RUNTIME_FUNCTIONS;
+
+    #[test]
+    fn precision_cast_ops_have_signatures() {
+        let names: Vec<&str> = RUNTIME_FUNCTIONS.iter().map(|(n, _, _)| *n).collect();
+        assert!(names.contains(&"nsl_tensor_cast"), "nsl_tensor_cast missing");
+        assert!(names.contains(&"nsl_tensor_cast_into"), "nsl_tensor_cast_into missing");
+        assert!(
+            names.contains(&"nsl_tensor_zeros_like_dtype"),
+            "nsl_tensor_zeros_like_dtype missing"
+        );
+    }
 }
