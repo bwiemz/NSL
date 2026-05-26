@@ -276,6 +276,10 @@ fn launch_pca(
             0i64, 0i64,
             // PCA Tier A: segment_ids ptr (trailing)
             seg_ids_dev,
+            // Tier B extension — null (not used for Tier A tests)
+            0i64, 0i64,
+            // doc_starts ptr — null (rope_q=false, no doc-aware positions)
+            0i64,
     );
 
     if rc != 0 {
@@ -410,6 +414,12 @@ fn tier_a_forward_single_segment_matches_unmasked_baseline() {
 //   concat → out_ref[0..128]
 //
 // Packed kernel output must match out_ref within 5e-3.
+//
+// This test satisfies spec §5 property 1 (cross-document attention
+// prohibition): the CPU reference (naive_attention_segmented) enforces
+// the segment boundary by design, and the packed kernel output must match
+// it — any cross-segment leakage would produce a numerical divergence
+// that exceeds the 5e-3 tolerance.
 // ===========================================================================
 
 #[test]
@@ -657,6 +667,98 @@ fn extract_segment(
         }
     }
     (q_s, k_s, v_s)
+}
+
+// ===========================================================================
+// A-4 Test 1: null seg_ids_ptr guard — masked+null must equal unmasked forward
+//
+// Validates spec §3 null-guard: when seg_ids_ptr==0 the kernel writes
+// an all-zero seg_smem sentinel (no segment masking applied), so the
+// output must be numerically identical to the segment_masked=false kernel.
+//
+// The launch_pca helper passes 0 (NULL) for seg_ids_ptr when
+// seg_ids_host is empty AND segment_masked is true (see harness, line
+// 235-243). This exercises the `@%p_seg_null bra NULL_LD` skip guard
+// added in A-3.
+//
+// Tolerance: 1e-5 — same kernel math, only the masking path is bypassed;
+// f16 rounding is identical so outputs should be bit-exact or within
+// a single ULP.
+//
+// CRITICAL (dQ-vacuous-gate lesson): if cuda_available() is true and the
+// masked-null launch returns None, we PANIC (guard failure), not skip.
+// ===========================================================================
+
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn masked_null_seg_ptr_equals_unmasked_forward() {
+    if !cuda_available() {
+        eprintln!("skipped: no CUDA device");
+        return;
+    }
+
+    let batch = 1usize; let heads = 1usize;
+    let seq_len = 128usize; let head_dim = 32usize;
+    let total = batch * heads * seq_len * head_dim;
+
+    let mut q = vec![0f32; total];
+    let mut k = vec![0f32; total];
+    let mut v = vec![0f32; total];
+    fill_seeded(&mut q, 0xA4_B4_C4_D4);
+    fill_seeded(&mut k, 0x11_22_33_44);
+    fill_seeded(&mut v, 0x55_66_77_88);
+
+    eprintln!("A-4 Test 1 — baseline (segment_masked=false)");
+    let baseline = launch_pca(
+        &q, &k, &v, batch, heads, seq_len, head_dim, true,
+        false, // segment_masked=false
+        &[],   // no seg_ids
+    );
+
+    eprintln!("A-4 Test 1 — masked+null (segment_masked=true, empty seg_ids → ptr=0)");
+    let masked_null = launch_pca(
+        &q, &k, &v, batch, heads, seq_len, head_dim, true,
+        true,  // segment_masked=true
+        &[],   // empty → seg_ids_ptr=0 (NULL)
+    );
+
+    // CRITICAL: if the GPU is present and the masked-null launch returned None,
+    // the null-guard failed (kernel crashed on NULL dereference).
+    let masked_null = masked_null.unwrap_or_else(|| {
+        panic!(
+            "masked kernel crashed on null seg_ids_ptr — A-3 null-guard FAILED \
+             (segment_masked=true, seg_ids_ptr=0 should be safe)"
+        )
+    });
+    let baseline = baseline.expect("baseline (segment_masked=false) launch failed unexpectedly");
+
+    let all_finite_b = baseline.iter().all(|x| x.is_finite());
+    let all_finite_m = masked_null.iter().all(|x| x.is_finite());
+    assert!(all_finite_b, "A-4 Test 1: baseline output contains non-finite values");
+    assert!(all_finite_m, "A-4 Test 1: masked+null output contains non-finite values");
+
+    let (max_abs, max_idx) = max_abs_diff(&masked_null, &baseline);
+    eprintln!(
+        "A-4 Test 1 [masked+null vs unmasked]: max_abs={:.2e} at idx={} \
+         masked_null[idx]={} baseline[idx]={}",
+        max_abs, max_idx, masked_null[max_idx], baseline[max_idx],
+    );
+    eprintln!("  first 4 baseline:    {:?}", &baseline[..4.min(baseline.len())]);
+    eprintln!("  first 4 masked_null: {:?}", &masked_null[..4.min(masked_null.len())]);
+
+    // Tight tolerance: same kernel, same math — only masking path differs.
+    // With null seg_ids the guard forces all-zero seg_smem, which means the
+    // segment predicate is always true (same as unmasked). f16 rounding is
+    // identical, so we expect bit-exact or within 1e-5.
+    let tol = 1e-5f32;
+    assert!(
+        max_abs <= tol,
+        "A-4 Test 1 FAILED: masked+null output diverges from unmasked, \
+         max_abs={:.2e} (threshold {:.0e}) — null-guard may be writing \
+         non-zero sentinel or the guard branch is not taken",
+        max_abs, tol,
+    );
+    eprintln!("A-4 Test 1 PASSED: masked+null == unmasked, max_abs={:.2e} <= {:.0e}", max_abs, tol);
 }
 
 /// Concatenate per-segment outputs back into a packed [B, H, S, D] tensor.
