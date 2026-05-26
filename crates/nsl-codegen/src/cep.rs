@@ -19,11 +19,11 @@ use crate::cep_rewrite::SearchAxes;
 use crate::cep_search::{
     architecture_search, prune_greedy, Constraints, Granularity, NasObjective, SearchOutcome,
 };
-use crate::gpu_specs::{default_gpu, find_gpu};
+use crate::gpu_specs::{default_gpu, find_gpu, GPU_DATABASE};
 use crate::weight_aware::WeightMap;
 
 /// Input for [`run_prune`].
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct CepPruneInput<'a> {
     pub spec: ModelSpec,
     pub weights: Option<&'a WeightMap>,
@@ -274,6 +274,125 @@ fn synthetic_importance(spec: &ModelSpec, slacks: &RooflineSlackTable) -> Import
 }
 
 // ---------------------------------------------------------------------------
+// Config bridge — semantic config + CLI overrides → driver input structs
+// ---------------------------------------------------------------------------
+
+/// CLI scalar overrides; decorator-primary, these win when present.
+#[derive(Debug, Clone, Default)]
+pub struct CliOverrides {
+    pub target: Option<String>,
+    pub sparsity: Option<f64>,
+    pub cep_out: Option<std::path::PathBuf>,
+}
+
+#[derive(Debug)]
+pub enum CepBridgeError {
+    UnknownTarget { target: String, supported: String },
+    BadPreserve(String),
+}
+
+impl std::fmt::Display for CepBridgeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CepBridgeError::UnknownTarget { target, supported } => {
+                write!(f, "CEP: unknown --cep-target '{target}'. Supported GPUs: {supported}")
+            }
+            CepBridgeError::BadPreserve(s) => write!(
+                f,
+                "CEP: preserve entry '{s}' must be a layer-index integer in v1 (glob preserve is v2)"
+            ),
+        }
+    }
+}
+
+fn supported_gpus() -> String {
+    GPU_DATABASE.iter().map(|g| g.name).collect::<Vec<_>>().join(", ")
+}
+
+fn parse_preserve_layers(preserve: &[String]) -> Result<Vec<u32>, CepBridgeError> {
+    preserve
+        .iter()
+        .map(|p| p.parse::<u32>().map_err(|_| CepBridgeError::BadPreserve(p.clone())))
+        .collect()
+}
+
+fn map_granularity(g: nsl_semantic::cep::Granularity) -> Granularity {
+    match g {
+        nsl_semantic::cep::Granularity::Head => Granularity::Head,
+        nsl_semantic::cep::Granularity::Ffn => Granularity::Ffn,
+        nsl_semantic::cep::Granularity::HeadAndFfn => Granularity::HeadAndFfn,
+    }
+}
+
+fn map_objective(o: nsl_semantic::cep::NasObjective) -> NasObjective {
+    match o {
+        nsl_semantic::cep::NasObjective::ParamEfficiency => NasObjective::ParamEfficiency,
+        nsl_semantic::cep::NasObjective::MinLatency => NasObjective::MinLatency,
+        nsl_semantic::cep::NasObjective::MinMemory => NasObjective::MinMemory,
+        nsl_semantic::cep::NasObjective::MinParams => NasObjective::MinParams,
+    }
+}
+
+/// Build `CepPruneInput` from semantic config + extracted spec + overrides.
+/// `target` is the pre-resolved effective target string, owned by the caller.
+pub fn build_prune_input<'a>(
+    cfg: &nsl_semantic::cep::CepPruneConfig,
+    spec: ModelSpec,
+    weights: Option<&'a WeightMap>,
+    target: &'a str,
+    sparsity_override: Option<f64>,
+) -> Result<CepPruneInput<'a>, CepBridgeError> {
+    if find_gpu(target).is_none() {
+        return Err(CepBridgeError::UnknownTarget {
+            target: target.to_string(),
+            supported: supported_gpus(),
+        });
+    }
+    let target_sparsity = sparsity_override.unwrap_or(cfg.sparsity);
+    let preserve_layers = parse_preserve_layers(&cfg.preserve)?;
+    let constraints = Constraints {
+        peak_memory_bytes: cfg.constraints.peak_memory_bytes.unwrap_or(u64::MAX),
+        latency_us: cfg.constraints.latency_us.unwrap_or(f64::INFINITY),
+        target_sparsity,
+        preserve_layers,
+    };
+    Ok(CepPruneInput {
+        spec,
+        weights,
+        target,
+        constraints,
+        granularity: map_granularity(cfg.granularity),
+        roofline_slack: RooflineSlackTable { per_layer: Vec::new() },
+    })
+}
+
+/// Build `CepSearchInput` from semantic config + extracted axes + target.
+pub fn build_search_input<'a>(
+    cfg: &nsl_semantic::cep::CepSearchConfig,
+    axes: SearchAxes,
+    target: &'a str,
+) -> Result<CepSearchInput<'a>, CepBridgeError> {
+    if find_gpu(target).is_none() {
+        return Err(CepBridgeError::UnknownTarget {
+            target: target.to_string(),
+            supported: supported_gpus(),
+        });
+    }
+    let constraints = Constraints {
+        peak_memory_bytes: cfg.constraints.peak_memory_bytes.unwrap_or(u64::MAX),
+        latency_us: cfg.constraints.latency_us.unwrap_or(f64::INFINITY),
+        target_sparsity: 0.0,
+        preserve_layers: Vec::new(),
+    };
+    Ok(CepSearchInput {
+        axes,
+        target,
+        constraints,
+        objective: map_objective(cfg.objective),
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -387,5 +506,75 @@ mod tests {
             importance: ImportanceTable::default(),
         };
         assert_eq!(plan.param_reduction(), 0.0);
+    }
+}
+
+#[cfg(test)]
+mod bridge_tests {
+    use super::*;
+    use crate::cep_oracle::{Activation, ModelSpec, NormType};
+
+    fn spec() -> ModelSpec {
+        ModelSpec {
+            d_model: 384,
+            n_layers: 6,
+            n_heads: vec![6; 6],
+            n_kv_heads: vec![3; 6],
+            head_dim: vec![64; 6],
+            d_ff: vec![1024; 6],
+            vocab: 4096,
+            max_seq: 2048,
+            batch: 1,
+            activation: Activation::SwiGlu,
+            norm: NormType::RmsNorm,
+            dtype_bytes: 4,
+        }
+    }
+
+    fn prune_cfg() -> nsl_semantic::cep::CepPruneConfig {
+        nsl_semantic::cep::CepPruneConfig {
+            target: None,
+            sparsity: 0.3,
+            granularity: nsl_semantic::cep::Granularity::HeadAndFfn,
+            preserve: vec!["0".to_string(), "5".to_string()],
+            constraints: nsl_semantic::cep::CepConstraints {
+                peak_memory_bytes: Some(6_000_000_000),
+                latency_us: Some(3000.0),
+            },
+            span: nsl_errors::Span::DUMMY,
+        }
+    }
+
+    #[test]
+    fn build_prune_input_maps_constraints_and_overrides() {
+        let cfg = prune_cfg();
+        let input = build_prune_input(&cfg, spec(), None, "H100-SXM", Some(0.5)).expect("input");
+        assert_eq!(input.target, "H100-SXM");
+        assert_eq!(input.constraints.peak_memory_bytes, 6_000_000_000);
+        assert_eq!(input.constraints.latency_us, 3000.0);
+        assert_eq!(input.constraints.target_sparsity, 0.5); // override beats cfg.sparsity (0.3)
+        assert_eq!(input.constraints.preserve_layers, vec![0, 5]);
+        assert!(matches!(input.granularity, Granularity::HeadAndFfn));
+    }
+
+    #[test]
+    fn build_prune_input_unknown_target_errors() {
+        let cfg = prune_cfg();
+        let err = build_prune_input(&cfg, spec(), None, "NoSuchGPU", None).unwrap_err();
+        match err {
+            CepBridgeError::UnknownTarget { target, supported } => {
+                assert_eq!(target, "NoSuchGPU");
+                assert!(supported.contains("H100-SXM"));
+            }
+            other => panic!("expected UnknownTarget, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_prune_input_bad_preserve_errors() {
+        let mut cfg = prune_cfg();
+        cfg.preserve = vec!["blocks.0.attn".to_string()];
+        let err = build_prune_input(&cfg, spec(), None, "H100-SXM", None).unwrap_err();
+        assert!(matches!(err, CepBridgeError::BadPreserve(_)));
     }
 }
