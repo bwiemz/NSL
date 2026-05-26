@@ -11,6 +11,7 @@
 
 pub mod d_prepass;
 pub mod dq;
+pub mod hbm_addr;
 
 use crate::flash_attention::FlashAttentionConfig;
 

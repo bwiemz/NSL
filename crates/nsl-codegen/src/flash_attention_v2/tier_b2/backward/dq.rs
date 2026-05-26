@@ -18,8 +18,6 @@
 //!
 //! Spec: docs/superpowers/specs/2026-05-19-csha-tier-b2-phase2-design.md §4 + §5.2
 
-pub mod hbm_addr;
-
 use crate::flash_attention::FlashAttentionConfig;
 use crate::flash_attention_v2::smem_layout::{
     tier_b2_dq_total_smem_bytes, tier_b2_effective_bq,
@@ -309,7 +307,7 @@ fn emit_outer_loop_open(ptx: &mut String) {
 /// held in registers across the kv sweep. s_lo = q_iter*bq + warp_id*16 + lane/4;
 /// s_hi = s_lo + 8. C-frag elements {0,1} use *_lo, {2,3} use *_hi (applied in Task 4).
 fn emit_stats_addr_load(ptx: &mut String, config: &FlashAttentionConfig) {
-    use hbm_addr::emit_3d_byte_offset;
+    use super::hbm_addr::emit_3d_byte_offset;
     let bq = tier_b2_effective_bq(config);
     ptx.push_str("    // === Per-row stats load (s_lo/s_hi = q_iter*bq + warp_id*16 + lane/4 [+8]) ===\n");
     ptx.push_str("    ld.param.u64 %stats_rmax_base, [row_max_ptr];\n");
@@ -394,7 +392,7 @@ fn emit_q_producer_load(ptx: &mut String, config: &FlashAttentionConfig) {
 
     // HBM byte offset for Q[batch_idx, head, q_tile_start, 0] using A1's helper.
     // emit_4d_byte_offset uses %row_index_tmp as scratch (already declared in emit_register_decls).
-    crate::flash_attention_v2::tier_b2::backward::dq::hbm_addr::emit_4d_byte_offset(
+    crate::flash_attention_v2::tier_b2::backward::hbm_addr::emit_4d_byte_offset(
         ptx,
         "%c1_q_hbm_off",
         "%batch_idx",
@@ -493,7 +491,7 @@ fn emit_dO_producer_load(ptx: &mut String, config: &FlashAttentionConfig) {
 
     // HBM byte offset for dO[batch_idx, head, do_tile_start, 0] using A1's helper.
     // emit_4d_byte_offset uses %row_index_tmp as scratch (declared in emit_register_decls).
-    crate::flash_attention_v2::tier_b2::backward::dq::hbm_addr::emit_4d_byte_offset(
+    crate::flash_attention_v2::tier_b2::backward::hbm_addr::emit_4d_byte_offset(
         ptx,
         "%c2_do_hbm_off",
         "%batch_idx",
@@ -588,7 +586,7 @@ fn emit_k_producer_load(ptx: &mut String, config: &FlashAttentionConfig) {
 
     // HBM byte offset for K[batch_idx, head, kv_tile_start, 0] using A1's helper.
     // emit_4d_byte_offset uses %row_index_tmp as scratch (declared in emit_register_decls).
-    crate::flash_attention_v2::tier_b2::backward::dq::hbm_addr::emit_4d_byte_offset(
+    crate::flash_attention_v2::tier_b2::backward::hbm_addr::emit_4d_byte_offset(
         ptx,
         "%c3_k_hbm_off",
         "%batch_idx",
@@ -684,7 +682,7 @@ fn emit_v_producer_load(ptx: &mut String, config: &FlashAttentionConfig) {
 
     // HBM byte offset for V[batch_idx, head, kv_tile_start, 0] using A1's helper.
     // emit_4d_byte_offset uses %row_index_tmp as scratch (declared in emit_register_decls).
-    crate::flash_attention_v2::tier_b2::backward::dq::hbm_addr::emit_4d_byte_offset(
+    crate::flash_attention_v2::tier_b2::backward::hbm_addr::emit_4d_byte_offset(
         ptx,
         "%c4_v_hbm_off",
         "%batch_idx",
@@ -1379,7 +1377,7 @@ fn emit_outer_loop_close(ptx: &mut String) {
 /// All registers (%g1_*) are declared in emit_register_decls to satisfy the PTX ISA
 /// constraint that all .reg directives precede executable instructions.
 fn emit_dq_finalize(ptx: &mut String, config: &FlashAttentionConfig) {
-    use hbm_addr::emit_4d_byte_offset;
+    use super::hbm_addr::emit_4d_byte_offset;
 
     let bq = tier_b2_effective_bq(config);
     let hd = config.head_dim as u32;
@@ -1805,14 +1803,14 @@ mod tests {
 
     #[test]
     fn dq_kernel_declares_row_index_tmp_scratch_for_hbm_addr_helpers() {
-        // emit_4d_byte_offset / emit_3d_byte_offset (dq::hbm_addr) require a caller-declared
+        // emit_4d_byte_offset / emit_3d_byte_offset (backward::hbm_addr) require a caller-declared
         // %row_index_tmp scratch; the synthesizer must include the declaration in
         // emit_register_decls so future cp.async / HBM-finalize sites can call the helpers
         // without producing undeclared-register ptxas errors.
         let ptx = synthesize_dq_kernel(&canonical_cfg()).unwrap();
         assert!(
             ptx.contains(".reg .u32 %row_index_tmp"),
-            "synthesize_dq_kernel must declare %row_index_tmp scratch (caller contract for dq::hbm_addr helpers)"
+            "synthesize_dq_kernel must declare %row_index_tmp scratch (caller contract for backward::hbm_addr helpers)"
         );
     }
 
