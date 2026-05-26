@@ -333,7 +333,7 @@ pub fn emit_with_smem_override(
         // collisions if both helpers fire in the same kernel.
         ptx.push_str("    .reg .b16 %rs_doc_seg;\n");
         ptx.push_str("    .reg .s32 %r_doc_start, %r_effective_pos_q, %r_effective_pos_k;\n");
-        ptx.push_str("    .reg .pred %p_doc_load_done;\n");
+        ptx.push_str("    .reg .pred %p_doc_load_done, %p_doc_null;\n");
     }
 
     // PCA Tier A: segment-mask helper scratch registers + SMEM buffer.
@@ -367,7 +367,7 @@ pub fn emit_with_smem_override(
         ptx.push_str("    .reg .u32 %r_pca_i, %r_pca_seq;\n");
         ptx.push_str("    .reg .u64 %rd_pca_off;\n");
         ptx.push_str("    .reg .b16 %rs_pca;\n");
-        ptx.push_str("    .reg .pred %p_pca_load, %p_pca_done;\n");
+        ptx.push_str("    .reg .pred %p_pca_load, %p_pca_done, %p_seg_null;\n");
         // SMEM buffer sized to pca_segment::DEFAULT_SMEM_SEGMENT_BUDGET so
         // it matches the ceiling pca_segment::plan_kernel uses to pick
         // SegmentResidency::Shared. Kept separate from `shmem` so Q/K/V
@@ -431,6 +431,11 @@ pub fn emit_with_smem_override(
     if config.segment_masked {
         ptx.push_str("\n    // --- PCA Tier A: load segment_ids from global to shared ---\n");
         ptx.push_str("    ld.param.u64 %rd_seg_global, [segment_ids_ptr];\n");
+        // PCA Tier A null-guard (spec §4.2): null segment_ids_ptr → write the
+        // all-zero sentinel (every position in segment 0 → seg[q]!=seg[k] is
+        // uniformly false → no masking). Computed once; predicates the per-
+        // iteration ld.global below so we skip the dereference, never load-then-check.
+        ptx.push_str("    setp.eq.u64 %p_seg_null, %rd_seg_global, 0;\n");
         // Get SMEM generic-space address of seg_smem.  Keep as u64 — do NOT
         // truncate to u32.  On Blackwell (sm_120+) the low 32 bits of the
         // generic address are NOT the raw shared-space offset when the label
@@ -450,7 +455,12 @@ pub fn emit_with_smem_override(
         ptx.push_str("    cvt.u64.u32 %rd_seg_smem, %r_pca_i;\n");
         ptx.push_str("    shl.b64 %rd_seg_smem, %rd_seg_smem, 1;\n");
         ptx.push_str("    add.u64 %rd_seg_smem, %rd_seg_smem, %rd_seg_global;\n");
+        ptx.push_str("    @%p_seg_null bra PCA_SEG_NULL_LD;\n");
         ptx.push_str("    ld.global.u16 %rs_pca, [%rd_seg_smem];\n");
+        ptx.push_str("    bra PCA_SEG_LD_DONE;\n");
+        ptx.push_str("PCA_SEG_NULL_LD:\n");
+        ptx.push_str("    mov.u16 %rs_pca, 0;\n");
+        ptx.push_str("PCA_SEG_LD_DONE:\n");
         // Shared address = seg_base (u64 generic) + i * 2
         ptx.push_str("    cvt.u64.u32 %rd_pca_off, %r_pca_i;\n");
         ptx.push_str("    shl.b64 %rd_pca_off, %rd_pca_off, 1;\n");

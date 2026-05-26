@@ -479,6 +479,9 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_packing_metadata_set", &[types::I64, types::I64], None),
     ("nsl_packing_metadata_get_segment_ids", &[], Some(types::I64)),
     ("nsl_packing_metadata_get_doc_starts", &[], Some(types::I64)),
+    // PCA Tier A (spec §6.1) — mismatch warning: warns once if a
+    // segment-masked module sees no segment_ids in the first N steps.
+    ("nsl_pca_packing_mismatch_check", &[types::I64], None),
     // In-place mutation ops (M14)
     ("nsl_tensor_copy_data", &[types::I64, types::I64], None),
     ("nsl_tensor_add_inplace", &[types::I64, types::I64], None),

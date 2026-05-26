@@ -9,7 +9,7 @@
 
 use std::collections::HashMap;
 
-use nsl_ast::block::{DatasetDef, TrainBlock, TrainSection};
+use nsl_ast::block::{TrainBlock, TrainSection};
 use nsl_ast::expr::ExprKind;
 use nsl_ast::stmt::StmtKind;
 use nsl_lexer::Interner;
@@ -17,6 +17,7 @@ use serde::Serialize;
 
 use crate::fase::{self, FaseConfig, FaseOptimizer, FasePlan};
 use crate::fase_memory::MemorySchedule;
+use crate::pca_activation::{collect_dataset_configs, extract_dataset_ref};
 use crate::pca_detect::{DatasetPackingConfig, PcaDetection, PcaDetectConfig};
 
 #[derive(Debug, Clone, Serialize)]
@@ -64,7 +65,7 @@ pub struct PcaSection {
 /// requires a `ModelFootprint` that cannot be cheaply derived from the AST
 /// without running semantic analysis; this is deferred to a later task.
 pub fn build_report(ast: &nsl_ast::Module, interner: &Interner, source_path: &std::path::Path) -> TrainingReport {
-    let dataset_configs = collect_dataset_configs(ast, interner);
+    let dataset_configs = collect_dataset_configs(&ast.stmts, interner);
     let mut blocks = Vec::new();
     for stmt in &ast.stmts {
         match &stmt.kind {
@@ -183,108 +184,6 @@ fn extract_optimizer(train: &TrainBlock, interner: &Interner) -> FaseOptimizer {
         }
     }
     FaseOptimizer::Unknown
-}
-
-/// Look inside `data:` sections for an assignment like `source = <ident>`.
-///
-/// In the AST a data section is `TrainSection::Data(Vec<Stmt>)`.  The parser
-/// renders `source = ds_name` as a `StmtKind::Assign` with a plain-ident
-/// target and plain-ident value, or alternatively as a `StmtKind::VarDecl`.
-fn extract_dataset_ref(train: &TrainBlock, interner: &Interner) -> Option<String> {
-    for section in &train.sections {
-        if let TrainSection::Data(stmts) = section {
-            for stmt in stmts {
-                // Pattern: `source = <ident>` → StmtKind::Assign
-                if let StmtKind::Assign { target, value, .. } = &stmt.kind {
-                    if let ExprKind::Ident(target_sym) = &target.kind {
-                        if resolve(interner, *target_sym) == "source" {
-                            if let ExprKind::Ident(val_sym) = &value.kind {
-                                return Some(resolve(interner, *val_sym).to_string());
-                            }
-                        }
-                    }
-                }
-                // Pattern: `let source = <ident>` → StmtKind::VarDecl
-                if let StmtKind::VarDecl { pattern, value: Some(val), .. } = &stmt.kind {
-                    if let nsl_ast::pattern::PatternKind::Ident(name) = &pattern.kind {
-                        if resolve(interner, *name) == "source" {
-                            if let ExprKind::Ident(val_sym) = &val.kind {
-                                return Some(resolve(interner, *val_sym).to_string());
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    None
-}
-
-/// Walk top-level items for `dataset <Name>(...)` blocks and build a
-/// packing-config map keyed by dataset name.
-///
-/// **Scope note:** Only the `packing`, `max_sequence_length`,
-/// `mean_doc_length`, `doc_length_stddev`, and `separator_token_id`
-/// keys inside the dataset body are extracted.  Unknown keys are silently
-/// ignored for forward-compatibility.
-fn collect_dataset_configs(ast: &nsl_ast::Module, interner: &Interner) -> HashMap<String, DatasetPackingConfig> {
-    let mut map = HashMap::new();
-    for stmt in &ast.stmts {
-        if let StmtKind::DatasetDef(def) = &stmt.kind {
-            let name = resolve(interner, def.name).to_string();
-            let cfg = extract_dataset_packing(def, interner);
-            map.insert(name, cfg);
-        }
-    }
-    map
-}
-
-fn extract_dataset_packing(def: &DatasetDef, interner: &Interner) -> DatasetPackingConfig {
-    let mut enabled = false;
-    let mut max_sequence_length: u32 = 0;
-    let mut mean_doc_length: Option<u32> = None;
-    let mut doc_length_stddev: Option<u32> = None;
-    let mut separator_token_id: Option<i64> = None;
-
-    for entry in &def.body {
-        let key = resolve(interner, entry.key);
-        match key {
-            "packing" => {
-                if let ExprKind::BoolLiteral(b) = &entry.value.kind {
-                    enabled = *b;
-                }
-            }
-            "max_sequence_length" | "max_seq_len" => {
-                if let ExprKind::IntLiteral(n) = &entry.value.kind {
-                    max_sequence_length = (*n).max(0) as u32;
-                }
-            }
-            "mean_doc_length" => {
-                if let ExprKind::IntLiteral(n) = &entry.value.kind {
-                    mean_doc_length = Some((*n).max(0) as u32);
-                }
-            }
-            "doc_length_stddev" => {
-                if let ExprKind::IntLiteral(n) = &entry.value.kind {
-                    doc_length_stddev = Some((*n).max(0) as u32);
-                }
-            }
-            "separator_token_id" => {
-                if let ExprKind::IntLiteral(n) = &entry.value.kind {
-                    separator_token_id = Some(*n);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    DatasetPackingConfig {
-        enabled,
-        max_sequence_length,
-        mean_doc_length,
-        doc_length_stddev,
-        separator_token_id,
-    }
 }
 
 // ─── Display / formatting ────────────────────────────────────────────────────

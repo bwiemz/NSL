@@ -3850,6 +3850,27 @@ impl Compiler<'_> {
 
             builder.switch_to_block(after_block);
             builder.seal_block(after_block);
+
+            // PCA Tier A (spec §6.1): when a segment-masked kernel was
+            // synthesized for this module, warn once if no segment_ids ever
+            // appear in the first N steps (DataLoader-never-packs footgun).
+            // Gated on the ACTUAL synthesized config so non-packed training
+            // (the common case) never sees this call. has_seg is the
+            // nsl_dict_contains("segment_ids") i64 result from above.
+            let module_is_masked = self
+                .kernels
+                .flash_attention_context
+                .as_ref()
+                .and_then(|c| c.csha_training_config.as_ref())
+                .map(|cfg| cfg.segment_masked)
+                .unwrap_or(false);
+            if module_is_masked {
+                self.compile_call_by_name(
+                    builder,
+                    "nsl_pca_packing_mismatch_check",
+                    &[has_seg],
+                )?;
+            }
         }
 
         let prev_batch_scope = state.flags.in_dataloader_batch_scope;

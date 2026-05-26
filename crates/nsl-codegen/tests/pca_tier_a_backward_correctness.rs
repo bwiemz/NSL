@@ -208,7 +208,15 @@ fn flash_attention_forward_reference_with_stats(
         let j_max = if causal { i + 1 } else { seq_len };
         let mut scores = vec![f32::NEG_INFINITY; seq_len];
         let mut max_score = f32::NEG_INFINITY;
-        let seg_i = segment_masked.then(|| seg_ids[i]);
+        // Null-guard mirror: when seg_ids is empty (GPU null-guard case),
+        // treat as unmasked regardless of segment_masked flag — the GPU kernel's
+        // skip-before-dereference guard writes all-zero seg_smem sentinel which
+        // has the same effect as no masking.
+        let seg_i = if segment_masked && !seg_ids.is_empty() {
+            Some(seg_ids[i])
+        } else {
+            None
+        };
 
         for (j, score_slot) in scores.iter_mut().enumerate().take(j_max) {
             if let Some(seg_i) = seg_i {
@@ -315,6 +323,7 @@ fn pca_backward_config(segment_masked: bool) -> FlashAttentionConfig {
             active_heads:                  1,
             rmsnorm_eps:                   1e-5,
             d_model:                       32,
+            skip_rmsnorm_prologue:         false,
         }),
     }
 }
@@ -630,6 +639,10 @@ fn launch_pca_backward(
             dxn_dev,
             // PCA Task 4B: trailing segment_ids.
             seg_dev,
+            // Tier B extension — null (not used for Tier A tests)
+            0i64, 0i64,
+            // doc_starts ptr — null (rope_q=false, no doc-aware positions)
+            0i64,
         )
     };
     // DEBUG: sync + report any async fault from the backward launch.
@@ -1205,6 +1218,109 @@ fn tier_a_backward_unequal_segments_matches_unpacked_reference() {
     assert!(dk_diff <= tol, "Fixture 3 FAILED: dk={:.3e} > {:.0e}", dk_diff, tol);
     assert!(dv_diff <= tol, "Fixture 3 FAILED: dv={:.3e} > {:.0e}", dv_diff, tol);
     eprintln!("Fixture 3 PASSED: dq={:.3e} dk={:.3e} dv={:.3e} <= {:.0e}", dq_diff, dk_diff, dv_diff, tol);
+}
+
+// ===========================================================================
+// A-4 Test 2: null seg_ids_ptr guard — masked+null must equal unmasked backward
+//
+// Validates the same null-guard in the BACKWARD kernel: when seg_ids_ptr==0
+// the kernel must behave identically to the segment_masked=false path.
+//
+// The launch_pca_backward helper passes seg_dev=0 when segment_masked is
+// true but seg_ids_host is empty (see harness, line 488-501).
+//
+// Tolerance: 5e-3 — matches the file's established backward tolerance.
+//
+// CRITICAL: if cuda_available() is true and the masked-null launch returns
+// None, we PANIC (guard failure), not skip.
+// ===========================================================================
+
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn masked_null_seg_ptr_equals_unmasked_backward() {
+    if !cuda_available() {
+        eprintln!("skipped: no CUDA device");
+        return;
+    }
+
+    let seq_len  = 128usize;
+    let head_dim = 32usize;
+    let total    = seq_len * head_dim;
+
+    let mut x      = vec![0f32; total];
+    let mut do_f32 = vec![0f32; total];
+    fill_seeded(&mut x,      0xA4B4_C4D4);
+    fill_seeded(&mut do_f32, 0x5566_7788);
+
+    let n_weights = head_dim * head_dim;
+    let mut wq_f32 = vec![0f32; n_weights];
+    let mut wk_f32 = vec![0f32; n_weights];
+    let mut wv_f32 = vec![0f32; n_weights];
+    fill_seeded(&mut wq_f32, 0x1111_2222);
+    fill_seeded(&mut wk_f32, 0x3333_4444);
+    fill_seeded(&mut wv_f32, 0x5555_6666);
+    let wq_f16: Vec<u16> = wq_f32.iter().map(|&v| f32_to_f16_bits(v)).collect();
+    let wk_f16: Vec<u16> = wk_f32.iter().map(|&v| f32_to_f16_bits(v)).collect();
+    let wv_f16: Vec<u16> = wv_f32.iter().map(|&v| f32_to_f16_bits(v)).collect();
+    let do_f16: Vec<u16> = do_f32.iter().map(|&v| f32_to_f16_bits(v)).collect();
+
+    eprintln!("A-4 Test 2 — baseline backward (segment_masked=false)");
+    let baseline = launch_pca_backward(
+        &x, &wq_f16, &wk_f16, &wv_f16, &do_f16,
+        seq_len, head_dim,
+        &[],   // empty → seg_dev=0
+        false, // segment_masked=false
+    );
+
+    eprintln!("A-4 Test 2 — masked+null backward (segment_masked=true, empty seg_ids → ptr=0)");
+    let masked_null = launch_pca_backward(
+        &x, &wq_f16, &wk_f16, &wv_f16, &do_f16,
+        seq_len, head_dim,
+        &[],   // empty → seg_dev=0 (NULL)
+        true,  // segment_masked=true
+    );
+
+    // CRITICAL: if the GPU is present and the masked-null launch returned None,
+    // the null-guard failed (kernel crashed on NULL dereference).
+    let (dq1, dk1, dv1) = masked_null.unwrap_or_else(|| {
+        panic!(
+            "masked backward kernel crashed on null seg_ids_ptr — A-3 null-guard FAILED \
+             (segment_masked=true, seg_ids_ptr=0 should be safe)"
+        )
+    });
+    let (dq0, dk0, dv0) = baseline.expect(
+        "baseline (segment_masked=false) backward launch failed unexpectedly"
+    );
+
+    for (name, arr) in [
+        ("dq0", &dq0), ("dk0", &dk0), ("dv0", &dv0),
+        ("dq1", &dq1), ("dk1", &dk1), ("dv1", &dv1),
+    ] {
+        assert_no_nan(name, arr, "A-4 Test 2");
+    }
+
+    let (dq_diff, dq_idx) = max_abs_diff(&dq1, &dq0);
+    let (dk_diff, dk_idx) = max_abs_diff(&dk1, &dk0);
+    let (dv_diff, dv_idx) = max_abs_diff(&dv1, &dv0);
+
+    eprintln!(
+        "A-4 Test 2 [masked+null vs unmasked backward]: \
+         dq={:.3e}@[{dq_idx}]  dk={:.3e}@[{dk_idx}]  dv={:.3e}@[{dv_idx}]",
+        dq_diff, dk_diff, dv_diff,
+    );
+    eprintln!("  first 4 dq1 (masked+null): {:?}", &dq1[..4.min(dq1.len())]);
+    eprintln!("  first 4 dq0 (baseline):    {:?}", &dq0[..4.min(dq0.len())]);
+
+    // Tolerance matches the file's established backward budget (5e-3).
+    let tol = 5e-3f32;
+    assert!(dq_diff <= tol, "A-4 Test 2 FAILED: dq={:.3e} > {:.0e}", dq_diff, tol);
+    assert!(dk_diff <= tol, "A-4 Test 2 FAILED: dk={:.3e} > {:.0e}", dk_diff, tol);
+    assert!(dv_diff <= tol, "A-4 Test 2 FAILED: dv={:.3e} > {:.0e}", dv_diff, tol);
+    eprintln!(
+        "A-4 Test 2 PASSED: masked+null == unmasked backward, \
+         dq={:.3e} dk={:.3e} dv={:.3e} <= {:.0e}",
+        dq_diff, dk_diff, dv_diff, tol,
+    );
 }
 
 #[test]

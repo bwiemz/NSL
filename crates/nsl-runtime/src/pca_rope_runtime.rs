@@ -23,6 +23,7 @@
 //!   - No locking overhead: `Cell::set` / `Cell::get` are non-atomic.
 
 use std::cell::Cell;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 thread_local! {
     /// `(segment_ids_ptr, doc_starts_ptr)` — raw device pointers stored
@@ -58,9 +59,59 @@ pub extern "C" fn nsl_packing_metadata_get_doc_starts() -> i64 {
     PACKING_METADATA.with(|c| c.get().1)
 }
 
+static STEPS_SEEN: AtomicU32 = AtomicU32::new(0);
+static SAW_SEGMENTS: AtomicBool = AtomicBool::new(false);
+static WARNED: AtomicBool = AtomicBool::new(false);
+const WARN_AFTER_N_STEPS: u32 = 100;
+
+/// Called once per training step (after the packing registry is set) ONLY when
+/// the module was compiled with segment masking (a masked kernel was emitted).
+/// `had_segments` != 0 means this step's batch contained `segment_ids`.
+///
+/// Warns ONCE if NO step in the first `WARN_AFTER_N_STEPS` had segment_ids —
+/// the "packing declared but the DataLoader never packs" footgun (spec §6.1).
+/// Does NOT warn on a single unpacked step (mixed-batch workloads are valid).
+#[no_mangle]
+pub extern "C" fn nsl_pca_packing_mismatch_check(had_segments: i64) {
+    if had_segments != 0 {
+        SAW_SEGMENTS.store(true, Ordering::Relaxed);
+    }
+    let n = STEPS_SEEN.fetch_add(1, Ordering::Relaxed) + 1;
+    if n >= WARN_AFTER_N_STEPS
+        && !SAW_SEGMENTS.load(Ordering::Relaxed)
+        && !WARNED.swap(true, Ordering::Relaxed)
+    {
+        eprintln!(
+            "[nsl-pca] packing was declared (segment masking active) but no \
+             segment_ids appeared in the first {WARN_AFTER_N_STEPS} steps — the \
+             masked kernel is running UNMASKED (identity). Check that your \
+             DataLoader actually packs (emits batch[\"segment_ids\"])."
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mismatch_check_warns_only_on_never_packs() {
+        // Reset the process-global statics so this test is order-independent.
+        STEPS_SEEN.store(0, std::sync::atomic::Ordering::Relaxed);
+        SAW_SEGMENTS.store(false, std::sync::atomic::Ordering::Relaxed);
+        WARNED.store(false, std::sync::atomic::Ordering::Relaxed);
+
+        // 99 unpacked steps, then a packed step at step 100 → segments DID appear,
+        // so NO warning (this models a mixed-batch workload, not never-packs).
+        for _ in 0..99 {
+            nsl_pca_packing_mismatch_check(0);
+        }
+        nsl_pca_packing_mismatch_check(1); // saw segments at step 100
+        assert!(
+            !WARNED.load(std::sync::atomic::Ordering::Relaxed),
+            "should NOT warn when segments appeared within the first N steps"
+        );
+    }
 
     #[test]
     fn uninitialized_state_returns_zero() {
