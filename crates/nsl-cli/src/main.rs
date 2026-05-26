@@ -150,6 +150,16 @@ enum Cli {
         /// Pass without value for text output, or `--training-report=json` for JSON.
         #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "text")]
         training_report: Option<TrainingReportFormat>,
+
+        /// CEP: run hardware-aware architecture search.
+        #[arg(long)]
+        cep_search: bool,
+        /// CEP: target GPU for analysis (e.g. H100-SXM).
+        #[arg(long)]
+        cep_target: Option<String>,
+        /// CEP: write the delta JSON here (default: <model>.cep.json).
+        #[arg(long)]
+        cep_out: Option<PathBuf>,
     },
 
     /// Compile and execute an NSL program
@@ -550,6 +560,19 @@ enum Cli {
 
         #[arg(long, value_name = "SECONDS", default_value_t = 600)]
         calibration_timeout: u64,
+
+        /// CEP: run compilation-verified pruning (requires --weights).
+        #[arg(long)]
+        cep_prune: bool,
+        /// CEP: target GPU for analysis (e.g. H100-SXM).
+        #[arg(long)]
+        cep_target: Option<String>,
+        /// CEP: override the decorator's prune sparsity.
+        #[arg(long)]
+        cep_sparsity: Option<f64>,
+        /// CEP: write the delta JSON here (default: <model>.cep.json).
+        #[arg(long)]
+        cep_out: Option<PathBuf>,
     },
 
     /// Run @test functions in an NSL file
@@ -812,7 +835,18 @@ fn main_inner() {
             wcet_target: _wcet_target,
             fpga_device: _fpga_device,
             training_report,
+            cep_search,
+            cep_target,
+            cep_out,
         } => {
+            if cep_search {
+                let ov = nsl_codegen::cep::CliOverrides {
+                    target: cep_target,
+                    sparsity: None,
+                    cep_out,
+                };
+                std::process::exit(run_cep_search(&file, &ov));
+            }
             if shapes {
                 let src = match std::fs::read_to_string(&file) {
                     Ok(s) => s,
@@ -1014,9 +1048,22 @@ fn main_inner() {
             calibration_samples,
             calibration_batch_size,
             calibration_timeout,
+            cep_prune,
+            cep_target,
+            cep_sparsity,
+            cep_out,
         } => {
             // M62a: shared_lib flag is threaded through compile_opts and handled
             // in the build path below.
+
+            if cep_prune {
+                let ov = nsl_codegen::cep::CliOverrides {
+                    target: cep_target,
+                    sparsity: cep_sparsity,
+                    cep_out,
+                };
+                std::process::exit(run_cep_prune(&file, weights.as_deref(), &ov));
+            }
 
             if autotune_clean {
                 let cache_dir = std::path::Path::new(".nsl-cache/autotune");
@@ -2534,6 +2581,226 @@ fn run_check(file: &PathBuf, dump_tokens: bool, dump_ast: bool, dump_types: bool
             parse_result.module.stmts.len()
         );
     }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// CEP frontend (DR-3, DR-9): `nsl build --cep-prune` / `nsl check --cep-search`.
+//
+// These orchestrators tie the already-built pieces together: the AST recognizer
+// (`cep_extract`), the semantic decorator validators (`nsl_semantic::cep`), the
+// codegen bridge (`nsl_codegen::cep`), and the delta writers. They short-circuit
+// the normal build/check path only when the respective flag is passed.
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Locate the `@cep_prune` / `@cep_search` decorator attached to the model
+/// definition. Returns the first matching decorator in source order.
+fn find_cep_decorator<'a>(
+    module: &'a nsl_ast::Module,
+    interner: &nsl_lexer::Interner,
+    want: &str,
+) -> Option<&'a nsl_ast::decl::Decorator> {
+    use nsl_ast::stmt::StmtKind;
+    for stmt in &module.stmts {
+        if let StmtKind::Decorated { decorators, stmt: inner } = &stmt.kind {
+            if matches!(inner.kind, StmtKind::ModelDef(_)) {
+                for deco in decorators {
+                    if deco.name.len() == 1
+                        && interner.resolve(deco.name[0].0).unwrap_or("") == want
+                    {
+                        return Some(deco);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Resolve the effective CEP target string. CLI `--cep-target` wins; otherwise
+/// the decorator's `target = ...` ident; otherwise the default "H100-SXM".
+fn resolve_cep_target(
+    cli: Option<&str>,
+    deco_target: Option<nsl_ast::Symbol>,
+    resolve: &dyn Fn(nsl_ast::Symbol) -> String,
+) -> String {
+    if let Some(t) = cli {
+        return t.to_string();
+    }
+    if let Some(sym) = deco_target {
+        let s = resolve(sym);
+        if !s.is_empty() {
+            return s;
+        }
+    }
+    "H100-SXM".to_string()
+}
+
+/// Default delta output path: `<model>.cep.json` next to the source file.
+fn default_cep_out(file: &std::path::Path) -> PathBuf {
+    file.with_extension("cep.json")
+}
+
+/// Emit CEP diagnostics with source context (same mechanism `run_check` uses:
+/// `SourceMap::add_file` + `emit_diagnostic`). Returns `true` if any diagnostic
+/// is at `Level::Error`.
+fn emit_cep_diags(file: &std::path::Path, diags: &[nsl_errors::Diagnostic]) -> bool {
+    let source = std::fs::read_to_string(file).unwrap_or_default();
+    let mut source_map = SourceMap::new();
+    source_map.add_file(file.display().to_string(), source);
+    for diag in diags {
+        source_map.emit_diagnostic(diag);
+    }
+    diags.iter().any(|d| d.level == Level::Error)
+}
+
+fn run_cep_prune(
+    file: &PathBuf,
+    weights: Option<&std::path::Path>,
+    ov: &nsl_codegen::cep::CliOverrides,
+) -> i32 {
+    use nsl_codegen::cep_extract::{cross_check_dims, extract_model_spec};
+
+    let Some(weights_path) = weights else {
+        eprintln!(
+            "error: --cep-prune requires --weights <file.safetensors> \
+             (a prune from synthetic scores would be silently wrong)"
+        );
+        return 1;
+    };
+
+    let (interner, parse_result, analysis) = frontend_with_flags(file, false);
+    // Analysis-error gate — same accessor as run_check: filter
+    // `analysis.diagnostics` on `Level::Error`. `frontend_with_flags` already
+    // exits on errors, but we keep a defensive gate that prints with source
+    // context before bailing.
+    let analysis_errors: Vec<_> = analysis
+        .diagnostics
+        .iter()
+        .filter(|d| d.level == Level::Error)
+        .cloned()
+        .collect();
+    if !analysis_errors.is_empty() {
+        emit_cep_diags(file, &analysis_errors);
+        return 1;
+    }
+
+    let module = &parse_result.module;
+    let resolve = |s: nsl_ast::Symbol| interner.resolve(s.0).unwrap_or("").to_string();
+
+    let Some(deco) = find_cep_decorator(module, &interner, "cep_prune") else {
+        eprintln!("error: --cep-prune requires a @cep_prune(...) decorator on the model");
+        return 1;
+    };
+    let mut diags = Vec::new();
+    let Some(cfg) = nsl_semantic::cep::validate_cep_prune_decorator(deco, &resolve, &mut diags)
+    else {
+        emit_cep_diags(file, &diags);
+        return 1;
+    };
+    // The validator may return `Some` while still pushing error diagnostics for
+    // recoverable problems; treat any pushed error as fatal.
+    if emit_cep_diags(file, &diags) {
+        return 1;
+    }
+
+    let spec = match extract_model_spec(module, &resolve) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("{e}");
+            return 1;
+        }
+    };
+
+    let wm = match nsl_codegen::weight_aware::WeightMap::load(weights_path) {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("error: failed to load weights: {e:?}");
+            return 1;
+        }
+    };
+    if let Err(e) = cross_check_dims(&spec, &wm, &resolve) {
+        eprintln!("{e}");
+        return 1;
+    }
+
+    let target = resolve_cep_target(ov.target.as_deref(), cfg.target, &resolve);
+    let input =
+        match nsl_codegen::cep::build_prune_input(&cfg, spec.clone(), Some(&wm), &target, ov.sparsity) {
+            Ok(i) => i,
+            Err(e) => {
+                eprintln!("{e}");
+                return 1;
+            }
+        };
+    let plan = nsl_codegen::cep::run_prune(input);
+    println!("{}", plan.render_report());
+
+    let out_path = ov.cep_out.clone().unwrap_or_else(|| default_cep_out(file));
+    if let Err(e) = nsl_codegen::cep::write_prune_delta(&plan, &spec, &out_path) {
+        eprintln!("error: failed to write delta: {e}");
+        return 1;
+    }
+    println!("CEP delta written to {}", out_path.display());
+    0
+}
+
+fn run_cep_search(file: &PathBuf, ov: &nsl_codegen::cep::CliOverrides) -> i32 {
+    use nsl_codegen::cep_extract::extract_search_axes;
+
+    let (interner, parse_result, analysis) = frontend_with_flags(file, false);
+    let analysis_errors: Vec<_> = analysis
+        .diagnostics
+        .iter()
+        .filter(|d| d.level == Level::Error)
+        .cloned()
+        .collect();
+    if !analysis_errors.is_empty() {
+        emit_cep_diags(file, &analysis_errors);
+        return 1;
+    }
+
+    let module = &parse_result.module;
+    let resolve = |s: nsl_ast::Symbol| interner.resolve(s.0).unwrap_or("").to_string();
+
+    let Some(deco) = find_cep_decorator(module, &interner, "cep_search") else {
+        eprintln!("error: --cep-search requires a @cep_search(...) decorator on the model");
+        return 1;
+    };
+    let mut diags = Vec::new();
+    let Some(cfg) = nsl_semantic::cep::validate_cep_search_decorator(deco, &resolve, &mut diags)
+    else {
+        emit_cep_diags(file, &diags);
+        return 1;
+    };
+    if emit_cep_diags(file, &diags) {
+        return 1;
+    }
+
+    let axes = match extract_search_axes(module, &resolve) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("{e}");
+            return 1;
+        }
+    };
+    let target = resolve_cep_target(ov.target.as_deref(), cfg.target, &resolve);
+    let input = match nsl_codegen::cep::build_search_input(&cfg, axes, &target) {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!("{e}");
+            return 1;
+        }
+    };
+    let plan = nsl_codegen::cep::run_search(input);
+    println!("{}", plan.render_report());
+
+    let out_path = ov.cep_out.clone().unwrap_or_else(|| default_cep_out(file));
+    if let Err(e) = nsl_codegen::cep::write_search_delta(&plan, &out_path) {
+        eprintln!("error: failed to write delta: {e}");
+        return 1;
+    }
+    println!("CEP delta written to {}", out_path.display());
+    0
 }
 
 /// Check if a file has any import statements or train blocks by quick-scanning.
