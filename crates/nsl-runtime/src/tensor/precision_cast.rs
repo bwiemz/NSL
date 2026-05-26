@@ -1,9 +1,13 @@
 //! CPDT precision-adaptive optimizer state casts (v1: FP16 <-> FP32).
 //!
 //! Tensor-level (whole-tensor) dequant/quant for FASE's optimizer-state
-//! storage. Reuses the crate's `f16_bits_to_f32` / `f32_to_f16_bits`
-//! (round-to-nearest-even) so CPU and GPU paths share identical numerics.
-//! Models its allocation on `crate::fp8::nsl_fp8_cast`.
+//! storage. Reuses the crate's `f16_bits_to_f32` (exact widening) and
+//! `f32_to_f16_bits` so CPU and GPU paths share identical numerics. NOTE:
+//! despite its docstring, `f32_to_f16_bits` *truncates* the mantissa (it is
+//! not round-to-nearest-even); v1 reuses it as-is. Truncation is biased
+//! toward zero — proper rounding for optimizer state is a deferred ladder
+//! step (see the design doc §10). Models its allocation on
+//! `crate::fp8::nsl_fp8_cast`.
 
 use std::ffi::c_void;
 
@@ -16,8 +20,9 @@ use super::{
 /// Cast a tensor to `target_dtype`, returning a NEW owned tensor.
 ///
 /// v1 supports F32 and FP16 storage. FP16 storage holds IEEE-754 half bits
-/// as `u16`; conversion uses the crate's round-to-nearest-even primitive.
-/// An F32->F32 cast yields a faithful copy. The source tensor is NOT consumed.
+/// as `u16`; the f32->f16 conversion uses the crate's `f32_to_f16_bits`
+/// (which truncates the mantissa — see the module note). An F32->F32 cast
+/// yields a faithful copy. The source tensor is NOT consumed.
 #[no_mangle]
 pub extern "C" fn nsl_tensor_cast(src_ptr: i64, target_dtype: i64) -> i64 {
     let t = unsafe { &*(src_ptr as *const NslTensor) };
@@ -90,17 +95,19 @@ mod tests {
     }
 
     #[test]
-    fn cast_f32_to_fp16_then_back_matches_rtn_primitive() {
+    fn cast_f32_to_fp16_then_back_matches_primitive_round_trip() {
         let vals = [1.0001_f32, 3.14159265_f32, -2.71828_f32, 65504.0, 1e-5];
         let src = f32_tensor(&vals);
         let fp16 = nsl_tensor_cast(src, DTYPE_FP16 as i64);
         let back = nsl_tensor_cast(fp16, DTYPE_F32 as i64);
         let got = read_f32(back);
         for (i, &v) in vals.iter().enumerate() {
+            // Expected == exact round-trip through the crate's f32->f16 primitive
+            // (which truncates) and back. Bit-exact: the cast must delegate to it.
             let expected = f16_bits_to_f32(f32_to_f16_bits(v));
             assert!(
                 (got[i] - expected).abs() <= 0.0,
-                "elem {i}: got {} expected {} (exact RTN round-trip)",
+                "elem {i}: got {} expected {} (exact primitive round-trip)",
                 got[i],
                 expected
             );
