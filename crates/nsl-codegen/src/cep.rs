@@ -11,6 +11,8 @@
 //! The driver is pure and deterministic — every invocation with the same
 //! inputs produces an identical report.
 
+use std::path::Path;
+
 use serde::Serialize;
 
 use crate::cep_importance::{analyse_weight_map, ImportanceTable, RooflineSlackTable};
@@ -271,6 +273,211 @@ fn synthetic_importance(spec: &ModelSpec, slacks: &RooflineSlackTable) -> Import
         ffns: Vec::new(),
         layers,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Delta-JSON writers — serialise a CepPlan to a versioned *.cep.json file.
+// These DTOs pin the on-disk schema independently of the core layout.
+// ---------------------------------------------------------------------------
+
+const CEP_DELTA_VERSION: u32 = 1;
+
+fn activation_str(a: crate::cep_oracle::Activation) -> &'static str {
+    use crate::cep_oracle::Activation::*;
+    match a {
+        Relu => "relu",
+        Gelu => "gelu",
+        SiLU => "silu",
+        SwiGlu => "swiglu",
+    }
+}
+
+fn norm_str(n: crate::cep_oracle::NormType) -> &'static str {
+    use crate::cep_oracle::NormType::*;
+    match n {
+        LayerNorm => "layernorm",
+        RmsNorm => "rmsnorm",
+    }
+}
+
+#[derive(Serialize)]
+struct SpecDto {
+    d_model: u32,
+    n_layers: u32,
+    n_heads: Vec<u32>,
+    n_kv_heads: Vec<u32>,
+    head_dim: u32,
+    d_ff: Vec<u32>,
+    activation: &'static str,
+    norm: &'static str,
+    vocab: u32,
+}
+
+impl SpecDto {
+    fn from_spec(s: &ModelSpec) -> Self {
+        SpecDto {
+            d_model: s.d_model,
+            n_layers: s.n_layers,
+            n_heads: s.n_heads.clone(),
+            n_kv_heads: s.n_kv_heads.clone(),
+            head_dim: s.head_dim.first().copied().unwrap_or(0),
+            d_ff: s.d_ff.clone(),
+            activation: activation_str(s.activation),
+            norm: norm_str(s.norm),
+            vocab: s.vocab,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct BaselineProfileDto {
+    total_flops: u64,
+    param_bytes: u64,
+    peak_memory_bytes: u64,
+    estimated_latency_us: f64,
+}
+
+#[derive(Serialize)]
+struct ChosenProfileDto {
+    param_bytes: u64,
+    peak_memory_bytes: u64,
+    estimated_latency_us: f64,
+    roofline_utilization: f64,
+}
+
+#[derive(Serialize)]
+struct LayerDeltaDto {
+    layer: u32,
+    pruned_heads: Vec<u32>,
+    new_d_ff: Option<u32>,
+    drop_layer: bool,
+}
+
+#[derive(Serialize)]
+struct ChosenDto {
+    spec: SpecDto,
+    profile: ChosenProfileDto,
+}
+
+#[derive(Serialize)]
+struct PruneDeltaBody {
+    per_layer: Vec<LayerDeltaDto>,
+}
+
+#[derive(Serialize)]
+struct PruneDeltaDoc {
+    cep_version: u32,
+    mode: &'static str,
+    target: String,
+    baseline_profile: BaselineProfileDto,
+    chosen: ChosenDto,
+    delta: PruneDeltaBody,
+}
+
+/// Serialize the prune delta — the Option-2 input contract.
+pub fn write_prune_delta(plan: &CepPlan, baseline: &ModelSpec, path: &Path) -> std::io::Result<()> {
+    let chosen = plan.outcome.chosen.as_ref();
+    let chosen_spec = chosen.map(|c| &c.spec);
+
+    let mut per_layer: Vec<LayerDeltaDto> = (0..baseline.n_layers)
+        .map(|l| LayerDeltaDto {
+            layer: l,
+            pruned_heads: Vec::new(),
+            new_d_ff: None,
+            drop_layer: false,
+        })
+        .collect();
+    for step in &plan.outcome.prune_log {
+        if step.accepted && step.kind == "head" {
+            if let (Some(h), Some(slot)) = (step.head, per_layer.get_mut(step.layer as usize)) {
+                slot.pruned_heads.push(h);
+            }
+        }
+    }
+    if let Some(cs) = chosen_spec {
+        for l in 0..baseline.n_layers as usize {
+            if cs.d_ff.get(l).copied().unwrap_or(0) < baseline.d_ff[l] {
+                per_layer[l].new_d_ff = Some(cs.d_ff[l]);
+            }
+        }
+    }
+
+    let bp = plan.outcome.baseline.as_ref();
+    let doc = PruneDeltaDoc {
+        cep_version: CEP_DELTA_VERSION,
+        mode: "prune",
+        target: plan.target_gpu.clone(),
+        baseline_profile: BaselineProfileDto {
+            total_flops: bp.map(|p| p.total_flops).unwrap_or(0),
+            param_bytes: bp.map(|p| p.param_bytes).unwrap_or(0),
+            peak_memory_bytes: bp.map(|p| p.peak_memory_bytes).unwrap_or(0),
+            estimated_latency_us: bp.map(|p| p.estimated_latency_us).unwrap_or(0.0),
+        },
+        chosen: ChosenDto {
+            spec: SpecDto::from_spec(chosen_spec.unwrap_or(baseline)),
+            profile: ChosenProfileDto {
+                param_bytes: chosen.map(|c| c.profile.param_bytes).unwrap_or(0),
+                peak_memory_bytes: chosen.map(|c| c.profile.peak_memory_bytes).unwrap_or(0),
+                estimated_latency_us: chosen.map(|c| c.profile.estimated_latency_us).unwrap_or(0.0),
+                roofline_utilization: chosen.map(|c| c.profile.roofline_utilization).unwrap_or(0.0),
+            },
+        },
+        delta: PruneDeltaBody { per_layer },
+    };
+    let json = serde_json::to_string_pretty(&doc)?;
+    std::fs::write(path, json)
+}
+
+#[derive(Serialize)]
+struct CandidateDto {
+    spec: SpecDto,
+    profile: ChosenProfileDto,
+    score: f64,
+    feasible: bool,
+}
+
+#[derive(Serialize)]
+struct SearchDoc {
+    cep_version: u32,
+    mode: &'static str,
+    target: String,
+    baseline_profile: Option<BaselineProfileDto>,
+    ranked_candidates: Vec<CandidateDto>,
+}
+
+/// Serialize the search result (mode "search" with ranked_candidates).
+pub fn write_search_delta(plan: &CepPlan, path: &Path) -> std::io::Result<()> {
+    let ranked = plan
+        .outcome
+        .ranked_candidates
+        .iter()
+        .take(10)
+        .map(|c| CandidateDto {
+            spec: SpecDto::from_spec(&c.spec),
+            profile: ChosenProfileDto {
+                param_bytes: c.profile.param_bytes,
+                peak_memory_bytes: c.profile.peak_memory_bytes,
+                estimated_latency_us: c.profile.estimated_latency_us,
+                roofline_utilization: c.profile.roofline_utilization,
+            },
+            score: c.score,
+            feasible: c.feasible,
+        })
+        .collect();
+    let doc = SearchDoc {
+        cep_version: CEP_DELTA_VERSION,
+        mode: "search",
+        target: plan.target_gpu.clone(),
+        baseline_profile: plan.outcome.baseline.as_ref().map(|p| BaselineProfileDto {
+            total_flops: p.total_flops,
+            param_bytes: p.param_bytes,
+            peak_memory_bytes: p.peak_memory_bytes,
+            estimated_latency_us: p.estimated_latency_us,
+        }),
+        ranked_candidates: ranked,
+    };
+    let json = serde_json::to_string_pretty(&doc)?;
+    std::fs::write(path, json)
 }
 
 // ---------------------------------------------------------------------------
@@ -576,5 +783,58 @@ mod bridge_tests {
         cfg.preserve = vec!["blocks.0.attn".to_string()];
         let err = build_prune_input(&cfg, spec(), None, "H100-SXM", None).unwrap_err();
         assert!(matches!(err, CepBridgeError::BadPreserve(_)));
+    }
+
+    use std::io::Read;
+
+    #[test]
+    fn write_prune_delta_emits_versioned_json() {
+        let baseline = spec();
+        let cfg = prune_cfg();
+        let input = build_prune_input(&cfg, baseline.clone(), None, "H100-SXM", Some(0.2)).expect("input");
+        let plan = run_prune(input);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("model.cep.json");
+        write_prune_delta(&plan, &baseline, &path).expect("write");
+
+        let mut s = String::new();
+        std::fs::File::open(&path).unwrap().read_to_string(&mut s).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["cep_version"], 1);
+        assert_eq!(v["mode"], "prune");
+        assert_eq!(v["target"], "H100-SXM");
+        assert!(v["baseline_profile"]["param_bytes"].is_number());
+        assert!(v["chosen"]["spec"]["d_model"].is_number());
+        assert!(v["chosen"]["spec"]["activation"].is_string());
+        assert!(v["delta"]["per_layer"].is_array());
+        assert_eq!(v["delta"]["per_layer"].as_array().unwrap().len(), baseline.n_layers as usize);
+    }
+
+    #[test]
+    fn write_search_delta_emits_ranked_candidates() {
+        use crate::cep_rewrite::SearchAxes;
+        let axes = SearchAxes {
+            d_model: vec![256, 384], n_layers: vec![4], n_heads: vec![4, 8],
+            n_kv_heads: vec![2], d_ff: vec![512, 1024],
+            activation: vec![crate::cep_oracle::Activation::SwiGlu],
+            norm: vec![crate::cep_oracle::NormType::RmsNorm],
+            vocab: 4096, head_dim: 64, max_seq: 2048, batch: 1, dtype_bytes: 4,
+        };
+        let scfg = nsl_semantic::cep::CepSearchConfig {
+            target: None,
+            objective: nsl_semantic::cep::NasObjective::ParamEfficiency,
+            constraints: Default::default(),
+            span: nsl_errors::Span::DUMMY,
+        };
+        let input = build_search_input(&scfg, axes, "H100-SXM").expect("input");
+        let plan = run_search(input);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.cep.json");
+        write_search_delta(&plan, &path).expect("write");
+        let s = std::fs::read_to_string(&path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["mode"], "search");
+        assert!(v["ranked_candidates"].is_array());
     }
 }
