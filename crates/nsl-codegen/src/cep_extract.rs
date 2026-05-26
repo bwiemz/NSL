@@ -11,6 +11,7 @@ use nsl_ast::{Module, Symbol};
 
 use crate::cep_oracle::{Activation, ModelSpec, NormType};
 use crate::cep_rewrite::SearchAxes;
+use crate::weight_aware::WeightMap;
 
 /// Recognizer refusals — each names what was expected vs. what was found.
 #[derive(Debug, Clone, PartialEq)]
@@ -494,10 +495,159 @@ pub fn extract_search_axes(module: &Module, resolve: Resolve) -> Result<SearchAx
     Ok(axes)
 }
 
+/// Mutual-consistency disagreement between AST-extracted dims and weight shapes.
+/// Names the disagreement, not the culprit.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CepCrossCheckError {
+    pub tensor: String,
+    pub expected: String,
+    pub found: String,
+}
+
+impl std::fmt::Display for CepCrossCheckError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "CEP: model source and weights disagree\n  tensor:   {}\n  expected: {}\n  found:    {}\n  (cannot tell which side is wrong — check the model source AND the weights file)",
+            self.tensor, self.expected, self.found
+        )
+    }
+}
+
+/// True if `shape` matches `[a, b]` in either orientation.
+fn dims_match(shape: &[usize], a: u32, b: u32) -> bool {
+    shape.len() == 2
+        && ((shape[0] as u32 == a && shape[1] as u32 == b)
+            || (shape[0] as u32 == b && shape[1] as u32 == a))
+}
+
+/// Cross-check extracted dims against actual tensor shapes for the attention +
+/// FFN tensors only. The embedding is excluded (vocab is fixed/legitimately
+/// padded — DR-8). Returns the first disagreement.
+pub fn cross_check_dims(
+    spec: &ModelSpec,
+    wm: &WeightMap,
+    _resolve: Resolve,
+) -> Result<(), CepCrossCheckError> {
+    let mut checked = 0usize;
+    for l in 0..spec.n_layers as usize {
+        let q_proj = spec.n_heads[l] * spec.head_dim[l];
+        let kv_proj = spec.n_kv_heads[l] * spec.head_dim[l];
+        let d_ff = spec.d_ff[l];
+        let dm = spec.d_model;
+
+        let checks: [(String, u32, String); 5] = [
+            (format!("blocks.{l}.attn.wq"), q_proj, format!("n_heads·head_dim = {q_proj}")),
+            (format!("blocks.{l}.attn.wk"), kv_proj, format!("n_kv_heads·head_dim = {kv_proj}")),
+            (format!("blocks.{l}.attn.wv"), kv_proj, format!("n_kv_heads·head_dim = {kv_proj}")),
+            (format!("blocks.{l}.ffn.w_gate"), d_ff, format!("d_ff = {d_ff}")),
+            (format!("blocks.{l}.ffn.w_up"), d_ff, format!("d_ff = {d_ff}")),
+        ];
+        for (name, other, label) in checks {
+            let Some(entry) = wm.get(&name) else { continue };
+            checked += 1;
+            if !dims_match(&entry.shape, dm, other) {
+                return Err(CepCrossCheckError {
+                    tensor: name,
+                    expected: format!(
+                        "{label} (with d_model = {dm}) from GroupedQueryAttention/SwiGLUFFN args"
+                    ),
+                    found: format!("weight shape {:?}", entry.shape),
+                });
+            }
+        }
+    }
+    if checked == 0 {
+        return Err(CepCrossCheckError {
+            tensor: "blocks.0.attn.wq".to_string(),
+            expected: "tensors named blocks.N.attn.* / blocks.N.ffn.*".to_string(),
+            found: "no tensors matching the model's attention/FFN naming convention".to_string(),
+        });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::cep_oracle::{Activation, NormType};
+    use crate::weight_aware::WeightMap;
+
+    // Write a minimal safetensors file with the given named f32 tensors (zero data).
+    fn write_safetensors(path: &std::path::Path, tensors: &[(String, Vec<usize>)]) {
+        use safetensors::tensor::TensorView;
+        use safetensors::Dtype;
+        use std::collections::HashMap as StdHashMap;
+        let owned: Vec<(String, Vec<usize>, Vec<u8>)> = tensors
+            .iter()
+            .map(|(n, s)| {
+                let len: usize = s.iter().product();
+                (n.clone(), s.clone(), vec![0u8; len * 4])
+            })
+            .collect();
+        let views: StdHashMap<String, TensorView<'_>> = owned
+            .iter()
+            .map(|(n, s, d)| {
+                (n.clone(), TensorView::new(Dtype::F32, s.clone(), d).unwrap())
+            })
+            .collect();
+        let bytes = safetensors::tensor::serialize(&views, &None).unwrap();
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    fn canonical_spec() -> ModelSpec {
+        ModelSpec {
+            d_model: 384,
+            n_layers: 6,
+            n_heads: vec![6; 6],
+            n_kv_heads: vec![3; 6],
+            head_dim: vec![64; 6],
+            d_ff: vec![1024; 6],
+            vocab: 4096,
+            max_seq: 2048,
+            batch: 1,
+            activation: Activation::SwiGlu,
+            norm: NormType::RmsNorm,
+            dtype_bytes: 4,
+        }
+    }
+
+    fn matching_tensors() -> Vec<(String, Vec<usize>)> {
+        let mut t = Vec::new();
+        for l in 0..6 {
+            t.push((format!("blocks.{l}.attn.wq"), vec![384, 384])); // n_heads*head_dim = 384
+            t.push((format!("blocks.{l}.attn.wk"), vec![384, 192])); // n_kv_heads*head_dim = 192
+            t.push((format!("blocks.{l}.attn.wv"), vec![384, 192]));
+            t.push((format!("blocks.{l}.ffn.w_gate"), vec![384, 1024]));
+            t.push((format!("blocks.{l}.ffn.w_up"), vec![384, 1024]));
+        }
+        t.push(("embed".to_string(), vec![4224, 384])); // padded vocab — must NOT be flagged
+        t
+    }
+
+    #[test]
+    fn cross_check_matching_weights_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("w.safetensors");
+        write_safetensors(&path, &matching_tensors());
+        let wm = WeightMap::load(&path).unwrap();
+        let resolve = |_s: nsl_ast::Symbol| String::new();
+        assert!(cross_check_dims(&canonical_spec(), &wm, &resolve).is_ok());
+    }
+
+    #[test]
+    fn cross_check_wrong_wq_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("w.safetensors");
+        let mut t = matching_tensors();
+        t[0].1 = vec![384, 768]; // blocks.0.attn.wq disagrees (768 != 384)
+        write_safetensors(&path, &t);
+        let wm = WeightMap::load(&path).unwrap();
+        let resolve = |_s: nsl_ast::Symbol| String::new();
+        let err = cross_check_dims(&canonical_spec(), &wm, &resolve).unwrap_err();
+        assert_eq!(err.tensor, "blocks.0.attn.wq");
+        assert!(err.to_string().contains("disagree"));
+    }
 
     fn parse(src: &str) -> (nsl_ast::Module, nsl_lexer::Interner) {
         let mut interner = nsl_lexer::Interner::new();
