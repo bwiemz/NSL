@@ -26,6 +26,14 @@ use super::{
 #[no_mangle]
 pub extern "C" fn nsl_tensor_cast(src_ptr: i64, target_dtype: i64) -> i64 {
     let t = unsafe { &*(src_ptr as *const NslTensor) };
+    // v1 is CPU-only: `t.data` is dereferenced as a host pointer below. A GPU
+    // tensor (device > 0) would be silent UB. Fail loudly instead. GPU support
+    // (host round-trip / on-device conversion) is the Task 15 / v2 boundary.
+    assert_eq!(
+        t.device, 0,
+        "nsl_tensor_cast: GPU tensors not supported in v1 (device={})",
+        t.device
+    );
     let len = t.len as usize;
     let target = target_dtype as u16;
 
@@ -65,6 +73,11 @@ pub extern "C" fn nsl_tensor_cast(src_ptr: i64, target_dtype: i64) -> i64 {
     let out = Box::new(NslTensor::new(
         data, shape, strides, t.ndim, t.len, t.device, target, 1, 0,
     ));
+    // Bare `Box::into_raw` — NOT `NslTensor::publish`. The caller owns the
+    // result and frees it explicitly (the FASE optimizer wrapping frees the
+    // dequant/quant working tensors each step). `publish` would `scope_track`
+    // the pointer; combined with the caller's explicit `nsl_tensor_free`, the
+    // scope-end sweep would touch an already-freed tensor (use-after-free).
     Box::into_raw(out) as i64
 }
 
@@ -112,6 +125,9 @@ mod tests {
                 expected
             );
         }
+        crate::tensor::nsl_tensor_free(src);
+        crate::tensor::nsl_tensor_free(fp16);
+        crate::tensor::nsl_tensor_free(back);
     }
 
     #[test]
@@ -121,6 +137,8 @@ mod tests {
         let out = nsl_tensor_cast(src, DTYPE_F32 as i64);
         let got = read_f32(out);
         assert_eq!(got, vals.to_vec(), "F32->F32 cast must preserve bits");
+        crate::tensor::nsl_tensor_free(src);
+        crate::tensor::nsl_tensor_free(out);
     }
 
     /// Negative control: verify that the crate primitive `f32_to_f16_bits` produces
@@ -171,5 +189,9 @@ mod tests {
             bits_lo, bits_hi,
             "cast must be faithful to f32_to_f16_bits: both values land in same f16 bucket"
         );
+        crate::tensor::nsl_tensor_free(src_lo);
+        crate::tensor::nsl_tensor_free(src_hi);
+        crate::tensor::nsl_tensor_free(fp16_lo);
+        crate::tensor::nsl_tensor_free(fp16_hi);
     }
 }
