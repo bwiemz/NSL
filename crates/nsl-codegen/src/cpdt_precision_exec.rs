@@ -56,15 +56,38 @@ pub fn build_dtype_lists(plan: &PrecisionPlan, param_paths: &[String]) -> (Vec<u
 }
 
 /// True when v1 precision-adaptive optimizer execution should activate.
-/// All four conditions are required (design doc §6): CPDT Full mode, a
-/// non-empty precision plan, weights present, and FASE Deferred mode.
+///
+/// Five conditions are required (design doc §6): CPDT Full mode, a non-empty
+/// precision plan, weights present, FASE Deferred mode, AND `wrapped_path_active`.
+///
+/// `wrapped_path_active` is load-bearing for correctness. The FASE final-step
+/// cast wrapping (dequant FP16->F32, run update, quant F32->FP16) is emitted
+/// ONLY on the non-unified-dispatch Deferred branch (`stmt.rs`, the
+/// `else if fase_deferred` arm). When WGGO is active, the optimizer step is
+/// emitted by `emit_unified_optim_step_dispatch`, which does NOT wrap — so
+/// allocating m/v at FP16 there would feed FP16 buffers to an unwrapped FP32
+/// update and SILENTLY CORRUPT optimizer state (the intermediates would run at
+/// FP16 storage precision). The caller passes `wrapped_path_active =
+/// wggo_overrides.is_none()` so FP16 is allocated only where the wrapping runs.
+///
+/// v1 consequence: a CPDT precision plan only exists when WGGO ran (its sole
+/// builder is gated on `wggo_applied`), and WGGO ⇒ the unified dispatch ⇒
+/// `wrapped_path_active == false`. So this gate is currently never satisfied at
+/// runtime — FP16 allocation is inert-but-SAFE. Activating it end-to-end is a
+/// documented follow-on: thread the wrap through `emit_unified_optim_step_dispatch`,
+/// fix the source-AD crash, and expose `--wggo` on `nsl run`.
 pub fn precision_active(
     cpdt_mode_is_full: bool,
     has_precision_plan: bool,
     weights_present: bool,
     fase_mode_is_deferred: bool,
+    wrapped_path_active: bool,
 ) -> bool {
-    cpdt_mode_is_full && has_precision_plan && weights_present && fase_mode_is_deferred
+    cpdt_mode_is_full
+        && has_precision_plan
+        && weights_present
+        && fase_mode_is_deferred
+        && wrapped_path_active
 }
 
 #[cfg(test)]
@@ -114,11 +137,12 @@ mod tests {
     }
 
     #[test]
-    fn gate_requires_all_four_conditions() {
-        assert!(precision_active(true, true, true, true));
-        assert!(!precision_active(true, true, true, false));
-        assert!(!precision_active(false, true, true, true));
-        assert!(!precision_active(true, false, true, true));
-        assert!(!precision_active(true, true, false, true));
+    fn gate_requires_all_five_conditions() {
+        assert!(precision_active(true, true, true, true, true));
+        assert!(!precision_active(true, true, true, true, false)); // wrapped path inactive (e.g. WGGO unified dispatch)
+        assert!(!precision_active(true, true, true, false, true)); // not Deferred
+        assert!(!precision_active(false, true, true, true, true)); // not Full
+        assert!(!precision_active(true, false, true, true, true)); // empty plan
+        assert!(!precision_active(true, true, false, true, true)); // no weights
     }
 }

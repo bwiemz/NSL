@@ -3526,6 +3526,11 @@ impl Compiler<'_> {
         // mutably) run. No `unsafe`, no tensor clones.
         let cpdt_precision_dtypes: Option<(Value, Value)> = {
             let dtype_data: Option<(Vec<u16>, Vec<u16>)> = {
+                // The FASE cast wrapping is emitted only on the non-unified-dispatch
+                // Deferred branch, which runs iff WGGO is inactive. Allocating FP16
+                // m/v on the unified-dispatch (WGGO) path would feed FP16 buffers to
+                // an unwrapped FP32 update → silent corruption. Gate on it.
+                let wrapped_path_active = self.wggo_overrides.is_none();
                 let plan = self.cpdt_plan.as_ref();
                 let active = plan
                     .map(|p| {
@@ -3534,6 +3539,7 @@ impl Compiler<'_> {
                             !p.precision.params.is_empty(),
                             true, // weights_present is implied by a non-empty precision plan
                             fase_deferred,
+                            wrapped_path_active,
                         )
                     })
                     .unwrap_or(false);

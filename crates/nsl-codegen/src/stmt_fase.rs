@@ -77,11 +77,12 @@ impl Compiler<'_> {
         // original (possibly FP16) buffers. F32 storage casts are identity copies,
         // so FP32-tier params are value-bit-identical. theta/m_partial unwrapped.
         //
-        // Defensive guard: only wrap when m_ptr and v_ptr are DISTINCT buffers.
-        // The SGD path passes v == m as a placeholder (no v state); wrapping it
-        // would double-cast the same pointer. The activation gate already
-        // restricts wrap_precision=true to AdamW (2 distinct state buffers), so
-        // this guard is belt-and-suspenders, never expected to fire for SGD.
+        // Guard: only wrap when m_ptr and v_ptr are DISTINCT buffers. The SGD
+        // path passes v == m as a placeholder (no v state); wrapping it would
+        // double-cast the same pointer. This runtime check is the actual SGD
+        // discriminator — the `precision_active` gate does NOT inspect optimizer
+        // arity, so this guard (not the gate) is what makes single-state
+        // optimizers safe if a caller ever passes wrap_precision=true for one.
         let wrap_precision = wrap_precision && m_ptr != v_ptr;
         let orig_m_ptr = m_ptr;
         let orig_v_ptr = v_ptr;
@@ -861,9 +862,14 @@ impl Compiler<'_> {
                     &[m_partial, cf],
                 )?;
             }
-            // CPDT precision wrapping is driven by the train-block dispatcher
-            // (which owns `cpdt_precision_dtypes`); this unified-dispatch helper
-            // is dead_code and not yet wired to it, so wrap_precision=false.
+            // CPDT precision wrapping is NOT applied on this unified-dispatch path
+            // (the WGGO path, live via stmt.rs's `if let Some(mtb) = mode_table_base`).
+            // wrap_precision=false here is SAFE because the FP16-allocation gate
+            // (`precision_active`) requires `wrapped_path_active = wggo_overrides.is_none()`,
+            // so when WGGO routes here the gate refuses FP16 allocation and m/v stay
+            // FP32 — no FP16 buffer ever reaches this unwrapped update. Threading the
+            // wrap through here (to let CPDT precision activate on the WGGO path) is a
+            // documented follow-on; see cpdt_precision_exec::precision_active.
             self.fase_emit_final_step(
                 builder,
                 theta,
