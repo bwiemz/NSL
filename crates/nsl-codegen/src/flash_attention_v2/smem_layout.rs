@@ -1126,16 +1126,70 @@ pub fn tier_b2_dq_total_smem_bytes(config: &FlashAttentionConfig) -> u32 {
     tier_b2_dq_k_colmajor_offset(config) + tier_b2_dq_k_colmajor_bytes(config)
 }
 
-// Phase 3 dK/dV-kernel SMEM offset stubs — return 0 for now, filled in
-// when the dK/dV-kernel lands. Declared here for forward-compat so callers
-// can reference them without a Phase 3 stub PR.
+// Phase 3 dK/dV-kernel SMEM layout accessors.
+//
+// Layout (low → high address, all f16 = 2 bytes/element):
+//   [Q row-major]    eb * hd * 2
+//   [K row-major]    eb * hd * 2
+//   [V row-major]    eb * hd * 2
+//   [dO row-major]   eb * hd * 2
+//   [Wk chunk]       CHUNK * hd * 2
+//   [Wv chunk]       CHUNK * hd * 2
+//   [x_q chunk]      eb * CHUNK * 2
+//   [x_kv chunk]     eb * CHUNK * 2
+//   [Q col-major]    eb * hd * 2
+//   [dO col-major]   eb * hd * 2
+//   [P col-major]    eb * eb * 2   (attention weight tile, A-operand scatter)
+//   [dS col-major]   eb * eb * 2   (softmax grad tile)
+//
+// Total = 4*eb*hd*2 + 2*CHUNK*hd*2 + 2*eb*CHUNK*2 + 2*eb*hd*2 + 2*eb*eb*2
+//       = 12*eb*hd + 4*eb^2 + 16*hd + 16*eb   (bytes, with CHUNK=4)
+
+// Row-major tiles (mirror tier_b2_dq_* chain).
 pub fn tier_b2_dkdv_q_offset(_config: &FlashAttentionConfig) -> u32 { 0 }
-pub fn tier_b2_dkdv_k_offset(_config: &FlashAttentionConfig) -> u32 { 0 }
-pub fn tier_b2_dkdv_v_offset(_config: &FlashAttentionConfig) -> u32 { 0 }
+pub fn tier_b2_dkdv_k_offset(config: &FlashAttentionConfig) -> u32 {
+    tier_b2_effective_bq(config) * config.head_dim as u32 * 2
+}
+pub fn tier_b2_dkdv_v_offset(config: &FlashAttentionConfig) -> u32 {
+    tier_b2_dkdv_k_offset(config) + tier_b2_effective_bkv(config) * config.head_dim as u32 * 2
+}
 #[allow(non_snake_case)]
-pub fn tier_b2_dkdv_dO_offset(_config: &FlashAttentionConfig) -> u32 { 0 }
-pub fn tier_b2_dkdv_ds_offset(_config: &FlashAttentionConfig) -> u32 { 0 }
-pub fn tier_b2_dkdv_total_smem_bytes(_config: &FlashAttentionConfig) -> u32 { 0 }
+pub fn tier_b2_dkdv_dO_offset(config: &FlashAttentionConfig) -> u32 {
+    tier_b2_dkdv_v_offset(config) + tier_b2_effective_bkv(config) * config.head_dim as u32 * 2
+}
+// Chunk staging (mirror dQ's Wk/Wv/x_q/x_kv, base = after dO).
+pub fn tier_b2_dkdv_wk_chunk_offset(config: &FlashAttentionConfig) -> u32 {
+    tier_b2_dkdv_dO_offset(config) + tier_b2_effective_bq(config) * config.head_dim as u32 * 2
+}
+pub fn tier_b2_dkdv_wv_chunk_offset(config: &FlashAttentionConfig) -> u32 {
+    tier_b2_dkdv_wk_chunk_offset(config) + TIER_B2_RMSNORM_CHUNK * config.head_dim as u32 * 2
+}
+pub fn tier_b2_dkdv_x_q_chunk_offset(config: &FlashAttentionConfig) -> u32 {
+    tier_b2_dkdv_wv_chunk_offset(config) + TIER_B2_RMSNORM_CHUNK * config.head_dim as u32 * 2
+}
+pub fn tier_b2_dkdv_x_kv_chunk_offset(config: &FlashAttentionConfig) -> u32 {
+    tier_b2_dkdv_x_q_chunk_offset(config) + tier_b2_effective_bq(config) * TIER_B2_RMSNORM_CHUNK * 2
+}
+// Col-major B-operand re-stage bands ([hd, eb] f16, col_stride eb*2).
+pub fn tier_b2_dkdv_q_colmajor_offset(config: &FlashAttentionConfig) -> u32 {
+    tier_b2_dkdv_x_kv_chunk_offset(config) + tier_b2_effective_bkv(config) * TIER_B2_RMSNORM_CHUNK * 2
+}
+#[allow(non_snake_case)]
+pub fn tier_b2_dkdv_dO_colmajor_offset(config: &FlashAttentionConfig) -> u32 {
+    tier_b2_dkdv_q_colmajor_offset(config) + tier_b2_effective_bq(config) * config.head_dim as u32 * 2
+}
+// Col-major A-operand scatter bands ([ek, eb] viewed row-major = P^T/dS^T, f16).
+pub fn tier_b2_dkdv_p_colmajor_offset(config: &FlashAttentionConfig) -> u32 {
+    tier_b2_dkdv_dO_colmajor_offset(config) + tier_b2_effective_bq(config) * config.head_dim as u32 * 2
+}
+pub fn tier_b2_dkdv_ds_colmajor_offset(config: &FlashAttentionConfig) -> u32 {
+    tier_b2_dkdv_p_colmajor_offset(config)
+        + tier_b2_effective_bq(config) * tier_b2_effective_bkv(config) * 2
+}
+pub fn tier_b2_dkdv_total_smem_bytes(config: &FlashAttentionConfig) -> u32 {
+    tier_b2_dkdv_ds_colmajor_offset(config)
+        + tier_b2_effective_bq(config) * tier_b2_effective_bkv(config) * 2
+}
 
 #[cfg(test)]
 mod tier_b2_dq_offset_tests {
@@ -1278,5 +1332,58 @@ mod tier_b2_dq_offset_tests {
             assert!(tier_b2_dq_total_smem_bytes(&cfg) <= SMEM_DYNAMIC_BUDGET_BYTES,
                 "hd={hd}: total SMEM exceeds 99 KB budget");
         }
+    }
+
+    // === dK/dV-kernel SMEM layout (Phase 3a Task 1) ===
+
+    #[test]
+    fn tier_b2_dkdv_total_matches_spec_schedule() {
+        // (head_dim, requested bq=bkv, expected total bytes) per spec section 3.2.
+        // Totals = 12*b*hd + 4*b^2 + 16*hd + 16*b at effective_bq.
+        let cases = [
+            (32i64, 32i64, 17408u32),  // smoke
+            (32, 64, 42496),           // sweep
+            (64, 64, 67584),           // no fallback
+            (128, 64, 55808),          // effective bq=32 fallback
+        ];
+        for (hd, bq, expected) in cases {
+            let mut cfg = canonical_hd128_cfg();
+            cfg.head_dim = hd;
+            cfg.block_q = bq;
+            cfg.block_kv = bq;
+            assert_eq!(tier_b2_dkdv_total_smem_bytes(&cfg), expected,
+                "dK/dV total SMEM at hd={} bq={}", hd, bq);
+        }
+    }
+
+    #[test]
+    fn tier_b2_dkdv_total_under_budget_at_all_in_scope_hd() {
+        for &hd in &[32i64, 64, 128] {
+            let mut cfg = canonical_hd128_cfg();
+            cfg.head_dim = hd;
+            cfg.block_q = 64;
+            cfg.block_kv = 64;
+            assert!(tier_b2_dkdv_total_smem_bytes(&cfg) <= SMEM_DYNAMIC_BUDGET_BYTES,
+                "hd={} dK/dV SMEM over 99 KB cap", hd);
+        }
+    }
+
+    #[test]
+    fn tier_b2_dkdv_bands_are_non_overlapping_and_ordered() {
+        let cfg = canonical_hd128_cfg(); // hd=128 -> effective bq=bkv=32
+        let eb = tier_b2_effective_bq(&cfg);
+        let hd = cfg.head_dim as u32;
+        assert_eq!(tier_b2_dkdv_q_offset(&cfg), 0);
+        assert_eq!(tier_b2_dkdv_k_offset(&cfg), eb * hd * 2);
+        assert_eq!(tier_b2_dkdv_v_offset(&cfg), 2 * eb * hd * 2);
+        assert_eq!(tier_b2_dkdv_dO_offset(&cfg), 3 * eb * hd * 2);
+        let q_col = tier_b2_dkdv_q_colmajor_offset(&cfg);
+        let do_col = tier_b2_dkdv_dO_colmajor_offset(&cfg);
+        let p_col = tier_b2_dkdv_p_colmajor_offset(&cfg);
+        let ds_col = tier_b2_dkdv_ds_colmajor_offset(&cfg);
+        assert!(q_col < do_col && do_col < p_col && p_col < ds_col,
+            "col bands must be strictly ordered: q={q_col} dO={do_col} p={p_col} ds={ds_col}");
+        assert!(ds_col + eb * eb * 2 <= tier_b2_dkdv_total_smem_bytes(&cfg),
+            "last col band must fit within total");
     }
 }
