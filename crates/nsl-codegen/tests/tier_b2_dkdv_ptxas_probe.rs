@@ -106,6 +106,17 @@ fn dkdv_kernel_contains_qkt_mma_and_tile_skip() {
 }
 
 #[test]
+fn dkdv_kernel_contains_dp_mma_and_ds_combine() {
+    let ptx = synthesize_dkdv_kernel(&cfg(64, 64)).expect("synth ok");
+    let mma_count = ptx.matches("mma.sync.aligned.m16n8k16").count();
+    assert!(mma_count >= 2, "expected >=2 MMAs after dP, got {mma_count}");
+    assert!(ptx.contains("// === dS = P * (dP - D)"), "dS combine present");
+    // The 1/sqrt(D) scale must be applied to dS (the fresh-branch fix).
+    assert!(ptx.contains("mul.f32 %ds_0, %ds_0, %f_scale"),
+        "dS must carry the 1/sqrt(D) f_scale factor");
+}
+
+#[test]
 fn dkdv_kernel_ptxas_clean_sm80() {
     let Some(ptxas) = find_ptxas() else {
         eprintln!("SKIP: ptxas not on PATH");

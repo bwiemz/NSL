@@ -168,6 +168,11 @@ fn emit_register_decls(ptx: &mut String, config: &FlashAttentionConfig) {
     ptx.push_str("    .reg .u32 %g2_d_tmp;\n");
     ptx.push_str("    .reg .u64 %g2_dk_byte_off, %g2_dk_addr;\n");
     ptx.push_str("    .reg .u64 %g2_dk_base;\n");
+    // dP MMA fragment registers (Task 5). All .reg directives must precede executable instructions.
+    ptx.push_str("    .reg .b32 %dp_a0, %dp_a1, %dp_a2, %dp_a3, %dp_b0, %dp_b1;\n");
+    ptx.push_str("    .reg .f32 %dp_c0, %dp_c1, %dp_c2, %dp_c3, %dp_d0, %dp_d1, %dp_d2, %dp_d3;\n");
+    // dS scalars (Task 5): dS_i = (1/sqrt(D)) * P_i * (dP_i - D[q]).
+    ptx.push_str("    .reg .f32 %ds_0, %ds_1, %ds_2, %ds_3;\n");
     // dV accumulators: hd/8 contiguous n-tiles x 4 f32/lane (Task 5 fills MMA; zeroed here).
     let n_acc = (config.head_dim / 8) as u32;
     for n in 0..n_acc {
@@ -775,6 +780,82 @@ fn emit_s_matmul_tiled(
     }
 }
 
+/// Emit the codegen-unrolled k-tile contraction for dP = dO @ V^T for ONE runtime
+/// n_tile (the kv-column tile selected by the live `%n_tile` register).
+///
+/// Mirrors `emit_s_matmul_tiled` for the dK/dV layout:
+///   - A = dO  (A-base: `tier_b2_dkdv_dO_offset`, `%band_row_base` q-row offset)
+///   - B = V   (B-base: `tier_b2_dkdv_v_offset`, runtime `%n_tile` kv-column offset)
+///   - row-major V byte-aliases V^T with col_stride = hd*2
+///
+/// Bug-fix invariants preserved from dq:
+///   1. Both `%a_base` and `%b_base` get `add.u32 ..., %mma_smem_base;` (the cvta'd
+///      shared base computed once in grid setup). A raw byte offset would read
+///      uninitialized SMEM.
+///   2. row_stride = hd*2 for both A (dO rows) and B (V^T cols).
+///   3. n_k_tiles = hd/16 (contraction over head_dim in 16-wide k-tiles).
+#[allow(non_snake_case)]
+fn emit_dp_matmul_tiled(
+    ptx: &mut String,
+    config: &FlashAttentionConfig,
+    a_regs: &[String; 4],
+    b_regs: &[String; 2],
+    c_regs: &[String; 4],
+    d_regs: &[String; 4],
+) {
+    use crate::flash_attention_v2::smem_layout::{
+        tier_b2_dkdv_dO_offset, tier_b2_dkdv_v_offset,
+    };
+    use crate::matmul_mma::{
+        emit_load_a_fragment_smem, emit_load_b_fragment_smem, emit_mma_instruction,
+    };
+    let hd = config.head_dim as u32;
+    let row_stride = (hd * 2) as usize;
+    let do_off = tier_b2_dkdv_dO_offset(config);
+    let v_off = tier_b2_dkdv_v_offset(config);
+    let n_k_tiles = hd / 16;
+    let pct4 = |r: &[String; 4]| {
+        [
+            format!("%{}", r[0]),
+            format!("%{}", r[1]),
+            format!("%{}", r[2]),
+            format!("%{}", r[3]),
+        ]
+    };
+    let pct2 = |r: &[String; 2]| [format!("%{}", r[0]), format!("%{}", r[1])];
+    for r in c_regs {
+        ptx.push_str(&format!("    mov.f32 %{r}, 0.0;\n"));
+    }
+    for k in 0..n_k_tiles {
+        // A base = cvta(shmem) + do_off + band_row_base*hd*2 + k*16*2  (dO-band rows, k-tile cols)
+        ptx.push_str(&format!(
+            "    mul.lo.u32 %a_base, %band_row_base, {};\n",
+            hd * 2
+        ));
+        ptx.push_str(&format!(
+            "    add.u32 %a_base, %a_base, {};\n",
+            do_off + k * 16 * 2
+        ));
+        ptx.push_str("    add.u32 %a_base, %a_base, %mma_smem_base;  // + cvta(shmem) base\n");
+        // B base = cvta(shmem) + v_off + n_tile*8*hd*2 + k*16*2  (V^T: kv cols via runtime %n_tile, hd k)
+        ptx.push_str(&format!(
+            "    mul.lo.u32 %b_base, %n_tile, {};\n",
+            8 * hd * 2
+        ));
+        ptx.push_str(&format!(
+            "    add.u32 %b_base, %b_base, {};\n",
+            v_off + k * 16 * 2
+        ));
+        ptx.push_str("    add.u32 %b_base, %b_base, %mma_smem_base;  // + cvta(shmem) base\n");
+        emit_load_a_fragment_smem(ptx, a_regs, "%a_base", row_stride);
+        emit_load_b_fragment_smem(ptx, b_regs, "%b_base", row_stride); // col_stride = hd*2 (row-major V byte-aliases V^T)
+        emit_mma_instruction(ptx, &pct4(d_regs), &pct4(a_regs), &pct2(b_regs), &pct4(c_regs));
+        for (c, d) in c_regs.iter().zip(d_regs.iter()) {
+            ptx.push_str(&format!("    mov.f32 %{c}, %{d};\n")); // MAC: next k accumulates onto this D
+        }
+    }
+}
+
 /// Emit the dK/dV inner-loop body: tile-skip gate, S=Q@K^T MMA, P-recompute.
 ///
 /// This is Task 4. The structure mirrors dq.rs::emit_inner_loop_body (top portion
@@ -882,7 +963,53 @@ fn emit_inner_loop_body(ptx: &mut String, config: &FlashAttentionConfig) {
     }
     ptx.push('\n');
 
-    // (Task 5: dP = dO@V^T + dS = P*(dP-D) inside the n-tile loop)
+    // === dP = dO @ V^T (tiled m16n8k16, per runtime n_tile) ===
+    ptx.push_str("    // === dP = dO @ V^T (tiled m16n8k16, k-tiles unrolled, per runtime n_tile) ===\n");
+    let dp_a_regs: [String; 4] = ["dp_a0", "dp_a1", "dp_a2", "dp_a3"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect::<Vec<_>>()
+        .try_into()
+        .unwrap();
+    let dp_b_regs: [String; 2] = ["dp_b0", "dp_b1"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect::<Vec<_>>()
+        .try_into()
+        .unwrap();
+    let dp_c_regs: [String; 4] = ["dp_c0", "dp_c1", "dp_c2", "dp_c3"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect::<Vec<_>>()
+        .try_into()
+        .unwrap();
+    let dp_d_regs: [String; 4] = ["dp_d0", "dp_d1", "dp_d2", "dp_d3"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect::<Vec<_>>()
+        .try_into()
+        .unwrap();
+    // .reg decls for the dP family are hoisted to emit_register_decls (PTX ISA).
+    emit_dp_matmul_tiled(ptx, config, &dp_a_regs, &dp_b_regs, &dp_c_regs, &dp_d_regs);
+    ptx.push('\n');
+
+    // === dS = P * (dP - D) ===
+    //
+    // dS[q,k] = (1/sqrt(D)) * P[q,k] * (dP[q,k] - D[q]).
+    // The 1/sqrt(D) factor (%f_scale) is set in the P-recompute above and still live.
+    // Omitting it makes dK ~sqrt(D)x too large.
+    // D[q] is per-row from HBM: %d_lo for elements {0,1} (row lane/4),
+    // %d_hi for elements {2,3} (row lane/4+8) — loaded by emit_stats_addr_load.
+    ptx.push_str("    // === dS = P * (dP - D) ===\n");
+    // %ds_0..3 declared in emit_register_decls (hoisted).
+    for i in 0..4 {
+        let d_row = if i < 2 { "%d_lo" } else { "%d_hi" };
+        ptx.push_str(&format!("    sub.f32 %ds_{i}, %dp_d{i}, {d_row};\n"));
+        ptx.push_str(&format!("    mul.f32 %ds_{i}, %ds_{i}, %p_{i};\n"));
+        ptx.push_str(&format!("    mul.f32 %ds_{i}, %ds_{i}, %f_scale;  // dS = (1/sqrt(D)) * P * (dP - D)\n"));
+    }
+    ptx.push('\n');
+
     // (Task 6: Q/dO re-stage for MMA-3/4)
     // (Task 7: P/dS col scatter for dV/dK MMA inputs)
     // (Task 8: MMA-3 dV_acc += P^T @ dO + MMA-4 dK_acc += dS^T @ Q, after the loop)
