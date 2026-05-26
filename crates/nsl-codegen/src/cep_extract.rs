@@ -112,7 +112,10 @@ fn collect_models<'a>(
 /// binding is a single identifier. Returns `None` for destructuring binds or
 /// declarations with no value.
 fn var_decl_name_and_init<'a>(kind: &'a StmtKind, resolve: Resolve) -> Option<(String, &'a ExprKind)> {
-    if let StmtKind::VarDecl { pattern, value, .. } = kind {
+    if let StmtKind::VarDecl { is_const, pattern, value, .. } = kind {
+        if !is_const {
+            return None;
+        }
         if let PatternKind::Ident(sym) = &pattern.kind {
             if let Some(init_expr) = value {
                 return Some((resolve(*sym), &init_expr.kind));
@@ -278,15 +281,13 @@ pub fn extract_model_spec(module: &Module, resolve: Resolve) -> Result<ModelSpec
             "`blocks` initializer is not a {block_type}(...) call"
         ))
     })?;
+    let block_arg_ctx = BindingCtx { params: HashMap::new(), consts: consts.clone() };
     let mut params = HashMap::new();
     for (i, param) in block_md.params.iter().enumerate() {
         if let Some(arg) = block_args.get(i) {
             if let Ok(v) = resolve_binding(
                 &arg.value,
-                &BindingCtx {
-                    params: HashMap::new(),
-                    consts: consts.clone(),
-                },
+                &block_arg_ctx,
                 resolve,
                 "block-param",
             ) {
@@ -807,5 +808,27 @@ model SearchNet:
         assert_eq!(axes.d_ff, vec![1024]);
         assert_eq!(axes.n_layers, vec![6]);
         assert_eq!(axes.vocab, 4096);
+    }
+
+    #[test]
+    fn refuses_unknown_search_axis() {
+        let src = r#"
+@search(bogus_axis, [1, 2, 3])
+model GroupedQueryAttention(d_model: int, n_heads: int, n_kv_heads: int, dropout_p: float):
+    wq: Tensor = randn([d_model, d_model])
+model SwiGLUFFN(d_model: int, d_ff: int, dropout_p: float):
+    w_gate: Tensor = randn([d_model, d_ff])
+model TransformerBlock(d_model: int, n_heads: int, n_kv_heads: int, d_ff: int, dropout_p: float):
+    attn: GroupedQueryAttention = GroupedQueryAttention(d_model, n_heads, n_kv_heads, dropout_p)
+    ffn: SwiGLUFFN = SwiGLUFFN(d_model, d_ff, dropout_p)
+    norm: RMSNorm = RMSNorm(d_model)
+model AxNet:
+    embed: Tensor = randn([1000, 256])
+    blocks: [TransformerBlock; 2] = TransformerBlock(256, 8, 4, 512, 0.1)
+"#;
+        let (module, interner) = parse(src);
+        let resolve = |s: nsl_ast::Symbol| interner.resolve(s.0).unwrap_or("").to_string();
+        let err = extract_search_axes(&module, &resolve).unwrap_err();
+        assert!(matches!(err, CepExtractError::UnknownSearchAxis { .. }), "got: {err}");
     }
 }

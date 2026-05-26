@@ -282,6 +282,8 @@ fn synthetic_importance(spec: &ModelSpec, slacks: &RooflineSlackTable) -> Import
 
 const CEP_DELTA_VERSION: u32 = 1;
 
+// NOTE: these emit the delta-JSON contract spelling (lowercase, no underscore),
+// intentionally distinct from cep_oracle's `as_str()` ("rms_norm"). Do not merge.
 fn activation_str(a: crate::cep_oracle::Activation) -> &'static str {
     use crate::cep_oracle::Activation::*;
     match a {
@@ -396,8 +398,10 @@ pub fn write_prune_delta(plan: &CepPlan, baseline: &ModelSpec, path: &Path) -> s
     }
     if let Some(cs) = chosen_spec {
         for l in 0..baseline.n_layers as usize {
-            if cs.d_ff.get(l).copied().unwrap_or(0) < baseline.d_ff[l] {
-                per_layer[l].new_d_ff = Some(cs.d_ff[l]);
+            if let Some(&w) = cs.d_ff.get(l) {
+                if w < baseline.d_ff[l] {
+                    per_layer[l].new_d_ff = Some(w);
+                }
             }
         }
     }

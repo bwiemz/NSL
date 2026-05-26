@@ -2714,7 +2714,7 @@ fn run_cep_prune(
     let wm = match nsl_codegen::weight_aware::WeightMap::load(weights_path) {
         Ok(w) => w,
         Err(e) => {
-            eprintln!("error: failed to load weights: {e:?}");
+            eprintln!("error: failed to load weights: {e}");
             return 1;
         }
     };
