@@ -23,6 +23,12 @@ use crate::flash_attention_v2::smem_layout::{
 };
 use crate::flash_attention_v2::tier_b2::backward::BackwardSynthError;
 
+// Bring in smem offset helpers used by the re-stage emitters (Task 6).
+use crate::flash_attention_v2::smem_layout::{
+    tier_b2_dkdv_q_offset, tier_b2_dkdv_q_colmajor_offset,
+    tier_b2_dkdv_dO_offset, tier_b2_dkdv_dO_colmajor_offset,
+};
+
 pub fn synthesize_dkdv_kernel(
     config: &FlashAttentionConfig,
 ) -> Result<String, BackwardSynthError> {
@@ -186,6 +192,18 @@ fn emit_register_decls(ptx: &mut String, config: &FlashAttentionConfig) {
             "    .reg .f32 %dk_acc_{n}_0, %dk_acc_{n}_1, %dk_acc_{n}_2, %dk_acc_{n}_3;\n"
         ));
     }
+    // Task 6 scratch registers for Q-col and dO-col SMEM->SMEM re-stage.
+    // Prefix %ar_* to avoid collision with %a_base / %a_regs used by MMA helpers.
+    // Both emit_qcol_restage_scatter and emit_dOcol_restage_scatter reuse these
+    // registers sequentially, so one declaration set suffices.
+    ptx.push_str("    .reg .u32 %ar_lane_mod4, %ar_lane_div4;\n");
+    ptx.push_str("    .reg .u32 %ar_row_base, %ar_col_base;\n");
+    ptx.push_str("    .reg .u32 %ar_src_row, %ar_src_col;\n");
+    ptx.push_str("    .reg .u32 %ar_src_off, %ar_dst_off;\n");
+    ptx.push_str("    .reg .u32 %ar_src_addr, %ar_dst_addr;\n");
+    ptx.push_str("    .reg .u64 %ar_smem_base64;\n");
+    ptx.push_str("    .reg .u32 %ar_smem_base32;\n");
+    ptx.push_str("    .reg .b16 %ar_val;\n");
     ptx.push('\n');
 }
 
@@ -1010,7 +1028,6 @@ fn emit_inner_loop_body(ptx: &mut String, config: &FlashAttentionConfig) {
     }
     ptx.push('\n');
 
-    // (Task 6: Q/dO re-stage for MMA-3/4)
     // (Task 7: P/dS col scatter for dV/dK MMA inputs)
     // (Task 8: MMA-3 dV_acc += P^T @ dO + MMA-4 dK_acc += dS^T @ Q, after the loop)
 
@@ -1022,7 +1039,161 @@ fn emit_inner_loop_body(ptx: &mut String, config: &FlashAttentionConfig) {
     ptx.push_str("DKDV_IDLE_SKIP_NTILE:\n");
     ptx.push('\n');
 
+    // === Task 6: Q-col + dO-col re-stage (mapping (a)) ===
+    // Run AFTER the n-tile loop closes (DKDV_IDLE_SKIP_NTILE), BEFORE DKDV_DS_SKIP_LABEL.
+    // All warps are reconverged here (idle warps jumped to DKDV_IDLE_SKIP_NTILE above).
+    // Each bar.sync is therefore deadlock-safe.
+    // These re-stages produce the col-major B-operands consumed by MMA-3/4 (Task 8).
+    emit_qcol_restage_scatter(ptx, config);
+    emit_dOcol_restage_scatter(ptx, config);
+
     ptx.push_str("DKDV_DS_SKIP_LABEL:\n");
+}
+
+/// Re-stage row-major Q[bq, hd] -> col-major Q[hd, bq] in SMEM (Task 6, mapping (a)).
+///
+/// Partition: each lane handles `pairs_per_lane = (bq/4) * (hd/8)` cells.
+///   src_row = lane%4 * (bq/4) + (p % (bq/4))   -- row in Q[bq, hd]
+///   src_col = lane/4 * (hd/8) + (p / (bq/4))   -- col in Q[bq, hd]
+///   src_off = q_off + src_row*(hd*2) + src_col*2
+///   dst_off = qcol_off + src_col*(bq*2) + src_row*2
+///
+/// Warp-0-gated (avoids 4x write amplification). All warps reach the trailing
+/// bar.sync (idle warps reconverged at DKDV_IDLE_SKIP_NTILE before this runs).
+///
+/// `%ar_*` scratch registers are declared in `emit_register_decls`.
+fn emit_qcol_restage_scatter(ptx: &mut String, config: &FlashAttentionConfig) {
+    let q_off    = tier_b2_dkdv_q_offset(config);
+    let qcol_off = tier_b2_dkdv_q_colmajor_offset(config);
+    let bq       = tier_b2_effective_bq(config);
+    let hd       = config.head_dim as u32;
+
+    let rows_per_lane_mod = bq  / 4;
+    let cols_per_lane_div = hd  / 8;
+    let pairs_per_lane    = rows_per_lane_mod * cols_per_lane_div;
+
+    let row_stride_src = hd  * 2;  // row-major Q src: hd*2 bytes per row
+    let col_stride_dst = bq  * 2;  // col-major Q dst: bq*2 bytes per col
+
+    ptx.push_str("    // === Task 6a: Q col-major re-stage Q[bq,hd] row-major -> Q[hd,bq] col-major ===\n");
+    ptx.push_str("    // Warp 0 gates the scatter (avoids 4x write amplification).\n");
+    ptx.push_str(&format!(
+        "    // ({pairs_per_lane} (row,col) pairs per lane; col_stride_dst={col_stride_dst} bytes)\n",
+    ));
+    ptx.push_str("    @!%p_producer bra DKDV_QCOL_RESTAGE_DONE;\n");
+
+    // Derive lane%4 and lane/4 (institutional-pin terms).
+    ptx.push_str("    and.b32 %ar_lane_mod4, %lane_id, 3;\n");
+    ptx.push_str("    shr.u32 %ar_lane_div4, %lane_id, 2;\n");
+
+    // Per-lane row/col base (lane-dependent, pair-independent).
+    ptx.push_str(&format!("    mul.lo.u32 %ar_row_base, %ar_lane_mod4, {rows_per_lane_mod};\n"));
+    ptx.push_str(&format!("    mul.lo.u32 %ar_col_base, %ar_lane_div4, {cols_per_lane_div};\n"));
+
+    // SMEM base as u32 shared-space address.
+    ptx.push_str("    cvta.shared.u64 %ar_smem_base64, shmem;\n");
+    ptx.push_str("    cvt.u32.u64 %ar_smem_base32, %ar_smem_base64;\n");
+
+    // Loop-unrolled per (row, col) pair.
+    for p in 0..pairs_per_lane {
+        let pair_row_off = p % rows_per_lane_mod;
+        let pair_col_off = p / rows_per_lane_mod;
+
+        ptx.push_str(&format!("    add.u32 %ar_src_row, %ar_row_base, {pair_row_off};\n"));
+        ptx.push_str(&format!("    add.u32 %ar_src_col, %ar_col_base, {pair_col_off};\n"));
+
+        // src_off = q_off + src_row * row_stride_src + src_col * 2
+        ptx.push_str(&format!("    mul.lo.u32 %ar_src_off, %ar_src_row, {row_stride_src};\n"));
+        // dst_off = qcol_off + src_col * col_stride_dst + src_row * 2
+        ptx.push_str(&format!("    mul.lo.u32 %ar_dst_off, %ar_src_col, {col_stride_dst};\n"));
+        // src_row * 2 for dst: reuse %ar_src_addr as scratch before address compute
+        ptx.push_str("    shl.b32 %ar_src_addr, %ar_src_row, 1;\n");
+        ptx.push_str("    add.u32 %ar_dst_off, %ar_dst_off, %ar_src_addr;\n");
+        ptx.push_str(&format!("    add.u32 %ar_dst_off, %ar_dst_off, {qcol_off};\n"));
+
+        // src_col * 2 for src_off: reuse %ar_dst_addr as scratch
+        ptx.push_str("    shl.b32 %ar_dst_addr, %ar_src_col, 1;\n");
+        ptx.push_str("    add.u32 %ar_src_off, %ar_src_off, %ar_dst_addr;\n");
+        ptx.push_str(&format!("    add.u32 %ar_src_off, %ar_src_off, {q_off};\n"));
+
+        // Compute actual SMEM addresses.
+        ptx.push_str("    add.u32 %ar_src_addr, %ar_smem_base32, %ar_src_off;\n");
+        ptx.push_str("    add.u32 %ar_dst_addr, %ar_smem_base32, %ar_dst_off;\n");
+
+        // ld.shared.b16 from row-major src; st.shared.b16 to col-major dst.
+        ptx.push_str("    ld.shared.b16 %ar_val, [%ar_src_addr];\n");
+        ptx.push_str("    st.shared.b16 [%ar_dst_addr], %ar_val;\n");
+    }
+
+    ptx.push_str("DKDV_QCOL_RESTAGE_DONE:\n");
+    ptx.push_str("    bar.sync 0;\n");
+}
+
+/// Re-stage row-major dO[bq, hd] -> col-major dO[hd, bq] in SMEM (Task 6, mapping (a)).
+///
+/// Structurally identical to `emit_qcol_restage_scatter`; uses the dO SMEM bands
+/// and a distinct DONE label to avoid duplicate-label ptxas rejection.
+///
+/// Warp-0-gated; trailing bar.sync ensures all warps see the re-staged data
+/// before any MMA reads it (all warps reconverged at DKDV_IDLE_SKIP_NTILE above).
+///
+/// `%ar_*` scratch registers are reused from the previous re-stage (sequential).
+#[allow(non_snake_case)]
+fn emit_dOcol_restage_scatter(ptx: &mut String, config: &FlashAttentionConfig) {
+    let do_off    = tier_b2_dkdv_dO_offset(config);
+    let docol_off = tier_b2_dkdv_dO_colmajor_offset(config);
+    let bq        = tier_b2_effective_bq(config);
+    let hd        = config.head_dim as u32;
+
+    let rows_per_lane_mod = bq / 4;
+    let cols_per_lane_div = hd / 8;
+    let pairs_per_lane    = rows_per_lane_mod * cols_per_lane_div;
+
+    let row_stride_src = hd * 2;
+    let col_stride_dst = bq * 2;
+
+    ptx.push_str("    // === Task 6b: dO col-major re-stage dO[bq,hd] row-major -> dO[hd,bq] col-major ===\n");
+    ptx.push_str("    // Warp 0 gates the scatter (avoids 4x write amplification).\n");
+    ptx.push_str(&format!(
+        "    // ({pairs_per_lane} (row,col) pairs per lane; col_stride_dst={col_stride_dst} bytes)\n",
+    ));
+    ptx.push_str("    @!%p_producer bra DKDV_DOCOL_RESTAGE_DONE;\n");
+
+    ptx.push_str("    and.b32 %ar_lane_mod4, %lane_id, 3;\n");
+    ptx.push_str("    shr.u32 %ar_lane_div4, %lane_id, 2;\n");
+
+    ptx.push_str(&format!("    mul.lo.u32 %ar_row_base, %ar_lane_mod4, {rows_per_lane_mod};\n"));
+    ptx.push_str(&format!("    mul.lo.u32 %ar_col_base, %ar_lane_div4, {cols_per_lane_div};\n"));
+
+    ptx.push_str("    cvta.shared.u64 %ar_smem_base64, shmem;\n");
+    ptx.push_str("    cvt.u32.u64 %ar_smem_base32, %ar_smem_base64;\n");
+
+    for p in 0..pairs_per_lane {
+        let pair_row_off = p % rows_per_lane_mod;
+        let pair_col_off = p / rows_per_lane_mod;
+
+        ptx.push_str(&format!("    add.u32 %ar_src_row, %ar_row_base, {pair_row_off};\n"));
+        ptx.push_str(&format!("    add.u32 %ar_src_col, %ar_col_base, {pair_col_off};\n"));
+
+        ptx.push_str(&format!("    mul.lo.u32 %ar_src_off, %ar_src_row, {row_stride_src};\n"));
+        ptx.push_str(&format!("    mul.lo.u32 %ar_dst_off, %ar_src_col, {col_stride_dst};\n"));
+        ptx.push_str("    shl.b32 %ar_src_addr, %ar_src_row, 1;\n");
+        ptx.push_str("    add.u32 %ar_dst_off, %ar_dst_off, %ar_src_addr;\n");
+        ptx.push_str(&format!("    add.u32 %ar_dst_off, %ar_dst_off, {docol_off};\n"));
+
+        ptx.push_str("    shl.b32 %ar_dst_addr, %ar_src_col, 1;\n");
+        ptx.push_str("    add.u32 %ar_src_off, %ar_src_off, %ar_dst_addr;\n");
+        ptx.push_str(&format!("    add.u32 %ar_src_off, %ar_src_off, {do_off};\n"));
+
+        ptx.push_str("    add.u32 %ar_src_addr, %ar_smem_base32, %ar_src_off;\n");
+        ptx.push_str("    add.u32 %ar_dst_addr, %ar_smem_base32, %ar_dst_off;\n");
+
+        ptx.push_str("    ld.shared.b16 %ar_val, [%ar_src_addr];\n");
+        ptx.push_str("    st.shared.b16 [%ar_dst_addr], %ar_val;\n");
+    }
+
+    ptx.push_str("DKDV_DOCOL_RESTAGE_DONE:\n");
+    ptx.push_str("    bar.sync 0;\n");
 }
 
 fn emit_inner_loop_close(ptx: &mut String) {
