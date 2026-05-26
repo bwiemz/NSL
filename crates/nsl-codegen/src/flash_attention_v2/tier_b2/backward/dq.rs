@@ -203,6 +203,24 @@ fn emit_register_decls(ptx: &mut String, _config: &FlashAttentionConfig) {
     ptx.push_str("    .reg .u32 %s_lo, %s_hi, %stat_lane_div4;\n");
     ptx.push_str("    .reg .f32 %rmax_lo, %rmax_hi, %rsum_lo, %rsum_hi;\n");
     ptx.push_str("    .reg .f32 %rsum_recip_lo, %rsum_recip_hi, %d_lo, %d_hi;\n");
+    // Inner-loop-body MMA fragment + P/dS scratch registers. Hoisted here (not
+    // declared inside emit_inner_loop_body) so all .reg directives precede any
+    // executable instruction per PTX ISA. The body keeps only the mov/mul/etc.
+    // that initialize them. Fixed names (config-independent): the S/dP fragment
+    // families, the P-recompute scalars, the dS lane values, and the dQ-matmul
+    // A/B fragment regs.
+    // S = Q@K^T fragment family (A: k16 rows b32-packed; B: n8 cols; C/D: f32 acc).
+    ptx.push_str("    .reg .b32 %s_a0, %s_a1, %s_a2, %s_a3, %s_b0, %s_b1;\n");
+    ptx.push_str("    .reg .f32 %s_c0, %s_c1, %s_c2, %s_c3, %s_d0, %s_d1, %s_d2, %s_d3;\n");
+    // P recompute scalars + per-lane P values.
+    ptx.push_str("    .reg .f32 %p_recip_log2e, %f_scale, %p_0, %p_1, %p_2, %p_3;\n");
+    // dP = dO@V^T fragment family (mirrors the S family).
+    ptx.push_str("    .reg .b32 %dp_a0, %dp_a1, %dp_a2, %dp_a3, %dp_b0, %dp_b1;\n");
+    ptx.push_str("    .reg .f32 %dp_c0, %dp_c1, %dp_c2, %dp_c3, %dp_d0, %dp_d1, %dp_d2, %dp_d3;\n");
+    // dS per-lane values (f32, scattered to SMEM as f16).
+    ptx.push_str("    .reg .f32 %ds_0, %ds_1, %ds_2, %ds_3;\n");
+    // dQ += dS@K fragment A/B regs (b32-packed f16 fragments; accumulators are %dq_acc_*).
+    ptx.push_str("    .reg .b32 %dq_a0, %dq_a1, %dq_a2, %dq_a3, %dq_b0, %dq_b1;\n");
     ptx.push('\n');
 }
 
@@ -1110,19 +1128,24 @@ fn emit_dq_matmul_tiled(ptx: &mut String, config: &FlashAttentionConfig,
     let n_k_tiles = bkv / 16;
     let pct4 = |r: &[String;4]| [format!("%{}",r[0]),format!("%{}",r[1]),format!("%{}",r[2]),format!("%{}",r[3])];
     let pct2 = |r: &[String;2]| [format!("%{}",r[0]),format!("%{}",r[1])];
-    for n in 0..n_n_tiles {
-        let dq = [format!("%dq_acc_{n}_0"), format!("%dq_acc_{n}_1"),
-                  format!("%dq_acc_{n}_2"), format!("%dq_acc_{n}_3")];
-        for k in 0..n_k_tiles {
-            // A base = cvta(shmem) + ds_off + band_row_base*bkv*2 + k*16*2  (runtime band_row_base)
-            ptx.push_str(&format!("    mul.lo.u32 %a_base, %band_row_base, {};\n", bkv * 2));
-            ptx.push_str(&format!("    add.u32 %a_base, %a_base, {};\n", ds_off + k * 16 * 2));
-            ptx.push_str("    add.u32 %a_base, %a_base, %mma_smem_base;  // + cvta(shmem) base\n");
+    // Loop k OUTER, n INNER: the dS A-fragment base depends only on k (not n), so this
+    // loads each A-fragment once per k-tile and reuses it across all hd/8 output n-tiles
+    // (the old n-outer order reloaded the SAME A-fragment n_n_tiles times). The MMA C=D
+    // accumulation across (n,k) is order-independent — %dq_acc_* is zeroed once by
+    // emit_dq_acc_init before the kv loop — so reordering is numerically identical.
+    for k in 0..n_k_tiles {
+        // A base = cvta(shmem) + ds_off + band_row_base*bkv*2 + k*16*2  (runtime band_row_base; depends only on k)
+        ptx.push_str(&format!("    mul.lo.u32 %a_base, %band_row_base, {};\n", bkv * 2));
+        ptx.push_str(&format!("    add.u32 %a_base, %a_base, {};\n", ds_off + k * 16 * 2));
+        ptx.push_str("    add.u32 %a_base, %a_base, %mma_smem_base;  // + cvta(shmem) base\n");
+        emit_load_a_fragment_smem(ptx, a_regs, "%a_base", ds_row_stride);
+        for n in 0..n_n_tiles {
+            let dq = [format!("%dq_acc_{n}_0"), format!("%dq_acc_{n}_1"),
+                      format!("%dq_acc_{n}_2"), format!("%dq_acc_{n}_3")];
             // B base = cvta(shmem) + kcol_off + n*8*bkv*2 + k*16*2  (compile-time offset into %b_base reg)
             let b_base = kcol_off + n * 8 * bkv * 2 + k * 16 * 2;
             ptx.push_str(&format!("    mov.u32 %b_base, {b_base};\n"));
             ptx.push_str("    add.u32 %b_base, %b_base, %mma_smem_base;  // + cvta(shmem) base\n");
-            emit_load_a_fragment_smem(ptx, a_regs, "%a_base", ds_row_stride);
             emit_load_b_fragment_smem(ptx, b_regs, "%b_base", kcol_col_stride);
             emit_mma_instruction(ptx, &dq, &pct4(a_regs), &pct2(b_regs), &dq); // C=D=dq_acc (MAC, no zeroing)
         }
@@ -1171,19 +1194,9 @@ fn emit_inner_loop_body(ptx: &mut String, config: &FlashAttentionConfig) {
         .collect::<Vec<_>>()
         .try_into()
         .unwrap();
-
-    for r in &a_regs {
-        ptx.push_str(&format!("    .reg .b32 %{};\n", r));
-    }
-    for r in &b_regs {
-        ptx.push_str(&format!("    .reg .b32 %{};\n", r));
-    }
-    for r in &c_regs {
-        ptx.push_str(&format!("    .reg .f32 %{};\n", r));
-    }
-    for r in &d_regs {
-        ptx.push_str(&format!("    .reg .f32 %{};\n", r));
-    }
+    // .reg decls for the S family are hoisted to emit_register_decls (PTX ISA: all
+    // .reg directives must precede executable instructions). These arrays only name
+    // the regs for the matmul helpers below.
 
     // === Open runtime n-tile streaming loop (DQ_NTILE_LOOP) ===
     // One iteration per 8-column kv n-tile (bkv/8 iterations at runtime). The body
@@ -1211,19 +1224,17 @@ fn emit_inner_loop_body(ptx: &mut String, config: &FlashAttentionConfig) {
     ptx.push_str("    // (Lane-by-lane on the f32 S-fragment values held in %s_d0..3.)\n");
     ptx.push_str("    // Elements {0,1} belong to row lane/4 (lo), elements {2,3} to row lane/4+8 (hi).\n");
     ptx.push_str("    // Stats loaded by emit_stats_addr_load: %rmax_lo/%rmax_hi, %rsum_recip_lo/%rsum_recip_hi.\n");
-    ptx.push_str("    .reg .f32 %p_recip_log2e;\n");
+    // %p_recip_log2e/%f_scale/%p_0..3 declared in emit_register_decls (hoisted).
     ptx.push_str("    mov.f32 %p_recip_log2e, 0F3FB8AA3B;  // 1/ln(2) = 1.4426950408889634\n");
     // Attention scale = 1/sqrt(head_dim). The forward computed row_max/row_sum on the
     // SCALED scores (scale * Q@K^T), so the recompute must scale the raw MMA S the same
     // way before exp — and dS carries the same 1/sqrt(D) factor (see reference math in
     // cpu_naive_backward.rs). Omitting it left dQ ~sqrt(D)x too large.
     let scale_bits = (1.0f32 / (config.head_dim as f32).sqrt()).to_bits();
-    ptx.push_str("    .reg .f32 %f_scale;\n");
     ptx.push_str(&format!("    mov.f32 %f_scale, 0F{scale_bits:08X};  // 1/sqrt(head_dim)\n"));
     for i in 0..4 {
         let (rmax, rrecip) = if i < 2 { ("%rmax_lo", "%rsum_recip_lo") }
                               else      { ("%rmax_hi", "%rsum_recip_hi") };
-        ptx.push_str(&format!("    .reg .f32 %p_{i};\n"));
         ptx.push_str(&format!("    mul.f32 %p_{i}, %s_d{i}, %f_scale;  // scale * S (match forward's scaled stats)\n"));
         ptx.push_str(&format!("    sub.f32 %p_{i}, %p_{i}, {rmax};\n"));
         ptx.push_str(&format!("    mul.f32 %p_{i}, %p_{i}, %p_recip_log2e;\n"));
@@ -1243,11 +1254,7 @@ fn emit_inner_loop_body(ptx: &mut String, config: &FlashAttentionConfig) {
         .iter().map(|s| s.to_string()).collect::<Vec<_>>().try_into().unwrap();
     let dp_d_regs: [String; 4] = ["dp_d0", "dp_d1", "dp_d2", "dp_d3"]
         .iter().map(|s| s.to_string()).collect::<Vec<_>>().try_into().unwrap();
-
-    for r in &dp_a_regs { ptx.push_str(&format!("    .reg .b32 %{};\n", r)); }
-    for r in &dp_b_regs { ptx.push_str(&format!("    .reg .b32 %{};\n", r)); }
-    for r in &dp_c_regs { ptx.push_str(&format!("    .reg .f32 %{};\n", r)); }
-    for r in &dp_d_regs { ptx.push_str(&format!("    .reg .f32 %{};\n", r)); }
+    // .reg decls for the dP family are hoisted to emit_register_decls.
 
     // Tile dP = dO @ V^T: hd/16 k-tiles unrolled; result %dp_d0..3 flows into dS.
     emit_dp_matmul_tiled(ptx, config, &dp_a_regs, &dp_b_regs, &dp_c_regs, &dp_d_regs);
@@ -1261,9 +1268,9 @@ fn emit_inner_loop_body(ptx: &mut String, config: &FlashAttentionConfig) {
     // D[q] is loaded from HBM per row: %d_lo for elements {0,1} (row lane/4),
     // %d_hi for elements {2,3} (row lane/4+8) — loaded by emit_stats_addr_load.
     ptx.push_str("    // === dS = P * (dP - D) ===\n");
+    // %ds_0..3 declared in emit_register_decls (hoisted).
     for i in 0..4 {
         let d_row = if i < 2 { "%d_lo" } else { "%d_hi" };
-        ptx.push_str(&format!("    .reg .f32 %ds_{i};\n"));
         ptx.push_str(&format!("    sub.f32 %ds_{i}, %dp_d{i}, {d_row};\n"));
         ptx.push_str(&format!("    mul.f32 %ds_{i}, %ds_{i}, %p_{i};\n"));
         ptx.push_str(&format!("    mul.f32 %ds_{i}, %ds_{i}, %f_scale;  // dS = (1/sqrt(D)) * P * (dP - D)\n"));
@@ -1316,13 +1323,7 @@ fn emit_inner_loop_body(ptx: &mut String, config: &FlashAttentionConfig) {
     // that orders K_col before this matmul — no new bar.sync is added.
     ptx.push_str("    // === dQ_acc += dS @ K (tiled m16n8k16, B-frag from col-major K re-stage) ===\n");
 
-    ptx.push_str("    .reg .b32 %dq_a0;\n");
-    ptx.push_str("    .reg .b32 %dq_a1;\n");
-    ptx.push_str("    .reg .b32 %dq_a2;\n");
-    ptx.push_str("    .reg .b32 %dq_a3;\n");
-    ptx.push_str("    .reg .b32 %dq_b0;\n");
-    ptx.push_str("    .reg .b32 %dq_b1;\n");
-
+    // %dq_a0..3 / %dq_b0..1 declared in emit_register_decls (hoisted).
     let dq_a = ["dq_a0","dq_a1","dq_a2","dq_a3"].map(String::from);
     let dq_b = ["dq_b0","dq_b1"].map(String::from);
     // Idle-warp gate (B): warps 2-3 (bq=32) skip the dQ matmul. emit_dq_matmul_tiled
