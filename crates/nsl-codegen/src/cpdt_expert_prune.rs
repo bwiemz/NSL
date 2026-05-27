@@ -178,4 +178,71 @@ mod tests {
             assert_eq!(got, want, "expert block j={j} (orig {orig})");
         }
     }
+
+    #[test]
+    fn no_dead_is_identity() {
+        let b = toy_bundle();
+        let res = prune_dead_experts(&b, &[]).unwrap();
+        assert_eq!(res.index_remap, vec![0, 1, 2, 3]);
+        assert_eq!(res.n_live, 4);
+        assert_eq!(res.sliced_router, b.router);
+        assert_eq!(res.kept_experts, b.experts);
+    }
+
+    #[test]
+    fn refuse_router_shape() {
+        let mut b = toy_bundle();
+        b.router.truncate(b.router.len() - 4); // wrong byte length
+        assert!(matches!(
+            prune_dead_experts(&b, &[1]),
+            Err(ExpertPruneRefusal::RouterShapeMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn refuse_bundle_inconsistent() {
+        let mut b = toy_bundle();
+        b.experts.truncate(b.experts.len() - 4); // experts bytes != n*block*bw
+        assert!(matches!(
+            prune_dead_experts(&b, &[1]),
+            Err(ExpertPruneRefusal::BundleInconsistent { .. })
+        ));
+    }
+
+    #[test]
+    fn refuse_dead_oob() {
+        let b = toy_bundle();
+        assert_eq!(
+            prune_dead_experts(&b, &[5]),
+            Err(ExpertPruneRefusal::DeadIndexOutOfRange { index: 5, n_experts: 4 })
+        );
+    }
+
+    #[test]
+    fn refuse_all_dead() {
+        let b = toy_bundle();
+        assert_eq!(prune_dead_experts(&b, &[0, 1, 2, 3]), Err(ExpertPruneRefusal::AllExpertsDead));
+    }
+
+    #[test]
+    fn refuse_insufficient_live() {
+        let mut b = toy_bundle();
+        b.top_k = 2;
+        // 4 experts, dead [0,1,3] -> n_live=1 < top_k=2.
+        assert_eq!(
+            prune_dead_experts(&b, &[0, 1, 3]),
+            Err(ExpertPruneRefusal::InsufficientLiveExperts { n_live: 1, top_k: 2 })
+        );
+    }
+
+    #[test]
+    fn refusal_mutates_nothing() {
+        // The transform takes &bundle and returns owned data, so the input is
+        // structurally immutable; assert it explicitly (clone-and-compare) so a
+        // future &mut refactor that partially mutates before failing is caught.
+        let b = toy_bundle();
+        let snapshot = b.clone();
+        let _ = prune_dead_experts(&b, &[5]); // refusal
+        assert_eq!(b, snapshot);
+    }
 }
