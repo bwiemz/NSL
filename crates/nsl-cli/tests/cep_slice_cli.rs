@@ -41,8 +41,10 @@ fn write_matching_safetensors(path: &Path) {
             v.push((format!("blocks.{l}.attn.wq"), vec![64, 64]));
             v.push((format!("blocks.{l}.attn.wk"), vec![64, 32]));
             v.push((format!("blocks.{l}.attn.wv"), vec![64, 32]));
+            v.push((format!("blocks.{l}.attn.wo"), vec![64, 64]));
             v.push((format!("blocks.{l}.ffn.w_gate"), vec![64, 128]));
             v.push((format!("blocks.{l}.ffn.w_up"), vec![64, 128]));
+            v.push((format!("blocks.{l}.ffn.w_down"), vec![128, 64]));
         }
         v
     };
@@ -102,4 +104,15 @@ fn cep_emit_weights_writes_smaller_safetensors() {
     let st = safetensors::SafeTensors::deserialize(&bytes)
         .expect("emitted file is valid safetensors");
     assert!(!st.names().is_empty(), "emitted safetensors has tensors");
+
+    // wo (axis-0 head slice) and w_down (axis-0 FFN slice) must round-trip through the CLI
+    // path — these axis-0 slicing roles are otherwise only exercised by the unit tests.
+    assert!(
+        st.tensor("blocks.0.attn.wo").is_ok(),
+        "wo must round-trip through --cep-emit-weights"
+    );
+    assert!(
+        st.tensor("blocks.0.ffn.w_down").is_ok(),
+        "w_down must round-trip through --cep-emit-weights"
+    );
 }

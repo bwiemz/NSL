@@ -192,6 +192,9 @@ pub(crate) fn to_safetensors_dtype(dt: WeightDType) -> safetensors::Dtype {
 
 /// Parse "blocks.{l}.{attn|ffn}.{name}" into (layer, "attn"|"ffn", leaf). Returns None
 /// for non-per-layer tensors (embed, final norm, lm_head) — copied through unchanged.
+/// Only `blocks.N.*` naming is recognized; `layers.N.*` / `h.N.*` conventions return None
+/// here and pass through unsliced (NSL canonical models, the only ones CEP extracts, use
+/// `blocks.*`).
 fn parse_layer_tensor(name: &str) -> Option<(u32, &'static str, String)> {
     let prefix = crate::wggo_graph::layer_prefix(name)?; // "blocks.0"
     let layer: u32 = prefix.strip_prefix("blocks.")?.parse().ok()?;
@@ -298,6 +301,18 @@ fn slice_one(
     let n_heads = spec.n_heads[l];
     let n_kv = spec.n_kv_heads[l].max(1);
     let group = (n_heads / n_kv).max(1);
+    // Invariant (upheld by plan_to_prune_delta): pruned_heads are whole GQA groups, so the
+    // KV-survivor test below — checking each group's first head as representative — is sound.
+    // Guard it in debug builds against a hand-edited/future-planner delta that violates
+    // group-alignment, which would otherwise desync Q survivors from KV survivors.
+    debug_assert!(
+        ld.pruned_heads.iter().all(|&h| {
+            let base = (h / group) * group;
+            (base..base + group).all(|x| ld.pruned_heads.contains(&x))
+        }),
+        "slice_one: layer {layer} pruned_heads {:?} are not whole GQA groups (group={group})",
+        ld.pruned_heads
+    );
     let survivor_q: Vec<u32> = (0..n_heads).filter(|h| !ld.pruned_heads.contains(h)).collect();
     // KV survivors: a group survives iff its query heads survive.
     let survivor_kv: Vec<u32> = (0..n_kv)
