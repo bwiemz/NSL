@@ -151,6 +151,36 @@ pub fn backward_rms_strip_offset(config: &FlashAttentionConfig) -> u32 {
     backward_dx_norm_offset(config) + (config.block_q as u32) * dm * 4
 }
 
+/// SMEM rebasing base for the standalone Tier B.2 `proj_backward` kernel.
+///
+/// The proj-backward kernel (Phase 3 T4) reuses the scalar fused-backward
+/// prelude + emitters, which place the dQ/dK/dV/x_norm/dx_norm/rms tiles AFTER
+/// the full forward layout (`total_bytes` + P + dS). As a *standalone* kernel
+/// proj_backward never touches the forward Q/KV/SP/weight tiles nor the P/dS
+/// tiles, so allocating SMEM up through the absolute `backward_rms_strip_offset`
+/// (~137 KB at hd=64, ~113 KB at hd=128) blows past the 99 KB dynamic-SMEM
+/// device cap and the launch fails with `CUDA_ERROR_INVALID_VALUE`.
+///
+/// `synthesize_proj_backward` therefore shifts `%shmem_base` DOWN by this base
+/// (`backward_dq_offset`, the lowest offset the proj kernel references) so the
+/// SAME emitter offsets land in a compacted region starting at allocation byte
+/// 0. The launch then only needs `tier_b2_proj_backward_smem_bytes` (~88 KB).
+/// All proj references go through `%shmem_base + backward_{dq,dv,dk,x_norm,
+/// dx_norm,rms}_offset`, and all rebase consistently because the shift is a
+/// single subtract applied once after the prelude.
+pub fn tier_b2_proj_backward_smem_base(config: &FlashAttentionConfig) -> u32 {
+    backward_dq_offset(config)
+}
+
+/// Compacted dynamic-SMEM byte count for the standalone proj-backward kernel
+/// after the `%shmem_base` rebase (see `tier_b2_proj_backward_smem_base`).
+/// Equals the span from the lowest referenced tile (dQ) through the end of the
+/// highest (the rms strip).
+pub fn tier_b2_proj_backward_smem_bytes(config: &FlashAttentionConfig) -> u32 {
+    let rms_end = backward_rms_strip_offset(config) + (config.block_q as u32) * 4;
+    rms_end - tier_b2_proj_backward_smem_base(config)
+}
+
 /// Runtime validation called by `synthesize_flash_attention_ptx_v2`.
 ///
 /// `direction` controls whether the backward-pass extra SMEM tiles are

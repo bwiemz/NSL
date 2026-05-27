@@ -1810,6 +1810,30 @@ fn tier_b2_dkdv_total_smem_bytes(block_q: i64, head_dim: i64) -> i64 {
     off
 }
 
+/// Compacted dynamic-SMEM bytes for the standalone `tier_b2_proj_backward`
+/// kernel, mirroring `smem_layout::tier_b2_proj_backward_smem_bytes`.
+///
+/// The proj kernel reuses the scalar fused-backward prelude, which lays out the
+/// dQ/dK/dV/v_in/x_norm/dx_norm/rms tiles AFTER the full forward layout
+/// (`total_bytes` + P + dS). `synthesize_proj_backward` rebases `%shmem_base`
+/// down by `backward_dq_offset` so those tiles start at allocation byte 0; in
+/// the rebase the `total_bytes` and P/dS terms cancel, leaving exactly the sum
+/// of the tail tiles below. All f32 except v_in (f16). seq == block_q in the
+/// smoke scope so block_q/block_kv are the raw config values (NOT effective_bq).
+/// MUST stay in sync with the codegen helper.
+#[cfg(feature = "cuda")]
+#[inline]
+fn tier_b2_proj_backward_smem_bytes(block_q: i64, block_kv: i64, head_dim: i64, d_model: i64) -> i64 {
+    let dq = block_q * head_dim * 4;
+    let dv = block_kv * head_dim * 4;
+    let dk = block_kv * head_dim * 4;
+    let v_in = block_kv * head_dim * 2;
+    let x_norm = block_q * d_model * 4;
+    let dx_norm = block_q * d_model * 4;
+    let rms_strip = block_q * 4;
+    dq + dv + dk + v_in + x_norm + dx_norm + rms_strip
+}
+
 /// CSHA Tier B.2 (Phase 3 T6): launch the 4-kernel hybrid backward sequence.
 ///
 /// `ptx_ptr` is a single (null-terminated) PTX module containing all four
@@ -2173,13 +2197,24 @@ fn csha_tier_b2_backward_launch(
 
         let grid_y = batch * effective_heads;
         let q_blocks = if block_q > 0 { (seq_len + block_q - 1) / block_q } else { 1 };
+        // T8 fix: the proj kernel rebases %shmem_base to a COMPACTED layout
+        // (see `synthesize_proj_backward` + `tier_b2_proj_backward_smem_bytes`),
+        // so the incoming `shared_mem_bytes` (which sizes the FULL scalar fused
+        // backward, ~137 KB at hd=64 — past the 99 KB device cap) must be
+        // overridden with the compacted ~88 KB span the standalone kernel
+        // actually uses. d_model from the active_heads-derived projection
+        // contract (== head_dim under the smoke scope).
+        let proj_smem = tier_b2_proj_backward_smem_bytes(
+            block_q, block_q, head_dim, d_model,
+        ) as u32;
+        let _ = shared_mem_bytes; // superseded by the compacted proj footprint
         let mut rc = success;
         for q_block in 0..q_blocks {
             slens = (q_block * block_q) as u64;
             let _ = std::hint::black_box(&slens);
             rc = crate::cuda::inner::kernel_launch(
                 ptx, name_proj.as_ptr(),
-                [1, grid_y, 1], [128, 1, 1], &args, shared_mem_bytes as u32,
+                [1, grid_y, 1], [128, 1, 1], &args, proj_smem,
             );
             if rc != success {
                 break;

@@ -21,6 +21,7 @@ use crate::flash_attention::FlashAttentionConfig;
 use crate::flash_attention_v2::phases;
 use crate::flash_attention_v2::smem_layout::{
     backward_dk_offset, backward_dq_offset, backward_dv_offset,
+    tier_b2_proj_backward_smem_base,
 };
 use crate::flash_attention_v2::tier_b2::backward::BackwardSynthError;
 
@@ -214,6 +215,28 @@ pub fn synthesize_proj_backward(
         "expected exactly one scalar entry header to rename"
     );
     ptx = ptx.replacen(&from, to, 1);
+
+    // SMEM rebase (T8 fix): the prelude declares + bases SMEM for the FULL
+    // scalar fused-backward layout (forward Q/KV/SP/weight tiles + P/dS +
+    // dQ/dK/dV + x_norm/dx_norm/rms), whose absolute footprint through the rms
+    // strip is ~137 KB (hd=64) / ~113 KB (hd=128) — past the 99 KB dynamic-SMEM
+    // device cap, so the standalone launch fails with CUDA_ERROR_INVALID_VALUE.
+    // This kernel only references the dQ/dK/dV/x_norm/dx_norm/rms tiles (all at
+    // offsets >= backward_dq_offset). Shift %shmem_base DOWN by that base so the
+    // SAME emitter offsets (`%shmem_base + backward_*_offset`) land in a
+    // compacted region starting at allocation byte 0. The launch then allocates
+    // only `tier_b2_proj_backward_smem_bytes` (~88 KB). One subtract, applied
+    // before any proj phase touches SMEM (the active_heads guard uses none).
+    let proj_base = tier_b2_proj_backward_smem_base(config);
+    if proj_base > 0 {
+        ptx.push_str(&format!(
+            "    // T8: rebase %shmem_base for compacted standalone proj SMEM \
+             (base={proj_base})\n"
+        ));
+        ptx.push_str(&format!(
+            "    sub.u64 %shmem_base, %shmem_base, {proj_base};\n"
+        ));
+    }
 
     // CSHA A.4 head-pruning guard — mirror the scalar backward orchestrator
     // so blocks whose head_idx >= csha_active_heads early-`ret` before doing
