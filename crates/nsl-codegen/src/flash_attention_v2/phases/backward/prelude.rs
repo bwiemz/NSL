@@ -261,7 +261,7 @@ pub fn emit(
     //   * Task 9 (backward dQ/dK rotation sites in csha_hooks_backward) —
     //     reads smem_doc_starts to compute effective_pos before cs_idx.
     if config.segment_masked && config.rope_q {
-        ptx.push_str("    // PCA §4.3 RoPE-reset registers (sites 3+4 + CTA prologue)\n");
+        ptx.push_str("    // PCA sec.4.3 RoPE-reset registers (sites 3+4 + CTA prologue)\n");
         ptx.push_str("    .reg .u64 %rd_doc_starts_ptr, %rd_doc_starts_addr;\n");
         // %r_doc_smem_base / %rd_doc_smem_addr: generic-space u64 SMEM base + per-iter
         // store addr (ptxas rejects [symbol + %reg] in shared stores, so we

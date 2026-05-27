@@ -320,7 +320,7 @@ pub fn emit_with_smem_override(
     //   * Tasks 7/8 (forward Q/K rotation sites) — read smem_doc_starts
     //   * Task 9 (backward dQ/dK sites) — read smem_doc_starts
     if config.segment_masked && config.rope_q {
-        ptx.push_str("    // PCA §4.3 RoPE-reset registers (sites 1-4 + CTA prologue)\n");
+        ptx.push_str("    // PCA sec.4.3 RoPE-reset registers (sites 1-4 + CTA prologue)\n");
         ptx.push_str("    .reg .u64 %rd_doc_starts_ptr, %rd_doc_starts_addr;\n");
         // %r_doc_smem_base / %rd_doc_smem_addr: generic-space u64 SMEM base + per-iter
         // store addr (ptxas rejects [symbol + %reg] in shared stores, so we

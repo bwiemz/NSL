@@ -100,7 +100,7 @@ pub fn emit_doc_starts_smem_load(ptx: &mut String) {
     // be true. No current fixture is rope_q=true, so it is unexercised; the
     // fix (budget the 1028 bytes and/or embed it in the shmem[] tail) belongs
     // with the rope_q=true launch harness the deferred Test 4 introduces.
-    ptx.push_str("    // PCA §4.3 — CTA prologue: load this row's doc_starts to SMEM\n");
+    ptx.push_str("    // PCA sec.4.3 -- CTA prologue: load this row's doc_starts to SMEM\n");
     ptx.push_str("    .shared .align 4 .b8 smem_doc_starts[1028];\n");
     ptx.push_str("    ld.param.u64 %rd_doc_starts_ptr, [doc_starts_ptr];\n");
     // PCA §4.3 null-guard (spec §4.2): null doc_starts_ptr → write the all-zero

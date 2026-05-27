@@ -1757,3 +1757,113 @@ fn launch_pca_backward_ex(
 
     Some((dq, dk, dv))
 }
+
+// ===========================================================================
+// Test B — doc_starts null-guard == standard positions, BACKWARD (rope_q=true)
+//
+// Validates the doc_starts null-guard in the BACKWARD kernel: when
+// doc_starts_ptr==0 the kernel must produce output IDENTICAL to a run
+// with doc_starts=[0,0,...] (standard positions, null-guard identity).
+//
+// head_dim=32 (matches the backward validator's d_model=head_dim constraint),
+// block=32, seq_len=128.
+//
+// Tolerance: 5e-3 — matches the file's established backward budget.
+//
+// CRITICAL: if cuda_available() is true and either launch returns None,
+// we PANIC (guard failure / kernel crash), not skip.
+// ===========================================================================
+
+#[test]
+#[ignore = "requires CUDA GPU"]
+fn doc_starts_null_equals_standard_positions_backward() {
+    if !cuda_available() {
+        eprintln!("skipped: no CUDA device");
+        return;
+    }
+
+    let head_dim = 32usize;
+    let block    = 32i64;
+    let seq_len  = 128usize;
+    let total    = seq_len * head_dim;
+
+    // Inputs.
+    let mut x      = vec![0f32; total];
+    let mut do_f32 = vec![0f32; total];
+    fill_seeded(&mut x,      0xB001);
+    fill_seeded(&mut do_f32, 0xB002);
+
+    let n_weights = head_dim * head_dim;
+    let mut wq_f32 = vec![0f32; n_weights];
+    let mut wk_f32 = vec![0f32; n_weights];
+    let mut wv_f32 = vec![0f32; n_weights];
+    fill_seeded(&mut wq_f32, 0xB003);
+    fill_seeded(&mut wk_f32, 0xB004);
+    fill_seeded(&mut wv_f32, 0xB005);
+    let wq_f16: Vec<u16> = wq_f32.iter().map(|&v| f32_to_f16_bits(v)).collect();
+    let wk_f16: Vec<u16> = wk_f32.iter().map(|&v| f32_to_f16_bits(v)).collect();
+    let wv_f16: Vec<u16> = wv_f32.iter().map(|&v| f32_to_f16_bits(v)).collect();
+    let do_f16: Vec<u16> = do_f32.iter().map(|&v| f32_to_f16_bits(v)).collect();
+
+    let (cos, sin) = rope_cos_sin_tables_f16(seq_len, head_dim);
+    let seg_ids  = vec![0u16; seq_len];   // single segment (non-null, mask is no-op)
+    // doc_starts layout: [batch_size, MAX_NUM_DOCS+1] i32, total batch_size * 1028 bytes.
+    // 257 entries per batch row. All zero → doc 0 starts at 0 → standard positions.
+    const MAX_NUM_DOCS_P1: usize = 257;
+    let doc_zero = vec![0i32; MAX_NUM_DOCS_P1];  // 1 batch row of 257 i32s, all zero
+
+    eprintln!("Test B — rope_q=true + doc_starts=[0,...] (standard positions backward)");
+    let with_doc_zero = launch_pca_backward_ex(
+        &x, &wq_f16, &wk_f16, &wv_f16, &do_f16,
+        seq_len, head_dim, block, block,
+        /*rope_q=*/true, &seg_ids, /*segment_masked=*/true,
+        Some((&cos, &sin)), Some(&doc_zero),
+    ).unwrap_or_else(|| panic!(
+        "Test B: doc_starts=[0] backward launch failed — this is unexpected (rope_q=true, hd=32)"
+    ));
+
+    eprintln!("Test B — rope_q=true + doc_starts=NULL (null-guard path backward)");
+    let with_doc_null = launch_pca_backward_ex(
+        &x, &wq_f16, &wk_f16, &wv_f16, &do_f16,
+        seq_len, head_dim, block, block,
+        true, &seg_ids, true,
+        Some((&cos, &sin)), None,   // None → doc_starts_ptr = 0 (null-guard)
+    ).unwrap_or_else(|| panic!(
+        "Test B: doc_starts=NULL backward launch failed (null-guard must not crash)"
+    ));
+
+    let (dq_zero, dk_zero, dv_zero) = with_doc_zero;
+    let (dq_null, dk_null, dv_null) = with_doc_null;
+
+    assert_no_nan("dq_zero", &dq_zero, "Test B");
+    assert_no_nan("dk_zero", &dk_zero, "Test B");
+    assert_no_nan("dv_zero", &dv_zero, "Test B");
+    assert_no_nan("dq_null", &dq_null, "Test B");
+    assert_no_nan("dk_null", &dk_null, "Test B");
+    assert_no_nan("dv_null", &dv_null, "Test B");
+
+    let (dq_diff, dq_idx) = max_abs_diff(&dq_null, &dq_zero);
+    let (dk_diff, dk_idx) = max_abs_diff(&dk_null, &dk_zero);
+    let (dv_diff, dv_idx) = max_abs_diff(&dv_null, &dv_zero);
+
+    eprintln!(
+        "Test B [doc_starts_null vs doc_starts=[0] backward]: \
+         dq={:.3e}@[{dq_idx}]  dk={:.3e}@[{dk_idx}]  dv={:.3e}@[{dv_idx}]",
+        dq_diff, dk_diff, dv_diff,
+    );
+    eprintln!("  first 4 dq_null: {:?}", &dq_null[..4.min(dq_null.len())]);
+    eprintln!("  first 4 dq_zero: {:?}", &dq_zero[..4.min(dq_zero.len())]);
+
+    let tol = 5e-3f32;
+    assert!(dq_diff <= tol,
+        "Test B FAILED: dq={:.3e} > {:.0e} (null-guard != doc_starts=[0] backward)", dq_diff, tol);
+    assert!(dk_diff <= tol,
+        "Test B FAILED: dk={:.3e} > {:.0e} (null-guard != doc_starts=[0] backward)", dk_diff, tol);
+    assert!(dv_diff <= tol,
+        "Test B FAILED: dv={:.3e} > {:.0e} (null-guard != doc_starts=[0] backward)", dv_diff, tol);
+    eprintln!(
+        "Test B PASSED: doc_starts-null == standard positions backward, \
+         dq={:.3e} dk={:.3e} dv={:.3e} <= {:.0e}",
+        dq_diff, dk_diff, dv_diff, tol,
+    );
+}
