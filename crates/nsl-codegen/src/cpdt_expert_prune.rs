@@ -122,6 +122,168 @@ pub fn prune_dead_experts(
     })
 }
 
+use crate::weight_aware::{WeightEntry, WeightMap};
+use std::collections::HashMap;
+
+/// Per-MoE outcome of the prune pass (for reporting + tests).
+#[derive(Debug, Clone, PartialEq)]
+pub enum MoePruneOutcome {
+    Pruned { layer: String, dead: Vec<u32>, n_live: usize, dropped_bytes: u64 },
+    NoDeadExperts { layer: String },
+    SkippedMissingRouter { layer: String },
+    SkippedMissingExperts { layer: String },
+    Refused { layer: String, refusal: ExpertPruneRefusal },
+}
+
+/// Affinity threshold below which an expert is pruned (mirrors
+/// `ExpertConfig::default().dead_expert_threshold`).
+const DEAD_EXPERT_THRESHOLD: f64 = 0.01;
+
+/// Resolve a `WeightMap` entry by trying candidate name suffixes under `key`.
+fn resolve<'a>(wm: &'a WeightMap, key: &str, suffixes: &[&str]) -> Option<&'a WeightEntry> {
+    suffixes.iter().find_map(|s| wm.get(&format!("{key}.{s}")))
+}
+
+/// Core of the non-WGGO MoE dead-expert prune pass. Mutates `weight_map`
+/// (slices router + experts in place) and `moe_configs` (threads `n_live` into
+/// `num_experts` for forward-looking consistency). Returns per-MoE outcomes.
+///
+/// No-op unless `cpdt_mode == Full`. Opportunistic: missing router/experts ->
+/// skip-with-outcome; found-but-inconsistent -> refusal-with-outcome; neither
+/// mutates the map. This is the blocker-sidestep call: it depends only on the
+/// router weights + the pure detection functions, never on WGGO/source-AD.
+pub fn prune_moe_weights_in_map(
+    cpdt_mode: crate::cpdt::CpdtMode,
+    moe_configs: &mut HashMap<String, crate::moe::MoeInfo>,
+    weight_map: &mut WeightMap,
+) -> Vec<MoePruneOutcome> {
+    use crate::cpdt::CpdtMode;
+    if cpdt_mode != CpdtMode::Full {
+        return Vec::new();
+    }
+
+    // Deterministic order over MoE layers.
+    let mut keys: Vec<String> = moe_configs.keys().cloned().collect();
+    keys.sort();
+
+    let mut outcomes = Vec::new();
+    for key in keys {
+        let info = moe_configs[&key].clone();
+        let n = info.num_experts;
+
+        // Resolve router (drives detection + slice) and packed experts.
+        let router_entry = match resolve(weight_map, &key, &["router.weight", "gate.weight", "router", "gate"]) {
+            Some(e) => e.clone(),
+            None => {
+                outcomes.push(MoePruneOutcome::SkippedMissingRouter { layer: key });
+                continue;
+            }
+        };
+        let expert_name = ["experts.weight", "experts"]
+            .iter()
+            .map(|s| format!("{key}.{s}"))
+            .find(|nm| weight_map.get(nm).is_some());
+        let expert_name = match expert_name {
+            Some(nm) => nm,
+            None => {
+                outcomes.push(MoePruneOutcome::SkippedMissingExperts { layer: key });
+                continue;
+            }
+        };
+        let expert_entry = weight_map.get(&expert_name).unwrap().clone();
+        let router_name = router_entry.name.clone();
+
+        // Found-but-inconsistent router shape -> refusal.
+        if router_entry.shape.len() != 2 || router_entry.shape[1] != n {
+            outcomes.push(MoePruneOutcome::Refused {
+                layer: key,
+                refusal: ExpertPruneRefusal::RouterShapeMismatch {
+                    expected_elems: router_entry.shape.first().copied().unwrap_or(0) * n,
+                    actual_elems: router_entry.num_elements,
+                },
+            });
+            continue;
+        }
+        let d_model = router_entry.shape[0];
+        let block_elems = expert_entry.num_elements / n.max(1);
+
+        // Detect dead experts from the router weights alone.
+        let affinities = crate::cpdt_expert::router_affinities(&router_entry, n as u32);
+        let dead = crate::cpdt_expert::detect_dead_experts(&affinities, DEAD_EXPERT_THRESHOLD);
+
+        let bundle = MoeWeightBundle {
+            router: router_entry.data.clone(),
+            experts: expert_entry.data.clone(),
+            d_model,
+            n_experts: n,
+            expert_block_elems: block_elems,
+            dtype: router_entry.dtype,
+            top_k: info.top_k,
+        };
+
+        match prune_dead_experts(&bundle, &dead) {
+            Err(refusal) => outcomes.push(MoePruneOutcome::Refused { layer: key, refusal }),
+            Ok(res) if res.dead_experts.is_empty() => {
+                outcomes.push(MoePruneOutcome::NoDeadExperts { layer: key });
+            }
+            Ok(res) => {
+                let dropped_bytes = (router_entry.data.len() - res.sliced_router.len()
+                    + expert_entry.data.len() - res.kept_experts.len()) as u64;
+                // Mutate the WeightMap entries in place (smaller bundle).
+                let new_router = WeightEntry::new(
+                    router_name.clone(),
+                    res.sliced_router,
+                    vec![d_model, res.n_live],
+                    router_entry.dtype,
+                );
+                let new_experts = WeightEntry::new(
+                    expert_name.clone(),
+                    res.kept_experts,
+                    vec![res.n_live, block_elems],
+                    expert_entry.dtype,
+                );
+                weight_map.insert(new_router);
+                weight_map.insert(new_experts);
+                // Thread n_live into the config (forward-looking consistency).
+                if let Some(cfg) = moe_configs.get_mut(&key) {
+                    cfg.num_experts = res.n_live;
+                }
+                outcomes.push(MoePruneOutcome::Pruned {
+                    layer: key,
+                    dead: res.dead_experts,
+                    n_live: res.n_live,
+                    dropped_bytes,
+                });
+            }
+        }
+    }
+    outcomes
+}
+
+/// Render a one-line report for each outcome (stderr).
+pub fn report_outcomes(outcomes: &[MoePruneOutcome]) {
+    for o in outcomes {
+        match o {
+            MoePruneOutcome::Pruned { layer, dead, n_live, dropped_bytes } => eprintln!(
+                "[cpdt] moe '{layer}': pruned experts {dead:?} (affinity < {DEAD_EXPERT_THRESHOLD}) \
+                 -> n_live={n_live}, dropped {dropped_bytes} bytes"
+            ),
+            MoePruneOutcome::NoDeadExperts { layer } => {
+                eprintln!("[cpdt] moe '{layer}': no dead experts, nothing pruned")
+            }
+            MoePruneOutcome::SkippedMissingRouter { layer } => {
+                eprintln!("[cpdt] moe '{layer}': skipped — no router weight found")
+            }
+            MoePruneOutcome::SkippedMissingExperts { layer } => {
+                eprintln!("[cpdt] moe '{layer}': skipped — no expert weights found")
+            }
+            MoePruneOutcome::Refused { layer, refusal } => {
+                eprintln!("[cpdt] moe '{layer}': prune refused — {refusal:?}")
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

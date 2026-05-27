@@ -181,3 +181,115 @@ fn live_prune_negative_control() {
 
     assert_ne!(out_wrong, out_ref, "pruning a live expert MUST change the output");
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Layer 3 — non-WGGO pass reachability
+// ─────────────────────────────────────────────────────────────────────────────
+
+use std::collections::HashMap;
+use nsl_codegen::cpdt::CpdtMode;
+use nsl_codegen::cpdt_expert_prune::{prune_moe_weights_in_map, MoePruneOutcome};
+use nsl_codegen::moe::MoeInfo;
+use nsl_codegen::weight_aware::WeightMap;
+
+fn moe_info(num_experts: usize, top_k: usize) -> MoeInfo {
+    MoeInfo { num_experts, top_k, capacity_factor: 100.0, aux_loss_coeff: 0.0 }
+}
+
+/// WeightMap with a router (dead col 1) + packed experts under `<key>.*`.
+fn weight_map_with_moe(key: &str) -> WeightMap {
+    let mut wm = WeightMap::default();
+    wm.insert(WeightEntry::new(
+        format!("{key}.router.weight"),
+        f32s(&router_flat()),
+        vec![D, N],
+        WeightDType::F32,
+    ));
+    wm.insert(WeightEntry::new(
+        format!("{key}.experts.weight"),
+        f32s(&experts_flat(&[0, 1, 2, 3])),
+        vec![N, D * D],
+        WeightDType::F32,
+    ));
+    wm
+}
+
+#[test]
+fn pass_prunes_and_reports() {
+    let mut wm = weight_map_with_moe("blocks.0.moe");
+    let mut cfgs = HashMap::new();
+    cfgs.insert("blocks.0.moe".to_string(), moe_info(N, 1));
+
+    let outcomes = prune_moe_weights_in_map(CpdtMode::Full, &mut cfgs, &mut wm);
+
+    // Outcome records the prune.
+    assert!(matches!(
+        outcomes.as_slice(),
+        [MoePruneOutcome::Pruned { ref dead, n_live: 3, .. }] if dead == &vec![1]
+    ));
+    // Router sliced to [D, 3]; experts sliced to [3, D*D].
+    assert_eq!(wm.get("blocks.0.moe.router.weight").unwrap().shape, vec![D, 3]);
+    assert_eq!(wm.get("blocks.0.moe.experts.weight").unwrap().shape, vec![3, D * D]);
+    // num_experts threaded to the config (forward-looking consistency).
+    assert_eq!(cfgs["blocks.0.moe"].num_experts, 3);
+}
+
+#[test]
+fn pass_skips_missing_router() {
+    let mut wm = WeightMap::default(); // no router entry
+    let mut cfgs = HashMap::new();
+    cfgs.insert("m".to_string(), moe_info(N, 1));
+    let outcomes = prune_moe_weights_in_map(CpdtMode::Full, &mut cfgs, &mut wm);
+    assert!(matches!(outcomes.as_slice(), [MoePruneOutcome::SkippedMissingRouter { .. }]));
+    assert_eq!(cfgs["m"].num_experts, N); // untouched
+}
+
+#[test]
+fn pass_gated_off_when_not_full() {
+    let mut wm = weight_map_with_moe("m");
+    let mut cfgs = HashMap::new();
+    cfgs.insert("m".to_string(), moe_info(N, 1));
+    let outcomes = prune_moe_weights_in_map(CpdtMode::ZeroOnly, &mut cfgs, &mut wm);
+    assert!(outcomes.is_empty());
+    assert_eq!(wm.get("m.router.weight").unwrap().shape, vec![D, N]); // untouched
+}
+
+#[test]
+fn pass_runs_without_wggo() {
+    // Blocker-sidestep: no WGGO/source-AD setup anywhere — the pass prunes from
+    // the router weights alone (cpdt Full + weights).
+    let mut wm = weight_map_with_moe("m");
+    let mut cfgs = HashMap::new();
+    cfgs.insert("m".to_string(), moe_info(N, 1));
+    let outcomes = prune_moe_weights_in_map(CpdtMode::Full, &mut cfgs, &mut wm);
+    assert!(matches!(outcomes.as_slice(), [MoePruneOutcome::Pruned { n_live: 3, .. }]));
+}
+
+#[test]
+fn pass_no_dead_experts_is_informational() {
+    // Router with NO zero column -> no dead experts -> informational no-op.
+    let mut wm = WeightMap::default();
+    wm.insert(WeightEntry::new(
+        "m.router.weight".into(),
+        f32s(&[
+            9.0, 2.0, 1.0, 1.0,
+            1.0, 2.0, 9.0, 1.0,
+            1.0, 2.0, 1.0, 9.0,
+            1.0, 2.0, 1.0, 1.0,
+        ]),
+        vec![D, N],
+        WeightDType::F32,
+    ));
+    wm.insert(WeightEntry::new(
+        "m.experts.weight".into(),
+        f32s(&experts_flat(&[0, 1, 2, 3])),
+        vec![N, D * D],
+        WeightDType::F32,
+    ));
+    let mut cfgs = HashMap::new();
+    cfgs.insert("m".to_string(), moe_info(N, 1));
+    let outcomes = prune_moe_weights_in_map(CpdtMode::Full, &mut cfgs, &mut wm);
+    assert!(matches!(outcomes.as_slice(), [MoePruneOutcome::NoDeadExperts { .. }]));
+    assert_eq!(wm.get("m.router.weight").unwrap().shape, vec![D, N]); // untouched
+    assert_eq!(cfgs["m"].num_experts, N);
+}
