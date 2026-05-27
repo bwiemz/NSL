@@ -225,6 +225,13 @@ pub fn cpu_naive_backward_dkdv(
 /// dq/dk/dv: row-major [batch,heads,seq,head_dim] f32. x_raw: [batch,heads,seq,d_model] f16.
 /// wq/wk/wv: [d_model, kv_dim] f16 (kv_dim = heads*head_dim). norm_weight: [d_model] f16.
 /// Returns (dWq, dWk, dWv, dx): dW* row-major [d_model, kv_dim] f32; dx [batch,heads,seq,d_model] f32.
+///
+/// The GPU folds the RMSNorm gain (gamma = norm_weight[p]) into x_norm BEFORE the
+/// projection: `x_norm[s,p] = (x_raw[s,p] / rms[s]) * norm_weight[p]` (emit_xnorm_recompute).
+/// Both gradient paths therefore carry gamma:
+///   dWq[p,j] = sum_s (x_raw[s,p]/rms[s]) * norm_weight[p] * dQ[s,j]   (likewise dWk/dWv)
+///   dx[s,p]  = g[p]/rms - x_raw[s,p]*sdot/(d_model*rms^3),
+///              where g[p] = dx_norm[s,p]*norm_weight[p], sdot = sum_p g[p]*x_raw[s,p].
 #[allow(clippy::too_many_arguments)]
 pub fn cpu_naive_backward_proj(
     dq: &[f32], dk: &[f32], dv: &[f32],
@@ -253,7 +260,13 @@ pub fn cpu_naive_backward_proj(
                 let rms = (mean_sq + eps).sqrt();
 
                 for p in 0..d_model {
-                    let xn = x_raw[x_base + p].to_f32() / rms;
+                    // x_norm = (x_raw/rms) * gamma -- the GPU folds the RMSNorm gain
+                    // (norm_weight[p]) into x_norm BEFORE the projection
+                    // (emit_xnorm_recompute), so the weight gradient MUST include it:
+                    //   dWq[p,j] = sum_s (x_raw[s,p]/rms[s]) * norm_weight[p] * dQ[s,j]
+                    // (the dx path below already applies gamma via g = dx_norm[p]*norm_weight[p];
+                    // omitting it here was an internal inconsistency).
+                    let xn = x_raw[x_base + p].to_f32() / rms * norm_weight[p].to_f32();
                     for j in 0..head_dim {
                         let col = hi * head_dim + j;
                         dwq[p * kv_dim + col] += xn * dq[y_base + j];
@@ -298,7 +311,15 @@ mod proj_tests {
     fn proj_dw_is_xnorm_t_times_dy_smoke() {
         // heads=1, d_model=head_dim=2, seq=1 -> single row, kv_dim=2.
         // x = [3,4] -> mean_sq = (9+16)/2 = 12.5; rms = sqrt(12.5+eps).
-        // x_norm = x/rms. dWq[p,j] = x_norm[0,p]*dq[0,j] (independent of Wq).
+        //
+        // NON-UNIT gamma (RMSNorm gain): gamma = [1.5, 0.5]. The GPU folds gamma
+        // into x_norm BEFORE the projection (x_norm = (x/rms)*gamma), so BOTH the
+        // weight-gradient and the input-gradient paths must carry gamma. With
+        // gamma != 1 this test FAILS if gamma is dropped from EITHER path:
+        //   dWq[p,j] = (x_raw[0,p]/rms) * gamma[p] * dq[0,j]   (gamma in dW path)
+        //   dx path:  dx_norm[p] = sum_j dq[j]*Wq[p,j];  g[p] = dx_norm[p]*gamma[p]
+        //             sdot = sum_p g[p]*x_raw[p];
+        //             dx[p] = g[p]/rms - x_raw[p]*sdot/(d_model*rms^3)
         let d_model = 2usize;
         let head_dim = 2usize;
         let seq = 1usize;
@@ -311,7 +332,7 @@ mod proj_tests {
         let wq = vec![h(1.0), h(0.0), h(0.0), h(1.0)];
         let wk = vec![h(0.0); d_model * head_dim];
         let wv = vec![h(0.0); d_model * head_dim];
-        let norm_weight = vec![h(1.0), h(1.0)];
+        let norm_weight = vec![h(1.5), h(0.5)];            // NON-UNIT gamma
 
         let (dwq, _dwk, _dwv, dx) = cpu_naive_backward_proj(
             &dq, &dk, &dv, &x_raw, &wq, &wk, &wv, &norm_weight,
@@ -319,20 +340,21 @@ mod proj_tests {
         );
 
         let rms = (12.5f32 + eps).sqrt();
-        let xn0 = 3.0 / rms;
-        let xn1 = 4.0 / rms;
-        // dWq[p,j] = x_norm[0,p]*dq[0,j]
-        assert!((dwq[0 * 2 + 0] - xn0 * 1.0).abs() < 1e-4, "dWq[0,0]");
-        assert!((dwq[0 * 2 + 1] - xn0 * 2.0).abs() < 1e-4, "dWq[0,1]");
-        assert!((dwq[1 * 2 + 0] - xn1 * 1.0).abs() < 1e-4, "dWq[1,0]");
-        assert!((dwq[1 * 2 + 1] - xn1 * 2.0).abs() < 1e-4, "dWq[1,1]");
+        let gamma = [1.5f32, 0.5f32];
+        let xr = [3.0f32, 4.0f32];
+        // dWq[p,j] = (x_raw[0,p]/rms) * gamma[p] * dq[0,j]  -- gamma MUST be present.
+        let xn0 = xr[0] / rms * gamma[0]; // (3/rms)*1.5
+        let xn1 = xr[1] / rms * gamma[1]; // (4/rms)*0.5
+        assert!((dwq[0 * 2 + 0] - xn0 * 1.0).abs() < 1e-4, "dWq[0,0]: got {} want {}", dwq[0], xn0 * 1.0);
+        assert!((dwq[0 * 2 + 1] - xn0 * 2.0).abs() < 1e-4, "dWq[0,1]: got {} want {}", dwq[1], xn0 * 2.0);
+        assert!((dwq[1 * 2 + 0] - xn1 * 1.0).abs() < 1e-4, "dWq[1,0]: got {} want {}", dwq[2], xn1 * 1.0);
+        assert!((dwq[1 * 2 + 1] - xn1 * 2.0).abs() < 1e-4, "dWq[1,1]: got {} want {}", dwq[3], xn1 * 2.0);
 
         // dx path (independent recomputation; identity Wq => dx_norm = [dq0, dq1] = [1,2]).
         let dxn = [1.0f32, 2.0f32];
-        let nw = [1.0f32, 1.0f32];
-        let xr = [3.0f32, 4.0f32];
-        let sdot = dxn[0] * nw[0] * xr[0] + dxn[1] * nw[1] * xr[1]; // 1*3 + 2*4 = 11
-        let exp = |p: usize| dxn[p] * nw[p] / rms - xr[p] * sdot / (d_model as f32 * rms * rms * rms);
+        let g = [dxn[0] * gamma[0], dxn[1] * gamma[1]]; // [1*1.5, 2*0.5] = [1.5, 1.0]
+        let sdot = g[0] * xr[0] + g[1] * xr[1]; // 1.5*3 + 1.0*4 = 8.5
+        let exp = |p: usize| g[p] / rms - xr[p] * sdot / (d_model as f32 * rms * rms * rms);
         assert!((dx[0] - exp(0)).abs() < 1e-4, "dx[0]: got {} want {}", dx[0], exp(0));
         assert!((dx[1] - exp(1)).abs() < 1e-4, "dx[1]: got {} want {}", dx[1], exp(1));
     }

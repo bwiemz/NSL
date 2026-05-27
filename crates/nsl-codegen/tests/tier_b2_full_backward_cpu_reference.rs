@@ -142,17 +142,21 @@ fn rel_tol_attn(hd: u32) -> f32 {
 ///
 /// The dproj kernel accumulates `dW = x_norm^T @ dY` in f32 but STORES the
 /// result as f16 (`cvt.rn.f16.f32`, by design — weight gradients are consumed
-/// f16 downstream) and recomputes x_norm with `rsqrt.approx.f32`. With dO
-/// upscaled x1024 the dW values are large (dWv up to ~1.8e3), where the f16 ULP
-/// is O(1); the resulting relative error is empirically ~5..9% (dWv worst,
-/// being contracted against the largest gradient dV). 1.2e-1 is the honest
-/// tolerance for an f16-stored weight gradient — NOT a loosening to hide a bug
-/// (the dx gradient below, stored f32, matches the CPU ref to ~1e-6, confirming
-/// the dproj/dRMSNorm math itself is exact; the residual is purely the f16 dW
-/// store). The scalar Tier C backward masks this by gating dW with *absolute*
-/// tolerances at un-upscaled (x0.1) input magnitudes.
+/// f16 downstream) and recomputes x_norm with `rsqrt.approx.f32`. The GPU folds
+/// the RMSNorm gain into x_norm = (x/rms)*gamma BEFORE the projection; the CPU
+/// reference (`cpu_naive_backward_proj`) now applies the SAME gamma in its dW
+/// path, so the two agree at genuine f16-STORE precision — the dW comparison is
+/// NOT masking any math error. (The previous 1.2e-1 tolerance was hiding a real
+/// reference bug: the CPU dW path omitted gamma, inflating the rel error to
+/// ~5..9%; once gamma is included the residual collapses to f16-store level. See
+/// `nsl-test/src/cpu_naive_backward.rs` doc.) Measured against the gamma-correct
+/// reference on RTX 5070 Ti (NSL_CUDA_SYNC=1): the worst dWq/dWk/dWv rel error
+/// across {CpuNaive,B1Forward} x {hd=64,hd=128} is 4.4e-4 (all four configs in
+/// the 2.5e-4..4.4e-4 band) — pure f16-store floor; cf. dx below at ~1e-6
+/// (f32-stored). The 3e-3 bound passes with ~7x margin and is NOT padded back
+/// toward the old 1.2e-1 (which was hiding the dropped-gamma reference bug).
 fn rel_tol_dweight(_hd: u32) -> f32 {
-    1.2e-1
+    3e-3
 }
 
 /// Tiered RELATIVE tolerance for dx (the input-tensor gradient).
