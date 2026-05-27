@@ -90,6 +90,10 @@ pub fn tier_b2_can_dispatch(
 /// single Q tile) AND Tier B.2 dispatch eligibility. `tier_b2_can_dispatch` is intentionally NOT
 /// modified -- the constraint is the hybrid's, not the Tier-B.2 kernels'. Widens when the
 /// projection-extension follow-on lands. `batch` is a launch dim, enforced by the parity test, not here.
+///
+/// `active_heads` must be **exactly 1** (`active_heads == 1`). The `0` sentinel meaning "all heads"
+/// is rejected as ambiguous — a many-head config routed through the single-head hybrid would produce
+/// colliding projection gradients. Over-routing is unsafe; under-routing falls back safely to scalar.
 pub fn tier_b2_hybrid_backward_eligible(config: &FlashAttentionConfig, seq_len: u32) -> bool {
     if tier_b2_can_dispatch(config).is_err() {
         return false;
@@ -97,7 +101,7 @@ pub fn tier_b2_hybrid_backward_eligible(config: &FlashAttentionConfig, seq_len: 
     let Some(csha) = config.csha.as_ref() else { return false; };
     let hd = config.head_dim as u32;
     let block_q = config.block_q as u32;
-    csha.active_heads.max(1) == 1
+    csha.active_heads == 1  // exactly one active head; the 0="all" sentinel is rejected as ambiguous -> safe fallback to scalar
         && csha.d_model == hd
         && seq_len == block_q
         && !config.rope_q

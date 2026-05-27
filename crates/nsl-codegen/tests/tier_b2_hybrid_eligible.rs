@@ -29,3 +29,7 @@ fn cfg(hd: i64, heads: u32, d_model: u32, rope: bool) -> FlashAttentionConfig {
     let mut c = cfg(64, 1, 64, false); c.csha = None;
     assert!(!tier_b2_hybrid_backward_eligible(&c, 64));
 }
+#[test] fn active_heads_zero_rejected() {
+    // active_heads=0 ("all heads", possibly many) is ambiguous -> must NOT be eligible.
+    assert!(!tier_b2_hybrid_backward_eligible(&cfg(64, 0, 64, false), 64));
+}
