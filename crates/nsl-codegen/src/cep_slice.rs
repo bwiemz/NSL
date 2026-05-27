@@ -207,6 +207,14 @@ fn parse_layer_tensor(name: &str) -> Option<(u32, &'static str, String)> {
 /// Slice a model's weights to a PruneDelta. Returns the sliced entries (a smaller set).
 /// Pure data transform — drops pruned heads' blocks (GQA-group-aligned), narrows FFN by
 /// magnitude survivors (consistent across w_gate/w_up/w_down), drops + re-keys dropped layers.
+///
+/// LIMITATION (SP1 scope): only `attn.*` and `ffn.*` per-layer tensors are sliced/re-keyed.
+/// Other intra-layer tensors (e.g. RMSNorm scales `blocks.{l}.norm.*`) take the passthrough
+/// path with their ORIGINAL key. That is correct for head/FFN pruning (which never renumbers
+/// layers), but it is NOT drop-aware: if `drop_layer` is ever set, such tensors are neither
+/// omitted for dropped layers nor renumbered for survivors. The greedy planner never sets
+/// `drop_layer` (it is always false today), so this is latent; full layer-drop support that
+/// also handles norm/other intra-layer tensors is deferred (SP2).
 pub fn apply_prune_delta_to_weights(
     wm: &WeightMap,
     spec: &ModelSpec,
@@ -330,14 +338,14 @@ pub fn write_sliced_weights(
     path: &std::path::Path,
 ) -> std::io::Result<()> {
     use safetensors::tensor::TensorView;
-    let views: Vec<(String, TensorView)> = entries
-        .iter()
-        .map(|(name, e)| {
-            let v = TensorView::new(to_safetensors_dtype(e.dtype), e.shape.clone(), &e.data)
-                .expect("valid tensor view");
-            (name.clone(), v)
-        })
-        .collect();
+    // Build views, propagating a shape/data-length inconsistency as an io::Error rather than
+    // panicking at the serialization boundary (`?` can't be used inside a `.map` closure).
+    let mut views: Vec<(String, TensorView)> = Vec::with_capacity(entries.len());
+    for (name, e) in entries {
+        let v = TensorView::new(to_safetensors_dtype(e.dtype), e.shape.clone(), &e.data)
+            .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err.to_string()))?;
+        views.push((name.clone(), v));
+    }
     let bytes = safetensors::serialize(views, &None)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
     std::fs::write(path, bytes)
@@ -363,9 +371,13 @@ mod tests {
     // Build a WeightMap with per-layer attn+ffn tensors (ramp values) + an embed passthrough.
     fn small_weights(spec: &ModelSpec) -> WeightMap {
         let mut entries = std::collections::HashMap::new();
-        let mut ramp = |name: &str, shape: Vec<usize>| {
+        // Each layer gets a distinct base offset so a tensor's layer identity is recoverable
+        // from its data — this lets the drop/re-key test assert the surviving tensor holds the
+        // ORIGINAL layer's bytes (not a different layer's). Layer 0 uses base 0, so the
+        // value-identity assertions in the head/FFN slicing test are unaffected.
+        let mut ramp = |name: &str, shape: Vec<usize>, base: f32| {
             let n: usize = shape.iter().product();
-            let vals: Vec<f32> = (0..n).map(|i| i as f32).collect();
+            let vals: Vec<f32> = (0..n).map(|i| base + i as f32).collect();
             entries.insert(name.to_string(), f32_entry(name, shape, &vals));
         };
         let dm = spec.d_model as usize;
@@ -374,15 +386,16 @@ mod tests {
             let nkv = spec.n_kv_heads[l] as usize;
             let hd = spec.head_dim[l] as usize;
             let dff = spec.d_ff[l] as usize;
-            ramp(&format!("blocks.{l}.attn.wq"), vec![dm, nh * hd]);
-            ramp(&format!("blocks.{l}.attn.wk"), vec![dm, nkv * hd]);
-            ramp(&format!("blocks.{l}.attn.wv"), vec![dm, nkv * hd]);
-            ramp(&format!("blocks.{l}.attn.wo"), vec![nh * hd, dm]);
-            ramp(&format!("blocks.{l}.ffn.w_gate"), vec![dm, dff]);
-            ramp(&format!("blocks.{l}.ffn.w_up"), vec![dm, dff]);
-            ramp(&format!("blocks.{l}.ffn.w_down"), vec![dff, dm]);
+            let base = (l as f32) * 10_000.0;
+            ramp(&format!("blocks.{l}.attn.wq"), vec![dm, nh * hd], base);
+            ramp(&format!("blocks.{l}.attn.wk"), vec![dm, nkv * hd], base);
+            ramp(&format!("blocks.{l}.attn.wv"), vec![dm, nkv * hd], base);
+            ramp(&format!("blocks.{l}.attn.wo"), vec![nh * hd, dm], base);
+            ramp(&format!("blocks.{l}.ffn.w_gate"), vec![dm, dff], base);
+            ramp(&format!("blocks.{l}.ffn.w_up"), vec![dm, dff], base);
+            ramp(&format!("blocks.{l}.ffn.w_down"), vec![dff, dm], base);
         }
-        ramp("embed", vec![spec.vocab as usize, dm]);
+        ramp("embed", vec![spec.vocab as usize, dm], 0.0);
         WeightMap::from_entries(entries)
     }
 
@@ -433,9 +446,14 @@ mod tests {
         };
         let out = apply_prune_delta_to_weights(&wm, &spec, &delta).unwrap();
         assert!(!out.contains_key("blocks.1.attn.wq"), "old layer-1 name must be re-keyed");
-        // original layer-1 wq (ramp 0..64) now lives at blocks.0.attn.wq
+        // original layer-1 wq now lives at blocks.0.attn.wq
         assert!(out.contains_key("blocks.0.attn.wq"));
         assert_eq!(out["blocks.0.attn.wq"].shape, vec![8, 8]);
+        // non-vacuous: it must hold the ORIGINAL layer-1 bytes (base 10000), not layer-0's
+        // (base 0) — proves the re-key carried the surviving layer's data, not a stale copy.
+        let wq_f = read_f32(&out["blocks.0.attn.wq"]);
+        assert_eq!(wq_f[0], 10_000.0);
+        assert_eq!(wq_f[63], 10_063.0);
         assert!(out.contains_key("embed"));
     }
 
