@@ -197,6 +197,83 @@ fn fixture_config(segment_masked: bool) -> FlashAttentionConfig {
 }
 
 // ---------------------------------------------------------------------------
+// f32 → f16 bit conversion helper (mirrors pca_tier_a_backward_correctness.rs).
+// Needed for converting cos/sin tables to f16 before device upload.
+// ---------------------------------------------------------------------------
+
+fn f32_to_f16_bits(x: f32) -> u16 {
+    if x.is_nan() { return 0x7E00; }
+    let b = x.to_bits();
+    let sign = (b >> 31) & 1;
+    let exp  = ((b >> 23) & 0xFF) as i32;
+    let mant = b & 0x7FFFFF;
+    if exp == 255 { return ((sign << 15) | 0x7C00 | if mant != 0 { 0x200 } else { 0 }) as u16; }
+    let exp_f16 = exp - 127 + 15;
+    if exp_f16 <= 0 {
+        let shift = (1 - exp_f16).min(24) as u32;
+        let shifted = (mant | 0x800000) >> shift;
+        let rounded = (shifted + 0x1000) >> 13;
+        return ((sign << 15) | rounded) as u16;
+    }
+    if exp_f16 >= 31 { return ((sign << 15) | 0x7C00) as u16; }
+    let mant16 = (mant + 0x1000) >> 13;
+    let overflow = (mant16 >> 10) & 1;
+    let exp16 = (exp_f16 as u32 + overflow) & 0x1F;
+    ((sign << 15) | (exp16 << 10) | (mant16 & 0x3FF)) as u16
+}
+
+// ---------------------------------------------------------------------------
+// Parameterized config builder — lets callers force the extern-SMEM regime
+// (total_bytes > 16 KB, e.g. head_dim=128, block_q=block_kv=128) and
+// exercise RoPE by passing rope_q=true.
+// ---------------------------------------------------------------------------
+
+#[allow(dead_code)] // used by Task 3/5/7 GPU tests
+fn fixture_config_sized(
+    head_dim: i64, block_q: i64, block_kv: i64, rope_q: bool, segment_masked: bool,
+) -> FlashAttentionConfig {
+    let mut c = fixture_config(segment_masked); // reuse base fields (causal, gpu_sm, csha, etc.)
+    c.head_dim = head_dim;
+    c.block_q  = block_q;
+    c.block_kv = block_kv;
+    c.rope_q   = rope_q;
+    c
+}
+
+// ---------------------------------------------------------------------------
+// RoPE cos/sin table generator.
+//
+// Generates standard RoPE tables in the layout the CSHA kernel's
+// `emit_rope_pair_sweep` reads:
+//
+//   cos/sin: [seq_len, half_dim] where half_dim = head_dim / 2
+//   element dtype: f16 (the kernel does `ld.global.b16` + `cvt.f32.f16`)
+//   address formula: (pos * half_dim + i) * 2  (bytes, 2 = sizeof(f16))
+//
+// Theta formula (matches cpu_reference_rope_single_doc / pca_rope_numerical):
+//   theta = pos / 10000^(2*i / head_dim)
+// which equals pos * 10000^(-(2*i / head_dim)).
+//
+// The returned Vec<u16> contains f16 bits, ready for nsl_test_cuda_h2d
+// (pass `cos_f16.as_ptr() as i64` and byte size = seq_len * half_dim * 2).
+// ---------------------------------------------------------------------------
+
+#[allow(dead_code)] // used by Task 3/5/7 GPU tests
+fn rope_cos_sin_tables_f16(seq_len: usize, head_dim: usize) -> (Vec<u16>, Vec<u16>) {
+    let half = head_dim / 2;
+    let mut cos_f16 = vec![0u16; seq_len * half];
+    let mut sin_f16 = vec![0u16; seq_len * half];
+    for pos in 0..seq_len {
+        for i in 0..half {
+            let theta = (pos as f64) * 10_000f64.powf(-(2.0 * i as f64) / head_dim as f64);
+            cos_f16[pos * half + i] = f32_to_f16_bits(theta.cos() as f32);
+            sin_f16[pos * half + i] = f32_to_f16_bits(theta.sin() as f32);
+        }
+    }
+    (cos_f16, sin_f16)
+}
+
+// ---------------------------------------------------------------------------
 // Core launch helper: upload Q/K/V + segment_ids, launch the kernel,
 // read back f16 output, free device memory; return host f32 output.
 //
@@ -793,4 +870,165 @@ fn interleave_unpacked_outputs(
         seq_offset += seg_len;
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// Extended forward launch helper — supports caller-chosen dims, rope_q=true,
+// and optional cos/sin / doc_starts uploads.
+//
+// - cos_sin = Some((cos_f16, sin_f16)): upload both, pass real cos_ptr/sin_ptr.
+//   Slices must be [seq_len * (head_dim/2)] f16 bits each.
+//   Use rope_cos_sin_tables_f16() to generate them.
+// - cos_sin = None: pass 0i64 for cos_ptr and sin_ptr.
+// - doc_starts = Some(ds): upload [max_docs_per_row+1] i32 entries and
+//   pass real doc_starts_ptr.
+// - doc_starts = None: pass 0i64.
+// - seg_ids empty AND segment_masked=false: seg_ids_ptr = 0.
+//
+// Dynamic SMEM: nsl_flash_attention_csha passes shared_mem_bytes to
+// kernel_launch, which calls cuFuncSetAttribute(MAX_DYNAMIC_SHARED_SIZE_BYTES)
+// for any non-zero value — so large/extern-SMEM configs are handled
+// automatically via shared_mem_bytes_selected().
+// ---------------------------------------------------------------------------
+
+#[allow(dead_code)]              // used by Task 3/5/7 GPU tests
+#[allow(clippy::too_many_arguments)]
+fn launch_pca_ex(
+    q: &[f32], k: &[f32], v: &[f32],
+    batch: usize, heads: usize, seq_len: usize, head_dim: usize,
+    block_q: i64, block_kv: i64,
+    rope_q: bool, segment_masked: bool, seg_ids: &[u16],
+    cos_sin: Option<(&[u16], &[u16])>,
+    doc_starts: Option<&[i32]>,
+) -> Option<Vec<f32>> {
+    let total    = batch * heads * seq_len * head_dim;
+    let f32_bytes = (total * std::mem::size_of::<f32>()) as i64;
+    let f16_bytes = (total * std::mem::size_of::<u16>()) as i64;
+    let lse_bytes = (batch * heads * seq_len * std::mem::size_of::<f32>()) as i64;
+
+    let config = fixture_config_sized(head_dim as i64, block_q, block_kv, rope_q, segment_masked);
+    let scale  = 1.0f32 / (head_dim as f32).sqrt();
+
+    let q_dev   = nsl_test_cuda_alloc(f32_bytes);
+    let k_dev   = nsl_test_cuda_alloc(f32_bytes);
+    let v_dev   = nsl_test_cuda_alloc(f32_bytes);
+    let out_dev = nsl_test_cuda_alloc(f16_bytes);
+    let lse_dev = nsl_test_cuda_alloc(lse_bytes);
+
+    assert!(q_dev != 0 && k_dev != 0 && v_dev != 0 && out_dev != 0 && lse_dev != 0,
+        "device alloc returned null");
+
+    nsl_test_cuda_h2d(q_dev, q.as_ptr() as i64, f32_bytes);
+    nsl_test_cuda_h2d(k_dev, k.as_ptr() as i64, f32_bytes);
+    nsl_test_cuda_h2d(v_dev, v.as_ptr() as i64, f32_bytes);
+
+    // Upload segment_ids if needed.
+    let seg_ids_dev: i64 = if !seg_ids.is_empty() && segment_masked {
+        let seg_bytes = std::mem::size_of_val(seg_ids) as i64;
+        let ptr = nsl_test_cuda_alloc(seg_bytes);
+        assert!(ptr != 0, "segment_ids device alloc returned null");
+        nsl_test_cuda_h2d(ptr, seg_ids.as_ptr() as i64, seg_bytes);
+        ptr
+    } else {
+        0i64
+    };
+
+    // Upload cos/sin tables (f16) if rope_q is active.
+    let (cos_dev, sin_dev): (i64, i64) = if let Some((cos_f16, sin_f16)) = cos_sin {
+        let cs_bytes = std::mem::size_of_val(cos_f16) as i64;
+        let c_ptr = nsl_test_cuda_alloc(cs_bytes);
+        let s_ptr = nsl_test_cuda_alloc(cs_bytes);
+        assert!(c_ptr != 0 && s_ptr != 0, "cos/sin device alloc returned null");
+        nsl_test_cuda_h2d(c_ptr, cos_f16.as_ptr() as i64, cs_bytes);
+        nsl_test_cuda_h2d(s_ptr, sin_f16.as_ptr() as i64, std::mem::size_of_val(sin_f16) as i64);
+        (c_ptr, s_ptr)
+    } else {
+        (0i64, 0i64)
+    };
+
+    // Upload doc_starts if provided.
+    let doc_starts_dev: i64 = if let Some(ds) = doc_starts {
+        let ds_bytes = std::mem::size_of_val(ds) as i64;
+        let ptr = nsl_test_cuda_alloc(ds_bytes);
+        assert!(ptr != 0, "doc_starts device alloc returned null");
+        nsl_test_cuda_h2d(ptr, ds.as_ptr() as i64, ds_bytes);
+        ptr
+    } else {
+        0i64
+    };
+
+    // PTX synthesis.
+    let mut ptx = synthesize_flash_attention_ptx_selected(&config);
+    while ptx.last() == Some(&0) { ptx.pop(); }
+    if ptx.last() != Some(&b'\n') { ptx.push(b'\n'); }
+    let dump = std::env::temp_dir().join(format!(
+        "pca_ex_seg{}_hd{}_bq{}_rope{}.ptx",
+        if segment_masked { "masked" } else { "plain" },
+        head_dim, block_q, if rope_q { "true" } else { "false" },
+    ));
+    std::fs::write(&dump, &ptx).ok();
+    eprintln!("PTX dumped to: {}", dump.display());
+    ptx.push(0);
+
+    let kernel_name = CString::new(flash_attention_kernel_name_selected(&config)).unwrap();
+    let smem = shared_mem_bytes_selected(&config) as i64;
+
+    let rc = nsl_flash_attention_csha(
+        q_dev, k_dev, v_dev, out_dev, lse_dev,
+        scale.to_bits() as i64,
+        batch as i64, heads as i64, seq_len as i64, head_dim as i64,
+        0, 0, 0, 0,         // paging
+        cos_dev, sin_dev, 0, 0,  // cos_ptr, sin_ptr, seq_ids_ptr, seq_lens_ptr
+        smem,
+        ptx.as_ptr() as i64,
+        kernel_name.as_ptr() as i64,
+        config.block_q, config.block_kv,
+        1i64,               // causal=true (PCA always causal)
+        // CSHA extras — all null/zero (no CSHA for Tier A PCA)
+        0, 0, 0, 0, 0, 0,
+        1e-5f32.to_bits() as i64,
+        0i64, 0i64,
+        // PCA Tier A: segment_ids ptr
+        seg_ids_dev,
+        // Tier B extension — null
+        0i64, 0i64,
+        // doc_starts ptr
+        doc_starts_dev,
+    );
+
+    if rc != 0 {
+        let log_ptr = nsl_test_cuda_jit_log(ptx.as_ptr() as i64);
+        let log = if log_ptr != 0 {
+            unsafe {
+                let cstr = std::ffi::CStr::from_ptr(log_ptr as *const i8);
+                cstr.to_string_lossy().into_owned()
+            }
+        } else {
+            "<no log>".into()
+        };
+        eprintln!("launch_pca_ex failed rc={} hd={} bq={} bkv={} rope={}\nJIT log:\n{}",
+            rc, head_dim, block_q, block_kv, rope_q, log);
+        nsl_test_cuda_free(q_dev); nsl_test_cuda_free(k_dev); nsl_test_cuda_free(v_dev);
+        nsl_test_cuda_free(out_dev); nsl_test_cuda_free(lse_dev);
+        if seg_ids_dev != 0 { nsl_test_cuda_free(seg_ids_dev); }
+        if cos_dev != 0 { nsl_test_cuda_free(cos_dev); }
+        if sin_dev != 0 { nsl_test_cuda_free(sin_dev); }
+        if doc_starts_dev != 0 { nsl_test_cuda_free(doc_starts_dev); }
+        return None;
+    }
+
+    // Read back f16 output and convert to f32.
+    let mut out_f16 = vec![0u16; total];
+    nsl_test_cuda_d2h(out_f16.as_mut_ptr() as i64, out_dev, f16_bytes);
+    let out_f32: Vec<f32> = out_f16.iter().map(|&b| f16_to_f32(b)).collect();
+
+    // Cleanup.
+    nsl_test_cuda_free(q_dev); nsl_test_cuda_free(k_dev); nsl_test_cuda_free(v_dev);
+    nsl_test_cuda_free(out_dev); nsl_test_cuda_free(lse_dev);
+    if seg_ids_dev != 0 { nsl_test_cuda_free(seg_ids_dev); }
+    if cos_dev != 0 { nsl_test_cuda_free(cos_dev); }
+    if sin_dev != 0 { nsl_test_cuda_free(sin_dev); }
+    if doc_starts_dev != 0 { nsl_test_cuda_free(doc_starts_dev); }
+
+    Some(out_f32)
 }
