@@ -30,7 +30,7 @@ impl std::fmt::Display for CepSliceError {
 
 /// Gather survivor blocks along `axis` (0 = rows, 1 = cols) of a row-major 2-D tensor.
 /// A block is `block_width` consecutive rows/cols; `survivor_units` are 0-based block
-/// indices (ascending). Returns a new contiguous WeightEntry; dtype-agnostic (byte copy).
+/// indices (**strictly ascending** (enforced)). Returns a new contiguous WeightEntry; dtype-agnostic (byte copy).
 pub fn slice_blocks(
     entry: &WeightEntry,
     axis: usize,
@@ -48,6 +48,24 @@ pub fn slice_blocks(
     let rows = entry.shape[0];
     let cols = entry.shape[1];
     let bw = entry.dtype.byte_width();
+    // Data must be exactly rows*cols*bw bytes, else the byte gather below would index-panic.
+    let expected_bytes = rows * cols * bw;
+    if entry.data.len() != expected_bytes {
+        return Err(CepSliceError::ShapeMismatch {
+            tensor: entry.name.clone(),
+            expected: format!("{expected_bytes} bytes ({rows}x{cols}x{bw})"),
+            found: format!("{} bytes", entry.data.len()),
+        });
+    }
+    // survivor_units must be strictly ascending: the gather preserves their order, and a
+    // non-ascending (or duplicated) list would silently reorder/duplicate weight blocks.
+    if survivor_units.windows(2).any(|w| w[0] >= w[1]) {
+        return Err(CepSliceError::ShapeMismatch {
+            tensor: entry.name.clone(),
+            expected: "strictly ascending survivor_units".into(),
+            found: format!("{survivor_units:?}"),
+        });
+    }
     let block = block_width as usize;
     for &u in survivor_units {
         if u >= n_units {
@@ -59,6 +77,7 @@ pub fn slice_blocks(
     let (new_rows, new_cols) = match axis {
         0 => {
             // Keep survivor row-blocks; each row is `cols * bw` bytes.
+            out.reserve(survivor_units.len() * block * cols * bw);
             let row_bytes = cols * bw;
             for &u in survivor_units {
                 let start = (u as usize) * block;
@@ -71,6 +90,7 @@ pub fn slice_blocks(
         }
         1 => {
             // Keep survivor col-blocks; gather per row.
+            out.reserve(rows * survivor_units.len() * block * bw);
             for r in 0..rows {
                 let row_off = r * cols * bw;
                 for &u in survivor_units {
@@ -157,5 +177,20 @@ mod tests {
     fn slice_blocks_rejects_out_of_range_unit() {
         let e = f32_entry("t", vec![2, 4], &[0.; 8]);
         assert!(slice_blocks(&e, 1, 4, 1, &[4]).is_err());
+    }
+
+    #[test]
+    fn slice_blocks_rejects_non_ascending_units() {
+        let e = f32_entry("t", vec![2, 4], &[0.; 8]);
+        assert!(slice_blocks(&e, 1, 4, 1, &[2, 0]).is_err());
+        // duplicates are also rejected (not strictly ascending)
+        assert!(slice_blocks(&e, 1, 4, 1, &[1, 1]).is_err());
+    }
+
+    #[test]
+    fn slice_blocks_rejects_truncated_data() {
+        // shape claims 2x4 (32 bytes) but only 6 floats (24 bytes) of data.
+        let e = f32_entry("t", vec![2, 4], &[0., 1., 2., 3., 4., 5.]);
+        assert!(slice_blocks(&e, 1, 4, 1, &[0, 1]).is_err());
     }
 }
