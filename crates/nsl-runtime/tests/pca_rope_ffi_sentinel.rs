@@ -97,6 +97,48 @@ fn csha_backward_ffi_accepts_trailing_doc_starts_ptr() {
         i64, i64,
         // PCA §4.3: doc_starts_ptr — the new trailing param under test.
         i64,
+        // CSHA Tier B.2 (Phase 3 T6): tier_b2_active flag (arity-consistency
+        // update — this test predates the flag; see the dedicated test below).
+        i64,
+    ) -> i64 = nsl_flash_attention_csha_backward;
+}
+
+/// CSHA-TIER-B2-FFI: `nsl_flash_attention_csha_backward` accepts the trailing
+/// `tier_b2_active: i64` flag param (Phase 3 T6).
+///
+/// The Tier B.2 4-kernel backward launch branch is selected by an explicit flag
+/// rather than kernel-name-suffix sniffing. This coercion fails to compile if
+/// the FFI signature does not append `tier_b2_active: i64` after `doc_starts_ptr`.
+/// Sentinel value `0` preserves today's scalar single-kernel behavior exactly.
+#[test]
+fn csha_backward_ffi_accepts_trailing_tier_b2_active() {
+    let _: extern "C" fn(
+        i64, i64, i64, i64, i64, i64,   // q, k, v, out, lse, scale_bits
+        i64, i64, i64, i64,             // batch, heads, seq_len, head_dim
+        i64, i64, i64, i64,             // block_table, k_pool, v_pool, block_size
+        i64, i64,                       // cos, sin
+        i64, i64,                       // seq_ids, seq_lens
+        i64, i64, i64,                  // shmem_bytes, ptx, name
+        i64, i64, i64,                  // block_q, block_kv, causal
+        // CSHA extras (9):
+        i64, i64, i64, i64, i64, i64,   // x, norm_weight, Wq, Wk, Wv, Wo
+        i64, i64, i64,                  // rmsnorm_eps_bits, active_heads, d_model
+        // Saved activations (6):
+        i64, i64, i64, i64, i64, i64,
+        // dO + 8 gradient outputs:
+        i64,                            // do_ptr
+        i64, i64, i64,                  // dq, dk, dv
+        i64, i64, i64,                  // dwq, dwk, dwv
+        i64,                            // dx
+        i64,                            // dx_norm
+        // PCA Tier A: segment_ids_ptr
+        i64,
+        // PCA Tier B Planner (PR #175): tier_b_ptx_ptr, tier_b_name_ptr.
+        i64, i64,
+        // PCA §4.3: doc_starts_ptr
+        i64,
+        // CSHA Tier B.2 (Phase 3 T6): tier_b2_active — the new trailing flag.
+        i64,
     ) -> i64 = nsl_flash_attention_csha_backward;
 }
 

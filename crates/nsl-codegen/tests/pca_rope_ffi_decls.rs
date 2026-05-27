@@ -7,7 +7,7 @@
 //!
 //!   * `nsl_flash_attention_csha`            — 37 params
 //!   * `nsl_flash_attention_csha_with_saves` — 43 params
-//!   * `nsl_flash_attention_csha_backward`   — 52 params
+//!   * `nsl_flash_attention_csha_backward`   — 53 params (52 + tier_b2_active)
 //!
 //! Each count = base + segment_ids (Tier A) + 2 tier_b + doc_starts (PCA §4.3).
 //!
@@ -75,10 +75,12 @@ fn csha_backward_decl_has_doc_starts_trailing_param() {
     // Authoritative count comes from RUNTIME_FUNCTIONS in builtins.rs:
     // 33 base (forward-side, includes the explicit `wo` slot) + 6 saves
     //   + 9 grad outputs (dO + dq/dk/dv + dwq/dwk/dwv + dx + dx_norm)
-    //   + 1 segment_ids + 2 tier_b + 1 doc_starts = 52.
+    //   + 1 segment_ids + 2 tier_b + 1 doc_starts + 1 tier_b2_active = 53.
+    // (tier_b2_active added in CSHA Tier B.2 Phase 3 T6.)
     assert_eq!(
         sig.params.len(),
-        52,
-        "nsl_flash_attention_csha_backward must accept 52 i64 params (PCA §4.3 Task 3 + Tier B)"
+        53,
+        "nsl_flash_attention_csha_backward must accept 53 i64 params \
+         (PCA §4.3 Task 3 + Tier B + CSHA Tier B.2 tier_b2_active)"
     );
 }

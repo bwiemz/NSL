@@ -1891,6 +1891,12 @@ fn lower_single_op(
                 &[],
             )?;
 
+            // CSHA Tier B.2 (Phase 3 T6): tier_b2_active flag, constant 0 for
+            // now. The FFI's 4-kernel hybrid launch branch is gated on this
+            // being non-zero; passing 0 keeps the scalar single-kernel backward
+            // path byte-identical. T7 computes the real flag.
+            let tier_b2_active_flag = builder.ins().iconst(cl_types::I64, 0);
+
             let _rc = call(
                 compiler,
                 builder,
@@ -1937,6 +1943,13 @@ fn lower_single_op(
                     // PCA §4.3: doc_starts_ptr — read from the same
                     // registry; matches the forward's effective_pos.
                     doc_starts_v,
+                    // CSHA Tier B.2 (Phase 3 T6): tier_b2_active flag. Pass a
+                    // constant 0 here to preserve EXACTLY today's behavior
+                    // (scalar single-kernel backward path). T7 will replace
+                    // this with the computed `tier_b2_hybrid_backward_eligible`
+                    // decision; until then the 4-kernel launch branch is
+                    // dormant and the scalar path is byte-identical.
+                    tier_b2_active_flag,
                 ],
             )?;
 

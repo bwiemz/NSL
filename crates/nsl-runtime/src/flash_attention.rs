@@ -1337,6 +1337,18 @@ pub extern "C" fn nsl_flash_attention_csha_backward(
     // kernel computes row offset as batch_idx * (MAX_NUM_DOCS+1) and
     // loads only its row's 1028-byte subtable. See spec §3.
     doc_starts_ptr: i64,
+    // CSHA Tier B.2 (Phase 3 T6): explicit flag selecting the 4-kernel hybrid
+    // backward launch path. When non-zero, `ptx_ptr` is treated as a module
+    // holding the four concatenated Tier B.2 backward entries
+    // (`tier_b2_d_prepass`, `tier_b2_dq_kernel`, `tier_b2_dkdv_kernel`,
+    // `tier_b2_proj_backward`) and they are launched in sequence, with a
+    // D = rowsum(dO*O) scratch buffer allocated for the intermediate. When 0
+    // (the default for all existing callers, including the wengert lowering
+    // until T7 computes the flag), behavior is byte-identical to the scalar
+    // single-kernel path below. Selection is an explicit flag rather than
+    // kernel-name-suffix sniffing — the dispatch decision is made in codegen
+    // (see `tier_b2_hybrid_backward_eligible`) and threaded here. See spec §7.
+    tier_b2_active: i64,
 ) -> i64 {
     use crate::pca_tier_b_runtime::{
         assert_tier_b_sentinels, should_dispatch_tier_b_at_runtime,
@@ -1360,6 +1372,51 @@ pub extern "C" fn nsl_flash_attention_csha_backward(
         } else {
             (ptx_ptr, name_ptr)
         };
+
+    // CSHA Tier B.2 (Phase 3 T6): 4-kernel hybrid backward launch branch.
+    // When the explicit flag is set, `ptx_ptr` holds the concatenated 4-entry
+    // Tier B.2 module; launch d_prepass -> dq -> dkdv -> proj_backward in
+    // sequence (same-stream, implicitly ordered), with a D=rowsum(dO*O) f32
+    // scratch buffer for the intermediate consumed by dq/dkdv. Returns early
+    // so the scalar single-kernel path below is reached only when the flag is
+    // 0 (byte-identical to today for every existing caller).
+    //
+    // Kernels 1-3 (d_prepass/dq/dkdv) use the standalone-validated per-kernel
+    // ABIs (ported from the Layer-1 GPU reference launchers). Kernel 4
+    // (proj_backward) reuses the SCALAR backward param ABI — the exact 49-arg
+    // list the scalar path below builds — so it is launched by re-running the
+    // scalar else-branch with `effective_name_ptr` overridden to
+    // "tier_b2_proj_backward". To keep the scalar path byte-identical, the
+    // Tier B.2 branch is fully self-contained here.
+    #[cfg(feature = "cuda")]
+    {
+        if tier_b2_active != 0 {
+            return csha_tier_b2_backward_launch(
+                ptx_ptr,
+                batch, heads, seq_len, head_dim,
+                block_q,
+                active_heads, d_model,
+                scale_bits,
+                shared_mem_bytes,
+                causal,
+                // RMSNorm + projection (scalar-ABI) forward inputs.
+                x_ptr, norm_weight_ptr,
+                wq_ptr, wk_ptr, wv_ptr, wo_ptr,
+                rmsnorm_eps_bits,
+                // Forward-saved activations.
+                q_proj_ptr, k_proj_ptr, v_proj_ptr,
+                row_max_ptr, row_sum_ptr, x_raw_ptr,
+                logsumexp_ptr, out_ptr,
+                // dO seed + gradient buffers.
+                do_ptr,
+                dq_ptr, dk_ptr, dv_ptr,
+                dwq_ptr, dwk_ptr, dwv_ptr,
+                dx_ptr, dx_norm_ptr,
+                // Packed-sequence pass-throughs.
+                segment_ids_ptr, doc_starts_ptr,
+            );
+        }
+    }
 
     #[cfg(feature = "cuda")]
     {
@@ -1676,11 +1733,466 @@ pub extern "C" fn nsl_flash_attention_csha_backward(
         let _ = (rmsnorm_eps_bits, active_heads, d_model);
         let _ = (q_proj_ptr, k_proj_ptr, v_proj_ptr, row_max_ptr, row_sum_ptr, x_raw_ptr);
         let _ = (do_ptr, dq_ptr, dk_ptr, dv_ptr, dwq_ptr, dwk_ptr, dwv_ptr, dx_ptr, dx_norm_ptr);
-        let _ = (segment_ids_ptr, doc_starts_ptr);
+        let _ = (segment_ids_ptr, doc_starts_ptr, tier_b2_active);
         let _ = (tier_b_ptx_ptr, tier_b_name_ptr, effective_ptx_ptr, effective_name_ptr);
         eprintln!("[nsl] CSHA backward requires CUDA.");
         -1
     }
+}
+
+/// CSHA Tier B.2 (Phase 3) — `effective_bq` per the dQ/dK/dV-kernel SMEM
+/// fallback schedule (`smem_layout::tier_b2_effective_bq`). The runtime cannot
+/// depend on `nsl-codegen` (the dependency runs the other way), so the formula
+/// is duplicated here. block_q is clamped to 32 at head_dim 128/256 (the
+/// SMEM-pressure / register-pressure fallback); otherwise it is used as-is.
+/// MUST stay in sync with `smem_layout::tier_b2_effective_bq`.
+#[cfg(feature = "cuda")]
+#[inline]
+fn tier_b2_effective_bq(block_q: i64, head_dim: i64) -> i64 {
+    match head_dim {
+        128 | 256 => block_q.min(32),
+        _ => block_q,
+    }
+}
+
+/// Total dynamic-SMEM bytes for the `tier_b2_dq_kernel`, mirroring
+/// `smem_layout::tier_b2_dq_total_smem_bytes` (the offset chain summed band by
+/// band). `eb == ek` in the Approach-A bq==bkv invariant, but both are computed
+/// for fidelity. CHUNK = `TIER_B2_RMSNORM_CHUNK` = 4. All tiles f16 (2 B/elem).
+/// MUST stay in sync with the codegen helper.
+#[cfg(feature = "cuda")]
+#[inline]
+fn tier_b2_dq_total_smem_bytes(block_q: i64, head_dim: i64) -> i64 {
+    const CHUNK: i64 = 4;
+    let eb = tier_b2_effective_bq(block_q, head_dim);
+    let ek = eb; // bq == bkv invariant
+    let hd = head_dim;
+    // Band chain (low -> high address), matching tier_b2_dq_*_offset:
+    //   Q, K, V, dO, dS, Wk-chunk, Wv-chunk, x_q-chunk, x_kv-chunk, K-colmajor.
+    let mut off = 0i64;
+    off += eb * hd * 2; // Q          -> K offset
+    off += ek * hd * 2; // K          -> V offset
+    off += ek * hd * 2; // V          -> dO offset
+    off += eb * hd * 2; // dO         -> dS offset
+    off += eb * ek * 2; // dS         -> Wk-chunk offset
+    off += CHUNK * hd * 2; // Wk-chunk -> Wv-chunk offset
+    off += CHUNK * hd * 2; // Wv-chunk -> x_q-chunk offset
+    off += eb * CHUNK * 2; // x_q-chunk -> x_kv-chunk offset
+    off += ek * CHUNK * 2; // x_kv-chunk -> K-colmajor offset
+    off += ek * hd * 2; // K-colmajor band (capacity == row-major K tile)
+    off
+}
+
+/// Total dynamic-SMEM bytes for the `tier_b2_dkdv_kernel`, mirroring
+/// `smem_layout::tier_b2_dkdv_total_smem_bytes`. Same prefix as dQ through the
+/// x_kv chunk, then the col-major B/A re-stage bands (Q-colmajor, dO-colmajor,
+/// P-colmajor, dS-colmajor). MUST stay in sync with the codegen helper.
+#[cfg(feature = "cuda")]
+#[inline]
+fn tier_b2_dkdv_total_smem_bytes(block_q: i64, head_dim: i64) -> i64 {
+    const CHUNK: i64 = 4;
+    let eb = tier_b2_effective_bq(block_q, head_dim);
+    let ek = eb; // bq == bkv invariant
+    let hd = head_dim;
+    let mut off = 0i64;
+    off += eb * hd * 2; // Q          -> K offset
+    off += ek * hd * 2; // K          -> V offset
+    off += ek * hd * 2; // V          -> dO offset
+    off += eb * hd * 2; // dO         -> Wk-chunk offset
+    off += CHUNK * hd * 2; // Wk-chunk -> Wv-chunk offset
+    off += CHUNK * hd * 2; // Wv-chunk -> x_q-chunk offset
+    off += eb * CHUNK * 2; // x_q-chunk -> x_kv-chunk offset
+    off += ek * CHUNK * 2; // x_kv-chunk -> Q-colmajor offset
+    off += eb * hd * 2; // Q-colmajor -> dO-colmajor offset
+    off += eb * hd * 2; // dO-colmajor -> P-colmajor offset
+    off += eb * ek * 2; // P-colmajor -> dS-colmajor offset
+    off += eb * ek * 2; // dS-colmajor band
+    off
+}
+
+/// CSHA Tier B.2 (Phase 3 T6): launch the 4-kernel hybrid backward sequence.
+///
+/// `ptx_ptr` is a single (null-terminated) PTX module containing all four
+/// concatenated entries:
+///   1. `tier_b2_d_prepass`    reads dO, O          -> writes D (scratch)
+///   2. `tier_b2_dq_kernel`    reads q/k/v_saved, dO, row_max, row_sum, D -> dQ
+///   3. `tier_b2_dkdv_kernel`  reads q/k/v_saved, dO, row_max, row_sum, D -> dK, dV
+///   4. `tier_b2_proj_backward` reads dQ/dK/dV (HBM, read-only) + x_raw/Wq/Wk/Wv
+///      + norm_weight -> dWq, dWk, dWv, dx, dx_norm  (scalar backward param ABI)
+///
+/// Buffer aliasing (spec §4): the dQ/dK/dV buffers written by kernels 2/3 ARE
+/// the final gradient outputs that kernel 4 reads; only the D-scratch is new.
+///
+/// Per-kernel grid/block are ported from the validated Layer-1 GPU reference
+/// launchers (`tier_b2_dq_kernel_cpu_reference.rs`,
+/// `tier_b2_dkdv_kernel_cpu_reference.rs`); kernel 4 mirrors the scalar
+/// backward launch (grid `(1, batch*effective_heads, 1)`, block `(128,1,1)`,
+/// threading the per-q-block base through the `seq_lens` slot).
+///
+/// Launches are same-stream and therefore implicitly ordered; `NSL_CUDA_SYNC`
+/// is honored inside `kernel_launch` (it synchronizes + surfaces async errors
+/// after every launch). Returns the first non-success `CUresult` as `i64`, or
+/// `CUDA_SUCCESS` (0) when all four launch cleanly.
+#[cfg(feature = "cuda")]
+#[allow(clippy::too_many_arguments)]
+fn csha_tier_b2_backward_launch(
+    ptx_ptr: i64,
+    batch: i64, heads: i64, seq_len: i64, head_dim: i64,
+    block_q: i64,
+    active_heads: i64, d_model: i64,
+    scale_bits: i64,
+    shared_mem_bytes: i64,
+    causal: i64,
+    x_ptr: i64, norm_weight_ptr: i64,
+    wq_ptr: i64, wk_ptr: i64, wv_ptr: i64, wo_ptr: i64,
+    rmsnorm_eps_bits: i64,
+    q_proj_ptr: i64, k_proj_ptr: i64, v_proj_ptr: i64,
+    row_max_ptr: i64, row_sum_ptr: i64, x_raw_ptr: i64,
+    logsumexp_ptr: i64, out_ptr: i64,
+    do_ptr: i64,
+    dq_ptr: i64, dk_ptr: i64, dv_ptr: i64,
+    dwq_ptr: i64, dwk_ptr: i64, dwv_ptr: i64,
+    dx_ptr: i64, dx_norm_ptr: i64,
+    segment_ids_ptr: i64, doc_starts_ptr: i64,
+) -> i64 {
+    use cudarc::driver::sys::CUresult;
+
+    let success = CUresult::CUDA_SUCCESS;
+
+    // Resolve the user-facing NslTensor handles to raw device pointers (auto-
+    // promotes CPU->GPU + extracts `.data`), exactly as the scalar path does.
+    // The forward-saved activations (q/k/v_proj, row_max, row_sum, x_raw) are
+    // raw device buffers from `nsl_csha_alloc_backward_activations_into` and
+    // pass through unchanged.
+    let d_o = csha_tensor_data_ptr(do_ptr);
+    let d_q = csha_tensor_data_ptr(dq_ptr);
+    let d_k = csha_tensor_data_ptr(dk_ptr);
+    let d_v = csha_tensor_data_ptr(dv_ptr);
+    let qp = q_proj_ptr as u64;
+    let kpj = k_proj_ptr as u64;
+    let vpj = v_proj_ptr as u64;
+    let rmax = row_max_ptr as u64;
+    let rsum = row_sum_ptr as u64;
+    let xraw = x_raw_ptr as u64;
+
+    // The D pre-pass (kernel 1) needs the forward attention output O to compute
+    // D = rowsum(dO * O). The scalar Tier C path resolves O from the `out_ptr`
+    // slot (`csha_tensor_data_ptr(out_ptr)`); the standalone dQ/dK/dV gates feed
+    // `fwd.o`. We source O from the same `out_ptr` slot here.
+    //
+    // PARITY-GATE NOTE (T8): the wengert `FusedCshaBackward` lowering currently
+    // passes `null` for `out_ptr` (it does not retain O as an NslTensor handle).
+    // The production forward-save plumbing must thread O into this slot for the
+    // hybrid; this is the single launch-arg the parity gate (T8) must confirm.
+    // If O is null the D pre-pass yields D == 0 and the §8 zero-output guard
+    // FAILS — so a missing O cannot pass vacuously. (Today the branch is dormant
+    // — every caller passes tier_b2_active = 0 — so this is not yet exercised.)
+    let o_for_prepass = csha_tensor_data_ptr(out_ptr);
+
+    // D-scratch: D = rowsum(dO * O), f32, shape [batch, heads, seq_len].
+    let d_elems = (batch * heads * seq_len) as usize;
+    let d_scratch_raw = if d_elems > 0 {
+        crate::cuda::inner::alloc_device(d_elems * 4)
+    } else {
+        std::ptr::null_mut()
+    };
+    if d_scratch_raw.is_null() {
+        eprintln!("[nsl] CSHA Tier B.2 backward: D-scratch alloc failed");
+        return CUresult::CUDA_ERROR_OUT_OF_MEMORY as i64;
+    }
+    crate::cuda::inner::memset_d8(d_scratch_raw, d_elems * 4);
+    let d_scratch = d_scratch_raw as u64;
+
+    // Zero the dQ/dK/dV output buffers (kernels write disjoint slices per launch;
+    // the scalar path zeroes dQ before the loop — mirror that for all three).
+    //
+    // PARITY-GATE NOTE (T8): the validated standalone dQ/dK/dV launchers write
+    // their outputs as f32 ([b,h,s,hd]*4 bytes). The wengert lowering, however,
+    // allocates dq/dk/dv as f16 NslTensors (`nsl_tensor_zeros_f16_on`). The
+    // parity gate must reconcile this — either size the dQ/dK/dV buffers f32 for
+    // the hybrid, or insert an f32->f16 conversion (cf. `csha_bwd_convert_f32_to_f16`
+    // in the scalar dK/dV path) before kernel 4 reads them. memset uses *4 here to
+    // match the f32 writer footprint; a smaller f16 buffer would be under-zeroed.
+    // (Dormant today: every caller passes tier_b2_active = 0.)
+    let qkv_elems = (batch * heads * seq_len * head_dim) as usize;
+    if d_q != 0 && qkv_elems > 0 {
+        crate::cuda::inner::memset_d8(d_q as *mut c_void, qkv_elems * 4);
+    }
+    if d_k != 0 && qkv_elems > 0 {
+        crate::cuda::inner::memset_d8(d_k as *mut c_void, qkv_elems * 4);
+    }
+    if d_v != 0 && qkv_elems > 0 {
+        crate::cuda::inner::memset_d8(d_v as *mut c_void, qkv_elems * 4);
+    }
+
+    // Null-terminated PTX + kernel-name C strings.
+    let ptx = ptx_ptr as *const u8;
+    let name_d_prepass = b"tier_b2_d_prepass\0";
+    let name_dq = b"tier_b2_dq_kernel\0";
+    let name_dkdv = b"tier_b2_dkdv_kernel\0";
+    let name_proj = b"tier_b2_proj_backward\0";
+
+    let eb = tier_b2_effective_bq(block_q, head_dim);
+
+    // ── Kernel 1: D pre-pass ──
+    // ABI: (d_o_ptr, o_ptr, d_out_ptr, seq_len:u32, heads:u32).
+    // Grid (ceil(seq/32), heads, batch), block (32,1,1), no dynamic SMEM.
+    {
+        let mut a_do = d_o as u64;
+        let mut a_o = o_for_prepass as u64;
+        let mut a_dout = d_scratch;
+        let mut a_seq = seq_len as u32;
+        let mut a_heads = heads as u32;
+        let args: [*mut c_void; 5] = [
+            &mut a_do as *mut _ as *mut c_void,
+            &mut a_o as *mut _ as *mut c_void,
+            &mut a_dout as *mut _ as *mut c_void,
+            &mut a_seq as *mut _ as *mut c_void,
+            &mut a_heads as *mut _ as *mut c_void,
+        ];
+        let grid_x = (seq_len + 31) / 32;
+        let rc = crate::cuda::inner::kernel_launch(
+            ptx, name_d_prepass.as_ptr(),
+            [grid_x, heads, batch], [32, 1, 1], &args, 0,
+        );
+        if rc != success {
+            crate::cuda::inner::free_device(d_scratch_raw);
+            return rc as i64;
+        }
+    }
+
+    // ── Kernel 2: dQ ──
+    // ABI: (q,k,v_saved, d_o, row_max, row_sum, d, segment_ids, d_q_out,
+    //       seq:u32, heads:u32, batch:u32).
+    // Grid (ceil(seq/eb), heads, batch), block (128,1,1), dynamic SMEM = dq total.
+    {
+        let mut a_q = qp;
+        let mut a_k = kpj;
+        let mut a_v = vpj;
+        let mut a_do = d_o as u64;
+        let mut a_rmax = rmax;
+        let mut a_rsum = rsum;
+        let mut a_d = d_scratch;
+        let mut a_seg = segment_ids_ptr as u64;
+        let mut a_dq = d_q as u64;
+        let mut a_seq = seq_len as u32;
+        let mut a_heads = heads as u32;
+        let mut a_batch = batch as u32;
+        let args: [*mut c_void; 12] = [
+            &mut a_q as *mut _ as *mut c_void,
+            &mut a_k as *mut _ as *mut c_void,
+            &mut a_v as *mut _ as *mut c_void,
+            &mut a_do as *mut _ as *mut c_void,
+            &mut a_rmax as *mut _ as *mut c_void,
+            &mut a_rsum as *mut _ as *mut c_void,
+            &mut a_d as *mut _ as *mut c_void,
+            &mut a_seg as *mut _ as *mut c_void,
+            &mut a_dq as *mut _ as *mut c_void,
+            &mut a_seq as *mut _ as *mut c_void,
+            &mut a_heads as *mut _ as *mut c_void,
+            &mut a_batch as *mut _ as *mut c_void,
+        ];
+        let grid_x = (seq_len + eb - 1) / eb;
+        let smem = tier_b2_dq_total_smem_bytes(block_q, head_dim) as u32;
+        let rc = crate::cuda::inner::kernel_launch(
+            ptx, name_dq.as_ptr(),
+            [grid_x, heads, batch], [128, 1, 1], &args, smem,
+        );
+        if rc != success {
+            crate::cuda::inner::free_device(d_scratch_raw);
+            return rc as i64;
+        }
+    }
+
+    // ── Kernel 3: dK/dV ──
+    // ABI: (q,k,v_saved, d_o, row_max, row_sum, d, segment_ids, d_k_out,
+    //       d_v_out, seq:u32, heads:u32, batch:u32). NOTE: d_k BEFORE d_v.
+    // Grid (ceil(seq/eb), heads, batch), block (128,1,1), dynamic SMEM = dkdv total.
+    {
+        let mut a_q = qp;
+        let mut a_k = kpj;
+        let mut a_v = vpj;
+        let mut a_do = d_o as u64;
+        let mut a_rmax = rmax;
+        let mut a_rsum = rsum;
+        let mut a_d = d_scratch;
+        let mut a_seg = segment_ids_ptr as u64;
+        let mut a_dk = d_k as u64;
+        let mut a_dv = d_v as u64;
+        let mut a_seq = seq_len as u32;
+        let mut a_heads = heads as u32;
+        let mut a_batch = batch as u32;
+        let args: [*mut c_void; 13] = [
+            &mut a_q as *mut _ as *mut c_void,
+            &mut a_k as *mut _ as *mut c_void,
+            &mut a_v as *mut _ as *mut c_void,
+            &mut a_do as *mut _ as *mut c_void,
+            &mut a_rmax as *mut _ as *mut c_void,
+            &mut a_rsum as *mut _ as *mut c_void,
+            &mut a_d as *mut _ as *mut c_void,
+            &mut a_seg as *mut _ as *mut c_void,
+            &mut a_dk as *mut _ as *mut c_void,
+            &mut a_dv as *mut _ as *mut c_void,
+            &mut a_seq as *mut _ as *mut c_void,
+            &mut a_heads as *mut _ as *mut c_void,
+            &mut a_batch as *mut _ as *mut c_void,
+        ];
+        let grid_x = (seq_len + eb - 1) / eb;
+        let smem = tier_b2_dkdv_total_smem_bytes(block_q, head_dim) as u32;
+        let rc = crate::cuda::inner::kernel_launch(
+            ptx, name_dkdv.as_ptr(),
+            [grid_x, heads, batch], [128, 1, 1], &args, smem,
+        );
+        if rc != success {
+            crate::cuda::inner::free_device(d_scratch_raw);
+            return rc as i64;
+        }
+    }
+
+    // ── Kernel 4: projection backward ──
+    // Reuses the SCALAR backward param ABI (the same 49-arg list the scalar
+    // else-branch builds). dQ/dK/dV are INPUTS (read from HBM into SMEM); only
+    // dWq/dWk/dWv/dx/dx_norm are written. The dk_scratch/dv_scratch slots are
+    // unused by proj_backward (no dK/dV finalize store) — pass null. Launch
+    // dims mirror the scalar backward: grid (1, batch*effective_heads, 1),
+    // block (128,1,1), incoming `shared_mem_bytes`, threading the per-q-block
+    // base through the `seq_lens` slot.
+    {
+        let effective_heads = if active_heads > 0 && active_heads < heads {
+            active_heads
+        } else {
+            heads
+        };
+
+        // q_ptr/k_ptr/v_ptr are unused by proj_backward (it reads the forward
+        // saves, not the raw inputs). Pass 0 for all three.
+        let mut k = 0u64;
+        let mut v = 0u64;
+        let mut out_p = o_for_prepass as u64;
+        let mut s = f32::from_bits(scale_bits as u32);
+        let mut b = batch as u64;
+        let mut h = heads as u64;
+        let mut sl = seq_len as u64;
+        let mut hd = head_dim as u64;
+        let mut bt = 0u64;
+        let mut kp = 0u64;
+        let mut vp = 0u64;
+        let mut bsz = 0u64;
+        let mut cos = 0u64;
+        let mut sin = 0u64;
+        let mut sids = 0u64;
+        let mut slens = 0u64; // per-q-block base, threaded in the loop below
+        let mut dfs_enter = 0u64;
+        let mut dfs_exit = 0u64;
+        let mut num_tree_nodes = 0u64;
+        let mut lse = csha_tensor_data_ptr(logsumexp_ptr) as u64;
+        let mut x = csha_tensor_data_ptr(x_ptr) as u64;
+        let mut nw = csha_tensor_data_ptr(norm_weight_ptr) as u64;
+        let mut wq = csha_tensor_data_ptr(wq_ptr) as u64;
+        let mut wk = csha_tensor_data_ptr(wk_ptr) as u64;
+        let mut wv = csha_tensor_data_ptr(wv_ptr) as u64;
+        let mut wo = csha_tensor_data_ptr(wo_ptr) as u64;
+        let mut eps = f32::from_bits(rmsnorm_eps_bits as u32);
+        let mut ah = active_heads as u32;
+        let mut dm = d_model as u32;
+        let mut a_qp = qp;
+        let mut a_kpj = kpj;
+        let mut a_vpj = vpj;
+        let mut a_rmax = rmax;
+        let mut a_rsum = rsum;
+        let mut a_xraw = xraw;
+        let mut a_do = d_o as u64;
+        // dQ/dK/dV: read-only inputs to proj_backward (from HBM).
+        let mut a_dq = d_q as u64;
+        let mut a_dk = d_k as u64;
+        let mut a_dv = d_v as u64;
+        // Gradient outputs written by proj_backward.
+        let mut a_dwq = csha_tensor_data_ptr(dwq_ptr) as u64;
+        let mut a_dwk = csha_tensor_data_ptr(dwk_ptr) as u64;
+        let mut a_dwv = csha_tensor_data_ptr(dwv_ptr) as u64;
+        let mut a_dx = csha_tensor_data_ptr(dx_ptr) as u64;
+        let mut a_dxn = csha_tensor_data_ptr(dx_norm_ptr) as u64;
+        // proj_backward does not write dK/dV — no f32 scratch needed.
+        let mut a_dk_scratch = 0u64;
+        let mut a_dv_scratch = 0u64;
+        let mut a_seg = segment_ids_ptr as u64;
+        let mut a_docs = doc_starts_ptr as u64;
+        let _ = causal; // proj/dRMSNorm are causal-agnostic; param resolved for ABI parity
+
+        let args: [*mut c_void; 49] = [
+            &mut k as *mut _ as *mut c_void, // q_ptr slot (unused; pass 0)
+            &mut k as *mut _ as *mut c_void,
+            &mut v as *mut _ as *mut c_void,
+            &mut out_p as *mut _ as *mut c_void,
+            &mut s as *mut _ as *mut c_void,
+            &mut b as *mut _ as *mut c_void,
+            &mut h as *mut _ as *mut c_void,
+            &mut sl as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut bt as *mut _ as *mut c_void,
+            &mut kp as *mut _ as *mut c_void,
+            &mut vp as *mut _ as *mut c_void,
+            &mut bsz as *mut _ as *mut c_void,
+            &mut cos as *mut _ as *mut c_void,
+            &mut sin as *mut _ as *mut c_void,
+            &mut sids as *mut _ as *mut c_void,
+            &mut slens as *mut _ as *mut c_void,
+            &mut dfs_enter as *mut _ as *mut c_void,
+            &mut dfs_exit as *mut _ as *mut c_void,
+            &mut num_tree_nodes as *mut _ as *mut c_void,
+            &mut lse as *mut _ as *mut c_void,
+            &mut x as *mut _ as *mut c_void,
+            &mut nw as *mut _ as *mut c_void,
+            &mut wq as *mut _ as *mut c_void,
+            &mut wk as *mut _ as *mut c_void,
+            &mut wv as *mut _ as *mut c_void,
+            &mut wo as *mut _ as *mut c_void,
+            &mut eps as *mut _ as *mut c_void,
+            &mut ah as *mut _ as *mut c_void,
+            &mut dm as *mut _ as *mut c_void,
+            &mut a_qp as *mut _ as *mut c_void,
+            &mut a_kpj as *mut _ as *mut c_void,
+            &mut a_vpj as *mut _ as *mut c_void,
+            &mut a_rmax as *mut _ as *mut c_void,
+            &mut a_rsum as *mut _ as *mut c_void,
+            &mut a_xraw as *mut _ as *mut c_void,
+            &mut a_do as *mut _ as *mut c_void,
+            &mut a_dq as *mut _ as *mut c_void,
+            &mut a_dk as *mut _ as *mut c_void,
+            &mut a_dv as *mut _ as *mut c_void,
+            &mut a_dwq as *mut _ as *mut c_void,
+            &mut a_dwk as *mut _ as *mut c_void,
+            &mut a_dwv as *mut _ as *mut c_void,
+            &mut a_dx as *mut _ as *mut c_void,
+            &mut a_dxn as *mut _ as *mut c_void,
+            &mut a_dk_scratch as *mut _ as *mut c_void,
+            &mut a_dv_scratch as *mut _ as *mut c_void,
+            &mut a_seg as *mut _ as *mut c_void,
+            &mut a_docs as *mut _ as *mut c_void,
+        ];
+
+        let grid_y = batch * effective_heads;
+        let q_blocks = if block_q > 0 { (seq_len + block_q - 1) / block_q } else { 1 };
+        let mut rc = success;
+        for q_block in 0..q_blocks {
+            slens = (q_block * block_q) as u64;
+            let _ = std::hint::black_box(&slens);
+            rc = crate::cuda::inner::kernel_launch(
+                ptx, name_proj.as_ptr(),
+                [1, grid_y, 1], [128, 1, 1], &args, shared_mem_bytes as u32,
+            );
+            if rc != success {
+                break;
+            }
+        }
+        if rc != success {
+            crate::cuda::inner::free_device(d_scratch_raw);
+            return rc as i64;
+        }
+    }
+
+    crate::cuda::inner::free_device(d_scratch_raw);
+    success as i64
 }
 
 /// f32 scratch → f16 output conversion kernel used by the CSHA backward

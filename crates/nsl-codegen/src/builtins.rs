@@ -1149,8 +1149,9 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
         None,
     ),
     // Gap D / Tier C (extended by Gap I.5 Option A): CSHA fused backward
-    // launch. 45 i64 args matching the wengert_lower.rs
-    // `PrimalOp::FusedCshaBackward` emission order:
+    // launch. i64 args matching the wengert_lower.rs
+    // `PrimalOp::FusedCshaBackward` emission order, plus the trailing
+    // tier_b2_active flag (CSHA Tier B.2 Phase 3 T6):
     //   36-arg forward-side prelude mirrored off `_with_saves`,
     //   + 6 forward-saved activation pointers,
     //   + dO input + 8 gradient outputs
@@ -1192,6 +1193,7 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
             types::I64,                         // tier_b_ptx_ptr (planner spec §4)
             types::I64,                         // tier_b_name_ptr (planner spec §4)
             types::I64,                         // doc_starts_ptr (PCA §4.3 Task 3)
+            types::I64,                         // tier_b2_active (CSHA Tier B.2 Phase 3 T6)
         ],
         Some(types::I64),
     ),
