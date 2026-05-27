@@ -18,9 +18,11 @@
 //! It is READ-ONLY on the HBM buffers (loads only; never stores back).
 
 use crate::flash_attention::FlashAttentionConfig;
+use crate::flash_attention_v2::phases;
 use crate::flash_attention_v2::smem_layout::{
     backward_dk_offset, backward_dq_offset, backward_dv_offset,
 };
+use crate::flash_attention_v2::tier_b2::backward::BackwardSynthError;
 
 /// Cooperatively load the three HBM dQ/dK/dV gradient buffers into the SMEM
 /// slots that `emit_dproj` reads (`backward_d{q,k,v}_offset`).
@@ -137,4 +139,160 @@ pub fn emit_dqkv_hbm_to_smem_load(ptx: &mut String, config: &FlashAttentionConfi
         ptx.push_str(&format!("V2_PROJBWD_LOAD_{label}_SKIP:\n"));
     }
     ptx.push_str("    bar.sync 0;  // dQ/dK/dV SMEM tiles visible before dproj reads\n");
+}
+
+/// Synthesize the complete `tier_b2_proj_backward` kernel.
+///
+/// This is the 4th "projection backward" kernel of the hybrid CSHA Tier B.2
+/// backward. The dQ/dK/dV gradients are produced by the (validated) `dq` and
+/// `dkdv` kernels and written to HBM. THIS kernel:
+///   1. loads dQ/dK/dV from HBM into the SMEM slots that the scalar
+///      `emit_dproj` reads (via `emit_dqkv_hbm_to_smem_load`),
+///   2. recomputes `x_norm` + `rms` from `x_raw_ptr`
+///      (`emit_xnorm_recompute`),
+///   3. runs the EXISTING scalar `emit_dproj` (dWq/dWk/dWv) and
+///      `emit_drmsnorm` (dx) emitters UNCHANGED.
+///
+/// It is READ-ONLY on the HBM dQ/dK/dV buffers — the final dQ/dK/dV are the
+/// other kernels' outputs, so there is NO dRoPE and NO dQ/dK/dV HBM finalize
+/// store here. The only HBM writes are the dW*/dx/dx_norm stores emitted by
+/// the reused `emit_dproj` / `emit_drmsnorm` (which target `%rd_bwd_dwq` /
+/// `%rd_bwd_dwk` / `%rd_bwd_dwv` / `dx_ptr` / `%rd_bwd_dxn`, never the
+/// dQ/dK/dV input pointers).
+///
+/// ## Prelude strategy: REUSE the scalar backward prelude, rename the entry.
+///
+/// `phases::backward::prelude::emit` already declares EVERY register and
+/// param the four reused emitters reference (`%shmem_base`, `%tid_x`,
+/// `%q_start`, `%head_idx`, `%batch_idx`, `%rd6`=seq, `%rd7`=head_dim, the
+/// `%rd_c*` / `%f_*` / `%h_tmp` / `%p_c*` / `%p0` / `%rd30`/`%rd31` scratch,
+/// the `%rd_bwd_d*` pointer regs, and the `x_raw_ptr` / `csha_eps` /
+/// `csha_norm_weight_ptr` / `csha_w{q,k,v}_ptr` / `dx_ptr` params) AND emits a
+/// launchable `.visible .entry` whose PARAMETER LIST is exactly the scalar
+/// backward kernel's — which is precisely the requirement (so the runtime can
+/// pass the same pointers). The ONLY required difference is the entry NAME.
+///
+/// We therefore call `prelude::emit` (with `tier_b = None` so the output is
+/// the byte-identical pre-Tier-B-2 baseline) and then rename the single
+/// `.visible .entry <scalar_name> (` line to `.visible .entry
+/// tier_b2_proj_backward (`. This touches ZERO shared files, so the scalar
+/// `synthesize_backward(config)` output is trivially unchanged. The rename
+/// targets exactly one line (the generated `kernel_name` appears only in the
+/// entry header).
+///
+/// Guards `head_dim % 32 != 0` (warp-reduction precondition shared with the
+/// dQ / dK/dV kernels).
+pub fn synthesize_proj_backward(
+    config: &FlashAttentionConfig,
+) -> Result<String, BackwardSynthError> {
+    let head_dim = config.head_dim as u32;
+    if !head_dim.is_multiple_of(32) {
+        return Err(BackwardSynthError::UnsupportedHeadDim(head_dim));
+    }
+
+    let mut ptx = String::new();
+
+    // Phase 0: header, .visible .entry, .extern .shared (when dynamic SMEM),
+    // SMEM decl, full register pool, scalar param loads, and grid/index setup
+    // that establishes %shmem_base / %tid_x / %q_start / %head_idx / %rd6 /
+    // %rd7 and all the %rd_c* / %f_* / %h_tmp / %p* scratch the reused
+    // emitters use. `tier_b = None` keeps this byte-identical to the scalar
+    // backward prelude baseline (Tier B.2 no-op guarantee, prelude.rs spec
+    // §7.4) — we only rename the entry below.
+    phases::backward::prelude::emit(&mut ptx, config, None);
+
+    // Rename the entry from the scalar backward name to the proj-backward
+    // name. The param list and body register pool are unchanged. The scalar
+    // `kernel_name` string only ever appears in the `.visible .entry ... (`
+    // header line, so a single targeted replace is exact and unambiguous.
+    let scalar_name = phases::backward::prelude::kernel_name(config);
+    let from = format!(".visible .entry {scalar_name} (");
+    let to = ".visible .entry tier_b2_proj_backward (";
+    debug_assert_eq!(
+        ptx.matches(&from).count(),
+        1,
+        "expected exactly one scalar entry header to rename"
+    );
+    ptx = ptx.replacen(&from, to, 1);
+
+    // CSHA A.4 head-pruning guard — mirror the scalar backward orchestrator
+    // so blocks whose head_idx >= csha_active_heads early-`ret` before doing
+    // any projection-backward work. Reuses the forward emitter; its scratch
+    // (%r10/%r11/%p0) and %head_idx are declared by the prelude pool, and
+    // `csha_active_heads` is in the param list. Placement is after the
+    // prelude's (segment_masked) bar.sync 0, identical to the scalar path.
+    phases::csha_hooks::emit_active_heads_guard(&mut ptx, config);
+
+    // T2 load: stage HBM dQ/dK/dV into the exact SMEM slots emit_dproj reads.
+    emit_dqkv_hbm_to_smem_load(&mut ptx, config);
+    ptx.push_str("    bar.sync 0;  // dQ/dK/dV SMEM staged before x_norm recompute\n");
+
+    // Recompute x_norm + rms (the forward did not persist them for backward).
+    phases::backward::csha_hooks_backward::emit_xnorm_recompute(&mut ptx, config);
+    ptx.push_str("    bar.sync 0;  // x_norm + rms visible before dproj / dRMSNorm\n");
+
+    // dproj weight gradients (dWq/dWk/dWv) and dRMSNorm (dx) — reused scalar
+    // emitters, UNCHANGED. q_tile_iter = 0: under the smoke scope seq ==
+    // block_q so a single q-block covers the whole tile (matches how the
+    // scalar dproj/dRMSNorm phases are invoked for the leading q-block).
+    phases::backward::csha_hooks_backward::emit_dproj(&mut ptx, config, 0);
+    phases::backward::csha_hooks_backward::emit_drmsnorm(&mut ptx, config, 0);
+
+    // Entry close.
+    ptx.push_str("    ret;\n");
+    ptx.push_str("}\n");
+
+    Ok(ptx)
+}
+
+#[cfg(test)]
+mod synth_tests {
+    use super::*;
+    use crate::flash_attention::{CshaExtras, RopeStyle};
+
+    fn cfg(head_dim: i64, d_model: u32) -> FlashAttentionConfig {
+        FlashAttentionConfig {
+            block_q: 64,
+            block_kv: 64,
+            head_dim,
+            causal: true,
+            paged: false,
+            rope_q: false,
+            rope_style: RopeStyle::HalfSplit,
+            gqa_group_size: 1,
+            tree_mask: false,
+            gpu_sm: 80,
+            segment_masked: false,
+            csha: Some(CshaExtras {
+                level: 2,
+                d_model,
+                active_heads: 1,
+                ..Default::default()
+            }),
+        }
+    }
+
+    #[test]
+    fn entry_renamed_and_phases_present() {
+        let ptx = synthesize_proj_backward(&cfg(64, 64)).expect("synth ok");
+        assert!(ptx.contains(".visible .entry tier_b2_proj_backward ("));
+        // The scalar backward name must NOT survive the rename.
+        let scalar = phases::backward::prelude::kernel_name(&cfg(64, 64));
+        assert!(
+            !ptx.contains(&format!(".visible .entry {scalar} (")),
+            "scalar entry header should have been renamed"
+        );
+        assert!(ptx.contains("V2_BWD_XNORM_RECOMPUTE"));
+        assert!(ptx.contains("V2_BWD_DPROJ_WQ"));
+        assert!(ptx.contains("V2_BWD_DRMSNORM"));
+        // Read-only on HBM dQ/dK/dV: no dRoPE phase, no dQ/dK/dV finalize.
+        assert!(!ptx.contains("V2_BWD_DROPE"));
+        assert!(ptx.trim_end().ends_with('}'));
+    }
+
+    #[test]
+    fn rejects_bad_head_dim() {
+        let err = synthesize_proj_backward(&cfg(48, 48)).unwrap_err();
+        assert_eq!(err, BackwardSynthError::UnsupportedHeadDim(48));
+    }
 }
