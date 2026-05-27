@@ -123,6 +123,8 @@ pub fn slice_blocks(
 
 /// Rank d_ff neurons by column L2 norm of w_gate (`[d_model, d_ff]`, neurons on axis-1);
 /// return the top `new_d_ff` survivor indices in ascending order. dtype-agnostic via to_f64.
+/// Returns `Ok(empty)` when `new_d_ff == 0` (or `d_ff == 0`); never panics on a
+/// well-formed `WeightEntry` (a data-length mismatch yields `ShapeMismatch`).
 pub fn ffn_survivors_by_magnitude(
     w_gate: &WeightEntry,
     d_ff: u32,
@@ -138,6 +140,16 @@ pub fn ffn_survivors_by_magnitude(
     let rows = w_gate.shape[0];
     let cols = d_ff as usize;
     let bw = w_gate.dtype.byte_width();
+    // Data must cover the claimed shape, else the per-column reads below would index-panic
+    // (parity with slice_blocks).
+    let expected_bytes = rows * cols * bw;
+    if w_gate.data.len() != expected_bytes {
+        return Err(CepSliceError::ShapeMismatch {
+            tensor: w_gate.name.clone(),
+            expected: format!("{expected_bytes} bytes ({rows}x{cols}x{bw})"),
+            found: format!("{} bytes", w_gate.data.len()),
+        });
+    }
     let keep = (new_d_ff as usize).min(cols);
 
     let mut norms: Vec<(u32, f64)> = (0..cols)
@@ -231,6 +243,13 @@ mod tests {
         // shape claims 2x4 (32 bytes) but only 6 floats (24 bytes) of data.
         let e = f32_entry("t", vec![2, 4], &[0., 1., 2., 3., 4., 5.]);
         assert!(slice_blocks(&e, 1, 4, 1, &[0, 1]).is_err());
+    }
+
+    #[test]
+    fn ffn_survivors_rejects_truncated_data() {
+        // shape claims [2,4] (32 bytes) but only 6 floats (24 bytes) of data.
+        let w_gate = f32_entry("ffn.w_gate", vec![2, 4], &[0., 1., 2., 3., 4., 5.]);
+        assert!(ffn_survivors_by_magnitude(&w_gate, 4, 2).is_err());
     }
 
     #[test]
