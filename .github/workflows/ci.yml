@@ -100,7 +100,7 @@ jobs:
         run: |
           cargo test -p nsl-codegen --test wggo_backward_pipeline \
             end_to_end_backward_subprocess_matches_analytical_reference \
-            --nocapture
+            -- --nocapture
 
   # M62b Spec C — ONNX Runtime custom op integration tests.
   # Always runs on PRs and pushes to main. The job is cheap (~5 min) and
