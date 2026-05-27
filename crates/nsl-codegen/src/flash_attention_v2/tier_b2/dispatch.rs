@@ -85,6 +85,24 @@ pub fn tier_b2_can_dispatch(
     Ok(BackwardTier::TierB2 { bq, bkv, chunk })
 }
 
+/// Is the FULL hybrid backward (Tier B.2 dQ/dK/dV + scalar projection) VALIDATED for this config?
+/// Bounded by the reused scalar projection emitters' smoke scope (heads==1, d_model==head_dim,
+/// single Q tile) AND Tier B.2 dispatch eligibility. `tier_b2_can_dispatch` is intentionally NOT
+/// modified -- the constraint is the hybrid's, not the Tier-B.2 kernels'. Widens when the
+/// projection-extension follow-on lands. `batch` is a launch dim, enforced by the parity test, not here.
+pub fn tier_b2_hybrid_backward_eligible(config: &FlashAttentionConfig, seq_len: u32) -> bool {
+    if tier_b2_can_dispatch(config).is_err() {
+        return false;
+    }
+    let Some(csha) = config.csha.as_ref() else { return false; };
+    let hd = config.head_dim as u32;
+    let block_q = config.block_q as u32;
+    csha.active_heads.max(1) == 1
+        && csha.d_model == hd
+        && seq_len == block_q
+        && !config.rope_q
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
