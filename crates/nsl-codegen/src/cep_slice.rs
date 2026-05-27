@@ -1,6 +1,10 @@
 //! CEP Option 2 — SP1: weight slicing (pure data transform).
 
-use crate::weight_aware::WeightEntry;
+use std::collections::HashMap;
+
+use crate::cep_oracle::ModelSpec;
+use crate::cep_rewrite::{LayerDelta, PruneDelta};
+use crate::weight_aware::{WeightDType, WeightEntry, WeightMap};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum CepSliceError {
@@ -172,10 +176,268 @@ pub fn ffn_survivors_by_magnitude(
     Ok(survivors)
 }
 
+/// Map our dtype to the safetensors crate's dtype for re-serialization.
+pub(crate) fn to_safetensors_dtype(dt: WeightDType) -> safetensors::Dtype {
+    match dt {
+        WeightDType::F16 => safetensors::Dtype::F16,
+        WeightDType::BF16 => safetensors::Dtype::BF16,
+        WeightDType::F32 => safetensors::Dtype::F32,
+        WeightDType::F64 => safetensors::Dtype::F64,
+        WeightDType::F8E4M3 => safetensors::Dtype::F8_E4M3,
+        WeightDType::F8E5M2 => safetensors::Dtype::F8_E5M2,
+        WeightDType::I8 => safetensors::Dtype::I8,
+        WeightDType::I32 => safetensors::Dtype::I32,
+    }
+}
+
+/// Parse "blocks.{l}.{attn|ffn}.{name}" into (layer, "attn"|"ffn", leaf). Returns None
+/// for non-per-layer tensors (embed, final norm, lm_head) — copied through unchanged.
+fn parse_layer_tensor(name: &str) -> Option<(u32, &'static str, String)> {
+    let prefix = crate::wggo_graph::layer_prefix(name)?; // "blocks.0"
+    let layer: u32 = prefix.strip_prefix("blocks.")?.parse().ok()?;
+    let rest = name.strip_prefix(&prefix)?.strip_prefix('.')?; // "attn.wq" | "ffn.w_gate"
+    let (sect, leaf) = rest.split_once('.')?;
+    match sect {
+        "attn" => Some((layer, "attn", leaf.to_string())),
+        "ffn" => Some((layer, "ffn", leaf.to_string())),
+        _ => None,
+    }
+}
+
+/// Slice a model's weights to a PruneDelta. Returns the sliced entries (a smaller set).
+/// Pure data transform — drops pruned heads' blocks (GQA-group-aligned), narrows FFN by
+/// magnitude survivors (consistent across w_gate/w_up/w_down), drops + re-keys dropped layers.
+pub fn apply_prune_delta_to_weights(
+    wm: &WeightMap,
+    spec: &ModelSpec,
+    delta: &PruneDelta,
+) -> Result<HashMap<String, WeightEntry>, CepSliceError> {
+    // Per-layer drop flags + the old->new layer re-key map (skip dropped layers).
+    let mut drop = vec![false; spec.n_layers as usize];
+    for ld in &delta.per_layer {
+        if (ld.layer as usize) < drop.len() && ld.drop_layer {
+            drop[ld.layer as usize] = true;
+        }
+    }
+    let mut rekey = vec![None; spec.n_layers as usize];
+    let mut next = 0u32;
+    for (l, d) in drop.iter().enumerate() {
+        if !*d {
+            rekey[l] = Some(next);
+            next += 1;
+        }
+    }
+    // Index the delta by layer for quick lookup.
+    let by_layer: HashMap<u32, &LayerDelta> =
+        delta.per_layer.iter().map(|ld| (ld.layer, ld)).collect();
+
+    // Precompute per-layer FFN survivor sets (one ranking per layer, from w_gate).
+    let mut ffn_survivors: HashMap<u32, Vec<u32>> = HashMap::new();
+    for ld in &delta.per_layer {
+        if let Some(new_ff) = ld.new_d_ff {
+            let l = ld.layer;
+            let gate_name = format!("blocks.{l}.ffn.w_gate");
+            let gate = wm
+                .get(&gate_name)
+                .ok_or(CepSliceError::MissingTensor { tensor: gate_name })?;
+            let surv = ffn_survivors_by_magnitude(gate, spec.d_ff[l as usize], new_ff)?;
+            ffn_survivors.insert(l, surv);
+        }
+    }
+
+    let mut out: HashMap<String, WeightEntry> = HashMap::new();
+    for (name, entry) in wm.entries() {
+        match parse_layer_tensor(name) {
+            None => {
+                // Passthrough (embed, final norm, lm_head, etc.).
+                out.insert(name.clone(), entry.clone());
+            }
+            Some((l, sect, leaf)) => {
+                if (l as usize) >= drop.len() || drop[l as usize] {
+                    continue; // dropped layer — omit
+                }
+                let new_l = rekey[l as usize].expect("surviving layer has a rekey");
+                let ld = by_layer.get(&l);
+                let hd = spec.head_dim[l as usize];
+
+                let mut sliced = if let Some(ld) = ld {
+                    slice_one(entry, sect, &leaf, l, spec, ld, hd, &ffn_survivors)?
+                } else {
+                    entry.clone()
+                };
+                sliced.name = format!("blocks.{new_l}.{sect}.{leaf}");
+                out.insert(sliced.name.clone(), sliced);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Slice a single per-layer tensor according to its role + the layer's delta.
+#[allow(clippy::too_many_arguments)]
+fn slice_one(
+    entry: &WeightEntry,
+    sect: &str,
+    leaf: &str,
+    layer: u32,
+    spec: &ModelSpec,
+    ld: &LayerDelta,
+    hd: u32,
+    ffn_survivors: &HashMap<u32, Vec<u32>>,
+) -> Result<WeightEntry, CepSliceError> {
+    let l = layer as usize;
+    // Attention head survivors (group-aligned: pruned_heads are whole groups).
+    let n_heads = spec.n_heads[l];
+    let n_kv = spec.n_kv_heads[l].max(1);
+    let group = (n_heads / n_kv).max(1);
+    let survivor_q: Vec<u32> = (0..n_heads).filter(|h| !ld.pruned_heads.contains(h)).collect();
+    // KV survivors: a group survives iff its query heads survive.
+    let survivor_kv: Vec<u32> = (0..n_kv)
+        .filter(|&g| !ld.pruned_heads.contains(&(g * group)))
+        .collect();
+
+    match (sect, leaf) {
+        ("attn", "wq") if !ld.pruned_heads.is_empty() => {
+            slice_blocks(entry, 1, n_heads, hd, &survivor_q)
+        }
+        ("attn", "wo") if !ld.pruned_heads.is_empty() => {
+            slice_blocks(entry, 0, n_heads, hd, &survivor_q)
+        }
+        ("attn", "wk") | ("attn", "wv") if !ld.pruned_heads.is_empty() => {
+            slice_blocks(entry, 1, n_kv, hd, &survivor_kv)
+        }
+        ("ffn", "w_gate") | ("ffn", "w_up") => {
+            if let Some(surv) = ffn_survivors.get(&layer) {
+                slice_blocks(entry, 1, spec.d_ff[l], 1, surv)
+            } else {
+                Ok(entry.clone())
+            }
+        }
+        ("ffn", "w_down") => {
+            if let Some(surv) = ffn_survivors.get(&layer) {
+                slice_blocks(entry, 0, spec.d_ff[l], 1, surv)
+            } else {
+                Ok(entry.clone())
+            }
+        }
+        _ => Ok(entry.clone()), // norm scales etc. inside a layer — passthrough
+    }
+}
+
+/// Re-serialize sliced entries to a smaller .safetensors at `path`.
+pub fn write_sliced_weights(
+    entries: &HashMap<String, WeightEntry>,
+    path: &std::path::Path,
+) -> std::io::Result<()> {
+    use safetensors::tensor::TensorView;
+    let views: Vec<(String, TensorView)> = entries
+        .iter()
+        .map(|(name, e)| {
+            let v = TensorView::new(to_safetensors_dtype(e.dtype), e.shape.clone(), &e.data)
+                .expect("valid tensor view");
+            (name.clone(), v)
+        })
+        .collect();
+    let bytes = safetensors::serialize(views, &None)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+    std::fs::write(path, bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::weight_aware::{WeightDType, WeightEntry};
+    use crate::cep_oracle::{Activation, ModelSpec, NormType};
+    use crate::cep_rewrite::{LayerDelta, PruneDelta};
+    use crate::weight_aware::{WeightDType, WeightEntry, WeightMap};
+
+    fn small_spec() -> ModelSpec {
+        // d_model=8, 2 layers, 4 heads, 2 kv (group=2), head_dim=2, d_ff=6.
+        ModelSpec {
+            d_model: 8, n_layers: 2,
+            n_heads: vec![4, 4], n_kv_heads: vec![2, 2], head_dim: vec![2, 2], d_ff: vec![6, 6],
+            vocab: 16, max_seq: 32, batch: 1,
+            activation: Activation::SwiGlu, norm: NormType::RmsNorm, dtype_bytes: 4,
+        }
+    }
+
+    // Build a WeightMap with per-layer attn+ffn tensors (ramp values) + an embed passthrough.
+    fn small_weights(spec: &ModelSpec) -> WeightMap {
+        let mut entries = std::collections::HashMap::new();
+        let mut ramp = |name: &str, shape: Vec<usize>| {
+            let n: usize = shape.iter().product();
+            let vals: Vec<f32> = (0..n).map(|i| i as f32).collect();
+            entries.insert(name.to_string(), f32_entry(name, shape, &vals));
+        };
+        let dm = spec.d_model as usize;
+        for l in 0..spec.n_layers as usize {
+            let nh = spec.n_heads[l] as usize;
+            let nkv = spec.n_kv_heads[l] as usize;
+            let hd = spec.head_dim[l] as usize;
+            let dff = spec.d_ff[l] as usize;
+            ramp(&format!("blocks.{l}.attn.wq"), vec![dm, nh * hd]);
+            ramp(&format!("blocks.{l}.attn.wk"), vec![dm, nkv * hd]);
+            ramp(&format!("blocks.{l}.attn.wv"), vec![dm, nkv * hd]);
+            ramp(&format!("blocks.{l}.attn.wo"), vec![nh * hd, dm]);
+            ramp(&format!("blocks.{l}.ffn.w_gate"), vec![dm, dff]);
+            ramp(&format!("blocks.{l}.ffn.w_up"), vec![dm, dff]);
+            ramp(&format!("blocks.{l}.ffn.w_down"), vec![dff, dm]);
+        }
+        ramp("embed", vec![spec.vocab as usize, dm]);
+        WeightMap::from_entries(entries)
+    }
+
+    #[test]
+    fn orchestrator_slices_heads_ffn_and_passes_through() {
+        let spec = small_spec();
+        let wm = small_weights(&spec);
+        // Drop group 0 (heads 0,1) of layer 0 -> 2 surviving heads {2,3}, 1 kv head {1}.
+        // Narrow layer 0 FFN to 4 (drop 2 lowest-magnitude neurons). Layer 1 untouched.
+        let delta = PruneDelta {
+            per_layer: vec![
+                LayerDelta { layer: 0, pruned_heads: vec![0, 1], new_d_ff: Some(4), drop_layer: false },
+                LayerDelta { layer: 1, pruned_heads: vec![], new_d_ff: None, drop_layer: false },
+            ],
+        };
+        let out = apply_prune_delta_to_weights(&wm, &spec, &delta).unwrap();
+
+        // wq [8, 8] -> survivor heads {2,3} -> cols {4,5,6,7} -> [8, 4]
+        let wq = &out["blocks.0.attn.wq"];
+        assert_eq!(wq.shape, vec![8, 4]);
+        // identity: row 0 of sliced == original row 0 cols 4..8 = [4,5,6,7]
+        let wq_f = read_f32(wq);
+        assert_eq!(&wq_f[0..4], &[4., 5., 6., 7.]);
+        // wk [8,4] -> survivor kv head {1} -> cols {2,3} -> [8,2]
+        assert_eq!(out["blocks.0.attn.wk"].shape, vec![8, 2]);
+        // wo [8,8] -> survivor heads {2,3} -> rows {4,5,6,7} -> [4,8]
+        assert_eq!(out["blocks.0.attn.wo"].shape, vec![4, 8]);
+        // FFN narrowed to 4 across all three (consistent)
+        assert_eq!(out["blocks.0.ffn.w_gate"].shape, vec![8, 4]);
+        assert_eq!(out["blocks.0.ffn.w_up"].shape, vec![8, 4]);
+        assert_eq!(out["blocks.0.ffn.w_down"].shape, vec![4, 8]);
+        // layer 1 untouched
+        assert_eq!(out["blocks.1.attn.wq"].shape, vec![8, 8]);
+        // passthrough
+        assert_eq!(out["embed"].shape, vec![16, 8]);
+    }
+
+    #[test]
+    fn orchestrator_drops_and_rekeys_layers() {
+        let spec = small_spec();
+        let wm = small_weights(&spec);
+        // Drop layer 0 entirely -> layer 1 re-keyed to blocks.0.
+        let delta = PruneDelta {
+            per_layer: vec![
+                LayerDelta { layer: 0, pruned_heads: vec![], new_d_ff: None, drop_layer: true },
+                LayerDelta { layer: 1, pruned_heads: vec![], new_d_ff: None, drop_layer: false },
+            ],
+        };
+        let out = apply_prune_delta_to_weights(&wm, &spec, &delta).unwrap();
+        assert!(!out.contains_key("blocks.1.attn.wq"), "old layer-1 name must be re-keyed");
+        // original layer-1 wq (ramp 0..64) now lives at blocks.0.attn.wq
+        assert!(out.contains_key("blocks.0.attn.wq"));
+        assert_eq!(out["blocks.0.attn.wq"].shape, vec![8, 8]);
+        assert!(out.contains_key("embed"));
+    }
 
     fn f32_entry(name: &str, shape: Vec<usize>, vals: &[f32]) -> WeightEntry {
         let mut data = Vec::with_capacity(vals.len() * 4);
