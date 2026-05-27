@@ -559,6 +559,8 @@ pub struct CliOverrides {
     pub target: Option<String>,
     pub sparsity: Option<f64>,
     pub cep_out: Option<std::path::PathBuf>,
+    /// CEP SP1: also emit the pruned weights to this .safetensors path.
+    pub cep_emit_weights: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug)]

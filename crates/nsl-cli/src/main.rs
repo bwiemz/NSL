@@ -601,6 +601,9 @@ enum Cli {
         /// CEP: write the delta JSON here (default: <model>.cep.json).
         #[arg(long)]
         cep_out: Option<PathBuf>,
+        /// CEP: also emit the pruned (sliced) weights to this .safetensors path.
+        #[arg(long)]
+        cep_emit_weights: Option<PathBuf>,
     },
 
     /// Run @test functions in an NSL file
@@ -872,6 +875,7 @@ fn main_inner() {
                     target: cep_target,
                     sparsity: None,
                     cep_out,
+                    cep_emit_weights: None,
                 };
                 std::process::exit(run_cep_search(&file, &ov));
             }
@@ -1080,6 +1084,7 @@ fn main_inner() {
             cep_target,
             cep_sparsity,
             cep_out,
+            cep_emit_weights,
         } => {
             // M62a: shared_lib flag is threaded through compile_opts and handled
             // in the build path below.
@@ -1089,6 +1094,7 @@ fn main_inner() {
                     target: cep_target,
                     sparsity: cep_sparsity,
                     cep_out,
+                    cep_emit_weights,
                 };
                 std::process::exit(run_cep_prune(&file, weights.as_deref(), &ov));
             }
@@ -2887,6 +2893,28 @@ fn run_cep_prune(
         return 1;
     }
     println!("CEP delta written to {}", out_path.display());
+
+    if let Some(weights_out) = ov.cep_emit_weights.as_ref() {
+        let delta = nsl_codegen::cep::plan_to_prune_delta(&plan, &spec);
+        match nsl_codegen::cep_slice::apply_prune_delta_to_weights(&wm, &spec, &delta) {
+            Ok(sliced) => {
+                let orig_params: usize = wm.entries().map(|(_, e)| e.num_elements).sum();
+                let new_params: usize = sliced.values().map(|e| e.num_elements).sum();
+                if let Err(e) = nsl_codegen::cep_slice::write_sliced_weights(&sliced, weights_out) {
+                    eprintln!("error: failed to write sliced weights: {e}");
+                    return 1;
+                }
+                println!(
+                    "CEP sliced weights written to {} ({orig_params} -> {new_params} params)",
+                    weights_out.display()
+                );
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                return 1;
+            }
+        }
+    }
     0
 }
 
