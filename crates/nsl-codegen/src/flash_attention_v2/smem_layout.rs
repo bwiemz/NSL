@@ -345,6 +345,48 @@ fn align_up_u32(x: u32, align: u32) -> u32 {
     (x + align - 1) & !(align - 1)
 }
 
+/// SMEM layout for a PCA-augmented kernel. The `seg_smem` (32 KB) and — when
+/// `rope_q` — `smem_doc_starts` (1028 B) regions live in the `shmem[]` tail,
+/// after `base_total`, addressed as `%shmem_base + offset`. There is no
+/// separate static `.shared` region, so the static-`.shared`-alongside-
+/// `extern .shared shmem[]` mixed layout (which crashes on sm_120) cannot occur.
+///
+/// Single source of truth: the dynamic-SMEM budget check, the launcher byte
+/// count, and the prelude base offsets all derive from this one function, so
+/// they cannot diverge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PcaSmemLayout {
+    /// Total `shmem[]` bytes (base + embedded PCA regions), 16-aligned.
+    pub total: u32,
+    /// Byte offset of `seg_smem` within `shmem[]` (meaningful only when `segment_masked`).
+    pub seg_off: u32,
+    /// Byte offset of `smem_doc_starts` within `shmem[]` (`Some` only when `segment_masked && rope_q`).
+    pub doc_off: Option<u32>,
+}
+
+/// `seg_smem` size = the cooperative-load ceiling (`DEFAULT_SMEM_SEGMENT_BUDGET`, 32 KB).
+const PCA_SEG_BYTES: u32 = crate::pca_segment::DEFAULT_SMEM_SEGMENT_BUDGET as u32;
+/// `smem_doc_starts` size = `(MAX_NUM_DOCS + 1) * 4` = `257 * 4` = 1028 bytes.
+const PCA_DOC_BYTES: u32 = 1028;
+
+/// Compute the PCA SMEM layout for a given base total. `base_total` is
+/// `total_bytes(config)` (forward) or `backward_total_bytes(config)` (backward).
+pub fn pca_smem_layout(base_total: u32, segment_masked: bool, rope_q: bool) -> PcaSmemLayout {
+    if !segment_masked {
+        return PcaSmemLayout { total: base_total, seg_off: 0, doc_off: None };
+    }
+    let seg_off = align_up_u32(base_total, 16);
+    let after_seg = seg_off + PCA_SEG_BYTES; // PCA_SEG_BYTES (32768) is 16-aligned → after_seg 16-aligned
+    if rope_q {
+        let doc_off = after_seg;
+        let total = align_up_u32(doc_off + PCA_DOC_BYTES, 16);
+        PcaSmemLayout { total, seg_off, doc_off: Some(doc_off) }
+    } else {
+        let total = align_up_u32(after_seg, 16);
+        PcaSmemLayout { total, seg_off, doc_off: None }
+    }
+}
+
 /// Total SMEM bytes: Q tile + KV tile + S/P rows (4 warps × block_kv × 4 bytes, f32).
 /// When `csha.fused_projections`, also includes Wq/Wk/Wv weight tile slots and
 /// a softmax-state save area for the K/V pre-pass split design.
@@ -972,6 +1014,35 @@ mod tests {
         assert!(result.is_ok(),
             "small (32,32,64) at chunk=64 must fit 99 KB; got {:?}", result);
         assert_eq!(result.unwrap(), 64, "validator must return selected chunk on success");
+    }
+
+    #[test]
+    fn pca_smem_layout_offsets_correct_and_nonoverlapping() {
+        // Not masked → passthrough (no PCA regions).
+        assert_eq!(
+            pca_smem_layout(10_000, false, false),
+            PcaSmemLayout { total: 10_000, seg_off: 0, doc_off: None }
+        );
+
+        // Masked, no rope → seg region in the tail after base; doc absent.
+        let l = pca_smem_layout(10_000, true, false);
+        assert_eq!(l.seg_off, 10_000);              // 10_000 already 16-aligned
+        assert!(l.seg_off >= 10_000);               // non-overlap: seg starts at/after base end
+        assert_eq!(l.seg_off % 16, 0);              // aligned
+        assert_eq!(l.doc_off, None);
+        assert!(l.total >= l.seg_off + 32_768);     // total covers seg (32 KB)
+        assert_eq!(l.total % 16, 0);
+
+        // Masked + rope, unaligned base → seg then doc, non-overlapping, aligned.
+        let l = pca_smem_layout(10_001, true, true);
+        assert_eq!(l.seg_off, 10_016);              // align_up(10_001, 16)
+        assert_eq!(l.seg_off % 16, 0);
+        let doc = l.doc_off.expect("doc_off present when rope_q");
+        assert_eq!(doc, 10_016 + 32_768);           // seg_off + SEG_BYTES
+        assert!(doc >= l.seg_off + 32_768);         // non-overlap: doc starts after seg
+        assert_eq!(doc % 16, 0);
+        assert!(l.total >= doc + 1028);             // total covers doc (1028 B)
+        assert_eq!(l.total % 16, 0);
     }
 }
 
