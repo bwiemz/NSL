@@ -838,6 +838,57 @@ fn masked_null_seg_ptr_equals_unmasked_forward() {
     eprintln!("A-4 Test 1 PASSED: masked+null == unmasked, max_abs={:.2e} <= {:.0e}", max_abs, tol);
 }
 
+// ===========================================================================
+// Task 3 (reproduce-first): extern-regime forward — the Blackwell mixed-layout bug
+//
+// A large config forces total_bytes into the extern-shmem regime via the
+// segment_masked +32 KB seg overhead. With the (pre-Task-4) static `.shared
+// seg_smem`, this is the Blackwell static+extern crash. The test ASSERTS
+// masked+null == unmasked (the fix's correctness); on pre-fix code the masked
+// launch faults (the documented RED). Task 4's embed turns it GREEN.
+// ===========================================================================
+
+#[test]
+#[ignore = "requires CUDA GPU; run ALONE (an illegal-address fault poisons the context)"]
+fn masked_extern_config_equals_unmasked_forward() {
+    if !cuda_available() { eprintln!("skipped: no CUDA device"); return; }
+
+    let head_dim = 128usize; let block = 64i64;
+    let batch = 1usize; let heads = 1usize; let seq_len = 128usize;
+
+    // Sanity: confirm this config is in the extern regime AND fits the dynamic cap,
+    // so the test exercises the right regime (not the static one the A-4 tests used).
+    let cfg = fixture_config_sized(head_dim as i64, block, block, /*rope_q=*/false, /*segment_masked=*/true);
+    let base = nsl_codegen::flash_attention_v2::smem_layout::total_bytes(&cfg);
+    let layout = nsl_codegen::flash_attention_v2::smem_layout::pca_smem_layout(base, true, false);
+    assert!(base <= 48 * 1024, "base total_bytes should fit static alone (got {base}) — the bug needs seg to force extern");
+    assert!(layout.total > 48 * 1024, "config must force extern (layout.total={}); else not the buggy regime", layout.total);
+    assert!(layout.total <= 99 * 1024, "config must fit the 99 KB dynamic cap (layout.total={})", layout.total);
+
+    let total = batch * heads * seq_len * head_dim;
+    let mut q = vec![0f32; total]; let mut k = vec![0f32; total]; let mut v = vec![0f32; total];
+    fill_seeded(&mut q, 0xE0_E1_E2_E3);
+    fill_seeded(&mut k, 0xD0_D1_D2_D3);
+    fill_seeded(&mut v, 0xC0_C1_C2_C3);
+
+    let baseline = launch_pca_ex(
+        &q, &k, &v, batch, heads, seq_len, head_dim, block, block,
+        /*rope_q=*/false, /*segment_masked=*/false, &[], /*cos_sin=*/None, /*doc_starts=*/None,
+    );
+    let masked_null = launch_pca_ex(
+        &q, &k, &v, batch, heads, seq_len, head_dim, block, block,
+        /*rope_q=*/false, /*segment_masked=*/true, &[], None, None, // empty seg_ids → seg_ids_ptr=0
+    );
+
+    let masked_null = masked_null.unwrap_or_else(|| panic!(
+        "masked extern-config kernel crashed (seg_smem static + extern shmem[], sm_120) — \
+         this is the documented pre-fix RED; Task 4's embed fix must make it Some"
+    ));
+    let baseline = baseline.expect("unmasked extern baseline launch failed unexpectedly");
+    let (max_abs, _) = max_abs_diff(&masked_null, &baseline);
+    assert!(max_abs < 1e-5, "masked+null != unmasked (extern): max_abs={max_abs:.2e}");
+}
+
 /// Concatenate per-segment outputs back into a packed [B, H, S, D] tensor.
 ///
 /// `seg_outs[i]` is the output for segment i, shape [B, H, lens[i], D].
