@@ -550,6 +550,10 @@ pub fn compile_returning_plan(
     compiler.collect_models(&ast.stmts)?;
     // M56 Task 17: compute agent struct layouts.
     compiler.collect_agents(&ast.stmts)?;
+    // CPDT Part III: non-WGGO MoE dead-expert prune. Runs here (not under the
+    // WGGO-gated invoke_cpdt_if_enabled) so it's reachable with --cpdt --weights
+    // alone. No-op unless cpdt Full + a @moe config + a loaded WeightMap.
+    crate::cpdt_expert_prune::run_moe_prune_pass(&mut compiler);
     populate_calibration_retention_from_ast_if_unset(&mut compiler, ast, interner)?;
     // Task 4: declare the calibration retention arena BEFORE method-body
     // codegen.  The pipe-site splice in `try_emit_retention_splice` early-
