@@ -1,13 +1,13 @@
-//! Tier B.2 backward kernel emitter — Phase 2 implementation.
+//! Tier B.2 backward kernel emitter — Phase 3 implementation.
 //!
-//! Phase 2 implements the three-kernel plan:
+//! Phase 3 implements the four-kernel plan:
 //!   - D pre-pass (`d_prepass` module, Task 6)
 //!   - dQ-kernel (Tasks 8-16)
 //!   - dK/dV-kernel (Phase 3)
+//!   - proj-backward (`proj_backward` module, Phase 3 T4)
 //!
-//! Phase 2 contract: `synthesize_tier_b2_backward` concatenates the PTX
-//! output of `synthesize_d_prepass` + `synthesize_dq_kernel`.  Phase 3
-//! will extend with dK/dV-kernel synthesis.
+//! Contract: `synthesize_tier_b2_backward` concatenates the PTX output of
+//! all four kernels into a single module.
 
 pub mod d_prepass;
 pub mod dkdv;
@@ -50,17 +50,21 @@ impl std::fmt::Display for BackwardSynthError {
 
 impl std::error::Error for BackwardSynthError {}
 
-/// Phase 3a emitter: synthesize D pre-pass + dQ-kernel + dK/dV-kernel PTX.
+/// Phase 3 emitter: synthesize D pre-pass + dQ-kernel + dK/dV-kernel + proj-backward PTX.
 ///
-/// Phase 3a adds the dK/dV-kernel scaffold (kv-outer/q-inner loop structure,
-/// cp.async data loads, finalize stub). Tasks 4-8 add the MMA math.
+/// The four kernels are concatenated into a single PTX module:
+///   1. `tier_b2_d_prepass`    — per-token D scalar precompute
+///   2. `tier_b2_dq_kernel`    — dQ accumulation (kv-outer/q-inner)
+///   3. `tier_b2_dkdv_kernel`  — dK/dV accumulation (Phase 3)
+///   4. `tier_b2_proj_backward` — projection/RMSNorm backward (Phase 3 T4)
 pub fn synthesize_tier_b2_backward(
     config: &FlashAttentionConfig,
 ) -> Result<String, BackwardSynthError> {
     let d_prepass_ptx = d_prepass::synthesize_d_prepass(config)?;
     let dq_ptx = dq::synthesize_dq_kernel(config)?;
     let dkdv_ptx = dkdv::synthesize_dkdv_kernel(config)?;
-    Ok(format!("{}\n\n{}\n\n{}", d_prepass_ptx, dq_ptx, dkdv_ptx))
+    let proj_ptx = proj_backward::synthesize_proj_backward(config)?;
+    Ok(format!("{}\n\n{}\n\n{}\n\n{}", d_prepass_ptx, dq_ptx, dkdv_ptx, proj_ptx))
 }
 
 #[cfg(test)]
@@ -103,5 +107,32 @@ mod tests {
         cfg.head_dim = 48;  // not divisible by 32
         let result = synthesize_tier_b2_backward(&cfg);
         assert_eq!(result, Err(BackwardSynthError::UnsupportedHeadDim(48)));
+    }
+
+    fn smoke_cfg() -> FlashAttentionConfig {
+        use crate::flash_attention::CshaExtras;
+        FlashAttentionConfig {
+            block_q: 64, block_kv: 64, head_dim: 64,
+            causal: true, paged: false,
+            rope_q: false, rope_style: RopeStyle::HalfSplit,
+            gqa_group_size: 1, tree_mask: false,
+            gpu_sm: 80, segment_masked: false,
+            csha: Some(CshaExtras {
+                level: 2,
+                d_model: 64,
+                active_heads: 1,
+                ..Default::default()
+            }),
+        }
+    }
+
+    #[test]
+    fn synth_includes_all_four_kernels() {
+        let cfg = smoke_cfg();
+        let ptx = synthesize_tier_b2_backward(&cfg).expect("synth ok");
+        for name in ["tier_b2_d_prepass", "tier_b2_dq_kernel", "tier_b2_dkdv_kernel",
+                     "tier_b2_proj_backward"] {
+            assert!(ptx.contains(name), "missing entry {name}");
+        }
     }
 }
