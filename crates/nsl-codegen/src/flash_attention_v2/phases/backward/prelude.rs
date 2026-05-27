@@ -21,7 +21,7 @@
 
 use crate::flash_attention::FlashAttentionConfig;
 use crate::flash_attention_v2::smem_layout::{
-    backward_extra_bytes, total_bytes, Direction, SMEM_BUDGET_BYTES,
+    backward_extra_bytes, pca_smem_layout, total_bytes, Direction, SMEM_BUDGET_BYTES,
 };
 use crate::kernel_skeleton::indexing::{
     emit_thread_lane_warp_register_decl, emit_thread_lane_warp_register_init,
@@ -48,20 +48,12 @@ pub fn backward_total_bytes(config: &FlashAttentionConfig) -> u32 {
 }
 
 fn backward_needs_dynamic_smem(config: &FlashAttentionConfig) -> bool {
-    // PCA Tier A: when segment_masked the prelude reserves
-    // DEFAULT_SMEM_SEGMENT_BUDGET bytes for the embedded seg_smem region
-    // at the tail of shmem (Blackwell fix; see register-decl comment
-    // below).  Force dynamic SMEM whenever the combined footprint exceeds
-    // the 48 KB static cap so the main shmem[] uses the `extern .shared`
-    // form.  Budget sourced from pca_segment::DEFAULT_SMEM_SEGMENT_BUDGET
-    // so the FA emitter's allocation tracks the planner's residency
-    // ceiling.
-    let seg_overhead = if config.segment_masked {
-        DEFAULT_SMEM_SEGMENT_BUDGET as u32
-    } else {
-        0
-    };
-    backward_total_bytes(config) + seg_overhead > SMEM_BUDGET_BYTES
+    // Count seg_smem AND smem_doc_starts (when rope_q) via the single-source
+    // layout (matches the forward budget check; doc was previously uncounted).
+    // No embed — backward already embeds seg_smem in the shmem[] tail; doc stays
+    // a separate static `.shared`. This only fixes the static-cap decision.
+    pca_smem_layout(backward_total_bytes(config), config.segment_masked, config.rope_q).total
+        > SMEM_BUDGET_BYTES
 }
 
 /// Emit the backward prelude: header, entry, SMEM, registers, indices.
