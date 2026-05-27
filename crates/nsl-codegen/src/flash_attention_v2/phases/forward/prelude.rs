@@ -7,23 +7,34 @@ use crate::flash_attention_v2::smem_layout::{needs_dynamic_smem, total_bytes, SM
 use crate::pca_segment::{DEFAULT_SMEM_SEGMENT_BUDGET, SegmentResidency};
 
 /// Forward SMEM-routing gate that also accounts for PCA Tier A's
-/// `seg_smem` static array (when `config.segment_masked`).  Without
-/// this, CSHA fused+saves + segment_masked configs can push the combined
-/// static SMEM past the 48 KB cap; ptxas accepts but launch fails with
-/// CUDA_ERROR_ILLEGAL_ADDRESS at sync time because the main shmem[] is
-/// silently over-allocated.  Mirrors `backward_needs_dynamic_smem`.
+/// `seg_smem` static array (when `config.segment_masked`) and the PCA
+/// §4.3 `smem_doc_starts[1028]` array (when `segment_masked && rope_q`).
+///
+/// Without both overheads, CSHA fused+saves + segment_masked configs can
+/// push the combined static SMEM past the 48 KB cap; ptxas accepts but
+/// launch fails with CUDA_ERROR_ILLEGAL_ADDRESS at sync time because the
+/// main shmem[] is silently over-allocated.  Mirrors
+/// `backward_needs_dynamic_smem`.
 ///
 /// `seg_smem` is sized to `pca_segment::DEFAULT_SMEM_SEGMENT_BUDGET`
 /// (the upper bound used by `pca_segment::plan_kernel` when deciding
 /// `SegmentResidency::Shared`); the FA emitter's allocation must match
 /// the planner so cooperative loads never write past the buffer.
+///
+/// `smem_doc_starts` is `(MAX_NUM_DOCS + 1) * 4` = 1028 bytes; sized
+/// by `pca_rope::MAX_NUM_DOCS` so this gate and the emitter stay in sync.
 fn fwd_needs_dynamic_smem(config: &FlashAttentionConfig) -> bool {
     let seg_overhead = if config.segment_masked {
         DEFAULT_SMEM_SEGMENT_BUDGET as u32
     } else {
         0
     };
-    total_bytes(config) + seg_overhead > SMEM_BUDGET_BYTES
+    let rope_overhead = if config.segment_masked && config.rope_q {
+        (crate::pca_rope::MAX_NUM_DOCS + 1) * 4
+    } else {
+        0
+    };
+    total_bytes(config) + seg_overhead + rope_overhead > SMEM_BUDGET_BYTES
         || needs_dynamic_smem(config)
 }
 use crate::kernel_skeleton::indexing::emit_thread_lane_warp_register_decl;
@@ -502,5 +513,78 @@ pub fn emit_with_smem_override(
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::flash_attention::{CshaExtras, FlashAttentionConfig, RopeStyle};
+    use crate::flash_attention_v2::smem_layout::{total_bytes, SMEM_BUDGET_BYTES};
+    use crate::pca_segment::DEFAULT_SMEM_SEGMENT_BUDGET;
+    use crate::pca_rope::MAX_NUM_DOCS;
+
+    fn rope_segment_config() -> FlashAttentionConfig {
+        FlashAttentionConfig {
+            block_q: 32, block_kv: 32, head_dim: 32,
+            causal: true, paged: false,
+            rope_q: true,
+            rope_style: RopeStyle::Adjacent,
+            gqa_group_size: 1, tree_mask: false, gpu_sm: 75,
+            segment_masked: true,
+            csha: Some(CshaExtras::level2(1e-5, 32)),
+        }
+    }
+
+    /// `fwd_needs_dynamic_smem` must include the 1028-byte `smem_doc_starts`
+    /// overhead when `segment_masked && rope_q`.  The fixture config has
+    /// `total_bytes + seg_overhead + rope_overhead > SMEM_BUDGET_BYTES`,
+    /// so the forward SMEM path must be dynamic, and the emitted PTX must
+    /// contain `.extern .shared` rather than the static `shmem[N]` form.
+    #[test]
+    fn fwd_smem_budget_counts_rope_doc_starts_overhead() {
+        let cfg = rope_segment_config();
+        let t = total_bytes(&cfg);
+        let seg = DEFAULT_SMEM_SEGMENT_BUDGET as u32;
+        let rope = (MAX_NUM_DOCS + 1) * 4;
+
+        // Verify rope_overhead constant matches pca_rope emission (1028 bytes).
+        assert_eq!(rope, 1028, "smem_doc_starts must be (MAX_NUM_DOCS+1)*4 = 1028 bytes");
+
+        // For this fixture total exceeds 48 KB once all three overheads are summed.
+        assert!(
+            t + seg + rope > SMEM_BUDGET_BYTES,
+            "total ({t}) + seg ({seg}) + rope ({rope}) must exceed {SMEM_BUDGET_BYTES}; \
+             fwd_needs_dynamic_smem must return true"
+        );
+
+        // Confirm the emitted PTX uses dynamic SMEM (extern .shared shmem[]).
+        let ptx = String::from_utf8(
+            crate::flash_attention_v2::synthesize_flash_attention_ptx_v2(&cfg)
+        ).expect("PTX must be valid UTF-8");
+        assert!(
+            ptx.contains(".extern .shared .align 16 .b8 shmem[]"),
+            "segment_masked+rope_q forward kernel must use extern .shared (dynamic SMEM); \
+             got PTX snippet:\n{}", &ptx[..ptx.len().min(400)]
+        );
+    }
+
+    /// Sentinel-disabled (segment_masked=false) path must NOT have its budget
+    /// inflated by rope_overhead — rope_overhead is only charged when both
+    /// segment_masked AND rope_q are set.
+    #[test]
+    fn fwd_smem_budget_skips_rope_overhead_when_segment_masked_false() {
+        let mut cfg = rope_segment_config();
+        cfg.segment_masked = false;
+        // Without segment_masked the config uses small static SMEM; the
+        // overhead must not be charged and `fwd_needs_dynamic_smem` must
+        // not incorrectly force dynamic SMEM.
+        let ptx = String::from_utf8(
+            crate::flash_attention_v2::synthesize_flash_attention_ptx_v2(&cfg)
+        ).expect("PTX must be valid UTF-8");
+        assert!(
+            !ptx.contains(".extern .shared .align 16 .b8 shmem[]"),
+            "segment_masked=false forward kernel must use static shmem (no extern .shared)"
+        );
     }
 }
