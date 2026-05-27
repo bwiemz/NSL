@@ -234,6 +234,7 @@ pub fn cpu_naive_backward_proj(
     eps: f32,
     batch: usize, heads: usize, seq: usize, head_dim: usize, d_model: usize,
 ) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
+    assert_eq!(heads, 1, "cpu_naive_backward_proj: multi-head dx reduction not implemented; heads must be 1 (smoke scope)");
     let kv_dim = heads * head_dim;
     let mut dwq = vec![0.0f32; d_model * kv_dim];
     let mut dwk = vec![0.0f32; d_model * kv_dim];
@@ -297,7 +298,7 @@ mod proj_tests {
     fn proj_dw_is_xnorm_t_times_dy_smoke() {
         // heads=1, d_model=head_dim=2, seq=1 -> single row, kv_dim=2.
         // x = [3,4] -> mean_sq = (9+16)/2 = 12.5; rms = sqrt(12.5+eps).
-        // x_norm = x/rms. dWq[p,j] = x_norm[0,p]*dq[0,j].
+        // x_norm = x/rms. dWq[p,j] = x_norm[0,p]*dq[0,j] (independent of Wq).
         let d_model = 2usize;
         let head_dim = 2usize;
         let seq = 1usize;
@@ -306,22 +307,33 @@ mod proj_tests {
         let dq = vec![1.0f32, 2.0];                        // [seq, head_dim]
         let dk = vec![0.0f32, 0.0];
         let dv = vec![0.0f32, 0.0];
-        let wq = vec![h(0.0); d_model * head_dim];
+        // Identity Wq (row-major [d_model, kv_dim]=[2,2]); Wk=Wv=0 so dx_norm = dq @ Wq^T.
+        let wq = vec![h(1.0), h(0.0), h(0.0), h(1.0)];
         let wk = vec![h(0.0); d_model * head_dim];
         let wv = vec![h(0.0); d_model * head_dim];
         let norm_weight = vec![h(1.0), h(1.0)];
 
-        let (dwq, _dwk, _dwv, _dx) = cpu_naive_backward_proj(
+        let (dwq, _dwk, _dwv, dx) = cpu_naive_backward_proj(
             &dq, &dk, &dv, &x_raw, &wq, &wk, &wv, &norm_weight,
             eps, /*batch*/1, /*heads*/1, seq, head_dim, d_model,
         );
 
-        let rms = ((9.0 + 16.0) / 2.0f32 + eps).sqrt();
+        let rms = (12.5f32 + eps).sqrt();
         let xn0 = 3.0 / rms;
         let xn1 = 4.0 / rms;
+        // dWq[p,j] = x_norm[0,p]*dq[0,j]
         assert!((dwq[0 * 2 + 0] - xn0 * 1.0).abs() < 1e-4, "dWq[0,0]");
         assert!((dwq[0 * 2 + 1] - xn0 * 2.0).abs() < 1e-4, "dWq[0,1]");
         assert!((dwq[1 * 2 + 0] - xn1 * 1.0).abs() < 1e-4, "dWq[1,0]");
         assert!((dwq[1 * 2 + 1] - xn1 * 2.0).abs() < 1e-4, "dWq[1,1]");
+
+        // dx path (independent recomputation; identity Wq => dx_norm = [dq0, dq1] = [1,2]).
+        let dxn = [1.0f32, 2.0f32];
+        let nw = [1.0f32, 1.0f32];
+        let xr = [3.0f32, 4.0f32];
+        let sdot = dxn[0] * nw[0] * xr[0] + dxn[1] * nw[1] * xr[1]; // 1*3 + 2*4 = 11
+        let exp = |p: usize| dxn[p] * nw[p] / rms - xr[p] * sdot / (d_model as f32 * rms * rms * rms);
+        assert!((dx[0] - exp(0)).abs() < 1e-4, "dx[0]: got {} want {}", dx[0], exp(0));
+        assert!((dx[1] - exp(1)).abs() < 1e-4, "dx[1]: got {} want {}", dx[1], exp(1));
     }
 }
