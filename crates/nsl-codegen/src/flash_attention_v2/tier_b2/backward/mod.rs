@@ -13,6 +13,7 @@ pub mod d_prepass;
 pub mod dkdv;
 pub mod dq;
 pub mod hbm_addr;
+pub mod proj_backward;
 
 use crate::flash_attention::FlashAttentionConfig;
 
