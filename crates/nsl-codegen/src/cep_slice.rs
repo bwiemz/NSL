@@ -121,6 +121,45 @@ pub fn slice_blocks(
     })
 }
 
+/// Rank d_ff neurons by column L2 norm of w_gate (`[d_model, d_ff]`, neurons on axis-1);
+/// return the top `new_d_ff` survivor indices in ascending order. dtype-agnostic via to_f64.
+pub fn ffn_survivors_by_magnitude(
+    w_gate: &WeightEntry,
+    d_ff: u32,
+    new_d_ff: u32,
+) -> Result<Vec<u32>, CepSliceError> {
+    if w_gate.shape.len() != 2 || w_gate.shape[1] != d_ff as usize {
+        return Err(CepSliceError::ShapeMismatch {
+            tensor: w_gate.name.clone(),
+            expected: format!("[d_model, {d_ff}]"),
+            found: format!("{:?}", w_gate.shape),
+        });
+    }
+    let rows = w_gate.shape[0];
+    let cols = d_ff as usize;
+    let bw = w_gate.dtype.byte_width();
+    let keep = (new_d_ff as usize).min(cols);
+
+    let mut norms: Vec<(u32, f64)> = (0..cols)
+        .map(|c| {
+            let mut sumsq = 0.0_f64;
+            for r in 0..rows {
+                let off = (r * cols + c) * bw;
+                let v = w_gate.dtype.to_f64(&w_gate.data[off..off + bw]);
+                sumsq += v * v;
+            }
+            (c as u32, sumsq) // sqrt is monotonic; ranking on sumsq is equivalent
+        })
+        .collect();
+    // Highest magnitude first; tie-break by lower index for determinism.
+    norms.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then(a.0.cmp(&b.0))
+    });
+    let mut survivors: Vec<u32> = norms.into_iter().take(keep).map(|(c, _)| c).collect();
+    survivors.sort_unstable();
+    Ok(survivors)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -192,5 +231,23 @@ mod tests {
         // shape claims 2x4 (32 bytes) but only 6 floats (24 bytes) of data.
         let e = f32_entry("t", vec![2, 4], &[0., 1., 2., 3., 4., 5.]);
         assert!(slice_blocks(&e, 1, 4, 1, &[0, 1]).is_err());
+    }
+
+    #[test]
+    fn ffn_survivors_keep_highest_magnitude_columns() {
+        // w_gate [2, 4]: column L2 norms ~ [sqrt(0+0), sqrt(1+1), sqrt(9+9), sqrt(4+4)]
+        // = col0=0, col1=1.41, col2=4.24, col3=2.83. Keep top 2 -> cols {2, 3} (ascending).
+        let w_gate = f32_entry("ffn.w_gate", vec![2, 4], &[
+            0., 1., 3., 2.,
+            0., 1., 3., 2.,
+        ]);
+        let surv = ffn_survivors_by_magnitude(&w_gate, 4, 2).unwrap();
+        assert_eq!(surv, vec![2, 3]);
+    }
+
+    #[test]
+    fn ffn_survivors_full_width_is_identity() {
+        let w_gate = f32_entry("ffn.w_gate", vec![2, 3], &[1., 2., 3., 4., 5., 6.]);
+        assert_eq!(ffn_survivors_by_magnitude(&w_gate, 3, 3).unwrap(), vec![0, 1, 2]);
     }
 }
