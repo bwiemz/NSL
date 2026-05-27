@@ -44,6 +44,12 @@ pub enum ExpertPruneRefusal {
     DeadIndexOutOfRange { index: u32, n_experts: usize },
     AllExpertsDead,
     InsufficientLiveExperts { n_live: usize, top_k: usize },
+    /// v1 byte-slices router + experts with a single byte-width, so the two
+    /// tensors must share a dtype. Mixed dtypes are refused (not mis-sliced);
+    /// matched-dtype support is the common case and a separate-byte-width
+    /// bundle is a documented follow-on. Produced only by the pass (the pure
+    /// transform carries one dtype).
+    MixedDtypeUnsupported { router_dtype: WeightDType, expert_dtype: WeightDType },
 }
 
 /// Prune dead experts from a MoE weight bundle: slice router columns + drop
@@ -205,6 +211,33 @@ pub fn prune_moe_weights_in_map(
             continue;
         }
         let d_model = router_entry.shape[0];
+
+        // v1 byte-slices with a single byte-width -> router and experts must
+        // share a dtype. Refuse mismatches rather than mis-slice the experts.
+        if expert_entry.dtype != router_entry.dtype {
+            outcomes.push(MoePruneOutcome::Refused {
+                layer: key,
+                refusal: ExpertPruneRefusal::MixedDtypeUnsupported {
+                    router_dtype: router_entry.dtype,
+                    expert_dtype: expert_entry.dtype,
+                },
+            });
+            continue;
+        }
+        // Expert tensor must pack evenly into n blocks (clearer diagnostic than
+        // the downstream byte-length refusal).
+        if !expert_entry.num_elements.is_multiple_of(n.max(1)) {
+            outcomes.push(MoePruneOutcome::Refused {
+                layer: key,
+                refusal: ExpertPruneRefusal::BundleInconsistent {
+                    reason: format!(
+                        "expert num_elements {} not divisible by n_experts {n}",
+                        expert_entry.num_elements
+                    ),
+                },
+            });
+            continue;
+        }
         let block_elems = expert_entry.num_elements / n.max(1);
 
         // Detect dead experts from the router weights alone.
@@ -227,8 +260,8 @@ pub fn prune_moe_weights_in_map(
                 outcomes.push(MoePruneOutcome::NoDeadExperts { layer: key });
             }
             Ok(res) => {
-                let dropped_bytes = (router_entry.data.len() - res.sliced_router.len()
-                    + expert_entry.data.len() - res.kept_experts.len()) as u64;
+                let dropped_bytes = router_entry.data.len().saturating_sub(res.sliced_router.len()) as u64
+                    + expert_entry.data.len().saturating_sub(res.kept_experts.len()) as u64;
                 // Mutate the WeightMap entries in place (smaller bundle).
                 let new_router = WeightEntry::new(
                     router_name.clone(),

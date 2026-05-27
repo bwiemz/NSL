@@ -188,7 +188,7 @@ fn live_prune_negative_control() {
 
 use std::collections::HashMap;
 use nsl_codegen::cpdt::CpdtMode;
-use nsl_codegen::cpdt_expert_prune::{prune_moe_weights_in_map, MoePruneOutcome};
+use nsl_codegen::cpdt_expert_prune::{prune_moe_weights_in_map, ExpertPruneRefusal, MoePruneOutcome};
 use nsl_codegen::moe::MoeInfo;
 use nsl_codegen::weight_aware::WeightMap;
 
@@ -291,5 +291,36 @@ fn pass_no_dead_experts_is_informational() {
     let outcomes = prune_moe_weights_in_map(CpdtMode::Full, &mut cfgs, &mut wm);
     assert!(matches!(outcomes.as_slice(), [MoePruneOutcome::NoDeadExperts { .. }]));
     assert_eq!(wm.get("m.router.weight").unwrap().shape, vec![D, N]); // untouched
+    assert_eq!(cfgs["m"].num_experts, N);
+}
+
+#[test]
+fn pass_refuses_mixed_dtype() {
+    // Router F32 + experts F16: v1 byte-slices with one byte-width, so a mixed
+    // dtype must REFUSE (not mis-slice the experts). Closes a silent-corruption
+    // path. The refusal fires before any slicing -> map untouched.
+    let mut wm = WeightMap::default();
+    wm.insert(WeightEntry::new(
+        "m.router.weight".into(),
+        f32s(&router_flat()),
+        vec![D, N],
+        WeightDType::F32,
+    ));
+    wm.insert(WeightEntry::new(
+        "m.experts.weight".into(),
+        vec![0u8; N * D * D * 2], // F16 byte length (2 bytes/elem)
+        vec![N, D * D],
+        WeightDType::F16,
+    ));
+    let mut cfgs = HashMap::new();
+    cfgs.insert("m".to_string(), moe_info(N, 1));
+    let outcomes = prune_moe_weights_in_map(CpdtMode::Full, &mut cfgs, &mut wm);
+    assert!(matches!(
+        outcomes.as_slice(),
+        [MoePruneOutcome::Refused { refusal: ExpertPruneRefusal::MixedDtypeUnsupported { .. }, .. }]
+    ));
+    // Untouched: no partial mutation on refusal.
+    assert_eq!(wm.get("m.router.weight").unwrap().shape, vec![D, N]);
+    assert_eq!(wm.get("m.experts.weight").unwrap().shape, vec![N, D * D]);
     assert_eq!(cfgs["m"].num_experts, N);
 }
