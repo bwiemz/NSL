@@ -386,8 +386,18 @@ struct PruneDeltaDoc {
 /// with `chosen.n_heads`.
 pub fn plan_to_prune_delta(plan: &CepPlan, baseline: &ModelSpec) -> PruneDelta {
     let chosen = plan.outcome.chosen.as_ref().map(|c| &c.spec);
-    let mut per_layer = Vec::with_capacity(baseline.n_layers as usize);
 
+    // Pre-index head importances by layer so per-group scoring is a small local scan
+    // rather than re-walking the full `plan.importance.heads` slice for every group.
+    let mut head_scores_by_layer: Vec<Vec<(u32, f64)>> =
+        vec![Vec::new(); baseline.n_layers as usize];
+    for h in &plan.importance.heads {
+        if (h.layer as usize) < head_scores_by_layer.len() {
+            head_scores_by_layer[h.layer as usize].push((h.head, h.score));
+        }
+    }
+
+    let mut per_layer = Vec::with_capacity(baseline.n_layers as usize);
     for l in 0..baseline.n_layers as usize {
         let base_heads = baseline.n_heads[l];
         let base_kv = baseline.n_kv_heads[l].max(1);
@@ -397,30 +407,35 @@ pub fn plan_to_prune_delta(plan: &CepPlan, baseline: &ModelSpec) -> PruneDelta {
             .map(|c| c.n_heads.get(l).copied().unwrap_or(base_heads))
             .unwrap_or(base_heads);
         let n_drop_heads = base_heads.saturating_sub(chosen_heads);
+        // The planner snaps n_heads to a group multiple, so the drop count is always a
+        // whole number of groups. Assert it so a future caller or planner change that
+        // breaks the invariant is caught in debug builds rather than silently truncating.
+        debug_assert_eq!(
+            n_drop_heads % group,
+            0,
+            "layer {l}: chosen_heads={chosen_heads} not a multiple of group={group}"
+        );
         let n_drop_groups = (n_drop_heads / group) as usize;
 
         let mut pruned_heads = Vec::new();
         if n_drop_groups > 0 {
+            let layer_scores = &head_scores_by_layer[l];
             // Score each of the `base_kv` groups by summed head importance for this layer.
             let mut group_scores: Vec<(u32, f64)> = (0..base_kv)
                 .map(|g| {
                     let lo = g * group;
                     let hi = lo + group;
-                    let s: f64 = plan
-                        .importance
-                        .heads
+                    let s: f64 = layer_scores
                         .iter()
-                        .filter(|h| h.layer == l as u32 && h.head >= lo && h.head < hi)
-                        .map(|h| h.score)
+                        .filter(|(head, _)| *head >= lo && *head < hi)
+                        .map(|(_, score)| *score)
                         .sum();
                     (g, s)
                 })
                 .collect();
             // Lowest-score groups first; tie-break by lower group index for determinism.
             group_scores.sort_by(|a, b| {
-                a.1.partial_cmp(&b.1)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-                    .then(a.0.cmp(&b.0))
+                a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal).then(a.0.cmp(&b.0))
             });
             for &(g, _) in group_scores.iter().take(n_drop_groups) {
                 for h in (g * group)..((g + 1) * group) {
@@ -434,12 +449,7 @@ pub fn plan_to_prune_delta(plan: &CepPlan, baseline: &ModelSpec) -> PruneDelta {
             .and_then(|c| c.d_ff.get(l).copied())
             .filter(|&w| w < baseline.d_ff[l]);
 
-        per_layer.push(LayerDelta {
-            layer: l as u32,
-            pruned_heads,
-            new_d_ff,
-            drop_layer: false,
-        });
+        per_layer.push(LayerDelta { layer: l as u32, pruned_heads, new_d_ff, drop_layer: false });
     }
     PruneDelta { per_layer }
 }
@@ -878,6 +888,13 @@ mod bridge_tests {
         let input = build_prune_input(&cfg, baseline.clone(), None, "H100-SXM", Some(0.2)).expect("input");
         let plan = run_prune(input);
         let delta = plan_to_prune_delta(&plan, &baseline);
+
+        // Non-vacuous: the chosen plan must actually prune at least one layer, or the
+        // group-alignment/contiguity assertions below would pass trivially on empty deltas.
+        assert!(
+            delta.per_layer.iter().any(|ld| !ld.pruned_heads.is_empty()),
+            "expected at least one pruned layer"
+        );
 
         let chosen = plan.outcome.chosen.as_ref().expect("chosen");
         for ld in &delta.per_layer {
