@@ -220,3 +220,108 @@ pub fn cpu_naive_backward_dkdv(
     }
     (dv, dk)
 }
+
+/// CPU-naive projection backward (smoke scope: heads==1, d_model==head_dim, seq==block_q).
+/// dq/dk/dv: row-major [batch,heads,seq,head_dim] f32. x_raw: [batch,heads,seq,d_model] f16.
+/// wq/wk/wv: [d_model, kv_dim] f16 (kv_dim = heads*head_dim). norm_weight: [d_model] f16.
+/// Returns (dWq, dWk, dWv, dx): dW* row-major [d_model, kv_dim] f32; dx [batch,heads,seq,d_model] f32.
+#[allow(clippy::too_many_arguments)]
+pub fn cpu_naive_backward_proj(
+    dq: &[f32], dk: &[f32], dv: &[f32],
+    x_raw: &[f16],
+    wq: &[f16], wk: &[f16], wv: &[f16],
+    norm_weight: &[f16],
+    eps: f32,
+    batch: usize, heads: usize, seq: usize, head_dim: usize, d_model: usize,
+) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>) {
+    let kv_dim = heads * head_dim;
+    let mut dwq = vec![0.0f32; d_model * kv_dim];
+    let mut dwk = vec![0.0f32; d_model * kv_dim];
+    let mut dwv = vec![0.0f32; d_model * kv_dim];
+    let mut dx = vec![0.0f32; batch * heads * seq * d_model];
+
+    for bi in 0..batch {
+        for hi in 0..heads {
+            for s in 0..seq {
+                let x_base = ((bi * heads + hi) * seq + s) * d_model;
+                let y_base = ((bi * heads + hi) * seq + s) * head_dim;
+
+                let mean_sq: f32 = (0..d_model)
+                    .map(|p| { let v = x_raw[x_base + p].to_f32(); v * v })
+                    .sum::<f32>() / d_model as f32;
+                let rms = (mean_sq + eps).sqrt();
+
+                for p in 0..d_model {
+                    let xn = x_raw[x_base + p].to_f32() / rms;
+                    for j in 0..head_dim {
+                        let col = hi * head_dim + j;
+                        dwq[p * kv_dim + col] += xn * dq[y_base + j];
+                        dwk[p * kv_dim + col] += xn * dk[y_base + j];
+                        dwv[p * kv_dim + col] += xn * dv[y_base + j];
+                    }
+                }
+
+                let mut dx_norm = vec![0.0f32; d_model];
+                for p in 0..d_model {
+                    let mut acc = 0.0f32;
+                    for j in 0..head_dim {
+                        let col = hi * head_dim + j;
+                        acc += dq[y_base + j] * wq[p * kv_dim + col].to_f32()
+                             + dk[y_base + j] * wk[p * kv_dim + col].to_f32()
+                             + dv[y_base + j] * wv[p * kv_dim + col].to_f32();
+                    }
+                    dx_norm[p] = acc;
+                }
+                let sdot: f32 = (0..d_model)
+                    .map(|p| dx_norm[p] * norm_weight[p].to_f32() * x_raw[x_base + p].to_f32())
+                    .sum();
+                for p in 0..d_model {
+                    let g = dx_norm[p] * norm_weight[p].to_f32();
+                    dx[x_base + p] =
+                        g / rms - x_raw[x_base + p].to_f32() * sdot / (d_model as f32 * rms * rms * rms);
+                }
+            }
+        }
+    }
+    (dwq, dwk, dwv, dx)
+}
+
+#[cfg(test)]
+mod proj_tests {
+    use super::cpu_naive_backward_proj;
+    use half::f16;
+
+    fn h(x: f32) -> f16 { f16::from_f32(x) }
+
+    #[test]
+    fn proj_dw_is_xnorm_t_times_dy_smoke() {
+        // heads=1, d_model=head_dim=2, seq=1 -> single row, kv_dim=2.
+        // x = [3,4] -> mean_sq = (9+16)/2 = 12.5; rms = sqrt(12.5+eps).
+        // x_norm = x/rms. dWq[p,j] = x_norm[0,p]*dq[0,j].
+        let d_model = 2usize;
+        let head_dim = 2usize;
+        let seq = 1usize;
+        let eps = 1e-5f32;
+        let x_raw = vec![h(3.0), h(4.0)];                 // [seq, d_model]
+        let dq = vec![1.0f32, 2.0];                        // [seq, head_dim]
+        let dk = vec![0.0f32, 0.0];
+        let dv = vec![0.0f32, 0.0];
+        let wq = vec![h(0.0); d_model * head_dim];
+        let wk = vec![h(0.0); d_model * head_dim];
+        let wv = vec![h(0.0); d_model * head_dim];
+        let norm_weight = vec![h(1.0), h(1.0)];
+
+        let (dwq, _dwk, _dwv, _dx) = cpu_naive_backward_proj(
+            &dq, &dk, &dv, &x_raw, &wq, &wk, &wv, &norm_weight,
+            eps, /*batch*/1, /*heads*/1, seq, head_dim, d_model,
+        );
+
+        let rms = ((9.0 + 16.0) / 2.0f32 + eps).sqrt();
+        let xn0 = 3.0 / rms;
+        let xn1 = 4.0 / rms;
+        assert!((dwq[0 * 2 + 0] - xn0 * 1.0).abs() < 1e-4, "dWq[0,0]");
+        assert!((dwq[0 * 2 + 1] - xn0 * 2.0).abs() < 1e-4, "dWq[0,1]");
+        assert!((dwq[1 * 2 + 0] - xn1 * 1.0).abs() < 1e-4, "dWq[1,0]");
+        assert!((dwq[1 * 2 + 1] - xn1 * 2.0).abs() < 1e-4, "dWq[1,1]");
+    }
+}
