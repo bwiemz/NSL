@@ -101,47 +101,23 @@ pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
         // RoPE branch here to prevent double-rotation.
         let csha_rope_active = config.csha.as_ref().is_some_and(|c| c.fused_projections);
 
-        // Optional RoPE cos/sin bases (position-indexed by q_row_global or effective_pos).
+        // Optional RoPE cos/sin bases (position-indexed by q_row_global).
         // Only needed when the non-CSHA inline path will fire.
+        // NOTE: per-document RoPE position reset on the FORWARD Q side
+        // (effective_pos = q_row_global - doc_starts[seg]) is NOT implemented
+        // here -- the prelude pre-declares the registers but the forward uses
+        // standard positions. Packed rope_q=true forward does not yet reset
+        // per-document (deferred; see project_pca_smem_mixed_layout_crash_disproven
+        // memory + the backward T9 reset which IS implemented). Tracked separately.
         if config.rope_q && !csha_rope_active {
             ptx.push_str("    // RoPE: cos/sin bases for q_row_global\n");
             ptx.push_str("    ld.param.u64 %rd25, [cos_ptr];\n");
             ptx.push_str("    ld.param.u64 %rd26, [sin_ptr];\n");
 
-            // PCA sec.4.3 site 1: when segment_masked && rope_q, route the
-            // cos/sin row through effective_pos = q_row_global - doc_starts[seg_ids[q_row_global]].
-            // This implements per-document RoPE position reset (Task 7 / spec §CFTP-4.3).
-            // Registers are pre-declared in the prelude under the same condition gate.
-            if config.segment_masked {
-                ptx.push_str("    // PCA sec.4.3 site 1: forward Q effective_pos\n");
-                // abs_pos = q_row_global (narrow from u64).
-                ptx.push_str("    cvt.u32.u64 %r_abs_pos, %rd21;\n");
-                // sid = seg_smem[abs_pos] — u16, byte offset abs_pos*2.
-                ptx.push_str("    mul.lo.u32 %r_doc_starts_byte_off, %r_abs_pos, 2;\n");
-                ptx.push_str("    cvt.u64.u32 %rd_doc_smem_addr, %r_doc_starts_byte_off;\n");
-                ptx.push_str("    add.u64 %rd_doc_smem_addr, %seg_base, %rd_doc_smem_addr;\n");
-                ptx.push_str("    ld.shared.u16 %rs_doc_seg, [%rd_doc_smem_addr];\n");
-                ptx.push_str("    cvt.u32.u16 %r_doc_starts_idx, %rs_doc_seg;\n");
-                // doc_start = smem_doc_starts[sid] — s32, byte offset sid*4.
-                ptx.push_str("    mul.lo.u32 %r_doc_starts_byte_off, %r_doc_starts_idx, 4;\n");
-                ptx.push_str("    cvta.shared.u64 %r_doc_smem_base, smem_doc_starts;\n");
-                ptx.push_str("    cvt.u64.u32 %rd_doc_smem_addr, %r_doc_starts_byte_off;\n");
-                ptx.push_str("    add.u64 %rd_doc_smem_addr, %r_doc_smem_base, %rd_doc_smem_addr;\n");
-                ptx.push_str("    ld.shared.s32 %r_doc_start, [%rd_doc_smem_addr];\n");
-                // effective_pos = abs_pos - doc_start (non-negative under packing invariants).
-                ptx.push_str("    sub.s32 %r_effective_pos_q, %r_abs_pos, %r_doc_start;\n");
-                // Use effective_pos for cos/sin row addressing (zero-extend s32→u64).
-                ptx.push_str("    cvt.u64.s32 %rd27, %r_effective_pos_q;\n");
-                ptx.push_str(&format!(
-                    "    mul.lo.u64 %rd27, %rd27, {};          // effective_pos * head_dim\n",
-                    head_dim
-                ));
-            } else {
-                ptx.push_str(&format!(
-                    "    mul.lo.u64 %rd27, %rd21, {};          // q_row_global * head_dim\n",
-                    head_dim
-                ));
-            }
+            ptx.push_str(&format!(
+                "    mul.lo.u64 %rd27, %rd21, {};          // q_row_global * head_dim\n",
+                head_dim
+            ));
             ptx.push_str("    shl.b64 %rd27, %rd27, 2;                  // * 4 bytes\n");
             ptx.push_str("    add.u64 %rd25, %rd25, %rd27;              // cos row base\n");
             ptx.push_str("    add.u64 %rd26, %rd26, %rd27;              // sin row base\n");
