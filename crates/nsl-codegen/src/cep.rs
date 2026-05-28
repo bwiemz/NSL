@@ -17,7 +17,7 @@ use serde::Serialize;
 
 use crate::cep_importance::{analyse_weight_map, ImportanceTable, RooflineSlackTable};
 use crate::cep_oracle::{evaluate, CompilationProfile, ModelSpec};
-use crate::cep_rewrite::SearchAxes;
+use crate::cep_rewrite::{LayerDelta, PruneDelta, SearchAxes};
 use crate::cep_search::{
     architecture_search, prune_greedy, Constraints, Granularity, NasObjective, SearchOutcome,
 };
@@ -376,38 +376,100 @@ struct PruneDeltaDoc {
     delta: PruneDeltaBody,
 }
 
+/// Build a GQA-group-aligned, importance-ranked PruneDelta from a prune plan.
+/// The shared source consumed by both `write_prune_delta` (JSON) and SP1's slicer.
+///
+/// Head pruning: `apply_delta` snaps `n_heads` to a group multiple by COUNT, so the
+/// chosen spec gives survivor counts but not identities. We pick which groups to drop
+/// by lowest summed head-importance (authoritative — `plan.importance.heads` is always
+/// populated in prune mode), keeping `pruned_heads` group-aligned and exactly consistent
+/// with `chosen.n_heads`.
+pub fn plan_to_prune_delta(plan: &CepPlan, baseline: &ModelSpec) -> PruneDelta {
+    let chosen = plan.outcome.chosen.as_ref().map(|c| &c.spec);
+
+    // Pre-index head importances by layer so per-group scoring is a small local scan
+    // rather than re-walking the full `plan.importance.heads` slice for every group.
+    let mut head_scores_by_layer: Vec<Vec<(u32, f64)>> =
+        vec![Vec::new(); baseline.n_layers as usize];
+    for h in &plan.importance.heads {
+        if (h.layer as usize) < head_scores_by_layer.len() {
+            head_scores_by_layer[h.layer as usize].push((h.head, h.score));
+        }
+    }
+
+    let mut per_layer = Vec::with_capacity(baseline.n_layers as usize);
+    for l in 0..baseline.n_layers as usize {
+        let base_heads = baseline.n_heads[l];
+        let base_kv = baseline.n_kv_heads[l].max(1);
+        let group = (base_heads / base_kv).max(1);
+
+        let chosen_heads = chosen
+            .map(|c| c.n_heads.get(l).copied().unwrap_or(base_heads))
+            .unwrap_or(base_heads);
+        let n_drop_heads = base_heads.saturating_sub(chosen_heads);
+        // The planner snaps n_heads to a group multiple, so the drop count is always a
+        // whole number of groups. Assert it so a future caller or planner change that
+        // breaks the invariant is caught in debug builds rather than silently truncating.
+        debug_assert_eq!(
+            n_drop_heads % group,
+            0,
+            "layer {l}: chosen_heads={chosen_heads} not a multiple of group={group}"
+        );
+        let n_drop_groups = (n_drop_heads / group) as usize;
+
+        let mut pruned_heads = Vec::new();
+        if n_drop_groups > 0 {
+            let layer_scores = &head_scores_by_layer[l];
+            // Score each of the `base_kv` groups by summed head importance for this layer.
+            let mut group_scores: Vec<(u32, f64)> = (0..base_kv)
+                .map(|g| {
+                    let lo = g * group;
+                    let hi = lo + group;
+                    let s: f64 = layer_scores
+                        .iter()
+                        .filter(|(head, _)| *head >= lo && *head < hi)
+                        .map(|(_, score)| *score)
+                        .sum();
+                    (g, s)
+                })
+                .collect();
+            // Lowest-score groups first; tie-break by lower group index for determinism.
+            group_scores.sort_by(|a, b| {
+                a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal).then(a.0.cmp(&b.0))
+            });
+            for &(g, _) in group_scores.iter().take(n_drop_groups) {
+                for h in (g * group)..((g + 1) * group) {
+                    pruned_heads.push(h);
+                }
+            }
+            pruned_heads.sort_unstable();
+        }
+
+        let new_d_ff = chosen
+            .and_then(|c| c.d_ff.get(l).copied())
+            .filter(|&w| w < baseline.d_ff[l]);
+
+        per_layer.push(LayerDelta { layer: l as u32, pruned_heads, new_d_ff, drop_layer: false });
+    }
+    PruneDelta { per_layer }
+}
+
 /// Serialize the prune delta — the Option-2 input contract.
 pub fn write_prune_delta(plan: &CepPlan, baseline: &ModelSpec, path: &Path) -> std::io::Result<()> {
     let chosen = plan.outcome.chosen.as_ref();
     let chosen_spec = chosen.map(|c| &c.spec);
 
-    let mut per_layer: Vec<LayerDeltaDto> = (0..baseline.n_layers)
-        .map(|l| LayerDeltaDto {
-            layer: l,
-            pruned_heads: Vec::new(),
-            new_d_ff: None,
-            // Always false in v1: the greedy prune driver removes heads + FFN
-            // width but never whole layers. Reserved for a future layer-drop
-            // (Option 2) path; cep_rewrite::LayerDelta already supports it.
-            drop_layer: false,
+    let prune_delta = plan_to_prune_delta(plan, baseline);
+    let per_layer: Vec<LayerDeltaDto> = prune_delta
+        .per_layer
+        .iter()
+        .map(|ld| LayerDeltaDto {
+            layer: ld.layer,
+            pruned_heads: ld.pruned_heads.clone(),
+            new_d_ff: ld.new_d_ff,
+            drop_layer: ld.drop_layer,
         })
         .collect();
-    for step in &plan.outcome.prune_log {
-        if step.accepted && step.kind == "head" {
-            if let (Some(h), Some(slot)) = (step.head, per_layer.get_mut(step.layer as usize)) {
-                slot.pruned_heads.push(h);
-            }
-        }
-    }
-    if let Some(cs) = chosen_spec {
-        for l in 0..baseline.n_layers as usize {
-            if let Some(&w) = cs.d_ff.get(l) {
-                if w < baseline.d_ff[l] {
-                    per_layer[l].new_d_ff = Some(w);
-                }
-            }
-        }
-    }
 
     let bp = plan.outcome.baseline.as_ref();
     let doc = PruneDeltaDoc {
@@ -497,6 +559,8 @@ pub struct CliOverrides {
     pub target: Option<String>,
     pub sparsity: Option<f64>,
     pub cep_out: Option<std::path::PathBuf>,
+    /// CEP SP1: also emit the pruned weights to this .safetensors path.
+    pub cep_emit_weights: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug)]
@@ -816,6 +880,47 @@ mod bridge_tests {
         assert!(v["chosen"]["spec"]["activation"].is_string());
         assert!(v["delta"]["per_layer"].is_array());
         assert_eq!(v["delta"]["per_layer"].as_array().unwrap().len(), baseline.n_layers as usize);
+    }
+
+    #[test]
+    fn plan_to_prune_delta_is_group_aligned_and_consistent() {
+        // baseline: 6 heads, 3 kv -> group size 2. Prune to 4 heads / 2 kv (drop 1 group).
+        let baseline = spec(); // d_model=384, n_layers=6, n_heads=[6;6], n_kv_heads=[3;6], head_dim=[64;6], d_ff=[1024;6]
+        let cfg = prune_cfg();
+        let input = build_prune_input(&cfg, baseline.clone(), None, "H100-SXM", Some(0.2)).expect("input");
+        let plan = run_prune(input);
+        let delta = plan_to_prune_delta(&plan, &baseline);
+
+        // Non-vacuous: the chosen plan must actually prune at least one layer, or the
+        // group-alignment/contiguity assertions below would pass trivially on empty deltas.
+        assert!(
+            delta.per_layer.iter().any(|ld| !ld.pruned_heads.is_empty()),
+            "expected at least one pruned layer"
+        );
+
+        let chosen = plan.outcome.chosen.as_ref().expect("chosen");
+        for ld in &delta.per_layer {
+            let l = ld.layer as usize;
+            let group = baseline.n_heads[l] / baseline.n_kv_heads[l]; // 2
+            // pruned_heads must be a whole number of groups
+            assert_eq!(ld.pruned_heads.len() % group as usize, 0, "layer {l}: not group-aligned");
+            // survivor count must equal the chosen spec exactly
+            assert_eq!(
+                baseline.n_heads[l] - ld.pruned_heads.len() as u32,
+                chosen.spec.n_heads[l],
+                "layer {l}: survivor count != chosen.n_heads"
+            );
+            // each pruned group is contiguous head indices [g*group, (g+1)*group)
+            let mut sorted = ld.pruned_heads.clone();
+            sorted.sort_unstable();
+            for chunk in sorted.chunks(group as usize) {
+                let g0 = chunk[0];
+                assert_eq!(g0 % group, 0, "layer {l}: group start not aligned");
+                for (i, &h) in chunk.iter().enumerate() {
+                    assert_eq!(h, g0 + i as u32, "layer {l}: group not contiguous");
+                }
+            }
+        }
     }
 
     #[test]

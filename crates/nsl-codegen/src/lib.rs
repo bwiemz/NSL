@@ -56,6 +56,7 @@ pub mod cep_importance;
 pub mod cep_oracle;
 pub mod cep_rewrite;
 pub mod cep_search;
+pub mod cep_slice;
 pub mod cfie;
 pub mod cfie_fused_sample;
 pub mod cfie_grammar;
