@@ -56,12 +56,22 @@ fn backward_needs_dynamic_smem(config: &FlashAttentionConfig) -> bool {
     // form.  Budget sourced from pca_segment::DEFAULT_SMEM_SEGMENT_BUDGET
     // so the FA emitter's allocation tracks the planner's residency
     // ceiling.
+    //
+    // PCA §4.3: when segment_masked && rope_q the prelude also emits
+    // `smem_doc_starts[1028]` as a SEPARATE `.shared` array outside
+    // shmem[].  Its 1028-byte footprint must be counted here so the
+    // static-vs-dynamic routing decision is not off by 1028 bytes.
     let seg_overhead = if config.segment_masked {
         DEFAULT_SMEM_SEGMENT_BUDGET as u32
     } else {
         0
     };
-    backward_total_bytes(config) + seg_overhead > SMEM_BUDGET_BYTES
+    let rope_overhead = if config.segment_masked && config.rope_q {
+        (crate::pca_rope::MAX_NUM_DOCS + 1) * 4
+    } else {
+        0
+    };
+    backward_total_bytes(config) + seg_overhead + rope_overhead > SMEM_BUDGET_BYTES
 }
 
 /// Emit the backward prelude: header, entry, SMEM, registers, indices.
@@ -566,5 +576,53 @@ mod tests {
             "backward SMEM ({bwd}) must exceed forward ({fwd}) by P+dQ+dK+dV"
         );
         assert_eq!(bwd - fwd, backward_extra_bytes(&cfg));
+    }
+
+    /// `backward_needs_dynamic_smem` must include the 1028-byte `smem_doc_starts`
+    /// overhead when `segment_masked && rope_q` (PCA §4.3).  For the fixture
+    /// config the total bwd+seg+rope overhead exceeds the 48 KB static cap,
+    /// so the backward prelude must emit `.extern .shared` and the caller
+    /// must request dynamic SMEM at launch.
+    #[test]
+    fn bwd_smem_budget_counts_rope_doc_starts_overhead() {
+        use crate::flash_attention::{CshaExtras, RopeStyle};
+        use crate::flash_attention_v2::smem_layout::SMEM_BUDGET_BYTES;
+        use crate::pca_segment::DEFAULT_SMEM_SEGMENT_BUDGET;
+        use crate::pca_rope::MAX_NUM_DOCS;
+
+        let cfg = FlashAttentionConfig {
+            block_q: 32, block_kv: 32, head_dim: 32,
+            causal: true, paged: false,
+            rope_q: true,
+            rope_style: RopeStyle::Adjacent,
+            gqa_group_size: 1, tree_mask: false, gpu_sm: 75,
+            segment_masked: true,
+            csha: Some(CshaExtras {
+                fused_projections: true,
+                save_activations_for_backward: true,
+                d_model: 32,
+                ..CshaExtras::default()
+            }),
+        };
+
+        let bwd = backward_total_bytes(&cfg);
+        let seg = DEFAULT_SMEM_SEGMENT_BUDGET as u32;
+        let rope = (MAX_NUM_DOCS + 1) * 4;
+
+        assert_eq!(rope, 1028, "smem_doc_starts must be (MAX_NUM_DOCS+1)*4 = 1028 bytes");
+
+        assert!(
+            bwd + seg + rope > SMEM_BUDGET_BYTES,
+            "backward ({bwd}) + seg ({seg}) + rope ({rope}) must exceed {SMEM_BUDGET_BYTES}; \
+             backward_needs_dynamic_smem must return true"
+        );
+
+        // Validate via PTX emission: dynamic SMEM uses `.extern .shared`.
+        let ptx = crate::flash_attention_v2::synthesize_backward(&cfg)
+            .expect("backward synthesis must succeed");
+        assert!(
+            ptx.contains(".extern .shared .align 16 .b8 shmem[]"),
+            "segment_masked+rope_q backward kernel must use extern .shared (dynamic SMEM)"
+        );
     }
 }

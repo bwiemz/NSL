@@ -70,29 +70,14 @@ jobs:
         continue-on-error: true
         run: cargo test -p nsl-cli --test e2e -- --test-threads=1
 
-  # WGGO Phase 2 merge-gate preview — runs the `#[ignore]`'d
-  # end_to_end_backward_subprocess_matches_analytical_reference test with
-  # --include-ignored on every push to a PR. Failure does NOT block merge
-  # (continue-on-error: true). The output is posted as a PR comment so the
-  # reviewer can evaluate before approving the second commit (the
-  # `#[ignore]` flip). See spec §7.4 of the merge-gate completion design.
-  #
-  # This job exists only during PR 3's review window. The second commit
-  # of PR 3 replaces it with a required `merge-gate` job that runs
-  # without `--include-ignored` (the test will be live by then) and is
-  # gated by a path filter on nsl-codegen / nsl-runtime / nsl-semantic.
-  merge-gate-preview:
-    name: WGGO Phase 2 merge-gate preview (continue-on-error)
+  # WGGO Phase 2 merge-gate — required check that gates merging any change to
+  # nsl-codegen, nsl-runtime, or nsl-semantic.  Graduated from the preview job
+  # in PR #217 (commit 2): the test is now live (no #[ignore]) so
+  # --include-ignored is no longer needed.  Spec §7.4.
+  wggo-merge-gate:
+    name: WGGO Phase 2 merge-gate
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
-    continue-on-error: true
-    # The post-output step uses actions/github-script to POST a PR comment.
-    # The default GITHUB_TOKEN lacks issues:write / pull-requests:write —
-    # those must be granted at the job level for the comment-post to succeed.
-    permissions:
-      contents: read
-      issues: write
-      pull-requests: write
     steps:
       - uses: actions/checkout@v4
 
@@ -111,35 +96,11 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Run merge-gate test (ignored)
-        id: merge_gate_run
-        continue-on-error: true
+      - name: Run WGGO merge-gate test
         run: |
-          cargo test -p nsl-codegen --test wggo_backward_pipeline -- \
-            --include-ignored \
+          cargo test -p nsl-codegen --test wggo_backward_pipeline \
             end_to_end_backward_subprocess_matches_analytical_reference \
-            --nocapture 2>&1 | tee preview-output.txt
-
-      - name: Post output to PR
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const fs = require('fs');
-            let output = '';
-            try {
-              output = fs.readFileSync('preview-output.txt', 'utf8');
-            } catch (_) {
-              output = '(no output captured — the test step did not run or failed before redirecting)';
-            }
-            const truncated = output.length > 60000
-              ? output.slice(-60000) + '\n...[truncated head]'
-              : output;
-            await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-              body: '## merge-gate-preview output\n\n```\n' + truncated + '\n```\n\n_Reviewer: evaluate this output before approving the `#[ignore]` flip in commit 2. Failure does not block merge of commit 1._',
-            });
+            -- --nocapture
 
   # M62b Spec C — ONNX Runtime custom op integration tests.
   # Always runs on PRs and pushes to main. The job is cheap (~5 min) and
