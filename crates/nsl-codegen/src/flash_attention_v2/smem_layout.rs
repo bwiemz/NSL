@@ -218,20 +218,22 @@ pub fn validate_scalar_v2_config(
         Direction::Forward => 0,
         Direction::Backward => backward_extra_bytes(config),
     };
-    // PCA Tier A: when `segment_masked`, the FA prelude reserves an
-    // additional `DEFAULT_SMEM_SEGMENT_BUDGET`-byte `seg_smem` region —
-    // separately-declared static SMEM on the forward side, and embedded
-    // at the tail of the extern shmem allocation on the backward side
-    // (see `phases/{forward,backward}/prelude.rs`). Either way the device
-    // sees `total + seg_overhead` bytes per CTA, so the validator must
-    // account for it or `segment_masked = true` configs that fit the
-    // 99 KB cap on paper will fail at launch with insufficient SMEM.
+    // PCA Tier A: when `segment_masked`, the FA prelude reserves a
+    // `DEFAULT_SMEM_SEGMENT_BUDGET`-byte `seg_smem` region (+ a 1028-byte
+    // `smem_doc_starts` region when `rope_q`) — separately-declared static SMEM
+    // on the forward side, `seg_smem` embedded in the extern shmem tail on the
+    // backward side (see `phases/{forward,backward}/prelude.rs`). Route the total
+    // through the single-source `pca_smem_layout` so this validator agrees with
+    // `fwd_needs_dynamic_smem` / `backward_needs_dynamic_smem` on what a PCA
+    // kernel needs (else a `segment_masked` config that fits the 99 KB cap on
+    // paper fails at launch with insufficient SMEM). `seg_overhead` is kept for
+    // the diagnostic message below.
     let seg_overhead = if config.segment_masked {
         crate::pca_segment::DEFAULT_SMEM_SEGMENT_BUDGET as u32
     } else {
         0
     };
-    let total = fwd_total + extra + seg_overhead;
+    let total = pca_smem_layout(fwd_total + extra, config.segment_masked, config.rope_q).total;
     let q_region  = kv_start;              // Q region: [0, kv_start)
     let kv_region = sp_start - kv_start;   // KV region: [kv_start, sp_start)
     let sp_region = fwd_total - sp_start;  // SP + weight + save region: [sp_start, fwd_total)
@@ -345,22 +347,34 @@ fn align_up_u32(x: u32, align: u32) -> u32 {
     (x + align - 1) & !(align - 1)
 }
 
-/// SMEM layout for a PCA-augmented kernel. The `seg_smem` (32 KB) and — when
-/// `rope_q` — `smem_doc_starts` (1028 B) regions live in the `shmem[]` tail,
-/// after `base_total`, addressed as `%shmem_base + offset`. There is no
-/// separate static `.shared` region, so the static-`.shared`-alongside-
-/// `extern .shared shmem[]` mixed layout (which crashes on sm_120) cannot occur.
+/// Single source of truth for PCA static-SMEM **sizing**. `base_total` is the
+/// core kernel SMEM (`total_bytes` forward / `backward_total_bytes` backward);
+/// `.total` adds the `seg_smem` (32 KB) region and — when `rope_q` — the
+/// `smem_doc_starts` (1028 B) region, 16-aligned. The dynamic-SMEM budget
+/// checks (`fwd_needs_dynamic_smem` / `backward_needs_dynamic_smem`) and the
+/// config validator all derive their total from this one function, so they
+/// cannot diverge on how much SMEM a PCA kernel needs.
 ///
-/// Single source of truth: the dynamic-SMEM budget check, the launcher byte
-/// count, and the prelude base offsets all derive from this one function, so
-/// they cannot diverge.
+/// NOTE — what is actually emitted today: the PCA regions are SEPARATE static
+/// `.shared` declarations, NOT embedded in `shmem[]` (forward: `seg_smem` +
+/// `smem_doc_starts` both separate static; backward: `seg_smem` embedded in the
+/// `shmem[]` tail, `smem_doc_starts` separate static). The `seg_off` / `doc_off`
+/// fields are therefore **dormant** — only `.total` is consumed. They are a
+/// ready primitive for embedding all regions in the `shmem[]` tail IF a future
+/// driver ever reproduces the Blackwell static+extern mixed-layout crash, which
+/// the 2026-05-12 SMEM probe + a 2026-05-27 reproduce found does NOT occur on
+/// CUDA 13.2 / driver 591.86 / RTX 5070 Ti (so the embed was intentionally not
+/// built). See `project_pca_smem_mixed_layout_crash_disproven` (memory).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PcaSmemLayout {
-    /// Total `shmem[]` bytes (base + embedded PCA regions), 16-aligned.
+    /// Total SMEM bytes a PCA kernel needs (base + seg [+ doc when rope_q]), 16-aligned.
+    /// This is the consumed field.
     pub total: u32,
-    /// Byte offset of `seg_smem` within `shmem[]` (meaningful only when `segment_masked`).
+    /// DORMANT (not consumed today): byte offset `seg_smem` WOULD have in a
+    /// shmem[]-tail embed. Valid only when `segment_masked`.
     pub seg_off: u32,
-    /// Byte offset of `smem_doc_starts` within `shmem[]` (`Some` only when `segment_masked && rope_q`).
+    /// DORMANT (not consumed today): byte offset `smem_doc_starts` WOULD have in
+    /// a shmem[]-tail embed. `Some` only when `segment_masked && rope_q`.
     pub doc_off: Option<u32>,
 }
 

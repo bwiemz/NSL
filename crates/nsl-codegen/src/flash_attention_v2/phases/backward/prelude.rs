@@ -163,7 +163,11 @@ pub fn emit(
         use crate::kernel_skeleton::smem::emit_static_smem_decl;
         // PCA Tier A: when segment_masked, reserve DEFAULT_SMEM_SEGMENT_BUDGET
         // bytes at the tail of shmem for the embedded seg_smem (see
-        // register-decl comment).
+        // register-decl comment). NOTE: smem_doc_starts (1028 B, emitted by
+        // emit_doc_starts_smem_load when rope_q) is a SEPARATE static `.shared`
+        // decl — NOT part of this shmem[] size (ptxas allocates it independently;
+        // the device reserves the sum). The static-vs-extern decision counts it
+        // via pca_smem_layout; this decl covers only the core + embedded-seg.
         let seg_overhead: u32 = if config.segment_masked {
             DEFAULT_SMEM_SEGMENT_BUDGET as u32
         } else {

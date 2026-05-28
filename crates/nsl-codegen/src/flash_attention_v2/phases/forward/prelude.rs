@@ -177,6 +177,11 @@ pub fn emit_with_smem_override(
     // before the .visible .entry).  Static configs declare the array here.
     // For Tier B.1, `smem_bytes` is the caller-supplied Tier-B.1 total (q +
     // 4×KV slabs + p_scratch + chunk_staging) rather than the Tier-A baseline.
+    // NOTE: on the forward side `seg_smem` (32 KB, when segment_masked) and
+    // `smem_doc_starts` (1028 B, when rope_q) are SEPARATE static `.shared`
+    // decls — NOT part of `smem_bytes`. ptxas allocates them independently; the
+    // device reserves the sum. The static-vs-extern decision counts them via
+    // pca_smem_layout (fwd_needs_dynamic_smem); this decl is the core region.
     if !fwd_needs_dynamic_smem(config) {
         use crate::kernel_skeleton::smem::emit_static_smem_decl;
         emit_static_smem_decl(ptx, smem_bytes as usize);
