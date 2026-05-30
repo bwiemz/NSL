@@ -71,6 +71,20 @@ pub fn slice_blocks(
         });
     }
     let block = block_width as usize;
+    // n_units * block_width must not exceed the axis dimension. A survivor unit u that
+    // satisfies u < n_units but where n_units*block > dim would pass the per-unit check
+    // below yet index-panic inside the byte-copy loop. Catch it here with a proper error.
+    let axis_dim = if axis == 0 { rows } else { cols };
+    let units_span = (n_units as usize).checked_mul(block).unwrap_or(usize::MAX);
+    if units_span > axis_dim {
+        return Err(CepSliceError::ShapeMismatch {
+            tensor: entry.name.clone(),
+            expected: format!(
+                "n_units({n_units})*block_width({block_width}) <= axis-{axis} dim ({axis_dim})"
+            ),
+            found: format!("{units_span}"),
+        });
+    }
     for &u in survivor_units {
         if u >= n_units {
             return Err(CepSliceError::UnitOutOfRange { tensor: entry.name.clone(), unit: u, n_units });
@@ -538,6 +552,26 @@ mod tests {
         // shape claims 2x4 (32 bytes) but only 6 floats (24 bytes) of data.
         let e = f32_entry("t", vec![2, 4], &[0., 1., 2., 3., 4., 5.]);
         assert!(slice_blocks(&e, 1, 4, 1, &[0, 1]).is_err());
+    }
+
+    #[test]
+    fn slice_blocks_rejects_n_units_span_exceeds_dim() {
+        // 2x4 tensor: cols=4. n_units=3, block_width=2 -> span=6 > 4. Must error.
+        let e = f32_entry("t", vec![2, 4], &[0.; 8]);
+        let err = slice_blocks(&e, 1, 3, 2, &[0, 1]).unwrap_err();
+        match err {
+            CepSliceError::ShapeMismatch { expected, .. } => {
+                assert!(expected.contains("n_units(3)*block_width(2)"), "unexpected: {expected}");
+            }
+            other => panic!("expected ShapeMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn slice_blocks_rejects_axis0_n_units_span_exceeds_rows() {
+        // 4x2 tensor: rows=4. n_units=3, block_width=2 -> span=6 > 4. Must error.
+        let e = f32_entry("t", vec![4, 2], &[0.; 8]);
+        assert!(slice_blocks(&e, 0, 3, 2, &[0]).is_err());
     }
 
     #[test]
