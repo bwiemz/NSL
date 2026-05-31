@@ -71,6 +71,22 @@ pub fn slice_blocks(
         });
     }
     let block = block_width as usize;
+    // Invariant: n_units * block_width must exactly equal the tensor dimension on the sliced
+    // axis. Without this, the final unit's byte-range access can silently exceed the row/col
+    // boundary and panic. The per-unit `u < n_units` check below is a necessary but not
+    // sufficient condition — it only rules out index overflow, not shape/spec mismatch.
+    let axis_dim = if axis == 0 { rows } else { cols };
+    let declared_dim = (n_units as usize).saturating_mul(block);
+    if declared_dim != axis_dim {
+        return Err(CepSliceError::ShapeMismatch {
+            tensor: entry.name.clone(),
+            expected: format!(
+                "n_units ({n_units}) * block_width ({block_width}) = {declared_dim} \
+                 to equal axis-{axis} dimension {axis_dim}"
+            ),
+            found: format!("{axis_dim}"),
+        });
+    }
     for &u in survivor_units {
         if u >= n_units {
             return Err(CepSliceError::UnitOutOfRange { tensor: entry.name.clone(), unit: u, n_units });
@@ -563,5 +579,42 @@ mod tests {
     fn ffn_survivors_full_width_is_identity() {
         let w_gate = f32_entry("ffn.w_gate", vec![2, 3], &[1., 2., 3., 4., 5., 6.]);
         assert_eq!(ffn_survivors_by_magnitude(&w_gate, 3, 3).unwrap(), vec![0, 1, 2]);
+    }
+
+    // Regression: slice_blocks must return ShapeMismatch (not panic) when
+    // n_units * block_width != tensor dimension on the sliced axis.
+    // Before the fix this would panic with an index-out-of-bounds when the
+    // last unit's byte range exceeded the row boundary.
+    #[test]
+    fn slice_blocks_rejects_inconsistent_n_units_axis1() {
+        // 2×10 tensor; caller claims n_units=3, block_width=4 → 3*4=12 ≠ 10.
+        let e = f32_entry("t", vec![2, 10], &[0.0f32; 20]);
+        let err = slice_blocks(&e, 1, 3, 4, &[0, 1]);
+        assert!(
+            matches!(err, Err(CepSliceError::ShapeMismatch { .. })),
+            "expected ShapeMismatch for n_units*block_width != cols; got {:?}", err
+        );
+    }
+
+    #[test]
+    fn slice_blocks_rejects_inconsistent_n_units_axis0() {
+        // 10×2 tensor; caller claims n_units=3, block_width=4 → 3*4=12 ≠ 10.
+        let e = f32_entry("t", vec![10, 2], &[0.0f32; 20]);
+        let err = slice_blocks(&e, 0, 3, 4, &[0, 1]);
+        assert!(
+            matches!(err, Err(CepSliceError::ShapeMismatch { .. })),
+            "expected ShapeMismatch for n_units*block_width != rows; got {:?}", err
+        );
+    }
+
+    #[test]
+    fn slice_blocks_accepts_exact_n_units_axis1() {
+        // 2×8 tensor, n_units=4, block_width=2 → 4*2=8=cols. Keeps units {1,3}.
+        let e = f32_entry("t", vec![2, 8], &[0., 1., 2., 3., 4., 5., 6., 7.,
+                                             10., 11., 12., 13., 14., 15., 16., 17.]);
+        let out = slice_blocks(&e, 1, 4, 2, &[1, 3]).unwrap();
+        assert_eq!(out.shape, vec![2, 4]);
+        // row 0: unit 1 → cols 2,3 → [2,3]; unit 3 → cols 6,7 → [6,7]
+        assert_eq!(read_f32(&out), vec![2., 3., 6., 7., 12., 13., 16., 17.]);
     }
 }
