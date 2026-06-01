@@ -247,6 +247,12 @@ pub fn apply_prune_delta_to_weights(
     for ld in &delta.per_layer {
         if let Some(new_ff) = ld.new_d_ff {
             let l = ld.layer;
+            // Guard mirrors the main loop (line ~267): skip out-of-range layers rather
+            // than panicking on spec.d_ff[l as usize] when a hand-edited or future-
+            // planner delta carries a layer index beyond spec.n_layers.
+            if (l as usize) >= spec.d_ff.len() {
+                continue;
+            }
             let gate_name = format!("blocks.{l}.ffn.w_gate");
             let gate = wm
                 .get(&gate_name)
@@ -563,5 +569,50 @@ mod tests {
     fn ffn_survivors_full_width_is_identity() {
         let w_gate = f32_entry("ffn.w_gate", vec![2, 3], &[1., 2., 3., 4., 5., 6.]);
         assert_eq!(ffn_survivors_by_magnitude(&w_gate, 3, 3).unwrap(), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn out_of_range_layer_in_delta_is_skipped_not_panicked() {
+        // A PruneDelta whose layer index exceeds spec.n_layers must not panic,
+        // even when the WeightMap contains a tensor for that layer (superset model).
+        // Regression for the unguarded spec.d_ff[l as usize] in the FFN precompute.
+        let spec = small_spec(); // n_layers=2, d_ff=[6,6]
+
+        // Build a WeightMap that includes a spurious out-of-range tensor so the gate
+        // lookup succeeds and the formerly-unguarded spec.d_ff[99] access is reached.
+        let mut raw: std::collections::HashMap<String, WeightEntry> = std::collections::HashMap::new();
+        let dm = spec.d_model as usize;
+        for l in 0..spec.n_layers as usize {
+            let nh = spec.n_heads[l] as usize;
+            let nkv = spec.n_kv_heads[l] as usize;
+            let hd = spec.head_dim[l] as usize;
+            let dff = spec.d_ff[l] as usize;
+            raw.insert(format!("blocks.{l}.attn.wq"),  f32_entry(&format!("blocks.{l}.attn.wq"),  vec![dm, nh * hd],  &vec![0.0f32; dm * nh * hd]));
+            raw.insert(format!("blocks.{l}.attn.wk"),  f32_entry(&format!("blocks.{l}.attn.wk"),  vec![dm, nkv * hd], &vec![0.0f32; dm * nkv * hd]));
+            raw.insert(format!("blocks.{l}.attn.wv"),  f32_entry(&format!("blocks.{l}.attn.wv"),  vec![dm, nkv * hd], &vec![0.0f32; dm * nkv * hd]));
+            raw.insert(format!("blocks.{l}.attn.wo"),  f32_entry(&format!("blocks.{l}.attn.wo"),  vec![nh * hd, dm],  &vec![0.0f32; nh * hd * dm]));
+            raw.insert(format!("blocks.{l}.ffn.w_gate"), f32_entry(&format!("blocks.{l}.ffn.w_gate"), vec![dm, dff], &vec![1.0f32; dm * dff]));
+            raw.insert(format!("blocks.{l}.ffn.w_up"),   f32_entry(&format!("blocks.{l}.ffn.w_up"),   vec![dm, dff], &vec![1.0f32; dm * dff]));
+            raw.insert(format!("blocks.{l}.ffn.w_down"), f32_entry(&format!("blocks.{l}.ffn.w_down"), vec![dff, dm], &vec![1.0f32; dff * dm]));
+        }
+        // Spurious out-of-range tensor: layer 99 gate (same d_ff as spec's layers).
+        raw.insert("blocks.99.ffn.w_gate".to_string(),
+            f32_entry("blocks.99.ffn.w_gate", vec![dm, 6], &vec![1.0f32; dm * 6]));
+        let wm = WeightMap::from_entries(raw);
+
+        let delta = PruneDelta {
+            per_layer: vec![
+                LayerDelta { layer: 0, pruned_heads: vec![], new_d_ff: None, drop_layer: false },
+                // layer=99 is beyond spec.n_layers=2; must be silently skipped.
+                LayerDelta { layer: 99, pruned_heads: vec![], new_d_ff: Some(4), drop_layer: false },
+            ],
+        };
+        let out = apply_prune_delta_to_weights(&wm, &spec, &delta).unwrap();
+        // in-range layers pass through unmodified
+        assert_eq!(out["blocks.0.attn.wq"].shape, vec![8, 8]);
+        assert_eq!(out["blocks.1.attn.wq"].shape, vec![8, 8]);
+        // the out-of-range layer's tensor is omitted (parse_layer_tensor returns None
+        // for layer indices beyond the spec; it simply does not appear in output).
+        assert!(!out.contains_key("blocks.99.ffn.w_gate"));
     }
 }
