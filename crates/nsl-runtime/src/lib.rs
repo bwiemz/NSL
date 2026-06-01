@@ -38,9 +38,9 @@
 //!
 //! Modules are declared at the crate root (keeping `nsl_runtime::foo` paths
 //! stable) and are also grouped under subsystem facade namespaces — see the
-//! [`core`], [`autodiff`], [`quantization`], [`attention`], [`data`],
-//! [`serving`], [`distributed`], [`peft`], [`observability`], [`ffi`], and
-//! [`experimental`] modules at the end of this file, plus the feature-gated
+//! [`builtins`], [`training`], [`quantization`], [`attention`], [`dataio`],
+//! [`inference`], [`distributed`], [`finetune`], [`observability`], [`ffi`],
+//! and [`experimental`] modules at the end of this file, plus the feature-gated
 //! [`interop`] facade. See `ARCHITECTURE.md` for details.
 
 // Clippy lints we accept as-is at the crate level:
