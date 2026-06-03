@@ -178,6 +178,7 @@ def test_session_load_and_run_calls_nsl_add():
         model = helper.make_model(
             graph,
             opset_imports=[helper.make_opsetid("com.nsl", 1)],
+            ir_version=8,  # pin to IR 8; ORT 1.22.0 supports up to IR 10
         )
 
         sess = ort.InferenceSession(model.SerializeToString(), sess_opts)
