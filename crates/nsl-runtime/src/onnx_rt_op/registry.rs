@@ -46,6 +46,11 @@ struct PerExportVtable {
     vtable: OrtCustomOp,
     /// Backing storage for `vtable.GetName`'s returned pointer.
     name_cstr: CString,
+    /// Pre-resolved `{name}__nsl_dispatch` function pointer. Resolved eagerly
+    /// in `make_custom_op_for_export` (called from `RegisterCustomOps`, which
+    /// runs inside the .so's own execution context) to avoid RTLD_LOCAL
+    /// visibility issues at `vtable_create_kernel` call time.
+    fn_ptr: Option<ExportFnPtr>,
 }
 
 // SAFETY: `PerExportVtable` contains only read-only function pointers and a
@@ -74,6 +79,27 @@ pub fn make_custom_op_for_export(idx: i64, name: *const c_char) -> *const OrtCus
     // codegen-emitted storage living forever (in case future codegen
     // changes that contract).
     let name_cstr = unsafe { CStr::from_ptr(name) }.to_owned();
+
+    // Eagerly resolve the dispatch symbol here, while we're executing
+    // inside `RegisterCustomOps` (called directly from scale2.so's export).
+    // This is the right moment because `resolve_self_symbol`'s dladdr
+    // anchor points at code in scale2.so, ensuring RTLD_NOLOAD opens the
+    // correct library handle. Deferring to vtable_create_kernel would still
+    // be inside scale2.so (ORT calls the vtable fn-ptr from our .so), but
+    // resolving eagerly is simpler and more robust.
+    let fn_ptr: Option<ExportFnPtr> = {
+        let dispatch_sym = format!("{}__nsl_dispatch", name_cstr.to_string_lossy());
+        CString::new(dispatch_sym)
+            .ok()
+            .and_then(|cname| {
+                let raw = unsafe { resolve_self_symbol(cname.as_ptr()) };
+                if raw == 0 {
+                    None
+                } else {
+                    Some(unsafe { std::mem::transmute::<usize, ExportFnPtr>(raw) })
+                }
+            })
+    };
 
     let entry = Box::new(PerExportVtable {
         vtable: OrtCustomOp {
@@ -111,6 +137,7 @@ pub fn make_custom_op_for_export(idx: i64, name: *const c_char) -> *const OrtCus
             ReleaseAliasMap: vtable_release_alias_map,
         },
         name_cstr,
+        fn_ptr,
     });
 
     // The Box's heap allocation address is what we return; pushing the Box
@@ -146,26 +173,17 @@ unsafe extern "C" fn vtable_create_kernel(
     _info: *const OrtKernelInfo,
 ) -> *mut c_void {
     let entry = op as *const PerExportVtable;
-    let name_ptr = (*entry).name_cstr.as_ptr();
-    // The callable symbol uses the __nsl_dispatch suffix (ExportFnPtr ABI);
-    // the bare export name exists for typed ctypes callers but has a
-    // different signature and cannot be used here.
-    let name_str = CStr::from_ptr(name_ptr).to_string_lossy();
-    let dispatch_sym = format!("{}__nsl_dispatch", name_str);
-    let dispatch_cname = match CString::new(dispatch_sym) {
-        Ok(c) => c,
-        Err(_) => return std::ptr::null_mut(),
+    // Use the fn_ptr resolved eagerly during make_custom_op_for_export
+    // (called from RegisterCustomOps). This avoids re-running dlsym under
+    // ORT's RTLD_LOCAL context where RTLD_DEFAULT wouldn't see our symbols.
+    let fn_ptr = match (*entry).fn_ptr {
+        Some(f) => f,
+        None => {
+            // Symbol was not found at registration time — return null kernel.
+            // ORT skips KernelCompute for null kernels in V1.
+            return std::ptr::null_mut();
+        }
     };
-    let raw_fn = resolve_self_symbol(dispatch_cname.as_ptr());
-    if raw_fn == 0 {
-        // Symbol not found. Return null kernel; ORT treats this as a
-        // create-kernel failure. (No status-returning variant in V1 —
-        // M62c migrates to CreateKernelV2 for proper error reporting.)
-        return std::ptr::null_mut();
-    }
-    // SAFETY: dlsym/GetProcAddress returned a non-null pointer to a symbol
-    // codegen emitted with the `ExportFnPtr` signature.
-    let fn_ptr: ExportFnPtr = std::mem::transmute::<usize, ExportFnPtr>(raw_fn);
     let state = Box::new(NslOrtKernelState {
         api,
         fn_ptr,
