@@ -187,7 +187,13 @@ unsafe extern "C" fn vtable_create_kernel(
     let state = Box::new(NslOrtKernelState {
         api,
         fn_ptr,
-        model_ptr: 0, // v1: stateless exports only.
+        // The codegen-emitted typed wrapper null-checks model_ptr and returns
+        // -1 immediately when model_ptr == 0. Stateless @exports don't need
+        // an NslModel*, but the check fires before any model-method code path,
+        // so we pass a non-zero sentinel. The wrapper only reads weights when
+        // is_model_method=true (which stateless exports never are), so the
+        // sentinel pointer is never dereferenced.
+        model_ptr: 1,
     });
     Box::into_raw(state) as *mut c_void
 }
