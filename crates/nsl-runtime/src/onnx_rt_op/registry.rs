@@ -145,7 +145,16 @@ unsafe extern "C" fn vtable_create_kernel(
 ) -> *mut c_void {
     let entry = op as *const PerExportVtable;
     let name_ptr = (*entry).name_cstr.as_ptr();
-    let raw_fn = resolve_self_symbol(name_ptr);
+    // The callable symbol uses the __nsl_dispatch suffix (ExportFnPtr ABI);
+    // the bare export name exists for typed ctypes callers but has a
+    // different signature and cannot be used here.
+    let name_str = CStr::from_ptr(name_ptr).to_string_lossy();
+    let dispatch_sym = format!("{}__nsl_dispatch", name_str);
+    let dispatch_cname = match CString::new(dispatch_sym) {
+        Ok(c) => c,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    let raw_fn = resolve_self_symbol(dispatch_cname.as_ptr());
     if raw_fn == 0 {
         // Symbol not found. Return null kernel; ORT treats this as a
         // create-kernel failure. (No status-returning variant in V1 —
