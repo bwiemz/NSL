@@ -51,11 +51,12 @@ fi
 # ONNX* names; ignore standard C library types that bindgen would otherwise
 # splat into the output.
 #
-# RUSTFMT=/bin/true: prevent bindgen from invoking rustfmt (which may not be
-# installed on the CI toolchain). Setting the env var works across all bindgen
-# versions; the --no-rustfmt-bindings / --formatter=none flag spelling varies
-# by version and is unreliable.
-RUSTFMT=/bin/true bindgen \
+# --formatter=prettyplease: prettyplease is compiled into bindgen as a library,
+# so no external `rustfmt` binary is required. The default formatter in
+# bindgen 0.72.x emits everything on one line, which breaks the line-oriented
+# extract_types grep below.
+bindgen \
+    --formatter=prettyplease \
     --allowlist-type 'Ort.*|ONNX.*' \
     --allowlist-function 'Ort.*|ONNX.*' \
     --allowlist-var 'ORT_.*|ONNX_.*' \
