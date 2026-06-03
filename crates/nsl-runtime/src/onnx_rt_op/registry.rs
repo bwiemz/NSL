@@ -319,8 +319,13 @@ unsafe extern "C" fn vtable_release_alias_map(
 ///    pointer by name. The codegen-emitted symbol lives in the same .so
 ///    as this code, so the same self-dlsym pattern works.
 ///
-/// **Unix:** `dlsym(RTLD_DEFAULT, name)` — searches the process's loaded
-/// symbol table including this `.so`.
+/// **Unix:** Uses `dladdr` to discover the filesystem path of the `.so`
+/// that contains this function, then `dlopen(path, RTLD_NOLOAD)` to
+/// obtain a handle scoped to our own library. This bypasses the
+/// `RTLD_DEFAULT` restriction: ORT loads custom-op libraries with
+/// `RTLD_LOCAL`, which hides their symbols from `RTLD_DEFAULT` searches.
+/// Falls back to `RTLD_DEFAULT` when `dladdr` / `RTLD_NOLOAD` fail (e.g.,
+/// when running from a test binary rather than a shared library).
 ///
 /// **Windows:** `GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, &this_fn, &out)`
 /// finds the module containing this function (i.e., our own DLL), then
@@ -332,14 +337,57 @@ pub(crate) unsafe fn resolve_self_symbol(name_ptr: *const c_char) -> usize {
     #[cfg(unix)]
     {
         extern "C" {
+            fn dlopen(filename: *const c_char, flags: i32) -> *mut c_void;
             fn dlsym(handle: *mut c_void, sym: *const c_char) -> *mut c_void;
+            fn dladdr(addr: *const c_void, info: *mut DlInfo) -> i32;
+            fn dlclose(handle: *mut c_void) -> i32;
         }
-        // RTLD_DEFAULT is a sentinel: NULL on Linux/macOS (POSIX). It tells
-        // dlsym to search the whole process symbol space, which includes
-        // this .so via the normal global symbol scope.
+
+        #[repr(C)]
+        struct DlInfo {
+            dli_fname: *const c_char,
+            dli_fbase: *mut c_void,
+            dli_sname: *const c_char,
+            dli_saddr: *mut c_void,
+        }
+
+        // Preferred path (Linux + macOS): use dladdr to find our own .so
+        // path, then RTLD_NOLOAD to obtain its handle without re-loading.
+        // This bypasses the RTLD_LOCAL restriction: ORT loads custom-op
+        // libraries with RTLD_LOCAL, hiding their symbols from
+        // RTLD_DEFAULT. RTLD_NOLOAD values are stable platform ABI
+        // constants (Linux: 4, macOS: 0x10).
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            const RTLD_NOW: i32 = 2;
+            #[cfg(target_os = "linux")]
+            const RTLD_NOLOAD: i32 = 4;
+            #[cfg(target_os = "macos")]
+            const RTLD_NOLOAD: i32 = 0x10;
+
+            let mut info = DlInfo {
+                dli_fname: std::ptr::null(),
+                dli_fbase: std::ptr::null_mut(),
+                dli_sname: std::ptr::null(),
+                dli_saddr: std::ptr::null_mut(),
+            };
+            let self_addr = resolve_self_symbol as *const c_void;
+            if dladdr(self_addr, &mut info) != 0 && !info.dli_fname.is_null() {
+                let handle = dlopen(info.dli_fname, RTLD_NOW | RTLD_NOLOAD);
+                if !handle.is_null() {
+                    let p = dlsym(handle, name_ptr);
+                    dlclose(handle);
+                    if !p.is_null() {
+                        return p as usize;
+                    }
+                }
+            }
+        }
+        // Fallback: RTLD_DEFAULT — works when the library was loaded with
+        // RTLD_GLOBAL, or when running in a test binary (no .so path).
+        // Also the only path on non-Linux/macOS Unix targets.
         const RTLD_DEFAULT: *mut c_void = std::ptr::null_mut();
-        let p = dlsym(RTLD_DEFAULT, name_ptr);
-        p as usize
+        dlsym(RTLD_DEFAULT, name_ptr) as usize
     }
     #[cfg(windows)]
     {
