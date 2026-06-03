@@ -209,10 +209,11 @@ unsafe extern "C" fn vtable_get_input_char(
     _op: *const OrtCustomOp,
     _idx: usize,
 ) -> OrtCustomOpInputOutputCharacteristic {
-    // VARIADIC lets ORT accept any input count >= GetVariadicInputMinArity().
-    // GetInputTypeCount==1 is the type template; the kernel reads n_in
-    // dynamically via KernelContext_GetInputCount so it handles any count.
-    OrtCustomOpInputOutputCharacteristic::INPUT_OUTPUT_VARIADIC
+    // REQUIRED: exactly GetInputTypeCount (1) input expected. ORT 1.22
+    // validates VARIADIC against a specific schema format that isn't met by
+    // a plain ONNX graph node; REQUIRED + count=1 matches a single-input
+    // node without schema mismatch errors.
+    OrtCustomOpInputOutputCharacteristic::INPUT_OUTPUT_REQUIRED
 }
 
 unsafe extern "C" fn vtable_get_output_char(
