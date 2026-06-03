@@ -2,14 +2,16 @@
 //!
 //! Recognizes the v1 MLP shape:
 //!
-//!     model TinyMlp:
-//!         W<i>: Tensor<[K, N], dtype>
-//!         b<i>: Tensor<[N], acc_dtype>
+//! ```text
+//! model TinyMlp:
+//!     W<i>: Tensor<[K, N], dtype>
+//!     b<i>: Tensor<[N], acc_dtype>
+//!     ...
+//!     fn forward(self, x: Tensor<[1, K], dtype>) -> Tensor<[1, N], acc_dtype>:
+//!         let h<i> = relu(matmul(<prev>, self.W<i>) + self.b<i>)
 //!         ...
-//!         fn forward(self, x: Tensor<[1, K], dtype>) -> Tensor<[1, N], acc_dtype>:
-//!             let h<i> = relu(matmul(<prev>, self.W<i>) + self.b<i>)
-//!             ...
-//!             return relu(matmul(<prev>, self.W<N>) + self.b<N>)
+//!         return relu(matmul(<prev>, self.W<N>) + self.b<N>)
+//! ```
 //!
 //! Emits 3 structured KIR ops per layer in this order: `KirOp::Matmul`,
 //! `KirOp::ElementwiseAdd`, `KirOp::Relu`. Errors on unrecognized shapes per
