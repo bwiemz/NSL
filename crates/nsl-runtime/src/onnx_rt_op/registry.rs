@@ -77,7 +77,13 @@ pub fn make_custom_op_for_export(idx: i64, name: *const c_char) -> *const OrtCus
 
     let entry = Box::new(PerExportVtable {
         vtable: OrtCustomOp {
-            version: EXPECTED_ORT_API_VERSION,
+            // version=1 tells ORT this op implements the V1 API. ORT 1.22
+            // uses the V2 kernel path (CreateKernelV2/KernelComputeV2) when
+            // version >= 18 AND CreateKernelV2 is non-null. With version=1
+            // ORT always uses CreateKernel + KernelCompute regardless of the
+            // V2 slot values. The post-v1 slots below are still populated
+            // because ORT 1.16+ reads the struct unconditionally for safety.
+            version: 1,
             CreateKernel: vtable_create_kernel,
             GetName: vtable_get_name,
             GetExecutionProviderType: vtable_get_ep_type,
@@ -94,10 +100,6 @@ pub fn make_custom_op_for_export(idx: i64, name: *const c_char) -> *const OrtCus
             GetVariadicInputHomogeneity: vtable_get_variadic_hom,
             GetVariadicOutputMinArity: vtable_get_variadic_min,
             GetVariadicOutputHomogeneity: vtable_get_variadic_hom,
-            // Post-V1 callbacks — Spec C registers V1 only. These slots
-            // must be populated (ORT 1.16+ reads them unconditionally),
-            // but the v2 paths are never invoked because we set the v1
-            // KernelCompute slot above.
             CreateKernelV2: vtable_create_kernel_v2_unused,
             KernelComputeV2: vtable_kernel_compute_v2_unused,
             InferOutputShapeFn: vtable_infer_output_shape_unused,
