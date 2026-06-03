@@ -198,7 +198,10 @@ unsafe extern "C" fn vtable_get_input_char(
     _op: *const OrtCustomOp,
     _idx: usize,
 ) -> OrtCustomOpInputOutputCharacteristic {
-    OrtCustomOpInputOutputCharacteristic::INPUT_OUTPUT_REQUIRED
+    // VARIADIC lets ORT accept any input count >= GetVariadicInputMinArity().
+    // GetInputTypeCount==1 is the type template; the kernel reads n_in
+    // dynamically via KernelContext_GetInputCount so it handles any count.
+    OrtCustomOpInputOutputCharacteristic::INPUT_OUTPUT_VARIADIC
 }
 
 unsafe extern "C" fn vtable_get_output_char(
