@@ -5613,6 +5613,7 @@ impl Compiler<'_> {
                 eps_const,
                 grad_accumulation_steps,
                 grad_clip,
+                cpdt_precision_dtypes,
             )?;
 
             // M43b: ZeRO Stage 1+ — all-gather updated params after optimizer step

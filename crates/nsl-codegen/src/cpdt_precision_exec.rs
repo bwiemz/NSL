@@ -74,22 +74,19 @@ pub fn build_dtype_lists(plan: &PrecisionPlan, param_paths: &[String]) -> (Vec<u
 /// Five conditions are required (design doc §6): CPDT Full mode, a non-empty
 /// precision plan, weights present, FASE Deferred mode, AND `wrapped_path_active`.
 ///
-/// `wrapped_path_active` is load-bearing for correctness. The FASE final-step
-/// cast wrapping (dequant FP16->F32, run update, quant F32->FP16) is emitted
-/// ONLY on the non-unified-dispatch Deferred branch (`stmt.rs`, the
-/// `else if fase_deferred` arm). When WGGO is active, the optimizer step is
-/// emitted by `emit_unified_optim_step_dispatch`, which does NOT wrap — so
-/// allocating m/v at FP16 there would feed FP16 buffers to an unwrapped FP32
-/// update and SILENTLY CORRUPT optimizer state (the intermediates would run at
-/// FP16 storage precision). The caller passes `wrapped_path_active =
-/// wggo_overrides.is_none()` so FP16 is allocated only where the wrapping runs.
+/// `wrapped_path_active` was historically load-bearing for correctness when
+/// the unified-dispatch arm hardcoded `wrap_precision=false`. As of the Part II
+/// activation cycle (S2), `emit_unified_optim_step_dispatch` now THREADS the
+/// caller's `cpdt_precision_dtypes` through to `fase_emit_final_step`, so both
+/// the WGGO unified-dispatch arm AND the non-WGGO Deferred arm wrap identically
+/// when `cpdt_precision_dtypes.is_some()`. The `wrapped_path_active` flag is
+/// kept here as defense-in-depth and will be relaxed to `true` unconditionally
+/// in S4 once the activation path lands its e2e numerical validation.
 ///
-/// v1 consequence: a CPDT precision plan only exists when WGGO ran (its sole
-/// builder is gated on `wggo_applied`), and WGGO ⇒ the unified dispatch ⇒
-/// `wrapped_path_active == false`. So this gate is currently never satisfied at
-/// runtime — FP16 allocation is inert-but-SAFE. Activating it end-to-end is a
-/// documented follow-on: thread the wrap through `emit_unified_optim_step_dispatch`,
-/// fix the source-AD crash, and expose `--wggo` on `nsl run`.
+/// Closed follow-ons (this cycle): source-AD MulElementwise broadcast crash
+/// (S1), unified-dispatch wrap threading (S2). Still open: relax this gate so
+/// `cpdt_precision_dtypes` is built on the WGGO path (S4), expose `--wggo` on
+/// `nsl run` (S3) to drive the e2e validation.
 pub fn precision_active(
     cpdt_mode_is_full: bool,
     has_precision_plan: bool,

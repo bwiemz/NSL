@@ -730,6 +730,12 @@ impl Compiler<'_> {
         eps_const: cranelift_codegen::ir::Value,
         grad_accumulation_steps: i64,
         grad_clip_threshold: f64,
+        // CPDT precision-adaptive optimizer execution: when Some, the
+        // Deferred sub-arm wraps `fase_emit_final_step` in nsl_tensor_cast
+        // (dequant FP16/INT8 → F32) and nsl_tensor_cast_into (quant back).
+        // None preserves the prior FP32-only behavior bit-identically.
+        // Threaded from stmt.rs's `cpdt_precision_dtypes` binding.
+        cpdt_precision_dtypes: Option<(cranelift_codegen::ir::Value, cranelift_codegen::ir::Value)>,
     ) -> Result<(), crate::error::CodegenError> {
         use cranelift_codegen::ir::{condcodes::IntCC, InstBuilder};
 
@@ -862,14 +868,16 @@ impl Compiler<'_> {
                     &[m_partial, cf],
                 )?;
             }
-            // CPDT precision wrapping is NOT applied on this unified-dispatch path
-            // (the WGGO path, live via stmt.rs's `if let Some(mtb) = mode_table_base`).
-            // wrap_precision=false here is SAFE because the FP16-allocation gate
-            // (`precision_active`) requires `wrapped_path_active = wggo_overrides.is_none()`,
-            // so when WGGO routes here the gate refuses FP16 allocation and m/v stay
-            // FP32 — no FP16 buffer ever reaches this unwrapped update. Threading the
-            // wrap through here (to let CPDT precision activate on the WGGO path) is a
-            // documented follow-on; see cpdt_precision_exec::precision_active.
+            // CPDT precision wrapping is now THREADED through this unified-dispatch
+            // path. `cpdt_precision_dtypes.is_some()` ⇔ the caller built FP16/INT8
+            // dtype lists for m/v; `fase_emit_final_step` wraps the F32 update with
+            // nsl_tensor_cast/cast_into (and its own `m_ptr != v_ptr` SGD guard
+            // prevents double-cast on single-state optimizers). When None, the
+            // wrap branch is skipped and the emitted IR is byte-identical to the
+            // pre-threading hardcoded `false`. The matching `wrapped_path_active`
+            // gate at stmt.rs:3533 is what actually decides whether the caller
+            // passes Some vs None — relaxing that gate is the S4 step that
+            // activates the wrap end-to-end on the WGGO path.
             self.fase_emit_final_step(
                 builder,
                 theta,
@@ -878,7 +886,7 @@ impl Compiler<'_> {
                 s2,
                 &fase_plan.recipe,
                 Some((bc1_inv, bc2_inv)),
-                false,
+                cpdt_precision_dtypes.is_some(),
             )?;
         }
         builder.ins().jump(iter_join, &[]);
