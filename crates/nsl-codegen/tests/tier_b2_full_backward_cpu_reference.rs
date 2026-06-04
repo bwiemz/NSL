@@ -309,6 +309,51 @@ fn tier_b2_full_backward_sweep_b1_forward_causal() {
     }
 }
 
+/// Sprint 10: structural codegen check that proj_backward's PTX includes
+/// the inverse-RoPE phase when (and only when) `config.rope_q` is true.
+/// Mirrors the Sprint-4 intra-tile-causal-mask emission check pattern.
+///
+/// This is the COMPILE-TIME half of the Sprint 10 deliverable. The
+/// runtime/numerical half (full 7-gradient parity at rope_q=true) is
+/// deferred until a rope_q-aware CPU naive forward/backward reference
+/// lands; the existing CPU naive references at
+/// `crates/nsl-test/src/cpu_naive_{forward,backward}.rs` do not yet apply
+/// RoPE (no cos/sin inputs, no rotation step), so a numerical parity gate
+/// can't be authored against them. Once the references gain a rope_q
+/// branch, the existing `validate_full_backward_for_source` harness can
+/// be re-used to add a rope_q=true sweep.
+#[test]
+fn tier_b2_proj_backward_emits_drope_when_rope_q_true() {
+    use nsl_codegen::flash_attention_v2::tier_b2::backward::proj_backward::synthesize_proj_backward;
+
+    // rope_q=true: the inverse-RoPE phase must be present, sequenced
+    // strictly between emit_xnorm_recompute and emit_dproj.
+    let mut cfg_rope = smoke_cfg(64, 64);
+    cfg_rope.rope_q = true;
+    let ptx_rope = synthesize_proj_backward(&cfg_rope).expect("synth ok");
+    assert!(
+        ptx_rope.contains("V2_BWD_DROPE_GUARD_0:")
+            && ptx_rope.contains("V2_BWD_DROPE_Q_LOOP_0:")
+            && ptx_rope.contains("V2_BWD_DROPE_K_LOOP_0:"),
+        "rope_q=true: proj_backward PTX must include the inverse-RoPE phase \
+         (V2_BWD_DROPE_GUARD/Q_LOOP/K_LOOP labels)"
+    );
+
+    // rope_q=false: zero dRoPE bytes — the codegen-side gate keeps the
+    // emitted PTX byte-identical to the pre-Sprint-10 baseline.
+    let ptx_no_rope = synthesize_proj_backward(&smoke_cfg(64, 64))
+        .expect("synth ok");
+    assert!(
+        !ptx_no_rope.contains("V2_BWD_DROPE"),
+        "rope_q=false: NO dRoPE label may appear (byte-identity guarantee)"
+    );
+    assert!(
+        !ptx_no_rope.contains("Tier C dRoPE: rope_q=false"),
+        "rope_q=false: emit_drope's internal no-op comment must NOT appear — \
+         the call must be gated externally for byte identity"
+    );
+}
+
 /// Sprint 4 (paper §4.1): structural verification that BOTH the tile-level
 /// causal skip predicate AND the new intra-tile per-element mask are emitted
 /// when `config.causal` is true. The intra-tile mask is gated entirely by the

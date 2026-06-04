@@ -22,8 +22,14 @@ fn cfg(hd: i64, heads: u32, d_model: u32, rope: bool) -> FlashAttentionConfig {
 #[test] fn seq_gt_block_q_rejected() {
     assert!(!tier_b2_hybrid_backward_eligible(&cfg(64, 1, 64, false), 128));
 }
-#[test] fn rope_q_rejected() {
-    assert!(!tier_b2_hybrid_backward_eligible(&cfg(64, 1, 64, true), 64));
+/// Sprint 10: rope_q=true was previously excluded from the hybrid
+/// backward eligibility. The hybrid now de-rotates dQ/dK to the pre-RoPE
+/// basis inside `proj_backward` via `emit_drope`, so rope_q=true configs
+/// that otherwise satisfy the smoke-intersection constraints route
+/// through the 4-kernel hybrid. The runtime `csha_tier_b2_backward_launch`
+/// also threads cos/sin to the proj kernel.
+#[test] fn rope_q_accepted() {
+    assert!(tier_b2_hybrid_backward_eligible(&cfg(64, 1, 64, true), 64));
 }
 #[test] fn non_csha_rejected() {
     let mut c = cfg(64, 1, 64, false); c.csha = None;

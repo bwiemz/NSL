@@ -120,10 +120,14 @@ pub fn tier_b2_hybrid_backward_eligible(config: &FlashAttentionConfig, seq_len: 
     let Some(csha) = config.csha.as_ref() else { return false; };
     let hd = config.head_dim as u32;
     let block_q = config.block_q as u32;
+    // Sprint 10: `rope_q=true` is now supported via emit_drope inside
+    // proj_backward (rotates dQ/dK from post-RoPE to pre-RoPE before
+    // emit_dproj reads them). Eligibility no longer excludes rope_q=true;
+    // the cos/sin pointers are threaded through `csha_tier_b2_backward_launch`
+    // and proj_backward's PTX includes the de-rotation when config.rope_q.
     csha.active_heads == 1  // exactly one active head; the 0="all" sentinel is rejected as ambiguous -> safe fallback to scalar
         && csha.d_model == hd
         && seq_len == block_q
-        && !config.rope_q
 }
 
 /// Compile-time subset of [`tier_b2_hybrid_backward_eligible`]: all checks that
@@ -148,9 +152,10 @@ pub fn tier_b2_hybrid_backward_compile_time_eligible(config: &FlashAttentionConf
     }
     let Some(csha) = config.csha.as_ref() else { return false; };
     let hd = config.head_dim as u32;
+    // Sprint 10: `rope_q=true` is now supported (see
+    // `tier_b2_hybrid_backward_eligible` and `proj_backward.rs::synthesize_*`).
     csha.active_heads == 1
         && csha.d_model == hd
-        && !config.rope_q
 }
 
 #[cfg(test)]
@@ -330,10 +335,18 @@ mod tests {
         assert!(!tier_b2_hybrid_backward_compile_time_eligible(&c));
     }
 
+    /// Sprint 10: rope_q=true was previously rejected; the hybrid backward
+    /// now routes through proj_backward's emit_drope phase to de-rotate
+    /// dQ/dK to the pre-RoPE basis before dproj reads them. The eligibility
+    /// predicate must now accept rope_q=true configs that otherwise satisfy
+    /// the smoke-intersection constraints.
     #[test]
-    fn compile_time_rejects_rope_q() {
+    fn compile_time_accepts_rope_q() {
         let c = hybrid_cfg(64, 1, 64, true, 80, 2);
-        assert!(!tier_b2_hybrid_backward_compile_time_eligible(&c));
+        assert!(
+            tier_b2_hybrid_backward_compile_time_eligible(&c),
+            "Sprint 10: rope_q=true must be eligible for the hybrid backward"
+        );
     }
 
     #[test]

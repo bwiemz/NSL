@@ -254,6 +254,40 @@ pub fn synthesize_proj_backward(
     phases::backward::csha_hooks_backward::emit_xnorm_recompute(&mut ptx, config);
     ptx.push_str("    bar.sync 0;  // x_norm + rms visible before dproj / dRMSNorm\n");
 
+    // Sprint 10: rope_q integration. When rope_q=true, dQ/dK live in HBM in
+    // the post-RoPE basis (the basis of q_saved/k_saved that the dq/dkdv
+    // kernels backproped through), but emit_dproj needs them in the pre-RoPE
+    // basis so dWq = x_norm^T @ dQ_preRoPE. `emit_drope` rotates the dQ/dK
+    // SMEM tiles in-place using the same inverse rotation the scalar Tier C
+    // path applies (see `mod.rs:1224`, matching phase order
+    // xnorm_recompute -> drope -> dproj -> drmsnorm). emit_drope already
+    // includes its own internal null-guard on cos_ptr/sin_ptr and a final
+    // bar.sync, and is a no-op when rope_q=false / csha=None (so the
+    // rope_q=false PTX is byte-identical to the pre-Sprint-10 baseline).
+    //
+    // Preconditions vs proj_backward's scope:
+    //   - dQ/dK SMEM tiles are staged into backward_d{q,k}_offset by
+    //     emit_dqkv_hbm_to_smem_load above + bar.sync — emit_drope reads
+    //     and writes those exact slots.
+    //   - The hybrid path's segment_masked-RoPE-reset (config.segment_masked
+    //     && config.rope_q) branch inside emit_drope requires %seg_base +
+    //     smem_doc_starts to be initialized; that is the scalar prelude's
+    //     responsibility (gated identically on segment_masked && rope_q in
+    //     prelude.rs:271) and the proj_backward kernel reuses that prelude
+    //     unchanged. Sentinel-disabled paths (segment_masked=false) are
+    //     trivially safe.
+    //
+    // Byte-identity gate: emit_drope itself emits a "no emission" comment
+    // when rope_q=false (csha_hooks_backward.rs:192-194), which would drift
+    // the rope_q=false PTX away from the pre-Sprint-10 baseline. We therefore
+    // gate the CALL externally — when !config.rope_q the call site emits
+    // ZERO bytes, preserving exact byte-for-byte equality on the historical
+    // rope_q=false path that all existing tests + the production wengert
+    // lowering exercise.
+    if config.rope_q {
+        phases::backward::csha_hooks_backward::emit_drope(&mut ptx, config, 0);
+    }
+
     // dproj weight gradients (dWq/dWk/dWv) and dRMSNorm (dx) — reused scalar
     // emitters, UNCHANGED. q_tile_iter = 0: under the smoke scope seq ==
     // block_q so a single q-block covers the whole tile (matches how the
@@ -317,5 +351,78 @@ mod synth_tests {
     fn rejects_bad_head_dim() {
         let err = synthesize_proj_backward(&cfg(48, 48)).unwrap_err();
         assert_eq!(err, BackwardSynthError::UnsupportedHeadDim(48));
+    }
+
+    /// Sprint 10: rope_q=true integration. When the config has rope_q=true,
+    /// emit_drope MUST be inserted between emit_xnorm_recompute and
+    /// emit_dproj so dQ/dK are rotated from post-RoPE (the basis q_saved/
+    /// k_saved live in, which the dq/dkdv kernels backproped through) to
+    /// pre-RoPE before emit_dproj computes dWq = x_norm^T @ dQ_preRoPE.
+    /// Both the Q-side and K-side dRoPE labels must appear (V is never
+    /// rotated by RoPE so V_LOOP is absent — same forward Adjacent-layout
+    /// epilogue rule as the scalar Tier C path).
+    #[test]
+    fn rope_q_true_emits_drope_chain() {
+        let mut c = cfg(64, 64);
+        c.rope_q = true;
+        let ptx = synthesize_proj_backward(&c).expect("synth ok");
+        // The Q + K rotation loops AND the shared null-guard must be present.
+        assert!(
+            ptx.contains("V2_BWD_DROPE_GUARD_0:"),
+            "rope_q=true: expected dRoPE null-guard label"
+        );
+        assert!(
+            ptx.contains("V2_BWD_DROPE_Q_LOOP_0:"),
+            "rope_q=true: expected Q-side dRoPE rotation loop"
+        );
+        assert!(
+            ptx.contains("V2_BWD_DROPE_K_LOOP_0:"),
+            "rope_q=true: expected K-side dRoPE rotation loop"
+        );
+        assert!(
+            !ptx.contains("V2_BWD_DROPE_V_LOOP"),
+            "V is never RoPE-rotated; V_LOOP must not be emitted"
+        );
+
+        // Ordering invariant: x_norm_recompute -> dRoPE -> dproj.
+        // The scalar Tier C orchestrator (mod.rs:1223-1225) emits the same
+        // sequence; this gate guards against a future refactor moving the
+        // call before the x_norm recompute (would still be correct on its
+        // own, but breaks parity with the scalar phase order).
+        let xnorm_pos = ptx.find("V2_BWD_XNORM_RECOMPUTE")
+            .expect("xnorm recompute label present");
+        let drope_pos = ptx.find("V2_BWD_DROPE_GUARD_0:")
+            .expect("dRoPE guard label present");
+        let dproj_pos = ptx.find("V2_BWD_DPROJ_WQ")
+            .expect("dproj label present");
+        assert!(
+            xnorm_pos < drope_pos && drope_pos < dproj_pos,
+            "phase order must be xnorm_recompute < dRoPE < dproj \
+             (xnorm={xnorm_pos}, drope={drope_pos}, dproj={dproj_pos})"
+        );
+    }
+
+    /// Sprint 10: byte-identity guard for the rope_q=false path. The
+    /// instructions require that adding the rope_q=true wiring MUST NOT
+    /// change the emitted PTX one byte for any rope_q=false config; this
+    /// test verifies the external gate (`if config.rope_q { ... }` in
+    /// `synthesize_proj_backward`) achieves that. Without the external
+    /// gate, emit_drope still emits a "no emission" comment which would
+    /// drift the rope_q=false PTX away from the pre-Sprint-10 baseline.
+    #[test]
+    fn rope_q_false_emits_no_drope_marker() {
+        let ptx = synthesize_proj_backward(&cfg(64, 64)).expect("synth ok");
+        assert!(
+            !ptx.contains("V2_BWD_DROPE"),
+            "rope_q=false: NO dRoPE label may appear"
+        );
+        // The "no emission" comment itself must also be absent — emit_drope
+        // is gated at the CALL site, not internally, so it is never invoked
+        // for rope_q=false. This is the byte-identity guarantee.
+        assert!(
+            !ptx.contains("Tier C dRoPE: rope_q=false"),
+            "rope_q=false: emit_drope's internal no-op comment MUST NOT appear \
+             (call must be gated externally for byte identity)"
+        );
     }
 }

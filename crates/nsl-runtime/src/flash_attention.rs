@@ -1414,6 +1414,11 @@ pub extern "C" fn nsl_flash_attention_csha_backward(
                 dx_ptr, dx_norm_ptr,
                 // Packed-sequence pass-throughs.
                 segment_ids_ptr, doc_starts_ptr,
+                // Sprint 10: rope_q=true threads cos/sin to proj_backward's
+                // emit_drope phase. Null on rope_q=false launches (the entire
+                // dRoPE emission is skipped at codegen time then, so a null
+                // here is never read).
+                cos_ptr, sin_ptr,
             );
         }
     }
@@ -1859,6 +1864,7 @@ fn tier_b2_proj_backward_smem_bytes(block_q: i64, block_kv: i64, head_dim: i64, 
 /// `CUDA_SUCCESS` (0) when all four launch cleanly.
 #[cfg(feature = "cuda")]
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn csha_tier_b2_backward_launch(
     ptx_ptr: i64,
     batch: i64, heads: i64, seq_len: i64, head_dim: i64,
@@ -1878,6 +1884,15 @@ fn csha_tier_b2_backward_launch(
     dwq_ptr: i64, dwk_ptr: i64, dwv_ptr: i64,
     dx_ptr: i64, dx_norm_ptr: i64,
     segment_ids_ptr: i64, doc_starts_ptr: i64,
+    // Sprint 10: rope_q=true support. When non-zero, the cos/sin device
+    // buffers are threaded through to the proj_backward kernel so its
+    // emit_drope phase can de-rotate dQ/dK from post-RoPE to pre-RoPE
+    // before emit_dproj computes the weight gradients. Null on rope_q=false
+    // launches; emit_drope's internal null-guard then makes the rotation a
+    // no-op (which it is even on the codegen side: the codegen-level gate
+    // in proj_backward.rs skips emit_drope entirely when !config.rope_q,
+    // so a null cos/sin here is never read).
+    cos_ptr: i64, sin_ptr: i64,
 ) -> i64 {
     use cudarc::driver::sys::CUresult;
 
@@ -2147,8 +2162,16 @@ fn csha_tier_b2_backward_launch(
         let mut kp = 0u64;
         let mut vp = 0u64;
         let mut bsz = 0u64;
-        let mut cos = 0u64;
-        let mut sin = 0u64;
+        // Sprint 10: thread cos/sin to proj_backward so its emit_drope phase
+        // can de-rotate dQ/dK to the pre-RoPE basis before dproj reads them.
+        // Resolve through csha_tensor_data_ptr (same auto-promote + .data
+        // extraction the scalar backward path uses for cos/sin at line
+        // 1469-1470). On rope_q=false launches the caller passes 0, which
+        // csha_tensor_data_ptr returns as 0 — emit_drope's internal null-
+        // guard then short-circuits; under the Sprint-10 codegen-side gate
+        // the entire dRoPE block is also skipped, so this is doubly safe.
+        let mut cos = csha_tensor_data_ptr(cos_ptr) as u64;
+        let mut sin = csha_tensor_data_ptr(sin_ptr) as u64;
         let mut sids = 0u64;
         let mut slens = 0u64; // per-q-block base, threaded in the loop below
         let mut dfs_enter = 0u64;
