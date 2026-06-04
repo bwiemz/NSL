@@ -189,7 +189,7 @@ mod tests {
     #[test]
     fn gate_requires_all_five_conditions() {
         assert!(precision_active(true, true, true, true, true));
-        assert!(!precision_active(true, true, true, true, false)); // wrapped path inactive (mode table contains FullBuffer entry post-S4)
+        assert!(!precision_active(true, true, true, true, false)); // wrapped_path_active=false (kept as defense-in-depth post-S5; no production caller passes false today)
         assert!(!precision_active(true, true, true, false, true)); // not Deferred
         assert!(!precision_active(false, true, true, true, true)); // not Full
         assert!(!precision_active(true, false, true, true, true)); // empty plan

@@ -726,6 +726,19 @@ impl Compiler<'_> {
         // CPDT FP16/INT8 wrap envelope (S5) — close. Quant-cast the working
         // F32 results back into the originally-typed storage buffers, then
         // free the working tensors. Mirrors fase_emit_final_step's exit.
+        //
+        // Asymmetry note vs fase_emit_final_step: that helper folds the
+        // m_ptr==v_ptr alias into a single combined `wrap_precision` flag
+        // at entry, so the entire cast branch is gated by a single
+        // condition. Here we instead use `wrap_precision` for the s1
+        // cast/cast_into (always paired) and a separate `wrap_s2` for
+        // the s2 pair — when SGD aliases s2==s1 we still cast s1 once
+        // and cast it back once, but skip the s2 work to avoid
+        // double-cast-into / double-free of the same buffer. Net effect
+        // for SGD: 1 cast in, 1 cast_into out, 1 free. For multi-state
+        // optimizers with distinct s1/s2: 2 cast in, 2 cast_into out,
+        // 2 free. Both shapes leak nothing and preserve the original
+        // buffer identities.
         if wrap_precision {
             self.compile_call_by_name(builder, "nsl_tensor_cast_into", &[orig_s1, s1])?;
             self.compile_call_by_name(builder, "nsl_tensor_free", &[s1])?;
