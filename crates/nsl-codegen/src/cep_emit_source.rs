@@ -380,19 +380,19 @@ mod tests {
     }
 
     const CANONICAL: &str = r#"
-model GroupedQueryAttention(d_model: int, n_heads: int, n_kv_heads: int, dropout_p: float):
+model GroupedQueryAttention(d_model: int, n_heads: int, n_kv_heads: int, head_dim: int, dropout_p: float):
     wq: Tensor = randn([d_model, d_model])
 model SwiGLUFFN(d_model: int, d_ff: int, dropout_p: float):
     w_gate: Tensor = randn([d_model, d_ff])
     fn forward(self, x: Tensor) -> Tensor:
         return silu(x @ self.w_gate)
-model TransformerBlock(d_model: int, n_heads: int, n_kv_heads: int, d_ff: int, dropout_p: float):
+model TransformerBlock(d_model: int, n_heads: int, n_kv_heads: int, head_dim: int, d_ff: int, dropout_p: float):
     attn_norm: RMSNorm = RMSNorm(d_model)
-    attn: GroupedQueryAttention = GroupedQueryAttention(d_model, n_heads, n_kv_heads, dropout_p)
+    attn: GroupedQueryAttention = GroupedQueryAttention(d_model, n_heads, n_kv_heads, head_dim, dropout_p)
     ffn: SwiGLUFFN = SwiGLUFFN(d_model, d_ff, dropout_p)
 model TinyCoder:
     embed: Tensor = randn([4096, 384]) * full([1], 0.02)
-    blocks: [TransformerBlock; 6] = TransformerBlock(384, 6, 3, 1024, 0.1)
+    blocks: [TransformerBlock; 6] = TransformerBlock(384, 6, 3, 64, 1024, 0.1)
     norm: RMSNorm = RMSNorm(384)
 "#;
 
@@ -433,7 +433,8 @@ model TinyCoder:
         assert_eq!(spec2.n_layers, 6);
         assert_eq!(spec2.vocab, 4096);
 
-        assert!(out.contains("blocks: [TransformerBlock; 6] = TransformerBlock(384, 4, 2, 512, 0.1)"),
+        // head_dim (64) is INVARIANT under CEP pruning; SP2 must not rewrite it.
+        assert!(out.contains("blocks: [TransformerBlock; 6] = TransformerBlock(384, 4, 2, 64, 512, 0.1)"),
                 "rewritten ctor call must match expected form, got:\n{out}");
         assert!(out.contains("randn([4096, 384])"),
                 "embed shape must not be touched");
@@ -458,18 +459,19 @@ model TinyCoder:
 const D_MODEL = 256
 const N_HEADS = 8
 const N_KV_HEADS = 4
+const HEAD_DIM = 32
 const D_FF = 512
-model GroupedQueryAttention(d_model: int, n_heads: int, n_kv_heads: int, dropout_p: float):
+model GroupedQueryAttention(d_model: int, n_heads: int, n_kv_heads: int, head_dim: int, dropout_p: float):
     wq: Tensor = randn([d_model, d_model])
 model SwiGLUFFN(d_model: int, d_ff: int, dropout_p: float):
     w_gate: Tensor = randn([d_model, d_ff])
-model TransformerBlock(d_model: int, n_heads: int, n_kv_heads: int, d_ff: int, dropout_p: float):
-    attn: GroupedQueryAttention = GroupedQueryAttention(d_model, n_heads, n_kv_heads, dropout_p)
+model TransformerBlock(d_model: int, n_heads: int, n_kv_heads: int, head_dim: int, d_ff: int, dropout_p: float):
+    attn: GroupedQueryAttention = GroupedQueryAttention(d_model, n_heads, n_kv_heads, head_dim, dropout_p)
     ffn: SwiGLUFFN = SwiGLUFFN(d_model, d_ff, dropout_p)
     norm: RMSNorm = RMSNorm(d_model)
 model ConstNet:
     embed: Tensor = randn([1000, 256])
-    blocks: [TransformerBlock; 2] = TransformerBlock(D_MODEL, N_HEADS, N_KV_HEADS, D_FF, 0.1)
+    blocks: [TransformerBlock; 2] = TransformerBlock(D_MODEL, N_HEADS, N_KV_HEADS, HEAD_DIM, D_FF, 0.1)
 "#;
 
     fn baseline_const_bound() -> ModelSpec {
@@ -507,24 +509,27 @@ model ConstNet:
         assert!(out.contains("const N_HEADS = 4"), "N_HEADS const must be rewritten, got:\n{out}");
         assert!(out.contains("const N_KV_HEADS = 2"), "N_KV_HEADS const must be rewritten");
         assert!(out.contains("const D_FF = 256"), "D_FF const must be rewritten");
-        assert!(out.contains("TransformerBlock(D_MODEL, N_HEADS, N_KV_HEADS, D_FF, 0.1)"),
+        // head_dim is invariant under CEP — HEAD_DIM const is unchanged AND the call-site
+        // arg order is preserved by reference (consts unchanged for invariant slots).
+        assert!(out.contains("TransformerBlock(D_MODEL, N_HEADS, N_KV_HEADS, HEAD_DIM, D_FF, 0.1)"),
                 "call site must keep referring to consts by name");
+        assert!(out.contains("const HEAD_DIM = 32"), "HEAD_DIM must not be rewritten (invariant)");
         assert!(out.contains("const D_MODEL = 256"), "D_MODEL must not be rewritten");
     }
 
     const ARITHMETIC_ARG: &str = r#"
 const N_HEADS = 8
-model GroupedQueryAttention(d_model: int, n_heads: int, n_kv_heads: int, dropout_p: float):
+model GroupedQueryAttention(d_model: int, n_heads: int, n_kv_heads: int, head_dim: int, dropout_p: float):
     wq: Tensor = randn([d_model, d_model])
 model SwiGLUFFN(d_model: int, d_ff: int, dropout_p: float):
     w_gate: Tensor = randn([d_model, d_ff])
-model TransformerBlock(d_model: int, n_heads: int, n_kv_heads: int, d_ff: int, dropout_p: float):
-    attn: GroupedQueryAttention = GroupedQueryAttention(d_model, n_heads, n_kv_heads, dropout_p)
+model TransformerBlock(d_model: int, n_heads: int, n_kv_heads: int, head_dim: int, d_ff: int, dropout_p: float):
+    attn: GroupedQueryAttention = GroupedQueryAttention(d_model, n_heads, n_kv_heads, head_dim, dropout_p)
     ffn: SwiGLUFFN = SwiGLUFFN(d_model, d_ff, dropout_p)
     norm: RMSNorm = RMSNorm(d_model)
 model Net:
     embed: Tensor = randn([1000, 256])
-    blocks: [TransformerBlock; 2] = TransformerBlock(256, N_HEADS * 2, 4, 512, 0.1)
+    blocks: [TransformerBlock; 2] = TransformerBlock(256, N_HEADS * 2, 4, 16, 512, 0.1)
 "#;
 
     #[test]
@@ -552,7 +557,7 @@ model Net:
     }
 
     const MISSING_ARG: &str = r#"
-model GroupedQueryAttention(d_model: int, n_heads: int, n_kv_heads: int, dropout_p: float):
+model GroupedQueryAttention(d_model: int, n_heads: int, n_kv_heads: int, head_dim: int, dropout_p: float):
     wq: Tensor = randn([d_model, d_model])
 model SwiGLUFFN(d_model: int, d_ff: int, dropout_p: float):
     w_gate: Tensor = randn([d_model, d_ff])
@@ -612,17 +617,17 @@ model Net:
     fn shared_const_used_for_two_slots_with_conflicting_values_refuses() {
         let src = r#"
 const X = 8
-model GroupedQueryAttention(d_model: int, n_heads: int, n_kv_heads: int, dropout_p: float):
+model GroupedQueryAttention(d_model: int, n_heads: int, n_kv_heads: int, head_dim: int, dropout_p: float):
     wq: Tensor = randn([d_model, d_model])
 model SwiGLUFFN(d_model: int, d_ff: int, dropout_p: float):
     w_gate: Tensor = randn([d_model, d_ff])
-model TransformerBlock(d_model: int, n_heads: int, n_kv_heads: int, d_ff: int, dropout_p: float):
-    attn: GroupedQueryAttention = GroupedQueryAttention(d_model, n_heads, n_kv_heads, dropout_p)
+model TransformerBlock(d_model: int, n_heads: int, n_kv_heads: int, head_dim: int, d_ff: int, dropout_p: float):
+    attn: GroupedQueryAttention = GroupedQueryAttention(d_model, n_heads, n_kv_heads, head_dim, dropout_p)
     ffn: SwiGLUFFN = SwiGLUFFN(d_model, d_ff, dropout_p)
     norm: RMSNorm = RMSNorm(d_model)
 model Net:
     embed: Tensor = randn([1000, 256])
-    blocks: [TransformerBlock; 2] = TransformerBlock(256, X, 4, X, 0.1)
+    blocks: [TransformerBlock; 2] = TransformerBlock(256, X, 4, 32, X, 0.1)
 "#;
         let (module, interner) = parse(src);
         let resolve = |s: Symbol| interner.resolve(s.0).unwrap_or("").to_string();
@@ -654,16 +659,11 @@ model Net:
     }
 
     /// SP2's emitted source extracts the chosen pruned (n_heads, n_kv_heads, d_ff) triple.
-    /// d_model is invariant (CEP design).
-    ///
-    /// KNOWN LIMITATION (deferred): the recognizer derives `head_dim = d_model / n_heads`
-    /// while SP1 slices using the BASELINE head_dim. After SP2 rewrites n_heads, the
-    /// recognizer's head_dim therefore disagrees with SP1's sliced projection width
-    /// (e.g. for baseline d_model=384/n_heads=6 -> hd=64; rewrite n_heads=4 -> hd=96
-    /// per the recognizer but the sliced wq has 4*64=256 cols not 4*96=384). This is a
-    /// stdlib GQA limitation (head_dim is implicit, not a parameter), not an SP2 bug;
-    /// fixing it requires either making head_dim an explicit GQA arg or teaching the
-    /// recognizer to source head_dim from weight shapes. Out of SP2 v1 scope.
+    /// d_model AND head_dim are invariant (CEP design); the stdlib GQA constructor now
+    /// takes head_dim as an explicit positional arg (slot 3 — between n_kv_heads and
+    /// dropout_p), so SP2's rewrite leaves head_dim untouched and the recognizer extracts
+    /// the same head_dim across the round-trip. (The prior "known limitation" comment
+    /// referring to derived head_dim is now closed — see project_cep_gqa_head_dim_explicit.)
     #[test]
     fn sp2_emitted_source_extracts_chosen_dim_triple() {
         let (module, interner) = parse(CANONICAL);
@@ -752,20 +752,29 @@ model Net:
                    "SP1 sliced w_gate cols {} must equal SP2 emitted d_ff {}",
                    sliced_wgate.shape[1], spec2.d_ff[0]);
 
-        // KV head count: SP1 drops one KV group (2 surviving); SP2 recognizes 2.
-        let sliced_wk = sliced.get("blocks.0.attn.wk").expect("layer 0 wk sliced");
-        let sp1_kv_count = (sliced_wk.shape[1] as u32) / baseline.head_dim[0];
-        assert_eq!(sp1_kv_count, spec2.n_kv_heads[0],
-                   "SP1 surviving KV count {} must equal SP2 emitted n_kv_heads {}",
-                   sp1_kv_count, spec2.n_kv_heads[0]);
+        // head_dim is invariant (CEP design): SP1 slices using baseline head_dim, SP2
+        // emits a source that preserves the head_dim arg literal, so the recognizer
+        // extracts the SAME head_dim across the round-trip.
+        assert_eq!(spec2.head_dim[0], baseline.head_dim[0],
+                   "head_dim must round-trip unchanged: SP2 emitted {} vs baseline {}",
+                   spec2.head_dim[0], baseline.head_dim[0]);
 
-        // Query head count (by SP1's surviving-head count derived from projection width
-        // using the BASELINE head_dim — the recognizer's derived head_dim differs by the
-        // documented limitation, but the COUNT agrees).
+        // KV head count + projection width: SP1's sliced wk has shape
+        // [d_model, surviving_kv * head_dim]. With head_dim now explicit, the SP2-emitted
+        // spec's `n_kv_heads * head_dim` projection width MUST equal SP1's sliced wk cols.
+        let sliced_wk = sliced.get("blocks.0.attn.wk").expect("layer 0 wk sliced");
+        let sp1_kv_proj = sliced_wk.shape[1] as u32;
+        let sp2_kv_proj = spec2.n_kv_heads[0] * spec2.head_dim[0];
+        assert_eq!(sp1_kv_proj, sp2_kv_proj,
+                   "SP1 sliced wk cols {} must equal SP2 n_kv_heads*head_dim = {}*{} = {}",
+                   sp1_kv_proj, spec2.n_kv_heads[0], spec2.head_dim[0], sp2_kv_proj);
+
+        // Query projection width: same invariant for wq cols = n_heads * head_dim.
         let sliced_wq = sliced.get("blocks.0.attn.wq").expect("layer 0 wq sliced");
-        let sp1_q_count = (sliced_wq.shape[1] as u32) / baseline.head_dim[0];
-        assert_eq!(sp1_q_count, spec2.n_heads[0],
-                   "SP1 surviving Q-head count {} must equal SP2 emitted n_heads {}",
-                   sp1_q_count, spec2.n_heads[0]);
+        let sp1_q_proj = sliced_wq.shape[1] as u32;
+        let sp2_q_proj = spec2.n_heads[0] * spec2.head_dim[0];
+        assert_eq!(sp1_q_proj, sp2_q_proj,
+                   "SP1 sliced wq cols {} must equal SP2 n_heads*head_dim = {}*{} = {}",
+                   sp1_q_proj, spec2.n_heads[0], spec2.head_dim[0], sp2_q_proj);
     }
 }

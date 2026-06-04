@@ -335,7 +335,7 @@ pub fn extract_model_spec(module: &Module, resolve: Resolve) -> Result<ModelSpec
             })
             .unwrap_or_else(|| "no constructor call".to_string());
         CepExtractError::UnrecognizedAttention {
-            expected: "GroupedQueryAttention(d_model, n_heads, n_kv_heads, dropout)".to_string(),
+            expected: "GroupedQueryAttention(d_model, n_heads, n_kv_heads, head_dim, dropout)".to_string(),
             found: format!("attention field is `{found}(...)`, not GroupedQueryAttention"),
         }
     })?;
@@ -370,7 +370,25 @@ pub fn extract_model_spec(module: &Module, resolve: Resolve) -> Result<ModelSpec
     if n_heads == 0 {
         return Err(CepExtractError::InvalidSpec("n_heads is 0".to_string()));
     }
-    let head_dim = d_model / n_heads;
+    // head_dim is now an EXPLICIT positional arg (slot 3 — between n_kv_heads and
+    // dropout_p) per the stdlib GQA signature `(d_model, n_heads, n_kv_heads, head_dim,
+    // dropout_p)`. Sourcing it from the call site instead of deriving as `d_model /
+    // n_heads` lets CEP-pruned models keep d_model fixed while shrinking n_heads — the
+    // SP2-emitted source preserves head_dim across the rewrite, and SP1's sliced
+    // projection width `n_heads * head_dim` agrees with the recognizer-extracted
+    // projection width by construction.
+    let head_dim = resolve_binding(
+        &attn_args
+            .get(3)
+            .ok_or_else(arg_missing("GQA head_dim"))?
+            .value,
+        &ctx,
+        resolve,
+        "head_dim",
+    )? as u32;
+    if head_dim == 0 {
+        return Err(CepExtractError::InvalidSpec("head_dim is 0".to_string()));
+    }
 
     let (ffn_type, ffn_args) = ffn.ok_or_else(|| {
         CepExtractError::MissingStructure(
@@ -658,19 +676,19 @@ mod tests {
     }
 
     const CANONICAL: &str = r#"
-model GroupedQueryAttention(d_model: int, n_heads: int, n_kv_heads: int, dropout_p: float):
+model GroupedQueryAttention(d_model: int, n_heads: int, n_kv_heads: int, head_dim: int, dropout_p: float):
     wq: Tensor = randn([d_model, d_model])
 model SwiGLUFFN(d_model: int, d_ff: int, dropout_p: float):
     w_gate: Tensor = randn([d_model, d_ff])
     fn forward(self, x: Tensor) -> Tensor:
         return silu(x @ self.w_gate)
-model TransformerBlock(d_model: int, n_heads: int, n_kv_heads: int, d_ff: int, dropout_p: float):
+model TransformerBlock(d_model: int, n_heads: int, n_kv_heads: int, head_dim: int, d_ff: int, dropout_p: float):
     attn_norm: RMSNorm = RMSNorm(d_model)
-    attn: GroupedQueryAttention = GroupedQueryAttention(d_model, n_heads, n_kv_heads, dropout_p)
+    attn: GroupedQueryAttention = GroupedQueryAttention(d_model, n_heads, n_kv_heads, head_dim, dropout_p)
     ffn: SwiGLUFFN = SwiGLUFFN(d_model, d_ff, dropout_p)
 model TinyCoder:
     embed: Tensor = randn([4096, 384]) * full([1], 0.02)
-    blocks: [TransformerBlock; 6] = TransformerBlock(384, 6, 3, 1024, 0.1)
+    blocks: [TransformerBlock; 6] = TransformerBlock(384, 6, 3, 64, 1024, 0.1)
     norm: RMSNorm = RMSNorm(384)
 "#;
 
@@ -713,32 +731,33 @@ model GPT2:
 const D_MODEL = 256
 const N_HEADS = 8
 const N_KV_HEADS = 4
+const HEAD_DIM = 32
 const D_FF = 512
-model GroupedQueryAttention(d_model: int, n_heads: int, n_kv_heads: int, dropout_p: float):
+model GroupedQueryAttention(d_model: int, n_heads: int, n_kv_heads: int, head_dim: int, dropout_p: float):
     wq: Tensor = randn([d_model, d_model])
 model SwiGLUFFN(d_model: int, d_ff: int, dropout_p: float):
     w_gate: Tensor = randn([d_model, d_ff])
-model TransformerBlock(d_model: int, n_heads: int, n_kv_heads: int, d_ff: int, dropout_p: float):
-    attn: GroupedQueryAttention = GroupedQueryAttention(d_model, n_heads, n_kv_heads, dropout_p)
+model TransformerBlock(d_model: int, n_heads: int, n_kv_heads: int, head_dim: int, d_ff: int, dropout_p: float):
+    attn: GroupedQueryAttention = GroupedQueryAttention(d_model, n_heads, n_kv_heads, head_dim, dropout_p)
     ffn: SwiGLUFFN = SwiGLUFFN(d_model, d_ff, dropout_p)
     norm: RMSNorm = RMSNorm(d_model)
 model ConstNet:
     embed: Tensor = randn([1000, 256])
-    blocks: [TransformerBlock; 2] = TransformerBlock(D_MODEL, N_HEADS, N_KV_HEADS, D_FF, 0.1)
+    blocks: [TransformerBlock; 2] = TransformerBlock(D_MODEL, N_HEADS, N_KV_HEADS, HEAD_DIM, D_FF, 0.1)
 "#;
 
     const UNRESOLVABLE: &str = r#"
-model GroupedQueryAttention(d_model: int, n_heads: int, n_kv_heads: int, dropout_p: float):
+model GroupedQueryAttention(d_model: int, n_heads: int, n_kv_heads: int, head_dim: int, dropout_p: float):
     wq: Tensor = randn([d_model, d_model])
 model SwiGLUFFN(d_model: int, d_ff: int, dropout_p: float):
     w_gate: Tensor = randn([d_model, d_ff])
-model TransformerBlock(d_model: int, n_heads: int, n_kv_heads: int, d_ff: int, dropout_p: float):
-    attn: GroupedQueryAttention = GroupedQueryAttention(d_model, mystery, n_kv_heads, dropout_p)
+model TransformerBlock(d_model: int, n_heads: int, n_kv_heads: int, head_dim: int, d_ff: int, dropout_p: float):
+    attn: GroupedQueryAttention = GroupedQueryAttention(d_model, mystery, n_kv_heads, head_dim, dropout_p)
     ffn: SwiGLUFFN = SwiGLUFFN(d_model, d_ff, dropout_p)
     norm: RMSNorm = RMSNorm(d_model)
 model BadNet:
     embed: Tensor = randn([1000, 256])
-    blocks: [TransformerBlock; 2] = TransformerBlock(256, 8, 4, 512, 0.1)
+    blocks: [TransformerBlock; 2] = TransformerBlock(256, 8, 4, 32, 512, 0.1)
 "#;
 
     #[test]
@@ -783,17 +802,17 @@ model BadNet:
 @cep_search(target = h100, objective = param_efficiency)
 @search(d_model, [256, 384, 512])
 @search(n_heads, [4, 6, 8])
-model GroupedQueryAttention(d_model: int, n_heads: int, n_kv_heads: int, dropout_p: float):
+model GroupedQueryAttention(d_model: int, n_heads: int, n_kv_heads: int, head_dim: int, dropout_p: float):
     wq: Tensor = randn([d_model, d_model])
 model SwiGLUFFN(d_model: int, d_ff: int, dropout_p: float):
     w_gate: Tensor = randn([d_model, d_ff])
-model TransformerBlock(d_model: int, n_heads: int, n_kv_heads: int, d_ff: int, dropout_p: float):
-    attn: GroupedQueryAttention = GroupedQueryAttention(d_model, n_heads, n_kv_heads, dropout_p)
+model TransformerBlock(d_model: int, n_heads: int, n_kv_heads: int, head_dim: int, d_ff: int, dropout_p: float):
+    attn: GroupedQueryAttention = GroupedQueryAttention(d_model, n_heads, n_kv_heads, head_dim, dropout_p)
     ffn: SwiGLUFFN = SwiGLUFFN(d_model, d_ff, dropout_p)
     norm: RMSNorm = RMSNorm(d_model)
 model SearchNet:
     embed: Tensor = randn([4096, 384]) * full([1], 0.02)
-    blocks: [TransformerBlock; 6] = TransformerBlock(384, 6, 3, 1024, 0.1)
+    blocks: [TransformerBlock; 6] = TransformerBlock(384, 6, 3, 64, 1024, 0.1)
 "#;
 
     #[test]
@@ -814,17 +833,17 @@ model SearchNet:
     fn refuses_unknown_search_axis() {
         let src = r#"
 @search(bogus_axis, [1, 2, 3])
-model GroupedQueryAttention(d_model: int, n_heads: int, n_kv_heads: int, dropout_p: float):
+model GroupedQueryAttention(d_model: int, n_heads: int, n_kv_heads: int, head_dim: int, dropout_p: float):
     wq: Tensor = randn([d_model, d_model])
 model SwiGLUFFN(d_model: int, d_ff: int, dropout_p: float):
     w_gate: Tensor = randn([d_model, d_ff])
-model TransformerBlock(d_model: int, n_heads: int, n_kv_heads: int, d_ff: int, dropout_p: float):
-    attn: GroupedQueryAttention = GroupedQueryAttention(d_model, n_heads, n_kv_heads, dropout_p)
+model TransformerBlock(d_model: int, n_heads: int, n_kv_heads: int, head_dim: int, d_ff: int, dropout_p: float):
+    attn: GroupedQueryAttention = GroupedQueryAttention(d_model, n_heads, n_kv_heads, head_dim, dropout_p)
     ffn: SwiGLUFFN = SwiGLUFFN(d_model, d_ff, dropout_p)
     norm: RMSNorm = RMSNorm(d_model)
 model AxNet:
     embed: Tensor = randn([1000, 256])
-    blocks: [TransformerBlock; 2] = TransformerBlock(256, 8, 4, 512, 0.1)
+    blocks: [TransformerBlock; 2] = TransformerBlock(256, 8, 4, 32, 512, 0.1)
 "#;
         let (module, interner) = parse(src);
         let resolve = |s: nsl_ast::Symbol| interner.resolve(s.0).unwrap_or("").to_string();

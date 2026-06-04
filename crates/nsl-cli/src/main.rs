@@ -1123,6 +1123,7 @@ fn main_inner() {
                     sparsity: cep_sparsity,
                     cep_out,
                     cep_emit_weights,
+                    cep_emit_source: None,
                 };
                 std::process::exit(run_cep_joint(&file, weights.as_deref(), &ov));
             }

@@ -58,7 +58,7 @@ Repository documentation and research artifacts are organized under `spec/`, `do
 ```python
 model TransformerBlock(d_model: int, n_heads: int):
     attn_norm: RMSNorm = RMSNorm(d_model)
-    attn: GroupedQueryAttention = GroupedQueryAttention(d_model, n_heads, 4, 0.1)
+    attn: GroupedQueryAttention = GroupedQueryAttention(d_model, n_heads, 4, d_model // n_heads, 0.1)
     ffn: SwiGLUFFN = SwiGLUFFN(d_model, d_model * 4, 0.1)
 
     fn forward(self, x: Tensor, training: bool) -> Tensor:
