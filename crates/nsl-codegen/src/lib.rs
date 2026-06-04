@@ -114,6 +114,7 @@ pub mod ownership;
 pub mod ownership_expr;
 pub mod pca_activation;
 pub mod pca_detect;
+pub mod pca_per_doc;
 pub mod pca_rope;
 pub mod pca_segment;
 pub mod pca_tier_b;
