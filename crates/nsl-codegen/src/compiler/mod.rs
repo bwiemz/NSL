@@ -509,6 +509,16 @@ pub struct Compiler<'a> {
     /// compiled, or if WRGA was disabled.
     pub last_wrga_plan: Option<crate::wrga::WrgaPlan>,
 
+    // ── CFTP §4.4 G3 side-channel (Sprint 2) ─────────────────────────
+    /// `@fused_lm_ce(...)` decorator configs for this compile, forwarded
+    /// from `CompileOptions.fused_ce_configs`.  Empty when no decorator
+    /// is present.  Sprint 2 stores these without consuming them; Sprint
+    /// 2.5 will read `fused_ce_configs[0].enabled` at the cross_entropy
+    /// lowering site to drive substitution toward `nsl_fused_linear_ce_*`
+    /// FFIs.  The marker comment in `wengert_lower.rs::PrimalOp::CrossEntropyLoss`
+    /// documents the deferred substitution site.
+    pub fused_ce_configs: Vec<crate::FusedCeDecoratorConfig>,
+
     // ── CPDT side-channel (pipeline integration) ─────────────────────
     /// CPDT mode requested via CLI. `Off` → planner does not run.
     pub cpdt_mode: crate::cpdt::CpdtMode,
@@ -773,6 +783,7 @@ impl<'a> Compiler<'a> {
             csha_fused_bwd_cache: HashMap::new(),
             wrga_inputs: options.wrga_inputs.clone(),
             last_wrga_plan: None,
+            fused_ce_configs: options.fused_ce_configs.clone(),
             cpdt_mode: options.cpdt_mode,
             cpdt_cluster: options.cpdt_cluster.clone(),
             cpdt_plan: None,

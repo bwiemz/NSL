@@ -481,6 +481,34 @@ pub enum AdapterKind {
     GatedLora,
 }
 
+/// CFTP §4.4 G3 (Sprint 2): codegen-side mirror of
+/// `nsl_semantic::cftp::FusedCeConfig`.
+///
+/// Derived from `AnalysisResult.fused_ce_configs` and forwarded into
+/// `CompileOptions.fused_ce_configs` by the CLI bridge.  Kept as a
+/// codegen-side newtype so nsl-codegen does NOT depend on nsl-semantic
+/// directly (matches the `WrgaInputs` / `FreezeDecoratorConfig` pattern).
+///
+/// v1 carries the two knobs surfaced by the decorator parser:
+///
+/// * `enabled` — whether the fused linear-CE kernel should fire on
+///   matching cross_entropy occurrences inside the decorated `train` block.
+/// * `vocab_tile` — explicit vocab-tile override (must be a multiple of
+///   128, validated in semantic).  `None` falls back to the codegen
+///   default (`FusedLinearCEConfig::default().vocab_tile` = 1024).
+///
+/// Sprint 2 wires only the plumbing; the lowering-site auto-substitution
+/// is documented as deferred to Sprint 2.5 — see the inline marker near
+/// `PrimalOp::CrossEntropyLoss` in `wengert_lower.rs`.
+#[derive(Debug, Clone)]
+pub struct FusedCeDecoratorConfig {
+    /// `enabled = true|false` from the decorator. Defaults to `false` if
+    /// the keyword arg is missing (preserves opt-in semantics).
+    pub enabled: bool,
+    /// `vocab_tile = N` override. `None` → codegen default.
+    pub vocab_tile: Option<u32>,
+}
+
 /// User-facing knob that gates how WGGO scores head importance.
 /// - `Auto`: use gradient scoring when a calibration sidecar is present
 ///   (with per-layer magnitude fallback); otherwise pure magnitude.
@@ -568,6 +596,11 @@ pub struct CompileOptions {
     pub shared_lib: bool,
     /// WRGA: decorator configs forwarded from nsl-semantic (Task 1 of bridge).
     pub wrga_inputs: Option<WrgaInputs>,
+    /// CFTP §4.4 G3 (Sprint 2): `@fused_lm_ce(...)` configs forwarded from
+    /// nsl-semantic.  Empty when no decorator is present; codegen consults
+    /// the first `enabled = true` entry to gate the fused linear-CE
+    /// kernel emission (Sprint 2.5 substitution; v1 plumbing-only).
+    pub fused_ce_configs: Vec<FusedCeDecoratorConfig>,
     /// WRGA Milestone B.2 Task 3: fold WRGA memory hints into real
     /// allocations (vs. B.1's observational-only path). Default false.
     pub wrga_fold_allocations: bool,
@@ -698,6 +731,7 @@ impl Default for CompileOptions {
             debug_training: false,
             shared_lib: false,
             wrga_inputs: None,
+            fused_ce_configs: Vec::new(),
             wrga_fold_allocations: false,
             wggo_mode: None,
             wggo_report: false,
