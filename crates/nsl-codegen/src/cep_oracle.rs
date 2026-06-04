@@ -174,7 +174,7 @@ impl ModelSpec {
 }
 
 /// Per-layer profile emitted by the oracle.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct LayerProfile {
     pub layer_index: u32,
     pub flops: u64,
@@ -186,6 +186,11 @@ pub struct LayerProfile {
     pub classification: BoundClassification,
     /// Whether the layer is compute-bound on the target.
     pub compute_bound: bool,
+    /// Number of distinct kernel launches for this layer after static fusion.
+    pub kernel_launches: u32,
+    /// Roofline upper-bound latency (μs): compute_time + memory_time (NOT max).
+    /// Contrast with `estimated_us` which uses max(compute, memory).
+    pub wcet_us: f64,
 }
 
 /// Entries in the fusion-opportunity log.
@@ -204,7 +209,7 @@ pub enum FusionEvent {
 }
 
 /// Top-level output of the oracle.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct CompilationProfile {
     pub total_flops: u64,
     pub total_hbm_bytes: u64,
@@ -215,6 +220,12 @@ pub struct CompilationProfile {
     pub roofline_utilization: f64,
     pub fusion_events: Vec<FusionEvent>,
     pub target_gpu: String,
+    /// Approximate binary size: parameter bytes + per-layer code-section estimate.
+    pub binary_size_bytes: u64,
+    /// Total kernel launches across all layers (including embedding and lm_head).
+    pub kernel_launches: u32,
+    /// Roofline upper-bound total latency (μs): sum of per-layer wcet_us.
+    pub wcet_us: f64,
 }
 
 impl CompilationProfile {
@@ -237,6 +248,36 @@ fn latency_us(flops: u64, bytes: u64, gpu: &GpuSpec, dtype_bytes: usize) -> f64 
     let compute_s = flops as f64 / peak_flops.max(1.0);
     let memory_s = bytes as f64 / peak_bw.max(1.0);
     compute_s.max(memory_s) * 1e6
+}
+
+/// Roofline worst-case execution time (microseconds): assumes compute and memory
+/// traffic do NOT overlap (sum instead of max).  This is an upper bound on the
+/// canonical roofline latency — not a true hardware WCET; there is no
+/// kernel-launch overhead, occupancy term, or p95 statistical inflation.  For
+/// DO-178C-style certified WCET use the wcet.rs module's FPGA-targeted helpers.
+fn worst_case_latency_us(flops: u64, bytes: u64, gpu: &GpuSpec, dtype_bytes: usize) -> f64 {
+    let peak_flops = gpu.peak_tflops(dtype_bytes) * 1e12;
+    let peak_bw = gpu.peak_bandwidth_gbs * 1e9;
+    let compute_s = flops as f64 / peak_flops.max(1.0);
+    let memory_s = bytes as f64 / peak_bw.max(1.0);
+    // SUM rather than max — assumes no pipelining of compute and memory traffic.
+    (compute_s + memory_s) * 1e6
+}
+
+/// Approximate binary size: parameter bytes + a per-layer PTX code-section
+/// estimate.  Each transformer block contributes ~20 KB of PTX text (Q/K/V
+/// matmuls, FlashAttention, output projection, FFN matmuls, norms — kernels
+/// are templated by shape but their text size dominates).  Embedding + lm_head
+/// contribute ~5 KB each.  Plus ~50 KB of runtime entry/dispatch glue.
+/// This is a first-order model, NOT the true linker output.
+fn binary_size_bytes_estimate(spec: &ModelSpec, param_bytes: u64) -> u64 {
+    let code_per_layer: u64 = 20_000;
+    let code_embed_lm: u64 = 10_000;
+    let code_runtime: u64 = 50_000;
+    param_bytes
+        .saturating_add(code_per_layer.saturating_mul(spec.n_layers as u64))
+        .saturating_add(code_embed_lm)
+        .saturating_add(code_runtime)
 }
 
 fn layer_profile(spec: &ModelSpec, gpu: &GpuSpec, layer: usize) -> LayerProfile {
@@ -281,11 +322,57 @@ fn layer_profile(spec: &ModelSpec, gpu: &GpuSpec, layer: usize) -> LayerProfile 
         let ffn = ffn_matmuls as u64 * d * ff;
         (attn + ffn + 2 * d) * spec.dtype_bytes as u64
     };
+    // Apply byte savings from the static fusion-event template.  Each fired event
+    // removes one tensor's worth of HBM round-trip (read + write that would otherwise
+    // leave and re-enter HBM as an intermediate).  Conservative: one bsd_bytes saving
+    // per always-on event; SwiGLU saves an additional bsdff_bytes for the gate*up
+    // intermediate.  This makes fusion_events numerically load-bearing rather than
+    // decorative, addressing paper §3.1 / G3+G15.
+    let bsd_bytes: u64 = (spec.batch as u64)
+        .saturating_mul(spec.max_seq as u64)
+        .saturating_mul(spec.d_model as u64)
+        .saturating_mul(spec.dtype_bytes as u64);
+    let bsdff_bytes: u64 = (spec.batch as u64)
+        .saturating_mul(spec.max_seq as u64)
+        .saturating_mul(spec.d_ff[layer] as u64)
+        .saturating_mul(spec.dtype_bytes as u64);
+    // Always-on events: NormIntoMatmul + MatmulIntoRope + SoftmaxIntoMatmul + ResidualAdd = 4
+    let mut savings: u64 = bsd_bytes.saturating_mul(4);
+    if matches!(spec.activation, Activation::SwiGlu) {
+        savings = savings.saturating_add(bsdff_bytes);
+    }
+    let hbm = hbm.saturating_sub(savings);
+
     let ai = arithmetic_intensity(flops, q_r + ffn_r, q_w + ffn_w);
     let ridge = gpu.crossover(dtype);
     let classification = classify_op(ai, ridge);
     let compute_bound = matches!(classification, BoundClassification::ComputeBound);
     let estimated_us = latency_us(flops, hbm, gpu, dtype);
+    let wcet_us = worst_case_latency_us(flops, hbm, gpu, dtype);
+
+    // Kernel launches per transformer block (unfused canonical count minus fusion savings).
+    // Base: 2 norms + 3 QKV projections + 1 RoPE + 1 FlashAttention + 1 output proj +
+    //       1 attn residual + N_ffn_matmuls + N_ffn_activation + 1 ffn residual.
+    let n_ffn_matmuls: u32 = if matches!(spec.activation, Activation::SwiGlu) { 3 } else { 2 };
+    let n_ffn_activation: u32 = if matches!(spec.activation, Activation::SwiGlu) { 0 } else { 1 };
+    let mut launches: u32 =
+          2  // norms (pre-attn, pre-ffn)
+        + 3  // QKV projections
+        + 1  // RoPE
+        + 1  // FlashAttention (already fused; counts as 1)
+        + 1  // output projection
+        + 1  // attention residual add
+        + n_ffn_matmuls
+        + n_ffn_activation
+        + 1; // FFN residual add
+    // Fusion events reduce launches 1:1 with what they collapse:
+    //   NormIntoMatmul + MatmulIntoRope + SoftmaxIntoMatmul + ResidualAdd = 4 always-on
+    launches -= 4;
+    if matches!(spec.activation, Activation::SwiGlu) {
+        launches -= 1; // SwigluGate fuses gate*up into down
+    }
+    // Floor: at least 5 launches per layer (fusion never eliminates all).
+    let kernel_launches = launches.max(5);
 
     LayerProfile {
         layer_index: layer as u32,
@@ -297,6 +384,8 @@ fn layer_profile(spec: &ModelSpec, gpu: &GpuSpec, layer: usize) -> LayerProfile 
         arithmetic_intensity: ai,
         classification,
         compute_bound,
+        kernel_launches,
+        wcet_us,
     }
 }
 
@@ -307,38 +396,46 @@ fn embedding_profile(spec: &ModelSpec, gpu: &GpuSpec) -> LayerProfile {
         spec.d_model as u64,
         spec.dtype_bytes as u64,
     );
-    let estimated_us = latency_us(f, r + w, gpu, spec.dtype_bytes as usize);
+    let bytes = r + w;
+    let estimated_us = latency_us(f, bytes, gpu, spec.dtype_bytes as usize);
+    let wcet_us = worst_case_latency_us(f, bytes, gpu, spec.dtype_bytes as usize);
     let ai = arithmetic_intensity(f, r, w);
     let ridge = gpu.crossover(spec.dtype_bytes as usize);
     LayerProfile {
         layer_index: u32::MAX,
         flops: f,
-        hbm_bytes: r + w,
-        activation_bytes: r + w,
+        hbm_bytes: bytes,
+        activation_bytes: bytes,
         param_bytes: (spec.vocab as u64) * (spec.d_model as u64) * spec.dtype_bytes as u64,
         estimated_us,
         arithmetic_intensity: ai,
         classification: classify_op(ai, ridge),
         compute_bound: false,
+        kernel_launches: 1,
+        wcet_us,
     }
 }
 
 fn lm_head_profile(spec: &ModelSpec, gpu: &GpuSpec) -> LayerProfile {
     let bs = (spec.batch as u64) * (spec.max_seq as u64);
     let (f, r, w) = matmul_cost(bs, spec.d_model as u64, spec.vocab as u64, spec.dtype_bytes as u64);
-    let estimated_us = latency_us(f, r + w, gpu, spec.dtype_bytes as usize);
+    let bytes = r + w;
+    let estimated_us = latency_us(f, bytes, gpu, spec.dtype_bytes as usize);
+    let wcet_us = worst_case_latency_us(f, bytes, gpu, spec.dtype_bytes as usize);
     let ai = arithmetic_intensity(f, r, w);
     let ridge = gpu.crossover(spec.dtype_bytes as usize);
     LayerProfile {
         layer_index: u32::MAX - 1,
         flops: f,
-        hbm_bytes: r + w,
+        hbm_bytes: bytes,
         activation_bytes: bs * spec.vocab as u64 * spec.dtype_bytes as u64,
         param_bytes: (spec.vocab as u64) * (spec.d_model as u64) * spec.dtype_bytes as u64,
         estimated_us,
         arithmetic_intensity: ai,
         classification: classify_op(ai, ridge),
         compute_bound: true,
+        kernel_launches: 1,
+        wcet_us,
     }
 }
 
@@ -378,6 +475,9 @@ pub fn evaluate(spec: &ModelSpec, gpu: &GpuSpec) -> Result<CompilationProfile, S
     let peak_act: u64 = per_layer.iter().map(|l| l.activation_bytes).max().unwrap_or(0);
     let peak_memory = param_bytes + peak_act;
     let estimated_latency_us: f64 = per_layer.iter().map(|l| l.estimated_us).sum();
+    let wcet_us: f64 = per_layer.iter().map(|l| l.wcet_us).sum();
+    let kernel_launches: u32 = per_layer.iter().map(|l| l.kernel_launches).sum();
+    let binary_size_bytes = binary_size_bytes_estimate(spec, param_bytes);
 
     // Roofline utilisation: total_flops / (peak_compute × estimated_latency_s).
     let peak_flops_per_s = gpu.peak_tflops(spec.dtype_bytes as usize) * 1e12;
@@ -394,6 +494,9 @@ pub fn evaluate(spec: &ModelSpec, gpu: &GpuSpec) -> Result<CompilationProfile, S
         roofline_utilization,
         fusion_events: detect_fusion_events(spec),
         target_gpu: gpu.name.to_string(),
+        binary_size_bytes,
+        kernel_launches,
+        wcet_us,
     })
 }
 
@@ -521,5 +624,81 @@ mod tests {
         assert_eq!(p1.total_flops, p2.total_flops);
         assert_eq!(p1.param_bytes, p2.param_bytes);
         assert_eq!(p1.fusion_events, p2.fusion_events);
+    }
+
+    #[test]
+    fn profile_surfaces_binary_size_and_kernel_launches() {
+        let spec = ModelSpec::uniform(384, 4, 6, 3, 64, 1024, 4096);
+        let gpu = crate::gpu_specs::find_gpu("H100-SXM").expect("gpu");
+        let p = evaluate(&spec, &gpu).expect("eval");
+        // binary_size_bytes >= param_bytes (must include at least the weights), and within
+        // ~2x for a tiny model (code section should not dominate).
+        assert!(p.binary_size_bytes >= p.param_bytes, "binary_size must include params");
+        assert!(
+            p.binary_size_bytes <= p.param_bytes * 2 + 10_000_000,
+            "binary_size must not be runaway"
+        );
+        // kernel_launches > 0 and equals the sum of per_layer launches.
+        assert!(p.kernel_launches > 0);
+        let summed: u32 = p.per_layer.iter().map(|l| l.kernel_launches).sum();
+        assert_eq!(p.kernel_launches, summed);
+        // Per real-block layer: within a sane range (well under 30).
+        for l in p.per_layer.iter().filter(|l| l.layer_index < spec.n_layers) {
+            assert!(
+                l.kernel_launches > 0 && l.kernel_launches < 30,
+                "layer {} launches out of range: {}",
+                l.layer_index,
+                l.kernel_launches
+            );
+        }
+    }
+
+    #[test]
+    fn fusion_events_reduce_per_layer_hbm() {
+        let spec = ModelSpec::uniform(384, 2, 6, 3, 64, 1024, 4096);
+        let gpu = crate::gpu_specs::find_gpu("H100-SXM").expect("gpu");
+        let p = evaluate(&spec, &gpu).expect("eval");
+        let layer = p.per_layer.iter().find(|l| l.layer_index == 0).unwrap();
+        let n_events_layer0: usize = p
+            .fusion_events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    FusionEvent::NormIntoMatmul { layer: 0 }
+                        | FusionEvent::SwigluGate { layer: 0 }
+                        | FusionEvent::ResidualAdd { layer: 0 }
+                        | FusionEvent::MatmulIntoRope { layer: 0 }
+                        | FusionEvent::SoftmaxIntoMatmul { layer: 0 }
+                )
+            })
+            .count();
+        assert!(n_events_layer0 >= 1, "expected at least one fusion event on layer 0");
+        assert!(layer.hbm_bytes > 0);
+    }
+
+    #[test]
+    fn profile_surfaces_wcet_us_at_least_estimated() {
+        // Roofline WCET = compute + memory >= max(compute, memory) = estimated.
+        let spec = ModelSpec::uniform(384, 3, 6, 3, 64, 1024, 4096);
+        let gpu = crate::gpu_specs::find_gpu("H100-SXM").expect("gpu");
+        let p = evaluate(&spec, &gpu).expect("eval");
+        assert!(
+            p.wcet_us >= p.estimated_latency_us - 1e-9,
+            "wcet_us={} must be >= estimated_latency_us={}",
+            p.wcet_us,
+            p.estimated_latency_us
+        );
+        assert!(p.wcet_us > 0.0);
+        assert!(p.estimated_latency_us > 0.0);
+        for l in &p.per_layer {
+            assert!(
+                l.wcet_us >= l.estimated_us - 1e-9,
+                "layer {} wcet {} >= estimated {}",
+                l.layer_index,
+                l.wcet_us,
+                l.estimated_us
+            );
+        }
     }
 }

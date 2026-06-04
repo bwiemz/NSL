@@ -280,7 +280,7 @@ fn synthetic_importance(spec: &ModelSpec, slacks: &RooflineSlackTable) -> Import
 // These DTOs pin the on-disk schema independently of the core layout.
 // ---------------------------------------------------------------------------
 
-const CEP_DELTA_VERSION: u32 = 1;
+const CEP_DELTA_VERSION: u32 = 2;
 
 // NOTE: these emit the delta-JSON contract spelling (lowercase, no underscore),
 // intentionally distinct from cep_oracle's `as_str()` ("rms_norm"). Do not merge.
@@ -308,7 +308,8 @@ struct SpecDto {
     n_layers: u32,
     n_heads: Vec<u32>,
     n_kv_heads: Vec<u32>,
-    head_dim: u32,
+    /// Per-layer head dimensions (replaces the old scalar `head_dim`; schema v2+).
+    head_dims: Vec<u32>,
     d_ff: Vec<u32>,
     activation: &'static str,
     norm: &'static str,
@@ -322,7 +323,7 @@ impl SpecDto {
             n_layers: s.n_layers,
             n_heads: s.n_heads.clone(),
             n_kv_heads: s.n_kv_heads.clone(),
-            head_dim: s.head_dim.first().copied().unwrap_or(0),
+            head_dims: s.head_dim.clone(),
             d_ff: s.d_ff.clone(),
             activation: activation_str(s.activation),
             norm: norm_str(s.norm),
@@ -872,7 +873,7 @@ mod bridge_tests {
         let mut s = String::new();
         std::fs::File::open(&path).unwrap().read_to_string(&mut s).unwrap();
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
-        assert_eq!(v["cep_version"], 1);
+        assert_eq!(v["cep_version"], 2);
         assert_eq!(v["mode"], "prune");
         assert_eq!(v["target"], "H100-SXM");
         assert!(v["baseline_profile"]["param_bytes"].is_number());
@@ -921,6 +922,37 @@ mod bridge_tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn delta_json_preserves_per_layer_head_dim() {
+        // Build a spec with HETEROGENEOUS head_dim per layer and confirm the serialized
+        // DTO carries them all as an array (not just the first scalar value).
+        let mut baseline = spec(); // n_layers=6
+        baseline.head_dim = vec![64, 64, 64, 64, 32, 32]; // mix two values
+        let cfg = prune_cfg();
+        let input =
+            build_prune_input(&cfg, baseline.clone(), None, "H100-SXM", Some(0.2)).expect("input");
+        let plan = run_prune(input);
+
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("delta.cep.json");
+        write_prune_delta(&plan, &baseline, &out).unwrap();
+        let txt = std::fs::read_to_string(&out).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&txt).unwrap();
+
+        // Schema v2: field is now `head_dims` (Vec<u32>), not a scalar `head_dim`.
+        let dims = v
+            .pointer("/chosen/spec/head_dims")
+            .expect("chosen.spec.head_dims must exist in schema v2");
+        assert!(dims.is_array(), "head_dims must serialize as a JSON array");
+        let dims_u32: Vec<u32> = dims
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_u64().unwrap() as u32)
+            .collect();
+        assert_eq!(dims_u32, vec![64, 64, 64, 64, 32, 32]);
     }
 
     #[test]
