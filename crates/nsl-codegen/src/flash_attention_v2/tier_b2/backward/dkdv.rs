@@ -167,6 +167,10 @@ fn emit_register_decls(ptx: &mut String, config: &FlashAttentionConfig) {
     // C2 cp.async V-tile registers (kv-outer resident; prefixed %c2_*).
     ptx.push_str("    .reg .u32 %c2_kv_tile_start, %c2_lane_byte_off, %c2_smem_base32, %c2_smem_dst;\n");
     ptx.push_str("    .reg .u64 %c2_v_hbm_off, %c2_v_hbm_base, %c2_lane_hbm_addr, %c2_smem_base64;\n");
+    // GQA kv-head scratch (paper s4.2 zero-copy stride): used by emit_kv_head_divisor
+    // in C1 (K-load) and C2 (V-load). Declared unconditionally; gqa_group_size=1 never
+    // writes it. %c12_kv_head signals shared use across C1/C2 K/V producer load sites.
+    ptx.push_str("    .reg .u32 %c12_kv_head;\n");
     // C3 cp.async Q-tile registers (q-inner per-iteration; prefixed %c3_*).
     ptx.push_str("    .reg .u32 %c3_q_tile_start, %c3_lane_byte_off, %c3_smem_base32, %c3_smem_dst;\n");
     ptx.push_str("    .reg .u64 %c3_q_hbm_off, %c3_q_hbm_base, %c3_lane_hbm_addr, %c3_smem_base64;\n");
@@ -388,12 +392,21 @@ fn emit_k_producer_load(ptx: &mut String, config: &FlashAttentionConfig) {
         "    mul.lo.u32 %c1_kv_tile_start, %kv_iter, {bkv};\n"
     ));
 
-    // HBM byte offset for K[batch_idx, head, kv_tile_start, 0].
+    // GQA zero-copy stride (paper s4.2): kv_head = q_head / gqa_group_size.
+    // Byte-identical no-op when gqa_group_size == 1.
+    let kv_head_reg = crate::flash_attention_v2::tier_b2::backward::hbm_addr::emit_kv_head_divisor(
+        ptx,
+        "%head",
+        "%c12_kv_head",
+        config.gqa_group_size,
+    );
+
+    // HBM byte offset for K[batch_idx, kv_head, kv_tile_start, 0].
     crate::flash_attention_v2::tier_b2::backward::hbm_addr::emit_4d_byte_offset(
         ptx,
         "%c1_k_hbm_off",
         "%batch_idx",
-        "%head",
+        kv_head_reg,
         "%c1_kv_tile_start",
         "0",        // d=0: column index (full row loaded via multi-chunk loop)
         "%heads_r",
@@ -472,12 +485,23 @@ fn emit_v_producer_load(ptx: &mut String, config: &FlashAttentionConfig) {
         "    mul.lo.u32 %c2_kv_tile_start, %kv_iter, {bkv};\n"
     ));
 
-    // HBM byte offset for V[batch_idx, head, kv_tile_start, 0].
+    // GQA zero-copy stride (paper s4.2): kv_head = q_head / gqa_group_size.
+    // Byte-identical no-op when gqa_group_size == 1. Reuses %c12_kv_head
+    // already written by the C1 K-load earlier in the same kv_iter — both
+    // K and V live at the same kv-head slot in the source tensors.
+    let kv_head_reg = crate::flash_attention_v2::tier_b2::backward::hbm_addr::emit_kv_head_divisor(
+        ptx,
+        "%head",
+        "%c12_kv_head",
+        config.gqa_group_size,
+    );
+
+    // HBM byte offset for V[batch_idx, kv_head, kv_tile_start, 0].
     crate::flash_attention_v2::tier_b2::backward::hbm_addr::emit_4d_byte_offset(
         ptx,
         "%c2_v_hbm_off",
         "%batch_idx",
-        "%head",
+        kv_head_reg,
         "%c2_kv_tile_start",
         "0",        // d=0: column index (full row loaded via multi-chunk loop)
         "%heads_r",
@@ -1824,5 +1848,69 @@ mod tests {
     fn synthesize_dkdv_kernel_entry_name_present() {
         let ptx = synthesize_dkdv_kernel(&canonical_cfg()).expect("synth ok");
         assert!(ptx.contains("tier_b2_dkdv_kernel"), "entry name must appear in PTX");
+    }
+
+    // -------------------------------------------------------------------
+    // Sprint 5 — GQA zero-copy stride pattern (paper s4.2). Mirrors the
+    // dq.rs counterpart tests for the dkdv kernel: C1 (K-load) and C2
+    // (V-load) sites consume `kv_head = q_head / gqa_group_size` for HBM
+    // addressing; gqa_group_size==1 path is byte-identical to baseline.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn synthesize_dkdv_kernel_emits_gqa_divisor_when_group_size_gt_one() {
+        let cfg = FlashAttentionConfig {
+            gqa_group_size: 4,
+            ..canonical_cfg()
+        };
+        let ptx = synthesize_dkdv_kernel(&cfg).expect("synth ok");
+
+        // (1) Each of C1 (K-load) and C2 (V-load) must emit the GQA divisor.
+        let div_count = ptx.matches("div.u32 %c12_kv_head, %head, 4;").count();
+        assert!(
+            div_count >= 2,
+            "expected >= 2 GQA div.u32 emissions (C1 K-load + C2 V-load), got {div_count}.\nPTX:\n{ptx}"
+        );
+
+        // (2) The %c12_kv_head register must be declared.
+        assert!(
+            ptx.contains(".reg .u32 %c12_kv_head;"),
+            "GQA kv_head scratch register must be declared"
+        );
+
+        // (3) emit_4d_byte_offset must consume %c12_kv_head at K and V sites.
+        let h_uses = ptx
+            .matches("add.u32    %row_index_tmp, %row_index_tmp, %c12_kv_head;")
+            .count();
+        assert!(
+            h_uses >= 2,
+            "kv_head_reg %c12_kv_head must reach emit_4d_byte_offset at K/V sites; got {h_uses}"
+        );
+    }
+
+    #[test]
+    fn synthesize_dkdv_kernel_byte_identical_at_gqa_one() {
+        let cfg = canonical_cfg();
+        let ptx = synthesize_dkdv_kernel(&cfg).expect("synth ok");
+        assert!(
+            !ptx.contains("div.u32 %c12_kv_head"),
+            "gqa_group_size=1 must NOT emit the GQA div.u32 (byte-identity guarantee)"
+        );
+        let kvh_mentions = ptx.matches("%c12_kv_head").count();
+        assert_eq!(
+            kvh_mentions, 1,
+            "gqa_group_size=1 must reference %c12_kv_head exactly once (the .reg decl); got {kvh_mentions}.\nMatches:\n{}",
+            ptx.lines().filter(|l| l.contains("%c12_kv_head")).collect::<Vec<_>>().join("\n")
+        );
+        // Inert scratch decl is allowed (keeps .reg pool stable).
+        assert!(ptx.contains(".reg .u32 %c12_kv_head;"));
+        // The K/V producer sites must still wire %head directly.
+        let h_uses = ptx
+            .matches("add.u32    %row_index_tmp, %row_index_tmp, %head;")
+            .count();
+        assert!(
+            h_uses >= 2,
+            "non-GQA path must wire %head directly into K (C1) and V (C2) loads; got {h_uses}"
+        );
     }
 }

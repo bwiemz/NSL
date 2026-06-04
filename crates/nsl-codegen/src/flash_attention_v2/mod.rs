@@ -432,8 +432,25 @@ fn emit_k_tile_load(ptx: &mut String, config: &FlashAttentionConfig, q_iter: u32
     }
 
     // K base global address.
-    ptx.push_str("    mul.lo.u64 %rd58, %batch_idx, %rd5;      // batch*heads\n");
-    ptx.push_str("    add.u64 %rd58, %rd58, %head_idx;         // + head\n");
+    // GQA zero-copy stride (paper s4.2): when gqa_group_size > 1, divide
+    // head_idx by the group size before composing the row index, so
+    // multiple Q-heads alias to the same kv-head slot in the K tensor.
+    // Byte-identical no-op when gqa_group_size == 1.
+    if config.gqa_group_size > 1 {
+        ptx.push_str(&format!(
+            "    // GQA: kv_head = q_head / {} (paper s4.2 zero-copy)\n",
+            config.gqa_group_size
+        ));
+        ptx.push_str(&format!(
+            "    div.u64 %rd57, %head_idx, {};\n",
+            config.gqa_group_size
+        ));
+        ptx.push_str("    mul.lo.u64 %rd58, %batch_idx, %rd5;      // batch*heads\n");
+        ptx.push_str("    add.u64 %rd58, %rd58, %rd57;             // + kv_head\n");
+    } else {
+        ptx.push_str("    mul.lo.u64 %rd58, %batch_idx, %rd5;      // batch*heads\n");
+        ptx.push_str("    add.u64 %rd58, %rd58, %head_idx;         // + head\n");
+    }
     ptx.push_str("    mul.lo.u64 %rd58, %rd58, %rd6;            // * seq_len\n");
     ptx.push_str("    add.u64 %rd58, %rd58, %k_start;           // + k_start\n");
     ptx.push_str("    mul.lo.u64 %rd58, %rd58, %rd7;            // * head_dim\n");
@@ -487,8 +504,23 @@ fn emit_v_tile_load(ptx: &mut String, config: &FlashAttentionConfig, q_iter: u32
         ));
     }
 
-    ptx.push_str("    mul.lo.u64 %rd58, %batch_idx, %rd5;\n");
-    ptx.push_str("    add.u64 %rd58, %rd58, %head_idx;\n");
+    // GQA zero-copy stride (paper s4.2): kv_head = q_head / gqa_group_size.
+    // Byte-identical no-op when gqa_group_size == 1.
+    if config.gqa_group_size > 1 {
+        ptx.push_str(&format!(
+            "    // GQA: kv_head = q_head / {} (paper s4.2 zero-copy)\n",
+            config.gqa_group_size
+        ));
+        ptx.push_str(&format!(
+            "    div.u64 %rd57, %head_idx, {};\n",
+            config.gqa_group_size
+        ));
+        ptx.push_str("    mul.lo.u64 %rd58, %batch_idx, %rd5;\n");
+        ptx.push_str("    add.u64 %rd58, %rd58, %rd57;             // + kv_head\n");
+    } else {
+        ptx.push_str("    mul.lo.u64 %rd58, %batch_idx, %rd5;\n");
+        ptx.push_str("    add.u64 %rd58, %rd58, %head_idx;\n");
+    }
     ptx.push_str("    mul.lo.u64 %rd58, %rd58, %rd6;\n");
     ptx.push_str("    add.u64 %rd58, %rd58, %k_start;\n");
     ptx.push_str("    mul.lo.u64 %rd58, %rd58, %rd7;\n");
@@ -1425,6 +1457,83 @@ mod backward_orchestrator_tests {
         assert!(
             ptx.contains(".visible .entry"),
             "fallback PTX should be a valid kernel"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // Sprint 5 — GQA zero-copy stride pattern (paper s4.2) for the
+    // Tier A / v2 forward emitter. The K-tile load (emit_k_tile_load)
+    // and V-tile load (emit_v_tile_load) at mod.rs must emit a
+    // compile-time-literal `div.u64 %rd57, %head_idx, N` when
+    // gqa_group_size > 1 and substitute %rd57 for %head_idx in the row
+    // index composition. gqa_group_size==1 must remain byte-identical
+    // to the pre-Sprint-5 baseline.
+    // -----------------------------------------------------------------
+
+    fn fwd_v2_cfg(gqa: u32) -> FlashAttentionConfig {
+        FlashAttentionConfig {
+            block_q: 32, block_kv: 32, head_dim: 32,
+            causal: false, paged: false, rope_q: false,
+            rope_style: RopeStyle::HalfSplit,
+            gqa_group_size: gqa, tree_mask: false, gpu_sm: 75,
+            segment_masked: false,
+            csha: None,
+        }
+    }
+
+    #[test]
+    fn v2_forward_emits_gqa_divisor_when_group_size_gt_one() {
+        let cfg = fwd_v2_cfg(4);
+        let ptx_bytes = synthesize_flash_attention_ptx_v2(&cfg);
+        let ptx = String::from_utf8_lossy(
+            &ptx_bytes[..ptx_bytes.len().saturating_sub(1)]
+        ).into_owned();
+
+        // The forward K-tile and V-tile loads each emit one div.u64
+        // for the GQA group size literal.
+        let div_count = ptx.matches("div.u64 %rd57, %head_idx, 4;").count();
+        assert!(
+            div_count >= 2,
+            "forward must emit >= 2 GQA div.u64 emissions (K-load + V-load), got {div_count}.\nPTX excerpt around `div.u64`:\n{}",
+            ptx.lines().filter(|l| l.contains("div.u64") || l.contains("head_idx")).collect::<Vec<_>>().join("\n")
+        );
+
+        // The kv-head intermediate %rd57 must reach the row-index chain
+        // in both K-load and V-load.
+        let kvh_uses = ptx.matches("add.u64 %rd58, %rd58, %rd57;").count();
+        assert!(
+            kvh_uses >= 2,
+            "kv_head register %rd57 must feed both K-load and V-load row indices; got {kvh_uses}"
+        );
+    }
+
+    #[test]
+    fn v2_forward_byte_identical_at_gqa_one() {
+        let cfg = fwd_v2_cfg(1);
+        let ptx_bytes = synthesize_flash_attention_ptx_v2(&cfg);
+        let ptx = String::from_utf8_lossy(
+            &ptx_bytes[..ptx_bytes.len().saturating_sub(1)]
+        ).into_owned();
+
+        // No GQA div.u64 must be emitted with the %rd57 destination
+        // and the gqa-paper s4.2 comment must be absent at gqa=1.
+        assert!(
+            !ptx.contains("div.u64 %rd57, %head_idx"),
+            "gqa_group_size=1 must NOT emit forward GQA div.u64 (byte-identity)"
+        );
+        assert!(
+            !ptx.contains("paper s4.2 zero-copy"),
+            "gqa_group_size=1 must NOT emit the s4.2 zero-copy annotation"
+        );
+        // The original Q-head wiring must still be present (proves we
+        // took the no-op branch, not a third branch that silently broke).
+        assert!(
+            ptx.contains("add.u64 %rd58, %rd58, %head_idx;         // + head"),
+            "gqa_group_size=1 K-load must wire %head_idx directly"
+        );
+        assert!(
+            ptx.contains("add.u64 %rd58, %rd58, %head_idx;\n"),
+            "gqa_group_size=1 V-load must wire %head_idx directly"
         );
     }
 }
