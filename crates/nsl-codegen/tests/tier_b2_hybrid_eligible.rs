@@ -22,14 +22,16 @@ fn cfg(hd: i64, heads: u32, d_model: u32, rope: bool) -> FlashAttentionConfig {
 #[test] fn seq_gt_block_q_rejected() {
     assert!(!tier_b2_hybrid_backward_eligible(&cfg(64, 1, 64, false), 128));
 }
-/// Sprint 10: rope_q=true was previously excluded from the hybrid
-/// backward eligibility. The hybrid now de-rotates dQ/dK to the pre-RoPE
-/// basis inside `proj_backward` via `emit_drope`, so rope_q=true configs
-/// that otherwise satisfy the smoke-intersection constraints route
-/// through the 4-kernel hybrid. The runtime `csha_tier_b2_backward_launch`
-/// also threads cos/sin to the proj kernel.
-#[test] fn rope_q_accepted() {
-    assert!(tier_b2_hybrid_backward_eligible(&cfg(64, 1, 64, true), 64));
+/// Sprint 10 (codegen + runtime) prepared the hybrid for rope_q=true via
+/// emit_drope in proj_backward + cos/sin threading in
+/// csha_tier_b2_backward_launch. HOWEVER the production wengert lowering
+/// at `wengert_lower.rs:1958` still passes null cos/sin, so eligibility
+/// must gate on `!rope_q` to keep production safe (the null-guard inside
+/// emit_drope would short-circuit silently, leaving dQ/dK post-RoPE
+/// when emit_dproj reads them). Reverts the dispatch widening pending
+/// the wengert source-side cos/sin wiring follow-on.
+#[test] fn rope_q_rejected_pending_wengert_cos_sin_wiring() {
+    assert!(!tier_b2_hybrid_backward_eligible(&cfg(64, 1, 64, true), 64));
 }
 #[test] fn non_csha_rejected() {
     let mut c = cfg(64, 1, 64, false); c.csha = None;
