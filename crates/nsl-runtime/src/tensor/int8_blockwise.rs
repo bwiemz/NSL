@@ -70,8 +70,7 @@ pub fn quant_to_buffer(src: &[f32], dst_bytes: &mut [u8], stochastic: bool, rng_
     let scale_part = unsafe {
         std::slice::from_raw_parts_mut(tail.as_mut_ptr() as *mut f32, n_blocks)
     };
-    let mut block_idx = 0usize;
-    for chunk_start in (0..n).step_by(INT8_BLOCK_SIZE) {
+    for (block_idx, chunk_start) in (0..n).step_by(INT8_BLOCK_SIZE).enumerate() {
         let chunk_end = (chunk_start + INT8_BLOCK_SIZE).min(n);
         let block = &src[chunk_start..chunk_end];
         let absmax = block_absmax(block);
@@ -87,7 +86,6 @@ pub fn quant_to_buffer(src: &[f32], dst_bytes: &mut [u8], stochastic: bool, rng_
             };
             int8_part[chunk_start + i] = q.clamp(-128.0, 127.0) as i8 as u8;
         }
-        block_idx += 1;
     }
 }
 
@@ -103,14 +101,12 @@ pub fn dequant_to_buffer(src_bytes: &[u8], dst: &mut [f32]) {
         )
     };
     let int8_part = &src_bytes[..n];
-    let mut block_idx = 0usize;
-    for chunk_start in (0..n).step_by(INT8_BLOCK_SIZE) {
+    for (block_idx, chunk_start) in (0..n).step_by(INT8_BLOCK_SIZE).enumerate() {
         let chunk_end = (chunk_start + INT8_BLOCK_SIZE).min(n);
         let scale = scale_part[block_idx];
         for i in chunk_start..chunk_end {
             dst[i] = (int8_part[i] as i8 as f32) * scale;
         }
-        block_idx += 1;
     }
 }
 
@@ -170,8 +166,7 @@ pub extern "C" fn nsl_tensor_quant_int8_blockwise(
     let mut rng_state: u64 = (n as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
     let do_stochastic = stochastic != 0;
 
-    let mut block_idx = 0usize;
-    for chunk_start in (0..n).step_by(INT8_BLOCK_SIZE) {
+    for (block_idx, chunk_start) in (0..n).step_by(INT8_BLOCK_SIZE).enumerate() {
         let chunk_end = (chunk_start + INT8_BLOCK_SIZE).min(n);
         let block = &src[chunk_start..chunk_end];
         let absmax = block_absmax(block);
@@ -188,7 +183,6 @@ pub extern "C" fn nsl_tensor_quant_int8_blockwise(
             let q = q.clamp(-128.0, 127.0) as i8;
             unsafe { *int8_ptr.add(chunk_start + i) = q };
         }
-        block_idx += 1;
     }
 
     let shape = NslTensor::copy_shape(t.shape, t.ndim);
@@ -241,15 +235,13 @@ pub extern "C" fn nsl_tensor_dequant_int8_blockwise(src_ptr: i64) -> i64 {
 
     let dst_data = checked_alloc(n * std::mem::size_of::<f32>()) as *mut f32;
 
-    let mut block_idx = 0usize;
-    for chunk_start in (0..n).step_by(INT8_BLOCK_SIZE) {
+    for (block_idx, chunk_start) in (0..n).step_by(INT8_BLOCK_SIZE).enumerate() {
         let chunk_end = (chunk_start + INT8_BLOCK_SIZE).min(n);
         let scale = unsafe { *scales_ptr.add(block_idx) };
         for i in chunk_start..chunk_end {
             let q = unsafe { *int8_ptr.add(i) };
             unsafe { *dst_data.add(i) = (q as f32) * scale };
         }
-        block_idx += 1;
     }
 
     let shape = NslTensor::copy_shape(t.shape, t.ndim);
