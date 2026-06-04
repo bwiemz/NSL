@@ -9,10 +9,62 @@
 
 use crate::flash_attention::{FlashAttentionConfig, RopeStyle};
 
-/// Emit the §A.4 active_heads guard. When `csha_active_heads` param is
-/// non-zero and `head_idx >= csha_active_heads`, the kernel returns
-/// immediately (dead-head pruning). Null guard: param=0 means "no
-/// pruning, run all heads".
+/// # CSHA paper §5.2 (dead-head elimination) — v1 envelope
+///
+/// Two-tier elimination, both shipped pre-cycle-2:
+///   * **Launcher truncation** (primary): when `csha.active_heads > 0` and
+///     < total heads, the `nsl_flash_attention_csha*` runtime launches
+///     `gridDim.y = batch * effective_heads` (see
+///     `nsl-runtime/src/flash_attention.rs` near line 654 for the forward
+///     CSHA path, with parallel sites near 976 / 1428 / 2145 for
+///     scalar+fused backward variants). Blocks for dead heads NEVER
+///     launch — no wasted SM cycles. Formula pinned by the
+///     `a4_grid_y_*` unit tests in that file.
+///   * **In-kernel guard** (this function, defense in depth): runtime
+///     predicate that short-circuits the block prologue when the block's
+///     head index would have been classified dead. Cheap, ASCII-PTX,
+///     no SMEM cost. The guard reads the `csha_active_heads` *kernel
+///     param* (not the codegen-time `config.csha.active_heads` literal)
+///     so a single emitted kernel handles any pruning count the launcher
+///     supplies, including the "no pruning" sentinel.
+///
+/// v1 envelope (cycle-2 audit):
+///   * `csha_active_heads == 0` is a SENTINEL meaning "all heads live" —
+///     the guard's first `setp.eq.u32 %r10, 0` branches over the
+///     head-index check, so no head is ejected. In a paired launch the
+///     launcher reports `effective_heads = heads` so the grid runs the
+///     full head count too.
+///   * `csha_active_heads > 0` triggers BOTH launcher truncation AND the
+///     in-kernel `ret` — defense in depth: kernel stays safe if a future
+///     caller forgets to truncate `gridDim.y` or constructs a grid
+///     against a different active_heads than the kernel was specialised
+///     against (cache-hit misrouting).
+///   * Emission is gated only on `config.csha.is_some()`; the v2 hooks
+///     variant emits the same PTX for any `csha.active_heads` value
+///     because the predicate lives in the kernel param, not in a
+///     compile-time literal. The legacy classic-path emitter at
+///     `flash_attention.rs::emit_csha_active_heads_guard` IS literal-
+///     gated (used by the non-v2 emitter); these two emitters cover
+///     different dispatch paths and must stay numerically equivalent
+///     at runtime.
+///
+/// Deferred to a future cycle (paper §5.2 v2):
+///   * Per-active-head codegen specialization — emit N variant kernels,
+///     one per active-head set, replacing the runtime guard with
+///     compile-time dead code elimination. Trades binary size for
+///     hot-path predicate cost.
+///   * Per-head mixed precision (depends on FP8 M35 — paper §3.3).
+///
+/// # Emission contract
+///
+/// When `config.csha.is_none()`: emits a single comment line only — no
+/// PTX instructions, no labels. This is what the non-CSHA dispatch
+/// (classic FA-2 path with `csha: None`) ships.
+///
+/// When `config.csha.is_some()`: emits the full guard prelude — `ld.param`
+/// of `csha_active_heads`, sentinel-zero skip branch (`@%p0 bra
+/// V2_CSHA_ACTIVE_HEADS_SKIP`), head-index compare, conditional `ret`,
+/// and the `V2_CSHA_ACTIVE_HEADS_SKIP:` label.
 pub fn emit_active_heads_guard(ptx: &mut String, config: &FlashAttentionConfig) {
     if config.csha.is_none() {
         ptx.push_str("    // CSHA A.4 active_heads guard: csha=None, no emission\n");

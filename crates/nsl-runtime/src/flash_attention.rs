@@ -651,6 +651,15 @@ pub extern "C" fn nsl_flash_attention_csha(
         // with a matching early-exit guard; shrink grid_y so each CTA
         // lands inside the active range. active_heads == 0 means "no
         // pruning — run the full head count".
+        //
+        // CSHA paper §5.2 v1 (cycle-2 audit): this is the PRIMARY tier
+        // of dead-head elimination — blocks for pruned heads never
+        // launch. The defense-in-depth in-kernel guard lives in
+        // `crates/nsl-codegen/src/flash_attention_v2/phases/forward/
+        // csha_hooks.rs::emit_active_heads_guard`; the same formula
+        // appears at the scalar+fused backward launch sites further
+        // down this file. Formula pinned by `a4_grid_y_*` unit tests
+        // in the `#[cfg(test)] mod` below.
         let effective_heads = if active_heads > 0 && active_heads < heads {
             active_heads
         } else {
@@ -4552,6 +4561,33 @@ mod tests {
         // differently"; fall back to the full count so we don't emit
         // the guard branch unnecessarily.
         assert_eq!(a4_effective_heads(8, 8), 8);
+    }
+
+    /// CSHA paper §5.2 v1 (Sprint 2 cycle-2 audit pin): the canonical
+    /// "half the heads pruned" case used by `csha_cuda_launch_fused`'s
+    /// h=8/active=4 fixture. Co-pinned alongside the in-source doc on
+    /// `crates/nsl-codegen/src/flash_attention_v2/phases/forward/csha_hooks.rs
+    /// ::emit_active_heads_guard` so the launcher and kernel guard
+    /// cannot silently disagree.
+    #[test]
+    fn a4_grid_y_half_pruned_canonical_case() {
+        assert_eq!(a4_effective_heads(8, 4), 4);
+        // Also pin the table of paper §5.2 v1 inputs we ship today.
+        for (heads, active, expected) in [
+            (4i64, 0i64, 4i64),  // sentinel zero -> full
+            (4,    1,    1),      // single live head (paper §5.2 extreme)
+            (4,    2,    2),
+            (4,    4,    4),      // active == heads -> full
+            (8,    0,    8),
+            (8,    4,    4),      // canonical half-pruned (this test fixture)
+            (8,    8,    8),
+        ] {
+            assert_eq!(
+                a4_effective_heads(heads, active),
+                expected,
+                "effective_heads({heads}, {active}) must be {expected}"
+            );
+        }
     }
 
     /// Smoke test: the CSHA FFI symbol resolves and the parameter signature

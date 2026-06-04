@@ -188,6 +188,104 @@ fn phase_csha_hooks__active_heads_guard() {
     insta::assert_snapshot!("phase_csha_active_heads_guard", ptx);
 }
 
+// ---------------------------------------------------------------------------
+// CSHA paper §5.2 v1 audit pins (Sprint 2 cycle-2)
+//
+// The two tests below codify the v1 dead-head-elimination envelope per the
+// in-source doc on `csha_hooks::emit_active_heads_guard`:
+//   * `csha = None`        -> comment-only, no PTX instructions / labels.
+//   * `csha = Some(...)`   -> sentinel-aware runtime predicate against
+//                              the `csha_active_heads` kernel param.
+//
+// They are structural string asserts (not insta snapshots) so they trip
+// independently of any future PTX whitespace / comment churn that the
+// existing snapshot would absorb on `cargo insta accept`. Together with
+// the `a4_grid_y_*` unit tests in `nsl-runtime/src/flash_attention.rs`
+// (~line 4527), they pin both tiers — launcher truncation AND in-kernel
+// guard — against silent regression.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn phase_csha_active_heads_guard__none_emits_comment_only() {
+    // CSHA paper §5.2 v1: when no CSHA dispatch is in play, the guard
+    // emitter is a no-op (single comment, zero instructions). Pinning
+    // this prevents a future refactor from accidentally emitting the
+    // guard prelude unconditionally and breaking non-CSHA kernels with
+    // an `ld.param.u32 [csha_active_heads]` against a missing param.
+    let mut ptx = String::new();
+    csha_hooks::emit_active_heads_guard(&mut ptx, &csha_canonical());
+
+    // Must contain the no-emission comment exactly once.
+    assert!(
+        ptx.contains("CSHA A.4 active_heads guard: csha=None, no emission"),
+        "csha=None must emit the no-emission comment; got:\n{ptx}"
+    );
+    // Must NOT emit any of the active-path PTX instructions or label.
+    assert!(
+        !ptx.contains("ld.param.u32"),
+        "csha=None must not emit param load; got:\n{ptx}"
+    );
+    assert!(
+        !ptx.contains("setp."),
+        "csha=None must not emit any setp; got:\n{ptx}"
+    );
+    assert!(
+        !ptx.contains("@%p0 ret"),
+        "csha=None must not emit conditional ret; got:\n{ptx}"
+    );
+    assert!(
+        !ptx.contains("V2_CSHA_ACTIVE_HEADS_SKIP"),
+        "csha=None must not emit the skip label; got:\n{ptx}"
+    );
+}
+
+#[test]
+fn phase_csha_active_heads_guard__some_emits_param_based_predicate() {
+    // CSHA paper §5.2 v1: in the v2-hooks variant the guard predicate
+    // lives in the kernel PARAM `csha_active_heads`, NOT in a compile-
+    // time literal. This is what lets a single emitted kernel handle
+    // any pruning count the launcher supplies, including the
+    // active_heads=0 "all heads live" sentinel (handled via the
+    // sentinel-zero skip branch).
+    let mut ptx = String::new();
+    csha_hooks::emit_active_heads_guard(&mut ptx, &csha_l2_rope_config());
+
+    // Param load: this is the v2 contract — predicate is runtime-driven.
+    assert!(
+        ptx.contains("ld.param.u32 %r10, [csha_active_heads];"),
+        "guard must load the csha_active_heads kernel param; got:\n{ptx}"
+    );
+    // Sentinel-zero skip: param==0 means "all heads live", bypass the
+    // head-index check. Without this, the launcher contract for
+    // active_heads=0 would mis-eject every head.
+    assert!(
+        ptx.contains("setp.eq.u32 %p0, %r10, 0;"),
+        "guard must emit the sentinel-zero predicate; got:\n{ptx}"
+    );
+    assert!(
+        ptx.contains("@%p0 bra V2_CSHA_ACTIVE_HEADS_SKIP;"),
+        "guard must branch over the head-index check on sentinel-zero; got:\n{ptx}"
+    );
+    // Head-index >= active_heads -> early-exit.
+    assert!(
+        ptx.contains("cvt.u32.u64 %r11, %head_idx;"),
+        "guard must materialise head_idx as u32 for compare; got:\n{ptx}"
+    );
+    assert!(
+        ptx.contains("setp.ge.u32 %p0, %r11, %r10;"),
+        "guard must compare head_idx >= csha_active_heads; got:\n{ptx}"
+    );
+    assert!(
+        ptx.contains("@%p0 ret;"),
+        "guard must conditionally ret on the head-index check; got:\n{ptx}"
+    );
+    // Skip label closes the block.
+    assert!(
+        ptx.contains("V2_CSHA_ACTIVE_HEADS_SKIP:"),
+        "guard must emit the skip label; got:\n{ptx}"
+    );
+}
+
 /// Label uniqueness regression: each CSHA hook's skip-label must be
 /// parameterised on `q_tile_iter` so the orchestrator can call each
 /// hook multiple times for block_q > 4 configs.
