@@ -28,6 +28,18 @@ pub enum CepEmitError {
     UnrewritableExpr { dim: &'static str, detail: String },
     MissingArg { what: &'static str },
     SpecMismatch { detail: String },
+    /// A single source span is targeted by two slots whose chosen pruned values differ
+    /// (e.g. `const SHARED = 8` used as both `n_heads` and `d_ff` while the delta wants
+    /// them rewritten to different values). Refuse rather than silently keep one and drop
+    /// the other.
+    SharedConstCollision {
+        span: (usize, usize),
+        replacements: Vec<String>,
+    },
+    /// Reserved for future callers that propagate a recognizer-side refusal (currently
+    /// unused — `find_top_model` returns `Option`; this variant lets a v2 broaden the
+    /// recognizer surface without breaking the error API).
+    Extract(crate::cep_extract::CepExtractError),
 }
 
 impl std::fmt::Display for CepEmitError {
@@ -49,6 +61,12 @@ impl std::fmt::Display for CepEmitError {
                 f,
                 "CEP emit: source disagrees with ModelSpec: {detail}"
             ),
+            CepEmitError::SharedConstCollision { span, replacements } => write!(
+                f,
+                "CEP emit: a single source span [{}, {}) is targeted by multiple slots with conflicting replacement values {:?}\n  (a `const NAME = ...` is shared across slots whose chosen pruned values differ; introduce a separate const per slot)",
+                span.0, span.1, replacements
+            ),
+            CepEmitError::Extract(err) => write!(f, "CEP emit: recognizer refusal: {err}"),
         }
     }
 }
@@ -257,15 +275,38 @@ pub fn apply_prune_delta_to_source(
         edits.push(edit_for_arg(module, resolve, dim, &arg.value, baseline_val, new_val)?);
     }
 
-    // Dedupe (same const may back multiple slots) then apply right-to-left.
+    // Sort right-to-left so earlier spans aren't invalidated by later splices.
     edits.sort_by_key(|e| std::cmp::Reverse(e.0));
-    edits.dedup_by(|a, b| a.0 == b.0 && a.1 == b.1);
+    // Refuse on shared-const collisions: a single span can only be replaced by one value;
+    // two edits targeting the same (start, end) with DIFFERENT replacements means a const
+    // is shared across slots whose chosen values disagree. Silent dedupe would corrupt.
+    let mut i = 0;
+    while i + 1 < edits.len() {
+        if edits[i].0 == edits[i + 1].0 && edits[i].1 == edits[i + 1].1 {
+            if edits[i].2 != edits[i + 1].2 {
+                return Err(CepEmitError::SharedConstCollision {
+                    span: (edits[i].0, edits[i].1),
+                    replacements: vec![edits[i].2.clone(), edits[i + 1].2.clone()],
+                });
+            }
+            edits.remove(i + 1); // identical edit — safe to drop
+        } else {
+            i += 1;
+        }
+    }
 
     let mut out = source.to_string();
     for (start, end, replacement) in edits {
         if end > out.len() || start > end {
             return Err(CepEmitError::SpecMismatch {
                 detail: format!("span [{start}, {end}) out of source bounds (len {})", out.len()),
+            });
+        }
+        if !out.is_char_boundary(start) || !out.is_char_boundary(end) {
+            return Err(CepEmitError::SpecMismatch {
+                detail: format!(
+                    "span [{start}, {end}) is not on UTF-8 char boundaries (refusing to split a codepoint)"
+                ),
             });
         }
         out.replace_range(start..end, &replacement);
@@ -564,6 +605,54 @@ model Net:
         assert!(matches!(err, CepEmitError::SpecMismatch { .. }), "got: {err}");
     }
 
+    /// A single top-level const is used to initialize TWO different slots whose chosen
+    /// pruned values disagree (n_heads -> 4 but d_ff -> 6). A naive dedupe would silently
+    /// keep one and drop the other; SP2 must refuse with `SharedConstCollision`.
+    #[test]
+    fn shared_const_used_for_two_slots_with_conflicting_values_refuses() {
+        let src = r#"
+const X = 8
+model GroupedQueryAttention(d_model: int, n_heads: int, n_kv_heads: int, dropout_p: float):
+    wq: Tensor = randn([d_model, d_model])
+model SwiGLUFFN(d_model: int, d_ff: int, dropout_p: float):
+    w_gate: Tensor = randn([d_model, d_ff])
+model TransformerBlock(d_model: int, n_heads: int, n_kv_heads: int, d_ff: int, dropout_p: float):
+    attn: GroupedQueryAttention = GroupedQueryAttention(d_model, n_heads, n_kv_heads, dropout_p)
+    ffn: SwiGLUFFN = SwiGLUFFN(d_model, d_ff, dropout_p)
+    norm: RMSNorm = RMSNorm(d_model)
+model Net:
+    embed: Tensor = randn([1000, 256])
+    blocks: [TransformerBlock; 2] = TransformerBlock(256, X, 4, X, 0.1)
+"#;
+        let (module, interner) = parse(src);
+        let resolve = |s: Symbol| interner.resolve(s.0).unwrap_or("").to_string();
+        // baseline: n_heads=X=8, n_kv_heads=4, d_ff=X=8 (yes, contrived but legal).
+        let baseline = ModelSpec {
+            d_model: 256, n_layers: 2,
+            n_heads: vec![8; 2], n_kv_heads: vec![4; 2],
+            head_dim: vec![32; 2], d_ff: vec![8; 2],
+            vocab: 1000, max_seq: 2048, batch: 1,
+            activation: Activation::SwiGlu, norm: NormType::RmsNorm,
+            dtype_bytes: 4,
+        };
+        // Prune 4 query heads (= 2 groups of 2) -> n_heads=4, n_kv_heads=2. Narrow d_ff
+        // to 6 (NOT 4). Now: n_heads slot wants "4", d_ff slot wants "6", both target the
+        // SAME const X span. Must refuse, not silently keep one.
+        let delta = PruneDelta {
+            per_layer: (0..2).map(|l| LayerDelta {
+                layer: l, pruned_heads: vec![0, 1, 2, 3],
+                new_d_ff: Some(6), drop_layer: false,
+            }).collect(),
+        };
+        let err = apply_prune_delta_to_source(src, &module, &resolve, &baseline, &delta)
+            .unwrap_err();
+        assert!(matches!(err, CepEmitError::SharedConstCollision { .. }),
+                "expected SharedConstCollision, got: {err}");
+        let msg = err.to_string();
+        assert!(msg.contains("conflicting replacement values"),
+                "error must explain conflict, got: {msg}");
+    }
+
     /// SP2's emitted source extracts the chosen pruned (n_heads, n_kv_heads, d_ff) triple.
     /// d_model is invariant (CEP design).
     ///
@@ -600,5 +689,83 @@ model Net:
         assert_eq!(spec2.n_heads[0], uniform.n_heads);
         assert_eq!(spec2.n_kv_heads[0], uniform.n_kv_heads);
         assert_eq!(spec2.d_ff[0], uniform.d_ff);
+    }
+
+    /// Direct SP1/SP2 cross-consistency (spec §6.6): build a WeightMap matching the
+    /// canonical fixture, run SP1's `apply_prune_delta_to_weights` AND SP2's
+    /// `apply_prune_delta_to_source` on the same delta, then assert the shapes that
+    /// MUST agree do (d_ff axis, KV head count, query head count). Head-dim discrepancy
+    /// (recognizer derives hd = d_model/n_heads) is the documented limitation and is
+    /// asserted around, not into.
+    #[test]
+    fn sp1_sliced_and_sp2_emitted_agree_on_dff_and_head_counts() {
+        use crate::weight_aware::{WeightDType, WeightEntry, WeightMap};
+        use std::collections::HashMap;
+
+        fn zero_entry(name: &str, shape: Vec<usize>) -> WeightEntry {
+            let n: usize = shape.iter().product();
+            WeightEntry {
+                name: name.to_string(),
+                data: vec![0u8; n * 4],
+                shape,
+                dtype: WeightDType::F32,
+                num_elements: n,
+                sparsity: None,
+                eliminated: false,
+            }
+        }
+
+        let (module, interner) = parse(CANONICAL);
+        let resolve = |s: Symbol| interner.resolve(s.0).unwrap_or("").to_string();
+        let baseline = baseline_canonical();
+
+        let mut entries: HashMap<String, WeightEntry> = HashMap::new();
+        for l in 0..6 {
+            entries.insert(format!("blocks.{l}.attn.wq"), zero_entry(&format!("blocks.{l}.attn.wq"), vec![384, 384]));
+            entries.insert(format!("blocks.{l}.attn.wk"), zero_entry(&format!("blocks.{l}.attn.wk"), vec![384, 192]));
+            entries.insert(format!("blocks.{l}.attn.wv"), zero_entry(&format!("blocks.{l}.attn.wv"), vec![384, 192]));
+            entries.insert(format!("blocks.{l}.attn.wo"), zero_entry(&format!("blocks.{l}.attn.wo"), vec![384, 384]));
+            entries.insert(format!("blocks.{l}.ffn.w_gate"), zero_entry(&format!("blocks.{l}.ffn.w_gate"), vec![384, 1024]));
+            entries.insert(format!("blocks.{l}.ffn.w_up"), zero_entry(&format!("blocks.{l}.ffn.w_up"), vec![384, 1024]));
+            entries.insert(format!("blocks.{l}.ffn.w_down"), zero_entry(&format!("blocks.{l}.ffn.w_down"), vec![1024, 384]));
+        }
+        let wm = WeightMap::from_entries(entries);
+
+        let delta = PruneDelta {
+            per_layer: (0..6).map(|l| LayerDelta {
+                layer: l, pruned_heads: vec![0, 1],
+                new_d_ff: Some(512), drop_layer: false,
+            }).collect(),
+        };
+
+        let sliced = crate::cep_slice::apply_prune_delta_to_weights(&wm, &baseline, &delta)
+            .expect("SP1 slice ok");
+        let out = apply_prune_delta_to_source(CANONICAL, &module, &resolve, &baseline, &delta)
+            .expect("SP2 rewrite ok");
+        let (module2, interner2) = parse(&out);
+        let resolve2 = |s: Symbol| interner2.resolve(s.0).unwrap_or("").to_string();
+        let spec2 = crate::cep_extract::extract_model_spec(&module2, &resolve2).unwrap();
+
+        // d_ff axis: SP1 sliced w_gate has [d_model, new_d_ff] cols; SP2 recognizes the same.
+        let sliced_wgate = sliced.get("blocks.0.ffn.w_gate").expect("layer 0 w_gate sliced");
+        assert_eq!(sliced_wgate.shape[1] as u32, spec2.d_ff[0],
+                   "SP1 sliced w_gate cols {} must equal SP2 emitted d_ff {}",
+                   sliced_wgate.shape[1], spec2.d_ff[0]);
+
+        // KV head count: SP1 drops one KV group (2 surviving); SP2 recognizes 2.
+        let sliced_wk = sliced.get("blocks.0.attn.wk").expect("layer 0 wk sliced");
+        let sp1_kv_count = (sliced_wk.shape[1] as u32) / baseline.head_dim[0];
+        assert_eq!(sp1_kv_count, spec2.n_kv_heads[0],
+                   "SP1 surviving KV count {} must equal SP2 emitted n_kv_heads {}",
+                   sp1_kv_count, spec2.n_kv_heads[0]);
+
+        // Query head count (by SP1's surviving-head count derived from projection width
+        // using the BASELINE head_dim — the recognizer's derived head_dim differs by the
+        // documented limitation, but the COUNT agrees).
+        let sliced_wq = sliced.get("blocks.0.attn.wq").expect("layer 0 wq sliced");
+        let sp1_q_count = (sliced_wq.shape[1] as u32) / baseline.head_dim[0];
+        assert_eq!(sp1_q_count, spec2.n_heads[0],
+                   "SP1 surviving Q-head count {} must equal SP2 emitted n_heads {}",
+                   sp1_q_count, spec2.n_heads[0]);
     }
 }
