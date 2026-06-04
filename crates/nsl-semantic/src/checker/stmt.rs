@@ -836,6 +836,65 @@ impl<'a> TypeChecker<'a> {
                             }
                         }
 
+                        if dname == "paged_kv" {
+                            // Sprint 2 cycle-3 (paper §3.2 paged KV): companion
+                            // decorator on an @flash_attention fn. Mirrors the
+                            // @tree_mask / @gqa companion-required pattern so
+                            // standalone use (which silently fell through the
+                            // function-level decorator scan pre-Sprint-2)
+                            // surfaces as a semantic error instead of a no-op.
+                            //
+                            // Note: the same decorator on a model-block layer
+                            // is handled by `checker/model.rs`, which validates
+                            // the arg names/types but does NOT require a
+                            // companion (model layers don't carry the
+                            // @flash_attention decorator — they wire paged KV
+                            // through the model graph instead). This arm is
+                            // therefore intentionally function-scope only.
+                            let has_flash = decorators.iter().any(|d| {
+                                d.name.len() == 1 && self.interner.resolve(d.name[0].0).unwrap_or("") == "flash_attention"
+                            });
+                            if !has_flash {
+                                self.diagnostics.push(
+                                    Diagnostic::error("@paged_kv requires @flash_attention on the same function")
+                                        .with_label(deco.span, "missing @flash_attention")
+                                );
+                            }
+                            // Arg validation: only `block_size` is recognised
+                            // at function scope; other args are model-level
+                            // (see `checker/model.rs::paged_kv`) and would be
+                            // silently ignored by `compiler/kernel.rs:1005-1022`,
+                            // so surface them as errors at the function level
+                            // to mirror the kernel.rs extraction rules.
+                            if let Some(ref args) = deco.args {
+                                for arg in args {
+                                    if let Some(ref name_sym) = arg.name {
+                                        let aname = self.interner.resolve(name_sym.0).unwrap_or("").to_string();
+                                        if aname == "block_size" {
+                                            if let ExprKind::IntLiteral(n) = &arg.value.kind {
+                                                if *n <= 0 {
+                                                    self.diagnostics.push(
+                                                        Diagnostic::error("@paged_kv 'block_size' must be a positive integer")
+                                                            .with_label(arg.span, "must be > 0")
+                                                    );
+                                                }
+                                            } else {
+                                                self.diagnostics.push(
+                                                    Diagnostic::error("@paged_kv 'block_size' argument must be an integer literal")
+                                                        .with_label(arg.span, "expected integer")
+                                                );
+                                            }
+                                        } else {
+                                            self.diagnostics.push(
+                                                Diagnostic::error(format!("@paged_kv unknown argument '{}' at function scope (only 'block_size' is recognised here)", aname))
+                                                    .with_label(arg.span, "unknown argument")
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
                         if dname == "autotune" {
                             match &stmt.kind {
                                 StmtKind::KernelDef(_) => {

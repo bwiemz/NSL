@@ -378,3 +378,89 @@ pub fn flash_tree_mask_context_for_source(
         None => (false, None, None, false),
     }
 }
+
+/// Sprint 2 cycle-3 (paper §3.2 paged KV) observation helper: does the
+/// `@paged_kv` decorator on an `@flash_attention` fn reach
+/// `FlashAttentionConfig::paged`, and does the kernel-name + synthesized
+/// PTX pick up the paged-KV variant?
+///
+/// Returns `(context_set, paged_flag, kernel_name, ptx_contains_paged_block_table_indirection)`:
+/// - `context_set`     — `true` iff a compile context was built (proof
+///                       the extraction site ran at all).
+/// - `paged_flag`      — `Some(ctx.config.paged)`; the load-bearing
+///                       end-to-end thread.
+/// - `kernel_name`     — what the runtime dispatcher will look up; pins
+///                       the variant tag (`_p1_` for paged=true) per
+///                       `flash_attention_kernel_name`'s format
+///                       `flash_attn_p{paged}_r..._g..._c..._t..._q..._kv...`.
+/// - `ptx_contains_paged_block_table_indirection` — `true` iff the
+///                       synthesized PTX emits the paged-only K block-table
+///                       indirection comment + divide. The KERNEL PARAMETER
+///                       `block_table_ptr` is declared unconditionally
+///                       (`flash_attention.rs:438`) and the `ld.param.u64`
+///                       for it is also unconditional (`flash_attention.rs:622`),
+///                       just like Sprint 1's `dfs_enter_ptr`. Only the
+///                       block-table indirection comment + divide block
+///                       (`flash_attention.rs:1622-1649`) is gated on
+///                       `config.paged`. Probing for that comment gives
+///                       the ground-truth proof that the paged code path
+///                       fired — probing for the parameter name would
+///                       be a Sprint-1-style false positive.
+///
+/// Note on `block_size`: the `@paged_kv(block_size=N)` argument is
+/// parsed and used at compile time for the `block_kv % block_size`
+/// alignment validation (`compiler/kernel.rs:1167`), but is NOT
+/// threaded onto `FlashAttentionConfig` — it remains a launch-time
+/// runtime parameter (the kernel's `.param .u64 block_size`). It is
+/// therefore not observable through the compile context; the runtime
+/// dispatch (not codegen) wires the launch arg. The fixture uses a
+/// bare `@paged_kv` and this helper does not return a block_size.
+pub fn flash_paged_kv_context_for_source(
+    src: &str,
+) -> (bool, Option<bool>, Option<String>, bool) {
+    use nsl_errors::FileId;
+
+    let mut interner = Interner::new();
+    let (tokens, _lex_diags) = nsl_lexer::tokenize(src, FileId(0), &mut interner);
+    let parsed = nsl_parser::parse(&tokens, &mut interner);
+    let stmts = parsed.module.stmts.clone();
+    let type_map: TypeMap = TypeMap::new();
+    let opts = crate::CompileOptions {
+        target: "sm_80".to_string(),
+        ..Default::default()
+    };
+
+    let mut compiler = crate::compiler::Compiler::new(&interner, &type_map, &opts)
+        .expect("Compiler::new failed in flash_paged_kv_context_for_source");
+
+    compiler
+        .compile_flash_attention_kernels(&stmts)
+        .expect("compile_flash_attention_kernels failed in flash_paged_kv_context_for_source");
+
+    match compiler.kernels.flash_attention_context {
+        Some(ctx) => {
+            let cfg = &ctx.config;
+            let kernel_name = crate::flash_attention::flash_attention_kernel_name(cfg);
+            let ptx = crate::flash_attention::synthesize_flash_attention_ptx(cfg);
+            let ptx_body = if ptx.last() == Some(&0) {
+                &ptx[..ptx.len() - 1]
+            } else {
+                &ptx[..]
+            };
+            let ptx_str = std::str::from_utf8(ptx_body).unwrap_or("");
+            // Probe for the paged-only block-table indirection comment,
+            // not the unconditional parameter. The comment
+            // `"Paged: block table indirection per physical block"` is
+            // emitted ONLY when `config.paged=true`
+            // (`flash_attention.rs:1623` inside `if config.paged { .. }`).
+            // The companion division `div.u64 %rd36, %k_start, %rd11`
+            // (logical_block = k_start / block_size) is also paged-only
+            // and would be a valid alternate probe; the comment is more
+            // self-documenting in the test failure message.
+            let has_paged_indirection =
+                ptx_str.contains("Paged: block table indirection per physical block");
+            (true, Some(cfg.paged), Some(kernel_name), has_paged_indirection)
+        }
+        None => (false, None, None, false),
+    }
+}
