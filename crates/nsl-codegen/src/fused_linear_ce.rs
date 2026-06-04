@@ -1,15 +1,76 @@
-//! G3 — Fused linear-CE with separator-skip (v1, scalar F32).
+//! G3 — Fused linear-CE with separator-skip (v1 single-CTA + v2 two-kernel large-vocab).
 //!
-//! Emits two PTX kernels that implement:
+//! Emits PTX kernels that implement:
 //!   loss = cross_entropy(x @ W^T + bias, targets)
-//! in a single pass per (batch, sequence) row, with a fast-path branch that
-//! skips the entire matmul + softmax for positions labelled `-100`.
+//! with a fast-path branch that skips the entire matmul + softmax for
+//! positions labelled `-100`.
+//!
+//! ## Design — single-CTA vs large-vocab routing
+//!
+//! The v1 path runs one CTA per `(batch, sequence)` token row and serially
+//! scans ALL vocabulary tiles inside that CTA (online log-sum-exp). For
+//! vocab > 8192 this becomes the bottleneck (e.g. NSL production vocab=49152
+//! with vocab_tile=128 → 384 serial tiles per CTA).
+//!
+//! Sprint 3 adds a **two-kernel cross-CTA reduction** path that activates
+//! when `vocab_size > LARGE_VOCAB_THRESHOLD` (= 8192).  Routing is decided
+//! by [`FusedLinearCEConfig::is_large_vocab`]; below the threshold the v1
+//! single-CTA kernel is emitted **byte-identical** to pre-Sprint-3 (this
+//! invariant is locked down by `tests/fused_linear_ce_large_vocab_numerical.rs::ptx_byte_identity_at_v4096`).
+//!
+//! ### Large-vocab path — Kernel A + Kernel B (Option 1)
+//!
+//! Picked over (Opt 2) atomic-CAS LSE (non-deterministic; CAS-loop blast
+//! radius) and (Opt 3) cooperative-groups grid sync (requires
+//! cuLaunchCooperativeKernel which NSL's launcher does not currently call).
+//!
+//! * **Kernel A — per-tile partials** (`*_fwd_large_partials_*`)
+//!   * Grid: `(num_tiles, B*S, 1)` — one CTA per (vocab_tile, token_row).
+//!   * Block: `(128, 1, 1)`.
+//!   * Each CTA computes `x @ W^T[tile_rows] + bias[tile_rows]` for its row
+//!     into shared memory (same dot-product loop as v1) then thread 0
+//!     reduces to a `(tile_max, tile_sum_unscaled)` pair where
+//!     `tile_sum_unscaled = sum_v exp(logit_v - tile_max)`.
+//!   * Writes 2 floats to `partials[row*num_tiles + tile_id]` HBM.
+//!   * `ignore_index` rows write `(0, 0)` to all their tiles' partials
+//!     and Kernel B's same-row guard short-circuits to a zero loss.
+//!
+//! * **Kernel B — per-row finalize** (`*_fwd_large_finalize_*`)
+//!   * Grid: `(B*S, 1, 1)`, block `(128, 1, 1)`.
+//!   * Each CTA's thread 0 reads `partials[row, 0..num_tiles]`, runs the
+//!     online-LSE rescaling formula across tiles, recomputes the single
+//!     `logit_at_target = x[row] @ W[tgt] + bias[tgt]` (one dot-product —
+//!     cheap relative to the per-row finalize cost), writes
+//!     `loss_out[row] = lse - logit_at_target` and
+//!     `lse_out[row] = global_max + log(global_sum)`.
+//!
+//! Math identity vs v1: the online-LSE reduction in Kernel B is exactly
+//! the same per-tile rescaling formula v1 runs inside one CTA, just split
+//! across CTA boundaries. Numerical equivalence at f32 holds to within
+//! one ULP per tile per row.
+//!
+//! ### Synchronisation
+//!
+//! The host MUST issue an implicit or explicit barrier (`cuCtxSynchronize`
+//! or stream sync) between Kernel A and Kernel B because Kernel B reads
+//! the partials Kernel A writes. The runtime launcher does this via the
+//! same-default-stream serialisation guarantee (both kernels launched on
+//! `current_stream()` = NULL stream; CUDA serialises NULL-stream work).
+//! `nsl_fused_linear_ce_forward_large` also calls `cuCtxSynchronize` at
+//! the end so callers can read the results.
+//!
+//! ### Backward
+//!
+//! The v1 backward kernel does NOT need cross-CTA LSE — it reads the saved
+//! `lse_out` from forward and recomputes softmax per `(tile, row)` chunk.
+//! It is reused unchanged for both paths. The per-tile scatter via
+//! `red.global.add.f32` to dW already handles large vocab correctly — only
+//! the outer tile loop scales, and bigger vocabs just mean more iterations.
 //!
 //! ## Scope
 //!
-//! v1 is research-grade: scalar `fma.rn.f32`, F32 only, vocab ≤ 8192.
-//! MMA tiling, fp16/bf16 storage, vocab > 8192, and quantised-W paths are
-//! all deferred to v2.  See `known_limits` in the design doc.
+//! Both paths are research-grade scalar `fma.rn.f32`, F32 only. MMA tiling,
+//! fp16/bf16 storage, and quantised-W paths are deferred.
 //!
 //! ## API
 //!
@@ -18,7 +79,7 @@
 //! let cfg = FusedLinearCEConfig {
 //!     vocab_size: 4096, hidden_size: 128, seq_len: 64, batch_size: 2,
 //!     vocab_tile: 1024, gpu_sm: 80, dtype: Dtype::F32,
-//!     ignore_index: -100, max_vocab_v1: 8192,
+//!     ignore_index: -100, max_vocab_v1: 262144,
 //! };
 //! cfg.validate().unwrap();
 //! let fwd_ptx = nsl_codegen::fused_linear_ce::synthesize_fused_linear_ce_ptx(&cfg);
@@ -27,7 +88,23 @@
 
 // ─── Config ─────────────────────────────────────────────────────────────────
 
-/// Dtype selector for FusedLinearCE.  v1 supports F32 only.
+/// Vocab sizes at or below this use the v1 single-CTA path **byte-identical**
+/// to pre-Sprint-3.  Above this, the Sprint-3 two-kernel large-vocab path
+/// activates (per-tile partials + per-row finalize).
+///
+/// Picked = 8192 because that was the v1 hard cap; using it as the routing
+/// threshold means the legacy path stays bit-for-bit unchanged for every
+/// shape that v1 used to accept, and the new path only lights up for shapes
+/// v1 used to reject.
+pub const LARGE_VOCAB_THRESHOLD: u32 = 8192;
+
+/// Absolute hard ceiling on `vocab_size`. Above this, both paths refuse to
+/// emit. Sized to cover all real-world LM vocabularies (NSL=49152,
+/// GPT-3=50257, LLaMA-3=128256) with headroom.
+pub const MAX_VOCAB_HARD_CEILING: u32 = 262_144;
+
+/// Dtype selector for FusedLinearCE.  Both v1 single-CTA and Sprint-3
+/// large-vocab paths support F32 only.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dtype {
     F32,
@@ -65,7 +142,11 @@ pub struct FusedLinearCEConfig {
     pub dtype: Dtype,
     /// Label value that means "ignore this token" (default -100).
     pub ignore_index: i64,
-    /// Hard cap on `vocab_size` for v1.  Synthesiser aborts if exceeded.
+    /// Per-config hard cap on `vocab_size`. Defaults to [`LARGE_VOCAB_THRESHOLD`]
+    /// (= 8192) to preserve pre-Sprint-3 rejection behaviour at the default
+    /// config; callers that want the Sprint-3 large-vocab path raise this
+    /// up to (and not above) [`MAX_VOCAB_HARD_CEILING`]. The field name is
+    /// retained for ABI stability with v1 callers.
     pub max_vocab_v1: u32,
 }
 
@@ -86,14 +167,39 @@ impl Default for FusedLinearCEConfig {
 }
 
 impl FusedLinearCEConfig {
+    /// Returns `true` when the Sprint-3 two-kernel large-vocab path will
+    /// be selected by [`synthesize_fused_linear_ce_ptx`]. False = legacy
+    /// v1 single-CTA path (byte-identical to pre-Sprint-3).
+    #[inline]
+    pub fn is_large_vocab(&self) -> bool {
+        self.vocab_size > LARGE_VOCAB_THRESHOLD
+    }
+
+    /// Number of vocab tiles per token row (used to size the partials
+    /// buffer in the large-vocab path).
+    #[inline]
+    pub fn num_vocab_tiles(&self) -> u32 {
+        self.vocab_size.div_ceil(self.vocab_tile)
+    }
+
     /// Validate configuration; returns `Err` with a descriptive message on
     /// any unsupported combination.
     pub fn validate(&self) -> Result<(), String> {
+        // Absolute ceiling — neither path emits above this.
+        if self.vocab_size > MAX_VOCAB_HARD_CEILING {
+            return Err(format!(
+                "fused_linear_ce: vocab_size {} exceeds hard ceiling {} — \
+                 LM vocabularies above 256K are out of scope (NSL=49152, \
+                 GPT-3=50257, LLaMA-3=128256 all fit comfortably below)",
+                self.vocab_size, MAX_VOCAB_HARD_CEILING
+            ));
+        }
         if self.vocab_size > self.max_vocab_v1 {
             return Err(format!(
-                "fused_linear_ce v1: vocab_size {} exceeds hard cap {} — \
-                 use standard CrossEntropyLoss for large-vocab models (v2 scope)",
-                self.vocab_size, self.max_vocab_v1
+                "fused_linear_ce: vocab_size {} exceeds per-config cap \
+                 max_vocab_v1={} — raise max_vocab_v1 up to {} to opt into the \
+                 large-vocab (cross-CTA) path",
+                self.vocab_size, self.max_vocab_v1, MAX_VOCAB_HARD_CEILING
             ));
         }
         if !self.hidden_size.is_multiple_of(32) {
@@ -136,6 +242,12 @@ impl FusedLinearCEConfig {
 
     /// Unique kernel name that encodes the vocab + hidden specialisation so
     /// the cudarc module cache differentiates specialisations.
+    ///
+    /// For `is_large_vocab() == false` this names the v1 single-CTA forward
+    /// kernel. For the large-vocab path callers should use
+    /// [`large_partials_kernel_name`](Self::large_partials_kernel_name) and
+    /// [`large_finalize_kernel_name`](Self::large_finalize_kernel_name)
+    /// instead.
     pub fn kernel_name(&self) -> String {
         format!(
             "nsl_fused_linear_ce_{}_v{}_h{}",
@@ -145,7 +257,8 @@ impl FusedLinearCEConfig {
         )
     }
 
-    /// Name of the backward kernel.
+    /// Name of the backward kernel (shared between v1 and large-vocab paths
+    /// — per-tile gradient scatter scales naturally with vocab).
     pub fn bwd_kernel_name(&self) -> String {
         format!(
             "nsl_fused_linear_ce_backward_{}_v{}_h{}",
@@ -153,6 +266,41 @@ impl FusedLinearCEConfig {
             self.vocab_size,
             self.hidden_size
         )
+    }
+
+    /// Name of Kernel A (per-tile partials) — large-vocab path only.
+    /// Grid: `(num_tiles, B*S, 1)`.
+    pub fn large_partials_kernel_name(&self) -> String {
+        format!(
+            "nsl_fused_linear_ce_fwd_large_partials_{}_v{}_h{}_t{}",
+            self.dtype.tag(),
+            self.vocab_size,
+            self.hidden_size,
+            self.vocab_tile,
+        )
+    }
+
+    /// Name of Kernel B (per-row finalize) — large-vocab path only.
+    /// Grid: `(B*S, 1, 1)`.
+    pub fn large_finalize_kernel_name(&self) -> String {
+        format!(
+            "nsl_fused_linear_ce_fwd_large_finalize_{}_v{}_h{}_t{}",
+            self.dtype.tag(),
+            self.vocab_size,
+            self.hidden_size,
+            self.vocab_tile,
+        )
+    }
+
+    /// Size in bytes of the cross-kernel partials buffer used by the
+    /// large-vocab path: `(B*S) * num_tiles * 2 * sizeof(f32)`.
+    ///
+    /// Each `(row, tile)` slot stores two floats:
+    /// `[tile_max, tile_sum_unscaled = sum_v exp(logit_v - tile_max)]`.
+    pub fn large_partials_bytes(&self) -> u64 {
+        let rows = self.batch_size as u64 * self.seq_len as u64;
+        let n_tiles = self.num_vocab_tiles() as u64;
+        rows * n_tiles * 2 * 4
     }
 
     /// Shared-memory budget per CTA: logits tile (vocab_tile * 4 bytes) +
@@ -180,6 +328,16 @@ impl FusedLinearCEConfig {
 
 /// Synthesise the forward PTX for the fused linear-CE kernel.
 ///
+/// **Routing**: when `cfg.is_large_vocab()` is `false` (vocab_size ≤ 8192),
+/// this returns the v1 single-CTA kernel **byte-identical** to pre-Sprint-3.
+/// When `true`, it returns a single PTX module containing *both* Kernel A
+/// (per-tile partials, name = `cfg.large_partials_kernel_name()`) and
+/// Kernel B (per-row finalize, name = `cfg.large_finalize_kernel_name()`).
+/// The caller (`nsl_fused_linear_ce_forward_large` host launcher) loads
+/// the single module and launches the two kernels back-to-back.
+///
+/// ### v1 single-CTA path (vocab ≤ 8192)
+///
 /// Grid: `(batch_size * seq_len, 1, 1)` — one CTA per token row.
 /// Block: `(128, 1, 1)`.
 ///
@@ -191,8 +349,28 @@ impl FusedLinearCEConfig {
 ///      After the tile loop, compute `loss = -(logit_at_target - lse)` and
 ///      write to `loss_out` and `lse_out` (for backward reuse).
 pub fn synthesize_fused_linear_ce_ptx(cfg: &FusedLinearCEConfig) -> Vec<u8> {
-    let ptx = emit_fwd_kernel(cfg);
-    ptx.into_bytes()
+    if cfg.is_large_vocab() {
+        synthesize_large_vocab_forward_ptx(cfg)
+    } else {
+        emit_fwd_kernel(cfg).into_bytes()
+    }
+}
+
+/// Synthesise a single PTX module containing both Kernel A (per-tile
+/// partials) and Kernel B (per-row finalize) of the Sprint-3 large-vocab
+/// two-kernel forward path.
+///
+/// Both kernels share the same `.version` / `.target` header and use
+/// separately-named `.extern .shared` allocations so the module compiles
+/// as one ptxas TU.
+pub fn synthesize_large_vocab_forward_ptx(cfg: &FusedLinearCEConfig) -> Vec<u8> {
+    let mut out = String::new();
+    out.push_str(&cfg.ptx_header());
+    out.push('\n');
+    out.push_str(&emit_large_partials_kernel(cfg, /*emit_header=*/ false));
+    out.push('\n');
+    out.push_str(&emit_large_finalize_kernel(cfg, /*emit_header=*/ false));
+    out.into_bytes()
 }
 
 /// Synthesise the backward PTX for the fused linear-CE kernel.
@@ -504,6 +682,429 @@ fn emit_fwd_kernel(cfg: &FusedLinearCEConfig) -> String {
     lines.push(String::new());
 
     lines.push(p("WRITE_DONE:"));
+    lines.push(p("\tret;"));
+    lines.push(p("}"));
+
+    lines.join("\n")
+}
+
+// ─── PTX emission — large-vocab path (Sprint 3) ──────────────────────────────
+
+/// Per-tile partials kernel (Kernel A) — see module-level Design block.
+///
+/// Grid: `(num_tiles, B*S, 1)`. Block: `(128, 1, 1)`.
+///
+/// Each CTA:
+///   1. row_idx = ctaid.y, tile_idx = ctaid.x.
+///   2. Loads target = targets[row_idx]; if == ignore_index, writes (0, 0)
+///      to its partials slot and returns (kernel B's same-row guard zeros
+///      the row's loss).
+///   3. Fills smem[0..vocab_tile*4] with logits = x[row] @ W[tile_rows]^T
+///      + bias[tile_rows] using the same 128-thread inner fill v1 uses.
+///   4. bar.sync; then thread 0 reduces smem to (tile_max, tile_sum_unscaled)
+///      where tile_sum_unscaled = sum_v exp(logit_v - tile_max), and stores
+///      both floats to partials[row*num_tiles + tile_idx, 0..2].
+fn emit_large_partials_kernel(cfg: &FusedLinearCEConfig, emit_header: bool) -> String {
+    let name = cfg.large_partials_kernel_name();
+    let vocab = cfg.vocab_size;
+    let hidden = cfg.hidden_size;
+    let vtile = cfg.vocab_tile;
+    let n_tiles = cfg.num_vocab_tiles();
+    let vtile_per_thread = vtile / 128;
+    let ignore = cfg.ignore_index;
+    let smem_bytes = cfg.shared_mem_bytes();
+
+    let mut lines: Vec<String> = Vec::new();
+    let p = |l: &str| l.to_owned();
+
+    if emit_header {
+        lines.push(cfg.ptx_header());
+    }
+    // Each kernel declares its own .extern .shared. Driver allocates per-launch.
+    lines.push(format!(
+        ".extern .shared .align 4 .b8 smem_partials_{vocab}[{smem_bytes}];"
+    ));
+    lines.push(String::new());
+
+    // Signature: x, W, bias, targets, partials, B, S, V, H, num_tiles.
+    lines.push(format!(".visible .entry {name}("));
+    lines.push(p("\t.param .u64 param_x,"));
+    lines.push(p("\t.param .u64 param_w,"));
+    lines.push(p("\t.param .u64 param_bias,"));
+    lines.push(p("\t.param .u64 param_targets,"));
+    lines.push(p("\t.param .u64 param_partials,"));
+    lines.push(p("\t.param .u32 param_B, .param .u32 param_S,"));
+    lines.push(p("\t.param .u32 param_V, .param .u32 param_H,"));
+    lines.push(p("\t.param .u32 param_num_tiles"));
+    lines.push(p(") {"));
+
+    lines.push(p("\t.reg .u64 %rd<30>;"));
+    lines.push(p("\t.reg .u32 %r<24>;"));
+    lines.push(p("\t.reg .s64 %tgt64;"));
+    lines.push(p("\t.reg .f32 %facc, %fa, %fb, %ftmp;"));
+    lines.push(p("\t.reg .f32 %ftmax, %ftsum, %flog2e;"));
+    lines.push(p("\t.reg .pred %pskip, %pv, %pth0;"));
+    lines.push(String::new());
+
+    // Load params.
+    lines.push(p("\tld.param.u64 %rd0, [param_x];"));
+    lines.push(p("\tld.param.u64 %rd1, [param_w];"));
+    lines.push(p("\tld.param.u64 %rd2, [param_bias];"));
+    lines.push(p("\tld.param.u64 %rd3, [param_targets];"));
+    lines.push(p("\tld.param.u64 %rd4, [param_partials];"));
+    lines.push(p("\tmov.u32 %r0, %ctaid.y;   // row_idx"));
+    lines.push(p("\tmov.u32 %r1, %tid.x;     // tid"));
+    lines.push(p("\tmov.u32 %r2, %ctaid.x;   // tile_idx"));
+    lines.push(p("\tmov.f32 %flog2e, 0f3FB8AA3B; // log2(e)"));
+    lines.push(String::new());
+
+    // partials_slot_ptr = partials + (row*num_tiles + tile_idx) * 2 * 4
+    lines.push(format!("\t// partials_slot = partials + (row*{n_tiles}+tile) * 8"));
+    lines.push(p("\tcvt.u64.u32 %rd5, %r0;"));
+    lines.push(format!("\tmov.u32 %r3, {n_tiles};"));
+    lines.push(p("\tcvt.u64.u32 %rd6, %r3;"));
+    lines.push(p("\tmul.lo.u64 %rd5, %rd5, %rd6;"));
+    lines.push(p("\tcvt.u64.u32 %rd7, %r2;"));
+    lines.push(p("\tadd.u64 %rd5, %rd5, %rd7;"));
+    lines.push(p("\tshl.b64 %rd5, %rd5, 3; // *8"));
+    lines.push(p("\tadd.u64 %rd5, %rd4, %rd5; // %rd5 = partials_slot_ptr"));
+    lines.push(String::new());
+
+    // Load target.
+    lines.push(p("\tcvt.u64.u32 %rd8, %r0;"));
+    lines.push(p("\tmul.lo.u64 %rd8, %rd8, 8;"));
+    lines.push(p("\tadd.u64 %rd8, %rd3, %rd8;"));
+    lines.push(p("\tld.global.s64 %tgt64, [%rd8];"));
+    lines.push(String::new());
+
+    // Skip path: thread 0 writes (0, 0) to partials slot, return.
+    lines.push(format!("\tsetp.eq.s64 %pskip, %tgt64, {ignore};"));
+    lines.push(p("\t@!%pskip bra LP_NOTSKIP;"));
+    lines.push(p("\tsetp.eq.u32 %pth0, %r1, 0;"));
+    lines.push(p("\t@!%pth0 bra LP_DONE;"));
+    lines.push(p("\tst.global.f32 [%rd5], 0f00000000;"));
+    lines.push(p("\tst.global.f32 [%rd5+4], 0f00000000;"));
+    lines.push(p("\tbra LP_DONE;"));
+    lines.push(p("LP_NOTSKIP:"));
+    lines.push(String::new());
+
+    // x_row_base = x + row * H * 4.
+    lines.push(p("\tcvt.u64.u32 %rd9, %r0;"));
+    lines.push(format!("\tmov.u32 %r4, {hidden};"));
+    lines.push(p("\tcvt.u64.u32 %rd10, %r4;"));
+    lines.push(p("\tmul.lo.u64 %rd9, %rd9, %rd10;"));
+    lines.push(p("\tshl.b64 %rd9, %rd9, 2;"));
+    lines.push(p("\tadd.u64 %rd9, %rd0, %rd9; // %rd9 = x_row_base"));
+    lines.push(String::new());
+
+    // v_base = tile_idx * vtile.
+    lines.push(format!("\tmul.lo.u32 %r5, %r2, {vtile}; // v_base"));
+    lines.push(String::new());
+
+    // Inner fill loop: each thread writes vtile_per_thread entries in stride-128.
+    lines.push(p("\tmov.u32 %r6, 0; // sub-iter counter"));
+    lines.push(p("LP_INNER:"));
+    lines.push(p("\t\tmul.lo.u32 %r7, %r6, 128;"));
+    lines.push(p("\t\tadd.u32 %r7, %r7, %r1;       // intra-tile slot"));
+    lines.push(p("\t\tadd.u32 %r8, %r7, %r5;       // v_idx = v_base + slot"));
+    lines.push(format!("\t\tsetp.lt.u32 %pv, %r8, {vocab};"));
+    lines.push(p("\t\t@!%pv bra LP_INNER_TAIL_ZERO;"));
+    lines.push(String::new());
+
+    // W_row_base = W + v_idx * H * 4.
+    lines.push(p("\t\tcvt.u64.u32 %rd11, %r8;"));
+    lines.push(format!("\t\tmov.u32 %r9, {hidden};"));
+    lines.push(p("\t\tcvt.u64.u32 %rd12, %r9;"));
+    lines.push(p("\t\tmul.lo.u64 %rd11, %rd11, %rd12;"));
+    lines.push(p("\t\tshl.b64 %rd11, %rd11, 2;"));
+    lines.push(p("\t\tadd.u64 %rd11, %rd1, %rd11; // %rd11 = W_row_base"));
+    lines.push(String::new());
+
+    // Dot product over H.
+    lines.push(p("\t\tmov.f32 %facc, 0f00000000;"));
+    lines.push(p("\t\tmov.u32 %r10, 0; // h"));
+    lines.push(p("\t\tLP_DOT:"));
+    lines.push(p("\t\t\tcvt.u64.u32 %rd13, %r10;"));
+    lines.push(p("\t\t\tshl.b64 %rd13, %rd13, 2;"));
+    lines.push(p("\t\t\tadd.u64 %rd14, %rd9, %rd13;"));
+    lines.push(p("\t\t\tld.global.f32 %fa, [%rd14];"));
+    lines.push(p("\t\t\tadd.u64 %rd14, %rd11, %rd13;"));
+    lines.push(p("\t\t\tld.global.f32 %fb, [%rd14];"));
+    lines.push(p("\t\t\tfma.rn.f32 %facc, %fa, %fb, %facc;"));
+    lines.push(p("\t\t\tadd.u32 %r10, %r10, 1;"));
+    lines.push(format!("\t\t\tsetp.lt.u32 %pv, %r10, {hidden};"));
+    lines.push(p("\t\t\t@%pv bra LP_DOT;"));
+    lines.push(String::new());
+
+    // facc += bias[v_idx].
+    lines.push(p("\t\tcvt.u64.u32 %rd15, %r8;"));
+    lines.push(p("\t\tshl.b64 %rd15, %rd15, 2;"));
+    lines.push(p("\t\tadd.u64 %rd15, %rd2, %rd15;"));
+    lines.push(p("\t\tld.global.f32 %ftmp, [%rd15];"));
+    lines.push(p("\t\tadd.f32 %facc, %facc, %ftmp;"));
+    lines.push(p("\t\tbra LP_INNER_STORE;"));
+    lines.push(String::new());
+
+    // Tail-zero (v_idx out of bounds): store -INF so it doesn't perturb max/sum.
+    lines.push(p("LP_INNER_TAIL_ZERO:"));
+    lines.push(p("\t\tmov.f32 %facc, 0f80800000; // -INF"));
+    lines.push(String::new());
+
+    // Store logit to smem[slot*4].
+    lines.push(p("LP_INNER_STORE:"));
+    lines.push(p("\t\tshl.b32 %r11, %r7, 2;"));
+    lines.push(format!("\t\tmov.u64 %rd16, smem_partials_{vocab};"));
+    lines.push(p("\t\tcvt.u64.u32 %rd17, %r11;"));
+    lines.push(p("\t\tadd.u64 %rd16, %rd16, %rd17;"));
+    lines.push(p("\t\tst.shared.f32 [%rd16], %facc;"));
+    lines.push(String::new());
+
+    lines.push(p("\t\tadd.u32 %r6, %r6, 1;"));
+    lines.push(format!("\t\tsetp.lt.u32 %pv, %r6, {vtile_per_thread};"));
+    lines.push(p("\t\t@%pv bra LP_INNER;"));
+    lines.push(String::new());
+
+    // bar.sync, then thread 0 reduces smem to (tile_max, tile_sum_unscaled).
+    lines.push(p("\tbar.sync 0;"));
+    lines.push(p("\tsetp.eq.u32 %pth0, %r1, 0;"));
+    lines.push(p("\t@!%pth0 bra LP_DONE;"));
+    lines.push(String::new());
+
+    // Pass 1: find tile_max over smem[0..vtile].
+    lines.push(p("\tmov.f32 %ftmax, 0f80800000;"));
+    lines.push(p("\tmov.u32 %r12, 0;"));
+    lines.push(p("LP_RED_MAX:"));
+    lines.push(p("\t\tshl.b32 %r13, %r12, 2;"));
+    lines.push(format!("\t\tmov.u64 %rd18, smem_partials_{vocab};"));
+    lines.push(p("\t\tcvt.u64.u32 %rd19, %r13;"));
+    lines.push(p("\t\tadd.u64 %rd18, %rd18, %rd19;"));
+    lines.push(p("\t\tld.shared.f32 %ftmp, [%rd18];"));
+    lines.push(p("\t\tmax.f32 %ftmax, %ftmax, %ftmp;"));
+    lines.push(p("\t\tadd.u32 %r12, %r12, 1;"));
+    lines.push(format!("\t\tsetp.lt.u32 %pv, %r12, {vtile};"));
+    lines.push(p("\t\t@%pv bra LP_RED_MAX;"));
+    lines.push(String::new());
+
+    // Pass 2: compute tile_sum_unscaled = sum_v exp(logit_v - tile_max).
+    lines.push(p("\tmov.f32 %ftsum, 0f00000000;"));
+    lines.push(p("\tmov.u32 %r12, 0;"));
+    lines.push(p("LP_RED_SUM:"));
+    lines.push(p("\t\tshl.b32 %r13, %r12, 2;"));
+    lines.push(format!("\t\tmov.u64 %rd18, smem_partials_{vocab};"));
+    lines.push(p("\t\tcvt.u64.u32 %rd19, %r13;"));
+    lines.push(p("\t\tadd.u64 %rd18, %rd18, %rd19;"));
+    lines.push(p("\t\tld.shared.f32 %ftmp, [%rd18];"));
+    lines.push(p("\t\tsub.f32 %ftmp, %ftmp, %ftmax;"));
+    lines.push(p("\t\tmul.f32 %ftmp, %ftmp, %flog2e;"));
+    lines.push(p("\t\tex2.approx.f32 %ftmp, %ftmp;"));
+    lines.push(p("\t\tadd.f32 %ftsum, %ftsum, %ftmp;"));
+    lines.push(p("\t\tadd.u32 %r12, %r12, 1;"));
+    lines.push(format!("\t\tsetp.lt.u32 %pv, %r12, {vtile};"));
+    lines.push(p("\t\t@%pv bra LP_RED_SUM;"));
+    lines.push(String::new());
+
+    // Store (tile_max, tile_sum_unscaled) to partials.
+    lines.push(p("\tst.global.f32 [%rd5],   %ftmax;"));
+    lines.push(p("\tst.global.f32 [%rd5+4], %ftsum;"));
+    lines.push(String::new());
+
+    lines.push(p("LP_DONE:"));
+    lines.push(p("\tret;"));
+    lines.push(p("}"));
+
+    lines.join("\n")
+}
+
+/// Per-row finalize kernel (Kernel B) — see module-level Design block.
+///
+/// Grid: `(B*S, 1, 1)`. Block: `(128, 1, 1)`. Uses ONE thread (tid 0) to do
+/// the cross-tile reduce — `num_tiles` is at most a few hundred so the
+/// serial reduce per row is cheap; the gain is parallelism across rows
+/// (the loop that was inside one CTA is now ONE iteration per row, with
+/// `num_tiles` independent partials already computed by Kernel A).
+///
+/// Each CTA:
+///   1. row_idx = ctaid.x.
+///   2. Loads targets[row]; if ignore, writes loss=0/lse=0 and returns.
+///   3. Thread 0 reads partials[row, 0..num_tiles], runs online-LSE rescaling
+///      to compute (global_max, global_sum).
+///   4. Thread 0 recomputes logit_at_target = x[row] @ W[tgt] + bias[tgt]
+///      (one dot product of length H — cheap).
+///   5. Writes loss_out[row] = -(logit_at_target - global_max - log(global_sum))
+///      and lse_out[row] = global_max + log(global_sum).
+fn emit_large_finalize_kernel(cfg: &FusedLinearCEConfig, emit_header: bool) -> String {
+    let name = cfg.large_finalize_kernel_name();
+    let vocab = cfg.vocab_size;
+    let hidden = cfg.hidden_size;
+    let n_tiles = cfg.num_vocab_tiles();
+    let ignore = cfg.ignore_index;
+
+    let mut lines: Vec<String> = Vec::new();
+    let p = |l: &str| l.to_owned();
+
+    if emit_header {
+        lines.push(cfg.ptx_header());
+    }
+    lines.push(String::new());
+
+    lines.push(format!(".visible .entry {name}("));
+    lines.push(p("\t.param .u64 param_x,"));
+    lines.push(p("\t.param .u64 param_w,"));
+    lines.push(p("\t.param .u64 param_bias,"));
+    lines.push(p("\t.param .u64 param_targets,"));
+    lines.push(p("\t.param .u64 param_partials,"));
+    lines.push(p("\t.param .u64 param_loss_out,"));
+    lines.push(p("\t.param .u64 param_lse_out,"));
+    lines.push(p("\t.param .u32 param_B, .param .u32 param_S,"));
+    lines.push(p("\t.param .u32 param_V, .param .u32 param_H,"));
+    lines.push(p("\t.param .u32 param_num_tiles"));
+    lines.push(p(") {"));
+
+    lines.push(p("\t.reg .u64 %rd<24>;"));
+    lines.push(p("\t.reg .u32 %r<16>;"));
+    lines.push(p("\t.reg .s64 %tgt64;"));
+    lines.push(p("\t.reg .f32 %fmax, %fsum, %ftmax, %ftsum, %fnew_max;"));
+    lines.push(p("\t.reg .f32 %ftmp, %fa, %fb, %facc, %flog, %flse, %floss;"));
+    lines.push(p("\t.reg .f32 %flog2e, %fln2;"));
+    lines.push(p("\t.reg .pred %pskip, %pth0, %pv;"));
+    lines.push(String::new());
+
+    lines.push(p("\tld.param.u64 %rd0, [param_x];"));
+    lines.push(p("\tld.param.u64 %rd1, [param_w];"));
+    lines.push(p("\tld.param.u64 %rd2, [param_bias];"));
+    lines.push(p("\tld.param.u64 %rd3, [param_targets];"));
+    lines.push(p("\tld.param.u64 %rd4, [param_partials];"));
+    lines.push(p("\tld.param.u64 %rd5, [param_loss_out];"));
+    lines.push(p("\tld.param.u64 %rd6, [param_lse_out];"));
+    lines.push(p("\tmov.u32 %r0, %ctaid.x;   // row_idx"));
+    lines.push(p("\tmov.u32 %r1, %tid.x;"));
+    lines.push(p("\tmov.f32 %flog2e, 0f3FB8AA3B;"));
+    lines.push(p("\tmov.f32 %fln2,   0f3F317218;"));
+    lines.push(String::new());
+
+    // Only thread 0 does the work; other threads idle then exit.
+    lines.push(p("\tsetp.eq.u32 %pth0, %r1, 0;"));
+    lines.push(p("\t@!%pth0 bra LF_DONE;"));
+    lines.push(String::new());
+
+    // Load target.
+    lines.push(p("\tcvt.u64.u32 %rd7, %r0;"));
+    lines.push(p("\tmul.lo.u64 %rd7, %rd7, 8;"));
+    lines.push(p("\tadd.u64 %rd7, %rd3, %rd7;"));
+    lines.push(p("\tld.global.s64 %tgt64, [%rd7];"));
+    lines.push(String::new());
+
+    // loss_out_ptr / lse_out_ptr for this row.
+    lines.push(p("\tcvt.u64.u32 %rd8, %r0;"));
+    lines.push(p("\tshl.b64 %rd8, %rd8, 2;"));
+    lines.push(p("\tadd.u64 %rd9, %rd5, %rd8;  // loss_out[row]"));
+    lines.push(p("\tadd.u64 %rd10, %rd6, %rd8; // lse_out[row]"));
+    lines.push(String::new());
+
+    // Skip path: write 0, 0.
+    lines.push(format!("\tsetp.eq.s64 %pskip, %tgt64, {ignore};"));
+    lines.push(p("\t@!%pskip bra LF_REDUCE;"));
+    lines.push(p("\tst.global.f32 [%rd9],  0f00000000;"));
+    lines.push(p("\tst.global.f32 [%rd10], 0f00000000;"));
+    lines.push(p("\tbra LF_DONE;"));
+    lines.push(p("LF_REDUCE:"));
+    lines.push(String::new());
+
+    // partials_row_base = partials + row * num_tiles * 8.
+    lines.push(p("\tcvt.u64.u32 %rd11, %r0;"));
+    lines.push(format!("\tmov.u32 %r2, {n_tiles};"));
+    lines.push(p("\tcvt.u64.u32 %rd12, %r2;"));
+    lines.push(p("\tmul.lo.u64 %rd11, %rd11, %rd12;"));
+    lines.push(p("\tshl.b64 %rd11, %rd11, 3; // *8"));
+    lines.push(p("\tadd.u64 %rd11, %rd4, %rd11; // partials_row_base"));
+    lines.push(String::new());
+
+    // Online-LSE reduce across tiles.
+    lines.push(p("\tmov.f32 %fmax, 0f80800000; // -INF"));
+    lines.push(p("\tmov.f32 %fsum, 0f00000000;"));
+    lines.push(p("\tmov.u32 %r3, 0; // tile_idx"));
+    lines.push(p("LF_LOOP:"));
+    lines.push(p("\t\tcvt.u64.u32 %rd13, %r3;"));
+    lines.push(p("\t\tshl.b64 %rd13, %rd13, 3;"));
+    lines.push(p("\t\tadd.u64 %rd13, %rd11, %rd13;"));
+    lines.push(p("\t\tld.global.f32 %ftmax, [%rd13];"));
+    lines.push(p("\t\tld.global.f32 %ftsum, [%rd13+4];"));
+    lines.push(String::new());
+
+    // new_max = max(fmax, ftmax).
+    lines.push(p("\t\tmax.f32 %fnew_max, %fmax, %ftmax;"));
+    // Rescale running sum: fsum *= exp(fmax - new_max).
+    lines.push(p("\t\tsub.f32 %ftmp, %fmax, %fnew_max;"));
+    lines.push(p("\t\tmul.f32 %ftmp, %ftmp, %flog2e;"));
+    lines.push(p("\t\tex2.approx.f32 %ftmp, %ftmp;"));
+    lines.push(p("\t\tmul.f32 %fsum, %fsum, %ftmp;"));
+    // Rescale tile sum: ftsum *= exp(ftmax - new_max).
+    lines.push(p("\t\tsub.f32 %ftmp, %ftmax, %fnew_max;"));
+    lines.push(p("\t\tmul.f32 %ftmp, %ftmp, %flog2e;"));
+    lines.push(p("\t\tex2.approx.f32 %ftmp, %ftmp;"));
+    lines.push(p("\t\tmul.f32 %ftsum, %ftsum, %ftmp;"));
+    // Accumulate.
+    lines.push(p("\t\tadd.f32 %fsum, %fsum, %ftsum;"));
+    lines.push(p("\t\tmov.f32 %fmax, %fnew_max;"));
+    lines.push(String::new());
+
+    lines.push(p("\t\tadd.u32 %r3, %r3, 1;"));
+    lines.push(format!("\t\tsetp.lt.u32 %pv, %r3, {n_tiles};"));
+    lines.push(p("\t\t@%pv bra LF_LOOP;"));
+    lines.push(String::new());
+
+    // lse = log(sum) + max.
+    lines.push(p("\tlg2.approx.f32 %flse, %fsum;"));
+    lines.push(p("\tmul.f32 %flse, %flse, %fln2;"));
+    lines.push(p("\tadd.f32 %flse, %flse, %fmax;"));
+    lines.push(String::new());
+
+    // logit_at_target: recompute single dot product x[row] @ W[tgt] + bias[tgt].
+    // x_row_base = x + row*H*4.
+    lines.push(p("\tcvt.u64.u32 %rd14, %r0;"));
+    lines.push(format!("\tmov.u32 %r4, {hidden};"));
+    lines.push(p("\tcvt.u64.u32 %rd15, %r4;"));
+    lines.push(p("\tmul.lo.u64 %rd14, %rd14, %rd15;"));
+    lines.push(p("\tshl.b64 %rd14, %rd14, 2;"));
+    lines.push(p("\tadd.u64 %rd14, %rd0, %rd14; // x_row_base"));
+    // W_tgt_base = W + tgt * H * 4 (tgt is in %tgt64 as s64; mul is u64 since vocab>0).
+    lines.push(p("\tmul.lo.s64 %rd16, %tgt64, %rd15;"));
+    lines.push(p("\tshl.b64 %rd16, %rd16, 2;"));
+    lines.push(p("\tadd.u64 %rd16, %rd1, %rd16; // W_tgt_base"));
+    lines.push(String::new());
+
+    // Dot.
+    lines.push(p("\tmov.f32 %facc, 0f00000000;"));
+    lines.push(p("\tmov.u32 %r5, 0;"));
+    lines.push(p("LF_DOT:"));
+    lines.push(p("\t\tcvt.u64.u32 %rd17, %r5;"));
+    lines.push(p("\t\tshl.b64 %rd17, %rd17, 2;"));
+    lines.push(p("\t\tadd.u64 %rd18, %rd14, %rd17;"));
+    lines.push(p("\t\tld.global.f32 %fa, [%rd18];"));
+    lines.push(p("\t\tadd.u64 %rd18, %rd16, %rd17;"));
+    lines.push(p("\t\tld.global.f32 %fb, [%rd18];"));
+    lines.push(p("\t\tfma.rn.f32 %facc, %fa, %fb, %facc;"));
+    lines.push(p("\t\tadd.u32 %r5, %r5, 1;"));
+    lines.push(format!("\t\tsetp.lt.u32 %pv, %r5, {hidden};"));
+    lines.push(p("\t\t@%pv bra LF_DOT;"));
+    lines.push(String::new());
+
+    // Add bias[tgt].
+    lines.push(p("\tmul.lo.s64 %rd19, %tgt64, 4;"));
+    lines.push(p("\tadd.u64 %rd19, %rd2, %rd19;"));
+    lines.push(p("\tld.global.f32 %ftmp, [%rd19];"));
+    lines.push(p("\tadd.f32 %facc, %facc, %ftmp; // logit_at_target"));
+    lines.push(String::new());
+
+    // loss = lse - logit_at_target.
+    lines.push(p("\tsub.f32 %floss, %flse, %facc;"));
+    lines.push(p("\tst.global.f32 [%rd9],  %floss;"));
+    lines.push(p("\tst.global.f32 [%rd10], %flse;"));
+    lines.push(String::new());
+
+    lines.push(p("LF_DONE:"));
+    // Suppress unused-V warning: keep V param consumed.
+    let _ = vocab;
     lines.push(p("\tret;"));
     lines.push(p("}"));
 
@@ -924,6 +1525,77 @@ mod tests {
         assert!(default_cfg().validate().is_ok());
     }
 
+    #[test]
+    fn test_validate_rejects_above_hard_ceiling() {
+        let mut cfg = default_cfg();
+        // Raise per-config cap so we don't hit the legacy gate first.
+        cfg.max_vocab_v1 = u32::MAX;
+        cfg.vocab_size = MAX_VOCAB_HARD_CEILING + 1;
+        cfg.vocab_tile = 128;
+        let err = cfg.validate().expect_err("above hard ceiling must reject");
+        assert!(err.contains("hard ceiling"), "{err}");
+    }
+
+    #[test]
+    fn test_is_large_vocab_predicate_matches_threshold() {
+        let mut cfg = default_cfg();
+        cfg.max_vocab_v1 = MAX_VOCAB_HARD_CEILING;
+
+        cfg.vocab_size = LARGE_VOCAB_THRESHOLD;
+        cfg.vocab_tile = 128;
+        assert!(!cfg.is_large_vocab(), "AT threshold must be small-vocab (v1 path)");
+
+        cfg.vocab_size = LARGE_VOCAB_THRESHOLD + 128;
+        assert!(cfg.is_large_vocab(), "above threshold must route to large-vocab path");
+    }
+
+    #[test]
+    fn test_validate_accepts_large_vocab_when_cap_raised() {
+        let cfg = FusedLinearCEConfig {
+            vocab_size: 49152,
+            hidden_size: 128,
+            seq_len: 64,
+            batch_size: 2,
+            vocab_tile: 128,
+            gpu_sm: 80,
+            dtype: Dtype::F32,
+            ignore_index: -100,
+            max_vocab_v1: MAX_VOCAB_HARD_CEILING,
+        };
+        cfg.validate().expect("vocab=49152 with raised cap MUST validate");
+        assert!(cfg.is_large_vocab());
+    }
+
+    #[test]
+    fn test_num_vocab_tiles_div_ceil() {
+        let mut cfg = default_cfg();
+        cfg.vocab_size = 49152;
+        cfg.vocab_tile = 128;
+        cfg.max_vocab_v1 = MAX_VOCAB_HARD_CEILING;
+        assert_eq!(cfg.num_vocab_tiles(), 49152 / 128);
+
+        // Non-divisible: rounds up.
+        cfg.vocab_size = 49153;
+        assert_eq!(cfg.num_vocab_tiles(), (49153 + 127) / 128);
+    }
+
+    #[test]
+    fn test_large_partials_bytes_matches_formula() {
+        let cfg = FusedLinearCEConfig {
+            vocab_size: 49152,
+            hidden_size: 128,
+            seq_len: 64,
+            batch_size: 2,
+            vocab_tile: 128,
+            gpu_sm: 80,
+            dtype: Dtype::F32,
+            ignore_index: -100,
+            max_vocab_v1: MAX_VOCAB_HARD_CEILING,
+        };
+        // (B*S) * num_tiles * 2 floats * 4 bytes = 128 * 384 * 8 = 393_216
+        assert_eq!(cfg.large_partials_bytes(), 128 * 384 * 8);
+    }
+
     // ── Kernel name ──────────────────────────────────────────────────────
 
     #[test]
@@ -1002,6 +1674,96 @@ mod tests {
         let ptx_bytes = synthesize_fused_linear_ce_backward_ptx(&cfg);
         let ptx = std::str::from_utf8(&ptx_bytes).unwrap();
         assert!(ptx.contains(&cfg.bwd_kernel_name()));
+    }
+
+    // ── Large-vocab two-kernel PTX synthesis (structural) ────────────────
+
+    fn large_vocab_cfg() -> FusedLinearCEConfig {
+        FusedLinearCEConfig {
+            vocab_size: 49152,
+            hidden_size: 128,
+            seq_len: 64,
+            batch_size: 2,
+            vocab_tile: 128,
+            gpu_sm: 80,
+            dtype: Dtype::F32,
+            ignore_index: -100,
+            max_vocab_v1: MAX_VOCAB_HARD_CEILING,
+        }
+    }
+
+    #[test]
+    fn test_large_ptx_contains_both_kernel_entries() {
+        let cfg = large_vocab_cfg();
+        cfg.validate().unwrap();
+        assert!(cfg.is_large_vocab());
+
+        let ptx_bytes = synthesize_fused_linear_ce_ptx(&cfg);
+        let ptx = std::str::from_utf8(&ptx_bytes).unwrap();
+
+        // Kernel A entry.
+        let kname_a = cfg.large_partials_kernel_name();
+        assert!(
+            ptx.contains(&format!(".visible .entry {kname_a}(")),
+            "missing Kernel A entry: {kname_a}"
+        );
+        // Kernel B entry.
+        let kname_b = cfg.large_finalize_kernel_name();
+        assert!(
+            ptx.contains(&format!(".visible .entry {kname_b}(")),
+            "missing Kernel B entry: {kname_b}"
+        );
+    }
+
+    #[test]
+    fn test_large_ptx_header_emitted_once() {
+        let cfg = large_vocab_cfg();
+        let ptx_bytes = synthesize_fused_linear_ce_ptx(&cfg);
+        let ptx = std::str::from_utf8(&ptx_bytes).unwrap();
+        // Exactly one .version line + one .target line at module scope.
+        assert_eq!(
+            ptx.matches(".version 7.0").count(),
+            1,
+            ".version must appear exactly once at module scope"
+        );
+        assert_eq!(
+            ptx.matches(".target sm_80").count(),
+            1,
+            ".target must appear exactly once at module scope"
+        );
+    }
+
+    #[test]
+    fn test_large_ptx_contains_skip_predicate() {
+        let cfg = large_vocab_cfg();
+        let ptx_bytes = synthesize_fused_linear_ce_ptx(&cfg);
+        let ptx = std::str::from_utf8(&ptx_bytes).unwrap();
+        assert!(ptx.contains("setp.eq.s64"));
+        assert!(ptx.contains("-100"));
+    }
+
+    #[test]
+    fn test_large_ptx_partials_pointer_arithmetic_is_present() {
+        let cfg = large_vocab_cfg();
+        let ptx_bytes = synthesize_fused_linear_ce_ptx(&cfg);
+        let ptx = std::str::from_utf8(&ptx_bytes).unwrap();
+        // Both kernels must dereference partials with an 8-byte stride
+        // (one f32 pair per (row, tile) slot). The store in Kernel A
+        // writes ftmax then ftsum at +0 and +4.
+        assert!(ptx.contains("st.global.f32 [%rd5],   %ftmax;"));
+        assert!(ptx.contains("st.global.f32 [%rd5+4], %ftsum;"));
+        // The load in Kernel B reads ftmax then ftsum at +0 and +4.
+        assert!(ptx.contains("ld.global.f32 %ftmax, [%rd13];"));
+        assert!(ptx.contains("ld.global.f32 %ftsum, [%rd13+4];"));
+    }
+
+    #[test]
+    fn test_large_ptx_is_ascii_only() {
+        let cfg = large_vocab_cfg();
+        let bytes = synthesize_fused_linear_ce_ptx(&cfg);
+        for b in bytes.iter() {
+            assert!(*b < 128, "non-ASCII byte 0x{b:02x} in large-vocab PTX");
+        }
     }
 
     #[test]
