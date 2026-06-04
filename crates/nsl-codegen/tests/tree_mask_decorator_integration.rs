@@ -13,10 +13,14 @@
 //!      tag was already shipped in M33, but no source-level NSL program
 //!      could reach it before this sprint).
 //!
-//!   3. The synthesized PTX contains `dfs_enter_ptr` (the kernel-param
-//!      name that is only emitted when `config.tree_mask=true`; see
-//!      `flash_attention.rs:582`).  This is the ground-truth proof that
-//!      the M33 PTX-side gate fired.
+//!   3. The synthesized PTX loads the `%dfs_enter_base` register from
+//!      `dfs_enter_ptr`. The PARAMETER `dfs_enter_ptr` is declared
+//!      unconditionally on the kernel (`flash_attention.rs:449`); only
+//!      the REGISTER load (`flash_attention.rs:584`/`635`) is gated on
+//!      `config.tree_mask`. Probing for `%dfs_enter_base` therefore
+//!      gives the ground-truth proof that the M33 ancestor-check code
+//!      path fired — probing for the parameter name would be a false
+//!      positive (caught by the holistic reviewer pre-cycle-3-close).
 //!
 //! Together (1)+(2)+(3) close the loop: source decorator → semantic
 //! checker → codegen extraction → config → kernel-name + PTX.
@@ -29,7 +33,7 @@ const TREE_MASK_FIXTURE: &str = include_str!("fixtures/tree_mask_decorator.nsl")
 
 #[test]
 fn tree_mask_decorator_reaches_config_and_kernel_name_and_ptx() {
-    let (ctx_set, tree_mask_flag, kernel_name, ptx_has_dfs_enter_ptr) =
+    let (ctx_set, tree_mask_flag, kernel_name, ptx_has_dfs_enter_base) =
         flash_tree_mask_context_for_source(TREE_MASK_FIXTURE);
 
     assert!(
@@ -58,10 +62,12 @@ fn tree_mask_decorator_reaches_config_and_kernel_name_and_ptx() {
     );
 
     assert!(
-        ptx_has_dfs_enter_ptr,
-        "Sprint 1 cycle-3: synthesized PTX must declare the \
-         `dfs_enter_ptr` kernel parameter when config.tree_mask=true \
+        ptx_has_dfs_enter_base,
+        "Sprint 1 cycle-3: synthesized PTX must load the \
+         `%dfs_enter_base` register when config.tree_mask=true \
          (paper §4 DFS-enter/DFS-exit ancestor check, shipped in M33 \
-         and gated on this flag)",
+         and gated on this flag). The PARAMETER `dfs_enter_ptr` is \
+         declared unconditionally; only the register load proves the \
+         M33 code path fired."
     );
 }

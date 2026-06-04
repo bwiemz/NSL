@@ -323,10 +323,15 @@ pub fn flash_gap_f_context_for_source(
 /// - `kernel_name`     — what the runtime dispatcher will look up; pins
 ///                       the variant tag (`_t1_` for tree_mask=true) per
 ///                       `flash_attention.rs::test_tree_mask_variant`.
-/// - `ptx_contains_dfs_enter_ptr` — `true` iff the synthesized PTX
-///                       carries the `dfs_enter_ptr` kernel parameter,
-///                       which is only emitted when `config.tree_mask`
-///                       is true (`flash_attention.rs:582`).
+/// - `ptx_contains_dfs_enter_base` — `true` iff the synthesized PTX
+///                       loads the `%dfs_enter_base` register from the
+///                       `dfs_enter_ptr` kernel parameter. The parameter
+///                       itself is emitted unconditionally
+///                       (`flash_attention.rs:449`), but the register
+///                       load (`flash_attention.rs:584`/`635`) is gated
+///                       on `config.tree_mask` — so probing for the
+///                       register gives the ground-truth proof that the
+///                       M33 ancestor-check code path was taken.
 pub fn flash_tree_mask_context_for_source(
     src: &str,
 ) -> (bool, Option<bool>, Option<String>, bool) {
@@ -362,7 +367,12 @@ pub fn flash_tree_mask_context_for_source(
                 &ptx[..]
             };
             let ptx_str = std::str::from_utf8(ptx_body).unwrap_or("");
-            let has_dfs = ptx_str.contains("dfs_enter_ptr");
+            // Probe for the register, not the parameter: the param
+            // `dfs_enter_ptr` is declared unconditionally; only the
+            // register load `%dfs_enter_base` is gated on
+            // `config.tree_mask` — so the register's presence is the
+            // ground-truth proof that the M33 ancestor-check fired.
+            let has_dfs = ptx_str.contains("%dfs_enter_base");
             (true, Some(cfg.tree_mask), Some(kernel_name), has_dfs)
         }
         None => (false, None, None, false),
