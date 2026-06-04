@@ -595,6 +595,11 @@ fn emit_fused_forward_under_claim(
             null, null,
             // PCA §4.3: doc_starts_ptr — read from the same registry.
             doc_starts_v,
+            // PCA per-doc CTA (Strategy 3 v1): num_docs_or_zero.  0 here —
+            // the @train fused forward kernel name does not carry the
+            // `_per_doc_cta` suffix in any codegen path today.  Wiring
+            // this to a packing-registry runtime read is Sprint 2 follow-on.
+            null,
         ],
     )?;
     {

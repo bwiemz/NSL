@@ -1080,6 +1080,10 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
             types::I64, // tier_b_name_ptr
             // PCA §4.3: doc_starts device pointer (0 = identity positions)
             types::I64, // doc_starts_ptr
+            // PCA per-doc CTA (Strategy 3 v1): num_docs_or_zero — grid_x
+            // override when the kernel name carries the `_per_doc_cta`
+            // suffix. Pass 0 for all non-per-doc topologies.
+            types::I64, // num_docs_or_zero
         ],
         Some(types::I64),
     ),
@@ -1124,6 +1128,10 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
             types::I64, // tier_b_name_ptr
             // PCA §4.3: doc_starts device pointer (0 = identity positions)
             types::I64, // doc_starts_ptr
+            // PCA per-doc CTA (Strategy 3 v1): num_docs_or_zero — grid_x
+            // override when the kernel name carries the `_per_doc_cta`
+            // suffix. Pass 0 for all non-per-doc topologies.
+            types::I64, // num_docs_or_zero
         ],
         Some(types::I64),
     ),
