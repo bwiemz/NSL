@@ -37,19 +37,35 @@ pub fn synthesize_dkdv_kernel(
     if !hd.is_multiple_of(32) {
         return Err(BackwardSynthError::UnsupportedHeadDim(hd));
     }
-    // Precondition: effective_bq == effective_bkv. The single warp-band register
-    // %band_row_base = warp_id*16 is used BOTH as a q-row base (inner-loop S/dP MMA,
-    // stats load, P/dS col scatter) AND as a kv-row base (outer-loop dV/dK accumulator
-    // MMA + HBM finalize). Those interpretations coincide only when bq==bkv (so
-    // active_warps = bq/16 = bkv/16 and each warp owns the same 16 rows in both axes).
-    // A bq!=bkv config would silently corrupt dK/dV; fail loudly instead.
+    // Sprint 3 cycle-2 (paper sec 3.2 asymmetric tiles): the historical
+    // effective_bq == effective_bkv precondition is LIFTED. `%band_row_base`
+    // has been split into axis-specific `%band_row_base_q` (inner-loop S/dP
+    // MMA, stats load, P/dS col scatter) and `%band_row_base_kv` (outer-loop
+    // dV/dK accumulator MMA + HBM finalize). The idle-warp predicate is also
+    // split per-axis: `%p_warp_active_q` gates Q-axis n-tile work and
+    // `%p_warp_active_kv` gates KV-axis dV/dK MMA + finalize. For the
+    // symmetric bq == bkv configs that ship today both registers hold
+    // identical values, so the emitted PTX is structurally equivalent
+    // (modulo register names + a second warp_id*16 multiply).
+    //
+    // Defensive invariants we DO still enforce:
+    //   - both effective_bq and effective_bkv must be divisible by 16
+    //     (one warp owns a 16-row band on each axis);
+    //   - both must be powers of two (the warp-band derivation stays
+    //     in-bounds for the gated warp range and keeps any future modulo
+    //     reduction expressible as `and.b32` with a tile-mask).
     {
         use crate::flash_attention_v2::smem_layout::{tier_b2_effective_bkv, tier_b2_effective_bq};
         let ebq = tier_b2_effective_bq(config);
         let ebkv = tier_b2_effective_bkv(config);
-        if ebq != ebkv {
+        if !ebq.is_multiple_of(16) || !ebkv.is_multiple_of(16) {
             return Err(BackwardSynthError::UnsupportedConfig(format!(
-                "dK/dV kernel requires effective_bq == effective_bkv (warp-band dual-use), got bq={ebq} bkv={ebkv}"
+                "dK/dV kernel requires effective_bq and effective_bkv divisible by 16, got bq={ebq} bkv={ebkv}"
+            )));
+        }
+        if !ebq.is_power_of_two() || !ebkv.is_power_of_two() {
+            return Err(BackwardSynthError::UnsupportedConfig(format!(
+                "dK/dV kernel requires effective_bq and effective_bkv to be powers of two, got bq={ebq} bkv={ebkv}"
             )));
         }
     }
@@ -73,7 +89,7 @@ pub fn synthesize_dkdv_kernel(
     emit_inner_loop_close(&mut ptx);
     // Finalize MUST run INSIDE the kv-outer loop: dK/dV accumulators are per-kv-tile
     // (zeroed at kv-outer open, accumulated over the q sweep). Finalize's HBM row =
-    // kv_iter*bkv + band_row_base + lane/4. Placing it after the kv-outer close would
+    // kv_iter*bkv + band_row_base_kv + lane/4. Placing it after the kv-outer close would
     // use the post-loop %kv_iter (= num_kv_iters), writing OOB rows. Run it per kv_iter
     // before the increment so each kv-tile's dK/dV is written with the correct in-range row.
     emit_dkdv_finalize(&mut ptx, config);
@@ -126,8 +142,18 @@ fn emit_register_decls(ptx: &mut String, config: &FlashAttentionConfig) {
     // NOTE: user register named %r_tid (not %tid) to avoid shadowing the PTX special register
     // %tid (a vector); ptxas rejects %tid.x when %tid is declared as a user u32.
     ptx.push_str("    .reg .u32 %r_tid, %lane_id, %warp_id;\n");
-    ptx.push_str("    .reg .u32 %band_row_base;\n");
-    ptx.push_str("    .reg .pred %p_warp_active;\n");
+    // Sprint 3 cycle-2 (paper sec 3.2): axis-specific warp-band bases. The
+    // pre-cycle-2 single %band_row_base was dual-purposed as both a q-row
+    // and a kv-row base, which silently corrupted dK/dV on bq != bkv tiles.
+    // Now %band_row_base_q feeds Q-axis sites (stats load, S/dP MMA, P/dS
+    // scatter, intra-tile causal mask) and %band_row_base_kv feeds KV-axis
+    // sites (dV/dK MMA + HBM finalize). For bq == bkv both registers hold
+    // identical values.
+    ptx.push_str("    .reg .u32 %band_row_base_q, %band_row_base_kv;\n");
+    // Sprint 3 cycle-2: per-axis idle-warp predicate. `_q` gates the q-axis
+    // n-tile loop (S/dP/P-scatter/dS-scatter); `_kv` gates the kv-axis
+    // dV/dK MMA + HBM finalize. With bq=bkv they hold identical values.
+    ptx.push_str("    .reg .pred %p_warp_active_q, %p_warp_active_kv;\n");
     ptx.push_str("    .reg .u32 %kv_tile, %q_tile, %head, %batch_idx;\n");
     ptx.push_str("    .reg .pred %p_tile_active, %p_producer, %p_consumer;\n");
     ptx.push_str("    .reg .u32 %addr_lo, %tile_skip_predicate;\n");
@@ -205,7 +231,7 @@ fn emit_register_decls(ptx: &mut String, config: &FlashAttentionConfig) {
     ptx.push_str("    .reg .f32 %ds_0, %ds_1, %ds_2, %ds_3;\n");
     // Sprint 4 (paper sec 4.1): intra-tile causal element-mask scratch.
     // Used by emit_intra_tile_causal_mask in this kernel (kv-outer/q-inner).
-    // q_abs_lo = q_iter*bq + band_row_base + lane/4 (+8 for hi);
+    // q_abs_lo = q_iter*bq + band_row_base_q + lane/4 (+8 for hi);
     // kv_abs_lo = kv_iter*bkv + n_tile*8 + (lane%4)*2 (+1 for hi).
     // %f_neg_inf carries the -INFINITY f32 sentinel. Compile-time gated emission:
     // when config.causal=false the executable instructions are not emitted; ptxas
@@ -284,26 +310,36 @@ fn emit_grid_id_setup(ptx: &mut String) {
     ptx.push('\n');
 }
 
-/// Emit warp-band ownership base and the idle-warp predicate from %warp_id.
+/// Emit axis-specific warp-band ownership bases and the per-axis idle-warp
+/// predicates from `%warp_id`.
 ///
-/// `%band_row_base = warp_id*16` is DUAL-USE (valid only under the kernel's
-/// `effective_bq == effective_bkv` precondition): a q-row base for the inner-loop
-/// S/dP MMA + stats + P/dS scatter, and a kv-row base for the outer-loop dV/dK
-/// accumulator MMA + finalize. With bq==bkv, `active_warps = bkv/16 = bq/16` and the
-/// 16-row band is identical in both axes. See the inline comment + the precondition
-/// in `synthesize_dkdv_kernel`.
+/// Sprint 3 cycle-2 (paper sec 3.2 asymmetric tiles): the pre-cycle-2 single
+/// `%band_row_base = warp_id*16` was DUAL-USE — a q-row base for the inner-loop
+/// S/dP MMA + stats + P/dS scatter AND a kv-row base for the outer-loop dV/dK
+/// accumulator MMA + finalize — and was only valid under the now-lifted
+/// `effective_bq == effective_bkv` precondition. The split:
+///
+///   `%band_row_base_q  = warp_id * 16`  -> Q-axis sites; `warp_id < bq/16`.
+///   `%band_row_base_kv = warp_id * 16`  -> KV-axis sites; `warp_id < bkv/16`.
+///
+/// Both are derived independently because future asymmetric layouts may apply
+/// different banding (e.g. modulo masking) on each axis without disturbing
+/// the other. For symmetric bq == bkv the two registers hold identical
+/// values and the emitted PTX is structurally equivalent to pre-cycle-2.
 fn emit_warp_band_setup(ptx: &mut String, config: &FlashAttentionConfig) {
-    let active_warps = tier_b2_effective_bkv(config) / 16; // 4 at bkv=64, 2 at bkv=32
-    // %band_row_base = warp_id*16 is dual-use: under the synthesize_dkdv_kernel
-    // precondition effective_bq == effective_bkv, it is simultaneously a valid q-row
-    // base (inner-loop S/dP MMA, stats load, P/dS col scatter — bq-tall tiles) AND a
-    // valid kv-row base (outer-loop dV/dK accumulator MMA + HBM finalize — bkv-tall
-    // tiles). active_warps = bkv/16 = bq/16, so each warp owns the same 16 rows in both
-    // interpretations. (The bq!=bkv case is rejected up front; see the precondition.)
-    ptx.push_str("    // Warp-per-m16-band: warp w owns row band [w*16, w*16+16) (q-rows inner / kv-rows outer; bq==bkv).\n");
-    ptx.push_str("    mul.lo.u32 %band_row_base, %warp_id, 16;\n");
+    let active_warps_q = tier_b2_effective_bq(config) / 16; // 4 at bq=64, 2 at bq=32
+    let active_warps_kv = tier_b2_effective_bkv(config) / 16; // 4 at bkv=64, 2 at bkv=32
+    ptx.push_str("    // Warp-per-m16-band, axis-specific (Sprint 3 cycle-2 / paper sec 3.2):\n");
+    ptx.push_str("    //   %band_row_base_q  = warp_id*16  -> Q-axis (S/dP MMA, stats, P/dS scatter)\n");
+    ptx.push_str("    //   %band_row_base_kv = warp_id*16  -> KV-axis (dV/dK MMA + HBM finalize)\n");
+    ptx.push_str("    // For bq == bkv both registers are identical (byte-equivalent to pre-Sprint-3).\n");
+    ptx.push_str("    mul.lo.u32 %band_row_base_q,  %warp_id, 16;\n");
+    ptx.push_str("    mul.lo.u32 %band_row_base_kv, %warp_id, 16;\n");
     ptx.push_str(&format!(
-        "    setp.lt.u32 %p_warp_active, %warp_id, {active_warps};  // active = warp_id < bkv/16\n"
+        "    setp.lt.u32 %p_warp_active_q,  %warp_id, {active_warps_q};  // q-axis active = warp_id < bq/16\n"
+    ));
+    ptx.push_str(&format!(
+        "    setp.lt.u32 %p_warp_active_kv, %warp_id, {active_warps_kv}; // kv-axis active = warp_id < bkv/16\n"
     ));
     ptx.push('\n');
 }
@@ -799,19 +835,20 @@ fn emit_do_producer_load(ptx: &mut String, config: &FlashAttentionConfig) {
 
 /// Load per-row softmax stats (row_max, row_sum, D) from HBM for the current q tile.
 ///
-/// Stats are indexed by q rows: s_lo = q_iter*bq + band_row_base + lane/4;
+/// Stats are indexed by q rows: s_lo = q_iter*bq + band_row_base_q + lane/4;
 /// s_hi = s_lo + 8.  Called inside the q-inner loop (per-q_iter), because
-/// each q_iter covers a different set of q rows.
+/// each q_iter covers a different set of q rows. Q-axis site -> use
+/// `%band_row_base_q` (Sprint 3 cycle-2 / paper sec 3.2 asymmetric tiles).
 fn emit_stats_addr_load(ptx: &mut String, config: &FlashAttentionConfig) {
     use super::hbm_addr::emit_3d_byte_offset;
     let bq = tier_b2_effective_bq(config);
-    ptx.push_str("    // === Per-row stats load (s_lo/s_hi = q_iter*bq + band_row_base + lane/4 [+8]) ===\n");
+    ptx.push_str("    // === Per-row stats load (s_lo/s_hi = q_iter*bq + band_row_base_q + lane/4 [+8]) ===\n");
     ptx.push_str("    ld.param.u64 %stats_rmax_base, [row_max_ptr];\n");
     ptx.push_str("    ld.param.u64 %stats_rsum_base, [row_sum_ptr];\n");
     ptx.push_str("    ld.param.u64 %stats_d_base, [d_ptr];\n");
     ptx.push_str("    shr.u32 %stat_lane_div4, %lane_id, 2;\n");
     ptx.push_str(&format!("    mul.lo.u32 %s_lo, %q_iter, {bq};\n"));
-    ptx.push_str("    add.u32 %s_lo, %s_lo, %band_row_base;\n");
+    ptx.push_str("    add.u32 %s_lo, %s_lo, %band_row_base_q;\n");
     ptx.push_str("    add.u32 %s_lo, %s_lo, %stat_lane_div4;\n");
     ptx.push_str("    add.u32 %s_hi, %s_lo, 8;\n");
     emit_3d_byte_offset(ptx, "%stats_off_lo", "%batch_idx", "%head", "%s_lo", "%heads_r", "%seq_len_r", 4);
@@ -882,15 +919,16 @@ fn emit_tile_skip_predicate(ptx: &mut String, config: &FlashAttentionConfig) {
 /// dK (dS^T @ Q). Matches the CPU naive reference `k_limit = qi + 1` exactly.
 ///
 /// LANE -> (q_abs, kv_abs) MAPPING (per PTX m16n8 D-fragment layout, identical
-/// to dq.rs::emit_intra_tile_causal_mask; in the dkdv kernel %band_row_base is
-/// a q-row offset for the S/dP MMA, exactly like dq):
+/// to dq.rs::emit_intra_tile_causal_mask; in the dkdv kernel %band_row_base_q is
+/// the Q-axis warp-band base for the S/dP MMA, exactly like dq's
+/// %band_row_base):
 ///   %s_d0 -> (q_abs_lo, kv_abs_lo)
 ///   %s_d1 -> (q_abs_lo, kv_abs_lo + 1)
 ///   %s_d2 -> (q_abs_lo + 8, kv_abs_lo)
 ///   %s_d3 -> (q_abs_lo + 8, kv_abs_lo + 1)
 /// where
-///   q_abs_lo  = q_iter * bq  + band_row_base + (lane_id / 4)
-///   kv_abs_lo = kv_iter * bkv + n_tile * 8   + (lane_id % 4) * 2
+///   q_abs_lo  = q_iter * bq  + band_row_base_q + (lane_id / 4)
+///   kv_abs_lo = kv_iter * bkv + n_tile * 8     + (lane_id % 4) * 2
 ///
 /// EMISSION GATING
 /// ---------------
@@ -906,7 +944,7 @@ fn emit_intra_tile_causal_mask(ptx: &mut String, config: &FlashAttentionConfig) 
 
     ptx.push_str("    // V2_INTRA_TILE_CAUSAL_MASK (paper sec 4.1): per-element causal mask\n");
     ptx.push_str("    // For each S-fragment element i in {0..3}:\n");
-    ptx.push_str("    //   q_abs_lo  = q_iter*bq  + band_row_base + lane_id/4\n");
+    ptx.push_str("    //   q_abs_lo  = q_iter*bq  + band_row_base_q + lane_id/4\n");
     ptx.push_str("    //   kv_abs_lo = kv_iter*bkv + n_tile*8     + (lane_id%4)*2\n");
     ptx.push_str("    //   d0 <- (q_abs_lo, kv_abs_lo); d1 <- (q_abs_lo, kv_abs_lo+1);\n");
     ptx.push_str("    //   d2 <- (q_abs_lo+8, kv_abs_lo); d3 <- (q_abs_lo+8, kv_abs_lo+1).\n");
@@ -917,7 +955,7 @@ fn emit_intra_tile_causal_mask(ptx: &mut String, config: &FlashAttentionConfig) 
     ptx.push_str("    shr.u32 %cm_lane_div4, %lane_id, 2;             // lane/4\n");
 
     ptx.push_str(&format!("    mul.lo.u32 %cm_q_tile_base, %q_iter, {bq};\n"));
-    ptx.push_str("    add.u32 %cm_q_abs_lo, %cm_q_tile_base, %band_row_base;\n");
+    ptx.push_str("    add.u32 %cm_q_abs_lo, %cm_q_tile_base, %band_row_base_q;\n");
     ptx.push_str("    add.u32 %cm_q_abs_lo, %cm_q_abs_lo, %cm_lane_div4;\n");
     ptx.push_str("    add.u32 %cm_q_abs_hi, %cm_q_abs_lo, 8;\n");
 
@@ -982,9 +1020,10 @@ fn emit_s_matmul_tiled(
         ptx.push_str(&format!("    mov.f32 %{r}, 0.0;\n"));
     }
     for k in 0..n_k_tiles {
-        // A base = cvta(shmem) + q_off + band_row_base*hd*2 + k*16*2 (Q-band rows, k-tile cols)
+        // A base = cvta(shmem) + q_off + band_row_base_q*hd*2 + k*16*2 (Q-band rows, k-tile cols)
+        // Sprint 3 cycle-2: Q-axis site -> %band_row_base_q (paper sec 3.2).
         ptx.push_str(&format!(
-            "    mul.lo.u32 %a_base, %band_row_base, {};\n",
+            "    mul.lo.u32 %a_base, %band_row_base_q, {};\n",
             hd * 2
         ));
         ptx.push_str(&format!(
@@ -1017,7 +1056,7 @@ fn emit_s_matmul_tiled(
 /// n_tile (the kv-column tile selected by the live `%n_tile` register).
 ///
 /// Mirrors `emit_s_matmul_tiled` for the dK/dV layout:
-///   - A = dO  (A-base: `tier_b2_dkdv_dO_offset`, `%band_row_base` q-row offset)
+///   - A = dO  (A-base: `tier_b2_dkdv_dO_offset`, `%band_row_base_q` q-row offset)
 ///   - B = V   (B-base: `tier_b2_dkdv_v_offset`, runtime `%n_tile` kv-column offset)
 ///   - row-major V byte-aliases V^T with col_stride = hd*2
 ///
@@ -1060,9 +1099,10 @@ fn emit_dp_matmul_tiled(
         ptx.push_str(&format!("    mov.f32 %{r}, 0.0;\n"));
     }
     for k in 0..n_k_tiles {
-        // A base = cvta(shmem) + do_off + band_row_base*hd*2 + k*16*2  (dO-band rows, k-tile cols)
+        // A base = cvta(shmem) + do_off + band_row_base_q*hd*2 + k*16*2  (dO-band rows, k-tile cols)
+        // Sprint 3 cycle-2: Q-axis site -> %band_row_base_q (paper sec 3.2).
         ptx.push_str(&format!(
-            "    mul.lo.u32 %a_base, %band_row_base, {};\n",
+            "    mul.lo.u32 %a_base, %band_row_base_q, {};\n",
             hd * 2
         ));
         ptx.push_str(&format!(
@@ -1098,7 +1138,7 @@ fn emit_dp_matmul_tiled(
 ///   - Labels use the DKDV_ prefix (both kernels concatenate into one PTX module).
 ///   - SMEM offsets use tier_b2_dkdv_q_offset / tier_b2_dkdv_k_offset.
 ///   - num_n_tiles = bkv/8 (contraction over the kv axis, one 8-col n-tile at a time).
-///   - %band_row_base maps to q-rows (per emit_warp_band_setup: warp_id*16 q-rows).
+///   - %band_row_base_q maps to q-rows (per emit_warp_band_setup: warp_id*16 q-rows).
 ///   - Per-row stats (%rmax_lo/hi, %rsum_recip_lo/hi) are loaded by emit_stats_addr_load
 ///     inside the q-inner loop (indexed by %q_iter), so they are fresh here.
 fn emit_inner_loop_body(ptx: &mut String, config: &FlashAttentionConfig) {
@@ -1147,17 +1187,19 @@ fn emit_inner_loop_body(ptx: &mut String, config: &FlashAttentionConfig) {
     // computes S(tiled) -> P-recompute for this %n_tile.
     // Tasks 5-8 will add dP/dS/scatter/MMA-3/4 inside the n-tile loop.
     let num_n_tiles = tier_b2_effective_bkv(config) / 8;
-    // Idle-warp gate: warps with warp_id >= bkv/16 skip the n-tile loop entirely.
-    // The loop has NO bar.sync inside, so skipping is deadlock-safe; idle warps
-    // reconverge at DKDV_IDLE_SKIP_NTILE.
-    ptx.push_str("    @!%p_warp_active bra DKDV_IDLE_SKIP_NTILE;\n");
+    // Idle-warp gate: warps with warp_id >= bq/16 skip the n-tile loop entirely.
+    // The n-tile loop is Q-axis work (S/dP/P-scatter/dS-scatter sit on the q-band
+    // owned by `%band_row_base_q`), so the gate is per-Q-axis (Sprint 3 cycle-2 /
+    // paper sec 3.2). The loop has NO bar.sync inside, so skipping is deadlock-safe;
+    // idle warps reconverge at DKDV_IDLE_SKIP_NTILE.
+    ptx.push_str("    @!%p_warp_active_q bra DKDV_IDLE_SKIP_NTILE;\n");
     ptx.push_str(&format!("    mov.u32 %num_n_tiles, {num_n_tiles};\n"));
     ptx.push_str("    mov.u32 %n_tile, 0;\n");
     ptx.push_str("DKDV_NTILE_LOOP:\n");
 
     // === S = Q @ K^T (m16n8k16, k-tile contraction codegen-unrolled per n_tile) ===
     // Row-major K[bkv, hd] byte-aliases to col-major K^T[hd, bkv] with
-    // col_stride_bytes = hd*2. A-frag base folds %band_row_base (q-rows);
+    // col_stride_bytes = hd*2. A-frag base folds %band_row_base_q (q-rows);
     // B-frag base derives from runtime %n_tile (kv columns).
     ptx.push_str("    // === E1: S = Q @ K^T (tiled m16n8k16, k-tiles unrolled, per runtime n_tile) ===\n");
     emit_s_matmul_tiled(ptx, config, &a_regs, &b_regs, &c_regs, &d_regs);
@@ -1282,7 +1324,10 @@ fn emit_inner_loop_body(ptx: &mut String, config: &FlashAttentionConfig) {
     let dkv_a: [String; 4] = ["dkv_a0", "dkv_a1", "dkv_a2", "dkv_a3"].map(String::from);
     let dkv_b: [String; 2] = ["dkv_b0", "dkv_b1"].map(String::from);
     ptx.push_str("    // === MMA-3: dV += P^T @ dO ; MMA-4: dK += dS^T @ Q ===\n");
-    ptx.push_str("    @!%p_warp_active bra DKDV_IDLE_SKIP_DKDV;\n");
+    // Sprint 3 cycle-2: KV-axis MMA -> gated on %p_warp_active_kv (warps that
+    // own a kv-band). Each warp's accumulator covers the full bq Q-axis via the
+    // emit_dkdv_matmul k-loop, so q-axis warps without a kv-band must skip.
+    ptx.push_str("    @!%p_warp_active_kv bra DKDV_IDLE_SKIP_DKDV;\n");
     emit_dkdv_matmul(ptx, config, pcol_off, docol_off, "dv_acc", &dkv_a, &dkv_b);
     emit_dkdv_matmul(ptx, config, dscol_off, qcol_off, "dk_acc", &dkv_a, &dkv_b);
     ptx.push_str("DKDV_IDLE_SKIP_DKDV:\n");
@@ -1294,7 +1339,7 @@ fn emit_inner_loop_body(ptx: &mut String, config: &FlashAttentionConfig) {
 /// Task 7 (b): Scatter P C-fragment values to col-major `[kv, bq]` f16 SMEM band.
 ///
 /// The per-lane PTX m16n8 D-fragment layout (same element→(q,kv) mapping as F1 in dq.rs):
-///   p_0 -> (q_lo = band_row_base + lane/4,     kv_lo = n_tile*8 + (lane%4)*2    )
+///   p_0 -> (q_lo = band_row_base_q + lane/4,   kv_lo = n_tile*8 + (lane%4)*2    )
 ///   p_1 -> (q_lo,                              kv_hi = kv_lo + 1)
 ///   p_2 -> (q_hi = q_lo + 8,                  kv_lo)
 ///   p_3 -> (q_hi,                              kv_hi)
@@ -1322,8 +1367,8 @@ fn emit_pcol_scatter(ptx: &mut String, config: &FlashAttentionConfig) {
     ptx.push_str("    and.b32 %bs_lane_mod4, %lane_id, 3;    // lane % 4\n");
     ptx.push_str("    shr.u32 %bs_lane_div4, %lane_id, 2;    // lane / 4\n");
 
-    // q_lo = band_row_base + lane/4 ;  q_hi = q_lo + 8
-    ptx.push_str("    add.u32 %bs_q_lo, %band_row_base, %bs_lane_div4;\n");
+    // q_lo = band_row_base_q + lane/4 ;  q_hi = q_lo + 8 (Sprint 3 cycle-2: Q-axis)
+    ptx.push_str("    add.u32 %bs_q_lo, %band_row_base_q, %bs_lane_div4;\n");
     ptx.push_str("    add.u32 %bs_q_hi, %bs_q_lo, 8;\n");
 
     // kv_lo = n_tile*8 + (lane%4)*2 ;  kv_hi = kv_lo + 1
@@ -1394,8 +1439,8 @@ fn emit_dscol_scatter(ptx: &mut String, config: &FlashAttentionConfig) {
     ptx.push_str("    and.b32 %bs_lane_mod4, %lane_id, 3;    // lane % 4\n");
     ptx.push_str("    shr.u32 %bs_lane_div4, %lane_id, 2;    // lane / 4\n");
 
-    // q_lo = band_row_base + lane/4 ;  q_hi = q_lo + 8
-    ptx.push_str("    add.u32 %bs_q_lo, %band_row_base, %bs_lane_div4;\n");
+    // q_lo = band_row_base_q + lane/4 ;  q_hi = q_lo + 8 (Sprint 3 cycle-2: Q-axis)
+    ptx.push_str("    add.u32 %bs_q_lo, %band_row_base_q, %bs_lane_div4;\n");
     ptx.push_str("    add.u32 %bs_q_hi, %bs_q_lo, 8;\n");
 
     // kv_lo = n_tile*8 + (lane%4)*2 ;  kv_hi = kv_lo + 1
@@ -1603,7 +1648,7 @@ fn emit_inner_loop_close(ptx: &mut String) {
 /// Arguments:
 ///   - `a_off` : SMEM byte offset of the A col-major band `[kv, bq]` f16.
 ///               Each kv-row is a row of bq f16 values; row_stride = bq*2.
-///               The warp's 16 kv-rows start at `band_row_base`.
+///               The warp's 16 kv-rows start at `band_row_base_kv`.
 ///   - `b_off` : SMEM byte offset of the B col-major band `[hd, bq]` f16.
 ///               Organised as `[n_tile*8 .. n_tile*8+8, bq]`; col_stride = bq*2.
 ///   - `acc_prefix`: register prefix for the accumulator, e.g. `"dv_acc"` or `"dk_acc"`.
@@ -1658,10 +1703,11 @@ fn emit_dkdv_matmul(
 
     // k OUTER / n INNER: load A once per k-tile, reuse across all hd/8 n-tiles.
     for k in 0..n_k_tiles {
-        // A base = cvta(shmem) + a_off + band_row_base*(bq*2) + k*16*2
-        // band_row_base is the warp's 16 kv-row base (kv-dimension of A).
+        // A base = cvta(shmem) + a_off + band_row_base_kv*(bq*2) + k*16*2
+        // %band_row_base_kv is the warp's 16 kv-row base (kv-dimension of A).
+        // Sprint 3 cycle-2: KV-axis site -> %band_row_base_kv (paper sec 3.2).
         ptx.push_str(&format!(
-            "    mul.lo.u32 %a_base, %band_row_base, {};\n",
+            "    mul.lo.u32 %a_base, %band_row_base_kv, {};\n",
             bq * 2
         ));
         ptx.push_str(&format!(
@@ -1692,7 +1738,7 @@ fn emit_dkdv_matmul(
 /// G1/G2: dV + dK HBM finalize — scatter dV_acc and dK_acc to HBM.
 ///
 /// Clones `emit_dq_finalize` from dq.rs TWICE, adapted for the kv-based output row:
-///   row = kv_iter*bkv + band_row_base + lane/4   (not q_iter*bq as in dQ)
+///   row = kv_iter*bkv + band_row_base_kv + lane/4   (not q_iter*bq as in dQ)
 ///
 /// Placed INSIDE the kv-outer loop (after q-inner loop closes, before the
 /// kv-outer back-edge), so each kv tile's accumulated dK/dV is written with
@@ -1701,7 +1747,8 @@ fn emit_dkdv_matmul(
 /// HBM byte_offset = (((batch_idx * H + head) * S + row) * D + col) * 4
 /// via emit_4d_byte_offset (sizeof_dtype = 4 for f32).
 ///
-/// Idle-warp gate: both blocks are wrapped in a single `@!%p_warp_active bra DKDV_IDLE_SKIP_FINAL`.
+/// Idle-warp gate: both blocks are wrapped in a single
+/// `@!%p_warp_active_kv bra DKDV_IDLE_SKIP_FINAL`.
 /// Deadlock-safe: the only code after finalize is the kv-outer back-edge (no bar.sync).
 fn emit_dkdv_finalize(ptx: &mut String, config: &FlashAttentionConfig) {
     use super::hbm_addr::emit_4d_byte_offset;
@@ -1711,9 +1758,10 @@ fn emit_dkdv_finalize(ptx: &mut String, config: &FlashAttentionConfig) {
     let n_n_tiles = hd / 8;
 
     // Idle-warp gate: warps with warp_id >= bkv/16 own no kv-rows and must skip
-    // the HBM stores or they would write OOB rows.
+    // the HBM stores or they would write OOB rows. Sprint 3 cycle-2: uses the
+    // KV-axis predicate %p_warp_active_kv (paper sec 3.2 asymmetric tiles).
     // DKDV_IDLE_SKIP_FINAL is placed after both dV and dK blocks; no bar.sync in between.
-    ptx.push_str("    @!%p_warp_active bra DKDV_IDLE_SKIP_FINAL;\n");
+    ptx.push_str("    @!%p_warp_active_kv bra DKDV_IDLE_SKIP_FINAL;\n");
 
     // --- dV block ---
     ptx.push_str("    // === Finalize dV ===\n");
@@ -1726,9 +1774,10 @@ fn emit_dkdv_finalize(ptx: &mut String, config: &FlashAttentionConfig) {
     // kv_tile_start = kv_iter * bkv
     ptx.push_str(&format!("    mul.lo.u32 %g1_kv_tile_start, %kv_iter, {bkv};\n"));
 
-    // row_lo = kv_tile_start + band_row_base + lane/4
+    // row_lo = kv_tile_start + band_row_base_kv + lane/4
     // row_hi = row_lo + 8
-    ptx.push_str("    add.u32 %g1_row_lo, %g1_kv_tile_start, %band_row_base;\n");
+    // Sprint 3 cycle-2: KV-axis site -> %band_row_base_kv (paper sec 3.2).
+    ptx.push_str("    add.u32 %g1_row_lo, %g1_kv_tile_start, %band_row_base_kv;\n");
     ptx.push_str("    add.u32 %g1_row_lo, %g1_row_lo, %g1_lane_div4;\n");
     ptx.push_str("    add.u32 %g1_row_hi, %g1_row_lo, 8;\n");
 
@@ -1787,9 +1836,10 @@ fn emit_dkdv_finalize(ptx: &mut String, config: &FlashAttentionConfig) {
     // kv_tile_start = kv_iter * bkv
     ptx.push_str(&format!("    mul.lo.u32 %g2_kv_tile_start, %kv_iter, {bkv};\n"));
 
-    // row_lo = kv_tile_start + band_row_base + lane/4
+    // row_lo = kv_tile_start + band_row_base_kv + lane/4
     // row_hi = row_lo + 8
-    ptx.push_str("    add.u32 %g2_row_lo, %g2_kv_tile_start, %band_row_base;\n");
+    // Sprint 3 cycle-2: KV-axis site -> %band_row_base_kv (paper sec 3.2).
+    ptx.push_str("    add.u32 %g2_row_lo, %g2_kv_tile_start, %band_row_base_kv;\n");
     ptx.push_str("    add.u32 %g2_row_lo, %g2_row_lo, %g2_lane_div4;\n");
     ptx.push_str("    add.u32 %g2_row_hi, %g2_row_lo, 8;\n");
 
@@ -1968,5 +2018,136 @@ mod tests {
             h_uses >= 2,
             "non-GQA path must wire %head directly into K (C1) and V (C2) loads; got {h_uses}"
         );
+    }
+
+    // -------------------------------------------------------------------
+    // Sprint 3 cycle-2 (paper sec 3.2 asymmetric tiles): axis-specific
+    // %band_row_base_q / %band_row_base_kv + %p_warp_active_q /
+    // %p_warp_active_kv. These tests pin (a) the symmetric case still emits
+    // both registers with byte-equivalent semantics, and (b) the kernel
+    // synthesizes successfully for both directions of asymmetry (bq != bkv).
+    // -------------------------------------------------------------------
+
+    fn asymmetric_cfg(bq: i64, bkv: i64, hd: i64) -> FlashAttentionConfig {
+        FlashAttentionConfig {
+            block_q: bq,
+            block_kv: bkv,
+            head_dim: hd,
+            causal: false,
+            paged: false,
+            rope_q: false,
+            rope_style: RopeStyle::HalfSplit,
+            gqa_group_size: 1,
+            tree_mask: false,
+            gpu_sm: 80,
+            segment_masked: false,
+            csha: Some(CshaExtras { level: 2, ..Default::default() }),
+        }
+    }
+
+    #[test]
+    fn dkdv_kernel_emits_axis_specific_band_row_base_and_warp_active() {
+        // Symmetric case: both registers must be declared, both warp-band
+        // derivations must be emitted, and the per-axis idle-warp predicates
+        // must be referenced at the Q-axis (n-tile loop) and KV-axis
+        // (dV/dK MMA + HBM finalize) sites.
+        let ptx = synthesize_dkdv_kernel(&canonical_cfg()).expect("synth ok");
+        assert!(
+            ptx.contains(".reg .u32 %band_row_base_q, %band_row_base_kv;"),
+            "axis-specific band-row-base registers must be declared"
+        );
+        assert!(
+            ptx.contains(".reg .pred %p_warp_active_q, %p_warp_active_kv;"),
+            "axis-specific idle-warp predicates must be declared"
+        );
+        assert!(
+            ptx.contains("mul.lo.u32 %band_row_base_q,  %warp_id, 16;"),
+            "Q-axis warp-band derivation must be emitted"
+        );
+        assert!(
+            ptx.contains("mul.lo.u32 %band_row_base_kv, %warp_id, 16;"),
+            "KV-axis warp-band derivation must be emitted"
+        );
+        assert!(
+            ptx.contains("@!%p_warp_active_q bra DKDV_IDLE_SKIP_NTILE;"),
+            "n-tile loop must be gated on the Q-axis warp-active predicate"
+        );
+        assert!(
+            ptx.contains("@!%p_warp_active_kv bra DKDV_IDLE_SKIP_DKDV;"),
+            "dV/dK MMA must be gated on the KV-axis warp-active predicate"
+        );
+        assert!(
+            ptx.contains("@!%p_warp_active_kv bra DKDV_IDLE_SKIP_FINAL;"),
+            "HBM finalize must be gated on the KV-axis warp-active predicate"
+        );
+        // Pre-cycle-2 unsuffixed register must not appear in any executable
+        // PTX line (comments may still reference the historical name; we
+        // therefore look only for the register-with-prefix patterns).
+        assert!(
+            !ptx.contains("%band_row_base,"),
+            "pre-cycle-2 unsuffixed %band_row_base must not appear in emitted PTX operands"
+        );
+        assert!(
+            !ptx.contains("%p_warp_active "),
+            "pre-cycle-2 unsuffixed %p_warp_active must not appear in emitted PTX operands"
+        );
+    }
+
+    #[test]
+    fn dkdv_kernel_synthesizes_at_asymmetric_bq_lt_bkv() {
+        // bq=32, bkv=64: q-axis has 2 active warps; kv-axis has 4.
+        // Warps 2,3 skip q-axis n-tile work but participate in dV/dK MMA
+        // + HBM finalize (their accumulator covers the full bq via the
+        // emit_dkdv_matmul k-loop). hd=64 keeps the SMEM math conservative.
+        let cfg = asymmetric_cfg(32, 64, 64);
+        let ptx = synthesize_dkdv_kernel(&cfg).expect("synth must accept bq < bkv");
+        assert!(ptx.contains("tier_b2_dkdv_kernel"));
+        // Sanity: Q-axis warp gate active_warps = bq/16 = 2.
+        assert!(
+            ptx.contains("setp.lt.u32 %p_warp_active_q,  %warp_id, 2;"),
+            "Q-axis active_warps must be bq/16=2 at bq=32"
+        );
+        // KV-axis warp gate active_warps = bkv/16 = 4.
+        assert!(
+            ptx.contains("setp.lt.u32 %p_warp_active_kv, %warp_id, 4;"),
+            "KV-axis active_warps must be bkv/16=4 at bkv=64"
+        );
+    }
+
+    #[test]
+    fn dkdv_kernel_synthesizes_at_asymmetric_bq_gt_bkv() {
+        // bq=64, bkv=32: q-axis has 4 active warps; kv-axis has 2.
+        // All 4 warps do q-axis n-tile work (scatter P/dS into SMEM);
+        // only warps 0,1 finalize dV/dK to HBM.
+        let cfg = asymmetric_cfg(64, 32, 64);
+        let ptx = synthesize_dkdv_kernel(&cfg).expect("synth must accept bq > bkv");
+        assert!(ptx.contains("tier_b2_dkdv_kernel"));
+        assert!(
+            ptx.contains("setp.lt.u32 %p_warp_active_q,  %warp_id, 4;"),
+            "Q-axis active_warps must be bq/16=4 at bq=64"
+        );
+        assert!(
+            ptx.contains("setp.lt.u32 %p_warp_active_kv, %warp_id, 2;"),
+            "KV-axis active_warps must be bkv/16=2 at bkv=32"
+        );
+    }
+
+    #[test]
+    fn dkdv_kernel_rejects_non_power_of_two_block_sizes() {
+        // 24 is divisible by 16? No (16 only divides multiples of 16 — 24 is not).
+        // We test a divisible-by-16 but not power-of-two value to hit the
+        // second guard. 48 is divisible by 16 (48 = 16 * 3) but not a power
+        // of two.
+        let cfg = asymmetric_cfg(48, 64, 64);
+        let result = synthesize_dkdv_kernel(&cfg);
+        assert!(matches!(result, Err(BackwardSynthError::UnsupportedConfig(_))));
+    }
+
+    #[test]
+    fn dkdv_kernel_rejects_not_divisible_by_16_block_sizes() {
+        // bq=8 is not divisible by 16.
+        let cfg = asymmetric_cfg(8, 64, 64);
+        let result = synthesize_dkdv_kernel(&cfg);
+        assert!(matches!(result, Err(BackwardSynthError::UnsupportedConfig(_))));
     }
 }

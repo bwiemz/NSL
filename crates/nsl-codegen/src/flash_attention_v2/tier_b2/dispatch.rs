@@ -85,17 +85,18 @@ pub fn tier_b2_can_dispatch(
     let Some((bq, chunk)) = ladder_row(hd) else {
         return Err(DispatchReject::UnsupportedHeadDim(hd));
     };
-    // Sprint 9 Part B: bkv == bq is a HARD kernel invariant of the dKdV kernel
-    // (dkdv.rs:40-54). The single `%band_row_base = warp_id*16` register is
-    // dual-used as a q-row base (inner-loop S/dP MMA + stats load + P/dS col
-    // scatter) AND a kv-row base (outer-loop dV/dK accumulator MMA + HBM
-    // finalize). Asymmetric tiles would silently corrupt dK/dV. Lifting this
-    // requires splitting %band_row_base into separate q/kv warp-band registers,
-    // doubling warp setup, and re-auditing every q-row vs kv-row use site in
-    // dkdv.rs (lines ~208, 290, 297, 303, 802-814, 885, 892, 909, finalize).
-    // That's a substantial kernel rewrite; deferred. Until then the planner
-    // pins bkv = bq, matching the precondition the dKdV kernel enforces at
-    // synth time via tier_b2_effective_bq/bkv parity.
+    // Sprint 3 cycle-2 (paper sec 3.2 asymmetric tiles): the historical
+    // bkv == bq invariant was lifted in dkdv.rs by splitting the dual-use
+    // %band_row_base register into axis-specific %band_row_base_q /
+    // %band_row_base_kv (and similarly the idle-warp predicate). The
+    // planner still pins bkv = bq today because no caller currently asks
+    // for asymmetric tiles AND the per-hd SMEM ladder above pins one
+    // (bq, chunk) pair per head_dim, so widening the predicate without a
+    // separate kv ladder would not change observed dispatch. Once a
+    // caller surfaces a genuine asymmetric demand (or a kv ladder lands),
+    // the kernel is ready: dkdv synthesise no longer rejects bq != bkv,
+    // and emit_warp_band_setup gates Q-axis work on bq/16 active warps
+    // and KV-axis work on bkv/16 active warps independently.
     let bkv = bq;
     let needed = tier_b2_smem_bytes(bq, bkv, hd, chunk);
     if needed > SMEM_DYNAMIC_BUDGET_BYTES {
