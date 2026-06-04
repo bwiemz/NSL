@@ -1203,6 +1203,41 @@ fn lower_single_op(
 
         // === Loss functions (3 ops) ===
         // Loss functions are composite: we lower them to sequences of existing FFI calls.
+        //
+        // CFTP §4.4 G3 (Sprint 2.5 SUBSTITUTION SITE):
+        //
+        // When the surrounding `train` block carries `@fused_lm_ce(enabled = true)`,
+        // the planned Sprint 2.5 lowering will:
+        //
+        //   1. Walk the Wengert list backwards from this op to confirm
+        //      `inputs[0]` was produced by a `Matmul` whose RHS is a
+        //      `Transpose` (the stdlib `fused_linear_ce` pattern in
+        //      stdlib/nsl/nn/losses.nsl), AND `inputs[0]` was produced by
+        //      a `BiasAdd`/`Add` whose RHS is a 1-D bias tensor.
+        //   2. Extract `(x, W, bias, targets)` from those upstream ops.
+        //   3. Synthesise a `FusedLinearCEConfig` from the static tensor
+        //      shapes (vocab_size, hidden_size, batch_size, seq_len)
+        //      + `Compiler.fused_ce_configs[0].vocab_tile`, embed the PTX
+        //      via `embed_flash_ptx`-style helper, emit a single
+        //      `nsl_fused_linear_ce_forward` FFI call with pre-allocated
+        //      loss + lse outputs (the latter saved for backward).
+        //   4. Register a custom backward emitter on the result var that
+        //      calls `nsl_fused_linear_ce_backward` with the saved lse,
+        //      producing dx / dW / dbias to feed `Compiler.adjoints`.
+        //
+        // Sprint 2 (current) intentionally falls through to the composite
+        // path below for ALL cross_entropy occurrences — the decorator
+        // is collected but does NOT yet drive substitution. The opt-in
+        // gate `Compiler.fused_ce_configs.first().map(|c| c.enabled)`
+        // exists in compiler state ready for Sprint 2.5 to consume.
+        //
+        // Cross-references:
+        //   * crates/nsl-codegen/src/fused_linear_ce.rs — PTX synthesis.
+        //   * crates/nsl-runtime/src/fused_linear_ce.rs — forward + bwd FFI.
+        //   * stdlib/nsl/nn/losses.nsl::fused_linear_ce — user-facing
+        //     stdlib function (Sprint 2 wires the composite v1 path).
+        //   * crates/nsl-semantic/src/cftp.rs::validate_fused_ce_decorator
+        //     — decorator parsing + alignment-invariant enforcement.
         PrimalOp::CrossEntropyLoss => {
             // Match stdlib/nsl/nn/losses.nsl semantics, including ignore labels
             // encoded as -100 by the DataLoader.
