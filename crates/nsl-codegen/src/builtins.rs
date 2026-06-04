@@ -1434,6 +1434,25 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
         &[types::I64, types::I64, types::I64, types::I64, types::I64],
         Some(types::I64),
     ),
+    // CPDT Part III v1 production-forward (M32 gap closure): same as v1
+    // plus `experts_ptr`, `hidden_dim`, `intermediate_dim` (3 extra i64
+    // args, total 8). Returns NslTensor `[total_tokens, intermediate_dim]`
+    // (note: trailing dim differs from v1's `[total_tokens, hidden_dim]`
+    // identity output). See crates/nsl-runtime/src/moe/ffi.rs.
+    (
+        "nsl_moe_dispatch_full_v2",
+        &[
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+        ],
+        Some(types::I64),
+    ),
     // --- M33: Speculative decoding runtime functions ---
     (
         "nsl_speculative_draft",

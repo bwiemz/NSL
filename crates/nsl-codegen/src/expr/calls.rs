@@ -1581,6 +1581,14 @@ impl Compiler<'_> {
         }
 
         // M32: MoE dispatch intrinsic
+        //
+        // CPDT Part III v1 production-forward (M32 gap closure): when an
+        // expert WeightMap entry is resolvable AND its shape implies a
+        // well-formed `(hidden_dim, intermediate_dim)` split, emit
+        // `nsl_moe_dispatch_full_v2` against the real expert weight tensor
+        // (replaces the M32 identity skeleton at moe/ffi.rs:287). Otherwise
+        // fall through to the v1 identity emission — silent-fallback to be
+        // hard-erred in S4.
         if func_name == "moe_dispatch" {
             if args.len() != 3 {
                 return Err(crate::error::CodegenError::new(
@@ -1589,15 +1597,12 @@ impl Compiler<'_> {
             }
             let tokens_val = self.compile_expr(builder, state, &args[0].value)?;
             let logits_val = self.compile_expr(builder, state, &args[1].value)?;
-            let _experts_val = self.compile_expr(builder, state, &args[2].value)?;
+            let experts_val = self.compile_expr(builder, state, &args[2].value)?;
 
-            // Look up MoE config from decorator extraction, using model name prefix
-            // from the mangled function name ("ModelName__method_name") to correctly
-            // resolve the right config in multi-layer models instead of grabbing an
-            // arbitrary entry via .values().next().
             // Look up MoE config by matching model name prefix from mangled function name.
-            // Try both "ModelName__method" pattern and any config key matching.
-            let config = state
+            // Also capture the matching key so we can scope the WeightMap lookup below
+            // identically to cpdt_expert_prune::prune_moe_weights_in_map.
+            let config_with_key = state
                 .current_function_name
                 .as_ref()
                 .and_then(|fn_name| {
@@ -1606,19 +1611,25 @@ impl Compiler<'_> {
                         .moe_configs
                         .iter()
                         .find(|(key, _)| key.starts_with(model_prefix))
-                        .map(|(_, info)| info.clone())
+                        .map(|(key, info)| (key.clone(), info.clone()))
                 })
                 .or_else(|| {
                     // Fallback: if only one MoE config exists, use it
                     if self.features.moe_configs.len() == 1 {
-                        self.features.moe_configs.values().next().cloned()
+                        self.features
+                            .moe_configs
+                            .iter()
+                            .next()
+                            .map(|(k, v)| (k.clone(), v.clone()))
                     } else {
                         None
                     }
                 });
-            let (num_experts, top_k, capacity_factor) = match config {
-                Some(info) => (info.num_experts, info.top_k, info.capacity_factor),
-                None => (8, 2, 1.25f32), // defaults
+            let (cfg_key, num_experts, top_k, capacity_factor) = match &config_with_key {
+                Some((k, info)) => {
+                    (Some(k.clone()), info.num_experts, info.top_k, info.capacity_factor)
+                }
+                None => (None, 8, 2, 1.25f32), // defaults
             };
 
             let num_experts_val = builder
@@ -1632,8 +1643,48 @@ impl Compiler<'_> {
                 capacity_factor.to_bits() as i64,
             );
 
-            // Call nsl_moe_dispatch_full(tokens, logits, num_experts, top_k, capacity_factor_bits)
-            // Returns a new NslTensor with the MoE output
+            // CPDT Part III v1: derive (hidden_dim, intermediate_dim) from
+            // the WeightMap router/experts shapes via the shared helper
+            // `crate::moe::derive_v2_dims`. None → silent v1 fallback (S4
+            // promotes that path to a hard compile error for cpdt_mode=Full).
+            let v2_dims = if let (Some(key), Some(weight_map)) =
+                (cfg_key.as_ref(), self.features.weight_map.as_ref())
+            {
+                crate::moe::derive_v2_dims(weight_map, key, num_experts)
+            } else {
+                None
+            };
+
+            if let Some((hidden_dim, intermediate_dim)) = v2_dims {
+                let hidden_val = builder.ins().iconst(
+                    cranelift_codegen::ir::types::I64,
+                    hidden_dim as i64,
+                );
+                let intermediate_val = builder.ins().iconst(
+                    cranelift_codegen::ir::types::I64,
+                    intermediate_dim as i64,
+                );
+                let result = self.compile_call_by_name(
+                    builder,
+                    "nsl_moe_dispatch_full_v2",
+                    &[
+                        tokens_val,
+                        logits_val,
+                        experts_val,
+                        num_experts_val,
+                        top_k_val,
+                        cap_bits,
+                        hidden_val,
+                        intermediate_val,
+                    ],
+                )?;
+                return Ok(result);
+            }
+
+            // Fallback: emit v1 (M32 identity skeleton) for backward
+            // compatibility. S4 will promote this path to a hard
+            // CodegenError when cpdt_mode == Full, so non-CPDT consumers
+            // still get v1 but CPDT consumers fail-fast on missing data.
             let result = self.compile_call_by_name(
                 builder,
                 "nsl_moe_dispatch_full",
