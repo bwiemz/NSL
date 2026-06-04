@@ -323,10 +323,14 @@ fn layer_profile(spec: &ModelSpec, gpu: &GpuSpec, layer: usize) -> LayerProfile 
         (attn + ffn + 2 * d) * spec.dtype_bytes as u64
     };
     // Apply byte savings from the static fusion-event template.  Each fired event
-    // removes one tensor's worth of HBM round-trip (read + write that would otherwise
-    // leave and re-enter HBM as an intermediate).  Conservative: one bsd_bytes saving
-    // per always-on event; SwiGLU saves an additional bsdff_bytes for the gate*up
-    // intermediate.  This makes fusion_events numerically load-bearing rather than
+    // eliminates a full HBM round-trip of the fused intermediate: the write to HBM
+    // and the subsequent read back are both avoided, so the saving is 2× the tensor
+    // size (read + write), not 1×.  Always-on events:
+    //   NormIntoMatmul + MatmulIntoRope + SoftmaxIntoMatmul + ResidualAdd = 4 events
+    // Each saves 2 × bsd_bytes → 8 × bsd_bytes total.
+    // SwiGLU also eliminates a full round-trip of the gate*up intermediate
+    // (bsdff_bytes wide), so that saves 2 × bsdff_bytes.
+    // This makes fusion_events numerically load-bearing rather than
     // decorative, addressing paper §3.1 / G3+G15.
     let bsd_bytes: u64 = (spec.batch as u64)
         .saturating_mul(spec.max_seq as u64)
@@ -336,10 +340,11 @@ fn layer_profile(spec: &ModelSpec, gpu: &GpuSpec, layer: usize) -> LayerProfile 
         .saturating_mul(spec.max_seq as u64)
         .saturating_mul(spec.d_ff[layer] as u64)
         .saturating_mul(spec.dtype_bytes as u64);
-    // Always-on events: NormIntoMatmul + MatmulIntoRope + SoftmaxIntoMatmul + ResidualAdd = 4
-    let mut savings: u64 = bsd_bytes.saturating_mul(4);
+    // 4 always-on events × 2 directions (read + write of the intermediate) = 8x bsd_bytes.
+    let mut savings: u64 = bsd_bytes.saturating_mul(8);
     if matches!(spec.activation, Activation::SwiGlu) {
-        savings = savings.saturating_add(bsdff_bytes);
+        // SwiGluGate also eliminates a full round-trip of the gate*up intermediate.
+        savings = savings.saturating_add(bsdff_bytes.saturating_mul(2));
     }
     let hbm = hbm.saturating_sub(savings);
 

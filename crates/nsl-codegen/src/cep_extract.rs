@@ -513,22 +513,24 @@ fn collect_search_string_axes(module: &Module, resolve: Resolve) -> Vec<(String,
 }
 
 /// Parse an activation name string (from a `@search(activation, [...])` axis).
+/// Case-insensitive: "SiLU", "silu", "SILU" all match.
 fn parse_activation(name: &str) -> Result<Activation, CepExtractError> {
-    match name {
+    match name.to_lowercase().as_str() {
         "relu" => Ok(Activation::Relu),
         "gelu" => Ok(Activation::Gelu),
         "silu" => Ok(Activation::SiLU),
         "swiglu" => Ok(Activation::SwiGlu),
-        other => Err(CepExtractError::UnrecognizedActivation { name: other.to_string() }),
+        _ => Err(CepExtractError::UnrecognizedActivation { name: name.to_string() }),
     }
 }
 
 /// Parse a norm-type name string (from a `@search(norm, [...])` axis).
+/// Case-insensitive: "RMSNorm", "rmsnorm", "rms_norm" all match.
 fn parse_norm(name: &str) -> Result<NormType, CepExtractError> {
-    match name {
+    match name.to_lowercase().as_str() {
         "layernorm" | "layer_norm" | "ln" => Ok(NormType::LayerNorm),
         "rmsnorm" | "rms_norm" | "rms" => Ok(NormType::RmsNorm),
-        other => Err(CepExtractError::UnrecognizedNorm { name: other.to_string() }),
+        _ => Err(CepExtractError::UnrecognizedNorm { name: name.to_string() }),
     }
 }
 
@@ -575,9 +577,13 @@ pub fn extract_search_axes(module: &Module, resolve: Resolve) -> Result<SearchAx
                     values.iter().map(|s| parse_norm(s)).collect();
                 axes.norm = parsed?;
             }
-            // Numeric axes may show up here if someone writes string-like values;
-            // skip them — they were already handled (or will error) above.
-            _ => {}
+            // Numeric axes that slip through as string values are rejected — they
+            // were already handled (or errored) in the integer-axis loop above.
+            // Any other name is an unknown axis: typos like `actvation` must not
+            // silently no-op, they must be reported.
+            other => {
+                return Err(CepExtractError::UnknownSearchAxis { axis: other.to_string() });
+            }
         }
     }
     Ok(axes)
@@ -953,6 +959,33 @@ model ActNormNet:
         assert_eq!(axes.activation.len(), 2);
         // Norm axis.
         assert_eq!(axes.norm, vec![NormType::RmsNorm]);
+    }
+
+    // W2-2: unknown categorical @search axis must return UnknownSearchAxis (not silently no-op).
+    #[test]
+    fn extract_search_axes_rejects_unknown_string_axis() {
+        // `@search(actvation, ["silu"])` — note the typo.  Must return UnknownSearchAxis.
+        let src = r#"
+@search(actvation, ["silu"])
+model GroupedQueryAttention(d_model: int, n_heads: int, n_kv_heads: int, dropout_p: float):
+    wq: Tensor = randn([d_model, d_model])
+model SwiGLUFFN(d_model: int, d_ff: int, dropout_p: float):
+    w_gate: Tensor = randn([d_model, d_ff])
+model TransformerBlock(d_model: int, n_heads: int, n_kv_heads: int, d_ff: int, dropout_p: float):
+    attn: GroupedQueryAttention = GroupedQueryAttention(d_model, n_heads, n_kv_heads, dropout_p)
+    ffn: SwiGLUFFN = SwiGLUFFN(d_model, d_ff, dropout_p)
+    norm: RMSNorm = RMSNorm(d_model)
+model TypoAxisNet:
+    embed: Tensor = randn([4096, 384]) * full([1], 0.02)
+    blocks: [TransformerBlock; 6] = TransformerBlock(384, 6, 3, 1024, 0.1)
+"#;
+        let (module, interner) = parse(src);
+        let resolve = |s: nsl_ast::Symbol| interner.resolve(s.0).unwrap_or("").to_string();
+        let err = extract_search_axes(&module, &resolve).unwrap_err();
+        assert!(
+            matches!(err, CepExtractError::UnknownSearchAxis { .. }),
+            "expected UnknownSearchAxis for typo 'actvation', got: {err:?}"
+        );
     }
 
     #[test]

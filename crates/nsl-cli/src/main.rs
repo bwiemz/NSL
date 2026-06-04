@@ -875,6 +875,10 @@ fn main_inner() {
             cep_target,
             cep_out,
         } => {
+            if cep_search && cep_profile {
+                eprintln!("error: --cep-search and --cep-profile are mutually exclusive");
+                std::process::exit(1);
+            }
             if cep_search {
                 let ov = nsl_codegen::cep::CliOverrides {
                     target: cep_target,
@@ -3039,8 +3043,17 @@ fn run_cep_profile(
     }
 
     let target = resolve_cep_target(ov.target.as_deref(), None, &resolve);
-    let gpu = nsl_codegen::gpu_specs::find_gpu(&target)
-        .unwrap_or_else(nsl_codegen::gpu_specs::default_gpu);
+    let gpu = match nsl_codegen::gpu_specs::find_gpu(&target) {
+        Some(g) => g,
+        None => {
+            eprintln!(
+                "error: unknown CEP target '{}'. Supported: {}",
+                target,
+                nsl_codegen::cep::supported_gpus_list()
+            );
+            return 1;
+        }
+    };
     let profile = match nsl_codegen::cep_oracle::evaluate(&spec, gpu) {
         Ok(p) => p,
         Err(e) => {
@@ -3051,7 +3064,7 @@ fn run_cep_profile(
 
     // §6.3-style one-shot profile output.
     println!("=== CEP Compilation Profile ===");
-    println!("Target: {target}");
+    println!("Target: {}", gpu.name);
     println!("Params: {:.1}M", spec.param_count() as f64 / 1e6);
     println!("Binary size: {}", cep_format_bytes_si(profile.binary_size_bytes));
     println!("Peak memory: {:.1}GB", profile.peak_memory_bytes as f64 / 1e9);

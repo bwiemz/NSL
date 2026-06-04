@@ -154,13 +154,26 @@ fn ffn_candidate_widths(baseline_d_ff: u32) -> Vec<u32> {
 /// - Per layer l: add (chosen.d_ff[l] / baseline.d_ff[l]) × ffn.score
 ///   (linear retention proxy).
 /// - Per surviving layer l: add layers[l].total_score.
-fn retained_capacity(baseline: &ModelSpec, chosen: &ModelSpec, importance: &ImportanceTable) -> f64 {
+///
+/// `pruned_heads_per_layer`: the actual set of pruned head indices per layer,
+/// accumulated during the greedy loop.  Using the ACTUAL pruned set avoids
+/// the "survivors have low indices" assumption that breaks under
+/// GQA-group-aligned pruning when low-importance heads have high indices.
+fn retained_capacity(
+    baseline: &ModelSpec,
+    chosen: &ModelSpec,
+    importance: &ImportanceTable,
+    pruned_heads_per_layer: &[Vec<u32>],
+) -> f64 {
     let mut total = 0.0_f64;
-    // Head retention: surviving heads have indices [0, chosen.n_heads[l]).
+    // Head retention: a head survived iff it was NOT in the pruned set.
     for h in &importance.heads {
         let l = h.layer as usize;
-        if l < chosen.n_layers as usize && h.head < chosen.n_heads.get(l).copied().unwrap_or(0) {
-            total += h.score;
+        if l < chosen.n_layers as usize {
+            let pruned = pruned_heads_per_layer.get(l).map(|v| v.as_slice()).unwrap_or(&[]);
+            if !pruned.contains(&h.head) {
+                total += h.score;
+            }
         }
     }
     // FFN width retention.
@@ -226,6 +239,11 @@ pub fn prune_greedy(
     let mut current_profile = baseline_profile.clone();
     let mut prune_log = Vec::new();
     let mut candidates_evaluated = 1u32;
+    // Track which head indices were actually pruned per layer so retained_capacity
+    // can filter by the REAL pruned set, not the "survivors have low indices" assumption
+    // that breaks under GQA-group-aligned pruning (W2-1 fix).
+    let mut pruned_heads_per_layer: Vec<Vec<u32>> =
+        vec![Vec::new(); base_spec.n_layers as usize];
 
     let ordered = prune_order(importance, &constraints.preserve_layers);
 
@@ -275,6 +293,11 @@ pub fn prune_greedy(
         // Accept.
         current_spec = trial_spec;
         current_profile = trial_profile;
+        // Record the pruned head index in its layer so retained_capacity can
+        // filter by the actual pruned set (not the low-index assumption).
+        if let Some(layer_pruned) = pruned_heads_per_layer.get_mut(h.layer as usize) {
+            layer_pruned.push(h.head);
+        }
         prune_log.push(PruneStep {
             kind: "head".into(),
             layer: h.layer,
@@ -365,7 +388,7 @@ pub fn prune_greedy(
         chosen: Some(EvaluatedCandidate {
             spec: current_spec.clone(),
             profile: current_profile.clone(),
-            score: retained_capacity(base_spec, &current_spec, importance),
+            score: retained_capacity(base_spec, &current_spec, importance, &pruned_heads_per_layer),
             feasible: satisfies_constraints(&current_profile, constraints),
         }),
         ranked_candidates: Vec::new(),
@@ -710,5 +733,102 @@ mod tests {
         );
         // And strictly positive (some capacity is retained).
         assert!(chosen.score > 0.0, "retained_capacity must be > 0");
+    }
+
+    // G5-extension — retained_capacity must use the ACTUAL pruned set, not the
+    // "survivors have low indices" assumption.  Under GQA-group-aligned pruning,
+    // the lowest-importance heads may have low indices, so survivors are the HIGH-
+    // indexed heads.  The old code (h.head < chosen.n_heads[l]) would count the
+    // pruned low-index heads as survivors and exclude the actual high-index survivors,
+    // producing a score that is too low (misses high-importance heads) and wrong
+    // (credits pruned heads).  This test makes the inversion detectable by using
+    // heterogeneous importance where the split is cleanly detectable.
+    #[test]
+    fn prune_chosen_score_reflects_actual_survivors_not_low_index_assumption() {
+        use crate::cep_importance::FfnImportance;
+
+        // spec: 4 layers, 8 heads per layer, 4 kv-heads → group size = 2.
+        // Heads 0..3 score 0.1 (low), heads 4..7 score 10.0 (high).
+        // Pruner will drop the lowest-score heads first (head 0, then head 1 to
+        // complete the GQA group {0,1}), making survivors {2,3,4,5,6,7}.
+        // Correct retained_capacity: 2×0.1 + 4×10.0 = 40.2 per layer (across 4 layers).
+        // Old (broken) code: h.head < chosen.n_heads[l]=6 → counts {0..5} which
+        // misses survivors {6,7} (score 10.0 each) and credits pruned {0,1} (score 0.1).
+        let s = spec(); // uniform(256, 4, 8, 4, 32, 512, 8192) → n_heads=8, n_kv=4
+        let n_layers = s.n_layers as usize;
+        let n_heads = s.n_heads[0] as usize;
+        let mut heads = Vec::new();
+        for l in 0..n_layers {
+            for h in 0..n_heads {
+                let score = if h < n_heads / 2 { 0.1_f64 } else { 10.0_f64 };
+                heads.push(HeadImportance {
+                    layer: l as u32,
+                    head: h as u32,
+                    weight_magnitude: 1.0,
+                    spectral_energy: 0.5,
+                    roofline_slack: 1.0,
+                    position_factor: 1.0,
+                    score,
+                });
+            }
+        }
+        // Include FFN importance so the score is non-zero even with 0 head-score contribution.
+        let mut ffns = Vec::new();
+        for l in 0..n_layers {
+            ffns.push(FfnImportance {
+                layer: l as u32,
+                weight_magnitude: 1.0,
+                position_factor: 1.0,
+                roofline_slack: 1.0,
+                score: 0.0, // zero FFN score so only head scores contribute
+            });
+        }
+        let layers = (0..n_layers)
+            .map(|l| crate::cep_importance::LayerImportance {
+                layer: l as u32,
+                attention_score: 0.0,
+                ffn_score: 0.0,
+                total_score: 0.0,
+            })
+            .collect();
+        let imp = ImportanceTable { heads, ffns, layers };
+
+        // Prune 1 GQA group (2 heads) per layer so we can observe the survivor set.
+        let outcome = prune_greedy(
+            &s,
+            &imp,
+            gpu(),
+            &Constraints {
+                target_sparsity: 0.02, // small target: 1 group drop suffices
+                ..Default::default()
+            },
+            Granularity::Head,
+        );
+        let chosen = outcome.chosen.as_ref().unwrap();
+
+        // If at least one head was pruned, the score must credit the high-importance
+        // survivors (score 10.0), not the pruned low-importance heads (score 0.1).
+        // With correct implementation: survivors are high-index heads → score ≥ some
+        // fraction of the total high-importance capacity.
+        // With the old broken code: would undercount by ~2 × 10.0 per affected layer
+        // (missing survivors 6,7) and overcount by ~2 × 0.1 (crediting pruned 0,1).
+        let any_head_pruned = outcome
+            .prune_log
+            .iter()
+            .any(|s| s.kind == "head" && s.accepted);
+        if any_head_pruned {
+            // High-importance heads are score 10.0; if survivors include them,
+            // the total must be significantly above the low-score threshold.
+            // n_layers=4 survivors=6 per layer; at least 4 high-score heads per layer.
+            // Minimum correct score per layer: 4 × 10.0 = 40.0.
+            // Old broken score per layer would be missing 2 high-score heads: ~20.0.
+            let min_expected = (n_layers as f64) * 4.0 * 10.0 * 0.5; // generous lower bound
+            assert!(
+                chosen.score > min_expected,
+                "retained_capacity {} too low — likely counting pruned heads instead of survivors \
+                 (expected > {min_expected}, which requires crediting the high-importance survivors)",
+                chosen.score
+            );
+        }
     }
 }

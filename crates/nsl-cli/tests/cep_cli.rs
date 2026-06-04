@@ -1,4 +1,4 @@
-//! Task 9: end-to-end CEP CLI integration tests.
+﻿//! Task 9: end-to-end CEP CLI integration tests.
 //!
 //! Exercises the now-complete CEP frontend pipeline through the `nsl` binary:
 //!
@@ -8,7 +8,7 @@
 //!   2. `build --cep-prune --weights <w>` on the canonical analyzable fixture
 //!      runs the full pipeline (frontend analysis → recognizer → cross-check →
 //!      prune oracle), prints the Pruning Report, and writes a versioned delta
-//!      JSON (`cep_version == 1`, `mode == "prune"`).
+//!      JSON (`cep_version == 2`, `mode == "prune"`).
 //!   3. `build --cep-prune` on `examples/gpt2.nsl` fails (gpt2 carries no
 //!      `@cep_prune` decorator and its fused-QKV attention is unrecognized).
 //!   4. `check --cep-search` on the searchable fixture runs the search oracle,
@@ -163,6 +163,35 @@ fn cep_profile_prints_compilation_profile() {
         .stdout(predicate::str::contains("Target: H100-SXM"))
         .stdout(predicate::str::contains("Kernel launches per forward:"))
         .stdout(predicate::str::contains("Estimated latency:"));
+}
+
+// W4-2: --cep-profile with unknown target must fail with a clear error message.
+#[test]
+fn cep_profile_rejects_unknown_target() {
+    let mut cmd = Command::cargo_bin("nsl").unwrap();
+    cmd.env("NSL_STDLIB_PATH", stdlib_path());
+    cmd.arg("check")
+        .arg(canonical_fixture())
+        .arg("--cep-profile")
+        .arg("--cep-target")
+        .arg("NoSuchGPU");
+    cmd.assert()
+        .failure()
+        .stderr(predicate::str::contains("unknown CEP target"));
+}
+
+// W4-5: --cep-search and --cep-profile are mutually exclusive.
+#[test]
+fn cep_search_and_profile_are_mutually_exclusive() {
+    let mut cmd = Command::cargo_bin("nsl").unwrap();
+    cmd.env("NSL_STDLIB_PATH", stdlib_path());
+    cmd.arg("check")
+        .arg(canonical_fixture())
+        .arg("--cep-search")
+        .arg("--cep-profile");
+    cmd.assert()
+        .failure()
+        .stderr(predicate::str::contains("mutually exclusive"));
 }
 
 #[test]

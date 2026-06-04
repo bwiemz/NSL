@@ -230,14 +230,12 @@ fn format_bytes_si(bytes: u64) -> String {
     }
 }
 
+/// Render param count as millions to one decimal place.  The render line uses
+/// `"{}M params"` with a literal "M", so this MUST return only the magnitude
+/// (no suffix).  Sub-1M counts render as "0.5M params" etc., which is correct
+/// and honest (toy fixtures never have genuinely large param counts).
 fn format_params_si(p: u64) -> String {
-    if p >= 1_000_000 {
-        format!("{:.1}", p as f64 / 1e6)
-    } else if p >= 1_000 {
-        format!("{:.1}K", p as f64 / 1e3)
-    } else {
-        format!("{}", p)
-    }
+    format!("{:.1}", p as f64 / 1e6)
 }
 
 /// Default roofline-slack proxy when the user doesn't supply one: derive
@@ -635,6 +633,7 @@ pub struct CliOverrides {
 pub enum CepBridgeError {
     UnknownTarget { target: String, supported: String },
     BadPreserve(String),
+    PreserveLayerOutOfRange { entry: String, n_layers: u32 },
 }
 
 impl std::fmt::Display for CepBridgeError {
@@ -647,6 +646,10 @@ impl std::fmt::Display for CepBridgeError {
                 f,
                 "CEP: preserve entry '{s}' is not recognized; use a layer index (e.g. '7') or 'blocks.<n>' / 'blocks.<n>.*' pattern (e.g. 'blocks.0.*')"
             ),
+            CepBridgeError::PreserveLayerOutOfRange { entry, n_layers } => write!(
+                f,
+                "CEP: preserve entry '{entry}' references layer >= n_layers ({n_layers})"
+            ),
         }
     }
 }
@@ -655,13 +658,21 @@ fn supported_gpus() -> String {
     GPU_DATABASE.iter().map(|g| g.name).collect::<Vec<_>>().join(", ")
 }
 
+/// Public alias used by the CLI to report supported GPU names.
+pub fn supported_gpus_list() -> String {
+    supported_gpus()
+}
+
 fn parse_preserve_layers(preserve: &[String], n_layers: u32) -> Result<Vec<u32>, CepBridgeError> {
     let mut out: Vec<u32> = Vec::with_capacity(preserve.len());
     for p in preserve {
         // Bare integer: "0", "7", etc.
         if let Ok(n) = p.parse::<u32>() {
             if n >= n_layers {
-                return Err(CepBridgeError::BadPreserve(p.clone()));
+                return Err(CepBridgeError::PreserveLayerOutOfRange {
+                    entry: p.clone(),
+                    n_layers,
+                });
             }
             out.push(n);
             continue;
@@ -675,7 +686,10 @@ fn parse_preserve_layers(preserve: &[String], n_layers: u32) -> Result<Vec<u32>,
             }
             if let Ok(n) = head.parse::<u32>() {
                 if n >= n_layers {
-                    return Err(CepBridgeError::BadPreserve(p.clone()));
+                    return Err(CepBridgeError::PreserveLayerOutOfRange {
+                        entry: p.clone(),
+                        n_layers,
+                    });
                 }
                 out.push(n);
                 continue;
@@ -869,6 +883,18 @@ mod tests {
         assert_eq!(table.heads.len() as u32, expected);
     }
 
+    // W4-1: format_params_si must always return millions-only (no suffix), so the render
+    // line "{}M params" composes correctly for sub-1M model candidates.
+    #[test]
+    fn format_params_si_handles_sub_1m() {
+        assert_eq!(format_params_si(500_000), "0.5");
+        assert_eq!(format_params_si(100), "0.0");
+        assert_eq!(format_params_si(48_800_000), "48.8");
+        // Values >= 1M still render correctly (no "K" or "M" suffix appended by the helper).
+        assert_eq!(format_params_si(1_000_000), "1.0");
+        assert_eq!(format_params_si(7_000_000_000), "7000.0");
+    }
+
     #[test]
     fn param_reduction_returns_zero_without_baseline() {
         let plan = CepPlan {
@@ -912,11 +938,17 @@ mod tests {
         // The oracle computes a first-order estimate: param_bytes + max_activation_per_layer,
         // which is much smaller (order of 100s of MB for a 50M param FP16 model). We assert
         // the oracle's output is in a sane range relative to what it can compute.
-        // Floor: at least param_bytes itself (peak must cover the weights).
+        //
+        // Note: peak_memory_bytes = param_bytes + max_activation_bytes (oracle formula), so
+        // its monotonic decrease under pruning is GUARANTEED by param_bytes monotonicity.
+        // The assertions here are sanity coverage, not independent signal.
+        //
+        // Floor: at least param_bytes + 1024 (the activation term must add at least a small
+        // page — this checks the formula structure rather than being a tautology of >= param_bytes).
         // Ceiling: 50 GB (any sane oracle estimate for a ~50M param model is well below this).
         assert!(
-            baseline.peak_memory_bytes >= baseline.param_bytes,
-            "peak_memory_bytes {} < param_bytes {} (oracle must include params in peak)",
+            baseline.peak_memory_bytes >= baseline.param_bytes + 1024,
+            "peak_memory_bytes {} must exceed param_bytes {} by at least 1 KiB (activation term)",
             baseline.peak_memory_bytes,
             baseline.param_bytes
         );
@@ -934,10 +966,16 @@ mod tests {
         );
 
         // Binary size: paper says 195 MB. Oracle is first-order; allow up to 1 GB.
-        // Sanity floor: at least param_bytes (weights must be included).
+        //
+        // Note: binary_size_bytes = param_bytes + ~20 KB/layer + 60 KB overhead (oracle
+        // formula), so its monotonic decrease under pruning is GUARANTEED by param_bytes
+        // monotonicity. The assertions here are sanity coverage, not independent signal.
+        //
+        // Floor: at least param_bytes + 20_000 (at least one layer's code section) — this
+        // checks the formula structure rather than being a tautology of >= param_bytes.
         assert!(
-            baseline.binary_size_bytes >= baseline.param_bytes,
-            "binary_size_bytes {} < param_bytes {}",
+            baseline.binary_size_bytes >= baseline.param_bytes + 20_000,
+            "binary_size_bytes {} must exceed param_bytes {} by at least 20 KB (per-layer overhead)",
             baseline.binary_size_bytes,
             baseline.param_bytes
         );
@@ -997,14 +1035,9 @@ mod tests {
                 chosen.profile.binary_size_bytes,
                 baseline.binary_size_bytes
             );
-            // Kernel launches: ≤ baseline.
-            assert!(
-                chosen.profile.kernel_launches <= baseline.kernel_launches,
-                "sparsity={}: pruned kernel_launches {} > baseline {}",
-                sparsity,
-                chosen.profile.kernel_launches,
-                baseline.kernel_launches
-            );
+            // Kernel launches: under HeadAndFfn granularity without layer drop,
+            // kernel_launches is INVARIANT (depends only on layer count, not head
+            // count).  No per-pruned assertion — it would be vacuously true.
             // Real search time was measured.
             assert!(
                 plan.outcome.wall_clock_us > 0,
@@ -1018,6 +1051,16 @@ mod tests {
         // --- Monotonicity: 20% < 30% < 50% sparsity means profiles[0] >= profiles[1] >= profiles[2] ---
         // profiles[0]=20%, profiles[1]=30%, profiles[2]=50%
         // Higher sparsity → strictly fewer params (and ≤ on other metrics).
+        //
+        // param_bytes monotonicity is the load-bearing signal.
+        // peak_memory_bytes and binary_size_bytes are derived from param_bytes plus small
+        // constants in the oracle (max_activation_bytes for peak; ~20KB/layer + 60KB for
+        // binary), so their monotonic decrease is GUARANTEED by param_bytes monotonicity.
+        // These assertions are sanity coverage, not independent signal.
+        //
+        // kernel_launches depends only on layer count (not head count), so under
+        // HeadAndFfn-without-layer-drop it is INVARIANT — monotonicity would be vacuous.
+        // No kernel_launches monotonicity assertion.
         for w in pruned_profiles.windows(2) {
             let less_sparse = &w[0];
             let more_sparse = &w[1];
@@ -1038,12 +1081,6 @@ mod tests {
                 "monotonicity violated on peak_memory_bytes: {} > {}",
                 more_sparse.peak_memory_bytes,
                 less_sparse.peak_memory_bytes
-            );
-            assert!(
-                more_sparse.kernel_launches <= less_sparse.kernel_launches,
-                "monotonicity violated on kernel_launches: {} > {}",
-                more_sparse.kernel_launches,
-                less_sparse.kernel_launches
             );
         }
     }
@@ -1152,7 +1189,10 @@ mod bridge_tests {
         let mut cfg = prune_cfg();
         cfg.preserve = vec!["blocks.99".to_string()];
         let err = build_prune_input(&cfg, baseline.clone(), None, "H100-SXM", None).unwrap_err();
-        assert!(matches!(err, CepBridgeError::BadPreserve(_)));
+        assert!(
+            matches!(err, CepBridgeError::PreserveLayerOutOfRange { .. }),
+            "expected PreserveLayerOutOfRange, got {err:?}"
+        );
     }
 
     use std::io::Read;

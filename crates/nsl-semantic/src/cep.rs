@@ -56,12 +56,11 @@ pub struct CepPruneConfig {
     pub span: Span,
 }
 
-/// Check whether a preserve pattern is structurally valid (same rules as the bridge).
-/// Returns `true` if the pattern is acceptable (bare integer, "blocks.<n>", or
-/// "blocks.<n>.<suffix>"), `false` if it should be rejected at check time.
+/// Pattern check only; out-of-range layer indices are caught at build time by
+/// `parse_preserve_layers` in the bridge (the semantic pass does not know `n_layers`).
 ///
-/// Note: out-of-range layer index checking is deferred to the bridge (the semantic
-/// pass doesn't know `n_layers`).
+/// Returns `true` if the pattern is structurally valid (bare non-negative integer,
+/// "blocks.<n>", or "blocks.<n>.<suffix>"), `false` if it should be rejected.
 fn is_valid_preserve_pattern(p: &str) -> bool {
     // Bare non-negative integer.
     if p.parse::<u32>().is_ok() {
