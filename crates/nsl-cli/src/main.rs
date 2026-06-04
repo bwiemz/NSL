@@ -150,6 +150,21 @@ enum Cli {
         /// Pass without value for text output, or `--training-report=json` for JSON.
         #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "text")]
         training_report: Option<TrainingReportFormat>,
+
+        /// CSHA: attention-fusion mode ("auto", "boundary", "pipeline",
+        /// "block", or "off").  Passing `--csha` without a value enables
+        /// auto mode.  Mirrors `nsl run --csha` / `nsl build --csha`;
+        /// drives the planner-only diagnostic surfaced by `--csha-report`.
+        #[arg(long, value_name = "MODE", num_args = 0..=1, default_missing_value = "auto")]
+        csha: Option<String>,
+
+        /// CSHA: print the attention-fusion report (paper §6.3) to stderr.
+        /// Mirrors `nsl run --csha-report` / `nsl build --csha-report`.
+        /// Runs the planner against the file's train block (if any) and
+        /// emits the per-layer Boundary / Pipeline / Block tier decisions
+        /// plus the backward-tier choice. No kernels are emitted.
+        #[arg(long)]
+        csha_report: bool,
     },
 
     /// Compile and execute an NSL program
@@ -807,6 +822,8 @@ fn main_inner() {
             wcet_target: _wcet_target,
             fpga_device: _fpga_device,
             training_report,
+            csha,
+            csha_report,
         } => {
             if shapes {
                 let src = match std::fs::read_to_string(&file) {
@@ -941,6 +958,131 @@ fn main_inner() {
                         let json = serde_json::to_string_pretty(&report)
                             .expect("serialize training report");
                         println!("{}", json);
+                    }
+                }
+            }
+
+            // CSHA (Sprint 3, paper §6.3): planner-only diagnostic on `nsl check`.
+            // Mirrors `nsl run --csha[-report]` / `nsl build --csha[-report]` but
+            // emits no kernels — runs the compile pipeline with the planner
+            // wired in via `CompileOptions::csha_mode`/`csha_report` and
+            // discards the resulting object bytes. The CSHA report fires
+            // from inside `compile_train_block`, so files without a train
+            // block produce a `note:` instead of a report.
+            if csha_report || csha.is_some() {
+                // Validate the mode string up front (matches Run/Build).
+                if let Some(ref m) = csha {
+                    if nsl_codegen::csha::CshaMode::parse(m).is_none() {
+                        eprintln!(
+                            "error: --csha value '{}' is not one of auto|boundary|pipeline|block|off",
+                            m
+                        );
+                        process::exit(1);
+                    }
+                }
+                let source = match std::fs::read_to_string(&file) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("error: could not read file '{}': {e}", file.display());
+                        process::exit(1);
+                    }
+                };
+                // `--csha-report` without an explicit `--csha` defaults to
+                // `auto` so the planner actually fires — mirrors the
+                // CPDT/WRGA convention where `--<feature>-report` implies
+                // the planner is on.
+                let mode_str = csha.clone().unwrap_or_else(|| "auto".to_string());
+                // Best-effort detection of whether the source has a train
+                // block so we can emit a helpful `note:` when the planner
+                // won't fire. Same quick scan `needs_multi_file` uses.
+                let has_train_block = source.lines().any(|line| {
+                    let t = line.trim();
+                    if t.starts_with('#') || t.starts_with("//") { return false; }
+                    t.starts_with("train(") || t.starts_with("train (")
+                });
+                if !has_train_block {
+                    eprintln!(
+                        "note: --csha-report: no `train(...)` block in {} — CSHA planner has nothing to do.",
+                        file.display(),
+                    );
+                } else {
+                    let mut opts = nsl_codegen::CompileOptions::default();
+                    opts.csha_mode = Some(mode_str);
+                    opts.csha_report = csha_report;
+                    // Force source-AD so the train block lowers to a
+                    // Wengert list (the planner runs against
+                    // `extractor.wengert_list()`). Without this the
+                    // tape-AD path bypasses CSHA entirely.
+                    opts.source_ad = true;
+                    // Suppress unrelated noise: no calibration data.
+                    opts.calibration_data = None;
+                    // Drive the same compile entry the `nsl build` path
+                    // uses (`compile_returning_plan`) so top-level
+                    // `train(...)` blocks reach `compile_train_block`
+                    // where the CSHA hook lives. The alternative
+                    // `compile_module_with_imports_*` family stops
+                    // after `compile_user_functions` and never runs
+                    // `compile_main`, so top-level train blocks would
+                    // silently skip the planner.
+                    let mut csha_interner = Interner::new();
+                    let mut csha_source_map = SourceMap::new();
+                    let csha_file_id = csha_source_map
+                        .add_file(file.display().to_string(), source.clone());
+                    let (csha_tokens, csha_lex_diags) =
+                        nsl_lexer::tokenize(&source, csha_file_id, &mut csha_interner);
+                    if csha_lex_diags
+                        .iter()
+                        .any(|d| d.level == Level::Error)
+                    {
+                        eprintln!(
+                            "note: --csha-report: lex errors prevented planner from running on {}",
+                            file.display(),
+                        );
+                    } else {
+                        let csha_parse = nsl_parser::parse(&csha_tokens, &mut csha_interner);
+                        if csha_parse
+                            .diagnostics
+                            .iter()
+                            .any(|d| d.level == Level::Error)
+                        {
+                            eprintln!(
+                                "note: --csha-report: parse errors prevented planner from running on {}",
+                                file.display(),
+                            );
+                        } else {
+                            let csha_analysis = nsl_semantic::analyze_with_imports(
+                                &csha_parse.module,
+                                &mut csha_interner,
+                                &std::collections::HashMap::new(),
+                                false, // linear_types not needed for the planner-only path
+                            );
+                            // Forward @csha decorator configs (Sprint 2)
+                            // exactly the way `run_build_single` does.
+                            opts.csha_configs = analysis_to_csha_configs(&csha_analysis);
+                            // The planner runs as a side-effect inside
+                            // `compile_train_block` (which sits inside
+                            // `compile_user_functions` → `compile_main`)
+                            // and emits its report to stderr BEFORE the
+                            // rest of codegen. Downstream codegen often
+                            // fails on `nsl check`'s minimal compile
+                            // (e.g. unresolved optimizer stdlib symbols
+                            // like `nsl_optim_sgd__sgd_step`) — we
+                            // intentionally swallow those errors with a
+                            // brief note so the CSHA report stays the
+                            // headline output.
+                            if let Err(e) = nsl_codegen::compile_returning_plan(
+                                &csha_parse.module,
+                                &csha_interner,
+                                &csha_analysis.type_map,
+                                false,
+                                &opts,
+                            ) {
+                                eprintln!(
+                                    "note: --csha-report: compile pipeline stopped after the planner ran (full codegen needs `nsl build`): {}",
+                                    e.message,
+                                );
+                            }
+                        }
                     }
                 }
             }
