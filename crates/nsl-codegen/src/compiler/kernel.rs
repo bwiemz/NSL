@@ -705,6 +705,7 @@ impl Compiler<'_> {
             d_model: resolved_d_model,
             save_activations_for_backward: true,
             skip_rmsnorm_prologue: false,
+            static_seq_len: None,
         };
         // Tier C's backward emitter (ds_compute/dqdk_accum/dv_accum)
         // currently hard-asserts `block_kv=32` (T3.3–T3.5 landed with

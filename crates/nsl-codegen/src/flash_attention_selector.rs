@@ -141,6 +141,7 @@ mod selector_tests {
                 d_model: head_dim as u32,
                 save_activations_for_backward: false,
                 skip_rmsnorm_prologue: false,
+                static_seq_len: None,
             }),
         }
     }

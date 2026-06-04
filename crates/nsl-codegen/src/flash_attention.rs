@@ -231,6 +231,19 @@ pub struct CshaExtras {
     /// narrow+chunkify pre-pass externally. Default false (RMSNorm
     /// prologue runs as before; current callers see no behavior change).
     pub skip_rmsnorm_prologue: bool,
+    /// **Sprint 8 (paper §4.1) — compile-time seq_len.**  When `Some(s)`,
+    /// the Tier B.2 dq/dkdv emitters treat the sequence length as a
+    /// compile-time constant and elide the runtime `ceil(seq_len / bq)` /
+    /// `ceil(seq_len / bkv)` shift sequence in `emit_q_iter_count_setup` /
+    /// `emit_kv_iter_count_setup`, replacing it with a single
+    /// `mov.u32 %num_q_iters, <const>` (and same for `%num_kv_iters`).
+    /// When the single-tile criterion holds (`s <= block_q` and
+    /// `s <= block_kv`) and `causal` is true, the outer tile-skip
+    /// predicate is folded to the constant `1` (single tile is always
+    /// active; per-element intra-tile masking still handles correctness).
+    /// `None` (default) preserves the existing runtime path and produces
+    /// byte-identical PTX to the pre-Sprint-8 emitters.
+    pub static_seq_len: Option<u32>,
 }
 
 impl CshaExtras {
@@ -247,6 +260,7 @@ impl CshaExtras {
             d_model: 0,
             save_activations_for_backward: false,
             skip_rmsnorm_prologue: false,
+            static_seq_len: None,
         }
     }
 
@@ -262,6 +276,7 @@ impl CshaExtras {
             d_model,
             save_activations_for_backward: false,
             skip_rmsnorm_prologue: false,
+            static_seq_len: None,
         }
     }
 

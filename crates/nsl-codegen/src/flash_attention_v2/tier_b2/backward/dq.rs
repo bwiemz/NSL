@@ -291,13 +291,31 @@ fn emit_warp_band_setup(ptx: &mut String, config: &FlashAttentionConfig) {
 /// %seq_len_r is declared in emit_register_decls so that all .reg directives
 /// precede executable instructions per PTX ISA.  The ld.param loads the value
 /// here because seq_len is first consumed in this helper.
+///
+/// Sprint 8 (paper §4.1) — compile-time seq_len constant-folding: when
+/// `config.csha.static_seq_len` is `Some(s)`, the two-instruction
+/// `add.u32 + shr.u32` sequence collapses to a single `mov.u32` with the
+/// pre-computed `ceil(s / bq)` constant. `%seq_len_r` is still loaded
+/// (downstream HBM stat addressing consumes it). When `None`, byte-identical
+/// PTX to the pre-Sprint-8 emitter is produced.
 fn emit_q_iter_count_setup(ptx: &mut String, config: &FlashAttentionConfig) {
     let bq = tier_b2_effective_bq(config);
     let log2_bq = bq.trailing_zeros();
     // %seq_len_r and %num_q_iters are both declared in emit_register_decls.
     ptx.push_str("    ld.param.u32 %seq_len_r, [seq_len];\n");
-    ptx.push_str(&format!("    add.u32 %num_q_iters, %seq_len_r, {};\n", bq - 1));
-    ptx.push_str(&format!("    shr.u32 %num_q_iters, %num_q_iters, {};\n", log2_bq));
+    match static_seq_len(config) {
+        Some(s) => {
+            // V2_STATIC_NUM_Q_ITERS marker: compile-time-folded num_q_iters.
+            let num_q_iters = s.div_ceil(bq);
+            ptx.push_str(&format!(
+                "    mov.u32 %num_q_iters, {num_q_iters};  // V2_STATIC_NUM_Q_ITERS (paper sec 4.1) seq_len={s} bq={bq}\n"
+            ));
+        }
+        None => {
+            ptx.push_str(&format!("    add.u32 %num_q_iters, %seq_len_r, {};\n", bq - 1));
+            ptx.push_str(&format!("    shr.u32 %num_q_iters, %num_q_iters, {};\n", log2_bq));
+        }
+    }
     ptx.push('\n');
 }
 
@@ -307,13 +325,50 @@ fn emit_q_iter_count_setup(ptx: &mut String, config: &FlashAttentionConfig) {
 ///   num_kv_iters = (seq_len + bkv - 1) >> log2(bkv)
 /// %seq_len_r is already loaded by emit_q_iter_count_setup, so this helper
 /// reuses it directly.
+///
+/// Sprint 8 (paper §4.1) — compile-time seq_len constant-folding: when
+/// `config.csha.static_seq_len` is `Some(s)`, the add/shr is replaced by a
+/// single `mov.u32` with the pre-computed `ceil(s / bkv)` constant.
 fn emit_kv_iter_count_setup(ptx: &mut String, config: &FlashAttentionConfig) {
     use crate::flash_attention_v2::smem_layout::tier_b2_effective_bkv;
     let bkv = tier_b2_effective_bkv(config);
-    // bkv is power-of-2 per spec §3.1 (ALLOWED_BLOCK_KV), so use shift.
-    ptx.push_str(&format!("    add.u32 %num_kv_iters, %seq_len_r, {};\n", bkv - 1));
-    ptx.push_str(&format!("    shr.u32 %num_kv_iters, %num_kv_iters, {};\n", bkv.trailing_zeros()));
+    match static_seq_len(config) {
+        Some(s) => {
+            // V2_STATIC_NUM_KV_ITERS marker: compile-time-folded num_kv_iters.
+            let num_kv_iters = s.div_ceil(bkv);
+            ptx.push_str(&format!(
+                "    mov.u32 %num_kv_iters, {num_kv_iters};  // V2_STATIC_NUM_KV_ITERS (paper sec 4.1) seq_len={s} bkv={bkv}\n"
+            ));
+        }
+        None => {
+            // bkv is power-of-2 per spec §3.1 (ALLOWED_BLOCK_KV), so use shift.
+            ptx.push_str(&format!("    add.u32 %num_kv_iters, %seq_len_r, {};\n", bkv - 1));
+            ptx.push_str(&format!("    shr.u32 %num_kv_iters, %num_kv_iters, {};\n", bkv.trailing_zeros()));
+        }
+    }
     ptx.push('\n');
+}
+
+/// Sprint 8 (paper §4.1) — extract the compile-time-known sequence length
+/// from the config's `CshaExtras::static_seq_len`. Returns `None` when the
+/// extras are absent OR `static_seq_len` is `None`. The two are
+/// behaviourally equivalent: callers want a u32 they can fold into a
+/// literal, or "fall back to the runtime path".
+fn static_seq_len(config: &FlashAttentionConfig) -> Option<u32> {
+    config.csha.as_ref().and_then(|c| c.static_seq_len)
+}
+
+/// Sprint 8 (paper §4.1) — single-tile criterion for elision of the outer
+/// tile-skip predicate.  When the statically-known sequence length fits
+/// in a single (q, kv) tile pair, the tile-skip comparison always
+/// resolves to "active" and can be folded to a constant `1`.  Intra-tile
+/// per-element causal masking (emitted by `emit_intra_tile_causal_mask`)
+/// still handles correctness within that single tile.
+fn is_single_tile(config: &FlashAttentionConfig) -> bool {
+    use crate::flash_attention_v2::smem_layout::tier_b2_effective_bkv;
+    let bq = tier_b2_effective_bq(config);
+    let bkv = tier_b2_effective_bkv(config);
+    matches!(static_seq_len(config), Some(s) if s <= bq && s <= bkv)
 }
 
 fn emit_outer_loop_open(ptx: &mut String) {
@@ -816,6 +871,16 @@ fn emit_tile_skip_predicate(ptx: &mut String, config: &FlashAttentionConfig) {
     let bq = tier_b2_effective_bq(config);
     let bkv = tier_b2_effective_bkv(config);
     if config.causal {
+        // Sprint 8 (paper §4.1) — single-tile elision: when the statically
+        // known seq_len fits in one (q, kv) tile pair, the tile-skip
+        // comparison always resolves to "active" and can be folded to a
+        // constant 1. Per-element intra-tile masking (emit_intra_tile_causal_mask)
+        // still handles correctness within that single tile.
+        if is_single_tile(config) {
+            ptx.push_str("    // === D1: tile_skip predicate (causal, V2_STATIC_SINGLE_TILE elision) ===\n");
+            ptx.push_str("    mov.u32 %tile_skip_predicate, 1;  // V2_STATIC_SINGLE_TILE (paper sec 4.1)\n");
+            return;
+        }
         // q_tile_end = q_iter * bq + (bq - 1)
         // kv_tile_start = kv_iter * bkv
         // predicate (1=active, 0=skip) = (kv_tile_start <= q_tile_end)
