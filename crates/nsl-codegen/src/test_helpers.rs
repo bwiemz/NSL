@@ -309,3 +309,62 @@ pub fn flash_gap_f_context_for_source(
         None => (false, None, false),
     }
 }
+
+/// Sprint 1 cycle-3 (paper §4 tree-mask) observation helper: does the
+/// `@tree_mask` decorator on an `@flash_attention` fn reach
+/// `FlashAttentionConfig::tree_mask`, and does the kernel-name +
+/// synthesized PTX pick up the tree-mask variant?
+///
+/// Returns `(context_set, tree_mask_flag, kernel_name, ptx_contains_dfs_enter_ptr)`:
+/// - `context_set`     — `true` iff a compile context was built (proof
+///                       the extraction site ran at all).
+/// - `tree_mask_flag`  — `Some(ctx.config.tree_mask)`; the load-bearing
+///                       end-to-end thread.
+/// - `kernel_name`     — what the runtime dispatcher will look up; pins
+///                       the variant tag (`_t1_` for tree_mask=true) per
+///                       `flash_attention.rs::test_tree_mask_variant`.
+/// - `ptx_contains_dfs_enter_ptr` — `true` iff the synthesized PTX
+///                       carries the `dfs_enter_ptr` kernel parameter,
+///                       which is only emitted when `config.tree_mask`
+///                       is true (`flash_attention.rs:582`).
+pub fn flash_tree_mask_context_for_source(
+    src: &str,
+) -> (bool, Option<bool>, Option<String>, bool) {
+    use nsl_errors::FileId;
+
+    let mut interner = Interner::new();
+    let (tokens, _lex_diags) = nsl_lexer::tokenize(src, FileId(0), &mut interner);
+    let parsed = nsl_parser::parse(&tokens, &mut interner);
+    let stmts = parsed.module.stmts.clone();
+    let type_map: TypeMap = TypeMap::new();
+    let opts = crate::CompileOptions {
+        target: "sm_80".to_string(),
+        ..Default::default()
+    };
+
+    let mut compiler = crate::compiler::Compiler::new(&interner, &type_map, &opts)
+        .expect("Compiler::new failed in flash_tree_mask_context_for_source");
+
+    compiler
+        .compile_flash_attention_kernels(&stmts)
+        .expect("compile_flash_attention_kernels failed in flash_tree_mask_context_for_source");
+
+    match compiler.kernels.flash_attention_context {
+        Some(ctx) => {
+            let cfg = &ctx.config;
+            let kernel_name = crate::flash_attention::flash_attention_kernel_name(cfg);
+            let ptx = crate::flash_attention::synthesize_flash_attention_ptx(cfg);
+            // Strip the trailing null byte that `synthesize_flash_attention_ptx`
+            // appends (cudarc expects a null-terminated PTX blob).
+            let ptx_body = if ptx.last() == Some(&0) {
+                &ptx[..ptx.len() - 1]
+            } else {
+                &ptx[..]
+            };
+            let ptx_str = std::str::from_utf8(ptx_body).unwrap_or("");
+            let has_dfs = ptx_str.contains("dfs_enter_ptr");
+            (true, Some(cfg.tree_mask), Some(kernel_name), has_dfs)
+        }
+        None => (false, None, None, false),
+    }
+}
