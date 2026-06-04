@@ -218,20 +218,22 @@ pub fn validate_scalar_v2_config(
         Direction::Forward => 0,
         Direction::Backward => backward_extra_bytes(config),
     };
-    // PCA Tier A: when `segment_masked`, the FA prelude reserves an
-    // additional `DEFAULT_SMEM_SEGMENT_BUDGET`-byte `seg_smem` region —
-    // separately-declared static SMEM on the forward side, and embedded
-    // at the tail of the extern shmem allocation on the backward side
-    // (see `phases/{forward,backward}/prelude.rs`). Either way the device
-    // sees `total + seg_overhead` bytes per CTA, so the validator must
-    // account for it or `segment_masked = true` configs that fit the
-    // 99 KB cap on paper will fail at launch with insufficient SMEM.
+    // PCA Tier A: when `segment_masked`, the FA prelude reserves a
+    // `DEFAULT_SMEM_SEGMENT_BUDGET`-byte `seg_smem` region (+ a 1028-byte
+    // `smem_doc_starts` region when `rope_q`) — separately-declared static SMEM
+    // on the forward side, `seg_smem` embedded in the extern shmem tail on the
+    // backward side (see `phases/{forward,backward}/prelude.rs`). Route the total
+    // through the single-source `pca_smem_layout` so this validator agrees with
+    // `fwd_needs_dynamic_smem` / `backward_needs_dynamic_smem` on what a PCA
+    // kernel needs (else a `segment_masked` config that fits the 99 KB cap on
+    // paper fails at launch with insufficient SMEM). `seg_overhead` is kept for
+    // the diagnostic message below.
     let seg_overhead = if config.segment_masked {
         crate::pca_segment::DEFAULT_SMEM_SEGMENT_BUDGET as u32
     } else {
         0
     };
-    let total = fwd_total + extra + seg_overhead;
+    let total = pca_smem_layout(fwd_total + extra, config.segment_masked, config.rope_q).total;
     let q_region  = kv_start;              // Q region: [0, kv_start)
     let kv_region = sp_start - kv_start;   // KV region: [kv_start, sp_start)
     let sp_region = fwd_total - sp_start;  // SP + weight + save region: [sp_start, fwd_total)
@@ -343,6 +345,60 @@ pub fn tier_b_range_table_offset(
 fn align_up_u32(x: u32, align: u32) -> u32 {
     debug_assert!(align.is_power_of_two());
     (x + align - 1) & !(align - 1)
+}
+
+/// Single source of truth for PCA static-SMEM **sizing**. `base_total` is the
+/// core kernel SMEM (`total_bytes` forward / `backward_total_bytes` backward);
+/// `.total` adds the `seg_smem` (32 KB) region and — when `rope_q` — the
+/// `smem_doc_starts` (1028 B) region, 16-aligned. The dynamic-SMEM budget
+/// checks (`fwd_needs_dynamic_smem` / `backward_needs_dynamic_smem`) and the
+/// config validator all derive their total from this one function, so they
+/// cannot diverge on how much SMEM a PCA kernel needs.
+///
+/// NOTE — what is actually emitted today: the PCA regions are SEPARATE static
+/// `.shared` declarations, NOT embedded in `shmem[]` (forward: `seg_smem` +
+/// `smem_doc_starts` both separate static; backward: `seg_smem` embedded in the
+/// `shmem[]` tail, `smem_doc_starts` separate static). The `seg_off` / `doc_off`
+/// fields are therefore **dormant** — only `.total` is consumed. They are a
+/// ready primitive for embedding all regions in the `shmem[]` tail IF a future
+/// driver ever reproduces the Blackwell static+extern mixed-layout crash, which
+/// the 2026-05-12 SMEM probe + a 2026-05-27 reproduce found does NOT occur on
+/// CUDA 13.2 / driver 591.86 / RTX 5070 Ti (so the embed was intentionally not
+/// built). See `project_pca_smem_mixed_layout_crash_disproven` (memory).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PcaSmemLayout {
+    /// Total SMEM bytes a PCA kernel needs (base + seg [+ doc when rope_q]), 16-aligned.
+    /// This is the consumed field.
+    pub total: u32,
+    /// DORMANT (not consumed today): byte offset `seg_smem` WOULD have in a
+    /// shmem[]-tail embed. Valid only when `segment_masked`.
+    pub seg_off: u32,
+    /// DORMANT (not consumed today): byte offset `smem_doc_starts` WOULD have in
+    /// a shmem[]-tail embed. `Some` only when `segment_masked && rope_q`.
+    pub doc_off: Option<u32>,
+}
+
+/// `seg_smem` size = the cooperative-load ceiling (`DEFAULT_SMEM_SEGMENT_BUDGET`, 32 KB).
+const PCA_SEG_BYTES: u32 = crate::pca_segment::DEFAULT_SMEM_SEGMENT_BUDGET as u32;
+/// `smem_doc_starts` size = `(MAX_NUM_DOCS + 1) * 4` = `257 * 4` = 1028 bytes.
+const PCA_DOC_BYTES: u32 = 1028;
+
+/// Compute the PCA SMEM layout for a given base total. `base_total` is
+/// `total_bytes(config)` (forward) or `backward_total_bytes(config)` (backward).
+pub fn pca_smem_layout(base_total: u32, segment_masked: bool, rope_q: bool) -> PcaSmemLayout {
+    if !segment_masked {
+        return PcaSmemLayout { total: base_total, seg_off: 0, doc_off: None };
+    }
+    let seg_off = align_up_u32(base_total, 16);
+    let after_seg = seg_off + PCA_SEG_BYTES; // PCA_SEG_BYTES (32768) is 16-aligned → after_seg 16-aligned
+    if rope_q {
+        let doc_off = after_seg;
+        let total = align_up_u32(doc_off + PCA_DOC_BYTES, 16);
+        PcaSmemLayout { total, seg_off, doc_off: Some(doc_off) }
+    } else {
+        let total = align_up_u32(after_seg, 16);
+        PcaSmemLayout { total, seg_off, doc_off: None }
+    }
 }
 
 /// Total SMEM bytes: Q tile + KV tile + S/P rows (4 warps × block_kv × 4 bytes, f32).
@@ -972,6 +1028,35 @@ mod tests {
         assert!(result.is_ok(),
             "small (32,32,64) at chunk=64 must fit 99 KB; got {:?}", result);
         assert_eq!(result.unwrap(), 64, "validator must return selected chunk on success");
+    }
+
+    #[test]
+    fn pca_smem_layout_offsets_correct_and_nonoverlapping() {
+        // Not masked → passthrough (no PCA regions).
+        assert_eq!(
+            pca_smem_layout(10_000, false, false),
+            PcaSmemLayout { total: 10_000, seg_off: 0, doc_off: None }
+        );
+
+        // Masked, no rope → seg region in the tail after base; doc absent.
+        let l = pca_smem_layout(10_000, true, false);
+        assert_eq!(l.seg_off, 10_000);              // 10_000 already 16-aligned
+        assert!(l.seg_off >= 10_000);               // non-overlap: seg starts at/after base end
+        assert_eq!(l.seg_off % 16, 0);              // aligned
+        assert_eq!(l.doc_off, None);
+        assert!(l.total >= l.seg_off + 32_768);     // total covers seg (32 KB)
+        assert_eq!(l.total % 16, 0);
+
+        // Masked + rope, unaligned base → seg then doc, non-overlapping, aligned.
+        let l = pca_smem_layout(10_001, true, true);
+        assert_eq!(l.seg_off, 10_016);              // align_up(10_001, 16)
+        assert_eq!(l.seg_off % 16, 0);
+        let doc = l.doc_off.expect("doc_off present when rope_q");
+        assert_eq!(doc, 10_016 + 32_768);           // seg_off + SEG_BYTES
+        assert!(doc >= l.seg_off + 32_768);         // non-overlap: doc starts after seg
+        assert_eq!(doc % 16, 0);
+        assert!(l.total >= doc + 1028);             // total covers doc (1028 B)
+        assert_eq!(l.total % 16, 0);
     }
 }
 

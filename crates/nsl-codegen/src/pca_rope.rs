@@ -87,20 +87,17 @@ pub fn doc_starts_disabled_sentinel(builder: &mut FunctionBuilder<'_>) -> Value 
 /// `flash_attention_v2/phases/forward/prelude.rs` (gated on
 /// `segment_masked && rope_q`).
 pub fn emit_doc_starts_smem_load(ptx: &mut String) {
-    // KNOWN LIMITATION (PCA Tier A activation review, 2026-05-26 — track with
-    // the deferred Test 4 / T11 doc_starts GPU validation): this 1028-byte
-    // `smem_doc_starts` region is NOT counted in `fwd_needs_dynamic_smem` /
-    // `backward_needs_dynamic_smem` (which only budget `seg_smem` via
-    // DEFAULT_SMEM_SEGMENT_BUDGET). For large `segment_masked && rope_q`
-    // configs on sm_120 this can (a) under-count static SMEM and (b) leave a
-    // static `.shared smem_doc_starts` alongside an `extern .shared shmem[]`
-    // (the mixed-layout Blackwell illegal-address pattern that seg_smem was
-    // moved into the shmem[] tail to avoid). Pre-dates this activation (the
-    // alloc came with RoPE-reset); reachable only now that segment_masked can
-    // be true. No current fixture is rope_q=true, so it is unexercised; the
-    // fix (budget the 1028 bytes and/or embed it in the shmem[] tail) belongs
-    // with the rope_q=true launch harness the deferred Test 4 introduces.
-    ptx.push_str("    // PCA §4.3 — CTA prologue: load this row's doc_starts to SMEM\n");
+    // This 1028-byte `smem_doc_starts` region IS now counted in the static-vs-
+    // extern budget: `fwd_needs_dynamic_smem` / `backward_needs_dynamic_smem`
+    // route through `smem_layout::pca_smem_layout(.., rope_q).total`, which adds
+    // the doc region when rope_q (2026-05-27 budget fix). It remains a SEPARATE
+    // static `.shared` (NOT embedded in shmem[]); on the extern path that means
+    // a static `.shared` coexists with `extern .shared shmem[]` — the Blackwell
+    // mixed-layout pattern — which the 2026-05-12 SMEM probe + a 2026-05-27
+    // reproduce found is SAFE on CUDA 13.2 / driver 591.86 / RTX 5070 Ti (the
+    // illegal-address premise did not reproduce), so the embed was intentionally
+    // not built. See `project_pca_smem_mixed_layout_crash_disproven` (memory).
+    ptx.push_str("    // PCA sec.4.3 -- CTA prologue: load this row's doc_starts to SMEM\n");
     ptx.push_str("    .shared .align 4 .b8 smem_doc_starts[1028];\n");
     ptx.push_str("    ld.param.u64 %rd_doc_starts_ptr, [doc_starts_ptr];\n");
     // PCA §4.3 null-guard (spec §4.2): null doc_starts_ptr → write the all-zero
