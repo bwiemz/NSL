@@ -553,6 +553,13 @@ pub fn compile_returning_plan(
     // CPDT Part III: non-WGGO MoE dead-expert prune. Runs here (not under the
     // WGGO-gated invoke_cpdt_if_enabled) so it's reachable with --cpdt --weights
     // alone. No-op unless cpdt Full + a @moe config + a loaded WeightMap.
+    // CPDT §6.1 — `@cpdt(...)` train-block decorator (must precede the
+    // mode/cluster-reading passes below so the decorator's source-level
+    // configuration is authoritative when present).
+    let cpdt_decor_outcome = crate::cpdt_decorator::apply_cpdt_decorator_from_ast(
+        ast, interner, &mut compiler,
+    );
+    crate::cpdt_decorator::report_outcome(&cpdt_decor_outcome);
     crate::cpdt_expert_prune::run_moe_prune_pass(&mut compiler);
     // CPDT §4.1 — roofline-derived capacity-factor override. Runs after the
     // prune pass (so n_live is settled in moe_configs) and before any body

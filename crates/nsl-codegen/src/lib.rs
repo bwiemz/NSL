@@ -66,6 +66,7 @@ pub mod cfie_speculative;
 pub mod cpdt;
 pub mod cpdt_comm;
 pub mod cpdt_expert;
+pub mod cpdt_decorator;
 pub mod cpdt_expert_prune;
 pub mod cpdt_moe_capacity;
 pub mod cpdt_joint;
