@@ -79,14 +79,17 @@ pub fn build_dtype_lists(plan: &PrecisionPlan, param_paths: &[String]) -> (Vec<u
 /// activation cycle (S2), `emit_unified_optim_step_dispatch` now THREADS the
 /// caller's `cpdt_precision_dtypes` through to `fase_emit_final_step`, so both
 /// the WGGO unified-dispatch arm AND the non-WGGO Deferred arm wrap identically
-/// when `cpdt_precision_dtypes.is_some()`. The `wrapped_path_active` flag is
-/// kept here as defense-in-depth and will be relaxed to `true` unconditionally
-/// in S4 once the activation path lands its e2e numerical validation.
+/// when `cpdt_precision_dtypes.is_some()`. As of S4, callers pass
+/// `wrapped_path_active = true` unconditionally — the parameter is kept as
+/// defense-in-depth for any future refactor that reintroduces a non-wrapping
+/// optimizer arm.
 ///
 /// Closed follow-ons (this cycle): source-AD MulElementwise broadcast crash
-/// (S1), unified-dispatch wrap threading (S2). Still open: relax this gate so
-/// `cpdt_precision_dtypes` is built on the WGGO path (S4), expose `--wggo` on
-/// `nsl run` (S3) to drive the e2e validation.
+/// (S1), unified-dispatch wrap threading (S2), `--wggo` on `nsl run` (S3),
+/// `wrapped_path_active` gate relaxation (S4). Part II FP16 optimizer
+/// execution is now live end-to-end on both the non-WGGO Deferred path and
+/// the WGGO unified-dispatch path; activation only requires a CPDT Full
+/// `PrecisionPlan` plus FASE Deferred (AdamW with grad_accumulation > 1).
 pub fn precision_active(
     cpdt_mode_is_full: bool,
     has_precision_plan: bool,

@@ -3526,11 +3526,20 @@ impl Compiler<'_> {
         // mutably) run. No `unsafe`, no tensor clones.
         let cpdt_precision_dtypes: Option<(Value, Value)> = {
             let dtype_data: Option<(Vec<u16>, Vec<u16>)> = {
-                // The FASE cast wrapping is emitted only on the non-unified-dispatch
-                // Deferred branch, which runs iff WGGO is inactive. Allocating FP16
-                // m/v on the unified-dispatch (WGGO) path would feed FP16 buffers to
-                // an unwrapped FP32 update → silent corruption. Gate on it.
-                let wrapped_path_active = self.wggo_overrides.is_none();
+                // Pre-S2: the FASE cast wrapping was emitted ONLY on the
+                // non-unified-dispatch Deferred branch (which runs iff WGGO is
+                // inactive); the unified-dispatch arm hardcoded
+                // `wrap_precision=false`. Allocating FP16 m/v on the WGGO path
+                // would have fed FP16 buffers to an unwrapped FP32 update →
+                // silent corruption. The gate was on `wggo_overrides.is_none()`.
+                //
+                // S2 threaded the wrap through `emit_unified_optim_step_dispatch`,
+                // so BOTH branches now wrap when `cpdt_precision_dtypes.is_some()`.
+                // The silent-corruption hazard is closed structurally, so the
+                // gate is unconditionally true (S4). `wrapped_path_active` stays
+                // a `precision_active` parameter as defense-in-depth in case a
+                // future refactor reintroduces a non-wrapping arm.
+                let wrapped_path_active = true;
                 let plan = self.cpdt_plan.as_ref();
                 let active = plan
                     .map(|p| {
