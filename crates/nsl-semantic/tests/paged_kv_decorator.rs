@@ -86,3 +86,69 @@ fn forward():
         errs
     );
 }
+
+/// Negative (Rule 2): unknown args at function scope error. Only
+/// `block_size` is recognised by `compiler/kernel.rs:1005-1022`; any
+/// other arg would be silently ignored by the kernel extraction site,
+/// so the semantic checker surfaces the typo as an error.
+/// Added in the cycle-3 holistic-review fix — the original Sprint 2
+/// commit shipped the rule in checker/stmt.rs:887-892 but no test
+/// pinned it.
+#[test]
+fn paged_kv_with_unknown_arg_errors() {
+    let src = "\
+@flash_attention
+@paged_kv(stride=8)
+fn forward():
+    pass
+";
+    let errs = paged_kv_errs(src);
+    assert!(
+        errs.iter().any(|e| e.contains("unknown argument")),
+        "expected '@paged_kv unknown argument' error, got {:?}",
+        errs
+    );
+}
+
+/// Negative (Rule 3a): `block_size=0` errors. The kernel's alignment
+/// check `bkv % block_size` would divide by zero at codegen time, so
+/// the semantic checker rejects non-positive values up front.
+/// Added in the cycle-3 holistic-review fix — the original Sprint 2
+/// commit shipped the rule in checker/stmt.rs:874-880 but no test
+/// pinned it.
+#[test]
+fn paged_kv_with_zero_block_size_errors() {
+    let src = "\
+@flash_attention
+@paged_kv(block_size=0)
+fn forward():
+    pass
+";
+    let errs = paged_kv_errs(src);
+    assert!(
+        errs.iter().any(|e| e.contains("positive integer")),
+        "expected '@paged_kv block_size must be a positive integer' error, got {:?}",
+        errs
+    );
+}
+
+/// Negative (Rule 3b): `block_size` with a non-literal arg errors.
+/// The checker only accepts integer literals; identifiers or expressions
+/// would silently produce wrong codegen behavior.
+/// Added in the cycle-3 holistic-review fix — Sprint 2's checker has
+/// the rule at checker/stmt.rs:881-886 but no test pinned it.
+#[test]
+fn paged_kv_with_non_literal_block_size_errors() {
+    let src = "\
+@flash_attention
+@paged_kv(block_size=x)
+fn forward():
+    pass
+";
+    let errs = paged_kv_errs(src);
+    assert!(
+        errs.iter().any(|e| e.contains("integer literal")),
+        "expected '@paged_kv block_size must be an integer literal' error, got {:?}",
+        errs
+    );
+}
