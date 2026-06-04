@@ -73,6 +73,13 @@ pub struct AnalysisResult {
     pub freeze_configs: Vec<crate::wrga::FreezeConfig>,
     /// WRGA: validated `@adapter(...)` configurations.
     pub adapter_configs: Vec<crate::wrga::AdapterConfig>,
+    /// CSHA Sprint 2: validated `@csha(...)` configurations, keyed by the
+    /// decorated model's name (or the LHS binding name for
+    /// `@csha let m = SomeModel()`). The CLI converts these into the
+    /// `CompileOptions.csha_configs` side-channel that the CSHA hook in
+    /// `nsl-codegen/src/stmt.rs` consults per-model so `level=`, `target=`,
+    /// and `disable=` take observable effect on codegen.
+    pub csha_configs: Vec<(String, crate::csha::CshaConfig)>,
     /// M62: Maps each `self.<field>` MemberAccess expression NodeId (inside an
     /// `@export` model method) to the declaration-order index of that field in
     /// the model's tensor-weight list.  Consumed by codegen to lower
@@ -113,6 +120,7 @@ pub fn analyze_with_imports(
     let wrga_configs = checker.wrga_configs;
     let freeze_configs = checker.freeze_configs;
     let adapter_configs = checker.adapter_configs;
+    let csha_configs = checker.csha_configs;
 
     // M62: Run `@export` decorator validation.  Pure-additive — appends
     // diagnostics without touching other analysis state.  Also returns the
@@ -186,6 +194,7 @@ pub fn analyze_with_imports(
         wrga_configs,
         freeze_configs,
         adapter_configs,
+        csha_configs,
         weight_index_map,
     }
 }

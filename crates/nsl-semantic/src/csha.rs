@@ -62,9 +62,11 @@ impl CshaLevel {
 pub struct CshaConfig {
     /// User-forced level.  `None` = auto.
     pub level: Option<CshaLevel>,
-    /// GPU target name as written by the user.  The codegen side looks
-    /// this up in `gpu_specs::GPU_DATABASE`.
-    pub target: Option<Symbol>,
+    /// GPU target name as written by the user, resolved to a string at
+    /// capture time so codegen consumers don't need access to the
+    /// interner.  The codegen side feeds this directly to
+    /// `csha::run_on_wengert` which looks it up in `gpu_specs::GPU_DATABASE`.
+    pub target: Option<String>,
     /// `@csha(disable=true)` — skip CSHA for this model.
     pub disabled: bool,
     pub span: Span,
@@ -76,7 +78,7 @@ pub fn validate_csha_decorator(
     diagnostics: &mut Vec<Diagnostic>,
 ) -> Option<CshaConfig> {
     let mut level: Option<CshaLevel> = None;
-    let mut target: Option<Symbol> = None;
+    let mut target: Option<String> = None;
     let mut disabled = false;
 
     if let Some(ref args) = deco.args {
@@ -111,8 +113,8 @@ pub fn validate_csha_decorator(
                     ),
                 },
                 "target" => match &arg.value.kind {
-                    ExprKind::Ident(sym) => target = Some(*sym),
-                    ExprKind::StringLiteral(_) => target = Some(*name_sym),
+                    ExprKind::Ident(sym) => target = Some(resolve_sym(*sym)),
+                    ExprKind::StringLiteral(s) => target = Some(s.clone()),
                     _ => diagnostics.push(
                         Diagnostic::error(
                             "@csha: target must be an identifier (e.g. h100, rtx5070ti)"

@@ -39,6 +39,13 @@ pub struct ModuleData {
     pub freeze_configs: Vec<nsl_semantic::wrga::FreezeConfig>,
     /// `@adapter` decorator configs captured by nsl-semantic.
     pub adapter_configs: Vec<nsl_semantic::wrga::AdapterConfig>,
+    /// Sprint 2 (paper §6.2): per-model `@csha(...)` decorator configs
+    /// captured by nsl-semantic.  Keyed by the decorated model's name (or
+    /// the LHS binding name for `@csha let m = SomeModel()`).  Routed into
+    /// `CompileOptions.csha_configs` so the CSHA hook in
+    /// `nsl-codegen/src/stmt.rs` applies per-model `disable=`, `level=`,
+    /// and `target=` overrides.
+    pub csha_configs: Vec<(String, nsl_semantic::csha::CshaConfig)>,
     /// M62: per-NodeId weight index resolutions for `self.<field>` accesses
     /// inside `@export` model methods. Routed into `CompileOptions.weight_index_map`
     /// for the entry module on the multi-file shared-lib path.
@@ -404,6 +411,7 @@ pub fn load_all_modules(
             wrga_configs: analysis.wrga_configs,
             freeze_configs: analysis.freeze_configs,
             adapter_configs: analysis.adapter_configs,
+            csha_configs: analysis.csha_configs,
             weight_index_map: analysis.weight_index_map,
         });
     }

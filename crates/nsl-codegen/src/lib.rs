@@ -592,6 +592,18 @@ pub struct CompileOptions {
     pub csha_mode: Option<String>,
     /// CSHA: print the attention-fusion report.
     pub csha_report: bool,
+    /// CSHA Sprint 2 (paper §6.2 binding fix): per-model `@csha(...)` config
+    /// captured by the semantic checker, keyed by the decorated model's name
+    /// (the `<Type>` in `model <Type>:` or the LHS binding name in
+    /// `@csha let m = SomeModel()`).  The CSHA hook in
+    /// `nsl-codegen/src/stmt.rs::compile_train_block` looks up the current
+    /// `model_type_name` in this map and:
+    ///   * `disabled = true` -> skip the CSHA pipeline for that compile.
+    ///   * `level    = Some(L)` -> clamp the planner's `mode_str` to L.
+    ///   * `target   = Some(T)` -> override `csha::run_on_wengert`'s target.
+    /// Empty map = no `@csha` decorators in the program (the default), which
+    /// preserves the pre-Sprint-2 behaviour driven solely by `--csha`.
+    pub csha_configs: HashMap<String, nsl_semantic::csha::CshaConfig>,
     /// CPDT: planner mode (Off/ZeroOnly/Full).
     pub cpdt_mode: crate::cpdt::CpdtMode,
     /// CPDT: cluster topology.  Required when `cpdt_mode != Off`.
@@ -703,6 +715,7 @@ impl Default for CompileOptions {
             wggo_prune_fraction: None,
             csha_mode: None,
             csha_report: false,
+            csha_configs: HashMap::new(),
             cpdt_mode: crate::cpdt::CpdtMode::Off,
             cpdt_cluster: None,
             cpdt_report_requested: false,

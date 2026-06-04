@@ -401,16 +401,79 @@ impl<'a> TypeChecker<'a> {
                             );
                         }
 
-                        // CSHA: @csha decorator validation
+                        // CSHA: @csha decorator validation.
+                        //
+                        // Sprint 2 (paper §6.2 binding fix): the validator
+                        // returns a `CshaConfig` describing the per-model
+                        // `level=`, `target=`, and `disable=` requests. Before
+                        // Sprint 2 the result was dropped on the floor, so
+                        // `@csha(disable=true)` parsed cleanly but had zero
+                        // codegen effect. Now we capture it keyed by the
+                        // decorated model's name (or the LHS binding name for
+                        // `@csha let m = SomeModel()`), and the CLI forwards
+                        // the side-table into `CompileOptions.csha_configs`
+                        // so the CSHA hook in `nsl-codegen/src/stmt.rs` can
+                        // look it up by `model_type_name` and:
+                        //   * `disabled=true`  -> skip the CSHA pipeline.
+                        //   * `level=Some(L)`  -> clamp the planner's mode.
+                        //   * `target=Some(T)` -> override the planner target.
                         if dname == "csha" {
                             let resolve = |s: nsl_ast::Symbol| -> String {
                                 self.interner.resolve(s.0).unwrap_or("").to_string()
                             };
-                            crate::csha::validate_csha_decorator(
+                            if let Some(cfg) = crate::csha::validate_csha_decorator(
                                 deco,
                                 &resolve,
                                 &mut self.diagnostics,
-                            );
+                            ) {
+                                // Resolve the model-or-binding name we want
+                                // to key the config by. Two shapes are
+                                // supported:
+                                //   1. `@csha(...) model Foo: ...`
+                                //   2. `@csha(...) let m = SomeModel()`
+                                // Case 2 keys by the LHS binding name (e.g.
+                                // "m") which is what the codegen hook will
+                                // see as `model_type_name` only when the
+                                // semantic type maps `m` back to its struct.
+                                // To keep this side-table useful in both
+                                // cases we record whichever name we can
+                                // recover here, and codegen does a HashMap
+                                // lookup either way.
+                                let model_name: Option<String> = match &stmt.kind {
+                                    StmtKind::ModelDef(model_def) => Some(
+                                        self.interner
+                                            .resolve(model_def.name.0)
+                                            .unwrap_or("")
+                                            .to_string(),
+                                    ),
+                                    StmtKind::VarDecl { pattern, .. } => {
+                                        if let nsl_ast::pattern::PatternKind::Ident(sym)
+                                            = &pattern.kind
+                                        {
+                                            Some(
+                                                self.interner
+                                                    .resolve(sym.0)
+                                                    .unwrap_or("")
+                                                    .to_string(),
+                                            )
+                                        } else {
+                                            None
+                                        }
+                                    }
+                                    _ => None,
+                                };
+                                if let Some(name) = model_name {
+                                    if !name.is_empty() {
+                                        self.csha_configs.push((name, cfg));
+                                    }
+                                }
+                                // Silently drop on non-model / non-binding
+                                // targets: the validator already accepted the
+                                // decorator on a syntactically valid form,
+                                // and the existing per-target diagnostics
+                                // (e.g. "@csha can only be applied to a
+                                // model") would be a follow-up to add.
+                            }
                         }
 
                         // WGGO: @wggo decorator validation

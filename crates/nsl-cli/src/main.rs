@@ -1268,6 +1268,10 @@ fn main_inner() {
                 wggo_prune_fraction,
                 csha_mode: csha.clone(),
                 csha_report,
+                // Sprint 2 (paper §6.2): default to empty here; populated
+                // per build path by analysis_to_csha_configs after the
+                // semantic checker has run.
+                csha_configs: std::collections::HashMap::new(),
                 cpdt_mode,
                 cpdt_cluster: cpdt_cluster.clone(),
                 cpdt_report_requested: cpdt_report,
@@ -1593,6 +1597,10 @@ fn main_inner() {
                 wggo_prune_fraction: None,
                 csha_mode: csha.clone(),
                 csha_report,
+                // Sprint 2 (paper §6.2): default to empty here; populated
+                // per build path by analysis_to_csha_configs after the
+                // semantic checker has run.
+                csha_configs: std::collections::HashMap::new(),
                 cpdt_mode: nsl_codegen::cpdt::CpdtMode::Off,
                 cpdt_cluster: None,
                 cpdt_report_requested: false,
@@ -2095,6 +2103,18 @@ fn module_data_to_wrga_inputs(m: &crate::loader::ModuleData) -> nsl_codegen::Wrg
     }
 }
 
+/// Sprint 2 (paper §6.2): convert the semantic side-table of validated
+/// `@csha(...)` decorators into the `HashMap<String, CshaConfig>` shape
+/// `CompileOptions.csha_configs` expects.  The CSHA hook in
+/// `nsl-codegen/src/stmt.rs` looks up `model_type_name` here and applies the
+/// per-model `disable=` / `level=` / `target=` overrides.  Empty when the
+/// program has no `@csha` decorators.
+fn analysis_to_csha_configs(
+    a: &nsl_semantic::AnalysisResult,
+) -> std::collections::HashMap<String, nsl_semantic::csha::CshaConfig> {
+    a.csha_configs.iter().cloned().collect()
+}
+
 fn analysis_to_wrga_inputs(a: &nsl_semantic::AnalysisResult) -> nsl_codegen::WrgaInputs {
     use nsl_codegen::{
         AdapterDecoratorConfig, AdapterKind, FreezeDecoratorConfig, WrgaDecoratorConfig,
@@ -2324,6 +2344,9 @@ fn run_build_shared_single(
     check_wrga_report_preconditions(&analysis, wrga_report, options);
     let mut options = options.clone();
     options.wrga_inputs = Some(analysis_to_wrga_inputs(&analysis));
+    // Sprint 2 (paper §6.2): forward @csha decorator configs so per-model
+    // disable/level/target overrides take effect on the shared-library path.
+    options.csha_configs = analysis_to_csha_configs(&analysis);
     // M62 Task 6: route weight_index_map from semantic analysis into codegen.
     options.weight_index_map = analysis.weight_index_map.clone();
     // M62: allocate a slot the compiler publishes @export functions into,
@@ -2616,6 +2639,11 @@ fn run_build_shared_multi(
             }
             let mut entry_options = options.clone();
             entry_options.wrga_inputs = Some(module_data_to_wrga_inputs(mod_data));
+            // Sprint 2 (paper §6.2): forward entry-module @csha decorator
+            // configs so per-model disable/level/target overrides take
+            // effect on the multi-file shared-lib path.
+            entry_options.csha_configs =
+                mod_data.csha_configs.iter().cloned().collect();
             entry_options.export_functions_out = Some(exports_slot.clone());
             // M62: route entry-module weight_index_map so @export model methods
             // can resolve `self.<field>` → weight index on the multi-file path.
@@ -2769,6 +2797,9 @@ fn run_build_zk(
     check_wrga_report_preconditions(&analysis, wrga_report, options);
     let mut options = options.clone();
     options.wrga_inputs = Some(analysis_to_wrga_inputs(&analysis));
+    // Sprint 2 (paper §6.2): forward @csha decorator configs so per-model
+    // disable/level/target overrides take effect on the ZK build path.
+    options.csha_configs = analysis_to_csha_configs(&analysis);
     // M62 Task 6: route weight_index_map from semantic analysis into codegen.
     options.weight_index_map = analysis.weight_index_map.clone();
     let options = &options;
@@ -2996,6 +3027,9 @@ fn run_build_standalone(
     check_wrga_report_preconditions(&analysis, wrga_report, options);
     let mut options = options.clone();
     options.wrga_inputs = Some(analysis_to_wrga_inputs(&analysis));
+    // Sprint 2 (paper §6.2): forward @csha decorator configs so per-model
+    // disable/level/target overrides take effect on the standalone build path.
+    options.csha_configs = analysis_to_csha_configs(&analysis);
     // M62 Task 6: route weight_index_map from semantic analysis into codegen.
     options.weight_index_map = analysis.weight_index_map.clone();
     let options = &options;
@@ -3133,6 +3167,9 @@ fn run_build_single(
     // Task 1 (WRGA bridge): forward decorator configs captured by nsl-semantic.
     let mut options = options.clone();
     options.wrga_inputs = Some(analysis_to_wrga_inputs(&analysis));
+    // Sprint 2 (paper §6.2): forward @csha decorator configs so per-model
+    // disable/level/target overrides take effect on the multi-module path.
+    options.csha_configs = analysis_to_csha_configs(&analysis);
     // M62 Task 6: route weight_index_map from semantic analysis into codegen so
     // compile_export_model_methods can resolve self.<field> → weight-array index.
     options.weight_index_map = analysis.weight_index_map.clone();
@@ -3382,6 +3419,11 @@ fn run_build_multi(
             }
             let mut entry_options = options.clone();
             entry_options.wrga_inputs = Some(module_data_to_wrga_inputs(mod_data));
+            // Sprint 2 (paper §6.2): forward entry-module @csha decorator
+            // configs so per-model disable/level/target overrides take
+            // effect on the multi-file standalone path.
+            entry_options.csha_configs =
+                mod_data.csha_configs.iter().cloned().collect();
             let entry_options = &entry_options;
 
             match nsl_codegen::compile_entry_returning_plan(

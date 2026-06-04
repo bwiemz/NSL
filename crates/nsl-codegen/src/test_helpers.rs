@@ -110,6 +110,7 @@ pub fn run_pre_pass_only(
             wrga_configs: Vec::new(),
             freeze_configs: Vec::new(),
             adapter_configs: Vec::new(),
+            csha_configs: Vec::new(),
             weight_index_map: std::collections::HashMap::new(),
         };
         // walk_ops may fail on trivial test inputs (no fn/train block).  The

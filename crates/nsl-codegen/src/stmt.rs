@@ -4136,7 +4136,55 @@ impl Compiler<'_> {
                 // decisions from WGGO are honoured (or rejected with a
                 // diagnostic) by CSHA.
                 if let Some(ref mode_str) = self.compile_options.csha_mode {
-                    if mode_str != "off" && mode_str != "disable" && mode_str != "disabled" {
+                    // Sprint 2 (paper §6.2 binding fix): consult the
+                    // per-model `@csha(...)` config captured by the semantic
+                    // checker, keyed by the model type the current train
+                    // block is compiling against.  We resolve effective
+                    // mode_str / target / disable HERE so the rest of the
+                    // hook stays uniform.
+                    let per_model_cfg = self
+                        .compile_options
+                        .csha_configs
+                        .get(&model_type_name)
+                        .cloned();
+                    let model_disabled = per_model_cfg
+                        .as_ref()
+                        .map(|c| c.disabled)
+                        .unwrap_or(false);
+                    // `level=` on the decorator clamps the planner's mode.
+                    // We prefer the decorator over `--csha` because the
+                    // decorator is the per-model authorial intent, not the
+                    // global build switch.  Mapping mirrors `CshaMode::parse`.
+                    let effective_mode_string: String = per_model_cfg
+                        .as_ref()
+                        .and_then(|c| {
+                            c.level.map(|l| match l {
+                                nsl_semantic::csha::CshaLevel::Boundary => {
+                                    "boundary".to_string()
+                                }
+                                nsl_semantic::csha::CshaLevel::Pipeline => {
+                                    "pipeline".to_string()
+                                }
+                                nsl_semantic::csha::CshaLevel::Block => {
+                                    "block".to_string()
+                                }
+                            })
+                        })
+                        .unwrap_or_else(|| mode_str.clone());
+                    let effective_mode_str = effective_mode_string.as_str();
+                    // `target=` on the decorator overrides the global GPU
+                    // target for CSHA planning only (does NOT affect the
+                    // rest of codegen — that runs on the global target).
+                    let effective_target: &str = per_model_cfg
+                        .as_ref()
+                        .and_then(|c| c.target.as_deref())
+                        .unwrap_or(self.compile_options.target.as_str());
+
+                    let disabled_by_decorator = model_disabled;
+                    let disabled_by_flag = mode_str == "off"
+                        || mode_str == "disable"
+                        || mode_str == "disabled";
+                    if !disabled_by_decorator && !disabled_by_flag {
                         // H.1: when `@flash_attention(head_dim=N)` is on a
                         // method, `compile_flash_attention_kernels` has
                         // already populated `flash_attention_context.config.head_dim`
@@ -4164,8 +4212,8 @@ impl Compiler<'_> {
                             });
                         if let Some(plan) = crate::csha::run_on_wengert(
                             extractor.wengert_list(),
-                            &self.compile_options.target,
-                            mode_str,
+                            effective_target,
+                            effective_mode_str,
                             None, // weight-aware analysis hooked up via CompileOptions.weight_file in follow-up
                             csha_shape_override, // H.1: forward decorator head_dim to the planner
                             8,    // default head count; weight-informed path refines this

@@ -55,6 +55,7 @@ fn run_profile_pre_pass(
         wrga_configs: Vec::new(),
         freeze_configs: Vec::new(),
         adapter_configs: Vec::new(),
+        csha_configs: Vec::new(),
         weight_index_map: std::collections::HashMap::new(),
     };
 
