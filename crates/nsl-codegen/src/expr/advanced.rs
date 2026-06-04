@@ -1628,6 +1628,13 @@ impl Compiler<'_> {
                         row_max: row_max_v,
                         row_sum: row_sum_v,
                         x_raw: x_raw_v,
+                        // Sprint 1 T1.1: retain the forward attention
+                        // output handle (already allocated above as
+                        // `out_val` via `nsl_tensor_zeros_like`/`_on`
+                        // and threaded into the with-saves FFI below).
+                        // The Tier B.2 hybrid backward's D pre-pass
+                        // reads O via `csha_tensor_data_ptr(out_ptr)`.
+                        out: out_val,
                         backward_ptx_data_id: bwd_ptx_id,
                         backward_name_data_id: bwd_name_id,
                     },

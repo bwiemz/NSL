@@ -369,6 +369,23 @@ pub struct CshaSavePointers {
     pub row_max: cranelift_codegen::ir::Value,
     pub row_sum: cranelift_codegen::ir::Value,
     pub x_raw: cranelift_codegen::ir::Value,
+    /// Sprint 1 T1.1: the forward attention output `O` tensor handle.
+    ///
+    /// The forward CSHA call site allocates `out_val` via
+    /// `nsl_tensor_zeros_on` and passes it to
+    /// `nsl_flash_attention_csha_with_saves`; after the launch this
+    /// NslTensor* holds the forward attention output. The Tier B.2
+    /// hybrid backward's D pre-pass needs `O` to compute
+    /// `D = rowsum(dO * O)` (kernel 1) — sourcing it from the same
+    /// per-layer save record keeps the lookup keyed by layer name and
+    /// avoids a separate cross-emit cache.
+    ///
+    /// Pre-T1.1 the backward emission passed `null` for the `out_ptr`
+    /// slot in `nsl_flash_attention_csha_backward`; the runtime's
+    /// `csha_tensor_data_ptr(out_ptr)` returned 0 and the D pre-pass
+    /// silently produced `D == 0`. See PARITY-GATE NOTE in
+    /// `crates/nsl-runtime/src/flash_attention.rs::nsl_flash_attention_csha_backward`.
+    pub out: cranelift_codegen::ir::Value,
     /// Gap B: data-section IDs for the CSHA fused backward PTX + name.
     /// Mirror of `FlashAttentionCompileContext.csha_backward_{ptx,name}_data_id`
     /// — copied here so Gap C/D's adjoint emitter has everything it needs

@@ -629,6 +629,12 @@ fn emit_fused_forward_under_claim(
             row_max: row_max_v,
             row_sum: row_sum_v,
             x_raw: x_raw_v,
+            // Sprint 1 T1.1: retain the forward attention output handle
+            // so the Tier B.2 hybrid backward's D pre-pass can compute
+            // D = rowsum(dO * O). The runtime resolves the device data
+            // pointer via `csha_tensor_data_ptr(out_ptr)` (see
+            // `nsl_flash_attention_csha_backward`).
+            out: out_val,
             backward_ptx_data_id: bwd_ptx_id,
             backward_name_data_id: bwd_name_id,
         },
@@ -1897,6 +1903,15 @@ fn lower_single_op(
             // path byte-identical. T7 computes the real flag.
             let tier_b2_active_flag = builder.ins().iconst(cl_types::I64, 0);
 
+            // Sprint 1 T1.1: source the forward attention output `O`
+            // handle from the per-layer save record (populated by the
+            // forward CSHA launch site in this same FunctionBuilder
+            // scope). The Tier B.2 hybrid backward's D pre-pass
+            // (kernel 1) computes D = rowsum(dO * O) and reads O via
+            // `csha_tensor_data_ptr(out_ptr)`. Pre-T1.1 we passed
+            // `null` here and the D pre-pass silently produced
+            // D == 0; see PARITY-GATE NOTE in
+            // `crates/nsl-runtime/src/flash_attention.rs::nsl_flash_attention_csha_backward`.
             let _rc = call(
                 compiler,
                 builder,
@@ -1904,7 +1919,7 @@ fn lower_single_op(
                 &[
                     // Forward-side 36 args (mirrors _with_saves order).
                     q_ptr, k_ptr, v_ptr,
-                    null,                 // out_ptr
+                    saves.out,            // out_ptr (Sprint 1 T1.1)
                     null,                 // logsumexp_ptr
                     scale_bits,
                     batch, heads, seq_len, hd_val,
