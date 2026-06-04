@@ -317,6 +317,40 @@ enum Cli {
         #[arg(long, value_name = "RATIO", default_value_t = 1.0)]
         cpdt_moe_roofline_slack: f64,
 
+        /// WGGO: global-optimization mode ("full", "greedy", or "off").
+        /// Passing `--wggo` without a value enables full mode.
+        /// Mirrors `nsl build --wggo` so CPDT precision-adaptive optimizer
+        /// activation can be exercised end-to-end via `nsl run`.
+        #[arg(long, value_name = "MODE", num_args = 0..=1, default_missing_value = "full")]
+        wggo: Option<String>,
+
+        /// WGGO: print the global-optimization report to stderr.
+        /// Mirrors `nsl build --wggo-report`.
+        #[arg(long)]
+        wggo_report: bool,
+
+        /// WGGO Stage 3: path to a `.nslweights` sidecar for real
+        /// weight-based importance scoring.  Without this flag the
+        /// analyzer falls back to uniform head scores.
+        /// Mirrors `nsl build --wggo-weights`.
+        #[arg(long, value_name = "PATH")]
+        wggo_weights: Option<PathBuf>,
+
+        /// WGGO head-importance scoring mode.
+        /// - `auto` (default): gradient scoring when calibration sidecar present, else magnitude.
+        /// - `magnitude`: force magnitude scoring even with calibration data.
+        /// - `grad`: require gradient scoring; errors if no calibration sidecar present.
+        /// Mirrors `nsl build --wggo-importance`.
+        #[arg(long, value_enum, default_value_t = CliWggoImportance::Auto)]
+        wggo_importance: CliWggoImportance,
+
+        /// WGGO Stage 3: fraction of heads the default
+        /// `min_retained_importance` threshold allows to be pruned.
+        /// Clamped to [0.0, 0.9]; default 0.25.
+        /// Mirrors `nsl build --wggo-prune-fraction`.
+        #[arg(long, value_name = "F")]
+        wggo_prune_fraction: Option<f64>,
+
         /// Path to the model weights file (.safetensors) for the
         /// weight-aware CPDT path. Mirrors `nsl build -w/--weights`.
         #[arg(short = 'w', long)]
@@ -1543,6 +1577,11 @@ fn main_inner() {
             cpdt_inter_bw,
             cpdt_report,
             cpdt_moe_roofline_slack,
+            wggo,
+            wggo_report,
+            wggo_weights,
+            wggo_importance,
+            wggo_prune_fraction,
             weights,
         } => {
             // CSHA: validate the same way `nsl build --csha` does so an
@@ -1553,6 +1592,40 @@ fn main_inner() {
                     eprintln!(
                         "error: --csha value '{}' is not one of auto|boundary|pipeline|block|off",
                         m
+                    );
+                    process::exit(1);
+                }
+            }
+
+            // WGGO: mirror the `nsl build` validation so an unrecognised mode,
+            // out-of-range prune fraction, or missing weights path fails fast
+            // rather than silently disabling the analyzer. CPDT Part II FP16
+            // activation depends on the WGGO mode-table dispatch reaching the
+            // wrapped optimizer step, so it is important that bad input fails
+            // visibly here instead of silently routing through the inactive arm.
+            if let Some(ref m) = wggo {
+                if nsl_codegen::wggo::WggoMode::parse(m).is_none() {
+                    eprintln!(
+                        "error: --wggo value '{}' is not one of full|greedy|off|auto",
+                        m
+                    );
+                    process::exit(1);
+                }
+            }
+            if let Some(f) = wggo_prune_fraction {
+                if !(0.0..=0.9).contains(&f) {
+                    eprintln!(
+                        "error: --wggo-prune-fraction must be in [0.0, 0.9], got {}",
+                        f
+                    );
+                    process::exit(1);
+                }
+            }
+            if let Some(ref p) = wggo_weights {
+                if !p.exists() {
+                    eprintln!(
+                        "error: --wggo-weights path does not exist: {}",
+                        p.display()
                     );
                     process::exit(1);
                 }
@@ -1770,8 +1843,8 @@ fn main_inner() {
                 shared_lib: false,
                 wrga_inputs: None,
                 wrga_fold_allocations: false,
-                wggo_mode: None,
-                wggo_report: false,
+                wggo_mode: wggo.clone(),
+                wggo_report,
                 // Phase 4 Task 6: when a train block is detected with --monitor,
                 // the health monitor takes over; disable the Phase 1/2 kernel
                 // timing path so they don't stomp on each other.
@@ -1796,9 +1869,9 @@ fn main_inner() {
                 health_monitor: detected_train_block,
                 health_flush_interval: None,
                 inspect_enabled: inspect,
-                wggo_weights: None,
-                wggo_importance: nsl_codegen::WggoImportance::Auto,
-                wggo_prune_fraction: None,
+                wggo_weights: wggo_weights.clone(),
+                wggo_importance: nsl_codegen::WggoImportance::from(wggo_importance),
+                wggo_prune_fraction,
                 csha_mode: csha.clone(),
                 csha_report,
                 // CPDT: thread the planner mode + cluster + plan-out slot into
