@@ -53,7 +53,7 @@ pub fn synthesize_dq_kernel(
     emit_inner_loop_close(&mut ptx);
     // Finalize MUST run INSIDE the outer q_iter loop: the dQ accumulator is per-q-tile
     // (zeroed by emit_dq_acc_init each q_iter, accumulated over the kv sweep), and the
-    // finalize's HBM row = q_iter*bq + band_row_base + lane/4. Placing it after
+    // finalize's HBM row = q_iter*bq + band_row_base_q + lane/4. Placing it after
     // emit_outer_loop_close used the post-loop %q_iter (= num_q_iters), writing OOB rows
     // (silently dropped → zero output) and only ever the last q-tile. Run it per q_iter
     // before the increment so each q-tile's dQ is written with the correct, in-range row.
@@ -110,7 +110,11 @@ fn emit_register_decls(ptx: &mut String, config: &FlashAttentionConfig) {
     // NOTE: user register named %r_tid (not %tid) to avoid shadowing the PTX special register
     // %tid (a vector); ptxas rejects %tid.x when %tid is declared as a user u32.
     ptx.push_str("    .reg .u32 %r_tid, %lane_id, %warp_id;\n");
-    ptx.push_str("    .reg .u32 %band_row_base;\n");
+    // Sprint 1 cycle-4: dq.rs uses ONLY a Q-axis band base (no KV-axis
+    // dual-use, unlike dkdv.rs). The `_q` suffix codifies this invariant
+    // explicitly. The 4-delimiter absence check in the test module verifies
+    // no future edit re-introduces the bare `%band_row_base` name.
+    ptx.push_str("    .reg .u32 %band_row_base_q;\n");
     ptx.push_str("    .reg .pred %p_warp_active;\n");
     ptx.push_str("    .reg .u32 %q_tile, %kv_tile, %head, %batch_idx;\n");
     ptx.push_str("    .reg .pred %p_tile_active, %p_producer, %p_consumer;\n");
@@ -226,7 +230,7 @@ fn emit_register_decls(ptx: &mut String, config: &FlashAttentionConfig) {
     // dQ += dS@K fragment A/B regs (b32-packed f16 fragments; accumulators are %dq_acc_*).
     ptx.push_str("    .reg .b32 %dq_a0, %dq_a1, %dq_a2, %dq_a3, %dq_b0, %dq_b1;\n");
     // Sprint 4 (paper §4.1): intra-tile causal element-mask scratch.
-    // Used by emit_intra_tile_causal_mask. q_abs_lo = q_iter*bq + band_row_base + lane/4
+    // Used by emit_intra_tile_causal_mask. q_abs_lo = q_iter*bq + band_row_base_q + lane/4
     // (and q_abs_hi = q_abs_lo + 8); kv_abs_lo = kv_iter*bkv + n_tile*8 + (lane%4)*2
     // (and kv_abs_hi = kv_abs_lo + 1). Per-element predicates %p_cm_{0..3} fire when
     // kv_abs > q_abs; %f_neg_inf carries the -INFINITY f32 sentinel (selp source).
@@ -275,7 +279,7 @@ fn emit_grid_id_setup(ptx: &mut String) {
 fn emit_warp_band_setup(ptx: &mut String, config: &FlashAttentionConfig) {
     let active_warps = tier_b2_effective_bq(config) / 16; // 4 at bq=64, 2 at bq=32
     ptx.push_str("    // Warp-per-m16-band: warp w owns q-rows [w*16, w*16+16).\n");
-    ptx.push_str("    mul.lo.u32 %band_row_base, %warp_id, 16;\n");
+    ptx.push_str("    mul.lo.u32 %band_row_base_q, %warp_id, 16;\n");
     ptx.push_str(&format!(
         "    setp.lt.u32 %p_warp_active, %warp_id, {active_warps};  // active = warp_id < bq/16\n"
     ));
@@ -389,7 +393,7 @@ fn emit_stats_addr_load(ptx: &mut String, config: &FlashAttentionConfig) {
     ptx.push_str("    ld.param.u64 %stats_d_base, [d_ptr];\n");
     ptx.push_str("    shr.u32 %stat_lane_div4, %lane_id, 2;\n");
     ptx.push_str(&format!("    mul.lo.u32 %s_lo, %q_iter, {bq};\n"));
-    ptx.push_str("    add.u32 %s_lo, %s_lo, %band_row_base;\n");
+    ptx.push_str("    add.u32 %s_lo, %s_lo, %band_row_base_q;\n");
     ptx.push_str("    add.u32 %s_lo, %s_lo, %stat_lane_div4;\n");
     ptx.push_str("    add.u32 %s_hi, %s_lo, 8;\n");
     emit_3d_byte_offset(ptx, "%stats_off_lo", "%batch_idx", "%head", "%s_lo", "%heads_r", "%seq_len_r", 4);
@@ -920,7 +924,7 @@ fn emit_tile_skip_predicate(ptx: &mut String, config: &FlashAttentionConfig) {
 ///   %s_d2 -> (q_abs_hi = q_abs_lo + 8, kv_abs_lo)
 ///   %s_d3 -> (q_abs_hi, kv_abs_hi)
 /// where
-///   q_abs_lo  = q_iter * bq  + band_row_base + (lane_id / 4)
+///   q_abs_lo  = q_iter * bq  + band_row_base_q + (lane_id / 4)
 ///   kv_abs_lo = kv_iter * bkv + n_tile * 8   + (lane_id % 4) * 2
 ///
 /// EMISSION GATING
@@ -941,7 +945,7 @@ fn emit_intra_tile_causal_mask(ptx: &mut String, config: &FlashAttentionConfig) 
 
     ptx.push_str("    // V2_INTRA_TILE_CAUSAL_MASK (paper sec 4.1): per-element causal mask\n");
     ptx.push_str("    // For each S-fragment element i in {0..3}:\n");
-    ptx.push_str("    //   q_abs_lo  = q_iter*bq  + band_row_base + lane_id/4\n");
+    ptx.push_str("    //   q_abs_lo  = q_iter*bq  + band_row_base_q + lane_id/4\n");
     ptx.push_str("    //   kv_abs_lo = kv_iter*bkv + n_tile*8     + (lane_id%4)*2\n");
     ptx.push_str("    //   d0 <- (q_abs_lo, kv_abs_lo); d1 <- (q_abs_lo, kv_abs_lo+1);\n");
     ptx.push_str("    //   d2 <- (q_abs_lo+8, kv_abs_lo); d3 <- (q_abs_lo+8, kv_abs_lo+1).\n");
@@ -952,9 +956,9 @@ fn emit_intra_tile_causal_mask(ptx: &mut String, config: &FlashAttentionConfig) 
     ptx.push_str("    shl.b32 %cm_lane_mod4_x2, %cm_lane_mod4_x2, 1;  // (lane%4)*2\n");
     ptx.push_str("    shr.u32 %cm_lane_div4, %lane_id, 2;             // lane/4\n");
 
-    // q_abs_lo = q_iter*bq + band_row_base + lane/4
+    // q_abs_lo = q_iter*bq + band_row_base_q + lane/4
     ptx.push_str(&format!("    mul.lo.u32 %cm_q_tile_base, %q_iter, {bq};\n"));
-    ptx.push_str("    add.u32 %cm_q_abs_lo, %cm_q_tile_base, %band_row_base;\n");
+    ptx.push_str("    add.u32 %cm_q_abs_lo, %cm_q_tile_base, %band_row_base_q;\n");
     ptx.push_str("    add.u32 %cm_q_abs_lo, %cm_q_abs_lo, %cm_lane_div4;\n");
     ptx.push_str("    add.u32 %cm_q_abs_hi, %cm_q_abs_lo, 8;\n");
 
@@ -996,7 +1000,7 @@ fn emit_intra_tile_causal_mask(ptx: &mut String, config: &FlashAttentionConfig) 
 /// dS is stored f16, not f32; Task 1 re-sized the dS band to `bq*bkv*2`).
 /// Destination: SMEM at `tier_b2_dq_ds_offset(config)`.
 ///
-/// Absolute row = `band_row_base + lane/4` (lo) / `+8` (hi); absolute column =
+/// Absolute row = `band_row_base_q + lane/4` (lo) / `+8` (hi); absolute column =
 /// `n_tile*8 + (lane%4)*2` (lo) / `+1` (hi), so each warp band scatters into its
 /// own 16 Q-rows and each n-tile into its own 8 kv-columns.
 ///
@@ -1013,10 +1017,10 @@ fn emit_ds_scatter_to_smem(ptx: &mut String, config: &FlashAttentionConfig) {
 
     ptx.push_str("    // === F1: Scatter dS to SMEM (row-major f16 tile at ds_offset) ===\n");
     ptx.push_str("    // Per PTX m16n8 D-frag layout per lane t (band b = warp band, n = n_tile):\n");
-    ptx.push_str("    //   ds_0 -> (row=band_row_base+t/4,   col=n_tile*8+(t%4)*2)\n");
-    ptx.push_str("    //   ds_1 -> (row=band_row_base+t/4,   col=n_tile*8+(t%4)*2+1)\n");
-    ptx.push_str("    //   ds_2 -> (row=band_row_base+t/4+8, col=n_tile*8+(t%4)*2)\n");
-    ptx.push_str("    //   ds_3 -> (row=band_row_base+t/4+8, col=n_tile*8+(t%4)*2+1)\n");
+    ptx.push_str("    //   ds_0 -> (row=band_row_base_q+t/4,   col=n_tile*8+(t%4)*2)\n");
+    ptx.push_str("    //   ds_1 -> (row=band_row_base_q+t/4,   col=n_tile*8+(t%4)*2+1)\n");
+    ptx.push_str("    //   ds_2 -> (row=band_row_base_q+t/4+8, col=n_tile*8+(t%4)*2)\n");
+    ptx.push_str("    //   ds_3 -> (row=band_row_base_q+t/4+8, col=n_tile*8+(t%4)*2+1)\n");
 
     // Obtain SMEM base as u32 shared-space address.
     // cvta.shared.u64 converts the shmem symbol to a 64-bit generic address;
@@ -1037,8 +1041,8 @@ fn emit_ds_scatter_to_smem(ptx: &mut String, config: &FlashAttentionConfig) {
     ptx.push_str("    shl.b32 %f1_col_lo_b, %f1_col_lo, 1;            // col_lo * 2 bytes (f16)\n");
     ptx.push_str("    shl.b32 %f1_col_hi_b, %f1_col_hi, 1;            // col_hi * 2 bytes (f16)\n");
 
-    // abs row_lo = band_row_base + lane/4 ; row_hi = +8.
-    ptx.push_str("    add.u32 %f1_lane_div4, %f1_lane_div4, %band_row_base;\n");
+    // abs row_lo = band_row_base_q + lane/4 ; row_hi = +8.
+    ptx.push_str("    add.u32 %f1_lane_div4, %f1_lane_div4, %band_row_base_q;\n");
     ptx.push_str(&format!("    mul.lo.u32 %f1_row_lo_off, %f1_lane_div4, {row_stride};\n"));
     // row_hi_off = (row_lo + 8) * row_stride = row_lo_off + 8*row_stride
     ptx.push_str(&format!("    add.u32 %f1_row_hi_off, %f1_row_lo_off, {};\n", 8 * row_stride));
@@ -1191,7 +1195,7 @@ fn emit_kcol_restage_scatter(ptx: &mut String, config: &FlashAttentionConfig) {
 /// The k-tile loop (`hd / 16` iterations) is UNROLLED at codegen time into a
 /// chain of m16n8k16 MMAs accumulating into `c_regs` (MAC: each iter's D feeds
 /// the next iter's C). The A-fragment base folds in the warp-band row offset
-/// (`%band_row_base`) so each warp reads its own 16-row Q band; the B-fragment
+/// (`%band_row_base_q`) so each warp reads its own 16-row Q band; the B-fragment
 /// base derives from the runtime `%n_tile` (each n-tile is 8 kv columns).
 ///
 /// Row-major K[bkv, hd] byte-aliases to col-major K^T[hd, bkv] with
@@ -1224,8 +1228,8 @@ fn emit_s_matmul_tiled(
         ptx.push_str(&format!("    mov.f32 %{r}, 0.0;\n"));
     }
     for k in 0..n_k_tiles {
-        // A base = cvta(shmem) + q_off + band_row_base*hd*2 + k*16*2  (Q-band rows, k-tile cols)
-        ptx.push_str(&format!("    mul.lo.u32 %a_base, %band_row_base, {};\n", hd * 2));
+        // A base = cvta(shmem) + q_off + band_row_base_q*hd*2 + k*16*2  (Q-band rows, k-tile cols)
+        ptx.push_str(&format!("    mul.lo.u32 %a_base, %band_row_base_q, {};\n", hd * 2));
         ptx.push_str(&format!("    add.u32 %a_base, %a_base, {};\n", q_off + k * 16 * 2));
         ptx.push_str("    add.u32 %a_base, %a_base, %mma_smem_base;  // + cvta(shmem) base\n");
         // B base = cvta(shmem) + k_off + n_tile*8*hd*2 + k*16*2  (Kᵀ: kv columns via runtime %n_tile, hd k)
@@ -1246,7 +1250,7 @@ fn emit_s_matmul_tiled(
 ///
 /// Mirrors `emit_s_matmul_tiled`: k-tile loop (`hd / 16` iterations) unrolled into
 /// a chain of m16n8k16 MMAs accumulating into `c_regs`. A-fragment base derives from
-/// `%band_row_base` (dO-band rows); B-fragment base derives from runtime `%n_tile`
+/// `%band_row_base_q` (dO-band rows); B-fragment base derives from runtime `%n_tile`
 /// (row-major V byte-aliases Vᵀ with col_stride = hd*2).
 fn emit_dp_matmul_tiled(
     ptx: &mut String,
@@ -1276,8 +1280,8 @@ fn emit_dp_matmul_tiled(
         ptx.push_str(&format!("    mov.f32 %{r}, 0.0;\n"));
     }
     for k in 0..n_k_tiles {
-        // A base = cvta(shmem) + do_off + band_row_base*hd*2 + k*16*2  (dO-band rows, k-tile cols)
-        ptx.push_str(&format!("    mul.lo.u32 %a_base, %band_row_base, {};\n", hd * 2));
+        // A base = cvta(shmem) + do_off + band_row_base_q*hd*2 + k*16*2  (dO-band rows, k-tile cols)
+        ptx.push_str(&format!("    mul.lo.u32 %a_base, %band_row_base_q, {};\n", hd * 2));
         ptx.push_str(&format!("    add.u32 %a_base, %a_base, {};\n", do_off + k * 16 * 2));
         ptx.push_str("    add.u32 %a_base, %a_base, %mma_smem_base;  // + cvta(shmem) base\n");
         // B base = cvta(shmem) + v_off + n_tile*8*hd*2 + k*16*2  (Vᵀ: kv columns via runtime %n_tile, hd k)
@@ -1299,14 +1303,14 @@ fn emit_dp_matmul_tiled(
 /// k-tiles (contraction over the kv axis). Each (n, k) pair issues one
 /// m16n8k16 MMA whose:
 ///   - A-fragment is dS (f16, row-major) at `tier_b2_dq_ds_offset`, with the
-///     warp-band row offset folded in via the runtime `%band_row_base`;
+///     warp-band row offset folded in via the runtime `%band_row_base_q`;
 ///   - B-fragment is K re-staged col-major at `tier_b2_dq_k_colmajor_offset`,
 ///     so the MMA computes A @ B = dS @ K (NOT dS @ K^T);
 ///   - C = D = `%dq_acc_{n}_*` (MAC) — the accumulator is register-resident and
 ///     zeroed ONCE by emit_dq_acc_init before the kv loop, so this function does
 ///     NOT re-zero it (it accumulates across both k AND the kv_iter loop).
 ///
-/// The A-base uses the runtime `%band_row_base` (mul+add into `%a_base`); the
+/// The A-base uses the runtime `%band_row_base_q` (mul+add into `%a_base`); the
 /// B-base is a compile-time constant passed directly as the base string.
 fn emit_dq_matmul_tiled(ptx: &mut String, config: &FlashAttentionConfig,
                         a_regs: &[String;4], b_regs: &[String;2]) {
@@ -1333,8 +1337,8 @@ fn emit_dq_matmul_tiled(ptx: &mut String, config: &FlashAttentionConfig,
     // accumulation across (n,k) is order-independent — %dq_acc_* is zeroed once by
     // emit_dq_acc_init before the kv loop — so reordering is numerically identical.
     for k in 0..n_k_tiles {
-        // A base = cvta(shmem) + ds_off + band_row_base*bkv*2 + k*16*2  (runtime band_row_base; depends only on k)
-        ptx.push_str(&format!("    mul.lo.u32 %a_base, %band_row_base, {};\n", bkv * 2));
+        // A base = cvta(shmem) + ds_off + band_row_base_q*bkv*2 + k*16*2  (runtime band_row_base_q; depends only on k)
+        ptx.push_str(&format!("    mul.lo.u32 %a_base, %band_row_base_q, {};\n", bkv * 2));
         ptx.push_str(&format!("    add.u32 %a_base, %a_base, {};\n", ds_off + k * 16 * 2));
         ptx.push_str("    add.u32 %a_base, %a_base, %mma_smem_base;  // + cvta(shmem) base\n");
         emit_load_a_fragment_smem(ptx, a_regs, "%a_base", ds_row_stride);
@@ -1414,7 +1418,7 @@ fn emit_inner_loop_body(ptx: &mut String, config: &FlashAttentionConfig) {
     // === S = Q @ K^T (m16n8k16, k-tile contraction codegen-unrolled per n_tile) ===
     // Row-major K[bkv, hd] byte-aliases to col-major K^T[hd, bkv] with
     // col_stride_bytes = hd * 2.  The 4-arg B-frag helper reads it correctly and
-    // produces Q @ K^T.  A-frag base folds %band_row_base; B-frag base from %n_tile.
+    // produces Q @ K^T.  A-frag base folds %band_row_base_q; B-frag base from %n_tile.
     ptx.push_str("    // === S = Q @ K^T (tiled m16n8k16, k-tiles unrolled, per runtime n_tile) ===\n");
     emit_s_matmul_tiled(ptx, config, &a_regs, &b_regs, &c_regs, &d_regs);
 
@@ -1516,7 +1520,7 @@ fn emit_inner_loop_body(ptx: &mut String, config: &FlashAttentionConfig) {
 
     // === dQ_acc += dS @ K (tiled m16n8k16, B-frag from col-major K re-stage) ===
     //
-    // A-frag: dS, f16 row-major in SMEM at tier_b2_dq_ds_offset (band_row_base base).
+    // A-frag: dS, f16 row-major in SMEM at tier_b2_dq_ds_offset (band_row_base_q base).
     // B-frag: K, col-major-staged in SMEM at tier_b2_dq_k_colmajor_offset.
     //         The 4-arg emit_load_b_fragment_smem reads col-major SMEM → col-major
     //         B-frag → the MMA computes A @ B = dS @ K (NOT dS @ K^T).
@@ -1600,9 +1604,9 @@ fn emit_dq_finalize(ptx: &mut String, config: &FlashAttentionConfig) {
     // q_tile_start = q_iter * bq
     ptx.push_str(&format!("    mul.lo.u32 %g1_q_tile_start, %q_iter, {bq};\n"));
 
-    // row_lo = q_tile_start + band_row_base + lane/4      (the "lo" MMA row)
-    // row_hi = q_tile_start + band_row_base + lane/4 + 8  (the "hi" MMA row)
-    ptx.push_str("    add.u32 %g1_row_lo, %g1_q_tile_start, %band_row_base;\n");
+    // row_lo = q_tile_start + band_row_base_q + lane/4      (the "lo" MMA row)
+    // row_hi = q_tile_start + band_row_base_q + lane/4 + 8  (the "hi" MMA row)
+    ptx.push_str("    add.u32 %g1_row_lo, %g1_q_tile_start, %band_row_base_q;\n");
     ptx.push_str("    add.u32 %g1_row_lo, %g1_row_lo, %g1_lane_div4;\n");
     ptx.push_str("    add.u32 %g1_row_hi, %g1_row_lo, 8;\n");
 
@@ -1846,7 +1850,7 @@ mod tests {
         assert!(ptx.contains("DQ_NTILE_LOOP"), "expected runtime n-tile streaming loop label");
         assert!(ptx.contains("mul.lo.u32 %b_base, %n_tile,"),
             "S K^T B-frag base must be computed from the runtime %n_tile");
-        assert!(ptx.contains("%band_row_base"), "S A-frag base must include warp-band offset");
+        assert!(ptx.contains("%band_row_base_q"), "S A-frag base must include warp-band offset");
     }
 
     #[test]
@@ -2078,7 +2082,7 @@ mod tests {
         // exact s_lo derivation (the lane/4 term is the bug-class term):
         assert!(ptx.contains("shr.u32 %stat_lane_div4, %lane_id, 2"), "s_lo must include lane/4");
         assert!(ptx.contains("mul.lo.u32 %s_lo, %q_iter, 64"), "s_lo must include q_iter*bq (bq=64 at hd=32)");
-        assert!(ptx.contains("add.u32 %s_lo, %s_lo, %band_row_base"), "s_lo must include warp band base");
+        assert!(ptx.contains("add.u32 %s_lo, %s_lo, %band_row_base_q"), "s_lo must include warp band base");
         assert!(ptx.contains("add.u32 %s_lo, %s_lo, %stat_lane_div4"), "s_lo must add lane/4");
         assert!(ptx.contains("add.u32 %s_hi, %s_lo, 8"), "s_hi = s_lo + 8");
         // 6 stat loads (rmax/rsum/d x lo/hi) and per-row reciprocal:
@@ -2092,7 +2096,7 @@ mod tests {
         // hd=32 -> bq=64 -> active warps = 64/16 = 4.
         let cfg = FlashAttentionConfig { head_dim: 32, ..canonical_cfg() };
         let ptx = synthesize_dq_kernel(&cfg).unwrap();
-        assert!(ptx.contains("mul.lo.u32 %band_row_base, %warp_id, 16"),
+        assert!(ptx.contains("mul.lo.u32 %band_row_base_q, %warp_id, 16"),
             "expected warp-band row base = warp_id*16");
         assert!(ptx.contains("setp.lt.u32 %p_warp_active, %warp_id, 4"),
             "expected warp-active predicate warp_id < bq/16 (=4 at bq=64)");
@@ -2155,7 +2159,7 @@ mod tests {
         assert!(!ptx.contains("st.shared.f32 [%f1_addr"),
             "dS scatter must no longer store f32");
         // address must fold the warp-band row and the per-n-tile column.
-        assert!(ptx.contains("%band_row_base"), "dS scatter row must add band_row_base");
+        assert!(ptx.contains("%band_row_base_q"), "dS scatter row must add band_row_base_q");
         assert!(ptx.contains("mul.lo.u32") && ptx.contains("%n_tile"),
             "dS scatter col must add n_tile*8 (mul.lo.u32 + add, NOT mad.lo)");
         // ISA 7.0: no mad.lo anywhere in the kernel.
@@ -2171,8 +2175,8 @@ mod tests {
         let st = ptx.matches("st.global.f32").count();
         assert_eq!(st, (128 / 8) * 4, "finalize must emit hd/8=16 n-tiles x 4 = 64 stores, got {st}");
         // row must fold the warp-band base (else every warp writes warp-0's rows).
-        assert!(ptx.contains("add.u32 %g1_row_lo, %g1_q_tile_start, %band_row_base"),
-            "finalize row must add %band_row_base before lane/4");
+        assert!(ptx.contains("add.u32 %g1_row_lo, %g1_q_tile_start, %band_row_base_q"),
+            "finalize row must add %band_row_base_q before lane/4");
         // the last n-tile accumulator must reach finalize (proves all 16 n-tiles stored).
         assert!(ptx.contains("%dq_acc_15_0") && ptx.contains("%dq_acc_15_3"),
             "finalize must store the last n-tile (n=15)");
@@ -2264,6 +2268,56 @@ mod tests {
         assert!(
             h_uses >= 2,
             "non-GQA path must wire %head directly into K-load (C3) and V-load (C4); got {h_uses}"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Sprint 1 cycle-4 (paper sec 3.2 Q-axis-only invariant): the dq.rs
+    // emitter uses the band-row-base register PURELY as a Q-axis index
+    // (warp band setup, stats-load q-row, intra-tile causal mask q_abs,
+    // dS scatter Q-row, S/dP/dQ MMA A-frag rows, HBM finalize Q-row) —
+    // there is NO KV-axis dual-use site (unlike dkdv.rs pre-cycle-2).
+    //
+    // The `_q` suffix codifies this invariant in the register name. This
+    // test pins the rename so any future edit that re-introduces the
+    // bare `%band_row_base` name (e.g. via copy/paste from a pre-rename
+    // diff) fails fast at codegen time. Parallel structure to dkdv.rs's
+    // `dkdv_kernel_emits_axis_specific_band_row_base_and_warp_active`
+    // (which checks both `_q` and `_kv` because dkdv has both axes).
+    // -------------------------------------------------------------------
+    #[test]
+    fn synthesize_dq_kernel_emits_axis_specific_band_row_base_q_only() {
+        let ptx = synthesize_dq_kernel(&canonical_cfg()).expect("synth ok");
+        // Sprint 1 cycle-4 invariant: dq.rs is Q-axis-only by construction
+        // (see emit_warp_band_setup docs); the `_q` suffix codifies it.
+        // Any future edit that reintroduces bare `%band_row_base` would
+        // violate the Q-axis-only invariant -- catch it here. The four
+        // delimiters cover every PTX operand context (separator, statement
+        // terminator, end-of-line, intra-instruction space) so a comment
+        // mentioning `band_row_base` symbolically (without the `%`) still
+        // matches none of the operand patterns.
+        assert!(
+            !ptx.contains("%band_row_base,")
+                && !ptx.contains("%band_row_base;")
+                && !ptx.contains("%band_row_base\n")
+                && !ptx.contains("%band_row_base "),
+            "pre-cycle-4 unsuffixed %band_row_base must not appear in dq.rs emitted PTX operands"
+        );
+        // Positive presence check: the q-suffixed register MUST appear
+        // (declaration + every use site).
+        assert!(
+            ptx.contains("%band_row_base_q"),
+            "dq.rs must declare %band_row_base_q after cycle-4 rename"
+        );
+        // Exact declaration: one and only one `.reg .u32 %band_row_base_q;`.
+        assert!(
+            ptx.contains(".reg .u32 %band_row_base_q;"),
+            "the axis-specific band-row-base register must be declared"
+        );
+        // Warp-band derivation must produce the q-suffixed register from %warp_id.
+        assert!(
+            ptx.contains("mul.lo.u32 %band_row_base_q, %warp_id, 16"),
+            "Q-axis warp-band derivation must target the _q-suffixed register"
         );
     }
 }
