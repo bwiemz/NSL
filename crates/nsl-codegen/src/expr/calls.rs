@@ -1681,10 +1681,32 @@ impl Compiler<'_> {
                 return Ok(result);
             }
 
-            // Fallback: emit v1 (M32 identity skeleton) for backward
-            // compatibility. S4 will promote this path to a hard
-            // CodegenError when cpdt_mode == Full, so non-CPDT consumers
-            // still get v1 but CPDT consumers fail-fast on missing data.
+            // CPDT Part III v1 (S4) — no silent v1 fallback when CPDT is
+            // active. When `cpdt_mode == Full` AND v2 emission failed, raise
+            // a hard compile error so the running program does not silently
+            // route through the M32 identity skeleton (which would mask a
+            // broken WeightMap / mismatched router/experts shapes).
+            // Non-CPDT consumers still get v1 (the M32 fallback) since they
+            // have no expectation of the production-forward path.
+            if matches!(self.cpdt_mode, crate::cpdt::CpdtMode::Full) {
+                return Err(crate::error::CodegenError::new(format!(
+                    "moe_dispatch: CPDT Full mode requires resolvable router + experts \
+                     entries in the WeightMap. None of the standard names resolved under \
+                     the MoeConfig key{}, or their shapes were inconsistent (router must be \
+                     [hidden, num_experts]; experts must be [num_experts, hidden * \
+                     intermediate]). Pass --weights with a safetensors bundle that \
+                     contains <key>.router.weight (or gate.weight / router / gate) AND \
+                     <key>.experts.weight (or experts).",
+                    cfg_key
+                        .as_deref()
+                        .map(|k| format!(" '{}'", k))
+                        .unwrap_or_default(),
+                )));
+            }
+
+            // Non-CPDT fallback: emit v1 (M32 identity skeleton). Kept for
+            // backward compatibility with consumers that don't supply a
+            // WeightMap and don't activate CPDT.
             let result = self.compile_call_by_name(
                 builder,
                 "nsl_moe_dispatch_full",
