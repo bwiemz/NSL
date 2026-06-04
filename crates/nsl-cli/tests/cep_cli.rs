@@ -126,7 +126,7 @@ fn cep_prune_end_to_end_writes_delta() {
 
     let delta = fs::read_to_string(&out_path).expect("delta JSON written");
     let v: serde_json::Value = serde_json::from_str(&delta).expect("delta is valid JSON");
-    assert_eq!(v["cep_version"], 1);
+    assert_eq!(v["cep_version"], 2); // Wave 1 bumped to 2 (binary_size/kernel_launches/wcet_us fields)
     assert_eq!(v["mode"], "prune");
 }
 

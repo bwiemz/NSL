@@ -158,12 +158,21 @@ impl SearchAxes {
             * self.norm.len()
     }
 
-    /// Enumerate all combinations as [`ModelSpec`]s.  Candidates whose
-    /// `n_heads % n_kv_heads != 0` are filtered out (shape algebra
-    /// rejection).
+    /// Enumerate all combinations as [`ModelSpec`]s.  Candidates are filtered
+    /// by shape-algebra invariants and §4.3 granularity constraints:
+    ///   * `n_kv_heads` must divide `n_heads` evenly (GQA invariant)
+    ///   * `n_heads` must divide `d_model` evenly (head-dim derivation)
+    ///   * `d_model` must be a power of two OR a multiple of 64 (§4.3 table row 1)
+    ///   * `d_ff` must be a multiple of 64 (§4.3 table row 6)
     pub fn enumerate(&self) -> Vec<ModelSpec> {
         let mut out = Vec::new();
         for &d in &self.d_model {
+            // §4.3: d_model must be power-of-two OR multiple of 64.
+            let is_pow2 = d.is_power_of_two();
+            let is_mult64 = d % 64 == 0;
+            if !is_pow2 && !is_mult64 {
+                continue;
+            }
             for &nl in &self.n_layers {
                 for &nh in &self.n_heads {
                     for &nkv in &self.n_kv_heads {
@@ -174,6 +183,10 @@ impl SearchAxes {
                             continue;
                         }
                         for &ff in &self.d_ff {
+                            // §4.3: d_ff must be a multiple of 64.
+                            if ff % 64 != 0 {
+                                continue;
+                            }
                             for &act in &self.activation {
                                 for &norm in &self.norm {
                                     out.push(ModelSpec {
@@ -322,6 +335,45 @@ mod tests {
         for nh in &pruned.n_heads {
             assert_eq!(*nh, spec.n_heads[0]);
         }
+    }
+
+    // G12 — §4.3 granularity: d_model must be pow2 or mult-64; d_ff must be mult-64.
+    #[test]
+    fn enumerate_rejects_non_mult64_d_ff_and_d_model() {
+        let axes = SearchAxes {
+            // 384: mult-64 (ok), 100: neither pow2 nor mult-64 (bad), 256: pow2 (ok)
+            d_model: vec![384, 100, 256],
+            n_layers: vec![4],
+            n_heads: vec![4],
+            n_kv_heads: vec![2],
+            // 1024: mult-64 (ok), 1000: not mult-64 (bad)
+            d_ff: vec![1024, 1000],
+            activation: vec![Activation::SwiGlu],
+            norm: vec![NormType::RmsNorm],
+            vocab: 32000,
+            head_dim: 64,
+            max_seq: 1024,
+            batch: 1,
+            dtype_bytes: 2,
+        };
+        let candidates = axes.enumerate();
+        // d_model=100 and d_ff=1000 must never appear.
+        for c in &candidates {
+            assert_ne!(c.d_model, 100, "d_model 100 (not pow2, not mult-64) must be filtered");
+            assert!(
+                !c.d_ff.contains(&1000),
+                "d_ff 1000 (not mult-64) must be filtered"
+            );
+        }
+        // Valid combinations (d_model∈{384,256} × d_ff∈{1024}) must remain.
+        assert!(
+            candidates.iter().any(|c| c.d_model == 384 && c.d_ff.iter().all(|&x| x == 1024)),
+            "d_model=384 + d_ff=1024 should be present"
+        );
+        assert!(
+            candidates.iter().any(|c| c.d_model == 256 && c.d_ff.iter().all(|&x| x == 1024)),
+            "d_model=256 + d_ff=1024 should be present"
+        );
     }
 
     #[test]

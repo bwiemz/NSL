@@ -122,6 +122,60 @@ pub struct PruneStep {
     pub new_latency_us: f64,
 }
 
+/// Candidate FFN widths for a layer's sweep. Derived from the layer's baseline
+/// `d_ff` so all real models (d_ff ∈ {1024, 4096, 8192, ...}) get a meaningful
+/// sweep. All candidates are multiples of 64 (paper §4.3 table) and strictly
+/// less than `baseline_d_ff`. Returned largest-first (try largest reduction first).
+fn ffn_candidate_widths(baseline_d_ff: u32) -> Vec<u32> {
+    let multipliers = [0.75_f32, 0.5, 0.375];
+    let mut widths: Vec<u32> = multipliers
+        .iter()
+        .map(|m| ((baseline_d_ff as f32 * m) as u32 / 64) * 64)
+        .filter(|&w| w > 0 && w < baseline_d_ff)
+        .collect();
+    widths.sort_unstable();
+    widths.dedup();
+    widths.into_iter().rev().collect() // try largest-shrink first
+}
+
+/// Retained capacity: the sum of importance scores of components that survived
+/// pruning. Paper §2.2 Mode 1: "Maximize: retained capacity (sum of importance
+/// scores)".
+///
+/// - Per surviving head h in layer l: add the head's importance score.
+/// - Per layer l: add (chosen.d_ff[l] / baseline.d_ff[l]) × ffn.score
+///   (linear retention proxy).
+/// - Per surviving layer l: add layers[l].total_score.
+fn retained_capacity(baseline: &ModelSpec, chosen: &ModelSpec, importance: &ImportanceTable) -> f64 {
+    let mut total = 0.0_f64;
+    // Head retention: surviving heads have indices [0, chosen.n_heads[l]).
+    for h in &importance.heads {
+        let l = h.layer as usize;
+        if l < chosen.n_layers as usize && h.head < chosen.n_heads.get(l).copied().unwrap_or(0) {
+            total += h.score;
+        }
+    }
+    // FFN width retention.
+    for f in &importance.ffns {
+        let l = f.layer as usize;
+        if l < chosen.n_layers as usize {
+            let base = baseline.d_ff.get(l).copied().unwrap_or(0) as f64;
+            let new = chosen.d_ff.get(l).copied().unwrap_or(0) as f64;
+            if base > 0.0 {
+                total += f.score * (new / base).clamp(0.0, 1.0);
+            }
+        }
+    }
+    // Layer retention: surviving layers contribute their total_score.
+    for lscore in &importance.layers {
+        let l = lscore.layer as usize;
+        if l < chosen.n_layers as usize {
+            total += lscore.total_score;
+        }
+    }
+    total
+}
+
 fn satisfies_constraints(profile: &CompilationProfile, c: &Constraints) -> bool {
     profile.peak_memory_bytes <= c.peak_memory_bytes
         && profile.estimated_latency_us <= c.latency_us
@@ -231,7 +285,6 @@ pub fn prune_greedy(
     if matches!(granularity, Granularity::Ffn | Granularity::HeadAndFfn)
         && !sparsity_reached(baseline_params, current_spec.param_count(), constraints.target_sparsity)
     {
-        let candidate_widths: [u32; 3] = [1024, 768, 512];
         // Iterate from least-important layer (low importance score).
         let mut layer_scores: Vec<(u32, f64)> = importance
             .layers
@@ -242,6 +295,7 @@ pub fn prune_greedy(
         layer_scores.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
         for (layer, _) in layer_scores {
+            let candidate_widths = ffn_candidate_widths(base_spec.d_ff[layer as usize]);
             for &w in &candidate_widths {
                 let mut delta = PruneDelta::for_spec(&current_spec);
                 if let Some(d) = delta.per_layer.iter_mut().find(|d| d.layer == layer) {
@@ -301,7 +355,7 @@ pub fn prune_greedy(
         chosen: Some(EvaluatedCandidate {
             spec: current_spec.clone(),
             profile: current_profile.clone(),
-            score: (baseline_params.saturating_sub(current_spec.param_count())) as f64,
+            score: retained_capacity(base_spec, &current_spec, importance),
             feasible: satisfies_constraints(&current_profile, constraints),
         }),
         ranked_candidates: Vec::new(),
@@ -576,5 +630,67 @@ mod tests {
         // either accepted or rejected.
         assert!(outcome.prune_log.len() >= 1);
         assert!(outcome.prune_log.len() <= total_heads);
+    }
+
+    // G4 — FFN widths must be data-driven, not hardcoded.
+    #[test]
+    fn ffn_candidate_widths_scale_to_baseline() {
+        // baseline d_ff = 4096 → widths {3072, 2048, 1536} (75%, 50%, 37.5% × mult-64)
+        let w = super::ffn_candidate_widths(4096);
+        assert!(!w.is_empty());
+        assert!(
+            w.iter().all(|&x| x % 64 == 0),
+            "must be multiples of 64: {w:?}"
+        );
+        assert!(
+            w.iter().all(|&x| x < 4096),
+            "must be strictly less than baseline"
+        );
+        assert_eq!(w[0], 3072); // largest-first
+        // baseline d_ff = 1024 → widths {768, 512, 384}
+        let w2 = super::ffn_candidate_widths(1024);
+        assert_eq!(w2, vec![768, 512, 384]);
+    }
+
+    // G5 — prune chosen score must be retained capacity, not params-saved.
+    #[test]
+    fn prune_chosen_score_is_retained_capacity() {
+        use crate::cep_importance::FfnImportance;
+
+        let s = spec();
+        let baseline_params = s.param_count() as f64;
+        // Build an importance table that includes ffns so retained_capacity is non-zero.
+        let mut imp = fake_importance(&s);
+        for l in 0..s.n_layers {
+            imp.ffns.push(FfnImportance {
+                layer: l,
+                weight_magnitude: 1.0,
+                position_factor: 1.0,
+                roofline_slack: 1.0,
+                score: 10.0,
+            });
+        }
+        let outcome = prune_greedy(
+            &s,
+            &imp,
+            gpu(),
+            &Constraints {
+                target_sparsity: 0.02,
+                ..Default::default()
+            },
+            Granularity::HeadAndFfn,
+        );
+        let chosen = outcome.chosen.as_ref().unwrap();
+        // Retained capacity sums importance scores (typically small numbers
+        // relative to raw param counts).  It must NOT look like "params saved"
+        // (which would be in the millions for this spec).
+        assert!(
+            chosen.score < baseline_params * 0.5,
+            "retained_capacity {} should not look like saved-params {}",
+            chosen.score,
+            baseline_params
+        );
+        // And strictly positive (some capacity is retained).
+        assert!(chosen.score > 0.0, "retained_capacity must be > 0");
     }
 }
