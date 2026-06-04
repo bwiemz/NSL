@@ -199,6 +199,19 @@ fn emit_register_decls(ptx: &mut String, config: &FlashAttentionConfig) {
     ptx.push_str("    .reg .f32 %dp_c0, %dp_c1, %dp_c2, %dp_c3, %dp_d0, %dp_d1, %dp_d2, %dp_d3;\n");
     // dS scalars (Task 5): dS_i = (1/sqrt(D)) * P_i * (dP_i - D[q]).
     ptx.push_str("    .reg .f32 %ds_0, %ds_1, %ds_2, %ds_3;\n");
+    // Sprint 4 (paper sec 4.1): intra-tile causal element-mask scratch.
+    // Used by emit_intra_tile_causal_mask in this kernel (kv-outer/q-inner).
+    // q_abs_lo = q_iter*bq + band_row_base + lane/4 (+8 for hi);
+    // kv_abs_lo = kv_iter*bkv + n_tile*8 + (lane%4)*2 (+1 for hi).
+    // %f_neg_inf carries the -INFINITY f32 sentinel. Compile-time gated emission:
+    // when config.causal=false the executable instructions are not emitted; ptxas
+    // tolerates unused decls.
+    ptx.push_str("    .reg .u32 %cm_q_abs_lo, %cm_q_abs_hi;\n");
+    ptx.push_str("    .reg .u32 %cm_kv_abs_lo, %cm_kv_abs_hi;\n");
+    ptx.push_str("    .reg .u32 %cm_lane_mod4_x2, %cm_lane_div4;\n");
+    ptx.push_str("    .reg .u32 %cm_kv_tile_base, %cm_q_tile_base, %cm_n_tile_col;\n");
+    ptx.push_str("    .reg .pred %p_cm_0, %p_cm_1, %p_cm_2, %p_cm_3;\n");
+    ptx.push_str("    .reg .f32 %f_neg_inf;\n");
     // dV accumulators: hd/8 contiguous n-tiles x 4 f32/lane (Task 5 fills MMA; zeroed here).
     let n_acc = (config.head_dim / 8) as u32;
     for n in 0..n_acc {
@@ -776,6 +789,76 @@ fn emit_tile_skip_predicate(ptx: &mut String, config: &FlashAttentionConfig) {
     }
 }
 
+/// Sprint 4 (paper sec 4.1): emit the intra-tile per-element causal mask.
+///
+/// CONTEXT
+/// -------
+/// `emit_tile_skip_predicate` handles whole-tile skip (kv_tile_start > q_tile_end).
+/// The DIAGONAL tile still contains elements that satisfy `kv_abs > q_abs` and
+/// must be masked individually. This emitter sets %s_d{i} = -INFINITY at those
+/// positions BEFORE the P-recompute's `exp(scale * S - rmax)`. Because exp(-INF)
+/// is exactly 0, P_masked = 0 and the downstream dS = (1/sqrt(D)) * P * (dP - D)
+/// is also 0, so masked elements contribute nothing to dV (P^T @ dO) or
+/// dK (dS^T @ Q). Matches the CPU naive reference `k_limit = qi + 1` exactly.
+///
+/// LANE -> (q_abs, kv_abs) MAPPING (per PTX m16n8 D-fragment layout, identical
+/// to dq.rs::emit_intra_tile_causal_mask; in the dkdv kernel %band_row_base is
+/// a q-row offset for the S/dP MMA, exactly like dq):
+///   %s_d0 -> (q_abs_lo, kv_abs_lo)
+///   %s_d1 -> (q_abs_lo, kv_abs_lo + 1)
+///   %s_d2 -> (q_abs_lo + 8, kv_abs_lo)
+///   %s_d3 -> (q_abs_lo + 8, kv_abs_lo + 1)
+/// where
+///   q_abs_lo  = q_iter * bq  + band_row_base + (lane_id / 4)
+///   kv_abs_lo = kv_iter * bkv + n_tile * 8   + (lane_id % 4) * 2
+///
+/// EMISSION GATING
+/// ---------------
+/// Body emitted iff `config.causal == true`. Non-causal configs: zero PTX overhead.
+/// Marker `V2_INTRA_TILE_CAUSAL_MASK` appears in a comment only when emitted
+/// (tested by `tier_b2_intra_tile_causal_mask_emission`).
+fn emit_intra_tile_causal_mask(ptx: &mut String, config: &FlashAttentionConfig) {
+    if !config.causal {
+        return;
+    }
+    let bq = tier_b2_effective_bq(config);
+    let bkv = tier_b2_effective_bkv(config);
+
+    ptx.push_str("    // V2_INTRA_TILE_CAUSAL_MASK (paper sec 4.1): per-element causal mask\n");
+    ptx.push_str("    // For each S-fragment element i in {0..3}:\n");
+    ptx.push_str("    //   q_abs_lo  = q_iter*bq  + band_row_base + lane_id/4\n");
+    ptx.push_str("    //   kv_abs_lo = kv_iter*bkv + n_tile*8     + (lane_id%4)*2\n");
+    ptx.push_str("    //   d0 <- (q_abs_lo, kv_abs_lo); d1 <- (q_abs_lo, kv_abs_lo+1);\n");
+    ptx.push_str("    //   d2 <- (q_abs_lo+8, kv_abs_lo); d3 <- (q_abs_lo+8, kv_abs_lo+1).\n");
+    ptx.push_str("    // mask if kv_abs > q_abs => %s_d{i} = -INF (exp -> 0 in P-recompute).\n");
+
+    ptx.push_str("    and.b32 %cm_lane_mod4_x2, %lane_id, 3;          // lane%4\n");
+    ptx.push_str("    shl.b32 %cm_lane_mod4_x2, %cm_lane_mod4_x2, 1;  // (lane%4)*2\n");
+    ptx.push_str("    shr.u32 %cm_lane_div4, %lane_id, 2;             // lane/4\n");
+
+    ptx.push_str(&format!("    mul.lo.u32 %cm_q_tile_base, %q_iter, {bq};\n"));
+    ptx.push_str("    add.u32 %cm_q_abs_lo, %cm_q_tile_base, %band_row_base;\n");
+    ptx.push_str("    add.u32 %cm_q_abs_lo, %cm_q_abs_lo, %cm_lane_div4;\n");
+    ptx.push_str("    add.u32 %cm_q_abs_hi, %cm_q_abs_lo, 8;\n");
+
+    ptx.push_str(&format!("    mul.lo.u32 %cm_kv_tile_base, %kv_iter, {bkv};\n"));
+    ptx.push_str("    mul.lo.u32 %cm_n_tile_col, %n_tile, 8;\n");
+    ptx.push_str("    add.u32 %cm_kv_abs_lo, %cm_kv_tile_base, %cm_n_tile_col;\n");
+    ptx.push_str("    add.u32 %cm_kv_abs_lo, %cm_kv_abs_lo, %cm_lane_mod4_x2;\n");
+    ptx.push_str("    add.u32 %cm_kv_abs_hi, %cm_kv_abs_lo, 1;\n");
+
+    ptx.push_str("    mov.f32 %f_neg_inf, 0FFF800000;  // -INFINITY\n");
+
+    ptx.push_str("    setp.gt.u32 %p_cm_0, %cm_kv_abs_lo, %cm_q_abs_lo;\n");
+    ptx.push_str("    selp.f32 %s_d0, %f_neg_inf, %s_d0, %p_cm_0;\n");
+    ptx.push_str("    setp.gt.u32 %p_cm_1, %cm_kv_abs_hi, %cm_q_abs_lo;\n");
+    ptx.push_str("    selp.f32 %s_d1, %f_neg_inf, %s_d1, %p_cm_1;\n");
+    ptx.push_str("    setp.gt.u32 %p_cm_2, %cm_kv_abs_lo, %cm_q_abs_hi;\n");
+    ptx.push_str("    selp.f32 %s_d2, %f_neg_inf, %s_d2, %p_cm_2;\n");
+    ptx.push_str("    setp.gt.u32 %p_cm_3, %cm_kv_abs_hi, %cm_q_abs_hi;\n");
+    ptx.push_str("    selp.f32 %s_d3, %f_neg_inf, %s_d3, %p_cm_3;\n");
+}
+
 /// E1: emit the tiled S = Q @ K^T m16n8k16 matmul for ONE runtime n_tile.
 ///
 /// Mirrors dq.rs::emit_s_matmul_tiled exactly, with SMEM offsets swapped to
@@ -998,6 +1081,11 @@ fn emit_inner_loop_body(ptx: &mut String, config: &FlashAttentionConfig) {
     // B-frag base derives from runtime %n_tile (kv columns).
     ptx.push_str("    // === E1: S = Q @ K^T (tiled m16n8k16, k-tiles unrolled, per runtime n_tile) ===\n");
     emit_s_matmul_tiled(ptx, config, &a_regs, &b_regs, &c_regs, &d_regs);
+
+    // === Sprint 4 (paper sec 4.1): intra-tile per-element causal mask ===
+    // Mask %s_d{0..3} to -INFINITY at positions where kv_abs > q_abs before the
+    // softmax exp. Compile-time gated by config.causal (no PTX overhead otherwise).
+    emit_intra_tile_causal_mask(ptx, config);
 
     // === P recompute (lane-by-lane, no SMEM) per spec ss4.3 step 4 ===
     // P[q,k] = softmax(scale * S[q,k]) = exp(scale*S[q,k] - row_max[q]) * row_sum_recip[q].

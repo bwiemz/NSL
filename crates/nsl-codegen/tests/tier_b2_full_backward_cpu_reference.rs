@@ -197,25 +197,18 @@ const GATE_DO_SCALE: f32 = 1024.0;
 const RMSNORM_EPS: f32 = 1e-5;
 
 /// Smoke-intersection config for a given head_dim.
+///
+/// Sprint 4 (paper §4.1 intra-tile causal masking): the dq/dkdv MMA kernels
+/// now apply per-element causal masking BEFORE the softmax exp (set S=-INF
+/// for kv_abs > q_abs when `config.causal`). The Phase-4 deferral has been
+/// closed; the smoke config defaults to causal=false because the historical
+/// gates were calibrated against that regime, but the Sprint 4 sweeps below
+/// rerun the SAME gate with causal=true and the new per-element mask.
 fn smoke_cfg(hd: i64, seq: i64) -> FlashAttentionConfig {
     FlashAttentionConfig {
         block_q: seq,
         block_kv: seq,
         head_dim: hd,
-        // causal == FALSE — the VALIDATED regime for the Tier B.2 dq/dkdv MMA
-        // kernels. Those kernels implement only a TILE-LEVEL causal skip
-        // (skip whole kv tiles where kv_tile_start > q_tile_end); they do NOT
-        // implement INTRA-tile element-level causal masking (zeroing P[q,k] for
-        // k > q inside a tile). Under the smoke scope seq == block_q is a SINGLE
-        // tile, so a causal=true launch would compute full (non-causal)
-        // attention and diverge from the masked CPU reference (measured: dQ/dK/dV
-        // rel 1.3..9.1 at causal=true vs 1.5e-3..6.2e-3 at causal=false). The
-        // intra-tile mask is an explicitly-deferred Phase-4 item (see
-        // `tier_b2/backward/dq.rs` module doc: "NO seq-boundary masking ...
-        // Phase-4 follow-on"). Gating here at the kernels' validated causal=false
-        // regime proves the full 7-gradient hybrid chain non-vacuously without
-        // silently masking the deferral; the gap is asserted as a known
-        // limitation in `tier_b2_full_backward_causal_gap_documented` below.
         causal: false,
         paged: false,
         rope_q: false,
@@ -283,42 +276,75 @@ fn tier_b2_full_backward_sweep_b1_forward() {
     }
 }
 
-/// Documents the KNOWN intra-tile causal-masking gap in the Tier B.2 dq/dkdv
-/// kernels (CPU-only; structural — no GPU). The dq/dkdv kernels emit only a
-/// TILE-LEVEL causal skip (`%p_causal_active = kv_tile_start <= q_tile_end`);
-/// there is NO per-element masking of `P[q,k]` for `k > q` inside a tile. Under
-/// the smoke scope (seq == block_q == one tile) the tile is never skipped, so a
-/// causal=true launch computes FULL attention and diverges from a masked
-/// reference (the T8 gate measured dQ/dK/dV rel 1.3..9.1 at causal=true vs
-/// 1.5e-3..6.2e-3 at causal=false). The full backward gate above therefore runs
-/// at the kernels' validated causal=false regime. This test pins the deferral:
-/// when intra-tile causal masking is implemented (Phase-4), it should fail and
-/// the smoke config can flip to causal=true.
+// ============================================================================
+// Sprint 4: intra-tile causal element masking (paper §4.1)
+// ============================================================================
+//
+// These sweeps rerun the full 7-gradient parity gate with causal=true and the
+// new per-element causal mask emitted by dq.rs / dkdv.rs. The CPU naive
+// reference at `cpu_naive_backward_*` already applies element-level masking
+// (`k_limit = qi + 1`), so the GPU output must match it under causal=true.
+
 #[test]
-fn tier_b2_full_backward_causal_gap_documented() {
+#[ignore]
+fn tier_b2_full_backward_sweep_cpu_naive_causal() {
+    // Sprint 4 — full 7-gradient gate, CpuNaive forward, causal=true.
+    for &hd in &[64i64, 128] {
+        let seq = if hd >= 128 { 32 } else { 64 };
+        let mut cfg = smoke_cfg(hd, seq);
+        cfg.causal = true;
+        validate_full_backward_for_source(&cfg, FSource::CpuNaive, seq as usize);
+    }
+}
+
+#[test]
+#[ignore]
+fn tier_b2_full_backward_sweep_b1_forward_causal() {
+    // Sprint 4 — full 7-gradient gate, B.1 GPU forward + adapter, causal=true.
+    // B.1 single-block precondition pins seq=32 for all hd; seq==block_q holds.
+    for &hd in &[64i64, 128] {
+        let mut cfg = smoke_cfg(hd, 32);
+        cfg.causal = true;
+        validate_full_backward_for_source(&cfg, FSource::B1Forward, 32);
+    }
+}
+
+/// Sprint 4 (paper §4.1): structural verification that BOTH the tile-level
+/// causal skip predicate AND the new intra-tile per-element mask are emitted
+/// when `config.causal` is true. The intra-tile mask is gated entirely by the
+/// compile-time `config.causal` flag — when false, the marker MUST NOT appear
+/// (zero PTX overhead in the non-causal path).
+#[test]
+fn tier_b2_intra_tile_causal_mask_emission() {
     use nsl_codegen::flash_attention_v2::tier_b2::backward::dkdv::synthesize_dkdv_kernel;
     use nsl_codegen::flash_attention_v2::tier_b2::backward::dq::synthesize_dq_kernel;
 
-    let mut cfg = smoke_cfg(64, 64);
-    cfg.causal = true; // request causal explicitly
+    // causal=true: both kernels emit the tile-skip predicate AND the per-element mask.
+    let mut cfg_causal = smoke_cfg(64, 64);
+    cfg_causal.causal = true;
+    let dq_c = synthesize_dq_kernel(&cfg_causal).expect("dq synth (causal)");
+    let dkdv_c = synthesize_dkdv_kernel(&cfg_causal).expect("dkdv synth (causal)");
 
-    let dq = synthesize_dq_kernel(&cfg).expect("dq synth");
-    let dkdv = synthesize_dkdv_kernel(&cfg).expect("dkdv synth");
-
-    // The ONLY causal construct is the tile-level skip predicate. If a future
-    // implementer adds an intra-tile per-element mask (zeroing P[q,k] for k>q),
-    // they should introduce a distinct marker and update this test + the smoke
-    // config to causal=true.
-    for (name, ptx) in [("dq", &dq), ("dkdv", &dkdv)] {
+    for (name, ptx) in [("dq", &dq_c), ("dkdv", &dkdv_c)] {
         assert!(
             ptx.contains("%p_causal_active"),
-            "{name}: expected the tile-level causal-skip predicate"
+            "{name} (causal=true): expected tile-level causal-skip predicate"
         );
         assert!(
+            ptx.contains("V2_INTRA_TILE_CAUSAL_MASK"),
+            "{name} (causal=true): expected intra-tile per-element causal mask marker"
+        );
+    }
+
+    // causal=false: NO intra-tile mask emitted (zero overhead path).
+    let cfg_noncausal = smoke_cfg(64, 64); // causal=false by default
+    let dq_nc = synthesize_dq_kernel(&cfg_noncausal).expect("dq synth (non-causal)");
+    let dkdv_nc = synthesize_dkdv_kernel(&cfg_noncausal).expect("dkdv synth (non-causal)");
+
+    for (name, ptx) in [("dq", &dq_nc), ("dkdv", &dkdv_nc)] {
+        assert!(
             !ptx.contains("V2_INTRA_TILE_CAUSAL_MASK"),
-            "{name}: an intra-tile causal mask appeared — implement it, then \
-             flip the T8 smoke config (smoke_cfg) to causal=true and remove \
-             this deferral guard"
+            "{name} (causal=false): intra-tile mask MUST NOT be emitted (zero-overhead gate)"
         );
     }
 }
