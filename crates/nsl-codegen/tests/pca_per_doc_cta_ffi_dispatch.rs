@@ -414,12 +414,15 @@ fn per_doc_cta_ffi_dispatch_matches_segmented_reference() {
         max_abs, max_idx, gpu_active[max_idx], cpu_active[max_idx],
     );
 
+    // Tolerance: 1e-3 (the v1 test uses 5e-3; observed max_abs on
+    // RTX 5070 Ti / CUDA 13.2 / driver 591.86 is ~2e-4, so the tighter
+    // bound is comfortable without being flaky).
     assert!(
-        max_abs <= 5e-3,
-        "per-doc CTA FFI dispatch FAILED: max_abs={:.6} > 5e-3 tolerance",
+        max_abs <= 1e-3,
+        "per-doc CTA FFI dispatch FAILED: max_abs={:.6} > 1e-3 tolerance",
         max_abs,
     );
-    eprintln!("per-doc CTA FFI dispatch PASSED: max_abs={:.6} <= 5e-3", max_abs);
+    eprintln!("per-doc CTA FFI dispatch PASSED: max_abs={:.6} <= 1e-3", max_abs);
 }
 
 // ===========================================================================

@@ -98,6 +98,28 @@ pub fn synthesize_per_doc_cta_forward(
 
     // Kernel entry + full param block (mirrors `prelude::emit_with_smem_override`
     // but uses the per-doc kernel name and appends `doc_starts_ptr` unconditionally).
+    //
+    // # ABI alignment with the production FFI
+    //
+    // `nsl_flash_attention_csha` and `_with_saves` pass a 38-arg launch
+    // list (see `nsl_runtime::flash_attention::nsl_flash_attention_csha`):
+    //   [0..35]: standard FA-2 prelude (`q..x_raw`)
+    //   [36]:    `segment_ids_ptr` (Tier A — present even when segment_masked=false)
+    //   [37]:    `doc_starts_ptr`  (PCA §4.3)
+    //
+    // The per-doc CTA kernel does NOT need `segment_ids_ptr` (cross-doc
+    // isolation comes from the launch grid, not seg-mask) but it DOES
+    // need `doc_starts_ptr` at the FFI's args[37] slot. To keep both
+    // ABIs aligned without a special FFI-side seg_ids skip, we declare a
+    // `_segment_ids_placeholder` param at position 36 and put
+    // `doc_starts_ptr` at position 37. The placeholder is loaded but
+    // never read — its presence consumes the FFI's seg_ids arg slot so
+    // the FFI's doc_starts arg slot lands on the kernel's
+    // `doc_starts_ptr` param.
+    //
+    // For the standalone-launch path (`nsl_kernel_launch` from the v1
+    // correctness test) callers MUST pass 38 args including a sentinel
+    // 0 at position 36 — same convention as the FFI.
     let name = per_doc_cta_kernel_name(&cfg);
     ptx.push_str(&format!(".visible .entry {} (\n", name));
     let params: &[(&str, &str)] = &[
@@ -120,6 +142,10 @@ pub fn synthesize_per_doc_cta_forward(
         (".param .u64", "v_proj_ptr"),
         (".param .u64", "row_max_ptr"), (".param .u64", "row_sum_ptr"),
         (".param .u64", "x_raw_ptr"),
+        // Tier-A-shaped placeholder: consumes the FFI's seg_ids arg
+        // slot so the next slot (doc_starts) lands on `doc_starts_ptr`.
+        // Never read by the per-doc kernel body.
+        (".param .u64", "_segment_ids_placeholder"),
         // Per-doc CTA: doc_starts unconditionally (unlike Tier A's conditional append).
         (".param .u64", "doc_starts_ptr"),
     ];

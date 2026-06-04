@@ -238,7 +238,8 @@ fn launch_per_doc_cta(
     // 5: batch, 6: heads, 7: seq_len, 8: head_dim,
     // 9..12: paging (0), 13..14: cos/sin (0), 15..16: seq_ids/seq_lens (0),
     // 17..19: tree_mask (0,0,0), 20: logsumexp,
-    // 21..29: CSHA extras (0), 30..35: Tier C (0), 36: doc_starts_ptr.
+    // 21..29: CSHA extras (0), 30..35: Tier C (0),
+    // 36: _segment_ids_placeholder (FFI-ABI alignment — never read), 37: doc_starts_ptr.
     let mut q     = q_dev as u64;
     let mut k     = k_dev as u64;
     let mut v     = v_dev as u64;
@@ -261,10 +262,11 @@ fn launch_per_doc_cta(
     // Tier C — all null.
     let mut qp: u64 = 0; let mut kp2: u64 = 0; let mut vp2: u64 = 0;
     let mut rmax: u64 = 0; let mut rsum: u64 = 0; let mut xraw: u64 = 0;
-    // Per-doc CTA: doc_starts_ptr (unconditional trailing param).
+    // Per-doc CTA: segment_ids placeholder (FFI-ABI alignment) + doc_starts_ptr.
+    let mut seg_ids_placeholder: u64 = 0;
     let mut doc_starts = doc_starts_dev as u64;
 
-    let args: [*mut c_void; 37] = [
+    let args: [*mut c_void; 38] = [
         &mut q     as *mut _ as *mut c_void,
         &mut k     as *mut _ as *mut c_void,
         &mut v     as *mut _ as *mut c_void,
@@ -301,6 +303,8 @@ fn launch_per_doc_cta(
         &mut rmax  as *mut _ as *mut c_void,
         &mut rsum  as *mut _ as *mut c_void,
         &mut xraw  as *mut _ as *mut c_void,
+        // FFI-ABI alignment: seg_ids slot (per-doc kernel doesn't read it).
+        &mut seg_ids_placeholder as *mut _ as *mut c_void,
         &mut doc_starts as *mut _ as *mut c_void,
     ];
 
@@ -317,7 +321,7 @@ fn launch_per_doc_cta(
             1i64,           // block_y
             1i64,           // block_z
             args.as_ptr() as i64,
-            37i64,          // num_args
+            38i64,          // num_args (FFI-ABI aligned: includes seg_ids placeholder)
             smem,           // shared_mem_bytes
         )
     };
