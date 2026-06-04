@@ -812,6 +812,30 @@ impl<'a> TypeChecker<'a> {
                             }
                         }
 
+                        if dname == "tree_mask" {
+                            // Paper §4 tree-mask: bare companion decorator on
+                            // an @flash_attention fn. v1 is bare (no args);
+                            // arg-less form mirrors the PTX-side gate plumbed
+                            // through `FlashAttentionConfig::tree_mask`.
+                            let has_flash = decorators.iter().any(|d| {
+                                d.name.len() == 1 && self.interner.resolve(d.name[0].0).unwrap_or("") == "flash_attention"
+                            });
+                            if !has_flash {
+                                self.diagnostics.push(
+                                    Diagnostic::error("@tree_mask requires @flash_attention on the same function")
+                                        .with_label(deco.span, "missing @flash_attention")
+                                );
+                            }
+                            if let Some(ref args) = deco.args {
+                                if !args.is_empty() {
+                                    self.diagnostics.push(
+                                        Diagnostic::error("@tree_mask takes no arguments in v1 (bare decorator only)")
+                                            .with_label(deco.span, "unexpected arguments")
+                                    );
+                                }
+                            }
+                        }
+
                         if dname == "autotune" {
                             match &stmt.kind {
                                 StmtKind::KernelDef(_) => {

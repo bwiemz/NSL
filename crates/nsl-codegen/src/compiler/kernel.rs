@@ -947,6 +947,12 @@ impl Compiler<'_> {
         let mut rope_q = false;
         let mut rope_style = crate::flash_attention::RopeStyle::HalfSplit;
         let mut gqa_group_size: u32 = 1;
+        // Paper §4 tree-mask: bare `@tree_mask` decorator flips `config.tree_mask`,
+        // which in turn (a) gates the PTX-side DFS-enter/DFS-exit ancestor check
+        // shipped in M33 and (b) appends a variant tag to the kernel name so the
+        // runtime dispatch picks the tree_mask kernel. v1 is a bare decorator;
+        // any args are rejected (mirrors `@paged_kv` block_size validation).
+        let mut tree_mask = false;
         // DOC-GAP F.2: optional `head_dim` argument on `@flash_attention`.
         // Default 64 matches historical behaviour; set explicitly via
         // `@flash_attention(head_dim=32)` to pick a config that fits the
@@ -1049,6 +1055,21 @@ impl Compiler<'_> {
                         }
                     }
                 }
+                "tree_mask" => {
+                    // Paper §4 v1: bare decorator only. Reject any args
+                    // (positional or named) with a clear error so future args
+                    // (e.g. a max-depth budget) require an explicit spec
+                    // update + extraction-site change rather than silently
+                    // being ignored.
+                    if let Some(ref args) = deco.args {
+                        if !args.is_empty() {
+                            return Err(CodegenError::new(
+                                "@tree_mask takes no arguments in v1 (bare decorator only)".to_string(),
+                            ));
+                        }
+                    }
+                    tree_mask = true;
+                }
                 _ => {}
             }
         }
@@ -1123,7 +1144,7 @@ impl Compiler<'_> {
                     rope_q,
                     rope_style,
                     gqa_group_size,
-                    tree_mask: false,
+                    tree_mask,
                     gpu_sm: parse_gpu_sm_from_target(&self.compile_options.target),
                     segment_masked: false,
                     csha: None,
@@ -1202,7 +1223,7 @@ impl Compiler<'_> {
                 rope_q,
                 rope_style,
                 gqa_group_size,
-                tree_mask: false,
+                tree_mask,
                 gpu_sm: parse_gpu_sm_from_target(&self.compile_options.target),
                 segment_masked: false,
                 csha: None,
@@ -1309,7 +1330,7 @@ impl Compiler<'_> {
                 rope_q,
                 rope_style,
                 gqa_group_size,
-                tree_mask: false,
+                tree_mask,
                 gpu_sm: parse_gpu_sm_from_target(&self.compile_options.target),
                 segment_masked: false,
                 csha: None,
