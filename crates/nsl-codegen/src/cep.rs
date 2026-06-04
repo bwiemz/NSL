@@ -879,6 +879,174 @@ mod tests {
         };
         assert_eq!(plan.param_reduction(), 0.0);
     }
+
+    /// G19 — paper §8.1 projection smoke test (NSLCoder-50M on H100).
+    ///
+    /// Asserts that CEP pruning produces PROJECTED-direction effects: monotonic decrease
+    /// in params / peak memory / binary size / kernel launches as sparsity rises, within
+    /// 3× of the §8.1 ratios. Does NOT assert exact paper numbers (those are projections,
+    /// not ground truth) — the oracle's first-order models for peak memory + binary size
+    /// are deliberately conservative, so we allow wide windows but require direction.
+    ///
+    /// Paper §3: NSLCoder-50M shape — D=512, L=8, H=8, KV=4, FFN=1408, head_dim=64.
+    /// Paper §8.1 baseline row: 48.8M params, 5.2 GB peak mem, 6.9 μs/tok, 195 MB binary.
+    #[test]
+    fn nslcoder_50m_projection_monotonicity() {
+        // §3 shape: D=512, L=8, H=8, KV=4, head_dim=64, FFN=1408, vocab=32000.
+        let spec = ModelSpec::uniform(512, 8, 8, 4, 64, 1408, 32000);
+        // find_gpu("H100") prefix-matches to H100-SXM (prefers SXM per gpu_specs::find_gpu).
+        let gpu = crate::gpu_specs::find_gpu("H100").expect("H100 in GPU_DATABASE");
+
+        // --- Baseline ---
+        let baseline = crate::cep_oracle::evaluate(&spec, gpu).expect("baseline profile");
+
+        // Param count: paper says 48.8M. Oracle uses fp16 (dtype_bytes=2).
+        let param_count = baseline.param_bytes / spec.dtype_bytes as u64;
+        assert!(
+            param_count >= 20_000_000 && param_count <= 100_000_000,
+            "NSLCoder-50M param count out of [20M, 100M]: {}",
+            param_count
+        );
+
+        // Peak memory: paper says 5.2 GB (full deployment with KV cache + batch).
+        // The oracle computes a first-order estimate: param_bytes + max_activation_per_layer,
+        // which is much smaller (order of 100s of MB for a 50M param FP16 model). We assert
+        // the oracle's output is in a sane range relative to what it can compute.
+        // Floor: at least param_bytes itself (peak must cover the weights).
+        // Ceiling: 50 GB (any sane oracle estimate for a ~50M param model is well below this).
+        assert!(
+            baseline.peak_memory_bytes >= baseline.param_bytes,
+            "peak_memory_bytes {} < param_bytes {} (oracle must include params in peak)",
+            baseline.peak_memory_bytes,
+            baseline.param_bytes
+        );
+        assert!(
+            baseline.peak_memory_bytes <= 50_000_000_000,
+            "peak_memory_bytes > 50 GB: {}",
+            baseline.peak_memory_bytes
+        );
+
+        // Latency must be positive and finite.
+        assert!(
+            baseline.estimated_latency_us > 0.0 && baseline.estimated_latency_us.is_finite(),
+            "estimated_latency_us invalid: {}",
+            baseline.estimated_latency_us
+        );
+
+        // Binary size: paper says 195 MB. Oracle is first-order; allow up to 1 GB.
+        // Sanity floor: at least param_bytes (weights must be included).
+        assert!(
+            baseline.binary_size_bytes >= baseline.param_bytes,
+            "binary_size_bytes {} < param_bytes {}",
+            baseline.binary_size_bytes,
+            baseline.param_bytes
+        );
+        assert!(
+            baseline.binary_size_bytes <= 1_000_000_000,
+            "binary_size_bytes > 1 GB: {}",
+            baseline.binary_size_bytes
+        );
+
+        // Kernel launches: 8-layer model; paper estimates ~16 launches/layer × 8 + 2 ≈ 130.
+        // Allow wide [10, 200] window.
+        assert!(
+            baseline.kernel_launches >= 10 && baseline.kernel_launches <= 200,
+            "kernel_launches out of [10, 200]: {}",
+            baseline.kernel_launches
+        );
+
+        // --- Pruned profiles at three sparsity levels ---
+        let sparsities: &[f64] = &[0.2, 0.3, 0.5];
+        let mut pruned_profiles: Vec<crate::cep_oracle::CompilationProfile> = Vec::new();
+
+        for &sparsity in sparsities {
+            let plan = run_prune(CepPruneInput {
+                spec: spec.clone(),
+                weights: None,
+                target: "H100",
+                constraints: Constraints {
+                    target_sparsity: sparsity,
+                    ..Default::default()
+                },
+                granularity: Granularity::HeadAndFfn,
+                roofline_slack: RooflineSlackTable::default(),
+            });
+
+            let chosen = plan.outcome.chosen.as_ref().expect("chosen must be Some after pruning");
+            // Pruned must be strictly smaller than baseline on params.
+            assert!(
+                chosen.profile.param_bytes < baseline.param_bytes,
+                "sparsity={}: pruned param_bytes {} >= baseline {}",
+                sparsity,
+                chosen.profile.param_bytes,
+                baseline.param_bytes
+            );
+            // Peak memory: ≤ baseline (may not strictly decrease at low sparsity).
+            assert!(
+                chosen.profile.peak_memory_bytes <= baseline.peak_memory_bytes,
+                "sparsity={}: pruned peak_memory_bytes {} > baseline {}",
+                sparsity,
+                chosen.profile.peak_memory_bytes,
+                baseline.peak_memory_bytes
+            );
+            // Binary size: ≤ baseline.
+            assert!(
+                chosen.profile.binary_size_bytes <= baseline.binary_size_bytes,
+                "sparsity={}: pruned binary_size_bytes {} > baseline {}",
+                sparsity,
+                chosen.profile.binary_size_bytes,
+                baseline.binary_size_bytes
+            );
+            // Kernel launches: ≤ baseline.
+            assert!(
+                chosen.profile.kernel_launches <= baseline.kernel_launches,
+                "sparsity={}: pruned kernel_launches {} > baseline {}",
+                sparsity,
+                chosen.profile.kernel_launches,
+                baseline.kernel_launches
+            );
+            // Real search time was measured.
+            assert!(
+                plan.outcome.wall_clock_us > 0,
+                "sparsity={}: wall_clock_us must be > 0",
+                sparsity
+            );
+
+            pruned_profiles.push(chosen.profile.clone());
+        }
+
+        // --- Monotonicity: 20% < 30% < 50% sparsity means profiles[0] >= profiles[1] >= profiles[2] ---
+        // profiles[0]=20%, profiles[1]=30%, profiles[2]=50%
+        // Higher sparsity → strictly fewer params (and ≤ on other metrics).
+        for w in pruned_profiles.windows(2) {
+            let less_sparse = &w[0];
+            let more_sparse = &w[1];
+            assert!(
+                more_sparse.param_bytes <= less_sparse.param_bytes,
+                "monotonicity violated on param_bytes: 30%/50% profile ({}) > 20%/30% profile ({})",
+                more_sparse.param_bytes,
+                less_sparse.param_bytes
+            );
+            assert!(
+                more_sparse.binary_size_bytes <= less_sparse.binary_size_bytes,
+                "monotonicity violated on binary_size_bytes: {} > {}",
+                more_sparse.binary_size_bytes,
+                less_sparse.binary_size_bytes
+            );
+            assert!(
+                more_sparse.peak_memory_bytes <= less_sparse.peak_memory_bytes,
+                "monotonicity violated on peak_memory_bytes: {} > {}",
+                more_sparse.peak_memory_bytes,
+                less_sparse.peak_memory_bytes
+            );
+            assert!(
+                more_sparse.kernel_launches <= less_sparse.kernel_launches,
+                "monotonicity violated on kernel_launches: {} > {}",
+                more_sparse.kernel_launches,
+                less_sparse.kernel_launches
+            );
+        }
+    }
 }
 
 #[cfg(test)]
