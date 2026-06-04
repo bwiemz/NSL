@@ -1927,27 +1927,70 @@ fn csha_tier_b2_backward_launch(
     crate::cuda::inner::memset_d8(d_scratch_raw, d_elems * 4);
     let d_scratch = d_scratch_raw as u64;
 
-    // Zero the dQ/dK/dV output buffers (kernels write disjoint slices per launch;
-    // the scalar path zeroes dQ before the loop — mirror that for all three).
+    // Sprint 1 T1.2 — DTYPE RECONCILIATION (production f16 dq/dk/dv vs kernel f32).
     //
-    // PARITY-GATE NOTE (T8): the validated standalone dQ/dK/dV launchers write
-    // their outputs as f32 ([b,h,s,hd]*4 bytes). The wengert lowering, however,
-    // allocates dq/dk/dv as f16 NslTensors (`nsl_tensor_zeros_f16_on`). The
-    // parity gate must reconcile this — either size the dQ/dK/dV buffers f32 for
-    // the hybrid, or insert an f32->f16 conversion (cf. `csha_bwd_convert_f32_to_f16`
-    // in the scalar dK/dV path) before kernel 4 reads them. memset uses *4 here to
-    // match the f32 writer footprint; a smaller f16 buffer would be under-zeroed.
-    // (Dormant today: every caller passes tier_b2_active = 0.)
+    // Wengert allocates dq/dk/dv as f16 NslTensors (`nsl_tensor_zeros_f16_on` —
+    // see `crates/nsl-codegen/src/wengert_lower.rs:1834-1846`). The downstream
+    // optimizer / extract ops expect f16 — this is the production contract.
+    //
+    // The Tier B.2 dq and dkdv kernels write `st.global.f32` (4 bytes/elem) into
+    // dq/dk/dv; the proj_backward kernel reads them back as `ld.global.f32`. Wiring
+    // the kernels' f32 writes directly against the f16 production buffers would be
+    // a 2x buffer overflow (the f16 allocation is half the size of the f32 write
+    // footprint). The scalar Tier C dK/dV path solves the same mismatch with f32
+    // scratch + `csha_bwd_convert_f32_to_f16` (see `flash_attention.rs:1521-1681`);
+    // we apply the identical pattern to dq + dk + dv here.
+    //
+    // Layout per scratch: f32 [batch, heads, seq_len, head_dim].
     let qkv_elems = (batch * heads * seq_len * head_dim) as usize;
-    if d_q != 0 && qkv_elems > 0 {
-        crate::cuda::inner::memset_d8(d_q as *mut c_void, qkv_elems * 4);
+    let scratch_bytes = qkv_elems * 4;
+    let dq_scratch_raw = if qkv_elems > 0 {
+        crate::cuda::inner::alloc_device(scratch_bytes)
+    } else {
+        std::ptr::null_mut()
+    };
+    let dk_scratch_raw = if qkv_elems > 0 {
+        crate::cuda::inner::alloc_device(scratch_bytes)
+    } else {
+        std::ptr::null_mut()
+    };
+    let dv_scratch_raw = if qkv_elems > 0 {
+        crate::cuda::inner::alloc_device(scratch_bytes)
+    } else {
+        std::ptr::null_mut()
+    };
+    let free_scratches = |dq_raw: *mut c_void, dk_raw: *mut c_void, dv_raw: *mut c_void,
+                          d_raw: *mut c_void| {
+        if !dq_raw.is_null() {
+            crate::cuda::inner::free_device(dq_raw);
+        }
+        if !dk_raw.is_null() {
+            crate::cuda::inner::free_device(dk_raw);
+        }
+        if !dv_raw.is_null() {
+            crate::cuda::inner::free_device(dv_raw);
+        }
+        if !d_raw.is_null() {
+            crate::cuda::inner::free_device(d_raw);
+        }
+    };
+    if qkv_elems > 0 && (dq_scratch_raw.is_null() || dk_scratch_raw.is_null() || dv_scratch_raw.is_null()) {
+        eprintln!("[nsl] CSHA Tier B.2 backward: dQ/dK/dV scratch alloc failed");
+        free_scratches(dq_scratch_raw, dk_scratch_raw, dv_scratch_raw, d_scratch_raw);
+        return CUresult::CUDA_ERROR_OUT_OF_MEMORY as i64;
     }
-    if d_k != 0 && qkv_elems > 0 {
-        crate::cuda::inner::memset_d8(d_k as *mut c_void, qkv_elems * 4);
+    if !dq_scratch_raw.is_null() {
+        crate::cuda::inner::memset_d8(dq_scratch_raw, scratch_bytes);
     }
-    if d_v != 0 && qkv_elems > 0 {
-        crate::cuda::inner::memset_d8(d_v as *mut c_void, qkv_elems * 4);
+    if !dk_scratch_raw.is_null() {
+        crate::cuda::inner::memset_d8(dk_scratch_raw, scratch_bytes);
     }
+    if !dv_scratch_raw.is_null() {
+        crate::cuda::inner::memset_d8(dv_scratch_raw, scratch_bytes);
+    }
+    let dq_scratch = dq_scratch_raw as u64;
+    let dk_scratch = dk_scratch_raw as u64;
+    let dv_scratch = dv_scratch_raw as u64;
 
     // Null-terminated PTX + kernel-name C strings.
     let ptx = ptx_ptr as *const u8;
@@ -1980,7 +2023,7 @@ fn csha_tier_b2_backward_launch(
             [grid_x, heads, batch], [32, 1, 1], &args, 0,
         );
         if rc != success {
-            crate::cuda::inner::free_device(d_scratch_raw);
+            free_scratches(dq_scratch_raw, dk_scratch_raw, dv_scratch_raw, d_scratch_raw);
             return rc as i64;
         }
     }
@@ -1998,7 +2041,8 @@ fn csha_tier_b2_backward_launch(
         let mut a_rsum = rsum;
         let mut a_d = d_scratch;
         let mut a_seg = segment_ids_ptr as u64;
-        let mut a_dq = d_q as u64;
+        // Sprint 1 T1.2: dq kernel writes f32 → dq_scratch (not the production f16 buffer).
+        let mut a_dq = dq_scratch;
         let mut a_seq = seq_len as u32;
         let mut a_heads = heads as u32;
         let mut a_batch = batch as u32;
@@ -2023,7 +2067,7 @@ fn csha_tier_b2_backward_launch(
             [grid_x, heads, batch], [128, 1, 1], &args, smem,
         );
         if rc != success {
-            crate::cuda::inner::free_device(d_scratch_raw);
+            free_scratches(dq_scratch_raw, dk_scratch_raw, dv_scratch_raw, d_scratch_raw);
             return rc as i64;
         }
     }
@@ -2041,8 +2085,9 @@ fn csha_tier_b2_backward_launch(
         let mut a_rsum = rsum;
         let mut a_d = d_scratch;
         let mut a_seg = segment_ids_ptr as u64;
-        let mut a_dk = d_k as u64;
-        let mut a_dv = d_v as u64;
+        // Sprint 1 T1.2: dkdv kernel writes f32 → dk_scratch / dv_scratch.
+        let mut a_dk = dk_scratch;
+        let mut a_dv = dv_scratch;
         let mut a_seq = seq_len as u32;
         let mut a_heads = heads as u32;
         let mut a_batch = batch as u32;
@@ -2068,7 +2113,7 @@ fn csha_tier_b2_backward_launch(
             [grid_x, heads, batch], [128, 1, 1], &args, smem,
         );
         if rc != success {
-            crate::cuda::inner::free_device(d_scratch_raw);
+            free_scratches(dq_scratch_raw, dk_scratch_raw, dv_scratch_raw, d_scratch_raw);
             return rc as i64;
         }
     }
@@ -2127,9 +2172,12 @@ fn csha_tier_b2_backward_launch(
         let mut a_xraw = xraw;
         let mut a_do = d_o as u64;
         // dQ/dK/dV: read-only inputs to proj_backward (from HBM).
-        let mut a_dq = d_q as u64;
-        let mut a_dk = d_k as u64;
-        let mut a_dv = d_v as u64;
+        // Sprint 1 T1.2: proj_backward reads f32 dQ/dK/dV from the same scratches
+        // the dq + dkdv kernels wrote to. The production f16 destinations are
+        // populated AFTER proj_backward via `csha_bwd_convert_f32_to_f16`.
+        let mut a_dq = dq_scratch;
+        let mut a_dk = dk_scratch;
+        let mut a_dv = dv_scratch;
         // Gradient outputs written by proj_backward.
         let mut a_dwq = csha_tensor_data_ptr(dwq_ptr) as u64;
         let mut a_dwk = csha_tensor_data_ptr(dwk_ptr) as u64;
@@ -2221,12 +2269,47 @@ fn csha_tier_b2_backward_launch(
             }
         }
         if rc != success {
-            crate::cuda::inner::free_device(d_scratch_raw);
+            free_scratches(dq_scratch_raw, dk_scratch_raw, dv_scratch_raw, d_scratch_raw);
             return rc as i64;
         }
     }
 
-    crate::cuda::inner::free_device(d_scratch_raw);
+    // Sprint 1 T1.2: Convert f32 scratches → f16 production destinations. Each
+    // call reads `qkv_elems` f32 elements from a scratch and writes the same
+    // count of f16 elements to the destination (the production wengert-allocated
+    // f16 buffer). `csha_bwd_convert_f32_to_f16` is the same helper the scalar
+    // dK/dV path uses (see `flash_attention.rs:1654-1674`).
+    if qkv_elems > 0 {
+        if d_q != 0 && !dq_scratch_raw.is_null() {
+            let c_rc = csha_bwd_convert_f32_to_f16(
+                dq_scratch_raw, d_q as *mut c_void, qkv_elems,
+            );
+            if c_rc != success {
+                free_scratches(dq_scratch_raw, dk_scratch_raw, dv_scratch_raw, d_scratch_raw);
+                return c_rc as i64;
+            }
+        }
+        if d_k != 0 && !dk_scratch_raw.is_null() {
+            let c_rc = csha_bwd_convert_f32_to_f16(
+                dk_scratch_raw, d_k as *mut c_void, qkv_elems,
+            );
+            if c_rc != success {
+                free_scratches(dq_scratch_raw, dk_scratch_raw, dv_scratch_raw, d_scratch_raw);
+                return c_rc as i64;
+            }
+        }
+        if d_v != 0 && !dv_scratch_raw.is_null() {
+            let c_rc = csha_bwd_convert_f32_to_f16(
+                dv_scratch_raw, d_v as *mut c_void, qkv_elems,
+            );
+            if c_rc != success {
+                free_scratches(dq_scratch_raw, dk_scratch_raw, dv_scratch_raw, d_scratch_raw);
+                return c_rc as i64;
+            }
+        }
+    }
+
+    free_scratches(dq_scratch_raw, dk_scratch_raw, dv_scratch_raw, d_scratch_raw);
     success as i64
 }
 

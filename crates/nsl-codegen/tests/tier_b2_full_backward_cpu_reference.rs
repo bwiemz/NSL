@@ -39,12 +39,19 @@
 //! - The proj-stage CPU reference (`cpu_naive_backward_proj`) is fed the *GPU*
 //!   dQ/dK/dV read back from the hybrid, so dWq/dWk/dWv/dx parity isolates the
 //!   proj kernel rather than compounding the (already-gated) dQ/dK/dV error.
-//! - dtype reconciliation: the dq/dkdv kernels write dQ/dK/dV as f32; the proj
-//!   kernel reads them back as f32 and writes dWq/dWk/dWv as f16, dx as f32. The
-//!   proj kernel reads x_raw/norm_weight as f32 (`ld.global.f32`) and Wq/Wk/Wv as
-//!   f16 (`ld.global.b16`). We therefore upload x_raw/norm_weight as f32 and W as
-//!   f16; the CPU reference takes the same values as f16 (round-trip exact via
-//!   `f16::to_f32`), so both paths see bit-identical numbers.
+//! - dtype reconciliation: the dq/dkdv kernels write dQ/dK/dV as f32 INTO
+//!   PRIVATE F32 SCRATCH BUFFERS inside `csha_tier_b2_backward_launch` (Sprint
+//!   1 T1.2); the proj kernel reads those same f32 scratches and writes
+//!   dWq/dWk/dWv as f16, dx as f32. After proj_backward, the launch converts
+//!   each f32 scratch into the production f16 destination buffers via
+//!   `csha_bwd_convert_f32_to_f16`. This matches the wengert lowering's f16
+//!   allocations (`nsl_tensor_zeros_f16_on`). The proj kernel reads
+//!   x_raw/norm_weight as f32 (`ld.global.f32`) and Wq/Wk/Wv as f16
+//!   (`ld.global.b16`). We therefore upload x_raw/norm_weight as f32 and W as
+//!   f16, allocate the dQ/dK/dV test destinations as f16 (mirroring production
+//!   wengert), and read them back as f16 → widen to f32 for the rel-error
+//!   comparison. The CPU reference takes the same values as f16 (round-trip
+//!   exact via `f16::to_f32`), so both paths see bit-identical numbers.
 //!
 //! Spec: docs/superpowers/specs/2026-05-19-csha-tier-b2-phase2-design.md §8
 
@@ -127,7 +134,10 @@ fn ptx_to_cstr_bytes(ptx: &str) -> Vec<u8> {
 }
 
 /// Tiered RELATIVE tolerance for the attention gradients (dQ/dK/dV). Same
-/// schedule as the dq/dkdv standalone gates (spec §6.1).
+/// schedule as the dq/dkdv standalone gates (spec §6.1). Sprint 1 T1.2:
+/// dQ/dK/dV now pass through an f32->f16 conversion in
+/// `csha_tier_b2_backward_launch` before reaching the test buffers; the f16
+/// quantization adds ~1e-3 rel error, well inside this schedule.
 fn rel_tol_attn(hd: u32) -> f32 {
     if hd >= 128 {
         8e-2
@@ -144,19 +154,23 @@ fn rel_tol_attn(hd: u32) -> f32 {
 /// result as f16 (`cvt.rn.f16.f32`, by design — weight gradients are consumed
 /// f16 downstream) and recomputes x_norm with `rsqrt.approx.f32`. The GPU folds
 /// the RMSNorm gain into x_norm = (x/rms)*gamma BEFORE the projection; the CPU
-/// reference (`cpu_naive_backward_proj`) now applies the SAME gamma in its dW
-/// path, so the two agree at genuine f16-STORE precision — the dW comparison is
-/// NOT masking any math error. (The previous 1.2e-1 tolerance was hiding a real
-/// reference bug: the CPU dW path omitted gamma, inflating the rel error to
-/// ~5..9%; once gamma is included the residual collapses to f16-store level. See
-/// `nsl-test/src/cpu_naive_backward.rs` doc.) Measured against the gamma-correct
-/// reference on RTX 5070 Ti (NSL_CUDA_SYNC=1): the worst dWq/dWk/dWv rel error
-/// across {CpuNaive,B1Forward} x {hd=64,hd=128} is 4.4e-4 (all four configs in
-/// the 2.5e-4..4.4e-4 band) — pure f16-store floor; cf. dx below at ~1e-6
-/// (f32-stored). The 3e-3 bound passes with ~7x margin and is NOT padded back
-/// toward the old 1.2e-1 (which was hiding the dropped-gamma reference bug).
+/// reference (`cpu_naive_backward_proj`) applies the SAME gamma in its dW path,
+/// so the math agrees up to numerical precision.
+///
+/// Sprint 1 T1.2: the GPU proj_backward consumes dQ/dK/dV from F32 scratches
+/// (full precision — the f32->f16 conversion to the production destination
+/// buffers happens AFTER proj_backward finishes). The CPU reference, however,
+/// is fed the f16-quantized dQ/dK/dV that we read back from device. That
+/// asymmetric f16 round-trip on the proj inputs perturbs the CPU dW result by
+/// up to ~1e-2 in the small-input B1Forward regime at hd=128 (measured on RTX
+/// 5070 Ti: B1Forward hd=128 dWq rel = 1.06e-2; CpuNaive hd=128 dWk rel =
+/// 3.4e-3; all others <= 3e-3). The 2e-2 bound covers the worst observed
+/// magnitude with comfortable headroom while keeping the zero-output guard
+/// (0.25x) as the real anti-drop check. The previous 3e-3 bound was the
+/// pre-T1.2 ceiling when the test allocated dQ/dK/dV as f32 throughout — no
+/// longer the production contract.
 fn rel_tol_dweight(_hd: u32) -> f32 {
-    3e-3
+    2e-2
 }
 
 /// Tiered RELATIVE tolerance for dx (the input-tensor gradient).
@@ -476,7 +490,6 @@ fn run_hybrid_backward_on_gpu(
     let w_elems = d_model * kv_dim;
 
     let qkv_f16_bytes = (qkv_elems * 2) as i64;
-    let qkv_f32_bytes = (qkv_elems * 4) as i64;
     let stat_bytes = (stat_elems * 4) as i64;
     let xm_f32_bytes = (xm_elems * 4) as i64;
     let dx_bytes = (xm_elems * 4) as i64;
@@ -499,9 +512,13 @@ fn run_hybrid_backward_on_gpu(
     let wv_dev = nsl_test_cuda_alloc(w_f16_bytes);
 
     // --- Gradient outputs (device) ---
-    let dq_dev = nsl_test_cuda_alloc(qkv_f32_bytes); // f32 (dq/dkdv kernels write f32)
-    let dk_dev = nsl_test_cuda_alloc(qkv_f32_bytes);
-    let dv_dev = nsl_test_cuda_alloc(qkv_f32_bytes);
+    // Sprint 1 T1.2: dq/dk/dv are allocated f16 to mirror the production
+    // wengert lowering (`nsl_tensor_zeros_f16_on`). The launch internally uses
+    // f32 scratches for the dq/dkdv/proj kernels and converts to f16 here via
+    // `csha_bwd_convert_f32_to_f16` before returning.
+    let dq_dev = nsl_test_cuda_alloc(qkv_f16_bytes); // f16 (production wengert contract)
+    let dk_dev = nsl_test_cuda_alloc(qkv_f16_bytes);
+    let dv_dev = nsl_test_cuda_alloc(qkv_f16_bytes);
     let dwq_dev = nsl_test_cuda_alloc(w_f16_bytes); // f16 (emit_dproj writes f16)
     let dwk_dev = nsl_test_cuda_alloc(w_f16_bytes);
     let dwv_dev = nsl_test_cuda_alloc(w_f16_bytes);
@@ -600,12 +617,16 @@ fn run_hybrid_backward_on_gpu(
     }
 
     // Read back gradients.
-    let mut dq_host = vec![0.0f32; qkv_elems];
-    let mut dk_host = vec![0.0f32; qkv_elems];
-    let mut dv_host = vec![0.0f32; qkv_elems];
-    nsl_test_cuda_d2h(dq_host.as_mut_ptr() as i64, dq_dev, qkv_f32_bytes);
-    nsl_test_cuda_d2h(dk_host.as_mut_ptr() as i64, dk_dev, qkv_f32_bytes);
-    nsl_test_cuda_d2h(dv_host.as_mut_ptr() as i64, dv_dev, qkv_f32_bytes);
+    // Sprint 1 T1.2: dq/dk/dv are f16 on device — read back as f16, widen to f32.
+    let mut dq_f16 = vec![half::f16::ZERO; qkv_elems];
+    let mut dk_f16 = vec![half::f16::ZERO; qkv_elems];
+    let mut dv_f16 = vec![half::f16::ZERO; qkv_elems];
+    nsl_test_cuda_d2h(dq_f16.as_mut_ptr() as i64, dq_dev, qkv_f16_bytes);
+    nsl_test_cuda_d2h(dk_f16.as_mut_ptr() as i64, dk_dev, qkv_f16_bytes);
+    nsl_test_cuda_d2h(dv_f16.as_mut_ptr() as i64, dv_dev, qkv_f16_bytes);
+    let dq_host: Vec<f32> = dq_f16.iter().map(|h| h.to_f32()).collect();
+    let dk_host: Vec<f32> = dk_f16.iter().map(|h| h.to_f32()).collect();
+    let dv_host: Vec<f32> = dv_f16.iter().map(|h| h.to_f32()).collect();
 
     // dWq/dWk/dWv are f16 on device — read back as f16, widen to f32.
     let mut dwq_f16 = vec![half::f16::ZERO; w_elems];
