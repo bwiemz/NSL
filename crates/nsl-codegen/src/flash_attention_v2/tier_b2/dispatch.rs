@@ -107,6 +107,33 @@ pub fn tier_b2_hybrid_backward_eligible(config: &FlashAttentionConfig, seq_len: 
         && !config.rope_q
 }
 
+/// Compile-time subset of [`tier_b2_hybrid_backward_eligible`]: all checks that
+/// depend only on the `FlashAttentionConfig` (NOT on `seq_len`, which is a
+/// runtime tensor shape dim).
+///
+/// Invariant (unit-tested below in `compile_time_plus_seq_eq_block_q_matches_full_predicate`):
+///
+/// ```text
+/// tier_b2_hybrid_backward_eligible(config, seq_len)
+///   == tier_b2_hybrid_backward_compile_time_eligible(config)
+///      && seq_len == config.block_q as u32
+/// ```
+///
+/// The wengert lowering call site uses this to decide whether to emit a
+/// trivial `iconst(0)` (config-ineligible) vs. a runtime `icmp seq_len, block_q`
+/// (config-eligible — the hybrid 4-kernel branch fires iff the runtime
+/// tile dim matches). Sprint 1 T1.3.
+pub fn tier_b2_hybrid_backward_compile_time_eligible(config: &FlashAttentionConfig) -> bool {
+    if tier_b2_can_dispatch(config).is_err() {
+        return false;
+    }
+    let Some(csha) = config.csha.as_ref() else { return false; };
+    let hd = config.head_dim as u32;
+    csha.active_heads == 1
+        && csha.d_model == hd
+        && !config.rope_q
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -186,5 +213,128 @@ mod tests {
             bytes >= 82 * 1024 && bytes <= 84 * 1024,
             "smem_bytes={bytes}, expected ~83 KB"
         );
+    }
+
+    // --- Sprint 1 T1.3: compile-time-only eligibility predicate ----------
+
+    fn hybrid_cfg(hd: i64, heads: u32, d_model: u32, rope: bool, sm: u32, level: u8)
+        -> FlashAttentionConfig
+    {
+        FlashAttentionConfig {
+            block_q: 64,
+            block_kv: 64,
+            head_dim: hd,
+            causal: true,
+            paged: false,
+            rope_q: rope,
+            rope_style: RopeStyle::HalfSplit,
+            gqa_group_size: 1,
+            tree_mask: false,
+            gpu_sm: sm,
+            segment_masked: false,
+            csha: Some(CshaExtras {
+                level,
+                d_model,
+                active_heads: heads,
+                ..Default::default()
+            }),
+        }
+    }
+
+    #[test]
+    fn compile_time_eligible_at_smoke_intersection() {
+        // hd=64, heads=1, d_model=64, rope=false, sm=80, level=2.
+        let c = hybrid_cfg(64, 1, 64, false, 80, 2);
+        assert!(tier_b2_hybrid_backward_compile_time_eligible(&c));
+    }
+
+    #[test]
+    fn compile_time_eligible_at_hd128() {
+        let c = hybrid_cfg(128, 1, 128, false, 80, 2);
+        assert!(tier_b2_hybrid_backward_compile_time_eligible(&c));
+    }
+
+    #[test]
+    fn compile_time_rejects_heads_gt_1() {
+        let c = hybrid_cfg(64, 2, 64, false, 80, 2);
+        assert!(!tier_b2_hybrid_backward_compile_time_eligible(&c));
+    }
+
+    #[test]
+    fn compile_time_rejects_active_heads_zero() {
+        // 0 = "all heads" sentinel — ambiguous; reject for safety.
+        let c = hybrid_cfg(64, 0, 64, false, 80, 2);
+        assert!(!tier_b2_hybrid_backward_compile_time_eligible(&c));
+    }
+
+    #[test]
+    fn compile_time_rejects_d_model_ne_head_dim() {
+        let c = hybrid_cfg(64, 1, 128, false, 80, 2);
+        assert!(!tier_b2_hybrid_backward_compile_time_eligible(&c));
+    }
+
+    #[test]
+    fn compile_time_rejects_rope_q() {
+        let c = hybrid_cfg(64, 1, 64, true, 80, 2);
+        assert!(!tier_b2_hybrid_backward_compile_time_eligible(&c));
+    }
+
+    #[test]
+    fn compile_time_rejects_sm_too_old() {
+        // gpu_sm=75 fails tier_b2_can_dispatch (Ampere required).
+        let c = hybrid_cfg(64, 1, 64, false, 75, 2);
+        assert!(!tier_b2_hybrid_backward_compile_time_eligible(&c));
+    }
+
+    #[test]
+    fn compile_time_rejects_level_below_2() {
+        let c = hybrid_cfg(64, 1, 64, false, 80, 1);
+        assert!(!tier_b2_hybrid_backward_compile_time_eligible(&c));
+    }
+
+    #[test]
+    fn compile_time_rejects_unsupported_head_dim() {
+        // hd=96 isn't in the per-hd ladder.
+        let c = hybrid_cfg(96, 1, 96, false, 80, 2);
+        assert!(!tier_b2_hybrid_backward_compile_time_eligible(&c));
+    }
+
+    #[test]
+    fn compile_time_rejects_no_csha() {
+        let mut c = hybrid_cfg(64, 1, 64, false, 80, 2);
+        c.csha = None;
+        assert!(!tier_b2_hybrid_backward_compile_time_eligible(&c));
+    }
+
+    /// Headline invariant the wengert lowering relies on:
+    ///     full_eligible(c, seq) == compile_time_eligible(c) && seq == block_q
+    #[test]
+    fn compile_time_plus_seq_eq_block_q_matches_full_predicate() {
+        // Cover both eligible and ineligible configs, with seq_len == block_q
+        // and seq_len != block_q, and verify the decomposition holds.
+        let configs = [
+            ("smoke",         hybrid_cfg(64,  1,  64, false, 80, 2)),
+            ("hd128",         hybrid_cfg(128, 1, 128, false, 80, 2)),
+            ("heads2",        hybrid_cfg(64,  2,  64, false, 80, 2)),
+            ("active0",       hybrid_cfg(64,  0,  64, false, 80, 2)),
+            ("rope",          hybrid_cfg(64,  1,  64, true,  80, 2)),
+            ("dm_mismatch",   hybrid_cfg(64,  1, 128, false, 80, 2)),
+            ("sm75",          hybrid_cfg(64,  1,  64, false, 75, 2)),
+            ("level1",        hybrid_cfg(64,  1,  64, false, 80, 1)),
+            ("hd96",          hybrid_cfg(96,  1,  96, false, 80, 2)),
+        ];
+        for (label, c) in &configs {
+            for seq in [32u32, 64, 128] {
+                let full = tier_b2_hybrid_backward_eligible(c, seq);
+                let ct = tier_b2_hybrid_backward_compile_time_eligible(c);
+                let expected = ct && seq == c.block_q as u32;
+                assert_eq!(
+                    full, expected,
+                    "decomposition broken for cfg='{label}' seq={seq}: \
+                     full={full}, compile_time={ct}, block_q={}",
+                    c.block_q
+                );
+            }
+        }
     }
 }

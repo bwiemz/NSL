@@ -1691,7 +1691,12 @@ fn lower_single_op(
                 .flash_attention_context
                 .as_ref()
                 .and_then(|c| c.csha_training_config.clone());
-            let (block_q, block_kv, head_dim, is_causal, d_model, eps_bits, shmem_bytes) =
+            // Sprint 1 T1.3: capture the compile-time Tier B.2 hybrid-backward
+            // eligibility decision while the config is in scope. The runtime
+            // `seq_len == block_q` check happens below using the Cranelift
+            // `seq_len` Value already extracted via `nsl_tensor_shape_dim`.
+            let (block_q, block_kv, head_dim, is_causal, d_model, eps_bits, shmem_bytes,
+                 tier_b2_compile_time_eligible) =
                 match training_cfg {
                     Some(cfg) => {
                         // Backward kernel sizes shmem differently than forward:
@@ -1712,7 +1717,9 @@ fn lower_single_op(
                             .as_ref()
                             .map(|c| c.rmsnorm_eps.to_bits() as i64)
                             .unwrap_or(1e-5f32.to_bits() as i64);
-                        (cfg.block_q, cfg.block_kv, cfg.head_dim, cfg.causal, dm, eps, bytes)
+                        let b2_ct =
+                            crate::flash_attention_v2::tier_b2::dispatch::tier_b2_hybrid_backward_compile_time_eligible(&cfg);
+                        (cfg.block_q, cfg.block_kv, cfg.head_dim, cfg.causal, dm, eps, bytes, b2_ct)
                     }
                     None => {
                         // No training config — the backward launch cannot
@@ -1897,11 +1904,35 @@ fn lower_single_op(
                 &[],
             )?;
 
-            // CSHA Tier B.2 (Phase 3 T6): tier_b2_active flag, constant 0 for
-            // now. The FFI's 4-kernel hybrid launch branch is gated on this
-            // being non-zero; passing 0 keeps the scalar single-kernel backward
-            // path byte-identical. T7 computes the real flag.
-            let tier_b2_active_flag = builder.ins().iconst(cl_types::I64, 0);
+            // CSHA Tier B.2 (Phase 3 T6 / Sprint 1 T1.3): tier_b2_active flag.
+            //
+            // Semantics — the flag is `1` iff
+            //   tier_b2_hybrid_backward_compile_time_eligible(config)   // compile-time
+            //   && seq_len == config.block_q                            // runtime
+            // matching `tier_b2_hybrid_backward_eligible(config, seq_len)`
+            // bit-for-bit (invariant unit-tested in `dispatch::tests`).
+            //
+            // Decomposition rationale:
+            //   - All Tier-B.2 dispatch checks except `seq_len == block_q` depend
+            //     only on the `FlashAttentionConfig` baked in at lowering time.
+            //   - `seq_len` is a runtime tensor shape dim (extracted above via
+            //     `nsl_tensor_shape_dim`), so the seq comparison must be emitted
+            //     as Cranelift IR.
+            //
+            // When the config is ineligible we emit a literal `iconst(0)` —
+            // ptxas trivially constant-folds the dead hybrid launch branch
+            // in the FFI. When the config is eligible the runtime compares
+            // the live seq_len against `block_q` and `uextend`s the i1 to i64.
+            // FFI gates the 4-kernel hybrid launch on this being non-zero;
+            // the scalar single-kernel path remains the fallback.
+            let tier_b2_active_flag = if tier_b2_compile_time_eligible {
+                use cranelift_codegen::ir::condcodes::IntCC;
+                let block_q_i64 = builder.ins().iconst(cl_types::I64, block_q);
+                let seq_eq_bq = builder.ins().icmp(IntCC::Equal, seq_len, block_q_i64);
+                builder.ins().uextend(cl_types::I64, seq_eq_bq)
+            } else {
+                builder.ins().iconst(cl_types::I64, 0)
+            };
 
             // Sprint 1 T1.1: source the forward attention output `O`
             // handle from the per-layer save record (populated by the
@@ -1958,12 +1989,13 @@ fn lower_single_op(
                     // PCA §4.3: doc_starts_ptr — read from the same
                     // registry; matches the forward's effective_pos.
                     doc_starts_v,
-                    // CSHA Tier B.2 (Phase 3 T6): tier_b2_active flag. Pass a
-                    // constant 0 here to preserve EXACTLY today's behavior
-                    // (scalar single-kernel backward path). T7 will replace
-                    // this with the computed `tier_b2_hybrid_backward_eligible`
-                    // decision; until then the 4-kernel launch branch is
-                    // dormant and the scalar path is byte-identical.
+                    // CSHA Tier B.2 (Phase 3 T6 / Sprint 1 T1.3): tier_b2_active flag.
+                    // Computed above as the AND of the compile-time
+                    // `tier_b2_hybrid_backward_compile_time_eligible(config)`
+                    // predicate and the runtime `seq_len == block_q` icmp.
+                    // FFI's 4-kernel hybrid launch fires iff this is non-zero;
+                    // otherwise the scalar single-kernel path remains active
+                    // (byte-identical to pre-Sprint-1 behavior).
                     tier_b2_active_flag,
                 ],
             )?;
