@@ -75,27 +75,37 @@ pub fn build_dtype_lists(plan: &PrecisionPlan, param_paths: &[String]) -> (Vec<u
 /// precision plan, weights present, FASE Deferred mode, AND `wrapped_path_active`.
 ///
 /// `wrapped_path_active` is load-bearing for correctness. It rules out paths
-/// that consume m/v WITHOUT a dequant→step→quant wrap. Two such paths
-/// historically existed: the unified-dispatch arm hardcoding
-/// `wrap_precision=false` (S2 closed this by threading the wrap through), and
-/// the unified-dispatch FullBuffer sub-arm calling into the F32-only stdlib
-/// optimizer FFI directly. The FullBuffer sub-arm is still unwrapped — today
-/// the FASE planner downgrades FullBuffer to Deferred upstream when CPDT is
-/// active, so the arm is dead code at runtime, but the caller MUST pass
-/// `wrapped_path_active = false` whenever the per-param mode table contains
-/// a FullBuffer entry. `stmt.rs:cpdt_precision_dtypes` enforces this by
-/// peeking at `build_param_mode_table` before deciding to allocate.
+/// that consume m/v WITHOUT a dequant→step→quant wrap. Three such paths
+/// historically existed:
+/// 1. The unified-dispatch arm hardcoding `wrap_precision=false`. **Closed
+///    by S2** — threaded the wrap through.
+/// 2. The unified-dispatch FullBuffer sub-arm passing raw s1/s2 to
+///    `emit_stdlib_optim_call` (F32-only FFI). **Closed by S5** —
+///    `emit_stdlib_optim_call` now itself takes `wrap_precision: bool` and
+///    wraps in the same dequant→step→quant envelope as
+///    `fase_emit_final_step`.
+/// 3. The standalone FullBuffer-global call site at `stmt.rs:5927`
+///    (no-WGGO, no mode table). The 4th condition (`fase_mode_is_deferred`)
+///    of this gate already rejects activation at that path; the call site
+///    passes `wrap_precision=false` for signature uniformity.
 ///
-/// Closed follow-ons: source-AD MulElementwise broadcast crash (S1),
-/// unified-dispatch Deferred-arm wrap threading (S2), `--wggo` on `nsl run`
-/// (S3), `wrapped_path_active` gate refinement to a structural mode-table
-/// guard (S4). Part II FP16 optimizer execution is now live end-to-end on
-/// the non-WGGO Deferred path AND the WGGO unified-dispatch path WHENEVER
-/// the mode table is uniformly Deferred. Activation otherwise requires a
-/// CPDT Full `PrecisionPlan` plus FASE Deferred (AdamW with
-/// grad_accumulation > 1). Still-open follow-on: wrap the FullBuffer
-/// sub-arm so the mode-table guard can be lifted; until then mixed mode
-/// tables silently downgrade to FP32 optimizer state with no diagnostic.
+/// With all three paths covered, `wrapped_path_active` can be set
+/// unconditionally to `true` (S5 lift). The parameter is retained as
+/// defense-in-depth.
+///
+/// Closed follow-ons (Part II FP16 activation cycle, 2026-06-04):
+/// - S1: source-AD MulElementwise broadcast crash (added third
+///   `target` field to AdjointExpr + reduce_to_shape wrap).
+/// - S2: unified-dispatch Deferred-arm wrap threading.
+/// - S3: `--wggo*` flags on `nsl run`.
+/// - S4: `wrapped_path_active` refinement to mode-table FullBuffer guard.
+/// - S5: unified-dispatch FullBuffer-arm wrap threading +
+///   `wrapped_path_active` lift to unconditional `true`.
+///
+/// Part II FP16 optimizer execution is now live end-to-end on every
+/// optimizer-emission code path. Activation only requires CPDT Full mode +
+/// a non-empty PrecisionPlan + FASE Deferred (AdamW with
+/// grad_accumulation > 1). No remaining silent-fallback paths.
 pub fn precision_active(
     cpdt_mode_is_full: bool,
     has_precision_plan: bool,

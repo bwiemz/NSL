@@ -3531,35 +3531,22 @@ impl Compiler<'_> {
                 // inactive); the unified-dispatch arm hardcoded
                 // `wrap_precision=false`. Allocating FP16 m/v on the WGGO path
                 // would have fed FP16 buffers to an unwrapped FP32 update →
-                // silent corruption. The original gate was on
-                // `wggo_overrides.is_none()` and the Deferred-only mode table
-                // assumption.
+                // silent corruption.
                 //
-                // S2 threaded the wrap through `emit_unified_optim_step_dispatch`'s
-                // Deferred sub-arm. S4 relaxes the gate to `true`, BUT the
-                // unified-dispatch FullBuffer sub-arm (stmt_fase.rs:894-916)
-                // still hands raw s1/s2 to `emit_stdlib_optim_call` (F32 FFI)
-                // without a cast wrap. Today the FASE planner downgrades every
-                // FullBuffer entry to Deferred upstream when CPDT is active, so
-                // the FullBuffer arm is dead code at runtime. If that invariant
-                // ever changes — a mixed mode table with FullBuffer entries —
-                // FP16 buffers would silently corrupt at the stdlib call. To
-                // keep the structural guarantee defensive against that, we
-                // refuse FP16 allocation here whenever the per-param mode table
-                // contains a FullBuffer entry.
-                let mode_table_has_fullbuffer = crate::fase_codegen_table::build_param_mode_table(
-                    &param_paths,
-                    &model_var_name,
-                    &fase_plan,
-                    self.wggo_overrides.as_ref(),
-                )
-                .map(|bytes| {
-                    bytes.iter().any(|&b| {
-                        b == crate::fase_codegen_table::ParamMode::FullBuffer as u8
-                    })
-                })
-                .unwrap_or(false);
-                let wrapped_path_active = !mode_table_has_fullbuffer;
+                // - S2 threaded the wrap through `emit_unified_optim_step_dispatch`'s
+                //   Deferred sub-arm.
+                // - S4 relaxed the gate from `wggo_overrides.is_none()` toward
+                //   `true`, with a review-fix mode-table FullBuffer guard kept
+                //   as the structural correctness backstop.
+                // - S5 threads the wrap through `emit_stdlib_optim_call` so
+                //   the unified-dispatch FullBuffer sub-arm ALSO wraps. With
+                //   both sub-arms wrapping, the silent-corruption hazard is
+                //   closed structurally and the FullBuffer guard can be
+                //   lifted — `wrapped_path_active = true` unconditionally.
+                //   The parameter is retained on `precision_active` as
+                //   defense-in-depth for any future refactor that
+                //   reintroduces a non-wrapping optimizer arm.
+                let wrapped_path_active = true;
                 let plan = self.cpdt_plan.as_ref();
                 let active = plan
                     .map(|p| {
@@ -5924,6 +5911,12 @@ impl Compiler<'_> {
             } else {
                 s1 // placeholder for non-Adam/SOAP optimizers (ignored by helper)
             };
+            // FullBuffer-global path (no mode table, no WGGO). The CPDT
+            // PrecisionPlan gate (`precision_active`'s 4th condition
+            // requires `fase_deferred=true`) suppresses cpdt_precision_dtypes
+            // construction here, so wrap_precision is always structurally
+            // false at this call site. Threaded through for signature
+            // uniformity with the unified-dispatch site.
             self.emit_stdlib_optim_call(
                 builder,
                 optimizer_name.as_str(),
@@ -5941,6 +5934,7 @@ impl Compiler<'_> {
                 beta2_const,
                 eps_const,
                 step_count_var,
+                false,
             )?;
 
             let one_opt = builder.ins().iconst(cl_types::I64, 1);
