@@ -355,3 +355,196 @@ pub extern "C" fn nsl_moe_dispatch_full(
 
     Box::into_raw(result) as i64
 }
+
+/// CPDT Part III v1 production-forward (M32 gap closure): high-level MoE
+/// dispatch that routes tokens through REAL per-expert FFN weights — no
+/// identity skeleton. Single-matmul "expert" semantics (matches the
+/// granular-op reference at crates/nsl-codegen/tests/cpdt_expert_prune.rs
+/// `moe_forward`): for each routed token, output = sorted_tokens × W_expert.
+///
+/// ABI: distinct symbol from `nsl_moe_dispatch_full` (kept byte-identical).
+/// v2 adds `experts_ptr` (NslTensor packed `[n_experts, hidden_dim *
+/// intermediate_dim]` row-major, f32 only) plus the two shape dimensions.
+///
+/// OUTPUT SHAPE: `[total_tokens, intermediate_dim]` (NOT `[total_tokens,
+/// hidden_dim]` — every paper-faithful MoE expert FFN changes the trailing
+/// dim from hidden to intermediate). Callers that previously consumed v1's
+/// hidden-dim identity output must adjust accordingly.
+///
+/// REFUSALS (return 0 — caller MUST treat as compile-time error):
+///   - experts_ptr == 0
+///   - num_experts == 0
+///   - experts.dtype != tokens.dtype (mixed-dtype silent-corruption hazard)
+///   - experts.len != num_experts * hidden_dim * intermediate_dim
+///
+/// Deferrals (v2.next): bias, activation, down-proj, gating-weight broadcast,
+/// capacity overflow handling, GPU expert_parallel_matmul, FP16 experts.
+#[no_mangle]
+pub extern "C" fn nsl_moe_dispatch_full_v2(
+    tokens_ptr: i64,
+    logits_ptr: i64,
+    experts_ptr: i64,
+    num_experts: i64,
+    top_k: i64,
+    capacity_factor_bits: i64,
+    hidden_dim: i64,
+    intermediate_dim: i64,
+) -> i64 {
+    use crate::tensor::NslTensor;
+    use crate::memory::checked_alloc;
+    use std::os::raw::c_void;
+
+    // ── Refusal gates — return 0 (null) on bad input ────────────────────
+    if experts_ptr == 0 || num_experts <= 0 || hidden_dim <= 0 || intermediate_dim <= 0 {
+        return 0;
+    }
+
+    let tokens = NslTensor::from_ptr(tokens_ptr);
+    let logits = NslTensor::from_ptr(logits_ptr);
+    let experts = NslTensor::from_ptr(experts_ptr);
+
+    // Mixed-dtype refusal: v1 byte-slices experts dtype-agnostically at
+    // compile time (cpdt_expert_prune::MixedDtypeUnsupported), but at
+    // runtime v2 needs a uniform dtype to safely interpret the buffer.
+    if experts.dtype != tokens.dtype {
+        return 0;
+    }
+
+    let num_experts_us = num_experts as usize;
+    let hidden_dim_us = hidden_dim as usize;
+    let intermediate_dim_us = intermediate_dim as usize;
+    let top_k = top_k as usize;
+    let capacity_factor = f32::from_bits(capacity_factor_bits as u32) as f64;
+
+    // Shape check: experts must be exactly [num_experts, hidden * intermediate].
+    let expected_experts_elems = num_experts_us
+        .saturating_mul(hidden_dim_us)
+        .saturating_mul(intermediate_dim_us);
+    if (experts.len as usize) != expected_experts_elems {
+        return 0;
+    }
+
+    let total_tokens = if logits.ndim >= 2 {
+        (unsafe { *logits.shape.offset(0) }) as usize
+    } else {
+        logits.len as usize / num_experts_us
+    };
+
+    // Read logits/tokens/experts as f32 — supporting both NSL CPU f64 default
+    // (dtype=0) and explicit f32 (dtype=1). For dtype symmetry we cast all
+    // three to f32 for the matmul.
+    let read_f32 = |t: &NslTensor| -> Vec<f32> {
+        if t.dtype == 0 {
+            let data = unsafe { std::slice::from_raw_parts(t.data as *const f64, t.len as usize) };
+            data.iter().map(|&v| v as f32).collect()
+        } else {
+            let data = unsafe { std::slice::from_raw_parts(t.data as *const f32, t.len as usize) };
+            data.to_vec()
+        }
+    };
+
+    let logits_f32 = read_f32(&logits);
+    let tokens_f32 = read_f32(&tokens);
+    let experts_f32 = read_f32(&experts);
+
+    // Route tokens — same as v1.
+    let routing = router::route_topk(
+        &logits_f32,
+        total_tokens,
+        num_experts_us,
+        top_k,
+        capacity_factor,
+    );
+    let total_assigned = routing.total_assigned as usize;
+
+    // Scatter tokens into sorted-by-expert layout [total_assigned, hidden].
+    let sorted_tokens = dispatch::scatter_tokens(
+        &tokens_f32,
+        &routing.sorted_token_indices,
+        hidden_dim_us,
+    );
+
+    // Per-expert matmul: sorted_outputs[t, j] = Σ_k sorted_tokens[t, k] * W_e[k, j]
+    // where t ranges over [boundaries[e], boundaries[e+1]) for expert e. Mirrors
+    // nsl_expert_parallel_matmul (ffi.rs:85) inline-replicated so we don't
+    // need to allocate an intermediate raw-buffer just for that FFI call.
+    let mut sorted_outputs = vec![0.0_f32; total_assigned * intermediate_dim_us];
+    let boundaries = &routing.expert_boundaries;
+    for e in 0..num_experts_us {
+        let start = boundaries[e] as usize;
+        let end = boundaries[e + 1] as usize;
+        if start == end {
+            continue;
+        }
+        let w_off = e * hidden_dim_us * intermediate_dim_us;
+        for t in start..end {
+            let tok_off = t * hidden_dim_us;
+            let out_off = t * intermediate_dim_us;
+            for j in 0..intermediate_dim_us {
+                let mut sum = 0.0_f32;
+                for k in 0..hidden_dim_us {
+                    sum += sorted_tokens[tok_off + k]
+                        * experts_f32[w_off + k * intermediate_dim_us + j];
+                }
+                sorted_outputs[out_off + j] = sum;
+            }
+        }
+    }
+
+    // Gather back to token order. Uniform weight 1.0 (gating-weight broadcast
+    // is a v2.next deferral; matches the granular-op reference exactly).
+    let gather_weights = vec![1.0_f32; total_assigned];
+    let output_f32 = dispatch::gather_tokens(
+        &sorted_outputs,
+        &routing.sorted_token_indices,
+        &gather_weights,
+        total_tokens,
+        top_k,
+        intermediate_dim_us,
+    );
+
+    // Allocate output NslTensor with shape [total_tokens, intermediate_dim].
+    // This is the v1↔v2 ABI difference downstream callers must absorb.
+    let output_len = total_tokens * intermediate_dim_us;
+    let out_dtype = tokens.dtype;
+    let data: *mut c_void = if out_dtype == 0 {
+        let ptr = checked_alloc(output_len * std::mem::size_of::<f64>()) as *mut f64;
+        for (i, &val) in output_f32.iter().enumerate().take(output_len) {
+            unsafe { *ptr.add(i) = val as f64 };
+        }
+        ptr as *mut c_void
+    } else {
+        let ptr = checked_alloc(output_len * std::mem::size_of::<f32>()) as *mut f32;
+        unsafe {
+            std::ptr::copy_nonoverlapping(output_f32.as_ptr(), ptr, output_len);
+        }
+        ptr as *mut c_void
+    };
+
+    // Output is always 2D: [total_tokens, intermediate_dim].
+    let ndim: i64 = 2;
+    let shape = checked_alloc(2 * std::mem::size_of::<i64>()) as *mut i64;
+    unsafe {
+        *shape = total_tokens as i64;
+        *shape.add(1) = intermediate_dim;
+    }
+    let strides = checked_alloc(2 * std::mem::size_of::<i64>()) as *mut i64;
+    unsafe {
+        *strides.add(1) = 1;
+        *strides = intermediate_dim;
+    }
+
+    let result = Box::new(NslTensor::new(
+        data,
+        shape,
+        strides,
+        ndim,
+        output_len as i64,
+        0,
+        out_dtype,
+        1,
+        0,
+    ));
+
+    Box::into_raw(result) as i64
+}
