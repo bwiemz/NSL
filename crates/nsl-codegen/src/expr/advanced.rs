@@ -1624,8 +1624,8 @@ impl Compiler<'_> {
                 // forward FFI agree on the same Cranelift Values. Forward and
                 // backward must see identical cos/sin — the save record is
                 // the structural channel that closes H1.
-                let rope_cos_v_sav = null;
-                let rope_sin_v_sav = null;
+                let rope_cos_v = null;
+                let rope_sin_v = null;
                 self.csha_forward_saves.insert(
                     layer_key,
                     crate::csha_apply::CshaSavePointers {
@@ -1647,8 +1647,8 @@ impl Compiler<'_> {
                         // Tier B.2 hybrid backward reads identical pointers
                         // (today both null → both forward and backward skip
                         // rotation, self-consistent rope-effectively-off).
-                        cos: rope_cos_v_sav,
-                        sin: rope_sin_v_sav,
+                        cos: rope_cos_v,
+                        sin: rope_sin_v,
                         backward_ptx_data_id: bwd_ptx_id,
                         backward_name_data_id: bwd_name_id,
                     },
@@ -1716,7 +1716,7 @@ impl Compiler<'_> {
                         scale_bits,
                         batch, heads, seq_len, head_dim,
                         null, null, null, null,         // paged
-                        rope_cos_v_sav, rope_sin_v_sav, // RoPE
+                        rope_cos_v, rope_sin_v, // RoPE
                         null, null,                     // seq_ids, seq_lens
                         save_shmem_val,
                         save_ptx_ptr, save_name_ptr,

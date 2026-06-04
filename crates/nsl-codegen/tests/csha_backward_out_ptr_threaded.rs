@@ -63,6 +63,11 @@ fn csha_save_pointers_carries_forward_out_value() {
         row_sum: Value::from_u32(404),
         x_raw:   Value::from_u32(405),
         out:     Value::from_u32(406),
+        // Sprint 1 cycle-2: RoPE cos/sin Values stashed alongside `out`
+        // so the Tier B.2 hybrid backward's `emit_drope` (proj_backward
+        // kernel) reads the same Values the forward FFI was handed.
+        cos:     Value::from_u32(407),
+        sin:     Value::from_u32(408),
         backward_ptx_data_id: None,
         backward_name_data_id: None,
     };
@@ -72,6 +77,43 @@ fn csha_save_pointers_carries_forward_out_value() {
     // type — accidental rename to `o_ptr` or signature change to
     // `Option<Value>` would fail here.
     assert_eq!(saves.out, Value::from_u32(406));
+}
+
+/// Sprint 1 cycle-2 structural pin for the new `cos` / `sin` fields on
+/// `CshaSavePointers`. Same shape as the `out` round-trip above: pin the
+/// API so an accidental rename, a switch to `Option<Value>`, or removal
+/// of either field fails to compile here.
+///
+/// The forward CSHA call site stashes the same Cranelift Values it hands
+/// to `nsl_flash_attention_csha_with_saves` for `rope_cos` / `rope_sin`.
+/// The Tier B.2 hybrid backward's `emit_drope` (proj_backward kernel,
+/// Sprint 10) MUST read identical Values so forward and backward agree
+/// on the rotation — when both are null the in-kernel null-guard fires
+/// on both sides and rotation is skipped self-consistently
+/// (rope-effectively-off, the current production state). When future
+/// work threads non-null cos/sin into the forward call site, backward
+/// picks them up automatically with no additional edits.
+#[test]
+fn csha_save_pointers_carries_rope_cos_and_sin_values() {
+    let saves = CshaSavePointers {
+        q_proj: Value::from_u32(500),
+        k_proj: Value::from_u32(501),
+        v_proj: Value::from_u32(502),
+        row_max: Value::from_u32(503),
+        row_sum: Value::from_u32(504),
+        x_raw:   Value::from_u32(505),
+        out:     Value::from_u32(506),
+        cos:     Value::from_u32(507),
+        sin:     Value::from_u32(508),
+        backward_ptx_data_id: None,
+        backward_name_data_id: None,
+    };
+
+    // Distinct sentinels prove the two slots are independent fields, not
+    // aliased to a single Value or accidentally collapsed at construction.
+    assert_eq!(saves.cos, Value::from_u32(507));
+    assert_eq!(saves.sin, Value::from_u32(508));
+    assert_ne!(saves.cos, saves.sin);
 }
 
 /// Source-level invariant: the `FusedCshaBackward` lowering in
