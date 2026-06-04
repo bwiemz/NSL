@@ -2084,7 +2084,10 @@ mod tests {
         // PTX line (comments may still reference the historical name; we
         // therefore look only for the register-with-prefix patterns).
         assert!(
-            !ptx.contains("%band_row_base,"),
+            !ptx.contains("%band_row_base,")
+                && !ptx.contains("%band_row_base;")
+                && !ptx.contains("%band_row_base\n")
+                && !ptx.contains("%band_row_base "),
             "pre-cycle-2 unsuffixed %band_row_base must not appear in emitted PTX operands"
         );
         assert!(
