@@ -683,7 +683,7 @@ fn bad(box: Box<int, str>) -> int:
 }
 
 // -----------------------------------------------------------------------
-// WRGA decorator collection tests
+// Decorator collection tests (WRGA + freeze + adapter + CFTP fused_lm_ce)
 // -----------------------------------------------------------------------
 
 /// Parse and analyze a snippet, returning the full AnalysisResult.
@@ -693,6 +693,95 @@ fn analyze_source(src: &str) -> crate::AnalysisResult {
     let parse_result = nsl_parser::parse(&tokens, &mut interner);
     crate::analyze(&parse_result.module, &mut interner)
 }
+
+// -----------------------------------------------------------------------
+// CFTP §4.4 G3 @fused_lm_ce decorator collection tests (Sprint 2)
+// -----------------------------------------------------------------------
+
+#[test]
+fn fused_lm_ce_decorator_on_train_block_is_captured() {
+    let src = r#"
+model Tiny:
+    w: Tensor = ones([2, 1])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x @ self.w
+
+let m = Tiny()
+let x = ones([4, 2])
+let y = zeros([4, 1])
+
+@fused_lm_ce(enabled = true, vocab_tile = 1024)
+train(model = m, epochs = 5):
+    optimizer: SGD(lr = 0.01)
+    step(batch):
+        let pred = m.forward(x)
+"#;
+    let res = analyze_source(src);
+    assert_eq!(
+        res.fused_ce_configs.len(),
+        1,
+        "expected one @fused_lm_ce config, got {:?}",
+        res.fused_ce_configs.len()
+    );
+    let cfg = &res.fused_ce_configs[0];
+    assert!(cfg.enabled, "enabled=true should round-trip");
+    assert_eq!(cfg.vocab_tile, Some(1024));
+}
+
+#[test]
+fn fused_lm_ce_decorator_on_non_train_target_errors() {
+    let src = r#"
+@fused_lm_ce(enabled = true)
+model Tiny:
+    w: Tensor = ones([2, 1])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x @ self.w
+"#;
+    let res = analyze_source(src);
+    // The decorator must be rejected when not on a `train` block.  The
+    // config is NOT captured (only train-attached configs flow through).
+    assert!(
+        res.fused_ce_configs.is_empty(),
+        "@fused_lm_ce on non-train target must NOT be captured, got {:?}",
+        res.fused_ce_configs.len()
+    );
+    assert!(
+        res.diagnostics
+            .iter()
+            .any(|d| format!("{:?}", d)
+                .contains("@fused_lm_ce may only be applied to a `train` block")),
+        "expected target-mismatch diagnostic, got: {:?}",
+        res.diagnostics
+    );
+}
+
+#[test]
+fn fused_lm_ce_decorator_vocab_tile_alignment_errors() {
+    // vocab_tile must be a multiple of 128 (per the v1 fused-CE kernel
+    // invariant — see validate_fused_ce_decorator in cftp.rs).
+    let src = r#"
+let m = Tiny()
+@fused_lm_ce(enabled = true, vocab_tile = 100)
+train(model = m, epochs = 1):
+    optimizer: SGD(lr = 0.01)
+    step(batch):
+        let _ = 0
+"#;
+    let res = analyze_source(src);
+    assert!(
+        res.diagnostics
+            .iter()
+            .any(|d| format!("{:?}", d).contains("must be a multiple of 128")),
+        "expected vocab_tile alignment diagnostic, got: {:?}",
+        res.diagnostics
+    );
+}
+
+// -----------------------------------------------------------------------
+// WRGA decorator collection tests
+// -----------------------------------------------------------------------
 
 #[test]
 fn wrga_decorator_is_captured() {
