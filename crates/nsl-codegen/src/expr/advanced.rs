@@ -1624,6 +1624,14 @@ impl Compiler<'_> {
                 // forward FFI agree on the same Cranelift Values. Forward and
                 // backward must see identical cos/sin — the save record is
                 // the structural channel that closes H1.
+                //
+                // WIRE-HERE: when future work threads a real cos/sin tensor
+                // source (e.g. resolved from a @param input or a wengert-side
+                // synthesis op), REPLACE the two `null` assignments below with
+                // the resolved Cranelift Value handles. The backward FFI in
+                // wengert_lower.rs consumes them from `saves.cos` / `saves.sin`
+                // — once these locals are non-null, backward picks them up
+                // with no further edits.
                 let rope_cos_v = null;
                 let rope_sin_v = null;
                 self.csha_forward_saves.insert(

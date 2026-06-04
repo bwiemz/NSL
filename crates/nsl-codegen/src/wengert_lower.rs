@@ -564,6 +564,14 @@ fn emit_fused_forward_under_claim(
     // Sprint 1 (cycle-2): hoist null RoPE cos/sin into named locals so the
     // save record can stash them. Forward and backward must agree on cos/sin;
     // the save record is the structural channel.
+    //
+    // WIRE-HERE: when future work threads a real cos/sin tensor source
+    // (e.g. resolved from a @param input or a wengert-side synthesis op),
+    // REPLACE the two `null` assignments below with the resolved Cranelift
+    // Value handles. The backward FFI call at the `nsl_flash_attention_csha_backward`
+    // invocation later in this function consumes them from `saves.cos` /
+    // `saves.sin` — once these locals are non-null, backward picks them up
+    // with no further edits.
     let rope_cos_v = null;
     let rope_sin_v = null;
     let launch_rc = call(
