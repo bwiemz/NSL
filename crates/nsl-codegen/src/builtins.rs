@@ -491,6 +491,9 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_tensor_cast", &[types::I64, types::I64], Some(types::I64)),
     ("nsl_tensor_cast_into", &[types::I64, types::I64], None),
     ("nsl_tensor_zeros_like_dtype", &[types::I64, types::I64], Some(types::I64)),
+    // CPDT §3.2: INT8 blockwise quantization (the headline 4× memory result)
+    ("nsl_tensor_quant_int8_blockwise", &[types::I64, types::I64], Some(types::I64)),
+    ("nsl_tensor_dequant_int8_blockwise", &[types::I64], Some(types::I64)),
     // Gradient clipping (M14)
     ("nsl_clip_grad_norm", &[types::I64, types::F64], None),
     // Collect all tensor params from a model struct (recursive, magic-probed)
@@ -2143,5 +2146,28 @@ mod tests {
             names.contains(&"nsl_tensor_zeros_like_dtype"),
             "nsl_tensor_zeros_like_dtype missing"
         );
+    }
+
+    #[test]
+    fn int8_blockwise_ops_have_signatures() {
+        // CPDT §3.2 — the headline 4× memory result. These signatures must
+        // match the runtime exports in nsl-runtime/src/tensor/int8_blockwise.rs
+        // and the ownership table in ffi_ownership.rs (both produce new owned
+        // tensors).
+        let table: Vec<(&str, &[cranelift_codegen::ir::Type], Option<cranelift_codegen::ir::Type>)> =
+            RUNTIME_FUNCTIONS
+                .iter()
+                .filter(|(n, _, _)| {
+                    *n == "nsl_tensor_quant_int8_blockwise"
+                        || *n == "nsl_tensor_dequant_int8_blockwise"
+                })
+                .map(|(n, p, r)| (*n, *p, *r))
+                .collect();
+        assert_eq!(table.len(), 2, "INT8 blockwise op pair missing");
+        for (name, params, ret) in &table {
+            assert_eq!(*ret, Some(cranelift_codegen::ir::types::I64), "{name} must return i64");
+            assert!(params.iter().all(|t| *t == cranelift_codegen::ir::types::I64),
+                "{name} params must all be I64");
+        }
     }
 }
