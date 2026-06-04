@@ -11,13 +11,18 @@ use std::sync::Mutex;
 pub static TRACING: AtomicBool = AtomicBool::new(false);
 static TRACE_GRAPH: Mutex<Option<TraceGraph>> = Mutex::new(None);
 
-// Test-only sentinel: set to `true` only while a `trace::tests` test body
-// is actively recording.  `record_op` checks this in `#[cfg(test)]` builds
-// so that tensor-op tests running in parallel (arithmetic, activation, etc.)
-// cannot inject spurious ops into the shared TRACE_GRAPH and cause
-// "expected N ops, got N+1" failures.
+// Test-only sentinel: set to `true` only on the thread running a
+// `trace::tests` body. Using thread_local ensures parallel test threads
+// (arithmetic, activation, etc.) always see false and cannot inject
+// spurious ops into the shared TRACE_GRAPH. The global AtomicBool
+// approach from the previous fix still allowed cross-thread contamination
+// because when TRACE_TEST_RECORDING was true (set by the trace-test thread)
+// any concurrent thread's record_op call would also pass the guard.
 #[cfg(test)]
-pub(crate) static TRACE_TEST_RECORDING: AtomicBool = AtomicBool::new(false);
+thread_local! {
+    pub(crate) static TRACE_TEST_RECORDING: std::cell::Cell<bool> =
+        std::cell::Cell::new(false);
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Types
@@ -107,11 +112,12 @@ pub fn record_op(
     if !is_tracing() {
         return;
     }
-    // In test builds, only record when a trace::tests body explicitly opted in.
-    // This blocks stray calls from parallel tensor-op tests (arithmetic,
-    // activation, etc.) that happen to run while TRACING=true.
+    // In test builds, only record when this THREAD explicitly opted in.
+    // Thread-local (not global) so that parallel tensor-op test threads
+    // (arithmetic, activation, etc.) are always blocked — their thread-local
+    // is false regardless of what the trace-test thread set.
     #[cfg(test)]
-    if !TRACE_TEST_RECORDING.load(Ordering::SeqCst) {
+    if !TRACE_TEST_RECORDING.with(|f| f.get()) {
         return;
     }
     let mut guard = TRACE_GRAPH.lock().expect("TRACE_GRAPH mutex poisoned");
@@ -213,14 +219,17 @@ mod tests {
     /// Helper: reset global state between tests so they don't interfere.
     fn reset_trace() {
         TRACING.store(false, Ordering::SeqCst);
-        *TRACE_GRAPH.lock().unwrap() = None;
+        // Recover from a poisoned mutex (e.g. a prior test panicked after
+        // locking TRACE_GRAPH) so subsequent tests still get a clean slate.
+        let mut guard = TRACE_GRAPH.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = None;
     }
 
     #[test]
     fn test_trace_basic_ops() {
         let _guard = TEST_LOCK.lock().unwrap();
         reset_trace();
-        TRACE_TEST_RECORDING.store(true, Ordering::SeqCst);
+        TRACE_TEST_RECORDING.with(|f| f.set(true));
 
         // Start trace
         nsl_trace_start();
@@ -259,7 +268,7 @@ mod tests {
         assert!(!is_tracing(), "tracing should be inactive after nsl_trace_stop");
         assert_ne!(raw, 0, "nsl_trace_stop should return a non-null pointer");
 
-        TRACE_TEST_RECORDING.store(false, Ordering::SeqCst);
+        TRACE_TEST_RECORDING.with(|f| f.set(false));
         let graph = unsafe { Box::from_raw(raw as *mut TraceGraph) };
 
         // Verify ops
@@ -291,7 +300,7 @@ mod tests {
     fn test_trace_pointer_resolution() {
         let _guard = TEST_LOCK.lock().unwrap();
         reset_trace();
-        TRACE_TEST_RECORDING.store(true, Ordering::SeqCst);
+        TRACE_TEST_RECORDING.with(|f| f.set(true));
 
         nsl_trace_start();
 
@@ -310,7 +319,7 @@ mod tests {
         nsl_trace_register_output(40, output_name.as_ptr() as i64);
 
         let raw = nsl_trace_stop();
-        TRACE_TEST_RECORDING.store(false, Ordering::SeqCst);
+        TRACE_TEST_RECORDING.with(|f| f.set(false));
         let graph = unsafe { Box::from_raw(raw as *mut TraceGraph) };
 
         // ptr 10 is in inputs
