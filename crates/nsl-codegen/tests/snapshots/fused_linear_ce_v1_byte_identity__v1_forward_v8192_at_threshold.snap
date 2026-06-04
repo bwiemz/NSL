@@ -1,0 +1,222 @@
+---
+source: crates/nsl-codegen/tests/fused_linear_ce_v1_byte_identity.rs
+assertion_line: 76
+expression: s
+---
+.version 7.0
+.target sm_80
+.address_size 64
+
+.extern .shared .align 4 .b8 smem_scratch[4128];
+
+.visible .entry nsl_fused_linear_ce_f32_v8192_h128(
+	.param .u64 param_x,
+	.param .u64 param_w,
+	.param .u64 param_bias,
+	.param .u64 param_targets,
+	.param .u64 param_loss_out,
+	.param .u64 param_lse_out,
+	.param .u32 param_B, .param .u32 param_S,
+	.param .u32 param_V, .param .u32 param_H
+) {
+	.reg .u64 %rd<30>;
+	.reg .u32 %r<20>;
+	.reg .s64 %tgt64;
+	.reg .f32 %flog, %facc, %fmax, %fsum, %ftmax, %flse, %floss;
+	.reg .f32 %fa, %fb, %flog2e, %fln2, %ftmp;
+	.reg .pred %pskip, %pv, %pth0, %ptgt;
+
+	ld.param.u64 %rd0, [param_x];
+	ld.param.u64 %rd1, [param_w];
+	ld.param.u64 %rd2, [param_bias];
+	ld.param.u64 %rd3, [param_targets];
+	ld.param.u64 %rd4, [param_loss_out];
+	ld.param.u64 %rd5, [param_lse_out];
+	mov.u32 %r0, %ctaid.x;   // row_idx
+	mov.u32 %r1, %tid.x;     // tid
+	mov.f32 %flog2e, 0f3FB8AA3B; // log2(e)
+	mov.f32 %fln2,   0f3F317218; // ln(2)
+
+	setp.eq.u32 %pth0, %r1, 0;
+	@!%pth0 bra INIT_DONE;
+	mov.u64 %rd6, smem_scratch;
+	add.u64 %rd6, %rd6, 4096;
+	st.shared.f32 [%rd6], 0f80800000; // -INF sentinel
+INIT_DONE:
+	bar.sync 0;
+
+	// Load targets[row_idx] (i64)
+	cvt.u64.u32 %rd7, %r0;
+	mul.lo.u64 %rd7, %rd7, 8;
+	add.u64 %rd7, %rd3, %rd7;
+	ld.global.s64 %tgt64, [%rd7];
+
+	// setp.eq.s64: if target == -100 skip
+	setp.eq.s64 %pskip, %tgt64, -100;
+	@%pskip bra SKIP_LABEL;
+
+	// x_row_base = x + row_idx * 128 * 4
+	cvt.u64.u32 %rd8, %r0;
+	mov.u32 %r2, 128;
+	cvt.u64.u32 %rd9, %r2;
+	mul.lo.u64 %rd8, %rd8, %rd9;
+	shl.b64 %rd8, %rd8, 2;
+	add.u64 %rd8, %rd0, %rd8; // %rd8 = x_row_base
+
+	mov.f32 %fmax, 0f80800000; // -INF
+	mov.f32 %fsum, 0f00000000; // 0.0
+
+	mov.u32 %r3, 0; // tile_idx
+TILE_LOOP:
+		mul.lo.u32 %r4, %r3, 1024; // v_base
+
+		mov.u32 %r5, 0; // sub-tile counter
+		INNER_LOOP:
+			mul.lo.u32 %r6, %r5, 128;
+			add.u32 %r6, %r6, %r1;
+			add.u32 %r6, %r6, %r4; // v_idx
+			setp.lt.u32 %pv, %r6, 8192;
+			@!%pv bra INNER_SKIP;
+
+			// W_row_base = W + v_idx * 128 * 4
+			cvt.u64.u32 %rd10, %r6;
+			mov.u32 %r7, 128;
+			cvt.u64.u32 %rd11, %r7;
+			mul.lo.u64 %rd10, %rd10, %rd11;
+			shl.b64 %rd10, %rd10, 2;
+			add.u64 %rd10, %rd1, %rd10; // %rd10 = W_row_base
+
+			mov.f32 %facc, 0f00000000;
+			mov.u32 %r8, 0; // h
+			DOT_LOOP:
+				cvt.u64.u32 %rd12, %r8;
+				shl.b64 %rd12, %rd12, 2; // h * 4
+				add.u64 %rd13, %rd8, %rd12; // x_row_base + h*4
+				ld.global.f32 %fa, [%rd13];
+				add.u64 %rd14, %rd10, %rd12; // W_row_base + h*4
+				ld.global.f32 %fb, [%rd14];
+				fma.rn.f32 %facc, %fa, %fb, %facc;
+				add.u32 %r8, %r8, 1;
+				setp.lt.u32 %pv, %r8, 128;
+				@%pv bra DOT_LOOP;
+
+			// facc += bias[v_idx]
+			cvt.u64.u32 %rd15, %r6;
+			shl.b64 %rd15, %rd15, 2;
+			add.u64 %rd15, %rd2, %rd15;
+			ld.global.f32 %ftmp, [%rd15];
+			add.f32 %facc, %facc, %ftmp;
+
+			// Store logit to smem_scratch[(r5*128+tid)*4]
+			mul.lo.u32 %r9, %r5, 128;
+			add.u32 %r9, %r9, %r1;
+			shl.b32 %r9, %r9, 2;
+			mov.u64 %rd16, smem_scratch;
+			cvt.u64.u32 %rd17, %r9;
+			add.u64 %rd16, %rd16, %rd17;
+			st.shared.f32 [%rd16], %facc;
+
+			// If v_idx == target, record logit_at_target in smem
+			cvt.s64.u32 %rd18, %r6;
+			setp.eq.s64 %ptgt, %rd18, %tgt64;
+			@!%ptgt bra NOT_TARGET;
+			mov.u64 %rd19, smem_scratch;
+			add.u64 %rd19, %rd19, 4096;
+			st.shared.f32 [%rd19], %facc;
+			NOT_TARGET:
+
+			INNER_SKIP:
+			add.u32 %r5, %r5, 1;
+			setp.lt.u32 %pv, %r5, 8;
+			@%pv bra INNER_LOOP;
+
+		bar.sync 0;
+
+		setp.eq.u32 %pth0, %r1, 0;
+		@!%pth0 bra TILE_REDUCE_DONE;
+
+		mov.f32 %ftmax, 0f80800000;
+		mov.u32 %r10, 0;
+		SMEM_MAX_LOOP:
+			add.u32 %r11, %r4, %r10; // v_base + i
+			setp.lt.u32 %pv, %r11, 8192;
+			@!%pv bra SMEM_MAX_DONE;
+			shl.b32 %r12, %r10, 2;
+			mov.u64 %rd20, smem_scratch;
+			cvt.u64.u32 %rd21, %r12;
+			add.u64 %rd20, %rd20, %rd21;
+			ld.shared.f32 %ftmp, [%rd20];
+			max.f32 %ftmax, %ftmax, %ftmp;
+			add.u32 %r10, %r10, 1;
+			setp.lt.u32 %pv, %r10, 1024;
+			@%pv bra SMEM_MAX_LOOP;
+		SMEM_MAX_DONE:
+
+		// Online-softmax update
+		max.f32 %flog, %fmax, %ftmax; // new_max (reuse %flog temporarily)
+		sub.f32 %fmax, %fmax, %flog; // old_max - new_max (negative or 0)
+		mul.f32 %fmax, %fmax, %flog2e;
+		ex2.approx.f32 %fmax, %fmax; // exp(old_max - new_max)
+		mul.f32 %fsum, %fsum, %fmax; // rescale
+		mov.f32 %fmax, %flog; // fmax = new_max
+
+		mov.u32 %r10, 0;
+		SMEM_SUM_LOOP:
+			add.u32 %r11, %r4, %r10;
+			setp.lt.u32 %pv, %r11, 8192;
+			@!%pv bra SMEM_SUM_DONE;
+			shl.b32 %r12, %r10, 2;
+			mov.u64 %rd20, smem_scratch;
+			cvt.u64.u32 %rd21, %r12;
+			add.u64 %rd20, %rd20, %rd21;
+			ld.shared.f32 %ftmp, [%rd20];
+			sub.f32 %ftmp, %ftmp, %fmax; // logit - new_max
+			mul.f32 %ftmp, %ftmp, %flog2e;
+			ex2.approx.f32 %ftmp, %ftmp;
+			add.f32 %fsum, %fsum, %ftmp;
+			add.u32 %r10, %r10, 1;
+			setp.lt.u32 %pv, %r10, 1024;
+			@%pv bra SMEM_SUM_LOOP;
+		SMEM_SUM_DONE:
+
+		TILE_REDUCE_DONE:
+		bar.sync 0;
+
+		add.u32 %r3, %r3, 1;
+		setp.lt.u32 %pv, %r3, 8;
+		@%pv bra TILE_LOOP;
+
+	setp.eq.u32 %pth0, %r1, 0;
+	@!%pth0 bra WRITE_DONE;
+
+	lg2.approx.f32 %flse, %fsum; // log2(sum_exp)
+	mul.f32 %flse, %flse, %fln2; // ln(sum_exp)
+	add.f32 %flse, %flse, %fmax; // lse = ln(sum_exp) + max
+
+	mov.u64 %rd22, smem_scratch;
+	add.u64 %rd22, %rd22, 4096;
+	ld.shared.f32 %flog, [%rd22]; // logit_at_target
+
+	sub.f32 %floss, %flse, %flog;
+
+	cvt.u64.u32 %rd23, %r0;
+	shl.b64 %rd23, %rd23, 2;
+	add.u64 %rd24, %rd4, %rd23;
+	st.global.f32 [%rd24], %floss;
+	add.u64 %rd24, %rd5, %rd23;
+	st.global.f32 [%rd24], %flse;
+	bra WRITE_DONE;
+
+SKIP_LABEL:
+	setp.eq.u32 %pth0, %r1, 0;
+	@!%pth0 bra WRITE_DONE;
+	cvt.u64.u32 %rd23, %r0;
+	shl.b64 %rd23, %rd23, 2;
+	add.u64 %rd24, %rd4, %rd23;
+	st.global.f32 [%rd24], 0f00000000;
+	add.u64 %rd24, %rd5, %rd23;
+	st.global.f32 [%rd24], 0f00000000;
+
+WRITE_DONE:
+	ret;
+}
