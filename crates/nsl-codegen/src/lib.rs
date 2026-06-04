@@ -67,6 +67,7 @@ pub mod cpdt;
 pub mod cpdt_comm;
 pub mod cpdt_expert;
 pub mod cpdt_expert_prune;
+pub mod cpdt_moe_capacity;
 pub mod cpdt_joint;
 pub mod cpdt_optim;
 pub mod cpdt_sensitivity;
@@ -608,6 +609,11 @@ pub struct CompileOptions {
     pub cpdt_cluster: Option<crate::cpdt_zero::ClusterSpec>,
     /// CPDT: whether `--cpdt-report` was requested (stdout full plan).
     pub cpdt_report_requested: bool,
+    /// CPDT §4.1: roofline slack ratio for the per-MoE capacity-factor
+    /// override (`cap = max(1.0, slack × top_k / n_experts)`). Default 1.0
+    /// (compute-bound — capacity clamps to 1.0). Higher values reflect
+    /// memory-bound expert FFNs and raise capacity.
+    pub cpdt_moe_roofline_slack: f64,
     /// CPDT: shared output slot the CLI reads after compile returns.
     /// `Compiler::invoke_cpdt_if_enabled` stashes the plan here so callers
     /// can render it without extending every entry-point return type.
@@ -716,6 +722,7 @@ impl Default for CompileOptions {
             cpdt_mode: crate::cpdt::CpdtMode::Off,
             cpdt_cluster: None,
             cpdt_report_requested: false,
+            cpdt_moe_roofline_slack: 1.0,
             cpdt_plan_out: None,
             export_functions_out: None,
             calibration_data: None,

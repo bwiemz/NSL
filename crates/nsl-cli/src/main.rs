@@ -311,6 +311,12 @@ enum Cli {
         #[arg(long, default_value_t = false)]
         cpdt_report: bool,
 
+        /// CPDT §4.1: roofline slack ratio for the per-MoE capacity-factor
+        /// override (`cap = max(1.0, slack × top_k / n_experts)`). Default 1.0
+        /// (compute-bound). Raise for memory-bound expert FFNs.
+        #[arg(long, value_name = "RATIO", default_value_t = 1.0)]
+        cpdt_moe_roofline_slack: f64,
+
         /// Path to the model weights file (.safetensors) for the
         /// weight-aware CPDT path. Mirrors `nsl build -w/--weights`.
         #[arg(short = 'w', long)]
@@ -566,6 +572,12 @@ enum Cli {
         /// CPDT: emit the full plan to stdout. Implies `--cpdt` (full mode).
         #[arg(long, default_value_t = false)]
         cpdt_report: bool,
+
+        /// CPDT §4.1: roofline slack ratio for the per-MoE capacity-factor
+        /// override (`cap = max(1.0, slack × top_k / n_experts)`). Default 1.0
+        /// (compute-bound). Raise for memory-bound expert FFNs.
+        #[arg(long, value_name = "RATIO", default_value_t = 1.0)]
+        cpdt_moe_roofline_slack: f64,
 
         /// Path to calibration dataset (.bin or .safetensors).  When
         /// omitted, calibration is skipped entirely.
@@ -1071,6 +1083,7 @@ fn main_inner() {
             cpdt_intra_bw,
             cpdt_inter_bw,
             cpdt_report,
+            cpdt_moe_roofline_slack,
             calibration_data,
             calibrate,
             calibration_samples,
@@ -1351,6 +1364,7 @@ fn main_inner() {
                 cpdt_mode,
                 cpdt_cluster: cpdt_cluster.clone(),
                 cpdt_report_requested: cpdt_report,
+                cpdt_moe_roofline_slack,
                 cpdt_plan_out: cpdt_plan_out.clone(),
                 export_functions_out: None,
                 calibration_data: calibration_data.clone(),
@@ -1528,6 +1542,7 @@ fn main_inner() {
             cpdt_intra_bw,
             cpdt_inter_bw,
             cpdt_report,
+            cpdt_moe_roofline_slack,
             weights,
         } => {
             // CSHA: validate the same way `nsl build --csha` does so an
@@ -1794,6 +1809,7 @@ fn main_inner() {
                 cpdt_mode,
                 cpdt_cluster: cpdt_cluster.clone(),
                 cpdt_report_requested: cpdt_report,
+                cpdt_moe_roofline_slack,
                 cpdt_plan_out: cpdt_plan_out.clone(),
                 export_functions_out: None,
                 calibration_data: None,

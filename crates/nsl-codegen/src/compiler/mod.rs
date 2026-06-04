@@ -519,6 +519,8 @@ pub struct Compiler<'a> {
     pub cpdt_plan: Option<crate::cpdt::CpdtPlan>,
     /// Whether `--cpdt-report` was requested.
     pub cpdt_report_requested: bool,
+    /// CPDT §4.1 roofline slack ratio for the MoE capacity-factor override.
+    pub cpdt_moe_roofline_slack: f64,
     /// Global default for CPDT's weight-aware path. Phase 1 requires exactly
     /// one `@cpdt` decorator per program (enforced in nsl-semantic); this
     /// field reflects that decorator's `weight_aware` argument, defaulting
@@ -777,6 +779,7 @@ impl<'a> Compiler<'a> {
             cpdt_cluster: options.cpdt_cluster.clone(),
             cpdt_plan: None,
             cpdt_report_requested: options.cpdt_report_requested,
+            cpdt_moe_roofline_slack: options.cpdt_moe_roofline_slack,
             cpdt_weight_aware: true,
             prediction_map: HashMap::new(),
             manifest_builder: None,
