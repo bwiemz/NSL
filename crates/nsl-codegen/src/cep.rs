@@ -578,7 +578,7 @@ impl std::fmt::Display for CepBridgeError {
             }
             CepBridgeError::BadPreserve(s) => write!(
                 f,
-                "CEP: preserve entry '{s}' must be a layer-index integer in v1 (glob preserve is v2)"
+                "CEP: preserve entry '{s}' is not recognized; use a layer index (e.g. '7') or 'blocks.<n>' / 'blocks.<n>.*' pattern (e.g. 'blocks.0.*')"
             ),
         }
     }
@@ -588,11 +588,37 @@ fn supported_gpus() -> String {
     GPU_DATABASE.iter().map(|g| g.name).collect::<Vec<_>>().join(", ")
 }
 
-fn parse_preserve_layers(preserve: &[String]) -> Result<Vec<u32>, CepBridgeError> {
-    preserve
-        .iter()
-        .map(|p| p.parse::<u32>().map_err(|_| CepBridgeError::BadPreserve(p.clone())))
-        .collect()
+fn parse_preserve_layers(preserve: &[String], n_layers: u32) -> Result<Vec<u32>, CepBridgeError> {
+    let mut out: Vec<u32> = Vec::with_capacity(preserve.len());
+    for p in preserve {
+        // Bare integer: "0", "7", etc.
+        if let Ok(n) = p.parse::<u32>() {
+            if n >= n_layers {
+                return Err(CepBridgeError::BadPreserve(p.clone()));
+            }
+            out.push(n);
+            continue;
+        }
+        // "blocks.<N>" or "blocks.<N>.<suffix>"
+        if let Some(rest) = p.strip_prefix("blocks.") {
+            let head = rest.split('.').next().unwrap_or("");
+            // Reject "blocks.*" or "blocks.*.X": cannot resolve to a specific layer.
+            if head == "*" || head.is_empty() {
+                return Err(CepBridgeError::BadPreserve(p.clone()));
+            }
+            if let Ok(n) = head.parse::<u32>() {
+                if n >= n_layers {
+                    return Err(CepBridgeError::BadPreserve(p.clone()));
+                }
+                out.push(n);
+                continue;
+            }
+        }
+        return Err(CepBridgeError::BadPreserve(p.clone()));
+    }
+    out.sort_unstable();
+    out.dedup();
+    Ok(out)
 }
 
 fn map_granularity(g: nsl_semantic::cep::Granularity) -> Granularity {
@@ -628,7 +654,7 @@ pub fn build_prune_input<'a>(
         });
     }
     let target_sparsity = sparsity_override.unwrap_or(cfg.sparsity);
-    let preserve_layers = parse_preserve_layers(&cfg.preserve)?;
+    let preserve_layers = parse_preserve_layers(&cfg.preserve, spec.n_layers)?;
     let constraints = Constraints {
         peak_memory_bytes: cfg.constraints.peak_memory_bytes.unwrap_or(u64::MAX),
         latency_us: cfg.constraints.latency_us.unwrap_or(f64::INFINITY),
@@ -852,8 +878,45 @@ mod bridge_tests {
     #[test]
     fn build_prune_input_bad_preserve_errors() {
         let mut cfg = prune_cfg();
-        cfg.preserve = vec!["blocks.0.attn".to_string()];
+        cfg.preserve = vec!["foo".to_string()];
         let err = build_prune_input(&cfg, spec(), None, "H100-SXM", None).unwrap_err();
+        assert!(matches!(err, CepBridgeError::BadPreserve(_)));
+    }
+
+    #[test]
+    fn build_prune_input_accepts_glob_preserve_blocks_n_star() {
+        let baseline = spec(); // n_layers = 6
+        let mut cfg = prune_cfg();
+        // Paper §6.1 syntax:
+        cfg.preserve = vec!["blocks.0.*".to_string(), "blocks.5.*".to_string()];
+        let input = build_prune_input(&cfg, baseline.clone(), None, "H100-SXM", None).expect("input");
+        assert_eq!(input.constraints.preserve_layers, vec![0, 5]);
+    }
+
+    #[test]
+    fn build_prune_input_accepts_blocks_n_without_star() {
+        let baseline = spec();
+        let mut cfg = prune_cfg();
+        cfg.preserve = vec!["blocks.1".to_string(), "blocks.3.attn".to_string()];
+        let input = build_prune_input(&cfg, baseline.clone(), None, "H100-SXM", None).expect("input");
+        assert_eq!(input.constraints.preserve_layers, vec![1, 3]);
+    }
+
+    #[test]
+    fn build_prune_input_rejects_blocks_star() {
+        let baseline = spec();
+        let mut cfg = prune_cfg();
+        cfg.preserve = vec!["blocks.*".to_string()];
+        let err = build_prune_input(&cfg, baseline.clone(), None, "H100-SXM", None).unwrap_err();
+        assert!(matches!(err, CepBridgeError::BadPreserve(_)));
+    }
+
+    #[test]
+    fn build_prune_input_rejects_out_of_range_layer() {
+        let baseline = spec(); // n_layers = 6
+        let mut cfg = prune_cfg();
+        cfg.preserve = vec!["blocks.99".to_string()];
+        let err = build_prune_input(&cfg, baseline.clone(), None, "H100-SXM", None).unwrap_err();
         assert!(matches!(err, CepBridgeError::BadPreserve(_)));
     }
 
