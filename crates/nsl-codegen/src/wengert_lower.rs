@@ -561,6 +561,11 @@ fn emit_fused_forward_under_claim(
         "nsl_packing_metadata_get_doc_starts",
         &[],
     )?;
+    // Sprint 1 (cycle-2): hoist null RoPE cos/sin into named locals so the
+    // save record can stash them. Forward and backward must agree on cos/sin;
+    // the save record is the structural channel.
+    let rope_cos_v = null;
+    let rope_sin_v = null;
     let launch_rc = call(
         compiler,
         builder,
@@ -571,7 +576,7 @@ fn emit_fused_forward_under_claim(
             scale_bits,
             batch, heads, seq_len, head_dim,
             null, null, null, null, // paged
-            null, null,             // RoPE
+            rope_cos_v, rope_sin_v, // RoPE
             null, null,             // seq_ids, seq_lens
             shmem_val,
             ptx_ptr, name_ptr,
@@ -635,6 +640,13 @@ fn emit_fused_forward_under_claim(
             // pointer via `csha_tensor_data_ptr(out_ptr)` (see
             // `nsl_flash_attention_csha_backward`).
             out: out_val,
+            // Sprint 1 (cycle-2): stash the same RoPE cos/sin Values the
+            // forward FFI was handed so the Tier B.2 hybrid backward reads
+            // identical pointers (today both null → both forward and
+            // backward skip rotation via the in-kernel null-guard,
+            // self-consistent rope-effectively-off).
+            cos: rope_cos_v,
+            sin: rope_sin_v,
             backward_ptx_data_id: bwd_ptx_id,
             backward_name_data_id: bwd_name_id,
         },
@@ -1955,7 +1967,7 @@ fn lower_single_op(
                     scale_bits,
                     batch, heads, seq_len, hd_val,
                     null, null, null, null,    // paged (block_table, k_pool, v_pool, block_size)
-                    null, null,                 // RoPE cos/sin
+                    saves.cos, saves.sin,       // RoPE cos/sin (Sprint 1 cycle-2: sourced from forward save record)
                     null, null,                 // seq_ids, seq_lens
                     shmem_val,
                     bwd_ptx_ptr, bwd_name_ptr,

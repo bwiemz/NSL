@@ -120,24 +120,20 @@ pub fn tier_b2_hybrid_backward_eligible(config: &FlashAttentionConfig, seq_len: 
     let Some(csha) = config.csha.as_ref() else { return false; };
     let hd = config.head_dim as u32;
     let block_q = config.block_q as u32;
-    // Sprint 10 (codegen + runtime) is in place: proj_backward emits emit_drope
-    // when config.rope_q, and `csha_tier_b2_backward_launch` threads cos/sin
-    // to the proj kernel. HOWEVER the production wengert lowering at
-    // `wengert_lower.rs:1958` still passes `null, null` for cos/sin — so a
-    // production `@train` config with rope_q=true routed through the hybrid
-    // would have emit_drope null-guard short-circuit, silently leaving dQ/dK
-    // in the post-RoPE basis when emit_dproj reads them (wrong dWq/dWk with
-    // NO crash). Test harnesses that pass cos/sin directly to the FFI DO
-    // exercise the new rope_q=true path correctly.
-    //
-    // Until the wengert side wires real cos/sin, gate the PRODUCTION eligibility
-    // on `!rope_q` so the dispatch falls back to the scalar path (which already
-    // handles rope_q correctly). The hybrid kernels/runtime remain ready for
-    // a follow-on that lands the wengert wiring.
+    // Sprint 1 cycle-2: rope_q=true is now safe because forward and backward
+    // share cos/sin via the CshaSavePointers channel. The forward call sites
+    // (wengert_lower.rs and expr/advanced.rs) hoist the cos/sin Cranelift
+    // Values handed to `nsl_flash_attention_csha_with_saves` into named locals
+    // and stash them on the per-layer save record; the backward FFI call at
+    // wengert_lower.rs:1958 reads `saves.cos`/`saves.sin` from the same record.
+    // Today both are null → forward and backward both skip rotation via the
+    // in-kernel null-guard (self-consistent, rope-effectively-off). When
+    // future work threads non-null cos/sin into the forward, backward picks
+    // them up automatically with no further edits — the H1 divergence risk
+    // that gated rope_q before is now structurally impossible.
     csha.active_heads == 1  // exactly one active head; the 0="all" sentinel is rejected as ambiguous -> safe fallback to scalar
         && csha.d_model == hd
         && seq_len == block_q
-        && !config.rope_q     // see comment above; reverts Sprint 10's premature dispatch widening
 }
 
 /// Compile-time subset of [`tier_b2_hybrid_backward_eligible`]: all checks that
@@ -162,13 +158,11 @@ pub fn tier_b2_hybrid_backward_compile_time_eligible(config: &FlashAttentionConf
     }
     let Some(csha) = config.csha.as_ref() else { return false; };
     let hd = config.head_dim as u32;
-    // Sprint 10 (codegen + runtime) is in place but `wengert_lower.rs:1958`
-    // still passes null cos/sin. Gating production eligibility on `!rope_q`
-    // until the wengert source-side cos/sin wiring lands (post-Sprint-10
-    // follow-on). See the matching comment in `tier_b2_hybrid_backward_eligible`.
+    // Sprint 1 cycle-2: rope_q=true is now safe because forward and backward
+    // share cos/sin via the CshaSavePointers channel. See the matching comment
+    // in `tier_b2_hybrid_backward_eligible` for the full rationale.
     csha.active_heads == 1
         && csha.d_model == hd
-        && !config.rope_q
 }
 
 #[cfg(test)]
@@ -348,19 +342,18 @@ mod tests {
         assert!(!tier_b2_hybrid_backward_compile_time_eligible(&c));
     }
 
-    /// Sprint 10 (codegen + runtime) prepared the hybrid for rope_q=true,
-    /// but the production wengert lowering still passes null cos/sin to the
-    /// FFI. Eligibility must REJECT rope_q=true until the wengert source-side
-    /// wiring lands (else emit_drope's null-guard silently skips de-rotation
-    /// → wrong dWq/dWk with no diagnostic). The Sprint-10 codegen + runtime
-    /// changes remain in place and are exercised by test harnesses that pass
-    /// cos/sin directly to the FFI.
+    /// Sprint 1 cycle-2: rope_q=true is now ACCEPTED. The CshaSavePointers
+    /// cos/sin channel structurally guarantees forward and backward see
+    /// identical Cranelift Values for cos/sin (today both null → both skip
+    /// rotation via the in-kernel null-guard, self-consistent). When future
+    /// work threads non-null cos/sin into the forward call site, backward
+    /// picks them up automatically — the H1 divergence risk is closed.
     #[test]
-    fn compile_time_rejects_rope_q_pending_wengert_wiring() {
+    fn compile_time_accepts_rope_q_via_saves_channel() {
         let c = hybrid_cfg(64, 1, 64, true, 80, 2);
         assert!(
-            !tier_b2_hybrid_backward_compile_time_eligible(&c),
-            "rope_q=true must NOT route through the hybrid until wengert wires cos/sin"
+            tier_b2_hybrid_backward_compile_time_eligible(&c),
+            "rope_q=true must route through the hybrid now that the saves channel guarantees forward/backward cos/sin agreement"
         );
     }
 
