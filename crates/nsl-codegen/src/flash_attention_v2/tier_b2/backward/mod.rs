@@ -65,7 +65,12 @@ impl std::error::Error for BackwardSynthError {}
 /// removes those leading directives so the assembler below can prepend exactly
 /// one shared header (the union: highest `.version`, the sm_80 target the
 /// dq/dkdv kernels require, and a single `shmem[]` extern).
-fn strip_module_header(ptx: &str) -> &str {
+///
+/// Visibility: `pub(crate)` so the scalar-vs-hybrid combined-module assembler
+/// in `flash_attention_v2::synthesize_backward_combined` (Sprint 1 T1.4) can
+/// reuse the exact same stripping convention when unioning the scalar
+/// backward and the four-kernel hybrid into a single loadable module.
+pub(crate) fn strip_module_header(ptx: &str) -> &str {
     match ptx.find(".visible .entry") {
         Some(idx) => &ptx[idx..],
         // No entry found — emitter contract violated; return as-is so the

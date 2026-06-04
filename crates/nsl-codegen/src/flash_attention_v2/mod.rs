@@ -770,6 +770,83 @@ pub fn synthesize_backward_with_tier(
     }
 }
 
+/// Sprint 1 T1.4: emit a single PTX module containing BOTH the scalar
+/// Tier C backward AND the Tier B.2 hybrid four-kernel backward when the
+/// config is compile-time eligible for the hybrid path. Otherwise return
+/// the scalar PTX unchanged.
+///
+/// The runtime FFI (`csha_tier_b2_backward_launch`) branches on
+/// `tier_b2_active` (computed at Wengert lowering, Sprint 1 T1.3) to pick
+/// either the scalar single-entry path or the four-kernel hybrid path.
+/// Both entries must live in the same loaded module so a single
+/// `cuModuleLoadData` + per-path `cuModuleGetFunction` lookup work; this
+/// function is what production codegen at `compiler/kernel.rs:822` calls
+/// to embed that combined module.
+///
+/// Header-union convention mirrors `synthesize_tier_b2_backward`:
+///   * Single `.version 8.7 / .target sm_80 / .address_size 64` (sm_80
+///     is mandatory for the dq/dkdv MMA path; sm_75-targeted bodies run
+///     fine on sm_80+ via JIT).
+///   * Single `.extern .shared .align 16 .b8 shmem[];` module-level
+///     declaration. Both the scalar backward (when its SMEM exceeds the
+///     48 KB static cap) and the hybrid kernels reference `shmem` via
+///     this extern; one extern is sufficient. Static `.shared` decls
+///     emitted INSIDE individual entry bodies are function-scoped and
+///     shadow the extern locally — no symbol collision.
+///   * Each component's body (everything from `.visible .entry`
+///     onward) is concatenated verbatim via `strip_module_header`.
+///
+/// **No-op guarantee**: for ineligible configs (head_dim not
+/// hybrid-compatible, csha.level<2, gpu_sm<80, rope_q=true,
+/// active_heads!=1, d_model!=head_dim, no CSHA, ...), the output is
+/// byte-identical to `synthesize_backward(config)`.
+pub fn synthesize_backward_combined(
+    config: &FlashAttentionConfig,
+) -> Result<String, String> {
+    use crate::flash_attention_v2::tier_b2::backward::{
+        strip_module_header, synthesize_tier_b2_backward,
+    };
+    use crate::flash_attention_v2::tier_b2::dispatch::tier_b2_hybrid_backward_compile_time_eligible;
+
+    // Always synthesize the scalar backward first — it is the fallback
+    // path the runtime takes when `tier_b2_active=0`, and we must
+    // preserve its validator-rejection behaviour (the caller in
+    // `compiler/kernel.rs` swallows the Err to fall back to the legacy
+    // tape-op backward).
+    let scalar_ptx = synthesize_backward(config)?;
+
+    if !tier_b2_hybrid_backward_compile_time_eligible(config) {
+        // Ineligible: byte-identical to scalar. Runtime will never set
+        // `tier_b2_active=1` for this config, so the hybrid entries
+        // would be dead weight.
+        return Ok(scalar_ptx);
+    }
+
+    // Eligible: synthesize the hybrid four-kernel module and union the
+    // headers. If hybrid synthesis fails (e.g. UnsupportedHeadDim that
+    // the compile-time predicate didn't catch — should be unreachable
+    // today but defensive), fall back to scalar so the runtime still
+    // has SOMETHING to launch.
+    let hybrid_ptx = match synthesize_tier_b2_backward(config) {
+        Ok(p) => p,
+        Err(_) => return Ok(scalar_ptx),
+    };
+
+    let mut combined = String::new();
+    // Single union header. `.version 8.7` is the highest any component
+    // emits; `.target sm_80` is required by the Tier B.2 MMA kernels
+    // and JIT-runs the sm_75-targeted scalar body fine. One shmem
+    // extern serves all entries that reference dynamic SMEM.
+    combined.push_str(".version 8.7\n");
+    combined.push_str(".target sm_80\n");
+    combined.push_str(".address_size 64\n\n");
+    combined.push_str(".extern .shared .align 16 .b8 shmem[];\n\n");
+    combined.push_str(strip_module_header(&scalar_ptx));
+    combined.push_str("\n\n");
+    combined.push_str(strip_module_header(&hybrid_ptx));
+    Ok(combined)
+}
+
 /// Tier C backward orchestrator with optional PCA Tier B.2 support.
 ///
 /// When `tier_b` is `None` this produces byte-identical output to
