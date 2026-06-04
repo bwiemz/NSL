@@ -13,6 +13,34 @@
 //!   - `num_docs_est <= MAX_NUM_DOCS` (matches the pca_rope SMEM bound).
 //!   - Explicitly gated behind `enable_per_doc_cta=true` in the planner
 //!     config (default OFF); v1 is FORWARD ONLY.
+//!
+//! # Production wiring status (CFTP v2 follow-on Sprint 1)
+//!
+//! The FFI dispatch in `nsl_flash_attention_csha` / `_with_saves`
+//! (Sprint 1, commit `c80312dc`) recognises the `_per_doc_cta` kernel
+//! suffix and uses the new trailing `num_docs_or_zero` arg as `grid_x`.
+//! The PTX synthesis side ([`crate::flash_attention_v2::per_doc_cta`])
+//! has been shipped and GPU-validated since CFTP v1 (PR #226).
+//!
+//! However, **no production code path flips `enable_per_doc_cta=true`
+//! today**:
+//!
+//!   - The user-facing `@pca(strategy=per_document)` decorator is
+//!     parsed and validated by `nsl_semantic::cftp::validate_pca_decorator`,
+//!     but the returned `PcaConfig` is currently DROPPED — the
+//!     semantic checker does not yet collect it onto a list analogous
+//!     to `wrga_configs` (see `crates/nsl-semantic/src/checker/stmt.rs:443`).
+//!   - The planner site that would call [`admit`] from production
+//!     code does not exist; `admit()` is invoked only from unit / GPU
+//!     tests that hardcode `enable_per_doc_cta: true`.
+//!
+//! Wiring `@pca(strategy=per_document)` → `enable_per_doc_cta=true`
+//! → admission → kernel-name suffix → `nsl_flash_attention_csha`
+//! `grid_x` override is **Sprint 2 follow-on work** (train-block
+//! decorator collection — same mechanism `@wrga`, `@freeze`, etc.
+//! already use). Once decorator collection is wired, the activation
+//! is a one-line `PerDocAdmitConfig` construction at the planner
+//! call site; this module + the FFI dispatch are ready to receive it.
 
 use crate::flash_attention::FlashAttentionConfig;
 use crate::pca_detect::{DatasetPackingConfig, PcaDetection, PcaStrategy};

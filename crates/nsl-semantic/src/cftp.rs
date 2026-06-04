@@ -148,6 +148,25 @@ pub struct PcaConfig {
     pub span: Span,
 }
 
+/// Parse + validate the `@pca(strategy=...)` decorator on a train block.
+///
+/// # Sprint 1 status (CFTP v2 follow-on)
+///
+/// As of Sprint 1 (commit `c80312dc`), the returned `PcaConfig` is
+/// **dropped by the caller** in `checker/stmt.rs::stmt_decorator` — see
+/// the matching block for `@wrga`, which pushes onto `self.wrga_configs`.
+/// `@pca` has no analogous collection list yet.
+///
+/// Plumbing `PcaConfig::strategy = PerDocument` through to
+/// `nsl_codegen::pca_per_doc::PerDocAdmitConfig::enable_per_doc_cta` is
+/// Sprint 2 follow-on work. The per-doc CTA emitter
+/// (`nsl_codegen::flash_attention_v2::per_doc_cta::synthesize_per_doc_cta_forward`)
+/// and the FFI dispatch (`nsl_runtime::flash_attention::nsl_flash_attention_csha`)
+/// are already in place to receive that decision.
+///
+/// Until decorator collection lands, the per-doc CTA path is reachable
+/// only from tests that hardcode `enable_per_doc_cta=true` on the
+/// admission config.
 pub fn validate_pca_decorator(
     deco: &Decorator,
     resolve_sym: &dyn Fn(Symbol) -> String,
