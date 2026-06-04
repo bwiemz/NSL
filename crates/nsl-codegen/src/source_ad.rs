@@ -3154,6 +3154,51 @@ mod tests {
         assert!(gen.adjoint_of(1).is_some());
     }
 
+    /// CPDT Part II activation: directly tests `lower_adjoint_expr` against
+    /// a single `MulElementwise` adjoint, independent of the full
+    /// `AdjointGenerator::generate` flow. Catches a bug class that
+    /// `mul_backward_emits_reduce_to_shape_per_arm` cannot — e.g. accidentally
+    /// swapping `raw` and `target` inside the Mul lowering's emit_op call
+    /// would still produce two ops and a `Passthrough("reduce_to_shape")`
+    /// op, but with the wrong target VarId.
+    #[test]
+    fn lower_adjoint_expr_mul_elementwise_uses_target_as_shape_anchor() {
+        let mut gen = AdjointGenerator::new(200);
+        // grad=100, other=42, target=7 — chosen to be unambiguous in the
+        // result inputs vector.
+        let _ = gen.lower_adjoint_expr(AdjointExpr::MulElementwise(100, 42, 7));
+        let ops = &gen.adjoint_ops;
+        assert_eq!(
+            ops.len(),
+            2,
+            "MulElementwise must lower to exactly 2 ops (Mul + reduce_to_shape), got {} (ops: {:?})",
+            ops.len(),
+            ops.iter().map(|o| &o.op).collect::<Vec<_>>(),
+        );
+        assert!(
+            matches!(ops[0].op, PrimalOp::Mul),
+            "op[0] must be PrimalOp::Mul, got {:?}",
+            ops[0].op,
+        );
+        assert_eq!(
+            ops[0].inputs,
+            vec![100, 42],
+            "Mul inputs must be (grad, other), got {:?}",
+            ops[0].inputs,
+        );
+        let raw_var = ops[0].result;
+        match &ops[1].op {
+            PrimalOp::Passthrough(name) => assert_eq!(name, "reduce_to_shape"),
+            other => panic!("op[1] must be Passthrough(\"reduce_to_shape\"), got {:?}", other),
+        }
+        assert_eq!(
+            ops[1].inputs,
+            vec![raw_var, 7],
+            "reduce_to_shape inputs must be (raw_mul_result, target), got {:?}",
+            ops[1].inputs,
+        );
+    }
+
     /// CPDT Part II activation: the source-AD lowering of `Mul`'s backward
     /// must reduce each grad arm to the shape of the input whose adjoint it
     /// feeds, otherwise broadcast multiplies (e.g. `h[2,64] * scale[64]`)

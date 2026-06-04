@@ -3531,15 +3531,35 @@ impl Compiler<'_> {
                 // inactive); the unified-dispatch arm hardcoded
                 // `wrap_precision=false`. Allocating FP16 m/v on the WGGO path
                 // would have fed FP16 buffers to an unwrapped FP32 update →
-                // silent corruption. The gate was on `wggo_overrides.is_none()`.
+                // silent corruption. The original gate was on
+                // `wggo_overrides.is_none()` and the Deferred-only mode table
+                // assumption.
                 //
-                // S2 threaded the wrap through `emit_unified_optim_step_dispatch`,
-                // so BOTH branches now wrap when `cpdt_precision_dtypes.is_some()`.
-                // The silent-corruption hazard is closed structurally, so the
-                // gate is unconditionally true (S4). `wrapped_path_active` stays
-                // a `precision_active` parameter as defense-in-depth in case a
-                // future refactor reintroduces a non-wrapping arm.
-                let wrapped_path_active = true;
+                // S2 threaded the wrap through `emit_unified_optim_step_dispatch`'s
+                // Deferred sub-arm. S4 relaxes the gate to `true`, BUT the
+                // unified-dispatch FullBuffer sub-arm (stmt_fase.rs:894-916)
+                // still hands raw s1/s2 to `emit_stdlib_optim_call` (F32 FFI)
+                // without a cast wrap. Today the FASE planner downgrades every
+                // FullBuffer entry to Deferred upstream when CPDT is active, so
+                // the FullBuffer arm is dead code at runtime. If that invariant
+                // ever changes — a mixed mode table with FullBuffer entries —
+                // FP16 buffers would silently corrupt at the stdlib call. To
+                // keep the structural guarantee defensive against that, we
+                // refuse FP16 allocation here whenever the per-param mode table
+                // contains a FullBuffer entry.
+                let mode_table_has_fullbuffer = crate::fase_codegen_table::build_param_mode_table(
+                    &param_paths,
+                    &model_var_name,
+                    &fase_plan,
+                    self.wggo_overrides.as_ref(),
+                )
+                .map(|bytes| {
+                    bytes.iter().any(|&b| {
+                        b == crate::fase_codegen_table::ParamMode::FullBuffer as u8
+                    })
+                })
+                .unwrap_or(false);
+                let wrapped_path_active = !mode_table_has_fullbuffer;
                 let plan = self.cpdt_plan.as_ref();
                 let active = plan
                     .map(|p| {
