@@ -604,6 +604,9 @@ enum Cli {
         /// CEP: also emit the pruned (sliced) weights to this .safetensors path.
         #[arg(long)]
         cep_emit_weights: Option<PathBuf>,
+        /// CEP SP2: also emit the rewritten NSL source with pruned dims to this path.
+        #[arg(long)]
+        cep_emit_source: Option<PathBuf>,
     },
 
     /// Run @test functions in an NSL file
@@ -876,6 +879,7 @@ fn main_inner() {
                     sparsity: None,
                     cep_out,
                     cep_emit_weights: None,
+                    cep_emit_source: None,
                 };
                 std::process::exit(run_cep_search(&file, &ov));
             }
@@ -1085,6 +1089,7 @@ fn main_inner() {
             cep_sparsity,
             cep_out,
             cep_emit_weights,
+            cep_emit_source,
         } => {
             // M62a: shared_lib flag is threaded through compile_opts and handled
             // in the build path below.
@@ -1095,6 +1100,7 @@ fn main_inner() {
                     sparsity: cep_sparsity,
                     cep_out,
                     cep_emit_weights,
+                    cep_emit_source,
                 };
                 std::process::exit(run_cep_prune(&file, weights.as_deref(), &ov));
             }
@@ -2908,6 +2914,37 @@ fn run_cep_prune(
                     "CEP sliced weights written to {} ({orig_params} -> {new_params} params)",
                     weights_out.display()
                 );
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                return 1;
+            }
+        }
+    }
+
+    // SP2: rewrite the source with chosen pruned dims and write to `cep_emit_source`.
+    if let Some(source_out) = ov.cep_emit_source.as_ref() {
+        let delta = nsl_codegen::cep::plan_to_prune_delta(&plan, &spec);
+        let original_source = match std::fs::read_to_string(file) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("error: failed to re-read source for SP2 emission: {e}");
+                return 1;
+            }
+        };
+        match nsl_codegen::cep_emit_source::apply_prune_delta_to_source(
+            &original_source,
+            module,
+            &resolve,
+            &spec,
+            &delta,
+        ) {
+            Ok(out_src) => {
+                if let Err(e) = std::fs::write(source_out, &out_src) {
+                    eprintln!("error: failed to write rewritten source: {e}");
+                    return 1;
+                }
+                println!("CEP rewritten source written to {}", source_out.display());
             }
             Err(e) => {
                 eprintln!("{e}");

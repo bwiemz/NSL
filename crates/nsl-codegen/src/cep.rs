@@ -561,6 +561,8 @@ pub struct CliOverrides {
     pub cep_out: Option<std::path::PathBuf>,
     /// CEP SP1: also emit the pruned weights to this .safetensors path.
     pub cep_emit_weights: Option<std::path::PathBuf>,
+    /// CEP SP2: also emit the rewritten NSL source with pruned dims to this path.
+    pub cep_emit_source: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug)]
