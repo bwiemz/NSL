@@ -10,7 +10,8 @@
 //! and CI lanes without CUDA install green.
 
 use nsl_codegen::fused_linear_ce::{
-    Dtype, FusedLinearCEConfig, synthesize_fused_linear_ce_ptx, MAX_VOCAB_HARD_CEILING,
+    Dtype, FusedLinearCEConfig, synthesize_fused_linear_ce_ptx,
+    synthesize_fused_linear_ce_backward_ptx, MAX_VOCAB_HARD_CEILING,
 };
 use std::io::Write;
 use std::process::{Command, Stdio};
@@ -93,6 +94,41 @@ fn large_vocab_two_kernel_module_assembles_for_sm80() {
         Ok(()) => eprintln!("ptxas accepted module (sm_80)"),
         Err(stderr) => panic!(
             "ptxas rejected large-vocab two-kernel module:\n{stderr}\nPTX at {}",
+            tmp.display()
+        ),
+    }
+}
+
+/// Backward kernel at large-vocab scale must also assemble cleanly. v1's
+/// emit_bwd_kernel is reused unchanged for both paths (per design); this
+/// test gates that the unchanged emitter still produces ptxas-clean PTX
+/// when vocab_size is raised to production scale.
+#[test]
+fn large_vocab_backward_kernel_assembles_for_sm80() {
+    let Some(ptxas) = find_ptxas() else {
+        eprintln!("ptxas not found in PATH; skipping");
+        return;
+    };
+
+    let cfg = FusedLinearCEConfig {
+        vocab_size: 49152,
+        hidden_size: 128,
+        seq_len: 64,
+        batch_size: 2,
+        vocab_tile: 128,
+        gpu_sm: 80,
+        dtype: Dtype::F32,
+        ignore_index: -100,
+        max_vocab_v1: MAX_VOCAB_HARD_CEILING,
+    };
+    cfg.validate().unwrap();
+    let ptx = synthesize_fused_linear_ce_backward_ptx(&cfg);
+    let tmp = std::env::temp_dir().join("fused_linear_ce_large_bwd_v49152.ptx");
+    std::fs::write(&tmp, &ptx).ok();
+    match assemble_ptx(&ptxas, &ptx, "sm_80") {
+        Ok(()) => eprintln!("ptxas accepted backward module"),
+        Err(stderr) => panic!(
+            "ptxas rejected large-vocab backward:\n{stderr}\nPTX at {}",
             tmp.display()
         ),
     }

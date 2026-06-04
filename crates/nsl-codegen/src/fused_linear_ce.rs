@@ -375,11 +375,23 @@ pub fn synthesize_large_vocab_forward_ptx(cfg: &FusedLinearCEConfig) -> Vec<u8> 
 
 /// Synthesise the backward PTX for the fused linear-CE kernel.
 ///
-/// Grid/block: same as forward.
+/// **Same kernel for both v1 and large-vocab forward paths.** The backward
+/// algorithm reads the saved per-row `lse_out` from the forward pass and
+/// per-(tile, row) recomputes `p_v = exp(logit_v - lse_row)`; it does NOT
+/// depend on whether the forward used the single-CTA or two-kernel reduce
+/// — it only needs the correct global LSE, which Kernel B writes. Grid
+/// stays `(B*S, 1, 1)`; each CTA serially scans `num_tiles` vocab tiles.
+///
+/// Trade-off: at large vocab the backward becomes the bottleneck (linear in
+/// num_tiles per row). Parallelising it to a `(num_tiles, B*S, 1)` grid is
+/// a future optimisation — correctness is unaffected today because the
+/// `red.global.add.f32` scatters into dW and dx are commutative-associative.
+///
+/// Grid/block: same as v1 forward.
 /// Recomputes logits (no logits buffer saved), computes
 /// `dlogits_v = (softmax_v - 1{v==target}) * grad_output / num_valid`,
 /// then scatters `dx += dlogits_v * W[v, :]` and
-/// `dW[v, :] += dlogits_v * x[row, :]` via atomic adds.
+/// `dW[v, :] += dlogits_v * x[row, :]` via `red.global.add.f32`.
 pub fn synthesize_fused_linear_ce_backward_ptx(cfg: &FusedLinearCEConfig) -> Vec<u8> {
     let ptx = emit_bwd_kernel(cfg);
     ptx.into_bytes()
