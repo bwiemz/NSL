@@ -107,8 +107,16 @@ pub struct SearchOutcome {
     pub ranked_candidates: Vec<EvaluatedCandidate>,
     /// Log of pruning steps (for greedy prune).
     pub prune_log: Vec<PruneStep>,
-    /// Number of candidates evaluated.
+    /// Number of candidates evaluated (feasibility-filtered for prune; total
+    /// enumerated BEFORE feasibility filtering for architecture_search).
     pub candidates_evaluated: u32,
+    /// Total candidates enumerated BEFORE feasibility or constraint filtering.
+    /// For prune mode this equals candidates_evaluated (every trial is logged).
+    /// For search mode this is the full cross-product count before filtering.
+    pub candidates_enumerated: u32,
+    /// Wall-clock duration of the search inside prune_greedy / architecture_search
+    /// (microseconds). Includes all candidate compilations. Set to 0 in Default.
+    pub wall_clock_us: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -210,6 +218,7 @@ pub fn prune_greedy(
     constraints: &Constraints,
     granularity: Granularity,
 ) -> SearchOutcome {
+    let t0 = std::time::Instant::now();
     let baseline_profile = evaluate(base_spec, gpu).expect("base spec must validate");
     let baseline_params = base_spec.param_count();
 
@@ -350,6 +359,7 @@ pub fn prune_greedy(
         }
     }
 
+    let wall_clock_us = t0.elapsed().as_micros() as u64;
     SearchOutcome {
         baseline: Some(baseline_profile.clone()),
         chosen: Some(EvaluatedCandidate {
@@ -361,6 +371,8 @@ pub fn prune_greedy(
         ranked_candidates: Vec::new(),
         prune_log,
         candidates_evaluated,
+        candidates_enumerated: candidates_evaluated,
+        wall_clock_us,
     }
 }
 
@@ -372,8 +384,11 @@ pub fn architecture_search(
     constraints: &Constraints,
     objective: NasObjective,
 ) -> SearchOutcome {
+    let t0 = std::time::Instant::now();
+    let mut enumerated_total = 0u32;
     let mut evaluated = Vec::new();
     for spec in axes.enumerate() {
+        enumerated_total += 1;
         let Ok(profile) = evaluate(&spec, gpu) else {
             continue;
         };
@@ -398,6 +413,7 @@ pub fn architecture_search(
                 .unwrap_or(std::cmp::Ordering::Equal),
         }
     });
+    let wall_clock_us = t0.elapsed().as_micros() as u64;
     let candidates_evaluated = evaluated.len() as u32;
     let chosen = evaluated.iter().find(|c| c.feasible).cloned();
     SearchOutcome {
@@ -406,6 +422,8 @@ pub fn architecture_search(
         ranked_candidates: evaluated,
         prune_log: Vec::new(),
         candidates_evaluated,
+        candidates_enumerated: enumerated_total,
+        wall_clock_us,
     }
 }
 

@@ -149,6 +149,23 @@ fn cep_prune_refuses_gpt2() {
 }
 
 #[test]
+fn cep_profile_prints_compilation_profile() {
+    let mut cmd = Command::cargo_bin("nsl").unwrap();
+    cmd.env("NSL_STDLIB_PATH", stdlib_path());
+    cmd.arg("check")
+        .arg(canonical_fixture())
+        .arg("--cep-profile")
+        .arg("--cep-target")
+        .arg("H100-SXM");
+    cmd.assert()
+        .success()
+        .stdout(predicate::str::contains("CEP Compilation Profile"))
+        .stdout(predicate::str::contains("Target: H100-SXM"))
+        .stdout(predicate::str::contains("Kernel launches per forward:"))
+        .stdout(predicate::str::contains("Estimated latency:"));
+}
+
+#[test]
 fn cep_search_end_to_end_writes_delta() {
     let tmp = TempDir::new().unwrap();
     let out_path = tmp.path().join("search.cep.json");

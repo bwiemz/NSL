@@ -76,7 +76,7 @@ impl CepPlan {
         1.0 - (chosen.profile.param_bytes as f64 / bp)
     }
 
-    /// Render the compilation report.
+    /// Render the compilation report (paper §6.3 format).
     pub fn render_report(&self) -> String {
         use std::fmt::Write as _;
         let mut s = String::new();
@@ -85,41 +85,70 @@ impl CepPlan {
             CepMode::Search => writeln!(s, "=== CEP Architecture Search Report ===").unwrap(),
         }
         writeln!(s, "Target: {}", self.target_gpu).unwrap();
-        writeln!(
-            s,
-            "Candidates evaluated: {}",
-            self.outcome.candidates_evaluated
-        )
-        .unwrap();
         writeln!(s).unwrap();
 
-        if let Some(baseline) = self.outcome.baseline.as_ref() {
+        if self.mode == CepMode::Prune {
+            // §6.3: "Search time: <S> seconds (<N> candidates evaluated)"
+            let secs = self.outcome.wall_clock_us as f64 / 1e6;
             writeln!(
                 s,
-                "Baseline: params={:.1}MB, peak={:.2}GB, latency={:.1}μs",
-                baseline.param_bytes as f64 / 1e6,
-                baseline.peak_memory_bytes as f64 / 1e9,
-                baseline.estimated_latency_us
+                "Search time: {:.2} seconds ({} candidates evaluated)",
+                secs, self.outcome.candidates_evaluated
             )
             .unwrap();
-        }
-        if let Some(chosen) = self.outcome.chosen.as_ref() {
-            writeln!(
-                s,
-                "Chosen:   params={:.1}MB, peak={:.2}GB, latency={:.1}μs  (feasible={})",
-                chosen.profile.param_bytes as f64 / 1e6,
-                chosen.profile.peak_memory_bytes as f64 / 1e9,
-                chosen.profile.estimated_latency_us,
-                chosen.feasible
-            )
-            .unwrap();
-            if self.mode == CepMode::Prune {
+
+            if let Some(baseline) = self.outcome.baseline.as_ref() {
+                writeln!(
+                    s,
+                    "Baseline: params={:.1}MB, peak={:.2}GB, latency={:.1}us",
+                    baseline.param_bytes as f64 / 1e6,
+                    baseline.peak_memory_bytes as f64 / 1e9,
+                    baseline.estimated_latency_us
+                )
+                .unwrap();
+            }
+            if let Some(chosen) = self.outcome.chosen.as_ref() {
+                writeln!(
+                    s,
+                    "Chosen:   params={:.1}MB, peak={:.2}GB, latency={:.1}us  (feasible={})",
+                    chosen.profile.param_bytes as f64 / 1e6,
+                    chosen.profile.peak_memory_bytes as f64 / 1e9,
+                    chosen.profile.estimated_latency_us,
+                    chosen.feasible
+                )
+                .unwrap();
                 writeln!(
                     s,
                     "Reduction: {:.1}% of params removed",
                     100.0 * self.param_reduction()
                 )
                 .unwrap();
+
+                // §6.3: constraint status
+                if chosen.feasible {
+                    writeln!(s, "All constraints satisfied.").unwrap();
+                } else {
+                    writeln!(s, "Constraints violated: feasible=false").unwrap();
+                }
+
+                // §6.3: "Binary size: <orig> -> <pruned>"
+                if let Some(baseline) = self.outcome.baseline.as_ref() {
+                    writeln!(
+                        s,
+                        "Binary size: {} -> {}",
+                        format_bytes_si(baseline.binary_size_bytes),
+                        format_bytes_si(chosen.profile.binary_size_bytes)
+                    )
+                    .unwrap();
+                    // §6.3: "Kernel launches per forward: <orig> -> <pruned>"
+                    writeln!(
+                        s,
+                        "Kernel launches per forward: {} -> {}",
+                        baseline.kernel_launches, chosen.profile.kernel_launches
+                    )
+                    .unwrap();
+                }
+
                 writeln!(s).unwrap();
                 writeln!(s, "Per-layer post-prune shape:").unwrap();
                 for (i, (&nh, &ff)) in chosen
@@ -132,14 +161,13 @@ impl CepPlan {
                     writeln!(s, "  Layer {i}: heads={nh}, FFN={ff}").unwrap();
                 }
             }
-        }
-        if self.mode == CepMode::Prune {
+
             writeln!(s).unwrap();
             writeln!(s, "Prune log ({} steps):", self.outcome.prune_log.len()).unwrap();
             for step in &self.outcome.prune_log {
                 writeln!(
                     s,
-                    "  [{}] layer={} {}{} — {} (params={:.1}MB)",
+                    "  [{}] layer={} {}{} - {} (params={:.1}MB)",
                     if step.accepted { "OK" } else { "-" },
                     step.layer,
                     step.kind,
@@ -150,26 +178,65 @@ impl CepPlan {
                 .unwrap();
             }
         } else {
-            writeln!(s, "Top candidates:").unwrap();
-            for (i, cand) in self.outcome.ranked_candidates.iter().take(5).enumerate() {
+            // Search mode — §6.3
+            let n_feasible = self.outcome.ranked_candidates.iter().filter(|c| c.feasible).count();
+            writeln!(
+                s,
+                "Search space: {} candidates",
+                self.outcome.candidates_enumerated
+            )
+            .unwrap();
+            writeln!(s, "Feasible (constraints met): {} candidates", n_feasible).unwrap();
+            let secs = self.outcome.wall_clock_us as f64 / 1e6;
+            writeln!(s, "Compilation time: {:.2} seconds", secs).unwrap();
+            writeln!(s).unwrap();
+
+            writeln!(s, "Top 3 architectures:").unwrap();
+            for (i, cand) in self.outcome.ranked_candidates.iter().take(3).enumerate() {
                 writeln!(
                     s,
-                    "  {}. d={}, L={}, H={}/{} KV, FFN={}, params={:.1}M  latency={:.1}μs  util={:.2}  feasible={}",
+                    "  {}. d={}, L={}, H={}, KV={}, FFN={} -> {}M params, {:.2}GB, {:.1}us/tok, util={:.2}",
                     i + 1,
                     cand.spec.d_model,
                     cand.spec.n_layers,
                     cand.spec.n_heads.first().copied().unwrap_or(0),
                     cand.spec.n_kv_heads.first().copied().unwrap_or(0),
                     cand.spec.d_ff.first().copied().unwrap_or(0),
-                    cand.spec.param_count() as f64 / 1e6,
+                    format_params_si(cand.spec.param_count()),
+                    cand.profile.peak_memory_bytes as f64 / 1e9,
                     cand.profile.estimated_latency_us,
                     cand.profile.roofline_utilization,
-                    cand.feasible
                 )
                 .unwrap();
             }
         }
         s
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SI formatting helpers (paper §6.3 spelling)
+// ---------------------------------------------------------------------------
+
+fn format_bytes_si(bytes: u64) -> String {
+    if bytes >= 1_000_000_000 {
+        format!("{:.1}GB", bytes as f64 / 1e9)
+    } else if bytes >= 1_000_000 {
+        format!("{}MB", bytes / 1_000_000)
+    } else if bytes >= 1_000 {
+        format!("{}KB", bytes / 1_000)
+    } else {
+        format!("{}B", bytes)
+    }
+}
+
+fn format_params_si(p: u64) -> String {
+    if p >= 1_000_000 {
+        format!("{:.1}", p as f64 / 1e6)
+    } else if p >= 1_000 {
+        format!("{:.1}K", p as f64 / 1e3)
+    } else {
+        format!("{}", p)
     }
 }
 
@@ -1043,5 +1110,56 @@ mod bridge_tests {
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
         assert_eq!(v["mode"], "search");
         assert!(v["ranked_candidates"].is_array());
+    }
+
+    #[test]
+    fn prune_report_includes_search_time_constraints_binary_kernel_launches() {
+        let baseline = spec();
+        let cfg = prune_cfg();
+        let input = build_prune_input(&cfg, baseline.clone(), None, "H100-SXM", Some(0.2)).expect("input");
+        let plan = run_prune(input);
+        let rendered = plan.render_report();
+        // §6.3 mandatory lines
+        assert!(rendered.contains("Search time:"), "missing 'Search time:' line\n{}", rendered);
+        assert!(
+            rendered.contains("All constraints satisfied") || rendered.contains("Constraints violated"),
+            "missing constraint-status line\n{}", rendered
+        );
+        assert!(rendered.contains("Binary size:"), "missing 'Binary size:' line\n{}", rendered);
+        assert!(
+            rendered.contains("Kernel launches per forward:"),
+            "missing 'Kernel launches per forward:' line\n{}", rendered
+        );
+    }
+
+    #[test]
+    fn search_report_includes_search_space_feasible_compilation_time_top3() {
+        use crate::cep_rewrite::SearchAxes;
+        let axes = SearchAxes {
+            d_model: vec![256, 384], n_layers: vec![4], n_heads: vec![4, 8],
+            n_kv_heads: vec![2], d_ff: vec![512, 1024],
+            activation: vec![crate::cep_oracle::Activation::SwiGlu],
+            norm: vec![crate::cep_oracle::NormType::RmsNorm],
+            vocab: 4096, head_dim: 64, max_seq: 2048, batch: 1, dtype_bytes: 4,
+        };
+        let scfg = nsl_semantic::cep::CepSearchConfig {
+            target: None,
+            objective: nsl_semantic::cep::NasObjective::ParamEfficiency,
+            constraints: Default::default(),
+            span: nsl_errors::Span::DUMMY,
+        };
+        let input = build_search_input(&scfg, axes, "H100-SXM").expect("input");
+        let plan = run_search(input);
+        let rendered = plan.render_report();
+        assert!(rendered.contains("Search space:"), "{}", rendered);
+        assert!(rendered.contains("Feasible"), "{}", rendered);
+        assert!(rendered.contains("Compilation time:"), "{}", rendered);
+        assert!(rendered.contains("Top 3 architectures:"), "{}", rendered);
+        // Per-candidate line shape — paper §6.3 example
+        assert!(
+            rendered.contains("d=") && rendered.contains("L=")
+                && rendered.contains("H=") && rendered.contains("KV="),
+            "per-candidate line missing d=/L=/H=/KV= tokens\n{}", rendered
+        );
     }
 }
