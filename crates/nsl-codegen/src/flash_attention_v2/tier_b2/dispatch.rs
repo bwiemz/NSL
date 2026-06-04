@@ -32,8 +32,16 @@ pub enum DispatchReject {
 /// Per-hd bq + chunk schedule from spec §6.4.
 ///
 /// Returns `None` if `head_dim` isn't in the supported set.
+///
+/// Sprint 9: hd=32 added at (bq=64, chunk=4). Matches `tier_b2_effective_bq`'s
+/// no-fallback path for hd in {32, 64} (smem_layout.rs:1037), and SMEM usage at
+/// (bq=bkv=64, hd=32, chunk=4) is ~33.5 KB, well under the 99 KB dynamic budget.
+/// The dQ-kernel tests at `dq.rs::synthesize_dq_kernel_*` and the dQ parity sweep
+/// at `tier_b2_dq_kernel_cpu_reference::tier_b2_dq_sweep_cpu_naive_forward`
+/// already exercise hd=32 with bq=64.
 fn ladder_row(head_dim: u32) -> Option<(u32, u32)> {
     match head_dim {
+        32  => Some((64, 4)),
         64  => Some((64, 4)),
         128 => Some((64, 4)),
         256 => Some((32, 4)),
@@ -77,6 +85,17 @@ pub fn tier_b2_can_dispatch(
     let Some((bq, chunk)) = ladder_row(hd) else {
         return Err(DispatchReject::UnsupportedHeadDim(hd));
     };
+    // Sprint 9 Part B: bkv == bq is a HARD kernel invariant of the dKdV kernel
+    // (dkdv.rs:40-54). The single `%band_row_base = warp_id*16` register is
+    // dual-used as a q-row base (inner-loop S/dP MMA + stats load + P/dS col
+    // scatter) AND a kv-row base (outer-loop dV/dK accumulator MMA + HBM
+    // finalize). Asymmetric tiles would silently corrupt dK/dV. Lifting this
+    // requires splitting %band_row_base into separate q/kv warp-band registers,
+    // doubling warp setup, and re-auditing every q-row vs kv-row use site in
+    // dkdv.rs (lines ~208, 290, 297, 303, 802-814, 885, 892, 909, finalize).
+    // That's a substantial kernel rewrite; deferred. Until then the planner
+    // pins bkv = bq, matching the precondition the dKdV kernel enforces at
+    // synth time via tier_b2_effective_bq/bkv parity.
     let bkv = bq;
     let needed = tier_b2_smem_bytes(bq, bkv, hd, chunk);
     if needed > SMEM_DYNAMIC_BUDGET_BYTES {
@@ -177,6 +196,35 @@ mod tests {
         );
     }
 
+    /// Sprint 9: hd=32 added to the SMEM ladder. The ladder pins bq=64; the
+    /// dispatch helper mirrors bkv=bq (preserving the dKdV kernel's symmetric
+    /// warp-band precondition at smem_layout.rs:1037 + dkdv.rs:40-54).
+    #[test]
+    fn dispatches_at_hd32_sm80_level2() {
+        let result = tier_b2_can_dispatch(&cfg(32, 80, 2));
+        assert_eq!(
+            result,
+            Ok(BackwardTier::TierB2 { bq: 64, bkv: 64, chunk: 4 })
+        );
+    }
+
+    /// Sprint 9: the SMEM budget at hd=32, bq=bkv=64, chunk=4 is well within
+    /// the 99 KB dynamic budget. Anchored numeric check guards against future
+    /// silent layout regressions blowing the ladder past the budget.
+    #[test]
+    fn smem_math_at_hd32_fits_budget() {
+        use crate::flash_attention_v2::smem_layout::SMEM_DYNAMIC_BUDGET_BYTES;
+        let bytes = tier_b2_smem_bytes(64, 64, 32, 4);
+        // Expected ~33.5 KB: 4*(64*32*2) + 64*64*4 + 4*32*2*2 + 64*4*2 + 64*4*2
+        //                  = 16384       + 16384     + 512        + 512    + 512
+        //                  = 34304 bytes.
+        assert_eq!(bytes, 34304, "SMEM math drifted from spec-computed hd=32 size");
+        assert!(
+            bytes < SMEM_DYNAMIC_BUDGET_BYTES,
+            "hd=32 ladder ({bytes} B) must fit within dynamic budget ({SMEM_DYNAMIC_BUDGET_BYTES} B)"
+        );
+    }
+
     #[test]
     fn rejects_sm75_even_at_level2() {
         let result = tier_b2_can_dispatch(&cfg(128, 75, 2));
@@ -254,6 +302,15 @@ mod tests {
         assert!(tier_b2_hybrid_backward_compile_time_eligible(&c));
     }
 
+    /// Sprint 9: hd=32 was previously rejected (UnsupportedHeadDim) by the SMEM
+    /// ladder. After adding the hd=32 row, the hybrid backward eligibility
+    /// follows the same predicate stack — must accept.
+    #[test]
+    fn compile_time_eligible_at_hd32() {
+        let c = hybrid_cfg(32, 1, 32, false, 80, 2);
+        assert!(tier_b2_hybrid_backward_compile_time_eligible(&c));
+    }
+
     #[test]
     fn compile_time_rejects_heads_gt_1() {
         let c = hybrid_cfg(64, 2, 64, false, 80, 2);
@@ -314,6 +371,7 @@ mod tests {
         // and seq_len != block_q, and verify the decomposition holds.
         let configs = [
             ("smoke",         hybrid_cfg(64,  1,  64, false, 80, 2)),
+            ("hd32",          hybrid_cfg(32,  1,  32, false, 80, 2)),
             ("hd128",         hybrid_cfg(128, 1, 128, false, 80, 2)),
             ("heads2",        hybrid_cfg(64,  2,  64, false, 80, 2)),
             ("active0",       hybrid_cfg(64,  0,  64, false, 80, 2)),
