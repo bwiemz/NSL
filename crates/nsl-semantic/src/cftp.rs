@@ -196,6 +196,109 @@ pub fn validate_pca_decorator(
 }
 
 // ---------------------------------------------------------------------------
+// G3: @fused_lm_ce decorator
+// ---------------------------------------------------------------------------
+
+/// Configuration extracted from a `@fused_lm_ce(...)` decorator on a `train`
+/// block.  Parsed by [`validate_fused_ce_decorator`].
+///
+/// v1 is OPT-IN ONLY.  No automatic substitution of `cross_entropy` happens
+/// unless this config is present with `enabled = true`.
+#[derive(Debug, Clone)]
+pub struct FusedCeConfig {
+    /// Whether the fused kernel is enabled for this train block.
+    pub enabled: bool,
+    /// Vocabulary tile size passed through to `FusedLinearCEConfig::vocab_tile`.
+    /// `None` → use the codegen default (1024).
+    pub vocab_tile: Option<u32>,
+    /// Source span of the decorator (for diagnostics).
+    pub span: Span,
+}
+
+/// Parse and validate a `@fused_lm_ce(enabled = true, vocab_tile = 1024)`
+/// decorator.
+///
+/// Mirrors the shape of [`validate_fase_decorator`] / [`validate_pca_decorator`].
+pub fn validate_fused_ce_decorator(
+    deco: &Decorator,
+    resolve_sym: &dyn Fn(Symbol) -> String,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Option<FusedCeConfig> {
+    let mut enabled = false;
+    let mut vocab_tile: Option<u32> = None;
+
+    if let Some(ref args) = deco.args {
+        for arg in args {
+            let Some(ref name_sym) = arg.name else {
+                diagnostics.push(
+                    Diagnostic::error(
+                        "@fused_lm_ce: positional arguments are not allowed".to_string(),
+                    )
+                    .with_label(arg.span, "expected `key = value`"),
+                );
+                continue;
+            };
+            let aname = resolve_sym(*name_sym);
+            match aname.as_str() {
+                "enabled" => match &arg.value.kind {
+                    ExprKind::BoolLiteral(b) => enabled = *b,
+                    _ => diagnostics.push(
+                        Diagnostic::error(
+                            "@fused_lm_ce: `enabled` must be a bool literal".to_string(),
+                        )
+                        .with_label(arg.span, "expected bool"),
+                    ),
+                },
+                "vocab_tile" => match &arg.value.kind {
+                    ExprKind::IntLiteral(n) => {
+                        if *n > 0 && *n <= 8192 && (n % 128 == 0) {
+                            vocab_tile = Some(*n as u32);
+                        } else if *n > 0 && *n <= 8192 {
+                            // Same invariant as FusedLinearCEConfig::validate:
+                            // the v1 kernel's inner fill is 128-thread-wide;
+                            // a non-128-aligned tile leaves the tail
+                            // uninitialised in smem and silently corrupts the
+                            // online-softmax reduction (see fused_linear_ce.rs).
+                            diagnostics.push(
+                                Diagnostic::error(format!(
+                                    "@fused_lm_ce: vocab_tile {n} must be a multiple of 128 \
+                                     (the v1 inner fill is 128-thread-wide; non-128-aligned \
+                                     tiles silently corrupt the online-softmax reduction)"
+                                ))
+                                .with_label(arg.span, "must be a multiple of 128"),
+                            );
+                        } else {
+                            diagnostics.push(
+                                Diagnostic::error(format!(
+                                    "@fused_lm_ce: vocab_tile {n} out of range [1, 8192]"
+                                ))
+                                .with_label(arg.span, "invalid vocab_tile"),
+                            );
+                        }
+                    }
+                    _ => diagnostics.push(
+                        Diagnostic::error(
+                            "@fused_lm_ce: `vocab_tile` must be an integer literal".to_string(),
+                        )
+                        .with_label(arg.span, "expected integer"),
+                    ),
+                },
+                _ => diagnostics.push(
+                    Diagnostic::error(format!("@fused_lm_ce: unknown argument '{aname}'"))
+                        .with_label(arg.span, "unknown argument"),
+                ),
+            }
+        }
+    }
+
+    Some(FusedCeConfig {
+        enabled,
+        vocab_tile,
+        span: deco.span,
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
