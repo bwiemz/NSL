@@ -56,6 +56,64 @@ fn xorshift_u01(state: &mut u64) -> f32 {
     ((r >> 40) as f32) * (1.0 / (1u32 << 24) as f32)
 }
 
+/// Raw-buffer quant: take `n` FP32 values and produce a blockwise INT8 buffer
+/// (data + scales) into `dst_bytes`. Used by `precision_cast::nsl_tensor_cast*`
+/// to lift the FP32 → INT8 path into the existing cast surface.
+pub fn quant_to_buffer(src: &[f32], dst_bytes: &mut [u8], stochastic: bool, rng_seed: u64) {
+    let n = src.len();
+    debug_assert_eq!(dst_bytes.len(), int8_blockwise_byte_size(n));
+    let scales_off = int8_blockwise_scales_offset(n);
+    let mut rng_state = rng_seed | 1;
+    let (int8_part, tail) = dst_bytes.split_at_mut(scales_off);
+    let int8_part = &mut int8_part[..n];
+    let n_blocks = n.div_ceil(INT8_BLOCK_SIZE);
+    let scale_part = unsafe {
+        std::slice::from_raw_parts_mut(tail.as_mut_ptr() as *mut f32, n_blocks)
+    };
+    let mut block_idx = 0usize;
+    for chunk_start in (0..n).step_by(INT8_BLOCK_SIZE) {
+        let chunk_end = (chunk_start + INT8_BLOCK_SIZE).min(n);
+        let block = &src[chunk_start..chunk_end];
+        let absmax = block_absmax(block);
+        let scale = if absmax > 0.0 { absmax / 127.0 } else { 1.0 };
+        scale_part[block_idx] = scale;
+        for (i, &v) in block.iter().enumerate() {
+            let scaled = v / scale;
+            let q = if stochastic {
+                let r = xorshift_u01(&mut rng_state);
+                (scaled + r).floor()
+            } else {
+                scaled.round()
+            };
+            int8_part[chunk_start + i] = q.clamp(-128.0, 127.0) as i8 as u8;
+        }
+        block_idx += 1;
+    }
+}
+
+/// Raw-buffer dequant: read a blockwise INT8 buffer and write FP32 values.
+pub fn dequant_to_buffer(src_bytes: &[u8], dst: &mut [f32]) {
+    let n = dst.len();
+    debug_assert_eq!(src_bytes.len(), int8_blockwise_byte_size(n));
+    let scales_off = int8_blockwise_scales_offset(n);
+    let scale_part = unsafe {
+        std::slice::from_raw_parts(
+            src_bytes.as_ptr().add(scales_off) as *const f32,
+            n.div_ceil(INT8_BLOCK_SIZE),
+        )
+    };
+    let int8_part = &src_bytes[..n];
+    let mut block_idx = 0usize;
+    for chunk_start in (0..n).step_by(INT8_BLOCK_SIZE) {
+        let chunk_end = (chunk_start + INT8_BLOCK_SIZE).min(n);
+        let scale = scale_part[block_idx];
+        for i in chunk_start..chunk_end {
+            dst[i] = (int8_part[i] as i8 as f32) * scale;
+        }
+        block_idx += 1;
+    }
+}
+
 /// Per-block absmax (symmetric quantization scale denominator).
 #[inline]
 fn block_absmax(block: &[f32]) -> f32 {

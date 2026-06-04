@@ -14,7 +14,7 @@ use std::ffi::c_void;
 use crate::memory::{checked_alloc, checked_alloc_zeroed};
 
 use super::{
-    f16_bits_to_f32, f32_to_f16_bits, NslTensor, DTYPE_F32, DTYPE_FP16,
+    f16_bits_to_f32, f32_to_f16_bits, int8_blockwise, NslTensor, DTYPE_F32, DTYPE_FP16, DTYPE_INT8,
 };
 
 /// Cast a tensor to `target_dtype`, returning a NEW owned tensor.
@@ -46,7 +46,15 @@ pub extern "C" fn nsl_tensor_cast(src_ptr: i64, target_dtype: i64) -> i64 {
             let d = unsafe { std::slice::from_raw_parts(t.data as *const u16, len) };
             d.iter().map(|&b| f16_bits_to_f32(b)).collect()
         }
-        other => panic!("nsl_tensor_cast: unsupported source dtype {other} (v1: F32/FP16)"),
+        DTYPE_INT8 => {
+            // CPDT §3.2 — INT8 blockwise source: read via int8_blockwise::dequant_to_buffer.
+            let bytes = int8_blockwise::int8_blockwise_byte_size(len);
+            let src_bytes = unsafe { std::slice::from_raw_parts(t.data as *const u8, bytes) };
+            let mut out = vec![0.0f32; len];
+            int8_blockwise::dequant_to_buffer(src_bytes, &mut out);
+            out
+        }
+        other => panic!("nsl_tensor_cast: unsupported source dtype {other}"),
     };
 
     let shape = NslTensor::copy_shape(t.shape, t.ndim);
@@ -67,7 +75,17 @@ pub extern "C" fn nsl_tensor_cast(src_ptr: i64, target_dtype: i64) -> i64 {
             }
             p as *mut c_void
         }
-        other => panic!("nsl_tensor_cast: unsupported target dtype {other} (v1: F32/FP16)"),
+        DTYPE_INT8 => {
+            // CPDT §3.2 — INT8 blockwise target: write via int8_blockwise::quant_to_buffer.
+            // Deterministic rounding for the bare-cast path; the stochastic
+            // variant lives at `nsl_tensor_quant_int8_blockwise`.
+            let bytes = int8_blockwise::int8_blockwise_byte_size(len);
+            let p = checked_alloc(bytes);
+            let buf = unsafe { std::slice::from_raw_parts_mut(p, bytes) };
+            int8_blockwise::quant_to_buffer(&src_f32, buf, false, len as u64);
+            p as *mut c_void
+        }
+        other => panic!("nsl_tensor_cast: unsupported target dtype {other}"),
     };
 
     let out = Box::new(NslTensor::new(
@@ -100,7 +118,14 @@ pub extern "C" fn nsl_tensor_cast_into(dst_ptr: i64, src_ptr: i64) {
             let d = unsafe { std::slice::from_raw_parts(src.data as *const u16, len) };
             d.iter().map(|&b| f16_bits_to_f32(b)).collect()
         }
-        other => panic!("nsl_tensor_cast_into: unsupported src dtype {other} (v1: F32/FP16)"),
+        DTYPE_INT8 => {
+            let bytes = int8_blockwise::int8_blockwise_byte_size(len);
+            let src_bytes = unsafe { std::slice::from_raw_parts(src.data as *const u8, bytes) };
+            let mut out = vec![0.0f32; len];
+            int8_blockwise::dequant_to_buffer(src_bytes, &mut out);
+            out
+        }
+        other => panic!("nsl_tensor_cast_into: unsupported src dtype {other}"),
     };
 
     match dst.dtype {
@@ -116,7 +141,16 @@ pub extern "C" fn nsl_tensor_cast_into(dst_ptr: i64, src_ptr: i64) {
                 unsafe { *p.add(i) = f32_to_f16_bits(v) };
             }
         }
-        other => panic!("nsl_tensor_cast_into: unsupported dst dtype {other} (v1: F32/FP16)"),
+        DTYPE_INT8 => {
+            // §3.2 in-place quant: overwrite dst's blockwise buffer with new
+            // INT8 values + scales. dst was allocated via
+            // nsl_tensor_zeros_like_dtype(DTYPE_INT8) so its buffer is sized
+            // for int8_blockwise_byte_size(len).
+            let bytes = int8_blockwise::int8_blockwise_byte_size(len);
+            let buf = unsafe { std::slice::from_raw_parts_mut(dst.data as *mut u8, bytes) };
+            int8_blockwise::quant_to_buffer(&src_f32, buf, false, len as u64);
+        }
+        other => panic!("nsl_tensor_cast_into: unsupported dst dtype {other}"),
     }
 }
 
@@ -146,11 +180,6 @@ pub extern "C" fn nsl_tensor_cast_into(dst_ptr: i64, src_ptr: i64) {
 pub extern "C" fn nsl_tensor_zeros_like_dtype(template_ptr: i64, dtype: i64) -> i64 {
     let t = unsafe { &*(template_ptr as *const NslTensor) };
     let dtype = dtype as u16;
-    let elem_size: usize = match dtype {
-        DTYPE_F32 => 4,
-        DTYPE_FP16 => 2,
-        other => panic!("nsl_tensor_zeros_like_dtype: unsupported dtype {other} (v1: F32=1, FP16=2)"),
-    };
 
     let ndim = t.ndim;
     let len = t.len;
@@ -159,8 +188,16 @@ pub extern "C" fn nsl_tensor_zeros_like_dtype(template_ptr: i64, dtype: i64) -> 
     let shape = NslTensor::copy_shape(t.shape, ndim);
     let strides = NslTensor::compute_strides(shape, ndim);
 
-    // Zero-fill: 0-bits == 0.0 for both f32 and FP16.
-    let data_size = (len as usize) * elem_size;
+    // Compute the data buffer size. INT8 blockwise needs scale storage too.
+    let data_size: usize = match dtype {
+        DTYPE_F32 => (len as usize) * 4,
+        DTYPE_FP16 => (len as usize) * 2,
+        DTYPE_INT8 => int8_blockwise::int8_blockwise_byte_size(len as usize),
+        other => panic!("nsl_tensor_zeros_like_dtype: unsupported dtype {other}"),
+    };
+    // Zero-fill is numerically zero for F32/FP16 (0-bits == 0.0). For INT8
+    // blockwise, zero values + zero scales decode as zero-FP32 — paper-
+    // faithful initial state for the optimizer-state buffer.
     let data = checked_alloc_zeroed(data_size) as *mut std::ffi::c_void;
 
     let tensor = Box::new(NslTensor::new(
@@ -357,5 +394,67 @@ mod tests {
         assert_eq!(got, vec![0.0_f32, 0.0]);
         crate::tensor::nsl_tensor_free(template);
         crate::tensor::nsl_tensor_free(z);
+    }
+
+    #[test]
+    fn cast_f32_to_int8_then_back_within_int8_precision() {
+        // CPDT §3.2: nsl_tensor_cast must now support DTYPE_INT8 as a target +
+        // source dtype (blockwise layout). Roundtrip error bounded by 1/127.
+        let vals: Vec<f32> = (0..64).map(|i| ((i as f32) / 64.0) * 2.0 - 1.0).collect();
+        let src = f32_tensor(&vals);
+        let int8 = nsl_tensor_cast(src, DTYPE_INT8 as i64);
+        assert_ne!(int8, 0);
+        let t = unsafe { &*(int8 as *const NslTensor) };
+        assert_eq!(t.dtype, DTYPE_INT8);
+        assert_eq!(t.len, 64);
+        let back = nsl_tensor_cast(int8, DTYPE_F32 as i64);
+        let got = read_f32(back);
+        for (a, b) in vals.iter().zip(got.iter()) {
+            assert!((a - b).abs() <= 1.0 / 127.0, "roundtrip {a} -> {b}");
+        }
+        crate::tensor::nsl_tensor_free(src);
+        crate::tensor::nsl_tensor_free(int8);
+        crate::tensor::nsl_tensor_free(back);
+    }
+
+    #[test]
+    fn cast_into_f32_to_int8_persistent_buffer() {
+        // Allocate a persistent INT8 blockwise buffer (zeros), then quant-store
+        // FP32 values into it in-place via cast_into — the §3.2 in-place
+        // "quant FP32 → INT8" half of the FASE-wrap pattern.
+        let template = f32_tensor(&vec![0.0_f32; 64]);
+        let dst_int8 = nsl_tensor_zeros_like_dtype(template, DTYPE_INT8 as i64);
+        let vals: Vec<f32> = (0..64).map(|i| ((i as f32) / 64.0) * 2.0 - 1.0).collect();
+        let src = f32_tensor(&vals);
+        nsl_tensor_cast_into(dst_int8, src);
+        // Read back via nsl_tensor_cast(int8 -> f32).
+        let back = nsl_tensor_cast(dst_int8, DTYPE_F32 as i64);
+        let got = read_f32(back);
+        for (a, b) in vals.iter().zip(got.iter()) {
+            assert!((a - b).abs() <= 1.0 / 127.0, "cast_into {a} -> {b}");
+        }
+        crate::tensor::nsl_tensor_free(template);
+        crate::tensor::nsl_tensor_free(src);
+        crate::tensor::nsl_tensor_free(back);
+        // dst_int8 was allocated via publish (scope-tracked) — free with explicit
+        // free to match the existing FP16 test pattern.
+        crate::tensor::nsl_tensor_free(dst_int8);
+    }
+
+    #[test]
+    fn zeros_like_dtype_int8_dequants_to_zero() {
+        let template = f32_tensor(&vec![7.0_f32; 64]);
+        let z = nsl_tensor_zeros_like_dtype(template, DTYPE_INT8 as i64);
+        let t = unsafe { &*(z as *const NslTensor) };
+        assert_eq!(t.dtype, DTYPE_INT8);
+        assert_eq!(t.len, 64);
+        let back = nsl_tensor_cast(z, DTYPE_F32 as i64);
+        let got = read_f32(back);
+        for v in &got {
+            assert_eq!(*v, 0.0);
+        }
+        crate::tensor::nsl_tensor_free(template);
+        crate::tensor::nsl_tensor_free(z);
+        crate::tensor::nsl_tensor_free(back);
     }
 }

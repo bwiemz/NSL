@@ -7,18 +7,32 @@
 
 use crate::cpdt_tier_apply::{OptimPrecision, ParamPrecision, PrecisionPlan};
 
-/// Runtime dtype codes (mirror `nsl-runtime` `DTYPE_*`: F32=1, FP16=2).
+/// Runtime dtype codes (mirror `nsl-runtime` `DTYPE_*`).
 pub const DTYPE_F32: u16 = 1;
 pub const DTYPE_FP16: u16 = 2;
+pub const DTYPE_INT8: u16 = 4;
 
-/// v1 clamp: map an optimizer-state precision to its v1 storage dtype.
-/// FP32 stays FP32; FP16 stays FP16; INT8 clamps to FP16 (v1 defers INT8).
-/// This is the SINGLE removal point for the INT8 ladder step.
+/// v1 clamp: map an optimizer-state precision to FP16 storage (Part II's FASE
+/// wrapping handles only F32/FP16). This is the Part II FP16 PATH — the runtime
+/// has INT8 blockwise ops now (§3.2 / Sprint 4), and the FASE-side cast wrapping
+/// to consume them is a separate follow-on.
 pub fn clamp_int8_to_fp16(p: OptimPrecision) -> u16 {
     match p {
         OptimPrecision::Fp32 => DTYPE_F32,
         OptimPrecision::Fp16 => DTYPE_FP16,
         OptimPrecision::Int8 => DTYPE_FP16,
+    }
+}
+
+/// Paper-faithful dtype mapping for `OptimPrecision`. FP32 → DTYPE_F32, FP16 →
+/// DTYPE_FP16, INT8 → DTYPE_INT8 (blockwise — runtime support shipped in §3.2).
+/// Use this when the consumer (cast wrapper / FASE step) actually handles INT8
+/// storage. `clamp_int8_to_fp16` remains the safe Part II default.
+pub fn dtype_for_precision_full(p: OptimPrecision) -> u16 {
+    match p {
+        OptimPrecision::Fp32 => DTYPE_F32,
+        OptimPrecision::Fp16 => DTYPE_FP16,
+        OptimPrecision::Int8 => DTYPE_INT8,
     }
 }
 
@@ -114,6 +128,26 @@ mod tests {
         assert_eq!(clamp_int8_to_fp16(OptimPrecision::Fp32), DTYPE_F32);
         assert_eq!(clamp_int8_to_fp16(OptimPrecision::Fp16), DTYPE_FP16);
         assert_eq!(clamp_int8_to_fp16(OptimPrecision::Int8), DTYPE_FP16);
+    }
+
+    #[test]
+    fn full_maps_int8_to_dtype_int8() {
+        // CPDT §3.2: runtime now supports INT8 blockwise storage (Sprint 4),
+        // so the paper-faithful dtype mapping returns DTYPE_INT8.
+        assert_eq!(dtype_for_precision_full(OptimPrecision::Fp32), DTYPE_F32);
+        assert_eq!(dtype_for_precision_full(OptimPrecision::Fp16), DTYPE_FP16);
+        assert_eq!(dtype_for_precision_full(OptimPrecision::Int8), DTYPE_INT8);
+    }
+
+    #[test]
+    fn full_and_clamp_differ_only_on_int8() {
+        for p in [OptimPrecision::Fp32, OptimPrecision::Fp16] {
+            assert_eq!(dtype_for_precision_full(p), clamp_int8_to_fp16(p));
+        }
+        assert_ne!(
+            dtype_for_precision_full(OptimPrecision::Int8),
+            clamp_int8_to_fp16(OptimPrecision::Int8),
+        );
     }
 
     #[test]
