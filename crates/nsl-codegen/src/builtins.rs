@@ -1229,6 +1229,52 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
         ],
         Some(types::I64),
     ),
+    // CFTP §4.4 G3 (Sprint 4): fused linear-CE FFI signatures.
+    // Forward v1 (small vocab, single CTA per row).
+    (
+        "nsl_fused_linear_ce_forward",
+        &[
+            types::I64, // ptx_ptr
+            types::I64, // kname_ptr
+            types::I64, types::I64, types::I64, types::I64, // x, W, bias, targets (raw device ptrs)
+            types::I64, types::I64, // loss_out, lse_out
+            types::I64, types::I64, types::I64, types::I64, // b, s, v, h
+            types::I64, // smem_bytes
+        ],
+        Some(types::I64),
+    ),
+    // Forward large-vocab (Sprint 3 two-kernel path, vocab > 8192).
+    (
+        "nsl_fused_linear_ce_forward_large",
+        &[
+            types::I64, // ptx_ptr
+            types::I64, // partials_kname_ptr
+            types::I64, // finalize_kname_ptr
+            types::I64, types::I64, types::I64, types::I64, // x, W, bias, targets
+            types::I64, // partials_ptr (caller-owned scratch)
+            types::I64, types::I64, // loss_out, lse_out
+            types::I64, types::I64, types::I64, types::I64, // b, s, v, h
+            types::I64, // num_tiles
+            types::I64, // smem_bytes
+        ],
+        Some(types::I64),
+    ),
+    // Backward (shared between v1 and large-vocab forward paths).
+    (
+        "nsl_fused_linear_ce_backward",
+        &[
+            types::I64, // ptx_ptr
+            types::I64, // kname_ptr
+            types::I64, // grad_output_bits (f32 bits packed into i64)
+            types::I64, types::I64, types::I64, types::I64, // x, W, bias, targets
+            types::I64, // lse_ptr
+            types::I64, types::I64, types::I64, // dx_out, dW_out, dbias_out
+            types::I64, types::I64, types::I64, types::I64, // b, s, v, h
+            types::I64, // num_valid
+            types::I64, // smem_bytes
+        ],
+        Some(types::I64),
+    ),
     // M42b: Quantized FlashAttention (KV-cache in INT8/FP8)
     (
         "nsl_flash_attention_quantized",

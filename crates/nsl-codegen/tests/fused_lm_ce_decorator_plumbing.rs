@@ -29,6 +29,10 @@ fn analysis_to_fused_ce_configs(
         .map(|c| FusedCeDecoratorConfig {
             enabled: c.enabled,
             vocab_tile: c.vocab_tile,
+            vocab_size: c.vocab_size,
+            hidden_size: c.hidden_size,
+            batch_size: c.batch_size,
+            seq_len: c.seq_len,
         })
         .collect()
 }

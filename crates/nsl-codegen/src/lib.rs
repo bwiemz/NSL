@@ -507,6 +507,20 @@ pub struct FusedCeDecoratorConfig {
     pub enabled: bool,
     /// `vocab_tile = N` override. `None` → codegen default.
     pub vocab_tile: Option<u32>,
+    /// CFTP §4.4 G3 (Sprint 4): `vocab_size = N` from the decorator.
+    /// Required at codegen time to bake `V` into the synthesised PTX.
+    /// `None` → the fused emitter falls back to the composite
+    /// `cross_entropy` lowering for this train block.
+    pub vocab_size: Option<u32>,
+    /// CFTP §4.4 G3 (Sprint 4): `hidden_size = N` from the decorator.
+    /// Required at codegen time to bake `H` into the synthesised PTX.
+    pub hidden_size: Option<u32>,
+    /// CFTP §4.4 G3 (Sprint 4): `batch_size = N` from the decorator.
+    /// Required at codegen time to size the per-row output buffers.
+    pub batch_size: Option<u32>,
+    /// CFTP §4.4 G3 (Sprint 4): `seq_len = N` from the decorator.
+    /// Required at codegen time to size the per-row output buffers.
+    pub seq_len: Option<u32>,
 }
 
 /// User-facing knob that gates how WGGO scores head importance.
