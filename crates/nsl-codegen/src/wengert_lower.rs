@@ -1348,7 +1348,7 @@ fn lower_single_op(
             vocab_tile,
             ignore_index,
             is_large,
-        } => return lower_fused_linear_ce_forward(
+        } => lower_fused_linear_ce_forward(
             compiler,
             builder,
             &inputs,
@@ -1372,7 +1372,7 @@ fn lower_single_op(
             seq_len,
             vocab_tile,
             ignore_index,
-        } => return lower_fused_linear_ce_backward_extract(
+        } => lower_fused_linear_ce_backward_extract(
             compiler,
             builder,
             &inputs,
@@ -3065,14 +3065,32 @@ mod tests {
             PrimalOp::Dropout { p: 0.1 },
             PrimalOp::Select,
             PrimalOp::Condition(CompareKind::Gt),
+            PrimalOp::FusedLinearCe {
+                vocab_size: 4096,
+                hidden_size: 128,
+                batch_size: 1,
+                seq_len: 1,
+                vocab_tile: 1024,
+                ignore_index: -100,
+                is_large: false,
+            },
+            PrimalOp::FusedLinearCeBackwardExtract {
+                component: 0,
+                vocab_size: 4096,
+                hidden_size: 128,
+                batch_size: 1,
+                seq_len: 1,
+                vocab_tile: 1024,
+                ignore_index: -100,
+            },
             PrimalOp::Input("x".into()),
             PrimalOp::Param("w".into()),
             PrimalOp::Constant(1.0),
         ];
-        // 53 variants total (including markers) — bumped by Gap D's
-        // FusedCshaBackward addition (on top of Gap C's
-        // CshaFusedBackwardExtract).
-        assert_eq!(ops.len(), 53);
+        // 55 variants total (including markers) — bumped by CFTP §4.4 G3
+        // (Sprint 4) FusedLinearCe + FusedLinearCeBackwardExtract on top of
+        // Gap D's FusedCshaBackward.
+        assert_eq!(ops.len(), 55);
     }
 
     #[test]
