@@ -419,7 +419,21 @@ struct PruneDeltaDoc {
 /// by lowest summed head-importance (authoritative — `plan.importance.heads` is always
 /// populated in prune mode), keeping `pruned_heads` group-aligned and exactly consistent
 /// with `chosen.n_heads`.
+///
+/// Joint mode: `apply_delta` compacts dropped layers out of the per-layer vectors, so
+/// `chosen.spec.n_heads[i]` is the i-th *surviving* layer, not the i-th baseline layer.
+/// We reconstruct the drop set from the prune_log accepted "layer" entries and build a
+/// baseline→chosen index map so surviving-layer head/FFN comparisons use the right slot.
 pub fn plan_to_prune_delta(plan: &CepPlan, baseline: &ModelSpec) -> PruneDelta {
+    // Collect accepted layer drops from the prune log (only populated by Joint mode).
+    let dropped_layers: std::collections::HashSet<u32> = plan
+        .outcome
+        .prune_log
+        .iter()
+        .filter(|s| s.kind == "layer" && s.accepted)
+        .map(|s| s.layer)
+        .collect();
+
     let chosen = plan.outcome.chosen.as_ref().map(|c| &c.spec);
 
     // Pre-index head importances by layer so per-group scoring is a small local scan
@@ -432,14 +446,39 @@ pub fn plan_to_prune_delta(plan: &CepPlan, baseline: &ModelSpec) -> PruneDelta {
         }
     }
 
+    // Map each baseline layer index to its compacted position in chosen.spec.
+    // Dropped layers map to None; surviving layers get a monotonically increasing index.
+    // For Prune mode (no drops) chosen_ci[l] == Some(l) for every l.
+    let mut chosen_ci: Vec<Option<usize>> = vec![None; baseline.n_layers as usize];
+    let mut ci = 0usize;
+    for l in 0..baseline.n_layers as usize {
+        if !dropped_layers.contains(&(l as u32)) {
+            chosen_ci[l] = Some(ci);
+            ci += 1;
+        }
+    }
+
     let mut per_layer = Vec::with_capacity(baseline.n_layers as usize);
     for l in 0..baseline.n_layers as usize {
+        // Layers dropped in joint mode: mark and skip head/FFN reconstruction.
+        if dropped_layers.contains(&(l as u32)) {
+            per_layer.push(LayerDelta {
+                layer: l as u32,
+                pruned_heads: Vec::new(),
+                new_d_ff: None,
+                drop_layer: true,
+            });
+            continue;
+        }
+
+        let ci = chosen_ci[l]; // compacted index into chosen.spec for this surviving layer
+
         let base_heads = baseline.n_heads[l];
         let base_kv = baseline.n_kv_heads[l].max(1);
         let group = (base_heads / base_kv).max(1);
 
-        let chosen_heads = chosen
-            .map(|c| c.n_heads.get(l).copied().unwrap_or(base_heads))
+        let chosen_heads = ci
+            .and_then(|i| chosen.and_then(|c| c.n_heads.get(i).copied()))
             .unwrap_or(base_heads);
         let n_drop_heads = base_heads.saturating_sub(chosen_heads);
         // The planner snaps n_heads to a group multiple, so the drop count is always a
@@ -480,8 +519,8 @@ pub fn plan_to_prune_delta(plan: &CepPlan, baseline: &ModelSpec) -> PruneDelta {
             pruned_heads.sort_unstable();
         }
 
-        let new_d_ff = chosen
-            .and_then(|c| c.d_ff.get(l).copied())
+        let new_d_ff = ci
+            .and_then(|i| chosen.and_then(|c| c.d_ff.get(i).copied()))
             .filter(|&w| w < baseline.d_ff[l]);
 
         per_layer.push(LayerDelta { layer: l as u32, pruned_heads, new_d_ff, drop_layer: false });
@@ -957,6 +996,78 @@ mod bridge_tests {
                     assert_eq!(h, g0 + i as u32, "layer {l}: group not contiguous");
                 }
             }
+        }
+    }
+
+    #[test]
+    fn plan_to_prune_delta_marks_dropped_layers_in_joint_mode() {
+        // Runs joint search with an aggressive target to force layer drops, then verifies
+        // that plan_to_prune_delta reflects those drops (drop_layer=true) and uses the
+        // correct compacted index into chosen.spec for surviving layers' head/FFN info.
+        let baseline = spec();
+        let input = CepPruneInput {
+            spec: baseline.clone(),
+            weights: None,
+            target: "H100-SXM",
+            constraints: crate::cep_search::Constraints {
+                peak_memory_bytes: u64::MAX,
+                latency_us: f64::MAX,
+                target_sparsity: 0.6,
+                preserve_layers: Vec::new(),
+            },
+            granularity: Granularity::HeadAndFfn,
+            roofline_slack: RooflineSlackTable::default(),
+        };
+        let plan = run_joint(input);
+
+        let dropped_in_log: std::collections::HashSet<u32> = plan
+            .outcome
+            .prune_log
+            .iter()
+            .filter(|s| s.kind == "layer" && s.accepted)
+            .map(|s| s.layer)
+            .collect();
+
+        // Only meaningful if the joint search actually dropped at least one layer.
+        assert!(
+            !dropped_in_log.is_empty(),
+            "no layer drops at target=0.6; test is vacuous — lower the target or raise the model"
+        );
+
+        let delta = plan_to_prune_delta(&plan, &baseline);
+
+        // Every accepted layer-drop in the log must have drop_layer=true in the delta.
+        for &l in &dropped_in_log {
+            let ld = delta.per_layer.iter().find(|d| d.layer == l).unwrap();
+            assert!(
+                ld.drop_layer,
+                "layer {l} was accepted as dropped in prune_log but delta has drop_layer=false"
+            );
+        }
+
+        // No extra layers should be marked dropped beyond what the log records.
+        let dropped_in_delta: std::collections::HashSet<u32> =
+            delta.per_layer.iter().filter(|d| d.drop_layer).map(|d| d.layer).collect();
+        assert_eq!(
+            dropped_in_delta, dropped_in_log,
+            "delta drop set does not exactly match prune_log accepted drops"
+        );
+
+        // Surviving layers: their head counts in delta must be consistent with baseline and
+        // chosen spec using the compacted index (not the original layer index).
+        let chosen = plan.outcome.chosen.as_ref().unwrap();
+        let surviving_baseline: Vec<usize> = (0..baseline.n_layers as usize)
+            .filter(|&l| !dropped_in_log.contains(&(l as u32)))
+            .collect();
+        for (ci, &bl) in surviving_baseline.iter().enumerate() {
+            let ld = &delta.per_layer[bl];
+            assert!(!ld.drop_layer);
+            let expected_heads = chosen.spec.n_heads[ci];
+            let actual_heads = baseline.n_heads[bl] - ld.pruned_heads.len() as u32;
+            assert_eq!(
+                actual_heads, expected_heads,
+                "layer {bl} (chosen idx {ci}): head count mismatch after delta"
+            );
         }
     }
 
