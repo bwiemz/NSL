@@ -274,6 +274,32 @@ fn dispatch_v2_refuses_null_experts_ptr() {
 }
 
 #[test]
+fn dispatch_v2_refuses_top_k_greater_than_one() {
+    // Gating-weight broadcast is a v2.next deferral; running v2 with
+    // top_k=2 would silently double-count each token in the gather.
+    // The refusal gate makes this fail-fast.
+    let tokens_ptr = make_f32_tensor(&[2, 3], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+    let logits_ptr = make_f32_tensor(&[2, 2], &[1.0, 0.5, 0.5, 1.0]);
+    let experts_ptr = make_f32_tensor(&[2, 9], &vec![0.1_f32; 18]);
+    let out_ptr = unsafe {
+        nsl_moe_dispatch_full_v2(
+            tokens_ptr, logits_ptr, experts_ptr,
+            2,
+            2, /* top_k > 1 */
+            (2.0_f32).to_bits() as i64,
+            3, 3,
+        )
+    };
+    assert_eq!(
+        out_ptr, 0,
+        "v2 must refuse top_k > 1 until gating-weight broadcast lands"
+    );
+    nsl_tensor_free(tokens_ptr);
+    nsl_tensor_free(logits_ptr);
+    nsl_tensor_free(experts_ptr);
+}
+
+#[test]
 fn dispatch_v2_refuses_wrong_experts_length() {
     let tokens_ptr = make_f32_tensor(&[2, 3], &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
     let logits_ptr = make_f32_tensor(&[2, 2], &[1.0, 0.0, 0.0, 1.0]);

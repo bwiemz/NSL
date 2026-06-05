@@ -36,6 +36,14 @@ pub fn derive_v2_dims(
     if router.shape[1] != num_experts {
         return None;
     }
+    // experts.shape[0] must also match num_experts. This is independent
+    // of the router check because router and experts could be sourced
+    // from different stages (e.g. only one was pruned, leaving them out
+    // of sync). Without this guard, a mismatch silently mis-indexes the
+    // packed expert blocks at runtime.
+    if experts.shape[0] != num_experts {
+        return None;
+    }
     let hidden = router.shape[0];
     let block_elems = experts.shape[1];
     if hidden == 0 || block_elems == 0 || !block_elems.is_multiple_of(hidden) {
@@ -201,6 +209,21 @@ mod tests {
             derive_v2_dims(&wm, "blocks.0", 4),
             None,
             "router.shape[1] != num_experts → refuse v2"
+        );
+    }
+
+    #[test]
+    fn derive_v2_dims_returns_none_when_experts_n_axis_mismatches() {
+        // Router and num_experts agree, but experts.shape[0] disagrees.
+        // Without this guard, a partially-pruned WeightMap would
+        // silently mis-index the packed expert blocks at runtime.
+        let mut wm = WeightMap::default();
+        wm.insert(make_weight("blocks.0.router.weight", vec![16, 4]));
+        wm.insert(make_weight("blocks.0.experts.weight", vec![6, 16 * 32]));
+        assert_eq!(
+            derive_v2_dims(&wm, "blocks.0", 4),
+            None,
+            "experts.shape[0] != num_experts → refuse v2 (router/experts out of sync)"
         );
     }
 

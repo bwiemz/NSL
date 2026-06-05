@@ -374,11 +374,16 @@ pub extern "C" fn nsl_moe_dispatch_full(
 /// REFUSALS (return 0 — caller MUST treat as compile-time error):
 ///   - experts_ptr == 0
 ///   - num_experts == 0
+///   - top_k != 1 — top_k > 1 would silently double-count each token's
+///     contributions in the gather (`gather_tokens` uses uniform 1.0
+///     weights regardless of top_k; gating-weight broadcast is a
+///     v2.next deferral). Fail-closed rather than silently miscompute.
 ///   - experts.dtype != tokens.dtype (mixed-dtype silent-corruption hazard)
 ///   - experts.len != num_experts * hidden_dim * intermediate_dim
 ///
-/// Deferrals (v2.next): bias, activation, down-proj, gating-weight broadcast,
-/// capacity overflow handling, GPU expert_parallel_matmul, FP16 experts.
+/// Deferrals (v2.next): bias, activation, down-proj, gating-weight
+/// broadcast + top_k > 1 support, capacity overflow handling,
+/// GPU expert_parallel_matmul, FP16 experts.
 #[no_mangle]
 pub extern "C" fn nsl_moe_dispatch_full_v2(
     tokens_ptr: i64,
@@ -396,6 +401,12 @@ pub extern "C" fn nsl_moe_dispatch_full_v2(
 
     // ── Refusal gates — return 0 (null) on bad input ────────────────────
     if experts_ptr == 0 || num_experts <= 0 || hidden_dim <= 0 || intermediate_dim <= 0 {
+        return 0;
+    }
+    // top_k > 1 silently double-counts each token's contribution in the
+    // gather (uniform 1.0 weights regardless of top_k; gating-weight
+    // broadcast is a v2.next deferral). Fail-closed.
+    if top_k != 1 {
         return 0;
     }
 

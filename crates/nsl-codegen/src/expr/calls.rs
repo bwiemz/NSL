@@ -1599,19 +1599,35 @@ impl Compiler<'_> {
             let logits_val = self.compile_expr(builder, state, &args[1].value)?;
             let experts_val = self.compile_expr(builder, state, &args[2].value)?;
 
-            // Look up MoE config by matching model name prefix from mangled function name.
-            // Also capture the matching key so we can scope the WeightMap lookup below
-            // identically to cpdt_expert_prune::prune_moe_weights_in_map.
+            // Look up MoE config by matching model name prefix from mangled
+            // function name. Also capture the matching key so we can scope
+            // the WeightMap lookup below identically to
+            // cpdt_expert_prune::prune_moe_weights_in_map.
+            //
+            // Multi-MoE caveat (review finding): when a model has multiple
+            // MoE blocks (`moe_configs` keys like "Block.moe1",
+            // "Block.moe2"), the substring `key.starts_with(model_prefix)`
+            // match collapses both onto the FIRST hit in HashMap iteration
+            // order — which is non-deterministic. v1 of Part III production-
+            // forward intentionally targets the single-MoE-per-class case;
+            // multi-MoE-per-class disambiguation is a v2.next deferral.
+            // To make multi-MoE failures LOUD rather than silent, we count
+            // candidate matches and refuse if more than one matches.
             let config_with_key = state
                 .current_function_name
                 .as_ref()
                 .and_then(|fn_name| {
                     let model_prefix = fn_name.split("__").next().unwrap_or("");
-                    self.features
+                    let candidates: Vec<_> = self
+                        .features
                         .moe_configs
                         .iter()
-                        .find(|(key, _)| key.starts_with(model_prefix))
-                        .map(|(key, info)| (key.clone(), info.clone()))
+                        .filter(|(key, _)| key.starts_with(model_prefix))
+                        .collect();
+                    match candidates.as_slice() {
+                        [(key, info)] => Some(((*key).clone(), (*info).clone())),
+                        _ => None, // 0 or >=2 matches → fall through to single-config fallback or None
+                    }
                 })
                 .or_else(|| {
                     // Fallback: if only one MoE config exists, use it
