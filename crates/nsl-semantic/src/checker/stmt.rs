@@ -895,6 +895,59 @@ impl<'a> TypeChecker<'a> {
                             }
                         }
 
+                        if dname == "attention_sink" {
+                            // Sprint 2 cycle-4 (paper §4.3 attention sinks):
+                            // companion decorator on an @flash_attention fn.
+                            // v0 API surface: extracts `tokens=N` (positive
+                            // integer literal) into `FlashAttentionConfig::
+                            // num_sink_tokens`. The SMEM-layout codegen that
+                            // actually pins the first N tokens is DEFERRED to
+                            // a future sprint — until then, the field is
+                            // wired through the pipeline but the kernel does
+                            // not emit any sink-specific PTX.
+                            //
+                            // Mirrors @paged_kv 'block_size' arg validation:
+                            //   - companion-required on @flash_attention,
+                            //   - unknown args rejected,
+                            //   - 'tokens' must be a positive integer literal.
+                            let has_flash = decorators.iter().any(|d| {
+                                d.name.len() == 1 && self.interner.resolve(d.name[0].0).unwrap_or("") == "flash_attention"
+                            });
+                            if !has_flash {
+                                self.diagnostics.push(
+                                    Diagnostic::error("@attention_sink requires @flash_attention on the same function")
+                                        .with_label(deco.span, "missing @flash_attention")
+                                );
+                            }
+                            if let Some(ref args) = deco.args {
+                                for arg in args {
+                                    if let Some(ref name_sym) = arg.name {
+                                        let aname = self.interner.resolve(name_sym.0).unwrap_or("").to_string();
+                                        if aname == "tokens" {
+                                            if let ExprKind::IntLiteral(n) = &arg.value.kind {
+                                                if *n <= 0 {
+                                                    self.diagnostics.push(
+                                                        Diagnostic::error("@attention_sink 'tokens' must be a positive integer")
+                                                            .with_label(arg.span, "must be > 0")
+                                                    );
+                                                }
+                                            } else {
+                                                self.diagnostics.push(
+                                                    Diagnostic::error("@attention_sink 'tokens' argument must be an integer literal")
+                                                        .with_label(arg.span, "expected integer")
+                                                );
+                                            }
+                                        } else {
+                                            self.diagnostics.push(
+                                                Diagnostic::error(format!("@attention_sink unknown argument '{}' at function scope (only 'tokens' is recognised here)", aname))
+                                                    .with_label(arg.span, "unknown argument")
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
                         if dname == "autotune" {
                             match &stmt.kind {
                                 StmtKind::KernelDef(_) => {

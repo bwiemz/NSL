@@ -284,6 +284,7 @@ fn emit_fused_produces_launch_op_plus_seven_extracts() {
         rope_style: RopeStyle::HalfSplit,
         gqa_group_size: 1,
         tree_mask: false,
+        num_sink_tokens: 0,
         gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras {
             level: 1,
             fused_projections: true,
@@ -478,6 +479,7 @@ fn gap_i2_launch_op_survives_dead_grad_elim_in_generated_adjoint() {
         rope_style: RopeStyle::HalfSplit,
         gqa_group_size: 1,
         tree_mask: false,
+        num_sink_tokens: 0,
         gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras {
             level: 1,
             fused_projections: false,
@@ -743,6 +745,7 @@ fn gap_d1_adjoint_routing_populates_correct_varids() {
         rope_style: RopeStyle::HalfSplit,
         gqa_group_size: 1,
         tree_mask: false,
+        num_sink_tokens: 0,
         gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras {
             level: 1,
             fused_projections: true,
@@ -1094,6 +1097,7 @@ fn gap_i4_launch_inputs_thread_weight_and_norm_pointers() {
         rope_style: RopeStyle::HalfSplit,
         gqa_group_size: 1,
         tree_mask: false,
+        num_sink_tokens: 0,
         gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras {
             level: 1,
             fused_projections: true,
@@ -1234,6 +1238,7 @@ fn gap_i4_launch_inputs_pass_null_for_none_norm_weight() {
         rope_style: RopeStyle::HalfSplit,
         gqa_group_size: 1,
         tree_mask: false,
+        num_sink_tokens: 0,
         gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras {
             level: 1,
             fused_projections: true,
@@ -1381,6 +1386,7 @@ fn gap_i_step_k_dgamma_accumulates_into_gamma_adjoint() {
         rope_style: RopeStyle::HalfSplit,
         gqa_group_size: 1,
         tree_mask: false,
+        num_sink_tokens: 0,
         segment_masked: false,
         gpu_sm: 75,
         csha: Some(CshaExtras {

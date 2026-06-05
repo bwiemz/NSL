@@ -7,7 +7,7 @@ fn emit_save_softmax_state_fires_hbm_save_under_save_activations_without_fused()
         block_q: 32, block_kv: 32, head_dim: 32,
         causal: false, paged: false, rope_q: false,
         rope_style: RopeStyle::HalfSplit, gqa_group_size: 1,
-        tree_mask: false, segment_masked: false, gpu_sm: 89,
+        tree_mask: false, num_sink_tokens: 0, segment_masked: false, gpu_sm: 89,
         csha: Some(CshaExtras {
             level: 1,
             fused_projections: false,

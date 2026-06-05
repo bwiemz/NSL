@@ -4,7 +4,7 @@ use nsl_codegen::flash_attention_v2::tier_b2::dispatch::tier_b2_hybrid_backward_
 fn cfg(hd: i64, heads: u32, d_model: u32, rope: bool) -> FlashAttentionConfig {
     FlashAttentionConfig {
         block_q: 64, block_kv: 64, head_dim: hd, causal: true, paged: false,
-        rope_q: rope, rope_style: RopeStyle::HalfSplit, gqa_group_size: 1, tree_mask: false,
+        rope_q: rope, rope_style: RopeStyle::HalfSplit, gqa_group_size: 1, tree_mask: false, num_sink_tokens: 0,
         gpu_sm: 80, segment_masked: false,
         csha: Some(CshaExtras { level: 2, d_model, active_heads: heads, ..Default::default() }),
     }

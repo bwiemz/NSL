@@ -40,7 +40,7 @@ fn backward_over_budget_config() -> FlashAttentionConfig {
         block_q: 64, block_kv: 64, head_dim: 64,
         causal: false, paged: false, rope_q: false,
         rope_style: RopeStyle::HalfSplit,
-        gqa_group_size: 1, tree_mask: false, gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras {
+        gqa_group_size: 1, tree_mask: false, num_sink_tokens: 0, gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras {
             fused_projections: true,
             save_activations_for_backward: true,
             d_model: 64,
@@ -227,7 +227,7 @@ fn ad_dispatcher_stays_single_emission_on_fused_accept() {
         block_q: 32, block_kv: 32, head_dim: 32,
         causal: false, paged: false, rope_q: false,
         rope_style: RopeStyle::HalfSplit,
-        gqa_group_size: 1, tree_mask: false, gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras {
+        gqa_group_size: 1, tree_mask: false, num_sink_tokens: 0, gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras {
             fused_projections: true,
             save_activations_for_backward: true,
             d_model: 32,

@@ -464,3 +464,57 @@ pub fn flash_paged_kv_context_for_source(
         None => (false, None, None, false),
     }
 }
+
+/// Sprint 2 cycle-4 (paper §4.3 attention sinks) observation helper: does
+/// the `@attention_sink(tokens=N)` decorator on an `@flash_attention` fn
+/// reach `FlashAttentionConfig::num_sink_tokens`?
+///
+/// Returns `(context_set, num_sink_tokens_flag)`:
+/// - `context_set`           — `true` iff a compile context was built
+///                             (proof the extraction site ran at all).
+/// - `num_sink_tokens_flag`  — `Some(ctx.config.num_sink_tokens)`; the
+///                             load-bearing end-to-end thread.
+///
+/// IMPORTANT — v0 API surface only:
+/// This helper INTENTIONALLY does NOT probe the synthesized PTX. The
+/// `num_sink_tokens` field is wired through the decorator-extraction
+/// loop into `FlashAttentionConfig`, but the SMEM-layout codegen that
+/// would actually materialize the sink cache (paper §4.3 Phase 5 v1)
+/// is DEFERRED to a future sprint. Until that lands, the kernel emits
+/// no sink-specific PTX — probing for a sink register would be either
+/// a false positive (matching unrelated text) or a guaranteed false
+/// negative. The integration test pins decorator → config wiring only,
+/// per the explicit cycle-4 Sprint 2 scope.
+///
+/// When the SMEM emission lands, EXTEND this helper to return a 3-tuple
+/// adding a `ptx_contains_sink_register: bool` field, and update the
+/// integration test to assert it (mirrors the cycle-3 Sprint 1 review-fix
+/// pattern in commit `0a987a73` — params unconditional, register loads
+/// gated on the flag).
+pub fn flash_attention_sink_context_for_source(
+    src: &str,
+) -> (bool, Option<u32>) {
+    use nsl_errors::FileId;
+
+    let mut interner = Interner::new();
+    let (tokens, _lex_diags) = nsl_lexer::tokenize(src, FileId(0), &mut interner);
+    let parsed = nsl_parser::parse(&tokens, &mut interner);
+    let stmts = parsed.module.stmts.clone();
+    let type_map: TypeMap = TypeMap::new();
+    let opts = crate::CompileOptions {
+        target: "sm_80".to_string(),
+        ..Default::default()
+    };
+
+    let mut compiler = crate::compiler::Compiler::new(&interner, &type_map, &opts)
+        .expect("Compiler::new failed in flash_attention_sink_context_for_source");
+
+    compiler
+        .compile_flash_attention_kernels(&stmts)
+        .expect("compile_flash_attention_kernels failed in flash_attention_sink_context_for_source");
+
+    match compiler.kernels.flash_attention_context {
+        Some(ctx) => (true, Some(ctx.config.num_sink_tokens)),
+        None => (false, None),
+    }
+}

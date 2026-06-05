@@ -37,7 +37,7 @@ fn skip_writeback_emits_when_feature_enabled() {
         block_q: 64, block_kv: 64, head_dim: 64,
         causal: true, paged: false, rope_q: true,
         rope_style: RopeStyle::HalfSplit, gqa_group_size: 2,
-        tree_mask: false, gpu_sm: 120, segment_masked: true, csha: None,
+        tree_mask: false, num_sink_tokens: 0, gpu_sm: 120, segment_masked: true, csha: None,
     };
     let mut ptx = String::new();
     emit_skip_decision_writeback(

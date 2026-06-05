@@ -1,0 +1,18 @@
+# Sprint 2 cycle-4 fixture (paper §4.3 attention sinks API surface v0).
+#
+# Pins the decorator-to-config wiring: `@attention_sink(tokens=4)`
+# alongside `@flash_attention` must reach
+# `FlashAttentionConfig::num_sink_tokens=4`.
+#
+# v0 scope: NO PTX assertion is made — the SMEM cache materialization
+# that paper §4.3 describes is DEFERRED to a future sprint. The
+# integration test pins decorator → config wiring ONLY.
+#
+# Body is intentionally trivial — the integration test only inspects the
+# compile context's `num_sink_tokens` field, which does not depend on
+# the function body.
+
+@flash_attention
+@attention_sink(tokens=4)
+fn forward():
+    pass

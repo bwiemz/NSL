@@ -10,7 +10,7 @@ fn canonical_cfg() -> FlashAttentionConfig {
         block_q: 64, block_kv: 64, head_dim: 32,
         causal: false, paged: false,
         rope_q: false, rope_style: RopeStyle::HalfSplit,
-        gqa_group_size: 1, tree_mask: false,
+        gqa_group_size: 1, tree_mask: false, num_sink_tokens: 0,
         gpu_sm: 80, segment_masked: false,
         csha: Some(CshaExtras { level: 2, ..Default::default() }),
     }

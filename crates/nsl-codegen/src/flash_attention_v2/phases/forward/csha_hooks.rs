@@ -1516,6 +1516,7 @@ mod tests {
             rope_style: RopeStyle::HalfSplit,
             gqa_group_size: 1,
             tree_mask: false,
+            num_sink_tokens: 0,
             gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras { fused_projections: true, d_model: 128, ..CshaExtras::default() }),
         }
     }
@@ -1532,6 +1533,7 @@ mod tests {
             rope_style: RopeStyle::Adjacent,  // emit_rope_pair_sweep implements Adjacent (x[2i], x[2i+1])
             gqa_group_size: 1,
             tree_mask: false,
+            num_sink_tokens: 0,
             gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras { fused_projections: true, d_model: 128, ..CshaExtras::default() }),
         }
     }
@@ -1707,6 +1709,7 @@ mod tests {
             rope_style: RopeStyle::HalfSplit,
             gqa_group_size: 1,
             tree_mask: false,
+            num_sink_tokens: 0,
             gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras {
                 fused_projections: true,
                 fused_output_proj: true,
@@ -1865,6 +1868,7 @@ mod tests {
             rope_style: RopeStyle::HalfSplit,
             gqa_group_size: 1,
             tree_mask: false,
+            num_sink_tokens: 0,
             gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras {
                 fused_projections: true,
                 save_activations_for_backward: true,
@@ -1902,7 +1906,7 @@ mod tests {
             block_q: 32, block_kv: 32, head_dim: 32,
             causal: false, paged: false, rope_q: false,
             rope_style: RopeStyle::HalfSplit, gqa_group_size: 1,
-            tree_mask: false, gpu_sm: 75, segment_masked: false,
+            tree_mask: false, num_sink_tokens: 0, gpu_sm: 75, segment_masked: false,
             csha: Some(CshaExtras {
                 fused_projections: false,
                 save_activations_for_backward: true,
@@ -1931,7 +1935,7 @@ mod tests {
             block_q: 32, block_kv: 32, head_dim: 32,
             causal: false, paged: false, rope_q: false,
             rope_style: RopeStyle::HalfSplit, gqa_group_size: 1,
-            tree_mask: false, gpu_sm: 75, segment_masked: false,
+            tree_mask: false, num_sink_tokens: 0, gpu_sm: 75, segment_masked: false,
             csha: Some(CshaExtras {
                 fused_projections: false,
                 save_activations_for_backward: true,
@@ -1973,7 +1977,7 @@ mod tests {
             block_q: 32, block_kv: 32, head_dim: 32,
             causal: false, paged: false, rope_q: false,
             rope_style: RopeStyle::HalfSplit, gqa_group_size: 1,
-            tree_mask: false, gpu_sm: 75, segment_masked: false,
+            tree_mask: false, num_sink_tokens: 0, gpu_sm: 75, segment_masked: false,
             csha: Some(CshaExtras {
                 fused_projections: false,
                 save_activations_for_backward: true,
@@ -2001,7 +2005,7 @@ mod tests {
             block_q: 32, block_kv: 32, head_dim: 32,
             causal: false, paged: false, rope_q: false,
             rope_style: RopeStyle::HalfSplit, gqa_group_size: 1,
-            tree_mask: false, gpu_sm: 75, segment_masked: false,
+            tree_mask: false, num_sink_tokens: 0, gpu_sm: 75, segment_masked: false,
             csha: Some(CshaExtras {
                 fused_projections: false,
                 save_activations_for_backward: true,
@@ -2028,7 +2032,7 @@ mod tests {
             block_q: 32, block_kv: 32, head_dim: 32,
             causal: false, paged: false, rope_q: false,
             rope_style: RopeStyle::HalfSplit, gqa_group_size: 1,
-            tree_mask: false, gpu_sm: 75, segment_masked: false,
+            tree_mask: false, num_sink_tokens: 0, gpu_sm: 75, segment_masked: false,
             csha: Some(CshaExtras {
                 fused_projections: false,
                 save_activations_for_backward: true,
@@ -2058,7 +2062,7 @@ mod tests {
             block_q: 32, block_kv: 32, head_dim: 32,
             causal: false, paged: false, rope_q: false,
             rope_style: RopeStyle::HalfSplit, gqa_group_size: 1,
-            tree_mask: false, gpu_sm: 75, segment_masked: false,
+            tree_mask: false, num_sink_tokens: 0, gpu_sm: 75, segment_masked: false,
             csha: Some(CshaExtras {
                 fused_projections: false,
                 save_activations_for_backward: true,
@@ -2090,7 +2094,7 @@ mod tests {
             block_q: 32, block_kv: 32, head_dim: 32,
             causal: false, paged: false, rope_q: false,
             rope_style: RopeStyle::HalfSplit, gqa_group_size: 1,
-            tree_mask: false, gpu_sm: 75, segment_masked: false,
+            tree_mask: false, num_sink_tokens: 0, gpu_sm: 75, segment_masked: false,
             csha: Some(CshaExtras {
                 fused_projections: false,
                 save_activations_for_backward: true,
@@ -2117,7 +2121,7 @@ mod tests {
             block_q: 32, block_kv: 32, head_dim: 32,
             causal: false, paged: false, rope_q: false,
             rope_style: RopeStyle::HalfSplit, gqa_group_size: 1,
-            tree_mask: false, gpu_sm: 75, segment_masked: false,
+            tree_mask: false, num_sink_tokens: 0, gpu_sm: 75, segment_masked: false,
             csha: Some(CshaExtras {
                 fused_projections: false,
                 save_activations_for_backward: true,
@@ -2149,6 +2153,7 @@ mod tests {
             rope_style: RopeStyle::HalfSplit,
             gqa_group_size: 1,
             tree_mask: false,
+            num_sink_tokens: 0,
             gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras {
                 fused_projections: true,
                 save_activations_for_backward: false,

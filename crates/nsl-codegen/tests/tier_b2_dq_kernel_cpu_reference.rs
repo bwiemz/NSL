@@ -132,6 +132,7 @@ fn canonical_hd32_cfg() -> FlashAttentionConfig {
         rope_style: RopeStyle::HalfSplit,
         gqa_group_size: 1,
         tree_mask: false,
+        num_sink_tokens: 0,
         gpu_sm: 80,
         segment_masked: false,
         // d_model=128 matches the T2.7 reference (tier_b1_save_activations_gpu)
@@ -153,6 +154,7 @@ fn cfg(bq: i64, hd: i64) -> FlashAttentionConfig {
         rope_style: RopeStyle::HalfSplit,
         gqa_group_size: 1,
         tree_mask: false,
+        num_sink_tokens: 0,
         gpu_sm: 80,
         segment_masked: false,
         // d_model=128 matches the T2.7 reference (tier_b1_save_activations_gpu)
@@ -268,6 +270,7 @@ fn tier_b2_d_prepass_grid_dispatch_and_hd_sweep() {
             rope_style: RopeStyle::HalfSplit,
             gqa_group_size: 1,
             tree_mask: false,
+            num_sink_tokens: 0,
             gpu_sm: 80,
             segment_masked: false,
             csha: Some(CshaExtras { level: 2, ..Default::default() }),

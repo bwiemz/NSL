@@ -636,6 +636,7 @@ fn tier_b_test_fixture() -> nsl_codegen::flash_attention::FlashAttentionConfig {
         rope_style: nsl_codegen::flash_attention::RopeStyle::HalfSplit,
         gqa_group_size: 2,
         tree_mask: false,
+        num_sink_tokens: 0,
         gpu_sm: 120,
         segment_masked: true,
         csha: None,

@@ -953,6 +953,13 @@ impl Compiler<'_> {
         // runtime dispatch picks the tree_mask kernel. v1 is a bare decorator;
         // any args are rejected (mirrors `@paged_kv` block_size validation).
         let mut tree_mask = false;
+        // Paper §4.3: attention sinks. Number of always-attended initial
+        // tokens for streaming attention with rolling KV cache. v0 API
+        // surface (Sprint 2 cycle-4): the decorator + config field are
+        // wired end-to-end, but the SMEM-layout codegen that would
+        // materialize the sink cache is DEFERRED to a future sprint.
+        // `0` is the sentinel for "sinks disabled".
+        let mut num_sink_tokens: u32 = 0;
         // DOC-GAP F.2: optional `head_dim` argument on `@flash_attention`.
         // Default 64 matches historical behaviour; set explicitly via
         // `@flash_attention(head_dim=32)` to pick a config that fits the
@@ -1070,6 +1077,32 @@ impl Compiler<'_> {
                     }
                     tree_mask = true;
                 }
+                "attention_sink" => {
+                    // Sprint 2 cycle-4 paper §4.3 API-surface landing.
+                    // v0: extract `tokens=N` arg into `config.num_sink_tokens`;
+                    // the SMEM cache emission that would actually pin the
+                    // first N tokens is DEFERRED to a future sprint.
+                    // Semantic validation (`stmt.rs`) catches negative /
+                    // zero / non-literal / unknown-arg cases up front,
+                    // so this loop only handles the happy path.
+                    if let Some(ref args) = deco.args {
+                        for arg in args {
+                            if let Some(ref name_sym) = arg.name {
+                                let aname = self
+                                    .interner
+                                    .resolve(name_sym.0)
+                                    .unwrap_or("");
+                                if aname == "tokens" {
+                                    if let ExprKind::IntLiteral(n) = &arg.value.kind {
+                                        if *n > 0 {
+                                            num_sink_tokens = *n as u32;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 _ => {}
             }
         }
@@ -1145,6 +1178,7 @@ impl Compiler<'_> {
                     rope_style,
                     gqa_group_size,
                     tree_mask,
+                    num_sink_tokens,
                     gpu_sm: parse_gpu_sm_from_target(&self.compile_options.target),
                     segment_masked: false,
                     csha: None,
@@ -1224,6 +1258,7 @@ impl Compiler<'_> {
                 rope_style,
                 gqa_group_size,
                 tree_mask,
+                num_sink_tokens,
                 gpu_sm: parse_gpu_sm_from_target(&self.compile_options.target),
                 segment_masked: false,
                 csha: None,
@@ -1331,6 +1366,7 @@ impl Compiler<'_> {
                 rope_style,
                 gqa_group_size,
                 tree_mask,
+                num_sink_tokens,
                 gpu_sm: parse_gpu_sm_from_target(&self.compile_options.target),
                 segment_masked: false,
                 csha: None,

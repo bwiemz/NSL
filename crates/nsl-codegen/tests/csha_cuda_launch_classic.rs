@@ -243,6 +243,7 @@ fn run_flash_attention_and_measure(
         rope_style: RopeStyle::HalfSplit,
         gqa_group_size: 1,
         tree_mask: false,
+        num_sink_tokens: 0,
         gpu_sm: 75, segment_masked: false, csha: None,
     };
 
@@ -382,6 +383,7 @@ fn run_classic_numerical_case(block_q: usize, block_kv: usize, head_dim: usize, 
         rope_style: RopeStyle::HalfSplit,
         gqa_group_size: 1,
         tree_mask: false,
+        num_sink_tokens: 0,
         gpu_sm: 75, segment_masked: false, csha: None,
     };
     assert_eq!(

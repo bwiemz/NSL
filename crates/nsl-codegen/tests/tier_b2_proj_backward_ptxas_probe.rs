@@ -24,6 +24,7 @@ fn cfg(hd: i64, bq: i64, d_model: u32) -> FlashAttentionConfig {
         rope_style: RopeStyle::HalfSplit,
         gqa_group_size: 1,
         tree_mask: false,
+        num_sink_tokens: 0,
         gpu_sm: 80,
         segment_masked: false,
         csha: Some(CshaExtras {

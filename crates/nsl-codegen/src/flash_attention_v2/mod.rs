@@ -1248,7 +1248,7 @@ mod backward_orchestrator_tests {
             block_q, block_kv, head_dim,
             causal: false, paged: false, rope_q: true,
             rope_style: RopeStyle::Adjacent,
-            gqa_group_size: 1, tree_mask: false, gpu_sm: 75,
+            gqa_group_size: 1, tree_mask: false, num_sink_tokens: 0, gpu_sm: 75,
             segment_masked: false,
             csha: Some(CshaExtras {
                 fused_projections: true,
@@ -1354,7 +1354,7 @@ mod backward_orchestrator_tests {
             block_q: 32, block_kv: 32, head_dim: 32,
             causal: false, paged: false, rope_q: false,
             rope_style: RopeStyle::Adjacent,
-            gqa_group_size: 1, tree_mask: false, gpu_sm: 75,
+            gqa_group_size: 1, tree_mask: false, num_sink_tokens: 0, gpu_sm: 75,
             segment_masked: false,
             csha: None,
         };
@@ -1445,7 +1445,7 @@ mod backward_orchestrator_tests {
             block_q: 32, block_kv: 32, head_dim: 64,
             causal: true, paged: false,
             rope_q: false, rope_style: RopeStyle::HalfSplit,
-            gqa_group_size: 1, tree_mask: false,
+            gqa_group_size: 1, tree_mask: false, num_sink_tokens: 0,
             gpu_sm: 80, segment_masked: false,
             csha: Some(CshaExtras { level: 2, ..Default::default() }),
         };
@@ -1475,7 +1475,7 @@ mod backward_orchestrator_tests {
             block_q: 32, block_kv: 32, head_dim: 32,
             causal: false, paged: false, rope_q: false,
             rope_style: RopeStyle::HalfSplit,
-            gqa_group_size: gqa, tree_mask: false, gpu_sm: 75,
+            gqa_group_size: gqa, tree_mask: false, num_sink_tokens: 0, gpu_sm: 75,
             segment_masked: false,
             csha: None,
         }

@@ -190,6 +190,7 @@ fn fixture_config(segment_masked: bool) -> FlashAttentionConfig {
         rope_style:    RopeStyle::HalfSplit,
         gqa_group_size: 1,
         tree_mask:     false,
+        num_sink_tokens: 0,
         gpu_sm:        75,
         segment_masked,
         csha:          None,

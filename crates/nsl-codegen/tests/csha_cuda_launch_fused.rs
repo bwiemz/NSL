@@ -262,6 +262,7 @@ fn run_fused_config_dmodel(
         rope_style:      RopeStyle::HalfSplit,
         gqa_group_size:  1,
         tree_mask:       false,
+        num_sink_tokens: 0,
         gpu_sm:          75, segment_masked: false, csha: Some(CshaExtras {
             level:             2,
             fused_rmsnorm:     true,
@@ -587,7 +588,7 @@ fn fused_csha_32x32x32_heads4_nocausal() {
         block_q: 32, block_kv: 32, head_dim: 32,
         causal: false, paged: false, rope_q: false,
         rope_style: RopeStyle::HalfSplit, gqa_group_size: 1,
-        tree_mask: false, gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras {
+        tree_mask: false, num_sink_tokens: 0, gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras {
             level: 2, fused_rmsnorm: true, fused_projections: true,
             fused_output_proj: false, active_heads: 4,
             rmsnorm_eps: 1e-5, d_model: 32,
@@ -778,7 +779,7 @@ fn run_with_saves(
         block_q: block_q as i64, block_kv: block_kv as i64, head_dim: hd as i64,
         causal, paged: false, rope_q,
         rope_style: RopeStyle::HalfSplit,
-        gqa_group_size: 1, tree_mask: false, gpu_sm: 75, segment_masked, csha: Some(CshaExtras {
+        gqa_group_size: 1, tree_mask: false, num_sink_tokens: 0, gpu_sm: 75, segment_masked, csha: Some(CshaExtras {
             level: 2,
             fused_rmsnorm: true,
             fused_projections: true,
@@ -1143,7 +1144,7 @@ fn t4_csha_backward_ffi_smoke() {
         block_q, block_kv, head_dim,
         causal: false, paged: false, rope_q: false,
         rope_style: RopeStyle::HalfSplit,
-        gqa_group_size: 1, tree_mask: false, gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras {
+        gqa_group_size: 1, tree_mask: false, num_sink_tokens: 0, gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras {
             level: 2, fused_rmsnorm: true, fused_projections: true,
             fused_output_proj: false,
             save_activations_for_backward: true,

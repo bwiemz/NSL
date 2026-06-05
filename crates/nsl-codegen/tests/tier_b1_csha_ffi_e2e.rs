@@ -93,6 +93,7 @@ fn canonical_config() -> FlashAttentionConfig {
         rope_style: RopeStyle::HalfSplit,
         gqa_group_size: 1,
         tree_mask: false,
+        num_sink_tokens: 0,
         gpu_sm: 120,
         segment_masked: false,
         csha: Some(CshaExtras {

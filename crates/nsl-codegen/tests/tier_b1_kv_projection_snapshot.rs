@@ -25,6 +25,7 @@ fn canonical_config(bq: i64, bkv: i64, hd: i64, dm: u32) -> FlashAttentionConfig
         rope_style: RopeStyle::HalfSplit,
         gqa_group_size: 1,
         tree_mask: false,
+        num_sink_tokens: 0,
         gpu_sm: 120,
         segment_masked: false,
         csha: Some(CshaExtras {

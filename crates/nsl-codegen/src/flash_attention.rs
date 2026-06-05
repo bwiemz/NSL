@@ -150,6 +150,17 @@ pub struct FlashAttentionConfig {
     pub gqa_group_size: u32,
     /// M33: Whether this attention uses a tree-structured causal mask for speculative decoding.
     pub tree_mask: bool,
+    /// Paper §4.3: attention sinks. Number of always-attended initial
+    /// tokens (typically 4) to stabilize streaming attention with rolling
+    /// KV cache.
+    ///
+    /// v0 API-surface landing (Sprint 2 cycle-4): this field is wired
+    /// through decorator extraction + semantic validation + integration
+    /// pin, but the SMEM-layout codegen that actually materializes the
+    /// sink cache is DEFERRED to a future sprint (paper §4.3 Phase 5 v1).
+    /// `num_sink_tokens = 0` is the sentinel for "sinks disabled" and is
+    /// the only value the codegen path currently respects.
+    pub num_sink_tokens: u32,
     /// Target GPU SM version for PTX target selection (default: 52).
     pub gpu_sm: u32,
     /// PCA Tier A: when `true`, the emitter produces a segment-aware
@@ -5933,6 +5944,7 @@ mod tests {
             rope_style: RopeStyle::HalfSplit,
             gqa_group_size: 1,
             tree_mask: false,
+            num_sink_tokens: 0,
             gpu_sm: 80,
         segment_masked: false,
         csha: None,
@@ -5955,6 +5967,7 @@ mod tests {
             rope_style: RopeStyle::Adjacent,
             gqa_group_size: 4,
             tree_mask: false,
+            num_sink_tokens: 0,
             gpu_sm: 80,
         segment_masked: false,
         csha: None,
@@ -5977,6 +5990,7 @@ mod tests {
             rope_style: RopeStyle::HalfSplit,
             gqa_group_size: 1,
             tree_mask: false,
+            num_sink_tokens: 0,
             gpu_sm: 80,
         segment_masked: false,
         csha: None,
@@ -5999,6 +6013,7 @@ mod tests {
             rope_style: RopeStyle::HalfSplit,
             gqa_group_size: 1,
             tree_mask: false,
+            num_sink_tokens: 0,
             gpu_sm: 80,
         segment_masked: false,
         csha: None,
@@ -6019,6 +6034,7 @@ mod tests {
             rope_style: RopeStyle::HalfSplit,
             gqa_group_size: 1,
             tree_mask: false,
+            num_sink_tokens: 0,
             gpu_sm: 80,
         segment_masked: false,
         csha: None,
@@ -6046,6 +6062,7 @@ mod tests {
             rope_style: RopeStyle::HalfSplit,
             gqa_group_size: 1,
             tree_mask: false,
+            num_sink_tokens: 0,
             gpu_sm: 80,
         segment_masked: false,
         csha: None,
@@ -6073,6 +6090,7 @@ mod tests {
             rope_style: RopeStyle::HalfSplit,
             gqa_group_size: 1,
             tree_mask: false,
+            num_sink_tokens: 0,
             gpu_sm: 80,
         segment_masked: false,
         csha: None,
@@ -6096,6 +6114,7 @@ mod tests {
             rope_style: RopeStyle::HalfSplit,
             gqa_group_size: 1,
             tree_mask: false,
+            num_sink_tokens: 0,
             gpu_sm: 80,
         segment_masked: false,
         csha: None,
@@ -6119,6 +6138,7 @@ mod tests {
             rope_style: RopeStyle::HalfSplit,
             gqa_group_size: 4,
             tree_mask: false,
+            num_sink_tokens: 0,
             gpu_sm: 80,
         segment_masked: false,
         csha: None,
@@ -6157,6 +6177,7 @@ mod tests {
             rope_style: RopeStyle::HalfSplit,
             gqa_group_size: 1,
             tree_mask: true,
+            num_sink_tokens: 0,
             gpu_sm: 80,
         segment_masked: false,
         csha: None,
@@ -6530,6 +6551,7 @@ mod tests {
             rope_style: RopeStyle::HalfSplit,
             gqa_group_size: 1,
             tree_mask: false,
+            num_sink_tokens: 0,
             gpu_sm: 80,
             segment_masked: false,
             csha: Some(CshaExtras::level1(1e-5)),
@@ -6547,6 +6569,7 @@ mod tests {
             rope_style: RopeStyle::HalfSplit,
             gqa_group_size: 1,
             tree_mask: false,
+            num_sink_tokens: 0,
             gpu_sm: 80,
             segment_masked: false,
             csha: None,
@@ -6629,6 +6652,7 @@ mod tests {
             rope_style: RopeStyle::HalfSplit,
             gqa_group_size: 1,
             tree_mask: false,
+            num_sink_tokens: 0,
             gpu_sm: 80,
             segment_masked: false,
             csha: Some(CshaExtras::level2(1e-5, 512)),
@@ -7117,6 +7141,7 @@ mod tests {
             rope_style: RopeStyle::HalfSplit,
             gqa_group_size: 1,
             tree_mask: false,
+            num_sink_tokens: 0,
             gpu_sm: 80,
             segment_masked: false,
             csha: None,

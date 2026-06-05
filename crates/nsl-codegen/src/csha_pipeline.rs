@@ -450,6 +450,7 @@ fn layer_backward_tier_report(
         rope_style: RopeStyle::HalfSplit,
         gqa_group_size: 1,
         tree_mask: false,
+        num_sink_tokens: 0,
         gpu_sm: gpu.sm_version,
         segment_masked: false,
         csha: Some(CshaExtras {

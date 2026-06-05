@@ -101,6 +101,7 @@ fn cfg_128(d_model: u32) -> FlashAttentionConfig {
         rope_style: RopeStyle::HalfSplit,
         gqa_group_size: 1,
         tree_mask: false,
+        num_sink_tokens: 0,
         gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras {
             level: 2,
             fused_rmsnorm: true,

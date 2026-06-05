@@ -922,6 +922,7 @@ fn build_flash_config(
         rope_style: RopeStyle::HalfSplit,
         gqa_group_size,
         tree_mask: false,
+        num_sink_tokens: 0,
         gpu_sm: 80,
         segment_masked: false,
         csha,

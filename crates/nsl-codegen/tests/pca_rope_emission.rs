@@ -25,6 +25,7 @@ fn config_segment_masked_with_rope() -> FlashAttentionConfig {
         rope_style: RopeStyle::Adjacent,
         gqa_group_size: 1,
         tree_mask: false,
+        num_sink_tokens: 0,
         gpu_sm: 75,
         segment_masked: true,
         csha: Some(CshaExtras::level2(1e-5, 32)),

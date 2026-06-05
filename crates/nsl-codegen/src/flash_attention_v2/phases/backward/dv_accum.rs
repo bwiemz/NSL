@@ -170,7 +170,7 @@ mod tests {
             block_q: 32, block_kv: 32, head_dim: hd,
             causal: false, paged: false, rope_q: false,
             rope_style: RopeStyle::HalfSplit,
-            gqa_group_size: 1, tree_mask: false, gpu_sm: 75,
+            gqa_group_size: 1, tree_mask: false, num_sink_tokens: 0, gpu_sm: 75,
             segment_masked: false,
             csha: Some(CshaExtras {
                 fused_projections: true,
