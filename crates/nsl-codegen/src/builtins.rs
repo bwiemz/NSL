@@ -1207,6 +1207,7 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
             types::I64,                         // tier_b_ptx_ptr (planner spec §4)
             types::I64,                         // tier_b_name_ptr (planner spec §4)
             types::I64,                         // doc_starts_ptr (PCA §4.3 Task 3)
+            types::I64,                         // num_docs_or_zero (PCA per-doc CTA backward, Sprint 5)
         ],
         Some(types::I64),
     ),

@@ -2036,6 +2036,14 @@ fn lower_single_op(
                     // PCA §4.3: doc_starts_ptr — read from the same
                     // registry; matches the forward's effective_pos.
                     doc_starts_v,
+                    // PCA per-doc CTA backward (Sprint 5): num_docs_or_zero
+                    // trailing sentinel. AD-side never emits a per-doc CTA
+                    // backward today (the planner gate that activates the
+                    // per-doc forward also feeds the backward synth at the
+                    // dispatch site), so passing 0 here keeps the legacy
+                    // per-q-block topology. Hot-path activation will set
+                    // this when the planner integrates with AD.
+                    null,
                 ],
             )?;
 

@@ -1492,6 +1492,16 @@ pub extern "C" fn nsl_flash_attention_csha_backward(
     // kernel computes row offset as batch_idx * (MAX_NUM_DOCS+1) and
     // loads only its row's 1028-byte subtable. See spec §3.
     doc_starts_ptr: i64,
+    // PCA per-doc CTA backward (Sprint 5): number of documents in the
+    // batch. Pass 0 for legacy (non-per-doc) topology; the standard
+    // `q_blocks` outer loop drives grid_x=1 launches per q-block. Pass
+    // non-zero ONLY when the dispatched backward kernel's name carries
+    // the `_per_doc_cta` suffix — grid_x is then overridden to
+    // `num_docs_or_zero` per Sprint 5's one-CTA-per-document backward
+    // launch contract, and the `q_blocks` outer loop is skipped.
+    // Mismatched signal/topology (suffix present + zero count, or zero
+    // suffix + nonzero count) returns -1 with an `eprintln!` diagnostic.
+    num_docs_or_zero: i64,
 ) -> i64 {
     use crate::pca_tier_b_runtime::{
         assert_tier_b_sentinels, should_dispatch_tier_b_at_runtime,
@@ -1523,8 +1533,43 @@ pub extern "C" fn nsl_flash_attention_csha_backward(
         } else {
             heads
         };
+        // PCA per-doc CTA (Sprint 5) topology detection. Mirrors the
+        // forward `nsl_flash_attention_csha` dispatch: when the kernel
+        // name carries `_per_doc_cta`, the backward launches with
+        // grid_x=num_docs (one CTA per document) and skips the per-q-block
+        // outer launch loop entirely (the kernel's per-doc prelude derives
+        // %q_start from doc_starts[bid_x] instead of bid_x*block_q +
+        // q_launch_base, so the slens-threaded q-block trick is unused).
+        let per_doc_cta = csha_is_per_doc_cta_kernel(effective_name_ptr);
+        if per_doc_cta {
+            if num_docs_or_zero <= 0 {
+                eprintln!(
+                    "[nsl::flash_attention] nsl_flash_attention_csha_backward: per-doc CTA \
+                     kernel ({:?}) requires num_docs_or_zero > 0, got {}",
+                    csha_kernel_name_for_diag(effective_name_ptr),
+                    num_docs_or_zero,
+                );
+                return -1;
+            }
+            if doc_starts_ptr == 0 {
+                eprintln!(
+                    "[nsl::flash_attention] nsl_flash_attention_csha_backward: per-doc CTA \
+                     kernel ({:?}) requires doc_starts_ptr != 0",
+                    csha_kernel_name_for_diag(effective_name_ptr),
+                );
+                return -1;
+            }
+        } else if num_docs_or_zero > 0 {
+            eprintln!(
+                "[nsl::flash_attention] nsl_flash_attention_csha_backward: num_docs_or_zero={} \
+                 provided but kernel name {:?} lacks the `_per_doc_cta` suffix",
+                num_docs_or_zero,
+                csha_kernel_name_for_diag(effective_name_ptr),
+            );
+            return -1;
+        }
         let q_blocks = (seq_len + block_q - 1) / block_q;
-        let grid_x = 1i64;
+        let grid_x = if per_doc_cta { num_docs_or_zero } else { 1i64 };
         let grid_y = batch * effective_heads;
         let grid_z = 1i64;
         let block_x = 128i64;
@@ -1702,14 +1747,13 @@ pub extern "C" fn nsl_flash_attention_csha_backward(
         }
 
         let mut rc = cudarc::driver::sys::CUresult::CUDA_SUCCESS;
-        for q_block in 0..q_blocks {
-            // Thread the q-block base into seq_lens_ptr slot via `slens`.
-            // Raw-ptr use: `args[16]` holds `&mut slens`, and CUDA's
-            // `cuLaunchKernel` reads the pointee at call time, so each
-            // iteration's assignment is picked up by the next launch.
-            // `black_box` prevents the optimizer from eliding the write
-            // because dataflow analysis can't see the read-through-ptr.
-            slens = (q_block * block_q) as u64;
+        if per_doc_cta {
+            // Per-doc CTA: ONE launch with grid_x=num_docs. The kernel's
+            // per-doc prelude derives %q_start from doc_starts[bid_x],
+            // ignoring %q_launch_base, so the slens-threaded q-block trick
+            // is not needed (and would be incorrect — there is no global
+            // q-block ordinal in the per-doc launch).
+            slens = 0u64;
             let _ = std::hint::black_box(&slens);
             rc = crate::cuda::inner::kernel_launch(
                 effective_ptx_ptr as *const u8,
@@ -1719,8 +1763,27 @@ pub extern "C" fn nsl_flash_attention_csha_backward(
                 &args,
                 shared_mem_bytes as u32,
             );
-            if rc != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
-                break;
+        } else {
+            for q_block in 0..q_blocks {
+                // Thread the q-block base into seq_lens_ptr slot via `slens`.
+                // Raw-ptr use: `args[16]` holds `&mut slens`, and CUDA's
+                // `cuLaunchKernel` reads the pointee at call time, so each
+                // iteration's assignment is picked up by the next launch.
+                // `black_box` prevents the optimizer from eliding the write
+                // because dataflow analysis can't see the read-through-ptr.
+                slens = (q_block * block_q) as u64;
+                let _ = std::hint::black_box(&slens);
+                rc = crate::cuda::inner::kernel_launch(
+                    effective_ptx_ptr as *const u8,
+                    effective_name_ptr as *const u8,
+                    [grid_x, grid_y, grid_z],
+                    [block_x, block_y, block_z],
+                    &args,
+                    shared_mem_bytes as u32,
+                );
+                if rc != cudarc::driver::sys::CUresult::CUDA_SUCCESS {
+                    break;
+                }
             }
         }
 
@@ -1833,6 +1896,7 @@ pub extern "C" fn nsl_flash_attention_csha_backward(
         let _ = (do_ptr, dq_ptr, dk_ptr, dv_ptr, dwq_ptr, dwk_ptr, dwv_ptr, dx_ptr, dx_norm_ptr);
         let _ = (segment_ids_ptr, doc_starts_ptr);
         let _ = (tier_b_ptx_ptr, tier_b_name_ptr, effective_ptx_ptr, effective_name_ptr);
+        let _ = num_docs_or_zero;
         eprintln!("[nsl] CSHA backward requires CUDA.");
         -1
     }
