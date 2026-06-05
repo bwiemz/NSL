@@ -13,20 +13,35 @@
 //!
 //! # v1 limitations (documented in spec §4 known_limits)
 //!
-//! - Forward ONLY.  Backward not implemented; callers MUST NOT invoke
-//!   this under autodiff recording.
 //! - One CTA per document (`max_doc_len <= block_q` enforced by `admit`).
-//! - No CSHA fused projections.
+//! - No CSHA fused projections (forward and backward both gate this off).
 //! - No Tier B tile-skip.
+//! - causal=true required (per-doc launch geometry assumes causal).
+//! - default-OFF (`enable_per_doc_cta=false` in `PerDocAdmitConfig`).
 //! - ABI: the per-doc kernel adds `doc_starts_ptr` as a trailing param
 //!   (unconditionally, unlike Tier A which gates on `segment_masked &&
 //!   rope_q`).  The runtime identifies the kernel by its `_per_doc_cta`
 //!   name suffix (mirrors the `_tier_b1_chunkN` pattern).
 //!
+//! # Backward (CFTP v2 follow-on Sprint 5)
+//!
+//! The backward kernel ([`synthesize_per_doc_cta_backward`]) reuses every
+//! standard FA-2 v2 backward phase (`ds_compute`, `dv_accum`, `dqdk_accum`,
+//! `finalize`) and only patches the prelude's `%q_start`/`%k_max` to load
+//! from `doc_starts[bid_x]` and `doc_starts[bid_x+1]`. Cross-CTA dQ/dK/dV
+//! HBM writes are bounded by `%k_max` (= doc_end) via two targeted
+//! `setp.lt.u64 ..., %k_max` substitutions in `finalize::emit_store_dq_only`
+//! and `emit_store_kv_only`, so out-of-doc rows never touch HBM.
+//!
+//! Same v1 caveats as forward apply: max_doc_len ≤ block_q, no CSHA fused
+//! projections, causal-only, default-OFF.
+//!
 //! # Entry points
 //!
 //! - [`synthesize_per_doc_cta_forward`] — returns the PTX `Vec<u8>`.
-//! - [`per_doc_cta_kernel_name`] — returns the kernel name string.
+//! - [`synthesize_per_doc_cta_backward`] — returns the PTX `Vec<u8>`.
+//! - [`per_doc_cta_kernel_name`] — forward kernel name string.
+//! - [`per_doc_cta_backward_kernel_name`] — backward kernel name string.
 
 use crate::flash_attention::FlashAttentionConfig;
 use crate::flash_attention_v2::phases;
@@ -363,6 +378,222 @@ fn emit_v_tile_load(ptx: &mut String, config: &FlashAttentionConfig, q_iter: u32
 }
 
 // ---------------------------------------------------------------------------
+// Per-doc CTA backward (CFTP v2 follow-on Sprint 5).
+//
+// Strategy: synthesize the standard FA-2 v2 backward via
+// `synthesize_backward(config_with_segment_masked_false)`, then post-process
+// to (1) rename the kernel with `_per_doc_cta` suffix, (2) inject the
+// FFI-ABI-aligned trailing params `_segment_ids_placeholder` + `doc_starts_ptr`,
+// (3) replace the standard `%q_start = bid_x * block_q + q_launch_base` prelude
+// with the per-doc `%q_start = doc_starts[bid_x]; %k_max = doc_starts[bid_x+1]`
+// load (mirrors `phases::forward::per_doc_prelude`), (4) override the
+// orchestrator's `%k_start = 0; %k_max = seq_len` with `%k_start = %q_start;`
+// (keeping the prelude-set `%k_max = doc_end`), and (5) bound the dQ/dK/dV
+// finalize HBM stores by `%k_max` instead of `%rd6` (seq_len) so out-of-doc
+// rows never write to HBM.
+//
+// All other backward phases (ds_compute, dv_accum, dqdk_accum, csha_hooks,
+// finalize) are reused UNCHANGED — the per-doc semantics flow through via
+// the patched `%q_start` / `%k_start` / `%k_max` register values plus the
+// existing causal mask.
+// ---------------------------------------------------------------------------
+
+/// Return the kernel entry-point name for a per-doc CTA backward kernel.
+///
+/// Format: `<bwd_base_name>_per_doc_cta` — the prefix matches the standard
+/// backward `kernel_name` (which itself starts with `flash_attn_backward_v2_`);
+/// the `_per_doc_cta` suffix is the ABI-stable dispatch signal recognised by
+/// `nsl_flash_attention_csha_backward`'s `csha_is_per_doc_cta_kernel` helper.
+pub fn per_doc_cta_backward_kernel_name(config: &FlashAttentionConfig) -> String {
+    let mut cfg = config.clone();
+    cfg.segment_masked = false;
+    let base = crate::flash_attention_v2::phases::backward::prelude::kernel_name(&cfg);
+    format!("{}{}", base, PER_DOC_CTA_SUFFIX)
+}
+
+/// Synthesise the per-doc CTA backward PTX kernel.
+///
+/// Returns the PTX as a NUL-terminated `Vec<u8>` suitable for
+/// `cuModuleLoadData`. On unsupported configs (validator rejection) returns
+/// `Err(message)`.
+///
+/// # ABI contract
+///
+/// The emitted kernel's param list extends the standard backward's
+/// `segment_masked=false` param list with two trailing params:
+///
+///   * `_segment_ids_placeholder` (slot 47 in the FFI args[] array) — never
+///     read; present only so the FFI's `seg_ids` slot lines up.
+///   * `doc_starts_ptr` (slot 48 in the FFI args[] array) — read by the
+///     per-doc prelude to derive `%q_start` and `%k_max`.
+///
+/// The FFI also appends `num_docs_or_zero` as a trailing scalar arg (added
+/// by Sprint 5 mirror of Sprint 1's forward FFI change) so the per-doc
+/// `grid_x = num_docs` override has a runtime value.
+///
+/// # Preconditions
+///
+/// * `config.causal == true` (per-doc is causal-only in v1).
+/// * `config.csha.is_some_and(|c| !c.fused_projections)` OR `config.csha.is_none()`
+///   (no fused projections in v1).
+/// * Validator accepts `Direction::Backward` for the (segment_masked=false)
+///   clone of the config.
+pub fn synthesize_per_doc_cta_backward(
+    _plan: &PerDocCtaPlan,
+    config: &FlashAttentionConfig,
+) -> Result<Vec<u8>, String> {
+    // Force segment_masked=false on the working clone — per-doc never uses
+    // seg_smem. Cross-doc isolation is structural via the launch grid.
+    let mut cfg = config.clone();
+    cfg.segment_masked = false;
+    if cfg.csha.as_ref().is_some_and(|c| c.fused_projections) {
+        return Err(
+            "per-doc CTA v1 backward does not support CSHA fused projections".to_string(),
+        );
+    }
+    if !cfg.causal {
+        return Err("per-doc CTA v1 backward requires causal=true".to_string());
+    }
+
+    // 1. Synthesise the standard backward PTX (no Tier B).
+    let std_ptx = crate::flash_attention_v2::synthesize_backward(&cfg)?;
+
+    // The standard backward emits a NUL terminator at the end — strip it
+    // for string-based patching, re-append before return.
+    let mut ptx = std_ptx;
+    if ptx.ends_with('\0') {
+        ptx.pop();
+    }
+
+    // 2. Rename the kernel: append `_per_doc_cta` to the `.visible .entry NAME (`
+    //    declaration. The standard kernel name is `phases::backward::prelude::kernel_name(&cfg)`.
+    let std_name = crate::flash_attention_v2::phases::backward::prelude::kernel_name(&cfg);
+    let new_name = format!("{}{}", std_name, PER_DOC_CTA_SUFFIX);
+    let old_entry = format!(".visible .entry {} (", std_name);
+    let new_entry = format!(".visible .entry {} (", new_name);
+    if !ptx.contains(&old_entry) {
+        return Err(format!(
+            "per-doc backward synth: expected to find `{}` in standard backward PTX",
+            old_entry
+        ));
+    }
+    ptx = ptx.replacen(&old_entry, &new_entry, 1);
+
+    // 3. Inject the FFI-ABI-aligned trailing params:
+    //    `_segment_ids_placeholder` (slot 47) + `doc_starts_ptr` (slot 48).
+    //    The standard segment_masked=false backward's param list ends with
+    //    `.param .u64 dv_scratch_ptr` followed by `)`. We find that closing
+    //    paren and insert the two extra params before it (with proper commas).
+    //
+    //    Standard tail looks like:
+    //        .param .u64 dv_scratch_ptr
+    //    )
+    //
+    //    We rewrite to:
+    //        .param .u64 dv_scratch_ptr,
+    //        .param .u64 _segment_ids_placeholder,
+    //        .param .u64 doc_starts_ptr
+    //    )
+    let std_tail = "    .param .u64 dv_scratch_ptr\n)";
+    let new_tail = "    .param .u64 dv_scratch_ptr,\n    .param .u64 _segment_ids_placeholder,\n    .param .u64 doc_starts_ptr\n)";
+    if !ptx.contains(std_tail) {
+        return Err(
+            "per-doc backward synth: expected standard backward param-list tail \
+             `.param .u64 dv_scratch_ptr\\n)` not found"
+                .to_string(),
+        );
+    }
+    ptx = ptx.replacen(std_tail, new_tail, 1);
+
+    // 4. Replace the standard prelude's `%q_start = bid_x * block_q + q_launch_base`
+    //    derivation with the per-doc `%q_start = doc_starts[bid_x]; %k_max = doc_starts[bid_x+1]`
+    //    load. The standard prelude emits exactly the four lines below
+    //    (see `phases/backward/prelude.rs:383-388` + `mov %k_start, 0;`).
+    //
+    //    We replace q_start derivation only — `%k_start = 0` and
+    //    `%k_max = %rd6` are emitted by the orchestrator (not the prelude)
+    //    and are patched in step 5.
+    let block_q = cfg.block_q;
+    let std_q_start_block = format!(
+        "    cvt.u64.u32 %q_start, %bid_x;\n    mul.lo.u64 %q_start, %q_start, {};\n    add.u64 %q_start, %q_start, %q_launch_base;\n",
+        block_q,
+    );
+    let new_q_start_block = String::from(
+        "    // ===== per-doc CTA prelude override (Sprint 5 backward) =====\n\
+         \x20   // %q_start = doc_starts[bid_x]; %k_max_pdoc = doc_starts[bid_x+1]\n\
+         \x20   .reg .u64 %rd_pdoc_base, %rd_pdoc_addr;\n\
+         \x20   .reg .s32 %r_pdoc_start, %r_pdoc_end;\n\
+         \x20   .reg .u32 %r_pdoc_len;\n\
+         \x20   .reg .u64 %k_max_pdoc;\n\
+         \x20   ld.param.u64 %rd_pdoc_base, [doc_starts_ptr];\n\
+         \x20   cvt.u64.u32 %rd_pdoc_addr, %bid_x;\n\
+         \x20   shl.b64 %rd_pdoc_addr, %rd_pdoc_addr, 2;  // bid_x * 4\n\
+         \x20   add.u64 %rd_pdoc_addr, %rd_pdoc_base, %rd_pdoc_addr;\n\
+         \x20   ld.global.s32 %r_pdoc_start, [%rd_pdoc_addr];\n\
+         \x20   add.u64 %rd_pdoc_addr, %rd_pdoc_addr, 4;\n\
+         \x20   ld.global.s32 %r_pdoc_end, [%rd_pdoc_addr];\n\
+         \x20   sub.s32 %r_pdoc_len, %r_pdoc_end, %r_pdoc_start;\n\
+         \x20   cvt.u64.s32 %q_start, %r_pdoc_start;  // q_start = doc_start\n\
+         \x20   cvt.u64.s32 %k_max_pdoc, %r_pdoc_end; // doc_end (saved for k_max patch)\n\
+         \x20   // ===== end per-doc prelude override =====\n",
+    );
+    if !ptx.contains(&std_q_start_block) {
+        return Err(format!(
+            "per-doc backward synth: standard q_start derivation block not found \
+             (expected:\n{})",
+            std_q_start_block
+        ));
+    }
+    ptx = ptx.replacen(&std_q_start_block, &new_q_start_block, 1);
+
+    // 5. Replace ALL occurrences of `mov.u64 %k_start, 0; mov.u64 %k_max, %rd6;`
+    //    with `mov.u64 %k_start, %q_start; mov.u64 %k_max, %k_max_pdoc;`.
+    //
+    //    There are TWO occurrences in the standard backward:
+    //      a. `prelude.rs:396-397` — a defensive init so kv_load doesn't fault
+    //         if SMEM has garbage (k_start=0 forces k_global=lane indexing).
+    //      b. `mod.rs:893-894` — the operational init immediately before
+    //         the `V2_BWD_LOOP_KV:` label that drives the kv-loop.
+    //
+    //    Both should be replaced — per-doc kernel needs `k_start = doc_start`
+    //    and `k_max = doc_end` consistently across the kernel body.
+    let std_kstart_block = "    mov.u64 %k_start, 0;\n    mov.u64 %k_max, %rd6;\n";
+    let new_kstart_block =
+        "    mov.u64 %k_start, %q_start;  // per-doc: sweep starts at doc_start\n    mov.u64 %k_max, %k_max_pdoc;  // per-doc: doc_end\n";
+    if !ptx.contains(std_kstart_block) {
+        return Err(
+            "per-doc backward synth: k_start/k_max init block not found"
+                .to_string(),
+        );
+    }
+    ptx = ptx.replace(std_kstart_block, new_kstart_block);
+
+    // 6. Bound dQ/dK/dV HBM stores by `%k_max` instead of `%rd6` (seq_len).
+    //    The standard backward finalize bounds the per-cell row index against
+    //    `%rd6` (seq_len), allowing writes to rows up to seq_len. For per-doc,
+    //    we want writes bounded by doc_end (= %k_max). Two textually-identical
+    //    `setp.lt.u64 %p0, %rd43, %rd6;` instances exist in `phases/backward/
+    //    finalize.rs` — one in `emit_store_dq_only`, one in `emit_store_kv_only`.
+    //    Replace ALL with the doc-end bound.
+    let std_bound = "    setp.lt.u64 %p0, %rd43, %rd6;\n";
+    let new_bound = "    setp.lt.u64 %p0, %rd43, %k_max;  // per-doc: bound by doc_end\n";
+    if !ptx.contains(std_bound) {
+        return Err(
+            "per-doc backward synth: finalize row-bound predicate not found".to_string(),
+        );
+    }
+    ptx = ptx.replace(std_bound, new_bound);
+
+    // 7. NUL-terminate for cuModuleLoadData.
+    if !ptx.ends_with('\n') {
+        ptx.push('\n');
+    }
+    let mut bytes = ptx.into_bytes();
+    bytes.push(0);
+    Ok(bytes)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -492,6 +723,255 @@ mod tests {
         assert_ne!(
             v2_bytes, per_doc_bytes,
             "per-doc PTX must differ from Tier A (different prelude + kernel name)"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Backward synthesis tests (CFTP v2 follow-on Sprint 5).
+    // -------------------------------------------------------------------
+
+    /// Backward-friendly base config (block_q/block_kv/head_dim = 32,
+    /// segment_masked=false, csha=None, causal=true).
+    fn bwd_cfg() -> FlashAttentionConfig {
+        FlashAttentionConfig {
+            block_q: 32, block_kv: 32, head_dim: 32,
+            causal: true, paged: false, rope_q: false,
+            rope_style: RopeStyle::HalfSplit,
+            gqa_group_size: 1, tree_mask: false, gpu_sm: 75,
+            segment_masked: false, csha: None,
+        }
+    }
+
+    fn build_bwd_plan(cfg: &FlashAttentionConfig) -> PerDocCtaPlan {
+        let packing = DatasetPackingConfig {
+            enabled: true,
+            max_sequence_length: 128,
+            mean_doc_length: Some(25),
+            doc_length_stddev: Some(0),
+            separator_token_id: Some(2),
+        };
+        let det = PcaDetection {
+            strategy: PcaStrategy::PerDocumentCta,
+            expected_doc_fraction: 0.195,
+            rationale: "test".to_string(),
+            segment_id_bytes_per_batch: 256,
+            eliminated_mask_bytes_per_batch: 32768,
+        };
+        crate::pca_per_doc::admit(
+            &det, cfg, &packing,
+            &PerDocAdmitConfig { enable_per_doc_cta: true, ..Default::default() },
+        )
+        .expect("admit should succeed for bwd_cfg")
+    }
+
+    #[test]
+    fn backward_kernel_name_includes_per_doc_cta_suffix() {
+        let cfg = bwd_cfg();
+        let name = per_doc_cta_backward_kernel_name(&cfg);
+        assert!(
+            name.ends_with(PER_DOC_CTA_SUFFIX),
+            "backward kernel name '{}' must end with '{}'", name, PER_DOC_CTA_SUFFIX
+        );
+        // Sprint 1 FFI dispatcher recognises the same suffix on either
+        // forward or backward, so `is_per_doc_cta_kernel` should match.
+        assert!(is_per_doc_cta_kernel(&name));
+        // Distinct from forward kernel name.
+        let fwd = per_doc_cta_kernel_name(&cfg);
+        assert_ne!(name, fwd, "backward and forward names must differ");
+        // Backward name carries the `backward_` prefix marker.
+        assert!(
+            name.contains("backward"),
+            "backward kernel name must contain `backward` marker, got '{}'", name,
+        );
+    }
+
+    #[test]
+    fn backward_synthesis_emits_per_doc_prelude_override() {
+        let cfg = bwd_cfg();
+        let plan = build_bwd_plan(&cfg);
+        let ptx_bytes = synthesize_per_doc_cta_backward(&plan, &cfg)
+            .expect("backward synth must succeed");
+        let ptx = String::from_utf8_lossy(&ptx_bytes);
+
+        assert!(
+            ptx.contains("per-doc CTA prelude override (Sprint 5 backward)"),
+            "backward PTX must contain per-doc prelude marker"
+        );
+        assert!(
+            ptx.contains("ld.param.u64 %rd_pdoc_base, [doc_starts_ptr];"),
+            "backward PTX must load doc_starts_ptr in prelude override"
+        );
+        assert!(
+            ptx.contains("ld.global.s32 %r_pdoc_start, [%rd_pdoc_addr];"),
+            "backward PTX must load doc_starts[bid_x] entries"
+        );
+    }
+
+    #[test]
+    fn backward_synthesis_replaces_k_start_init() {
+        let cfg = bwd_cfg();
+        let plan = build_bwd_plan(&cfg);
+        let ptx_bytes = synthesize_per_doc_cta_backward(&plan, &cfg)
+            .expect("backward synth must succeed");
+        let ptx = String::from_utf8_lossy(&ptx_bytes);
+
+        // The standard `mov.u64 %k_start, 0;` is replaced by `... %k_start, %q_start;`.
+        assert!(
+            !ptx.contains("    mov.u64 %k_start, 0;\n    mov.u64 %k_max, %rd6;\n"),
+            "standard k_start=0 / k_max=seq_len block must be replaced"
+        );
+        assert!(
+            ptx.contains("mov.u64 %k_start, %q_start;"),
+            "backward PTX must initialise k_start from q_start"
+        );
+        assert!(
+            ptx.contains("mov.u64 %k_max, %k_max_pdoc;"),
+            "backward PTX must initialise k_max from doc_end"
+        );
+    }
+
+    #[test]
+    fn backward_synthesis_bounds_finalize_by_k_max() {
+        let cfg = bwd_cfg();
+        let plan = build_bwd_plan(&cfg);
+        let ptx_bytes = synthesize_per_doc_cta_backward(&plan, &cfg)
+            .expect("backward synth must succeed");
+        let ptx = String::from_utf8_lossy(&ptx_bytes);
+
+        // The textually-identical `setp.lt.u64 %p0, %rd43, %rd6;` must NOT
+        // appear (we replaced all occurrences with `..., %k_max;`).
+        assert!(
+            !ptx.contains("setp.lt.u64 %p0, %rd43, %rd6;"),
+            "standard seq_len bound on finalize row index must be replaced"
+        );
+        assert!(
+            ptx.contains("setp.lt.u64 %p0, %rd43, %k_max;"),
+            "backward PTX must bound finalize stores by k_max (doc_end)"
+        );
+        // The per-doc marker comment must annotate the replacement.
+        assert!(
+            ptx.contains("per-doc: bound by doc_end"),
+            "k_max-bound replacement must carry the per-doc annotation"
+        );
+    }
+
+    #[test]
+    fn backward_synthesis_appends_doc_starts_param() {
+        let cfg = bwd_cfg();
+        let plan = build_bwd_plan(&cfg);
+        let ptx_bytes = synthesize_per_doc_cta_backward(&plan, &cfg)
+            .expect("backward synth must succeed");
+        let ptx = String::from_utf8_lossy(&ptx_bytes);
+
+        assert!(
+            ptx.contains(".param .u64 _segment_ids_placeholder"),
+            "backward PTX must declare seg_ids placeholder param (FFI ABI alignment)"
+        );
+        assert!(
+            ptx.contains(".param .u64 doc_starts_ptr"),
+            "backward PTX must declare doc_starts_ptr param"
+        );
+    }
+
+    #[test]
+    fn backward_synthesis_kernel_name_in_entry_decl() {
+        let cfg = bwd_cfg();
+        let plan = build_bwd_plan(&cfg);
+        let ptx_bytes = synthesize_per_doc_cta_backward(&plan, &cfg)
+            .expect("backward synth must succeed");
+        let ptx = String::from_utf8_lossy(&ptx_bytes);
+
+        let expected_name = per_doc_cta_backward_kernel_name(&cfg);
+        let needle = format!(".visible .entry {} (", expected_name);
+        assert!(
+            ptx.contains(&needle),
+            "backward PTX must declare entry with the per-doc backward kernel name, got missing '{}'", needle,
+        );
+    }
+
+    #[test]
+    fn backward_synthesis_rejects_fused_projections() {
+        let mut cfg = bwd_cfg();
+        cfg.csha = Some(crate::flash_attention::CshaExtras {
+            fused_projections: true,
+            save_activations_for_backward: true,
+            d_model: 32,
+            ..crate::flash_attention::CshaExtras::default()
+        });
+        let plan = build_bwd_plan(&bwd_cfg());
+        let result = synthesize_per_doc_cta_backward(&plan, &cfg);
+        assert!(result.is_err(), "fused_projections must be rejected in v1");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("fused projections"),
+            "rejection message must explain the reason, got '{}'", err,
+        );
+    }
+
+    #[test]
+    fn backward_synthesis_rejects_non_causal() {
+        let mut cfg = bwd_cfg();
+        cfg.causal = false;
+        let plan = build_bwd_plan(&bwd_cfg());
+        let result = synthesize_per_doc_cta_backward(&plan, &cfg);
+        assert!(result.is_err(), "non-causal must be rejected in v1");
+        let err = result.unwrap_err();
+        assert!(err.contains("causal"), "rejection message must mention causal, got '{}'", err);
+    }
+
+    #[test]
+    fn backward_synthesis_nul_terminated() {
+        let cfg = bwd_cfg();
+        let plan = build_bwd_plan(&cfg);
+        let ptx_bytes = synthesize_per_doc_cta_backward(&plan, &cfg)
+            .expect("backward synth must succeed");
+        assert_eq!(
+            ptx_bytes.last(),
+            Some(&0u8),
+            "backward PTX must be NUL-terminated for cuModuleLoadData"
+        );
+    }
+
+    #[test]
+    fn backward_synthesis_no_seg_smem() {
+        let cfg = bwd_cfg();
+        let plan = build_bwd_plan(&cfg);
+        let ptx_bytes = synthesize_per_doc_cta_backward(&plan, &cfg)
+            .expect("backward synth must succeed");
+        let ptx = String::from_utf8_lossy(&ptx_bytes);
+        // segment_masked=false is enforced on the working clone, so the
+        // backward must not emit any seg_smem load/predicate code.
+        assert!(
+            !ptx.contains("BW_PCA_LOAD_LOOP"),
+            "per-doc backward must not emit segment_ids SMEM load loop"
+        );
+        assert!(
+            !ptx.contains("%p_seg_SEGMASK"),
+            "per-doc backward must not declare seg_mask predicate"
+        );
+    }
+
+    #[test]
+    fn backward_synthesis_param_list_byte_aligned_with_forward_ffi() {
+        // The runtime FFI's args[47] holds seg_ids, args[48] holds doc_starts
+        // (mirrors forward's _per_doc_cta ABI). Therefore the per-doc backward's
+        // param list MUST end with `_segment_ids_placeholder` then `doc_starts_ptr`
+        // in that order, with `doc_starts_ptr` immediately before the closing `)`.
+        let cfg = bwd_cfg();
+        let plan = build_bwd_plan(&cfg);
+        let ptx_bytes = synthesize_per_doc_cta_backward(&plan, &cfg)
+            .expect("backward synth must succeed");
+        let ptx = String::from_utf8_lossy(&ptx_bytes);
+        // Find the ordering: _segment_ids_placeholder appears before doc_starts_ptr.
+        let pos_placeholder = ptx
+            .find("_segment_ids_placeholder")
+            .expect("placeholder param missing");
+        let pos_doc_starts = ptx
+            .find("doc_starts_ptr")
+            .expect("doc_starts_ptr param missing");
+        assert!(
+            pos_placeholder < pos_doc_starts,
+            "param order must be _segment_ids_placeholder THEN doc_starts_ptr"
         );
     }
 }
