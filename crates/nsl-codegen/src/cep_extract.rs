@@ -203,7 +203,7 @@ fn arg_missing(what: &'static str) -> impl Fn() -> CepExtractError {
 /// Within a model, a field named `"blocks"` is preferred; otherwise the
 /// first such field is taken.  Returns `(model_def, element_type_name,
 /// array_size, init_expr)`.
-fn find_top_model<'a>(
+pub(crate) fn find_top_model<'a>(
     module: &'a Module,
     resolve: Resolve,
 ) -> Option<(&'a ModelDef, String, i64, &'a Expr)> {

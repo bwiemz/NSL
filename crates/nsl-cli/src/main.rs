@@ -592,6 +592,10 @@ enum Cli {
         /// CEP: run compilation-verified pruning (requires --weights).
         #[arg(long)]
         cep_prune: bool,
+        /// CEP Mode 3 (paper §2.2): run joint prune-search (heads + FFN + layer drops).
+        /// Requires --weights. Mutually exclusive with --cep-prune.
+        #[arg(long)]
+        cep_joint: bool,
         /// CEP: target GPU for analysis (e.g. H100-SXM).
         #[arg(long)]
         cep_target: Option<String>,
@@ -604,6 +608,9 @@ enum Cli {
         /// CEP: also emit the pruned (sliced) weights to this .safetensors path.
         #[arg(long)]
         cep_emit_weights: Option<PathBuf>,
+        /// CEP SP2: also emit the rewritten NSL source with pruned dims to this path.
+        #[arg(long)]
+        cep_emit_source: Option<PathBuf>,
     },
 
     /// Run @test functions in an NSL file
@@ -876,6 +883,7 @@ fn main_inner() {
                     sparsity: None,
                     cep_out,
                     cep_emit_weights: None,
+                    cep_emit_source: None,
                 };
                 std::process::exit(run_cep_search(&file, &ov));
             }
@@ -1081,13 +1089,22 @@ fn main_inner() {
             calibration_batch_size,
             calibration_timeout,
             cep_prune,
+            cep_joint,
             cep_target,
             cep_sparsity,
             cep_out,
             cep_emit_weights,
+            cep_emit_source,
         } => {
             // M62a: shared_lib flag is threaded through compile_opts and handled
             // in the build path below.
+
+            if cep_prune && cep_joint {
+                eprintln!(
+                    "error: --cep-prune and --cep-joint are mutually exclusive (use one)"
+                );
+                std::process::exit(1);
+            }
 
             if cep_prune {
                 let ov = nsl_codegen::cep::CliOverrides {
@@ -1095,8 +1112,19 @@ fn main_inner() {
                     sparsity: cep_sparsity,
                     cep_out,
                     cep_emit_weights,
+                    cep_emit_source,
                 };
                 std::process::exit(run_cep_prune(&file, weights.as_deref(), &ov));
+            }
+
+            if cep_joint {
+                let ov = nsl_codegen::cep::CliOverrides {
+                    target: cep_target,
+                    sparsity: cep_sparsity,
+                    cep_out,
+                    cep_emit_weights,
+                };
+                std::process::exit(run_cep_joint(&file, weights.as_deref(), &ov));
             }
 
             if autotune_clean {
@@ -2901,6 +2929,154 @@ fn run_cep_prune(
                 let orig_params: usize = wm.entries().map(|(_, e)| e.num_elements).sum();
                 let new_params: usize = sliced.values().map(|e| e.num_elements).sum();
                 if let Err(e) = nsl_codegen::cep_slice::write_sliced_weights(&sliced, weights_out) {
+                    eprintln!("error: failed to write sliced weights: {e}");
+                    return 1;
+                }
+                println!(
+                    "CEP sliced weights written to {} ({orig_params} -> {new_params} params)",
+                    weights_out.display()
+                );
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                return 1;
+            }
+        }
+    }
+
+    // SP2: rewrite the source with chosen pruned dims and write to `cep_emit_source`.
+    if let Some(source_out) = ov.cep_emit_source.as_ref() {
+        let delta = nsl_codegen::cep::plan_to_prune_delta(&plan, &spec);
+        let original_source = match std::fs::read_to_string(file) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("error: failed to re-read source for SP2 emission: {e}");
+                return 1;
+            }
+        };
+        match nsl_codegen::cep_emit_source::apply_prune_delta_to_source(
+            &original_source,
+            module,
+            &resolve,
+            &spec,
+            &delta,
+        ) {
+            Ok(out_src) => {
+                if let Err(e) = std::fs::write(source_out, &out_src) {
+                    eprintln!("error: failed to write rewritten source: {e}");
+                    return 1;
+                }
+                println!("CEP rewritten source written to {}", source_out.display());
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                return 1;
+            }
+        }
+    }
+    0
+}
+
+/// CEP Mode 3 (paper §2.2) — joint prune-search. Same setup as `run_cep_prune` (reuses
+/// the @cep_prune decorator for v1 config; weights required for non-synthetic
+/// importance), but calls `nsl_codegen::cep::run_joint` to extend the action space with
+/// layer drops on top of head + FFN pruning.
+fn run_cep_joint(
+    file: &PathBuf,
+    weights: Option<&std::path::Path>,
+    ov: &nsl_codegen::cep::CliOverrides,
+) -> i32 {
+    use nsl_codegen::cep_extract::{cross_check_dims, extract_model_spec};
+
+    let Some(weights_path) = weights else {
+        eprintln!(
+            "error: --cep-joint requires --weights <file.safetensors> \
+             (joint search without weight-derived importance would be silently wrong)"
+        );
+        return 1;
+    };
+
+    let (interner, parse_result, analysis) = frontend_with_flags(file, false);
+    let analysis_errors: Vec<_> = analysis
+        .diagnostics
+        .iter()
+        .filter(|d| d.level == Level::Error)
+        .cloned()
+        .collect();
+    if !analysis_errors.is_empty() {
+        emit_cep_diags(file, &analysis_errors);
+        return 1;
+    }
+
+    let module = &parse_result.module;
+    let resolve = |s: nsl_ast::Symbol| interner.resolve(s.0).unwrap_or("").to_string();
+
+    let Some(deco) = find_cep_decorator(module, &interner, "cep_prune") else {
+        eprintln!("error: --cep-joint requires a @cep_prune(...) decorator on the model");
+        return 1;
+    };
+    let mut diags = Vec::new();
+    let Some(cfg) = nsl_semantic::cep::validate_cep_prune_decorator(deco, &resolve, &mut diags)
+    else {
+        emit_cep_diags(file, &diags);
+        return 1;
+    };
+    if emit_cep_diags(file, &diags) {
+        return 1;
+    }
+
+    let spec = match extract_model_spec(module, &resolve) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("{e}");
+            return 1;
+        }
+    };
+
+    let wm = match nsl_codegen::weight_aware::WeightMap::load(weights_path) {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("error: failed to load weights: {e}");
+            return 1;
+        }
+    };
+    if let Err(e) = cross_check_dims(&spec, &wm, &resolve) {
+        eprintln!("{e}");
+        return 1;
+    }
+
+    let target = resolve_cep_target(ov.target.as_deref(), cfg.target, &resolve);
+    let input = match nsl_codegen::cep::build_prune_input(
+        &cfg,
+        spec.clone(),
+        Some(&wm),
+        &target,
+        ov.sparsity,
+    ) {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!("{e}");
+            return 1;
+        }
+    };
+    let plan = nsl_codegen::cep::run_joint(input);
+    println!("{}", plan.render_report());
+
+    let out_path = ov.cep_out.clone().unwrap_or_else(|| default_cep_out(file));
+    if let Err(e) = nsl_codegen::cep::write_prune_delta(&plan, &spec, &out_path) {
+        eprintln!("error: failed to write delta: {e}");
+        return 1;
+    }
+    println!("CEP joint delta written to {}", out_path.display());
+
+    if let Some(weights_out) = ov.cep_emit_weights.as_ref() {
+        let delta = nsl_codegen::cep::plan_to_prune_delta(&plan, &spec);
+        match nsl_codegen::cep_slice::apply_prune_delta_to_weights(&wm, &spec, &delta) {
+            Ok(sliced) => {
+                let orig_params: usize = wm.entries().map(|(_, e)| e.num_elements).sum();
+                let new_params: usize = sliced.values().map(|e| e.num_elements).sum();
+                if let Err(e) = nsl_codegen::cep_slice::write_sliced_weights(&sliced, weights_out)
+                {
                     eprintln!("error: failed to write sliced weights: {e}");
                     return 1;
                 }

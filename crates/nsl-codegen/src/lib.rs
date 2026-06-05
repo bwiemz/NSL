@@ -124,6 +124,7 @@ pub mod bitnet;
 pub mod fp8;
 pub mod pca_activation;
 pub mod pca_detect;
+pub mod pca_per_doc;
 pub mod pca_rope;
 pub mod pca_segment;
 pub mod pca_tier_b;
@@ -156,6 +157,7 @@ pub mod epilogue_fusion;
 pub mod flash_attention;
 pub mod flash_attention_selector;
 pub mod flash_attention_v2;
+pub mod fused_linear_ce;
 pub mod fusion;
 pub mod fusion_graph;
 pub mod fusion_report;
@@ -174,6 +176,7 @@ pub mod cep_importance;
 pub mod cep_oracle;
 pub mod cep_rewrite;
 pub mod cep_search;
+pub mod cep_emit_source;
 pub mod cep_slice;
 pub mod cfie;
 pub mod cfie_fused_sample;
@@ -271,7 +274,7 @@ pub mod training {
 /// Quantization and reduced-precision execution.
 pub mod quantization {
     pub use crate::{
-        bitnet, fp8, pca_activation, pca_detect, pca_rope, pca_segment, pca_tier_b,
+        bitnet, fp8, pca_activation, pca_detect, pca_per_doc, pca_rope, pca_segment, pca_tier_b,
         pca_tile_config, pca_tilerange, pca_tileskip, weight_aware,
     };
 }
@@ -289,7 +292,7 @@ pub mod distributed {
 pub mod analysis {
     pub use crate::{
         autotune, calibration, cost_model, epilogue_fusion, flash_attention,
-        flash_attention_selector, flash_attention_v2, fusion, fusion_graph,
+        flash_attention_selector, flash_attention_v2, fused_linear_ce, fusion, fusion_graph,
         fusion_report, inspect, memory_planner, profiling, reduction_fusion, serve,
         wcet,
     };
@@ -300,7 +303,7 @@ pub mod analysis {
 pub mod experimental {
     pub use crate::{
         cep, cep_extract, cep_importance, cep_oracle, cep_rewrite, cep_search,
-        cep_slice, cfie, cfie_fused_sample, cfie_grammar, cfie_kv_plan,
+        cep_emit_source, cep_slice, cfie, cfie_fused_sample, cfie_grammar, cfie_kv_plan,
         cfie_kv_quant, cfie_persistent, cfie_speculative, csha, csha_apply,
         csha_boundary, csha_patterns, csha_pipeline, csha_specialize, fase,
         fase_clip, fase_codegen_table, fase_memory, fase_optimizer, multimodal,

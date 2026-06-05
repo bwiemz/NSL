@@ -100,6 +100,13 @@ pub use cuda::{
     nsl_test_cuda_jit_log,
 };
 
+// G3 fused linear-CE FFIs exposed for cross-crate integration tests.
+#[doc(hidden)]
+pub use fused_linear_ce::{
+    nsl_fused_linear_ce_forward,
+    nsl_fused_linear_ce_backward,
+};
+
 // CSHA Tier B.1 pre-pass PTX kernels (exposed for the GPU validation
 // tests in `tests/tier_b1_prepass_gpu.rs`; the orchestration FFI uses
 // them internally via `cuda::tier_b1_prepass::launch_*`).
@@ -199,6 +206,9 @@ pub mod peft;
 // WRGA B.3 Task 4: fused LoRA/IA³ adapter FFIs
 pub mod fused_adapter;
 
+// G3: Fused linear + cross-entropy kernel (separator-skip v1)
+pub mod fused_linear_ce;
+
 // M54: Unikernel runtime (bare-metal deployment)
 pub mod unikernel;
 
@@ -244,7 +254,8 @@ pub mod gpu {
 /// Automatic differentiation and training-time runtime support.
 pub mod training {
     pub use crate::{
-        autodiff, backward_context, checkpoint, grad_context, vmap_runtime, zero,
+        autodiff, backward_context, checkpoint, fused_linear_ce, grad_context,
+        vmap_runtime, zero,
     };
 }
 
