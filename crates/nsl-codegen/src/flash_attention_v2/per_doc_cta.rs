@@ -620,7 +620,42 @@ pub fn synthesize_per_doc_cta_backward(
     }
     ptx = ptx.replace(std_k_bound, new_k_bound);
 
-    // 9. NUL-terminate for cuModuleLoadData.
+    // 9. Bound q_load HBM read by `%k_max` instead of `%rd6` (seq_len).
+    //    `phases/backward/q_load.rs:59` emits a per-q_tile_iter guard
+    //    `setp.ge.u64 %p1, %rd34, %rd6` where %rd34 = q_row_global. Standard
+    //    backward skips rows past seq_len. For per-doc, the guard MUST also
+    //    skip rows in `[doc_end, doc_start + block_q)` — without this, when
+    //    `doc_start + block_q > seq_len` (block_q-aligned doc_start within
+    //    `seq_len - block_q .. seq_len`), the load would read past the
+    //    q_proj buffer end and fault with `CUDA_ERROR_ILLEGAL_ADDRESS`. The
+    //    downstream d_correction/finalize guards already produce zero
+    //    contributions for these polluted SMEM cells, but reading past HBM
+    //    is unsafe. Replace all occurrences.
+    let std_qload_bound =
+        "    setp.ge.u64 %p1, %rd34, %rd6;         // q_row_global >= seq_len?\n";
+    let new_qload_bound = "    setp.ge.u64 %p1, %rd34, %k_max;         // per-doc: skip past doc_end\n";
+    if !ptx.contains(std_qload_bound) {
+        return Err(
+            "per-doc backward synth: q_load HBM bound predicate not found".to_string(),
+        );
+    }
+    ptx = ptx.replace(std_qload_bound, new_qload_bound);
+
+    // 10. Bound kv_load HBM read by `%k_max` instead of `%rd6` (seq_len).
+    //     `phases/backward/kv_load.rs:54` emits `setp.ge.u64 %p1, %rd35, %rd6`
+    //     where %rd35 = k_row_global. Same rationale as step 9 — per-doc K/V
+    //     rows past doc_end must be skipped to prevent HBM faults on configs
+    //     where `k_start + block_kv > seq_len`. Replace all occurrences.
+    let std_kvload_bound = "    setp.ge.u64 %p1, %rd35, %rd6;\n";
+    let new_kvload_bound = "    setp.ge.u64 %p1, %rd35, %k_max;  // per-doc: skip past doc_end\n";
+    if !ptx.contains(std_kvload_bound) {
+        return Err(
+            "per-doc backward synth: kv_load HBM bound predicate not found".to_string(),
+        );
+    }
+    ptx = ptx.replace(std_kvload_bound, new_kvload_bound);
+
+    // 11. NUL-terminate for cuModuleLoadData.
     if !ptx.ends_with('\n') {
         ptx.push('\n');
     }
