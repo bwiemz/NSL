@@ -584,7 +584,43 @@ pub fn synthesize_per_doc_cta_backward(
     }
     ptx = ptx.replace(std_bound, new_bound);
 
-    // 7. NUL-terminate for cuModuleLoadData.
+    // 7. Bound d_correction + ds_compute padding-row skip by `%k_max` instead
+    //    of `%rd6`. Both emit `setp.ge.u64 %p0, %rd39, %rd6;` at the top of
+    //    each per-warp emission to zero/skip padding rows (q_row_global >=
+    //    seq_len). For per-doc, padding rows have q_row_global ∈ [doc_end,
+    //    seq_len) — these MUST be skipped to prevent garbage row_max/row_sum
+    //    reads from inflating P and propagating into dV/dK/dQ. Replace all
+    //    32+ occurrences (one per q_tile_iter * each emit site) with the
+    //    doc-end bound.
+    let std_padding_bound = "    setp.ge.u64 %p0, %rd39, %rd6;\n";
+    let new_padding_bound = "    setp.ge.u64 %p0, %rd39, %k_max;  // per-doc: skip padding past doc_end\n";
+    if !ptx.contains(std_padding_bound) {
+        return Err(
+            "per-doc backward synth: d_correction/ds_compute padding-row \
+             skip predicate not found"
+                .to_string(),
+        );
+    }
+    ptx = ptx.replace(std_padding_bound, new_padding_bound);
+
+    // 8. Bound ds_compute's k-column mask by `%k_max` instead of `%rd6`.
+    //    `ds_compute::emit` line 207 emits `setp.ge.u64 %p1, %rd42, %rd6;`
+    //    where %rd42 = lane + k_start = k_global. This masks k-columns past
+    //    seq_len to -INF in the recomputed P. For per-doc, k-columns in
+    //    [doc_end, seq_len) are cross-doc and MUST also be masked.
+    //    Replacing the bound forces P=0 for those k positions so dV[k] and
+    //    dK[k] for cross-doc k receive zero contribution.
+    let std_k_bound = "    setp.ge.u64 %p1, %rd42, %rd6;\n";
+    let new_k_bound = "    setp.ge.u64 %p1, %rd42, %k_max;  // per-doc: mask k-columns past doc_end\n";
+    if !ptx.contains(std_k_bound) {
+        return Err(
+            "per-doc backward synth: ds_compute k-column mask predicate not found"
+                .to_string(),
+        );
+    }
+    ptx = ptx.replace(std_k_bound, new_k_bound);
+
+    // 9. NUL-terminate for cuModuleLoadData.
     if !ptx.ends_with('\n') {
         ptx.push('\n');
     }
@@ -827,6 +863,30 @@ mod tests {
         assert!(
             ptx.contains("mov.u64 %k_max, %k_max_pdoc;"),
             "backward PTX must initialise k_max from doc_end"
+        );
+    }
+
+    #[test]
+    fn backward_synthesis_bounds_d_correction_padding_skip_by_k_max() {
+        let cfg = bwd_cfg();
+        let plan = build_bwd_plan(&cfg);
+        let ptx_bytes = synthesize_per_doc_cta_backward(&plan, &cfg)
+            .expect("backward synth must succeed");
+        let ptx = String::from_utf8_lossy(&ptx_bytes);
+        // d_correction / ds_compute padding-row skip MUST be bounded by
+        // %k_max (doc_end), not %rd6 (seq_len), so padding q-rows don't
+        // inflate dV/dK via garbage row_max/row_sum reads.
+        assert!(
+            !ptx.contains("setp.ge.u64 %p0, %rd39, %rd6;"),
+            "all d_correction/ds_compute padding-skip predicates must be patched"
+        );
+        assert!(
+            ptx.contains("setp.ge.u64 %p0, %rd39, %k_max;"),
+            "padding-skip predicate must use %k_max bound"
+        );
+        assert!(
+            ptx.contains("per-doc: skip padding past doc_end"),
+            "padding-skip replacement must carry the per-doc annotation"
         );
     }
 
