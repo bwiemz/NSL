@@ -1,3 +1,37 @@
+//! # nsl-codegen — Cranelift IR generation and native compilation
+//!
+//! This crate lowers the type-checked NSL AST into Cranelift IR, emits object
+//! code, and orchestrates the many analysis/optimization passes that run in
+//! between. It is the largest crate in the workspace, so its modules are
+//! organized into the subsystem groups below.
+//!
+//! ## Public API
+//!
+//! The **stable entry points** are re-exported at the crate root:
+//! [`compile`], [`compile_module`], [`compile_entry`], [`CompileOptions`],
+//! [`CodegenError`], and the `compile_*_returning_plan` family.
+//!
+//! For navigating internals, the modules are also surfaced through subsystem
+//! **facade namespaces** that mirror the architecture:
+//!
+//! - [`core`] — the compilation pipeline itself (compiler driver, statement /
+//!   expression lowering, linker, C-export/header emission, ownership).
+//! - [`gpu`] — GPU backends (PTX, AMDGPU, Metal, WGSL) and kernel lowering.
+//! - [`training`] — autodiff (tape + source-to-source), Wengert lists, `vmap`.
+//! - [`quantization`] — FP8, BitNet, AWQ/PCA precision tiering, weight analysis.
+//! - [`distributed`] — tensor / context / pipeline parallelism, MoE, CPDT.
+//! - [`analysis`] — cost model, autotuning, fusion, memory planning, WCET,
+//!   FlashAttention codegen, calibration.
+//! - [`experimental`] — research subsystems (CEP, CFIE, CSHA, WGGO, WRGA,
+//!   FASE, ZK, FPGA, unikernel, sparse, speculative, multimodal). These APIs
+//!   are **not stable** and may change or be removed between releases.
+//!
+//! These facades re-export the same modules that remain available at the crate
+//! root for backward compatibility; they exist to make the crate navigable and
+//! to flag which subsystems are experimental.
+//!
+//! See `ARCHITECTURE.md` in this crate for a fuller description.
+
 // Clippy style-lint churn new in 1.95+ that's not worth per-site fixes here:
 // - doc_overindented_list_items / doc_lazy_continuation / unused_parens: doc
 //   formatting pedantry that fires on preexisting ASCII diagrams.
@@ -27,29 +61,115 @@
     clippy::len_without_is_empty
 )]
 
+// ===========================================================================
+// Module declarations
+//
+// Every module is declared at the crate root (this keeps internal `crate::foo`
+// paths and existing `nsl_codegen::foo` consumers stable). They are grouped
+// below by subsystem for navigability, and re-surfaced through the facade
+// namespaces (`core`, `gpu`, `training`, `quantization`, `distributed`,
+// `analysis`, `experimental`) defined at the end of this file.
+// ===========================================================================
+
+// --- Core compilation pipeline -------------------------------------------
 pub mod agent;
-pub mod autotune;
 pub mod builtins;
 pub(crate) mod c_export_table;
 pub mod c_header;
 pub mod c_wrapper;
-pub mod calibration;
 pub mod compiler;
 pub mod context;
-pub mod context_parallel;
-pub mod cost_model;
-pub mod deterministic_kernels;
-pub mod profiling;
+pub mod dynamic_shapes;
+pub mod error;
+pub mod expr;
+pub mod ffi_ownership;
+pub mod func;
 pub mod grammar_compiler;
+pub mod linker;
+pub mod ownership;
+pub mod ownership_expr;
 pub mod schema_convert;
+pub mod standalone;
 pub mod stdlib_loader;
+pub mod stmt;
+pub mod stmt_fase;
+pub mod types;
+pub mod use_count;
 
-pub mod ad_rules;
+// --- GPU backends & kernel lowering --------------------------------------
 pub mod backend_amdgpu;
 pub mod backend_metal;
 pub mod backend_ptx;
 pub mod backend_wgsl;
+pub mod deterministic_kernels;
+pub mod gpu_specs;
+pub mod gpu_target;
+pub mod kernel;
+pub mod kernel_ir;
+pub mod kernel_lower;
+pub mod kernel_skeleton;
+pub mod matmul_mma;
+pub mod ptxas_validation;
+
+// --- Autodiff & training -------------------------------------------------
+pub mod ad_rules;
+pub mod source_ad;
+pub mod training_report;
+pub mod vmap;
+pub mod wengert;
+pub mod wengert_lower;
+
+// --- Quantization & precision --------------------------------------------
 pub mod bitnet;
+pub mod fp8;
+pub mod pca_activation;
+pub mod pca_detect;
+pub mod pca_per_doc;
+pub mod pca_rope;
+pub mod pca_segment;
+pub mod pca_tier_b;
+pub mod pca_tile_config;
+pub mod pca_tilerange;
+pub mod pca_tileskip;
+pub mod weight_aware;
+
+// --- Distributed & parallelism -------------------------------------------
+pub mod context_parallel;
+pub mod cpdt;
+pub mod cpdt_comm;
+pub mod cpdt_expert;
+pub mod cpdt_joint;
+pub mod cpdt_optim;
+pub mod cpdt_precision_exec;
+pub mod cpdt_sensitivity;
+pub mod cpdt_tier_apply;
+pub mod cpdt_zero;
+pub mod moe;
+pub mod moe_kernels;
+pub mod pipeline;
+pub mod tensor_parallel;
+
+// --- Cost model, fusion & analysis ---------------------------------------
+pub mod autotune;
+pub mod calibration;
+pub mod cost_model;
+pub mod epilogue_fusion;
+pub mod flash_attention;
+pub mod flash_attention_selector;
+pub mod flash_attention_v2;
+pub mod fused_linear_ce;
+pub mod fusion;
+pub mod fusion_graph;
+pub mod fusion_report;
+pub mod inspect;
+pub mod memory_planner;
+pub mod profiling;
+pub mod reduction_fusion;
+pub mod serve;
+pub mod wcet;
+
+// --- Experimental research subsystems ------------------------------------
+// These are NOT part of the stable API. See the `experimental` facade.
 pub mod cep;
 pub mod cep_extract;
 pub mod cep_importance;
@@ -65,84 +185,22 @@ pub mod cfie_kv_plan;
 pub mod cfie_kv_quant;
 pub mod cfie_persistent;
 pub mod cfie_speculative;
-pub mod cpdt;
-pub mod cpdt_comm;
-pub mod cpdt_expert;
-pub mod cpdt_joint;
-pub mod cpdt_optim;
-pub mod cpdt_sensitivity;
-pub mod cpdt_tier_apply;
-pub mod cpdt_precision_exec;
-pub mod cpdt_zero;
 pub mod csha;
 pub mod csha_apply;
 pub mod csha_boundary;
 pub mod csha_patterns;
 pub mod csha_pipeline;
 pub mod csha_specialize;
-pub mod dynamic_shapes;
-pub mod epilogue_fusion;
-pub mod error;
-pub mod expr;
 pub mod fase;
 pub mod fase_clip;
 pub mod fase_codegen_table;
 pub mod fase_memory;
 pub mod fase_optimizer;
-pub mod stmt_fase;
-pub mod flash_attention;
-pub mod flash_attention_v2;
-pub mod flash_attention_selector;
-pub mod fused_linear_ce;
-pub mod fp8;
-pub mod func;
-pub mod fusion;
-pub mod fusion_graph;
-pub mod fusion_report;
-pub mod gpu_specs;
-pub mod gpu_target;
-pub mod inspect;
-pub mod kernel;
-pub mod kernel_ir;
-pub mod kernel_lower;
-pub mod kernel_skeleton;
-pub mod linker;
-pub mod memory_planner;
-pub mod moe;
-pub mod moe_kernels;
 pub mod multimodal;
-pub mod ffi_ownership;
-pub mod ownership;
-pub mod ownership_expr;
-pub mod pca_activation;
-pub mod pca_detect;
-pub mod pca_per_doc;
-pub mod pca_rope;
-pub mod pca_segment;
-pub mod pca_tier_b;
-pub mod pca_tile_config;
-pub mod pca_tilerange;
-pub mod pca_tileskip;
-pub mod training_report;
-pub mod pipeline;
-pub mod ptxas_validation;
-pub mod reduction_fusion;
-pub mod serve;
-pub mod source_ad;
 pub mod sparse;
 pub mod speculative;
-pub mod standalone;
-pub mod stmt;
-pub mod tensor_parallel;
-pub mod types;
 pub mod unikernel;
 pub mod unikernel_boot;
-pub mod use_count;
-pub mod vmap;
-pub mod wcet;
-pub mod weight_aware;
-pub mod wengert;
-pub mod wengert_lower;
 pub mod wggo;
 pub mod wggo_apply;
 pub mod wggo_conflicts;
@@ -151,21 +209,16 @@ pub mod wggo_dp;
 pub mod wggo_gradient_scorer;
 pub mod wggo_graph;
 pub mod wggo_ilp;
+pub mod wggo_overrides;
+pub mod wggo_prune;
 pub mod wggo_schedule;
 pub mod wggo_weight_analysis;
 pub mod wggo_weight_analysis_cache;
 pub mod wggo_weight_analysis_nslweights;
-pub mod wggo_overrides;
-pub mod wggo_prune;
 pub use wggo_overrides::{
     OverrideDiagnostic, OverrideRejectReason, PerLayerOverride, WggoOverrides,
 };
-pub mod fpga_error;
-pub mod hir;
-pub mod backend_verilog;
-pub mod kernel_lower_fpga;  // M57.1 §3.3
 pub mod wrga;
-pub mod matmul_mma;
 pub mod wrga_adapter_init;
 pub mod wrga_adapter_inject;
 pub mod wrga_adapter_rewrite;
@@ -178,6 +231,96 @@ pub mod wrga_prune;
 pub mod wrga_roofline;
 pub mod wrga_spectral;
 pub mod zk;
+
+// FPGA / hardware-synthesis path (experimental).
+pub mod backend_verilog;
+pub mod fpga_error;
+pub mod hir;
+pub mod kernel_lower_fpga;  // M57.1 §3.3
+
+// ===========================================================================
+// Subsystem facade namespaces
+//
+// These re-export the modules above under architecture-oriented namespaces so
+// the crate is navigable without touching the (backward-compatible) crate-root
+// paths. New code is encouraged to import through these facades.
+// ===========================================================================
+
+/// Core compilation pipeline: the compiler driver, statement/expression
+/// lowering, linking, C-export/header emission, and ownership analysis.
+pub mod core {
+    pub use crate::{
+        agent, builtins, c_header, c_wrapper, compiler, context, dynamic_shapes,
+        error, expr, ffi_ownership, func, grammar_compiler, linker, ownership,
+        ownership_expr, schema_convert, standalone, stdlib_loader, stmt, stmt_fase,
+        types, use_count,
+    };
+}
+
+/// GPU code generation: device backends and kernel lowering.
+pub mod gpu {
+    pub use crate::{
+        backend_amdgpu, backend_metal, backend_ptx, backend_wgsl,
+        deterministic_kernels, gpu_specs, gpu_target, kernel, kernel_ir,
+        kernel_lower, kernel_skeleton, matmul_mma, ptxas_validation,
+    };
+}
+
+/// Automatic differentiation and training-time codegen.
+pub mod training {
+    pub use crate::{ad_rules, source_ad, training_report, vmap, wengert, wengert_lower};
+}
+
+/// Quantization and reduced-precision execution.
+pub mod quantization {
+    pub use crate::{
+        bitnet, fp8, pca_activation, pca_detect, pca_per_doc, pca_rope, pca_segment, pca_tier_b,
+        pca_tile_config, pca_tilerange, pca_tileskip, weight_aware,
+    };
+}
+
+/// Distributed execution and parallelism strategies.
+pub mod distributed {
+    pub use crate::{
+        context_parallel, cpdt, cpdt_comm, cpdt_expert, cpdt_joint, cpdt_optim,
+        cpdt_precision_exec, cpdt_sensitivity, cpdt_tier_apply, cpdt_zero, moe,
+        moe_kernels, pipeline, tensor_parallel,
+    };
+}
+
+/// Cost modeling, fusion, memory planning, and other analysis passes.
+pub mod analysis {
+    pub use crate::{
+        autotune, calibration, cost_model, epilogue_fusion, flash_attention,
+        flash_attention_selector, flash_attention_v2, fused_linear_ce, fusion, fusion_graph,
+        fusion_report, inspect, memory_planner, profiling, reduction_fusion, serve,
+        wcet,
+    };
+}
+
+/// Experimental research subsystems. **APIs here are unstable** and may change
+/// or be removed between releases.
+pub mod experimental {
+    pub use crate::{
+        cep, cep_extract, cep_importance, cep_oracle, cep_rewrite, cep_search,
+        cep_emit_source, cep_slice, cfie, cfie_fused_sample, cfie_grammar, cfie_kv_plan,
+        cfie_kv_quant, cfie_persistent, cfie_speculative, csha, csha_apply,
+        csha_boundary, csha_patterns, csha_pipeline, csha_specialize, fase,
+        fase_clip, fase_codegen_table, fase_memory, fase_optimizer, multimodal,
+        sparse, speculative, unikernel, unikernel_boot, wggo, wggo_apply,
+        wggo_conflicts, wggo_cost, wggo_dp, wggo_gradient_scorer, wggo_graph,
+        wggo_ilp, wggo_overrides, wggo_prune, wggo_schedule, wggo_weight_analysis,
+        wggo_weight_analysis_cache, wggo_weight_analysis_nslweights, wrga,
+        wrga_adapter_init, wrga_adapter_inject, wrga_adapter_rewrite,
+        wrga_fused_ptx, wrga_fusion, wrga_kernel_helpers, wrga_memory,
+        wrga_prescan, wrga_prune, wrga_roofline, wrga_spectral, zk,
+    };
+
+    /// FPGA / hardware-synthesis path (Verilog emission, HIR lowering).
+    pub mod fpga {
+        pub use crate::{backend_verilog, fpga_error, hir, kernel_lower_fpga};
+    }
+}
 
 /// Binary-internal modules re-exposed at the library level so integration
 /// tests can reach them without the source code living twice. The actual

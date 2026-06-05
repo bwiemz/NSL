@@ -1,6 +1,5 @@
 //! Diagnostic coverage tests for source-AD fallback paths.
 
-use assert_cmd::prelude::*;
 use std::process::Command;
 use tempfile::TempDir;
 
@@ -43,8 +42,7 @@ train(model = m, epochs = 1):
     let workspace_root = root.parent().unwrap().parent().unwrap();
     let stdlib = workspace_root.join("stdlib");
 
-    let out = Command::cargo_bin("nsl")
-        .unwrap()
+    let out = Command::new(nsl_bin())
         .env("NSL_STDLIB_PATH", &stdlib)
         .arg("run")
         .args(["--source-ad", "--target", "cuda_sm80"])
@@ -61,4 +59,18 @@ train(model = m, epochs = 1):
         stderr.contains("copy_data"),
         "warning should name the specific unrecognized FFI.\nstderr:\n{stderr}",
     );
+}
+/// Path to the `nsl` binary built by `cargo test --workspace`.
+///
+/// `nsl` lives in the sibling `nsl-cli` crate, so Cargo does not set
+/// `CARGO_BIN_EXE_nsl` for this crate's integration tests, and assert_cmd 2.2+
+/// no longer falls back to the target directory. Resolve it next to the running
+/// test executable instead: `target/<profile>/deps/<test>` -> `target/<profile>/nsl`.
+fn nsl_bin() -> std::path::PathBuf {
+    let mut dir = std::env::current_exe().expect("locate test executable");
+    dir.pop(); // drop the test-binary file name
+    if dir.ends_with("deps") {
+        dir.pop();
+    }
+    dir.join(format!("nsl{}", std::env::consts::EXE_SUFFIX))
 }
