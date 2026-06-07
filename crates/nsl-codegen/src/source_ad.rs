@@ -3450,7 +3450,7 @@ impl<'a> WengertExtractor<'a> {
     /// each chain is only removed once verified to have no remaining
     /// consumers in the completed tape.
     pub fn finalize(mut self) -> Option<WengertList> {
-        if !(self.is_static && !self.list.ops.is_empty()) {
+        if !self.is_static || self.list.ops.is_empty() {
             return None;
         }
         // Review Finding 1: run all pending fused-LCE prunes against
