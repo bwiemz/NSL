@@ -49,15 +49,26 @@ fn silu(x: f32) -> f32 {
     x * (1.0_f32 / (1.0_f32 + (-x).exp()))
 }
 
+fn gelu_tanh(x: f32) -> f32 {
+    // Identical formula to the production FFI — references the same f32
+    // constants so the test catches a typo regression in either.
+    const SQRT_2_OVER_PI: f32 = 0.7978845608028654_f32;
+    const GELU_CUBIC: f32 = 0.044715_f32;
+    let inner = SQRT_2_OVER_PI * (x + GELU_CUBIC * x * x * x);
+    0.5_f32 * x * (1.0_f32 + inner.tanh())
+}
+
+
 /// Single-token, single-expert forward pass. Used as the building block
 /// for the hand-computed multi-token reference, independent of
 /// route_topk / scatter / gather. Returns `out[hidden]`.
-fn ffn_expert_silu(
+fn ffn_expert(
     token: &[f32],
     w_up: &[f32],   // shape [hidden, intermediate], row-major
     w_down: &[f32], // shape [intermediate, hidden], row-major
     hidden: usize,
     intermediate: usize,
+    activation: fn(f32) -> f32,
 ) -> Vec<f32> {
     let mut x_up = vec![0.0_f32; intermediate];
     for j in 0..intermediate {
@@ -67,7 +78,7 @@ fn ffn_expert_silu(
         }
         x_up[j] = s;
     }
-    let x_act: Vec<f32> = x_up.iter().map(|&v| silu(v)).collect();
+    let x_act: Vec<f32> = x_up.iter().map(|&v| activation(v)).collect();
     let mut x_down = vec![0.0_f32; hidden];
     for h in 0..hidden {
         let mut s = 0.0_f32;
@@ -78,6 +89,7 @@ fn ffn_expert_silu(
     }
     x_down
 }
+
 
 #[test]
 fn dispatch_v3_silu_top_k_two_matches_hand_computed_reference() {
@@ -218,7 +230,7 @@ fn dispatch_v3_distinct_experts_top_k_one_matches_per_expert_reference() {
         let tok = &tokens[t * hidden..(t + 1) * hidden];
         let wu = &w_up[e * hidden * intermediate..(e + 1) * hidden * intermediate];
         let wd = &w_down[e * intermediate * hidden..(e + 1) * intermediate * hidden];
-        let out = ffn_expert_silu(tok, wu, wd, hidden, intermediate);
+        let out = ffn_expert(tok, wu, wd, hidden, intermediate, silu);
         // top_k=1 routing weight is exactly 1.0 (verified by v2.1 tests).
         for h in 0..hidden {
             expected[t * hidden + h] = out[h];
@@ -334,10 +346,15 @@ fn dispatch_v3_refuses_invalid_inputs() {
     assert_eq!(unsafe {
         nsl_moe_dispatch_full_v3(tokens_ptr, logits_ptr, w_up_ptr, w_down_ptr, 2, 3, cap, 2, 2, 1)
     }, 0, "must refuse top_k=3");
-    // Unknown activation kind.
+    // Unknown activation kind: 4 is past the v2.4 range (0=identity,
+    // 1=SiLU, 2=GELU, 3=ReLU). SwiGLU and others are v2.5+ deferrals.
     assert_eq!(unsafe {
-        nsl_moe_dispatch_full_v3(tokens_ptr, logits_ptr, w_up_ptr, w_down_ptr, 2, 1, cap, 2, 2, 2)
-    }, 0, "must refuse activation_kind=2 (only 0 or 1 supported in v2.2)");
+        nsl_moe_dispatch_full_v3(tokens_ptr, logits_ptr, w_up_ptr, w_down_ptr, 2, 1, cap, 2, 2, 4)
+    }, 0, "must refuse activation_kind=4 (only 0..=3 supported in v2.4)");
+    // Negative also refused (signed-i64 input).
+    assert_eq!(unsafe {
+        nsl_moe_dispatch_full_v3(tokens_ptr, logits_ptr, w_up_ptr, w_down_ptr, 2, 1, cap, 2, 2, -1)
+    }, 0, "must refuse activation_kind=-1");
     // Wrong up shape.
     let bad_up = make_f32_tensor(&[10], &vec![0.5_f32; 10]);
     assert_eq!(unsafe {
@@ -356,3 +373,242 @@ fn dispatch_v3_refuses_invalid_inputs() {
     nsl_tensor_free(bad_up);
     nsl_tensor_free(bad_down);
 }
+
+#[test]
+fn dispatch_v3_gelu_top_k_one_matches_hand_computed_reference() {
+    // 4 tokens × 3 distinct experts, top_k=1, hidden=3 intermediate=2.
+    // Same fixture as the SiLU variant; only the activation differs.
+    // Catches any cross-activation contamination (e.g. accidentally
+    // computing silu when the caller asked for gelu).
+    let total_tokens = 4_usize;
+    let hidden = 3_usize;
+    let intermediate = 2_usize;
+    let num_experts = 3_usize;
+
+    let tokens: Vec<f32> = vec![
+        1.0, 0.0, 0.0,
+        0.0, 1.0, 0.0,
+        0.0, 0.0, 1.0,
+        1.0, 1.0, 1.0,
+    ];
+    let logits: Vec<f32> = vec![
+        5.0, 0.0, 0.0,
+        0.0, 5.0, 0.0,
+        0.0, 0.0, 5.0,
+        5.0, 0.0, 0.0,
+    ];
+    let w_up: Vec<f32> = (0..num_experts * hidden * intermediate)
+        .map(|i| {
+            let e = i / (hidden * intermediate);
+            0.1 * ((e + 1) as f32) + 0.01 * ((i % 7) as f32)
+        })
+        .collect();
+    let w_down: Vec<f32> = (0..num_experts * intermediate * hidden)
+        .map(|i| {
+            let e = i / (intermediate * hidden);
+            -0.2 * ((e + 1) as f32) + 0.03 * ((i % 5) as f32)
+        })
+        .collect();
+
+    let routes: [usize; 4] = [0, 1, 2, 0];
+    let mut expected: Vec<f32> = vec![0.0_f32; total_tokens * hidden];
+    for (t, &e) in routes.iter().enumerate() {
+        let tok = &tokens[t * hidden..(t + 1) * hidden];
+        let wu = &w_up[e * hidden * intermediate..(e + 1) * hidden * intermediate];
+        let wd = &w_down[e * intermediate * hidden..(e + 1) * intermediate * hidden];
+        let out = ffn_expert(tok, wu, wd, hidden, intermediate, gelu_tanh);
+        for h in 0..hidden {
+            expected[t * hidden + h] = out[h];
+        }
+    }
+
+    let tokens_ptr = make_f32_tensor(&[total_tokens as i64, hidden as i64], &tokens);
+    let logits_ptr = make_f32_tensor(&[total_tokens as i64, num_experts as i64], &logits);
+    let w_up_ptr = make_f32_tensor(
+        &[num_experts as i64, (hidden * intermediate) as i64], &w_up,
+    );
+    let w_down_ptr = make_f32_tensor(
+        &[num_experts as i64, (intermediate * hidden) as i64], &w_down,
+    );
+
+    let out_ptr = unsafe {
+        nsl_moe_dispatch_full_v3(
+            tokens_ptr, logits_ptr,
+            w_up_ptr, w_down_ptr,
+            num_experts as i64,
+            1,
+            (2.0_f32).to_bits() as i64,
+            hidden as i64,
+            intermediate as i64,
+            2, // activation_kind = GELU
+        )
+    };
+    assert_ne!(out_ptr, 0);
+    let got = read_f32(out_ptr, total_tokens * hidden);
+
+    let mut max_abs = 0.0_f32;
+    for (g, w) in got.iter().zip(expected.iter()) {
+        let d = (g - w).abs();
+        if d > max_abs { max_abs = d; }
+    }
+    assert!(
+        max_abs <= 1e-6,
+        "v3 GELU diverges from per-token-per-expert reference: max_abs_diff={max_abs:.6e}"
+    );
+
+    nsl_tensor_free(tokens_ptr);
+    nsl_tensor_free(logits_ptr);
+    nsl_tensor_free(w_up_ptr);
+    nsl_tensor_free(w_down_ptr);
+    nsl_tensor_free(out_ptr);
+}
+
+#[test]
+fn dispatch_v3_relu_zeros_negative_intermediate_activations() {
+    // ReLU's defining property: negative pre-activations become exactly
+    // zero. Construct a fixture where W_up @ token has KNOWN-NEGATIVE
+    // intermediate entries: token = [1, 0], W_up = [[-2, -3], [0, 0]]
+    // (shape [hidden=2, intermediate=2]). Then x_up = [-2, -3]; ReLU
+    // zeros both. The down-proj receives [0, 0] regardless of its
+    // weights, so the output is [0, 0]. Pinning this catches any
+    // future regression that "softens" ReLU (e.g. accidentally swaps
+    // to SiLU which would produce nonzero output for negative inputs).
+    let tokens: Vec<f32> = vec![
+        1.0, 0.0,    // token 0
+        0.5, 0.5,    // token 1: x_up = [-2*0.5 + 0*0.5, -3*0.5 + 0*0.5] = [-1, -1.5] → ReLU → [0,0]
+    ];
+    let logits: Vec<f32> = vec![10.0, 0.0,  10.0, 0.0]; // both → expert 0
+    let w_up: Vec<f32> = vec![
+        -2.0, -3.0,  0.0, 0.0,   // expert 0: shape [hidden=2, intermediate=2]
+        7.0, 7.0,    7.0, 7.0,   // expert 1 (unused but must be valid f32)
+    ];
+    let w_down: Vec<f32> = vec![
+        1.0, 1.0,  1.0, 1.0,     // expert 0: any values; ReLU output is 0 so down result is 0
+        7.0, 7.0,  7.0, 7.0,     // expert 1 (unused)
+    ];
+    let expected: Vec<f32> = vec![
+        0.0, 0.0,
+        0.0, 0.0,
+    ];
+
+    let tokens_ptr = make_f32_tensor(&[2, 2], &tokens);
+    let logits_ptr = make_f32_tensor(&[2, 2], &logits);
+    let w_up_ptr = make_f32_tensor(&[2, 4], &w_up);
+    let w_down_ptr = make_f32_tensor(&[2, 4], &w_down);
+
+    let out_ptr = unsafe {
+        nsl_moe_dispatch_full_v3(
+            tokens_ptr, logits_ptr, w_up_ptr, w_down_ptr,
+            2, 1, (2.0_f32).to_bits() as i64, 2, 2,
+            3, // activation_kind = ReLU
+        )
+    };
+    assert_ne!(out_ptr, 0);
+    let got = read_f32(out_ptr, 4);
+    for (g, w) in got.iter().zip(expected.iter()) {
+        assert!((g - w).abs() < 1e-6, "ReLU on negative intermediates should zero them out: got={got:?} want={expected:?}");
+    }
+
+    nsl_tensor_free(tokens_ptr);
+    nsl_tensor_free(logits_ptr);
+    nsl_tensor_free(w_up_ptr);
+    nsl_tensor_free(w_down_ptr);
+    nsl_tensor_free(out_ptr);
+}
+
+#[test]
+fn dispatch_v3_relu_preserves_positive_intermediate_activations() {
+    // Complement to the previous test: ReLU on positive pre-activations
+    // must NOT change them. Token = [1, 0], W_up = identity → x_up = [1, 0].
+    // ReLU([1, 0]) = [1, 0] (0 is the boundary; ReLU(0) = max(0, 0) = 0,
+    // unchanged). W_down = identity → output = [1, 0]. The single matmul
+    // chain through identity activation matches.
+    let tokens: Vec<f32> = vec![1.0, 0.0];
+    let logits: Vec<f32> = vec![10.0, 0.0];
+    let w_up: Vec<f32> = vec![
+        1.0, 0.0,  0.0, 1.0,
+        7.0, 7.0,  7.0, 7.0,
+    ];
+    let w_down: Vec<f32> = vec![
+        1.0, 0.0,  0.0, 1.0,
+        7.0, 7.0,  7.0, 7.0,
+    ];
+    let expected: Vec<f32> = vec![1.0, 0.0];
+
+    let tokens_ptr = make_f32_tensor(&[1, 2], &tokens);
+    let logits_ptr = make_f32_tensor(&[1, 2], &logits);
+    let w_up_ptr = make_f32_tensor(&[2, 4], &w_up);
+    let w_down_ptr = make_f32_tensor(&[2, 4], &w_down);
+
+    let out_ptr = unsafe {
+        nsl_moe_dispatch_full_v3(
+            tokens_ptr, logits_ptr, w_up_ptr, w_down_ptr,
+            2, 1, (2.0_f32).to_bits() as i64, 2, 2,
+            3,
+        )
+    };
+    assert_ne!(out_ptr, 0);
+    let got = read_f32(out_ptr, 2);
+    for (g, w) in got.iter().zip(expected.iter()) {
+        assert!((g - w).abs() < 1e-6, "ReLU should preserve nonneg: got={got:?} want={expected:?}");
+    }
+
+    nsl_tensor_free(tokens_ptr);
+    nsl_tensor_free(logits_ptr);
+    nsl_tensor_free(w_up_ptr);
+    nsl_tensor_free(w_down_ptr);
+    nsl_tensor_free(out_ptr);
+}
+
+#[test]
+fn dispatch_v3_activations_produce_distinct_outputs() {
+    // Different activations on the SAME inputs must produce DIFFERENT
+    // outputs (except for trivial cases). Catches any bug where the
+    // activation selector silently fell through to one default for all
+    // kinds (e.g. a match-fallthrough that left every kind hitting the
+    // SiLU branch).
+    let tokens: Vec<f32> = vec![0.5, 0.7,  -0.3, 0.4]; // mixed signs after up-matmul
+    let logits: Vec<f32> = vec![10.0, 0.0,  10.0, 0.0];
+    let w_up: Vec<f32> = vec![
+        1.0, -1.0,  0.5, 0.5,  // expert 0: produces mixed-sign intermediates
+        7.0, 7.0,   7.0, 7.0,
+    ];
+    let w_down: Vec<f32> = vec![
+        1.0, 0.0,   0.0, 1.0,  // expert 0: identity-ish
+        7.0, 7.0,   7.0, 7.0,
+    ];
+
+    let mut outputs: Vec<Vec<f32>> = Vec::new();
+    for &act in &[1_i64, 2, 3] {
+        let tokens_ptr = make_f32_tensor(&[2, 2], &tokens);
+        let logits_ptr = make_f32_tensor(&[2, 2], &logits);
+        let w_up_ptr = make_f32_tensor(&[2, 4], &w_up);
+        let w_down_ptr = make_f32_tensor(&[2, 4], &w_down);
+
+        let out_ptr = unsafe {
+            nsl_moe_dispatch_full_v3(
+                tokens_ptr, logits_ptr, w_up_ptr, w_down_ptr,
+                2, 1, (2.0_f32).to_bits() as i64, 2, 2,
+                act,
+            )
+        };
+        assert_ne!(out_ptr, 0, "activation_kind={} failed", act);
+        outputs.push(read_f32(out_ptr, 4));
+
+        nsl_tensor_free(tokens_ptr);
+        nsl_tensor_free(logits_ptr);
+        nsl_tensor_free(w_up_ptr);
+        nsl_tensor_free(w_down_ptr);
+        nsl_tensor_free(out_ptr);
+    }
+
+    // Each pair must differ somewhere — if any two match bit-exactly,
+    // the activation selector dispatched both to the same branch.
+    fn diff_max(a: &[f32], b: &[f32]) -> f32 {
+        a.iter().zip(b.iter()).map(|(x, y)| (x - y).abs()).fold(0.0_f32, f32::max)
+    }
+    assert!(diff_max(&outputs[0], &outputs[1]) > 1e-5, "SiLU vs GELU: outputs[0]={:?} outputs[1]={:?}", outputs[0], outputs[1]);
+    assert!(diff_max(&outputs[1], &outputs[2]) > 1e-5, "GELU vs ReLU: outputs[1]={:?} outputs[2]={:?}", outputs[1], outputs[2]);
+    assert!(diff_max(&outputs[0], &outputs[2]) > 1e-5, "SiLU vs ReLU: outputs[0]={:?} outputs[2]={:?}", outputs[0], outputs[2]);
+}
+

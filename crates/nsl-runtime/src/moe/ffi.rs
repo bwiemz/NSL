@@ -594,22 +594,31 @@ pub extern "C" fn nsl_moe_dispatch_full_v2(
 ///   - experts_down_ptr shape == [n_experts, intermediate_dim * hidden_dim]
 ///
 /// ACTIVATION SELECTION:
-///   - activation_kind == 1 → SiLU = x * sigmoid(x)
 ///   - activation_kind == 0 → identity (no activation; only useful to
-///     differentiate v3-vs-v2 at the test level; production should use 1)
-///   - activation_kind ∈ other → refused (return 0). ReLU / GELU / etc
-///     are v2.3 deferrals.
+///     differentiate v3-vs-v2 at the test level; production should use
+///     a real activation)
+///   - activation_kind == 1 → SiLU = x * sigmoid(x). Mixtral / DeepSeek
+///     MoE default.
+///   - activation_kind == 2 → GELU (tanh approximation):
+///       0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x^3))).
+///     Matches PyTorch's `F.gelu(approximate='tanh')`. Used by GPT-2
+///     and earlier transformer FFNs.
+///   - activation_kind == 3 → ReLU = max(0, x). Pre-modern; included
+///     mostly for completeness + as a sanity-check baseline.
+///   - activation_kind ∈ other → refused (return 0). SwiGLU = (silu(gate)
+///     ⊙ up) @ down needs a third weight matrix and is a separate
+///     v2.5 FFI variant (v4).
 ///
 /// REFUSALS (return 0):
 ///   - any of experts_up_ptr, experts_down_ptr is null
 ///   - num_experts/hidden/intermediate <= 0
 ///   - top_k ∉ {1, 2} (route_topk asserts {1,2})
-///   - activation_kind ∉ {0, 1}
+///   - activation_kind ∉ {0, 1, 2, 3}
 ///   - mixed dtype between tokens / experts_up / experts_down
 ///   - experts_up.len   != n_experts * hidden * intermediate
 ///   - experts_down.len != n_experts * intermediate * hidden
 ///
-/// Deferrals (v2.next): bias on either matmul, GELU/ReLU,
+/// Deferrals (v2.next): bias on either matmul,
 /// gating-projection variant (SwiGLU = (gate ⊙ silu(up)) @ down),
 /// capacity-overflow renorm, GPU expert_parallel_matmul,
 /// FP16/mixed-precision experts, codegen lowering (v3 is reachable
@@ -640,7 +649,7 @@ pub extern "C" fn nsl_moe_dispatch_full_v3(
     if top_k != 1 && top_k != 2 {
         return 0;
     }
-    if activation_kind != 0 && activation_kind != 1 {
+    if !(0..=3).contains(&activation_kind) {
         return 0;
     }
 
@@ -730,17 +739,44 @@ pub extern "C" fn nsl_moe_dispatch_full_v3(
                 intermediate[j] = sum;
             }
 
-            // Activation. activation_kind==0 is identity (skip); ==1 is
-            // SiLU = x * sigmoid(x). Numerically safe for all finite
-            // f32: exp(-x)→∞ on large negative x gives silu→0 (correct
-            // limit); exp(-x)→0 on large positive x gives silu→x
-            // (correct limit). NaN inputs propagate NaN — caller's
-            // responsibility (consistent with the rest of moe/ffi.rs).
-            if activation_kind == 1 {
-                for v in intermediate.iter_mut() {
-                    let s = 1.0_f32 / (1.0_f32 + (-*v).exp());
-                    *v *= s;
+            // Activation. activation_kind selects the elementwise
+            // nonlinearity. All variants are numerically safe for all
+            // finite f32; NaN inputs propagate NaN (caller's
+            // responsibility, consistent with the rest of moe/ffi.rs).
+            //
+            //   0 → identity (skip)
+            //   1 → SiLU = x * sigmoid(x)
+            //   2 → GELU (tanh approximation, matches torch.gelu approx="tanh")
+            //   3 → ReLU = max(0, x)
+            match activation_kind {
+                0 => {}
+                1 => {
+                    for v in intermediate.iter_mut() {
+                        let s = 1.0_f32 / (1.0_f32 + (-*v).exp());
+                        *v *= s;
+                    }
                 }
+                2 => {
+                    // GELU(x) ≈ 0.5 * x * (1 + tanh(√(2/π) * (x + 0.044715 * x³)))
+                    // 0.7978845608 = sqrt(2.0 / std::f32::consts::PI), precomputed
+                    // as an f32 constant to avoid bringing the dependency into
+                    // this inner loop.
+                    const SQRT_2_OVER_PI: f32 = 0.7978845608028654_f32;
+                    const GELU_CUBIC: f32 = 0.044715_f32;
+                    for v in intermediate.iter_mut() {
+                        let x = *v;
+                        let inner = SQRT_2_OVER_PI * (x + GELU_CUBIC * x * x * x);
+                        *v = 0.5_f32 * x * (1.0_f32 + inner.tanh());
+                    }
+                }
+                3 => {
+                    for v in intermediate.iter_mut() {
+                        if *v < 0.0_f32 {
+                            *v = 0.0_f32;
+                        }
+                    }
+                }
+                _ => unreachable!("activation_kind {} bypassed the upfront refusal gate", activation_kind),
             }
 
             // x_down[h] = Σ_j x_act[j] * W_down[e][j, h]
