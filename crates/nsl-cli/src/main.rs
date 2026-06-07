@@ -1123,7 +1123,7 @@ fn main_inner() {
                     sparsity: cep_sparsity,
                     cep_out,
                     cep_emit_weights,
-                    cep_emit_source: None,
+                    cep_emit_source,
                 };
                 std::process::exit(run_cep_joint(&file, weights.as_deref(), &ov));
             }
@@ -1366,6 +1366,7 @@ fn main_inner() {
                 debug_training,
                 shared_lib,
                 wrga_inputs: None,
+                fused_ce_configs: Vec::new(),
                 wrga_fold_allocations,
                 wggo_mode: wggo.clone(),
                 wggo_report,
@@ -1789,6 +1790,7 @@ fn main_inner() {
                 debug_training,
                 shared_lib: false,
                 wrga_inputs: None,
+                fused_ce_configs: Vec::new(),
                 wrga_fold_allocations: false,
                 wggo_mode: None,
                 wggo_report: false,
@@ -2645,6 +2647,45 @@ fn module_data_to_wrga_inputs(m: &crate::loader::ModuleData) -> nsl_codegen::Wrg
     }
 }
 
+/// CFTP §4.4 G3 (Sprint 2): bridge `@fused_lm_ce(...)` configs from
+/// `AnalysisResult` into the codegen-side `FusedCeDecoratorConfig` newtype.
+/// Mirrors `analysis_to_wrga_inputs` — keeps nsl-codegen free of a direct
+/// nsl-semantic dependency.
+fn analysis_to_fused_ce_configs(
+    a: &nsl_semantic::AnalysisResult,
+) -> Vec<nsl_codegen::FusedCeDecoratorConfig> {
+    a.fused_ce_configs
+        .iter()
+        .map(|c| nsl_codegen::FusedCeDecoratorConfig {
+            enabled: c.enabled,
+            vocab_tile: c.vocab_tile,
+            vocab_size: c.vocab_size,
+            hidden_size: c.hidden_size,
+            batch_size: c.batch_size,
+            seq_len: c.seq_len,
+        })
+        .collect()
+}
+
+/// Mirror of `module_data_to_wrga_inputs` for `@fused_lm_ce` configs.
+/// Used by multi-file paths that consume the entry module's `ModuleData`
+/// rather than a single `AnalysisResult`.
+fn module_data_to_fused_ce_configs(
+    m: &crate::loader::ModuleData,
+) -> Vec<nsl_codegen::FusedCeDecoratorConfig> {
+    m.fused_ce_configs
+        .iter()
+        .map(|c| nsl_codegen::FusedCeDecoratorConfig {
+            enabled: c.enabled,
+            vocab_tile: c.vocab_tile,
+            vocab_size: c.vocab_size,
+            hidden_size: c.hidden_size,
+            batch_size: c.batch_size,
+            seq_len: c.seq_len,
+        })
+        .collect()
+}
+
 fn analysis_to_wrga_inputs(a: &nsl_semantic::AnalysisResult) -> nsl_codegen::WrgaInputs {
     use nsl_codegen::{
         AdapterDecoratorConfig, AdapterKind, FreezeDecoratorConfig, WrgaDecoratorConfig,
@@ -3264,6 +3305,7 @@ fn run_build_shared_single(
     check_wrga_report_preconditions(&analysis, wrga_report, options);
     let mut options = options.clone();
     options.wrga_inputs = Some(analysis_to_wrga_inputs(&analysis));
+    options.fused_ce_configs = analysis_to_fused_ce_configs(&analysis);
     // M62 Task 6: route weight_index_map from semantic analysis into codegen.
     options.weight_index_map = analysis.weight_index_map.clone();
     // M62: allocate a slot the compiler publishes @export functions into,
@@ -3556,6 +3598,7 @@ fn run_build_shared_multi(
             }
             let mut entry_options = options.clone();
             entry_options.wrga_inputs = Some(module_data_to_wrga_inputs(mod_data));
+            entry_options.fused_ce_configs = module_data_to_fused_ce_configs(mod_data);
             entry_options.export_functions_out = Some(exports_slot.clone());
             // M62: route entry-module weight_index_map so @export model methods
             // can resolve `self.<field>` → weight index on the multi-file path.
@@ -3709,6 +3752,7 @@ fn run_build_zk(
     check_wrga_report_preconditions(&analysis, wrga_report, options);
     let mut options = options.clone();
     options.wrga_inputs = Some(analysis_to_wrga_inputs(&analysis));
+    options.fused_ce_configs = analysis_to_fused_ce_configs(&analysis);
     // M62 Task 6: route weight_index_map from semantic analysis into codegen.
     options.weight_index_map = analysis.weight_index_map.clone();
     let options = &options;
@@ -3936,6 +3980,7 @@ fn run_build_standalone(
     check_wrga_report_preconditions(&analysis, wrga_report, options);
     let mut options = options.clone();
     options.wrga_inputs = Some(analysis_to_wrga_inputs(&analysis));
+    options.fused_ce_configs = analysis_to_fused_ce_configs(&analysis);
     // M62 Task 6: route weight_index_map from semantic analysis into codegen.
     options.weight_index_map = analysis.weight_index_map.clone();
     let options = &options;
@@ -4073,6 +4118,7 @@ fn run_build_single(
     // Task 1 (WRGA bridge): forward decorator configs captured by nsl-semantic.
     let mut options = options.clone();
     options.wrga_inputs = Some(analysis_to_wrga_inputs(&analysis));
+    options.fused_ce_configs = analysis_to_fused_ce_configs(&analysis);
     // M62 Task 6: route weight_index_map from semantic analysis into codegen so
     // compile_export_model_methods can resolve self.<field> → weight-array index.
     options.weight_index_map = analysis.weight_index_map.clone();
@@ -4322,6 +4368,7 @@ fn run_build_multi(
             }
             let mut entry_options = options.clone();
             entry_options.wrga_inputs = Some(module_data_to_wrga_inputs(mod_data));
+            entry_options.fused_ce_configs = module_data_to_fused_ce_configs(mod_data);
             let entry_options = &entry_options;
 
             match nsl_codegen::compile_entry_returning_plan(

@@ -446,6 +446,43 @@ impl<'a> TypeChecker<'a> {
                                 &mut self.diagnostics,
                             );
                         }
+                        // CFTP §4.4 G3: @fused_lm_ce decorator validation.
+                        // Validated configs are captured so codegen can
+                        // later substitute composite cross_entropy with the
+                        // fused linear-CE kernel. Sprint 2 (PR #226 follow-on)
+                        // wires only the decorator collection + plumbing; the
+                        // lowering-site auto-substitution is deferred to
+                        // Sprint 2.5 (see docs/superpowers/specs/2026-04-20-cftp-v2-followon.md
+                        // and the deferral note in
+                        // crates/nsl-codegen/src/wengert_lower.rs near
+                        // PrimalOp::CrossEntropyLoss).
+                        //
+                        // Enforces the design rule that @fused_lm_ce attaches
+                        // only to a `train` block — applying it elsewhere
+                        // produces a noise-free single error (matches the
+                        // pattern used by @freeze / @adapter above).
+                        if dname == "fused_lm_ce" {
+                            if !matches!(&stmt.kind, StmtKind::TrainBlock(_)) {
+                                self.diagnostics.push(
+                                    Diagnostic::error(
+                                        "@fused_lm_ce may only be applied to a `train` block"
+                                            .to_string(),
+                                    )
+                                    .with_label(deco.span, "invalid @fused_lm_ce target"),
+                                );
+                            } else {
+                                let resolve = |s: nsl_ast::Symbol| -> String {
+                                    self.interner.resolve(s.0).unwrap_or("").to_string()
+                                };
+                                if let Some(cfg) = crate::cftp::validate_fused_ce_decorator(
+                                    deco,
+                                    &resolve,
+                                    &mut self.diagnostics,
+                                ) {
+                                    self.fused_ce_configs.push(cfg);
+                                }
+                            }
+                        }
 
                         // WRGA: @wrga / @freeze / @adapter decorator validation.
                         // Validated configs are captured so codegen's

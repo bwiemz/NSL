@@ -4000,7 +4000,14 @@ impl Compiler<'_> {
             self.compile_call_by_name(builder, "nsl_set_training_mode", &[true_val])?;
 
             // 2. Try to extract Wengert list from step body
-            let mut extractor = crate::source_ad::WengertExtractor::new(self.interner);
+            //
+            // CFTP §4.4 G3 (Sprint 4): plumb the first `@fused_lm_ce` decorator
+            // into the extractor so `fused_linear_ce(...)` calls inside this
+            // train block can be recognised as a single `PrimalOp::FusedLinearCe`
+            // when v1's enabled + shape-hint preconditions hold.
+            let fused_ce_cfg = self.fused_ce_configs.first().cloned();
+            let mut extractor = crate::source_ad::WengertExtractor::new(self.interner)
+                .with_fused_ce_config(fused_ce_cfg);
 
             // Wire model method bodies and field types for inline expansion
             extractor.set_model_method_bodies(self.models.model_method_bodies.clone());

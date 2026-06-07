@@ -1208,6 +1208,37 @@ impl AdjointGenerator {
                 vec![y_bar, q, k, v, fwd_out],
             ),
 
+            // CFTP §4.4 G3 (Sprint 4): fused linear-CE backward extract.
+            // Lowers to a `FusedLinearCeBackwardExtract` op with the inputs
+            // the wengert lowerer expects:
+            //   [grad, x, W, bias, targets, fwd_result]
+            AdjointExpr::FusedLinearCeBackward {
+                grad,
+                x,
+                w,
+                bias,
+                targets,
+                fwd_result,
+                component,
+                vocab_size,
+                hidden_size,
+                batch_size,
+                seq_len,
+                vocab_tile,
+                ignore_index,
+            } => self.emit_op(
+                PrimalOp::FusedLinearCeBackwardExtract {
+                    component,
+                    vocab_size,
+                    hidden_size,
+                    batch_size,
+                    seq_len,
+                    vocab_tile,
+                    ignore_index,
+                },
+                vec![grad, x, w, bias, targets, fwd_result],
+            ),
+
             // --- RoPE backward: apply inverse rotation (rotate by -θ) ---
             // RoPE(x, θ) = R(θ)·x, so d/dx = R(θ)^T = R(-θ).
             // Negating the input is WRONG (that's reflection, not inverse rotation).
@@ -1462,6 +1493,15 @@ pub struct WengertExtractor<'a> {
     /// `MemberAccess` nodes (e.g. the synthesized `self.lora_A_<site>`
     /// accesses whose member Symbol is a sentinel field symbol).
     synth_member_names: HashMap<nsl_ast::NodeId, String>,
+    /// CFTP §4.4 G3 (Sprint 4): the active `@fused_lm_ce(...)` config
+    /// for this train block, if any.  When `enabled = true` AND all
+    /// shape hints (`vocab_size`, `hidden_size`, `batch_size`, `seq_len`)
+    /// are populated, the builtin-recognition pass emits a
+    /// `PrimalOp::FusedLinearCe` for matching `fused_linear_ce(...)` calls
+    /// instead of stepping into the composite stdlib body.  Otherwise the
+    /// composite path is used (preserving v1's safety + the composite-
+    /// fallback regression invariant required by Sprint 4 spec).
+    fused_ce_config: Option<crate::FusedCeDecoratorConfig>,
 }
 
 impl<'a> WengertExtractor<'a> {
@@ -1487,7 +1527,21 @@ impl<'a> WengertExtractor<'a> {
             named_param_vars: Vec::new(),
             synth_call_names: HashMap::new(),
             synth_member_names: HashMap::new(),
+            fused_ce_config: None,
         }
+    }
+
+    /// CFTP §4.4 G3 (Sprint 4): builder method for plumbing the
+    /// `@fused_lm_ce` decorator config into builtin recognition.  Callers
+    /// (compiler/train-block lowering) thread `compiler.fused_ce_configs[0]`
+    /// here when the active train block carries the decorator and v1's
+    /// opt-in gate is satisfied.
+    pub fn with_fused_ce_config(
+        mut self,
+        cfg: Option<crate::FusedCeDecoratorConfig>,
+    ) -> Self {
+        self.fused_ce_config = cfg;
+        self
     }
 
     fn alloc_var(&mut self) -> VarId {
@@ -2259,6 +2313,70 @@ impl<'a> WengertExtractor<'a> {
                         training: true,
                     },
                     "rmsnorm" | "rms_norm" => PrimalOp::RMSNorm { eps: 1e-5 },
+                    // CFTP §4.4 G3 (Sprint 4): user-facing `fused_linear_ce`.
+                    //
+                    // When the active train block carries `@fused_lm_ce(enabled=true)`
+                    // AND all four shape hints are populated, recognise the call
+                    // as a single `PrimalOp::FusedLinearCe` instead of stepping
+                    // into the stdlib composite (matmul + cross_entropy).
+                    //
+                    // When the decorator is absent or shape hints are missing,
+                    // we INTENTIONALLY return `None` so callers fall through to
+                    // the regular function-body lowering — preserving the
+                    // composite path's bit-identity for inference / disabled
+                    // decorators.  This honours the Sprint 4 regression
+                    // invariant: a program without `@fused_lm_ce` always emits
+                    // the composite.
+                    "fused_linear_ce" => {
+                        if args.len() != 4 {
+                            eprintln!(
+                                "[source-ad] fused_linear_ce expected 4 args (x, W, bias, targets), got {}",
+                                args.len()
+                            );
+                            return None;
+                        }
+                        if let Some(cfg) = self.fused_ce_config.as_ref() {
+                            if cfg.enabled {
+                                if let (Some(v), Some(h), Some(b), Some(s)) = (
+                                    cfg.vocab_size,
+                                    cfg.hidden_size,
+                                    cfg.batch_size,
+                                    cfg.seq_len,
+                                ) {
+                                    let vt = cfg.vocab_tile.unwrap_or(
+                                        crate::fused_linear_ce::FusedLinearCEConfig::default().vocab_tile,
+                                    );
+                                    let is_large = v
+                                        > crate::fused_linear_ce::LARGE_VOCAB_THRESHOLD;
+                                    let four = vec![
+                                        input_vars[0], input_vars[1],
+                                        input_vars[2], input_vars[3],
+                                    ];
+                                    self.push_op(WengertOp {
+                                        id: self.list.ops.len() as u32,
+                                        result,
+                                        op: PrimalOp::FusedLinearCe {
+                                            vocab_size: v,
+                                            hidden_size: h,
+                                            batch_size: b,
+                                            seq_len: s,
+                                            vocab_tile: vt,
+                                            ignore_index: -100,
+                                            is_large,
+                                        },
+                                        inputs: four,
+                                        saved_for_backward: false,
+                                        checkpointed: false,
+                                    });
+                                    return Some(result);
+                                }
+                            }
+                        }
+                        // Fall through: composite expansion via the regular
+                        // function-body lowering (stdlib `fused_linear_ce`
+                        // body in stdlib/nsl/nn/losses.nsl).
+                        return None;
+                    }
                     // Loss functions
                     "cross_entropy" | "cross_entropy_loss" => PrimalOp::CrossEntropyLoss,
                     "mse_loss" => PrimalOp::MSELoss,

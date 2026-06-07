@@ -693,6 +693,9 @@ fn launch_pca_backward(
             0i64, 0i64,
             // doc_starts ptr — null (rope_q=false, no doc-aware positions)
             0i64,
+            // PCA per-doc CTA backward (Sprint 5): num_docs_or_zero — 0
+            // means legacy per-q-block topology (Tier A; not per-doc).
+            0i64,
         )
     };
     // DEBUG: sync + report any async fault from the backward launch.
@@ -1704,6 +1707,9 @@ fn launch_pca_backward_ex(
             seg_dev,
             0i64, 0i64,                 // Tier B extension — null
             doc_starts_dev,             // doc_starts ptr
+            // PCA per-doc CTA backward (Sprint 5): num_docs_or_zero — 0
+            // means legacy per-q-block topology (Tier A; not per-doc).
+            0i64,
         )
     };
     unsafe {
