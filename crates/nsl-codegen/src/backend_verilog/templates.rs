@@ -18,13 +18,26 @@ pub fn emit_signal_ref(s: &SignalRef) -> String {
             let idx_str = emit_index_exprs(indices);
             format!("{}{}", array_name, idx_str)
         }
-        // M57.1 wire-array realization (Task W5): identical render shape to
-        // WireArrayElement — both lower to `name[idx0][idx1]...`. The HIR
-        // distinction (wire family vs const family) is preserved structurally
-        // for declaration emission and snapshot fidelity.
-        SignalRef::IndexedLocalParam { array_name, indices } => {
-            let idx_str = emit_index_exprs(indices);
-            format!("{}{}", array_name, idx_str)
+        // M57.1 wire-array realization (Task W5): flat bitvector bit-select.
+        // Yosys ≤0.44 rejects multi-dim packed localparams, so the array is
+        // stored as a 1D bitvector and accessed via `name[base +: W]` where
+        // `base = (i0*D1 + i1)*W` for 2D (or `i0*W` for 1D).
+        SignalRef::IndexedLocalParam { array_name, indices, dims, elem_width } => {
+            let w = *elem_width;
+            let base = match dims.len() {
+                1 => {
+                    let i0 = emit_index_expr_arith(&indices[0]);
+                    format!("{} * {}", i0, w)
+                }
+                2 => {
+                    let c = dims[1];
+                    let i0 = emit_index_expr_arith(&indices[0]);
+                    let i1 = emit_index_expr_arith(&indices[1]);
+                    format!("({} * {} + {}) * {}", i0, c, i1, w)
+                }
+                n => panic!("IndexedLocalParam: rank {} not supported in v1", n),
+            };
+            format!("{}[{} +: {}]", array_name, base, w)
         }
         // M57.1 wire-array realization (Task W5): Verilog indexed part-select.
         // Used to slice the `Port::Input("x_l<i>")` flat bus into per-element
@@ -60,7 +73,7 @@ pub fn emit_signal_ref(s: &SignalRef) -> String {
 
 /// M57.1 wire-array realization helper: render an `IndexExpr` chain into
 /// concatenated Verilog `[...]` subscripts. Shared between `WireArrayElement`,
-/// `IndexedLocalParam`, and `AssignWireArrayElement`.
+/// and `AssignWireArrayElement`.
 pub(crate) fn emit_index_exprs(indices: &[IndexExpr]) -> String {
     indices.iter()
         .map(|ix| match ix {
@@ -73,18 +86,32 @@ pub(crate) fn emit_index_exprs(indices: &[IndexExpr]) -> String {
         .collect()
 }
 
+/// Render an `IndexExpr` as an arithmetic expression (no wrapping brackets).
+/// Used by `IndexedLocalParam` flat bit-select emission.
+fn emit_index_expr_arith(ix: &IndexExpr) -> String {
+    match ix {
+        IndexExpr::Literal(n) => format!("{}", n),
+        IndexExpr::Genvar(name) => name.clone(),
+        IndexExpr::GenvarPlus(name, k) => format!("({} + {})", name, k),
+        IndexExpr::Reg(r) => format!("_r{}", r.0),
+        IndexExpr::RegPlus(r, k) => format!("(_r{} + {})", r.0, k),
+    }
+}
+
 pub fn emit_wire(w: &Wire) -> String {
     format!("wire signed [{}:0] _w{};", w.width - 1, w.id.0)
 }
 
 /// M57.1 wire-array realization (Task W2): module-scope multi-dim wire decl.
-/// Mechanical lowering — emits `wire signed [W-1:0] name [0:dims[0]-1]...;`
-/// (single space after name, no separator between dim brackets).
+/// Emits `wire signed [W-1:0] name [0:dims[0]-1]...;` with the unpacked
+/// dimensions placed AFTER the name (Verilog 2001 / SV unpacked-array style).
+/// Yosys ≤0.44 rejects 2D packed wire syntax (`wire [D][W] name`) with
+/// `unexpected '['` — unpacked arrays (`wire [W] name [0:D-1]`) are accepted.
 pub fn emit_wire_array(wa: &WireArray) -> String {
-    let dims_str: String = wa.dims.iter()
+    let unpacked_dims: String = wa.dims.iter()
         .map(|d| format!("[0:{}]", d - 1))
         .collect();
-    format!("wire signed [{}:0] {} {};", wa.width - 1, wa.name, dims_str)
+    format!("wire signed [{}:0] {} {};", wa.width - 1, wa.name, unpacked_dims)
 }
 
 /// M57.1 wire-array realization (Task W4): drives one element of a WireArray.
@@ -103,48 +130,28 @@ pub fn emit_local_param(lp: &LocalParam) -> String {
     )
 }
 
-/// M57.1 wire-array realization (Task W5): emit a module-scope multi-dim
-/// const array as `localparam signed [W-1:0] name [0:dim0-1]... = '{...};`.
-/// For 2D arrays the literal renders as a nested SystemVerilog `'{ }`. For
-/// 1D as a flat `'{ }`. Higher ranks panic (not exercised by v1 MLP).
+/// M57.1 wire-array realization (Task W5): emit a module-scope const array
+/// as a flat 1D bitvector localparam: `localparam signed [N*W-1:0] name = {…};`.
 ///
-/// Mechanical lowering — values flow verbatim through `{width}'sd{value}`,
-/// matching `emit_local_param`'s signed-decimal encoding. Snapshot tests
-/// elide localparam lines (`elide_localparams`) so the bulk of the W matrix
-/// content doesn't dominate the structural-skeleton snapshot.
+/// Yosys ≤0.44 rejects multi-dimensional packed localparams, so all arrays
+/// (1D and 2D) are flattened to a single `[total_bits-1:0]` declaration.
+/// The initializer uses a standard Verilog concat `{…}` (not the SV `'{…}`
+/// aggregate) so older Yosys versions accept it.
+///
+/// Bit layout: element at flat index `i` occupies bits `[i*W, i*W+W-1]`.
+/// Concat is MSB-first, so element `N-1` is first (highest bits). The
+/// corresponding `IndexedLocalParam` signal ref uses `name[i*W +: W]` (1D)
+/// or `name[(r*C+c)*W +: W]` (2D) to address individual elements.
 pub fn emit_local_param_array(lpa: &LocalParamArray) -> String {
-    let dims_str: String = lpa.dims.iter()
-        .map(|d| format!(" [0:{}]", d - 1))
-        .collect();
-    let values_str = match lpa.dims.len() {
-        2 => {
-            let (rows, cols) = (lpa.dims[0], lpa.dims[1]);
-            assert_eq!(lpa.values.len(), rows * cols,
-                "LocalParamArray.values len {} != rows({}) * cols({})",
-                lpa.values.len(), rows, cols);
-            let row_strs: Vec<String> = (0..rows).map(|r| {
-                let cells: Vec<String> = (0..cols).map(|c| {
-                    format!("{}'sd{}", lpa.width, lpa.values[r * cols + c])
-                }).collect();
-                format!("'{{{}}}", cells.join(", "))
-            }).collect();
-            format!("'{{{}}}", row_strs.join(", "))
-        }
-        1 => {
-            assert_eq!(lpa.values.len(), lpa.dims[0],
-                "LocalParamArray.values len {} != dim {}",
-                lpa.values.len(), lpa.dims[0]);
-            let cells: Vec<String> = lpa.values.iter()
-                .map(|v| format!("{}'sd{}", lpa.width, v))
-                .collect();
-            format!("'{{{}}}", cells.join(", "))
-        }
-        n => panic!("emit_local_param_array: rank {} not supported in v1", n),
-    };
-    format!(
-        "localparam signed [{}:0] {}{} = {};",
-        lpa.width - 1, lpa.name, dims_str, values_str
-    )
+    let total: usize = lpa.dims.iter().product();
+    let total_bits = total * lpa.width;
+    // MSB-first concat: element N-1 → highest bits, element 0 → lowest bits.
+    // Reversing values gives name[i*W +: W] == values[i].
+    let cells: Vec<String> = lpa.values.iter().rev().map(|v| {
+        format!("{}'sd{}", lpa.width, v)
+    }).collect();
+    let values_str = format!("{{{}}}", cells.join(", "));
+    format!("localparam signed [{}:0] {} = {};", total_bits - 1, lpa.name, values_str)
 }
 
 pub fn emit_mul(m: &Mul) -> String {
@@ -195,10 +202,13 @@ pub fn emit_wire_decl(d: &WireDecl) -> String {
 }
 
 /// M57.2 (Task 6): module-scope clocked register array — sequential sibling
-/// of `WireArray`. Emits `reg signed [w-1:0] {name} [0:dims[0]-1]...;`.
+/// of `WireArray`. Emits `reg signed [w-1:0] {name} [0:dims[0]-1]...;` using
+/// unpacked-array syntax (dims after name) for Yosys compatibility.
 pub fn emit_reg_array(ra: &RegArray) -> String {
-    let dims_str: String = ra.dims.iter().map(|d| format!("[0:{}]", d - 1)).collect();
-    format!("reg signed [{}:0] {} {};", ra.width - 1, ra.name, dims_str)
+    let unpacked_dims: String = ra.dims.iter()
+        .map(|d| format!("[0:{}]", d - 1))
+        .collect();
+    format!("reg signed [{}:0] {} {};", ra.width - 1, ra.name, unpacked_dims)
 }
 
 pub fn emit_sign_extend(s: &SignExtend) -> String {

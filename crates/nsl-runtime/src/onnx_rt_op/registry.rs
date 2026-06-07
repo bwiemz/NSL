@@ -77,7 +77,13 @@ pub fn make_custom_op_for_export(idx: i64, name: *const c_char) -> *const OrtCus
 
     let entry = Box::new(PerExportVtable {
         vtable: OrtCustomOp {
-            version: EXPECTED_ORT_API_VERSION,
+            // version == 1 tells ORT to route through CreateKernel (v1) and
+            // KernelCompute (v1). When version >= 2, ORT 1.16+ calls
+            // CreateKernelV2 / KernelComputeV2 instead — those stubs return
+            // null-success but never allocate any output tensors, producing
+            // None outputs. EXPECTED_ORT_API_VERSION (22) is the API query
+            // version, not the custom-op interface version.
+            version: 1,
             CreateKernel: vtable_create_kernel,
             GetName: vtable_get_name,
             GetExecutionProviderType: vtable_get_ep_type,
@@ -94,10 +100,9 @@ pub fn make_custom_op_for_export(idx: i64, name: *const c_char) -> *const OrtCus
             GetVariadicInputHomogeneity: vtable_get_variadic_hom,
             GetVariadicOutputMinArity: vtable_get_variadic_min,
             GetVariadicOutputHomogeneity: vtable_get_variadic_hom,
-            // Post-V1 callbacks — Spec C registers V1 only. These slots
-            // must be populated (ORT 1.16+ reads them unconditionally),
-            // but the v2 paths are never invoked because we set the v1
-            // KernelCompute slot above.
+            // Post-V1 slots — ORT 1.16+ reads these unconditionally even for
+            // version=1 ops, so they must be valid function pointers. They are
+            // never INVOKED for version=1 ops; the stubs are safety guards.
             CreateKernelV2: vtable_create_kernel_v2_unused,
             KernelComputeV2: vtable_kernel_compute_v2_unused,
             InferOutputShapeFn: vtable_infer_output_shape_unused,
@@ -144,8 +149,17 @@ unsafe extern "C" fn vtable_create_kernel(
     _info: *const OrtKernelInfo,
 ) -> *mut c_void {
     let entry = op as *const PerExportVtable;
-    let name_ptr = (*entry).name_cstr.as_ptr();
-    let raw_fn = resolve_self_symbol(name_ptr);
+    let name_cstr = &(*entry).name_cstr;
+    // Must resolve the `__nsl_dispatch` symbol, NOT the typed wrapper.
+    // The typed wrapper has signature (model*, desc*...) -> i32, which is
+    // incompatible with `ExportFnPtr` = (i64, i64, i64, i64, i64) -> i64.
+    // The dispatch wrapper has the correct 5-i64 ABI and correctly handles
+    // a null model_ptr (v1 stateless exports pass 0 as the model handle).
+    let dispatch_name = {
+        let base = name_cstr.to_string_lossy();
+        CString::new(format!("{}__nsl_dispatch", base)).unwrap()
+    };
+    let raw_fn = resolve_self_symbol(dispatch_name.as_ptr());
     if raw_fn == 0 {
         // Symbol not found. Return null kernel; ORT treats this as a
         // create-kernel failure. (No status-returning variant in V1 —
@@ -153,12 +167,18 @@ unsafe extern "C" fn vtable_create_kernel(
         return std::ptr::null_mut();
     }
     // SAFETY: dlsym/GetProcAddress returned a non-null pointer to a symbol
-    // codegen emitted with the `ExportFnPtr` signature.
+    // codegen emitted with the `ExportFnPtr` dispatch signature.
     let fn_ptr: ExportFnPtr = std::mem::transmute::<usize, ExportFnPtr>(raw_fn);
     let state = Box::new(NslOrtKernelState {
         api,
         fn_ptr,
-        model_ptr: 0, // v1: stateless exports only.
+        // v1: stateless exports only. Pass a non-null sentinel (1) rather than
+        // 0 because the codegen-emitted typed wrapper null-checks model_ptr
+        // and returns -1 if zero. Stateless exports never dereference the
+        // model pointer, so 1 safely bypasses the guard without accessing
+        // invalid memory. A genuine null-model error surfaces only when a
+        // weight-accessing export is called here, which v1 does not support.
+        model_ptr: 1,
     });
     Box::into_raw(state) as *mut c_void
 }

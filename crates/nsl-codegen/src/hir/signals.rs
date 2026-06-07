@@ -17,13 +17,19 @@ pub enum SignalRef {
         indices: Vec<IndexExpr>,
     },
     /// M57.1 wire-array realization (Task W5): reads one element of a
-    /// `LocalParamArray` declared at module scope. Identical shape to
-    /// `WireArrayElement` but lowers as a Verilog localparam read.
+    /// `LocalParamArray` declared at module scope. Lowers to a flat
+    /// bitvector bit-select: `name[(i0*D1+i1)*W +: W]` for 2D arrays
+    /// (Yosys ≤0.44 rejects multi-dimensional packed localparams).
     /// `array_name` matches a `LocalParamArray`'s `name`; `indices` must
-    /// be `dims.len()` long.
+    /// be `dims.len()` long. `dims` and `elem_width` mirror the
+    /// `LocalParamArray` fields needed for flat index computation.
     IndexedLocalParam {
         array_name: String,
         indices: Vec<IndexExpr>,
+        /// Shape of the underlying `LocalParamArray` (same as `LocalParamArray::dims`).
+        dims: Vec<usize>,
+        /// Width per element (same as `LocalParamArray::width`).
+        elem_width: usize,
     },
     /// M57.1 wire-array realization (Task W5): Verilog indexed part select on
     /// a Port (or wire) — emits `{name}[{base_bit} +: {width}]`. Used to
@@ -73,8 +79,13 @@ impl SignalRef {
     pub fn wire_array_element(name: impl Into<String>, indices: Vec<IndexExpr>) -> Self {
         Self::WireArrayElement { array_name: name.into(), indices }
     }
-    pub fn indexed_local_param(name: impl Into<String>, indices: Vec<IndexExpr>) -> Self {
-        Self::IndexedLocalParam { array_name: name.into(), indices }
+    pub fn indexed_local_param(
+        name: impl Into<String>,
+        indices: Vec<IndexExpr>,
+        dims: Vec<usize>,
+        elem_width: usize,
+    ) -> Self {
+        Self::IndexedLocalParam { array_name: name.into(), indices, dims, elem_width }
     }
     pub fn port_bit_slice(name: impl Into<String>, base_bit: usize, width: usize) -> Self {
         Self::PortBitSlice { name: name.into(), base_bit, width }

@@ -20,7 +20,7 @@ module tiny_mlp(
     generate for (genvar _gv1 = 0; _gv1 < 128; _gv1++) begin : gen_1
         generate for (genvar _gv2 = 0; _gv2 < 784; _gv2++) begin : gen_2
             wire signed [15:0] _w1;
-            assign _w1 = $signed(x_l1_a[_gv2]) * $signed(W1[_gv2][_gv1]);
+            assign _w1 = $signed(x_l1_a[_gv2]) * $signed(W1[(_gv2 * 128 + _gv1) * 8 +: 8]);
             wire signed [31:0] _w2;
             assign _w2 = {{16{_w1[15]}}, _w1};
             wire signed [31:0] _w3;
@@ -39,7 +39,7 @@ module tiny_mlp(
     generate for (genvar _gv4 = 0; _gv4 < 10; _gv4++) begin : gen_4
         generate for (genvar _gv5 = 0; _gv5 < 128; _gv5++) begin : gen_5
             wire signed [63:0] _w5;
-            assign _w5 = $signed(relu_l1[_gv5]) * $signed(W2[_gv5][_gv4]);
+            assign _w5 = $signed(relu_l1[_gv5]) * $signed(W2[(_gv5 * 10 + _gv4) * 32 +: 32]);
             wire signed [63:0] _w6;
             assign _w6 = $signed(acc_l2[_gv4][_gv5]) + $signed(_w5);
             assign acc_l2[_gv4][(_gv5 + 1)] = _w6;

@@ -178,7 +178,10 @@ impl FusedLinearCEConfig {
 
 // ─── Forward kernel synthesis ────────────────────────────────────────────────
 
-/// Synthesise the forward PTX for the fused linear-CE kernel.
+/// Synthesise the forward PTX for the fused linear-CE kernel (null-terminated).
+///
+/// Returns null-terminated PTX bytes suitable for `cuModuleLoadData` — matching
+/// the same convention as `backend_ptx::lower_kir_to_ptx`.
 ///
 /// Grid: `(batch_size * seq_len, 1, 1)` — one CTA per token row.
 /// Block: `(128, 1, 1)`.
@@ -191,11 +194,14 @@ impl FusedLinearCEConfig {
 ///      After the tile loop, compute `loss = -(logit_at_target - lse)` and
 ///      write to `loss_out` and `lse_out` (for backward reuse).
 pub fn synthesize_fused_linear_ce_ptx(cfg: &FusedLinearCEConfig) -> Vec<u8> {
-    let ptx = emit_fwd_kernel(cfg);
-    ptx.into_bytes()
+    let mut bytes = emit_fwd_kernel(cfg).into_bytes();
+    bytes.push(0); // null-terminate for cuModuleLoadData
+    bytes
 }
 
-/// Synthesise the backward PTX for the fused linear-CE kernel.
+/// Synthesise the backward PTX for the fused linear-CE kernel (null-terminated).
+///
+/// Returns null-terminated PTX bytes suitable for `cuModuleLoadData`.
 ///
 /// Grid/block: same as forward.
 /// Recomputes logits (no logits buffer saved), computes
@@ -203,8 +209,9 @@ pub fn synthesize_fused_linear_ce_ptx(cfg: &FusedLinearCEConfig) -> Vec<u8> {
 /// then scatters `dx += dlogits_v * W[v, :]` and
 /// `dW[v, :] += dlogits_v * x[row, :]` via atomic adds.
 pub fn synthesize_fused_linear_ce_backward_ptx(cfg: &FusedLinearCEConfig) -> Vec<u8> {
-    let ptx = emit_bwd_kernel(cfg);
-    ptx.into_bytes()
+    let mut bytes = emit_bwd_kernel(cfg).into_bytes();
+    bytes.push(0); // null-terminate for cuModuleLoadData
+    bytes
 }
 
 // ─── PTX emission — forward ───────────────────────────────────────────────────

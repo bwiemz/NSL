@@ -273,10 +273,9 @@ fn fused_linear_ce_gpu_forward_and_backward() {
 
     // ── 1. Synthesise PTX ────────────────────────────────────────────────
 
-    let mut fwd_ptx = synthesize_fused_linear_ce_ptx(&cfg);
-    fwd_ptx.push(0u8); // NUL-terminate for CUDA driver
-    let mut bwd_ptx = synthesize_fused_linear_ce_backward_ptx(&cfg);
-    bwd_ptx.push(0u8);
+    // synthesize_* returns null-terminated PTX (matches lower_kir_to_ptx convention).
+    let fwd_ptx = synthesize_fused_linear_ce_ptx(&cfg);
+    let bwd_ptx = synthesize_fused_linear_ce_backward_ptx(&cfg);
 
     let fwd_name = format!("{}\0", cfg.kernel_name());
     let bwd_name = format!("{}\0", cfg.bwd_kernel_name());

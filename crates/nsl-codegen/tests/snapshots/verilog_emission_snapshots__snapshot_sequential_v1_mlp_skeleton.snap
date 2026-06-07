@@ -23,7 +23,7 @@ module tiny_mlp_seq(
     reg signed [7:0] x_buf [0:783];
     reg signed [63:0] h_buf [0:127];
     wire signed [15:0] _w1;
-    assign _w1 = $signed(x_buf[_r3]) * $signed(W1[_r3][_r2]);
+    assign _w1 = $signed(x_buf[_r3]) * $signed(W1[(_r3 * 128 + _r2) * 8 +: 8]);
     wire signed [63:0] _w2;
     assign _w2 = {{48{_w1[15]}}, _w1};
     wire signed [63:0] _w3;
@@ -39,7 +39,7 @@ module tiny_mlp_seq(
     wire signed [0:0] _w8;
     assign _w8 = ($signed(_r2) == 127);
     wire signed [63:0] _w9;
-    assign _w9 = $signed(h_buf[_r3]) * $signed(W2[_r3][_r2]);
+    assign _w9 = $signed(h_buf[_r3]) * $signed(W2[(_r3 * 10 + _r2) * 32 +: 32]);
     wire signed [63:0] _w10;
     assign _w10 = $signed(_r4) + $signed(_w9);
     wire signed [63:0] _w11;
@@ -852,7 +852,7 @@ module tiny_mlp_seq(
               x_buf[781] <= x[6248 +: 8];
               x_buf[782] <= x[6256 +: 8];
               x_buf[783] <= x[6264 +: 8];
-              _r4 <= b1[0];
+              _r4 <= b1[0 * 32 +: 32];
               _r2 <= ZERO;
               _r3 <= ZERO;
               _r1 <= S_L1_MAC;
@@ -863,11 +863,11 @@ module tiny_mlp_seq(
               h_buf[_r2] <= _w4;
               _r3 <= ZERO;
               if (_w8) begin
-                _r4 <= b2[0];
+                _r4 <= b2[0 * 64 +: 64];
                 _r2 <= ZERO;
                 _r1 <= S_L2_MAC;
               end else begin
-                _r4 <= b1[(_r2 + 1)];
+                _r4 <= b1[(_r2 + 1) * 32 +: 32];
                 _r2 <= _w6;
               end
             end else begin
@@ -882,7 +882,7 @@ module tiny_mlp_seq(
               if (_w15) begin
                 _r1 <= S_DONE;
               end else begin
-                _r4 <= b2[(_r2 + 1)];
+                _r4 <= b2[(_r2 + 1) * 64 +: 64];
                 _r2 <= _w13;
               end
             end else begin
