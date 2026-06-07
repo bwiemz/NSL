@@ -50,11 +50,13 @@ fi
 # Generate Rust definitions from the upstream header. Allowlist Ort* and
 # ONNX* names; ignore standard C library types that bindgen would otherwise
 # splat into the output.
-# --no-rustfmt-bindings: skip rustfmt formatting pass; this check only
-# compares type-name sets, so formatting is irrelevant and rustfmt may not
-# be installed on the CI runner.
+# --formatter none: skip all formatting passes (rustfmt and prettyplease).
+# This check only compares type-name sets, so formatting is irrelevant and
+# neither formatter needs to be installed on the CI runner. (bindgen ≥0.66
+# renamed the old --no-rustfmt-bindings flag to --formatter <none|rustfmt|
+# prettyplease>; --formatter none covers both formatters.)
 bindgen \
-    --no-rustfmt-bindings \
+    --formatter none \
     --allowlist-type 'Ort.*|ONNX.*' \
     --allowlist-function 'Ort.*|ONNX.*' \
     --allowlist-var 'ORT_.*|ONNX_.*' \
@@ -71,14 +73,26 @@ bindgen \
 #
 # Field-by-field structural equality is NOT checked here; the binary-layout
 # assertions inside `vendored.rs` (`const _:` blocks) guard that property.
+#
+# IMPORTANT: grep is wrapped in a subshell `(grep ... || true)` so that a
+# zero-match result (exit code 1) does NOT trigger `set -euo pipefail` and
+# kill the script silently before any echo runs. Zero upstream matches are
+# caught explicitly by the non-empty check below.
 extract_types() {
     # shellcheck disable=SC2016
-    grep -hE '^(pub struct |pub enum |pub type )(Ort|ONNX)[A-Za-z0-9_]+' "$1" \
+    (grep -hE '^(pub struct |pub enum |pub type )(Ort|ONNX)[A-Za-z0-9_]+' "$1" || true) \
         | sed -E 's/^(pub struct |pub enum |pub type )//; s/[^A-Za-z0-9_].*$//' \
         | sort -u
 }
 extract_types "${GENERATED}" > "${UPSTREAM_SYMS}"
 extract_types "${VENDORED}" > "${VENDORED_SYMS}"
+
+if [[ ! -s "${UPSTREAM_SYMS}" ]]; then
+    echo "ERROR: bindgen produced no Ort*/ONNX* type declarations from ${HEADER}."
+    echo "This usually means bindgen failed silently or the allowlist did not match."
+    echo "Try running manually: bindgen --formatter none --allowlist-type 'Ort.*|ONNX.*' ${HEADER}"
+    exit 1
+fi
 
 # Spec C only vendors a subset of upstream types (Ort{Session,Status,...},
 # OrtApi, OrtApiBase, OrtCustomOp, OrtKernelContext, etc.). We assert that
