@@ -18,14 +18,14 @@ model SwiGLUFFN(d_model: int, d_ff: int, dropout_p: float):
         return (gate * up) @ self.w_down
 
 # Pre-norm transformer block: RMSNorm + GQA + SwiGLU.
-model TransformerBlock(d_model: int, n_heads: int, n_kv_heads: int, d_ff: int, dropout_p: float):
+model TransformerBlock(d_model: int, n_heads: int, n_kv_heads: int, head_dim: int, d_ff: int, dropout_p: float):
     attn_norm: RMSNorm = RMSNorm(d_model)
-    attn: GroupedQueryAttention = GroupedQueryAttention(d_model, n_heads, n_kv_heads, dropout_p)
+    attn: GroupedQueryAttention = GroupedQueryAttention(d_model, n_heads, n_kv_heads, head_dim, dropout_p)
     ffn_norm: RMSNorm = RMSNorm(d_model)
     ffn: SwiGLUFFN = SwiGLUFFN(d_model, d_ff, dropout_p)
 
 @cep_prune(target = h100, sparsity = 0.3, granularity = "head+ffn")
 model TinyCoder:
     embed: Tensor = randn([256, 64]) * full([1], 0.02)
-    blocks: [TransformerBlock; 2] = TransformerBlock(64, 4, 2, 128, 0.1)
+    blocks: [TransformerBlock; 2] = TransformerBlock(64, 4, 2, 16, 128, 0.1)
     norm: RMSNorm = RMSNorm(64)

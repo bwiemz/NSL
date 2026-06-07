@@ -3,7 +3,7 @@ from nsl.nn.losses import cross_entropy
 
 model TinyGqa:
     embed: Tensor = randn([32, 8])
-    attn: GroupedQueryAttention = GroupedQueryAttention(8, 2, 1, 0.0)
+    attn: GroupedQueryAttention = GroupedQueryAttention(8, 2, 1, 4, 0.0)
     w_out: Tensor = randn([8, 32])
 
     fn forward(self, input_ids: Tensor) -> Tensor:
