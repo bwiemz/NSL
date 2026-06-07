@@ -1115,7 +1115,7 @@ impl Compiler<'_> {
                                     if let ExprKind::IntLiteral(n) = &arg.value.kind {
                                         if *n > 0 {
                                             return Err(CodegenError::new(
-                                                "@attention_sink(tokens=N) configured but SMEM cache emission is deferred to a future sprint (paper §4.3 v1). num_sink_tokens > 0 is currently not supported at codegen. To exercise the API surface set tokens=0 or omit the decorator."
+                                                "@attention_sink(tokens=N) configured but SMEM cache emission is deferred to a future sprint (paper §4.3 v1). num_sink_tokens > 0 is currently not supported at codegen. To disable sinks, omit the decorator (tokens=0 is rejected by the semantic checker per cycle-4 Sprint 2 Rule 3a)."
                                                     .to_string(),
                                             ));
                                         }
