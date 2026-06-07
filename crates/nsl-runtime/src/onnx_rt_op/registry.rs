@@ -167,7 +167,13 @@ unsafe extern "C" fn vtable_create_kernel(
     let state = Box::new(NslOrtKernelState {
         api,
         fn_ptr,
-        model_ptr: 0, // v1: stateless exports only.
+        // v1: stateless exports only. Pass a non-null sentinel (1) rather than
+        // 0 because the codegen-emitted typed wrapper null-checks model_ptr
+        // and returns -1 if zero. Stateless exports never dereference the
+        // model pointer, so 1 safely bypasses the guard without accessing
+        // invalid memory. A genuine null-model error surfaces only when a
+        // weight-accessing export is called here, which v1 does not support.
+        model_ptr: 1,
     });
     Box::into_raw(state) as *mut c_void
 }
