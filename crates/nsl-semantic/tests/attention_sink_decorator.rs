@@ -50,9 +50,20 @@ fn attention_sink_errs(src: &str) -> Vec<String> {
 }
 
 /// Positive: `@flash_attention` + `@attention_sink(tokens=4)` on the
-/// same fn is clean — the decorator extraction site threads `tokens=4`
-/// into `config.num_sink_tokens`. tokens=4 is the canonical value (paper
-/// §4.3: 4 sink tokens stabilize streaming attention).
+/// same fn is clean at the SEMANTIC layer — the decorator extraction
+/// site at codegen will thread `tokens=4` into `config.num_sink_tokens`.
+/// tokens=4 is the canonical value (paper §4.3: 4 sink tokens stabilize
+/// streaming attention).
+///
+/// NOTE — Sprint 2 cycle-5 codegen refusal: while this configuration
+/// is SEMANTICALLY valid (syntax + argument shape are right), the
+/// codegen layer currently REFUSES `num_sink_tokens > 0` until the
+/// paper §4.3 SMEM cache emission lands. That refusal is exercised in
+/// `nsl-codegen/tests/attention_sink_decorator_integration.rs::nonzero_tokens_refused_with_deferral_message`.
+/// The semantic checker is the right layer to accept valid syntax and
+/// the codegen layer is the right layer to refuse the not-yet-emitted
+/// path — leave this test asserting clean semantics regardless of the
+/// codegen state.
 #[test]
 fn flash_attention_with_attention_sink_is_clean() {
     let src = "\

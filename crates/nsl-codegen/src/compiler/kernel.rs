@@ -959,7 +959,14 @@ impl Compiler<'_> {
         // wired end-to-end, but the SMEM-layout codegen that would
         // materialize the sink cache is DEFERRED to a future sprint.
         // `0` is the sentinel for "sinks disabled".
-        let mut num_sink_tokens: u32 = 0;
+        //
+        // Sprint 2 cycle-5: the only previous assignment site has been
+        // replaced with a refusal (see `attention_sink` arm below), so
+        // this binding is currently always `0` at the three
+        // FlashAttentionConfig construction sites. When SMEM emission
+        // lands, restore the `mut` qualifier and the
+        // `num_sink_tokens = *n as u32` assignment in the decorator arm.
+        let num_sink_tokens: u32 = 0;
         // DOC-GAP F.2: optional `head_dim` argument on `@flash_attention`.
         // Default 64 matches historical behaviour; set explicitly via
         // `@flash_attention(head_dim=32)` to pick a config that fits the
@@ -1085,6 +1092,18 @@ impl Compiler<'_> {
                     // Semantic validation (`stmt.rs`) catches negative /
                     // zero / non-literal / unknown-arg cases up front,
                     // so this loop only handles the happy path.
+                    //
+                    // Sprint 2 cycle-5 (this commit) closes the silent-
+                    // correctness gap that v0 left open: a user writing
+                    // `@attention_sink(tokens=4)` would have compiled
+                    // cleanly and run as if sinks were disabled, with no
+                    // error or warning. Refuse the configuration HERE,
+                    // at the decorator-extraction site, so the error
+                    // lands as close to the user's source as possible.
+                    // tokens=0 cannot be written (semantic rejects it);
+                    // users who want sinks disabled simply omit the
+                    // decorator entirely (num_sink_tokens stays at the
+                    // local-default 0 and flows through unchanged).
                     if let Some(ref args) = deco.args {
                         for arg in args {
                             if let Some(ref name_sym) = arg.name {
@@ -1095,7 +1114,10 @@ impl Compiler<'_> {
                                 if aname == "tokens" {
                                     if let ExprKind::IntLiteral(n) = &arg.value.kind {
                                         if *n > 0 {
-                                            num_sink_tokens = *n as u32;
+                                            return Err(CodegenError::new(
+                                                "@attention_sink(tokens=N) configured but SMEM cache emission is deferred to a future sprint (paper §4.3 v1). num_sink_tokens > 0 is currently not supported at codegen. To exercise the API surface set tokens=0 or omit the decorator."
+                                                    .to_string(),
+                                            ));
                                         }
                                     }
                                 }

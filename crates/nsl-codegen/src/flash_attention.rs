@@ -154,12 +154,18 @@ pub struct FlashAttentionConfig {
     /// tokens (typically 4) to stabilize streaming attention with rolling
     /// KV cache.
     ///
-    /// v0 API-surface landing (Sprint 2 cycle-4): this field is wired
-    /// through decorator extraction + semantic validation + integration
-    /// pin, but the SMEM-layout codegen that actually materializes the
-    /// sink cache is DEFERRED to a future sprint (paper §4.3 Phase 5 v1).
-    /// `num_sink_tokens = 0` is the sentinel for "sinks disabled" and is
-    /// the only value the codegen path currently respects.
+    /// v0 API-surface state (Sprint 2 cycle-4 + Sprint 2 cycle-5 refusal):
+    /// the decorator + config + semantic validation ARE wired through,
+    /// but the SMEM-cache codegen is DEFERRED to a future sprint. Configs
+    /// with `num_sink_tokens > 0` are REFUSED at codegen with a clear
+    /// error rather than silently producing rope-effectively-off output.
+    /// The only value that flows through to PTX synthesis today is `0`
+    /// (the sentinel "sinks disabled" state — users who want disabled
+    /// simply omit the `@attention_sink` decorator entirely). When the
+    /// SMEM-emission sprint lands, lift the refusal in
+    /// `compiler/kernel.rs::attention_sink` and extend the integration
+    /// test in `attention_sink_decorator_integration.rs` with a gated
+    /// PTX probe.
     pub num_sink_tokens: u32,
     /// Target GPU SM version for PTX target selection (default: 52).
     pub gpu_sm: u32,

@@ -1,0 +1,17 @@
+# Sprint 2 cycle-5 fixture (paper §4.3 attention sinks API surface v0).
+#
+# Pins the "sinks disabled" sentinel path: when `@attention_sink` is
+# OMITTED, the decorator-extraction site leaves `num_sink_tokens=0` (the
+# local-default) and compilation flows through cleanly with no refusal.
+#
+# This is the ONLY way users can express "sinks off" — the semantic
+# checker rejects `@attention_sink(tokens=0)` up front (Rule 3a in
+# `nsl-semantic/tests/attention_sink_decorator.rs`), so omission is the
+# sentinel.
+#
+# Companion to `attention_sink_decorator.nsl`, which carries
+# `tokens=4` and (post-Sprint-2-cycle-5) hits the codegen refusal.
+
+@flash_attention
+fn forward():
+    pass

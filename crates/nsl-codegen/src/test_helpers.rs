@@ -518,3 +518,42 @@ pub fn flash_attention_sink_context_for_source(
         None => (false, None),
     }
 }
+
+/// Sprint 2 cycle-5 (paper §4.3 silent-gap closure) observation helper:
+/// fallible variant of [`flash_attention_sink_context_for_source`] that
+/// returns the compile error string instead of panicking. Used by the
+/// integration test to assert that `@attention_sink(tokens=N)` with
+/// `N > 0` is REFUSED at codegen — the cycle-4 v0 API surface left a
+/// silent correctness gap (decorator parsed, config set, but no SMEM
+/// emission → user output was rope-effectively-off with no warning).
+///
+/// On success returns `Ok((context_set, num_sink_tokens_flag))` with
+/// the same semantics as the panicking helper. On compile failure
+/// returns `Err(error_message)` for substring assertions.
+pub fn try_flash_attention_sink_context_for_source(
+    src: &str,
+) -> Result<(bool, Option<u32>), String> {
+    use nsl_errors::FileId;
+
+    let mut interner = Interner::new();
+    let (tokens, _lex_diags) = nsl_lexer::tokenize(src, FileId(0), &mut interner);
+    let parsed = nsl_parser::parse(&tokens, &mut interner);
+    let stmts = parsed.module.stmts.clone();
+    let type_map: TypeMap = TypeMap::new();
+    let opts = crate::CompileOptions {
+        target: "sm_80".to_string(),
+        ..Default::default()
+    };
+
+    let mut compiler = crate::compiler::Compiler::new(&interner, &type_map, &opts)
+        .map_err(|e| format!("Compiler::new failed: {e}"))?;
+
+    compiler
+        .compile_flash_attention_kernels(&stmts)
+        .map_err(|e| format!("{e}"))?;
+
+    Ok(match compiler.kernels.flash_attention_context {
+        Some(ctx) => (true, Some(ctx.config.num_sink_tokens)),
+        None => (false, None),
+    })
+}
