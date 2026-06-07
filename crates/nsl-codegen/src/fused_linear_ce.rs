@@ -103,11 +103,25 @@ pub const LARGE_VOCAB_THRESHOLD: u32 = 8192;
 /// GPT-3=50257, LLaMA-3=128256) with headroom.
 pub const MAX_VOCAB_HARD_CEILING: u32 = 262_144;
 
-/// Dtype selector for FusedLinearCE.  Both v1 single-CTA and Sprint-3
-/// large-vocab paths support F32 only.
+/// Dtype selector for FusedLinearCE.
+///
+/// Both v1 single-CTA and Sprint-3 large-vocab paths support **F32** and
+/// **F16** (Sprint v3-2). F16 uses the standard mixed-precision convention:
+/// loads/stores in `.f16`, accumulators (online-LSE max + sum, dot products)
+/// in `.f32`. The large-vocab partials buffer stays f32 for numerical
+/// robustness regardless of input dtype. The backward gradient outputs
+/// (dx/dW/dbias) are also written in f32 even at `Dtype::F16` — this matches
+/// PyTorch's mixed-precision convention where master weights and the
+/// optimizer state stay at f32 while only forward activations + weights
+/// halve their footprint.
+///
+/// **Bf16** is deferred to a v4 follow-on (structurally identical to fp16
+/// emit-wise but different exponent biasing → wider tolerance bounds need
+/// validation against a bf16-aware reference).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dtype {
     F32,
+    F16,
 }
 
 impl Dtype {
@@ -115,6 +129,57 @@ impl Dtype {
     pub fn tag(self) -> &'static str {
         match self {
             Dtype::F32 => "f32",
+            Dtype::F16 => "f16",
+        }
+    }
+
+    /// Storage size in bytes of one element in HBM / SMEM. Used to size the
+    /// online-softmax SMEM tile and to compute byte strides for HBM
+    /// addressing.
+    #[inline]
+    pub fn bytes_per_elem(self) -> u32 {
+        match self {
+            Dtype::F32 => 4,
+            Dtype::F16 => 2,
+        }
+    }
+
+    /// PTX type-suffix for `ld.global.*` / `ld.shared.*` loads.
+    ///
+    /// Matches `tag()` today, kept as a separate accessor so future dtypes
+    /// (bf16) that share a load family with f16 but have a different
+    /// kernel-name tag don't accidentally collide.
+    #[inline]
+    pub fn ptx_load_suffix(self) -> &'static str {
+        match self {
+            Dtype::F32 => "f32",
+            Dtype::F16 => "f16",
+        }
+    }
+
+    /// PTX type-suffix for `st.global.*` / `st.shared.*` stores. Same family
+    /// as `ptx_load_suffix` today; kept distinct for future asymmetric paths.
+    #[inline]
+    pub fn ptx_store_suffix(self) -> &'static str {
+        match self {
+            Dtype::F32 => "f32",
+            Dtype::F16 => "f16",
+        }
+    }
+
+    /// The PTX register family used to *hold* one element in registers
+    /// during HBM↔SMEM staging at this dtype.
+    ///
+    /// For `F32` this is `"f32"` (registers used directly for math). For
+    /// `F16` we move bytes through `.b16` registers and explicitly
+    /// `cvt.f32.f16`/`cvt.rn.f16.f32` to/from `.f32` math registers — this
+    /// matches the standard mixed-precision convention and keeps the
+    /// algorithm in f32 precision end-to-end.
+    #[inline]
+    pub fn ptx_reg_family(self) -> &'static str {
+        match self {
+            Dtype::F32 => "f32",
+            Dtype::F16 => "b16",
         }
     }
 }
@@ -208,8 +273,9 @@ impl FusedLinearCEConfig {
                 self.hidden_size
             ));
         }
-        if self.dtype != Dtype::F32 {
-            return Err("fused_linear_ce v1: only Dtype::F32 is supported".into());
+        // F32 + F16 accepted (Sprint v3-2). Bf16 deferred to v4.
+        match self.dtype {
+            Dtype::F32 | Dtype::F16 => {}
         }
         if self.batch_size == 0 || self.seq_len == 0 {
             return Err("fused_linear_ce: batch_size * seq_len must be > 0".into());
@@ -303,10 +369,17 @@ impl FusedLinearCEConfig {
         rows * n_tiles * 2 * 4
     }
 
-    /// Shared-memory budget per CTA: logits tile (vocab_tile * 4 bytes) +
-    /// warp-shuffle scratch / LSE-max scalars (32 bytes pad).
+    /// Shared-memory budget per CTA: logits tile
+    /// (`vocab_tile * dtype.bytes_per_elem()` bytes) + warp-shuffle scratch /
+    /// LSE-max scalars (32 bytes pad).
+    ///
+    /// At `Dtype::F32` this is `vocab_tile * 4 + 32` (unchanged from
+    /// pre-Sprint-v3-2; the byte-identity snapshot pins this). At
+    /// `Dtype::F16` the per-element size halves, so the SMEM tile halves
+    /// too — useful headroom on smem-constrained SMs but not yet exploited
+    /// to raise the vocab_tile cap (see `validate()` deferred follow-on).
     pub fn shared_mem_bytes(&self) -> u32 {
-        self.vocab_tile * 4 + 32
+        self.vocab_tile * self.dtype.bytes_per_elem() + 32
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────
