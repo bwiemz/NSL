@@ -5,14 +5,56 @@
 //! is suitable for the per-CTA kernel path.  Rejection falls back to the
 //! existing Tier-A segment-masked kernel.
 //!
-//! v1 limitations (forward-only, documented in the design spec):
-//!   - Causal attention only (`fa_config.causal == true` required).
-//!   - No CSHA fused projections.
+//! v1 limitations (documented in the design spec):
+//!   - Causal attention only (`fa_config.causal == true` required for
+//!     both forward and backward).
+//!   - No CSHA fused projections (forward and backward both gate this off).
 //!   - `max_doc_len_est <= fa_config.block_q` (one CTA per doc; docs
 //!     exceeding the tile size fall back to Tier A).
 //!   - `num_docs_est <= MAX_NUM_DOCS` (matches the pca_rope SMEM bound).
 //!   - Explicitly gated behind `enable_per_doc_cta=true` in the planner
-//!     config (default OFF); v1 is FORWARD ONLY.
+//!     config (default OFF).
+//!   - Backward additionally requires `block_kv == 32` (the standard FA-2
+//!     v2 backward's `ds_compute::emit` hard-asserts this — wider tiles
+//!     land in T3.6+; per-doc inherits the same constraint).
+//!
+//! # Production wiring status (CFTP v2 follow-on Sprint 1+5)
+//!
+//! The forward FFI dispatch in `nsl_flash_attention_csha` / `_with_saves`
+//! (Sprint 1, commit `c80312dc`) recognises the `_per_doc_cta` kernel
+//! suffix and uses the new trailing `num_docs_or_zero` arg as `grid_x`.
+//! The backward FFI dispatch in `nsl_flash_attention_csha_backward`
+//! (Sprint 5) mirrors the same suffix-detection — when the dispatched
+//! backward kernel name carries `_per_doc_cta`, it launches with
+//! `grid_x = num_docs` (skipping the per-q-block outer loop entirely)
+//! and the per-doc prelude derives `%q_start` / `%k_max` from the
+//! doc_starts table loaded via the kernel param.
+//!
+//! Both the forward PTX ([`crate::flash_attention_v2::per_doc_cta::synthesize_per_doc_cta_forward`])
+//! and the backward PTX ([`crate::flash_attention_v2::per_doc_cta::synthesize_per_doc_cta_backward`])
+//! are shipped and GPU-validated against segmented CPU references
+//! (forward: max_abs 2.08e-4; backward: dQ 3.4e-5, dK 1.3e-3, dV 2.0e-2
+//! on the 4-doc fixture with seg lengths {32, 28, 24, 16}).
+//!
+//! However, **no production code path flips `enable_per_doc_cta=true`
+//! today**:
+//!
+//!   - The user-facing `@pca(strategy=per_document)` decorator is
+//!     parsed and validated by `nsl_semantic::cftp::validate_pca_decorator`,
+//!     but the returned `PcaConfig` is currently DROPPED — the
+//!     semantic checker does not yet collect it onto a list analogous
+//!     to `wrga_configs` (see `crates/nsl-semantic/src/checker/stmt.rs:443`).
+//!   - The planner site that would call [`admit`] from production
+//!     code does not exist; `admit()` is invoked only from unit / GPU
+//!     tests that hardcode `enable_per_doc_cta: true`.
+//!
+//! Wiring `@pca(strategy=per_document)` → `enable_per_doc_cta=true`
+//! → admission → kernel-name suffix → `nsl_flash_attention_csha`
+//! `grid_x` override is **Sprint 2 follow-on work** (train-block
+//! decorator collection — same mechanism `@wrga`, `@freeze`, etc.
+//! already use). Once decorator collection is wired, the activation
+//! is a one-line `PerDocAdmitConfig` construction at the planner
+//! call site; this module + the FFI dispatch are ready to receive it.
 
 use crate::flash_attention::FlashAttentionConfig;
 use crate::pca_detect::{DatasetPackingConfig, PcaDetection, PcaStrategy};

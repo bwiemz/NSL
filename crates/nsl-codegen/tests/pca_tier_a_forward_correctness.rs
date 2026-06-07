@@ -357,6 +357,8 @@ fn launch_pca(
             0i64, 0i64,
             // doc_starts ptr — null (rope_q=false, no doc-aware positions)
             0i64,
+            // PCA per-doc CTA Strategy 3 v1: num_docs_or_zero — 0 (legacy topology)
+            0i64,
     );
 
     if rc != 0 {
@@ -1045,6 +1047,8 @@ fn launch_pca_ex(
         0i64, 0i64,
         // doc_starts ptr
         doc_starts_dev,
+        // PCA per-doc CTA Strategy 3 v1: num_docs_or_zero — 0 (Tier A is not per-doc)
+        0i64,
     );
 
     if rc != 0 {

@@ -104,6 +104,7 @@ pub use cuda::{
 #[doc(hidden)]
 pub use fused_linear_ce::{
     nsl_fused_linear_ce_forward,
+    nsl_fused_linear_ce_forward_large,
     nsl_fused_linear_ce_backward,
 };
 

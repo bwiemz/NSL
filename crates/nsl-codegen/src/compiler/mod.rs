@@ -499,6 +499,20 @@ pub struct Compiler<'a> {
     /// cache and evicts on the last component (dx_norm / component=7).
     pub csha_fused_bwd_cache: HashMap<Value, [Value; 8]>,
 
+    // ── CFTP §4.4 G3 Sprint 4: FusedLinearCe forward+backward side-channels ─
+    /// Maps the Cranelift Value of a `PrimalOp::FusedLinearCe` forward result
+    /// to the saved `lse_out` device pointer that the backward kernel
+    /// requires.  Populated by the forward lowering arm and consumed (with
+    /// eviction on the last extract) by `FusedLinearCeBackwardExtract`.
+    pub fused_ce_fwd_lse: HashMap<Value, Value>,
+    /// Three-slot side-channel for the fused linear-CE backward outputs
+    /// (`dx`, `dW`, `dbias`) keyed by the forward result Value.  Populated
+    /// by component=0's lowering arm via `nsl_fused_linear_ce_backward`;
+    /// components 1 and 2 read from the cache; the last component (2)
+    /// evicts.  Mirrors `flash_attn_bwd_cache` (list-based) but uses a
+    /// fixed-arity slot record for the v1 three-output backward.
+    pub fused_ce_bwd_cache: HashMap<Value, [Value; 3]>,
+
     // ── WRGA side-channel (Milestone A) ─────────────────────────────
     /// WRGA decorator configs for this compile, forwarded from `CompileOptions`.
     /// Consumed inside `compile_train_step_with_source_ad` when a `@train` block
@@ -508,6 +522,16 @@ pub struct Compiler<'a> {
     /// observability (`nsl check --wrga-report`).  `None` if no `@train` block
     /// compiled, or if WRGA was disabled.
     pub last_wrga_plan: Option<crate::wrga::WrgaPlan>,
+
+    // ── CFTP §4.4 G3 side-channel (Sprint 2) ─────────────────────────
+    /// `@fused_lm_ce(...)` decorator configs for this compile, forwarded
+    /// from `CompileOptions.fused_ce_configs`.  Empty when no decorator
+    /// is present.  Sprint 2 stores these without consuming them; Sprint
+    /// 2.5 will read `fused_ce_configs[0].enabled` at the cross_entropy
+    /// lowering site to drive substitution toward `nsl_fused_linear_ce_*`
+    /// FFIs.  The marker comment in `wengert_lower.rs::PrimalOp::CrossEntropyLoss`
+    /// documents the deferred substitution site.
+    pub fused_ce_configs: Vec<crate::FusedCeDecoratorConfig>,
 
     // ── CPDT side-channel (pipeline integration) ─────────────────────
     /// CPDT mode requested via CLI. `Off` → planner does not run.
@@ -771,8 +795,11 @@ impl<'a> Compiler<'a> {
             flash_attn_aux: HashMap::new(),
             flash_attn_bwd_cache: HashMap::new(),
             csha_fused_bwd_cache: HashMap::new(),
+            fused_ce_fwd_lse: HashMap::new(),
+            fused_ce_bwd_cache: HashMap::new(),
             wrga_inputs: options.wrga_inputs.clone(),
             last_wrga_plan: None,
+            fused_ce_configs: options.fused_ce_configs.clone(),
             cpdt_mode: options.cpdt_mode,
             cpdt_cluster: options.cpdt_cluster.clone(),
             cpdt_plan: None,

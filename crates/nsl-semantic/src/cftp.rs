@@ -148,6 +148,25 @@ pub struct PcaConfig {
     pub span: Span,
 }
 
+/// Parse + validate the `@pca(strategy=...)` decorator on a train block.
+///
+/// # Sprint 1 status (CFTP v2 follow-on)
+///
+/// As of Sprint 1 (commit `c80312dc`), the returned `PcaConfig` is
+/// **dropped by the caller** in `checker/stmt.rs::stmt_decorator` — see
+/// the matching block for `@wrga`, which pushes onto `self.wrga_configs`.
+/// `@pca` has no analogous collection list yet.
+///
+/// Plumbing `PcaConfig::strategy = PerDocument` through to
+/// `nsl_codegen::pca_per_doc::PerDocAdmitConfig::enable_per_doc_cta` is
+/// Sprint 2 follow-on work. The per-doc CTA emitter
+/// (`nsl_codegen::flash_attention_v2::per_doc_cta::synthesize_per_doc_cta_forward`)
+/// and the FFI dispatch (`nsl_runtime::flash_attention::nsl_flash_attention_csha`)
+/// are already in place to receive that decision.
+///
+/// Until decorator collection lands, the per-doc CTA path is reachable
+/// only from tests that hardcode `enable_per_doc_cta=true` on the
+/// admission config.
 pub fn validate_pca_decorator(
     deco: &Decorator,
     resolve_sym: &dyn Fn(Symbol) -> String,
@@ -211,6 +230,20 @@ pub struct FusedCeConfig {
     /// Vocabulary tile size passed through to `FusedLinearCEConfig::vocab_tile`.
     /// `None` → use the codegen default (1024).
     pub vocab_tile: Option<u32>,
+    /// CFTP §4.4 G3 (Sprint 4): vocabulary size baked into the synthesised
+    /// PTX.  Required when `enabled = true` for the fused kernel to actually
+    /// fire — codegen falls back to the composite cross_entropy path when
+    /// `vocab_size` is `None`.  Range: (0, 262144].
+    pub vocab_size: Option<u32>,
+    /// CFTP §4.4 G3 (Sprint 4): hidden dimension baked into the synthesised
+    /// PTX.  Required when `enabled = true`.  Must be divisible by 32.
+    pub hidden_size: Option<u32>,
+    /// CFTP §4.4 G3 (Sprint 4): batch dimension used to size per-row
+    /// output buffers (`loss_out`, `lse_out`).  Required when `enabled = true`.
+    pub batch_size: Option<u32>,
+    /// CFTP §4.4 G3 (Sprint 4): sequence length used to size per-row
+    /// output buffers.  Required when `enabled = true`.
+    pub seq_len: Option<u32>,
     /// Source span of the decorator (for diagnostics).
     pub span: Span,
 }
@@ -226,6 +259,10 @@ pub fn validate_fused_ce_decorator(
 ) -> Option<FusedCeConfig> {
     let mut enabled = false;
     let mut vocab_tile: Option<u32> = None;
+    let mut vocab_size: Option<u32> = None;
+    let mut hidden_size: Option<u32> = None;
+    let mut batch_size: Option<u32> = None;
+    let mut seq_len: Option<u32> = None;
 
     if let Some(ref args) = deco.args {
         for arg in args {
@@ -283,6 +320,93 @@ pub fn validate_fused_ce_decorator(
                         .with_label(arg.span, "expected integer"),
                     ),
                 },
+                "vocab_size" => match &arg.value.kind {
+                    ExprKind::IntLiteral(n) => {
+                        if *n > 0 && *n <= 262_144 {
+                            vocab_size = Some(*n as u32);
+                        } else {
+                            diagnostics.push(
+                                Diagnostic::error(format!(
+                                    "@fused_lm_ce: vocab_size {n} out of range (0, 262144]"
+                                ))
+                                .with_label(arg.span, "invalid vocab_size"),
+                            );
+                        }
+                    }
+                    _ => diagnostics.push(
+                        Diagnostic::error(
+                            "@fused_lm_ce: `vocab_size` must be an integer literal".to_string(),
+                        )
+                        .with_label(arg.span, "expected integer"),
+                    ),
+                },
+                "hidden_size" => match &arg.value.kind {
+                    ExprKind::IntLiteral(n) => {
+                        if *n > 0 && *n <= 65536 && (*n % 32 == 0) {
+                            hidden_size = Some(*n as u32);
+                        } else if *n > 0 && *n <= 65536 {
+                            diagnostics.push(
+                                Diagnostic::error(format!(
+                                    "@fused_lm_ce: hidden_size {n} must be divisible by 32"
+                                ))
+                                .with_label(arg.span, "must be divisible by 32"),
+                            );
+                        } else {
+                            diagnostics.push(
+                                Diagnostic::error(format!(
+                                    "@fused_lm_ce: hidden_size {n} out of range (0, 65536]"
+                                ))
+                                .with_label(arg.span, "invalid hidden_size"),
+                            );
+                        }
+                    }
+                    _ => diagnostics.push(
+                        Diagnostic::error(
+                            "@fused_lm_ce: `hidden_size` must be an integer literal".to_string(),
+                        )
+                        .with_label(arg.span, "expected integer"),
+                    ),
+                },
+                "batch_size" => match &arg.value.kind {
+                    ExprKind::IntLiteral(n) => {
+                        if *n > 0 && *n <= 65536 {
+                            batch_size = Some(*n as u32);
+                        } else {
+                            diagnostics.push(
+                                Diagnostic::error(format!(
+                                    "@fused_lm_ce: batch_size {n} out of range (0, 65536]"
+                                ))
+                                .with_label(arg.span, "invalid batch_size"),
+                            );
+                        }
+                    }
+                    _ => diagnostics.push(
+                        Diagnostic::error(
+                            "@fused_lm_ce: `batch_size` must be an integer literal".to_string(),
+                        )
+                        .with_label(arg.span, "expected integer"),
+                    ),
+                },
+                "seq_len" => match &arg.value.kind {
+                    ExprKind::IntLiteral(n) => {
+                        if *n > 0 && *n <= 65536 {
+                            seq_len = Some(*n as u32);
+                        } else {
+                            diagnostics.push(
+                                Diagnostic::error(format!(
+                                    "@fused_lm_ce: seq_len {n} out of range (0, 65536]"
+                                ))
+                                .with_label(arg.span, "invalid seq_len"),
+                            );
+                        }
+                    }
+                    _ => diagnostics.push(
+                        Diagnostic::error(
+                            "@fused_lm_ce: `seq_len` must be an integer literal".to_string(),
+                        )
+                        .with_label(arg.span, "expected integer"),
+                    ),
+                },
                 _ => diagnostics.push(
                     Diagnostic::error(format!("@fused_lm_ce: unknown argument '{aname}'"))
                         .with_label(arg.span, "unknown argument"),
@@ -294,6 +418,10 @@ pub fn validate_fused_ce_decorator(
     Some(FusedCeConfig {
         enabled,
         vocab_tile,
+        vocab_size,
+        hidden_size,
+        batch_size,
+        seq_len,
         span: deco.span,
     })
 }

@@ -17,3 +17,37 @@ fn cross_entropy(logits: Tensor, targets: Tensor) -> Tensor:
 fn bce_loss(pred: Tensor, target: Tensor) -> Tensor:
     let clamped = clamp(pred, 0.0000001, 0.9999999)
     return neg(mean(target * log(clamped) + (1.0 - target) * log(1.0 - clamped)))
+
+# CFTP §4.4 G3 (Sprint 2): fused linear + cross-entropy.
+#
+# Single user-facing API for the language-modeling head:
+#
+#   loss = fused_linear_ce(x, W, bias, targets)
+#         ≡ cross_entropy(x @ W^T + bias, targets)
+#
+# Sprint 2 (this commit): lowers to the composite path explicitly so the
+# function is available even without the fused kernel. The body is
+# structurally identical to what an LM head writes by hand, which keeps
+# AD + ignore-index (-100) semantics drop-in compatible with the
+# existing stdlib cross_entropy.
+#
+# Sprint 2.5 (deferred): when codegen sees this call inside a `train`
+# block decorated with `@fused_lm_ce(enabled = true)`, the
+# Compiler.fused_ce_configs slot (already populated by Sprint 2)
+# instructs source-AD to short-circuit the matmul + cross_entropy
+# composite to a direct nsl_fused_linear_ce_forward / _backward FFI
+# launch. The substitution site is marked in
+# crates/nsl-codegen/src/wengert_lower.rs near PrimalOp::CrossEntropyLoss.
+#
+# Input shape contract (matches the v1 fused kernel's FFI):
+#   x:       [B*S, H]   f32
+#   W:       [V,   H]   f32  (row-major; transposed at use-site below)
+#   bias:    [V]        f32
+#   targets: [B*S]      i64  (with -100 = ignore_index)
+#
+# Returns: scalar loss tensor (mean over valid positions).
+fn fused_linear_ce(x: Tensor, W: Tensor, bias: Tensor, targets: Tensor) -> Tensor:
+    # Transpose W from [V, H] to [H, V] so x @ W_t yields [B*S, V] logits.
+    let W_t = transpose(W, 0, 1)
+    let logits = x @ W_t + bias
+    return cross_entropy(logits, targets)
