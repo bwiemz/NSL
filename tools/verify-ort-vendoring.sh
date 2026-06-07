@@ -50,7 +50,11 @@ fi
 # Generate Rust definitions from the upstream header. Allowlist Ort* and
 # ONNX* names; ignore standard C library types that bindgen would otherwise
 # splat into the output.
+# --no-rustfmt-bindings: skip rustfmt formatting pass; this check only
+# compares type-name sets, so formatting is irrelevant and rustfmt may not
+# be installed on the CI runner.
 bindgen \
+    --no-rustfmt-bindings \
     --allowlist-type 'Ort.*|ONNX.*' \
     --allowlist-function 'Ort.*|ONNX.*' \
     --allowlist-var 'ORT_.*|ONNX_.*' \
