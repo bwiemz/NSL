@@ -138,15 +138,54 @@ pub enum RopeStyle {
 }
 
 /// Configuration for a FlashAttention PTX kernel variant.
+///
+/// Construction sites: ~115 across the codebase (no `#[derive(Default)]` —
+/// every site must thread every field). When adding a new field, search for
+/// `FlashAttentionConfig {` and update all literals (cycle-4 Sprint 2 worked
+/// example: `num_sink_tokens` threading at 113 sites).
 #[derive(Clone, Debug)]
 pub struct FlashAttentionConfig {
+    /// Q-tile height: rows of `Q` (and `O`) loaded into SMEM per CTA.
+    /// Must be a power of two ≥ 16 (kernels emit 16-row warp bands).
+    /// Cycle-2 Sprint 3 split the dkdv backward `%band_row_base` into
+    /// `_q`/`_kv` axes so this can differ from `block_kv` (asymmetric
+    /// tiles per forward PR #101); the dkdv dispatch predicate still
+    /// gates `bq==bkv` until a caller surfaces demand.
     pub block_q: i64,
+    /// KV-tile height: rows of `K`/`V` loaded into SMEM per CTA. Same
+    /// constraints as `block_q`. Common values: 32, 64, 128 (the SMEM
+    /// ladder in `compiler/kernel.rs`).
     pub block_kv: i64,
+    /// Per-head dimension. Drives the SMEM ladder dispatch — Cycle 1
+    /// shipped hd=32/64/128/256 variants per paper §6.4.
     pub head_dim: i64,
+    /// Lower-triangular mask: `S[q, k] = -inf` when `k > q`. Defaults
+    /// to `true` for the `@flash_attention` decorator (cycle-1 invariant).
+    /// Cycle 1 added intra-tile element masking (paper §4.1); the
+    /// compile-time `num_q_iters` elision is also gated here.
     pub causal: bool,
+    /// Paged KV cache: K/V are sourced via a `block_table_ptr`
+    /// indirection (M25 runtime, paper §3.2 inference-only).
+    /// **Mutually exclusive with `segment_masked`** — see
+    /// `validate()` for the enforcement.
     pub paged: bool,
+    /// Apply RoPE rotation to Q (and K when `csha.fused_projections`)
+    /// inside the kernel. Cycle-1 shipped the rotation PTX; cycle-2
+    /// Sprint 1 wired cos/sin through `CshaSavePointers` so the
+    /// forward/backward share pointers. Today both are null in the
+    /// production path (rope-effectively-off) — Phase 3c-2 will source
+    /// non-null tensors per `WIRE-HERE` callouts.
     pub rope_q: bool,
+    /// RoPE pairing convention. Only `RopeStyle::Adjacent` (GPT-NeoX /
+    /// GPT-J: pair `x[2i]` with `x[2i+1]`) is implemented in the kernel
+    /// emitters; `RopeStyle::HalfSplit` (LLaMA / Qwen) is reserved for
+    /// future work (`emit_rope_pair_sweep` asserts on it).
     pub rope_style: RopeStyle,
+    /// Grouped-query attention group size: `H_q / H_kv`. `1` is MHA
+    /// (no sharing); `8` is typical for Llama-3-8B. Cycle-1 Sprint 5
+    /// added the zero-copy stride pattern in Tier B/CSHA codegen (paper
+    /// §4.2) so K/V are read with `kv_head = q_head / gqa_group_size`
+    /// rather than replicated in HBM.
     pub gqa_group_size: u32,
     /// M33: Whether this attention uses a tree-structured causal mask for speculative decoding.
     pub tree_mask: bool,
@@ -183,9 +222,18 @@ pub struct FlashAttentionConfig {
 }
 
 impl FlashAttentionConfig {
-    /// Spec §3.2 invariant: segment_masked + paged are mutually
-    /// exclusive; paged KV cache is inference-only, packed
-    /// pretraining doesn't use it.
+    /// Spec §3.2 invariant: `segment_masked` + `paged` are mutually
+    /// exclusive; paged KV cache is inference-only, packed pretraining
+    /// (PCA Tier A — segment-aware causal attention for packed
+    /// documents) doesn't use it.
+    ///
+    /// **Note**: this validator is only invoked by tests today; it is
+    /// NOT load-bearing on the production PTX synthesis path. Most
+    /// invariants are enforced by codegen-time refusals (e.g., the
+    /// `num_sink_tokens > 0` refusal at `compiler/kernel.rs::attention_sink`
+    /// added cycle-5 Sprint 2) or by the semantic checker. Adding new
+    /// validation here is fine but does not protect production callers
+    /// until they explicitly invoke `validate()`.
     pub fn validate(&self) -> Result<(), String> {
         if self.segment_masked && self.paged {
             return Err(
