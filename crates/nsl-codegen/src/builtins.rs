@@ -1453,6 +1453,28 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
         ],
         Some(types::I64),
     ),
+    // CPDT Part III v2.2 paper-faithful MoE FFN: per-expert kernel is
+    // `up → SiLU → down` instead of v2's single matmul. 10 i64 args:
+    // tokens, logits, experts_up, experts_down, num_experts, top_k,
+    // capacity_factor_bits, hidden_dim, intermediate_dim, activation_kind.
+    // Returns NslTensor `[total_tokens, hidden_dim]` (back to hidden,
+    // unlike v2's intermediate). See nsl-runtime/src/moe/ffi.rs.
+    (
+        "nsl_moe_dispatch_full_v3",
+        &[
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+            types::I64,
+        ],
+        Some(types::I64),
+    ),
     // --- M33: Speculative decoding runtime functions ---
     (
         "nsl_speculative_draft",

@@ -989,6 +989,20 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         },
     );
 
+    // CPDT Part III v2.3: paper-faithful MoE FFN intrinsic
+    // (`moe_dispatch_ffn(tokens, logits, experts_up, experts_down)`).
+    // Opt-in 4-arg variant that lowers to `nsl_moe_dispatch_full_v3`
+    // (up → SiLU → down). Coexists with the 3-arg `moe_dispatch`
+    // (v1/v2 path); users opt into v3 by switching intrinsics.
+    def(
+        "moe_dispatch_ffn",
+        Type::Function {
+            params: vec![Type::Unknown, Type::Unknown, Type::Unknown, Type::Unknown],
+            ret: Box::new(tensor_ret.clone()),
+            effect: Effect::Inferred,
+        },
+    );
+
     // M33: Speculative decode step intrinsic
     def(
         "speculative_decode",

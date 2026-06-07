@@ -52,6 +52,91 @@ pub fn derive_v2_dims(
     Some((hidden, block_elems / hidden))
 }
 
+/// CPDT Part III v2.3 codegen lowering for `nsl_moe_dispatch_full_v3`:
+/// derive `(hidden_dim, intermediate_dim)` from the WeightMap by
+/// resolving BOTH the up- and down-projection expert blocks.
+///
+/// Layout contract (mirrors v2 packed convention, extended for two
+/// matmuls):
+///   - router               shape == [hidden_dim, num_experts]
+///   - experts up-proj     shape == [num_experts, hidden_dim * intermediate_dim]
+///   - experts down-proj   shape == [num_experts, intermediate_dim * hidden_dim]
+///
+/// Name resolution suffixes mirror cpdt_expert_prune's resilience to
+/// alternate naming (some safetensors bundles use `gate.weight` instead
+/// of `router.weight`; `experts.weight` is the v2 single-matmul name).
+/// For v3 the up/down keys MUST be distinguished: NSL's packed-layout
+/// convention uses `experts.up.weight` / `experts.down.weight` (with
+/// the `.weight` suffix optional for both). NOTE: raw HF Mixtral
+/// safetensors use a DIFFERENT layout (per-expert `experts.{e}.w1` /
+/// `w2` / `w3` for SwiGLU) — those bundles need to be packed into NSL's
+/// 2D `[num_experts, hidden * intermediate]` row-major layout by an
+/// ingestion pre-step before this helper will resolve them. v2.4 may
+/// add a raw-HF ingestion path; for v2.3 the packed layout is the
+/// contract.
+///
+/// Returns `None` (silent v2 fallback at the call site) when any of:
+///   - no router entry resolves under the key
+///   - no experts-up entry resolves under the key
+///   - no experts-down entry resolves under the key
+///   - shapes aren't 2D
+///   - router.shape[1] != num_experts
+///   - experts_up.shape[0] != num_experts OR experts_down.shape[0] != num_experts
+///   - hidden_dim is zero
+///   - experts_up trailing dim isn't a multiple of hidden_dim
+///   - the derived intermediate_dim from up doesn't match the derived
+///     intermediate_dim from down
+///
+/// The call site promotes `None` to a hard compile error under
+/// `cpdt_mode == Full` (same shape as S4 from v1's production-forward
+/// landing).
+pub fn derive_v3_dims(
+    weight_map: &WeightMap,
+    key: &str,
+    num_experts: usize,
+) -> Option<(usize, usize)> {
+    let router = ["router.weight", "gate.weight", "router", "gate"]
+        .iter()
+        .find_map(|s| weight_map.get(&format!("{key}.{s}")))?;
+    let experts_up = ["experts.up.weight", "experts.up"]
+        .iter()
+        .find_map(|s| weight_map.get(&format!("{key}.{s}")))?;
+    let experts_down = ["experts.down.weight", "experts.down"]
+        .iter()
+        .find_map(|s| weight_map.get(&format!("{key}.{s}")))?;
+    if router.shape.len() != 2
+        || experts_up.shape.len() != 2
+        || experts_down.shape.len() != 2
+    {
+        return None;
+    }
+    if router.shape[1] != num_experts {
+        return None;
+    }
+    if experts_up.shape[0] != num_experts || experts_down.shape[0] != num_experts {
+        return None;
+    }
+    let hidden = router.shape[0];
+    let up_block_elems = experts_up.shape[1];
+    let down_block_elems = experts_down.shape[1];
+    if hidden == 0
+        || up_block_elems == 0
+        || down_block_elems == 0
+        || !up_block_elems.is_multiple_of(hidden)
+        || !down_block_elems.is_multiple_of(hidden)
+    {
+        return None;
+    }
+    let intermediate_from_up = up_block_elems / hidden;
+    let intermediate_from_down = down_block_elems / hidden;
+    if intermediate_from_up != intermediate_from_down {
+        // Up and down disagree on the inner dim — silent corruption
+        // hazard at runtime. Refuse v3.
+        return None;
+    }
+    Some((hidden, intermediate_from_up))
+}
+
 /// Compile-time info about a MoE layer.
 #[derive(Debug, Clone)]
 pub struct MoeInfo {
@@ -236,6 +321,90 @@ mod tests {
             derive_v2_dims(&wm, "blocks.0", 4),
             None,
             "block_elems % hidden != 0 → refuse v2 (silent corruption guard)"
+        );
+    }
+
+    // ── derive_v3_dims (CPDT Part III v2.3 paper-faithful FFN lowering) ───
+    #[test]
+    fn derive_v3_dims_resolves_with_up_and_down_present() {
+        let mut wm = WeightMap::default();
+        wm.insert(make_weight("blocks.0.router.weight", vec![16, 4]));
+        wm.insert(make_weight("blocks.0.experts.up.weight", vec![4, 16 * 32]));
+        wm.insert(make_weight("blocks.0.experts.down.weight", vec![4, 32 * 16]));
+        assert_eq!(
+            derive_v3_dims(&wm, "blocks.0", 4),
+            Some((16, 32)),
+            "hidden=16 from router.shape[0], intermediate=32 from experts.up.shape[1] / hidden"
+        );
+    }
+
+    #[test]
+    fn derive_v3_dims_resolves_alternate_name_suffixes() {
+        let mut wm = WeightMap::default();
+        wm.insert(make_weight("blocks.0.gate.weight", vec![8, 2]));
+        wm.insert(make_weight("blocks.0.experts.up", vec![2, 8 * 16]));
+        wm.insert(make_weight("blocks.0.experts.down", vec![2, 16 * 8]));
+        assert_eq!(
+            derive_v3_dims(&wm, "blocks.0", 2),
+            Some((8, 16)),
+            "fallback names without `.weight` suffix must resolve"
+        );
+    }
+
+    #[test]
+    fn derive_v3_dims_returns_none_when_only_v2_single_experts_present() {
+        // v2 single-matmul layout: just experts.weight, no up/down split.
+        // v3 must refuse — caller falls through to v2 emission.
+        let mut wm = WeightMap::default();
+        wm.insert(make_weight("blocks.0.router.weight", vec![16, 4]));
+        wm.insert(make_weight("blocks.0.experts.weight", vec![4, 16 * 32]));
+        assert_eq!(
+            derive_v3_dims(&wm, "blocks.0", 4),
+            None,
+            "v2 single-matmul layout has no up/down split → derive_v3_dims must refuse"
+        );
+    }
+
+    #[test]
+    fn derive_v3_dims_returns_none_when_only_up_present() {
+        let mut wm = WeightMap::default();
+        wm.insert(make_weight("blocks.0.router.weight", vec![16, 4]));
+        wm.insert(make_weight("blocks.0.experts.up.weight", vec![4, 16 * 32]));
+        // No experts.down entry.
+        assert_eq!(
+            derive_v3_dims(&wm, "blocks.0", 4),
+            None,
+            "missing experts.down → refuse v3"
+        );
+    }
+
+    #[test]
+    fn derive_v3_dims_returns_none_when_up_and_down_disagree_on_intermediate() {
+        // up implies intermediate=32 (16*32 / 16), down implies
+        // intermediate=64 (16*64 / 16). Silent-corruption hazard if not
+        // caught — v3 would still compute but with mis-aligned trailing
+        // axis, producing plausible-looking garbage.
+        let mut wm = WeightMap::default();
+        wm.insert(make_weight("blocks.0.router.weight", vec![16, 4]));
+        wm.insert(make_weight("blocks.0.experts.up.weight", vec![4, 16 * 32]));
+        wm.insert(make_weight("blocks.0.experts.down.weight", vec![4, 16 * 64]));
+        assert_eq!(
+            derive_v3_dims(&wm, "blocks.0", 4),
+            None,
+            "up-derived intermediate != down-derived intermediate → refuse v3 (silent-corruption guard)"
+        );
+    }
+
+    #[test]
+    fn derive_v3_dims_returns_none_when_router_n_experts_mismatches() {
+        let mut wm = WeightMap::default();
+        wm.insert(make_weight("blocks.0.router.weight", vec![16, 8]));
+        wm.insert(make_weight("blocks.0.experts.up.weight", vec![4, 16 * 32]));
+        wm.insert(make_weight("blocks.0.experts.down.weight", vec![4, 32 * 16]));
+        assert_eq!(
+            derive_v3_dims(&wm, "blocks.0", 4),
+            None,
+            "router.shape[1] != num_experts → refuse v3"
         );
     }
 }
