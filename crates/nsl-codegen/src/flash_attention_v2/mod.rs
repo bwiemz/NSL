@@ -906,6 +906,21 @@ pub fn synthesize_backward_with_tier(
     use crate::flash_attention_v2::tier_b2::BackwardTier;
     use crate::flash_attention_v2::tier_b2::backward::synthesize_tier_b2_backward;
 
+    // Sprint 2 cycle-7 defense-in-depth: refuse `num_sink_tokens > 0`
+    // before dispatching to either tier. Both downstream paths
+    // (`synthesize_backward` -> `synthesize_backward_with_tier_b`, and
+    // `synthesize_tier_b2_backward`) would silently emit sink-unaware
+    // gradients without this check. See `synthesize_backward_with_tier_b`
+    // and `synthesize_backward_combined` for the same per-entry-point
+    // refusal pattern.
+    let (eligible, why) = sinks::attention_sinks_v1_backward_eligible(config);
+    if !eligible {
+        return Err(format!(
+            "Sprint 2 cycle-7 backward sinks refusal at tier-dispatch entry: {}",
+            why.unwrap_or("(unknown reason)")
+        ));
+    }
+
     match backward_dispatch_tier(config) {
         BackwardTier::TierB2 { .. } => {
             // Phase 1: stub returns NotImplemented; transparently fall
@@ -957,6 +972,22 @@ pub fn synthesize_backward_combined(
         strip_module_header, synthesize_tier_b2_backward,
     };
     use crate::flash_attention_v2::tier_b2::dispatch::tier_b2_hybrid_backward_compile_time_eligible;
+
+    // Sprint 2 cycle-7 defense-in-depth: refuse `num_sink_tokens > 0`
+    // at the combined-module entry too. `synthesize_backward` (called
+    // immediately below) already refuses via `synthesize_backward_with_tier_b`,
+    // but this explicit check keeps the per-entry-point refusal contract
+    // visible at the hybrid path's front door. Otherwise, a future
+    // refactor that bypasses `synthesize_backward` (e.g., directly
+    // synthesizing only the hybrid four-kernel module) could silently
+    // reintroduce the silent-correctness gap.
+    let (eligible, why) = sinks::attention_sinks_v1_backward_eligible(config);
+    if !eligible {
+        return Err(format!(
+            "Sprint 2 cycle-7 backward sinks refusal at combined entry: {}",
+            why.unwrap_or("(unknown reason)")
+        ));
+    }
 
     // Always synthesize the scalar backward first — it is the fallback
     // path the runtime takes when `tier_b2_active=0`, and we must
@@ -1018,6 +1049,27 @@ pub fn synthesize_backward_with_tier_b(
     config: &FlashAttentionConfig,
     tier_b: Option<(u32, SegmentResidency)>,
 ) -> Result<String, String> {
+    // Sprint 2 cycle-7 defense-in-depth: refuse `num_sink_tokens > 0`.
+    // The forward eligibility predicate already refuses
+    // `csha.save_activations_for_backward = true` + `num_sink_tokens > 0`
+    // at the compiler/kernel.rs front door, but the cycle-5
+    // `feedback_deferral_must_refuse` invariant says refusals must
+    // be at EVERY entry point — not just the decorator extraction
+    // site. A caller that bypasses kernel.rs (e.g., direct codegen
+    // call in a test that constructs FlashAttentionConfig by hand)
+    // would otherwise silently emit backward PTX that does NOT
+    // understand the persistent sink slab — producing wrong
+    // gradients with no error. Lift point: when a future v2 sprint
+    // lands sink-aware dQ/dK/dV kernels, update
+    // `sinks::attention_sinks_v1_backward_eligible` to allow it.
+    let (eligible, why) = sinks::attention_sinks_v1_backward_eligible(config);
+    if !eligible {
+        return Err(format!(
+            "Sprint 2 cycle-7 backward sinks refusal: {}",
+            why.unwrap_or("(unknown reason)")
+        ));
+    }
+
     smem_layout::validate_scalar_v2_config(config, smem_layout::Direction::Backward)
         .map_err(|e| format!("backward validator rejected: {e}"))?;
 

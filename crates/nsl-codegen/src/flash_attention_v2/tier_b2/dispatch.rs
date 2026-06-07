@@ -121,6 +121,18 @@ pub fn tier_b2_hybrid_backward_eligible(config: &FlashAttentionConfig, seq_len: 
     let Some(csha) = config.csha.as_ref() else { return false; };
     let hd = config.head_dim as u32;
     let block_q = config.block_q as u32;
+    // Sprint 2 cycle-7 (§4.3 attention sinks v1): defense-in-depth refusal.
+    // v1 is forward-only — the dQ/dKdV/proj-backward kernels do not
+    // understand the persistent sink slab. Returning `false` here forces
+    // the planner to pick BackwardTier::Scalar, which is ALSO sink-unaware
+    // — but the scalar `synthesize_backward_with_tier_b` has its own
+    // sink refusal that surfaces a clear error. This clause is the "should
+    // not have been reached" defensive layer per cycle-5
+    // `feedback_deferral_must_refuse`. Lift point: a future v2 backward
+    // sprint that lands sink-aware kernels.
+    if config.num_sink_tokens > 0 {
+        return false;
+    }
     // Sprint 1 cycle-2: rope_q=true is now safe because forward and backward
     // share cos/sin via the CshaSavePointers channel. The forward call sites
     // (wengert_lower.rs and expr/advanced.rs) hoist the cos/sin Cranelift
@@ -159,6 +171,17 @@ pub fn tier_b2_hybrid_backward_compile_time_eligible(config: &FlashAttentionConf
     }
     let Some(csha) = config.csha.as_ref() else { return false; };
     let hd = config.head_dim as u32;
+    // Sprint 2 cycle-7 (§4.3 attention sinks v1): defense-in-depth refusal —
+    // mirrors `tier_b2_hybrid_backward_eligible`. Compile-time predicates
+    // gate the wengert-lowering branch that decides between the hybrid
+    // 4-kernel runtime branch and the scalar fallback (Sprint 1 T1.3).
+    // Forcing `false` here at `num_sink_tokens > 0` makes the wengert
+    // lowering emit a trivial `iconst(0)` for the runtime-active flag, so
+    // the runtime never even attempts to launch the hybrid kernels for a
+    // sinks-enabled config. Lift point matches the runtime predicate.
+    if config.num_sink_tokens > 0 {
+        return false;
+    }
     // Sprint 1 cycle-2: rope_q=true is now safe because forward and backward
     // share cos/sin via the CshaSavePointers channel. See the matching comment
     // in `tier_b2_hybrid_backward_eligible` for the full rationale.
@@ -385,6 +408,61 @@ mod tests {
         let mut c = hybrid_cfg(64, 1, 64, false, 80, 2);
         c.csha = None;
         assert!(!tier_b2_hybrid_backward_compile_time_eligible(&c));
+    }
+
+    // -----------------------------------------------------------------
+    // Sprint 2 cycle-7 (§4.3 attention sinks v1): defense-in-depth refusal.
+    // The compile-time + runtime hybrid eligibility predicates must
+    // return `false` whenever `num_sink_tokens > 0` — even at the
+    // otherwise-eligible smoke config. v1 is forward-only; the dQ/dKdV
+    // kernels do not understand the persistent sink slab.
+    // -----------------------------------------------------------------
+
+    /// Compile-time predicate must reject the otherwise-eligible smoke
+    /// config when `num_sink_tokens > 0` (defense-in-depth: the forward
+    /// front door also refuses this, but the predicate is consulted at
+    /// wengert lowering and would otherwise emit `iconst(1)` for the
+    /// runtime-active flag — silently launching sink-unaware backward).
+    #[test]
+    fn compile_time_rejects_sinks_enabled_at_smoke_config() {
+        let mut c = hybrid_cfg(64, 1, 64, false, 80, 2);
+        c.num_sink_tokens = 4;
+        assert!(
+            !tier_b2_hybrid_backward_compile_time_eligible(&c),
+            "compile-time hybrid predicate must refuse sinks-enabled config"
+        );
+    }
+
+    /// Runtime predicate must reject the otherwise-eligible smoke config
+    /// when `num_sink_tokens > 0`. Tested at `seq_len = block_q` so we
+    /// know the only reason for refusal is the sinks axis.
+    #[test]
+    fn runtime_rejects_sinks_enabled_at_smoke_config() {
+        let mut c = hybrid_cfg(64, 1, 64, false, 80, 2);
+        c.num_sink_tokens = 4;
+        assert!(
+            !tier_b2_hybrid_backward_eligible(&c, c.block_q as u32),
+            "runtime hybrid predicate must refuse sinks-enabled config"
+        );
+    }
+
+    /// Same config with `num_sink_tokens = 0` must remain ACCEPTED to
+    /// prove the refusal axis is sinks, not some other regression.
+    /// Pins the per-axis exercise principle: a test that "rejects the
+    /// config" without first proving the baseline accepts could be
+    /// masking a deeper bug.
+    #[test]
+    fn both_predicates_accept_same_config_at_zero_sinks() {
+        let mut c = hybrid_cfg(64, 1, 64, false, 80, 2);
+        c.num_sink_tokens = 0;
+        assert!(
+            tier_b2_hybrid_backward_compile_time_eligible(&c),
+            "baseline compile-time predicate must accept the zero-sinks config"
+        );
+        assert!(
+            tier_b2_hybrid_backward_eligible(&c, c.block_q as u32),
+            "baseline runtime predicate must accept the zero-sinks config"
+        );
     }
 
     /// Headline invariant the wengert lowering relies on:

@@ -129,6 +129,45 @@ pub fn attention_sinks_v1_eligible(
     (true, None)
 }
 
+/// Sprint 2 cycle-7: backward path eligibility for sinks v1.
+///
+/// v1 is FORWARD-ONLY. Backward (Tier B.2 hybrid OR scalar) is NOT
+/// supported for `num_sink_tokens > 0` — the dK/dV/dQ kernels do not
+/// understand the persistent sink slab, the projection-backward HBM
+/// reads would consume garbage for sink-row positions, and the
+/// `backward_v_input_offset` aliasing constraint would break.
+///
+/// Returns `(eligible, blocking_reason)`. At `num_sink_tokens == 0`,
+/// returns `(true, None)` — backward is unaffected by sinks. At
+/// `num_sink_tokens > 0`, returns `(false, Some(msg))` where `msg`
+/// names backward + cites the future v2 sprint lift point (cycle-5
+/// `feedback_deferral_must_refuse` invariant).
+///
+/// Lift point: when a future v2 backward sprint lands dK/dV/dQ
+/// sink-aware kernels + sink-aware projection-backward HBM reads,
+/// change the constant `false` here to a real per-axis check.
+///
+/// This is defense-in-depth: the forward eligibility predicate
+/// already refuses `csha.save_activations_for_backward = true` with
+/// `num_sink_tokens > 0` at the compiler/kernel.rs front door, but
+/// this predicate is consulted at the codegen-level backward entry
+/// points (`synthesize_backward_combined`, the Tier B.2 dispatch
+/// predicates) so a caller that bypasses kernel.rs cannot silently
+/// emit wrong gradients.
+pub fn attention_sinks_v1_backward_eligible(
+    config: &FlashAttentionConfig,
+) -> (bool, Option<&'static str>) {
+    if config.num_sink_tokens == 0 {
+        return (true, None); // backward is unaffected by sinks-disabled configs
+    }
+    (
+        false,
+        Some(
+            "backward synthesis with num_sink_tokens > 0 is deferred to a future v2 sprint — sinks v1 is forward-only. The dK/dV/dQ kernels do not understand the persistent sink slab; the projection-backward HBM read of sink rows would consume garbage.",
+        ),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -308,5 +347,95 @@ mod eligibility_tests {
         let msg = why.unwrap();
         assert!(msg.contains("fused_projections"));
         assert!(msg.contains("Sprint"));
+    }
+}
+
+#[cfg(test)]
+mod backward_eligibility_tests {
+    use super::*;
+    use crate::flash_attention::{CshaExtras, FlashAttentionConfig, RopeStyle};
+
+    /// Sprint 2 cycle-7: the backward eligibility predicate must return
+    /// `(true, None)` whenever `num_sink_tokens == 0` REGARDLESS of any
+    /// other axis. Sinks-disabled configs are unaffected by the v1
+    /// forward-only restriction.
+    #[test]
+    fn zero_sinks_backward_always_eligible_regardless_of_axes() {
+        // Stress: even with every potentially-blocking axis set,
+        // num_sink_tokens=0 must short-circuit before any other check.
+        let permutations: &[FlashAttentionConfig] = &[
+            FlashAttentionConfig {
+                block_q: 64, block_kv: 64, head_dim: 64,
+                causal: true, paged: true, rope_q: true,
+                rope_style: RopeStyle::HalfSplit, gqa_group_size: 8,
+                tree_mask: true, num_sink_tokens: 0,
+                gpu_sm: 80, segment_masked: true,
+                csha: Some(CshaExtras {
+                    save_activations_for_backward: true,
+                    fused_projections: true,
+                    level: 2,
+                    ..CshaExtras::default()
+                }),
+            },
+            FlashAttentionConfig {
+                block_q: 128, block_kv: 64, head_dim: 32,
+                causal: false, paged: false, rope_q: false,
+                rope_style: RopeStyle::Adjacent, gqa_group_size: 1,
+                tree_mask: false, num_sink_tokens: 0,
+                gpu_sm: 75, segment_masked: false, csha: None,
+            },
+        ];
+        for cfg in permutations {
+            assert_eq!(
+                attention_sinks_v1_backward_eligible(cfg),
+                (true, None),
+                "num_sink_tokens=0 backward must always be eligible regardless of other axes"
+            );
+        }
+    }
+
+    /// Sprint 2 cycle-7: when sinks are enabled the backward predicate
+    /// must refuse with a message that names BOTH "backward" and a v2
+    /// sprint citation so the user knows (a) what failed and (b) which
+    /// future sprint lifts it (cycle-5 `feedback_deferral_must_refuse`
+    /// invariant: every deferred config has a code-level refusal naming
+    /// the lift point).
+    #[test]
+    fn sinks_enabled_backward_refused_naming_v2_and_backward() {
+        let cfg = FlashAttentionConfig {
+            block_q: 64, block_kv: 64, head_dim: 64,
+            causal: false, paged: false, rope_q: false,
+            rope_style: RopeStyle::Adjacent, gqa_group_size: 1,
+            tree_mask: false, num_sink_tokens: 4,
+            gpu_sm: 80, segment_masked: false, csha: None,
+        };
+        let (eligible, why) = attention_sinks_v1_backward_eligible(&cfg);
+        assert!(!eligible, "expected refusal for sinks-enabled backward");
+        let msg = why.expect("blocking reason must be Some");
+        assert!(
+            msg.contains("v2"),
+            "blocking reason must cite future v2 sprint: '{msg}'"
+        );
+        assert!(
+            msg.contains("backward"),
+            "blocking reason must name backward: '{msg}'"
+        );
+    }
+
+    /// Sprint 2 cycle-7: the predicate refuses at ANY positive sink
+    /// token count, not just the canonical Sprint 1b narrow value (4).
+    #[test]
+    fn sinks_enabled_backward_refused_at_arbitrary_token_counts() {
+        for n in [1u32, 2, 4, 8, 16, 32] {
+            let cfg = FlashAttentionConfig {
+                block_q: 64, block_kv: 64, head_dim: 64,
+                causal: false, paged: false, rope_q: false,
+                rope_style: RopeStyle::Adjacent, gqa_group_size: 1,
+                tree_mask: false, num_sink_tokens: n,
+                gpu_sm: 80, segment_masked: false, csha: None,
+            };
+            let (eligible, _) = attention_sinks_v1_backward_eligible(&cfg);
+            assert!(!eligible, "sinks-enabled backward must refuse at n={n}");
+        }
     }
 }

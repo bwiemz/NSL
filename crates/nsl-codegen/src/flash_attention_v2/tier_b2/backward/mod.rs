@@ -96,6 +96,26 @@ pub(crate) fn strip_module_header(ptx: &str) -> &str {
 pub fn synthesize_tier_b2_backward(
     config: &FlashAttentionConfig,
 ) -> Result<String, BackwardSynthError> {
+    // Sprint 2 cycle-7 defense-in-depth: refuse `num_sink_tokens > 0`.
+    // The forward eligibility predicate refuses
+    // `csha.save_activations_for_backward = true` + `num_sink_tokens > 0`
+    // at the compiler/kernel.rs front door, but the Tier B.2 hybrid
+    // path can be reached via several callers (the v2 combined-module
+    // assembler, the v2 tier-dispatch wrapper, and any direct call
+    // from a test). The dQ/dKdV kernels do not understand the
+    // persistent sink slab — they read HBM with stride formulas that
+    // assume the unique-position layout of pre-Sprint-1b kernels. A
+    // hybrid module synthesised here at `num_sink_tokens > 0` would
+    // launch successfully and silently emit wrong gradients. Lift
+    // point: when a future v2 sprint extends the dQ/dKdV/proj-backward
+    // kernels to read the sink slab, drop this guard.
+    if config.num_sink_tokens > 0 {
+        return Err(BackwardSynthError::UnsupportedConfig(
+            "Sprint 2 cycle-7: backward synthesis with num_sink_tokens > 0 is deferred to a future v2 sprint — sinks v1 is forward-only. The dK/dV/dQ kernels do not understand the persistent sink slab; the projection-backward HBM read of sink rows would consume garbage."
+                .to_string(),
+        ));
+    }
+
     let d_prepass_ptx = d_prepass::synthesize_d_prepass(config)?;
     let dq_ptx = dq::synthesize_dq_kernel(config)?;
     let dkdv_ptx = dkdv::synthesize_dkdv_kernel(config)?;
