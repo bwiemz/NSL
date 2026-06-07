@@ -374,16 +374,19 @@ pub extern "C" fn nsl_moe_dispatch_full(
 /// REFUSALS (return 0 — caller MUST treat as compile-time error):
 ///   - experts_ptr == 0
 ///   - num_experts == 0
-///   - top_k != 1 — top_k > 1 would silently double-count each token's
-///     contributions in the gather (`gather_tokens` uses uniform 1.0
-///     weights regardless of top_k; gating-weight broadcast is a
-///     v2.next deferral). Fail-closed rather than silently miscompute.
+///   - top_k not in {1, 2} — `route_topk` itself asserts this; v2 fails
+///     closed at the FFI boundary rather than panicking inside the router.
 ///   - experts.dtype != tokens.dtype (mixed-dtype silent-corruption hazard)
 ///   - experts.len != num_experts * hidden_dim * intermediate_dim
 ///
-/// Deferrals (v2.next): bias, activation, down-proj, gating-weight
-/// broadcast + top_k > 1 support, capacity overflow handling,
-/// GPU expert_parallel_matmul, FP16 experts.
+/// GATING-WEIGHT BROADCAST: top_k > 1 now uses the real per-token-per-
+/// expert routing weights from `routing.sorted_assignment_weights`
+/// (router-normalized so the surviving pair sums to 1.0 per token).
+/// `gather_tokens` performs the weighted sum across each token's
+/// surviving assignments.
+///
+/// Deferrals (v2.next): bias, activation, down-proj, capacity overflow
+/// handling, GPU expert_parallel_matmul, FP16 experts.
 #[no_mangle]
 pub extern "C" fn nsl_moe_dispatch_full_v2(
     tokens_ptr: i64,
@@ -403,10 +406,9 @@ pub extern "C" fn nsl_moe_dispatch_full_v2(
     if experts_ptr == 0 || num_experts <= 0 || hidden_dim <= 0 || intermediate_dim <= 0 {
         return 0;
     }
-    // top_k > 1 silently double-counts each token's contribution in the
-    // gather (uniform 1.0 weights regardless of top_k; gating-weight
-    // broadcast is a v2.next deferral). Fail-closed.
-    if top_k != 1 {
+    // route_topk asserts top_k in {1, 2}. Fail closed at the FFI boundary
+    // instead of letting the assertion panic across the C ABI.
+    if top_k != 1 && top_k != 2 {
         return 0;
     }
 
@@ -502,13 +504,16 @@ pub extern "C" fn nsl_moe_dispatch_full_v2(
         }
     }
 
-    // Gather back to token order. Uniform weight 1.0 (gating-weight broadcast
-    // is a v2.next deferral; matches the granular-op reference exactly).
-    let gather_weights = vec![1.0_f32; total_assigned];
+    // Gather back to token order using the real per-(token, expert)
+    // routing weights from sorted_assignment_weights. For top_k=1 every
+    // weight is 1.0 (single-element softmax), so this remains bit-exact
+    // against the prior uniform-1.0 path. For top_k=2 each surviving
+    // assignment carries its router-normalized share; gather_tokens
+    // accumulates the weighted sum back to the original token row.
     let output_f32 = dispatch::gather_tokens(
         &sorted_outputs,
         &routing.sorted_token_indices,
-        &gather_weights,
+        &routing.sorted_assignment_weights,
         total_tokens,
         top_k,
         intermediate_dim_us,
