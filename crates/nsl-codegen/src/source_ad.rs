@@ -1651,6 +1651,26 @@ impl<'a> WengertExtractor<'a> {
             (_, Some(PrimalOp::Matmul)) => (rhs_op?, lhs),
             _ => return None,
         };
+        // Review Finding 3: reject `Add(Matmul, Matmul)` and other
+        // patterns where the "bias" slot would receive a high-rank
+        // tensor.  The arm above picks the FIRST Matmul-producing
+        // operand as the matmul leg and treats the OTHER Add operand
+        // as `bias_var`.  If `bias_var` is itself the output of a
+        // Matmul (e.g. `matmul(x1, W1^T) + matmul(x2, W2^T)`), the
+        // substituted fused FFI will dereference its bias_ptr as a
+        // dense `[V]` vector — reading garbage from a `[B*S, V]`
+        // matmul intermediate.  Same hazard for
+        // `ScaledDotProductAttention` (high-rank output) and `Conv2d`
+        // (if/when it appears).  Refuse the substitution and fall
+        // through to the composite path.
+        if let Some(bias_producer) = self.list.find_producer(bias_var) {
+            if matches!(
+                bias_producer.op,
+                PrimalOp::Matmul | PrimalOp::ScaledDotProductAttention { .. }
+            ) {
+                return None;
+            }
+        }
         if matmul_op.inputs.len() != 2 {
             return None;
         }

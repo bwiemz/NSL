@@ -389,6 +389,54 @@ fn auto_substitution_prunes_dead_composite_upstream_chain() {
     );
 }
 
+// ─── Test 8: review Finding 3 — Add(Matmul, Matmul) is rejected ────────
+//
+// `try_match_fused_linear_ce_pattern` previously accepted whatever the
+// non-Matmul operand of the Add was as `bias_var`.  If BOTH Add
+// operands are Matmuls (e.g. `matmul(x1, W1^T) + matmul(x2, W2^T)`),
+// the wrong-shape RHS would silently be passed in the bias slot to the
+// fused FFI, which dereferences it as a `[V]` vector — reading garbage.
+//
+// The fix: detect the bias-side Matmul producer and reject the
+// substitution, falling through to the composite path.
+
+const ADD_MATMUL_MATMUL_SRC: &str = r#"
+fn step(x1: Tensor, w1: Tensor, x2: Tensor, w2: Tensor, targets: Tensor) -> Tensor:
+    let w1_t = transpose(w1, 0, 1)
+    let w2_t = transpose(w2, 0, 1)
+    let logits = matmul(x1, w1_t) + matmul(x2, w2_t)
+    return cross_entropy(logits, targets)
+"#;
+
+#[test]
+fn ambiguous_add_matmul_matmul_pattern_is_rejected() {
+    let cfg = FusedCeDecoratorConfig {
+        enabled: true,
+        vocab_tile: Some(1024),
+        vocab_size: Some(4096),
+        hidden_size: Some(128),
+        batch_size: Some(2),
+        seq_len: Some(32),
+    };
+    let list = extract_first_fn(ADD_MATMUL_MATMUL_SRC, Some(cfg))
+        .expect("extraction must succeed");
+
+    // The matcher must refuse — the "bias" operand is itself a Matmul
+    // result, so passing it as a `[V]` bias would corrupt the kernel.
+    assert_eq!(
+        count_fused(&list),
+        0,
+        "Add(Matmul, Matmul) is ambiguous — the bias slot would receive \
+         a high-rank tensor.  Substitution must be refused (Finding 3)."
+    );
+    // Composite CE must take over.
+    assert_eq!(
+        count_composite_ce(&list),
+        1,
+        "composite PrimalOp::CrossEntropyLoss must be emitted as fallback"
+    );
+}
+
 // ─── Test 6: Sprint 4's explicit-call path still works ──────────────────
 
 #[test]
