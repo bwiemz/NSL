@@ -81,10 +81,10 @@ pub fn emit_wire(w: &Wire) -> String {
 /// Mechanical lowering — emits `wire signed [W-1:0] name [0:dims[0]-1]...;`
 /// (single space after name, no separator between dim brackets).
 pub fn emit_wire_array(wa: &WireArray) -> String {
-    let dims_str: String = wa.dims.iter()
-        .map(|d| format!("[0:{}]", d - 1))
+    let packed_dims: String = wa.dims.iter()
+        .map(|d| format!("[{}:0]", d - 1))
         .collect();
-    format!("wire signed [{}:0] {} {};", wa.width - 1, wa.name, dims_str)
+    format!("wire signed {}[{}:0] {};", packed_dims, wa.width - 1, wa.name)
 }
 
 /// M57.1 wire-array realization (Task W4): drives one element of a WireArray.
@@ -104,46 +104,43 @@ pub fn emit_local_param(lp: &LocalParam) -> String {
 }
 
 /// M57.1 wire-array realization (Task W5): emit a module-scope multi-dim
-/// const array as `localparam signed [W-1:0] name [0:dim0-1]... = '{...};`.
-/// For 2D arrays the literal renders as a nested SystemVerilog `'{ }`. For
-/// 1D as a flat `'{ }`. Higher ranks panic (not exercised by v1 MLP).
+/// const array as `localparam signed [D0-1:0]...[W-1:0] name = { ... };`.
+/// Packed dimensions (before the identifier) are used for Yosys compatibility
+/// — Yosys rejects unpacked dimensions after the name. The initializer uses
+/// standard Verilog concatenation (MSB-first) rather than SV `'{ }` aggregates
+/// which older Yosys versions do not support.
 ///
-/// Mechanical lowering — values flow verbatim through `{width}'sd{value}`,
-/// matching `emit_local_param`'s signed-decimal encoding. Snapshot tests
-/// elide localparam lines (`elide_localparams`) so the bulk of the W matrix
-/// content doesn't dominate the structural-skeleton snapshot.
+/// Element mapping: `name[r][c]` = `values[r*cols + c]`. Higher ranks panic.
 pub fn emit_local_param_array(lpa: &LocalParamArray) -> String {
-    let dims_str: String = lpa.dims.iter()
-        .map(|d| format!(" [0:{}]", d - 1))
+    let packed_dims: String = lpa.dims.iter()
+        .map(|d| format!("[{}:0]", d - 1))
         .collect();
     let values_str = match lpa.dims.len() {
         2 => {
             let (rows, cols) = (lpa.dims[0], lpa.dims[1]);
-            assert_eq!(lpa.values.len(), rows * cols,
-                "LocalParamArray.values len {} != rows({}) * cols({})",
-                lpa.values.len(), rows, cols);
-            let row_strs: Vec<String> = (0..rows).map(|r| {
-                let cells: Vec<String> = (0..cols).map(|c| {
+            // Packed [rows-1:0][cols-1:0][W-1:0]: name[r][c] = values[r*cols+c].
+            // Concat is MSB-first: iterate r from rows-1 down to 0, c from cols-1 down to 0.
+            let cells: Vec<String> = (0..rows).rev().flat_map(|r| {
+                (0..cols).rev().map(move |c| {
                     format!("{}'sd{}", lpa.width, lpa.values[r * cols + c])
-                }).collect();
-                format!("'{{{}}}", cells.join(", "))
+                })
             }).collect();
-            format!("'{{{}}}", row_strs.join(", "))
+            format!("{{{}}}", cells.join(", "))
         }
         1 => {
-            assert_eq!(lpa.values.len(), lpa.dims[0],
-                "LocalParamArray.values len {} != dim {}",
-                lpa.values.len(), lpa.dims[0]);
-            let cells: Vec<String> = lpa.values.iter()
-                .map(|v| format!("{}'sd{}", lpa.width, v))
-                .collect();
-            format!("'{{{}}}", cells.join(", "))
+            let n = lpa.dims[0];
+            // Packed [n-1:0][W-1:0]: name[i] = values[i].
+            // Concat is MSB-first: iterate i from n-1 down to 0.
+            let cells: Vec<String> = (0..n).rev().map(|i| {
+                format!("{}'sd{}", lpa.width, lpa.values[i])
+            }).collect();
+            format!("{{{}}}", cells.join(", "))
         }
         n => panic!("emit_local_param_array: rank {} not supported in v1", n),
     };
     format!(
-        "localparam signed [{}:0] {}{} = {};",
-        lpa.width - 1, lpa.name, dims_str, values_str
+        "localparam signed {}[{}:0] {} = {};",
+        packed_dims, lpa.width - 1, lpa.name, values_str
     )
 }
 
@@ -197,8 +194,10 @@ pub fn emit_wire_decl(d: &WireDecl) -> String {
 /// M57.2 (Task 6): module-scope clocked register array — sequential sibling
 /// of `WireArray`. Emits `reg signed [w-1:0] {name} [0:dims[0]-1]...;`.
 pub fn emit_reg_array(ra: &RegArray) -> String {
-    let dims_str: String = ra.dims.iter().map(|d| format!("[0:{}]", d - 1)).collect();
-    format!("reg signed [{}:0] {} {};", ra.width - 1, ra.name, dims_str)
+    let packed_dims: String = ra.dims.iter()
+        .map(|d| format!("[{}:0]", d - 1))
+        .collect();
+    format!("reg signed {}[{}:0] {};", packed_dims, ra.width - 1, ra.name)
 }
 
 pub fn emit_sign_extend(s: &SignExtend) -> String {
@@ -559,7 +558,7 @@ mod tests {
         };
         assert_eq!(
             emit_wire_array(&wa),
-            "wire signed [31:0] acc_l1 [0:127][0:784];"
+            "wire signed [127:0][784:0][31:0] acc_l1;"
         );
     }
 
@@ -572,7 +571,7 @@ mod tests {
         };
         assert_eq!(
             emit_wire_array(&wa),
-            "wire signed [31:0] relu_l1 [0:127];"
+            "wire signed [127:0][31:0] relu_l1;"
         );
     }
 
@@ -665,7 +664,7 @@ mod tests {
     #[test]
     fn reg_array_emits_declaration() {
         let ra = RegArray { name: "x_buf".into(), dims: vec![784], width: 8 };
-        assert_eq!(emit_reg_array(&ra), "reg signed [7:0] x_buf [0:783];");
+        assert_eq!(emit_reg_array(&ra), "reg signed [783:0][7:0] x_buf;");
     }
 
     // --- M57.2 (Task 7): SeqLValue ---
