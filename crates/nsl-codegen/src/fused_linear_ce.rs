@@ -2543,7 +2543,7 @@ fn emit_bwd_kernel_f16(cfg: &FusedLinearCEConfig) -> String {
          \t\t\t\tcvt.f32.f16 %f5, %h0;\n\
          \t\t\t\t// f6 = scaled * W[v, h]  (f32 grad slice)\n\
          \t\t\t\tmul.f32 %f6, %f4, %f5;\n\
-         \t\t\t\t// dx_out[row, h] += f6  (f32 destination — stride 4)\n\
+         \t\t\t\t// dx_out[row, h] += f6  (f32 destination - stride 4)\n\
          \t\t\t\tcvt.u64.u32 %rd14, %r9;\n\
          \t\t\t\tshl.b64 %rd14, %rd14, 2;\n\
          \t\t\t\tadd.u64 %rd14, %rd20, %rd14;\n\
@@ -2554,7 +2554,7 @@ fn emit_bwd_kernel_f16(cfg: &FusedLinearCEConfig) -> String {
          \t\t\t\tcvt.f32.f16 %f7, %h1;\n\
          \t\t\t\t// f8 = scaled * x[row, h]\n\
          \t\t\t\tmul.f32 %f8, %f4, %f7;\n\
-         \t\t\t\t// dW_out[v, h] += f8  (f32 destination — stride 4)\n\
+         \t\t\t\t// dW_out[v, h] += f8  (f32 destination - stride 4)\n\
          \t\t\t\tcvt.u64.u32 %rd14, %r9;\n\
          \t\t\t\tshl.b64 %rd14, %rd14, 2;\n\
          \t\t\t\tadd.u64 %rd14, %rd21, %rd14;\n\
