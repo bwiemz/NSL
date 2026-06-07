@@ -8,10 +8,14 @@
 //! (identical value on every lane after the reductions).
 
 use crate::flash_attention::FlashAttentionConfig;
+use crate::flash_attention_v2::sinks::effective_block_kv;
 use crate::flash_attention_v2::smem_layout::sp_offset;
 
 pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
-    let block_kv = config.block_kv as u32;
+    // §4.3 sinks (Sprint 1a precursor): the softmax chunk count, warp-base
+    // stride, and final in-range compare all bound the SMEM S/P row, which
+    // matches what s_compute / pv_accum see. Byte-identical at num_sink_tokens==0.
+    let block_kv = effective_block_kv(config) as u32;
     let fused = config.csha.as_ref().is_some_and(|c| c.fused_projections);
     // J-A3 softmax-internal capture: when save_activations is on, snapshot
     // the three decisive softmax-state registers to dedicated scratch regs

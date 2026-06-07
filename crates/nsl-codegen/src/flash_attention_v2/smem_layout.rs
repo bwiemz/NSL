@@ -320,7 +320,13 @@ pub fn sp_offset(config: &FlashAttentionConfig) -> u32 {
 /// time; without the expanded region each S-pass overwrites the previous iter's P.
 pub fn sp_bytes(config: &FlashAttentionConfig) -> u32 {
     let warps     = 4u32;
-    let block_kv  = config.block_kv as u32;
+    // §4.3 sinks (Sprint 1a precursor): SP scratch holds one S/P slot per
+    // (warp, kv-row). The kv-row count is `effective_block_kv` — what
+    // s_compute writes to and softmax / pv_accum read. If sp_bytes used
+    // raw `block_kv` while s_compute wrote to `effective_block_kv`-many
+    // rows the S-store would overflow into adjacent SMEM regions. At
+    // num_sink_tokens==0, this is identical to `config.block_kv` (no-op).
+    let block_kv  = crate::flash_attention_v2::sinks::effective_block_kv(config) as u32;
     let base      = warps * block_kv * 4;
     if config.csha.as_ref().is_some_and(|c| c.fused_projections) {
         let iters = (config.block_q as u32).div_ceil(4);

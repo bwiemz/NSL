@@ -18,6 +18,7 @@
 //! d = lane + 32*i. Finalize phase divides by %row_sum and stores out.
 
 use crate::flash_attention::FlashAttentionConfig;
+use crate::flash_attention_v2::sinks::effective_block_kv;
 use crate::flash_attention_v2::smem_layout::{kv_offset, sp_offset};
 
 /// O_acc register base - lane-held O slice starts at `%f{O_BASE}`.
@@ -28,7 +29,10 @@ pub const O_BASE: u32 = 48;
 pub fn emit(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
     let head_dim = config.head_dim as u32;
     let slices   = head_dim / 32;
-    let block_kv = config.block_kv as u32;
+    // §4.3 sinks (Sprint 1a precursor): the PV inner loop bound and the
+    // P-load warp-base stride must match the SMEM row count s_compute /
+    // softmax write. Byte-identical at num_sink_tokens==0.
+    let block_kv = effective_block_kv(config) as u32;
     let fused = config.csha.as_ref().is_some_and(|c| c.fused_projections);
     // SP slice base offset for this q_tile_iter (same logic as softmax.rs).
     let sp_iter_offset = if fused {

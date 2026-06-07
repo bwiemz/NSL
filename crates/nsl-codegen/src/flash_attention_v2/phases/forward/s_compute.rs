@@ -19,6 +19,7 @@
 use crate::flash_attention::FlashAttentionConfig;
 use crate::flash_attention_v2::phases::q_load::Q_BASE;
 use crate::flash_attention_v2::phases::softmax::emit_direct_hbm_store_of_reg;
+use crate::flash_attention_v2::sinks::effective_block_kv;
 use crate::flash_attention_v2::smem_layout::{kv_offset, sp_offset};
 use crate::pca_segment::SegmentResidency;
 
@@ -36,7 +37,10 @@ pub fn emit(
 ) {
     let head_dim = config.head_dim as u32;
     let slices   = head_dim / 32;
-    let block_kv = config.block_kv as u32;
+    // §4.3 sinks (Sprint 1a precursor): the inner k-loop bound and the
+    // S-store stride must match the row count in the SMEM KV slab. At
+    // num_sink_tokens==0 this is identical to `config.block_kv`.
+    let block_kv = effective_block_kv(config) as u32;
     let fused = config.csha.as_ref().is_some_and(|c| c.fused_projections);
     let capture = config
         .csha
@@ -91,7 +95,12 @@ pub fn emit(
     //     Codified in `docs/superpowers/specs/2026-05-13-tier-b-b15-3-skip-ratio-investigation.md`.
     if let Some((seq_len, residency)) = tier_b {
         if crate::pca_tilerange::should_emit_tier_b(config, seq_len as u64, residency) {
-            let log2_bkv = block_kv.trailing_zeros();
+            // PCA Tier B kvt-ordinal: derives the HBM kv-tile index from
+            // %k_start, which advances by HBM `config.block_kv` per outer
+            // iteration (mod.rs k_start += block_kv). Use the HBM-side
+            // stride here, NOT effective_block_kv (the sink slab does not
+            // add to HBM kv-tile stride). Byte-identical at num_sink_tokens==0.
+            let log2_bkv = (config.block_kv as u32).trailing_zeros();
             let range_table_base =
                 crate::flash_attention_v2::smem_layout::tier_b_range_table_offset(
                     config,

@@ -12,6 +12,7 @@
 pub mod smem_layout;
 pub mod register_budget;
 pub mod phases;
+pub mod sinks;
 pub mod tier_b1;
 pub mod tier_b2;
 
@@ -415,7 +416,11 @@ pub fn synthesize_flash_attention_ptx_v2_with_tier_b(
 /// overwriting the fused result.  When `csha_wk_ptr` is null (caller
 /// pre-projected K/V via classic k_ptr) the load runs normally.
 fn emit_k_tile_load(ptx: &mut String, config: &FlashAttentionConfig, q_iter: u32) {
-    let total_k_elems = (config.block_kv as u32) * (config.head_dim as u32);
+    // §4.3 attention sinks (Sprint 1a precursor): the load loop covers
+    // `effective_block_kv` rows so the K SMEM slab matches the bound that
+    // s_compute / softmax / pv_accum / sp_bytes use. At num_sink_tokens==0
+    // this is identical to `config.block_kv` (byte-identity invariant).
+    let total_k_elems = (sinks::effective_block_kv(config) as u32) * (config.head_dim as u32);
     let fused_k = config.csha.as_ref().is_some_and(|c| c.fused_projections);
 
     ptx.push_str("    // K tile load: 128 threads cooperatively load block_kv*head_dim elems\n");
@@ -489,7 +494,8 @@ fn emit_k_tile_load(ptx: &mut String, config: &FlashAttentionConfig, q_iter: u32
 /// projection sweep has already written projected V into SMEM — skip the
 /// HBM load to avoid overwriting the fused result.
 fn emit_v_tile_load(ptx: &mut String, config: &FlashAttentionConfig, q_iter: u32) {
-    let total_v_elems = (config.block_kv as u32) * (config.head_dim as u32);
+    // §4.3 attention sinks (Sprint 1a precursor): see emit_k_tile_load.
+    let total_v_elems = (sinks::effective_block_kv(config) as u32) * (config.head_dim as u32);
     let fused_v = config.csha.as_ref().is_some_and(|c| c.fused_projections);
 
     ptx.push_str("    // V tile load: cooperative, reuses K region\n");
