@@ -410,3 +410,177 @@ fn fp16_forward_backward_at_v8192_boundary() {
     // V=8192 is exactly the small/large routing threshold (still small).
     run_fp16_numerical(1, 32, 8192, 128, 1024);
 }
+
+// ─── Review Finding 2 — large-vocab F16 non-divisor regression guard ──
+//
+// V=8193 with vocab_tile=128 produces ceil(8193/128) = 65 tiles where
+// the last tile has 1 real logit + 127 tail-zero slots.  Pre-fix, every
+// tail slot wrote fp16 0x0000 (the broken cvt path), and the per-tile
+// max-reduce folded 0.0 into the cross-CTA LSE — corrupting forward
+// loss whenever all real logits were negative.  Post-fix the tail
+// slots hold fp16 -INF (0xFC00) so the max-reduce ignores them.
+//
+// We deliberately pick V=8193 (just over the LARGE_VOCAB_THRESHOLD of
+// 8192) instead of V=49153 to keep the CPU f64 reference under a
+// minute even on modest hosts (rows=32 × 8193 × 128 = ~33M f64 muls).
+// Routes through the SAME `emit_large_partials_kernel_f16` path the
+// production V=49152 fixture uses — the tail-zero branch and its
+// reduction-time consumer are identical.
+
+#[test]
+#[ignore]
+fn fp16_large_vocab_non_divisor_no_tail_zero_corruption() {
+    if !cuda_available() {
+        return;
+    }
+
+    use nsl_codegen::fused_linear_ce::MAX_VOCAB_HARD_CEILING;
+    use nsl_runtime::nsl_fused_linear_ce_forward_large;
+
+    const B: usize = 1;
+    const S: usize = 32;
+    const V: usize = 8193; // V % vocab_tile != 0 — exercises tail-zero branch
+    const H: usize = 128;
+    const VOCAB_TILE: u32 = 128;
+
+    let cfg = FusedLinearCEConfig {
+        vocab_size: V as u32,
+        hidden_size: H as u32,
+        seq_len: S as u32,
+        batch_size: B as u32,
+        vocab_tile: VOCAB_TILE,
+        gpu_sm: 80,
+        dtype: Dtype::F16,
+        ignore_index: IGNORE_INDEX,
+        max_vocab_v1: MAX_VOCAB_HARD_CEILING,
+    };
+    cfg.validate().expect("V=8193 must validate (no V%vocab_tile gate)");
+    assert!(
+        cfg.is_large_vocab(),
+        "V=8193 must route through the large-vocab F16 kernels"
+    );
+
+    let rows = B * S;
+    let mut targets = vec![0i64; rows];
+    for (i, t) in targets.iter_mut().enumerate() {
+        *t = if i % 16 == 0 { IGNORE_INDEX } else { ((i * 37 + 13) % V) as i64 };
+    }
+
+    // Seed with NEGATIVE-only logits to expose the bug: pre-fix the
+    // tail slots stored fp16 0.0 (the broken cvt path), which would
+    // then dominate the max-reduce — corrupting the LSE and the loss.
+    // Post-fix the tail stores fp16 -INF, so 0.0 never appears.
+    //
+    // Negative logits via a tiny mean-shift: subtract a bias from the
+    // distribution so the max real logit is comfortably below 0.0.
+    let mut x_f32 = vec![0f32; rows * H];
+    let mut w_f32 = vec![0f32; V * H];
+    let mut bias_f32 = vec![-2.0f32; V]; // baseline negative bias
+    fill_seeded(&mut x_f32, 42);
+    fill_seeded(&mut w_f32, 137);
+    // additive perturbation on top of the negative baseline
+    {
+        let mut tmp = vec![0f32; V];
+        fill_seeded(&mut tmp, 7);
+        for (b_, t_) in bias_f32.iter_mut().zip(tmp.iter()) {
+            *b_ += *t_ * 0.1;
+        }
+    }
+
+    let x_ref = round_through_fp16(&x_f32);
+    let w_ref = round_through_fp16(&w_f32);
+    let bias_ref = round_through_fp16(&bias_f32);
+
+    let mut x_h16 = vec![0u16; rows * H];
+    let mut w_h16 = vec![0u16; V * H];
+    let mut bias_h16 = vec![0u16; V];
+    f32_slice_to_fp16_bits(&x_f32, &mut x_h16);
+    f32_slice_to_fp16_bits(&w_f32, &mut w_h16);
+    f32_slice_to_fp16_bits(&bias_f32, &mut bias_h16);
+
+    let mut ptx = nsl_codegen::fused_linear_ce::synthesize_fused_linear_ce_ptx(&cfg);
+    ptx.push(0u8);
+    let kname_a = format!("{}\0", cfg.large_partials_kernel_name());
+    let kname_b = format!("{}\0", cfg.large_finalize_kernel_name());
+
+    let x_bytes = (rows * H * 2) as i64;
+    let w_bytes = (V * H * 2) as i64;
+    let bias_bytes = (V * 2) as i64;
+    let tgt_bytes = (rows * 8) as i64;
+    let loss_bytes = (rows * 4) as i64;
+    let lse_bytes = (rows * 4) as i64;
+    let partials_bytes = cfg.large_partials_bytes() as i64;
+
+    let x_dev = unsafe { nsl_test_cuda_alloc(x_bytes) };
+    let w_dev = unsafe { nsl_test_cuda_alloc(w_bytes) };
+    let bias_dev = unsafe { nsl_test_cuda_alloc(bias_bytes) };
+    let tgt_dev = unsafe { nsl_test_cuda_alloc(tgt_bytes) };
+    let loss_dev = unsafe { nsl_test_cuda_alloc(loss_bytes) };
+    let lse_dev = unsafe { nsl_test_cuda_alloc(lse_bytes) };
+    let partials_dev = unsafe { nsl_test_cuda_alloc(partials_bytes) };
+
+    unsafe {
+        nsl_test_cuda_h2d(x_dev, x_h16.as_ptr() as i64, x_bytes);
+        nsl_test_cuda_h2d(w_dev, w_h16.as_ptr() as i64, w_bytes);
+        nsl_test_cuda_h2d(bias_dev, bias_h16.as_ptr() as i64, bias_bytes);
+        nsl_test_cuda_h2d(tgt_dev, targets.as_ptr() as i64, tgt_bytes);
+    }
+
+    let (ref_mean_loss, _ref_lse) =
+        cpu_reference_forward(B, S, V, H, &x_ref, &w_ref, &bias_ref, &targets);
+    eprintln!("CPU ref mean loss = {ref_mean_loss:.6}");
+
+    let smem = cfg.shared_mem_bytes();
+    let num_tiles = cfg.num_vocab_tiles();
+    let rc = nsl_fused_linear_ce_forward_large(
+        ptx.as_ptr() as i64,
+        kname_a.as_ptr() as i64,
+        kname_b.as_ptr() as i64,
+        x_dev, w_dev, bias_dev, tgt_dev, partials_dev,
+        loss_dev, lse_dev,
+        B as i64, S as i64, V as i64, H as i64,
+        num_tiles as i64,
+        smem as i64,
+        DTYPE_TAG_F16,
+    );
+    assert_eq!(
+        rc, 0,
+        "nsl_fused_linear_ce_forward_large (fp16, non-divisor V) failed rc={rc}"
+    );
+
+    let mut loss_host = vec![0f32; rows];
+    unsafe {
+        nsl_test_cuda_d2h(loss_host.as_mut_ptr() as i64, loss_dev, loss_bytes);
+    }
+    let mut gpu_loss_sum = 0f64;
+    let mut gpu_nv = 0usize;
+    for (i, &lv) in loss_host.iter().enumerate() {
+        if targets[i] != IGNORE_INDEX {
+            gpu_loss_sum += lv as f64;
+            gpu_nv += 1;
+        }
+    }
+    let gpu_mean_loss = gpu_loss_sum / gpu_nv.max(1) as f64;
+    let rel_err =
+        (gpu_mean_loss - ref_mean_loss).abs() / ref_mean_loss.abs().max(1.0);
+    eprintln!(
+        "fp16 V=8193 forward: gpu={gpu_mean_loss:.6} ref={ref_mean_loss:.6} rel_err={rel_err:.2e}"
+    );
+    assert!(
+        rel_err < 1e-3,
+        "fp16 V=8193 (non-divisor) forward rel_err {rel_err:.2e} exceeds 1e-3 \
+         — pre-fix this fixture would have shown corruption when all real \
+         logits were negative (tail-zero stored fp16 0.0 instead of -INF, \
+         dominating the per-tile max-reduce)"
+    );
+
+    unsafe {
+        nsl_test_cuda_free(x_dev);
+        nsl_test_cuda_free(w_dev);
+        nsl_test_cuda_free(bias_dev);
+        nsl_test_cuda_free(tgt_dev);
+        nsl_test_cuda_free(loss_dev);
+        nsl_test_cuda_free(lse_dev);
+        nsl_test_cuda_free(partials_dev);
+    }
+}

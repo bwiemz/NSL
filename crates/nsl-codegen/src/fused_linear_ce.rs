@@ -2035,12 +2035,27 @@ fn emit_large_partials_kernel_f16(cfg: &FusedLinearCEConfig) -> String {
     lines.push(p("\t\tbra LP_INNER_STORE;"));
     lines.push(String::new());
 
-    // Tail-zero: store -INF fp16 so it doesn't perturb max/sum.
+    // Tail-zero: store fp16 -INF directly to smem so it doesn't perturb
+    // max/sum.  Review Finding 2: previously this path mov'd the f32
+    // bit-pattern 0f80800000 (which is -1.175e-38 — the smallest normal
+    // negative f32, NOT -INF) into %facc and fell through to the shared
+    // store-via-cvt path.  cvt.rn.f16.f32 then mapped -1.175e-38 to fp16
+    // 0x0000 (below fp16 subnormal range), and the downstream
+    // LP_RED_MAX/LP_RED_SUM reads max'd with 0.0 — corrupting the
+    // per-tile LSE whenever all real logits in the tile were negative.
+    // We now branch around the cvt and write 0xFC00 (fp16 -INF) directly.
     lines.push(p("LP_INNER_TAIL_ZERO:"));
-    lines.push(p("\t\tmov.f32 %facc, 0f80800000; // -INF f32 (cvt'd to fp16 -INF below)"));
+    lines.push(p("\t\tshl.b32 %r11, %r7, 1; // *2"));
+    lines.push(format!("\t\tmov.u64 %rd16, smem_partials_{vocab};"));
+    lines.push(p("\t\tcvt.u64.u32 %rd17, %r11;"));
+    lines.push(p("\t\tadd.u64 %rd16, %rd16, %rd17;"));
+    lines.push(p("\t\tmov.b16 %h2, 0xFC00; // fp16 -INF (direct, no f32 cvt)"));
+    lines.push(p("\t\tst.shared.b16 [%rd16], %h2;"));
+    lines.push(p("\t\tbra LP_INNER_AFTER_STORE;"));
     lines.push(String::new());
 
-    // Store logit to smem as fp16.
+    // Store logit to smem as fp16 — real-tile path goes through the
+    // f32 → fp16 cvt below.
     lines.push(p("LP_INNER_STORE:"));
     lines.push(p("\t\tshl.b32 %r11, %r7, 1; // *2"));
     lines.push(format!("\t\tmov.u64 %rd16, smem_partials_{vocab};"));
@@ -2048,6 +2063,7 @@ fn emit_large_partials_kernel_f16(cfg: &FusedLinearCEConfig) -> String {
     lines.push(p("\t\tadd.u64 %rd16, %rd16, %rd17;"));
     lines.push(p("\t\tcvt.rn.f16.f32 %h2, %facc;"));
     lines.push(p("\t\tst.shared.b16 [%rd16], %h2;"));
+    lines.push(p("LP_INNER_AFTER_STORE:"));
     lines.push(String::new());
 
     lines.push(p("\t\tadd.u32 %r6, %r6, 1;"));

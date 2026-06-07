@@ -256,6 +256,105 @@ fn fp16_intermediate_scale_assembles_for_sm80_at_v16384() {
     }
 }
 
+// ─── Review Finding 2 — F16 tail-zero sentinel regression guard ─────────
+//
+// Pre-fix the large-vocab partials F16 kernel mov'd the f32 bit-pattern
+// `0f80800000` (which is -1.175e-38, NOT -INF) into %facc on the
+// tail-zero branch, then cvt.rn.f16.f32'd it through the shared store
+// path.  The cvt mapped -1.175e-38 to fp16 0x0000 (below the fp16
+// subnormal range), and the downstream max-reduce over the smem tile
+// then folded 0.0 into the per-tile max — corrupting the cross-CTA LSE
+// when all real logits were negative.  Latent because every existing
+// fixture used cleanly-divisible vocab (vocab % vocab_tile == 0), so no
+// tail slot was ever exercised by a tile that also held real logits.
+//
+// The fix branches around the cvt and writes the fp16 -INF bit-pattern
+// (`0xFC00`) directly via `mov.b16 %h2, 0xFC00 ; st.shared.b16 …`.
+//
+// This regression test asserts:
+//   1. The fixed sentinel pattern is structurally present.
+//   2. The old broken pattern (`mov.f32 %facc, 0f80800000` immediately
+//      before a fall-through into the cvt-store path) is GONE.
+//   3. The kernel still assembles via ptxas.
+//
+// Non-divisor vocab is also accepted by the kernel — V=49153 produces
+// `ceil(49153/128) = 385` tiles where the last tile holds 1 real logit
+// + 127 tail-zero slots.  The PTX emitter does not parameterise on
+// (V % vocab_tile), so any large-vocab F16 invocation suffices to
+// exercise the structural check; we still pick a non-divisor V here so
+// future GPU runs can pick this fixture up unchanged.
+
+#[test]
+fn fp16_large_vocab_tail_zero_writes_fp16_neg_inf_directly() {
+    let cfg = FusedLinearCEConfig {
+        vocab_size: 49153,
+        hidden_size: 128,
+        seq_len: 32,
+        batch_size: 1,
+        vocab_tile: 128,
+        gpu_sm: 80,
+        dtype: Dtype::F16,
+        ignore_index: -100,
+        max_vocab_v1: MAX_VOCAB_HARD_CEILING,
+    };
+    cfg.validate().expect("V=49153 must validate (no V%vocab_tile gate)");
+    assert!(cfg.is_large_vocab(), "fixture must route through the F16 large-vocab path");
+
+    let ptx = synthesize_fused_linear_ce_ptx(&cfg);
+    let txt = std::str::from_utf8(&ptx).expect("PTX must be ASCII");
+
+    // (1) Direct fp16 -INF write at the tail-zero label.
+    assert!(
+        txt.contains("LP_INNER_TAIL_ZERO:"),
+        "Large-vocab fp16 partials must keep the LP_INNER_TAIL_ZERO label"
+    );
+    assert!(
+        txt.contains("mov.b16 %h2, 0xFC00"),
+        "Tail-zero branch MUST write fp16 -INF (0xFC00) directly — the \
+         previous f32 sentinel `0f80800000` was -1.175e-38, NOT -INF, \
+         and cvt'd to fp16 0x0000 (Finding 2)"
+    );
+    // (2) The broken pattern must be GONE from the F16 large-vocab
+    // partials kernel.  Search restricted: scope to the partials
+    // kernel by anchoring on the kernel name and stopping at the
+    // finalize entry-point.  This prevents false positives from
+    // unrelated f32 sentinels in the finalize kernel (which reads
+    // f32 partials and legitimately uses 0f80800000 for its f32 max
+    // accumulator init).
+    let partials_name = cfg.large_partials_kernel_name();
+    let finalize_name = cfg.large_finalize_kernel_name();
+    let partials_start = txt
+        .find(&partials_name)
+        .expect("PTX must contain the partials kernel entry");
+    let partials_end = txt[partials_start..]
+        .find(&finalize_name)
+        .map(|off| partials_start + off)
+        .unwrap_or(txt.len());
+    let partials_section = &txt[partials_start..partials_end];
+    assert!(
+        !partials_section.contains("mov.f32 %facc, 0f80800000"),
+        "Partials kernel must NOT mov 0f80800000 into %facc — that was \
+         the broken sentinel that round-tripped through cvt.rn.f16.f32 \
+         to fp16 0x0000 (Finding 2 regression guard)"
+    );
+
+    // (3) ptxas-assemble.
+    if let Some(ptxas) = find_ptxas() {
+        let tmp = std::env::temp_dir()
+            .join("fused_linear_ce_fp16_large_v49153_finding2.ptx");
+        std::fs::write(&tmp, &ptx).ok();
+        match assemble_ptx(&ptxas, &ptx, "sm_80", "fp16_large_v49153_f2") {
+            Ok(()) => eprintln!("ptxas accepted V=49153 fp16 module"),
+            Err(stderr) => panic!(
+                "ptxas rejected V=49153 fp16 module after Finding 2 fix:\n{stderr}\n\
+                 PTX at {}", tmp.display()
+            ),
+        }
+    } else {
+        eprintln!("ptxas not found in PATH; structural assertions still ran");
+    }
+}
+
 #[test]
 fn fp16_ptx_is_ascii_only() {
     // Unicode in PTX triggers CUDA_ERROR_INVALID_PTX under cudarc JIT
