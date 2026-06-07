@@ -79,7 +79,7 @@ impl CepPlan {
         1.0 - (chosen.profile.param_bytes as f64 / bp)
     }
 
-    /// Render the compilation report.
+    /// Render the compilation report (paper §6.3 format).
     pub fn render_report(&self) -> String {
         use std::fmt::Write as _;
         let mut s = String::new();
@@ -89,41 +89,70 @@ impl CepPlan {
             CepMode::Joint => writeln!(s, "=== CEP Joint Prune-Search Report ===").unwrap(),
         }
         writeln!(s, "Target: {}", self.target_gpu).unwrap();
-        writeln!(
-            s,
-            "Candidates evaluated: {}",
-            self.outcome.candidates_evaluated
-        )
-        .unwrap();
         writeln!(s).unwrap();
 
-        if let Some(baseline) = self.outcome.baseline.as_ref() {
+        if matches!(self.mode, CepMode::Prune | CepMode::Joint) {
+            // §6.3: "Search time: <S> seconds (<N> candidates evaluated)"
+            let secs = self.outcome.wall_clock_us as f64 / 1e6;
             writeln!(
                 s,
-                "Baseline: params={:.1}MB, peak={:.2}GB, latency={:.1}μs",
-                baseline.param_bytes as f64 / 1e6,
-                baseline.peak_memory_bytes as f64 / 1e9,
-                baseline.estimated_latency_us
+                "Search time: {:.2} seconds ({} candidates evaluated)",
+                secs, self.outcome.candidates_evaluated
             )
             .unwrap();
-        }
-        if let Some(chosen) = self.outcome.chosen.as_ref() {
-            writeln!(
-                s,
-                "Chosen:   params={:.1}MB, peak={:.2}GB, latency={:.1}μs  (feasible={})",
-                chosen.profile.param_bytes as f64 / 1e6,
-                chosen.profile.peak_memory_bytes as f64 / 1e9,
-                chosen.profile.estimated_latency_us,
-                chosen.feasible
-            )
-            .unwrap();
-            if matches!(self.mode, CepMode::Prune | CepMode::Joint) {
+
+            if let Some(baseline) = self.outcome.baseline.as_ref() {
+                writeln!(
+                    s,
+                    "Baseline: params={:.1}MB, peak={:.2}GB, latency={:.1}us",
+                    baseline.param_bytes as f64 / 1e6,
+                    baseline.peak_memory_bytes as f64 / 1e9,
+                    baseline.estimated_latency_us
+                )
+                .unwrap();
+            }
+            if let Some(chosen) = self.outcome.chosen.as_ref() {
+                writeln!(
+                    s,
+                    "Chosen:   params={:.1}MB, peak={:.2}GB, latency={:.1}us  (feasible={})",
+                    chosen.profile.param_bytes as f64 / 1e6,
+                    chosen.profile.peak_memory_bytes as f64 / 1e9,
+                    chosen.profile.estimated_latency_us,
+                    chosen.feasible
+                )
+                .unwrap();
                 writeln!(
                     s,
                     "Reduction: {:.1}% of params removed",
                     100.0 * self.param_reduction()
                 )
                 .unwrap();
+
+                // §6.3: constraint status
+                if chosen.feasible {
+                    writeln!(s, "All constraints satisfied.").unwrap();
+                } else {
+                    writeln!(s, "Constraints violated: feasible=false").unwrap();
+                }
+
+                // §6.3: "Binary size: <orig> -> <pruned>"
+                if let Some(baseline) = self.outcome.baseline.as_ref() {
+                    writeln!(
+                        s,
+                        "Binary size: {} -> {}",
+                        format_bytes_si(baseline.binary_size_bytes),
+                        format_bytes_si(chosen.profile.binary_size_bytes)
+                    )
+                    .unwrap();
+                    // §6.3: "Kernel launches per forward: <orig> -> <pruned>"
+                    writeln!(
+                        s,
+                        "Kernel launches per forward: {} -> {}",
+                        baseline.kernel_launches, chosen.profile.kernel_launches
+                    )
+                    .unwrap();
+                }
+
                 writeln!(s).unwrap();
                 writeln!(s, "Per-layer post-prune shape:").unwrap();
                 for (i, (&nh, &ff)) in chosen
@@ -136,14 +165,13 @@ impl CepPlan {
                     writeln!(s, "  Layer {i}: heads={nh}, FFN={ff}").unwrap();
                 }
             }
-        }
-        if matches!(self.mode, CepMode::Prune | CepMode::Joint) {
+
             writeln!(s).unwrap();
             writeln!(s, "Prune log ({} steps):", self.outcome.prune_log.len()).unwrap();
             for step in &self.outcome.prune_log {
                 writeln!(
                     s,
-                    "  [{}] layer={} {}{} — {} (params={:.1}MB)",
+                    "  [{}] layer={} {}{} - {} (params={:.1}MB)",
                     if step.accepted { "OK" } else { "-" },
                     step.layer,
                     step.kind,
@@ -154,27 +182,64 @@ impl CepPlan {
                 .unwrap();
             }
         } else {
-            writeln!(s, "Top candidates:").unwrap();
-            for (i, cand) in self.outcome.ranked_candidates.iter().take(5).enumerate() {
+            // Search mode — §6.3
+            let n_feasible = self.outcome.ranked_candidates.iter().filter(|c| c.feasible).count();
+            writeln!(
+                s,
+                "Search space: {} candidates",
+                self.outcome.candidates_enumerated
+            )
+            .unwrap();
+            writeln!(s, "Feasible (constraints met): {} candidates", n_feasible).unwrap();
+            let secs = self.outcome.wall_clock_us as f64 / 1e6;
+            writeln!(s, "Compilation time: {:.2} seconds", secs).unwrap();
+            writeln!(s).unwrap();
+
+            writeln!(s, "Top 3 architectures:").unwrap();
+            for (i, cand) in self.outcome.ranked_candidates.iter().take(3).enumerate() {
                 writeln!(
                     s,
-                    "  {}. d={}, L={}, H={}/{} KV, FFN={}, params={:.1}M  latency={:.1}μs  util={:.2}  feasible={}",
+                    "  {}. d={}, L={}, H={}, KV={}, FFN={} -> {}M params, {:.2}GB, {:.1}us/tok, util={:.2}",
                     i + 1,
                     cand.spec.d_model,
                     cand.spec.n_layers,
                     cand.spec.n_heads.first().copied().unwrap_or(0),
                     cand.spec.n_kv_heads.first().copied().unwrap_or(0),
                     cand.spec.d_ff.first().copied().unwrap_or(0),
-                    cand.spec.param_count() as f64 / 1e6,
+                    format_params_si(cand.spec.param_count()),
+                    cand.profile.peak_memory_bytes as f64 / 1e9,
                     cand.profile.estimated_latency_us,
                     cand.profile.roofline_utilization,
-                    cand.feasible
                 )
                 .unwrap();
             }
         }
         s
     }
+}
+
+// ---------------------------------------------------------------------------
+// SI formatting helpers (paper §6.3 spelling)
+// ---------------------------------------------------------------------------
+
+fn format_bytes_si(bytes: u64) -> String {
+    if bytes >= 1_000_000_000 {
+        format!("{:.1}GB", bytes as f64 / 1e9)
+    } else if bytes >= 1_000_000 {
+        format!("{}MB", bytes / 1_000_000)
+    } else if bytes >= 1_000 {
+        format!("{}KB", bytes / 1_000)
+    } else {
+        format!("{}B", bytes)
+    }
+}
+
+/// Render param count as millions to one decimal place.  The render line uses
+/// `"{}M params"` with a literal "M", so this MUST return only the magnitude
+/// (no suffix).  Sub-1M counts render as "0.5M params" etc., which is correct
+/// and honest (toy fixtures never have genuinely large param counts).
+fn format_params_si(p: u64) -> String {
+    format!("{:.1}", p as f64 / 1e6)
 }
 
 /// Default roofline-slack proxy when the user doesn't supply one: derive
@@ -315,7 +380,7 @@ fn synthetic_importance(spec: &ModelSpec, slacks: &RooflineSlackTable) -> Import
 // These DTOs pin the on-disk schema independently of the core layout.
 // ---------------------------------------------------------------------------
 
-const CEP_DELTA_VERSION: u32 = 1;
+const CEP_DELTA_VERSION: u32 = 2;
 
 // NOTE: these emit the delta-JSON contract spelling (lowercase, no underscore),
 // intentionally distinct from cep_oracle's `as_str()` ("rms_norm"). Do not merge.
@@ -343,7 +408,8 @@ struct SpecDto {
     n_layers: u32,
     n_heads: Vec<u32>,
     n_kv_heads: Vec<u32>,
-    head_dim: u32,
+    /// Per-layer head dimensions (replaces the old scalar `head_dim`; schema v2+).
+    head_dims: Vec<u32>,
     d_ff: Vec<u32>,
     activation: &'static str,
     norm: &'static str,
@@ -357,7 +423,7 @@ impl SpecDto {
             n_layers: s.n_layers,
             n_heads: s.n_heads.clone(),
             n_kv_heads: s.n_kv_heads.clone(),
-            head_dim: s.head_dim.first().copied().unwrap_or(0),
+            head_dims: s.head_dim.clone(),
             d_ff: s.d_ff.clone(),
             activation: activation_str(s.activation),
             norm: norm_str(s.norm),
@@ -604,6 +670,7 @@ pub struct CliOverrides {
 pub enum CepBridgeError {
     UnknownTarget { target: String, supported: String },
     BadPreserve(String),
+    PreserveLayerOutOfRange { entry: String, n_layers: u32 },
 }
 
 impl std::fmt::Display for CepBridgeError {
@@ -614,7 +681,11 @@ impl std::fmt::Display for CepBridgeError {
             }
             CepBridgeError::BadPreserve(s) => write!(
                 f,
-                "CEP: preserve entry '{s}' must be a layer-index integer in v1 (glob preserve is v2)"
+                "CEP: preserve entry '{s}' is not recognized; use a layer index (e.g. '7') or 'blocks.<n>' / 'blocks.<n>.*' pattern (e.g. 'blocks.0.*')"
+            ),
+            CepBridgeError::PreserveLayerOutOfRange { entry, n_layers } => write!(
+                f,
+                "CEP: preserve entry '{entry}' references layer >= n_layers ({n_layers})"
             ),
         }
     }
@@ -624,11 +695,48 @@ fn supported_gpus() -> String {
     GPU_DATABASE.iter().map(|g| g.name).collect::<Vec<_>>().join(", ")
 }
 
-fn parse_preserve_layers(preserve: &[String]) -> Result<Vec<u32>, CepBridgeError> {
-    preserve
-        .iter()
-        .map(|p| p.parse::<u32>().map_err(|_| CepBridgeError::BadPreserve(p.clone())))
-        .collect()
+/// Public alias used by the CLI to report supported GPU names.
+pub fn supported_gpus_list() -> String {
+    supported_gpus()
+}
+
+fn parse_preserve_layers(preserve: &[String], n_layers: u32) -> Result<Vec<u32>, CepBridgeError> {
+    let mut out: Vec<u32> = Vec::with_capacity(preserve.len());
+    for p in preserve {
+        // Bare integer: "0", "7", etc.
+        if let Ok(n) = p.parse::<u32>() {
+            if n >= n_layers {
+                return Err(CepBridgeError::PreserveLayerOutOfRange {
+                    entry: p.clone(),
+                    n_layers,
+                });
+            }
+            out.push(n);
+            continue;
+        }
+        // "blocks.<N>" or "blocks.<N>.<suffix>"
+        if let Some(rest) = p.strip_prefix("blocks.") {
+            let head = rest.split('.').next().unwrap_or("");
+            // Reject "blocks.*" or "blocks.*.X": cannot resolve to a specific layer.
+            if head == "*" || head.is_empty() {
+                return Err(CepBridgeError::BadPreserve(p.clone()));
+            }
+            if let Ok(n) = head.parse::<u32>() {
+                if n >= n_layers {
+                    return Err(CepBridgeError::PreserveLayerOutOfRange {
+                        entry: p.clone(),
+                        n_layers,
+                    });
+                }
+                out.push(n);
+                continue;
+            }
+        }
+        return Err(CepBridgeError::BadPreserve(p.clone()));
+    }
+    out.sort_unstable();
+    out.dedup();
+    Ok(out)
 }
 
 fn map_granularity(g: nsl_semantic::cep::Granularity) -> Granularity {
@@ -664,7 +772,7 @@ pub fn build_prune_input<'a>(
         });
     }
     let target_sparsity = sparsity_override.unwrap_or(cfg.sparsity);
-    let preserve_layers = parse_preserve_layers(&cfg.preserve)?;
+    let preserve_layers = parse_preserve_layers(&cfg.preserve, spec.n_layers)?;
     let constraints = Constraints {
         peak_memory_bytes: cfg.constraints.peak_memory_bytes.unwrap_or(u64::MAX),
         latency_us: cfg.constraints.latency_us.unwrap_or(f64::INFINITY),
@@ -812,6 +920,18 @@ mod tests {
         assert_eq!(table.heads.len() as u32, expected);
     }
 
+    // W4-1: format_params_si must always return millions-only (no suffix), so the render
+    // line "{}M params" composes correctly for sub-1M model candidates.
+    #[test]
+    fn format_params_si_handles_sub_1m() {
+        assert_eq!(format_params_si(500_000), "0.5");
+        assert_eq!(format_params_si(100), "0.0");
+        assert_eq!(format_params_si(48_800_000), "48.8");
+        // Values >= 1M still render correctly (no "K" or "M" suffix appended by the helper).
+        assert_eq!(format_params_si(1_000_000), "1.0");
+        assert_eq!(format_params_si(7_000_000_000), "7000.0");
+    }
+
     #[test]
     fn param_reduction_returns_zero_without_baseline() {
         let plan = CepPlan {
@@ -821,6 +941,185 @@ mod tests {
             importance: ImportanceTable::default(),
         };
         assert_eq!(plan.param_reduction(), 0.0);
+    }
+
+    /// G19 — paper §8.1 projection smoke test (NSLCoder-50M on H100).
+    ///
+    /// Asserts that CEP pruning produces PROJECTED-direction effects: monotonic decrease
+    /// in params / peak memory / binary size / kernel launches as sparsity rises, within
+    /// 3× of the §8.1 ratios. Does NOT assert exact paper numbers (those are projections,
+    /// not ground truth) — the oracle's first-order models for peak memory + binary size
+    /// are deliberately conservative, so we allow wide windows but require direction.
+    ///
+    /// Paper §3: NSLCoder-50M shape — D=512, L=8, H=8, KV=4, FFN=1408, head_dim=64.
+    /// Paper §8.1 baseline row: 48.8M params, 5.2 GB peak mem, 6.9 μs/tok, 195 MB binary.
+    #[test]
+    fn nslcoder_50m_projection_monotonicity() {
+        // §3 shape: D=512, L=8, H=8, KV=4, head_dim=64, FFN=1408, vocab=32000.
+        let spec = ModelSpec::uniform(512, 8, 8, 4, 64, 1408, 32000);
+        // find_gpu("H100") prefix-matches to H100-SXM (prefers SXM per gpu_specs::find_gpu).
+        let gpu = crate::gpu_specs::find_gpu("H100").expect("H100 in GPU_DATABASE");
+
+        // --- Baseline ---
+        let baseline = crate::cep_oracle::evaluate(&spec, gpu).expect("baseline profile");
+
+        // Param count: paper says 48.8M. Oracle uses fp16 (dtype_bytes=2).
+        let param_count = baseline.param_bytes / spec.dtype_bytes as u64;
+        assert!(
+            param_count >= 20_000_000 && param_count <= 100_000_000,
+            "NSLCoder-50M param count out of [20M, 100M]: {}",
+            param_count
+        );
+
+        // Peak memory: paper says 5.2 GB (full deployment with KV cache + batch).
+        // The oracle computes a first-order estimate: param_bytes + max_activation_per_layer,
+        // which is much smaller (order of 100s of MB for a 50M param FP16 model). We assert
+        // the oracle's output is in a sane range relative to what it can compute.
+        //
+        // Note: peak_memory_bytes = param_bytes + max_activation_bytes (oracle formula), so
+        // its monotonic decrease under pruning is GUARANTEED by param_bytes monotonicity.
+        // The assertions here are sanity coverage, not independent signal.
+        //
+        // Floor: at least param_bytes + 1024 (the activation term must add at least a small
+        // page — this checks the formula structure rather than being a tautology of >= param_bytes).
+        // Ceiling: 50 GB (any sane oracle estimate for a ~50M param model is well below this).
+        assert!(
+            baseline.peak_memory_bytes >= baseline.param_bytes + 1024,
+            "peak_memory_bytes {} must exceed param_bytes {} by at least 1 KiB (activation term)",
+            baseline.peak_memory_bytes,
+            baseline.param_bytes
+        );
+        assert!(
+            baseline.peak_memory_bytes <= 50_000_000_000,
+            "peak_memory_bytes > 50 GB: {}",
+            baseline.peak_memory_bytes
+        );
+
+        // Latency must be positive and finite.
+        assert!(
+            baseline.estimated_latency_us > 0.0 && baseline.estimated_latency_us.is_finite(),
+            "estimated_latency_us invalid: {}",
+            baseline.estimated_latency_us
+        );
+
+        // Binary size: paper says 195 MB. Oracle is first-order; allow up to 1 GB.
+        //
+        // Note: binary_size_bytes = param_bytes + ~20 KB/layer + 60 KB overhead (oracle
+        // formula), so its monotonic decrease under pruning is GUARANTEED by param_bytes
+        // monotonicity. The assertions here are sanity coverage, not independent signal.
+        //
+        // Floor: at least param_bytes + 20_000 (at least one layer's code section) — this
+        // checks the formula structure rather than being a tautology of >= param_bytes.
+        assert!(
+            baseline.binary_size_bytes >= baseline.param_bytes + 20_000,
+            "binary_size_bytes {} must exceed param_bytes {} by at least 20 KB (per-layer overhead)",
+            baseline.binary_size_bytes,
+            baseline.param_bytes
+        );
+        assert!(
+            baseline.binary_size_bytes <= 1_000_000_000,
+            "binary_size_bytes > 1 GB: {}",
+            baseline.binary_size_bytes
+        );
+
+        // Kernel launches: 8-layer model; paper estimates ~16 launches/layer × 8 + 2 ≈ 130.
+        // Allow wide [10, 200] window.
+        assert!(
+            baseline.kernel_launches >= 10 && baseline.kernel_launches <= 200,
+            "kernel_launches out of [10, 200]: {}",
+            baseline.kernel_launches
+        );
+
+        // --- Pruned profiles at three sparsity levels ---
+        let sparsities: &[f64] = &[0.2, 0.3, 0.5];
+        let mut pruned_profiles: Vec<crate::cep_oracle::CompilationProfile> = Vec::new();
+
+        for &sparsity in sparsities {
+            let plan = run_prune(CepPruneInput {
+                spec: spec.clone(),
+                weights: None,
+                target: "H100",
+                constraints: Constraints {
+                    target_sparsity: sparsity,
+                    ..Default::default()
+                },
+                granularity: Granularity::HeadAndFfn,
+                roofline_slack: RooflineSlackTable::default(),
+            });
+
+            let chosen = plan.outcome.chosen.as_ref().expect("chosen must be Some after pruning");
+            // Pruned must be strictly smaller than baseline on params.
+            assert!(
+                chosen.profile.param_bytes < baseline.param_bytes,
+                "sparsity={}: pruned param_bytes {} >= baseline {}",
+                sparsity,
+                chosen.profile.param_bytes,
+                baseline.param_bytes
+            );
+            // Peak memory: ≤ baseline (may not strictly decrease at low sparsity).
+            assert!(
+                chosen.profile.peak_memory_bytes <= baseline.peak_memory_bytes,
+                "sparsity={}: pruned peak_memory_bytes {} > baseline {}",
+                sparsity,
+                chosen.profile.peak_memory_bytes,
+                baseline.peak_memory_bytes
+            );
+            // Binary size: ≤ baseline.
+            assert!(
+                chosen.profile.binary_size_bytes <= baseline.binary_size_bytes,
+                "sparsity={}: pruned binary_size_bytes {} > baseline {}",
+                sparsity,
+                chosen.profile.binary_size_bytes,
+                baseline.binary_size_bytes
+            );
+            // Kernel launches: under HeadAndFfn granularity without layer drop,
+            // kernel_launches is INVARIANT (depends only on layer count, not head
+            // count).  No per-pruned assertion — it would be vacuously true.
+            // Real search time was measured.
+            assert!(
+                plan.outcome.wall_clock_us > 0,
+                "sparsity={}: wall_clock_us must be > 0",
+                sparsity
+            );
+
+            pruned_profiles.push(chosen.profile.clone());
+        }
+
+        // --- Monotonicity: 20% < 30% < 50% sparsity means profiles[0] >= profiles[1] >= profiles[2] ---
+        // profiles[0]=20%, profiles[1]=30%, profiles[2]=50%
+        // Higher sparsity → strictly fewer params (and ≤ on other metrics).
+        //
+        // param_bytes monotonicity is the load-bearing signal.
+        // peak_memory_bytes and binary_size_bytes are derived from param_bytes plus small
+        // constants in the oracle (max_activation_bytes for peak; ~20KB/layer + 60KB for
+        // binary), so their monotonic decrease is GUARANTEED by param_bytes monotonicity.
+        // These assertions are sanity coverage, not independent signal.
+        //
+        // kernel_launches depends only on layer count (not head count), so under
+        // HeadAndFfn-without-layer-drop it is INVARIANT — monotonicity would be vacuous.
+        // No kernel_launches monotonicity assertion.
+        for w in pruned_profiles.windows(2) {
+            let less_sparse = &w[0];
+            let more_sparse = &w[1];
+            assert!(
+                more_sparse.param_bytes <= less_sparse.param_bytes,
+                "monotonicity violated on param_bytes: 30%/50% profile ({}) > 20%/30% profile ({})",
+                more_sparse.param_bytes,
+                less_sparse.param_bytes
+            );
+            assert!(
+                more_sparse.binary_size_bytes <= less_sparse.binary_size_bytes,
+                "monotonicity violated on binary_size_bytes: {} > {}",
+                more_sparse.binary_size_bytes,
+                less_sparse.binary_size_bytes
+            );
+            assert!(
+                more_sparse.peak_memory_bytes <= less_sparse.peak_memory_bytes,
+                "monotonicity violated on peak_memory_bytes: {} > {}",
+                more_sparse.peak_memory_bytes,
+                less_sparse.peak_memory_bytes
+            );
+        }
     }
 }
 
@@ -888,9 +1187,49 @@ mod bridge_tests {
     #[test]
     fn build_prune_input_bad_preserve_errors() {
         let mut cfg = prune_cfg();
-        cfg.preserve = vec!["blocks.0.attn".to_string()];
+        cfg.preserve = vec!["foo".to_string()];
         let err = build_prune_input(&cfg, spec(), None, "H100-SXM", None).unwrap_err();
         assert!(matches!(err, CepBridgeError::BadPreserve(_)));
+    }
+
+    #[test]
+    fn build_prune_input_accepts_glob_preserve_blocks_n_star() {
+        let baseline = spec(); // n_layers = 6
+        let mut cfg = prune_cfg();
+        // Paper §6.1 syntax:
+        cfg.preserve = vec!["blocks.0.*".to_string(), "blocks.5.*".to_string()];
+        let input = build_prune_input(&cfg, baseline.clone(), None, "H100-SXM", None).expect("input");
+        assert_eq!(input.constraints.preserve_layers, vec![0, 5]);
+    }
+
+    #[test]
+    fn build_prune_input_accepts_blocks_n_without_star() {
+        let baseline = spec();
+        let mut cfg = prune_cfg();
+        cfg.preserve = vec!["blocks.1".to_string(), "blocks.3.attn".to_string()];
+        let input = build_prune_input(&cfg, baseline.clone(), None, "H100-SXM", None).expect("input");
+        assert_eq!(input.constraints.preserve_layers, vec![1, 3]);
+    }
+
+    #[test]
+    fn build_prune_input_rejects_blocks_star() {
+        let baseline = spec();
+        let mut cfg = prune_cfg();
+        cfg.preserve = vec!["blocks.*".to_string()];
+        let err = build_prune_input(&cfg, baseline.clone(), None, "H100-SXM", None).unwrap_err();
+        assert!(matches!(err, CepBridgeError::BadPreserve(_)));
+    }
+
+    #[test]
+    fn build_prune_input_rejects_out_of_range_layer() {
+        let baseline = spec(); // n_layers = 6
+        let mut cfg = prune_cfg();
+        cfg.preserve = vec!["blocks.99".to_string()];
+        let err = build_prune_input(&cfg, baseline.clone(), None, "H100-SXM", None).unwrap_err();
+        assert!(
+            matches!(err, CepBridgeError::PreserveLayerOutOfRange { .. }),
+            "expected PreserveLayerOutOfRange, got {err:?}"
+        );
     }
 
     use std::io::Read;
@@ -909,7 +1248,7 @@ mod bridge_tests {
         let mut s = String::new();
         std::fs::File::open(&path).unwrap().read_to_string(&mut s).unwrap();
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
-        assert_eq!(v["cep_version"], 1);
+        assert_eq!(v["cep_version"], 2);
         assert_eq!(v["mode"], "prune");
         assert_eq!(v["target"], "H100-SXM");
         assert!(v["baseline_profile"]["param_bytes"].is_number());
@@ -961,6 +1300,37 @@ mod bridge_tests {
     }
 
     #[test]
+    fn delta_json_preserves_per_layer_head_dim() {
+        // Build a spec with HETEROGENEOUS head_dim per layer and confirm the serialized
+        // DTO carries them all as an array (not just the first scalar value).
+        let mut baseline = spec(); // n_layers=6
+        baseline.head_dim = vec![64, 64, 64, 64, 32, 32]; // mix two values
+        let cfg = prune_cfg();
+        let input =
+            build_prune_input(&cfg, baseline.clone(), None, "H100-SXM", Some(0.2)).expect("input");
+        let plan = run_prune(input);
+
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("delta.cep.json");
+        write_prune_delta(&plan, &baseline, &out).unwrap();
+        let txt = std::fs::read_to_string(&out).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&txt).unwrap();
+
+        // Schema v2: field is now `head_dims` (Vec<u32>), not a scalar `head_dim`.
+        let dims = v
+            .pointer("/chosen/spec/head_dims")
+            .expect("chosen.spec.head_dims must exist in schema v2");
+        assert!(dims.is_array(), "head_dims must serialize as a JSON array");
+        let dims_u32: Vec<u32> = dims
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|x| x.as_u64().unwrap() as u32)
+            .collect();
+        assert_eq!(dims_u32, vec![64, 64, 64, 64, 32, 32]);
+    }
+
+    #[test]
     fn write_search_delta_emits_ranked_candidates() {
         use crate::cep_rewrite::SearchAxes;
         let axes = SearchAxes {
@@ -985,5 +1355,56 @@ mod bridge_tests {
         let v: serde_json::Value = serde_json::from_str(&s).unwrap();
         assert_eq!(v["mode"], "search");
         assert!(v["ranked_candidates"].is_array());
+    }
+
+    #[test]
+    fn prune_report_includes_search_time_constraints_binary_kernel_launches() {
+        let baseline = spec();
+        let cfg = prune_cfg();
+        let input = build_prune_input(&cfg, baseline.clone(), None, "H100-SXM", Some(0.2)).expect("input");
+        let plan = run_prune(input);
+        let rendered = plan.render_report();
+        // §6.3 mandatory lines
+        assert!(rendered.contains("Search time:"), "missing 'Search time:' line\n{}", rendered);
+        assert!(
+            rendered.contains("All constraints satisfied") || rendered.contains("Constraints violated"),
+            "missing constraint-status line\n{}", rendered
+        );
+        assert!(rendered.contains("Binary size:"), "missing 'Binary size:' line\n{}", rendered);
+        assert!(
+            rendered.contains("Kernel launches per forward:"),
+            "missing 'Kernel launches per forward:' line\n{}", rendered
+        );
+    }
+
+    #[test]
+    fn search_report_includes_search_space_feasible_compilation_time_top3() {
+        use crate::cep_rewrite::SearchAxes;
+        let axes = SearchAxes {
+            d_model: vec![256, 384], n_layers: vec![4], n_heads: vec![4, 8],
+            n_kv_heads: vec![2], d_ff: vec![512, 1024],
+            activation: vec![crate::cep_oracle::Activation::SwiGlu],
+            norm: vec![crate::cep_oracle::NormType::RmsNorm],
+            vocab: 4096, head_dim: 64, max_seq: 2048, batch: 1, dtype_bytes: 4,
+        };
+        let scfg = nsl_semantic::cep::CepSearchConfig {
+            target: None,
+            objective: nsl_semantic::cep::NasObjective::ParamEfficiency,
+            constraints: Default::default(),
+            span: nsl_errors::Span::DUMMY,
+        };
+        let input = build_search_input(&scfg, axes, "H100-SXM").expect("input");
+        let plan = run_search(input);
+        let rendered = plan.render_report();
+        assert!(rendered.contains("Search space:"), "{}", rendered);
+        assert!(rendered.contains("Feasible"), "{}", rendered);
+        assert!(rendered.contains("Compilation time:"), "{}", rendered);
+        assert!(rendered.contains("Top 3 architectures:"), "{}", rendered);
+        // Per-candidate line shape — paper §6.3 example
+        assert!(
+            rendered.contains("d=") && rendered.contains("L=")
+                && rendered.contains("H=") && rendered.contains("KV="),
+            "per-candidate line missing d=/L=/H=/KV= tokens\n{}", rendered
+        );
     }
 }

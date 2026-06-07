@@ -21,6 +21,8 @@ pub enum CepExtractError {
     UnresolvableBinding { dim: String, detail: String },
     UnknownFfnActivation { ffn_type: String },
     UnknownSearchAxis { axis: String },
+    UnrecognizedActivation { name: String },
+    UnrecognizedNorm { name: String },
     InvalidSpec(String),
 }
 
@@ -44,7 +46,19 @@ impl std::fmt::Display for CepExtractError {
             CepExtractError::UnknownSearchAxis { axis } => {
                 write!(
                     f,
-                    "CEP: unknown @search axis '{axis}' (known: d_model, n_layers, n_heads, n_kv_heads, d_ff)"
+                    "CEP: unknown @search axis '{axis}' (known: d_model, n_layers, n_heads, n_kv_heads, d_ff, activation, norm)"
+                )
+            }
+            CepExtractError::UnrecognizedActivation { name } => {
+                write!(
+                    f,
+                    "CEP: unrecognized activation '{name}' (known: relu, gelu, silu, swiglu)"
+                )
+            }
+            CepExtractError::UnrecognizedNorm { name } => {
+                write!(
+                    f,
+                    "CEP: unrecognized norm '{name}' (known: layernorm, layer_norm, ln, rmsnorm, rms_norm, rms)"
                 )
             }
             CepExtractError::InvalidSpec(m) => write!(f, "CEP: extracted spec is invalid: {m}"),
@@ -440,7 +454,8 @@ pub fn extract_model_spec(module: &Module, resolve: Resolve) -> Result<ModelSpec
     Ok(spec)
 }
 
-/// Collect every `@search(axis, [values])` decorator in the module.
+/// Collect every `@search(axis, [values])` decorator whose values are integer
+/// literals.
 fn collect_search_axes(module: &Module, resolve: Resolve) -> Vec<(String, Vec<u32>)> {
     let mut out = Vec::new();
     for stmt in &module.stmts {
@@ -467,6 +482,58 @@ fn collect_search_axes(module: &Module, resolve: Resolve) -> Vec<(String, Vec<u3
     out
 }
 
+/// Collect every `@search(axis, [values])` decorator whose values are string
+/// literals or identifiers (used for categorical axes like `activation` / `norm`).
+fn collect_search_string_axes(module: &Module, resolve: Resolve) -> Vec<(String, Vec<String>)> {
+    let mut out = Vec::new();
+    for stmt in &module.stmts {
+        let StmtKind::Decorated { decorators, .. } = &stmt.kind else { continue };
+        for deco in decorators {
+            if deco.name.len() != 1 || resolve(deco.name[0]) != "search" {
+                continue;
+            }
+            let Some(args) = &deco.args else { continue };
+            let (Some(a0), Some(a1)) = (args.first(), args.get(1)) else { continue };
+            let ExprKind::Ident(axis_sym) = &a0.value.kind else { continue };
+            let ExprKind::ListLiteral(items) = &a1.value.kind else { continue };
+            let mut values = Vec::new();
+            for it in items {
+                match &it.kind {
+                    ExprKind::StringLiteral(s) => values.push(s.clone()),
+                    ExprKind::Ident(sym) => values.push(resolve(*sym)),
+                    _ => {}
+                }
+            }
+            if !values.is_empty() {
+                out.push((resolve(*axis_sym), values));
+            }
+        }
+    }
+    out
+}
+
+/// Parse an activation name string (from a `@search(activation, [...])` axis).
+/// Case-insensitive: "SiLU", "silu", "SILU" all match.
+fn parse_activation(name: &str) -> Result<Activation, CepExtractError> {
+    match name.to_lowercase().as_str() {
+        "relu" => Ok(Activation::Relu),
+        "gelu" => Ok(Activation::Gelu),
+        "silu" => Ok(Activation::SiLU),
+        "swiglu" => Ok(Activation::SwiGlu),
+        _ => Err(CepExtractError::UnrecognizedActivation { name: name.to_string() }),
+    }
+}
+
+/// Parse a norm-type name string (from a `@search(norm, [...])` axis).
+/// Case-insensitive: "RMSNorm", "rmsnorm", "rms_norm" all match.
+fn parse_norm(name: &str) -> Result<NormType, CepExtractError> {
+    match name.to_lowercase().as_str() {
+        "layernorm" | "layer_norm" | "ln" => Ok(NormType::LayerNorm),
+        "rmsnorm" | "rms_norm" | "rms" => Ok(NormType::RmsNorm),
+        _ => Err(CepExtractError::UnrecognizedNorm { name: name.to_string() }),
+    }
+}
+
 pub fn extract_search_axes(module: &Module, resolve: Resolve) -> Result<SearchAxes, CepExtractError> {
     let base = extract_model_spec(module, resolve)?;
     let mut axes = SearchAxes {
@@ -483,6 +550,7 @@ pub fn extract_search_axes(module: &Module, resolve: Resolve) -> Result<SearchAx
         batch: base.batch,
         dtype_bytes: base.dtype_bytes,
     };
+    // Integer-valued axes (d_model, n_layers, n_heads, n_kv_heads, d_ff).
     for (axis, values) in collect_search_axes(module, resolve) {
         match axis.as_str() {
             "d_model" => axes.d_model = values,
@@ -490,7 +558,32 @@ pub fn extract_search_axes(module: &Module, resolve: Resolve) -> Result<SearchAx
             "n_heads" => axes.n_heads = values,
             "n_kv_heads" => axes.n_kv_heads = values,
             "d_ff" => axes.d_ff = values,
+            // Categorical axes are handled below via collect_search_string_axes;
+            // ignore them here so we don't double-error.
+            "activation" | "norm" | "norm_type" => {}
             other => return Err(CepExtractError::UnknownSearchAxis { axis: other.to_string() }),
+        }
+    }
+    // String-valued categorical axes (activation, norm / norm_type).
+    for (axis, values) in collect_search_string_axes(module, resolve) {
+        match axis.as_str() {
+            "activation" => {
+                let parsed: Result<Vec<Activation>, _> =
+                    values.iter().map(|s| parse_activation(s)).collect();
+                axes.activation = parsed?;
+            }
+            "norm" | "norm_type" => {
+                let parsed: Result<Vec<NormType>, _> =
+                    values.iter().map(|s| parse_norm(s)).collect();
+                axes.norm = parsed?;
+            }
+            // Numeric axes that slip through as string values are rejected — they
+            // were already handled (or errored) in the integer-axis loop above.
+            // Any other name is an unknown axis: typos like `actvation` must not
+            // silently no-op, they must be reported.
+            other => {
+                return Err(CepExtractError::UnknownSearchAxis { axis: other.to_string() });
+            }
         }
     }
     Ok(axes)
@@ -830,5 +923,93 @@ model AxNet:
         let resolve = |s: nsl_ast::Symbol| interner.resolve(s.0).unwrap_or("").to_string();
         let err = extract_search_axes(&module, &resolve).unwrap_err();
         assert!(matches!(err, CepExtractError::UnknownSearchAxis { .. }), "got: {err}");
+    }
+
+    // G17 — @search(activation, [...]) and @search(norm, [...]) axes.
+    const ACTIVATION_NORM_SEARCHABLE: &str = r#"
+@search(activation, ["silu", "swiglu"])
+@search(norm, ["rmsnorm"])
+model GroupedQueryAttention(d_model: int, n_heads: int, n_kv_heads: int, dropout_p: float):
+    wq: Tensor = randn([d_model, d_model])
+model SwiGLUFFN(d_model: int, d_ff: int, dropout_p: float):
+    w_gate: Tensor = randn([d_model, d_ff])
+model TransformerBlock(d_model: int, n_heads: int, n_kv_heads: int, d_ff: int, dropout_p: float):
+    attn: GroupedQueryAttention = GroupedQueryAttention(d_model, n_heads, n_kv_heads, dropout_p)
+    ffn: SwiGLUFFN = SwiGLUFFN(d_model, d_ff, dropout_p)
+    norm: RMSNorm = RMSNorm(d_model)
+model ActNormNet:
+    embed: Tensor = randn([4096, 384]) * full([1], 0.02)
+    blocks: [TransformerBlock; 6] = TransformerBlock(384, 6, 3, 1024, 0.1)
+"#;
+
+    #[test]
+    fn extracts_activation_and_norm_axes() {
+        let (module, interner) = parse(ACTIVATION_NORM_SEARCHABLE);
+        let resolve = |s: nsl_ast::Symbol| interner.resolve(s.0).unwrap_or("").to_string();
+        let axes = extract_search_axes(&module, &resolve).expect("axes");
+        // Both activation variants must be present.
+        assert!(
+            axes.activation.contains(&Activation::SiLU),
+            "SiLU should be in activation axes: {:?}", axes.activation
+        );
+        assert!(
+            axes.activation.contains(&Activation::SwiGlu),
+            "SwiGlu should be in activation axes: {:?}", axes.activation
+        );
+        assert_eq!(axes.activation.len(), 2);
+        // Norm axis.
+        assert_eq!(axes.norm, vec![NormType::RmsNorm]);
+    }
+
+    // W2-2: unknown categorical @search axis must return UnknownSearchAxis (not silently no-op).
+    #[test]
+    fn extract_search_axes_rejects_unknown_string_axis() {
+        // `@search(actvation, ["silu"])` — note the typo.  Must return UnknownSearchAxis.
+        let src = r#"
+@search(actvation, ["silu"])
+model GroupedQueryAttention(d_model: int, n_heads: int, n_kv_heads: int, dropout_p: float):
+    wq: Tensor = randn([d_model, d_model])
+model SwiGLUFFN(d_model: int, d_ff: int, dropout_p: float):
+    w_gate: Tensor = randn([d_model, d_ff])
+model TransformerBlock(d_model: int, n_heads: int, n_kv_heads: int, d_ff: int, dropout_p: float):
+    attn: GroupedQueryAttention = GroupedQueryAttention(d_model, n_heads, n_kv_heads, dropout_p)
+    ffn: SwiGLUFFN = SwiGLUFFN(d_model, d_ff, dropout_p)
+    norm: RMSNorm = RMSNorm(d_model)
+model TypoAxisNet:
+    embed: Tensor = randn([4096, 384]) * full([1], 0.02)
+    blocks: [TransformerBlock; 6] = TransformerBlock(384, 6, 3, 1024, 0.1)
+"#;
+        let (module, interner) = parse(src);
+        let resolve = |s: nsl_ast::Symbol| interner.resolve(s.0).unwrap_or("").to_string();
+        let err = extract_search_axes(&module, &resolve).unwrap_err();
+        assert!(
+            matches!(err, CepExtractError::UnknownSearchAxis { .. }),
+            "expected UnknownSearchAxis for typo 'actvation', got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn unrecognized_activation_returns_error() {
+        let src = r#"
+@search(activation, ["bogus_act"])
+model GroupedQueryAttention(d_model: int, n_heads: int, n_kv_heads: int, dropout_p: float):
+    wq: Tensor = randn([d_model, d_model])
+model SwiGLUFFN(d_model: int, d_ff: int, dropout_p: float):
+    w_gate: Tensor = randn([d_model, d_ff])
+model TransformerBlock(d_model: int, n_heads: int, n_kv_heads: int, d_ff: int, dropout_p: float):
+    attn: GroupedQueryAttention = GroupedQueryAttention(d_model, n_heads, n_kv_heads, dropout_p)
+    ffn: SwiGLUFFN = SwiGLUFFN(d_model, d_ff, dropout_p)
+    norm: RMSNorm = RMSNorm(d_model)
+model BadActNet:
+    embed: Tensor = randn([4096, 384]) * full([1], 0.02)
+    blocks: [TransformerBlock; 6] = TransformerBlock(384, 6, 3, 1024, 0.1)
+"#;
+        let (module, interner) = parse(src);
+        let resolve = |s: nsl_ast::Symbol| interner.resolve(s.0).unwrap_or("").to_string();
+        let err = extract_search_axes(&module, &resolve).unwrap_err();
+        assert!(
+            matches!(err, CepExtractError::UnrecognizedActivation { .. }),
+            "got: {err}"
+        );
     }
 }

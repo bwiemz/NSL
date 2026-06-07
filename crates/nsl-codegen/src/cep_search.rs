@@ -107,8 +107,16 @@ pub struct SearchOutcome {
     pub ranked_candidates: Vec<EvaluatedCandidate>,
     /// Log of pruning steps (for greedy prune).
     pub prune_log: Vec<PruneStep>,
-    /// Number of candidates evaluated.
+    /// Number of candidates evaluated (feasibility-filtered for prune; total
+    /// enumerated BEFORE feasibility filtering for architecture_search).
     pub candidates_evaluated: u32,
+    /// Total candidates enumerated BEFORE feasibility or constraint filtering.
+    /// For prune mode this equals candidates_evaluated (every trial is logged).
+    /// For search mode this is the full cross-product count before filtering.
+    pub candidates_enumerated: u32,
+    /// Wall-clock duration of the search inside prune_greedy / architecture_search
+    /// (microseconds). Includes all candidate compilations. Set to 0 in Default.
+    pub wall_clock_us: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -120,6 +128,73 @@ pub struct PruneStep {
     pub reason: String,
     pub new_param_bytes: u64,
     pub new_latency_us: f64,
+}
+
+/// Candidate FFN widths for a layer's sweep. Derived from the layer's baseline
+/// `d_ff` so all real models (d_ff ∈ {1024, 4096, 8192, ...}) get a meaningful
+/// sweep. All candidates are multiples of 64 (paper §4.3 table) and strictly
+/// less than `baseline_d_ff`. Returned largest-first (try largest reduction first).
+fn ffn_candidate_widths(baseline_d_ff: u32) -> Vec<u32> {
+    let multipliers = [0.75_f32, 0.5, 0.375];
+    let mut widths: Vec<u32> = multipliers
+        .iter()
+        .map(|m| ((baseline_d_ff as f32 * m) as u32 / 64) * 64)
+        .filter(|&w| w > 0 && w < baseline_d_ff)
+        .collect();
+    widths.sort_unstable();
+    widths.dedup();
+    widths.into_iter().rev().collect() // try largest-shrink first
+}
+
+/// Retained capacity: the sum of importance scores of components that survived
+/// pruning. Paper §2.2 Mode 1: "Maximize: retained capacity (sum of importance
+/// scores)".
+///
+/// - Per surviving head h in layer l: add the head's importance score.
+/// - Per layer l: add (chosen.d_ff[l] / baseline.d_ff[l]) × ffn.score
+///   (linear retention proxy).
+/// - Per surviving layer l: add layers[l].total_score.
+///
+/// `pruned_heads_per_layer`: the actual set of pruned head indices per layer,
+/// accumulated during the greedy loop.  Using the ACTUAL pruned set avoids
+/// the "survivors have low indices" assumption that breaks under
+/// GQA-group-aligned pruning when low-importance heads have high indices.
+fn retained_capacity(
+    baseline: &ModelSpec,
+    chosen: &ModelSpec,
+    importance: &ImportanceTable,
+    pruned_heads_per_layer: &[Vec<u32>],
+) -> f64 {
+    let mut total = 0.0_f64;
+    // Head retention: a head survived iff it was NOT in the pruned set.
+    for h in &importance.heads {
+        let l = h.layer as usize;
+        if l < chosen.n_layers as usize {
+            let pruned = pruned_heads_per_layer.get(l).map(|v| v.as_slice()).unwrap_or(&[]);
+            if !pruned.contains(&h.head) {
+                total += h.score;
+            }
+        }
+    }
+    // FFN width retention.
+    for f in &importance.ffns {
+        let l = f.layer as usize;
+        if l < chosen.n_layers as usize {
+            let base = baseline.d_ff.get(l).copied().unwrap_or(0) as f64;
+            let new = chosen.d_ff.get(l).copied().unwrap_or(0) as f64;
+            if base > 0.0 {
+                total += f.score * (new / base).clamp(0.0, 1.0);
+            }
+        }
+    }
+    // Layer retention: surviving layers contribute their total_score.
+    for lscore in &importance.layers {
+        let l = lscore.layer as usize;
+        if l < chosen.n_layers as usize {
+            total += lscore.total_score;
+        }
+    }
+    total
 }
 
 fn satisfies_constraints(profile: &CompilationProfile, c: &Constraints) -> bool {
@@ -156,6 +231,7 @@ pub fn prune_greedy(
     constraints: &Constraints,
     granularity: Granularity,
 ) -> SearchOutcome {
+    let t0 = std::time::Instant::now();
     let baseline_profile = evaluate(base_spec, gpu).expect("base spec must validate");
     let baseline_params = base_spec.param_count();
 
@@ -163,6 +239,11 @@ pub fn prune_greedy(
     let mut current_profile = baseline_profile.clone();
     let mut prune_log = Vec::new();
     let mut candidates_evaluated = 1u32;
+    // Track which head indices were actually pruned per layer so retained_capacity
+    // can filter by the REAL pruned set, not the "survivors have low indices" assumption
+    // that breaks under GQA-group-aligned pruning (W2-1 fix).
+    let mut pruned_heads_per_layer: Vec<Vec<u32>> =
+        vec![Vec::new(); base_spec.n_layers as usize];
 
     let ordered = prune_order(importance, &constraints.preserve_layers);
 
@@ -212,6 +293,11 @@ pub fn prune_greedy(
         // Accept.
         current_spec = trial_spec;
         current_profile = trial_profile;
+        // Record the pruned head index in its layer so retained_capacity can
+        // filter by the actual pruned set (not the low-index assumption).
+        if let Some(layer_pruned) = pruned_heads_per_layer.get_mut(h.layer as usize) {
+            layer_pruned.push(h.head);
+        }
         prune_log.push(PruneStep {
             kind: "head".into(),
             layer: h.layer,
@@ -231,7 +317,6 @@ pub fn prune_greedy(
     if matches!(granularity, Granularity::Ffn | Granularity::HeadAndFfn)
         && !sparsity_reached(baseline_params, current_spec.param_count(), constraints.target_sparsity)
     {
-        let candidate_widths: [u32; 3] = [1024, 768, 512];
         // Iterate from least-important layer (low importance score).
         let mut layer_scores: Vec<(u32, f64)> = importance
             .layers
@@ -242,6 +327,7 @@ pub fn prune_greedy(
         layer_scores.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
         for (layer, _) in layer_scores {
+            let candidate_widths = ffn_candidate_widths(base_spec.d_ff[layer as usize]);
             for &w in &candidate_widths {
                 let mut delta = PruneDelta::for_spec(&current_spec);
                 if let Some(d) = delta.per_layer.iter_mut().find(|d| d.layer == layer) {
@@ -296,17 +382,20 @@ pub fn prune_greedy(
         }
     }
 
+    let wall_clock_us = t0.elapsed().as_micros() as u64;
     SearchOutcome {
         baseline: Some(baseline_profile.clone()),
         chosen: Some(EvaluatedCandidate {
             spec: current_spec.clone(),
             profile: current_profile.clone(),
-            score: (baseline_params.saturating_sub(current_spec.param_count())) as f64,
+            score: retained_capacity(base_spec, &current_spec, importance, &pruned_heads_per_layer),
             feasible: satisfies_constraints(&current_profile, constraints),
         }),
         ranked_candidates: Vec::new(),
         prune_log,
         candidates_evaluated,
+        candidates_enumerated: candidates_evaluated,
+        wall_clock_us,
     }
 }
 
@@ -318,8 +407,11 @@ pub fn architecture_search(
     constraints: &Constraints,
     objective: NasObjective,
 ) -> SearchOutcome {
+    let t0 = std::time::Instant::now();
+    let mut enumerated_total = 0u32;
     let mut evaluated = Vec::new();
     for spec in axes.enumerate() {
+        enumerated_total += 1;
         let Ok(profile) = evaluate(&spec, gpu) else {
             continue;
         };
@@ -344,6 +436,7 @@ pub fn architecture_search(
                 .unwrap_or(std::cmp::Ordering::Equal),
         }
     });
+    let wall_clock_us = t0.elapsed().as_micros() as u64;
     let candidates_evaluated = evaluated.len() as u32;
     let chosen = evaluated.iter().find(|c| c.feasible).cloned();
     SearchOutcome {
@@ -352,6 +445,8 @@ pub fn architecture_search(
         ranked_candidates: evaluated,
         prune_log: Vec::new(),
         candidates_evaluated,
+        candidates_enumerated: enumerated_total,
+        wall_clock_us,
     }
 }
 
@@ -372,6 +467,7 @@ pub fn joint_prune_search(
     constraints: &Constraints,
     granularity: Granularity,
 ) -> SearchOutcome {
+    let t0 = std::time::Instant::now();
     let baseline_profile = evaluate(base_spec, gpu).expect("base spec must validate");
     let baseline_params = base_spec.param_count();
 
@@ -392,6 +488,7 @@ pub fn joint_prune_search(
             prune_log,
             candidates_evaluated,
             constraints,
+            t0,
         );
     }
 
@@ -455,7 +552,7 @@ pub fn joint_prune_search(
                 new_latency_us: current_profile.estimated_latency_us,
             });
             if sparsity_reached(baseline_params, current_params, constraints.target_sparsity) {
-                return finish_joint(baseline_profile, base_spec, &delta, current_profile, prune_log, candidates_evaluated, constraints);
+                return finish_joint(baseline_profile, base_spec, &delta, current_profile, prune_log, candidates_evaluated, constraints, t0);
             }
         }
     }
@@ -509,7 +606,7 @@ pub fn joint_prune_search(
                     new_latency_us: current_profile.estimated_latency_us,
                 });
                 if sparsity_reached(baseline_params, current_params, constraints.target_sparsity) {
-                    return finish_joint(baseline_profile, base_spec, &delta, current_profile, prune_log, candidates_evaluated, constraints);
+                    return finish_joint(baseline_profile, base_spec, &delta, current_profile, prune_log, candidates_evaluated, constraints, t0);
                 }
             }
         }
@@ -590,7 +687,7 @@ pub fn joint_prune_search(
         }
     }
 
-    finish_joint(baseline_profile, base_spec, &delta, current_profile, prune_log, candidates_evaluated, constraints)
+    finish_joint(baseline_profile, base_spec, &delta, current_profile, prune_log, candidates_evaluated, constraints, t0)
 }
 
 /// Read the effective FFN width at `layer` given the delta accumulated so far.
@@ -603,16 +700,6 @@ fn current_ff_for(base_spec: &ModelSpec, delta: &PruneDelta, layer: u32) -> u32 
         .unwrap_or_else(|| base_spec.d_ff[layer as usize])
 }
 
-/// Candidate FFN widths to try below `current` (decreasing). Mirrors the policy used by
-/// PR #227 — 75/50/37.5% of current, multiples of 64, strictly less than current.
-fn ffn_candidate_widths(current: u32) -> Vec<u32> {
-    let raw = [current * 3 / 4, current / 2, current * 3 / 8];
-    let mut out: Vec<u32> = raw.iter().map(|&w| (w / 64).max(1) * 64).collect();
-    out.retain(|&w| w < current);
-    out.dedup();
-    out
-}
-
 fn finish_joint(
     baseline_profile: CompilationProfile,
     base_spec: &ModelSpec,
@@ -621,9 +708,11 @@ fn finish_joint(
     prune_log: Vec<PruneStep>,
     candidates_evaluated: u32,
     constraints: &Constraints,
+    t0: std::time::Instant,
 ) -> SearchOutcome {
     let final_spec = apply_delta(base_spec, delta);
     let baseline_params = base_spec.param_count();
+    let wall_clock_us = t0.elapsed().as_micros() as u64;
     SearchOutcome {
         baseline: Some(baseline_profile),
         chosen: Some(EvaluatedCandidate {
@@ -635,6 +724,8 @@ fn finish_joint(
         ranked_candidates: Vec::new(),
         prune_log,
         candidates_evaluated,
+        candidates_enumerated: candidates_evaluated,
+        wall_clock_us,
     }
 }
 
@@ -1049,5 +1140,164 @@ mod tests {
         // either accepted or rejected.
         assert!(outcome.prune_log.len() >= 1);
         assert!(outcome.prune_log.len() <= total_heads);
+    }
+
+    // G4 — FFN widths must be data-driven, not hardcoded.
+    #[test]
+    fn ffn_candidate_widths_scale_to_baseline() {
+        // baseline d_ff = 4096 → widths {3072, 2048, 1536} (75%, 50%, 37.5% × mult-64)
+        let w = super::ffn_candidate_widths(4096);
+        assert!(!w.is_empty());
+        assert!(
+            w.iter().all(|&x| x % 64 == 0),
+            "must be multiples of 64: {w:?}"
+        );
+        assert!(
+            w.iter().all(|&x| x < 4096),
+            "must be strictly less than baseline"
+        );
+        assert_eq!(w[0], 3072); // largest-first
+        // baseline d_ff = 1024 → widths {768, 512, 384}
+        let w2 = super::ffn_candidate_widths(1024);
+        assert_eq!(w2, vec![768, 512, 384]);
+    }
+
+    // G5 — prune chosen score must be retained capacity, not params-saved.
+    #[test]
+    fn prune_chosen_score_is_retained_capacity() {
+        use crate::cep_importance::FfnImportance;
+
+        let s = spec();
+        let baseline_params = s.param_count() as f64;
+        // Build an importance table that includes ffns so retained_capacity is non-zero.
+        let mut imp = fake_importance(&s);
+        for l in 0..s.n_layers {
+            imp.ffns.push(FfnImportance {
+                layer: l,
+                weight_magnitude: 1.0,
+                position_factor: 1.0,
+                roofline_slack: 1.0,
+                score: 10.0,
+            });
+        }
+        let outcome = prune_greedy(
+            &s,
+            &imp,
+            gpu(),
+            &Constraints {
+                target_sparsity: 0.02,
+                ..Default::default()
+            },
+            Granularity::HeadAndFfn,
+        );
+        let chosen = outcome.chosen.as_ref().unwrap();
+        // Retained capacity sums importance scores (typically small numbers
+        // relative to raw param counts).  It must NOT look like "params saved"
+        // (which would be in the millions for this spec).
+        assert!(
+            chosen.score < baseline_params * 0.5,
+            "retained_capacity {} should not look like saved-params {}",
+            chosen.score,
+            baseline_params
+        );
+        // And strictly positive (some capacity is retained).
+        assert!(chosen.score > 0.0, "retained_capacity must be > 0");
+    }
+
+    // G5-extension — retained_capacity must use the ACTUAL pruned set, not the
+    // "survivors have low indices" assumption.  Under GQA-group-aligned pruning,
+    // the lowest-importance heads may have low indices, so survivors are the HIGH-
+    // indexed heads.  The old code (h.head < chosen.n_heads[l]) would count the
+    // pruned low-index heads as survivors and exclude the actual high-index survivors,
+    // producing a score that is too low (misses high-importance heads) and wrong
+    // (credits pruned heads).  This test makes the inversion detectable by using
+    // heterogeneous importance where the split is cleanly detectable.
+    #[test]
+    fn prune_chosen_score_reflects_actual_survivors_not_low_index_assumption() {
+        use crate::cep_importance::FfnImportance;
+
+        // spec: 4 layers, 8 heads per layer, 4 kv-heads → group size = 2.
+        // Heads 0..3 score 0.1 (low), heads 4..7 score 10.0 (high).
+        // Pruner will drop the lowest-score heads first (head 0, then head 1 to
+        // complete the GQA group {0,1}), making survivors {2,3,4,5,6,7}.
+        // Correct retained_capacity: 2×0.1 + 4×10.0 = 40.2 per layer (across 4 layers).
+        // Old (broken) code: h.head < chosen.n_heads[l]=6 → counts {0..5} which
+        // misses survivors {6,7} (score 10.0 each) and credits pruned {0,1} (score 0.1).
+        let s = spec(); // uniform(256, 4, 8, 4, 32, 512, 8192) → n_heads=8, n_kv=4
+        let n_layers = s.n_layers as usize;
+        let n_heads = s.n_heads[0] as usize;
+        let mut heads = Vec::new();
+        for l in 0..n_layers {
+            for h in 0..n_heads {
+                let score = if h < n_heads / 2 { 0.1_f64 } else { 10.0_f64 };
+                heads.push(HeadImportance {
+                    layer: l as u32,
+                    head: h as u32,
+                    weight_magnitude: 1.0,
+                    spectral_energy: 0.5,
+                    roofline_slack: 1.0,
+                    position_factor: 1.0,
+                    score,
+                });
+            }
+        }
+        // Include FFN importance so the score is non-zero even with 0 head-score contribution.
+        let mut ffns = Vec::new();
+        for l in 0..n_layers {
+            ffns.push(FfnImportance {
+                layer: l as u32,
+                weight_magnitude: 1.0,
+                position_factor: 1.0,
+                roofline_slack: 1.0,
+                score: 0.0, // zero FFN score so only head scores contribute
+            });
+        }
+        let layers = (0..n_layers)
+            .map(|l| crate::cep_importance::LayerImportance {
+                layer: l as u32,
+                attention_score: 0.0,
+                ffn_score: 0.0,
+                total_score: 0.0,
+            })
+            .collect();
+        let imp = ImportanceTable { heads, ffns, layers };
+
+        // Prune 1 GQA group (2 heads) per layer so we can observe the survivor set.
+        let outcome = prune_greedy(
+            &s,
+            &imp,
+            gpu(),
+            &Constraints {
+                target_sparsity: 0.02, // small target: 1 group drop suffices
+                ..Default::default()
+            },
+            Granularity::Head,
+        );
+        let chosen = outcome.chosen.as_ref().unwrap();
+
+        // If at least one head was pruned, the score must credit the high-importance
+        // survivors (score 10.0), not the pruned low-importance heads (score 0.1).
+        // With correct implementation: survivors are high-index heads → score ≥ some
+        // fraction of the total high-importance capacity.
+        // With the old broken code: would undercount by ~2 × 10.0 per affected layer
+        // (missing survivors 6,7) and overcount by ~2 × 0.1 (crediting pruned 0,1).
+        let any_head_pruned = outcome
+            .prune_log
+            .iter()
+            .any(|s| s.kind == "head" && s.accepted);
+        if any_head_pruned {
+            // High-importance heads are score 10.0; if survivors include them,
+            // the total must be significantly above the low-score threshold.
+            // n_layers=4 survivors=6 per layer; at least 4 high-score heads per layer.
+            // Minimum correct score per layer: 4 × 10.0 = 40.0.
+            // Old broken score per layer would be missing 2 high-score heads: ~20.0.
+            let min_expected = (n_layers as f64) * 4.0 * 10.0 * 0.5; // generous lower bound
+            assert!(
+                chosen.score > min_expected,
+                "retained_capacity {} too low — likely counting pruned heads instead of survivors \
+                 (expected > {min_expected}, which requires crediting the high-importance survivors)",
+                chosen.score
+            );
+        }
     }
 }

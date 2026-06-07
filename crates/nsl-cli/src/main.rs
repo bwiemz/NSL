@@ -154,6 +154,10 @@ enum Cli {
         /// CEP: run hardware-aware architecture search.
         #[arg(long)]
         cep_search: bool,
+        /// CEP: print a bare CompilationProfile for the model (paper §7.1
+        /// differentiator — equivalent of PyTorch's missing 'nsl check --perf').
+        #[arg(long)]
+        cep_profile: bool,
         /// CEP: target GPU for analysis (e.g. H100-SXM).
         #[arg(long)]
         cep_target: Option<String>,
@@ -874,9 +878,14 @@ fn main_inner() {
             fpga_device: _fpga_device,
             training_report,
             cep_search,
+            cep_profile,
             cep_target,
             cep_out,
         } => {
+            if cep_search && cep_profile {
+                eprintln!("error: --cep-search and --cep-profile are mutually exclusive");
+                std::process::exit(1);
+            }
             if cep_search {
                 let ov = nsl_codegen::cep::CliOverrides {
                     target: cep_target,
@@ -886,6 +895,16 @@ fn main_inner() {
                     cep_emit_source: None,
                 };
                 std::process::exit(run_cep_search(&file, &ov));
+            }
+            if cep_profile {
+                let ov = nsl_codegen::cep::CliOverrides {
+                    target: cep_target,
+                    sparsity: None,
+                    cep_out: None,
+                    cep_emit_weights: None,
+                    cep_emit_source: None,
+                };
+                std::process::exit(run_cep_profile(&file, weights.as_deref(), &ov));
             }
             if shapes {
                 let src = match std::fs::read_to_string(&file) {
@@ -3193,6 +3212,115 @@ fn run_cep_search(file: &PathBuf, ov: &nsl_codegen::cep::CliOverrides) -> i32 {
     }
     println!("CEP delta written to {}", out_path.display());
     0
+}
+
+/// Run a bare compilation profile for a model (paper §7.1 'nsl check --cep-profile').
+/// Prints a one-shot CompilationProfile without modification.
+fn run_cep_profile(
+    file: &PathBuf,
+    weights: Option<&std::path::Path>,
+    ov: &nsl_codegen::cep::CliOverrides,
+) -> i32 {
+    use nsl_codegen::cep_extract::{cross_check_dims, extract_model_spec};
+
+    let (interner, parse_result, analysis) = frontend_with_flags(file, false);
+    let analysis_errors: Vec<_> = analysis
+        .diagnostics
+        .iter()
+        .filter(|d| d.level == Level::Error)
+        .cloned()
+        .collect();
+    if !analysis_errors.is_empty() {
+        emit_cep_diags(file, &analysis_errors);
+        return 1;
+    }
+
+    let module = &parse_result.module;
+    let resolve = |s: nsl_ast::Symbol| interner.resolve(s.0).unwrap_or("").to_string();
+
+    let spec = match extract_model_spec(module, &resolve) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("{e}");
+            return 1;
+        }
+    };
+
+    // Optional weight cross-check (same logic as run_cep_prune).
+    if let Some(weights_path) = weights {
+        let wm = match nsl_codegen::weight_aware::WeightMap::load(weights_path) {
+            Ok(w) => w,
+            Err(e) => {
+                eprintln!("error: failed to load weights: {e}");
+                return 1;
+            }
+        };
+        if let Err(e) = cross_check_dims(&spec, &wm, &resolve) {
+            eprintln!("{e}");
+            return 1;
+        }
+    }
+
+    let target = resolve_cep_target(ov.target.as_deref(), None, &resolve);
+    let gpu = match nsl_codegen::gpu_specs::find_gpu(&target) {
+        Some(g) => g,
+        None => {
+            eprintln!(
+                "error: unknown CEP target '{}'. Supported: {}",
+                target,
+                nsl_codegen::cep::supported_gpus_list()
+            );
+            return 1;
+        }
+    };
+    let profile = match nsl_codegen::cep_oracle::evaluate(&spec, gpu) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("error: CEP oracle failed: {e:?}");
+            return 1;
+        }
+    };
+
+    // §6.3-style one-shot profile output.
+    println!("=== CEP Compilation Profile ===");
+    println!("Target: {}", gpu.name);
+    println!("Params: {:.1}M", spec.param_count() as f64 / 1e6);
+    println!("Binary size: {}", cep_format_bytes_si(profile.binary_size_bytes));
+    println!("Peak memory: {:.1}GB", profile.peak_memory_bytes as f64 / 1e9);
+    println!("Estimated latency: {:.1}us/token", profile.estimated_latency_us);
+    println!("WCET (roofline upper bound): {:.1}us/token", profile.wcet_us);
+    println!("Kernel launches per forward: {}", profile.kernel_launches);
+    println!("Total FLOPs: {}", cep_format_flops(profile.total_flops));
+    println!("Total HBM bytes: {:.1}GB", profile.total_hbm_bytes as f64 / 1e9);
+    println!("Roofline utilization: {:.2}", profile.roofline_utilization);
+    println!("Fusion opportunities: {}", profile.fusion_events.len());
+    0
+}
+
+fn cep_format_bytes_si(bytes: u64) -> String {
+    if bytes >= 1_000_000_000 {
+        format!("{:.1}GB", bytes as f64 / 1e9)
+    } else if bytes >= 1_000_000 {
+        format!("{}MB", bytes / 1_000_000)
+    } else if bytes >= 1_000 {
+        format!("{}KB", bytes / 1_000)
+    } else {
+        format!("{}B", bytes)
+    }
+}
+
+fn cep_format_flops(flops: u64) -> String {
+    if flops >= 1_000_000_000_000 {
+        format!("{:.1}T", flops as f64 / 1e12)
+    } else if flops >= 1_000_000_000 {
+        format!("{:.1}G", flops as f64 / 1e9)
+    } else if flops >= 1_000_000 {
+        format!("{:.1}M", flops as f64 / 1e6)
+    } else if flops >= 1_000 {
+        format!("{:.1}K", flops as f64 / 1e3)
+    } else {
+        format!("{}", flops)
+    }
 }
 
 /// Check if a file has any import statements or train blocks by quick-scanning.
