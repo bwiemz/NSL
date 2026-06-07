@@ -50,13 +50,15 @@ fi
 # Generate Rust definitions from the upstream header. Allowlist Ort* and
 # ONNX* names; ignore standard C library types that bindgen would otherwise
 # splat into the output.
-# --formatter none: skip all formatting passes (rustfmt and prettyplease).
-# This check only compares type-name sets, so formatting is irrelevant and
-# neither formatter needs to be installed on the CI runner. (bindgen ≥0.66
-# renamed the old --no-rustfmt-bindings flag to --formatter <none|rustfmt|
-# prettyplease>; --formatter none covers both formatters.)
+# --formatter prettyplease: use bindgen's embedded prettyplease crate to
+# format output. Unlike --formatter rustfmt, this requires no external binary
+# — prettyplease is compiled into the bindgen binary. Unlike --formatter none,
+# this produces properly line-wrapped output where `pub struct Foo {` appears
+# on its own line, which the extract_types grep relies on. (bindgen ≥0.66
+# supports --formatter <none|rustfmt|prettyplease>; the old
+# --no-rustfmt-bindings flag was removed in ≥0.70.)
 bindgen \
-    --formatter none \
+    --formatter prettyplease \
     --allowlist-type 'Ort.*|ONNX.*' \
     --allowlist-function 'Ort.*|ONNX.*' \
     --allowlist-var 'ORT_.*|ONNX_.*' \
@@ -74,14 +76,16 @@ bindgen \
 # Field-by-field structural equality is NOT checked here; the binary-layout
 # assertions inside `vendored.rs` (`const _:` blocks) guard that property.
 #
-# IMPORTANT: grep is wrapped in a subshell `(grep ... || true)` so that a
-# zero-match result (exit code 1) does NOT trigger `set -euo pipefail` and
-# kill the script silently before any echo runs. Zero upstream matches are
-# caught explicitly by the non-empty check below.
+# grep uses -o (only-matching) to extract the declaration keyword + type name
+# from anywhere in the line. This is robust to both formatted output (where
+# `pub struct Foo {` is at line start) and compact output (where attributes
+# and declarations appear on the same line). The subshell `(... || true)`
+# prevents `set -euo pipefail` from killing the script silently on zero
+# matches; zero upstream matches are caught explicitly by the check below.
 extract_types() {
     # shellcheck disable=SC2016
-    (grep -hE '^(pub struct |pub enum |pub type )(Ort|ONNX)[A-Za-z0-9_]+' "$1" || true) \
-        | sed -E 's/^(pub struct |pub enum |pub type )//; s/[^A-Za-z0-9_].*$//' \
+    (grep -ohE '(pub struct|pub enum|pub type) (Ort|ONNX)[A-Za-z0-9_]+' "$1" || true) \
+        | sed -E 's/^(pub struct|pub enum|pub type) //' \
         | sort -u
 }
 extract_types "${GENERATED}" > "${UPSTREAM_SYMS}"
@@ -89,8 +93,8 @@ extract_types "${VENDORED}" > "${VENDORED_SYMS}"
 
 if [[ ! -s "${UPSTREAM_SYMS}" ]]; then
     echo "ERROR: bindgen produced no Ort*/ONNX* type declarations from ${HEADER}."
-    echo "This usually means bindgen failed silently or the allowlist did not match."
-    echo "Try running manually: bindgen --formatter none --allowlist-type 'Ort.*|ONNX.*' ${HEADER}"
+    echo "This usually means the allowlist did not match any types in the header."
+    echo "Try: bindgen --formatter prettyplease --allowlist-type 'Ort.*|ONNX.*' ${HEADER} | grep -oE 'pub (struct|enum|type) (Ort|ONNX)[A-Za-z0-9_]+'"
     exit 1
 fi
 
