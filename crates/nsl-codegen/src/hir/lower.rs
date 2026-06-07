@@ -939,6 +939,8 @@ fn build_datapath(
         let w_elem = SignalRef::indexed_local_param(
             w_name,
             vec![IndexExpr::Reg(k_reg), IndexExpr::Reg(o_reg)],
+            vec![k_i, n_i],
+            b_width,
         );
         // prod = x_src[k] * W{i}[k][o]
         let prod = Mul::new(x_elem, w_elem, a_width, b_width, prod_width);
@@ -1070,7 +1072,12 @@ fn build_fsm(ctx: &SeqLoweringCtx, module: &mut HirModule) -> Result<(), FpgaLow
     // acc <= b1[0]; o <= '0; k <= '0; state <= S_L1_MAC.
     start_body.push(SeqStmt::RegAssign {
         target: SeqLValue::Register(acc_reg),
-        value: SignalRef::indexed_local_param(b1_name, vec![IndexExpr::Literal(0)]),
+        value: SignalRef::indexed_local_param(
+            b1_name,
+            vec![IndexExpr::Literal(0)],
+            vec![ctx.layers[0].n],
+            ctx.layers[0].acc_width,
+        ),
     });
     start_body.push(SeqStmt::RegAssign { target: SeqLValue::Register(o_reg), value: zero() });
     start_body.push(SeqStmt::RegAssign { target: SeqLValue::Register(k_reg), value: zero() });
@@ -1121,6 +1128,8 @@ fn build_fsm(ctx: &SeqLoweringCtx, module: &mut HirModule) -> Result<(), FpgaLow
                     value: SignalRef::indexed_local_param(
                         next_b_name,
                         vec![IndexExpr::Literal(0)],
+                        vec![ctx.layers[layer_idx].n],
+                        ctx.layers[layer_idx].acc_width,
                     ),
                 },
                 SeqStmt::RegAssign { target: SeqLValue::Register(o_reg), value: zero() },
@@ -1138,6 +1147,8 @@ fn build_fsm(ctx: &SeqLoweringCtx, module: &mut HirModule) -> Result<(), FpgaLow
                 value: SignalRef::indexed_local_param(
                     b_name,
                     vec![IndexExpr::RegPlus(o_reg, 1)],
+                    vec![layer.n],
+                    layer.acc_width,
                 ),
             },
             SeqStmt::RegAssign {
@@ -1424,6 +1435,8 @@ pub(crate) fn lower_v1_mlp_single_layer(
             SignalRef::indexed_local_param(
                 b_arr_name.clone(),
                 vec![IndexExpr::Literal(o)],
+                vec![n_outputs],
+                acc_width,
             )
         } else {
             SignalRef::local_param(&zero_lp_name)
@@ -1457,6 +1470,8 @@ pub(crate) fn lower_v1_mlp_single_layer(
                 IndexExpr::Genvar(gv_k_name.clone()),
                 IndexExpr::Genvar(gv_o_name.clone()),
             ],
+            vec![k_dim, n_outputs],
+            b_width,
         ),
         a_width,
         b_width,
@@ -2050,7 +2065,7 @@ mod tests {
                 _ => panic!("expected Literal(o) at indices[0]"),
             }
             match &a.src {
-                SignalRef::IndexedLocalParam { array_name, indices } => {
+                SignalRef::IndexedLocalParam { array_name, indices, .. } => {
                     assert_eq!(array_name, "b1");
                     assert_eq!(indices.len(), 1);
                     match &indices[0] {
@@ -2149,34 +2164,31 @@ mod tests {
             .lower(&kir, "tiny_mlp_seq").unwrap();
         let v = VerilogEmitter::emit_module(&module);
 
-        // ── Case (1): phase-entry seeds b1[0] and b2[0] ─────────────────────
+        // ── Case (1): phase-entry seeds b1[0 * …] and b2[0 * …] ─────────────
+        // With the flat bit-select format, `Literal(0)` emits as `0 * w` so
+        // the subscript starts with `b1[0 * ` rather than the old `b1[0]`.
         assert!(
-            v.contains("b1[0]"),
-            "layer-1 phase-entry seed b1[0] missing from FSM Verilog",
+            v.contains("b1[0 * "),
+            "layer-1 phase-entry seed b1[0 * ...] missing from FSM Verilog",
         );
         assert!(
-            v.contains("b2[0]"),
-            "layer-2 phase-entry seed b2[0] missing from FSM Verilog",
+            v.contains("b2[0 * "),
+            "layer-2 phase-entry seed b2[0 * ...] missing from FSM Verilog",
         );
 
-        // ── Case (2): intra-layer advance b{i}[(o+1)] ───────────────────────
-        // The o register emits as `_rN`; the RegPlus form emits as `[(_rN + 1)]`.
-        // We locate the o-register name from the `o <= ZERO` reset line
-        // (the only line of the form `_rN <= ZERO;` in the reset block where N
-        // is also used as an index in b1/b2 subscripts).
-        //
-        // More practically: scan for `b1[(` and confirm ` + 1)]` follows on the
-        // same line (the full token is `b1[(_rN + 1)]`).
+        // ── Case (2): intra-layer advance b{i}[(_rN + 1) * …] ──────────────
+        // With flat bit-selects, `RegPlus(o_reg, 1)` emits as `(_rN + 1) * w`.
+        // We check that a line contains `b1[(_r` and ` + 1) * ` together.
         let b1_intra = v.lines().any(|line| {
-            if let Some(pos) = line.find("b1[(") {
-                line[pos..].contains(" + 1)]")
+            if let Some(pos) = line.find("b1[(_r") {
+                line[pos..].contains(" + 1) * ")
             } else {
                 false
             }
         });
         assert!(
             b1_intra,
-            "intra-layer advance `b1[(_rN + 1)]` missing from FSM Verilog",
+            "intra-layer advance `b1[(_rN + 1) * ...]` missing from FSM Verilog",
         );
 
         // ── Case (3): no bare `b1[_rN]` or `b2[_rN]` form ──────────────────

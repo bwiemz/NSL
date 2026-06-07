@@ -18,13 +18,26 @@ pub fn emit_signal_ref(s: &SignalRef) -> String {
             let idx_str = emit_index_exprs(indices);
             format!("{}{}", array_name, idx_str)
         }
-        // M57.1 wire-array realization (Task W5): identical render shape to
-        // WireArrayElement — both lower to `name[idx0][idx1]...`. The HIR
-        // distinction (wire family vs const family) is preserved structurally
-        // for declaration emission and snapshot fidelity.
-        SignalRef::IndexedLocalParam { array_name, indices } => {
-            let idx_str = emit_index_exprs(indices);
-            format!("{}{}", array_name, idx_str)
+        // M57.1 wire-array realization (Task W5): flat bitvector bit-select.
+        // Yosys ≤0.44 rejects multi-dim packed localparams, so the array is
+        // stored as a 1D bitvector and accessed via `name[base +: W]` where
+        // `base = (i0*D1 + i1)*W` for 2D (or `i0*W` for 1D).
+        SignalRef::IndexedLocalParam { array_name, indices, dims, elem_width } => {
+            let w = *elem_width;
+            let base = match dims.len() {
+                1 => {
+                    let i0 = emit_index_expr_arith(&indices[0]);
+                    format!("{} * {}", i0, w)
+                }
+                2 => {
+                    let c = dims[1];
+                    let i0 = emit_index_expr_arith(&indices[0]);
+                    let i1 = emit_index_expr_arith(&indices[1]);
+                    format!("({} * {} + {}) * {}", i0, c, i1, w)
+                }
+                n => panic!("IndexedLocalParam: rank {} not supported in v1", n),
+            };
+            format!("{}[{} +: {}]", array_name, base, w)
         }
         // M57.1 wire-array realization (Task W5): Verilog indexed part-select.
         // Used to slice the `Port::Input("x_l<i>")` flat bus into per-element
@@ -60,7 +73,7 @@ pub fn emit_signal_ref(s: &SignalRef) -> String {
 
 /// M57.1 wire-array realization helper: render an `IndexExpr` chain into
 /// concatenated Verilog `[...]` subscripts. Shared between `WireArrayElement`,
-/// `IndexedLocalParam`, and `AssignWireArrayElement`.
+/// and `AssignWireArrayElement`.
 pub(crate) fn emit_index_exprs(indices: &[IndexExpr]) -> String {
     indices.iter()
         .map(|ix| match ix {
@@ -71,6 +84,18 @@ pub(crate) fn emit_index_exprs(indices: &[IndexExpr]) -> String {
             IndexExpr::RegPlus(r, k) => format!("[(_r{} + {})]", r.0, k),
         })
         .collect()
+}
+
+/// Render an `IndexExpr` as an arithmetic expression (no wrapping brackets).
+/// Used by `IndexedLocalParam` flat bit-select emission.
+fn emit_index_expr_arith(ix: &IndexExpr) -> String {
+    match ix {
+        IndexExpr::Literal(n) => format!("{}", n),
+        IndexExpr::Genvar(name) => name.clone(),
+        IndexExpr::GenvarPlus(name, k) => format!("({} + {})", name, k),
+        IndexExpr::Reg(r) => format!("_r{}", r.0),
+        IndexExpr::RegPlus(r, k) => format!("(_r{} + {})", r.0, k),
+    }
 }
 
 pub fn emit_wire(w: &Wire) -> String {
@@ -103,45 +128,28 @@ pub fn emit_local_param(lp: &LocalParam) -> String {
     )
 }
 
-/// M57.1 wire-array realization (Task W5): emit a module-scope multi-dim
-/// const array as `localparam signed [D0-1:0]...[W-1:0] name = { ... };`.
-/// Packed dimensions (before the identifier) are used for Yosys compatibility
-/// — Yosys rejects unpacked dimensions after the name. The initializer uses
-/// standard Verilog concatenation (MSB-first) rather than SV `'{ }` aggregates
-/// which older Yosys versions do not support.
+/// M57.1 wire-array realization (Task W5): emit a module-scope const array
+/// as a flat 1D bitvector localparam: `localparam signed [N*W-1:0] name = {…};`.
 ///
-/// Element mapping: `name[r][c]` = `values[r*cols + c]`. Higher ranks panic.
+/// Yosys ≤0.44 rejects multi-dimensional packed localparams, so all arrays
+/// (1D and 2D) are flattened to a single `[total_bits-1:0]` declaration.
+/// The initializer uses a standard Verilog concat `{…}` (not the SV `'{…}`
+/// aggregate) so older Yosys versions accept it.
+///
+/// Bit layout: element at flat index `i` occupies bits `[i*W, i*W+W-1]`.
+/// Concat is MSB-first, so element `N-1` is first (highest bits). The
+/// corresponding `IndexedLocalParam` signal ref uses `name[i*W +: W]` (1D)
+/// or `name[(r*C+c)*W +: W]` (2D) to address individual elements.
 pub fn emit_local_param_array(lpa: &LocalParamArray) -> String {
-    let packed_dims: String = lpa.dims.iter()
-        .map(|d| format!("[{}:0]", d - 1))
-        .collect();
-    let values_str = match lpa.dims.len() {
-        2 => {
-            let (rows, cols) = (lpa.dims[0], lpa.dims[1]);
-            // Packed [rows-1:0][cols-1:0][W-1:0]: name[r][c] = values[r*cols+c].
-            // Concat is MSB-first: iterate r from rows-1 down to 0, c from cols-1 down to 0.
-            let cells: Vec<String> = (0..rows).rev().flat_map(|r| {
-                (0..cols).rev().map(move |c| {
-                    format!("{}'sd{}", lpa.width, lpa.values[r * cols + c])
-                })
-            }).collect();
-            format!("{{{}}}", cells.join(", "))
-        }
-        1 => {
-            let n = lpa.dims[0];
-            // Packed [n-1:0][W-1:0]: name[i] = values[i].
-            // Concat is MSB-first: iterate i from n-1 down to 0.
-            let cells: Vec<String> = (0..n).rev().map(|i| {
-                format!("{}'sd{}", lpa.width, lpa.values[i])
-            }).collect();
-            format!("{{{}}}", cells.join(", "))
-        }
-        n => panic!("emit_local_param_array: rank {} not supported in v1", n),
-    };
-    format!(
-        "localparam signed {}[{}:0] {} = {};",
-        packed_dims, lpa.width - 1, lpa.name, values_str
-    )
+    let total: usize = lpa.dims.iter().product();
+    let total_bits = total * lpa.width;
+    // MSB-first concat: element N-1 → highest bits, element 0 → lowest bits.
+    // Reversing values gives name[i*W +: W] == values[i].
+    let cells: Vec<String> = lpa.values.iter().rev().map(|v| {
+        format!("{}'sd{}", lpa.width, v)
+    }).collect();
+    let values_str = format!("{{{}}}", cells.join(", "));
+    format!("localparam signed [{}:0] {} = {};", total_bits - 1, lpa.name, values_str)
 }
 
 pub fn emit_mul(m: &Mul) -> String {

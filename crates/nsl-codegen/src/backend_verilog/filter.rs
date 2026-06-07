@@ -18,11 +18,14 @@ pub fn elide_localparams(verilog: &str) -> String {
     let scalar = Regex::new(
         r"^\s*localparam\s+signed\s+\[\d+:0\]\s+\w+\s*=\s*\d+'sd-?\d+;\s*$",
     ).unwrap();
-    // Match `localparam signed [..] name [0:..]...[0:..] = '{...};` — the
-    // SystemVerilog array form. The `'{}` literal can span the rest of the
-    // line; we anchor only on the leading shape and terminating `};`.
+    // Legacy SV aggregate form: `localparam signed [W:0] name [0:N]... = '{…};`
     let array = Regex::new(
         r"^\s*localparam\s+signed\s+\[\d+:0\]\s+\w+(?:\s*\[0:\d+\])+\s*=\s*'\{.*\};\s*$",
+    ).unwrap();
+    // Flat bitvector form (current emitter): `localparam signed [N:0] name = {…};`
+    // Uses standard Verilog concat (no leading `'`).
+    let flat_array = Regex::new(
+        r"^\s*localparam\s+signed\s+\[\d+:0\]\s+\w+\s*=\s*\{[^;]*\};\s*$",
     ).unwrap();
     // M57.1 wire-array mini §3.2: per-element fan-out / bias-seed assigns
     // (e.g. `assign x_l1_a[7] = x_l1[56 +: 8];` or
@@ -36,7 +39,7 @@ pub fn elide_localparams(verilog: &str) -> String {
     let mut prev_was_element = false;
     let mut result: Vec<String> = Vec::new();
     for line in verilog.lines() {
-        if scalar.is_match(line) || array.is_match(line) {
+        if scalar.is_match(line) || array.is_match(line) || flat_array.is_match(line) {
             continue;
         }
         if element_assign.is_match(line) {
@@ -107,5 +110,19 @@ mod tests {
         let input = "    localparam signed [31:0] b1 [0:127] = '{32'sd0, 32'sd1};";
         let out = elide_localparams(input);
         assert!(!out.contains("b1"), "1D array localparam should be elided");
+    }
+
+    #[test]
+    fn elides_flat_bitvector_localparam_1d() {
+        let input = "    localparam signed [4095:0] b1 = {32'sd0, 32'sd1, 32'sd2};";
+        let out = elide_localparams(input);
+        assert!(!out.contains("b1"), "flat 1D localparam should be elided");
+    }
+
+    #[test]
+    fn elides_flat_bitvector_localparam_large() {
+        let input = "    localparam signed [802815:0] W1 = {8'sd0, 8'sd0, 8'sd0};";
+        let out = elide_localparams(input);
+        assert!(!out.contains("W1"), "flat large localparam should be elided");
     }
 }

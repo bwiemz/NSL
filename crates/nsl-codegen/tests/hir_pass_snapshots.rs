@@ -352,7 +352,7 @@ fn format_sigref(s: &nsl_codegen::hir::SignalRef) -> String {
             format!("WireArrayElement({array_name}{})", format_index_exprs(indices))
         }
         // M57.1 wire-array realization (Task W5): indexed LocalParamArray read.
-        nsl_codegen::hir::SignalRef::IndexedLocalParam { array_name, indices } => {
+        nsl_codegen::hir::SignalRef::IndexedLocalParam { array_name, indices, .. } => {
             format!("IndexedLocalParam({array_name}{})", format_index_exprs(indices))
         }
         // M57.1 wire-array realization (Task W5): Verilog `name[base +: width]`.
