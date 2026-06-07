@@ -1,0 +1,102 @@
+# G6 / paper §3.2 — minimal CEP-prunable fixture WITH a recovery-FT train block.
+#
+# Shape-equivalent to cep_canonical_small.nsl for CEP recognizer purposes
+# (`@cep_prune` + `blocks: [TransformerBlock; N]` + GroupedQueryAttention +
+# SwiGLUFFN + RMSNorm), but extended with:
+#   - forward methods (deliberately simple — single matmul per submodule —
+#     so source-AD compilation stays small),
+#   - an instance + a one-epoch train block at the bottom.
+#
+# After SP2 rewrites the (n_heads, n_kv_heads, d_ff) ctor args in
+# TransformerBlock(...), the train block at the bottom is preserved
+# verbatim (it doesn't reference these dims directly), and compiling the
+# rewritten source under `--source-ad` produces a backward pass shaped to
+# the pruned topology — the paper §3.2 claim.
+#
+# Model definitions are INLINE (not stdlib imports) so the test never
+# depends on the heavy stdlib GQA/RoPE forward path; the CEP recognizer
+# accepts the model based on type NAMES alone.
+
+# RMSNorm — recognizer-friendly name; simple forward (just sums a normaliser).
+model RMSNorm(d: int):
+    w: Tensor = ones([d])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x * self.w
+
+# GroupedQueryAttention — recognizer-friendly NAME + 5-arg constructor matching
+# cep_canonical_small.nsl. Forward is a simple linear chain through wq + wo
+# — enough for source-AD to observe pruning-induced shape shrinkage on
+# (wq, wo) but without softmax / RoPE / reshape complications.
+model GroupedQueryAttention(d_model: int, n_heads: int, n_kv_heads: int, head_dim: int, dropout_p: float):
+    wq: Tensor = ones([d_model, n_heads * head_dim])
+    wk: Tensor = ones([d_model, n_kv_heads * head_dim])
+    wv: Tensor = ones([d_model, n_kv_heads * head_dim])
+    wo: Tensor = ones([n_heads * head_dim, d_model])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        let q = x @ self.wq
+        return q @ self.wo
+
+# SwiGLUFFN — recognizer matches the type NAME against `ffn_activation` so
+# the categorical activation field of CompilationProfile resolves to SwiGlu.
+model SwiGLUFFN(d_model: int, d_ff: int, dropout_p: float):
+    w_gate: Tensor = ones([d_model, d_ff])
+    w_up: Tensor = ones([d_model, d_ff])
+    w_down: Tensor = ones([d_ff, d_model])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        let gate = silu(x @ self.w_gate)
+        let up = x @ self.w_up
+        return (gate * up) @ self.w_down
+
+model TransformerBlock(d_model: int, n_heads: int, n_kv_heads: int, head_dim: int, d_ff: int, dropout_p: float):
+    attn_norm: RMSNorm = RMSNorm(d_model)
+    attn: GroupedQueryAttention = GroupedQueryAttention(d_model, n_heads, n_kv_heads, head_dim, dropout_p)
+    ffn_norm: RMSNorm = RMSNorm(d_model)
+    ffn: SwiGLUFFN = SwiGLUFFN(d_model, d_ff, dropout_p)
+
+    fn forward(self, x: Tensor) -> Tensor:
+        let h = self.attn.forward(self.attn_norm.forward(x))
+        return self.ffn.forward(self.ffn_norm.forward(h))
+
+@cep_prune(target = h100, sparsity = 0.3, granularity = "head+ffn")
+model TinyCoder:
+    embed: Tensor = ones([256, 64])
+    blocks: [TransformerBlock; 2] = TransformerBlock(64, 4, 2, 16, 128, 0.1)
+    norm: RMSNorm = RMSNorm(64)
+
+    # Toy forward: direct matmul chain through block-0's pruned tensors.
+    # Avoids `self.blocks[i].forward()` because the type checker can't
+    # currently track per-element types of an `[Block; N]` array — only
+    # FIELD access on indexed-array slots type-checks today (`.wq`, not
+    # `.forward(...)`). The shape contract is unchanged: every tensor
+    # touched here (wq, wo, w_gate, w_up, w_down) shrinks under CEP
+    # head + FFN pruning, so the source-AD backward shrinks with it.
+    fn forward(self, x: Tensor) -> Tensor:
+        # block 0: attn proxy
+        let q0 = x @ self.blocks[0].attn.wq
+        let h0 = q0 @ self.blocks[0].attn.wo
+        # block 0: ffn proxy
+        let g0 = silu(h0 @ self.blocks[0].ffn.w_gate)
+        let u0 = h0 @ self.blocks[0].ffn.w_up
+        let f0 = (g0 * u0) @ self.blocks[0].ffn.w_down
+        # block 1: same shape, exercises both layers' pruning.
+        let q1 = f0 @ self.blocks[1].attn.wq
+        let h1 = q1 @ self.blocks[1].attn.wo
+        let g1 = silu(h1 @ self.blocks[1].ffn.w_gate)
+        let u1 = h1 @ self.blocks[1].ffn.w_up
+        let f1 = (g1 * u1) @ self.blocks[1].ffn.w_down
+        return f1
+
+let m = TinyCoder()
+let x = ones([4, 64])
+
+# One-epoch train block — enough to fire source AD + WRGA, no dataloader.
+# The loss touches every Wq/Wo/W_gate/W_up/W_down per block, so the
+# backward ops scale with the pruned (n_heads, d_ff) dims.
+train(model = m, epochs = 1):
+    optimizer: SGD(lr = 0.001)
+    step(batch):
+        let out = m.forward(x)
+        let loss = sum(out)
