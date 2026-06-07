@@ -595,6 +595,11 @@ fn emit_fused_forward_under_claim(
             null, null,
             // PCA §4.3: doc_starts_ptr — read from the same registry.
             doc_starts_v,
+            // PCA per-doc CTA (Strategy 3 v1): num_docs_or_zero.  0 here —
+            // the @train fused forward kernel name does not carry the
+            // `_per_doc_cta` suffix in any codegen path today.  Wiring
+            // this to a packing-registry runtime read is Sprint 2 follow-on.
+            null,
         ],
     )?;
     {
@@ -1198,6 +1203,41 @@ fn lower_single_op(
 
         // === Loss functions (3 ops) ===
         // Loss functions are composite: we lower them to sequences of existing FFI calls.
+        //
+        // CFTP §4.4 G3 (Sprint 2.5 SUBSTITUTION SITE):
+        //
+        // When the surrounding `train` block carries `@fused_lm_ce(enabled = true)`,
+        // the planned Sprint 2.5 lowering will:
+        //
+        //   1. Walk the Wengert list backwards from this op to confirm
+        //      `inputs[0]` was produced by a `Matmul` whose RHS is a
+        //      `Transpose` (the stdlib `fused_linear_ce` pattern in
+        //      stdlib/nsl/nn/losses.nsl), AND `inputs[0]` was produced by
+        //      a `BiasAdd`/`Add` whose RHS is a 1-D bias tensor.
+        //   2. Extract `(x, W, bias, targets)` from those upstream ops.
+        //   3. Synthesise a `FusedLinearCEConfig` from the static tensor
+        //      shapes (vocab_size, hidden_size, batch_size, seq_len)
+        //      + `Compiler.fused_ce_configs[0].vocab_tile`, embed the PTX
+        //      via `embed_flash_ptx`-style helper, emit a single
+        //      `nsl_fused_linear_ce_forward` FFI call with pre-allocated
+        //      loss + lse outputs (the latter saved for backward).
+        //   4. Register a custom backward emitter on the result var that
+        //      calls `nsl_fused_linear_ce_backward` with the saved lse,
+        //      producing dx / dW / dbias to feed `Compiler.adjoints`.
+        //
+        // Sprint 2 (current) intentionally falls through to the composite
+        // path below for ALL cross_entropy occurrences — the decorator
+        // is collected but does NOT yet drive substitution. The opt-in
+        // gate `Compiler.fused_ce_configs.first().map(|c| c.enabled)`
+        // exists in compiler state ready for Sprint 2.5 to consume.
+        //
+        // Cross-references:
+        //   * crates/nsl-codegen/src/fused_linear_ce.rs — PTX synthesis.
+        //   * crates/nsl-runtime/src/fused_linear_ce.rs — forward + bwd FFI.
+        //   * stdlib/nsl/nn/losses.nsl::fused_linear_ce — user-facing
+        //     stdlib function (Sprint 2 wires the composite v1 path).
+        //   * crates/nsl-semantic/src/cftp.rs::validate_fused_ce_decorator
+        //     — decorator parsing + alignment-invariant enforcement.
         PrimalOp::CrossEntropyLoss => {
             // Match stdlib/nsl/nn/losses.nsl semantics, including ignore labels
             // encoded as -100 by the DataLoader.
@@ -1285,6 +1325,65 @@ fn lower_single_op(
             free_tensor_value(compiler, builder, sq)?;
             Ok(result)
         }
+        // CFTP §4.4 G3 (Sprint 4): fused linear-CE forward.
+        //
+        // Replaces the composite `x @ W^T + bias` matmul + `cross_entropy`
+        // expansion with a single PTX kernel launch (or two kernels at
+        // V > 8192).  The forward produces per-row losses in HBM; this
+        // lowering then applies the standard `sum(masked_nll) / num_valid`
+        // reduction to return a scalar mean loss to AD.
+        //
+        // Synchronisation: the FFI calls `cuCtxSynchronize` internally
+        // after the kernel launch, so loss_out is ready by the time we
+        // run the CPU-side / NslTensor-side reduction below.
+        //
+        // The forward also saves `lse_out` on
+        // `compiler.fused_ce_fwd_lse` keyed by the result Cranelift
+        // Value — the backward extract dispatcher consumes it.
+        PrimalOp::FusedLinearCe {
+            vocab_size,
+            hidden_size,
+            batch_size,
+            seq_len,
+            vocab_tile,
+            ignore_index,
+            is_large,
+        } => lower_fused_linear_ce_forward(
+            compiler,
+            builder,
+            &inputs,
+            *vocab_size,
+            *hidden_size,
+            *batch_size,
+            *seq_len,
+            *vocab_tile,
+            *ignore_index,
+            *is_large,
+        ),
+        // CFTP §4.4 G3 (Sprint 4): fused linear-CE backward extract.
+        // Mirrors `FlashAttentionBackwardExtract` — first component fires
+        // the backward FFI and caches outputs; subsequent components hit
+        // the cache; the last evicts.
+        PrimalOp::FusedLinearCeBackwardExtract {
+            component,
+            vocab_size,
+            hidden_size,
+            batch_size,
+            seq_len,
+            vocab_tile,
+            ignore_index,
+        } => lower_fused_linear_ce_backward_extract(
+            compiler,
+            builder,
+            &inputs,
+            *component,
+            *vocab_size,
+            *hidden_size,
+            *batch_size,
+            *seq_len,
+            *vocab_tile,
+            *ignore_index,
+        ),
         PrimalOp::L1Loss => {
             // l1_loss(pred, target) = mean(|pred - target|)
             // ELTLS (FBIP-3): nsl_tensor_sub takes a flags byte.
@@ -1937,6 +2036,14 @@ fn lower_single_op(
                     // PCA §4.3: doc_starts_ptr — read from the same
                     // registry; matches the forward's effective_pos.
                     doc_starts_v,
+                    // PCA per-doc CTA backward (Sprint 5): num_docs_or_zero
+                    // trailing sentinel. AD-side never emits a per-doc CTA
+                    // backward today (the planner gate that activates the
+                    // per-doc forward also feeds the backward synth at the
+                    // dispatch site), so passing 0 here keeps the legacy
+                    // per-q-block topology. Hot-path activation will set
+                    // this when the planner integrates with AD.
+                    null,
                 ],
             )?;
 
@@ -2319,6 +2426,492 @@ fn lower_single_op(
     }
 }
 
+// ── CFTP §4.4 G3 (Sprint 4): fused linear-CE forward + backward lowering ────
+
+/// Build a per-config `FusedLinearCEConfig` from the per-op shape facts.
+///
+/// `gpu_sm = 80` matches the codegen default — the runtime PTX header
+/// always emits `.target sm_{max(80, gpu_sm)}` so this works on all
+/// post-Ampere GPUs including Blackwell (sm_120).
+fn build_fused_ce_cfg(
+    vocab_size: u32,
+    hidden_size: u32,
+    batch_size: u32,
+    seq_len: u32,
+    vocab_tile: u32,
+    ignore_index: i64,
+) -> Result<crate::fused_linear_ce::FusedLinearCEConfig, CodegenError> {
+    let cfg = crate::fused_linear_ce::FusedLinearCEConfig {
+        vocab_size,
+        hidden_size,
+        seq_len,
+        batch_size,
+        vocab_tile,
+        gpu_sm: 80,
+        dtype: crate::fused_linear_ce::Dtype::F32,
+        ignore_index,
+        // Raise the per-config cap to the hard ceiling so Sprint-3's
+        // large-vocab path activates whenever vocab > 8192 without the
+        // caller having to thread `max_vocab_v1` separately.
+        max_vocab_v1: crate::fused_linear_ce::MAX_VOCAB_HARD_CEILING,
+    };
+    cfg.validate()
+        .map_err(|e| CodegenError::new(format!("FusedLinearCe config invalid: {e}")))?;
+    Ok(cfg)
+}
+
+/// Embed a Vec<u8> of PTX bytes (NUL-terminated copy made internally) and
+/// a kernel name (NUL-terminated copy) into the Cranelift module's
+/// `.rodata` and return Cranelift Values pointing to each.
+///
+/// Uses unique data symbol names derived from `tag` so multiple
+/// PrimalOp::FusedLinearCe ops in the same compile unit don't collide.
+fn embed_fused_ce_data(
+    compiler: &mut crate::compiler::Compiler,
+    builder: &mut FunctionBuilder,
+    tag: &str,
+    ptx_bytes: &[u8],
+    kernel_name: &str,
+) -> Result<(Value, Value), CodegenError> {
+    use cranelift_module::DataDescription;
+    use cranelift_module::Linkage;
+
+    let mut ptx_with_nul = ptx_bytes.to_vec();
+    ptx_with_nul.push(0);
+    let ptx_sym = format!("__nsl_fused_ce_ptx_{}", tag);
+    let ptx_id = compiler
+        .module
+        .declare_data(&ptx_sym, Linkage::Local, false, false)
+        .map_err(|e| CodegenError::new(format!("declare fused-ce PTX data '{ptx_sym}': {e}")))?;
+    let mut ptx_desc = DataDescription::new();
+    ptx_desc.define(ptx_with_nul.into_boxed_slice());
+    compiler
+        .module
+        .define_data(ptx_id, &ptx_desc)
+        .map_err(|e| CodegenError::new(format!("define fused-ce PTX data '{ptx_sym}': {e}")))?;
+
+    let mut name_with_nul = kernel_name.as_bytes().to_vec();
+    name_with_nul.push(0);
+    let name_sym = format!("__nsl_fused_ce_name_{}", tag);
+    let name_id = compiler
+        .module
+        .declare_data(&name_sym, Linkage::Local, false, false)
+        .map_err(|e| CodegenError::new(format!("declare fused-ce name data '{name_sym}': {e}")))?;
+    let mut name_desc = DataDescription::new();
+    name_desc.define(name_with_nul.into_boxed_slice());
+    compiler
+        .module
+        .define_data(name_id, &name_desc)
+        .map_err(|e| CodegenError::new(format!("define fused-ce name data '{name_sym}': {e}")))?;
+
+    let ptx_gv = compiler.module.declare_data_in_func(ptx_id, builder.func);
+    let name_gv = compiler.module.declare_data_in_func(name_id, builder.func);
+    let ptx_val = builder.ins().symbol_value(cl_types::I64, ptx_gv);
+    let name_val = builder.ins().symbol_value(cl_types::I64, name_gv);
+    Ok((ptx_val, name_val))
+}
+
+/// Build a CPU-side f32 NslTensor with `shape` then move it to device=1
+/// (CUDA). Returns the NslTensor handle Value (i64).
+fn alloc_gpu_f32_tensor(
+    compiler: &mut crate::compiler::Compiler,
+    builder: &mut FunctionBuilder,
+    shape: &[i64],
+) -> Result<Value, CodegenError> {
+    let shape_list = call(compiler, builder, "nsl_list_new", &[])?;
+    for &dim in shape {
+        let dim_val = builder.ins().iconst(cl_types::I64, dim);
+        call(compiler, builder, "nsl_list_push", &[shape_list, dim_val])?;
+    }
+    let cpu_tensor = call(compiler, builder, "nsl_tensor_zeros", &[shape_list])?;
+    let cuda_device = builder.ins().iconst(cl_types::I64, 1);
+    let gpu_tensor = call(
+        compiler,
+        builder,
+        "nsl_tensor_to_device",
+        &[cpu_tensor, cuda_device],
+    )?;
+    Ok(gpu_tensor)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lower_fused_linear_ce_forward(
+    compiler: &mut crate::compiler::Compiler,
+    builder: &mut FunctionBuilder,
+    inputs: &[Value],
+    vocab_size: u32,
+    hidden_size: u32,
+    batch_size: u32,
+    seq_len: u32,
+    vocab_tile: u32,
+    ignore_index: i64,
+    is_large: bool,
+) -> Result<Value, CodegenError> {
+    let cfg = build_fused_ce_cfg(
+        vocab_size,
+        hidden_size,
+        batch_size,
+        seq_len,
+        vocab_tile,
+        ignore_index,
+    )?;
+    let rows = (batch_size as i64) * (seq_len as i64);
+    let x_t = inputs[0];
+    let w_t = inputs[1];
+    let bias_t = inputs[2];
+    let targets_t = inputs[3];
+
+    // Allocate per-row output buffers on GPU.
+    let loss_out = alloc_gpu_f32_tensor(compiler, builder, &[rows])?;
+    let lse_out = alloc_gpu_f32_tensor(compiler, builder, &[rows])?;
+
+    // Extract raw device pointers for the FFI.
+    let x_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[x_t])?;
+    let w_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[w_t])?;
+    let bias_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[bias_t])?;
+    let tgt_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[targets_t])?;
+    let loss_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[loss_out])?;
+    let lse_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[lse_out])?;
+
+    // Forward PTX synthesis + embedding.
+    let fwd_ptx_bytes = crate::fused_linear_ce::synthesize_fused_linear_ce_ptx(&cfg);
+    let smem_bytes = cfg.shared_mem_bytes() as i64;
+    let b_val = builder.ins().iconst(cl_types::I64, batch_size as i64);
+    let s_val = builder.ins().iconst(cl_types::I64, seq_len as i64);
+    let v_val = builder.ins().iconst(cl_types::I64, vocab_size as i64);
+    let h_val = builder.ins().iconst(cl_types::I64, hidden_size as i64);
+    let smem_val = builder.ins().iconst(cl_types::I64, smem_bytes);
+
+    if is_large {
+        // Large-vocab two-kernel path. Allocate partials buffer and
+        // pass both kernel-name pointers.
+        let num_tiles = cfg.num_vocab_tiles() as i64;
+        let tag = format!(
+            "v{}_h{}_t{}_large",
+            vocab_size, hidden_size, vocab_tile
+        );
+        let partials_kname = cfg.large_partials_kernel_name();
+        let finalize_kname = cfg.large_finalize_kernel_name();
+        let (ptx_ptr, partials_name_ptr) =
+            embed_fused_ce_data(compiler, builder, &tag, &fwd_ptx_bytes, &partials_kname)?;
+        // Reuse the same PTX module for the finalize kernel name embed.
+        // Only the name string differs.
+        let (_, finalize_name_ptr) = embed_fused_ce_data(
+            compiler,
+            builder,
+            &format!("{tag}_finalize"),
+            &fwd_ptx_bytes,
+            &finalize_kname,
+        )?;
+
+        // Partials scratch: f32[rows * num_tiles * 2]; allocate on GPU.
+        let partials_buf = alloc_gpu_f32_tensor(
+            compiler,
+            builder,
+            &[rows * num_tiles * 2],
+        )?;
+        let partials_ptr =
+            call(compiler, builder, "nsl_tensor_data_ptr", &[partials_buf])?;
+        let num_tiles_val = builder.ins().iconst(cl_types::I64, num_tiles);
+
+        let _rc = call(
+            compiler,
+            builder,
+            "nsl_fused_linear_ce_forward_large",
+            &[
+                ptx_ptr,
+                partials_name_ptr,
+                finalize_name_ptr,
+                x_ptr,
+                w_ptr,
+                bias_ptr,
+                tgt_ptr,
+                partials_ptr,
+                loss_ptr,
+                lse_ptr,
+                b_val,
+                s_val,
+                v_val,
+                h_val,
+                num_tiles_val,
+                smem_val,
+            ],
+        )?;
+        // Partials scratch is no longer needed after the launch.
+        free_tensor_value(compiler, builder, partials_buf)?;
+    } else {
+        let tag = format!("v{}_h{}_small", vocab_size, hidden_size);
+        let kname = cfg.kernel_name();
+        let (ptx_ptr, name_ptr) =
+            embed_fused_ce_data(compiler, builder, &tag, &fwd_ptx_bytes, &kname)?;
+        let _rc = call(
+            compiler,
+            builder,
+            "nsl_fused_linear_ce_forward",
+            &[
+                ptx_ptr,
+                name_ptr,
+                x_ptr,
+                w_ptr,
+                bias_ptr,
+                tgt_ptr,
+                loss_ptr,
+                lse_ptr,
+                b_val,
+                s_val,
+                v_val,
+                h_val,
+                smem_val,
+            ],
+        )?;
+    }
+
+    // Per-row losses are in `loss_out`. Apply the same masked-mean
+    // reduction the composite `CrossEntropyLoss` lowering uses so the
+    // scalar result is bit-compatible with the dual path.
+    //
+    // valid_mask[i] = clamp(targets[i] + 1, 0, 1) — 0 for -100, 1 else.
+    // num_valid = sum(valid_mask) + eps.
+    // total = sum(loss_out * valid_mask).
+    // result = total / num_valid.
+    let one_f = builder.ins().f64const(1.0);
+    let zero_f = builder.ins().f64const(0.0);
+    let eps_f = builder.ins().f64const(1e-8);
+    let addsc_flags = builder.ins().iconst(cl_types::I8, 0);
+    let targets_plus_one = call(
+        compiler,
+        builder,
+        "nsl_tensor_add_scalar",
+        &[targets_t, one_f, addsc_flags],
+    )?;
+    let valid_mask = call(
+        compiler,
+        builder,
+        "nsl_tensor_clamp",
+        &[targets_plus_one, zero_f, one_f],
+    )?;
+    // The fused kernel already writes 0 to ignore-index rows, but multiplying
+    // by valid_mask makes the masking explicit and matches the composite
+    // semantics (gradient seeds also see the same identity).
+    let mul_flags = builder.ins().iconst(cl_types::I8, 0);
+    let masked_loss = call(
+        compiler,
+        builder,
+        "nsl_tensor_mul",
+        &[loss_out, valid_mask, mul_flags],
+    )?;
+    let num_valid = call(compiler, builder, "nsl_tensor_sum", &[valid_mask])?;
+    let addsc_flags2 = builder.ins().iconst(cl_types::I8, 0);
+    let num_valid_eps = call(
+        compiler,
+        builder,
+        "nsl_tensor_add_scalar",
+        &[num_valid, eps_f, addsc_flags2],
+    )?;
+    let total = call(compiler, builder, "nsl_tensor_sum", &[masked_loss])?;
+    let div_flags = builder.ins().iconst(cl_types::I8, 0);
+    let result = call(
+        compiler,
+        builder,
+        "nsl_tensor_div",
+        &[total, num_valid_eps, div_flags],
+    )?;
+    // Free intermediates we own (loss_out's masked product, valid_mask
+    // chain, total, num_valid_eps). The raw `loss_out` is freed too,
+    // since the result lives in the new scalar tensor.  `lse_out`
+    // is cached for backward — DO NOT free it here.
+    for tmp in [
+        targets_plus_one,
+        valid_mask,
+        masked_loss,
+        num_valid,
+        num_valid_eps,
+        total,
+        loss_out,
+    ] {
+        free_tensor_value(compiler, builder, tmp)?;
+    }
+
+    // Cache the lse_out for backward extract dispatch keyed by the
+    // scalar-result Cranelift Value. Backward's first extract (component
+    // = 0) reads + consumes it; the entry is evicted there.
+    compiler.fused_ce_fwd_lse.insert(result, lse_out);
+    Ok(result)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn lower_fused_linear_ce_backward_extract(
+    compiler: &mut crate::compiler::Compiler,
+    builder: &mut FunctionBuilder,
+    inputs: &[Value],
+    component: u8,
+    vocab_size: u32,
+    hidden_size: u32,
+    batch_size: u32,
+    seq_len: u32,
+    vocab_tile: u32,
+    ignore_index: i64,
+) -> Result<Value, CodegenError> {
+    if component > 2 {
+        return Err(CodegenError::new(format!(
+            "FusedLinearCeBackwardExtract: component {} out of range 0..=2",
+            component
+        )));
+    }
+    // Convention (mirrors FusedCshaBackwardExtract):
+    //   inputs[0] = output_bar (upstream grad seed)
+    //   inputs[1..5] = x, W, bias, targets (forward inputs)
+    //   inputs[5] = fwd_result (the FusedLinearCe op's result Value — cache key)
+    let output_bar = inputs[0];
+    let x_t = inputs[1];
+    let w_t = inputs[2];
+    let bias_t = inputs[3];
+    let targets_t = inputs[4];
+    let fwd_result_key = inputs[5];
+
+    // Fire the backward launch on component=0; cache on subsequent calls.
+    let slot = if let Some(&cached) = compiler.fused_ce_bwd_cache.get(&fwd_result_key) {
+        cached
+    } else {
+        let cfg = build_fused_ce_cfg(
+            vocab_size,
+            hidden_size,
+            batch_size,
+            seq_len,
+            vocab_tile,
+            ignore_index,
+        )?;
+
+        // Allocate output tensors (dx[B*S, H], dW[V, H], dbias[V]).
+        let rows = (batch_size as i64) * (seq_len as i64);
+        let dx_out = alloc_gpu_f32_tensor(
+            compiler,
+            builder,
+            &[rows, hidden_size as i64],
+        )?;
+        let dw_out = alloc_gpu_f32_tensor(
+            compiler,
+            builder,
+            &[vocab_size as i64, hidden_size as i64],
+        )?;
+        let dbias_out =
+            alloc_gpu_f32_tensor(compiler, builder, &[vocab_size as i64])?;
+
+        // Look up saved lse buffer; consume + evict from the map.
+        let lse_out = compiler
+            .fused_ce_fwd_lse
+            .remove(&fwd_result_key)
+            .ok_or_else(|| {
+                CodegenError::new(
+                    "FusedLinearCeBackwardExtract: no saved lse for fwd_result \
+                     — forward must run before backward (compiler.fused_ce_fwd_lse \
+                     is populated in lower_fused_linear_ce_forward).",
+                )
+            })?;
+
+        // Extract raw device pointers for the backward FFI.
+        let x_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[x_t])?;
+        let w_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[w_t])?;
+        let bias_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[bias_t])?;
+        let tgt_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[targets_t])?;
+        let lse_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[lse_out])?;
+        let dx_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[dx_out])?;
+        let dw_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[dw_out])?;
+        let dbias_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[dbias_out])?;
+
+        // Backward PTX synthesis + embed.
+        let bwd_ptx_bytes =
+            crate::fused_linear_ce::synthesize_fused_linear_ce_backward_ptx(&cfg);
+        let bwd_kname = cfg.bwd_kernel_name();
+        let tag = format!("bwd_v{}_h{}", vocab_size, hidden_size);
+        let (bwd_ptx_ptr, bwd_name_ptr) =
+            embed_fused_ce_data(compiler, builder, &tag, &bwd_ptx_bytes, &bwd_kname)?;
+
+        // grad_output: the upstream scalar grad (a 0-dim or 1-elem tensor).
+        // Extract its f32 value via nsl_tensor_item (returns f64), demote to
+        // f32, and pack the bits into i64.  This matches the FFI signature
+        // which takes `grad_output_bits: i64` reinterpreted via
+        // `f32::from_bits(grad_output_bits as u32)`.
+        let grad_f64 = call(compiler, builder, "nsl_tensor_item", &[output_bar])?;
+        let grad_f32 = builder.ins().fdemote(cl_types::F32, grad_f64);
+        let grad_bits_i32 = builder.ins().bitcast(
+            cl_types::I32,
+            cranelift_codegen::ir::MemFlags::new(),
+            grad_f32,
+        );
+        let grad_bits = builder.ins().sextend(cl_types::I64, grad_bits_i32);
+
+        // num_valid: count(targets != ignore_index). Compute via the same
+        // valid_mask trick used in forward; convert to i64 scalar.
+        let one_f = builder.ins().f64const(1.0);
+        let zero_f = builder.ins().f64const(0.0);
+        let addsc_flags_b = builder.ins().iconst(cl_types::I8, 0);
+        let targets_plus_one =
+            call(compiler, builder, "nsl_tensor_add_scalar", &[
+                targets_t,
+                one_f,
+                addsc_flags_b,
+            ])?;
+        let valid_mask =
+            call(compiler, builder, "nsl_tensor_clamp", &[
+                targets_plus_one,
+                zero_f,
+                one_f,
+            ])?;
+        let num_valid_t = call(compiler, builder, "nsl_tensor_sum", &[valid_mask])?;
+        let num_valid_f64 = call(compiler, builder, "nsl_tensor_item", &[num_valid_t])?;
+        let num_valid = builder.ins().fcvt_to_sint(cl_types::I64, num_valid_f64);
+
+        let b_val = builder.ins().iconst(cl_types::I64, batch_size as i64);
+        let s_val = builder.ins().iconst(cl_types::I64, seq_len as i64);
+        let v_val = builder.ins().iconst(cl_types::I64, vocab_size as i64);
+        let h_val = builder.ins().iconst(cl_types::I64, hidden_size as i64);
+        let smem_val = builder.ins().iconst(cl_types::I64, cfg.shared_mem_bytes() as i64);
+
+        let _rc = call(
+            compiler,
+            builder,
+            "nsl_fused_linear_ce_backward",
+            &[
+                bwd_ptx_ptr,
+                bwd_name_ptr,
+                grad_bits,
+                x_ptr,
+                w_ptr,
+                bias_ptr,
+                tgt_ptr,
+                lse_ptr,
+                dx_ptr,
+                dw_ptr,
+                dbias_ptr,
+                b_val,
+                s_val,
+                v_val,
+                h_val,
+                num_valid,
+                smem_val,
+            ],
+        )?;
+
+        // Free temporaries; lse_out's storage is consumed by the FFI then
+        // freed here (the kernel has already finished reading it because
+        // the FFI calls cuCtxSynchronize).
+        for tmp in [targets_plus_one, valid_mask, num_valid_t, lse_out] {
+            free_tensor_value(compiler, builder, tmp)?;
+        }
+
+        let slot = [dx_out, dw_out, dbias_out];
+        compiler.fused_ce_bwd_cache.insert(fwd_result_key, slot);
+        slot
+    };
+
+    let result = slot[component as usize];
+    if component == 2 {
+        compiler.fused_ce_bwd_cache.remove(&fwd_result_key);
+    }
+    Ok(result)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2480,14 +3073,32 @@ mod tests {
             PrimalOp::Dropout { p: 0.1 },
             PrimalOp::Select,
             PrimalOp::Condition(CompareKind::Gt),
+            PrimalOp::FusedLinearCe {
+                vocab_size: 4096,
+                hidden_size: 128,
+                batch_size: 1,
+                seq_len: 1,
+                vocab_tile: 1024,
+                ignore_index: -100,
+                is_large: false,
+            },
+            PrimalOp::FusedLinearCeBackwardExtract {
+                component: 0,
+                vocab_size: 4096,
+                hidden_size: 128,
+                batch_size: 1,
+                seq_len: 1,
+                vocab_tile: 1024,
+                ignore_index: -100,
+            },
             PrimalOp::Input("x".into()),
             PrimalOp::Param("w".into()),
             PrimalOp::Constant(1.0),
         ];
-        // 53 variants total (including markers) — bumped by Gap D's
-        // FusedCshaBackward addition (on top of Gap C's
-        // CshaFusedBackwardExtract).
-        assert_eq!(ops.len(), 53);
+        // 55 variants total (including markers) — bumped by CFTP §4.4 G3
+        // (Sprint 4) FusedLinearCe + FusedLinearCeBackwardExtract on top of
+        // Gap D's FusedCshaBackward.
+        assert_eq!(ops.len(), 55);
     }
 
     #[test]

@@ -19,7 +19,8 @@ use crate::cep_importance::{analyse_weight_map, ImportanceTable, RooflineSlackTa
 use crate::cep_oracle::{evaluate, CompilationProfile, ModelSpec};
 use crate::cep_rewrite::{LayerDelta, PruneDelta, SearchAxes};
 use crate::cep_search::{
-    architecture_search, prune_greedy, Constraints, Granularity, NasObjective, SearchOutcome,
+    architecture_search, joint_prune_search, prune_greedy, Constraints, Granularity, NasObjective,
+    SearchOutcome,
 };
 use crate::gpu_specs::{default_gpu, find_gpu, GPU_DATABASE};
 use crate::weight_aware::WeightMap;
@@ -58,6 +59,8 @@ pub struct CepPlan {
 pub enum CepMode {
     Prune,
     Search,
+    /// Paper §2.2 Mode 3 — joint prune-search over heads + FFN + layer drops.
+    Joint,
 }
 
 impl CepPlan {
@@ -83,11 +86,12 @@ impl CepPlan {
         match self.mode {
             CepMode::Prune => writeln!(s, "=== CEP Pruning Report ===").unwrap(),
             CepMode::Search => writeln!(s, "=== CEP Architecture Search Report ===").unwrap(),
+            CepMode::Joint => writeln!(s, "=== CEP Joint Prune-Search Report ===").unwrap(),
         }
         writeln!(s, "Target: {}", self.target_gpu).unwrap();
         writeln!(s).unwrap();
 
-        if self.mode == CepMode::Prune {
+        if matches!(self.mode, CepMode::Prune | CepMode::Joint) {
             // §6.3: "Search time: <S> seconds (<N> candidates evaluated)"
             let secs = self.outcome.wall_clock_us as f64 / 1e6;
             writeln!(
@@ -283,6 +287,37 @@ pub fn run_prune(input: CepPruneInput) -> CepPlan {
 
     CepPlan {
         mode: CepMode::Prune,
+        target_gpu: gpu.name.to_string(),
+        outcome,
+        importance,
+    }
+}
+
+/// Paper §2.2 Mode 3 — joint prune-search. Same input contract as `run_prune` (weights
+/// required for non-synthetic importance), but `joint_prune_search` extends the action
+/// space with layer drops on top of head + FFN pruning.
+pub fn run_joint(input: CepPruneInput) -> CepPlan {
+    let gpu = find_gpu(input.target).unwrap_or_else(default_gpu);
+    let baseline = evaluate(&input.spec, gpu).expect("base spec must validate");
+    let slacks = if input.roofline_slack.per_layer.is_empty() {
+        slack_from_profile(&baseline)
+    } else {
+        input.roofline_slack
+    };
+    let importance = if let Some(wm) = input.weights {
+        analyse_weight_map(wm, &input.spec.n_heads, input.spec.n_layers, &slacks)
+    } else {
+        synthetic_importance(&input.spec, &slacks)
+    };
+    let outcome = joint_prune_search(
+        &input.spec,
+        &importance,
+        gpu,
+        &input.constraints,
+        input.granularity,
+    );
+    CepPlan {
+        mode: CepMode::Joint,
         target_gpu: gpu.name.to_string(),
         outcome,
         importance,
@@ -627,6 +662,8 @@ pub struct CliOverrides {
     pub cep_out: Option<std::path::PathBuf>,
     /// CEP SP1: also emit the pruned weights to this .safetensors path.
     pub cep_emit_weights: Option<std::path::PathBuf>,
+    /// CEP SP2: also emit the rewritten NSL source with pruned dims to this path.
+    pub cep_emit_source: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug)]

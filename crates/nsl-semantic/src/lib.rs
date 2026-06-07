@@ -78,6 +78,13 @@ pub struct AnalysisResult {
     /// the model's tensor-weight list.  Consumed by codegen to lower
     /// `self.W` → `load(weight_ptrs + index * 8)`.
     pub weight_index_map: WeightIndexMap,
+    /// CFTP §4.4 G3 (Sprint 2): validated `@fused_lm_ce(...)` configurations
+    /// captured during semantic analysis.  One entry per decorated `train`
+    /// block.  Codegen plumbs these via `CompileOptions.fused_ce_configs`
+    /// (Sprint 2 wires the collection; Sprint 2.5 will use these to drive
+    /// the lowering-site auto-substitution of composite cross_entropy → the
+    /// fused linear-CE kernel).
+    pub fused_ce_configs: Vec<crate::cftp::FusedCeConfig>,
 }
 
 /// Run semantic analysis on a parsed module (single-file, backward compatible).
@@ -113,6 +120,7 @@ pub fn analyze_with_imports(
     let wrga_configs = checker.wrga_configs;
     let freeze_configs = checker.freeze_configs;
     let adapter_configs = checker.adapter_configs;
+    let fused_ce_configs = checker.fused_ce_configs;
 
     // M62: Run `@export` decorator validation.  Pure-additive — appends
     // diagnostics without touching other analysis state.  Also returns the
@@ -187,5 +195,6 @@ pub fn analyze_with_imports(
         freeze_configs,
         adapter_configs,
         weight_index_map,
+        fused_ce_configs,
     }
 }

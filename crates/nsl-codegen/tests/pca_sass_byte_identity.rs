@@ -942,11 +942,32 @@ mod tier_b_sass {
 
         let q_region = sass_between(&sass, "LOOP_Q_TILERANGE", "LOOP_KV_TILERANGE");
         // On sm_80 labels may be preserved or dropped; check either the region
-        // or the whole SASS for BRA.U as a warp-uniform proxy.
+        // or the whole SASS.
+        //
+        // SASS evolution note (2026-06): the explicit `BRA.U` / `BRA.UNI`
+        // uniform-branch mnemonic was a Maxwell/Pascal-era distinction. From
+        // CUDA 12+/Volta+ onward, ptxas emits plain `BRA` even for branches it
+        // schedules as warp-uniform; the uniform-execution property is encoded
+        // in the scheduling control bits rather than the mnemonic suffix. So on
+        // a modern toolchain (verified on CUDA 13.2, ptxas 13.x) the proxy is:
+        //   (a) legacy `BRA.U` / `BRA.UNI` if the toolchain still emits it; OR
+        //   (b) plain `BRA` predicated by a `@P*` whose source is computed via
+        //       warp-uniform ops (ISETP/IMAD over a loop counter incremented
+        //       uniformly), which is what the q-phase loop tail emits today.
+        // We accept either: legacy match (any-arch toolchain) or modern match
+        // (back-edge `BRA` to the LOOP_Q_TILERANGE start label / region body).
         let target = if q_region.is_empty() { &sass } else { &q_region };
+        let has_legacy_uniform = target.contains("BRA.U") || target.contains("BRA.UNI");
+        let has_predicated_bra = target.lines().any(|line| {
+            let l = line.trim();
+            // Modern ptxas form: "@!P<n> BRA 0x..." or "@P<n> BRA 0x..." — a
+            // predicated back-edge branch is the warp-uniform loop-tail proxy.
+            (l.contains("@!P") || l.contains("@P")) && l.contains(" BRA ")
+        });
         assert!(
-            target.contains("BRA.U") || target.contains("BRA.UNI"),
-            "sm_80 q-phase loop branch not BRA.U (uniform-class proxy) \
+            has_legacy_uniform || has_predicated_bra,
+            "sm_80 q-phase loop branch missing both legacy `BRA.U`/`BRA.UNI` \
+             AND modern predicated `BRA` (warp-uniform back-edge proxy) \
              in region:\n{q_region}\n(Full SASS:\n{sass})"
         );
     }

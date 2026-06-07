@@ -279,6 +279,71 @@ pub enum PrimalOp {
     FusedIa3Matmul {
         kernel_handle: i64,
     },
+    /// CFTP §4.4 G3 (Sprint 4): fused linear + cross-entropy.
+    ///
+    /// Single PrimalOp that emits one call to either
+    /// `nsl_fused_linear_ce_forward` (v1, vocab ≤ 8192) or
+    /// `nsl_fused_linear_ce_forward_large` (Sprint 3, vocab > 8192)
+    /// followed by a `sum / num_valid` scalar reduction.
+    ///
+    /// Inputs: `[x, W, bias, targets]` where
+    ///   x:       `[B*S, H]` f32
+    ///   W:       `[V, H]`   f32 (row-major)
+    ///   bias:    `[V]`      f32
+    ///   targets: `[B*S]`    i64 (with -100 = ignore_index)
+    ///
+    /// All shape parameters (`vocab_size`, `hidden_size`, `batch_size`,
+    /// `seq_len`, `vocab_tile`) are compile-time constants required to
+    /// synthesise the PTX kernel.  `is_large` is derived from
+    /// `vocab_size > LARGE_VOCAB_THRESHOLD` at construction time.
+    ///
+    /// The result is the scalar mean loss tensor.  The forward kernel
+    /// writes per-row losses + per-row LSE; the lowerer applies the
+    /// final `sum(loss_out) / num_valid` reduction using the same
+    /// formula as the composite `PrimalOp::CrossEntropyLoss` lowering.
+    ///
+    /// Backward is dispatched via `FusedLinearCeBackwardExtract` —
+    /// see that variant's docs for the cache/extract pattern.
+    FusedLinearCe {
+        vocab_size: u32,
+        hidden_size: u32,
+        batch_size: u32,
+        seq_len: u32,
+        vocab_tile: u32,
+        ignore_index: i64,
+        is_large: bool,
+    },
+    /// CFTP §4.4 G3 (Sprint 4): fused linear + cross-entropy backward extract.
+    ///
+    /// Component mapping:
+    ///   - 0 = dx     (gradient w.r.t. activations `x`)
+    ///   - 1 = dW     (gradient w.r.t. weight `W`)
+    ///   - 2 = dbias  (gradient w.r.t. `bias`)
+    ///
+    /// Inputs:
+    ///   inputs[0] = output_bar (upstream scalar gradient seed)
+    ///   inputs[1] = x          (forward activation)
+    ///   inputs[2] = W          (forward weight)
+    ///   inputs[3] = bias       (forward bias)
+    ///   inputs[4] = targets    (forward targets, for num_valid recompute)
+    ///   inputs[5] = fwd_result (the FusedLinearCe op's result VarId — used as cache key)
+    ///
+    /// The component=0 lowerer launches `nsl_fused_linear_ce_backward`
+    /// and caches `[dx, dW, dbias]` in `compiler.fused_ce_bwd_cache`
+    /// keyed by `fwd_result`.  Components 1 and 2 look up the same
+    /// cache entry; the last component (2) evicts.
+    FusedLinearCeBackwardExtract {
+        component: u8,
+        /// Shape parameters baked at op-construction time so the
+        /// lowerer can re-synthesise the backward PTX without
+        /// re-querying the decorator config.
+        vocab_size: u32,
+        hidden_size: u32,
+        batch_size: u32,
+        seq_len: u32,
+        vocab_tile: u32,
+        ignore_index: i64,
+    },
     // Regularization
     Dropout {
         p: f64,

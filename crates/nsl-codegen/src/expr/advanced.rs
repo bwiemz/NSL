@@ -1720,6 +1720,12 @@ impl Compiler<'_> {
                         // registry. 0 when uninitialized → identity path
                         // (no RoPE reset).
                         doc_starts_v,
+                        // PCA per-doc CTA (Strategy 3 v1): num_docs_or_zero.
+                        // 0 here — the per-doc CTA dispatch is not surfaced
+                        // through the @train-fused @flash_attention call;
+                        // train-block decorator collection that flips this
+                        // to a runtime read is Sprint 2 follow-on.
+                        null,
                     ],
                 )?;
                 {
@@ -1783,6 +1789,7 @@ impl Compiler<'_> {
                         ptx_ptr, name_ptr,
                         block_q_val, block_kv_val,
                         causal_val,
+                        // (continued — args after `causal_val` are tagged below.)
                         // CSHA extras (A.2.1a + A.2.1e + A.2.1g):
                         //
                         // x_v comes from a `state.variables` probe for a
@@ -1816,6 +1823,14 @@ impl Compiler<'_> {
                         // PCA §4.3: doc_starts_ptr — read from the same
                         // registry.
                         doc_starts_v,
+                        // PCA per-doc CTA (Strategy 3 v1): num_docs_or_zero.
+                        // 0 here — the per-doc CTA dispatch is not surfaced
+                        // through the inference `@flash_attention` call.
+                        // Wiring this to a runtime read requires train-block
+                        // decorator collection (Sprint 2 follow-on); the
+                        // FFI still uses the legacy `ceil(seq/block_q)`
+                        // grid_x for every existing caller.
+                        null,
                     ],
                 )?;
             }

@@ -111,6 +111,7 @@ pub fn run_pre_pass_only(
             freeze_configs: Vec::new(),
             adapter_configs: Vec::new(),
             weight_index_map: std::collections::HashMap::new(),
+            fused_ce_configs: Vec::new(),
         };
         // walk_ops may fail on trivial test inputs (no fn/train block).  The
         // production path is non-fatal; mirror that so the source-text

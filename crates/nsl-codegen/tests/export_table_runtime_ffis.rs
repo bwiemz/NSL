@@ -2,11 +2,10 @@
 //! FFIs (emitted into every `--shared-lib` artifact) round-trip the
 //! list of `@export`-decorated functions known to codegen at build time.
 //!
-//! Uses `assert_cmd::Command::cargo_bin("nsl")` rather than
-//! `env!("CARGO_BIN_EXE_nsl")` because `nsl` lives in the sibling
-//! `nsl-cli` crate, not in `nsl-codegen`.
+//! Resolves the `nsl` binary via `nsl_bin` (next to the test executable)
+//! rather than `cargo_bin`/`env!("CARGO_BIN_EXE_nsl")`, because `nsl` lives in
+//! the sibling `nsl-cli` crate, so `CARGO_BIN_EXE_nsl` is not set here.
 
-use assert_cmd::prelude::*;
 use std::ffi::CStr;
 use std::os::raw::c_char;
 use std::process::Command;
@@ -42,8 +41,7 @@ fn beta(x: Tensor<[4], f32>) -> Tensor<[4], f32>:
     let workspace_root = root.parent().unwrap().parent().unwrap();
     let stdlib = workspace_root.join("stdlib");
 
-    let status = Command::cargo_bin("nsl")
-        .unwrap()
+    let status = Command::new(nsl_bin())
         .env("NSL_STDLIB_PATH", &stdlib)
         .args([
             "build",
@@ -78,4 +76,18 @@ fn beta(x: Tensor<[4], f32>) -> Tensor<[4], f32>:
     // Out-of-bounds index returns NULL.
     let oob = unsafe { get_name(7) };
     assert!(oob.is_null(), "out-of-bounds index must return NULL");
+}
+/// Path to the `nsl` binary built by `cargo test --workspace`.
+///
+/// `nsl` lives in the sibling `nsl-cli` crate, so Cargo does not set
+/// `CARGO_BIN_EXE_nsl` for this crate's integration tests, and assert_cmd 2.2+
+/// no longer falls back to the target directory. Resolve it next to the running
+/// test executable instead: `target/<profile>/deps/<test>` -> `target/<profile>/nsl`.
+fn nsl_bin() -> std::path::PathBuf {
+    let mut dir = std::env::current_exe().expect("locate test executable");
+    dir.pop(); // drop the test-binary file name
+    if dir.ends_with("deps") {
+        dir.pop();
+    }
+    dir.join(format!("nsl{}", std::env::consts::EXE_SUFFIX))
 }
