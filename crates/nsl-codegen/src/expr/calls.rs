@@ -1580,6 +1580,150 @@ impl Compiler<'_> {
             );
         }
 
+        // CPDT Part III v2.3 paper-faithful MoE FFN lowering:
+        // `moe_dispatch_ffn(tokens, logits, experts_up, experts_down)` is
+        // the opt-in 4-arg variant that emits `nsl_moe_dispatch_full_v3`.
+        // It coexists with the 3-arg `moe_dispatch` (v1/v2 path) — users
+        // opt into v3 by switching source intrinsics; existing v1/v2
+        // callers are unaffected.
+        //
+        // Shape-derivation rules (mirror v1/v2 with the up/down split):
+        //   - cpdt_mode == Full → require both router AND experts.up AND
+        //     experts.down to resolve in the WeightMap under the matching
+        //     MoeConfig key with consistent dims. None → hard CodegenError.
+        //   - cpdt_mode != Full → if v3 dims resolve, emit v3; otherwise
+        //     return an error (no silent v2 fallback from this site —
+        //     callers using moe_dispatch_ffn explicitly want v3).
+        //
+        // Activation: hardcoded SiLU (activation_kind=1) for v2.3.
+        // Per-decorator `@moe(activation="gelu" | "swiglu" | ...)` is a
+        // v2.4 deferral — when added it threads through the existing
+        // `extract_moe_decorator` path in moe.rs.
+        if func_name == "moe_dispatch_ffn" {
+            if args.len() != 4 {
+                return Err(crate::error::CodegenError::new(
+                    "moe_dispatch_ffn() takes 4 arguments (tokens, router_logits, experts_up, experts_down)",
+                ));
+            }
+            let tokens_val = self.compile_expr(builder, state, &args[0].value)?;
+            let logits_val = self.compile_expr(builder, state, &args[1].value)?;
+            let experts_up_val = self.compile_expr(builder, state, &args[2].value)?;
+            let experts_down_val = self.compile_expr(builder, state, &args[3].value)?;
+
+            // Same multi-MoE candidate resolution as the v2 site —
+            // ensures multi-MoE-per-class fails LOUDLY (refuse on >=2
+            // matches; documented v2.next deferral for disambiguation).
+            let config_with_key = state
+                .current_function_name
+                .as_ref()
+                .and_then(|fn_name| {
+                    let model_prefix = fn_name.split("__").next().unwrap_or("");
+                    let candidates: Vec<_> = self
+                        .features
+                        .moe_configs
+                        .iter()
+                        .filter(|(key, _)| key.starts_with(model_prefix))
+                        .collect();
+                    match candidates.as_slice() {
+                        [(key, info)] => Some(((*key).clone(), (*info).clone())),
+                        _ => None,
+                    }
+                })
+                .or_else(|| {
+                    if self.features.moe_configs.len() == 1 {
+                        self.features
+                            .moe_configs
+                            .iter()
+                            .next()
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                    } else {
+                        None
+                    }
+                });
+            let (cfg_key, num_experts, top_k, capacity_factor) = match &config_with_key {
+                Some((k, info)) => {
+                    (Some(k.clone()), info.num_experts, info.top_k, info.capacity_factor)
+                }
+                None => (None, 8, 2, 1.25f32),
+            };
+
+            let num_experts_val = builder
+                .ins()
+                .iconst(cranelift_codegen::ir::types::I64, num_experts as i64);
+            let top_k_val = builder
+                .ins()
+                .iconst(cranelift_codegen::ir::types::I64, top_k as i64);
+            let cap_bits = builder.ins().iconst(
+                cranelift_codegen::ir::types::I64,
+                capacity_factor.to_bits() as i64,
+            );
+
+            let v3_dims = if let (Some(key), Some(weight_map)) =
+                (cfg_key.as_ref(), self.features.weight_map.as_ref())
+            {
+                crate::moe::derive_v3_dims(weight_map, key, num_experts)
+            } else {
+                None
+            };
+
+            if let Some((hidden_dim, intermediate_dim)) = v3_dims {
+                let hidden_val = builder.ins().iconst(
+                    cranelift_codegen::ir::types::I64,
+                    hidden_dim as i64,
+                );
+                let intermediate_val = builder.ins().iconst(
+                    cranelift_codegen::ir::types::I64,
+                    intermediate_dim as i64,
+                );
+                // SiLU hardcoded for v2.3 (activation_kind=1). When a
+                // future @moe(activation=...) decorator arm lands, the
+                // selector flows into MoeInfo and overrides this
+                // constant.
+                let activation_kind_val = builder
+                    .ins()
+                    .iconst(cranelift_codegen::ir::types::I64, 1_i64);
+                let result = self.compile_call_by_name(
+                    builder,
+                    "nsl_moe_dispatch_full_v3",
+                    &[
+                        tokens_val,
+                        logits_val,
+                        experts_up_val,
+                        experts_down_val,
+                        num_experts_val,
+                        top_k_val,
+                        cap_bits,
+                        hidden_val,
+                        intermediate_val,
+                        activation_kind_val,
+                    ],
+                )?;
+                return Ok(result);
+            }
+
+            // No silent fallback from moe_dispatch_ffn. Users that call
+            // this intrinsic explicitly want v3; if v3 dims can't
+            // resolve, the build fails loudly. This is stricter than
+            // moe_dispatch's v1-fallback for non-CPDT — that fallback
+            // exists for source-API backward compat, which isn't a
+            // concern here (moe_dispatch_ffn is a new entry point).
+            return Err(crate::error::CodegenError::new(format!(
+                "moe_dispatch_ffn: v3 (paper-faithful FFN) requires resolvable router + \
+                 experts.up + experts.down entries in the WeightMap. None of the standard \
+                 names resolved under the MoeConfig key{}, or their shapes were inconsistent \
+                 (router must be [hidden, num_experts]; experts.up must be [num_experts, \
+                 hidden * intermediate]; experts.down must be [num_experts, intermediate * \
+                 hidden]; up- and down-derived intermediate dims must agree). Pass --weights \
+                 with a safetensors bundle that contains <key>.router.weight AND \
+                 <key>.experts.up.weight AND <key>.experts.down.weight (with `.weight` \
+                 suffix optional).",
+                cfg_key
+                    .as_deref()
+                    .map(|k| format!(" '{}'", k))
+                    .unwrap_or_default(),
+            )));
+        }
+
         // M32: MoE dispatch intrinsic
         //
         // CPDT Part III v1 production-forward (M32 gap closure): when an
