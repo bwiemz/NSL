@@ -144,8 +144,17 @@ unsafe extern "C" fn vtable_create_kernel(
     _info: *const OrtKernelInfo,
 ) -> *mut c_void {
     let entry = op as *const PerExportVtable;
-    let name_ptr = (*entry).name_cstr.as_ptr();
-    let raw_fn = resolve_self_symbol(name_ptr);
+    let name_cstr = &(*entry).name_cstr;
+    // Must resolve the `__nsl_dispatch` symbol, NOT the typed wrapper.
+    // The typed wrapper has signature (model*, desc*...) -> i32, which is
+    // incompatible with `ExportFnPtr` = (i64, i64, i64, i64, i64) -> i64.
+    // The dispatch wrapper has the correct 5-i64 ABI and correctly handles
+    // a null model_ptr (v1 stateless exports pass 0 as the model handle).
+    let dispatch_name = {
+        let base = name_cstr.to_string_lossy();
+        CString::new(format!("{}__nsl_dispatch", base)).unwrap()
+    };
+    let raw_fn = resolve_self_symbol(dispatch_name.as_ptr());
     if raw_fn == 0 {
         // Symbol not found. Return null kernel; ORT treats this as a
         // create-kernel failure. (No status-returning variant in V1 —
@@ -153,7 +162,7 @@ unsafe extern "C" fn vtable_create_kernel(
         return std::ptr::null_mut();
     }
     // SAFETY: dlsym/GetProcAddress returned a non-null pointer to a symbol
-    // codegen emitted with the `ExportFnPtr` signature.
+    // codegen emitted with the `ExportFnPtr` dispatch signature.
     let fn_ptr: ExportFnPtr = std::mem::transmute::<usize, ExportFnPtr>(raw_fn);
     let state = Box::new(NslOrtKernelState {
         api,

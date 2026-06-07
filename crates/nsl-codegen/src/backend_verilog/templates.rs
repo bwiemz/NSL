@@ -103,13 +103,15 @@ pub fn emit_wire(w: &Wire) -> String {
 }
 
 /// M57.1 wire-array realization (Task W2): module-scope multi-dim wire decl.
-/// Mechanical lowering — emits `wire signed [W-1:0] name [0:dims[0]-1]...;`
-/// (single space after name, no separator between dim brackets).
+/// Emits `wire signed [W-1:0] name [0:dims[0]-1]...;` with the unpacked
+/// dimensions placed AFTER the name (Verilog 2001 / SV unpacked-array style).
+/// Yosys ≤0.44 rejects 2D packed wire syntax (`wire [D][W] name`) with
+/// `unexpected '['` — unpacked arrays (`wire [W] name [0:D-1]`) are accepted.
 pub fn emit_wire_array(wa: &WireArray) -> String {
-    let packed_dims: String = wa.dims.iter()
-        .map(|d| format!("[{}:0]", d - 1))
+    let unpacked_dims: String = wa.dims.iter()
+        .map(|d| format!("[0:{}]", d - 1))
         .collect();
-    format!("wire signed {}[{}:0] {};", packed_dims, wa.width - 1, wa.name)
+    format!("wire signed [{}:0] {} {};", wa.width - 1, wa.name, unpacked_dims)
 }
 
 /// M57.1 wire-array realization (Task W4): drives one element of a WireArray.
@@ -200,12 +202,13 @@ pub fn emit_wire_decl(d: &WireDecl) -> String {
 }
 
 /// M57.2 (Task 6): module-scope clocked register array — sequential sibling
-/// of `WireArray`. Emits `reg signed [w-1:0] {name} [0:dims[0]-1]...;`.
+/// of `WireArray`. Emits `reg signed [w-1:0] {name} [0:dims[0]-1]...;` using
+/// unpacked-array syntax (dims after name) for Yosys compatibility.
 pub fn emit_reg_array(ra: &RegArray) -> String {
-    let packed_dims: String = ra.dims.iter()
-        .map(|d| format!("[{}:0]", d - 1))
+    let unpacked_dims: String = ra.dims.iter()
+        .map(|d| format!("[0:{}]", d - 1))
         .collect();
-    format!("reg signed {}[{}:0] {};", packed_dims, ra.width - 1, ra.name)
+    format!("reg signed [{}:0] {} {};", ra.width - 1, ra.name, unpacked_dims)
 }
 
 pub fn emit_sign_extend(s: &SignExtend) -> String {
@@ -566,7 +569,7 @@ mod tests {
         };
         assert_eq!(
             emit_wire_array(&wa),
-            "wire signed [127:0][784:0][31:0] acc_l1;"
+            "wire signed [31:0] acc_l1 [0:127][0:784];"
         );
     }
 
@@ -579,7 +582,7 @@ mod tests {
         };
         assert_eq!(
             emit_wire_array(&wa),
-            "wire signed [127:0][31:0] relu_l1;"
+            "wire signed [31:0] relu_l1 [0:127];"
         );
     }
 
@@ -672,7 +675,7 @@ mod tests {
     #[test]
     fn reg_array_emits_declaration() {
         let ra = RegArray { name: "x_buf".into(), dims: vec![784], width: 8 };
-        assert_eq!(emit_reg_array(&ra), "reg signed [783:0][7:0] x_buf;");
+        assert_eq!(emit_reg_array(&ra), "reg signed [7:0] x_buf [0:783];");
     }
 
     // --- M57.2 (Task 7): SeqLValue ---

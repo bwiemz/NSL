@@ -20,8 +20,8 @@ module tiny_mlp_seq(
     reg signed [63:0] _r4;
     reg signed [0:0] _r5;
     reg signed [0:0] _r6;
-    reg signed [783:0][7:0] x_buf;
-    reg signed [127:0][63:0] h_buf;
+    reg signed [7:0] x_buf [0:783];
+    reg signed [63:0] h_buf [0:127];
     wire signed [15:0] _w1;
     assign _w1 = $signed(x_buf[_r3]) * $signed(W1[(_r3 * 128 + _r2) * 8 +: 8]);
     wire signed [63:0] _w2;
