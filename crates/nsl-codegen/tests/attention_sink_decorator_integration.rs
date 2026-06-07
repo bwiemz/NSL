@@ -50,7 +50,7 @@ fn tokens_zero_sentinel_flows_through_cleanly() {
     // that the Sprint 1b cycle-7 eligibility check does NOT regress the
     // disabled path — `num_sink_tokens == 0` short-circuits eligibility
     // to (true, None) regardless of other axes.
-    let (ctx_set, num_sink_tokens_flag) =
+    let (ctx_set, num_sink_tokens_flag, ptx_has_sink_k_ptr) =
         flash_attention_sink_context_for_source(ATTENTION_SINK_DISABLED_FIXTURE);
 
     assert!(
@@ -68,6 +68,22 @@ fn tokens_zero_sentinel_flows_through_cleanly() {
          value here would mean the cycle-7 eligibility-check assignment \
          in kernel.rs regressed."
     );
+
+    // Sprint 1b cycle-7 holistic-review fix: pin the SPRINT 1A
+    // BYTE-IDENTITY invariant at the integration-test layer. When
+    // `num_sink_tokens == 0`, the kernel signature MUST NOT declare
+    // `sink_k_ptr` — that param is gated at `prelude.rs:156-159` and
+    // its presence at zero-sinks would break the fa_v2_snapshots suite
+    // and the Sprint 1a refactor's correctness proof. Probing here
+    // gives a SECOND line of defense in case a future implementer
+    // accidentally unconditional-emits the param.
+    assert!(
+        !ptx_has_sink_k_ptr,
+        "Sprint 1a byte-identity invariant: at num_sink_tokens=0 the \
+         emitted PTX MUST NOT declare `sink_k_ptr` — gated emission \
+         lives at prelude.rs:156-159. If this fires, an unconditional \
+         declaration regression has broken the fa_v2_snapshots suite."
+    );
 }
 
 #[test]
@@ -78,7 +94,7 @@ fn narrow_tier_a_forward_sinks_accepted() {
     // round-trips the decorator's tokens=4. Eligibility short-circuited
     // for tokens=0 disabled, here it returns (true, None) for tokens=4.
     let result = try_flash_attention_sink_context_for_source(ATTENTION_SINK_NARROW_FIXTURE);
-    let (ctx_set, num_sink_tokens_flag) = match result {
+    let (ctx_set, num_sink_tokens_flag, ptx_has_sink_k_ptr) = match result {
         Ok(t) => t,
         Err(e) => panic!(
             "Sprint 1b cycle-7: narrow @attention_sink(tokens=4) MUST \
@@ -101,6 +117,23 @@ fn narrow_tier_a_forward_sinks_accepted() {
          value into the FlashAttentionConfig. A 0 here means the \
          decorator-extraction arm regressed (Sprint 1b restored the \
          `num_sink_tokens = N` assignment that cycle-5 removed)."
+    );
+
+    // Sprint 1b cycle-7 holistic-review fix: deliver the PTX probe the
+    // test's docstring promises. Mirrors the cycle-3 review-fix pattern
+    // in commit `0a987a73` — probe a GATED emission (param declared
+    // ONLY when num_sink_tokens > 0 per prelude.rs:156-159), NOT an
+    // unconditional structure. The probe is the proof that the Sprint 1b
+    // codegen path actually fired, not just that the config value
+    // round-tripped.
+    assert!(
+        ptx_has_sink_k_ptr,
+        "Sprint 1b cycle-7: narrow accepted config MUST emit the \
+         `sink_k_ptr` param declaration (prelude.rs:156-159 gates on \
+         num_sink_tokens > 0). If this fires, the eligibility check let \
+         the config through to codegen but the prelude gate did not fire \
+         — a soft-correctness regression where the user thinks sinks are \
+         on but the kernel emits no sink-loading PTX."
     );
 }
 

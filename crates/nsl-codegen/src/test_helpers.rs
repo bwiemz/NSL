@@ -478,22 +478,25 @@ pub fn flash_paged_kv_context_for_source(
 /// IMPORTANT — v0 API surface only:
 /// This helper INTENTIONALLY does NOT probe the synthesized PTX. The
 /// `num_sink_tokens` field is wired through the decorator-extraction
-/// loop into `FlashAttentionConfig`, but the SMEM-layout codegen that
-/// would actually materialize the sink cache (paper §4.3 Phase 5 v1)
-/// is DEFERRED to a future sprint. Until that lands, the kernel emits
-/// no sink-specific PTX — probing for a sink register would be either
-/// a false positive (matching unrelated text) or a guaranteed false
-/// negative. The integration test pins decorator → config wiring only,
-/// per the explicit cycle-4 Sprint 2 scope.
+/// loop into `FlashAttentionConfig`. Sprint 1b cycle-7 added the gated
+/// SMEM emission: when `num_sink_tokens > 0` AND the narrow-config
+/// eligibility predicate passes, the kernel signature declares
+/// `sink_k_ptr` / `sink_v_ptr` params and the K/V load loop reads sink
+/// rows from those pointers. This helper now returns a 3-tuple so the
+/// integration test can pin the GATED emission (mirrors the cycle-3
+/// Sprint 1 review-fix pattern in commit `0a987a73` — probe a
+/// sink-only emission, NOT an unconditional declaration).
 ///
-/// When the SMEM emission lands, EXTEND this helper to return a 3-tuple
-/// adding a `ptx_contains_sink_register: bool` field, and update the
-/// integration test to assert it (mirrors the cycle-3 Sprint 1 review-fix
-/// pattern in commit `0a987a73` — params unconditional, register loads
-/// gated on the flag).
+/// Returns: `(context_set, num_sink_tokens, ptx_contains_sink_k_ptr)`.
+/// `ptx_contains_sink_k_ptr` is `true` iff the synthesized forward PTX
+/// declares the `sink_k_ptr` param — the param is emitted ONLY when
+/// `config.num_sink_tokens > 0`, per `prelude.rs:156-159`. The probe
+/// CATCHES a future regression where the param is declared
+/// unconditionally (which would break the Sprint 1a byte-identity
+/// invariant + the fa_v2_snapshots suite).
 pub fn flash_attention_sink_context_for_source(
     src: &str,
-) -> (bool, Option<u32>) {
+) -> (bool, Option<u32>, bool) {
     use nsl_errors::FileId;
 
     let mut interner = Interner::new();
@@ -514,8 +517,28 @@ pub fn flash_attention_sink_context_for_source(
         .expect("compile_flash_attention_kernels failed in flash_attention_sink_context_for_source");
 
     match compiler.kernels.flash_attention_context {
-        Some(ctx) => (true, Some(ctx.config.num_sink_tokens)),
-        None => (false, None),
+        Some(ctx) => {
+            let cfg = &ctx.config;
+            let num = cfg.num_sink_tokens;
+            // Synthesize the forward PTX and probe for the sink_k_ptr
+            // parameter declaration. The declaration is GATED on
+            // num_sink_tokens > 0 (prelude.rs:156-159), so its presence
+            // proves the Sprint 1b emission path fired.
+            // Probe the v2 path — that's where the Sprint 1b sink param
+            // emission lives (prelude.rs:156-159 is the v2 prelude).
+            // The legacy `synthesize_flash_attention_ptx` does NOT emit
+            // sink params; probing it would be a false negative.
+            let ptx = crate::flash_attention_v2::synthesize_flash_attention_ptx_v2(cfg);
+            let ptx_body = if ptx.last() == Some(&0) {
+                &ptx[..ptx.len() - 1]
+            } else {
+                &ptx[..]
+            };
+            let ptx_str = std::str::from_utf8(ptx_body).unwrap_or("");
+            let has_sink_k_ptr = ptx_str.contains("sink_k_ptr");
+            (true, Some(num), has_sink_k_ptr)
+        }
+        None => (false, None, false),
     }
 }
 
@@ -527,12 +550,14 @@ pub fn flash_attention_sink_context_for_source(
 /// silent correctness gap (decorator parsed, config set, but no SMEM
 /// emission → user output was rope-effectively-off with no warning).
 ///
-/// On success returns `Ok((context_set, num_sink_tokens_flag))` with
-/// the same semantics as the panicking helper. On compile failure
-/// returns `Err(error_message)` for substring assertions.
+/// On success returns `Ok((context_set, num_sink_tokens_flag,
+/// ptx_contains_sink_k_ptr))` with the same semantics as the panicking
+/// helper (Sprint 1b cycle-7 holistic-review fix added the third
+/// element). On compile failure returns `Err(error_message)` for
+/// substring assertions.
 pub fn try_flash_attention_sink_context_for_source(
     src: &str,
-) -> Result<(bool, Option<u32>), String> {
+) -> Result<(bool, Option<u32>, bool), String> {
     use nsl_errors::FileId;
 
     let mut interner = Interner::new();
@@ -553,7 +578,23 @@ pub fn try_flash_attention_sink_context_for_source(
         .map_err(|e| format!("{e}"))?;
 
     Ok(match compiler.kernels.flash_attention_context {
-        Some(ctx) => (true, Some(ctx.config.num_sink_tokens)),
-        None => (false, None),
+        Some(ctx) => {
+            let cfg = &ctx.config;
+            let num = cfg.num_sink_tokens;
+            // Probe the v2 path — that's where the Sprint 1b sink param
+            // emission lives (prelude.rs:156-159 is the v2 prelude).
+            // The legacy `synthesize_flash_attention_ptx` does NOT emit
+            // sink params; probing it would be a false negative.
+            let ptx = crate::flash_attention_v2::synthesize_flash_attention_ptx_v2(cfg);
+            let ptx_body = if ptx.last() == Some(&0) {
+                &ptx[..ptx.len() - 1]
+            } else {
+                &ptx[..]
+            };
+            let ptx_str = std::str::from_utf8(ptx_body).unwrap_or("");
+            let has_sink_k_ptr = ptx_str.contains("sink_k_ptr");
+            (true, Some(num), has_sink_k_ptr)
+        }
+        None => (false, None, false),
     })
 }
