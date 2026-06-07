@@ -2614,6 +2614,9 @@ fn lower_fused_linear_ce_forward(
             call(compiler, builder, "nsl_tensor_data_ptr", &[partials_buf])?;
         let num_tiles_val = builder.ins().iconst(cl_types::I64, num_tiles);
 
+        // dtype_tag = 0 (F32 sentinel; Sprint v3-2 added the trailing arg).
+        // V4 follow-on will derive this from the @fused_lm_ce decorator.
+        let dtype_tag_val = builder.ins().iconst(cl_types::I64, 0);
         let _rc = call(
             compiler,
             builder,
@@ -2635,6 +2638,7 @@ fn lower_fused_linear_ce_forward(
                 h_val,
                 num_tiles_val,
                 smem_val,
+                dtype_tag_val,
             ],
         )?;
         // Partials scratch is no longer needed after the launch.
@@ -2644,6 +2648,8 @@ fn lower_fused_linear_ce_forward(
         let kname = cfg.kernel_name();
         let (ptx_ptr, name_ptr) =
             embed_fused_ce_data(compiler, builder, &tag, &fwd_ptx_bytes, &kname)?;
+        // dtype_tag = 0 (F32 sentinel; Sprint v3-2 added the trailing arg).
+        let dtype_tag_val = builder.ins().iconst(cl_types::I64, 0);
         let _rc = call(
             compiler,
             builder,
@@ -2662,6 +2668,7 @@ fn lower_fused_linear_ce_forward(
                 v_val,
                 h_val,
                 smem_val,
+                dtype_tag_val,
             ],
         )?;
     }
@@ -2868,6 +2875,8 @@ fn lower_fused_linear_ce_backward_extract(
         let h_val = builder.ins().iconst(cl_types::I64, hidden_size as i64);
         let smem_val = builder.ins().iconst(cl_types::I64, cfg.shared_mem_bytes() as i64);
 
+        // dtype_tag = 0 (F32 sentinel; Sprint v3-2 added the trailing arg).
+        let dtype_tag_val = builder.ins().iconst(cl_types::I64, 0);
         let _rc = call(
             compiler,
             builder,
@@ -2890,6 +2899,7 @@ fn lower_fused_linear_ce_backward_extract(
                 h_val,
                 num_valid,
                 smem_val,
+                dtype_tag_val,
             ],
         )?;
 
