@@ -1622,7 +1622,11 @@ impl<'a> WengertExtractor<'a> {
             PrimalOp::Transpose { dim0: 0, dim1: 1 } => {}
             _ => return None,
         }
-        if transpose_op.inputs.len() != 1 {
+        // `transpose(W, 0, 1)` is recognised in `extract_expr` with inputs
+        // `[W, dim0_const, dim1_const]` (the two dim args get folded to
+        // `PrimalOp::Constant` VarIds even though they aren't used by AD).
+        // Pull W from the first input slot; reject if missing.
+        if transpose_op.inputs.is_empty() {
             return None;
         }
         let w_var = transpose_op.inputs[0];
