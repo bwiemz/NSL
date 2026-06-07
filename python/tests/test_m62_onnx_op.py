@@ -114,7 +114,7 @@ def test_make_onnx_node_produces_valid_proto():
     ),
 )
 def test_session_load_and_run_calls_nsl_add():
-    """End-to-end: NSL @export add() invoked through ORT InferenceSession."""
+    """End-to-end: NSL @export scale2() invoked through ORT InferenceSession."""
     import numpy as np
     import onnxruntime as ort
     from onnx import helper, TensorProto
@@ -129,14 +129,16 @@ def test_session_load_and_run_calls_nsl_add():
 
     with tempfile.TemporaryDirectory() as td:
         tmp = Path(td)
-        src = tmp / "add.nsl"
+        # Single-input function: v1 registry kernel infers output shape from
+        # input[0]; multi-input dispatch needs v2 kernel with shape inference.
+        src = tmp / "scale2.nsl"
         src.write_text(
             "@export\n"
-            "fn add(a: Tensor<[4], f32>, b: Tensor<[4], f32>)"
+            "fn scale2(x: Tensor<[4], f32>)"
             " -> Tensor<[4], f32>:\n"
-            "    return a + b\n"
+            "    return x + x\n"
         )
-        lib = tmp / f"add.{_lib_ext()}"
+        lib = tmp / f"scale2.{_lib_ext()}"
 
         env = os.environ.copy()
         stdlib = WORKSPACE / "stdlib"
@@ -163,32 +165,29 @@ def test_session_load_and_run_calls_nsl_add():
         sess_opts = ort.SessionOptions()
         register_nsl_provider(sess_opts, str(lib))
 
-        node = make_onnx_node("add", inputs=["a", "b"], outputs=["c"])
+        node = make_onnx_node("scale2", inputs=["x"], outputs=["y"])
         graph = helper.make_graph(
             nodes=[node],
             name="t",
             inputs=[
-                helper.make_tensor_value_info("a", TensorProto.FLOAT, [4]),
-                helper.make_tensor_value_info("b", TensorProto.FLOAT, [4]),
+                helper.make_tensor_value_info("x", TensorProto.FLOAT, [4]),
             ],
             outputs=[
-                helper.make_tensor_value_info("c", TensorProto.FLOAT, [4]),
+                helper.make_tensor_value_info("y", TensorProto.FLOAT, [4]),
             ],
         )
         model = helper.make_model(
             graph,
             opset_imports=[helper.make_opsetid("com.nsl", 1)],
+            ir_version=8,  # pin to IR 8; ORT 1.22.0 supports up to IR 10
         )
 
         sess = ort.InferenceSession(model.SerializeToString(), sess_opts)
         out = sess.run(
-            ["c"],
-            {
-                "a": np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32),
-                "b": np.array([10.0, 20.0, 30.0, 40.0], dtype=np.float32),
-            },
+            ["y"],
+            {"x": np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32)},
         )
-        assert out[0].tolist() == [11.0, 22.0, 33.0, 44.0]
+        assert out[0].tolist() == [2.0, 4.0, 6.0, 8.0]
 
 
 if __name__ == "__main__":  # pragma: no cover - manual invocation helper

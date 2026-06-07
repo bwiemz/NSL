@@ -50,7 +50,13 @@ fi
 # Generate Rust definitions from the upstream header. Allowlist Ort* and
 # ONNX* names; ignore standard C library types that bindgen would otherwise
 # splat into the output.
+#
+# --formatter=prettyplease: prettyplease is compiled into bindgen as a library,
+# so no external `rustfmt` binary is required. The default formatter in
+# bindgen 0.72.x emits everything on one line, which breaks the line-oriented
+# extract_types grep below.
 bindgen \
+    --formatter=prettyplease \
     --allowlist-type 'Ort.*|ONNX.*' \
     --allowlist-function 'Ort.*|ONNX.*' \
     --allowlist-var 'ORT_.*|ONNX_.*' \

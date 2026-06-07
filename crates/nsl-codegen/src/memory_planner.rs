@@ -812,29 +812,34 @@ pub fn compute_tensor_bytes(
     dtype: &nsl_semantic::types::DType,
 ) -> Option<(u64, SizeKind)> {
     let mut total_elems: u64 = 1;
+    let mut any_bounded = false;
+    let mut symbolic_expr = String::new();
     for dim in &shape.dims {
         match dim {
             nsl_semantic::types::Dim::Concrete(n) => {
                 total_elems = total_elems.saturating_mul(*n as u64);
             }
             nsl_semantic::types::Dim::Bounded { upper_bound, .. } => {
-                // Use upper bound for slab planning
+                // Use upper bound for slab planning. Do NOT return early here —
+                // remaining Concrete dimensions must also be included in the
+                // product (early return was a bug that under-reported tensor
+                // size for shapes like [Concrete(64), Bounded(1024), Concrete(768)]).
                 let ub = *upper_bound as u64;
                 total_elems = total_elems.saturating_mul(ub);
-                let bytes = total_elems * dtype_byte_size(dtype);
-                return Some((
-                    bytes,
-                    SizeKind::Bounded {
-                        upper: bytes,
-                        symbolic_expr: format!("{:?}", shape),
-                    },
-                ));
+                if !any_bounded {
+                    symbolic_expr = format!("{:?}", shape);
+                }
+                any_bounded = true;
             }
             _ => return None, // Dynamic / Wildcard / Symbolic — can't plan
         }
     }
     let bytes = total_elems * dtype_byte_size(dtype);
-    Some((bytes, SizeKind::Static(bytes)))
+    if any_bounded {
+        Some((bytes, SizeKind::Bounded { upper: bytes, symbolic_expr }))
+    } else {
+        Some((bytes, SizeKind::Static(bytes)))
+    }
 }
 
 /// Return the byte size of a DType.
@@ -1954,6 +1959,100 @@ mod tests {
             rematerialize(&allocs, &op_infos, crate::cost_model::REMAT_SCORE_THRESHOLD);
         // Input dies at 10 but recompute point is at 94 — cannot remat
         assert!(recomp_points.is_empty(), "cannot remat if inputs are dead");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// compute_tensor_bytes regression tests — M36 memory-size correctness
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod compute_tensor_bytes_tests {
+    use super::*;
+    use nsl_semantic::types::{Dim, DType, Shape};
+
+    fn make_sym(name: &str) -> nsl_ast::Symbol {
+        let mut interner = nsl_lexer::Interner::new();
+        nsl_ast::Symbol(interner.get_or_intern(name))
+    }
+
+    /// Regression: the old code returned early inside the Bounded arm, dropping
+    /// all Concrete dimensions that followed it.  For
+    /// [Concrete(64), Bounded(max=1024), Concrete(768)] @ F32 the old code
+    /// computed 64*1024*4 = 262_144 bytes instead of 64*1024*768*4 = 201_326_592.
+    #[test]
+    fn bounded_dim_in_middle_trailing_concrete_dims_included() {
+        let s = make_sym("S");
+        let shape = Shape {
+            dims: vec![
+                Dim::Concrete(64),
+                Dim::Bounded { name: s, upper_bound: 1024 },
+                Dim::Concrete(768),
+            ],
+        };
+        let (bytes, kind) = compute_tensor_bytes(&shape, &DType::F32)
+            .expect("plannable shape must return Some");
+        assert_eq!(bytes, 64 * 1024 * 768 * 4,
+            "all dims including those after the Bounded dim must multiply into the byte count");
+        assert!(
+            matches!(kind, SizeKind::Bounded { upper, .. } if upper == 64 * 1024 * 768 * 4),
+            "SizeKind must be Bounded with the full upper bound, not a truncated one"
+        );
+    }
+
+    /// Leading Bounded dim followed by Concrete dims — same invariant.
+    /// Old code: 512*2 = 1_024 bytes.  Correct: 512*32*128*2 = 4_194_304 bytes.
+    #[test]
+    fn bounded_dim_first_trailing_concrete_dims_included() {
+        let s = make_sym("B");
+        let shape = Shape {
+            dims: vec![
+                Dim::Bounded { name: s, upper_bound: 512 },
+                Dim::Concrete(32),
+                Dim::Concrete(128),
+            ],
+        };
+        let (bytes, _) = compute_tensor_bytes(&shape, &DType::Fp16)
+            .expect("plannable shape must return Some");
+        assert_eq!(bytes, 512 * 32 * 128 * 2,
+            "Concrete dims after a leading Bounded dim must be included in the upper bound");
+    }
+
+    /// All-concrete shapes must still return SizeKind::Static (unchanged behavior).
+    #[test]
+    fn all_concrete_shape_returns_static() {
+        let shape = Shape {
+            dims: vec![Dim::Concrete(8), Dim::Concrete(16), Dim::Concrete(32)],
+        };
+        let (bytes, kind) = compute_tensor_bytes(&shape, &DType::F32).unwrap();
+        assert_eq!(bytes, 8 * 16 * 32 * 4);
+        assert!(matches!(kind, SizeKind::Static(_)));
+    }
+
+    /// Multiple Bounded dims: both upper bounds must be used.
+    #[test]
+    fn multiple_bounded_dims_both_included() {
+        let mut interner = nsl_lexer::Interner::new();
+        let s1 = nsl_ast::Symbol(interner.get_or_intern("B"));
+        let s2 = nsl_ast::Symbol(interner.get_or_intern("S"));
+        let shape = Shape {
+            dims: vec![
+                Dim::Bounded { name: s1, upper_bound: 64 },
+                Dim::Bounded { name: s2, upper_bound: 128 },
+            ],
+        };
+        let (bytes, kind) = compute_tensor_bytes(&shape, &DType::F32).unwrap();
+        assert_eq!(bytes, 64 * 128 * 4);
+        assert!(matches!(kind, SizeKind::Bounded { .. }));
+    }
+
+    /// Dynamic dim returns None regardless of position.
+    #[test]
+    fn dynamic_dim_returns_none() {
+        let shape = Shape {
+            dims: vec![Dim::Concrete(64), Dim::Wildcard, Dim::Concrete(128)],
+        };
+        assert!(compute_tensor_bytes(&shape, &DType::F32).is_none());
     }
 }
 
