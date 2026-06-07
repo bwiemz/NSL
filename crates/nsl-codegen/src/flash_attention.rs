@@ -176,10 +176,14 @@ pub struct FlashAttentionConfig {
     /// production path (rope-effectively-off) — Phase 3c-2 will source
     /// non-null tensors per `WIRE-HERE` callouts.
     pub rope_q: bool,
-    /// RoPE pairing convention. Only `RopeStyle::Adjacent` (GPT-NeoX /
-    /// GPT-J: pair `x[2i]` with `x[2i+1]`) is implemented in the kernel
-    /// emitters; `RopeStyle::HalfSplit` (LLaMA / Qwen) is reserved for
-    /// future work (`emit_rope_pair_sweep` asserts on it).
+    /// RoPE pairing convention. The scalar forward emitter handles
+    /// BOTH `RopeStyle::Adjacent` (GPT-NeoX / GPT-J: pair `x[2i]`
+    /// with `x[2i+1]`) and `RopeStyle::HalfSplit` (LLaMA / Qwen: pair
+    /// `x[i]` with `x[i + hd/2]`) — see `flash_attention.rs:1324` for
+    /// the match. The CSHA-fused kernel emitter (`emit_rope_pair_sweep`
+    /// in `csha_hooks.rs`) currently only implements `Adjacent` and
+    /// asserts on `HalfSplit`; CSHA-fused `HalfSplit` support is
+    /// reserved for future work.
     pub rope_style: RopeStyle,
     /// Grouped-query attention group size: `H_q / H_kv`. `1` is MHA
     /// (no sharing); `8` is typical for Llama-3-8B. Cycle-1 Sprint 5
