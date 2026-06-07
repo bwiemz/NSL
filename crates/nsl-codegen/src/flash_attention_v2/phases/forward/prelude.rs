@@ -145,6 +145,18 @@ pub fn emit_with_smem_override(
     if config.segment_masked && config.rope_q {
         params.push((".param .u64", "doc_starts_ptr"));
     }
+    // §4.3 attention sinks (Sprint 1b cycle-7): sink K/V pointers only
+    // when num_sink_tokens > 0. Appended at the tail so num_sink_tokens=0
+    // signatures stay byte-identical to pre-Sprint-1b (the snapshot
+    // invariant). Conditional emission mirrors the cycle-3 review-fix
+    // pattern: only declared in PTX when the feature is actually live;
+    // the runtime FFI dispatch site (Sprint 1b Task E in
+    // nsl-runtime::flash_attention) threads the matching pointers
+    // through only on the sink-enabled launch path.
+    if config.num_sink_tokens > 0 {
+        params.push((".param .u64", "sink_k_ptr"));
+        params.push((".param .u64", "sink_v_ptr"));
+    }
     // PCA Tier B M3 instrumentation (B1.5-3): per-tile skip-decision HBM
     // buffer pointer. Only declared when:
     //   1. Tier B is being emitted (tier_b is Some + budget admits), AND
@@ -334,6 +346,18 @@ pub fn emit_with_smem_override(
         ptx.push_str("    .reg .b16 %rs_doc_seg;\n");
         ptx.push_str("    .reg .s32 %r_doc_start, %r_effective_pos_q, %r_effective_pos_k;\n");
         ptx.push_str("    .reg .pred %p_doc_load_done;\n");
+    }
+
+    // §4.3 attention sinks (Sprint 1b cycle-7): named registers for the
+    // sink K/V pre-load emitted by emit_{k,v}_tile_load. Gated on
+    // num_sink_tokens > 0 so disabled-sinks PTX is byte-identical to
+    // pre-Sprint-1b (snapshot invariant). The named registers (not pool
+    // slots) avoid collisions with the existing %rd<64> / %p<8> numbered
+    // pools that the rolling-load arithmetic uses.
+    if config.num_sink_tokens > 0 {
+        ptx.push_str("    // sinks v1: sink K/V pre-load scratch registers\n");
+        ptx.push_str("    .reg .u64 %rd_sink_base, %rd_sink_idx, %rd_sink_off, %rd_sink_src, %rd_sink_dst;\n");
+        ptx.push_str("    .reg .pred %p_sink;\n");
     }
 
     // PCA Tier A: segment-mask helper scratch registers + SMEM buffer.

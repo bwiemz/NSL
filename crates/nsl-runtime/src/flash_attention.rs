@@ -2806,6 +2806,125 @@ pub extern "C" fn nsl_rope_cache_write(
 ///     ds = p * (dp - D[i])                                   -- softmax backward
 ///     dQ[i] += ds * K[j] * scale
 ///     dK[j] += ds * Q[i] * scale
+/// §4.3 attention sinks (Sprint 1b cycle-7) FFI null-pointer guard.
+///
+/// Returns `Ok(())` when sinks are disabled (`num_sink_tokens == 0`) OR
+/// when both `sink_k_ptr` and `sink_v_ptr` are non-null. Returns
+/// `Err(...)` with a precise diagnostic naming which pointer is null
+/// when sinks are enabled but one or both pointers were passed as zero.
+///
+/// **Why this exists**: when codegen emits a sinks-enabled kernel
+/// (`num_sink_tokens > 0`), the kernel issues `ld.global.b16
+/// [sink_k_ptr + ...]` / `ld.global.b16 [sink_v_ptr + ...]`
+/// unconditionally for every thread in the cooperative pre-load. A
+/// null pointer there causes `CUDA_ERROR_ILLEGAL_ADDRESS` at the first
+/// access — silent-corruption-free, but with a useless device-side
+/// diagnostic. Catching the null case host-side gives the user a
+/// clear, actionable error pointing at the FFI dispatch.
+///
+/// **FFI wiring deferred**: the production `nsl_flash_attention` FFI
+/// does not yet thread `sink_k_ptr`/`sink_v_ptr` through its signature
+/// (the cascade of Cranelift call-site updates exceeds the Sprint 1b
+/// 100-LOC budget per the spec's failure-policy guidance). The
+/// validator is exposed here so the codegen-side eligibility check can
+/// be paired with a host-side null-ptr check at the eventual FFI
+/// landing site without refactoring this helper.
+pub fn validate_sinks_pointers_nonnull(
+    num_sink_tokens: u32,
+    sink_k_ptr: i64,
+    sink_v_ptr: i64,
+) -> Result<(), String> {
+    if num_sink_tokens == 0 {
+        return Ok(());
+    }
+    if sink_k_ptr == 0 && sink_v_ptr == 0 {
+        return Err(format!(
+            "nsl_flash_attention: num_sink_tokens={} > 0 requires non-null sink_k_ptr and sink_v_ptr (got sink_k_ptr=0x0, sink_v_ptr=0x0)",
+            num_sink_tokens
+        ));
+    }
+    if sink_k_ptr == 0 {
+        return Err(format!(
+            "nsl_flash_attention: num_sink_tokens={} > 0 requires non-null sink_k_ptr (got sink_k_ptr=0x0)",
+            num_sink_tokens
+        ));
+    }
+    if sink_v_ptr == 0 {
+        return Err(format!(
+            "nsl_flash_attention: num_sink_tokens={} > 0 requires non-null sink_v_ptr (got sink_v_ptr=0x0)",
+            num_sink_tokens
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod sinks_validator_tests {
+    use super::validate_sinks_pointers_nonnull;
+
+    #[test]
+    fn zero_sinks_accepts_both_null() {
+        // Sentinel: when sinks are disabled, the validator must accept
+        // null pointers (callers will pass 0 for the disabled path).
+        assert!(validate_sinks_pointers_nonnull(0, 0, 0).is_ok());
+    }
+
+    #[test]
+    fn zero_sinks_accepts_arbitrary_ptrs() {
+        // Sentinel disabled: pointer values are ignored.
+        assert!(validate_sinks_pointers_nonnull(0, 0xdead, 0xbeef).is_ok());
+    }
+
+    #[test]
+    fn nonzero_sinks_accepts_both_nonnull() {
+        assert!(validate_sinks_pointers_nonnull(4, 0xdead, 0xbeef).is_ok());
+    }
+
+    #[test]
+    fn nonzero_sinks_rejects_both_null_naming_both() {
+        let err = validate_sinks_pointers_nonnull(4, 0, 0)
+            .expect_err("both null with sinks enabled must reject");
+        assert!(
+            err.contains("sink_k_ptr") && err.contains("sink_v_ptr"),
+            "error must name BOTH missing pointers: {}",
+            err
+        );
+        assert!(err.contains("num_sink_tokens=4"));
+    }
+
+    #[test]
+    fn nonzero_sinks_rejects_null_k_naming_k() {
+        let err = validate_sinks_pointers_nonnull(4, 0, 0xbeef)
+            .expect_err("null sink_k_ptr with sinks enabled must reject");
+        assert!(
+            err.contains("sink_k_ptr"),
+            "error must name the missing sink_k_ptr: {}",
+            err
+        );
+        assert!(
+            !err.contains("sink_v_ptr"),
+            "error must NOT name sink_v_ptr when only k is null: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn nonzero_sinks_rejects_null_v_naming_v() {
+        let err = validate_sinks_pointers_nonnull(4, 0xdead, 0)
+            .expect_err("null sink_v_ptr with sinks enabled must reject");
+        assert!(
+            err.contains("sink_v_ptr"),
+            "error must name the missing sink_v_ptr: {}",
+            err
+        );
+        assert!(
+            !err.contains("sink_k_ptr"),
+            "error must NOT name sink_k_ptr when only v is null: {}",
+            err
+        );
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn flash_attention_backward_cpu(
     q: &[f32], k: &[f32], v: &[f32],

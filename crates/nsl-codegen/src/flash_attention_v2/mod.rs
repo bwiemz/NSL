@@ -416,14 +416,64 @@ pub fn synthesize_flash_attention_ptx_v2_with_tier_b(
 /// overwriting the fused result.  When `csha_wk_ptr` is null (caller
 /// pre-projected K/V via classic k_ptr) the load runs normally.
 fn emit_k_tile_load(ptx: &mut String, config: &FlashAttentionConfig, q_iter: u32) {
-    // §4.3 attention sinks (Sprint 1a precursor): the load loop covers
-    // `effective_block_kv` rows so the K SMEM slab matches the bound that
-    // s_compute / softmax / pv_accum / sp_bytes use. At num_sink_tokens==0
-    // this is identical to `config.block_kv` (byte-identity invariant).
-    let total_k_elems = (sinks::effective_block_kv(config) as u32) * (config.head_dim as u32);
+    // §4.3 attention sinks (Sprint 1a precursor): the rolling load covers
+    // `block_kv` rows; when sinks are enabled the sink pre-load below
+    // covers an additional `num_sink_tokens` rows so the K SMEM slab
+    // matches `effective_block_kv` rows that s_compute / softmax /
+    // pv_accum / sp_bytes consume. At num_sink_tokens==0 this is
+    // identical to `config.block_kv` and emits byte-identical PTX
+    // (snapshot invariant).
+    let rolling_k_elems = (config.block_kv as u32) * (config.head_dim as u32);
     let fused_k = config.csha.as_ref().is_some_and(|c| c.fused_projections);
+    let kv_off = smem_layout::kv_offset(config);
+    let n_sink = config.num_sink_tokens;
+    let head_dim = config.head_dim as u32;
+    // SMEM byte offset of the rolling K rows: skip past the sink slab if
+    // sinks are enabled. At num_sink_tokens==0 this is `kv_off` —
+    // byte-identical to pre-Sprint-1b.
+    let rolling_kv_off = kv_off + n_sink * head_dim * 2;
 
     ptx.push_str("    // K tile load: 128 threads cooperatively load block_kv*head_dim elems\n");
+
+    // §4.3 sinks (Sprint 1b cycle-7): emit sink K pre-load at the front
+    // of the KV SMEM slab. Reads `num_sink_tokens * head_dim` f16 values
+    // from `sink_k_ptr` (the producer materialises sinks at narrow
+    // precision; see runtime FFI Task E for the null-ptr guard). Falls
+    // through to the rolling K load below which writes to a shifted SMEM
+    // offset so it doesn't stomp on the sinks. Skipped entirely when
+    // num_sink_tokens==0 → byte-identical to pre-Sprint-1b.
+    if n_sink > 0 {
+        let sink_elems = n_sink * head_dim;
+        ptx.push_str(&format!(
+            "    // sinks v1: pre-load {n_sink} sink K rows from sink_k_ptr -> kv_offset (front of slab)\n"
+        ));
+        ptx.push_str("    ld.param.u64 %rd_sink_base, [sink_k_ptr];\n");
+        ptx.push_str("    cvt.u64.u32 %rd_sink_idx, %tid_x;\n");
+        ptx.push_str(&format!("V2_LOOP_K_SINK_LOAD_{}:\n", q_iter));
+        ptx.push_str(&format!(
+            "    setp.lt.u64 %p_sink, %rd_sink_idx, {sink_elems};\n"
+        ));
+        ptx.push_str(&format!(
+            "    @!%p_sink bra V2_K_SINK_LOAD_DONE_{};\n",
+            q_iter
+        ));
+        // Sink table is f16 (2 bytes/elem) — matches sink_slab_bytes().
+        ptx.push_str("    shl.b64 %rd_sink_off, %rd_sink_idx, 1;\n");
+        ptx.push_str("    add.u64 %rd_sink_src, %rd_sink_base, %rd_sink_off;\n");
+        ptx.push_str("    ld.global.b16 %h0, [%rd_sink_src];\n");
+        // SMEM dest at kv_offset + idx * 2 (f16 stride).
+        ptx.push_str(&format!(
+            "    add.u64 %rd_sink_dst, %rd_sink_off, {kv_off};\n"
+        ));
+        ptx.push_str("    add.u64 %rd_sink_dst, %rd_sink_dst, %shmem_base;\n");
+        ptx.push_str("    st.shared.b16 [%rd_sink_dst], %h0;\n");
+        ptx.push_str("    add.u64 %rd_sink_idx, %rd_sink_idx, 128;\n");
+        ptx.push_str(&format!(
+            "    bra V2_LOOP_K_SINK_LOAD_{};\n",
+            q_iter
+        ));
+        ptx.push_str(&format!("V2_K_SINK_LOAD_DONE_{}:\n", q_iter));
+    }
 
     // When fused K projection is enabled, null-guard the HBM load: if
     // csha_wk_ptr is non-null the projection already filled SMEM; skip.
@@ -468,16 +518,26 @@ fn emit_k_tile_load(ptx: &mut String, config: &FlashAttentionConfig, q_iter: u32
     ptx.push_str("    ld.global.f32 %f0, [%rd61];\n");
     ptx.push_str("    cvt.rn.f16.f32 %h0, %f0;\n");
     ptx.push_str("    shl.b64 %rd60, %rd59, 1;\n");
-    ptx.push_str(&format!(
-        "    add.u64 %rd60, %rd60, {};                 // + kv_offset\n",
-        smem_layout::kv_offset(config)
-    ));
+    // Preserve pre-Sprint-1b comment text at num_sink_tokens=0 (snapshot
+    // byte-identity invariant); add a sink-slab note only when sinks
+    // shift the SMEM destination.
+    if n_sink == 0 {
+        ptx.push_str(&format!(
+            "    add.u64 %rd60, %rd60, {};                 // + kv_offset\n",
+            rolling_kv_off
+        ));
+    } else {
+        ptx.push_str(&format!(
+            "    add.u64 %rd60, %rd60, {};                 // + kv_offset + sink slab\n",
+            rolling_kv_off
+        ));
+    }
     ptx.push_str("    add.u64 %smem_addr, %rd60, %shmem_base;\n");
     ptx.push_str("    st.shared.b16 [%smem_addr], %h0;\n");
     ptx.push_str("    add.u64 %rd59, %rd59, 128;\n");
     ptx.push_str(&format!(
         "    setp.lt.u64 %p0, %rd59, {};\n",
-        total_k_elems
+        rolling_k_elems
     ));
     ptx.push_str(&format!("    @%p0 bra V2_LOOP_K_LOAD_{};\n", q_iter));
 
@@ -495,10 +555,52 @@ fn emit_k_tile_load(ptx: &mut String, config: &FlashAttentionConfig, q_iter: u32
 /// HBM load to avoid overwriting the fused result.
 fn emit_v_tile_load(ptx: &mut String, config: &FlashAttentionConfig, q_iter: u32) {
     // §4.3 attention sinks (Sprint 1a precursor): see emit_k_tile_load.
-    let total_v_elems = (sinks::effective_block_kv(config) as u32) * (config.head_dim as u32);
+    // The rolling load covers `block_kv` rows; when sinks are enabled the
+    // sink pre-load below covers an additional `num_sink_tokens` rows so
+    // the V SMEM slab matches `effective_block_kv` rows. At
+    // num_sink_tokens==0 emits byte-identical PTX to pre-Sprint-1b.
+    let rolling_v_elems = (config.block_kv as u32) * (config.head_dim as u32);
     let fused_v = config.csha.as_ref().is_some_and(|c| c.fused_projections);
+    let kv_off = smem_layout::kv_offset(config);
+    let n_sink = config.num_sink_tokens;
+    let head_dim = config.head_dim as u32;
+    let rolling_kv_off = kv_off + n_sink * head_dim * 2;
 
     ptx.push_str("    // V tile load: cooperative, reuses K region\n");
+
+    // §4.3 sinks (Sprint 1b cycle-7): emit sink V pre-load at the front
+    // of the KV SMEM slab. Symmetric to the K sink pre-load. Skipped
+    // entirely when num_sink_tokens==0 → byte-identical to pre-Sprint-1b.
+    if n_sink > 0 {
+        let sink_elems = n_sink * head_dim;
+        ptx.push_str(&format!(
+            "    // sinks v1: pre-load {n_sink} sink V rows from sink_v_ptr -> kv_offset (front of slab)\n"
+        ));
+        ptx.push_str("    ld.param.u64 %rd_sink_base, [sink_v_ptr];\n");
+        ptx.push_str("    cvt.u64.u32 %rd_sink_idx, %tid_x;\n");
+        ptx.push_str(&format!("V2_LOOP_V_SINK_LOAD_{}:\n", q_iter));
+        ptx.push_str(&format!(
+            "    setp.lt.u64 %p_sink, %rd_sink_idx, {sink_elems};\n"
+        ));
+        ptx.push_str(&format!(
+            "    @!%p_sink bra V2_V_SINK_LOAD_DONE_{};\n",
+            q_iter
+        ));
+        ptx.push_str("    shl.b64 %rd_sink_off, %rd_sink_idx, 1;\n");
+        ptx.push_str("    add.u64 %rd_sink_src, %rd_sink_base, %rd_sink_off;\n");
+        ptx.push_str("    ld.global.b16 %h0, [%rd_sink_src];\n");
+        ptx.push_str(&format!(
+            "    add.u64 %rd_sink_dst, %rd_sink_off, {kv_off};\n"
+        ));
+        ptx.push_str("    add.u64 %rd_sink_dst, %rd_sink_dst, %shmem_base;\n");
+        ptx.push_str("    st.shared.b16 [%rd_sink_dst], %h0;\n");
+        ptx.push_str("    add.u64 %rd_sink_idx, %rd_sink_idx, 128;\n");
+        ptx.push_str(&format!(
+            "    bra V2_LOOP_V_SINK_LOAD_{};\n",
+            q_iter
+        ));
+        ptx.push_str(&format!("V2_V_SINK_LOAD_DONE_{}:\n", q_iter));
+    }
 
     // When fused V projection is enabled, null-guard: skip if csha_wv_ptr != 0.
     if fused_v {
@@ -539,16 +641,26 @@ fn emit_v_tile_load(ptx: &mut String, config: &FlashAttentionConfig, q_iter: u32
     ptx.push_str("    ld.global.f32 %f0, [%rd61];\n");
     ptx.push_str("    cvt.rn.f16.f32 %h0, %f0;\n");
     ptx.push_str("    shl.b64 %rd60, %rd59, 1;\n");
-    ptx.push_str(&format!(
-        "    add.u64 %rd60, %rd60, {};\n",
-        smem_layout::kv_offset(config)
-    ));
+    // Preserve pre-Sprint-1b emission verbatim at num_sink_tokens=0
+    // (the V-load line had NO trailing comment originally); add a
+    // sink-slab note only when sinks shift the SMEM destination.
+    if n_sink == 0 {
+        ptx.push_str(&format!(
+            "    add.u64 %rd60, %rd60, {};\n",
+            rolling_kv_off
+        ));
+    } else {
+        ptx.push_str(&format!(
+            "    add.u64 %rd60, %rd60, {};                 // + kv_offset + sink slab\n",
+            rolling_kv_off
+        ));
+    }
     ptx.push_str("    add.u64 %smem_addr, %rd60, %shmem_base;\n");
     ptx.push_str("    st.shared.b16 [%smem_addr], %h0;\n");
     ptx.push_str("    add.u64 %rd59, %rd59, 128;\n");
     ptx.push_str(&format!(
         "    setp.lt.u64 %p0, %rd59, {};\n",
-        total_v_elems
+        rolling_v_elems
     ));
     ptx.push_str(&format!("    @%p0 bra V2_LOOP_V_LOAD_{};\n", q_iter));
 

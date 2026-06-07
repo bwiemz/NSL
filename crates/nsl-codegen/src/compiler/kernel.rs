@@ -960,13 +960,16 @@ impl Compiler<'_> {
         // materialize the sink cache is DEFERRED to a future sprint.
         // `0` is the sentinel for "sinks disabled".
         //
-        // Sprint 2 cycle-5: the only previous assignment site has been
-        // replaced with a refusal (see `attention_sink` arm below), so
-        // this binding is currently always `0` at the three
-        // FlashAttentionConfig construction sites. When SMEM emission
-        // lands, restore the `mut` qualifier and the
-        // `num_sink_tokens = *n as u32` assignment in the decorator arm.
-        let num_sink_tokens: u32 = 0;
+        // Sprint 2 cycle-5: the only previous assignment site was replaced
+        // with an unconditional refusal in the `attention_sink` arm below.
+        // Sprint 1b cycle-7 LIFTS that refusal for the narrow Tier A
+        // forward single-tile config — the decorator-extraction arm now
+        // assigns `num_sink_tokens = N` for any `tokens=N` literal, and
+        // each FlashAttentionConfig construction site below consults
+        // `attention_sinks_v1_eligible` to refuse non-narrow configs with
+        // an axis-specific blocking reason + future Sprint citation
+        // (cycle-5 `feedback_deferral_must_refuse` invariant).
+        let mut num_sink_tokens: u32 = 0;
         // DOC-GAP F.2: optional `head_dim` argument on `@flash_attention`.
         // Default 64 matches historical behaviour; set explicitly via
         // `@flash_attention(head_dim=32)` to pick a config that fits the
@@ -1086,24 +1089,24 @@ impl Compiler<'_> {
                 }
                 "attention_sink" => {
                     // Sprint 2 cycle-4 paper §4.3 API-surface landing.
-                    // v0: extract `tokens=N` arg into `config.num_sink_tokens`;
-                    // the SMEM cache emission that would actually pin the
-                    // first N tokens is DEFERRED to a future sprint.
+                    // Sprint 2 cycle-5 added an unconditional refusal for
+                    // `tokens>0` to close the silent-correctness gap that
+                    // v0 left open (decorator parsed, but no SMEM emission).
+                    // Sprint 1b cycle-7 (this commit) LIFTS that refusal
+                    // for the narrow Tier A forward single-tile config —
+                    // assign `num_sink_tokens = N` here and let the
+                    // per-construction-site `attention_sinks_v1_eligible`
+                    // check below refuse non-narrow configs with an axis-
+                    // specific blocking reason + future Sprint citation.
+                    //
                     // Semantic validation (`stmt.rs`) catches negative /
                     // zero / non-literal / unknown-arg cases up front,
-                    // so this loop only handles the happy path.
-                    //
-                    // Sprint 2 cycle-5 (this commit) closes the silent-
-                    // correctness gap that v0 left open: a user writing
-                    // `@attention_sink(tokens=4)` would have compiled
-                    // cleanly and run as if sinks were disabled, with no
-                    // error or warning. Refuse the configuration HERE,
-                    // at the decorator-extraction site, so the error
-                    // lands as close to the user's source as possible.
-                    // tokens=0 cannot be written (semantic rejects it);
-                    // users who want sinks disabled simply omit the
-                    // decorator entirely (num_sink_tokens stays at the
-                    // local-default 0 and flows through unchanged).
+                    // so this loop only handles the happy path. tokens=0
+                    // cannot be written (semantic rejects it); users who
+                    // want sinks disabled simply OMIT the decorator
+                    // (num_sink_tokens stays at the local-default 0 and
+                    // flows through eligibility unchanged via the early
+                    // `if config.num_sink_tokens == 0` return).
                     if let Some(ref args) = deco.args {
                         for arg in args {
                             if let Some(ref name_sym) = arg.name {
@@ -1114,10 +1117,7 @@ impl Compiler<'_> {
                                 if aname == "tokens" {
                                     if let ExprKind::IntLiteral(n) = &arg.value.kind {
                                         if *n > 0 {
-                                            return Err(CodegenError::new(
-                                                "@attention_sink(tokens=N) configured but SMEM cache emission is deferred to a future sprint (paper §4.3 v1). num_sink_tokens > 0 is currently not supported at codegen. To disable sinks, omit the decorator (tokens=0 is rejected by the semantic checker per cycle-4 Sprint 2 Rule 3a)."
-                                                    .to_string(),
-                                            ));
+                                            num_sink_tokens = *n as u32;
                                         }
                                     }
                                 }
@@ -1137,6 +1137,42 @@ impl Compiler<'_> {
         // sm_52 limit. When paged, block_kv must be a multiple of block_size.
         // The "primary" context uses the middle-value fallback (or the single
         // default when @autotune is absent).
+
+        // Sprint 1b cycle-7: helper to reject @attention_sink configs that
+        // are not v1-narrow. Called at EACH FlashAttentionConfig
+        // construction site below (one for each path: autotune-variant,
+        // autotune-primary, single-config) so the eligibility check sees
+        // the FULLY-MATERIALIZED config and the error message names the
+        // exact failing axis + future Sprint that lifts it.
+        //
+        // Header format makes the user's input visible up front (`@attention_sink(tokens={n})`)
+        // and the body cites paper §4.3 v1 narrowness + the eligibility
+        // predicate's blocking_reason (axis + Sprint). Disabled-sinks
+        // (num_sink_tokens==0) configs short-circuit eligibility and never
+        // hit this path.
+        fn reject_if_sinks_ineligible(
+            config: &crate::flash_attention::FlashAttentionConfig,
+        ) -> Result<(), CodegenError> {
+            if config.num_sink_tokens == 0 {
+                return Ok(());
+            }
+            let (eligible, why) =
+                crate::flash_attention_v2::sinks::attention_sinks_v1_eligible(config);
+            if eligible {
+                return Ok(());
+            }
+            let blocking = why.unwrap_or("(unknown axis)");
+            Err(CodegenError::new(format!(
+                "@attention_sink(tokens={n}) - v1 narrowness violation: {blocking}.\n\n\
+                 v1 supports: Tier A scalar forward, single-tile \
+                 (block_q==block_kv==seq_len), causal=false, rope_q=false, \
+                 gqa_group_size=1, paged=false, segment_masked=false, \
+                 tree_mask=false, no @train (no backward), no \
+                 csha.fused_projections.",
+                n = config.num_sink_tokens,
+                blocking = blocking,
+            )))
+        }
 
         let has_autotune = decorators.iter().any(|d| {
             d.name.len() == 1 && self.interner.resolve(d.name[0].0).unwrap_or("") == "autotune"
@@ -1205,6 +1241,9 @@ impl Compiler<'_> {
                     segment_masked: false,
                     csha: None,
                 };
+
+                // Sprint 1b cycle-7: @attention_sink v1 narrowness check.
+                reject_if_sinks_ineligible(&test_config)?;
 
                 // Shared memory validation: (block_q + block_kv) * head_dim * 2 <= 49152 (48KB)
                 let mut diags = Vec::<String>::new();
@@ -1285,6 +1324,9 @@ impl Compiler<'_> {
                 segment_masked: false,
                 csha: None,
             };
+
+            // Sprint 1b cycle-7: @attention_sink v1 narrowness check.
+            reject_if_sinks_ineligible(&config)?;
 
             let mut diags = Vec::<String>::new();
             let kernel_name = crate::flash_attention_selector::flash_attention_kernel_name_selected_with_diag(
@@ -1393,6 +1435,9 @@ impl Compiler<'_> {
                 segment_masked: false,
                 csha: None,
             };
+
+            // Sprint 1b cycle-7: @attention_sink v1 narrowness check.
+            reject_if_sinks_ineligible(&config)?;
 
             // PCA Tier B Planner (planner spec §5): use the emission helper.
             // Single-config path sets `segment_masked: false`, so

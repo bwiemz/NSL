@@ -306,9 +306,17 @@ pub fn kv_offset(config: &FlashAttentionConfig) -> u32 {
     (config.block_q * config.head_dim * 2) as u32
 }
 
-/// S/P scratch region starts immediately after the KV tile (block_kv × head_dim × 2 bytes, f16).
+/// S/P scratch region starts immediately after the KV tile.
+///
+/// KV slab spans `effective_block_kv × head_dim × 2` bytes — at
+/// `num_sink_tokens == 0` this is identical to
+/// `block_kv × head_dim × 2` (byte-identity invariant); when sinks are
+/// enabled (Sprint 1b cycle-7) the sink rows are pinned at the front of
+/// the slab and the SP region shifts up by `sink_slab_bytes(config)` so
+/// the rolling K/V rows don't stomp it.
 pub fn sp_offset(config: &FlashAttentionConfig) -> u32 {
-    kv_offset(config) + (config.block_kv * config.head_dim * 2) as u32
+    let effective_bkv = crate::flash_attention_v2::sinks::effective_block_kv(config) as u32;
+    kv_offset(config) + effective_bkv * (config.head_dim as u32) * 2
 }
 
 /// S/P scratch region size (bytes).
