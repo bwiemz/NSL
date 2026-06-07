@@ -1557,6 +1557,78 @@ impl<'a> WengertExtractor<'a> {
         self.list.ops.push(op);
     }
 
+    /// CFTP §4.4 G3 (Sprint v3-1) — auto-substitution pattern matcher.
+    ///
+    /// Walks the Wengert list backwards from `logits_var` looking for the
+    /// canonical stdlib `fused_linear_ce` decomposition:
+    ///
+    /// ```text
+    ///   logits_var = Add(Matmul(x, Transpose(W, 0, 1)), bias)
+    /// ```
+    ///
+    /// On match, returns `Some((x_var, W_var, bias_var))`. Returns `None` on
+    /// any structural mismatch (different op chain, missing transpose,
+    /// missing bias add, producers not present in `self.list`, etc.).
+    ///
+    /// The caller (the `"cross_entropy"` builtin recognition arm) checks
+    /// `Some(_)` together with `fused_ce_config.enabled` AND fully-populated
+    /// shape hints before emitting a `PrimalOp::FusedLinearCe` substitution.
+    /// In all other cases the caller falls through to the standard
+    /// `PrimalOp::CrossEntropyLoss` lowering — preserving the regression
+    /// invariant that programs without `@fused_lm_ce` keep the composite path.
+    ///
+    /// Edge cases handled:
+    ///   * `bias` is required by v1's fused FFI signature, so a bare
+    ///     `Matmul(x, Transpose(W))` (no add) does NOT match.
+    ///   * `Transpose` must be over `{dim0:0, dim1:1}` — matching the stdlib
+    ///     `transpose(W, 0, 1)` rewrite. Other transposes are intentionally
+    ///     refused so we don't auto-substitute a user's bespoke W layout.
+    ///   * Add operands may appear in either order:
+    ///     `Add(Matmul(...), bias)` and `Add(bias, Matmul(...))` both match.
+    fn try_match_fused_linear_ce_pattern(
+        &self,
+        logits_var: VarId,
+    ) -> Option<(VarId, VarId, VarId)> {
+        let add_op = self.list.find_producer(logits_var)?;
+        if !matches!(add_op.op, PrimalOp::Add) {
+            return None;
+        }
+        if add_op.inputs.len() != 2 {
+            return None;
+        }
+        // Inspect both Add operands — Matmul may be on either side.
+        let lhs = add_op.inputs[0];
+        let rhs = add_op.inputs[1];
+        let lhs_op = self.list.find_producer(lhs);
+        let rhs_op = self.list.find_producer(rhs);
+        let (matmul_op, bias_var) = match (
+            lhs_op.map(|o| &o.op),
+            rhs_op.map(|o| &o.op),
+        ) {
+            (Some(PrimalOp::Matmul), _) => (lhs_op?, rhs),
+            (_, Some(PrimalOp::Matmul)) => (rhs_op?, lhs),
+            _ => return None,
+        };
+        if matmul_op.inputs.len() != 2 {
+            return None;
+        }
+        let x_var = matmul_op.inputs[0];
+        let w_transposed_var = matmul_op.inputs[1];
+        let transpose_op = self.list.find_producer(w_transposed_var)?;
+        // The stdlib `fused_linear_ce` does `transpose(W, 0, 1)` — match
+        // exactly that. Refuse other transpose dims so we don't silently
+        // mis-substitute a user's bespoke layout.
+        match transpose_op.op {
+            PrimalOp::Transpose { dim0: 0, dim1: 1 } => {}
+            _ => return None,
+        }
+        if transpose_op.inputs.len() != 1 {
+            return None;
+        }
+        let w_var = transpose_op.inputs[0];
+        Some((x_var, w_var, bias_var))
+    }
+
     fn extract_int_literal(expr: &nsl_ast::expr::Expr) -> Option<i64> {
         match &expr.kind {
             ExprKind::IntLiteral(v) => Some(*v),
