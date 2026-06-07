@@ -948,17 +948,17 @@ model AxNet:
     const ACTIVATION_NORM_SEARCHABLE: &str = r#"
 @search(activation, ["silu", "swiglu"])
 @search(norm, ["rmsnorm"])
-model GroupedQueryAttention(d_model: int, n_heads: int, n_kv_heads: int, dropout_p: float):
+model GroupedQueryAttention(d_model: int, n_heads: int, n_kv_heads: int, head_dim: int, dropout_p: float):
     wq: Tensor = randn([d_model, d_model])
 model SwiGLUFFN(d_model: int, d_ff: int, dropout_p: float):
     w_gate: Tensor = randn([d_model, d_ff])
-model TransformerBlock(d_model: int, n_heads: int, n_kv_heads: int, d_ff: int, dropout_p: float):
-    attn: GroupedQueryAttention = GroupedQueryAttention(d_model, n_heads, n_kv_heads, dropout_p)
+model TransformerBlock(d_model: int, n_heads: int, n_kv_heads: int, head_dim: int, d_ff: int, dropout_p: float):
+    attn: GroupedQueryAttention = GroupedQueryAttention(d_model, n_heads, n_kv_heads, head_dim, dropout_p)
     ffn: SwiGLUFFN = SwiGLUFFN(d_model, d_ff, dropout_p)
     norm: RMSNorm = RMSNorm(d_model)
 model ActNormNet:
     embed: Tensor = randn([4096, 384]) * full([1], 0.02)
-    blocks: [TransformerBlock; 6] = TransformerBlock(384, 6, 3, 1024, 0.1)
+    blocks: [TransformerBlock; 6] = TransformerBlock(384, 6, 3, 64, 1024, 0.1)
 "#;
 
     #[test]
@@ -986,17 +986,17 @@ model ActNormNet:
         // `@search(actvation, ["silu"])` — note the typo.  Must return UnknownSearchAxis.
         let src = r#"
 @search(actvation, ["silu"])
-model GroupedQueryAttention(d_model: int, n_heads: int, n_kv_heads: int, dropout_p: float):
+model GroupedQueryAttention(d_model: int, n_heads: int, n_kv_heads: int, head_dim: int, dropout_p: float):
     wq: Tensor = randn([d_model, d_model])
 model SwiGLUFFN(d_model: int, d_ff: int, dropout_p: float):
     w_gate: Tensor = randn([d_model, d_ff])
-model TransformerBlock(d_model: int, n_heads: int, n_kv_heads: int, d_ff: int, dropout_p: float):
-    attn: GroupedQueryAttention = GroupedQueryAttention(d_model, n_heads, n_kv_heads, dropout_p)
+model TransformerBlock(d_model: int, n_heads: int, n_kv_heads: int, head_dim: int, d_ff: int, dropout_p: float):
+    attn: GroupedQueryAttention = GroupedQueryAttention(d_model, n_heads, n_kv_heads, head_dim, dropout_p)
     ffn: SwiGLUFFN = SwiGLUFFN(d_model, d_ff, dropout_p)
     norm: RMSNorm = RMSNorm(d_model)
 model TypoAxisNet:
     embed: Tensor = randn([4096, 384]) * full([1], 0.02)
-    blocks: [TransformerBlock; 6] = TransformerBlock(384, 6, 3, 1024, 0.1)
+    blocks: [TransformerBlock; 6] = TransformerBlock(384, 6, 3, 64, 1024, 0.1)
 "#;
         let (module, interner) = parse(src);
         let resolve = |s: nsl_ast::Symbol| interner.resolve(s.0).unwrap_or("").to_string();
@@ -1011,17 +1011,17 @@ model TypoAxisNet:
     fn unrecognized_activation_returns_error() {
         let src = r#"
 @search(activation, ["bogus_act"])
-model GroupedQueryAttention(d_model: int, n_heads: int, n_kv_heads: int, dropout_p: float):
+model GroupedQueryAttention(d_model: int, n_heads: int, n_kv_heads: int, head_dim: int, dropout_p: float):
     wq: Tensor = randn([d_model, d_model])
 model SwiGLUFFN(d_model: int, d_ff: int, dropout_p: float):
     w_gate: Tensor = randn([d_model, d_ff])
-model TransformerBlock(d_model: int, n_heads: int, n_kv_heads: int, d_ff: int, dropout_p: float):
-    attn: GroupedQueryAttention = GroupedQueryAttention(d_model, n_heads, n_kv_heads, dropout_p)
+model TransformerBlock(d_model: int, n_heads: int, n_kv_heads: int, head_dim: int, d_ff: int, dropout_p: float):
+    attn: GroupedQueryAttention = GroupedQueryAttention(d_model, n_heads, n_kv_heads, head_dim, dropout_p)
     ffn: SwiGLUFFN = SwiGLUFFN(d_model, d_ff, dropout_p)
     norm: RMSNorm = RMSNorm(d_model)
 model BadActNet:
     embed: Tensor = randn([4096, 384]) * full([1], 0.02)
-    blocks: [TransformerBlock; 6] = TransformerBlock(384, 6, 3, 1024, 0.1)
+    blocks: [TransformerBlock; 6] = TransformerBlock(384, 6, 3, 64, 1024, 0.1)
 "#;
         let (module, interner) = parse(src);
         let resolve = |s: nsl_ast::Symbol| interner.resolve(s.0).unwrap_or("").to_string();
