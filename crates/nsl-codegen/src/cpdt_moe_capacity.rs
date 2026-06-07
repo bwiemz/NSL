@@ -102,7 +102,13 @@ mod tests {
     use super::*;
 
     fn info(num_experts: usize, top_k: usize, capacity_factor: f32) -> MoeInfo {
-        MoeInfo { num_experts, top_k, capacity_factor, aux_loss_coeff: 0.0 }
+        MoeInfo {
+            num_experts,
+            top_k,
+            capacity_factor,
+            aux_loss_coeff: 0.0,
+            activation: crate::moe::MoeActivation::default(),
+        }
     }
 
     #[test]

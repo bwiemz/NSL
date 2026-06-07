@@ -1640,11 +1640,19 @@ impl Compiler<'_> {
                         None
                     }
                 });
-            let (cfg_key, num_experts, top_k, capacity_factor) = match &config_with_key {
-                Some((k, info)) => {
-                    (Some(k.clone()), info.num_experts, info.top_k, info.capacity_factor)
-                }
-                None => (None, 8, 2, 1.25f32),
+            let (cfg_key, num_experts, top_k, capacity_factor, activation) = match &config_with_key {
+                Some((k, info)) => (
+                    Some(k.clone()),
+                    info.num_experts,
+                    info.top_k,
+                    info.capacity_factor,
+                    info.activation,
+                ),
+                // No MoeConfig matched. Fall back to single-MoE defaults
+                // for the numeric fields and the default activation
+                // (SiLU). The error path below still fires loud when v3
+                // dims can't be derived.
+                None => (None, 8, 2, 1.25f32, crate::moe::MoeActivation::default()),
             };
 
             let num_experts_val = builder
@@ -1675,13 +1683,15 @@ impl Compiler<'_> {
                     cranelift_codegen::ir::types::I64,
                     intermediate_dim as i64,
                 );
-                // SiLU hardcoded for v2.3 (activation_kind=1). When a
-                // future @moe(activation=...) decorator arm lands, the
-                // selector flows into MoeInfo and overrides this
-                // constant.
+                // CPDT Part III v2.4: activation_kind sourced from
+                // MoeInfo.activation (the @moe(activation="…") kwarg
+                // or the SiLU default). The enum's `repr(i64)` matches
+                // the runtime FFI's literal switch on 0/1/2/3 — pinned
+                // by `moe_activation_repr_matches_ffi_contract` in
+                // moe.rs tests.
                 let activation_kind_val = builder
                     .ins()
-                    .iconst(cranelift_codegen::ir::types::I64, 1_i64);
+                    .iconst(cranelift_codegen::ir::types::I64, activation as i64);
                 let result = self.compile_call_by_name(
                     builder,
                     "nsl_moe_dispatch_full_v3",

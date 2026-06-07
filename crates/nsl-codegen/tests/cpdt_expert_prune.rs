@@ -193,7 +193,13 @@ use nsl_codegen::moe::MoeInfo;
 use nsl_codegen::weight_aware::WeightMap;
 
 fn moe_info(num_experts: usize, top_k: usize) -> MoeInfo {
-    MoeInfo { num_experts, top_k, capacity_factor: 100.0, aux_loss_coeff: 0.0 }
+    MoeInfo {
+        num_experts,
+        top_k,
+        capacity_factor: 100.0,
+        aux_loss_coeff: 0.0,
+        activation: nsl_codegen::moe::MoeActivation::default(),
+    }
 }
 
 /// WeightMap with a router (dead col 1) + packed experts under `<key>.*`.
