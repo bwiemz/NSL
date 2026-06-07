@@ -2450,7 +2450,81 @@ impl<'a> WengertExtractor<'a> {
                         return None;
                     }
                     // Loss functions
-                    "cross_entropy" | "cross_entropy_loss" => PrimalOp::CrossEntropyLoss,
+                    //
+                    // CFTP §4.4 G3 (Sprint v3-1): auto-substitution into the
+                    // fused linear-CE kernel when the surrounding `train` block
+                    // carries `@fused_lm_ce(enabled = true, ...)` AND the
+                    // `cross_entropy(logits, targets)` input was produced by
+                    // the canonical `Add(Matmul(x, Transpose(W, 0, 1)), bias)`
+                    // pattern (the same expansion the stdlib's
+                    // `fused_linear_ce(x, W, bias, targets)` decomposes to).
+                    //
+                    // On a successful match we synthesise a single
+                    // `PrimalOp::FusedLinearCe` with inputs `[x, W, bias,
+                    // targets]` (the same four-input shape Sprint 4's
+                    // explicit-call path uses) and return immediately.  The
+                    // AD rule in `ad_rules.rs` then produces the three
+                    // backward components automatically.
+                    //
+                    // On ANY of the following, we fall through to the
+                    // standard `PrimalOp::CrossEntropyLoss` emission below —
+                    // preserving the composite path's bit-identity:
+                    //   * decorator absent, or `enabled = false`
+                    //   * any of the four shape hints (vocab_size,
+                    //     hidden_size, batch_size, seq_len) is `None`
+                    //   * the upstream chain doesn't match the canonical
+                    //     stdlib decomposition (see
+                    //     `try_match_fused_linear_ce_pattern`)
+                    //
+                    // This is the substitution site that the wengert_lower.rs
+                    // Sprint 2.5 comment near `PrimalOp::CrossEntropyLoss`
+                    // forward-referenced.
+                    "cross_entropy" | "cross_entropy_loss" => {
+                        if args.len() == 2 && input_vars.len() == 2 {
+                            if let Some(cfg) = self.fused_ce_config.as_ref() {
+                                if cfg.enabled {
+                                    if let (Some(v), Some(h), Some(b), Some(s)) = (
+                                        cfg.vocab_size,
+                                        cfg.hidden_size,
+                                        cfg.batch_size,
+                                        cfg.seq_len,
+                                    ) {
+                                        let logits_var = input_vars[0];
+                                        let targets_var = input_vars[1];
+                                        if let Some((x_var, w_var, bias_var)) =
+                                            self.try_match_fused_linear_ce_pattern(logits_var)
+                                        {
+                                            let vt = cfg.vocab_tile.unwrap_or(
+                                                crate::fused_linear_ce::FusedLinearCEConfig::default(
+                                                ).vocab_tile,
+                                            );
+                                            let is_large = v
+                                                > crate::fused_linear_ce::LARGE_VOCAB_THRESHOLD;
+                                            let four = vec![x_var, w_var, bias_var, targets_var];
+                                            self.push_op(WengertOp {
+                                                id: self.list.ops.len() as u32,
+                                                result,
+                                                op: PrimalOp::FusedLinearCe {
+                                                    vocab_size: v,
+                                                    hidden_size: h,
+                                                    batch_size: b,
+                                                    seq_len: s,
+                                                    vocab_tile: vt,
+                                                    ignore_index: -100,
+                                                    is_large,
+                                                },
+                                                inputs: four,
+                                                saved_for_backward: false,
+                                                checkpointed: false,
+                                            });
+                                            return Some(result);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        PrimalOp::CrossEntropyLoss
+                    }
                     "mse_loss" => PrimalOp::MSELoss,
                     "l1_loss" => PrimalOp::L1Loss,
                     // Reductions
