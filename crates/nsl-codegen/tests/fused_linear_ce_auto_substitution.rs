@@ -1,0 +1,465 @@
+//! CFTP §4.4 G3 (Sprint v3-1) — auto-substitution coverage.
+//!
+//! Sprint 4 wired the COMPILER side of the explicit-call path:
+//! `fused_linear_ce(x, W, bias, targets)` in user code → recognised in
+//! source-AD as a single `PrimalOp::FusedLinearCe`, AD rule emits three
+//! backward components.
+//!
+//! Sprint v3-1 (this test file) covers the implicit-call path: when a
+//! `train` block carries `@fused_lm_ce(enabled = true, ...)` AND the
+//! user writes the canonical decomposition
+//!
+//! ```text
+//!   W_t = transpose(W, 0, 1)
+//!   logits = matmul(x, W_t) + bias
+//!   loss   = cross_entropy(logits, targets)
+//! ```
+//!
+//! the compiler should detect the upstream
+//! `Add(Matmul(x, Transpose(W, 0, 1)), bias)` chain in the Wengert tape
+//! and substitute the `cross_entropy` recognition with a single
+//! `PrimalOp::FusedLinearCe`, identical to what the explicit call path
+//! emits.  Backward then flows through the same AD rule.
+//!
+//! These tests assert PrimalOp presence/absence in the extracted
+//! `WengertList`.  GPU numerical correctness is already covered by
+//! `fused_linear_ce_numerical.rs` (V=4096) and
+//! `fused_linear_ce_large_vocab_numerical.rs` (V=49152), so this file
+//! deliberately stops at the Wengert layer — exactly mirroring
+//! `fused_linear_ce_lowering_end_to_end.rs`'s Sprint 4 strategy.
+
+use nsl_codegen::fused_linear_ce::LARGE_VOCAB_THRESHOLD;
+use nsl_codegen::source_ad::WengertExtractor;
+use nsl_codegen::wengert::PrimalOp;
+use nsl_codegen::FusedCeDecoratorConfig;
+use nsl_lexer::Interner;
+
+/// Extract the Wengert list for the first FnDef in `src`, optionally
+/// with a `@fused_lm_ce` decorator config plumbed in.  Returns the
+/// extracted list (when extraction succeeded).
+///
+/// Mirrors `fused_linear_ce_lowering_end_to_end::extract_first_fn`.
+fn extract_first_fn(
+    src: &str,
+    cfg: Option<FusedCeDecoratorConfig>,
+) -> Option<nsl_codegen::wengert::WengertList> {
+    let mut interner_box = Box::new(Interner::new());
+    let (tokens, _) =
+        nsl_lexer::tokenize(src, nsl_errors::FileId(0), &mut interner_box);
+    let parsed = nsl_parser::parse(&tokens, &mut interner_box);
+    let module = parsed.module;
+    // SAFETY: leak the interner so the returned references live for the
+    // test duration. This is a one-off test pattern.
+    let interner_static: &'static Interner = Box::leak(interner_box);
+    let mut extractor =
+        WengertExtractor::new(interner_static).with_fused_ce_config(cfg);
+    let fn_def = module
+        .stmts
+        .iter()
+        .find_map(|s| match &s.kind {
+            nsl_ast::stmt::StmtKind::FnDef(f) => Some(f),
+            _ => None,
+        })
+        .expect("test src must contain a fn");
+    for param in &fn_def.params {
+        extractor.register_input(param.name);
+    }
+    let ok = extractor.extract_stmts(&fn_def.body.stmts);
+    if !ok {
+        return None;
+    }
+    extractor.finalize()
+}
+
+fn count_fused(list: &nsl_codegen::wengert::WengertList) -> usize {
+    list.ops
+        .iter()
+        .filter(|op| matches!(op.op, PrimalOp::FusedLinearCe { .. }))
+        .count()
+}
+
+fn count_composite_ce(list: &nsl_codegen::wengert::WengertList) -> usize {
+    list.ops
+        .iter()
+        .filter(|op| matches!(op.op, PrimalOp::CrossEntropyLoss))
+        .count()
+}
+
+/// Canonical user-written decomposition that the auto-substitution
+/// should target.  Mirrors stdlib `fused_linear_ce`'s body exactly so
+/// the test exercises the realistic codepath users hit.
+const AUTO_SUB_SRC: &str = r#"
+fn step(x: Tensor, w: Tensor, bias: Tensor, targets: Tensor) -> Tensor:
+    let w_t = transpose(w, 0, 1)
+    let logits = matmul(x, w_t) + bias
+    return cross_entropy(logits, targets)
+"#;
+
+/// Same pattern but with NO bias add — so the matcher should refuse
+/// even with the decorator fully populated.
+const NO_BIAS_SRC: &str = r#"
+fn step(x: Tensor, w: Tensor, targets: Tensor) -> Tensor:
+    let w_t = transpose(w, 0, 1)
+    let logits = matmul(x, w_t)
+    return cross_entropy(logits, targets)
+"#;
+
+/// CE called on a bare ident (no Matmul/Add chain at all) — the matcher
+/// must refuse and fall through to the composite path.
+const PLAIN_LOGITS_SRC: &str = r#"
+fn step(logits: Tensor, targets: Tensor) -> Tensor:
+    return cross_entropy(logits, targets)
+"#;
+
+/// Sprint 4's explicit-call path — `fused_linear_ce(x, w, bias, targets)`
+/// remains a separate code path from the auto-substitution; this guard
+/// catches accidental regressions.
+const EXPLICIT_CALL_SRC: &str = r#"
+fn step(x: Tensor, w: Tensor, bias: Tensor, targets: Tensor) -> Tensor:
+    return fused_linear_ce(x, w, bias, targets)
+"#;
+
+// ─── Test 1: decorator enabled + canonical pattern → auto-substitution fires ─
+
+#[test]
+fn auto_substitution_fires_when_decorator_enabled_and_pattern_matches() {
+    let cfg = FusedCeDecoratorConfig {
+        enabled: true,
+        vocab_tile: Some(1024),
+        vocab_size: Some(4096),
+        hidden_size: Some(128),
+        batch_size: Some(2),
+        seq_len: Some(32),
+    };
+    let list = extract_first_fn(AUTO_SUB_SRC, Some(cfg))
+        .expect("extraction must succeed");
+    let fused: Vec<_> = list
+        .ops
+        .iter()
+        .filter_map(|op| match &op.op {
+            PrimalOp::FusedLinearCe {
+                vocab_size,
+                hidden_size,
+                batch_size,
+                seq_len,
+                vocab_tile,
+                ignore_index,
+                is_large,
+            } => Some((
+                *vocab_size,
+                *hidden_size,
+                *batch_size,
+                *seq_len,
+                *vocab_tile,
+                *ignore_index,
+                *is_large,
+            )),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        fused.len(),
+        1,
+        "expected exactly one FusedLinearCe op after auto-substitution"
+    );
+    let (v, h, b, s, vt, ignore, is_large) = fused[0];
+    assert_eq!(v, 4096);
+    assert_eq!(h, 128);
+    assert_eq!(b, 2);
+    assert_eq!(s, 32);
+    assert_eq!(vt, 1024);
+    assert_eq!(ignore, -100);
+    assert!(
+        !is_large,
+        "V=4096 < {LARGE_VOCAB_THRESHOLD} must route to small-vocab path"
+    );
+    // And critically: the composite CE op MUST NOT also appear (we
+    // substituted, not duplicated).
+    assert_eq!(
+        count_composite_ce(&list),
+        0,
+        "PrimalOp::CrossEntropyLoss must NOT be emitted alongside the fused op"
+    );
+}
+
+// ─── Test 2: decorator off → composite preserved ────────────────────────
+
+#[test]
+fn decorator_disabled_preserves_composite_cross_entropy() {
+    let cfg = FusedCeDecoratorConfig {
+        enabled: false,
+        vocab_tile: Some(1024),
+        vocab_size: Some(4096),
+        hidden_size: Some(128),
+        batch_size: Some(2),
+        seq_len: Some(32),
+    };
+    let list = extract_first_fn(AUTO_SUB_SRC, Some(cfg))
+        .expect("extraction must succeed");
+    assert_eq!(
+        count_fused(&list),
+        0,
+        "decorator disabled → no FusedLinearCe should appear"
+    );
+    assert_eq!(
+        count_composite_ce(&list),
+        1,
+        "composite PrimalOp::CrossEntropyLoss must be emitted instead"
+    );
+}
+
+// ─── Test 3: decorator absent → composite preserved ─────────────────────
+
+#[test]
+fn decorator_absent_preserves_composite_cross_entropy() {
+    let list = extract_first_fn(AUTO_SUB_SRC, None)
+        .expect("extraction must succeed");
+    assert_eq!(
+        count_fused(&list),
+        0,
+        "no decorator → no FusedLinearCe should appear"
+    );
+    assert_eq!(
+        count_composite_ce(&list),
+        1,
+        "composite PrimalOp::CrossEntropyLoss must be emitted instead"
+    );
+}
+
+// ─── Test 4: pattern mismatch (no Add/Matmul chain) → composite ─────────
+
+#[test]
+fn pattern_mismatch_falls_through_to_composite_even_when_enabled() {
+    let cfg = FusedCeDecoratorConfig {
+        enabled: true,
+        vocab_tile: Some(1024),
+        vocab_size: Some(4096),
+        hidden_size: Some(128),
+        batch_size: Some(2),
+        seq_len: Some(32),
+    };
+    // No upstream Matmul or Add — `cross_entropy` is called on a bare
+    // function parameter.  The matcher MUST refuse.
+    let list = extract_first_fn(PLAIN_LOGITS_SRC, Some(cfg))
+        .expect("extraction must succeed");
+    assert_eq!(
+        count_fused(&list),
+        0,
+        "pattern mismatch (plain logits, no Add(Matmul, bias) chain) \
+         must NOT trigger auto-substitution"
+    );
+    assert_eq!(
+        count_composite_ce(&list),
+        1,
+        "composite PrimalOp::CrossEntropyLoss must be emitted as fallback"
+    );
+
+    // Sub-case: pattern has Matmul + Transpose but NO bias add.
+    // The matcher requires the BiasAdd because v1's FFI signature is
+    // 4-input (x, W, bias, targets) with no bias-elision.
+    let list_no_bias = extract_first_fn(
+        NO_BIAS_SRC,
+        Some(FusedCeDecoratorConfig {
+            enabled: true,
+            vocab_tile: Some(1024),
+            vocab_size: Some(4096),
+            hidden_size: Some(128),
+            batch_size: Some(2),
+            seq_len: Some(32),
+        }),
+    )
+    .expect("extraction must succeed");
+    assert_eq!(
+        count_fused(&list_no_bias),
+        0,
+        "Matmul-without-bias-Add pattern must NOT trigger auto-substitution"
+    );
+    assert_eq!(
+        count_composite_ce(&list_no_bias),
+        1,
+        "no-bias case must lower composite CE"
+    );
+}
+
+// ─── Test 5: large-vocab routing through auto-substitution ──────────────
+
+#[test]
+fn auto_substitution_routes_large_vocab_to_two_kernel_path() {
+    let cfg = FusedCeDecoratorConfig {
+        enabled: true,
+        vocab_tile: Some(128),
+        vocab_size: Some(49152),
+        hidden_size: Some(512),
+        batch_size: Some(1),
+        seq_len: Some(64),
+    };
+    let list = extract_first_fn(AUTO_SUB_SRC, Some(cfg))
+        .expect("extraction must succeed");
+    let is_large = list
+        .ops
+        .iter()
+        .find_map(|op| match &op.op {
+            PrimalOp::FusedLinearCe { is_large, .. } => Some(*is_large),
+            _ => None,
+        })
+        .expect(
+            "expected exactly one FusedLinearCe op produced by auto-substitution",
+        );
+    assert!(
+        is_large,
+        "V=49152 > {LARGE_VOCAB_THRESHOLD} must route to large-vocab \
+         path through the auto-substituted op too"
+    );
+    assert_eq!(
+        count_composite_ce(&list),
+        0,
+        "PrimalOp::CrossEntropyLoss must NOT also appear"
+    );
+}
+
+// ─── Test 7: review Finding 1 — dead composite chain is pruned ──────────
+//
+// After auto-substitution emits `PrimalOp::FusedLinearCe`, the upstream
+// `Transpose → Matmul → Add` chain that produced `logits_var` must be
+// removed from the Wengert tape.  The lowerer has no DCE, so leaving
+// the chain in place causes the train step to physically run a
+// `[B*S, V]` matmul + bias-add that nothing consumes — wasting ~1.5 GB
+// of HBM per step at V=49152/H=4096/B=2/S=4096.
+
+#[test]
+fn auto_substitution_prunes_dead_composite_upstream_chain() {
+    let cfg = FusedCeDecoratorConfig {
+        enabled: true,
+        vocab_tile: Some(1024),
+        vocab_size: Some(4096),
+        hidden_size: Some(128),
+        batch_size: Some(2),
+        seq_len: Some(32),
+    };
+    let list = extract_first_fn(AUTO_SUB_SRC, Some(cfg))
+        .expect("extraction must succeed");
+
+    // Sanity: exactly one FusedLinearCe.
+    assert_eq!(
+        count_fused(&list),
+        1,
+        "auto-substitution must fire on the canonical pattern"
+    );
+
+    // Walk the tape — none of these three composite ops should remain.
+    // (Without the prune they would all still be present alongside the
+    // fused op, since substitution emits an additional op rather than
+    // structurally replacing the chain.)
+    let has_matmul = list
+        .ops
+        .iter()
+        .any(|op| matches!(op.op, PrimalOp::Matmul));
+    let has_transpose = list
+        .ops
+        .iter()
+        .any(|op| matches!(op.op, PrimalOp::Transpose { dim0: 0, dim1: 1 }));
+    let has_add = list
+        .ops
+        .iter()
+        .any(|op| matches!(op.op, PrimalOp::Add));
+
+    assert!(
+        !has_matmul,
+        "PrimalOp::Matmul from the substituted chain must be pruned \
+         after auto-substitution (Finding 1 — would otherwise allocate \
+         a wasted [B*S, V] tensor each training step)"
+    );
+    assert!(
+        !has_transpose,
+        "PrimalOp::Transpose {{ dim0: 0, dim1: 1 }} from the substituted \
+         chain must be pruned after auto-substitution (Finding 1)"
+    );
+    assert!(
+        !has_add,
+        "PrimalOp::Add (the bias-add producing logits_var) must be pruned \
+         after auto-substitution (Finding 1)"
+    );
+
+    // Composite CE must still NOT be present (already covered by Test 1
+    // but re-asserted here so this test stands on its own).
+    assert_eq!(
+        count_composite_ce(&list),
+        0,
+        "PrimalOp::CrossEntropyLoss must not appear after substitution"
+    );
+}
+
+// ─── Test 8: review Finding 3 — Add(Matmul, Matmul) is rejected ────────
+//
+// `try_match_fused_linear_ce_pattern` previously accepted whatever the
+// non-Matmul operand of the Add was as `bias_var`.  If BOTH Add
+// operands are Matmuls (e.g. `matmul(x1, W1^T) + matmul(x2, W2^T)`),
+// the wrong-shape RHS would silently be passed in the bias slot to the
+// fused FFI, which dereferences it as a `[V]` vector — reading garbage.
+//
+// The fix: detect the bias-side Matmul producer and reject the
+// substitution, falling through to the composite path.
+
+const ADD_MATMUL_MATMUL_SRC: &str = r#"
+fn step(x1: Tensor, w1: Tensor, x2: Tensor, w2: Tensor, targets: Tensor) -> Tensor:
+    let w1_t = transpose(w1, 0, 1)
+    let w2_t = transpose(w2, 0, 1)
+    let logits = matmul(x1, w1_t) + matmul(x2, w2_t)
+    return cross_entropy(logits, targets)
+"#;
+
+#[test]
+fn ambiguous_add_matmul_matmul_pattern_is_rejected() {
+    let cfg = FusedCeDecoratorConfig {
+        enabled: true,
+        vocab_tile: Some(1024),
+        vocab_size: Some(4096),
+        hidden_size: Some(128),
+        batch_size: Some(2),
+        seq_len: Some(32),
+    };
+    let list = extract_first_fn(ADD_MATMUL_MATMUL_SRC, Some(cfg))
+        .expect("extraction must succeed");
+
+    // The matcher must refuse — the "bias" operand is itself a Matmul
+    // result, so passing it as a `[V]` bias would corrupt the kernel.
+    assert_eq!(
+        count_fused(&list),
+        0,
+        "Add(Matmul, Matmul) is ambiguous — the bias slot would receive \
+         a high-rank tensor.  Substitution must be refused (Finding 3)."
+    );
+    // Composite CE must take over.
+    assert_eq!(
+        count_composite_ce(&list),
+        1,
+        "composite PrimalOp::CrossEntropyLoss must be emitted as fallback"
+    );
+}
+
+// ─── Test 6: Sprint 4's explicit-call path still works ──────────────────
+
+#[test]
+fn sprint4_explicit_call_path_still_works() {
+    let cfg = FusedCeDecoratorConfig {
+        enabled: true,
+        vocab_tile: Some(1024),
+        vocab_size: Some(4096),
+        hidden_size: Some(128),
+        batch_size: Some(2),
+        seq_len: Some(32),
+    };
+    let list = extract_first_fn(EXPLICIT_CALL_SRC, Some(cfg))
+        .expect("extraction must succeed");
+    assert_eq!(
+        count_fused(&list),
+        1,
+        "explicit fused_linear_ce(...) call must still emit FusedLinearCe \
+         (Sprint 4 path is independent of Sprint v3-1 auto-substitution)"
+    );
+    assert_eq!(
+        count_composite_ce(&list),
+        0,
+        "explicit call path must NOT emit a composite CE"
+    );
+}
