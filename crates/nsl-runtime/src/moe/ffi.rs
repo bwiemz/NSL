@@ -564,3 +564,246 @@ pub extern "C" fn nsl_moe_dispatch_full_v2(
 
     Box::into_raw(result) as i64
 }
+
+/// CPDT Part III v2.2 — paper-faithful MoE FFN.
+///
+/// Layers a second matmul + activation on top of v2's single-matmul
+/// "expert", producing the standard MoE FFN structure used by
+/// Mixtral / DeepSeek MoE / etc.:
+///
+///   x_up   = x_token  @ W_up_e                # [hidden] -> [intermediate]
+///   x_act  = activation(x_up)                 # in-place; SiLU = x * sigmoid(x)
+///   x_down = x_act    @ W_down_e              # [intermediate] -> [hidden]
+///   out    = Σ_e routing_weight[t, e] * x_down
+///
+/// Output shape is `[total_tokens, hidden_dim]` — distinct from v2 which
+/// stopped at intermediate_dim. Downstream consumers reading the
+/// trailing dim of v3 vs v2 outputs will see different sizes.
+///
+/// CONTRACT vs v1/v2:
+///   - v1 (`nsl_moe_dispatch_full`): identity skeleton; output ==
+///     scattered tokens at hidden_dim. KEPT BYTE-IDENTICAL.
+///   - v2 (`nsl_moe_dispatch_full_v2`): real W_up matmul; output at
+///     intermediate_dim. KEPT BYTE-IDENTICAL.
+///   - v3 (this fn): adds activation + W_down; output back at
+///     hidden_dim. Routing/scatter/gather pipeline IS SHARED with
+///     v2 — only the per-expert compute kernel differs.
+///
+/// WEIGHTS LAYOUT (both packed [n_experts, ...] row-major):
+///   - experts_up_ptr   shape == [n_experts, hidden_dim * intermediate_dim]
+///   - experts_down_ptr shape == [n_experts, intermediate_dim * hidden_dim]
+///
+/// ACTIVATION SELECTION:
+///   - activation_kind == 1 → SiLU = x * sigmoid(x)
+///   - activation_kind == 0 → identity (no activation; only useful to
+///     differentiate v3-vs-v2 at the test level; production should use 1)
+///   - activation_kind ∈ other → refused (return 0). ReLU / GELU / etc
+///     are v2.3 deferrals.
+///
+/// REFUSALS (return 0):
+///   - any of experts_up_ptr, experts_down_ptr is null
+///   - num_experts/hidden/intermediate <= 0
+///   - top_k ∉ {1, 2} (route_topk asserts {1,2})
+///   - activation_kind ∉ {0, 1}
+///   - mixed dtype between tokens / experts_up / experts_down
+///   - experts_up.len   != n_experts * hidden * intermediate
+///   - experts_down.len != n_experts * intermediate * hidden
+///
+/// Deferrals (v2.next): bias on either matmul, GELU/ReLU,
+/// gating-projection variant (SwiGLU = (gate ⊙ silu(up)) @ down),
+/// capacity-overflow renorm, GPU expert_parallel_matmul,
+/// FP16/mixed-precision experts, codegen lowering (v3 is reachable
+/// only via direct FFI today, mirroring v2's pre-codegen state).
+#[no_mangle]
+pub extern "C" fn nsl_moe_dispatch_full_v3(
+    tokens_ptr: i64,
+    logits_ptr: i64,
+    experts_up_ptr: i64,
+    experts_down_ptr: i64,
+    num_experts: i64,
+    top_k: i64,
+    capacity_factor_bits: i64,
+    hidden_dim: i64,
+    intermediate_dim: i64,
+    activation_kind: i64,
+) -> i64 {
+    use crate::tensor::NslTensor;
+    use crate::memory::checked_alloc;
+    use std::os::raw::c_void;
+
+    // ── Refusal gates ──────────────────────────────────────────────────
+    if experts_up_ptr == 0 || experts_down_ptr == 0
+        || num_experts <= 0 || hidden_dim <= 0 || intermediate_dim <= 0
+    {
+        return 0;
+    }
+    if top_k != 1 && top_k != 2 {
+        return 0;
+    }
+    if activation_kind != 0 && activation_kind != 1 {
+        return 0;
+    }
+
+    let tokens = NslTensor::from_ptr(tokens_ptr);
+    let logits = NslTensor::from_ptr(logits_ptr);
+    let experts_up = NslTensor::from_ptr(experts_up_ptr);
+    let experts_down = NslTensor::from_ptr(experts_down_ptr);
+
+    // Uniform dtype required across tokens / both expert tensors. v2.next
+    // will add mixed-precision; for v2.2 we mirror v2's refusal.
+    if experts_up.dtype != tokens.dtype || experts_down.dtype != tokens.dtype {
+        return 0;
+    }
+
+    let num_experts_us = num_experts as usize;
+    let hidden_dim_us = hidden_dim as usize;
+    let intermediate_dim_us = intermediate_dim as usize;
+    let top_k = top_k as usize;
+    let capacity_factor = f32::from_bits(capacity_factor_bits as u32) as f64;
+
+    // Shape checks.
+    let expected_up = num_experts_us
+        .saturating_mul(hidden_dim_us)
+        .saturating_mul(intermediate_dim_us);
+    let expected_down = num_experts_us
+        .saturating_mul(intermediate_dim_us)
+        .saturating_mul(hidden_dim_us);
+    if (experts_up.len as usize) != expected_up || (experts_down.len as usize) != expected_down {
+        return 0;
+    }
+
+    let total_tokens = if logits.ndim >= 2 {
+        (unsafe { *logits.shape.offset(0) }) as usize
+    } else {
+        logits.len as usize / num_experts_us
+    };
+
+    let read_f32 = |t: &NslTensor| -> Vec<f32> {
+        if t.dtype == 0 {
+            let data = unsafe { std::slice::from_raw_parts(t.data as *const f64, t.len as usize) };
+            data.iter().map(|&v| v as f32).collect()
+        } else {
+            let data = unsafe { std::slice::from_raw_parts(t.data as *const f32, t.len as usize) };
+            data.to_vec()
+        }
+    };
+
+    let logits_f32 = read_f32(&logits);
+    let tokens_f32 = read_f32(&tokens);
+    let experts_up_f32 = read_f32(&experts_up);
+    let experts_down_f32 = read_f32(&experts_down);
+
+    let routing = router::route_topk(
+        &logits_f32, total_tokens, num_experts_us, top_k, capacity_factor,
+    );
+    let total_assigned = routing.total_assigned as usize;
+
+    let sorted_tokens = dispatch::scatter_tokens(
+        &tokens_f32, &routing.sorted_token_indices, hidden_dim_us,
+    );
+
+    // Per-expert up-matmul → activation → down-matmul. Output buffer is
+    // sized for hidden_dim trailing axis (back to the input size).
+    let mut sorted_outputs = vec![0.0_f32; total_assigned * hidden_dim_us];
+    // Intermediate scratch reused per expert range to avoid reallocating.
+    let mut intermediate = vec![0.0_f32; intermediate_dim_us];
+    let boundaries = &routing.expert_boundaries;
+    for e in 0..num_experts_us {
+        let start = boundaries[e] as usize;
+        let end = boundaries[e + 1] as usize;
+        if start == end {
+            continue;
+        }
+        let up_off = e * hidden_dim_us * intermediate_dim_us;
+        let down_off = e * intermediate_dim_us * hidden_dim_us;
+        for t in start..end {
+            let tok_off = t * hidden_dim_us;
+            let out_off = t * hidden_dim_us;
+
+            // x_up[j] = Σ_k token[k] * W_up[e][k, j]
+            for j in 0..intermediate_dim_us {
+                let mut sum = 0.0_f32;
+                for k in 0..hidden_dim_us {
+                    sum += sorted_tokens[tok_off + k]
+                        * experts_up_f32[up_off + k * intermediate_dim_us + j];
+                }
+                intermediate[j] = sum;
+            }
+
+            // Activation. activation_kind==0 is identity (skip); ==1 is
+            // SiLU = x * sigmoid(x). Numerically safe for all finite
+            // f32: exp(-x)→∞ on large negative x gives silu→0 (correct
+            // limit); exp(-x)→0 on large positive x gives silu→x
+            // (correct limit). NaN inputs propagate NaN — caller's
+            // responsibility (consistent with the rest of moe/ffi.rs).
+            if activation_kind == 1 {
+                for v in intermediate.iter_mut() {
+                    let s = 1.0_f32 / (1.0_f32 + (-*v).exp());
+                    *v *= s;
+                }
+            }
+
+            // x_down[h] = Σ_j x_act[j] * W_down[e][j, h]
+            for h in 0..hidden_dim_us {
+                let mut sum = 0.0_f32;
+                for j in 0..intermediate_dim_us {
+                    sum += intermediate[j]
+                        * experts_down_f32[down_off + j * hidden_dim_us + h];
+                }
+                sorted_outputs[out_off + h] = sum;
+            }
+        }
+    }
+
+    // Gather back with the real routing weights — same alignment as v2.1.
+    let output_f32 = dispatch::gather_tokens(
+        &sorted_outputs,
+        &routing.sorted_token_indices,
+        &routing.sorted_assignment_weights,
+        total_tokens,
+        top_k,
+        hidden_dim_us,
+    );
+
+    let output_len = total_tokens * hidden_dim_us;
+    let out_dtype = tokens.dtype;
+    let data: *mut c_void = if out_dtype == 0 {
+        let ptr = checked_alloc(output_len * std::mem::size_of::<f64>()) as *mut f64;
+        for (i, &val) in output_f32.iter().enumerate().take(output_len) {
+            unsafe { *ptr.add(i) = val as f64 };
+        }
+        ptr as *mut c_void
+    } else {
+        let ptr = checked_alloc(output_len * std::mem::size_of::<f32>()) as *mut f32;
+        unsafe {
+            std::ptr::copy_nonoverlapping(output_f32.as_ptr(), ptr, output_len);
+        }
+        ptr as *mut c_void
+    };
+
+    let ndim: i64 = 2;
+    let shape = checked_alloc(2 * std::mem::size_of::<i64>()) as *mut i64;
+    unsafe {
+        *shape = total_tokens as i64;
+        *shape.add(1) = hidden_dim;
+    }
+    let strides = checked_alloc(2 * std::mem::size_of::<i64>()) as *mut i64;
+    unsafe {
+        *strides.add(1) = 1;
+        *strides = hidden_dim;
+    }
+
+    let result = Box::new(NslTensor::new(
+        data,
+        shape,
+        strides,
+        ndim,
+        output_len as i64,
+        0,
+        out_dtype,
+        1,
+        0,
+    ));
+
+    Box::into_raw(result) as i64
+}
