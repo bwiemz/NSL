@@ -317,6 +317,78 @@ fn auto_substitution_routes_large_vocab_to_two_kernel_path() {
     );
 }
 
+// ─── Test 7: review Finding 1 — dead composite chain is pruned ──────────
+//
+// After auto-substitution emits `PrimalOp::FusedLinearCe`, the upstream
+// `Transpose → Matmul → Add` chain that produced `logits_var` must be
+// removed from the Wengert tape.  The lowerer has no DCE, so leaving
+// the chain in place causes the train step to physically run a
+// `[B*S, V]` matmul + bias-add that nothing consumes — wasting ~1.5 GB
+// of HBM per step at V=49152/H=4096/B=2/S=4096.
+
+#[test]
+fn auto_substitution_prunes_dead_composite_upstream_chain() {
+    let cfg = FusedCeDecoratorConfig {
+        enabled: true,
+        vocab_tile: Some(1024),
+        vocab_size: Some(4096),
+        hidden_size: Some(128),
+        batch_size: Some(2),
+        seq_len: Some(32),
+    };
+    let list = extract_first_fn(AUTO_SUB_SRC, Some(cfg))
+        .expect("extraction must succeed");
+
+    // Sanity: exactly one FusedLinearCe.
+    assert_eq!(
+        count_fused(&list),
+        1,
+        "auto-substitution must fire on the canonical pattern"
+    );
+
+    // Walk the tape — none of these three composite ops should remain.
+    // (Without the prune they would all still be present alongside the
+    // fused op, since substitution emits an additional op rather than
+    // structurally replacing the chain.)
+    let has_matmul = list
+        .ops
+        .iter()
+        .any(|op| matches!(op.op, PrimalOp::Matmul));
+    let has_transpose = list
+        .ops
+        .iter()
+        .any(|op| matches!(op.op, PrimalOp::Transpose { dim0: 0, dim1: 1 }));
+    let has_add = list
+        .ops
+        .iter()
+        .any(|op| matches!(op.op, PrimalOp::Add));
+
+    assert!(
+        !has_matmul,
+        "PrimalOp::Matmul from the substituted chain must be pruned \
+         after auto-substitution (Finding 1 — would otherwise allocate \
+         a wasted [B*S, V] tensor each training step)"
+    );
+    assert!(
+        !has_transpose,
+        "PrimalOp::Transpose {{ dim0: 0, dim1: 1 }} from the substituted \
+         chain must be pruned after auto-substitution (Finding 1)"
+    );
+    assert!(
+        !has_add,
+        "PrimalOp::Add (the bias-add producing logits_var) must be pruned \
+         after auto-substitution (Finding 1)"
+    );
+
+    // Composite CE must still NOT be present (already covered by Test 1
+    // but re-asserted here so this test stands on its own).
+    assert_eq!(
+        count_composite_ce(&list),
+        0,
+        "PrimalOp::CrossEntropyLoss must not appear after substitution"
+    );
+}
+
 // ─── Test 6: Sprint 4's explicit-call path still works ──────────────────
 
 #[test]

@@ -1502,6 +1502,36 @@ pub struct WengertExtractor<'a> {
     /// composite path is used (preserving v1's safety + the composite-
     /// fallback regression invariant required by Sprint 4 spec).
     fused_ce_config: Option<crate::FusedCeDecoratorConfig>,
+    /// CFTP §4.4 G3 (Sprint v3-1, review Finding 1): each successful
+    /// `cross_entropy → FusedLinearCe` auto-substitution records its
+    /// dead upstream chain (`Transpose → Matmul → Add`) here.  The
+    /// prune itself runs at `finalize()` time — by then the entire
+    /// tape is complete, so the "is this VarId still consumed by
+    /// anything else?" check is exact (no false negatives from
+    /// substitution-time scans that haven't yet seen later uses).
+    pending_fused_lce_prunes: Vec<FusedLceMatch>,
+}
+
+/// CFTP §4.4 G3 (Sprint v3-1, review Finding 1):
+/// matcher output for `try_match_fused_linear_ce_pattern`.
+///
+/// Carries both the substitution inputs (`x_var`, `w_var`,
+/// `bias_var`) AND the three upstream op result VarIds that produced
+/// the now-dead `Transpose(W) → Matmul(x, W^T) → Add(matmul, bias)`
+/// chain.  After the substitution emits a `PrimalOp::FusedLinearCe`,
+/// `prune_fused_lce_dead_chain` uses the three result-VarIds to
+/// surgically remove the upstream ops — the lowerer has no DCE and
+/// would otherwise physically run the dead chain, allocating + freeing
+/// a `[B*S, V]` tensor per training step (1.5 GB at the v3-2 fp16
+/// fixture shape).
+#[derive(Debug, Clone, Copy)]
+struct FusedLceMatch {
+    x_var: VarId,
+    w_var: VarId,
+    bias_var: VarId,
+    transpose_result_var: VarId,
+    matmul_result_var: VarId,
+    add_result_var: VarId,
 }
 
 impl<'a> WengertExtractor<'a> {
@@ -1528,6 +1558,7 @@ impl<'a> WengertExtractor<'a> {
             synth_call_names: HashMap::new(),
             synth_member_names: HashMap::new(),
             fused_ce_config: None,
+            pending_fused_lce_prunes: Vec::new(),
         }
     }
 
@@ -1585,10 +1616,21 @@ impl<'a> WengertExtractor<'a> {
     ///     refused so we don't auto-substitute a user's bespoke W layout.
     ///   * Add operands may appear in either order:
     ///     `Add(Matmul(...), bias)` and `Add(bias, Matmul(...))` both match.
+    ///
+    /// Returns `FusedLceMatch` carrying both the substitution inputs
+    /// (`x_var`, `w_var`, `bias_var`) AND the three upstream op result
+    /// VarIds (`logits_var` = add result, `matmul_result_var`,
+    /// `w_transposed_var` = transpose result).  The caller uses the
+    /// upstream VarIds to prune the now-dead composite chain from
+    /// `self.list.ops` — without pruning, the lowerer (which iterates
+    /// every op with no DCE — see `wengert_lower.rs:72-94`) would
+    /// physically run the transpose + matmul + add producing a
+    /// `[B*S, V]` tensor that nothing consumes, wasting ~1.5 GB at
+    /// V=49152/H=4096/B=2/S=4096 per training step (review Finding 1).
     fn try_match_fused_linear_ce_pattern(
         &self,
         logits_var: VarId,
-    ) -> Option<(VarId, VarId, VarId)> {
+    ) -> Option<FusedLceMatch> {
         let add_op = self.list.find_producer(logits_var)?;
         if !matches!(add_op.op, PrimalOp::Add) {
             return None;
@@ -1612,6 +1654,7 @@ impl<'a> WengertExtractor<'a> {
         if matmul_op.inputs.len() != 2 {
             return None;
         }
+        let matmul_result_var = matmul_op.result;
         let x_var = matmul_op.inputs[0];
         let w_transposed_var = matmul_op.inputs[1];
         let transpose_op = self.list.find_producer(w_transposed_var)?;
@@ -1630,7 +1673,80 @@ impl<'a> WengertExtractor<'a> {
             return None;
         }
         let w_var = transpose_op.inputs[0];
-        Some((x_var, w_var, bias_var))
+        Some(FusedLceMatch {
+            x_var,
+            w_var,
+            bias_var,
+            transpose_result_var: w_transposed_var,
+            matmul_result_var,
+            add_result_var: logits_var,
+        })
+    }
+
+    /// Review Finding 1: prune the upstream `Transpose → Matmul → Add`
+    /// chain that produced `logits_var` after auto-substitution succeeds.
+    ///
+    /// Called by `finalize()` once the entire tape is built, so the
+    /// "is this VarId consumed elsewhere?" check is exact — every op
+    /// that will ever be pushed has already been pushed.  We deliberately
+    /// do NOT consult `self.symbol_to_var`: symbol-bound VarIds that no
+    /// op actually consumes are still dead (Cranelift lowering iterates
+    /// `list.ops`, not the symbol map).
+    ///
+    /// Strategy: for each of the three chain ops, surgically remove it
+    /// from `list.ops` IF its result VarId has no consumers outside the
+    /// chain itself AND isn't the function output.
+    ///
+    /// Returns the number of ops actually removed.  Conservative on
+    /// ambiguity (leaves the op in place) — correctness over pruning.
+    fn prune_fused_lce_dead_chain(list: &mut WengertList, m: &FusedLceMatch) -> usize {
+        // The three op-result VarIds we'd like to remove.  In-chain
+        // consumers don't block removal (Matmul reads transpose, Add
+        // reads matmul) since they themselves are about to be removed.
+        let chain_results = [
+            m.transpose_result_var,
+            m.matmul_result_var,
+            m.add_result_var,
+        ];
+
+        let is_dead = |var: VarId, list: &WengertList| -> bool {
+            // Never remove the function output.
+            if list.output == var {
+                return false;
+            }
+            // Scan all ops; a consumer that's NOT itself in the chain
+            // blocks removal.
+            for op in &list.ops {
+                if chain_results.contains(&op.result) {
+                    continue;
+                }
+                if op.inputs.contains(&var) {
+                    return false;
+                }
+            }
+            true
+        };
+
+        let mut removed = 0usize;
+        for target in chain_results {
+            if !is_dead(target, list) {
+                continue;
+            }
+            // Remove the op producing `target`.  Linear scan is O(N)
+            // but we run this at most once per cross_entropy
+            // substitution; N is bounded by the per-fn op count.
+            let before = list.ops.len();
+            list.ops.retain(|op| op.result != target);
+            if list.ops.len() < before {
+                removed += 1;
+                // Leave `var_types` and `var_names` entries in place —
+                // they're lookup-only and harmless once the producing
+                // op is gone.  Removing them would risk breaking
+                // downstream type queries on still-live VarIds that
+                // happen to share an entry.
+            }
+        }
+        removed
     }
 
     fn extract_int_literal(expr: &nsl_ast::expr::Expr) -> Option<i64> {
@@ -2495,7 +2611,7 @@ impl<'a> WengertExtractor<'a> {
                                     ) {
                                         let logits_var = input_vars[0];
                                         let targets_var = input_vars[1];
-                                        if let Some((x_var, w_var, bias_var)) =
+                                        if let Some(m) =
                                             self.try_match_fused_linear_ce_pattern(logits_var)
                                         {
                                             let vt = cfg.vocab_tile.unwrap_or(
@@ -2504,7 +2620,9 @@ impl<'a> WengertExtractor<'a> {
                                             );
                                             let is_large = v
                                                 > crate::fused_linear_ce::LARGE_VOCAB_THRESHOLD;
-                                            let four = vec![x_var, w_var, bias_var, targets_var];
+                                            let four = vec![
+                                                m.x_var, m.w_var, m.bias_var, targets_var,
+                                            ];
                                             self.push_op(WengertOp {
                                                 id: self.list.ops.len() as u32,
                                                 result,
@@ -2521,6 +2639,14 @@ impl<'a> WengertExtractor<'a> {
                                                 saved_for_backward: false,
                                                 checkpointed: false,
                                             });
+                                            // Review Finding 1: defer the prune of the
+                                            // now-dead upstream composite chain
+                                            // (Transpose → Matmul → Add) until finalize().
+                                            // By then the whole tape is built, so the
+                                            // "is this VarId consumed elsewhere?" check is
+                                            // exact — no false-positive prunes from later
+                                            // ops that haven't been pushed yet.
+                                            self.pending_fused_lce_prunes.push(m);
                                             return Some(result);
                                         }
                                     }
@@ -3297,12 +3423,23 @@ impl<'a> WengertExtractor<'a> {
     }
 
     /// Finalize extraction. Returns the WengertList if the graph is static.
-    pub fn finalize(self) -> Option<WengertList> {
-        if self.is_static && !self.list.ops.is_empty() {
-            Some(self.list)
-        } else {
-            None
+    ///
+    /// Side-effect: drains `pending_fused_lce_prunes` and removes the
+    /// dead `Transpose → Matmul → Add` chains the auto-substitution
+    /// path queued during extraction (review Finding 1).  Conservative —
+    /// each chain is only removed once verified to have no remaining
+    /// consumers in the completed tape.
+    pub fn finalize(mut self) -> Option<WengertList> {
+        if !(self.is_static && !self.list.ops.is_empty()) {
+            return None;
         }
+        // Review Finding 1: run all pending fused-LCE prunes against
+        // the COMPLETED tape so the consumer-scan sees every op.
+        let prunes = std::mem::take(&mut self.pending_fused_lce_prunes);
+        for m in &prunes {
+            Self::prune_fused_lce_dead_chain(&mut self.list, m);
+        }
+        Some(self.list)
     }
 
     /// Check if the computation graph is static (no dynamic control flow).
