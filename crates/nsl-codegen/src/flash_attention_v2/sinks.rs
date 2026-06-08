@@ -151,9 +151,20 @@ pub fn attention_sinks_v1_eligible(
 /// already refuses `csha.save_activations_for_backward = true` with
 /// `num_sink_tokens > 0` at the compiler/kernel.rs front door, but
 /// this predicate is consulted at the codegen-level backward entry
-/// points (`synthesize_backward_combined`, the Tier B.2 dispatch
-/// predicates) so a caller that bypasses kernel.rs cannot silently
-/// emit wrong gradients.
+/// points so a caller that bypasses kernel.rs cannot silently emit
+/// wrong gradients.
+///
+/// **Canonical callers** (single source of truth — a future v2 sprint
+/// that lifts backward sinks edits THIS function, and every consumer
+/// automatically gets the new check):
+///   - `flash_attention_v2::mod::synthesize_backward_with_tier`
+///   - `flash_attention_v2::mod::synthesize_backward_combined`
+///   - `flash_attention_v2::mod::synthesize_backward_with_tier_b`
+///   - `flash_attention_v2::tier_b2::backward::synthesize_tier_b2_backward`
+///     (Sprint 3 cycle-7 holistic-review fix routed this through the
+///     predicate; pre-review-fix it used an inline `if > 0` check.)
+///   - `flash_attention_v2::tier_b2::dispatch::tier_b2_hybrid_backward_eligible`
+///   - `flash_attention_v2::tier_b2::dispatch::tier_b2_hybrid_backward_compile_time_eligible`
 pub fn attention_sinks_v1_backward_eligible(
     config: &FlashAttentionConfig,
 ) -> (bool, Option<&'static str>) {

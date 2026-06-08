@@ -109,11 +109,19 @@ pub fn synthesize_tier_b2_backward(
     // launch successfully and silently emit wrong gradients. Lift
     // point: when a future v2 sprint extends the dQ/dKdV/proj-backward
     // kernels to read the sink slab, drop this guard.
-    if config.num_sink_tokens > 0 {
-        return Err(BackwardSynthError::UnsupportedConfig(
-            "Sprint 2 cycle-7: backward synthesis with num_sink_tokens > 0 is deferred to a future v2 sprint — sinks v1 is forward-only. The dK/dV/dQ kernels do not understand the persistent sink slab; the projection-backward HBM read of sink rows would consume garbage."
-                .to_string(),
-        ));
+    // Sprint 3 cycle-7 holistic-review fix: route through the canonical
+    // `attention_sinks_v1_backward_eligible` predicate so a future v2
+    // sprint that lifts backward sinks has a SINGLE source of truth to
+    // edit. Pre-review-fix this site used an inline `if num_sink_tokens > 0`
+    // — semantically identical but it would have silently diverged from
+    // the predicate if a future sprint added a per-axis check there.
+    let (backward_eligible, backward_why) =
+        crate::flash_attention_v2::sinks::attention_sinks_v1_backward_eligible(config);
+    if !backward_eligible {
+        return Err(BackwardSynthError::UnsupportedConfig(format!(
+            "Sprint 2 cycle-7: {}",
+            backward_why.unwrap_or("(unknown reason — sinks::attention_sinks_v1_backward_eligible returned (false, None); this is a bug)")
+        )));
     }
 
     let d_prepass_ptx = d_prepass::synthesize_d_prepass(config)?;
