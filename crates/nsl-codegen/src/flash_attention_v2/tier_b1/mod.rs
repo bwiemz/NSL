@@ -72,6 +72,32 @@ use crate::flash_attention::FlashAttentionConfig;
 /// test's marker becomes either the orchestrator's tail-comment sentinel or
 /// the `synthesize`-function entry-label name.
 pub fn synthesize(config: &FlashAttentionConfig, chunk: u32) -> Vec<u8> {
+    // Sprint 3 cycle-7 (§4.3 attention sinks v1): defense-in-depth refusal
+    // at the Tier B.1 synthesizer entry point. The dispatch predicate
+    // (`is_tier_b1_dispatch` in `flash_attention_v2::mod.rs`) already
+    // excludes `num_sink_tokens > 0` so that the v2 entry path falls
+    // through to Tier A v2 (Sprint 1b sink-aware). This panic protects
+    // against a caller that bypasses the v2 entry and invokes
+    // `tier_b1::synthesize` directly with sinks enabled — without this
+    // guard the kernel would silently emit sink-unaware PTX (the cp.async
+    // prologue + projection_mma chunk loop do not pre-load or read the
+    // persistent sink slab). See cycle-5 `feedback_deferral_must_refuse`
+    // invariant: every entry point either works or refuses with a clear
+    // citation of the future sprint that lifts it.
+    assert_eq!(
+        config.num_sink_tokens, 0,
+        "Sprint 3 cycle-7 refusal: tier_b1::synthesize does not support \
+         num_sink_tokens > 0 (got {}). The Tier B.1 pipelined-MMA forward \
+         kernel does not understand the persistent sink slab — the \
+         cp.async prologue would not pre-load sink rows and \
+         projection_mma::emit_kv_projection_chunk_loop would write past \
+         them. Deferred to a future sprint with sink-aware Tier B.1 \
+         cp.async + MMA kernels. Callers should reach this path via \
+         `synthesize_flash_attention_ptx_v2_with_tier_b`, which falls \
+         through to Tier A v2 (sink-aware per Sprint 1b) for \
+         sinks-enabled configs.",
+        config.num_sink_tokens,
+    );
     let mut ptx = String::new();
 
     // 1. PTX header (target, version, param block, register decls).

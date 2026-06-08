@@ -61,8 +61,14 @@ pub fn synthesize_flash_attention_ptx_v2_with_tier_b(
     tier_b: Option<(u32, SegmentResidency)>,
 ) -> Vec<u8> {
     // CSHA Tier B.1 dispatch (orthogonal to PCA Tier B; see docstring).
+    // Sprint 3 cycle-7 (§4.3 attention sinks v1): defense-in-depth refusal —
+    // mirrors `is_tier_b1_dispatch`. The pipelined-MMA forward does not
+    // understand sinks; falling through to Tier A v2 here picks up Sprint
+    // 1b's sink-aware narrow path. Lift point: a future sprint with
+    // sink-aware Tier B.1 kernels.
     let want_tier_b1 = config.csha.as_ref().is_some_and(|c| c.level >= 2)
-        && config.gpu_sm >= 80;
+        && config.gpu_sm >= 80
+        && config.num_sink_tokens == 0;
     if want_tier_b1 {
         match tier_b1::chunk_config::select(config) {
             Ok(chunk) => {
@@ -781,8 +787,20 @@ pub fn flash_attention_kernel_name_v2(config: &FlashAttentionConfig) -> String {
 /// the CSHA pipelined level is requested AND the target GPU supports
 /// the cp.async + m16n8k16 path. Mirrors the dispatch predicate in
 /// `synthesize_flash_attention_ptx_v2` exactly.
+///
+/// Sprint 3 cycle-7 (§4.3 attention sinks v1): defense-in-depth refusal.
+/// The Tier B.1 pipelined-MMA forward kernel does NOT understand the
+/// persistent sink slab — neither `projection_mma::emit_kv_projection_chunk_loop`
+/// nor `attention_mma::emit_phase_b_attention` reserves SMEM rows for
+/// sinks, and the cp.async prologue kicks (`pipeline::emit_prologue_kicks`)
+/// would not pre-load the sink rows. Returning `false` here forces the
+/// dispatch to fall through to the Tier A v2 path, which Sprint 1b made
+/// sink-aware for the narrow single-tile configuration. Lift point: when
+/// a future sprint lands sink-aware Tier B.1 cp.async + MMA kernels.
 pub fn is_tier_b1_dispatch(config: &FlashAttentionConfig) -> bool {
-    config.csha.as_ref().is_some_and(|c| c.level >= 2) && config.gpu_sm >= 80
+    config.csha.as_ref().is_some_and(|c| c.level >= 2)
+        && config.gpu_sm >= 80
+        && config.num_sink_tokens == 0
 }
 
 /// Central dispatch toggle for PCA Tier B PTX emission.
@@ -1705,5 +1723,107 @@ mod backward_orchestrator_tests {
             ptx.contains("add.u64 %rd58, %rd58, %head_idx;\n"),
             "gqa_group_size=1 V-load must wire %head_idx directly"
         );
+    }
+}
+
+#[cfg(test)]
+mod sinks_tier_b1_dispatch_tests {
+    //! Sprint 3 cycle-7 (§4.3 attention sinks v1): unit tests for the
+    //! Tier B.1 dispatch refusal under `num_sink_tokens > 0`. Mirrors the
+    //! Sprint 2 `tier_b2_hybrid_backward_eligible` sinks refusal pattern.
+    use super::*;
+    use crate::flash_attention::{CshaExtras, FlashAttentionConfig, RopeStyle};
+
+    fn tier_b1_otherwise_eligible_cfg() -> FlashAttentionConfig {
+        // Otherwise-eligible: csha.level=2 + gpu_sm=120 (Blackwell). The
+        // ONLY axis we mutate per test is `num_sink_tokens` so the refusal
+        // proof is sinks-axis-only.
+        FlashAttentionConfig {
+            block_q: 32, block_kv: 32, head_dim: 32,
+            causal: true, paged: false, rope_q: false,
+            rope_style: RopeStyle::HalfSplit,
+            gqa_group_size: 1, tree_mask: false, num_sink_tokens: 0,
+            gpu_sm: 120, segment_masked: false,
+            csha: Some(CshaExtras {
+                level: 2,
+                d_model: 2048,
+                ..CshaExtras::default()
+            }),
+        }
+    }
+
+    #[test]
+    fn is_tier_b1_dispatch_true_when_otherwise_eligible_and_zero_sinks() {
+        // Proves the test config is on the "happy path" of dispatch so
+        // the sinks-axis refusal below is the load-bearing axis.
+        let cfg = tier_b1_otherwise_eligible_cfg();
+        assert!(
+            is_tier_b1_dispatch(&cfg),
+            "otherwise-eligible config with num_sink_tokens=0 must dispatch to Tier B.1"
+        );
+    }
+
+    #[test]
+    fn is_tier_b1_dispatch_false_when_sinks_enabled() {
+        // The Tier B.1 pipelined-MMA forward kernel does not understand
+        // the persistent sink slab — the predicate must return `false`
+        // so dispatch falls through to Tier A v2 (sink-aware per
+        // Sprint 1b). cycle-5 `feedback_deferral_must_refuse` invariant.
+        let mut cfg = tier_b1_otherwise_eligible_cfg();
+        cfg.num_sink_tokens = 4;
+        assert!(
+            !is_tier_b1_dispatch(&cfg),
+            "Tier B.1 dispatch must refuse num_sink_tokens > 0 (defense-in-depth)"
+        );
+    }
+
+    #[test]
+    fn is_tier_b1_dispatch_false_when_level_below_2() {
+        // Pin: dropping csha.level to 1 alone makes the predicate `false`.
+        // Proves the level >= 2 check is separable from the sinks check.
+        let mut cfg = tier_b1_otherwise_eligible_cfg();
+        cfg.csha.as_mut().unwrap().level = 1;
+        assert!(!is_tier_b1_dispatch(&cfg));
+    }
+
+    #[test]
+    fn is_tier_b1_dispatch_false_when_gpu_sm_below_80() {
+        let mut cfg = tier_b1_otherwise_eligible_cfg();
+        cfg.gpu_sm = 75;
+        assert!(!is_tier_b1_dispatch(&cfg));
+    }
+
+    /// Sprint 3 cycle-7: when `synthesize_flash_attention_ptx_v2_with_tier_b`
+    /// sees a sinks-enabled config that would otherwise route to Tier B.1,
+    /// it must fall through to Tier A v2 (which is sink-aware per Sprint 1b)
+    /// rather than emit the Tier B.1 single-iter scaffold sentinel.
+    #[test]
+    fn sinks_enabled_falls_through_to_tier_a_v2_not_tier_b1() {
+        let mut cfg = tier_b1_otherwise_eligible_cfg();
+        // Sprint 1b narrow-config so the Tier A v2 path accepts sinks.
+        cfg.causal = false;
+        cfg.block_q = 64;
+        cfg.block_kv = 64;
+        cfg.head_dim = 64;
+        cfg.num_sink_tokens = 4;
+        let ptx = synthesize_flash_attention_ptx_v2(&cfg);
+        let s = String::from_utf8_lossy(&ptx);
+        assert!(
+            !s.contains("Tier B.1 single-iter scaffold complete"),
+            "sinks-enabled config must NOT route to Tier B.1 scaffold (defense-in-depth); got: {}",
+            &s[..s.len().min(200)]
+        );
+    }
+
+    /// Sprint 3 cycle-7: direct call to `tier_b1::synthesize` with a
+    /// sinks-enabled config MUST panic with a Sprint-3-citing message.
+    /// Defense in depth in case a caller bypasses the v2 entry path.
+    #[test]
+    #[should_panic(expected = "Sprint 3 cycle-7 refusal")]
+    fn tier_b1_synthesize_panics_when_sinks_enabled() {
+        let mut cfg = tier_b1_otherwise_eligible_cfg();
+        cfg.num_sink_tokens = 4;
+        // `chunk` arg is irrelevant — the panic fires before any emission.
+        let _ = tier_b1::synthesize(&cfg, 32);
     }
 }
