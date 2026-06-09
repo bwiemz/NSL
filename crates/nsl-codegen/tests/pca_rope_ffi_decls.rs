@@ -81,10 +81,11 @@ fn csha_backward_decl_has_doc_starts_trailing_param() {
     // Authoritative count comes from RUNTIME_FUNCTIONS in builtins.rs:
     // 33 base (forward-side, includes the explicit `wo` slot) + 6 saves
     //   + 9 grad outputs (dO + dq/dk/dv + dwq/dwk/dwv + dx + dx_norm)
-    //   + 1 segment_ids + 2 tier_b + 1 doc_starts = 52.
+    //   + 1 segment_ids + 2 tier_b + 1 doc_starts + 1 num_docs_or_zero
+    //   (Sprint 5 Task 4 added per-doc CTA backward support) = 53.
     assert_eq!(
         sig.params.len(),
-        52,
-        "nsl_flash_attention_csha_backward must accept 52 i64 params (PCA §4.3 Task 3 + Tier B)"
+        53,
+        "nsl_flash_attention_csha_backward must accept 53 i64 params (PCA §4.3 Task 3 + Tier B + Sprint 5)"
     );
 }
