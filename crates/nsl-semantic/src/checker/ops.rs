@@ -222,6 +222,44 @@ impl<'a> TypeChecker<'a> {
                     }
                 }
             }
+
+            // transpose(tensor, dim0, dim1) free-function form.
+            // Mirrors the method form (`tensor.transpose(d0, d1)`) handled below.
+            if name == "transpose" {
+                if let Some(first_arg_ty) = arg_types.first() {
+                    if first_arg_ty.is_indeterminate() {
+                        return first_arg_ty.clone();
+                    }
+                    if let Type::Tensor { shape, dtype, device } = first_arg_ty {
+                        if shape.rank() >= 2 && args.len() >= 3 {
+                            let d0 = match &args[1].value.kind {
+                                ExprKind::IntLiteral(n) => Some(*n as usize),
+                                _ => None,
+                            };
+                            let d1 = match &args[2].value.kind {
+                                ExprKind::IntLiteral(n) => Some(*n as usize),
+                                _ => None,
+                            };
+                            if let (Some(d0), Some(d1)) = (d0, d1) {
+                                if d0 < shape.rank() && d1 < shape.rank() {
+                                    let mut new_dims = shape.dims.clone();
+                                    new_dims.swap(d0, d1);
+                                    return Type::Tensor {
+                                        shape: Shape { dims: new_dims },
+                                        dtype: *dtype,
+                                        device: device.clone(),
+                                    };
+                                }
+                            }
+                        }
+                        return Type::Tensor {
+                            shape: Shape::unknown(),
+                            dtype: *dtype,
+                            device: device.clone(),
+                        };
+                    }
+                }
+            }
         }
 
         // Tensor method shape inference (reshape, transpose)

@@ -1128,6 +1128,22 @@ impl Compiler<'_> {
                 &[tensor_val, dim_val],
             );
         }
+        // transpose(tensor, dim0, dim1) -- free function form mirroring tensor.transpose(d0, d1)
+        if func_name == "transpose" && !self.registry.functions.contains_key(&func_name) {
+            if args.len() != 3 {
+                return Err(CodegenError::new(
+                    "transpose() takes exactly 3 arguments (tensor, dim0, dim1)",
+                ));
+            }
+            let tensor_val = self.compile_expr(builder, state, &args[0].value)?;
+            let d0_val = self.compile_expr(builder, state, &args[1].value)?;
+            let d1_val = self.compile_expr(builder, state, &args[2].value)?;
+            return self.compile_call_by_name(
+                builder,
+                "nsl_tensor_transpose",
+                &[tensor_val, d0_val, d1_val],
+            );
+        }
         // M18a: stack(list_of_tensors, dim) -> tensor
         if func_name == "stack" && !self.registry.functions.contains_key(&func_name) {
             if args.len() != 2 {
