@@ -172,6 +172,15 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
             effect: Effect::Inferred,
         },
     );
+    // transpose(tensor, dim0, dim1) -> tensor; exact return shape resolved in check_call
+    def(
+        "transpose",
+        Type::Function {
+            params: vec![tensor_ret.clone(), Type::Int, Type::Int],
+            ret: Box::new(Type::Unknown),
+            effect: Effect::Inferred,
+        },
+    );
 
     // NN layer constructors
     for name in &[
