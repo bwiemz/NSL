@@ -144,8 +144,18 @@ unsafe extern "C" fn vtable_create_kernel(
     _info: *const OrtKernelInfo,
 ) -> *mut c_void {
     let entry = op as *const PerExportVtable;
-    let name_ptr = (*entry).name_cstr.as_ptr();
-    let raw_fn = resolve_self_symbol(name_ptr);
+    // The ExportFnPtr ABI (model, in_arr, n_in, out_arr, n_out) → i64 is
+    // implemented by `<name>__nsl_dispatch`, not the raw `<name>` symbol.
+    // See `c_wrapper.rs::emit_c_abi_dispatch_wrapper` and
+    // `c_api/exports.rs::ExportRegistry::from_library_path` which use the
+    // same suffix convention.
+    let name_bytes = (*entry).name_cstr.to_bytes();
+    let dispatch_bytes: Vec<u8> = [name_bytes, b"__nsl_dispatch"].concat();
+    let dispatch_cstr = match CString::new(dispatch_bytes) {
+        Ok(s) => s,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    let raw_fn = resolve_self_symbol(dispatch_cstr.as_ptr());
     if raw_fn == 0 {
         // Symbol not found. Return null kernel; ORT treats this as a
         // create-kernel failure. (No status-returning variant in V1 —
