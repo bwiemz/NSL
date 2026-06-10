@@ -169,9 +169,6 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-onnxrt-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Install bindgen-cli
-        run: cargo install bindgen-cli --locked
-
       - name: Install ONNX Runtime 1.22.0
         run: |
           wget -q https://github.com/microsoft/onnxruntime/releases/download/v1.22.0/onnxruntime-linux-x64-1.22.0.tgz

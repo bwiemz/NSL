@@ -12,13 +12,13 @@
 # locally, examine the diff, and update `vendored.rs` (adding missing types
 # as opaque placeholders if Spec C's scope doesn't need their fields typed).
 #
-# Dependencies: `bindgen` (the CLI). Install with:
-#   cargo install bindgen-cli
+# Dependencies: standard POSIX tools only (grep, sed, sort, comm).
+# No bindgen or libclang required.
 #
-# The check is a symbol-set comparison, not a structural diff — bindgen's
-# emitted Rust differs from our hand-rolled layout, but the set of declared
-# `Ort*` / `ONNX*` types should overlap. Spec C §3.2 calls this a "sanity
-# smoke test"; the binary-layout assertions live as `const _:` checks inside
+# The check is a symbol-set comparison, not a structural diff — the C header
+# is grepped directly for every Ort* / ONNX* identifier, which forms a
+# superset of the declared types. Spec C §3.2 calls this a "sanity smoke
+# test"; the binary-layout assertions live as `const _:` checks inside
 # `vendored.rs` itself.
 
 set -euo pipefail
@@ -26,7 +26,6 @@ set -euo pipefail
 ORT_VERSION="1.22.0"
 HEADER="third_party/onnxruntime-${ORT_VERSION}/include/onnxruntime_c_api.h"
 VENDORED="crates/nsl-runtime/src/onnx_rt_op/vendored.rs"
-GENERATED="${TMPDIR:-/tmp}/ort-bindgen-generated.rs"
 UPSTREAM_SYMS="${TMPDIR:-/tmp}/ort-upstream-syms.txt"
 VENDORED_SYMS="${TMPDIR:-/tmp}/ort-vendored-syms.txt"
 
@@ -41,41 +40,25 @@ if [[ ! -f "${VENDORED}" ]]; then
     exit 1
 fi
 
-if ! command -v bindgen >/dev/null 2>&1; then
-    echo "ERROR: bindgen CLI not installed."
-    echo "Install with: cargo install bindgen-cli"
-    exit 1
-fi
-
-# Generate Rust definitions from the upstream header. Allowlist Ort* and
-# ONNX* names; ignore standard C library types that bindgen would otherwise
-# splat into the output.
-bindgen \
-    --allowlist-type 'Ort.*|ONNX.*' \
-    --allowlist-function 'Ort.*|ONNX.*' \
-    --allowlist-var 'ORT_.*|ONNX_.*' \
-    --formatter none \
-    "${HEADER}" \
-    > "${GENERATED}"
-
-# Extract the type-name set from both files, restricted to ORT's namespace
-# prefix (Ort* / ONNX*). We strip the leading `pub struct ` / `pub type ` /
-# `pub enum ` keyword and keep only the type name — this normalizes across
-# the stylistic difference between bindgen (which emits `pub type
-# OrtErrorCode = c_int;` for C enums) and our hand-rolled file (which uses
-# `pub struct OrtErrorCode(pub u32);`). The check is then "does every
-# vendored type name still exist upstream in some form?".
-#
-# Field-by-field structural equality is NOT checked here; the binary-layout
-# assertions inside `vendored.rs` (`const _:` blocks) guard that property.
-extract_types() {
-    # shellcheck disable=SC2016
+# Extract the type-name set from vendored.rs. Strip the leading Rust keyword
+# (`pub struct ` / `pub type ` / `pub enum `) and keep only the type name.
+extract_vendored_types() {
     grep -hE '^(pub struct |pub enum |pub type )(Ort|ONNX)[A-Za-z0-9_]+' "$1" \
         | sed -E 's/^(pub struct |pub enum |pub type )//; s/[^A-Za-z0-9_].*$//' \
         | sort -u
 }
-extract_types "${GENERATED}" > "${UPSTREAM_SYMS}"
-extract_types "${VENDORED}" > "${VENDORED_SYMS}"
+
+# Extract all Ort* / ONNX* identifiers from the C header. This produces a
+# superset of the declared types (typedef names, struct tags, enum tags, and
+# any occurrence in comments or macro bodies). That is intentional: we only
+# assert presence ("still exists upstream"), not absence. Field-by-field
+# structural equality is owned by the `const _:` assertions in vendored.rs.
+extract_header_types() {
+    grep -oE '(Ort|ONNX)[A-Za-z0-9_]+' "$1" | sort -u
+}
+
+extract_vendored_types "${VENDORED}" > "${VENDORED_SYMS}"
+extract_header_types "${HEADER}" > "${UPSTREAM_SYMS}"
 
 # Spec C only vendors a subset of upstream types (Ort{Session,Status,...},
 # OrtApi, OrtApiBase, OrtCustomOp, OrtKernelContext, etc.). We assert that

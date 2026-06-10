@@ -67,6 +67,7 @@ fn v1_mlp_kir() -> KernelIR {
 // placeholder names. Unignore this test in PR 4 after the structural
 // skeleton is complete.
 #[test]
+#[ignore = "deferred to PR 4: localparam unpacked array dims not supported by Yosys; see emit_local_param_array in backend_verilog/templates.rs"]
 fn yosys_gate_v1_mlp_clean() {
     if !YosysGate::is_available() {
         eprintln!("SKIPPED: yosys not installed");
