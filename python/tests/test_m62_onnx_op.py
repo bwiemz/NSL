@@ -179,6 +179,10 @@ def test_session_load_and_run_calls_nsl_add():
             graph,
             opset_imports=[helper.make_opsetid("com.nsl", 1)],
         )
+        # ORT 1.22.0 supports ONNX IR versions up to 10; newer onnx package
+        # releases default to IR version 13+. Pin to IR v8 which covers all
+        # standard tensor ops and is compatible with every ORT 1.x release.
+        model.ir_version = 8
 
         sess = ort.InferenceSession(model.SerializeToString(), sess_opts)
         out = sess.run(
