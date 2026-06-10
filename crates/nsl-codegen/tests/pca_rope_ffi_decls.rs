@@ -8,8 +8,8 @@
 //!
 //!   * `nsl_flash_attention_csha`            — 38 params (+1 num_docs_or_zero)
 //!   * `nsl_flash_attention_csha_with_saves` — 44 params (+1 num_docs_or_zero)
-//!   * `nsl_flash_attention_csha_backward`   — 52 params (no num_docs_or_zero —
-//!     backward kernel is Sprint 5 follow-on, no per-doc backward exists today)
+//!   * `nsl_flash_attention_csha_backward`   — 53 params (includes
+//!     num_docs_or_zero; per-doc CTA backward landed in Sprint 5)
 //!
 //! Each forward count = base + segment_ids (Tier A) + 2 tier_b + doc_starts
 //!                       (PCA §4.3) + num_docs_or_zero (per-doc CTA).
@@ -81,10 +81,11 @@ fn csha_backward_decl_has_doc_starts_trailing_param() {
     // Authoritative count comes from RUNTIME_FUNCTIONS in builtins.rs:
     // 33 base (forward-side, includes the explicit `wo` slot) + 6 saves
     //   + 9 grad outputs (dO + dq/dk/dv + dwq/dwk/dwv + dx + dx_norm)
-    //   + 1 segment_ids + 2 tier_b + 1 doc_starts = 52.
+    //   + 1 segment_ids + 2 tier_b + 1 doc_starts + 1 num_docs_or_zero = 53.
+    // num_docs_or_zero was added in Sprint 5 (per-doc CTA backward).
     assert_eq!(
         sig.params.len(),
-        52,
-        "nsl_flash_attention_csha_backward must accept 52 i64 params (PCA §4.3 Task 3 + Tier B)"
+        53,
+        "nsl_flash_attention_csha_backward must accept 53 i64 params (PCA §4.3 Task 3 + Tier B + Sprint 5)"
     );
 }
