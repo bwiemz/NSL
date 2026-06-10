@@ -94,12 +94,11 @@ pub fn make_custom_op_for_export(idx: i64, name: *const c_char) -> *const OrtCus
             GetVariadicInputHomogeneity: vtable_get_variadic_hom,
             GetVariadicOutputMinArity: vtable_get_variadic_min,
             GetVariadicOutputHomogeneity: vtable_get_variadic_hom,
-            // Post-V1 callbacks — Spec C registers V1 only. These slots
-            // must be populated (ORT 1.16+ reads them unconditionally),
-            // but the v2 paths are never invoked because we set the v1
-            // KernelCompute slot above.
-            CreateKernelV2: vtable_create_kernel_v2_unused,
-            KernelComputeV2: vtable_kernel_compute_v2_unused,
+            // V2 callbacks — ORT 1.22 calls CreateKernelV2 preferentially
+            // when op->version >= 16 (our version=ORT_API_VERSION=22).
+            // These delegate to the same V1 helpers above.
+            CreateKernelV2: vtable_create_kernel_v2,
+            KernelComputeV2: vtable_kernel_compute_v2,
             InferOutputShapeFn: vtable_infer_output_shape_unused,
             GetStartVersion: vtable_get_start_version,
             GetEndVersion: vtable_get_end_version,
@@ -144,8 +143,18 @@ unsafe extern "C" fn vtable_create_kernel(
     _info: *const OrtKernelInfo,
 ) -> *mut c_void {
     let entry = op as *const PerExportVtable;
-    let name_ptr = (*entry).name_cstr.as_ptr();
-    let raw_fn = resolve_self_symbol(name_ptr);
+    // The ExportFnPtr ABI (model, in_arr, n_in, out_arr, n_out) → i64 is
+    // implemented by `<name>__nsl_dispatch`, not the raw `<name>` symbol.
+    // See `c_wrapper.rs::emit_c_abi_dispatch_wrapper` and
+    // `c_api/exports.rs::ExportRegistry::from_library_path` which use the
+    // same suffix convention.
+    let name_bytes = (*entry).name_cstr.to_bytes();
+    let dispatch_bytes: Vec<u8> = [name_bytes, b"__nsl_dispatch"].concat();
+    let dispatch_cstr = match CString::new(dispatch_bytes) {
+        Ok(s) => s,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    let raw_fn = resolve_self_symbol(dispatch_cstr.as_ptr());
     if raw_fn == 0 {
         // Symbol not found. Return null kernel; ORT treats this as a
         // create-kernel failure. (No status-returning variant in V1 —
@@ -224,27 +233,45 @@ unsafe extern "C" fn vtable_get_variadic_hom(_op: *const OrtCustomOp) -> i32 {
 }
 
 // ---------------------------------------------------------------------------
-// V2 / 1.16+ vtable functions — populated with safe stubs.
+// V2 / 1.16+ vtable functions.
 //
-// Spec C v1 uses the V1 KernelCompute path. ORT 1.22 still reads these slots
-// during op registration even if it never invokes them through this op, so
-// they must contain valid function pointers.
+// ORT 1.16+ selects CreateKernelV2 over CreateKernel when op->version >= 16.
+// Since we set version=ORT_API_VERSION=22, ORT 1.22 ALWAYS invokes the V2
+// path. These functions delegate to the shared V1 helpers so the kernel
+// creation + compute logic is not duplicated.
 // ---------------------------------------------------------------------------
 
-unsafe extern "C" fn vtable_create_kernel_v2_unused(
-    _op: *const OrtCustomOp,
-    _api: *const OrtApi,
-    _info: *const OrtKernelInfo,
-    _kernel_out: *mut *mut c_void,
+unsafe extern "C" fn vtable_create_kernel_v2(
+    op: *const OrtCustomOp,
+    api: *const OrtApi,
+    info: *const OrtKernelInfo,
+    kernel_out: *mut *mut c_void,
 ) -> *mut OrtStatus {
-    // Should never be called — Spec C registers via V1 CreateKernel.
+    let kernel = vtable_create_kernel(op, api, info);
+    if kernel.is_null() {
+        // Dispatch symbol not found or state allocation failed. Return a
+        // non-null status sentinel so ORT surfaces the failure rather than
+        // proceeding with a null kernel handle.
+        #[allow(clippy::manual_dangling_ptr)]
+        return 1usize as *mut OrtStatus;
+    }
+    if !kernel_out.is_null() {
+        *kernel_out = kernel;
+    } else {
+        drop(Box::from_raw(kernel as *mut super::kernel::NslOrtKernelState));
+        #[allow(clippy::manual_dangling_ptr)]
+        return 1usize as *mut OrtStatus;
+    }
     std::ptr::null_mut()
 }
 
-unsafe extern "C" fn vtable_kernel_compute_v2_unused(
-    _op_kernel: *mut c_void,
-    _context: *mut OrtKernelContext,
+unsafe extern "C" fn vtable_kernel_compute_v2(
+    op_kernel: *mut c_void,
+    context: *mut OrtKernelContext,
 ) -> *mut OrtStatus {
+    if !op_kernel.is_null() {
+        nsl_ort_kernel_compute(op_kernel, context);
+    }
     std::ptr::null_mut()
 }
 
@@ -307,8 +334,12 @@ unsafe extern "C" fn vtable_release_alias_map(
 ///    pointer by name. The codegen-emitted symbol lives in the same .so
 ///    as this code, so the same self-dlsym pattern works.
 ///
-/// **Unix:** `dlsym(RTLD_DEFAULT, name)` — searches the process's loaded
-/// symbol table including this `.so`.
+/// **Unix:** Use `dladdr` to find the path of the `.so` that contains this
+/// function, then `dlopen(RTLD_NOW)` to get a handle to that specific
+/// library. `dlsym(handle, name)` searches within the library regardless of
+/// whether it was opened with `RTLD_LOCAL` or `RTLD_GLOBAL` — the
+/// `RTLD_DEFAULT` approach only works with `RTLD_GLOBAL`. Falls back to
+/// `dlsym(RTLD_DEFAULT, name)` if `dladdr`/`dlopen` fail.
 ///
 /// **Windows:** `GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, &this_fn, &out)`
 /// finds the module containing this function (i.e., our own DLL), then
@@ -321,11 +352,48 @@ pub(crate) unsafe fn resolve_self_symbol(name_ptr: *const c_char) -> usize {
     {
         extern "C" {
             fn dlsym(handle: *mut c_void, sym: *const c_char) -> *mut c_void;
+            fn dlopen(filename: *const c_char, flags: i32) -> *mut c_void;
+            fn dlclose(handle: *mut c_void) -> i32;
+            fn dladdr(addr: *const c_void, info: *mut DlInfo) -> i32;
         }
-        // RTLD_DEFAULT is a sentinel: NULL on Linux/macOS (POSIX). It tells
-        // dlsym to search the whole process symbol space, which includes
-        // this .so via the normal global symbol scope.
+        // Layout mirrors `Dl_info` from <dlfcn.h>. The fields we need are
+        // `dli_fname` (path of the .so) and `dli_fbase` (load base address).
+        // The POSIX layout is stable across Linux and macOS.
+        #[repr(C)]
+        struct DlInfo {
+            dli_fname: *const c_char,
+            dli_fbase: *mut c_void,
+            dli_sname: *const c_char,
+            dli_saddr: *mut c_void,
+        }
+        // RTLD_NOW=2 on both Linux and macOS. Requesting immediate symbol
+        // binding; for an already-loaded library dlopen just increments the
+        // ref count without re-loading.
+        const RTLD_NOW: i32 = 2;
         const RTLD_DEFAULT: *mut c_void = std::ptr::null_mut();
+
+        // Use our own function address as the anchor (mirrors the Windows
+        // FROM_ADDRESS approach). dladdr finds which .so owns this address.
+        let mut dl_info = DlInfo {
+            dli_fname: std::ptr::null(),
+            dli_fbase: std::ptr::null_mut(),
+            dli_sname: std::ptr::null(),
+            dli_saddr: std::ptr::null_mut(),
+        };
+        if dladdr(resolve_self_symbol as *const c_void, &mut dl_info) != 0
+            && !dl_info.dli_fname.is_null()
+        {
+            let handle = dlopen(dl_info.dli_fname, RTLD_NOW);
+            if !handle.is_null() {
+                let p = dlsym(handle, name_ptr);
+                // Balance the ref-count increment; the library stays loaded.
+                dlclose(handle);
+                if !p.is_null() {
+                    return p as usize;
+                }
+            }
+        }
+        // Fallback: RTLD_DEFAULT works when the .so was opened RTLD_GLOBAL.
         let p = dlsym(RTLD_DEFAULT, name_ptr);
         p as usize
     }
