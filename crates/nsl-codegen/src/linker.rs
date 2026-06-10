@@ -496,8 +496,11 @@ pub fn link_shared(obj_paths: &[PathBuf], output_path: &Path) -> Result<(), Code
 /// M62 Task 6: like [`link_shared`] but also forces the named symbols into
 /// the export table.  On MSVC, Cranelift's `Linkage::Export` is not enough —
 /// `link.exe /DLL` still needs an explicit `/EXPORT:<sym>` to expose the
-/// function via `GetProcAddress` / `ctypes.CDLL`.  On Unix `Linkage::Export`
-/// is sufficient; the names are accepted but unused.
+/// function via `GetProcAddress` / `ctypes.CDLL`.  On Linux, Cranelift's
+/// `Linkage::Export` sets `STB_GLOBAL` binding in the object file, but
+/// `dlsym` looks in `.dynsym` — which the GNU linker only populates for
+/// symbols explicitly listed via `--export-dynamic-symbol` when building a
+/// `-shared` library without a version script.
 pub fn link_shared_with_exports(
     obj_paths: &[PathBuf],
     output_path: &Path,
@@ -507,9 +510,9 @@ pub fn link_shared_with_exports(
 
     if cfg!(target_os = "windows") {
         link_shared_msvc(obj_paths, output_path, &runtime_lib, extra_exports)
-            .or_else(|_| link_shared_gcc(obj_paths, output_path, &runtime_lib))
+            .or_else(|_| link_shared_gcc(obj_paths, output_path, &runtime_lib, extra_exports))
     } else {
-        link_shared_gcc(obj_paths, output_path, &runtime_lib)
+        link_shared_gcc(obj_paths, output_path, &runtime_lib, extra_exports)
     }
 }
 
@@ -712,6 +715,7 @@ fn link_shared_gcc(
     obj_paths: &[PathBuf],
     output_path: &Path,
     runtime_lib: &Path,
+    extra_exports: &[&str],
 ) -> Result<(), CodegenError> {
     let cc = find_c_compiler()?;
 
@@ -733,6 +737,14 @@ fn link_shared_gcc(
         // Set SONAME so the dynamic linker can identify the library
         if let Some(filename) = output_path.file_name() {
             cmd.arg(format!("-Wl,-soname,{}", filename.to_string_lossy()));
+        }
+        // Promote each requested symbol into .dynsym so dlsym can find it.
+        // Cranelift's Linkage::Export sets STB_GLOBAL in the object file but
+        // the GNU linker only puts a symbol in .dynsym when -shared is used
+        // if it's explicitly listed here or the whole table is exported via
+        // --export-dynamic (which would also pull in internal symbols).
+        for sym in extra_exports {
+            cmd.arg(format!("-Wl,--export-dynamic-symbol={sym}"));
         }
     }
 
