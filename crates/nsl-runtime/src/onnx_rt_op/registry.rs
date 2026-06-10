@@ -94,12 +94,11 @@ pub fn make_custom_op_for_export(idx: i64, name: *const c_char) -> *const OrtCus
             GetVariadicInputHomogeneity: vtable_get_variadic_hom,
             GetVariadicOutputMinArity: vtable_get_variadic_min,
             GetVariadicOutputHomogeneity: vtable_get_variadic_hom,
-            // Post-V1 callbacks — Spec C registers V1 only. These slots
-            // must be populated (ORT 1.16+ reads them unconditionally),
-            // but the v2 paths are never invoked because we set the v1
-            // KernelCompute slot above.
-            CreateKernelV2: vtable_create_kernel_v2_unused,
-            KernelComputeV2: vtable_kernel_compute_v2_unused,
+            // V2 callbacks — ORT 1.22 calls CreateKernelV2 preferentially
+            // when op->version >= 16 (our version=ORT_API_VERSION=22).
+            // These delegate to the same V1 helpers above.
+            CreateKernelV2: vtable_create_kernel_v2,
+            KernelComputeV2: vtable_kernel_compute_v2,
             InferOutputShapeFn: vtable_infer_output_shape_unused,
             GetStartVersion: vtable_get_start_version,
             GetEndVersion: vtable_get_end_version,
@@ -234,27 +233,45 @@ unsafe extern "C" fn vtable_get_variadic_hom(_op: *const OrtCustomOp) -> i32 {
 }
 
 // ---------------------------------------------------------------------------
-// V2 / 1.16+ vtable functions — populated with safe stubs.
+// V2 / 1.16+ vtable functions.
 //
-// Spec C v1 uses the V1 KernelCompute path. ORT 1.22 still reads these slots
-// during op registration even if it never invokes them through this op, so
-// they must contain valid function pointers.
+// ORT 1.16+ selects CreateKernelV2 over CreateKernel when op->version >= 16.
+// Since we set version=ORT_API_VERSION=22, ORT 1.22 ALWAYS invokes the V2
+// path. These functions delegate to the shared V1 helpers so the kernel
+// creation + compute logic is not duplicated.
 // ---------------------------------------------------------------------------
 
-unsafe extern "C" fn vtable_create_kernel_v2_unused(
-    _op: *const OrtCustomOp,
-    _api: *const OrtApi,
-    _info: *const OrtKernelInfo,
-    _kernel_out: *mut *mut c_void,
+unsafe extern "C" fn vtable_create_kernel_v2(
+    op: *const OrtCustomOp,
+    api: *const OrtApi,
+    info: *const OrtKernelInfo,
+    kernel_out: *mut *mut c_void,
 ) -> *mut OrtStatus {
-    // Should never be called — Spec C registers via V1 CreateKernel.
+    let kernel = vtable_create_kernel(op, api, info);
+    if kernel.is_null() {
+        // Dispatch symbol not found or state allocation failed. Return a
+        // non-null status sentinel so ORT surfaces the failure rather than
+        // proceeding with a null kernel handle.
+        #[allow(clippy::manual_dangling_ptr)]
+        return 1usize as *mut OrtStatus;
+    }
+    if !kernel_out.is_null() {
+        *kernel_out = kernel;
+    } else {
+        drop(Box::from_raw(kernel as *mut super::kernel::NslOrtKernelState));
+        #[allow(clippy::manual_dangling_ptr)]
+        return 1usize as *mut OrtStatus;
+    }
     std::ptr::null_mut()
 }
 
-unsafe extern "C" fn vtable_kernel_compute_v2_unused(
-    _op_kernel: *mut c_void,
-    _context: *mut OrtKernelContext,
+unsafe extern "C" fn vtable_kernel_compute_v2(
+    op_kernel: *mut c_void,
+    context: *mut OrtKernelContext,
 ) -> *mut OrtStatus {
+    if !op_kernel.is_null() {
+        nsl_ort_kernel_compute(op_kernel, context);
+    }
     std::ptr::null_mut()
 }
 
