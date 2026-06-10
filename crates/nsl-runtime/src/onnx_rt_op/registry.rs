@@ -317,8 +317,12 @@ unsafe extern "C" fn vtable_release_alias_map(
 ///    pointer by name. The codegen-emitted symbol lives in the same .so
 ///    as this code, so the same self-dlsym pattern works.
 ///
-/// **Unix:** `dlsym(RTLD_DEFAULT, name)` — searches the process's loaded
-/// symbol table including this `.so`.
+/// **Unix:** Use `dladdr` to find the path of the `.so` that contains this
+/// function, then `dlopen(RTLD_NOW)` to get a handle to that specific
+/// library. `dlsym(handle, name)` searches within the library regardless of
+/// whether it was opened with `RTLD_LOCAL` or `RTLD_GLOBAL` — the
+/// `RTLD_DEFAULT` approach only works with `RTLD_GLOBAL`. Falls back to
+/// `dlsym(RTLD_DEFAULT, name)` if `dladdr`/`dlopen` fail.
 ///
 /// **Windows:** `GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, &this_fn, &out)`
 /// finds the module containing this function (i.e., our own DLL), then
@@ -331,11 +335,48 @@ pub(crate) unsafe fn resolve_self_symbol(name_ptr: *const c_char) -> usize {
     {
         extern "C" {
             fn dlsym(handle: *mut c_void, sym: *const c_char) -> *mut c_void;
+            fn dlopen(filename: *const c_char, flags: i32) -> *mut c_void;
+            fn dlclose(handle: *mut c_void) -> i32;
+            fn dladdr(addr: *const c_void, info: *mut DlInfo) -> i32;
         }
-        // RTLD_DEFAULT is a sentinel: NULL on Linux/macOS (POSIX). It tells
-        // dlsym to search the whole process symbol space, which includes
-        // this .so via the normal global symbol scope.
+        // Layout mirrors `Dl_info` from <dlfcn.h>. The fields we need are
+        // `dli_fname` (path of the .so) and `dli_fbase` (load base address).
+        // The POSIX layout is stable across Linux and macOS.
+        #[repr(C)]
+        struct DlInfo {
+            dli_fname: *const c_char,
+            dli_fbase: *mut c_void,
+            dli_sname: *const c_char,
+            dli_saddr: *mut c_void,
+        }
+        // RTLD_NOW=2 on both Linux and macOS. Requesting immediate symbol
+        // binding; for an already-loaded library dlopen just increments the
+        // ref count without re-loading.
+        const RTLD_NOW: i32 = 2;
         const RTLD_DEFAULT: *mut c_void = std::ptr::null_mut();
+
+        // Use our own function address as the anchor (mirrors the Windows
+        // FROM_ADDRESS approach). dladdr finds which .so owns this address.
+        let mut dl_info = DlInfo {
+            dli_fname: std::ptr::null(),
+            dli_fbase: std::ptr::null_mut(),
+            dli_sname: std::ptr::null(),
+            dli_saddr: std::ptr::null_mut(),
+        };
+        if dladdr(resolve_self_symbol as *const c_void, &mut dl_info) != 0
+            && !dl_info.dli_fname.is_null()
+        {
+            let handle = dlopen(dl_info.dli_fname, RTLD_NOW);
+            if !handle.is_null() {
+                let p = dlsym(handle, name_ptr);
+                // Balance the ref-count increment; the library stays loaded.
+                dlclose(handle);
+                if !p.is_null() {
+                    return p as usize;
+                }
+            }
+        }
+        // Fallback: RTLD_DEFAULT works when the .so was opened RTLD_GLOBAL.
         let p = dlsym(RTLD_DEFAULT, name_ptr);
         p as usize
     }
