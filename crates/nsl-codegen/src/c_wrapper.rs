@@ -416,7 +416,17 @@ pub fn emit_c_abi_dispatch_wrapper(
             .declare_func_in_func(wrapper.wrapper_func_id, builder.func);
 
         let mut typed_args: Vec<cranelift_codegen::ir::Value> = Vec::new();
-        typed_args.push(model_ptr);
+        // Stateless exports (is_model_method=false) have no NslModel. The
+        // typed C-ABI wrapper always null-checks model_ptr and returns -1 for
+        // 0, but never dereferences model_ptr when is_model_method=false.
+        // Pass sentinel 1 so the check passes; for model methods pass the real
+        // model_ptr from the dispatch ABI (set by nsl_model_call callers).
+        let effective_model = if wrapper.is_model_method {
+            model_ptr
+        } else {
+            builder.ins().iconst(cw_types::I64, 1)
+        };
+        typed_args.push(effective_model);
 
         // One pointer per tensor input: inputs_ptr + i * sizeof(NslTensorDesc).
         for i in 0..wrapper.export_info.params.len() {
