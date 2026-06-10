@@ -198,11 +198,7 @@ unsafe extern "C" fn vtable_get_input_char(
     _op: *const OrtCustomOp,
     _idx: usize,
 ) -> OrtCustomOpInputOutputCharacteristic {
-    // Declare the single slot as variadic so ORT accepts NSL exports with any
-    // arity (unary, binary, ...) without knowing the count at vtable-creation
-    // time. GetVariadicInputMinArity=1 enforces at least one input.
-    // nsl_ort_kernel_compute already queries the actual count from the context.
-    OrtCustomOpInputOutputCharacteristic::INPUT_OUTPUT_VARIADIC
+    OrtCustomOpInputOutputCharacteristic::INPUT_OUTPUT_REQUIRED
 }
 
 unsafe extern "C" fn vtable_get_output_char(
