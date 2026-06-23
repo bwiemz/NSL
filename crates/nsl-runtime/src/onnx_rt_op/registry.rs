@@ -186,7 +186,12 @@ unsafe extern "C" fn vtable_create_kernel(
     let state = Box::new(NslOrtKernelState {
         api,
         fn_ptr,
-        model_ptr: 0, // v1: stateless exports only.
+        // Non-zero sentinel for stateless exports: the codegen-emitted typed
+        // wrapper null-checks model_ptr and returns -1 when it is zero. For
+        // @export functions that are not model methods, model_ptr is never
+        // dereferenced — the null check is the only consumer. Use 1 so the
+        // check passes without providing a real model handle.
+        model_ptr: 1,
     });
     Box::into_raw(state) as *mut c_void
 }
@@ -279,7 +284,10 @@ unsafe extern "C" fn vtable_create_kernel_v2(
     let state = Box::new(NslOrtKernelState {
         api,
         fn_ptr,
-        model_ptr: 0, // v1: stateless exports only.
+        // Non-zero sentinel for stateless exports: see vtable_create_kernel
+        // above for the full rationale. model_ptr=1 bypasses the null check
+        // in the codegen-emitted typed wrapper without being a real model ptr.
+        model_ptr: 1,
     });
     *kernel_out = Box::into_raw(state) as *mut c_void;
     std::ptr::null_mut() // null OrtStatus* = success
