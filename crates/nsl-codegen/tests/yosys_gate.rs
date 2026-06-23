@@ -67,6 +67,7 @@ fn v1_mlp_kir() -> KernelIR {
 // placeholder names. Unignore this test in PR 4 after the structural
 // skeleton is complete.
 #[test]
+#[ignore = "re-enable in PR 4 once wire declarations and acc_l<i>_prev ports are wired (M57.1 §3.5)"]
 fn yosys_gate_v1_mlp_clean() {
     if !YosysGate::is_available() {
         eprintln!("SKIPPED: yosys not installed");

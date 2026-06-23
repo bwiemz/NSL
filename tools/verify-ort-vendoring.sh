@@ -51,6 +51,7 @@ fi
 # ONNX* names; ignore standard C library types that bindgen would otherwise
 # splat into the output.
 bindgen \
+    --no-rustfmt-bindings \
     --allowlist-type 'Ort.*|ONNX.*' \
     --allowlist-function 'Ort.*|ONNX.*' \
     --allowlist-var 'ORT_.*|ONNX_.*' \
