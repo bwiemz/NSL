@@ -63,10 +63,10 @@ pub unsafe extern "C" fn RegisterCustomOps(
     // The codegen-emitted `nsl_get_num_exports` and `nsl_get_export_name`
     // are not linked statically — they exist only in shipped `.so/.dll`
     // artifacts where `--features onnx-rt-op` is enabled alongside an
-    // `@export`-bearing NSL module. We resolve them at runtime via the
-    // same self-dlsym pattern the registry uses for individual exports:
-    // - Unix: `dlsym(RTLD_DEFAULT, ...)`
-    // - Windows: `GetModuleHandleExW(FROM_ADDRESS) + GetProcAddress`.
+    // `@export`-bearing NSL module. We resolve them via `resolve_self_symbol`
+    // which uses a library-specific handle (dladdr+dlopen RTLD_NOLOAD on
+    // Linux; RTLD_SELF on macOS; GetModuleHandleExW on Windows) rather than
+    // RTLD_DEFAULT, because ORT loads us with RTLD_LOCAL.
     //
     // If either symbol is missing (the common case for `cargo test` /
     // examples where no NSL `@export`s exist), we treat the export

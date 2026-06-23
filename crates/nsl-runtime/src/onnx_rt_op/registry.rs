@@ -16,8 +16,12 @@
 //!
 //! Each vtable's `CreateKernel` resolves the export by name *from this same
 //! `.so`/`.dll`* via:
-//! - Unix: `dlsym(RTLD_DEFAULT, name)`.
-//! - Windows: `GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, &resolve_export_via_self_dlsym, &out)`
+//! - macOS: `dlsym(RTLD_SELF, name)` — `RTLD_SELF` searches only this dylib.
+//! - Linux/POSIX: `dladdr(self_fn)` → path → `dlopen(path, RTLD_NOLOAD)` →
+//!   `dlsym(specific_handle, name)`. Cannot use `RTLD_DEFAULT` (NULL) because
+//!   ORT loads custom-op libraries with `RTLD_LOCAL`, excluding them from the
+//!   global symbol scope.
+//! - Windows: `GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, &self_fn, &out)`
 //!   then `GetProcAddress(out, name)`.
 //!
 //! Spec A's `nsl_model_lookup_function` requires a model handle, which the
@@ -47,14 +51,12 @@ struct PerExportVtable {
     /// Backing storage for `vtable.GetName`'s returned pointer.
     name_cstr: CString,
     /// Pre-resolved `<name>__nsl_dispatch` function pointer. Resolved eagerly
-    /// during `make_custom_op_for_export` (inside `RegisterCustomOps`) rather
-    /// than lazily in `vtable_create_kernel` because:
-    ///   1. The correct dispatch symbol is `<name>__nsl_dispatch`, not the
-    ///      user-facing `<name>` (which has a different calling convention).
-    ///   2. `dlsym(RTLD_DEFAULT, ...)` is more reliable from within
-    ///      `RegisterCustomOps` (which executes in the library's load context)
-    ///      than from `vtable_create_kernel` (which executes at inference time
-    ///      when the library may have been opened with RTLD_LOCAL scope).
+    /// during `make_custom_op_for_export` via `resolve_self_symbol`, which
+    /// uses a library-specific dlopen/dlsym handle rather than RTLD_DEFAULT.
+    /// This is required because ORT loads custom-op libraries with RTLD_LOCAL,
+    /// which hides their symbols from the global scope that RTLD_DEFAULT
+    /// searches. The correct symbol name is `<name>__nsl_dispatch`, NOT the
+    /// user-facing `<name>` which uses a different calling convention.
     cached_dispatch_fn: usize,
 }
 
@@ -326,34 +328,96 @@ unsafe extern "C" fn vtable_release_alias_map(
 ///
 /// Used for two things in Spec C:
 /// 1. `mod.rs::RegisterCustomOps` looks up the codegen-emitted
-///    `nsl_get_num_exports` / `nsl_get_export_name` enumeration FFIs at
-///    runtime. They may not exist in test binaries; we handle absence by
-///    returning success with no domain.
-/// 2. Per-export `CreateKernel` looks up the export's NSL function
-///    pointer by name. The codegen-emitted symbol lives in the same .so
-///    as this code, so the same self-dlsym pattern works.
+///    `nsl_get_num_exports` / `nsl_get_export_name` enumeration FFIs.
+/// 2. `make_custom_op_for_export` pre-resolves each `<name>__nsl_dispatch`.
 ///
-/// **Unix:** `dlsym(RTLD_DEFAULT, name)` — searches the process's loaded
-/// symbol table including this `.so`.
+/// **macOS:** `dlsym(RTLD_SELF, name)` — `RTLD_SELF = (void*)-3` searches
+/// only the calling module's symbols, regardless of `RTLD_LOCAL`.
 ///
-/// **Windows:** `GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, &this_fn, &out)`
-/// finds the module containing this function (i.e., our own DLL), then
-/// `GetProcAddress(out, name)`. Mirrors the canonical pattern in
-/// `c_api/mod.rs::nsl_dl_path_for_fn_addr`. We pass our own function's
-/// address as the lookup anchor so the call works equally well from a
-/// `.dll`, `.exe`, or test binary.
+/// **Linux/POSIX:** `dladdr(self_fn)` gives our library's path; then
+/// `dlopen(path, RTLD_LAZY|RTLD_NOLOAD)` returns a library-specific handle
+/// without a new load; then `dlsym(handle, name)` finds the symbol directly
+/// in our library. Cannot use `RTLD_DEFAULT` (NULL) because ORT 1.22
+/// opens custom-op libraries with `RTLD_LOCAL`, which excludes them from
+/// the global symbol table that `RTLD_DEFAULT` searches.
+///
+/// **Windows:** `GetModuleHandleExW(FROM_ADDRESS, self_fn)` finds our DLL,
+/// then `GetProcAddress(module, name)` — no `RTLD_LOCAL` analog on Windows.
 pub(crate) unsafe fn resolve_self_symbol(name_ptr: *const c_char) -> usize {
     #[cfg(unix)]
     {
         extern "C" {
             fn dlsym(handle: *mut c_void, sym: *const c_char) -> *mut c_void;
         }
-        // RTLD_DEFAULT is a sentinel: NULL on Linux/macOS (POSIX). It tells
-        // dlsym to search the whole process symbol space, which includes
-        // this .so via the normal global symbol scope.
-        const RTLD_DEFAULT: *mut c_void = std::ptr::null_mut();
-        let p = dlsym(RTLD_DEFAULT, name_ptr);
-        p as usize
+
+        // --- macOS: RTLD_SELF searches only this dylib. -------------------
+        #[cfg(target_os = "macos")]
+        {
+            // RTLD_SELF = (void*)-3 on macOS. Tells dlsym to search only
+            // the dylib that contains the calling code, bypassing RTLD_LOCAL.
+            const RTLD_SELF: *mut c_void = (-3_isize as usize) as *mut c_void;
+            return dlsym(RTLD_SELF, name_ptr) as usize;
+        }
+
+        // --- Linux / other POSIX: dladdr + dlopen(RTLD_NOLOAD). -----------
+        //
+        // RTLD_DEFAULT (NULL on Linux) searches only the global symbol scope.
+        // ORT 1.22 opens custom-op libraries with dlopen(path, RTLD_LOCAL),
+        // which keeps their symbols out of the global scope. We need a
+        // library-specific handle instead.
+        #[cfg(not(target_os = "macos"))]
+        {
+            extern "C" {
+                fn dladdr(addr: *const c_void, info: *mut DlInfo) -> i32;
+                fn dlopen(filename: *const c_char, flag: i32) -> *mut c_void;
+                fn dlclose(handle: *mut c_void) -> i32;
+            }
+
+            // POSIX Dl_info layout (matches glibc and musl).
+            #[repr(C)]
+            struct DlInfo {
+                dli_fname: *const c_char, // path of .so containing addr
+                dli_fbase: *mut c_void,   // base load address of that .so
+                dli_sname: *const c_char, // nearest symbol name
+                dli_saddr: *mut c_void,   // nearest symbol address
+            }
+
+            // glibc/Linux values: RTLD_LAZY=1, RTLD_NOLOAD=4.
+            const RTLD_LAZY: i32 = 0x0001;
+            // RTLD_NOLOAD: return existing handle without loading; NULL if
+            // the library is not already resident (ours always is).
+            const RTLD_NOLOAD: i32 = 0x0004;
+
+            let mut info = DlInfo {
+                dli_fname: std::ptr::null(),
+                dli_fbase: std::ptr::null_mut(),
+                dli_sname: std::ptr::null(),
+                dli_saddr: std::ptr::null_mut(),
+            };
+            // Use this function's own address as an anchor into our .so.
+            if dladdr(resolve_self_symbol as *const c_void, &mut info) == 0
+                || info.dli_fname.is_null()
+            {
+                return 0;
+            }
+            // Get a handle to our already-loaded library. RTLD_NOLOAD does
+            // not re-load it; it just returns the existing mapping handle
+            // and increments the refcount. dlsym on this handle finds symbols
+            // in our specific library, regardless of RTLD_LOCAL.
+            let handle = dlopen(info.dli_fname, RTLD_LAZY | RTLD_NOLOAD);
+            if handle.is_null() {
+                return 0;
+            }
+            let p = dlsym(handle, name_ptr);
+            // Balance the refcount bump from dlopen(RTLD_NOLOAD).
+            dlclose(handle);
+            return p as usize;
+        }
+
+        // Both cfg branches above return explicitly. This trailing expression
+        // is the unix block's type anchor for the Rust type checker.
+        #[allow(unreachable_code)]
+        0_usize
     }
     #[cfg(windows)]
     {
