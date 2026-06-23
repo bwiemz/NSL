@@ -46,6 +46,16 @@ struct PerExportVtable {
     vtable: OrtCustomOp,
     /// Backing storage for `vtable.GetName`'s returned pointer.
     name_cstr: CString,
+    /// Pre-resolved `<name>__nsl_dispatch` function pointer. Resolved eagerly
+    /// during `make_custom_op_for_export` (inside `RegisterCustomOps`) rather
+    /// than lazily in `vtable_create_kernel` because:
+    ///   1. The correct dispatch symbol is `<name>__nsl_dispatch`, not the
+    ///      user-facing `<name>` (which has a different calling convention).
+    ///   2. `dlsym(RTLD_DEFAULT, ...)` is more reliable from within
+    ///      `RegisterCustomOps` (which executes in the library's load context)
+    ///      than from `vtable_create_kernel` (which executes at inference time
+    ///      when the library may have been opened with RTLD_LOCAL scope).
+    cached_dispatch_fn: usize,
 }
 
 // SAFETY: `PerExportVtable` contains only read-only function pointers and a
@@ -74,6 +84,16 @@ pub fn make_custom_op_for_export(idx: i64, name: *const c_char) -> *const OrtCus
     // codegen-emitted storage living forever (in case future codegen
     // changes that contract).
     let name_cstr = unsafe { CStr::from_ptr(name) }.to_owned();
+
+    // Resolve the dispatch symbol eagerly while we are still executing inside
+    // RegisterCustomOps (library load context). The export ABI uses the
+    // `<name>__nsl_dispatch` symbol, not the user-facing `<name>` symbol —
+    // see ExportRegistry::from_library_path in c_api/exports.rs which uses
+    // the same convention. Resolving here avoids RTLD_LOCAL issues at
+    // inference time and uses the correct symbol name.
+    let dispatch_sym = format!("{}__nsl_dispatch\0", name_cstr.to_str().unwrap_or(""));
+    let cached_dispatch_fn =
+        unsafe { resolve_self_symbol(dispatch_sym.as_ptr() as *const c_char) };
 
     let entry = Box::new(PerExportVtable {
         vtable: OrtCustomOp {
@@ -109,6 +129,7 @@ pub fn make_custom_op_for_export(idx: i64, name: *const c_char) -> *const OrtCus
             ReleaseAliasMap: vtable_release_alias_map,
         },
         name_cstr,
+        cached_dispatch_fn,
     });
 
     // The Box's heap allocation address is what we return; pushing the Box
@@ -144,16 +165,21 @@ unsafe extern "C" fn vtable_create_kernel(
     _info: *const OrtKernelInfo,
 ) -> *mut c_void {
     let entry = op as *const PerExportVtable;
-    let name_ptr = (*entry).name_cstr.as_ptr();
-    let raw_fn = resolve_self_symbol(name_ptr);
+    // Use the dispatch pointer pre-resolved at registration time. This avoids
+    // two bugs: (1) the wrong symbol name (`<name>` vs `<name>__nsl_dispatch`),
+    // (2) RTLD_DEFAULT not finding symbols from RTLD_LOCAL-opened libraries at
+    // inference time.
+    let raw_fn = (*entry).cached_dispatch_fn;
     if raw_fn == 0 {
-        // Symbol not found. Return null kernel; ORT treats this as a
-        // create-kernel failure. (No status-returning variant in V1 —
-        // M62c migrates to CreateKernelV2 for proper error reporting.)
+        // Dispatch symbol not found at registration time — CreateKernel
+        // returns null. ORT treats this as a create-kernel failure.
+        // (No status-returning variant in V1 — M62c migrates to
+        // CreateKernelV2 for proper error reporting.)
         return std::ptr::null_mut();
     }
-    // SAFETY: dlsym/GetProcAddress returned a non-null pointer to a symbol
-    // codegen emitted with the `ExportFnPtr` signature.
+    // SAFETY: cached_dispatch_fn was resolved via resolve_self_symbol during
+    // make_custom_op_for_export. Codegen emits the `<name>__nsl_dispatch`
+    // symbol with the ExportFnPtr signature.
     let fn_ptr: ExportFnPtr = std::mem::transmute::<usize, ExportFnPtr>(raw_fn);
     let state = Box::new(NslOrtKernelState {
         api,
