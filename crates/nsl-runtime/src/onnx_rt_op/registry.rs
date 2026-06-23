@@ -116,12 +116,12 @@ pub fn make_custom_op_for_export(idx: i64, name: *const c_char) -> *const OrtCus
             GetVariadicInputHomogeneity: vtable_get_variadic_hom,
             GetVariadicOutputMinArity: vtable_get_variadic_min,
             GetVariadicOutputHomogeneity: vtable_get_variadic_hom,
-            // Post-V1 callbacks — Spec C registers V1 only. These slots
-            // must be populated (ORT 1.16+ reads them unconditionally),
-            // but the v2 paths are never invoked because we set the v1
-            // KernelCompute slot above.
-            CreateKernelV2: vtable_create_kernel_v2_unused,
-            KernelComputeV2: vtable_kernel_compute_v2_unused,
+            // V2 callbacks: ORT 1.16+ calls CreateKernelV2 / KernelComputeV2
+            // in preference to V1 whenever these slots are non-null.
+            // These implementations mirror the V1 logic with the V2 signature
+            // (status-returning) so ORT's preferred path works correctly.
+            CreateKernelV2: vtable_create_kernel_v2,
+            KernelComputeV2: vtable_kernel_compute_v2,
             InferOutputShapeFn: vtable_infer_output_shape_unused,
             GetStartVersion: vtable_get_start_version,
             GetEndVersion: vtable_get_end_version,
@@ -252,27 +252,46 @@ unsafe extern "C" fn vtable_get_variadic_hom(_op: *const OrtCustomOp) -> i32 {
 }
 
 // ---------------------------------------------------------------------------
-// V2 / 1.16+ vtable functions — populated with safe stubs.
+// V2 / 1.16+ vtable functions.
 //
-// Spec C v1 uses the V1 KernelCompute path. ORT 1.22 still reads these slots
-// during op registration even if it never invokes them through this op, so
-// they must contain valid function pointers.
+// ORT 1.16+ prefers CreateKernelV2 / KernelComputeV2 over their V1
+// counterparts whenever the slots are non-null. Populating them with stubs
+// that don't write to kernel_out causes ORT to run with a null kernel state
+// and produce None outputs. These implementations mirror the V1 logic but
+// use the V2 signature (returns *mut OrtStatus instead of void/ptr).
 // ---------------------------------------------------------------------------
 
-unsafe extern "C" fn vtable_create_kernel_v2_unused(
-    _op: *const OrtCustomOp,
-    _api: *const OrtApi,
+unsafe extern "C" fn vtable_create_kernel_v2(
+    op: *const OrtCustomOp,
+    api: *const OrtApi,
     _info: *const OrtKernelInfo,
-    _kernel_out: *mut *mut c_void,
+    kernel_out: *mut *mut c_void,
 ) -> *mut OrtStatus {
-    // Should never be called — Spec C registers via V1 CreateKernel.
-    std::ptr::null_mut()
+    let entry = op as *const PerExportVtable;
+    let raw_fn = (*entry).cached_dispatch_fn;
+    if raw_fn == 0 {
+        // Dispatch symbol was not found at registration time. Write null so
+        // KernelComputeV2 can detect the empty state and skip execution.
+        *kernel_out = std::ptr::null_mut();
+        return std::ptr::null_mut();
+    }
+    let fn_ptr: ExportFnPtr = std::mem::transmute::<usize, ExportFnPtr>(raw_fn);
+    let state = Box::new(NslOrtKernelState {
+        api,
+        fn_ptr,
+        model_ptr: 0, // v1: stateless exports only.
+    });
+    *kernel_out = Box::into_raw(state) as *mut c_void;
+    std::ptr::null_mut() // null OrtStatus* = success
 }
 
-unsafe extern "C" fn vtable_kernel_compute_v2_unused(
-    _op_kernel: *mut c_void,
-    _context: *mut OrtKernelContext,
+unsafe extern "C" fn vtable_kernel_compute_v2(
+    op_kernel: *mut c_void,
+    context: *mut OrtKernelContext,
 ) -> *mut OrtStatus {
+    if !op_kernel.is_null() {
+        nsl_ort_kernel_compute(op_kernel, context);
+    }
     std::ptr::null_mut()
 }
 
