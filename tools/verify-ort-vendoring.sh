@@ -95,9 +95,12 @@ echo "bindgen completed: $(wc -l < "${GENERATED}") lines generated."
 # from killing the script under `set -eo pipefail`. An empty UPSTREAM_SYMS
 # is caught explicitly below (which gives a clearer error than a silent exit).
 extract_types() {
+    # grep -o prints each match on its own line regardless of input line count.
+    # bindgen 0.72.x with --formatter=none emits all declarations on a single
+    # line; anchoring to ^ would find nothing. -o avoids that fragility.
     # shellcheck disable=SC2016
-    grep -hE '^(pub struct |pub enum |pub type )(Ort|ONNX)[A-Za-z0-9_]+' "$1" \
-        | sed -E 's/^(pub struct |pub enum |pub type )//; s/[^A-Za-z0-9_].*$//' \
+    grep -ohE '(pub struct |pub enum |pub type )(Ort|ONNX)[A-Za-z0-9_]+' "$1" \
+        | sed -E 's/^(pub struct |pub enum |pub type )//' \
         | sort -u || true
 }
 extract_types "${GENERATED}" > "${UPSTREAM_SYMS}"
