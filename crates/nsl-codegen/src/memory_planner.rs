@@ -812,29 +812,37 @@ pub fn compute_tensor_bytes(
     dtype: &nsl_semantic::types::DType,
 ) -> Option<(u64, SizeKind)> {
     let mut total_elems: u64 = 1;
+    let mut has_bounded = false;
     for dim in &shape.dims {
         match dim {
             nsl_semantic::types::Dim::Concrete(n) => {
                 total_elems = total_elems.saturating_mul(*n as u64);
             }
             nsl_semantic::types::Dim::Bounded { upper_bound, .. } => {
-                // Use upper bound for slab planning
+                // Use upper bound for slab planning; continue to accumulate
+                // remaining dims rather than returning early — a Bounded dim
+                // in the middle of a shape (e.g. [Bounded(B), Concrete(D)])
+                // requires all dims to be multiplied before the byte count is
+                // final.
                 let ub = *upper_bound as u64;
                 total_elems = total_elems.saturating_mul(ub);
-                let bytes = total_elems * dtype_byte_size(dtype);
-                return Some((
-                    bytes,
-                    SizeKind::Bounded {
-                        upper: bytes,
-                        symbolic_expr: format!("{:?}", shape),
-                    },
-                ));
+                has_bounded = true;
             }
             _ => return None, // Dynamic / Wildcard / Symbolic — can't plan
         }
     }
     let bytes = total_elems * dtype_byte_size(dtype);
-    Some((bytes, SizeKind::Static(bytes)))
+    if has_bounded {
+        Some((
+            bytes,
+            SizeKind::Bounded {
+                upper: bytes,
+                symbolic_expr: format!("{:?}", shape),
+            },
+        ))
+    } else {
+        Some((bytes, SizeKind::Static(bytes)))
+    }
 }
 
 /// Return the byte size of a DType.
@@ -1954,6 +1962,107 @@ mod tests {
             rematerialize(&allocs, &op_infos, crate::cost_model::REMAT_SCORE_THRESHOLD);
         // Input dies at 10 but recompute point is at 94 — cannot remat
         assert!(recomp_points.is_empty(), "cannot remat if inputs are dead");
+    }
+
+    // ── compute_tensor_bytes regression: Bounded dim NOT last in shape ────────
+    //
+    // Before the fix, compute_tensor_bytes returned early upon seeing a Bounded
+    // dimension, multiplying only the dims processed so far and dropping all
+    // subsequent Concrete dims. This caused silent slab-slot undersizing for
+    // any tensor shaped [Bounded(B), Concrete(D), ...] — the canonical batch ×
+    // hidden layout — resulting in aliased gradient accumulation buffers.
+
+    #[test]
+    fn compute_tensor_bytes_bounded_then_concrete_accumulates_all_dims() {
+        use nsl_semantic::types::{Dim, DType, Shape};
+        use string_interner::StringInterner;
+        use string_interner::backend::BucketBackend;
+        use string_interner::DefaultSymbol;
+
+        let mut interner: StringInterner<BucketBackend<DefaultSymbol>> = StringInterner::new();
+        let sym = nsl_ast::Symbol(interner.get_or_intern("B"));
+
+        // [Bounded(B=32), Concrete(64)] — typical batch × hidden tensor.
+        let shape = Shape {
+            dims: vec![
+                Dim::Bounded { name: sym, upper_bound: 32 },
+                Dim::Concrete(64),
+            ],
+        };
+
+        let (bytes, kind) = compute_tensor_bytes(&shape, &DType::F32)
+            .expect("should be plannable");
+
+        // Correct: 32 * 64 * 4 = 8192 bytes.
+        // Before fix: 32 * 4 = 128 bytes (missing the Concrete(64) factor).
+        assert_eq!(
+            bytes, 8192,
+            "compute_tensor_bytes must account for ALL dims including those \
+             after the first Bounded dim; got {bytes} (expected 8192)"
+        );
+        assert!(
+            matches!(kind, SizeKind::Bounded { upper: 8192, .. }),
+            "kind must be Bounded with upper=8192, got {:?}", kind
+        );
+    }
+
+    #[test]
+    fn compute_tensor_bytes_concrete_then_bounded_then_concrete() {
+        use nsl_semantic::types::{Dim, DType, Shape};
+        use string_interner::StringInterner;
+        use string_interner::backend::BucketBackend;
+        use string_interner::DefaultSymbol;
+
+        let mut interner: StringInterner<BucketBackend<DefaultSymbol>> = StringInterner::new();
+        let sym = nsl_ast::Symbol(interner.get_or_intern("S"));
+
+        // [Concrete(4), Bounded(S=8), Concrete(3)] — multi-axis bounded.
+        let shape = Shape {
+            dims: vec![
+                Dim::Concrete(4),
+                Dim::Bounded { name: sym, upper_bound: 8 },
+                Dim::Concrete(3),
+            ],
+        };
+
+        let (bytes, kind) = compute_tensor_bytes(&shape, &DType::F32)
+            .expect("should be plannable");
+
+        // Correct: 4 * 8 * 3 * 4 = 384 bytes.
+        // Before fix: 4 * 8 * 4 = 128 bytes (missing Concrete(3) factor).
+        assert_eq!(
+            bytes, 384,
+            "compute_tensor_bytes must continue past a Bounded dim; got {bytes} (expected 384)"
+        );
+        assert!(
+            matches!(kind, SizeKind::Bounded { upper: 384, .. }),
+            "kind must be Bounded with upper=384, got {:?}", kind
+        );
+    }
+
+    #[test]
+    fn compute_tensor_bytes_bounded_last_unchanged() {
+        use nsl_semantic::types::{Dim, DType, Shape};
+        use string_interner::StringInterner;
+        use string_interner::backend::BucketBackend;
+        use string_interner::DefaultSymbol;
+
+        let mut interner: StringInterner<BucketBackend<DefaultSymbol>> = StringInterner::new();
+        let sym = nsl_ast::Symbol(interner.get_or_intern("D"));
+
+        // [Concrete(16), Bounded(D=64)] — Bounded is last; fix must not change result.
+        let shape = Shape {
+            dims: vec![
+                Dim::Concrete(16),
+                Dim::Bounded { name: sym, upper_bound: 64 },
+            ],
+        };
+
+        let (bytes, _kind) = compute_tensor_bytes(&shape, &DType::F32)
+            .expect("should be plannable");
+
+        // 16 * 64 * 4 = 4096 bytes — same before and after fix.
+        assert_eq!(bytes, 4096, "Bounded-last case must yield 4096 bytes");
     }
 }
 
