@@ -175,9 +175,13 @@ def test_session_load_and_run_calls_nsl_add():
                 helper.make_tensor_value_info("c", TensorProto.FLOAT, [4]),
             ],
         )
+        # ir_version=8 keeps the model compatible with ORT 1.22.x (max IR 10).
+        # The unversioned `onnx` pip package (≥2.0) defaults to IR version 13
+        # which ORT 1.22.0 rejects; this test only needs basic graph loading.
         model = helper.make_model(
             graph,
             opset_imports=[helper.make_opsetid("com.nsl", 1)],
+            ir_version=8,
         )
 
         sess = ort.InferenceSession(model.SerializeToString(), sess_opts)
