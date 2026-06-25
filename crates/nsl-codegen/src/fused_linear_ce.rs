@@ -585,7 +585,7 @@ fn emit_fwd_kernel(cfg: &FusedLinearCEConfig) -> String {
     lines.push(p("\t@!%pth0 bra INIT_DONE;"));
     lines.push(p("\tmov.u64 %rd6, smem_scratch;"));
     lines.push(format!("\tadd.u64 %rd6, %rd6, {lat_offset};"));
-    lines.push(p("\tst.shared.f32 [%rd6], 0f80800000; // -INF sentinel"));
+    lines.push(p("\tst.shared.f32 [%rd6], 0fFF800000; // -INF sentinel (f32 IEEE 754 -INF)"));
     lines.push(p("INIT_DONE:"));
     lines.push(p("\tbar.sync 0;"));
     lines.push(String::new());
@@ -615,7 +615,7 @@ fn emit_fwd_kernel(cfg: &FusedLinearCEConfig) -> String {
     lines.push(String::new());
 
     // Init online-softmax accumulators.
-    lines.push(p("\tmov.f32 %fmax, 0f80800000; // -INF"));
+    lines.push(p("\tmov.f32 %fmax, 0fFF800000; // -INF (f32, IEEE 754 binary32)"));
     lines.push(p("\tmov.f32 %fsum, 0f00000000; // 0.0"));
     lines.push(String::new());
 
@@ -710,7 +710,7 @@ fn emit_fwd_kernel(cfg: &FusedLinearCEConfig) -> String {
     lines.push(String::new());
 
     // Step 1: find tile_max.
-    lines.push(p("\t\tmov.f32 %ftmax, 0f80800000;"));
+    lines.push(p("\t\tmov.f32 %ftmax, 0fFF800000; // -INF (f32)"));
     lines.push(p("\t\tmov.u32 %r10, 0;"));
     lines.push(p("\t\tSMEM_MAX_LOOP:"));
     lines.push(p("\t\t\tadd.u32 %r11, %r4, %r10; // v_base + i"));
@@ -937,7 +937,7 @@ fn emit_fwd_kernel_f16(cfg: &FusedLinearCEConfig) -> String {
     lines.push(String::new());
 
     // Init online-softmax accumulators (f32).
-    lines.push(p("\tmov.f32 %fmax, 0f80800000; // -INF (f32)"));
+    lines.push(p("\tmov.f32 %fmax, 0fFF800000; // -INF (f32, IEEE 754 binary32 sign=1 exp=0xFF mant=0)"));
     lines.push(p("\tmov.f32 %fsum, 0f00000000;"));
     lines.push(String::new());
 
@@ -1035,7 +1035,7 @@ fn emit_fwd_kernel_f16(cfg: &FusedLinearCEConfig) -> String {
     lines.push(String::new());
 
     // Step 1: find tile_max (read fp16 → cvt to f32, fold into f32 max).
-    lines.push(p("\t\tmov.f32 %ftmax, 0f80800000;"));
+    lines.push(p("\t\tmov.f32 %ftmax, 0fFF800000; // -INF (f32)"));
     lines.push(p("\t\tmov.u32 %r10, 0;"));
     lines.push(p("\t\tSMEM_MAX_LOOP:"));
     lines.push(p("\t\t\tadd.u32 %r11, %r4, %r10; // v_base + i"));
@@ -1303,7 +1303,7 @@ fn emit_large_partials_kernel(cfg: &FusedLinearCEConfig, emit_header: bool) -> S
 
     // Tail-zero (v_idx out of bounds): store -INF so it doesn't perturb max/sum.
     lines.push(p("LP_INNER_TAIL_ZERO:"));
-    lines.push(p("\t\tmov.f32 %facc, 0f80800000; // -INF"));
+    lines.push(p("\t\tmov.f32 %facc, 0fFF800000; // -INF (f32, IEEE 754 binary32)"));
     lines.push(String::new());
 
     // Store logit to smem[slot*4].
@@ -1327,7 +1327,7 @@ fn emit_large_partials_kernel(cfg: &FusedLinearCEConfig, emit_header: bool) -> S
     lines.push(String::new());
 
     // Pass 1: find tile_max over smem[0..vtile].
-    lines.push(p("\tmov.f32 %ftmax, 0f80800000;"));
+    lines.push(p("\tmov.f32 %ftmax, 0fFF800000; // -INF (f32)"));
     lines.push(p("\tmov.u32 %r12, 0;"));
     lines.push(p("LP_RED_MAX:"));
     lines.push(p("\t\tshl.b32 %r13, %r12, 2;"));
@@ -1476,7 +1476,7 @@ fn emit_large_finalize_kernel(cfg: &FusedLinearCEConfig, emit_header: bool) -> S
     lines.push(String::new());
 
     // Online-LSE reduce across tiles.
-    lines.push(p("\tmov.f32 %fmax, 0f80800000; // -INF"));
+    lines.push(p("\tmov.f32 %fmax, 0fFF800000; // -INF (f32, IEEE 754 binary32)"));
     lines.push(p("\tmov.f32 %fsum, 0f00000000;"));
     lines.push(p("\tmov.u32 %r3, 0; // tile_idx"));
     lines.push(p("LF_LOOP:"));
@@ -2102,7 +2102,7 @@ fn emit_large_partials_kernel_f16(cfg: &FusedLinearCEConfig) -> String {
     lines.push(String::new());
 
     // Reduce smem fp16 tile to (tile_max, tile_sum_unscaled) in f32.
-    lines.push(p("\tmov.f32 %ftmax, 0f80800000;"));
+    lines.push(p("\tmov.f32 %ftmax, 0fFF800000; // -INF (f32)"));
     lines.push(p("\tmov.u32 %r12, 0;"));
     lines.push(p("LP_RED_MAX:"));
     lines.push(p("\t\tshl.b32 %r13, %r12, 1; // *2"));
@@ -2234,7 +2234,7 @@ fn emit_large_finalize_kernel_f16(cfg: &FusedLinearCEConfig) -> String {
     lines.push(String::new());
 
     // Online-LSE reduce — identical to F32 path (partials are f32).
-    lines.push(p("\tmov.f32 %fmax, 0f80800000;"));
+    lines.push(p("\tmov.f32 %fmax, 0fFF800000; // -INF (f32)"));
     lines.push(p("\tmov.f32 %fsum, 0f00000000;"));
     lines.push(p("\tmov.u32 %r3, 0;"));
     lines.push(p("LF_LOOP:"));
@@ -2818,7 +2818,7 @@ fn emit_fwd_kernel_bf16(cfg: &FusedLinearCEConfig) -> String {
     lines.push(String::new());
 
     // Init online-softmax accumulators (f32).
-    lines.push(p("\tmov.f32 %fmax, 0f80800000; // -INF (f32)"));
+    lines.push(p("\tmov.f32 %fmax, 0fFF800000; // -INF (f32, IEEE 754 binary32 sign=1 exp=0xFF mant=0)"));
     lines.push(p("\tmov.f32 %fsum, 0f00000000;"));
     lines.push(String::new());
 
@@ -2916,7 +2916,7 @@ fn emit_fwd_kernel_bf16(cfg: &FusedLinearCEConfig) -> String {
     lines.push(String::new());
 
     // Step 1: find tile_max (read bf16 → cvt to f32, fold into f32 max).
-    lines.push(p("\t\tmov.f32 %ftmax, 0f80800000;"));
+    lines.push(p("\t\tmov.f32 %ftmax, 0fFF800000; // -INF (f32)"));
     lines.push(p("\t\tmov.u32 %r10, 0;"));
     lines.push(p("\t\tSMEM_MAX_LOOP:"));
     lines.push(p("\t\t\tadd.u32 %r11, %r4, %r10; // v_base + i"));
@@ -3217,7 +3217,7 @@ fn emit_large_partials_kernel_bf16(cfg: &FusedLinearCEConfig) -> String {
     lines.push(String::new());
 
     // Reduce smem bf16 tile to (tile_max, tile_sum_unscaled) in f32.
-    lines.push(p("\tmov.f32 %ftmax, 0f80800000;"));
+    lines.push(p("\tmov.f32 %ftmax, 0fFF800000; // -INF (f32)"));
     lines.push(p("\tmov.u32 %r12, 0;"));
     lines.push(p("LP_RED_MAX:"));
     lines.push(p("\t\tshl.b32 %r13, %r12, 1; // *2"));
@@ -3349,7 +3349,7 @@ fn emit_large_finalize_kernel_bf16(cfg: &FusedLinearCEConfig) -> String {
     lines.push(String::new());
 
     // Online-LSE reduce — identical to F32 path (partials are f32).
-    lines.push(p("\tmov.f32 %fmax, 0f80800000;"));
+    lines.push(p("\tmov.f32 %fmax, 0fFF800000; // -INF (f32)"));
     lines.push(p("\tmov.f32 %fsum, 0f00000000;"));
     lines.push(p("\tmov.u32 %r3, 0;"));
     lines.push(p("LF_LOOP:"));

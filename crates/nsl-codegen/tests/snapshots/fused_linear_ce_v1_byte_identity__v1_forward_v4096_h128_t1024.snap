@@ -1,6 +1,5 @@
 ---
 source: crates/nsl-codegen/tests/fused_linear_ce_v1_byte_identity.rs
-assertion_line: 44
 expression: s
 ---
 .version 7.0
@@ -41,7 +40,7 @@ expression: s
 	@!%pth0 bra INIT_DONE;
 	mov.u64 %rd6, smem_scratch;
 	add.u64 %rd6, %rd6, 4096;
-	st.shared.f32 [%rd6], 0f80800000; // -INF sentinel
+	st.shared.f32 [%rd6], 0fFF800000; // -INF sentinel (f32 IEEE 754 -INF)
 INIT_DONE:
 	bar.sync 0;
 
@@ -63,7 +62,7 @@ INIT_DONE:
 	shl.b64 %rd8, %rd8, 2;
 	add.u64 %rd8, %rd0, %rd8; // %rd8 = x_row_base
 
-	mov.f32 %fmax, 0f80800000; // -INF
+	mov.f32 %fmax, 0fFF800000; // -INF (f32, IEEE 754 binary32)
 	mov.f32 %fsum, 0f00000000; // 0.0
 
 	mov.u32 %r3, 0; // tile_idx
@@ -135,7 +134,7 @@ TILE_LOOP:
 		setp.eq.u32 %pth0, %r1, 0;
 		@!%pth0 bra TILE_REDUCE_DONE;
 
-		mov.f32 %ftmax, 0f80800000;
+		mov.f32 %ftmax, 0fFF800000; // -INF (f32)
 		mov.u32 %r10, 0;
 		SMEM_MAX_LOOP:
 			add.u32 %r11, %r4, %r10; // v_base + i
