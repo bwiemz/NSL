@@ -1158,17 +1158,19 @@ pub fn synthesize_backward_with_recompute(
         smem_layout::validate_scalar_v2_config(config, smem_layout::Direction::Backward)
             .map_err(|e| format!("backward validator (checkpoint=Full) rejected: {e}"))?;
 
-        // Functional emission landing point — empty in cycle 10 v1.
-        // Cycle 11 wires:
-        //   * suppress `kv_load::emit_k_suffixed` / `emit_v_suffixed`
-        //     when `config.checkpoint.is_some()`,
-        //   * route `emit_prologue_recompute` output into
-        //     `%k_smem_base` / `%v_smem_base` so downstream
-        //     `ds_compute` / `dqdk_accum` / `dv_accum` see recomputed
-        //     projections,
-        //   * GPU numerical validation: atol=5e-4 rtol=5e-3 at
-        //     hd in {64,128}, S in {512, 2048, 4096}.
-        unreachable!("R0 must fire before reaching the emission landing point")
+        // Cycle-11 Task 4 functional emission landing point. When the
+        // refusal cascade above passed (i.e., the config is recompute-
+        // eligible) and R0 was bypassed via the cfg-gated
+        // `bypass_r0_for_testing()` seam, route to the tier-b scalar
+        // synthesizer. That synthesizer's `checkpoint.is_some()`
+        // dispatch fork at the kv_load call site swaps the HBM-load
+        // emitters for `emit_kv_recompute`, which writes recomputed K/V
+        // into `%k_smem_base` / `%v_smem_base` for the downstream
+        // `ds_compute` / `dv_accum` / `dqdk_accum` consumers. GPU
+        // numerical validation (G4: atol=5e-4 rtol=5e-3 at
+        // hd in {64,128}, S in {512, 2048, 4096}) lands in cycle 12 and
+        // lifts R0 in production.
+        synthesize_backward_with_tier_b(config, None)
     }
 }
 
@@ -1446,8 +1448,19 @@ pub fn synthesize_backward_with_tier_b(
         ));
         ptx.push_str("    cvt.u32.u64 %r_qt_ord_TB_BWD, %rd_qt_ord_TB_BWD;\n");
     }
-    phases::backward::kv_load::emit_k_suffixed(&mut ptx, config, "MAIN");
-    phases::backward::kv_load::emit_v_suffixed(&mut ptx, config, "MAIN");
+    // Cycle-11 Task 4 dispatch fork: when `@checkpoint` decorated the
+    // enclosing fn, the kv_load emitters (which expect K/V to be already
+    // resident in HBM) are replaced with `emit_kv_recompute`, which
+    // re-derives K/V into `%k_smem_base`/`%v_smem_base` from saved
+    // x_raw_ptr + W_k/W_v projection weights. R0 still guards production
+    // (lifted only via the cfg-gated `bypass_r0_for_testing()` seam);
+    // this fork is reached only when R0 is bypassed under test.
+    if config.checkpoint.is_some() {
+        phases::backward::csha_hooks_backward::emit_kv_recompute(&mut ptx, config, "MAIN");
+    } else {
+        phases::backward::kv_load::emit_k_suffixed(&mut ptx, config, "MAIN");
+        phases::backward::kv_load::emit_v_suffixed(&mut ptx, config, "MAIN");
+    }
     for (tag, off, total, per_thread) in [
         ("DV", dv_off, dk_dv_cells, cells_per_thread),
         ("DK", dk_off, dk_dv_cells, cells_per_thread),

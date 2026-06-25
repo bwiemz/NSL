@@ -62,6 +62,16 @@ required-features = ["calibrate"]
 name = "build_wggo_fixtures"
 path = "src/bin/build_wggo_fixtures.rs"
 
+# Cycle-11 Task 4 structural probes. The G3a-G3d gates exercise the
+# `bypass_r0_for_testing()` builder on `CheckpointExtras`, which is
+# `#[cfg(any(test, feature = "test-helpers"))]`-gated. Integration
+# tests compile as separate crates, so `cfg(test)` is NOT active on
+# the `nsl-codegen` lib — we MUST enable the `test-helpers` feature.
+[[test]]
+name = "checkpoint_cycle11_structural"
+path = "tests/checkpoint_cycle11_structural.rs"
+required-features = ["test-helpers"]
+
 [[bin]]
 name = "bench"
 path = "src/bin/bench.rs"
