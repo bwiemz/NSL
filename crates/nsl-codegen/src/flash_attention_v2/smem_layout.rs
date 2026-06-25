@@ -181,38 +181,54 @@ pub fn tier_b2_proj_backward_smem_bytes(config: &FlashAttentionConfig) -> u32 {
     rms_end - tier_b2_proj_backward_smem_base(config)
 }
 
-/// Cycle-10 §5.3 Task 7: extra SMEM scratch the `policy="full"` recompute
+/// Cycle-11 §4 update: extra SMEM scratch the `policy="full"` recompute
 /// path needs on top of the existing forward + backward tiles to hold the
 /// re-derived prologue values during backward.
 ///
-/// Byte math (all f16 storage — backward consumes 16-bit prologue tiles
-/// because they are reproduced from forward-precision inputs and immediately
-/// fed back into f32 accumulators downstream):
-///   - `x_norm` tile: `block_q * head_dim * 2` bytes
-///   - `Q_proj` tile: `block_q * head_dim * 2`
-///   - `K_proj` tile: `block_q * head_dim * 2`
-///   - `V_proj` tile: `block_q * head_dim * 2`
-///   - `Q_rope` tile: `block_q * head_dim * 2`
-///   - `K_rope` tile: `block_q * head_dim * 2`
+/// **Cycle-11 3-tile strategy (NOT 6).** Cycle 10 reserved 6 tiles
+/// (x_norm, Q_proj, K_proj, V_proj, Q_rope, K_rope) conservatively. The
+/// cycle-11 functional-substitution wiring observes that K_proj and V_proj
+/// can be written back into the existing `%k_smem_base` / `%v_smem_base`
+/// slots (overwriting the now-unused kv_load tiles — those are dispatched
+/// off when `checkpoint.is_some()`). Q_proj is the only producer whose
+/// downstream consumer survives, but in v1.1 the only required NEW SMEM
+/// surface is the **xnorm scratch** read by both projection-recompute
+/// matmuls. K_rope rotation is applied in place on `%k_smem_base` via
+/// `emit_rope_k_epilogue` (same as forward), needing no extra scratch.
 ///
-/// Conservatively rolled up as `6 * block_q * head_dim * 2` = 12 bq * hd
-/// bytes. We round the comment-line constant to `4 * block_q * head_dim * 2`
-/// in the spec body for the "approximate main tiles" tally and add a
-/// second 8-byte-per-element term for the two RoPE intermediates to keep
-/// the validator honest:
+/// Byte math: **1 tile × f16** =
 ///
-///   recompute_extra_bytes = 4 * bq * hd * 2 + 2 * bq * hd * 2
-///                         = 6 * bq * hd * 2
-///                         = 12 * bq * hd  (bytes)
+///   recompute_extra_bytes = 1 * block_q * head_dim * 2
+///                         = 2 * bq * hd  (bytes)
 ///
-/// At hd=64, bq=64 this is 12*64*64 = 49152 = 48 KB.
-/// At hd=256, bq=128 it is 12*256*128 = 393216 = 384 KB (definitively over
-/// the 99 KB Blackwell cap, exercising the R5 refusal path).
+/// At hd=64, bq=64 this is 2*64*64 = 8192 = 8 KB.
+/// At hd=256, bq=128 it is 2*256*128 = 65536 = 64 KB (the R5 large-config
+/// refusal still trips because the forward+backward base layout at
+/// hd=256/bq=128 exceeds 99 KB on its own; the recompute term is no longer
+/// the dominant overflow source but the cap-check still rejects).
 pub fn recompute_extra_bytes(config: &FlashAttentionConfig) -> usize {
     let bq = config.block_q as usize;
     let hd = config.head_dim as usize;
-    // 6 prologue tiles × f16 (2 bytes) per element.
-    6 * bq * hd * 2
+    // Cycle-11: single xnorm scratch tile (f16). K_proj/V_proj reuse
+    // `%k_smem_base`/`%v_smem_base`; K_rope rotates in place.
+    bq * hd * 2
+}
+
+/// Cycle-11 §4 helper: byte offset of the new xnorm scratch tile within
+/// the dynamic-SMEM region, used by `emit_prologue_recompute_from_raw`
+/// to write the recomputed `x_norm[block_q, head_dim]` (f16, row-major,
+/// stride `head_dim*2`).
+///
+/// The xnorm scratch slot lives at the very top of the recompute extra
+/// region (immediately past the forward + backward layouts). Total budget
+/// allocated for this slot is `recompute_extra_bytes(config)` =
+/// `block_q * head_dim * 2` bytes — exactly one tile.
+pub fn recompute_xnorm_offset(config: &FlashAttentionConfig) -> u32 {
+    // Anchor at the end of the backward extra region — the forward tiles
+    // occupy `total_bytes(config)`, the backward extra (`dQ`/`dK`/`dV`/
+    // `x_norm`/`dx_norm`/`rms_strip`/`P`) sits after, and the recompute
+    // xnorm scratch comes last.
+    total_bytes(config) + backward_extra_bytes(config)
 }
 
 /// Runtime validation called by `synthesize_flash_attention_ptx_v2`.
@@ -1129,20 +1145,37 @@ mod tests {
     }
 
     #[test]
-    fn cycle10_task7_recompute_extra_bytes_byte_math() {
-        // 6 prologue tiles * f16 (2 bytes) per element.
-        // At hd=64, bq=64: 6 * 64 * 64 * 2 = 49152 bytes.
+    fn cycle11_recompute_extra_bytes_byte_math() {
+        // Cycle-11 §4: shrunk to 1 xnorm scratch tile (was 6 in cycle-10).
+        // K_proj/V_proj reuse %k_smem_base / %v_smem_base; K_rope rotates
+        // in place. Only the f16 xnorm scratch needs new SMEM.
+        //
+        // At hd=64, bq=64: 1 * 64 * 64 * 2 = 8192 bytes.
         let mut cfg = base_cfg();
         cfg.block_q = 64;
         cfg.block_kv = 64;
         cfg.head_dim = 64;
-        assert_eq!(recompute_extra_bytes(&cfg), 49152);
+        assert_eq!(recompute_extra_bytes(&cfg), 8192);
 
-        // At hd=256, bq=128: 6 * 128 * 256 * 2 = 393216 bytes.
+        // At hd=256, bq=128: 1 * 128 * 256 * 2 = 65536 bytes.
         cfg.block_q = 128;
         cfg.block_kv = 128;
         cfg.head_dim = 256;
-        assert_eq!(recompute_extra_bytes(&cfg), 393216);
+        assert_eq!(recompute_extra_bytes(&cfg), 65536);
+    }
+
+    #[test]
+    fn cycle11_recompute_xnorm_offset_above_backward_region() {
+        // The xnorm scratch slot must sit ABOVE the backward extra region
+        // so it can't collide with dQ/dK/dV/x_norm/rms_strip/P. This pins
+        // the offset to total_bytes + backward_extra_bytes — any future
+        // refactor that shifts either tile must re-validate this offset.
+        let mut cfg = base_cfg();
+        cfg.block_q = 64;
+        cfg.block_kv = 64;
+        cfg.head_dim = 64;
+        let off = recompute_xnorm_offset(&cfg);
+        assert!(off >= total_bytes(&cfg) + backward_extra_bytes(&cfg));
     }
 
     #[test]

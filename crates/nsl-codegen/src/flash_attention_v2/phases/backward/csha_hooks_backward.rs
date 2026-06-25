@@ -38,7 +38,7 @@ use crate::flash_attention::FlashAttentionConfig;
 use crate::flash_attention_v2::smem_layout::{
     backward_dk_offset, backward_dq_offset, backward_dv_offset,
     backward_dx_norm_offset, backward_rms_strip_offset,
-    backward_x_norm_offset,
+    backward_x_norm_offset, recompute_xnorm_offset,
 };
 
 // ────────────────────────────────────────────────────────────────────────
@@ -875,6 +875,237 @@ pub fn emit_drmsnorm(ptx: &mut String, config: &FlashAttentionConfig, q_tile_ite
             "    shfl.sync.bfly.b32 %f_nw, %f_gd, {offset}, 31, 0xFFFFFFFF;\n"
         ));
         ptx.push_str("    add.f32 %f_gd, %f_gd, %f_nw;\n");
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────────
+// Cycle-11 §5: emit_prologue_recompute_from_raw
+//
+// Re-derives `x_norm = RMSNorm(x_raw)` for the current Q tile during the
+// backward pass, writing the result to a NEW SMEM scratch tile (NOT back
+// to HBM the way the forward `emit_prologue_namespaced` does). This breaks
+// the cycle-10 trap T7 (forward mutates `csha_x_ptr` in place, so the
+// backward cannot re-derive from there — it must read the un-normed
+// `x_raw_ptr` save channel).
+//
+// Reads/writes:
+//   - reads `[x_raw_ptr]`  (pre-RMSNorm raw x, f32 HBM,
+//                            layout [batch, heads, seq, head_dim])
+//   - reads `[csha_eps]`, `[csha_norm_weight_ptr]`
+//   - writes `%shmem_base + recompute_xnorm_offset(config)` (f16 SMEM,
+//            row-major [block_q, head_dim], stride `head_dim*2` bytes)
+//
+// Risk-3 guard: a null `x_raw_ptr` MUST NOT silently produce garbage —
+// emit `setp.eq.u64 %p_xraw_null, %rd_x_raw_ptr, 0;` + `@%p bra _SKIP`
+// before any `ld.global` from x_raw.
+//
+// Labels carry `<namespace_suffix>` so the backward path can emit this
+// inside the same PTX text section as the forward prologue without label
+// collision. Convention: forward uses `""`; backward callers pass e.g.
+// `"_bwd_recompute_0"`.
+// ────────────────────────────────────────────────────────────────────────
+
+/// Cycle-11 §5 / Task 2: emit a prologue-recompute pass that reads from
+/// `x_raw_ptr` (NOT `csha_x_ptr`) and writes the recomputed `x_norm`
+/// tile to a NEW SMEM scratch slot at `recompute_xnorm_offset(config)`.
+///
+/// `q_tile_iter` is plumbed into the label namespace the same way the
+/// forward emitter does. `namespace_suffix` MUST be unique per call
+/// site to avoid label collision with the in-section forward prologue.
+///
+/// This emitter is exercised under `cfg(test)` or with the `test-helpers`
+/// Cargo feature via `CheckpointExtras::bypass_r0_for_testing()`. In
+/// production the R0 refusal at `synthesize_backward_with_recompute`
+/// prevents reaching this codepath — see cycle-10 Phase F.
+pub fn emit_prologue_recompute_from_raw(
+    ptx: &mut String,
+    config: &FlashAttentionConfig,
+    q_tile_iter: u32,
+    namespace_suffix: &str,
+) {
+    if config.csha.is_none() {
+        ptx.push_str(
+            "    // Cycle-11 prologue-recompute-from-raw: csha=None, no emission\n",
+        );
+        return;
+    }
+    let head_dim = config.head_dim as u32;
+    let block_q = config.block_q as u32;
+    let xn_off = recompute_xnorm_offset(config);
+
+    ptx.push_str(&format!(
+        "    // Cycle-11 §5: RMSNorm(x_raw) -> SMEM xnorm scratch \
+         (q_tile_iter={q_tile_iter}, suffix='{namespace_suffix}', \
+         xn_off={xn_off})\n"
+    ));
+    ptx.push_str(&format!(
+        "V2_PROLOGUE_RECOMPUTE_FROM_RAW_ENTRY{namespace_suffix}:\n"
+    ));
+
+    // Risk-3: null-guard on x_raw_ptr. Silent garbage is the primary
+    // failure mode if forward save logic ever drops the x_raw write.
+    ptx.push_str("    ld.param.u64 %rd_x_raw_ptr, [x_raw_ptr];\n");
+    ptx.push_str("    setp.eq.u64 %p_xraw_null, %rd_x_raw_ptr, 0;\n");
+    ptx.push_str(&format!(
+        "    @%p_xraw_null bra V2_PROLOGUE_RECOMPUTE_FROM_RAW_DONE{namespace_suffix};\n"
+    ));
+
+    // One thread per row of the Q tile (block_q rows, tid_x identifies
+    // the row in this scope). Other lanes idle through both passes;
+    // matches `emit_xnorm_recompute`'s partition contract.
+    ptx.push_str(&format!(
+        "    setp.lt.u32 %p_row_active{namespace_suffix}, %tid_x, {block_q};\n"
+    ));
+    ptx.push_str(&format!(
+        "    @!%p_row_active{namespace_suffix} bra V2_PROLOGUE_RECOMPUTE_FROM_RAW_DONE{namespace_suffix};\n"
+    ));
+
+    // ── Address: x_raw_row_base = x_raw_ptr +
+    //               ((batch*heads + head_idx)*seq + (q_start+tid_x)) * head_dim * 4
+    //   (head_dim==d_model in the v1.1 smoke scope; see emit_xnorm_recompute).
+    ptx.push_str("    cvt.u64.u32 %rd_xr0, %tid_x;\n");
+    ptx.push_str("    add.u64 %rd_xr0, %rd_xr0, %q_start;        // row_global\n");
+    ptx.push_str("    mul.lo.u64 %rd_xr1, %head_idx, %rd6;       // head_idx * seq\n");
+    ptx.push_str("    add.u64 %rd_xr1, %rd_xr1, %rd_xr0;\n");
+    ptx.push_str("    mul.lo.u64 %rd_xr1, %rd_xr1, %rd7;         // * head_dim\n");
+    ptx.push_str("    shl.b64 %rd_xr1, %rd_xr1, 2;               // * 4 bytes f32\n");
+    ptx.push_str(
+        "    add.u64 %rd_xr_row, %rd_x_raw_ptr, %rd_xr1; // x_raw row base\n",
+    );
+
+    // ── Pass 1: mean_sq = sum_d x^2 / head_dim
+    ptx.push_str("    mov.f32 %f_xr_ms, 0f00000000;\n");
+    for d in 0..head_dim {
+        ptx.push_str(&format!(
+            "    ld.global.f32 %f_xr_v, [%rd_xr_row + {}];\n",
+            d * 4
+        ));
+        ptx.push_str("    fma.rn.f32 %f_xr_ms, %f_xr_v, %f_xr_v, %f_xr_ms;\n");
+    }
+    ptx.push_str(&format!(
+        "    mov.f32 %f_xr_tmp, 0f{:08X};  // 1/head_dim\n",
+        (1.0f32 / head_dim as f32).to_bits()
+    ));
+    ptx.push_str("    mul.f32 %f_xr_ms, %f_xr_ms, %f_xr_tmp;\n");
+    ptx.push_str("    ld.param.f32 %f_xr_tmp, [csha_eps];\n");
+    ptx.push_str("    add.f32 %f_xr_ms, %f_xr_ms, %f_xr_tmp;\n");
+    ptx.push_str("    sqrt.approx.f32 %f_xr_rms, %f_xr_ms;\n");
+    ptx.push_str("    rsqrt.approx.f32 %f_xr_rinv, %f_xr_ms;\n");
+
+    // ── xnorm scratch row base in SMEM (f16, stride head_dim*2).
+    ptx.push_str("    cvt.u64.u32 %rd_xr_sm, %tid_x;\n");
+    ptx.push_str(&format!(
+        "    mul.lo.u64 %rd_xr_sm, %rd_xr_sm, {};         // row * head_dim*2\n",
+        head_dim * 2
+    ));
+    ptx.push_str(&format!(
+        "    add.u64 %rd_xr_sm, %rd_xr_sm, {xn_off};      // + recompute_xnorm_offset\n"
+    ));
+    ptx.push_str("    add.u64 %rd_xr_sm, %shmem_base, %rd_xr_sm;\n");
+
+    // ── Pass 2: x_norm[d] = x[d] * rinv * norm_weight[d], f32 -> f16 store
+    ptx.push_str("    ld.param.u64 %rd_xr_nw, [csha_norm_weight_ptr];\n");
+    for d in 0..head_dim {
+        ptx.push_str(&format!(
+            "    ld.global.f32 %f_xr_v, [%rd_xr_row + {}];\n",
+            d * 4
+        ));
+        ptx.push_str(&format!(
+            "    ld.global.f32 %f_xr_w, [%rd_xr_nw + {}];\n",
+            d * 4
+        ));
+        ptx.push_str("    mul.f32 %f_xr_v, %f_xr_v, %f_xr_rinv;\n");
+        ptx.push_str("    mul.f32 %f_xr_v, %f_xr_v, %f_xr_w;\n");
+        ptx.push_str("    cvt.rn.f16.f32 %h_xr_v, %f_xr_v;\n");
+        ptx.push_str(&format!(
+            "    st.shared.b16 [%rd_xr_sm + {}], %h_xr_v;\n",
+            d * 2
+        ));
+    }
+
+    ptx.push_str(&format!(
+        "V2_PROLOGUE_RECOMPUTE_FROM_RAW_DONE{namespace_suffix}:\n"
+    ));
+    ptx.push_str(&format!(
+        "    bar.sync 0;  // xnorm scratch tile visible to all lanes ({namespace_suffix})\n"
+    ));
+}
+
+#[cfg(test)]
+mod cycle11_recompute_tests {
+    use super::*;
+    use crate::flash_attention::{
+        CheckpointExtras, CshaExtras, FlashAttentionConfig, RopeStyle,
+    };
+
+    fn cfg_full_bypass() -> FlashAttentionConfig {
+        FlashAttentionConfig {
+            block_q: 32, block_kv: 32, head_dim: 32,
+            causal: false, paged: false, rope_q: false,
+            rope_style: RopeStyle::HalfSplit,
+            gqa_group_size: 1, tree_mask: false, num_sink_tokens: 0, gpu_sm: 75,
+            segment_masked: false,
+            csha: Some(CshaExtras {
+                fused_projections: true,
+                save_activations_for_backward: true,
+                d_model: 32,
+                ..CshaExtras::default()
+            }),
+            checkpoint: Some(CheckpointExtras::full().bypass_r0_for_testing()),
+        }
+    }
+
+    #[test]
+    fn cycle11_emit_prologue_recompute_from_raw_uses_x_raw_not_csha_x_ptr() {
+        let cfg = cfg_full_bypass();
+        let mut ptx = String::new();
+        emit_prologue_recompute_from_raw(&mut ptx, &cfg, 0, "_bwd_recompute_0");
+
+        // Reads from x_raw_ptr (the Cycle-10 trap T7 fix).
+        assert!(
+            ptx.contains("ld.param.u64 %rd_x_raw_ptr, [x_raw_ptr]"),
+            "must load x_raw_ptr (NOT csha_x_ptr); ptx=\n{}",
+            ptx
+        );
+        // Risk-3 null guard
+        assert!(
+            ptx.contains("setp.eq.u64 %p_xraw_null, %rd_x_raw_ptr, 0"),
+            "missing Risk-3 null-guard on x_raw_ptr"
+        );
+        // Does NOT touch csha_x_ptr (which the forward path mutates in place)
+        assert!(
+            !ptx.contains("[csha_x_ptr]"),
+            "recompute path must not read csha_x_ptr (forward overwrites it)"
+        );
+        // Suffix-namespaced labels
+        assert!(
+            ptx.contains("V2_PROLOGUE_RECOMPUTE_FROM_RAW_ENTRY_bwd_recompute_0:"),
+            "missing namespaced ENTRY label"
+        );
+        assert!(
+            ptx.contains("V2_PROLOGUE_RECOMPUTE_FROM_RAW_DONE_bwd_recompute_0:"),
+            "missing namespaced DONE label"
+        );
+        // Writes the xnorm scratch tile (st.shared.b16) at the new offset
+        assert!(
+            ptx.contains("st.shared.b16"),
+            "must write f16 xnorm tile to SMEM scratch"
+        );
+        // Terminating bar.sync 0 post-condition
+        assert!(
+            ptx.contains("bar.sync 0"),
+            "must terminate with bar.sync 0 to satisfy SMEM visibility contract"
+        );
+    }
+
+    #[test]
+    fn cycle11_emit_prologue_recompute_from_raw_no_csha_is_noop() {
+        let mut cfg = cfg_full_bypass();
+        cfg.csha = None;
+        let mut ptx = String::new();
+        emit_prologue_recompute_from_raw(&mut ptx, &cfg, 0, "_bwd_recompute_0");
+        assert!(ptx.contains("csha=None, no emission"));
+        assert!(!ptx.contains("ld.param.u64 %rd_x_raw_ptr"));
     }
 }
 
