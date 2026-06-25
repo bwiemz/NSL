@@ -36,6 +36,26 @@
 //! returning `None` with an explicit panic message.
 //!
 //! No CUDA / no JIT execution — pure Cranelift IR shape assertion.
+//!
+//! ## Coverage gap (CFTP v5 follow-on Finding 8 — LOW)
+//!
+//! This test pins the IR shape (presence/absence of FFI calls + dtype_tag
+//! sentinel + kernel-name dtype suffix) but does NOT verify numerical
+//! correctness through the wengert lowering.  GPU-numerical coverage at
+//! V=49152 lives in
+//!   * `fused_linear_ce_fp16_v49152_numerical.rs`
+//!   * `fused_linear_ce_bf16_v49152_numerical.rs`
+//! and those tests bypass the wengert dispatch entirely (they allocate
+//! bf16/fp16 buffers themselves via `f32_slice_to_bf16_bits`).  So
+//! Finding 7's buffer-conformance gap (wengert tape emits f32 buffers,
+//! kernel reads bf16/fp16) is NOT observed by any test in this file.
+//!
+//! Mitigation: see `crates/nsl-runtime/src/fused_linear_ce.rs::refuse_non_f32_if_gated`
+//! — the runtime FFI can be hardened against this gap via the
+//! `NSL_FUSED_LCE_REFUSE_NON_F32=1` env var.  A CUDA-gated end-to-end
+//! test driving the full pipeline (NSL source → compile_wengert_ops →
+//! JIT → execute → compare against CPU f64 reference) is the v6 ladder
+//! step that closes the gap structurally.
 
 #![cfg(feature = "test-helpers")]
 
