@@ -31,7 +31,7 @@
 use nsl_codegen::fused_linear_ce::LARGE_VOCAB_THRESHOLD;
 use nsl_codegen::source_ad::WengertExtractor;
 use nsl_codegen::wengert::PrimalOp;
-use nsl_codegen::FusedCeDecoratorConfig;
+use nsl_codegen::{FusedCeDecoratorConfig, FusedCeDtypeHint};
 use nsl_lexer::Interner;
 
 /// Extract the Wengert list for the first FnDef in `src`, optionally
@@ -676,6 +676,72 @@ fn no_transpose_pattern_deferred_to_v5() {
 }
 
 // ─── Test 6: Sprint 4's explicit-call path still works ──────────────────
+
+// CFTP v5 follow-on Finding 9 (LOW): all pre-existing tests in this
+// file pass `dtype: None`, which maps to F32 via
+// `fused_ce_dtype_for_compiler` — so the auto-substitution path's
+// behaviour under fp16/bf16 dtype hints was never exercised at the
+// wengert layer.  The two tests below close that gap by asserting the
+// auto-substitution STILL fires under fp16 / bf16 hints (the lift in
+// v5 should NOT have changed substitution behaviour — substitution is
+// orthogonal to dtype, the dtype only affects downstream lowering).
+//
+// Combined with the activation IR tests in
+// `fused_lm_ce_activation_end_to_end.rs`, this re-establishes positive
+// coverage of the bf16/fp16 path from source → wengert → IR.
+
+#[test]
+fn auto_substitution_fires_with_bf16_dtype_hint() {
+    let cfg = FusedCeDecoratorConfig {
+        enabled: true,
+        vocab_tile: Some(1024),
+        vocab_size: Some(4096),
+        hidden_size: Some(128),
+        batch_size: Some(2),
+        seq_len: Some(32),
+        dtype: Some(FusedCeDtypeHint::Bf16),
+    };
+    let list = extract_first_fn(AUTO_SUB_SRC, Some(cfg))
+        .expect("extraction must succeed under bf16 hint");
+    assert_eq!(
+        count_fused(&list),
+        1,
+        "auto-substitution must still fire when dtype=Bf16 — the v5 lift \
+         only affects downstream wengert lowering, NOT the upstream \
+         pattern recognition.  A regression here would mean the dtype \
+         hint accidentally became a gate on substitution itself."
+    );
+    assert_eq!(
+        count_composite_ce(&list),
+        0,
+        "bf16 hint must NOT cause a fallback to composite cross_entropy"
+    );
+}
+
+#[test]
+fn auto_substitution_fires_with_fp16_dtype_hint() {
+    let cfg = FusedCeDecoratorConfig {
+        enabled: true,
+        vocab_tile: Some(1024),
+        vocab_size: Some(4096),
+        hidden_size: Some(128),
+        batch_size: Some(2),
+        seq_len: Some(32),
+        dtype: Some(FusedCeDtypeHint::F16),
+    };
+    let list = extract_first_fn(AUTO_SUB_SRC, Some(cfg))
+        .expect("extraction must succeed under fp16 hint");
+    assert_eq!(
+        count_fused(&list),
+        1,
+        "auto-substitution must still fire when dtype=F16",
+    );
+    assert_eq!(
+        count_composite_ce(&list),
+        0,
+        "fp16 hint must NOT cause a fallback to composite cross_entropy",
+    );
+}
 
 #[test]
 fn sprint4_explicit_call_path_still_works() {
