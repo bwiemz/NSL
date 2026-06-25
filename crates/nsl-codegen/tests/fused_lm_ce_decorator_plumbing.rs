@@ -33,6 +33,7 @@ fn analysis_to_fused_ce_configs(
             hidden_size: c.hidden_size,
             batch_size: c.batch_size,
             seq_len: c.seq_len,
+            dtype: None,
         })
         .collect()
 }

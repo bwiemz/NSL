@@ -130,6 +130,7 @@ fn auto_substitution_fires_when_decorator_enabled_and_pattern_matches() {
         hidden_size: Some(128),
         batch_size: Some(2),
         seq_len: Some(32),
+            dtype: None,
     };
     let list = extract_first_fn(AUTO_SUB_SRC, Some(cfg))
         .expect("extraction must succeed");
@@ -193,6 +194,7 @@ fn decorator_disabled_preserves_composite_cross_entropy() {
         hidden_size: Some(128),
         batch_size: Some(2),
         seq_len: Some(32),
+            dtype: None,
     };
     let list = extract_first_fn(AUTO_SUB_SRC, Some(cfg))
         .expect("extraction must succeed");
@@ -237,6 +239,7 @@ fn pattern_mismatch_falls_through_to_composite_even_when_enabled() {
         hidden_size: Some(128),
         batch_size: Some(2),
         seq_len: Some(32),
+            dtype: None,
     };
     // No upstream Matmul or Add — `cross_entropy` is called on a bare
     // function parameter.  The matcher MUST refuse.
@@ -266,6 +269,7 @@ fn pattern_mismatch_falls_through_to_composite_even_when_enabled() {
             hidden_size: Some(128),
             batch_size: Some(2),
             seq_len: Some(32),
+            dtype: None,
         }),
     )
     .expect("extraction must succeed");
@@ -292,6 +296,7 @@ fn auto_substitution_routes_large_vocab_to_two_kernel_path() {
         hidden_size: Some(512),
         batch_size: Some(1),
         seq_len: Some(64),
+            dtype: None,
     };
     let list = extract_first_fn(AUTO_SUB_SRC, Some(cfg))
         .expect("extraction must succeed");
@@ -335,6 +340,7 @@ fn auto_substitution_prunes_dead_composite_upstream_chain() {
         hidden_size: Some(128),
         batch_size: Some(2),
         seq_len: Some(32),
+            dtype: None,
     };
     let list = extract_first_fn(AUTO_SUB_SRC, Some(cfg))
         .expect("extraction must succeed");
@@ -417,6 +423,7 @@ fn ambiguous_add_matmul_matmul_pattern_is_rejected() {
         hidden_size: Some(128),
         batch_size: Some(2),
         seq_len: Some(32),
+            dtype: None,
     };
     let list = extract_first_fn(ADD_MATMUL_MATMUL_SRC, Some(cfg))
         .expect("extraction must succeed");
@@ -448,6 +455,7 @@ fn sprint4_explicit_call_path_still_works() {
         hidden_size: Some(128),
         batch_size: Some(2),
         seq_len: Some(32),
+            dtype: None,
     };
     let list = extract_first_fn(EXPLICIT_CALL_SRC, Some(cfg))
         .expect("extraction must succeed");

@@ -101,6 +101,7 @@ fn step(x: Tensor, w: Tensor, bias: Tensor, targets: Tensor) -> Tensor:
         hidden_size: Some(128),
         batch_size: Some(2),
         seq_len: Some(64),
+            dtype: None,
     };
     let list = extract_first_fn(src, Some(cfg)).expect("extraction must succeed");
     let fused: Vec<_> = list
@@ -156,6 +157,7 @@ fn step(x: Tensor, w: Tensor, bias: Tensor, targets: Tensor) -> Tensor:
         hidden_size: Some(512),
         batch_size: Some(1),
         seq_len: Some(64),
+            dtype: None,
     };
     let list = extract_first_fn(src, Some(cfg)).expect("extraction must succeed");
     let is_large = list
@@ -187,6 +189,7 @@ fn step(x: Tensor, w: Tensor, bias: Tensor, targets: Tensor) -> Tensor:
         hidden_size: Some(128),
         batch_size: Some(2),
         seq_len: Some(64),
+            dtype: None,
     };
     let list = extract_first_fn(src, Some(cfg));
     if let Some(list) = list {
@@ -216,6 +219,7 @@ fn step(x: Tensor, w: Tensor, bias: Tensor, targets: Tensor) -> Tensor:
         hidden_size: Some(128),
         batch_size: Some(2),
         seq_len: Some(64),
+            dtype: None,
     };
     let list = extract_first_fn(src, Some(cfg));
     if let Some(list) = list {
@@ -319,6 +323,7 @@ fn step(x: Tensor, w: Tensor, bias: Tensor, targets: Tensor) -> Tensor:
         hidden_size: Some(128),
         batch_size: Some(1),
         seq_len: Some(64),
+            dtype: None,
     };
     let list = extract_first_fn(src, Some(cfg)).expect("extraction must succeed");
     let is_large = list
