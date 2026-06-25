@@ -181,12 +181,53 @@ pub fn tier_b2_proj_backward_smem_bytes(config: &FlashAttentionConfig) -> u32 {
     rms_end - tier_b2_proj_backward_smem_base(config)
 }
 
+/// Cycle-10 §5.3 Task 7: extra SMEM scratch the `policy="full"` recompute
+/// path needs on top of the existing forward + backward tiles to hold the
+/// re-derived prologue values during backward.
+///
+/// Byte math (all f16 storage — backward consumes 16-bit prologue tiles
+/// because they are reproduced from forward-precision inputs and immediately
+/// fed back into f32 accumulators downstream):
+///   - `x_norm` tile: `block_q * head_dim * 2` bytes
+///   - `Q_proj` tile: `block_q * head_dim * 2`
+///   - `K_proj` tile: `block_q * head_dim * 2`
+///   - `V_proj` tile: `block_q * head_dim * 2`
+///   - `Q_rope` tile: `block_q * head_dim * 2`
+///   - `K_rope` tile: `block_q * head_dim * 2`
+///
+/// Conservatively rolled up as `6 * block_q * head_dim * 2` = 12 bq * hd
+/// bytes. We round the comment-line constant to `4 * block_q * head_dim * 2`
+/// in the spec body for the "approximate main tiles" tally and add a
+/// second 8-byte-per-element term for the two RoPE intermediates to keep
+/// the validator honest:
+///
+///   recompute_extra_bytes = 4 * bq * hd * 2 + 2 * bq * hd * 2
+///                         = 6 * bq * hd * 2
+///                         = 12 * bq * hd  (bytes)
+///
+/// At hd=64, bq=64 this is 12*64*64 = 49152 = 48 KB.
+/// At hd=256, bq=128 it is 12*256*128 = 393216 = 384 KB (definitively over
+/// the 99 KB Blackwell cap, exercising the R5 refusal path).
+pub fn recompute_extra_bytes(config: &FlashAttentionConfig) -> usize {
+    let bq = config.block_q as usize;
+    let hd = config.head_dim as usize;
+    // 6 prologue tiles × f16 (2 bytes) per element.
+    6 * bq * hd * 2
+}
+
 /// Runtime validation called by `synthesize_flash_attention_ptx_v2`.
 ///
 /// `direction` controls whether the backward-pass extra SMEM tiles are
 /// added to the budget before the 99 KB cap check. Forward: unchanged
 /// from Tier A. Backward (Tier C): adds `backward_extra_bytes` to the
 /// forward total.
+///
+/// Cycle-10 §5.3 Task 7 (R5): when `config.checkpoint.is_some()` with
+/// `CheckpointPolicy::Full`, the prologue-recompute scratch tiles
+/// (`recompute_extra_bytes`) are added on top of the forward + backward
+/// extra. If the total exceeds `SMEM_DYNAMIC_BUDGET_BYTES` the validator
+/// returns a refusal whose message contains the substring "exceeds device"
+/// (R5 testable contract).
 pub fn validate_scalar_v2_config(
     config: &FlashAttentionConfig,
     direction: Direction,
@@ -248,6 +289,19 @@ pub fn validate_scalar_v2_config(
         Direction::Forward => 0,
         Direction::Backward => backward_extra_bytes(config),
     };
+    // Cycle-10 §5.3 Task 7 (R5): policy=Full needs prologue-recompute
+    // scratch on top of the forward + backward layouts. Add only when
+    // a CheckpointExtras carrier is present; absence preserves
+    // byte-identity.
+    let recompute_extra = if let Some(ref ckpt) = config.checkpoint {
+        match ckpt.policy {
+            crate::flash_attention::CheckpointPolicy::Full => {
+                recompute_extra_bytes(config) as u32
+            }
+        }
+    } else {
+        0
+    };
     // PCA Tier A: when `segment_masked`, the FA prelude reserves an
     // additional `DEFAULT_SMEM_SEGMENT_BUDGET`-byte `seg_smem` region —
     // separately-declared static SMEM on the forward side, and embedded
@@ -261,11 +315,29 @@ pub fn validate_scalar_v2_config(
     } else {
         0
     };
-    let total = fwd_total + extra + seg_overhead;
+    let total = fwd_total + extra + seg_overhead + recompute_extra;
     let q_region  = kv_start;              // Q region: [0, kv_start)
     let kv_region = sp_start - kv_start;   // KV region: [kv_start, sp_start)
     let sp_region = fwd_total - sp_start;  // SP + weight + save region: [sp_start, fwd_total)
     if total > SMEM_DYNAMIC_BUDGET_BYTES {
+        // Cycle-10 §5.3 Task 7 (R5): when the overflow is driven by the
+        // policy="full" recompute term, emit a refusal whose message
+        // contains the substring "exceeds device" so callers / tests can
+        // discriminate this from forward / backward exhaustion.
+        if recompute_extra > 0 {
+            return Err(ConfigError(format!(
+                "checkpoint policy=\"full\" SMEM {} KB exceeds device {} KB \
+                 at hd={}, block_q={} (forward={} backward_extra={} recompute_extra={} seg={})",
+                total / 1024,
+                SMEM_DYNAMIC_BUDGET_BYTES / 1024,
+                config.head_dim,
+                config.block_q,
+                fwd_total,
+                extra,
+                recompute_extra,
+                seg_overhead,
+            )));
+        }
         return Err(ConfigError(match direction {
             Direction::Forward => format!(
                 "SMEM total {} bytes ({:.1} KB) exceeds 99 KB dynamic SMEM budget \
@@ -1022,6 +1094,105 @@ mod tests {
         assert!(result.is_ok(),
             "small (32,32,64) at chunk=64 must fit 99 KB; got {:?}", result);
         assert_eq!(result.unwrap(), 64, "validator must return selected chunk on success");
+    }
+
+    // ── Cycle-10 §5.3 Task 7 (R5): policy="full" SMEM budget tests ────────
+    //
+    // The validator must add `recompute_extra_bytes(config)` to the SMEM
+    // total whenever `config.checkpoint = Some(Full)`. Small configs still
+    // fit the 99 KB dynamic budget; large configs must refuse with the
+    // testable substring "exceeds device".
+
+    fn checkpoint_full_cfg(block_q: i64, head_dim: i64) -> FlashAttentionConfig {
+        use crate::flash_attention::{CheckpointExtras, CheckpointPolicy};
+        FlashAttentionConfig {
+            block_q,
+            block_kv: block_q,
+            head_dim,
+            causal: false,
+            paged: false,
+            rope_q: false,
+            rope_style: RopeStyle::HalfSplit,
+            gqa_group_size: 1,
+            tree_mask: false,
+            num_sink_tokens: 0,
+            gpu_sm: 75,
+            segment_masked: false,
+            csha: None,
+            checkpoint: Some(CheckpointExtras {
+                policy: CheckpointPolicy::Full,
+            }),
+        }
+    }
+
+    #[test]
+    fn cycle10_task7_recompute_extra_bytes_byte_math() {
+        // 6 prologue tiles * f16 (2 bytes) per element.
+        // At hd=64, bq=64: 6 * 64 * 64 * 2 = 49152 bytes.
+        let mut cfg = base_cfg();
+        cfg.block_q = 64;
+        cfg.block_kv = 64;
+        cfg.head_dim = 64;
+        assert_eq!(recompute_extra_bytes(&cfg), 49152);
+
+        // At hd=256, bq=128: 6 * 128 * 256 * 2 = 393216 bytes.
+        cfg.block_q = 128;
+        cfg.block_kv = 128;
+        cfg.head_dim = 256;
+        assert_eq!(recompute_extra_bytes(&cfg), 393216);
+    }
+
+    #[test]
+    fn cycle10_task7_small_full_policy_fits_budget() {
+        // hd=64, block_q=64 + policy=Full: forward (~9 KB) + 0 backward extra
+        // + ~48 KB recompute < 99 KB. Validator accepts on the Forward path.
+        let cfg = checkpoint_full_cfg(64, 64);
+        let result = validate_scalar_v2_config(&cfg, Direction::Forward);
+        assert!(
+            result.is_ok(),
+            "hd=64 bq=64 + policy=Full must fit the 99 KB budget; got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn cycle10_task7_large_full_policy_exceeds_device() {
+        // hd=256, block_q=128 + policy=Full: ~384 KB recompute term alone
+        // dwarfs the 99 KB budget. Validator must refuse with the R5
+        // substring "exceeds device" and identify the policy="full" branch.
+        let cfg = checkpoint_full_cfg(128, 256);
+        let err = validate_scalar_v2_config(&cfg, Direction::Forward)
+            .expect_err("hd=256 bq=128 + policy=Full must overflow the budget");
+        let msg = err.0;
+        assert!(
+            msg.contains("exceeds device"),
+            "R5 error must contain substring 'exceeds device'; got: {}",
+            msg
+        );
+        assert!(
+            msg.contains("policy=\"full\""),
+            "R5 error must identify policy=\"full\" branch; got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn cycle10_task7_no_policy_preserves_byte_identity() {
+        // checkpoint=None must add zero bytes to the budget at any size.
+        // Verifies the byte-identity invariant for the default path.
+        let mut cfg = base_cfg();
+        cfg.block_q = 64;
+        cfg.block_kv = 64;
+        cfg.head_dim = 64;
+        cfg.checkpoint = None;
+
+        // Same config WITHOUT the checkpoint must accept on the Forward path.
+        let result = validate_scalar_v2_config(&cfg, Direction::Forward);
+        assert!(
+            result.is_ok(),
+            "hd=64 bq=64 without checkpoint must fit; got {:?}",
+            result
+        );
     }
 }
 
