@@ -1475,14 +1475,17 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
         ],
         Some(types::I64),
     ),
-    // CPDT Part III v2.5 Mixtral SwiGLU MoE FFN: per-expert kernel is
-    // `silu(gate) * up → down`. 10 i64 args: tokens, logits, experts_gate,
+    // CPDT Part III v2.5+v2.8 Mixtral gated MoE FFN: per-expert kernel is
+    // `gate_act(gate) * up → down` where gate_act is selected by
+    // gate_activation_kind. 11 i64 args: tokens, logits, experts_gate,
     // experts_up, experts_down, num_experts, top_k, capacity_factor_bits,
-    // hidden_dim, intermediate_dim. Output shape matches v3
+    // hidden_dim, intermediate_dim, gate_activation_kind (v2.8: 1=SwiGLU,
+    // 2=GeGLU, 3=ReGLU). Output shape matches v3
     // `[total_tokens, hidden_dim]`. See nsl-runtime/src/moe/ffi.rs.
     (
         "nsl_moe_dispatch_full_v4",
         &[
+            types::I64,
             types::I64,
             types::I64,
             types::I64,

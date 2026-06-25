@@ -70,10 +70,10 @@ let x = ones([2, 8])
 let y = m.forward(x)
 "#;
 
-const MOE_SWIGLU_WITH_GELU_SRC: &str = r#"from nsl.nn.losses import mse_loss
+const MOE_SWIGLU_WITH_IDENTITY_SRC: &str = r#"from nsl.nn.losses import mse_loss
 
 model Block:
-    @moe(num_experts=4, top_k=1, capacity_factor=2.0, activation="gelu")
+    @moe(num_experts=4, top_k=1, capacity_factor=2.0, activation="identity")
     experts_dummy: int = 4
     router: Tensor = ones([8, 4])
     experts_gate: Tensor = ones([4, 8 * 16])
@@ -90,22 +90,21 @@ let y = m.forward(x)
 "#;
 
 #[test]
-fn moe_dispatch_swiglu_with_non_silu_activation_errors_loudly() {
-    // SwiGLU is structurally `silu(gate) * up @ down` — the SiLU is
-    // wired into the v4 per-expert kernel, not a selectable arg.
-    // If a user writes `@moe(activation="gelu")` and calls
-    // moe_dispatch_swiglu, the source-level intent (gelu-gated FFN)
-    // does NOT match what v4 emits. Per the v2.4 INVALID-VALUE-FATAL
-    // convention, that mismatch is a hard build failure rather than
-    // silent silu emission. The @moe decorator is collected on FIELDS
-    // (compiler/collection.rs:526), so the fixture places it on a
-    // sentinel `experts_dummy` field to populate moe_configs.
+fn moe_dispatch_swiglu_with_identity_activation_errors_loudly() {
+    // CPDT Part III v2.8 — v4 now accepts gate_activation_kind ∈
+    // {1, 2, 3} (SwiGLU/GeGLU/ReGLU), so `@moe(activation="gelu")` and
+    // `@moe(activation="relu")` are now happy paths (covered by v2.8's
+    // CLI gate). But `activation="identity"` STAYS refused: a GLU with
+    // identity gate degenerates to `gate * up @ down`, which is not a
+    // known production MoE structure. Callers that genuinely want no
+    // gate should use `moe_dispatch_ffn` (v3 FFI) — a 2-weight FFN
+    // without a gate matrix at all.
     let tmp = TempDir::new().unwrap();
-    let src = tmp.path().join("moe_swiglu_gelu.nsl");
-    fs::write(&src, MOE_SWIGLU_WITH_GELU_SRC).unwrap();
+    let src = tmp.path().join("moe_swiglu_identity.nsl");
+    fs::write(&src, MOE_SWIGLU_WITH_IDENTITY_SRC).unwrap();
     let weights = tmp.path().join("weights.safetensors");
     write_unrelated_safetensors(&weights);
-    let out = tmp.path().join("moe_swiglu_gelu.o");
+    let out = tmp.path().join("moe_swiglu_identity.o");
 
     let mut cmd = Command::cargo_bin("nsl").unwrap();
     cmd.env("NSL_STDLIB_PATH", stdlib_path());
@@ -119,8 +118,9 @@ fn moe_dispatch_swiglu_with_non_silu_activation_errors_loudly() {
 
     cmd.assert().failure().stderr(
         predicate::str::contains("moe_dispatch_swiglu").and(
-            predicate::str::contains("SwiGLU FFI hardcodes silu(gate)*up")
-                .and(predicate::str::contains("Gelu")),
+            predicate::str::contains("identity").and(
+                predicate::str::contains("not a known production MoE structure"),
+            ),
         ),
     );
 }

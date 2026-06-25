@@ -278,9 +278,13 @@ pub struct MoeInfo {
     pub top_k: usize,
     pub capacity_factor: f32,
     pub aux_loss_coeff: f32,
-    /// CPDT Part III v2.4: activation for the v3 (paper-faithful FFN)
-    /// lowering path. Defaults to SiLU. Source: `@moe(activation="…")`
-    /// decorator kwarg. Unread by the v1/v2 lowering paths.
+    /// CPDT Part III v2.4/v2.8: activation for the v3 (paper-faithful
+    /// FFN) and v4 (SwiGLU/GeGLU/ReGLU) lowering paths. Defaults to SiLU
+    /// (kind=1 → SiLU on v3, SwiGLU on v4). Identity is REFUSED on v4
+    /// at the moe_dispatch_swiglu codegen boundary (see
+    /// `expr/calls.rs`); on v3 it is the explicit "no activation"
+    /// choice. v1/v2 lowering paths ignore this field. Source:
+    /// `@moe(activation="…")` decorator kwarg.
     pub activation: MoeActivation,
     /// CPDT Part III v2.7: optional WeightMap key prefix override.
     /// When `None` (the default), the v3/v4 lowering arms key into the

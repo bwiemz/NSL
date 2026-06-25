@@ -1003,11 +1003,14 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         },
     );
 
-    // CPDT Part III v2.5: Mixtral's SwiGLU MoE FFN intrinsic
+    // CPDT Part III v2.5+v2.8: Mixtral's gated MoE FFN intrinsic
     // (`moe_dispatch_swiglu(tokens, logits, experts_gate, experts_up,
     // experts_down)`). 5-arg opt-in that lowers to
-    // `nsl_moe_dispatch_full_v4` (silu(gate) * up → down). Coexists
-    // with v2 / v3 source intrinsics.
+    // `nsl_moe_dispatch_full_v4`. Gate activation selected by
+    // `@moe(activation="silu"|"gelu"|"relu")` — default silu→SwiGLU,
+    // gelu→GeGLU (v2.8), relu→ReGLU (v2.8). `@moe(activation="identity")`
+    // is refused at codegen (use `moe_dispatch_ffn` v3 for a 2-weight
+    // FFN). Coexists with v2 / v3 source intrinsics.
     def(
         "moe_dispatch_swiglu",
         Type::Function {

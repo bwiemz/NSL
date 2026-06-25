@@ -29,8 +29,13 @@ extern "C" {
         capacity_factor_bits: i64,
         hidden_dim: i64,
         intermediate_dim: i64,
+        gate_activation_kind: i64,
     ) -> i64;
 }
+
+/// v2.8 SwiGLU constant — preserves byte-for-byte the v2.5/v2.7
+/// behavior in this test file (which all predate gate_activation_kind).
+const SWIGLU: i64 = 1;
 
 fn make_f32_tensor(shape: &[i64], vals: &[f32]) -> i64 {
     let shape_list = nsl_list_new();
@@ -180,6 +185,7 @@ fn dispatch_v4_top_k_one_distinct_experts_matches_reference() {
             (2.0_f32).to_bits() as i64,
             hidden as i64,
             intermediate as i64,
+            SWIGLU,
         )
     };
     assert_ne!(out_ptr, 0, "v4 returned null for valid SwiGLU inputs");
@@ -269,6 +275,7 @@ fn dispatch_v4_top_k_two_symmetric_closed_form() {
             (2.0_f32).to_bits() as i64,
             2,
             2,
+            SWIGLU,
         )
     };
     assert_ne!(out_ptr, 0);
@@ -328,7 +335,7 @@ fn dispatch_v4_zero_gate_kills_expert_contribution_exactly() {
         nsl_moe_dispatch_full_v4(
             tokens_ptr, logits_ptr,
             w_gate_ptr, w_up_ptr, w_down_ptr,
-            2, 1, (2.0_f32).to_bits() as i64, 3, 2,
+            2, 1, (2.0_f32).to_bits() as i64, 3, 2, SWIGLU,
         )
     };
     assert_ne!(out_ptr, 0);
@@ -378,7 +385,7 @@ fn dispatch_v4_swiglu_differs_from_silu_when_gate_equals_up() {
         nsl_moe_dispatch_full_v4(
             tokens_ptr, logits_ptr,
             w_gate_ptr, w_up_ptr, w_down_ptr,
-            2, 1, (2.0_f32).to_bits() as i64, 2, 2,
+            2, 1, (2.0_f32).to_bits() as i64, 2, 2, SWIGLU,
         )
     };
     assert_ne!(out_ptr, 0);
@@ -433,7 +440,7 @@ fn dispatch_v4_refuses_invalid_inputs() {
 
     let v = |gate, up, down, ne, tk, h, i| unsafe {
         nsl_moe_dispatch_full_v4(
-            tokens_ptr, logits_ptr, gate, up, down, ne, tk, cap, h, i,
+            tokens_ptr, logits_ptr, gate, up, down, ne, tk, cap, h, i, SWIGLU,
         )
     };
 
@@ -459,7 +466,7 @@ fn dispatch_v4_refuses_invalid_inputs() {
     // which is instant UB. The refusal must precede from_ptr.
     let v_null = |t, l| unsafe {
         nsl_moe_dispatch_full_v4(
-            t, l, w_gate_ptr, w_up_ptr, w_down_ptr, 2, 1, cap, 2, 2,
+            t, l, w_gate_ptr, w_up_ptr, w_down_ptr, 2, 1, cap, 2, 2, SWIGLU,
         )
     };
     assert_eq!(v_null(0, logits_ptr), 0, "null tokens");
@@ -512,4 +519,288 @@ fn dispatch_v4_refuses_invalid_inputs() {
     nsl_tensor_free(w_up_fp16);
     nsl_tensor_free(w_down_fp16);
     nsl_tensor_free(bad);
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// CPDT Part III v2.8 — GeGLU + ReGLU + activation-kind refusal tests.
+// v4 was extended with `gate_activation_kind` ∈ {1, 2, 3} after the
+// v2.5/v2.7 cycles fixed signature at 10 args. These tests pin:
+//   - kind=2 (GeGLU) matches a hand-rolled `gelu(gate) * up @ down`
+//     reference and DIFFERS from kind=1 (SwiGLU) by more than fp32 epsilon
+//   - kind=3 (ReGLU) matches a hand-rolled `relu(gate) * up @ down`
+//     reference and DIFFERS from kind=1 by more than fp32 epsilon
+//   - kind=0 (identity) is refused (return 0) — a GLU with identity gate
+//     degenerates to gate*up@down and is not a known production MoE
+//   - kind∈{-1, 4, i64::MIN, i64::MAX} are all refused (full out-of-range
+//     pin so the bounds check can't silently widen)
+// ─────────────────────────────────────────────────────────────────────
+
+fn gelu_tanh(x: f32) -> f32 {
+    // tanh-approx GELU, matches torch.gelu(approximate='tanh') and v3
+    // activation_kind=2. SQRT_2_OVER_PI computed inline (no const dep
+    // on the FFI module).
+    let sqrt_2_over_pi = 0.7978845608028654_f32;
+    let inner = sqrt_2_over_pi * (x + 0.044715_f32 * x * x * x);
+    0.5_f32 * x * (1.0_f32 + inner.tanh())
+}
+
+fn relu(x: f32) -> f32 {
+    if x < 0.0_f32 { 0.0_f32 } else { x }
+}
+
+/// Hand-rolled GeGLU expert — `gelu(gate) * up @ down`. Independent
+/// of swiglu_expert so a SwiGLU bug cannot mask a GeGLU bug.
+fn geglu_expert(
+    token: &[f32], w_gate: &[f32], w_up: &[f32], w_down: &[f32],
+    hidden: usize, intermediate: usize,
+) -> Vec<f32> {
+    let mut x_gate = vec![0.0_f32; intermediate];
+    let mut x_up = vec![0.0_f32; intermediate];
+    for j in 0..intermediate {
+        let mut sg = 0.0_f32;
+        let mut su = 0.0_f32;
+        for k in 0..hidden {
+            sg += token[k] * w_gate[k * intermediate + j];
+            su += token[k] * w_up[k * intermediate + j];
+        }
+        x_gate[j] = sg;
+        x_up[j] = su;
+    }
+    let x_act: Vec<f32> = x_gate.iter().zip(x_up.iter())
+        .map(|(&g, &u)| gelu_tanh(g) * u).collect();
+    let mut x_down = vec![0.0_f32; hidden];
+    for h in 0..hidden {
+        let mut s = 0.0_f32;
+        for j in 0..intermediate {
+            s += x_act[j] * w_down[j * hidden + h];
+        }
+        x_down[h] = s;
+    }
+    x_down
+}
+
+/// Hand-rolled ReGLU expert — `relu(gate) * up @ down`.
+fn reglu_expert(
+    token: &[f32], w_gate: &[f32], w_up: &[f32], w_down: &[f32],
+    hidden: usize, intermediate: usize,
+) -> Vec<f32> {
+    let mut x_gate = vec![0.0_f32; intermediate];
+    let mut x_up = vec![0.0_f32; intermediate];
+    for j in 0..intermediate {
+        let mut sg = 0.0_f32;
+        let mut su = 0.0_f32;
+        for k in 0..hidden {
+            sg += token[k] * w_gate[k * intermediate + j];
+            su += token[k] * w_up[k * intermediate + j];
+        }
+        x_gate[j] = sg;
+        x_up[j] = su;
+    }
+    let x_act: Vec<f32> = x_gate.iter().zip(x_up.iter())
+        .map(|(&g, &u)| relu(g) * u).collect();
+    let mut x_down = vec![0.0_f32; hidden];
+    for h in 0..hidden {
+        let mut s = 0.0_f32;
+        for j in 0..intermediate {
+            s += x_act[j] * w_down[j * hidden + h];
+        }
+        x_down[h] = s;
+    }
+    x_down
+}
+
+#[test]
+fn dispatch_v4_geglu_matches_hand_reference() {
+    // 2 tokens, 1 expert (top_k=1, expert 0 wins both), hidden=2,
+    // intermediate=2. Logits force both tokens to expert 0. Weights
+    // chosen with non-trivial magnitudes so silu/gelu differ
+    // by more than fp32 noise (silu(0.7)=0.4500 vs gelu(0.7)=0.5249).
+    let tokens: Vec<f32> = vec![0.7, 0.3,  0.5, 0.9];
+    // num_experts=1, top_k=1 → logits shape [total_tokens, 1].
+    let logits: Vec<f32> = vec![1.0,  1.0];
+    let w_gate: Vec<f32> = vec![1.1, -0.4,  0.6, 1.2];
+    let w_up:   Vec<f32> = vec![0.8,  0.5, -0.3, 1.0];
+    let w_down: Vec<f32> = vec![0.7, -0.2,  0.4, 0.9];
+
+    let tokens_ptr = make_f32_tensor(&[2, 2], &tokens);
+    let logits_ptr = make_f32_tensor(&[2, 1], &logits);
+    let w_gate_ptr = make_f32_tensor(&[1, 4], &w_gate);
+    let w_up_ptr   = make_f32_tensor(&[1, 4], &w_up);
+    let w_down_ptr = make_f32_tensor(&[1, 4], &w_down);
+
+    let out_ptr = unsafe {
+        nsl_moe_dispatch_full_v4(
+            tokens_ptr, logits_ptr, w_gate_ptr, w_up_ptr, w_down_ptr,
+            1, 1, (4.0_f32).to_bits() as i64, 2, 2, 2, /* GeGLU */
+        )
+    };
+    assert_ne!(out_ptr, 0, "v4 returned null for valid GeGLU inputs");
+    let got = read_f32(out_ptr, 4);
+
+    let mut expected = vec![0.0_f32; 4];
+    for t in 0..2 {
+        let tok = &tokens[t * 2..(t + 1) * 2];
+        let row = geglu_expert(tok, &w_gate, &w_up, &w_down, 2, 2);
+        expected[t * 2..(t + 1) * 2].copy_from_slice(&row);
+    }
+
+    let mut max_abs = 0.0_f32;
+    for (g, w) in got.iter().zip(expected.iter()) {
+        let d = (g - w).abs();
+        if d > max_abs { max_abs = d; }
+    }
+    assert!(
+        max_abs <= 1e-6,
+        "GeGLU diverges from hand reference: got={got:?} want={expected:?} max_abs_diff={max_abs:.6e}"
+    );
+
+    // Also confirm GeGLU output DIFFERS from SwiGLU output for these
+    // weights — proves we are not silently routing kind=2 through the
+    // kind=1 branch.
+    let swiglu_out_ptr = unsafe {
+        nsl_moe_dispatch_full_v4(
+            tokens_ptr, logits_ptr, w_gate_ptr, w_up_ptr, w_down_ptr,
+            1, 1, (4.0_f32).to_bits() as i64, 2, 2, SWIGLU,
+        )
+    };
+    let swiglu_out = read_f32(swiglu_out_ptr, 4);
+    let mut max_diff = 0.0_f32;
+    for (g, s) in got.iter().zip(swiglu_out.iter()) {
+        let d = (g - s).abs();
+        if d > max_diff { max_diff = d; }
+    }
+    assert!(
+        max_diff > 1e-3,
+        "GeGLU output too close to SwiGLU — branch may be aliased: max_diff={max_diff:.6e}"
+    );
+
+    nsl_tensor_free(tokens_ptr);
+    nsl_tensor_free(logits_ptr);
+    nsl_tensor_free(w_gate_ptr);
+    nsl_tensor_free(w_up_ptr);
+    nsl_tensor_free(w_down_ptr);
+    nsl_tensor_free(out_ptr);
+    nsl_tensor_free(swiglu_out_ptr);
+}
+
+#[test]
+fn dispatch_v4_reglu_matches_hand_reference() {
+    // Construct weights where SOME gate-projections are negative (so
+    // ReLU clips them to zero) and others are positive — exercises
+    // both branches of the ReLU. SwiGLU/silu would output a small but
+    // nonzero value for the clipped lanes, so the SwiGLU-vs-ReGLU
+    // divergence test below catches a silent alias.
+    let tokens: Vec<f32> = vec![1.0, -0.5,  -0.3, 0.8];
+    // num_experts=1, top_k=1 → logits shape [total_tokens, 1].
+    let logits: Vec<f32> = vec![1.0,  1.0];
+    // w_gate row 0 col 0 = +1.5 → x_gate[0] for token 0 = 0.75
+    // w_gate row 0 col 1 = -1.0 → x_gate[1] for token 0 = -0.5 (ReLU→0)
+    let w_gate: Vec<f32> = vec![1.5, -1.0,  0.3, 0.7];
+    let w_up:   Vec<f32> = vec![0.8,  0.5, -0.3, 1.0];
+    let w_down: Vec<f32> = vec![0.7, -0.2,  0.4, 0.9];
+
+    let tokens_ptr = make_f32_tensor(&[2, 2], &tokens);
+    let logits_ptr = make_f32_tensor(&[2, 1], &logits);
+    let w_gate_ptr = make_f32_tensor(&[1, 4], &w_gate);
+    let w_up_ptr   = make_f32_tensor(&[1, 4], &w_up);
+    let w_down_ptr = make_f32_tensor(&[1, 4], &w_down);
+
+    let out_ptr = unsafe {
+        nsl_moe_dispatch_full_v4(
+            tokens_ptr, logits_ptr, w_gate_ptr, w_up_ptr, w_down_ptr,
+            1, 1, (4.0_f32).to_bits() as i64, 2, 2, 3, /* ReGLU */
+        )
+    };
+    assert_ne!(out_ptr, 0, "v4 returned null for valid ReGLU inputs");
+    let got = read_f32(out_ptr, 4);
+
+    let mut expected = vec![0.0_f32; 4];
+    for t in 0..2 {
+        let tok = &tokens[t * 2..(t + 1) * 2];
+        let row = reglu_expert(tok, &w_gate, &w_up, &w_down, 2, 2);
+        expected[t * 2..(t + 1) * 2].copy_from_slice(&row);
+    }
+
+    let mut max_abs = 0.0_f32;
+    for (g, w) in got.iter().zip(expected.iter()) {
+        let d = (g - w).abs();
+        if d > max_abs { max_abs = d; }
+    }
+    assert!(
+        max_abs <= 1e-6,
+        "ReGLU diverges from hand reference: got={got:?} want={expected:?} max_abs_diff={max_abs:.6e}"
+    );
+
+    // Confirm ReGLU output DIFFERS from SwiGLU for these weights.
+    let swiglu_out_ptr = unsafe {
+        nsl_moe_dispatch_full_v4(
+            tokens_ptr, logits_ptr, w_gate_ptr, w_up_ptr, w_down_ptr,
+            1, 1, (4.0_f32).to_bits() as i64, 2, 2, SWIGLU,
+        )
+    };
+    let swiglu_out = read_f32(swiglu_out_ptr, 4);
+    let mut max_diff = 0.0_f32;
+    for (g, s) in got.iter().zip(swiglu_out.iter()) {
+        let d = (g - s).abs();
+        if d > max_diff { max_diff = d; }
+    }
+    assert!(
+        max_diff > 1e-3,
+        "ReGLU output too close to SwiGLU — branch may be aliased: max_diff={max_diff:.6e}"
+    );
+
+    nsl_tensor_free(tokens_ptr);
+    nsl_tensor_free(logits_ptr);
+    nsl_tensor_free(w_gate_ptr);
+    nsl_tensor_free(w_up_ptr);
+    nsl_tensor_free(w_down_ptr);
+    nsl_tensor_free(out_ptr);
+    nsl_tensor_free(swiglu_out_ptr);
+}
+
+#[test]
+fn dispatch_v4_refuses_invalid_gate_activation_kind() {
+    // Bounds check: kind must be in {1, 2, 3}. 0 (identity) is
+    // structurally non-Mixtral so it's REFUSED at this FFI; callers
+    // wanting identity gate should use v3 (a 2-weight FFN). Negative
+    // and large-positive inputs are pinned to catch a silent widening
+    // of the bounds check.
+    let tokens_ptr = make_f32_tensor(&[2, 2], &[1.0, 2.0, 3.0, 4.0]);
+    let logits_ptr = make_f32_tensor(&[2, 2], &[1.0, 0.5, 0.5, 1.0]);
+    let w_gate_ptr = make_f32_tensor(&[2, 4], &vec![0.1_f32; 8]);
+    let w_up_ptr = make_f32_tensor(&[2, 4], &vec![0.1_f32; 8]);
+    let w_down_ptr = make_f32_tensor(&[2, 4], &vec![0.1_f32; 8]);
+    let cap = (2.0_f32).to_bits() as i64;
+
+    let v_kind = |kind: i64| unsafe {
+        nsl_moe_dispatch_full_v4(
+            tokens_ptr, logits_ptr, w_gate_ptr, w_up_ptr, w_down_ptr,
+            2, 1, cap, 2, 2, kind,
+        )
+    };
+
+    assert_eq!(v_kind(0), 0, "identity (kind=0) refused");
+    assert_eq!(v_kind(-1), 0, "kind=-1 refused");
+    assert_eq!(v_kind(4), 0, "kind=4 refused");
+    assert_eq!(v_kind(100), 0, "kind=100 refused");
+    assert_eq!(v_kind(i64::MIN), 0, "kind=i64::MIN refused");
+    assert_eq!(v_kind(i64::MAX), 0, "kind=i64::MAX refused");
+
+    // Sanity: kind ∈ {1, 2, 3} all succeed (return non-zero) with
+    // identical inputs — confirms the refusal is kind-specific.
+    let ok1 = v_kind(1);
+    let ok2 = v_kind(2);
+    let ok3 = v_kind(3);
+    assert_ne!(ok1, 0, "SwiGLU kind=1 must succeed");
+    assert_ne!(ok2, 0, "GeGLU kind=2 must succeed");
+    assert_ne!(ok3, 0, "ReGLU kind=3 must succeed");
+
+    nsl_tensor_free(tokens_ptr);
+    nsl_tensor_free(logits_ptr);
+    nsl_tensor_free(w_gate_ptr);
+    nsl_tensor_free(w_up_ptr);
+    nsl_tensor_free(w_down_ptr);
+    nsl_tensor_free(ok1);
+    nsl_tensor_free(ok2);
+    nsl_tensor_free(ok3);
 }

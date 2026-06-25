@@ -844,17 +844,23 @@ pub extern "C" fn nsl_moe_dispatch_full_v3(
     Box::into_raw(result) as i64
 }
 
-/// CPDT Part III v2.5 — Mixtral's SwiGLU MoE FFN.
+/// CPDT Part III v2.5+v2.8 — Mixtral-style gated MoE FFN (SwiGLU /
+/// GeGLU / ReGLU).
 ///
 /// SwiGLU is the dominant production MoE activation (Mixtral, DeepSeek
 /// MoE, Llama-3 dense FFNs). It uses a THIRD weight matrix beyond v3's
 /// up + down, splitting the up-projection into a gate path and a
-/// straight path, then element-wise multiplying after the nonlinearity:
+/// straight path, then element-wise multiplying after the nonlinearity.
+/// v2.8 generalized v4 to also support GeGLU (gelu-gated, PaLM/Gemini)
+/// and ReGLU (relu-gated, T5 variants) via the new
+/// `gate_activation_kind` selector:
 ///
-///   x_gate = token  @ W_gate[e]    # [hidden] -> [intermediate]
-///   x_up   = token  @ W_up[e]      # [hidden] -> [intermediate]
-///   x_act  = silu(x_gate) * x_up   # GLU step (element-wise)
-///   x_down = x_act  @ W_down[e]    # [intermediate] -> [hidden]
+///   x_gate = token  @ W_gate[e]              # [hidden] -> [intermediate]
+///   x_up   = token  @ W_up[e]                # [hidden] -> [intermediate]
+///   x_act  = gate_act(x_gate) * x_up         # GLU step; gate_act ∈
+///                                            #   {silu, gelu, relu}
+///                                            #   per gate_activation_kind
+///   x_down = x_act  @ W_down[e]              # [intermediate] -> [hidden]
 ///   out    = sum over e of routing_weight[t, e] * x_down
 ///
 /// Output shape `[total_tokens, hidden_dim]` — same as v3 (returns to
@@ -866,7 +872,8 @@ pub extern "C" fn nsl_moe_dispatch_full_v3(
 ///     intermediate_dim.
 ///   - v3 (`nsl_moe_dispatch_full_v3`): W_up -> activation -> W_down,
 ///     output at hidden_dim, single scalar activation.
-///   - v4 (this fn): GATE + W_up -> SiLU-gated multiply -> W_down,
+///   - v4 (this fn): GATE + W_up -> selectable gate-activation multiply
+///     (silu/gelu/relu, see GATE-ACTIVATION SELECTION below) -> W_down,
 ///     output at hidden_dim. Routing / scatter / gather pipeline IS
 ///     SHARED with v2/v3; only the per-expert kernel is new.
 ///
@@ -875,25 +882,39 @@ pub extern "C" fn nsl_moe_dispatch_full_v3(
 ///   - experts_up_ptr   shape == [n_experts, hidden_dim * intermediate_dim]
 ///   - experts_down_ptr shape == [n_experts, intermediate_dim * hidden_dim]
 ///
-/// The gate-activation is hardcoded to SiLU per the Mixtral / DeepSeek
-/// MoE convention. GeGLU (gate-activation = GELU) and ReGLU would be
-/// v2.next variants; they share the same FFI shape with a different
-/// inner nonlinearity. For now we don't expose an activation_kind arg
-/// — adding it later is a non-breaking signature extension.
+/// GATE-ACTIVATION SELECTION (CPDT Part III v2.8):
+///   - gate_activation_kind == 1 → SwiGLU = silu(gate) * up. Mixtral /
+///     DeepSeek MoE / Llama-3 dense FFN default.
+///   - gate_activation_kind == 2 → GeGLU  = gelu(gate) * up. Used by
+///     PaLM / Gemini dense FFNs; numerically close to SwiGLU but with
+///     PyTorch's tanh-approx GELU (matches `F.gelu(approximate='tanh')`).
+///   - gate_activation_kind == 3 → ReGLU  = relu(gate) * up. Used by
+///     some smaller models (T5 variants); cheaper than SwiGLU/GeGLU
+///     since relu is branch-only.
+///   - gate_activation_kind ∈ other → refused (return 0). Identity (0)
+///     is explicitly REFUSED here: a GLU with identity gate degenerates
+///     to `gate * up @ down`, which is NOT any known production MoE
+///     structure. Callers that genuinely want no gate activation should
+///     use the v3 FFI (`nsl_moe_dispatch_full_v3`) with
+///     activation_kind=0 — that is a 2-weight FFN, not a 3-weight GLU.
+///
+/// The gate-activation arg is a non-breaking signature extension over
+/// the v2.5/v2.7 v4 FFI: callers that pass 1 here get the v2.5 SwiGLU
+/// behavior bit-for-bit.
 ///
 /// REFUSALS (return 0):
 ///   - tokens_ptr or logits_ptr is null
 ///   - any of experts_gate_ptr, experts_up_ptr, experts_down_ptr is null
 ///   - num_experts/hidden/intermediate <= 0
 ///   - top_k not in {1, 2} (route_topk asserts {1, 2})
+///   - gate_activation_kind ∉ {1, 2, 3}
 ///   - mixed dtype between tokens / experts_{gate, up, down}
 ///   - experts_gate.len != n_experts * hidden * intermediate
 ///   - experts_up.len   != n_experts * hidden * intermediate
 ///   - experts_down.len != n_experts * intermediate * hidden
 ///
-/// Deferrals (v2.next): bias on any matmul, GeGLU / ReGLU variants,
-/// capacity-overflow renorm, GPU expert_parallel_matmul,
-/// FP16/mixed-precision experts.
+/// Deferrals (v2.next): bias on any matmul, capacity-overflow renorm,
+/// GPU expert_parallel_matmul, FP16/mixed-precision experts.
 #[no_mangle]
 pub extern "C" fn nsl_moe_dispatch_full_v4(
     tokens_ptr: i64,
@@ -906,6 +927,7 @@ pub extern "C" fn nsl_moe_dispatch_full_v4(
     capacity_factor_bits: i64,
     hidden_dim: i64,
     intermediate_dim: i64,
+    gate_activation_kind: i64,
 ) -> i64 {
     use crate::tensor::NslTensor;
     use crate::memory::checked_alloc;
@@ -932,6 +954,12 @@ pub extern "C" fn nsl_moe_dispatch_full_v4(
         return 0;
     }
     if top_k != 1 && top_k != 2 {
+        return 0;
+    }
+    // v2.8 — gate_activation_kind must be in {1, 2, 3} (SwiGLU/GeGLU/
+    // ReGLU). Identity (0) is structurally non-Mixtral; refuse so a
+    // caller passing 0 cannot silently emit `gate * up @ down`.
+    if !(1..=3).contains(&gate_activation_kind) {
         return 0;
     }
 
@@ -1029,13 +1057,47 @@ pub extern "C" fn nsl_moe_dispatch_full_v4(
                 up_scratch[j] = sum_u;
             }
 
-            // GLU step: x_act[j] = silu(x_gate[j]) * x_up[j].
-            // SiLU numerical edges already proven for v3. Writes back
-            // into up_scratch so the down-matmul reads a single buffer.
-            for j in 0..intermediate_dim_us {
-                let g = gate_scratch[j];
-                let s = 1.0_f32 / (1.0_f32 + (-g).exp());
-                up_scratch[j] = (g * s) * up_scratch[j];
+            // GLU step (v2.8): x_act[j] = gate_act(x_gate[j]) * x_up[j].
+            // Writes back into up_scratch so the down-matmul reads a
+            // single buffer. The match-on-kind hoist is outside the j-
+            // loop so the branch is taken once per (expert, token), not
+            // once per intermediate cell. Numerical edges (subnormals,
+            // ±Inf) for SiLU/GELU/ReLU are identical to v3's tested
+            // activation_kind {1, 2, 3} branches — same formulae.
+            match gate_activation_kind {
+                1 => {
+                    // SwiGLU = silu(gate) * up
+                    for j in 0..intermediate_dim_us {
+                        let g = gate_scratch[j];
+                        let s = 1.0_f32 / (1.0_f32 + (-g).exp());
+                        up_scratch[j] = (g * s) * up_scratch[j];
+                    }
+                }
+                2 => {
+                    // GeGLU = gelu(gate) * up. tanh-approx, matches
+                    // torch.gelu(approximate='tanh') and the v3
+                    // activation_kind=2 branch.
+                    const SQRT_2_OVER_PI: f32 = 0.7978845608028654_f32;
+                    const GELU_CUBIC: f32 = 0.044715_f32;
+                    for j in 0..intermediate_dim_us {
+                        let x = gate_scratch[j];
+                        let inner = SQRT_2_OVER_PI * (x + GELU_CUBIC * x * x * x);
+                        let gelu_x = 0.5_f32 * x * (1.0_f32 + inner.tanh());
+                        up_scratch[j] = gelu_x * up_scratch[j];
+                    }
+                }
+                3 => {
+                    // ReGLU = relu(gate) * up
+                    for j in 0..intermediate_dim_us {
+                        let g = gate_scratch[j];
+                        let relu_g = if g < 0.0_f32 { 0.0_f32 } else { g };
+                        up_scratch[j] = relu_g * up_scratch[j];
+                    }
+                }
+                _ => unreachable!(
+                    "gate_activation_kind {} bypassed the upfront refusal gate",
+                    gate_activation_kind
+                ),
             }
 
             // x_down[h] = sum over j of x_act[j] * W_down[e][j, h]

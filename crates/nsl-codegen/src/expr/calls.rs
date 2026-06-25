@@ -1641,28 +1641,36 @@ impl Compiler<'_> {
                         info.activation,
                         info.weight_prefix.clone(),
                     ),
-                    None => (None, 8, 2, 1.25f32, crate::moe::MoeActivation::Silu, None),
+                    // Fallback path is unreachable when v4 dims resolve
+                    // (config_with_key=None ⇒ lookup_key=None ⇒
+                    // v4_dims=None ⇒ hard error before activation is
+                    // consumed). Mirrors the v3 arm's use of
+                    // MoeActivation::default() so a future flip of the
+                    // default can't silently diverge v3 vs v4 fallbacks.
+                    None => (None, 8, 2, 1.25f32, crate::moe::MoeActivation::default(), None),
                 };
 
-            // SwiGLU is structurally `silu(gate) * up @ down` — the
-            // SiLU is wired into the per-expert kernel, not a
-            // selectable activation argument. If the user wrote
-            // `@moe(activation="gelu")` and then called
-            // `moe_dispatch_swiglu(...)`, the source-level intent
-            // (gelu-gated FFN) does NOT match what v4 emits (silu-
-            // gated FFN). Per v2.4's INVALID-VALUE-FATAL / no-silent-
-            // fallback convention, refuse loudly rather than silently
-            // emit silu output. Real GeGLU / ReGLU support is a v2.next
-            // FFI variant.
-            if activation != crate::moe::MoeActivation::Silu {
-                return Err(crate::error::CodegenError::new(format!(
-                    "moe_dispatch_swiglu: SwiGLU FFI hardcodes silu(gate)*up by \
-                     construction. @moe(activation={:?}) cannot override the \
-                     gate activation. Either omit the activation kwarg (defaults \
-                     to silu), call moe_dispatch_ffn for non-SwiGLU activations, \
-                     or wait for v2.next GeGLU / ReGLU FFI variants.",
-                    activation
-                )));
+            // CPDT Part III v2.8 — gate-activation selection.
+            // v4 now accepts gate_activation_kind ∈ {1, 2, 3}
+            // (SwiGLU/GeGLU/ReGLU). `@moe(activation="…")` is the source
+            // of truth, mapping silu→1, gelu→2, relu→3.
+            //
+            // Identity is REFUSED at the codegen boundary (matching the
+            // runtime FFI's upfront gate). A GLU with identity gate
+            // degenerates to `gate * up @ down`, which is structurally
+            // non-Mixtral; callers that genuinely want no gate should
+            // use `moe_dispatch_ffn` (v3 FFI, 2-weight FFN) with
+            // `@moe(activation="identity")`, not v4.
+            if activation == crate::moe::MoeActivation::Identity {
+                return Err(crate::error::CodegenError::new(
+                    "moe_dispatch_swiglu: @moe(activation=\"identity\") is invalid \
+                     for the SwiGLU FFI — a GLU with identity gate degenerates to \
+                     `gate * up @ down`, which is not a known production MoE \
+                     structure. Use `moe_dispatch_ffn` (v3 FFI) for a 2-weight FFN \
+                     without a gate activation. Valid v4 activations: silu \
+                     (SwiGLU, default), gelu (GeGLU), relu (ReGLU)."
+                        .to_string(),
+                ));
             }
 
             let num_experts_val = builder
@@ -1675,6 +1683,9 @@ impl Compiler<'_> {
                 cranelift_codegen::ir::types::I64,
                 capacity_factor.to_bits() as i64,
             );
+            let gate_activation_val = builder
+                .ins()
+                .iconst(cranelift_codegen::ir::types::I64, activation as i64);
 
             // CPDT Part III v2.7 — `@moe(weight_prefix="…")` overrides
             // the moe_configs key for WeightMap lookups. When Some,
@@ -1714,6 +1725,7 @@ impl Compiler<'_> {
                         cap_bits,
                         hidden_val,
                         intermediate_val,
+                        gate_activation_val,
                     ],
                 )?;
                 return Ok(result);
