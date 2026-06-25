@@ -806,35 +806,56 @@ pub fn check_vram_budget(plan: &SlabPlan, budget_bytes: u64) -> Option<String> {
 // ---------------------------------------------------------------------------
 
 /// Compute the byte size of a tensor type from its shape and dtype.
-/// Returns None if any dimension is non-concrete (symbolic, dynamic, etc.).
+/// Returns None if any dimension is non-planable (Dynamic / Wildcard /
+/// Symbolic).  Bounded dims contribute their upper bound; Concrete dims
+/// contribute their exact size.  When ANY dim is `Bounded`, the returned
+/// `SizeKind` is `Bounded { upper, .. }`; otherwise it's `Static(bytes)`.
+///
+/// Silent-corruption bug fix (PR #244 follow-on, originally surfaced by
+/// draft PR #241): the prior implementation EARLY-RETURNED from the
+/// `Bounded` arm with `total_elems` reflecting only the dims seen so
+/// far + the bounded dim.  Trailing dims silently dropped out of the
+/// byte count. For shape `[Bounded(B=32), Concrete(64)]` at f32 this
+/// produced 128 bytes (32 * 4) instead of 8192 (32 * 64 * 4) — a 64×
+/// underestimate. The M36 slab planner sizes physical slots from this
+/// count, so any bounded-leading shape with trailing concrete dims
+/// allocated a too-small slab and downstream writes corrupted adjacent
+/// activations — the worst failure mode (silent + cascading).
+///
+/// Fix: walk EVERY dim, accumulate into `total_elems`, and decide
+/// `SizeKind` after the full walk.  A `has_bounded` flag remembers
+/// whether any Bounded dim was seen so the final variant is correct.
 pub fn compute_tensor_bytes(
     shape: &nsl_semantic::types::Shape,
     dtype: &nsl_semantic::types::DType,
 ) -> Option<(u64, SizeKind)> {
     let mut total_elems: u64 = 1;
+    let mut has_bounded = false;
     for dim in &shape.dims {
         match dim {
             nsl_semantic::types::Dim::Concrete(n) => {
                 total_elems = total_elems.saturating_mul(*n as u64);
             }
             nsl_semantic::types::Dim::Bounded { upper_bound, .. } => {
-                // Use upper bound for slab planning
+                // Use upper bound for slab planning, but KEEP WALKING so
+                // trailing Concrete dims are not silently dropped.
                 let ub = *upper_bound as u64;
                 total_elems = total_elems.saturating_mul(ub);
-                let bytes = total_elems * dtype_byte_size(dtype);
-                return Some((
-                    bytes,
-                    SizeKind::Bounded {
-                        upper: bytes,
-                        symbolic_expr: format!("{:?}", shape),
-                    },
-                ));
+                has_bounded = true;
             }
             _ => return None, // Dynamic / Wildcard / Symbolic — can't plan
         }
     }
-    let bytes = total_elems * dtype_byte_size(dtype);
-    Some((bytes, SizeKind::Static(bytes)))
+    let bytes = total_elems.saturating_mul(dtype_byte_size(dtype));
+    let kind = if has_bounded {
+        SizeKind::Bounded {
+            upper: bytes,
+            symbolic_expr: format!("{:?}", shape),
+        }
+    } else {
+        SizeKind::Static(bytes)
+    };
+    Some((bytes, kind))
 }
 
 /// Return the byte size of a DType.
@@ -2112,6 +2133,117 @@ mod consume_hints_tests {
             post, 1,
             "adjacent-lifetime activations ([0,5) and [5,10)) must merge: \
              they are not overlapping under half-open interval semantics"
+        );
+    }
+
+    // --- compute_tensor_bytes silent-corruption regression tests ---
+    //
+    // Before the fix, the `Dim::Bounded` arm in `compute_tensor_bytes`
+    // EARLY-RETURNED with `total_elems` reflecting only the dims seen so
+    // far + the bounded dim. Trailing dims silently dropped out of the
+    // byte count, producing a too-small slab in the M36 planner and
+    // corrupting adjacent activations downstream.
+
+    fn bounded(upper: i64) -> nsl_semantic::types::Dim {
+        // Test-only Symbol — the interned string is irrelevant for byte-count
+        // math; we round-trip through an Interner to obtain a real
+        // `DefaultSymbol`, then convert via the public `From<DefaultSymbol>
+        // for Symbol` impl in `crates/nsl-ast/src/lib.rs:27-31`.
+        let mut interner = nsl_lexer::Interner::new();
+        let sym: nsl_ast::Symbol = interner.get_or_intern("B").into();
+        nsl_semantic::types::Dim::Bounded {
+            name: sym,
+            upper_bound: upper,
+        }
+    }
+
+    fn concrete(n: i64) -> nsl_semantic::types::Dim {
+        nsl_semantic::types::Dim::Concrete(n)
+    }
+
+    fn shape(dims: Vec<nsl_semantic::types::Dim>) -> nsl_semantic::types::Shape {
+        nsl_semantic::types::Shape { dims }
+    }
+
+    /// Headline regression: shape `[Bounded(32), Concrete(64)]` at f32
+    /// MUST yield 8192 bytes — not 128 bytes. The pre-fix code returned
+    /// 128 (a 64× underestimate) by dropping the trailing Concrete dim.
+    #[test]
+    fn compute_tensor_bytes_bounded_then_concrete_keeps_trailing_dim() {
+        let s = shape(vec![bounded(32), concrete(64)]);
+        let result = compute_tensor_bytes(&s, &nsl_semantic::types::DType::F32);
+        let (bytes, kind) = result.expect("plannable: Bounded + Concrete");
+        assert_eq!(
+            bytes, 8192,
+            "[Bounded(32), Concrete(64)] f32 must be 32*64*4 = 8192, \
+             not 128 (the pre-fix early-return underestimate)"
+        );
+        assert!(
+            matches!(kind, SizeKind::Bounded { upper: 8192, .. }),
+            "kind must be Bounded with upper = 8192; got {kind:?}"
+        );
+    }
+
+    /// Concrete-Bounded-Concrete: bounded dim in the MIDDLE must not
+    /// cause trailing concretes to vanish.
+    #[test]
+    fn compute_tensor_bytes_concrete_bounded_concrete_walks_all_dims() {
+        let s = shape(vec![concrete(8), bounded(32), concrete(64)]);
+        let result = compute_tensor_bytes(&s, &nsl_semantic::types::DType::F32);
+        let (bytes, kind) = result.expect("plannable: Concrete + Bounded + Concrete");
+        assert_eq!(
+            bytes, 8 * 32 * 64 * 4,
+            "[Concrete(8), Bounded(32), Concrete(64)] f32 must be 65536"
+        );
+        assert!(
+            matches!(kind, SizeKind::Bounded { upper: 65536, .. }),
+            "kind must be Bounded with upper = 65536; got {kind:?}"
+        );
+    }
+
+    /// Bounded as the LAST dim — no trailing concretes to lose, but the
+    /// returned kind must still be Bounded (not Static).  This pins
+    /// that the `has_bounded` flag is set even when the Bounded dim is
+    /// the only / last contributor.
+    #[test]
+    fn compute_tensor_bytes_concrete_then_bounded_is_bounded_kind() {
+        let s = shape(vec![concrete(8), bounded(32)]);
+        let result = compute_tensor_bytes(&s, &nsl_semantic::types::DType::F32);
+        let (bytes, kind) = result.expect("plannable: Concrete + Bounded");
+        assert_eq!(bytes, 8 * 32 * 4, "[Concrete(8), Bounded(32)] f32 = 1024");
+        assert!(
+            matches!(kind, SizeKind::Bounded { upper: 1024, .. }),
+            "kind must be Bounded with upper = 1024; got {kind:?}"
+        );
+    }
+
+    /// Pure-concrete shapes must still return Static (no has_bounded
+    /// regression for the all-concrete fast path).
+    #[test]
+    fn compute_tensor_bytes_all_concrete_is_static() {
+        let s = shape(vec![concrete(4), concrete(16)]);
+        let result = compute_tensor_bytes(&s, &nsl_semantic::types::DType::F32);
+        let (bytes, kind) = result.expect("plannable: all-concrete");
+        assert_eq!(bytes, 4 * 16 * 4);
+        assert!(
+            matches!(kind, SizeKind::Static(256)),
+            "all-concrete shape must yield SizeKind::Static; got {kind:?}"
+        );
+    }
+
+    /// Negative case: a non-planable dim (`Wildcard`) anywhere in the
+    /// shape must still cause `None` to be returned (the planner refuses
+    /// to size slabs for non-concrete dims).  Pins that the fix did not
+    /// silently weaken the refusal path — the `_ => return None` arm is
+    /// reached for Wildcard even after a leading Bounded.
+    #[test]
+    fn compute_tensor_bytes_wildcard_after_bounded_still_refuses() {
+        let s = shape(vec![bounded(32), nsl_semantic::types::Dim::Wildcard]);
+        let result = compute_tensor_bytes(&s, &nsl_semantic::types::DType::F32);
+        assert!(
+            result.is_none(),
+            "Bounded + Wildcard must still refuse — Wildcard makes the \
+             shape non-plannable regardless of preceding Bounded.  Got: {result:?}"
         );
     }
 }
