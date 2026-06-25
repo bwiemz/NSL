@@ -3098,6 +3098,18 @@ impl<'a> WengertExtractor<'a> {
             return None;
         }
 
+        // Cycle-10 §5.3 Task 6: if this method is registered as
+        // `@checkpoint(policy=Full)` in the semantic-layer-published
+        // policy map, stamp the just-extracted prologue ops and emit
+        // a `PrologueRecompute` marker at the tape tail. No-op when
+        // the policy map is empty (byte-identity preserved).
+        let fn_name = self
+            .interner
+            .resolve(fn_def.name.0)
+            .unwrap_or("?")
+            .to_string();
+        self.apply_checkpoint_policy(&fn_name);
+
         // The method's return value is the list output (set by Return stmt extraction)
         let result = self.list.output;
 
@@ -4943,6 +4955,61 @@ mod tests {
         assert_eq!(a, SubgraphId(0));
         assert_eq!(b, SubgraphId(1));
         assert_eq!(c, SubgraphId(2));
+    }
+
+    #[test]
+    fn cycle10_task6_with_checkpoint_policies_is_byte_identity_when_empty() {
+        // Wire-up contract: the loader passes an empty HashMap when no
+        // @checkpoint decorators are present. The extractor must be
+        // observationally indistinguishable from one constructed without
+        // any installer.
+        let interner = Interner::new();
+        let ext_baseline = WengertExtractor::new(&interner);
+        let ext_wired = WengertExtractor::new(&interner)
+            .with_checkpoint_policies(HashMap::new());
+
+        assert!(ext_baseline.checkpoint_policies.is_empty());
+        assert!(ext_wired.checkpoint_policies.is_empty());
+        assert_eq!(ext_baseline.next_subgraph_id, ext_wired.next_subgraph_id);
+        assert_eq!(ext_baseline.list.ops.len(), ext_wired.list.ops.len());
+    }
+
+    #[test]
+    fn cycle10_task6_with_checkpoint_policies_carries_full_for_named_fn() {
+        // Simulate the loader → CompileOptions → WengertExtractor flow:
+        // a single fn_name keyed to Full lands in the extractor and
+        // apply_checkpoint_policy fires only for that name.
+        let interner = Interner::new();
+        let mut policies = HashMap::new();
+        policies.insert("forward".to_string(), CheckpointPolicy::Full);
+        let mut ext = WengertExtractor::new(&interner)
+            .with_checkpoint_policies(policies);
+
+        // Inject one intermediate op so stamping has something to flip.
+        let v = ext.alloc_var();
+        ext.push_op(WengertOp {
+            id: 0,
+            result: v,
+            op: PrimalOp::Relu,
+            inputs: vec![],
+            saved_for_backward: false,
+            checkpointed: false,
+        });
+
+        // Applying for a non-keyed fn is a no-op (byte-identity).
+        ext.apply_checkpoint_policy("not_forward");
+        assert!(!ext.list.ops[0].checkpointed);
+        assert_eq!(ext.list.ops.len(), 1);
+
+        // Applying for the keyed fn flips the stamp + emits exactly one
+        // PrologueRecompute marker.
+        ext.apply_checkpoint_policy("forward");
+        assert!(ext.list.ops[0].checkpointed);
+        assert_eq!(ext.list.ops.len(), 2);
+        assert!(matches!(
+            ext.list.ops[1].op,
+            PrimalOp::PrologueRecompute { .. }
+        ));
     }
 
     #[test]

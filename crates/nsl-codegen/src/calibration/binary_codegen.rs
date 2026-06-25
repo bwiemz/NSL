@@ -1302,7 +1302,11 @@ fn emit_model_backward_bridge(
     // Run WengertExtractor on the forward body.
     // We set self_context = "self" so SelfRef + field → "self.<field>".
     // The model instance is registered with a synthetic Symbol whose name is "self".
-    let mut extractor = crate::source_ad::WengertExtractor::new(compiler.interner);
+    // Cycle-10 §5.3 Task 6 wire-up (calibration model_backward): route
+    // per-fn @checkpoint(policy=...) policies into the extractor. Empty
+    // map = byte-identity preserved.
+    let mut extractor = crate::source_ad::WengertExtractor::new(compiler.interner)
+        .with_checkpoint_policies(compiler.compile_options.checkpoint_policies.clone());
     extractor.set_model_method_bodies(compiler.models.model_method_bodies.clone());
     extractor.set_model_field_types(compiler.models.model_field_types.clone());
 
@@ -1330,6 +1334,18 @@ fn emit_model_backward_bridge(
     }
 
     let extraction_ok = extractor.extract_stmts(&forward_fn_def.body.stmts);
+
+    // Cycle-10 §5.3 Task 6: apply transitive checkpoint stamping if the
+    // forward method itself is `@checkpoint(policy=Full)`. No-op when the
+    // policy map is empty.
+    if extraction_ok {
+        let fn_name = compiler
+            .interner
+            .resolve(forward_fn_def.name.0)
+            .unwrap_or("?")
+            .to_string();
+        extractor.apply_checkpoint_policy(&fn_name);
+    }
 
     if !extraction_ok || extractor.wengert_list().ops.is_empty() {
         // Extraction failed — emit trivial stub, log warning.

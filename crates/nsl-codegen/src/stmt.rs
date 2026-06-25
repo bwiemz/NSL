@@ -3903,7 +3903,12 @@ impl Compiler<'_> {
             self.compile_call_by_name(builder, "nsl_set_training_mode", &[true_val])?;
 
             // 2. Try to extract Wengert list from step body
-            let mut extractor = crate::source_ad::WengertExtractor::new(self.interner);
+            //
+            // Cycle-10 §5.3 Task 6 wire-up: route per-fn @checkpoint(policy=...)
+            // policies collected by EffectChecker through CompileOptions into
+            // the extractor. Empty map = byte-identity preserved.
+            let mut extractor = crate::source_ad::WengertExtractor::new(self.interner)
+                .with_checkpoint_policies(self.compile_options.checkpoint_policies.clone());
 
             // Wire model method bodies and field types for inline expansion
             extractor.set_model_method_bodies(self.models.model_method_bodies.clone());
@@ -7401,7 +7406,11 @@ impl Compiler<'_> {
     ) -> Result<Option<(Value, Value)>, CodegenError> {
         eprintln!("[nsl] Using source-to-source AD for grad block");
 
-        let mut extractor = crate::source_ad::WengertExtractor::new(self.interner);
+        // Cycle-10 §5.3 Task 6 wire-up (grad block): route per-fn
+        // @checkpoint(policy=...) policies into the extractor. Empty map
+        // = byte-identity preserved.
+        let mut extractor = crate::source_ad::WengertExtractor::new(self.interner)
+            .with_checkpoint_policies(self.compile_options.checkpoint_policies.clone());
         extractor.set_model_method_bodies(self.models.model_method_bodies.clone());
         extractor.set_model_field_types(self.models.model_field_types.clone());
         // WRGA B.3.2 Option 3: plumb synth overrides so the extractor

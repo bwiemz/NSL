@@ -1414,6 +1414,10 @@ fn main_inner() {
                 // per build path by analysis_to_csha_configs after the
                 // semantic checker has run.
                 csha_configs: std::collections::HashMap::new(),
+                // Cycle-10 §5.3 Task 6: per-build-path checkpoint policy
+                // map; populated by analysis_to_checkpoint_policies after
+                // the semantic checker runs (mirrors csha_configs).
+                checkpoint_policies: std::collections::HashMap::new(),
                 cpdt_mode,
                 cpdt_cluster: cpdt_cluster.clone(),
                 cpdt_report_requested: cpdt_report,
@@ -1743,6 +1747,9 @@ fn main_inner() {
                 // per build path by analysis_to_csha_configs after the
                 // semantic checker has run.
                 csha_configs: std::collections::HashMap::new(),
+                // Cycle-10 §5.3 Task 6: per-build-path checkpoint policy
+                // map; populated after the semantic checker runs.
+                checkpoint_policies: std::collections::HashMap::new(),
                 cpdt_mode: nsl_codegen::cpdt::CpdtMode::Off,
                 cpdt_cluster: None,
                 cpdt_report_requested: false,
@@ -2257,6 +2264,17 @@ fn analysis_to_csha_configs(
     a.csha_configs.iter().cloned().collect()
 }
 
+/// Cycle-10 §5.3 paper checkpointing-aware backward (Task 6):
+/// expose `EffectChecker::checkpoint_policies()` (already published on
+/// `AnalysisResult.checkpoint_policies`) in the
+/// `HashMap<String, CheckpointPolicy>` shape `CompileOptions.checkpoint_policies`
+/// expects. Empty when no `@checkpoint(policy="...")` decorators are present.
+fn analysis_to_checkpoint_policies(
+    a: &nsl_semantic::AnalysisResult,
+) -> std::collections::HashMap<String, nsl_semantic::effects::CheckpointPolicy> {
+    a.checkpoint_policies.clone()
+}
+
 fn analysis_to_wrga_inputs(a: &nsl_semantic::AnalysisResult) -> nsl_codegen::WrgaInputs {
     use nsl_codegen::{
         AdapterDecoratorConfig, AdapterKind, FreezeDecoratorConfig, WrgaDecoratorConfig,
@@ -2489,6 +2507,10 @@ fn run_build_shared_single(
     // Sprint 2 (paper §6.2): forward @csha decorator configs so per-model
     // disable/level/target overrides take effect on the shared-library path.
     options.csha_configs = analysis_to_csha_configs(&analysis);
+    // Cycle-10 §5.3 Task 6: route @checkpoint(policy=...) policies from
+    // EffectChecker into CompileOptions so WengertExtractor::with_checkpoint_policies
+    // can stamp the prologue + emit a PrologueRecompute marker.
+    options.checkpoint_policies = analysis_to_checkpoint_policies(&analysis);
     // M62 Task 6: route weight_index_map from semantic analysis into codegen.
     options.weight_index_map = analysis.weight_index_map.clone();
     // M62: allocate a slot the compiler publishes @export functions into,
@@ -2786,6 +2808,10 @@ fn run_build_shared_multi(
             // effect on the multi-file shared-lib path.
             entry_options.csha_configs =
                 mod_data.csha_configs.iter().cloned().collect();
+            // Cycle-10 §5.3 Task 6: forward @checkpoint(policy=...) policies
+            // from the entry module's semantic analysis into CompileOptions.
+            entry_options.checkpoint_policies =
+                mod_data.checkpoint_policies.clone();
             entry_options.export_functions_out = Some(exports_slot.clone());
             // M62: route entry-module weight_index_map so @export model methods
             // can resolve `self.<field>` → weight index on the multi-file path.
@@ -2942,6 +2968,10 @@ fn run_build_zk(
     // Sprint 2 (paper §6.2): forward @csha decorator configs so per-model
     // disable/level/target overrides take effect on the ZK build path.
     options.csha_configs = analysis_to_csha_configs(&analysis);
+    // Cycle-10 §5.3 Task 6: route @checkpoint(policy=...) policies from
+    // EffectChecker into CompileOptions so WengertExtractor::with_checkpoint_policies
+    // can stamp the prologue + emit a PrologueRecompute marker.
+    options.checkpoint_policies = analysis_to_checkpoint_policies(&analysis);
     // M62 Task 6: route weight_index_map from semantic analysis into codegen.
     options.weight_index_map = analysis.weight_index_map.clone();
     let options = &options;
@@ -3172,6 +3202,10 @@ fn run_build_standalone(
     // Sprint 2 (paper §6.2): forward @csha decorator configs so per-model
     // disable/level/target overrides take effect on the standalone build path.
     options.csha_configs = analysis_to_csha_configs(&analysis);
+    // Cycle-10 §5.3 Task 6: route @checkpoint(policy=...) policies from
+    // EffectChecker into CompileOptions so WengertExtractor::with_checkpoint_policies
+    // can stamp the prologue + emit a PrologueRecompute marker.
+    options.checkpoint_policies = analysis_to_checkpoint_policies(&analysis);
     // M62 Task 6: route weight_index_map from semantic analysis into codegen.
     options.weight_index_map = analysis.weight_index_map.clone();
     let options = &options;
@@ -3312,6 +3346,10 @@ fn run_build_single(
     // Sprint 2 (paper §6.2): forward @csha decorator configs so per-model
     // disable/level/target overrides take effect on the multi-module path.
     options.csha_configs = analysis_to_csha_configs(&analysis);
+    // Cycle-10 §5.3 Task 6: route @checkpoint(policy=...) policies from
+    // EffectChecker into CompileOptions so WengertExtractor::with_checkpoint_policies
+    // can stamp the prologue + emit a PrologueRecompute marker.
+    options.checkpoint_policies = analysis_to_checkpoint_policies(&analysis);
     // M62 Task 6: route weight_index_map from semantic analysis into codegen so
     // compile_export_model_methods can resolve self.<field> → weight-array index.
     options.weight_index_map = analysis.weight_index_map.clone();
@@ -3566,6 +3604,10 @@ fn run_build_multi(
             // effect on the multi-file standalone path.
             entry_options.csha_configs =
                 mod_data.csha_configs.iter().cloned().collect();
+            // Cycle-10 §5.3 Task 6: forward @checkpoint(policy=...) policies
+            // from the entry module's semantic analysis into CompileOptions.
+            entry_options.checkpoint_policies =
+                mod_data.checkpoint_policies.clone();
             let entry_options = &entry_options;
 
             match nsl_codegen::compile_entry_returning_plan(

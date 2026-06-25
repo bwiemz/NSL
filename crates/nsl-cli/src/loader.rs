@@ -50,6 +50,15 @@ pub struct ModuleData {
     /// inside `@export` model methods. Routed into `CompileOptions.weight_index_map`
     /// for the entry module on the multi-file shared-lib path.
     pub weight_index_map: std::collections::HashMap<nsl_ast::NodeId, usize>,
+    /// Cycle-10 §5.3 paper checkpointing-aware backward (Task 6):
+    /// per-function `@checkpoint(policy=...)` policies harvested from
+    /// `EffectChecker::checkpoint_policies()` at the `analyze_with_imports`
+    /// call site below. Routed into `CompileOptions.checkpoint_policies`
+    /// so the codegen-side `WengertExtractor::with_checkpoint_policies`
+    /// installer can stamp the prologue + emit a `PrologueRecompute` marker.
+    /// Empty map = no checkpointing = byte-identity preserved.
+    pub checkpoint_policies:
+        std::collections::HashMap<String, nsl_semantic::effects::CheckpointPolicy>,
 }
 
 /// The complete module graph for a compilation unit.
@@ -413,6 +422,12 @@ pub fn load_all_modules(
             adapter_configs: analysis.adapter_configs,
             csha_configs: analysis.csha_configs,
             weight_index_map: analysis.weight_index_map,
+            // Cycle-10 §5.3 Task 6 (W9 corrected wire-up point):
+            // route EffectChecker::checkpoint_policies() output collected
+            // by the just-completed `analyze_with_imports` call into
+            // ModuleData so main.rs can publish it onto
+            // `CompileOptions.checkpoint_policies` for codegen to read.
+            checkpoint_policies: analysis.checkpoint_policies,
         });
     }
 

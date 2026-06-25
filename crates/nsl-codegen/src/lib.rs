@@ -604,6 +604,15 @@ pub struct CompileOptions {
     /// Empty map = no `@csha` decorators in the program (the default), which
     /// preserves the pre-Sprint-2 behaviour driven solely by `--csha`.
     pub csha_configs: HashMap<String, nsl_semantic::csha::CshaConfig>,
+    /// Cycle-10 §5.3 paper checkpointing-aware backward (Task 6):
+    /// per-function `@checkpoint(policy=...)` policies collected by
+    /// `EffectChecker::checkpoint_policies()` and routed through the
+    /// `nsl-cli` loader (`crates/nsl-cli/src/loader.rs:414`). Consumed
+    /// by extractor construction sites in `stmt.rs` /
+    /// `binary_codegen.rs` via `WengertExtractor::with_checkpoint_policies`.
+    /// Empty map = no checkpointing transformations = byte-identity preserved.
+    pub checkpoint_policies:
+        HashMap<String, nsl_semantic::effects::CheckpointPolicy>,
     /// CPDT: planner mode (Off/ZeroOnly/Full).
     pub cpdt_mode: crate::cpdt::CpdtMode,
     /// CPDT: cluster topology.  Required when `cpdt_mode != Off`.
@@ -716,6 +725,7 @@ impl Default for CompileOptions {
             csha_mode: None,
             csha_report: false,
             csha_configs: HashMap::new(),
+            checkpoint_policies: HashMap::new(),
             cpdt_mode: crate::cpdt::CpdtMode::Off,
             cpdt_cluster: None,
             cpdt_report_requested: false,
