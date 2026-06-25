@@ -14,7 +14,8 @@ use std::ffi::c_void;
 use crate::memory::{checked_alloc, checked_alloc_zeroed};
 
 use super::{
-    f16_bits_to_f32, f32_to_f16_bits, NslTensor, DTYPE_F32, DTYPE_FP16,
+    bf16_bits_to_f32, f16_bits_to_f32, f32_to_bf16_bits, f32_to_f16_bits, NslTensor, DTYPE_BF16,
+    DTYPE_F32, DTYPE_FP16,
 };
 
 /// Cast a tensor to `target_dtype`, returning a NEW owned tensor.
@@ -46,7 +47,11 @@ pub extern "C" fn nsl_tensor_cast(src_ptr: i64, target_dtype: i64) -> i64 {
             let d = unsafe { std::slice::from_raw_parts(t.data as *const u16, len) };
             d.iter().map(|&b| f16_bits_to_f32(b)).collect()
         }
-        other => panic!("nsl_tensor_cast: unsupported source dtype {other} (v1: F32/FP16)"),
+        DTYPE_BF16 => {
+            let d = unsafe { std::slice::from_raw_parts(t.data as *const u16, len) };
+            d.iter().map(|&b| bf16_bits_to_f32(b)).collect()
+        }
+        other => panic!("nsl_tensor_cast: unsupported source dtype {other} (v6: F32/FP16/BF16)"),
     };
 
     let shape = NslTensor::copy_shape(t.shape, t.ndim);
@@ -67,7 +72,14 @@ pub extern "C" fn nsl_tensor_cast(src_ptr: i64, target_dtype: i64) -> i64 {
             }
             p as *mut c_void
         }
-        other => panic!("nsl_tensor_cast: unsupported target dtype {other} (v1: F32/FP16)"),
+        DTYPE_BF16 => {
+            let p = checked_alloc(len * std::mem::size_of::<u16>()) as *mut u16;
+            for (i, &v) in src_f32.iter().enumerate() {
+                unsafe { *p.add(i) = f32_to_bf16_bits(v) };
+            }
+            p as *mut c_void
+        }
+        other => panic!("nsl_tensor_cast: unsupported target dtype {other} (v6: F32/FP16/BF16)"),
     };
 
     let out = Box::new(NslTensor::new(
@@ -79,6 +91,107 @@ pub extern "C" fn nsl_tensor_cast(src_ptr: i64, target_dtype: i64) -> i64 {
     // the pointer; combined with the caller's explicit `nsl_tensor_free`, the
     // scope-end sweep would touch an already-freed tensor (use-after-free).
     Box::into_raw(out) as i64
+}
+
+/// CFTP v6 convenience: cast a tensor to BF16, returning a NEW owned tensor
+/// published into the scope sweep (so the shadow buffer is reclaimed at
+/// function-scope exit — the right lifecycle for forward inline-cast). The
+/// source tensor is NOT consumed. v6 is CPU-only (the underlying
+/// `nsl_tensor_cast` is CPU-only); a device-side PTX cast kernel is deferred
+/// to v7. Supports F32/FP16/BF16 source dtypes (BF16->BF16 is a faithful copy).
+#[no_mangle]
+pub extern "C" fn nsl_tensor_to_bf16(src_ptr: i64) -> i64 {
+    cast_and_publish(src_ptr, DTYPE_BF16)
+}
+
+/// CFTP v6 convenience: cast a tensor to FP16, returning a NEW owned tensor
+/// published into the scope sweep. See `nsl_tensor_to_bf16`. Uses the crate's
+/// `f32_to_f16_bits` primitive (truncating, not RTE — see module note).
+#[no_mangle]
+pub extern "C" fn nsl_tensor_to_fp16(src_ptr: i64) -> i64 {
+    cast_and_publish(src_ptr, DTYPE_FP16)
+}
+
+/// CFTP v6 convenience: cast a tensor to F32, returning a NEW owned tensor
+/// published into the scope sweep. Needed for backward symmetry: if dx is
+/// emitted as BF16/FP16, the wengert tape may need an F32 widened copy.
+#[no_mangle]
+pub extern "C" fn nsl_tensor_to_f32(src_ptr: i64) -> i64 {
+    cast_and_publish(src_ptr, DTYPE_F32)
+}
+
+/// Shared helper for v6 cast wrappers. Performs a CPU cast (via the same
+/// host arithmetic as `nsl_tensor_cast`), but allocates the result via
+/// `NslTensor::publish` so the new tensor participates in the scope sweep
+/// (in contrast to `nsl_tensor_cast` which uses bare `Box::into_raw` for
+/// FASE optimizer-state buffers that are explicitly freed each step).
+fn cast_and_publish(src_ptr: i64, target_dtype: u16) -> i64 {
+    let t = unsafe { &*(src_ptr as *const NslTensor) };
+    assert_eq!(
+        t.device, 0,
+        "cast_and_publish: GPU tensors not supported in v6 (device={}); v7 will add a PTX cast kernel",
+        t.device
+    );
+    let len = t.len as usize;
+
+    let src_f32: Vec<f32> = match t.dtype {
+        DTYPE_F32 => {
+            let d = unsafe { std::slice::from_raw_parts(t.data as *const f32, len) };
+            d.to_vec()
+        }
+        DTYPE_FP16 => {
+            let d = unsafe { std::slice::from_raw_parts(t.data as *const u16, len) };
+            d.iter().map(|&b| f16_bits_to_f32(b)).collect()
+        }
+        DTYPE_BF16 => {
+            let d = unsafe { std::slice::from_raw_parts(t.data as *const u16, len) };
+            d.iter().map(|&b| bf16_bits_to_f32(b)).collect()
+        }
+        other => panic!("cast_and_publish: unsupported source dtype {other} (v6: F32/FP16/BF16)"),
+    };
+
+    let shape = NslTensor::copy_shape(t.shape, t.ndim);
+    let strides = NslTensor::compute_strides(shape, t.ndim);
+
+    let data: *mut c_void = match target_dtype {
+        DTYPE_F32 => {
+            let p = checked_alloc(len * std::mem::size_of::<f32>()) as *mut f32;
+            for (i, &v) in src_f32.iter().enumerate() {
+                unsafe { *p.add(i) = v };
+            }
+            p as *mut c_void
+        }
+        DTYPE_FP16 => {
+            let p = checked_alloc(len * std::mem::size_of::<u16>()) as *mut u16;
+            for (i, &v) in src_f32.iter().enumerate() {
+                unsafe { *p.add(i) = f32_to_f16_bits(v) };
+            }
+            p as *mut c_void
+        }
+        DTYPE_BF16 => {
+            let p = checked_alloc(len * std::mem::size_of::<u16>()) as *mut u16;
+            for (i, &v) in src_f32.iter().enumerate() {
+                unsafe { *p.add(i) = f32_to_bf16_bits(v) };
+            }
+            p as *mut c_void
+        }
+        other => panic!("cast_and_publish: unsupported target dtype {other} (v6: F32/FP16/BF16)"),
+    };
+
+    let out = Box::new(NslTensor::new(
+        data,
+        shape,
+        strides,
+        t.ndim,
+        t.len,
+        t.device,
+        target_dtype,
+        1, // owns_data
+        0, // data_owner
+    ));
+    // publish (not bare Box::into_raw) — scope_track participation so the
+    // forward inline-cast shadow buffer is reclaimed on function-scope exit.
+    NslTensor::publish(out)
 }
 
 /// Convert `src` (read as f32) into `dst`'s dtype and write it IN PLACE into
@@ -100,7 +213,11 @@ pub extern "C" fn nsl_tensor_cast_into(dst_ptr: i64, src_ptr: i64) {
             let d = unsafe { std::slice::from_raw_parts(src.data as *const u16, len) };
             d.iter().map(|&b| f16_bits_to_f32(b)).collect()
         }
-        other => panic!("nsl_tensor_cast_into: unsupported src dtype {other} (v1: F32/FP16)"),
+        DTYPE_BF16 => {
+            let d = unsafe { std::slice::from_raw_parts(src.data as *const u16, len) };
+            d.iter().map(|&b| bf16_bits_to_f32(b)).collect()
+        }
+        other => panic!("nsl_tensor_cast_into: unsupported src dtype {other} (v6: F32/FP16/BF16)"),
     };
 
     match dst.dtype {
@@ -116,7 +233,13 @@ pub extern "C" fn nsl_tensor_cast_into(dst_ptr: i64, src_ptr: i64) {
                 unsafe { *p.add(i) = f32_to_f16_bits(v) };
             }
         }
-        other => panic!("nsl_tensor_cast_into: unsupported dst dtype {other} (v1: F32/FP16)"),
+        DTYPE_BF16 => {
+            let p = dst.data as *mut u16;
+            for (i, &v) in src_f32.iter().enumerate() {
+                unsafe { *p.add(i) = f32_to_bf16_bits(v) };
+            }
+        }
+        other => panic!("nsl_tensor_cast_into: unsupported dst dtype {other} (v6: F32/FP16/BF16)"),
     }
 }
 
@@ -149,7 +272,8 @@ pub extern "C" fn nsl_tensor_zeros_like_dtype(template_ptr: i64, dtype: i64) -> 
     let elem_size: usize = match dtype {
         DTYPE_F32 => 4,
         DTYPE_FP16 => 2,
-        other => panic!("nsl_tensor_zeros_like_dtype: unsupported dtype {other} (v1: F32=1, FP16=2)"),
+        DTYPE_BF16 => 2,
+        other => panic!("nsl_tensor_zeros_like_dtype: unsupported dtype {other} (v6: F32=1, FP16=2, BF16=3)"),
     };
 
     let ndim = t.ndim;
@@ -345,6 +469,189 @@ mod tests {
         assert_eq!(t.dtype, DTYPE_FP16, "dtype is FP16");
         let bits = unsafe { std::slice::from_raw_parts(t.data as *const u16, 4) };
         assert!(bits.iter().all(|&b| f16_bits_to_f32(b) == 0.0), "all zero");
+        crate::tensor::nsl_tensor_free(template);
+        crate::tensor::nsl_tensor_free(z);
+    }
+
+    fn bf16_tensor(vals: &[f32]) -> i64 {
+        let len = vals.len();
+        let data = checked_alloc(len * std::mem::size_of::<u16>()) as *mut u16;
+        for (i, &v) in vals.iter().enumerate() {
+            unsafe { *data.add(i) = f32_to_bf16_bits(v) };
+        }
+        let shape = NslTensor::copy_shape([len as i64].as_ptr() as *mut i64, 1);
+        let strides = NslTensor::compute_strides(shape, 1);
+        let t = Box::new(NslTensor::new(
+            data as *mut c_void, shape, strides, 1, len as i64, 0, DTYPE_BF16, 1, 0,
+        ));
+        Box::into_raw(t) as i64
+    }
+
+    /// CFTP v6: bit-pattern equality vs hand-computed bf16 reference.
+    /// bf16 = top 16 bits of f32, so 1.0 = 0x3F800000_f32 -> 0x3F80_bf16.
+    #[test]
+    fn to_bf16_produces_expected_bit_patterns() {
+        // Hand-computed references: bf16 bits = high 16 bits of the f32 bits.
+        let vals = [1.0_f32, -2.0, 0.5, 0.0];
+        let expected_bits: [u16; 4] = [
+            (1.0_f32.to_bits() >> 16) as u16,   // 0x3F80
+            ((-2.0_f32).to_bits() >> 16) as u16, // 0xC000
+            (0.5_f32.to_bits() >> 16) as u16,   // 0x3F00
+            0x0000,
+        ];
+        let src = f32_tensor(&vals);
+        let bf16 = nsl_tensor_to_bf16(src);
+        let t = unsafe { &*(bf16 as *const NslTensor) };
+        assert_eq!(t.dtype, DTYPE_BF16, "result must be tagged bf16");
+        assert_eq!(t.len, vals.len() as i64);
+        let bits = unsafe { std::slice::from_raw_parts(t.data as *const u16, vals.len()) };
+        for i in 0..vals.len() {
+            assert_eq!(
+                bits[i], expected_bits[i],
+                "elem {i}: got 0x{:04X} expected 0x{:04X}",
+                bits[i], expected_bits[i]
+            );
+        }
+        crate::tensor::nsl_tensor_free(src);
+        crate::tensor::nsl_tensor_free(bf16);
+    }
+
+    /// Round-trip f32 -> bf16 -> f32 closes within bf16's truncating eps.
+    /// bf16 has 7 explicit mantissa bits so unit roundoff = 2^-7 ≈ 7.8e-3.
+    /// The crate's `f32_to_bf16_bits` truncates (drops low 16 bits), so worst
+    /// case relative error approaches the unit roundoff itself, not 0.5 ULP.
+    /// We use 7.9e-3 (one ULP above 2^-7) to be safe.
+    #[test]
+    fn to_bf16_round_trip_within_epsilon() {
+        let vals = [1.0001_f32, 3.14159265, -2.71828, 1234.5, 1e-3, -1e3];
+        let src = f32_tensor(&vals);
+        let bf16 = nsl_tensor_to_bf16(src);
+        let back = nsl_tensor_to_f32(bf16);
+        let got = read_f32(back);
+        for (i, &v) in vals.iter().enumerate() {
+            let rel = ((got[i] - v) / v).abs();
+            assert!(
+                rel <= 7.9e-3,
+                "elem {i}: v={v} got={} rel_err={} (bf16 truncating eps ~7.8e-3)",
+                got[i],
+                rel
+            );
+        }
+        crate::tensor::nsl_tensor_free(src);
+        crate::tensor::nsl_tensor_free(bf16);
+        crate::tensor::nsl_tensor_free(back);
+    }
+
+    /// Round-trip f32 -> fp16 -> f32 closes within fp16's epsilon (~9.8e-4).
+    /// fp16 has 10 mantissa bits, eps ~= 2^-10 ≈ 9.77e-4. Truncating primitive
+    /// gives worst-case ~2 * eps but real-world values stay within ~1.1e-3.
+    #[test]
+    fn to_fp16_round_trip_within_epsilon() {
+        // Avoid subnormal and overflow regions: fp16 range is ~6e-5 to 65504.
+        let vals = [1.0001_f32, 3.14159265, -2.71828, 1234.5, 1.5e-2, -512.0];
+        let src = f32_tensor(&vals);
+        let fp16 = nsl_tensor_to_fp16(src);
+        let back = nsl_tensor_to_f32(fp16);
+        let got = read_f32(back);
+        for (i, &v) in vals.iter().enumerate() {
+            let rel = ((got[i] - v) / v).abs();
+            // Truncating primitive can lose up to ~2 ULP at worst; use 1.1e-3.
+            assert!(
+                rel <= 1.1e-3,
+                "elem {i}: v={v} got={} rel_err={} (fp16 eps ~9.8e-4)",
+                got[i],
+                rel
+            );
+        }
+        crate::tensor::nsl_tensor_free(src);
+        crate::tensor::nsl_tensor_free(fp16);
+        crate::tensor::nsl_tensor_free(back);
+    }
+
+    /// Multi-size coverage: small (1), aligned (16), non-aligned (17), large (1024).
+    #[test]
+    fn to_bf16_multi_size_round_trip() {
+        for &n in &[1_usize, 16, 17, 1024] {
+            let vals: Vec<f32> = (0..n).map(|i| (i as f32) * 0.125 + 0.1).collect();
+            let src = f32_tensor(&vals);
+            let bf16 = nsl_tensor_to_bf16(src);
+            let back = nsl_tensor_to_f32(bf16);
+            let got = read_f32(back);
+            for (i, &v) in vals.iter().enumerate() {
+                let rel = ((got[i] - v) / v).abs();
+                assert!(
+                    rel <= 7.9e-3,
+                    "n={n} elem {i}: v={v} got={} rel_err={}",
+                    got[i],
+                    rel
+                );
+            }
+            // Cast also preserves shape + strides.
+            let t = unsafe { &*(bf16 as *const NslTensor) };
+            assert_eq!(t.len as usize, n, "len preserved (n={n})");
+            assert_eq!(t.ndim, 1, "ndim preserved (n={n})");
+            crate::tensor::nsl_tensor_free(src);
+            crate::tensor::nsl_tensor_free(bf16);
+            crate::tensor::nsl_tensor_free(back);
+        }
+    }
+
+    /// Confirm the v6 wrappers DELEGATE to the same primitives as nsl_tensor_cast.
+    /// `nsl_tensor_to_bf16(x)` and `nsl_tensor_cast(x, DTYPE_BF16)` must produce
+    /// bit-identical buffers.
+    #[test]
+    fn to_bf16_matches_nsl_tensor_cast_bit_for_bit() {
+        let vals = [1.0_f32, -3.14, 1e-2, 65500.0];
+        let src_a = f32_tensor(&vals);
+        let src_b = f32_tensor(&vals);
+        let via_wrapper = nsl_tensor_to_bf16(src_a);
+        let via_cast = nsl_tensor_cast(src_b, DTYPE_BF16 as i64);
+        let bits_a = unsafe {
+            std::slice::from_raw_parts(
+                (*(via_wrapper as *const NslTensor)).data as *const u16,
+                vals.len(),
+            )
+        };
+        let bits_b = unsafe {
+            std::slice::from_raw_parts(
+                (*(via_cast as *const NslTensor)).data as *const u16,
+                vals.len(),
+            )
+        };
+        assert_eq!(bits_a, bits_b, "wrapper must be bit-identical to nsl_tensor_cast");
+        crate::tensor::nsl_tensor_free(src_a);
+        crate::tensor::nsl_tensor_free(src_b);
+        // Note: via_wrapper was published into scope_track. In tests there is
+        // no enclosing function scope sweep, so an explicit free is fine.
+        crate::tensor::nsl_tensor_free(via_wrapper);
+        crate::tensor::nsl_tensor_free(via_cast);
+    }
+
+    /// Source dtype coverage: bf16 source -> f32 cast (backward symmetry path).
+    #[test]
+    fn nsl_tensor_cast_supports_bf16_source() {
+        let vals = [1.0_f32, -2.0, 0.5];
+        let src = bf16_tensor(&vals);
+        let out = nsl_tensor_cast(src, DTYPE_F32 as i64);
+        let got = read_f32(out);
+        // Exact: bf16 1.0/-2.0/0.5 round-trip with zero error (all exactly representable).
+        for (i, &v) in vals.iter().enumerate() {
+            assert_eq!(got[i], v, "elem {i}: exact bf16 value lost");
+        }
+        crate::tensor::nsl_tensor_free(src);
+        crate::tensor::nsl_tensor_free(out);
+    }
+
+    /// zeros_like_dtype now supports BF16.
+    #[test]
+    fn zeros_like_dtype_bf16() {
+        let template = f32_tensor(&[5.0, 6.0, 7.0]);
+        let z = nsl_tensor_zeros_like_dtype(template, DTYPE_BF16 as i64);
+        let t = unsafe { &*(z as *const NslTensor) };
+        assert_eq!(t.dtype, DTYPE_BF16, "dtype is BF16");
+        assert_eq!(t.len, 3);
+        let bits = unsafe { std::slice::from_raw_parts(t.data as *const u16, 3) };
+        assert!(bits.iter().all(|&b| bf16_bits_to_f32(b) == 0.0), "all zero");
         crate::tensor::nsl_tensor_free(template);
         crate::tensor::nsl_tensor_free(z);
     }
