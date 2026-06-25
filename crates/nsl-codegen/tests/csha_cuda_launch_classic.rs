@@ -297,6 +297,14 @@ fn run_flash_attention_and_measure(
             0, 0, 0, 0, 0, 0,
             1e-5f32.to_bits() as i64,
             0, 0,
+            // PCA Tier A: segment_ids ptr (trailing) — 0 = unpacked launch.
+            0i64,
+            // Tier B extension — null (no Tier B dispatch for the classic test).
+            0i64, 0i64,
+            // doc_starts ptr — null (no doc-aware RoPE for the classic test).
+            0i64,
+            // PCA per-doc CTA Strategy 3 v1: num_docs_or_zero — 0 (legacy topology).
+            0i64,
     );
     if rc != 0 {
         let log_ptr = nsl_test_cuda_jit_log(ptx.as_ptr() as i64);

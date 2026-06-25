@@ -221,6 +221,7 @@ fn run_scale(scale: &ScaleParams) {
         b as i64, s as i64, v as i64, h as i64,
         num_tiles as i64,
         smem as i64,
+        0, // dtype_tag = 0 (F32 sentinel; Sprint v3-2)
     );
     assert_eq!(rc, 0, "nsl_fused_linear_ce_forward_large failed rc={rc}");
 

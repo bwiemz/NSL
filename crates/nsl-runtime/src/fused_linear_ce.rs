@@ -28,7 +28,23 @@
 /// * `smem_bytes`   — shared-memory bytes per CTA (from `FusedLinearCEConfig::shared_mem_bytes()`).
 ///
 /// Returns 0 on success, negative on error.
+///
+/// # `dtype_tag` (Sprint v3-2 trailing arg)
+///
+/// `0` = F32 (default — preserves pre-Sprint-v3-2 behaviour byte-identically;
+/// all existing callers including the Cranelift IR call site in
+/// `wengert_lower.rs` pass this sentinel).
+///
+/// `1` = F16. Callers that pass `1` MUST allocate `x_ptr`, `w_ptr`, `bias_ptr`
+/// as fp16 in HBM. The `loss_out_ptr` and `lse_out_ptr` outputs stay f32
+/// regardless of `dtype_tag`. Threading actual fp16 from user code is a v4
+/// follow-on (requires the @fused_lm_ce decorator to accept a `dtype` arg
+/// and wengert_lower to derive `dtype_tag` from the @fused_lm_ce hint).
+///
+/// Any value other than 0 or 1 is treated as F32 (defensive — preserves
+/// forward-compat with un-recompiled callers).
 #[no_mangle]
+#[allow(clippy::too_many_arguments)]
 pub extern "C" fn nsl_fused_linear_ce_forward(
     ptx_ptr: i64,
     kname_ptr: i64,
@@ -43,7 +59,14 @@ pub extern "C" fn nsl_fused_linear_ce_forward(
     v: i64,
     h: i64,
     smem_bytes: i64,
+    dtype_tag: i64,
 ) -> i64 {
+    // dtype_tag is currently informational; the host launcher's element-size
+    // handling is implicit in the PTX bytes the caller supplied (the codegen
+    // already specialized to the right dtype). The argument is plumbed so
+    // future host-side hooks (e.g. SMEM cap raising for fp16) can branch on
+    // it without another ABI change.
+    let _dtype_tag = dtype_tag;
     #[cfg(feature = "cuda")]
     {
         let rc = crate::cuda::fused_ce_kernels::launch_forward(
@@ -116,6 +139,12 @@ pub extern "C" fn nsl_fused_linear_ce_forward(
 /// * `smem_bytes`   — Kernel A per-CTA smem budget; Kernel B is launched with 0.
 ///
 /// Returns 0 on success, negative on error.
+///
+/// # `dtype_tag` (Sprint v3-2 trailing arg)
+///
+/// `0` = F32 (default; preserves pre-Sprint-v3-2 ABI). `1` = F16 — caller
+/// MUST allocate x/W/bias in HBM as fp16; partials_ptr stays f32-sized
+/// (`large_partials_bytes()` is dtype-independent).
 #[no_mangle]
 #[allow(clippy::too_many_arguments)]
 pub extern "C" fn nsl_fused_linear_ce_forward_large(
@@ -135,7 +164,9 @@ pub extern "C" fn nsl_fused_linear_ce_forward_large(
     h: i64,
     num_tiles: i64,
     smem_bytes: i64,
+    dtype_tag: i64,
 ) -> i64 {
+    let _dtype_tag = dtype_tag;
     #[cfg(feature = "cuda")]
     {
         let rc = crate::cuda::fused_ce_kernels::launch_forward_large(
@@ -195,7 +226,16 @@ pub extern "C" fn nsl_fused_linear_ce_forward_large(
 /// * `smem_bytes`     — shared-memory bytes per CTA.
 ///
 /// Returns 0 on success, negative on error.
+///
+/// # `dtype_tag` (Sprint v3-2 trailing arg)
+///
+/// `0` = F32 (default; preserves pre-Sprint-v3-2 ABI). `1` = F16 — caller
+/// MUST allocate x/W/bias in HBM as fp16; lse_ptr stays f32 (forward
+/// writes f32 regardless of activation dtype); dx_out / dw_out / dbias_out
+/// stay f32 regardless of dtype_tag (PyTorch master-gradient convention —
+/// the kernel emits `red.global.add.f32` for cross-CTA accumulation).
 #[no_mangle]
+#[allow(clippy::too_many_arguments)]
 pub extern "C" fn nsl_fused_linear_ce_backward(
     ptx_ptr: i64,
     kname_ptr: i64,
@@ -214,8 +254,10 @@ pub extern "C" fn nsl_fused_linear_ce_backward(
     h: i64,
     num_valid: i64,
     smem_bytes: i64,
+    dtype_tag: i64,
 ) -> i64 {
     let grad_output = f32::from_bits(grad_output_bits as u32);
+    let _dtype_tag = dtype_tag;
 
     #[cfg(feature = "cuda")]
     {

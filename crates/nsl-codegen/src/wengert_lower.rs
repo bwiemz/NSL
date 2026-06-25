@@ -1204,38 +1204,38 @@ fn lower_single_op(
         // === Loss functions (3 ops) ===
         // Loss functions are composite: we lower them to sequences of existing FFI calls.
         //
-        // CFTP §4.4 G3 (Sprint 2.5 SUBSTITUTION SITE):
+        // CFTP §4.4 G3 (Sprint v3-1 — substitution implemented UPSTREAM):
         //
-        // When the surrounding `train` block carries `@fused_lm_ce(enabled = true)`,
-        // the planned Sprint 2.5 lowering will:
+        // Sprint v3-1 implemented `@fused_lm_ce` auto-substitution in
+        // source_ad.rs (see the `"cross_entropy" | "cross_entropy_loss"`
+        // arm in `WengertExtractor::extract_expr`, plus the helper
+        // `try_match_fused_linear_ce_pattern`).  When the surrounding
+        // `train` block carries `@fused_lm_ce(enabled = true)` AND all
+        // four shape hints are populated AND the input matches
+        // `Add(Matmul(x, Transpose(W, 0, 1)), bias)`, source-AD emits
+        // `PrimalOp::FusedLinearCe` instead of `PrimalOp::CrossEntropyLoss`
+        // before the lowerer ever runs — so by the time we get here, this
+        // arm only sees CE for the composite/regression path.
         //
-        //   1. Walk the Wengert list backwards from this op to confirm
-        //      `inputs[0]` was produced by a `Matmul` whose RHS is a
-        //      `Transpose` (the stdlib `fused_linear_ce` pattern in
-        //      stdlib/nsl/nn/losses.nsl), AND `inputs[0]` was produced by
-        //      a `BiasAdd`/`Add` whose RHS is a 1-D bias tensor.
-        //   2. Extract `(x, W, bias, targets)` from those upstream ops.
-        //   3. Synthesise a `FusedLinearCEConfig` from the static tensor
-        //      shapes (vocab_size, hidden_size, batch_size, seq_len)
-        //      + `Compiler.fused_ce_configs[0].vocab_tile`, embed the PTX
-        //      via `embed_flash_ptx`-style helper, emit a single
-        //      `nsl_fused_linear_ce_forward` FFI call with pre-allocated
-        //      loss + lse outputs (the latter saved for backward).
-        //   4. Register a custom backward emitter on the result var that
-        //      calls `nsl_fused_linear_ce_backward` with the saved lse,
-        //      producing dx / dW / dbias to feed `Compiler.adjoints`.
+        // This arm intentionally lowers the composite (logsoftmax + gather
+        // + neg/mean) for ALL `PrimalOp::CrossEntropyLoss` we see — that's
+        // the correct behaviour for:
+        //   * decorator absent
+        //   * `enabled = false`
+        //   * missing shape hints
+        //   * input chain that doesn't match the canonical decomposition
+        //     (e.g. user hand-rolled fused logits without the Add(Matmul,
+        //     bias) pattern, or used a non-`{0,1}` transpose)
+        //   * inference-mode evaluation outside any train block
         //
-        // Sprint 2 (current) intentionally falls through to the composite
-        // path below for ALL cross_entropy occurrences — the decorator
-        // is collected but does NOT yet drive substitution. The opt-in
-        // gate `Compiler.fused_ce_configs.first().map(|c| c.enabled)`
-        // exists in compiler state ready for Sprint 2.5 to consume.
-        //
-        // Cross-references:
+        // Cross-references (still useful for spelunking):
+        //   * crates/nsl-codegen/src/source_ad.rs (search for
+        //     `try_match_fused_linear_ce_pattern`) — the substitution site.
         //   * crates/nsl-codegen/src/fused_linear_ce.rs — PTX synthesis.
         //   * crates/nsl-runtime/src/fused_linear_ce.rs — forward + bwd FFI.
         //   * stdlib/nsl/nn/losses.nsl::fused_linear_ce — user-facing
-        //     stdlib function (Sprint 2 wires the composite v1 path).
+        //     stdlib function (composite v1 path; the auto-substitution
+        //     replaces this expansion at source-AD time when enabled).
         //   * crates/nsl-semantic/src/cftp.rs::validate_fused_ce_decorator
         //     — decorator parsing + alignment-invariant enforcement.
         PrimalOp::CrossEntropyLoss => {
@@ -2614,6 +2614,9 @@ fn lower_fused_linear_ce_forward(
             call(compiler, builder, "nsl_tensor_data_ptr", &[partials_buf])?;
         let num_tiles_val = builder.ins().iconst(cl_types::I64, num_tiles);
 
+        // dtype_tag = 0 (F32 sentinel; Sprint v3-2 added the trailing arg).
+        // V4 follow-on will derive this from the @fused_lm_ce decorator.
+        let dtype_tag_val = builder.ins().iconst(cl_types::I64, 0);
         let _rc = call(
             compiler,
             builder,
@@ -2635,6 +2638,7 @@ fn lower_fused_linear_ce_forward(
                 h_val,
                 num_tiles_val,
                 smem_val,
+                dtype_tag_val,
             ],
         )?;
         // Partials scratch is no longer needed after the launch.
@@ -2644,6 +2648,8 @@ fn lower_fused_linear_ce_forward(
         let kname = cfg.kernel_name();
         let (ptx_ptr, name_ptr) =
             embed_fused_ce_data(compiler, builder, &tag, &fwd_ptx_bytes, &kname)?;
+        // dtype_tag = 0 (F32 sentinel; Sprint v3-2 added the trailing arg).
+        let dtype_tag_val = builder.ins().iconst(cl_types::I64, 0);
         let _rc = call(
             compiler,
             builder,
@@ -2662,6 +2668,7 @@ fn lower_fused_linear_ce_forward(
                 v_val,
                 h_val,
                 smem_val,
+                dtype_tag_val,
             ],
         )?;
     }
@@ -2868,6 +2875,8 @@ fn lower_fused_linear_ce_backward_extract(
         let h_val = builder.ins().iconst(cl_types::I64, hidden_size as i64);
         let smem_val = builder.ins().iconst(cl_types::I64, cfg.shared_mem_bytes() as i64);
 
+        // dtype_tag = 0 (F32 sentinel; Sprint v3-2 added the trailing arg).
+        let dtype_tag_val = builder.ins().iconst(cl_types::I64, 0);
         let _rc = call(
             compiler,
             builder,
@@ -2890,6 +2899,7 @@ fn lower_fused_linear_ce_backward_extract(
                 h_val,
                 num_valid,
                 smem_val,
+                dtype_tag_val,
             ],
         )?;
 

@@ -103,11 +103,25 @@ pub const LARGE_VOCAB_THRESHOLD: u32 = 8192;
 /// GPT-3=50257, LLaMA-3=128256) with headroom.
 pub const MAX_VOCAB_HARD_CEILING: u32 = 262_144;
 
-/// Dtype selector for FusedLinearCE.  Both v1 single-CTA and Sprint-3
-/// large-vocab paths support F32 only.
+/// Dtype selector for FusedLinearCE.
+///
+/// Both v1 single-CTA and Sprint-3 large-vocab paths support **F32** and
+/// **F16** (Sprint v3-2). F16 uses the standard mixed-precision convention:
+/// loads/stores in `.f16`, accumulators (online-LSE max + sum, dot products)
+/// in `.f32`. The large-vocab partials buffer stays f32 for numerical
+/// robustness regardless of input dtype. The backward gradient outputs
+/// (dx/dW/dbias) are also written in f32 even at `Dtype::F16` — this matches
+/// PyTorch's mixed-precision convention where master weights and the
+/// optimizer state stay at f32 while only forward activations + weights
+/// halve their footprint.
+///
+/// **Bf16** is deferred to a v4 follow-on (structurally identical to fp16
+/// emit-wise but different exponent biasing → wider tolerance bounds need
+/// validation against a bf16-aware reference).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Dtype {
     F32,
+    F16,
 }
 
 impl Dtype {
@@ -115,6 +129,57 @@ impl Dtype {
     pub fn tag(self) -> &'static str {
         match self {
             Dtype::F32 => "f32",
+            Dtype::F16 => "f16",
+        }
+    }
+
+    /// Storage size in bytes of one element in HBM / SMEM. Used to size the
+    /// online-softmax SMEM tile and to compute byte strides for HBM
+    /// addressing.
+    #[inline]
+    pub fn bytes_per_elem(self) -> u32 {
+        match self {
+            Dtype::F32 => 4,
+            Dtype::F16 => 2,
+        }
+    }
+
+    /// PTX type-suffix for `ld.global.*` / `ld.shared.*` loads.
+    ///
+    /// Matches `tag()` today, kept as a separate accessor so future dtypes
+    /// (bf16) that share a load family with f16 but have a different
+    /// kernel-name tag don't accidentally collide.
+    #[inline]
+    pub fn ptx_load_suffix(self) -> &'static str {
+        match self {
+            Dtype::F32 => "f32",
+            Dtype::F16 => "f16",
+        }
+    }
+
+    /// PTX type-suffix for `st.global.*` / `st.shared.*` stores. Same family
+    /// as `ptx_load_suffix` today; kept distinct for future asymmetric paths.
+    #[inline]
+    pub fn ptx_store_suffix(self) -> &'static str {
+        match self {
+            Dtype::F32 => "f32",
+            Dtype::F16 => "f16",
+        }
+    }
+
+    /// The PTX register family used to *hold* one element in registers
+    /// during HBM↔SMEM staging at this dtype.
+    ///
+    /// For `F32` this is `"f32"` (registers used directly for math). For
+    /// `F16` we move bytes through `.b16` registers and explicitly
+    /// `cvt.f32.f16`/`cvt.rn.f16.f32` to/from `.f32` math registers — this
+    /// matches the standard mixed-precision convention and keeps the
+    /// algorithm in f32 precision end-to-end.
+    #[inline]
+    pub fn ptx_reg_family(self) -> &'static str {
+        match self {
+            Dtype::F32 => "f32",
+            Dtype::F16 => "b16",
         }
     }
 }
@@ -208,8 +273,9 @@ impl FusedLinearCEConfig {
                 self.hidden_size
             ));
         }
-        if self.dtype != Dtype::F32 {
-            return Err("fused_linear_ce v1: only Dtype::F32 is supported".into());
+        // F32 + F16 accepted (Sprint v3-2). Bf16 deferred to v4.
+        match self.dtype {
+            Dtype::F32 | Dtype::F16 => {}
         }
         if self.batch_size == 0 || self.seq_len == 0 {
             return Err("fused_linear_ce: batch_size * seq_len must be > 0".into());
@@ -303,10 +369,17 @@ impl FusedLinearCEConfig {
         rows * n_tiles * 2 * 4
     }
 
-    /// Shared-memory budget per CTA: logits tile (vocab_tile * 4 bytes) +
-    /// warp-shuffle scratch / LSE-max scalars (32 bytes pad).
+    /// Shared-memory budget per CTA: logits tile
+    /// (`vocab_tile * dtype.bytes_per_elem()` bytes) + warp-shuffle scratch /
+    /// LSE-max scalars (32 bytes pad).
+    ///
+    /// At `Dtype::F32` this is `vocab_tile * 4 + 32` (unchanged from
+    /// pre-Sprint-v3-2; the byte-identity snapshot pins this). At
+    /// `Dtype::F16` the per-element size halves, so the SMEM tile halves
+    /// too — useful headroom on smem-constrained SMs but not yet exploited
+    /// to raise the vocab_tile cap (see `validate()` deferred follow-on).
     pub fn shared_mem_bytes(&self) -> u32 {
-        self.vocab_tile * 4 + 32
+        self.vocab_tile * self.dtype.bytes_per_elem() + 32
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────
@@ -352,7 +425,13 @@ pub fn synthesize_fused_linear_ce_ptx(cfg: &FusedLinearCEConfig) -> Vec<u8> {
     if cfg.is_large_vocab() {
         synthesize_large_vocab_forward_ptx(cfg)
     } else {
-        emit_fwd_kernel(cfg).into_bytes()
+        match cfg.dtype {
+            // F32 path is BYTE-IDENTICAL to pre-Sprint-v3-2 — calls the
+            // untouched emitter. Sprint 3's v1 byte-identity snapshot pins
+            // this contract.
+            Dtype::F32 => emit_fwd_kernel(cfg).into_bytes(),
+            Dtype::F16 => emit_fwd_kernel_f16(cfg).into_bytes(),
+        }
     }
 }
 
@@ -367,9 +446,22 @@ pub fn synthesize_large_vocab_forward_ptx(cfg: &FusedLinearCEConfig) -> Vec<u8> 
     let mut out = String::new();
     out.push_str(&cfg.ptx_header());
     out.push('\n');
-    out.push_str(&emit_large_partials_kernel(cfg, /*emit_header=*/ false));
-    out.push('\n');
-    out.push_str(&emit_large_finalize_kernel(cfg, /*emit_header=*/ false));
+    match cfg.dtype {
+        // F32 path is BYTE-IDENTICAL to pre-Sprint-v3-2 large-vocab — gated by
+        // `tests/fused_linear_ce_large_vocab_numerical.rs::ptx_byte_identity_at_v4096`
+        // (uses the small-vocab routing) and the structural large-vocab ptxas
+        // test at v=49152. Calls the untouched emitters.
+        Dtype::F32 => {
+            out.push_str(&emit_large_partials_kernel(cfg, /*emit_header=*/ false));
+            out.push('\n');
+            out.push_str(&emit_large_finalize_kernel(cfg, /*emit_header=*/ false));
+        }
+        Dtype::F16 => {
+            out.push_str(&emit_large_partials_kernel_f16(cfg));
+            out.push('\n');
+            out.push_str(&emit_large_finalize_kernel_f16(cfg));
+        }
+    }
     out.into_bytes()
 }
 
@@ -393,8 +485,12 @@ pub fn synthesize_large_vocab_forward_ptx(cfg: &FusedLinearCEConfig) -> Vec<u8> 
 /// then scatters `dx += dlogits_v * W[v, :]` and
 /// `dW[v, :] += dlogits_v * x[row, :]` via `red.global.add.f32`.
 pub fn synthesize_fused_linear_ce_backward_ptx(cfg: &FusedLinearCEConfig) -> Vec<u8> {
-    let ptx = emit_bwd_kernel(cfg);
-    ptx.into_bytes()
+    match cfg.dtype {
+        // F32 path is BYTE-IDENTICAL to pre-Sprint-v3-2 — pinned by
+        // `tests/fused_linear_ce_v1_byte_identity.rs::v1_backward_*`.
+        Dtype::F32 => emit_bwd_kernel(cfg).into_bytes(),
+        Dtype::F16 => emit_bwd_kernel_f16(cfg).into_bytes(),
+    }
 }
 
 // ─── PTX emission — forward ───────────────────────────────────────────────────
@@ -682,6 +778,329 @@ fn emit_fwd_kernel(cfg: &FusedLinearCEConfig) -> String {
     lines.push(String::new());
 
     // Skip label: write zeros.
+    lines.push(p("SKIP_LABEL:"));
+    lines.push(p("\tsetp.eq.u32 %pth0, %r1, 0;"));
+    lines.push(p("\t@!%pth0 bra WRITE_DONE;"));
+    lines.push(p("\tcvt.u64.u32 %rd23, %r0;"));
+    lines.push(p("\tshl.b64 %rd23, %rd23, 2;"));
+    lines.push(p("\tadd.u64 %rd24, %rd4, %rd23;"));
+    lines.push(p("\tst.global.f32 [%rd24], 0f00000000;"));
+    lines.push(p("\tadd.u64 %rd24, %rd5, %rd23;"));
+    lines.push(p("\tst.global.f32 [%rd24], 0f00000000;"));
+    lines.push(String::new());
+
+    lines.push(p("WRITE_DONE:"));
+    lines.push(p("\tret;"));
+    lines.push(p("}"));
+
+    lines.join("\n")
+}
+
+// ── F16 forward kernel ───────────────────────────────────────────────────────
+//
+// Mixed-precision convention (Sprint v3-2):
+//   * HBM loads of x, W, bias are `ld.global.b16` → `cvt.f32.f16` into f32
+//     math registers (the dot-product accumulators).
+//   * SMEM logit tile is stored as `.b16` (2 bytes/elem) — the per-tile
+//     online-LSE reduction loads `.b16`, converts to f32, then folds into
+//     the f32 max + sum registers. This halves the SMEM footprint vs F32.
+//   * +INF / -INF sentinels and the log2e + ln2 constants live in f32
+//     registers; the online-LSE algorithm is bit-for-bit the same as F32.
+//   * HBM outputs `loss_out` and `lse_out` are written as `.f32` (per
+//     convention; downstream backward consumes the same f32 lse).
+//
+// The kernel layout, loop structure, sync points, and SMEM partitioning
+// mirror `emit_fwd_kernel` exactly — only the dtype of HBM/SMEM staging
+// changes. Keeping the structure parallel preserves the option of merging
+// the two emitters in a future refactor (deferred for byte-identity safety).
+fn emit_fwd_kernel_f16(cfg: &FusedLinearCEConfig) -> String {
+    let name = cfg.kernel_name();
+    let vocab = cfg.vocab_size;
+    let hidden = cfg.hidden_size;
+    let vtile = cfg.vocab_tile;
+    let n_tiles = vocab.div_ceil(vtile);
+    let vtile_per_thread = vtile / 128;
+    let ignore = cfg.ignore_index;
+    let smem_bytes = cfg.shared_mem_bytes();
+    // F16 SMEM: 2 bytes/elem instead of 4. logit_at_target scratch slot lives
+    // immediately after the tile and ALSO uses 2 bytes; the +32 padding in
+    // shared_mem_bytes() leaves ample room.
+    let elem_bytes = cfg.dtype.bytes_per_elem(); // = 2 for F16
+    let lat_offset = vtile * elem_bytes;
+
+    let mut lines: Vec<String> = Vec::new();
+    let p = |l: &str| l.to_owned();
+
+    lines.push(cfg.ptx_header());
+    // `.align 2` because the SMEM is half-precision; ptxas auto-aligns to 4
+    // for the +INF sentinel store anyway — but the declared align matches
+    // the dtype.
+    lines.push(format!(".extern .shared .align 2 .b8 smem_scratch[{smem_bytes}];"));
+    lines.push(String::new());
+    lines.push(format!(".visible .entry {name}("));
+    lines.push(p("\t.param .u64 param_x,"));
+    lines.push(p("\t.param .u64 param_w,"));
+    lines.push(p("\t.param .u64 param_bias,"));
+    lines.push(p("\t.param .u64 param_targets,"));
+    lines.push(p("\t.param .u64 param_loss_out,"));
+    lines.push(p("\t.param .u64 param_lse_out,"));
+    lines.push(p("\t.param .u32 param_B, .param .u32 param_S,"));
+    lines.push(p("\t.param .u32 param_V, .param .u32 param_H"));
+    lines.push(p(") {"));
+    // Registers.
+    lines.push(p("\t.reg .u64 %rd<30>;"));
+    lines.push(p("\t.reg .u32 %r<20>;"));
+    lines.push(p("\t.reg .s64 %tgt64;"));
+    lines.push(p("\t.reg .b16 %h0, %h1, %h2;"));
+    lines.push(p("\t.reg .f32 %flog, %facc, %fmax, %fsum, %ftmax, %flse, %floss;"));
+    lines.push(p("\t.reg .f32 %fa, %fb, %flog2e, %fln2, %ftmp;"));
+    lines.push(p("\t.reg .pred %pskip, %pv, %pth0, %ptgt;"));
+    lines.push(String::new());
+
+    // Load params.
+    lines.push(p("\tld.param.u64 %rd0, [param_x];"));
+    lines.push(p("\tld.param.u64 %rd1, [param_w];"));
+    lines.push(p("\tld.param.u64 %rd2, [param_bias];"));
+    lines.push(p("\tld.param.u64 %rd3, [param_targets];"));
+    lines.push(p("\tld.param.u64 %rd4, [param_loss_out];"));
+    lines.push(p("\tld.param.u64 %rd5, [param_lse_out];"));
+    lines.push(p("\tmov.u32 %r0, %ctaid.x;   // row_idx"));
+    lines.push(p("\tmov.u32 %r1, %tid.x;     // tid"));
+    lines.push(p("\tmov.f32 %flog2e, 0f3FB8AA3B; // log2(e)"));
+    lines.push(p("\tmov.f32 %fln2,   0f3F317218; // ln(2)"));
+    lines.push(String::new());
+
+    // Thread 0 initialises logit_at_target smem slot to -INF (as fp16
+    // bit-pattern 0xFBFF = -65504, the most negative finite fp16; the
+    // logit_at_target slot is only consumed if the target was found, so a
+    // strict -INF bit-pattern is not required — but using fp16 -INF
+    // (0xFC00) keeps the semantics matched).
+    lines.push(p("\tsetp.eq.u32 %pth0, %r1, 0;"));
+    lines.push(p("\t@!%pth0 bra INIT_DONE;"));
+    lines.push(p("\tmov.u64 %rd6, smem_scratch;"));
+    lines.push(format!("\tadd.u64 %rd6, %rd6, {lat_offset};"));
+    lines.push(p("\tmov.b16 %h0, 0xFC00; // fp16 -INF sentinel"));
+    lines.push(p("\tst.shared.b16 [%rd6], %h0;"));
+    lines.push(p("INIT_DONE:"));
+    lines.push(p("\tbar.sync 0;"));
+    lines.push(String::new());
+
+    // Load target[row_idx].
+    lines.push(p("\t// Load targets[row_idx] (i64)"));
+    lines.push(p("\tcvt.u64.u32 %rd7, %r0;"));
+    lines.push(p("\tmul.lo.u64 %rd7, %rd7, 8;"));
+    lines.push(p("\tadd.u64 %rd7, %rd3, %rd7;"));
+    lines.push(p("\tld.global.s64 %tgt64, [%rd7];"));
+    lines.push(String::new());
+
+    // Skip branch.
+    lines.push(format!("\t// setp.eq.s64: if target == {ignore} skip"));
+    lines.push(format!("\tsetp.eq.s64 %pskip, %tgt64, {ignore};"));
+    lines.push(p("\t@%pskip bra SKIP_LABEL;"));
+    lines.push(String::new());
+
+    // x_row_base = x + row * H * 2 (fp16: 2 bytes/elem).
+    lines.push(format!(
+        "\t// x_row_base = x + row_idx * {hidden} * {elem_bytes}"
+    ));
+    lines.push(p("\tcvt.u64.u32 %rd8, %r0;"));
+    lines.push(format!("\tmov.u32 %r2, {hidden};"));
+    lines.push(p("\tcvt.u64.u32 %rd9, %r2;"));
+    lines.push(p("\tmul.lo.u64 %rd8, %rd8, %rd9;"));
+    lines.push(p("\tshl.b64 %rd8, %rd8, 1; // *2 for fp16"));
+    lines.push(p("\tadd.u64 %rd8, %rd0, %rd8; // %rd8 = x_row_base"));
+    lines.push(String::new());
+
+    // Init online-softmax accumulators (f32).
+    lines.push(p("\tmov.f32 %fmax, 0f80800000; // -INF (f32)"));
+    lines.push(p("\tmov.f32 %fsum, 0f00000000;"));
+    lines.push(String::new());
+
+    // Outer tile loop.
+    lines.push(p("\tmov.u32 %r3, 0; // tile_idx"));
+    lines.push(p("TILE_LOOP:"));
+    lines.push(format!("\t\tmul.lo.u32 %r4, %r3, {vtile}; // v_base"));
+    lines.push(String::new());
+
+    lines.push(p("\t\tmov.u32 %r5, 0; // sub-tile counter"));
+    lines.push(p("\t\tINNER_LOOP:"));
+    lines.push(p("\t\t\tmul.lo.u32 %r6, %r5, 128;"));
+    lines.push(p("\t\t\tadd.u32 %r6, %r6, %r1;"));
+    lines.push(p("\t\t\tadd.u32 %r6, %r6, %r4; // v_idx"));
+    lines.push(format!("\t\t\tsetp.lt.u32 %pv, %r6, {vocab};"));
+    lines.push(p("\t\t\t@!%pv bra INNER_SKIP;"));
+    lines.push(String::new());
+
+    // W_row_base = W + v_idx * H * 2.
+    lines.push(format!(
+        "\t\t\t// W_row_base = W + v_idx * {hidden} * {elem_bytes}"
+    ));
+    lines.push(p("\t\t\tcvt.u64.u32 %rd10, %r6;"));
+    lines.push(format!("\t\t\tmov.u32 %r7, {hidden};"));
+    lines.push(p("\t\t\tcvt.u64.u32 %rd11, %r7;"));
+    lines.push(p("\t\t\tmul.lo.u64 %rd10, %rd10, %rd11;"));
+    lines.push(p("\t\t\tshl.b64 %rd10, %rd10, 1; // *2 for fp16"));
+    lines.push(p("\t\t\tadd.u64 %rd10, %rd1, %rd10; // %rd10 = W_row_base"));
+    lines.push(String::new());
+
+    // Dot-product loop — load .b16, cvt to .f32, fma in f32.
+    lines.push(p("\t\t\tmov.f32 %facc, 0f00000000;"));
+    lines.push(p("\t\t\tmov.u32 %r8, 0; // h"));
+    lines.push(p("\t\t\tDOT_LOOP:"));
+    lines.push(p("\t\t\t\tcvt.u64.u32 %rd12, %r8;"));
+    lines.push(p("\t\t\t\tshl.b64 %rd12, %rd12, 1; // h * 2"));
+    lines.push(p("\t\t\t\tadd.u64 %rd13, %rd8, %rd12;"));
+    lines.push(p("\t\t\t\tld.global.b16 %h1, [%rd13];"));
+    lines.push(p("\t\t\t\tcvt.f32.f16 %fa, %h1;"));
+    lines.push(p("\t\t\t\tadd.u64 %rd14, %rd10, %rd12;"));
+    lines.push(p("\t\t\t\tld.global.b16 %h1, [%rd14];"));
+    lines.push(p("\t\t\t\tcvt.f32.f16 %fb, %h1;"));
+    lines.push(p("\t\t\t\tfma.rn.f32 %facc, %fa, %fb, %facc;"));
+    lines.push(p("\t\t\t\tadd.u32 %r8, %r8, 1;"));
+    lines.push(format!("\t\t\t\tsetp.lt.u32 %pv, %r8, {hidden};"));
+    lines.push(p("\t\t\t\t@%pv bra DOT_LOOP;"));
+    lines.push(String::new());
+
+    // Add bias[v_idx].
+    lines.push(p("\t\t\t// facc += bias[v_idx] (fp16 HBM)"));
+    lines.push(p("\t\t\tcvt.u64.u32 %rd15, %r6;"));
+    lines.push(p("\t\t\tshl.b64 %rd15, %rd15, 1; // *2"));
+    lines.push(p("\t\t\tadd.u64 %rd15, %rd2, %rd15;"));
+    lines.push(p("\t\t\tld.global.b16 %h1, [%rd15];"));
+    lines.push(p("\t\t\tcvt.f32.f16 %ftmp, %h1;"));
+    lines.push(p("\t\t\tadd.f32 %facc, %facc, %ftmp;"));
+    lines.push(String::new());
+
+    // Store logit to smem tile (cvt back to fp16; tile is .b16 stride 2).
+    lines.push(p("\t\t\t// Store logit to smem_scratch[(r5*128+tid)*2] as fp16"));
+    lines.push(p("\t\t\tmul.lo.u32 %r9, %r5, 128;"));
+    lines.push(p("\t\t\tadd.u32 %r9, %r9, %r1;"));
+    lines.push(p("\t\t\tshl.b32 %r9, %r9, 1; // *2"));
+    lines.push(p("\t\t\tmov.u64 %rd16, smem_scratch;"));
+    lines.push(p("\t\t\tcvt.u64.u32 %rd17, %r9;"));
+    lines.push(p("\t\t\tadd.u64 %rd16, %rd16, %rd17;"));
+    lines.push(p("\t\t\tcvt.rn.f16.f32 %h2, %facc;"));
+    lines.push(p("\t\t\tst.shared.b16 [%rd16], %h2;"));
+    lines.push(String::new());
+
+    // If v_idx == target, record logit_at_target in smem (also fp16).
+    lines.push(p("\t\t\t// If v_idx == target, record logit_at_target (fp16)"));
+    lines.push(p("\t\t\tcvt.s64.u32 %rd18, %r6;"));
+    lines.push(p("\t\t\tsetp.eq.s64 %ptgt, %rd18, %tgt64;"));
+    lines.push(p("\t\t\t@!%ptgt bra NOT_TARGET;"));
+    lines.push(p("\t\t\tmov.u64 %rd19, smem_scratch;"));
+    lines.push(format!("\t\t\tadd.u64 %rd19, %rd19, {lat_offset};"));
+    lines.push(p("\t\t\tst.shared.b16 [%rd19], %h2;"));
+    lines.push(p("\t\t\tNOT_TARGET:"));
+    lines.push(String::new());
+
+    lines.push(p("\t\t\tINNER_SKIP:"));
+    lines.push(p("\t\t\tadd.u32 %r5, %r5, 1;"));
+    lines.push(format!("\t\t\tsetp.lt.u32 %pv, %r5, {vtile_per_thread};"));
+    lines.push(p("\t\t\t@%pv bra INNER_LOOP;"));
+    lines.push(String::new());
+
+    // Sync: all logits in smem.
+    lines.push(p("\t\tbar.sync 0;"));
+    lines.push(String::new());
+
+    // Thread 0 reduces smem tile.
+    lines.push(p("\t\tsetp.eq.u32 %pth0, %r1, 0;"));
+    lines.push(p("\t\t@!%pth0 bra TILE_REDUCE_DONE;"));
+    lines.push(String::new());
+
+    // Step 1: find tile_max (read fp16 → cvt to f32, fold into f32 max).
+    lines.push(p("\t\tmov.f32 %ftmax, 0f80800000;"));
+    lines.push(p("\t\tmov.u32 %r10, 0;"));
+    lines.push(p("\t\tSMEM_MAX_LOOP:"));
+    lines.push(p("\t\t\tadd.u32 %r11, %r4, %r10; // v_base + i"));
+    lines.push(format!("\t\t\tsetp.lt.u32 %pv, %r11, {vocab};"));
+    lines.push(p("\t\t\t@!%pv bra SMEM_MAX_DONE;"));
+    lines.push(p("\t\t\tshl.b32 %r12, %r10, 1; // *2"));
+    lines.push(p("\t\t\tmov.u64 %rd20, smem_scratch;"));
+    lines.push(p("\t\t\tcvt.u64.u32 %rd21, %r12;"));
+    lines.push(p("\t\t\tadd.u64 %rd20, %rd20, %rd21;"));
+    lines.push(p("\t\t\tld.shared.b16 %h1, [%rd20];"));
+    lines.push(p("\t\t\tcvt.f32.f16 %ftmp, %h1;"));
+    lines.push(p("\t\t\tmax.f32 %ftmax, %ftmax, %ftmp;"));
+    lines.push(p("\t\t\tadd.u32 %r10, %r10, 1;"));
+    lines.push(format!("\t\t\tsetp.lt.u32 %pv, %r10, {vtile};"));
+    lines.push(p("\t\t\t@%pv bra SMEM_MAX_LOOP;"));
+    lines.push(p("\t\tSMEM_MAX_DONE:"));
+    lines.push(String::new());
+
+    // Online-softmax rescale.
+    lines.push(p("\t\t// Online-softmax update"));
+    lines.push(p("\t\tmax.f32 %flog, %fmax, %ftmax; // new_max"));
+    lines.push(p("\t\tsub.f32 %fmax, %fmax, %flog;"));
+    lines.push(p("\t\tmul.f32 %fmax, %fmax, %flog2e;"));
+    lines.push(p("\t\tex2.approx.f32 %fmax, %fmax;"));
+    lines.push(p("\t\tmul.f32 %fsum, %fsum, %fmax;"));
+    lines.push(p("\t\tmov.f32 %fmax, %flog;"));
+    lines.push(String::new());
+
+    // Tile sum (fp16 load → cvt to f32 → fold into f32 sum).
+    lines.push(p("\t\tmov.u32 %r10, 0;"));
+    lines.push(p("\t\tSMEM_SUM_LOOP:"));
+    lines.push(p("\t\t\tadd.u32 %r11, %r4, %r10;"));
+    lines.push(format!("\t\t\tsetp.lt.u32 %pv, %r11, {vocab};"));
+    lines.push(p("\t\t\t@!%pv bra SMEM_SUM_DONE;"));
+    lines.push(p("\t\t\tshl.b32 %r12, %r10, 1; // *2"));
+    lines.push(p("\t\t\tmov.u64 %rd20, smem_scratch;"));
+    lines.push(p("\t\t\tcvt.u64.u32 %rd21, %r12;"));
+    lines.push(p("\t\t\tadd.u64 %rd20, %rd20, %rd21;"));
+    lines.push(p("\t\t\tld.shared.b16 %h1, [%rd20];"));
+    lines.push(p("\t\t\tcvt.f32.f16 %ftmp, %h1;"));
+    lines.push(p("\t\t\tsub.f32 %ftmp, %ftmp, %fmax;"));
+    lines.push(p("\t\t\tmul.f32 %ftmp, %ftmp, %flog2e;"));
+    lines.push(p("\t\t\tex2.approx.f32 %ftmp, %ftmp;"));
+    lines.push(p("\t\t\tadd.f32 %fsum, %fsum, %ftmp;"));
+    lines.push(p("\t\t\tadd.u32 %r10, %r10, 1;"));
+    lines.push(format!("\t\t\tsetp.lt.u32 %pv, %r10, {vtile};"));
+    lines.push(p("\t\t\t@%pv bra SMEM_SUM_LOOP;"));
+    lines.push(p("\t\tSMEM_SUM_DONE:"));
+    lines.push(String::new());
+
+    lines.push(p("\t\tTILE_REDUCE_DONE:"));
+    lines.push(p("\t\tbar.sync 0;"));
+    lines.push(String::new());
+
+    lines.push(p("\t\tadd.u32 %r3, %r3, 1;"));
+    lines.push(format!("\t\tsetp.lt.u32 %pv, %r3, {n_tiles};"));
+    lines.push(p("\t\t@%pv bra TILE_LOOP;"));
+    lines.push(String::new());
+
+    // Finalize: thread 0 writes loss + lse as f32.
+    lines.push(p("\tsetp.eq.u32 %pth0, %r1, 0;"));
+    lines.push(p("\t@!%pth0 bra WRITE_DONE;"));
+    lines.push(String::new());
+
+    lines.push(p("\tlg2.approx.f32 %flse, %fsum;"));
+    lines.push(p("\tmul.f32 %flse, %flse, %fln2;"));
+    lines.push(p("\tadd.f32 %flse, %flse, %fmax;"));
+    lines.push(String::new());
+
+    // logit_at_target from smem (read fp16, cvt to f32).
+    lines.push(p("\tmov.u64 %rd22, smem_scratch;"));
+    lines.push(format!("\tadd.u64 %rd22, %rd22, {lat_offset};"));
+    lines.push(p("\tld.shared.b16 %h1, [%rd22];"));
+    lines.push(p("\tcvt.f32.f16 %flog, %h1;"));
+    lines.push(String::new());
+
+    lines.push(p("\tsub.f32 %floss, %flse, %flog;"));
+    lines.push(String::new());
+
+    // Write outputs as f32 (loss + lse stay f32 regardless of dtype).
+    lines.push(p("\tcvt.u64.u32 %rd23, %r0;"));
+    lines.push(p("\tshl.b64 %rd23, %rd23, 2;"));
+    lines.push(p("\tadd.u64 %rd24, %rd4, %rd23;"));
+    lines.push(p("\tst.global.f32 [%rd24], %floss;"));
+    lines.push(p("\tadd.u64 %rd24, %rd5, %rd23;"));
+    lines.push(p("\tst.global.f32 [%rd24], %flse;"));
+    lines.push(p("\tbra WRITE_DONE;"));
+    lines.push(String::new());
+
+    // Skip label: write zeros (f32).
     lines.push(p("SKIP_LABEL:"));
     lines.push(p("\tsetp.eq.u32 %pth0, %r1, 0;"));
     lines.push(p("\t@!%pth0 bra WRITE_DONE;"));
@@ -1446,6 +1865,774 @@ fn emit_bwd_kernel(cfg: &FusedLinearCEConfig) -> String {
     s.push_str(&format!(
         "\t// Thread r1 zeros H/128 elements (stride 128)\n\
          \tmov.u32 %r5, 0;\n\
+         BWD_ZERO_LOOP:\n\
+         \t\tmul.lo.u32 %r6, %r5, 128;\n\
+         \t\tadd.u32 %r6, %r6, %r1;\n\
+         \t\tsetp.lt.u32 %p_valid, %r6, {hidden};\n\
+         \t\t@!%p_valid bra BWD_ZERO_DONE;\n\
+         \t\tshl.b32 %r6, %r6, 2;\n\
+         \t\tcvt.u64.u32 %rd12, %r6;\n\
+         \t\tadd.u64 %rd12, %rd10, %rd12;\n\
+         \t\tst.global.f32 [%rd12], 0f00000000;\n\
+         \t\tadd.u32 %r5, %r5, 1;\n\
+         \t\tbra BWD_ZERO_LOOP;\n\
+         BWD_ZERO_DONE:\n\
+    \n"
+    ));
+
+    s.push_str("BWD_DONE:\n\tret;\n}\n");
+
+    s
+}
+
+// ── F16 large-vocab kernels (Sprint v3-2) ────────────────────────────────────
+//
+// Mixed-precision convention for the two-kernel large-vocab path:
+//   * Kernel A (per-tile partials) loads x / W / bias as `.b16` → `cvt.f32.f16`,
+//     accumulates dot products in f32, stages SMEM logits as `.b16`, and
+//     writes the cross-CTA partials buffer as f32 — the partials buffer
+//     stays f32 for cross-CTA numerical robustness (the online-LSE rescale
+//     in Kernel B compounds across tiles; fp16 partials would visibly
+//     degrade lse accuracy at vocab=49152+).
+//   * Kernel B (per-row finalize) reads f32 partials AND ALSO recomputes
+//     `logit_at_target = x[row] @ W[tgt] + bias[tgt]` — at dtype=F16 that
+//     recompute uses the same fp16 HBM staging convention as Kernel A.
+//     The final `loss_out` / `lse_out` writes stay f32 (same as v1).
+fn emit_large_partials_kernel_f16(cfg: &FusedLinearCEConfig) -> String {
+    let name = cfg.large_partials_kernel_name();
+    let vocab = cfg.vocab_size;
+    let hidden = cfg.hidden_size;
+    let vtile = cfg.vocab_tile;
+    let n_tiles = cfg.num_vocab_tiles();
+    let vtile_per_thread = vtile / 128;
+    let ignore = cfg.ignore_index;
+    let smem_bytes = cfg.shared_mem_bytes();
+
+    let mut lines: Vec<String> = Vec::new();
+    let p = |l: &str| l.to_owned();
+
+    // `.align 2` because SMEM is fp16.
+    lines.push(format!(
+        ".extern .shared .align 2 .b8 smem_partials_{vocab}[{smem_bytes}];"
+    ));
+    lines.push(String::new());
+
+    lines.push(format!(".visible .entry {name}("));
+    lines.push(p("\t.param .u64 param_x,"));
+    lines.push(p("\t.param .u64 param_w,"));
+    lines.push(p("\t.param .u64 param_bias,"));
+    lines.push(p("\t.param .u64 param_targets,"));
+    lines.push(p("\t.param .u64 param_partials,"));
+    lines.push(p("\t.param .u32 param_B, .param .u32 param_S,"));
+    lines.push(p("\t.param .u32 param_V, .param .u32 param_H,"));
+    lines.push(p("\t.param .u32 param_num_tiles"));
+    lines.push(p(") {"));
+
+    lines.push(p("\t.reg .u64 %rd<30>;"));
+    lines.push(p("\t.reg .u32 %r<24>;"));
+    lines.push(p("\t.reg .s64 %tgt64;"));
+    lines.push(p("\t.reg .b16 %h0, %h1, %h2;"));
+    lines.push(p("\t.reg .f32 %facc, %fa, %fb, %ftmp;"));
+    lines.push(p("\t.reg .f32 %ftmax, %ftsum, %flog2e;"));
+    lines.push(p("\t.reg .pred %pskip, %pv, %pth0;"));
+    lines.push(String::new());
+
+    lines.push(p("\tld.param.u64 %rd0, [param_x];"));
+    lines.push(p("\tld.param.u64 %rd1, [param_w];"));
+    lines.push(p("\tld.param.u64 %rd2, [param_bias];"));
+    lines.push(p("\tld.param.u64 %rd3, [param_targets];"));
+    lines.push(p("\tld.param.u64 %rd4, [param_partials];"));
+    lines.push(p("\tmov.u32 %r0, %ctaid.y;   // row_idx"));
+    lines.push(p("\tmov.u32 %r1, %tid.x;     // tid"));
+    lines.push(p("\tmov.u32 %r2, %ctaid.x;   // tile_idx"));
+    lines.push(p("\tmov.f32 %flog2e, 0f3FB8AA3B;"));
+    lines.push(String::new());
+
+    // partials_slot = partials + (row*num_tiles + tile) * 2 * 4 (f32 partials).
+    lines.push(format!("\t// partials_slot = partials + (row*{n_tiles}+tile) * 8 (f32 partials)"));
+    lines.push(p("\tcvt.u64.u32 %rd5, %r0;"));
+    lines.push(format!("\tmov.u32 %r3, {n_tiles};"));
+    lines.push(p("\tcvt.u64.u32 %rd6, %r3;"));
+    lines.push(p("\tmul.lo.u64 %rd5, %rd5, %rd6;"));
+    lines.push(p("\tcvt.u64.u32 %rd7, %r2;"));
+    lines.push(p("\tadd.u64 %rd5, %rd5, %rd7;"));
+    lines.push(p("\tshl.b64 %rd5, %rd5, 3; // *8"));
+    lines.push(p("\tadd.u64 %rd5, %rd4, %rd5;"));
+    lines.push(String::new());
+
+    // Load target.
+    lines.push(p("\tcvt.u64.u32 %rd8, %r0;"));
+    lines.push(p("\tmul.lo.u64 %rd8, %rd8, 8;"));
+    lines.push(p("\tadd.u64 %rd8, %rd3, %rd8;"));
+    lines.push(p("\tld.global.s64 %tgt64, [%rd8];"));
+    lines.push(String::new());
+
+    // Skip path: write (0, 0) f32 partials.
+    lines.push(format!("\tsetp.eq.s64 %pskip, %tgt64, {ignore};"));
+    lines.push(p("\t@!%pskip bra LP_NOTSKIP;"));
+    lines.push(p("\tsetp.eq.u32 %pth0, %r1, 0;"));
+    lines.push(p("\t@!%pth0 bra LP_DONE;"));
+    lines.push(p("\tst.global.f32 [%rd5], 0f00000000;"));
+    lines.push(p("\tst.global.f32 [%rd5+4], 0f00000000;"));
+    lines.push(p("\tbra LP_DONE;"));
+    lines.push(p("LP_NOTSKIP:"));
+    lines.push(String::new());
+
+    // x_row_base = x + row * H * 2 (fp16).
+    lines.push(p("\tcvt.u64.u32 %rd9, %r0;"));
+    lines.push(format!("\tmov.u32 %r4, {hidden};"));
+    lines.push(p("\tcvt.u64.u32 %rd10, %r4;"));
+    lines.push(p("\tmul.lo.u64 %rd9, %rd9, %rd10;"));
+    lines.push(p("\tshl.b64 %rd9, %rd9, 1; // *2 fp16"));
+    lines.push(p("\tadd.u64 %rd9, %rd0, %rd9;"));
+    lines.push(String::new());
+
+    lines.push(format!("\tmul.lo.u32 %r5, %r2, {vtile}; // v_base"));
+    lines.push(String::new());
+
+    lines.push(p("\tmov.u32 %r6, 0;"));
+    lines.push(p("LP_INNER:"));
+    lines.push(p("\t\tmul.lo.u32 %r7, %r6, 128;"));
+    lines.push(p("\t\tadd.u32 %r7, %r7, %r1;"));
+    lines.push(p("\t\tadd.u32 %r8, %r7, %r5;"));
+    lines.push(format!("\t\tsetp.lt.u32 %pv, %r8, {vocab};"));
+    lines.push(p("\t\t@!%pv bra LP_INNER_TAIL_ZERO;"));
+    lines.push(String::new());
+
+    // W_row_base — fp16 stride 2.
+    lines.push(p("\t\tcvt.u64.u32 %rd11, %r8;"));
+    lines.push(format!("\t\tmov.u32 %r9, {hidden};"));
+    lines.push(p("\t\tcvt.u64.u32 %rd12, %r9;"));
+    lines.push(p("\t\tmul.lo.u64 %rd11, %rd11, %rd12;"));
+    lines.push(p("\t\tshl.b64 %rd11, %rd11, 1; // *2 fp16"));
+    lines.push(p("\t\tadd.u64 %rd11, %rd1, %rd11;"));
+    lines.push(String::new());
+
+    lines.push(p("\t\tmov.f32 %facc, 0f00000000;"));
+    lines.push(p("\t\tmov.u32 %r10, 0;"));
+    lines.push(p("\t\tLP_DOT:"));
+    lines.push(p("\t\t\tcvt.u64.u32 %rd13, %r10;"));
+    lines.push(p("\t\t\tshl.b64 %rd13, %rd13, 1; // *2 fp16"));
+    lines.push(p("\t\t\tadd.u64 %rd14, %rd9, %rd13;"));
+    lines.push(p("\t\t\tld.global.b16 %h0, [%rd14];"));
+    lines.push(p("\t\t\tcvt.f32.f16 %fa, %h0;"));
+    lines.push(p("\t\t\tadd.u64 %rd14, %rd11, %rd13;"));
+    lines.push(p("\t\t\tld.global.b16 %h1, [%rd14];"));
+    lines.push(p("\t\t\tcvt.f32.f16 %fb, %h1;"));
+    lines.push(p("\t\t\tfma.rn.f32 %facc, %fa, %fb, %facc;"));
+    lines.push(p("\t\t\tadd.u32 %r10, %r10, 1;"));
+    lines.push(format!("\t\t\tsetp.lt.u32 %pv, %r10, {hidden};"));
+    lines.push(p("\t\t\t@%pv bra LP_DOT;"));
+    lines.push(String::new());
+
+    // Bias fp16.
+    lines.push(p("\t\tcvt.u64.u32 %rd15, %r8;"));
+    lines.push(p("\t\tshl.b64 %rd15, %rd15, 1; // *2"));
+    lines.push(p("\t\tadd.u64 %rd15, %rd2, %rd15;"));
+    lines.push(p("\t\tld.global.b16 %h2, [%rd15];"));
+    lines.push(p("\t\tcvt.f32.f16 %ftmp, %h2;"));
+    lines.push(p("\t\tadd.f32 %facc, %facc, %ftmp;"));
+    lines.push(p("\t\tbra LP_INNER_STORE;"));
+    lines.push(String::new());
+
+    // Tail-zero: store fp16 -INF directly to smem so it doesn't perturb
+    // max/sum.  Review Finding 2: previously this path mov'd the f32
+    // bit-pattern 0f80800000 (which is -1.175e-38 — the smallest normal
+    // negative f32, NOT -INF) into %facc and fell through to the shared
+    // store-via-cvt path.  cvt.rn.f16.f32 then mapped -1.175e-38 to fp16
+    // 0x0000 (below fp16 subnormal range), and the downstream
+    // LP_RED_MAX/LP_RED_SUM reads max'd with 0.0 — corrupting the
+    // per-tile LSE whenever all real logits in the tile were negative.
+    // We now branch around the cvt and write 0xFC00 (fp16 -INF) directly.
+    lines.push(p("LP_INNER_TAIL_ZERO:"));
+    lines.push(p("\t\tshl.b32 %r11, %r7, 1; // *2"));
+    lines.push(format!("\t\tmov.u64 %rd16, smem_partials_{vocab};"));
+    lines.push(p("\t\tcvt.u64.u32 %rd17, %r11;"));
+    lines.push(p("\t\tadd.u64 %rd16, %rd16, %rd17;"));
+    lines.push(p("\t\tmov.b16 %h2, 0xFC00; // fp16 -INF (direct, no f32 cvt)"));
+    lines.push(p("\t\tst.shared.b16 [%rd16], %h2;"));
+    lines.push(p("\t\tbra LP_INNER_AFTER_STORE;"));
+    lines.push(String::new());
+
+    // Store logit to smem as fp16 — real-tile path goes through the
+    // f32 → fp16 cvt below.
+    lines.push(p("LP_INNER_STORE:"));
+    lines.push(p("\t\tshl.b32 %r11, %r7, 1; // *2"));
+    lines.push(format!("\t\tmov.u64 %rd16, smem_partials_{vocab};"));
+    lines.push(p("\t\tcvt.u64.u32 %rd17, %r11;"));
+    lines.push(p("\t\tadd.u64 %rd16, %rd16, %rd17;"));
+    lines.push(p("\t\tcvt.rn.f16.f32 %h2, %facc;"));
+    lines.push(p("\t\tst.shared.b16 [%rd16], %h2;"));
+    lines.push(p("LP_INNER_AFTER_STORE:"));
+    lines.push(String::new());
+
+    lines.push(p("\t\tadd.u32 %r6, %r6, 1;"));
+    lines.push(format!("\t\tsetp.lt.u32 %pv, %r6, {vtile_per_thread};"));
+    lines.push(p("\t\t@%pv bra LP_INNER;"));
+    lines.push(String::new());
+
+    lines.push(p("\tbar.sync 0;"));
+    lines.push(p("\tsetp.eq.u32 %pth0, %r1, 0;"));
+    lines.push(p("\t@!%pth0 bra LP_DONE;"));
+    lines.push(String::new());
+
+    // Reduce smem fp16 tile to (tile_max, tile_sum_unscaled) in f32.
+    lines.push(p("\tmov.f32 %ftmax, 0f80800000;"));
+    lines.push(p("\tmov.u32 %r12, 0;"));
+    lines.push(p("LP_RED_MAX:"));
+    lines.push(p("\t\tshl.b32 %r13, %r12, 1; // *2"));
+    lines.push(format!("\t\tmov.u64 %rd18, smem_partials_{vocab};"));
+    lines.push(p("\t\tcvt.u64.u32 %rd19, %r13;"));
+    lines.push(p("\t\tadd.u64 %rd18, %rd18, %rd19;"));
+    lines.push(p("\t\tld.shared.b16 %h0, [%rd18];"));
+    lines.push(p("\t\tcvt.f32.f16 %ftmp, %h0;"));
+    lines.push(p("\t\tmax.f32 %ftmax, %ftmax, %ftmp;"));
+    lines.push(p("\t\tadd.u32 %r12, %r12, 1;"));
+    lines.push(format!("\t\tsetp.lt.u32 %pv, %r12, {vtile};"));
+    lines.push(p("\t\t@%pv bra LP_RED_MAX;"));
+    lines.push(String::new());
+
+    lines.push(p("\tmov.f32 %ftsum, 0f00000000;"));
+    lines.push(p("\tmov.u32 %r12, 0;"));
+    lines.push(p("LP_RED_SUM:"));
+    lines.push(p("\t\tshl.b32 %r13, %r12, 1; // *2"));
+    lines.push(format!("\t\tmov.u64 %rd18, smem_partials_{vocab};"));
+    lines.push(p("\t\tcvt.u64.u32 %rd19, %r13;"));
+    lines.push(p("\t\tadd.u64 %rd18, %rd18, %rd19;"));
+    lines.push(p("\t\tld.shared.b16 %h0, [%rd18];"));
+    lines.push(p("\t\tcvt.f32.f16 %ftmp, %h0;"));
+    lines.push(p("\t\tsub.f32 %ftmp, %ftmp, %ftmax;"));
+    lines.push(p("\t\tmul.f32 %ftmp, %ftmp, %flog2e;"));
+    lines.push(p("\t\tex2.approx.f32 %ftmp, %ftmp;"));
+    lines.push(p("\t\tadd.f32 %ftsum, %ftsum, %ftmp;"));
+    lines.push(p("\t\tadd.u32 %r12, %r12, 1;"));
+    lines.push(format!("\t\tsetp.lt.u32 %pv, %r12, {vtile};"));
+    lines.push(p("\t\t@%pv bra LP_RED_SUM;"));
+    lines.push(String::new());
+
+    // Store (tile_max, tile_sum_unscaled) as f32 partials.
+    lines.push(p("\tst.global.f32 [%rd5],   %ftmax;"));
+    lines.push(p("\tst.global.f32 [%rd5+4], %ftsum;"));
+    lines.push(String::new());
+
+    lines.push(p("LP_DONE:"));
+    lines.push(p("\tret;"));
+    lines.push(p("}"));
+
+    lines.join("\n")
+}
+
+/// F16 finalize kernel.
+///
+/// Reads f32 partials (Kernel A writes f32 regardless of activation dtype),
+/// runs online-LSE rescale in f32, recomputes `logit_at_target = x[row] @
+/// W[tgt] + bias[tgt]` with fp16 staging + f32 fma accumulator, writes
+/// `loss_out` and `lse_out` as f32.
+fn emit_large_finalize_kernel_f16(cfg: &FusedLinearCEConfig) -> String {
+    let name = cfg.large_finalize_kernel_name();
+    let vocab = cfg.vocab_size;
+    let hidden = cfg.hidden_size;
+    let n_tiles = cfg.num_vocab_tiles();
+    let ignore = cfg.ignore_index;
+
+    let mut lines: Vec<String> = Vec::new();
+    let p = |l: &str| l.to_owned();
+    lines.push(String::new());
+
+    lines.push(format!(".visible .entry {name}("));
+    lines.push(p("\t.param .u64 param_x,"));
+    lines.push(p("\t.param .u64 param_w,"));
+    lines.push(p("\t.param .u64 param_bias,"));
+    lines.push(p("\t.param .u64 param_targets,"));
+    lines.push(p("\t.param .u64 param_partials,"));
+    lines.push(p("\t.param .u64 param_loss_out,"));
+    lines.push(p("\t.param .u64 param_lse_out,"));
+    lines.push(p("\t.param .u32 param_B, .param .u32 param_S,"));
+    lines.push(p("\t.param .u32 param_V, .param .u32 param_H,"));
+    lines.push(p("\t.param .u32 param_num_tiles"));
+    lines.push(p(") {"));
+
+    lines.push(p("\t.reg .u64 %rd<24>;"));
+    lines.push(p("\t.reg .u32 %r<16>;"));
+    lines.push(p("\t.reg .s64 %tgt64;"));
+    lines.push(p("\t.reg .b16 %h0, %h1, %h2;"));
+    lines.push(p("\t.reg .f32 %fmax, %fsum, %ftmax, %ftsum, %fnew_max;"));
+    lines.push(p("\t.reg .f32 %ftmp, %fa, %fb, %facc, %flog, %flse, %floss;"));
+    lines.push(p("\t.reg .f32 %flog2e, %fln2;"));
+    lines.push(p("\t.reg .pred %pskip, %pth0, %pv;"));
+    lines.push(String::new());
+
+    lines.push(p("\tld.param.u64 %rd0, [param_x];"));
+    lines.push(p("\tld.param.u64 %rd1, [param_w];"));
+    lines.push(p("\tld.param.u64 %rd2, [param_bias];"));
+    lines.push(p("\tld.param.u64 %rd3, [param_targets];"));
+    lines.push(p("\tld.param.u64 %rd4, [param_partials];"));
+    lines.push(p("\tld.param.u64 %rd5, [param_loss_out];"));
+    lines.push(p("\tld.param.u64 %rd6, [param_lse_out];"));
+    lines.push(p("\tmov.u32 %r0, %ctaid.x;"));
+    lines.push(p("\tmov.u32 %r1, %tid.x;"));
+    lines.push(p("\tmov.f32 %flog2e, 0f3FB8AA3B;"));
+    lines.push(p("\tmov.f32 %fln2,   0f3F317218;"));
+    lines.push(String::new());
+
+    lines.push(p("\tsetp.eq.u32 %pth0, %r1, 0;"));
+    lines.push(p("\t@!%pth0 bra LF_DONE;"));
+    lines.push(String::new());
+
+    lines.push(p("\tcvt.u64.u32 %rd7, %r0;"));
+    lines.push(p("\tmul.lo.u64 %rd7, %rd7, 8;"));
+    lines.push(p("\tadd.u64 %rd7, %rd3, %rd7;"));
+    lines.push(p("\tld.global.s64 %tgt64, [%rd7];"));
+    lines.push(String::new());
+
+    lines.push(p("\tcvt.u64.u32 %rd8, %r0;"));
+    lines.push(p("\tshl.b64 %rd8, %rd8, 2;"));
+    lines.push(p("\tadd.u64 %rd9, %rd5, %rd8;"));
+    lines.push(p("\tadd.u64 %rd10, %rd6, %rd8;"));
+    lines.push(String::new());
+
+    lines.push(format!("\tsetp.eq.s64 %pskip, %tgt64, {ignore};"));
+    lines.push(p("\t@!%pskip bra LF_REDUCE;"));
+    lines.push(p("\tst.global.f32 [%rd9],  0f00000000;"));
+    lines.push(p("\tst.global.f32 [%rd10], 0f00000000;"));
+    lines.push(p("\tbra LF_DONE;"));
+    lines.push(p("LF_REDUCE:"));
+    lines.push(String::new());
+
+    // partials_row_base = partials + row * num_tiles * 8 (f32 partials).
+    lines.push(p("\tcvt.u64.u32 %rd11, %r0;"));
+    lines.push(format!("\tmov.u32 %r2, {n_tiles};"));
+    lines.push(p("\tcvt.u64.u32 %rd12, %r2;"));
+    lines.push(p("\tmul.lo.u64 %rd11, %rd11, %rd12;"));
+    lines.push(p("\tshl.b64 %rd11, %rd11, 3;"));
+    lines.push(p("\tadd.u64 %rd11, %rd4, %rd11;"));
+    lines.push(String::new());
+
+    // Online-LSE reduce — identical to F32 path (partials are f32).
+    lines.push(p("\tmov.f32 %fmax, 0f80800000;"));
+    lines.push(p("\tmov.f32 %fsum, 0f00000000;"));
+    lines.push(p("\tmov.u32 %r3, 0;"));
+    lines.push(p("LF_LOOP:"));
+    lines.push(p("\t\tcvt.u64.u32 %rd13, %r3;"));
+    lines.push(p("\t\tshl.b64 %rd13, %rd13, 3;"));
+    lines.push(p("\t\tadd.u64 %rd13, %rd11, %rd13;"));
+    lines.push(p("\t\tld.global.f32 %ftmax, [%rd13];"));
+    lines.push(p("\t\tld.global.f32 %ftsum, [%rd13+4];"));
+    lines.push(String::new());
+
+    lines.push(p("\t\tmax.f32 %fnew_max, %fmax, %ftmax;"));
+    lines.push(p("\t\tsub.f32 %ftmp, %fmax, %fnew_max;"));
+    lines.push(p("\t\tmul.f32 %ftmp, %ftmp, %flog2e;"));
+    lines.push(p("\t\tex2.approx.f32 %ftmp, %ftmp;"));
+    lines.push(p("\t\tmul.f32 %fsum, %fsum, %ftmp;"));
+    lines.push(p("\t\tsub.f32 %ftmp, %ftmax, %fnew_max;"));
+    lines.push(p("\t\tmul.f32 %ftmp, %ftmp, %flog2e;"));
+    lines.push(p("\t\tex2.approx.f32 %ftmp, %ftmp;"));
+    lines.push(p("\t\tmul.f32 %ftsum, %ftsum, %ftmp;"));
+    lines.push(p("\t\tadd.f32 %fsum, %fsum, %ftsum;"));
+    lines.push(p("\t\tmov.f32 %fmax, %fnew_max;"));
+    lines.push(String::new());
+
+    lines.push(p("\t\tadd.u32 %r3, %r3, 1;"));
+    lines.push(format!("\t\tsetp.lt.u32 %pv, %r3, {n_tiles};"));
+    lines.push(p("\t\t@%pv bra LF_LOOP;"));
+    lines.push(String::new());
+
+    lines.push(p("\tlg2.approx.f32 %flse, %fsum;"));
+    lines.push(p("\tmul.f32 %flse, %flse, %fln2;"));
+    lines.push(p("\tadd.f32 %flse, %flse, %fmax;"));
+    lines.push(String::new());
+
+    // x_row_base — fp16 stride 2.
+    lines.push(p("\tcvt.u64.u32 %rd14, %r0;"));
+    lines.push(format!("\tmov.u32 %r4, {hidden};"));
+    lines.push(p("\tcvt.u64.u32 %rd15, %r4;"));
+    lines.push(p("\tmul.lo.u64 %rd14, %rd14, %rd15;"));
+    lines.push(p("\tshl.b64 %rd14, %rd14, 1; // *2 fp16"));
+    lines.push(p("\tadd.u64 %rd14, %rd0, %rd14;"));
+    // W_tgt_base — fp16 stride 2.
+    lines.push(p("\tmul.lo.s64 %rd16, %tgt64, %rd15;"));
+    lines.push(p("\tshl.b64 %rd16, %rd16, 1; // *2 fp16"));
+    lines.push(p("\tadd.u64 %rd16, %rd1, %rd16;"));
+    lines.push(String::new());
+
+    // Dot loop — fp16 → f32 → fma.
+    lines.push(p("\tmov.f32 %facc, 0f00000000;"));
+    lines.push(p("\tmov.u32 %r5, 0;"));
+    lines.push(p("LF_DOT:"));
+    lines.push(p("\t\tcvt.u64.u32 %rd17, %r5;"));
+    lines.push(p("\t\tshl.b64 %rd17, %rd17, 1; // *2"));
+    lines.push(p("\t\tadd.u64 %rd18, %rd14, %rd17;"));
+    lines.push(p("\t\tld.global.b16 %h0, [%rd18];"));
+    lines.push(p("\t\tcvt.f32.f16 %fa, %h0;"));
+    lines.push(p("\t\tadd.u64 %rd18, %rd16, %rd17;"));
+    lines.push(p("\t\tld.global.b16 %h1, [%rd18];"));
+    lines.push(p("\t\tcvt.f32.f16 %fb, %h1;"));
+    lines.push(p("\t\tfma.rn.f32 %facc, %fa, %fb, %facc;"));
+    lines.push(p("\t\tadd.u32 %r5, %r5, 1;"));
+    lines.push(format!("\t\tsetp.lt.u32 %pv, %r5, {hidden};"));
+    lines.push(p("\t\t@%pv bra LF_DOT;"));
+    lines.push(String::new());
+
+    // Bias[tgt] fp16.
+    lines.push(p("\tmul.lo.s64 %rd19, %tgt64, 2; // fp16 stride"));
+    lines.push(p("\tadd.u64 %rd19, %rd2, %rd19;"));
+    lines.push(p("\tld.global.b16 %h2, [%rd19];"));
+    lines.push(p("\tcvt.f32.f16 %ftmp, %h2;"));
+    lines.push(p("\tadd.f32 %facc, %facc, %ftmp;"));
+    lines.push(String::new());
+
+    lines.push(p("\tsub.f32 %floss, %flse, %facc;"));
+    lines.push(p("\tst.global.f32 [%rd9],  %floss;"));
+    lines.push(p("\tst.global.f32 [%rd10], %flse;"));
+    lines.push(String::new());
+
+    lines.push(p("LF_DONE:"));
+    let _ = vocab;
+    lines.push(p("\tret;"));
+    lines.push(p("}"));
+
+    lines.join("\n")
+}
+
+// ── F16 backward kernel ──────────────────────────────────────────────────────
+//
+// Mixed-precision convention (Sprint v3-2):
+//   * x / W / bias HBM loads are `ld.global.b16` + `cvt.f32.f16` into f32
+//     math registers. Backward recomputes logits from forward inputs and
+//     the saved f32 lse, so the dtype of `x`/`W`/`bias` is the same as in
+//     the forward kernel.
+//   * The saved `lse` buffer stays `.f32` (written by the forward kernel
+//     as f32 regardless of activation dtype) — `ld.global.f32 %lse_val`.
+//   * The `grad_output` parameter is still `.param .f32` (a scalar; no
+//     reason to halve a single value).
+//   * Gradient outputs `dx`, `dW`, `dbias` stay `.f32` and the cross-CTA
+//     accumulator uses `red.global.add.f32`. Rationale:
+//       - `red.global.add.f16` is not portable across SMs (some pre-sm_70
+//         lack it; sm_80+ supports it but adds a numerical-determinism
+//         risk via non-deterministic accumulation order in fp16).
+//       - PyTorch's standard mixed-precision convention writes master
+//         gradients in f32; downstream optimizer state stays f32.
+//       - Per the Sprint v3-2 spec: "current backward signature returns
+//         f32 dW even when dtype=F16; this matches PyTorch's
+//         mixed-precision convention".
+//     The optional fp16 down-cast in an epilogue kernel is deferred.
+//
+// Output buffers dx/dW/dbias MUST be allocated by the caller as f32 even
+// when `dtype = F16` — the runtime FFI layer threads this convention.
+fn emit_bwd_kernel_f16(cfg: &FusedLinearCEConfig) -> String {
+    let name = cfg.bwd_kernel_name();
+    let vocab = cfg.vocab_size;
+    let hidden = cfg.hidden_size;
+    let vtile = cfg.vocab_tile;
+    let n_tiles = vocab.div_ceil(vtile);
+    let vtile_per_thread = vtile / 128;
+    let ignore = cfg.ignore_index;
+    let smem_bytes = cfg.shared_mem_bytes();
+
+    let mut s = String::new();
+
+    s.push_str(&cfg.ptx_header());
+    s.push('\n');
+
+    // SMEM not used by backward (forward stored everything it needs in HBM),
+    // but the declaration is kept for ABI parity with the F32 path's launcher.
+    s.push_str(&format!(
+        ".extern .shared .align 2 .b8 smem_scratch[{smem_bytes}];\n\n"
+    ));
+
+    s.push_str(&format!(
+        ".visible .entry {name}(\n\
+         \t.param .f32 param_grad_output,\n\
+         \t.param .u64 param_x,\n\
+         \t.param .u64 param_w,\n\
+         \t.param .u64 param_bias,\n\
+         \t.param .u64 param_targets,\n\
+         \t.param .u64 param_lse,\n\
+         \t.param .u64 param_dx_out,\n\
+         \t.param .u64 param_dw_out,\n\
+         \t.param .u64 param_dbias_out,\n\
+         \t.param .u32 param_B,\n\
+         \t.param .u32 param_S,\n\
+         \t.param .u32 param_V,\n\
+         \t.param .u32 param_H,\n\
+         \t.param .u32 param_num_valid\n\
+         ) {{\n"
+    ));
+
+    s.push_str(
+        "\t.reg .u64 %rd<24>;\n\
+         \t.reg .u32 %r<20>;\n\
+         \t.reg .s64 %target_val;\n\
+         \t.reg .b16 %h0, %h1, %h2;\n\
+         \t.reg .f32 %f<20>;\n\
+         \t.reg .f32 %logit_acc;\n\
+         \t.reg .f32 %grad_output;\n\
+         \t.reg .f32 %lse_val;\n\
+         \t.reg .f32 %scale;\n\
+         \t.reg .pred %p_skip;\n\
+         \t.reg .pred %p_valid;\n\
+         \t.reg .pred %p_intile;\n\
+         \t.reg .pred %p_is_target;\n\
+         \t.reg .u32 %num_valid;\n\
+         \t.reg .f32 %num_valid_f;\n\
+    \n",
+    );
+
+    s.push_str(
+        "\tld.param.f32 %grad_output, [param_grad_output];\n\
+         \tld.param.u64 %rd0, [param_x];\n\
+         \tld.param.u64 %rd1, [param_w];\n\
+         \tld.param.u64 %rd2, [param_bias];\n\
+         \tld.param.u64 %rd3, [param_targets];\n\
+         \tld.param.u64 %rd4, [param_lse];\n\
+         \tld.param.u64 %rd5, [param_dx_out];\n\
+         \tld.param.u64 %rd6, [param_dw_out];\n\
+         \tld.param.u64 %rd7, [param_dbias_out];\n\
+         \tld.param.u32 %num_valid, [param_num_valid];\n\
+         \tcvt.rn.f32.u32 %num_valid_f, %num_valid;\n\
+    \n",
+    );
+
+    s.push_str(
+        "\tmov.u32 %r0, %ctaid.x;\n\
+         \tmov.u32 %r1, %tid.x;\n\
+    \n",
+    );
+
+    s.push_str(
+        "\tcvt.u64.u32 %rd8, %r0;\n\
+         \tmul.lo.u64 %rd8, %rd8, 8;\n\
+         \tadd.u64 %rd8, %rd3, %rd8;\n\
+         \tld.global.s64 %target_val, [%rd8];\n\
+    \n",
+    );
+
+    s.push_str(&format!(
+        "\tsetp.eq.s64 %p_skip, %target_val, {ignore};\n\
+         \t@%p_skip bra BWD_SKIP_LABEL;\n\
+    \n"
+    ));
+
+    // Saved lse stays f32 even at dtype=F16 (matches forward's f32 write).
+    s.push_str(
+        "\tcvt.u64.u32 %rd9, %r0;\n\
+         \tshl.b64 %rd9, %rd9, 2;\n\
+         \tadd.u64 %rd9, %rd4, %rd9;\n\
+         \tld.global.f32 %lse_val, [%rd9];\n\
+    \n",
+    );
+
+    // x_row_base + dx_row_base. x stride 2 (fp16); dx stride 4 (f32 output).
+    s.push_str(&format!(
+        "\tcvt.u64.u32 %rd10, %r0;\n\
+         \tmov.u32 %r2, {hidden};\n\
+         \tcvt.u64.u32 %rd11, %r2;\n\
+         \tmul.lo.u64 %rd10, %rd10, %rd11;\n\
+         \tshl.b64 %rd10, %rd10, 1; // x: *2 (fp16)\n\
+         \tadd.u64 %rd10, %rd0, %rd10;\n\
+         \t// dx_row_base = dx_out + row_idx * H * 4 (f32 grad)\n\
+         \tcvt.u64.u32 %rd20, %r0;\n\
+         \tmul.lo.u64 %rd20, %rd20, %rd11;\n\
+         \tshl.b64 %rd20, %rd20, 2; // dx: *4 (f32)\n\
+         \tadd.u64 %rd20, %rd5, %rd20;\n\
+    \n"
+    ));
+
+    s.push_str("\tdiv.rn.f32 %scale, %grad_output, %num_valid_f;\n\n");
+    s.push_str("\tmov.f32 %f15, 0f3FB8AA3B; // log2(e)\n\n");
+
+    s.push_str(
+        "\tmov.u32 %r3, 0; // tile_idx\n\
+         BWD_TILE_LOOP:\n",
+    );
+
+    s.push_str(&format!(
+        "\t\tmul.lo.u32 %r4, %r3, {vtile}; // v_base\n\
+    \n"
+    ));
+
+    s.push_str(
+        "\t\tmov.u32 %r5, 0; // inner counter\n\
+         BWD_INNER_LOOP:\n",
+    );
+
+    s.push_str(
+        "\t\t\tmul.lo.u32 %r6, %r5, 128;\n\
+         \t\t\tadd.u32 %r6, %r6, %r1;\n\
+         \t\t\tadd.u32 %r6, %r6, %r4;\n",
+    );
+
+    s.push_str(&format!(
+        "\t\t\tsetp.lt.u32 %p_valid, %r6, {vocab};\n\
+         \t\t\t@!%p_valid bra BWD_INNER_SKIP;\n\
+    \n"
+    ));
+
+    // W_row_base — fp16 stride 2.
+    s.push_str(&format!(
+        "\t\t\t// W_row_base for v_idx (fp16)\n\
+         \t\t\tcvt.u64.u32 %rd12, %r6;\n\
+         \t\t\tmov.u32 %r7, {hidden};\n\
+         \t\t\tcvt.u64.u32 %rd13, %r7;\n\
+         \t\t\tmul.lo.u64 %rd12, %rd12, %rd13;\n\
+         \t\t\tshl.b64 %rd12, %rd12, 1; // *2 fp16\n\
+         \t\t\tadd.u64 %rd12, %rd1, %rd12;\n\
+    \n"
+    ));
+
+    // Dot product — fp16 loads → cvt.f32.f16 → fma.f32.
+    s.push_str(
+        "\t\t\tmov.f32 %logit_acc, 0f00000000;\n\
+         \t\t\tmov.u32 %r8, 0;\n\
+         BWD_DOT_LOOP:\n\
+         \t\t\t\tcvt.u64.u32 %rd14, %r8;\n\
+         \t\t\t\tshl.b64 %rd14, %rd14, 1; // *2 fp16\n\
+         \t\t\t\tadd.u64 %rd15, %rd10, %rd14;\n\
+         \t\t\t\tld.global.b16 %h0, [%rd15];\n\
+         \t\t\t\tcvt.f32.f16 %f0, %h0;\n\
+         \t\t\t\tadd.u64 %rd16, %rd12, %rd14;\n\
+         \t\t\t\tld.global.b16 %h1, [%rd16];\n\
+         \t\t\t\tcvt.f32.f16 %f1, %h1;\n\
+         \t\t\t\tfma.rn.f32 %logit_acc, %f0, %f1, %logit_acc;\n\
+         \t\t\t\tadd.u32 %r8, %r8, 1;\n",
+    );
+
+    s.push_str(&format!(
+        "\t\t\t\tsetp.lt.u32 %p_valid, %r8, {hidden};\n\
+         \t\t\t\t@%p_valid bra BWD_DOT_LOOP;\n\
+    \n"
+    ));
+
+    // Add bias (fp16).
+    s.push_str(
+        "\t\t\t// bias (fp16)\n\
+         \t\t\tcvt.u64.u32 %rd17, %r6;\n\
+         \t\t\tshl.b64 %rd17, %rd17, 1; // *2\n\
+         \t\t\tadd.u64 %rd17, %rd2, %rd17;\n\
+         \t\t\tld.global.b16 %h2, [%rd17];\n\
+         \t\t\tcvt.f32.f16 %f2, %h2;\n\
+         \t\t\tadd.f32 %logit_acc, %logit_acc, %f2;\n\
+    \n",
+    );
+
+    // p_v = exp(logit_v - lse).
+    s.push_str(
+        "\t\t\tsub.f32 %f3, %logit_acc, %lse_val;\n\
+         \t\t\tmul.f32 %f3, %f3, %f15;\n\
+         \t\t\tex2.approx.f32 %f3, %f3;\n\
+    \n",
+    );
+
+    s.push_str(
+        "\t\t\tcvt.s64.u32 %rd18, %r6;\n\
+         \t\t\tsetp.eq.s64 %p_is_target, %rd18, %target_val;\n\
+         \t\t\t@%p_is_target sub.f32 %f3, %f3, 0f3F800000; // -= 1.0\n\
+         \t\t\tmul.f32 %f4, %f3, %scale;\n\
+    \n",
+    );
+
+    // dW_row_base — f32 stride 4 (dW is master-precision f32 regardless of activation dtype).
+    s.push_str(&format!(
+        "\t\t\t// dW_row_base = dW_out + v_idx * H * 4 (f32 master grad)\n\
+         \t\t\tcvt.u64.u32 %rd21, %r6;\n\
+         \t\t\tmov.u32 %r9, {hidden};\n\
+         \t\t\tcvt.u64.u32 %rd22, %r9;\n\
+         \t\t\tmul.lo.u64 %rd21, %rd21, %rd22;\n\
+         \t\t\tshl.b64 %rd21, %rd21, 2; // *4 (f32)\n\
+         \t\t\tadd.u64 %rd21, %rd6, %rd21;\n\
+    \n"
+    ));
+
+    // H-loop scatter.
+    //   W[v, h]  is fp16 (stride 2 from %rd12)
+    //   x[row,h] is fp16 (stride 2 from %rd10)
+    //   dx_out + dW_out are f32 (stride 4 from %rd20 / %rd21)
+    s.push_str(
+        "\t\t\tmov.u32 %r9, 0; // h counter\n\
+         BWD_H_LOOP:\n\
+         \t\t\t\tcvt.u64.u32 %rd23, %r9;\n\
+         \t\t\t\tshl.b64 %rd23, %rd23, 1; // *2 fp16 (for W, x loads)\n\
+         \t\t\t\t// W[v, h] fp16\n\
+         \t\t\t\tadd.u64 %rd14, %rd12, %rd23;\n\
+         \t\t\t\tld.global.b16 %h0, [%rd14];\n\
+         \t\t\t\tcvt.f32.f16 %f5, %h0;\n\
+         \t\t\t\t// f6 = scaled * W[v, h]  (f32 grad slice)\n\
+         \t\t\t\tmul.f32 %f6, %f4, %f5;\n\
+         \t\t\t\t// dx_out[row, h] += f6  (f32 destination - stride 4)\n\
+         \t\t\t\tcvt.u64.u32 %rd14, %r9;\n\
+         \t\t\t\tshl.b64 %rd14, %rd14, 2;\n\
+         \t\t\t\tadd.u64 %rd14, %rd20, %rd14;\n\
+         \t\t\t\tred.global.add.f32 [%rd14], %f6;\n\
+         \t\t\t\t// x[row, h] fp16\n\
+         \t\t\t\tadd.u64 %rd14, %rd10, %rd23;\n\
+         \t\t\t\tld.global.b16 %h1, [%rd14];\n\
+         \t\t\t\tcvt.f32.f16 %f7, %h1;\n\
+         \t\t\t\t// f8 = scaled * x[row, h]\n\
+         \t\t\t\tmul.f32 %f8, %f4, %f7;\n\
+         \t\t\t\t// dW_out[v, h] += f8  (f32 destination - stride 4)\n\
+         \t\t\t\tcvt.u64.u32 %rd14, %r9;\n\
+         \t\t\t\tshl.b64 %rd14, %rd14, 2;\n\
+         \t\t\t\tadd.u64 %rd14, %rd21, %rd14;\n\
+         \t\t\t\tred.global.add.f32 [%rd14], %f8;\n\
+         \t\t\t\tadd.u32 %r9, %r9, 1;\n",
+    );
+
+    s.push_str(&format!(
+        "\t\t\t\tsetp.lt.u32 %p_valid, %r9, {hidden};\n\
+         \t\t\t\t@%p_valid bra BWD_H_LOOP;\n\
+    \n"
+    ));
+
+    // dbias[v] += scaled (f32 output stride 4).
+    s.push_str(
+        "\t\t\t// dbias_out[v] += scaled (f32 output)\n\
+         \t\t\tcvt.u64.u32 %rd14, %r6;\n\
+         \t\t\tshl.b64 %rd14, %rd14, 2; // *4 f32\n\
+         \t\t\tadd.u64 %rd14, %rd7, %rd14;\n\
+         \t\t\tred.global.add.f32 [%rd14], %f4;\n\
+    \n",
+    );
+
+    s.push_str(
+        "BWD_INNER_SKIP:\n\
+         \t\t\tadd.u32 %r5, %r5, 1;\n",
+    );
+
+    s.push_str(&format!(
+        "\t\t\tsetp.lt.u32 %p_valid, %r5, {vtile_per_thread};\n\
+         \t\t\t@%p_valid bra BWD_INNER_LOOP;\n\
+    \n"
+    ));
+
+    s.push_str("\t\tadd.u32 %r3, %r3, 1;\n");
+
+    s.push_str(&format!(
+        "\t\tsetp.lt.u32 %p_valid, %r3, {n_tiles};\n\
+         \t\t@%p_valid bra BWD_TILE_LOOP;\n\
+    \n"
+    ));
+
+    s.push_str("\tbra BWD_DONE;\n\n");
+
+    // Skip path: zero dx_out[row, :] as f32 (stride 4).
+    s.push_str(
+        "BWD_SKIP_LABEL:\n\
+         \t// Zero dx_out[row, :] for skipped token (f32 output)\n",
+    );
+
+    s.push_str(&format!(
+        "\tcvt.u64.u32 %rd10, %r0;\n\
+         \tmov.u32 %r2, {hidden};\n\
+         \tcvt.u64.u32 %rd11, %r2;\n\
+         \tmul.lo.u64 %rd10, %rd10, %rd11;\n\
+         \tshl.b64 %rd10, %rd10, 2; // *4 (f32 dx)\n\
+         \tadd.u64 %rd10, %rd5, %rd10;\n\
+    \n"
+    ));
+
+    s.push_str(&format!(
+        "\tmov.u32 %r5, 0;\n\
          BWD_ZERO_LOOP:\n\
          \t\tmul.lo.u32 %r6, %r5, 128;\n\
          \t\tadd.u32 %r6, %r6, %r1;\n\

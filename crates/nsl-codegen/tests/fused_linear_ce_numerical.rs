@@ -340,6 +340,7 @@ fn fused_linear_ce_gpu_forward_and_backward() {
             x_dev, w_dev, bias_dev, tgt_dev, loss_dev, lse_dev,
             B as i64, S as i64, V as i64, H as i64,
             smem as i64,
+            0, // dtype_tag = 0 (F32 sentinel; Sprint v3-2)
         )
     };
     assert_eq!(fwd_rc, 0, "nsl_fused_linear_ce_forward failed rc={}", fwd_rc);
@@ -396,6 +397,7 @@ fn fused_linear_ce_gpu_forward_and_backward() {
             B as i64, S as i64, V as i64, H as i64,
             num_valid as i64,
             smem as i64,
+            0, // dtype_tag = 0 (F32 sentinel; Sprint v3-2)
         )
     };
     assert_eq!(bwd_rc, 0, "nsl_fused_linear_ce_backward failed rc={}", bwd_rc);
