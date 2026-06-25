@@ -472,11 +472,28 @@ fn bf16_large_vocab_non_divisor_no_tail_zero_corruption() {
         *t = if i % 16 == 0 { IGNORE_INDEX } else { ((i * 37 + 13) % V) as i64 };
     }
 
-    // NEGATIVE-only logits via a tiny mean-shift: subtract a bias from the
-    // distribution so the max real logit is comfortably below 0.0.
+    // NEGATIVE-only logits via a deep mean-shift: subtract a large bias from
+    // the distribution so EVERY real logit (at every tile, every row) is
+    // comfortably below 0.0 — not just the average.
+    //
+    // Adversarial review Finding 4 (MEDIUM): the previous `bias = -2.0 ± 0.03`
+    // did NOT reliably produce all-negative logits at every tile. With
+    // x,W ∈ [-0.3, 0.3] and H=128, dot stddev ≈ sqrt(128 * (0.3^2/3)^2) ≈ 0.62,
+    // so logits ≈ N(-2, 0.62). Across V=8193 logits per row, expected
+    // positive-logit count per row ≈ V * P(z > 3.23σ) ≈ ~8 — meaning most
+    // per-tile max-reduces saw a positive real logit, and a buggy tail-zero
+    // sentinel of 0.0 would NOT corrupt those tiles (max(positive, 0) =
+    // positive). Only the tail tile (1 real + 127 tail-zeros) reliably
+    // exercised the bug.
+    //
+    // bias = -10.0 with stddev ≈ 0.62 puts the +3σ upper bound at ~-8.14;
+    // P(logit > 0) ≈ Q(-(-10)/0.62) ≈ Q(16) ≈ 10^-58, so expected positive
+    // logits per row across V=8193 is ≈ 10^-54. Every per-tile max-reduce
+    // sees ONLY negative real logits, so a buggy non-(-INF) sentinel
+    // consistently corrupts every tile (not just the tail).
     let mut x_f32 = vec![0f32; rows * H];
     let mut w_f32 = vec![0f32; V * H];
-    let mut bias_f32 = vec![-2.0f32; V];
+    let mut bias_f32 = vec![-10.0f32; V];
     fill_seeded(&mut x_f32, 42);
     fill_seeded(&mut w_f32, 137);
     {

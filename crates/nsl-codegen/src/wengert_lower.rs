@@ -2479,9 +2479,19 @@ fn fused_ce_dtype_for_compiler(
     compiler: &crate::compiler::Compiler,
 ) -> (i64, crate::fused_linear_ce::Dtype) {
     use crate::FusedCeDtypeHint;
+    // Adversarial review Finding 9: guard the dtype read by `enabled` so a
+    // future code path that lowers a PrimalOp::FusedLinearCe via a different
+    // upstream substitution cannot silently inherit the dtype hint of a
+    // disabled decorator. The current callers (source_ad.rs::extract_expr
+    // for the @fused_lm_ce auto-substitution arm AND for explicit
+    // `fused_linear_ce` builtin calls) ALREADY check `cfg.enabled` before
+    // emitting the FusedLinearCe op, so this guard is defense-in-depth —
+    // it codifies the documented `disabled → composite preserved` invariant
+    // as a single-source-of-truth filter.
     match compiler
         .fused_ce_configs
         .first()
+        .filter(|c| c.enabled)
         .and_then(|c| c.dtype)
     {
         None | Some(FusedCeDtypeHint::F32) => (0, crate::fused_linear_ce::Dtype::F32),
