@@ -109,6 +109,7 @@ pub mod kernel_skeleton;
 pub mod linker;
 pub mod memory_planner;
 pub mod moe;
+pub mod moe_hf_pack;
 pub mod moe_kernels;
 pub mod multimodal;
 pub mod ffi_ownership;

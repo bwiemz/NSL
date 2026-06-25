@@ -488,6 +488,32 @@ impl WeightMap {
         self.entries.insert(entry.name.clone(), entry);
     }
 
+    /// Remove a weight entry by name, returning it. Keeps `total_bytes`
+    /// consistent. Returns `None` if the entry was not present.
+    ///
+    /// Used by CPDT Part III v2.6 HF Mixtral packing to consume per-expert
+    /// HF source entries after their bytes have been packed into NSL
+    /// convention.
+    pub fn remove(&mut self, name: &str) -> Option<WeightEntry> {
+        let entry = self.entries.remove(name)?;
+        self.total_bytes = self.total_bytes.saturating_sub(entry.data.len() as u64);
+        Some(entry)
+    }
+
+    /// Construct an empty `WeightMap` for tests + library callers that
+    /// need to compose entries programmatically (e.g., CPDT Part III v2.6
+    /// HF Mixtral packing tests). The `file_hash` is zeroed and
+    /// `source_path` is empty — neither field is load-bearing for the
+    /// `get` / `insert` / `remove` / `entries` surface.
+    pub fn new_for_test() -> Self {
+        WeightMap {
+            entries: HashMap::new(),
+            file_hash: [0u8; 32],
+            source_path: String::new(),
+            total_bytes: 0,
+        }
+    }
+
     /// SHA-256 hash of the original safetensors file.
     pub fn hash(&self) -> &[u8; 32] {
         &self.file_hash
