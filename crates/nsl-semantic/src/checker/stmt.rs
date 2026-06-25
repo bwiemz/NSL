@@ -470,6 +470,36 @@ impl<'a> TypeChecker<'a> {
                                     )
                                     .with_label(deco.span, "invalid @fused_lm_ce target"),
                                 );
+                            } else if !self.fused_ce_configs.is_empty() {
+                                // CFTP v5 follow-on Finding 1 (HIGH): codegen reads
+                                // `compiler.fused_ce_configs.first()` for every train-block
+                                // lowering via `fused_ce_dtype_for_compiler`.  A second
+                                // `@fused_lm_ce` in the same compilation unit therefore
+                                // gets SILENTLY ignored — every train block, including
+                                // the second one, sees the FIRST decorator's dtype hint.
+                                // This is the silent-corruption gap from the adversarial
+                                // review: a user who writes
+                                //   @fused_lm_ce(dtype="fp16") train(...) ...
+                                //   @fused_lm_ce(dtype="bf16") train(...) ...
+                                // would get fp16 PTX + fp16 dtype_tag for BOTH train
+                                // blocks, while the second block's HBM is bf16-shaped.
+                                //
+                                // Per the `feedback_deferral_must_refuse` invariant we
+                                // refuse rather than silently weaken.  Lifting this
+                                // limitation requires either (a) per-train-block
+                                // dispatch keyed by AST node id, or (b) explicit
+                                // dispatch-index plumbing — both are v6+ ladder steps.
+                                self.diagnostics.push(
+                                    Diagnostic::error(
+                                        "@fused_lm_ce: at most one decorator is allowed per \
+                                         compilation unit (v5 codegen uses a single \
+                                         compiler-wide dtype hint; a second decorator \
+                                         would be silently ignored). Merge train blocks \
+                                         or remove the duplicate."
+                                            .to_string(),
+                                    )
+                                    .with_label(deco.span, "duplicate @fused_lm_ce decorator"),
+                                );
                             } else {
                                 let resolve = |s: nsl_ast::Symbol| -> String {
                                     self.interner.resolve(s.0).unwrap_or("").to_string()
