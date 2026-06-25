@@ -2649,29 +2649,17 @@ fn lower_fused_linear_ce_forward(
     // mantissa analysis — that empirical pin closes the v4 reviewer's
     // "no full-V numerical pin" finding.
     //
-    // ⚠️  CFTP v5 follow-on Finding 7 (HIGH) — buffer-conformance gap.
-    // The wengert tape still produces f32 tensors today; the runtime
-    // contract is that callers using `@fused_lm_ce(dtype = "fp16"|"bf16")`
-    // are responsible for ensuring the x/W/bias HBM allocations match the
-    // sentinel.  When the buffer layout does NOT match (e.g. wengert
-    // emits f32 here, the PTX bytes ld.global.b16 against the f32 bytes),
-    // the kernel reads garbage with NO error and NO diagnostic.  Per the
-    // `feedback_deferral_must_refuse` invariant, this is exactly the
-    // silent-weakening pattern that should not ship.
-    //
-    // Mitigation pending the v6 shadow-buffer plumbing:
-    //   * Set `NSL_FUSED_LCE_REFUSE_NON_F32=1` in the runtime environment
-    //     to harden `nsl_fused_linear_ce_{forward,forward_large,backward}`
-    //     against dtype_tag != 0 dispatches.  See
-    //     `crates/nsl-runtime/src/fused_linear_ce.rs::refuse_non_f32_if_gated`.
-    //   * The activation tests in `fused_lm_ce_activation_end_to_end.rs`
-    //     verify IR shape only; they do NOT execute the FFI.
-    //   * Direct-FFI tests (`fused_linear_ce_{fp16,bf16}_v49152_numerical.rs`)
-    //     allocate compliant bf16/fp16 buffers manually — they ARE safe.
-    //
-    // v6 ladder step: insert an explicit f32→bf16/fp16 device-side cast
-    // op into the wengert tape for x_t/w_t/bias_t when emitter_dtype != F32,
-    // then drop the runtime env-var guard.
+    // CFTP v6 — STRUCTURAL buffer-conformance close-out of Sprint v5
+    // Finding 7.  The wengert tape produces f32 tensors; when the active
+    // decorator selects `dtype = "fp16"|"bf16"` we INLINE a device-side
+    // precision_cast op (`nsl_tensor_to_{bf16,fp16}`) below, so the FFI
+    // always sees buffers whose byte layout matches the PTX kernel's
+    // `ld.global.b16` reads.  The Sprint v5 env-gated runtime refusal
+    // (`NSL_FUSED_LCE_REFUSE_NON_F32`) has been REMOVED in v6 because
+    // this structural cast makes the silent-corruption window unreachable
+    // from the wengert dispatch.  Direct-FFI tests
+    // (`fused_linear_ce_{fp16,bf16}_v49152_numerical.rs`) continue to
+    // allocate compliant bf16/fp16 buffers manually.
     let (dtype_tag, emitter_dtype) = fused_ce_dtype_for_compiler(compiler);
     let cfg = build_fused_ce_cfg(
         vocab_size,
@@ -2947,10 +2935,10 @@ fn lower_fused_linear_ce_backward_extract(
         // Only the f16/bf16 reads of x/W/bias/lse are dtype-sensitive, and
         // those mirror the forward dispatch contract closed in v5.
         //
-        // ⚠️  CFTP v5 follow-on Finding 7 — the same buffer-conformance
-        // gap that applies to the forward dispatch applies here.  See the
-        // forward path's comment block above and
-        // `crates/nsl-runtime/src/fused_linear_ce.rs::refuse_non_f32_if_gated`.
+        // CFTP v6 — buffer-conformance is closed STRUCTURALLY here too: the
+        // `maybe_precision_cast_inputs` call below inserts the same device-side
+        // cast op that the forward path emits.  The v5 env-guarded runtime
+        // refusal has been removed; see the forward path's comment block.
         let (dtype_tag, emitter_dtype) = fused_ce_dtype_for_compiler(compiler);
         let cfg = build_fused_ce_cfg(
             vocab_size,
