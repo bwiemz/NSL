@@ -77,6 +77,7 @@ fn cfg_from_axes(
             fused_projections: fused_proj,
             ..CshaExtras::default()
         }),
+        checkpoint: None,
     }
 }
 

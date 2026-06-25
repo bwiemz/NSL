@@ -36,6 +36,7 @@ fn smoke_cfg() -> FlashAttentionConfig {
             active_heads: 1,
             ..Default::default()
         }),
+        checkpoint: None,
     }
 }
 

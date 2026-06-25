@@ -31,6 +31,7 @@ fn canonical_config(bq: i64, bkv: i64, hd: i64, dm: u32) -> FlashAttentionConfig
             d_model: dm,
             ..CshaExtras::default()
         }),
+        checkpoint: None,
     }
 }
 

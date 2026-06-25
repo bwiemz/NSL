@@ -294,6 +294,7 @@ fn emit_fused_produces_launch_op_plus_seven_extracts() {
             rmsnorm_eps: 1e-5,
             ..CshaExtras::default()
         }),
+        checkpoint: None,
     };
 
     let mark = FusionMark {
@@ -490,6 +491,7 @@ fn gap_i2_launch_op_survives_dead_grad_elim_in_generated_adjoint() {
             rmsnorm_eps: 1e-5,
             ..CshaExtras::default()
         }),
+        checkpoint: None,
     };
     let mark = FusionMark {
         layer: "blocks.0".into(),
@@ -755,6 +757,7 @@ fn gap_d1_adjoint_routing_populates_correct_varids() {
             rmsnorm_eps: 1e-5,
             ..CshaExtras::default()
         }),
+        checkpoint: None,
     };
 
     // Build a grouped mark with chain_varids by hand (mirrors what
@@ -1107,6 +1110,7 @@ fn gap_i4_launch_inputs_thread_weight_and_norm_pointers() {
             rmsnorm_eps: 1e-5,
             ..CshaExtras::default()
         }),
+        checkpoint: None,
     };
 
     // Chain varids with a trainable gamma (norm_weight_var = Some(1)).
@@ -1248,6 +1252,7 @@ fn gap_i4_launch_inputs_pass_null_for_none_norm_weight() {
             rmsnorm_eps: 1e-5,
             ..CshaExtras::default()
         }),
+        checkpoint: None,
     };
     let varids = CshaChainVarIds {
         q_out_var: 4,
@@ -1398,6 +1403,7 @@ fn gap_i_step_k_dgamma_accumulates_into_gamma_adjoint() {
             rmsnorm_eps: 1e-5,
             ..CshaExtras::default()
         }),
+        checkpoint: None,
     };
 
     // Hand-built chain_varids mirroring what

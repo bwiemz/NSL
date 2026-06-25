@@ -327,6 +327,7 @@ mod synth_tests {
                 active_heads: 1,
                 ..Default::default()
             }),
+            checkpoint: None,
         }
     }
 

@@ -33,6 +33,7 @@ fn cfg(hd: i64, bq: i64, d_model: u32) -> FlashAttentionConfig {
             active_heads: 1,
             ..Default::default()
         }),
+        checkpoint: None,
     }
 }
 

@@ -111,7 +111,9 @@ fn t_cfg(hd: i64) -> nsl_codegen::flash_attention::FlashAttentionConfig {
     FlashAttentionConfig { block_q: 32, block_kv: 32, head_dim: hd, causal: false, paged: false,
         rope_q: false, rope_style: RopeStyle::HalfSplit, gqa_group_size: 1, tree_mask: false, num_sink_tokens: 0,
         gpu_sm: 80, segment_masked: false,
-        csha: Some(CshaExtras { level: 2, d_model: 128, ..Default::default() }) }
+        csha: Some(CshaExtras { level: 2, d_model: 128, ..Default::default() }) ,
+        checkpoint: None,
+        }
 }
 
 #[test]

@@ -145,6 +145,7 @@ fn forward_saves_match_cpu_reference() {
             rmsnorm_eps: norm_eps,
             d_model: d_model as u32,
         }),
+        checkpoint: None,
     };
 
     smem_layout::validate_scalar_v2_config(&config, Direction::Forward)

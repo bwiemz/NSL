@@ -11,6 +11,7 @@ fn csha_canonical() -> FlashAttentionConfig {
         causal: true, paged: false, rope_q: false,
         rope_style: RopeStyle::HalfSplit, gqa_group_size: 1,
         tree_mask: false, num_sink_tokens: 0, gpu_sm: 75, segment_masked: false, csha: None,
+        checkpoint: None,
     }
 }
 
@@ -20,6 +21,7 @@ fn non_csha_canonical() -> FlashAttentionConfig {
         causal: true, paged: false, rope_q: false,
         rope_style: RopeStyle::HalfSplit, gqa_group_size: 1,
         tree_mask: false, num_sink_tokens: 0, gpu_sm: 75, segment_masked: false, csha: None,
+        checkpoint: None,
     }
 }
 
@@ -149,6 +151,7 @@ fn csha_l2_rope_config() -> FlashAttentionConfig {
         causal: true, paged: false, rope_q: true,
         rope_style: RopeStyle::Adjacent, gqa_group_size: 1,  // emit_rope_pair_sweep implements Adjacent
         tree_mask: false, num_sink_tokens: 0, gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras::level2(1e-5, 32)),
+        checkpoint: None,
     }
 }
 

@@ -754,6 +754,7 @@ impl Compiler<'_> {
         let backward_block_q: i64 = 32;
         let training_config = crate::flash_attention::FlashAttentionConfig {
             csha: Some(csha_extras),
+            checkpoint: None,
             block_q: backward_block_q,
             block_kv: backward_block_kv,
             ..base_config
@@ -1240,6 +1241,7 @@ impl Compiler<'_> {
                     gpu_sm: parse_gpu_sm_from_target(&self.compile_options.target),
                     segment_masked: false,
                     csha: None,
+                    checkpoint: None,
                 };
 
                 // Sprint 1b cycle-7: @attention_sink v1 narrowness check.
@@ -1323,6 +1325,7 @@ impl Compiler<'_> {
                 gpu_sm: parse_gpu_sm_from_target(&self.compile_options.target),
                 segment_masked: false,
                 csha: None,
+                checkpoint: None,
             };
 
             // Sprint 1b cycle-7: @attention_sink v1 narrowness check.
@@ -1434,6 +1437,7 @@ impl Compiler<'_> {
                 gpu_sm: parse_gpu_sm_from_target(&self.compile_options.target),
                 segment_masked: false,
                 csha: None,
+                checkpoint: None,
             };
 
             // Sprint 1b cycle-7: @attention_sink v1 narrowness check.

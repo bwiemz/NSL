@@ -65,6 +65,7 @@ fn ok_config() -> FlashAttentionConfig {
             d_model: 32,
             ..CshaExtras::default()
         }),
+        checkpoint: None,
     }
 }
 
@@ -86,6 +87,7 @@ fn over_budget_config() -> FlashAttentionConfig {
             d_model: 64,
             ..CshaExtras::default()
         }),
+        checkpoint: None,
     }
 }
 
@@ -249,6 +251,7 @@ fn non_smoke_config_records_event_with_scope_gate() {
             d_model: 64,
             ..CshaExtras::default()
         }),
+        checkpoint: None,
     };
 
     // Ensure the config passes the backward validator — otherwise this
@@ -347,6 +350,7 @@ fn gap_i1_training_config_clamps_plan_fusion_flags() {
             d_model: 128,
             ..CshaExtras::default()
         }),
+        checkpoint: None,
     };
     // Plan config MUST fail the validator — otherwise this test isn't
     // actually exercising the clamp path.
@@ -379,6 +383,7 @@ fn gap_i1_training_config_clamps_plan_fusion_flags() {
             rmsnorm_eps: 1e-5,
             ..CshaExtras::default()
         }),
+        checkpoint: None,
     };
     // Training config MUST pass the validator — otherwise even the
     // clamp can't make the dispatcher hit `EmitFused`.

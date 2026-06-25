@@ -458,6 +458,7 @@ fn layer_backward_tier_report(
             d_model: shape.d_model as u32,
             ..Default::default()
         }),
+        checkpoint: None,
     };
 
     match backward_dispatch_tier(&cfg) {

@@ -224,6 +224,7 @@ fn smoke_cfg(hd: i64, seq: i64) -> FlashAttentionConfig {
             active_heads: 1,    // heads == 1 (smoke)
             ..Default::default()
         }),
+        checkpoint: None,
     }
 }
 

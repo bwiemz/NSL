@@ -926,6 +926,7 @@ fn build_flash_config(
         gpu_sm: 80,
         segment_masked: false,
         csha,
+        checkpoint: None,
     }
 }
 

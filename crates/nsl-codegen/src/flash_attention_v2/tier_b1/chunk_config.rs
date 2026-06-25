@@ -99,6 +99,7 @@ mod tests {
                 d_model: dm,
                 ..CshaExtras::default()
             }),
+            checkpoint: None,
         }
     }
 
@@ -151,6 +152,7 @@ mod tests {
                 d_model: 0,
                 ..CshaExtras::default()
             }),
+            checkpoint: None,
         };
         let result = select(&cfg);
         assert!(result.is_err());

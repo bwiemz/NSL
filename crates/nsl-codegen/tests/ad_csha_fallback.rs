@@ -46,6 +46,7 @@ fn backward_over_budget_config() -> FlashAttentionConfig {
             d_model: 64,
             ..CshaExtras::default()
         }),
+        checkpoint: None,
     }
 }
 
@@ -233,6 +234,7 @@ fn ad_dispatcher_stays_single_emission_on_fused_accept() {
             d_model: 32,
             ..CshaExtras::default()
         }),
+        checkpoint: None,
     };
     let mark = mark_for_layer(ok_cfg);
     let ops = claimed_chain_ops();

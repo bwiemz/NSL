@@ -54,6 +54,7 @@ fn canonical_cfg() -> FlashAttentionConfig {
             level: 2,
             ..Default::default()
         }),
+        checkpoint: None,
     }
 }
 

@@ -18,6 +18,7 @@ fn canonical_no_sinks_config() -> FlashAttentionConfig {
         tree_mask: false, num_sink_tokens: 0,
         gpu_sm: 80, segment_masked: false,
         csha: None,
+        checkpoint: None,
     }
 }
 

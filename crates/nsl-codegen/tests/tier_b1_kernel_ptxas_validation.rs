@@ -29,6 +29,7 @@ fn canonical_config() -> FlashAttentionConfig {
             d_model: 2048,
             ..CshaExtras::default()
         }),
+        checkpoint: None,
     }
 }
 

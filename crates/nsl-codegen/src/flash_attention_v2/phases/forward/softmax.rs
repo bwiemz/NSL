@@ -304,6 +304,7 @@ mod tests {
                 d_model: 128,
                 ..CshaExtras::default()
             }),
+            checkpoint: None,
         }
     }
 

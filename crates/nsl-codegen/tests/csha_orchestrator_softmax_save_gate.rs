@@ -15,6 +15,7 @@ fn forward_synthesis_includes_row_max_hbm_save_under_save_activations_without_fu
             d_model: 32,
             ..CshaExtras::default()
         }),
+        checkpoint: None,
     };
     let ptx_bytes = synthesize_flash_attention_ptx_v2(&cfg);
     let ptx = String::from_utf8_lossy(&ptx_bytes);

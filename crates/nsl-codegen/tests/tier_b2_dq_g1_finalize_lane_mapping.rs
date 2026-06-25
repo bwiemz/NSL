@@ -20,6 +20,7 @@ fn canonical_cfg() -> FlashAttentionConfig {
         gpu_sm: 80,
         segment_masked: false,
         csha: Some(CshaExtras { level: 2, ..Default::default() }),
+        checkpoint: None,
     }
 }
 

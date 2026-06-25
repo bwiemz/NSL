@@ -1488,6 +1488,7 @@ mod backward_orchestrator_tests {
                 d_model,
                 ..CshaExtras::default()
             }),
+            checkpoint: None,
         }
     }
 
@@ -1589,6 +1590,7 @@ mod backward_orchestrator_tests {
             gqa_group_size: 1, tree_mask: false, num_sink_tokens: 0, gpu_sm: 75,
             segment_masked: false,
             csha: None,
+            checkpoint: None,
         };
         let ptx = synthesize_backward(&cfg).expect("synth backward");
 
@@ -1680,6 +1682,7 @@ mod backward_orchestrator_tests {
             gqa_group_size: 1, tree_mask: false, num_sink_tokens: 0,
             gpu_sm: 80, segment_masked: false,
             csha: Some(CshaExtras { level: 2, ..Default::default() }),
+            checkpoint: None,
         };
         let result = synthesize_backward_with_tier(&cfg);
         // Phase 1: tier_b2 emitter is a stub; the wrapper falls back
@@ -1710,6 +1713,7 @@ mod backward_orchestrator_tests {
             gqa_group_size: gqa, tree_mask: false, num_sink_tokens: 0, gpu_sm: 75,
             segment_masked: false,
             csha: None,
+            checkpoint: None,
         }
     }
 
@@ -1793,6 +1797,7 @@ mod sinks_tier_b1_dispatch_tests {
                 d_model: 2048,
                 ..CshaExtras::default()
             }),
+            checkpoint: None,
         }
     }
 

@@ -212,6 +212,7 @@ mod tests {
                 level,
                 ..Default::default()
             }),
+            checkpoint: None,
         }
     }
 
@@ -324,6 +325,7 @@ mod tests {
                 active_heads: heads,
                 ..Default::default()
             }),
+            checkpoint: None,
         }
     }
 

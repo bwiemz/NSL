@@ -181,6 +181,7 @@ fn run_fused_backward_config(
             rmsnorm_eps: norm_eps,
             d_model: d_model,
         }),
+        checkpoint: None,
     };
 
     // Budget check.
@@ -544,6 +545,7 @@ fn t6_3_matrix_sweep_numerical() {
                         active_heads: heads,
                         rmsnorm_eps: 1e-5, d_model: dm,
                     }),
+                    checkpoint: None,
                 };
                 if let Err(e) = smem_layout::validate_scalar_v2_config(
                     &pre_cfg, Direction::Backward,

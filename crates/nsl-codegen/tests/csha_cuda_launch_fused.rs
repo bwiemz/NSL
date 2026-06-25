@@ -273,6 +273,7 @@ fn run_fused_config_dmodel(
             d_model:           d_model as u32,
             save_activations_for_backward: false,
         }),
+        checkpoint: None,
     };
 
     // Pre-validate before calling select_emitter: v1 is deleted so out-of-matrix
@@ -594,6 +595,7 @@ fn fused_csha_32x32x32_heads4_nocausal() {
             rmsnorm_eps: 1e-5, d_model: 32,
             save_activations_for_backward: false,
         }),
+        checkpoint: None,
     };
     assert_eq!(
         select_emitter(&probe),
@@ -789,6 +791,7 @@ fn run_with_saves(
             rmsnorm_eps: norm_eps,
             d_model: dm as u32,
         }),
+        checkpoint: None,
     };
 
     if let Err(e) = smem_layout::validate_scalar_v2_config(&config, smem_layout::Direction::Forward) {
@@ -1152,6 +1155,7 @@ fn t4_csha_backward_ffi_smoke() {
             rmsnorm_eps: norm_eps,
             d_model: d_model as u32,
         }),
+        checkpoint: None,
     };
 
     let mut ptx_str = synthesize_backward(&config)

@@ -758,6 +758,7 @@ mod tests {
             gpu_sm: 75,
             segment_masked: false,
             csha: None,
+            checkpoint: None,
         }
     }
 
@@ -804,6 +805,7 @@ mod tests {
                 d_model,
                 ..CshaExtras::default()
             }),
+            checkpoint: None,
         }
     }
 
@@ -949,6 +951,7 @@ mod tests {
                 level: 2,
                 ..CshaExtras::default()
             }),
+            checkpoint: None,
         }
     }
 
@@ -1251,6 +1254,7 @@ mod tier_b2_dq_offset_tests {
             gqa_group_size: 1, tree_mask: false, num_sink_tokens: 0,
             gpu_sm: 80, segment_masked: false,
             csha: Some(CshaExtras { level: 2, ..Default::default() }),
+            checkpoint: None,
         }
     }
 

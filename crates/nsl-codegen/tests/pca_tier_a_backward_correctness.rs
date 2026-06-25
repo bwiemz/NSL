@@ -317,6 +317,7 @@ fn pca_backward_config(segment_masked: bool) -> FlashAttentionConfig {
             rmsnorm_eps:                   1e-5,
             d_model:                       32,
         }),
+        checkpoint: None,
     }
 }
 

@@ -245,6 +245,7 @@ fn run_flash_attention_and_measure(
         tree_mask: false,
         num_sink_tokens: 0,
         gpu_sm: 75, segment_masked: false, csha: None,
+        checkpoint: None,
     };
 
     // Use std::panic::catch_unwind so an emitter panic (e.g., SMEM budget assert)
@@ -385,6 +386,7 @@ fn run_classic_numerical_case(block_q: usize, block_kv: usize, head_dim: usize, 
         tree_mask: false,
         num_sink_tokens: 0,
         gpu_sm: 75, segment_masked: false, csha: None,
+        checkpoint: None,
     };
     assert_eq!(
         select_emitter(&probe_config),

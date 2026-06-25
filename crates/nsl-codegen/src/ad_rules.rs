@@ -1431,6 +1431,7 @@ mod tests {
                 d_model,
                 ..crate::flash_attention::CshaExtras::default()
             }),
+            checkpoint: None,
         }
     }
 

@@ -109,6 +109,7 @@ fn canonical_config() -> FlashAttentionConfig {
             skip_rmsnorm_prologue: false,
             ..CshaExtras::default()
         }),
+        checkpoint: None,
     }
 }
 

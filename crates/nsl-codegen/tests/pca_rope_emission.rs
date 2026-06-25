@@ -29,6 +29,7 @@ fn config_segment_masked_with_rope() -> FlashAttentionConfig {
         gpu_sm: 75,
         segment_masked: true,
         csha: Some(CshaExtras::level2(1e-5, 32)),
+        checkpoint: None,
     }
 }
 

@@ -63,6 +63,7 @@ fn config() -> FlashAttentionConfig {
             d_model: 32,
             ..CshaExtras::default()
         }),
+        checkpoint: None,
     }
 }
 

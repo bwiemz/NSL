@@ -82,6 +82,7 @@ fn cfg_32_32_32() -> FlashAttentionConfig {
         gpu_sm: 80,
         segment_masked: true,
         csha: None,
+        checkpoint: None,
     }
 }
 
@@ -101,6 +102,7 @@ fn cfg_64_64_64() -> FlashAttentionConfig {
         gpu_sm: 80,
         segment_masked: true,
         csha: None,
+        checkpoint: None,
     }
 }
 

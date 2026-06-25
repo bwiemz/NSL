@@ -28,6 +28,7 @@ fn cfg(hd: i64, bq: i64) -> FlashAttentionConfig {
             level: 2,
             ..Default::default()
         }),
+        checkpoint: None,
     }
 }
 

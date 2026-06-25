@@ -505,6 +505,7 @@ mod tests {
                 d_model,
                 ..CshaExtras::default()
             }),
+            checkpoint: None,
         }
     }
 

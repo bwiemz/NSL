@@ -180,6 +180,7 @@ fn backward_prelude_ptxas_clean_sm75_sm90_sm120() {
             d_model: 32,
             ..CshaExtras::default()
         }),
+        checkpoint: None,
     };
 
     let mut failures = Vec::new();
@@ -219,6 +220,7 @@ fn backward_prelude_plus_q_load_ptxas_clean_sm75_sm90_sm120() {
             d_model: 32,
             ..CshaExtras::default()
         }),
+        checkpoint: None,
     };
 
     let mut failures = Vec::new();
@@ -259,6 +261,7 @@ fn backward_prelude_qload_ds_compute_ptxas_clean_sm75_sm90_sm120() {
                 d_model: 32,
                 ..CshaExtras::default()
             }),
+            checkpoint: None,
         };
         let mut failures = Vec::new();
         for sm in &["sm_75", "sm_90", "sm_120"] {
@@ -297,6 +300,7 @@ fn backward_prelude_qload_ds_dv_ptxas_clean_sm75_sm90_sm120() {
             d_model: 32,
             ..CshaExtras::default()
         }),
+        checkpoint: None,
     };
     let mut failures = Vec::new();
     for sm in &["sm_75", "sm_90", "sm_120"] {
@@ -333,6 +337,7 @@ fn backward_through_dqdk_accum_ptxas_clean_sm75_sm90_sm120() {
             d_model: 32,
             ..CshaExtras::default()
         }),
+        checkpoint: None,
     };
     let mut failures = Vec::new();
     for sm in &["sm_75", "sm_90", "sm_120"] {
@@ -370,6 +375,7 @@ fn backward_through_csha_hooks_ptxas_clean_sm75_sm90_sm120() {
             d_model: 32,
             ..CshaExtras::default()
         }),
+        checkpoint: None,
     };
     let mut failures = Vec::new();
     for sm in &["sm_75", "sm_90", "sm_120"] {
@@ -410,6 +416,7 @@ fn backward_full_pipeline_ptxas_clean_sm75_sm90_sm120() {
                 d_model: 32,
                 ..CshaExtras::default()
             }),
+            checkpoint: None,
         };
         let mut failures = Vec::new();
         for sm in &["sm_75", "sm_90", "sm_120"] {
@@ -453,6 +460,7 @@ fn synthesize_backward_orchestrator_ptxas_clean_sm75_sm90_sm120() {
                 d_model: 32,
                 ..CshaExtras::default()
             }),
+            checkpoint: None,
         };
         let mut failures = Vec::new();
         for sm in &["sm_75", "sm_90", "sm_120"] {

@@ -151,6 +151,7 @@ fn with_saves_ptx_contains_csha_save_labels() {
             skip_rmsnorm_prologue: false,
             static_seq_len: None,
         }),
+        checkpoint: None,
     };
 
     let ptx_with_saves = synthesize_flash_attention_ptx_v2(&mk(true));

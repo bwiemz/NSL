@@ -137,6 +137,7 @@ fn dx_norm_hbm_buffer_is_populated() {
             rmsnorm_eps: norm_eps,
             d_model: dm as u32,
         }),
+        checkpoint: None,
     };
 
     smem_layout::validate_scalar_v2_config(&config, Direction::Backward)

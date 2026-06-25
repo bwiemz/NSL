@@ -32,6 +32,7 @@ fn gate_fixture_cfg() -> FlashAttentionConfig {
         gpu_sm: 120,
         segment_masked: true,
         csha: None,
+        checkpoint: None,
     }
 }
 

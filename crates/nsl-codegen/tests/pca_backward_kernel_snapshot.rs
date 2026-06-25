@@ -38,6 +38,7 @@ fn minimal_segment_masked_backward_config() -> FlashAttentionConfig {
             d_model: 32,
             ..CshaExtras::default()
         }),
+        checkpoint: None,
     }
 }
 

@@ -35,6 +35,7 @@ fn minimal_segment_masked_config() -> FlashAttentionConfig {
         gpu_sm: 80,
         segment_masked: true,
         csha: None,
+        checkpoint: None,
     }
 }
 
@@ -54,6 +55,7 @@ fn segment_masked_config_64x64x64() -> FlashAttentionConfig {
         gpu_sm: 80,
         segment_masked: true,
         csha: None,
+        checkpoint: None,
     }
 }
 

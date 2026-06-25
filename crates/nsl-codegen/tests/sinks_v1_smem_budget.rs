@@ -34,6 +34,7 @@ fn cfg(block_q: i64, block_kv: i64, head_dim: i64, num_sink_tokens: u32) -> Flas
         gpu_sm: 80,
         segment_masked: false,
         csha: None,
+        checkpoint: None,
     }
 }
 

@@ -1608,6 +1608,7 @@ mod tests {
                 d_model: dm,
                 ..CshaExtras::default()
             }),
+            checkpoint: None,
         }
     }
 

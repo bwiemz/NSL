@@ -164,6 +164,7 @@ mod tests {
             gqa_group_size: 1, tree_mask: false, num_sink_tokens: 0,
             gpu_sm: 80, segment_masked: false,
             csha: Some(CshaExtras { level: 2, ..Default::default() }),
+            checkpoint: None,
         }
     }
 
@@ -207,6 +208,7 @@ mod tests {
                 active_heads: 1,
                 ..Default::default()
             }),
+            checkpoint: None,
         }
     }
 

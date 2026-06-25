@@ -1518,6 +1518,7 @@ mod tests {
             tree_mask: false,
             num_sink_tokens: 0,
             gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras { fused_projections: true, d_model: 128, ..CshaExtras::default() }),
+            checkpoint: None,
         }
     }
 
@@ -1535,6 +1536,7 @@ mod tests {
             tree_mask: false,
             num_sink_tokens: 0,
             gpu_sm: 75, segment_masked: false, csha: Some(CshaExtras { fused_projections: true, d_model: 128, ..CshaExtras::default() }),
+            checkpoint: None,
         }
     }
 
@@ -1716,6 +1718,7 @@ mod tests {
                 d_model: 128,
                 ..CshaExtras::default()
             }),
+            checkpoint: None,
         }
     }
 
@@ -1875,6 +1878,7 @@ mod tests {
                 d_model: 128,
                 ..CshaExtras::default()
             }),
+            checkpoint: None,
         };
         let mut ptx = String::new();
         emit_save_softmax_state(&mut ptx, &cfg, 0);
@@ -1913,6 +1917,7 @@ mod tests {
                 d_model: 128,
                 ..CshaExtras::default()
             }),
+            checkpoint: None,
         };
         let mut ptx = String::new();
         emit_save_softmax_state_with_diag(&mut ptx, &cfg, 0, "");
@@ -1942,6 +1947,7 @@ mod tests {
                 d_model: 128,
                 ..CshaExtras::default()
             }),
+            checkpoint: None,
         };
         let mut ptx = String::new();
         emit_save_softmax_state_with_diag(&mut ptx, &cfg, 0, "wrow");
@@ -1984,6 +1990,7 @@ mod tests {
                 d_model: 128,
                 ..CshaExtras::default()
             }),
+            checkpoint: None,
         };
         let mut ptx = String::new();
         emit_save_softmax_state_with_diag(&mut ptx, &cfg, 0, "wid");
@@ -2012,6 +2019,7 @@ mod tests {
                 d_model: 128,
                 ..CshaExtras::default()
             }),
+            checkpoint: None,
         };
         let mut ptx = String::new();
         emit_save_softmax_state_with_diag(&mut ptx, &cfg, 0, "qstart");
@@ -2039,6 +2047,7 @@ mod tests {
                 d_model: 128,
                 ..CshaExtras::default()
             }),
+            checkpoint: None,
         };
         let mut off = String::new();
         emit_save_softmax_state_with_diag(&mut off, &cfg, 0, "");
@@ -2069,6 +2078,7 @@ mod tests {
                 d_model: 128,
                 ..CshaExtras::default()
             }),
+            checkpoint: None,
         };
         let mut ptx = String::new();
         emit_save_softmax_state_with_diag(&mut ptx, &cfg, 0, "fmax");
@@ -2101,6 +2111,7 @@ mod tests {
                 d_model: 128,
                 ..CshaExtras::default()
             }),
+            checkpoint: None,
         };
         let mut ptx = String::new();
         emit_save_softmax_state_with_diag(&mut ptx, &cfg, 0, "newmax");
@@ -2128,6 +2139,7 @@ mod tests {
                 d_model: 128,
                 ..CshaExtras::default()
             }),
+            checkpoint: None,
         };
         let mut ptx = String::new();
         emit_save_softmax_state_with_diag(&mut ptx, &cfg, 0, "fsum");
@@ -2160,6 +2172,7 @@ mod tests {
                 d_model: 128,
                 ..CshaExtras::default()
             }),
+            checkpoint: None,
         };
         let mut ptx = String::new();
         emit_save_softmax_state(&mut ptx, &cfg, 0);

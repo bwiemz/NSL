@@ -194,6 +194,7 @@ fn fixture_config(segment_masked: bool) -> FlashAttentionConfig {
         gpu_sm:        75,
         segment_masked,
         csha:          None,
+        checkpoint: None,
     }
 }
 

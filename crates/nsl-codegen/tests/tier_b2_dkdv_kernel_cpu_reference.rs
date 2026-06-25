@@ -104,6 +104,7 @@ fn cfg(bq: i64, hd: i64) -> FlashAttentionConfig {
         gpu_sm: 80,
         segment_masked: false,
         csha: Some(CshaExtras { level: 2, d_model: 128, ..Default::default() }),
+        checkpoint: None,
     }
 }
 

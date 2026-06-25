@@ -38,6 +38,7 @@ fn tier_b1_eligible_config() -> FlashAttentionConfig {
             d_model: 2048,
             ..CshaExtras::default()
         }),
+        checkpoint: None,
     }
 }
 

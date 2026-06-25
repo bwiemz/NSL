@@ -337,6 +337,7 @@ fn save_config(head_dim: i64) -> FlashAttentionConfig {
             save_activations_for_backward: true,
             ..CshaExtras::default()
         }),
+        checkpoint: None,
     }
 }
 

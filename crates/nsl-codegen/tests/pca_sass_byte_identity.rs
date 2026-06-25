@@ -640,6 +640,7 @@ fn tier_b_test_fixture() -> nsl_codegen::flash_attention::FlashAttentionConfig {
         gpu_sm: 120,
         segment_masked: true,
         csha: None,
+        checkpoint: None,
     }
 }
 

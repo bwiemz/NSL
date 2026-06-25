@@ -112,6 +112,7 @@ fn cfg_128(d_model: u32) -> FlashAttentionConfig {
             d_model,
             save_activations_for_backward: false,
         }),
+        checkpoint: None,
     }
 }
 

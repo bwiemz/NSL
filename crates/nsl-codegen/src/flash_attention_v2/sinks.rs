@@ -184,6 +184,7 @@ mod tests {
             rope_style: RopeStyle::Adjacent, gqa_group_size: 1,
             tree_mask: false, num_sink_tokens,
             gpu_sm: 80, segment_masked: false, csha: None,
+            checkpoint: None,
         }
     }
 
@@ -229,6 +230,7 @@ mod eligibility_tests {
             rope_style: RopeStyle::Adjacent, gqa_group_size: 1,
             tree_mask: false, num_sink_tokens: 4,
             gpu_sm: 80, segment_masked: false, csha: None,
+            checkpoint: None,
         }
     }
 
@@ -421,6 +423,7 @@ mod backward_eligibility_tests {
                     level: 2,
                     ..CshaExtras::default()
                 }),
+                checkpoint: None,
             },
             FlashAttentionConfig {
                 block_q: 128, block_kv: 64, head_dim: 32,
@@ -428,6 +431,7 @@ mod backward_eligibility_tests {
                 rope_style: RopeStyle::Adjacent, gqa_group_size: 1,
                 tree_mask: false, num_sink_tokens: 0,
                 gpu_sm: 75, segment_masked: false, csha: None,
+                checkpoint: None,
             },
         ];
         for cfg in permutations {
@@ -453,6 +457,7 @@ mod backward_eligibility_tests {
             rope_style: RopeStyle::Adjacent, gqa_group_size: 1,
             tree_mask: false, num_sink_tokens: 4,
             gpu_sm: 80, segment_masked: false, csha: None,
+            checkpoint: None,
         };
         let (eligible, why) = attention_sinks_v1_backward_eligible(&cfg);
         assert!(!eligible, "expected refusal for sinks-enabled backward");
@@ -478,6 +483,7 @@ mod backward_eligibility_tests {
                 rope_style: RopeStyle::Adjacent, gqa_group_size: 1,
                 tree_mask: false, num_sink_tokens: n,
                 gpu_sm: 80, segment_masked: false, csha: None,
+                checkpoint: None,
             };
             let (eligible, _) = attention_sinks_v1_backward_eligible(&cfg);
             assert!(!eligible, "sinks-enabled backward must refuse at n={n}");

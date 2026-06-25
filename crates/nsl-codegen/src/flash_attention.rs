@@ -223,6 +223,17 @@ pub struct FlashAttentionConfig {
     /// `NSL-CSHA-Research.PDF`.
     #[doc(hidden)]
     pub csha: Option<CshaExtras>,
+    /// Paper §5.3 checkpointing-aware backward extensions. `None` (the
+    /// default) preserves classic backward (M14 tape fallback or fused
+    /// CSHA backward). `Some(..)` selects a compiler-synthesized
+    /// checkpointing strategy that recomputes prologue activations
+    /// during backward instead of materializing/retaining them.
+    ///
+    /// v1 ships `policy="full"` only (single-variant invariant inversion
+    /// per cycle-10 Refuter 3). Other policies are reserved for v2/v3.
+    /// See `docs/superpowers/specs/2026-06-24-csha-checkpointing-aware-backward-design.md`.
+    #[doc(hidden)]
+    pub checkpoint: Option<CheckpointExtras>,
 }
 
 impl FlashAttentionConfig {
@@ -248,6 +259,34 @@ impl FlashAttentionConfig {
         }
         Ok(())
     }
+}
+
+/// Paper §5.3 checkpointing-aware backward policy.
+///
+/// v1 ships a single variant (`Full`) per cycle-10 Refuter 3 invariant
+/// inversion: the policy enum exists so that the kwarg parser can refuse
+/// unsupported variants without inventing API surface that has no test
+/// coverage. `Selective`, `SelectivePostnorm`, `Custom` are reserved for
+/// v2/v3 and are explicitly refused at the semantic layer.
+///
+/// `Full` recomputes the entire prologue (RMSNorm + Q/K/V projections +
+/// RoPE) during backward instead of materializing it from HBM saves.
+/// See `docs/superpowers/specs/2026-06-24-csha-checkpointing-aware-backward-design.md`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum CheckpointPolicy {
+    /// Full prologue recompute during backward (v1 only variant).
+    Full,
+}
+
+/// Paper §5.3 checkpointing-aware backward configuration carrier.
+///
+/// Mirrors the `CshaExtras` sub-struct pattern: adding a single
+/// `Option<CheckpointExtras>` field to `FlashAttentionConfig` keeps
+/// the ~371 in-tree construction sites near-zero churn (cycle-10 T2).
+#[derive(Clone, Debug)]
+pub struct CheckpointExtras {
+    /// Active checkpointing policy. v1 ships `CheckpointPolicy::Full`.
+    pub policy: CheckpointPolicy,
 }
 
 /// CSHA kernel-level fusion extensions.
@@ -6006,10 +6045,46 @@ mod tests {
             gpu_sm: 80,
         segment_masked: false,
         csha: None,
+        checkpoint: None,
         };
         assert_eq!(
             flash_attention_kernel_name(&config),
             "flash_attn_p0_r0_hs_g1_c1_t0_q64_kv64"
+        );
+    }
+
+    // Cycle-10 Task 1: verify the sub-struct pattern keeps `checkpoint`
+    // disabled by default so that classic kernels remain byte-identical
+    // (per §5.3 v1 invariant inversion and T2 mitigation).
+    #[test]
+    fn flash_attention_config_default_checkpoint_is_none() {
+        let config = FlashAttentionConfig {
+            block_q: 64,
+            block_kv: 64,
+            head_dim: 128,
+            causal: true,
+            paged: false,
+            rope_q: false,
+            rope_style: RopeStyle::HalfSplit,
+            gqa_group_size: 1,
+            tree_mask: false,
+            num_sink_tokens: 0,
+            gpu_sm: 80,
+            segment_masked: false,
+            csha: None,
+            checkpoint: None,
+        };
+        assert!(config.checkpoint.is_none());
+        // Also verify the Some(..) constructor works and round-trips.
+        let policied = FlashAttentionConfig {
+            checkpoint: Some(CheckpointExtras {
+                policy: CheckpointPolicy::Full,
+            }),
+            ..config.clone()
+        };
+        assert_eq!(
+            policied.checkpoint.as_ref().map(|c| c.policy),
+            Some(CheckpointPolicy::Full)
         );
     }
 
@@ -6029,6 +6104,7 @@ mod tests {
             gpu_sm: 80,
         segment_masked: false,
         csha: None,
+        checkpoint: None,
         };
         assert_eq!(
             flash_attention_kernel_name(&config),
@@ -6052,6 +6128,7 @@ mod tests {
             gpu_sm: 80,
         segment_masked: false,
         csha: None,
+        checkpoint: None,
         };
         // (64 + 64) * 128 * 2 = 32768 bytes (32 KB)
         assert_eq!(shared_mem_bytes(&config), 32768);
@@ -6075,6 +6152,7 @@ mod tests {
             gpu_sm: 80,
         segment_masked: false,
         csha: None,
+        checkpoint: None,
         };
         assert_eq!(shared_mem_bytes(&config), 49152);
         // This exceeds 48KB — the semantic checker should reject this combination
@@ -6096,6 +6174,7 @@ mod tests {
             gpu_sm: 80,
         segment_masked: false,
         csha: None,
+        checkpoint: None,
         };
         let ptx = synthesize_flash_attention_ptx(&config);
         let ptx_str = std::str::from_utf8(&ptx[..ptx.len() - 1]).unwrap(); // strip null
@@ -6124,6 +6203,7 @@ mod tests {
             gpu_sm: 80,
         segment_masked: false,
         csha: None,
+        checkpoint: None,
         };
         let ptx_no_causal = synthesize_flash_attention_ptx(&config);
         let str_no = std::str::from_utf8(&ptx_no_causal[..ptx_no_causal.len() - 1]).unwrap();
@@ -6152,6 +6232,7 @@ mod tests {
             gpu_sm: 80,
         segment_masked: false,
         csha: None,
+        checkpoint: None,
         };
         let ptx = synthesize_flash_attention_ptx(&config);
         let ptx_str = std::str::from_utf8(&ptx[..ptx.len() - 1]).unwrap();
@@ -6176,6 +6257,7 @@ mod tests {
             gpu_sm: 80,
         segment_masked: false,
         csha: None,
+        checkpoint: None,
         };
         let ptx = synthesize_flash_attention_ptx(&config);
         let ptx_str = std::str::from_utf8(&ptx[..ptx.len() - 1]).unwrap();
@@ -6200,6 +6282,7 @@ mod tests {
             gpu_sm: 80,
         segment_masked: false,
         csha: None,
+        checkpoint: None,
         };
         let ptx = synthesize_flash_attention_ptx(&config);
         let ptx_str = std::str::from_utf8(&ptx[..ptx.len() - 1]).unwrap();
@@ -6239,6 +6322,7 @@ mod tests {
             gpu_sm: 80,
         segment_masked: false,
         csha: None,
+        checkpoint: None,
         };
         let ptx = synthesize_flash_attention_ptx(&config);
         let ptx_str = std::str::from_utf8(&ptx[..ptx.len() - 1]).unwrap();
@@ -6613,6 +6697,7 @@ mod tests {
             gpu_sm: 80,
             segment_masked: false,
             csha: Some(CshaExtras::level1(1e-5)),
+            checkpoint: None,
         }
     }
 
@@ -6631,6 +6716,7 @@ mod tests {
             gpu_sm: 80,
             segment_masked: false,
             csha: None,
+            checkpoint: None,
         }
     }
 
@@ -6714,6 +6800,7 @@ mod tests {
             gpu_sm: 80,
             segment_masked: false,
             csha: Some(CshaExtras::level2(1e-5, 512)),
+            checkpoint: None,
         }
     }
 
@@ -7203,6 +7290,7 @@ mod tests {
             gpu_sm: 80,
             segment_masked: false,
             csha: None,
+            checkpoint: None,
         };
 
         // Case 1: paged=true alone is fine.

@@ -693,6 +693,7 @@ mod tests {
                 d_model: 2048,
                 ..CshaExtras::default()
             }),
+            checkpoint: None,
         }
     }
 

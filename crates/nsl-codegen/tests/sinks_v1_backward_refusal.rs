@@ -79,6 +79,7 @@ fn sinks_enabled_bypass_cfg() -> FlashAttentionConfig {
             save_activations_for_backward: true,
             ..CshaExtras::default()
         }),
+        checkpoint: None,
     }
 }
 

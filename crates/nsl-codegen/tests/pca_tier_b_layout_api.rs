@@ -14,6 +14,7 @@ fn fa_base_seg_masked() -> FlashAttentionConfig {
         causal: true, paged: false, rope_q: true,
         rope_style: RopeStyle::HalfSplit, gqa_group_size: 2,
         tree_mask: false, num_sink_tokens: 0, gpu_sm: 120, segment_masked: true, csha: None,
+        checkpoint: None,
     }
 }
 

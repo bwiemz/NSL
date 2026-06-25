@@ -114,6 +114,7 @@ mod selector_tests {
             gpu_sm,
             segment_masked: false,
             csha: None,
+            checkpoint: None,
         }
     }
 
@@ -145,6 +146,7 @@ mod selector_tests {
                 skip_rmsnorm_prologue: false,
                 static_seq_len: None,
             }),
+            checkpoint: None,
         }
     }
 

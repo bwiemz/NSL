@@ -33,6 +33,7 @@ fn segment_masked_config() -> FlashAttentionConfig {
         gpu_sm: 80,
         segment_masked: true,
         csha: None,
+        checkpoint: None,
     }
 }
 

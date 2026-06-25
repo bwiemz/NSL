@@ -40,6 +40,7 @@ fn base_cfg(bq: i64, bkv: i64, hd: i64) -> FlashAttentionConfig {
             d_model: hd as u32,
             ..Default::default()
         }),
+        checkpoint: None,
     }
 }
 

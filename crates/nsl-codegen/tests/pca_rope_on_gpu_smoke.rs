@@ -30,6 +30,7 @@ fn smoke_config() -> FlashAttentionConfig {
         gpu_sm: 75,
         segment_masked: true,
         csha: Some(CshaExtras::default()),
+        checkpoint: None,
     }
 }
 

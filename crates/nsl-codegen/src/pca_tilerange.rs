@@ -662,6 +662,7 @@ mod tests {
             gpu_sm: 90,
             segment_masked: true,
             csha: None,
+            checkpoint: None,
         }
     }
 

@@ -15,6 +15,7 @@ fn emit_save_softmax_state_fires_hbm_save_under_save_activations_without_fused()
             d_model: 32,
             ..CshaExtras::default()
         }),
+        checkpoint: None,
     };
     let mut ptx = String::new();
     csha_hooks::emit_save_softmax_state(&mut ptx, &cfg, 0);

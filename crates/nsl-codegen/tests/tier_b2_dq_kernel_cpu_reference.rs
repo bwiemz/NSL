@@ -140,6 +140,7 @@ fn canonical_hd32_cfg() -> FlashAttentionConfig {
         // (bare ..Default::default()) defeats the B1Forward path's unwrap_or(128)
         // fallback (which only fires for csha=None) and zero-sizes every B.1 input.
         csha: Some(CshaExtras { level: 2, d_model: 128, ..Default::default() }),
+        checkpoint: None,
     }
 }
 
@@ -162,6 +163,7 @@ fn cfg(bq: i64, hd: i64) -> FlashAttentionConfig {
         // (bare ..Default::default()) defeats the B1Forward path's unwrap_or(128)
         // fallback (which only fires for csha=None) and zero-sizes every B.1 input.
         csha: Some(CshaExtras { level: 2, d_model: 128, ..Default::default() }),
+        checkpoint: None,
     }
 }
 
@@ -274,6 +276,7 @@ fn tier_b2_d_prepass_grid_dispatch_and_hd_sweep() {
             gpu_sm: 80,
             segment_masked: false,
             csha: Some(CshaExtras { level: 2, ..Default::default() }),
+            checkpoint: None,
         };
         let hd = case.hd as usize;
 
