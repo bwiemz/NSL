@@ -235,11 +235,10 @@ fn run_bf16_numerical(b: usize, s: usize, v: usize, h: usize, vocab_tile: u32) {
     f32_slice_to_bf16_bits(&w_f32, &mut w_bf16);
     f32_slice_to_bf16_bits(&bias_f32, &mut bias_bf16);
 
-    // PTX.
-    let mut fwd_ptx = synthesize_fused_linear_ce_ptx(&cfg);
-    fwd_ptx.push(0u8);
-    let mut bwd_ptx = synthesize_fused_linear_ce_backward_ptx(&cfg);
-    bwd_ptx.push(0u8);
+    // PTX. synthesize_* now returns null-terminated bytes for cuModuleLoadData
+    // (contract documented in crates/nsl-codegen/src/fused_linear_ce.rs).
+    let fwd_ptx = synthesize_fused_linear_ce_ptx(&cfg);
+    let bwd_ptx = synthesize_fused_linear_ce_backward_ptx(&cfg);
     let fwd_name = format!("{}\0", cfg.kernel_name());
     let bwd_name = format!("{}\0", cfg.bwd_kernel_name());
 
@@ -515,8 +514,9 @@ fn bf16_large_vocab_non_divisor_no_tail_zero_corruption() {
     f32_slice_to_bf16_bits(&w_f32, &mut w_bf16);
     f32_slice_to_bf16_bits(&bias_f32, &mut bias_bf16);
 
-    let mut ptx = nsl_codegen::fused_linear_ce::synthesize_fused_linear_ce_ptx(&cfg);
-    ptx.push(0u8);
+    // synthesize_* now returns null-terminated bytes for cuModuleLoadData
+    // (contract documented in crates/nsl-codegen/src/fused_linear_ce.rs).
+    let ptx = nsl_codegen::fused_linear_ce::synthesize_fused_linear_ce_ptx(&cfg);
     let kname_a = format!("{}\0", cfg.large_partials_kernel_name());
     let kname_b = format!("{}\0", cfg.large_finalize_kernel_name());
 
