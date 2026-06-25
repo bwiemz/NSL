@@ -36,6 +36,48 @@ pub struct PruneResult {
     pub dead_experts: Vec<u32>,
 }
 
+/// CPDT Part III v2.9 — one per-expert projection in a multi-projection
+/// MoE FFN (v3 = up+down, v4 = gate+up+down). Each projection is packed
+/// `[n_experts, block_elems]` row-major in its own byte buffer; the
+/// block_elems may differ across projections within the same MoE
+/// (e.g. for v4 with hidden=8 / intermediate=16: gate and up have
+/// 8*16=128 elems/block, down has 16*8=128 elems/block — equal here but
+/// asymmetric configs are common).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExpertProjection {
+    /// Human-readable name for diagnostics + WeightMap key on writeback
+    /// (e.g., "experts.gate.weight", "experts.up.weight", "experts.down.weight").
+    pub name: String,
+    pub data: Vec<u8>,
+    /// Elements per expert block for THIS projection.
+    pub block_elems: usize,
+    pub dtype: WeightDType,
+}
+
+/// CPDT Part III v2.9 — sliced output of one input projection. Same
+/// length as the input `Vec<ExpertProjection>` passed to
+/// `prune_dead_experts_split`, in the same order.
+#[derive(Debug, Clone, PartialEq)]
+pub struct KeptProjection {
+    pub name: String,
+    pub data: Vec<u8>,
+    pub block_elems: usize,
+    pub dtype: WeightDType,
+}
+
+/// CPDT Part III v2.9 — result of a successful multi-projection prune.
+/// `sliced_router` mirrors v1 `PruneResult.sliced_router`; the per-
+/// projection slices are returned in the same order as the input
+/// projections so callers can pair input.name with output.name.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SplitPruneResult {
+    pub sliced_router: Vec<u8>,
+    pub kept_projections: Vec<KeptProjection>,
+    pub index_remap: Vec<u32>,
+    pub n_live: usize,
+    pub dead_experts: Vec<u32>,
+}
+
 /// Precondition failures. On any refusal, nothing is produced (input untouched).
 #[derive(Debug, Clone, PartialEq)]
 pub enum ExpertPruneRefusal {
@@ -50,6 +92,33 @@ pub enum ExpertPruneRefusal {
     /// bundle is a documented follow-on. Produced only by the pass (the pure
     /// transform carries one dtype).
     MixedDtypeUnsupported { router_dtype: WeightDType, expert_dtype: WeightDType },
+    /// v2.9: `prune_dead_experts_split` requires at least one projection.
+    /// An empty list is a programmer error (the caller should not have
+    /// reached the split path) — refuse loudly rather than no-op.
+    EmptyProjectionList,
+    /// v2.9: one of the projections in the split-path has a byte length
+    /// that doesn't equal `n_experts * block_elems * dtype.byte_width()`.
+    /// Reported per-projection so the caller can identify which one.
+    ProjectionShapeMismatch { name: String, expected_bytes: usize, actual_bytes: usize },
+    /// v2.9: split-path projections must share dtype with the router.
+    /// Mixed dtypes across projections are rejected here for the same
+    /// reason as the legacy MixedDtypeUnsupported above (one byte-width
+    /// drives the byte slice).
+    ProjectionDtypeMismatch { name: String, projection_dtype: WeightDType, router_dtype: WeightDType },
+    /// v2.9 fix F4 (LOW adversarial review): the router tensor's shape
+    /// is not 2D. Distinct from `RouterShapeMismatch` because the
+    /// "expected vs actual elems" diagnostic is meaningless when the
+    /// tensor isn't 2D at all (a 1D fused router would produce a
+    /// quadratic-in-n expected count). Reported with the actual ndim
+    /// so the user can correct the upstream packing.
+    RouterShapeNot2D { actual_ndim: usize, num_elements: usize },
+    /// v2.9 fix F2 (IMPORTANT adversarial review): a projection tensor's
+    /// shape is not 2D `[n_experts, block_elems]`. Without this gate
+    /// the pass would silently reshape a 1D `[n*block_elems]` packed
+    /// buffer into 2D on writeback (non-monotonic: only changes shape
+    /// when at least one expert is dead). Refusal mirrors the router
+    /// 2D check and names the offending projection.
+    ProjectionShapeNot2D { name: String, actual_ndim: usize, num_elements: usize },
 }
 
 /// Prune dead experts from a MoE weight bundle: slice router columns + drop
@@ -128,13 +197,154 @@ pub fn prune_dead_experts(
     })
 }
 
+/// CPDT Part III v2.9 — multi-projection dead-expert prune.
+///
+/// Slices `router` columns + each of `projections`'s expert blocks, all
+/// keyed by the SAME `index_remap` single source of truth. v3 layout
+/// passes 2 projections (`experts.{up,down}.weight`); v4 layout passes
+/// 3 (`experts.{gate,up,down}.weight`). v1/v2 single-projection callers
+/// should continue using `prune_dead_experts` — this function is the
+/// generalized form.
+///
+/// Per-projection guarantee: each projection is sliced INDEPENDENTLY
+/// using the same `index_remap`, so a v4 caller with mismatched
+/// gate/up/down block_elems still gets consistent expert-id ordering
+/// across all three outputs.
+///
+/// Refusals (no partial mutation — split-path is structurally pure;
+/// inputs are taken by `&` and outputs are owned):
+///   - `EmptyProjectionList` — `projections.is_empty()`
+///   - `RouterShapeMismatch` — `router.len() != d_model * n_experts * bw`
+///   - `ProjectionShapeMismatch` — projection.data.len() doesn't match
+///     `n_experts * projection.block_elems * bw`
+///   - `ProjectionDtypeMismatch` — projection.dtype != router_dtype
+///   - `DeadIndexOutOfRange` — any dead index >= n_experts
+///   - `AllExpertsDead` — every expert is in dead_experts
+///   - `InsufficientLiveExperts` — n_live < top_k
+pub fn prune_dead_experts_split(
+    router: &[u8],
+    router_dtype: WeightDType,
+    d_model: usize,
+    n_experts: usize,
+    top_k: usize,
+    projections: &[ExpertProjection],
+    dead_experts: &[u32],
+) -> Result<SplitPruneResult, ExpertPruneRefusal> {
+    if projections.is_empty() {
+        return Err(ExpertPruneRefusal::EmptyProjectionList);
+    }
+    let bw = router_dtype.byte_width();
+    let n = n_experts;
+
+    // Router byte-length check.
+    let expected_router = d_model * n * bw;
+    if router.len() != expected_router {
+        return Err(ExpertPruneRefusal::RouterShapeMismatch {
+            expected_elems: d_model * n,
+            actual_elems: router.len() / bw.max(1),
+        });
+    }
+
+    // Per-projection consistency: dtype + byte length. Validate ALL
+    // projections BEFORE any allocation so a downstream failure can't
+    // leave the caller with half-sliced state. (Inputs are immutable
+    // refs — there is nothing to roll back — but explicit upfront
+    // validation matches v2.6's two-phase-commit convention and gives
+    // clearer diagnostics than a mid-slice panic.)
+    for p in projections {
+        if p.dtype != router_dtype {
+            return Err(ExpertPruneRefusal::ProjectionDtypeMismatch {
+                name: p.name.clone(),
+                projection_dtype: p.dtype,
+                router_dtype,
+            });
+        }
+        let expected = n * p.block_elems * bw;
+        if p.data.len() != expected {
+            return Err(ExpertPruneRefusal::ProjectionShapeMismatch {
+                name: p.name.clone(),
+                expected_bytes: expected,
+                actual_bytes: p.data.len(),
+            });
+        }
+    }
+
+    // Dead-index range check.
+    for &d in dead_experts {
+        if d as usize >= n {
+            return Err(ExpertPruneRefusal::DeadIndexOutOfRange { index: d, n_experts: n });
+        }
+    }
+
+    // index_remap: survivors in ascending order (the single source of truth).
+    let dead_set: std::collections::BTreeSet<u32> = dead_experts.iter().copied().collect();
+    let index_remap: Vec<u32> = (0..n as u32).filter(|e| !dead_set.contains(e)).collect();
+    let n_live = index_remap.len();
+    if n_live == 0 {
+        return Err(ExpertPruneRefusal::AllExpertsDead);
+    }
+    if n_live < top_k {
+        return Err(ExpertPruneRefusal::InsufficientLiveExperts { n_live, top_k });
+    }
+
+    // Slice router: [d_model, n] -> [d_model, n_live], keep columns index_remap.
+    let mut sliced_router = vec![0u8; d_model * n_live * bw];
+    for r in 0..d_model {
+        for (j, &orig) in index_remap.iter().enumerate() {
+            let src = (r * n + orig as usize) * bw;
+            let dst = (r * n_live + j) * bw;
+            sliced_router[dst..dst + bw].copy_from_slice(&router[src..src + bw]);
+        }
+    }
+
+    // Slice each projection: keep block index_remap[j], in order.
+    let kept_projections: Vec<KeptProjection> = projections
+        .iter()
+        .map(|p| {
+            let blk = p.block_elems * bw;
+            let mut kept = vec![0u8; n_live * blk];
+            for (j, &orig) in index_remap.iter().enumerate() {
+                let src = orig as usize * blk;
+                let dst = j * blk;
+                kept[dst..dst + blk].copy_from_slice(&p.data[src..src + blk]);
+            }
+            KeptProjection {
+                name: p.name.clone(),
+                data: kept,
+                block_elems: p.block_elems,
+                dtype: p.dtype,
+            }
+        })
+        .collect();
+
+    Ok(SplitPruneResult {
+        sliced_router,
+        kept_projections,
+        index_remap,
+        n_live,
+        dead_experts: dead_set.into_iter().collect(),
+    })
+}
+
 use crate::weight_aware::{WeightEntry, WeightMap};
 use std::collections::HashMap;
+
+/// CPDT Part III v2.9: which experts-tensor layout the pass detected
+/// for a given MoE layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MoeExpertsLayout {
+    /// v1/v2: single packed `experts.weight` tensor.
+    Single,
+    /// v3: `experts.up.weight` + `experts.down.weight`.
+    UpDown,
+    /// v4: `experts.gate.weight` + `experts.up.weight` + `experts.down.weight`.
+    GateUpDown,
+}
 
 /// Per-MoE outcome of the prune pass (for reporting + tests).
 #[derive(Debug, Clone, PartialEq)]
 pub enum MoePruneOutcome {
-    Pruned { layer: String, dead: Vec<u32>, n_live: usize, dropped_bytes: u64 },
+    Pruned { layer: String, layout: MoeExpertsLayout, dead: Vec<u32>, n_live: usize, dropped_bytes: u64 },
     NoDeadExperts { layer: String },
     SkippedMissingRouter { layer: String },
     SkippedMissingExperts { layer: String },
@@ -177,34 +387,103 @@ pub fn prune_moe_weights_in_map(
         let info = moe_configs[&key].clone();
         let n = info.num_experts;
 
-        // Resolve router (drives detection + slice) and packed experts.
-        let router_entry = match resolve(weight_map, &key, &["router.weight", "gate.weight", "router", "gate"]) {
+        // CPDT Part III v2.9 fix F1 (HIGH adversarial review) — mirror the
+        // v3/v4 codegen lookup-key resolution from `expr/calls.rs`. The
+        // codegen v4 lowering uses `lookup_key = weight_prefix.or(cfg_key)`
+        // (see expr/calls.rs ≈ 1685); the pass MUST use the same key, else
+        // an HF Mixtral run (post-v2.7 auto-pack writes tensors under the
+        // HF prefix, NOT the moe_configs key) silently lands in
+        // `SkippedMissingRouter` and the pass no-ops. The moe_configs key
+        // itself stays load-bearing for `MoePruneOutcome.layer` (operator-
+        // facing) and the `moe_configs.get_mut(&key)` writeback below.
+        let lookup_key: &str = info.weight_prefix.as_deref().unwrap_or(&key);
+
+        // Resolve router (drives detection + slice).
+        let router_entry = match resolve(weight_map, lookup_key, &["router.weight", "gate.weight", "router", "gate"]) {
             Some(e) => e.clone(),
             None => {
                 outcomes.push(MoePruneOutcome::SkippedMissingRouter { layer: key });
                 continue;
             }
         };
-        let expert_name = ["experts.weight", "experts"]
+        let router_name = router_entry.name.clone();
+
+        // CPDT Part III v2.9 — layout detection. Precedence: v4 (gate+up+down) > v3 (up+down) > v1/v2 (single).
+        //
+        // Rationale for precedence: a v4 checkpoint contains all three
+        // (gate, up, down); a v3 checkpoint has only up+down (no gate);
+        // v1/v2 has a single packed `experts.weight`. Picking the
+        // widest layout that fully resolves means an HF Mixtral
+        // checkpoint (post-v2.7 auto-pack) gets pruned across all 3
+        // projections, while a legacy v1/v2 packed-single-tensor file
+        // still uses the original single-tensor path. PARTIAL v4
+        // matches (e.g., gate + up present but down missing) are
+        // structurally invalid — refuse loudly with PartialMultiProjLayout
+        // rather than silently downgrade to v3 or v1/v2. v2.9 fix F3
+        // (LOW adversarial review): OVER-COMPLETE matches (multi-proj
+        // + legacy single coexisting) are also refused — the legacy
+        // single would persist as dead orphan bytes after the multi-
+        // proj prune, inflating WeightMap.total_bytes() and confusing
+        // downstream passes that scan by total weight. Refuse rather
+        // than silently leave the orphan.
+        let gate_present = resolve(weight_map, lookup_key, &["experts.gate.weight", "experts.gate"]).is_some();
+        let up_present   = resolve(weight_map, lookup_key, &["experts.up.weight",   "experts.up"]).is_some();
+        let down_present = resolve(weight_map, lookup_key, &["experts.down.weight", "experts.down"]).is_some();
+        let single_present = ["experts.weight", "experts"]
             .iter()
-            .map(|s| format!("{key}.{s}"))
-            .find(|nm| weight_map.get(nm).is_some());
-        let expert_name = match expert_name {
-            Some(nm) => nm,
-            None => {
+            .any(|s| weight_map.get(&format!("{lookup_key}.{s}")).is_some());
+
+        let layout = match (gate_present, up_present, down_present, single_present) {
+            (true,  true,  true,  false) => MoeExpertsLayout::GateUpDown,
+            (false, true,  true,  false) => MoeExpertsLayout::UpDown,
+            (false, false, false, true) => MoeExpertsLayout::Single,
+            (false, false, false, false) => {
                 outcomes.push(MoePruneOutcome::SkippedMissingExperts { layer: key });
                 continue;
             }
+            // Partial multi-projection match OR over-complete (multi-proj
+            // + legacy single coexisting). Refuse loudly — silent
+            // downgrade in either direction leaves orphan tensors that
+            // either crash downstream FFI dispatch (partial match) or
+            // misreport total weight bytes (over-complete).
+            _ => {
+                let reason = format!(
+                    "ambiguous multi-projection MoE layout under '{lookup_key}': \
+                     gate={gate_present}, up={up_present}, down={down_present}, \
+                     single={single_present}. v4 needs exactly gate+up+down, v3 \
+                     needs exactly up+down, v1/v2 needs exactly the single \
+                     `experts.weight`. A partial or over-complete set would leave \
+                     orphan tensors after slicing.",
+                );
+                outcomes.push(MoePruneOutcome::Refused {
+                    layer: key,
+                    refusal: ExpertPruneRefusal::BundleInconsistent {
+                        reason,
+                    },
+                });
+                continue;
+            }
         };
-        let expert_entry = weight_map.get(&expert_name).unwrap().clone();
-        let router_name = router_entry.name.clone();
 
-        // Found-but-inconsistent router shape -> refusal.
-        if router_entry.shape.len() != 2 || router_entry.shape[1] != n {
+        // Found-but-inconsistent router shape -> refusal. v2.9 fix F4
+        // (LOW adversarial review): split into two refusals so the 1D
+        // case gets a meaningful diagnostic instead of a quadratic-
+        // in-n bogus "expected" count.
+        if router_entry.shape.len() != 2 {
+            outcomes.push(MoePruneOutcome::Refused {
+                layer: key,
+                refusal: ExpertPruneRefusal::RouterShapeNot2D {
+                    actual_ndim: router_entry.shape.len(),
+                    num_elements: router_entry.num_elements,
+                },
+            });
+            continue;
+        }
+        if router_entry.shape[1] != n {
             outcomes.push(MoePruneOutcome::Refused {
                 layer: key,
                 refusal: ExpertPruneRefusal::RouterShapeMismatch {
-                    expected_elems: router_entry.shape.first().copied().unwrap_or(0) * n,
+                    expected_elems: router_entry.shape[0] * n,
                     actual_elems: router_entry.num_elements,
                 },
             });
@@ -212,77 +491,134 @@ pub fn prune_moe_weights_in_map(
         }
         let d_model = router_entry.shape[0];
 
-        // v1 byte-slices with a single byte-width -> router and experts must
-        // share a dtype. Refuse mismatches rather than mis-slice the experts.
-        if expert_entry.dtype != router_entry.dtype {
-            outcomes.push(MoePruneOutcome::Refused {
-                layer: key,
-                refusal: ExpertPruneRefusal::MixedDtypeUnsupported {
+        // Resolve the per-projection WeightEntries for the detected layout.
+        // Order matters for the SplitPruneResult.kept_projections list
+        // and for the v3/v4 writeback below.
+        let projection_specs: Vec<(&[&str], &str)> = match layout {
+            MoeExpertsLayout::Single => vec![
+                (&["experts.weight", "experts"][..], "experts.weight"),
+            ],
+            MoeExpertsLayout::UpDown => vec![
+                (&["experts.up.weight", "experts.up"][..],     "experts.up.weight"),
+                (&["experts.down.weight", "experts.down"][..], "experts.down.weight"),
+            ],
+            MoeExpertsLayout::GateUpDown => vec![
+                (&["experts.gate.weight", "experts.gate"][..], "experts.gate.weight"),
+                (&["experts.up.weight",   "experts.up"][..],   "experts.up.weight"),
+                (&["experts.down.weight", "experts.down"][..], "experts.down.weight"),
+            ],
+        };
+        let resolved: Vec<WeightEntry> = projection_specs
+            .iter()
+            .map(|(suffixes, _)| resolve(weight_map, lookup_key, suffixes).unwrap().clone())
+            .collect();
+
+        // All projections must (a) be 2D `[n_experts, block_elems]`,
+        // (b) share dtype with router (single byte-width slice), and
+        // (c) pack evenly into n. v2.9 fix F2 (IMPORTANT adversarial
+        // review) — the 2D shape gate prevents silent 1D→2D reshape
+        // on writeback that would otherwise be non-monotonic (only
+        // changes shape when at least one expert is dead).
+        let mut refusal: Option<ExpertPruneRefusal> = None;
+        let mut block_elems_vec: Vec<usize> = Vec::with_capacity(resolved.len());
+        for entry in &resolved {
+            if entry.dtype != router_entry.dtype {
+                refusal = Some(ExpertPruneRefusal::ProjectionDtypeMismatch {
+                    name: entry.name.clone(),
+                    projection_dtype: entry.dtype,
                     router_dtype: router_entry.dtype,
-                    expert_dtype: expert_entry.dtype,
-                },
-            });
-            continue;
-        }
-        // Expert tensor must pack evenly into n blocks (clearer diagnostic than
-        // the downstream byte-length refusal).
-        if !expert_entry.num_elements.is_multiple_of(n.max(1)) {
-            outcomes.push(MoePruneOutcome::Refused {
-                layer: key,
-                refusal: ExpertPruneRefusal::BundleInconsistent {
+                });
+                break;
+            }
+            if entry.shape.len() != 2 || entry.shape[0] != n {
+                refusal = Some(ExpertPruneRefusal::ProjectionShapeNot2D {
+                    name: entry.name.clone(),
+                    actual_ndim: entry.shape.len(),
+                    num_elements: entry.num_elements,
+                });
+                break;
+            }
+            if !entry.num_elements.is_multiple_of(n.max(1)) {
+                refusal = Some(ExpertPruneRefusal::BundleInconsistent {
                     reason: format!(
-                        "expert num_elements {} not divisible by n_experts {n}",
-                        expert_entry.num_elements
+                        "projection '{}' num_elements {} not divisible by n_experts {n}",
+                        entry.name, entry.num_elements,
                     ),
-                },
-            });
+                });
+                break;
+            }
+            block_elems_vec.push(entry.num_elements / n.max(1));
+        }
+        if let Some(r) = refusal {
+            outcomes.push(MoePruneOutcome::Refused { layer: key, refusal: r });
             continue;
         }
-        let block_elems = expert_entry.num_elements / n.max(1);
 
         // Detect dead experts from the router weights alone.
         let affinities = crate::cpdt_expert::router_affinities(&router_entry, n as u32);
         let dead = crate::cpdt_expert::detect_dead_experts(&affinities, DEAD_EXPERT_THRESHOLD);
 
-        let bundle = MoeWeightBundle {
-            router: router_entry.data.clone(),
-            experts: expert_entry.data.clone(),
-            d_model,
-            n_experts: n,
-            expert_block_elems: block_elems,
-            dtype: router_entry.dtype,
-            top_k: info.top_k,
-        };
+        let projections: Vec<ExpertProjection> = resolved
+            .iter()
+            .zip(block_elems_vec.iter())
+            .map(|(entry, &be)| ExpertProjection {
+                name: entry.name.clone(),
+                data: entry.data.clone(),
+                block_elems: be,
+                dtype: entry.dtype,
+            })
+            .collect();
 
-        match prune_dead_experts(&bundle, &dead) {
+        match prune_dead_experts_split(
+            &router_entry.data,
+            router_entry.dtype,
+            d_model,
+            n,
+            info.top_k,
+            &projections,
+            &dead,
+        ) {
             Err(refusal) => outcomes.push(MoePruneOutcome::Refused { layer: key, refusal }),
             Ok(res) if res.dead_experts.is_empty() => {
                 outcomes.push(MoePruneOutcome::NoDeadExperts { layer: key });
             }
             Ok(res) => {
-                let dropped_bytes = router_entry.data.len().saturating_sub(res.sliced_router.len()) as u64
-                    + expert_entry.data.len().saturating_sub(res.kept_experts.len()) as u64;
-                // Mutate the WeightMap entries in place (smaller bundle).
+                let dropped_router_bytes = router_entry.data.len().saturating_sub(res.sliced_router.len()) as u64;
+                let dropped_proj_bytes: u64 = resolved
+                    .iter()
+                    .zip(res.kept_projections.iter())
+                    .map(|(in_e, kp)| in_e.data.len().saturating_sub(kp.data.len()) as u64)
+                    .sum();
+                let dropped_bytes = dropped_router_bytes + dropped_proj_bytes;
+
+                // Writeback: mutate WeightMap in place. Use the
+                // RESOLVED entry's name (preserving the suffix the
+                // weight file actually used — `.weight` or bare) so the
+                // downstream codegen lookup at expr/calls.rs still
+                // resolves them.
                 let new_router = WeightEntry::new(
                     router_name.clone(),
                     res.sliced_router,
                     vec![d_model, res.n_live],
                     router_entry.dtype,
                 );
-                let new_experts = WeightEntry::new(
-                    expert_name.clone(),
-                    res.kept_experts,
-                    vec![res.n_live, block_elems],
-                    expert_entry.dtype,
-                );
                 weight_map.insert(new_router);
-                weight_map.insert(new_experts);
-                // Thread n_live into the config (forward-looking consistency).
+                for (in_e, kp) in resolved.iter().zip(res.kept_projections.into_iter()) {
+                    let new_entry = WeightEntry::new(
+                        in_e.name.clone(),
+                        kp.data,
+                        vec![res.n_live, kp.block_elems],
+                        kp.dtype,
+                    );
+                    weight_map.insert(new_entry);
+                }
+
                 if let Some(cfg) = moe_configs.get_mut(&key) {
                     cfg.num_experts = res.n_live;
                 }
                 outcomes.push(MoePruneOutcome::Pruned {
                     layer: key,
+                    layout,
                     dead: res.dead_experts,
                     n_live: res.n_live,
                     dropped_bytes,
@@ -297,8 +633,8 @@ pub fn prune_moe_weights_in_map(
 pub fn report_outcomes(outcomes: &[MoePruneOutcome]) {
     for o in outcomes {
         match o {
-            MoePruneOutcome::Pruned { layer, dead, n_live, dropped_bytes } => eprintln!(
-                "[cpdt] moe '{layer}': pruned experts {dead:?} (affinity < {DEAD_EXPERT_THRESHOLD}) \
+            MoePruneOutcome::Pruned { layer, layout, dead, n_live, dropped_bytes } => eprintln!(
+                "[cpdt] moe '{layer}' ({layout:?}): pruned experts {dead:?} (affinity < {DEAD_EXPERT_THRESHOLD}) \
                  -> n_live={n_live}, dropped {dropped_bytes} bytes"
             ),
             MoePruneOutcome::NoDeadExperts { layer } => {
