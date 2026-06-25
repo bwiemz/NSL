@@ -16,6 +16,21 @@ use nsl_codegen::fused_linear_ce::{
     synthesize_fused_linear_ce_backward_ptx, synthesize_fused_linear_ce_ptx,
 };
 
+/// Strip the trailing null byte that the public synthesizers append for
+/// `cuModuleLoadData`. The snapshot tests below pin the *kernel bytes*
+/// (the v1 emitter contract), not the null-termination contract — that
+/// contract is pinned separately by the unit tests in `fused_linear_ce.rs`
+/// (`*_ptx_is_null_terminated_*`). Stripping the null here preserves the
+/// snapshot semantics across the null-termination change.
+fn strip_trailing_nul(ptx: &[u8]) -> &[u8] {
+    assert_eq!(
+        ptx.last(),
+        Some(&0u8),
+        "synthesizer contract: PTX must be null-terminated for cuModuleLoadData",
+    );
+    &ptx[..ptx.len() - 1]
+}
+
 /// The exact config used by `tests/fused_linear_ce_numerical.rs` — the v1
 /// GPU numerical test. Capturing this specific shape's PTX gates that the
 /// GPU test will continue to see the same kernel bytes.
@@ -40,7 +55,7 @@ fn v1_forward_ptx_at_v4096_matches_snapshot() {
     assert!(!cfg.is_large_vocab(), "this config MUST route to v1 path");
 
     let ptx = synthesize_fused_linear_ce_ptx(&cfg);
-    let s = std::str::from_utf8(&ptx).expect("PTX is ASCII");
+    let s = std::str::from_utf8(strip_trailing_nul(&ptx)).expect("PTX is ASCII");
     insta::assert_snapshot!("v1_forward_v4096_h128_t1024", s);
 }
 
@@ -48,7 +63,7 @@ fn v1_forward_ptx_at_v4096_matches_snapshot() {
 fn v1_backward_ptx_at_v4096_matches_snapshot() {
     let cfg = v1_test_cfg();
     let ptx = synthesize_fused_linear_ce_backward_ptx(&cfg);
-    let s = std::str::from_utf8(&ptx).expect("PTX is ASCII");
+    let s = std::str::from_utf8(strip_trailing_nul(&ptx)).expect("PTX is ASCII");
     insta::assert_snapshot!("v1_backward_v4096_h128_t1024", s);
 }
 
@@ -72,7 +87,7 @@ fn v1_forward_ptx_at_threshold_v8192_matches_snapshot() {
     assert!(!cfg.is_large_vocab(), "threshold value MUST remain v1 path");
 
     let ptx = synthesize_fused_linear_ce_ptx(&cfg);
-    let s = std::str::from_utf8(&ptx).expect("PTX is ASCII");
+    let s = std::str::from_utf8(strip_trailing_nul(&ptx)).expect("PTX is ASCII");
     insta::assert_snapshot!("v1_forward_v8192_at_threshold", s);
 }
 
@@ -96,7 +111,7 @@ fn large_vocab_routing_just_above_threshold() {
     assert!(cfg.is_large_vocab(), "above-threshold MUST route to large-vocab");
 
     let ptx = synthesize_fused_linear_ce_ptx(&cfg);
-    let s = std::str::from_utf8(&ptx).expect("PTX is ASCII");
+    let s = std::str::from_utf8(strip_trailing_nul(&ptx)).expect("PTX is ASCII");
     // Header MUST appear exactly once (single module containing both kernels).
     assert_eq!(s.matches(".version 7.0").count(), 1);
     // Both kernels MUST be present.

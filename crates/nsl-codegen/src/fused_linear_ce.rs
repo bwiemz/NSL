@@ -440,17 +440,26 @@ impl FusedLinearCEConfig {
 ///      After the tile loop, compute `loss = -(logit_at_target - lse)` and
 ///      write to `loss_out` and `lse_out` (for backward reuse).
 pub fn synthesize_fused_linear_ce_ptx(cfg: &FusedLinearCEConfig) -> Vec<u8> {
+    // Contract: returned bytes are null-terminated, matching the convention
+    // established by `backend_ptx::lower_kir_to_ptx`. The CUDA driver entry
+    // point `cuModuleLoadData` reads the PTX module bytes as a C string until
+    // it hits a `0` byte — passing a non-terminated buffer is UB (the driver
+    // reads past the buffer end). The large-vocab branch null-terminates
+    // itself; only the small-vocab branch needs the explicit push here.
     if cfg.is_large_vocab() {
         synthesize_large_vocab_forward_ptx(cfg)
     } else {
-        match cfg.dtype {
-            // F32 path is BYTE-IDENTICAL to pre-Sprint-v3-2 — calls the
-            // untouched emitter. Sprint 3's v1 byte-identity snapshot pins
-            // this contract.
+        let mut bytes = match cfg.dtype {
+            // F32 path's *kernel bytes* remain BYTE-IDENTICAL to pre-Sprint-v3-2
+            // — calls the untouched emitter. Sprint 3's v1 byte-identity
+            // snapshot pins those kernel bytes; the snapshot test strips the
+            // trailing null before asserting so the contract is preserved.
             Dtype::F32 => emit_fwd_kernel(cfg).into_bytes(),
             Dtype::F16 => emit_fwd_kernel_f16(cfg).into_bytes(),
             Dtype::Bf16 => emit_fwd_kernel_bf16(cfg).into_bytes(),
-        }
+        };
+        bytes.push(0);
+        bytes
     }
 }
 
@@ -462,11 +471,15 @@ pub fn synthesize_fused_linear_ce_ptx(cfg: &FusedLinearCEConfig) -> Vec<u8> {
 /// separately-named `.extern .shared` allocations so the module compiles
 /// as one ptxas TU.
 pub fn synthesize_large_vocab_forward_ptx(cfg: &FusedLinearCEConfig) -> Vec<u8> {
+    // Contract: returned bytes are null-terminated, matching the convention
+    // established by `backend_ptx::lower_kir_to_ptx`. See
+    // `synthesize_fused_linear_ce_ptx` for the rationale.
     let mut out = String::new();
     out.push_str(&cfg.ptx_header());
     out.push('\n');
     match cfg.dtype {
-        // F32 path is BYTE-IDENTICAL to pre-Sprint-v3-2 large-vocab — gated by
+        // F32 path's *kernel bytes* remain BYTE-IDENTICAL to pre-Sprint-v3-2
+        // large-vocab — gated by
         // `tests/fused_linear_ce_large_vocab_numerical.rs::ptx_byte_identity_at_v4096`
         // (uses the small-vocab routing) and the structural large-vocab ptxas
         // test at v=49152. Calls the untouched emitters.
@@ -486,7 +499,9 @@ pub fn synthesize_large_vocab_forward_ptx(cfg: &FusedLinearCEConfig) -> Vec<u8> 
             out.push_str(&emit_large_finalize_kernel_bf16(cfg));
         }
     }
-    out.into_bytes()
+    let mut bytes = out.into_bytes();
+    bytes.push(0);
+    bytes
 }
 
 /// Synthesise the backward PTX for the fused linear-CE kernel.
@@ -509,13 +524,19 @@ pub fn synthesize_large_vocab_forward_ptx(cfg: &FusedLinearCEConfig) -> Vec<u8> 
 /// then scatters `dx += dlogits_v * W[v, :]` and
 /// `dW[v, :] += dlogits_v * x[row, :]` via `red.global.add.f32`.
 pub fn synthesize_fused_linear_ce_backward_ptx(cfg: &FusedLinearCEConfig) -> Vec<u8> {
-    match cfg.dtype {
-        // F32 path is BYTE-IDENTICAL to pre-Sprint-v3-2 — pinned by
-        // `tests/fused_linear_ce_v1_byte_identity.rs::v1_backward_*`.
+    // Contract: returned bytes are null-terminated, matching the convention
+    // established by `backend_ptx::lower_kir_to_ptx`. See
+    // `synthesize_fused_linear_ce_ptx` for the rationale.
+    let mut bytes = match cfg.dtype {
+        // F32 path's *kernel bytes* remain BYTE-IDENTICAL to pre-Sprint-v3-2
+        // — pinned by `tests/fused_linear_ce_v1_byte_identity.rs::v1_backward_*`,
+        // which strips the trailing null before snapshot assertion.
         Dtype::F32 => emit_bwd_kernel(cfg).into_bytes(),
         Dtype::F16 => emit_bwd_kernel_f16(cfg).into_bytes(),
         Dtype::Bf16 => emit_bwd_kernel_bf16(cfg).into_bytes(),
-    }
+    };
+    bytes.push(0);
+    bytes
 }
 
 // ─── PTX emission — forward ───────────────────────────────────────────────────
@@ -4113,6 +4134,129 @@ mod tests {
         let bwd = synthesize_fused_linear_ce_backward_ptx(&cfg);
         for byte in fwd.iter().chain(bwd.iter()) {
             assert!(*byte < 128, "non-ASCII byte 0x{byte:02x} found in PTX");
+        }
+    }
+
+    // ── Null-termination contract ─────────────────────────────────────────
+    //
+    // Every public synthesizer in this module returns null-terminated PTX
+    // bytes so they can be passed straight to `cuModuleLoadData` without
+    // the caller having to remember to append `0u8`. This matches the
+    // convention established by `backend_ptx::lower_kir_to_ptx`. Forgetting
+    // the null is silent UB (CUDA driver reads past the buffer) — pin every
+    // (synthesizer × dtype × routing) combination so any future emitter
+    // that bypasses the synthesizer wrapper trips this test.
+
+    fn null_term_cfg(dtype: Dtype, large: bool) -> FusedLinearCEConfig {
+        FusedLinearCEConfig {
+            // 4096 (small-vocab path), 49152 (large-vocab path).
+            vocab_size: if large { 49152 } else { 4096 },
+            hidden_size: 128,
+            seq_len: 32,
+            batch_size: 1,
+            vocab_tile: if large { 128 } else { 1024 },
+            gpu_sm: 80,
+            dtype,
+            ignore_index: -100,
+            max_vocab_v1: if large { MAX_VOCAB_HARD_CEILING } else { 8192 },
+        }
+    }
+
+    #[test]
+    fn fwd_ptx_is_null_terminated_small_vocab_f32() {
+        let cfg = null_term_cfg(Dtype::F32, false);
+        let bytes = synthesize_fused_linear_ce_ptx(&cfg);
+        assert_eq!(bytes.last(), Some(&0u8), "small-vocab F32 forward must end with NUL");
+    }
+
+    #[test]
+    fn fwd_ptx_is_null_terminated_small_vocab_f16() {
+        let cfg = null_term_cfg(Dtype::F16, false);
+        let bytes = synthesize_fused_linear_ce_ptx(&cfg);
+        assert_eq!(bytes.last(), Some(&0u8), "small-vocab F16 forward must end with NUL");
+    }
+
+    #[test]
+    fn fwd_ptx_is_null_terminated_small_vocab_bf16() {
+        let cfg = null_term_cfg(Dtype::Bf16, false);
+        let bytes = synthesize_fused_linear_ce_ptx(&cfg);
+        assert_eq!(bytes.last(), Some(&0u8), "small-vocab Bf16 forward must end with NUL");
+    }
+
+    #[test]
+    fn fwd_ptx_is_null_terminated_large_vocab_f32() {
+        let cfg = null_term_cfg(Dtype::F32, true);
+        assert!(cfg.is_large_vocab());
+        let bytes = synthesize_fused_linear_ce_ptx(&cfg);
+        assert_eq!(bytes.last(), Some(&0u8), "large-vocab F32 forward must end with NUL");
+        // Pin no double-null — dispatcher delegates without re-pushing.
+        let trailing_nulls = bytes.iter().rev().take_while(|&&b| b == 0).count();
+        assert_eq!(trailing_nulls, 1, "dispatcher must not double-null the large-vocab path");
+    }
+
+    #[test]
+    fn fwd_ptx_is_null_terminated_large_vocab_f16() {
+        let cfg = null_term_cfg(Dtype::F16, true);
+        let bytes = synthesize_fused_linear_ce_ptx(&cfg);
+        assert_eq!(bytes.last(), Some(&0u8), "large-vocab F16 forward must end with NUL");
+    }
+
+    #[test]
+    fn fwd_ptx_is_null_terminated_large_vocab_bf16() {
+        let cfg = null_term_cfg(Dtype::Bf16, true);
+        let bytes = synthesize_fused_linear_ce_ptx(&cfg);
+        assert_eq!(bytes.last(), Some(&0u8), "large-vocab Bf16 forward must end with NUL");
+    }
+
+    #[test]
+    fn large_vocab_synth_is_null_terminated_direct_call() {
+        // Direct call to the large-vocab synthesizer (not via dispatcher).
+        let cfg = null_term_cfg(Dtype::F32, true);
+        let bytes = synthesize_large_vocab_forward_ptx(&cfg);
+        assert_eq!(bytes.last(), Some(&0u8), "synthesize_large_vocab_forward_ptx must end with NUL");
+    }
+
+    #[test]
+    fn bwd_ptx_is_null_terminated_f32() {
+        let cfg = null_term_cfg(Dtype::F32, false);
+        let bytes = synthesize_fused_linear_ce_backward_ptx(&cfg);
+        assert_eq!(bytes.last(), Some(&0u8), "F32 backward must end with NUL");
+    }
+
+    #[test]
+    fn bwd_ptx_is_null_terminated_f16() {
+        let cfg = null_term_cfg(Dtype::F16, false);
+        let bytes = synthesize_fused_linear_ce_backward_ptx(&cfg);
+        assert_eq!(bytes.last(), Some(&0u8), "F16 backward must end with NUL");
+    }
+
+    #[test]
+    fn bwd_ptx_is_null_terminated_bf16() {
+        let cfg = null_term_cfg(Dtype::Bf16, false);
+        let bytes = synthesize_fused_linear_ce_backward_ptx(&cfg);
+        assert_eq!(bytes.last(), Some(&0u8), "Bf16 backward must end with NUL");
+    }
+
+    #[test]
+    fn ptx_has_no_interior_nuls() {
+        // CUDA driver stops at the first NUL — if the kernel text itself
+        // contains an embedded NUL, the module load truncates the bytes
+        // silently. Pin that interior NULs never appear (the trailing NUL
+        // is the ONLY 0 byte in a well-formed PTX module).
+        let cfg = default_cfg();
+        for synth_name in ["fwd", "bwd"] {
+            let bytes = if synth_name == "fwd" {
+                synthesize_fused_linear_ce_ptx(&cfg)
+            } else {
+                synthesize_fused_linear_ce_backward_ptx(&cfg)
+            };
+            let n = bytes.len();
+            for (i, b) in bytes[..n - 1].iter().enumerate() {
+                assert_ne!(
+                    *b, 0u8,
+                    "interior NUL at byte {i} in {synth_name} PTX would truncate cuModuleLoadData"
+                );
+            }
         }
     }
 }
