@@ -1631,7 +1631,7 @@ impl Compiler<'_> {
                         None
                     }
                 });
-            let (cfg_key, num_experts, top_k, capacity_factor, activation) =
+            let (cfg_key, num_experts, top_k, capacity_factor, activation, weight_prefix) =
                 match &config_with_key {
                     Some((k, info)) => (
                         Some(k.clone()),
@@ -1639,8 +1639,9 @@ impl Compiler<'_> {
                         info.top_k,
                         info.capacity_factor,
                         info.activation,
+                        info.weight_prefix.clone(),
                     ),
-                    None => (None, 8, 2, 1.25f32, crate::moe::MoeActivation::Silu),
+                    None => (None, 8, 2, 1.25f32, crate::moe::MoeActivation::Silu, None),
                 };
 
             // SwiGLU is structurally `silu(gate) * up @ down` — the
@@ -1675,8 +1676,15 @@ impl Compiler<'_> {
                 capacity_factor.to_bits() as i64,
             );
 
+            // CPDT Part III v2.7 — `@moe(weight_prefix="…")` overrides
+            // the moe_configs key for WeightMap lookups. When Some,
+            // the v4 arm derives dims under that prefix (so a user
+            // running against an HF Mixtral safetensors file can say
+            // `weight_prefix="model.layers.0.block_sparse_moe"` even
+            // though NSL field names cannot contain `.`).
+            let lookup_key = weight_prefix.as_ref().or(cfg_key.as_ref()).cloned();
             let v4_dims = if let (Some(key), Some(weight_map)) =
-                (cfg_key.as_ref(), self.features.weight_map.as_ref())
+                (lookup_key.as_ref(), self.features.weight_map.as_ref())
             {
                 crate::moe::derive_v4_dims(weight_map, key, num_experts)
             } else {
@@ -1715,17 +1723,19 @@ impl Compiler<'_> {
             return Err(crate::error::CodegenError::new(format!(
                 "moe_dispatch_swiglu: v4 (SwiGLU) requires resolvable router + \
                  experts.gate + experts.up + experts.down entries in the WeightMap. \
-                 None of the standard names resolved under the MoeConfig key{}, or \
+                 None of the standard names resolved under the lookup prefix{}, or \
                  their shapes were inconsistent (router must be [hidden, num_experts]; \
                  each of experts.gate / experts.up must be [num_experts, hidden * \
                  intermediate]; experts.down must be [num_experts, intermediate * \
                  hidden]; all three projections must agree on intermediate). Pass \
-                 --weights with a safetensors bundle containing <key>.router.weight \
-                 AND <key>.experts.gate.weight AND <key>.experts.up.weight AND \
-                 <key>.experts.down.weight (with `.weight` suffix optional). Raw HF \
-                 Mixtral safetensors use per-expert experts.{{e}}.w1/w2/w3 — those \
-                 need a packing pre-step.",
-                cfg_key
+                 --weights with a safetensors bundle containing <prefix>.router.weight \
+                 AND <prefix>.experts.gate.weight AND <prefix>.experts.up.weight AND \
+                 <prefix>.experts.down.weight (with `.weight` suffix optional). Raw HF \
+                 Mixtral safetensors use per-expert experts.{{e}}.w1/w2/w3 — v2.6's \
+                 packing primitive (auto-run at WeightMap::load since v2.7) rewrites \
+                 them in place under the HF prefix; declare `@moe(weight_prefix=\"...\")` \
+                 in source to point this lookup at that prefix.",
+                lookup_key
                     .as_deref()
                     .map(|k| format!(" '{}'", k))
                     .unwrap_or_default(),
@@ -1792,20 +1802,29 @@ impl Compiler<'_> {
                         None
                     }
                 });
-            let (cfg_key, num_experts, top_k, capacity_factor, activation) = match &config_with_key {
-                Some((k, info)) => (
-                    Some(k.clone()),
-                    info.num_experts,
-                    info.top_k,
-                    info.capacity_factor,
-                    info.activation,
-                ),
-                // No MoeConfig matched. Fall back to single-MoE defaults
-                // for the numeric fields and the default activation
-                // (SiLU). The error path below still fires loud when v3
-                // dims can't be derived.
-                None => (None, 8, 2, 1.25f32, crate::moe::MoeActivation::default()),
-            };
+            let (cfg_key, num_experts, top_k, capacity_factor, activation, weight_prefix) =
+                match &config_with_key {
+                    Some((k, info)) => (
+                        Some(k.clone()),
+                        info.num_experts,
+                        info.top_k,
+                        info.capacity_factor,
+                        info.activation,
+                        info.weight_prefix.clone(),
+                    ),
+                    // No MoeConfig matched. Fall back to single-MoE defaults
+                    // for the numeric fields and the default activation
+                    // (SiLU). The error path below still fires loud when v3
+                    // dims can't be derived.
+                    None => (
+                        None,
+                        8,
+                        2,
+                        1.25f32,
+                        crate::moe::MoeActivation::default(),
+                        None,
+                    ),
+                };
 
             let num_experts_val = builder
                 .ins()
@@ -1818,8 +1837,14 @@ impl Compiler<'_> {
                 capacity_factor.to_bits() as i64,
             );
 
+            // CPDT Part III v2.7 — `@moe(weight_prefix="…")` overrides
+            // the moe_configs key for WeightMap lookups (same pattern as
+            // the v4 arm above). Lets a user point the v3 lowering at
+            // an HF-style prefix that contains `.` (NSL field names
+            // can't).
+            let lookup_key = weight_prefix.as_ref().or(cfg_key.as_ref()).cloned();
             let v3_dims = if let (Some(key), Some(weight_map)) =
-                (cfg_key.as_ref(), self.features.weight_map.as_ref())
+                (lookup_key.as_ref(), self.features.weight_map.as_ref())
             {
                 crate::moe::derive_v3_dims(weight_map, key, num_experts)
             } else {
@@ -1872,14 +1897,16 @@ impl Compiler<'_> {
             return Err(crate::error::CodegenError::new(format!(
                 "moe_dispatch_ffn: v3 (paper-faithful FFN) requires resolvable router + \
                  experts.up + experts.down entries in the WeightMap. None of the standard \
-                 names resolved under the MoeConfig key{}, or their shapes were inconsistent \
+                 names resolved under the lookup prefix{}, or their shapes were inconsistent \
                  (router must be [hidden, num_experts]; experts.up must be [num_experts, \
                  hidden * intermediate]; experts.down must be [num_experts, intermediate * \
                  hidden]; up- and down-derived intermediate dims must agree). Pass --weights \
-                 with a safetensors bundle that contains <key>.router.weight AND \
-                 <key>.experts.up.weight AND <key>.experts.down.weight (with `.weight` \
-                 suffix optional).",
-                cfg_key
+                 with a safetensors bundle that contains <prefix>.router.weight AND \
+                 <prefix>.experts.up.weight AND <prefix>.experts.down.weight (with `.weight` \
+                 suffix optional). Declare `@moe(weight_prefix=\"...\")` in source to point \
+                 this lookup at a non-NSL-identifier prefix (e.g., an HF Mixtral path \
+                 segment with dots).",
+                lookup_key
                     .as_deref()
                     .map(|k| format!(" '{}'", k))
                     .unwrap_or_default(),

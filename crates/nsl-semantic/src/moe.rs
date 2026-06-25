@@ -120,6 +120,26 @@ pub fn validate_moe_decorator(
                             );
                         }
                     }
+                    // CPDT Part III v2.7 — explicit WeightMap-key
+                    // prefix override for the v3/v4 lowering. Required
+                    // when the user's safetensors key segments contain
+                    // `.` (e.g., HF Mixtral `model.layers.0.
+                    // block_sparse_moe`) because NSL field names cannot.
+                    // Empty-string is REJECTED at the codegen layer's
+                    // extract_moe_decorator path; we only validate the
+                    // STRING-LITERAL-NESS here (the codegen layer does
+                    // the empty-string check so the error message can
+                    // reference the v2.7 use case).
+                    "weight_prefix" => {
+                        if !matches!(arg.value.kind, ExprKind::StringLiteral(_)) {
+                            diagnostics.push(
+                                Diagnostic::error(
+                                    "@moe: weight_prefix must be a string literal".to_string(),
+                                )
+                                .with_label(arg.span, "expected string literal"),
+                            );
+                        }
+                    }
                     _ => {
                         diagnostics.push(
                             Diagnostic::error(format!("@moe: unknown argument '{}'", aname))

@@ -438,27 +438,6 @@ fn validate_all_projections(
             source_keys.push(key);
         }
 
-        // Refuse if MORE per-expert entries exist than declared. A
-        // user mistyping `@moe(num_experts=4)` against an 8-expert
-        // checkpoint would otherwise silently get a 4-expert build
-        // with the other 4 leaking as orphans. We scan only the
-        // immediate next index (num_experts) because finding even one
-        // extra is enough to refuse — the user's input is misconfigured.
-        let extra_key = format!(
-            "{}.experts.{}.{}.weight",
-            hf_prefix,
-            num_experts,
-            proj.hf_suffix(),
-        );
-        if weight_map.get(&extra_key).is_some() {
-            return Err(PackError::ExtraExpertsPresent {
-                hf_prefix: hf_prefix.to_string(),
-                declared_num_experts: num_experts,
-                found_extra_index: num_experts,
-                offending_key: extra_key,
-            });
-        }
-
         let shape = expected_shape.expect("first-expert pass sets expected_shape");
         let dtype = expected_dtype.expect("first-expert pass sets expected_dtype");
         plans.push(ProjectionPlan {
@@ -468,6 +447,44 @@ fn validate_all_projections(
             dtype,
             element_bytes: dtype.byte_width(),
             source_keys,
+        });
+    }
+
+    // Unified extra-experts scan. The v2.6 implementation probed only
+    // the immediate next index (`num_experts`) per projection, which
+    // silently MISSED gapped sets like {0, 1, 3} (expert 2 missing
+    // entirely, expert 3 fully present). Scanning the full WeightMap
+    // for any `<hf_prefix>.experts.<N>.w[123].weight` where
+    // N >= num_experts catches every leak — pinned by the v2.7
+    // adversarial-review F1 fix.
+    let prefix_search = format!("{}.experts.", hf_prefix);
+    let mut max_extra: Option<usize> = None;
+    for name in weight_map.names() {
+        let Some(rest) = name.strip_prefix(&prefix_search) else {
+            continue;
+        };
+        let Some((idx_str, tail)) = rest.split_once('.') else {
+            continue;
+        };
+        if !matches!(tail, "w1.weight" | "w2.weight" | "w3.weight") {
+            continue;
+        }
+        let Ok(idx) = idx_str.parse::<usize>() else {
+            continue;
+        };
+        if idx >= num_experts {
+            max_extra = Some(max_extra.map_or(idx, |m| m.max(idx)));
+        }
+    }
+    if let Some(idx) = max_extra {
+        // Report the first w-suffix's key. Picking deterministically
+        // matters for stable error messages.
+        let offending_key = format!("{}{}.w1.weight", prefix_search, idx);
+        return Err(PackError::ExtraExpertsPresent {
+            hf_prefix: hf_prefix.to_string(),
+            declared_num_experts: num_experts,
+            found_extra_index: idx,
+            offending_key,
         });
     }
 
@@ -550,6 +567,170 @@ pub fn pack_hf_mixtral_experts(
         inserted_names,
         removed_names,
     })
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// CPDT Part III v2.7 — auto-detection
+// ─────────────────────────────────────────────────────────────────────────
+
+/// One detected HF Mixtral MoE block in a WeightMap. Produced by
+/// [`detect_hf_mixtral_blocks`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DetectedHfMixtralBlock {
+    /// HF prefix, e.g. `model.layers.0.block_sparse_moe`.
+    pub hf_prefix: String,
+    /// Highest expert index + 1. The detector requires the contiguous
+    /// run `experts.{0..num_experts}.w{1,2,3}.weight` to all be
+    /// present; gaps cause the block to be rejected from the
+    /// detected set (the pack call would refuse with MissingExpert
+    /// anyway).
+    pub num_experts: usize,
+}
+
+/// Scan a `WeightMap` for HF Mixtral MoE blocks. A block is detected
+/// when every key in the contiguous run `<prefix>.experts.{0..N}.w{1,
+/// 2,3}.weight` is present for some `N ≥ 1` AND no `<prefix>.experts.N.
+/// w*.weight` exists (i.e., the run is exact, not truncated to a
+/// caller's `num_experts`). The detector does NOT validate per-expert
+/// shapes / dtypes — that's the packing primitive's job. A detected
+/// block is just "a contiguous run of HF-shaped names that the user
+/// probably wants packed."
+///
+/// Detection is read-only. The returned `DetectedHfMixtralBlock`s are
+/// sorted by `hf_prefix` for deterministic iteration order under
+/// downstream consumers.
+///
+/// Gotchas pinned by the v2.7 adversarial review:
+/// - If a prefix has w1/w2/w3 for experts {0, 1, 3} (i.e., expert 2
+///   missing entirely, expert 3 fully present), the detector reports
+///   `num_experts=2` (the largest contiguous run starting at 0). The
+///   caller's pack invocation then trips `ExtraExpertsPresent` because
+///   `validate_all_projections`'s unified scan (post-v2.7-F1 fix)
+///   finds the orphan at index 3 even though it isn't the immediate
+///   next index. That's the right behavior — the user fixes their
+///   safetensors, not their NSL source.
+/// - Already-packed entries (`<prefix>.experts.gate.weight` etc.) are
+///   ignored by detection (the parser requires a NUMERIC expert index;
+///   `gate`/`up`/`down` fail the `parse::<usize>()` arm).
+/// - The detector requires a NON-EMPTY prefix segment before
+///   `.experts.` (real HF Mixtral safetensors always include a
+///   `model.layers.X.block_sparse_moe` style prefix; bare
+///   `experts.0.w1.weight` keys are silently skipped). Documented per
+///   the v2.7 adversarial-review F3 fix.
+/// - The detector tolerates ANY (non-empty) name segments before the
+///   trailing `.experts.{N}.w{1,2,3}.weight` suffix —
+///   `model.layers.0.block_sparse_moe`, `transformer.h.0.moe`,
+///   `experts_layer_0` all detect identically.
+pub fn detect_hf_mixtral_blocks(weight_map: &WeightMap) -> Vec<DetectedHfMixtralBlock> {
+    use std::collections::BTreeMap;
+    // For each candidate prefix, tracks max(expert_index_seen) and
+    // whether ALL three w-suffixes were observed for every index in
+    // 0..=max_index. We accumulate into a per-(prefix, expert_index)
+    // bitmask (bit 0 = w1 seen, bit 1 = w2 seen, bit 2 = w3 seen) and
+    // post-process to find the largest contiguous run.
+    let mut per_prefix: BTreeMap<String, BTreeMap<usize, u8>> = BTreeMap::new();
+
+    for name in weight_map.names() {
+        // Look for the `.experts.<N>.w<1|2|3>.weight` suffix; the prefix
+        // is everything to the left of `.experts.`.
+        let Some((prefix, rest)) = name.rsplit_once(".experts.") else {
+            continue;
+        };
+        // `rest` must look like `<digits>.w[123].weight`.
+        let Some((idx_str, tail)) = rest.split_once('.') else {
+            continue;
+        };
+        let Ok(expert_index) = idx_str.parse::<usize>() else {
+            // Not a numeric expert index — already-packed entries
+            // (`experts.gate.weight`, `experts.up.weight`,
+            // `experts.down.weight`) take this branch.
+            continue;
+        };
+        let suffix_bit = match tail {
+            "w1.weight" => 1u8 << 0,
+            "w2.weight" => 1u8 << 1,
+            "w3.weight" => 1u8 << 2,
+            _ => continue, // Bias tensor or other HF artifact.
+        };
+        let by_prefix = per_prefix.entry(prefix.to_string()).or_default();
+        let entry_bits = by_prefix.entry(expert_index).or_insert(0);
+        *entry_bits |= suffix_bit;
+    }
+
+    let mut detected: Vec<DetectedHfMixtralBlock> = Vec::new();
+    for (prefix, by_index) in &per_prefix {
+        // Largest N such that experts 0..N are all complete (all 3
+        // w-suffixes seen). Stops at the first missing-or-incomplete
+        // index. If expert 0 itself is incomplete, the block is not
+        // detected.
+        const ALL_THREE: u8 = 0b111;
+        let mut n_complete = 0usize;
+        loop {
+            match by_index.get(&n_complete) {
+                Some(&bits) if bits == ALL_THREE => {
+                    n_complete += 1;
+                }
+                _ => break,
+            }
+        }
+        if n_complete >= 1 {
+            detected.push(DetectedHfMixtralBlock {
+                hf_prefix: prefix.clone(),
+                num_experts: n_complete,
+            });
+        }
+    }
+    detected
+}
+
+/// Outcome of a `pack_all_detected_hf_mixtral_blocks` call: which
+/// blocks were detected, which packs succeeded, and which failed (with
+/// the per-block `PackError`).
+#[derive(Debug, Clone)]
+pub struct AutoPackOutcome {
+    /// Successfully packed blocks (in detection order). Each entry's
+    /// `hf_prefix` equals the value used as both `hf_prefix` and
+    /// `target_prefix` in the underlying `pack_hf_mixtral_experts`
+    /// call — the auto-pack always rewrites in place.
+    pub packed: Vec<(DetectedHfMixtralBlock, PackOutcome)>,
+    /// Blocks the detector found but the packer refused. The auto-pack
+    /// path does NOT short-circuit on the first error — it tries every
+    /// detected block and reports all failures, so a user with one bad
+    /// MoE block (e.g., dtype mismatch on layer 5) still gets the
+    /// other layers packed.
+    pub failed: Vec<(DetectedHfMixtralBlock, PackError)>,
+}
+
+/// Scan `weight_map` for HF Mixtral blocks (via
+/// [`detect_hf_mixtral_blocks`]) and run `pack_hf_mixtral_experts` on
+/// each. Returns an [`AutoPackOutcome`] enumerating successes + per-
+/// block failures.
+///
+/// Each pack call is independent — a failure on one block does NOT
+/// roll back another block's packed entries. Per-block atomicity is
+/// already provided by `pack_hf_mixtral_experts`'s two-phase commit
+/// (v2.6); cross-block atomicity is intentionally NOT provided because
+/// a partial result is still useful (you can build a model that uses
+/// the successful layers and inspect the failures).
+pub fn pack_all_detected_hf_mixtral_blocks(weight_map: &mut WeightMap) -> AutoPackOutcome {
+    let detected = detect_hf_mixtral_blocks(weight_map);
+    let mut packed = Vec::new();
+    let mut failed = Vec::new();
+    for block in detected {
+        // Rewrite in place — target prefix == HF prefix. The v2.7
+        // source kwarg `@moe(weight_prefix="…")` lets users point the
+        // v4 lowering at the HF prefix directly.
+        match pack_hf_mixtral_experts(
+            weight_map,
+            &block.hf_prefix,
+            &block.hf_prefix,
+            block.num_experts,
+        ) {
+            Ok(outcome) => packed.push((block, outcome)),
+            Err(err) => failed.push((block, err)),
+        }
+    }
+    AutoPackOutcome { packed, failed }
 }
 
 #[cfg(test)]
@@ -1237,5 +1418,326 @@ mod tests {
             "expected TargetAlreadyExists on up.weight, got {:?}",
             err,
         );
+    }
+
+    // ── v2.7 auto-detection tests ─────────────────────────────────────
+
+    fn insert_hf_block(wm: &mut WeightMap, prefix: &str, num_experts: usize) {
+        for e in 0..num_experts {
+            for w in ["w1", "w2", "w3"] {
+                let (rows, cols) = if w == "w2" { (2, 3) } else { (3, 2) };
+                wm.insert(make_f32_entry(
+                    &format!("{}.experts.{}.{}.weight", prefix, e, w),
+                    vec![rows, cols],
+                    &[1.0_f32; 6],
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn detect_hf_mixtral_blocks_finds_single_complete_block() {
+        let mut wm = WeightMap::new_for_test();
+        insert_hf_block(&mut wm, "model.layers.0.block_sparse_moe", 2);
+        let found = detect_hf_mixtral_blocks(&wm);
+        assert_eq!(
+            found,
+            vec![DetectedHfMixtralBlock {
+                hf_prefix: "model.layers.0.block_sparse_moe".to_string(),
+                num_experts: 2,
+            }]
+        );
+    }
+
+    #[test]
+    fn detect_hf_mixtral_blocks_finds_multiple_blocks_sorted_by_prefix() {
+        // Two MoE layers, one with 4 experts, one with 2.
+        let mut wm = WeightMap::new_for_test();
+        insert_hf_block(&mut wm, "model.layers.1.block_sparse_moe", 2);
+        insert_hf_block(&mut wm, "model.layers.0.block_sparse_moe", 4);
+        let found = detect_hf_mixtral_blocks(&wm);
+        // BTreeMap-backed sort: layers.0 before layers.1.
+        assert_eq!(
+            found,
+            vec![
+                DetectedHfMixtralBlock {
+                    hf_prefix: "model.layers.0.block_sparse_moe".to_string(),
+                    num_experts: 4,
+                },
+                DetectedHfMixtralBlock {
+                    hf_prefix: "model.layers.1.block_sparse_moe".to_string(),
+                    num_experts: 2,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn detect_hf_mixtral_blocks_skips_block_with_incomplete_expert_0() {
+        // Only w1 + w2 present for expert 0 — w3 missing. The block
+        // is incomplete and must NOT be detected.
+        let mut wm = WeightMap::new_for_test();
+        wm.insert(make_f32_entry("moe0.experts.0.w1.weight", vec![3, 2], &[1.0; 6]));
+        wm.insert(make_f32_entry("moe0.experts.0.w2.weight", vec![2, 3], &[1.0; 6]));
+        let found = detect_hf_mixtral_blocks(&wm);
+        assert!(found.is_empty(), "incomplete expert 0 must not detect");
+    }
+
+    #[test]
+    fn detect_hf_mixtral_blocks_stops_at_first_incomplete_index() {
+        // Experts 0+1 complete, expert 2 partial. Detector reports
+        // num_experts=2. Caller's pack invocation will then trip
+        // ExtraExpertsPresent on expert 2 — correct behavior, the
+        // user has a malformed safetensors.
+        let mut wm = WeightMap::new_for_test();
+        insert_hf_block(&mut wm, "moe0", 2);
+        // Add a partial expert 2 (only w1).
+        wm.insert(make_f32_entry("moe0.experts.2.w1.weight", vec![3, 2], &[1.0; 6]));
+        let found = detect_hf_mixtral_blocks(&wm);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].num_experts, 2);
+    }
+
+    #[test]
+    fn detect_hf_mixtral_blocks_ignores_already_packed_entries() {
+        // A WeightMap that's already been packed (e.g., from a prior
+        // CLI run with the same file) must NOT detect a new block —
+        // the packed `experts.gate.weight` / `experts.up.weight` etc.
+        // are NOT numeric expert indices.
+        let mut wm = WeightMap::new_for_test();
+        wm.insert(make_f32_entry(
+            "moe0.experts.gate.weight",
+            vec![2, 12],
+            &[1.0; 24],
+        ));
+        wm.insert(make_f32_entry(
+            "moe0.experts.up.weight",
+            vec![2, 12],
+            &[1.0; 24],
+        ));
+        wm.insert(make_f32_entry(
+            "moe0.experts.down.weight",
+            vec![2, 12],
+            &[1.0; 24],
+        ));
+        let found = detect_hf_mixtral_blocks(&wm);
+        assert!(found.is_empty(), "already-packed entries must not detect as HF");
+    }
+
+    #[test]
+    fn detect_hf_mixtral_blocks_ignores_unrelated_keys() {
+        let mut wm = WeightMap::new_for_test();
+        wm.insert(make_f32_entry("router.weight", vec![2, 2], &[1.0; 4]));
+        wm.insert(make_f32_entry(
+            "model.embed_tokens.weight",
+            vec![2, 2],
+            &[1.0; 4],
+        ));
+        // No `.experts.<N>.w[123].weight` keys at all.
+        let found = detect_hf_mixtral_blocks(&wm);
+        assert!(found.is_empty());
+    }
+
+    // ── pack_all_detected_hf_mixtral_blocks orchestrator ──────────────
+
+    #[test]
+    fn pack_all_detected_hf_mixtral_blocks_packs_one_block_in_place() {
+        let mut wm = WeightMap::new_for_test();
+        insert_hf_block(&mut wm, "moe0", 2);
+        let outcome = pack_all_detected_hf_mixtral_blocks(&mut wm);
+        assert_eq!(outcome.packed.len(), 1);
+        assert!(outcome.failed.is_empty());
+        assert_eq!(outcome.packed[0].0.hf_prefix, "moe0");
+        // Packed entries appeared under HF prefix.
+        assert!(wm.get("moe0.experts.gate.weight").is_some());
+        assert!(wm.get("moe0.experts.up.weight").is_some());
+        assert!(wm.get("moe0.experts.down.weight").is_some());
+        // HF sources removed.
+        assert!(wm.get("moe0.experts.0.w1.weight").is_none());
+    }
+
+    #[test]
+    fn pack_all_detected_hf_mixtral_blocks_independent_failure_does_not_block_other_blocks() {
+        // Two MoE blocks. The first has a dtype mismatch (corrupted);
+        // the second is clean. The auto-pack must successfully pack
+        // the second and report the first as failed — cross-block
+        // failures must not roll back successful blocks.
+        let mut wm = WeightMap::new_for_test();
+        // Block 0: corrupted (expert 1's w1 has a different dtype).
+        wm.insert(make_f32_entry("bad.experts.0.w1.weight", vec![2, 2], &[1.0; 4]));
+        wm.insert(make_f32_entry("bad.experts.0.w2.weight", vec![2, 2], &[1.0; 4]));
+        wm.insert(make_f32_entry("bad.experts.0.w3.weight", vec![2, 2], &[1.0; 4]));
+        let bad_w1_f16 = vec![0u8; 2 * 2 * 2];
+        wm.insert(WeightEntry::new(
+            "bad.experts.1.w1.weight".to_string(),
+            bad_w1_f16,
+            vec![2, 2],
+            WeightDType::F16,
+        ));
+        wm.insert(make_f32_entry("bad.experts.1.w2.weight", vec![2, 2], &[1.0; 4]));
+        wm.insert(make_f32_entry("bad.experts.1.w3.weight", vec![2, 2], &[1.0; 4]));
+        // Block 1: clean.
+        insert_hf_block(&mut wm, "good", 2);
+
+        let outcome = pack_all_detected_hf_mixtral_blocks(&mut wm);
+        assert_eq!(outcome.packed.len(), 1, "the good block must pack");
+        assert_eq!(outcome.failed.len(), 1, "the bad block must fail");
+        assert_eq!(outcome.packed[0].0.hf_prefix, "good");
+        assert_eq!(outcome.failed[0].0.hf_prefix, "bad");
+        assert!(matches!(outcome.failed[0].1, PackError::DtypeMismatch { .. }));
+        // Good block is packed; bad block's HF sources are still
+        // present (atomic refusal per v2.6's two-phase commit).
+        assert!(wm.get("good.experts.gate.weight").is_some());
+        assert!(wm.get("bad.experts.0.w1.weight").is_some());
+    }
+
+    #[test]
+    fn pack_all_detected_hf_mixtral_blocks_noop_on_empty_or_already_packed() {
+        let mut wm = WeightMap::new_for_test();
+        // Already-packed; detector returns empty; orchestrator no-ops.
+        wm.insert(make_f32_entry(
+            "moe0.experts.gate.weight",
+            vec![2, 12],
+            &[1.0; 24],
+        ));
+        let outcome = pack_all_detected_hf_mixtral_blocks(&mut wm);
+        assert!(outcome.packed.is_empty());
+        assert!(outcome.failed.is_empty());
+        // Pre-existing packed entry is untouched.
+        assert!(wm.get("moe0.experts.gate.weight").is_some());
+    }
+
+    // ── v2.7 adversarial-review fixes ─────────────────────────────────
+
+    #[test]
+    fn pack_hf_mixtral_experts_refuses_gapped_experts_with_orphan_at_higher_index() {
+        // v2.7 adversarial-review fix F1 (HIGH): pre-fix, a checkpoint
+        // with experts {0, 1, 3} (expert 2 entirely missing, expert 3
+        // fully present) would silently half-pack — the per-projection
+        // probe only checked index `num_experts` (= 2), and since
+        // expert 2 was MISSING, no refusal fired. Expert 3's three
+        // tensors leaked as orphans.
+        //
+        // The unified scan catches ANY index >= num_experts. Pin it
+        // explicitly with the gapped case.
+        let mut wm = WeightMap::new_for_test();
+        // Experts 0 + 1 complete.
+        for e in [0_usize, 1_usize] {
+            for w in ["w1", "w2", "w3"] {
+                let (rows, cols) = if w == "w2" { (2, 3) } else { (3, 2) };
+                wm.insert(make_f32_entry(
+                    &format!("moe0.experts.{}.{}.weight", e, w),
+                    vec![rows, cols],
+                    &[1.0_f32; 6],
+                ));
+            }
+        }
+        // Expert 2 ENTIRELY MISSING; expert 3 fully present.
+        for w in ["w1", "w2", "w3"] {
+            let (rows, cols) = if w == "w2" { (2, 3) } else { (3, 2) };
+            wm.insert(make_f32_entry(
+                &format!("moe0.experts.3.{}.weight", w),
+                vec![rows, cols],
+                &[1.0_f32; 6],
+            ));
+        }
+
+        // detect_hf_mixtral_blocks reports num_experts=2 (the largest
+        // contiguous run starting at 0). The packer must then refuse
+        // because expert 3 is an orphan.
+        let detected = detect_hf_mixtral_blocks(&wm);
+        assert_eq!(detected.len(), 1);
+        assert_eq!(detected[0].num_experts, 2);
+
+        let err = pack_hf_mixtral_experts(&mut wm, "moe0", "moe0", 2).unwrap_err();
+        match err {
+            PackError::ExtraExpertsPresent {
+                declared_num_experts,
+                found_extra_index,
+                ..
+            } => {
+                assert_eq!(declared_num_experts, 2);
+                assert_eq!(found_extra_index, 3, "must find the orphan at index 3, NOT only probe index 2");
+            }
+            other => panic!("expected ExtraExpertsPresent at index 3, got {:?}", other),
+        }
+        // WeightMap atomically unmodified — orphan still present, no
+        // packed entries appeared.
+        assert!(wm.get("moe0.experts.gate.weight").is_none());
+        assert!(wm.get("moe0.experts.3.w1.weight").is_some());
+    }
+
+    #[test]
+    fn pack_hf_mixtral_experts_refuses_orphan_at_arbitrary_higher_index() {
+        // Same F1 fix, broader scope: orphans at index 7 with
+        // num_experts=2 must also be caught.
+        let mut wm = WeightMap::new_for_test();
+        for e in [0_usize, 1_usize] {
+            for w in ["w1", "w2", "w3"] {
+                let (rows, cols) = if w == "w2" { (2, 3) } else { (3, 2) };
+                wm.insert(make_f32_entry(
+                    &format!("hf.experts.{}.{}.weight", e, w),
+                    vec![rows, cols],
+                    &[1.0_f32; 6],
+                ));
+            }
+        }
+        // Far-away orphan.
+        wm.insert(make_f32_entry(
+            "hf.experts.7.w1.weight",
+            vec![3, 2],
+            &[1.0_f32; 6],
+        ));
+
+        let err = pack_hf_mixtral_experts(&mut wm, "hf", "hf", 2).unwrap_err();
+        match err {
+            PackError::ExtraExpertsPresent { found_extra_index, .. } => {
+                assert_eq!(found_extra_index, 7);
+            }
+            other => panic!("expected ExtraExpertsPresent at index 7, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn pack_all_detected_hf_mixtral_blocks_mixed_hf_and_already_packed_reports_failure() {
+        // v2.7 adversarial-review fix F2 (IMPORTANT): a WeightMap with
+        // BOTH HF per-expert keys AND already-packed entries under the
+        // SAME prefix is a corrupted/half-aborted state. The auto-pack
+        // detector finds the HF block; the packer immediately trips
+        // `TargetAlreadyExists` on the pre-existing packed entry. The
+        // failure is reported via auto_pack.failed — and the wrapper
+        // in entry_points.rs then SURFACES the failure as a hard
+        // CodegenError (F2 fix) rather than silently letting the build
+        // continue against stale shadow data.
+        let mut wm = WeightMap::new_for_test();
+        // Pre-existing packed gate entry.
+        wm.insert(make_f32_entry(
+            "moe0.experts.gate.weight",
+            vec![2, 12],
+            &[99.0; 24],
+        ));
+        // Plus a fresh HF expert under the same prefix.
+        for w in ["w1", "w2", "w3"] {
+            let (rows, cols) = if w == "w2" { (2, 3) } else { (3, 2) };
+            wm.insert(make_f32_entry(
+                &format!("moe0.experts.0.{}.weight", w),
+                vec![rows, cols],
+                &[1.0; 6],
+            ));
+        }
+        let outcome = pack_all_detected_hf_mixtral_blocks(&mut wm);
+        assert!(
+            outcome.packed.is_empty(),
+            "mixed-state block must not pack: {:?}",
+            outcome.packed,
+        );
+        assert_eq!(outcome.failed.len(), 1);
+        assert!(matches!(
+            outcome.failed[0].1,
+            PackError::TargetAlreadyExists { .. }
+        ));
+        // The stale packed entry is preserved (atomic refusal).
+        assert!(wm.get("moe0.experts.gate.weight").is_some());
+        assert!(wm.get("moe0.experts.0.w1.weight").is_some());
     }
 }

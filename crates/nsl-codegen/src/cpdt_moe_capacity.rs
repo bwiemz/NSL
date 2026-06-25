@@ -108,6 +108,7 @@ mod tests {
             capacity_factor,
             aux_loss_coeff: 0.0,
             activation: crate::moe::MoeActivation::default(),
+            weight_prefix: None,
         }
     }
 

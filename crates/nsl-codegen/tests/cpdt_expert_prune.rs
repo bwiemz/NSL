@@ -199,6 +199,7 @@ fn moe_info(num_experts: usize, top_k: usize) -> MoeInfo {
         capacity_factor: 100.0,
         aux_loss_coeff: 0.0,
         activation: nsl_codegen::moe::MoeActivation::default(),
+        weight_prefix: None,
     }
 }
 

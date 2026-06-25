@@ -188,6 +188,65 @@ fn load_and_register_weights_if_needed(
     })?;
     let integrity = crate::weight_aware::WeightIntegrity::new(*wmap.hash());
 
+    // CPDT Part III v2.7 — HF Mixtral auto-pack.
+    //
+    // Scan the freshly-loaded WeightMap for HF Mixtral per-expert
+    // patterns (`<prefix>.experts.{e}.w{1,2,3}.weight`) and rewrite
+    // each detected block in place into NSL packed convention so the
+    // downstream `derive_v3_dims` / `derive_v4_dims` can resolve them.
+    // Per-block atomicity is provided by v2.6's two-phase commit;
+    // cross-block failures don't roll back successful blocks (a user
+    // with one bad MoE layer still gets every other layer packed).
+    //
+    // The auto-pack is an UNCONDITIONAL post-load pass — a no-op when
+    // no HF patterns are found, so no CLI flag is needed to gate it.
+    // Users with non-HF safetensors (NSL-packed or other MoE
+    // conventions) see no behavior change. Users with HF Mixtral
+    // safetensors get the pack for free.
+    let auto_pack = crate::moe_hf_pack::pack_all_detected_hf_mixtral_blocks(&mut wmap);
+    if !auto_pack.packed.is_empty() {
+        eprintln!(
+            "[nsl] CPDT v2.7: auto-packed {} HF Mixtral MoE block{} into NSL convention",
+            auto_pack.packed.len(),
+            if auto_pack.packed.len() == 1 { "" } else { "s" },
+        );
+        for (block, _) in &auto_pack.packed {
+            eprintln!(
+                "  - {} (num_experts={})",
+                block.hf_prefix, block.num_experts,
+            );
+        }
+    }
+    // v2.7 adversarial-review F2 fix: hard-refuse on any auto-pack
+    // failure. Previously the wrapper only printed failures to stderr
+    // and let the build continue, which created a silent-corruption
+    // hazard for the mixed HF+already-packed case: detection finds
+    // the HF block, packer trips `TargetAlreadyExists` on the stale
+    // pre-existing packed entry, the failure is logged-but-ignored,
+    // and `derive_v4_dims` then succeeds against the STALE shadow
+    // data while the freshly-loaded HF per-expert tensors become
+    // orphans. Per the "deferral must refuse" / "no silent fallback"
+    // invariant carried from v2.3..v2.6, any HF block detected MUST
+    // either pack successfully or surface as a build error.
+    if !auto_pack.failed.is_empty() {
+        let mut msg = String::from(
+            "CPDT v2.7: HF Mixtral auto-pack failed for one or more detected blocks:\n",
+        );
+        for (block, err) in &auto_pack.failed {
+            use std::fmt::Write as _;
+            let _ = writeln!(msg, "  - {}: {}", block.hf_prefix, err);
+        }
+        if !auto_pack.packed.is_empty() {
+            let _ = std::fmt::Write::write_str(
+                &mut msg,
+                "\nNote: other blocks WERE successfully packed in place (per-block \
+                 atomicity preserved). Rebuilding after fixing the failed blocks will \
+                 not double-pack the successful ones.",
+            );
+        }
+        return Err(crate::error::CodegenError::new(msg));
+    }
+
     // Sparsity analysis for sparse codegen / dead-weight elimination.
     if options.weight_config.sparse_codegen || options.weight_config.dead_weight_elim {
         let names: Vec<String> = wmap.names().map(|s| s.to_string()).collect();

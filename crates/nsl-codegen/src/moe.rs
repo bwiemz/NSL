@@ -282,6 +282,16 @@ pub struct MoeInfo {
     /// lowering path. Defaults to SiLU. Source: `@moe(activation="…")`
     /// decorator kwarg. Unread by the v1/v2 lowering paths.
     pub activation: MoeActivation,
+    /// CPDT Part III v2.7: optional WeightMap key prefix override.
+    /// When `None` (the default), the v3/v4 lowering arms key into the
+    /// WeightMap under the moe_configs key (`<model_name>.<field_name>`).
+    /// When `Some("foo.bar")`, the lowering arms key under `foo.bar`
+    /// instead — so the user can declare `@moe(weight_prefix=
+    /// "model.layers.0.block_sparse_moe")` against a real HF Mixtral
+    /// safetensors file (whose key segments contain `.` characters
+    /// that NSL field names cannot). Source: `@moe(weight_prefix="…")`
+    /// decorator kwarg.
+    pub weight_prefix: Option<String>,
 }
 
 /// Extract @moe decorator from a list of decorators.
@@ -306,6 +316,7 @@ pub fn extract_moe_decorator<'a>(
             let mut capacity_factor: f32 = 1.25;
             let mut aux_loss_coeff: f32 = 0.01;
             let mut activation: MoeActivation = MoeActivation::default();
+            let mut weight_prefix: Option<String> = None;
 
             if let Some(ref args) = deco.args {
                 for arg in args {
@@ -352,6 +363,37 @@ pub fn extract_moe_decorator<'a>(
                                     ));
                                 }
                             }
+                            "weight_prefix" => {
+                                // CPDT Part III v2.7 — explicit
+                                // WeightMap-key prefix for the v3/v4
+                                // lowering. Required when the user's
+                                // safetensors key segments contain `.`
+                                // (e.g., HF Mixtral `model.layers.0.
+                                // block_sparse_moe`) because NSL field
+                                // names cannot. Empty-string is REJECTED
+                                // here — None and "" are NOT equivalent:
+                                // a Some("") would look up under
+                                // `.router.weight` (with leading dot),
+                                // which is never a real safetensors
+                                // key. Better to refuse loudly than
+                                // silently produce that lookup.
+                                if let ExprKind::StringLiteral(s) = &arg.value.kind {
+                                    if s.is_empty() {
+                                        return Err(
+                                            "@moe: weight_prefix must be a non-empty string \
+                                             (e.g. weight_prefix=\"model.layers.0.block_sparse_moe\")"
+                                                .to_string(),
+                                        );
+                                    }
+                                    weight_prefix = Some(s.clone());
+                                } else {
+                                    return Err(format!(
+                                        "@moe: weight_prefix kwarg must be a string literal \
+                                         (e.g. weight_prefix=\"model.layers.0.block_sparse_moe\"), \
+                                         got non-string expression"
+                                    ));
+                                }
+                            }
                             _ => {}
                         }
                     }
@@ -365,6 +407,7 @@ pub fn extract_moe_decorator<'a>(
                     capacity_factor,
                     aux_loss_coeff,
                     activation,
+                    weight_prefix,
                 }));
             }
         }
@@ -392,12 +435,14 @@ mod tests {
             capacity_factor: 1.25,
             aux_loss_coeff: 0.01,
             activation: MoeActivation::Silu,
+            weight_prefix: None,
         };
         assert_eq!(info.num_experts, 8);
         assert_eq!(info.top_k, 2);
         assert!((info.capacity_factor - 1.25).abs() < 1e-6);
         assert!((info.aux_loss_coeff - 0.01).abs() < 1e-6);
         assert_eq!(info.activation, MoeActivation::Silu);
+        assert_eq!(info.weight_prefix, None);
     }
 
     #[test]
@@ -408,11 +453,16 @@ mod tests {
             capacity_factor: 2.0,
             aux_loss_coeff: 0.05,
             activation: MoeActivation::Gelu,
+            weight_prefix: Some("model.layers.0.block_sparse_moe".to_string()),
         };
         let cloned = info.clone();
         assert_eq!(cloned.num_experts, 4);
         assert_eq!(cloned.top_k, 1);
         assert_eq!(cloned.activation, MoeActivation::Gelu);
+        assert_eq!(
+            cloned.weight_prefix.as_deref(),
+            Some("model.layers.0.block_sparse_moe")
+        );
     }
 
     // ── MoeActivation parser (CPDT Part III v2.4) ──────────────────────────
@@ -462,6 +512,13 @@ mod tests {
         assert_eq!(MoeActivation::Gelu as i64, 2);
         assert_eq!(MoeActivation::Relu as i64, 3);
     }
+
+    // CPDT Part III v2.7 — @moe(weight_prefix=…) parsing is covered
+    // end-to-end by the CLI integration test
+    // crates/nsl-cli/tests/cpdt_part3_v2_7_hf_mixtral_pack.rs. The
+    // empty-string and non-string-literal refusal arms are pinned by
+    // that test plus the test_moe_info_clone test above (which exercises
+    // weight_prefix: Some(...) in the struct surface).
 
     // ── derive_v2_dims (CPDT Part III v1 production-forward) ───────────────
     use crate::weight_aware::{WeightDType, WeightEntry, WeightMap};
