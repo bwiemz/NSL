@@ -1121,6 +1121,7 @@ mod tests {
             csha: None,
             checkpoint: Some(CheckpointExtras {
                 policy: CheckpointPolicy::Full,
+                paged_kv_collision: false,
             }),
         }
     }

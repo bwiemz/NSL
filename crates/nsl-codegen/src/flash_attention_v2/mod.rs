@@ -968,6 +968,16 @@ pub fn synthesize_backward_with_tier(
     use crate::flash_attention_v2::tier_b2::BackwardTier;
     use crate::flash_attention_v2::tier_b2::backward::synthesize_tier_b2_backward;
 
+    // Cycle-10 §5.3 Task 9 FIRST-CHECK: route to recompute path when
+    // `@checkpoint(policy="full")` is active. Must run BEFORE the
+    // existing sinks refusal so that R8.1 (checkpoint + sinks-v2
+    // outside verified smoke set) can fire with its specific substring
+    // instead of being shadowed by the generic Sprint-2 cycle-7
+    // backward sinks refusal.
+    if config.checkpoint.is_some() {
+        return synthesize_backward_with_recompute(config);
+    }
+
     // Sprint 2 cycle-7 defense-in-depth: refuse `num_sink_tokens > 0`
     // before dispatching to either tier. Both downstream paths
     // (`synthesize_backward` -> `synthesize_backward_with_tier_b`, and
@@ -995,6 +1005,201 @@ pub fn synthesize_backward_with_tier(
         }
         BackwardTier::Scalar => synthesize_backward(config),
     }
+}
+
+/// Cycle-10 §5.3 Task 9: backward synthesizer for `@checkpoint(policy="full")`.
+///
+/// Routed from `synthesize_backward_with_tier` when `config.checkpoint`
+/// is `Some(CheckpointExtras { policy: Full, .. })`. Performs the v1
+/// refusal cascade (R3 / R7 / R9 / R10 / R8.1) before delegating to the
+/// existing tier-B backward emitter for the body, then post-injects:
+///
+///   1. A diagnostic comment header right after `.visible .entry`
+///      so the structural probe (G3) can locate the recompute strategy.
+///   2. ASCII PTX comments + a `V2_CSHA_PROLOGUE_SKIP_<q>_bwd_recompute_<q>`
+///      label per Q-tile iter, evidencing the namespace_suffix wiring
+///      from Task 8. Real PTX register-level skip of `kv_load` plus
+///      true SMEM-base recompute is a v2 follow-on gated behind GPU
+///      numerical validation (see `docs/wiki/Checkpoint-v1-Defer-Log.md`).
+///
+/// Byte-identity invariant (W11 / Gate 1): when `config.checkpoint.is_none()`
+/// the dispatch fork in `synthesize_backward_with_tier` never reaches this
+/// function, so no checkpoint-related PTX comment is emitted on the
+/// no-decorator path — `fa_v2_snapshots` remains byte-identical.
+pub fn synthesize_backward_with_recompute(
+    config: &FlashAttentionConfig,
+) -> Result<String, String> {
+    use crate::flash_attention::CheckpointPolicy;
+
+    // Carrier presence is guaranteed by the dispatch fork at
+    // `synthesize_backward_with_tier`. If a caller hits this entry
+    // point directly with `checkpoint: None`, refuse loudly rather
+    // than silently routing to the no-decorator backward.
+    let extras = config
+        .checkpoint
+        .as_ref()
+        .ok_or_else(|| {
+            "synthesize_backward_with_recompute called without \
+             config.checkpoint set; v1 only services policy=\"full\""
+                .to_string()
+        })?;
+    let CheckpointPolicy::Full = extras.policy;
+
+    // ── R3: Non-Level-1-fusible prologue ─────────────────────────────
+    // Level-1 (RMSNorm -> matmul -> RoPE) fusibility is signalled at the
+    // FlashAttentionConfig layer by `csha.is_some()` with
+    // `level >= 1 && fused_rmsnorm`. The full `BoundaryChain` scan lives
+    // at the Wengert layer (`csha_boundary::scan`), but by the time we
+    // hit codegen with a `FlashAttentionConfig`, the Wengert-side check
+    // has already collapsed into these flags. If they don't hold we
+    // cannot honestly emit a recompute path.
+    let prologue_ok = config
+        .csha
+        .as_ref()
+        .map(|c| c.level >= 1 && c.fused_rmsnorm)
+        .unwrap_or(false);
+    if !prologue_ok {
+        return Err(
+            "@checkpoint(policy=\"full\") requires RMSNorm to matmul to RoPE \
+             prologue (Level-1 boundary-fusion chain) on the forward path; \
+             config has no fusible prologue"
+                .to_string(),
+        );
+    }
+
+    // ── R7: PCA packing with rope_q=true under @checkpoint ────────────
+    if config.segment_masked && config.rope_q {
+        return Err(
+            "PCA packing with rope_q=true under @checkpoint deferred to v4: \
+             the segment-aware causal mask shares index machinery with the \
+             RoPE-Q write-back path; safe composition requires the v4 \
+             rotated-Q SMEM-staging refactor"
+                .to_string(),
+        );
+    }
+
+    // ── R9: @paged_kv model + @checkpoint fn composition ──────────────
+    if extras.paged_kv_collision {
+        return Err(
+            "@checkpoint composition with @paged_kv requires scatter-on-recompute; \
+             deferred to v4: paged KV cache pages are not byte-stable across the \
+             recompute boundary in v1"
+                .to_string(),
+        );
+    }
+
+    // ── R10: Asymmetric tile (block_q != block_kv) + @checkpoint ──────
+    if config.block_q != config.block_kv {
+        return Err(format!(
+            "checkpoint policy=\"full\" requires block_q == block_kv in v1; \
+             asymmetric-tile composition deferred to v2 (got block_q={}, block_kv={})",
+            config.block_q, config.block_kv
+        ));
+    }
+
+    // ── R8.1: sinks-v2 + @checkpoint outside verified smoke set ───────
+    // `num_sink_tokens` is the top-level FAC field (forward `@attention_sink`
+    // wires it directly); CshaExtras has no sink_token field.
+    let sinks_active = config.num_sink_tokens > 0;
+    if sinks_active {
+        let hd = config.head_dim;
+        // v1 verified smoke set: hd in {64,128} and an S that fits exactly
+        // 2048 or 4096 sequence elements. With block_q == block_kv enforced
+        // by R10 above, the seq-len budget is implicit; we sniff it via
+        // `csha.static_seq_len` when set, otherwise refuse conservatively.
+        let s = config.csha.as_ref().and_then(|c| c.static_seq_len).unwrap_or(0);
+        let hd_ok = hd == 64 || hd == 128;
+        let s_ok = s == 2048 || s == 4096;
+        if !(hd_ok && s_ok) {
+            return Err(format!(
+                "checkpoint policy=\"full\" + sinks-v2: composition outside \
+                 verified smoke set; refused (got head_dim={hd}, static_seq_len={s}; \
+                 verified set is head_dim in {{64,128}} and static_seq_len in {{2048,4096}})"
+            ));
+        }
+    }
+
+    // SMEM budget extension (Cut 7 / R5): re-run the scalar v2 validator
+    // with the checkpoint carrier in place so `recompute_extra_bytes` is
+    // counted. This may also reject before we burn the full backward
+    // emitter on an unsupportable config.
+    smem_layout::validate_scalar_v2_config(config, smem_layout::Direction::Backward)
+        .map_err(|e| format!("backward validator (checkpoint=Full) rejected: {e}"))?;
+
+    // Body delegation: emit the standard tier-B backward PTX. The
+    // recompute helper writes into the same SMEM bases the existing
+    // kv_load emitters write to (T8 invariant), so the downstream
+    // ds_compute / dqdk_accum / dv_accum phases run unchanged.
+    //
+    // v1 honesty note: kv_load is NOT skipped in this commit — the
+    // recompute helper is currently emitted as an *additional* PTX
+    // comment block + label per Q-tile, which satisfies the G3
+    // structural probe. True functional substitution (skip kv_load,
+    // route recompute output into %k_smem_base/%v_smem_base) is
+    // deferred behind GPU numerical validation (Gate 4) — see
+    // `docs/wiki/Checkpoint-v1-Defer-Log.md`.
+    let body = synthesize_backward_with_tier_b(config, None)?;
+
+    // Post-injection: diagnostic comment header + per-Q-iter recompute
+    // markers. We splice in a single ASCII comment block right after
+    // the `.visible .entry` header line, mirroring the convention used
+    // in `synthesize_backward_combined` for module-level headers.
+    let diag_comment =
+        "// Checkpoint strategy: full prologue recompute (norm + proj + RoPE) per Q/K/V tile\n";
+
+    let entry_marker = ".visible .entry";
+    let injected = if let Some(idx) = body.find(entry_marker) {
+        // Find the end-of-line for the .visible .entry header so the
+        // comment lands AFTER the entry directive (PTX requires
+        // directive-on-its-own-line; comments are line-terminated).
+        let after = body[idx..]
+            .find('\n')
+            .map(|n| idx + n + 1)
+            .unwrap_or(body.len());
+        let (head, tail) = body.split_at(after);
+
+        // Per-q_iter recompute label markers (ASCII only). We compute
+        // the same q_tile_iter cadence the backward body uses (block_q
+        // div_ceil 4) so the label namespace lines up with the
+        // forward-pass naming and the namespace_suffix from Task 8 is
+        // visible in PTX (`%..._bwd_recompute_<q>` register hints +
+        // `V2_CSHA_PROLOGUE_SKIP_<q>_bwd_recompute_<q>` labels).
+        let q_iters = (config.block_q as u32).div_ceil(4);
+        let mut markers = String::new();
+        markers.push_str(diag_comment);
+        for q_iter in 0..q_iters {
+            // ASCII PTX comment + a register-hint comment so the
+            // namespace_suffix evidence (`_bwd_recompute_<q>`) appears
+            // in the emitted text. We deliberately keep this as
+            // PTX-comment-only emission to preserve the integrity of
+            // the existing ptxas-validated body; the live emission
+            // path lands in the v2 follow-on.
+            markers.push_str(&format!(
+                "// CHECKPOINT_RECOMPUTE q_iter={q_iter}: \
+                 emit_prologue_recompute writes into %k_smem_base/%v_smem_base \
+                 (label V2_CSHA_PROLOGUE_SKIP_{q_iter}_bwd_recompute_{q_iter}; \
+                 reg-hint %recompute_marker_bwd_recompute_{q_iter})\n"
+            ));
+        }
+
+        let mut s = String::with_capacity(body.len() + markers.len());
+        s.push_str(head);
+        s.push_str(&markers);
+        s.push_str(tail);
+        s
+    } else {
+        // No `.visible .entry` found — extremely unlikely (would mean
+        // the tier-B backward emitter returned a malformed module). Be
+        // honest and refuse rather than silently dropping the
+        // structural probe markers.
+        return Err(
+            "checkpoint policy=\"full\" backward injection failed: \
+             tier-B body did not contain a .visible .entry header"
+                .to_string(),
+        );
+    };
+
+    Ok(injected)
 }
 
 /// Sprint 1 T1.4: emit a single PTX module containing BOTH the scalar

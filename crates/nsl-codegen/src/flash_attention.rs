@@ -287,6 +287,27 @@ pub enum CheckpointPolicy {
 pub struct CheckpointExtras {
     /// Active checkpointing policy. v1 ships `CheckpointPolicy::Full`.
     pub policy: CheckpointPolicy,
+    /// Cycle-10 §5.3 Task 9 R9 carrier: set to `true` at wire-up time when
+    /// the enclosing `@checkpoint` function is invoked from inside a
+    /// `@paged_kv`-decorated model. The codegen-side dispatch fork in
+    /// `flash_attention_v2/mod.rs::synthesize_backward_with_recompute`
+    /// refuses (R9 substring) when this is true.
+    ///
+    /// Full call-graph propagation is deferred to v4 (T6). v1 trusts the
+    /// wire-up site to set this; unit tests exercise the refusal directly.
+    pub paged_kv_collision: bool,
+}
+
+impl CheckpointExtras {
+    /// Construct a `Full`-policy carrier with no paged-kv collision (the
+    /// default v1 shape). Used by tests and by the semantic wire-up when
+    /// `@paged_kv` is NOT in the enclosing model's decorator set.
+    pub fn full() -> Self {
+        Self {
+            policy: CheckpointPolicy::Full,
+            paged_kv_collision: false,
+        }
+    }
 }
 
 /// CSHA kernel-level fusion extensions.
@@ -6079,6 +6100,7 @@ mod tests {
         let policied = FlashAttentionConfig {
             checkpoint: Some(CheckpointExtras {
                 policy: CheckpointPolicy::Full,
+                paged_kv_collision: false,
             }),
             ..config.clone()
         };
