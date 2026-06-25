@@ -4,6 +4,45 @@ use nsl_ast::Symbol;
 
 use nsl_errors::Diagnostic;
 
+/// CPDT Part III v2.10 fix F2 (LOW adversarial review) — semantic-layer
+/// shape validation for `@moe(weight_prefix="…")`.
+///
+/// Mirrors `crate::moe::validate_weight_prefix` in `nsl-codegen`. Cannot
+/// share the function because `nsl-semantic` does not depend on
+/// `nsl-codegen`; duplication is by policy (matches v2.4's activation
+/// precedent where the semantic allow-list duplicates codegen's
+/// INVALID-VALUE-FATAL parse). Returns Some(error message) on a
+/// malformed prefix, None on accept. Caller has already confirmed the
+/// string is non-empty.
+fn validate_weight_prefix_shape(s: &str) -> Option<String> {
+    if s.starts_with('.') {
+        return Some(format!(
+            "@moe: weight_prefix cannot start with '.' (got \"{s}\"). \
+             Resolution would compose to `..router.weight`. Drop the leading dot."
+        ));
+    }
+    if s.ends_with('.') {
+        return Some(format!(
+            "@moe: weight_prefix cannot end with '.' (got \"{s}\"). \
+             Resolution would compose to `{s}.router.weight` (empty segment between \
+             the prefix tail and `router`). Drop the trailing dot."
+        ));
+    }
+    if s.contains("..") {
+        return Some(format!(
+            "@moe: weight_prefix cannot contain consecutive dots '..' (got \"{s}\"). \
+             Each dot must separate non-empty path segments."
+        ));
+    }
+    if let Some(ws) = s.chars().find(|c| c.is_ascii_whitespace()) {
+        return Some(format!(
+            "@moe: weight_prefix cannot contain whitespace (found {ws:?} in \"{s}\"). \
+             Safetensors keys never contain whitespace."
+        ));
+    }
+    None
+}
+
 /// Validate @moe decorator arguments.
 /// Returns (num_experts, top_k, capacity_factor, aux_loss_coeff) or None on error.
 pub fn validate_moe_decorator(
@@ -130,8 +169,31 @@ pub fn validate_moe_decorator(
                     // STRING-LITERAL-NESS here (the codegen layer does
                     // the empty-string check so the error message can
                     // reference the v2.7 use case).
+                    //
+                    // CPDT Part III v2.10 fix F2 (LOW adversarial review):
+                    // mirror the codegen-layer `validate_weight_prefix`
+                    // shape checks (leading dot, trailing dot, consecutive
+                    // dots, whitespace) here too. nsl-semantic does NOT
+                    // depend on nsl-codegen, so the four checks are
+                    // duplicated by policy — mirrors v2.4's activation
+                    // precedent (semantic allow-list duplicates codegen's
+                    // INVALID-VALUE-FATAL parse). LSP / `nsl check` /
+                    // pre-commit IDE hooks that run semantic without
+                    // codegen will surface the diagnostic at the source
+                    // line of the typo.
                     "weight_prefix" => {
-                        if !matches!(arg.value.kind, ExprKind::StringLiteral(_)) {
+                        if let ExprKind::StringLiteral(s) = &arg.value.kind {
+                            if !s.is_empty() {
+                                if let Some(msg) = validate_weight_prefix_shape(s) {
+                                    diagnostics.push(
+                                        Diagnostic::error(msg)
+                                            .with_label(arg.span, "malformed weight_prefix"),
+                                    );
+                                }
+                            }
+                            // Empty-string itself stays codegen-rejected
+                            // (the v2.7 ordering convention).
+                        } else {
                             diagnostics.push(
                                 Diagnostic::error(
                                     "@moe: weight_prefix must be a string literal".to_string(),
@@ -160,4 +222,50 @@ pub fn validate_moe_decorator(
     }
 
     Some((num_experts.unwrap(), top_k, capacity_factor, aux_loss_coeff))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_weight_prefix_shape;
+
+    // CPDT Part III v2.10 fix F2 (LOW adversarial review). Pin the
+    // semantic-layer duplicate of the codegen `validate_weight_prefix`
+    // so a future refactor that drops one of the four checks (leading
+    // dot, trailing dot, consecutive dots, whitespace) is caught here
+    // even if the codegen-layer test still passes.
+
+    #[test]
+    fn semantic_validate_weight_prefix_accepts_canonical_hf_form() {
+        assert!(validate_weight_prefix_shape("model.layers.0.block_sparse_moe").is_none());
+        assert!(validate_weight_prefix_shape("transformer.h.3.ffn").is_none());
+        assert!(validate_weight_prefix_shape("bare_name").is_none());
+    }
+
+    #[test]
+    fn semantic_validate_weight_prefix_rejects_leading_dot() {
+        let err = validate_weight_prefix_shape(".hf.layer").unwrap();
+        assert!(err.contains("cannot start with '.'"), "msg was: {err}");
+        assert!(err.contains(".hf.layer"), "msg must echo prefix");
+    }
+
+    #[test]
+    fn semantic_validate_weight_prefix_rejects_trailing_dot() {
+        let err = validate_weight_prefix_shape("hf.layer.").unwrap();
+        assert!(err.contains("cannot end with '.'"), "msg was: {err}");
+        assert!(err.contains("hf.layer."), "msg must echo prefix");
+    }
+
+    #[test]
+    fn semantic_validate_weight_prefix_rejects_consecutive_dots() {
+        let err = validate_weight_prefix_shape("model..layers").unwrap();
+        assert!(err.contains("consecutive dots"), "msg was: {err}");
+        assert!(err.contains("model..layers"), "msg must echo prefix");
+    }
+
+    #[test]
+    fn semantic_validate_weight_prefix_rejects_whitespace() {
+        let err = validate_weight_prefix_shape("model. layers").unwrap();
+        assert!(err.contains("whitespace"), "msg was: {err}");
+        assert!(err.contains("model. layers"), "msg must echo prefix");
+    }
 }

@@ -298,6 +298,73 @@ pub struct MoeInfo {
     pub weight_prefix: Option<String>,
 }
 
+/// CPDT Part III v2.10 — validate the shape of a `weight_prefix` string
+/// at decorator-parse time.
+///
+/// The v3/v4 WeightMap lookup composes the prefix with a suffix via
+/// `format!("{prefix}.{suffix}")` — e.g.,
+/// `format!("{weight_prefix}.router.weight")`. A malformed prefix
+/// silently produces a key that no real safetensors file uses, so the
+/// lookup just returns None and the user sees a `derive_v4_dims`-not-
+/// resolved error far downstream from the actual mistake. Refuse loudly
+/// at the source so the diagnostic points at the typo.
+///
+/// Rejected patterns (each names the offending substring):
+///   - leading `.` (e.g. `".hf.layer"`) → composes to `..router.weight`
+///   - trailing `.` (e.g. `"hf.layer."`) → composes to `hf.layer..router.weight`
+///   - consecutive dots `..` (e.g. `"hf..layer"`) → composes with `..` in the middle
+///   - any ASCII whitespace (` `, `\t`, `\n`, `\r`, etc.) — safetensors
+///     keys do not contain whitespace; almost certainly a copy-paste
+///     artifact from a config file
+///
+/// Accepted patterns (the documented HF/Mixtral forms):
+///   - alphanumeric + underscores + single dots, no leading/trailing dot
+///     (e.g., `"model.layers.0.block_sparse_moe"`, `"transformer.h.3.ffn"`)
+///   - bare names with no dots (e.g., `"my_layer"`) — degenerate but valid
+///
+/// Returns Ok(()) on accept, Err(msg) on reject. The empty-string check
+/// stays in the kwarg parser (the v2.7 ordering convention) and is NOT
+/// duplicated here.
+pub fn validate_weight_prefix(s: &str) -> Result<(), String> {
+    debug_assert!(
+        !s.is_empty(),
+        "validate_weight_prefix called on empty string — caller should refuse empty first",
+    );
+    if s.starts_with('.') {
+        return Err(format!(
+            "@moe: weight_prefix cannot start with '.' (got \"{s}\"). \
+             Resolution would compose to `..router.weight`. Drop the leading dot."
+        ));
+    }
+    if s.ends_with('.') {
+        // v2.10 fix F1 (LOW adversarial review): the parenthetical
+        // narration is input-agnostic. For `"hf."` the composed key is
+        // `hf..router.weight` (double-dot); for `"hf..."` it would be
+        // `hf....router.weight` (four dots). "Empty segment" describes
+        // both cases correctly without claiming a specific dot count.
+        return Err(format!(
+            "@moe: weight_prefix cannot end with '.' (got \"{s}\"). \
+             Resolution would compose to `{s}.router.weight` (empty segment between \
+             the prefix tail and `router`). Drop the trailing dot."
+        ));
+    }
+    if s.contains("..") {
+        return Err(format!(
+            "@moe: weight_prefix cannot contain consecutive dots '..' (got \"{s}\"). \
+             Each dot must separate non-empty path segments — `model.layers.0` is valid, \
+             `model..layers` is not."
+        ));
+    }
+    if let Some(ws) = s.chars().find(|c| c.is_ascii_whitespace()) {
+        return Err(format!(
+            "@moe: weight_prefix cannot contain whitespace (found {ws:?} in \"{s}\"). \
+             Safetensors keys never contain whitespace — this is almost certainly a \
+             stray space or newline copy-pasted from a config file."
+        ));
+    }
+    Ok(())
+}
+
 /// Extract @moe decorator from a list of decorators.
 ///
 /// The `activation` kwarg (v2.4) is INVALID-VALUE-FATAL: if the kwarg
@@ -389,6 +456,11 @@ pub fn extract_moe_decorator<'a>(
                                                 .to_string(),
                                         );
                                     }
+                                    // CPDT Part III v2.10 — refuse malformed
+                                    // prefixes at parse time so the diagnostic
+                                    // points at the typo, not at the
+                                    // downstream `derive_v4_dims` failure.
+                                    validate_weight_prefix(s)?;
                                     weight_prefix = Some(s.clone());
                                 } else {
                                     return Err(format!(
@@ -780,6 +852,96 @@ mod tests {
             derive_v4_dims(&wm, "blocks.0", 4),
             None,
             "gate.shape[0] != num_experts → refuse v4"
+        );
+    }
+
+    // ── validate_weight_prefix (CPDT Part III v2.10) ─────────────────────
+    //
+    // Pins each of the 4 refusal kinds (leading dot, trailing dot,
+    // consecutive dots, whitespace) plus happy paths. A regression that
+    // dropped any single check would fail exactly one test, naming the
+    // dropped case.
+
+    #[test]
+    fn validate_weight_prefix_accepts_canonical_hf_form() {
+        // The documented v2.7 form — alphanumeric + underscores + single
+        // dots separating non-empty segments.
+        assert!(validate_weight_prefix("model.layers.0.block_sparse_moe").is_ok());
+        assert!(validate_weight_prefix("transformer.h.3.ffn").is_ok());
+        assert!(validate_weight_prefix("encoder.block.5.layer.1.mlp").is_ok());
+    }
+
+    #[test]
+    fn validate_weight_prefix_accepts_bare_name_no_dots() {
+        // Degenerate but valid — a single segment with no dots. The
+        // resolver still composes `bare.router.weight` correctly.
+        assert!(validate_weight_prefix("hf_layer").is_ok());
+        assert!(validate_weight_prefix("layer0").is_ok());
+        assert!(validate_weight_prefix("a").is_ok());
+    }
+
+    #[test]
+    fn validate_weight_prefix_rejects_leading_dot() {
+        let err = validate_weight_prefix(".hf.layer").unwrap_err();
+        assert!(err.contains("cannot start with '.'"), "msg was: {err}");
+        assert!(err.contains(".hf.layer"), "msg must echo the offending prefix");
+        // Even a single leading dot is rejected (no special case for
+        // "single-char prefix").
+        assert!(validate_weight_prefix(".x").is_err());
+        assert!(validate_weight_prefix(".").is_err());
+    }
+
+    #[test]
+    fn validate_weight_prefix_rejects_trailing_dot() {
+        let err = validate_weight_prefix("hf.layer.").unwrap_err();
+        assert!(err.contains("cannot end with '.'"), "msg was: {err}");
+        assert!(err.contains("hf.layer."), "msg must echo the offending prefix");
+        // A bare "." would hit the leading-dot check first; that's fine
+        // — both refusals are correct for that degenerate input.
+    }
+
+    #[test]
+    fn validate_weight_prefix_rejects_consecutive_dots() {
+        // v2.10 fix F4 (LOW adversarial review): also pin the
+        // offending-prefix echo so a regression that drops `(got "{s}")`
+        // is caught.
+        let err = validate_weight_prefix("model..layers.0").unwrap_err();
+        assert!(err.contains("consecutive dots"), "msg was: {err}");
+        assert!(err.contains("model..layers.0"), "msg must echo prefix: {err}");
+        // Even longer runs are rejected (the `..` substring check covers
+        // any run of length ≥ 2).
+        assert!(validate_weight_prefix("a...b").is_err());
+        // Embedded in the middle is rejected too.
+        assert!(validate_weight_prefix("transformer.h..3.ffn").is_err());
+    }
+
+    #[test]
+    fn validate_weight_prefix_rejects_whitespace() {
+        // Common copy-paste hazards: stray space, tab, newline. v2.10
+        // fix F4 (LOW adversarial review): also pin the offending-prefix
+        // echo so a regression that drops `(got "{s}")` is caught.
+        let err_space = validate_weight_prefix("model. layers.0").unwrap_err();
+        assert!(err_space.contains("whitespace"), "msg was: {err_space}");
+        assert!(err_space.contains("model. layers.0"), "msg must echo prefix: {err_space}");
+        assert!(validate_weight_prefix("model.\tlayers").is_err());
+        assert!(validate_weight_prefix("model.\nlayers").is_err());
+        // Trailing space (also caught by whitespace before trailing-dot).
+        assert!(validate_weight_prefix("model.layers ").is_err());
+        // Leading space.
+        assert!(validate_weight_prefix(" model.layers").is_err());
+    }
+
+    #[test]
+    fn validate_weight_prefix_refusal_ordering_pins_leading_dot_first() {
+        // Multiple violations: leading-dot AND trailing-dot AND
+        // consecutive dots AND whitespace. Leading-dot is checked first
+        // (the resolver's compose order would fail there first), so the
+        // refusal must name THAT case — a regression that changed check
+        // order would surface as a different message.
+        let err = validate_weight_prefix(". .layer..").unwrap_err();
+        assert!(
+            err.contains("cannot start with '.'"),
+            "leading-dot must win over other violations; msg was: {err}"
         );
     }
 }
