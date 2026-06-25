@@ -577,6 +577,75 @@ fn step(x: Tensor, w: Tensor, bias: Tensor, targets: Tensor) -> Tensor:
     return cross_entropy(logits, targets)
 "#;
 
+// ─── Test 12 (Adversarial review Findings 1 + 8): rank-3 W LATENT-HAZARD pin ─
+//
+// The auto-substitution matcher does NOT structurally verify that W is
+// rank-2 — it accepts whatever VarId sits in the transpose op's first
+// input slot.  Every PTX emitter indexes W as W[v*H + h] (rank-2 [V, H]);
+// a user who wrote `matmul(x, transpose(W3D, -2, -1)) + bias` over a
+// rank-3 W3D (e.g. an MoE expert stack [D, V, H]) would have the matcher
+// silently fire, the fused FFI stride through W3D as if it were [V, H],
+// and produce wrong forward logits + wrong dW gradients with no
+// diagnostic.
+//
+// The source-AD layer has no shape table available at the matcher site
+// (only the wengert PrimalOp graph), so we cannot structurally enforce
+// rank-2 today.  Current mitigations:
+//   * The upstream type system rejects most non-2D Matmul shape configs.
+//   * The decorator's (vocab_size, hidden_size) shape contract pins the
+//     expected [V, H] shape at the caller before substitution.
+// A 3-D W that satisfies neither check would still slip through.
+//
+// This test EXISTS to document the deferral surface — the source NSL
+// code below does NOT actually construct a rank-3 W (it's just a parameter
+// the matcher sees as opaque), and the matcher still fires.  The test
+// asserts the CURRENT documented-bug behaviour so a future structural
+// rank-2 enforcement lands with an explicit assertion FLIP (not a silent
+// behaviour change).  IF structural enforcement is added: replace
+// `count_fused == 1` with `count_fused == 0` and add the rank-3 negative
+// path as the new safety net.
+
+const RANK_AGNOSTIC_NEG_DIM_SRC: &str = r#"
+fn step(x: Tensor, w: Tensor, bias: Tensor, targets: Tensor) -> Tensor:
+    let w_t = transpose(w, -2, -1)
+    let logits = matmul(x, w_t) + bias
+    return cross_entropy(logits, targets)
+"#;
+
+#[test]
+fn rank_check_absent_matcher_fires_regardless_of_w_rank() {
+    let cfg = FusedCeDecoratorConfig {
+        enabled: true,
+        vocab_tile: Some(1024),
+        vocab_size: Some(4096),
+        hidden_size: Some(128),
+        batch_size: Some(2),
+        seq_len: Some(32),
+        dtype: None,
+    };
+    let list = extract_first_fn(RANK_AGNOSTIC_NEG_DIM_SRC, Some(cfg))
+        .expect("extraction must succeed");
+    // CURRENT BEHAVIOUR (adversarial review Findings 1 + 8): matcher
+    // has no rank table and fires regardless of W's declared rank.
+    // The negative-dim transpose form is precisely the form most likely
+    // to come from rank-agnostic NSL code (which is exactly the source
+    // most likely to be ≥3D).  Documented LATENT HAZARD: callers must
+    // ensure W is rank-2 at the type-system layer + the decorator's
+    // (vocab_size, hidden_size) hint must pin the expected shape.
+    //
+    // If a future sprint adds structural rank-2 enforcement at the
+    // matcher (walking the producer of w_var + consulting a shape
+    // table), update this assertion from `1` to `0` and add a
+    // separate positive test for the rank-2 path.
+    assert_eq!(
+        count_fused(&list),
+        1,
+        "current matcher does NOT enforce W rank — see source_ad.rs \
+         rustdoc 'LATENT 3-D+ RISK'. Flip to 0 when rank-2 enforcement \
+         lands."
+    );
+}
+
 #[test]
 fn no_transpose_pattern_deferred_to_v5() {
     let cfg = FusedCeDecoratorConfig {

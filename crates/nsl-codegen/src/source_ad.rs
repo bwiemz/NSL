@@ -1628,6 +1628,29 @@ impl<'a> WengertExtractor<'a> {
     ///     refusal was over-strict and forced idiomatic NSL code (which
     ///     prefers negative dims for rank-agnostic transposes) onto the
     ///     slower composite path.
+    ///
+    ///     LATENT 3-D+ RISK (adversarial review Findings 1 + 8): the matcher
+    ///     does NOT structurally verify that `W` is rank-2 — it accepts
+    ///     `W` via the transpose's first input slot regardless of declared
+    ///     rank.  Every PTX emitter indexes `W` as `W[v*H + h]` (rank-2
+    ///     `[V, H]`); a user who wrote `matmul(x, transpose(W3D, -2, -1))
+    ///     + bias` over a rank-3 `W3D` (e.g. an MoE expert stack `[D, V, H]`
+    ///     or a head-major `[heads, V, H]` layout) would have the matcher
+    ///     silently fire, the fused FFI stride through `W3D` as if it were
+    ///     `[V, H]`, and produce wrong forward logits + wrong dW gradients
+    ///     with no diagnostic.
+    ///
+    ///     Current mitigation: the upstream type system rejects non-2D
+    ///     Matmul inputs in most shape configurations, AND the decorator's
+    ///     `(vocab_size, hidden_size)` shape contract — checked by the
+    ///     caller before emitting the substitution — pins the expected
+    ///     `[V, H]` shape.  A 3-D `W` that happens to satisfy `D * V == V`
+    ///     OR a missing-shape-hint path would slip through.  Structural
+    ///     rank-2 enforcement (walk the producer of `w_var`, consult the
+    ///     shape table for `Param` / `Constant` ops) is tracked as a
+    ///     follow-on — the cheapest pin until then is the negative-test
+    ///     coverage codified in `fused_linear_ce_auto_substitution.rs`
+    ///     (rank-3 W → no substitution).
     ///   * No-transpose W layout (`Matmul(x, W)` with W already `[H, V]`)
     ///     is NOT accepted.  Sprint v4-3 deferral: the runtime FFI at
     ///     `crates/nsl-runtime/src/fused_linear_ce.rs` (`w_ptr` doc) and
