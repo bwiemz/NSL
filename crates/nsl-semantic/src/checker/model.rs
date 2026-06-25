@@ -206,6 +206,23 @@ impl<'a> TypeChecker<'a> {
                                 );
                             }
                             if dname == "paged_kv" {
+                                // Cycle-10 §5.3 (Task 4 / T6 / R9): record
+                                // the enclosing model's name so the
+                                // codegen-side dispatch fork at
+                                // `flash_attention_v2/mod.rs::synthesize_backward_with_tier`
+                                // can refuse the
+                                // `@checkpoint(policy="full")` + `@paged_kv`
+                                // composition before either side fires. v1
+                                // records lexical-scope membership only;
+                                // call-graph resolution deferred to v4.
+                                let model_name = self
+                                    .interner
+                                    .resolve(model_def.name.0)
+                                    .unwrap_or("")
+                                    .to_string();
+                                if !model_name.is_empty() {
+                                    self.effect_checker.mark_paged_kv_model(&model_name);
+                                }
                                 if let Some(ref args) = deco.args {
                                     for arg in args {
                                         if let Some(ref name_sym) = arg.name {
