@@ -12,6 +12,71 @@
 //! The PTX is supplied by the caller (typically a test or compiler-emitted
 //! call site); this module does NOT synthesise PTX — that lives in
 //! `nsl-codegen::fused_linear_ce`.
+//!
+//! # CFTP v5 follow-on Finding 7 (HIGH) — buffer-conformance contract
+//!
+//! When `dtype_tag != 0` (fp16 or bf16), the caller MUST allocate
+//! `x_ptr` / `w_ptr` / `bias_ptr` in HBM with a layout matching the dtype:
+//! `[B*S*H]` or `[V*H]` of 16-bit elements (2 bytes per elem) for the
+//! 16-bit dtypes.  The PTX kernels do `ld.global.b16` reads on those
+//! pointers — supplying a 32-bit-laid-out buffer reads the upper+lower
+//! halves of two adjacent f32s as a single bf16/fp16 with NO error and
+//! NO diagnostic (silent numerical corruption).
+//!
+//! The v5 wengert dispatch currently emits f32 buffers from the wengert
+//! tape regardless of the decorator's dtype hint — see the v6 ladder step
+//! "precision_cast / shadow-buffer pass" noted in
+//! `crates/nsl-codegen/src/wengert_lower.rs::lower_fused_linear_ce_forward`.
+//! Direct-FFI tests like `fused_linear_ce_{fp16,bf16}_v49152_numerical.rs`
+//! allocate compliant buffers explicitly so they are safe; codegen
+//! callers driving this FFI through `compile_wengert_ops` are NOT (yet).
+//!
+//! Setting `NSL_FUSED_LCE_REFUSE_NON_F32=1` in the environment causes
+//! both forward and backward FFI calls to refuse non-zero `dtype_tag`
+//! values with a hard return-code error rather than silently launching
+//! against potentially-mismatched buffers.  CI tests that supply bf16
+//! buffers explicitly should NOT set this var; production runners that
+//! drive the FFI through the wengert dispatch and want the
+//! deferral-must-refuse invariant active SHOULD.
+
+/// CFTP v5 follow-on Finding 7 (HIGH): opt-in runtime refusal of non-F32
+/// dispatch when the wengert-driven shadow-buffer plumbing is not yet
+/// in place.  Returns `Some(rc)` if the caller should short-circuit and
+/// return `rc` to its caller.  Returns `None` when the dispatch is
+/// allowed to proceed.
+///
+/// The refusal fires when:
+///   - `dtype_tag != 0`, AND
+///   - the `NSL_FUSED_LCE_REFUSE_NON_F32` env var is set to any non-empty
+///     value (e.g. `1`).
+///
+/// Tests that exercise the FFI directly with compliant bf16/fp16 buffers
+/// (the V=49152 numerical pins) do NOT set the env var; production
+/// runners that drive the FFI through the wengert dispatch SHOULD set
+/// it until v6 lands the precision_cast / shadow-buffer pass.
+#[inline]
+fn refuse_non_f32_if_gated(dtype_tag: i64, ffi_name: &str) -> Option<i64> {
+    if dtype_tag == 0 {
+        return None;
+    }
+    let gated = std::env::var_os("NSL_FUSED_LCE_REFUSE_NON_F32")
+        .map(|v| !v.is_empty())
+        .unwrap_or(false);
+    if !gated {
+        return None;
+    }
+    eprintln!(
+        "{ffi_name}: refusing dispatch with dtype_tag={dtype_tag} because \
+         NSL_FUSED_LCE_REFUSE_NON_F32 is set. The v5 codegen lift produces \
+         f32 buffers from the wengert tape; non-zero dtype_tag values \
+         require caller-allocated 16-bit-layout HBM (see module docs). \
+         Either unset NSL_FUSED_LCE_REFUSE_NON_F32 if the buffers are \
+         compliant (e.g. the V=49152 direct-FFI tests), or wait for the \
+         v6 shadow-buffer pass before driving this FFI from \
+         compile_wengert_ops with @fused_lm_ce(dtype=\"fp16\"|\"bf16\").",
+    );
+    Some(-1)
+}
 
 /// Forward: `loss[i] = -log_softmax(x[i] @ W^T + bias)[target[i]]`.
 ///
@@ -72,6 +137,12 @@ pub extern "C" fn nsl_fused_linear_ce_forward(
     // already specialized to the right dtype). The argument is plumbed so
     // future host-side hooks (e.g. SMEM cap raising for fp16) can branch on
     // it without another ABI change.
+    //
+    // CFTP v5 follow-on Finding 7: opt-in refusal when wengert-side shadow
+    // buffers are not yet plumbed.  See module docs.
+    if let Some(rc) = refuse_non_f32_if_gated(dtype_tag, "nsl_fused_linear_ce_forward") {
+        return rc;
+    }
     let _dtype_tag = dtype_tag;
     #[cfg(feature = "cuda")]
     {
@@ -173,6 +244,12 @@ pub extern "C" fn nsl_fused_linear_ce_forward_large(
     smem_bytes: i64,
     dtype_tag: i64,
 ) -> i64 {
+    // CFTP v5 follow-on Finding 7: see module docs.
+    if let Some(rc) =
+        refuse_non_f32_if_gated(dtype_tag, "nsl_fused_linear_ce_forward_large")
+    {
+        return rc;
+    }
     let _dtype_tag = dtype_tag;
     #[cfg(feature = "cuda")]
     {
@@ -265,6 +342,10 @@ pub extern "C" fn nsl_fused_linear_ce_backward(
     smem_bytes: i64,
     dtype_tag: i64,
 ) -> i64 {
+    // CFTP v5 follow-on Finding 7: see module docs.
+    if let Some(rc) = refuse_non_f32_if_gated(dtype_tag, "nsl_fused_linear_ce_backward") {
+        return rc;
+    }
     let grad_output = f32::from_bits(grad_output_bits as u32);
     let _dtype_tag = dtype_tag;
 
@@ -309,5 +390,97 @@ pub extern "C" fn nsl_fused_linear_ce_backward(
                  b, s, v, h, num_valid, smem_bytes);
         eprintln!("nsl_fused_linear_ce_backward: compiled without cuda feature");
         -1
+    }
+}
+
+#[cfg(test)]
+mod refusal_tests {
+    //! CFTP v5 follow-on Finding 7 (HIGH): tests for the opt-in runtime
+    //! refusal helper.  These run on every commit (no CUDA dependency) and
+    //! pin the env-var contract.
+
+    use super::refuse_non_f32_if_gated;
+
+    /// Helper: run a closure with the env var temporarily set to `value`,
+    /// restoring the previous state on drop.  Uses a process-wide mutex
+    /// because env-var manipulation is not thread-safe and cargo test
+    /// runs tests in parallel by default.
+    struct EnvGuard {
+        prev: Option<std::ffi::OsString>,
+    }
+    impl EnvGuard {
+        fn set(value: Option<&str>) -> Self {
+            let prev = std::env::var_os("NSL_FUSED_LCE_REFUSE_NON_F32");
+            match value {
+                Some(v) => std::env::set_var("NSL_FUSED_LCE_REFUSE_NON_F32", v),
+                None => std::env::remove_var("NSL_FUSED_LCE_REFUSE_NON_F32"),
+            }
+            EnvGuard { prev }
+        }
+    }
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => std::env::set_var("NSL_FUSED_LCE_REFUSE_NON_F32", v),
+                None => std::env::remove_var("NSL_FUSED_LCE_REFUSE_NON_F32"),
+            }
+        }
+    }
+
+    /// Tests serialize on this mutex so env-var manipulation does not race
+    /// across parallel test threads.  std::env::set_var is not thread-safe.
+    static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn dtype_tag_zero_never_refuses_regardless_of_env() {
+        let _lk = ENV_MUTEX.lock().unwrap();
+        for value in [None, Some(""), Some("1"), Some("anything")] {
+            let _g = EnvGuard::set(value);
+            assert!(
+                refuse_non_f32_if_gated(0, "test_call").is_none(),
+                "dtype_tag=0 (F32) must NEVER refuse; env={:?}", value
+            );
+        }
+    }
+
+    #[test]
+    fn dtype_tag_nonzero_with_env_unset_does_not_refuse() {
+        let _lk = ENV_MUTEX.lock().unwrap();
+        let _g = EnvGuard::set(None);
+        assert!(
+            refuse_non_f32_if_gated(1, "test_call").is_none(),
+            "dtype_tag=1 (F16) without env gate must NOT refuse (preserves \
+             V=49152 direct-FFI tests' behaviour)"
+        );
+        assert!(
+            refuse_non_f32_if_gated(2, "test_call").is_none(),
+            "dtype_tag=2 (Bf16) without env gate must NOT refuse"
+        );
+    }
+
+    #[test]
+    fn dtype_tag_nonzero_with_env_set_refuses() {
+        let _lk = ENV_MUTEX.lock().unwrap();
+        let _g = EnvGuard::set(Some("1"));
+        assert_eq!(
+            refuse_non_f32_if_gated(1, "test_call"),
+            Some(-1),
+            "dtype_tag=1 with env gate set must refuse with rc=-1"
+        );
+        assert_eq!(
+            refuse_non_f32_if_gated(2, "test_call"),
+            Some(-1),
+            "dtype_tag=2 with env gate set must refuse with rc=-1"
+        );
+    }
+
+    #[test]
+    fn empty_env_var_does_not_gate() {
+        let _lk = ENV_MUTEX.lock().unwrap();
+        let _g = EnvGuard::set(Some(""));
+        assert!(
+            refuse_non_f32_if_gated(1, "test_call").is_none(),
+            "empty NSL_FUSED_LCE_REFUSE_NON_F32 should NOT activate the gate"
+        );
     }
 }

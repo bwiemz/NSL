@@ -2587,39 +2587,43 @@ fn lower_fused_linear_ce_forward(
     ignore_index: i64,
     is_large: bool,
 ) -> Result<Value, CodegenError> {
-    // CFTP v4-2: read dtype hint from the active `@fused_lm_ce` decorator.
+    // CFTP v5: read dtype hint from the active `@fused_lm_ce` decorator.
     // Both the emitter cfg AND the FFI dtype_tag must agree; a single
     // source of truth (`fused_ce_dtype_for_compiler`) guarantees that.
-    let (dtype_tag, emitter_dtype) = fused_ce_dtype_for_compiler(compiler);
-    // Adversarial review Finding 2 (HIGH): the wengert tape produces f32
-    // tensors (no source-level fp16/bf16 type exists in NSL today), but
-    // the f16/bf16 emitters use `ld.global.b16` (2 bytes/elem) against
-    // f32 buffers (4 bytes/elem). Without a precision_cast op to
-    // re-allocate x_t/w_t/bias_t as 16-bit in HBM, every load reads
-    // half the bytes of one f32 element + half of the next, reinterpreting
-    // them as the 16-bit format — complete numerical garbage with no
-    // error, no diagnostic, no compile-time refusal. Per the deferral
-    // pattern codified in `feedback_deferral_must_refuse`: a deferred
-    // surface MUST refuse, not silently corrupt. Lift the cast-plumbing
-    // gate to a hard CodegenError until the parallel-bf16-buffer
-    // allocation pass lands (tracked for v4-3+).
     //
-    // The v4-1 emitters themselves are validated end-to-end by direct
-    // FFI tests in `fused_linear_ce_bf16_numerical.rs` /
-    // `fused_linear_ce_numerical.rs` (fp16) which allocate the 16-bit
-    // HBM buffers themselves — that path is unaffected by this refusal.
-    if !matches!(emitter_dtype, crate::fused_linear_ce::Dtype::F32) {
-        return Err(CodegenError::new(format!(
-            "@fused_lm_ce(dtype = \"{}\") requires HBM precision_cast \
-             plumbing for x/W/bias (the wengert tape is f32; the f16/bf16 \
-             emitters expect 16-bit storage) — deferred to a follow-on \
-             sprint. As of v4-2, only `dtype = \"f32\"` (or absent) is \
-             accepted at this dispatch site; the f16/bf16 emitters are \
-             reachable end-to-end via direct FFI tests with caller-managed \
-             16-bit HBM allocation.",
-            emitter_dtype.tag()
-        )));
-    }
+    // ACTIVATION (Sprint v5): the v4-2 refusal that gated this dispatch on
+    // `dtype == F32` is LIFTED.  GPU numerical correctness at V=49152 was
+    // validated by the prior sprint via direct-FFI tests
+    // (`fused_linear_ce_fp16_v49152_numerical.rs` /
+    //  `fused_linear_ce_bf16_v49152_numerical.rs`) with documented
+    // relaxed tolerances (≈5e-2 rel-err) derived from the 384-tile
+    // mantissa analysis — that empirical pin closes the v4 reviewer's
+    // "no full-V numerical pin" finding.
+    //
+    // ⚠️  CFTP v5 follow-on Finding 7 (HIGH) — buffer-conformance gap.
+    // The wengert tape still produces f32 tensors today; the runtime
+    // contract is that callers using `@fused_lm_ce(dtype = "fp16"|"bf16")`
+    // are responsible for ensuring the x/W/bias HBM allocations match the
+    // sentinel.  When the buffer layout does NOT match (e.g. wengert
+    // emits f32 here, the PTX bytes ld.global.b16 against the f32 bytes),
+    // the kernel reads garbage with NO error and NO diagnostic.  Per the
+    // `feedback_deferral_must_refuse` invariant, this is exactly the
+    // silent-weakening pattern that should not ship.
+    //
+    // Mitigation pending the v6 shadow-buffer plumbing:
+    //   * Set `NSL_FUSED_LCE_REFUSE_NON_F32=1` in the runtime environment
+    //     to harden `nsl_fused_linear_ce_{forward,forward_large,backward}`
+    //     against dtype_tag != 0 dispatches.  See
+    //     `crates/nsl-runtime/src/fused_linear_ce.rs::refuse_non_f32_if_gated`.
+    //   * The activation tests in `fused_lm_ce_activation_end_to_end.rs`
+    //     verify IR shape only; they do NOT execute the FFI.
+    //   * Direct-FFI tests (`fused_linear_ce_{fp16,bf16}_v49152_numerical.rs`)
+    //     allocate compliant bf16/fp16 buffers manually — they ARE safe.
+    //
+    // v6 ladder step: insert an explicit f32→bf16/fp16 device-side cast
+    // op into the wengert tape for x_t/w_t/bias_t when emitter_dtype != F32,
+    // then drop the runtime env-var guard.
+    let (dtype_tag, emitter_dtype) = fused_ce_dtype_for_compiler(compiler);
     let cfg = build_fused_ce_cfg(
         vocab_size,
         hidden_size,
@@ -2858,25 +2862,24 @@ fn lower_fused_linear_ce_backward_extract(
     let slot = if let Some(&cached) = compiler.fused_ce_bwd_cache.get(&fwd_result_key) {
         cached
     } else {
-        // CFTP v4-2: same dtype source-of-truth as forward (see
+        // CFTP v5: same dtype source-of-truth as forward (see
         // `fused_ce_dtype_for_compiler`). The backward kernel name is
         // a function of the cfg's `dtype` field so the PTX byte stream
         // we synthesise here must match the forward path's choice.
+        //
+        // ACTIVATION (Sprint v5): the v4-2 backward refusal is LIFTED
+        // symmetrically with the forward path.  The backward kernel writes
+        // `dx_out` / `dw_out` / `dbias_out` as f32 regardless of `dtype_tag`
+        // (per the runtime contract), so the gradient that flows back into
+        // the (f32) wengert tape is dtype-correct without further plumbing.
+        // Only the f16/bf16 reads of x/W/bias/lse are dtype-sensitive, and
+        // those mirror the forward dispatch contract closed in v5.
+        //
+        // ⚠️  CFTP v5 follow-on Finding 7 — the same buffer-conformance
+        // gap that applies to the forward dispatch applies here.  See the
+        // forward path's comment block above and
+        // `crates/nsl-runtime/src/fused_linear_ce.rs::refuse_non_f32_if_gated`.
         let (dtype_tag, emitter_dtype) = fused_ce_dtype_for_compiler(compiler);
-        // Adversarial review Finding 2 (HIGH): mirror the forward
-        // refusal — the backward emitter has the same HBM-layout
-        // contract (`ld.global.b16` against f32 buffers = corruption).
-        // The forward dispatch would normally have errored out before
-        // we ever get here, but the guard is duplicated defensively
-        // in case a future caller invokes backward directly.
-        if !matches!(emitter_dtype, crate::fused_linear_ce::Dtype::F32) {
-            return Err(CodegenError::new(format!(
-                "@fused_lm_ce(dtype = \"{}\") backward: same precision_cast \
-                 plumbing gap as forward (see `lower_fused_linear_ce_forward` \
-                 for the full rationale). Deferred to a follow-on sprint.",
-                emitter_dtype.tag()
-            )));
-        }
         let cfg = build_fused_ce_cfg(
             vocab_size,
             hidden_size,

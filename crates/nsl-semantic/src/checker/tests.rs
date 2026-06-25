@@ -779,6 +779,60 @@ train(model = m, epochs = 1):
     );
 }
 
+/// CFTP v5 follow-on Finding 1 (HIGH): a SECOND `@fused_lm_ce` decorator
+/// in the same compilation unit must be REFUSED.  The codegen reads
+/// `fused_ce_configs.first()` for every train block's dtype dispatch, so a
+/// silently-accepted second decorator would corrupt the second train block's
+/// HBM-layout contract (e.g. `@fused_lm_ce(dtype="fp16")` first +
+/// `@fused_lm_ce(dtype="bf16")` second → second block silently uses fp16
+/// dispatch against bf16 buffers).  See `feedback_deferral_must_refuse`.
+#[test]
+fn fused_lm_ce_duplicate_decorator_is_refused() {
+    let src = r#"
+model Tiny:
+    w: Tensor = ones([2, 1])
+
+    fn forward(self, x: Tensor) -> Tensor:
+        return x @ self.w
+
+let m = Tiny()
+let x = ones([4, 2])
+let y = zeros([4, 1])
+
+@fused_lm_ce(enabled = true, vocab_tile = 1024)
+train(model = m, epochs = 1):
+    optimizer: SGD(lr = 0.01)
+    step(batch):
+        let pred = m.forward(x)
+
+@fused_lm_ce(enabled = true, vocab_tile = 128)
+train(model = m, epochs = 1):
+    optimizer: SGD(lr = 0.01)
+    step(batch):
+        let pred = m.forward(x)
+"#;
+    let res = analyze_source(src);
+    // Only the FIRST decorator's config is collected; the second is refused.
+    assert_eq!(
+        res.fused_ce_configs.len(),
+        1,
+        "duplicate @fused_lm_ce: expected exactly one collected config (the first), \
+         got {:?}",
+        res.fused_ce_configs.len()
+    );
+    assert_eq!(
+        res.fused_ce_configs[0].vocab_tile,
+        Some(1024),
+        "the FIRST decorator's vocab_tile must be the surviving config",
+    );
+    assert!(
+        res.diagnostics.iter().any(|d| format!("{:?}", d)
+            .contains("at most one decorator is allowed per compilation unit")),
+        "expected duplicate-decorator refusal diagnostic, got: {:?}",
+        res.diagnostics
+    );
+}
+
 // -----------------------------------------------------------------------
 // WRGA decorator collection tests
 // -----------------------------------------------------------------------
