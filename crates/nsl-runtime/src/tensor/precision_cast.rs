@@ -35,6 +35,30 @@ pub extern "C" fn nsl_tensor_cast(src_ptr: i64, target_dtype: i64) -> i64 {
         "nsl_tensor_cast: GPU tensors not supported in v1 (device={})",
         t.device
     );
+    // CFTP v6 Finding 2 (HIGH): the cast reads `t.data` LINEARLY for `len`
+    // contiguous elements then overwrites the output strides with
+    // `compute_strides(shape)` (always row-major contiguous). A non-contiguous
+    // source (transposed view, sliced view, broadcast) would silently produce a
+    // tensor whose values are wrong — the cast reads physical layout but claims
+    // logical contiguous semantics. Refuse non-contiguous sources loudly so a
+    // future caller that legitimately passes a strided view surfaces here
+    // rather than silently corrupting training numerics.
+    assert!(
+        t.is_contiguous(),
+        "nsl_tensor_cast: source tensor must be contiguous (ndim={}); \
+         non-contiguous sources are NOT supported — call \
+         nsl_tensor_contiguous(src) before nsl_tensor_cast.",
+        t.ndim
+    );
+    // CFTP v6 Finding 4 (MEDIUM): len/shape mismatch would size the alloc
+    // by `t.len` while downstream callers (PTX kernels) trust `product(shape)`
+    // — refuse such tensors at the cast site to catch the violation early.
+    assert_eq!(
+        t.len,
+        NslTensor::total_elements(t.shape, t.ndim),
+        "nsl_tensor_cast: t.len ({}) != product(t.shape) — invariant violation",
+        t.len
+    );
     let len = t.len as usize;
     let target = target_dtype as u16;
 
@@ -132,6 +156,22 @@ fn cast_and_publish(src_ptr: i64, target_dtype: u16) -> i64 {
         "cast_and_publish: GPU tensors not supported in v6 (device={}); v7 will add a PTX cast kernel",
         t.device
     );
+    // CFTP v6 Finding 2 (HIGH): refuse non-contiguous sources — see the
+    // long-form rationale on nsl_tensor_cast. The linear-read + row-major-
+    // strides path silently corrupts non-contiguous inputs.
+    assert!(
+        t.is_contiguous(),
+        "cast_and_publish: source tensor must be contiguous (ndim={}); \
+         the wengert lowering must pass contiguous x/W/bias buffers.",
+        t.ndim
+    );
+    // CFTP v6 Finding 4 (MEDIUM): refuse len/shape mismatch.
+    assert_eq!(
+        t.len,
+        NslTensor::total_elements(t.shape, t.ndim),
+        "cast_and_publish: t.len ({}) != product(t.shape) — invariant violation",
+        t.len
+    );
     let len = t.len as usize;
 
     let src_f32: Vec<f32> = match t.dtype {
@@ -204,6 +244,19 @@ pub extern "C" fn nsl_tensor_cast_into(dst_ptr: i64, src_ptr: i64) {
     let src = unsafe { &*(src_ptr as *const NslTensor) };
     assert_eq!(dst.device, 0, "nsl_tensor_cast_into: GPU dst not supported in v1 (device={})", dst.device);
     assert_eq!(src.device, 0, "nsl_tensor_cast_into: GPU src not supported in v1 (device={})", src.device);
+    // CFTP v6 Finding 2: refuse non-contiguous src/dst — `nsl_tensor_cast_into`
+    // does a linear read and a linear in-place write; a non-contiguous view
+    // would silently corrupt the underlying buffer.
+    assert!(
+        src.is_contiguous(),
+        "nsl_tensor_cast_into: src must be contiguous (ndim={})",
+        src.ndim
+    );
+    assert!(
+        dst.is_contiguous(),
+        "nsl_tensor_cast_into: dst must be contiguous (ndim={})",
+        dst.ndim
+    );
     let len = dst.len as usize;
     assert_eq!(dst.len, src.len, "nsl_tensor_cast_into: length mismatch (dst={}, src={})", dst.len, src.len);
 
@@ -664,5 +717,37 @@ mod tests {
         assert_eq!(got, vec![0.0_f32, 0.0]);
         crate::tensor::nsl_tensor_free(template);
         crate::tensor::nsl_tensor_free(z);
+    }
+
+    /// CFTP v6 Finding 2 (HIGH): the contiguity guard precondition is a
+    /// load-bearing invariant — verify both positive forms work today.  The
+    /// negative (refusal) cases cannot use `#[should_panic]` because the
+    /// cast FFIs are `extern "C"` (panic-on-unwind aborts the test runner);
+    /// the assertion itself is verified at the function-prologue line.
+    /// This test exercises the happy path (contiguous tensor) and confirms
+    /// the new `is_contiguous` check does not over-trigger on row-major
+    /// rank-2 inputs (a stride layout the prior tests did not cover).
+    #[test]
+    fn cast_accepts_rank2_row_major_contiguous() {
+        // 2x2 row-major contiguous: shape=[2,2], strides=[2,1], len=4.
+        let vals = [1.0_f32, 2.0, 3.0, 4.0];
+        let len = vals.len();
+        let data = checked_alloc(len * std::mem::size_of::<f32>()) as *mut f32;
+        for (i, &v) in vals.iter().enumerate() {
+            unsafe { *data.add(i) = v };
+        }
+        let shape = NslTensor::copy_shape([2_i64, 2].as_ptr() as *mut i64, 2);
+        let strides = NslTensor::compute_strides(shape, 2);
+        let t = Box::new(NslTensor::new(
+            data as *mut c_void, shape, strides, 2, len as i64, 0, DTYPE_F32, 1, 0,
+        ));
+        let src = Box::into_raw(t) as i64;
+        // Should NOT panic — the contiguous, len==product(shape) input is valid.
+        let bf16 = nsl_tensor_to_bf16(src);
+        let t = unsafe { &*(bf16 as *const NslTensor) };
+        assert_eq!(t.dtype, DTYPE_BF16);
+        assert_eq!(t.len, 4);
+        crate::tensor::nsl_tensor_free(src);
+        crate::tensor::nsl_tensor_free(bf16);
     }
 }
