@@ -1060,12 +1060,25 @@ pub fn synthesize_backward_with_recompute(
     // Phase F (cycle 10 first-pass closure). See module doc above and
     // `docs/wiki/Checkpoint-v1-Defer-Log.md` § "Cycle 10 first-pass
     // functional gap closure (R0)" for the full disclosure.
-    return Err(
-        "@checkpoint(policy=\"full\") functional recompute not yet wired in v1: \
-         ships API surface + refusal cascade only. kv_load substitution + \
-         SMEM-base routing deferred to follow-on cycle behind GPU validation gate."
-            .to_string(),
-    );
+    //
+    // Cycle-11 §2 test-only bypass seam: when built with `cfg(test)` or
+    // the `test-helpers` Cargo feature AND the caller set
+    // `CheckpointExtras::bypass_r0_for_testing()`, fall through to the
+    // structurally-validated cascade below. In production builds the
+    // `r0_bypass` field doesn't exist (cfg-gated out), so this entire
+    // bypass-read compiles to a literal `false` and R0 always fires.
+    #[cfg(any(test, feature = "test-helpers"))]
+    let r0_bypass = extras.r0_bypass;
+    #[cfg(not(any(test, feature = "test-helpers")))]
+    let r0_bypass = false;
+    if !r0_bypass {
+        return Err(
+            "@checkpoint(policy=\"full\") functional recompute not yet wired in v1: \
+             ships API surface + refusal cascade only. kv_load substitution + \
+             SMEM-base routing deferred to follow-on cycle behind GPU validation gate."
+                .to_string(),
+        );
+    }
 
     // ── Refusals below are unreachable while R0 is in place (cycle 10
     //    v1). They are retained verbatim so that lifting R0 in cycle 11

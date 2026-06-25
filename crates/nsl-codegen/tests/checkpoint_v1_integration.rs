@@ -156,8 +156,8 @@ fn g2_r9_paged_kv_collision_refuses() {
     // enclosing fn was also `@paged_kv`-decorated. Phase F: R0-shadowed.
     let cfg = FlashAttentionConfig {
         checkpoint: Some(CheckpointExtras {
-            policy: CheckpointPolicy::Full,
             paged_kv_collision: true,
+            ..CheckpointExtras::full()
         }),
         ..base_fusible()
     };

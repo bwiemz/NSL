@@ -1122,6 +1122,8 @@ mod tests {
             checkpoint: Some(CheckpointExtras {
                 policy: CheckpointPolicy::Full,
                 paged_kv_collision: false,
+                #[cfg(any(test, feature = "test-helpers"))]
+                r0_bypass: false,
             }),
         }
     }

@@ -296,6 +296,19 @@ pub struct CheckpointExtras {
     /// Full call-graph propagation is deferred to v4 (T6). v1 trusts the
     /// wire-up site to set this; unit tests exercise the refusal directly.
     pub paged_kv_collision: bool,
+
+    /// Cycle-11 §2 test-only R0 bypass seam. When `true`, the R0 refusal
+    /// at `flash_attention_v2/mod.rs::synthesize_backward_with_recompute`
+    /// is skipped and the structurally-validated PTX recompute path is
+    /// emitted instead. Field exists ONLY under the `test` cfg or the
+    /// `test-helpers` Cargo feature — in production builds the field is
+    /// removed at compile time and R0 is unconditional.
+    ///
+    /// Construct via `bypass_r0_for_testing()` (chained builder), never
+    /// directly. Audit production by grepping `bypass_r0_for_testing` —
+    /// it must occur ONLY in `#[cfg(test)]` or test-helper modules.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub r0_bypass: bool,
 }
 
 impl CheckpointExtras {
@@ -306,7 +319,23 @@ impl CheckpointExtras {
         Self {
             policy: CheckpointPolicy::Full,
             paged_kv_collision: false,
+            #[cfg(any(test, feature = "test-helpers"))]
+            r0_bypass: false,
         }
+    }
+
+    /// Cycle-11 §2 test-only R0-bypass builder.
+    ///
+    /// Returns a carrier with `r0_bypass=true`, enabling the structurally
+    /// validated PTX recompute path under test. The R0 refusal at
+    /// `synthesize_backward_with_recompute` consults `r0_bypass` and skips
+    /// the refusal when this is set. In production the field doesn't exist
+    /// and R0 always fires — so calls to this builder from non-test code
+    /// would fail to compile, which is the desired audit posture.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn bypass_r0_for_testing(mut self) -> Self {
+        self.r0_bypass = true;
+        self
     }
 }
 
@@ -6101,6 +6130,8 @@ mod tests {
             checkpoint: Some(CheckpointExtras {
                 policy: CheckpointPolicy::Full,
                 paged_kv_collision: false,
+                #[cfg(any(test, feature = "test-helpers"))]
+                r0_bypass: false,
             }),
             ..config.clone()
         };
