@@ -35,7 +35,7 @@ pub mod vmap;
 pub mod wggo;
 pub mod wrga;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use nsl_ast::{Module, Symbol};
 use nsl_errors::Diagnostic;
@@ -85,6 +85,15 @@ pub struct AnalysisResult {
     /// the model's tensor-weight list.  Consumed by codegen to lower
     /// `self.W` → `load(weight_ptrs + index * 8)`.
     pub weight_index_map: WeightIndexMap,
+    /// Cycle-10 §5.3 (Task 3): per-function checkpointing policies, as
+    /// parsed from `@checkpoint(policy="...")` kwargs. Consumed by the
+    /// `nsl-cli` loader at `crates/nsl-cli/src/loader.rs` (Task 6) to
+    /// pass into `WengertExtractor::with_checkpoint_policy`.
+    pub checkpoint_policies: HashMap<String, crate::effects::CheckpointPolicy>,
+    /// Cycle-10 §5.3 (Task 4): models annotated `@paged_kv`. Consumed by
+    /// the codegen-side R9 cross-scope refusal predicate at
+    /// `flash_attention_v2/mod.rs::synthesize_backward_with_tier`.
+    pub paged_kv_models: HashSet<String>,
 }
 
 /// Run semantic analysis on a parsed module (single-file, backward compatible).
@@ -121,6 +130,11 @@ pub fn analyze_with_imports(
     let freeze_configs = checker.freeze_configs;
     let adapter_configs = checker.adapter_configs;
     let csha_configs = checker.csha_configs;
+    // Cycle-10 §5.3 (Tasks 3/4): extract checkpoint policies and
+    // @paged_kv membership from the effect checker for downstream
+    // codegen consumption.
+    let checkpoint_policies = checker.effect_checker.checkpoint_policies().clone();
+    let paged_kv_models = checker.effect_checker.paged_kv_models().clone();
 
     // M62: Run `@export` decorator validation.  Pure-additive — appends
     // diagnostics without touching other analysis state.  Also returns the
@@ -196,5 +210,7 @@ pub fn analyze_with_imports(
         adapter_configs,
         csha_configs,
         weight_index_map,
+        checkpoint_policies,
+        paged_kv_models,
     }
 }
