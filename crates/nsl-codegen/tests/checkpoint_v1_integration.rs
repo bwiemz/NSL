@@ -28,7 +28,7 @@
 //! lifting R0.
 
 use nsl_codegen::flash_attention::{
-    CheckpointExtras, CheckpointPolicy, CshaExtras, FlashAttentionConfig, RopeStyle,
+    CheckpointExtras, CshaExtras, FlashAttentionConfig, RopeStyle,
 };
 use nsl_codegen::flash_attention_v2::synthesize_backward_with_tier;
 
@@ -95,22 +95,18 @@ fn g1_no_decorator_backward_emits_no_checkpoint_marker() {
 
 #[test]
 fn g2_r0_policy_full_refuses_until_functional_recompute_lands() {
-    // R0 (Phase F): policy="full" must refuse at codegen until cycle 11
-    // wires the functional substitution (skip kv_load, route
-    // emit_prologue_recompute into %k_smem_base/%v_smem_base) and GPU
-    // numerical validation lands. Without this gate, cycle 10's
-    // comment-only post-injection would silently emit
-    // identical-to-no-decorator PTX, violating cycle-5
+    // R0 (cycle 11): the wording moved from "not yet wired" to
+    // "awaiting GPU numerical validation gate" once the CPU codegen
+    // substitution landed structurally. R0 still fires unconditionally
+    // in production until cycle 12 runs G4 on Blackwell and lifts it.
+    // Without R0, cycle 11's structurally-validated PTX would ship
+    // without numerical confirmation, violating
     // feedback_deferral_must_refuse.
     let cfg = base_fusible();
     let err = synthesize_backward_with_tier(&cfg)
         .expect_err("R0: policy=full must refuse in v1");
     assert!(
-        err.contains(
-            "@checkpoint(policy=\"full\") functional recompute not yet wired in v1: \
-             ships API surface + refusal cascade only. kv_load substitution + \
-             SMEM-base routing deferred to follow-on cycle behind GPU validation gate."
-        ),
+        err.contains("awaiting GPU numerical validation gate"),
         "R0 missing expected substring: {err}"
     );
 }
@@ -130,7 +126,7 @@ fn g2_r3_non_fusible_prologue_refuses() {
     let err = synthesize_backward_with_tier(&cfg)
         .expect_err("R3 (R0-shadowed in v1): config must refuse");
     assert!(
-        err.contains("functional recompute not yet wired in v1"),
+        err.contains("awaiting GPU numerical validation gate"),
         "R0 (shadowing R3) missing expected substring: {err}"
     );
 }
@@ -145,7 +141,7 @@ fn g2_r7_pca_packing_with_rope_q_refuses() {
     let err = synthesize_backward_with_tier(&cfg)
         .expect_err("R7 (R0-shadowed in v1): config must refuse");
     assert!(
-        err.contains("functional recompute not yet wired in v1"),
+        err.contains("awaiting GPU numerical validation gate"),
         "R0 (shadowing R7) missing expected substring: {err}"
     );
 }
@@ -164,7 +160,7 @@ fn g2_r9_paged_kv_collision_refuses() {
     let err = synthesize_backward_with_tier(&cfg)
         .expect_err("R9 (R0-shadowed in v1): config must refuse");
     assert!(
-        err.contains("functional recompute not yet wired in v1"),
+        err.contains("awaiting GPU numerical validation gate"),
         "R0 (shadowing R9) missing expected substring: {err}"
     );
 }
@@ -178,7 +174,7 @@ fn g2_r10_asymmetric_tile_refuses() {
     let err = synthesize_backward_with_tier(&cfg)
         .expect_err("R10 (R0-shadowed in v1): config must refuse");
     assert!(
-        err.contains("functional recompute not yet wired in v1"),
+        err.contains("awaiting GPU numerical validation gate"),
         "R0 (shadowing R10) missing expected substring: {err}"
     );
 }
@@ -202,45 +198,32 @@ fn g2_r81_sinks_v2_composition_refuses() {
     let err = synthesize_backward_with_tier(&cfg)
         .expect_err("R8.1 (R0-shadowed in v1): config must refuse");
     assert!(
-        err.contains("functional recompute not yet wired in v1"),
+        err.contains("awaiting GPU numerical validation gate"),
         "R0 (shadowing R8.1) missing expected substring: {err}"
     );
 }
 
-// ----- G3: R0 refusal-reachability probe (Phase F honest gate) ----------
-
-#[test]
-fn g3_policy_full_refuses_with_r0_substring() {
-    // G3 (Phase F): cycle 10's first pass shipped a tautological
-    // structural probe — it asserted that PTX comments containing
-    // synthesized substrings were emitted, which passed trivially
-    // because the comments contained themselves. Reviewer 1 caught
-    // this. Phase F replaces G3 with a honest refusal-reachability
-    // gate: a fusible-prologue config that previously took the
-    // recompute path now returns R0's exact substring.
-    //
-    // This gate FAILS if R0 is removed without a real replacement —
-    // i.e., if cycle 11 lifts R0 without simultaneously wiring the
-    // kv_load skip + SMEM-base routing + GPU validation gate. The
-    // cycle-11 commit that lifts R0 must also rewrite G3 to assert
-    // numerical equivalence against the materialized-saves baseline.
-    let cfg = base_fusible();
-    let err = synthesize_backward_with_tier(&cfg)
-        .expect_err("G3: fusible-prologue + checkpoint=Full must refuse at R0 in v1");
-
-    assert!(
-        err.contains("@checkpoint(policy=\"full\") functional recompute not yet wired in v1"),
-        "G3: R0 refusal substring missing. Got: {err}"
-    );
-    assert!(
-        err.contains("kv_load substitution + SMEM-base routing deferred"),
-        "G3: R0 deferral disclosure missing. Got: {err}"
-    );
-    assert!(
-        err.contains("behind GPU validation gate"),
-        "G3: R0 GPU-validation-gate disclosure missing. Got: {err}"
-    );
-}
+// ----- G3 retired in cycle 11 -------------------------------------------
+//
+// Cycle 10 Phase F shipped `g3_policy_full_refuses_with_r0_substring`
+// as a refusal-reachability gate against the R0 substring set
+// ("functional recompute not yet wired in v1" + "kv_load substitution
+// + SMEM-base routing deferred" + "behind GPU validation gate"). Those
+// substrings were retired in cycle 11 along with the wording update
+// — the CPU codegen substitution is now wired and the deferral is
+// gated by GPU numerical validation (cycle 12), not by wiring.
+//
+// The cycle 11 replacement is the four-gate suite
+// `g3a/g3b/g3c/g3d_*` in
+// `tests/checkpoint_cycle11_structural.rs`, which covers the same
+// reachability invariant PLUS structural witnesses for the dispatch
+// fork (kv_load skip + recompute label + SMEM-write ordering +
+// no-decorator byte-identity).
+//
+// The R0-substring anchor itself lives in
+// `g2_r0_policy_full_refuses_until_functional_recompute_lands` above
+// — single source of truth so a future R0 wording change touches one
+// test, not two.
 
 // ----- G6: sibling-leak guard (EffectChecker::checkpoint_policies) ------
 

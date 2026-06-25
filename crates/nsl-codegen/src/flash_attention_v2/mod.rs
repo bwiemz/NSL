@@ -1073,9 +1073,10 @@ pub fn synthesize_backward_with_recompute(
     let r0_bypass = false;
     if !r0_bypass {
         return Err(
-            "@checkpoint(policy=\"full\") functional recompute not yet wired in v1: \
-             ships API surface + refusal cascade only. kv_load substitution + \
-             SMEM-base routing deferred to follow-on cycle behind GPU validation gate."
+            "@checkpoint(policy=\"full\") refused: CPU codegen substitution wired \
+             (cycle 11) but awaiting GPU numerical validation gate (cycle 12). \
+             kv_load -> recompute routing structurally validated; deferred \
+             until end-to-end gradient correctness confirmed on Blackwell."
                 .to_string(),
         );
     }
