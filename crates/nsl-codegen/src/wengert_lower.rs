@@ -2500,6 +2500,55 @@ fn fused_ce_dtype_for_compiler(
     }
 }
 
+/// CFTP v6 — Inline precision-cast for fused_linear_ce inputs.
+///
+/// Given the `dtype_tag` resolved from `fused_ce_dtype_for_compiler` and the
+/// three f32 wengert tensors (x / W / bias), emit a `nsl_tensor_to_bf16` or
+/// `nsl_tensor_to_fp16` call for each when `dtype_tag != 0`, returning the
+/// cast tensor handles to be fed into the subsequent `nsl_tensor_data_ptr`
+/// calls. When `dtype_tag == 0` the tensors are returned unchanged so the
+/// F32 v1 byte-identity contract is preserved (no extra FFI calls, no extra
+/// HBM allocation).
+///
+/// The runtime cast wrappers (`nsl_tensor_to_{bf16,fp16}`, registered in
+/// `RUNTIME_FUNCTIONS` by the CFTP v6 codegen-signatures commit) publish
+/// the shadow buffer into the scope sweep, so the cast tensors are
+/// reclaimed at function-scope exit alongside `loss_out` / `lse_out`.
+///
+/// `dtype_tag` is the same wire constant the FFI's terminal `dtype_tag_val`
+/// arg uses:
+///   * 0 -> F32 — no cast, no FFI emit.
+///   * 1 -> FP16 — emit `nsl_tensor_to_fp16` for each input.
+///   * 2 -> BF16 — emit `nsl_tensor_to_bf16` for each input.
+/// Any other value is a logic error (we panic-on-unreachable in the helper
+/// rather than silently dropping the dtype).
+fn maybe_precision_cast_inputs(
+    compiler: &mut crate::compiler::Compiler,
+    builder: &mut FunctionBuilder,
+    dtype_tag: i64,
+    x_t: Value,
+    w_t: Value,
+    bias_t: Value,
+) -> Result<(Value, Value, Value), CodegenError> {
+    let cast_fn = match dtype_tag {
+        0 => return Ok((x_t, w_t, bias_t)),
+        1 => "nsl_tensor_to_fp16",
+        2 => "nsl_tensor_to_bf16",
+        other => {
+            return Err(CodegenError::new(format!(
+                "maybe_precision_cast_inputs: unsupported dtype_tag {other} \
+                 (expected 0=F32, 1=FP16, 2=BF16). This is a wengert-lower \
+                 invariant; fused_ce_dtype_for_compiler must produce exactly \
+                 one of {{0,1,2}}."
+            )));
+        }
+    };
+    let x_cast = call(compiler, builder, cast_fn, &[x_t])?;
+    let w_cast = call(compiler, builder, cast_fn, &[w_t])?;
+    let bias_cast = call(compiler, builder, cast_fn, &[bias_t])?;
+    Ok((x_cast, w_cast, bias_cast))
+}
+
 /// Embed a Vec<u8> of PTX bytes (NUL-terminated copy made internally) and
 /// a kernel name (NUL-terminated copy) into the Cranelift module's
 /// `.rodata` and return Cranelift Values pointing to each.
@@ -2643,10 +2692,33 @@ fn lower_fused_linear_ce_forward(
     let loss_out = alloc_gpu_f32_tensor(compiler, builder, &[rows])?;
     let lse_out = alloc_gpu_f32_tensor(compiler, builder, &[rows])?;
 
-    // Extract raw device pointers for the FFI.
-    let x_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[x_t])?;
-    let w_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[w_t])?;
-    let bias_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[bias_t])?;
+    // CFTP v6: INLINE PRECISION CAST (closes Sprint v5 Finding 7).
+    //
+    // When the active `@fused_lm_ce(dtype = "fp16"|"bf16")` decorator selects
+    // a non-f32 emitter dtype, the wengert tape's f32 storage no longer
+    // matches the PTX's `ld.global.b16` reads on x/W/bias. Sprint v5
+    // mitigated via an env-gated runtime refusal (`NSL_FUSED_LCE_REFUSE_NON_F32`);
+    // Sprint v6 closes the gap STRUCTURALLY by inserting an explicit cast
+    // op BEFORE the FFI call so the kernel sees the correct byte layout.
+    //
+    // Cast scope: only the x/W/bias INPUTS (read as fp16/bf16 by the PTX).
+    // Outputs (loss_out / lse_out / dx / dW / dbias) stay f32 — the FFI
+    // contract is master-grad on the output side regardless of dtype_tag.
+    //
+    // Lifecycle: `nsl_tensor_to_{bf16,fp16}` publish the shadow buffer into
+    // the scope sweep (see `precision_cast::cast_and_publish`), so each cast
+    // tensor is reclaimed at function-scope exit — same lifecycle as
+    // `loss_out`/`lse_out` above.  Cost is `(B*S*H + V*H + V) * 2 bytes` of
+    // extra HBM per forward+backward step; the caching path is a v7 opt.
+    //
+    // Byte-identity: when `dtype_tag == 0` (no decorator OR `dtype="f32"`)
+    // the cast block is fully skipped, so the F32 v1 byte-identity contract
+    // is preserved.
+    let (x_t_for_ffi, w_t_for_ffi, bias_t_for_ffi) =
+        maybe_precision_cast_inputs(compiler, builder, dtype_tag, x_t, w_t, bias_t)?;
+    let x_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[x_t_for_ffi])?;
+    let w_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[w_t_for_ffi])?;
+    let bias_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[bias_t_for_ffi])?;
     let tgt_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[targets_t])?;
     let loss_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[loss_out])?;
     let lse_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[lse_out])?;
@@ -2917,10 +2989,17 @@ fn lower_fused_linear_ce_backward_extract(
                 )
             })?;
 
-        // Extract raw device pointers for the backward FFI.
-        let x_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[x_t])?;
-        let w_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[w_t])?;
-        let bias_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[bias_t])?;
+        // CFTP v6: INLINE PRECISION CAST on backward inputs (symmetric with
+        // forward path; see lower_fused_linear_ce_forward for the rationale).
+        // Only x/W/bias are read in the dtype-sensitive `ld.global.b16` paths;
+        // lse_out stays f32 (FFI contract), and the dx/dW/dbias outputs stay
+        // f32 (master-grad convention). dtype_tag == 0 fully skips the cast,
+        // preserving the F32 v1 byte-identity contract.
+        let (x_t_for_ffi, w_t_for_ffi, bias_t_for_ffi) =
+            maybe_precision_cast_inputs(compiler, builder, dtype_tag, x_t, w_t, bias_t)?;
+        let x_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[x_t_for_ffi])?;
+        let w_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[w_t_for_ffi])?;
+        let bias_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[bias_t_for_ffi])?;
         let tgt_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[targets_t])?;
         let lse_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[lse_out])?;
         let dx_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[dx_out])?;
