@@ -352,6 +352,19 @@ fn bf16_large_vocab_tail_zero_writes_bf16_neg_inf_directly() {
          broken f32-sentinel-then-cvt pattern that round-trips through \
          cvt.rn.bf16.f32 to a finite value and corrupts the max-reduce"
     );
+    // (2b) Adversarial review Finding 6: tighten the scope — assert that
+    // NO `0f80800000` (the smallest-normal-negative bug pattern) appears
+    // anywhere in the partials section as the operand of a `mov.f32`,
+    // AND that no `0f80800000` follows a `cvt.rn.bf16.f32` cvt anywhere.
+    // Finding 3 fixed the register-init sites (now `0fFF800000` = true
+    // f32 -INF); this gate locks the fix in against regression.
+    assert!(
+        !partials_section.contains("0f80800000"),
+        "Partials kernel must NOT contain ANY `0f80800000` literal — \
+         Finding 3 corrected the -INF register-init bit pattern to \
+         `0fFF800000`; presence of the old buggy literal indicates a \
+         regression."
+    );
     // (3) Negative pin against the fp16 sentinel value — copy-paste hazard
     // from the fp16 emitter would have left 0xFC00 in place.
     assert!(

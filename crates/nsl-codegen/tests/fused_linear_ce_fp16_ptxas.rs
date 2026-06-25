@@ -317,10 +317,11 @@ fn fp16_large_vocab_tail_zero_writes_fp16_neg_inf_directly() {
     // (2) The broken pattern must be GONE from the F16 large-vocab
     // partials kernel.  Search restricted: scope to the partials
     // kernel by anchoring on the kernel name and stopping at the
-    // finalize entry-point.  This prevents false positives from
-    // unrelated f32 sentinels in the finalize kernel (which reads
-    // f32 partials and legitimately uses 0f80800000 for its f32 max
-    // accumulator init).
+    // finalize entry-point.  Historically this prevented false positives
+    // from `0f80800000` sentinels in the finalize kernel, but Finding 3
+    // corrected ALL register-init sites to `0fFF800000` so the literal
+    // `0f80800000` no longer appears anywhere in fused-LCE PTX (outside
+    // explanatory comments). The scoping is kept for forward-compat.
     let partials_name = cfg.large_partials_kernel_name();
     let finalize_name = cfg.large_finalize_kernel_name();
     let partials_start = txt
@@ -336,6 +337,17 @@ fn fp16_large_vocab_tail_zero_writes_fp16_neg_inf_directly() {
         "Partials kernel must NOT mov 0f80800000 into %facc — that was \
          the broken sentinel that round-tripped through cvt.rn.f16.f32 \
          to fp16 0x0000 (Finding 2 regression guard)"
+    );
+    // Adversarial review Finding 6 (parallel to bf16): assert the literal
+    // `0f80800000` is absent from the partials section entirely. Finding 3
+    // corrected ALL register-init bit patterns from `0f80800000`
+    // (= -1.175e-38) to `0fFF800000` (= true f32 -INF); this gate locks
+    // the fix in against regression.
+    assert!(
+        !partials_section.contains("0f80800000"),
+        "Partials kernel must NOT contain ANY `0f80800000` literal — \
+         Finding 3 corrected the -INF register-init bit pattern. \
+         Presence of the old buggy literal indicates a regression."
     );
 
     // (3) ptxas-assemble.
