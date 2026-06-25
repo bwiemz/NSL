@@ -2002,6 +2002,21 @@ impl<'a> WengertExtractor<'a> {
 
             // Field access: self.w, m.w, block.attn → treat as a parameter reference
             ExprKind::MemberAccess { object, member } => {
+                // G6.1.2 — paper §3.2 closure: pre-register all nested
+                // model contexts implied by this MemberAccess chain
+                // BEFORE computing `is_model_param` below.  Top-down
+                // extraction otherwise computes the classification
+                // before recursing into the inner object, so
+                // `self.blocks[0].attn.wq` would check
+                // `is_model_param("m.blocks.0.attn")` against an empty
+                // map, fall to the data-access branch, then only
+                // register "m.blocks.0" once it recurses all the way
+                // down — too late to fix the classification of the
+                // ancestor frames.  The pre-pass walks bottom-up so all
+                // intermediate contexts are in place before the
+                // classification check.
+                self.preregister_chain_contexts(expr);
+
                 // WRGA B.3.2 Option 3: synthesized adapter accesses carry a
                 // sentinel member Symbol; the real field name lives in
                 // synth_member_names. Consult it FIRST so we recover e.g.
@@ -2042,6 +2057,16 @@ impl<'a> WengertExtractor<'a> {
                         // by recursively resolving the member access chain
                         self.resolve_member_access_prefix(object)
                     }
+                    // G6.1.2 — paper §3.2 closure: subscript on `[Model; N]`
+                    // produces a compound prefix like `"m.blocks.0"` that
+                    // matches what `enumerate_model_tensor_paths` emits in
+                    // the runtime tensor-path table (stmt.rs ~line 6396).
+                    // The `Subscript` arm in `extract_expr` will have
+                    // already registered the indexed context into
+                    // `context_to_model_type` by the time we reach the
+                    // first `.field` access on the result, so the
+                    // Param-classification check below sees it.
+                    ExprKind::Subscript { .. } => self.resolve_member_access_prefix(object),
                     _ => None,
                 };
 
@@ -2062,11 +2087,67 @@ impl<'a> WengertExtractor<'a> {
 
                     // Determine if this is a model parameter (prefix is a known model context)
                     // or a data access (e.g., batch.input_ids). Only model params get gradients.
-                    let is_model_param = self.context_to_model_type.contains_key(&prefix);
+                    //
+                    // G6.1.2 — paper §3.2 closure: not every field access on a
+                    // model context is a tensor Param. `self.blocks` on
+                    // `TinyCoder` is a `[TransformerBlock; N]` array, not a
+                    // tensor. `self.attn` on `TransformerBlock` is a nested
+                    // model, not a tensor. Both must NOT be registered as
+                    // Params — otherwise the gradient-collection scan at
+                    // stmt.rs ~line 4856 fails to match them against the
+                    // runtime `trainable_tensor_param_paths`, surfacing as
+                    // the "0/N trainable params connected" silent grad-miss
+                    // that regressed the prior partial fix attempt.
+                    //
+                    // Discriminator: `model_field_types[parent_model_type]`
+                    // (built by `compiler/collection.rs:411-728`) is
+                    // populated ONLY with non-built-in named types — i.e.
+                    // nested model fields and `[Model; N]` array fields.
+                    // Tensor / int / float / bool / str fields are NEVER
+                    // present (filtered at collection.rs:507-510).  So if
+                    // `field_name` IS in the map, it's a nested model or
+                    // model-array (NOT a tensor) and must be classified as
+                    // a context, not a Param.
+                    let parent_model = self.context_to_model_type.get(&prefix).cloned();
+                    let nested_field_type = parent_model
+                        .as_ref()
+                        .and_then(|pt| self.model_field_types.get(pt))
+                        .and_then(|fields| fields.get(&field_name))
+                        .cloned();
+                    let is_model_param = parent_model.is_some() && nested_field_type.is_none();
 
                     let var = self.alloc_var();
                     self.symbol_to_var.insert(*member, var);
                     self.list.var_names.insert(var, compound.clone());
+
+                    // G6.1.2 — when the field is a SINGULAR nested model
+                    // (not a `[Model; N]` array), register the compound as
+                    // a new context so the next chain link (`.tensor` or
+                    // `.method()`) resolves correctly.  Array fields are
+                    // registered per-index by the `Subscript` arm below;
+                    // doing it here for `[Model; N]` would register a
+                    // mis-shaped "array-context" that wouldn't match any
+                    // runtime path.
+                    //
+                    // Format coupling: `starts_with('[')` here recognizes
+                    // the `format!("[{};{}]", elem_name, size)` produced
+                    // by `compiler/collection.rs::~line 481` for
+                    // `TypeExprKind::FixedArray`.  The two sites must
+                    // stay in sync — if the collection-side format ever
+                    // grows a leading whitespace or a different bracket
+                    // shape, this check silently mis-classifies and
+                    // downstream `is_model_param` accepts the array
+                    // name as a tensor Param.  No test currently catches
+                    // that drift; the coupling is documented here so a
+                    // future maintainer touching collection.rs:481 sees
+                    // the dependency.
+                    if let Some(ref ft) = nested_field_type {
+                        if !ft.starts_with('[') {
+                            self.context_to_model_type
+                                .entry(compound.clone())
+                                .or_insert_with(|| ft.clone());
+                        }
+                    }
 
                     if is_model_param {
                         self.param_symbols.insert(*member);
@@ -2990,6 +3071,15 @@ impl<'a> WengertExtractor<'a> {
 
             // Subscript: list[index] — non-differentiable metadata access
             ExprKind::Subscript { object, index } => {
+                // G6.1.2 — paper §3.2 closure: pre-register all nested
+                // model contexts implied by this chain before recursing.
+                // See `preregister_chain_contexts` for the rationale —
+                // top-down extraction would otherwise compute
+                // `is_model_param` before the recursive descent that
+                // would register intermediate contexts, locking in the
+                // wrong classification.
+                self.preregister_chain_contexts(expr);
+
                 let obj = self.extract_expr(object)?;
                 if let nsl_ast::expr::SubscriptKind::Index(idx_expr) = index.as_ref() {
                     let idx = self.extract_expr(idx_expr)?;
@@ -3420,8 +3510,131 @@ impl<'a> WengertExtractor<'a> {
         Some(result)
     }
 
+    /// G6.1.2 — paper §3.2 closure: walk a MemberAccess/Subscript chain
+    /// bottom-up and eagerly register all nested-model contexts implied
+    /// by the chain into `context_to_model_type`.
+    ///
+    /// Called from `extract_expr` at the top of every `MemberAccess`
+    /// and `Subscript` arm.  Without this pre-pass, the top-down
+    /// extraction order causes the parent `is_model_param` check to
+    /// run BEFORE the recursive descent that would register an
+    /// intermediate context, locking in a wrong-classification frame
+    /// at every chain depth.
+    ///
+    /// Registration uses `model_field_types` (populated by
+    /// `compiler/collection.rs:411-728`), which contains ONLY non-
+    /// built-in named field types (nested models + `[Model; N]`
+    /// arrays) — Tensor / int / float / bool / str are excluded at
+    /// collection.rs:507-510, so presence in the map is the
+    /// discriminator for "this field is a nested model context, not a
+    /// tensor Param".
+    ///
+    /// Indices must be static integer literals; dynamic indices skip
+    /// registration so the static-AD path falls back safely (tape-AD
+    /// handles dynamic indexing at runtime).
+    fn preregister_chain_contexts(&mut self, expr: &nsl_ast::expr::Expr) {
+        match &expr.kind {
+            ExprKind::MemberAccess { object, member } => {
+                // Descend first so deeper contexts are registered before
+                // we compute this access's compound.
+                self.preregister_chain_contexts(object);
+
+                // If the object resolves to a prefix and the parent
+                // model has this field as a SINGULAR nested model,
+                // register `{prefix}.{field} -> field_type`.  Skip
+                // array fields here — those are handled per-index by
+                // the Subscript arm below (registering a bare-array
+                // compound would mis-shape the context map).
+                if let Some(obj_prefix) = self.resolve_member_access_prefix(object) {
+                    let parent_model = self.context_to_model_type.get(&obj_prefix).cloned();
+                    let field_name = self.interner.resolve(member.0).unwrap_or("?").to_string();
+                    if let Some(parent) = parent_model {
+                        if let Some(field_ty) = self
+                            .model_field_types
+                            .get(&parent)
+                            .and_then(|fields| fields.get(&field_name))
+                            .cloned()
+                        {
+                            if !field_ty.starts_with('[') {
+                                let compound = format!("{}.{}", obj_prefix, field_name);
+                                self.context_to_model_type
+                                    .entry(compound)
+                                    .or_insert(field_ty);
+                            }
+                        }
+                    }
+                }
+            }
+            ExprKind::Subscript { object, index } => {
+                self.preregister_chain_contexts(object);
+
+                // Static-index subscript on a `[Model; N]` field:
+                // register the indexed compound -> element model type.
+                if let nsl_ast::expr::SubscriptKind::Index(idx_expr) = index.as_ref() {
+                    if let ExprKind::IntLiteral(i) = &idx_expr.kind {
+                        if *i >= 0 {
+                            if let Some(obj_prefix) = self.resolve_member_access_prefix(object) {
+                                if let Some((parent_pref, field_name)) =
+                                    obj_prefix.rsplit_once('.')
+                                {
+                                    let parent_model = self
+                                        .context_to_model_type
+                                        .get(parent_pref)
+                                        .cloned();
+                                    if let Some(field_ty) = parent_model
+                                        .as_ref()
+                                        .and_then(|pt| self.model_field_types.get(pt))
+                                        .and_then(|fields| fields.get(field_name))
+                                        .cloned()
+                                    {
+                                        // Same format coupling as the
+                                        // singular-Model arm above —
+                                        // recognises the
+                                        // `format!("[{};{}]", elem, n)`
+                                        // from
+                                        // `compiler/collection.rs::~481`.
+                                        // Any drift on either side breaks
+                                        // silently; keep these two
+                                        // recognizers in sync.
+                                        if field_ty.starts_with('[') && field_ty.contains(';') {
+                                            let inner = field_ty
+                                                .trim_start_matches('[')
+                                                .trim_end_matches(']');
+                                            if let Some(elem) = inner.split(';').next() {
+                                                let indexed_ctx = format!("{}.{}", obj_prefix, i);
+                                                self.context_to_model_type
+                                                    .entry(indexed_ctx)
+                                                    .or_insert_with(|| elem.trim().to_string());
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Resolve a nested MemberAccess chain to a compound prefix string.
     /// E.g., `self.attn` -> "m.blocks.0.attn", `block.ffn` -> "m.blocks.0.ffn"
+    ///
+    /// G6.1.2: also handles `Subscript` of array-of-models fields. For
+    /// `self.blocks[0]` this yields `"m.blocks.0"` — matching the
+    /// runtime tensor-path format that `enumerate_model_tensor_paths`
+    /// (stmt.rs ~line 6396) emits.  Subscript indices must be static
+    /// integer literals; dynamic indices return None so the AD path
+    /// falls back safely (tape-AD handles dynamic indexing at runtime).
+    ///
+    /// This is intentionally a PURE STRING WALK with no side effects —
+    /// eager registration of intermediate contexts happens in
+    /// `preregister_chain_contexts`, called at the top of the
+    /// `extract_expr` `MemberAccess` / `Subscript` arms.  Mixing
+    /// registration into resolution would re-introduce the
+    /// lazy-vs-eager asymmetry that regressed the prior partial fix
+    /// attempt.
     fn resolve_member_access_prefix(&self, expr: &nsl_ast::expr::Expr) -> Option<String> {
         match &expr.kind {
             ExprKind::MemberAccess { object, member } => {
@@ -3433,10 +3646,35 @@ impl<'a> WengertExtractor<'a> {
                         })
                     }
                     ExprKind::MemberAccess { .. } => self.resolve_member_access_prefix(object),
+                    ExprKind::Subscript { .. } => self.resolve_member_access_prefix(object),
                     _ => None,
                 };
                 let field_name = self.interner.resolve(member.0).unwrap_or("?").to_string();
                 obj_prefix.map(|p| format!("{}.{}", p, field_name))
+            }
+            // G6.1.2: array-of-models subscript. `self.blocks[0]` -> "m.blocks.0".
+            ExprKind::Subscript { object, index } => {
+                let obj_prefix = match &object.kind {
+                    ExprKind::SelfRef => self.self_context.clone(),
+                    ExprKind::Ident(sym) => {
+                        self.symbol_name_overrides.get(sym).cloned().or_else(|| {
+                            Some(self.interner.resolve(sym.0).unwrap_or("?").to_string())
+                        })
+                    }
+                    ExprKind::MemberAccess { .. } => self.resolve_member_access_prefix(object),
+                    ExprKind::Subscript { .. } => self.resolve_member_access_prefix(object),
+                    _ => None,
+                }?;
+                let nsl_ast::expr::SubscriptKind::Index(idx_expr) = index.as_ref() else {
+                    return None;
+                };
+                let ExprKind::IntLiteral(i) = &idx_expr.kind else {
+                    return None;
+                };
+                if *i < 0 {
+                    return None;
+                }
+                Some(format!("{}.{}", obj_prefix, i))
             }
             _ => None,
         }
