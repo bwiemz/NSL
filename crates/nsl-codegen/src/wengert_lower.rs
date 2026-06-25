@@ -2534,14 +2534,25 @@ fn maybe_precision_cast_inputs(
         0 => return Ok((x_t, w_t, bias_t)),
         1 => "nsl_tensor_to_fp16",
         2 => "nsl_tensor_to_bf16",
-        other => {
-            return Err(CodegenError::new(format!(
-                "maybe_precision_cast_inputs: unsupported dtype_tag {other} \
-                 (expected 0=F32, 1=FP16, 2=BF16). This is a wengert-lower \
-                 invariant; fused_ce_dtype_for_compiler must produce exactly \
-                 one of {{0,1,2}}."
-            )));
-        }
+        // CFTP v6 Finding 15 (LOW): `fused_ce_dtype_for_compiler` is the
+        // single source of truth; its fully-covered match over
+        // `Option<FusedCeDtypeHint>` (None|F32|F16|Bf16) produces exactly
+        // {0,1,2}.  If a future variant is added to `FusedCeDtypeHint`,
+        // that match becomes a compile error first — but if the producer
+        // is updated and the consumer (here) is forgotten, this
+        // `unreachable!` will fire loudly in debug builds, surfacing the
+        // missed update at the first test invocation rather than after
+        // a downstream codegen error.
+        other => unreachable!(
+            "maybe_precision_cast_inputs: unsupported dtype_tag {other} \
+             (expected 0=F32, 1=FP16, 2=BF16). This is a wengert-lower \
+             invariant violation; `fused_ce_dtype_for_compiler` is the \
+             single source of truth and must produce exactly one of \
+             {{0,1,2}}. If you are seeing this, you added a variant to \
+             `FusedCeDtypeHint` without updating both \
+             `fused_ce_dtype_for_compiler` (producer) and \
+             `maybe_precision_cast_inputs` (consumer)."
+        ),
     };
     let x_cast = call(compiler, builder, cast_fn, &[x_t])?;
     let w_cast = call(compiler, builder, cast_fn, &[w_t])?;

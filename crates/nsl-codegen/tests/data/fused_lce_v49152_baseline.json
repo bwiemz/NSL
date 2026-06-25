@@ -21,7 +21,8 @@
       "W_dist": "normal(0, 0.01) seed=137",
       "bias_dist": "zeros",
       "targets": "deterministic seeded; ~20% mapped to IGNORE_INDEX (-100)"
-    }
+    },
+    "fp16_bf16_rounding_mode_provenance": "round-to-nearest-even via half::f16::from_f32 / half::bf16::from_f32 (staged in the test harness BEFORE the GPU H2D copy). This matches the PTX kernel's `cvt.rn.{f16,bf16}.f32` semantics but does NOT match the v6 runtime cast primitives `f32_to_f16_bits` / `f32_to_bf16_bits`, which TRUNCATE (see adversarial-review Finding 11 + the docstring rewrite landed in this cycle). Adversarial-review Finding 9 (MEDIUM): the wengert-driven production path that flows through `nsl_tensor_to_{fp16,bf16}` would inject ~2x the rounding noise of the RTE-staged baseline; that path is REFUSED by default at the FFI (Findings 1/6/12 fix) until v7's RTE alignment lands, so the production path that would mismatch this baseline cannot reach the kernel today. Direct-FFI tests that opt-in via NSL_FUSED_LCE_ALLOW_NON_F32_FFI=1 stage RTE bytes themselves (see test_file), preserving baseline validity."
   },
   "fp16_v49152": {
     "test_file": "crates/nsl-codegen/tests/fused_linear_ce_fp16_v49152_numerical.rs",

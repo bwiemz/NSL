@@ -40,22 +40,38 @@
 //! different cfg from the explicit call path) would surface as a single-
 //! ULP discrepancy somewhere in the loss vector — flagged immediately.
 //!
-//! ## Test methodology
+//! ## Test methodology — what the CUDA-gated test actually pins
 //!
 //! There is no way to actually JIT-execute the two NSL programs in the
-//! current test harness (no `cranelift_jit` integration).  This test
-//! instead pins the equivalence at the FFI byte-contract layer:
+//! current test harness (no `cranelift_jit` integration).  The CUDA-
+//! gated runtime test (`decorator_and_explicit_call_loss_byte_identical_fp16`,
+//! `#[ignore]`'d) pins **kernel determinism under the fp16 dispatch**,
+//! not the decorator-vs-explicit-call ROUNDING equivalence — both paths
+//! stage their fp16 buffers via `half::f16::from_f32` (RTE) and the test
+//! runs the FFI twice on identical bytes, asserting byte-identical
+//! output.
 //!
-//!   * Call `nsl_fused_linear_ce_forward` with `dtype_tag=1` and fp16
-//!     buffers A (the "decorator-after-cast" outcome).
-//!   * Call `nsl_fused_linear_ce_forward` with `dtype_tag=1` and the
-//!     same fp16 buffers B (the "explicit-call pre-cast" outcome,
-//!     where the caller produced the SAME fp16 bytes via the same
-//!     `half::f16::from_f32` rounding the runtime cast wrapper
-//!     `nsl_tensor_to_fp16` is contracted to produce after v7's
-//!     rounding alignment).
-//!   * Assert the two output `loss[i]` arrays are bit-for-bit equal
-//!     via `to_bits()` comparison.
+//! That is INTENTIONAL.  The runtime cast wrapper `nsl_tensor_to_fp16`
+//! delegates to `f32_to_f16_bits`, which **truncates** the lower 13
+//! mantissa bits (NOT RTE — see `crates/nsl-runtime/src/tensor/mod.rs`
+//! docstring fix in Finding 11).  `nsl_tensor_to_fp16(x)` is therefore
+//! NOT bit-identical to `half::f16::from_f32(x)` for inputs whose
+//! dropped bits exceed the half-ULP rounding boundary, so a test that
+//! staged Path A via `nsl_tensor_to_fp16` and Path B via
+//! `half::from_f32` would FAIL byte-identity today.  Adversarial
+//! review Finding 8 (HIGH) identified this — the test docstring used
+//! to imply a rounding-equivalence claim the code cannot deliver until
+//! v7's RTE alignment lands.
+//!
+//! Concretely the CUDA-gated test verifies:
+//!   * The FFI is DETERMINISTIC under `dtype_tag=1` (two calls with
+//!     identical byte buffers produce bit-for-bit identical output).
+//!   * Not an end-to-end decorator-vs-explicit equivalence.
+//!
+//! The compile-side IR-equivalence pin (`decorator_path_and_explicit_call_path_emit_byte_identical_forward`)
+//! DOES assert byte-identical Cranelift IR for the two dispatch paths
+//! (same FFI call site, same `dtype_tag` literal, same iconst args) —
+//! that is the load-bearing equivalence claim the suite makes today.
 //!
 //! As a second pin, also assert that the SAME wengert dispatch under
 //! both an `enabled=true` decorator config AND a synthetic single-op
@@ -480,25 +496,25 @@ mod gpu {
         loss_gpu
     }
 
-    /// CUDA-gated byte-identical equivalence pin.
+    /// CUDA-gated FFI determinism pin under the fp16 dispatch.
     ///
-    /// Builds identical fp16 byte buffers, runs the forward kernel
-    /// twice, and asserts the per-row `loss` outputs are bit-for-bit
-    /// equal via `to_bits()`.  This is the strongest possible
-    /// equivalence statement — any single-ULP drift between two
-    /// supposedly-equivalent dispatch paths fails this gate
-    /// immediately.
+    /// Per adversarial-review Finding 8 (HIGH): this test does NOT
+    /// prove a decorator-vs-explicit-call rounding equivalence — both
+    /// calls stage their fp16 buffers via `half::f16::from_f32` (RTE)
+    /// and run the FFI twice on identical bytes.  The byte-identical
+    /// output proves the FFI is DETERMINISTIC, not that the two
+    /// dispatch paths produce equivalent rounding.  An honest
+    /// rounding-equivalence test would route Path A through
+    /// `nsl_tensor_to_fp16` (truncating) and Path B through
+    /// `half::f16::from_f32` (RTE), which would FAIL byte-identity
+    /// today and only pass after v7's RTE alignment lands.
     ///
-    /// Concretely: the orchestrator's claim is that the decorator path
-    /// (cast then call) and the explicit-call path (pre-cast then
-    /// call) terminate at the SAME FFI with the SAME bytes; the
-    /// byte-identical output is the operational consequence of that
-    /// claim.  Both calls in this test simulate one of the two paths
-    /// having just delivered its fp16 bytes to the FFI; the FFI is
-    /// deterministic; the outputs are bit-identical.
+    /// The compile-side IR-equivalence pin in this file does prove
+    /// byte-identical Cranelift IR for the two dispatch paths; that
+    /// is the load-bearing equivalence claim the suite makes today.
     #[test]
     #[ignore]
-    fn decorator_and_explicit_call_loss_byte_identical_fp16() {
+    fn ffi_is_deterministic_under_fp16_dispatch() {
         if !cuda_available() {
             return;
         }
@@ -563,14 +579,14 @@ mod gpu {
         }
         assert_eq!(
             mismatches, 0,
-            "fp16 decorator path and explicit-call path produced non-byte-identical \
-             loss for {mismatches} of {rows} rows.  Either the FFI lost determinism, \
-             or the two dispatch paths diverged in their byte-level commitments to \
-             the kernel (different rounding mode, different dtype_tag, different \
-             grid shape).  Mismatching rows printed above."
+            "fp16 FFI lost determinism: {mismatches} of {rows} rows produced \
+             non-byte-identical loss between two identical-input dispatches. \
+             The FFI MUST be deterministic — a kernel that takes the same \
+             device bytes twice must produce the same output bytes twice. \
+             Mismatching rows printed above."
         );
         eprintln!(
-            "fp16 byte-identical equivalence: {} of {} rows bit-for-bit equal",
+            "fp16 FFI determinism: {} of {} rows bit-for-bit equal",
             rows, rows
         );
     }
