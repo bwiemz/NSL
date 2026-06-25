@@ -5,6 +5,21 @@ use std::collections::HashMap;
 pub type OpId = u32;
 pub type VarId = u32;
 
+/// Paper §5.3 checkpointing-aware backward: identifier for a
+/// "recompute subgraph" — a connected slice of the forward Wengert list
+/// whose values are intentionally NOT persisted across the forward /
+/// backward boundary and are recomputed on demand during backward.
+///
+/// v1 ships a singleton: only one prologue subgraph per @checkpoint
+/// function (RMSNorm + Q/K/V projections + RoPE). Multi-subgraph
+/// (e.g. selective post-norm) is deferred to v2 (`SubgraphId(1..)`).
+///
+/// Wire-up: assigned by the `WengertExtractor::with_checkpoint_policy`
+/// stamping pass (cycle-10 Task 5), consumed by the dispatch fork at
+/// `flash_attention_v2/mod.rs::synthesize_backward_with_tier` (Task 9).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SubgraphId(pub u32);
+
 /// Cranelift-level type tag for a VarId in the Wengert graph.
 ///
 /// The lowerer needs to know whether a VarId is a tensor pointer (i64),
@@ -241,6 +256,26 @@ pub enum PrimalOp {
     /// saved-activation pointer record on `Compiler.csha_forward_saves`.
     FusedCshaBackward {
         layer: String,
+    },
+    /// Paper §5.3 checkpointing-aware backward marker op (cycle-10 Task 2).
+    ///
+    /// Inserted by `WengertExtractor::with_checkpoint_policy` (Task 5) at
+    /// the boundary between the forward prologue and the persisted
+    /// attention residency: the marker tells the codegen-side dispatch
+    /// at `synthesize_backward_with_tier` (Task 9) "this subgraph's
+    /// values must be recomputed during backward, not loaded from HBM
+    /// saves."
+    ///
+    /// The op itself is a structural no-op at lowering time — `wengert_lower`
+    /// treats it as `Identity` over a zero-valued placeholder result so it
+    /// participates in the use-def chain without emitting any work. The
+    /// `subgraph_id` is consumed by the backward-kernel PTX emitter
+    /// (`emit_prologue_recompute`, Task 8) to namespace the recomputed
+    /// register state and keep it disjoint from the persisted side.
+    ///
+    /// v1 only inserts `SubgraphId(0)` (singleton prologue per Task 2 / T9).
+    PrologueRecompute {
+        subgraph_id: SubgraphId,
     },
     RoPE {
         dim: usize,
@@ -521,5 +556,23 @@ mod tests {
         };
         assert_eq!(list.len(), 1);
         assert!(!list.is_empty());
+    }
+
+    // Cycle-10 Task 2: verify SubgraphId(0) round-trips through
+    // PrimalOp::PrologueRecompute construction. v1 is singleton.
+    #[test]
+    fn prologue_recompute_singleton_subgraph_id_round_trips() {
+        let id = SubgraphId(0);
+        let op = PrimalOp::PrologueRecompute { subgraph_id: id };
+        match &op {
+            PrimalOp::PrologueRecompute { subgraph_id } => {
+                assert_eq!(*subgraph_id, SubgraphId(0));
+                assert_eq!(subgraph_id.0, 0);
+            }
+            _ => panic!("expected PrologueRecompute"),
+        }
+        // type_for_op treats the marker as Tensor (downstream lowerer
+        // emits a null placeholder result).
+        assert_eq!(type_for_op(&op), WengertType::Tensor);
     }
 }

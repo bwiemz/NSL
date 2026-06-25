@@ -2105,6 +2105,19 @@ fn lower_single_op(
                 &[inputs[0], inputs[1], cmp_val],
             )
         }
+        // Paper §5.3 checkpointing-aware backward marker (cycle-10 Task 2).
+        //
+        // Lowering treats this as a structural no-op: the marker exists in
+        // the Wengert use-def graph so that the source-AD reverse-walk and
+        // the downstream codegen dispatch can both observe "this subgraph
+        // was checkpointed; values were not persisted across the forward /
+        // backward boundary." The actual recompute PTX is emitted by the
+        // backward-kernel emitter (`emit_prologue_recompute`, Task 8) — at
+        // wengert-lower time we just emit a null placeholder result so the
+        // var_map stays well-formed.
+        PrimalOp::PrologueRecompute { subgraph_id: _ } => {
+            Ok(builder.ins().iconst(cl_types::I64, 0))
+        }
 
         // === Non-differentiable passthroughs ===
         PrimalOp::Passthrough(ref name) => {
