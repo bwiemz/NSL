@@ -49,10 +49,41 @@
 //! ```
 //!
 //! Bf16 aggregate noise is **comparable** to fp16 here — not 8× worse —
-//! because the bf16 emitter casts UP to f32 during dot-product
-//! accumulation (`cvt.f32.bf16` on every load) and only HBM storage is
-//! bf16. The 8× per-element mantissa penalty therefore applies only to
-//! the input rounding, not to the in-register accumulator chain.
+//! because the **central-limit cancellation** over `num_valid × V ≈ 5×10^6`
+//! independent rounding events averages the per-event noise down by
+//! `1/sqrt(N) ≈ 4.5×10^-4`.  Refined accounting (per Finding 6 of the v5
+//! adversarial review):
+//!
+//!   - HBM loads of `x`/`W`/`bias` are bf16, but the dot-product
+//!     accumulator stays in **f32** (`cvt.f32.bf16` per load, mul+add in
+//!     f32 registers).  The accumulator chain itself does NOT lose
+//!     mantissa precision at bf16 rates.
+//!   - BUT the per-tile **logit cache in SMEM** is rounded back to bf16
+//!     via `cvt.rn.bf16.f32 %h2, %facc; st.shared.b16` at
+//!     `crates/nsl-codegen/src/fused_linear_ce.rs:3199-3205` (LP_INNER_STORE).
+//!     The reduction loops (`LP_RED_MAX`, `LP_RED_SUM`) then load it back
+//!     via `cvt.f32.bf16`, so the max / sum-exp reductions DO see
+//!     bf16-truncated logit values.  This is the 8×-vs-fp16 per-event
+//!     penalty source.
+//!   - The aggregate `mean_loss` is therefore a sum of ~5×10^6 bf16-noise
+//!     events divided by `num_valid ≈ 100`.  CLT applies to the inner
+//!     sum-over-V: per-row noise floor ≈ `2^-7 × sqrt(V) / V ≈ 8e-3 / 222`
+//!     ≈ 3.6e-5 per row, divided across rows ≈ 4e-6 on the aggregate.
+//!     Observed 7.37e-9 is well below this ceiling because the **benign
+//!     input fixture** (`x∈U[-0.5,0.5]`, `W∈N(0,0.01)`) produces a
+//!     near-uniform softmax where the per-tile-max spread is ~0 — the
+//!     rescale `exp(old_max - new_max)` is essentially `exp(0)=1` on
+//!     every tile, removing the cross-tile-rescale ULP jitter that
+//!     would otherwise dominate.
+//!
+//! **Important caveat (Finding 4)**: this fixture EXERCISES the bf16
+//! kernel's emitter under benign-input conditions — it does NOT validate
+//! the kernel against production transformer logit distributions, where
+//! logit spreads of 5-10 (step 0) to 20+ (converged) make the softmax
+//! peak much higher and put real pressure on the per-tile rescale chain.
+//! A future test fixture with `W∈N(0,0.05)` + target-class boost should
+//! be added to extend coverage.  The current fixture remains as a
+//! regression guard against catastrophic emitter regressions.
 //!
 //! Tolerances pinned at ~100× the empirical baseline:
 //!   - bf16 fwd mean_loss rel_err <= 1e-5  (~1400× headroom)
@@ -64,6 +95,12 @@
 //! These match the fp16 V=49152 gates exactly — a divergence between
 //! fp16 and bf16 at production scale would itself be a smoke signal
 //! and warrant investigation.
+//!
+//! **Audit trail (Finding 5 mitigation)**: empirical baselines above
+//! are recorded in `crates/nsl-codegen/tests/data/fused_lce_v49152_baseline.json`
+//! along with the GPU SKU, driver version, and PTX hash at the time of
+//! measurement.  See that file for the full provenance — without it, the
+//! docstring's claimed numbers are not auditable.
 
 #![cfg(feature = "cuda")]
 
@@ -323,10 +360,14 @@ fn bf16_forward_backward_at_v49152_production_scale() {
         gpu_mean_loss, cpu_fwd.mean_loss, mean_loss_rel, max_lse_abs
     );
 
-    // Tolerances match the fp16 V=49152 gates — the cvt.f32.bf16 cast
-    // on every dot-product load means the in-register accumulator chain
-    // sees the same f32 precision as the fp16 path. A divergence between
-    // bf16 and fp16 at production scale would itself be a smoke signal.
+    // Tolerances match the fp16 V=49152 gates.  The accumulator chain
+    // stays in f32, but the per-tile logit cache IS rounded to bf16 via
+    // `cvt.rn.bf16.f32` before SMEM storage (see fused_linear_ce.rs
+    // line 3204).  Aggregate tolerance is dominated by central-limit
+    // cancellation over ~5e6 rounding events on this benign-input
+    // fixture — not by the accumulator chain.  See module docs for the
+    // refined accounting (Finding 6) and the production-distribution
+    // caveat (Finding 4).
     assert!(
         mean_loss_rel < 1e-5,
         "bf16 V=49152 fwd mean_loss rel_err {:.3e} exceeds 1e-5 — \

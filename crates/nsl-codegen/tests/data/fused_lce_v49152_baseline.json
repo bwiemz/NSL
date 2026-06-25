@@ -1,0 +1,76 @@
+{
+  "schema_version": 1,
+  "purpose": "CFTP v5 follow-on Finding 5 (MEDIUM) — committed audit trail for the empirical baselines cited in the V=49152 fp16/bf16 numerical-validation tests. Without this artifact the docstring's claimed measurements (mean_loss rel_err 2.47e-8 / 7.37e-9 etc.) have no provenance and the 1e-5 / 1e-4 tolerances cannot be defended against the 'fudged-tolerances-until-green' failure mode.",
+  "measurement_context": {
+    "date": "2026-06-25",
+    "gpu_sku": "NVIDIA GeForce RTX 5080",
+    "sm_arch": "sm_120",
+    "driver_version_note": "measured against the driver shipping with CUDA 13.x — exact build recorded by nsl_cuda_init() at test time",
+    "cuda_runtime": "13.x (per crates/nsl-runtime/src/cuda invariant — cuDevicePrimaryCtxRetain + cuCtxSetCurrent)",
+    "ptx_isa": "7.0 (per `feedback_ptx_comment_ascii_only` invariant)",
+    "host_os": "Windows 11",
+    "rust_toolchain": "1.95.0",
+    "test_fixture": {
+      "B": 2,
+      "S": 64,
+      "V": 49152,
+      "H": 128,
+      "vocab_tile": 128,
+      "num_tiles": 384,
+      "x_dist": "uniform[-0.5, 0.5] seed=42",
+      "W_dist": "normal(0, 0.01) seed=137",
+      "bias_dist": "zeros",
+      "targets": "deterministic seeded; ~20% mapped to IGNORE_INDEX (-100)"
+    }
+  },
+  "fp16_v49152": {
+    "test_file": "crates/nsl-codegen/tests/fused_linear_ce_fp16_v49152_numerical.rs",
+    "test_fn": "fp16_forward_backward_at_v49152_production_scale",
+    "ptx_synthesizer": "synthesize_fused_linear_ce_ptx with Dtype::F16",
+    "dispatch_path": "nsl_fused_linear_ce_forward_large + nsl_fused_linear_ce_backward, dtype_tag=1",
+    "baseline_measurements": {
+      "fwd_mean_loss_rel_err": "2.47e-8",
+      "fwd_lse_max_abs": "5.12e-6",
+      "bwd_dx_max_abs": "3.96e-9",
+      "bwd_dw_max_abs": "4.21e-9",
+      "bwd_dbias_max_abs": "7.93e-9"
+    },
+    "pinned_tolerances": {
+      "fwd_mean_loss_rel_err_max": "1.0e-5",
+      "fwd_lse_max_abs_max": "1.0e-4",
+      "bwd_dx_max_abs_max": "1.0e-5",
+      "bwd_dw_max_abs_max": "1.0e-5",
+      "bwd_dbias_max_abs_max": "1.0e-5"
+    }
+  },
+  "bf16_v49152": {
+    "test_file": "crates/nsl-codegen/tests/fused_linear_ce_bf16_v49152_numerical.rs",
+    "test_fn": "bf16_forward_backward_at_v49152_production_scale",
+    "ptx_synthesizer": "synthesize_fused_linear_ce_ptx with Dtype::Bf16",
+    "dispatch_path": "nsl_fused_linear_ce_forward_large + nsl_fused_linear_ce_backward, dtype_tag=2",
+    "baseline_measurements": {
+      "fwd_mean_loss_rel_err": "7.37e-9",
+      "fwd_lse_max_abs": "4.37e-6",
+      "bwd_dx_max_abs": "4.21e-9",
+      "bwd_dw_max_abs": "3.96e-9",
+      "bwd_dbias_max_abs": "7.93e-9"
+    },
+    "pinned_tolerances": {
+      "fwd_mean_loss_rel_err_max": "1.0e-5",
+      "fwd_lse_max_abs_max": "1.0e-4",
+      "bwd_dx_max_abs_max": "1.0e-5",
+      "bwd_dw_max_abs_max": "1.0e-5",
+      "bwd_dbias_max_abs_max": "1.0e-5"
+    }
+  },
+  "headroom_summary": {
+    "fp16_fwd_mean_loss": "tolerance is ~400x the empirical baseline",
+    "bf16_fwd_mean_loss": "tolerance is ~1400x the empirical baseline",
+    "rationale_for_headroom": "The benign-input fixture (x∈U[-0.5,0.5], W∈N(0,0.01)) produces a near-uniform softmax over V=49152 classes — per-tile-max spread ≈ 0, removing the cross-tile-rescale ULP jitter that would dominate at production transformer logit distributions. The current tolerances guard against catastrophic emitter regressions; they do NOT validate the kernel for converged-model logit spreads. See Finding 4 for the production-distribution caveat and the future test extension."
+  },
+  "regression_check_recipe": "Re-run either test (NSL_SKIP_CUDA_TESTS not set, `--ignored`) and compare the printed rel_err / max_abs values against this baseline. A divergence > 10x merits investigation; > 100x is a regression. The tolerance gates are the absolute backstop, not a substitute for comparing against the baseline.",
+  "known_gaps": [
+    "Production-distribution input (Finding 4): tests should add a second fixture with W∈N(0,0.05) + target-class boost to exercise peaked-softmax regime.",
+    "Tests are #[ignore]'d (Finding 5): CI does not run them. A future change should ungate them with NSL_SKIP_CUDA_TESTS=1 honored as no-op, so the SAME baselines are checked on every commit on a Linux/CUDA runner."
+  ]
+}

@@ -65,6 +65,21 @@
 //! (Wider than V=4096's 1e-3 forward / 1e-3 backward only on the LSE
 //! axis where the 384-tile rescale chain genuinely costs precision —
 //! the dx/dW/dbias accumulation paths converge faster than ULP × V.)
+//!
+//! **Audit trail (Finding 5 mitigation)**: empirical baselines above are
+//! recorded in `crates/nsl-codegen/tests/data/fused_lce_v49152_baseline.json`
+//! along with the GPU SKU, driver version, and PTX-synthesizer entry
+//! point at the time of measurement.  Without that artifact the
+//! docstring's claimed numbers are not auditable.
+//!
+//! **Production-distribution caveat (Finding 4)**: this fixture exercises
+//! the fp16 kernel against benign inputs that produce a near-uniform
+//! softmax (per-logit stddev ≈ 0.033, all 49152 logits clustered within
+//! ~±0.1).  It does NOT validate the kernel for real transformer
+//! distributions where logit spreads of 5-10 (step 0) to 20+ (converged)
+//! put real pressure on the per-tile rescale chain.  Future work should
+//! add a second fixture with `W∈N(0,0.05)` + target-class boost to
+//! exercise the peaked-softmax regime.
 
 #![cfg(feature = "cuda")]
 
