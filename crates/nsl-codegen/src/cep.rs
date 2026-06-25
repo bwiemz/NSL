@@ -488,6 +488,41 @@ struct PruneDeltaDoc {
 pub fn plan_to_prune_delta(plan: &CepPlan, baseline: &ModelSpec) -> PruneDelta {
     let chosen = plan.outcome.chosen.as_ref().map(|c| &c.spec);
 
+    // Joint mode (Mode 3) bug fix: collect baseline layer indices that the
+    // planner accepted-dropped. The planner emits a
+    // `PruneStep { kind: "layer", layer: l, accepted: true }` per accepted
+    // drop (see `cep_search.rs::~647-682`). In Prune mode this set is empty
+    // so the delta produced for that mode is byte-identical to the
+    // pre-fix behavior.
+    let dropped_layers: std::collections::HashSet<u32> = plan
+        .outcome
+        .prune_log
+        .iter()
+        .filter(|s| s.accepted && s.kind == "layer")
+        .map(|s| s.layer)
+        .collect();
+
+    // Build baseline-layer-index → compacted-chosen-spec-index map. The
+    // chosen spec emitted by `apply_delta` (`cep_rewrite.rs::~120-124`)
+    // COMPACTS dropped layers out of every per-layer vector, so
+    // `chosen.spec.n_heads[k]` is the k-th *surviving* layer's head count,
+    // NOT the k-th baseline layer's.  Indexing chosen.n_heads with the
+    // raw baseline layer index produces off-by-N wrong deltas for every
+    // baseline layer following a dropped one — the silent correctness
+    // bug that shipped with PR #229 (Mode 3) and was latent on main
+    // until this fix.
+    let baseline_to_chosen: std::collections::HashMap<u32, usize> = {
+        let mut m = std::collections::HashMap::new();
+        let mut k = 0usize;
+        for l in 0..baseline.n_layers {
+            if !dropped_layers.contains(&l) {
+                m.insert(l, k);
+                k += 1;
+            }
+        }
+        m
+    };
+
     // Pre-index head importances by layer so per-group scoring is a small local scan
     // rather than re-walking the full `plan.importance.heads` slice for every group.
     let mut head_scores_by_layer: Vec<Vec<(u32, f64)>> =
@@ -500,12 +535,33 @@ pub fn plan_to_prune_delta(plan: &CepPlan, baseline: &ModelSpec) -> PruneDelta {
 
     let mut per_layer = Vec::with_capacity(baseline.n_layers as usize);
     for l in 0..baseline.n_layers as usize {
+        // Dropped baseline layer: emit `drop_layer: true` and skip head/FFN
+        // delta computation.  `apply_delta` consumes `drop_layer` directly
+        // (see `cep_rewrite.rs::~93`); on dropped layers the per-layer
+        // head/FFN fields are ignored downstream, but leaving them empty
+        // here makes the emitted .cep.json unambiguous.
+        if dropped_layers.contains(&(l as u32)) {
+            per_layer.push(LayerDelta {
+                layer: l as u32,
+                pruned_heads: Vec::new(),
+                new_d_ff: None,
+                drop_layer: true,
+            });
+            continue;
+        }
+
         let base_heads = baseline.n_heads[l];
         let base_kv = baseline.n_kv_heads[l].max(1);
         let group = (base_heads / base_kv).max(1);
 
+        // Look up the chosen spec via the COMPACTED index (NOT the raw
+        // baseline index) so layers following a dropped one resolve to
+        // the correct surviving-layer slot.  In Prune mode (no layer
+        // drops) `baseline_to_chosen[l] = l` for all l, so this is
+        // byte-identical to the pre-fix behavior.
+        let compacted_idx = baseline_to_chosen.get(&(l as u32)).copied();
         let chosen_heads = chosen
-            .map(|c| c.n_heads.get(l).copied().unwrap_or(base_heads))
+            .and_then(|c| compacted_idx.and_then(|k| c.n_heads.get(k).copied()))
             .unwrap_or(base_heads);
         let n_drop_heads = base_heads.saturating_sub(chosen_heads);
         // The planner snaps n_heads to a group multiple, so the drop count is always a
@@ -547,7 +603,7 @@ pub fn plan_to_prune_delta(plan: &CepPlan, baseline: &ModelSpec) -> PruneDelta {
         }
 
         let new_d_ff = chosen
-            .and_then(|c| c.d_ff.get(l).copied())
+            .and_then(|c| compacted_idx.and_then(|k| c.d_ff.get(k).copied()))
             .filter(|&w| w < baseline.d_ff[l]);
 
         per_layer.push(LayerDelta { layer: l as u32, pruned_heads, new_d_ff, drop_layer: false });
@@ -1297,6 +1353,130 @@ mod bridge_tests {
                 }
             }
         }
+    }
+
+    /// Joint mode (Mode 3) regression — PR #232's Bug 2.
+    ///
+    /// `apply_delta` (cep_rewrite.rs::~120-124) compacts dropped layers out of every
+    /// per-layer vector in the chosen spec, so `chosen.spec.n_heads[k]` is the k-th
+    /// SURVIVING layer's head count.  Before this fix, `plan_to_prune_delta` indexed
+    /// `chosen.spec.n_heads[l]` with the raw baseline layer index, producing:
+    ///
+    ///   - Wrong head/FFN deltas for every baseline layer following a drop
+    ///     (off-by-N shift after the first dropped layer).
+    ///   - `drop_layer: false` on every entry, even when joint search accepted drops
+    ///     — so SP1 (`--cep-emit-weights`) and the delta JSON output
+    ///     (`--cep-out`) lost the layer-drop signal entirely.
+    ///
+    /// This test forces joint search to drop at least one layer (aggressive sparsity
+    /// + descending layer importance so the LAST layer drops first), then asserts:
+    ///
+    ///   1. Every dropped baseline layer surfaces with `drop_layer: true`.
+    ///   2. No surviving layer is mis-flagged with `drop_layer: true`.
+    ///   3. Head/FFN deltas on surviving baseline layers AFTER a drop resolve to the
+    ///      correct compacted-chosen-index head/FFN counts (the off-by-N case).
+    #[test]
+    fn plan_to_prune_delta_marks_dropped_layers_in_joint_mode() {
+        // Aggressive sparsity target — head + FFN pruning alone can't reach 0.5,
+        // so joint search must engage layer drops.  Empty preserve list so the
+        // last layer (least important under synthetic position-factor scoring)
+        // gets dropped first.
+        let baseline = spec();
+        let mut cfg = prune_cfg();
+        cfg.sparsity = 0.5;
+        cfg.preserve = Vec::new();
+        cfg.granularity = nsl_semantic::cep::Granularity::HeadAndFfn;
+        // Relax constraints so joint search can actually reach the target — the
+        // default cfg's peak_memory_bytes / latency_us are tight.
+        cfg.constraints.peak_memory_bytes = None;
+        cfg.constraints.latency_us = None;
+        let input = build_prune_input(&cfg, baseline.clone(), None, "H100-SXM", Some(0.5))
+            .expect("input");
+        let plan = run_joint(input);
+
+        // Force the test to fail loudly if the planner doesn't actually drop a layer
+        // — otherwise (1)+(2) below would pass trivially on the empty drop set.
+        let accepted_drops: std::collections::HashSet<u32> = plan
+            .outcome
+            .prune_log
+            .iter()
+            .filter(|s| s.accepted && s.kind == "layer")
+            .map(|s| s.layer)
+            .collect();
+        assert!(
+            !accepted_drops.is_empty(),
+            "expected at least one accepted layer drop in joint mode at sparsity=0.5; \
+             prune_log = {:?}",
+            plan.outcome.prune_log
+        );
+
+        let delta = plan_to_prune_delta(&plan, &baseline);
+
+        // (1) Every accepted-dropped baseline layer must surface as drop_layer:true.
+        let delta_drops: std::collections::HashSet<u32> = delta
+            .per_layer
+            .iter()
+            .filter(|ld| ld.drop_layer)
+            .map(|ld| ld.layer)
+            .collect();
+        assert_eq!(
+            delta_drops, accepted_drops,
+            "delta drop-set must match the prune_log accepted-drops exactly. \
+             delta_drops={delta_drops:?}, accepted_drops={accepted_drops:?}"
+        );
+
+        // (2) No surviving layer mis-flagged with drop_layer:true.
+        for ld in &delta.per_layer {
+            if accepted_drops.contains(&ld.layer) {
+                continue;
+            }
+            assert!(
+                !ld.drop_layer,
+                "layer {} survives in chosen spec but delta says drop_layer:true",
+                ld.layer
+            );
+        }
+
+        // (3) Surviving-layer head/FFN deltas resolve via the COMPACTED index.
+        //     For each surviving baseline layer, walk a parallel compacted-index
+        //     counter; the survivor head count from the delta must match
+        //     chosen.spec.n_heads[compacted_idx] — the off-by-N case in Bug 2.
+        let chosen = plan.outcome.chosen.as_ref().expect("joint produced no chosen spec");
+        let mut compacted_idx = 0usize;
+        for ld in &delta.per_layer {
+            let l = ld.layer as usize;
+            if ld.drop_layer {
+                continue;
+            }
+            let surviving_heads = baseline.n_heads[l] - ld.pruned_heads.len() as u32;
+            assert_eq!(
+                surviving_heads, chosen.spec.n_heads[compacted_idx],
+                "layer {} (compacted index {}): survivor count from delta = {}, \
+                 chosen.spec.n_heads[{}] = {} — off-by-N bug surfacing again",
+                l, compacted_idx, surviving_heads, compacted_idx,
+                chosen.spec.n_heads[compacted_idx]
+            );
+            // FFN check: new_d_ff must either be None (no shrink) OR match
+            // chosen.spec.d_ff at the compacted index — NOT at the raw
+            // baseline index l (which is what Bug 2 produced).
+            if let Some(new_d_ff) = ld.new_d_ff {
+                assert_eq!(
+                    new_d_ff, chosen.spec.d_ff[compacted_idx],
+                    "layer {} (compacted index {}): new_d_ff = {} != chosen.spec.d_ff[{}] = {}",
+                    l, compacted_idx, new_d_ff, compacted_idx,
+                    chosen.spec.d_ff[compacted_idx]
+                );
+            }
+            compacted_idx += 1;
+        }
+        // Total surviving layers in delta must equal the chosen spec's layer count.
+        assert_eq!(
+            compacted_idx as u32,
+            chosen.spec.n_layers,
+            "delta surviving-layer count ({}) != chosen.spec.n_layers ({})",
+            compacted_idx,
+            chosen.spec.n_layers
+        );
     }
 
     #[test]
