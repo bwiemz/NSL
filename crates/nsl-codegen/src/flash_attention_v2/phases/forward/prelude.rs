@@ -358,6 +358,21 @@ pub fn emit_with_smem_override(
         ptx.push_str("    // sinks v1: sink K/V pre-load scratch registers\n");
         ptx.push_str("    .reg .u64 %rd_sink_base, %rd_sink_idx, %rd_sink_off, %rd_sink_src, %rd_sink_dst;\n");
         ptx.push_str("    .reg .pred %p_sink;\n");
+        // Sprint 2 cycle-8 §4.3 multi-tile: %p_skip_sinks gates the sink
+        // K/V pre-load on `%k_start == 0` so the sinks load once on the
+        // first KV iteration and persist across subsequent iters. Used
+        // by emit_k_tile_load + emit_v_tile_load in mod.rs.
+        ptx.push_str("    .reg .pred %p_skip_sinks;\n");
+        // Sprint 2 cycle-8 §4.3 causal bypass: %rd_num_sink_tokens_reg
+        // holds the num_sink_tokens compile-time constant as a u64
+        // register so s_compute can compare k_global against it without
+        // needing a new kernel param (FFI signature is unchanged from
+        // Sprint 1b). Initialized via mov.u64 below.
+        ptx.push_str("    .reg .u64 %rd_num_sink_tokens_reg;\n");
+        ptx.push_str(&format!(
+            "    mov.u64 %rd_num_sink_tokens_reg, {};\n",
+            config.num_sink_tokens
+        ));
     }
 
     // PCA Tier A: segment-mask helper scratch registers + SMEM buffer.

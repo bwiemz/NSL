@@ -33,6 +33,13 @@ pub fn sink_slab_bytes(config: &FlashAttentionConfig) -> usize {
 }
 
 /// Sprint 1b cycle-7: attention sinks v1 narrow-config eligibility.
+/// Sprint 2 cycle-8 (this commit): `causal=true` and multi-tile
+/// (`block_q != block_kv`) now eligible — sinks live in SMEM only at
+/// `kv_iter==0` first-load and persist immutable across subsequent
+/// iterations; sinks bypass causal mask via OR semantics at s_compute
+/// (`k_global < num_sink_tokens` → mask predicate forced false so sink
+/// rows attend regardless of query position).
+///
 /// Returns `(eligible, blocking_reason)`. `blocking_reason` is `Some` iff
 /// `num_sink_tokens > 0` and the config violates v1 narrowness. The
 /// string MUST name the failing axis AND cite the future Sprint number
@@ -42,8 +49,8 @@ pub fn sink_slab_bytes(config: &FlashAttentionConfig) -> usize {
 /// unconditionally — this is the sentinel "sinks disabled" path and the
 /// other axes (causal/rope/gqa/...) are not consulted.
 ///
-/// v1 supports: Tier A scalar forward, single-tile
-/// (`block_q==block_kv==seq_len`), `causal=false`, `rope_q=false`,
+/// Post-cycle-8-Sprint-2 v1 envelope: Tier A scalar forward, single- OR
+/// multi-tile, `causal=true` OR `causal=false`, `rope_q=false`,
 /// `gqa_group_size=1`, `paged=false`, `segment_masked=false`,
 /// `tree_mask=false`, no `csha.save_activations_for_backward` (no
 /// backward), no `csha.fused_projections`, and
@@ -53,14 +60,6 @@ pub fn attention_sinks_v1_eligible(
 ) -> (bool, Option<&'static str>) {
     if config.num_sink_tokens == 0 {
         return (true, None); // sentinel disabled
-    }
-    if config.causal {
-        return (
-            false,
-            Some(
-                "causal=true (deferred to cycle-7 Sprint 2: multi-tile + causal sink-bypass predicate)",
-            ),
-        );
     }
     if config.rope_q {
         return (
@@ -111,12 +110,6 @@ pub fn attention_sinks_v1_eligible(
                 ),
             );
         }
-    }
-    if config.block_q != config.block_kv {
-        return (
-            false,
-            Some("block_q != block_kv (deferred to cycle-7 Sprint 2: multi-tile sink layout)"),
-        );
     }
     if config.num_sink_tokens as i64 > config.block_kv {
         return (
@@ -284,11 +277,60 @@ mod eligibility_tests {
         };
     }
 
-    per_axis_refusal_test!(
-        causal_refused,
-        |c: &mut FlashAttentionConfig| c.causal = true,
-        "causal=true"
+    // Sprint 2 cycle-8 acceptance helper. Mirrors per_axis_refusal_test!
+    // but asserts `(true, None)` — used for axes that the Sprint 2 lift
+    // moved from REFUSED to ACCEPTED. Each test mutates only the lifted
+    // axis from the narrow baseline, keeping every other axis narrow.
+    macro_rules! per_axis_acceptance_test {
+        ($name:ident, $mutate:expr) => {
+            #[test]
+            fn $name() {
+                let mut cfg = narrow_cfg();
+                let mutate: fn(&mut FlashAttentionConfig) = $mutate;
+                mutate(&mut cfg);
+                assert_eq!(
+                    attention_sinks_v1_eligible(&cfg),
+                    (true, None),
+                    "Sprint 2 cycle-8 lifted this axis from refused to accepted; \
+                     if the predicate refuses here the lift regressed"
+                );
+            }
+        };
+    }
+
+    per_axis_acceptance_test!(
+        causal_accepted,
+        |c: &mut FlashAttentionConfig| c.causal = true
     );
+    per_axis_acceptance_test!(
+        multi_tile_accepted,
+        |c: &mut FlashAttentionConfig| {
+            // block_q=64 (narrow default), block_kv lifted to 128 so the
+            // KV loop runs multiple iterations across a sequence-aligned
+            // launch. Sprint 2 cycle-8 makes the kv_iter==0 gate persist
+            // the sink slab across these iterations.
+            c.block_q = 64;
+            c.block_kv = 128;
+        }
+    );
+
+    #[test]
+    fn causal_multi_tile_combined_accepted() {
+        // Sprint 2 cycle-8: the TWO lifted axes flipped simultaneously
+        // (causal=true AND block_q != block_kv) — the rationale for
+        // landing them in one sprint is exactly that splitting would
+        // ship dead PTX (causal-only without kv_iter==0 gate corrupts
+        // multi-tile; multi-tile-only without OR-bypass refuses sink
+        // rows at the s_compute mask). The cross-axis matrix safety
+        // net (sinks_v1_cross_axis_matrix.rs) covers the rest of the
+        // product; this is the canonical combined-narrow pin.
+        let mut cfg = narrow_cfg();
+        cfg.causal = true;
+        cfg.block_q = 64;
+        cfg.block_kv = 128;
+        assert_eq!(attention_sinks_v1_eligible(&cfg), (true, None));
+    }
+
     per_axis_refusal_test!(
         rope_q_refused,
         |c: &mut FlashAttentionConfig| c.rope_q = true,
@@ -313,14 +355,6 @@ mod eligibility_tests {
         tree_mask_refused,
         |c: &mut FlashAttentionConfig| c.tree_mask = true,
         "tree_mask=true"
-    );
-    per_axis_refusal_test!(
-        multi_tile_refused,
-        |c: &mut FlashAttentionConfig| {
-            c.block_q = 64;
-            c.block_kv = 128;
-        },
-        "block_q != block_kv"
     );
     per_axis_refusal_test!(
         too_many_sinks_refused,

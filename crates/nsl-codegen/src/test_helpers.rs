@@ -598,3 +598,54 @@ pub fn try_flash_attention_sink_context_for_source(
         None => (false, None, false),
     })
 }
+
+/// Sprint 2 cycle-8 §4.3 multi-tile + causal lift PTX probe helper.
+///
+/// Like [`try_flash_attention_sink_context_for_source`] but returns the
+/// FULL synthesized v2 forward PTX as a `String` (UTF-8) so an
+/// integration test can probe for arbitrary substrings — load-bearing
+/// for the Sprint 2 cycle-8 cycle-3 false-positive trap pattern: probe
+/// the gated PTX register `%p_skip_sinks` (multi-tile kv_iter==0 gate)
+/// and `%p_sink` (causal sink-bypass mask predicate), NOT the
+/// comment-only descriptive lines.
+///
+/// Returns `Ok((num_sink_tokens, ptx_str))` on success, `Err(msg)` on
+/// compile failure. PTX trailing NUL is stripped.
+pub fn try_flash_attention_v2_forward_ptx_for_source(
+    src: &str,
+) -> Result<(u32, String), String> {
+    use nsl_errors::FileId;
+
+    let mut interner = Interner::new();
+    let (tokens, _lex_diags) = nsl_lexer::tokenize(src, FileId(0), &mut interner);
+    let parsed = nsl_parser::parse(&tokens, &mut interner);
+    let stmts = parsed.module.stmts.clone();
+    let type_map: TypeMap = TypeMap::new();
+    let opts = crate::CompileOptions {
+        target: "sm_80".to_string(),
+        ..Default::default()
+    };
+
+    let mut compiler = crate::compiler::Compiler::new(&interner, &type_map, &opts)
+        .map_err(|e| format!("Compiler::new failed: {e}"))?;
+
+    compiler
+        .compile_flash_attention_kernels(&stmts)
+        .map_err(|e| format!("{e}"))?;
+
+    let ctx = compiler
+        .kernels
+        .flash_attention_context
+        .ok_or_else(|| "no FlashAttentionCompileContext built — fixture lacks @flash_attention?".to_string())?;
+    let cfg = &ctx.config;
+    let num = cfg.num_sink_tokens;
+    let ptx = crate::flash_attention_v2::synthesize_flash_attention_ptx_v2(cfg);
+    let ptx_body = if ptx.last() == Some(&0) {
+        &ptx[..ptx.len() - 1]
+    } else {
+        &ptx[..]
+    };
+    let ptx_str = std::str::from_utf8(ptx_body)
+        .map_err(|e| format!("synthesized PTX is not valid UTF-8: {e}"))?;
+    Ok((num, ptx_str.to_string()))
+}

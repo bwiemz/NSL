@@ -301,6 +301,37 @@ pub fn emit(
         ptx.push_str("    cvt.u64.u32 %rd35, %r3;\n");
         ptx.push_str("    add.u64 %rd35, %q_start, %rd35;            // q_row_global\n");
         ptx.push_str("    setp.gt.u64 %p0, %rd34, %rd35;\n");
+        // Sprint 2 cycle-8 §4.3 attention sinks causal-bypass: sinks
+        // always attend regardless of query position (paper §4.3
+        // "regardless of query position"). Sinks live at k_global ∈ [0,
+        // num_sink_tokens). When k_global < num_sink_tokens, %p_sink
+        // fires and we OR-extend the causal mask predicate so the
+        // following `@%p0 mov.f32 %f0, -inf` is suppressed for sink
+        // rows. The %p_sink register is declared in the forward prelude
+        // (gated on num_sink_tokens > 0); %rd_num_sink_tokens_reg holds
+        // the compile-time num_sink_tokens literal. At
+        // num_sink_tokens=0 NEITHER instruction is emitted → causal-only
+        // PTX is byte-identical to pre-Sprint-2 (snapshot invariant).
+        //
+        // OR-extension semantics: %p0 starts as "k > q" (mask if true).
+        // After the OR, %p0 = (k > q) OR (k < num_sink_tokens) — i.e.
+        // mask if the row is BEYOND causal, but we want sinks ALWAYS
+        // unmasked. So we should NOT include sink rows in the mask.
+        // Flip: subtract sinks from %p0 by using AND-NOT semantics.
+        //
+        // Correct logic: mask iff (k_global > q_row_global) AND NOT
+        // (k_global < num_sink_tokens). PTX:
+        //     setp.ge.u64 %p_sink, %rd34, %rd_num_sink_tokens_reg;
+        //     and.pred    %p0,     %p0,    %p_sink;
+        // Sets %p_sink = "k_global >= num_sink_tokens" (i.e. NOT a sink
+        // row). AND with the causal mask → mask only non-sink rows that
+        // exceed the causal bound. Sink rows always attend.
+        if config.num_sink_tokens > 0 {
+            ptx.push_str(
+                "    setp.ge.u64 %p_sink, %rd34, %rd_num_sink_tokens_reg;  // not a sink row\n",
+            );
+            ptx.push_str("    and.pred %p0, %p0, %p_sink;                            // sink-bypass: never mask sinks\n");
+        }
         // PCA Tier A: extend %p0 with cross-segment disjunction (spec §5.1).
         // Guard: only when BOTH causal (so %p0 is already set) AND segment_masked.
         // If !causal && segment_masked, %p0 is uninitialized; we skip rather than

@@ -448,10 +448,27 @@ fn emit_k_tile_load(ptx: &mut String, config: &FlashAttentionConfig, q_iter: u32
     // through to the rolling K load below which writes to a shifted SMEM
     // offset so it doesn't stomp on the sinks. Skipped entirely when
     // num_sink_tokens==0 → byte-identical to pre-Sprint-1b.
+    //
+    // Sprint 2 cycle-8 §4.3 multi-tile: the sink-load is wrapped with a
+    // PTX-level conditional gating on `%k_start == 0` so the sinks load
+    // ONLY on the first KV iteration. For subsequent iters the sink rows
+    // persist immutable in SMEM (the rolling K load writes into the
+    // shifted `rolling_kv_off` slot which sits past the sink slab, so
+    // the slab is never clobbered). The conditional itself is gated on
+    // `num_sink_tokens > 0` at codegen time — at zero sinks NEITHER the
+    // setp/bra NOR the load body emits → byte-identical PTX (cycle-7
+    // Sprint 1a snapshot invariant).
     if n_sink > 0 {
         let sink_elems = n_sink * head_dim;
         ptx.push_str(&format!(
             "    // sinks v1: pre-load {n_sink} sink K rows from sink_k_ptr -> kv_offset (front of slab)\n"
+        ));
+        // Sprint 2 cycle-8 §4.3 multi-tile: sinks load ONLY when kv_iter == 0.
+        // For subsequent iters, sink rows persist in SMEM from the first load.
+        ptx.push_str("    setp.ne.u64 %p_skip_sinks, %k_start, 0;\n");
+        ptx.push_str(&format!(
+            "    @%p_skip_sinks bra V2_K_SINK_LOAD_SKIP_{};\n",
+            q_iter
         ));
         ptx.push_str("    ld.param.u64 %rd_sink_base, [sink_k_ptr];\n");
         ptx.push_str("    cvt.u64.u32 %rd_sink_idx, %tid_x;\n");
@@ -479,6 +496,7 @@ fn emit_k_tile_load(ptx: &mut String, config: &FlashAttentionConfig, q_iter: u32
             q_iter
         ));
         ptx.push_str(&format!("V2_K_SINK_LOAD_DONE_{}:\n", q_iter));
+        ptx.push_str(&format!("V2_K_SINK_LOAD_SKIP_{}:\n", q_iter));
     }
 
     // When fused K projection is enabled, null-guard the HBM load: if
@@ -577,10 +595,21 @@ fn emit_v_tile_load(ptx: &mut String, config: &FlashAttentionConfig, q_iter: u32
     // §4.3 sinks (Sprint 1b cycle-7): emit sink V pre-load at the front
     // of the KV SMEM slab. Symmetric to the K sink pre-load. Skipped
     // entirely when num_sink_tokens==0 → byte-identical to pre-Sprint-1b.
+    //
+    // Sprint 2 cycle-8 §4.3 multi-tile: same kv_iter==0 gating as the K
+    // sink pre-load — sinks load only on the first KV iteration and
+    // persist across subsequent ones. Symmetric guard so the V slab
+    // matches the K slab's "load once, persist" semantics.
     if n_sink > 0 {
         let sink_elems = n_sink * head_dim;
         ptx.push_str(&format!(
             "    // sinks v1: pre-load {n_sink} sink V rows from sink_v_ptr -> kv_offset (front of slab)\n"
+        ));
+        // Sprint 2 cycle-8 §4.3 multi-tile: sinks load ONLY when kv_iter == 0.
+        ptx.push_str("    setp.ne.u64 %p_skip_sinks, %k_start, 0;\n");
+        ptx.push_str(&format!(
+            "    @%p_skip_sinks bra V2_V_SINK_LOAD_SKIP_{};\n",
+            q_iter
         ));
         ptx.push_str("    ld.param.u64 %rd_sink_base, [sink_v_ptr];\n");
         ptx.push_str("    cvt.u64.u32 %rd_sink_idx, %tid_x;\n");
@@ -606,6 +635,7 @@ fn emit_v_tile_load(ptx: &mut String, config: &FlashAttentionConfig, q_iter: u32
             q_iter
         ));
         ptx.push_str(&format!("V2_V_SINK_LOAD_DONE_{}:\n", q_iter));
+        ptx.push_str(&format!("V2_V_SINK_LOAD_SKIP_{}:\n", q_iter));
     }
 
     // When fused V projection is enabled, null-guard: skip if csha_wv_ptr != 0.

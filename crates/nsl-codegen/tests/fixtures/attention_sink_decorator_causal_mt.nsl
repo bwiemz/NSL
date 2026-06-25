@@ -1,0 +1,19 @@
+# Sprint 2 cycle-8 fixture (paper §4.3 attention sinks v2 combined
+# causal + multi-tile lift).
+#
+# Pins the COMBINED lifted-axis path: `causal=true` AND multi-tile
+# (`block_q != block_kv` via `@autotune`) simultaneously — the canonical
+# Sprint 2 cycle-8 cell. The two axes MUST land together because
+# splitting them ships dead PTX: causal-only without `kv_iter==0` gate
+# silently breaks multi-tile (sink rows clobbered after iter 0);
+# multi-tile-only without OR-bypass refuses sink rows at the s_compute
+# mask.
+#
+# Body is trivial — the test inspects the compile context + embedded PTX,
+# not function body semantics.
+
+@flash_attention
+@autotune(block_q=[64], block_kv=[128])
+@attention_sink(tokens=4)
+fn forward():
+    pass
