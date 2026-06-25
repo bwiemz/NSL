@@ -243,10 +243,19 @@ pub fn apply_prune_delta_to_weights(
         delta.per_layer.iter().map(|ld| (ld.layer, ld)).collect();
 
     // Precompute per-layer FFN survivor sets (one ranking per layer, from w_gate).
+    // Guard `l >= drop.len()` mirrors the main slicing loop (see below) and the
+    // drop-flag pass above (line 229) — both silently skip out-of-range layer
+    // indices rather than panic on `spec.d_ff[l]`. Reaching this branch requires
+    // a hand-crafted delta (the greedy planner only emits 0..n_layers) AND a
+    // WeightMap containing `blocks.{l}.ffn.w_gate` for that stray l, so it's
+    // latent today but a panic in defense-in-depth terms.
     let mut ffn_survivors: HashMap<u32, Vec<u32>> = HashMap::new();
     for ld in &delta.per_layer {
         if let Some(new_ff) = ld.new_d_ff {
             let l = ld.layer;
+            if (l as usize) >= drop.len() {
+                continue;
+            }
             let gate_name = format!("blocks.{l}.ffn.w_gate");
             let gate = wm
                 .get(&gate_name)
@@ -563,5 +572,53 @@ mod tests {
     fn ffn_survivors_full_width_is_identity() {
         let w_gate = f32_entry("ffn.w_gate", vec![2, 3], &[1., 2., 3., 4., 5., 6.]);
         assert_eq!(ffn_survivors_by_magnitude(&w_gate, 3, 3).unwrap(), vec![0, 1, 2]);
+    }
+
+    // Regression: precompute loop previously panicked at `spec.d_ff[l as usize]`
+    // when `delta.per_layer` carried an out-of-range layer AND the WeightMap
+    // happened to contain `blocks.{l}.ffn.w_gate` for that index. The drop-flag
+    // pass (line ~229) and the main slicing loop (line ~267) both silently skip
+    // out-of-range `l`; the precompute now matches that convention.
+    #[test]
+    fn precompute_skips_out_of_range_layer_in_delta() {
+        let spec = small_spec(); // n_layers=2, d_ff.len()=2
+        let mut wm_entries = std::collections::HashMap::new();
+        // Reuse the standard small-weights generator then inject a stray
+        // `blocks.99.ffn.w_gate` so the wm.get() lookup in the precompute would
+        // succeed and reach the formerly-unguarded `spec.d_ff[99]` access.
+        let base_wm = small_weights(&spec);
+        for (k, v) in base_wm.entries() {
+            wm_entries.insert(k.clone(), v.clone());
+        }
+        let stray_dm = spec.d_model as usize;
+        let stray_dff = spec.d_ff[0] as usize;
+        let stray_vals: Vec<f32> = (0..(stray_dm * stray_dff))
+            .map(|i| 99_000.0 + i as f32)
+            .collect();
+        wm_entries.insert(
+            "blocks.99.ffn.w_gate".to_string(),
+            f32_entry("blocks.99.ffn.w_gate", vec![stray_dm, stray_dff], &stray_vals),
+        );
+        let wm = WeightMap::from_entries(wm_entries);
+
+        let delta = PruneDelta {
+            per_layer: vec![
+                // The out-of-range delta — would have panicked at `spec.d_ff[99]`.
+                LayerDelta { layer: 99, pruned_heads: vec![], new_d_ff: Some(2), drop_layer: false },
+                // A real in-range layer so the rest of the orchestrator still produces output.
+                LayerDelta { layer: 0, pruned_heads: vec![], new_d_ff: Some(4), drop_layer: false },
+            ],
+        };
+
+        let out = apply_prune_delta_to_weights(&wm, &spec, &delta)
+            .expect("must not panic on out-of-range layer in delta");
+
+        // The in-range slicing still happens (layer 0 FFN narrowed 6 -> 4).
+        assert_eq!(out["blocks.0.ffn.w_gate"].shape, vec![8, 4]);
+        // The stray tensor is untouched by the precompute (no survivor set is
+        // computed for layer 99) and the main slicing loop's guard at line ~267
+        // also skips it; the orchestrator's parse_layer_tensor path simply
+        // never reaches `slice_one` for layer 99, so it's omitted from output.
+        assert!(!out.contains_key("blocks.99.ffn.w_gate"));
     }
 }
