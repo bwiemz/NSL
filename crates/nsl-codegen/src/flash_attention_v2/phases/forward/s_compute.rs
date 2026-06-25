@@ -304,28 +304,30 @@ pub fn emit(
         // Sprint 2 cycle-8 §4.3 attention sinks causal-bypass: sinks
         // always attend regardless of query position (paper §4.3
         // "regardless of query position"). Sinks live at k_global ∈ [0,
-        // num_sink_tokens). When k_global < num_sink_tokens, %p_sink
-        // fires and we OR-extend the causal mask predicate so the
-        // following `@%p0 mov.f32 %f0, -inf` is suppressed for sink
-        // rows. The %p_sink register is declared in the forward prelude
-        // (gated on num_sink_tokens > 0); %rd_num_sink_tokens_reg holds
-        // the compile-time num_sink_tokens literal. At
-        // num_sink_tokens=0 NEITHER instruction is emitted → causal-only
-        // PTX is byte-identical to pre-Sprint-2 (snapshot invariant).
+        // num_sink_tokens).
         //
-        // OR-extension semantics: %p0 starts as "k > q" (mask if true).
-        // After the OR, %p0 = (k > q) OR (k < num_sink_tokens) — i.e.
-        // mask if the row is BEYOND causal, but we want sinks ALWAYS
-        // unmasked. So we should NOT include sink rows in the mask.
-        // Flip: subtract sinks from %p0 by using AND-NOT semantics.
-        //
-        // Correct logic: mask iff (k_global > q_row_global) AND NOT
-        // (k_global < num_sink_tokens). PTX:
+        // CRITICAL %p0 semantics: at `s_compute.rs:349` the consumer is
+        // `@%p0 mov.f32 %f0, 0xFF800000;` — `%p0 == true` means "this
+        // row IS masked (set to -inf)". The cycle-8 dispatch spec
+        // originally proposed `setp.lt + or.pred` which would have
+        // FORCE-MASKED sinks (opposite of intended). The correct AND-
+        // bypass logic (caught by the Sprint 2 implementer pre-merge):
         //     setp.ge.u64 %p_sink, %rd34, %rd_num_sink_tokens_reg;
         //     and.pred    %p0,     %p0,    %p_sink;
-        // Sets %p_sink = "k_global >= num_sink_tokens" (i.e. NOT a sink
-        // row). AND with the causal mask → mask only non-sink rows that
-        // exceed the causal bound. Sink rows always attend.
+        // %p_sink = "k_global >= num_sink_tokens" → true for NON-sink
+        // rows, false for sink rows. AND with the causal mask leaves
+        // non-sink causal-violating rows masked, but folds sink rows
+        // to `false` regardless of %p0's causal value — sink rows are
+        // ALWAYS attended. The %p_sink register and
+        // %rd_num_sink_tokens_reg are declared in the forward prelude
+        // (gated on num_sink_tokens > 0). At num_sink_tokens=0 NEITHER
+        // instruction is emitted → causal-only PTX is byte-identical
+        // to pre-Sprint-2 (snapshot invariant).
+        //
+        // Walkthrough (cycle-8 holistic-review-verified):
+        //   k=2,  N=4,  q=5  → setp.gt(2,5)=false   AND setp.ge(2,4)=false  = false. Sink attended.
+        //   k=10, N=4,  q=5  → setp.gt(10,5)=true   AND setp.ge(10,4)=true  = true.  Non-sink, k>q, masked.
+        //   k=10, N=4,  q=15 → setp.gt(10,15)=false AND setp.ge(10,4)=true  = false. Non-sink, k<=q, attended.
         if config.num_sink_tokens > 0 {
             ptx.push_str(
                 "    setp.ge.u64 %p_sink, %rd34, %rd_num_sink_tokens_reg;  // not a sink row\n",

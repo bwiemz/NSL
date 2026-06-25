@@ -451,13 +451,27 @@ fn emit_k_tile_load(ptx: &mut String, config: &FlashAttentionConfig, q_iter: u32
     //
     // Sprint 2 cycle-8 §4.3 multi-tile: the sink-load is wrapped with a
     // PTX-level conditional gating on `%k_start == 0` so the sinks load
-    // ONLY on the first KV iteration. For subsequent iters the sink rows
+    // ONLY when the live K outer-loop iterator is at iter-0. For
+    // subsequent iters within the SAME outer K loop, the sink rows
     // persist immutable in SMEM (the rolling K load writes into the
     // shifted `rolling_kv_off` slot which sits past the sink slab, so
     // the slab is never clobbered). The conditional itself is gated on
     // `num_sink_tokens > 0` at codegen time — at zero sinks NEITHER the
     // setp/bra NOR the load body emits → byte-identical PTX (cycle-7
     // Sprint 1a snapshot invariant).
+    //
+    // NOTE on fused-path semantics (cycle-8 holistic-review finding):
+    // In the fused S/PV orchestrator, the K outer loop is RESTARTED at
+    // each q_iter (`%k_start = 0` reset at the top of each q_iter's S
+    // pass). This means `setp.ne %k_start, 0` fires false at iter-0 of
+    // EVERY q_iter, so the sink K rows re-load once per q_iter rather
+    // than once per kernel invocation. The data is idempotent (same f16
+    // values written to the same SMEM slots), so this is a PERFORMANCE
+    // regression for multi-q_iter configs (~num_sink_tokens × head_dim
+    // wasted bytes per q_iter), NOT a correctness bug. A future cycle
+    // could add a function-scope `%p_sinks_loaded` predicate to load
+    // truly once per kernel. v1 accepts the per-q_iter reload as the
+    // honest cost of the simplest correct lift.
     if n_sink > 0 {
         let sink_elems = n_sink * head_dim;
         ptx.push_str(&format!(
