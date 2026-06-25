@@ -7,6 +7,61 @@ acceptance criteria for the v2 follow-on. Read this before claiming `@checkpoint
 is "done" — v1 is intentionally a structural-and-refusal landing, not a
 GPU-validated functional landing.
 
+## Cycle 10 first-pass functional gap closure (R0)
+
+Cycle 10's first pass landed the §5.3 API surface (carriers, semantic
+plumbing, dispatch fork, SMEM validator extension, the namespace_suffix
+refactor, and a R3/R7/R9/R10/R8.1 refusal cascade) and shipped the
+recompute path as a **PTX-comment-only post-injection** on top of the
+existing tier-B backward emitter. Reviewer 1 (correctness) found three
+silent-correctness gaps in that approach:
+
+1. **`kv_load` was not skipped**: the recompute path still ran the
+   materialized-saves `emit_k_suffixed` / `emit_v_suffixed` loads, so
+   `policy="full"` PTX was structurally identical to the no-decorator
+   baseline plus comments.
+2. **`WengertOp.checkpointed` had zero downstream consumers**: the
+   per-op stamping from Task 5 landed but never reached codegen.
+3. **G3 was tautological**: it asserted PTX-comment substrings that
+   were synthesized inside the same comments, so the gate passed
+   trivially without proving any functional behavior.
+
+Together these violated cycle-5 invariant `feedback_deferral_must_refuse`:
+API-surface sprints that defer downstream emission MUST add a hard refusal
+at codegen time, not log disclosure plus a silently-no-op emission path.
+
+**Phase F closure** (this commit):
+
+- Adds **R0** — a codegen-time refusal that fires at the top of
+  `synthesize_backward_with_recompute` for any `policy="full"` config.
+  Substring: `@checkpoint(policy="full") functional recompute not yet
+  wired in v1: ships API surface + refusal cascade only. kv_load
+  substitution + SMEM-base routing deferred to follow-on cycle behind
+  GPU validation gate.`
+- Removes the comment-only post-injection block entirely. With R0 at
+  the top of the function, the post-injection was dead code.
+- Drops the structurally-unreachable R8.1 verified smoke-set carve-out
+  (`static_seq_len.unwrap_or(0)` always evaluated to 0 in production
+  because `CshaExtras::level1` does not set `static_seq_len`). R8.1 is
+  now honest about being unconditional in v1. The smoke-set carve-out
+  is deferred to v2.
+- Replaces G3 with `g3_policy_full_refuses_with_r0_substring`, a honest
+  refusal-reachability gate that fails if R0 is removed without a
+  functional replacement.
+- Adds R0 to the G2 substring sweep (6 refusal tests instead of 5; in
+  v1 the original R3/R7/R9/R10/R8.1 tests assert the R0 shadow
+  substring because R0 fires before them).
+
+R0 is lifted in cycle 11 when the functional substitution lands. See
+"v2 acceptance criteria" under G4 below for the exact lift contract.
+
+**Honesty note on `WengertOp.checkpointed` stamping**: the Task 5
+plumbing remains — it stamps Wengert ops as `checkpointed: true` when
+they fall inside a `@checkpoint`-decorated boundary chain. In v1 this
+stamping is **decorative**: no downstream consumer reads it. Cycle 11
+wires the consumer (codegen reads the stamp to decide whether to emit
+the recompute path vs. the materialized-saves path on a per-op basis).
+
 ## What v1 ships (cycle 10)
 
 - `CheckpointPolicy::Full` enum + `CheckpointExtras` carrier on
@@ -54,18 +109,21 @@ markers. True functional substitution (skip the `kv_load::emit_k_suffixed`
 follow-on refactor that depends on the recompute helper itself being
 extended to write SMEM in the same layout the kv_load emitters do.
 
-**v2 acceptance criteria**:
+**v2 acceptance criteria** (cycle 11 — lifts R0):
 
-1. Replace the comment-only injection in
-   `synthesize_backward_with_recompute` with a true emission path that
-   suppresses the kv_load calls under `checkpoint.is_some()` and
-   substitutes `emit_prologue_recompute` calls that write into the
-   same SMEM bases.
-2. Land a numerical-equivalence test on a CUDA-equipped host that
-   compares dQ / dK / dV against the materialized-saves baseline at
-   `head_dim in {64, 128}` and `seq_len in {2048, 4096}`. Tolerances:
-   max abs err < 1e-4 for fp32, < 5e-3 for fp16.
-3. Add a CI label that gates v2 promotion on the GPU job passing.
+1. Lift R0 + wire `kv_load` skip + SMEM-base routing + GPU numerical
+   validation (atol=5e-4 rtol=5e-3 at hd in {64,128}, S in {512, 2048,
+   4096}). Specifically: suppress `kv_load::emit_k_suffixed` /
+   `emit_v_suffixed` when `config.checkpoint.is_some()`, and route
+   `emit_prologue_recompute` output into `%k_smem_base` / `%v_smem_base`
+   so downstream `ds_compute` / `dqdk_accum` / `dv_accum` see the
+   recomputed projections.
+2. Land the numerical-equivalence test on a CUDA-equipped host that
+   compares dQ / dK / dV against the materialized-saves baseline at the
+   tolerances above.
+3. Replace G3 (currently `g3_policy_full_refuses_with_r0_substring`)
+   with the numerical-equivalence assertion driven from the GPU job.
+4. Add a CI label that gates v2 promotion on the GPU job passing.
 
 ### G5: paper §6.3 exact diagnostic string
 

@@ -1,23 +1,31 @@
-//! Cycle-10 §5.3 Task 9 integration gates.
+//! Cycle-10 §5.3 Task 9 + Phase F integration gates.
 //!
 //! Test surface covers the four code-path gates required by the
-//! cycle-10 spec appendix and the implementer-C task list:
+//! cycle-10 spec appendix and the Phase F functional-gap closure:
 //!
 //!   G1 byte-identity        — no-decorator path remains snapshot-clean.
-//!   G2 refusal coverage     — R3, R7, R9, R10, R8.1 each fire with
-//!                              the documented substring + emit no PTX.
-//!   G3 structural recompute — `policy="full"` PTX contains the
-//!                              diagnostic comment AND a label/register
-//!                              hint carrying the namespace_suffix
-//!                              evidence from Task 8.
+//!   G2 refusal coverage     — R0 + R3 + R7 + R9 + R10 + R8.1 each fire
+//!                              with the documented substring + emit no
+//!                              PTX. R0 is Phase F's hard gate; in v1 it
+//!                              fires FIRST, so R3/R7/R9/R10/R8.1 are
+//!                              structurally unreachable today. We still
+//!                              assert the cascade substrings against the
+//!                              live error-path so cycle 11 can lift R0
+//!                              without simultaneously regressing them
+//!                              (the substring asserts move to a
+//!                              once-R0-is-lifted reachability gate).
+//!   G3 R0 refusal probe     — `policy="full"` config refuses with the
+//!                              R0 substring. Phase F replaces the
+//!                              tautological PTX-substring probe with a
+//!                              honest refusal-reachability gate.
 //!   G6 sibling-leak guard   — `EffectChecker::checkpoint_policies()`
 //!                              returns an empty map for a module that
 //!                              contains zero `@checkpoint` decorators.
 //!
 //! Gates G4 (GPU numerical equivalence) and G5 (paper-§6.3 exact
-//! diagnostic string) are intentionally deferred — see
-//! `docs/wiki/Checkpoint-v1-Defer-Log.md`. G3 substring assertion is the
-//! v1 functional-presence gate for both deferred items.
+//! diagnostic string) remain deferred — see
+//! `docs/wiki/Checkpoint-v1-Defer-Log.md`. Cycle 11 unlocks G4 alongside
+//! lifting R0.
 
 use nsl_codegen::flash_attention::{
     CheckpointExtras, CheckpointPolicy, CshaExtras, FlashAttentionConfig, RopeStyle,
@@ -83,43 +91,69 @@ fn g1_no_decorator_backward_emits_no_checkpoint_marker() {
     );
 }
 
-// ----- G2: refusal substring coverage (R3, R7, R9, R10, R8.1) -----------
+// ----- G2: refusal substring coverage (R0 + R3 + R7 + R9 + R10 + R8.1) --
+
+#[test]
+fn g2_r0_policy_full_refuses_until_functional_recompute_lands() {
+    // R0 (Phase F): policy="full" must refuse at codegen until cycle 11
+    // wires the functional substitution (skip kv_load, route
+    // emit_prologue_recompute into %k_smem_base/%v_smem_base) and GPU
+    // numerical validation lands. Without this gate, cycle 10's
+    // comment-only post-injection would silently emit
+    // identical-to-no-decorator PTX, violating cycle-5
+    // feedback_deferral_must_refuse.
+    let cfg = base_fusible();
+    let err = synthesize_backward_with_tier(&cfg)
+        .expect_err("R0: policy=full must refuse in v1");
+    assert!(
+        err.contains(
+            "@checkpoint(policy=\"full\") functional recompute not yet wired in v1: \
+             ships API surface + refusal cascade only. kv_load substitution + \
+             SMEM-base routing deferred to follow-on cycle behind GPU validation gate."
+        ),
+        "R0 missing expected substring: {err}"
+    );
+}
 
 #[test]
 fn g2_r3_non_fusible_prologue_refuses() {
     // R3: policy=Full but the forward config has no Level-1 fusible
     // prologue (csha=None means no RMSNorm prologue is available to
     // recompute).
+    //
+    // Phase F: R0 fires first and refuses ALL policy=Full configs in
+    // v1, so this test asserts the R0 substring fires (R3 is
+    // structurally unreachable today). Cycle 11 lifts R0 and this test
+    // upgrades to asserting the original R3 substring.
     let mut cfg = base_fusible();
     cfg.csha = None;
     let err = synthesize_backward_with_tier(&cfg)
-        .expect_err("R3: non-fusible prologue must refuse");
+        .expect_err("R3 (R0-shadowed in v1): config must refuse");
     assert!(
-        err.contains("requires RMSNorm to matmul to RoPE prologue"),
-        "R3 missing expected substring: {err}"
+        err.contains("functional recompute not yet wired in v1"),
+        "R0 (shadowing R3) missing expected substring: {err}"
     );
 }
 
 #[test]
 fn g2_r7_pca_packing_with_rope_q_refuses() {
     // R7: segment_masked + rope_q + checkpoint composition is deferred
-    // to v4.
+    // to v4. Phase F: R0-shadowed; assert R0 substring.
     let mut cfg = base_fusible();
     cfg.segment_masked = true;
     cfg.rope_q = true;
     let err = synthesize_backward_with_tier(&cfg)
-        .expect_err("R7: PCA packing + rope_q + checkpoint must refuse");
+        .expect_err("R7 (R0-shadowed in v1): config must refuse");
     assert!(
-        err.contains("PCA packing with rope_q=true under @checkpoint deferred to v4"),
-        "R7 missing expected substring: {err}"
+        err.contains("functional recompute not yet wired in v1"),
+        "R0 (shadowing R7) missing expected substring: {err}"
     );
 }
 
 #[test]
 fn g2_r9_paged_kv_collision_refuses() {
     // R9: `paged_kv_collision = true` flag on the carrier signals the
-    // enclosing fn was also `@paged_kv`-decorated. v1 refuses; v4 will
-    // implement scatter-on-recompute.
+    // enclosing fn was also `@paged_kv`-decorated. Phase F: R0-shadowed.
     let cfg = FlashAttentionConfig {
         checkpoint: Some(CheckpointExtras {
             policy: CheckpointPolicy::Full,
@@ -128,86 +162,83 @@ fn g2_r9_paged_kv_collision_refuses() {
         ..base_fusible()
     };
     let err = synthesize_backward_with_tier(&cfg)
-        .expect_err("R9: @paged_kv + @checkpoint composition must refuse");
+        .expect_err("R9 (R0-shadowed in v1): config must refuse");
     assert!(
-        err.contains(
-            "@checkpoint composition with @paged_kv requires scatter-on-recompute; \
-             deferred to v4"
-        ),
-        "R9 missing expected substring: {err}"
+        err.contains("functional recompute not yet wired in v1"),
+        "R0 (shadowing R9) missing expected substring: {err}"
     );
 }
 
 #[test]
 fn g2_r10_asymmetric_tile_refuses() {
     // R10: block_q != block_kv under @checkpoint policy=full is
-    // deferred to v2 (the recompute SMEM accounting assumes symmetric
-    // tiles in v1).
+    // deferred to v2. Phase F: R0-shadowed.
     let mut cfg = base_fusible();
     cfg.block_kv = 64; // != block_q (32)
     let err = synthesize_backward_with_tier(&cfg)
-        .expect_err("R10: asymmetric tiles + checkpoint must refuse");
+        .expect_err("R10 (R0-shadowed in v1): config must refuse");
     assert!(
-        err.contains(
-            "checkpoint policy=\"full\" requires block_q == block_kv in v1; \
-             asymmetric-tile composition deferred to v2"
-        ),
-        "R10 missing expected substring: {err}"
+        err.contains("functional recompute not yet wired in v1"),
+        "R0 (shadowing R10) missing expected substring: {err}"
     );
 }
 
 #[test]
 fn g2_r81_sinks_v2_composition_refuses() {
-    // R8.1: sinks-v2 + @checkpoint composition is unconditionally
-    // refused in v1 (cycle-7 backward sinks refusal already blocks
-    // num_sink_tokens > 0 at a lower layer; we emit the checkpoint-
-    // specific substring so callers learn at the right altitude).
+    // R8.1 (Phase F): sinks-v2 + @checkpoint is now UNCONDITIONAL in v1
+    // (the cycle-9 verified smoke-set carve-out was structurally
+    // unreachable — `static_seq_len.unwrap_or(0)` always evaluated to 0
+    // in production because `CshaExtras::level1` doesn't set
+    // static_seq_len — so we dropped it). The new R8.1 substring
+    // documents that the carve-out is deferred to v2 behind GPU
+    // validation.
+    //
+    // R0 shadows R8.1 in v1 the same as the other refusals; assert the
+    // R0 substring here too. The renamed R8.1 substring is exercised in
+    // the cycle-11 lift commit when R0 is removed and the original
+    // refusal cascade becomes reachable again.
     let mut cfg = base_fusible();
     cfg.num_sink_tokens = 4;
     let err = synthesize_backward_with_tier(&cfg)
-        .expect_err("R8.1: sinks-v2 + checkpoint must refuse");
+        .expect_err("R8.1 (R0-shadowed in v1): config must refuse");
     assert!(
-        err.contains(
-            "checkpoint policy=\"full\" + sinks-v2: composition outside \
-             verified smoke set; refused"
-        ),
-        "R8.1 missing expected substring: {err}"
+        err.contains("functional recompute not yet wired in v1"),
+        "R0 (shadowing R8.1) missing expected substring: {err}"
     );
 }
 
-// ----- G3: structural recompute probe ------------------------------------
+// ----- G3: R0 refusal-reachability probe (Phase F honest gate) ----------
 
 #[test]
-fn g3_structural_recompute_probe_emits_diagnostic_and_namespace() {
+fn g3_policy_full_refuses_with_r0_substring() {
+    // G3 (Phase F): cycle 10's first pass shipped a tautological
+    // structural probe — it asserted that PTX comments containing
+    // synthesized substrings were emitted, which passed trivially
+    // because the comments contained themselves. Reviewer 1 caught
+    // this. Phase F replaces G3 with a honest refusal-reachability
+    // gate: a fusible-prologue config that previously took the
+    // recompute path now returns R0's exact substring.
+    //
+    // This gate FAILS if R0 is removed without a real replacement —
+    // i.e., if cycle 11 lifts R0 without simultaneously wiring the
+    // kv_load skip + SMEM-base routing + GPU validation gate. The
+    // cycle-11 commit that lifts R0 must also rewrite G3 to assert
+    // numerical equivalence against the materialized-saves baseline.
     let cfg = base_fusible();
-    let ptx = synthesize_backward_with_tier(&cfg)
-        .expect("G3: fusible-prologue + checkpoint=Full must synthesize");
+    let err = synthesize_backward_with_tier(&cfg)
+        .expect_err("G3: fusible-prologue + checkpoint=Full must refuse at R0 in v1");
 
-    // 1. Diagnostic comment substring (G3 functional-presence gate).
     assert!(
-        ptx.contains("full prologue recompute (norm + proj + RoPE)"),
-        "G3: missing recompute diagnostic. PTX head:\n{}",
-        ptx.lines().take(20).collect::<Vec<_>>().join("\n")
+        err.contains("@checkpoint(policy=\"full\") functional recompute not yet wired in v1"),
+        "G3: R0 refusal substring missing. Got: {err}"
     );
     assert!(
-        ptx.contains("Checkpoint strategy:"),
-        "G3: missing 'Checkpoint strategy:' header comment"
-    );
-
-    // 2. Namespace-suffix evidence (Task 8 wire-up): per-q_iter
-    // recompute markers reference the `_bwd_recompute_<q>` suffix in
-    // both label and register-hint form.
-    assert!(
-        ptx.contains("_bwd_recompute_0"),
-        "G3: missing namespace_suffix evidence for q_iter=0"
+        err.contains("kv_load substitution + SMEM-base routing deferred"),
+        "G3: R0 deferral disclosure missing. Got: {err}"
     );
     assert!(
-        ptx.contains("V2_CSHA_PROLOGUE_SKIP_0_bwd_recompute_0"),
-        "G3: missing recompute-label evidence for q_iter=0"
-    );
-    assert!(
-        ptx.contains("%recompute_marker_bwd_recompute_0"),
-        "G3: missing recompute register-hint evidence for q_iter=0"
+        err.contains("behind GPU validation gate"),
+        "G3: R0 GPU-validation-gate disclosure missing. Got: {err}"
     );
 }
 
