@@ -2708,11 +2708,19 @@ fn lower_fused_linear_ce_forward(
     // the scope sweep (see `precision_cast::cast_and_publish`), so each cast
     // tensor is reclaimed at function-scope exit — same lifecycle as
     // `loss_out`/`lse_out` above.  Cost is `(B*S*H + V*H + V) * 2 bytes` of
-    // extra HBM per forward+backward step; the caching path is a v7 opt.
+    // extra HBM per forward+backward step.
+    //
+    // CFTP v6 Findings 10/14: the cast Values are CACHED in
+    // `compiler.fused_ce_fwd_casts` (paired with `dtype_tag` per
+    // Finding 16) so the symmetric backward extract REUSES them
+    // instead of emitting three more cast calls — without the cache
+    // the implementation emitted six casts per dispatch (forward three
+    // + backward three), doubling the docstring's quoted HBM cost.
     //
     // Byte-identity: when `dtype_tag == 0` (no decorator OR `dtype="f32"`)
     // the cast block is fully skipped, so the F32 v1 byte-identity contract
-    // is preserved.
+    // is preserved (and the cache still stores the pass-through inputs as
+    // a no-op so the backward can reuse them uniformly).
     let (x_t_for_ffi, w_t_for_ffi, bias_t_for_ffi) =
         maybe_precision_cast_inputs(compiler, builder, dtype_tag, x_t, w_t, bias_t)?;
     let x_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[x_t_for_ffi])?;
@@ -2896,6 +2904,20 @@ fn lower_fused_linear_ce_forward(
     // scalar-result Cranelift Value. Backward's first extract (component
     // = 0) reads + consumes it; the entry is evicted there.
     compiler.fused_ce_fwd_lse.insert(result, lse_out);
+    // CFTP v6 Findings 10/14 + 16: cache the forward-side cast Values
+    // so the symmetric backward dispatch can REUSE them instead of
+    // emitting three more `nsl_tensor_to_{bf16,fp16}` calls per step
+    // (the docstring's quoted '(B*S*H + V*H + V) * 2 bytes per forward
+    // + backward step' assumed one cast set; without this cache the
+    // implementation emitted two).  Pair with `dtype_tag` so a future
+    // backward path that disagrees with the cached dtype surfaces as
+    // a CodegenError rather than silently reusing the wrong byte
+    // layout.  For dtype_tag == 0 (F32) the cached Values are the
+    // pass-through inputs, so this is a no-op cost (one HashMap entry
+    // per FusedLinearCe op).
+    compiler
+        .fused_ce_fwd_casts
+        .insert(result, (x_t_for_ffi, w_t_for_ffi, bias_t_for_ffi, dtype_tag));
     Ok(result)
 }
 
@@ -2988,14 +3010,46 @@ fn lower_fused_linear_ce_backward_extract(
                 )
             })?;
 
-        // CFTP v6: INLINE PRECISION CAST on backward inputs (symmetric with
-        // forward path; see lower_fused_linear_ce_forward for the rationale).
-        // Only x/W/bias are read in the dtype-sensitive `ld.global.b16` paths;
-        // lse_out stays f32 (FFI contract), and the dx/dW/dbias outputs stay
-        // f32 (master-grad convention). dtype_tag == 0 fully skips the cast,
-        // preserving the F32 v1 byte-identity contract.
-        let (x_t_for_ffi, w_t_for_ffi, bias_t_for_ffi) =
-            maybe_precision_cast_inputs(compiler, builder, dtype_tag, x_t, w_t, bias_t)?;
+        // CFTP v6 Findings 10/14 + 16: REUSE the forward-side precision
+        // casts via `fused_ce_fwd_casts` instead of emitting three more
+        // `nsl_tensor_to_{bf16,fp16}` calls.  This halves the per-step
+        // cast HBM cost and matches the forward docstring's quoted
+        // `(B*S*H + V*H + V) * 2 bytes` (which assumed one cast per
+        // forward+backward step, not two).  Defensive dtype check: the
+        // cached dtype_tag MUST match the current backward dtype_tag —
+        // a mismatch means `fused_ce_configs[0].dtype` was mutated
+        // between forward and backward emission (e.g., a curriculum
+        // that flips dtype mid-step), in which case reusing the cached
+        // cast bytes would silently feed the wrong byte layout to the
+        // kernel.  Fall back to a fresh cast emission on miss so a
+        // separately-compiled backward without a forward cache entry
+        // still works (this is the path taken by backward-only
+        // compilation pipelines).
+        let (x_t_for_ffi, w_t_for_ffi, bias_t_for_ffi) = match compiler
+            .fused_ce_fwd_casts
+            .get(&fwd_result_key)
+            .copied()
+        {
+            Some((x_cast, w_cast, bias_cast, cached_dtype)) => {
+                if cached_dtype != dtype_tag {
+                    return Err(CodegenError::new(format!(
+                        "FusedLinearCeBackwardExtract: cached forward cast dtype_tag={} \
+                         != current backward dtype_tag={} — `fused_ce_configs[0].dtype` \
+                         was mutated between forward and backward emission. \
+                         This violates the v6 single-source-of-truth invariant \
+                         (`fused_ce_dtype_for_compiler` must return the same value \
+                         throughout one compile).",
+                        cached_dtype, dtype_tag
+                    )));
+                }
+                (x_cast, w_cast, bias_cast)
+            }
+            None => {
+                // Backward-only compile (no forward cache entry).  Emit
+                // fresh casts as the v6 baseline did.
+                maybe_precision_cast_inputs(compiler, builder, dtype_tag, x_t, w_t, bias_t)?
+            }
+        };
         let x_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[x_t_for_ffi])?;
         let w_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[w_t_for_ffi])?;
         let bias_ptr = call(compiler, builder, "nsl_tensor_data_ptr", &[bias_t_for_ffi])?;
@@ -3098,6 +3152,10 @@ fn lower_fused_linear_ce_backward_extract(
     let result = slot[component as usize];
     if component == 2 {
         compiler.fused_ce_bwd_cache.remove(&fwd_result_key);
+        // CFTP v6 Finding 10/14: evict the cast cache on the same
+        // last-component boundary so the cache stays bounded across
+        // many FusedLinearCe ops in one compile.
+        compiler.fused_ce_fwd_casts.remove(&fwd_result_key);
     }
     Ok(result)
 }

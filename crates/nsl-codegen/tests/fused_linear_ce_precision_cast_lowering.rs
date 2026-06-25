@@ -467,9 +467,14 @@ fn f32_hint_emits_no_precision_cast_backward() {
     );
 }
 
+/// CFTP v6 Findings 10/14: the forward+backward dispatch emits exactly
+/// 3 cast calls — the forward casts are CACHED on the Compiler keyed by
+/// the forward result Value and the backward extract REUSES them via
+/// `compiler.fused_ce_fwd_casts.get(...)`. Without the cache the
+/// implementation emitted 6 casts (forward 3 + backward 3), doubling
+/// the docstring's quoted HBM cost. Pin the cached-reuse contract.
 #[test]
-fn fp16_hint_emits_three_to_fp16_calls_per_dispatch_backward() {
-    // Forward (3 casts) + backward (3 casts) = 6 cast calls total.
+fn fp16_hint_emits_three_to_fp16_calls_per_dispatch_with_backward_cache_reuse() {
     let (func, idx) = lower_and_resolve(
         Some(FusedCeDtypeHint::F16),
         SMALL_VOCAB,
@@ -484,8 +489,12 @@ fn fp16_hint_emits_three_to_fp16_calls_per_dispatch_backward() {
     );
     assert_eq!(
         count_calls(&func, idx.get("nsl_tensor_to_fp16").copied()),
-        6,
-        "FP16 hint MUST emit 3 cast calls per dispatch (forward + backward = 6 total).",
+        3,
+        "FP16 hint MUST emit exactly 3 cast calls per forward+backward dispatch \
+         (Findings 10/14): forward emits the casts and stashes them in \
+         `compiler.fused_ce_fwd_casts`; backward reuses the cached Values \
+         instead of emitting 3 more. A regression to 6 means the backward \
+         arm fell through to the cache-miss branch.",
     );
     assert_eq!(count_calls(&func, idx.get("nsl_tensor_to_bf16").copied()), 0);
     assert!(
@@ -497,7 +506,7 @@ fn fp16_hint_emits_three_to_fp16_calls_per_dispatch_backward() {
 }
 
 #[test]
-fn bf16_hint_emits_three_to_bf16_calls_per_dispatch_backward() {
+fn bf16_hint_emits_three_to_bf16_calls_per_dispatch_with_backward_cache_reuse() {
     let (func, idx) = lower_and_resolve(
         Some(FusedCeDtypeHint::Bf16),
         SMALL_VOCAB,
@@ -512,8 +521,9 @@ fn bf16_hint_emits_three_to_bf16_calls_per_dispatch_backward() {
     );
     assert_eq!(
         count_calls(&func, idx.get("nsl_tensor_to_bf16").copied()),
-        6,
-        "BF16 hint MUST emit 3 cast calls per dispatch (forward + backward = 6 total).",
+        3,
+        "BF16 hint MUST emit exactly 3 cast calls per forward+backward dispatch \
+         (Findings 10/14 cache-reuse pin — same as fp16).",
     );
     assert_eq!(count_calls(&func, idx.get("nsl_tensor_to_fp16").copied()), 0);
 }
