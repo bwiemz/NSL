@@ -1580,6 +1580,158 @@ impl Compiler<'_> {
             );
         }
 
+        // CPDT Part III v2.5 SwiGLU MoE FFN lowering:
+        // `moe_dispatch_swiglu(tokens, logits, experts_gate, experts_up,
+        // experts_down)` is the 5-arg variant that emits
+        // `nsl_moe_dispatch_full_v4` (Mixtral's default FFN structure).
+        // Coexists with v2 `moe_dispatch` and v3 `moe_dispatch_ffn`;
+        // users opt in by switching intrinsics.
+        //
+        // No silent fallback to v3/v2 — users that call this intrinsic
+        // explicitly want SwiGLU. Failure is loud, message lists the
+        // expected WeightMap keys.
+        if func_name == "moe_dispatch_swiglu" {
+            if args.len() != 5 {
+                return Err(crate::error::CodegenError::new(
+                    "moe_dispatch_swiglu() takes 5 arguments (tokens, router_logits, experts_gate, experts_up, experts_down)",
+                ));
+            }
+            let tokens_val = self.compile_expr(builder, state, &args[0].value)?;
+            let logits_val = self.compile_expr(builder, state, &args[1].value)?;
+            let experts_gate_val = self.compile_expr(builder, state, &args[2].value)?;
+            let experts_up_val = self.compile_expr(builder, state, &args[3].value)?;
+            let experts_down_val = self.compile_expr(builder, state, &args[4].value)?;
+
+            // Same multi-MoE candidate resolution as v3 — refuse on >=2
+            // matches (multi-MoE disambiguation is v2.next).
+            let config_with_key = state
+                .current_function_name
+                .as_ref()
+                .and_then(|fn_name| {
+                    let model_prefix = fn_name.split("__").next().unwrap_or("");
+                    let candidates: Vec<_> = self
+                        .features
+                        .moe_configs
+                        .iter()
+                        .filter(|(key, _)| key.starts_with(model_prefix))
+                        .collect();
+                    match candidates.as_slice() {
+                        [(key, info)] => Some(((*key).clone(), (*info).clone())),
+                        _ => None,
+                    }
+                })
+                .or_else(|| {
+                    if self.features.moe_configs.len() == 1 {
+                        self.features
+                            .moe_configs
+                            .iter()
+                            .next()
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                    } else {
+                        None
+                    }
+                });
+            let (cfg_key, num_experts, top_k, capacity_factor, activation) =
+                match &config_with_key {
+                    Some((k, info)) => (
+                        Some(k.clone()),
+                        info.num_experts,
+                        info.top_k,
+                        info.capacity_factor,
+                        info.activation,
+                    ),
+                    None => (None, 8, 2, 1.25f32, crate::moe::MoeActivation::Silu),
+                };
+
+            // SwiGLU is structurally `silu(gate) * up @ down` — the
+            // SiLU is wired into the per-expert kernel, not a
+            // selectable activation argument. If the user wrote
+            // `@moe(activation="gelu")` and then called
+            // `moe_dispatch_swiglu(...)`, the source-level intent
+            // (gelu-gated FFN) does NOT match what v4 emits (silu-
+            // gated FFN). Per v2.4's INVALID-VALUE-FATAL / no-silent-
+            // fallback convention, refuse loudly rather than silently
+            // emit silu output. Real GeGLU / ReGLU support is a v2.next
+            // FFI variant.
+            if activation != crate::moe::MoeActivation::Silu {
+                return Err(crate::error::CodegenError::new(format!(
+                    "moe_dispatch_swiglu: SwiGLU FFI hardcodes silu(gate)*up by \
+                     construction. @moe(activation={:?}) cannot override the \
+                     gate activation. Either omit the activation kwarg (defaults \
+                     to silu), call moe_dispatch_ffn for non-SwiGLU activations, \
+                     or wait for v2.next GeGLU / ReGLU FFI variants.",
+                    activation
+                )));
+            }
+
+            let num_experts_val = builder
+                .ins()
+                .iconst(cranelift_codegen::ir::types::I64, num_experts as i64);
+            let top_k_val = builder
+                .ins()
+                .iconst(cranelift_codegen::ir::types::I64, top_k as i64);
+            let cap_bits = builder.ins().iconst(
+                cranelift_codegen::ir::types::I64,
+                capacity_factor.to_bits() as i64,
+            );
+
+            let v4_dims = if let (Some(key), Some(weight_map)) =
+                (cfg_key.as_ref(), self.features.weight_map.as_ref())
+            {
+                crate::moe::derive_v4_dims(weight_map, key, num_experts)
+            } else {
+                None
+            };
+
+            if let Some((hidden_dim, intermediate_dim)) = v4_dims {
+                let hidden_val = builder.ins().iconst(
+                    cranelift_codegen::ir::types::I64,
+                    hidden_dim as i64,
+                );
+                let intermediate_val = builder.ins().iconst(
+                    cranelift_codegen::ir::types::I64,
+                    intermediate_dim as i64,
+                );
+                let result = self.compile_call_by_name(
+                    builder,
+                    "nsl_moe_dispatch_full_v4",
+                    &[
+                        tokens_val,
+                        logits_val,
+                        experts_gate_val,
+                        experts_up_val,
+                        experts_down_val,
+                        num_experts_val,
+                        top_k_val,
+                        cap_bits,
+                        hidden_val,
+                        intermediate_val,
+                    ],
+                )?;
+                return Ok(result);
+            }
+
+            // No silent fallback. SwiGLU is opt-in.
+            return Err(crate::error::CodegenError::new(format!(
+                "moe_dispatch_swiglu: v4 (SwiGLU) requires resolvable router + \
+                 experts.gate + experts.up + experts.down entries in the WeightMap. \
+                 None of the standard names resolved under the MoeConfig key{}, or \
+                 their shapes were inconsistent (router must be [hidden, num_experts]; \
+                 each of experts.gate / experts.up must be [num_experts, hidden * \
+                 intermediate]; experts.down must be [num_experts, intermediate * \
+                 hidden]; all three projections must agree on intermediate). Pass \
+                 --weights with a safetensors bundle containing <key>.router.weight \
+                 AND <key>.experts.gate.weight AND <key>.experts.up.weight AND \
+                 <key>.experts.down.weight (with `.weight` suffix optional). Raw HF \
+                 Mixtral safetensors use per-expert experts.{{e}}.w1/w2/w3 — those \
+                 need a packing pre-step.",
+                cfg_key
+                    .as_deref()
+                    .map(|k| format!(" '{}'", k))
+                    .unwrap_or_default(),
+            )));
+        }
+
         // CPDT Part III v2.3 paper-faithful MoE FFN lowering:
         // `moe_dispatch_ffn(tokens, logits, experts_up, experts_down)` is
         // the opt-in 4-arg variant that emits `nsl_moe_dispatch_full_v3`.

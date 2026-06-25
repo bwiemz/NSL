@@ -1003,6 +1003,26 @@ pub fn register_builtins(scopes: &mut ScopeMap, interner: &mut Interner) {
         },
     );
 
+    // CPDT Part III v2.5: Mixtral's SwiGLU MoE FFN intrinsic
+    // (`moe_dispatch_swiglu(tokens, logits, experts_gate, experts_up,
+    // experts_down)`). 5-arg opt-in that lowers to
+    // `nsl_moe_dispatch_full_v4` (silu(gate) * up → down). Coexists
+    // with v2 / v3 source intrinsics.
+    def(
+        "moe_dispatch_swiglu",
+        Type::Function {
+            params: vec![
+                Type::Unknown,
+                Type::Unknown,
+                Type::Unknown,
+                Type::Unknown,
+                Type::Unknown,
+            ],
+            ret: Box::new(tensor_ret.clone()),
+            effect: Effect::Inferred,
+        },
+    );
+
     // M33: Speculative decode step intrinsic
     def(
         "speculative_decode",

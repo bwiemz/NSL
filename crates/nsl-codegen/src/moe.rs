@@ -137,6 +137,96 @@ pub fn derive_v3_dims(
     Some((hidden, intermediate_from_up))
 }
 
+/// CPDT Part III v2.5 codegen lowering for `nsl_moe_dispatch_full_v4`:
+/// derive `(hidden_dim, intermediate_dim)` from the WeightMap by
+/// resolving router + gate + up + down expert blocks.
+///
+/// Layout contract (extends v3 with a gate projection):
+///   - router               shape == [hidden_dim, num_experts]
+///   - experts gate-proj   shape == [num_experts, hidden_dim * intermediate_dim]
+///   - experts up-proj     shape == [num_experts, hidden_dim * intermediate_dim]
+///   - experts down-proj   shape == [num_experts, intermediate_dim * hidden_dim]
+///
+/// Name resolution suffixes: NSL's packed-layout convention uses
+/// `experts.gate.weight` / `experts.up.weight` / `experts.down.weight`
+/// (with `.weight` suffix optional for all three). Raw HF Mixtral
+/// safetensors use per-expert `experts.{e}.w1/w2/w3` (w1=gate, w3=up,
+/// w2=down for SwiGLU) — those bundles need a packing pre-step before
+/// this helper resolves them. v2.next raw-HF ingestion is deferred.
+///
+/// Returns `None` (caller produces a hard CodegenError under
+/// `moe_dispatch_swiglu` — there is no v3-fallback semantics from this
+/// site) when any of:
+///   - no router entry resolves
+///   - no experts.gate / experts.up / experts.down entry resolves
+///   - shapes aren't 2D
+///   - router.shape[1] != num_experts
+///   - any of {gate, up, down}.shape[0] != num_experts
+///   - hidden_dim is zero
+///   - gate / up / down trailing dims aren't multiples of hidden_dim
+///   - the derived intermediate_dim from gate, up, and down don't all
+///     agree (silent-corruption guard)
+pub fn derive_v4_dims(
+    weight_map: &WeightMap,
+    key: &str,
+    num_experts: usize,
+) -> Option<(usize, usize)> {
+    let router = ["router.weight", "gate.weight", "router", "gate"]
+        .iter()
+        .find_map(|s| weight_map.get(&format!("{key}.{s}")))?;
+    let experts_gate = ["experts.gate.weight", "experts.gate"]
+        .iter()
+        .find_map(|s| weight_map.get(&format!("{key}.{s}")))?;
+    let experts_up = ["experts.up.weight", "experts.up"]
+        .iter()
+        .find_map(|s| weight_map.get(&format!("{key}.{s}")))?;
+    let experts_down = ["experts.down.weight", "experts.down"]
+        .iter()
+        .find_map(|s| weight_map.get(&format!("{key}.{s}")))?;
+    if router.shape.len() != 2
+        || experts_gate.shape.len() != 2
+        || experts_up.shape.len() != 2
+        || experts_down.shape.len() != 2
+    {
+        return None;
+    }
+    if router.shape[1] != num_experts {
+        return None;
+    }
+    if experts_gate.shape[0] != num_experts
+        || experts_up.shape[0] != num_experts
+        || experts_down.shape[0] != num_experts
+    {
+        return None;
+    }
+    let hidden = router.shape[0];
+    let gate_block_elems = experts_gate.shape[1];
+    let up_block_elems = experts_up.shape[1];
+    let down_block_elems = experts_down.shape[1];
+    if hidden == 0
+        || gate_block_elems == 0
+        || up_block_elems == 0
+        || down_block_elems == 0
+        || !gate_block_elems.is_multiple_of(hidden)
+        || !up_block_elems.is_multiple_of(hidden)
+        || !down_block_elems.is_multiple_of(hidden)
+    {
+        return None;
+    }
+    let intermediate_from_gate = gate_block_elems / hidden;
+    let intermediate_from_up = up_block_elems / hidden;
+    let intermediate_from_down = down_block_elems / hidden;
+    // All three projections must agree on the inner dim. If gate and
+    // up disagree, the silu(gate) * up multiply is mis-aligned. If
+    // down disagrees, the down-matmul reads garbage. Refuse v4.
+    if intermediate_from_gate != intermediate_from_up
+        || intermediate_from_up != intermediate_from_down
+    {
+        return None;
+    }
+    Some((hidden, intermediate_from_gate))
+}
+
 /// CPDT Part III v2.4: activation selector for the v3 paper-faithful
 /// MoE FFN. Matches the runtime `activation_kind` enum exactly so
 /// `as i64` produces the FFI value with no translation table.
@@ -537,6 +627,98 @@ mod tests {
             derive_v3_dims(&wm, "blocks.0", 4),
             None,
             "router.shape[1] != num_experts → refuse v3"
+        );
+    }
+
+    // ── derive_v4_dims (CPDT Part III v2.5 SwiGLU lowering) ────────────────
+
+    #[test]
+    fn derive_v4_dims_resolves_with_gate_up_down_present() {
+        let mut wm = WeightMap::default();
+        wm.insert(make_weight("blocks.0.router.weight", vec![16, 4]));
+        wm.insert(make_weight("blocks.0.experts.gate.weight", vec![4, 16 * 32]));
+        wm.insert(make_weight("blocks.0.experts.up.weight", vec![4, 16 * 32]));
+        wm.insert(make_weight("blocks.0.experts.down.weight", vec![4, 32 * 16]));
+        assert_eq!(
+            derive_v4_dims(&wm, "blocks.0", 4),
+            Some((16, 32)),
+            "hidden=16 from router.shape[0]; intermediate=32 shared across gate/up/down"
+        );
+    }
+
+    #[test]
+    fn derive_v4_dims_resolves_alternate_name_suffixes() {
+        let mut wm = WeightMap::default();
+        wm.insert(make_weight("blocks.0.gate.weight", vec![8, 2]));
+        wm.insert(make_weight("blocks.0.experts.gate", vec![2, 8 * 16]));
+        wm.insert(make_weight("blocks.0.experts.up", vec![2, 8 * 16]));
+        wm.insert(make_weight("blocks.0.experts.down", vec![2, 16 * 8]));
+        assert_eq!(
+            derive_v4_dims(&wm, "blocks.0", 2),
+            Some((8, 16)),
+            "names without `.weight` suffix must resolve"
+        );
+    }
+
+    #[test]
+    fn derive_v4_dims_returns_none_when_v3_layout_missing_gate() {
+        // v3 packed layout: just experts.up + experts.down, no gate.
+        // v4 must refuse — caller produces a hard CodegenError.
+        let mut wm = WeightMap::default();
+        wm.insert(make_weight("blocks.0.router.weight", vec![16, 4]));
+        wm.insert(make_weight("blocks.0.experts.up.weight", vec![4, 16 * 32]));
+        wm.insert(make_weight("blocks.0.experts.down.weight", vec![4, 32 * 16]));
+        assert_eq!(
+            derive_v4_dims(&wm, "blocks.0", 4),
+            None,
+            "v3 layout (no gate) must NOT resolve as v4"
+        );
+    }
+
+    #[test]
+    fn derive_v4_dims_returns_none_when_gate_disagrees_on_intermediate() {
+        // gate implies intermediate=64 but up implies intermediate=32.
+        // Silent corruption hazard at runtime — refuse v4.
+        let mut wm = WeightMap::default();
+        wm.insert(make_weight("blocks.0.router.weight", vec![16, 4]));
+        wm.insert(make_weight("blocks.0.experts.gate.weight", vec![4, 16 * 64]));
+        wm.insert(make_weight("blocks.0.experts.up.weight", vec![4, 16 * 32]));
+        wm.insert(make_weight("blocks.0.experts.down.weight", vec![4, 32 * 16]));
+        assert_eq!(
+            derive_v4_dims(&wm, "blocks.0", 4),
+            None,
+            "gate-derived intermediate != up-derived intermediate → refuse v4"
+        );
+    }
+
+    #[test]
+    fn derive_v4_dims_returns_none_when_down_disagrees_on_intermediate() {
+        // gate and up agree (intermediate=32) but down implies 64.
+        let mut wm = WeightMap::default();
+        wm.insert(make_weight("blocks.0.router.weight", vec![16, 4]));
+        wm.insert(make_weight("blocks.0.experts.gate.weight", vec![4, 16 * 32]));
+        wm.insert(make_weight("blocks.0.experts.up.weight", vec![4, 16 * 32]));
+        wm.insert(make_weight("blocks.0.experts.down.weight", vec![4, 64 * 16]));
+        assert_eq!(
+            derive_v4_dims(&wm, "blocks.0", 4),
+            None,
+            "down-derived intermediate != gate/up → refuse v4"
+        );
+    }
+
+    #[test]
+    fn derive_v4_dims_returns_none_when_gate_shape_0_mismatches_num_experts() {
+        // gate.shape[0] = 6 but num_experts = 4. Silent mis-indexing
+        // hazard at runtime if not caught.
+        let mut wm = WeightMap::default();
+        wm.insert(make_weight("blocks.0.router.weight", vec![16, 4]));
+        wm.insert(make_weight("blocks.0.experts.gate.weight", vec![6, 16 * 32]));
+        wm.insert(make_weight("blocks.0.experts.up.weight", vec![4, 16 * 32]));
+        wm.insert(make_weight("blocks.0.experts.down.weight", vec![4, 32 * 16]));
+        assert_eq!(
+            derive_v4_dims(&wm, "blocks.0", 4),
+            None,
+            "gate.shape[0] != num_experts → refuse v4"
         );
     }
 }

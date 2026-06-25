@@ -84,6 +84,42 @@ pub fn validate_moe_decorator(
                             }
                         }
                     }
+                    // CPDT Part III v2.5 (closes a v2.4 surface gap):
+                    // `activation` selects the per-expert nonlinearity
+                    // for the v3 paper-faithful MoE FFN, AND drives the
+                    // v4 SwiGLU activation-mismatch refusal. Accepted
+                    // values match `MoeActivation::from_str` in the
+                    // codegen side (canonical names + lowercase aliases).
+                    // INVALID-VALUE-FATAL: unknown strings are rejected
+                    // at semantic time, not silently defaulted, matching
+                    // the v2.4 convention. The set is intentionally
+                    // duplicated here (not factored into a shared crate)
+                    // because nsl-semantic does not depend on nsl-codegen.
+                    "activation" => {
+                        if let ExprKind::StringLiteral(s) = &arg.value.kind {
+                            let kind = s.to_ascii_lowercase();
+                            let allowed = matches!(
+                                kind.as_str(),
+                                "identity" | "none" | "silu" | "swish" | "gelu" | "relu"
+                            );
+                            if !allowed {
+                                diagnostics.push(
+                                    Diagnostic::error(format!(
+                                        "@moe: unknown activation kind '{s}' — \
+                                         allowed: identity, none, silu, swish, gelu, relu"
+                                    ))
+                                    .with_label(arg.span, "unknown activation"),
+                                );
+                            }
+                        } else {
+                            diagnostics.push(
+                                Diagnostic::error(
+                                    "@moe: activation must be a string literal".to_string(),
+                                )
+                                .with_label(arg.span, "expected string literal"),
+                            );
+                        }
+                    }
                     _ => {
                         diagnostics.push(
                             Diagnostic::error(format!("@moe: unknown argument '{}'", aname))
