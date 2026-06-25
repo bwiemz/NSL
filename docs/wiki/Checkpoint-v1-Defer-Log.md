@@ -199,3 +199,15 @@ Until the v2 GPU validation lands:
 Cross-reference: see cycle-10 spec corrections appendix at
 `docs/superpowers/specs/2026-06-24-csha-checkpointing-aware-backward-design.md`
 for the W1-W17 fabrication audit and the authoritative cut sequence.
+
+## Cycle 11 functional substitution landing (R0 stays)
+
+Cycle 11 wires the kv_load -> emit_kv_recompute substitution behind R0:
+
+- Test-only bypass via bypass_r0_for_testing() on CheckpointExtras (cfg-gated, no production attack surface)
+- kv_load::emit_k_suffixed/emit_v_suffixed skipped when config.checkpoint.is_some()
+- emit_kv_recompute writes K_proj/V_proj into %k_smem_base/%v_smem_base via x_raw_ptr + W_k/W_v + RoPE saves
+- Structural probes G3a (kv_load skip evidence), G3b (recompute label), G3c (SMEM ordering), G3d (no-decorator byte-identity)
+
+Cycle 12 will lift R0 + run G4 GPU numerical validation at (hd, S) in {(64, 512), (64, 2048), (128, 2048), (128, 4096)} via csha_cuda_backward.rs harness.
+
