@@ -86,6 +86,30 @@ pub fn emit_active_heads_guard(ptx: &mut String, config: &FlashAttentionConfig) 
 /// for the warp's query row and writes the result back into the x
 /// buffer in-place. Null-guarded on `csha_x_ptr`.
 pub fn emit_prologue(ptx: &mut String, config: &FlashAttentionConfig, q_tile_iter: u32) {
+    // Forward-path entry point: delegate to the namespaced variant with
+    // an empty suffix to preserve byte-identity. Verified against the
+    // `fa_v2_snapshots` baseline (25/25 byte-identical post-cycle-10).
+    emit_prologue_namespaced(ptx, config, q_tile_iter, "");
+}
+
+/// Cycle-10 §5.3 Task 8: namespaced `emit_prologue` variant.
+///
+/// `namespace_suffix` is appended to every PTX *label* this function
+/// emits (`V2_CSHA_PROLOGUE_SKIP_{q_tile_iter}{suffix}`). PTX registers
+/// (`%rd52`, `%f0`, etc.) are NOT suffixed because they are declared
+/// in the kernel prelude and shared across all phase emitters; the
+/// backward recompute path will reload them per call, not re-declare
+/// them.
+///
+/// Forward path passes `suffix = ""` to preserve byte-identity. Backward
+/// recompute path (Task 9) will pass a backward-suitable suffix like
+/// `"_bwd_{q_tile_iter}"` via `emit_prologue_recompute` below.
+pub fn emit_prologue_namespaced(
+    ptx: &mut String,
+    config: &FlashAttentionConfig,
+    q_tile_iter: u32,
+    namespace_suffix: &str,
+) {
     if config.csha.is_none() {
         ptx.push_str("    // CSHA A.2.2 prologue: csha=None, no emission\n");
         return;
@@ -101,8 +125,8 @@ pub fn emit_prologue(ptx: &mut String, config: &FlashAttentionConfig, q_tile_ite
     ptx.push_str("    ld.param.u64 %rd52, [csha_x_ptr];\n");
     ptx.push_str("    setp.eq.u64 %p0, %rd52, 0;\n");
     ptx.push_str(&format!(
-        "    @%p0 bra V2_CSHA_PROLOGUE_SKIP_{};\n",
-        q_tile_iter
+        "    @%p0 bra V2_CSHA_PROLOGUE_SKIP_{}{};\n",
+        q_tile_iter, namespace_suffix
     ));
 
     // Tier C: load x_raw_ptr once (for the per-slice raw-x save below).
@@ -195,8 +219,29 @@ pub fn emit_prologue(ptx: &mut String, config: &FlashAttentionConfig, q_tile_ite
         ptx.push_str("    st.global.f32 [%rd54], %f2;\n");
     }
 
-    ptx.push_str(&format!("V2_CSHA_PROLOGUE_SKIP_{}:\n", q_tile_iter));
+    ptx.push_str(&format!(
+        "V2_CSHA_PROLOGUE_SKIP_{}{}:\n",
+        q_tile_iter, namespace_suffix
+    ));
     ptx.push_str("    bar.sync 0;  // FENCE: all prologue writes complete\n");
+}
+
+/// Cycle-10 §5.3 Task 8: backward-suitable wrapper around
+/// `emit_prologue_namespaced`.
+///
+/// Used by the backward dispatch fork (Task 9) under
+/// `CheckpointPolicy::Full` to re-emit the prologue at backward-pass
+/// time with a backward-distinguished label namespace, so the
+/// recomputed labels (e.g. `V2_CSHA_PROLOGUE_SKIP_0_bwd_0`) do not
+/// collide with the forward-pass labels still resident in the same
+/// PTX text section.
+pub fn emit_prologue_recompute(
+    ptx: &mut String,
+    config: &FlashAttentionConfig,
+    q_tile_iter: u32,
+    namespace_suffix: &str,
+) {
+    emit_prologue_namespaced(ptx, config, q_tile_iter, namespace_suffix);
 }
 
 /// Emit the §A.2.3 matmul projection (Q/K/V fused projection).
@@ -2228,5 +2273,69 @@ mod tests {
             "K RoPE must run before S-compute; \
              found ROPE_K @ byte {rope_k_idx} but S-compute @ byte {attn_body_idx}"
         );
+    }
+
+    // ── Cycle-10 §5.3 Task 8: namespaced emit_prologue tests ──────────────
+
+    #[test]
+    fn cycle10_task8_forward_path_byte_identical() {
+        // emit_prologue is now a thin shim around emit_prologue_namespaced
+        // with suffix="". The PTX bytes must match a direct
+        // emit_prologue_namespaced(..., "") call exactly — this is the
+        // contract that guarantees fa_v2_snapshots byte-identity.
+        let cfg = cfg_with_projections();
+        let mut a = String::new();
+        let mut b = String::new();
+        emit_prologue(&mut a, &cfg, 0);
+        emit_prologue_namespaced(&mut b, &cfg, 0, "");
+        assert_eq!(a, b, "forward path must equal namespaced empty-suffix call");
+
+        // Specifically: emitted label uses the unsuffixed form.
+        assert!(
+            a.contains("V2_CSHA_PROLOGUE_SKIP_0:"),
+            "forward label must be V2_CSHA_PROLOGUE_SKIP_0 (no suffix); got: {}",
+            a
+        );
+        assert!(
+            !a.contains("V2_CSHA_PROLOGUE_SKIP_0_bwd"),
+            "forward must NOT include backward-suffixed label"
+        );
+    }
+
+    #[test]
+    fn cycle10_task8_emit_prologue_recompute_uses_suffix() {
+        // emit_prologue_recompute is the backward-path entry point. With
+        // a backward-distinguishing suffix the emitted labels must carry
+        // the suffix so they don't collide with forward labels in the
+        // same PTX text section.
+        let cfg = cfg_with_projections();
+        let mut ptx = String::new();
+        emit_prologue_recompute(&mut ptx, &cfg, 0, "_bwd_0");
+        assert!(
+            ptx.contains("V2_CSHA_PROLOGUE_SKIP_0_bwd_0:"),
+            "backward-suffixed label V2_CSHA_PROLOGUE_SKIP_0_bwd_0 missing; got: {}",
+            ptx
+        );
+        assert!(
+            ptx.contains("V2_CSHA_PROLOGUE_SKIP_0_bwd_0;"),
+            "branch target to V2_CSHA_PROLOGUE_SKIP_0_bwd_0 missing; got: {}",
+            ptx
+        );
+    }
+
+    #[test]
+    fn cycle10_task8_no_csha_short_circuits_with_or_without_suffix() {
+        // The csha=None bail-out is independent of the suffix.
+        let mut cfg = cfg_with_projections();
+        cfg.csha = None;
+        let mut a = String::new();
+        let mut b = String::new();
+        emit_prologue(&mut a, &cfg, 0);
+        emit_prologue_recompute(&mut b, &cfg, 0, "_bwd_0");
+        assert_eq!(
+            a, b,
+            "csha=None short-circuit must be suffix-independent"
+        );
+        assert!(a.contains("csha=None"));
     }
 }
