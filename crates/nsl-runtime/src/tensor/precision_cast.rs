@@ -8,6 +8,37 @@
 //! toward zero — proper rounding for optimizer state is a deferred ladder
 //! step (see the design doc §10). Models its allocation on
 //! `crate::fp8::nsl_fp8_cast`.
+//!
+//! # Adversarial review v6 — remaining deferred items
+//!
+//! Finding 3 (MEDIUM, HBM growth in long-scope loops): each forward+
+//! backward step allocates one set of cast shadow buffers per
+//! FusedLinearCe op via `cast_and_publish`'s `NslTensor::publish`,
+//! which `scope_track`s the tensor; the scope sweep runs at function
+//! exit. A training loop body lowered into one Cranelift function
+//! that runs N iterations within ONE scope (e.g., gradient
+//! accumulation) accumulates the cast tensors over the entire loop
+//! rather than per iteration.  The Finding 10/14 forward-to-backward
+//! cache halves the per-iteration cost (one cast set per dispatch
+//! instead of two), but the per-loop accumulation hazard remains.
+//! Mitigations: (a) ensure the lowered loop body emits per-iteration
+//! `nsl_tensor_scope_begin`/`scope_end` boundaries; (b) longer term,
+//! a v7 on-device cast kernel + a model-weight-pinned W shadow buffer
+//! lifts the cost out of the loop entirely.
+//!
+//! Finding 7 (HIGH, RTE rounding gap): the underlying `f32_to_f16_bits`
+//! / `f32_to_bf16_bits` primitives TRUNCATE rather than round-to-
+//! nearest-even, producing a one-sided bias of up to one full unit
+//! roundoff per element.  Real RTE rounding is the design-doc §10
+//! deferred ladder step.  The Findings 1/6/12 fix (default-on FFI
+//! refusal) blocks the wengert-driven production path from reaching
+//! the kernel today, so the rounding-bias hazard is DORMANT under v6:
+//! direct-FFI tests that opt-in via `NSL_FUSED_LCE_ALLOW_NON_F32_FFI=1`
+//! stage their bytes via `half::*::from_f32` (RTE) and so are
+//! unaffected.  A v7 follow-on must (a) implement RTE in the
+//! primitives, (b) re-measure the V=49152 baselines via the production
+//! path (not via `half::from_f32`), and (c) lift the FFI refusal once
+//! the device-side cast kernel + RTE primitives are both ready.
 
 use std::ffi::c_void;
 
