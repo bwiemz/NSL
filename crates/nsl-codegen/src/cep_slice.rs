@@ -71,6 +71,39 @@ pub fn slice_blocks(
         });
     }
     let block = block_width as usize;
+    // The function's contract is that the sliced axis is exactly `n_units` blocks
+    // of `block_width` consecutive rows/cols, i.e. `n_units * block_width == axis_dim`.
+    // The `u < n_units` check below rules out unit-index overflow but is NOT
+    // sufficient: if the model spec says `n_heads * head_dim` but the stored
+    // tensor was shaped differently (or a future caller passes a stale `n_units`),
+    // the last unit's byte range silently runs past the row/col boundary and the
+    // gather panics with index-out-of-bounds. Convert that latent panic into
+    // ShapeMismatch up-front.
+    let axis_dim = match axis {
+        0 => rows,
+        1 => cols,
+        _ => {
+            return Err(CepSliceError::ShapeMismatch {
+                tensor: entry.name.clone(),
+                expected: "axis 0 or 1".into(),
+                found: format!("axis {axis}"),
+            })
+        }
+    };
+    let span = (n_units as usize).checked_mul(block).ok_or_else(|| {
+        CepSliceError::ShapeMismatch {
+            tensor: entry.name.clone(),
+            expected: format!("n_units({n_units}) * block_width({block}) fits in usize"),
+            found: "multiplication overflow".into(),
+        }
+    })?;
+    if span != axis_dim {
+        return Err(CepSliceError::ShapeMismatch {
+            tensor: entry.name.clone(),
+            expected: format!("axis {axis} dim = n_units * block_width = {span}"),
+            found: format!("axis {axis} dim = {axis_dim}"),
+        });
+    }
     for &u in survivor_units {
         if u >= n_units {
             return Err(CepSliceError::UnitOutOfRange { tensor: entry.name.clone(), unit: u, n_units });
@@ -547,6 +580,50 @@ mod tests {
         // shape claims 2x4 (32 bytes) but only 6 floats (24 bytes) of data.
         let e = f32_entry("t", vec![2, 4], &[0., 1., 2., 3., 4., 5.]);
         assert!(slice_blocks(&e, 1, 4, 1, &[0, 1]).is_err());
+    }
+
+    // Regression: prior to the span check, callers passing `n_units * block_width`
+    // larger or smaller than the axis dim could reach the gather loop and either
+    // panic (span > axis_dim — last block reads past data.len()) or silently
+    // succeed with a wrong-shape result (span < axis_dim — trailing data unused).
+    // Both spec/shape mismatches now surface as ShapeMismatch up-front.
+
+    #[test]
+    fn slice_blocks_rejects_axis1_span_exceeds_cols() {
+        // shape 2x4, axis=1, n_units=3, block_width=2 -> span=6 > cols=4.
+        // Without the guard: gather index off=row_off+4*bw runs past row in last unit.
+        let e = f32_entry("t", vec![2, 4], &[0., 1., 2., 3., 4., 5., 6., 7.]);
+        let err = slice_blocks(&e, 1, 3, 2, &[0, 1, 2]).unwrap_err();
+        match err {
+            CepSliceError::ShapeMismatch { .. } => {}
+            other => panic!("expected ShapeMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn slice_blocks_rejects_axis0_span_exceeds_rows() {
+        // shape 4x2, axis=0, n_units=3, block_width=2 -> span=6 > rows=4.
+        // Without the guard: start=4 in last unit -> r in 4..6 -> off=4*row_bytes
+        // runs past data.len() and panics.
+        let e = f32_entry("t", vec![4, 2], &[0., 1., 2., 3., 4., 5., 6., 7.]);
+        let err = slice_blocks(&e, 0, 3, 2, &[0, 1, 2]).unwrap_err();
+        match err {
+            CepSliceError::ShapeMismatch { .. } => {}
+            other => panic!("expected ShapeMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn slice_blocks_rejects_span_smaller_than_axis_dim() {
+        // shape 2x4, axis=1, n_units=2, block_width=1 -> span=2 < cols=4.
+        // Without the guard: gather succeeds but produces wrong-shape output
+        // (would silently drop trailing cols 2,3 from the spec's view).
+        let e = f32_entry("t", vec![2, 4], &[0., 1., 2., 3., 4., 5., 6., 7.]);
+        let err = slice_blocks(&e, 1, 2, 1, &[0, 1]).unwrap_err();
+        match err {
+            CepSliceError::ShapeMismatch { .. } => {}
+            other => panic!("expected ShapeMismatch, got {other:?}"),
+        }
     }
 
     #[test]
