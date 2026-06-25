@@ -112,6 +112,8 @@ pub fn run_pre_pass_only(
             adapter_configs: Vec::new(),
             csha_configs: Vec::new(),
             weight_index_map: std::collections::HashMap::new(),
+            checkpoint_policies: std::collections::HashMap::new(),
+            paged_kv_models: std::collections::HashSet::new(),
         };
         // walk_ops may fail on trivial test inputs (no fn/train block).  The
         // production path is non-fatal; mirror that so the source-text

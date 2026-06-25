@@ -6,9 +6,16 @@ use crate::ad_rules::{
 };
 use crate::csha_apply::FusionMark;
 use crate::wengert::{
-    type_for_op, CompareKind, OpId, PrimalOp, VarId, WengertList, WengertOp, WengertType,
+    type_for_op, CompareKind, OpId, PrimalOp, SubgraphId, VarId, WengertList, WengertOp,
+    WengertType,
 };
 use std::collections::{HashMap, HashSet};
+
+// Cycle-10 §5.3 (Task 5): semantic-layer CheckpointPolicy. nsl-codegen
+// already depends on nsl-semantic via Cargo.toml; the loader (Task 6)
+// passes the per-function map collected by `EffectChecker` into
+// `WengertExtractor::with_checkpoint_policies`.
+use nsl_semantic::effects::CheckpointPolicy;
 
 // M40b: Wengert extraction from typed AST
 use nsl_ast::expr::ExprKind;
@@ -1462,6 +1469,18 @@ pub struct WengertExtractor<'a> {
     /// `MemberAccess` nodes (e.g. the synthesized `self.lora_A_<site>`
     /// accesses whose member Symbol is a sentinel field symbol).
     synth_member_names: HashMap<nsl_ast::NodeId, String>,
+
+    /// Cycle-10 §5.3 Task 5: per-function `@checkpoint(policy=...)` policies
+    /// flowed from the semantic layer (`EffectChecker::checkpoint_policies()`)
+    /// through the loader wire-up at `crates/nsl-cli/src/loader.rs` (Task 6).
+    /// Empty map = no checkpointing = byte-identity preserved at default.
+    pub(crate) checkpoint_policies: HashMap<String, CheckpointPolicy>,
+
+    /// Cycle-10 §5.3 Task 5: monotonic allocator for `SubgraphId` values.
+    /// Each call to `apply_checkpoint_policy` for a `policy=Full` function
+    /// allocates a fresh id and emits exactly one
+    /// `PrimalOp::PrologueRecompute { subgraph_id }` marker into the tape.
+    pub(crate) next_subgraph_id: u32,
 }
 
 impl<'a> WengertExtractor<'a> {
@@ -1487,6 +1506,96 @@ impl<'a> WengertExtractor<'a> {
             named_param_vars: Vec::new(),
             synth_call_names: HashMap::new(),
             synth_member_names: HashMap::new(),
+            checkpoint_policies: HashMap::new(),
+            next_subgraph_id: 0,
+        }
+    }
+
+    /// Cycle-10 §5.3 Task 5: builder-style installer for per-function
+    /// `@checkpoint(policy=...)` policies. Sibling to the existing
+    /// `set_model_method_bodies` / `set_model_field_types` / `set_synth_*`
+    /// installers. Wire-up flows from `EffectChecker::checkpoint_policies()`
+    /// through `crates/nsl-cli/src/loader.rs` (Task 6).
+    ///
+    /// Empty map = no checkpointing transformations = byte-identity preserved
+    /// at default. Non-empty map activates `apply_checkpoint_policy` after
+    /// extraction to perform transitive stamping + `PrologueRecompute` emission.
+    pub fn with_checkpoint_policies(
+        mut self,
+        policies: HashMap<String, CheckpointPolicy>,
+    ) -> Self {
+        self.checkpoint_policies = policies;
+        self
+    }
+
+    /// Cycle-10 §5.3 Task 5: allocate a fresh `SubgraphId` for a recompute
+    /// subgraph. v1 is singleton-per-`@checkpoint`-fn so a single allocation
+    /// per call site suffices. Monotonically increments for tests + multi-fn
+    /// compile units.
+    pub(crate) fn alloc_subgraph_id(&mut self) -> SubgraphId {
+        let id = self.next_subgraph_id;
+        self.next_subgraph_id = self.next_subgraph_id.saturating_add(1);
+        SubgraphId(id)
+    }
+
+    /// Cycle-10 §5.3 Task 5: transitive stamping pass.
+    ///
+    /// Caller is the per-fn extraction site (`stmt.rs` grad-block or
+    /// `binary_codegen.rs` forward-fn). Pre: `extract_stmts(fn_body)` ran
+    /// successfully on the extractor.
+    ///
+    /// Behavior:
+    ///   - If `checkpoint_policies` does not contain `fn_name`, no-op.
+    ///     This is the byte-identity branch.
+    ///   - If keyed with `CheckpointPolicy::Full`, walk the entire current
+    ///     tape and stamp every previously-emitted `WengertOp.checkpointed = true`
+    ///     (the prologue subgraph in v1 = everything upstream of the
+    ///     persisted attention residency). v1 prologue is everything in
+    ///     scope because the @checkpoint fn body IS the prologue +
+    ///     attention chain, and only forward-input `Input` / `Param` ops
+    ///     are exempt (they are entry-of-function args, not recomputed).
+    ///   - Allocate a fresh `SubgraphId` via `alloc_subgraph_id` and emit
+    ///     exactly one `PrimalOp::PrologueRecompute { subgraph_id }` marker
+    ///     onto the tape at the boundary point (the current tape tail).
+    ///     The codegen-side dispatch fork at Task 9 consumes this marker.
+    ///
+    /// W13 invariant: cos/sin saves channel lives at the PTX-param layer
+    /// (`flash_attention.rs:1138-1142` cos_ptr/sin_ptr), NOT on
+    /// `CshaSavePointers`. This pass therefore does NOT touch
+    /// `csha_apply.rs:365-382`. Wengert-level suppression here applies
+    /// only to RoPE primal-op intermediates (mul/sub/add/tensor_cat) by
+    /// virtue of stamping `checkpointed=true` — the lowerer reads this
+    /// flag to skip save-pointer emission.
+    pub fn apply_checkpoint_policy(&mut self, fn_name: &str) {
+        let Some(policy) = self.checkpoint_policies.get(fn_name).copied() else {
+            return;
+        };
+        match policy {
+            CheckpointPolicy::Full => {
+                // Stamp every previously-emitted op as checkpointed EXCEPT
+                // function-entry roots (Input / Param). The roots are not
+                // "recomputed" — they are the args the caller passed in.
+                for op in self.list.ops.iter_mut() {
+                    match op.op {
+                        PrimalOp::Input(_) | PrimalOp::Param(_) => {}
+                        _ => op.checkpointed = true,
+                    }
+                }
+
+                // Emit exactly one PrologueRecompute marker at the boundary.
+                // alloc_subgraph_id() returns a fresh, monotonic id.
+                let subgraph_id = self.alloc_subgraph_id();
+                let marker_var = self.alloc_var();
+                let op_id = self.list.ops.len() as u32;
+                self.push_op(WengertOp {
+                    id: op_id,
+                    result: marker_var,
+                    op: PrimalOp::PrologueRecompute { subgraph_id },
+                    inputs: vec![],
+                    saved_for_backward: false,
+                    checkpointed: true,
+                });
+            }
         }
     }
 
@@ -4726,5 +4835,140 @@ mod tests {
 
         // x must have an adjoint
         assert!(gen.adjoint_of(0).is_some(), "x must have an adjoint");
+    }
+
+    // -----------------------------------------------------------------
+    // Cycle-10 §5.3 Task 5: WengertExtractor checkpoint policy tests
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn cycle10_task5_empty_policies_no_transitive_stamping() {
+        let interner = Interner::new();
+        let mut ext = WengertExtractor::new(&interner);
+        // Manually push a synthetic op so we can observe (no extraction
+        // needed for the byte-identity contract).
+        let v = ext.alloc_var();
+        let op_id = ext.list.ops.len() as u32;
+        ext.push_op(WengertOp {
+            id: op_id,
+            result: v,
+            op: PrimalOp::Relu,
+            inputs: vec![],
+            saved_for_backward: false,
+            checkpointed: false,
+        });
+
+        // With no policies configured, apply_checkpoint_policy is a no-op.
+        ext.apply_checkpoint_policy("any_fn_name");
+
+        assert_eq!(ext.list.ops.len(), 1, "no marker should be emitted");
+        assert!(
+            !ext.list.ops[0].checkpointed,
+            "no stamping should occur with empty policies"
+        );
+        assert_eq!(ext.next_subgraph_id, 0, "allocator must not advance");
+    }
+
+    #[test]
+    fn cycle10_task5_full_policy_stamps_and_emits_marker() {
+        let interner = Interner::new();
+        let mut ext = WengertExtractor::new(&interner);
+
+        // Simulate a prologue: Input (entry root) + Relu + Sigmoid (intermediates).
+        let v_in = ext.alloc_var();
+        ext.push_op(WengertOp {
+            id: 0,
+            result: v_in,
+            op: PrimalOp::Input("x".to_string()),
+            inputs: vec![],
+            saved_for_backward: false,
+            checkpointed: false,
+        });
+        let v1 = ext.alloc_var();
+        ext.push_op(WengertOp {
+            id: 1,
+            result: v1,
+            op: PrimalOp::Relu,
+            inputs: vec![v_in],
+            saved_for_backward: false,
+            checkpointed: false,
+        });
+        let v2 = ext.alloc_var();
+        ext.push_op(WengertOp {
+            id: 2,
+            result: v2,
+            op: PrimalOp::Sigmoid,
+            inputs: vec![v1],
+            saved_for_backward: false,
+            checkpointed: false,
+        });
+
+        // Configure a Full policy for "csha_fwd".
+        let mut policies = HashMap::new();
+        policies.insert("csha_fwd".to_string(), CheckpointPolicy::Full);
+        let mut ext = ext.with_checkpoint_policies(policies);
+        ext.apply_checkpoint_policy("csha_fwd");
+
+        // Expect: Input root NOT stamped, Relu + Sigmoid stamped, ONE
+        // PrologueRecompute marker emitted at the tail.
+        assert_eq!(
+            ext.list.ops.len(),
+            4,
+            "exactly one marker op should be emitted"
+        );
+        assert!(
+            !ext.list.ops[0].checkpointed,
+            "Input root must not be stamped"
+        );
+        assert!(ext.list.ops[1].checkpointed, "Relu must be stamped");
+        assert!(ext.list.ops[2].checkpointed, "Sigmoid must be stamped");
+        match ext.list.ops[3].op {
+            PrimalOp::PrologueRecompute { subgraph_id } => {
+                assert_eq!(subgraph_id, SubgraphId(0), "fresh id starts at 0");
+            }
+            ref other => panic!("expected PrologueRecompute, got {:?}", other),
+        }
+
+        // Allocator advanced exactly once.
+        assert_eq!(ext.next_subgraph_id, 1);
+    }
+
+    #[test]
+    fn cycle10_task5_subgraph_id_allocator_monotonic() {
+        let interner = Interner::new();
+        let mut ext = WengertExtractor::new(&interner);
+        let a = ext.alloc_subgraph_id();
+        let b = ext.alloc_subgraph_id();
+        let c = ext.alloc_subgraph_id();
+        assert_eq!(a, SubgraphId(0));
+        assert_eq!(b, SubgraphId(1));
+        assert_eq!(c, SubgraphId(2));
+    }
+
+    #[test]
+    fn cycle10_task5_policy_for_unrelated_fn_is_noop() {
+        let interner = Interner::new();
+        let mut ext = WengertExtractor::new(&interner);
+        let v = ext.alloc_var();
+        ext.push_op(WengertOp {
+            id: 0,
+            result: v,
+            op: PrimalOp::Relu,
+            inputs: vec![],
+            saved_for_backward: false,
+            checkpointed: false,
+        });
+
+        // Policy set for "other_fn", but we apply for "this_fn".
+        let mut policies = HashMap::new();
+        policies.insert("other_fn".to_string(), CheckpointPolicy::Full);
+        let mut ext = ext.with_checkpoint_policies(policies);
+        ext.apply_checkpoint_policy("this_fn");
+
+        assert_eq!(ext.list.ops.len(), 1, "no marker should be emitted");
+        assert!(
+            !ext.list.ops[0].checkpointed,
+            "no stamping for mismatched fn name"
+        );
     }
 }
