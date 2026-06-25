@@ -1031,6 +1031,258 @@ pub fn emit_prologue_recompute_from_raw(
     ));
 }
 
+// ────────────────────────────────────────────────────────────────────────
+// Cycle-11 §3 / Task 3: emit_kv_recompute
+//
+// Replaces the cycle-10 `kv_load::emit_k_suffixed` + `emit_v_suffixed`
+// pair when `config.checkpoint.is_some()`. Re-derives K_proj/V_proj from
+// scratch on the backward pass:
+//
+//   1. Null-guard x_raw_ptr (Risk-3 — same as emit_prologue_recompute_from_raw)
+//   2. Recompute x_norm into SMEM scratch via emit_prologue_recompute_from_raw
+//   3. K_proj = x_norm @ Wk[:, head_idx*head_dim..(head_idx+1)*head_dim]
+//      written to `%k_smem_base + kv_row*(head_dim*2) + col*2` (f16 row-major,
+//      stride head_dim*2 bytes — same contract as kv_load.rs:23-86)
+//   4. V_proj = x_norm @ Wv (same write contract, %v_smem_base)
+//   5. K-side RoPE via the forward's `emit_rope_k_epilogue` (in place on
+//      %k_smem_base; Adjacent layout) — same call the forward path uses
+//   6. Terminating `bar.sync 0` so the downstream ds_compute consumers
+//      (ds_compute.rs:309,330) see the recomputed K/V tiles
+//
+// Layout invariants enforced (mirrors kv_load.rs comment block):
+//   - K tile @ %k_smem_base, f16 [block_kv, head_dim], stride head_dim*2
+//   - V tile @ %v_smem_base, same layout
+//   - bar.sync 0 (NOT .aligned) — matches kv_load.rs:93
+//
+// Smoke-scope assumption inherited from `emit_xnorm_recompute`:
+//   d_model == head_dim, heads == 1, kv_dim == head_dim. Wider configs
+//   are STRUCTURALLY callable but the per-block accumulation is honest
+//   only when this block is the sole contributor to its K_proj/V_proj
+//   region. See cycle-13+ for multi-block accumulation.
+// ────────────────────────────────────────────────────────────────────────
+
+/// Emit one projection-recompute matmul for either K or V, writing the
+/// f16 result to a kv-tile SMEM slot at `<smem_base> + kv_row*(head_dim*2)
+/// + col*2`. xnorm input is at `recompute_xnorm_offset(config)` (f16,
+/// stride `head_dim*2`).
+///
+/// Partitioning: one warp per row, `slices_per_lane = max(head_dim/32, 1)`
+/// columns per lane within each row — same shape kv_load.rs uses. Each
+/// per-cell accumulation runs over `d_model` (== `head_dim` under the
+/// smoke scope).
+fn emit_one_recompute_matmul(
+    ptx: &mut String,
+    config: &FlashAttentionConfig,
+    tag: &str,
+    label_suffix: &str,
+    weight_param_name: &str,
+    smem_base: &str,
+    xnorm_off: u32,
+) {
+    let csha = config.csha.as_ref().expect("emit_one_recompute_matmul requires csha");
+    let d_model = csha.d_model;
+    let head_dim = config.head_dim as u32;
+    let block_kv = config.block_kv as u32;
+    let heads = csha.active_heads.max(1);
+    let kv_dim = heads * head_dim;
+    let slices_per_lane = (head_dim / 32).max(1);
+    let rows_per_warp = block_kv.div_ceil(4);
+
+    ptx.push_str(&format!(
+        "    // Cycle-11 §3: {tag} recompute matmul (block_kv={block_kv}, \
+         slices/lane={slices_per_lane}, rows/warp={rows_per_warp})\n"
+    ));
+    ptx.push_str(&format!("V2_RECOMPUTE_{tag}_MATMUL_{label_suffix}:\n"));
+
+    // Per-projection null-guard on the weight pointer.
+    ptx.push_str(&format!(
+        "    ld.param.u64 %rd_rcw, [{weight_param_name}];\n"
+    ));
+    ptx.push_str("    setp.eq.u64 %p_rc_null, %rd_rcw, 0;\n");
+    ptx.push_str(&format!(
+        "    @%p_rc_null bra V2_RECOMPUTE_{tag}_MATMUL_SKIP_{label_suffix};\n"
+    ));
+
+    for r in 0..rows_per_warp {
+        // kv_row = warp_id + r*4
+        ptx.push_str(&format!(
+            "    add.u32 %r_rc0, %warp_id, {}; // kv_row\n",
+            r * 4
+        ));
+        ptx.push_str("    cvt.u64.u32 %rd_rc_row, %r_rc0;\n");
+        ptx.push_str("    add.u64 %rd_rc_row_abs, %rd_rc_row, %k_start;\n");
+        ptx.push_str("    setp.ge.u64 %p_rc_oob, %rd_rc_row_abs, %rd6;\n");
+
+        // xnorm row base in SMEM: shmem_base + xnorm_off + kv_row*(head_dim*2)
+        // NOTE: under the smoke scope (seq == block_q == block_kv) and
+        // single contributor per K_proj row, indexing kv_row directly
+        // matches the forward's per-row x_norm consumer.
+        ptx.push_str(&format!(
+            "    mul.lo.u64 %rd_rc_xnrow, %rd_rc_row, {}; // kv_row * head_dim*2\n",
+            head_dim * 2
+        ));
+        ptx.push_str(&format!(
+            "    add.u64 %rd_rc_xnrow, %rd_rc_xnrow, {xnorm_off};\n"
+        ));
+        ptx.push_str("    add.u64 %rd_rc_xnrow, %shmem_base, %rd_rc_xnrow;\n");
+
+        for slice in 0..slices_per_lane {
+            // col = lane * slices_per_lane + slice
+            ptx.push_str("    cvt.u64.u32 %rd_rc_col, %lane;\n");
+            if slices_per_lane > 1 {
+                ptx.push_str(&format!(
+                    "    mul.lo.u64 %rd_rc_col, %rd_rc_col, {slices_per_lane};\n"
+                ));
+            }
+            if slice > 0 {
+                ptx.push_str(&format!("    add.u64 %rd_rc_col, %rd_rc_col, {slice};\n"));
+            }
+
+            // Accumulator init
+            ptx.push_str("    mov.f32 %f_rc_acc, 0f00000000;\n");
+
+            // global col offset in W: head_idx*head_dim + col
+            //   W byte offset for (p, j_global) = (p*kv_dim + j_global) * 2
+            // We hoist `head_idx*head_dim` because it's constant within the
+            // matmul body for this block.
+            ptx.push_str(&format!(
+                "    mul.lo.u64 %rd_rc_jg, %head_idx, {}; // head_idx * head_dim\n",
+                head_dim
+            ));
+            ptx.push_str("    add.u64 %rd_rc_jg, %rd_rc_jg, %rd_rc_col; // + col\n");
+
+            // Inner reduction over p in 0..d_model (== head_dim under smoke).
+            // x_norm[kv_row, p] from SMEM f16; W[p, j_global] from HBM f16.
+            for p in 0..d_model {
+                // xnorm load (f16 -> f32)
+                ptx.push_str(&format!(
+                    "    ld.shared.b16 %h_rc_x, [%rd_rc_xnrow + {}];\n",
+                    p * 2
+                ));
+                ptx.push_str("    cvt.f32.f16 %f_rc_x, %h_rc_x;\n");
+                // Weight: W[p, j_global] = weight_base + (p*kv_dim + j_global)*2
+                ptx.push_str(&format!(
+                    "    mul.lo.u64 %rd_rc_wo, %rd_rc_jg, 2; // j_global*2 base\n"
+                ));
+                // Add p*kv_dim*2 (constant per p)
+                ptx.push_str(&format!(
+                    "    add.u64 %rd_rc_wo, %rd_rc_wo, {}; // + p*kv_dim*2\n",
+                    p * kv_dim * 2
+                ));
+                ptx.push_str("    add.u64 %rd_rc_wa, %rd_rcw, %rd_rc_wo;\n");
+                ptx.push_str("    ld.global.b16 %h_rc_w, [%rd_rc_wa];\n");
+                ptx.push_str("    cvt.f32.f16 %f_rc_w, %h_rc_w;\n");
+                ptx.push_str("    fma.rn.f32 %f_rc_acc, %f_rc_x, %f_rc_w, %f_rc_acc;\n");
+            }
+
+            // f32 -> f16 store to SMEM at smem_base + kv_row*(head_dim*2) + col*2
+            ptx.push_str(&format!(
+                "    mul.lo.u64 %rd_rc_sm, %rd_rc_row, {}; // kv_row * head_dim*2\n",
+                head_dim * 2
+            ));
+            ptx.push_str("    shl.b64 %rd_rc_sm_c, %rd_rc_col, 1; // col*2\n");
+            ptx.push_str("    add.u64 %rd_rc_sm, %rd_rc_sm, %rd_rc_sm_c;\n");
+            ptx.push_str(&format!(
+                "    add.u64 %rd_rc_sm, {smem_base}, %rd_rc_sm;\n"
+            ));
+            ptx.push_str("    cvt.rn.f16.f32 %h_rc_out, %f_rc_acc;\n");
+            // OOB-row protection: skip store if kv_row >= seq.
+            ptx.push_str("    @!%p_rc_oob st.shared.b16 [%rd_rc_sm], %h_rc_out;\n");
+        }
+    }
+
+    ptx.push_str(&format!("V2_RECOMPUTE_{tag}_MATMUL_SKIP_{label_suffix}:\n"));
+    ptx.push_str(&format!(
+        "    bar.sync 0;  // recomputed {tag} tile visible ({label_suffix})\n"
+    ));
+}
+
+/// Cycle-11 §3 / Task 3: emit the full K/V projection-recompute sequence
+/// that REPLACES `kv_load::emit_k_suffixed` + `emit_v_suffixed` when
+/// `config.checkpoint.is_some()`. See the module-level comment block
+/// above for the layout / null-guard / barrier contract this honours.
+///
+/// `kv_iter_suffix` is the label-namespace suffix (typically `"MAIN"`
+/// matching the dispatch fork in `mod.rs:934-935`); it must be unique
+/// within the emitted PTX text section.
+///
+/// Production callers reach this only via the test-only R0 bypass set
+/// by `CheckpointExtras::bypass_r0_for_testing()` (cycle-11 Task 1).
+/// R0 stays in production until cycle-12 GPU validation lifts it.
+pub fn emit_kv_recompute(
+    ptx: &mut String,
+    config: &FlashAttentionConfig,
+    kv_iter_suffix: &str,
+) {
+    if config.csha.is_none() {
+        ptx.push_str("    // Cycle-11 emit_kv_recompute: csha=None, no emission\n");
+        return;
+    }
+    let xn_off = recompute_xnorm_offset(config);
+
+    ptx.push_str(&format!(
+        "    // ─── Cycle-11 §3 emit_kv_recompute ({kv_iter_suffix}) ───\n"
+    ));
+    ptx.push_str(&format!("V2_KV_RECOMPUTE_{kv_iter_suffix}:\n"));
+
+    // Step 1: Risk-3 null-guard on x_raw_ptr (early-exit if forward did
+    // not stage x_raw — silent garbage is the failure mode).
+    ptx.push_str("    ld.param.u64 %rd_kvr_xraw, [x_raw_ptr];\n");
+    ptx.push_str("    setp.eq.u64 %p_kvr_xraw_null, %rd_kvr_xraw, 0;\n");
+    ptx.push_str(&format!(
+        "    @%p_kvr_xraw_null bra V2_KV_RECOMPUTE_DONE_{kv_iter_suffix};\n"
+    ));
+
+    // Step 2: produce x_norm in SMEM scratch via the cycle-11 Task-2 emitter.
+    let suffix = format!("_bwd_recompute_{kv_iter_suffix}");
+    emit_prologue_recompute_from_raw(ptx, config, 0, &suffix);
+
+    // Step 3: K_proj recompute -> %k_smem_base
+    ptx.push_str(&format!(
+        "    // Cycle-11 §3 step 3: K_proj recompute -> %k_smem_base ({kv_iter_suffix})\n"
+    ));
+    emit_one_recompute_matmul(
+        ptx,
+        config,
+        "K",
+        kv_iter_suffix,
+        "csha_wk_ptr",
+        "%k_smem_base",
+        xn_off,
+    );
+
+    // Step 4: V_proj recompute -> %v_smem_base
+    ptx.push_str(&format!(
+        "    // Cycle-11 §3 step 4: V_proj recompute -> %v_smem_base ({kv_iter_suffix})\n"
+    ));
+    emit_one_recompute_matmul(
+        ptx,
+        config,
+        "V",
+        kv_iter_suffix,
+        "csha_wv_ptr",
+        "%v_smem_base",
+        xn_off,
+    );
+
+    // Step 5: K-side RoPE in place on %k_smem_base (matches the forward
+    // path's emit_rope_k_epilogue call). Only emits when rope_q=true and
+    // fused_projections=true; otherwise it's a no-op. R7 (rope_q=true +
+    // segment_masked) remains refused upstream by mod.rs cascade.
+    ptx.push_str(&format!(
+        "    // Cycle-11 §3 step 5: K RoPE epilogue ({kv_iter_suffix})\n"
+    ));
+    crate::flash_attention_v2::phases::forward::csha_hooks::emit_rope_k_epilogue(ptx, config);
+
+    // Step 6: terminating bar.sync 0 to satisfy kv_load's post-condition
+    // contract (downstream ds_compute consumers in ds_compute.rs:309,330
+    // expect the K/V tiles fully resident in SMEM at this point).
+    ptx.push_str(&format!("V2_KV_RECOMPUTE_DONE_{kv_iter_suffix}:\n"));
+    ptx.push_str(&format!(
+        "    bar.sync 0;  // KV recompute complete ({kv_iter_suffix})\n"
+    ));
+}
+
 #[cfg(test)]
 mod cycle11_recompute_tests {
     use super::*;
@@ -1106,6 +1358,65 @@ mod cycle11_recompute_tests {
         emit_prologue_recompute_from_raw(&mut ptx, &cfg, 0, "_bwd_recompute_0");
         assert!(ptx.contains("csha=None, no emission"));
         assert!(!ptx.contains("ld.param.u64 %rd_x_raw_ptr"));
+    }
+
+    #[test]
+    fn cycle11_emit_kv_recompute_writes_k_and_v_smem_bases() {
+        let cfg = cfg_full_bypass();
+        let mut ptx = String::new();
+        emit_kv_recompute(&mut ptx, &cfg, "MAIN");
+
+        // Entry label present
+        assert!(
+            ptx.contains("V2_KV_RECOMPUTE_MAIN:"),
+            "missing entry label V2_KV_RECOMPUTE_MAIN; ptx=\n{ptx}"
+        );
+        // BOTH K and V SMEM bases are written
+        assert!(
+            ptx.contains("%k_smem_base"),
+            "emit_kv_recompute must write to %k_smem_base"
+        );
+        assert!(
+            ptx.contains("%v_smem_base"),
+            "emit_kv_recompute must write to %v_smem_base"
+        );
+        // Per-projection matmul labels present
+        assert!(ptx.contains("V2_RECOMPUTE_K_MATMUL_MAIN:"));
+        assert!(ptx.contains("V2_RECOMPUTE_V_MATMUL_MAIN:"));
+        // x_raw_ptr null guard at the orchestrator level (Risk-3)
+        assert!(
+            ptx.contains("setp.eq.u64 %p_kvr_xraw_null, %rd_kvr_xraw, 0"),
+            "Risk-3 x_raw null-guard missing at orchestrator level"
+        );
+        // Prologue recompute embedded inside
+        assert!(
+            ptx.contains("V2_PROLOGUE_RECOMPUTE_FROM_RAW_ENTRY_bwd_recompute_MAIN:"),
+            "prologue recompute step (Task 2) not invoked"
+        );
+        // Terminating bar.sync 0 (NOT .aligned)
+        assert!(
+            ptx.contains("V2_KV_RECOMPUTE_DONE_MAIN:"),
+            "missing terminating DONE label"
+        );
+        assert!(
+            ptx.contains("bar.sync 0"),
+            "must terminate with bar.sync 0 per kv_load post-condition contract"
+        );
+        // f16 SMEM writes at both bases
+        assert!(
+            ptx.contains("st.shared.b16"),
+            "must emit f16 store of recomputed projection tile"
+        );
+    }
+
+    #[test]
+    fn cycle11_emit_kv_recompute_no_csha_is_noop() {
+        let mut cfg = cfg_full_bypass();
+        cfg.csha = None;
+        let mut ptx = String::new();
+        emit_kv_recompute(&mut ptx, &cfg, "MAIN");
+        assert!(ptx.contains("csha=None, no emission"));
+        assert!(!ptx.contains("V2_KV_RECOMPUTE_MAIN:"));
     }
 }
 
