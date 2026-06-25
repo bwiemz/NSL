@@ -48,6 +48,6 @@ fn bce_loss(pred: Tensor, target: Tensor) -> Tensor:
 # Returns: scalar loss tensor (mean over valid positions).
 fn fused_linear_ce(x: Tensor, W: Tensor, bias: Tensor, targets: Tensor) -> Tensor:
     # Transpose W from [V, H] to [H, V] so x @ W_t yields [B*S, V] logits.
-    let W_t = transpose(W, 0, 1)
+    let W_t = W.transpose(0, 1)
     let logits = x @ W_t + bias
     return cross_entropy(logits, targets)
