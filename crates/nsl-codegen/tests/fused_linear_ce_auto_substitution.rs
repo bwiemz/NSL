@@ -444,6 +444,168 @@ fn ambiguous_add_matmul_matmul_pattern_is_rejected() {
     );
 }
 
+// ─── Test 9 (Sprint v4-3): negative-dim transpose substitutes ───────────
+//
+// Sprint v4-3 widens the matcher to accept all four 2D-equivalent
+// transpose forms: `{0,1}`, `{1,0}`, and the negative-dim encodings
+// `{-2,-1}` / `{-1,-2}` (which `encode_transpose_dim` rewrites to
+// `{usize::MAX - 1, usize::MAX}` and its swap).  Pre-v4-3 only the
+// first was accepted, silently routing idiomatic NSL code onto the
+// composite path.
+//
+// All four assertions hit the same matcher arm, so we parameterise
+// over the four user-written transpose-arg pairs to pin all four.
+//
+// `transpose(W, 1, 0)` produces an actual permutation that differs
+// from the stdlib `transpose(W, 0, 1)` if W is non-square, but on a
+// 2D weight tensor of any shape the kernel sees the same memory layout
+// either way — both produce `W^T`.  The semantic equivalence is what
+// the matcher is asserting; we are NOT asserting the kernel runs (the
+// numerical regression tests in `fused_linear_ce_numerical.rs` cover
+// the kernel layer).
+
+const NEG_DIM_SRC_LAST_TWO: &str = r#"
+fn step(x: Tensor, w: Tensor, bias: Tensor, targets: Tensor) -> Tensor:
+    let w_t = transpose(w, -2, -1)
+    let logits = matmul(x, w_t) + bias
+    return cross_entropy(logits, targets)
+"#;
+
+const NEG_DIM_SRC_LAST_TWO_SWAP: &str = r#"
+fn step(x: Tensor, w: Tensor, bias: Tensor, targets: Tensor) -> Tensor:
+    let w_t = transpose(w, -1, -2)
+    let logits = matmul(x, w_t) + bias
+    return cross_entropy(logits, targets)
+"#;
+
+const POS_DIM_SRC_SWAPPED: &str = r#"
+fn step(x: Tensor, w: Tensor, bias: Tensor, targets: Tensor) -> Tensor:
+    let w_t = transpose(w, 1, 0)
+    let logits = matmul(x, w_t) + bias
+    return cross_entropy(logits, targets)
+"#;
+
+#[test]
+fn negative_dim_transpose_substitutes() {
+    let cfg = FusedCeDecoratorConfig {
+        enabled: true,
+        vocab_tile: Some(1024),
+        vocab_size: Some(4096),
+        hidden_size: Some(128),
+        batch_size: Some(2),
+        seq_len: Some(32),
+        dtype: None,
+    };
+
+    for (label, src) in [
+        ("transpose(W, -2, -1)", NEG_DIM_SRC_LAST_TWO),
+        ("transpose(W, -1, -2)", NEG_DIM_SRC_LAST_TWO_SWAP),
+        ("transpose(W, 1, 0)", POS_DIM_SRC_SWAPPED),
+    ] {
+        let list = extract_first_fn(src, Some(cfg.clone()))
+            .unwrap_or_else(|| panic!("{label}: extraction must succeed"));
+        assert_eq!(
+            count_fused(&list),
+            1,
+            "{label}: Sprint v4-3 widened matcher MUST substitute this \
+             2D-equivalent transpose form into a fused op"
+        );
+        assert_eq!(
+            count_composite_ce(&list),
+            0,
+            "{label}: composite CE must NOT also appear post-substitution"
+        );
+    }
+}
+
+// ─── Test 10 (Sprint v4-3): bias-free DEFERRAL pin ──────────────────────
+//
+// A bare `Matmul(x, Transpose(W))` (no bias add) is NOT substituted in
+// v4-3 — the runtime FFI emitters at
+// `crates/nsl-runtime/src/fused_linear_ce.rs` and the corresponding PTX
+// emitters in `crates/nsl-codegen/src/fused_linear_ce.rs` unconditionally
+// declare `param_bias` with no null-guard predicate; a true bias-free
+// fast path needs new emitter variants.  This test pins the deferral
+// (NOT a regression of the v4-3 widening) — if a future sprint adds a
+// bias-free emitter, this test should be UPDATED, not deleted, to
+// document the v4-3 → v5+ behaviour transition.
+
+#[test]
+fn bias_free_pattern_deferred_to_v5() {
+    let cfg = FusedCeDecoratorConfig {
+        enabled: true,
+        vocab_tile: Some(1024),
+        vocab_size: Some(4096),
+        hidden_size: Some(128),
+        batch_size: Some(2),
+        seq_len: Some(32),
+        dtype: None,
+    };
+    let list = extract_first_fn(NO_BIAS_SRC, Some(cfg))
+        .expect("extraction must succeed");
+    assert_eq!(
+        count_fused(&list),
+        0,
+        "Sprint v4-3 deferral: bias-free Matmul(x, W^T) → CE chain does \
+         NOT substitute (needs a no-bias PTX emitter variant; tracked v5+). \
+         If a future sprint lands the variant, update this assertion to \
+         `count_fused == 1` and document the behaviour flip in the test \
+         body."
+    );
+    assert_eq!(
+        count_composite_ce(&list),
+        1,
+        "bias-free case falls through to composite CE (correct + safe — \
+         slower but bit-equivalent)"
+    );
+}
+
+// ─── Test 11 (Sprint v4-3): no-transpose DEFERRAL pin ───────────────────
+//
+// `Matmul(x, W)` where W is already in `[H, V]` layout is NOT
+// substituted in v4-3 — every PTX emitter in
+// `crates/nsl-codegen/src/fused_linear_ce.rs` indexes W as `W[v*H + h]`,
+// i.e. requires W in `[V, H]` layout.  Supporting `[H, V]` needs a
+// parallel emitter variant + new FFI symbol; tracked v5+.
+//
+// Same pinning contract as Test 10: if a future sprint lands the
+// variant, update the assertion + document the transition.
+
+const NO_TRANSPOSE_SRC: &str = r#"
+fn step(x: Tensor, w: Tensor, bias: Tensor, targets: Tensor) -> Tensor:
+    let logits = matmul(x, w) + bias
+    return cross_entropy(logits, targets)
+"#;
+
+#[test]
+fn no_transpose_pattern_deferred_to_v5() {
+    let cfg = FusedCeDecoratorConfig {
+        enabled: true,
+        vocab_tile: Some(1024),
+        vocab_size: Some(4096),
+        hidden_size: Some(128),
+        batch_size: Some(2),
+        seq_len: Some(32),
+        dtype: None,
+    };
+    let list = extract_first_fn(NO_TRANSPOSE_SRC, Some(cfg))
+        .expect("extraction must succeed");
+    assert_eq!(
+        count_fused(&list),
+        0,
+        "Sprint v4-3 deferral: Matmul(x, W) + bias → CE with W already \
+         in [H, V] layout does NOT substitute (every fused-CE PTX emitter \
+         indexes W as `W[v*H + h]`, requiring [V, H]; a parallel emitter \
+         + new FFI symbol tracked v5+).  If a future sprint lands the \
+         variant, update this assertion to `count_fused == 1`."
+    );
+    assert_eq!(
+        count_composite_ce(&list),
+        1,
+        "no-transpose case falls through to composite CE (correct + safe)"
+    );
+}
+
 // ─── Test 6: Sprint 4's explicit-call path still works ──────────────────
 
 #[test]
