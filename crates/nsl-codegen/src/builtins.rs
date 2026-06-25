@@ -491,6 +491,10 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ("nsl_tensor_cast", &[types::I64, types::I64], Some(types::I64)),
     ("nsl_tensor_cast_into", &[types::I64, types::I64], None),
     ("nsl_tensor_zeros_like_dtype", &[types::I64, types::I64], Some(types::I64)),
+    // CFTP v6 forward inline-cast wrappers: src_ptr -> new tensor (scope-tracked).
+    ("nsl_tensor_to_bf16", &[types::I64], Some(types::I64)),
+    ("nsl_tensor_to_fp16", &[types::I64], Some(types::I64)),
+    ("nsl_tensor_to_f32", &[types::I64], Some(types::I64)),
     // Gradient clipping (M14)
     ("nsl_clip_grad_norm", &[types::I64, types::F64], None),
     // Collect all tensor params from a model struct (recursive, magic-probed)
@@ -2210,5 +2214,31 @@ mod tests {
             names.contains(&"nsl_tensor_zeros_like_dtype"),
             "nsl_tensor_zeros_like_dtype missing"
         );
+    }
+
+    /// CFTP v6: forward inline-cast wrapper FFIs are registered with the
+    /// correct Cranelift signature ([I64] -> I64). Required so wengert_lower
+    /// can emit calls to them from compiled NSL.
+    #[test]
+    fn cftp_v6_cast_wrappers_have_signatures() {
+        use cranelift_codegen::ir::types;
+        for &name in &["nsl_tensor_to_bf16", "nsl_tensor_to_fp16", "nsl_tensor_to_f32"] {
+            let entry = RUNTIME_FUNCTIONS
+                .iter()
+                .find(|(n, _, _)| *n == name)
+                .unwrap_or_else(|| panic!("{name} missing from RUNTIME_FUNCTIONS"));
+            assert_eq!(
+                entry.1,
+                &[types::I64],
+                "{name}: expected params [I64], got {:?}",
+                entry.1
+            );
+            assert_eq!(
+                entry.2,
+                Some(types::I64),
+                "{name}: expected return I64, got {:?}",
+                entry.2
+            );
+        }
     }
 }
