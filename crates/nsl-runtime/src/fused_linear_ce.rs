@@ -29,7 +29,7 @@
 ///
 /// Returns 0 on success, negative on error.
 ///
-/// # `dtype_tag` (Sprint v3-2 trailing arg)
+/// # `dtype_tag` (Sprint v3-2 trailing arg; extended in v4-1)
 ///
 /// `0` = F32 (default — preserves pre-Sprint-v3-2 behaviour byte-identically;
 /// all existing callers including the Cranelift IR call site in
@@ -37,11 +37,17 @@
 ///
 /// `1` = F16. Callers that pass `1` MUST allocate `x_ptr`, `w_ptr`, `bias_ptr`
 /// as fp16 in HBM. The `loss_out_ptr` and `lse_out_ptr` outputs stay f32
-/// regardless of `dtype_tag`. Threading actual fp16 from user code is a v4
-/// follow-on (requires the @fused_lm_ce decorator to accept a `dtype` arg
-/// and wengert_lower to derive `dtype_tag` from the @fused_lm_ce hint).
+/// regardless of `dtype_tag`.
 ///
-/// Any value other than 0 or 1 is treated as F32 (defensive — preserves
+/// `2` = Bf16 (Sprint v4-1). Same HBM-layout contract as F16 (16-bit storage
+/// for x/W/bias; f32 outputs). The kernel-side bf16 cvt mnemonics need PTX
+/// ISA 7.8+ — codegen bumps to `.version 8.0` on the bf16 path so callers
+/// don't need to do anything special at this FFI layer.
+///
+/// Threading actual fp16/bf16 from user code (so the @fused_lm_ce decorator
+/// drives `dtype_tag` end-to-end) is a v4-2 follow-on.
+///
+/// Any value outside {0, 1, 2} is treated as F32 (defensive — preserves
 /// forward-compat with un-recompiled callers).
 #[no_mangle]
 #[allow(clippy::too_many_arguments)]
@@ -140,11 +146,12 @@ pub extern "C" fn nsl_fused_linear_ce_forward(
 ///
 /// Returns 0 on success, negative on error.
 ///
-/// # `dtype_tag` (Sprint v3-2 trailing arg)
+/// # `dtype_tag` (Sprint v3-2 trailing arg; extended in v4-1)
 ///
 /// `0` = F32 (default; preserves pre-Sprint-v3-2 ABI). `1` = F16 — caller
-/// MUST allocate x/W/bias in HBM as fp16; partials_ptr stays f32-sized
-/// (`large_partials_bytes()` is dtype-independent).
+/// MUST allocate x/W/bias in HBM as fp16. `2` = Bf16 (Sprint v4-1) —
+/// same HBM layout as F16 (16-bit storage). `partials_ptr` stays f32-sized
+/// across all dtypes (`large_partials_bytes()` is dtype-independent).
 #[no_mangle]
 #[allow(clippy::too_many_arguments)]
 pub extern "C" fn nsl_fused_linear_ce_forward_large(
@@ -227,13 +234,15 @@ pub extern "C" fn nsl_fused_linear_ce_forward_large(
 ///
 /// Returns 0 on success, negative on error.
 ///
-/// # `dtype_tag` (Sprint v3-2 trailing arg)
+/// # `dtype_tag` (Sprint v3-2 trailing arg; extended in v4-1)
 ///
 /// `0` = F32 (default; preserves pre-Sprint-v3-2 ABI). `1` = F16 — caller
-/// MUST allocate x/W/bias in HBM as fp16; lse_ptr stays f32 (forward
-/// writes f32 regardless of activation dtype); dx_out / dw_out / dbias_out
-/// stay f32 regardless of dtype_tag (PyTorch master-gradient convention —
-/// the kernel emits `red.global.add.f32` for cross-CTA accumulation).
+/// MUST allocate x/W/bias in HBM as fp16. `2` = Bf16 (Sprint v4-1) — same
+/// HBM layout as F16 (16-bit storage). `lse_ptr` stays f32 across all
+/// dtypes (forward writes f32 regardless of activation dtype); `dx_out` /
+/// `dw_out` / `dbias_out` stay f32 regardless of dtype_tag (PyTorch
+/// master-gradient convention — the kernel emits `red.global.add.f32`
+/// for cross-CTA accumulation).
 #[no_mangle]
 #[allow(clippy::too_many_arguments)]
 pub extern "C" fn nsl_fused_linear_ce_backward(

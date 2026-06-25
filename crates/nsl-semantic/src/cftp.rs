@@ -218,6 +218,23 @@ pub fn validate_pca_decorator(
 // G3: @fused_lm_ce decorator
 // ---------------------------------------------------------------------------
 
+/// CFTP §4.4 G3 v4-2: dtype hint extracted from `@fused_lm_ce(dtype="...")`.
+///
+/// Forwarded as a sentinel through the codegen + runtime FFI:
+/// * `F32` → `dtype_tag = 0` (pre-v3-2 byte-identical behavior)
+/// * `F16` → `dtype_tag = 1` (Sprint v3-2 emitters)
+/// * `Bf16` → `dtype_tag = 2` (Sprint v4-1 emitters)
+///
+/// Lives in nsl-semantic alongside [`FusedCeConfig`]; the codegen-side
+/// mirror is `nsl_codegen::FusedCeDtypeHint` so nsl-codegen does NOT
+/// depend on nsl-semantic types directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FusedCeDtypeHint {
+    F32,
+    F16,
+    Bf16,
+}
+
 /// Configuration extracted from a `@fused_lm_ce(...)` decorator on a `train`
 /// block.  Parsed by [`validate_fused_ce_decorator`].
 ///
@@ -244,6 +261,11 @@ pub struct FusedCeConfig {
     /// CFTP §4.4 G3 (Sprint 4): sequence length used to size per-row
     /// output buffers.  Required when `enabled = true`.
     pub seq_len: Option<u32>,
+    /// CFTP §4.4 G3 v4-2: dtype hint from `@fused_lm_ce(dtype = "...")`.
+    /// `None` → codegen defaults to F32 (preserves pre-v4-2 behavior).
+    /// Accepted string values (case-sensitive): `"f32"`, `"fp32"`,
+    /// `"f16"`, `"fp16"`, `"bf16"`.
+    pub dtype: Option<FusedCeDtypeHint>,
     /// Source span of the decorator (for diagnostics).
     pub span: Span,
 }
@@ -263,6 +285,7 @@ pub fn validate_fused_ce_decorator(
     let mut hidden_size: Option<u32> = None;
     let mut batch_size: Option<u32> = None;
     let mut seq_len: Option<u32> = None;
+    let mut dtype: Option<FusedCeDtypeHint> = None;
 
     if let Some(ref args) = deco.args {
         for arg in args {
@@ -387,6 +410,26 @@ pub fn validate_fused_ce_decorator(
                         .with_label(arg.span, "expected integer"),
                     ),
                 },
+                "dtype" => match &arg.value.kind {
+                    ExprKind::StringLiteral(s) => match s.as_str() {
+                        "f32" | "fp32" => dtype = Some(FusedCeDtypeHint::F32),
+                        "f16" | "fp16" => dtype = Some(FusedCeDtypeHint::F16),
+                        "bf16" => dtype = Some(FusedCeDtypeHint::Bf16),
+                        other => diagnostics.push(
+                            Diagnostic::error(format!(
+                                "@fused_lm_ce: dtype '{other}' not recognised; \
+                                 accepted: \"f32\", \"fp32\", \"f16\", \"fp16\", \"bf16\""
+                            ))
+                            .with_label(arg.span, "invalid dtype string"),
+                        ),
+                    },
+                    _ => diagnostics.push(
+                        Diagnostic::error(
+                            "@fused_lm_ce: `dtype` must be a string literal".to_string(),
+                        )
+                        .with_label(arg.span, "expected string literal"),
+                    ),
+                },
                 "seq_len" => match &arg.value.kind {
                     ExprKind::IntLiteral(n) => {
                         if *n > 0 && *n <= 65536 {
@@ -422,6 +465,7 @@ pub fn validate_fused_ce_decorator(
         hidden_size,
         batch_size,
         seq_len,
+        dtype,
         span: deco.span,
     })
 }

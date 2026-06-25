@@ -1232,9 +1232,14 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
     ),
     // CFTP §4.4 G3 (Sprint 4): fused linear-CE FFI signatures.
     // Sprint v3-2 added trailing `dtype_tag` (0=F32 sentinel preserves
-    // pre-v3-2 ABI; 1=F16). Cranelift IR call sites in wengert_lower.rs
-    // pass `0` for now — threading actual fp16 from user code is a v4
-    // follow-on via the @fused_lm_ce decorator.
+    // pre-v3-2 ABI; 1=F16). Sprint v4-1 extended the sentinel space
+    // with 2=Bf16 (same single-i64 trailing arg — no ABI bump).
+    // The Cranelift IR call sites in wengert_lower.rs derive the tag
+    // from the @fused_lm_ce(dtype=...) decorator via
+    // `fused_ce_dtype_for_compiler`. Note: v4-2 wengert refuses
+    // tag != 0 pending precision_cast plumbing (see review Finding 2);
+    // direct FFI tests with caller-managed 16-bit HBM allocation
+    // exercise tags 1 and 2 end-to-end.
     // Forward v1 (small vocab, single CTA per row).
     (
         "nsl_fused_linear_ce_forward",
@@ -1245,7 +1250,7 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
             types::I64, types::I64, // loss_out, lse_out
             types::I64, types::I64, types::I64, types::I64, // b, s, v, h
             types::I64, // smem_bytes
-            types::I64, // dtype_tag (Sprint v3-2; 0=F32, 1=F16)
+            types::I64, // dtype_tag (Sprint v3-2 / extended v4-1; 0=F32, 1=F16, 2=Bf16)
         ],
         Some(types::I64),
     ),
@@ -1262,7 +1267,7 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
             types::I64, types::I64, types::I64, types::I64, // b, s, v, h
             types::I64, // num_tiles
             types::I64, // smem_bytes
-            types::I64, // dtype_tag (Sprint v3-2; 0=F32, 1=F16)
+            types::I64, // dtype_tag (Sprint v3-2 / extended v4-1; 0=F32, 1=F16, 2=Bf16)
         ],
         Some(types::I64),
     ),
@@ -1279,7 +1284,7 @@ const RUNTIME_FUNCTIONS: &[(&str, &[types::Type], Option<types::Type>)] = &[
             types::I64, types::I64, types::I64, types::I64, // b, s, v, h
             types::I64, // num_valid
             types::I64, // smem_bytes
-            types::I64, // dtype_tag (Sprint v3-2; 0=F32, 1=F16)
+            types::I64, // dtype_tag (Sprint v3-2 / extended v4-1; 0=F32, 1=F16, 2=Bf16)
         ],
         Some(types::I64),
     ),

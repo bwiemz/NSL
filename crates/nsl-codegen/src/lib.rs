@@ -665,6 +665,37 @@ pub struct FusedCeDecoratorConfig {
     /// CFTP §4.4 G3 (Sprint 4): `seq_len = N` from the decorator.
     /// Required at codegen time to size the per-row output buffers.
     pub seq_len: Option<u32>,
+    /// CFTP §4.4 G3 v4-2: dtype hint from the decorator, mapped to the
+    /// runtime FFI sentinel: `None`/`F32` → 0, `F16` → 1, `Bf16` → 2.
+    /// Mirror of `nsl_semantic::cftp::FusedCeConfig.dtype`; kept as a
+    /// codegen-local enum so nsl-codegen does not depend on nsl-semantic
+    /// types (same convention as the rest of `FusedCeDecoratorConfig`).
+    pub dtype: Option<FusedCeDtypeHint>,
+}
+
+/// Codegen-side mirror of `nsl_semantic::cftp::FusedCeDtypeHint`.
+///
+/// Maps to the runtime FFI `dtype_tag: i64` sentinel:
+/// * `F32` → 0 (v3-2 / pre-v3-2 byte-identical)
+/// * `F16` → 1 (v3-2 fp16 emitters)
+/// * `Bf16` → 2 (v4-1 bf16 emitters)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FusedCeDtypeHint {
+    F32,
+    F16,
+    Bf16,
+}
+
+impl FusedCeDtypeHint {
+    /// FFI sentinel value matching the runtime contract.
+    #[inline]
+    pub fn dtype_tag(self) -> i64 {
+        match self {
+            FusedCeDtypeHint::F32 => 0,
+            FusedCeDtypeHint::F16 => 1,
+            FusedCeDtypeHint::Bf16 => 2,
+        }
+    }
 }
 
 /// User-facing knob that gates how WGGO scores head importance.

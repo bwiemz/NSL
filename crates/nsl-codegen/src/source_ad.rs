@@ -1610,10 +1610,54 @@ impl<'a> WengertExtractor<'a> {
     ///
     /// Edge cases handled:
     ///   * `bias` is required by v1's fused FFI signature, so a bare
-    ///     `Matmul(x, Transpose(W))` (no add) does NOT match.
-    ///   * `Transpose` must be over `{dim0:0, dim1:1}` — matching the stdlib
-    ///     `transpose(W, 0, 1)` rewrite. Other transposes are intentionally
-    ///     refused so we don't auto-substitute a user's bespoke W layout.
+    ///     `Matmul(x, Transpose(W))` (no add) does NOT match.  Sprint v4-3
+    ///     deferral: a bias-free PTX variant is feasible but would require
+    ///     emitter forks (`emit_fwd_kernel_no_bias` + `emit_bwd_kernel_no_bias`
+    ///     etc. — comparable LOC to the bf16 sprint).  A cheaper host-side
+    ///     workaround (caller allocates+zeros a `[V]` scratch buffer) was
+    ///     considered for v4-3 but not landed because the upstream
+    ///     decorator/wengert path has no hook to inject scratch alloc
+    ///     today; tracked for v5+.
+    ///   * `Transpose` must be over the last two dims of a 2D weight tensor.
+    ///     Sprint v4-3 widens this beyond the strict stdlib
+    ///     `transpose(W, 0, 1)` rewrite — `transpose(W, 1, 0)` and the
+    ///     negative-dim form `transpose(W, -2, -1)` (encoded via
+    ///     `encode_transpose_dim` as `(usize::MAX - 1, usize::MAX)`) and its
+    ///     swap `transpose(W, -1, -2)` are now all accepted.  All three
+    ///     forms are semantically identical on a 2D tensor — the previous
+    ///     refusal was over-strict and forced idiomatic NSL code (which
+    ///     prefers negative dims for rank-agnostic transposes) onto the
+    ///     slower composite path.
+    ///
+    ///     LATENT 3-D+ RISK (adversarial review Findings 1 + 8): the matcher
+    ///     does NOT structurally verify that `W` is rank-2 — it accepts
+    ///     `W` via the transpose's first input slot regardless of declared
+    ///     rank.  Every PTX emitter indexes `W` as `W[v*H + h]` (rank-2
+    ///     `[V, H]`); a user who wrote `matmul(x, transpose(W3D, -2, -1))
+    ///     + bias` over a rank-3 `W3D` (e.g. an MoE expert stack `[D, V, H]`
+    ///     or a head-major `[heads, V, H]` layout) would have the matcher
+    ///     silently fire, the fused FFI stride through `W3D` as if it were
+    ///     `[V, H]`, and produce wrong forward logits + wrong dW gradients
+    ///     with no diagnostic.
+    ///
+    ///     Current mitigation: the upstream type system rejects non-2D
+    ///     Matmul inputs in most shape configurations, AND the decorator's
+    ///     `(vocab_size, hidden_size)` shape contract — checked by the
+    ///     caller before emitting the substitution — pins the expected
+    ///     `[V, H]` shape.  A 3-D `W` that happens to satisfy `D * V == V`
+    ///     OR a missing-shape-hint path would slip through.  Structural
+    ///     rank-2 enforcement (walk the producer of `w_var`, consult the
+    ///     shape table for `Param` / `Constant` ops) is tracked as a
+    ///     follow-on — the cheapest pin until then is the negative-test
+    ///     coverage codified in `fused_linear_ce_auto_substitution.rs`
+    ///     (rank-3 W → no substitution).
+    ///   * No-transpose W layout (`Matmul(x, W)` with W already `[H, V]`)
+    ///     is NOT accepted.  Sprint v4-3 deferral: the runtime FFI at
+    ///     `crates/nsl-runtime/src/fused_linear_ce.rs` (`w_ptr` doc) and
+    ///     every PTX emitter indexes W as `[V, H]` (`W[v*H + h]`).  An
+    ///     `[H, V]` path needs a new emitter variant + new FFI symbol
+    ///     (`nsl_fused_linear_ce_forward_w_hv` or similar) — comparable
+    ///     LOC to the bf16 sprint; tracked for v5+.
     ///   * Add operands may appear in either order:
     ///     `Add(Matmul(...), bias)` and `Add(bias, Matmul(...))` both match.
     ///
@@ -1678,11 +1722,36 @@ impl<'a> WengertExtractor<'a> {
         let x_var = matmul_op.inputs[0];
         let w_transposed_var = matmul_op.inputs[1];
         let transpose_op = self.list.find_producer(w_transposed_var)?;
-        // The stdlib `fused_linear_ce` does `transpose(W, 0, 1)` — match
-        // exactly that. Refuse other transpose dims so we don't silently
-        // mis-substitute a user's bespoke layout.
+        // Sprint v4-3: accept any of the four semantically-equivalent
+        // last-two-dim transposes of a 2D weight tensor:
+        //   * `transpose(W, 0, 1)` → `{0, 1}` (stdlib form)
+        //   * `transpose(W, 1, 0)` → `{1, 0}` (operand swap; same matrix)
+        //   * `transpose(W, -2, -1)` → `{usize::MAX - 1, usize::MAX}`
+        //     (negative-dim encoding from `encode_transpose_dim`)
+        //   * `transpose(W, -1, -2)` → `{usize::MAX, usize::MAX - 1}` (swap)
+        //
+        // These four forms are bit-identical on a 2D tensor.  The
+        // pre-v4-3 matcher accepted only the first form, forcing
+        // idiomatic NSL code (which prefers negative-dim transposes for
+        // rank-agnostic code, see `source_ad.rs` lines 556-560/597-598/
+        // 656-672/746-761 where the AD rules themselves emit
+        // `{usize::MAX - 1, usize::MAX}`) onto the slower composite
+        // path.  Higher-dim transposes (e.g. `transpose(W, 0, 2)`) are
+        // STILL refused — those reshape a >2D tensor in ways that the
+        // fused FFI's `[V, H]` indexing cannot honour.
+        const NEG_MINUS_2: usize = usize::MAX - 1;
+        const NEG_MINUS_1: usize = usize::MAX;
         match transpose_op.op {
-            PrimalOp::Transpose { dim0: 0, dim1: 1 } => {}
+            PrimalOp::Transpose { dim0: 0, dim1: 1 }
+            | PrimalOp::Transpose { dim0: 1, dim1: 0 }
+            | PrimalOp::Transpose {
+                dim0: NEG_MINUS_2,
+                dim1: NEG_MINUS_1,
+            }
+            | PrimalOp::Transpose {
+                dim0: NEG_MINUS_1,
+                dim1: NEG_MINUS_2,
+            } => {}
             _ => return None,
         }
         // `transpose(W, 0, 1)` is recognised in `extract_expr` with inputs

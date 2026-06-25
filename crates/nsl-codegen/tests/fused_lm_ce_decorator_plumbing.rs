@@ -33,6 +33,17 @@ fn analysis_to_fused_ce_configs(
             hidden_size: c.hidden_size,
             batch_size: c.batch_size,
             seq_len: c.seq_len,
+            dtype: c.dtype.map(|d| match d {
+                nsl_semantic::cftp::FusedCeDtypeHint::F32 => {
+                    nsl_codegen::FusedCeDtypeHint::F32
+                }
+                nsl_semantic::cftp::FusedCeDtypeHint::F16 => {
+                    nsl_codegen::FusedCeDtypeHint::F16
+                }
+                nsl_semantic::cftp::FusedCeDtypeHint::Bf16 => {
+                    nsl_codegen::FusedCeDtypeHint::Bf16
+                }
+            }),
         })
         .collect()
 }

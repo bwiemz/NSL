@@ -2440,6 +2440,7 @@ fn build_fused_ce_cfg(
     seq_len: u32,
     vocab_tile: u32,
     ignore_index: i64,
+    dtype: crate::fused_linear_ce::Dtype,
 ) -> Result<crate::fused_linear_ce::FusedLinearCEConfig, CodegenError> {
     let cfg = crate::fused_linear_ce::FusedLinearCEConfig {
         vocab_size,
@@ -2448,7 +2449,7 @@ fn build_fused_ce_cfg(
         batch_size,
         vocab_tile,
         gpu_sm: 80,
-        dtype: crate::fused_linear_ce::Dtype::F32,
+        dtype,
         ignore_index,
         // Raise the per-config cap to the hard ceiling so Sprint-3's
         // large-vocab path activates whenever vocab > 8192 without the
@@ -2458,6 +2459,45 @@ fn build_fused_ce_cfg(
     cfg.validate()
         .map_err(|e| CodegenError::new(format!("FusedLinearCe config invalid: {e}")))?;
     Ok(cfg)
+}
+
+/// CFTP v4-2: derive the FFI dtype_tag + emitter Dtype from the active
+/// `@fused_lm_ce` decorator config. Reads `compiler.fused_ce_configs[0]`
+/// (which is the only entry — a train block carries at most one decorator).
+///
+/// Returns `(dtype_tag, emitter_dtype)`:
+/// * `(0, Dtype::F32)` for `dtype = "f32"` or absent decorator
+///   (pre-v4-2 byte-identical default)
+/// * `(1, Dtype::F16)` for `dtype = "f16" | "fp16"`
+/// * `(2, Dtype::Bf16)` for `dtype = "bf16"`
+///
+/// IMPORTANT: both the FFI sentinel and the emitter dtype must agree —
+/// the PTX bytes carry the dtype-specialised cvt instructions and the
+/// runtime dispatch tag must match so the launcher chooses the same
+/// path. Hence a single source of truth.
+fn fused_ce_dtype_for_compiler(
+    compiler: &crate::compiler::Compiler,
+) -> (i64, crate::fused_linear_ce::Dtype) {
+    use crate::FusedCeDtypeHint;
+    // Adversarial review Finding 9: guard the dtype read by `enabled` so a
+    // future code path that lowers a PrimalOp::FusedLinearCe via a different
+    // upstream substitution cannot silently inherit the dtype hint of a
+    // disabled decorator. The current callers (source_ad.rs::extract_expr
+    // for the @fused_lm_ce auto-substitution arm AND for explicit
+    // `fused_linear_ce` builtin calls) ALREADY check `cfg.enabled` before
+    // emitting the FusedLinearCe op, so this guard is defense-in-depth —
+    // it codifies the documented `disabled → composite preserved` invariant
+    // as a single-source-of-truth filter.
+    match compiler
+        .fused_ce_configs
+        .first()
+        .filter(|c| c.enabled)
+        .and_then(|c| c.dtype)
+    {
+        None | Some(FusedCeDtypeHint::F32) => (0, crate::fused_linear_ce::Dtype::F32),
+        Some(FusedCeDtypeHint::F16) => (1, crate::fused_linear_ce::Dtype::F16),
+        Some(FusedCeDtypeHint::Bf16) => (2, crate::fused_linear_ce::Dtype::Bf16),
+    }
 }
 
 /// Embed a Vec<u8> of PTX bytes (NUL-terminated copy made internally) and
@@ -2547,6 +2587,39 @@ fn lower_fused_linear_ce_forward(
     ignore_index: i64,
     is_large: bool,
 ) -> Result<Value, CodegenError> {
+    // CFTP v4-2: read dtype hint from the active `@fused_lm_ce` decorator.
+    // Both the emitter cfg AND the FFI dtype_tag must agree; a single
+    // source of truth (`fused_ce_dtype_for_compiler`) guarantees that.
+    let (dtype_tag, emitter_dtype) = fused_ce_dtype_for_compiler(compiler);
+    // Adversarial review Finding 2 (HIGH): the wengert tape produces f32
+    // tensors (no source-level fp16/bf16 type exists in NSL today), but
+    // the f16/bf16 emitters use `ld.global.b16` (2 bytes/elem) against
+    // f32 buffers (4 bytes/elem). Without a precision_cast op to
+    // re-allocate x_t/w_t/bias_t as 16-bit in HBM, every load reads
+    // half the bytes of one f32 element + half of the next, reinterpreting
+    // them as the 16-bit format — complete numerical garbage with no
+    // error, no diagnostic, no compile-time refusal. Per the deferral
+    // pattern codified in `feedback_deferral_must_refuse`: a deferred
+    // surface MUST refuse, not silently corrupt. Lift the cast-plumbing
+    // gate to a hard CodegenError until the parallel-bf16-buffer
+    // allocation pass lands (tracked for v4-3+).
+    //
+    // The v4-1 emitters themselves are validated end-to-end by direct
+    // FFI tests in `fused_linear_ce_bf16_numerical.rs` /
+    // `fused_linear_ce_numerical.rs` (fp16) which allocate the 16-bit
+    // HBM buffers themselves — that path is unaffected by this refusal.
+    if !matches!(emitter_dtype, crate::fused_linear_ce::Dtype::F32) {
+        return Err(CodegenError::new(format!(
+            "@fused_lm_ce(dtype = \"{}\") requires HBM precision_cast \
+             plumbing for x/W/bias (the wengert tape is f32; the f16/bf16 \
+             emitters expect 16-bit storage) — deferred to a follow-on \
+             sprint. As of v4-2, only `dtype = \"f32\"` (or absent) is \
+             accepted at this dispatch site; the f16/bf16 emitters are \
+             reachable end-to-end via direct FFI tests with caller-managed \
+             16-bit HBM allocation.",
+            emitter_dtype.tag()
+        )));
+    }
     let cfg = build_fused_ce_cfg(
         vocab_size,
         hidden_size,
@@ -2554,6 +2627,7 @@ fn lower_fused_linear_ce_forward(
         seq_len,
         vocab_tile,
         ignore_index,
+        emitter_dtype,
     )?;
     let rows = (batch_size as i64) * (seq_len as i64);
     let x_t = inputs[0];
@@ -2614,9 +2688,11 @@ fn lower_fused_linear_ce_forward(
             call(compiler, builder, "nsl_tensor_data_ptr", &[partials_buf])?;
         let num_tiles_val = builder.ins().iconst(cl_types::I64, num_tiles);
 
-        // dtype_tag = 0 (F32 sentinel; Sprint v3-2 added the trailing arg).
-        // V4 follow-on will derive this from the @fused_lm_ce decorator.
-        let dtype_tag_val = builder.ins().iconst(cl_types::I64, 0);
+        // CFTP v4-2: dtype_tag derived from @fused_lm_ce(dtype="...").
+        //   None | Some("f32") -> 0 (pre-v4-2 byte-identical)
+        //   Some("f16")        -> 1 (Sprint v3-2 emitters)
+        //   Some("bf16")       -> 2 (Sprint v4-1 emitters)
+        let dtype_tag_val = builder.ins().iconst(cl_types::I64, dtype_tag);
         let _rc = call(
             compiler,
             builder,
@@ -2648,8 +2724,10 @@ fn lower_fused_linear_ce_forward(
         let kname = cfg.kernel_name();
         let (ptx_ptr, name_ptr) =
             embed_fused_ce_data(compiler, builder, &tag, &fwd_ptx_bytes, &kname)?;
-        // dtype_tag = 0 (F32 sentinel; Sprint v3-2 added the trailing arg).
-        let dtype_tag_val = builder.ins().iconst(cl_types::I64, 0);
+        // CFTP v4-2: dtype_tag derived from @fused_lm_ce(dtype="...").
+        // Same source-of-truth as the large-vocab path above (see
+        // `fused_ce_dtype_for_compiler`).
+        let dtype_tag_val = builder.ins().iconst(cl_types::I64, dtype_tag);
         let _rc = call(
             compiler,
             builder,
@@ -2780,6 +2858,25 @@ fn lower_fused_linear_ce_backward_extract(
     let slot = if let Some(&cached) = compiler.fused_ce_bwd_cache.get(&fwd_result_key) {
         cached
     } else {
+        // CFTP v4-2: same dtype source-of-truth as forward (see
+        // `fused_ce_dtype_for_compiler`). The backward kernel name is
+        // a function of the cfg's `dtype` field so the PTX byte stream
+        // we synthesise here must match the forward path's choice.
+        let (dtype_tag, emitter_dtype) = fused_ce_dtype_for_compiler(compiler);
+        // Adversarial review Finding 2 (HIGH): mirror the forward
+        // refusal — the backward emitter has the same HBM-layout
+        // contract (`ld.global.b16` against f32 buffers = corruption).
+        // The forward dispatch would normally have errored out before
+        // we ever get here, but the guard is duplicated defensively
+        // in case a future caller invokes backward directly.
+        if !matches!(emitter_dtype, crate::fused_linear_ce::Dtype::F32) {
+            return Err(CodegenError::new(format!(
+                "@fused_lm_ce(dtype = \"{}\") backward: same precision_cast \
+                 plumbing gap as forward (see `lower_fused_linear_ce_forward` \
+                 for the full rationale). Deferred to a follow-on sprint.",
+                emitter_dtype.tag()
+            )));
+        }
         let cfg = build_fused_ce_cfg(
             vocab_size,
             hidden_size,
@@ -2787,6 +2884,7 @@ fn lower_fused_linear_ce_backward_extract(
             seq_len,
             vocab_tile,
             ignore_index,
+            emitter_dtype,
         )?;
 
         // Allocate output tensors (dx[B*S, H], dW[V, H], dbias[V]).
@@ -2875,8 +2973,9 @@ fn lower_fused_linear_ce_backward_extract(
         let h_val = builder.ins().iconst(cl_types::I64, hidden_size as i64);
         let smem_val = builder.ins().iconst(cl_types::I64, cfg.shared_mem_bytes() as i64);
 
-        // dtype_tag = 0 (F32 sentinel; Sprint v3-2 added the trailing arg).
-        let dtype_tag_val = builder.ins().iconst(cl_types::I64, 0);
+        // CFTP v4-2: dtype_tag from `@fused_lm_ce(dtype="...")` decorator
+        // (resolved above; same value the forward path used).
+        let dtype_tag_val = builder.ins().iconst(cl_types::I64, dtype_tag);
         let _rc = call(
             compiler,
             builder,
