@@ -690,22 +690,60 @@ impl Compiler<'_> {
         let resolved_d_model = self
             .resolve_csha_d_model_from_stmts(stmts)
             .unwrap_or(base_config.head_dim as u32);
-        // Minimum-invasive CSHA preset: boundary level + saves. Level 0
-        // is explicitly rejected by the kernel-name encoder, so we use
-        // level=1 without turning on any fusion flags — the only bit
-        // that actually matters for Gap B is
-        // `save_activations_for_backward=true`.
-        let csha_extras = crate::flash_attention::CshaExtras {
-            level: 1,
-            fused_rmsnorm: false,
-            fused_projections: false,
-            fused_output_proj: false,
-            active_heads: 0,
-            rmsnorm_eps: 1e-5,
-            d_model: resolved_d_model,
-            save_activations_for_backward: true,
-            skip_rmsnorm_prologue: false,
-            static_seq_len: None,
+        // Cycle-12 T1 wire-up: derive @checkpoint(policy=Full) presence
+        // from `compile_options.checkpoint_policies`. v1 ships a single
+        // policy variant (Full) per cycle-10 Refuter 3; we use ANY entry
+        // in the map as the trigger for routing the backward through
+        // `synthesize_backward_with_recompute`. The map being non-empty
+        // is the in-tree signal that the user wrote `@checkpoint` on a
+        // training-loop function.
+        //
+        // The fn-name-keyed lookup (which fn carries @checkpoint) is
+        // deferred to a follow-on cycle where the compile_flash_attention
+        // pipeline gains per-fn context — today the CSHA training PTX
+        // emission is module-scoped (one training_config per module
+        // owning the @train block).
+        let checkpoint_full_active = self
+            .compile_options
+            .checkpoint_policies
+            .values()
+            .any(|p| matches!(p, nsl_semantic::effects::CheckpointPolicy::Full));
+        let training_checkpoint = if checkpoint_full_active {
+            Some(crate::flash_attention::CheckpointExtras::full())
+        } else {
+            None
+        };
+
+        // Cycle-12 T4: when `@checkpoint(policy=Full)` is active, the
+        // backward kv-recompute path requires the forward to stage
+        // x_raw + Wk/Wv. The cycle-12 R3 augmentation refuses configs
+        // that don't satisfy `fused_projections=true`, so we MUST flip
+        // the preset to the fused-projections preset when checkpoint is
+        // Some. Otherwise (the pre-cycle-12 default), keep the cycle-11
+        // minimum-invasive preset with `save_activations_for_backward`
+        // alone.
+        let csha_extras = if checkpoint_full_active {
+            let mut x = crate::flash_attention::CshaExtras::level1_with_fused_proj(1e-5);
+            x.d_model = resolved_d_model;
+            // T4 (defense-in-depth): `level1_with_fused_proj` already
+            // sets save_activations_for_backward=true, but reassert here
+            // so a future builder refactor doesn't silently break the
+            // x_raw save channel (the cycle-11 silent-garbage bug).
+            x.save_activations_for_backward = true;
+            x
+        } else {
+            crate::flash_attention::CshaExtras {
+                level: 1,
+                fused_rmsnorm: false,
+                fused_projections: false,
+                fused_output_proj: false,
+                active_heads: 0,
+                rmsnorm_eps: 1e-5,
+                d_model: resolved_d_model,
+                save_activations_for_backward: true,
+                skip_rmsnorm_prologue: false,
+                static_seq_len: None,
+            }
         };
         // Tier C's backward emitter (ds_compute/dqdk_accum/dv_accum)
         // currently hard-asserts `block_kv=32` (T3.3–T3.5 landed with
@@ -754,7 +792,12 @@ impl Compiler<'_> {
         let backward_block_q: i64 = 32;
         let training_config = crate::flash_attention::FlashAttentionConfig {
             csha: Some(csha_extras),
-            checkpoint: None,
+            // Cycle-12 T1: route @checkpoint(policy=Full) into the
+            // backward synthesizer. None preserves cycle-11 baseline
+            // (kv_load HBM path); Some routes the dispatch fork into
+            // `synthesize_backward_with_recompute` -> cycle-11
+            // `emit_kv_recompute` substitution.
+            checkpoint: training_checkpoint,
             block_q: backward_block_q,
             block_kv: backward_block_kv,
             ..base_config

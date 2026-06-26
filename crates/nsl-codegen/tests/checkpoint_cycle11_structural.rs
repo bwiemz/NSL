@@ -217,6 +217,65 @@ fn g3c_rope_k_write_between_projection_and_ds_compute() {
 }
 
 #[test]
+fn g5_production_wire_up_smoke() {
+    // Cycle-12 T1: when `compile_options.checkpoint_policies` contains
+    // a Full entry, the kernel.rs CSHA training-PTX wire-up MUST
+    // construct `Some(CheckpointExtras::full())` on the training_config
+    // (line 757). The downstream backward synthesis then routes through
+    // `synthesize_backward_with_recompute` -> cycle-11
+    // `emit_kv_recompute`, producing `V2_KV_RECOMPUTE_MAIN` in the PTX.
+    //
+    // Driving the full Compiler pipeline end-to-end requires a NSL
+    // model with @flash_attention + @train + @checkpoint(policy="full")
+    // which is heavy for a structural test. Instead we exercise the
+    // structural invariant directly: build a config matching what the
+    // wire-up would construct (level1_with_fused_proj + checkpoint=Full)
+    // and assert it produces V2_KV_RECOMPUTE_MAIN end-to-end.
+    //
+    // If this assertion regresses because the wire-up SHAPE changes
+    // (e.g. config no longer routes to emit_kv_recompute), the
+    // production wire-up is structurally broken regardless of whether
+    // the @train+@checkpoint plumbing works.
+    let cfg = build_bypass_config();
+    let ptx = synthesize_backward_with_tier(&cfg)
+        .expect("G5: cycle-12 wire-up shape backward synthesis must succeed");
+    assert!(
+        ptx.contains("V2_KV_RECOMPUTE_MAIN"),
+        "G5: wire-up shape did NOT route into kv-recompute path. \
+         Production kernel.rs T1 wire-up is broken — even with \
+         CheckpointExtras::full() + level1_with_fused_proj() the \
+         dispatch fork failed to substitute kv_load with emit_kv_recompute."
+    );
+}
+
+#[test]
+fn g6_save_activations_forced_when_checkpoint_some() {
+    // Cycle-12 T4: when `config.checkpoint.is_some()`, the forward
+    // CSHA path MUST stage x_raw for the backward kv-recompute. The
+    // `level1_with_fused_proj` builder is the single source of truth
+    // for this invariant — it sets `save_activations_for_backward = true`
+    // alongside `fused_projections = true`. Future builder refactors
+    // that drop the save flag would silently regress to the cycle-11
+    // silent-garbage bug.
+    let cfg = build_bypass_config();
+    assert!(
+        cfg.checkpoint.is_some(),
+        "G6 precondition: build_bypass_config must have checkpoint=Some"
+    );
+    let csha = cfg.csha.as_ref().expect("G6 precondition: CSHA required");
+    assert!(
+        csha.save_activations_for_backward,
+        "G6: x_raw save not auto-enabled with checkpoint=Some. \
+         level1_with_fused_proj() must set save_activations_for_backward=true."
+    );
+    assert!(
+        csha.fused_projections,
+        "G6: fused_projections not set with checkpoint=Some. \
+         Cycle-12 R3 augmentation requires it."
+    );
+}
+
+#[test]
 fn g8_trap_on_null_x_raw_ptr() {
     // Cycle 12: the cycle-11 `bra V2_KV_RECOMPUTE_DONE_*` early-exit
     // on null x_raw_ptr was the SILENT-garbage bug — downstream
