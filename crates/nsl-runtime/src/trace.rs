@@ -16,8 +16,20 @@ static TRACE_GRAPH: Mutex<Option<TraceGraph>> = Mutex::new(None);
 // so that tensor-op tests running in parallel (arithmetic, activation, etc.)
 // cannot inject spurious ops into the shared TRACE_GRAPH and cause
 // "expected N ops, got N+1" failures.
+//
+// **THREAD-LOCAL** — `nsl_trace_start()` sets the global `TRACING` flag to
+// true, which means every test thread sees `is_tracing() == true` for the
+// duration of any trace test's recording window. A global `AtomicBool` here
+// was insufficient: the trace-test thread set it true, then parallel
+// tensor-op test threads also saw it true and pushed stray ops into
+// `TRACE_GRAPH`. Per-thread state means parallel threads always observe
+// their own `false` initial value regardless of what the trace-test thread
+// has set on its own thread.
 #[cfg(test)]
-pub(crate) static TRACE_TEST_RECORDING: AtomicBool = AtomicBool::new(false);
+thread_local! {
+    pub(crate) static TRACE_TEST_RECORDING: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Types
@@ -109,9 +121,11 @@ pub fn record_op(
     }
     // In test builds, only record when a trace::tests body explicitly opted in.
     // This blocks stray calls from parallel tensor-op tests (arithmetic,
-    // activation, etc.) that happen to run while TRACING=true.
+    // activation, etc.) that happen to run while TRACING=true. The flag is
+    // thread-local — only the thread that called `TRACE_TEST_RECORDING.set(true)`
+    // sees `true`; every other test thread sees its own initial `false`.
     #[cfg(test)]
-    if !TRACE_TEST_RECORDING.load(Ordering::SeqCst) {
+    if !TRACE_TEST_RECORDING.with(|c| c.get()) {
         return;
     }
     let mut guard = TRACE_GRAPH.lock().expect("TRACE_GRAPH mutex poisoned");
@@ -211,16 +225,22 @@ mod tests {
     static TEST_LOCK: StdMutex<()> = StdMutex::new(());
 
     /// Helper: reset global state between tests so they don't interfere.
+    /// Recovers from a poisoned `TRACE_GRAPH` mutex so that a prior test
+    /// panicking while holding the lock doesn't cascade into the next test.
     fn reset_trace() {
         TRACING.store(false, Ordering::SeqCst);
-        *TRACE_GRAPH.lock().unwrap() = None;
+        let mut guard = match TRACE_GRAPH.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *guard = None;
     }
 
     #[test]
     fn test_trace_basic_ops() {
         let _guard = TEST_LOCK.lock().unwrap();
         reset_trace();
-        TRACE_TEST_RECORDING.store(true, Ordering::SeqCst);
+        TRACE_TEST_RECORDING.with(|c| c.set(true));
 
         // Start trace
         nsl_trace_start();
@@ -259,7 +279,7 @@ mod tests {
         assert!(!is_tracing(), "tracing should be inactive after nsl_trace_stop");
         assert_ne!(raw, 0, "nsl_trace_stop should return a non-null pointer");
 
-        TRACE_TEST_RECORDING.store(false, Ordering::SeqCst);
+        TRACE_TEST_RECORDING.with(|c| c.set(false));
         let graph = unsafe { Box::from_raw(raw as *mut TraceGraph) };
 
         // Verify ops
@@ -291,7 +311,7 @@ mod tests {
     fn test_trace_pointer_resolution() {
         let _guard = TEST_LOCK.lock().unwrap();
         reset_trace();
-        TRACE_TEST_RECORDING.store(true, Ordering::SeqCst);
+        TRACE_TEST_RECORDING.with(|c| c.set(true));
 
         nsl_trace_start();
 
@@ -310,7 +330,7 @@ mod tests {
         nsl_trace_register_output(40, output_name.as_ptr() as i64);
 
         let raw = nsl_trace_stop();
-        TRACE_TEST_RECORDING.store(false, Ordering::SeqCst);
+        TRACE_TEST_RECORDING.with(|c| c.set(false));
         let graph = unsafe { Box::from_raw(raw as *mut TraceGraph) };
 
         // ptr 10 is in inputs
@@ -336,5 +356,77 @@ mod tests {
             Some(&1),
             "ptr 40 should map to node 1 (Relu)"
         );
+    }
+
+    // Regression: pins that `TRACE_TEST_RECORDING` is genuinely thread-local.
+    // A worker thread spawned while the main thread has set its own cell to
+    // `true` MUST observe its own per-thread initial `false`. If this ever
+    // regresses to a global (e.g. someone "consolidates" the state back to
+    // an `AtomicBool`), parallel tensor-op tests will silently push stray
+    // entries into the shared `TRACE_GRAPH` during a trace test's recording
+    // window — the same bug this fix closes.
+    #[test]
+    fn trace_test_recording_is_thread_local() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        reset_trace();
+        TRACE_TEST_RECORDING.with(|c| c.set(true));
+        assert!(TRACE_TEST_RECORDING.with(|c| c.get()), "main thread set it true");
+
+        let observed_in_worker = std::thread::spawn(|| {
+            TRACE_TEST_RECORDING.with(|c| c.get())
+        })
+        .join()
+        .expect("worker thread must not panic");
+
+        assert!(
+            !observed_in_worker,
+            "TRACE_TEST_RECORDING must be thread-local — a parallel thread MUST observe its own initial false"
+        );
+        TRACE_TEST_RECORDING.with(|c| c.set(false));
+    }
+
+    // End-to-end regression: while a trace test holds the recording window
+    // open on the main thread (TRACING=true globally + TRACE_TEST_RECORDING
+    // true thread-locally), a parallel thread calling `record_op` must NOT
+    // pollute `TRACE_GRAPH`. This is the exact contamination path the
+    // pre-fix global AtomicBool let through.
+    #[test]
+    fn parallel_thread_record_op_does_not_pollute_trace_graph() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        reset_trace();
+        TRACE_TEST_RECORDING.with(|c| c.set(true));
+        nsl_trace_start();
+
+        // Worker thread simulates a parallel tensor-op test. `TRACING` is
+        // true globally (set by `nsl_trace_start()` above), but the worker's
+        // own `TRACE_TEST_RECORDING` is its initial false — so `record_op`
+        // must early-return without touching TRACE_GRAPH.
+        let worker_saw_recording = std::thread::spawn(|| {
+            record_op(OpType::Add, vec![1, 2], 3, vec![4], 0, vec![]);
+            TRACE_TEST_RECORDING.with(|c| c.get())
+        })
+        .join()
+        .expect("worker thread must not panic");
+        assert!(
+            !worker_saw_recording,
+            "worker thread must observe its own thread-local default false (was true → would re-introduce the parallel contamination bug)"
+        );
+
+        // Main thread DOES record its own op — its thread-local is true.
+        record_op(OpType::Mul, vec![10, 20], 30, vec![4], 0, vec![]);
+
+        let raw = nsl_trace_stop();
+        TRACE_TEST_RECORDING.with(|c| c.set(false));
+        let graph = unsafe { Box::from_raw(raw as *mut TraceGraph) };
+
+        // Exactly one op — only the main thread's Mul. The worker's Add was
+        // filtered by the thread-local check.
+        assert_eq!(
+            graph.ops.len(),
+            1,
+            "worker-thread record_op must NOT have polluted TRACE_GRAPH (got {} ops, expected 1)",
+            graph.ops.len()
+        );
+        assert_eq!(graph.ops[0].op_type, OpType::Mul);
     }
 }
