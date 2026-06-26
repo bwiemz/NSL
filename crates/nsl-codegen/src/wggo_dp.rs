@@ -93,6 +93,10 @@ pub struct ClusterSpec {
     pub memory_budget: u64,
     /// Maximum allowed pipeline stages (defaults to 1 = no pipelining).
     pub max_stages: u32,
+    /// Inter-GPU interconnect bandwidth (GB/s) used to estimate ZeRO
+    /// collective latency.  Default `300.0` is an NVLink-class heuristic;
+    /// the repo has no measured collective-latency oracle.
+    pub interconnect_gbs: f64,
 }
 
 impl Default for ClusterSpec {
@@ -101,6 +105,7 @@ impl Default for ClusterSpec {
             num_gpus: 1,
             memory_budget: 8u64 * 1024 * 1024 * 1024,
             max_stages: 1,
+            interconnect_gbs: 300.0,
         }
     }
 }
@@ -337,6 +342,7 @@ mod tests {
                 num_gpus: 1,
                 memory_budget: 1, // absurdly small → peak_memory must still fit
                 max_stages: 1,
+                interconnect_gbs: 300.0,
             },
             importance: ImportanceScores {
                 per_layer: vec![0.0, 0.0],
@@ -357,6 +363,7 @@ mod tests {
                 num_gpus: 8,
                 memory_budget: 80u64 * 1024 * 1024 * 1024,
                 max_stages: 1,
+                interconnect_gbs: 300.0,
             },
             ..Default::default()
         };
