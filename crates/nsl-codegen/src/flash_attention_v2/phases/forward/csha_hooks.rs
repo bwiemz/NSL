@@ -9,6 +9,62 @@
 
 use crate::flash_attention::{FlashAttentionConfig, RopeStyle};
 
+/// Cycle 13 save-suppression gate for K_proj and V_proj saves under
+/// `@checkpoint(policy="full")`.
+///
+/// Returns `true` if the K/V save site should emit its `st.global.b16`
+/// store (the historical, byte-identical behavior). Returns `false` if
+/// the save should be SUPPRESSED — the K/V tensors will be reconstructed
+/// on the backward pass by `emit_kv_recompute -> emit_one_recompute_matmul`.
+///
+/// # Invariant: orthogonal flags
+///
+/// `save_activations_for_backward` and `checkpoint` STAY ORTHOGONAL.
+/// They are never collapsed into a single flag:
+///   * `save_activations_for_backward == false` ⇒ no saves at all (the
+///     existing early-return at `emit_save_activations_subset` line 759
+///     handles this; this helper is not even consulted).
+///   * `checkpoint == Some(Full)` (with cascade admission) ⇒ K/V saves
+///     SUPPRESSED specifically; Q_proj, row_max, row_sum, out are
+///     RETAINED (see Phase A facet 2 — backward q_load reads q_proj_ptr
+///     unconditionally; `D = rowsum(dO ⊙ O)` needs `out`; ds_compute
+///     needs the LSE).
+///
+/// # REACHABILITY corollary (cycle 12)
+///
+/// Suppression fires ONLY when `validate_checkpoint_eligibility(cfg)`
+/// admits the config. If R3/R7/R8.1/R9/R10/R11/R12 reject (for example
+/// `segment_masked=true` hits R12), this returns `true` (= emit saves
+/// as the fallback path). This honors the cycle-12 invariant that the
+/// forward-emit decision and the backward-dispatch decision consult the
+/// SAME cascade so the kernel never reads uninitialized HBM.
+///
+/// HBM-byte savings claim is unvalidated until cycle 14 (Blackwell
+/// measurement).
+pub(super) fn should_emit_kv_save(cfg: &FlashAttentionConfig) -> bool {
+    use crate::flash_attention::CheckpointPolicy;
+    use crate::flash_attention_v2::validate_checkpoint_eligibility;
+
+    let want_save = cfg
+        .csha
+        .as_ref()
+        .is_some_and(|c| c.save_activations_for_backward);
+    if !want_save {
+        // save_activations=false: the early-return at line 759 of
+        // emit_save_activations_subset already handles this. Return
+        // false defensively so any future caller can rely on the
+        // helper meaning "should this specific K/V save site emit?"
+        return false;
+    }
+    let policy_full = cfg
+        .checkpoint
+        .as_ref()
+        .is_some_and(|c| c.policy == CheckpointPolicy::Full);
+    let cascade_ok = validate_checkpoint_eligibility(cfg).is_ok();
+    let suppress = policy_full && cascade_ok;
+    !suppress
+}
+
 /// # CSHA paper §5.2 (dead-head elimination) — v1 envelope
 ///
 /// Two-tier elimination, both shipped pre-cycle-2:
@@ -818,6 +874,25 @@ pub fn emit_save_activations_subset(
         SaveSet::V  => &all[2..3],
     };
     for &(label, ptr_name, smem_base) in entries {
+        // Cycle 13: per-tensor K/V suppression gate under @checkpoint(policy="full").
+        // Q_proj is RETAINED (backward q_load reads it). Only K_proj and V_proj are
+        // suppressed; the backward path reconstructs them via emit_kv_recompute ->
+        // emit_one_recompute_matmul. See should_emit_kv_save doc for orthogonality
+        // and REACHABILITY invariants.
+        if matches!(ptr_name, "k_proj_ptr" | "v_proj_ptr") && !should_emit_kv_save(config) {
+            ptx.push_str(&format!(
+                "    // -- Save {label} activation: SUPPRESSED under @checkpoint(policy=\"full\") --\n"
+            ));
+            ptx.push_str(&format!(
+                "    // {ptr_name} write: SUPPRESSED under @checkpoint(policy=\"full\")\n"
+            ));
+            ptx.push_str(&format!(
+                "    // recomputed via emit_kv_recompute -> emit_one_recompute_matmul[w{}]\n",
+                label.to_ascii_lowercase()
+            ));
+            ptx.push_str("    // HBM-byte savings claim unvalidated until cycle 14\n");
+            continue;
+        }
         ptx.push_str(&format!(
             "    // -- Save {label} activation to HBM via [{ptr_name}] --\n"
         ));

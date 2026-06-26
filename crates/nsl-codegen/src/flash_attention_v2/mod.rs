@@ -1049,7 +1049,7 @@ pub fn synthesize_backward_with_tier(
 /// (`synthesize_backward_with_tier_b`). When `config.checkpoint.is_none()`
 /// the helper is a no-op — preserving the byte-identity invariant of
 /// the no-decorator path (`fa_v2_snapshots` 25/25 byte-identical).
-fn validate_checkpoint_eligibility(config: &FlashAttentionConfig) -> Result<(), String> {
+pub(crate) fn validate_checkpoint_eligibility(config: &FlashAttentionConfig) -> Result<(), String> {
     use crate::flash_attention::CheckpointPolicy;
     use crate::flash_attention_v2::tier_b2::dispatch::tier_b2_hybrid_backward_compile_time_eligible;
 
