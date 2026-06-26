@@ -211,3 +211,68 @@ Cycle 11 wires the kv_load -> emit_kv_recompute substitution behind R0:
 
 Cycle 12 will lift R0 + run G4 GPU numerical validation at (hd, S) in {(64, 512), (64, 2048), (128, 2048), (128, 4096)} via csha_cuda_backward.rs harness.
 
+## Cycle 13 K/V save-suppression structural landing
+
+Cycle 13 wires the forward-side gate for K_proj + V_proj save-suppression
+under `@checkpoint(policy="full")`. This is the first cycle that
+materially reduces forward HBM write traffic when the checkpoint
+decorator is active.
+
+- Mechanism shipped: `should_emit_kv_save(cfg)` helper in
+  `flash_attention_v2/phases/forward/csha_hooks.rs` + per-tensor gate
+  inside `emit_save_activations_subset`. Single source of truth; called
+  exactly once per K and V emit-site.
+- Suppresses K_proj + V_proj saves (each ~8.39 MB at hd=128, S=2048,
+  B=1, h=16 reference shape from Phase A facet 1 Table D). Total
+  cycle-13 structural reduction: **16.78 MB of 50.60 MB = 33% of total**.
+- Paper §6.3 49% headline awaits Q_proj suppression (cycle 15+) or
+  x_raw suppression (cycle 14+ rewire).
+- G9 structural probe (`tests/csha_checkpoint_full_save_suppression.rs`):
+  4 falsifiable assertions covering suppression, baseline byte-identity,
+  refusal-comment presence, and the cycle-12 REACHABILITY corollary
+  fallback path.
+- `validate_checkpoint_eligibility` visibility widened from private to
+  `pub(crate)` so the forward emit site can consult the same cascade
+  the backward dispatch site does — guaranteeing forward-emit and
+  backward-route stay in lockstep (no uninitialized HBM reads).
+- `save_activations_for_backward` and `checkpoint` stay ORTHOGONAL.
+  The gate's doc-comment explains why and forbids collapsing them.
+
+### Deferred from cycle 13
+
+- **Real HBM measurement**: cycle 14 — requires Blackwell. The codegen-
+  site refusal comment carries the marker
+  `"HBM-byte savings claim unvalidated until cycle 14"`, asserted by
+  G9-c.
+- **Q_proj save-suppression**: cycle 15+ — requires `emit_q_recompute`
+  orchestrator + second backward dispatch fork (backward `q_load::emit`
+  currently reads `q_proj_ptr` unconditionally per Phase A facet 2).
+- **x_raw save-suppression**: cycle 14+ — Phase A facet 1 §B.1 confirms
+  cycle-11/12 `emit_kv_recompute` loads x from `x_raw_ptr`, so
+  suppressing x_raw save breaks recompute. Requires forward-emitter
+  rewire to expose `x_input` as a live SMEM/register tile to the
+  backward path.
+- **HBM allocation savings**: `nsl_csha_alloc_backward_activations`
+  still allocates K_proj/V_proj HBM even though writes are now
+  suppressed. v1.3 accepted: runtime null-skip handles unused pointers
+  safely. Cycle-14 threads the gate into the alloc site as part of the
+  empirical-measurement plumbing.
+- **WengertOp.checkpointed first-consumer wiring**: deferred. Cycle-10's
+  decorative stamp stays decorative for one more cycle. Production
+  wire-up at `compiler/kernel.rs:711-715` (cycle-12) already populates
+  `FlashAttentionConfig.checkpoint` at function granularity, which
+  `should_emit_kv_save` consumes directly. Per-CSHA-call granularity
+  within a single function (the only thing the WengertOp stamp would
+  enable) is not needed until multiple CSHA calls per function carry
+  distinct checkpoint policies.
+- **R11 / R12 cascade lifts**: separate cycles; cycle 13 consumes the
+  existing cycle-12 cascade unchanged.
+- **Selective per-tensor checkpointing**: `policy="full"` only.
+
+### Gate inventory updates
+
+| Gate | Status | Notes |
+|---|---|---|
+| G9 K/V structural save-suppression | GREEN | 4/4 in csha_checkpoint_full_save_suppression |
+| G1 byte-identity (no-decorator) | GREEN | 25/25 fa_v2_snapshots preserved post-cycle-13 |
+
