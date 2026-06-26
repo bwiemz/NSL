@@ -98,6 +98,12 @@ fn refuse_non_f32_if_unsafe(dtype_tag: i64, ffi_name: &str) -> bool {
     if dtype_tag == 0 {
         return false;
     }
+    // CFTP v7 follow-on (finding-15): one-shot warning if a CI lane or
+    // operator script left over from v6 still sets the legacy ALLOW
+    // env var. v6's `NSL_FUSED_LCE_ALLOW_NON_F32_FFI=1` is a no-op
+    // under v7 — surface the rename to stderr so stale automation is
+    // discovered and updated.
+    warn_on_legacy_env_once();
     if std::env::var_os("NSL_FUSED_LCE_REFUSE_NON_F32").is_none() {
         return false;
     }
@@ -110,6 +116,31 @@ fn refuse_non_f32_if_unsafe(dtype_tag: i64, ffi_name: &str) -> bool {
          it to restore normal v7 activation.",
     );
     true
+}
+
+/// CFTP v7 follow-on (finding-15): emit a one-shot stderr warning when
+/// the legacy v6 env var `NSL_FUSED_LCE_ALLOW_NON_F32_FFI` is observed.
+/// Under v7 the variable is a no-op (we kept it unhandled so straggler
+/// CI invocations fall through harmlessly), but operators reading the v6
+/// docs may believe it still gates an opt-in safety override. A warning
+/// surfaces the rename without spamming the log on every FFI call.
+fn warn_on_legacy_env_once() {
+    use std::sync::Once;
+    static WARNED: Once = Once::new();
+    WARNED.call_once(|| {
+        if std::env::var_os("NSL_FUSED_LCE_ALLOW_NON_F32_FFI").is_some() {
+            eprintln!(
+                "nsl_fused_linear_ce: legacy env var \
+                 NSL_FUSED_LCE_ALLOW_NON_F32_FFI is set but has NO effect \
+                 under CFTP v7 — the v6 default-on FFI refusal was lifted \
+                 because the wengert-inserted precision_cast op + GPU PTX \
+                 cast kernel cover the dtype-conformance contract. If you \
+                 set this var to drive a diagnostic, use \
+                 NSL_FUSED_LCE_REFUSE_NON_F32=1 instead (opposite \
+                 semantics — refuse instead of allow)."
+            );
+        }
+    });
 }
 
 /// Forward: `loss[i] = -log_softmax(x[i] @ W^T + bias)[target[i]]`.
