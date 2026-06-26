@@ -877,6 +877,123 @@ mod tests {
         crate::tensor::nsl_tensor_free(z);
     }
 
+    /// CFTP v7 follow-on (finding 7/2): CPU `f32_to_bf16_bits` now uses
+    /// IEEE-754 RTE (round-to-nearest-even) via `half::bf16::from_f32`,
+    /// matching PTX `cvt.rn.bf16.f32` bit-for-bit on every input. Pin
+    /// the rounding so a regression to the truncating implementation is
+    /// caught immediately.
+    #[test]
+    fn f32_to_bf16_bits_uses_rte_not_truncation() {
+        use crate::tensor::f32_to_bf16_bits;
+        // f32 = 0x3F80FFFF (just below 0x3F810000). Lower 16 bits = 0xFFFF
+        // > 0x8000, so RTE rounds UP from 0x3F80 to 0x3F81. Truncation
+        // would yield 0x3F80 (the buggy v6 behavior).
+        let v = f32::from_bits(0x3F80FFFF);
+        let bits = f32_to_bf16_bits(v);
+        assert_eq!(
+            bits, 0x3F81,
+            "f32_to_bf16_bits MUST round-to-nearest-even (got 0x{bits:04X}, \
+             expected 0x3F81). Truncation here would silently disagree with \
+             PTX cvt.rn.bf16.f32 by one full ULP on the CPU staging path."
+        );
+        // Exact halfway: f32 = 0x3F808000. Lower 16 = 0x8000 == halfway.
+        // RTE: round to even (mant LSB = 0) → keep 0x3F80.
+        let v2 = f32::from_bits(0x3F808000);
+        assert_eq!(
+            f32_to_bf16_bits(v2),
+            0x3F80,
+            "RTE halfway with even-LSB neighbour must round DOWN (banker's rounding)"
+        );
+        // Exact halfway with odd LSB: f32 = 0x3F818000. Lower 16 = 0x8000;
+        // mant LSB = 1 (odd) → round UP to 0x3F82.
+        let v3 = f32::from_bits(0x3F818000);
+        assert_eq!(
+            f32_to_bf16_bits(v3),
+            0x3F82,
+            "RTE halfway with odd-LSB neighbour must round UP to the even mantissa"
+        );
+    }
+
+    /// CFTP v7 follow-on (finding 7/2): same RTE pin for fp16.
+    #[test]
+    fn f32_to_f16_bits_uses_rte_not_truncation() {
+        use crate::tensor::f32_to_f16_bits;
+        // f32 = 0x3F80FFFF (mant bits: 0x00FFFF). f16 mant = top 10 of 23 =
+        // 0x00FFFF >> 13 = 7; round bit = bit 12 = 1; sticky = bits 0-11 =
+        // 0xFFF (non-zero). > halfway → round UP from 7 to 8. Expected 0x3C08.
+        // v6 truncation would have produced 0x3C07.
+        let v = f32::from_bits(0x3F80FFFF);
+        let bits = f32_to_f16_bits(v);
+        assert_eq!(
+            bits, 0x3C08,
+            "f32_to_f16_bits MUST round-to-nearest-even (got 0x{bits:04X}, \
+             expected 0x3C08). v6 truncation produced 0x3C07."
+        );
+        // Halfway tie with even neighbour: f32 = 0x3F801000 (mant LSB=0 in
+        // f16). Lower 13 = 0x1000 exactly; sticky = 0; tie → round to even.
+        // f16 mant stays 0 → 0x3C00.
+        let v2 = f32::from_bits(0x3F801000);
+        assert_eq!(
+            f32_to_f16_bits(v2),
+            0x3C00,
+            "RTE halfway with even neighbour must round DOWN"
+        );
+        // Halfway tie with odd neighbour: f32 = 0x3F803000 (f16 base mant=1).
+        // Lower 13 = 0x1000 exact halfway; tie → round to even. Round UP
+        // from 1 to 2 → 0x3C02.
+        let v3 = f32::from_bits(0x3F803000);
+        assert_eq!(
+            f32_to_f16_bits(v3),
+            0x3C02,
+            "RTE halfway with odd neighbour must round UP to even"
+        );
+    }
+
+    /// CFTP v7 follow-on (finding 8): NaN preservation — both bf16 and f16
+    /// primitives previously silently flushed NaN to ±Inf because the
+    /// finite-overflow check (`exp >= 143` for f16; `bits >> 16` for bf16)
+    /// also matched `exp == 255`. Delegating to `half` preserves NaN.
+    #[test]
+    fn f32_to_f16_bits_preserves_nan() {
+        use crate::tensor::f32_to_f16_bits;
+        let nan_bits = f32_to_f16_bits(f32::NAN);
+        // f16 NaN: exp = 0x1F (top 5 bits), mant != 0. f16 +Inf is 0x7C00
+        // (mant == 0); any quiet NaN has mant != 0.
+        let exp = (nan_bits >> 10) & 0x1F;
+        let mant = nan_bits & 0x3FF;
+        assert_eq!(exp, 0x1F, "NaN must produce f16 exp=0x1F (not zero)");
+        assert_ne!(
+            mant, 0,
+            "NaN must produce f16 NaN (mant != 0) — finding-8: previous \
+             implementation collapsed NaN to ±Inf (mant == 0)"
+        );
+    }
+
+    #[test]
+    fn f32_to_bf16_bits_preserves_nan() {
+        use crate::tensor::f32_to_bf16_bits;
+        // sNaN with payload only in low 16 mantissa bits: 0x7F800001.
+        // v6 truncation: bits >> 16 = 0x7F80 = bf16 +Inf (silent NaN→Inf).
+        // v7 (half crate): preserves NaN.
+        let snan = f32::from_bits(0x7F80_0001);
+        let bits = f32_to_bf16_bits(snan);
+        let exp = (bits >> 7) & 0xFF;
+        let mant = bits & 0x7F;
+        assert_eq!(exp, 0xFF, "bf16 NaN must have exp=0xFF");
+        assert_ne!(
+            mant, 0,
+            "bf16 NaN MUST keep a non-zero mantissa (got 0x{bits:04X}). \
+             v6 truncation produced 0x7F80 (= bf16 +Inf), silently \
+             converting NaN to Inf."
+        );
+        // Standard qNaN — always preserved.
+        let qnan_bits = f32_to_bf16_bits(f32::NAN);
+        let qexp = (qnan_bits >> 7) & 0xFF;
+        let qmant = qnan_bits & 0x7F;
+        assert_eq!(qexp, 0xFF);
+        assert_ne!(qmant, 0);
+    }
+
     /// CFTP v6 Finding 2 (HIGH): the contiguity guard precondition is a
     /// load-bearing invariant — verify both positive forms work today.  The
     /// negative (refusal) cases cannot use `#[should_panic]` because the
