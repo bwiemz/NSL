@@ -1007,31 +1007,28 @@ pub fn synthesize_backward_with_tier(
     }
 }
 
-/// Cycle-10 Phase F: backward synthesizer for `@checkpoint(policy="full")` —
-/// refusal-only in v1.
+/// Cycle-12 §1: backward synthesizer for `@checkpoint(policy="full")` —
+/// R0 narrowed to R3/R11/R12 in cycle 12.
 ///
-/// Routed from `synthesize_backward_with_tier` when `config.checkpoint`
-/// is `Some(CheckpointExtras { policy: Full, .. })`. This function emits
-/// **zero PTX**: it runs the v1 refusal cascade and returns the first
-/// matching `Err(_)` so callers learn — at the right altitude — that
-/// the functional recompute path is not yet wired.
+/// R0 narrowed to R3/R11/R12 in cycle 12: the unconditional R0 catch-all
+/// refusal was retired; the cycle-11 structurally-validated PTX path is
+/// now reachable in production for the cycle-12-eligible configuration
+/// set (`level >= 1 && fused_rmsnorm && fused_projections`,
+/// `!(segment_masked && rope_q)`, `!(segment_masked && checkpoint)`,
+/// `num_sink_tokens == 0`, `!paged_kv_collision`, `block_q == block_kv`,
+/// `!tier_b2_hybrid_backward_compile_time_eligible`). Configs outside
+/// the eligible set must refuse with one of the specific R3/R7/R8.1/
+/// R9/R10/R11/R12 messages — there is no catch-all in cycle 12.
 ///
-/// Refusal order (deliberate):
-///   1. **R0** — hard gate at the top. Fires unconditionally once the
-///      dispatch fork has routed here. Cycle 10's first pass synthesized
-///      PTX comments + label substrings to satisfy the G3 structural
-///      probe, but the comment-only post-injection did NOT skip
-///      `kv_load`, did NOT route `emit_prologue_recompute` into
-///      `%k_smem_base` / `%v_smem_base`, and the WengertOp.checkpointed
-///      stamping had zero downstream consumers. That violates cycle-5
-///      invariant `feedback_deferral_must_refuse` — API-surface sprints
-///      that defer downstream emission MUST refuse, not log disclosure.
-///      R0 is lifted in cycle 11 when the functional substitution +
-///      GPU numerical validation (Gate 4) lands.
-///   2. R3 / R7 / R9 / R10 / R8.1 — unchanged textual refusals. In
-///      practice R0 fires first so these are unreachable today, but
-///      they're kept so the codepath is internally consistent (and so
-///      lifting R0 in cycle 11 doesn't simultaneously regress them).
+/// Refusal cascade (cycle 12): R3 (augmented for fused_projections) →
+/// R7 → R9 → R10 → R8.1 → R11 (Tier B.2 + checkpoint composition) →
+/// R12 (segment_masked + checkpoint composition) → SMEM validator →
+/// fall-through to `synthesize_backward_with_tier_b` for the
+/// eligible-config functional emit path.
+///
+/// The cfg-gated `r0_bypass` field on `CheckpointExtras` remains for
+/// cycle-11 test compatibility — it is now a no-op (test-helpers seam,
+/// no longer needed for R0 lift). New tests should not consult it.
 ///
 /// Byte-identity invariant (W11 / Gate 1): when `config.checkpoint.is_none()`
 /// the dispatch fork in `synthesize_backward_with_tier` never reaches this
@@ -1041,6 +1038,7 @@ pub fn synthesize_backward_with_recompute(
     config: &FlashAttentionConfig,
 ) -> Result<String, String> {
     use crate::flash_attention::CheckpointPolicy;
+    use crate::flash_attention_v2::tier_b2::dispatch::tier_b2_hybrid_backward_compile_time_eligible;
 
     // Carrier presence is guaranteed by the dispatch fork at
     // `synthesize_backward_with_tier`. If a caller hits this entry
@@ -1056,123 +1054,121 @@ pub fn synthesize_backward_with_recompute(
         })?;
     let CheckpointPolicy::Full = extras.policy;
 
-    // ── R0: refuse policy="full" until functional recompute lands ────
-    // Phase F (cycle 10 first-pass closure). See module doc above and
-    // `docs/wiki/Checkpoint-v1-Defer-Log.md` § "Cycle 10 first-pass
-    // functional gap closure (R0)" for the full disclosure.
-    //
-    // Cycle-11 §2 test-only bypass seam: when built with `cfg(test)` or
-    // the `test-helpers` Cargo feature AND the caller set
-    // `CheckpointExtras::bypass_r0_for_testing()`, fall through to the
-    // structurally-validated cascade below. In production builds the
-    // `r0_bypass` field doesn't exist (cfg-gated out), so this entire
-    // bypass-read compiles to a literal `false` and R0 always fires.
-    #[cfg(any(test, feature = "test-helpers"))]
-    let r0_bypass = extras.r0_bypass;
-    #[cfg(not(any(test, feature = "test-helpers")))]
-    let r0_bypass = false;
-    if !r0_bypass {
+    // ── R3 (cycle-12 augmented): Non-Level-1-fusible prologue ────────
+    // Cycle 12 augmented R3 with the `fused_projections` requirement —
+    // without staged x_raw + Wk/Wv on the forward path, the backward
+    // kv-recompute would silently no-op (the x_raw_ptr null guard at
+    // csha_hooks_backward.rs early-exits when x_raw is null, leaving
+    // K/V SMEM tiles never written).
+    let prologue_ok = config
+        .csha
+        .as_ref()
+        .map(|c| c.level >= 1 && c.fused_rmsnorm && c.fused_projections)
+        .unwrap_or(false);
+    if !prologue_ok {
         return Err(
-            "@checkpoint(policy=\"full\") refused: CPU codegen substitution wired \
-             (cycle 11) but awaiting GPU numerical validation gate (cycle 12). \
-             kv_load -> recompute routing structurally validated; deferred \
-             until end-to-end gradient correctness confirmed on Blackwell."
+            "@checkpoint(policy=\"full\") requires RMSNorm + fused-projections + RoPE \
+             prologue (Level-1 boundary-fusion chain with x_raw + Wk/Wv staged for \
+             backward recompute) on the forward path; config has no fusible prologue \
+             (level/fused_rmsnorm/fused_projections gate failed). Set \
+             @csha(level=1, fused_rmsnorm=true, fused_projections=true) on the forward \
+             function to enable kv-recompute backward."
                 .to_string(),
         );
     }
 
-    // ── Refusals below are unreachable while R0 is in place (cycle 10
-    //    v1). They are retained verbatim so that lifting R0 in cycle 11
-    //    does not simultaneously regress the cascade. `#[allow]` would
-    //    silence dead_code complaints but the `return Err(...)` above
-    //    is a terminating statement; rustc treats the following block
-    //    as unreachable and `#[allow(unreachable_code)]` keeps the body
-    //    compiling for the cycle-11 lift point.
-    #[allow(unreachable_code)]
-    {
-        // ── R3: Non-Level-1-fusible prologue ─────────────────────────
-        let prologue_ok = config
-            .csha
-            .as_ref()
-            .map(|c| c.level >= 1 && c.fused_rmsnorm)
-            .unwrap_or(false);
-        if !prologue_ok {
-            return Err(
-                "@checkpoint(policy=\"full\") requires RMSNorm to matmul to RoPE \
-                 prologue (Level-1 boundary-fusion chain) on the forward path; \
-                 config has no fusible prologue"
-                    .to_string(),
-            );
-        }
-
-        // ── R7: PCA packing with rope_q=true under @checkpoint ───────
-        if config.segment_masked && config.rope_q {
-            return Err(
-                "PCA packing with rope_q=true under @checkpoint deferred to v4: \
-                 the segment-aware causal mask shares index machinery with the \
-                 RoPE-Q write-back path; safe composition requires the v4 \
-                 rotated-Q SMEM-staging refactor"
-                    .to_string(),
-            );
-        }
-
-        // ── R9: @paged_kv model + @checkpoint fn composition ─────────
-        if extras.paged_kv_collision {
-            return Err(
-                "@checkpoint composition with @paged_kv requires scatter-on-recompute; \
-                 deferred to v4: paged KV cache pages are not byte-stable across the \
-                 recompute boundary in v1"
-                    .to_string(),
-            );
-        }
-
-        // ── R10: Asymmetric tile (block_q != block_kv) + @checkpoint ─
-        if config.block_q != config.block_kv {
-            return Err(format!(
-                "checkpoint policy=\"full\" requires block_q == block_kv in v1; \
-                 asymmetric-tile composition deferred to v2 (got block_q={}, block_kv={})",
-                config.block_q, config.block_kv
-            ));
-        }
-
-        // ── R8.1: sinks-v2 + @checkpoint — UNCONDITIONAL in v1 ───────
-        // The cycle-9 spec carved out an "unless (hd, S) is in verified
-        // smoke set" exception, but Reviewer 1 found the carve-out
-        // referenced `static_seq_len.unwrap_or(0)` which is ALWAYS 0 in
-        // production (`CshaExtras::level1` does not set static_seq_len),
-        // so the carve-out was structurally unreachable. Phase F drops
-        // it and makes R8.1 honest about being unconditional. The
-        // smoke-set carve-out is deferred to v2 (requires GPU
-        // validation), and re-evaluating it requires plumbing
-        // static_seq_len through the wire-up site first.
-        if config.num_sink_tokens > 0 {
-            return Err(
-                "checkpoint policy=\"full\" + sinks-v2 composition refused in v1; \
-                 smoke-set carve-out deferred to v2 (requires GPU validation)"
-                    .to_string(),
-            );
-        }
-
-        // SMEM budget extension (Cut 7 / R5): re-run the scalar v2 validator
-        // with the checkpoint carrier in place so `recompute_extra_bytes` is
-        // counted.
-        smem_layout::validate_scalar_v2_config(config, smem_layout::Direction::Backward)
-            .map_err(|e| format!("backward validator (checkpoint=Full) rejected: {e}"))?;
-
-        // Cycle-11 Task 4 functional emission landing point. When the
-        // refusal cascade above passed (i.e., the config is recompute-
-        // eligible) and R0 was bypassed via the cfg-gated
-        // `bypass_r0_for_testing()` seam, route to the tier-b scalar
-        // synthesizer. That synthesizer's `checkpoint.is_some()`
-        // dispatch fork at the kv_load call site swaps the HBM-load
-        // emitters for `emit_kv_recompute`, which writes recomputed K/V
-        // into `%k_smem_base` / `%v_smem_base` for the downstream
-        // `ds_compute` / `dv_accum` / `dqdk_accum` consumers. GPU
-        // numerical validation (G4: atol=5e-4 rtol=5e-3 at
-        // hd in {64,128}, S in {512, 2048, 4096}) lands in cycle 12 and
-        // lifts R0 in production.
-        synthesize_backward_with_tier_b(config, None)
+    // ── R7: PCA packing with rope_q=true under @checkpoint ───────
+    if config.segment_masked && config.rope_q {
+        return Err(
+            "PCA packing with rope_q=true under @checkpoint deferred to v4: \
+             the segment-aware causal mask shares index machinery with the \
+             RoPE-Q write-back path; safe composition requires the v4 \
+             rotated-Q SMEM-staging refactor"
+                .to_string(),
+        );
     }
+
+    // ── R9: @paged_kv model + @checkpoint fn composition ─────────
+    if extras.paged_kv_collision {
+        return Err(
+            "@checkpoint composition with @paged_kv requires scatter-on-recompute; \
+             deferred to v4: paged KV cache pages are not byte-stable across the \
+             recompute boundary in v1"
+                .to_string(),
+        );
+    }
+
+    // ── R10: Asymmetric tile (block_q != block_kv) + @checkpoint ─
+    if config.block_q != config.block_kv {
+        return Err(format!(
+            "checkpoint policy=\"full\" requires block_q == block_kv in v1; \
+             asymmetric-tile composition deferred to v2 (got block_q={}, block_kv={})",
+            config.block_q, config.block_kv
+        ));
+    }
+
+    // ── R8.1: sinks-v2 + @checkpoint — UNCONDITIONAL in v1 ───────
+    // The cycle-9 spec carved out an "unless (hd, S) is in verified
+    // smoke set" exception, but Reviewer 1 found the carve-out
+    // referenced `static_seq_len.unwrap_or(0)` which is ALWAYS 0 in
+    // production (`CshaExtras::level1` does not set static_seq_len),
+    // so the carve-out was structurally unreachable. Phase F drops
+    // it and makes R8.1 honest about being unconditional. The
+    // smoke-set carve-out is deferred to v2 (requires GPU
+    // validation), and re-evaluating it requires plumbing
+    // static_seq_len through the wire-up site first.
+    if config.num_sink_tokens > 0 {
+        return Err(
+            "checkpoint policy=\"full\" + sinks-v2 composition refused in v1; \
+             smoke-set carve-out deferred to v2 (requires GPU validation)"
+                .to_string(),
+        );
+    }
+
+    // ── R11 (cycle-12 new): Tier B.2 hybrid backward + @checkpoint ─
+    // Tier B.2 hybrid four-kernel backward composes with @checkpoint
+    // only via a coordinated dq/dkdv/d_prepass/proj recompute lift —
+    // deferred to cycle 13. v1 must refuse rather than silently routing
+    // the hybrid path through scalar-v2 kv-recompute (which would
+    // produce wrong gradients for the dq/dkdv MMA tiles).
+    if tier_b2_hybrid_backward_compile_time_eligible(config) {
+        return Err(
+            "@checkpoint(policy=\"full\") + Tier B.2 hybrid backward composition \
+             deferred to cycle 13; configure for scalar-v2 backward or remove \
+             @checkpoint"
+                .to_string(),
+        );
+    }
+
+    // ── R12 (cycle-12 new): segment_masked (PCA Tier-B) + @checkpoint ─
+    // PCA Tier-B planner and kv-recompute are not co-emitted in v1; the
+    // segment-aware tile-active predicate would gate recompute writes
+    // unpredictably. Deferred to a co-emission lift in a later cycle.
+    if config.segment_masked {
+        return Err(
+            "@checkpoint(policy=\"full\") + paged-segment-masked composition deferred; \
+             PCA Tier-B planner and kv-recompute not co-emitted"
+                .to_string(),
+        );
+    }
+
+    // SMEM budget extension (Cut 7 / R5): re-run the scalar v2 validator
+    // with the checkpoint carrier in place so `recompute_extra_bytes` is
+    // counted.
+    smem_layout::validate_scalar_v2_config(config, smem_layout::Direction::Backward)
+        .map_err(|e| format!("backward validator (checkpoint=Full) rejected: {e}"))?;
+
+    // Cycle-12 functional emission landing point — R0 retired. The
+    // refusal cascade above narrows to the eligible-config subset; this
+    // call routes into the tier-b scalar synthesizer whose
+    // `checkpoint.is_some()` dispatch fork at the kv_load call site
+    // swaps the HBM-load emitters for `emit_kv_recompute`, which writes
+    // recomputed K/V into `%k_smem_base` / `%v_smem_base` for the
+    // downstream `ds_compute` / `dv_accum` / `dqdk_accum` consumers.
+    // GPU numerical validation (G4: atol=5e-4 rtol=5e-3 at hd in
+    // {64,128}, S in {512, 2048, 4096}) runs in cycle 13 (cuda-gated
+    // harness).
+    synthesize_backward_with_tier_b(config, None)
 }
 
 /// Sprint 1 T1.4: emit a single PTX module containing BOTH the scalar

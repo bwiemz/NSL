@@ -326,12 +326,19 @@ impl CheckpointExtras {
 
     /// Cycle-11 §2 test-only R0-bypass builder.
     ///
-    /// Returns a carrier with `r0_bypass=true`, enabling the structurally
-    /// validated PTX recompute path under test. The R0 refusal at
-    /// `synthesize_backward_with_recompute` consults `r0_bypass` and skips
-    /// the refusal when this is set. In production the field doesn't exist
-    /// and R0 always fires — so calls to this builder from non-test code
-    /// would fail to compile, which is the desired audit posture.
+    /// **Cycle-12 status: test-helpers seam, no longer needed for R0 lift.**
+    /// R0 was retired in cycle 12 (see `synthesize_backward_with_recompute`
+    /// doc comment). The cfg-gated `r0_bypass` field and this builder
+    /// remain so cycle-11 tests that constructed configs with the bypass
+    /// continue to compile and pass — the field is now a no-op flag, and
+    /// the production R0 refusal it once skipped no longer exists.
+    ///
+    /// Returns a carrier with `r0_bypass=true`. In cycle 11 the R0
+    /// refusal at `synthesize_backward_with_recompute` consulted
+    /// `r0_bypass` and skipped the refusal when set. In production the
+    /// field doesn't exist (cfg-gated out) — so calls to this builder
+    /// from non-test code would fail to compile, which is the desired
+    /// audit posture.
     #[cfg(any(test, feature = "test-helpers"))]
     pub fn bypass_r0_for_testing(mut self) -> Self {
         self.r0_bypass = true;
@@ -420,6 +427,29 @@ impl CshaExtras {
             skip_rmsnorm_prologue: false,
             static_seq_len: None,
         }
+    }
+
+    /// Cycle-12 R3 augmentation: Level-1 preset with `fused_projections=true`
+    /// AND `save_activations_for_backward=true` so the forward path stages
+    /// `x_raw` + `Wk/Wv` for the backward kv-recompute. Matches the
+    /// cycle-12-eligible R3 predicate
+    /// (`level >= 1 && fused_rmsnorm && fused_projections`).
+    ///
+    /// `d_model` must be set externally (mirrors `level2`/`level3`); the
+    /// fused-projections SMEM tile size depends on it.
+    ///
+    /// Used by:
+    ///   - tests/checkpoint_cycle11_structural.rs build_bypass_config
+    ///   - tests/checkpoint_v1_integration.rs base_fusible (via field set)
+    ///   - compiler/kernel.rs T1 wire-up (when @checkpoint policy=Full is
+    ///     present on a fn in the @train block)
+    pub fn level1_with_fused_proj(rmsnorm_eps: f32) -> Self {
+        let mut x = Self::level1(rmsnorm_eps);
+        x.fused_projections = true;
+        // T4 (cycle 12): auto-enable forward x_raw save so backward
+        // kv-recompute reads non-null x_raw_ptr.
+        x.save_activations_for_backward = true;
+        x
     }
 
     /// CSHA level 2 preset — full projection pipelining.

@@ -29,9 +29,14 @@ use nsl_codegen::flash_attention_v2::synthesize_backward_with_tier;
 
 /// A backward-safe Level-1-fusible CSHA config that satisfies all v1
 /// recompute preconditions (block_q == block_kv, no sinks, no PCA-rope_q
-/// composition) AND sets `r0_bypass=true` so the codegen path falls
-/// through R0 into the cycle-11 substitution.
+/// composition) AND uses the cycle-12 `level1_with_fused_proj` builder
+/// so the cycle-12 R3 augmentation (which now also requires
+/// `fused_projections=true`) is satisfied. The `r0_bypass=true` field
+/// is retained from cycle 11 — it's now a no-op since R0 was retired
+/// in cycle 12, but kept for compile/test compatibility.
 fn build_bypass_config() -> FlashAttentionConfig {
+    let mut csha = CshaExtras::level1_with_fused_proj(1e-6);
+    csha.d_model = 32;
     FlashAttentionConfig {
         block_q: 32,
         block_kv: 32,
@@ -45,7 +50,7 @@ fn build_bypass_config() -> FlashAttentionConfig {
         num_sink_tokens: 0,
         gpu_sm: 75,
         segment_masked: false,
-        csha: Some(CshaExtras::level1(1e-6)),
+        csha: Some(csha),
         checkpoint: Some(CheckpointExtras::full().bypass_r0_for_testing()),
     }
 }
