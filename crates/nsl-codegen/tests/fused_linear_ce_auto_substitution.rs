@@ -686,12 +686,23 @@ fn no_transpose_pattern_deferred_to_v5() {
 // v5 should NOT have changed substitution behaviour — substitution is
 // orthogonal to dtype, the dtype only affects downstream lowering).
 //
-// Combined with the activation IR tests in
-// `fused_lm_ce_activation_end_to_end.rs`, this re-establishes positive
-// coverage of the bf16/fp16 path from source → wengert → IR.
+// CFTP v6 Finding 13 (MEDIUM): these tests exercise the WengertExtractor
+// only (`extract_first_fn` stops there); they do NOT invoke
+// `compile_wengert_ops` and therefore do NOT exercise the v6
+// `maybe_precision_cast_inputs` lowering.  The claim they pin is
+// narrow: "auto-substitution recognition is dtype-orthogonal at the
+// wengert layer".  The end-to-end cast-emission claim is pinned in
+// `fused_lm_ce_e2e_{fp16,bf16}_activation.rs` (Phase 1 IR-shape
+// assertions) and in `fused_linear_ce_precision_cast_lowering.rs` (the
+// IR-emission contract for the cast wrappers themselves).
 
+/// Narrow scope per Finding 13: the WengertExtractor sees `dtype=Bf16`
+/// on the decorator config and STILL recognises the fused_linear_ce
+/// pattern (substitution is dtype-orthogonal at the wengert layer).
+/// This test does NOT exercise the v6 precision-cast lowering — see
+/// the module comment block above.
 #[test]
-fn auto_substitution_fires_with_bf16_dtype_hint() {
+fn wengert_recognition_is_dtype_orthogonal_under_bf16_hint() {
     let cfg = FusedCeDecoratorConfig {
         enabled: true,
         vocab_tile: Some(1024),
@@ -718,8 +729,11 @@ fn auto_substitution_fires_with_bf16_dtype_hint() {
     );
 }
 
+/// Mirror of the bf16 test under fp16 — pins the same wengert-layer
+/// dtype-orthogonal recognition (Finding 13: this is NOT an end-to-end
+/// cast-emission test; see module comment).
 #[test]
-fn auto_substitution_fires_with_fp16_dtype_hint() {
+fn wengert_recognition_is_dtype_orthogonal_under_fp16_hint() {
     let cfg = FusedCeDecoratorConfig {
         enabled: true,
         vocab_tile: Some(1024),

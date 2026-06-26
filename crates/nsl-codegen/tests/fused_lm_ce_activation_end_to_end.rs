@@ -50,12 +50,14 @@
 //! Finding 7's buffer-conformance gap (wengert tape emits f32 buffers,
 //! kernel reads bf16/fp16) is NOT observed by any test in this file.
 //!
-//! Mitigation: see `crates/nsl-runtime/src/fused_linear_ce.rs::refuse_non_f32_if_gated`
-//! — the runtime FFI can be hardened against this gap via the
-//! `NSL_FUSED_LCE_REFUSE_NON_F32=1` env var.  A CUDA-gated end-to-end
-//! test driving the full pipeline (NSL source → compile_wengert_ops →
-//! JIT → execute → compare against CPU f64 reference) is the v6 ladder
-//! step that closes the gap structurally.
+//! Mitigation (Sprint v6): wengert_lower now inserts an explicit
+//! `nsl_tensor_to_{bf16,fp16}` precision_cast op into the Cranelift IR
+//! before the FFI call whenever `dtype_tag != 0`, closing the gap
+//! structurally.  The v5 opt-in runtime refusal
+//! (`NSL_FUSED_LCE_REFUSE_NON_F32`) has been REMOVED.  A CUDA-gated
+//! end-to-end test driving the full pipeline (NSL source →
+//! compile_wengert_ops → JIT → execute → compare against CPU f64
+//! reference) remains a follow-on validation step.
 
 #![cfg(feature = "test-helpers")]
 

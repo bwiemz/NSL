@@ -253,8 +253,16 @@ pub(crate) fn f16_bits_to_f32(bits: u16) -> f32 {
     }
 }
 
-/// Convert f32 to IEEE 754 half-precision (f16) bits (round-to-nearest-even on truncation).
-/// Mirror of `f16_bits_to_f32`; saturates to ±Inf on overflow, flushes to zero on underflow.
+/// Convert f32 to IEEE 754 half-precision (f16) bits.
+///
+/// IMPORTANT: This **truncates** the lower 13 mantissa bits (one-sided bias
+/// toward zero). It is NOT round-to-nearest-even. Worst-case relative error
+/// approaches the f16 unit roundoff (~9.77e-4) rather than half-ULP (~4.88e-4).
+/// For IEEE-compliant RTE rounding (e.g. matching PTX `cvt.rn.f16.f32` or
+/// `half::f16::from_f32`), use the `half` crate; CFTP v6's fast cast path
+/// reuses this primitive as-is and the rounding gap is deferred to v7 (see
+/// `tensor/precision_cast.rs` module note). Saturates to ±Inf on overflow,
+/// flushes to zero on underflow.
 #[inline]
 pub(crate) fn f32_to_f16_bits(val: f32) -> u16 {
     let bits = val.to_bits();
@@ -283,7 +291,15 @@ pub(crate) fn bf16_bits_to_f32(bits: u16) -> f32 {
     f32::from_bits((bits as u32) << 16)
 }
 
-/// Convert f32 to bf16 bits (truncate lower 16 bits).
+/// Convert f32 to bf16 bits.
+///
+/// IMPORTANT: This **truncates** the lower 16 bits of the f32 (one-sided bias
+/// toward zero). It is NOT round-to-nearest-even — worst-case relative error
+/// approaches the bf16 unit roundoff (~7.81e-3) rather than half-ULP. For
+/// IEEE-compliant RTE rounding (e.g. matching PTX `cvt.rn.bf16.f32` or
+/// `half::bf16::from_f32`), use the `half` crate; CFTP v6's fast cast path
+/// reuses this primitive as-is and the rounding gap is deferred to v7 (see
+/// `tensor/precision_cast.rs` module note).
 #[inline]
 pub(crate) fn f32_to_bf16_bits(val: f32) -> u16 {
     (val.to_bits() >> 16) as u16

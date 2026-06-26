@@ -505,6 +505,33 @@ pub struct Compiler<'a> {
     /// requires.  Populated by the forward lowering arm and consumed (with
     /// eviction on the last extract) by `FusedLinearCeBackwardExtract`.
     pub fused_ce_fwd_lse: HashMap<Value, Value>,
+    /// CFTP v6 Findings 10/14 (cache forward casts across fwd/bwd) +
+    /// Finding 16 (pair dtype with cached value).  Stores `(x_cast,
+    /// w_cast, bias_cast, dtype_tag)` keyed by the forward
+    /// `FusedLinearCe` result Value so the symmetric backward extract
+    /// can REUSE the forward's precision-cast shadow buffers instead
+    /// of emitting three more `nsl_tensor_to_{bf16,fp16}` calls per
+    /// step.  The `dtype_tag` slot lets the backward arm cross-check
+    /// the cached cast bytes match the current backward's dtype — a
+    /// mismatch (e.g. a curriculum that flips dtype mid-step) surfaces
+    /// as a CodegenError rather than silently reusing the wrong cast.
+    ///
+    /// Memory savings: ~430MB for V=49152/H=4096/B=2/S=4096 — the v6
+    /// docstring at `lower_fused_linear_ce_forward` quoted `(B*S*H +
+    /// V*H + V) * 2 bytes` as the cost PER forward+backward step, but
+    /// the v6 implementation emitted SIX casts per dispatch (forward
+    /// three + backward three), doubling the actual cost.  This cache
+    /// brings the v6 implementation in line with the docstring.
+    ///
+    /// Eviction: the same lifecycle as `fused_ce_bwd_cache` — the
+    /// backward dispatch's last-component extract (component=2)
+    /// evicts the cast cache alongside the `[dx, dW, dbias]` slots.
+    /// On a forward-only compile (no backward in the same module),
+    /// the cache entries remain in the compiler and are dropped when
+    /// the `Compiler` itself is dropped — no scope-sweep involvement
+    /// because the `Value` handles point at IR-emitted call results,
+    /// not runtime tensors.
+    pub fused_ce_fwd_casts: HashMap<Value, (Value, Value, Value, i64)>,
     /// Three-slot side-channel for the fused linear-CE backward outputs
     /// (`dx`, `dW`, `dbias`) keyed by the forward result Value.  Populated
     /// by component=0's lowering arm via `nsl_fused_linear_ce_backward`;
@@ -796,6 +823,7 @@ impl<'a> Compiler<'a> {
             flash_attn_bwd_cache: HashMap::new(),
             csha_fused_bwd_cache: HashMap::new(),
             fused_ce_fwd_lse: HashMap::new(),
+            fused_ce_fwd_casts: HashMap::new(),
             fused_ce_bwd_cache: HashMap::new(),
             wrga_inputs: options.wrga_inputs.clone(),
             last_wrga_plan: None,
