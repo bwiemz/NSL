@@ -26,19 +26,19 @@
 //! a v7 on-device cast kernel + a model-weight-pinned W shadow buffer
 //! lifts the cost out of the loop entirely.
 //!
-//! Finding 7 (HIGH, RTE rounding gap): the underlying `f32_to_f16_bits`
-//! / `f32_to_bf16_bits` primitives TRUNCATE rather than round-to-
+//! Finding 7 (HIGH, RTE rounding gap): the underlying CPU primitives
+//! `f32_to_f16_bits` / `f32_to_bf16_bits` TRUNCATE rather than round-to-
 //! nearest-even, producing a one-sided bias of up to one full unit
-//! roundoff per element.  Real RTE rounding is the design-doc §10
-//! deferred ladder step.  The Findings 1/6/12 fix (default-on FFI
-//! refusal) blocks the wengert-driven production path from reaching
-//! the kernel today, so the rounding-bias hazard is DORMANT under v6:
-//! direct-FFI tests that opt-in via `NSL_FUSED_LCE_ALLOW_NON_F32_FFI=1`
-//! stage their bytes via `half::*::from_f32` (RTE) and so are
-//! unaffected.  A v7 follow-on must (a) implement RTE in the
-//! primitives, (b) re-measure the V=49152 baselines via the production
-//! path (not via `half::from_f32`), and (c) lift the FFI refusal once
-//! the device-side cast kernel + RTE primitives are both ready.
+//! roundoff per element.  CFTP v7 closes the GAP on the production GPU
+//! path by routing GPU tensors through `gpu_cast_and_publish` →
+//! PTX `cvt.rn.{f16,bf16}.f32` (IEEE-754 default RTE), so the
+//! production wengert lowering matches the `half::*::from_f32`
+//! rounding used by the V=49152 baselines.  The CPU primitives'
+//! truncation lives only on CPU staging paths that real training runs
+//! do not exercise; aligning the CPU primitives to RTE is the §10
+//! deferred ladder step.  With v7 the FFI refusal at
+//! `fused_linear_ce.rs` is LIFTED — `NSL_FUSED_LCE_REFUSE_NON_F32=1`
+//! remains as an opt-in diagnostic / safety override.
 
 use std::ffi::c_void;
 

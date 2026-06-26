@@ -13,7 +13,7 @@
 //! call site); this module does NOT synthesise PTX — that lives in
 //! `nsl-codegen::fused_linear_ce`.
 //!
-//! # CFTP v6 — structural buffer-conformance via wengert precision_cast
+//! # CFTP v7 — GPU-side precision_cast kernel lifts the v6 FFI refusal
 //!
 //! When `dtype_tag != 0` (fp16 or bf16), the caller MUST allocate
 //! `x_ptr` / `w_ptr` / `bias_ptr` in HBM with a layout matching the dtype:
@@ -27,67 +27,80 @@
 //! `crates/nsl-codegen/src/wengert_lower.rs::lower_fused_linear_ce_forward`
 //! (and the symmetric `..._backward_extract`) inserts an explicit
 //! `nsl_tensor_to_{bf16,fp16}` cast op into the Cranelift IR before the
-//! FFI call whenever `dtype_tag != 0`.
+//! FFI call whenever `dtype_tag != 0`.  The cast op publishes a fresh
+//! 16-bit storage tensor with the dtype-compliant HBM layout above, so the
+//! production lowering can no longer reach the kernel with a malformed
+//! buffer.
 //!
-//! ## Adversarial-review remediation (Findings 1 / 6 / 12 — HIGH)
+//! ## CFTP v7 — lifting the default-on FFI refusal
 //!
-//! The structural cast (`cast_and_publish` in
-//! `runtime/src/tensor/precision_cast.rs`) is CPU-only in v6 — it asserts
-//! `t.device == 0` and panics on a GPU tensor (with an `extern "C"` abort
-//! that ends the process). A real training step lowered through the
-//! wengert dispatch passes GPU x/W/bias straight into `nsl_tensor_to_bf16`
-//! and so would abort. To keep the FFI safe until the v7 device-side cast
-//! kernel lands, this module ALSO enforces the dtype-conformance contract
-//! at the FFI boundary by REFUSING `dtype_tag != 0` with a clear
-//! diagnostic and a `-1` return code — preserving the Deferral-must-refuse
-//! invariant. The refusal is the safe interim per the Findings 1/6/12 fix
-//! options (option a: keep the refusal until a real device-side cast kernel
-//! lands; the v6 structural cast is INCOMPLETE for the GPU path the FFI
-//! requires).
+//! The v6 default-on FFI refusal (`refuse_non_f32_if_unsafe`) was a safe
+//! interim because `cast_and_publish` was CPU-only: it asserted
+//! `t.device == 0` and aborted on any GPU tensor, so the structural cast
+//! could not actually run on the production GPU path the FFI requires.
+//! Sprint v7 closes that gap end-to-end:
 //!
-//! Callers that want to exercise the manually-staged direct-FFI numerical
-//! path (`fused_linear_ce_{fp16,bf16}_v49152_numerical.rs` allocates
-//! compliant 16-bit device buffers explicitly) can set the
-//! `NSL_FUSED_LCE_ALLOW_NON_F32_FFI=1` opt-in escape valve — those tests
-//! KNOW the buffers are dtype-compliant because they staged them
-//! themselves. The wengert-driven production path never sets that env
-//! var, so a malformed buffer reaching the kernel produces a clean refusal
-//! rather than silent corruption (the v5 invariant restored).
+//!   1. `cast_and_publish` now accepts GPU tensors and routes them through
+//!      `gpu_cast_and_publish` (commit 30f2183c).
+//!   2. The GPU cast kernels (`crates/nsl-codegen/src/precision_cast_ptx.rs`,
+//!      commit 3cc13824) emit `cvt.rn.{bf16,f16}.f32` — IEEE-754 default
+//!      round-to-nearest-even — matching the host `half::*::from_f32`
+//!      rounding used by the direct-FFI numerical baselines.
+//!   3. The CPU primitives' truncation gap is closed by the same RTE PTX
+//!      kernels on the production GPU path; the dormant CPU-only
+//!      truncation lives only on CPU staging paths that real training
+//!      runs do not exercise.
+//!   4. V=49152 baselines have been re-measured via the production
+//!      wengert path (the e2e fp16/bf16 activation tests
+//!      `fused_lm_ce_e2e_{fp16,bf16}_activation.rs`), removing the
+//!      `half::from_f32` shortcut.
+//!   5. The forward-to-backward precision-cast cache from commit 475b7b08
+//!      remains in effect (Findings 10/14/16): one cast set per dispatch
+//!      shared across forward and backward.
+//!
+//! With those preconditions met, the v6 default-on refusal is REMOVED:
+//! `dtype_tag != 0` now reaches the kernel directly, and the
+//! `NSL_FUSED_LCE_ALLOW_NON_F32_FFI` opt-in env var becomes a no-op (we
+//! leave it unhandled so any straggler CI invocations fall through
+//! harmlessly).  The F32 (`dtype_tag == 0`) byte-identity contract is
+//! preserved — that path was never gated by the refusal.
+//!
+//! ## Diagnostic / safety override (`NSL_FUSED_LCE_REFUSE_NON_F32=1`)
+//!
+//! As an operator escape hatch for diagnosing a suspected dtype-conformance
+//! regression in a downstream build (e.g. a future codegen change that
+//! drops the wengert `nsl_tensor_to_{bf16,fp16}` insertion), setting
+//! `NSL_FUSED_LCE_REFUSE_NON_F32=1` reinstates the v6 behavior: the FFI
+//! returns `-1` with a clear diagnostic when `dtype_tag != 0`.  This is
+//! OFF by default — production runs never set the var — so the v7
+//! activation contract is preserved.
 
-/// CFTP v6 Findings 1/6/12 (HIGH): inverse-deferral guard.
+/// CFTP v7 diagnostic / safety override.
 ///
-/// The Sprint v5 env-guarded refusal was REMOVED in d61e8282 on the
-/// assumption that the wengert structural cast closes the gap — but
-/// `cast_and_publish` panics on any GPU tensor, so the structural cast
-/// cannot run on the production path it is supposed to fix. Restore the
-/// refusal as a default-on safety net: when `dtype_tag != 0` the FFI
-/// returns `-1` with a clear diagnostic UNLESS the caller has explicitly
-/// opted into the manually-staged path via `NSL_FUSED_LCE_ALLOW_NON_F32_FFI=1`.
+/// OFF by default: `dtype_tag != 0` proceeds straight to the kernel because
+/// the v7 preconditions (GPU cast kernel + RTE + cache + re-measured
+/// baselines) are met.  When `NSL_FUSED_LCE_REFUSE_NON_F32=1` is set, the
+/// v6 default-on refusal is reinstated for diagnostic purposes — useful for
+/// confirming a suspected dtype-conformance regression in a downstream
+/// build without rebuilding the runtime.
 ///
-/// Returns `true` if the call should refuse (i.e. caller should return `-1`
+/// Returns `true` if the call should refuse (caller returns `-1`
 /// immediately); `false` if the call should proceed normally.
 #[inline]
 fn refuse_non_f32_if_unsafe(dtype_tag: i64, ffi_name: &str) -> bool {
     if dtype_tag == 0 {
         return false;
     }
-    // Opt-in escape valve for direct-FFI numerical tests that stage
-    // dtype-compliant device buffers themselves. The wengert-driven
-    // production path NEVER sets this var, so a malformed buffer is
-    // refused cleanly rather than silently corrupting the kernel reads.
-    if std::env::var_os("NSL_FUSED_LCE_ALLOW_NON_F32_FFI").is_some() {
+    if std::env::var_os("NSL_FUSED_LCE_REFUSE_NON_F32").is_none() {
         return false;
     }
     eprintln!(
-        "{ffi_name}: refusing dtype_tag={dtype_tag} — the v6 wengert \
-         precision_cast (`nsl_tensor_to_{{bf16,fp16}}`) does not support \
-         GPU tensors (asserts t.device==0). Set \
-         NSL_FUSED_LCE_ALLOW_NON_F32_FFI=1 to opt into the manually-staged \
-         direct-FFI path (callers must allocate dtype-compliant 16-bit HBM \
-         buffers themselves). Restoring the v5 default-on refusal per \
-         Findings 1/6/12; the silent-corruption hazard the v5 refusal \
-         guarded was reintroduced when the structural cast turned out to \
-         be CPU-only.",
+        "{ffi_name}: NSL_FUSED_LCE_REFUSE_NON_F32=1 set; refusing \
+         dtype_tag={dtype_tag}.  The v7 production path is now safe by \
+         default (GPU PTX cast kernel + RTE rounding + wengert-inserted \
+         precision_cast); this env var is an opt-in diagnostic override \
+         for confirming a suspected dtype-conformance regression.  Unset \
+         it to restore normal v7 activation.",
     );
     true
 }
@@ -146,11 +159,13 @@ pub extern "C" fn nsl_fused_linear_ce_forward(
     smem_bytes: i64,
     dtype_tag: i64,
 ) -> i64 {
-    // CFTP v6 Findings 1/6/12: default-on dtype refusal.  The v6 structural
-    // cast (`cast_and_publish`) panics on GPU tensors, so it cannot run on
-    // the production wengert path; refuse here unless the caller has opted
-    // into the manually-staged direct-FFI path via
-    // `NSL_FUSED_LCE_ALLOW_NON_F32_FFI=1`.
+    // CFTP v7: the v6 default-on dtype refusal has been LIFTED.  All four
+    // preconditions in the module docstring are now satisfied (GPU cast
+    // kernel, RTE rounding, cache reuse, V=49152 re-measured baselines)
+    // and the production wengert path inserts the precision_cast op into
+    // the Cranelift IR before this FFI is reached.  F32 stays byte-identical.
+    // Setting `NSL_FUSED_LCE_REFUSE_NON_F32=1` reinstates the v6 refusal as
+    // an operator-facing diagnostic override.
     if refuse_non_f32_if_unsafe(dtype_tag, "nsl_fused_linear_ce_forward") {
         return -1;
     }
@@ -255,7 +270,7 @@ pub extern "C" fn nsl_fused_linear_ce_forward_large(
     smem_bytes: i64,
     dtype_tag: i64,
 ) -> i64 {
-    // CFTP v6 Findings 1/6/12: default-on dtype refusal (see forward).
+    // CFTP v7: refusal lifted — see forward FFI above for the rationale.
     if refuse_non_f32_if_unsafe(dtype_tag, "nsl_fused_linear_ce_forward_large") {
         return -1;
     }
@@ -351,7 +366,7 @@ pub extern "C" fn nsl_fused_linear_ce_backward(
     smem_bytes: i64,
     dtype_tag: i64,
 ) -> i64 {
-    // CFTP v6 Findings 1/6/12: default-on dtype refusal (see forward).
+    // CFTP v7: refusal lifted — see forward FFI above for the rationale.
     if refuse_non_f32_if_unsafe(dtype_tag, "nsl_fused_linear_ce_backward") {
         return -1;
     }
@@ -403,33 +418,32 @@ pub extern "C" fn nsl_fused_linear_ce_backward(
 }
 
 #[cfg(test)]
-mod v6_default_refusal_tests {
-    //! CFTP v6 Findings 1/6/12 (HIGH): the FFI dtype refusal is RESTORED
-    //! and now DEFAULT-ON for `dtype_tag != 0`, because the v6 structural
-    //! cast (`cast_and_publish`) is CPU-only and panics on GPU tensors —
-    //! it cannot run on the production wengert path. The opt-in escape
-    //! valve `NSL_FUSED_LCE_ALLOW_NON_F32_FFI=1` lets manually-staged
-    //! direct-FFI numerical tests proceed.
+mod v7_default_activation_tests {
+    //! CFTP v7: the v6 default-on FFI dtype refusal is LIFTED.  By default,
+    //! `dtype_tag != 0` proceeds straight to the kernel because all four
+    //! v7 preconditions (GPU PTX cast, RTE rounding, cache reuse,
+    //! re-measured V=49152 baselines) are satisfied and the wengert
+    //! lowering inserts an explicit `nsl_tensor_to_{bf16,fp16}` op into
+    //! the IR before the FFI is reached.
     //!
-    //! These tests run on BOTH CUDA-enabled and CUDA-disabled lanes — the
-    //! refusal short-circuits BEFORE the cuda-gated launcher, so the same
-    //! `-1` return is observable on either build profile.  This closes
-    //! Finding 5 (LOW): the v5 negative-pin only ran on `cfg(not(cuda))`.
+    //! `NSL_FUSED_LCE_REFUSE_NON_F32=1` remains respected as an opt-in
+    //! diagnostic / safety override for confirming a suspected
+    //! dtype-conformance regression without rebuilding the runtime.
 
     /// Tests serialize on this mutex so env-var manipulation does not race
     /// across parallel test threads.  std::env::set_var is not thread-safe.
     static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    /// RAII guard for the opt-in escape-valve env var.
+    /// RAII guard for the v7 diagnostic-override env var.
     struct EnvGuard {
         prev: Option<std::ffi::OsString>,
     }
     impl EnvGuard {
         fn set(value: Option<&str>) -> Self {
-            let prev = std::env::var_os("NSL_FUSED_LCE_ALLOW_NON_F32_FFI");
+            let prev = std::env::var_os("NSL_FUSED_LCE_REFUSE_NON_F32");
             match value {
-                Some(v) => std::env::set_var("NSL_FUSED_LCE_ALLOW_NON_F32_FFI", v),
-                None => std::env::remove_var("NSL_FUSED_LCE_ALLOW_NON_F32_FFI"),
+                Some(v) => std::env::set_var("NSL_FUSED_LCE_REFUSE_NON_F32", v),
+                None => std::env::remove_var("NSL_FUSED_LCE_REFUSE_NON_F32"),
             }
             EnvGuard { prev }
         }
@@ -437,74 +451,99 @@ mod v6_default_refusal_tests {
     impl Drop for EnvGuard {
         fn drop(&mut self) {
             match &self.prev {
-                Some(v) => std::env::set_var("NSL_FUSED_LCE_ALLOW_NON_F32_FFI", v),
-                None => std::env::remove_var("NSL_FUSED_LCE_ALLOW_NON_F32_FFI"),
+                Some(v) => std::env::set_var("NSL_FUSED_LCE_REFUSE_NON_F32", v),
+                None => std::env::remove_var("NSL_FUSED_LCE_REFUSE_NON_F32"),
             }
         }
     }
 
-    /// Forward dtype_tag=2 (bf16) MUST refuse with `-1` by default on
-    /// both cuda-enabled and cuda-disabled lanes.  The refusal fires
-    /// BEFORE the `#[cfg(feature="cuda")]` launcher block, so pointer args
-    /// are never read — null pointers are safe input.
+    /// F32 (dtype_tag=0) MUST NOT trigger the refusal — this pins the
+    /// byte-identity contract that the F32 fast path is never gated on
+    /// env vars.
     #[test]
-    fn default_refuses_bf16_dtype_tag_forward_without_env_opt_in() {
+    fn f32_dtype_tag_never_refuses() {
         let _lk = ENV_MUTEX.lock().unwrap();
-        let _g = EnvGuard::set(None); // ensure unset
+        let _g = EnvGuard::set(None);
+        assert!(
+            !super::refuse_non_f32_if_unsafe(0, "test"),
+            "dtype_tag=0 must never refuse — F32 byte-identity contract"
+        );
+        // Even with the diagnostic override on, F32 must still proceed.
+        let _g2 = EnvGuard::set(Some("1"));
+        assert!(
+            !super::refuse_non_f32_if_unsafe(0, "test"),
+            "F32 byte-identity contract holds even with diagnostic override on"
+        );
+    }
+
+    /// By default (no env var set), the v7 helper MUST allow dtype_tag=1/2
+    /// through — the GPU PTX cast kernel + wengert-inserted precision_cast
+    /// make the path safe without an opt-in.
+    #[test]
+    fn bf16_dtype_tag_activates_by_default() {
+        let _lk = ENV_MUTEX.lock().unwrap();
+        let _g = EnvGuard::set(None);
+        assert!(
+            !super::refuse_non_f32_if_unsafe(2, "test"),
+            "v7 default: dtype_tag=2 (bf16) must proceed to the kernel"
+        );
+    }
+
+    /// Mirror for fp16 (dtype_tag=1).
+    #[test]
+    fn fp16_dtype_tag_activates_by_default() {
+        let _lk = ENV_MUTEX.lock().unwrap();
+        let _g = EnvGuard::set(None);
+        assert!(
+            !super::refuse_non_f32_if_unsafe(1, "test"),
+            "v7 default: dtype_tag=1 (fp16) must proceed to the kernel"
+        );
+    }
+
+    /// Diagnostic-override path: NSL_FUSED_LCE_REFUSE_NON_F32=1 reinstates
+    /// the v6 refusal for diagnosing a downstream regression without
+    /// rebuilding the runtime.
+    #[test]
+    fn diagnostic_override_refuses_bf16_dtype_tag() {
+        let _lk = ENV_MUTEX.lock().unwrap();
+        let _g = EnvGuard::set(Some("1"));
+        assert!(
+            super::refuse_non_f32_if_unsafe(2, "test"),
+            "NSL_FUSED_LCE_REFUSE_NON_F32=1 must reinstate the v6 refusal for dtype_tag=2"
+        );
+        assert!(
+            super::refuse_non_f32_if_unsafe(1, "test"),
+            "NSL_FUSED_LCE_REFUSE_NON_F32=1 must reinstate the v6 refusal for dtype_tag=1"
+        );
+    }
+
+    /// Diagnostic-override applied at the forward FFI entry point: the
+    /// short-circuit returns -1 BEFORE the launcher block, so null
+    /// pointer args are safe.
+    #[test]
+    fn ffi_forward_honors_diagnostic_override() {
+        let _lk = ENV_MUTEX.lock().unwrap();
+        let _g = EnvGuard::set(Some("1"));
         let rc = super::nsl_fused_linear_ce_forward(
             0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 0, 2,
         );
         assert_eq!(
             rc, -1,
-            "dtype_tag=2 (bf16) must refuse without NSL_FUSED_LCE_ALLOW_NON_F32_FFI; \
-             the v6 structural cast is CPU-only and cannot ensure conformance."
+            "FFI must short-circuit with -1 when diagnostic override is set"
         );
     }
 
-    /// Mirror for fp16 dtype_tag=1.
+    /// Same for backward.
     #[test]
-    fn default_refuses_fp16_dtype_tag_forward_without_env_opt_in() {
+    fn ffi_backward_honors_diagnostic_override() {
         let _lk = ENV_MUTEX.lock().unwrap();
-        let _g = EnvGuard::set(None);
-        let rc = super::nsl_fused_linear_ce_forward(
-            0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 0, 1,
-        );
-        assert_eq!(rc, -1, "dtype_tag=1 (fp16) must refuse without opt-in");
-    }
-
-    /// Mirror for backward.
-    #[test]
-    fn default_refuses_bf16_dtype_tag_backward_without_env_opt_in() {
-        let _lk = ENV_MUTEX.lock().unwrap();
-        let _g = EnvGuard::set(None);
+        let _g = EnvGuard::set(Some("1"));
         let rc = super::nsl_fused_linear_ce_backward(
             0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 2,
         );
-        assert_eq!(rc, -1, "backward dtype_tag=2 must refuse without opt-in");
-    }
-
-    /// F32 (dtype_tag=0) MUST NOT trigger the refusal.  On a non-cuda build
-    /// the FFI returns `-1` for the compiled-without-cuda reason, but the
-    /// refusal helper itself must return `false` (no refusal).  This pins
-    /// the contract that the F32 byte-identity path is never blocked.
-    #[test]
-    fn f32_dtype_tag_does_not_trigger_refusal() {
-        assert!(
-            !super::refuse_non_f32_if_unsafe(0, "test"),
-            "dtype_tag=0 must never refuse — F32 byte-identity contract"
-        );
-    }
-
-    /// Opt-in escape valve via NSL_FUSED_LCE_ALLOW_NON_F32_FFI=1 allows
-    /// dtype_tag=1/2 to proceed past the refusal helper.
-    #[test]
-    fn env_opt_in_disables_refusal_for_bf16_dtype_tag() {
-        let _lk = ENV_MUTEX.lock().unwrap();
-        let _g = EnvGuard::set(Some("1"));
-        assert!(
-            !super::refuse_non_f32_if_unsafe(2, "test"),
-            "with NSL_FUSED_LCE_ALLOW_NON_F32_FFI=1 set, dtype_tag=2 must NOT refuse \
-             (escape valve for manually-staged direct-FFI numerical tests)."
+        assert_eq!(
+            rc, -1,
+            "backward FFI must short-circuit with -1 when diagnostic override is set"
         );
     }
 }
