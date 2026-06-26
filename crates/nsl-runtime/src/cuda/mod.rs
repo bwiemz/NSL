@@ -9,6 +9,7 @@ pub(crate) mod kernels;
 pub(crate) mod fused_kernels;
 pub(crate) mod fused_ce_kernels;
 pub(crate) mod kernels_hopper;
+pub(crate) mod precision_cast_kernels;
 pub(crate) mod tier_b1_prepass;
 
 #[cfg(feature = "cuda")]

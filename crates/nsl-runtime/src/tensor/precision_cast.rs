@@ -175,34 +175,139 @@ pub extern "C" fn nsl_tensor_to_f32(src_ptr: i64) -> i64 {
     cast_and_publish(src_ptr, DTYPE_F32)
 }
 
+/// CFTP v7: GPU dispatch for the v6 cast wrappers.
+///
+/// Allocates a device-side destination buffer, launches the appropriate PTX
+/// cast kernel, and publishes the result so the scope sweep reclaims it.
+/// `t` MUST already be device-resident and contiguous (the caller guards
+/// both before reaching this function).
+///
+/// Same-dtype "casts" (e.g. F32->F32) are handled via `cuMemcpyDtoD` rather
+/// than a kernel — there is no PTX cast pair for them. bf16<->fp16 are NOT
+/// supported by a single kernel; the caller would have to stage via f32.
+/// For the v7 surface (which is only reachable from the three v6 wrappers)
+/// every legitimate (src,target) pair is covered.
+#[cfg(feature = "cuda")]
+fn gpu_cast_and_publish(t: &NslTensor, target_dtype: u16) -> i64 {
+    use crate::cuda::precision_cast_kernels;
+
+    let len = t.len as usize;
+    let target_elem_size: usize = match target_dtype {
+        DTYPE_F32 => 4,
+        DTYPE_FP16 => 2,
+        DTYPE_BF16 => 2,
+        other => panic!(
+            "gpu_cast_and_publish: unsupported target dtype {other} (v7: F32/FP16/BF16)"
+        ),
+    };
+
+    // Allocate the device-side destination buffer via the runtime's managed
+    // allocator (same path as every other GPU op; participates in the
+    // caching allocator + OOM recovery).
+    let dst_bytes = len * target_elem_size;
+    let dst_data = crate::cuda::inner::alloc_managed(dst_bytes);
+
+    // Same-dtype path: device-to-device memcpy (no conversion).
+    if t.dtype == target_dtype {
+        crate::cuda::inner::memcpy_dtod(
+            dst_data,
+            t.data as *const std::ffi::c_void,
+            dst_bytes,
+        );
+    } else {
+        let (ptx, kname) =
+            precision_cast_kernels::pick_cast_kernel(t.dtype, target_dtype).unwrap_or_else(|| {
+                panic!(
+                    "gpu_cast_and_publish: no GPU cast kernel for src dtype {} -> target {}; \
+                     v7 supports {{f32,fp16,bf16}} pairs through f32 only",
+                    t.dtype, target_dtype
+                )
+            });
+        let rc = precision_cast_kernels::launch_cast(
+            ptx,
+            kname,
+            t.data as u64,
+            dst_data as u64,
+            len as u64,
+        );
+        assert_eq!(
+            rc, 0,
+            "gpu_cast_and_publish: cast kernel '{}' launch failed (rc={rc})",
+            kname.trim_end_matches('\0')
+        );
+        // Synchronise so callers reading the destination see consistent
+        // results (mirrors `nsl_fused_linear_ce_forward`'s post-launch sync).
+        unsafe {
+            cudarc::driver::sys::cuCtxSynchronize();
+        }
+    }
+
+    let shape = NslTensor::copy_shape(t.shape, t.ndim);
+    let strides = NslTensor::compute_strides(shape, t.ndim);
+    let out = Box::new(NslTensor::new(
+        dst_data,
+        shape,
+        strides,
+        t.ndim,
+        t.len,
+        t.device, // preserve device (1+ for CUDA)
+        target_dtype,
+        1, // owns_data
+        0, // data_owner
+    ));
+    NslTensor::publish(out)
+}
+
+/// `cuda` feature off: GPU dispatch is unreachable (no device tensors can
+/// exist without the `cuda` feature). Provide a stub for the non-cuda build
+/// so the device-branch in `cast_and_publish` still compiles.
+#[cfg(not(feature = "cuda"))]
+fn gpu_cast_and_publish(t: &NslTensor, _target_dtype: u16) -> i64 {
+    panic!(
+        "gpu_cast_and_publish: device tensor (device={}) reached cast path \
+         but runtime was compiled without the `cuda` feature",
+        t.device
+    );
+}
+
 /// Shared helper for v6 cast wrappers. Performs a CPU cast (via the same
 /// host arithmetic as `nsl_tensor_cast`), but allocates the result via
 /// `NslTensor::publish` so the new tensor participates in the scope sweep
 /// (in contrast to `nsl_tensor_cast` which uses bare `Box::into_raw` for
 /// FASE optimizer-state buffers that are explicitly freed each step).
+///
+/// CFTP v7 (2026-06-26): GPU tensors are now dispatched to
+/// `gpu_cast_and_publish` (which lowers to a PTX cast kernel). CPU tensors
+/// continue to take the host-staged path below — byte-identical to v6.
 fn cast_and_publish(src_ptr: i64, target_dtype: u16) -> i64 {
     let t = unsafe { &*(src_ptr as *const NslTensor) };
-    assert_eq!(
-        t.device, 0,
-        "cast_and_publish: GPU tensors not supported in v6 (device={}); v7 will add a PTX cast kernel",
-        t.device
-    );
-    // CFTP v6 Finding 2 (HIGH): refuse non-contiguous sources — see the
-    // long-form rationale on nsl_tensor_cast. The linear-read + row-major-
-    // strides path silently corrupts non-contiguous inputs.
+    // CFTP v6 Finding 2 (HIGH) + Finding 4 (MEDIUM): the contiguity and
+    // len/shape invariants are correctness preconditions for BOTH the CPU
+    // host-staged path AND the v7 GPU PTX cast — keep them before any
+    // device-branch so a violating input is refused regardless of device.
+    // (Linear-read + row-major-strides assumption applies to GPU too: the
+    // cast kernels index `i in [0, numel)` over the source buffer without
+    // consulting strides.)
     assert!(
         t.is_contiguous(),
         "cast_and_publish: source tensor must be contiguous (ndim={}); \
          the wengert lowering must pass contiguous x/W/bias buffers.",
         t.ndim
     );
-    // CFTP v6 Finding 4 (MEDIUM): refuse len/shape mismatch.
     assert_eq!(
         t.len,
         NslTensor::total_elements(t.shape, t.ndim),
         "cast_and_publish: t.len ({}) != product(t.shape) — invariant violation",
         t.len
     );
+
+    // CFTP v7: GPU dispatch — must come BEFORE any host slice read on
+    // `t.data` (lines below treat `t.data` as a HOST pointer; a GPU
+    // tensor would be silent UB otherwise).
+    if t.device > 0 {
+        return gpu_cast_and_publish(t, target_dtype);
+    }
+
     let len = t.len as usize;
 
     let src_f32: Vec<f32> = match t.dtype {
