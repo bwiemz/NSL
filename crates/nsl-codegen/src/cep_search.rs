@@ -951,7 +951,7 @@ mod tests {
         // Aggressive target — head + FFN passes alone can't reach it; layer drop must
         // engage. Layer importance is descending so the LAST layer drops first.
         let s = spec();
-        let baseline = s.param_count();
+        let _baseline = s.param_count();
         let constraints = Constraints {
             peak_memory_bytes: u64::MAX,
             latency_us: f64::MAX,
